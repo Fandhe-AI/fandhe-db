@@ -3514,6 +3514,24 @@ pub enum UpsertValue {
     /// 大小を保持する）。
     Excluded(String),
     Literal(InsertLiteral),
+    /// `<col> = <col> + (<数値リテラル> | EXCLUDED.<col>)`（SQL-49・RECOVER-11、
+    /// Issue #2425）。左辺と同じ列だけを加算の左オペランドに取り、演算子は `+` のみ
+    /// （一般の式・他列参照は #1738 の担当で `42601` のまま）。`column` は左辺と同名であること
+    /// を構文段で保証済み。型検査・範囲検査は `sql::parser::bind_upsert_assignments`
+    /// と `sql::upsert_add` が担う。
+    Add {
+        column: String,
+        operand: UpsertAddOperand,
+    },
+}
+
+/// [`UpsertValue::Add`] の右オペランド（Issue #2425）。
+#[derive(Debug, Clone, PartialEq)]
+pub enum UpsertAddOperand {
+    /// 数値リテラル（符号付き可。`InsertLiteral::Number` のみ受理する）。
+    Literal(InsertLiteral),
+    /// `EXCLUDED.<col>`（列名は宣言どおりの大小を保持する）。
+    Excluded(String),
 }
 
 /// `ON CONFLICT (id) DO NOTHING | DO UPDATE SET ...` の衝突分岐（SQL-20・
@@ -9573,6 +9591,56 @@ impl<'a> Parser<'a> {
     fn parse_upsert_assignment(&mut self) -> Result<(String, UpsertValue), SqlSurfaceError> {
         let column = self.expect_ident()?;
         self.expect_punct('=')?;
+        // 加算形 `<ident> + ...`（Issue #2425）。引用なしの `true`／`false`／`NULL` は
+        // 従来のリテラル経路へ流す。先読みは `get` のみ（添字を使わない）。
+        let is_add = match self.peek() {
+            Some(Token::Ident(s)) => {
+                // 引用付き `"null"` は列名なので加算の左オペランドとして受理する
+                // （引用なしの NULL 定数だけをリテラル経路へ流す）。
+                (self.quoted_null.contains(&self.pos)
+                    || !(s.eq_ignore_ascii_case("NULL")
+                        || s.eq_ignore_ascii_case("true")
+                        || s.eq_ignore_ascii_case("false")))
+                    && matches!(
+                        self.tokens.get(self.pos.saturating_add(1)),
+                        Some(Token::Punct('+'))
+                    )
+            }
+            _ => false,
+        };
+        if is_add {
+            let lhs = self.expect_ident()?;
+            self.expect_punct('+')?;
+            if lhs != column {
+                return Err(SqlSurfaceError::unsupported(
+                    "ON CONFLICT SET addition must reference the assigned column itself",
+                ));
+            }
+            let operand =
+                if let Some(Token::QualifiedIdent { qualifier, name }) = self.peek().cloned() {
+                    self.advance();
+                    if !qualifier.eq_ignore_ascii_case("EXCLUDED") {
+                        return Err(SqlSurfaceError::unsupported(format!(
+                            "unsupported ON CONFLICT SET qualifier: {qualifier}"
+                        )));
+                    }
+                    UpsertAddOperand::Excluded(name)
+                } else {
+                    match self.expect_literal()? {
+                    lit @ InsertLiteral::Number(_) => UpsertAddOperand::Literal(lit),
+                    _ => return Err(SqlSurfaceError::unsupported(
+                        "ON CONFLICT SET addition requires a numeric literal or EXCLUDED column",
+                    )),
+                }
+                };
+            return Ok((
+                column,
+                UpsertValue::Add {
+                    column: lhs,
+                    operand,
+                },
+            ));
+        }
         let value = if let Some(Token::QualifiedIdent { qualifier, name }) = self.peek().cloned() {
             self.advance();
             if !qualifier.eq_ignore_ascii_case("EXCLUDED") {
@@ -22621,6 +22689,109 @@ mod tests {
         );
     }
 
+    /// `DO UPDATE SET <col> = <col> + ...` の構文（Issue #2425・SQL-49）。
+    #[test]
+    fn upsert_set_add_syntax_accepts_same_column_forms() {
+        let lookup = catalog_with(&["documents"]);
+        let lit = |s: &str| UpsertAddOperand::Literal(InsertLiteral::Number(s.to_string()));
+        let cases: [(&str, UpsertAddOperand); 5] = [
+            ("n = n + 1", lit("1")),
+            ("n = n + -1", lit("-1")),
+            ("n = n + +1", lit("+1")),
+            (
+                "n = n + EXCLUDED.m",
+                UpsertAddOperand::Excluded("m".to_string()),
+            ),
+            (
+                "n = n + excluded.n",
+                UpsertAddOperand::Excluded("n".to_string()),
+            ),
+        ];
+        for (set, operand) in cases {
+            let sql = format!(
+                "INSERT INTO documents (id, n) VALUES (1, 1) ON CONFLICT (id) DO UPDATE SET {set} \
+                 USING OPERATION_ID 'op-add-1'"
+            );
+            let stmt = validate_insert(&sql, &lookup, LedgerMode::Ledgered).expect(&sql);
+            let Some(OnConflictClause {
+                action: OnConflictAction::DoUpdate(a),
+                ..
+            }) = stmt.on_conflict
+            else {
+                panic!("expected DoUpdate: {sql}");
+            };
+            let expected = UpsertValue::Add {
+                column: "n".to_string(),
+                operand,
+            };
+            assert_eq!(a, vec![("n".to_string(), expected)], "{sql}");
+        }
+        let sql = "INSERT INTO documents (id, a, b) VALUES (1, 1, 1) ON CONFLICT (id) \
+                   DO UPDATE SET a = a + 1, b = EXCLUDED.b USING OPERATION_ID 'op-add-2'";
+        let stmt = validate_insert(sql, &lookup, LedgerMode::Ledgered).expect(sql);
+        let Some(OnConflictClause {
+            action: OnConflictAction::DoUpdate(a),
+            ..
+        }) = stmt.on_conflict
+        else {
+            panic!("expected DoUpdate");
+        };
+        assert_eq!(a.len(), 2);
+        assert!(matches!(a[1].1, UpsertValue::Excluded(_)));
+    }
+
+    /// 加算形の対象外（別列・左右逆・他演算子・連鎖・括弧・NULL・文字列・修飾付き）は
+    /// `42601` のまま（一般の式は #1738）。
+    #[test]
+    fn upsert_set_add_syntax_rejects_everything_else() {
+        let lookup = catalog_with(&["documents"]);
+        for set in [
+            "n = m + 1",
+            "n = 1 + n",
+            "n = n - 1",
+            "n = n * 2",
+            "n = n / 2",
+            "n = n + 1 + 2",
+            "n = (n + 1)",
+            "n = n + NULL",
+            "n = n + 'x'",
+            "n = n + true",
+            "n = t.n + 1",
+            "n = EXCLUDED.n + 1",
+            "n = n + foo.m",
+            "n = n +",
+        ] {
+            let sql = format!(
+                "INSERT INTO documents (id, n) VALUES (1, 1) ON CONFLICT (id) DO UPDATE SET {set} \
+                 USING OPERATION_ID 'op-add-3'"
+            );
+            let err = validate_insert(&sql, &lookup, LedgerMode::Ledgered).unwrap_err();
+            assert_eq!(err.wire_code(), "42601", "{sql}");
+        }
+    }
+
+    /// 引用付き `"null"` 列は加算の左オペランドとして受理し、引用なしの `NULL` 定数とは
+    /// 区別する（引用なしは従来どおり `42601`）。
+    #[test]
+    fn upsert_set_add_accepts_quoted_null_column() {
+        let lookup = catalog_with(&["documents"]);
+        let sql = "INSERT INTO documents (id, \"null\") VALUES (1, 1) ON CONFLICT (id) \
+                   DO UPDATE SET \"null\" = \"null\" + 1 USING OPERATION_ID 'op-add-q'";
+        let stmt = validate_insert(sql, &lookup, LedgerMode::Ledgered).expect(sql);
+        let Some(OnConflictClause {
+            action: OnConflictAction::DoUpdate(a),
+            ..
+        }) = stmt.on_conflict
+        else {
+            panic!("expected DoUpdate");
+        };
+        assert!(matches!(a[0].1, UpsertValue::Add { .. }));
+        let bare = "INSERT INTO documents (id, n) VALUES (1, 1) ON CONFLICT (id) \
+                    DO UPDATE SET n = NULL + 1 USING OPERATION_ID 'op-add-q2'";
+        let err = validate_insert(bare, &lookup, LedgerMode::Ledgered).unwrap_err();
+        assert_eq!(err.wire_code(), "42601");
+    }
+
     /// INSERT の VALUES は `NULL`（大小無視）を `InsertLiteral::Null` として受理する
     /// （Issue #1523・SQL-41）。
     #[test]
@@ -23069,7 +23240,8 @@ mod tests {
     }
 
     /// 式の複数 SET・述語形でも構文木のまま保持し、宣言順を保つ。
-    /// `ON CONFLICT ... DO UPDATE SET` の式は引き続き対象外（`42601`）。
+    /// `ON CONFLICT ... DO UPDATE SET` の一般の式は引き続き対象外（`42601`。同じ列への
+    /// `+` 加算だけは Issue #2425 で受理するため、ここでは `*` を使う）。
     #[test]
     fn update_set_expressions_in_predicate_form_and_upsert_stays_rejected() {
         let lookup = catalog_with(&["documents"]);
@@ -23087,7 +23259,7 @@ mod tests {
         assert!(matches!(p.assignments()[1].1, SetValue::Expr(_)));
         let err = validate_insert(
             "INSERT INTO documents (id, n) VALUES (1, 1) ON CONFLICT (id) DO UPDATE SET \
-             n = n + 1 USING OPERATION_ID 'op-se-3'",
+             n = n * 2 USING OPERATION_ID 'op-se-3'",
             &lookup,
             LedgerMode::Ledgered,
         )

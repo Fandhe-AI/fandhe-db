@@ -5612,6 +5612,16 @@ fn execute_upsert_inner(
                         crate::tenant::UpsertSetValue::Excluded(*src_idx)
                     }
                     BoundUpsertValue::Literal(v) => crate::tenant::UpsertSetValue::Literal(v),
+                    BoundUpsertValue::Add(operand) => {
+                        crate::tenant::UpsertSetValue::Add(match operand {
+                            crate::sql::parser::BoundUpsertAddOperand::Literal(v) => {
+                                crate::tenant::UpsertAddOperandRef::Literal(v)
+                            }
+                            crate::sql::parser::BoundUpsertAddOperand::Excluded(i) => {
+                                crate::tenant::UpsertAddOperandRef::Excluded(*i)
+                            }
+                        })
+                    }
                 };
                 (*col_idx, v)
             })
