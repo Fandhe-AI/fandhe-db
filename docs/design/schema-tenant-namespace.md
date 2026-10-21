@@ -476,7 +476,7 @@ TABLE-27 (3) のポインタ。セッション変数 `search_path` を engine �
   `pg_temp` はセッションに一時表があるときだけ実在、それ以外は `(呼び出し元テナント, 名前)` の
   1 回の get で判定する（他テナントの SCHEMA は不在と同じ扱い・同じ応答。D4）。`current_schema()` は
   先頭（無ければ NULL）、`current_schemas(false)` は全体、`(true)` は暗黙の一時スキーマ・`pg_catalog` を
-  PostgreSQL と同じ順序で前置する
+  PostgreSQL と同じ順序で、明示リストに無いものだけ前置する（明示した `pg_temp` は位置を保持する）
 - **実装**: `sql::search_path` に path 要素の展開の共通化（`creation_target` と共有。挙動は不変）・
   `resolve_schema_functions`・thread-local RAII の `SchemaFnScope` を置く。スコープを張るのは
   `core.rs` の `ConstSelect` の実行腕（式木が `current_schema` 系を含むときだけ probe。含まない文は

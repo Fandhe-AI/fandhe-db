@@ -240,9 +240,9 @@ fn temp_schema_is_visible_only_with_temp_tables() {
     assert!(t.find("pg_catalog") < t.find("public"), "{t}");
 }
 
-/// 明示 path に `pg_temp` があっても、暗黙の一時スキーマは `pg_catalog` より前に 1 件だけ並ぶ。
+/// 明示 path の `pg_temp` は位置を保持し、重複させない。明示が無ければ暗黙の一時が `pg_catalog` より前に並ぶ。
 #[test]
-fn explicit_pg_temp_keeps_temp_before_pg_catalog_without_duplicate() {
+fn explicit_pg_temp_keeps_its_position_without_duplicate() {
     let (core, _g) = new_core("cs-temp-explicit");
     let mut s = ddl_session();
     ok(
@@ -250,11 +250,31 @@ fn explicit_pg_temp_keeps_temp_before_pg_catalog_without_duplicate() {
         &mut s,
         "CREATE TEMP TABLE tmp (id BIGINT PRIMARY KEY)",
     );
+    let order = |t: &str, names: [&str; 3]| {
+        let p: Vec<_> = names.iter().map(|n| t.find(n)).collect();
+        assert!(p.iter().all(Option::is_some), "{t}");
+        assert!(p[0] < p[1] && p[1] < p[2], "{t}");
+        assert_eq!(t.matches("pg_temp").count(), 1, "{t}");
+    };
     ok(&core, &mut s, "SET search_path = pg_temp, public");
-    let t = schemas(&core, &mut s, "true");
-    assert_eq!(t.matches("pg_temp").count(), 1, "{t}");
-    assert!(t.find("pg_temp") < t.find("pg_catalog"), "{t}");
-    assert!(t.find("pg_catalog") < t.find("public"), "{t}");
+    order(
+        &schemas(&core, &mut s, "true"),
+        ["pg_catalog", "pg_temp", "public"],
+    );
+    ok(
+        &core,
+        &mut s,
+        "SET search_path = pg_catalog, pg_temp, public",
+    );
+    order(
+        &schemas(&core, &mut s, "true"),
+        ["pg_catalog", "pg_temp", "public"],
+    );
+    ok(&core, &mut s, "SET search_path = public");
+    order(
+        &schemas(&core, &mut s, "true"),
+        ["pg_temp", "pg_catalog", "public"],
+    );
 }
 
 /// FROM なし HAVING の裸の `current_schema` も関数として解決される（42703 にならない）。

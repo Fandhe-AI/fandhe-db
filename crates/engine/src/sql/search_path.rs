@@ -519,30 +519,23 @@ impl SchemaFnValues {
         self.explicit.first().map(String::as_str)
     }
 
-    /// `current_schemas(include_implicit)` の値。`true` は暗黙の一時スキーマと `pg_catalog` を
-    /// PostgreSQL と同じ順序（一時 → `pg_catalog` → 明示リスト）で前置する。
+    /// `current_schemas(include_implicit)` の値。`true` は暗黙の要素を PostgreSQL と同じ規則で前置する。
+    /// 暗黙の一時スキーマ（一時表があるとき）と `pg_catalog` は、明示リストに無い場合だけ
+    /// 一時 → `pg_catalog` の順で先頭へ置き、明示されている場合は利用者が書いた位置を保持する。
     pub(crate) fn schemas(&self, include_implicit: bool) -> Vec<String> {
         let mut out = Vec::with_capacity(self.explicit.len().saturating_add(2));
         if include_implicit {
             let has = |n: &str| self.explicit.iter().any(|e| e == n);
-            // 暗黙の一時スキーマは明示リストの `pg_temp` の有無によらず常に先頭へ置く
-            // （明示側の `pg_temp` は下で除去して重複させない）。
-            if self.temp_visible {
+            // 明示リストの `pg_temp` は一時表があるときだけ残る（resolve 側で判定済み）ため、
+            // `has("pg_temp")` が真なら暗黙前置は不要（重複させず明示位置を保つ）。
+            if self.temp_visible && !has("pg_temp") {
                 out.push("pg_temp".to_string());
             }
             if !has("pg_catalog") {
                 out.push("pg_catalog".to_string());
             }
-            let skip_temp = self.temp_visible;
-            out.extend(
-                self.explicit
-                    .iter()
-                    .filter(|e| !(skip_temp && e.as_str() == "pg_temp"))
-                    .cloned(),
-            );
-        } else {
-            out.extend(self.explicit.iter().cloned());
         }
+        out.extend(self.explicit.iter().cloned());
         out
     }
 }
