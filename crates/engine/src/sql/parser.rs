@@ -3367,7 +3367,7 @@ pub(crate) fn bind_column_default(
 /// 前に判定するため、型不正な値も 22P02 より先に 428C9 になる。PostgreSQL と同じ順序）。判定は
 /// スキーマだけで決まり、テナントの状態・SEQUENCE カタログを引かない（存在オラクルにならない）。
 /// COPY は PostgreSQL と同じく IDENTITY 列へ入力値をそのまま書くため呼ばない。
-fn reject_generated_always_value(column: &ColumnDef) -> Result<(), SqlSurfaceError> {
+pub(crate) fn reject_generated_always_value(column: &ColumnDef) -> Result<(), SqlSurfaceError> {
     if column
         .default_expr
         .as_ref()
@@ -3377,6 +3377,22 @@ fn reject_generated_always_value(column: &ColumnDef) -> Result<(), SqlSurfaceErr
         return Err(SqlSurfaceError::GeneratedAlways {
             column: column.name.clone(),
         });
+    }
+    Ok(())
+}
+
+/// INSERT の列リストの列名重複を `22000` で拒否する（`VALUES` 形の [`bind_insert_row`] と
+/// `INSERT ... SELECT` の束縛〔`sql::insert_select`。SQL-51〕が共有する。第 2 の実装を作らない）。
+pub(crate) fn check_insert_column_list_duplicates(
+    columns: &[String],
+) -> Result<(), SqlSurfaceError> {
+    let mut seen_columns: std::collections::HashSet<&str> = std::collections::HashSet::new();
+    for name in columns {
+        if !seen_columns.insert(name.as_str()) {
+            return Err(SqlSurfaceError::invalid_input(format!(
+                "duplicate column in INSERT column list: {name}"
+            )));
+        }
     }
     Ok(())
 }
@@ -3396,14 +3412,7 @@ fn bind_insert_row(
         ));
     }
 
-    let mut seen_columns: std::collections::HashSet<&str> = std::collections::HashSet::new();
-    for name in columns {
-        if !seen_columns.insert(name.as_str()) {
-            return Err(SqlSurfaceError::invalid_input(format!(
-                "duplicate column in INSERT column list: {name}"
-            )));
-        }
-    }
+    check_insert_column_list_duplicates(columns)?;
 
     // 疑似列 `id` を持つのは従来方式の表だけ（TABLE-23・Issue #2199）。採番方式の表は暗黙の `id` を
     // 持たず、行の識別子は書き込み段（`tenant`）が同じ write txn 内で払い出す。`BoundInsert.id` は

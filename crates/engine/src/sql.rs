@@ -206,6 +206,7 @@ pub(crate) mod hnsw_hybrid;
 pub(crate) mod index_expr;
 pub(crate) mod index_implication;
 pub(crate) mod index_predicate;
+pub(crate) mod insert_select;
 /// `[INNER|LEFT|RIGHT|FULL] JOIN`（等価結合の left-deep 連鎖・集計形・スカラー
 /// `ORDER BY`）の束縛・実行本体（SQL-28・RLS-10、TASK-212、Issue #925・#926・
 /// #1190）。`sql::allowlist::ValidatedJoin` を受け取り、

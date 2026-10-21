@@ -1520,6 +1520,14 @@ pub enum ParsedSql {
     /// `INSERT`（単一行・複数行 `VALUES`・`ON CONFLICT`・`RETURNING` を含む。
     /// SQL-10・SQL-16・SQL-20・SQL-21）。
     Insert(crate::sql::allowlist::ValidatedInsert),
+    /// `INSERT INTO <表> (<列>...) <SELECT> [RETURNING ...] [USING OPERATION_ID ...]`
+    /// （SQL-51・Issue #1732）。内側 SELECT は既存の SELECT 検証器を通過済みで、構文・内側の検証・
+    /// 列数／型の束縛までを担う。行の実体化・RLS・挿入・台帳は後続 Issue の担当で、実行腕は束縛の後に
+    /// `0A000` を返し、行・台帳・世代に触れない（fail-closed）。
+    ///
+    /// **BREAKING CHANGE**（Issue #1732）: 本 variant の追加により `ParsedSql` を網羅的に
+    /// マッチするクレート外コードは追随が必要。
+    InsertSelect(crate::sql::allowlist::ValidatedInsertSelect),
     /// 自動更新可能なビューへの `INSERT`（TABLE-43・Issue #1671）。送られた文の形のまま保持し、
     /// 基表への書き換えは Execute／Describe 時に現在のカタログで行う（Parse と Execute の間の
     /// `CREATE OR REPLACE VIEW`／`DROP VIEW` を取り込む）。自動更新不可のビューは Parse で `55000`。
@@ -1759,6 +1767,7 @@ fn statement_clock_scope(
         }
         ParsedSql::Statement(_)
         | ParsedSql::Insert(_)
+        | ParsedSql::InsertSelect(_)
         | ParsedSql::ViewInsert(_)
         | ParsedSql::ViewDelete(_)
         | ParsedSql::ViewUpdate(_)
@@ -1815,7 +1824,7 @@ fn insert_sequence_scope(
         ParsedSql::SessionRouted(routed) => {
             return insert_sequence_scope(storage, session, routed.inner())
         }
-        ParsedSql::Insert(_) | ParsedSql::ViewInsert(_) => true,
+        ParsedSql::Insert(_) | ParsedSql::InsertSelect(_) | ParsedSql::ViewInsert(_) => true,
         ParsedSql::Statement(_)
         | ParsedSql::Truncate(_)
         | ParsedSql::Delete(_)
@@ -1869,7 +1878,7 @@ fn insert_default_clock_scope(
         ParsedSql::SessionRouted(routed) => {
             return insert_default_clock_scope(routed.inner(), txn_start_micros)
         }
-        ParsedSql::Insert(_) | ParsedSql::ViewInsert(_) => true,
+        ParsedSql::Insert(_) | ParsedSql::InsertSelect(_) | ParsedSql::ViewInsert(_) => true,
         ParsedSql::Statement(_)
         | ParsedSql::Truncate(_)
         | ParsedSql::Delete(_)
@@ -2031,6 +2040,7 @@ fn table_schemas_in(
 fn parsed_operation_id(parsed: &ParsedSql) -> Option<&str> {
     match parsed {
         ParsedSql::Insert(stmt) => stmt.operation_id.as_ref().map(|id| id.as_str()),
+        ParsedSql::InsertSelect(stmt) => stmt.operation_id().map(|id| id.as_str()),
         ParsedSql::ViewInsert(stmt) => stmt.operation_id().map(|id| id.as_str()),
         ParsedSql::ViewDelete(stmt) => stmt.operation_id().map(|id| id.as_str()),
         ParsedSql::ViewUpdate(stmt) => stmt.operation_id().map(|id| id.as_str()),
@@ -4714,11 +4724,19 @@ impl EngineCore {
             // 構造検証 → 存在確認の順序は `validate_insert_tokens_with_limit` と同じ。INTO の名前が
             // 表でなくビューなら、自動更新可能なものに限りビューへの INSERT として受理する
             // （TABLE-43・Issue #1671。書き換えは Execute 時）。
-            let stmt = crate::sql::allowlist::parse_insert_shape_tokens_with_limit(
+            let parsed_insert = crate::sql::allowlist::parse_insert_any_shape_tokens_with_limit(
                 &tokens,
                 ledger_mode,
                 self.dml_limits.max_insert_rows_per_statement,
             )?;
+            let stmt = match parsed_insert {
+                crate::sql::allowlist::ParsedInsertTokens::Values(stmt) => stmt,
+                // `INSERT ... SELECT`（SQL-51・Issue #1732）。内側 SELECT の検証は SELECT 経路と同じ
+                // `storage_lookup`（一時カタログ・ビューの解決込み）で行う。
+                crate::sql::allowlist::ParsedInsertTokens::Select(shape) => {
+                    return self.parse_insert_select(shape, &lookup, &storage_lookup);
+                }
+            };
             if crate::sql::allowlist::TableLookup::table_exists(&lookup, &stmt.table_name)? {
                 return Ok(ParsedSql::Insert(stmt));
             }
@@ -5060,6 +5078,109 @@ impl EngineCore {
         Ok(ParsedSql::Statement(stmt))
     }
 
+    /// `INSERT ... SELECT` の挿入先の確認と内側 SELECT の検証（SQL-51・Issue #1732）。
+    ///
+    /// 挿入先が表でなくビューなら `0A000`（ビューへの `INSERT ... SELECT` は未対応）、表でもビューでも
+    /// なければ既存の書き込み文と同じ `42P01`／`42809`。内側 SELECT は既存の SELECT 検証器
+    /// （`validate_sql_tokens_with_subquery_ctx_limits`）へトークン列のまま渡し、文字列を組み立て直さない。
+    /// 受理するのは読み取りの文種だけで、`EXPLAIN`・`SET`・`SHOW`・`CREATE FUNCTION` は `42601`、
+    /// `USING PLAN`（LLM I/O を起こす）は `0A000`。`Statement` の網羅 `match` により、将来の variant 追加は
+    /// コンパイルエラーで判断を強制される。
+    fn parse_insert_select(
+        &self,
+        shape: crate::sql::allowlist::InsertSelectShape,
+        lookup: &impl crate::sql::allowlist::TableLookup,
+        storage_lookup: &impl crate::sql::allowlist::TableLookup,
+    ) -> Result<ParsedSql, crate::sql::allowlist::SqlSurfaceError> {
+        use crate::sql::allowlist::{SqlSurfaceError, Statement};
+        if !crate::sql::allowlist::TableLookup::table_exists(lookup, &shape.table_name)? {
+            if matches!(self.storage.view_definition(&shape.table_name), Ok(Some(_))) {
+                return Err(SqlSurfaceError::feature_not_supported(
+                    "INSERT ... SELECT into a view is not supported",
+                ));
+            }
+            return Err(self.reclassify_write_to_view_error_for(
+                Some(crate::sql::allowlist::ViewWriteOp::Insert),
+                SqlSurfaceError::undefined_table(shape.table_name),
+            ));
+        }
+        // `INSERT` 先頭のため `QuotedNull` が残っている。単独の SELECT と同じ扱いに揃える
+        // （FROM なし SELECT は引用情報を保持する）。
+        let from_less = matches!(
+            shape.query_tokens.first(),
+            Some(crate::sql::lexer::Token::Keyword(
+                crate::sql::lexer::Keyword::Select
+            ))
+        ) && crate::sql::allowlist::is_from_less_select(&shape.query_tokens);
+        let inner_tokens = if from_less {
+            shape.query_tokens.clone()
+        } else {
+            crate::sql::lexer::demote_quoted_null(shape.query_tokens.clone())
+        };
+        let query = crate::sql::allowlist::validate_sql_tokens_with_subquery_ctx_limits(
+            &inner_tokens,
+            storage_lookup,
+            0,
+            self.nesting_limits,
+        )?;
+        match &query {
+            Statement::Select(v) if v.using_plan().is_some() => {
+                return Err(SqlSurfaceError::feature_not_supported(
+                    "INSERT ... SELECT with USING PLAN is not supported",
+                ));
+            }
+            Statement::Select(_)
+            | Statement::Scan(_)
+            | Statement::Aggregate(_)
+            | Statement::Join(_)
+            | Statement::SetOperation(_)
+            | Statement::BufferedView(_)
+            | Statement::ConstSelect(_)
+            | Statement::MaterializedView(_) => {}
+            Statement::Explain(_)
+            | Statement::SetSearchMode { .. }
+            | Statement::SetTimeZone { .. }
+            | Statement::ShowTimeZone
+            | Statement::SetSearchPath { .. }
+            | Statement::ShowSearchPath
+            | Statement::CreateFunction { .. } => {
+                return Err(SqlSurfaceError::unsupported(
+                    "INSERT ... SELECT requires a SELECT query",
+                ));
+            }
+        }
+        Ok(ParsedSql::InsertSelect(
+            crate::sql::allowlist::ValidatedInsertSelect::new(shape, query),
+        ))
+    }
+
+    /// `INSERT ... SELECT` の束縛（SQL-51・Issue #1732）。挿入先スキーマと内側 SELECT の結果列メタ
+    /// （既存の Describe で導出）を突き合わせ、列数・型の不整合を拒否する。実行腕・Describe 腕が呼ぶ。
+    /// 内側とのスナップショット一致は要求しない（実行時の再検証は後続 Issue が write txn 内で行う）。
+    fn bind_insert_select(
+        &self,
+        session: &crate::sql::mode::SessionState,
+        stmt: &crate::sql::allowlist::ValidatedInsertSelect,
+        limits: &crate::result_limits::ResultLimits,
+    ) -> Result<
+        crate::sql::insert_select::BoundInsertSelectTarget,
+        crate::sql::allowlist::SqlSurfaceError,
+    > {
+        let source = self
+            .describe_parsed_in_session_impl(
+                session,
+                &ParsedSql::Statement((*stmt.query).clone()),
+                false,
+                &[],
+                limits,
+            )?
+            .ok_or_else(|| crate::sql::allowlist::SqlSurfaceError::Internal {
+                detail: "internal error".to_string(),
+            })?;
+        let (_read_txn, schema) = self.read_txn_with_schema(&stmt.table_name)?;
+        crate::sql::insert_select::bind(stmt, &schema, &source)
+    }
+
     /// Issue #927・SQL-29 (a)・TASK-213: `Self::parse_sql_prepared` が拡張
     /// クエリプロトコル経由のサブクエリを一律拒否するための、安価なテキスト
     /// 走査（`Parser::require_subquery_depth` を経由せず、`sql::allowlist::
@@ -5221,6 +5342,26 @@ impl EngineCore {
             return Err(
                 crate::sql::allowlist::SqlSurfaceError::feature_not_supported(
                     "bind parameters are not supported in setval / lastval",
+                ),
+            );
+        }
+        // SQL-51・Issue #1732: `INSERT ... SELECT` の内側 SELECT は `$n` の位置規則（`VALUES` 前提）の
+        // 対象外のため、`$n` を含む形は位置検査より前に `0A000` で拒否する（fail-closed）。
+        if matches!(
+            tokens.first(),
+            Some(crate::sql::lexer::Token::Ident(name)) if name.eq_ignore_ascii_case("INSERT")
+        ) && tokens.iter().any(|t| {
+            matches!(
+                t,
+                crate::sql::lexer::Token::Keyword(crate::sql::lexer::Keyword::Select)
+            )
+        }) && tokens
+            .iter()
+            .any(|t| matches!(t, crate::sql::lexer::Token::Param(_)))
+        {
+            return Err(
+                crate::sql::allowlist::SqlSurfaceError::feature_not_supported(
+                    "bind parameters are not supported in INSERT ... SELECT",
                 ),
             );
         }
@@ -5790,6 +5931,17 @@ impl EngineCore {
                     &lookup,
                 )?;
                 Ok(crate::sql::SqlOutcome::Insert(outcome))
+            }
+            // SQL-51・Issue #1732: 構文・内側 SELECT の検証・列数／型の束縛まで。行の実体化・RLS・
+            // 挿入・台帳は後続 Issue の担当のため、束縛を通った形も `0A000` で拒否する（行・台帳・
+            // 世代に触れない fail-closed）。列数・型の不一致は `0A000` より先に報告する。
+            ParsedSql::InsertSelect(stmt) => {
+                self.bind_insert_select(session, stmt, &self.result_limits)?;
+                Err(
+                    crate::sql::allowlist::SqlSurfaceError::feature_not_supported(
+                        "INSERT ... SELECT is not supported yet",
+                    ),
+                )
             }
             ParsedSql::ViewInsert(stmt) => self
                 .execute_view_insert(
@@ -6665,6 +6817,13 @@ impl EngineCore {
                 }
                 Ok(crate::sql::SqlOutcome::Query(result))
             }
+            // SQL-51・Issue #1732: autocommit と同じく、束縛（列数・型）の後に `0A000` で拒否する。
+            ParsedSql::InsertSelect(stmt) => {
+                self.bind_insert_select(session, stmt, &self.result_limits)?;
+                Err(SqlSurfaceError::feature_not_supported(
+                    "INSERT ... SELECT is not supported yet",
+                ))
+            }
             // COPY・DDL 等、明示トランザクション内での対応外の文（対象外。
             // `docs/design/explicit-transaction.md` 参照）。
             _ => Err(SqlSurfaceError::transaction_feature_not_supported(
@@ -7329,6 +7488,20 @@ impl EngineCore {
                         &projection,
                         &schema,
                     )?)),
+                    None => Ok(None),
+                }
+            }
+            // SQL-51・Issue #1732: 束縛（列数・型）を通した上で、`RETURNING` の列メタだけを返す。
+            ParsedSql::InsertSelect(stmt) => {
+                let bound = self.bind_insert_select(session, stmt, limits)?;
+                match bound.returning {
+                    Some(projection) => {
+                        let (_read_txn, schema) = self.read_txn_with_schema(&stmt.table_name)?;
+                        Ok(Some(crate::sql::returning::column_meta(
+                            &projection,
+                            &schema,
+                        )?))
+                    }
                     None => Ok(None),
                 }
             }

@@ -257,7 +257,11 @@ fn is_session_exempt(parsed: &ParsedSql) -> bool {
 fn is_write(parsed: &ParsedSql) -> bool {
     matches!(
         parsed,
-        ParsedSql::Insert(_) | ParsedSql::Truncate(_) | ParsedSql::Delete(_) | ParsedSql::Update(_)
+        ParsedSql::Insert(_)
+            | ParsedSql::InsertSelect(_)
+            | ParsedSql::Truncate(_)
+            | ParsedSql::Delete(_)
+            | ParsedSql::Update(_)
     )
 }
 
