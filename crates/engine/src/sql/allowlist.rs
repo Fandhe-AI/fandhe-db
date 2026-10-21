@@ -9179,7 +9179,7 @@ impl<'a> Parser<'a> {
                 | Token::Param(_)
                 | Token::QualifiedIdent { .. }
                 | Token::QuotedNull(_)
-                | Token::Punct(')'),
+                | Token::Punct(')' | ']'),
             ) => true,
             Some(Token::Ident(p)) => ![
                 "AS", "ON", "JOIN", "USING", "AND", "OR", "NOT", "IN", "IS", "LIKE", "ILIKE",
@@ -24044,6 +24044,16 @@ mod tests {
             assert!(shape.returning.is_none(), "{sql}");
             let n = lexer::tokenize(sql).expect("tokenize").len();
             assert_eq!(shape.query_tokens.len() + 6, n, "span must be whole: {sql}");
+        }
+        // 配列コンストラクタ・添字の終端 `]` の直後の `RETURNING` も句境界になる。
+        for sql in [
+            "INSERT INTO t (a) SELECT ARRAY[1, 2] RETURNING a",
+            "INSERT INTO t (a) SELECT b[1] FROM x RETURNING a",
+        ] {
+            let ParsedInsertTokens::Select(shape) = parse_insert_any(sql, mode).expect(sql) else {
+                panic!("expected Select shape: {sql}");
+            };
+            assert!(shape.returning.is_some(), "{sql}");
         }
         // 本物の句は従来どおり境界になる。
         let ParsedInsertTokens::Select(shape) = parse_insert_any(
