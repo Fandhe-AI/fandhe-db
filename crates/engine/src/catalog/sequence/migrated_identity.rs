@@ -40,9 +40,9 @@ use crate::storage::read_source::ReadSource;
 use super::{
     choose_implicit_sequence_name_in_txn, corrupt_may_own_id_sequence, create_sequence_in_txn,
     decode_sequence_def_with_owner, load_sequence_bytes_in_txn, make_object_name,
-    owned_sequence_entries_in_txn, owned_sequence_entries_lenient, sequence_key,
-    set_sequence_owner_in_txn, validate_relation_key, write_state_in_txn, RelationKey, SeqCursor,
-    SequenceDef, SequenceOwner, SequenceParams, MAX_CURSORS, SEQUENCES_TABLE,
+    owned_sequence_entries_lenient, sequence_key, set_sequence_owner_in_txn, validate_relation_key,
+    write_state_in_txn, RelationKey, SeqCursor, SequenceDef, SequenceOwner, SequenceParams,
+    MAX_CURSORS, SEQUENCES_TABLE,
 };
 
 /// 移行する `id` 列の名前（ADR D2。PK 列名は移行後も `id`）。
@@ -326,7 +326,13 @@ pub(crate) fn migrated_id_sequence_in_txn(
         let found = {
             match ReadSource::open_table(write_txn, SEQUENCES_TABLE) {
                 Ok(t) => match t.get(sequence_key(&default_name))? {
-                    Some(g) => Some(decode_sequence_def_with_owner(g.value())?),
+                    // 破損した暗黙名は「所有者なし」として読み飛ばす（open 時の割り当てと同じ扱い）。
+                    // 以降の所有者走査（寛容版）へ進み、見つからなければ `None`（呼び出し側が 23502）。
+                    Some(g) => match decode_sequence_def_with_owner(g.value()) {
+                        Ok(v) => Some(v),
+                        Err(CatalogError::CorruptSchema(_)) => None,
+                        Err(e) => return Err(e),
+                    },
                     None => None,
                 },
                 Err(redb::TableError::TableDoesNotExist(_)) => None,
@@ -339,7 +345,8 @@ pub(crate) fn migrated_id_sequence_in_txn(
             }
         }
     }
-    let found = owned_sequence_entries_in_txn(write_txn, &|o| o == &expected)?;
+    // 破損した無関係な SEQUENCE で INSERT を失敗させない（破損項目は所有者なしとして読み飛ばす）。
+    let (found, _corrupt) = owned_sequence_entries_lenient(write_txn, &|o| o == &expected)?;
     match found.as_slice() {
         [] => Ok(None),
         [(name, def, _)] => Ok(Some((name.clone(), *def))),
