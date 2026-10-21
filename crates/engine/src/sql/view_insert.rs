@@ -23,7 +23,8 @@
 
 use super::allowlist::{
     ConflictTargetSpec, OnConflictAction, OnConflictClause, Projection, SqlSurfaceError,
-    TableLookup, UpsertValue, ValidatedInsert, ValidatedViewInsert, ViewWriteOp, WherePredicate,
+    TableLookup, UpsertAddOperand, UpsertValue, ValidatedInsert, ValidatedViewInsert, ViewWriteOp,
+    WherePredicate,
 };
 use super::exec::ColumnMeta;
 use super::view::{resolve_from, Resolved};
@@ -202,6 +203,15 @@ fn rewrite_on_conflict(
                 let value = match value {
                     UpsertValue::Excluded(src) => UpsertValue::Excluded(mapper.physical(src)?),
                     UpsertValue::Literal(l) => UpsertValue::Literal(l.clone()),
+                    UpsertValue::Add { column, operand } => UpsertValue::Add {
+                        column: mapper.physical(column)?,
+                        operand: match operand {
+                            UpsertAddOperand::Excluded(src) => {
+                                UpsertAddOperand::Excluded(mapper.physical(src)?)
+                            }
+                            UpsertAddOperand::Literal(l) => UpsertAddOperand::Literal(l.clone()),
+                        },
+                    },
                 };
                 out.push((mapper.physical(col)?, value));
             }
