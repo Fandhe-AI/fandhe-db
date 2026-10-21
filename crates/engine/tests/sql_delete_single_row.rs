@@ -590,23 +590,21 @@ fn explain_delete_is_rejected_as_unsupported_syntax() {
     assert_eq!(err.wire_code(), "42601");
 }
 
-/// `WHERE` を伴わない `DELETE` は許可形状外（`id` 等価指定のみ受理）として
-/// `42601` で拒否される。
+/// `WHERE` を伴わない `DELETE` は SQL-36（Issue #1743）で述語形として受理される
+/// （単一行専用の入口 `validate_delete` は従来どおり `42601`）。
 #[test]
-fn delete_without_where_is_rejected_as_unsupported_syntax() {
+fn delete_without_where_is_accepted_as_predicate_form() {
     let (core, path) = new_core_with_table();
     let _guard = CleanupGuard(path);
     let alice = ctx_for("alice", true);
     let mut session = SessionState::default();
 
-    let err = core
-        .execute_sql_in_session(
-            &alice,
-            &mut session,
-            &format!("DELETE FROM {TABLE} USING OPERATION_ID 'op-no-where'"),
-        )
-        .expect_err("DELETE without WHERE must be rejected");
-    assert_eq!(err.wire_code(), "42601");
+    core.execute_sql_in_session(
+        &alice,
+        &mut session,
+        &format!("DELETE FROM {TABLE} USING OPERATION_ID 'op-no-where'"),
+    )
+    .expect("DELETE without WHERE must be accepted (SQL-36)");
 }
 
 /// セッションを持たない `execute_sql` は `DELETE` を受理しない（`SELECT`／

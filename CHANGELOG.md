@@ -9,6 +9,9 @@
 
 ### Breaking Changes
 
+- `WHERE` 省略の `UPDATE`／`DELETE`（Issue #1743・SQL-36）: `DELETE FROM t`・`UPDATE t SET ...` を受理する。
+  `validate_delete_statement`／`validate_update_form` が `42601` を返さなくなり、`where_predicates()` が空を返しうる。
+  単一行専用の入口（`validate_delete`・`validate_update`）・NoSQL 表層・恒真述語（`WHERE TRUE` 等）は不変。
 - `current_schema()`・`current_schemas()`（Issue #1718・TABLE-27 (7)）: FROM なし SELECT で `current_schema()`・
   裸の `current_schema`・`current_schemas(bool)` が `search_path` に従った値（テナントで実在する SCHEMA のみ）を返す。
   互換性の変更: UDF 名 `current_schema`・`current_schemas` を予約名にした（`CREATE FUNCTION` は拒否される）。
