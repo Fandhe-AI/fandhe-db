@@ -265,3 +265,103 @@ fn wire_extended_query_revalidates_after_search_path_changes() {
     assert_eq!(rows, 1);
     sync(&mut stream);
 }
+/// DataRow（`D`）本体の先頭 1 セルをテキストで取り出す（NULL は `None`）。
+fn first_cell(body: &[u8]) -> Option<String> {
+    let len = i32::from_be_bytes(body.get(2..6)?.try_into().ok()?);
+    if len < 0 {
+        return None;
+    }
+    let end = 6usize.checked_add(usize::try_from(len).ok()?)?;
+    Some(String::from_utf8_lossy(body.get(6..end)?).into_owned())
+}
+
+/// 簡易クエリの `current_schema()`・`current_schemas(true)`（TABLE-27 (7)・Issue #1718）。
+/// RowDescription の型 OID（text 25／text[] 1009）、handshake の username と同名の SCHEMA、
+/// 裸の `current_schema`（Rails 形）、`SET search_path` への追随を確かめる。
+#[test]
+fn wire_simple_query_current_schema_functions() {
+    let (core, _guard) = new_core();
+    let store = allowed_store(&[("alice", "tenant-a", "correct-horse")], &["alice"]);
+    let addr = spawn_server(store, core);
+    let mut stream = authenticate_to_ready_for_query(addr, "alice", "correct-horse");
+
+    send_simple_query(
+        &mut stream,
+        "SELECT current_schema(), current_schemas(true)",
+    );
+    let cols = read_row_description_with_oids(&mut stream);
+    assert_eq!(
+        cols,
+        vec![
+            ("current_schema".to_string(), 25),
+            ("current_schemas".to_string(), 1009)
+        ]
+    );
+    let row = read_data_row(&mut stream);
+    assert_eq!(row[0].as_deref(), Some("public"));
+    assert_eq!(row[1].as_deref(), Some("{pg_catalog,public}"));
+    assert_eq!(read_command_complete(&mut stream), "SELECT 1");
+    read_ready_for_query(&mut stream);
+
+    simple_ok(&mut stream, "CREATE SCHEMA alice");
+    send_simple_query(&mut stream, "SELECT current_schema");
+    assert_eq!(read_row_description(&mut stream), vec!["current_schema"]);
+    assert_eq!(read_data_row(&mut stream)[0].as_deref(), Some("alice"));
+    assert_eq!(read_command_complete(&mut stream), "SELECT 1");
+    read_ready_for_query(&mut stream);
+
+    simple_ok(&mut stream, "SET search_path TO nosuch");
+    send_simple_query(
+        &mut stream,
+        "SELECT current_schema(), current_schemas(false)",
+    );
+    let _ = read_row_description(&mut stream);
+    let row = read_data_row(&mut stream);
+    assert_eq!(row[0], None);
+    assert_eq!(row[1].as_deref(), Some("{}"));
+    assert_eq!(read_command_complete(&mut stream), "SELECT 1");
+    read_ready_for_query(&mut stream);
+}
+
+/// 拡張クエリ: Parse 済みの `SELECT current_schema()` は、Parse 後の `SET search_path` の値を
+/// Execute のたびに束縛し直して返す（陳腐化しない）。Describe は型を返す。
+#[test]
+fn wire_extended_query_current_schema_follows_set() {
+    let (core, _guard) = new_core();
+    let store = allowed_store(&[("alice", "tenant-a", "correct-horse")], &["alice"]);
+    let addr = spawn_server(store, core);
+    let mut stream = authenticate_to_ready_for_query(addr, "alice", "correct-horse");
+
+    send_length_prefixed_message(
+        &mut stream,
+        b'P',
+        &parse_body("cs", "SELECT current_schema()", 0),
+    );
+    assert_eq!(read_message(&mut stream).0, b'1');
+    send_length_prefixed_message(&mut stream, b'D', b"Scs\0");
+    assert_eq!(read_message(&mut stream).0, b't');
+    assert_eq!(read_message(&mut stream).0, b'T');
+    sync(&mut stream);
+
+    let run = |stream: &mut TcpStream, portal: &str| -> Option<String> {
+        send_length_prefixed_message(stream, b'B', &bind_body(portal, "cs"));
+        assert_eq!(read_message(stream).0, b'2');
+        send_length_prefixed_message(stream, b'E', &execute_body(portal, 0));
+        let mut cell = None;
+        loop {
+            let (kind, body) = read_message(stream);
+            match kind {
+                b'D' => cell = first_cell(&body),
+                b'C' => break,
+                other => panic!("unexpected message {}", other as char),
+            }
+        }
+        sync(stream);
+        cell
+    };
+    assert_eq!(run(&mut stream, "p0").as_deref(), Some("public"));
+    simple_ok(&mut stream, "SET search_path TO nosuch");
+    assert_eq!(run(&mut stream, "p1"), None);
+    simple_ok(&mut stream, "RESET search_path");
+    assert_eq!(run(&mut stream, "p2").as_deref(), Some("public"));
+}

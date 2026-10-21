@@ -471,12 +471,8 @@ pub(crate) fn creation_target(
     probe: &dyn Fn(&str) -> Result<bool, SqlSurfaceError>,
 ) -> Result<CreateTarget, SqlSurfaceError> {
     for elem in session.search_path().elems() {
-        let name: String = match elem {
-            SearchPathElem::User => match session.session_user() {
-                Some(u) => normalize_name(u),
-                None => continue,
-            },
-            SearchPathElem::Name(n) => n.clone(),
+        let Some(name) = expand_elem(session, elem) else {
+            continue;
         };
         if name == PUBLIC {
             return Ok(CreateTarget::Public);
@@ -493,6 +489,124 @@ pub(crate) fn creation_target(
         }
     }
     Err(SqlSurfaceError::NoSchemaSelected)
+}
+
+/// path の要素 1 件を正規化した SCHEMA 名へ展開する。`$user` は handshake が確定した username
+/// だけから展開し（D6）、未設定なら `None`（飛ばす）。[`creation_target`] と
+/// [`resolve_schema_functions`] が共有し、未修飾の作成先と `current_schema()` が別の展開規則で
+/// ずれないようにする。
+fn expand_elem(session: &SessionState, elem: &SearchPathElem) -> Option<String> {
+    match elem {
+        SearchPathElem::User => session.session_user().map(normalize_name),
+        SearchPathElem::Name(n) => Some(n.clone()),
+    }
+}
+
+/// `current_schema()`・`current_schemas()` の元になる、セッションのテナントで解決できる SCHEMA の
+/// 並び（TABLE-27 (7)・Issue #1718）。内部キー・内部 ID は持たない（利用者が書いた名前を正規化した
+/// ものだけ。D2）。
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct SchemaFnValues {
+    /// 実在する path 要素（重複除去済み。path の順）。
+    explicit: Vec<String>,
+    /// セッションに一時表があるか（暗黙の一時スキーマを `current_schemas(true)` に含める条件）。
+    temp_visible: bool,
+}
+
+impl SchemaFnValues {
+    /// `current_schema()` の値（明示リストの先頭。無ければ `None`）。
+    pub(crate) fn current(&self) -> Option<&str> {
+        self.explicit.first().map(String::as_str)
+    }
+
+    /// `current_schemas(include_implicit)` の値。`true` は暗黙の一時スキーマと `pg_catalog` を
+    /// PostgreSQL と同じ順序（一時 → `pg_catalog` → 明示リスト）で前置する。
+    pub(crate) fn schemas(&self, include_implicit: bool) -> Vec<String> {
+        let mut out = Vec::with_capacity(self.explicit.len().saturating_add(2));
+        if include_implicit {
+            let has = |n: &str| self.explicit.iter().any(|e| e == n);
+            if self.temp_visible && !has("pg_temp") {
+                out.push("pg_temp".to_string());
+            }
+            if !has("pg_catalog") {
+                out.push("pg_catalog".to_string());
+            }
+        }
+        out.extend(self.explicit.iter().cloned());
+        out
+    }
+}
+
+/// path を先頭から見て、セッションのテナントで実在する SCHEMA を集める。`probe` は
+/// 呼び出し元テナントの SCHEMA 存在照会（`(テナント, 名前)` の 1 回の get。他テナントの SCHEMA は
+/// 不在と同じく飛ばす。D4）。照会回数は path の要素数（上限 [`MAX_SEARCH_PATH_ELEMENTS`]）以下。
+pub(crate) fn resolve_schema_functions(
+    session: &SessionState,
+    probe: &dyn Fn(&str) -> Result<bool, SqlSurfaceError>,
+) -> Result<SchemaFnValues, SqlSurfaceError> {
+    let temp_visible = !session.temp_tables().is_empty();
+    let mut explicit: Vec<String> = Vec::new();
+    for elem in session.search_path().elems() {
+        let Some(name) = expand_elem(session, elem) else {
+            continue;
+        };
+        if explicit.contains(&name) {
+            continue;
+        }
+        let exists = match name.as_str() {
+            PUBLIC | "pg_catalog" | "information_schema" => true,
+            "pg_temp" => temp_visible,
+            _ => probe(&name)?,
+        };
+        if exists {
+            explicit.push(name);
+        }
+    }
+    Ok(SchemaFnValues {
+        explicit,
+        temp_visible,
+    })
+}
+
+/// `current_schema` 系の束縛へ値を渡すモード。
+#[derive(Debug, Clone)]
+pub(crate) enum SchemaFnMode {
+    /// 実行用（probe 済みの値）。
+    Values(SchemaFnValues),
+    /// Describe 用（型だけ公告する。カタログを引かない）。
+    TypesOnly,
+}
+
+thread_local! {
+    static SCHEMA_FN: std::cell::RefCell<Option<SchemaFnMode>> =
+        const { std::cell::RefCell::new(None) };
+}
+
+/// `current_schema` 系の値を現スレッドの束縛へ渡す RAII ガード。`core.rs` の FROM なし定数
+/// SELECT の 2 つの腕（実行・Describe）だけが張る。スコープの無い文脈（FROM あり SELECT・
+/// INSERT・DEFAULT・CHECK・索引・ビュー本文等）では束縛が `0A000` で拒否する（fail-closed）。
+/// drop で直前の値へ戻す（panic でも他文脈へ漏れない）。
+pub(crate) struct SchemaFnScope {
+    prev: Option<SchemaFnMode>,
+}
+
+impl SchemaFnScope {
+    pub(crate) fn enter(mode: SchemaFnMode) -> Self {
+        let prev = SCHEMA_FN.with(|c| c.replace(Some(mode)));
+        SchemaFnScope { prev }
+    }
+}
+
+impl Drop for SchemaFnScope {
+    fn drop(&mut self) {
+        let prev = self.prev.take();
+        SCHEMA_FN.with(|c| c.replace(prev));
+    }
+}
+
+/// 現スレッドのスコープのモード（無ければ `None`）。
+pub(crate) fn current_schema_fn_mode() -> Option<SchemaFnMode> {
+    SCHEMA_FN.with(|c| c.borrow().clone())
 }
 
 #[cfg(test)]

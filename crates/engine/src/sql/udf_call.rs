@@ -2091,6 +2091,10 @@ fn is_reserved_function_name(name: &str) -> bool {
             // `setval`／`lastval`（TABLE-24・Issue #1691）は単独の `SELECT` 形としてだけ解釈される。
             | "SETVAL"
             | "LASTVAL"
+            // `current_schema`／`current_schemas`（TABLE-27 (7)・Issue #1718）は FROM なし SELECT の
+            // 専用束縛。同名の UDF を許すと呼び出せない定義が登録できてしまう（互換性変更）。
+            | "CURRENT_SCHEMA"
+            | "CURRENT_SCHEMAS"
     ) || is_builtin_function_name(name)
         || crate::sql::allowlist::is_aggregate_function_name(name)
 }
@@ -3338,6 +3342,15 @@ pub(crate) fn expr_result_column_type(
     if let Expr::Cast { ty, .. } = expr {
         return ty.result_column_type();
     }
+    // `current_schemas(..)` は NULL でも `text[]` を公告する（TABLE-27 (7)・Issue #1718）。
+    if matches!(expr, Expr::Call { name, .. } if name.eq_ignore_ascii_case("current_schemas")) {
+        return crate::catalog::ArrayType::new(
+            crate::catalog::ArrayElemType::Text,
+            crate::catalog::MAX_ARRAY_ELEMENTS,
+        )
+        .ok()
+        .map(ColumnType::Array);
+    }
     // `jsonb_array_length` は int4（PostgreSQL と同じ。Issue #1599）。
     if matches!(
         bound,
@@ -3905,6 +3918,14 @@ pub(super) fn bind_expr_any(
                     ));
                 }
                 return Ok((bound.clone(), *ty));
+            }
+            // 裸の `current_schema`（Rails 等が送る括弧なし形）。列を持たない FROM なし SELECT の
+            // 束縛（`env.schema` なし）かつスコープがあるときだけ関数呼び出しと同じに扱う。
+            if env.schema.is_none()
+                && name.eq_ignore_ascii_case("current_schema")
+                && crate::sql::search_path::current_schema_fn_mode().is_some()
+            {
+                return bind_schema_fn("current_schema", &[]);
             }
             let schema = env.schema.ok_or_else(|| {
                 SqlSurfaceError::invalid_input(format!(
@@ -5821,6 +5842,92 @@ fn wrap_date_to_timestamp(e: BoundExpr) -> BoundExpr {
     }
 }
 
+/// `current_schema`／`current_schemas`（TABLE-27 (7)・Issue #1718）の名前か（小文字化済みの名前）。
+pub(crate) fn is_schema_fn_name(lower: &str) -> bool {
+    matches!(lower, "current_schema" | "current_schemas")
+}
+
+/// `current_schema` 系の固定拒否文言（スコープの無い文脈。入力を反射しない）。
+fn schema_fn_unsupported() -> SqlSurfaceError {
+    SqlSurfaceError::FeatureNotSupported {
+        detail: "current_schema() is only supported in a SELECT without FROM".to_string(),
+    }
+}
+
+/// `current_schemas` の引数（真偽の定数）を束縛時に評価する。`Ok(None)` は `NULL`（strict で
+/// 結果も `NULL`）。真偽以外の型は `42883`、定数でない式は `0A000`（固定文言）。
+fn schema_fn_bool_arg(arg: &Expr) -> Result<Option<bool>, SqlSurfaceError> {
+    let no_such = || SqlSurfaceError::undefined_function("function current_schemas does not exist");
+    let parse = |s: &str| match s.to_ascii_lowercase().as_str() {
+        "true" | "t" => Some(true),
+        "false" | "f" => Some(false),
+        _ => None,
+    };
+    match arg {
+        Expr::Null => Ok(None),
+        // 拡張クエリの Bind は真偽の `$n` を `Ident("true"/"false")` へ置き換える。
+        Expr::Ident(n) if n.eq_ignore_ascii_case("null") => Ok(None),
+        Expr::Ident(n) => parse(n).map(Some).ok_or_else(schema_fn_unsupported),
+        Expr::Cast {
+            expr,
+            ty: crate::sql::cast::CastType::Bool,
+        } => match &**expr {
+            Expr::String(s) => parse(s).map(Some).ok_or_else(no_such),
+            Expr::Null => Ok(None),
+            _ => Err(schema_fn_unsupported()),
+        },
+        Expr::Number(_) | Expr::String(_) => Err(no_such()),
+        _ => Err(schema_fn_unsupported()),
+    }
+}
+
+/// `current_schema()`／`current_schemas(bool)` を束縛時に確定した定数へ解決する。値は
+/// [`crate::sql::search_path::SchemaFnScope`]（FROM なし SELECT の実行腕が probe 済みの値を張る）
+/// から読み、スコープが無い文脈は `0A000` で拒否する（fail-closed）。Describe 用の
+/// `TypesOnly` は型だけを公告する（値は実行されない）。
+fn bind_schema_fn(
+    lower_name: &str,
+    args: &[Expr],
+) -> Result<(BoundExpr, ExprType), SqlSurfaceError> {
+    use crate::sql::search_path::{current_schema_fn_mode, SchemaFnMode};
+    let is_one = lower_name == "current_schemas";
+    if args.len() != usize::from(is_one) {
+        return Err(SqlSurfaceError::undefined_function(format!(
+            "function {lower_name} expects {} argument(s), got {}",
+            usize::from(is_one),
+            args.len()
+        )));
+    }
+    let mode = current_schema_fn_mode().ok_or_else(schema_fn_unsupported)?;
+    if !is_one {
+        return Ok(match mode {
+            SchemaFnMode::TypesOnly => (BoundExpr::Text(String::new()), ExprType::Text),
+            SchemaFnMode::Values(v) => match v.current() {
+                Some(n) => (BoundExpr::Text(n.to_string()), ExprType::Text),
+                None => (BoundExpr::Null, ExprType::Text),
+            },
+        });
+    }
+    let include_implicit = match args.first() {
+        Some(a) => schema_fn_bool_arg(a)?,
+        None => None,
+    };
+    let items = match (mode, include_implicit) {
+        (_, None) => return Ok((BoundExpr::Null, ExprType::Array)),
+        (SchemaFnMode::TypesOnly, Some(_)) => Vec::new(),
+        (SchemaFnMode::Values(v), Some(b)) => {
+            v.schemas(b).into_iter().map(BoundExpr::Text).collect()
+        }
+    };
+    Ok((
+        BoundExpr::ArrayConstructor {
+            elem: crate::catalog::ArrayElemType::Text,
+            items,
+        },
+        ExprType::Array,
+    ))
+}
+
 fn bind_call(
     name: &str,
     args: &[Expr],
@@ -5847,6 +5954,9 @@ fn bind_call(
         return Err(SqlSurfaceError::FeatureNotSupported {
             detail: "setval and lastval are not supported in this context".to_string(),
         });
+    }
+    if is_schema_fn_name(&lower_name) {
+        return bind_schema_fn(&lower_name, args);
     }
     if crate::sql::json_fn::is_json_fn_name(&lower_name) {
         return crate::sql::json_fn::bind_json_fn(&lower_name, args, env, node_budget);

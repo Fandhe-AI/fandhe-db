@@ -166,6 +166,8 @@ fn reject_non_constant_with(expr: &Expr, allow_placeholders: bool) -> Result<(),
             Ok(())
         }
         Expr::Ident(n) if allow_placeholders && aggregate_placeholder_index(n).is_some() => Ok(()),
+        // 裸の `current_schema`（TABLE-27 (7)・Issue #1718）は列参照ではなく値関数。
+        Expr::Ident(n) if n.eq_ignore_ascii_case("current_schema") => Ok(()),
         Expr::Ident(_) => Err(SqlSurfaceError::ColumnReferenceWithoutFrom),
         Expr::Call { name, args } => {
             // 集計項目はトップレベルのみ構文段が受理し、束縛段は引数だけをこの検査へ
@@ -181,8 +183,20 @@ fn reject_non_constant_with(expr: &Expr, allow_placeholders: bool) -> Result<(),
             if name.eq_ignore_ascii_case("set_config") {
                 return Err(SqlSurfaceError::unsupported("set_config is not supported"));
             }
-            args.iter()
-                .try_for_each(|a| reject_non_constant_with(a, allow_placeholders))
+            // `current_schemas(true|false)` の真偽リテラル（`Ident` として解析される）は列参照ではない
+            // （TABLE-27 (7)・Issue #1718）。束縛段（`udf_call::schema_fn_bool_arg`）が定数として読む。
+            let is_schema_fn = name.eq_ignore_ascii_case("current_schemas");
+            args.iter().try_for_each(|a| match a {
+                Expr::Ident(n)
+                    if is_schema_fn
+                        && (n.eq_ignore_ascii_case("true")
+                            || n.eq_ignore_ascii_case("false")
+                            || n.eq_ignore_ascii_case("null")) =>
+                {
+                    Ok(())
+                }
+                _ => reject_non_constant_with(a, allow_placeholders),
+            })
         }
         Expr::Binary { lhs, rhs, .. } | Expr::JsonAccess { lhs, rhs, .. } => {
             reject_non_constant_with(lhs, allow_placeholders)?;
@@ -206,6 +220,81 @@ fn reject_non_constant_with(expr: &Expr, allow_placeholders: bool) -> Result<(),
             reject_non_constant_with(rhs, allow_placeholders)
         }
     }
+}
+
+/// 式木に `current_schema`／`current_schemas`（関数形・裸の `current_schema`）を含むか
+/// （TABLE-27 (7)・Issue #1718）。`Expr` の全 variant を網羅し `_ =>` を置かない。
+/// 呼び出し元は `core.rs` の FROM なし SELECT の実行腕で、含まない文では SCHEMA の照会
+/// （probe）を一切行わないための判定に使う。
+fn expr_uses_schema_fn(expr: &Expr) -> bool {
+    match expr {
+        Expr::Number(_)
+        | Expr::String(_)
+        | Expr::Null
+        | Expr::DateLiteral(_)
+        | Expr::TimestampLiteral(_)
+        | Expr::IntervalLiteral(_)
+        | Expr::TimeLiteral(_)
+        | Expr::TimestampTzLiteral { .. }
+        | Expr::ValueFunction { .. } => false,
+        Expr::Collate { expr, .. } | Expr::Cast { expr, .. } => expr_uses_schema_fn(expr),
+        Expr::ArrayConstructor(_) | Expr::Subscript { .. } | Expr::Quantified { .. } => expr
+            .array_expr_children()
+            .into_iter()
+            .flatten()
+            .any(expr_uses_schema_fn),
+        Expr::SqlJsonQuery(q) => {
+            expr_uses_schema_fn(&q.context)
+                || expr_uses_schema_fn(&q.path)
+                || q.passing.iter().any(|(_, e)| expr_uses_schema_fn(e))
+                || [&q.on_empty, &q.on_error].into_iter().flatten().any(|b| {
+                    matches!(
+                        b,
+                        crate::sql::udf_call::SqlJsonBehavior::Default(e) if expr_uses_schema_fn(e)
+                    )
+                })
+        }
+        Expr::Ident(n) => n.eq_ignore_ascii_case("current_schema"),
+        Expr::Call { name, args } => {
+            crate::sql::udf_call::is_schema_fn_name(&name.to_ascii_lowercase())
+                || args.iter().any(expr_uses_schema_fn)
+        }
+        Expr::Binary { lhs, rhs, .. } | Expr::JsonAccess { lhs, rhs, .. } => {
+            expr_uses_schema_fn(lhs) || expr_uses_schema_fn(rhs)
+        }
+        Expr::Case { whens, else_result } => {
+            whens
+                .iter()
+                .any(|(c, r)| expr_uses_schema_fn(c) || expr_uses_schema_fn(r))
+                || else_result.as_deref().is_some_and(expr_uses_schema_fn)
+        }
+        Expr::Coalesce(args) => args.iter().any(expr_uses_schema_fn),
+        Expr::NullIf(lhs, rhs) => expr_uses_schema_fn(lhs) || expr_uses_schema_fn(rhs),
+    }
+}
+
+/// 検証済みの FROM なし SELECT が `current_schema` 系を含むか（投影・集計引数・`WHERE`・`HAVING`）。
+pub(crate) fn uses_schema_fn(validated: &ValidatedConstSelect) -> bool {
+    let item_uses = validated.items().iter().any(|i| match i.aggregate() {
+        Some(agg) => match &agg.arg {
+            AggregateArg::Star => false,
+            AggregateArg::Expr(e) => expr_uses_schema_fn(e),
+        },
+        None => expr_uses_schema_fn(i.expr()),
+    });
+    let cond_uses = |c: &ConstSelectCondition| match c {
+        ConstSelectCondition::Expr(e) => expr_uses_schema_fn(e),
+        ConstSelectCondition::Bool(_) | ConstSelectCondition::Null => false,
+    };
+    item_uses
+        || validated.where_clause().is_some_and(cond_uses)
+        || validated.having().is_some_and(|h| {
+            cond_uses(h.condition())
+                || h.aggregates().iter().any(|a| match &a.arg {
+                    AggregateArg::Star => false,
+                    AggregateArg::Expr(e) => expr_uses_schema_fn(e),
+                })
+        })
 }
 
 /// 数値リテラルを PostgreSQL 同様の型（`integer` → `bigint` → `numeric`）で定数化する。
@@ -254,6 +343,10 @@ fn item_name(item: &ConstSelectItem) -> String {
     }
     if let Some(agg) = item.aggregate() {
         return agg.func.default_alias().to_string();
+    }
+    // 裸の `current_schema` の列名は PostgreSQL と同じ `current_schema`（Issue #1718）。
+    if matches!(item.expr(), Expr::Ident(n) if n.eq_ignore_ascii_case("current_schema")) {
+        return "current_schema".to_string();
     }
     crate::sql::parser::default_expr_alias(item.expr())
 }
