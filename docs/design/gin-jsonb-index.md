@@ -394,3 +394,59 @@ INDEX-8 ポインタ（関連: INDEX-7・TABLE-12・TABLE-16・RLS-9・RLS-10・
 
 集計・`GROUP BY`・`ORDER BY` 付き scan・ウィンドウ・検索 SELECT（ハイブリッド）・UPDATE／DELETE の WHERE への適用、
 複数索引の交差、`jsonb_ops` での `@?`／`@@`、許可形より広い jsonpath、CLI の上限フラグ、crash テストと越境マトリクス（#2209）。
+
+## 10. Issue #2209 実装記録（越境マトリクスと crash 耐性）
+
+本 Issue はテスト・crash ハーネス・CI 配線だけを追加し、engine 本体と公開 API は変更しない。ポインタ: INDEX-8
+（関連: TABLE-12・RLS-9・RLS-10・PERSIST-1・SQL-27）。
+
+### 10.1 越境マトリクス（`crates/engine/tests/rls10_gin_index_paths.rs`）
+
+閲覧テナント 3 つ（tenant-a/b/c を順に閲覧側にする）× 可視性 2 モード（Public のみ／Public＋Private）×
+実行経路 2 つ（autocommit／`BEGIN` … `COMMIT`）× 演算子（`@>`・`?`・`?|`・`?&`・`@@`・`@?`・所有者トークンの
+`@>`）で、共有索引テーブル経由の越境が無いことを固定する。オラクル側では production の可視性判定を呼ばない。
+
+| 項目 | 内容 |
+| ---- | ---- |
+| T0 | EXPLAIN が `index_gin`／`gin_index_candidates` を示す（索引経路を実際に通る）。期待集合が空でない組み合わせの下限を固定 |
+| T1 | 結果が GIN なしの双子表 `p` とバイト単位で一致し、テスト側の真実値（自テナントの行＋他テナントの Public 行）とも一致 |
+| T2 | 他 2 テナントが同じキー・同じ id の Private 行を足しても、閲覧側の応答・EXPLAIN・事後状態・監査結果が不変（flood 不変性） |
+| T3 | 閲覧側の INSERT・UPDATE・DELETE・UPSERT・TRUNCATE の前後で、他テナントの行と監査結果が不変 |
+| T4 | `RENAME COLUMN` の後に 1 テナントだけ書き込み、マーカーが有効・無効の混在する状態でも結果が `p` と一致（D9 の縮退経路） |
+| T5 | 他テナントの UPDATE・DELETE（Public 行を含む）の後に、閲覧側へ旧値が現れない（stale ポスティング） |
+| T6 | 自テナントの範囲へ他テナントの行・存在しない行を指す偽装ポスティングを raw redb で差し込んでも、結果は `p` と一致（`user_gin/` 接頭辞でテーブルを列挙し、内部名を決め打ちしない） |
+| T7 | 共有 DDL（`CREATE INDEX`）の `54000` が他テナントの行に起因しても、文面は自分の行が原因の場合とバイト単位で同一で、テナント・値を含まない。書き込み時の `54000` は他テナントの状態で応答が変わらない |
+| T8 | 試行総数（3×2×2×9）の固定と、捏造した違反を検査器が検出する負の対照 |
+
+Public 行は Rust の行 API でしか作れない（SQL の INSERT は Private 固定）ため、フィクスチャは従来方式の表に
+`insert_typed_row` で seed し、索引は後から宣言する（`CREATE INDEX` の初回構築が全テナントを対象にする）。
+
+### 10.2 crash 耐性（`crates/engine/examples/crash_tool_gin_index.rs`・`scripts/crash_test_gin_index.sh`）
+
+D11 の決定どおり、一意索引・採番状態の crash ツールと同型の専用ツール＋スクリプト＋独立 CI ジョブ
+（`crash-test-gin-index`）とした。
+
+- `write dml`: 3 テナントを交互に、1 バッチ 1 明示 txn（5 行 INSERT → 先頭行 UPDATE → 2 行目 DELETE → `COMMIT`）で
+  `g`（`g_ops`・`g_path` を宣言）と双子表 `p` へ書き続ける。`COMMITTED` を開始同期点とする
+- `write ddl`: 3 テナント各 300 行を入れた表で `DROP INDEX` → `CREATE INDEX`（同期構築の 1 txn）を繰り返し、
+  構築・破棄の途中の kill を狙う
+- `verify`: `g` と `p` の行集合の一致、行を持つ全テナント × 宣言済み全索引の `verify_gin_index_read_only` が
+  `marker_valid && missing == 0 && stale == 0`（§8.5 の診断 API を crash オラクルに使う）、演算子ごとの固定クエリの
+  `g`／`p` 一致と他テナント行の不在、`ddl` では宣言と物理テーブル `user_gin/<名前>` の原子性
+- `self-check`: 小さな 2 テナントの DB で片方のテナントのポスティングを raw redb で全削除し、監査と読み取りの
+  オラクルが欠落を検出すること、他テナントの監査が clean のままであること（監査がテナント単位）を確かめる
+- スクリプトは奇数セットが `dml`、偶数セットが `ddl`。既定はセット数 4・反復回数 10（手元の実測は約 11 秒）。
+  `write.log` の最終 `COMMITTED` の行数を下回れば data loss として失敗する
+
+### 10.3 要確認（自動運転下の判断で、人間の確認が要る事項）
+
+- ruleset の必須チェックへ `crash-test-gin-index` を登録するのはオーナー作業（登録までは必須として扱われない）。
+  必須チェック名の表（`.claude/rules/github-actions.md`）には追記済み
+- T7 は、`CREATE INDEX` の `54000` が他テナントのデータに起因しうる（1 ビットの観測差）ことを、D10 が許容した
+  挙動として固定する。許容の見直しは設計判断
+- crash の既定セット数と反復回数（時間予算の見込みから決めた値）
+
+### 10.4 対象外
+
+NoSQL 表層（フィルタ構文に jsonb の包含・キー存在演算子が無く、GIN の読み取り経路に到達しない）、pg wire 経由の
+越境（SQL は engine の同じ入口を通るため結合テストで代表させた）、GIN の適用範囲外の経路（§9.6）、CLI の上限フラグ。
