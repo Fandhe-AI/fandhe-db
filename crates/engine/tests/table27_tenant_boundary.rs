@@ -112,6 +112,28 @@ fn query_ids(o: &SqlOutcome) -> BTreeSet<u64> {
     }
 }
 
+/// 結果の `(id, v)` 組を並べ替えて返す（重複行も保持する。先頭 2 列が整数であること）。
+fn query_pairs(o: &SqlOutcome) -> Vec<(u64, u64)> {
+    match o {
+        SqlOutcome::Query(r) => {
+            let mut v: Vec<(u64, u64)> = r
+                .rows
+                .iter()
+                .map(|row| (cell_u64(&row.cells[0]), cell_u64(&row.cells[1])))
+                .collect();
+            v.sort_unstable();
+            v
+        }
+        other => panic!("expected Query, got {other:?}"),
+    }
+}
+
+fn pairs_of(rows: &[Truth]) -> Vec<(u64, u64)> {
+    let mut v: Vec<(u64, u64)> = rows.iter().map(|t| (t.id, t.v)).collect();
+    v.sort_unstable();
+    v
+}
+
 fn count_of(o: &SqlOutcome) -> u64 {
     match o {
         SqlOutcome::Query(r) => cell_u64(&r.rows[0].cells[0]),
@@ -283,6 +305,9 @@ fn t1_explicit_transaction_responses_match_a_world_without_the_schema() {
         // 失敗後の文は中断済みトランザクションとして拒否される（25P02）か、文自体が
         // トランザクション内で未対応として拒否される。どちらでも成功してはならない。
         assert!(chains[0][1].starts_with("ERR"), "{sql}: {:?}", chains[0]);
+        // 失敗後の後続 SELECT も拒否され（fail-closed）、ROLLBACK は成功して状態を解く。
+        assert!(chains[0][2].starts_with("ERR"), "{sql}: {:?}", chains[0]);
+        assert!(chains[0][3].starts_with("OK"), "{sql}: {:?}", chains[0]);
         trials += 1;
     }
     assert_eq!(trials, MUST_FAIL.len(), "trial count drifted");
@@ -660,62 +685,72 @@ fn seed_matrix(core: &EngineCore) -> Vec<Truth> {
     truths
 }
 
-/// 参照形ごとの SQL とオラクル。`(説明, SQL, 期待 id 集合)`。
-fn read_forms(
-    truths: &[Truth],
-    viewer: usize,
-    private: bool,
-) -> Vec<(String, String, BTreeSet<u64>)> {
+/// 参照形ごとの SQL とオラクル。`(説明, SQL, 期待 (id, v) 組の並べ替え済み列)`。
+/// id は全テナントで同じ 1〜3 を持つため、テナント固有の v も比較して他テナントの行への取り違えと重複行を検出する。
+type Form = (String, String, Vec<(u64, u64)>);
+
+fn read_forms(truths: &[Truth], viewer: usize, private: bool) -> Vec<Form> {
     let pubs = expected(truths, viewer, private, Table::Public);
     let schs = expected(truths, viewer, private, Table::Schema);
-    let pv: BTreeSet<u64> = pubs.iter().map(|t| t.v).collect();
-    let sv: BTreeSet<u64> = schs.iter().map(|t| t.v).collect();
-    let join_ids: BTreeSet<u64> = schs
+    let mut join: Vec<(u64, u64)> = Vec::new();
+    for a in &schs {
+        for b in &pubs {
+            if a.v == b.v {
+                join.push((a.id, a.v));
+            }
+        }
+    }
+    join.sort_unstable();
+    let in_sub: Vec<Truth> = schs
         .iter()
-        .filter(|t| pv.contains(&t.v))
-        .map(|t| t.id)
+        .filter(|a| pubs.iter().any(|b| b.v == a.v))
+        .cloned()
         .collect();
-    let _ = sv;
-    let union: BTreeSet<u64> = id_set(&schs).union(&id_set(&pubs)).copied().collect();
-    let mut out = Vec::new();
+    let mut union = pairs_of(&schs);
+    union.extend(pairs_of(&pubs));
+    union.sort_unstable();
+    union.dedup();
+    let mut out: Vec<Form> = Vec::new();
     for (name, q, set) in [
-        ("public.t", "public.t", id_set(&pubs)),
-        ("s.t", "s.t", id_set(&schs)),
+        ("public.t", "public.t", pairs_of(&pubs)),
+        ("s.t", "s.t", pairs_of(&schs)),
     ] {
         out.push((
             format!("{name} all"),
-            format!("SELECT id FROM {q} LIMIT 1000"),
+            format!("SELECT id, v FROM {q} LIMIT 1000"),
             set.clone(),
         ));
         out.push((
             format!("{name} indexed"),
-            format!("SELECT id FROM {q} WHERE v >= 0 LIMIT 1000"),
+            format!("SELECT id, v FROM {q} WHERE v >= 0 LIMIT 1000"),
             set.clone(),
         ));
         out.push((
             format!("{name} exists"),
-            format!("SELECT id FROM {q} WHERE EXISTS (SELECT id FROM {q} LIMIT 1000) LIMIT 1000"),
+            format!(
+                "SELECT id, v FROM {q} WHERE EXISTS (SELECT id FROM {q} LIMIT 1000) LIMIT 1000"
+            ),
             set,
         ));
     }
     out.push((
         "s.vw".into(),
-        "SELECT id FROM s.vw LIMIT 1000".into(),
-        id_set(&schs),
+        "SELECT id, v FROM s.vw LIMIT 1000".into(),
+        pairs_of(&schs),
     ));
     out.push((
         "join".into(),
-        "SELECT a.id FROM s.t a JOIN public.t b ON a.v = b.v LIMIT 1000".into(),
-        join_ids.clone(),
+        "SELECT a.id, a.v FROM s.t a JOIN public.t b ON a.v = b.v LIMIT 1000".into(),
+        join,
     ));
     out.push((
         "in-subquery".into(),
-        "SELECT id FROM s.t WHERE v IN (SELECT v FROM public.t LIMIT 1000) LIMIT 1000".into(),
-        join_ids,
+        "SELECT id, v FROM s.t WHERE v IN (SELECT v FROM public.t LIMIT 1000) LIMIT 1000".into(),
+        pairs_of(&in_sub),
     ));
     out.push((
         "union".into(),
-        "SELECT id FROM s.t UNION SELECT id FROM public.t".into(),
+        "SELECT id, v FROM s.t UNION SELECT id, v FROM public.t".into(),
         union,
     ));
     out
@@ -731,7 +766,7 @@ fn t0_t3_reads_through_every_reference_form_match_the_independent_oracle() {
         for private in [false, true] {
             let mut s = session(tenant);
             for (name, sql, want) in read_forms(&truths, viewer, private) {
-                let got = query_ids(&ok_mode(&core, tenant, private, &mut s, &sql));
+                let got = query_pairs(&ok_mode(&core, tenant, private, &mut s, &sql));
                 assert_eq!(got, want, "{tenant} private={private} {name}: {sql}");
                 if !want.is_empty() {
                     nonempty += 1;
@@ -763,15 +798,15 @@ fn t0_t3_reads_through_every_reference_form_match_the_independent_oracle() {
                 &mut s,
                 "SET search_path = s, public",
             );
-            let got = query_ids(&ok_mode(
+            let got = query_pairs(&ok_mode(
                 &core,
                 tenant,
                 private,
                 &mut s,
-                "SELECT id FROM t LIMIT 1000",
+                "SELECT id, v FROM t LIMIT 1000",
             ));
-            let want = id_set(&expected(&truths, viewer, private, Table::Public));
-            let sch = id_set(&expected(&truths, viewer, private, Table::Schema));
+            let want = pairs_of(&expected(&truths, viewer, private, Table::Public));
+            let sch = pairs_of(&expected(&truths, viewer, private, Table::Schema));
             assert!(
                 got == want || got == sch,
                 "{tenant} private={private} search_path form: got {got:?}, public {want:?}, schema {sch:?}"
@@ -1072,7 +1107,19 @@ fn t6_same_named_objects_in_same_named_schemas_do_not_collide() {
             s,
             "SELECT id, s.f(id) AS d FROM s.t ORDER BY id LIMIT 10",
         );
-        assert!(matches!(o, SqlOutcome::Query(ref r) if r.rows.len() == 1));
+        // 同名 UDF は自テナントの係数 i + 2 で評価される（他テナントの関数へ誤解決しない）。
+        match &o {
+            SqlOutcome::Query(r) => {
+                assert_eq!(r.rows.len(), 1);
+                assert_eq!(cell_u64(&r.rows[0].cells[0]), 1);
+                assert_eq!(
+                    r.rows[0].cells[1],
+                    Cell::Float((i + 2) as f64),
+                    "s.f of {i}"
+                );
+            }
+            other => panic!("expected Query, got {other:?}"),
+        }
         // UNIQUE 制約は各テナントで独立に効いている（自分の重複は拒否、他テナントの値とは無関係）。
         let dup = run(
             &core,
