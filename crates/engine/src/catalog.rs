@@ -7932,7 +7932,10 @@ impl TableSchema {
         target: &crate::tenant::UpsertTarget<'_>,
     ) -> Result<()> {
         match target {
-            crate::tenant::UpsertTarget::Unique(_) => Ok(()),
+            // 対象省略（SQL-49、Issue #1736）は UNIQUE 対象と同じく行キー指定ではない。
+            crate::tenant::UpsertTarget::Unique(_) | crate::tenant::UpsertTarget::AnyUnique => {
+                Ok(())
+            }
             crate::tenant::UpsertTarget::RowId => self.require_legacy_row_identity(),
         }
     }
