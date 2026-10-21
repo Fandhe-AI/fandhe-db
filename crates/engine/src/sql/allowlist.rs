@@ -3537,20 +3537,23 @@ pub enum OnConflictAction {
 /// （`ValidatedStatement` の一般契約と同じ「構造検証はここまで」の分担）。
 #[derive(Debug, Clone, PartialEq)]
 pub struct OnConflictClause {
-    /// 衝突対象の書き方（列リスト形または制約名形）。
+    /// 衝突対象の書き方（列リスト形・制約名形・省略形）。
     pub target: ConflictTargetSpec,
     pub action: OnConflictAction,
 }
 
 /// `ON CONFLICT` の衝突対象の構文表現（SQL-49、Issue #1737）。構文段階では書かれた
 /// 形のみを保持し、スキーマ照合は `sql::parser::resolve_conflict_target` の責務とする。
-/// 対象省略形（Issue #1736）は本 enum への variant 追加で対応できる構造にしてある。
+///
 #[derive(Debug, Clone, PartialEq)]
 pub enum ConflictTargetSpec {
     /// `ON CONFLICT (<col>[, <col>]*)`。列名の宣言順（列数上限・重複列名は構文段で検査済み）。
     Columns(Vec<String>),
     /// `ON CONFLICT ON CONSTRAINT <name>`。名前解決は束縛時にカタログのスキーマで行う。
     Constraint(String),
+    /// 対象省略（`ON CONFLICT DO NOTHING`、Issue #1736）。`DO NOTHING` 専用で、
+    /// どの一意性違反でも該当行だけを飛ばす。`DO UPDATE` との組は構文段階で `42601`。
+    Omitted,
 }
 
 /// 許可形状の構造判定を通過した INSERT 文（SQL-10・SQL-16、TASK-80・TASK-190）。
@@ -9498,12 +9501,28 @@ impl<'a> Parser<'a> {
     /// 空の対象リスト（`ON CONFLICT ()`）は未対応のまま `42601`
     /// （対象外・申し送り: Issue #1074 §8）。`ON CONSTRAINT` の名前解決
     /// （不在 `42704`・CHECK/FK 名 `42809`）は `sql::parser::resolve_conflict_target`。
+    /// 対象省略の `ON CONFLICT DO NOTHING` は [`ConflictTargetSpec::Omitted`] として受理し、
+    /// 省略 + `DO UPDATE` は `42601`（SQL-49、Issue #1736）。
     fn parse_on_conflict_clause(&mut self) -> Result<Option<OnConflictClause>, SqlSurfaceError> {
         if !self.peek_contextual_keyword("ON") {
             return Ok(None);
         }
         self.advance();
         self.expect_contextual_keyword("CONFLICT")?;
+        // 対象省略（SQL-49、Issue #1736）: `CONFLICT` の直後が `DO` なら列リストを
+        // 持たない形。`()` はここへは入らず従来どおり拒否される。
+        if self.peek_contextual_keyword("DO") {
+            self.advance();
+            self.expect_contextual_keyword("NOTHING").map_err(|_| {
+                SqlSurfaceError::unsupported(
+                    "ON CONFLICT DO UPDATE requires inference specification or constraint name",
+                )
+            })?;
+            return Ok(Some(OnConflictClause {
+                target: ConflictTargetSpec::Omitted,
+                action: OnConflictAction::DoNothing,
+            }));
+        }
         let target = if self.peek_contextual_keyword("ON") {
             // `ON CONSTRAINT <name>` 形（SQL-49、Issue #1737）。名前解決は束縛時。
             self.advance();
@@ -23095,16 +23114,38 @@ mod tests {
     }
 
     #[test]
-    fn rejects_upsert_missing_target_column_list() {
+    fn accepts_upsert_omitted_target_do_nothing() {
+        // SQL-49（Issue #1736）: 対象省略の `DO NOTHING` は構文段階で受理する。
         let lookup = catalog_with(&["documents"]);
-        let err = validate_insert(
+        let stmt = validate_insert(
             "INSERT INTO documents (id) VALUES (1) ON CONFLICT DO NOTHING \
              USING OPERATION_ID 'op-upsert-4'",
             &lookup,
             LedgerMode::Ledgered,
         )
-        .unwrap_err();
-        assert_eq!(err.wire_code(), "42601");
+        .unwrap();
+        assert_eq!(
+            stmt.on_conflict,
+            Some(OnConflictClause {
+                target: ConflictTargetSpec::Omitted,
+                action: OnConflictAction::DoNothing,
+            })
+        );
+    }
+
+    #[test]
+    fn rejects_upsert_omitted_target_do_update_and_other_target_forms() {
+        // 対象省略の `DO UPDATE`・空の列リストは 42601（`ON CONSTRAINT` は Issue #1737 で受理）（SQL-49）。
+        let lookup = catalog_with(&["documents"]);
+        for sql in [
+            "INSERT INTO documents (id) VALUES (1) ON CONFLICT DO UPDATE SET lang = NULL \
+             USING OPERATION_ID 'op-a'",
+            "INSERT INTO documents (id) VALUES (1) ON CONFLICT () DO NOTHING \
+             USING OPERATION_ID 'op-c'",
+        ] {
+            let err = validate_insert(sql, &lookup, LedgerMode::Ledgered).unwrap_err();
+            assert_eq!(err.wire_code(), "42601", "{sql}");
+        }
     }
 
     #[test]

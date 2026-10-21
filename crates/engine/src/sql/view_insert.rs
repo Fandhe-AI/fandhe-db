@@ -188,6 +188,8 @@ fn rewrite_on_conflict(
         ),
         // ビュー自身は制約を持たないため、制約名は対象リレーション上に存在しない
         // （SQL-49、Issue #1737。受理せず fail-closed の `42704`）。
+        // 対象省略（SQL-49、Issue #1736）は列名を持たないためそのまま写す。
+        ConflictTargetSpec::Omitted => ConflictTargetSpec::Omitted,
         ConflictTargetSpec::Constraint(name) => {
             return Err(SqlSurfaceError::UndefinedObject { name: name.clone() });
         }

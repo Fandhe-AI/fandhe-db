@@ -354,3 +354,62 @@ fn wire_upsert_unique_target_response_is_byte_identical_for_other_tenant_row_and
     read_command_complete(&mut bob_check);
     read_ready_for_query(&mut bob_check);
 }
+
+// --- 対象省略の ON CONFLICT DO NOTHING（SQL-49、Issue #1736） --------
+
+fn upsert_omitted_target_sql(rows: &str, returning: &str, op_id: &str) -> String {
+    format!(
+        "INSERT INTO docs (id, a) VALUES {rows} ON CONFLICT DO NOTHING {returning} \
+         USING OPERATION_ID '{op_id}'"
+    )
+}
+
+/// 対象省略の `DO NOTHING`: UNIQUE 違反の行だけを飛ばし、`INSERT 0 <挿入数>` を返す。
+#[test]
+fn wire_upsert_omitted_target_skips_only_violating_rows() {
+    let (core, _guard) = new_core_with_unique_column_table();
+    let addrs = spawn_with_users(core, &[("alice", "tenant-a", "pw-alice")]);
+    let mut stream = connect_as(addrs[0], "alice", "pw-alice");
+
+    send_simple_query(&mut stream, &insert_a_sql(1, "x", "wire-upsert-omit-seed"));
+    assert_eq!(read_command_complete(&mut stream), "INSERT 0 1");
+    read_ready_for_query(&mut stream);
+
+    // id=1 の行キー違反・a='x' の UNIQUE 違反・非衝突の 3 行。
+    send_simple_query(
+        &mut stream,
+        &upsert_omitted_target_sql("(1, 'p'), (2, 'x'), (3, 'z')", "", "wire-upsert-omit-1"),
+    );
+    assert_eq!(read_command_complete(&mut stream), "INSERT 0 1");
+    read_ready_for_query(&mut stream);
+}
+
+/// 対象省略の `RETURNING` は飛ばした行を返さない。
+#[test]
+fn wire_upsert_omitted_target_returning_excludes_skipped_rows() {
+    let (core, _guard) = new_core_with_unique_column_table();
+    let addrs = spawn_with_users(core, &[("alice", "tenant-a", "pw-alice")]);
+    let mut stream = connect_as(addrs[0], "alice", "pw-alice");
+
+    send_simple_query(
+        &mut stream,
+        &insert_a_sql(1, "x", "wire-upsert-omit-seed-r"),
+    );
+    assert_eq!(read_command_complete(&mut stream), "INSERT 0 1");
+    read_ready_for_query(&mut stream);
+
+    send_simple_query(
+        &mut stream,
+        &upsert_omitted_target_sql(
+            "(2, 'x'), (3, 'z')",
+            "RETURNING id, a",
+            "wire-upsert-omit-2",
+        ),
+    );
+    let columns = read_row_description(&mut stream);
+    assert_eq!(columns, vec!["id".to_string(), "a".to_string()]);
+    let row = read_data_row(&mut stream);
+    assert_eq!(row, vec![Some("3".to_string()), Some("z".to_string())]);
+    assert_eq!(read_command_complete(&mut stream), "INSERT 0 1");
+    read_ready_for_query(&mut stream);
+}

@@ -9,6 +9,11 @@
 
 ### Breaking Changes
 
+- 対象省略の `ON CONFLICT DO NOTHING`（Issue #1736・SQL-49）: `INSERT ... ON CONFLICT DO NOTHING` を受理し、行キー・
+  PRIMARY KEY・UNIQUE 制約・UNIQUE 索引（式・部分を含む）のどれかに違反した行だけを飛ばす（`NOT NULL`・`CHECK`・`FOREIGN KEY`
+  は従来どおりエラー）。公開 API の変更: `sql::allowlist::OnConflictClause::target` を `Vec<String>` から
+  `OnConflictTarget`（`Columns(Vec<String>)`／`Omitted`）へ変更し、`sql::parser::BoundConflictTarget` に `AnyUnique` を追加した。
+  対象省略の `DO UPDATE` は `42601`。詳細は [sql-upsert.md](docs/design/sql-upsert.md) の「Issue #1736 追記」。
 - `current_schema()`・`current_schemas()`（Issue #1718・TABLE-27 (7)）: FROM なし SELECT で `current_schema()`・
   裸の `current_schema`・`current_schemas(bool)` が `search_path` に従った値（テナントで実在する SCHEMA のみ）を返す。
   互換性の変更: UDF 名 `current_schema`・`current_schemas` を予約名にした（`CREATE FUNCTION` は拒否される）。
