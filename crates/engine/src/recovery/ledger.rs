@@ -378,6 +378,20 @@ pub(crate) fn record_in_txn_accepting(
     // 用いたトランザクション開始時刻を v3 エントリとして残す（Issue #2188・SQL-37。
     // 呼び出し元の `tenant.rs` は同一スタック上で `core.rs` のスコープ内にいる）。
     let ledger = ledger.with_evaluated_at(crate::sql::time_fn::ledger_evaluated_at());
+    // `INSERT ... SELECT`（SQL-51 (5)・Issue #1733）: 結果行の値ではなく正規化済みの文から導いた
+    // ハッシュで照合・記録する（結果が再送時に変わっても同一文は `23505`）。記録先の表が一致する
+    // ときだけ適用し、正規化方式の変遷は無いため `legacy_hashes` は使わない。
+    if let Some(stmt_hash) = crate::sql::insert_select_scope::override_hash(table) {
+        return record_core(
+            write_txn,
+            tenant_id,
+            table,
+            ledger,
+            &stmt_hash,
+            &[],
+            JobTableCheck::Enforce,
+        );
+    }
     // ビュー経由の書き込み（TABLE-43・Issue #1671）では、内容ハッシュへビュー名のドメインを被せる。
     // 同じ `operation_id` を基表へ直接再送した場合は別内容として `22023` になる。台帳のキー
     // （`table`）は基表名のまま。スコープ外のハッシュは従来とビット同一。
@@ -406,6 +420,76 @@ pub(crate) fn record_in_txn_accepting(
         legacy_hashes,
         JobTableCheck::Enforce,
     )
+}
+
+/// 既存エントリ（`stored`）と文ハッシュ `content_hash` の照合結果。呼び出し時点でエントリが
+/// 存在する前提のため、常に `Err`（一致は `Duplicate`・不一致や v1 は `ContentMismatch`）。
+fn classify_existing(stored: &[u8], content_hash: &ContentHash) -> Result<(), LedgerRecordError> {
+    match decode_entry(stored).map_err(|_| {
+        LedgerRecordError::Corrupted(StorageError::Codec(
+            "op_ledger entry has unknown format version".to_string(),
+        ))
+    })? {
+        StoredEntry::V1 => Err(LedgerRecordError::ContentMismatch),
+        StoredEntry::V2 { hash } | StoredEntry::V3 { hash, .. } => {
+            if content_hash.matches(&hash) {
+                Err(LedgerRecordError::Duplicate)
+            } else {
+                Err(LedgerRecordError::ContentMismatch)
+            }
+        }
+    }
+}
+
+/// `INSERT ... SELECT` が内側 SELECT を評価する**前**に行う台帳の事前照合（読み取り専用。SQL-51 (5)・
+/// RECOVER-10/11・Issue #1733）。既存エントリがあれば文ハッシュと照合して `Duplicate`／
+/// `ContentMismatch` を返し、無ければ `Ok`。`ledger` が記録しない種別（`Disabled`・`Omitted`）は
+/// 何も触れず `Ok`。確定的な記録は書き込み txn 内の [`record_in_txn_accepting`] が改めて行う。
+pub(crate) fn precheck_in_read_txn(
+    read_txn: &redb::ReadTransaction,
+    tenant_id: &str,
+    table: &str,
+    ledger: LedgerWrite<'_>,
+    content_hash: &ContentHash,
+) -> Result<(), LedgerRecordError> {
+    let Some(op_id) = ledger.op_id() else {
+        return Ok(());
+    };
+    let ledger_table = match read_txn.open_table(OP_LEDGER_TABLE) {
+        Ok(t) => t,
+        Err(redb::TableError::TableDoesNotExist(_)) => return Ok(()),
+        Err(e) => return Err(LedgerRecordError::from(e)),
+    };
+    match ledger_table.get((tenant_id, table, op_id.as_str()))? {
+        Some(guard) => classify_existing(guard.value(), content_hash),
+        None => Ok(()),
+    }
+}
+
+/// [`precheck_in_read_txn`] の書き込み txn 版（明示トランザクションの共有 write txn 用）。台帳
+/// テーブルが無ければ（`open_table` の自動作成を避けるため）何もせず `Ok`。
+pub(crate) fn precheck_in_write_txn(
+    write_txn: &redb::WriteTransaction,
+    tenant_id: &str,
+    table: &str,
+    ledger: LedgerWrite<'_>,
+    content_hash: &ContentHash,
+) -> Result<(), LedgerRecordError> {
+    let Some(op_id) = ledger.op_id() else {
+        return Ok(());
+    };
+    let exists = write_txn
+        .list_tables()?
+        .any(|handle| handle.name() == OP_LEDGER_TABLE.name());
+    if !exists {
+        return Ok(());
+    }
+    let ledger_table = write_txn.open_table(OP_LEDGER_TABLE)?;
+    let result = match ledger_table.get((tenant_id, table, op_id.as_str()))? {
+        Some(guard) => classify_existing(guard.value(), content_hash),
+        None => Ok(()),
+    };
+    result
 }
 
 /// 分割実行の完了経路（[`crate::recovery::partitioned_job::complete_in_txn`]）専用の

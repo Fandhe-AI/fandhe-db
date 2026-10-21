@@ -5146,6 +5146,67 @@ pub(crate) fn execute_insert_batch_with_schema_in(
     })
 }
 
+/// `INSERT ... SELECT` の内側 SELECT 評価**前**の台帳事前照合（SQL-51 (5)・Issue #1733）。
+/// 同じ `operation_id` の記録が既にあれば、結果行の値を見る前に文ハッシュで `23505`（同一文）
+/// または `22023`（別文）を返す。`ledger_mode` が記録しない構成・`operation_id` 省略（Optional）では
+/// 何もしない。`operation_id` 必須構成での省略は `23502` 相当の `MissingOperationId`。
+pub(crate) fn precheck_insert_select_ledger(
+    target: &crate::tenant::WriteTarget<'_>,
+    ctx: &PolicyContext,
+    table: &str,
+    operation_id: Option<&crate::recovery::required_op_id::OperationId>,
+    ledger_mode: crate::recovery::required_op_id::LedgerMode,
+    statement_hash: &crate::recovery::content_hash::ContentHash,
+) -> Result<(), SqlSurfaceError> {
+    let ledger_write = ledger_mode
+        .resolve(operation_id)
+        .map_err(|_| SqlSurfaceError::MissingOperationId)?;
+    let result = match target {
+        crate::tenant::WriteTarget::Autocommit(storage) => {
+            use redb::ReadableDatabase;
+            let read_txn = storage
+                .db()
+                .begin_read()
+                .map_err(|_| SqlSurfaceError::Internal {
+                    detail: "failed to begin read transaction".to_string(),
+                })?;
+            crate::recovery::ledger::precheck_in_read_txn(
+                &read_txn,
+                ctx.tenant_id(),
+                table,
+                ledger_write,
+                statement_hash,
+            )
+        }
+        crate::tenant::WriteTarget::InTxn(write_txn) => {
+            crate::recovery::ledger::precheck_in_write_txn(
+                write_txn,
+                ctx.tenant_id(),
+                table,
+                ledger_write,
+                statement_hash,
+            )
+        }
+    };
+    result.map_err(|e| map_insert_write_error(crate::tenant::TenantWriteError::from(e)))
+}
+
+/// `INSERT ... SELECT` が 0 行だったときの台帳だけの記録（SQL-51 (5)・Issue #1733）。
+pub(crate) fn record_insert_select_ledger_only(
+    target: crate::tenant::WriteTarget<'_>,
+    ctx: &PolicyContext,
+    table: &str,
+    operation_id: Option<&crate::recovery::required_op_id::OperationId>,
+    ledger_mode: crate::recovery::required_op_id::LedgerMode,
+    statement_hash: &crate::recovery::content_hash::ContentHash,
+) -> Result<(), SqlSurfaceError> {
+    let ledger_write = ledger_mode
+        .resolve(operation_id)
+        .map_err(|_| SqlSurfaceError::MissingOperationId)?;
+    crate::tenant::record_ledger_only_unchecked(target, table, ctx, ledger_write, statement_hash)
+        .map_err(map_insert_write_error)
+}
+
 /// `id` 省略の行を受理できない経路（UPSERT）の固定文言拒否（`0A000`。設計記録 D9）。
 fn reject_id_omission_unsupported() -> SqlSurfaceError {
     SqlSurfaceError::FeatureNotSupported {
