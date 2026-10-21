@@ -34,7 +34,7 @@
 use redb::{ReadableDatabase, ReadableTable};
 
 use super::{
-    decode_schema_with_resolver, encode_schema, get_enum_type_in_read_txn, validate_identifier,
+    decode_schema_with_resolver, encode_schema, get_enum_type_in_read_txn, validate_relation_key,
     CatalogError, RowIdentity, CATALOG_TABLE,
 };
 use crate::storage::{Result, Storage, StorageError};
@@ -207,7 +207,7 @@ fn candidates_with(storage: &Storage, identity: RowIdentity) -> Result<Vec<Strin
     for entry in table.iter().map_err(|e| catalog_to_storage(e.into()))? {
         let (key, value) = entry.map_err(|e| catalog_to_storage(e.into()))?;
         let name = key.value();
-        if validate_identifier(name).is_err() {
+        if validate_relation_key(name).is_err() {
             continue;
         }
         let bytes = value.value();
@@ -394,6 +394,34 @@ mod tests {
         }
         let s = Storage::open(&path).expect("reopen");
         assert!(id_sequence_owner(&s, "old").is_some());
+    }
+
+    /// Issue #1699: SCHEMA 配下（内部キー `#<id>.<name>`）の移行済み表も、次の open が所有 SEQUENCE を
+    /// 補完する（候補抽出と割り当てが relation キーに対応していること）。
+    #[test]
+    fn open_backfills_sequence_for_schema_scoped_migrated_tables() {
+        use crate::catalog::namespace::RelationKey;
+        let path = unique_db_path("legacy-id-backfill-schema");
+        let _g = CleanupGuard(path.clone());
+        let key;
+        {
+            let s = Storage::open(&path).expect("open");
+            s.create_schema("tenant-a", "s1", false).expect("schema");
+            let sid = s.schema_id("tenant-a", "s1").expect("id").expect("some");
+            key = format!("{}t", RelationKey::schema_prefix(sid));
+            s.create_table(&legacy(&key)).expect("create");
+            assert_eq!(migrate_marks_only(&s).expect("marks"), 1);
+            assert_eq!(identity(&s, &key), RowIdentity::MigratedId);
+            assert!(id_sequence_owner(&s, &key).is_none());
+        }
+        let s = Storage::open(&path).expect("reopen");
+        let sid = s.schema_id("tenant-a", "s1").expect("id").expect("some");
+        let seq = format!("{}t_id_seq", RelationKey::schema_prefix(sid));
+        let owner = s.sequence_owner(&seq).expect("lookup").expect("owner");
+        assert_eq!(
+            (owner.table.as_str(), owner.column.as_str()),
+            (key.as_str(), "id")
+        );
     }
 
     /// Issue #1699: 無関係な SEQUENCE が 1 件壊れていても open は成功し、他の表の割り当ては続く。

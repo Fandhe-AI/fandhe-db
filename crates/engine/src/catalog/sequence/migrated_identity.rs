@@ -31,8 +31,8 @@ use redb::ReadableTable;
 
 use crate::catalog::{
     get_table_schema_in_txn_impl, map_row_table_error, user_rows_table_def, user_rows_table_name,
-    validate_identifier, CatalogError, ColumnDefault, ColumnType, IdentityKind, Result,
-    RowIdentity, Storage, TableSchema,
+    CatalogError, ColumnDefault, ColumnType, IdentityKind, Result, RowIdentity, Storage,
+    TableSchema,
 };
 use crate::row_codec::{scan_scalar_columns, ScalarRef};
 use crate::storage::read_source::ReadSource;
@@ -250,7 +250,7 @@ pub(crate) fn assign_migrated_id_identity_in_txn(
     write_txn: &redb::WriteTransaction,
     table: &str,
 ) -> Result<MigratedIdIdentityOutcome> {
-    validate_identifier(table)?;
+    validate_relation_key(table)?;
     let schema = get_table_schema_in_txn_impl(write_txn, table, true)?;
     if let Some(sequence) = check_preconditions(write_txn, &schema)? {
         return Ok(MigratedIdIdentityOutcome::AlreadyAssigned { sequence });
