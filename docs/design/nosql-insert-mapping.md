@@ -182,3 +182,9 @@ TABLE-23・NOSQL-23 のポインタ。疑似列 `id` を持つ表（従来方式
 写像し、宣言のない `id` キーは未知列（`22000`）とする。PK 列の省略は engine の `DEFAULT`／NOT NULL 規則に任せる
 （`23502`）。行の識別子は engine が払い出し、応答には出さない（実装: `crates/wire-server/src/http/query/insert.rs`
 の `bind_row`）。
+
+## 移行済み表での `id` キー省略（Issue #1700）
+
+移行済み表（TABLE-23・TABLE-24。[migrated-id-identity.md](migrated-id-identity.md)）への `insert` は
+行の `id` キーを省略でき、engine が同じ write txn 内で所有 SEQUENCE から行順に採番する。
+明示した `"id": null`・非整数は `22000`、省略行と明示行の混在は `0A000`。従来方式の表は `id` 必須のまま。

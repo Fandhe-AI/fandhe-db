@@ -465,3 +465,9 @@ SEQUENCE を進めないこと・UPDATE・`OVERRIDING`・DDL の組み合わせ�
   `DO UPDATE SET` の束縛より先に働くため、`DO UPDATE SET` 側の 428C9 は多層防御で、SQL からは到達しない
 - SEQUENCE 定義 blob の `AS smallint/integer` 型タグ（bigint 固定のまま。列型の範囲は作成時に検査する）
 - information_schema・`pg_get_serial_sequence`・`attidentity` 相当の表示
+
+## 補足（Issue #1700）: 疑似列 `id` の省略と COPY
+
+COPY の `DEFAULT nextval` 列は引き続き `0A000`。移行済み表の疑似列 `id` の省略は、COPY・複数行
+INSERT・NoSQL insert でも受理して所有 SEQUENCE から採番する（[migrated-id-identity.md](migrated-id-identity.md)
+の D8・D9）。

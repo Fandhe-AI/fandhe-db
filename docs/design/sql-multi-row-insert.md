@@ -104,3 +104,10 @@ limits`）が想定外に大きい `Vec<BoundInsert>` を受け取ることは�
 - ファイル形（`path`/`body`）INSERT への複数行 `VALUES` 併用は `42601` の
   まま（別構文の検討は別 Issue）。
 - 上記はユーザー承認なしに Issue を起票せず、PR 本文の「対象外」節へ記載する。
+
+## 移行済み表での `id` 省略（Issue #1700）
+
+移行済み表で列リストから `id` を省略した複数行 `VALUES` は、1 文 = 1 台帳エントリのまま行ごとに
+採番する。内容照合ハッシュは `id` を材料にしない別タグ（`InsertIdentityBatch`・
+`InsertIdentityBatchExpr`）で、全行が明示 `id` のバッチは従来のタグ・バイト列のまま。
+詳細は [migrated-id-identity.md](migrated-id-identity.md) の D8。
