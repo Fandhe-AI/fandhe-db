@@ -2384,6 +2384,16 @@ pub(crate) enum UpsertSetValue<'a> {
     /// `rows` スライスにおける同じ行の値列）の列インデックス参照。
     Excluded(usize),
     Literal(&'a crate::row_codec::Value),
+    /// `<col> = <col> + <operand>`（SQL-49、Issue #2425）。衝突した可視な既存行の
+    /// pre-image へ加算する（同じ write トランザクション内の read-merge-write）。
+    Add(UpsertAddOperandRef<'a>),
+}
+
+/// [`UpsertSetValue::Add`] の右オペランド（Issue #2425）。
+pub(crate) enum UpsertAddOperandRef<'a> {
+    Literal(&'a crate::row_codec::Value),
+    /// 新規挿入しようとした行の列インデックス（`EXCLUDED.<col>`）。
+    Excluded(usize),
 }
 
 /// [`upsert_typed_rows_unchecked`] の衝突分岐（SQL-20・TASK-193、Issue #872）。
@@ -2768,6 +2778,25 @@ fn upsert_typed_rows_impl(
                         UpsertSetValue::Literal(v) => {
                             content_hash::UpsertAssignmentHashValue::Literal(v)
                         }
+                        UpsertSetValue::Add(UpsertAddOperandRef::Literal(v)) => {
+                            content_hash::UpsertAssignmentHashValue::Add(
+                                content_hash::UpsertAddHashOperand::Literal(v),
+                            )
+                        }
+                        UpsertSetValue::Add(UpsertAddOperandRef::Excluded(src_idx)) => {
+                            let src_name = schema
+                                .columns
+                                .get(*src_idx)
+                                .map(|c| c.name.as_str())
+                                .ok_or_else(|| {
+                                    TenantWriteError::Catalog(CatalogError::Invalid(
+                                        "unknown EXCLUDED source column index".to_string(),
+                                    ))
+                                })?;
+                            content_hash::UpsertAssignmentHashValue::Add(
+                                content_hash::UpsertAddHashOperand::Excluded(src_name),
+                            )
+                        }
                     };
                     hash_assignments.push((col_name.to_string(), hash_value));
                 }
@@ -3067,6 +3096,9 @@ fn upsert_typed_rows_impl(
                                     .record(RowId::from_legacy_id(write_id), merged_values.clone());
                             }
                             let mut embedding_value: Vec<f32> = existing.embedding.clone();
+                            // 加算式（Issue #2425）の左辺は、全代入が更新前の行を見る（PG と同じ）よう
+                            // 書き換え前の値を別に保持する。
+                            let pre_image_values = merged_values.clone();
 
                             for (col_idx, value) in assignments.iter() {
                                 // `src_idx`／`col_idx` は束縛時点のスキーマ（`bind_upsert_assignments`）
@@ -3091,6 +3123,43 @@ fn upsert_typed_rows_impl(
                                         })?
                                     }
                                     UpsertSetValue::Literal(v) => (*v).clone(),
+                                    UpsertSetValue::Add(operand) => {
+                                        let rhs = match operand {
+                                            UpsertAddOperandRef::Literal(v) => *v,
+                                            UpsertAddOperandRef::Excluded(src_idx) => {
+                                                values.get(*src_idx).ok_or_else(|| {
+                                                    CatalogError::Invalid(
+                                                        "internal: EXCLUDED source column index out of range"
+                                                            .to_string(),
+                                                    )
+                                                })?
+                                            }
+                                        };
+                                        let column =
+                                            schema.columns.get(*col_idx).ok_or_else(|| {
+                                                CatalogError::Invalid(
+                                                    "internal: SET target column index out of range"
+                                                        .to_string(),
+                                                )
+                                            })?;
+                                        let current =
+                                            pre_image_values.get(*col_idx).ok_or_else(|| {
+                                                CatalogError::Invalid(
+                                                    "internal: SET target column index out of range"
+                                                        .to_string(),
+                                                )
+                                            })?;
+                                        crate::sql::upsert_add::eval_upsert_add(
+                                            &column.ty,
+                                            column.nullable,
+                                            &column.name,
+                                            current,
+                                            rhs,
+                                        )
+                                        .map_err(|e| {
+                                            TenantWriteError::SetExpressionEvaluationFailed(e)
+                                        })?
+                                    }
                                 };
                                 // `EXCLUDED.<列>` 等、値が実行時にしか決まらない代入の
                                 // `VARCHAR(n)` 長さ検証（`22001`。TABLE-31・Issue #1564）。
