@@ -107,6 +107,24 @@ fn insert_target_from_tokens(tokens: &[crate::sql::lexer::Token]) -> Option<(Str
     Some((table.clone(), columns))
 }
 
+/// `INSERT INTO <表> VALUES` 形（列リスト省略。SQL-50・Issue #1730）の表名を返す。
+/// [`insert_target_from_tokens`] が `None`（列リスト無し）を返したときの補完用で、
+/// 形が違えば `None`（型は未解決＝`Text`）。
+fn insert_table_without_column_list(tokens: &[crate::sql::lexer::Token]) -> Option<String> {
+    use crate::sql::lexer::Token;
+    let is_word = |t: Option<&Token>, w: &str| matches!(t, Some(Token::Ident(x)) if x.eq_ignore_ascii_case(w));
+    if !is_word(tokens.first(), "INSERT")
+        || !is_word(tokens.get(1), "INTO")
+        || !is_word(tokens.get(3), "VALUES")
+    {
+        return None;
+    }
+    match tokens.get(2) {
+        Some(Token::Ident(table) | Token::QuotedNull(table)) => Some(table.clone()),
+        _ => None,
+    }
+}
+
 /// トークン列のうち括弧深さ 0 で最初の `FROM` の添字を返す（Issue #1188）。`EXTRACT(field
 /// FROM src)` の括弧内 `FROM` をテーブル名の手掛かりと取り違えないための走査で、
 /// prepared statement のパラメータ型推論（`EngineCore::prepare_*`）が呼ぶ。
@@ -5378,7 +5396,15 @@ impl EngineCore {
         };
         // `INSERT INTO <表> ( <列> {, <列>} ) VALUES`（構文は `Parser::parse_insert` が
         // 保証する形。ここでは型の引き当てだけに使い、崩れていれば未解決として扱う）。
-        let insert_target: Option<(String, Vec<String>)> = insert_target_from_tokens(tokens);
+        // 列リスト省略（`INSERT INTO <表> VALUES (...)`。SQL-50・Issue #1730）は、表のスキーマから
+        // `SELECT *` と同じ宣言順の列（疑似 `id` が先頭）を序数へ当てる。表を引けない（ビュー等）場合は
+        // 従来どおり未解決（`Text`）。構文と既存の列型照会だけで決まり、存在オラクルを増やさない。
+        let insert_target: Option<(String, Vec<String>)> = insert_target_from_tokens(tokens)
+            .or_else(|| {
+                let table = insert_table_without_column_list(tokens)?;
+                let schema = self.storage.get_table_schema(&table).ok()?;
+                Some((table, crate::catalog::lookup_star_columns_of(&schema)))
+            });
         let column_type = |table: &str, column: &str| -> Option<PreparedParamType> {
             let id_type = || Some(PreparedParamType::Column(ColumnMeta::Id));
             let (schema, column) = match self.storage.get_table_schema(table) {

@@ -298,6 +298,8 @@ fn bind_row(
     let validated = ValidatedInsert {
         table_name: table.to_string(),
         columns,
+        // NoSQL 表層は列を常に明示する（列リスト省略は SQL 表層専用。SQL-50・Issue #1730）。
+        columns_omitted: false,
         rows: vec![literals],
         operation_id: operation_id.cloned(),
         // NoSQL 表層 `insert` op は `RETURNING`／`ON CONFLICT` を公開しない

@@ -479,6 +479,7 @@ fn nosql_insert(
             let validated = ValidatedInsert {
                 table_name: "d".to_string(),
                 columns: vec!["id".to_string(), "tag".to_string()],
+                columns_omitted: false,
                 rows: vec![vec![
                     InsertLiteral::Number(id.to_string()),
                     InsertLiteral::String("x".to_string()),
