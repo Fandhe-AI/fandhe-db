@@ -2413,6 +2413,11 @@ pub(crate) enum UpsertTarget<'a> {
     /// 走査で対象キーの一致を判定する（`constraint::enforce_unique_keys_in_txn`
     /// と同じ RLS-9・RLS-10 (c) の判断）。
     Unique(&'a [usize]),
+    /// 対象省略の `ON CONFLICT DO NOTHING`（SQL-49、Issue #1736）。行キー・PRIMARY KEY・
+    /// UNIQUE 制約・UNIQUE 索引のどれかに違反した行だけを飛ばす。判定は書き込み後の一意性検査と
+    /// 同じ永続索引・同じ鍵計算で行う（`constraint::AnyUniqueProbe`）。`DO NOTHING` 専用で、
+    /// 文内の重複は「先の行を挿入し後の重複を飛ばす」（`IdConflict` を返さない）。
+    AnyUnique,
 }
 
 /// [`upsert_typed_rows_unchecked`] の成功時の結果（SQL-20・TASK-193、
@@ -2536,6 +2541,8 @@ enum ConflictState {
     Visible(Option<crate::storage::Row>),
     /// 所有だが不可視（またはヘッダ不整合）。
     Invisible,
+    /// 対象省略（`UpsertTarget::AnyUnique`）でいずれかの一意性に違反した行。可視性を問わず飛ばす。
+    Skipped,
 }
 
 /// [`upsert_typed_rows_unchecked`]・[`upsert_typed_rows_capturing_unchecked`] の
@@ -2557,6 +2564,12 @@ fn upsert_typed_rows_impl(
     validate_relation_key(table)?;
     if rows.is_empty() {
         return Ok(UpsertOutcome::default());
+    }
+    // 対象省略は `DO NOTHING` 専用（構文段・束縛段で拒否済みの多層防御。SQL-49、Issue #1736）。
+    if matches!(target, UpsertTarget::AnyUnique) && !matches!(action, UpsertAction::DoNothing) {
+        return Err(TenantWriteError::Catalog(CatalogError::Invalid(
+            "ON CONFLICT DO UPDATE requires inference specification or constraint name".to_string(),
+        )));
     }
     check_volatile_len(volatile_default_columns, rows.len())?;
     // UPSERT は SEQUENCE の印を処理しない（束縛段が `0A000` で拒否済みの多層防御。TABLE-24・
@@ -2624,7 +2637,7 @@ fn upsert_typed_rows_impl(
             let allocated = schema.is_allocated();
             if allocated {
                 schema.require_legacy_row_identity_unless_unique_target(target)?;
-            } else {
+            } else if !matches!(target, UpsertTarget::AnyUnique) {
                 // バッチ内 id 重複検出（`insert_typed_rows_unchecked` と同じ設計。確保はフォール
                 // ブルにする）。呼び出し元 `sql::parser::bind_upsert_form` が束縛時点で既に `22000` として
                 // 拒否済みのため通常は到達しないが、本関数単体でも fail-closed を保つ。`VALUES` の
@@ -2768,7 +2781,7 @@ fn upsert_typed_rows_impl(
             // UNIQUE 対象の列名（解決した制約の宣言順。`target` の `indices` と同じ
             // 並び）を `content_hash::for_typed_upsert` へ渡す（Issue #1074）。
             let hash_target_columns: Vec<&str> = match target {
-                UpsertTarget::RowId => Vec::new(),
+                UpsertTarget::RowId | UpsertTarget::AnyUnique => Vec::new(),
                 UpsertTarget::Unique(indices) => indices
                     .iter()
                     .map(|&idx| {
@@ -2787,6 +2800,7 @@ fn upsert_typed_rows_impl(
             };
             let hash_target = match target {
                 UpsertTarget::RowId => content_hash::UpsertHashTarget::RowId,
+                UpsertTarget::AnyUnique => content_hash::UpsertHashTarget::AnyUnique,
                 UpsertTarget::Unique(_) => {
                     content_hash::UpsertHashTarget::Unique(&hash_target_columns)
                 }
@@ -2828,7 +2842,7 @@ fn upsert_typed_rows_impl(
             // 問わない全行が母集合。`row_table` はまだ本文で 1 行も書き込んでいない
             // ためこの時点のスキャンが「この文の書き込みより前」の状態と一致する）。
             let unique_existing: Option<std::collections::HashMap<Vec<u8>, RowId>> = match target {
-                UpsertTarget::RowId => None,
+                UpsertTarget::RowId | UpsertTarget::AnyUnique => None,
                 UpsertTarget::Unique(indices) => {
                     let (mut existing, corrupt_ids) =
                         crate::constraint::scan_tenant_rows_by_unique_key(
@@ -2854,6 +2868,20 @@ fn upsert_typed_rows_impl(
             // 書かなかった行は含めない（TABLE-16・TASK-204、Issue #903。
             // `constraint.rs` モジュールドキュメント参照）。
             let mut written_ids: Vec<u64> = Vec::new();
+            // 対象省略（SQL-49、Issue #1736）の衝突判定器。行の書き込み前に永続索引を最新にする。
+            // 索引テーブルのハンドルは `enforce_row_constraints_in_txn` の前に drop する。
+            let mut any_unique_probe: Option<crate::constraint::AnyUniqueProbe<'_>> =
+                if matches!(target, UpsertTarget::AnyUnique) {
+                    Some(crate::constraint::AnyUniqueProbe::prepare(
+                        write_txn,
+                        table,
+                        &schema,
+                        ctx.tenant_id(),
+                        &row_table,
+                    )?)
+                } else {
+                    None
+                };
             // `FOREIGN KEY` の `ON UPDATE` 参照アクション（Issue #1076）の連鎖起点。
             // `DO UPDATE` で実際に既存行を書き換えた場合のみ、書き換え前の全列値を
             // 積む（新規挿入行は「更新」ではないため対象外）。
@@ -2874,6 +2902,8 @@ fn upsert_typed_rows_impl(
                 // キーに NULL を含む行・未一致はいずれも非衝突＝新規挿入分岐へ）。
                 let conflict_id: Option<u64> = match target {
                     UpsertTarget::RowId => Some(*id),
+                    // 対象省略は `AnyUniqueProbe` が判定する（下の `conflict_state`）。
+                    UpsertTarget::AnyUnique => None,
                     UpsertTarget::Unique(indices) => {
                         crate::constraint::unique_key_from_values(indices, values)
                             .map_err(|m| {
@@ -2898,42 +2928,82 @@ fn upsert_typed_rows_impl(
                 // 他テナント行は物理キーの名前空間（TABLE-12）で取得すらされず、常に
                 // `Absent`（新規挿入）となる（RLS-9）。`AccessGuard` の借用は後続の
                 // `insert` と衝突しないようこのブロック内に閉じ込める。
-                let conflict_state: ConflictState = match conflict_id {
-                    Some(cid) => match row_table
-                        .get(&row_key(ctx.tenant_id(), RowId::from_legacy_id(cid)))
-                        .map_err(CatalogError::from)?
-                    {
-                        Some(guard) => {
-                            let raw = guard.value();
-                            match decode_row_tenant_and_visibility(raw) {
-                                Ok((row_tenant, row_visibility))
-                                    if ctx.is_owner(row_tenant)
-                                        && ctx.is_visible(row_tenant, row_visibility) =>
-                                {
-                                    match action {
-                                        // `DO UPDATE` のみ read-merge-write のため本体が要る。
-                                        // `DO NOTHING` は可視・不可視で応答差が出ないよう本体を
-                                        // 読まない。
-                                        UpsertAction::DoUpdate(_) => ConflictState::Visible(Some(
-                                            crate::storage::decode_row_for_key(
-                                                ctx.tenant_id(),
-                                                RowId::from_legacy_id(cid),
-                                                raw,
-                                            )
-                                            .map_err(TenantWriteError::Storage)?,
-                                        )),
-                                        UpsertAction::DoNothing => ConflictState::Visible(None),
-                                    }
-                                }
-                                _ => ConflictState::Invisible,
+                let conflict_state: ConflictState = if let Some(probe) = any_unique_probe.as_mut() {
+                    // 対象省略（SQL-49、Issue #1736）: 挿入しようとする行の物理バイト列から、
+                    // 書き込み後の一意性検査と同じ鍵で衝突を判定する。衝突なら本体を読まず飛ばす。
+                    let embedding: &[f32] = match vector_idx {
+                        Some(idx) => match values.get(idx) {
+                            Some(crate::row_codec::Value::Vector(v)) => v.as_slice(),
+                            _ => {
+                                return Err(TenantWriteError::Catalog(CatalogError::Invalid(
+                                    "VECTOR column value missing or not a Vector".to_string(),
+                                )))
                             }
-                        }
+                        },
+                        None => &[],
+                    };
+                    let metadata = crate::row_codec::encode_scalar_columns(&schema, values)
+                        .map_err(|e| CatalogError::Invalid(e.to_string()))?;
+                    let probe_row = RowInput {
+                        tenant_id: ctx.tenant_id(),
+                        visibility: insert_visibility,
+                        embedding,
+                        metadata: &metadata,
+                    };
+                    let encoded = encode_row(&probe_row)?;
+                    if probe.conflicts_or_reserve(
+                        &row_table,
+                        &schema,
+                        ctx,
+                        insert_id,
+                        encoded.as_slice(),
+                    )? {
+                        ConflictState::Skipped
+                    } else {
+                        ConflictState::Absent
+                    }
+                } else {
+                    match conflict_id {
+                        Some(cid) => match row_table
+                            .get(&row_key(ctx.tenant_id(), RowId::from_legacy_id(cid)))
+                            .map_err(CatalogError::from)?
+                        {
+                            Some(guard) => {
+                                let raw = guard.value();
+                                match decode_row_tenant_and_visibility(raw) {
+                                    Ok((row_tenant, row_visibility))
+                                        if ctx.is_owner(row_tenant)
+                                            && ctx.is_visible(row_tenant, row_visibility) =>
+                                    {
+                                        match action {
+                                            // `DO UPDATE` のみ read-merge-write のため本体が要る。
+                                            // `DO NOTHING` は可視・不可視で応答差が出ないよう本体を
+                                            // 読まない。
+                                            UpsertAction::DoUpdate(_) => {
+                                                ConflictState::Visible(Some(
+                                                    crate::storage::decode_row_for_key(
+                                                        ctx.tenant_id(),
+                                                        RowId::from_legacy_id(cid),
+                                                        raw,
+                                                    )
+                                                    .map_err(TenantWriteError::Storage)?,
+                                                ))
+                                            }
+                                            UpsertAction::DoNothing => ConflictState::Visible(None),
+                                        }
+                                    }
+                                    _ => ConflictState::Invisible,
+                                }
+                            }
+                            None => ConflictState::Absent,
+                        },
                         None => ConflictState::Absent,
-                    },
-                    None => ConflictState::Absent,
+                    }
                 };
 
-                if let ConflictState::Invisible = conflict_state {
+                if matches!(conflict_state, ConflictState::Skipped) {
+                    // 対象省略で一意性に違反した行（SQL-49、Issue #1736）。件数・返却にも数えない。
+                } else if let ConflictState::Invisible = conflict_state {
                     match action {
                         // 不可視の衝突先はスキップ（書き込まず、件数・返却にも数えない）。
                         UpsertAction::DoNothing => {}
@@ -3153,6 +3223,9 @@ fn upsert_typed_rows_impl(
             // 切って再オープンする）。
             if !written_ids.is_empty() {
                 drop(row_table);
+                // 対象省略の判定器が持つ索引テーブルのハンドルを、一意性検査が同じテーブルを
+                // 開く前に解放する（`TableAlreadyOpen` の回避。SQL-49、Issue #1736）。
+                drop(any_unique_probe);
                 let written_rowids: Vec<RowId> = written_ids
                     .iter()
                     .map(|&id| RowId::from_legacy_id(id))

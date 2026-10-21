@@ -22,8 +22,8 @@
 //! セッションの `PolicyContext` が決め、ビュー作成者の可視性は引き継がれない。
 
 use super::allowlist::{
-    OnConflictAction, OnConflictClause, Projection, SqlSurfaceError, TableLookup, UpsertValue,
-    ValidatedInsert, ValidatedViewInsert, ViewWriteOp, WherePredicate,
+    OnConflictAction, OnConflictClause, OnConflictTarget, Projection, SqlSurfaceError, TableLookup,
+    UpsertValue, ValidatedInsert, ValidatedViewInsert, ViewWriteOp, WherePredicate,
 };
 use super::exec::ColumnMeta;
 use super::view::{resolve_from, Resolved};
@@ -179,11 +179,16 @@ fn rewrite_on_conflict(
     mapper: &Mapper<'_>,
     clause: &OnConflictClause,
 ) -> Result<OnConflictClause, SqlSurfaceError> {
-    let target = clause
-        .target
-        .iter()
-        .map(|c| mapper.physical(c))
-        .collect::<Result<Vec<_>, _>>()?;
+    let target = match &clause.target {
+        OnConflictTarget::Columns(columns) => OnConflictTarget::Columns(
+            columns
+                .iter()
+                .map(|c| mapper.physical(c))
+                .collect::<Result<Vec<_>, _>>()?,
+        ),
+        // 対象省略（SQL-49、Issue #1736）は列名を持たないためそのまま写す。
+        OnConflictTarget::Omitted => OnConflictTarget::Omitted,
+    };
     let action = match &clause.action {
         OnConflictAction::DoNothing => OnConflictAction::DoNothing,
         OnConflictAction::DoUpdate(assignments) => {
@@ -418,7 +423,10 @@ mod tests {
         .expect("rewrite");
         assert_eq!(r.insert.columns, vec!["title".to_string()]);
         let oc = r.insert.on_conflict.expect("on conflict");
-        assert_eq!(oc.target, vec!["title".to_string()]);
+        assert_eq!(
+            oc.target,
+            crate::sql::allowlist::OnConflictTarget::Columns(vec!["title".to_string()])
+        );
         assert_eq!(
             oc.action,
             OnConflictAction::DoUpdate(vec![(
