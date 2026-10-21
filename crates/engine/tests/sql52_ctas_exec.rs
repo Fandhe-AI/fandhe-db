@@ -211,7 +211,8 @@ fn if_not_exists_is_noop_and_plain_duplicate_is_rejected() {
 // 対象ビヘイビア: SQL-52 (2)。途中で失敗したら表が残らない（行数超過・未対応の列型・元表の不在）。
 #[test]
 fn failure_leaves_no_table_behind() {
-    // 行数上限（`--max-result-rows` 相当）を 1 にして、2 行の結果を 54000 にする。
+    // `--max-result-rows` 相当を 1 にすると、通常の SELECT と同じく LIMIT 2 は範囲外（22000）。
+    // 列定義の導出と実行が同じ設定を参照するため、拒否されても表は残らない。
     let (core, path) = setup_with("sql52-atomic", |c| {
         c.with_result_limits(ResultLimits::new(1))
     });
@@ -222,7 +223,7 @@ fn failure_leaves_no_table_behind() {
             "alice",
             "CREATE TABLE f1 AS SELECT id FROM src LIMIT 2"
         )),
-        "54000"
+        "22000"
     );
     assert_eq!(count(&core, "alice", "f1"), Err("42P01".to_string()));
 
@@ -231,7 +232,7 @@ fn failure_leaves_no_table_behind() {
         code(run(
             &core,
             "alice",
-            "CREATE TABLE f2 AS SELECT id, tags FROM arr LIMIT 2"
+            "CREATE TABLE f2 AS SELECT id, tags FROM arr LIMIT 1"
         )),
         "0A000"
     );
@@ -252,7 +253,7 @@ fn failure_leaves_no_table_behind() {
     let o = ctas(
         &core,
         "bob",
-        "CREATE TABLE f4 AS SELECT id FROM src LIMIT 2",
+        "CREATE TABLE f4 AS SELECT id FROM src LIMIT 1",
     );
     assert_eq!(o.rows(), Some(1));
 }
@@ -276,6 +277,22 @@ fn insert_row_limit_failure_leaves_no_table_behind() {
         "54000"
     );
     assert_eq!(count(&core, "alice", "g1"), Err("42P01".to_string()));
+}
+
+// 対象ビヘイビア: SQL-52。起動時設定で引き上げた LIMIT 範囲は列定義の導出でも効く（既定 10,000 超）。
+#[test]
+fn raised_result_limit_applies_to_column_derivation() {
+    let (core, path) = setup_with("sql52-raised-limit", |c| {
+        c.with_result_limits(ResultLimits::new(20_000))
+    });
+    let _g = CleanupGuard(path);
+    let o = ctas(
+        &core,
+        "alice",
+        "CREATE TABLE big AS SELECT a FROM src LIMIT 15000",
+    );
+    assert!(!o.skipped());
+    assert_eq!(count(&core, "alice", "big"), Ok(2));
 }
 
 // 対象ビヘイビア: SQL-52 (1)。0 行の問い合わせは空の表を作り、行数は 0。
@@ -401,6 +418,26 @@ fn temp_table_source_is_rejected() {
         .expect_err("must be rejected");
     assert_eq!(e.wire_code(), "0A000");
     assert_eq!(count(&core, "alice", "tc"), Err("42P01".to_string()));
+}
+
+// 対象ビヘイビア: SQL-52 (5)・TABLE-44。拡張クエリの Parse 経路でも、一時表を読む CTAS は 0A000。
+#[test]
+fn temp_table_source_is_rejected_in_prepared_parse() {
+    let (core, path) = setup("sql52-temp-prep");
+    let _g = CleanupGuard(path);
+    let mut s = SessionState::default();
+    s.allow_ddl();
+    let c = ctx("alice");
+    core.execute_sql_in_session(&c, &mut s, "CREATE TEMP TABLE tt (a TEXT)")
+        .expect("temp table");
+    match core.parse_sql_prepared_with_declared_in_session(
+        &s,
+        "CREATE TABLE tc AS SELECT a FROM tt LIMIT 10",
+        &[],
+    ) {
+        Ok(_) => panic!("must be rejected"),
+        Err(e) => assert_eq!(e.wire_code(), "0A000"),
+    }
 }
 
 // 対象ビヘイビア: SQL-52・RECOVER-1。台帳必須モードの `WITH DATA` は operation_id 無しのため 23502、

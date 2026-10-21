@@ -46,7 +46,7 @@ impl EngineCore {
                 &ParsedSql::Statement(statement.clone()),
                 false,
                 &[],
-                &crate::result_limits::ResultLimits::default(),
+                &self.result_limits,
             )?
             .ok_or_else(|| SqlSurfaceError::Internal {
                 detail: "internal error".to_string(),

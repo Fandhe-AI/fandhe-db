@@ -685,7 +685,9 @@ impl EngineCore {
             && matches!(tokens.get(1), Some(crate::sql::lexer::Token::Ident(b)) if b.eq_ignore_ascii_case("TABLE"));
         if txn_control_head
             || is_drop_table
-            || crate::sql::allowlist::is_create_table_statement(&tokens)
+            // CTAS は内側の問い合わせが一時表を読みうるため免除しない（simple-query 経路と同じ。`0A000`）。
+            || (crate::sql::allowlist::is_create_table_statement(&tokens)
+                && !crate::sql::allowlist::is_create_table_as_statement(&tokens))
             || crate::sql::allowlist::is_create_temp_table_statement(&tokens)
         {
             return self.parse_sql_prepared_for_tenant(sql, declared, session.resolution_tenant());
