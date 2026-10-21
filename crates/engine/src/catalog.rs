@@ -7882,9 +7882,9 @@ impl TableSchema {
         )
     }
 
-    /// 開く時点の移行（Issue #2200）で移行済みの印が付いた表かを返す。`id` 省略の INSERT
-    /// （Issue #1699）の受理判定に使う。
-    pub(crate) fn is_migrated_id(&self) -> bool {
+    /// 移行済みの印が付いた表か（Issue #2200）。`id` 省略の INSERT（#1699）と NoSQL 表層（#1700）が使う。
+    /// SEQUENCE の有無は見ず、スキーマだけで決まる。
+    pub fn is_migrated_id(&self) -> bool {
         matches!(self.row_identity, RowIdentity::MigratedId)
     }
 

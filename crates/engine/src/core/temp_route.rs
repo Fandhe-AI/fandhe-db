@@ -496,6 +496,16 @@ impl EngineCore {
         use crate::sql::transaction::TransactionStatus;
         let Some(target) = batch.temp.clone() else {
             let was_idle = txn.status() == TransactionStatus::Idle;
+            // 移行済み表への `id` 省略 COPY（TABLE-24・Issue #1700）は所有 SEQUENCE から採番するため、
+            // INSERT 文と同じ採番文脈（アロケータとセッションの `currval` 状態）を張る。
+            // 省略しない COPY には張らない（従来の挙動を変えない。セッションなしの公開入口
+            // `commit_copy_in_txn` は明示 txn で採番文脈が無く `0A000` で fail-closed になる）。
+            let _sequence_scope = batch.bounds.iter().any(|b| b.id_omitted).then(|| {
+                crate::sql::sequence_scope::SequenceScope::enter(
+                    Arc::clone(self.storage.sequence_allocator()),
+                    session.sequences_handle(),
+                )
+            });
             let outcome = self.commit_copy_in_txn(ctx, txn, batch)?;
             if was_idle {
                 session.apply_temp_on_commit()?;

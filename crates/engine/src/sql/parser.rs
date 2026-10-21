@@ -326,10 +326,11 @@ pub struct BoundInsert {
 enum IdOmission {
     /// 省略不可（`22000`）。NoSQL 表層が使う公開 `bind_insert` の従来契約。
     Required,
-    /// 移行済み表の単一行 INSERT に限り省略を受理する（SQL 表層の `bind_insert_form` の単一行形）。
+    /// 移行済み表の INSERT で省略を受理する（SQL 表層の `bind_insert_form` の単一行・複数行形と、
+    /// NoSQL 表層の [`bind_insert_identity`]。複数行は Issue #1700）。
     Identity,
-    /// 移行済み表で省略すると `0A000`（複数行 `VALUES`・UPSERT。#1700 で受理予定のため、
-    /// 仮値 `0` が行 id になる fail-open を作らず固定文言で拒否する）。
+    /// 移行済み表で省略すると `0A000`（UPSERT。衝突時の欠番と `DO UPDATE` の意味が未設計のため、
+    /// 仮値 `0` が行 id になる fail-open を作らず固定文言で拒否する。設計記録 D9）。
     Unsupported,
 }
 
@@ -3101,6 +3102,17 @@ pub fn bind_insert(
     bind_insert_impl(stmt, schema, false, IdOmission::Required)
 }
 
+/// [`bind_insert`] の `id` 省略受理版（NoSQL 表層用。TABLE-24・Issue #1700）。単一行契約・検証は
+/// [`bind_insert`] と同じで、移行済み表（[`TableSchema::is_migrated_id`]）に限り列リストからの
+/// `id` 省略を受理して [`BoundInsert::id_omitted`] を真にする（採番は書き込み段）。呼び出し元は
+/// wire-server の NoSQL `insert` 束縛（`http::query::insert`）。[`bind_insert`] の署名・契約は不変。
+pub fn bind_insert_identity(
+    stmt: &ValidatedInsert,
+    schema: &TableSchema,
+) -> Result<BoundInsert, SqlSurfaceError> {
+    bind_insert_impl(stmt, schema, false, IdOmission::Identity)
+}
+
 /// [`bind_insert`] の本体。`defer_not_null` が真なら、省略された非 nullable 列（DEFAULT なし）の
 /// `23502` を束縛時に返さず [`VolatileColumn::MissingNotNull`] として書き込み段へ運ぶ
 /// （[`bind_insert_form`] の行形 INSERT だけが真で呼ぶ。Issue #1629）。
@@ -3402,18 +3414,18 @@ fn bind_insert_row(
     // 作らず、判定はスキーマだけで決まる）。採番は書き込み段が同じ write txn 内で行う。
     let has_pseudo_id = schema.has_pseudo_id();
     let id_pos = columns.iter().position(|c| c == "id");
-    let id_omitted = has_pseudo_id && id_pos.is_none() && schema.is_migrated_id() && {
-        match omission {
-            IdOmission::Identity => true,
-            IdOmission::Unsupported => {
-                return Err(SqlSurfaceError::FeatureNotSupported {
-                    detail: "omitting the id pseudo-column is only supported for single-row INSERT"
-                        .to_string(),
-                })
+    let id_omitted =
+        has_pseudo_id && id_pos.is_none() && schema.is_migrated_id() && {
+            match omission {
+                IdOmission::Identity => true,
+                IdOmission::Unsupported => return Err(SqlSurfaceError::FeatureNotSupported {
+                    detail:
+                        "omitting the id pseudo-column is not supported for INSERT ... ON CONFLICT"
+                            .to_string(),
+                }),
+                IdOmission::Required => false,
             }
-            IdOmission::Required => false,
-        }
-    };
+        };
     let id: u64 = if has_pseudo_id && !id_omitted {
         let id_pos = id_pos.ok_or_else(|| {
             SqlSurfaceError::invalid_input("INSERT column list must include the id pseudo-column")
@@ -4963,7 +4975,7 @@ pub fn bind_insert_form(
                 &stmt.operation_id,
                 schema,
                 true,
-                IdOmission::Unsupported,
+                IdOmission::Identity,
             )?);
         }
         Ok(BoundInsertForm::RowBatch(bounds))
@@ -9461,25 +9473,34 @@ mod tests {
             BoundInsertForm::Row(b) => assert!(!b.id_omitted && b.id == 3),
             other => panic!("{other:?}"),
         }
-        // 複数行・UPSERT での省略は 0A000。
-        for multi in [
+        // 複数行は全行が省略の印つきで受理される（Issue #1700）。UPSERT での省略は 0A000。
+        let multi = crate::sql::allowlist::validate_insert(
             "INSERT INTO documents (embedding, body) VALUES ('[0.1,0.2,0.3]', 'a'), \
              ('[0.1,0.2,0.3]', 'b') USING OPERATION_ID 'op-i3'",
+            &lookup,
+            crate::recovery::required_op_id::LedgerMode::Ledgered,
+        )
+        .expect("allowlist");
+        match bind_insert_form(&multi, &migrated).expect("multi-row omission accepted") {
+            BoundInsertForm::RowBatch(rows) => {
+                assert_eq!(rows.len(), 2);
+                assert!(rows.iter().all(|b| b.id_omitted && b.id == 0));
+            }
+            other => panic!("{other:?}"),
+        }
+        let upsert = crate::sql::allowlist::validate_insert(
             "INSERT INTO documents (embedding, body) VALUES ('[0.1,0.2,0.3]', 'a') \
              ON CONFLICT (id) DO NOTHING USING OPERATION_ID 'op-i4'",
-        ] {
-            let stmt = crate::sql::allowlist::validate_insert(
-                multi,
-                &lookup,
-                crate::recovery::required_op_id::LedgerMode::Ledgered,
-            )
-            .expect("allowlist");
-            assert_eq!(
-                bind_insert_form(&stmt, &migrated).unwrap_err().wire_code(),
-                "0A000",
-                "{multi}"
-            );
-        }
+            &lookup,
+            crate::recovery::required_op_id::LedgerMode::Ledgered,
+        )
+        .expect("allowlist");
+        assert_eq!(
+            bind_insert_form(&upsert, &migrated)
+                .unwrap_err()
+                .wire_code(),
+            "0A000"
+        );
     }
 
     /// 明示 `NULL`（Issue #1523・SQL-41）は nullable 列で `Value::Null` になり、

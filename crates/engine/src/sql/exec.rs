@@ -5107,10 +5107,13 @@ pub(crate) fn execute_insert_batch_with_schema_in(
             "INSERT batch rows must share the same table and operation_id",
         ));
     }
-    // `id` を省略した行（仮値 `0`）は単一行 INSERT だけが受理する（Issue #1699。複数行は #1700）。
-    // 束縛段が拒否済みの多層防御で、仮値が行 id として書かれる fail-open を実行段でも塞ぐ。
-    if bounds.iter().any(|b| b.id_omitted) {
-        return Err(reject_id_omission_unsupported());
+    // `id` の省略は全行一様のバッチだけが受理する（Issue #1700。SQL の複数行 VALUES は列リストを
+    // 共有するため常に一様）。省略行と明示行の混在は表現できない形（NoSQL の行ごとの有無）で、
+    // ハッシュに行ごとの有無を持ち込まないため `0A000` で拒否する（束縛段の拒否と別に、仮値が
+    // 行 id として書かれる fail-open を実行段でも塞ぐ多層防御）。
+    let id_omitted = first.id_omitted;
+    if bounds.iter().any(|b| b.id_omitted != id_omitted) {
+        return Err(reject_mixed_id_omission());
     }
 
     let ledger_write = ledger_mode
@@ -5127,6 +5130,7 @@ pub(crate) fn execute_insert_batch_with_schema_in(
         ctx,
         INSERT_ROW_VISIBILITY,
         &rows,
+        id_omitted,
         ledger_write,
         expected_schema,
         &volatile,
@@ -5142,10 +5146,19 @@ pub(crate) fn execute_insert_batch_with_schema_in(
     })
 }
 
-/// `id` 省略の行を受理できない経路（複数行・UPSERT）の固定文言拒否（`0A000`）。
+/// `id` 省略の行を受理できない経路（UPSERT）の固定文言拒否（`0A000`。設計記録 D9）。
 fn reject_id_omission_unsupported() -> SqlSurfaceError {
     SqlSurfaceError::FeatureNotSupported {
-        detail: "omitting the id pseudo-column is only supported for single-row INSERT".to_string(),
+        detail: "omitting the id pseudo-column is not supported for INSERT ... ON CONFLICT"
+            .to_string(),
+    }
+}
+
+/// 同じバッチ内で `id` を省略した行と明示した行が混在する形の固定文言拒否（`0A000`。Issue #1700）。
+fn reject_mixed_id_omission() -> SqlSurfaceError {
+    SqlSurfaceError::FeatureNotSupported {
+        detail: "mixing omitted and explicit id values in one INSERT batch is not supported"
+            .to_string(),
     }
 }
 
