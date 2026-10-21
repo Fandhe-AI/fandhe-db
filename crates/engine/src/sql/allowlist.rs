@@ -3710,6 +3710,27 @@ impl ValidatedViewUpdate {
     }
 }
 
+/// [`mark_explicit_where`] が注入する印の予約名。識別子として字句化できない NUL を含むため
+/// 利用者入力の `WHERE visible()` とは衝突せず、content_hash の直列化（`push_dml_where_predicates`）
+/// はこの印を除外する。これにより畳み込み後に恒真となる `WHERE` の台帳ハッシュは印の導入前と
+/// 同一に保たれ、明示 `WHERE visible()` とも区別される。
+pub(crate) const EXPLICIT_WHERE_MARKER: &str = "\u{0}explicit_where";
+
+/// `WHERE` が書かれているのに述語列が空になる形（`WHERE TRUE`・`(TRUE OR FALSE)` 等、構文段の
+/// 真偽リテラル畳み込み〔SQL-41〕で述語が消えるもの）に、RLS 述語 `visible()` を 1 件足して返す。
+/// 空の述語列は「`WHERE` 省略」（SQL-36・Issue #1743）の表現と同一であり、明示した恒真を省略と
+/// 取り違えないための印。`visible()` は束縛後にフィルタを生まない（RLS は常に暗黙適用される）ので、
+/// 基表への DML は束縛段の「`visible()` のみ」拒否（`42601`）に従来どおり落ち、ビュー経由では
+/// ビューの述語と合成されて従来どおり通る。恒真述語 DML の受理は #1744 の範囲で、そこでこの関数を外す。
+fn mark_explicit_where(mut predicates: Vec<WherePredicate>) -> Vec<WherePredicate> {
+    if predicates.is_empty() {
+        predicates.push(WherePredicate::PredicateCall {
+            name: EXPLICIT_WHERE_MARKER.to_string(),
+        });
+    }
+    predicates
+}
+
 /// `id = <literal>` の述語列を、構文解析器（`WHERE` の述語文法）に通して得る（TABLE-43・Issue #1672）。
 /// ビューへの単一行形 `WHERE id = <n>` を、ビューの `WHERE` 述語と AND 合成する述語形へ変換する際、
 /// 利用者が `WHERE <述語> AND id = <n>` と書いたときと同じ AST にするために使う。SQL 文字列は組み
@@ -9713,7 +9734,7 @@ impl<'a> Parser<'a> {
     /// `DELETE FROM <table> WHERE <where> USING OPERATION_ID '<id>' [;]` を
     /// 受理する（SQL-18・TASK-191 の単一行・`id` 完全一致形、Issue #870・
     /// TASK-192・SQL-19 の述語形の両方をここで構造判定する）。`WHERE` 句の
-    /// 省略は両形式共通で許可リスト外（`Keyword::Where` を必須とする）。
+    /// 省略は SQL-36（Issue #1743）で述語形（空の述語列）として受理する。
     ///
     /// `WHERE` 直後が [`Self::peek_single_row_delete_id`] に一致する場合
     /// （`id = <number>` の直後が文末／`;`／`USING`）のみ [`ParsedDeleteWhere::RowId`]
@@ -9728,16 +9749,23 @@ impl<'a> Parser<'a> {
         self.expect_keyword(Keyword::From)?;
         let table_name = self.expect_ident()?;
 
-        self.expect_keyword(Keyword::Where)?;
-
-        let where_clause = if self.peek_single_row_delete_id() {
-            self.advance(); // "id"
-            self.advance(); // '='
-            let id_literal = self.expect_number()?;
-            ParsedDeleteWhere::RowId { id_literal }
+        // SQL-36（Issue #1743）: `WHERE` 省略は空の述語列（`Predicates(vec![])`）で表す。
+        // 明示した `WHERE` は `mark_explicit_where` で必ず 1 件以上になるため、空列は省略と一対一に対応する。
+        // 単一行専用入口（`validate_delete_tokens`）は `Predicates(_)` を `42601` で拒否するので
+        // 受理範囲は広がらない。opt-in の `--require-where-for-dml`（#2210）はここで空列を見て拒否する。
+        let where_clause = if matches!(self.peek(), Some(Token::Keyword(Keyword::Where))) {
+            self.advance(); // WHERE
+            if self.peek_single_row_delete_id() {
+                self.advance(); // "id"
+                self.advance(); // '='
+                let id_literal = self.expect_number()?;
+                ParsedDeleteWhere::RowId { id_literal }
+            } else {
+                let predicates = mark_explicit_where(self.parse_where()?);
+                ParsedDeleteWhere::Predicates(predicates)
+            }
         } else {
-            let predicates = self.parse_where()?;
-            ParsedDeleteWhere::Predicates(predicates)
+            ParsedDeleteWhere::Predicates(Vec::new())
         };
 
         // `RETURNING`（Issue #873・SQL-21）は `USING OPERATION_ID` 句の直前。
@@ -9826,8 +9854,18 @@ impl<'a> Parser<'a> {
             assignments.push(self.parse_update_assignment()?);
         }
 
-        self.expect_keyword(Keyword::Where)?;
-        let where_form = self.parse_update_where()?;
+        // SQL-36（Issue #1743）: `WHERE` 省略は空の述語列で表す（DELETE と同じ。#2210 の結線点）。
+        let where_form = if matches!(self.peek(), Some(Token::Keyword(Keyword::Where))) {
+            self.advance(); // WHERE
+            match self.parse_update_where()? {
+                UpdateWhereForm::Predicates(p) => {
+                    UpdateWhereForm::Predicates(mark_explicit_where(p))
+                }
+                other => other,
+            }
+        } else {
+            UpdateWhereForm::Predicates(Vec::new())
+        };
 
         // `RETURNING`（Issue #873・SQL-21）は `USING OPERATION_ID` 句の直前。
         // 構造パースのみ行い、受理／拒否の判定は呼び出し元
@@ -24044,15 +24082,41 @@ mod tests {
     }
 
     #[test]
-    fn rejects_delete_statement_without_where_clause() {
+    fn accepts_delete_statement_without_where_clause_as_empty_predicates() {
         let lookup = catalog_with(&["documents"]);
-        let err = validate_delete_statement(
+        // SQL-36（Issue #1743）: WHERE 省略は空の述語列を持つ述語形として受理する。
+        for sql in [
             "DELETE FROM documents USING OPERATION_ID 'op-0001'",
-            &lookup,
-            LedgerMode::Ledgered,
-        )
-        .expect_err("DELETE without WHERE must be rejected (全行削除は TRUNCATE の管轄)");
-        assert_eq!(err.wire_code(), "42601");
+            "DELETE FROM documents USING OPERATION_ID 'op-0001';",
+            "DELETE FROM documents RETURNING id USING OPERATION_ID 'op-0001'",
+            "DELETE FROM documents USING OPERATION_ID 'op-0001' PARTITIONED",
+        ] {
+            let stmt = validate_delete_statement(sql, &lookup, LedgerMode::Ledgered)
+                .unwrap_or_else(|e| panic!("{sql} must be accepted: {e:?}"));
+            match stmt {
+                DeleteStatement::Predicate(p) => assert!(p.where_predicates().is_empty()),
+                other => panic!("expected predicate form, got {other:?}"),
+            }
+        }
+        let stmt =
+            validate_delete_statement("DELETE FROM documents", &lookup, LedgerMode::Optional)
+                .expect("bare DELETE accepted when ledger is optional");
+        assert!(matches!(stmt, DeleteStatement::Predicate(_)));
+    }
+
+    #[test]
+    fn rejects_delete_without_where_with_extra_tokens() {
+        let lookup = catalog_with(&["documents"]);
+        for sql in [
+            "DELETE FROM documents WHERE",
+            "DELETE FROM documents ORDER BY id",
+            "DELETE FROM documents LIMIT 1",
+            "DELETE FROM documents USING other",
+        ] {
+            let err = validate_delete_statement(sql, &lookup, LedgerMode::Optional)
+                .expect_err("extra tokens must be rejected");
+            assert_eq!(err.wire_code(), "42601", "{sql}");
+        }
     }
 
     #[test]
@@ -26774,15 +26838,34 @@ mod tests {
     }
 
     #[test]
-    fn validate_update_form_still_rejects_missing_where_clause() {
+    fn validate_update_form_accepts_missing_where_clause_as_empty_predicates() {
         let lookup = catalog_with(&["documents"]);
-        let err = validate_update_form(
+        // SQL-36（Issue #1743）: WHERE 省略は空の述語列を持つ述語形として受理する。
+        for sql in [
             "UPDATE documents SET lang = 'en' USING OPERATION_ID 'op-0001'",
-            &lookup,
-            LedgerMode::Ledgered,
-        )
-        .expect_err("missing WHERE clause must be rejected");
-        assert_eq!(err.wire_code(), "42601");
+            "UPDATE documents SET lang = 'en' RETURNING id USING OPERATION_ID 'op-0001'",
+            "UPDATE documents SET lang = 'en' USING OPERATION_ID 'op-0001' PARTITIONED",
+        ] {
+            let form = validate_update_form(sql, &lookup, LedgerMode::Ledgered)
+                .unwrap_or_else(|e| panic!("{sql} must be accepted: {e:?}"));
+            match form {
+                ValidatedUpdateForm::Predicate(p) => assert!(p.where_predicates().is_empty()),
+                _ => panic!("expected predicate form for {sql}"),
+            }
+        }
+    }
+
+    #[test]
+    fn validate_update_form_rejects_missing_where_with_extra_tokens() {
+        let lookup = catalog_with(&["documents"]);
+        for sql in [
+            "UPDATE documents SET lang = 'en' WHERE",
+            "UPDATE documents SET lang = 'en' FROM other",
+        ] {
+            let err = validate_update_form(sql, &lookup, LedgerMode::Optional)
+                .expect_err("extra tokens must be rejected");
+            assert_eq!(err.wire_code(), "42601", "{sql}");
+        }
     }
 
     #[test]

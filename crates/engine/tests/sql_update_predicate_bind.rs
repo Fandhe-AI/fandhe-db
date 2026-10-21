@@ -131,18 +131,21 @@ fn bound_predicate_update_never_exposes_tenant_or_visibility_assignment() {
     assert_eq!(bind_err.wire_code(), "42601");
 }
 
-/// `WHERE` 省略は許可リスト層で `42601` に拒否され、`ValidatedUpdateForm` を
-/// 経由しても全行更新に相当する形が構造上作れないことを固定する。
+/// `WHERE` 省略は SQL-36（Issue #1743）で受理され、束縛後のフィルタが空になることを固定する。
 #[test]
-fn where_clause_omission_is_rejected_before_reaching_bound_form() {
+fn where_clause_omission_binds_with_empty_filters() {
     let lookup = catalog();
-    let err = validate_update_form(
+    let form = validate_update_form(
         "UPDATE documents SET body = 'x' USING OPERATION_ID 'op-0001'",
         &lookup,
         LedgerMode::Ledgered,
     )
-    .unwrap_err();
-    assert_eq!(err.wire_code(), "42601");
+    .expect("WHERE omission is accepted");
+    let bound =
+        bind_update_form(&form, &schema(), &UdfRegistry::default()).expect("WHERE omission binds");
+    let debug = format!("{bound:?}");
+    assert!(debug.contains("metadata_filters: []"), "{debug}");
+    assert!(debug.contains("expr_filters: []"), "{debug}");
 }
 
 /// [`engine::sql::parser::check_dml_affected_rows_with_limit`] が公開 API として

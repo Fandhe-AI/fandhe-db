@@ -34,8 +34,7 @@ UPDATE <table> SET <col> = <lit>[, <col> = <lit>]* WHERE <where_form>
   `SELECT`・広域取得 `SELECT` と同一の `WHERE` 述語文法（等価・前方一致・
   `visible()`・式比較の `AND` 結合。`sql::allowlist::WherePredicate`）を再利用する。
 
-`WHERE` 句そのものの省略は許可リスト層で構造的に `42601`（`Keyword::Where` を
-無条件に要求。振り分けより前の判定）。
+`WHERE` 句そのものの省略は SQL-36（Issue #1743）で述語形（空の述語列）として受理する。
 
 ## 追加型 API（破壊的変更を避ける）
 
@@ -93,8 +92,8 @@ UPDATE <table> SET <col> = <lit>[, <col> = <lit>]* WHERE <where_form>
 
 `WHERE visible()` のみ（`metadata_filters`・`expr_filters` がともに空）は構造上
 `WHERE` 句を持つが実質的に全行更新であるため、`bind_update_form` の `Predicate`
-腕が束縛時に `42601` で拒否する（`WHERE` 自体の省略は許可リスト層が既に拒否済み
-だが、`visible()` のみという「実質的な無条件更新」の形はここでの追加防御）。
+腕が束縛時に `42601` で拒否する（`WHERE` 自体の省略は SQL-36・Issue #1743 で受理する。
+空の述語列は束縛段ガードの対象外。`visible()` のみという形は引き続きここで拒否する）。
 `visible()` を他述語と `AND` 併用する形（例: `WHERE visible() AND lang = 'ja'`）は
 `metadata_filters`／`expr_filters` のいずれかが非空になるため受理される
 （RLS は述語の有無に関わらず暗黙適用のため、`visible()` の有無自体は実行結線の
