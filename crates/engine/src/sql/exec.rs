@@ -5628,6 +5628,9 @@ fn execute_upsert_inner(
     // ドキュメント参照）。
     let tenant_target = match &bound.target {
         crate::sql::parser::BoundConflictTarget::RowId => crate::tenant::UpsertTarget::RowId,
+        crate::sql::parser::BoundConflictTarget::AnyUnique => {
+            crate::tenant::UpsertTarget::AnyUnique
+        }
         crate::sql::parser::BoundConflictTarget::Unique(indices) => {
             crate::tenant::UpsertTarget::Unique(indices)
         }
