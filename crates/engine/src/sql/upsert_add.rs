@@ -81,13 +81,24 @@ pub(crate) fn bind_add_literal(
     }
     if is_float_type(target) {
         return match text.parse::<f64>() {
-            Ok(f) if f.is_finite() => Ok(Value::Double(f)),
+            // 非ゼロ仮数のリテラルが 0.0 に丸まる（アンダーフロー）場合は拒否する。
+            // 黙って 0 加算になると範囲検査をすり抜け、台帳ハッシュも衝突するため。
+            Ok(f) if f.is_finite() && !(f == 0.0 && has_nonzero_mantissa(text)) => {
+                Ok(Value::Double(f))
+            }
             _ => Err(SqlSurfaceError::numeric_out_of_range(
                 "double precision out of range",
             )),
         };
     }
     check_target_type(target).map(|()| Value::Null)
+}
+
+/// 指数部を除いた仮数に 0 以外の数字が含まれるか（アンダーフロー判定用）。
+fn has_nonzero_mantissa(text: &str) -> bool {
+    text.split(['e', 'E'])
+        .next()
+        .is_some_and(|m| m.bytes().any(|b| (b'1'..=b'9').contains(&b)))
 }
 
 fn int_value(v: &Value) -> Option<i128> {
@@ -315,6 +326,16 @@ mod tests {
         assert_eq!(
             bind_add_literal(&ColumnType::Double, &lit("0.5")).unwrap(),
             Value::Double(0.5)
+        );
+        for t in ["1e-999", "-1e-999", "0.5e-400"] {
+            assert_eq!(
+                code(bind_add_literal(&ColumnType::Double, &lit(t)).unwrap_err()),
+                "22003"
+            );
+        }
+        assert_eq!(
+            bind_add_literal(&ColumnType::Double, &lit("0.0e-999")).unwrap(),
+            Value::Double(0.0)
         );
     }
 
