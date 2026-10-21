@@ -195,7 +195,9 @@ impl EngineCore {
             req.operation_id.as_ref(),
             clock,
         )?;
-        if bounds.len() > 1 {
+        // 1 行でもバイト量・チャンク総量の上限（INDEX-4）を必ず通す（fail-closed。
+        // 委譲先の書き込み段はこの検査を補わない）。0 行は台帳記録のみの経路へ進む。
+        if !bounds.is_empty() {
             self.validate_insert_row_batch_limits(&bounds)?;
         }
 
@@ -513,6 +515,31 @@ mod tests {
             &a,
             "SELECT id, embedding, lang FROM src LIMIT 100",
             "op-is-limit",
+        )
+        .unwrap_err();
+        assert_eq!(err.wire_code(), "54000");
+        assert_eq!(count(&core, &a, "dst"), 0);
+    }
+
+    // 対象ビヘイビア: SQL-51・INDEX-4（ポインタ）。結果が 1 行でもバイト量上限を超えれば
+    // 54000 で拒否され、何も挿入されない。
+    #[test]
+    fn single_row_result_is_subject_to_byte_limit() {
+        let dir = tempdir();
+        let core = open(dir.path());
+        let a = ctx("tenant-a");
+        seed(&core, &a, "src", 1, "op-seed-single");
+        let core = core.with_batch_limits(crate::batch_limits::BatchLimits {
+            max_files_per_batch: 64,
+            max_file_body_bytes: 1,
+            max_batch_total_bytes: 1_000_000,
+            max_batch_chunks: 1_000_000,
+        });
+        let err = insert_select(
+            &core,
+            &a,
+            "SELECT id, embedding, lang FROM src LIMIT 100",
+            "op-is-single",
         )
         .unwrap_err();
         assert_eq!(err.wire_code(), "54000");
