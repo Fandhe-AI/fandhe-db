@@ -346,6 +346,7 @@ impl UniqueKeyPlan {
             keys: Vec::new(),
             uniques: Vec::new(),
             partials: vec![forced],
+            gins: Vec::new(),
         };
         let mut plan = Self::build(schema, &decls)?;
         plan.specs.clear();
@@ -375,6 +376,7 @@ impl UniqueKeyPlan {
                 elements: elements.to_vec(),
             }],
             partials: Vec::new(),
+            gins: Vec::new(),
         };
         let mut plan = Self::build(schema, &decls)?;
         plan.specs.clear();
@@ -698,6 +700,18 @@ fn enforce_row_constraints_impl(
             written_ids,
             &decls,
             compiled.as_ref(),
+        )?;
+        // GIN 相当索引（INDEX-8、Issue #2207・`docs/design/gin-jsonb-index.md` D8）の維持。
+        // 書き込んだ行のエントリを同一 write txn でポスティングへ反映する（欠落不可の不変条件を保つ
+        // 唯一のチョークポイント）。上限超過は `54000` で、呼び出し元は commit しない。
+        crate::gin_index::maintain_rows_in_txn(
+            write_txn,
+            table_name,
+            schema,
+            tenant_id,
+            written_ids,
+            &decls.gins,
+            &crate::gin_index::GinLimits::default(),
         )?;
         // ビューの `WITH CHECK OPTION`（TABLE-43 (2)・Issue #1673）。一意索引の後・FK の前
         // （PostgreSQL の検査順に合わせる）。
@@ -1084,6 +1098,83 @@ pub(crate) fn forget_unique_index_rows_in_txn(
     ids: &[RowId],
 ) -> Result<(), TenantWriteError> {
     unique_index::forget_rows_in_txn(write_txn, table_name, schema, tenant_id, ids)
+}
+
+/// 削除経路（`tenant.rs` の `delete_row_impl`・`apply_predicate_delete_in_txn`・
+/// `replace_typed_rows_by_text_key` と FK `ON DELETE CASCADE`）が、行削除の直後・同一 write txn 内から
+/// 呼ぶ GIN 相当索引（INDEX-8、Issue #2207）のポスティング後片付け窓口
+/// （[`crate::gin_index::forget_rows_in_txn`] の薄いラッパー）。索引カタログから宣言を読み、行ストアには
+/// 触れない（行ストアの可変ハンドルを保持したまま呼べる）。後片付けは衛生措置で、呼び出し漏れは正しさに
+/// 影響しない（stale は読み取り側の再検査で除かれる）。GIN 宣言の無い表では何もしない。
+pub(crate) fn forget_gin_index_rows_in_txn(
+    write_txn: &redb::WriteTransaction,
+    table_name: &str,
+    tenant_id: &str,
+    ids: &[RowId],
+) -> Result<(), TenantWriteError> {
+    if ids.is_empty() {
+        return Ok(());
+    }
+    let decls = crate::catalog::table_expression_decls_in_txn(write_txn, table_name)?;
+    crate::gin_index::forget_rows_in_txn(write_txn, tenant_id, ids, &decls.gins)
+}
+
+/// TRUNCATE（`tenant.rs::truncate_tables_unchecked`）が行ストアの全削除後に呼ぶ、テナント範囲の GIN 相当索引
+/// （INDEX-8、Issue #2207）クリア窓口（[`crate::gin_index::clear_tenant_in_txn`] の薄いラッパー）。
+/// 他テナントの範囲には触れず、空の索引として完全な状態（マーカー有効）にする。
+pub(crate) fn clear_gin_index_for_tenant_in_txn(
+    write_txn: &redb::WriteTransaction,
+    table_name: &str,
+    schema: &TableSchema,
+    tenant_id: &str,
+) -> Result<(), TenantWriteError> {
+    let decls = crate::catalog::table_expression_decls_in_txn(write_txn, table_name)?;
+    crate::gin_index::clear_tenant_in_txn(write_txn, schema, tenant_id, &decls.gins)
+}
+
+/// `EngineCore::verify_gin_index_read_only`（GIN 相当索引の診断）の本体窓口。`decl` の索引を自テナントの範囲
+/// だけ読み取り専用で検証する（書き込み・遅延バックフィルをしない。
+/// [`crate::gin_index::audit_tenant_read_only`] の薄いラッパー）。物理テーブルが未作成ならマーカー無効・
+/// 全エントリ欠落として返す。
+pub(crate) fn verify_gin_index_read_only(
+    read_txn: &redb::ReadTransaction,
+    table_name: &str,
+    schema: &TableSchema,
+    tenant_id: &str,
+    decl: &crate::catalog::DeclaredGinIndex,
+) -> Result<crate::catalog::GinIndexAudit, TenantWriteError> {
+    let row_table_name = crate::catalog::user_rows_table_name(table_name);
+    let row_table = match read_txn.open_table(crate::catalog::user_rows_table_def(&row_table_name))
+    {
+        Ok(t) => t,
+        // 行テーブル未作成は行 0 件として扱う（CREATE INDEX の構築と同じ扱い。物理 GIN テーブルも作られない）。
+        Err(redb::TableError::TableDoesNotExist(_)) => {
+            return Ok(crate::catalog::GinIndexAudit {
+                marker_valid: false,
+                missing: 0,
+                stale: 0,
+            })
+        }
+        Err(e) => return Err(crate::catalog::map_row_table_error(e).into()),
+    };
+    let gin_table_name = crate::catalog::user_gin_table_name(&decl.index_name);
+    let limits = crate::gin_index::GinLimits::default();
+    match read_txn.open_table(crate::catalog::user_gin_table_def(&gin_table_name)) {
+        Ok(index_table) => crate::gin_index::audit_tenant_read_only(
+            &row_table,
+            Some(&index_table),
+            schema,
+            tenant_id,
+            decl,
+            &limits,
+        ),
+        Err(redb::TableError::TableDoesNotExist(_)) => {
+            crate::gin_index::audit_tenant_read_only::<_, redb::ReadOnlyTable<_, _>>(
+                &row_table, None, schema, tenant_id, decl, &limits,
+            )
+        }
+        Err(e) => Err(TenantWriteError::Catalog(CatalogError::from(e))),
+    }
 }
 
 /// 宣言 PRIMARY KEY の永続一意索引を**読み取り側**から参照する窓口（Issue #2198。`sql::pk_point` の
@@ -4391,6 +4482,9 @@ fn apply_referential_action(
                 tenant_id,
                 &deleted_ids,
             )?;
+            // GIN 相当索引（INDEX-8、Issue #2207）のポスティングも後片付けする（`CASCADE` 経由の削除は
+            // `tenant.rs` の削除経路を通らないため、ここで明示的に呼ぶ契約。衛生措置）。
+            forget_gin_index_rows_in_txn(write_txn, &child_schema.name, tenant_id, &deleted_ids)?;
         }
         return Ok((PropagatedChange::Removed, Some(pre_images)));
     }

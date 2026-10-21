@@ -70,6 +70,11 @@ pub enum ScalarPlan {
     /// 解決する広域取得（Issue #2198・TABLE-23）。`classify_scalar_plan*` は返さず、`sql::pk_point::
     /// classify_pk_point`（`sql::scan` の実行経路選択と同じ静的分類）が `EXPLAIN` へ付与する。
     IndexPrimaryKey,
+    /// jsonb 列への包含・キー存在・jsonpath 演算子を、GIN 相当索引（`user_gin/{索引名}`）のポスティングで
+    /// 解決する広域取得（INDEX-8、Issue #2208）。`classify_scalar_plan*` は返さず、`sql::gin_scan::
+    /// classify_gin_scan`（`sql::scan` の実行経路選択と同じ静的分類）が `EXPLAIN` へ付与する。索引名は
+    /// `scalar_plan:` 行の ` index=<name>` 接尾辞に出る（INDEX-7 と同じ規則）。
+    IndexGin,
 }
 
 /// [`classify_scalar_plan`] の入力。`sql::exec`・`sql::using_plan::

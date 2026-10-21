@@ -9,6 +9,26 @@
 
 ### Breaking Changes
 
+- GIN 相当索引の読み取り（Issue #2208・INDEX-8）: 広域取得で jsonb 列への `@>`・`?`・`?|`・`?&`（`jsonb_ops`）と
+  `@>`・`@?`・`@@`（`jsonb_path_ops`）が GIN 相当索引のポスティングで候補を絞るようになった（候補は全走査と同じ可視性判定と
+  WHERE 全体の再評価を通るため、結果の行・順序・`LIMIT`／`OFFSET` の数え方は不変）。`EXPLAIN` はこの形のときだけ
+  `scalar_plan: index_gin index=<索引名>`・`access_path: gin_index_candidates` を出す（従来は `plain_scan`／`full_scan`）。
+  PK 点検索が成り立つ文は従来どおり PK が優先。`ORDER BY`・ウィンドウ・OR・NOT・空集合の問い合わせ・許可形でない jsonpath は不変。
+  公開 API は `ScalarPlan::IndexGin` の追加（`#[non_exhaustive]`）。詳細は [gin-jsonb-index.md](docs/design/gin-jsonb-index.md) の §9。
+- GIN 相当索引のキー抽出と DML 維持（Issue #2207・INDEX-8）: `CREATE INDEX ... USING gin` の宣言が物理テーブル
+  `user_gin/{索引名}` のポスティングを持つようになり、INSERT・UPSERT・UPDATE・DELETE・COPY・TRUNCATE・分割実行 DML・
+  FK 参照アクションと同じ write txn で維持する（`CREATE INDEX` は既存行から同期構築）。1 値あたり 65,535 エントリ・
+  `jsonb_ops` の 1 エントリ 4,096 バイトを超える jsonb の書き込み・`CREATE INDEX` は `54000`（副作用なし）。
+  結果集合は宣言の有無で変わらない（読み取り側の利用は #2208）。公開 API は `TenantWriteError::GinIndexEntryLimitExceeded`・
+  `EngineCore::verify_gin_index_read_only`・`GinIndexAudit` の追加。
+  BREAKING CHANGE: `TenantWriteError` に variant を追加したため外部の網羅的な `match` は更新が要る。GIN 索引付きの表への
+  書き込みが上限超過で `54000` になりうる。
+- GIN 相当索引の宣言（Issue #2206・INDEX-8）: `CREATE INDEX ... USING gin (<JSONB 列> [jsonb_ops | jsonb_path_ops])` を
+  受理してカタログへ永続化する（従来は `0A000`）。JSONB 以外の列・複数列・式・`UNIQUE`・`WHERE`・`COLLATE` は `0A000`、
+  未知の演算子クラスは `42704`。宣言の受理までで、索引の生成・利用は後続（宣言は結果集合に影響しない）。
+  公開 API は `IndexKind::Gin(GinOpClass)` と `GinOpClass` の追加。索引カタログの形式は新版 `v8`（`v1`〜`v7` は不変）。
+  BREAKING CHANGE: `IndexKind` に variant を追加したため外部の網羅的な `match` は更新が要る。`v8` を含むデータディレクトリは
+  旧バイナリでは読めない（未知の版として拒否する）。
 - NoSQL の単一行アドレスと insert・scan を PRIMARY KEY 基準へ移行（Issue #2201・TABLE-23・NOSQL-23）: SQL の `CREATE TABLE` で作った表（採番方式）に対して NoSQL の `scan`（`explain` を含む）・`insert`（`id` 不要）・`update`／`delete`（`where` に PRIMARY KEY の列を指定、複合可。PK なし表の単一行形は `42601`・述語形 `filter` は使える）が使える。疑似列 `id` を持つ表の `where: {"id": n}` は互換のまま。NoSQL の `aggregate`／`search` は採番方式の表に対して引き続き `0A000`。`update`／`delete` の `where` の型検査は表のスキーマ解決後（未知キーは従来どおり `42601`）。既存の要求は同じ応答を返すため、既存クライアントへの破壊的変更ではない。
 - 既存表の `id` の移行（Issue #2200・TABLE-23）: 既存データディレクトリを開く時点で、従来方式の永続表のカタログを
   移行済みの印（v15 の `rowmode:migrated`。`RowIdentity::MigratedId`）へ一方向に書き換える（表ごとに原子的・再 open で収束。

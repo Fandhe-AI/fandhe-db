@@ -329,3 +329,12 @@ PLAN-11・TASK-186（NOSQL-6・NOSQL-10・NOSQL-16）
 `AccessPath::PrimaryKeyLookup`）。実行側と同じ静的分類（`sql::pk_point::classify_pk_point`）を呼ぶので 2 行は
 矛盾しない。テナント単位のマーカー欠落による範囲走査への縮退は露出せず、索引名の注記も付けない。
 語彙数の変更は SQL-27 の確定時に spec 側とすり合わせる事項。
+
+## 追記（Issue #2208・INDEX-8）: GIN の語彙
+
+広域取得（`sql::scan`）で jsonb 列への包含・キー存在・jsonpath 演算子が GIN 相当索引の候補探査になるとき、
+`scalar_plan: index_gin index=<索引名>` と `access_path: gin_index_candidates` を出す（新しい語彙。`ScalarPlan::IndexGin`・
+`AccessPath::GinIndexCandidates`）。索引名の注記は INDEX-7 と同じ `index=<name>` 接尾辞の規則。実行側と同じ静的分類
+（`sql::gin_scan::classify_gin_scan`）を呼ぶので 2 行は矛盾しない。優先順位は PK 点検索 → GIN → 全走査。
+EXPLAIN は索引の物理テーブルを開かず、テナント単位のマーカー欠落による行範囲走査への縮退・候補数・テナントの
+有無は露出しない。語彙数の変更は SQL-27 の確定時に spec 側とすり合わせる事項。
