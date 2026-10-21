@@ -13391,7 +13391,13 @@ pub(crate) fn is_create_table_as_statement(tokens: &[Token]) -> bool {
     if ident_at(i, "IF") && ident_at(i + 1, "NOT") && ident_at(i + 2, "EXISTS") {
         i += 3;
     }
-    if !matches!(tokens.get(i), Some(Token::Ident(_))) {
+    // 対象名は `schema.name`（`Token::QualifiedIdent`）や引用識別子も取りうる。名前書き換え
+    // （`rewrite_relation_names_full`）より前に呼ぶ経路（一時表スキャン・`$n` 拒否の判定）でも
+    // 修飾名の CTAS を取りこぼさないよう、識別子相当のトークンを受理する。
+    if !tokens
+        .get(i)
+        .is_some_and(crate::sql::relation_name::is_ident_like)
+    {
         return false;
     }
     ctas_as_follows(tokens, i + 1)
@@ -29372,6 +29378,18 @@ mod create_table_as_tests {
         assert!(!is("CREATE TABLE t (a, b)"));
         assert!(!is("CREATE TEMP TABLE t AS SELECT 1"));
         assert!(!is("CREATE VIEW t AS SELECT 1"));
+    }
+
+    #[test]
+    fn predicate_accepts_schema_qualified_target_names() {
+        let is = |sql: &str| is_create_table_as_statement(&lexer::tokenize(sql).expect("tok"));
+        assert!(is("CREATE TABLE public.t AS SELECT 1"));
+        assert!(is(
+            "CREATE TABLE IF NOT EXISTS public.t (a, b) AS SELECT 1, 2"
+        ));
+        assert!(is("CREATE TABLE s1.t AS SELECT 1"));
+        assert!(!is("CREATE TABLE public.t (a INT)"));
+        assert!(!is("CREATE TEMP TABLE public.t AS SELECT 1"));
     }
 
     #[test]
