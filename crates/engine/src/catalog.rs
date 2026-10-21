@@ -11632,6 +11632,20 @@ pub(crate) fn require_table_schema_write_any_identity(
     decode_schema_with_resolver(table_name, &bytes, &mut resolve)
 }
 
+/// 検証済みのスキーマを同じ write txn で [`CATALOG_TABLE`] へ書き戻す（`validate_schema` →
+/// `encode_schema` → 保存）。ALTER 系の個別処理と同じ手順を、他モジュール（`catalog::sequence` の
+/// 移行 IDENTITY 割り当て。Issue #1698）が共有するための入口。世代 bump・commit は含まない。
+pub(crate) fn write_schema_in_txn(
+    write_txn: &redb::WriteTransaction,
+    schema: &TableSchema,
+) -> Result<()> {
+    validate_schema(schema)?;
+    let encoded = encode_schema(schema)?;
+    let mut catalog_table = write_txn.open_table(CATALOG_TABLE)?;
+    catalog_table.insert(schema.name.as_str(), encoded.as_slice())?;
+    Ok(())
+}
+
 /// `#[cfg(test)]` 限定の生書き込み API（`insert_row_into_table` /
 /// `insert_rows_into_table` / `insert_typed_row`。Issue #1078）の共通ガード。
 /// これら 3 API は [`crate::constraint::enforce_row_constraints_in_txn`]
