@@ -9558,14 +9558,16 @@ impl<'a> Parser<'a> {
     fn parse_upsert_assignment(&mut self) -> Result<(String, UpsertValue), SqlSurfaceError> {
         let column = self.expect_ident()?;
         self.expect_punct('=')?;
-        // 加算形 `<ident> + ...`（Issue #2425）。`true`／`false`／`NULL` と引用付き
-        // `"null"` は従来のリテラル経路へ流す。先読みは `get` のみ（添字を使わない）。
+        // 加算形 `<ident> + ...`（Issue #2425）。引用なしの `true`／`false`／`NULL` は
+        // 従来のリテラル経路へ流す。先読みは `get` のみ（添字を使わない）。
         let is_add = match self.peek() {
             Some(Token::Ident(s)) => {
-                !s.eq_ignore_ascii_case("NULL")
-                    && !s.eq_ignore_ascii_case("true")
-                    && !s.eq_ignore_ascii_case("false")
-                    && !self.quoted_null.contains(&self.pos)
+                // 引用付き `"null"` は列名なので加算の左オペランドとして受理する
+                // （引用なしの NULL 定数だけをリテラル経路へ流す）。
+                (self.quoted_null.contains(&self.pos)
+                    || !(s.eq_ignore_ascii_case("NULL")
+                        || s.eq_ignore_ascii_case("true")
+                        || s.eq_ignore_ascii_case("false")))
                     && matches!(
                         self.tokens.get(self.pos.saturating_add(1)),
                         Some(Token::Punct('+'))
@@ -22733,6 +22735,28 @@ mod tests {
             let err = validate_insert(&sql, &lookup, LedgerMode::Ledgered).unwrap_err();
             assert_eq!(err.wire_code(), "42601", "{sql}");
         }
+    }
+
+    /// 引用付き `"null"` 列は加算の左オペランドとして受理し、引用なしの `NULL` 定数とは
+    /// 区別する（引用なしは従来どおり `42601`）。
+    #[test]
+    fn upsert_set_add_accepts_quoted_null_column() {
+        let lookup = catalog_with(&["documents"]);
+        let sql = "INSERT INTO documents (id, \"null\") VALUES (1, 1) ON CONFLICT (id) \
+                   DO UPDATE SET \"null\" = \"null\" + 1 USING OPERATION_ID 'op-add-q'";
+        let stmt = validate_insert(sql, &lookup, LedgerMode::Ledgered).expect(sql);
+        let Some(OnConflictClause {
+            action: OnConflictAction::DoUpdate(a),
+            ..
+        }) = stmt.on_conflict
+        else {
+            panic!("expected DoUpdate");
+        };
+        assert!(matches!(a[0].1, UpsertValue::Add { .. }));
+        let bare = "INSERT INTO documents (id, n) VALUES (1, 1) ON CONFLICT (id) \
+                    DO UPDATE SET n = NULL + 1 USING OPERATION_ID 'op-add-q2'";
+        let err = validate_insert(bare, &lookup, LedgerMode::Ledgered).unwrap_err();
+        assert_eq!(err.wire_code(), "42601");
     }
 
     /// INSERT の VALUES は `NULL`（大小無視）を `InsertLiteral::Null` として受理する
