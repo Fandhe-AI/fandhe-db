@@ -2038,6 +2038,17 @@ fn push_dml_where_predicates(
     predicates: &[crate::sql::allowlist::WherePredicate],
     udf_registry: &crate::sql::udf_call::UdfRegistry,
 ) -> Result<(), crate::sql::allowlist::SqlSurfaceError> {
+    // `mark_explicit_where` の印はハッシュ入力へ混入させない（印導入前の台帳レコードとの
+    // ハッシュ互換、および明示 `WHERE visible()` との区別を保つ）。
+    let is_marker = |p: &crate::sql::allowlist::WherePredicate| {
+        matches!(
+            p,
+            crate::sql::allowlist::WherePredicate::PredicateCall { name }
+                if name == crate::sql::allowlist::EXPLICIT_WHERE_MARKER
+        )
+    };
+    let predicates: Vec<&crate::sql::allowlist::WherePredicate> =
+        predicates.iter().filter(|p| !is_marker(p)).collect();
     let count = u32::try_from(predicates.len()).map_err(|_| dml_hash_field_too_large())?;
     b.push_raw(&count.to_le_bytes());
 
@@ -5204,6 +5215,27 @@ mod tests {
             h_empty, h_populated,
             "UDF section must be omitted entirely when no UDF is referenced by WHERE"
         );
+    }
+
+    /// `WHERE TRUE` 等の畳み込み恒真 `WHERE` に注入される印（`EXPLICIT_WHERE_MARKER`）は
+    /// ハッシュに寄与せず（印導入前と同一＝空述語列と同一）、明示 `WHERE visible()` とは異なる。
+    #[test]
+    fn explicit_where_marker_is_excluded_from_dml_hash() {
+        use crate::sql::allowlist::{WherePredicate, EXPLICIT_WHERE_MARKER};
+        use crate::sql::udf_call::UdfRegistry;
+
+        let registry = UdfRegistry::default();
+        let marker = vec![WherePredicate::PredicateCall {
+            name: EXPLICIT_WHERE_MARKER.to_string(),
+        }];
+        let visible = vec![WherePredicate::PredicateCall {
+            name: "visible".to_string(),
+        }];
+        let marked = for_delete_where("t", &marker, &registry).expect("hash");
+        let empty = for_delete_where("t", &[], &registry).expect("hash");
+        let explicit = for_delete_where("t", &visible, &registry).expect("hash");
+        assert_eq!(marked, empty);
+        assert_ne!(marked, explicit);
     }
 
     /// golden 固定（SQL-42・Issue #1521）: lexer が `%`／単独 `#` を字句化しても、

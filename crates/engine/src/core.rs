@@ -1346,8 +1346,8 @@ struct HnswEngineState {
 /// fail-closed に拒否する。
 ///
 /// - 空列（`WHERE` 句省略に相当）は全行対象の DML になりうるため `42601` で拒否する
-///   （SQL 表層の `WHERE` 句省略が構文段で拒否されることとのパリティ。
-///   `bind_predicate_delete` 自体には空列を拒否するガードが無いため、
+///   （SQL 表層は SQL-36・Issue #1743 で省略を受理するが、NoSQL 表層は SQL-36 (5) により空列を拒否し続ける。意図的な非対称。
+///   束縛段は空列（省略）を通すため、
 ///   NoSQL 経路はこの関数が唯一の防御になる）。
 /// - 葉として `Equality`／`BoolEquality`／`Prefix`／`Between`／`IsNull`／`Compare`／
 ///   `InList` を許可し、`Not` はそれらを**直接**包む場合に限り許可する（再帰しない。
