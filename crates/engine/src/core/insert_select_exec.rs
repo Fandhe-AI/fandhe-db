@@ -1,7 +1,8 @@
 //! `INSERT ... SELECT` の実行本体（SQL-51・Issue #1733。親: #1731）。
 //!
 //! 責務境界: 構文検証と束縛（列数・型の静的照合）は構文・束縛側（#1732）、内容照合ハッシュの
-//! 文正規化（#1734）は台帳側の担当。本モジュールは検証済みの内側 SELECT を **書き込むセッションの
+//! 文正規化（#1734）は台帳側の担当で、本モジュールは渡された文ハッシュで台帳を照合・記録する
+//! （内側 SELECT の評価前に事前照合し、0 行でも記録する）。本モジュールは検証済みの内側 SELECT を **書き込むセッションの
 //! `PolicyContext`** で既存の読み取り経路（`execute_read_statement_with_limits`）に通して実体化し、
 //! 結果行を `Vec<BoundInsert>` へ変換して、複数行 `VALUES`・COPY と同じ書き込み経路
 //! （`sql::exec::execute_insert_*_in`）へ渡すところまでを担う（第 2 の書き込み経路を作らない）。
@@ -31,6 +32,7 @@
 use super::EngineCore;
 use crate::catalog::{CatalogError, TableSchema};
 use crate::policy::PolicyContext;
+use crate::recovery::content_hash::ContentHash;
 use crate::recovery::required_op_id::OperationId;
 use crate::result_limits::{ResultLimits, MAX_RESULT_ROWS_HARD_CAP};
 use crate::sql::allowlist::{Projection, SqlSurfaceError, Statement};
@@ -56,6 +58,11 @@ pub(super) struct InsertSelectRequest<'a> {
     /// 結果行数を `cap` と照合して超過を `54000` にする。
     pub select: Statement,
     pub operation_id: Option<OperationId>,
+    /// 正規化済みの文から導いた台帳照合ハッシュ（`recovery::content_hash::for_insert_select`・#1734）。
+    /// 内側 SELECT の**結果行の値は材料にしない**ため、再送時に結果が変わっても同一文は `23505`、
+    /// 別の文は `22023` になる。呼び出し元（#1732 の束縛側）が `USING OPERATION_ID` 句を除いた
+    /// トークン列から算出して渡す。
+    pub statement_hash: ContentHash,
     pub returning: Option<&'a Projection>,
     /// `ON CONFLICT` が付いているか（併用は別 Issue のため `0A000`）。
     pub has_on_conflict: bool,
@@ -96,6 +103,24 @@ impl EngineCore {
         // RETURNING は評価より前に束縛する（未知の列は SELECT を走らせる前に `42703`）。
         let returning = crate::sql::parser::bind_returning(req.returning, &schema)?;
         let targets = resolve_target_columns(&schema, req.columns)?;
+
+        // 書き込み先。台帳の事前照合・0 行の台帳記録・本書き込みで同じ形に揃える。
+        let make_target = || match &mode {
+            InsertSelectTxn::Autocommit => WriteTarget::Autocommit(&self.storage),
+            InsertSelectTxn::InTxn(write_txn) => WriteTarget::InTxn(write_txn),
+        };
+
+        // 台帳の事前照合は内側 SELECT の評価より前に行う（SQL-51 (5)・RECOVER-10/11）。既に記録済みの
+        // `operation_id` は、結果が変わっていても同一文なら `23505`、別文なら `22023` で、SELECT を
+        // 評価せずに拒否する。
+        crate::sql::exec::precheck_insert_select_ledger(
+            &make_target(),
+            ctx,
+            req.table_name,
+            req.operation_id.as_ref(),
+            self.ledger_mode,
+            &req.statement_hash,
+        )?;
 
         let cap = self.insert_select_row_cap();
         let fetch = cap
@@ -174,8 +199,24 @@ impl EngineCore {
             self.validate_insert_row_batch_limits(&bounds)?;
         }
 
-        // 0 行は書き込みも台帳記録もしない（既存のバッチ経路は空を `22000` にするためここで分岐）。
+        // 書き込み経路が台帳へ記録するハッシュを、結果行の値ではなく文のハッシュへ差し替える
+        // （記録先の表が一致する記録だけ。ガードは本関数の末尾まで保持する）。
+        let _ledger_scope = crate::sql::insert_select_scope::InsertSelectLedgerScope::enter(
+            req.table_name,
+            req.statement_hash,
+        );
+
+        // 0 行は行を書かないが、台帳には記録する（後日の同一 `operation_id` 再送が新たに挿入される
+        // 事故を防ぐ。既存のバッチ経路は空を `22000` にするためここで分岐）。
         if bounds.is_empty() {
+            crate::sql::exec::record_insert_select_ledger_only(
+                make_target(),
+                ctx,
+                req.table_name,
+                req.operation_id.as_ref(),
+                self.ledger_mode,
+                &req.statement_hash,
+            )?;
             return Ok(match returning {
                 None => SqlOutcome::Insert(InsertOutcome {
                     rows_affected: 0,
@@ -206,10 +247,7 @@ impl EngineCore {
             }
             _ => None,
         };
-        let target = match &mode {
-            InsertSelectTxn::Autocommit => WriteTarget::Autocommit(&self.storage),
-            InsertSelectTxn::InTxn(write_txn) => WriteTarget::InTxn(write_txn),
-        };
+        let target = make_target();
         match returning {
             None => crate::sql::exec::execute_insert_batch_with_schema_in(
                 target,
@@ -298,6 +336,16 @@ mod tests {
         }
     }
 
+    /// 文ハッシュ（#1734）。`INSERT INTO <table> <select>` のトークン列から導く（句の有無は無関係）。
+    fn test_stmt_hash(table: &str, select: &str) -> ContentHash {
+        let sql = format!("INSERT INTO {table} {select}");
+        let toks = crate::sql::lexer::tokenize(&sql).expect("tokenize");
+        crate::recovery::content_hash::for_insert_select(
+            crate::recovery::content_hash::strip_operation_id_clause(&toks),
+        )
+        .expect("hash")
+    }
+
     fn insert_select(
         core: &EngineCore,
         c: &PolicyContext,
@@ -319,6 +367,7 @@ mod tests {
                 columns: Some(&cols),
                 select: select_stmt(core, select),
                 operation_id: Some(OperationId::parse(op).expect("op id")),
+                statement_hash: test_stmt_hash("dst", select),
                 returning: None,
                 has_on_conflict: false,
             },
@@ -349,6 +398,7 @@ mod tests {
                     columns: Some(&cols),
                     select: select_stmt(&core, "SELECT 1, 'ja'"),
                     operation_id: Some(OperationId::parse("op-const").expect("op id")),
+                    statement_hash: test_stmt_hash("t", "s389"),
                     returning: None,
                     has_on_conflict: false,
                 },
@@ -538,6 +588,7 @@ mod tests {
                         "SELECT id, embedding, lang FROM src ORDER BY id LIMIT 100",
                     ),
                     operation_id: Some(OperationId::parse("op-is-ret").expect("op")),
+                    statement_hash: test_stmt_hash("t", "s578"),
                     returning: Some(&projection),
                     has_on_conflict: false,
                 },
@@ -594,6 +645,7 @@ mod tests {
                     columns: Some(&cols),
                     select: select_stmt(&core, "SELECT id, embedding, lang FROM src LIMIT 100"),
                     operation_id: Some(OperationId::parse("op-zero").expect("op")),
+                    statement_hash: test_stmt_hash("t", "s634"),
                     returning: Some(&projection),
                     has_on_conflict: false,
                 },
@@ -624,6 +676,7 @@ mod tests {
                     columns: None,
                     select: select_stmt(&core, "SELECT id, embedding, lang FROM src LIMIT 1"),
                     operation_id: None,
+                    statement_hash: test_stmt_hash("t", "s664"),
                     returning: None,
                     has_on_conflict: true,
                 },
@@ -658,6 +711,7 @@ mod tests {
                 columns: Some(&cols),
                 select: select_stmt(core, select),
                 operation_id: Some(OperationId::parse(op).expect("op id")),
+                statement_hash: test_stmt_hash(table, select),
                 returning: None,
                 has_on_conflict: false,
             },
@@ -825,5 +879,135 @@ mod tests {
         .expect("insert");
         crate::recovery::commit_boundary::commit(txn).expect("commit");
         assert_eq!(count(&core, &a, "d2"), 2);
+    }
+
+    const ALL_SRC: &str = "SELECT id, embedding, lang FROM src LIMIT 100";
+
+    // 対象ビヘイビア: SQL-51 (5)・RECOVER-10/11（ポインタ）。結果が変わった後の同一文の再送は、
+    // 結果値ベースの `22023` ではなく文ハッシュ照合の `23505` になり、二重挿入しない。
+    #[test]
+    fn resend_after_result_change_is_23505() {
+        let dir = tempdir();
+        let core = open(dir.path());
+        let a = ctx("tenant-a");
+        seed(&core, &a, "src", 2, "op-seed-a");
+        insert_select(&core, &a, ALL_SRC, "op-is-chg").expect("first");
+        assert_eq!(count(&core, &a, "dst"), 2);
+        run(
+            &core,
+            &a,
+            "INSERT INTO src (id, embedding, lang) VALUES (9, '[9.0,0.0]', 'ja') \
+             USING OPERATION_ID 'op-seed-more'",
+        )
+        .expect("seed more");
+        let err = insert_select(&core, &a, ALL_SRC, "op-is-chg").unwrap_err();
+        assert_eq!(err.wire_code(), "23505");
+        assert_eq!(count(&core, &a, "dst"), 2);
+    }
+
+    // 対象ビヘイビア: SQL-51 (5)・RECOVER-10（ポインタ）。同じ operation_id で別の文は `22023`。
+    #[test]
+    fn same_operation_id_different_statement_is_22023() {
+        let dir = tempdir();
+        let core = open(dir.path());
+        let a = ctx("tenant-a");
+        seed(&core, &a, "src", 2, "op-seed-a");
+        insert_select(&core, &a, ALL_SRC, "op-is-diff").expect("first");
+        let err = insert_select(
+            &core,
+            &a,
+            "SELECT id, embedding, lang FROM src WHERE lang = 'ja' LIMIT 100",
+            "op-is-diff",
+        )
+        .unwrap_err();
+        assert_eq!(err.wire_code(), "22023");
+        assert_eq!(count(&core, &a, "dst"), 2);
+    }
+
+    // 対象ビヘイビア: SQL-51 (5)・RECOVER-11（ポインタ）。初回が 0 行でも台帳に記録され、
+    // 後日（元が増えた後）の同一 operation_id・同一文の再送は挿入せず `23505`。
+    #[test]
+    fn zero_row_first_run_is_recorded_in_ledger() {
+        let dir = tempdir();
+        let core = open(dir.path());
+        let a = ctx("tenant-a");
+        let out = insert_select(&core, &a, ALL_SRC, "op-is-zero").expect("zero rows");
+        assert!(matches!(
+            out,
+            SqlOutcome::Insert(InsertOutcome {
+                rows_affected: 0,
+                ..
+            })
+        ));
+        seed(&core, &a, "src", 2, "op-seed-a");
+        let err = insert_select(&core, &a, ALL_SRC, "op-is-zero").unwrap_err();
+        assert_eq!(err.wire_code(), "23505");
+        assert_eq!(count(&core, &a, "dst"), 0);
+    }
+
+    // 対象ビヘイビア: SQL-51 (5)（ポインタ）。照合は内側 SELECT の評価前: 記録済みの operation_id・
+    // 同一文ハッシュなら、評価すれば形不一致（`XX000`）になる SELECT でも `23505` で拒否する。
+    #[test]
+    fn ledger_precheck_runs_before_inner_select_evaluation() {
+        let dir = tempdir();
+        let core = open(dir.path());
+        let a = ctx("tenant-a");
+        seed(&core, &a, "src", 2, "op-seed-a");
+        insert_select(&core, &a, ALL_SRC, "op-is-pre").expect("first");
+        let cols = vec![
+            "id".to_string(),
+            "embedding".to_string(),
+            "lang".to_string(),
+        ];
+        let mut s = SessionState::default();
+        let err = core
+            .execute_insert_select(
+                InsertSelectTxn::Autocommit,
+                &a,
+                &mut s,
+                InsertSelectRequest {
+                    table_name: "dst",
+                    columns: Some(&cols),
+                    select: select_stmt(&core, "SELECT id FROM src LIMIT 1"),
+                    operation_id: Some(OperationId::parse("op-is-pre").expect("op id")),
+                    statement_hash: test_stmt_hash("dst", ALL_SRC),
+                    returning: None,
+                    has_on_conflict: false,
+                },
+            )
+            .unwrap_err();
+        assert_eq!(err.wire_code(), "23505");
+    }
+
+    // 対象ビヘイビア: SQL-51 (5)・SQL-31（ポインタ）。明示トランザクションでも 0 行の記録・再送の
+    // 照合が働く（commit 後の同一文の再送は `23505`）。
+    #[test]
+    fn in_txn_zero_row_run_is_recorded_and_resend_is_23505() {
+        let dir = tempdir();
+        let core = open(dir.path());
+        let a = ctx("tenant-a");
+        let txn = core.storage.begin_write_txn().expect("write txn");
+        insert_select_into(
+            &core,
+            &a,
+            InsertSelectTxn::InTxn(&txn),
+            "dst",
+            &["id", "embedding", "lang"],
+            ALL_SRC,
+            "op-txn-zero",
+        )
+        .expect("zero rows");
+        let err = insert_select_into(
+            &core,
+            &a,
+            InsertSelectTxn::InTxn(&txn),
+            "dst",
+            &["id", "embedding", "lang"],
+            ALL_SRC,
+            "op-txn-zero",
+        )
+        .unwrap_err();
+        assert_eq!(err.wire_code(), "23505");
+        crate::recovery::commit_boundary::commit(txn).expect("commit");
     }
 }
