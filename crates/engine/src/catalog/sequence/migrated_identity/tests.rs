@@ -428,7 +428,7 @@ fn migrated_real(
         }
         txn.commit_raw_for_test().expect("commit");
     }
-    let n = crate::catalog::legacy_id_migration::migrate_legacy_ids(&s).expect("migrate");
+    let n = crate::catalog::legacy_id_migration::migrate_marks_only(&s).expect("migrate");
     assert_eq!(n, tables.len());
     (s, g)
 }

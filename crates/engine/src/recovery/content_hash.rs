@@ -167,6 +167,15 @@ enum OpTag {
     /// [`OpTag::TruncateCascade`] を使い、RESTART だけを別ドメインに分離する。
     /// [`for_truncate_tables_restart_identity`] 参照。
     TruncateRestartIdentity = 20,
+    /// 移行済み表（`RowIdentity::MigratedId`）への、疑似列 `id` を省略した単一行 INSERT 用
+    /// （TABLE-24・Issue #1699。設計記録 `docs/design/migrated-id-identity.md` D8）。`id` は
+    /// サーバーが払い出すためハッシュ材料に含めない。明示 `id` の INSERT（[`OpTag::Insert`]）とは
+    /// 別ドメインに分離し、省略した文が `id = 0` を明示した文と衝突しないようにする。
+    /// [`for_typed_insert_identity`] 参照。複数行・UPSERT は #1700 が同じ系列で拡張する。
+    InsertIdentity = 21,
+    /// `VALUES` 内の単独時刻関数・`nextval` 等を含む、`id` 省略の単一行 INSERT 用
+    /// （[`OpTag::InsertIdentity`] の式つき版。[`for_typed_insert_identity_expr`] 参照）。
+    InsertIdentityExpr = 22,
 }
 
 /// 長さプレフィクス付きフィールド連結でハッシュ入力を組み立てるビルダー
@@ -763,6 +772,34 @@ pub(crate) fn for_typed_insert(
     Ok(b.finish())
 }
 
+/// 疑似列 `id` を省略した単一行 INSERT 用（TABLE-24・Issue #1699、設計 D8）。操作種別タグは
+/// [`OpTag::InsertIdentity`]、材料は [`for_typed_insert`] から `id` を除いたもの
+/// （`visibility` → embedding → 列名付きペア）。`id` は書き込み段が払い出すため材料にせず、
+/// 明示 `id` の文（[`OpTag::Insert`]）とはタグで分離する（`id = 0` を明示した文と衝突しない）。
+pub(crate) fn for_typed_insert_identity(
+    visibility: Visibility,
+    embedding: &[f32],
+    columns: &[(&str, &Value)],
+) -> Result<ContentHash, StorageError> {
+    let mut b = HashInputBuilder::new(OpTag::InsertIdentity);
+    b.push_u8(visibility.to_byte());
+    push_vector(&mut b, embedding)?;
+    push_named_scalar_columns(&mut b, columns)?;
+    Ok(b.finish())
+}
+
+/// [`for_typed_insert_identity`] の式つき版（`VALUES` 内の単独時刻関数・`nextval` 等を構文形で
+/// 材料にする。タグは [`OpTag::InsertIdentityExpr`]。列の扱いは [`for_typed_insert_expr`] と同じ）。
+pub(crate) fn for_typed_insert_identity_expr(
+    visibility: Visibility,
+    embedding: &[f32],
+    columns: &[(&str, HashColumnInput<'_>)],
+) -> Result<ContentHash, StorageError> {
+    let mut b = HashInputBuilder::new(OpTag::InsertIdentityExpr);
+    push_expr_row_body(&mut b, visibility, embedding, columns)?;
+    Ok(b.finish())
+}
+
 /// [`for_typed_insert_batch`]・`tenant::insert_typed_rows_unchecked` が共有する
 /// 1 行分のハッシュ材料（`(id, visibility, embedding, 非 VECTOR 列の列名付き
 /// ペア列)`）。`clippy::type_complexity` 回避のための型エイリアス（意味は
@@ -1055,6 +1092,16 @@ fn push_expr_row(
     columns: &[(&str, HashColumnInput<'_>)],
 ) -> Result<(), StorageError> {
     b.push_u64(id);
+    push_expr_row_body(b, visibility, embedding, columns)
+}
+
+/// [`push_expr_row`] の `id` を除いた本体（`id` 省略の INSERT〔Issue #1699〕と共有する）。
+fn push_expr_row_body(
+    b: &mut HashInputBuilder,
+    visibility: Visibility,
+    embedding: &[f32],
+    columns: &[(&str, HashColumnInput<'_>)],
+) -> Result<(), StorageError> {
     b.push_u8(visibility.to_byte());
     push_vector(b, embedding)?;
     let written = columns
@@ -3857,6 +3904,61 @@ mod tests {
                     .as_bytes()
             ),
             "3430c25e760c5c1c5fc94538d0efaf312fba2773ac0052cadde806468e73853d"
+        );
+    }
+
+    /// Issue #1699（D8）: `id` 省略の単一行 INSERT のハッシュは、`id` を材料にせず、
+    /// どの明示 `id`（`0` を含む）の文のハッシュとも一致しない。明示 `id` の文のバイト列は不変
+    /// （golden）。式つき版も同様。
+    #[test]
+    fn omitted_id_insert_hash_is_a_separate_domain() {
+        fn to_hex(bytes: &[u8; 32]) -> String {
+            bytes.iter().map(|b| format!("{b:02x}")).collect()
+        }
+        let v = Value::Text("x".to_string());
+        let cols: [(&str, &Value); 1] = [("a", &v)];
+        let vis = Visibility::Private;
+        let omitted = for_typed_insert_identity(vis, &[], &cols).expect("hash");
+        for id in [0u64, 1, u64::MAX] {
+            let explicit = for_typed_insert(id, vis, &[], &cols).expect("hash");
+            assert_ne!(omitted, explicit, "id={id}");
+        }
+        // 材料が同じなら決定的、列の値が違えば別のハッシュ。
+        assert_eq!(
+            omitted,
+            for_typed_insert_identity(vis, &[], &cols).expect("hash")
+        );
+        let w = Value::Text("y".to_string());
+        assert_ne!(
+            omitted,
+            for_typed_insert_identity(vis, &[], &[("a", &w)]).expect("hash")
+        );
+        // 式つき版も明示 id の式つき版と別ドメイン。
+        let expr_cols = [("a", HashColumnInput::Value(&v))];
+        let omitted_expr = for_typed_insert_identity_expr(vis, &[], &expr_cols).expect("hash");
+        assert_ne!(omitted, omitted_expr);
+        for id in [0u64, 1] {
+            assert_ne!(
+                omitted_expr,
+                for_typed_insert_expr(id, vis, &[], &expr_cols).expect("hash")
+            );
+        }
+        // golden（レイアウトの固定。更新しない）。
+        assert_eq!(
+            to_hex(omitted.as_bytes()),
+            "96d6ca782d35a7854d709b9fe94a1b9513ab28f98115cb6be262f8652cde3bb2"
+        );
+        assert_eq!(
+            to_hex(
+                for_typed_insert(7, vis, &[], &cols)
+                    .expect("hash")
+                    .as_bytes()
+            ),
+            "f70ea74c87be6d3c39adae39814557eaa45c8dc1e07b2376eaea56070a6fcd79"
+        );
+        assert_eq!(
+            to_hex(omitted_expr.as_bytes()),
+            "e15729aef042a52c8b426b26930c2ada49d9dbc54b6902c5afe39fcba3984620"
         );
     }
 

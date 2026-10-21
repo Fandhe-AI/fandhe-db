@@ -1467,6 +1467,127 @@ fn reject_missing_not_null(
     Ok(())
 }
 
+/// 採番に使うアロケータとセッション状態を解決する（`nextval` 列の採番と、移行済み表の `id` 省略
+/// INSERT の採番〔Issue #1699〕が共有する。第 2 の実装を作らない）。一時表（セッション専用の別 DB）は
+/// 永続 DB の SEQUENCE カタログを解決できず、カーソルも一時 DB へ永続化してしまうため明示的に拒否する
+/// （`42P01` の誤報を避ける）。`SequenceScope` が無い経路は `Autocommit` の `Storage` のアロケータだけを
+/// 使い（セッション状態なし）、明示トランザクションでスコープが無ければ `0A000`（fail-closed）。
+fn sequence_runtime(
+    target: &WriteTarget<'_>,
+) -> Result<
+    (
+        std::sync::Arc<crate::catalog::sequence::SequenceAllocator>,
+        Option<crate::sql::sequence_scope::SharedSessionSequences>,
+    ),
+    TenantWriteError,
+> {
+    let sql_err = |e: SqlSurfaceError| TenantWriteError::SequenceEvaluationFailed(e);
+    if matches!(target, WriteTarget::Autocommit(storage) if storage.is_temp_scoped()) {
+        return Err(sql_err(SqlSurfaceError::FeatureNotSupported {
+            detail: "nextval is not supported for temporary tables".to_string(),
+        }));
+    }
+    match crate::sql::sequence_scope::current() {
+        Some(c) => Ok((c.allocator, c.session)),
+        None => match target {
+            WriteTarget::Autocommit(storage) => {
+                Ok((std::sync::Arc::clone(storage.sequence_allocator()), None))
+            }
+            WriteTarget::InTxn(_) => Err(sql_err(SqlSurfaceError::FeatureNotSupported {
+                detail: "nextval is not supported in this context".to_string(),
+            })),
+        },
+    }
+}
+
+/// 自テナントの SEQUENCE から次の値を払い出し、セッションの `currval` 状態へ記録する
+/// （[`sequence_runtime`] とあわせて採番の唯一の実体。`AllocError` を wire_code 契約へ写像する:
+/// 上限到達は `2200H`、カーソル過多は `54000`、アロケータ破損は `XX000`）。
+fn nextval_recorded(
+    allocator: &crate::catalog::sequence::SequenceAllocator,
+    session: Option<&crate::sql::sequence_scope::SharedSessionSequences>,
+    write_txn: &redb::WriteTransaction,
+    tenant_id: &str,
+    seq_id: u64,
+    params: &crate::catalog::sequence::SequenceParams,
+    restart_value: i64,
+) -> Result<i64, TenantWriteError> {
+    use crate::catalog::sequence::AllocError;
+    let sql_err = |e: SqlSurfaceError| TenantWriteError::SequenceEvaluationFailed(e);
+    let v = allocator
+        .next_value_in_txn(write_txn, tenant_id, seq_id, params, restart_value)
+        .map_err(|e| match e {
+            AllocError::LimitReached { ascending } => {
+                sql_err(SqlSurfaceError::SequenceGeneratorLimitExceeded { ascending })
+            }
+            AllocError::TooManyCursors => {
+                sql_err(SqlSurfaceError::payload_too_large("too many sequences"))
+            }
+            AllocError::Poisoned => sql_err(SqlSurfaceError::Internal {
+                detail: "sequence allocator unavailable".to_string(),
+            }),
+            AllocError::Catalog(c) => TenantWriteError::Catalog(c),
+        })?;
+    if let Some(session) = session {
+        let mut state = session.lock().map_err(|_| {
+            sql_err(SqlSurfaceError::Internal {
+                detail: "sequence session state unavailable".to_string(),
+            })
+        })?;
+        if !state.record_nextval(tenant_id, seq_id, v) {
+            return Err(sql_err(SqlSurfaceError::payload_too_large(
+                "too many sequences in session",
+            )));
+        }
+    }
+    Ok(v)
+}
+
+/// 移行済み表の疑似列 `id` を省略した INSERT の `id` を、同じ write txn 内で所有 SEQUENCE
+/// （`<table>_id_seq`）から払い出して行 id（`u64`）として返す（TABLE-24・Issue #1699。台帳照合と
+/// NOT NULL 検査の後に呼ぶ。再送の `23505` で値を消費しない）。払い出した値は `RETURNING id` の
+/// 投影用にスコープへ記録する。
+///
+/// 所有 SEQUENCE が無い移行済み表（移行 2 段目が前提不一致で見送った表）は、PostgreSQL で DEFAULT の無い
+/// NOT NULL 列を省略した場合と同じ `23502`（列名 `id`）で固定文言拒否する。判定はカタログ（全テナント
+/// 共有）だけで決まりテナントの状態を引かないので、他テナントの存在オラクルにならない。
+/// 払い出し値は MINVALUE 1 の `i64` で、`u64` へは checked に変換する（失敗は fail-closed）。
+/// 既存行との衝突は自動で次の値へ飛ばさず、行挿入が `IdConflict`（`23505`）を返す。
+fn assign_pseudo_id(
+    target: &WriteTarget<'_>,
+    write_txn: &redb::WriteTransaction,
+    tenant_id: &str,
+    table: &str,
+) -> Result<u64, TenantWriteError> {
+    let (allocator, session) = sequence_runtime(target)?;
+    let Some((_, def)) = crate::catalog::sequence::migrated_id_sequence_in_txn(write_txn, table)?
+    else {
+        return Err(TenantWriteError::Catalog(
+            CatalogError::NotNullConstraintViolation("id".to_string()),
+        ));
+    };
+    let value = nextval_recorded(
+        &allocator,
+        session.as_ref(),
+        write_txn,
+        tenant_id,
+        def.id,
+        &def.params,
+        def.restart_value,
+    )?;
+    let id = u64::try_from(value).map_err(|_| {
+        TenantWriteError::Catalog(CatalogError::Invalid(
+            "assigned id is out of range".to_string(),
+        ))
+    })?;
+    crate::sql::sequence_scope::record_assigned(
+        0,
+        crate::sql::sequence_scope::PSEUDO_ID_COLUMN,
+        value,
+    );
+    Ok(id)
+}
+
 /// 台帳照合の後に、SEQUENCE の印（[`VolatileColumn::Sequence`]・[`VolatileColumn::DefaultSequence`]）を
 /// 持つ行の仮値 `Null` を、書き込み txn 内で払い出した値（または `currval`）へ差し替えた行の複製を
 /// 返す（TABLE-24・Issue #1690。印が 1 つも無ければ `None` で何も複製しない）。
@@ -1494,26 +1615,7 @@ fn assign_sequence_values(
         return Ok(None);
     }
     let sql_err = |e: SqlSurfaceError| TenantWriteError::SequenceEvaluationFailed(e);
-    // 一時表（セッション専用の別 DB）は永続 DB の SEQUENCE カタログを解決できず、カーソルも
-    // 一時 DB へ永続化してしまうため、採番を伴う書き込みは明示的に拒否する（`42P01` の誤報を避ける）。
-    if matches!(target, WriteTarget::Autocommit(storage) if storage.is_temp_scoped()) {
-        return Err(sql_err(SqlSurfaceError::FeatureNotSupported {
-            detail: "nextval is not supported for temporary tables".to_string(),
-        }));
-    }
-    let (allocator, session) = match sequence_scope::current() {
-        Some(c) => (c.allocator, c.session),
-        None => match target {
-            WriteTarget::Autocommit(storage) => {
-                (std::sync::Arc::clone(storage.sequence_allocator()), None)
-            }
-            WriteTarget::InTxn(_) => {
-                return Err(sql_err(SqlSurfaceError::FeatureNotSupported {
-                    detail: "nextval is not supported in this context".to_string(),
-                }))
-            }
-        },
-    };
+    let (allocator, session) = sequence_runtime(target)?;
 
     let mut out: Vec<Vec<crate::row_codec::Value>> = Vec::new();
     out.try_reserve_exact(row_values.len()).map_err(|_| {
@@ -1562,37 +1664,15 @@ fn assign_sequence_values(
             let (seq_id, params, restart_value) =
                 (seq_def.id, seq_def.params, seq_def.restart_value);
             let value: i64 = match func {
-                SequenceFunc::Nextval => {
-                    let v = allocator
-                        .next_value_in_txn(write_txn, tenant_id, seq_id, &params, restart_value)
-                        .map_err(|e| match e {
-                            AllocError::LimitReached { ascending } => {
-                                sql_err(SqlSurfaceError::SequenceGeneratorLimitExceeded {
-                                    ascending,
-                                })
-                            }
-                            AllocError::TooManyCursors => {
-                                sql_err(SqlSurfaceError::payload_too_large("too many sequences"))
-                            }
-                            AllocError::Poisoned => sql_err(SqlSurfaceError::Internal {
-                                detail: "sequence allocator unavailable".to_string(),
-                            }),
-                            AllocError::Catalog(c) => TenantWriteError::Catalog(c),
-                        })?;
-                    if let Some(session) = &session {
-                        let mut state = session.lock().map_err(|_| {
-                            sql_err(SqlSurfaceError::Internal {
-                                detail: "sequence session state unavailable".to_string(),
-                            })
-                        })?;
-                        if !state.record_nextval(tenant_id, seq_id, v) {
-                            return Err(sql_err(SqlSurfaceError::payload_too_large(
-                                "too many sequences in session",
-                            )));
-                        }
-                    }
-                    v
-                }
+                SequenceFunc::Nextval => nextval_recorded(
+                    &allocator,
+                    session.as_ref(),
+                    write_txn,
+                    tenant_id,
+                    seq_id,
+                    &params,
+                    restart_value,
+                )?,
                 SequenceFunc::Currval => {
                     let Some(session) = &session else {
                         return Err(sql_err(SqlSurfaceError::FeatureNotSupported {
@@ -1703,6 +1783,7 @@ pub fn insert_typed_row(
         ledger_write,
         None,
         &[],
+        false,
     )
 }
 
@@ -1742,6 +1823,7 @@ pub(crate) fn insert_typed_row_unchecked(
     ledger_write: LedgerWrite<'_>,
     expected_schema: Option<&crate::catalog::TableSchema>,
     volatile_default_columns: &[VolatileColumn],
+    id_omitted: bool,
 ) -> Result<(), TenantWriteError> {
     insert_typed_row_impl(
         false,
@@ -1754,6 +1836,7 @@ pub(crate) fn insert_typed_row_unchecked(
         ledger_write,
         expected_schema,
         volatile_default_columns,
+        id_omitted,
     )
 }
 
@@ -1771,10 +1854,18 @@ fn insert_typed_row_impl(
     ledger_write: LedgerWrite<'_>,
     expected_schema: Option<&crate::catalog::TableSchema>,
     volatile_default_columns: &[VolatileColumn],
+    id_omitted: bool,
 ) -> Result<(), TenantWriteError> {
     validate_relation_key(table)?;
     target.with_txn(|write_txn| {
         let schema = require_table_schema_write_any_identity(write_txn, table)?;
+        // `id` 省略は移行済み表だけが受理できる（束縛段の判定を、書き込み txn 内で取得した
+        // スキーマで再確認する。別の識別方式へ差し替わった表に仮値 `id` を書かない fail-closed）。
+        if id_omitted && !schema.is_migrated_id() {
+            return Err(TenantWriteError::Catalog(CatalogError::Invalid(
+                "table schema changed after the insert values were bound".to_string(),
+            )));
+        }
         if require_legacy {
             schema
                 .require_legacy_row_identity()
@@ -1831,14 +1922,24 @@ fn insert_typed_row_impl(
         // `VALUES` 内の単独時刻関数（Issue #2188）を含む文だけ、構文形を材料にする別ドメイン
         // （`InsertExpr`）を使う。省略列へ適用した DEFAULT（定数・時刻とも）は材料から除外し、
         // DEFAULT の変更を挟んだ再送が一致するようにする（Issue #1629 D1）。
+        // `id` を省略した文は `id` を材料にしない別ドメインのハッシュを使う（Issue #1699・D8。
+        // 明示 `id` の文のハッシュはバイト不変）。
         let content_hash = if has_values_expr(volatile_default_columns) {
             let expr_columns =
                 named_expr_columns(&schema, values, vector_idx, volatile_default_columns)?;
-            content_hash::for_typed_insert_expr(hash_id, visibility, embedding, &expr_columns)?
+            if id_omitted {
+                content_hash::for_typed_insert_identity_expr(visibility, embedding, &expr_columns)?
+            } else {
+                content_hash::for_typed_insert_expr(hash_id, visibility, embedding, &expr_columns)?
+            }
         } else {
             let named_columns =
                 named_value_columns(&schema, values, vector_idx, volatile_default_columns)?;
-            content_hash::for_typed_insert(hash_id, visibility, embedding, &named_columns)?
+            if id_omitted {
+                content_hash::for_typed_insert_identity(visibility, embedding, &named_columns)?
+            } else {
+                content_hash::for_typed_insert(hash_id, visibility, embedding, &named_columns)?
+            }
         };
         ledger::record_in_txn(
             write_txn,
@@ -1861,6 +1962,13 @@ fn insert_typed_row_impl(
         let values: &[crate::row_codec::Value] = match &sequence_rows {
             Some(rows) => rows.first().map(Vec::as_slice).unwrap_or(values),
             None => values,
+        };
+        // 移行済み表の `id` 省略は、台帳照合・NOT NULL 検査の後に所有 SEQUENCE から払い出す
+        // （Issue #1699。再送の `23505` で値を消費しない。TABLE-24 (3)）。
+        let id = if id_omitted {
+            assign_pseudo_id(&target, write_txn, ctx.tenant_id(), table)?
+        } else {
+            id
         };
         // 行のエンコードは台帳照合と NOT NULL 検査の後に行う（省略された非 nullable 列の仮値
         // `Null` が、再送判定より先に `22000` を起こさないため。Issue #1629）。

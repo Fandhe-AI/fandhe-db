@@ -32,9 +32,10 @@ use redb::{ReadableDatabase, ReadableTable, ReadableTableMetadata, TableDefiniti
 mod migrated_identity;
 
 // #2200 の移行 txn（`catalog::legacy_id_migration`）が呼ぶ入口を親モジュールへ公開する。
-// 結線までは未使用のため unused_imports を許容する。
-#[allow(unused_imports)]
-pub(crate) use migrated_identity::{assign_migrated_id_identity_in_txn, MigratedIdIdentityOutcome};
+pub(crate) use migrated_identity::{
+    assign_migrated_id_identity_in_txn, migrated_id_sequence_in_txn, tables_missing_id_sequence,
+    MigratedIdIdentityOutcome,
+};
 
 use crate::storage::read_source::ReadSource;
 
@@ -1277,8 +1278,8 @@ pub(crate) fn drop_owned_sequences_in_txn(
 
 /// 所有者が `matches` を満たす SEQUENCE の `(名前, 定義, 所有者)` を列挙する
 /// （[`MAX_SEQUENCES`] 件で打ち切り。読み取りハンドルは返す前に解放する）。
-fn owned_sequence_entries_in_txn(
-    write_txn: &redb::WriteTransaction,
+fn owned_sequence_entries_in_txn<S: ReadSource>(
+    write_txn: &S,
     matches: &impl Fn(&SequenceOwner) -> bool,
 ) -> Result<Vec<(String, SequenceDef, SequenceOwner)>> {
     let table = match ReadSource::open_table(write_txn, SEQUENCES_TABLE) {

@@ -644,6 +644,7 @@ fn bind_copy_record(
         values: bound_values,
         operation_id: operation_id.clone(),
         volatile_default_columns,
+        id_omitted: false,
     })
 }
 

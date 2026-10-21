@@ -3825,6 +3825,7 @@ pub(crate) fn execute_insert_with_schema_in(
         ledger_write,
         expected_schema,
         &bound.volatile_default_columns,
+        bound.id_omitted,
     )
     .map_err(map_insert_write_error)?;
 
@@ -5106,6 +5107,11 @@ pub(crate) fn execute_insert_batch_with_schema_in(
             "INSERT batch rows must share the same table and operation_id",
         ));
     }
+    // `id` を省略した行（仮値 `0`）は単一行 INSERT だけが受理する（Issue #1699。複数行は #1700）。
+    // 束縛段が拒否済みの多層防御で、仮値が行 id として書かれる fail-open を実行段でも塞ぐ。
+    if bounds.iter().any(|b| b.id_omitted) {
+        return Err(reject_id_omission_unsupported());
+    }
 
     let ledger_write = ledger_mode
         .resolve(first.operation_id.as_ref())
@@ -5134,6 +5140,13 @@ pub(crate) fn execute_insert_batch_with_schema_in(
         rows_affected,
         incremental: None,
     })
+}
+
+/// `id` 省略の行を受理できない経路（複数行・UPSERT）の固定文言拒否（`0A000`）。
+fn reject_id_omission_unsupported() -> SqlSurfaceError {
+    SqlSurfaceError::FeatureNotSupported {
+        detail: "omitting the id pseudo-column is only supported for single-row INSERT".to_string(),
+    }
 }
 
 /// 各行の揮発性 DEFAULT 適用列（`BoundInsert::volatile_default_columns`）を `tenant` の
@@ -5266,9 +5279,11 @@ pub(crate) fn execute_insert_returning_in(
     // `nextval`／`currval` の列（TABLE-24・Issue #1690）は束縛時点では仮値 `Null` のため、書き込み前の
     // 投影（バイト予算の検査）には列型の代表値を置き、書き込み後に払い出された値で投影し直す
     // （どちらも整数セルで大きさが同じなので、再投影は失敗しない）。印が無い文は従来どおり。
+    // `id` を省略した行（移行済み表の単一行 INSERT。Issue #1699）の `RETURNING id` も同じ方式で、
+    // 書き込み前は仮値 `0`（`u64` セルで大きさが同じ）で投影し、書き込み後に払い出し値で投影し直す。
     let has_sequence = bounds
         .iter()
-        .any(|b| b.volatile_default_columns.iter().any(is_sequence_mark));
+        .any(|b| b.id_omitted || b.volatile_default_columns.iter().any(is_sequence_mark));
     let mut rows = Vec::new();
     let mut budget = 0usize;
     for bound in bounds {
@@ -5329,9 +5344,21 @@ pub(crate) fn execute_insert_returning_in(
             let values = sequence_patched_values(bound, schema, |col| {
                 assigned.get(&(row_idx, col)).copied()
             })?;
+            let row_id = if bound.id_omitted {
+                let assigned_id = assigned
+                    .get(&(row_idx, crate::sql::sequence_scope::PSEUDO_ID_COLUMN))
+                    .copied()
+                    .and_then(|v| u64::try_from(v).ok())
+                    .ok_or_else(|| SqlSurfaceError::Internal {
+                        detail: "RETURNING id assignment mismatch".to_string(),
+                    })?;
+                assigned_id
+            } else {
+                bound.id
+            };
             rows.push(mask_returning_row_id(
                 schema,
-                crate::sql::returning::project_row(bound.id, &values, returning, &mut budget)?,
+                crate::sql::returning::project_row(row_id, &values, returning, &mut budget)?,
             ));
         }
     }
@@ -5488,6 +5515,10 @@ fn execute_upsert_inner(
         .resolve(bound.operation_id.as_ref())
         .map_err(|_| SqlSurfaceError::MissingOperationId)?;
 
+    // UPSERT は `id` 省略を受理しない（Issue #1699。束縛段が拒否済みの多層防御）。
+    if bound.rows.iter().any(|b| b.id_omitted) {
+        return Err(reject_id_omission_unsupported());
+    }
     let rows: Vec<(u64, &[crate::row_codec::Value])> = bound
         .rows
         .iter()
@@ -5993,6 +6024,7 @@ mod tests {
                 ],
                 operation_id: Some(op_id.clone()),
                 volatile_default_columns: Vec::new(),
+                id_omitted: false,
             }
         }
 
@@ -6132,6 +6164,7 @@ mod tests {
                     ],
                     operation_id: Some(seed_op_id),
                     volatile_default_columns: Vec::new(),
+                    id_omitted: false,
                 },
                 LedgerMode::Ledgered,
             )
@@ -6152,6 +6185,7 @@ mod tests {
                     ],
                     operation_id: Some(upsert_op_id.clone()),
                     volatile_default_columns: Vec::new(),
+                    id_omitted: false,
                 }],
                 target: crate::sql::parser::BoundConflictTarget::RowId,
                 action: BoundConflictAction::DoUpdate(vec![(

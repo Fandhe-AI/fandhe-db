@@ -170,6 +170,11 @@ pub(crate) fn current() -> Option<SequenceContext> {
     CURRENT.with(|c| c.borrow().clone())
 }
 
+/// 疑似列 `id`（移行済み表の `id` 省略 INSERT が払い出した値。Issue #1699）を表す列位置の番兵。
+/// 実在する列の位置と衝突しないよう `usize::MAX` を使い、`RETURNING` の投影が `id` だけを
+/// この記録で差し替える。
+pub(crate) const PSEUDO_ID_COLUMN: usize = usize::MAX;
+
 /// 書き込みが払い出した値を記録する（`RETURNING` 用）。
 /// スコープ外（NoSQL 等）では記録しない（読み手が居らず、スレッドローカルが際限なく増えるため）。
 pub(crate) fn record_assigned(row: usize, col: usize, value: i64) {

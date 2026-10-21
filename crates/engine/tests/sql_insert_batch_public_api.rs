@@ -47,6 +47,7 @@ fn bound(id: u64, op_id: Option<&str>) -> BoundInsert {
         ],
         operation_id: op_id.map(|s| OperationId::parse(s).expect("valid operation_id")),
         volatile_default_columns: Vec::new(),
+        id_omitted: false,
     }
 }
 
