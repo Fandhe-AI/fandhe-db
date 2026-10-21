@@ -80,6 +80,13 @@ pub(crate) fn derive_ctas_column_defs(
                 "CREATE TABLE AS column needs a valid name; specify a column alias",
             ));
         }
+        // RLS 内部列・構文予約語は `CREATE TABLE`／`ADD COLUMN` と同じく拒否する（fail-closed。
+        // `id` は CTAS では通常の列として許す契約のため対象外）。ASCII 大文字小文字は無視。
+        if is_reserved_ctas_column_name(name) {
+            return Err(SqlSurfaceError::unsupported(format!(
+                "column name {name:?} is reserved"
+            )));
+        }
         if out.iter().any(|c| &c.name == name) {
             return Err(SqlSurfaceError::duplicate_column(name.clone()));
         }
@@ -107,6 +114,14 @@ pub(crate) fn derive_ctas_column_defs(
         ));
     }
     Ok(out)
+}
+
+/// CTAS の列名として使えない予約名か（`tenant_id`／`visibility`／`check`／`constraint`）。
+/// `CREATE TABLE`／`ADD COLUMN` の予約列名判定と同じ集合から、CTAS が通常列として許す `id` を除く。
+fn is_reserved_ctas_column_name(name: &str) -> bool {
+    ["tenant_id", "visibility", "check", "constraint"]
+        .iter()
+        .any(|r| name.eq_ignore_ascii_case(r))
 }
 
 /// 導いた列定義から、制約なし・採番方式（暗黙の `id` を持たない）の [`ValidatedCreateTable`] を作る。
@@ -283,6 +298,16 @@ mod tests {
         assert_eq!(defs[0].name, "id");
         assert_eq!(defs[1].name, "k");
         assert!(defs.iter().all(|d| d.ty == ALIASED_ID_TYPE && d.nullable));
+    }
+
+    #[test]
+    fn sql52_1_reserved_column_names_rejected_via_list_and_alias() {
+        for r in ["tenant_id", "Visibility", "CHECK", "constraint"] {
+            let outs = [col("a", Some(ColumnType::Text))];
+            assert_eq!(code(derive_ctas_column_defs(&outs, &names(&[r]))), "42601");
+            let outs = [col(r, Some(ColumnType::Text))];
+            assert_eq!(code(derive_ctas_column_defs(&outs, &[])), "42601");
+        }
     }
 
     #[test]
