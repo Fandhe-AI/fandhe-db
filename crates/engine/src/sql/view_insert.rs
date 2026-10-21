@@ -22,8 +22,8 @@
 //! セッションの `PolicyContext` が決め、ビュー作成者の可視性は引き継がれない。
 
 use super::allowlist::{
-    OnConflictAction, OnConflictClause, Projection, SqlSurfaceError, TableLookup, UpsertValue,
-    ValidatedInsert, ValidatedViewInsert, ViewWriteOp, WherePredicate,
+    ConflictTargetSpec, OnConflictAction, OnConflictClause, Projection, SqlSurfaceError,
+    TableLookup, UpsertValue, ValidatedInsert, ValidatedViewInsert, ViewWriteOp, WherePredicate,
 };
 use super::exec::ColumnMeta;
 use super::view::{resolve_from, Resolved};
@@ -179,11 +179,19 @@ fn rewrite_on_conflict(
     mapper: &Mapper<'_>,
     clause: &OnConflictClause,
 ) -> Result<OnConflictClause, SqlSurfaceError> {
-    let target = clause
-        .target
-        .iter()
-        .map(|c| mapper.physical(c))
-        .collect::<Result<Vec<_>, _>>()?;
+    let target = match &clause.target {
+        ConflictTargetSpec::Columns(columns) => ConflictTargetSpec::Columns(
+            columns
+                .iter()
+                .map(|c| mapper.physical(c))
+                .collect::<Result<Vec<_>, _>>()?,
+        ),
+        // ビュー自身は制約を持たないため、制約名は対象リレーション上に存在しない
+        // （SQL-49、Issue #1737。受理せず fail-closed の `42704`）。
+        ConflictTargetSpec::Constraint(name) => {
+            return Err(SqlSurfaceError::UndefinedObject { name: name.clone() });
+        }
+    };
     let action = match &clause.action {
         OnConflictAction::DoNothing => OnConflictAction::DoNothing,
         OnConflictAction::DoUpdate(assignments) => {
@@ -418,7 +426,10 @@ mod tests {
         .expect("rewrite");
         assert_eq!(r.insert.columns, vec!["title".to_string()]);
         let oc = r.insert.on_conflict.expect("on conflict");
-        assert_eq!(oc.target, vec!["title".to_string()]);
+        assert_eq!(
+            oc.target,
+            ConflictTargetSpec::Columns(vec!["title".to_string()])
+        );
         assert_eq!(
             oc.action,
             OnConflictAction::DoUpdate(vec![(

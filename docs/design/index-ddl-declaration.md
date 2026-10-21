@@ -205,7 +205,7 @@ Issue #1065 で実装済み。詳細・設計判断は
 - **削除**: `DROP INDEX` が同一 txn で同名の UNIQUE 制約も外し、永続一意索引を無効化して索引衛生を行う。
   FK の参照先になっている間は `2BP01`（他の UNIQUE・PK が同じ列集合を覆っていても救済しない）。
   `ALTER TABLE DROP CONSTRAINT <索引名>` は `42704`（索引由来の UNIQUE は制約として扱わない）。
-  `ON CONFLICT ON CONSTRAINT <名>` は従来どおり `42601`。
+  `ON CONFLICT ON CONSTRAINT <名>` は制約として扱わず `42704`（Issue #1737）。
 - **未対応の形（fail-closed）**: `USING hnsw`・`COLLATE`（一意キーの正準化は照合を見ない）は `0A000`（構文段）。
   暗黙の `id` 列・`BOOLEAN`／`JSON(B)`／`ARRAY` など一意キー許可型または索引化対応型の外は `0A000`（カタログ段）。
   名前を省いた形は `42601`。`NULLS NOT DISTINCT`・`INCLUDE`・`CONCURRENTLY` は構文として受理しない。

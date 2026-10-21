@@ -12115,6 +12115,37 @@ impl EngineCore {
         )
     }
 
+    /// `ON CONFLICT ON CONSTRAINT <名>` の名前が `CREATE UNIQUE INDEX` 由来のとき `42704` で
+    /// 拒否する（SQL-49・INDEX-9 (3)、Issue #1737）。`sql::parser::bind_insert_form` の名前解決は
+    /// スキーマだけを見る純関数で索引カタログを参照できないため、束縛の前にここで判定する
+    /// （`execute_insert_form`・`execute_insert_returning_form`・ファイル形バッチの 3 経路から呼ぶ）。
+    /// スキーマ取得と本判定は別 txn だが、競合しても返るエラーコードが入れ替わるだけで、
+    /// 書き込みは既存の世代検査で保護される。カタログ I/O 失敗は固定文言の `Internal` に丸める。
+    fn reject_index_derived_conflict_constraint(
+        &self,
+        stmt: &crate::sql::allowlist::ValidatedInsert,
+    ) -> Result<(), crate::sql::allowlist::SqlSurfaceError> {
+        let Some(crate::sql::allowlist::OnConflictClause {
+            target: crate::sql::allowlist::ConflictTargetSpec::Constraint(name),
+            ..
+        }) = &stmt.on_conflict
+        else {
+            return Ok(());
+        };
+        match self
+            .storage
+            .is_unique_index_of_table(&stmt.table_name, name)
+        {
+            Ok(false) => Ok(()),
+            Ok(true) => {
+                Err(crate::sql::allowlist::SqlSurfaceError::UndefinedObject { name: name.clone() })
+            }
+            Err(_) => Err(crate::sql::allowlist::SqlSurfaceError::Internal {
+                detail: "failed to load table schema".to_string(),
+            }),
+        }
+    }
+
     /// [`Self::execute_insert_sql`]・[`Self::execute_sql_in_session`] の
     /// INSERT 分岐が共有する束縛〜実行本体（Issue #485）。
     /// `sql::allowlist::validate_insert_with_limit`／
@@ -12153,6 +12184,7 @@ impl EngineCore {
                     },
                 })?,
         };
+        self.reject_index_derived_conflict_constraint(stmt)?;
         let bound = crate::sql::parser::bind_insert_form(stmt, &schema)?;
         match bound {
             crate::sql::parser::BoundInsertForm::Row(bound) => {
@@ -12250,6 +12282,7 @@ impl EngineCore {
             .ok_or_else(|| crate::sql::allowlist::SqlSurfaceError::Internal {
                 detail: "execute_insert_returning_form called without RETURNING".to_string(),
             })?;
+        self.reject_index_derived_conflict_constraint(stmt)?;
         let bound = crate::sql::parser::bind_insert_form(stmt, &schema)?;
         match bound {
             crate::sql::parser::BoundInsertForm::Row(bound) => {
@@ -13333,6 +13366,7 @@ impl EngineCore {
                         },
                     })?,
             };
+            self.reject_index_derived_conflict_constraint(&stmt)?;
             let bound = crate::sql::parser::bind_insert_form(&stmt, &schema)?;
             match bound {
                 crate::sql::parser::BoundInsertForm::File(file_bound) => {
