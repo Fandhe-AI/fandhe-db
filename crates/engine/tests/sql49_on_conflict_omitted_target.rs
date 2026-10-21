@@ -214,8 +214,6 @@ fn syntax_forms_are_pinned() {
         "INSERT INTO docs (id, k, u, w, n) VALUES (9, 'q', 'q', 'q', 1) \
          ON CONFLICT DO UPDATE SET n = 2 USING OPERATION_ID 'op-s49-a'",
         "INSERT INTO docs (id, k, u, w, n) VALUES (9, 'q', 'q', 'q', 1) \
-         ON CONFLICT ON CONSTRAINT docs_pkey DO NOTHING USING OPERATION_ID 'op-s49-b'",
-        "INSERT INTO docs (id, k, u, w, n) VALUES (9, 'q', 'q', 'q', 1) \
          ON CONFLICT () DO NOTHING USING OPERATION_ID 'op-s49-c'",
     ] {
         assert_eq!(code(&core, &mut s, "alice", sql), "42601", "{sql}");

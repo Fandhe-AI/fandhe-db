@@ -26,7 +26,7 @@ USING OPERATION_ID '<id>'
 - 対象列リストは `(id)`、または宣言済み `UNIQUE` 制約・`PRIMARY KEY`（単一列・
   複数列）の構成列集合と一致する列名の並びを受理する（TABLE-16、Issue #1074・
   SQL-49、Issue #1707。「ON CONFLICT 対象の UNIQUE 制約列への拡張」節・
-  「Issue #1707 追記」節参照）。どれとも一致しない対象は `42P10`。`ON CONSTRAINT` 形・
+  「Issue #1707 追記」節参照）。どれとも一致しない対象は `42P10`。`ON CONSTRAINT` 形は Issue #1737 で対応（末尾の追記参照）。
   式索引・部分索引の推論形は対象外のまま `42601`。対象を省略した `ON CONFLICT DO NOTHING`
   は Issue #1736 で受理する（省略した `DO UPDATE` は `42601`。「Issue #1736 追記」節参照）。
 - `ON CONFLICT` は複数行 `VALUES`（SQL-16、TASK-190）と併用でき、全行が同じ衝突分岐を
@@ -247,7 +247,7 @@ spec 側「別途」の扱いのまま（コードでの固定テストも追加
 - `UNIQUE` 制約を衝突対象にする拡張（TABLE-16）は Issue #1074 で実装済み
   （「ON CONFLICT 対象の UNIQUE 制約列への拡張」節参照）。`PRIMARY KEY` 宣言列を
   対象にすることは Issue #1707 で実装済み（「Issue #1707 追記」節参照）。
-  `ON CONFLICT ON CONSTRAINT <name>`・部分一意制約の `ON CONFLICT` は引き続き対象外
+  部分一意制約の `ON CONFLICT` は引き続き対象外
   （`42601`）。対象省略の `DO NOTHING` は Issue #1736 で実装済み（「Issue #1736 追記」節参照）。
 - `23505` の `code` ラベル分離（`DUPLICATE_OPERATION_ID` vs `UNIQUE_VIOLATION`）は
   Issue #1180 で実装済み。
@@ -274,7 +274,7 @@ spec 側「別途」の扱いのまま（コードでの固定テストも追加
   未知列は PostgreSQL では `42703` だが、本 Issue は「一致なし」の `42P10` のみを定めるため
   別分岐は設けていない（差異として記録。寄せるかは別途判断）。
 - **`42601` のまま**: 構文段（`parse_on_conflict_clause`）で拒否する形——式索引推論
-  `((<式>))`、部分索引推論 `(<列>) WHERE ...`、`ON CONSTRAINT`、空リスト、
+  `((<式>))`、部分索引推論 `(<列>) WHERE ...`、空リスト、
   重複列、列数超過、ファイル形 `INSERT` との併用。
 - **NULL**: PK 構成列は NOT NULL。`VALUES` の NULL は衝突せず新規挿入分岐へ進み `23502`
   になる（結合テストで固定）。既存行側の PK 列は NOT NULL のため事前走査の
@@ -311,15 +311,15 @@ spec 側「別途」の扱いのまま（コードでの固定テストも追加
   (b) 一意性は文末にまとめて検査する（既存 `UPDATE` 経路と同じ）ため、複数行の `DO UPDATE` で
   PK 値を入れ替える文は本実装では成功する（PostgreSQL は行ごとに検査し `23505`）。
   いずれも PostgreSQL と異なる挙動を固めないため回帰テストでは固定しない。
-- **対象外**: バッチ内の対象キー重複の `21000` 化、`ON CONFLICT ON CONSTRAINT`、
+- **対象外**: バッチ内の対象キー重複の `21000` 化、`ON CONFLICT ON CONSTRAINT`（Issue #1737 で対応済み。下記追記）、
   `DO UPDATE ... WHERE`、SET 右辺の式、NoSQL 表層の `upsert`（対象省略の `DO NOTHING` は
   Issue #1736 で対応。次節）。
 
 ## Issue #1736 追記: 対象省略の ON CONFLICT DO NOTHING（SQL-49 ポインタ）
 
 - **構文**: `ON CONFLICT DO NOTHING` を受理する。AST は `OnConflictClause.target` を
-  `OnConflictTarget::{Columns, Omitted}` にし、省略と空リスト `()` を区別する（`()`・`ON CONSTRAINT`
-  は従来どおり `42601`）。省略した `DO UPDATE` は構文段と束縛段の両方で `42601`
+  `ConflictTargetSpec::{Columns, Constraint, Omitted}` にし、省略と空リスト `()` を区別する（空リスト `()` は従来どおり `42601`。
+  `ON CONSTRAINT` は Issue #1737 で受理する）。省略した `DO UPDATE` は構文段と束縛段の両方で `42601`
   （多層防御。実行段も内部エラーで拒否する）。
 - **束縛**: `BoundConflictTarget::AnyUnique`。文内の `id`・鍵の重複は拒否しない（PostgreSQL と
   同じく先の行を挿入し後の重複を飛ばす）。対象を指定した形の文内重複 `22000` は変えない
@@ -339,12 +339,32 @@ spec 側「別途」の扱いのまま（コードでの固定テストも追加
   レイアウトは不変。
 - **PostgreSQL との差異（記録のみ）**: 飛ばす行には `CHECK` 制約を評価しない（`NOT NULL` はハッシュ材料の
   組み立て時に全行で検査する）。対象を指定した既存の `DO NOTHING` も同様。
-- **対象外**: `ON CONFLICT ON CONSTRAINT`（#1737）、`DO UPDATE` の式・`WHERE`、`INSERT ... SELECT`
+- **対象外**: `DO UPDATE` の式・`WHERE`、`INSERT ... SELECT`
   との併用、NoSQL 表層の `upsert`。
 
 > Issue #2199 注記: 採番方式の表（SQL 表層で新しく作る表）には行キー指定の `ON CONFLICT (id)` が無く、`id` は宣言した通常の列として
 > PRIMARY KEY／UNIQUE 制約との照合（`Unique` 対象）で解決する。新規挿入行の rowid は書き込み段が払い出す。詳細は
 > [rowid-primary-key-separation.md](rowid-primary-key-separation.md) の §11。
+
+## Issue #1737 追記: `ON CONFLICT ON CONSTRAINT <名前>`
+
+SQL-49 (1)・(5)・INDEX-9 (3) のポインタ。構文は `ON CONFLICT ON CONSTRAINT <名前>
+{DO NOTHING | DO UPDATE SET ...}`。`OnConflictClause::target` は `ConflictTargetSpec`
+（`Columns`／`Constraint`／`Omitted` の 3 variant）になった（BREAKING CHANGE。`Omitted` は
+Issue #1736 の対象省略形）。
+
+- 名前解決は束縛時（`sql::parser::resolve_conflict_target`）。`DROP CONSTRAINT` と同じ探索順で
+  UNIQUE 制約 → PRIMARY KEY の実効名を引き、列リスト形と同じ `BoundConflictTarget`（制約の宣言順）へ
+  解決する。このため同じ制約の列リスト形と衝突判定・`RETURNING`・内容照合ハッシュが一致し、
+  両形の再送は台帳重複になる。
+- SQLSTATE: 不在 `42704`、CHECK・FOREIGN KEY の名前 `42809`、`CREATE UNIQUE INDEX` 由来の名前
+  `42704`（制約として扱わない。`DROP CONSTRAINT <索引名>` と対称）、大文字小文字は区別する。
+- 索引由来の判定は索引カタログが要るため、純関数の束縛ではなく `core` が束縛前に
+  `Storage::is_unique_index_of_table` で行う（スキーマ取得と別 txn。競合してもエラーコードが
+  入れ替わるだけで書き込みは既存の世代検査で守られる）。
+- PRIMARY KEY 未宣言の従来方式の表の導出名 `<表>_pkey` は不在（`42704`）。行キー衝突は `(id)` 形で書く。
+- ビュー経由は制約を持たないため `42704`。`INSERT ... SELECT` との併用は従来どおり `0A000`。
+  NoSQL 表層の `upsert` は対象外のまま。
 
 ## Issue #2425 追記: `DO UPDATE SET` 右辺の数値加算（SQL-20・SQL-49・RECOVER-11 ポインタ）
 

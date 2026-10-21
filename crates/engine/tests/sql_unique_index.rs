@@ -277,7 +277,7 @@ fn on_conflict_inference_and_foreign_key_target_use_the_unique_index() {
         "INSERT INTO docs (id, a, b) VALUES (2, 'x', 'b') ON CONFLICT ON CONSTRAINT docs_a DO NOTHING USING OPERATION_ID '{}'",
         op()
     );
-    assert_eq!(code(&core, &mut s, "owner", &named), "42601");
+    assert_eq!(code(&core, &mut s, "owner", &named), "42704");
 
     exec(
         &core,

@@ -15528,6 +15528,28 @@ impl Storage {
         Ok(out)
     }
 
+    /// `name` が `table` に対する一意索引（`CREATE UNIQUE INDEX`。INDEX-9）として索引カタログに
+    /// 登録済みかを read txn で判定する（Issue #1737）。`INSERT ... ON CONFLICT ON CONSTRAINT <名>`
+    /// が索引由来の UNIQUE 制約を制約として扱わない（`42704`）ための判定で、`core` の INSERT
+    /// 実行前に呼ばれる。write txn 版 `unique_index_def_for_table_in_txn` と同じ導出・同じ判定。
+    /// 索引カタログ未作成は `false`。値の破損は `CorruptSchema` で fail-closed に返す。
+    pub(crate) fn is_unique_index_of_table(&self, table: &str, name: &str) -> Result<bool> {
+        let read_txn = self.db().begin_read()?;
+        let index_table = match read_txn.open_table(INDEX_CATALOG_TABLE) {
+            Ok(t) => t,
+            Err(redb::TableError::TableDoesNotExist(_)) => return Ok(false),
+            Err(e) => return Err(e.into()),
+        };
+        let Ok(key) = namespace::sibling_key(table, name) else {
+            return Ok(false);
+        };
+        let Some(guard) = index_table.get(key.as_str())? else {
+            return Ok(false);
+        };
+        let def = decode_index_def(&key, guard.value())?;
+        Ok(def.unique && def.table == table)
+    }
+
     /// `CREATE OR REPLACE VIEW`（TABLE-41 (2)・Issue #1660）の永続化。`expected_old` は SQL 表層が
     /// 互換性検査（列の名前・型・順序）に使った旧定義（無ければ `None`）で、同一 write txn 内で
     /// 現在の定義と突き合わせる（compare-and-swap）。不一致は `Err(ViewDefinitionChanged)` で何も

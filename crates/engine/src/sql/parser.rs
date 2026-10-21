@@ -17,9 +17,9 @@
 use crate::catalog::{ColumnDef, ColumnDefault, ColumnType, TableSchema};
 use crate::declarative_filter::{self, DeclarativeFilter, MetadataFilter};
 use crate::sql::allowlist::{
-    FunctionArg, InsertLiteral, OnConflictAction, OnConflictClause, OnConflictTarget, OrderByForm,
-    Projection, ScalarOrderKey, UpsertAddOperand, UpsertValue, ValidatedDelete, ValidatedInsert,
-    ValidatedPredicateDelete, ValidatedStatement, WherePredicate,
+    ConflictTargetSpec, FunctionArg, InsertLiteral, OnConflictAction, OnConflictClause,
+    OrderByForm, Projection, ScalarOrderKey, UpsertAddOperand, UpsertValue, ValidatedDelete,
+    ValidatedInsert, ValidatedPredicateDelete, ValidatedStatement, WherePredicate,
 };
 use crate::sql::plan::EvaluationOrder;
 use crate::sql::udf_call::Expr;
@@ -5127,13 +5127,63 @@ pub fn bind_insert_form(
 /// 式・部分索引の推論形は構文段（`sql::allowlist::parse_on_conflict_clause`）で
 /// `42601` として拒否済みでここへは来ない。
 fn resolve_conflict_target(
-    target: &OnConflictTarget,
+    target: &ConflictTargetSpec,
     schema: &TableSchema,
 ) -> Result<BoundConflictTarget, SqlSurfaceError> {
-    let target: &[String] = match target {
-        OnConflictTarget::Columns(columns) => columns,
-        OnConflictTarget::Omitted => return Ok(BoundConflictTarget::AnyUnique),
-    };
+    match target {
+        ConflictTargetSpec::Columns(columns) => resolve_conflict_target_columns(columns, schema),
+        ConflictTargetSpec::Constraint(name) => resolve_conflict_target_constraint(name, schema),
+        // 対象省略（Issue #1736）: どの一意性違反でも対象にする。
+        ConflictTargetSpec::Omitted => Ok(BoundConflictTarget::AnyUnique),
+    }
+}
+
+/// `ON CONFLICT ON CONSTRAINT <name>` の名前解決（SQL-49、Issue #1737）。
+/// `ALTER TABLE ... DROP CONSTRAINT` と同じ探索順（UNIQUE 制約 → PRIMARY KEY 実効名）で
+/// 制約を引き、名前・種別の検証後にその構成列を列リスト形と同じ解決
+/// （[`resolve_conflict_target_columns`]。列集合照合・正準順）へ通す。順序違いの UNIQUE 2 本や
+/// PRIMARY KEY と UNIQUE の順序違いでも両形が同じ [`BoundConflictTarget`] へ解決され、
+/// 内容照合ハッシュ・RETURNING・衝突判定が一致して同一 operation_id の相互再送が台帳重複になる。
+///
+/// - CHECK・FOREIGN KEY の名前は `42809`（[`SqlSurfaceError::WrongObjectType`]）
+/// - 不在の名前は `42704`（[`SqlSurfaceError::UndefinedObject`]）
+/// - `CREATE UNIQUE INDEX` 由来の名前は制約として扱わない（`42704`）。索引カタログは
+///   本関数から見えないため、呼び出し元（`core`）が事前に拒否する前提とする。
+/// - 疑似列 `id` を持つ表の PRIMARY KEY が `(id)` 単独なら行キー解決（`RowId`）、
+///   `id` と他列の混在は列リスト形と同じく `42P10`（fail-closed）。
+fn resolve_conflict_target_constraint(
+    name: &str,
+    schema: &TableSchema,
+) -> Result<BoundConflictTarget, SqlSurfaceError> {
+    if let Some(constraint) = schema
+        .unique_constraints()
+        .iter()
+        .find(|c| c.name() == name)
+    {
+        return resolve_conflict_target_columns(constraint.columns(), schema);
+    }
+    if schema.primary_key_constraint_name_effective().as_deref() == Some(name) {
+        if let Some(pk) = schema.primary_key() {
+            return resolve_conflict_target_columns(pk, schema);
+        }
+    }
+    if schema.foreign_keys().iter().any(|f| f.name() == name)
+        || schema.checks().iter().any(|c| c.name == name)
+    {
+        return Err(SqlSurfaceError::WrongObjectType {
+            name: name.to_string(),
+        });
+    }
+    Err(SqlSurfaceError::UndefinedObject {
+        name: name.to_string(),
+    })
+}
+
+/// 列リスト形 `ON CONFLICT (<col>, ...)` の解決（[`resolve_conflict_target`] の本体）。
+fn resolve_conflict_target_columns(
+    target: &[String],
+    schema: &TableSchema,
+) -> Result<BoundConflictTarget, SqlSurfaceError> {
     // `(id)` の行キー解決は疑似列 `id` を持つ従来方式の表だけ。採番方式の表の `id` は通常の列で、
     // PRIMARY KEY／UNIQUE 制約との照合（下）で解決する（TABLE-23・Issue #2199）。
     if schema.has_pseudo_id() {
@@ -11538,6 +11588,131 @@ mod tests {
                 other => panic!("expected BoundInsertForm::Upsert, got {other:?}"),
             }
         }
+    }
+
+    // --- ON CONFLICT ON CONSTRAINT（SQL-49、Issue #1737） --------
+
+    fn constraint_target_schema() -> TableSchema {
+        TableSchema::new(
+            "documents",
+            vec![
+                ColumnDef::new("a", ColumnType::Text, false),
+                ColumnDef::new("b", ColumnType::Text, true),
+                ColumnDef::new("c", ColumnType::Text, true),
+            ],
+        )
+        .with_unique_constraints(vec![
+            crate::catalog::UniqueConstraint::with_name("uq_a".to_string(), vec!["a".to_string()]),
+            crate::catalog::UniqueConstraint::with_name(
+                "uq_bc".to_string(),
+                vec!["b".to_string(), "c".to_string()],
+            ),
+        ])
+        .with_primary_key(vec!["c".to_string(), "a".to_string()])
+    }
+
+    fn bind_named(
+        name: &str,
+        schema: &TableSchema,
+    ) -> Result<BoundConflictTarget, SqlSurfaceError> {
+        let sql = format!(
+            "INSERT INTO documents (id, a, b, c) VALUES (1, 'x', 'y', 'z') \
+             ON CONFLICT ON CONSTRAINT {name} DO NOTHING USING OPERATION_ID 'op-onc'"
+        );
+        match bind_upsert_sql(&sql, schema)? {
+            BoundInsertForm::Upsert(upsert) => Ok(upsert.target),
+            other => panic!("expected BoundInsertForm::Upsert, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn bind_on_constraint_resolves_unique_and_primary_key_names_in_declared_order() {
+        let schema = constraint_target_schema();
+        assert_eq!(
+            bind_named("uq_a", &schema).unwrap(),
+            BoundConflictTarget::Unique(vec![0])
+        );
+        assert_eq!(
+            bind_named("uq_bc", &schema).unwrap(),
+            BoundConflictTarget::Unique(vec![1, 2])
+        );
+        // PRIMARY KEY の導出名。列位置は PK の宣言順（`c` → `a`）。
+        assert_eq!(
+            bind_named("documents_pkey", &schema).unwrap(),
+            BoundConflictTarget::Unique(vec![2, 0])
+        );
+    }
+
+    #[test]
+    fn bind_on_constraint_matches_column_list_form_for_reordered_constraints() {
+        let schema = TableSchema::new(
+            "documents",
+            vec![
+                ColumnDef::new("a", ColumnType::Text, false),
+                ColumnDef::new("b", ColumnType::Text, true),
+            ],
+        )
+        .with_unique_constraints(vec![
+            crate::catalog::UniqueConstraint::with_name(
+                "uq_ab".to_string(),
+                vec!["a".to_string(), "b".to_string()],
+            ),
+            crate::catalog::UniqueConstraint::with_name(
+                "uq_ba".to_string(),
+                vec!["b".to_string(), "a".to_string()],
+            ),
+        ])
+        .with_primary_key(vec!["b".to_string(), "a".to_string()]);
+        let bind = |t: &str| {
+            let sql = format!(
+                "INSERT INTO documents (id, a, b) VALUES (1, 'x', 'y') \
+                 ON CONFLICT {t} DO NOTHING USING OPERATION_ID 'op-onc'"
+            );
+            match bind_upsert_sql(&sql, &schema).unwrap() {
+                BoundInsertForm::Upsert(u) => u.target,
+                other => panic!("expected Upsert, got {other:?}"),
+            }
+        };
+        let expected = bind("(b, a)");
+        assert_eq!(bind("(a, b)"), expected);
+        for name in ["uq_ab", "uq_ba", "documents_pkey"] {
+            assert_eq!(bind(&format!("ON CONSTRAINT {name}")), expected, "{name}");
+        }
+    }
+
+    #[test]
+    fn bind_on_constraint_resolves_explicit_primary_key_name() {
+        let schema = constraint_target_schema().with_primary_key_name(Some("pk_x".to_string()));
+        assert_eq!(
+            bind_named("pk_x", &schema).unwrap(),
+            BoundConflictTarget::Unique(vec![2, 0])
+        );
+        // 明示名を付けた後は導出名では引けない。
+        assert_eq!(
+            bind_named("documents_pkey", &schema)
+                .unwrap_err()
+                .wire_code(),
+            "42704"
+        );
+    }
+
+    #[test]
+    fn bind_on_constraint_rejects_undefined_and_case_mismatched_names() {
+        let schema = constraint_target_schema();
+        for name in ["nope", "UQ_A"] {
+            assert_eq!(bind_named(name, &schema).unwrap_err().wire_code(), "42704");
+        }
+        // PRIMARY KEY 未宣言の表では導出名も不在。
+        let no_pk = TableSchema::new(
+            "documents",
+            vec![ColumnDef::new("a", ColumnType::Text, false)],
+        );
+        assert_eq!(
+            bind_named("documents_pkey", &no_pk)
+                .unwrap_err()
+                .wire_code(),
+            "42704"
+        );
     }
 
     #[test]
