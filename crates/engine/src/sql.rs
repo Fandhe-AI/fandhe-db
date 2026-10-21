@@ -160,6 +160,7 @@ pub(crate) mod check_constraint;
 pub(crate) mod const_expr;
 pub mod const_select;
 pub mod copy;
+pub(crate) mod ctas;
 pub(crate) mod cte;
 pub mod cursor;
 pub(crate) mod datetime_fn;

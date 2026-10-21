@@ -69,6 +69,7 @@ use redb::ReadableDatabase;
 mod temp_route;
 pub use temp_route::SessionRoutedSql;
 
+mod ctas_exec;
 mod matview_exec;
 
 /// 検索 `k` の上限（直接 Rust API 用）。明示 `LIMIT` の既定値と同値だが、SQL／NoSQL の
