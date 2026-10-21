@@ -6514,9 +6514,7 @@ mod tests {
             "INSERT INTO t (a) SELECT a FROM s WHERE b = 'x' LIMIT 3 ON CONFLICT DO NOTHING",
             "INSERT INTO t (a) SELECT a FROM s LIMIT 3 WHERE b = 'x'",
         ] {
-            if let Ok(toks) = crate::sql::lexer::tokenize(other) {
-                assert_ne!(base, for_insert_select(&toks).unwrap(), "{other}");
-            }
+            assert_ne!(base, sel_hash(other), "{other}");
         }
         // 内側の USING MODE は剥がさない
         let a = sel_hash("INSERT INTO t (a) SELECT a FROM s USING MODE recall");
