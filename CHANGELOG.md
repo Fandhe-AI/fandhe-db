@@ -9,6 +9,11 @@
 
 ### Breaking Changes
 
+- `current_schema()`・`current_schemas()`（Issue #1718・TABLE-27 (7)）: FROM なし SELECT で `current_schema()`・
+  裸の `current_schema`・`current_schemas(bool)` が `search_path` に従った値（テナントで実在する SCHEMA のみ）を返す。
+  互換性の変更: UDF 名 `current_schema`・`current_schemas` を予約名にした（`CREATE FUNCTION` は拒否される）。
+  FROM あり SELECT・INSERT・DEFAULT・CHECK・索引・ビュー本文での使用は `0A000`。型は `text`／`text[]`。
+  詳細は [schema-tenant-namespace.md](docs/design/schema-tenant-namespace.md) の §11。
 - `search_path` の追加（Issue #1715・TABLE-27）: セッション変数 `search_path`（既定 `"$user", public`）の `SET`／`RESET`／`SHOW`
   を受理する。実効 path に `public` が含まれないセッションでは、一時表以外の未修飾のテーブル参照が `42P01`、作成系 DDL の
   作成先が `public` 以外になる文が `3F000`／`0A000` になる（既定の path の挙動は不変）。`"$user"` は handshake の username から

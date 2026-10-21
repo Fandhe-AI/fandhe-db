@@ -190,8 +190,8 @@ README の公開済み要点を超えて具体化しない。公開境界を広�
 - `information_schema` と `pg_catalog` を利用者の SCHEMA 名として作ることは拒否する
   （PostgreSQL ではいずれも常に存在するため重複扱い。`pg_` 接頭辞の規則とあわせて #1713 で
   確定する）
-- `current_schema()`・`current_schemas()` の意味は TABLE-27 のポインタに従い、#1718 で確定する。
-  それまでは `CURRENT_SCHEMA` の現行の `42601` を維持する
+- `current_schema()`・`current_schemas()` の意味は TABLE-27 (7) のポインタに従い、#1718 で確定した
+  （§11）。`INSERT VALUES`・`DEFAULT` の裸の `CURRENT_SCHEMA` は現行の `42601` を維持する
 
 ### D10. 権限（#1713・#2234）
 
@@ -462,7 +462,40 @@ TABLE-27 (3) のポインタ。セッション変数 `search_path` を engine �
   `ParameterStatus` 通知、`set_config('search_path', ..)`・`ALTER ROLE .. SET search_path`、NoSQL 表層
   （ステートレスで既定の path）
 
-## 11. Issue #1719 実装記録
+## 11. Issue #1718 実装記録
+
+`current_schema()`・`current_schemas()`（TABLE-27 (7)）を psql／ドライバ互換の応答として返す。
+システムカタログ（`pg_namespace` 等）は D9 のとおり対象外のまま。
+
+- **受理範囲**: FROM なし SELECT（`ConstSelect`）の式の中だけ。`current_schema()`・裸の `current_schema`
+  （ASCII 大小無視。Rails 形。text 型のため投影・`WHERE`・`CASE`・`COALESCE` 等の式位置で使える）・
+  `current_schemas(true|false|NULL)`（配列型のため、既存の配列値の規約どおり投影と `CAST` の被演算子だけ。
+  `CASE`／`COALESCE` 等へ流すと `0A000`）。
+  それ以外の文脈（`FROM` あり SELECT・`INSERT VALUES`・`DEFAULT`・CHECK・索引・ビュー本文・UDF 定義）は
+  束縛のスコープが無いため `0A000`（固定文言）で fail-closed。引数の arity 違反と非 bool は `42883`
+- **解決規則**: path の各要素を展開（`$user` は handshake の username だけから。未設定なら飛ばす）し、
+  実在する要素だけを重複除去して並べる。`public`・`pg_catalog`・`information_schema` は常に実在、
+  `pg_temp` はセッションに一時表があるときだけ実在、それ以外は `(呼び出し元テナント, 名前)` の
+  1 回の get で判定する（他テナントの SCHEMA は不在と同じ扱い・同じ応答。D4）。`current_schema()` は
+  先頭（無ければ NULL）、`current_schemas(false)` は全体、`(true)` は暗黙の一時スキーマ・`pg_catalog` を
+  PostgreSQL と同じ順序で、明示リストに無いものだけ前置する（明示した `pg_temp` は位置を保持する）
+- **実装**: `sql::search_path` に path 要素の展開の共通化（`creation_target` と共有。挙動は不変）・
+  `resolve_schema_functions`・thread-local RAII の `SchemaFnScope` を置く。スコープを張るのは
+  `core.rs` の `ConstSelect` の実行腕（式木が `current_schema` 系を含むときだけ probe。含まない文は
+  照会コストゼロ）と Describe 腕（型だけ公告。`PolicyContext` を持たないため probe しない）。
+  `udf_call::bind_call` が `now()` と同じ位置で定数へ畳む。`BuiltinFn`・`ValueFunctionKind` の variant は増やさない
+- **出力**: 結果列の型は `text`／`text[]`。内部キー・内部 ID（`#<id>.`）は応答・エラーに出さない（D2）
+- **意図的な PostgreSQL との差**: 型は `name`／`name[]`（OID 19／1003）ではなく `text`／`text[]`（WIRE-13 のポインタ）／
+  一時スキーマの表示名は `pg_temp_N` ではなく固定の `pg_temp`（backend 番号を出さない）／一時スキーマの存在は
+  「一時表が 1 つ以上あるか」で近似（PostgreSQL は全一時表を DROP しても残る）／引用した `"current_schema"` も
+  値を返す（lexer が引用の有無を区別しない。PostgreSQL では `42703`）／`FROM` ありの文での使用は `0A000`
+- **互換性の変更**: UDF 名 `current_schema`・`current_schemas` を予約名にした（UDF はセッション単位で
+  永続化しないため保存済みデータへの影響なし）
+- **対象外**: システムカタログと psql の `\dn`・`FROM` あり／INSERT／DEFAULT／CHECK／索引／ビュー本文での
+  `current_schema` 系・修飾つき `pg_catalog.current_schema()`・`current_setting('search_path')`・
+  StartupMessage の `search_path` と `ParameterStatus`・`name` 型の導入・`pg_temp.x` の結線
+
+## 12. Issue #1719 実装記録
 
 SCHEMA 導入（#1713〜#1717）後もテナント境界が保たれることの横断回帰テスト。ポインタ: TABLE-27（関連: RLS-7・RLS-10・ERR-6）。**テストのみの追加**で、engine 本体・公開 API・依存は不変。
 
