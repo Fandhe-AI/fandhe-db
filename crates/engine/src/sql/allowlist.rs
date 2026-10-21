@@ -9126,6 +9126,22 @@ impl<'a> Parser<'a> {
     /// 列数と一致する必要がある（不一致は行ごとに検出して拒否）。RETURNING・
     /// 可視性ラベル指定は引き続き構造的に受理しない。
     fn parse_insert(&mut self) -> Result<ParsedInsertShape, SqlSurfaceError> {
+        let (table_name, columns, columns_omitted, default_values) = self.parse_insert_head()?;
+        // `INSERT ... SELECT`（SQL-51・Issue #1732）は内側 SELECT の検証にカタログ照会が要るため、
+        // 本入口（`VALUES` 専用）では受理せず `0A000` で明示する（SELECT 形を `VALUES` 必須の
+        // `42601` と取り違えない・黙って落とさない fail-closed）。受理するのは
+        // [`parse_insert_any_shape_tokens_with_limit`] だけ。
+        if self.at_insert_query_start() {
+            return Err(SqlSurfaceError::feature_not_supported(
+                "INSERT ... SELECT is not supported on this entry point",
+            ));
+        }
+        self.parse_insert_values_tail(table_name, columns, columns_omitted, default_values)
+    }
+
+    /// `INSERT INTO <table> (<col>[, <col>]*)` の見出し部（`OVERRIDING` の拒否まで）を解析する。
+    /// `VALUES` 形・`SELECT` 形が共有する（SQL-50・SQL-51）。
+    fn parse_insert_head(&mut self) -> Result<(String, Vec<String>, bool, bool), SqlSurfaceError> {
         self.expect_contextual_keyword("INSERT")?;
         self.expect_contextual_keyword("INTO")?;
         let table_name = self.expect_ident()?;
@@ -9166,6 +9182,213 @@ impl<'a> Parser<'a> {
                     "INSERT ... OVERRIDING is not supported",
                 ));
             }
+        }
+        Ok((table_name, columns, columns_omitted, default_values))
+    }
+
+    /// 列リストの後ろが問い合わせ（`SELECT`・`(SELECT`・`WITH`）の先頭か。`VALUES` 形との分岐に使う。
+    fn at_insert_query_start(&self) -> bool {
+        matches!(self.peek(), Some(Token::Keyword(Keyword::Select)))
+            || self.peek_contextual_keyword("WITH")
+            || (matches!(self.peek(), Some(Token::Punct('(')))
+                && matches!(
+                    self.tokens.get(self.pos.saturating_add(1)),
+                    Some(Token::Keyword(Keyword::Select))
+                ))
+    }
+
+    /// 深さ 0 の識別子 `RETURNING`（位置 `idx`）が INSERT の `RETURNING` 句の開始か、列名・別名等の
+    /// 識別子かを文脈で判定する（Issue #1732 レビュー対応）。`RETURNING` は予約語ではないため、
+    /// 直前が式の終端（リテラル・`)`・演算子語以外の識別子）で、直後が射影の先頭（識別子・`*`）の
+    /// ときだけ句境界とする。それ以外は識別子として問い合わせ範囲に残し、SELECT 検証器へ委ねる。
+    /// 曖昧な形（`SELECT a returning FROM t` 等は別名として扱う）は範囲に残る側へ倒れ、
+    /// SELECT 検証器が拒否する（fail-closed）。
+    fn returning_is_clause_boundary(&self, start: usize, idx: usize) -> bool {
+        if idx <= start {
+            return false;
+        }
+        let prev_ends_expr = match self.tokens.get(idx.saturating_sub(1)) {
+            Some(
+                Token::Number(_)
+                | Token::StringLiteral(_)
+                | Token::Param(_)
+                | Token::QualifiedIdent { .. }
+                | Token::QuotedNull(_)
+                | Token::Punct(')' | ']'),
+            ) => true,
+            // `AS` 直後の別名として消費された語は、綴りが演算子語と同じでも式の終端として扱う
+            // （`SELECT 1 AS desc RETURNING a`、`AS "desc"` 等。引用付き識別子は字句解析後に
+            // 裸の語と区別できないため、構文上の位置〔`AS` の直後〕で判定する）。
+            Some(Token::Ident(_))
+                if idx >= start.saturating_add(2)
+                    && matches!(
+                        self.tokens.get(idx.saturating_sub(2)),
+                        Some(Token::Ident(a)) if a.eq_ignore_ascii_case("AS")
+                    ) =>
+            {
+                true
+            }
+            // `ORDER BY <式> ASC|DESC` の方向指定は句の終端。ただし `SELECT desc RETURNING a` のように
+            // 列名・別名としての `ASC`／`DESC` と取り違えないよう、深さ 0 に先行する `ORDER BY` があり、
+            // かつ直前（`ASC`／`DESC` の手前）が式の終端のときに限る。
+            Some(Token::Ident(p))
+                if p.eq_ignore_ascii_case("ASC") || p.eq_ignore_ascii_case("DESC") =>
+            {
+                self.is_order_direction(start, idx.saturating_sub(1))
+            }
+            Some(Token::Ident(p)) => ![
+                "AS", "ON", "JOIN", "USING", "AND", "OR", "NOT", "IN", "IS", "LIKE", "ILIKE",
+                "BETWEEN", "INNER", "LEFT", "RIGHT", "FULL", "CROSS", "NATURAL", "OUTER",
+                "DISTINCT",
+            ]
+            .iter()
+            .any(|w| p.eq_ignore_ascii_case(w)),
+            _ => false,
+        };
+        let next_starts_projection = matches!(
+            self.tokens.get(idx.saturating_add(1)),
+            Some(Token::Ident(_) | Token::QualifiedIdent { .. } | Token::QualifiedStar { .. })
+                | Some(Token::Punct('*'))
+        );
+        prev_ends_expr && next_starts_projection
+    }
+
+    /// 位置 `dir_idx` の `ASC`／`DESC` が `ORDER BY` の方向指定か（`returning_is_clause_boundary` から呼ぶ）。
+    /// 深さ 0 で `start..dir_idx` に `ORDER BY` が先行し、直前が式の終端（リテラル・`)`・`]`・演算子語でない
+    /// 識別子）であるときだけ真。列名・別名の `desc`／`asc` は偽（範囲に残して SELECT 検証器へ委ねる）。
+    fn is_order_direction(&self, start: usize, dir_idx: usize) -> bool {
+        let mut depth: usize = 0;
+        let mut seen_order_by = false;
+        for i in start..dir_idx {
+            match self.tokens.get(i) {
+                Some(Token::Punct('(')) => depth = depth.saturating_add(1),
+                Some(Token::Punct(')')) => depth = depth.saturating_sub(1),
+                Some(Token::Keyword(Keyword::Order))
+                    if depth == 0
+                        && matches!(
+                            self.tokens.get(i.saturating_add(1)),
+                            Some(Token::Keyword(Keyword::By))
+                        ) =>
+                {
+                    seen_order_by = true;
+                }
+                _ => {}
+            }
+        }
+        if !seen_order_by || dir_idx <= start {
+            return false;
+        }
+        match self.tokens.get(dir_idx.saturating_sub(1)) {
+            Some(
+                Token::Number(_)
+                | Token::StringLiteral(_)
+                | Token::Param(_)
+                | Token::QualifiedIdent { .. }
+                | Token::QuotedNull(_)
+                | Token::Punct(')' | ']'),
+            ) => true,
+            Some(Token::Ident(p)) => ![
+                "BY", "AS", "ON", "AND", "OR", "NOT", "IN", "IS", "LIKE", "ILIKE", "BETWEEN",
+                "DISTINCT", "ASC", "DESC",
+            ]
+            .iter()
+            .any(|w| p.eq_ignore_ascii_case(w)),
+            _ => false,
+        }
+    }
+
+    /// `INSERT ... SELECT` の問い合わせ部と後続句を解析する（SQL-51・Issue #1732）。
+    ///
+    /// 問い合わせの範囲（`query_span`）は、括弧の深さ 0 で最初に現れる `ON CONFLICT`・`RETURNING`・
+    /// （`RETURNING` と `ON CONFLICT` は予約語でないため、列名・別名・JOIN の `ON` 述語内の同名語は文脈判定で除外する）
+    /// `USING OPERATION_ID`・`;`・文末の手前までとする。`ON`／`USING` は 2 トークン組で判定し、JOIN の
+    /// `ON`・`USING (...)`・`USING PLAN(...)`・`USING MODE` を誤って区切りにしない。範囲の中身の検証は
+    /// 呼び出し元（`core.rs`）が既存の SELECT 検証器へ渡して行う（SELECT 構文を第 2 の実装にしない）。
+    /// `ON CONFLICT` との併用は別 Issue のため `0A000`。
+    fn parse_insert_select_tail(
+        &mut self,
+        table_name: String,
+        columns: Vec<String>,
+    ) -> Result<ParsedInsertSelectShape, SqlSurfaceError> {
+        if columns.is_empty() {
+            return Err(SqlSurfaceError::unsupported(
+                "INSERT ... SELECT requires an explicit column list",
+            ));
+        }
+        let start = self.pos;
+        let mut depth: usize = 0;
+        let mut pending_joins: usize = 0;
+        let mut idx = start;
+        let end = loop {
+            match self.tokens.get(idx) {
+                None => break idx,
+                Some(Token::Punct('(')) => depth = depth.saturating_add(1),
+                Some(Token::Punct(')')) => depth = depth.saturating_sub(1),
+                Some(Token::Punct(';')) if depth == 0 => break idx,
+                Some(Token::Ident(w)) if depth == 0 => {
+                    let next_is = |word: &str| {
+                        matches!(
+                            self.tokens.get(idx.saturating_add(1)),
+                            Some(Token::Ident(n)) if n.eq_ignore_ascii_case(word)
+                        )
+                    };
+                    if w.eq_ignore_ascii_case("JOIN") {
+                        pending_joins = pending_joins.saturating_add(1);
+                    } else if w.eq_ignore_ascii_case("USING")
+                        && pending_joins > 0
+                        && matches!(
+                            self.tokens.get(idx.saturating_add(1)),
+                            Some(Token::Punct('('))
+                        )
+                    {
+                        // `JOIN ... USING (...)` は ON を伴わずに結合条件を閉じる。
+                        pending_joins = pending_joins.saturating_sub(1);
+                    } else if w.eq_ignore_ascii_case("ON") && pending_joins > 0 {
+                        // 直前の JOIN に対応する結合条件の `ON`（`ON CONFLICT` 句ではない）。
+                        pending_joins = pending_joins.saturating_sub(1);
+                    } else if (w.eq_ignore_ascii_case("ON") && next_is("CONFLICT"))
+                        || (w.eq_ignore_ascii_case("USING") && next_is("OPERATION_ID"))
+                        || (w.eq_ignore_ascii_case("RETURNING")
+                            && self.returning_is_clause_boundary(start, idx))
+                    {
+                        break idx;
+                    }
+                }
+                Some(_) => {}
+            }
+            idx = idx.saturating_add(1);
+        };
+        if end <= start {
+            return Err(SqlSurfaceError::unsupported(
+                "INSERT ... SELECT requires a query",
+            ));
+        }
+        self.pos = end;
+        if self.peek_contextual_keyword("ON") {
+            return Err(SqlSurfaceError::feature_not_supported(
+                "INSERT ... SELECT with ON CONFLICT is not supported",
+            ));
+        }
+        let returning = self.parse_returning_clause()?;
+        let operation_id = self.parse_operation_id_clause()?;
+        Ok(ParsedInsertSelectShape {
+            table_name,
+            columns,
+            query_span: (start, end),
+            returning,
+            operation_id,
+        })
+    }
+
+    /// `VALUES` 形の本体（見出し部の後ろ）。既存の [`Self::parse_insert`] の後半をそのまま切り出したもの。
+    fn parse_insert_values_tail(
+        &mut self,
+        table_name: String,
+        columns: Vec<String>,
+        columns_omitted: bool,
+        default_values: bool,
+    ) -> Result<ParsedInsertShape, SqlSurfaceError> {
+        if !default_values {
             self.expect_contextual_keyword("VALUES")?;
         }
         // 明示列リストは行ごとに列数と照合する。列リスト省略は先頭行の長さを後続行の基準にする
@@ -17880,6 +18103,16 @@ pub fn validate_statement(
     }
 }
 
+/// `INSERT ... SELECT` の構文段の中間結果（SQL-51・Issue #1732）。問い合わせ本体は
+/// トークン位置の範囲 `query_span` だけを持ち、検証は呼び出し元がカタログを引きながら行う。
+struct ParsedInsertSelectShape {
+    table_name: String,
+    columns: Vec<String>,
+    query_span: (usize, usize),
+    returning: Option<Projection>,
+    operation_id: Option<OperationId>,
+}
+
 /// 構文木（[`ValidatedInsert`] の元）。カタログ存在確認前の中間結果
 /// （SQL-10・SQL-16、TASK-80・TASK-190）。
 struct ParsedInsertShape {
@@ -18140,8 +18373,9 @@ pub(crate) fn validate_partitioned_control_tokens(
 /// INTO テーブルがカタログに実在するかを確認する（SQL-10、TASK-80 の公開 API）。
 /// `validate_statement`（SELECT 専用、TASK-74）とは独立したエントリポイントとする
 /// （SELECT 文に `USING OPERATION_ID` を付けた入力は `validate_statement` 側の
-/// `expect_end_of_statement` が余剰トークンとして `42601` で拒否するため、
-/// SELECT/INSERT を誤って混同受理する経路は構造的に存在しない）。
+/// `expect_end_of_statement` が余剰トークンとして `42601` で拒否する。
+/// `INSERT ... SELECT`〔SQL-51〕は内側 SELECT を検証できない本入口では受理せず `0A000`
+/// とし、受理は `core.rs` の `parse_tokens_in` 経由の入口だけが担う）。
 ///
 /// 検証順序は決定的（同一入力には常に同一の [`SqlSurfaceError`] を返す）。
 /// `operation_id` 必須化ガード（`mode.require`。TASK-92・RECOVER-1）を含む段階構成の
@@ -18220,6 +18454,123 @@ pub(crate) fn parse_insert_shape_tokens_with_limit(
         returning: shape.returning,
         on_conflict: shape.on_conflict,
     })
+}
+
+/// `INSERT ... SELECT` の構文段の結果（SQL-51・Issue #1732）。内側 SELECT は未検証のトークン列
+/// （送られた span のまま。`QuotedNull` を保持する）で、`core.rs` が SELECT 検証器へ渡して
+/// [`ValidatedInsertSelect`] へ昇格させる。
+#[derive(Debug, Clone, PartialEq)]
+pub(crate) struct InsertSelectShape {
+    pub(crate) table_name: String,
+    pub(crate) columns: Vec<String>,
+    pub(crate) query_tokens: Vec<Token>,
+    pub(crate) returning: Option<Projection>,
+    pub(crate) operation_id: Option<OperationId>,
+}
+
+/// [`parse_insert_any_shape_tokens_with_limit`] の結果。
+#[derive(Debug, Clone, PartialEq)]
+pub(crate) enum ParsedInsertTokens {
+    Values(ValidatedInsert),
+    Select(InsertSelectShape),
+}
+
+/// 検証済みの `INSERT INTO <表> (<列>...) <SELECT> [RETURNING ...] [USING OPERATION_ID ...]`
+/// （SQL-51・Issue #1732）。内側 SELECT は既存の SELECT 検証器を通過済みで、実行腕は束縛（列数・型）の後に
+/// `core/insert_select_exec.rs` の実行本体（Issue #1733）へ渡す。
+#[derive(Debug, Clone, PartialEq)]
+pub struct ValidatedInsertSelect {
+    pub(crate) table_name: String,
+    pub(crate) columns: Vec<String>,
+    pub(crate) query: Box<Statement>,
+    pub(crate) query_tokens: Vec<Token>,
+    pub(crate) returning: Option<Projection>,
+    pub(crate) operation_id: Option<OperationId>,
+    /// 台帳の内容照合ハッシュ（`recovery::content_hash::for_insert_select`。送られた文のトークン列から
+    /// `USING OPERATION_ID` 句と末尾 `;` を除いて算出。内側 SELECT の結果行は材料にしない。Issue #1734）。
+    pub(crate) statement_hash: crate::recovery::content_hash::ContentHash,
+}
+
+impl ValidatedInsertSelect {
+    /// 構文段の結果・検証済みの内側 SELECT・文の台帳ハッシュから作る（`core.rs::parse_insert_select` が呼ぶ）。
+    pub(crate) fn new(
+        shape: InsertSelectShape,
+        query: Statement,
+        statement_hash: crate::recovery::content_hash::ContentHash,
+    ) -> Self {
+        Self {
+            table_name: shape.table_name,
+            columns: shape.columns,
+            query: Box::new(query),
+            query_tokens: shape.query_tokens,
+            returning: shape.returning,
+            operation_id: shape.operation_id,
+            statement_hash,
+        }
+    }
+
+    /// 挿入先の表名。
+    pub fn table_name(&self) -> &str {
+        &self.table_name
+    }
+
+    /// 列リスト。
+    pub fn columns(&self) -> &[String] {
+        &self.columns
+    }
+
+    /// 検証済みの内側 SELECT。
+    pub fn query(&self) -> &Statement {
+        &self.query
+    }
+
+    /// `USING OPERATION_ID` の値。
+    pub fn operation_id(&self) -> Option<&OperationId> {
+        self.operation_id.as_ref()
+    }
+}
+
+/// [`parse_insert_shape_tokens_with_limit`] の `INSERT ... SELECT` 受理版（SQL-51・Issue #1732）。
+/// `VALUES` 形は従来と同一の [`ValidatedInsert`]、SELECT 形は未検証の問い合わせ span を持つ
+/// [`InsertSelectShape`] を返す。`operation_id` 必須化（`mode.require`）はどちらもカタログ照会の前。
+pub(crate) fn parse_insert_any_shape_tokens_with_limit(
+    tokens: &[lexer::Token],
+    mode: LedgerMode,
+    max_insert_rows: Option<std::num::NonZeroUsize>,
+) -> Result<ParsedInsertTokens, SqlSurfaceError> {
+    let mut p = Parser::new(tokens).with_max_insert_rows(max_insert_rows);
+    let (table_name, columns, columns_omitted, default_values) = p.parse_insert_head()?;
+    if p.at_insert_query_start() {
+        let shape = p.parse_insert_select_tail(table_name, columns)?;
+        p.expect_end_of_statement()?;
+        mode.require(shape.operation_id.as_ref())?;
+        let (start, end) = shape.query_span;
+        let query_tokens = tokens
+            .get(start..end)
+            .ok_or_else(|| SqlSurfaceError::Internal {
+                detail: "internal error".to_string(),
+            })?
+            .to_vec();
+        return Ok(ParsedInsertTokens::Select(InsertSelectShape {
+            table_name: shape.table_name,
+            columns: shape.columns,
+            query_tokens,
+            returning: shape.returning,
+            operation_id: shape.operation_id,
+        }));
+    }
+    let shape = p.parse_insert_values_tail(table_name, columns, columns_omitted, default_values)?;
+    p.expect_end_of_statement()?;
+    mode.require(shape.operation_id.as_ref())?;
+    Ok(ParsedInsertTokens::Values(ValidatedInsert {
+        table_name: shape.table_name,
+        columns: shape.columns,
+        columns_omitted: shape.columns_omitted,
+        rows: shape.rows,
+        operation_id: shape.operation_id,
+        returning: shape.returning,
+        on_conflict: shape.on_conflict,
+    }))
 }
 
 /// 式内 `$n` の型推論（Issue #1546・SQL-45 のポインタ）専用の式解析入口。
@@ -23787,6 +24138,169 @@ mod tests {
         let err =
             validate_insert(&sql, &lookup, LedgerMode::Ledgered).expect_err("must be rejected");
         assert_eq!(err.wire_code(), "42601");
+    }
+
+    /// `INSERT ... SELECT`（SQL-51・Issue #1732）の構文段。問い合わせ span の区切り・後続句・拒否形。
+    fn parse_insert_any(
+        sql: &str,
+        mode: LedgerMode,
+    ) -> Result<ParsedInsertTokens, SqlSurfaceError> {
+        let tokens = lexer::tokenize(sql).expect("tokenize");
+        parse_insert_any_shape_tokens_with_limit(&tokens, mode, None)
+    }
+
+    #[test]
+    fn insert_select_span_is_cut_at_top_level_clauses_only() {
+        // JOIN の `ON`・`USING (...)`・`USING PLAN(...)` で切らず、`RETURNING`／`USING OPERATION_ID`／`;` で切る。
+        let sql = "INSERT INTO t (a) SELECT x.a FROM x JOIN y ON x.a = y.a LIMIT 3 \
+                   RETURNING a USING OPERATION_ID 'op-1';";
+        let ParsedInsertTokens::Select(shape) =
+            parse_insert_any(sql, LedgerMode::Ledgered).expect("parse")
+        else {
+            panic!("expected Select shape");
+        };
+        let tail = format!("{:?}", shape.query_tokens.last().expect("non-empty"));
+        assert!(tail.contains('3'), "span must end at LIMIT 3: {tail}");
+        assert!(shape.returning.is_some());
+        assert!(shape.operation_id.is_some());
+
+        let sql = "INSERT INTO t (a) SELECT a FROM x USING PLAN(retrieve = 'q') LIMIT 3";
+        let ParsedInsertTokens::Select(shape) =
+            parse_insert_any(sql, LedgerMode::CompareOnlyWithoutLedger).expect("parse")
+        else {
+            panic!("expected Select shape");
+        };
+        assert!(shape.operation_id.is_none());
+        assert!(
+            shape.query_tokens.len() > 8,
+            "USING PLAN must stay inside the span"
+        );
+    }
+
+    #[test]
+    fn insert_select_span_keeps_clause_names_used_as_identifiers() {
+        let mode = LedgerMode::CompareOnlyWithoutLedger;
+        for sql in [
+            "INSERT INTO t (a) SELECT returning FROM x LIMIT 1",
+            "INSERT INTO t (a) SELECT x.returning FROM x LIMIT 1",
+            "INSERT INTO t (a) SELECT a AS returning FROM x LIMIT 1",
+            "INSERT INTO t (a) SELECT conflict FROM x LIMIT 1",
+            "INSERT INTO t (a) SELECT a FROM x JOIN y ON conflict = y.a LIMIT 1",
+            "INSERT INTO t (a) SELECT a FROM x JOIN y ON x.a = returning LIMIT 1",
+            "INSERT INTO t (a) SELECT a FROM x ORDER BY returning LIMIT 1",
+        ] {
+            let ParsedInsertTokens::Select(shape) = parse_insert_any(sql, mode).expect(sql) else {
+                panic!("expected Select shape: {sql}");
+            };
+            assert!(shape.returning.is_none(), "{sql}");
+            let n = lexer::tokenize(sql).expect("tokenize").len();
+            assert_eq!(shape.query_tokens.len() + 6, n, "span must be whole: {sql}");
+        }
+        // 配列コンストラクタ・添字の終端 `]` の直後の `RETURNING` も句境界になる。
+        for sql in [
+            "INSERT INTO t (a) SELECT ARRAY[1, 2] RETURNING a",
+            "INSERT INTO t (a) SELECT b[1] FROM x RETURNING a",
+        ] {
+            let ParsedInsertTokens::Select(shape) = parse_insert_any(sql, mode).expect(sql) else {
+                panic!("expected Select shape: {sql}");
+            };
+            assert!(shape.returning.is_some(), "{sql}");
+        }
+        // `AS` 直後の別名が演算子語と同じ綴りでも `RETURNING` は句境界になる。
+        for sql in [
+            "INSERT INTO t (a) SELECT 1 AS desc RETURNING a",
+            "INSERT INTO t (a) SELECT a AS asc FROM x RETURNING a",
+        ] {
+            let ParsedInsertTokens::Select(shape) = parse_insert_any(sql, mode).expect(sql) else {
+                panic!("expected Select shape: {sql}");
+            };
+            assert!(shape.returning.is_some(), "{sql}");
+        }
+        // `ORDER BY` の方向指定（`NULLS FIRST/LAST` 含む）の後の `RETURNING` も句境界になる。
+        for sql in [
+            "INSERT INTO t (a) SELECT a FROM x GROUP BY a ORDER BY a DESC RETURNING a",
+            "INSERT INTO t (a) SELECT a FROM x ORDER BY a ASC RETURNING a",
+            "INSERT INTO t (a) SELECT a FROM x ORDER BY a DESC NULLS LAST RETURNING a",
+            "INSERT INTO t (a) SELECT a FROM x ORDER BY a NULLS FIRST RETURNING a",
+            "INSERT INTO t (a) SELECT a FROM x ORDER BY b, a DESC RETURNING a",
+        ] {
+            let ParsedInsertTokens::Select(shape) = parse_insert_any(sql, mode).expect(sql) else {
+                panic!("expected Select shape: {sql}");
+            };
+            assert!(shape.returning.is_some(), "{sql}");
+        }
+        // 列名・別名の `desc` は方向指定とみなさず範囲に残す（従来の保護）。
+        for sql in [
+            "INSERT INTO t (a) SELECT desc returning FROM x",
+            "INSERT INTO t (a) SELECT a FROM x ORDER BY desc returning",
+        ] {
+            let ParsedInsertTokens::Select(shape) = parse_insert_any(sql, mode).expect(sql) else {
+                panic!("expected Select shape: {sql}");
+            };
+            assert!(shape.returning.is_none(), "{sql}");
+        }
+        // 本物の句は従来どおり境界になる。
+        let ParsedInsertTokens::Select(shape) = parse_insert_any(
+            "INSERT INTO t (a) SELECT a FROM x JOIN y ON x.a = y.a LIMIT 1 RETURNING a",
+            mode,
+        )
+        .expect("parse") else {
+            panic!("expected Select shape");
+        };
+        assert!(shape.returning.is_some());
+        assert_eq!(
+            parse_insert_any(
+                "INSERT INTO t (a) SELECT a FROM x JOIN y ON x.a = y.a LIMIT 1 ON CONFLICT (a) DO NOTHING",
+                mode
+            )
+            .expect_err("must fail")
+            .wire_code(),
+            "0A000"
+        );
+    }
+
+    #[test]
+    fn insert_select_rejections() {
+        let mode = LedgerMode::CompareOnlyWithoutLedger;
+        let code = |sql: &str| {
+            parse_insert_any(sql, mode)
+                .expect_err("must fail")
+                .wire_code()
+                .to_string()
+        };
+        assert_eq!(
+            code("INSERT INTO t (a) SELECT a FROM x LIMIT 1 ON CONFLICT (a) DO NOTHING"),
+            "0A000"
+        );
+        assert_eq!(code("INSERT INTO t (a) RETURNING a"), "42601");
+        assert_eq!(code("INSERT INTO t SELECT a FROM x LIMIT 1"), "42601");
+        // 括弧の外の余剰句（`RETURNING` の後ろの `SELECT`）は後続句の解析が `42601` で拒否する。
+        assert_eq!(
+            code("INSERT INTO t (a) SELECT a FROM x LIMIT 1 RETURNING a SELECT 1"),
+            "42601"
+        );
+        // 必須化ガードはカタログ照会の前（`23502`）
+        assert_eq!(
+            parse_insert_any(
+                "INSERT INTO t (a) SELECT a FROM x LIMIT 1",
+                LedgerMode::Ledgered
+            )
+            .expect_err("must fail")
+            .wire_code(),
+            "23502"
+        );
+    }
+
+    #[test]
+    fn validate_insert_rejects_select_form_with_0a000() {
+        let lookup = catalog_with(&["t", "x"]);
+        let err = validate_insert(
+            "INSERT INTO t (a) SELECT a FROM x LIMIT 1",
+            &lookup,
+            LedgerMode::CompareOnlyWithoutLedger,
+        )
+        .expect_err("SELECT form is not supported on this entry point");
+        assert_eq!(err.wire_code(), "0A000");
     }
 
     #[test]

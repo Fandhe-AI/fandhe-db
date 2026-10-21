@@ -23,11 +23,8 @@
 //! 共有 write txn を読み取り源にも書き込み先にも使う（自トランザクションの未 commit 変更が見え、
 //! ROLLBACK で破棄される）。設計判断は `docs/design/insert-select.md`。
 //!
-//! 呼び出し元: 構文・束縛側（#1732）が `ParsedSql` の INSERT ... SELECT 腕を結線するまでは
-//! crate 内テストからのみ呼ばれる（結線は autocommit 腕・明示トランザクション腕の 2 箇所）。
-
-// 結線前は crate 内テストからのみ呼ばれる（上記）。
-#![cfg_attr(not(test), allow(dead_code))]
+//! 呼び出し元: `core.rs` の autocommit 腕・明示トランザクション腕の `ParsedSql::InsertSelect`
+//! （入口は `execute_parsed_insert_select`。束縛は #1732 の `sql::insert_select::bind`）。
 
 use super::EngineCore;
 use crate::catalog::{CatalogError, TableSchema};
@@ -75,6 +72,34 @@ impl EngineCore {
         self.result_limits
             .max_result_rows()
             .min(MAX_RESULT_ROWS_HARD_CAP.saturating_sub(1))
+    }
+
+    /// `ParsedSql::InsertSelect` の実行腕から呼ぶ入口（SQL-51・Issue #1732・#1733）。束縛（列数・型の
+    /// 静的照合。内側 SELECT の結果列メタは Describe で導出）を挿入より前に通し、検証済みの文を
+    /// [`InsertSelectRequest`] へ詰めて [`Self::execute_insert_select`] へ渡す。`ON CONFLICT` との併用は
+    /// parser が `0A000` で拒否済みのため `has_on_conflict` は常に偽。
+    pub(super) fn execute_parsed_insert_select(
+        &self,
+        mode: InsertSelectTxn<'_>,
+        ctx: &PolicyContext,
+        session: &mut SessionState,
+        stmt: &crate::sql::allowlist::ValidatedInsertSelect,
+    ) -> Result<SqlOutcome, SqlSurfaceError> {
+        self.bind_insert_select(session, stmt, &self.result_limits)?;
+        self.execute_insert_select(
+            mode,
+            ctx,
+            session,
+            InsertSelectRequest {
+                table_name: &stmt.table_name,
+                columns: Some(&stmt.columns),
+                select: (*stmt.query).clone(),
+                operation_id: stmt.operation_id.clone(),
+                statement_hash: stmt.statement_hash,
+                returning: stmt.returning.as_ref(),
+                has_on_conflict: false,
+            },
+        )
     }
 
     /// `INSERT ... SELECT` の実行本体。手順は先頭の `//!` を参照（全検査を書き込みの前に行う）。
