@@ -9162,9 +9162,46 @@ impl<'a> Parser<'a> {
                 ))
     }
 
+    /// 深さ 0 の識別子 `RETURNING`（位置 `idx`）が INSERT の `RETURNING` 句の開始か、列名・別名等の
+    /// 識別子かを文脈で判定する（Issue #1732 レビュー対応）。`RETURNING` は予約語ではないため、
+    /// 直前が式の終端（リテラル・`)`・演算子語以外の識別子）で、直後が射影の先頭（識別子・`*`）の
+    /// ときだけ句境界とする。それ以外は識別子として問い合わせ範囲に残し、SELECT 検証器へ委ねる。
+    /// 曖昧な形（`SELECT a returning FROM t` 等は別名として扱う）は範囲に残る側へ倒れ、
+    /// SELECT 検証器が拒否する（fail-closed）。
+    fn returning_is_clause_boundary(&self, start: usize, idx: usize) -> bool {
+        if idx <= start {
+            return false;
+        }
+        let prev_ends_expr = match self.tokens.get(idx.saturating_sub(1)) {
+            Some(
+                Token::Number(_)
+                | Token::StringLiteral(_)
+                | Token::Param(_)
+                | Token::QualifiedIdent { .. }
+                | Token::QuotedNull(_)
+                | Token::Punct(')'),
+            ) => true,
+            Some(Token::Ident(p)) => ![
+                "AS", "ON", "JOIN", "USING", "AND", "OR", "NOT", "IN", "IS", "LIKE", "ILIKE",
+                "BETWEEN", "INNER", "LEFT", "RIGHT", "FULL", "CROSS", "NATURAL", "OUTER",
+                "DISTINCT", "ASC", "DESC",
+            ]
+            .iter()
+            .any(|w| p.eq_ignore_ascii_case(w)),
+            _ => false,
+        };
+        let next_starts_projection = matches!(
+            self.tokens.get(idx.saturating_add(1)),
+            Some(Token::Ident(_) | Token::QualifiedIdent { .. } | Token::QualifiedStar { .. })
+                | Some(Token::Punct('*'))
+        );
+        prev_ends_expr && next_starts_projection
+    }
+
     /// `INSERT ... SELECT` の問い合わせ部と後続句を解析する（SQL-51・Issue #1732）。
     ///
     /// 問い合わせの範囲（`query_span`）は、括弧の深さ 0 で最初に現れる `ON CONFLICT`・`RETURNING`・
+    /// （`RETURNING` と `ON CONFLICT` は予約語でないため、列名・別名・JOIN の `ON` 述語内の同名語は文脈判定で除外する）
     /// `USING OPERATION_ID`・`;`・文末の手前までとする。`ON`／`USING` は 2 トークン組で判定し、JOIN の
     /// `ON`・`USING (...)`・`USING PLAN(...)`・`USING MODE` を誤って区切りにしない。範囲の中身の検証は
     /// 呼び出し元（`core.rs`）が既存の SELECT 検証器へ渡して行う（SELECT 構文を第 2 の実装にしない）。
@@ -9176,6 +9213,7 @@ impl<'a> Parser<'a> {
     ) -> Result<ParsedInsertSelectShape, SqlSurfaceError> {
         let start = self.pos;
         let mut depth: usize = 0;
+        let mut pending_joins: usize = 0;
         let mut idx = start;
         let end = loop {
             match self.tokens.get(idx) {
@@ -9190,9 +9228,24 @@ impl<'a> Parser<'a> {
                             Some(Token::Ident(n)) if n.eq_ignore_ascii_case(word)
                         )
                     };
-                    if w.eq_ignore_ascii_case("RETURNING")
-                        || (w.eq_ignore_ascii_case("ON") && next_is("CONFLICT"))
+                    if w.eq_ignore_ascii_case("JOIN") {
+                        pending_joins = pending_joins.saturating_add(1);
+                    } else if w.eq_ignore_ascii_case("USING")
+                        && pending_joins > 0
+                        && matches!(
+                            self.tokens.get(idx.saturating_add(1)),
+                            Some(Token::Punct('('))
+                        )
+                    {
+                        // `JOIN ... USING (...)` は ON を伴わずに結合条件を閉じる。
+                        pending_joins = pending_joins.saturating_sub(1);
+                    } else if w.eq_ignore_ascii_case("ON") && pending_joins > 0 {
+                        // 直前の JOIN に対応する結合条件の `ON`（`ON CONFLICT` 句ではない）。
+                        pending_joins = pending_joins.saturating_sub(1);
+                    } else if (w.eq_ignore_ascii_case("ON") && next_is("CONFLICT"))
                         || (w.eq_ignore_ascii_case("USING") && next_is("OPERATION_ID"))
+                        || (w.eq_ignore_ascii_case("RETURNING")
+                            && self.returning_is_clause_boundary(start, idx))
                     {
                         break idx;
                     }
@@ -23970,6 +24023,45 @@ mod tests {
         assert!(
             shape.query_tokens.len() > 8,
             "USING PLAN must stay inside the span"
+        );
+    }
+
+    #[test]
+    fn insert_select_span_keeps_clause_names_used_as_identifiers() {
+        let mode = LedgerMode::CompareOnlyWithoutLedger;
+        for sql in [
+            "INSERT INTO t (a) SELECT returning FROM x LIMIT 1",
+            "INSERT INTO t (a) SELECT x.returning FROM x LIMIT 1",
+            "INSERT INTO t (a) SELECT a AS returning FROM x LIMIT 1",
+            "INSERT INTO t (a) SELECT conflict FROM x LIMIT 1",
+            "INSERT INTO t (a) SELECT a FROM x JOIN y ON conflict = y.a LIMIT 1",
+            "INSERT INTO t (a) SELECT a FROM x JOIN y ON x.a = returning LIMIT 1",
+            "INSERT INTO t (a) SELECT a FROM x ORDER BY returning LIMIT 1",
+        ] {
+            let ParsedInsertTokens::Select(shape) = parse_insert_any(sql, mode).expect(sql) else {
+                panic!("expected Select shape: {sql}");
+            };
+            assert!(shape.returning.is_none(), "{sql}");
+            let n = lexer::tokenize(sql).expect("tokenize").len();
+            assert_eq!(shape.query_tokens.len() + 6, n, "span must be whole: {sql}");
+        }
+        // 本物の句は従来どおり境界になる。
+        let ParsedInsertTokens::Select(shape) = parse_insert_any(
+            "INSERT INTO t (a) SELECT a FROM x JOIN y ON x.a = y.a LIMIT 1 RETURNING a",
+            mode,
+        )
+        .expect("parse") else {
+            panic!("expected Select shape");
+        };
+        assert!(shape.returning.is_some());
+        assert_eq!(
+            parse_insert_any(
+                "INSERT INTO t (a) SELECT a FROM x JOIN y ON x.a = y.a LIMIT 1 ON CONFLICT (a) DO NOTHING",
+                mode
+            )
+            .expect_err("must fail")
+            .wire_code(),
+            "0A000"
         );
     }
 
