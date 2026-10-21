@@ -931,6 +931,15 @@ pub(crate) enum UpsertAssignmentHashValue<'a> {
     /// ハッシュも変わる）。
     Excluded(&'a str),
     Literal(&'a Value),
+    /// `<col> = <col> + <operand>`（SQL-49・RECOVER-11、Issue #2425）。ハッシュに含めるのは
+    /// 送られた文の形（演算子・オペランド種別・リテラル／参照列名）だけで、評価結果の値は含めない。
+    Add(UpsertAddHashOperand<'a>),
+}
+
+/// [`UpsertAssignmentHashValue::Add`] の右オペランド（Issue #2425）。
+pub(crate) enum UpsertAddHashOperand<'a> {
+    Excluded(&'a str),
+    Literal(&'a Value),
 }
 
 /// [`for_typed_upsert`] の衝突分岐（SQL-20・TASK-193、Issue #872）。
@@ -989,6 +998,22 @@ fn push_upsert_header(
                     UpsertAssignmentHashValue::Literal(v) => {
                         b.push_u8(1);
                         push_value(b, v)?;
+                    }
+                    // kind 2 = 加算（Issue #2425）。kind 0/1 のバイト列は不変。左辺列は
+                    // 直前に push した代入先名と同じなので重ねない。`+` は演算子タグ。
+                    UpsertAssignmentHashValue::Add(operand) => {
+                        b.push_u8(2);
+                        b.push_u8(b'+');
+                        match operand {
+                            UpsertAddHashOperand::Excluded(src) => {
+                                b.push_u8(0);
+                                b.push_bytes(src.as_bytes())?;
+                            }
+                            UpsertAddHashOperand::Literal(v) => {
+                                b.push_u8(1);
+                                push_value(b, v)?;
+                            }
+                        }
                     }
                 }
             }
@@ -3067,6 +3092,49 @@ mod tests {
             to_hex(up_rowid_update.as_bytes()),
             "dbce4de35815ad0850535db0fec3b402bd3561480a61d713c475fdd5b72f41da"
         );
+    }
+
+    /// 加算代入（kind 2。Issue #2425・SQL-49・RECOVER-11）の判別性: 形・リテラル・参照列が違えば
+    /// ハッシュが変わり、同じ入力なら変わらない。評価結果の値は入力に含まれない。
+    #[test]
+    fn for_typed_upsert_add_assignment_is_discriminated() {
+        let embedding = [0.5_f32, 1.5];
+        let n = Value::Integer(1);
+        let cols: [(&str, &Value); 1] = [("n", &n)];
+        let rows: [TypedInsertBatchRow<'_>; 1] = [(1, Visibility::Private, &embedding, &cols)];
+        let one = Value::BigInt(1);
+        let two = Value::BigInt(2);
+        let hash = |v: UpsertAssignmentHashValue<'_>| {
+            let a = [("n".to_string(), v)];
+            *for_typed_upsert(
+                &UpsertHashTarget::RowId,
+                &UpsertHashAction::DoUpdate(&a),
+                &rows,
+            )
+            .unwrap()
+            .as_bytes()
+        };
+        let add_one = hash(UpsertAssignmentHashValue::Add(
+            UpsertAddHashOperand::Literal(&one),
+        ));
+        assert_eq!(
+            add_one,
+            hash(UpsertAssignmentHashValue::Add(
+                UpsertAddHashOperand::Literal(&one)
+            ))
+        );
+        assert_ne!(
+            add_one,
+            hash(UpsertAssignmentHashValue::Add(
+                UpsertAddHashOperand::Literal(&two)
+            ))
+        );
+        assert_ne!(add_one, hash(UpsertAssignmentHashValue::Literal(&one)));
+        let add_excluded = hash(UpsertAssignmentHashValue::Add(
+            UpsertAddHashOperand::Excluded("n"),
+        ));
+        assert_ne!(add_excluded, hash(UpsertAssignmentHashValue::Excluded("n")));
+        assert_ne!(add_excluded, add_one);
     }
 
     /// golden 固定（Issue #1692・TABLE-24 (3)・RECOVER-10・RECOVER-11）: `nextval`／`currval` の

@@ -18,8 +18,8 @@ use crate::catalog::{ColumnDef, ColumnDefault, ColumnType, TableSchema};
 use crate::declarative_filter::{self, DeclarativeFilter, MetadataFilter};
 use crate::sql::allowlist::{
     FunctionArg, InsertLiteral, OnConflictAction, OnConflictClause, OrderByForm, Projection,
-    ScalarOrderKey, UpsertValue, ValidatedDelete, ValidatedInsert, ValidatedPredicateDelete,
-    ValidatedStatement, WherePredicate,
+    ScalarOrderKey, UpsertAddOperand, UpsertValue, ValidatedDelete, ValidatedInsert,
+    ValidatedPredicateDelete, ValidatedStatement, WherePredicate,
 };
 use crate::sql::plan::EvaluationOrder;
 use crate::sql::udf_call::Expr;
@@ -4868,6 +4868,18 @@ pub enum BoundUpsertValue {
     /// `BoundInsert::values` の列インデックス（同じ行の束縛済み値を指す）。
     Excluded(usize),
     Literal(crate::row_codec::Value),
+    /// `<col> = <col> + <operand>`（SQL-49、Issue #2425）。左辺の列 index は外側タプルの
+    /// 代入先と同じ。衝突した可視な既存行の値（pre-image）へ加算する。
+    Add(BoundUpsertAddOperand),
+}
+
+/// [`BoundUpsertValue::Add`] の右オペランド（Issue #2425）。
+#[derive(Debug, Clone, PartialEq)]
+pub enum BoundUpsertAddOperand {
+    /// 代入先の型に合わせて束縛した数値（整数は `BigInt`、浮動小数は `Double`）。
+    Literal(crate::row_codec::Value),
+    /// `BoundInsert::values` の列インデックス（`EXCLUDED.<col>`）。
+    Excluded(usize),
 }
 
 /// 束縛済みの `ON CONFLICT (id) DO NOTHING | DO UPDATE SET ...`（SQL-20・
@@ -5370,6 +5382,44 @@ fn bind_upsert_assignments(
                     )));
                 }
                 BoundUpsertValue::Excluded(src_idx)
+            }
+            UpsertValue::Add {
+                column: lhs,
+                operand,
+            } => {
+                if lhs != name {
+                    return Err(SqlSurfaceError::unsupported(
+                        "ON CONFLICT SET addition must reference the assigned column itself",
+                    ));
+                }
+                crate::sql::upsert_add::check_target_type(&column.ty)?;
+                let bound_operand = match operand {
+                    UpsertAddOperand::Literal(literal) => BoundUpsertAddOperand::Literal(
+                        crate::sql::upsert_add::bind_add_literal(&column.ty, literal)?,
+                    ),
+                    UpsertAddOperand::Excluded(src) => {
+                        if (src == "id" && schema.has_pseudo_id())
+                            || src == "tenant_id"
+                            || src == "visibility"
+                        {
+                            return Err(SqlSurfaceError::unsupported(format!(
+                                "column {src:?} cannot be referenced by EXCLUDED"
+                            )));
+                        }
+                        let src_idx = schema
+                            .columns
+                            .iter()
+                            .position(|c| &c.name == src)
+                            .ok_or_else(|| SqlSurfaceError::undefined_column(src))?;
+                        let src_column = schema
+                            .columns
+                            .get(src_idx)
+                            .ok_or_else(|| SqlSurfaceError::undefined_column(src))?;
+                        crate::sql::upsert_add::check_operand_pair(&column.ty, &src_column.ty)?;
+                        BoundUpsertAddOperand::Excluded(src_idx)
+                    }
+                };
+                BoundUpsertValue::Add(bound_operand)
             }
             UpsertValue::Literal(literal) => {
                 let v = match (&column.ty, literal) {
