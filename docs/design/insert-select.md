@@ -51,19 +51,18 @@ INSERT INTO <表> (<列>[, ...]) <query> [RETURNING ...] [USING OPERATION_ID '<i
 5. `RETURNING` の投影を既存の束縛で検証する
 
 内側の結果列メタは既存の Describe で導出する（列の導出を第 2 の実装にしない）。挿入先スキーマと内側の
-スナップショットの一致は本 Issue では要求せず、実行時の再検証は後続 Issue が write txn 内で行う。
+スナップショットの一致は本 Issue では要求せず、実行時の再検証は #1733 の実行本体が write txn 内で行う。
 エラー文言は英語の固定文言とスキーマ由来の列名だけで、値・他テナントの情報を含めない。
 
 ### 5. 後続への引き継ぎ
 
-- #1733: `BoundInsertSelectTarget`（`slots`・`id_omitted`・`omitted`）を実行側で再利用し、内側 SELECT の RLS 適用と挿入を実装する
-- #1734: `ValidatedInsertSelect::query_tokens`（送られた内側 SELECT の span）を内容照合ハッシュの材料にする
+- #1733・#1734: 結線済み（第 II 部。`BoundInsertSelectTarget` の再利用と `query_tokens` による台帳ハッシュ）
 - #1730: 列リスト省略（`INSERT INTO t SELECT ...`）と `DEFAULT VALUES`
 - SQL-34 / #2212: 内側 SELECT の LIMIT 省略の扱い
 
 ### 6. 対象外（fail-closed）
 
-`ON CONFLICT` との併用・列リスト省略・実行・content_hash・ビューへの挿入・一時表が関与する文・拡張クエリの `$n`・`OVERRIDING`・
+`ON CONFLICT` との併用・列リスト省略・ビューへの挿入・一時表が関与する文・拡張クエリの `$n`・`OVERRIDING`・
 `PARTITIONED` との併用（構文上受理しない）。
 
 ## 第 II 部 実行（SQL-51・Issue #1733）

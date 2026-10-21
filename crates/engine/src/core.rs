@@ -1544,8 +1544,10 @@ pub enum ParsedSql {
     Insert(crate::sql::allowlist::ValidatedInsert),
     /// `INSERT INTO <表> (<列>...) <SELECT> [RETURNING ...] [USING OPERATION_ID ...]`
     /// （SQL-51・Issue #1732）。内側 SELECT は既存の SELECT 検証器を通過済みで、構文・内側の検証・
-    /// 列数／型の束縛までを担う。行の実体化・RLS・挿入・台帳は後続 Issue の担当で、実行腕は束縛の後に
-    /// `0A000` を返し、行・台帳・世代に触れない（fail-closed）。
+    /// 列数／型の束縛までを担う。実行腕は束縛の後に
+    /// `execute_parsed_insert_select`（Issue #1733）へ結線済みで、内側 SELECT の RLS 適用・挿入・台帳記録
+    /// （`for_insert_select` のハッシュ。Issue #1734）まで行う。ON CONFLICT 併用・ビュー・一時表・`$n`・
+    /// `USING PLAN` は実行前に `0A000` で拒否する（fail-closed）。
     ///
     /// **BREAKING CHANGE**（Issue #1732）: 本 variant の追加により `ParsedSql` を網羅的に
     /// マッチするクレート外コードは追随が必要。
