@@ -847,6 +847,16 @@ pub(crate) fn map_outcome(outcome: SqlOutcome) -> OutcomeResponse {
         SqlOutcome::CreateTable(_) => OutcomeResponse::Command {
             tag: "CREATE TABLE".to_string(),
         },
+        // SQL-52（Issue #1678）: `CREATE TABLE ... AS ... WITH DATA` は pg 互換の `SELECT <n>`。`n` は
+        // この文を実行したセッション自身の文脈で投入した行数だけ（他テナントの件数は engine が持たない）。
+        // `WITH NO DATA` と `IF NOT EXISTS` の no-op は件数を持たない固定タグ `CREATE TABLE AS`。
+        SqlOutcome::CreateTableAs(outcome) => OutcomeResponse::Command {
+            tag: if outcome.populated() && !outcome.skipped() {
+                format!("SELECT {}", outcome.rows().unwrap_or(0))
+            } else {
+                "CREATE TABLE AS".to_string()
+            },
+        },
         // SQL-23・TASK-203（Issue #902）: `DROP TABLE`（`sql::ddl::
         // DropTableOutcome` は削除件数を一切持たない）の応答を pg 互換の
         // `CommandComplete` タグ `DROP TABLE`（件数を持たない固定タグ。

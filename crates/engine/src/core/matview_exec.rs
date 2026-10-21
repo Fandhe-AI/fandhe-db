@@ -350,7 +350,7 @@ impl EngineCore {
     }
 
     /// 非バイト順照合の列を持つ表を本文が読むなら `0A000`（`check_buffered_view_collations` と同じ判定）。
-    fn check_matview_body_collations(
+    pub(super) fn check_matview_body_collations(
         &self,
         read_txn: &impl crate::storage::read_source::ReadSource,
         stmt: &Statement,

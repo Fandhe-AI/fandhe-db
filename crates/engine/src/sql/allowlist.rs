@@ -10596,7 +10596,7 @@ impl<'a> Parser<'a> {
         }
         self.expect_contextual_keyword("TABLE")?;
         let (if_not_exists, table_name) = self.parse_create_table_name()?;
-        if self.peek_ident_matches("AS") {
+        if ctas_as_follows(&self.tokens, self.pos) {
             // `CREATE TEMP TABLE ... AS`（SQL-52）は未確定のため `0A000`。
             return Err(SqlSurfaceError::feature_not_supported(
                 "CREATE TEMPORARY TABLE ... AS is not supported",
@@ -13437,6 +13437,226 @@ pub(crate) fn validate_refresh_materialized_view_tokens(
         name,
         concurrently,
         with_data,
+    })
+}
+
+/// `CREATE TABLE [IF NOT EXISTS] <名前> [(<列名>[, ...])] AS <問い合わせ> [WITH [NO] DATA]
+/// [USING OPERATION_ID '<id>'] [;]`（CTAS。SQL-52・Issue #1678）の構文段の検証結果。
+///
+/// カタログを一切照会しない（DDL 権限ゲートより前に表・列の存在を観測させないため。`CreateView`・
+/// `CreateMaterializedView` と同じ設計）。内側の問い合わせは構造だけを検証してトークン列のまま保持し、
+/// 実カタログでの再検証（`42P01` 等）は権限ゲート通過後の実行段（`core::ctas_exec`）が行う。
+#[derive(Debug, Clone, PartialEq)]
+pub struct ValidatedCreateTableAs {
+    pub(crate) table_name: String,
+    /// `IF NOT EXISTS` の有無。
+    pub(crate) if_not_exists: bool,
+    /// 列名リスト（空なら問い合わせの出力列名を使う。重複・識別子検査は列定義導出が担う）。
+    pub(crate) column_names: Vec<String>,
+    /// 内側の問い合わせのトークン列（`WITH [NO] DATA`・`USING OPERATION_ID`・末尾 `;` を除く。
+    /// FROM なし以外は引用付き `NULL` を通常の識別子へ戻し済み）。
+    pub(crate) query_tokens: Vec<Token>,
+    /// `WITH DATA`（省略時の既定）なら真。
+    pub(crate) with_data: bool,
+    /// `USING OPERATION_ID`（受理するが、実行段は台帳が未実装のため `0A000`。Issue #1679 の担当）。
+    pub(crate) operation_id: Option<OperationId>,
+    /// 作成対象名が `public.` で明示修飾されていたか（`core::EngineCore` が名前解決から設定する）。
+    pub(crate) public_qualified: bool,
+}
+
+impl ValidatedCreateTableAs {
+    /// 作成する表の名前（名前解決済み）。
+    pub fn table_name(&self) -> &str {
+        &self.table_name
+    }
+
+    /// `IF NOT EXISTS` が指定されたか。
+    pub fn if_not_exists(&self) -> bool {
+        self.if_not_exists
+    }
+
+    /// 列名リスト（空なら問い合わせの出力列名を使う）。
+    pub fn column_names(&self) -> &[String] {
+        &self.column_names
+    }
+
+    /// 行を投入するか（`WITH DATA`。省略時も真）。
+    pub fn with_data(&self) -> bool {
+        self.with_data
+    }
+
+    /// `USING OPERATION_ID` で指定された識別子（未指定・`NULL` は `None`）。
+    pub fn operation_id(&self) -> Option<&OperationId> {
+        self.operation_id.as_ref()
+    }
+}
+
+/// 位置 `i`（表名の直後）から `AS`、または `( 識別子 {, 識別子} ) AS` が続くか。
+/// `CREATE TABLE`・`CREATE TEMP TABLE` が CTAS の形を判別するために共有する。
+fn ctas_as_follows(tokens: &[Token], mut i: usize) -> bool {
+    let ident_at = |i: usize, word: &str| matches!(tokens.get(i), Some(Token::Ident(n)) if n.eq_ignore_ascii_case(word));
+    if ident_at(i, "AS") {
+        return true;
+    }
+    if !matches!(tokens.get(i), Some(Token::Punct('('))) {
+        return false;
+    }
+    i += 1;
+    loop {
+        if !matches!(tokens.get(i), Some(Token::Ident(_))) {
+            return false;
+        }
+        i += 1;
+        match tokens.get(i) {
+            Some(Token::Punct(',')) => i += 1,
+            Some(Token::Punct(')')) => {
+                i += 1;
+                break;
+            }
+            _ => return false,
+        }
+    }
+    ident_at(i, "AS")
+}
+
+/// `CREATE TABLE ... AS` の形か（`core.rs::parse_tokens_in` が通常の `CREATE TABLE` より前に
+/// 分岐するための述語。SQL-52・Issue #1678）。`CREATE TEMP TABLE` は一致しない。
+pub(crate) fn is_create_table_as_statement(tokens: &[Token]) -> bool {
+    if !is_create_table_statement(tokens) {
+        return false;
+    }
+    let ident_at = |i: usize, word: &str| matches!(tokens.get(i), Some(Token::Ident(n)) if n.eq_ignore_ascii_case(word));
+    let mut i = 2;
+    if ident_at(i, "IF") && ident_at(i + 1, "NOT") && ident_at(i + 2, "EXISTS") {
+        i += 3;
+    }
+    // 対象名は `schema.name`（`Token::QualifiedIdent`）や引用識別子も取りうる。名前書き換え
+    // （`rewrite_relation_names_full`）より前に呼ぶ経路（一時表スキャン・`$n` 拒否の判定）でも
+    // 修飾名の CTAS を取りこぼさないよう、識別子相当のトークンを受理する。
+    if !tokens
+        .get(i)
+        .is_some_and(crate::sql::relation_name::is_ident_like)
+    {
+        return false;
+    }
+    ctas_as_follows(tokens, i + 1)
+}
+
+/// 末尾の `USING OPERATION_ID '<id>'`（または `NULL`）を剥がす。無ければそのまま返す。
+fn split_ctas_operation_id(
+    tokens: &[Token],
+) -> Result<(&[Token], Option<OperationId>), SqlSurfaceError> {
+    let body = strip_trailing_semicolons(tokens);
+    if let [head @ .., Token::Ident(u), Token::Ident(o), last] = body {
+        if u.eq_ignore_ascii_case("USING") && o.eq_ignore_ascii_case("OPERATION_ID") {
+            return match last {
+                Token::StringLiteral(raw) => Ok((head, Some(OperationId::parse(raw)?))),
+                Token::Ident(n) if n.eq_ignore_ascii_case("NULL") => Ok((head, None)),
+                _ => Err(SqlSurfaceError::unsupported(
+                    "expected string literal after USING OPERATION_ID",
+                )),
+            };
+        }
+    }
+    Ok((body, None))
+}
+
+/// 内側の問い合わせが「行を返す読み取りの文種」かを検査する（`INSERT ... SELECT` と CTAS が共有。
+/// `what` は文言用の文種名）。`EXPLAIN`・`SET`・`SHOW`・`CREATE FUNCTION` は `42601`、LLM I/O を起こす
+/// `USING PLAN` は `0A000`。`Statement` の網羅 `match` により variant 追加時は判断が強制される。
+pub(crate) fn require_row_query_statement(
+    query: &Statement,
+    what: &str,
+) -> Result<(), SqlSurfaceError> {
+    match query {
+        Statement::Select(v) if v.using_plan().is_some() => {
+            Err(SqlSurfaceError::feature_not_supported(format!(
+                "{what} with USING PLAN is not supported"
+            )))
+        }
+        Statement::Select(_)
+        | Statement::Scan(_)
+        | Statement::Aggregate(_)
+        | Statement::Join(_)
+        | Statement::SetOperation(_)
+        | Statement::BufferedView(_)
+        | Statement::ConstSelect(_)
+        | Statement::MaterializedView(_) => Ok(()),
+        Statement::Explain(_)
+        | Statement::SetSearchMode { .. }
+        | Statement::SetTimeZone { .. }
+        | Statement::ShowTimeZone
+        | Statement::SetSearchPath { .. }
+        | Statement::ShowSearchPath
+        | Statement::CreateFunction { .. } => Err(SqlSurfaceError::unsupported(format!(
+            "{what} requires a SELECT query"
+        ))),
+    }
+}
+
+/// CTAS の内側トークン列を、`INSERT ... SELECT` と同じ規則で単独の SELECT と同じ引用付き `NULL` の
+/// 扱いへ揃える（FROM なし SELECT だけ引用情報を保持する）。
+pub(crate) fn normalize_inner_query_tokens(tokens: Vec<Token>) -> Vec<Token> {
+    let from_less = matches!(tokens.first(), Some(Token::Keyword(lexer::Keyword::Select)))
+        && is_from_less_select(&tokens);
+    if from_less {
+        tokens
+    } else {
+        lexer::demote_quoted_null(tokens)
+    }
+}
+
+/// [`ValidatedCreateTableAs`] の構文段の検証本体（`core.rs::parse_tokens_in` から呼ばれる。SQL-52・
+/// Issue #1678）。カタログを照会しない。
+pub(crate) fn validate_create_table_as_tokens(
+    tokens: &[Token],
+) -> Result<ValidatedCreateTableAs, SqlSurfaceError> {
+    let mut p = Parser::new(tokens);
+    p.expect_contextual_keyword("CREATE")?;
+    p.expect_contextual_keyword("TABLE")?;
+    let (if_not_exists, table_name) = p.parse_create_table_name()?;
+    let mut column_names: Vec<String> = Vec::new();
+    if matches!(p.peek(), Some(Token::Punct('('))) {
+        p.advance();
+        loop {
+            let name = p.expect_ident()?;
+            if column_names.len() >= MAX_COLUMN_COUNT {
+                return Err(SqlSurfaceError::payload_too_large(
+                    "too many columns in CREATE TABLE AS",
+                ));
+            }
+            column_names.push(name);
+            match p.advance() {
+                Some(Token::Punct(',')) => {}
+                Some(Token::Punct(')')) => break,
+                _ => {
+                    return Err(SqlSurfaceError::unsupported(
+                        "expected ',' or ')' in CREATE TABLE AS column name list",
+                    ))
+                }
+            }
+        }
+    }
+    p.expect_contextual_keyword("AS")?;
+    let (rest, operation_id) = split_ctas_operation_id(p.remaining())?;
+    let (query_tokens, with_data) = split_matview_data_clause(rest);
+    if query_tokens.is_empty() {
+        return Err(SqlSurfaceError::unsupported(
+            "expected a query after AS in CREATE TABLE AS",
+        ));
+    }
+    let query_tokens = normalize_inner_query_tokens(query_tokens.to_vec());
+    // 構造だけを検証する（実在確認は権限ゲート後の実行段）。文種と `USING PLAN` もここで確定する。
+    let query = validate_sql_tokens_with_subquery_ctx(&query_tokens, &StructuralOnlyLookup, 0)?;
+    require_row_query_statement(&query, "CREATE TABLE AS")?;
+    Ok(ValidatedCreateTableAs {
+        table_name,
+        if_not_exists,
+        column_names,
+        query_tokens,
+        with_data,
+        operation_id,
+        public_qualified: false,
     })
 }
 
@@ -29410,6 +29630,89 @@ mod sequence_function_tests {
         ] {
             let tokens = lexer::tokenize(sql).expect("tokenize");
             assert!(!is_sequence_function_select(&tokens), "{sql}");
+        }
+    }
+}
+
+/// `CREATE TABLE ... AS` の構文検証（SQL-52・Issue #1678）。カタログを引かず構造だけを見るため、存在しない
+/// 元表でも受理する。
+#[cfg(test)]
+mod create_table_as_tests {
+    use super::*;
+
+    fn parse(sql: &str) -> Result<ValidatedCreateTableAs, SqlSurfaceError> {
+        let tokens = lexer::tokenize(sql).expect("tokenize");
+        assert!(is_create_table_as_statement(&tokens), "{sql}");
+        validate_create_table_as_tokens(&tokens)
+    }
+
+    #[test]
+    fn accepts_all_clause_combinations() {
+        let plain = parse("CREATE TABLE t AS SELECT a FROM nowhere LIMIT 1").expect("plain");
+        assert_eq!(plain.table_name(), "t");
+        assert!(plain.with_data() && !plain.if_not_exists());
+        assert!(plain.column_names().is_empty() && plain.operation_id().is_none());
+        let full = parse(
+            "create table if not exists t (x, y) as select a, b from nowhere limit 1 with no data;",
+        )
+        .expect("full");
+        assert!(full.if_not_exists() && !full.with_data());
+        assert_eq!(full.column_names(), ["x".to_string(), "y".to_string()]);
+        let op = parse(
+            "CREATE TABLE t AS SELECT a FROM nowhere LIMIT 1 WITH DATA USING OPERATION_ID 'op-1';",
+        )
+        .expect("operation id");
+        assert!(op.with_data() && op.operation_id().is_some());
+    }
+
+    #[test]
+    fn rejects_malformed_forms_with_syntax_error() {
+        for bad in [
+            "CREATE TABLE t AS",
+            "CREATE TABLE t AS ;",
+            "CREATE TABLE t AS EXPLAIN SELECT a FROM u LIMIT 1",
+            "CREATE TABLE t AS SELECT a FROM u LIMIT 1 WITH",
+            "CREATE TABLE t AS SELECT a FROM u LIMIT 1 extra",
+            "CREATE TABLE t AS SELECT a INTO u2 FROM u LIMIT 1",
+            "CREATE TABLE t AS SELECT a FROM u LIMIT 1 USING OPERATION_ID 7",
+        ] {
+            let e = parse(bad).expect_err(bad);
+            assert_eq!(e.wire_code(), "42601", "{bad}");
+        }
+    }
+
+    #[test]
+    fn predicate_distinguishes_ctas_from_plain_create_table() {
+        let is = |sql: &str| is_create_table_as_statement(&lexer::tokenize(sql).expect("tok"));
+        assert!(is("CREATE TABLE t AS SELECT 1"));
+        assert!(is("CREATE TABLE IF NOT EXISTS t (a, b) AS SELECT 1, 2"));
+        assert!(!is("CREATE TABLE t (a INT)"));
+        assert!(!is("CREATE TABLE t (a, b)"));
+        assert!(!is("CREATE TEMP TABLE t AS SELECT 1"));
+        assert!(!is("CREATE VIEW t AS SELECT 1"));
+    }
+
+    #[test]
+    fn predicate_accepts_schema_qualified_target_names() {
+        let is = |sql: &str| is_create_table_as_statement(&lexer::tokenize(sql).expect("tok"));
+        assert!(is("CREATE TABLE public.t AS SELECT 1"));
+        assert!(is(
+            "CREATE TABLE IF NOT EXISTS public.t (a, b) AS SELECT 1, 2"
+        ));
+        assert!(is("CREATE TABLE s1.t AS SELECT 1"));
+        assert!(!is("CREATE TABLE public.t (a INT)"));
+        assert!(!is("CREATE TEMP TABLE public.t AS SELECT 1"));
+    }
+
+    #[test]
+    fn temp_table_ctas_forms_are_feature_not_supported() {
+        for sql in [
+            "CREATE TEMP TABLE t AS SELECT a FROM u LIMIT 1",
+            "CREATE TEMP TABLE t (x) AS SELECT a FROM u LIMIT 1",
+        ] {
+            let tokens = lexer::tokenize(sql).expect("tok");
+            let e = validate_create_temp_table_tokens(&tokens).expect_err(sql);
+            assert_eq!(e.wire_code(), "0A000", "{sql}");
         }
     }
 }

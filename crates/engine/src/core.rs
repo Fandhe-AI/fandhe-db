@@ -1689,6 +1689,15 @@ pub enum ParsedSql {
     /// **BREAKING CHANGE**（Issue #1664）: 本 variant の追加により `ParsedSql` を網羅的に
     /// マッチする既存コードはすべて更新済み。
     CreateMaterializedView(crate::sql::allowlist::ValidatedCreateMaterializedView),
+    /// `CREATE TABLE [IF NOT EXISTS] <name> [(<col>, ...)] AS <SELECT> [WITH [NO] DATA]`
+    /// （CTAS。SQL-52・Issue #1678）。構文検証（`validate_create_table_as_tokens`）はカタログを一切
+    /// 照会しない。DDL 権限ゲートの後、`EngineCore::execute_create_table_as`
+    /// （`core/ctas_exec.rs`）が 1 つの write txn で表の作成と行の投入を行う。明示トランザクション内は
+    /// 汎用フォールバックで `0A000`（DDL と同じ）。
+    ///
+    /// **BREAKING CHANGE**（Issue #1678）: 本 variant の追加により `ParsedSql` を網羅的に
+    /// マッチする既存コードはすべて更新済み。
+    CreateTableAs(crate::sql::allowlist::ValidatedCreateTableAs),
     /// `REFRESH MATERIALIZED VIEW [CONCURRENTLY] <name> [WITH [NO] DATA]`（TABLE-42・Issue #1665）。
     /// DDL 権限ゲートと再実体化は `execute_parsed_in_session` の同名腕が担い、構文検証は
     /// カタログを照会しない。明示トランザクション内は汎用フォールバックで `0A000`
@@ -1801,6 +1810,7 @@ fn statement_clock_scope(
         | ParsedSql::Transaction(_)
         | ParsedSql::DropTable(_)
         | ParsedSql::CreateTable(_)
+        | ParsedSql::CreateTableAs(_)
         | ParsedSql::CreateTempTable(_)
         | ParsedSql::Cursor(_)
         | ParsedSql::Partitioned(_)
@@ -1858,6 +1868,7 @@ fn insert_sequence_scope(
         | ParsedSql::Transaction(_)
         | ParsedSql::DropTable(_)
         | ParsedSql::CreateTable(_)
+        | ParsedSql::CreateTableAs(_)
         | ParsedSql::CreateTempTable(_)
         | ParsedSql::Cursor(_)
         | ParsedSql::Partitioned(_)
@@ -1912,6 +1923,7 @@ fn insert_default_clock_scope(
         | ParsedSql::Transaction(_)
         | ParsedSql::DropTable(_)
         | ParsedSql::CreateTable(_)
+        | ParsedSql::CreateTableAs(_)
         | ParsedSql::CreateTempTable(_)
         | ParsedSql::Cursor(_)
         | ParsedSql::Partitioned(_)
@@ -2185,6 +2197,7 @@ fn attach_public_qualified(
     match parsed {
         ParsedSql::DropTable(stmt) => stmt.public_qualified = public_qualified.to_vec(),
         ParsedSql::CreateTable(stmt) => stmt.public_qualified = create_public,
+        ParsedSql::CreateTableAs(stmt) => stmt.public_qualified = create_public,
         ParsedSql::CreateView(stmt) => stmt.public_qualified = create_public,
         ParsedSql::CreateMaterializedView(stmt) => stmt.public_qualified = create_public,
         ParsedSql::CreateSequence(stmt) => stmt.public_qualified = create_public,
@@ -3724,6 +3737,7 @@ impl EngineCore {
                     | crate::sql::SqlOutcome::Returning(_)
                     | crate::sql::SqlOutcome::Update(_)
                     | crate::sql::SqlOutcome::CreateTable(_)
+                    | crate::sql::SqlOutcome::CreateTableAs(_)
                     | crate::sql::SqlOutcome::DropTable(_)
                     | crate::sql::SqlOutcome::AlterTable(_)
                     | crate::sql::SqlOutcome::CreateView(_)
@@ -3778,6 +3792,7 @@ impl EngineCore {
                     | crate::sql::SqlOutcome::Returning(_)
                     | crate::sql::SqlOutcome::Update(_)
                     | crate::sql::SqlOutcome::CreateTable(_)
+                    | crate::sql::SqlOutcome::CreateTableAs(_)
                     | crate::sql::SqlOutcome::DropTable(_)
                     | crate::sql::SqlOutcome::AlterTable(_)
                     | crate::sql::SqlOutcome::CreateView(_)
@@ -3829,6 +3844,7 @@ impl EngineCore {
                     | crate::sql::SqlOutcome::Returning(_)
                     | crate::sql::SqlOutcome::Update(_)
                     | crate::sql::SqlOutcome::CreateTable(_)
+                    | crate::sql::SqlOutcome::CreateTableAs(_)
                     | crate::sql::SqlOutcome::DropTable(_)
                     | crate::sql::SqlOutcome::AlterTable(_)
                     | crate::sql::SqlOutcome::CreateView(_)
@@ -3887,6 +3903,7 @@ impl EngineCore {
                     | crate::sql::SqlOutcome::Returning(_)
                     | crate::sql::SqlOutcome::Update(_)
                     | crate::sql::SqlOutcome::CreateTable(_)
+                    | crate::sql::SqlOutcome::CreateTableAs(_)
                     | crate::sql::SqlOutcome::DropTable(_)
                     | crate::sql::SqlOutcome::AlterTable(_)
                     | crate::sql::SqlOutcome::CreateView(_)
@@ -3951,6 +3968,7 @@ impl EngineCore {
                     | crate::sql::SqlOutcome::Returning(_)
                     | crate::sql::SqlOutcome::Update(_)
                     | crate::sql::SqlOutcome::CreateTable(_)
+                    | crate::sql::SqlOutcome::CreateTableAs(_)
                     | crate::sql::SqlOutcome::DropTable(_)
                     | crate::sql::SqlOutcome::AlterTable(_)
                     | crate::sql::SqlOutcome::CreateView(_)
@@ -4434,7 +4452,9 @@ impl EngineCore {
         let is_drop_table = matches!(tokens.first(), Some(crate::sql::lexer::Token::Ident(a)) if a.eq_ignore_ascii_case("DROP"))
             && matches!(tokens.get(1), Some(crate::sql::lexer::Token::Ident(b)) if b.eq_ignore_ascii_case("TABLE"));
         let scan_exempt = is_drop_table
-            || crate::sql::allowlist::is_create_table_statement(&tokens)
+            // CTAS は内側の問い合わせが一時表を読みうるため走査を免除しない（一時表は `0A000`）。
+            || (crate::sql::allowlist::is_create_table_statement(&tokens)
+                && !crate::sql::allowlist::is_create_table_as_statement(&tokens))
             || crate::sql::allowlist::is_create_temp_table_statement(&tokens)
             // SCHEMA 名は関係名と別の名前空間で一時表を読み書きしないため走査対象外（TABLE-27・Issue #1713）。
             || crate::sql::allowlist::is_create_schema_statement(&tokens)
@@ -5063,6 +5083,13 @@ impl EngineCore {
         // 順序を統一）: `validate_create_table_tokens` はカタログ照会（テーブル名
         // の重複判定）を一切行わない。権限判定・実行本体は
         // `execute_parsed_in_session` の `CreateTable` 分岐が担う。
+        // SQL-52・Issue #1678: `CREATE TABLE ... AS`（CTAS）は通常の `CREATE TABLE` より前に分岐する。
+        // 構造検証のみでカタログを照会しない（権限の無い主体へ元表の存在を観測させない）。
+        if crate::sql::allowlist::is_create_table_as_statement(&tokens) {
+            let mut stmt = crate::sql::allowlist::validate_create_table_as_tokens(&tokens)?;
+            stmt.public_qualified = create_public;
+            return Ok(ParsedSql::CreateTableAs(stmt));
+        }
         if crate::sql::allowlist::is_create_table_statement(&tokens) {
             let mut stmt = crate::sql::allowlist::validate_create_table_tokens(&tokens)?;
             stmt.public_qualified = create_public;
@@ -5117,7 +5144,7 @@ impl EngineCore {
         lookup: &impl crate::sql::allowlist::TableLookup,
         storage_lookup: &impl crate::sql::allowlist::TableLookup,
     ) -> Result<ParsedSql, crate::sql::allowlist::SqlSurfaceError> {
-        use crate::sql::allowlist::{SqlSurfaceError, Statement};
+        use crate::sql::allowlist::SqlSurfaceError;
         if !crate::sql::allowlist::TableLookup::table_exists(lookup, &shape.table_name)? {
             if matches!(self.storage.view_definition(&shape.table_name), Ok(Some(_))) {
                 return Err(SqlSurfaceError::feature_not_supported(
@@ -5130,50 +5157,16 @@ impl EngineCore {
             ));
         }
         // `INSERT` 先頭のため `QuotedNull` が残っている。単独の SELECT と同じ扱いに揃える
-        // （FROM なし SELECT は引用情報を保持する）。
-        let from_less = matches!(
-            shape.query_tokens.first(),
-            Some(crate::sql::lexer::Token::Keyword(
-                crate::sql::lexer::Keyword::Select
-            ))
-        ) && crate::sql::allowlist::is_from_less_select(&shape.query_tokens);
-        let inner_tokens = if from_less {
-            shape.query_tokens.clone()
-        } else {
-            crate::sql::lexer::demote_quoted_null(shape.query_tokens.clone())
-        };
+        // （FROM なし SELECT は引用情報を保持する。CTAS と共有）。
+        let inner_tokens =
+            crate::sql::allowlist::normalize_inner_query_tokens(shape.query_tokens.clone());
         let query = crate::sql::allowlist::validate_sql_tokens_with_subquery_ctx_limits(
             &inner_tokens,
             storage_lookup,
             0,
             self.nesting_limits,
         )?;
-        match &query {
-            Statement::Select(v) if v.using_plan().is_some() => {
-                return Err(SqlSurfaceError::feature_not_supported(
-                    "INSERT ... SELECT with USING PLAN is not supported",
-                ));
-            }
-            Statement::Select(_)
-            | Statement::Scan(_)
-            | Statement::Aggregate(_)
-            | Statement::Join(_)
-            | Statement::SetOperation(_)
-            | Statement::BufferedView(_)
-            | Statement::ConstSelect(_)
-            | Statement::MaterializedView(_) => {}
-            Statement::Explain(_)
-            | Statement::SetSearchMode { .. }
-            | Statement::SetTimeZone { .. }
-            | Statement::ShowTimeZone
-            | Statement::SetSearchPath { .. }
-            | Statement::ShowSearchPath
-            | Statement::CreateFunction { .. } => {
-                return Err(SqlSurfaceError::unsupported(
-                    "INSERT ... SELECT requires a SELECT query",
-                ));
-            }
-        }
+        crate::sql::allowlist::require_row_query_statement(&query, "INSERT ... SELECT")?;
         // 台帳の内容照合ハッシュは送られた文のトークン列（`USING OPERATION_ID` 句・末尾 `;` を除く）から
         // 算出する（Issue #1734）。未束縛の `$n` が残る形は上流で拒否済みだが、残っていればここでも
         // 固定文言で拒否する（fail-closed）。
@@ -5396,6 +5389,19 @@ impl EngineCore {
             return Err(
                 crate::sql::allowlist::SqlSurfaceError::feature_not_supported(
                     "bind parameters are not supported in INSERT ... SELECT",
+                ),
+            );
+        }
+        // SQL-52・Issue #1678: `CREATE TABLE ... AS` も DDL であり内側の問い合わせは `$n` の位置規則の
+        // 対象外のため、`$n` を含む形は位置検査より前に `0A000` で拒否する（fail-closed）。
+        if crate::sql::allowlist::is_create_table_as_statement(&tokens)
+            && tokens
+                .iter()
+                .any(|t| matches!(t, crate::sql::lexer::Token::Param(_)))
+        {
+            return Err(
+                crate::sql::allowlist::SqlSurfaceError::feature_not_supported(
+                    "bind parameters are not supported in CREATE TABLE AS",
                 ),
             );
         }
@@ -6180,6 +6186,19 @@ impl EngineCore {
                     &self.schema_limits,
                 )?;
                 Ok(crate::sql::SqlOutcome::CreateTable(outcome))
+            }
+            // SQL-52・Issue #1678: CTAS。DDL 権限ゲートを名前解決・カタログ照会（内側の問い合わせの
+            // 実カタログ検証を含む）より先に置く（権限の無い主体へ元表・作成先の有無を返さない）。
+            ParsedSql::CreateTableAs(stmt) => {
+                crate::sql::ddl::require_ddl_permission(session)?;
+                self.require_creation_target(
+                    ctx,
+                    session,
+                    stmt.public_qualified,
+                    stmt.table_name(),
+                )?;
+                let outcome = self.execute_create_table_as(ctx, session, stmt)?;
+                Ok(crate::sql::SqlOutcome::CreateTableAs(outcome))
             }
             // TABLE-44・Issue #1683: 一時表の作成は DDL 実行権限ゲートの対象外（セッション内で
             // 閉じる）。永続カタログには触れず、セッションの一時カタログへ登録する。
@@ -7666,6 +7685,8 @@ impl EngineCore {
             // DDL のため結果列を持たない。DDL 実行権限判定・カタログへの反映は
             // 一切行わない（Describe は本体を実行しない契約）。
             ParsedSql::CreateTable(_) | ParsedSql::CreateTempTable(_) => Ok(None),
+            // SQL-52・Issue #1678: CTAS も DDL（`CommandComplete` のみ）で結果列を持たない（Describe は実行しない）。
+            ParsedSql::CreateTableAs(_) => Ok(None),
             // `ALTER TABLE ADD COLUMN`（TASK-202・SQL-23。Issue #900）も
             // `CommandComplete` のみを返す DDL のため結果列を持たない。DDL 実行
             // 権限判定・カタログへの反映は一切行わない（Describe は本体を実行

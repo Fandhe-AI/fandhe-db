@@ -438,6 +438,13 @@ pub enum SqlOutcome {
     /// `wire-server::simple_query`）はすべて更新済み。クレート外で `SqlOutcome`
     /// を網羅的にマッチするコードがあれば追随が必要。
     CreateTable(ddl::CreateTableOutcome),
+    /// `CREATE TABLE <name> [(<col>, ...)] AS <SELECT> [WITH [NO] DATA]`（SQL-52・Issue #1678）が
+    /// 成功したことを示す応答。`wire-server::simple_query` は投入した場合 `SELECT <n>`、
+    /// `WITH NO DATA`・`IF NOT EXISTS` の no-op は `CREATE TABLE AS` のタグを返す。
+    ///
+    /// **BREAKING CHANGE**（Issue #1678）: 本 variant の追加により `SqlOutcome` を網羅的に
+    /// マッチする既存コード（`crate::core::EngineCore`・`wire-server`）はすべて更新済み。
+    CreateTableAs(ddl::CreateTableAsOutcome),
     /// `DROP TABLE <table>`（SQL-23・TASK-203、Issue #902）がセッション経由の
     /// 実行経路（`crate::core::EngineCore::execute_parsed_in_session`）で
     /// 成功したことを示す応答。DDL 実行権限ゲート（`ddl::require_ddl_permission`）を
