@@ -17,8 +17,8 @@
 use crate::catalog::{ColumnDef, ColumnDefault, ColumnType, TableSchema};
 use crate::declarative_filter::{self, DeclarativeFilter, MetadataFilter};
 use crate::sql::allowlist::{
-    FunctionArg, InsertLiteral, OnConflictAction, OnConflictClause, OrderByForm, Projection,
-    ScalarOrderKey, UpsertAddOperand, UpsertValue, ValidatedDelete, ValidatedInsert,
+    FunctionArg, InsertLiteral, OnConflictAction, OnConflictClause, OnConflictTarget, OrderByForm,
+    Projection, ScalarOrderKey, UpsertAddOperand, UpsertValue, ValidatedDelete, ValidatedInsert,
     ValidatedPredicateDelete, ValidatedStatement, WherePredicate,
 };
 use crate::sql::plan::EvaluationOrder;
@@ -4907,6 +4907,10 @@ pub enum BoundConflictTarget {
     /// 同じ制約に解決され、同じ並びになる——`content_hash::for_typed_upsert`
     /// の再送判定・golden ハッシュがこの順序に依存する）。
     Unique(Vec<usize>),
+    /// 対象省略の `ON CONFLICT DO NOTHING`（SQL-49、Issue #1736）。行キー・PRIMARY KEY・
+    /// UNIQUE 制約・UNIQUE 索引のどれに違反した行も、その行だけを飛ばす。`DO NOTHING`
+    /// 専用（`DO UPDATE` との組は構文段・束縛段の両方で `42601`）。
+    AnyUnique,
 }
 
 /// 束縛済みの UPSERT 文（SQL-20・TASK-193、Issue #872。実行結線は
@@ -5117,9 +5121,13 @@ pub fn bind_insert_form(
 /// 式・部分索引の推論形は構文段（`sql::allowlist::parse_on_conflict_clause`）で
 /// `42601` として拒否済みでここへは来ない。
 fn resolve_conflict_target(
-    target: &[String],
+    target: &OnConflictTarget,
     schema: &TableSchema,
 ) -> Result<BoundConflictTarget, SqlSurfaceError> {
+    let target: &[String] = match target {
+        OnConflictTarget::Columns(columns) => columns,
+        OnConflictTarget::Omitted => return Ok(BoundConflictTarget::AnyUnique),
+    };
     // `(id)` の行キー解決は疑似列 `id` を持つ従来方式の表だけ。採番方式の表の `id` は通常の列で、
     // PRIMARY KEY／UNIQUE 制約との照合（下）で解決する（TABLE-23・Issue #2199）。
     if schema.has_pseudo_id() {
@@ -5188,6 +5196,14 @@ fn bind_upsert_form(
 ) -> Result<BoundInsertForm, SqlSurfaceError> {
     let target = resolve_conflict_target(&clause.target, schema)?;
     let action = &clause.action;
+    // 多層防御: 対象省略は `DO NOTHING` 専用（構文段で拒否済みでも束縛段で再検査する）。
+    if matches!(target, BoundConflictTarget::AnyUnique)
+        && !matches!(action, OnConflictAction::DoNothing)
+    {
+        return Err(SqlSurfaceError::unsupported(
+            "ON CONFLICT DO UPDATE requires inference specification or constraint name",
+        ));
+    }
     let mut rows: Vec<BoundInsert> = Vec::new();
     rows.try_reserve_exact(stmt.rows.len()).map_err(|_| {
         SqlSurfaceError::payload_too_large("failed to reserve UPSERT row batch buffer")
@@ -5222,7 +5238,13 @@ fn bind_upsert_form(
         .map_err(|_| SqlSurfaceError::payload_too_large("failed to reserve UPSERT id set"))?;
     // 採番方式の表には利用者指定の行 id が無い（`BoundInsert.id` は固定値）ため、行 id の重複検出は
     // 従来方式の表だけ。同一文内の対象キー重複は下の `Unique` 検査が拒否する（Issue #2199）。
-    for row in rows.iter().filter(|_| schema.has_pseudo_id()) {
+    // 対象省略（`AnyUnique`）は「先の行を挿入し後の重複を飛ばす」ため文内重複を拒否しない
+    // （SQL-49、Issue #1736）。
+    let reject_in_statement_duplicates = !matches!(target, BoundConflictTarget::AnyUnique);
+    for row in rows
+        .iter()
+        .filter(|_| schema.has_pseudo_id() && reject_in_statement_duplicates)
+    {
         if !seen_ids.insert(row.id) {
             return Err(SqlSurfaceError::invalid_input(format!(
                 "duplicate id {} within the same UPSERT statement",
@@ -11371,6 +11393,26 @@ mod tests {
         match bound {
             BoundInsertForm::Upsert(upsert) => {
                 assert_eq!(upsert.target, BoundConflictTarget::Unique(vec![0]));
+            }
+            other => panic!("expected BoundInsertForm::Upsert, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn bind_upsert_form_resolves_omitted_target_and_keeps_in_statement_duplicates() {
+        // SQL-49（Issue #1736）: 対象省略は `AnyUnique` へ解決し、文内の id・鍵の重複は
+        // 束縛段で拒否しない（先の行を挿入し後の重複を飛ばす）。
+        let schema = unique_target_schema();
+        let bound = bind_upsert_sql(
+            "INSERT INTO documents (id, a) VALUES (1, 'x'), (1, 'x') ON CONFLICT DO NOTHING \
+             USING OPERATION_ID 'op-any-unique'",
+            &schema,
+        )
+        .expect("omitted target should bind");
+        match bound {
+            BoundInsertForm::Upsert(upsert) => {
+                assert_eq!(upsert.target, BoundConflictTarget::AnyUnique);
+                assert_eq!(upsert.rows.len(), 2);
             }
             other => panic!("expected BoundInsertForm::Upsert, got {other:?}"),
         }

@@ -27,7 +27,8 @@ USING OPERATION_ID '<id>'
   複数列）の構成列集合と一致する列名の並びを受理する（TABLE-16、Issue #1074・
   SQL-49、Issue #1707。「ON CONFLICT 対象の UNIQUE 制約列への拡張」節・
   「Issue #1707 追記」節参照）。どれとも一致しない対象は `42P10`。`ON CONSTRAINT` 形・
-  式索引・部分索引の推論形は対象外のまま `42601`。
+  式索引・部分索引の推論形は対象外のまま `42601`。対象を省略した `ON CONFLICT DO NOTHING`
+  は Issue #1736 で受理する（省略した `DO UPDATE` は `42601`。「Issue #1736 追記」節参照）。
 - `ON CONFLICT` は複数行 `VALUES`（SQL-16、TASK-190）と併用でき、全行が同じ衝突分岐を
   共有する。
 - `ON CONFLICT` はファイル形 `INSERT`（`path`/`body` 列指定。TASK-120）とは併用できない
@@ -247,7 +248,7 @@ spec 側「別途」の扱いのまま（コードでの固定テストも追加
   （「ON CONFLICT 対象の UNIQUE 制約列への拡張」節参照）。`PRIMARY KEY` 宣言列を
   対象にすることは Issue #1707 で実装済み（「Issue #1707 追記」節参照）。
   `ON CONFLICT ON CONSTRAINT <name>`・部分一意制約の `ON CONFLICT` は引き続き対象外
-  （`42601`）。
+  （`42601`）。対象省略の `DO NOTHING` は Issue #1736 で実装済み（「Issue #1736 追記」節参照）。
 - `23505` の `code` ラベル分離（`DUPLICATE_OPERATION_ID` vs `UNIQUE_VIOLATION`）は
   Issue #1180 で実装済み。
 - NoSQL 表層の UPSERT（`on_conflict` キーの規範化）。
@@ -273,7 +274,7 @@ spec 側「別途」の扱いのまま（コードでの固定テストも追加
   未知列は PostgreSQL では `42703` だが、本 Issue は「一致なし」の `42P10` のみを定めるため
   別分岐は設けていない（差異として記録。寄せるかは別途判断）。
 - **`42601` のまま**: 構文段（`parse_on_conflict_clause`）で拒否する形——式索引推論
-  `((<式>))`、部分索引推論 `(<列>) WHERE ...`、`ON CONSTRAINT`、空リスト、対象の省略、
+  `((<式>))`、部分索引推論 `(<列>) WHERE ...`、`ON CONSTRAINT`、空リスト、
   重複列、列数超過、ファイル形 `INSERT` との併用。
 - **NULL**: PK 構成列は NOT NULL。`VALUES` の NULL は衝突せず新規挿入分岐へ進み `23502`
   になる（結合テストで固定）。既存行側の PK 列は NOT NULL のため事前走査の
@@ -310,8 +311,36 @@ spec 側「別途」の扱いのまま（コードでの固定テストも追加
   (b) 一意性は文末にまとめて検査する（既存 `UPDATE` 経路と同じ）ため、複数行の `DO UPDATE` で
   PK 値を入れ替える文は本実装では成功する（PostgreSQL は行ごとに検査し `23505`）。
   いずれも PostgreSQL と異なる挙動を固めないため回帰テストでは固定しない。
-- **対象外**: バッチ内の対象キー重複の `21000` 化、`ON CONFLICT ON CONSTRAINT`、対象省略の
-  `DO NOTHING`、`DO UPDATE ... WHERE`、SET 右辺の式、NoSQL 表層の `upsert`。
+- **対象外**: バッチ内の対象キー重複の `21000` 化、`ON CONFLICT ON CONSTRAINT`、
+  `DO UPDATE ... WHERE`、SET 右辺の式、NoSQL 表層の `upsert`（対象省略の `DO NOTHING` は
+  Issue #1736 で対応。次節）。
+
+## Issue #1736 追記: 対象省略の ON CONFLICT DO NOTHING（SQL-49 ポインタ）
+
+- **構文**: `ON CONFLICT DO NOTHING` を受理する。AST は `OnConflictClause.target` を
+  `OnConflictTarget::{Columns, Omitted}` にし、省略と空リスト `()` を区別する（`()`・`ON CONSTRAINT`
+  は従来どおり `42601`）。省略した `DO UPDATE` は構文段と束縛段の両方で `42601`
+  （多層防御。実行段も内部エラーで拒否する）。
+- **束縛**: `BoundConflictTarget::AnyUnique`。文内の `id`・鍵の重複は拒否しない（PostgreSQL と
+  同じく先の行を挿入し後の重複を飛ばす）。対象を指定した形の文内重複 `22000` は変えない
+  （この非対称は意図的。`21000` 化は SQL-49 (4) の別 Issue）。id 省略・SEQUENCE 呼び出しの拒否は維持する。
+- **実行**: `constraint::AnyUniqueProbe` が行ごとに、行キー（従来方式の表）・主キー・UNIQUE 制約・
+  UNIQUE 索引（式・部分を含む）のいずれかの違反を事前に判定し、違反した行だけを飛ばす。
+  判定は書き込み後の一意性検査と同じ鍵計算（`UniqueKeyPlan::row_keys`）と同じ永続索引
+  （`user_uniq/{table}`）で行い、鍵集合がずれないようにしている（ずれると飛ばすべき行が `23505`
+  になる）。索引エントリが stale の場合は所有者の行を読み戻して鍵を再計算し、一致したときだけ
+  衝突とする。同じ文で先に挿入した行の鍵はメモリ上で追跡する。挿入した行は従来どおり
+  `CHECK`・`NOT NULL`・`FOREIGN KEY`・一意性を検査する（一意性検査は事前判定が漏れたときの最後の砦）。
+- **テナント境界**: 判定の母集合は自テナントの物理キー範囲だけ。他テナントの鍵は衝突しない（RLS-9）。
+  自テナントの不可視行との衝突も飛ばし、不可視行の破損状態は応答に出さない（RLS-10）。
+- **RETURNING・件数**: 飛ばした行は返さず、`INSERT 0 <挿入数>`。全行を飛ばしてもテーブル世代は
+  進めず、台帳は記録する（既存の `DO NOTHING` と同じ）。
+- **content_hash**: `UpsertHashTarget::AnyUnique`（action tag `4`、列名部なし）。既存の tag `0`〜`3` の
+  レイアウトは不変。
+- **PostgreSQL との差異（記録のみ）**: 飛ばす行には `CHECK` 制約を評価しない（`NOT NULL` はハッシュ材料の
+  組み立て時に全行で検査する）。対象を指定した既存の `DO NOTHING` も同様。
+- **対象外**: `ON CONFLICT ON CONSTRAINT`（#1737）、`DO UPDATE` の式・`WHERE`、`INSERT ... SELECT`
+  との併用、NoSQL 表層の `upsert`。
 
 > Issue #2199 注記: 採番方式の表（SQL 表層で新しく作る表）には行キー指定の `ON CONFLICT (id)` が無く、`id` は宣言した通常の列として
 > PRIMARY KEY／UNIQUE 制約との照合（`Unique` 対象）で解決する。新規挿入行の rowid は書き込み段が払い出す。詳細は

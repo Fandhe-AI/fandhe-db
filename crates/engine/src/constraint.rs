@@ -1391,6 +1391,170 @@ where
     Ok((existing, corrupt_invisible))
 }
 
+/// 永続一意索引テーブル（`user_uniq/{table}`）の可変ハンドル型。
+type UniqIndexTable<'txn> = redb::Table<'txn, (&'static str, &'static [u8]), &'static [u8]>;
+
+/// 対象省略の `ON CONFLICT DO NOTHING`（SQL-49、Issue #1736）の衝突判定器。
+///
+/// `tenant::upsert_typed_rows_impl`（`UpsertTarget::AnyUnique`）だけが使う。1 行ごとに
+/// 「行キー `(tenant, id)`・PRIMARY KEY・UNIQUE 制約・UNIQUE 索引（式・部分を含む）の
+/// どれかに違反するか」を、書き込み後の一意性検査（[`enforce_unique_keys_with_decls`]）と
+/// **同じ鍵計算**（[`UniqueKeyPlan::row_keys`]）と同じ永続索引（`user_uniq/{table}`）で
+/// 事前に判定する。鍵集合がずれると飛ばすべき行が `23505` として表に出るため、鍵計算を
+/// 第 2 系統に分けない。判定母集合は自テナントの物理キー範囲だけ（RLS-9。他テナントの
+/// 行・索引エントリには触れない）。衝突先の可視性は問わない（不可視行の破損状態も応答に
+/// 出さない）。同じ文で先に挿入した行の鍵はメモリ上で追跡する（永続索引へは書き込み後検査が
+/// 反映するため、文の途中では未反映）。
+///
+/// 保持する索引テーブルのハンドルは、[`enforce_row_constraints_in_txn`] を呼ぶ前に
+/// drop すること（同じテーブルの二重 open は `TableAlreadyOpen`）。
+pub(crate) struct AnyUniqueProbe<'txn> {
+    plan: UniqueKeyPlan,
+    compiled: Option<crate::sql::expression_key_index::CompiledIndexExpressions>,
+    index_table: Option<UniqIndexTable<'txn>>,
+    /// 序数ごとの、この文で挿入済みの行の正準キー。
+    inserted_keys: Vec<HashSet<Vec<u8>>>,
+}
+
+impl<'txn> AnyUniqueProbe<'txn> {
+    /// 判定器を作り、自テナントの永続一意索引を最新にする（未構築なら既存行から再構築）。
+    /// 主キー・UNIQUE 制約・一意索引がどれも無い表では索引を開かない。
+    pub(crate) fn prepare<R>(
+        write_txn: &'txn redb::WriteTransaction,
+        table_name: &str,
+        schema: &TableSchema,
+        tenant_id: &str,
+        row_table: &R,
+    ) -> Result<Self, TenantWriteError>
+    where
+        R: ReadableTable<(&'static str, u64), &'static [u8]>,
+    {
+        let decls = crate::catalog::table_expression_decls_in_txn(write_txn, table_name)?;
+        let compiled = crate::sql::expression_key_index::CompiledIndexExpressions::compile(
+            schema,
+            &decls.keys,
+        )?;
+        let plan = UniqueKeyPlan::build(schema, &decls)?;
+        let index_table = if plan.is_empty() {
+            None
+        } else {
+            let index_table_name = crate::catalog::user_uniq_table_name(table_name);
+            let mut index_table = write_txn
+                .open_table(crate::catalog::user_uniq_table_def(&index_table_name))
+                .map_err(|e| TenantWriteError::Catalog(CatalogError::from(e)))?;
+            unique_index::ensure_tenant_index(
+                row_table,
+                &mut index_table,
+                schema,
+                &plan,
+                compiled.as_ref(),
+                tenant_id,
+                &HashSet::new(),
+            )?;
+            Some(index_table)
+        };
+        let inserted_keys = (0..plan.ordinal_count()).map(|_| HashSet::new()).collect();
+        Ok(Self {
+            plan,
+            compiled,
+            index_table,
+            inserted_keys,
+        })
+    }
+
+    /// 物理バイト列 `buf`・行 id `id` の行がいずれかの一意性に違反するなら `true`（飛ばす行）。
+    /// 違反しなければ、その行の鍵を「挿入済み」として記録して `false` を返す（呼び出し元は
+    /// 続けて必ず挿入する）。違反の一部だけを見て残りを後段の `23505` に任せることはしない。
+    pub(crate) fn conflicts_or_reserve<R>(
+        &mut self,
+        row_table: &R,
+        schema: &TableSchema,
+        ctx: &crate::policy::PolicyContext,
+        id: u64,
+        buf: &[u8],
+    ) -> Result<bool, TenantWriteError>
+    where
+        R: ReadableTable<(&'static str, u64), &'static [u8]>,
+    {
+        let tenant_id = ctx.tenant_id();
+        // 行キー（疑似 `id`）の所有。従来方式の表だけが利用者指定の `id` を持つ。
+        if schema.has_pseudo_id()
+            && row_table
+                .get(row_key(tenant_id, RowId::from_legacy_id(id)))
+                .map_err(crate::catalog::CatalogError::from)?
+                .is_some()
+        {
+            return Ok(true);
+        }
+        let keys = self
+            .plan
+            .row_keys(schema, self.compiled.as_ref(), id, buf)?;
+        for (ordinal, key) in keys.iter().enumerate() {
+            let Some(key) = key else {
+                continue;
+            };
+            if self
+                .inserted_keys
+                .get(ordinal)
+                .is_some_and(|set| set.contains(key))
+            {
+                return Ok(true);
+            }
+            let Some(index_table) = self.index_table.as_ref() else {
+                continue;
+            };
+            let ordinal_u16 = u16::try_from(ordinal)
+                .map_err(|_| internal("unique key ordinal exceeds u16 range"))?;
+            let Some(owner) =
+                unique_index::lookup_forward_read_only(index_table, tenant_id, ordinal_u16, key)?
+            else {
+                continue;
+            };
+            // 索引は stale でありうる。所有者の行を読み戻して鍵を再計算し、一致したときだけ衝突。
+            let Some(guard) = row_table
+                .get(row_key(tenant_id, owner))
+                .map_err(crate::catalog::CatalogError::from)?
+            else {
+                continue;
+            };
+            let owner_buf = guard.value();
+            match self
+                .plan
+                .row_keys(schema, self.compiled.as_ref(), owner.legacy_id(), owner_buf)
+            {
+                Ok(owner_keys) => {
+                    if owner_keys.get(ordinal).and_then(|k| k.as_deref()) == Some(key.as_slice()) {
+                        return Ok(true);
+                    }
+                }
+                Err(e) => {
+                    // 可視行の破損は fail-closed で伝える。不可視行の破損は応答に出さず、
+                    // 衝突として扱う（健全な不可視行との応答差を作らない。RLS-10）。
+                    let visible = matches!(
+                        crate::storage::decode_row_tenant_and_visibility(owner_buf),
+                        Ok((row_tenant, row_visibility))
+                            if ctx.is_owner(row_tenant)
+                                && ctx.is_visible(row_tenant, row_visibility)
+                    );
+                    if visible {
+                        return Err(e);
+                    }
+                    return Ok(true);
+                }
+            }
+        }
+        for (ordinal, key) in keys.into_iter().enumerate() {
+            let Some(key) = key else {
+                continue;
+            };
+            if let Some(set) = self.inserted_keys.get_mut(ordinal) {
+                set.insert(key);
+            }
+        }
+        Ok(false)
+    }
+}
+
 /// [`scan_tenant_rows_by_unique_key`] の戻り値（対象キー → 既存行 id の対応表と、
 /// キーを復元できなかった不可視行の id 一覧）。
 pub(crate) type UniqueKeyScan = (HashMap<Vec<u8>, RowId>, Vec<RowId>);

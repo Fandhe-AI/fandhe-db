@@ -3555,10 +3555,24 @@ pub enum OnConflictAction {
 /// （`ValidatedStatement` の一般契約と同じ「構造検証はここまで」の分担）。
 #[derive(Debug, Clone, PartialEq)]
 pub struct OnConflictClause {
+    /// 衝突対象の指定（列リスト、または省略。Issue #1736）。
+    pub target: OnConflictTarget,
+    pub action: OnConflictAction,
+}
+
+/// `ON CONFLICT` の衝突対象（SQL-49、Issue #1736）。
+///
+/// 構文段階では「列リストを書いた」か「省略した」かだけを区別する。省略形は
+/// `DO NOTHING` 専用で、`DO UPDATE` との組は構文段階で `42601` になる
+/// （`sql::allowlist::Parser::parse_on_conflict_clause`）。空の列リスト
+/// `ON CONFLICT ()` は省略とは別物で従来どおり `42601`。
+#[derive(Debug, Clone, PartialEq)]
+pub enum OnConflictTarget {
     /// `ON CONFLICT (...)` に書かれた列名の宣言順（`push` 前に列数上限
     /// [`crate::catalog::MAX_UNIQUE_CONSTRAINT_COLUMNS`]・重複列名を検査済み）。
-    pub target: Vec<String>,
-    pub action: OnConflictAction,
+    Columns(Vec<String>),
+    /// 対象省略（`ON CONFLICT DO NOTHING`）。どの一意性違反でも該当行だけを飛ばす。
+    Omitted,
 }
 
 /// 許可形状の構造判定を通過した INSERT 文（SQL-10・SQL-16、TASK-80・TASK-190）。
@@ -9504,13 +9518,29 @@ impl<'a> Parser<'a> {
     /// 一致なしは `42P10`、SQL-49・Issue #1707）。式・部分索引の推論形
     /// （`((<式>))`・`(<列>) WHERE ...`）は本関数で `42601` のまま拒否する。
     /// `ON CONFLICT ON CONSTRAINT ...`・空の対象リスト（`ON CONFLICT ()`）は
-    /// 未対応のまま `42601`（対象外・申し送り: Issue #1074 §8）。
+    /// 未対応のまま `42601`（対象外・申し送り: Issue #1074 §8）。対象省略の
+    /// `ON CONFLICT DO NOTHING` は [`OnConflictTarget::Omitted`] として受理し、
+    /// 省略 + `DO UPDATE` は `42601`（SQL-49、Issue #1736）。
     fn parse_on_conflict_clause(&mut self) -> Result<Option<OnConflictClause>, SqlSurfaceError> {
         if !self.peek_contextual_keyword("ON") {
             return Ok(None);
         }
         self.advance();
         self.expect_contextual_keyword("CONFLICT")?;
+        // 対象省略（SQL-49、Issue #1736）: `CONFLICT` の直後が `DO` なら列リストを
+        // 持たない形。`ON CONSTRAINT` や `()` はここへは入らず従来どおり拒否される。
+        if self.peek_contextual_keyword("DO") {
+            self.advance();
+            self.expect_contextual_keyword("NOTHING").map_err(|_| {
+                SqlSurfaceError::unsupported(
+                    "ON CONFLICT DO UPDATE requires inference specification or constraint name",
+                )
+            })?;
+            return Ok(Some(OnConflictClause {
+                target: OnConflictTarget::Omitted,
+                action: OnConflictAction::DoNothing,
+            }));
+        }
         self.expect_punct('(')?;
         let mut target = vec![self.expect_ident()?];
         while matches!(self.peek(), Some(Token::Punct(','))) {
@@ -9548,7 +9578,10 @@ impl<'a> Parser<'a> {
             }
             OnConflictAction::DoUpdate(assignments)
         };
-        Ok(Some(OnConflictClause { target, action }))
+        Ok(Some(OnConflictClause {
+            target: OnConflictTarget::Columns(target),
+            action,
+        }))
     }
 
     /// `ON CONFLICT ... DO UPDATE SET` の 1 要素（`<col> = (EXCLUDED.<col> |
@@ -22601,7 +22634,7 @@ mod tests {
         assert_eq!(
             stmt.on_conflict,
             Some(OnConflictClause {
-                target: vec!["id".to_string()],
+                target: OnConflictTarget::Columns(vec!["id".to_string()]),
                 action: OnConflictAction::DoNothing,
             })
         );
@@ -22621,7 +22654,7 @@ mod tests {
         assert_eq!(
             stmt.on_conflict,
             Some(OnConflictClause {
-                target: vec!["id".to_string()],
+                target: OnConflictTarget::Columns(vec!["id".to_string()]),
                 action: OnConflictAction::DoUpdate(vec![
                     (
                         "embedding".to_string(),
@@ -22650,7 +22683,7 @@ mod tests {
         assert_eq!(
             stmt.on_conflict,
             Some(OnConflictClause {
-                target: vec!["id".to_string()],
+                target: OnConflictTarget::Columns(vec!["id".to_string()]),
                 action: OnConflictAction::DoNothing,
             })
         );
@@ -22830,7 +22863,7 @@ mod tests {
         assert_eq!(
             stmt.on_conflict,
             Some(OnConflictClause {
-                target: vec!["id".to_string()],
+                target: OnConflictTarget::Columns(vec!["id".to_string()]),
                 action: OnConflictAction::DoUpdate(vec![(
                     "lang".to_string(),
                     UpsertValue::Literal(InsertLiteral::Null)
@@ -23235,16 +23268,40 @@ mod tests {
     }
 
     #[test]
-    fn rejects_upsert_missing_target_column_list() {
+    fn accepts_upsert_omitted_target_do_nothing() {
+        // SQL-49（Issue #1736）: 対象省略の `DO NOTHING` は構文段階で受理する。
         let lookup = catalog_with(&["documents"]);
-        let err = validate_insert(
+        let stmt = validate_insert(
             "INSERT INTO documents (id) VALUES (1) ON CONFLICT DO NOTHING \
              USING OPERATION_ID 'op-upsert-4'",
             &lookup,
             LedgerMode::Ledgered,
         )
-        .unwrap_err();
-        assert_eq!(err.wire_code(), "42601");
+        .unwrap();
+        assert_eq!(
+            stmt.on_conflict,
+            Some(OnConflictClause {
+                target: OnConflictTarget::Omitted,
+                action: OnConflictAction::DoNothing,
+            })
+        );
+    }
+
+    #[test]
+    fn rejects_upsert_omitted_target_do_update_and_other_target_forms() {
+        // 対象省略の `DO UPDATE`・`ON CONSTRAINT`・空の列リストは 42601（SQL-49）。
+        let lookup = catalog_with(&["documents"]);
+        for sql in [
+            "INSERT INTO documents (id) VALUES (1) ON CONFLICT DO UPDATE SET lang = NULL \
+             USING OPERATION_ID 'op-a'",
+            "INSERT INTO documents (id) VALUES (1) ON CONFLICT ON CONSTRAINT x DO NOTHING \
+             USING OPERATION_ID 'op-b'",
+            "INSERT INTO documents (id) VALUES (1) ON CONFLICT () DO NOTHING \
+             USING OPERATION_ID 'op-c'",
+        ] {
+            let err = validate_insert(sql, &lookup, LedgerMode::Ledgered).unwrap_err();
+            assert_eq!(err.wire_code(), "42601", "{sql}");
+        }
     }
 
     #[test]
@@ -23266,7 +23323,7 @@ mod tests {
         assert_eq!(
             stmt.on_conflict,
             Some(OnConflictClause {
-                target: vec!["lang".to_string()],
+                target: OnConflictTarget::Columns(vec!["lang".to_string()]),
                 action: OnConflictAction::DoNothing,
             })
         );
@@ -23294,7 +23351,7 @@ mod tests {
             assert_eq!(
                 stmt.on_conflict,
                 Some(OnConflictClause {
-                    target: vec![target.to_string()],
+                    target: OnConflictTarget::Columns(vec![target.to_string()]),
                     action: OnConflictAction::DoNothing,
                 })
             );
@@ -23318,7 +23375,7 @@ mod tests {
         assert_eq!(
             stmt.on_conflict,
             Some(OnConflictClause {
-                target: vec!["id".to_string(), "lang".to_string()],
+                target: OnConflictTarget::Columns(vec!["id".to_string(), "lang".to_string()]),
                 action: OnConflictAction::DoNothing,
             })
         );

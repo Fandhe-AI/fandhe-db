@@ -963,6 +963,9 @@ pub(crate) enum UpsertHashTarget<'a> {
     /// `ON CONFLICT (<UNIQUE 制約の構成列>)`。列名は解決した制約の宣言順
     /// （`sql::parser` が `schema.unique_constraints()` から解決した順）。
     Unique(&'a [&'a str]),
+    /// 対象省略の `ON CONFLICT DO NOTHING`（SQL-49、Issue #1736）。action tag は
+    /// 既存の `0`〜`3` と衝突しない `4` を使い、列名部は持たない。
+    AnyUnique,
 }
 
 /// [`for_typed_upsert`]・[`for_typed_upsert_expr`] が共有する UPSERT の衝突対象・
@@ -979,6 +982,7 @@ fn push_upsert_header(
     let action_tag_base: u8 = match target {
         UpsertHashTarget::RowId => 0,
         UpsertHashTarget::Unique(_) => 2,
+        UpsertHashTarget::AnyUnique => 4,
     };
     match action {
         UpsertHashAction::DoNothing => b.push_u8(action_tag_base),
@@ -4568,6 +4572,37 @@ mod tests {
         // 呼び出し元の `sql::parser::bind_upsert_form` にあり、常に解決した
         // 制約の宣言順で本関数へ渡す契約——`sql/parser.rs` の結合テスト参照）。
         assert_ne!(unique_ab_hash, unique_ba_hash);
+    }
+
+    /// 対象省略（SQL-49、Issue #1736）は action tag `4` で他の対象と先頭バイトの時点で分岐し、
+    /// 既存の `(id)`・UNIQUE 対象のハッシュ（上の golden）は変えない。
+    #[test]
+    fn for_typed_upsert_any_unique_target_differs_and_is_stable() {
+        let embedding = [1.0_f32, 0.0, 0.0];
+        let lang = Value::Text("ja".to_string());
+        let cols: [(&str, &Value); 1] = [("lang", &lang)];
+        let rows: [TypedInsertBatchRow<'_>; 1] = [(1, Visibility::Private, &embedding, &cols)];
+        let any = for_typed_upsert(
+            &UpsertHashTarget::AnyUnique,
+            &UpsertHashAction::DoNothing,
+            &rows,
+        )
+        .expect("hash");
+        let again = for_typed_upsert(
+            &UpsertHashTarget::AnyUnique,
+            &UpsertHashAction::DoNothing,
+            &rows,
+        )
+        .expect("hash");
+        assert_eq!(any, again);
+        for other in [
+            UpsertHashTarget::RowId,
+            UpsertHashTarget::Unique(&["a"]),
+            UpsertHashTarget::Unique(&[]),
+        ] {
+            let h = for_typed_upsert(&other, &UpsertHashAction::DoNothing, &rows).expect("hash");
+            assert_ne!(any, h);
+        }
     }
 
     // --- for_update_where / for_delete_where（Issue #871・SQL-19・TASK-192） --------
