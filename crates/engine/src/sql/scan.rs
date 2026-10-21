@@ -43,6 +43,11 @@
 //! PRIMARY KEY の全構成列がリテラル等価なら、全行走査の代わりに永続一意索引の点検索で候補を絞る
 //! （[`crate::sql::pk_point`]）。候補も全走査と同じ [`with_visible_row`] を通るため、出力は全走査と同一。
 //!
+//! **GIN 候補探査**（INDEX-8、Issue #2208。`docs/design/gin-jsonb-index.md` §9）: 順序なしの経路で PK 点検索に
+//! ならず、jsonb 列への包含・キー存在・jsonpath 演算子が AND 連言にあり、その列に GIN 相当索引が宣言されて
+//! いれば、全行走査の代わりにポスティングで候補を絞る（[`crate::sql::gin_scan`]）。候補は PK 点検索と同様に
+//! 全走査と同じ [`with_visible_row`]（WHERE 全体の再評価を含む）を通るため、出力は全走査と同一。
+//!
 //! `OFFSET`（Issue #916・SQL-25 (b)・TASK-209。詳細は
 //! `docs/design/sql-offset-paging.md`）は「可視かつ `WHERE` 一致」の行のみを対象に
 //! 読み飛ばす。RLS 判定・`WHERE` 評価が確定した後でのみ計数するため、不可視行は
@@ -1288,11 +1293,37 @@ pub(crate) fn execute_scan_with_budget(
                 )?;
             }
             crate::sql::pk_point::PkPointPlan::NotApplicable => {
-                for entry in table.iter().map_err(storage_internal)? {
-                    let (k, v) = entry.map_err(storage_internal)?;
-                    let (key_tenant, id) = k.value();
-                    if consume(key_tenant, id, v.value())? {
-                        break;
+                // Issue #2208: PK 点検索にならない場合だけ GIN 候補探査を試す。宣言（索引カタログ）は
+                // GIN の対象になりうる形の述語があるときだけ読む（それ以外の文でカタログ読み取りを増やさない）。
+                let gin_plan = if crate::sql::gin_scan::may_use_gin(bound) {
+                    let decls = catalog::table_expression_decls_in_source(read_txn, &bound.table)
+                        .map_err(|_| SqlSurfaceError::Internal {
+                        detail: "gin index declaration lookup failed".to_string(),
+                    })?;
+                    crate::sql::gin_scan::classify_gin_scan(schema, bound, &decls.gins)
+                } else {
+                    crate::sql::gin_scan::GinScanPlan::NotApplicable
+                };
+                match gin_plan {
+                    crate::sql::gin_scan::GinScanPlan::Index { decl, keys } => {
+                        crate::sql::gin_scan::for_each_candidate(
+                            read_txn,
+                            &table,
+                            ctx,
+                            schema,
+                            &decl,
+                            &keys,
+                            &mut consume,
+                        )?;
+                    }
+                    crate::sql::gin_scan::GinScanPlan::NotApplicable => {
+                        for entry in table.iter().map_err(storage_internal)? {
+                            let (k, v) = entry.map_err(storage_internal)?;
+                            let (key_tenant, id) = k.value();
+                            if consume(key_tenant, id, v.value())? {
+                                break;
+                            }
+                        }
                     }
                 }
             }

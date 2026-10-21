@@ -1241,6 +1241,29 @@ pub(crate) struct DeclaredUniqueExpressionIndex {
     pub(crate) elements: Vec<UniqueElementDecl>,
 }
 
+/// GIN 相当索引 1 本の宣言（INDEX-8、Issue #2207）。DML 維持（`gin_index::maintain_rows_in_txn`）と
+/// 後片付け・TRUNCATE・診断が入力にする。索引名の昇順で [`TableExpressionDecls::gins`] に載る。
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct DeclaredGinIndex {
+    pub(crate) index_name: String,
+    pub(crate) column: String,
+    pub(crate) opclass: GinOpClass,
+}
+
+/// GIN 相当索引の診断結果（INDEX-8、Issue #2207。[`crate::core::EngineCore::verify_gin_index_read_only`]
+/// の戻り値）。自テナントの索引だけを読み取り専用で検証した件数で、他テナントの情報を含まない。
+/// 欠落（`missing`）は不変条件違反（偽陰性の原因）、`stale` は存在しない行・古い値を指すエントリで
+/// 衛生上の指標（正しさには影響しない）。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct GinIndexAudit {
+    /// テナントのマーカーが現在の宣言・形式版に一致するか。
+    pub marker_valid: bool,
+    /// 生存行の抽出エントリのうちポスティングが無いものの件数。
+    pub missing: usize,
+    /// 生存行に対応しないポスティング・逆引きの件数。
+    pub stale: usize,
+}
+
 /// 対象テーブルの式索引の宣言一式（INDEX-10、Issue #1649・#1651）。`keys` は全式索引の式要素
 /// （索引名の昇順・索引内の要素順）、`uniques` はそのうち一意の索引（索引名の昇順）。
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
@@ -1250,6 +1273,8 @@ pub(crate) struct TableExpressionDecls {
     /// 部分索引（INDEX-11、Issue #1654。索引名の昇順）。`keys`・`uniques` には混ぜない（部分索引の
     /// 式要素は述語 TRUE の行でだけ評価し、一意検査の対象にもならない）。
     pub(crate) partials: Vec<DeclaredPartialIndex>,
+    /// GIN 相当索引（INDEX-8、Issue #2207。索引名の昇順）。式索引・一意検査とは独立に維持する。
+    pub(crate) gins: Vec<DeclaredGinIndex>,
 }
 
 /// 索引カタログ表 `index_table` から対象テーブルの式索引の宣言を読む共通実装。write／read txn の
@@ -1279,7 +1304,25 @@ where
             continue;
         }
         let def = decode_index_def(key.value(), bytes)?;
-        if !matches!(def.kind, IndexKind::Scalar) || def.table != table {
+        if def.table != table {
+            continue;
+        }
+        if let IndexKind::Gin(opclass) = def.kind {
+            // GIN 宣言は列を 1 個だけ持つ（`decode_index_def` が検証済み）。無ければ破損として拒否する。
+            let Some(column) = def.columns.first() else {
+                return Err(CatalogError::CorruptSchema(format!(
+                    "gin index has no column for index {}",
+                    def.name
+                )));
+            };
+            out.gins.push(DeclaredGinIndex {
+                index_name: def.name.clone(),
+                column: column.clone(),
+                opclass,
+            });
+            continue;
+        }
+        if !matches!(def.kind, IndexKind::Scalar) {
             continue;
         }
         if let Some(partial) = DeclaredPartialIndex::from_def(&def) {
@@ -1323,6 +1366,36 @@ pub(crate) fn table_expression_decls_in_txn(
         Err(redb::TableError::TableDoesNotExist(_)) => Ok(TableExpressionDecls::default()),
         Err(e) => Err(e.into()),
     }
+}
+
+/// 索引名 `index_name` が GIN 相当索引（INDEX-8、Issue #2207）として宣言済みなら、その表名と宣言を返す
+/// （[`crate::core::EngineCore::verify_gin_index_read_only`] 用の読み取り専用の引き当て）。索引が無い・
+/// GIN でない場合は `None`。破損は `Err`（fail-closed）。
+pub(crate) fn gin_decl_in_read_txn(
+    read_txn: &redb::ReadTransaction,
+    index_name: &str,
+) -> Result<Option<(String, DeclaredGinIndex)>> {
+    validate_identifier(index_name)?;
+    let table = match read_txn.open_table(INDEX_CATALOG_TABLE) {
+        Ok(t) => t,
+        Err(redb::TableError::TableDoesNotExist(_)) => return Ok(None),
+        Err(e) => return Err(e.into()),
+    };
+    let Some(guard) = table.get(index_name)? else {
+        return Ok(None);
+    };
+    let def = decode_index_def(index_name, guard.value())?;
+    let (IndexKind::Gin(opclass), Some(column)) = (def.kind, def.columns.first()) else {
+        return Ok(None);
+    };
+    Ok(Some((
+        def.table.clone(),
+        DeclaredGinIndex {
+            index_name: def.name.clone(),
+            column: column.clone(),
+            opclass,
+        },
+    )))
 }
 
 /// [`table_expression_decls_in_txn`] の read txn 版（クラッシュ耐性検証の読み取り専用診断が使う）。
@@ -2536,6 +2609,11 @@ fn alter_column_type_rewrite_expr_in_txn(
     }
     invalidate_user_uniq_if_key_column_in_txn(write_txn, table_name, &schema, column_name)?;
     crate::key_index::drop_indexes_containing_column_in_txn(write_txn, table_name, column_name)?;
+    // GIN 相当索引（INDEX-8、Issue #2207・`docs/design/gin-jsonb-index.md` D4・D7・D8）。行を直接
+    // 書き換えるこの経路は `constraint::enforce_row_constraints_in_txn` を通らないため、変更列を対象と
+    // する GIN 索引を同一 write txn で新しい値から再構築する（完全性と抽出上限の契約を保つ）。
+    // 上限超過は `54000`（commit 前に返るため副作用ゼロ）。
+    rebuild_gin_indexes_on_column_in_txn(write_txn, table_name, &schema, column_name)?;
     if schema_check_references_column(old_schema, column_name) {
         revalidate_checks_after_type_change_in_txn(
             write_txn,
@@ -2553,6 +2631,35 @@ fn alter_column_type_rewrite_expr_in_txn(
         .insert(table_name, encoded.as_slice())
         .map_err(CatalogError::from)?;
     Ok(schema)
+}
+
+/// 変更列 `column_name` を対象とする GIN 相当索引を、新スキーマ `schema` の行から同一 write txn で
+/// 再構築する（`alter_column_type_rewrite_expr_in_txn` が行の書き換え後に呼ぶ。INDEX-8、Issue #2207）。
+/// 抽出上限超過は `54000` の固定文言（全テナントの行が対象のためテナント・値は含めない）。
+fn rebuild_gin_indexes_on_column_in_txn(
+    write_txn: &redb::WriteTransaction,
+    table_name: &str,
+    schema: &TableSchema,
+    column_name: &str,
+) -> std::result::Result<(), AlterCheckError> {
+    let decls = table_expression_decls_in_txn(write_txn, table_name)?;
+    for decl in decls.gins.iter().filter(|d| d.column == column_name) {
+        crate::gin_index::build_all_tenants_in_txn(
+            write_txn,
+            table_name,
+            schema,
+            decl,
+            &crate::gin_index::GinLimits::default(),
+        )
+        .map_err(|e| match e {
+            crate::tenant::TenantWriteError::GinIndexEntryLimitExceeded => AlterCheckError::Sql(
+                SqlSurfaceError::payload_too_large("gin index entry limit exceeded"),
+            ),
+            crate::tenant::TenantWriteError::Catalog(c) => AlterCheckError::Catalog(c),
+            other => AlterCheckError::Catalog(CatalogError::CorruptSchema(other.to_string())),
+        })?;
+    }
+    Ok(())
 }
 
 /// 一般変換（`RewriteExpr`）の静的検証（行を読まない。TABLE-40 (3)・Issue #1637）。新しい型が
@@ -3775,6 +3882,11 @@ fn map_index_validation_error(e: crate::tenant::TenantWriteError) -> CreateIndex
             CreateIndexError::Sql(crate::sql::alter_using::redact_row_conversion_error(inner))
         }
         crate::tenant::TenantWriteError::Catalog(c) => CreateIndexError::Catalog(c),
+        // GIN 索引の初回構築（INDEX-8、Issue #2207）で抽出上限を超えた行がある。`54000` の固定文言で、
+        // テナント・値・件数は含めない（全テナントの行が対象のため）。
+        crate::tenant::TenantWriteError::GinIndexEntryLimitExceeded => CreateIndexError::Sql(
+            SqlSurfaceError::payload_too_large("gin index entry limit exceeded"),
+        ),
         other => CreateIndexError::Catalog(CatalogError::CorruptSchema(other.to_string())),
     }
 }
@@ -11552,6 +11664,20 @@ pub(crate) fn require_table_schema_write_any_identity(
     decode_schema_with_resolver(table_name, &bytes, &mut resolve)
 }
 
+/// 検証済みのスキーマを同じ write txn で [`CATALOG_TABLE`] へ書き戻す（`validate_schema` →
+/// `encode_schema` → 保存）。ALTER 系の個別処理と同じ手順を、他モジュール（`catalog::sequence` の
+/// 移行 IDENTITY 割り当て。Issue #1698）が共有するための入口。世代 bump・commit は含まない。
+pub(crate) fn write_schema_in_txn(
+    write_txn: &redb::WriteTransaction,
+    schema: &TableSchema,
+) -> Result<()> {
+    validate_schema(schema)?;
+    let encoded = encode_schema(schema)?;
+    let mut catalog_table = write_txn.open_table(CATALOG_TABLE)?;
+    catalog_table.insert(schema.name.as_str(), encoded.as_slice())?;
+    Ok(())
+}
+
 /// `#[cfg(test)]` 限定の生書き込み API（`insert_row_into_table` /
 /// `insert_rows_into_table` / `insert_typed_row`。Issue #1078）の共通ガード。
 /// これら 3 API は [`crate::constraint::enforce_row_constraints_in_txn`]
@@ -11575,9 +11701,12 @@ fn reject_constrained_table_for_raw_write(
     // 式索引の宣言（INDEX-10、Issue #1649）・部分索引の述語（INDEX-11、Issue #1654）も検査点でしか
     // 強制できないため、同じく拒否する。
     let index_decls = table_expression_decls_in_txn(write_txn, table_name)?;
-    if !index_decls.keys.is_empty() || !index_decls.partials.is_empty() {
+    if !index_decls.keys.is_empty()
+        || !index_decls.partials.is_empty()
+        || !index_decls.gins.is_empty()
+    {
         return Err(CatalogError::Invalid(
-            "raw test-only write API does not support tables with expression or partial indexes; use crate::tenant write APIs".to_string(),
+            "raw test-only write API does not support tables with expression, partial or gin indexes; use crate::tenant write APIs".to_string(),
         ));
     }
     if schema.primary_key().is_some()
@@ -15205,6 +15334,24 @@ impl Storage {
                 let encoded_schema = encode_schema(updated)?;
                 let mut catalog_table = write_txn.open_table(CATALOG_TABLE)?;
                 catalog_table.insert(def.table.as_str(), encoded_schema.as_slice())?;
+            }
+            // GIN 相当索引（INDEX-8、Issue #2207）の初回構築。同じ write txn で全テナント・全可視性の
+            // 既存行を 1 回だけ走査して抽出・上限検証・ポスティング書き込みを行う。上限超過は `54000`
+            // （commit 前に返るため宣言も索引も残らない）。
+            if let (IndexKind::Gin(opclass), Some(column)) = (def.kind, def.columns.first()) {
+                let decl = DeclaredGinIndex {
+                    index_name: def.name.clone(),
+                    column: column.clone(),
+                    opclass,
+                };
+                crate::gin_index::build_all_tenants_in_txn(
+                    &write_txn,
+                    &def.table,
+                    &schema,
+                    &decl,
+                    &crate::gin_index::GinLimits::default(),
+                )
+                .map_err(map_index_validation_error)?;
             }
         }
         if def.unique {
