@@ -84,6 +84,9 @@ cat <<'EOF'
   crash-test-sequence
       採番状態・operation_id 台帳の crash 耐性回帰テスト
       $ scripts/crash_test_sequence.sh
+  crash-test-gin-index
+      GIN 相当索引の crash 耐性回帰テスト
+      $ scripts/crash_test_gin_index.sh
   tmp-leak-check
       テスト一時領域の残置検出ゲート
       $ scripts/check_tmp_leak.sh
@@ -141,6 +144,7 @@ cat <<'EOF'
       $ scripts/crash_test_temp_table.sh
       $ scripts/crash_test_view_write.sh
       $ scripts/crash_test_sequence.sh
+      $ scripts/crash_test_gin_index.sh
       $ scripts/check_tmp_leak.sh
       $ scripts/core_api_check.sh
       $ scripts/sort_determinism_check.sh

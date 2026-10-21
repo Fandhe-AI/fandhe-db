@@ -135,6 +135,11 @@ crash-test-view-write: ## ビュー書き込みの crash 耐性・台帳再送�
 crash-test-sequence: ## 採番状態・operation_id 台帳の crash 耐性回帰テスト
 	scripts/crash_test_sequence.sh
 
+# GIN 相当索引の crash 耐性回帰テスト（Issue #2209・INDEX-8 ポインタ。scripts/crash_test_gin_index.sh を実行）
+.PHONY: crash-test-gin-index
+crash-test-gin-index: ## GIN 相当索引の crash 耐性回帰テスト
+	scripts/crash_test_gin_index.sh
+
 # テスト一時領域の残置検出ゲート（Issue #1303。scripts/check_tmp_leak.sh を実行。FULL=1 で workspace 全テスト）
 .PHONY: tmp-leak-check
 tmp-leak-check: ## テスト一時領域の残置検出ゲート
@@ -201,7 +206,7 @@ worktree-lag-check-selftest: ## worktree-lag-check のセルフテスト
 	@scripts/tests/check_worktree_lag_test.sh
 
 .PHONY: ci
-ci: lint-docs fmt-check lint test test-default-build crash-test crash-test-interrupt crash-test-cross-table crash-test-unique-index crash-test-partitioned-dml crash-test-temp-table crash-test-view-write crash-test-sequence tmp-leak-check core-api-check sort-determinism-check scripts-test simd-codegen-check deny ## CI（ci.yml）と同等のチェックを一括実行する
+ci: lint-docs fmt-check lint test test-default-build crash-test crash-test-interrupt crash-test-cross-table crash-test-unique-index crash-test-partitioned-dml crash-test-temp-table crash-test-view-write crash-test-sequence crash-test-gin-index tmp-leak-check core-api-check sort-determinism-check scripts-test simd-codegen-check deny ## CI（ci.yml）と同等のチェックを一括実行する
 
 # TASK-127 の性能・Recall 受け入れ基準回帰ベンチを実行する（時間依存のため ci には含めない。.github/workflows/bench.yml から週次 schedule / workflow_dispatch で実行）
 .PHONY: bench-simd
