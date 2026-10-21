@@ -32,7 +32,7 @@
 //! 従来方式の表 `mig_rows (n BIGINT, via TEXT)` を作って開き直し（移行で所有 SEQUENCE
 //! `mig_rows_id_seq` が付く）、`id` を省略した INSERT の採番を検証する。
 //! - `write-identity <db_path>`: 連番 `n`（書き込み順）の行を、文の形（単一行・2 行・3 行・明示
-//!   トランザクション）を `first_n % 4` で決めて書き続ける。どの文も `RETURNING id` と
+//!   トランザクション）を文の通し番号 `% 4` で決めて書き続ける。どの文も `RETURNING id` と
 //!   `USING OPERATION_ID 'mig-<first_n>'` を付け、成功ごとに
 //!   `COMMITTED op=mig-<first_n> rows=<総行数> n=<最後の id>` を flush する。数行ごとに
 //!   `BEGIN` → `id` 省略 INSERT → `ROLLBACK` を挟む。
@@ -527,7 +527,7 @@ mod identity {
 
     /// 検証対象の表（従来方式で作り、開き直しの移行で所有 SEQUENCE を持つ）。
     const MIG_TABLE: &str = "mig_rows";
-    /// 文の形のサイクル長（`first_n % 4`）。
+    /// 文の形のサイクル長（文の通し番号 `% 4`）。
     const SHAPES: u64 = 4;
 
     /// 開く（開く時点の移行を走らせるため `EngineCore::open` を使う）。
@@ -552,13 +552,15 @@ mod identity {
         open(path)
     }
 
-    /// 先頭 `first_n` の文の行数と、明示トランザクションで包むか。
-    fn shape_of(first_n: u64) -> (u64, bool) {
-        match first_n % SHAPES {
-            0 => (1, false),
-            1 => (2, false),
-            2 => (3, false),
-            _ => (1, true),
+    /// 文の通し番号（0 始まり）から、その文の行数と、明示トランザクションで包むか。
+    /// 行番号 `first_n` は 1 文あたり 1〜3 ずつ進み剰余が偏るため、形は通し番号で選ぶ
+    /// （全 4 形に到達する）。復旧後も `statements` が文境界から通し番号を再構成する。
+    fn shape_of(stmt_idx: u64) -> (u64, bool) {
+        match stmt_idx % SHAPES {
+            0 => (2, false),
+            1 => (3, false),
+            2 => (1, true),
+            _ => (1, false),
         }
     }
 
@@ -567,10 +569,12 @@ mod identity {
     fn statements(upto_rows: u64) -> Vec<(u64, u64, bool)> {
         let mut out = Vec::new();
         let mut first = 1u64;
+        let mut idx = 0u64;
         while first <= upto_rows {
-            let (len, txn) = shape_of(first);
+            let (len, txn) = shape_of(idx);
             out.push((first, len, txn));
             first += len;
+            idx += 1;
         }
         out
     }
@@ -745,14 +749,16 @@ mod identity {
         let ctx = tenant_ctx()?;
         let existing = read_rows(&core, &ctx)?;
         // 再開: 既存の行数の次の `n` から続ける（verify が文の境界を保証している）。
+        let first_idx = u64::try_from(statements(u64::try_from(existing.len()).unwrap_or(0)).len())
+            .map_err(|_| "statement count overflow".to_string())?;
         let mut next_n = u64::try_from(existing.len())
             .map_err(|_| "row count overflow".to_string())?
             .checked_add(1)
             .ok_or("n overflow")?;
         let stdout = std::io::stdout();
         let mut handle = stdout.lock();
-        for _ in 0..MAX_ROWS {
-            let (len, txn_wrapped) = shape_of(next_n);
+        for stmt_idx in first_idx..first_idx.saturating_add(MAX_ROWS) {
+            let (len, txn_wrapped) = shape_of(stmt_idx);
             if next_n % ROLLBACK_EVERY == 0 {
                 let id = rolled_back_probe(&core, &ctx, next_n)?;
                 writeln!(handle, "ROLLEDBACK id={id}")
