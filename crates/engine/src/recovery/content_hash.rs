@@ -184,6 +184,9 @@ enum OpTag {
     InsertIdentityBatch = 23,
     /// [`OpTag::InsertIdentityBatch`] の式つき版（[`for_typed_insert_identity_batch_expr`] 参照）。
     InsertIdentityBatchExpr = 24,
+    /// `INSERT ... SELECT`（Issue #1734・SQL-51 (5)・RECOVER-10/11）。送られた文のトークン列
+    /// （内側 SELECT を含む）だけを材料にし、VALUES 形の `Insert*`・`Upsert*` とは別ドメインに分離する。
+    InsertSelect = 25,
 }
 
 /// 長さプレフィクス付きフィールド連結でハッシュ入力を組み立てるビルダー
@@ -1275,6 +1278,119 @@ pub(crate) fn for_view_write(view_name: &str, inner: &ContentHash) -> ContentHas
     b.push_raw(view_name.as_bytes());
     b.push_raw(inner.as_bytes());
     b.finish()
+}
+
+/// `INSERT ... SELECT` の台帳照合ハッシュ（Issue #1734。ポインタ: SQL-51 (5)・RECOVER-10・RECOVER-11）。
+///
+/// 入力は許可リスト parser へ渡す直前のトークン列（`$n` は実値の `StringLiteral` へ置換済み）から
+/// [`strip_operation_id_clause`] で `USING OPERATION_ID` 句と末尾 `;` を除いたもの。内側 SELECT の
+/// **結果行の値は材料にしない**ため、内側の結果が再送時に変わる・0 行・上限超過でも同一文なら
+/// 同一ハッシュになる（`23505`）。識別子の大小・数値表記は畳まない（差があれば `22023` 側へ倒す）。
+/// 未束縛の [`Token::Param`] が残っていれば `Err`（fail-closed）。呼び出し元は #1733 の
+/// INSERT ... SELECT 実行経路（台帳記録は内側 SELECT 実体化より前に 1 回だけ行う）。
+#[cfg_attr(not(test), allow(dead_code))] // #1733 が結線する
+pub(crate) fn for_insert_select(
+    statement_tokens: &[crate::sql::lexer::Token],
+) -> Result<ContentHash, StorageError> {
+    let mut b = HashInputBuilder::new(OpTag::InsertSelect);
+    b.push_u64(statement_tokens.len() as u64);
+    for t in statement_tokens {
+        push_token(&mut b, t)?;
+    }
+    Ok(b.finish())
+}
+
+/// トークン 1 個を「variant タグ 1 バイト＋長さプレフィクス付き payload」で直列化する。
+/// `Token`／`Keyword` とも網羅 match（ワイルドカード腕なし）で、lexer への variant 追加を
+/// コンパイルエラーにして黙った衝突を防ぐ。
+fn push_token(b: &mut HashInputBuilder, t: &crate::sql::lexer::Token) -> Result<(), StorageError> {
+    use crate::sql::lexer::{Keyword, Token};
+    match t {
+        Token::Keyword(k) => {
+            b.push_u8(1);
+            b.push_u8(match k {
+                Keyword::Select => 1,
+                Keyword::From => 2,
+                Keyword::Where => 3,
+                Keyword::And => 4,
+                Keyword::Order => 5,
+                Keyword::By => 6,
+                Keyword::Limit => 7,
+            });
+        }
+        Token::Ident(s) => push_token_str(b, 2, s)?,
+        Token::QuotedBoolWord(s) => push_token_str(b, 3, s)?,
+        Token::QuotedCollationName(s) => push_token_str(b, 4, s)?,
+        Token::QuotedDollarUser => b.push_u8(5),
+        Token::StringLiteral(s) => push_token_str(b, 6, s)?,
+        Token::Number(s) => push_token_str(b, 7, s)?,
+        Token::Punct(c) => {
+            b.push_u8(8);
+            let mut buf = [0u8; 4];
+            b.push_bytes(c.encode_utf8(&mut buf).as_bytes())?;
+        }
+        Token::Arrow => b.push_u8(9),
+        Token::ArrowText => b.push_u8(10),
+        Token::HashArrow => b.push_u8(11),
+        Token::HashArrowText => b.push_u8(12),
+        Token::HashMinus => b.push_u8(13),
+        Token::JsonContains => b.push_u8(14),
+        Token::JsonPathExists => b.push_u8(15),
+        Token::JsonPathMatch => b.push_u8(16),
+        Token::JsonContainedBy => b.push_u8(17),
+        Token::JsonExists => b.push_u8(18),
+        Token::JsonExistsAny => b.push_u8(19),
+        Token::JsonExistsAll => b.push_u8(20),
+        Token::ArrayOverlap => b.push_u8(21),
+        Token::TypeCast => b.push_u8(22),
+        Token::Concat => b.push_u8(23),
+        Token::DistanceOp => b.push_u8(24),
+        Token::Le => b.push_u8(25),
+        Token::Ge => b.push_u8(26),
+        Token::QualifiedIdent { qualifier, name } => {
+            b.push_u8(27);
+            b.push_bytes(qualifier.as_bytes())?;
+            b.push_bytes(name.as_bytes())?;
+        }
+        Token::QualifiedStar { qualifier } => push_token_str(b, 28, qualifier)?,
+        Token::QuotedNull(s) => push_token_str(b, 29, s)?,
+        Token::Param(_) => {
+            return Err(StorageError::Codec(
+                "content hash: unbound parameter placeholder".to_string(),
+            ))
+        }
+    }
+    Ok(())
+}
+
+fn push_token_str(b: &mut HashInputBuilder, tag: u8, s: &str) -> Result<(), StorageError> {
+    b.push_u8(tag);
+    b.push_bytes(s.as_bytes())
+}
+
+/// 文のトークン列から末尾の `;` と末尾の `USING OPERATION_ID <文字列リテラル | NULL>` を除く
+/// （operation_id は台帳のキーであり内容照合の材料にしない。Issue #1734）。句が無ければ入力のまま返す。
+/// 内側 SELECT の `USING MODE ...` 等は末尾でも `OPERATION_ID` を伴わないため剥がさない。
+#[cfg_attr(not(test), allow(dead_code))] // #1733 が結線する
+pub(crate) fn strip_operation_id_clause(
+    tokens: &[crate::sql::lexer::Token],
+) -> &[crate::sql::lexer::Token] {
+    use crate::sql::lexer::Token;
+    let mut rest = match tokens.split_last() {
+        Some((Token::Punct(';'), head)) => head,
+        _ => tokens,
+    };
+    if let [.., Token::Ident(u), Token::Ident(o), last] = rest {
+        let value_ok = match last {
+            Token::StringLiteral(_) => true,
+            Token::Ident(n) => n.eq_ignore_ascii_case("NULL"),
+            _ => false,
+        };
+        if value_ok && u.eq_ignore_ascii_case("USING") && o.eq_ignore_ascii_case("OPERATION_ID") {
+            rest = rest.get(..rest.len().saturating_sub(3)).unwrap_or(rest);
+        }
+    }
+    rest
 }
 
 /// `delete_row_unchecked` 用（TASK-101 対象経路 5）。入力: `id` のみ（削除要求は
@@ -6348,5 +6464,83 @@ mod tests {
         )
         .expect("h");
         assert_ne!(one, two);
+    }
+
+    // ---- Issue #1734: INSERT ... SELECT の content_hash（SQL-51 (5)・RECOVER-10/11）----
+
+    fn sel_hash(sql: &str) -> ContentHash {
+        let toks = crate::sql::lexer::tokenize(sql).expect("tokenize");
+        for_insert_select(strip_operation_id_clause(&toks)).expect("hash")
+    }
+
+    const SEL: &str = "INSERT INTO t (a) SELECT a FROM s WHERE b = 'x' LIMIT 3";
+
+    #[test]
+    fn for_insert_select_layout_is_golden() {
+        let hex: String = sel_hash(SEL)
+            .as_bytes()
+            .iter()
+            .map(|b| format!("{b:02x}"))
+            .collect();
+        assert_eq!(
+            hex,
+            "8e36a6fdb1c6bbe0c285be3a5736e169d364ef05d922da109681286e482b6d8c"
+        );
+    }
+
+    #[test]
+    fn insert_select_hash_ignores_whitespace_comments_and_operation_id() {
+        let base = sel_hash(SEL);
+        assert_eq!(
+            base,
+            sel_hash("INSERT  INTO t (a)\n SELECT a FROM s /* c */ WHERE b = 'x' LIMIT 3")
+        );
+        let with_a = format!("{SEL} USING OPERATION_ID 'a'");
+        let with_b = format!("{SEL} using operation_id 'b';");
+        assert_eq!(base, sel_hash(&with_a));
+        assert_eq!(base, sel_hash(&with_b));
+        assert_eq!(base, sel_hash(&format!("{SEL} USING OPERATION_ID NULL")));
+        assert_eq!(base, sel_hash(&format!("{SEL};")));
+    }
+
+    #[test]
+    fn insert_select_hash_is_sensitive_to_statement_differences() {
+        let base = sel_hash(SEL);
+        for other in [
+            "INSERT INTO t (a) SELECT a FROM s WHERE b = 'y' LIMIT 3",
+            "INSERT INTO t (a) SELECT a FROM s WHERE b = 'x' LIMIT 4",
+            "INSERT INTO T (a) SELECT a FROM s WHERE b = 'x' LIMIT 3",
+            "INSERT INTO t (a) SELECT a FROM s WHERE b = 'x'",
+            "INSERT INTO t (a) SELECT a FROM s WHERE b = 'x' LIMIT 3 ON CONFLICT DO NOTHING",
+            "INSERT INTO t (a) SELECT a FROM s LIMIT 3 WHERE b = 'x'",
+        ] {
+            if let Ok(toks) = crate::sql::lexer::tokenize(other) {
+                assert_ne!(base, for_insert_select(&toks).unwrap(), "{other}");
+            }
+        }
+        // 内側の USING MODE は剥がさない
+        let a = sel_hash("INSERT INTO t (a) SELECT a FROM s USING MODE recall");
+        let b = sel_hash("INSERT INTO t (a) SELECT a FROM s");
+        assert_ne!(a, b);
+    }
+
+    #[test]
+    fn insert_select_hash_rejects_unbound_param_and_has_no_concat_ambiguity() {
+        use crate::sql::lexer::Token;
+        assert!(for_insert_select(&[Token::Param(1)]).is_err());
+        let ab_c =
+            for_insert_select(&[Token::Ident("ab".into()), Token::Ident("c".into())]).unwrap();
+        let a_bc =
+            for_insert_select(&[Token::Ident("a".into()), Token::Ident("bc".into())]).unwrap();
+        assert_ne!(ab_c, a_bc);
+    }
+
+    #[test]
+    fn insert_select_hash_is_domain_separated_from_values_insert() {
+        let toks = crate::sql::lexer::tokenize("INSERT INTO t (a) SELECT a FROM s").unwrap();
+        assert_ne!(
+            for_insert_select(&toks).unwrap(),
+            for_typed_insert_batch(&[]).unwrap()
+        );
     }
 }
