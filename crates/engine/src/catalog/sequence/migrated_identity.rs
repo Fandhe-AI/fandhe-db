@@ -38,8 +38,9 @@ use crate::row_codec::{scan_scalar_columns, ScalarRef};
 use crate::storage::read_source::ReadSource;
 
 use super::{
-    choose_implicit_sequence_name_in_txn, create_sequence_in_txn, decode_sequence_def_with_owner,
-    load_sequence_bytes_in_txn, make_object_name, owned_sequence_entries_in_txn, sequence_key,
+    choose_implicit_sequence_name_in_txn, corrupt_may_own_id_sequence, create_sequence_in_txn,
+    decode_sequence_def_with_owner, load_sequence_bytes_in_txn, make_object_name,
+    owned_sequence_entries_in_txn, owned_sequence_entries_lenient, sequence_key,
     set_sequence_owner_in_txn, validate_relation_key, write_state_in_txn, RelationKey, SeqCursor,
     SequenceDef, SequenceOwner, SequenceParams, MAX_CURSORS, SEQUENCES_TABLE,
 };
@@ -77,9 +78,14 @@ fn check_pseudo_id_preconditions(
     write_txn: &redb::WriteTransaction,
     schema: &TableSchema,
 ) -> Result<Option<String>> {
-    let found = owned_sequence_entries_in_txn(write_txn, &|o| {
+    // 無関係な破損 SEQUENCE では失敗させない。ただし `id` 用の名前に当たる破損があれば
+    // 所有関係を判断できないため、拒否して割り当てを見送る（fail-closed）。
+    let (found, corrupt) = owned_sequence_entries_lenient(write_txn, &|o| {
         o.table == schema.name && o.column == ID_COLUMN
     })?;
+    if found.is_empty() && corrupt_may_own_id_sequence(&corrupt, &schema.name) {
+        return Err(invalid("migrated id sequence ownership is undecidable"));
+    }
     match found.as_slice() {
         [] => Ok(None),
         [(name, _, _)] => Ok(Some(name.clone())),
@@ -351,12 +357,14 @@ pub(crate) fn tables_missing_id_sequence<S: ReadSource>(
     if candidates.is_empty() {
         return Ok(Vec::new());
     }
-    let owned = owned_sequence_entries_in_txn(source, &|o| o.column == ID_COLUMN)?;
+    // 破損 SEQUENCE は読み飛ばす（無関係な 1 件で open を失敗させない）。所有関係を判断できない
+    // 表（破損名が暗黙名に当たる）は候補から外して割り当てを見送る。
+    let (owned, corrupt) = owned_sequence_entries_lenient(source, &|o| o.column == ID_COLUMN)?;
     let have: std::collections::BTreeSet<&str> =
         owned.iter().map(|(_, _, o)| o.table.as_str()).collect();
     Ok(candidates
         .iter()
-        .filter(|t| !have.contains(t.as_str()))
+        .filter(|t| !have.contains(t.as_str()) && !corrupt_may_own_id_sequence(&corrupt, t))
         .cloned()
         .collect())
 }

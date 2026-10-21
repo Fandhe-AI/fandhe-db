@@ -396,6 +396,33 @@ mod tests {
         assert!(id_sequence_owner(&s, "old").is_some());
     }
 
+    /// Issue #1699: 無関係な SEQUENCE が 1 件壊れていても open は成功し、他の表の割り当ては続く。
+    /// 壊れた名前が `id` 用の暗黙名に当たる表は所有関係を判断できないため見送る（fail-closed）。
+    #[test]
+    fn corrupt_sequence_does_not_block_open_or_other_assignments() {
+        let path = unique_db_path("legacy-id-corrupt-seq");
+        let _g = CleanupGuard(path.clone());
+        {
+            let s = Storage::open(&path).expect("open");
+            s.create_table(&legacy("good")).expect("create");
+            s.create_table(&legacy("risky")).expect("create");
+            let txn = s.begin_write_txn().expect("txn");
+            {
+                let mut t = txn
+                    .open_table(super::super::sequence::SEQUENCES_TABLE)
+                    .expect("sequences");
+                t.insert(("public", "unrelated_seq"), b"garbage".as_slice())
+                    .expect("insert");
+                t.insert(("public", "risky_id_seq"), b"garbage".as_slice())
+                    .expect("insert");
+            }
+            txn.commit_raw_for_test().expect("commit");
+        }
+        let s = Storage::open(&path).expect("open despite corrupt sequence");
+        assert!(id_sequence_owner(&s, "good").is_some());
+        assert!(id_sequence_owner(&s, "risky").is_none());
+    }
+
     /// Issue #1699: 2 段目を commit 前・commit 後で中断しても、再実行で収束し二重に作らない。
     #[test]
     fn interrupted_identity_assignment_converges() {
