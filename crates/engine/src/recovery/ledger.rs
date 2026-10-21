@@ -1967,4 +1967,37 @@ mod tests {
         }
         assert!(rename_table_in_txn(&wt, "documents", "docs2").is_err());
     }
+
+    // Issue #1734・SQL-51 (5): INSERT ... SELECT のハッシュは文のみが材料で、内側 SELECT の結果行を
+    // 含まない。よって内側の結果が変わった後の同一文の再送も同一ハッシュ＝Duplicate（23505）になる。
+    #[test]
+    fn insert_select_ledger_duplicate_mismatch_and_cross_domain() {
+        use crate::recovery::content_hash::{for_insert_select, for_typed_insert_batch};
+        use crate::sql::lexer::tokenize;
+        let h = |sql: &str| for_insert_select(&tokenize(sql).expect("tok")).expect("hash");
+        let stmt = h("INSERT INTO t (a) SELECT a FROM s");
+        let other = h("INSERT INTO t (a) SELECT a FROM s WHERE a > 1");
+
+        let path = unique_db_path("ledger-insert-select");
+        let _guard = CleanupGuard(path.clone());
+        let db = redb::Database::create(&path).expect("create db");
+        let txn = db.begin_write().expect("begin write");
+        let rec = |o: &str, hash: &ContentHash| {
+            record_in_txn(&txn, "tenant-a", "t", LedgerWrite::Record(&op(o)), hash)
+        };
+        assert_eq!(rec("op-1", &stmt).expect("first"), RecordOutcome::Recorded);
+        assert!(matches!(
+            rec("op-1", &stmt),
+            Err(LedgerRecordError::Duplicate)
+        ));
+        assert!(matches!(
+            rec("op-1", &other),
+            Err(LedgerRecordError::ContentMismatch)
+        ));
+        let values = for_typed_insert_batch(&[]).expect("values hash");
+        assert!(matches!(
+            rec("op-1", &values),
+            Err(LedgerRecordError::ContentMismatch)
+        ));
+    }
 }
