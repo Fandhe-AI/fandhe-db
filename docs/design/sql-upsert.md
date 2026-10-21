@@ -318,8 +318,8 @@ spec 側「別途」の扱いのまま（コードでの固定テストも追加
 ## Issue #1736 追記: 対象省略の ON CONFLICT DO NOTHING（SQL-49 ポインタ）
 
 - **構文**: `ON CONFLICT DO NOTHING` を受理する。AST は `OnConflictClause.target` を
-  `ConflictTargetSpec::{Columns, Constraint, Omitted}` にし、省略と空リスト `()` を区別する（`()`・`ON CONSTRAINT`
-  は従来どおり `42601`）。省略した `DO UPDATE` は構文段と束縛段の両方で `42601`
+  `ConflictTargetSpec::{Columns, Constraint, Omitted}` にし、省略と空リスト `()` を区別する（空リスト `()` は従来どおり `42601`。
+  `ON CONSTRAINT` は Issue #1737 で受理する）。省略した `DO UPDATE` は構文段と束縛段の両方で `42601`
   （多層防御。実行段も内部エラーで拒否する）。
 - **束縛**: `BoundConflictTarget::AnyUnique`。文内の `id`・鍵の重複は拒否しない（PostgreSQL と
   同じく先の行を挿入し後の重複を飛ばす）。対象を指定した形の文内重複 `22000` は変えない
@@ -339,7 +339,7 @@ spec 側「別途」の扱いのまま（コードでの固定テストも追加
   レイアウトは不変。
 - **PostgreSQL との差異（記録のみ）**: 飛ばす行には `CHECK` 制約を評価しない（`NOT NULL` はハッシュ材料の
   組み立て時に全行で検査する）。対象を指定した既存の `DO NOTHING` も同様。
-- **対象外**: `ON CONFLICT ON CONSTRAINT`（#1737）、`DO UPDATE` の式・`WHERE`、`INSERT ... SELECT`
+- **対象外**: `DO UPDATE` の式・`WHERE`、`INSERT ... SELECT`
   との併用、NoSQL 表層の `upsert`。
 
 > Issue #2199 注記: 採番方式の表（SQL 表層で新しく作る表）には行キー指定の `ON CONFLICT (id)` が無く、`id` は宣言した通常の列として
@@ -350,7 +350,8 @@ spec 側「別途」の扱いのまま（コードでの固定テストも追加
 
 SQL-49 (1)・(5)・INDEX-9 (3) のポインタ。構文は `ON CONFLICT ON CONSTRAINT <名前>
 {DO NOTHING | DO UPDATE SET ...}`。`OnConflictClause::target` は `ConflictTargetSpec`
-（`Columns`／`Constraint`）になった（BREAKING CHANGE。対象省略形は variant の追加で対応する）。
+（`Columns`／`Constraint`／`Omitted` の 3 variant）になった（BREAKING CHANGE。`Omitted` は
+Issue #1736 の対象省略形）。
 
 - 名前解決は束縛時（`sql::parser::resolve_conflict_target`）。`DROP CONSTRAINT` と同じ探索順で
   UNIQUE 制約 → PRIMARY KEY の実効名を引き、列リスト形と同じ `BoundConflictTarget`（制約の宣言順）へ
