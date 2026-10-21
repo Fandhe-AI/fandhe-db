@@ -5116,8 +5116,10 @@ fn resolve_conflict_target(
 
 /// `ON CONFLICT ON CONSTRAINT <name>` の名前解決（SQL-49、Issue #1737）。
 /// `ALTER TABLE ... DROP CONSTRAINT` と同じ探索順（UNIQUE 制約 → PRIMARY KEY 実効名）で
-/// 制約を引き、列リスト形と同じ [`BoundConflictTarget`]（制約の宣言順）へ解決するため、
-/// 内容照合ハッシュ・RETURNING・衝突判定は同じ制約の列リスト形と一致する。
+/// 制約を引き、名前・種別の検証後にその構成列を列リスト形と同じ解決
+/// （[`resolve_conflict_target_columns`]。列集合照合・正準順）へ通す。順序違いの UNIQUE 2 本や
+/// PRIMARY KEY と UNIQUE の順序違いでも両形が同じ [`BoundConflictTarget`] へ解決され、
+/// 内容照合ハッシュ・RETURNING・衝突判定が一致して同一 operation_id の相互再送が台帳重複になる。
 ///
 /// - CHECK・FOREIGN KEY の名前は `42809`（[`SqlSurfaceError::WrongObjectType`]）
 /// - 不在の名前は `42704`（[`SqlSurfaceError::UndefinedObject`]）
@@ -5134,11 +5136,11 @@ fn resolve_conflict_target_constraint(
         .iter()
         .find(|c| c.name() == name)
     {
-        return conflict_target_from_columns(constraint.columns(), schema);
+        return resolve_conflict_target_columns(constraint.columns(), schema);
     }
     if schema.primary_key_constraint_name_effective().as_deref() == Some(name) {
         if let Some(pk) = schema.primary_key() {
-            return conflict_target_from_columns(pk, schema);
+            return resolve_conflict_target_columns(pk, schema);
         }
     }
     if schema.foreign_keys().iter().any(|f| f.name() == name)
@@ -5151,35 +5153,6 @@ fn resolve_conflict_target_constraint(
     Err(SqlSurfaceError::UndefinedObject {
         name: name.to_string(),
     })
-}
-
-/// 解決済み制約の構成列（宣言順）を [`BoundConflictTarget`] へ写す。疑似列 `id` 単独は
-/// `RowId`、疑似列と他列の混在は `42P10`、それ以外は列インデックスの `Unique`。
-fn conflict_target_from_columns(
-    columns: &[String],
-    schema: &TableSchema,
-) -> Result<BoundConflictTarget, SqlSurfaceError> {
-    if schema.has_pseudo_id() {
-        if matches!(columns, [only] if only == "id") {
-            return Ok(BoundConflictTarget::RowId);
-        }
-        if columns.iter().any(|c| c == "id") {
-            return Err(SqlSurfaceError::InvalidColumnReference);
-        }
-    }
-    columns
-        .iter()
-        .map(|name| {
-            schema
-                .columns
-                .iter()
-                .position(|c| &c.name == name)
-                .ok_or_else(|| SqlSurfaceError::Internal {
-                    detail: "internal: conflict target column not found in live schema".to_string(),
-                })
-        })
-        .collect::<Result<Vec<_>, _>>()
-        .map(BoundConflictTarget::Unique)
 }
 
 /// 列リスト形 `ON CONFLICT (<col>, ...)` の解決（[`resolve_conflict_target`] の本体）。
@@ -11572,6 +11545,43 @@ mod tests {
             bind_named("documents_pkey", &schema).unwrap(),
             BoundConflictTarget::Unique(vec![2, 0])
         );
+    }
+
+    #[test]
+    fn bind_on_constraint_matches_column_list_form_for_reordered_constraints() {
+        let schema = TableSchema::new(
+            "documents",
+            vec![
+                ColumnDef::new("a", ColumnType::Text, false),
+                ColumnDef::new("b", ColumnType::Text, true),
+            ],
+        )
+        .with_unique_constraints(vec![
+            crate::catalog::UniqueConstraint::with_name(
+                "uq_ab".to_string(),
+                vec!["a".to_string(), "b".to_string()],
+            ),
+            crate::catalog::UniqueConstraint::with_name(
+                "uq_ba".to_string(),
+                vec!["b".to_string(), "a".to_string()],
+            ),
+        ])
+        .with_primary_key(vec!["b".to_string(), "a".to_string()]);
+        let bind = |t: &str| {
+            let sql = format!(
+                "INSERT INTO documents (id, a, b) VALUES (1, 'x', 'y') \
+                 ON CONFLICT {t} DO NOTHING USING OPERATION_ID 'op-onc'"
+            );
+            match bind_upsert_sql(&sql, &schema).unwrap() {
+                BoundInsertForm::Upsert(u) => u.target,
+                other => panic!("expected Upsert, got {other:?}"),
+            }
+        };
+        let expected = bind("(b, a)");
+        assert_eq!(bind("(a, b)"), expected);
+        for name in ["uq_ab", "uq_ba", "documents_pkey"] {
+            assert_eq!(bind(&format!("ON CONSTRAINT {name}")), expected, "{name}");
+        }
     }
 
     #[test]
