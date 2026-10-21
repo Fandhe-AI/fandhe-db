@@ -9228,10 +9228,18 @@ impl<'a> Parser<'a> {
             {
                 true
             }
+            // `ORDER BY <式> ASC|DESC` の方向指定は句の終端。ただし `SELECT desc RETURNING a` のように
+            // 列名・別名としての `ASC`／`DESC` と取り違えないよう、深さ 0 に先行する `ORDER BY` があり、
+            // かつ直前（`ASC`／`DESC` の手前）が式の終端のときに限る。
+            Some(Token::Ident(p))
+                if p.eq_ignore_ascii_case("ASC") || p.eq_ignore_ascii_case("DESC") =>
+            {
+                self.is_order_direction(start, idx.saturating_sub(1))
+            }
             Some(Token::Ident(p)) => ![
                 "AS", "ON", "JOIN", "USING", "AND", "OR", "NOT", "IN", "IS", "LIKE", "ILIKE",
                 "BETWEEN", "INNER", "LEFT", "RIGHT", "FULL", "CROSS", "NATURAL", "OUTER",
-                "DISTINCT", "ASC", "DESC",
+                "DISTINCT",
             ]
             .iter()
             .any(|w| p.eq_ignore_ascii_case(w)),
@@ -9243,6 +9251,50 @@ impl<'a> Parser<'a> {
                 | Some(Token::Punct('*'))
         );
         prev_ends_expr && next_starts_projection
+    }
+
+    /// 位置 `dir_idx` の `ASC`／`DESC` が `ORDER BY` の方向指定か（`returning_is_clause_boundary` から呼ぶ）。
+    /// 深さ 0 で `start..dir_idx` に `ORDER BY` が先行し、直前が式の終端（リテラル・`)`・`]`・演算子語でない
+    /// 識別子）であるときだけ真。列名・別名の `desc`／`asc` は偽（範囲に残して SELECT 検証器へ委ねる）。
+    fn is_order_direction(&self, start: usize, dir_idx: usize) -> bool {
+        let mut depth: usize = 0;
+        let mut seen_order_by = false;
+        for i in start..dir_idx {
+            match self.tokens.get(i) {
+                Some(Token::Punct('(')) => depth = depth.saturating_add(1),
+                Some(Token::Punct(')')) => depth = depth.saturating_sub(1),
+                Some(Token::Keyword(Keyword::Order))
+                    if depth == 0
+                        && matches!(
+                            self.tokens.get(i.saturating_add(1)),
+                            Some(Token::Keyword(Keyword::By))
+                        ) =>
+                {
+                    seen_order_by = true;
+                }
+                _ => {}
+            }
+        }
+        if !seen_order_by || dir_idx <= start {
+            return false;
+        }
+        match self.tokens.get(dir_idx.saturating_sub(1)) {
+            Some(
+                Token::Number(_)
+                | Token::StringLiteral(_)
+                | Token::Param(_)
+                | Token::QualifiedIdent { .. }
+                | Token::QuotedNull(_)
+                | Token::Punct(')' | ']'),
+            ) => true,
+            Some(Token::Ident(p)) => ![
+                "BY", "AS", "ON", "AND", "OR", "NOT", "IN", "IS", "LIKE", "ILIKE", "BETWEEN",
+                "DISTINCT", "ASC", "DESC",
+            ]
+            .iter()
+            .any(|w| p.eq_ignore_ascii_case(w)),
+            _ => false,
+        }
     }
 
     /// `INSERT ... SELECT` の問い合わせ部と後続句を解析する（SQL-51・Issue #1732）。
@@ -24163,6 +24215,29 @@ mod tests {
                 panic!("expected Select shape: {sql}");
             };
             assert!(shape.returning.is_some(), "{sql}");
+        }
+        // `ORDER BY` の方向指定（`NULLS FIRST/LAST` 含む）の後の `RETURNING` も句境界になる。
+        for sql in [
+            "INSERT INTO t (a) SELECT a FROM x GROUP BY a ORDER BY a DESC RETURNING a",
+            "INSERT INTO t (a) SELECT a FROM x ORDER BY a ASC RETURNING a",
+            "INSERT INTO t (a) SELECT a FROM x ORDER BY a DESC NULLS LAST RETURNING a",
+            "INSERT INTO t (a) SELECT a FROM x ORDER BY a NULLS FIRST RETURNING a",
+            "INSERT INTO t (a) SELECT a FROM x ORDER BY b, a DESC RETURNING a",
+        ] {
+            let ParsedInsertTokens::Select(shape) = parse_insert_any(sql, mode).expect(sql) else {
+                panic!("expected Select shape: {sql}");
+            };
+            assert!(shape.returning.is_some(), "{sql}");
+        }
+        // 列名・別名の `desc` は方向指定とみなさず範囲に残す（従来の保護）。
+        for sql in [
+            "INSERT INTO t (a) SELECT desc returning FROM x",
+            "INSERT INTO t (a) SELECT a FROM x ORDER BY desc returning",
+        ] {
+            let ParsedInsertTokens::Select(shape) = parse_insert_any(sql, mode).expect(sql) else {
+                panic!("expected Select shape: {sql}");
+            };
+            assert!(shape.returning.is_none(), "{sql}");
         }
         // 本物の句は従来どおり境界になる。
         let ParsedInsertTokens::Select(shape) = parse_insert_any(

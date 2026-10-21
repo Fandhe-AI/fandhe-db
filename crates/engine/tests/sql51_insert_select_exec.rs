@@ -223,3 +223,38 @@ fn on_conflict_with_insert_select_stays_fail_closed() {
     assert_eq!(code(r), "0A000");
     assert!(ids(&core, "alice", "dst").is_empty());
 }
+
+/// `ORDER BY` の方向指定の後の `RETURNING` も句境界として認識され、挿入・返却される。
+#[test]
+fn returning_after_order_by_direction_is_recognized() {
+    let (core, path) = setup("sql51-e2e-orderdir");
+    let _g = CleanupGuard(path);
+    for (i, sql) in [
+        "INSERT INTO dst (id, a) SELECT a, COUNT(*) FROM src GROUP BY a ORDER BY a DESC RETURNING id",
+        "INSERT INTO dst (id) SELECT a FROM src ORDER BY a ASC LIMIT 100 RETURNING id",
+    ]
+    .iter()
+    .enumerate()
+    {
+        // 各文で別の表へ入れ直すため、先に dst を空にする（主キー重複を避ける）。
+        if i > 0 {
+            let mut s = SessionState::default();
+            s.allow_ddl();
+            core.execute_sql_in_session(
+                &ctx("alice"),
+                &mut s,
+                "TRUNCATE TABLE dst USING OPERATION_ID 'trunc-x'"
+                    .replace("x", &i.to_string())
+                    .as_str(),
+            )
+            .expect("truncate");
+        }
+        match run(&core, "alice", sql).unwrap_or_else(|e| panic!("{sql}: {e:?}")) {
+            SqlOutcome::Returning(r) => {
+                assert_eq!(r.rows_affected, 2, "{sql}");
+                assert_eq!(r.result.rows.len(), 2, "{sql}");
+            }
+            other => panic!("expected Returning for {sql}, got {other:?}"),
+        }
+    }
+}
