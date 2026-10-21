@@ -548,6 +548,11 @@ const ALLOWLIST: &[(&str, u32)] = &[
     ("catalog/sequence.rs", 2704),
     // Issue #1689（ALTER SEQUENCE）: `alter_sequence`／`rename_sequence`（803・842）も同じ表だけを書く
     // （定義 blob の上書き・キーの付け替え・状態行の削除）ため同じ理由で対象外。
+    // Issue #1733（INSERT ... SELECT）: `core/insert_select_exec.rs` の 880・1011 行は `#[cfg(test)]` 内の
+    // 明示トランザクション検証で共有 write txn を commit するだけの呼び出し。行の書き込みと世代 bump は
+    // 既存の `sql::exec::execute_insert_*_in` 経路が同じ txn 内で済ませており、ここで追加の bump は不要。
+    ("core/insert_select_exec.rs", 880),
+    ("core/insert_select_exec.rs", 1011),
 ];
 
 /// `recovery/commit_boundary.rs` の `pub(crate) fn`/`pub fn` シグネチャを

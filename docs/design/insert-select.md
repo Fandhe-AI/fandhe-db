@@ -17,7 +17,7 @@ RLS-7・RLS-10・RECOVER-10・RECOVER-11）。
 6. 2 段目の上限: `--max-insert-rows` と INDEX-4 のバッチ上限を挿入前に判定する（`54000`）。
 7. 書き込みは複数行 `VALUES`・COPY と同じ `sql::exec::execute_insert_batch_with_schema_in`
    （RETURNING は `execute_insert_returning_in`）。1 write txn・1 台帳エントリで、失敗は txn の abort で
-   全体が拒否される。0 行は書き込みも台帳記録もしない。
+   全体が拒否される。0 行は行の書き込みをせず、台帳だけを記録する（`record_insert_select_ledger_only`）。
 
 ## スナップショットの判断
 
@@ -43,10 +43,10 @@ RLS-7・RLS-10・RECOVER-10・RECOVER-11）。
 
 ## 台帳（#1734 への引き継ぎ）
 
-内容照合ハッシュは既存のバッチ経路（行の値ベース）をそのまま使う。同じ `operation_id` での二重挿入は台帳キーで
-防がれるが、内側の結果が変わった後の同じ文の再送は #1734 がハッシュを文の正規化へ置き換えるまで `22023`
-になる（拒否側。fail-open ではない）。ハッシュを渡す場所は predicate DELETE の `content_hash_value`
-引数の前例に倣う想定で、本 Issue では引数を追加していない。
+内容照合ハッシュは結果行ではなく、呼び出し側から渡される `statement_hash`（文の正規化ハッシュ）を使う。
+書き込み段は `InsertSelectLedgerScope` で行の値ベースのハッシュを文ハッシュへ差し替える。同じ
+`operation_id` での再送は、内側の結果が変わった後でも同一文なら台帳キーで照合され `23505` になり、
+二重挿入しない。文が異なる再送は内容不一致として拒否される（拒否側。fail-open ではない）。
 
 ## 値の変換（代入変換）
 
