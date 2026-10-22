@@ -281,6 +281,9 @@ impl EngineCore {
         let mut core = Self::assemble(storage, Box::new(crate::kernel::CpuScalarProvider), None);
         core.ledger_mode = LedgerMode::CompareOnlyWithoutLedger;
         core.precision_policy = template.precision_policy;
+        // `--require-where-for-dml`（Issue #2210）。拡張クエリの Parse は一時コア上で構造検証されるため、
+        // 引き継がないと一時表だけ WHERE 省略の UPDATE/DELETE が通る（fail-open）。
+        core.require_where_for_dml = template.require_where_for_dml;
         core.batch_limits = template.batch_limits;
         core.transaction_limits = template.transaction_limits;
         core.dml_limits = template.dml_limits;

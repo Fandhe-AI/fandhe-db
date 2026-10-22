@@ -261,6 +261,30 @@ fn enabled_rejects_omitted_where_on_temp_table() {
         .expect("with where");
 }
 
+/// 一時表への拡張クエリ（Parse）でも WHERE 省略は拒否される（一時コアへのフラグ引き継ぎ）。
+#[test]
+fn enabled_rejects_omitted_where_on_temp_table_extended_query() {
+    let (core, _g) = new_core(true);
+    let a = ctx_for("tenant-a");
+    let mut s = SessionState::default();
+    s.allow_ddl();
+    core.execute_sql_in_session(
+        &a,
+        &mut s,
+        "CREATE TEMP TABLE t (id BIGINT PRIMARY KEY, n INTEGER)",
+    )
+    .expect("create temp");
+    for sql in ["DELETE FROM t", "UPDATE t SET n = 2"] {
+        let e = core
+            .parse_sql_prepared_with_declared_in_session(&s, sql, &[])
+            .map(|_| ())
+            .unwrap_err();
+        assert_eq!(e.wire_code(), "42601", "{sql}");
+    }
+    core.parse_sql_prepared_with_declared_in_session(&s, "DELETE FROM t WHERE id = 1", &[])
+        .expect("with where");
+}
+
 /// 判定は表の存在確認より前: 存在しない表でも 42601（存在の手掛かりを返さない）。
 #[test]
 fn enabled_rejects_before_table_existence_check() {
