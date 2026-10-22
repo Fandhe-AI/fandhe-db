@@ -139,7 +139,7 @@ pub fn check_dml_affected_rows(count: usize) -> Result<(), SqlSurfaceError>; // 
 ## 構文上の余剰トークンの扱い
 
 `HINT ORDER(...)`・`USING MODE '...'`・`ORDER BY ...`・`LIMIT n`・複数テーブル
-指定・サブクエリはいずれも `parse_update` の文法に存在しないため、
+指定・`SET` 右辺のサブクエリはいずれも `parse_update` の文法に存在しないため（`WHERE` 内のサブクエリは Issue #1750・SQL-53 で構文段が受理し、束縛段が `42601` で止める）、
 `expect_end_of_statement` が余剰トークンとして構造的に `42601` へ落とす（述語形
 でも id 指定形でも同じ経路。個別の拒否コードを持たない）。結合テストで両形状に
 対して固定している。

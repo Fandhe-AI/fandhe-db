@@ -2309,9 +2309,9 @@ fn push_dml_where_predicate(
             push_dml_where_predicate(b, inner, udf_registry, referenced)?;
         }
         // Issue #927・SQL-29 (a)・TASK-213: サブクエリは述語形 `UPDATE`/`DELETE`
-        // の WHERE では構文解析段（`Parser::require_subquery_depth`）が既定
-        // `subquery_ctx == None` により `42601` で拒否するため、DML の content
-        // hash 対象へ到達しない（fail-closed の防御的経路）。
+        // の WHERE を構文段が受理する（Issue #1750・SQL-53）が、束縛段
+        // （`bind_where_predicates`）が先に `42601` で拒否するため、DML の content
+        // hash 対象へ到達しない（fail-closed の防御的経路。ハッシュ化は #1752）。
         WherePredicate::InSubquery { .. }
         | WherePredicate::Exists { .. }
         | WherePredicate::ScalarSubqueryCompare { .. } => {

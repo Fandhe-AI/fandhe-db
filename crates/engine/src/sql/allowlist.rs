@@ -2012,9 +2012,10 @@ pub enum WherePredicate {
     ///
     /// 構文的に受理するのは [`Parser::subquery_ctx`] が `Some` の文脈（読み取り
     /// SELECT の WHERE。`sql::allowlist::validate_sql_tokens` のトップレベル
-    /// 呼び出しのみが設定する）のみで、CHECK 本体・述語形
-    /// `UPDATE`/`DELETE`・カーソル・`COPY`・`EXPLAIN` からは構文解析段で `42601`
-    /// になる。単純形の `CREATE VIEW` 本体（[`parse_view_body`]）も同様に拒否するが、
+    /// 呼び出しのみが設定する）のみで、CHECK 本体・カーソル・`COPY`・`EXPLAIN` と、述語形 `UPDATE`/`DELETE` の
+    /// `RETURNING`・`SET` 右辺からは構文解析段で `42601` になる。述語形
+    /// `UPDATE`/`DELETE` の `WHERE` に限り [`Parser::parse_dml_where`] が文脈を差し替えて
+    /// 構文段で受理する（Issue #1750・SQL-53 (a)。実行は束縛段が `42601` で止め、#1751 で結線）。単純形の `CREATE VIEW` 本体（[`parse_view_body`]）も同様に拒否するが、
     /// 評価後射影形の本文（`LIMIT` 付き。[`classify_view_body`]。Issue #1360）は
     /// 本文を読み取り SELECT として検証するため受理する。`NOT IN` は
     /// `Not(InSubquery)` で表す（Issue #1191）。
@@ -4767,6 +4768,10 @@ struct Parser<'a> {
     /// 検出したら `54000` にする。`sql::allowlist::validate_sql_tokens` の
     /// トップレベル呼び出し（`parse_select_shape`/`parse_aggregate_shape` の
     /// 呼び出し元）だけが `Some(0)` を設定する。
+    /// 述語形 `UPDATE`／`DELETE` の `WHERE` 解析の間だけ [`Self::subquery_ctx`] へ差し替える
+    /// 文脈深さ（Issue #1750・SQL-53）。`RETURNING` の投影・`SET` 右辺では `None` のまま
+    /// なので、これらの位置のサブクエリは従来どおり `42601`。[`Self::parse_dml_where`] が設定・復元する。
+    dml_where_subquery_ctx: Option<usize>,
     subquery_ctx: Option<usize>,
     /// サブクエリ深さ・CTE 定義数の実効上限（Issue #1552）。`Parser::new` の既定は
     /// ハード上限と同値で、セッション SQL のパース入口だけが
@@ -4898,6 +4903,7 @@ impl<'a> Parser<'a> {
             pos: 0,
             expr_node_budget: MAX_EXPR_NODES,
             subquery_ctx: None,
+            dml_where_subquery_ctx: None,
             nesting_limits: crate::nesting_limits::NestingLimits::default(),
             case_nesting: 0,
             allow_null_literal: false,
@@ -4937,6 +4943,23 @@ impl<'a> Parser<'a> {
     fn with_subquery_ctx(mut self, depth: usize) -> Self {
         self.subquery_ctx = Some(depth);
         self
+    }
+
+    /// 述語形 DML の `WHERE` でサブクエリ構文を受理する構築（Issue #1750・SQL-53）。
+    /// 受理するのは構文段までで、実行は束縛段（`bind_where_predicates`）が `42601` で止める
+    /// （内側 SELECT の評価は #1751）。
+    fn with_dml_where_subquery_ctx(mut self, depth: usize) -> Self {
+        self.dml_where_subquery_ctx = Some(depth);
+        self
+    }
+
+    /// DML の `WHERE` だけを [`Self::dml_where_subquery_ctx`] の文脈で解析する（エラー時も復元する）。
+    fn parse_dml_where(&mut self) -> Result<Vec<WherePredicate>, SqlSurfaceError> {
+        let prev = self.subquery_ctx;
+        self.subquery_ctx = self.dml_where_subquery_ctx;
+        let result = self.parse_where();
+        self.subquery_ctx = prev;
+        result
     }
 
     /// 入れ子系上限の実効値を差し替える（Issue #1552）。起動時設定
@@ -10116,7 +10139,7 @@ impl<'a> Parser<'a> {
                 let id_literal = self.expect_number()?;
                 ParsedDeleteWhere::RowId { id_literal }
             } else {
-                let predicates = mark_explicit_where(self.parse_where()?);
+                let predicates = mark_explicit_where(self.parse_dml_where()?);
                 ParsedDeleteWhere::Predicates(predicates)
             }
         } else {
@@ -10140,6 +10163,9 @@ impl<'a> Parser<'a> {
         };
         if partitioned.is_some() {
             reject_partitioned_combination(returning.is_some())?;
+            if let ParsedDeleteWhere::Predicates(p) = &where_clause {
+                reject_partitioned_subquery(p)?;
+            }
         }
 
         Ok(ParsedDeleteShape {
@@ -10189,8 +10215,8 @@ impl<'a> Parser<'a> {
     /// セッション入口 [`validate_update_form_tokens`] は実行結線へ渡す
     /// （Issue #1182）。振り分け後の
     /// 受理判定（id 指定形以外は許可しない等）も同じ呼び出し元の責務とし、
-    /// 本メソッドは構造パースのみを行う。複数テーブル・サブクエリは本メソッド
-    /// が生成できる文法にそもそも存在しないため構造的に受理しない（個別の
+    /// 本メソッドは構造パースのみを行う。複数テーブル・`SET` 右辺のサブクエリは本メソッド
+    /// が生成できる文法にそもそも存在しないため（`WHERE` 内のサブクエリのみ Issue #1750 で受理）構造的に受理しない（個別の
     /// 拒否コードを持たず、`expect_end_of_statement` が余剰トークンとして
     /// `42601` へ落とす）。
     fn parse_update(&mut self) -> Result<ParsedUpdateShape, SqlSurfaceError> {
@@ -10238,6 +10264,9 @@ impl<'a> Parser<'a> {
         };
         if partitioned.is_some() {
             reject_partitioned_combination(returning.is_some())?;
+            if let UpdateWhereForm::Predicates(p) = &where_form {
+                reject_partitioned_subquery(p)?;
+            }
         }
 
         Ok(ParsedUpdateShape {
@@ -10290,7 +10319,7 @@ impl<'a> Parser<'a> {
         }
 
         self.pos = start;
-        let predicates = self.parse_where()?;
+        let predicates = self.parse_dml_where()?;
         Ok(UpdateWhereForm::Predicates(predicates))
     }
 
@@ -19011,8 +19040,12 @@ struct ParsedDeleteShape {
 /// 通ることで、構文解析そのものを複製しない。
 fn parse_delete_statement_shape(
     tokens: &[lexer::Token],
+    dml_where_subquery: Option<crate::nesting_limits::NestingLimits>,
 ) -> Result<ParsedDeleteShape, SqlSurfaceError> {
     let mut p = Parser::new(tokens);
+    if let Some(limits) = dml_where_subquery {
+        p = p.with_nesting_limits(limits).with_dml_where_subquery_ctx(0);
+    }
     let shape = p.parse_delete()?;
     p.expect_end_of_statement()?;
     Ok(shape)
@@ -19055,7 +19088,7 @@ pub(crate) fn validate_delete_tokens(
     lookup: &impl TableLookup,
     mode: LedgerMode,
 ) -> Result<ValidatedDelete, SqlSurfaceError> {
-    let shape = parse_delete_statement_shape(tokens)?;
+    let shape = parse_delete_statement_shape(tokens, None)?;
 
     let id_literal = match shape.where_clause {
         ParsedDeleteWhere::RowId { id_literal } => id_literal,
@@ -19109,7 +19142,22 @@ pub(crate) fn validate_delete_statement_tokens(
     lookup: &impl TableLookup,
     mode: LedgerMode,
 ) -> Result<DeleteStatement, SqlSurfaceError> {
-    let stmt = parse_delete_statement_shape_tokens(tokens, mode)?;
+    validate_delete_statement_tokens_with_limits(
+        tokens,
+        lookup,
+        mode,
+        crate::nesting_limits::NestingLimits::default(),
+    )
+}
+
+/// [`validate_delete_statement_tokens`] の入れ子上限指定版（Issue #1750・#1552）。
+pub(crate) fn validate_delete_statement_tokens_with_limits(
+    tokens: &[lexer::Token],
+    lookup: &impl TableLookup,
+    mode: LedgerMode,
+    limits: crate::nesting_limits::NestingLimits,
+) -> Result<DeleteStatement, SqlSurfaceError> {
+    let stmt = parse_delete_statement_shape_tokens_with_limits(tokens, mode, limits)?;
 
     let table_name = match &stmt {
         DeleteStatement::SingleRow(v) => &v.table_name,
@@ -19136,11 +19184,26 @@ pub(crate) fn validate_delete_statement_tokens(
 /// `parse_tokens` が、FROM の名前が表でなかったときにビューへの DELETE として扱う
 /// （`ParsedSql::ViewDelete`。TABLE-43・Issue #1672）ために、構造検証を二重に行わず形だけを取り出す入口。
 /// 返す `table_name` は存在確認前の名前。
+#[cfg(test)]
 pub(crate) fn parse_delete_statement_shape_tokens(
     tokens: &[lexer::Token],
     mode: LedgerMode,
 ) -> Result<DeleteStatement, SqlSurfaceError> {
-    let shape = parse_delete_statement_shape(tokens)?;
+    parse_delete_statement_shape_tokens_with_limits(
+        tokens,
+        mode,
+        crate::nesting_limits::NestingLimits::default(),
+    )
+}
+
+/// [`parse_delete_statement_shape_tokens`] の入れ子上限指定版（Issue #1750）。述語形の `WHERE` で
+/// サブクエリ構文を受理する（実行は束縛段が `42601` で止める。#1751 で実行結線）。
+pub(crate) fn parse_delete_statement_shape_tokens_with_limits(
+    tokens: &[lexer::Token],
+    mode: LedgerMode,
+    limits: crate::nesting_limits::NestingLimits,
+) -> Result<DeleteStatement, SqlSurfaceError> {
+    let shape = parse_delete_statement_shape(tokens, Some(limits))?;
 
     // 分割実行はジョブ識別に operation_id を使うため、構成に関わらず必須（Issue #1704）。
     if shape.partitioned.is_some() {
@@ -19174,6 +19237,20 @@ fn reject_partitioned_combination(has_returning: bool) -> Result<(), SqlSurfaceE
     if has_returning {
         return Err(SqlSurfaceError::unsupported(
             "PARTITIONED cannot be combined with RETURNING",
+        ));
+    }
+    Ok(())
+}
+
+/// `PARTITIONED` 修飾と `WHERE` 内サブクエリの併用を `42601` で拒否する（Issue #1750・SQL-53）。
+/// 分割実行は束縛とハッシュの順序に依存するため、サブクエリ述語を届かせない。固定文言。
+fn reject_partitioned_subquery(predicates: &[WherePredicate]) -> Result<(), SqlSurfaceError> {
+    if predicates
+        .iter()
+        .any(crate::sql::subquery::predicate_contains_subquery)
+    {
+        return Err(SqlSurfaceError::unsupported(
+            "PARTITIONED cannot be combined with a subquery in WHERE",
         ));
     }
     Ok(())
@@ -20446,7 +20523,22 @@ pub(crate) fn validate_update_form_tokens(
     lookup: &impl TableLookup,
     mode: LedgerMode,
 ) -> Result<ValidatedUpdateForm, SqlSurfaceError> {
-    let form = parse_update_form_shape_tokens(tokens, mode)?;
+    validate_update_form_tokens_with_limits(
+        tokens,
+        lookup,
+        mode,
+        crate::nesting_limits::NestingLimits::default(),
+    )
+}
+
+/// [`validate_update_form_tokens`] の入れ子上限指定版（Issue #1750・#1552）。
+pub(crate) fn validate_update_form_tokens_with_limits(
+    tokens: &[lexer::Token],
+    lookup: &impl TableLookup,
+    mode: LedgerMode,
+    limits: crate::nesting_limits::NestingLimits,
+) -> Result<ValidatedUpdateForm, SqlSurfaceError> {
+    let form = parse_update_form_shape_tokens_with_limits(tokens, mode, limits)?;
 
     let table_name = match &form {
         ValidatedUpdateForm::Single(v) => &v.table_name,
@@ -20473,11 +20565,28 @@ pub(crate) fn validate_update_form_tokens(
 /// `parse_tokens` が、UPDATE の対象が表でなかったときにビューへの UPDATE として扱う
 /// （`ParsedSql::ViewUpdate`。TABLE-43・Issue #1672）ために、構造検証を二重に行わず形だけを取り出す入口。
 /// 返す `table_name` は存在確認前の名前。
+#[cfg(test)]
 pub(crate) fn parse_update_form_shape_tokens(
     tokens: &[lexer::Token],
     mode: LedgerMode,
 ) -> Result<ValidatedUpdateForm, SqlSurfaceError> {
-    let mut p = Parser::new(tokens);
+    parse_update_form_shape_tokens_with_limits(
+        tokens,
+        mode,
+        crate::nesting_limits::NestingLimits::default(),
+    )
+}
+
+/// [`parse_update_form_shape_tokens`] の入れ子上限指定版（Issue #1750）。述語形の `WHERE` で
+/// サブクエリ構文を受理する（実行は束縛段が `42601` で止める。#1751 で実行結線）。
+pub(crate) fn parse_update_form_shape_tokens_with_limits(
+    tokens: &[lexer::Token],
+    mode: LedgerMode,
+    limits: crate::nesting_limits::NestingLimits,
+) -> Result<ValidatedUpdateForm, SqlSurfaceError> {
+    let mut p = Parser::new(tokens)
+        .with_nesting_limits(limits)
+        .with_dml_where_subquery_ctx(0);
     let shape = p.parse_update()?;
     p.expect_end_of_statement()?;
 
@@ -27804,6 +27913,96 @@ mod tests {
         )
         .expect_err("subquery SET value must be rejected");
         assert_eq!(err.wire_code(), "42601");
+    }
+
+    /// SQL-53（Issue #1750）: 述語形 DML の WHERE はサブクエリ 5 形を構文段で受理し、
+    /// 非セッション単一行入口・PARTITIONED 併用・RETURNING／SET の投影位置は `42601` のまま。
+    #[test]
+    fn dml_where_accepts_five_subquery_forms_and_keeps_other_positions_closed() {
+        let lookup = catalog_with(&["documents", "notes"]);
+        let wheres = [
+            "lang IN (SELECT lang FROM notes LIMIT 10)",
+            "lang NOT IN (SELECT lang FROM notes LIMIT 10)",
+            "EXISTS (SELECT id FROM notes LIMIT 1)",
+            "NOT EXISTS (SELECT id FROM notes LIMIT 1)",
+            "lang = (SELECT lang FROM notes LIMIT 1)",
+            "lang = 'ja' OR EXISTS (SELECT id FROM notes LIMIT 1)",
+        ];
+        for w in wheres {
+            let d = format!("DELETE FROM documents WHERE {w} USING OPERATION_ID 'op-0001'");
+            match validate_delete_statement(&d, &lookup, LedgerMode::Ledgered)
+                .unwrap_or_else(|e| panic!("{w}: {e:?}"))
+            {
+                DeleteStatement::Predicate(v) => assert!(v
+                    .where_predicates
+                    .iter()
+                    .any(crate::sql::subquery::predicate_contains_subquery)),
+                other => panic!("unexpected: {other:?}"),
+            }
+            let u =
+                format!("UPDATE documents SET body = 'x' WHERE {w} USING OPERATION_ID 'op-0001'");
+            match validate_update_form(&u, &lookup, LedgerMode::Ledgered)
+                .unwrap_or_else(|e| panic!("{w}: {e:?}"))
+            {
+                ValidatedUpdateForm::Predicate(v) => assert!(v
+                    .where_predicates
+                    .iter()
+                    .any(crate::sql::subquery::predicate_contains_subquery)),
+                other => panic!("unexpected: {other:?}"),
+            }
+            // 非セッションの単一行専用入口は従来どおり 42601。
+            let e = validate_delete(&d, &lookup, LedgerMode::Ledgered).expect_err("single-row");
+            assert_eq!(e.wire_code(), "42601");
+            let e = validate_update(&u, &lookup, LedgerMode::Ledgered).expect_err("single-row");
+            assert_eq!(e.wire_code(), "42601");
+            // PARTITIONED との併用は 42601。
+            let pd =
+                format!("DELETE FROM documents WHERE {w} USING OPERATION_ID 'op-0001' PARTITIONED");
+            let e = validate_delete_statement(&pd, &lookup, LedgerMode::Ledgered)
+                .expect_err("partitioned");
+            assert_eq!(e.wire_code(), "42601");
+            let pu = format!(
+                "UPDATE documents SET body = 'x' WHERE {w} USING OPERATION_ID 'op-0001' PARTITIONED"
+            );
+            let e =
+                validate_update_form(&pu, &lookup, LedgerMode::Ledgered).expect_err("partitioned");
+            assert_eq!(e.wire_code(), "42601");
+        }
+        // RETURNING の投影位置・SET 右辺のサブクエリは受理しない。
+        let e = validate_delete_statement(
+            "DELETE FROM documents WHERE lang = 'ja' RETURNING (SELECT id FROM notes LIMIT 1) USING OPERATION_ID 'op-0001'",
+            &lookup,
+            LedgerMode::Ledgered,
+        )
+        .expect_err("returning subquery");
+        assert_eq!(e.wire_code(), "42601");
+        let e = validate_update_form(
+            "UPDATE documents SET body = (SELECT lang FROM notes LIMIT 1) WHERE lang IN (SELECT lang FROM notes LIMIT 1) USING OPERATION_ID 'op-0001'",
+            &lookup,
+            LedgerMode::Ledgered,
+        )
+        .expect_err("set subquery");
+        assert_eq!(e.wire_code(), "42601");
+    }
+
+    /// SQL-53（Issue #1750）: 起動時設定の入れ子上限（最小 1）でも DML の WHERE の 1 段目は受理する。
+    /// 内側の入れ子段数の検査は束縛段の再検証（`sql::subquery`）が担う。
+    #[test]
+    fn dml_where_subquery_accepts_first_level_under_minimum_nesting_limit() {
+        let lookup = catalog_with(&["documents", "notes"]);
+        let tokens = super::super::relation_name::tokenize_resolved(
+            "DELETE FROM documents WHERE lang IN (SELECT lang FROM notes LIMIT 1) USING OPERATION_ID 'op-0001'",
+            false,
+        )
+        .expect("lex");
+        let limits = crate::nesting_limits::NestingLimits::new(1, 1, 1, 1);
+        validate_delete_statement_tokens_with_limits(
+            &tokens,
+            &lookup,
+            LedgerMode::Ledgered,
+            limits,
+        )
+        .expect("first-level subquery");
     }
 
     #[test]
