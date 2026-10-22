@@ -1812,6 +1812,20 @@ impl ParsedSql {
             other => other,
         }
     }
+
+    /// 振り分けの包みを持つ文について、一時カタログの世代・`search_path` の世代が準備時から
+    /// 変わっていないかを検査する（陳腐化なら `0A000`。包みの無い文は常に `Ok`）。
+    /// `execute_parsed_in_txn` の粗いゲートと同じ検査で、wire-server が包みを外して
+    /// 独自に実行する経路（COPY の委譲。Issue #1760）が、ゲートを迂回しないために呼ぶ。
+    pub fn require_session_current(
+        &self,
+        session: &crate::sql::mode::SessionState,
+    ) -> Result<(), crate::sql::allowlist::SqlSurfaceError> {
+        match self {
+            ParsedSql::SessionRouted(routed) => routed.require_current(session),
+            _ => Ok(()),
+        }
+    }
 }
 
 /// セッション TimeZone を現在の文の束縛区間へ張る（`execute_parsed_in_session` 等の
@@ -5568,7 +5582,17 @@ impl EngineCore {
             }) {
                 return Err(crate::sql::allowlist::SqlSurfaceError::UndefinedParameter { param });
             }
-            let copy_tokens = crate::sql::lexer::demote_quoted_null(tokens.clone());
+            // 簡易クエリの `begin_copy`（印なしの `tokenize`）と同じ字句に揃えるため、引用付きの
+            // `NULL`／`ARRAY`／SQL 値関数予約語（`QuotedNull`）もすべて `Ident` へ戻す
+            // （`demote_quoted_null` は引用付き `ARRAY` を残し、表名・列名 `"array"` が 42601 になる）。
+            let copy_tokens: Vec<crate::sql::lexer::Token> = tokens
+                .iter()
+                .cloned()
+                .map(|t| match t {
+                    crate::sql::lexer::Token::QuotedNull(s) => crate::sql::lexer::Token::Ident(s),
+                    other => other,
+                })
+                .collect();
             let stmt = crate::sql::allowlist::validate_copy_tokens(
                 &copy_tokens,
                 &self.storage,

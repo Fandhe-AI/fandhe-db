@@ -1975,6 +1975,10 @@ fn handle_bind_body(
             let parsed = if session.has_temp_tables()
                 || session.search_path_hides_public()
                 || matches!(parsed, ParsedSql::SessionRouted(_))
+                // COPY は Execute で元 SQL を現在のカタログへ再解決するため、一時表を持たない
+                // セッションでも世代つきの包みを作る（Bind 後に作られた同名の一時表への化けを
+                // Execute 前に `0A000` で拒否する。Issue #1760）。
+                || matches!(parsed, ParsedSql::Copy(_))
             {
                 let _session_tz_scope =
                     engine::datetime::SessionTimeZoneScope::enter(session.time_zone().clone());
@@ -2324,10 +2328,15 @@ fn execute_portal<'e, S: WireStream>(
                 .get_mut(portal_name)
                 .ok_or(HandlerError::UnknownPortal)?;
             portal.state = PortalState::Failed;
-            // 元 SQL の再実行は包み（`SessionRouted`）を外すため、通常の `execute_parsed_in_txn` が
-            // 行う世代検査をここで先に適用する（Bind 後に同名の一時表が作られた portal は陳腐化として
-            // `0A000`。新しい一時表へ COPY を振り分けない）。
-            EngineCore::check_parsed_current(session, &parsed).map_err(HandlerError::Sql)?;
+            // 包みを外した元 SQL は `begin_copy*` が現在のカタログで再解決するため、Bind 後に
+            // 同名の一時表が作られると宛先が化ける。通常経路の粗いゲートと同じ世代検査を先に行い、
+            // 陳腐化した portal は `0A000` で拒否する。
+            if let Err(e) = parsed.require_session_current(session) {
+                // 通常経路（`execute_parsed_in_txn`）と同じく、検査失敗は明示 Tx を中断状態へ倒す
+                // （Sync 後 `E`。後続 COMMIT が以前の書き込みを確定しない）。
+                txn.fail();
+                return Err(HandlerError::Sql(e));
+            }
             return Ok(PortalExecution::Copy { sql });
         }
 

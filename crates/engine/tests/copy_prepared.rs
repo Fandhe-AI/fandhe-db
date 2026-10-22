@@ -119,3 +119,30 @@ fn execute_is_0a000_without_side_effects() {
         .expect_err("stub rejects");
     assert_eq!(err.wire_code(), "0A000");
 }
+
+/// 引用付き `"array"` の表名・列名は簡易クエリ `begin_copy` と拡張クエリ Parse の双方で
+/// 同じく受理される（引用付き ARRAY が `QuotedNull` のまま 42601 にならない回帰）。
+#[test]
+fn quoted_array_identifier_is_accepted_in_both_paths() {
+    let path = unique_db_path("copy-prepared-quoted-array");
+    let _g = CleanupGuard(path.clone());
+    let storage = Storage::open(&path).expect("open storage");
+    storage
+        .create_table(&TableSchema::new(
+            "array",
+            vec![
+                ColumnDef::new("embedding", ColumnType::Vector(2), false),
+                ColumnDef::new("array", ColumnType::Text, false),
+            ],
+        ))
+        .expect("create table");
+    let core = EngineCore::from_storage(storage, Box::new(CpuScalarProvider));
+    let session = SessionState::default();
+    let sql = r#"COPY "array" (id, embedding, "array") FROM STDIN"#;
+    core.begin_copy(&ctx(), &session, sql).expect("simple");
+    let prepared = core.parse_sql_prepared(sql).expect("prepared");
+    assert!(matches!(
+        prepared.parsed_if_unparameterized(),
+        Some(ParsedSql::Copy(_))
+    ));
+}
