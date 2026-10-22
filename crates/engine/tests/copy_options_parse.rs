@@ -132,6 +132,38 @@ fn non_default_options_are_0a000_for_to_until_applied() {
 }
 
 #[test]
+fn unsupported_value_options_without_value_are_42601_and_with_value_0a000() {
+    let (core, _g) = open("copy-opt-unsupported-value");
+    for name in [
+        "FORCE_QUOTE",
+        "FORCE_NOT_NULL",
+        "FORCE_NULL",
+        "DEFAULT",
+        "ON_ERROR",
+        "LOG_VERBOSITY",
+    ] {
+        let value = match name {
+            "FORCE_QUOTE" | "FORCE_NOT_NULL" | "FORCE_NULL" => "(a)",
+            "DEFAULT" => "'x'",
+            "ON_ERROR" => "ignore",
+            _ => "verbose",
+        };
+        for dir in [FROM, TO] {
+            assert_eq!(
+                rejected_code(&core, &format!("{dir} WITH (FORMAT csv, {name})")),
+                "42601",
+                "{dir} {name} (no value)"
+            );
+            assert_eq!(
+                rejected_code(&core, &format!("{dir} WITH (FORMAT csv, {name} {value})")),
+                "0A000",
+                "{dir} {name} (with value)"
+            );
+        }
+    }
+}
+
+#[test]
 fn classification_matches_between_simple_and_parse() {
     let (core, _g) = open("copy-opt-class");
     let cases = [
@@ -170,6 +202,12 @@ fn classification_matches_between_simple_and_parse() {
         rejected_code(&core, &format!("{TO} WITH (HEADER MATCH)")),
         "0A000"
     );
+    accepted_in_both(&core, &format!("{FROM} WITH (ENCODING UTF8)"));
+    accepted_in_both(&core, &format!("{TO} WITH (ENCODING utf8)"));
+    assert_eq!(
+        rejected_code(&core, &format!("{FROM} WITH (ENCODING latin1)")),
+        "0A000"
+    );
     accepted_in_both(&core, &format!("{FROM} WITH (ENCODING 'utf8')"));
     accepted_in_both(&core, &format!("{TO} WITH (ENCODING 'UTF-8')"));
 }
@@ -183,6 +221,10 @@ fn error_messages_do_not_echo_values() {
         format!("{FROM} WITH (HEADER secretval)"),
         format!("{FROM} WITH ('secret')"),
         format!("{FROM} WITH (FORCE_QUOTE ('secret'))"),
+        format!("{FROM} DELIMITER secretval"),
+        format!("{FROM} FORCE secretval"),
+        format!("{FROM} FORCE QUOTE ('secretcol')"),
+        format!("{FROM} FORCE NOT secretval"),
     ] {
         let e = begin(&core, &sql).map(|_| ()).expect_err("rejected");
         assert!(!e.to_string().contains("secret"), "{e}");

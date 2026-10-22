@@ -1646,8 +1646,9 @@ pub enum ParsedSql {
     Cursor(crate::sql::cursor::CursorStatement),
     /// 拡張クエリプロトコルの Parse が検証済みの `COPY` 文（Issue #1759・WIRE-21 (1)・ERR-6 の
     /// ポインタ）。Parse／Bind／Describe だけを受理し、行・台帳・世代には一切触れない。
-    /// Execute は Issue #1760 まで `0A000` で拒否する（[`EngineCore::execute_parsed_in_session`]・
-    /// [`EngineCore::execute_parsed_in_txn`] の本 variant の腕が #1760 の差し替え位置）。
+    /// Execute は wire-server が横取りして CopyIn／CopyOut を実行する（Issue #1760）ため、
+    /// [`EngineCore::execute_parsed_in_session`]・[`EngineCore::execute_parsed_in_txn`] の
+    /// 本 variant の腕は他の呼び出し元に対する防御的な fail-closed（`0A000`）として残す。
     /// 簡易クエリ（`Q`）の `COPY` は本 variant を経由せず `begin_copy*` へ直行する。
     /// [`EngineCore::parse_sql`] は `COPY` を受理しない（拡張クエリの Parse だけが生成する）。
     ///
@@ -1809,6 +1810,20 @@ impl ParsedSql {
         match self {
             ParsedSql::SessionRouted(routed) => routed.inner(),
             other => other,
+        }
+    }
+
+    /// 振り分けの包みを持つ文について、一時カタログの世代・`search_path` の世代が準備時から
+    /// 変わっていないかを検査する（陳腐化なら `0A000`。包みの無い文は常に `Ok`）。
+    /// `execute_parsed_in_txn` の粗いゲートと同じ検査で、wire-server が包みを外して
+    /// 独自に実行する経路（COPY の委譲。Issue #1760）が、ゲートを迂回しないために呼ぶ。
+    pub fn require_session_current(
+        &self,
+        session: &crate::sql::mode::SessionState,
+    ) -> Result<(), crate::sql::allowlist::SqlSurfaceError> {
+        match self {
+            ParsedSql::SessionRouted(routed) => routed.require_current(session),
+            _ => Ok(()),
         }
     }
 }
@@ -4418,18 +4433,22 @@ impl EngineCore {
         if is_delete {
             // SQL-36（Issue #2210）: 構造解析 → WHERE 省略ガード → カタログ検証の順。通常 DML 経路と
             // 同じく、ガードを表の存在確認より前に置き、不存在表と既存表で応答を分けない。
-            let shape =
-                crate::sql::allowlist::parse_delete_statement_shape_tokens(rest, self.ledger_mode)?;
+            let shape = crate::sql::allowlist::parse_delete_statement_shape_tokens_with_limits(
+                rest,
+                self.ledger_mode,
+                self.nesting_limits,
+            )?;
             if let DeleteStatement::Predicate(v) = &shape {
                 crate::sql::allowlist::reject_omitted_where_for_dml(
                     self.require_where_for_dml,
                     v.where_predicates(),
                 )?;
             }
-            let stmt = crate::sql::allowlist::validate_delete_statement_tokens(
+            let stmt = crate::sql::allowlist::validate_delete_statement_tokens_with_limits(
                 rest,
                 lookup,
                 self.ledger_mode,
+                self.nesting_limits,
             )
             .map_err(|e| self.reclassify_write_to_view_error(e))?;
             return match stmt {
@@ -4441,16 +4460,24 @@ impl EngineCore {
             };
         }
         // SQL-36（Issue #2210）: DELETE と同じ順序（構造解析 → WHERE 省略ガード → カタログ検証）。
-        let shape = crate::sql::allowlist::parse_update_form_shape_tokens(rest, self.ledger_mode)?;
+        let shape = crate::sql::allowlist::parse_update_form_shape_tokens_with_limits(
+            rest,
+            self.ledger_mode,
+            self.nesting_limits,
+        )?;
         if let ValidatedUpdateForm::Predicate(v) = &shape {
             crate::sql::allowlist::reject_omitted_where_for_dml(
                 self.require_where_for_dml,
                 v.where_predicates(),
             )?;
         }
-        let stmt =
-            crate::sql::allowlist::validate_update_form_tokens(rest, lookup, self.ledger_mode)
-                .map_err(|e| self.reclassify_write_to_view_error(e))?;
+        let stmt = crate::sql::allowlist::validate_update_form_tokens_with_limits(
+            rest,
+            lookup,
+            self.ledger_mode,
+            self.nesting_limits,
+        )
+        .map_err(|e| self.reclassify_write_to_view_error(e))?;
         match stmt {
             ValidatedUpdateForm::Predicate(v) if v.partitioned().is_some() => {
                 self.check_partitioned_chunk(v.partitioned())?;
@@ -4888,8 +4915,11 @@ impl EngineCore {
             // 構造検証 → 存在確認の順序は `validate_delete_statement_tokens` と同じ。FROM の名前が表で
             // なくビューなら、自動更新可能なものに限りビューへの DELETE として受理する（TABLE-43・
             // Issue #1672。書き換えは Execute 時）。
-            let stmt =
-                crate::sql::allowlist::parse_delete_statement_shape_tokens(&tokens, ledger_mode)?;
+            let stmt = crate::sql::allowlist::parse_delete_statement_shape_tokens_with_limits(
+                &tokens,
+                ledger_mode,
+                self.nesting_limits,
+            )?;
             // SQL-36（Issue #2210）: opt-in 有効時は `WHERE` 省略を表の存在確認より前に拒否する
             // （ビュー・PARTITIONED・一時表の分類 parse も本経路を通る）。
             if let crate::sql::allowlist::DeleteStatement::Predicate(v) = &stmt {
@@ -4946,7 +4976,11 @@ impl EngineCore {
         );
         if is_update_statement {
             // 構造検証 → 存在確認の順序は `validate_update_form_tokens` と同じ（TABLE-43・Issue #1672）。
-            let stmt = crate::sql::allowlist::parse_update_form_shape_tokens(&tokens, ledger_mode)?;
+            let stmt = crate::sql::allowlist::parse_update_form_shape_tokens_with_limits(
+                &tokens,
+                ledger_mode,
+                self.nesting_limits,
+            )?;
             // SQL-36（Issue #2210）: DELETE と同じ位置・同じ理由で `WHERE` 省略を拒否する。
             if let crate::sql::allowlist::ValidatedUpdateForm::Predicate(v) = &stmt {
                 crate::sql::allowlist::reject_omitted_where_for_dml(
@@ -6640,8 +6674,9 @@ impl EngineCore {
                 "transaction control statements are not supported by this entry point",
             )),
             // Issue #1759・WIRE-21 (1): 拡張クエリの `COPY` は Parse／Bind／Describe まで受理し、
-            // Execute は Issue #1760 まで `0A000` で拒否する（fail-closed・副作用なし。行・台帳・
-            // 世代には触れない。#1760 がこの腕を `begin_copy*` への結線へ差し替える）。
+            // Execute は wire-server が先に横取りして `begin_copy*` へ結線する（Issue #1760）ため
+            // 通常は到達しない。他の呼び出し元への防御的な fail-closed（`0A000`・副作用なし。
+            // 行・台帳・世代には触れない）。
             ParsedSql::Copy(_) => Err(
                 crate::sql::allowlist::SqlSurfaceError::feature_not_supported(
                     "COPY via the extended query protocol is not supported yet",
@@ -7128,8 +7163,9 @@ impl EngineCore {
                 txn.mark_written(ctx.tenant_id(), &stmt.table_name);
                 Ok(outcome)
             }
-            // Issue #1759: 拡張クエリの `COPY` は Execute を Issue #1760 まで拒否する（fail-closed・
-            // 副作用なし。呼び出し元がトランザクションを `Failed` へ遷移させる）。
+            // 拡張クエリの `COPY` は wire-server が先に横取りする（Issue #1760）ため通常は到達しない。
+            // 他の呼び出し元への防御的な fail-closed（副作用なし。呼び出し元がトランザクションを
+            // `Failed` へ遷移させる）。
             ParsedSql::Copy(_) => Err(SqlSurfaceError::feature_not_supported(
                 "COPY via the extended query protocol is not supported yet",
             )),

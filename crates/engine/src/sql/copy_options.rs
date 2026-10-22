@@ -173,7 +173,21 @@ const KNOWN_OPTIONS: &[&str] = &[
 ];
 
 /// 値が必須のオプション（値なしは PostgreSQL の "requires a parameter" 相当）。
-const VALUE_REQUIRED: &[&str] = &["format", "delimiter", "null", "quote", "escape", "encoding"];
+const VALUE_REQUIRED: &[&str] = &[
+    "format",
+    "delimiter",
+    "null",
+    "quote",
+    "escape",
+    "encoding",
+    // 対象外（0A000）のオプションも、値なしは先に 42601 とする（値欠落が最優先の契約）。
+    "force_quote",
+    "force_not_null",
+    "force_null",
+    "default",
+    "on_error",
+    "log_verbosity",
+];
 
 /// 本 Issue では解決せず、認識したうえで `0A000` にするオプション。
 const UNSUPPORTED_OPTIONS: &[&str] = &[
@@ -346,16 +360,19 @@ fn single_byte(s: &str) -> Option<u8> {
     }
 }
 
-/// 文字列系オプションの値を取り出す。値が文字列リテラルでなければ `22023`。
+/// 文字列系オプションの値を取り出す。PostgreSQL の `copy_generic_opt_arg` と `defGetString` に
+/// 合わせ、文字列リテラル・引用符なしの識別子・数値を受理する（`*`・列リストは `22023`）。
 fn string_value(opt: Option<&RawCopyOption>) -> Result<Option<&str>, SqlSurfaceError> {
     match opt.and_then(|o| o.value.as_ref()) {
         None => Ok(None),
-        Some(RawCopyValue::String(s)) => Ok(Some(s.as_str())),
+        Some(RawCopyValue::String(s))
+        | Some(RawCopyValue::Ident(s))
+        | Some(RawCopyValue::Number(s)) => Ok(Some(s.as_str())),
         Some(_) => Err(invalid("COPY option value must be a string")),
     }
 }
 
-/// `HEADER` の値（省略は true。`true/false/on/off/1/0/match`。大小を区別しない）。
+/// `HEADER` の値（省略は true。PostgreSQL の真偽値表記と `match`。大小を区別しない）。
 fn parse_header(value: Option<&RawCopyValue>) -> Result<CopyHeader, SqlSurfaceError> {
     let text = match value {
         None => return Ok(CopyHeader::True),
@@ -364,12 +381,36 @@ fn parse_header(value: Option<&RawCopyValue>) -> Result<CopyHeader, SqlSurfaceEr
         | Some(RawCopyValue::Number(s)) => s.to_ascii_lowercase(),
         Some(_) => return Err(invalid("COPY HEADER requires a Boolean value or match")),
     };
-    match text.as_str() {
-        "true" | "on" | "1" => Ok(CopyHeader::True),
-        "false" | "off" | "0" => Ok(CopyHeader::False),
-        "match" => Ok(CopyHeader::Match),
-        _ => Err(invalid("COPY HEADER requires a Boolean value or match")),
+    if text == "match" {
+        return Ok(CopyHeader::Match);
     }
+    match parse_bool(&text) {
+        Some(true) => Ok(CopyHeader::True),
+        Some(false) => Ok(CopyHeader::False),
+        None => Err(invalid("COPY HEADER requires a Boolean value or match")),
+    }
+}
+
+/// PostgreSQL の `parse_bool` と同じ規則の真偽値解釈（入力は小文字化済み）。
+/// `true`・`false`・`yes`・`no` は空でない接頭辞を許し、`on`・`off` は 2 文字以上の接頭辞
+/// （`o` 単独は曖昧なので不正）、`1`・`0` は完全一致のみ。`parse_header` から呼ぶ。
+fn parse_bool(text: &str) -> Option<bool> {
+    let is_prefix = |full: &str| !text.is_empty() && full.starts_with(text);
+    if is_prefix("true") || is_prefix("yes") || text == "1" {
+        return Some(true);
+    }
+    if is_prefix("false") || is_prefix("no") || text == "0" {
+        return Some(false);
+    }
+    if text.len() >= 2 {
+        if "on".starts_with(text) {
+            return Some(true);
+        }
+        if "off".starts_with(text) {
+            return Some(false);
+        }
+    }
+    None
 }
 
 #[cfg(test)]
@@ -454,6 +495,40 @@ mod tests {
             .map(|_| raw("header", None))
             .collect();
         assert_eq!(code(many, CopyDirection::From), "42601");
+    }
+
+    #[test]
+    fn header_accepts_postgres_boolean_spellings() {
+        let h = |v: &str| resolve(vec![raw("header", s(v))], CopyDirection::From);
+        for t in ["t", "tr", "true", "y", "yes", "on", "1", "ON", "Yes"] {
+            assert_eq!(h(t).expect(t).1.header(), CopyHeader::True, "{t}");
+        }
+        for f in ["f", "fa", "false", "n", "no", "of", "off", "0", "OFF"] {
+            assert_eq!(h(f).expect(f).1.header(), CopyHeader::False, "{f}");
+        }
+        assert_eq!(h("match").expect("match").1.header(), CopyHeader::Match);
+        for bad in ["o", "", "x", "truex", "yess", "2", "onn", "secretbool"] {
+            let e = h(bad).expect_err(bad);
+            assert_eq!(e.wire_code(), "22023", "{bad}");
+            assert!(!e.to_string().contains("secretbool"), "{e}");
+        }
+    }
+
+    #[test]
+    fn string_options_accept_identifier_and_number_values() {
+        for v in [id("UTF8"), id("utf8"), s("UTF8")] {
+            ok(vec![raw("encoding", v)]);
+        }
+        let latin = |v| code(vec![raw("encoding", v)], CopyDirection::From);
+        assert_eq!(latin(id("latin1")), "0A000");
+        assert_eq!(latin(Some(RawCopyValue::Star)), "22023");
+        assert_eq!(latin(Some(RawCopyValue::List(vec!["a".into()]))), "22023");
+        let (_, o) = ok(vec![
+            raw("format", id("csv")),
+            raw("delimiter", Some(RawCopyValue::Number("1".into()))),
+            raw("null", id("nil")),
+        ]);
+        assert_eq!((o.delimiter(), o.null_string()), (b'1', "nil"));
     }
 
     #[test]

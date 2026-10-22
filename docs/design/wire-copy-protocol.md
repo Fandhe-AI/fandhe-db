@@ -29,9 +29,9 @@
   ハンドシェイク層のフレーム受信期限が及び、期限超過で接続を閉じてライタを解放する
   （詳細は `docs/design/explicit-transaction.md`「wire-server への結線」）。
 - 対象外（起票済み・別 Issue／別タスクへ申し送り）:
-  - 拡張クエリプロトコル（TASK-216）経由の COPY の Execute（CopyIn／CopyOut の開始。
-    Issue #1760）と、CopyFail 等の後の Sync までの同期回復（Issue #1761）。Parse／Bind／
-    Describe までは Issue #1759 で受理済み（下の「拡張クエリの Parse／Bind／Describe」節）。
+  - 拡張クエリプロトコル（TASK-216）経由の COPY の、CopyFail 等の後の Sync までの
+    同期回復の詳細（Issue #1761）。Parse／Bind／Describe は Issue #1759、Execute は
+    Issue #1760 で対応済み（下の 2 節）。
   - COPY オプションの TO 側の適用（Issue #1765。構文の解析は Issue #1763、FROM 側の
     `HEADER`／`DELIMITER`／`NULL`／`QUOTE`／`ESCAPE` の適用は Issue #1764 で実装済み。
     下の「許可リスト」「FROM STDIN の逐次取り込み」節）、binary 形式（WIRE-14 関連）、
@@ -282,8 +282,64 @@
   接続を維持する。
 - 一時表: 一時表を参照する COPY の Parse は `0A000`（fail-closed。一時表の経路〔`is_routable`〕が
   COPY を含まないため）。対応は Issue #1760 以降で判断する。
-- Execute（#1760 への引き継ぎ契約）: `execute_parsed_in_session`／`execute_in_active_txn` の
+- Execute（#1760 で対応済み。次節参照。以下は #1759 時点の引き継ぎ契約の記録）: `execute_parsed_in_session`／`execute_in_active_txn` の
   `ParsedSql::Copy` の腕は `0A000` の fail-closed スタブ（行・台帳・世代に触れない。明示
   トランザクション中は Failed へ遷移）。#1760 は `ValidatedCopy::sql()` を `begin_copy`／
   `begin_copy_in_txn` へ渡す形でこの腕を置き換える。wire-server の `is_write_statement`
   判定（`extended_query.rs`）は `_` の腕で Copy を書き込み扱いにする点も #1760 で見直す。
+
+## 拡張クエリの Execute（Issue #1760。親 #1758・WIRE-21 (2) ポインタ）
+
+- 分岐位置: CopyIn／CopyOut は stream を要するため engine では実行できない。wire-server の
+  `extended_query::execute_portal` が `ParsedSql::Copy` の portal を `execute_parsed_in_txn` へ渡さず
+  横取りし、`handle_execute` が `simple_query::run_copy_statement`（`Finish::Continue`）経由で
+  `copy.rs` へ委譲する。簡易クエリと同じ gating（暗黙 Tx の `0A000`・`Failed` の `25P02`）と
+  完了タグ・Tx 遷移を共有し、第 2 の COPY 実行器を作らない。engine の `ParsedSql::Copy` の
+  `0A000` 腕は他の呼び出し元向けの防御的な fail-closed として残す。
+- ReadyForQuery: Sync が送るため `copy.rs` は `CommandComplete` か ErrorResponse だけを書く。
+  copy-in 中の Flush／Sync は既存どおり無視される（libpq 型の一括送信でも RFQ は完了後に 1 回）。
+- portal 状態: 実行を試みる時点で `Failed` へ倒し、成功時のみ `Done { tag }` へ上書きする。
+  再 Execute は既存の `Done` 契約どおりタグだけを再送する。失敗時は `copy.rs` が ErrorResponse を
+  書き済みのため二重送出せず、`ignore_till_sync` だけを立てて Sync で回復する（`CopyStep::Failed`）。
+  Terminate／早期 EOF は接続終了。
+- TOCTOU: Parse 時の検証結果は信用せず、元 SQL を `begin_copy*` へ渡して実行時点で再検証する
+  （Parse 後に表が DROP されていれば CopyInResponse の前に `42P01`）。
+- `COPY (...) TO STDOUT` も同じ経路で処理する。`max_rows` は COPY には無関係で無視する。
+- `is_write_statement`: COPY は計算より前に横取りされるため到達しない（明示の腕で明記）。
+- 層 A: `crates/wire-server/tests/wire21_copy_execute.rs`（簡易クエリとのバイト同一性・
+  テナント境界・libpq 型順序を含む）。実クライアント（psycopg の pipeline 等）での層 B 確認は
+  未実施（親 #1758 で扱う）。#1761 への申し送り: エラー後の Flush／Sync 規則の詳細、
+  ignore_till_sync 中に届いた CopyData／CopyDone／CopyFail の扱い。
+
+## 拡張クエリの Sync 同期回復（Issue #1761。親 #1758・WIRE-21 (3) ポインタ）
+
+COPY の Execute が失敗した後は、ErrorResponse を返して `ignore_till_sync` に入り、Sync で
+ReadyForQuery を返して接続を継続する。層 A: `crates/wire-server/tests/wire21_copy_sync_recovery.rs`。
+
+### 接続継続可否
+
+| 事象 | 応答 | 接続 | RFQ 状態 |
+| ---- | ---- | ---- | -------- |
+| CopyFail・行デコード失敗・INDEX-4 上限超過・commit 時の制約違反 | ErrorResponse | 継続（Sync まで読み捨て） | 暗黙 `I`／明示 `E` |
+| Execute 時の再検証失敗・gating（`25P02` 等） | ErrorResponse（CopyInResponse 前） | 継続 | 同上 |
+| フレーム TooLarge／Malformed | ErrorResponse | 切断 | - |
+| 不正形 CopyFail・同期回復中の本文付き CopyDone | `08P01` | 切断 | - |
+| 読み捨て予算超過 | `08P01` | 切断 | - |
+| copy-in 中の非 COPY メッセージ（WIRE-21 (2)） | `08P01` | 切断 | - |
+| Terminate／EOF | なし | 切断 | - |
+
+### 規則
+
+- Flush／Sync: copy-in 中（CopyDone／CopyFail 受信前）は既存どおり無視する。失敗後の Flush は
+  何も返さず、Sync が ReadyForQuery を返す。ErrorResponse は Sync を待たず flush 済みで届く。
+- 同期回復中の CopyData／CopyDone／CopyFail は、失敗の発生源を問わず応答なしで読み捨てる。
+  本文はアロケートせず、`limits::COPY_DISCARD_MAX_BYTES`／`COPY_DISCARD_MAX_MESSAGES` の
+  予算（`ExtendedQueryState` が保持し Sync で 0 へ戻す）で有界化する。
+- 同期回復の外での CopyData／CopyDone／CopyFail は WIRE-8 の `0A000` + 切断のまま。
+- 明示トランザクション中の失敗は `Failed`（後続は `25P02`）。暗黙トランザクションでは commit しない。
+
+### 判断と対象外
+
+- ErrorResponse は CopyDone／CopyFail 受信後にまとめて送る方式（簡易クエリ COPY と共有経路・
+  WIRE-21 (5) のバイト同一性）を維持する。PostgreSQL 本家同等の即時送出は別課題。
+- 実クライアント（psycopg 等）での層 B 確認は親 #1758 で扱う。

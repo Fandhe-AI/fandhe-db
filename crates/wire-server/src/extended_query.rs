@@ -19,8 +19,10 @@
 //! [`respond_error_and_await_sync`] が ErrorResponse を送出したうえで
 //! [`ExtendedQueryState::ignore_till_sync`] を立て、接続は維持したまま
 //! `handshake::post_auth_loop` が次に届く Sync（'S'）まで後続メッセージを
-//! 読み捨てる（'X' は通常どおり終了、COPY・FunctionCall・未知の型バイトは
-//! 破棄対象にせず fail-closed に切断する。詳細は `post_auth_loop` 参照）。
+//! 読み捨てる（'X' は通常どおり終了、FunctionCall・未知の型バイトは破棄対象に
+//! せず fail-closed に切断する。COPY 失敗後に届く CopyData／CopyDone／CopyFail は
+//! 有界予算つきで読み捨てて接続を継続する〔Issue #1761・WIRE-21 (3) ポインタ〕。
+//! 詳細は `post_auth_loop` 参照）。
 //! Sync 到達時にフラグを解除し、`ReadyForQuery` を返して同期を回復する。
 //! portal は、`Idle`／`Failed` ではすべて破棄し、明示トランザクション
 //! 〔`BEGIN`/`COMMIT`/`ROLLBACK`。SQL-31・TASK-221〕中（`InTransaction`）は
@@ -95,8 +97,9 @@
 //!   → `0A000`（`FeatureNotSupported`）
 //! - 結果 format code の個数不正・値不正（0/1 以外） → `08P01`
 //!   （`ProtocolViolation`。[`result_encoder::BinaryFormatError`]）
-//! - `COPY` 文の Parse／Bind／Describe は受理し、Execute は Issue #1760 まで `0A000`
-//!   （Issue #1759・WIRE-21 (1)）。`COPY` に `$n` を置くと Parse が `42P02`
+//! - `COPY` 文の Parse／Bind／Describe は受理する（Issue #1759・WIRE-21 (1)）。Execute は
+//!   [`handle_execute`] が横取りして `copy.rs` の CopyIn／CopyOut へ委譲する
+//!   （Issue #1760・WIRE-21 (2)）。`COPY` に `$n` を置くと Parse が `42P02`
 //!   （`UndefinedParameter`）で拒否する
 //! - 件数・名前長・保持バイト上限超過 →
 //!   `54000`（`PayloadTooLarge`。[`crate::limits`] の各定数）
@@ -1066,6 +1069,10 @@ pub(crate) struct ExtendedQueryState {
     /// `handshake::post_auth_loop` は Sync（'S'）・Terminate（'X'）以外の
     /// メッセージを読み捨てる。
     pub(crate) ignore_till_sync: bool,
+    /// 同期回復中に読み捨てた COPY 系メッセージ（'d'/'c'/'f'）のバイト数・件数
+    /// （Issue #1761）。`handshake::post_auth_loop` が加算し、Sync で 0 へ戻す。
+    pub(crate) ignored_copy_bytes: usize,
+    pub(crate) ignored_copy_messages: usize,
 }
 
 impl ExtendedQueryState {
@@ -1082,6 +1089,8 @@ impl ExtendedQueryState {
             statements: PreparedStatementStore::with_max_named(limits.max_prepared_statements),
             portals: PortalStore::new(),
             ignore_till_sync: false,
+            ignored_copy_bytes: 0,
+            ignored_copy_messages: 0,
         }
     }
 
@@ -1383,11 +1392,12 @@ fn respond_error_and_close<S: WireStream>(stream: &mut S, err: &HandlerError) ->
 /// 立てる（モジュールドキュメント「エラー後の同期回復」節）。接続は維持する。
 ///
 /// 拡張クエリプロトコルのエラー応答（Parse・Bind・Describe・Execute・Close 等）は
-/// すべて本関数を通る。`handshake::post_auth_loop` は各メッセージの処理後（と次の
+/// 本関数を通る（COPY の失敗だけは `copy.rs` が ErrorResponse を書き済みのため
+/// `run_copy_portal` が旗だけを立てる。Issue #1761）。`handshake::post_auth_loop` は各メッセージの処理後（と次の
 /// メッセージの受信直後）に `ignore_till_sync` を見て、明示トランザクションが
 /// `Active` なら `Failed` へ遷移させる（SQL-31・TASK-221。PR #1041 レビュー指摘）。
 /// 各ハンドラは `SessionTransaction` を受け取らないため、この旗が唯一の受け渡し
-/// 経路になる。エラー応答を本関数以外の方法で返す経路を追加してはならない
+/// 経路になる。エラー応答を本関数・`run_copy_portal` 以外の方法で返す経路を追加してはならない
 /// （切断する経路は `respond_error_and_close`。切断で `SessionTransaction` が
 /// drop され、書き込みトランザクションは abort される）。
 fn respond_error_and_await_sync<S: WireStream>(
@@ -1965,6 +1975,10 @@ fn handle_bind_body(
             let parsed = if session.has_temp_tables()
                 || session.search_path_hides_public()
                 || matches!(parsed, ParsedSql::SessionRouted(_))
+                // COPY は Execute で元 SQL を現在のカタログへ再解決するため、一時表を持たない
+                // セッションでも世代つきの包みを作る（Bind 後に作られた同名の一時表への化けを
+                // Execute 前に `0A000` で拒否する。Issue #1760）。
+                || matches!(parsed, ParsedSql::Copy(_))
             {
                 let _session_tz_scope =
                     engine::datetime::SessionTimeZoneScope::enter(session.time_zone().clone());
@@ -2082,11 +2096,82 @@ pub(crate) fn handle_execute<'e, S: WireStream>(
         &msg.portal_name,
         msg.max_rows,
     ) {
-        Ok(()) => Ok(LoopSignal::Continue),
+        Ok(PortalExecution::Responded) => Ok(LoopSignal::Continue),
+        Ok(PortalExecution::Copy { sql }) => run_copy_portal(
+            stream,
+            engine,
+            ctx,
+            session,
+            txn,
+            state,
+            &msg.portal_name,
+            &sql,
+        ),
         Err(err) => {
             respond_error_and_await_sync(stream, &err, state)?;
             Ok(LoopSignal::Continue)
         }
+    }
+}
+
+/// [`execute_portal`] の結果。応答を書き終えたか、COPY サブプロトコルの実行を
+/// 呼び出し元へ求めるか（Issue #1760）を区別する。
+enum PortalExecution {
+    /// 応答（CommandComplete・DataRow 等）を書き終えた。
+    Responded,
+    /// COPY の portal。`copy.rs` の CopyIn／CopyOut は `io::Result` で I/O 失敗を扱い、
+    /// 自前で ErrorResponse を書くため、`HandlerError` 経路（二重応答になる）に乗せず
+    /// [`handle_execute`] が [`run_copy_portal`] で実行する。portal は `Failed` 済み。
+    Copy { sql: String },
+}
+
+/// COPY の portal を簡易クエリと同じ入口（`simple_query::run_copy_statement`・
+/// `Finish::Continue`）で実行し、結果を portal 状態と接続ループへの合図へ写像する
+/// （Issue #1760・WIRE-21 (2)）。`ReadyForQuery` は Sync が送るため `copy.rs` は書かない。
+/// Execute の `max_rows` は COPY には無関係で無視する。
+///
+/// Parse 時の検証結果は信用せず、元 SQL を `begin_copy*` へ渡して現時点のカタログ・
+/// セッション・`ctx` で再検証する（TOCTOU 対策。表が DROP 済みなら CopyInResponse 前に拒否）。
+#[allow(clippy::too_many_arguments)]
+fn run_copy_portal<'e, S: WireStream>(
+    stream: &mut S,
+    engine: &'e EngineCore,
+    ctx: &engine::policy::PolicyContext,
+    session: &mut SessionState,
+    txn: &mut engine::sql::transaction::SessionTransaction<'e>,
+    state: &mut ExtendedQueryState,
+    portal_name: &str,
+    sql: &str,
+) -> io::Result<LoopSignal> {
+    let step = crate::simple_query::run_copy_statement(
+        stream,
+        engine,
+        ctx,
+        session,
+        txn,
+        sql,
+        crate::simple_query::Finish::Continue,
+    )?;
+    match step {
+        crate::copy::CopyStep::Completed { tag } => {
+            if let Some(portal) = state.portals.get_mut(portal_name) {
+                portal.state = PortalState::Done { tag };
+            }
+            // CommandComplete を Sync 待ちにせず届ける（バッファ付き・TLS の WireStream で、
+            // 完了応答を待ってから Sync を送るクライアントのハングを防ぐ）。
+            stream.flush()?;
+            Ok(LoopSignal::Continue)
+        }
+        crate::copy::CopyStep::Failed => {
+            // ErrorResponse は `copy.rs` が書き済み。`respond_error_and_await_sync` の
+            // 例外経路として、旗だけを立てて Sync で回復する（二重送出しない）。
+            engine::log_stderr!("wire-server: extended query COPY failed, awaiting Sync");
+            // Sync を待たずに ErrorResponse をクライアントへ届ける（Issue #1761）。
+            stream.flush()?;
+            state.ignore_till_sync = true;
+            Ok(LoopSignal::Continue)
+        }
+        crate::copy::CopyStep::Closed => Ok(LoopSignal::Closed),
     }
 }
 
@@ -2134,7 +2219,7 @@ fn execute_portal<'e, S: WireStream>(
     state: &mut ExtendedQueryState,
     portal_name: &str,
     max_rows: i32,
-) -> Result<(), HandlerError> {
+) -> Result<PortalExecution, HandlerError> {
     // 明示トランザクションが `Failed`（エラーによる abort・持続時間上限による
     // 解放後）の間は、`ROLLBACK`（未実行の `Ready`）と空文字列の portal 以外への
     // Execute を、portal の存在確認や実行状態に依らず最初に `25P02`（期限切れの
@@ -2169,7 +2254,7 @@ fn execute_portal<'e, S: WireStream>(
             .write_all(&result_encoder::encode_empty_query_response())
             .map_err(io_to_handler)?;
         stream.flush().map_err(io_to_handler)?;
-        return Ok(());
+        return Ok(PortalExecution::Responded);
     }
 
     let needs_execution = matches!(
@@ -2231,6 +2316,30 @@ fn execute_portal<'e, S: WireStream>(
         // 判定していたが、当時は明示トランザクションが無かったため
         // `Insert`/`Truncate`/`Delete`/`Update` は常に単独 commit で成立し
         // 問題にならなかった）。
+        // COPY の portal は CopyIn／CopyOut サブプロトコルが要る（stream を持たない engine では
+        // 実行できない）ため、`execute_parsed_in_txn` へ渡さず呼び出し元へ委譲する
+        // （Issue #1760）。先頭の `25P02` 検査・未登録／Empty／Done の処理は通過済みで、
+        // gating（暗黙 Tx の `0A000`・`Failed` の `25P02`）は `run_copy_statement` が担う。
+        // 実行を試みる portal は終端 `Failed` へ倒し、成功時のみ呼び出し元が `Done` へ上書きする。
+        if let ParsedSql::Copy(v) = parsed.peel_session_route() {
+            let sql = v.sql().to_owned();
+            let portal = state
+                .portals
+                .get_mut(portal_name)
+                .ok_or(HandlerError::UnknownPortal)?;
+            portal.state = PortalState::Failed;
+            // 包みを外した元 SQL は `begin_copy*` が現在のカタログで再解決するため、Bind 後に
+            // 同名の一時表が作られると宛先が化ける。通常経路の粗いゲートと同じ世代検査を先に行い、
+            // 陳腐化した portal は `0A000` で拒否する。
+            if let Err(e) = parsed.require_session_current(session) {
+                // 通常経路（`execute_parsed_in_txn`）と同じく、検査失敗は明示 Tx を中断状態へ倒す
+                // （Sync 後 `E`。後続 COMMIT が以前の書き込みを確定しない）。
+                txn.fail();
+                return Err(HandlerError::Sql(e));
+            }
+            return Ok(PortalExecution::Copy { sql });
+        }
+
         let was_active_before_execution = txn.is_active();
         // 一時カタログに対する振り分けの包みは外した文の種類で判定する（TABLE-44・Issue #1684。
         // 実行は包んだ形のまま `execute_parsed_in_txn` に渡す）。
@@ -2248,6 +2357,8 @@ fn execute_portal<'e, S: WireStream>(
                 | engine::sql::partitioned::PartitionedControl::ExplainDelete(_)
                 | engine::sql::partitioned::PartitionedControl::ExplainUpdate(_),
             ) => false,
+            // `COPY` は上で横取り済みでここへは到達しない（書き込み扱いの見直し申し送りへの回答）。
+            ParsedSql::Copy(_) => !was_active_before_execution,
             _ => !was_active_before_execution,
         };
 
@@ -2475,7 +2586,7 @@ fn execute_portal<'e, S: WireStream>(
         if response.is_err() && is_cursor_fetch {
             txn.fail();
         }
-        return response;
+        return response.map(|()| PortalExecution::Responded);
     }
 
     let portal = state
@@ -2490,7 +2601,7 @@ fn execute_portal<'e, S: WireStream>(
     // 返していた。`Done` の扱いを `FETCH` 以外の portal と揃える）。
     if let PortalState::Done { tag } = &portal.state {
         let tag = tag.clone();
-        return write_command_complete(stream, &tag);
+        return write_command_complete(stream, &tag).map(|()| PortalExecution::Responded);
     }
 
     // カーソル `FETCH` 由来 portal の中断保持分（`PortalState::Suspended`）を
@@ -2620,7 +2731,7 @@ fn execute_portal<'e, S: WireStream>(
     if let Some(tag) = finished_tag {
         portal.state = PortalState::Done { tag };
     }
-    Ok(())
+    Ok(PortalExecution::Responded)
 }
 
 // ---------------------------------------------------------------------------
@@ -2659,6 +2770,8 @@ pub(crate) fn handle_sync<S: WireStream>(
     };
 
     state.ignore_till_sync = false;
+    state.ignored_copy_bytes = 0;
+    state.ignored_copy_messages = 0;
     // WIRE-11・SQL-31・TASK-221・Issue #1174: 明示トランザクション中
     // （`InTransaction` かつ世代確定）は、同世代で Bind した名前付き portal のみ
     // Sync を越えて保持する。それ以外（`Idle`／`Failed`・世代不明）は従来どおり
