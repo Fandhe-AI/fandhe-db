@@ -9,7 +9,9 @@
 //! 呼び出し文脈（拡張クエリ）: `extended_query::handle_execute` が COPY の portal を
 //! `simple_query::run_copy_statement`（`Finish::Continue`）経由で本モジュールへ委譲する
 //! （Issue #1760・WIRE-21 (2)）。拡張クエリでは `ReadyForQuery` を Sync が送るため、
-//! 本モジュールは `CommandComplete` または ErrorResponse だけを書く。
+//! 本モジュールは `CommandComplete` または ErrorResponse だけを書く。失敗後の
+//! 回復（Sync まで後続メッセージを読み捨てて ReadyForQuery を返す）は
+//! `extended_query`／`handshake::post_auth_loop` の同期回復が担う（Issue #1761）。
 //!
 //! 呼び出し文脈（簡易クエリ）: `simple_query::run_copy_statement` が、分割済みの 1 文へ
 //! `engine::sql::copy::is_copy_statement` を適用して真なら（セッションが `Idle` の
@@ -105,7 +107,7 @@ fn respond_frame_error_and_terminate<S: WireStream>(stream: &mut S, e: FrameErro
 /// 非現実的に大きく実効的な上限として機能しない。件数上限
 /// [`crate::limits::COPY_DISCARD_MAX_MESSAGES`] をバイト予算とは別に設けることで、
 /// フレームサイズに関わらず読み捨て件数そのものを有界化する）。
-fn enforce_discard_budget<S: WireStream>(
+pub(crate) fn enforce_discard_budget<S: WireStream>(
     stream: &mut S,
     discarded_bytes: usize,
     discarded_messages: usize,

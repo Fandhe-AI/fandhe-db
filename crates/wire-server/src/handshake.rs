@@ -616,14 +616,52 @@ fn post_auth_loop<'e, S: WireStream>(
         // 正規の Terminate として受理されてしまい、フレーミング検証契約が
         // ignore_till_sync モードでだけ回避可能になる）。長さ検証自体が失敗
         // した場合は通常の `X` 分岐と同じく `?` で fail-closed に伝播する。
-        // COPY・FunctionCall・未知の型バイトは破棄対象にせず fail-closed に
-        // `reject_and_close`（既存の WIRE-8 契約のまま）。それ以外
-        // （'Q'/'P'/'D'/'B'/'E'/'C'/'H'）は長さフィールドのみ検証して本文を
-        // 読み捨て、応答を一切送らない。
+        // Issue #1761（WIRE-21 (3) ポインタ）: COPY 失敗後にクライアントが送り続ける
+        // CopyData（'d'）・CopyDone（'c'）・CopyFail（'f'）は応答なしで読み捨てて
+        // 接続を継続する（失敗の発生源が COPY か否かを問わず同期回復中は一律）。
+        // 本文はアロケートせず `discard_body` で捨て、バイト・件数の二重予算
+        // （`copy::enforce_discard_budget`）で有界化する。超過は `08P01` + 切断。
+        // 同期回復の外での 'd'/'c'/'f' は WIRE-8 の `0A000` + 切断のまま。
+        // FunctionCall・未知の型バイトは fail-closed に `reject_and_close`
+        // （既存の WIRE-8 契約のまま）。それ以外（'Q'/'P'/'D'/'B'/'E'/'C'/'H'）は
+        // 長さフィールドのみ検証して本文を読み捨て、応答を一切送らない。
         if extended.ignore_till_sync && type_byte != b'S' {
             if type_byte == b'X' {
                 let _body = framing::read_length_prefixed_body(stream, 4, 4)?;
                 return Ok(());
+            }
+            if matches!(type_byte, b'c' | b'd' | b'f') {
+                let body_len = if type_byte == b'c' {
+                    // CopyDone は固定形状（length=4・本文なし）。逸脱は fail-closed。
+                    framing::read_length_prefixed_body(stream, 4, 4)?;
+                    0
+                } else {
+                    let total_len = framing::validate_typed_message_length_prefix(
+                        stream,
+                        framing::MIN_TYPED_MESSAGE_LEN,
+                        framing::MAX_MESSAGE_LEN,
+                    )?;
+                    let body_len = total_len
+                        .checked_sub(4)
+                        .ok_or(FrameError::Malformed("message length below header size"))?;
+                    framing::discard_body(stream, body_len)?;
+                    body_len
+                };
+                extended.ignored_copy_bytes = extended
+                    .ignored_copy_bytes
+                    .saturating_add(body_len)
+                    .saturating_add(crate::limits::COPY_DISCARD_FRAME_OVERHEAD_BYTES);
+                extended.ignored_copy_messages = extended.ignored_copy_messages.saturating_add(1);
+                if crate::copy::enforce_discard_budget(
+                    stream,
+                    extended.ignored_copy_bytes,
+                    extended.ignored_copy_messages,
+                )
+                .is_err()
+                {
+                    return Ok(());
+                }
+                continue;
             }
             let kind = crate::protocol_dispatch::classify(type_byte);
             match kind {
