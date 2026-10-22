@@ -191,6 +191,7 @@ mod temp_rows_tests;
 #[cfg(test)]
 mod truncate_restart_identity_tests;
 pub(crate) mod upsert_add;
+pub(crate) mod upsert_expr;
 pub(crate) mod upsert_where;
 #[cfg(test)]
 mod write_time_ledger_tests;

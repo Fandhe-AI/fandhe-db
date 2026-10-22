@@ -3523,6 +3523,13 @@ pub enum UpsertValue {
         column: String,
         operand: UpsertAddOperand,
     },
+    /// 上のどの形にも当てはまらない一般の値式（算術・組み込み関数・`CASE`／`COALESCE` 等。
+    /// SQL-49、Issue #1739。土台は `UPDATE ... SET` の式 SQL-45 と同じ [`Expr`]）。
+    /// 式中の列参照は構文段で解決する: 修飾なし／`<INSERT 対象表名>.<列>` は既存行の列
+    /// （`Expr::Ident(<列>)`）、`EXCLUDED.<列>` は予約接頭辞
+    /// （[`crate::sql::upsert_expr::EXCLUDED_PREFIX`]）付きの `Expr::Ident` に置き換える。
+    /// 型検査・範囲検査は `sql::upsert_expr` が担う。
+    Expr(Expr),
 }
 
 /// [`UpsertValue::Add`] の右オペランド（Issue #2425）。
@@ -4789,6 +4796,9 @@ struct Parser<'a> {
     /// SELECT リストで既に確定した項目が占める集計項目枠数（[`AggregateSelectItem::slot_count`]
     /// の合計）。式中の集計呼び出しを溜める前に [`MAX_AGGREGATE_ITEMS`] を検査するための基点。
     agg_slots_used: usize,
+    /// `ON CONFLICT ... DO UPDATE SET` の右辺を解析している間だけ `Some(<INSERT 対象表名>)`
+    /// （SQL-49、Issue #1739）。式中の修飾列参照 `t.col`／`EXCLUDED.col` の解決に使う。
+    upsert_table: Option<String>,
 }
 
 /// WHERE の式述語 1 葉の解析結果（[`Parser::parse_expression_predicate`]）。`<>` は式の AST に
@@ -4850,6 +4860,7 @@ impl<'a> Parser<'a> {
             allow_aggregate_expr_items: false,
             agg_calls: None,
             agg_slots_used: 0,
+            upsert_table: None,
             legacy_implicit_id: false,
         }
     }
@@ -7841,7 +7852,20 @@ impl<'a> Parser<'a> {
                     }
                 }
             }
+            // `ON CONFLICT ... DO UPDATE SET` の右辺だけで有効な修飾列参照（SQL-49、Issue #1739）。
+            Some(Token::QualifiedIdent { qualifier, name }) if self.upsert_table.is_some() => {
+                self.advance();
+                self.consume_expr_node()?;
+                self.resolve_upsert_qualified_column(&qualifier, name)
+            }
             Some(Token::Ident(name)) => {
+                // 予約接頭辞で始まる識別子（引用識別子での偽装）は `EXCLUDED.<列>` の解決結果と
+                // 区別できないため拒否する（fail-closed。SQL-49、Issue #1739）。
+                if self.upsert_table.is_some() && name.starts_with('\u{0}') {
+                    return Err(SqlSurfaceError::unsupported(
+                        "reserved identifier prefix in ON CONFLICT SET expression",
+                    ));
+                }
                 self.advance();
                 if matches!(self.peek(), Some(Token::Punct('('))) {
                     self.parse_call_expr(name, depth)
@@ -7854,6 +7878,32 @@ impl<'a> Parser<'a> {
                 "unsupported expression term near {other:?}"
             ))),
         }
+    }
+
+    /// `DO UPDATE SET` 右辺の修飾列参照を式の列参照へ解決する（SQL-49、Issue #1739）。
+    /// `EXCLUDED.<列>`（修飾子は大小無視）は予約接頭辞付きの識別子、`<INSERT 対象表名>.<列>`
+    /// （表名は識別子の規約どおり大小を区別）は修飾なしの既存行の列にする。それ以外の修飾子は
+    /// `42P01`（カタログは照会せず、存在オラクルにしない）。
+    fn resolve_upsert_qualified_column(
+        &self,
+        qualifier: &str,
+        name: String,
+    ) -> Result<Expr, SqlSurfaceError> {
+        if name.starts_with('\u{0}') {
+            return Err(SqlSurfaceError::unsupported(
+                "reserved identifier prefix in ON CONFLICT SET expression",
+            ));
+        }
+        if qualifier.eq_ignore_ascii_case("EXCLUDED") {
+            return Ok(Expr::Ident(format!(
+                "{}{name}",
+                crate::sql::upsert_expr::EXCLUDED_PREFIX
+            )));
+        }
+        if self.upsert_table.as_deref() == Some(qualifier) {
+            return Ok(Expr::Ident(name));
+        }
+        Err(SqlSurfaceError::undefined_table(qualifier))
     }
 
     /// [`Self::case_nesting`] を 1 段進め、[`MAX_CASE_NESTING`] を超えないか検査
@@ -9670,16 +9720,12 @@ impl<'a> Parser<'a> {
         } else {
             self.expect_contextual_keyword("UPDATE")?;
             self.expect_contextual_keyword("SET")?;
-            let mut assignments = vec![self.parse_upsert_assignment()?];
-            while matches!(self.peek(), Some(Token::Punct(','))) {
-                self.advance();
-                if assignments.len() >= MAX_UPDATE_SET_ASSIGNMENTS {
-                    return Err(SqlSurfaceError::unsupported(
-                        "too many ON CONFLICT DO UPDATE SET assignments",
-                    ));
-                }
-                assignments.push(self.parse_upsert_assignment()?);
-            }
+            // 右辺式の修飾列参照を解決するため、SET 節の解析中だけ対象表名を持つ（SQL-49、
+            // Issue #1739）。エラー時も `?` の前に必ず外す。
+            self.upsert_table = Some(table_name.to_string());
+            let parsed = self.parse_upsert_assignment_list();
+            self.upsert_table = None;
+            let assignments = parsed?;
             let condition = if matches!(self.peek(), Some(Token::Keyword(Keyword::Where))) {
                 self.advance(); // WHERE
                 self.parse_upsert_where_condition(table_name)?
@@ -9781,23 +9827,66 @@ impl<'a> Parser<'a> {
         Ok(condition)
     }
 
-    /// `ON CONFLICT ... DO UPDATE SET` の 1 要素（`<col> = (EXCLUDED.<col> |
-    /// <lit>)`）を構造パースする（SQL-20・TASK-193、Issue #872。
-    /// `Parser::parse_update_assignment` と同じ形だが、右辺に
-    /// [`Token::QualifiedIdent`]（`EXCLUDED.<col>`）も受理する点が異なる）。
-    fn parse_upsert_assignment(&mut self) -> Result<(String, UpsertValue), SqlSurfaceError> {
-        let column = self.expect_ident()?;
-        self.expect_punct('=')?;
-        // 加算形 `<ident> + ...`（Issue #2425）。引用なしの `true`／`false`／`NULL` は
-        // 従来のリテラル経路へ流す。先読みは `get` のみ（添字を使わない）。
-        let is_add = match self.peek() {
+    /// `DO UPDATE SET` の代入リスト（`,` 区切り。個数上限は [`MAX_UPDATE_SET_ASSIGNMENTS`]）。
+    fn parse_upsert_assignment_list(
+        &mut self,
+    ) -> Result<Vec<(String, UpsertValue)>, SqlSurfaceError> {
+        let mut assignments = vec![self.parse_upsert_assignment()?];
+        while matches!(self.peek(), Some(Token::Punct(','))) {
+            self.advance();
+            if assignments.len() >= MAX_UPDATE_SET_ASSIGNMENTS {
+                return Err(SqlSurfaceError::unsupported(
+                    "too many ON CONFLICT DO UPDATE SET assignments",
+                ));
+            }
+            assignments.push(self.parse_upsert_assignment()?);
+        }
+        Ok(assignments)
+    }
+
+    /// `idx` 位置のトークンが `DO UPDATE SET` の 1 代入の終端か（文末・`,`・`;`・`WHERE`・
+    /// `RETURNING`・`USING`）。加算形・`EXCLUDED.<列>` 単独形の「右辺がそこで終わる」判定に使う。
+    fn at_upsert_value_end(&self, idx: usize) -> bool {
+        match self.tokens.get(idx) {
+            None | Some(Token::Punct(',' | ';')) | Some(Token::Keyword(Keyword::Where)) => true,
             Some(Token::Ident(s)) => {
-                // 引用付き `"null"` は列名なので加算の左オペランドとして受理する
-                // （引用なしの NULL 定数だけをリテラル経路へ流す）。
+                !self.quoted_null.contains(&idx)
+                    && (s.eq_ignore_ascii_case("RETURNING") || s.eq_ignore_ascii_case("USING"))
+            }
+            _ => false,
+        }
+    }
+
+    /// 加算形 `<col> = <同じ列> + (<数値リテラル> | EXCLUDED.<列>)` が右辺全体と一致する場合だけ
+    /// 消費して返す（SQL-49、Issue #2425）。一致しなければ位置を戻して `None`（一般の式へ回す）。
+    ///
+    /// 数値以外のリテラルが右辺全体のオペランドになる形（`n + NULL`・`n + 'x'`・`n + true`）は
+    /// Issue #2425・#2427 の契約どおり `42601` のまま拒否する（`$n` に NULL を束縛した文の
+    /// 再検証もこの経路で拒否される）。
+    fn try_parse_upsert_add(
+        &mut self,
+        column: &str,
+    ) -> Result<Option<UpsertValue>, SqlSurfaceError> {
+        let start = self.pos;
+        let parsed = self.try_parse_upsert_add_inner(column);
+        if !matches!(parsed, Ok(Some(_))) {
+            self.pos = start;
+        }
+        parsed
+    }
+
+    fn try_parse_upsert_add_inner(
+        &mut self,
+        column: &str,
+    ) -> Result<Option<UpsertValue>, SqlSurfaceError> {
+        // 引用なしの `true`／`false`／`NULL` は左オペランド（列名）ではなく定数。
+        let is_lhs = match self.peek() {
+            Some(Token::Ident(s)) => {
                 (self.quoted_null.contains(&self.pos)
                     || !(s.eq_ignore_ascii_case("NULL")
                         || s.eq_ignore_ascii_case("true")
                         || s.eq_ignore_ascii_case("false")))
+                    && s == column
                     && matches!(
                         self.tokens.get(self.pos.saturating_add(1)),
                         Some(Token::Punct('+'))
@@ -9805,49 +9894,76 @@ impl<'a> Parser<'a> {
             }
             _ => false,
         };
-        if is_add {
-            let lhs = self.expect_ident()?;
-            self.expect_punct('+')?;
-            if lhs != column {
-                return Err(SqlSurfaceError::unsupported(
-                    "ON CONFLICT SET addition must reference the assigned column itself",
-                ));
+        if !is_lhs {
+            return Ok(None);
+        }
+        self.advance();
+        self.advance();
+        let operand = if let Some(Token::QualifiedIdent { qualifier, name }) = self.peek().cloned()
+        {
+            if !qualifier.eq_ignore_ascii_case("EXCLUDED") {
+                return Ok(None);
             }
-            let operand =
-                if let Some(Token::QualifiedIdent { qualifier, name }) = self.peek().cloned() {
-                    self.advance();
-                    if !qualifier.eq_ignore_ascii_case("EXCLUDED") {
-                        return Err(SqlSurfaceError::unsupported(format!(
-                            "unsupported ON CONFLICT SET qualifier: {qualifier}"
-                        )));
+            self.advance();
+            UpsertAddOperand::Excluded(name)
+        } else {
+            match self.expect_literal() {
+                Ok(lit @ InsertLiteral::Number(_)) => UpsertAddOperand::Literal(lit),
+                Ok(_) => {
+                    if self.at_upsert_value_end(self.pos) {
+                        return Err(SqlSurfaceError::unsupported(
+                            "ON CONFLICT SET addition requires a numeric literal or EXCLUDED column",
+                        ));
                     }
-                    UpsertAddOperand::Excluded(name)
-                } else {
-                    match self.expect_literal()? {
-                    lit @ InsertLiteral::Number(_) => UpsertAddOperand::Literal(lit),
-                    _ => return Err(SqlSurfaceError::unsupported(
-                        "ON CONFLICT SET addition requires a numeric literal or EXCLUDED column",
-                    )),
+                    return Ok(None);
                 }
-                };
-            return Ok((
-                column,
-                UpsertValue::Add {
-                    column: lhs,
-                    operand,
-                },
+                Err(_) => return Ok(None),
+            }
+        };
+        if !self.at_upsert_value_end(self.pos) {
+            return Ok(None);
+        }
+        Ok(Some(UpsertValue::Add {
+            column: column.to_string(),
+            operand,
+        }))
+    }
+
+    /// `ON CONFLICT ... DO UPDATE SET` の 1 要素（`<col> = <右辺>`）を構造パースする
+    /// （SQL-20・TASK-193、Issue #872。`Parser::parse_update_assignment` と同じ形だが、
+    /// 右辺に `EXCLUDED.<col>` も受理する点が異なる）。右辺は次の順に試す（SQL-49）:
+    /// 1. 加算形（[`UpsertValue::Add`]。Issue #2425。右辺全体が一致するときだけ）
+    /// 2. `EXCLUDED.<col>` 単独（[`UpsertValue::Excluded`]）
+    /// 3. リテラル単独（[`UpsertValue::Literal`]）
+    /// 4. それ以外は一般の値式（[`UpsertValue::Expr`]。Issue #1739）
+    fn parse_upsert_assignment(&mut self) -> Result<(String, UpsertValue), SqlSurfaceError> {
+        let column = self.expect_ident()?;
+        self.expect_punct('=')?;
+        if let Some(add) = self.try_parse_upsert_add(&column)? {
+            return Ok((column, add));
+        }
+        // `SET c = DEFAULT` は未対応のまま `42601`（列参照 `DEFAULT` として一般の式へ流さない）。
+        if self.peek_ident_matches("DEFAULT")
+            && !self.quoted_null.contains(&self.pos)
+            && self.at_upsert_value_end(self.pos.saturating_add(1))
+        {
+            return Err(SqlSurfaceError::unsupported(
+                "DEFAULT is not supported in ON CONFLICT DO UPDATE SET",
             ));
         }
-        let value = if let Some(Token::QualifiedIdent { qualifier, name }) = self.peek().cloned() {
-            self.advance();
-            if !qualifier.eq_ignore_ascii_case("EXCLUDED") {
-                return Err(SqlSurfaceError::unsupported(format!(
-                    "unsupported ON CONFLICT SET qualifier: {qualifier}"
-                )));
+        if let Some(Token::QualifiedIdent { qualifier, name }) = self.peek().cloned() {
+            if qualifier.eq_ignore_ascii_case("EXCLUDED")
+                && self.at_upsert_value_end(self.pos.saturating_add(1))
+            {
+                self.advance();
+                return Ok((column, UpsertValue::Excluded(name)));
             }
-            UpsertValue::Excluded(name)
-        } else {
-            UpsertValue::Literal(self.expect_literal()?)
+            let expr = self.parse_bounded_value_expr()?;
+            return Ok((column, UpsertValue::Expr(expr)));
+        }
+        let value = match self.expect_literal_or_set_expr()? {
+            SetValue::Literal(lit) => UpsertValue::Literal(lit),
+            SetValue::Expr(expr) => UpsertValue::Expr(expr),
         };
         Ok((column, value))
     }
@@ -23202,11 +23318,27 @@ mod tests {
         assert!(matches!(a[1].1, UpsertValue::Excluded(_)));
     }
 
-    /// 加算形の対象外（別列・左右逆・他演算子・連鎖・括弧・NULL・文字列・修飾付き）は
-    /// `42601` のまま（一般の式は #1738）。
+    /// 加算形に当てはまらない右辺は一般の式（`UpsertValue::Expr`。Issue #1739）として受理し、
+    /// 修飾列参照を構文段で解決する（`t.n`→`n`、`EXCLUDED.n`→予約接頭辞付き）。
     #[test]
-    fn upsert_set_add_syntax_rejects_everything_else() {
+    fn upsert_set_non_add_shapes_parse_as_expr() {
         let lookup = catalog_with(&["documents"]);
+        let parse = |set: &str| {
+            let sql = format!(
+                "INSERT INTO documents (id, n) VALUES (1, 1) ON CONFLICT (id) DO UPDATE SET {set} \
+                 USING OPERATION_ID 'op-add-3'"
+            );
+            validate_insert(&sql, &lookup, LedgerMode::Ledgered).map(|stmt| {
+                let Some(OnConflictClause {
+                    action: OnConflictAction::DoUpdate { assignments: a, .. },
+                    ..
+                }) = stmt.on_conflict
+                else {
+                    panic!("expected DoUpdate: {sql}");
+                };
+                a
+            })
+        };
         for set in [
             "n = m + 1",
             "n = 1 + n",
@@ -23214,21 +23346,74 @@ mod tests {
             "n = n * 2",
             "n = n / 2",
             "n = n + 1 + 2",
+            "n = n + 1 * 2",
             "n = (n + 1)",
-            "n = n + NULL",
-            "n = n + 'x'",
-            "n = n + true",
-            "n = t.n + 1",
+            "n = documents.n + EXCLUDED.n",
             "n = EXCLUDED.n + 1",
-            "n = n + foo.m",
-            "n = n +",
+            "n = n + NULL + 1",
+            "n = n + 'x' || 'y'",
+            "n = coalesce(n, 0) + 1",
+        ] {
+            let a = parse(set).unwrap_or_else(|e| panic!("{set}: {e:?}"));
+            assert!(matches!(a[0].1, UpsertValue::Expr(_)), "{set}: {a:?}");
+        }
+        // 修飾子の解決: 対象表名は修飾なしの列、EXCLUDED は予約接頭辞つきの列。
+        let a = parse("n = documents.n + EXCLUDED.n").expect("qualified");
+        let UpsertValue::Expr(Expr::Binary { lhs, rhs, .. }) = &a[0].1 else {
+            panic!("expected binary expr");
+        };
+        assert_eq!(**lhs, Expr::Ident("n".to_string()));
+        assert_eq!(
+            **rhs,
+            Expr::Ident(format!("{}n", crate::sql::upsert_expr::EXCLUDED_PREFIX))
+        );
+        // 厳密な加算形・EXCLUDED 単独・リテラルは従来の variant のまま（回帰）。
+        assert!(matches!(
+            parse("n = n + 1").unwrap()[0].1,
+            UpsertValue::Add { .. }
+        ));
+        assert!(matches!(
+            parse("n = n + EXCLUDED.n").unwrap()[0].1,
+            UpsertValue::Add { .. }
+        ));
+        assert!(matches!(
+            parse("n = EXCLUDED.n").unwrap()[0].1,
+            UpsertValue::Excluded(_)
+        ));
+        assert!(matches!(
+            parse("n = 5").unwrap()[0].1,
+            UpsertValue::Literal(_)
+        ));
+        assert!(matches!(
+            parse("n = NULL").unwrap()[0].1,
+            UpsertValue::Literal(_)
+        ));
+    }
+
+    /// 構文段で今も拒否する形（未知の修飾子は `42P01`、途中で終わる式・予約接頭辞の偽装は
+    /// `42601`）。
+    #[test]
+    fn upsert_set_expr_syntax_rejects_invalid_shapes() {
+        let lookup = catalog_with(&["documents"]);
+        for (set, expected) in [
+            ("n = n + foo.m", "42P01"),
+            ("n = t.n + 1", "42P01"),
+            // 厳密な加算形の右辺が数値以外のリテラル 1 個の形は従来どおり（#2425・#2427）。
+            ("n = n + NULL", "42601"),
+            ("n = n + 'x'", "42601"),
+            ("n = n + true", "42601"),
+            ("n = foo.m", "42P01"),
+            ("n = foo.m * 2", "42P01"),
+            ("n = n +", "42601"),
+            ("n = n + (", "42601"),
+            ("n = \"\u{0}excluded.n\" + 1", "42601"),
         ] {
             let sql = format!(
                 "INSERT INTO documents (id, n) VALUES (1, 1) ON CONFLICT (id) DO UPDATE SET {set} \
                  USING OPERATION_ID 'op-add-3'"
             );
             let err = validate_insert(&sql, &lookup, LedgerMode::Ledgered).unwrap_err();
-            assert_eq!(err.wire_code(), "42601", "{sql}");
+            assert_eq!(err.wire_code(), expected, "{sql}");
         }
     }
 
@@ -23304,10 +23489,20 @@ mod tests {
             panic!("expected DoUpdate");
         };
         assert!(matches!(a[0].1, UpsertValue::Add { .. }));
+        // 引用なしの `NULL` は加算の左オペランドにならない（加算形ではなく一般の式の経路へ回る。
+        // 構文段では列参照 `NULL` 扱いで通り、束縛段が `42703` にする。Issue #1739）。
+        // 右オペランドが `NULL` の加算形は従来どおり `42601`（上のテスト参照）。
         let bare = "INSERT INTO documents (id, n) VALUES (1, 1) ON CONFLICT (id) \
                     DO UPDATE SET n = NULL + 1 USING OPERATION_ID 'op-add-q2'";
-        let err = validate_insert(bare, &lookup, LedgerMode::Ledgered).unwrap_err();
-        assert_eq!(err.wire_code(), "42601");
+        let stmt = validate_insert(bare, &lookup, LedgerMode::Ledgered).expect(bare);
+        let Some(OnConflictClause {
+            action: OnConflictAction::DoUpdate { assignments: a, .. },
+            ..
+        }) = stmt.on_conflict
+        else {
+            panic!("expected DoUpdate");
+        };
+        assert!(matches!(a[0].1, UpsertValue::Expr(_)));
     }
 
     /// INSERT の VALUES は `NULL`（大小無視）を `InsertLiteral::Null` として受理する
@@ -23420,8 +23615,22 @@ mod tests {
                 "INSERT INTO documents (id, lang) VALUES (1, 'x') ON CONFLICT (id) DO UPDATE \
                  SET lang = {lit} USING OPERATION_ID 'op-null-8'"
             );
-            let err = validate_insert(&sql, &lookup, LedgerMode::Ledgered).unwrap_err();
-            assert_eq!(err.wire_code(), "42601", "{sql}");
+            // DO UPDATE SET の右辺も UPDATE SET と同じ式を受理する（Issue #1739）。`+NULL` 以外は
+            // 構造検証を通り、列参照形の拒否は束縛段が担う。
+            let insert_result = validate_insert(&sql, &lookup, LedgerMode::Ledgered);
+            if lit == "+NULL" {
+                assert_eq!(insert_result.unwrap_err().wire_code(), "42601", "{sql}");
+            } else {
+                let stmt = insert_result.expect("structure ok");
+                let Some(OnConflictClause {
+                    action: OnConflictAction::DoUpdate { assignments: a, .. },
+                    ..
+                }) = stmt.on_conflict
+                else {
+                    panic!("expected DoUpdate: {sql}");
+                };
+                assert!(matches!(a[0].1, UpsertValue::Expr(_)), "{sql}");
+            }
         }
     }
 
@@ -23445,14 +23654,27 @@ mod tests {
                 SetValue::Expr(Expr::Ident("NULL".to_string()))
             )]
         );
-        let err = validate_insert(
+        // DO UPDATE SET も同じく列参照として解析する（Issue #1739。NULL 定数にならないことが契約）。
+        let stmt = validate_insert(
             "INSERT INTO documents (id, lang) VALUES (1, 'x') ON CONFLICT (id) DO UPDATE SET \
              lang = \"null\" USING OPERATION_ID 'op-q-2'",
             &lookup,
             LedgerMode::Ledgered,
         )
-        .unwrap_err();
-        assert_eq!(err.wire_code(), "42601");
+        .expect("structure ok");
+        assert_eq!(
+            stmt.on_conflict,
+            Some(OnConflictClause {
+                target: ConflictTargetSpec::Columns(vec!["id".to_string()]),
+                action: OnConflictAction::DoUpdate {
+                    assignments: vec![(
+                        "lang".to_string(),
+                        UpsertValue::Expr(Expr::Ident("null".to_string()))
+                    )],
+                    condition: Vec::new(),
+                },
+            })
+        );
         let err = validate_insert(
             "INSERT INTO documents (id, lang) VALUES (1, \"NULL\") USING OPERATION_ID 'op-q-3'",
             &lookup,
@@ -23761,10 +23983,10 @@ mod tests {
     }
 
     /// 式の複数 SET・述語形でも構文木のまま保持し、宣言順を保つ。
-    /// `ON CONFLICT ... DO UPDATE SET` の一般の式は引き続き対象外（`42601`。同じ列への
-    /// `+` 加算だけは Issue #2425 で受理するため、ここでは `*` を使う）。
+    /// `ON CONFLICT ... DO UPDATE SET` の一般の式は Issue #1739 で受理する
+    /// （`UpsertValue::Expr`。加算形だけは Issue #2425 の `UpsertValue::Add` のまま）。
     #[test]
-    fn update_set_expressions_in_predicate_form_and_upsert_stays_rejected() {
+    fn update_set_expressions_in_predicate_form_and_upsert_accepts_expr() {
         let lookup = catalog_with(&["documents"]);
         let stmt = validate_update_form(
             "UPDATE documents SET a = 1, b = a + 1 WHERE lang = 'ja' USING OPERATION_ID 'op-se-2'",
@@ -23778,14 +24000,21 @@ mod tests {
         assert_eq!(p.assignments().len(), 2);
         assert!(matches!(p.assignments()[0].1, SetValue::Literal(_)));
         assert!(matches!(p.assignments()[1].1, SetValue::Expr(_)));
-        let err = validate_insert(
+        let stmt = validate_insert(
             "INSERT INTO documents (id, n) VALUES (1, 1) ON CONFLICT (id) DO UPDATE SET \
              n = n * 2 USING OPERATION_ID 'op-se-3'",
             &lookup,
             LedgerMode::Ledgered,
         )
-        .unwrap_err();
-        assert_eq!(err.wire_code(), "42601");
+        .expect("general expression in DO UPDATE SET");
+        let Some(OnConflictClause {
+            action: OnConflictAction::DoUpdate { assignments: a, .. },
+            ..
+        }) = stmt.on_conflict
+        else {
+            panic!("expected DoUpdate");
+        };
+        assert!(matches!(a[0].1, UpsertValue::Expr(_)));
     }
 
     #[test]
@@ -24043,16 +24272,28 @@ mod tests {
     }
 
     #[test]
-    fn rejects_upsert_excluded_qualifier_used_bare() {
+    fn upsert_excluded_qualifier_used_bare_is_a_plain_column_reference() {
+        // 裸の `EXCLUDED`（行全体参照）は未対応。構文段では通常の列参照として受理し、束縛段が
+        // 実在しない列として `42703` にする（Issue #1739。結合テスト `sql49_upsert_set_expr`）。
         let lookup = catalog_with(&["documents"]);
-        let err = validate_insert(
-            "INSERT INTO documents (id) VALUES (1) ON CONFLICT (id) DO UPDATE SET id = EXCLUDED \
+        let stmt = validate_insert(
+            "INSERT INTO documents (id, n) VALUES (1, 1) ON CONFLICT (id) DO UPDATE SET n = EXCLUDED \
              USING OPERATION_ID 'op-upsert-13'",
             &lookup,
             LedgerMode::Ledgered,
         )
-        .unwrap_err();
-        assert_eq!(err.wire_code(), "42601");
+        .expect("bare EXCLUDED parses as an identifier");
+        let Some(OnConflictClause {
+            action: OnConflictAction::DoUpdate { assignments: a, .. },
+            ..
+        }) = stmt.on_conflict
+        else {
+            panic!("expected DoUpdate");
+        };
+        assert_eq!(
+            a[0].1,
+            UpsertValue::Expr(Expr::Ident("EXCLUDED".to_string()))
+        );
     }
 
     #[test]

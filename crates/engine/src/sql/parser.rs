@@ -4877,6 +4877,9 @@ pub enum BoundUpsertValue {
     /// `<col> = <col> + <operand>`（SQL-49、Issue #2425）。左辺の列 index は外側タプルの
     /// 代入先と同じ。衝突した可視な既存行の値（pre-image）へ加算する。
     Add(BoundUpsertAddOperand),
+    /// 一般の値式（SQL-49、Issue #1739）。既存行（pre-image）と `EXCLUDED` を並べた合成
+    /// スキーマ上で束縛済み。評価は `tenant` が所有・可視と確定した衝突行に対してだけ行う。
+    Expr(crate::sql::upsert_expr::BoundUpsertExpr),
 }
 
 /// [`BoundUpsertValue::Add`] の右オペランド（Issue #2425）。
@@ -5531,6 +5534,9 @@ fn bind_upsert_assignments(
                 };
                 BoundUpsertValue::Add(bound_operand)
             }
+            UpsertValue::Expr(expr) => BoundUpsertValue::Expr(
+                crate::sql::upsert_expr::bind_upsert_expr(name, expr, column, schema)?,
+            ),
             UpsertValue::Literal(literal) => {
                 let v = match (&column.ty, literal) {
             // 時刻関数の単独形（Issue #2188）は `bind_insert_row` だけが評価する。

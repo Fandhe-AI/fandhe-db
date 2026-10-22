@@ -339,13 +339,13 @@ fn unsupported_shapes_are_rejected_fail_closed() {
     let _g = CleanupGuard(path);
     let ctx = ctx_for("tenant-a");
     insert(&core, &ctx, 1, "n, d, t, num", "1, 1.0, 'x', 1.00");
-    let cases: [(&str, &str); 14] = [
-        ("n = nn + 1", "42601"),
-        ("n = n - 1", "42601"),
-        ("n = n + 1 + 2", "42601"),
+    // 加算形に当てはまらない式（別列・左右逆・他演算子・連鎖）は Issue #1739 で一般の式として
+    // 受理するため、ここ（厳密な加算形の fail-closed 検証）には含めない。
+    // 受理側の挙動は `sql49_upsert_set_expr.rs`。
+    let cases: [(&str, &str); 11] = [
         ("n = n + NULL", "42601"),
-        ("n = 1 + n", "42601"),
-        ("n = EXCLUDED.n + 1", "42601"),
+        ("n = n + 'x'", "42601"),
+        ("n = n + true", "42601"),
         ("num = num + 1", "0A000"),
         ("n = n + 1.5", "0A000"),
         ("n = n + EXCLUDED.d", "0A000"),
