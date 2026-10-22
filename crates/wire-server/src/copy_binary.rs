@@ -3,8 +3,9 @@
 //! 役割: PostgreSQL の binary COPY ストリーム（署名・フラグ・ヘッダ拡張・タプル・トレーラ。
 //! 形式は PostgreSQL 公式ドキュメント「COPY — Binary Format」）を、**列の型を知らずに**
 //! フィールド単位のバイト列へ分解する [`BinaryCopyReader`] と、同じ形式を書き出す
-//! `encode_*_into` を提供する。型ごとの変換は #1768、`run_copy_from` への結線は #1769、
-//! `run_copy_to` への結線は #1770 が担う（本モジュールの呼び出し元の予定）。
+//! `encode_*_into` を提供する。型ごとの変換は #1768、`run_copy_from` への結線は #1769 が担う。
+//! writer のうちヘッダ／トレーラは `run_copy_to`（#1770・WIRE-23）が本番で使う。reader と
+//! `encode_tuple_into` の本番の呼び出し元は #1769（それまで未使用のため個別に dead_code を許可）。
 //!
 //! engine の text/csv 用 `RecordSplitter` と違い wire-server に置くのは、binary フィールドを
 //! 型コーデック（`binary_param`・`result_encoder::binary` と同じ層）で変換してから engine の
@@ -14,17 +15,19 @@
 //! で扱い、宣言長を確保量に使わない（fail-closed）。入力全体の量は #1769 が INDEX-4 の
 //! 生 CopyData 累計上限で有界にする（ヘッダ拡張はメモリ O(1) で読み飛ばす）。
 //! エラー文言は固定文字列で、受信値・他テナントの情報を含めない。
-#![cfg_attr(not(test), allow(dead_code))] // 本番の呼び出し元は #1768〜#1770 が結線する。
 
 /// 署名（11 バイト）。
 const SIGNATURE: &[u8; 11] = b"PGCOPY\n\xff\r\n\0";
 /// flags の OID 有無ビット（bit 16）。
+#[cfg_attr(not(test), allow(dead_code))] // 本番の呼び出し元は #1769（COPY FROM binary）
 const FLAG_OIDS: u32 = 1 << 16;
 /// flags の critical 領域（bit 17〜31）。
+#[cfg_attr(not(test), allow(dead_code))] // 本番の呼び出し元は #1769（COPY FROM binary）
 const FLAGS_CRITICAL_MASK: u32 = 0xFFFE_0000;
 
 /// binary COPY フレーム層のエラー。`sqlstate`／`client_message` で wire への写像を返す。
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[cfg_attr(not(test), allow(dead_code))] // 本番の呼び出し元は #1769（COPY FROM binary）
 pub(crate) enum CopyBinaryError {
     /// 署名・flags・ヘッダ拡張長の不正（22P04）。
     InvalidHeader,
@@ -42,6 +45,7 @@ pub(crate) enum CopyBinaryError {
     EncodeOverflow,
 }
 
+#[cfg_attr(not(test), allow(dead_code))] // 本番の呼び出し元は #1769（COPY FROM binary）
 impl CopyBinaryError {
     /// SQLSTATE（`ErrorClass` への写像は 22P04 の variant 追加を伴うため #1769 で行う）。
     pub(crate) fn sqlstate(&self) -> &'static str {
@@ -72,6 +76,7 @@ impl CopyBinaryError {
 
 /// parser のメモリ上限（確保前に検証する）。
 #[derive(Debug, Clone, Copy)]
+#[cfg_attr(not(test), allow(dead_code))] // 本番の呼び出し元は #1769（COPY FROM binary）
 pub(crate) struct BinaryFrameLimits {
     /// 1 フィールドの最大バイト数。
     pub max_field_bytes: usize,
@@ -80,6 +85,7 @@ pub(crate) struct BinaryFrameLimits {
 }
 
 #[derive(Debug, Clone, Copy)]
+#[cfg_attr(not(test), allow(dead_code))] // 本番の呼び出し元は #1769（COPY FROM binary）
 enum State {
     Signature { matched: usize },
     Flags { buf: [u8; 4], filled: usize },
@@ -94,6 +100,7 @@ enum State {
 
 /// チャンク境界をまたぐストリーミング parser。CopyData の分割位置に依存しない。
 #[derive(Debug)]
+#[cfg_attr(not(test), allow(dead_code))] // 本番の呼び出し元は #1769（COPY FROM binary）
 pub(crate) struct BinaryCopyReader {
     state: State,
     expected_fields: usize,
@@ -104,6 +111,7 @@ pub(crate) struct BinaryCopyReader {
 }
 
 /// `buf[*filled..]` を `chunk[*pos..]` から埋め、満了したら true。
+#[cfg_attr(not(test), allow(dead_code))] // 本番の呼び出し元は #1769（COPY FROM binary）
 fn fill(buf: &mut [u8], filled: &mut usize, chunk: &[u8], pos: &mut usize) -> bool {
     let rest = chunk.get(*pos..).unwrap_or(&[]);
     let need = buf.len().saturating_sub(*filled);
@@ -117,6 +125,7 @@ fn fill(buf: &mut [u8], filled: &mut usize, chunk: &[u8], pos: &mut usize) -> bo
     *filled >= buf.len()
 }
 
+#[cfg_attr(not(test), allow(dead_code))] // 本番の呼び出し元は #1769（COPY FROM binary）
 impl BinaryCopyReader {
     /// `expected_fields` は 1..=`i16::MAX`（範囲外は構成不正として `EncodeOverflow`）。
     pub(crate) fn new(
@@ -348,6 +357,7 @@ pub(crate) fn encode_header_into(out: &mut Vec<u8>) {
 }
 
 /// 1 タプルを追記する（`None` は NULL）。失敗時は `out` を呼び出し前の長さへ戻す。
+#[cfg_attr(not(test), allow(dead_code))] // 本番の呼び出し元は #1769（COPY FROM binary）
 pub(crate) fn encode_tuple_into(
     fields: &[Option<&[u8]>],
     out: &mut Vec<u8>,
@@ -360,6 +370,7 @@ pub(crate) fn encode_tuple_into(
     result
 }
 
+#[cfg_attr(not(test), allow(dead_code))] // 本番の呼び出し元は #1769（COPY FROM binary）
 fn encode_tuple_inner(fields: &[Option<&[u8]>], out: &mut Vec<u8>) -> Result<(), CopyBinaryError> {
     let count = i16::try_from(fields.len()).map_err(|_| CopyBinaryError::EncodeOverflow)?;
     out.extend_from_slice(&count.to_be_bytes());

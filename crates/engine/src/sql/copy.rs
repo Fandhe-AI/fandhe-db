@@ -402,7 +402,9 @@ impl RecordSplitter {
     /// `options`（区切り・NULL 文字列・引用・エスケープ）を適用する分割器。
     fn with_options(format: CopyFormat, options: &CopyOptions) -> Self {
         match format {
-            CopyFormat::Text => RecordSplitter::Text {
+            // Binary は CopyInSession::new が先に拒否するため到達しない（多層防御。
+            // 到達しても text として解釈する安全側の構成）。
+            CopyFormat::Text | CopyFormat::Binary => RecordSplitter::Text {
                 pending: Vec::new(),
                 pending_cr: false,
                 delimiter: options.delimiter(),
@@ -949,6 +951,12 @@ impl CopyInSession {
         clock: crate::sql::time_fn::StatementClock,
         time_zone: crate::datetime::SessionTimeZone,
     ) -> Result<Self, SqlSurfaceError> {
+        // FROM の binary は Issue #1769 まで未対応（resolve が先に 42601 で拒否済みの多層防御）。
+        if format == CopyFormat::Binary {
+            return Err(SqlSurfaceError::unsupported(
+                "COPY FORMAT binary is not supported",
+            ));
+        }
         // csv で QUOTE／ESCAPE が改行系だとレコード終端と曖昧になるため、未対応として
         // CopyInResponse 前に拒否する（PostgreSQL は検査しないが拒否側に倒す既知の相違）。
         if format == CopyFormat::Csv

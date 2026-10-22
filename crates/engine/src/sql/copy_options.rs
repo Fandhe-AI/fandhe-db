@@ -10,8 +10,9 @@
 //! HEADER・DELIMITER・NULL・QUOTE・ESCAPE を適用済みのためゲートは無い。`COPY TO` 側は
 //! まだ適用しておらず、適用しないまま受理すると無言の fail-open になるため、format の既定値と
 //! 異なる解決結果は [`reject_unapplied_for_to`] が `0A000` で拒否する。`COPY TO` 側の適用
-//! （Issue #1765）は、その呼び出し 1 行を外すだけでよい。`FORMAT binary` は WIRE-23 の領域のため、従来どおり
-//! `42601` のまま先送りする。
+//! （Issue #1765）は、その呼び出し 1 行を外すだけでよい。`FORMAT binary` は `COPY TO` のみ受理し
+//! （WIRE-23・Issue #1770）、`COPY FROM` は Issue #1769 まで従来どおり `42601` で拒否する。
+//! binary と DELIMITER・NULL・HEADER・QUOTE・ESCAPE の併用は PostgreSQL 17 と同じく `0A000`。
 //!
 //! エラー文言にはユーザー入力の値を含めない（`22023`・`0A000` は固定文言。`42601` に含めるのは
 //! 切り詰め済みのオプション名だけで、構文エラーのトークンは載せない）。
@@ -78,7 +79,9 @@ impl CopyOptions {
     /// `format` の既定値だけで構成したオプション。
     fn defaults_for(format: CopyFormat) -> Self {
         match format {
-            CopyFormat::Text => Self {
+            // binary は text と同じ既定値（併用不可オプションは resolve が拒否済みで、
+            // 未指定なら is_default_for(Binary) が真になる）。
+            CopyFormat::Text | CopyFormat::Binary => Self {
                 header: CopyHeader::False,
                 delimiter: b'\t',
                 null_string: "\\N".to_string(),
@@ -243,12 +246,15 @@ pub(crate) fn resolve(
             match s.to_ascii_lowercase().as_str() {
                 "text" => CopyFormat::Text,
                 "csv" => CopyFormat::Csv,
-                // binary は WIRE-23 の領域。従来どおり 42601 で先送りする。
-                "binary" => {
-                    return Err(SqlSurfaceError::unsupported(
-                        "COPY FORMAT binary is not supported",
-                    ))
-                }
+                // binary は COPY TO のみ（WIRE-23・Issue #1770）。FROM は Issue #1769 まで 42601。
+                "binary" => match direction {
+                    CopyDirection::To => CopyFormat::Binary,
+                    CopyDirection::From => {
+                        return Err(SqlSurfaceError::unsupported(
+                            "COPY FORMAT binary is not supported",
+                        ))
+                    }
+                },
                 _ => return Err(invalid("COPY format is not recognized")),
             }
         }
@@ -277,6 +283,19 @@ pub(crate) fn resolve(
         let e = enc.to_ascii_uppercase();
         if e != "UTF8" && e != "UTF-8" {
             return Err(not_supported("COPY encoding is not supported"));
+        }
+    }
+
+    // binary と併用できないオプション（PostgreSQL 17 は既定値適用の前に 0A000 で拒否する）。
+    if format == CopyFormat::Binary {
+        if delimiter_s.is_some() {
+            return Err(not_supported("cannot specify DELIMITER in BINARY mode"));
+        }
+        if null_s.is_some() {
+            return Err(not_supported("cannot specify NULL in BINARY mode"));
+        }
+        if header != CopyHeader::False {
+            return Err(not_supported("cannot specify HEADER in BINARY mode"));
         }
     }
 
@@ -309,7 +328,7 @@ pub(crate) fn resolve(
     if header == CopyHeader::Match && direction == CopyDirection::To {
         return Err(not_supported("COPY HEADER MATCH is only for COPY FROM"));
     }
-    if format == CopyFormat::Text && quote_s.is_some() {
+    if format != CopyFormat::Csv && quote_s.is_some() {
         return Err(not_supported("COPY QUOTE requires CSV mode"));
     }
     let quote = match quote_s {
@@ -317,7 +336,7 @@ pub(crate) fn resolve(
             .ok_or_else(|| not_supported("COPY quote must be a single one-byte character"))?,
         None => defaults.quote,
     };
-    if format == CopyFormat::Text && escape_s.is_some() {
+    if format != CopyFormat::Csv && escape_s.is_some() {
         return Err(not_supported("COPY ESCAPE requires CSV mode"));
     }
     let escape = match escape_s {
@@ -536,6 +555,34 @@ mod tests {
         let f = |v| vec![raw("format", id(v))];
         assert_eq!(code(f("json"), CopyDirection::From), "22023");
         assert_eq!(code(f("binary"), CopyDirection::From), "42601");
+    }
+
+    #[test]
+    fn binary_is_to_only_and_rejects_conflicting_options() {
+        let bin = || raw("format", id("binary"));
+        let (fmt, o) = resolve(vec![bin()], CopyDirection::To).expect("binary to");
+        assert_eq!(fmt, CopyFormat::Binary);
+        assert!(o.is_default_for(CopyFormat::Binary));
+        let (_, o) = resolve(
+            vec![bin(), raw("header", s("false")), raw("encoding", s("UTF8"))],
+            CopyDirection::To,
+        )
+        .expect("binary with HEADER false");
+        assert!(o.is_default_for(CopyFormat::Binary));
+        for (name, v) in [
+            ("delimiter", s(",")),
+            ("null", s("x")),
+            ("header", s("true")),
+            ("quote", s("'")),
+            ("escape", s("\\")),
+        ] {
+            assert_eq!(
+                code(vec![bin(), raw(name, v)], CopyDirection::To),
+                "0A000",
+                "{name}"
+            );
+        }
+        assert_eq!(code(vec![bin()], CopyDirection::From), "42601");
     }
 
     #[test]
