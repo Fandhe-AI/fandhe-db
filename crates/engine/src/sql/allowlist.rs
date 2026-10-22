@@ -10259,10 +10259,20 @@ impl<'a> Parser<'a> {
             return Err(source_err());
         }
         if !explicit_row {
-            let next = self.tokens.get(self.pos + 1);
-            let is_subquery = matches!(next, Some(Token::Keyword(Keyword::Select)))
-                || matches!(next, Some(Token::Ident(w))
-                    if w.eq_ignore_ascii_case("WITH") || w.eq_ignore_ascii_case("VALUES"));
+            // `values` / `with` は通常の識別子でもあるため、後続トークンが
+            // サブクエリ構文（`VALUES (` / `WITH [RECURSIVE] name [(..)] AS`）の
+            // ときだけサブクエリ扱いにし、それ以外は列参照経路へ流す。
+            let at = |n: usize| self.tokens.get(self.pos.saturating_add(n));
+            let is_word = |t: Option<&Token>, w: &str| matches!(t, Some(Token::Ident(x)) if x.eq_ignore_ascii_case(w));
+            let is_values_query =
+                is_word(at(1), "VALUES") && matches!(at(2), Some(Token::Punct('(')));
+            let is_with_query = is_word(at(1), "WITH")
+                && ((matches!(at(2), Some(Token::Ident(_)))
+                    && (is_word(at(3), "AS") || matches!(at(3), Some(Token::Punct('(')))))
+                    || (is_word(at(2), "RECURSIVE") && matches!(at(3), Some(Token::Ident(_)))));
+            let is_subquery = matches!(at(1), Some(Token::Keyword(Keyword::Select)))
+                || is_values_query
+                || is_with_query;
             if is_subquery {
                 return Err(SqlSurfaceError::feature_not_supported(
                     "multiple-column UPDATE with a subquery source is not supported",
@@ -24075,8 +24085,17 @@ mod tests {
         ] {
             assert_eq!(parse(set).unwrap_err().wire_code(), "42601", "{set}");
         }
-        for set in ["(n, o) = (SELECT 1, 2)", "(n, o) = (VALUES (1, 2))"] {
+        for set in [
+            "(n, o) = (SELECT 1, 2)",
+            "(n, o) = (VALUES (1, 2))",
+            "(n, o) = (WITH c AS (SELECT 1) SELECT 1, 2)",
+            "(n, o) = (WITH RECURSIVE c AS (SELECT 1) SELECT 1, 2)",
+        ] {
             assert_eq!(parse(set).unwrap_err().wire_code(), "0A000", "{set}");
+        }
+        // `values` / `with` は通常の識別子: 先頭スロットの列参照として受理する。
+        for set in ["(n, o) = (values, 1)", "(n, o) = (with, 1)"] {
+            assert!(parse(set).is_ok(), "{set}");
         }
         let cols: Vec<String> = (0..=MAX_UPDATE_SET_ASSIGNMENTS)
             .map(|i| format!("c{i}"))
