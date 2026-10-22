@@ -150,4 +150,5 @@ DELETE FROM <table> WHERE <predicates> USING OPERATION_ID '<id>'
 - **ビュー**: 省略形はビューの述語だけが対象になる（述語の無いビューならビューで見える全行）。
 - **影響行数上限**: `--max-dml-affected-rows` の既定（上限なし）は変えない。指定時は省略形も対象で、超過は
   副作用ゼロ・台帳記録なしで全体を拒否する。省略形専用の既定上限は設けない。
+- **#2210 の実装**: 実装済み。記録は [require-where-for-dml-cli.md](require-where-for-dml-cli.md)。
 - **#2210 への申し送り**: 省略の判定は `parse_delete`／`parse_update` が返す述語列の空（`mark_explicit_where` 通過後）で取れる。
