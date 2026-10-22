@@ -4433,18 +4433,22 @@ impl EngineCore {
         if is_delete {
             // SQL-36（Issue #2210）: 構造解析 → WHERE 省略ガード → カタログ検証の順。通常 DML 経路と
             // 同じく、ガードを表の存在確認より前に置き、不存在表と既存表で応答を分けない。
-            let shape =
-                crate::sql::allowlist::parse_delete_statement_shape_tokens(rest, self.ledger_mode)?;
+            let shape = crate::sql::allowlist::parse_delete_statement_shape_tokens_with_limits(
+                rest,
+                self.ledger_mode,
+                self.nesting_limits,
+            )?;
             if let DeleteStatement::Predicate(v) = &shape {
                 crate::sql::allowlist::reject_omitted_where_for_dml(
                     self.require_where_for_dml,
                     v.where_predicates(),
                 )?;
             }
-            let stmt = crate::sql::allowlist::validate_delete_statement_tokens(
+            let stmt = crate::sql::allowlist::validate_delete_statement_tokens_with_limits(
                 rest,
                 lookup,
                 self.ledger_mode,
+                self.nesting_limits,
             )
             .map_err(|e| self.reclassify_write_to_view_error(e))?;
             return match stmt {
@@ -4456,16 +4460,24 @@ impl EngineCore {
             };
         }
         // SQL-36（Issue #2210）: DELETE と同じ順序（構造解析 → WHERE 省略ガード → カタログ検証）。
-        let shape = crate::sql::allowlist::parse_update_form_shape_tokens(rest, self.ledger_mode)?;
+        let shape = crate::sql::allowlist::parse_update_form_shape_tokens_with_limits(
+            rest,
+            self.ledger_mode,
+            self.nesting_limits,
+        )?;
         if let ValidatedUpdateForm::Predicate(v) = &shape {
             crate::sql::allowlist::reject_omitted_where_for_dml(
                 self.require_where_for_dml,
                 v.where_predicates(),
             )?;
         }
-        let stmt =
-            crate::sql::allowlist::validate_update_form_tokens(rest, lookup, self.ledger_mode)
-                .map_err(|e| self.reclassify_write_to_view_error(e))?;
+        let stmt = crate::sql::allowlist::validate_update_form_tokens_with_limits(
+            rest,
+            lookup,
+            self.ledger_mode,
+            self.nesting_limits,
+        )
+        .map_err(|e| self.reclassify_write_to_view_error(e))?;
         match stmt {
             ValidatedUpdateForm::Predicate(v) if v.partitioned().is_some() => {
                 self.check_partitioned_chunk(v.partitioned())?;
@@ -4903,8 +4915,11 @@ impl EngineCore {
             // 構造検証 → 存在確認の順序は `validate_delete_statement_tokens` と同じ。FROM の名前が表で
             // なくビューなら、自動更新可能なものに限りビューへの DELETE として受理する（TABLE-43・
             // Issue #1672。書き換えは Execute 時）。
-            let stmt =
-                crate::sql::allowlist::parse_delete_statement_shape_tokens(&tokens, ledger_mode)?;
+            let stmt = crate::sql::allowlist::parse_delete_statement_shape_tokens_with_limits(
+                &tokens,
+                ledger_mode,
+                self.nesting_limits,
+            )?;
             // SQL-36（Issue #2210）: opt-in 有効時は `WHERE` 省略を表の存在確認より前に拒否する
             // （ビュー・PARTITIONED・一時表の分類 parse も本経路を通る）。
             if let crate::sql::allowlist::DeleteStatement::Predicate(v) = &stmt {
@@ -4961,7 +4976,11 @@ impl EngineCore {
         );
         if is_update_statement {
             // 構造検証 → 存在確認の順序は `validate_update_form_tokens` と同じ（TABLE-43・Issue #1672）。
-            let stmt = crate::sql::allowlist::parse_update_form_shape_tokens(&tokens, ledger_mode)?;
+            let stmt = crate::sql::allowlist::parse_update_form_shape_tokens_with_limits(
+                &tokens,
+                ledger_mode,
+                self.nesting_limits,
+            )?;
             // SQL-36（Issue #2210）: DELETE と同じ位置・同じ理由で `WHERE` 省略を拒否する。
             if let crate::sql::allowlist::ValidatedUpdateForm::Predicate(v) = &stmt {
                 crate::sql::allowlist::reject_omitted_where_for_dml(

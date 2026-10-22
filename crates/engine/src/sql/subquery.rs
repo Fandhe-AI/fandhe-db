@@ -1003,7 +1003,7 @@ fn static_validation_predicates(preds: &[WherePredicate]) -> Vec<WherePredicate>
 /// 述語がサブクエリ（`IN`／`EXISTS`／スカラー比較）を含むかを再帰的に判定する。
 /// 入れ子 WHERE の実行時エラー時に、サブクエリを含まない述語だけで静的検証を
 /// 完了させるために使う（`execute_inner_query` 系から呼ばれる）。
-fn predicate_contains_subquery(pred: &WherePredicate) -> bool {
+pub(crate) fn predicate_contains_subquery(pred: &WherePredicate) -> bool {
     match pred {
         WherePredicate::InSubquery { .. }
         | WherePredicate::Exists { .. }

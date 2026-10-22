@@ -137,6 +137,16 @@ fn merge_predicates(
     rv: &ResolvedView,
     predicates: &[WherePredicate],
 ) -> Result<Vec<WherePredicate>, SqlSurfaceError> {
+    // Issue #1750・SQL-53: ビュー経由の DML の WHERE 内サブクエリは未対応。内側の識別子が
+    // ビュー公開名か基表名か定まらないため、column_map の有無によらず入口で一律に拒否する。
+    if predicates
+        .iter()
+        .any(crate::sql::subquery::predicate_contains_subquery)
+    {
+        return Err(SqlSurfaceError::unsupported(
+            "subquery in WHERE is not supported for DML through a view",
+        ));
+    }
     check_columns_within_view(
         rv.view_columns.as_deref(),
         &Projection::All,

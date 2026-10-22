@@ -1116,12 +1116,15 @@ fn exists_subquery_in_ranked_select_is_rejected() {
     ));
 }
 
+/// `USING OPERATION_ID` 付きの述語形 UPDATE のサブクエリは内側の実行前に `0A000` で拒否され、
+/// 表の内容を変えない（暫定ゲート。SQL-53 の結合テストと同じ契約）。
 #[test]
-fn in_subquery_in_update_where_is_rejected() {
+fn in_subquery_in_update_where_with_operation_id_is_gated_without_side_effects() {
     let (core, path) = new_core();
     let _guard = CleanupGuard(path);
     let ctx = ctx_for("tenant-a");
     seed_docs(&core, &ctx);
+    insert_allowed_lang(&core, &ctx, 100, "ja");
 
     let err = core
         .execute_sql_in_session(
@@ -1132,11 +1135,16 @@ fn in_subquery_in_update_where_is_rejected() {
                  USING OPERATION_ID 'update-subquery'"
             ),
         )
-        .expect_err("subquery in UPDATE WHERE must be rejected");
-    assert!(matches!(
-        err,
-        engine::sql::allowlist::SqlSurfaceError::UnsupportedSyntax { .. }
-    ));
+        .expect_err("subquery in UPDATE WHERE with OPERATION_ID must be gated");
+    assert_eq!(err.wire_code(), "0A000", "{err:?}");
+    let all = select_ids(
+        &core,
+        &ctx,
+        &format!(
+            "SELECT id FROM {DOCS} WHERE lang = 'xx' ORDER BY embedding <=> '[0.1,0.1]' LIMIT 100"
+        ),
+    );
+    assert!(all.is_empty(), "no row may be updated: {all:?}");
 }
 
 #[test]
@@ -1467,26 +1475,49 @@ fn not_in_subquery_static_validation_is_independent_of_row_count() {
     }
 }
 
-/// サブクエリ不許可の文脈（述語形 DML）では `NOT IN`／`NOT EXISTS` も `42601` のまま。
+/// 述語形 DML では `NOT IN`／`NOT EXISTS` も受理され、内側の結果で対象行が決まる
+/// （`operation_id` 省略時。内側が空なら `NOT EXISTS` は真・`NOT IN` は全行対象）。
 #[test]
-fn not_subquery_forms_stay_rejected_in_non_subquery_contexts() {
+fn not_subquery_forms_execute_in_predicate_dml() {
     let (core, path) = new_core();
     let _guard = CleanupGuard(path);
     let ctx = ctx_for("tenant-a");
     seed_docs(&core, &ctx);
-    for sql in [
-        format!("UPDATE {DOCS} SET lang = 'x' WHERE NOT EXISTS (SELECT id FROM {VISITS} LIMIT 1)"),
-        format!("DELETE FROM {DOCS} WHERE lang NOT IN (SELECT lang FROM {ALLOWED_LANGS} LIMIT 1)"),
-    ] {
-        let err = core
-            .execute_sql_in_session(&ctx, &mut SessionState::default(), &sql)
-            .expect_err("must be rejected");
-        assert!(
-            matches!(
-                err,
-                engine::sql::allowlist::SqlSurfaceError::UnsupportedSyntax { .. }
+    let run = |sql: &str| {
+        core.execute_sql_in_session(&ctx, &mut SessionState::default(), sql)
+            .unwrap_or_else(|e| panic!("sql={sql:?} should succeed: {e:?}"))
+    };
+    let count = |lang: &str| {
+        select_ids(
+            &core,
+            &ctx,
+            &format!(
+                "SELECT id FROM {DOCS} WHERE lang = '{lang}' \
+                 ORDER BY embedding <=> '[0.1,0.1]' LIMIT 100"
             ),
-            "sql={sql} err={err:?}"
-        );
-    }
+        )
+    };
+
+    // 内側（visits）が空: NOT EXISTS は真なので全 4 行が更新される。
+    run(&format!(
+        "UPDATE {DOCS} SET lang = 'x' WHERE NOT EXISTS (SELECT id FROM {VISITS} LIMIT 1)"
+    ));
+    assert_eq!(count("x"), vec![1, 2, 3, 4]);
+
+    // 内側に行がある: NOT EXISTS は偽なので更新されない。
+    insert_visit(&core, &ctx, 1, "n");
+    run(&format!(
+        "UPDATE {DOCS} SET lang = 'y' WHERE NOT EXISTS (SELECT id FROM {VISITS} LIMIT 1)"
+    ));
+    assert!(count("y").is_empty());
+
+    // NOT IN: allowed_langs に 'x' のみ → 'x' 以外は残る。先に 2 行を 'z' に変える。
+    run(&format!("UPDATE {DOCS} SET lang = 'z' WHERE id = 1"));
+    run(&format!("UPDATE {DOCS} SET lang = 'z' WHERE id = 2"));
+    insert_allowed_lang(&core, &ctx, 1, "x");
+    run(&format!(
+        "DELETE FROM {DOCS} WHERE lang NOT IN (SELECT lang FROM {ALLOWED_LANGS} LIMIT 10)"
+    ));
+    assert_eq!(count("x"), vec![3, 4]);
+    assert!(count("z").is_empty());
 }
