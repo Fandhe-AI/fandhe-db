@@ -5606,7 +5606,7 @@ fn execute_upsert_inner(
     // 変換する（`tenant.rs` モジュールドキュメント参照）。
     let tenant_assignments: Vec<(usize, crate::tenant::UpsertSetValue<'_>)> = match &bound.action {
         BoundConflictAction::DoNothing => Vec::new(),
-        BoundConflictAction::DoUpdate(assignments) => assignments
+        BoundConflictAction::DoUpdate { assignments, .. } => assignments
             .iter()
             .map(|(col_idx, value)| {
                 let v = match value {
@@ -5632,11 +5632,36 @@ fn execute_upsert_inner(
             })
             .collect(),
     };
+    // `DO UPDATE SET ... WHERE <条件>`（SQL-49 (3)、Issue #1740）: 束縛段で検証済みの述語列を
+    // 文ごとに 1 回コンパイルし、評価クロージャとして tenant へ渡す（`tenant` は `sql` に
+    // 依存しない）。評価は衝突した既存行のビューと `EXCLUDED`（挿入しようとした行）の
+    // ビューを連結して行う。
+    let compiled_where = match &bound.action {
+        BoundConflictAction::DoUpdate { condition, .. } if !condition.is_empty() => Some(
+            crate::sql::upsert_where::CompiledUpsertWhere::compile(condition, bound_schema)?,
+        ),
+        _ => None,
+    };
+    let where_fn = |existing: &[Option<ScalarRef<'_>>],
+                    excluded_values: &[Value],
+                    id: u64|
+     -> Result<bool, SqlSurfaceError> {
+        let Some(compiled) = compiled_where.as_ref() else {
+            return Ok(true);
+        };
+        let payload = array_payload_scratch(excluded_values)?;
+        let excluded = candidate_scalar_view(excluded_values, &payload);
+        compiled.matches(existing, &excluded, id)
+    };
     let tenant_action = match &bound.action {
         BoundConflictAction::DoNothing => crate::tenant::UpsertAction::DoNothing,
-        BoundConflictAction::DoUpdate(_) => {
-            crate::tenant::UpsertAction::DoUpdate(&tenant_assignments)
-        }
+        BoundConflictAction::DoUpdate { condition, .. } => crate::tenant::UpsertAction::DoUpdate(
+            &tenant_assignments,
+            compiled_where.as_ref().map(|_| crate::tenant::UpsertWhere {
+                eval: &where_fn,
+                predicates: condition,
+            }),
+        ),
     };
     // `sql::parser::BoundConflictTarget` を `tenant::UpsertTarget`（`sql` へ
     // 依存しない最小表現）へ変換する（Issue #1074。`tenant.rs` モジュール
@@ -6280,10 +6305,13 @@ mod tests {
                     id_omitted: false,
                 }],
                 target: crate::sql::parser::BoundConflictTarget::RowId,
-                action: BoundConflictAction::DoUpdate(vec![(
-                    2,
-                    BoundUpsertValue::Literal(Value::Text("stale".to_string())),
-                )]),
+                action: BoundConflictAction::DoUpdate {
+                    assignments: vec![(
+                        2,
+                        BoundUpsertValue::Literal(Value::Text("stale".to_string())),
+                    )],
+                    condition: Vec::new(),
+                },
                 operation_id: Some(upsert_op_id),
             };
 

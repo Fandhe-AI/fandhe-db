@@ -415,10 +415,6 @@ fn unsupported_forms_stay_fail_closed() {
     let (core, path) = setup("sql51-oc-reject");
     let _g = CleanupGuard(path);
     let cases: &[(&str, &str)] = &[
-        (
-            "ON CONFLICT (id) DO UPDATE SET t = EXCLUDED.t WHERE dst.k > 0",
-            "42601",
-        ),
         ("ON CONFLICT (nope) DO NOTHING", "42P10"),
         ("ON CONFLICT ON CONSTRAINT nope DO NOTHING", "42704"),
         ("ON CONFLICT DO UPDATE SET t = EXCLUDED.t", "42601"),

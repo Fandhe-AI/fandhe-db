@@ -3571,7 +3571,15 @@ pub enum OnConflictAction {
     /// 衝突した行はそのまま変更しない（新規挿入もしない）。
     DoNothing,
     /// 衝突した行の指定列だけを上書きする（宣言順を保持。read-merge-write）。
-    DoUpdate(Vec<(String, UpsertValue)>),
+    ///
+    /// `condition` は `DO UPDATE SET ... WHERE <条件>` の条件（SQL-49 (3)、Issue #1740。
+    /// 空なら `WHERE` なし）。条件内の列参照は構文段で 1 対 1 に正規化済みで、衝突した
+    /// 既存行の列は素の列名、`EXCLUDED.<col>` は `sql::upsert_where::EXCLUDED_PREFIX` 付きの
+    /// 列名として `WherePredicate` に載る（束縛は `sql::upsert_where`）。
+    DoUpdate {
+        assignments: Vec<(String, UpsertValue)>,
+        condition: Vec<WherePredicate>,
+    },
 }
 
 /// `ON CONFLICT (<col>[, <col>]*) DO NOTHING | DO UPDATE SET ...`（SQL-20・
@@ -9659,8 +9667,9 @@ impl<'a> Parser<'a> {
     /// 文脈的キーワード `ON` でなければ `None` を返し呼び出し元の位置を進めない。
     ///
     /// 対象は列リスト形に加え `ON CONSTRAINT <name>` 形（Issue #1737）も受理する
-    /// （名前に続く余剰トークン・名前欠落は `42601`）。`DO UPDATE SET` の後ろに `WHERE` を続けた形・句の重複は
-    /// 専用の判定を持たず、構造的に余剰トークンとして
+    /// （名前に続く余剰トークン・名前欠落は `42601`）。`DO UPDATE SET` の後ろの `WHERE <条件>` は
+    /// [`Self::parse_on_conflict_action`] が受理する（SQL-49 (3)、Issue #1740）。句の重複・
+    /// `DO NOTHING` の後ろの `WHERE` は専用の判定を持たず、構造的に余剰トークンとして
     /// `Parser::expect_end_of_statement`（呼び出し元 [`parse_delete_statement_shape`]
     /// 等と同じ、本メソッドの直接の呼び出し元 [`Parser::parse_insert`] が最終的に
     /// 委ねる契約）が `42601` で拒否する。
@@ -9748,8 +9757,10 @@ impl<'a> Parser<'a> {
         Ok(target)
     }
 
-    /// `DO NOTHING | DO UPDATE SET ...` の `DO` 以降をパースする
-    /// （[`Self::parse_on_conflict_clause`] の内部分割）。
+    /// `DO NOTHING | DO UPDATE SET ... [WHERE <条件>]` の `DO` 以降をパースする
+    /// （[`Self::parse_on_conflict_clause`] の内部分割）。`WHERE`（SQL-49 (3)、Issue #1740）は
+    /// `DO UPDATE` 専用で、`DO NOTHING WHERE ...` は従来どおり余剰トークンとして
+    /// `Parser::expect_end_of_statement` が `42601` で拒否する。
     fn parse_on_conflict_action(
         &mut self,
         table_name: &str,
@@ -9765,9 +9776,114 @@ impl<'a> Parser<'a> {
             self.upsert_table = Some(table_name.to_string());
             let parsed = self.parse_upsert_assignment_list();
             self.upsert_table = None;
-            OnConflictAction::DoUpdate(parsed?)
+            let assignments = parsed?;
+            let condition = if matches!(self.peek(), Some(Token::Keyword(Keyword::Where))) {
+                self.advance(); // WHERE
+                self.parse_upsert_where_condition(table_name)?
+            } else {
+                Vec::new()
+            };
+            OnConflictAction::DoUpdate {
+                assignments,
+                condition,
+            }
         };
         Ok(action)
+    }
+
+    /// `DO UPDATE SET ... WHERE` の条件（`WHERE` 消費済み）を解析する（SQL-49 (3)、Issue #1740）。
+    ///
+    /// 条件の文法は通常の `WHERE`（[`Self::parse_where`]）と同一で、第 2 の述語パーサーは
+    /// 作らない。修飾列参照だけが異なるため、条件区間（深さ 0 の `RETURNING`／`USING`／`;`／
+    /// 文末まで）のトークンを解析の前に 1 対 1 で書き換える（`sql::qualified_column` と同じ
+    /// 考え方で、トークン数が変わらないので `quoted_null` の添字も保たれる）:
+    /// - `EXCLUDED.<col>`（修飾子の大小は無視）→ `Ident(EXCLUDED_PREFIX + col)`
+    /// - `<INSERT 対象表名>.<col>` → `Ident(col)`（既存行の列）
+    /// - それ以外の修飾子 → `42P01`（カタログは照会しない。存在オラクルにしない）
+    /// - `t.*`・予約接頭辞（NUL 文字）で始まる引用識別子 → `42601`（接頭辞の偽装を許さない）
+    ///
+    /// 区間を解析し終えた位置が区間末と一致しなければ `42601`。サブクエリは
+    /// `subquery_ctx == None` のため `parse_where` が `42601` で拒否する。
+    fn parse_upsert_where_condition(
+        &mut self,
+        table_name: &str,
+    ) -> Result<Vec<WherePredicate>, SqlSurfaceError> {
+        let start = self.pos;
+        let mut depth = 0usize;
+        let mut end = start;
+        let mut rewrites: Vec<(usize, Token)> = Vec::new();
+        while let Some(token) = self.tokens.get(end) {
+            match token {
+                Token::Punct('(') => depth = depth.saturating_add(1),
+                Token::Punct(')') => {
+                    if depth == 0 {
+                        break;
+                    }
+                    depth -= 1;
+                }
+                Token::Punct(';') if depth == 0 => break,
+                // `RETURNING`／`USING` は予約語でないため列名（引用付き含む）と区別が要る。
+                // 実句境界（`RETURNING <射影>`／`USING OPERATION_ID`）のときだけ区間を閉じる
+                // （`sql::params::is_where_clause_boundary` と同じ方針）。
+                Token::Ident(w)
+                    if depth == 0
+                        && ((w.eq_ignore_ascii_case("RETURNING")
+                            && self.returning_is_clause_boundary(start, end))
+                            || (w.eq_ignore_ascii_case("USING")
+                                && matches!(
+                                    self.tokens.get(end.saturating_add(1)),
+                                    Some(Token::Ident(n)) if n.eq_ignore_ascii_case("OPERATION_ID")
+                                ))) =>
+                {
+                    break;
+                }
+                Token::Ident(w) if w.starts_with(crate::sql::upsert_where::EXCLUDED_PREFIX) => {
+                    return Err(SqlSurfaceError::unsupported(
+                        "reserved identifier prefix in ON CONFLICT DO UPDATE WHERE",
+                    ));
+                }
+                Token::QualifiedStar { .. } => {
+                    return Err(SqlSurfaceError::unsupported(
+                        "qualified star is not allowed in ON CONFLICT DO UPDATE WHERE",
+                    ));
+                }
+                Token::QualifiedIdent { qualifier, name } => {
+                    if name.starts_with(crate::sql::upsert_where::EXCLUDED_PREFIX) {
+                        return Err(SqlSurfaceError::unsupported(
+                            "reserved identifier prefix in ON CONFLICT DO UPDATE WHERE",
+                        ));
+                    }
+                    let replacement = if qualifier.eq_ignore_ascii_case("EXCLUDED") {
+                        Token::Ident(format!(
+                            "{}{name}",
+                            crate::sql::upsert_where::EXCLUDED_PREFIX
+                        ))
+                    } else if qualifier == table_name {
+                        Token::Ident(name.clone())
+                    } else {
+                        return Err(SqlSurfaceError::undefined_table(qualifier.clone()));
+                    };
+                    rewrites.push((end, replacement));
+                }
+                _ => {}
+            }
+            end = end.saturating_add(1);
+        }
+        if !rewrites.is_empty() {
+            let tokens = self.tokens.to_mut();
+            for (idx, replacement) in rewrites {
+                if let Some(slot) = tokens.get_mut(idx) {
+                    *slot = replacement;
+                }
+            }
+        }
+        let condition = self.parse_where()?;
+        if self.pos != end {
+            return Err(SqlSurfaceError::unsupported(
+                "unexpected token in ON CONFLICT DO UPDATE WHERE",
+            ));
+        }
+        Ok(condition)
     }
 
     /// `DO UPDATE SET` の代入リスト（`,` 区切り。個数上限は [`MAX_UPDATE_SET_ASSIGNMENTS`]）。
@@ -23340,16 +23456,19 @@ mod tests {
             stmt.on_conflict,
             Some(OnConflictClause {
                 target: ConflictTargetSpec::Columns(vec!["id".to_string()]),
-                action: OnConflictAction::DoUpdate(vec![
-                    (
-                        "embedding".to_string(),
-                        UpsertValue::Excluded("embedding".to_string())
-                    ),
-                    (
-                        "lang".to_string(),
-                        UpsertValue::Literal(InsertLiteral::String("en".to_string()))
-                    ),
-                ]),
+                action: OnConflictAction::DoUpdate {
+                    assignments: vec![
+                        (
+                            "embedding".to_string(),
+                            UpsertValue::Excluded("embedding".to_string())
+                        ),
+                        (
+                            "lang".to_string(),
+                            UpsertValue::Literal(InsertLiteral::String("en".to_string()))
+                        ),
+                    ],
+                    condition: Vec::new(),
+                },
             })
         );
     }
@@ -23399,7 +23518,7 @@ mod tests {
             );
             let stmt = validate_insert(&sql, &lookup, LedgerMode::Ledgered).expect(&sql);
             let Some(OnConflictClause {
-                action: OnConflictAction::DoUpdate(a),
+                action: OnConflictAction::DoUpdate { assignments: a, .. },
                 ..
             }) = stmt.on_conflict
             else {
@@ -23415,7 +23534,7 @@ mod tests {
                    DO UPDATE SET a = a + 1, b = EXCLUDED.b USING OPERATION_ID 'op-add-2'";
         let stmt = validate_insert(sql, &lookup, LedgerMode::Ledgered).expect(sql);
         let Some(OnConflictClause {
-            action: OnConflictAction::DoUpdate(a),
+            action: OnConflictAction::DoUpdate { assignments: a, .. },
             ..
         }) = stmt.on_conflict
         else {
@@ -23437,7 +23556,7 @@ mod tests {
             );
             validate_insert(&sql, &lookup, LedgerMode::Ledgered).map(|stmt| {
                 let Some(OnConflictClause {
-                    action: OnConflictAction::DoUpdate(a),
+                    action: OnConflictAction::DoUpdate { assignments: a, .. },
                     ..
                 }) = stmt.on_conflict
                 else {
@@ -23524,6 +23643,62 @@ mod tests {
         }
     }
 
+    /// `DO UPDATE SET ... WHERE <条件>`（SQL-49 (3)、Issue #1740）の構文段: 修飾列は 1 対 1 に
+    /// 正規化され、`RETURNING`／`USING OPERATION_ID` と併用でき、`DO NOTHING WHERE`・
+    /// 未知の修飾子・予約接頭辞の偽装・余剰トークンは拒否される。
+    #[test]
+    fn upsert_do_update_where_parses_and_normalizes_qualifiers() {
+        let lookup = catalog_with(&["documents"]);
+        let parse = |wh: &str| {
+            let sql = format!(
+                "INSERT INTO documents (id, n) VALUES (1, 1) ON CONFLICT (id) DO UPDATE SET \
+                 n = EXCLUDED.n WHERE {wh} RETURNING n USING OPERATION_ID 'op-w'"
+            );
+            validate_insert(&sql, &lookup, LedgerMode::Ledgered)
+        };
+        for wh in [
+            "n = 1",
+            "documents.n < EXCLUDED.n",
+            "excluded.n IS NULL OR (n IN (1, 2) AND NOT (n = 3))",
+        ] {
+            let stmt = parse(wh).unwrap_or_else(|e| panic!("{wh}: {e:?}"));
+            let Some(OnConflictClause {
+                action: OnConflictAction::DoUpdate { condition, .. },
+                ..
+            }) = stmt.on_conflict
+            else {
+                panic!("expected DoUpdate: {wh}");
+            };
+            assert!(!condition.is_empty(), "{wh}");
+            let dbg = format!("{condition:?}");
+            assert!(!dbg.contains("QualifiedIdent"), "{wh}: {dbg}");
+            assert!(!dbg.contains("documents."), "{wh}: {dbg}");
+        }
+        let stmt = parse("documents.n < EXCLUDED.n").expect("qualified");
+        let Some(OnConflictClause {
+            action: OnConflictAction::DoUpdate { condition, .. },
+            ..
+        }) = stmt.on_conflict
+        else {
+            panic!("expected DoUpdate");
+        };
+        assert!(format!("{condition:?}").contains("excluded.n"));
+
+        assert_eq!(parse("other.n = 1").unwrap_err().wire_code(), "42P01");
+        assert_eq!(parse("documents.* = 1").unwrap_err().wire_code(), "42601");
+        assert_eq!(parse("n = 1 LIMIT 1").unwrap_err().wire_code(), "42601");
+        assert_eq!(parse("").unwrap_err().wire_code(), "42601");
+        // `DO NOTHING` に `WHERE` は付けられない（従来どおり余剰トークン）。
+        let sql = "INSERT INTO documents (id, n) VALUES (1, 1) ON CONFLICT (id) DO NOTHING \
+                   WHERE n = 1 USING OPERATION_ID 'op-w'";
+        assert_eq!(
+            validate_insert(sql, &lookup, LedgerMode::Ledgered)
+                .unwrap_err()
+                .wire_code(),
+            "42601"
+        );
+    }
+
     /// 引用付き `"null"` 列は加算の左オペランドとして受理し、引用なしの `NULL` 定数とは
     /// 区別する（引用なしは従来どおり `42601`）。
     #[test]
@@ -23533,7 +23708,7 @@ mod tests {
                    DO UPDATE SET \"null\" = \"null\" + 1 USING OPERATION_ID 'op-add-q'";
         let stmt = validate_insert(sql, &lookup, LedgerMode::Ledgered).expect(sql);
         let Some(OnConflictClause {
-            action: OnConflictAction::DoUpdate(a),
+            action: OnConflictAction::DoUpdate { assignments: a, .. },
             ..
         }) = stmt.on_conflict
         else {
@@ -23547,7 +23722,7 @@ mod tests {
                     DO UPDATE SET n = NULL + 1 USING OPERATION_ID 'op-add-q2'";
         let stmt = validate_insert(bare, &lookup, LedgerMode::Ledgered).expect(bare);
         let Some(OnConflictClause {
-            action: OnConflictAction::DoUpdate(a),
+            action: OnConflictAction::DoUpdate { assignments: a, .. },
             ..
         }) = stmt.on_conflict
         else {
@@ -23628,10 +23803,13 @@ mod tests {
             stmt.on_conflict,
             Some(OnConflictClause {
                 target: ConflictTargetSpec::Columns(vec!["id".to_string()]),
-                action: OnConflictAction::DoUpdate(vec![(
-                    "lang".to_string(),
-                    UpsertValue::Literal(InsertLiteral::Null)
-                )]),
+                action: OnConflictAction::DoUpdate {
+                    assignments: vec![(
+                        "lang".to_string(),
+                        UpsertValue::Literal(InsertLiteral::Null)
+                    )],
+                    condition: Vec::new(),
+                },
             })
         );
     }
@@ -23671,7 +23849,7 @@ mod tests {
             } else {
                 let stmt = insert_result.expect("structure ok");
                 let Some(OnConflictClause {
-                    action: OnConflictAction::DoUpdate(a),
+                    action: OnConflictAction::DoUpdate { assignments: a, .. },
                     ..
                 }) = stmt.on_conflict
                 else {
@@ -23714,10 +23892,13 @@ mod tests {
             stmt.on_conflict,
             Some(OnConflictClause {
                 target: ConflictTargetSpec::Columns(vec!["id".to_string()]),
-                action: OnConflictAction::DoUpdate(vec![(
-                    "lang".to_string(),
-                    UpsertValue::Expr(Expr::Ident("null".to_string()))
-                )]),
+                action: OnConflictAction::DoUpdate {
+                    assignments: vec![(
+                        "lang".to_string(),
+                        UpsertValue::Expr(Expr::Ident("null".to_string()))
+                    )],
+                    condition: Vec::new(),
+                },
             })
         );
         let err = validate_insert(
@@ -24131,7 +24312,7 @@ mod tests {
         )
         .expect("general expression in DO UPDATE SET");
         let Some(OnConflictClause {
-            action: OnConflictAction::DoUpdate(a),
+            action: OnConflictAction::DoUpdate { assignments: a, .. },
             ..
         }) = stmt.on_conflict
         else {
@@ -24346,16 +24527,26 @@ mod tests {
     }
 
     #[test]
-    fn rejects_upsert_do_update_set_where_clause() {
+    fn accepts_upsert_do_update_set_where_clause() {
+        // Issue #1740（SQL-49 (3)）で `DO UPDATE SET` の後ろの `WHERE` を受理するようになった
+        // （それまでは余剰トークンとして `42601`）。`DO NOTHING WHERE` は
+        // `upsert_do_update_where_parses_and_normalizes_qualifiers` が拒否を固定する。
         let lookup = catalog_with(&["documents"]);
-        let err = validate_insert(
+        let stmt = validate_insert(
             "INSERT INTO documents (id, lang) VALUES (1, 'ja') ON CONFLICT (id) \
              DO UPDATE SET lang = 'en' WHERE lang = 'ja' USING OPERATION_ID 'op-upsert-10'",
             &lookup,
             LedgerMode::Ledgered,
         )
-        .unwrap_err();
-        assert_eq!(err.wire_code(), "42601");
+        .expect("DO UPDATE SET ... WHERE should be accepted");
+        let Some(OnConflictClause {
+            action: OnConflictAction::DoUpdate { condition, .. },
+            ..
+        }) = stmt.on_conflict
+        else {
+            panic!("expected DoUpdate");
+        };
+        assert_eq!(condition.len(), 1);
     }
 
     #[test]
@@ -24397,7 +24588,7 @@ mod tests {
         )
         .expect("bare EXCLUDED parses as an identifier");
         let Some(OnConflictClause {
-            action: OnConflictAction::DoUpdate(a),
+            action: OnConflictAction::DoUpdate { assignments: a, .. },
             ..
         }) = stmt.on_conflict
         else {
@@ -25504,10 +25695,6 @@ mod tests {
                 .to_string()
         };
         // 未対応の ON CONFLICT 形は従来どおり fail-closed（Issue #2614）。
-        assert_eq!(
-            code("INSERT INTO t (a) SELECT a FROM x LIMIT 1 ON CONFLICT (a) DO UPDATE SET a = EXCLUDED.a WHERE a > 0"),
-            "42601"
-        );
         assert_eq!(
             code("INSERT INTO t (a) SELECT a FROM x LIMIT 1 ON CONFLICT DO UPDATE SET a = EXCLUDED.a"),
             "42601"

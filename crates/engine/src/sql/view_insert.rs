@@ -197,7 +197,18 @@ fn rewrite_on_conflict(
     };
     let action = match &clause.action {
         OnConflictAction::DoNothing => OnConflictAction::DoNothing,
-        OnConflictAction::DoUpdate(assignments) => {
+        OnConflictAction::DoUpdate {
+            assignments,
+            condition,
+        } => {
+            // 条件内の列（公開名）を物理名へ写す処理は未対応のため fail-closed で拒否する
+            // （SQL-49 (3)、Issue #1740。`check_constraint::map_predicate_columns` が流用できる
+            // 見込みだが、`EXCLUDED.` 接頭辞付き名の扱いを含めて将来の課題とする）。
+            if !condition.is_empty() {
+                return Err(SqlSurfaceError::feature_not_supported(
+                    "ON CONFLICT DO UPDATE WHERE is not supported through a view",
+                ));
+            }
             let mut out = Vec::with_capacity(assignments.len());
             for (col, value) in assignments {
                 let value = match value {
@@ -221,7 +232,10 @@ fn rewrite_on_conflict(
                 };
                 out.push((mapper.physical(col)?, value));
             }
-            OnConflictAction::DoUpdate(out)
+            OnConflictAction::DoUpdate {
+                assignments: out,
+                condition: Vec::new(),
+            }
         }
     };
     Ok(OnConflictClause { target, action })
@@ -425,6 +439,18 @@ mod tests {
         );
     }
 
+    /// `DO UPDATE ... WHERE`（SQL-49 (3)、Issue #1740）のビュー経由は未対応で、`0A000` で拒否する。
+    #[test]
+    fn do_update_where_through_a_view_is_not_supported() {
+        let err = rewrite(
+            vec![("v", def("docs", "SELECT id , title FROM docs", &[]))],
+            "INSERT INTO v (title) VALUES ('a') ON CONFLICT (title) DO UPDATE SET \
+             title = EXCLUDED.title WHERE title = 'a'",
+        )
+        .expect_err("where through a view");
+        assert!(matches!(err, SqlSurfaceError::FeatureNotSupported { .. }));
+    }
+
     /// 列別名つきビューは公開名で書き、列リスト・ON CONFLICT・`EXCLUDED`・`RETURNING` が物理名へ写る。
     #[test]
     fn aliased_view_maps_every_position_to_physical_names() {
@@ -450,10 +476,13 @@ mod tests {
         );
         assert_eq!(
             oc.action,
-            OnConflictAction::DoUpdate(vec![(
-                "title".to_string(),
-                UpsertValue::Excluded("title".to_string())
-            )])
+            OnConflictAction::DoUpdate {
+                assignments: vec![(
+                    "title".to_string(),
+                    UpsertValue::Excluded("title".to_string())
+                )],
+                condition: Vec::new(),
+            }
         );
         assert_eq!(
             r.insert.returning,

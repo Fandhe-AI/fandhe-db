@@ -2407,8 +2407,31 @@ pub(crate) enum UpsertAction<'a> {
     /// (`schema.columns` の対象列インデックス, 右辺) の宣言順スライス
     /// （並べ替えない。`content_hash::for_typed_upsert` の再送判定がこの順序に
     /// 依存する）。
-    DoUpdate(&'a [(usize, UpsertSetValue<'a>)]),
+    ///
+    /// 第 2 要素は `DO UPDATE SET ... WHERE <条件>` の評価クロージャ（SQL-49 (3)、
+    /// Issue #1740。`None` なら `WHERE` なし）。`sql` へ依存しない設計を保つため、
+    /// 束縛・評価は呼び出し元（`sql::exec::execute_upsert_inner`）が
+    /// [`UpsertWhereFn`] に閉じ込めて渡す。
+    DoUpdate(&'a [(usize, UpsertSetValue<'a>)], Option<UpsertWhere<'a>>),
 }
+
+/// `DO UPDATE ... WHERE` の条件（Issue #1740）。`eval` は評価クロージャ、`predicates` は
+/// 内容照合ハッシュ（`content_hash::UpsertHashAction::DoUpdateWhere`）へ渡す述語列で、
+/// WHERE の有無・内容が異なる同一 `operation_id` の再送を `22023` で弾くために使う。
+#[derive(Clone, Copy)]
+pub(crate) struct UpsertWhere<'a> {
+    pub(crate) eval: UpsertWhereFn<'a>,
+    pub(crate) predicates: &'a [crate::sql::allowlist::WherePredicate],
+}
+
+/// `DO UPDATE ... WHERE` 条件の評価関数（Issue #1740）。引数は (衝突した既存行の
+/// スカラービュー, 挿入しようとした行の値列〔`EXCLUDED`〕, 既存行の `id`)。`true` のときだけ
+/// 更新し、偽と NULL は `false`。`Err` は文全体を abort する（行・台帳とも痕跡を残さない）。
+pub(crate) type UpsertWhereFn<'a> = &'a dyn Fn(
+    &[Option<crate::row_codec::ScalarRef<'_>>],
+    &[crate::row_codec::Value],
+    u64,
+) -> Result<bool, SqlSurfaceError>;
 
 /// [`upsert_typed_rows_unchecked`] の衝突対象（TABLE-16・Issue #1074）。
 /// `sql::parser::BoundConflictTarget` に対応する最小表現（`sql` に依存しない
@@ -2581,7 +2604,7 @@ fn upsert_typed_rows_impl(
     }
     // 式つきの代入は束縛時スキーマとの照合（`expected_schema`）が前提（列 index で結び付くため。
     // SQL-49、Issue #1739）。無ければ fail-closed に拒否する。
-    if let UpsertAction::DoUpdate(assignments) = action {
+    if let UpsertAction::DoUpdate(assignments, _) = action {
         if expected_schema.is_none()
             && assignments
                 .iter()
@@ -2660,6 +2683,14 @@ fn upsert_typed_rows_impl(
                         "table schema changed after the insert values were bound".to_string(),
                     )));
                 }
+            }
+            // 束縛済みの `DO UPDATE ... WHERE` 条件は列 index で束縛時スキーマに結び付く。
+            // `expected_schema` が無ければ同一性を確認できないため拒否する（Issue #1740）。
+            if matches!(action, UpsertAction::DoUpdate(_, Some(_))) && expected_schema.is_none() {
+                return Err(TenantWriteError::Catalog(CatalogError::Invalid(
+                    "internal: ON CONFLICT DO UPDATE WHERE requires the bound table schema"
+                        .to_string(),
+                )));
             }
             // 採番方式の表（TABLE-23・Issue #2199）: 利用者指定の行 id が無いため行 id の重複検出は
             // 従来方式の表だけが対象で、衝突対象は `(id)` の行キー指定ではなく PRIMARY KEY／UNIQUE
@@ -2768,7 +2799,7 @@ fn upsert_typed_rows_impl(
             // 借用するため、`hash_assignments` は `match` の外側で寿命を確保する）。
             let mut hash_assignments: Vec<(String, content_hash::UpsertAssignmentHashValue<'_>)> =
                 Vec::new();
-            if let UpsertAction::DoUpdate(assignments) = action {
+            if let UpsertAction::DoUpdate(assignments, _) = action {
                 hash_assignments
                     .try_reserve_exact(assignments.len())
                     .map_err(|_| {
@@ -2828,10 +2859,19 @@ fn upsert_typed_rows_impl(
                     hash_assignments.push((col_name.to_string(), hash_value));
                 }
             }
+            // WHERE 条件は束縛時に空の UDF レジストリで検証済み（UDF 参照は束縛段で拒否）。
+            let hash_udf_registry = crate::sql::udf_call::UdfRegistry::default();
             let hash_action = match action {
                 UpsertAction::DoNothing => content_hash::UpsertHashAction::DoNothing,
-                UpsertAction::DoUpdate(_) => {
+                UpsertAction::DoUpdate(_, None) => {
                     content_hash::UpsertHashAction::DoUpdate(&hash_assignments)
+                }
+                UpsertAction::DoUpdate(_, Some(w)) => {
+                    content_hash::UpsertHashAction::DoUpdateWhere {
+                        assignments: &hash_assignments,
+                        predicates: w.predicates,
+                        udf_registry: &hash_udf_registry,
+                    }
                 }
             };
             // UNIQUE 対象の列名（解決した制約の宣言順。`target` の `indices` と同じ
@@ -3035,7 +3075,7 @@ fn upsert_typed_rows_impl(
                                             // `DO UPDATE` のみ read-merge-write のため本体が要る。
                                             // `DO NOTHING` は可視・不可視で応答差が出ないよう本体を
                                             // 読まない。
-                                            UpsertAction::DoUpdate(_) => {
+                                            UpsertAction::DoUpdate(..) => {
                                                 ConflictState::Visible(Some(
                                                     crate::storage::decode_row_for_key(
                                                         ctx.tenant_id(),
@@ -3066,7 +3106,7 @@ fn upsert_typed_rows_impl(
                         // 書き込み意図を黙って捨てず文全体を拒否する。`Err` で `with_txn` が
                         // write トランザクションを drop・abort し、行・台帳とも痕跡ゼロ
                         // （RECOVER-11）。
-                        UpsertAction::DoUpdate(_) => {
+                        UpsertAction::DoUpdate(..) => {
                             return Err(TenantWriteError::ConflictTargetNotVisible);
                         }
                     }
@@ -3084,7 +3124,7 @@ fn upsert_typed_rows_impl(
                         UpsertAction::DoNothing => {
                             // 変更なし（新規挿入もしない）。
                         }
-                        UpsertAction::DoUpdate(assignments) => {
+                        UpsertAction::DoUpdate(assignments, condition) => {
                             let existing = match existing_opt {
                                 Some(row) => row,
                                 None => {
@@ -3096,6 +3136,23 @@ fn upsert_typed_rows_impl(
                                     )));
                                 }
                             };
+                            // `DO UPDATE ... WHERE`（SQL-49 (3)、Issue #1740）: 所有かつ可視と確定した
+                            // 衝突行だけを、書き換え・`pre_images` 記録・`RETURNING` 投影・件数加算の
+                            // **前**に評価する。偽・NULL の行は何も残さず次の行へ進み、SET の右辺も
+                            // 評価しない（偽の行で加算の範囲外等が起きない）。評価エラーは文全体を
+                            // abort する。
+                            if let Some(condition) = condition {
+                                let existing_view = crate::row_codec::scan_scalar_columns(
+                                    &schema,
+                                    &existing.metadata,
+                                )
+                                .map_err(|e| CatalogError::Invalid(e.to_string()))?;
+                                let take = (condition.eval)(&existing_view, values, write_id)
+                                    .map_err(TenantWriteError::SetExpressionEvaluationFailed)?;
+                                if !take {
+                                    continue;
+                                }
+                            }
                             // read-merge-write: 既存行のスカラー列を復元し、SET 対象
                             // 列だけを新しい値で上書きする（宣言順を保持する必要は
                             // ない——最終的な行内容は適用順に依存しない一意な値へ
@@ -3384,7 +3441,7 @@ fn upsert_typed_rows_impl(
                 // 再利用する（`key_index.rs` モジュールドキュメント参照）。`pre_images`
                 // は ON UPDATE 参照アクション（Issue #1076）の連鎖起点。
                 if updated > 0 {
-                    if let UpsertAction::DoUpdate(assignments) = action {
+                    if let UpsertAction::DoUpdate(assignments, _) = action {
                         let updated_columns: Vec<usize> =
                             assignments.iter().map(|(idx, _)| *idx).collect();
                         crate::constraint::enforce_referencing_rows_in_txn(
@@ -9474,7 +9531,7 @@ mod tests {
         // 拒否するはずの形。本関数単体の fail-closed 契約を直接検証する）。
         let null_value = crate::row_codec::Value::Null;
         let assignments = [(0usize, UpsertSetValue::Literal(&null_value))];
-        let action = UpsertAction::DoUpdate(&assignments);
+        let action = UpsertAction::DoUpdate(&assignments, None);
         // 行の `values`（`(id, values)`）は衝突判定より前のハッシュ材料組み立て
         // でも `values[vector_idx]` を `Value::Vector` として要求するため、
         // 実際には使われない（`DO UPDATE` は SET 対象列だけを反映し `values` の
@@ -9512,6 +9569,127 @@ mod tests {
             "拒否された SET が既存 embedding を書き換えてはならない"
         );
     }
+    // Issue #1740（SQL-49 (3)）: `DO UPDATE ... WHERE` の評価クロージャが偽を返した行は、
+    // 更新・件数・テーブル世代のいずれも進めない。`Err` は文全体を abort する。
+    #[test]
+    fn upsert_do_update_where_false_skips_row_and_error_aborts() {
+        let path = unique_db_path("upsert-where-skip");
+        let _cleanup = CleanupGuard(path.clone());
+        let storage = Storage::open(&path).expect("open storage");
+        storage.create_table(&schema("docs")).expect("create table");
+        let ctx = PolicyContext::new("tenant-a").expect("valid tenant");
+        let op_id = OperationId::parse("op-seed").expect("valid operation_id");
+        insert_row(
+            &storage,
+            "docs",
+            &ctx,
+            1,
+            &RowInput {
+                tenant_id: "tenant-a",
+                visibility: Visibility::Public,
+                embedding: &[1.0, 0.0],
+                metadata: &[],
+            },
+            &op_id,
+        )
+        .expect("seed row insert must succeed");
+
+        let new_vector = crate::row_codec::Value::Vector(vec![5.0, 5.0]);
+        let assignments = [(0usize, UpsertSetValue::Excluded(0))];
+        let values = [new_vector];
+        let rows: [(u64, &[crate::row_codec::Value]); 1] = [(1, &values)];
+        let generation_before = storage.table_generation("docs").expect("generation");
+
+        let skip = |_: &[Option<crate::row_codec::ScalarRef<'_>>],
+                    _: &[crate::row_codec::Value],
+                    _: u64|
+         -> Result<bool, SqlSurfaceError> { Ok(false) };
+        let outcome = upsert_typed_rows_unchecked(
+            WriteTarget::Autocommit(&storage),
+            "docs",
+            &ctx,
+            Visibility::Private,
+            &rows,
+            &UpsertTarget::RowId,
+            &UpsertAction::DoUpdate(
+                &assignments,
+                Some(UpsertWhere {
+                    eval: &skip,
+                    predicates: &[],
+                }),
+            ),
+            LedgerWrite::Disabled,
+            Some(&schema("docs")),
+            &[],
+        )
+        .expect("skipped upsert succeeds");
+        assert_eq!((outcome.inserted, outcome.updated), (0, 0));
+        assert_eq!(
+            storage.table_generation("docs").expect("generation"),
+            generation_before
+        );
+        let row = visible_rows(&storage, "docs", &ctx)
+            .expect("visible_rows")
+            .into_iter()
+            .find(|r| r.id == 1)
+            .expect("row");
+        assert_eq!(row.embedding, vec![1.0, 0.0]);
+
+        let fail = |_: &[Option<crate::row_codec::ScalarRef<'_>>],
+                    _: &[crate::row_codec::Value],
+                    _: u64|
+         -> Result<bool, SqlSurfaceError> {
+            Err(SqlSurfaceError::Internal {
+                detail: "boom".to_string(),
+            })
+        };
+        let err = upsert_typed_rows_unchecked(
+            WriteTarget::Autocommit(&storage),
+            "docs",
+            &ctx,
+            Visibility::Private,
+            &rows,
+            &UpsertTarget::RowId,
+            &UpsertAction::DoUpdate(
+                &assignments,
+                Some(UpsertWhere {
+                    eval: &fail,
+                    predicates: &[],
+                }),
+            ),
+            LedgerWrite::Disabled,
+            Some(&schema("docs")),
+            &[],
+        )
+        .expect_err("evaluation error aborts");
+        assert!(matches!(
+            err,
+            TenantWriteError::SetExpressionEvaluationFailed(_)
+        ));
+
+        // 条件を渡すのに `expected_schema` が無い呼び出しは fail-closed に拒否する。
+        let err = upsert_typed_rows_unchecked(
+            WriteTarget::Autocommit(&storage),
+            "docs",
+            &ctx,
+            Visibility::Private,
+            &rows,
+            &UpsertTarget::RowId,
+            &UpsertAction::DoUpdate(
+                &assignments,
+                Some(UpsertWhere {
+                    eval: &skip,
+                    predicates: &[],
+                }),
+            ),
+            LedgerWrite::Disabled,
+            None,
+            &[],
+        )
+        .expect_err("condition requires the bound schema");
+        assert!(matches!(err, TenantWriteError::Catalog(_)));
+    }
+
     // ---- Issue #1182: UPDATE・述語形 DELETE・UPSERT の `RETURNING` 投影コールバック ----
     //
     // いずれも `project` が `Err` を返した場合に、行変更・台帳追記の**どちらも**
@@ -9870,7 +10048,7 @@ mod tests {
             Visibility::Private,
             &rows,
             &UpsertTarget::RowId,
-            &UpsertAction::DoUpdate(&assignments),
+            &UpsertAction::DoUpdate(&assignments, None),
             ledger2(),
             None,
             &[],
@@ -9987,7 +10165,7 @@ mod tests {
             &ctx,
             &rows,
             &UpsertTarget::RowId,
-            &UpsertAction::DoUpdate(&assignments),
+            &UpsertAction::DoUpdate(&assignments, None),
             "op-1254-upd",
             &mut n,
         )
@@ -10006,7 +10184,7 @@ mod tests {
             &ctx_all,
             &rows,
             &UpsertTarget::RowId,
-            &UpsertAction::DoUpdate(&assignments),
+            &UpsertAction::DoUpdate(&assignments, None),
             "op-1254-upd",
             &mut n,
         )
@@ -10080,7 +10258,7 @@ mod tests {
             &ctx,
             &rows,
             &UpsertTarget::RowId,
-            &UpsertAction::DoUpdate(&assignments),
+            &UpsertAction::DoUpdate(&assignments, None),
             "op-1254-c2",
             &mut n,
         )
@@ -10226,7 +10404,7 @@ mod tests {
                 &ctx,
                 &rows,
                 &target,
-                &UpsertAction::DoUpdate(&assignments),
+                &UpsertAction::DoUpdate(&assignments, None),
                 &format!("op-1254-{tag}-u"),
                 n,
             );
