@@ -100,10 +100,11 @@ fn parse_rejects_unsupported_forms_fail_closed() {
     let (core, path, _s) = setup("sql51-reject");
     let _g = CleanupGuard(path);
     let cases: &[(&str, &str)] = &[
-        // ON CONFLICT との併用は別 Issue
+        // ON CONFLICT 併用の未対応形は fail-closed（併用自体は Issue #2614 で受理）
         (
-            "INSERT INTO dst (id, a) SELECT id, a FROM src LIMIT 3 ON CONFLICT (id) DO NOTHING",
-            "0A000",
+            "INSERT INTO dst (id, a) SELECT id, a FROM src LIMIT 3 \
+             ON CONFLICT (id) DO UPDATE SET a = EXCLUDED.a WHERE dst.a > 0",
+            "42601",
         ),
         // 空の問い合わせ
         ("INSERT INTO dst (id, a) RETURNING id", "42601"),

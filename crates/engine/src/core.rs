@@ -5219,7 +5219,20 @@ impl EngineCore {
                 detail: "internal error".to_string(),
             })?;
         let (_read_txn, schema) = self.read_txn_with_schema(&stmt.table_name)?;
-        crate::sql::insert_select::bind(stmt, &schema, &source)
+        let bound = crate::sql::insert_select::bind(stmt, &schema, &source)?;
+        // `ON CONFLICT` 併用（Issue #2614）の静的な誤りは Describe 段・内側 SELECT の評価前に返す
+        // （`42P10`／`42704`／`42809` 等）。結果は捨て、実行本体が自分で取得したスキーマで再束縛する
+        // （スキーマ取得と書き込みの間の差を TOCTOU として扱わないため）。
+        if let Some(clause) = stmt.on_conflict.as_ref() {
+            self.reject_index_derived_conflict_constraint(&stmt.table_name, Some(clause))?;
+            crate::sql::parser::bind_conflict_clause(clause, &schema)?;
+            // 移行済み表で `id` 省略の UPSERT は実行本体と同じ条件で bind 時にも拒否する
+            // （Describe 成功・Execute 必ず拒否の食い違いを作らない）。
+            let targets =
+                crate::sql::insert_select::resolve_target_columns(&schema, Some(&bound.columns))?;
+            crate::sql::insert_select::reject_omitted_id_upsert(&schema, &targets)?;
+        }
+        Ok(bound)
     }
 
     /// Issue #927・SQL-29 (a)・TASK-213: `Self::parse_sql_prepared` が拡張
@@ -12178,21 +12191,22 @@ impl EngineCore {
     /// （`execute_insert_form`・`execute_insert_returning_form`・ファイル形バッチの 3 経路から呼ぶ）。
     /// スキーマ取得と本判定は別 txn だが、競合しても返るエラーコードが入れ替わるだけで、
     /// 書き込みは既存の世代検査で保護される。カタログ I/O 失敗は固定文言の `Internal` に丸める。
+    ///
+    /// `table_name`・`on_conflict` を直接受けるのは、VALUES 形（`ValidatedInsert`）と
+    /// `INSERT ... SELECT`（`ValidatedInsertSelect`。Issue #2614）で共有するため。
     fn reject_index_derived_conflict_constraint(
         &self,
-        stmt: &crate::sql::allowlist::ValidatedInsert,
+        table_name: &str,
+        on_conflict: Option<&crate::sql::allowlist::OnConflictClause>,
     ) -> Result<(), crate::sql::allowlist::SqlSurfaceError> {
         let Some(crate::sql::allowlist::OnConflictClause {
             target: crate::sql::allowlist::ConflictTargetSpec::Constraint(name),
             ..
-        }) = &stmt.on_conflict
+        }) = on_conflict
         else {
             return Ok(());
         };
-        match self
-            .storage
-            .is_unique_index_of_table(&stmt.table_name, name)
-        {
+        match self.storage.is_unique_index_of_table(table_name, name) {
             Ok(false) => Ok(()),
             Ok(true) => {
                 Err(crate::sql::allowlist::SqlSurfaceError::UndefinedObject { name: name.clone() })
@@ -12241,7 +12255,7 @@ impl EngineCore {
                     },
                 })?,
         };
-        self.reject_index_derived_conflict_constraint(stmt)?;
+        self.reject_index_derived_conflict_constraint(&stmt.table_name, stmt.on_conflict.as_ref())?;
         let bound = crate::sql::parser::bind_insert_form(stmt, &schema)?;
         match bound {
             crate::sql::parser::BoundInsertForm::Row(bound) => {
@@ -12339,7 +12353,7 @@ impl EngineCore {
             .ok_or_else(|| crate::sql::allowlist::SqlSurfaceError::Internal {
                 detail: "execute_insert_returning_form called without RETURNING".to_string(),
             })?;
-        self.reject_index_derived_conflict_constraint(stmt)?;
+        self.reject_index_derived_conflict_constraint(&stmt.table_name, stmt.on_conflict.as_ref())?;
         let bound = crate::sql::parser::bind_insert_form(stmt, &schema)?;
         match bound {
             crate::sql::parser::BoundInsertForm::Row(bound) => {
@@ -13423,7 +13437,10 @@ impl EngineCore {
                         },
                     })?,
             };
-            self.reject_index_derived_conflict_constraint(&stmt)?;
+            self.reject_index_derived_conflict_constraint(
+                &stmt.table_name,
+                stmt.on_conflict.as_ref(),
+            )?;
             let bound = crate::sql::parser::bind_insert_form(&stmt, &schema)?;
             match bound {
                 crate::sql::parser::BoundInsertForm::File(file_bound) => {

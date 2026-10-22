@@ -2667,7 +2667,11 @@ fn upsert_typed_rows_impl(
             let allocated = schema.is_allocated();
             if allocated {
                 schema.require_legacy_row_identity_unless_unique_target(target)?;
-            } else if !matches!(target, UpsertTarget::AnyUnique) {
+            } else if matches!(target, UpsertTarget::RowId) {
+                // UNIQUE／対象省略の対象では事前の id 重複検査をしない（Issue #2614）。INSERT ... SELECT
+                // 由来の行は id が重複し得るが、衝突でスキップ・更新される行は新規挿入しないため
+                // id の一意性は問われない。実際に新規挿入する行は `insert_unique_row` が既存行・
+                // 同一文内の先行挿入行との id 重複を `IdConflict`（`23505`）で拒否する。
                 // バッチ内 id 重複検出（`insert_typed_rows_unchecked` と同じ設計。確保はフォール
                 // ブルにする）。呼び出し元 `sql::parser::bind_upsert_form` が束縛時点で既に `22000` として
                 // 拒否済みのため通常は到達しないが、本関数単体でも fail-closed を保つ。`VALUES` の
