@@ -53,9 +53,12 @@ use std::thread;
 use std::time::{Duration, Instant};
 
 use engine::catalog::{ColumnDef, ColumnType, TableSchema};
+use engine::core::EngineCore;
+use engine::kernel::CpuScalarProvider;
 use engine::policy::PolicyContext;
 use engine::recovery::required_op_id::OperationId;
 use engine::row_codec::Value;
+use engine::sql::mode::SessionState;
 use engine::storage::{Storage, Visibility};
 use engine::uuid::Uuid;
 use wire_server::result_encoder::binary;
@@ -2579,6 +2582,589 @@ fn psycopg_natural_binary_params_outside_the_compat_table_fail_closed() {
             String::from_utf8_lossy(&out.stdout).starts_with("after:"),
             "{name}"
         );
+    }
+    drop(env);
+}
+// --- Issue #2433: 非等価・BETWEEN の `$n` のリテラル形一致と RLS（SQL-78・SQL-24・SQL-19・WIRE-12・TASK-336 のポインタ） ---
+//
+// 層 A（`wire_sql78_noneq_between_rls.rs`）が確定オラクルとして固定した「非 NULL の Bind は同じ値の
+// リテラル形（簡易クエリ）と同じ結果になる」「他テナントの行・存在情報が現れない」を、無改造の実
+// クライアントからも確認する。比較の原則:
+// - 比較は**同一クライアント内**で行う（拡張 `$n` 形 vs 同じクライアントの簡易クエリ）。ドライバごとの
+//   値の表記差（真偽・日付など）を比較に持ち込まないため、結果は `label`（TEXT）列だけを読む。
+// - 受理か拒否かはリテラル形に追従させ、SQLSTATE は値を直書きせず両形の一致だけを固定する。
+// - 行集合はソートして比べる（順序は本題ではない）。
+// - 状態を変える DML は、クライアント・形ごとに新しい環境（DB・サーバー）を起動して分離する。
+// - 表は SQL の `CREATE TABLE`（暗黙の `id` を持たない採番方式）で作る。BOOLEAN の比較と TEXT の
+//   BETWEEN が `TableSchema::new` の表では `22000` になるため、リテラル形と比べられる範囲が広い。
+
+/// `r` の各列（`n INTEGER, b BIGINT, d DOUBLE PRECISION, s TEXT, day DATE, u UUID, flag BOOLEAN`）。
+const RANGE_COLS: [&str; 7] = ["n", "b", "d", "s", "day", "u", "flag"];
+/// tenant-a と tenant-b は `n` の値域を交互に重ねて持つ（`n > 0` が漏れれば両テナントにまたがる）。
+const RANGE_A_VALUES: [u32; 3] = [1, 5, 9];
+const RANGE_B_VALUES: [u32; 3] = [2, 6, 10];
+const RANGE_SEL_TAIL: &str = "ORDER BY label LIMIT 100";
+
+fn range_raw(col: &str, v: u32) -> String {
+    match col {
+        "n" => v.to_string(),
+        "b" => (v * 100).to_string(),
+        "d" => format!("{v}.5"),
+        "s" => format!("s{v:02}"),
+        "day" => format!("2024-01-{v:02}"),
+        "u" => format!("00000000-0000-0000-0000-{v:012}"),
+        "flag" => (v % 2 == 1).to_string(),
+        other => panic!("unknown column {other}"),
+    }
+}
+
+/// リテラル形での値の書き方。数値は素のまま、それ以外は `'..'`（`'` は二重化）。BOOLEAN 列の
+/// `BETWEEN` 境界は文字列リテラルが受理形のため、`between` のときは `flag` も引用する。
+fn range_literal(col: &str, raw: &str, between: bool) -> String {
+    match col {
+        "n" | "b" | "d" => raw.to_string(),
+        "flag" if !between => raw.to_string(),
+        _ => format!("'{}'", raw.replace('\'', "''")),
+    }
+}
+
+/// `r` を載せたサーバー一式（子プロセス・DB・ユーザーファイルの寿命を束ねる）。
+struct RangeEnv {
+    server: ServerGuard,
+    _db: temp_db::CleanupGuard,
+    _users_dir: temp_db::TempDir,
+}
+
+/// SQL の `CREATE TABLE` と SQL の `INSERT`（所有テナントの Private 行になる）で seed した DB を作り、
+/// サーバーを起動する。seed 用の engine はサーバー起動前に drop する（DB のロックを解放する）。
+fn start_range_env(tag: &str) -> RangeEnv {
+    let path = temp_db::unique_db_path(&format!("three-client-range-{tag}"));
+    let db = temp_db::CleanupGuard(path.clone());
+    {
+        let storage = Storage::open(&path).expect("open storage");
+        let core = EngineCore::from_storage(storage, Box::new(CpuScalarProvider));
+        let mut ddl = SessionState::default();
+        ddl.allow_ddl();
+        core.execute_sql_in_session(
+            &PolicyContext::new("tenant-a").expect("valid tenant"),
+            &mut ddl,
+            "CREATE TABLE r (n INTEGER, b BIGINT, d DOUBLE PRECISION, s TEXT, day DATE, u UUID, \
+             flag BOOLEAN, label TEXT)",
+        )
+        .expect("create table r");
+        for (tenant, prefix, values) in [
+            ("tenant-a", "a", RANGE_A_VALUES),
+            ("tenant-b", "b", RANGE_B_VALUES),
+        ] {
+            let mut session = SessionState::default();
+            for v in values {
+                core.execute_sql_in_session(
+                    &PolicyContext::new(tenant).expect("valid tenant"),
+                    &mut session,
+                    &format!(
+                        "INSERT INTO r (n, b, d, s, day, u, flag, label) VALUES ({n}, {b}, {d}, \
+                         '{s}', '{day}', '{u}', {flag}, '{prefix}-{v}') \
+                         USING OPERATION_ID 'range-seed-{prefix}-{v}'",
+                        n = range_raw("n", v),
+                        b = range_raw("b", v),
+                        d = range_raw("d", v),
+                        s = range_raw("s", v),
+                        day = range_raw("day", v),
+                        u = range_raw("u", v),
+                        flag = v % 2 == 1,
+                    ),
+                )
+                .expect("seed insert");
+            }
+        }
+    }
+    let users_dir = temp_db::TempDir::new(&format!("three-client-range-{tag}-users"));
+    let users_path = users_dir.path().join("users.txt");
+    write_users_file(&users_path);
+    let server = spawn_wire_server(&users_path, &path);
+    RangeEnv {
+        server,
+        _db: db,
+        _users_dir: users_dir,
+    }
+}
+
+/// 簡易クエリ（'Q'）で `sql` を 1 文送る。psql は `-c`、psycopg は `ClientCursor`、node pg は
+/// values なしの `query(text)`（いずれも既存の簡易クエリ用ハーネスと同じ駆動方法）。
+/// 拒否の SQLSTATE を読めるよう psql は `VERBOSITY=verbose` で起動する。
+fn spawn_simple(
+    client: Client,
+    port: u16,
+    user: &str,
+    password: &str,
+    sql: &str,
+) -> std::process::Output {
+    match client {
+        Client::Psql => {
+            let psql = resolve_tool("PSQL_BIN", "psql");
+            Command::new(&psql)
+                .env("PGPASSWORD", password)
+                .args([
+                    "-h",
+                    "127.0.0.1",
+                    "-p",
+                    &port.to_string(),
+                    "-U",
+                    user,
+                    "-d",
+                    "irrelevant-db-name",
+                    "-X",
+                    "-w",
+                    "-q",
+                    "-At",
+                    "-F",
+                    "|",
+                    "-v",
+                    "ON_ERROR_STOP=1",
+                    "-v",
+                    "VERBOSITY=verbose",
+                    "-c",
+                    sql,
+                ])
+                .output()
+                .unwrap_or_else(|e| panic!("failed to spawn {psql}: {e}"))
+        }
+        Client::Psycopg => {
+            let python = resolve_tool("PYTHON_BIN", "python3");
+            let script =
+                Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/three_client/psycopg_client.py");
+            Command::new(&python)
+                .arg(&script)
+                .env("WIRE_HOST", "127.0.0.1")
+                .env("WIRE_PORT", port.to_string())
+                .env("WIRE_USER", user)
+                .env("WIRE_PASSWORD", password)
+                .env("WIRE_SQL", sql)
+                .output()
+                .unwrap_or_else(|e| panic!("failed to spawn {python}: {e}"))
+        }
+        Client::Pg => {
+            let node = resolve_tool("NODE_BIN", "node");
+            let script =
+                Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/three_client/pg_client.js");
+            Command::new(&node)
+                .arg(&script)
+                .env("WIRE_HOST", "127.0.0.1")
+                .env("WIRE_PORT", port.to_string())
+                .env("WIRE_USER", user)
+                .env("WIRE_PASSWORD", password)
+                .env("WIRE_SQL", sql)
+                .output()
+                .unwrap_or_else(|e| panic!("failed to spawn {node}: {e}"))
+        }
+    }
+}
+
+/// stderr から SQLSTATE を取り出す。psycopg／pg は `[SQLSTATE=XXXXX]`、psql（verbose）は
+/// `ERROR:  XXXXX:`。取れなければ panic する（fail-closed: 想定外の失敗を「一致」と誤認しない）。
+fn sqlstate_of(client: Client, stderr: &str) -> String {
+    let code = match client {
+        Client::Psql => stderr
+            .split("ERROR:  ")
+            .nth(1)
+            .and_then(|rest| rest.get(..5)),
+        _ => stderr
+            .split("[SQLSTATE=")
+            .nth(1)
+            .and_then(|rest| rest.get(..5)),
+    };
+    let code = code.unwrap_or_else(|| panic!("{client:?}: no SQLSTATE in stderr: {stderr}"));
+    assert!(
+        code.chars().all(|c| c.is_ascii_alphanumeric()),
+        "{client:?}: malformed SQLSTATE {code:?} in {stderr}"
+    );
+    code.to_string()
+}
+
+/// 実行結果を「ソート済みの行集合（`<型名>:` を除去）」または「SQLSTATE」へ畳む。
+fn fold_output(client: Client, output: &std::process::Output) -> Result<Vec<String>, String> {
+    if output.status.success() {
+        let mut rows = untag(
+            &String::from_utf8_lossy(&output.stdout)
+                .lines()
+                .map(|l| l.trim().to_string())
+                .filter(|l| !l.is_empty())
+                .collect::<Vec<_>>(),
+        );
+        rows.sort();
+        Ok(rows)
+    } else {
+        Err(sqlstate_of(
+            client,
+            &String::from_utf8_lossy(&output.stderr),
+        ))
+    }
+}
+
+/// 拡張 `$n` 形の実行（psql は verbose、psycopg／pg は text の OID 0 パラメータ）。
+fn ext_folded(
+    client: Client,
+    port: u16,
+    user: &str,
+    password: &str,
+    sql: &str,
+    params: &[&str],
+) -> Result<Vec<String>, String> {
+    let output = if client == Client::Psql {
+        spawn_psql_bind(port, user, password, sql, params, true)
+    } else {
+        spawn_client(client, port, user, password, sql, params, Opts::default())
+    };
+    fold_output(client, &output)
+}
+
+fn simple_folded(
+    client: Client,
+    port: u16,
+    user: &str,
+    password: &str,
+    sql: &str,
+) -> Result<Vec<String>, String> {
+    fold_output(client, &spawn_simple(client, port, user, password, sql))
+}
+
+/// 拡張形（`$n`）とリテラル形の組。
+struct RangeCase {
+    ext: String,
+    literal: String,
+    values: Vec<String>,
+}
+
+fn range_cases() -> Vec<RangeCase> {
+    let head = "SELECT label FROM r WHERE";
+    let tail = RANGE_SEL_TAIL;
+    let mut cases = Vec::new();
+    for col in RANGE_COLS {
+        let mid = range_raw(col, 5);
+        for op_sym in [">", "<>"] {
+            cases.push(RangeCase {
+                ext: format!("{head} {col} {op_sym} $1 {tail}"),
+                literal: format!(
+                    "{head} {col} {op_sym} {} {tail}",
+                    range_literal(col, &mid, false)
+                ),
+                values: vec![mid.clone()],
+            });
+        }
+        let (lo, hi) = (range_raw(col, 2), range_raw(col, 6));
+        for neg in ["", "NOT "] {
+            cases.push(RangeCase {
+                ext: format!("{head} {col} {neg}BETWEEN $1 AND $2 {tail}"),
+                literal: format!(
+                    "{head} {col} {neg}BETWEEN {} AND {} {tail}",
+                    range_literal(col, &lo, true),
+                    range_literal(col, &hi, true)
+                ),
+                values: vec![lo.clone(), hi.clone()],
+            });
+        }
+    }
+    cases.push(RangeCase {
+        ext: format!("{head} n > $1 AND s <= $2 {tail}"),
+        literal: format!("{head} n > 1 AND s <= 's06' {tail}"),
+        values: vec!["1".into(), "s06".into()],
+    });
+    cases.push(RangeCase {
+        ext: format!("{head} n < $1 OR day >= $2 {tail}"),
+        literal: format!("{head} n < 3 OR day >= '2024-01-09' {tail}"),
+        values: vec!["3".into(), "2024-01-09".into()],
+    });
+    // 不正値・インジェクション風の値は不透明なリテラルのまま扱われる（結果はリテラル形に追従）。
+    for (col, bad) in [("day", "not-a-date"), ("n", "abc"), ("s", "x' OR '1'='1")] {
+        cases.push(RangeCase {
+            ext: format!("{head} {col} <> $1 {tail}"),
+            literal: format!("{head} {col} <> '{}' {tail}", bad.replace('\'', "''")),
+            values: vec![bad.to_string()],
+        });
+    }
+    cases
+}
+
+/// 常時実行のガード: seed の値域が両テナントにまたがる（`n > 0` が漏れれば他テナントの行が
+/// 見える）形であり、ケース表が全列・両形を網羅していること。
+#[test]
+fn range_fixture_overlaps_tenants_and_cases_cover_all_columns() {
+    let overlap = RANGE_A_VALUES.iter().min() < RANGE_B_VALUES.iter().max()
+        && RANGE_B_VALUES.iter().min() < RANGE_A_VALUES.iter().max();
+    assert!(overlap, "tenant value ranges must interleave");
+    let cases = range_cases();
+    for col in RANGE_COLS {
+        assert!(cases
+            .iter()
+            .any(|c| c.ext.contains(&format!("WHERE {col} >"))));
+        assert!(cases
+            .iter()
+            .any(|c| c.ext.contains(&format!("{col} NOT BETWEEN"))));
+    }
+    for c in &cases {
+        let placeholders = (1..=c.values.len())
+            .filter(|i| c.ext.contains(&format!("${i}")))
+            .count();
+        assert_eq!(placeholders, c.values.len(), "{}", c.ext);
+        assert!(!c.literal.contains('$'), "{}", c.literal);
+    }
+}
+
+/// 3 クライアント × 3 テナントで、非 NULL の `$n`（非等価・`[NOT] BETWEEN`・複合・不正値）の結果が
+/// 同じクライアントの簡易クエリのリテラル形と一致すること（受理時は行集合、拒否時は SQLSTATE）。
+#[test]
+#[ignore = "requires psql, python3+psycopg, node+pg; run via `make e2e-three-client`"]
+fn three_clients_noneq_between_params_match_simple_literal_form() {
+    let env = start_range_env("literal");
+    let port = env.server.port;
+    let cases = range_cases();
+    let mut accepted_nonempty = 0usize;
+    for client in Client::ALL {
+        for (idx, (user, pw)) in USERS.iter().enumerate() {
+            // alice は全ケース、bob・carol は RLS の確認に足りる間引き（4 件に 1 件）。
+            let step = if idx == 0 { 1 } else { 4 };
+            for case in cases.iter().step_by(step) {
+                let vals: Vec<&str> = case.values.iter().map(String::as_str).collect();
+                let ext = ext_folded(client, port, user, pw, &case.ext, &vals);
+                let lit = simple_folded(client, port, user, pw, &case.literal);
+                assert_eq!(
+                    ext, lit,
+                    "{client:?}/{user}: {} vs {}",
+                    case.ext, case.literal
+                );
+                if idx == 0 && matches!(&ext, Ok(rows) if !rows.is_empty()) {
+                    accepted_nonempty += 1;
+                }
+            }
+        }
+    }
+    // 非 vacuous: 受理されて行を返したケースが十分にある。
+    assert!(
+        accepted_nonempty >= 3 * 20,
+        "too few accepted non-empty cases: {accepted_nonempty}"
+    );
+    drop(env);
+}
+
+/// 3 クライアントで、非等価・BETWEEN の `$n` の結果が自テナントの行だけであり（carol は空）、拒否応答が
+/// 3 テナントで同一でテナント id・他テナントの値を含まないこと。
+#[test]
+#[ignore = "requires psql, python3+psycopg, node+pg; run via `make e2e-three-client`"]
+fn three_clients_noneq_between_params_respect_rls() {
+    let env = start_range_env("rls");
+    let port = env.server.port;
+    let probes: [(&str, Vec<&str>); 2] = [
+        (
+            "SELECT label FROM r WHERE n > $1 ORDER BY label LIMIT 100",
+            vec!["0"],
+        ),
+        (
+            "SELECT label FROM r WHERE n BETWEEN $1 AND $2 ORDER BY label LIMIT 100",
+            vec!["0", "100"],
+        ),
+    ];
+    // (自テナントの label 接頭辞, 件数)
+    let expect = [(Some("a-"), 3usize), (Some("b-"), 3), (None, 0)];
+    let reject_sqls: [(&str, Vec<&str>, &str); 2] = [
+        (
+            "SELECT label FROM r WHERE nosuchcol > $1 LIMIT 5",
+            vec!["1"],
+            "42703",
+        ),
+        (
+            "SELECT label FROM r WHERE $1 < n LIMIT 5",
+            vec!["1"],
+            "42601",
+        ),
+    ];
+    for client in Client::ALL {
+        for (sql, params) in &probes {
+            for (i, (user, pw)) in USERS.iter().enumerate() {
+                let rows = ext_folded(client, port, user, pw, sql, params)
+                    .unwrap_or_else(|e| panic!("{client:?}/{user}: rejected {e}: {sql}"));
+                assert_eq!(rows.len(), expect[i].1, "{client:?}/{user}: {rows:?}");
+                if let Some(prefix) = expect[i].0 {
+                    assert!(rows.iter().all(|r| r.starts_with(prefix)), "{rows:?}");
+                }
+            }
+        }
+        for (sql, params, sqlstate) in &reject_sqls {
+            let mut bodies = Vec::new();
+            for (user, pw) in USERS {
+                bodies.push(rejected_stderr(
+                    client,
+                    port,
+                    user,
+                    pw,
+                    sql,
+                    params,
+                    Opts::default(),
+                    sqlstate,
+                ));
+            }
+            assert_eq!(bodies[0], bodies[1], "{client:?}: {sql}");
+            assert_eq!(bodies[0], bodies[2], "{client:?}: {sql}");
+            for leak in ["tenant", "a-1", "a-5", "a-9", "b-2", "b-6", "b-10"] {
+                assert!(!bodies[0].contains(leak), "{client:?}: leak {leak:?}");
+            }
+        }
+    }
+    drop(env);
+}
+
+/// 述語形 UPDATE／DELETE の非等価・BETWEEN の `$n` を bob が実行した後の読み戻し（3 テナント分）が、
+/// 同じクライアントのリテラル形で実行した場合と一致し、alice の行は変わらず、carol の DML は 0 件のまま
+/// であること。状態を分離するため、クライアント・形ごとに新しい環境を起動する。
+#[test]
+#[ignore = "requires psql, python3+psycopg, node+pg; run via `make e2e-three-client`"]
+fn three_clients_predicate_dml_noneq_between_match_literal_form() {
+    let snapshots = |port: u16| -> Vec<Vec<String>> {
+        USERS
+            .iter()
+            .map(|(user, pw)| run_psycopg_snapshot(port, user, pw))
+            .collect()
+    };
+    for (client, tag) in [
+        (Client::Psql, "psql"),
+        (Client::Psycopg, "psycopg"),
+        (Client::Pg, "pg"),
+    ] {
+        let mut results: Vec<Vec<Vec<String>>> = Vec::new();
+        for form in ["ext", "lit"] {
+            let env = start_range_env(&format!("dml-{tag}-{form}"));
+            let port = env.server.port;
+            // (ユーザー, 拡張形, パラメータ, リテラル形)。operation_id は連番で一意にする。
+            let dmls: Vec<(usize, &str, Vec<String>, String)> = {
+                let (o1, o2, o3, o4, o5) = (
+                    next_op(tag),
+                    next_op(tag),
+                    next_op(tag),
+                    next_op(tag),
+                    next_op(tag),
+                );
+                vec![
+                    (
+                        1,
+                        "UPDATE r SET label = 'upd' WHERE n > $1 USING OPERATION_ID $2",
+                        vec!["4".into(), o1.clone()],
+                        format!("UPDATE r SET label = 'upd' WHERE n > 4 USING OPERATION_ID '{o1}'"),
+                    ),
+                    (
+                        1,
+                        "DELETE FROM r WHERE day BETWEEN $1 AND $2 USING OPERATION_ID $3",
+                        vec!["2024-01-01".into(), "2024-01-07".into(), o2.clone()],
+                        format!(
+                            "DELETE FROM r WHERE day BETWEEN '2024-01-01' AND '2024-01-07' \
+                             USING OPERATION_ID '{o2}'"
+                        ),
+                    ),
+                    (
+                        2,
+                        "UPDATE r SET label = 'hijack' WHERE n > $1 USING OPERATION_ID $2",
+                        vec!["0".into(), o3.clone()],
+                        format!(
+                            "UPDATE r SET label = 'hijack' WHERE n > 0 USING OPERATION_ID '{o3}'"
+                        ),
+                    ),
+                    (
+                        2,
+                        "DELETE FROM r WHERE n <> $1 USING OPERATION_ID $2",
+                        vec!["-1".into(), o4.clone()],
+                        format!("DELETE FROM r WHERE n <> -1 USING OPERATION_ID '{o4}'"),
+                    ),
+                    (
+                        0,
+                        "UPDATE r SET label = 'a-upd' WHERE n <> $1 USING OPERATION_ID $2",
+                        vec!["5".into(), o5.clone()],
+                        format!(
+                            "UPDATE r SET label = 'a-upd' WHERE n <> 5 USING OPERATION_ID '{o5}'"
+                        ),
+                    ),
+                ]
+            };
+            for (user_idx, ext_sql, params, lit_sql) in &dmls {
+                let (user, pw) = USERS[*user_idx];
+                let output = if form == "ext" {
+                    let p: Vec<&str> = params.iter().map(String::as_str).collect();
+                    if client == Client::Psql {
+                        spawn_psql_bind(port, user, pw, ext_sql, &p, true)
+                    } else {
+                        spawn_client(client, port, user, pw, ext_sql, &p, Opts::default())
+                    }
+                } else {
+                    spawn_simple(client, port, user, pw, lit_sql)
+                };
+                assert!(
+                    output.status.success(),
+                    "{client:?}/{form}/{user}: {ext_sql}: stderr={}",
+                    String::from_utf8_lossy(&output.stderr)
+                );
+            }
+            results.push(snapshots(port));
+            drop(env);
+        }
+        assert_eq!(
+            results[0], results[1],
+            "{client:?}: ext vs literal snapshots"
+        );
+        let snap = &results[0];
+        // 非 vacuous: bob は n=10 の 1 行だけ残り、alice は自分の 2 行だけが更新され、carol は空のまま。
+        assert_eq!(snap[1], vec!["upd|10".to_string()], "{client:?}: bob");
+        assert_eq!(
+            snap[0],
+            s(&["a-upd|1", "a-5|5", "a-upd|9"]),
+            "{client:?}: alice"
+        );
+        assert!(snap[2].is_empty(), "{client:?}: carol");
+    }
+}
+
+/// 読み戻し用: 指定ユーザーが見える `r` の `label|n`（`n` 昇順）。クライアント非依存にするため
+/// psycopg の簡易クエリで固定して読む。
+fn run_psycopg_snapshot(port: u16, user: &str, password: &str) -> Vec<String> {
+    let output = spawn_simple(
+        Client::Psycopg,
+        port,
+        user,
+        password,
+        "SELECT label, n FROM r ORDER BY n LIMIT 100",
+    );
+    assert!(
+        output.status.success(),
+        "snapshot failed for {user}: stderr={}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    String::from_utf8_lossy(&output.stdout)
+        .lines()
+        .map(|l| l.trim().to_string())
+        .filter(|l| !l.is_empty())
+        .collect()
+}
+
+/// psycopg（`None`）と node pg（`null`）の NULL パラメータを非等価の位置へ渡した結果が、簡易クエリの
+/// リテラル `NULL` と一致すること（受理・拒否とも一致。psql は NULL を送れないため対象外）。
+#[test]
+#[ignore = "requires psql, python3+psycopg, node+pg; run via `make e2e-three-client`"]
+fn psycopg_and_pg_null_param_in_noneq_matches_literal() {
+    let env = start_range_env("nullparam");
+    let port = env.server.port;
+    let ext_sql = "SELECT label FROM r WHERE n > $1 ORDER BY label LIMIT 100";
+    let lit_sql = "SELECT label FROM r WHERE n > NULL ORDER BY label LIMIT 100";
+    for client in [Client::Psycopg, Client::Pg] {
+        let opts = match client {
+            Client::Psycopg => Opts {
+                typed_json: Some(typed_json(&[("null", "null")])),
+                ..Opts::default()
+            },
+            _ => Opts {
+                nullable_json: Some(nullable_json(&[None])),
+                ..Opts::default()
+            },
+        };
+        let output = spawn_client(client, port, "alice", "pw-alice", ext_sql, &[], opts);
+        let ext = fold_output(client, &output);
+        let lit = simple_folded(client, port, "alice", "pw-alice", lit_sql);
+        assert_eq!(ext, lit, "{client:?}: NULL param vs literal NULL");
     }
     drop(env);
 }

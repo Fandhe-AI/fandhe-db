@@ -433,6 +433,9 @@ Bind 値 `None`（SQL NULL）は、`sql::params` が裸の `Token::Ident("NULL")
   `22000`（リテラル形と一致。SQL の CREATE TABLE で作った表では受理・描述される。engine 側
   `sql78_where_noneq_between_params.rs` が固定）、存在しない列・表は `42703`／`42P01`、`$n op $m` は
   宣言なしで `42P18`、宣言 OID は echo）も現行挙動として固定する。
+- NULL 以外の値の Bind がリテラル形の簡易クエリと一致すること、および RLS 3 テナントの非観測性は
+  Issue #2433 で固定した（層 A: `crates/wire-server/tests/wire_sql78_noneq_between_rls.rs`、
+  層 B: `three_client_extended_e2e.rs`。詳細は [three-client-e2e-harness.md](three-client-e2e-harness.md)）。
 
 ## 検証
 
