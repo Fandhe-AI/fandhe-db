@@ -372,7 +372,7 @@ fn string_value(opt: Option<&RawCopyOption>) -> Result<Option<&str>, SqlSurfaceE
     }
 }
 
-/// `HEADER` の値（省略は true。`true/false/on/off/1/0/match`。大小を区別しない）。
+/// `HEADER` の値（省略は true。PostgreSQL の真偽値表記と `match`。大小を区別しない）。
 fn parse_header(value: Option<&RawCopyValue>) -> Result<CopyHeader, SqlSurfaceError> {
     let text = match value {
         None => return Ok(CopyHeader::True),
@@ -381,12 +381,36 @@ fn parse_header(value: Option<&RawCopyValue>) -> Result<CopyHeader, SqlSurfaceEr
         | Some(RawCopyValue::Number(s)) => s.to_ascii_lowercase(),
         Some(_) => return Err(invalid("COPY HEADER requires a Boolean value or match")),
     };
-    match text.as_str() {
-        "true" | "on" | "1" => Ok(CopyHeader::True),
-        "false" | "off" | "0" => Ok(CopyHeader::False),
-        "match" => Ok(CopyHeader::Match),
-        _ => Err(invalid("COPY HEADER requires a Boolean value or match")),
+    if text == "match" {
+        return Ok(CopyHeader::Match);
     }
+    match parse_bool(&text) {
+        Some(true) => Ok(CopyHeader::True),
+        Some(false) => Ok(CopyHeader::False),
+        None => Err(invalid("COPY HEADER requires a Boolean value or match")),
+    }
+}
+
+/// PostgreSQL の `parse_bool` と同じ規則の真偽値解釈（入力は小文字化済み）。
+/// `true`・`false`・`yes`・`no` は空でない接頭辞を許し、`on`・`off` は 2 文字以上の接頭辞
+/// （`o` 単独は曖昧なので不正）、`1`・`0` は完全一致のみ。`parse_header` から呼ぶ。
+fn parse_bool(text: &str) -> Option<bool> {
+    let is_prefix = |full: &str| !text.is_empty() && full.starts_with(text);
+    if is_prefix("true") || is_prefix("yes") || text == "1" {
+        return Some(true);
+    }
+    if is_prefix("false") || is_prefix("no") || text == "0" {
+        return Some(false);
+    }
+    if text.len() >= 2 {
+        if "on".starts_with(text) {
+            return Some(true);
+        }
+        if "off".starts_with(text) {
+            return Some(false);
+        }
+    }
+    None
 }
 
 #[cfg(test)]
@@ -471,6 +495,23 @@ mod tests {
             .map(|_| raw("header", None))
             .collect();
         assert_eq!(code(many, CopyDirection::From), "42601");
+    }
+
+    #[test]
+    fn header_accepts_postgres_boolean_spellings() {
+        let h = |v: &str| resolve(vec![raw("header", s(v))], CopyDirection::From);
+        for t in ["t", "tr", "true", "y", "yes", "on", "1", "ON", "Yes"] {
+            assert_eq!(h(t).expect(t).1.header(), CopyHeader::True, "{t}");
+        }
+        for f in ["f", "fa", "false", "n", "no", "of", "off", "0", "OFF"] {
+            assert_eq!(h(f).expect(f).1.header(), CopyHeader::False, "{f}");
+        }
+        assert_eq!(h("match").expect("match").1.header(), CopyHeader::Match);
+        for bad in ["o", "", "x", "truex", "yess", "2", "onn", "secretbool"] {
+            let e = h(bad).expect_err(bad);
+            assert_eq!(e.wire_code(), "22023", "{bad}");
+            assert!(!e.to_string().contains("secretbool"), "{e}");
+        }
     }
 
     #[test]
