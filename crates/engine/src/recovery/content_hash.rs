@@ -937,9 +937,13 @@ pub(crate) enum UpsertAssignmentHashValue<'a> {
     /// `<col> = <col> + <operand>`（SQL-49・RECOVER-11、Issue #2425）。ハッシュに含めるのは
     /// 送られた文の形（演算子・オペランド種別・リテラル／参照列名）だけで、評価結果の値は含めない。
     Add(UpsertAddHashOperand<'a>),
-    /// 一般の値式（SQL-49・RECOVER-11、Issue #1739）。ハッシュに含めるのは送られた文の形
-    /// （構文木。`EXCLUDED.<列>` は予約接頭辞付きの列参照として区別される）だけで、評価結果の
-    /// 値は含めない。式が違う再送を同一操作と誤判定しない（fail-open の防止）ための kind 3。
+    /// `SET <col> = <一般式>`（SQL-49・RECOVER-11、Issue #1741。kind 3）。送られた文の構文形
+    /// （[`push_set_expr`]。`n / 2` と `n / 2.0` は区別する）だけをハッシュし、評価結果の値は
+    /// 含めない。加算形（kind 2）とは別ハッシュ（同じ見た目でも経路が違えば `22023` 側へ倒す
+    /// fail-closed）。UDF 定義節は含めない（UPDATE の SET 式と同じ。受理する側の契約は
+    /// `docs/design/sql-upsert.md` の Issue #1741 追記参照）。
+    // 結線は #1739（SET 右辺の一般式の parser・束縛）で行う。それまでは単体テストからのみ構築される。
+    #[cfg_attr(not(test), allow(dead_code))]
     Expr(&'a crate::sql::udf_call::Expr),
 }
 
@@ -951,12 +955,27 @@ pub(crate) enum UpsertAddHashOperand<'a> {
 
 /// [`for_typed_upsert`] の衝突分岐（SQL-20・TASK-193、Issue #872）。
 /// `sql::allowlist::OnConflictAction` に対応する最小表現。
+// variant 名は `sql::allowlist::OnConflictAction`（`DoNothing`／`DoUpdate`）と揃える。
+#[allow(clippy::enum_variant_names)]
 pub(crate) enum UpsertHashAction<'a> {
     DoNothing,
     /// `(対象列名, 右辺)` の宣言順スライス（並べ替えない。`Parser::parse_
     /// upsert_assignment` の宣言順をそのまま保持する契約は
     /// `sql::parser::bind_upsert_assignments` が担う）。
     DoUpdate(&'a [(String, UpsertAssignmentHashValue<'a>)]),
+    /// `DO UPDATE SET ... WHERE <条件>`（SQL-49・RECOVER-11、Issue #1741）。action tag は
+    /// `(id)` 対象 6／UNIQUE 対象 7（対象省略〔AnyUnique〕との組は構文段・束縛段で拒否済みで、
+    /// ハッシュ層でも `Err`。tag 5 は未到達値の欠番として再利用しない）。述語列は UPDATE／DELETE
+    /// の WHERE と同じ [`push_dml_where_predicates`]（参照 UDF の推移閉包を含み、WASM UDF と
+    /// サブクエリ述語は `Err`）で直列化し、割当の直後に置く。`udf_registry` を持たせて
+    /// `for_typed_upsert*` のシグネチャを変えない。
+    // 結線は #1740（DO UPDATE ... WHERE の parser・評価）で行う。それまでは単体テストからのみ構築される。
+    #[cfg_attr(not(test), allow(dead_code))]
+    DoUpdateWhere {
+        assignments: &'a [(String, UpsertAssignmentHashValue<'a>)],
+        predicates: &'a [crate::sql::allowlist::WherePredicate],
+        udf_registry: &'a crate::sql::udf_call::UdfRegistry,
+    },
 }
 
 /// [`for_typed_upsert`] の衝突対象（SQL-20・TABLE-16、Issue #1074）。
@@ -973,6 +992,55 @@ pub(crate) enum UpsertHashTarget<'a> {
     /// 対象省略の `ON CONFLICT DO NOTHING`（SQL-49、Issue #1736）。action tag は
     /// 既存の `0`〜`3` と衝突しない `4` を使い、列名部は持たない。
     AnyUnique,
+}
+
+/// [`push_upsert_header`] が `DoUpdate`／`DoUpdateWhere` で共有する割当部（件数 u32 LE →
+/// 各割当〔代入先列名 → value kind 0〜3 → 本体〕）。kind 0〜2 のバイト列は Issue #1741 前後で不変。
+fn push_upsert_assignments(
+    b: &mut HashInputBuilder,
+    assignments: &[(String, UpsertAssignmentHashValue<'_>)],
+) -> Result<(), StorageError> {
+    let count = u32::try_from(assignments.len()).map_err(|_| {
+        StorageError::Codec("content hash upsert assignment count too large".to_string())
+    })?;
+    b.push_raw(&count.to_le_bytes());
+    for (name, value) in assignments.iter() {
+        b.push_bytes(name.as_bytes())?;
+        match value {
+            UpsertAssignmentHashValue::Excluded(src) => {
+                b.push_u8(0);
+                b.push_bytes(src.as_bytes())?;
+            }
+            UpsertAssignmentHashValue::Literal(v) => {
+                b.push_u8(1);
+                push_value(b, v)?;
+            }
+            // kind 2 = 加算（Issue #2425）。左辺列は直前に push した代入先名と同じなので
+            // 重ねない。`+` は演算子タグ。
+            UpsertAssignmentHashValue::Add(operand) => {
+                b.push_u8(2);
+                b.push_u8(b'+');
+                match operand {
+                    UpsertAddHashOperand::Excluded(src) => {
+                        b.push_u8(0);
+                        b.push_bytes(src.as_bytes())?;
+                    }
+                    UpsertAddHashOperand::Literal(v) => {
+                        b.push_u8(1);
+                        push_value(b, v)?;
+                    }
+                }
+            }
+            // kind 3 = 一般式（Issue #1741）。UPDATE の SET 式と同じ整数／倍精度の字面区別。
+            UpsertAssignmentHashValue::Expr(expr) => {
+                b.push_u8(3);
+                push_set_expr(b, expr).map_err(|_| {
+                    StorageError::Codec("content hash upsert expression too large".to_string())
+                })?;
+            }
+        }
+    }
+    Ok(())
 }
 
 /// [`for_typed_upsert`]・[`for_typed_upsert_expr`] が共有する UPSERT の衝突対象・
@@ -995,49 +1063,29 @@ fn push_upsert_header(
         UpsertHashAction::DoNothing => b.push_u8(action_tag_base),
         UpsertHashAction::DoUpdate(assignments) => {
             b.push_u8(action_tag_base + 1);
-            let count = u32::try_from(assignments.len()).map_err(|_| {
-                StorageError::Codec("content hash upsert assignment count too large".to_string())
-            })?;
-            b.push_raw(&count.to_le_bytes());
-            for (name, value) in assignments.iter() {
-                b.push_bytes(name.as_bytes())?;
-                match value {
-                    UpsertAssignmentHashValue::Excluded(src) => {
-                        b.push_u8(0);
-                        b.push_bytes(src.as_bytes())?;
-                    }
-                    UpsertAssignmentHashValue::Literal(v) => {
-                        b.push_u8(1);
-                        push_value(b, v)?;
-                    }
-                    // kind 3 = 一般の式（Issue #1739）。`UPDATE ... SET` の式と同じ直列化
-                    // （数値リテラルの整数分類つき）。kind 0/1/2 のバイト列は不変。
-                    UpsertAssignmentHashValue::Expr(expr) => {
-                        b.push_u8(3);
-                        push_set_expr(b, expr).map_err(|_| {
-                            StorageError::Codec(
-                                "content hash upsert set expression too large".to_string(),
-                            )
-                        })?;
-                    }
-                    // kind 2 = 加算（Issue #2425）。kind 0/1 のバイト列は不変。左辺列は
-                    // 直前に push した代入先名と同じなので重ねない。`+` は演算子タグ。
-                    UpsertAssignmentHashValue::Add(operand) => {
-                        b.push_u8(2);
-                        b.push_u8(b'+');
-                        match operand {
-                            UpsertAddHashOperand::Excluded(src) => {
-                                b.push_u8(0);
-                                b.push_bytes(src.as_bytes())?;
-                            }
-                            UpsertAddHashOperand::Literal(v) => {
-                                b.push_u8(1);
-                                push_value(b, v)?;
-                            }
-                        }
-                    }
+            push_upsert_assignments(b, assignments)?;
+        }
+        UpsertHashAction::DoUpdateWhere {
+            assignments,
+            predicates,
+            udf_registry,
+        } => {
+            // tag 6（`(id)`）／7（UNIQUE）。対象省略との組は到達不能だが fail-closed で拒否する。
+            let tag = match target {
+                UpsertHashTarget::RowId => 6,
+                UpsertHashTarget::Unique(_) => 7,
+                UpsertHashTarget::AnyUnique => {
+                    return Err(StorageError::Codec(
+                        "content hash upsert where requires an explicit conflict target"
+                            .to_string(),
+                    ));
                 }
-            }
+            };
+            b.push_u8(tag);
+            push_upsert_assignments(b, assignments)?;
+            push_dml_where_predicates(b, predicates, udf_registry).map_err(|_| {
+                StorageError::Codec("content hash upsert where predicate rejected".to_string())
+            })?;
         }
     }
     if let UpsertHashTarget::Unique(columns) = target {
@@ -3183,6 +3231,253 @@ mod tests {
         ));
         assert_ne!(add_excluded, hash(UpsertAssignmentHashValue::Excluded("n")));
         assert_ne!(add_excluded, add_one);
+    }
+
+    // --- Issue #1741: 式つき upsert の内容照合ハッシュ（SQL-49・RECOVER-11） ----------
+
+    fn upsert_bin(
+        op: crate::sql::udf_call::BinOp,
+        lhs: &str,
+        rhs: &str,
+    ) -> crate::sql::udf_call::Expr {
+        use crate::sql::udf_call::Expr;
+        Expr::Binary {
+            op,
+            lhs: Box::new(Expr::Ident(lhs.to_string())),
+            rhs: Box::new(Expr::Number(rhs.to_string())),
+        }
+    }
+
+    fn upsert_cmp(
+        op: crate::sql::udf_call::BinOp,
+        col: &str,
+        n: &str,
+    ) -> crate::sql::allowlist::WherePredicate {
+        crate::sql::allowlist::WherePredicate::Expression(upsert_bin(op, col, n))
+    }
+
+    /// 1 行の固定入力に対して、与えた action で `for_typed_upsert`／`for_typed_upsert_expr`
+    /// 両方のハッシュを返す補助。
+    fn upsert_hashes(
+        target: &UpsertHashTarget<'_>,
+        action: &UpsertHashAction<'_>,
+    ) -> Result<([u8; 32], [u8; 32]), StorageError> {
+        let embedding = [0.5_f32, 1.5];
+        let n = Value::Integer(1);
+        let cols: [(&str, &Value); 1] = [("n", &n)];
+        let rows: [TypedInsertBatchRow<'_>; 1] = [(1, Visibility::Private, &embedding, &cols)];
+        let plain = *for_typed_upsert(target, action, &rows)?.as_bytes();
+        let ecols: [(&str, HashColumnInput<'_>); 1] = [("n", HashColumnInput::Value(&n))];
+        let erows: [TypedInsertExprBatchRow<'_>; 1] =
+            [(1, Visibility::Private, &embedding, &ecols)];
+        let expr = *for_typed_upsert_expr(target, action, &erows)?.as_bytes();
+        Ok((plain, expr))
+    }
+
+    /// kind 3（一般式）: 同一文は同一ハッシュ（冪等）、式・リテラル・整数分類・列参照の違いは
+    /// 別ハッシュ（`22023`）、kind 0〜2 とは別ハッシュ。
+    #[test]
+    fn upsert_expr_assignment_is_idempotent_and_discriminated() {
+        use crate::sql::udf_call::{BinOp, Expr};
+        let hash = |e: &Expr| {
+            let a = [("n".to_string(), UpsertAssignmentHashValue::Expr(e))];
+            upsert_hashes(&UpsertHashTarget::RowId, &UpsertHashAction::DoUpdate(&a)).unwrap()
+        };
+        let plus1 = upsert_bin(BinOp::Add, "n", "1");
+        assert_eq!(hash(&plus1), hash(&upsert_bin(BinOp::Add, "n", "1")));
+        assert_ne!(hash(&plus1).0, hash(&plus1).1, "plain/expr domains differ");
+        assert_ne!(hash(&plus1), hash(&upsert_bin(BinOp::Sub, "n", "1")));
+        assert_ne!(hash(&plus1), hash(&upsert_bin(BinOp::Add, "n", "2")));
+        assert_ne!(hash(&plus1), hash(&upsert_bin(BinOp::Add, "m", "1")));
+        assert_ne!(
+            hash(&upsert_bin(BinOp::Div, "n", "2")),
+            hash(&upsert_bin(BinOp::Div, "n", "2.0")),
+            "integer vs double division must differ"
+        );
+
+        // kind 間の区別。
+        let one = Value::BigInt(1);
+        let num1 = Expr::Number("1".to_string());
+        let ident_b = Expr::Ident("b".to_string());
+        let other = |v: UpsertAssignmentHashValue<'_>| {
+            let a = [("n".to_string(), v)];
+            upsert_hashes(&UpsertHashTarget::RowId, &UpsertHashAction::DoUpdate(&a)).unwrap()
+        };
+        assert_ne!(hash(&num1), other(UpsertAssignmentHashValue::Literal(&one)));
+        assert_ne!(
+            hash(&plus1),
+            other(UpsertAssignmentHashValue::Add(
+                UpsertAddHashOperand::Literal(&one)
+            ))
+        );
+        assert_ne!(
+            hash(&ident_b),
+            other(UpsertAssignmentHashValue::Excluded("b")),
+            "bare column must not collide with EXCLUDED.<col>"
+        );
+    }
+
+    /// tag 6／7（`DO UPDATE ... WHERE`）: 同一は同一、WHERE の有無・演算子・比較値・OR 構造・
+    /// 対象種別の違いは別ハッシュ。明示 WHERE の印はハッシュに影響しない。
+    #[test]
+    fn upsert_do_update_where_is_idempotent_and_discriminated() {
+        use crate::sql::allowlist::{WherePredicate, EXPLICIT_WHERE_MARKER};
+        use crate::sql::udf_call::{BinOp, Expr, UdfRegistry};
+        let registry = UdfRegistry::default();
+        let plus1 = upsert_bin(BinOp::Add, "n", "1");
+        let a = [("n".to_string(), UpsertAssignmentHashValue::Expr(&plus1))];
+        let cols = ["u"];
+        let hash = |target: &UpsertHashTarget<'_>, preds: &[WherePredicate]| {
+            upsert_hashes(
+                target,
+                &UpsertHashAction::DoUpdateWhere {
+                    assignments: &a,
+                    predicates: preds,
+                    udf_registry: &registry,
+                },
+            )
+            .unwrap()
+        };
+        let id = UpsertHashTarget::RowId;
+        let uniq = UpsertHashTarget::Unique(&cols);
+        let gt1 = [upsert_cmp(BinOp::Gt, "n", "1")];
+        assert_eq!(
+            hash(&id, &gt1),
+            hash(&id, &[upsert_cmp(BinOp::Gt, "n", "1")])
+        );
+        assert_ne!(
+            hash(&id, &gt1),
+            hash(&id, &[upsert_cmp(BinOp::Ge, "n", "1")])
+        );
+        assert_ne!(
+            hash(&id, &gt1),
+            hash(&id, &[upsert_cmp(BinOp::Gt, "n", "2")])
+        );
+        assert_ne!(hash(&id, &gt1), hash(&uniq, &gt1));
+        // WHERE 有無（DoUpdate と DoUpdateWhere）。
+        let no_where = upsert_hashes(&id, &UpsertHashAction::DoUpdate(&a)).unwrap();
+        assert_ne!(hash(&id, &gt1), no_where);
+        assert_ne!(hash(&id, &[]), no_where, "tag 6 differs from tag 1");
+        // OR 構造と平坦な AND 列。
+        let or_tree = [WherePredicate::Or(vec![
+            vec![upsert_cmp(BinOp::Gt, "a", "1")],
+            vec![
+                upsert_cmp(BinOp::Gt, "b", "1"),
+                upsert_cmp(BinOp::Gt, "c", "1"),
+            ],
+        ])];
+        let flat = [
+            upsert_cmp(BinOp::Gt, "a", "1"),
+            upsert_cmp(BinOp::Gt, "b", "1"),
+            upsert_cmp(BinOp::Gt, "c", "1"),
+        ];
+        assert_ne!(hash(&id, &or_tree), hash(&id, &flat));
+        // 明示 WHERE の印は除外される。
+        let marked = [
+            WherePredicate::PredicateCall {
+                name: EXPLICIT_WHERE_MARKER.to_string(),
+            },
+            upsert_cmp(BinOp::Gt, "n", "1"),
+        ];
+        assert_eq!(hash(&id, &marked), hash(&id, &gt1));
+        // 割当側と述語側に同じ式を置いても境界が曖昧にならない。
+        let moved = [(
+            "n".to_string(),
+            UpsertAssignmentHashValue::Expr(&Expr::Ident("x".to_string())),
+        )];
+        let in_pred = upsert_hashes(
+            &id,
+            &UpsertHashAction::DoUpdateWhere {
+                assignments: &moved,
+                predicates: &gt1,
+                udf_registry: &registry,
+            },
+        )
+        .unwrap();
+        assert_ne!(in_pred, hash(&id, &gt1));
+    }
+
+    /// 対象省略（AnyUnique）と WHERE の組、サブクエリ述語は fail-closed で `Err`。
+    #[test]
+    fn upsert_do_update_where_rejects_invalid_combinations() {
+        use crate::sql::udf_call::UdfRegistry;
+        let registry = UdfRegistry::default();
+        let a: [(String, UpsertAssignmentHashValue<'_>); 0] = [];
+        let result = upsert_hashes(
+            &UpsertHashTarget::AnyUnique,
+            &UpsertHashAction::DoUpdateWhere {
+                assignments: &a,
+                predicates: &[],
+                udf_registry: &registry,
+            },
+        );
+        assert!(result.is_err());
+    }
+
+    /// ゾーン無し `TIMESTAMPTZ` リテラルを含む式は、セッション TimeZone が違えば別ハッシュ。
+    #[test]
+    fn upsert_expr_hash_includes_session_time_zone_for_timestamptz_literal() {
+        use crate::datetime::{SessionTimeZone, SessionTimeZoneScope};
+        use crate::sql::udf_call::Expr;
+        let e = Expr::TimestampTzLiteral {
+            micros: 0,
+            session_local: true,
+        };
+        let hash_in = |tz: &str| {
+            let _scope =
+                SessionTimeZoneScope::enter(SessionTimeZone::parse_setting(tz).expect("tz"));
+            let a = [("ts".to_string(), UpsertAssignmentHashValue::Expr(&e))];
+            upsert_hashes(&UpsertHashTarget::RowId, &UpsertHashAction::DoUpdate(&a)).unwrap()
+        };
+        assert_ne!(hash_in("Asia/Tokyo"), hash_in("UTC"));
+        assert_eq!(hash_in("UTC"), hash_in("UTC"));
+    }
+
+    /// golden 固定（Issue #1741）: kind 3 と tag 6／7 の代表レイアウト。台帳の前方互換のため
+    /// 値は変更しない。
+    #[test]
+    fn upsert_expr_and_where_layouts_are_golden() {
+        use crate::sql::udf_call::{BinOp, UdfRegistry};
+        let registry = UdfRegistry::default();
+        let plus1 = upsert_bin(BinOp::Add, "n", "1");
+        let a = [("n".to_string(), UpsertAssignmentHashValue::Expr(&plus1))];
+        let preds = [upsert_cmp(BinOp::Gt, "n", "1")];
+        let cols = ["u"];
+        fn to_hex(bytes: &[u8; 32]) -> String {
+            bytes.iter().map(|b| format!("{b:02x}")).collect()
+        }
+        let kind3 =
+            upsert_hashes(&UpsertHashTarget::RowId, &UpsertHashAction::DoUpdate(&a)).unwrap();
+        let tag6 = upsert_hashes(
+            &UpsertHashTarget::RowId,
+            &UpsertHashAction::DoUpdateWhere {
+                assignments: &a,
+                predicates: &preds,
+                udf_registry: &registry,
+            },
+        )
+        .unwrap();
+        let tag7 = upsert_hashes(
+            &UpsertHashTarget::Unique(&cols),
+            &UpsertHashAction::DoUpdateWhere {
+                assignments: &a,
+                predicates: &preds,
+                udf_registry: &registry,
+            },
+        )
+        .unwrap();
+        assert_eq!(
+            to_hex(&kind3.0),
+            "37f978bdf68a2029e997fa916fc43eb1b5fa457d7e2ebff1ed90063146f46baf"
+        );
+        assert_eq!(
+            to_hex(&tag6.0),
+            "2309dbcba96292134d0fa62df01302963ee10035e002d4aaa0b3472334085f70"
+        );
+        assert_eq!(
+            to_hex(&tag7.1),
+            "a97fa6f1837d2eebecdefc893b1581fae12ec7118ab3dafdcae904cc42037fbb"
+        );
     }
 
     /// 一般の式の代入（kind 3。Issue #1739・SQL-49・RECOVER-11）の判別性: 式が違えば（演算子・

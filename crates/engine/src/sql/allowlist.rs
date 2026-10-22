@@ -9529,7 +9529,7 @@ impl<'a> Parser<'a> {
         }
         self.pos = end;
         // 句の順序は VALUES 形と同じ（`ON CONFLICT` → `RETURNING` → `USING OPERATION_ID`）。
-        let on_conflict = self.parse_on_conflict_clause()?;
+        let on_conflict = self.parse_on_conflict_clause(&table_name)?;
         let returning = self.parse_returning_clause()?;
         let operation_id = self.parse_operation_id_clause()?;
         Ok(ParsedInsertSelectShape {
