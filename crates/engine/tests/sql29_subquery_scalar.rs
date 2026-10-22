@@ -730,8 +730,6 @@ fn scalar_subquery_stays_rejected_in_non_subquery_contexts() {
     ins(&core, &ctx, ITEMS, 1, &[("qty", "1")]);
     ins(&core, &ctx, REFS, 1, &[("qty", "1")]);
     for sql in [
-        format!("UPDATE {ITEMS} SET name = 'x' WHERE qty = (SELECT qty FROM {REFS} LIMIT 1)"),
-        format!("DELETE FROM {ITEMS} WHERE qty = (SELECT qty FROM {REFS} LIMIT 1)"),
         format!(
             "EXPLAIN SELECT id FROM {ITEMS} WHERE qty = (SELECT qty FROM {REFS} LIMIT 1) LIMIT 10"
         ),
@@ -759,6 +757,45 @@ fn scalar_subquery_stays_rejected_in_non_subquery_contexts() {
         ))
         .expect("unparameterized scalar subquery must be accepted");
     assert_eq!(prepared.param_count(), 0);
+}
+
+/// 述語形 UPDATE／DELETE の WHERE 内スカラーサブクエリは受理され、内側の値で対象行が決まる
+/// （`operation_id` 省略時。`USING OPERATION_ID` 付きは暫定ゲートで `0A000`・副作用なし）。
+#[test]
+fn scalar_subquery_executes_in_predicate_dml() {
+    let (core, path) = new_core();
+    let _guard = CleanupGuard(path);
+    let ctx = ctx_for("tenant-a");
+    ins(&core, &ctx, ITEMS, 1, &[("qty", "1")]);
+    ins(&core, &ctx, ITEMS, 2, &[("qty", "2")]);
+    ins(&core, &ctx, REFS, 1, &[("qty", "1")]);
+    let run = |sql: &str| core.execute_sql_in_session(&ctx, &mut SessionState::default(), sql);
+    let all = format!("SELECT id FROM {ITEMS} WHERE qty >= 0 LIMIT 100");
+
+    let err = run(&format!(
+        "DELETE FROM {ITEMS} WHERE qty = (SELECT qty FROM {REFS} LIMIT 1) USING OPERATION_ID 'd1'"
+    ))
+    .expect_err("gated with OPERATION_ID");
+    assert_eq!(err.wire_code(), "0A000", "{err:?}");
+    assert_eq!(ids(&core, &ctx, &all), vec![1, 2]);
+
+    run(&format!(
+        "UPDATE {ITEMS} SET name = 'x' WHERE qty = (SELECT qty FROM {REFS} LIMIT 1)"
+    ))
+    .expect("update executes");
+    assert_eq!(
+        ids(
+            &core,
+            &ctx,
+            &format!("SELECT id FROM {ITEMS} WHERE name = 'x' LIMIT 100")
+        ),
+        vec![1]
+    );
+    run(&format!(
+        "DELETE FROM {ITEMS} WHERE qty = (SELECT qty FROM {REFS} LIMIT 1)"
+    ))
+    .expect("delete executes");
+    assert_eq!(ids(&core, &ctx, &all), vec![2]);
 }
 
 /// Issue #2270 回帰（PR #2463 レビュー指摘）: 非 0 scale の numeric 投影を DOUBLE／BIGINT 列の

@@ -271,6 +271,39 @@
   未実施（親 #1758 で扱う）。#1761 への申し送り: エラー後の Flush／Sync 規則の詳細、
   ignore_till_sync 中に届いた CopyData／CopyDone／CopyFail の扱い。
 
+## 拡張クエリの Sync 同期回復（Issue #1761。親 #1758・WIRE-21 (3) ポインタ）
+
+COPY の Execute が失敗した後は、ErrorResponse を返して `ignore_till_sync` に入り、Sync で
+ReadyForQuery を返して接続を継続する。層 A: `crates/wire-server/tests/wire21_copy_sync_recovery.rs`。
+
+### 接続継続可否
+
+| 事象 | 応答 | 接続 | RFQ 状態 |
+| ---- | ---- | ---- | -------- |
+| CopyFail・行デコード失敗・INDEX-4 上限超過・commit 時の制約違反 | ErrorResponse | 継続（Sync まで読み捨て） | 暗黙 `I`／明示 `E` |
+| Execute 時の再検証失敗・gating（`25P02` 等） | ErrorResponse（CopyInResponse 前） | 継続 | 同上 |
+| フレーム TooLarge／Malformed | ErrorResponse | 切断 | - |
+| 不正形 CopyFail・同期回復中の本文付き CopyDone | `08P01` | 切断 | - |
+| 読み捨て予算超過 | `08P01` | 切断 | - |
+| copy-in 中の非 COPY メッセージ（WIRE-21 (2)） | `08P01` | 切断 | - |
+| Terminate／EOF | なし | 切断 | - |
+
+### 規則
+
+- Flush／Sync: copy-in 中（CopyDone／CopyFail 受信前）は既存どおり無視する。失敗後の Flush は
+  何も返さず、Sync が ReadyForQuery を返す。ErrorResponse は Sync を待たず flush 済みで届く。
+- 同期回復中の CopyData／CopyDone／CopyFail は、失敗の発生源を問わず応答なしで読み捨てる。
+  本文はアロケートせず、`limits::COPY_DISCARD_MAX_BYTES`／`COPY_DISCARD_MAX_MESSAGES` の
+  予算（`ExtendedQueryState` が保持し Sync で 0 へ戻す）で有界化する。
+- 同期回復の外での CopyData／CopyDone／CopyFail は WIRE-8 の `0A000` + 切断のまま。
+- 明示トランザクション中の失敗は `Failed`（後続は `25P02`）。暗黙トランザクションでは commit しない。
+
+### 判断と対象外
+
+- ErrorResponse は CopyDone／CopyFail 受信後にまとめて送る方式（簡易クエリ COPY と共有経路・
+  WIRE-21 (5) のバイト同一性）を維持する。PostgreSQL 本家同等の即時送出は別課題。
+- 実クライアント（psycopg 等）での層 B 確認は親 #1758 で扱う。
+
 ## Issue #1767: binary 形式のフレーム層（親 #1766・WIRE-23 (1)(2) ポインタ）
 
 `crates/wire-server/src/copy_binary.rs` に、列の型を知らない binary COPY のフレームコーデックを新設した

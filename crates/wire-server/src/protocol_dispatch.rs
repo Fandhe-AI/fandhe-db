@@ -47,6 +47,9 @@ pub(crate) enum FrontendMessageKind {
     ExtendedQuery(u8),
     /// COPY・関数呼び出し系（FunctionCall/CopyData/CopyDone/CopyFail）。
     /// 拡張クエリと同様に未対応のため同じ応答契約（0A000 + 切断）に倒す。
+    /// ただし拡張クエリの同期回復（ignore-till-sync）中の 'd'/'c'/'f' は
+    /// `post_auth_loop` が読み捨てるため本分類の `reject_and_close` へ到達しない
+    /// （Issue #1761・WIRE-21 (3) ポインタ）。
     UnsupportedFeature(u8),
     /// 上記のいずれにも該当しない型バイト（認証後に来るべきでない 'p' を含む）。
     Unknown(u8),

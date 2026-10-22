@@ -2705,6 +2705,8 @@ fn bind_where_predicates_recursive(
             // 経由せずここへ到達しうるため、未解決のまま束縛に届いた場合は
             // 一律 `42601` で拒否する（fail-closed。構文段の
             // `Parser::require_subquery_depth` と二重にゲートする）。
+            // Issue #1750・SQL-53: 述語形 `UPDATE`/`DELETE` は構文段が受理するようになったが、
+            // 内側 SELECT の解決は #1751 まで未結線のため、この腕が fail-closed に止める。
             WherePredicate::InSubquery { .. }
             | WherePredicate::Exists { .. }
             | WherePredicate::ScalarSubqueryCompare { .. } => {

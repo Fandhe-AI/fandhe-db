@@ -38,7 +38,8 @@
 | `IN` 対象値の型 | `TEXT`／`ENUM`／`BOOLEAN`／`DATE`／`TIMESTAMP`／`NUMERIC`／`UUID`／`BYTEA`／`INTEGER`／`BIGINT`（Issue #1191 で拡大）に加え `REAL`／`DOUBLE PRECISION`（Issue #1352。浮動小数族どうし。`REAL` は `f64` へ無損失拡大して比較し、`-0.0` は `+0.0` と等しい。非有限値は `22000`）。内側の投影列は同じ値族であること。`VECTOR`／配列／JSON は `22000`。整数・浮動小数列の distinct 値数は 1 サイトあたり `IN` 256・`NOT IN` 128 まで（超過は `54000`） |
 | 拡張クエリプロトコル（Parse/Bind、`$n`） | **非対応**（`42601`。理由は後述） |
 | Describe（拡張クエリプロトコルの投影列導出） | 対象外（拡張クエリプロトコル自体が非対応のため） |
-| `EXPLAIN`・カーソル `DECLARE`・`COPY (SELECT ...) TO`・CHECK 制約本体・`CREATE VIEW` 本体・述語形 `UPDATE`/`DELETE`・明示トランザクション内 | **非対応**（`42601`。すべて構文解析段でゲート） |
+| `EXPLAIN`・カーソル `DECLARE`・`COPY (SELECT ...) TO`・CHECK 制約本体・`CREATE VIEW` 本体・明示トランザクション内 | **非対応**（`42601`。すべて構文解析段でゲート） |
+| 述語形 `UPDATE`/`DELETE` の `WHERE`（Issue #1750・SQL-53 (a)） | 構文段は受理（`Parser::parse_dml_where` が WHERE 解析の間だけ文脈を有効化。`RETURNING`・`SET` 右辺・`PARTITIONED` 併用・ビュー経由は `42601`）。実行は #1751 の経路（束縛前に内側を RLS つきで解決）。`USING OPERATION_ID` 付きは暫定ゲートが内側の実行前に `0A000` で拒否し、省略時（`Optional` 台帳モード）は実行する |
 
 ## 設計
 

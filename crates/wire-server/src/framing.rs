@@ -326,6 +326,41 @@ pub fn discard_body<R: Read>(reader: &mut R, len: usize) -> Result<(), FrameErro
     Ok(())
 }
 
+/// 本文 `len` バイトを固定長バッファで読み捨てつつ、PostgreSQL の `String` 型（末尾が単一の NUL で、
+/// それより前に NUL を含まない C 文字列）の形をしているかを返す（Issue #1761。同期回復中の
+/// CopyFail 本文の検証用。`copy.rs` の CopyFail 検査と同じ構造判定を、アロケートせず有界に行う）。
+/// 本文は常に最後まで消費する（形が不正でも呼び出し側が応答して切断するだけでよい）。
+/// 途中切断は [`FrameError::Truncated`]。`len == 0`（本文なし）は不正形として `false`。
+pub fn discard_c_string_body<R: Read>(reader: &mut R, len: usize) -> Result<bool, FrameError> {
+    let mut chunk = [0u8; 8192];
+    let mut remaining = len;
+    let mut valid = len > 0;
+    while remaining > 0 {
+        let n = remaining.min(chunk.len());
+        let dst = chunk
+            .get_mut(..n)
+            .ok_or(FrameError::Malformed("discard chunk out of range"))?;
+        read_exact_within_deadline(reader, dst)?;
+        remaining = remaining.saturating_sub(n);
+        let filled = chunk
+            .get(..n)
+            .ok_or(FrameError::Malformed("discard chunk out of range"))?;
+        // 末尾バイト（最終チャンクの最後）だけが NUL でなければならず、それ以外の NUL は不正。
+        let (body, tail) = if remaining == 0 {
+            filled.split_at(n.saturating_sub(1))
+        } else {
+            (filled, &[][..])
+        };
+        if body.contains(&0) {
+            valid = false;
+        }
+        if remaining == 0 && tail.first() != Some(&0) {
+            valid = false;
+        }
+    }
+    Ok(valid)
+}
+
 /// StartupMessage（SSLRequest/GSSENCRequest/CancelRequest を含む、認証前の最初の
 /// パケット）を読み取る。`MIN_STARTUP_LEN..=MAX_STARTUP_LEN` の範囲外は
 /// `Malformed`（`08P01`）に写像する（WIRE-10。`MAX_MESSAGE_LEN` 超過であっても
