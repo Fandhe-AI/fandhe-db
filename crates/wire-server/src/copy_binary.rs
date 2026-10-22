@@ -3,12 +3,12 @@
 //! 役割: PostgreSQL の binary COPY ストリーム（署名・フラグ・ヘッダ拡張・タプル・トレーラ。
 //! 形式は PostgreSQL 公式ドキュメント「COPY — Binary Format」）を、**列の型を知らずに**
 //! フィールド単位のバイト列へ分解する [`BinaryCopyReader`] と、同じ形式を書き出す
-//! `encode_*_into` を提供する。型ごとの変換は #1768（暫定の対応表は #1769 の `binary_param::for_copy_column`）、
+//! `encode_*_into` を提供する。型ごとの変換は #1768 の `copy_binary_types`、
 //! `run_copy_from` への結線は #1769（[`BinaryCopyReader`] を `copy::run_copy_from` が使う）、
 //! `run_copy_to` への結線は #1770 が担う（`encode_*_into` の呼び出し元の予定）。
 //!
 //! engine の text/csv 用 `RecordSplitter` と違い wire-server に置くのは、binary フィールドを
-//! 型コーデック（`binary_param`・`result_encoder::binary` と同じ層）で変換してから engine の
+//! 型コーデック（`binary_param`・`result_encoder::binary` と同じ層。[`crate::copy_binary_types`]）で変換してから engine の
 //! 束縛へ渡す流れにし、型情報の無いバイト列を engine へ渡さないため。
 //!
 //! 受信データ経路のため `unwrap`／`expect`／添字アクセスを使わず、長さは `try_from`／`checked_*`

@@ -1299,3 +1299,200 @@ fn wire17_copy_to_stdout_accepts_psql_backslash_copy_shapes() {
     assert_eq!(read_command_complete(&mut stream), "COPY 1");
     read_ready_for_query(&mut stream);
 }
+// ---------------------------------------------------------------------
+// COPY TO STDOUT のオプション適用（Issue #1765・WIRE-22・TASK-294）
+// ---------------------------------------------------------------------
+
+/// `docs`（nullable `note` 付き）と同形の `docs2` を持つ core（TO→FROM 往復の再投入先）。
+fn new_core_with_two_note_tables() -> (Arc<EngineCore>, temp_db::CleanupGuard) {
+    let path = temp_db::unique_db_path("wire22-copy-to-opts");
+    let guard = temp_db::CleanupGuard(path.clone());
+    let storage = Storage::open(&path).expect("open storage");
+    for name in ["docs", "docs2"] {
+        storage
+            .create_table(&TableSchema::new(
+                name,
+                vec![
+                    ColumnDef::new("embedding", ColumnType::Vector(2), false),
+                    ColumnDef::new("lang", ColumnType::Text, false),
+                    ColumnDef::new("note", ColumnType::Text, true),
+                ],
+            ))
+            .expect("create table");
+    }
+    let core = EngineCore::from_storage(storage, Box::new(CpuScalarProvider))
+        .with_ledger_mode(engine::recovery::required_op_id::LedgerMode::Ledgered);
+    (Arc::new(core), guard)
+}
+
+/// `COPY ... FROM STDIN` を 1 チャンクで流し込み、CommandComplete タグを返す。
+fn copy_in_all(stream: &mut std::net::TcpStream, sql: &str, data: &[u8]) -> String {
+    send_simple_query(stream, sql);
+    let _ = read_copy_in_response(stream);
+    send_copy_data(stream, data);
+    send_copy_done(stream);
+    let tag = read_command_complete(stream);
+    read_ready_for_query(stream);
+    tag
+}
+
+/// `COPY (...) TO STDOUT` を実行し、全 CopyData 本文とタグを返す。
+fn copy_out_all(stream: &mut std::net::TcpStream, sql: &str) -> (Vec<Vec<u8>>, String) {
+    send_simple_query(stream, sql);
+    let _ = read_copy_out_response(stream);
+    let mut rows = Vec::new();
+    loop {
+        let mut kind = [0u8; 1];
+        stream.read_exact(&mut kind).expect("read type");
+        let mut len_buf = [0u8; 4];
+        stream.read_exact(&mut len_buf).expect("read len");
+        let len = i32::from_be_bytes(len_buf) as usize;
+        let mut body = vec![0u8; len - 4];
+        stream.read_exact(&mut body).expect("read body");
+        match kind[0] {
+            b'd' => rows.push(body),
+            b'c' => break,
+            other => panic!("unexpected message {}", other as char),
+        }
+    }
+    let tag = read_command_complete(stream);
+    read_ready_for_query(stream);
+    (rows, tag)
+}
+
+fn text_lines(mut rows: Vec<Vec<u8>>) -> Vec<String> {
+    rows.sort();
+    rows.into_iter()
+        .map(|r| String::from_utf8(r).expect("utf8"))
+        .collect()
+}
+
+#[test]
+fn wire22_copy_to_text_delimiter_and_null_are_applied() {
+    let (core, _guard) = new_core_with_two_note_tables();
+    let mut stream = spawn_with_alice(core);
+    let tag = copy_in_all(
+        &mut stream,
+        "COPY docs (id, embedding, lang, note) FROM STDIN USING OPERATION_ID 'w22-t1'",
+        b"1\t[1.0,0.0]\ta|b\t\\N\n2\t[0.0,1.0]\tc\\\\d\tx\n",
+    );
+    assert_eq!(tag, "COPY 2");
+    let (rows, tag) = copy_out_all(
+        &mut stream,
+        "COPY (SELECT id, lang, note FROM docs LIMIT 10) TO STDOUT WITH (DELIMITER '|', NULL 'NULL')",
+    );
+    assert_eq!(tag, "COPY 2");
+    assert_eq!(text_lines(rows), vec!["1|a\\|b|NULL\n", "2|c\\\\d|x\n"]);
+}
+
+#[test]
+fn wire22_copy_to_text_header_is_first_and_not_counted() {
+    let (core, _guard) = new_core_with_two_note_tables();
+    let mut stream = spawn_with_alice(core);
+    copy_in_all(
+        &mut stream,
+        "COPY docs (id, embedding, lang, note) FROM STDIN USING OPERATION_ID 'w22-t2'",
+        b"1\t[1.0,0.0]\tja\t\\N\n",
+    );
+    let (rows, tag) = copy_out_all(
+        &mut stream,
+        "COPY (SELECT id, lang, note FROM docs LIMIT 10) TO STDOUT WITH (HEADER)",
+    );
+    assert_eq!(tag, "COPY 1");
+    assert_eq!(rows[0], b"id\tlang\tnote\n");
+    assert_eq!(rows[1], b"1\tja\t\\N\n");
+    assert_eq!(rows.len(), 2);
+}
+
+#[test]
+fn wire22_copy_to_csv_quote_escape_delimiter_header_are_applied() {
+    let (core, _guard) = new_core_with_two_note_tables();
+    let mut stream = spawn_with_alice(core);
+    copy_in_all(
+        &mut stream,
+        "COPY docs (id, embedding, lang, note) FROM STDIN USING OPERATION_ID 'w22-t3'",
+        b"1\t[1.0,0.0]\tit's\t\\N\n2\t[0.0,1.0]\ta;b\tplain\n",
+    );
+    let (rows, tag) = copy_out_all(
+        &mut stream,
+        "COPY (SELECT id, lang, note FROM docs LIMIT 10) TO STDOUT \
+         WITH (FORMAT csv, HEADER, DELIMITER ';', QUOTE '''', ESCAPE '\\')",
+    );
+    assert_eq!(tag, "COPY 2");
+    assert_eq!(rows[0], b"id;lang;note\n");
+    assert_eq!(
+        text_lines(rows[1..].to_vec()),
+        vec!["1;'it\\'s';\n", "2;'a;b';plain\n"]
+    );
+}
+
+#[test]
+fn wire22_copy_to_csv_null_string_collision_is_quoted() {
+    let (core, _guard) = new_core_with_two_note_tables();
+    let mut stream = spawn_with_alice(core);
+    copy_in_all(
+        &mut stream,
+        "COPY docs (id, embedding, lang, note) FROM STDIN USING OPERATION_ID 'w22-t4'",
+        b"1\t[1.0,0.0]\tx\t\\N\n2\t[0.0,1.0]\ty\t\n",
+    );
+    let (rows, _tag) = copy_out_all(
+        &mut stream,
+        "COPY (SELECT id, lang, note FROM docs LIMIT 10) TO STDOUT WITH (FORMAT csv, NULL 'x')",
+    );
+    assert_eq!(text_lines(rows), vec!["1,\"x\",x\n", "2,y,\n"]);
+}
+
+#[test]
+fn wire22_copy_to_csv_single_column_end_marker_is_quoted() {
+    let (core, _guard) = new_core_with_two_note_tables();
+    let mut stream = spawn_with_alice(core);
+    copy_in_all(
+        &mut stream,
+        "COPY docs (id, embedding, lang, note) FROM STDIN USING OPERATION_ID 'w22-t5'",
+        b"1\t[1.0,0.0]\t\\\\.\t\\N\n",
+    );
+    let (rows, _tag) = copy_out_all(
+        &mut stream,
+        "COPY (SELECT lang FROM docs LIMIT 10) TO STDOUT WITH (FORMAT csv)",
+    );
+    assert_eq!(rows, vec![b"\"\\.\"\n".to_vec()]);
+}
+
+/// 同一オプションで TO → FROM → TO した出力がバイト単位で一致する（往復）。
+#[test]
+fn wire22_copy_to_from_round_trip_with_options_is_byte_identical() {
+    let cases: [(&str, &str); 2] = [
+        ("WITH (HEADER, DELIMITER '|', NULL 'NULL')", "w22-rt-text"),
+        (
+            "WITH (FORMAT csv, HEADER, DELIMITER ';', NULL 'x', QUOTE '''', ESCAPE '\\')",
+            "w22-rt-csv",
+        ),
+    ];
+    for (opts, op) in cases {
+        let (core, _guard) = new_core_with_two_note_tables();
+        let mut stream = spawn_with_alice(core);
+        copy_in_all(
+            &mut stream,
+            &format!("COPY docs (id, embedding, lang, note) FROM STDIN USING OPERATION_ID '{op}'"),
+            b"1\t[1.0,0.0]\tit's|a;b\t\\N\n2\t[0.0,1.0]\tc\\\\d\tx\n3\t[0.5,0.5]\ty\t\n",
+        );
+        let to_docs =
+            format!("COPY (SELECT id, embedding, lang, note FROM docs LIMIT 10) TO STDOUT {opts}");
+        let (first, tag) = copy_out_all(&mut stream, &to_docs);
+        assert_eq!(tag, "COPY 3");
+        let payload: Vec<u8> = first.iter().flatten().copied().collect();
+        let tag = copy_in_all(
+            &mut stream,
+            &format!(
+                "COPY docs2 (id, embedding, lang, note) FROM STDIN {opts} USING OPERATION_ID '{op}-in'"
+            ),
+            &payload,
+        );
+        assert_eq!(tag, "COPY 3");
+        let (second, tag) =
+            copy_out_all(&mut stream, &to_docs.replace("FROM docs ", "FROM docs2 "));
+        assert_eq!(tag, "COPY 3");
+        assert_eq!(first[0], second[0], "header must match");
+        assert_eq!(text_lines(first), text_lines(second), "{opts}");
+    }
+}

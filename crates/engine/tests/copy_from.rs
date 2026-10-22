@@ -661,7 +661,7 @@ fn copy_to_stdout_returns_only_own_tenant_rows() {
         .begin_copy(&policy_a, &session, &sql)
         .expect("begin_copy succeeds");
     let (format, result) = match plan {
-        CopyPlan::To(f, r) => (f, r),
+        CopyPlan::To(f, r, _) => (f, r),
         CopyPlan::From(_) => panic!("expected TO plan"),
     };
     assert_eq!(format, engine::sql::allowlist::CopyFormat::Text);
@@ -1067,7 +1067,7 @@ fn copy_to_stdout_projects_boolean_array_bytea_enum_columns() {
         .begin_copy(&policy, &session, &sql)
         .expect("begin_copy succeeds");
     let (_, result) = match plan {
-        CopyPlan::To(f, r) => (f, r),
+        CopyPlan::To(f, r, _) => (f, r),
         CopyPlan::From(_) => panic!("expected TO plan"),
     };
     let row = result.rows.into_iter().next().expect("row exists");

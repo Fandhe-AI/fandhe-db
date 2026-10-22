@@ -408,7 +408,7 @@ fn int4_with_wrong_length_is_22p03_with_zero_rows() {
 }
 
 #[test]
-fn invalid_utf8_and_nul_in_text_are_22p02() {
+fn invalid_utf8_and_nul_in_text_are_22p03() {
     for payload in [vec![0xff, 0xfe], b"a\0b".to_vec()] {
         let bad = tuple(&[
             Some(numeric_int(1)),
@@ -419,7 +419,7 @@ fn invalid_utf8_and_nul_in_text_are_22p02() {
             None,
             None,
         ]);
-        copy_fails(wide_limits(), &[&stream_of(&[bad], true)], "22P02");
+        copy_fails(wide_limits(), &[&stream_of(&[bad], true)], "22P03");
     }
 }
 

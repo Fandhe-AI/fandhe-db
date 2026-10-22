@@ -11,8 +11,9 @@
 
 - `COPY ... FROM STDIN` が `HEADER`（`MATCH` を含む）・`DELIMITER`・`NULL`・`QUOTE`・`ESCAPE` を適用する（Issue #1764・WIRE-22）。
   text 形式では `\<区切り文字>` を区切り文字そのものとして受理する（既定のタブ区切りでも `\<TAB>` がリテラルのタブになる）。
-  `COPY TO` 側の適用は Issue #1765（それまで非既定のオプションは `0A000`）。詳細は
-  [wire-copy-protocol.md](docs/design/wire-copy-protocol.md)。
+  詳細は [wire-copy-protocol.md](docs/design/wire-copy-protocol.md)。
+- `COPY (...) TO STDOUT` が `HEADER`・`DELIMITER`・`NULL`・`QUOTE`・`ESCAPE` を適用する（Issue #1765・WIRE-22）。
+  ヘッダ行は `COPY n` の n に含めない。非既定のオプションを `0A000` で拒否していたゲートは撤去した。
 - opt-in の `--require-where-for-dml`（Issue #2210・SQL-36）: `EngineCore::with_require_where_for_dml(bool)` を追加し、
   有効時は `WHERE` 省略の SQL `UPDATE`／`DELETE` を変更開始前に `42601` で拒否する（既定は無効で挙動不変）。
   wire-server に値なしスイッチ `--require-where-for-dml` を追加した。明示した述語・NoSQL 表層・`TRUNCATE` は対象外。
@@ -20,6 +21,9 @@
 
 ### Breaking Changes
 
+- `core::CopyPlan::To`（Issue #1765・WIRE-22）: 第 3 要素に解決済みの `sql::copy_options::CopyOptions` を追加した
+  （`To(format, result)` → `To(format, result, options)`）。2 要素でパターンマッチするコードはコンパイルできなくなる。
+  移行: `To(f, r)` を `To(f, r, _)` に改め、出力にオプションを適用する側は第 3 要素を使う（`To(..)` は変更不要）。
 - `COPY` の検証済みオプション（Issue #1764・WIRE-22）: `sql::allowlist::ValidatedCopyFrom`／`ValidatedCopyTo` に
   必須の公開フィールド `options: sql::copy_options::CopyOptions` を追加した。構造体リテラルで生成する外部コードと、
   全フィールドを列挙して分解（パターンマッチ）するコードはコンパイルできなくなる。移行: 構造体を自前で

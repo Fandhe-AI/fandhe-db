@@ -472,7 +472,7 @@ impl EngineCore {
                         &core.result_limits,
                     )?;
                     let result = core.run_scan_plan(write_txn, ctx, &schema, &bound)?;
-                    Ok(Some(super::CopyPlan::To(v.format, result)))
+                    Ok(Some(super::CopyPlan::To(v.format, result, v.options)))
                 }
                 _ => Ok(Some(core.begin_copy_validated(
                     ctx,
