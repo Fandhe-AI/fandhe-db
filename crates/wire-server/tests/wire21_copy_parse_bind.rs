@@ -1,10 +1,9 @@
 //! 拡張クエリプロトコルの Parse／Bind／Describe で `COPY` 文を受理する結合テスト
 //! （Issue #1759・WIRE-21 (1)・ERR-6 のポインタ。親 Issue #1758）。
 //!
-//! 対象は Parse／Bind／Describe まで。Execute（CopyIn／CopyOut の開始）は Issue #1760、
-//! CopyFail 等の後の Sync 回復は Issue #1761 の担当で、本ファイルは Execute が
-//! `0A000` の fail-closed スタブであること（副作用なし）だけを固定する。#1760 で Execute が
-//! 実装されたら、`execute_is_rejected_with_0a000_without_side_effects` を置き換える。
+//! 対象は Parse／Bind／Describe まで。Execute（CopyIn／CopyOut の開始と完了）は
+//! `wire21_copy_execute.rs`（Issue #1760）、CopyFail 等の後の Sync 回復の詳細は Issue #1761
+//! の担当。
 //! エラーは接続を閉じず、Sync まで後続を読み捨てて `ReadyForQuery` へ同期回復する
 //! （`crate::extended_query` モジュールドキュメント）。
 
@@ -247,50 +246,6 @@ fn bind_with_a_parameter_to_copy_is_rejected_with_08p01() {
     expect_parse_complete(&mut stream);
     send_length_prefixed_message(&mut stream, b'B', &bind_body_with("p", "c", &["1"], &[]));
     expect_error_and_recover(&mut stream, "08P01");
-    stream.shutdown(Shutdown::Write).ok();
-}
-
-/// Execute は Issue #1760 まで `0A000`（fail-closed）。副作用はなく、明示トランザクション中は
-/// トランザクションが Failed（'E'）になり ROLLBACK で戻る。#1760 で本テストを置き換える。
-#[test]
-fn execute_is_rejected_with_0a000_without_side_effects() {
-    let (core, _g) = new_core();
-    let mut stream = connect(Arc::clone(&core));
-    parse(&mut stream, "c", COPY_FROM, 0);
-    expect_parse_complete(&mut stream);
-    send_length_prefixed_message(&mut stream, b'B', &common::bind_body("p", "c"));
-    let (kind, _) = read_message(&mut stream);
-    assert_eq!(kind, b'2');
-    send_length_prefixed_message(&mut stream, b'E', &common::execute_body("p", 0));
-    expect_error_and_recover(&mut stream, "0A000");
-
-    // 明示トランザクション中。
-    assert_eq!(simple(&mut stream, "BEGIN"), b'T');
-    parse(&mut stream, "c2", COPY_FROM, 0);
-    expect_parse_complete(&mut stream);
-    send_length_prefixed_message(&mut stream, b'B', &common::bind_body("p2", "c2"));
-    let (kind, _) = read_message(&mut stream);
-    assert_eq!(kind, b'2');
-    send_length_prefixed_message(&mut stream, b'E', &common::execute_body("p2", 0));
-    let (kind, body) = read_message(&mut stream);
-    assert_eq!(kind, b'E');
-    assert!(String::from_utf8_lossy(&body).contains("0A000"));
-    sync(&mut stream);
-    assert_eq!(read_until_ready(&mut stream), b'E');
-    assert_eq!(simple(&mut stream, "ROLLBACK"), b'I');
-
-    // 行は増えていない。
-    send_simple_query(&mut stream, "SELECT id FROM documents LIMIT 10");
-    let mut rows = 0;
-    loop {
-        let (kind, _) = read_message(&mut stream);
-        match kind {
-            b'D' => rows += 1,
-            b'Z' => break,
-            _ => {}
-        }
-    }
-    assert_eq!(rows, 0, "rejected COPY must not insert rows");
     stream.shutdown(Shutdown::Write).ok();
 }
 

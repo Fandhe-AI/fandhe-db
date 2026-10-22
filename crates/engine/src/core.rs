@@ -1641,8 +1641,9 @@ pub enum ParsedSql {
     Cursor(crate::sql::cursor::CursorStatement),
     /// 拡張クエリプロトコルの Parse が検証済みの `COPY` 文（Issue #1759・WIRE-21 (1)・ERR-6 の
     /// ポインタ）。Parse／Bind／Describe だけを受理し、行・台帳・世代には一切触れない。
-    /// Execute は Issue #1760 まで `0A000` で拒否する（[`EngineCore::execute_parsed_in_session`]・
-    /// [`EngineCore::execute_parsed_in_txn`] の本 variant の腕が #1760 の差し替え位置）。
+    /// Execute は wire-server が横取りして CopyIn／CopyOut を実行する（Issue #1760）ため、
+    /// [`EngineCore::execute_parsed_in_session`]・[`EngineCore::execute_parsed_in_txn`] の
+    /// 本 variant の腕は他の呼び出し元に対する防御的な fail-closed（`0A000`）として残す。
     /// 簡易クエリ（`Q`）の `COPY` は本 variant を経由せず `begin_copy*` へ直行する。
     /// [`EngineCore::parse_sql`] は `COPY` を受理しない（拡張クエリの Parse だけが生成する）。
     ///
@@ -6620,8 +6621,9 @@ impl EngineCore {
                 "transaction control statements are not supported by this entry point",
             )),
             // Issue #1759・WIRE-21 (1): 拡張クエリの `COPY` は Parse／Bind／Describe まで受理し、
-            // Execute は Issue #1760 まで `0A000` で拒否する（fail-closed・副作用なし。行・台帳・
-            // 世代には触れない。#1760 がこの腕を `begin_copy*` への結線へ差し替える）。
+            // Execute は wire-server が先に横取りして `begin_copy*` へ結線する（Issue #1760）ため
+            // 通常は到達しない。他の呼び出し元への防御的な fail-closed（`0A000`・副作用なし。
+            // 行・台帳・世代には触れない）。
             ParsedSql::Copy(_) => Err(
                 crate::sql::allowlist::SqlSurfaceError::feature_not_supported(
                     "COPY via the extended query protocol is not supported yet",
@@ -7108,8 +7110,9 @@ impl EngineCore {
                 txn.mark_written(ctx.tenant_id(), &stmt.table_name);
                 Ok(outcome)
             }
-            // Issue #1759: 拡張クエリの `COPY` は Execute を Issue #1760 まで拒否する（fail-closed・
-            // 副作用なし。呼び出し元がトランザクションを `Failed` へ遷移させる）。
+            // 拡張クエリの `COPY` は wire-server が先に横取りする（Issue #1760）ため通常は到達しない。
+            // 他の呼び出し元への防御的な fail-closed（副作用なし。呼び出し元がトランザクションを
+            // `Failed` へ遷移させる）。
             ParsedSql::Copy(_) => Err(SqlSurfaceError::feature_not_supported(
                 "COPY via the extended query protocol is not supported yet",
             )),
