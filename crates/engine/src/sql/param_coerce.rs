@@ -31,6 +31,11 @@ pub(crate) enum ParamContextKind {
     Operator,
     /// 組み込み関数の文字列引数位置。
     FunctionArg,
+    /// `ON CONFLICT DO UPDATE SET <列> = <列> + $n` の加算オペランド位置（Issue #2427・SQL-49）。
+    /// 規則は [`Self::Operator`] と同じだが、整数の代入先へ非整数の数値型（float4／float8／
+    /// numeric）を宣言した場合はリテラル経路（整数列への非整数リテラルの加算）と揃えて
+    /// `0A000` にする。
+    AddOperand,
 }
 
 /// `$n` の 1 出現についての判定入力。`infer_param_types` が構文とカタログから導く。
@@ -127,7 +132,19 @@ pub(crate) fn check_declared(
                 )))
             }
         }
-        ParamContextKind::Operator => {
+        ParamContextKind::Operator | ParamContextKind::AddOperand => {
+            if check.kind == ParamContextKind::AddOperand
+                && matches!(to, CastKind::Int2 | CastKind::Int4 | CastKind::Int8)
+                && matches!(
+                    from,
+                    CastKind::Float4 | CastKind::Float8 | CastKind::Numeric
+                )
+            {
+                return Err(SqlSurfaceError::feature_not_supported(format!(
+                    "parameter ${n} of type {} added to an integer column is not supported",
+                    from.label()
+                )));
+            }
             if is_implicit(cast_rule(from, to)) || is_implicit(cast_rule(to, from)) {
                 Ok(())
             } else {
@@ -192,6 +209,26 @@ mod tests {
         assert_eq!(e.wire_code(), "42883");
         assert!(check_declared(DeclaredParamType::Int8, &chk(O, CastKind::Text)).is_err());
         assert!(check_declared(DeclaredParamType::Bool, &chk(O, CastKind::Int4)).is_err());
+    }
+
+    #[test]
+    fn add_operand_rejects_non_integer_declared_type_for_integer_target() {
+        use ParamContextKind::AddOperand as P;
+        // 整数の代入先: 整数宣言は受理、非整数の数値宣言は `0A000`、非数値は `42883`。
+        assert!(check_declared(DeclaredParamType::Int8, &chk(P, CastKind::Int4)).is_ok());
+        for d in [
+            DeclaredParamType::Float4,
+            DeclaredParamType::Float8,
+            DeclaredParamType::Numeric,
+        ] {
+            let e = check_declared(d, &chk(P, CastKind::Int4)).unwrap_err();
+            assert_eq!(e.wire_code(), "0A000");
+        }
+        let e = check_declared(DeclaredParamType::Text, &chk(P, CastKind::Int4)).unwrap_err();
+        assert_eq!(e.wire_code(), "42883");
+        // 浮動小数の代入先: 数値宣言は Operator と同じ規則で受理。
+        assert!(check_declared(DeclaredParamType::Int4, &chk(P, CastKind::Float8)).is_ok());
+        assert!(check_declared(DeclaredParamType::Float8, &chk(P, CastKind::Float4)).is_ok());
     }
 
     #[test]

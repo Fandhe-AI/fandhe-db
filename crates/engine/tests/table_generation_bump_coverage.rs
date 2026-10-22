@@ -554,6 +554,10 @@ const ALLOWLIST: &[(&str, u32)] = &[
     // 既存の `sql::exec::execute_insert_*_in` 経路が同じ txn 内で済ませており、ここで追加の bump は不要。
     ("core/insert_select_exec.rs", 932),
     ("core/insert_select_exec.rs", 1063),
+    // Issue #1679（CTAS の台帳）: `core/ctas_exec.rs` の 300 行は `IF NOT EXISTS` の no-op（既存の表がある）で
+    // `operation_id` の台帳だけを記録する commit。表の中身・定義は変えないため世代 bump は不要
+    // （表を作る commit 側の 235 行は直前で bump 済み）。
+    ("core/ctas_exec.rs", 300),
 ];
 
 /// `recovery/commit_boundary.rs` の `pub(crate) fn`/`pub fn` シグネチャを

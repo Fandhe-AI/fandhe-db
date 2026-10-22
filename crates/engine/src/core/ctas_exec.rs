@@ -4,8 +4,9 @@
 //! 列定義を導く純粋関数は `sql::ctas`（#1677）が担い、本モジュールは `core.rs` の
 //! `execute_parsed_in_session_inner` の `CreateTableAs` 腕（DDL 権限ゲート・作成先判定の通過後）から呼ばれ、
 //! それらを **1 つの write txn** の中で束ねる（表の作成と行の投入を原子的に行う）。`operation_id` の台帳・
-//! 冪等な再送・入力側上限の判定点の集約は #1679 の担当で、本 Issue では `USING OPERATION_ID` を `0A000`、
-//! 台帳必須モード（`Ledgered`）の `WITH DATA` を `23502` で拒否する（fail-closed）。
+//! 冪等な再送・入力側上限の判定点の集約は #1679 で、`USING OPERATION_ID` 付きは台帳の照合（表の重複判定
+//! `42P07` より前）を行い、記録は表の作成と同じ commit に入れる。台帳必須モード（`Ledgered`）で
+//! `operation_id` 無しの `WITH DATA` は `23502` で拒否する（fail-closed）。
 //!
 //! 原子性: 書き込みゲート（単一ライタ）を取った write txn を読み取り源にも書き込み先にも使い、
 //! (1) 出力列の確定、(2) 表の作成、(3) 内側の問い合わせの評価、(4) 行の投入、を同一スナップショット上で
@@ -31,6 +32,7 @@ use crate::sql::exec::QueryResult;
 use crate::sql::mode::SessionState;
 use crate::sql::SqlOutcome;
 use crate::storage::Storage;
+use crate::tenant::WriteTarget;
 
 impl EngineCore {
     /// `statement` の出力列と任意の列名リストから CTAS の列定義を導く。
@@ -55,13 +57,14 @@ impl EngineCore {
         crate::sql::ctas::derive_ctas_column_defs(&outputs, column_names)
     }
 
-    /// `CREATE TABLE ... AS` の実行本体（SQL-52・Issue #1678）。呼び出し元の腕が DDL 権限ゲートと
+    /// `CREATE TABLE ... AS` の実行本体（SQL-52・Issue #1678・#1679）。呼び出し元の腕が DDL 権限ゲートと
     /// 作成先判定（`require_creation_target`）を通過済みであることが前提。
     ///
-    /// 判定順（決定的）: `USING OPERATION_ID` `0A000` → 同名の関係の有無（`IF NOT EXISTS` は no-op、
-    /// 無指定は `42P07`）→ 内側の問い合わせの実カタログ検証 → 台帳必須モードの `WITH DATA` `23502`
-    /// → 書き込みゲート取得 → 出力列・列定義の導出と検査 → 表の作成 → （`WITH DATA`）評価・上限検査・
-    /// 投入 → 世代 bump → commit（1 回だけ）。
+    /// 判定順（決定的）: 台帳の事前照合（`operation_id` 指定時。同じ文の再送は `23505`、別の文は
+    /// `22023`）→ 同名の関係の有無（`IF NOT EXISTS` は no-op、無指定は `42P07`）→ 内側の問い合わせの
+    /// 実カタログ検証 → 台帳必須モードの `WITH DATA` `23502` → 書き込みゲート取得 → write txn 内の
+    /// 台帳再照合 → 出力列・列定義の導出と検査 → 表の作成 → （`WITH DATA`）評価・上限検査（入力側 →
+    /// 書き込み側）・投入 → 台帳記録（経路ごとにちょうど 1 回）→ 世代 bump → commit（1 回だけ）。
     pub(super) fn execute_create_table_as(
         &self,
         ctx: &PolicyContext,
@@ -76,11 +79,17 @@ impl EngineCore {
             populated: false,
             rows: None,
         };
-        // 台帳（#1679）が未実装のため、`operation_id` 付きは書き込みの前に拒否する（fail-closed）。
-        if stmt.operation_id().is_some() {
-            return Err(SqlSurfaceError::feature_not_supported(
-                "CREATE TABLE AS with USING OPERATION_ID is not supported",
-            ));
+        let operation_id = stmt.operation_id();
+        // 台帳の照合は表の重複判定より前に行う（再送は `42P07` ではなく `23505`／`22023`）。
+        if operation_id.is_some() {
+            crate::sql::exec::precheck_insert_select_ledger(
+                &WriteTarget::Autocommit(&self.storage),
+                ctx,
+                stmt.table_name(),
+                operation_id,
+                self.ledger_mode,
+                &stmt.statement_hash,
+            )?;
         }
         // 早期の名前衝突判定（高価な検証・評価の前に抜ける）。最終判定は下の write txn が担う。
         let exists = self
@@ -88,13 +97,45 @@ impl EngineCore {
             .relation_name_exists(stmt.table_name())
             .map_err(|_| internal())?;
         if exists {
-            return if stmt.if_not_exists() {
-                Ok(skipped)
-            } else {
-                Err(SqlSurfaceError::duplicate_table(
+            if !stmt.if_not_exists() {
+                // `operation_id` 指定時は、事前照合から名前判定までの間に別 writer が同じ文を commit した
+                // 場合でも契約（再送は `23505`／別文は `22023`）を保つため、書き込みゲートの中で台帳を
+                // 再照合してから `42P07` を確定する。
+                if operation_id.is_some() {
+                    let write_txn = self
+                        .storage
+                        .begin_write_txn()
+                        .map_err(crate::catalog::convert_storage_error)
+                        .map_err(map_create_table_catalog_error)?;
+                    crate::sql::exec::precheck_insert_select_ledger(
+                        &WriteTarget::InTxn(&write_txn),
+                        ctx,
+                        stmt.table_name(),
+                        operation_id,
+                        self.ledger_mode,
+                        &stmt.statement_hash,
+                    )?;
+                    // ゲート待ちの間に並行 DROP で関係が消えていた場合は、存在しない名前へ `42P07` を
+                    // 返さず再試行可能なエラーにする（再送すれば通常の作成になる）。
+                    let still_exists = self
+                        .storage
+                        .relation_name_exists(stmt.table_name())
+                        .map_err(|_| internal())?;
+                    if !still_exists {
+                        return Err(SqlSurfaceError::Internal {
+                            detail: "CREATE TABLE AS target changed concurrently; retry"
+                                .to_string(),
+                        });
+                    }
+                }
+                return Err(SqlSurfaceError::duplicate_table(
                     stmt.table_name().to_string(),
-                ))
-            };
+                ));
+            }
+            if operation_id.is_none() {
+                return Ok(skipped);
+            }
+            return self.record_ctas_noop(ctx, stmt, skipped);
         }
         // 構文段は構造だけを検証したため、実カタログでの検証（`42P01` 等）はここで行う。
         let query = crate::sql::allowlist::validate_sql_tokens_with_subquery_ctx_limits(
@@ -108,7 +149,7 @@ impl EngineCore {
         // 書かないため対象外）。
         if stmt.with_data() {
             self.ledger_mode
-                .resolve(None)
+                .resolve(operation_id)
                 .map_err(|_| SqlSurfaceError::MissingOperationId)?;
         }
 
@@ -119,6 +160,17 @@ impl EngineCore {
             .begin_write_txn()
             .map_err(crate::catalog::convert_storage_error)
             .map_err(map_create_table_catalog_error)?;
+        // ゲート待ちの間に同じ文が先に commit した場合（TOCTOU）も `42P07` ではなく `23505` にする。
+        if operation_id.is_some() {
+            crate::sql::exec::precheck_insert_select_ledger(
+                &WriteTarget::InTxn(&write_txn),
+                ctx,
+                stmt.table_name(),
+                operation_id,
+                self.ledger_mode,
+                &stmt.statement_hash,
+            )?;
+        }
 
         let columns = self.ctas_output_column_defs(session, &query, stmt.column_names())?;
         let validated = crate::sql::ctas::ctas_validated_create_table(
@@ -150,7 +202,14 @@ impl EngineCore {
         match Storage::create_table_in_write_txn(&write_txn, &schema) {
             Ok(()) => {}
             Err(crate::catalog::CatalogError::TableAlreadyExists(_)) if stmt.if_not_exists() => {
-                return Ok(skipped);
+                // ゲート待ちの間に別の writer が作った場合。台帳は上の再照合で未記録と確認済みのため、
+                // `operation_id` 指定時は no-op でも記録する。
+                drop(write_txn);
+                return if operation_id.is_some() {
+                    self.record_ctas_noop(ctx, stmt, skipped)
+                } else {
+                    Ok(skipped)
+                };
             }
             Err(e) => return Err(map_create_table_catalog_error(e)),
         }
@@ -158,6 +217,16 @@ impl EngineCore {
         let mut inserted: Option<u64> = None;
         if stmt.with_data() {
             inserted = Some(self.populate_ctas_table(ctx, session, &write_txn, stmt, query)?);
+        } else if operation_id.is_some() {
+            // 行を書かない経路は台帳だけを記録する（再送が二重作成にならないように）。
+            crate::sql::exec::record_insert_select_ledger_only(
+                WriteTarget::InTxn(&write_txn),
+                ctx,
+                stmt.table_name(),
+                operation_id,
+                self.ledger_mode,
+                &stmt.statement_hash,
+            )?;
         }
 
         // 表の作成の世代 bump は commit の直前に行う（`commit_boundary::commit` の悉皆検査の契約）。
@@ -173,6 +242,90 @@ impl EngineCore {
         })
     }
 
+    /// `IF NOT EXISTS` ＋ `operation_id` 指定で既存の関係があり no-op になる場合に、台帳だけを記録する。
+    /// 「適用済み」とした `operation_id` を後の再送（例: DROP の後）が別の内容で作り直す事故を防ぐ
+    /// （`INSERT ... SELECT` の 0 行記録と同じ方針）。write txn 内で台帳を再照合し、関係が並行 DROP で
+    /// 消えていれば fail-closed で拒否する（再送すれば通常の作成になる）。
+    fn record_ctas_noop(
+        &self,
+        ctx: &PolicyContext,
+        stmt: &ValidatedCreateTableAs,
+        skipped: CreateTableAsOutcome,
+    ) -> Result<CreateTableAsOutcome, SqlSurfaceError> {
+        let write_txn = self
+            .storage
+            .begin_write_txn()
+            .map_err(crate::catalog::convert_storage_error)
+            .map_err(map_create_table_catalog_error)?;
+        crate::sql::exec::precheck_insert_select_ledger(
+            &WriteTarget::InTxn(&write_txn),
+            ctx,
+            stmt.table_name(),
+            stmt.operation_id(),
+            self.ledger_mode,
+            &stmt.statement_hash,
+        )?;
+        // 書き込みゲートを保持している間は他の writer が commit できないため、この確認は txn と一致する。
+        let still_exists = self
+            .storage
+            .relation_name_exists(stmt.table_name())
+            .map_err(|_| SqlSurfaceError::Internal {
+                detail: "internal error".to_string(),
+            })?;
+        if !still_exists {
+            // 並行 DROP で消えた。fail-closed で拒否する（クライアントの再送で通常の作成になる）。
+            return Err(SqlSurfaceError::Internal {
+                detail: "CREATE TABLE AS target changed concurrently; retry".to_string(),
+            });
+        }
+        // 表以外（ビュー・索引）への no-op は台帳を記録しない。DROP VIEW 等は台帳を削除しないため、
+        // 記録すると DROP 後の再送が対象不在のまま `23505` になる（台帳の寿命は表の DROP にのみ紐づく）。
+        match self.storage.get_table_schema(stmt.table_name()) {
+            Ok(_) => {}
+            Err(crate::catalog::CatalogError::TableNotFound(_)) => return Ok(skipped),
+            Err(_) => {
+                return Err(SqlSurfaceError::Internal {
+                    detail: "internal error".to_string(),
+                })
+            }
+        }
+        crate::sql::exec::record_insert_select_ledger_only(
+            WriteTarget::InTxn(&write_txn),
+            ctx,
+            stmt.table_name(),
+            stmt.operation_id(),
+            self.ledger_mode,
+            &stmt.statement_hash,
+        )?;
+        crate::recovery::commit_boundary::commit(write_txn)
+            .map_err(crate::catalog::convert_storage_error)
+            .map_err(map_create_table_catalog_error)?;
+        Ok(skipped)
+    }
+
+    /// CTAS の入力側行数上限（SQL-52 (2)。`--max-result-rows` 由来）と、`cap + 1` 件で打ち切る取得上限。
+    /// 入力側の判定点は本関数と [`Self::check_ctas_input_rows`] の 1 か所に集約する（#2212 が
+    /// `INSERT ... SELECT`・MATERIALIZED VIEW・COPY と統一する際の置き換え点）。
+    fn ctas_input_row_limit(&self) -> Result<(usize, ResultLimits), SqlSurfaceError> {
+        let cap = self.insert_select_row_cap();
+        let fetch = cap
+            .checked_add(1)
+            .ok_or_else(|| SqlSurfaceError::Internal {
+                detail: "internal error".to_string(),
+            })?;
+        Ok((cap, ResultLimits::new(fetch)))
+    }
+
+    /// 入力を実体化した時点の入力側上限判定（超過は `54000`。書き込みの前に行う）。
+    fn check_ctas_input_rows(len: usize, cap: usize) -> Result<(), SqlSurfaceError> {
+        if len > cap {
+            return Err(SqlSurfaceError::payload_too_large(
+                "CREATE TABLE AS result exceeds the row limit",
+            ));
+        }
+        Ok(())
+    }
+
     /// 内側の問い合わせを書き込むセッションの文脈で評価し、同じ write txn で作成済みの表へ投入する。
     /// 評価結果は全行を実体化してから上限（`--max-result-rows`・`--max-insert-rows`・INDEX-4）を判定し、
     /// すべて書き込みの前に行う（投入は既存の複数行 `VALUES`・`INSERT ... SELECT` と同じ書き込み経路。
@@ -185,13 +338,7 @@ impl EngineCore {
         stmt: &ValidatedCreateTableAs,
         query: Statement,
     ) -> Result<u64, SqlSurfaceError> {
-        let cap = self.insert_select_row_cap();
-        let fetch = cap
-            .checked_add(1)
-            .ok_or_else(|| SqlSurfaceError::Internal {
-                detail: "internal error".to_string(),
-            })?;
-        let limits = ResultLimits::new(fetch);
+        let (cap, limits) = self.ctas_input_row_limit()?;
 
         // 時刻は文の先頭で 1 度だけ確定し、内側の問い合わせの `now()` で共有する（`INSERT ... SELECT` と同じ）。
         let outer_clock = crate::sql::time_fn::current_clock();
@@ -229,16 +376,23 @@ impl EngineCore {
             });
         }
         // 1 段目の上限。ここまで行は書いていない（表の作成も commit 前で、失敗すれば txn ごと破棄される）。
-        if rows.len() > cap {
-            return Err(SqlSurfaceError::payload_too_large(
-                "CREATE TABLE AS result exceeds the row limit",
-            ));
-        }
+        Self::check_ctas_input_rows(rows.len(), cap)?;
         self.check_insert_row_count_limit(rows.len())?;
         let row_count = u64::try_from(rows.len()).map_err(|_| SqlSurfaceError::Internal {
             detail: "internal error".to_string(),
         })?;
         if rows.is_empty() {
+            // 0 行でも台帳には記録する（再送が二重作成にならないように）。
+            if stmt.operation_id().is_some() {
+                crate::sql::exec::record_insert_select_ledger_only(
+                    WriteTarget::InTxn(write_txn),
+                    ctx,
+                    stmt.table_name(),
+                    stmt.operation_id(),
+                    self.ledger_mode,
+                    &stmt.statement_hash,
+                )?;
+            }
             return Ok(0);
         }
         let targets = crate::sql::insert_select::resolve_target_columns(&schema, None)?;
@@ -247,13 +401,18 @@ impl EngineCore {
             &schema,
             &targets,
             rows,
-            None,
+            stmt.operation_id(),
             clock,
         )?;
         // 1 行でもバイト量・チャンク総量の上限（INDEX-4）を必ず通す（委譲先の書き込み段はこの検査を補わない）。
         self.validate_insert_row_batch_limits(&bounds)?;
+        // 書き込み経路が台帳へ記録するハッシュを結果行の値ではなく文のハッシュへ差し替える。
+        let _ledger_scope = crate::sql::insert_select_scope::InsertSelectLedgerScope::enter(
+            stmt.table_name(),
+            stmt.statement_hash,
+        );
         crate::sql::exec::execute_insert_batch_with_schema_in(
-            crate::tenant::WriteTarget::InTxn(write_txn),
+            WriteTarget::InTxn(write_txn),
             ctx,
             &bounds,
             self.ledger_mode,
