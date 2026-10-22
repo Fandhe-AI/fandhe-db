@@ -362,6 +362,44 @@ fn dropped_table_between_bind_and_execute_is_rejected_before_copy_in() {
     s.shutdown(Shutdown::Write).ok();
 }
 
+/// Bind 後に同名・同構造の一時表を作ってから Execute すると、永続表向けだった COPY が
+/// 一時表へ化けないよう `0A000` で拒否される（行はどちらにも入らない）。
+#[test]
+fn temp_table_created_between_bind_and_execute_is_rejected_with_0a000() {
+    // 一時表は VECTOR 列を持てないため、TEXT 列のみの永続表 `notes` を宛先にする。
+    let path = temp_db::unique_db_path("wire21-copy-temp-stale");
+    let _g = temp_db::CleanupGuard(path.clone());
+    let storage = Storage::open(&path).expect("open storage");
+    storage
+        .create_table(&TableSchema::new(
+            "notes",
+            vec![ColumnDef::new("body", ColumnType::Text, false)],
+        ))
+        .expect("create table");
+    let core = Arc::new(EngineCore::from_storage(
+        storage,
+        Box::new(CpuScalarProvider),
+    ));
+    let mut s = connect(core);
+    parse_bind(&mut s, "COPY notes (id, body) FROM STDIN", "p");
+    send_simple_query(
+        &mut s,
+        "CREATE TEMP TABLE notes (id BIGINT PRIMARY KEY, body TEXT)",
+    );
+    expect_command_complete(&mut s, "CREATE TABLE");
+    assert_eq!(read_until_ready(&mut s), b'I');
+    execute(&mut s, "p");
+    let body = expect(&mut s, b'E');
+    assert!(
+        String::from_utf8_lossy(&body).contains("0A000"),
+        "{}",
+        String::from_utf8_lossy(&body)
+    );
+    sync(&mut s);
+    assert_eq!(expect(&mut s, b'Z'), b"I");
+    s.shutdown(Shutdown::Write).ok();
+}
+
 #[test]
 fn copy_to_stdout_streams_rows_and_completes() {
     let (core, _g) = new_core();

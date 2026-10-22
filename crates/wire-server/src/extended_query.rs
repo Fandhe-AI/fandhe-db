@@ -1966,6 +1966,10 @@ fn handle_bind_body(
             let parsed = if session.has_temp_tables()
                 || session.search_path_hides_public()
                 || matches!(parsed, ParsedSql::SessionRouted(_))
+                // COPY は Execute で元 SQL を現在のカタログへ再解決するため、一時表を持たない
+                // セッションでも世代つきの包みを作る（Bind 後に作られた同名の一時表への化けを
+                // Execute 前に `0A000` で拒否する。Issue #1760）。
+                || matches!(parsed, ParsedSql::Copy(_))
             {
                 let _session_tz_scope =
                     engine::datetime::SessionTimeZoneScope::enter(session.time_zone().clone());
@@ -2310,6 +2314,12 @@ fn execute_portal<'e, S: WireStream>(
                 .get_mut(portal_name)
                 .ok_or(HandlerError::UnknownPortal)?;
             portal.state = PortalState::Failed;
+            // 包みを外した元 SQL は `begin_copy*` が現在のカタログで再解決するため、Bind 後に
+            // 同名の一時表が作られると宛先が化ける。通常経路の粗いゲートと同じ世代検査を先に行い、
+            // 陳腐化した portal は `0A000` で拒否する。
+            parsed
+                .require_session_current(session)
+                .map_err(HandlerError::Sql)?;
             return Ok(PortalExecution::Copy { sql });
         }
 

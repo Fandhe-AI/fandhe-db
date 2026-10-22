@@ -1812,6 +1812,20 @@ impl ParsedSql {
             other => other,
         }
     }
+
+    /// 振り分けの包みを持つ文について、一時カタログの世代・`search_path` の世代が準備時から
+    /// 変わっていないかを検査する（陳腐化なら `0A000`。包みの無い文は常に `Ok`）。
+    /// `execute_parsed_in_txn` の粗いゲートと同じ検査で、wire-server が包みを外して
+    /// 独自に実行する経路（COPY の委譲。Issue #1760）が、ゲートを迂回しないために呼ぶ。
+    pub fn require_session_current(
+        &self,
+        session: &crate::sql::mode::SessionState,
+    ) -> Result<(), crate::sql::allowlist::SqlSurfaceError> {
+        match self {
+            ParsedSql::SessionRouted(routed) => routed.require_current(session),
+            _ => Ok(()),
+        }
+    }
 }
 
 /// セッション TimeZone を現在の文の束縛区間へ張る（`execute_parsed_in_session` 等の
