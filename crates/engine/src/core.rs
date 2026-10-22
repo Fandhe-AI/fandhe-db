@@ -5174,12 +5174,47 @@ impl EngineCore {
         // （FROM なし SELECT は引用情報を保持する。CTAS と共有）。
         let inner_tokens =
             crate::sql::allowlist::normalize_inner_query_tokens(shape.query_tokens.clone());
-        let query = crate::sql::allowlist::validate_sql_tokens_with_subquery_ctx_limits(
-            &inner_tokens,
-            storage_lookup,
-            0,
-            self.nesting_limits,
-        )?;
+        // 内側 SELECT の `LIMIT` 省略（Issue #2615）。まず送られた形のまま検証し、受理されればそのまま使う
+        // （集計・定数 SELECT など `LIMIT` 不要の形。行数上限は実行側の `rows.len() > cap` 判定が担う）。
+        // 拒否され、かつ括弧深さ 0 に `LIMIT` が無いときだけ、末尾へ `LIMIT 行数上限+1` を付けて再検証する。
+        // `cap` ちょうどで切ると黙って切り詰める fail-open になるため、必ず `+1` で超過（`54000`）を検出する。
+        // 再検証も拒否なら元の拒否理由を返す（`OFFSET` のみ・`USING MODE` 等は従来の `42601` のまま）。
+        let validate_inner = |tokens: &[crate::sql::lexer::Token]| {
+            crate::sql::allowlist::validate_sql_tokens_with_subquery_ctx_limits(
+                tokens,
+                storage_lookup,
+                0,
+                self.nesting_limits,
+            )
+        };
+        let mut implicit_limit: Option<u32> = None;
+        let query = match validate_inner(&inner_tokens) {
+            Ok(q) => q,
+            Err(first_err) => {
+                if crate::sql::allowlist::has_top_level_limit(&inner_tokens) {
+                    return Err(first_err);
+                }
+                let fetch = self
+                    .insert_select_row_cap()
+                    .checked_add(1)
+                    .and_then(|n| u32::try_from(n).ok())
+                    .ok_or_else(|| SqlSurfaceError::Internal {
+                        detail: "internal error".to_string(),
+                    })?;
+                let mut limited = inner_tokens.clone();
+                limited.push(crate::sql::lexer::Token::Keyword(
+                    crate::sql::lexer::Keyword::Limit,
+                ));
+                limited.push(crate::sql::lexer::Token::Number(fetch.to_string()));
+                match validate_inner(&limited) {
+                    Ok(q) => {
+                        implicit_limit = Some(fetch);
+                        q
+                    }
+                    Err(_) => return Err(first_err),
+                }
+            }
+        };
         crate::sql::allowlist::require_row_query_statement(&query, "INSERT ... SELECT")?;
         // 台帳の内容照合ハッシュは送られた文のトークン列（`USING OPERATION_ID` 句・末尾 `;` を除く）から
         // 算出する（Issue #1734）。未束縛の `$n` が残る形は上流で拒否済みだが、残っていればここでも
@@ -5190,9 +5225,12 @@ impl EngineCore {
         .map_err(|_| SqlSurfaceError::Internal {
             detail: "internal error".to_string(),
         })?;
-        Ok(ParsedSql::InsertSelect(
-            crate::sql::allowlist::ValidatedInsertSelect::new(shape, query, statement_hash),
-        ))
+        let mut validated =
+            crate::sql::allowlist::ValidatedInsertSelect::new(shape, query, statement_hash);
+        if let Some(fetch) = implicit_limit {
+            validated = validated.with_implicit_limit(fetch);
+        }
+        Ok(ParsedSql::InsertSelect(validated))
     }
 
     /// `INSERT ... SELECT` の束縛（SQL-51・Issue #1732）。挿入先スキーマと内側 SELECT の結果列メタ
@@ -5207,6 +5245,13 @@ impl EngineCore {
         crate::sql::insert_select::BoundInsertSelectTarget,
         crate::sql::allowlist::SqlSurfaceError,
     > {
+        // `LIMIT` を暗黙付与した文（Issue #2615）は、付与値（行数上限 + 1）が Describe の `LIMIT` 範囲検査で
+        // `22000` にならないよう、その値を上限とする。明示 `LIMIT` の文は従来の `limits` のまま。
+        let implicit_limits = stmt
+            .implicit_limit
+            .and_then(|n| usize::try_from(n).ok())
+            .map(crate::result_limits::ResultLimits::new);
+        let limits = implicit_limits.as_ref().unwrap_or(limits);
         let source = self
             .describe_parsed_in_session_impl(
                 session,

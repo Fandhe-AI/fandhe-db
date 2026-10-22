@@ -13797,6 +13797,21 @@ pub(crate) fn require_row_query_statement(
     }
 }
 
+/// トークン列の括弧深さ 0 に `LIMIT` があるか（`INSERT ... SELECT` の内側 SELECT が `LIMIT` を省略したかの
+/// 判定。サブクエリ・括弧内の `LIMIT` と文字列リテラル中の語は数えない。Issue #2615）。
+pub(crate) fn has_top_level_limit(tokens: &[Token]) -> bool {
+    let mut depth: usize = 0;
+    for t in tokens {
+        match t {
+            Token::Punct('(') => depth = depth.saturating_add(1),
+            Token::Punct(')') => depth = depth.saturating_sub(1),
+            Token::Keyword(lexer::Keyword::Limit) if depth == 0 => return true,
+            _ => {}
+        }
+    }
+    false
+}
+
 /// CTAS の内側トークン列を、`INSERT ... SELECT` と同じ規則で単独の SELECT と同じ引用付き `NULL` の
 /// 扱いへ揃える（FROM なし SELECT だけ引用情報を保持する）。
 pub(crate) fn normalize_inner_query_tokens(tokens: Vec<Token>) -> Vec<Token> {
@@ -19070,6 +19085,9 @@ pub struct ValidatedInsertSelect {
     /// 台帳の内容照合ハッシュ（`recovery::content_hash::for_insert_select`。送られた文のトークン列から
     /// `USING OPERATION_ID` 句と末尾 `;` を除いて算出。内側 SELECT の結果行は材料にしない。Issue #1734）。
     pub(crate) statement_hash: crate::recovery::content_hash::ContentHash,
+    /// 内側 SELECT が `LIMIT` を省略したときに束縛段が付与した `LIMIT` の値（`行数上限 + 1`。Issue #2615）。
+    /// 付与しなかった文（明示 `LIMIT` あり・集計など `LIMIT` 不要の形）は `None`。`query` はこの付与後の文。
+    pub(crate) implicit_limit: Option<u32>,
 }
 
 impl ValidatedInsertSelect {
@@ -19089,7 +19107,15 @@ impl ValidatedInsertSelect {
             returning: shape.returning,
             operation_id: shape.operation_id,
             statement_hash,
+            implicit_limit: None,
         }
+    }
+
+    /// 内側 SELECT へ `LIMIT` を暗黙付与した文であることを記録する（`core.rs::parse_insert_select` が呼ぶ。
+    /// Issue #2615）。束縛段はこの値を Describe の行数上限として使う。
+    pub(crate) fn with_implicit_limit(mut self, fetch: u32) -> Self {
+        self.implicit_limit = Some(fetch);
+        self
     }
 
     /// 挿入先の表名。
@@ -25035,6 +25061,26 @@ mod tests {
     ) -> Result<ParsedInsertTokens, SqlSurfaceError> {
         let tokens = lexer::tokenize(sql).expect("tokenize");
         parse_insert_any_shape_tokens_with_limit(&tokens, mode, None)
+    }
+
+    /// Issue #2615: 括弧深さ 0 の `LIMIT` だけを数える（サブクエリ・括弧内・文字列リテラル中は数えない）。
+    #[test]
+    fn has_top_level_limit_ignores_nested_and_literal_limit() {
+        let tok = |sql: &str| lexer::tokenize(sql).expect("tokenize");
+        assert!(has_top_level_limit(&tok("SELECT a FROM t LIMIT 3")));
+        assert!(has_top_level_limit(&tok(
+            "SELECT a FROM t ORDER BY a LIMIT 3 OFFSET 1"
+        )));
+        assert!(!has_top_level_limit(&tok("SELECT a FROM t")));
+        assert!(!has_top_level_limit(&tok(
+            "SELECT a FROM t WHERE a IN (SELECT a FROM u LIMIT 2)"
+        )));
+        assert!(!has_top_level_limit(&tok(
+            "(SELECT a FROM t LIMIT 1) UNION ALL (SELECT a FROM u LIMIT 1)"
+        )));
+        assert!(!has_top_level_limit(&tok(
+            "SELECT a FROM t WHERE b = 'limit'"
+        )));
     }
 
     #[test]

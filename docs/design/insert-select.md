@@ -58,7 +58,7 @@ INSERT INTO <表> (<列>[, ...]) <query> [RETURNING ...] [USING OPERATION_ID '<i
 
 - #1733・#1734: 結線済み（第 II 部。`BoundInsertSelectTarget` の再利用と `query_tokens` による台帳ハッシュ）
 - #1730: `DEFAULT VALUES`（列リスト省略の `INSERT ... SELECT` は第 III 部で受理）
-- SQL-34 / #2212: 内側 SELECT の LIMIT 省略の扱い
+- SQL-34: 内側 SELECT の LIMIT 省略は #2615 で受理（末尾「Issue #2615 追記」）。`--max-result-rows` の CLI 統一は #2212
 
 ### 6. 対象外（fail-closed）
 
@@ -182,3 +182,22 @@ NULL 許容は NULL・DEFAULT の無い NOT NULL は `23502`）。`DEFAULT nextv
   VALUES 形の文内重複（`22000`）はここでは変えない（別 Issue #1738 の担当）。
 - fail-closed のまま: 移行済み表で `id` を省略した UPSERT（Issue #1699。Describe 段 `bind_insert_select` も実行本体と同じ共有判定 `reject_omitted_id_upsert` で bind 時に `0A000`）・SEQUENCE の DEFAULT・ビュー／一時表・拡張クエリの `$n`。
 - BREAKING: `SqlSurfaceError` への variant 追加、および `INSERT ... SELECT ... ON CONFLICT` が `0A000` から受理へ変わる。
+
+## Issue #2615 追記（内側 LIMIT 省略の受理・自己参照・PG 照合・IDENTITY 採番の検証。SQL-51・SQL-34 ポインタ）
+
+- 方式: `core.rs::parse_insert_select` は、まず送られた形のまま内側 SELECT を検証する。拒否され、かつ括弧深さ 0 に
+  `LIMIT` が無いときだけ、トークン列の末尾へ `LIMIT <行数上限 + 1>` を付けて再検証する（SQL 文字列は組み立て直さない。
+  matview と同じ骨格）。再検証も拒否なら元の拒否理由（`42601`）を返す。集計・定数 SELECT など `LIMIT` 不要の形は
+  最初の検証で通るため注入せず、上限判定は実行側の `rows.len() > cap`（`54000`）が担う。
+- `cap` ちょうどの `LIMIT` は黙って切り詰める fail-open になるため付けない。必ず `cap + 1` で読み、超過は `54000`
+  （1 行も挿入せず、台帳にも残さない）。`cap` の算出元は `insert_select_row_cap()` の 1 か所（#2212 の置き換え点）。
+- `ValidatedInsertSelect::implicit_limit`（`pub(crate)`）に付与値を記録し、`bind_insert_select` はその値を Describe の
+  `LIMIT` 範囲検査の上限にする（`22000` を避ける）。明示 `LIMIT` の文は従来どおり（`n > max_result_rows` は `22000`）。
+  公開アクセサ `query()` は付与後の文を返す。
+- 台帳ハッシュは送られた文のトークン列から算出するため、注入は材料に入らない。LIMIT 省略形と明示形は別の文として扱う。
+- 残る `42601`: `OFFSET` のみで `LIMIT` が無い形、`USING MODE`／`HINT ORDER` 付きで `LIMIT` が無い形、集合演算の枝・CTE 本体・
+  サブクエリ内側での `LIMIT` 省略（外側にだけ注入するため内側の規則は不変）。
+- 対象外: 上記の内側 `LIMIT` 省略・CTAS の `LIMIT` 省略・`--max-result-rows` の CLI 統一（#2211・#2212）・
+  移行済み表で `id` を省略した UPSERT（#1699。fail-closed のまま）。
+- テスト: `tests/sql51_insert_select_limit_omitted.rs`（受理・上限境界・RLS・Describe・台帳・自己参照・PG 照合の期待値）、
+  `tests/sql51_insert_select_migrated_id.rs`（移行済み表の IDENTITY 採番・再送・明示トランザクション・自己参照）。
