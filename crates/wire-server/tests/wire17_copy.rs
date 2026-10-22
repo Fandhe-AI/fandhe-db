@@ -237,6 +237,53 @@ fn wire17_copy_from_stdin_csv_format_is_accepted() {
     read_ready_for_query(&mut stream);
 }
 
+/// WIRE-22・Issue #1764: HEADER・DELIMITER 付きの csv を複数 CopyData チャンクで送り、
+/// ヘッダ行が `COPY n` の行数に含まれないことを確かめる。
+#[test]
+fn wire22_copy_from_stdin_csv_header_and_delimiter_are_applied() {
+    let (core, _guard) = new_core_with_docs_table();
+    let mut stream = spawn_with_alice(core);
+
+    send_simple_query(
+        &mut stream,
+        "COPY docs (id, embedding, lang) FROM STDIN WITH (FORMAT csv, HEADER, DELIMITER ';') USING OPERATION_ID 'wire-copy-hdr-1'",
+    );
+    let _ = read_copy_in_response(&mut stream);
+    send_copy_data(&mut stream, b"id;embedding;la");
+    send_copy_data(&mut stream, b"ng\n1;[1.0,0.0];ja\n2;[0.0,1.0];");
+    send_copy_data(&mut stream, b"ja\n");
+    send_copy_done(&mut stream);
+
+    let tag = read_command_complete(&mut stream);
+    assert_eq!(tag, "COPY 2");
+    read_ready_for_query(&mut stream);
+}
+
+/// WIRE-22・Issue #1764: `HEADER MATCH` の不一致は CopyDone 後に ErrorResponse（22000）で
+/// 拒否され、接続は ReadyForQuery へ戻り、行は 1 件も commit されない。
+#[test]
+fn wire22_copy_from_stdin_header_match_mismatch_is_rejected_and_connection_survives() {
+    let (core, _guard) = new_core_with_docs_table();
+    let mut stream = spawn_with_alice(core);
+
+    send_simple_query(
+        &mut stream,
+        "COPY docs (id, embedding, lang) FROM STDIN WITH (FORMAT csv, HEADER MATCH) USING OPERATION_ID 'wire-copy-hdr-2'",
+    );
+    let _ = read_copy_in_response(&mut stream);
+    send_copy_data(&mut stream, b"id,embedding,other\n1,\"[1.0,0.0]\",ja\n");
+    send_copy_done(&mut stream);
+
+    expect_error_response_with_sqlstate(&mut stream, "22000");
+    read_ready_for_query(&mut stream);
+
+    send_simple_query(&mut stream, "SELECT id FROM docs LIMIT 10");
+    let _ = read_row_description(&mut stream);
+    let tag = read_command_complete(&mut stream);
+    assert_eq!(tag, "SELECT 0", "no row must have been committed");
+    read_ready_for_query(&mut stream);
+}
+
 #[test]
 fn wire17_copy_from_stdin_missing_operation_id_is_rejected_before_copy_in_response() {
     let (core, _guard) = new_core_with_docs_table();

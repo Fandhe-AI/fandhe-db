@@ -9,6 +9,10 @@
 
 ### Added
 
+- `COPY ... FROM STDIN` が `HEADER`（`MATCH` を含む）・`DELIMITER`・`NULL`・`QUOTE`・`ESCAPE` を適用する（Issue #1764・WIRE-22）。
+  text 形式では `\<区切り文字>` を区切り文字そのものとして受理する（既定のタブ区切りでも `\<TAB>` がリテラルのタブになる）。
+  `COPY TO` 側の適用は Issue #1765（それまで非既定のオプションは `0A000`）。詳細は
+  [wire-copy-protocol.md](docs/design/wire-copy-protocol.md)。
 - opt-in の `--require-where-for-dml`（Issue #2210・SQL-36）: `EngineCore::with_require_where_for_dml(bool)` を追加し、
   有効時は `WHERE` 省略の SQL `UPDATE`／`DELETE` を変更開始前に `42601` で拒否する（既定は無効で挙動不変）。
   wire-server に値なしスイッチ `--require-where-for-dml` を追加した。明示した述語・NoSQL 表層・`TRUNCATE` は対象外。
@@ -16,6 +20,11 @@
 
 ### Breaking Changes
 
+- `COPY` の検証済みオプション（Issue #1764・WIRE-22）: `sql::allowlist::ValidatedCopyFrom`／`ValidatedCopyTo` に
+  必須の公開フィールド `options: sql::copy_options::CopyOptions` を追加した。構造体リテラルで生成する外部コードと、
+  全フィールドを列挙して分解（パターンマッチ）するコードはコンパイルできなくなる。移行: 構造体を自前で
+  組み立てず、`validate_copy_*` 系の入口が返す検証済み値を使う（`options` は検証・既定値適用済みで、HEADER・DELIMITER・NULL・
+  QUOTE・ESCAPE を `options` フィールドから参照できる）。分解側は `..` を付けるか `options` を束縛して使う。
 - 述語形 `UPDATE`／`DELETE` の恒真述語（Issue #1744・SQL-36・SQL-41）: `WHERE TRUE`・`... OR TRUE`・`WHERE visible()` 単独を受理する。
   `sql::parser::bind_predicate_delete`／`bind_update_form` がこれらに `42601` を返さなくなり、`BoundOrGroup::is_trivially_true` を削除した。
   対象は自テナントの可視行で、影響行数上限は実行段が判定する。NoSQL 表層は不変。

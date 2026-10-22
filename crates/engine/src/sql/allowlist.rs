@@ -20076,7 +20076,7 @@ pub struct ValidatedCopyFrom {
     /// 列リストの宣言順（`id` 疑似列を必ず含む。重複はここで拒否済み）。
     pub columns: Vec<String>,
     pub format: CopyFormat,
-    /// 解決済みの `WITH` オプション（Issue #1763。適用は Issue #1764。それまでは既定値のみ受理）。
+    /// 解決済みの `WITH` オプション（Issue #1763 で解決、Issue #1764 で `sql::copy` が適用）。
     pub options: copy_options::CopyOptions,
     /// 文末専用句で搬送された、検証済みの `operation_id`。句の欠落・明示
     /// `NULL` はいずれも `None`（`ValidatedInsert::operation_id` と同じ契約。
@@ -20410,8 +20410,7 @@ fn validate_copy_from_tokens(
             )));
         }
     }
-    // データ経路が未適用のオプションは fail-closed（Issue #1764 が外す）。
-    copy_options::reject_unapplied_for_from(format, &options)?;
+    // FROM 側のオプション（HEADER・DELIMITER・NULL・QUOTE・ESCAPE）は `sql::copy` が適用する（Issue #1764）。
     // 疑似列 `id` の要否は表の行識別方式で決まる（採番方式の表は不要。TABLE-23・Issue #2199）ため、
     // 列リストへの `id` 必須検査は束縛段（`sql::copy`）が表のスキーマを見て行う。
 

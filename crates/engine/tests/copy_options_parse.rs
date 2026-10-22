@@ -1,8 +1,9 @@
 //! `COPY` の `WITH` オプション構文解析（Issue #1763・WIRE-22・TASK-294 のポインタ）の engine API
 //! 層の結合テスト。簡易クエリの `EngineCore::begin_copy` と拡張クエリの Parse
 //! （`parse_sql_prepared`）が同じ検証入口を共有し、同一の SQLSTATE を返すこと、旧構文と新構文が
-//! 同じ結果になること、データ経路が未適用のオプションが `0A000` で拒否される（無言の fail-open
-//! にならない）ことを固定する。オプションの適用は Issue #1764（FROM）・#1765（TO）の担当。
+//! 同じ結果になること、データ経路が未適用の TO 側オプションが `0A000` で拒否される（無言の
+//! fail-open にならない）ことを固定する。オプションの適用は FROM が Issue #1764（適用済み）、
+//! TO が #1765 の担当。
 
 use engine::catalog::{ColumnDef, ColumnType, TableSchema};
 use engine::core::{CopyPlan, EngineCore};
@@ -100,23 +101,33 @@ fn explicit_defaults_are_accepted_for_both_directions() {
     }
 }
 
+/// 非既定オプションの受理／拒否の方向差を固定する。FROM は Issue #1764 でデータ経路が適用済みのため
+/// 受理し、TO は適用（Issue #1765）まで `0A000` のまま（無言の fail-open にしない）。
+const NON_DEFAULT_OPTIONS: [&str; 5] = [
+    " WITH (HEADER)",
+    " CSV HEADER",
+    " WITH (FORMAT csv, DELIMITER ';')",
+    " WITH (NULL 'x')",
+    " WITH (FORMAT csv, QUOTE '''')",
+];
+
 #[test]
-fn non_default_options_are_0a000_until_applied() {
-    let (core, _g) = open("copy-opt-gate");
-    for dir in [FROM, TO] {
-        for opt in [
-            " WITH (HEADER)",
-            " CSV HEADER",
-            " WITH (FORMAT csv, DELIMITER ';')",
-            " WITH (NULL 'x')",
-            " WITH (FORMAT csv, QUOTE '''')",
-        ] {
-            assert_eq!(
-                rejected_code(&core, &format!("{dir}{opt}")),
-                "0A000",
-                "{dir}{opt}"
-            );
-        }
+fn non_default_options_are_accepted_for_from() {
+    let (core, _g) = open("copy-opt-from-applied");
+    for opt in NON_DEFAULT_OPTIONS {
+        accepted_in_both(&core, &format!("{FROM}{opt}"));
+    }
+}
+
+#[test]
+fn non_default_options_are_0a000_for_to_until_applied() {
+    let (core, _g) = open("copy-opt-to-gate");
+    for opt in NON_DEFAULT_OPTIONS {
+        assert_eq!(
+            rejected_code(&core, &format!("{TO}{opt}")),
+            "0A000",
+            "{TO}{opt}"
+        );
     }
 }
 

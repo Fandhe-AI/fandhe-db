@@ -6,12 +6,11 @@
 //! 重複・未知名・値の型・モード制約・方向制約を PostgreSQL 17 と同じ分類で検証して、
 //! 解決済みの [`CopyOptions`] と [`CopyFormat`] を返す。トークン型（`Parser`）には依存しない。
 //!
-//! fail-closed の前提: 本 Issue は構文の解析だけを担い、データ経路（[`crate::sql::copy`]・
-//! wire-server の COPY ハンドラ）はまだオプションを適用しない。適用しないまま受理すると
-//! ヘッダ行がデータ化する等の無言の fail-open になるため、format の既定値と異なる解決結果は
-//! [`reject_unapplied_for_from`]／[`reject_unapplied_for_to`] が `0A000` で拒否する。
-//! `COPY FROM` 側の適用（Issue #1764）・`COPY TO` 側の適用（Issue #1765）は、それぞれ自分の
-//! 方向のゲート呼び出しを外すだけでよい。`FORMAT binary` は WIRE-23 の領域のため、従来どおり
+//! fail-closed の前提: `COPY FROM` 側のデータ経路（[`crate::sql::copy`]）は Issue #1764 で
+//! HEADER・DELIMITER・NULL・QUOTE・ESCAPE を適用済みのためゲートは無い。`COPY TO` 側は
+//! まだ適用しておらず、適用しないまま受理すると無言の fail-open になるため、format の既定値と
+//! 異なる解決結果は [`reject_unapplied_for_to`] が `0A000` で拒否する。`COPY TO` 側の適用
+//! （Issue #1765）は、その呼び出し 1 行を外すだけでよい。`FORMAT binary` は WIRE-23 の領域のため、従来どおり
 //! `42601` のまま先送りする。
 //!
 //! エラー文言にはユーザー入力の値を含めない（`22023`・`0A000` は固定文言。`42601` に含めるのは
@@ -122,16 +121,14 @@ impl CopyOptions {
     }
 }
 
-const UNAPPLIED_DETAIL: &str = "COPY option is not supported yet";
-
-/// `COPY FROM STDIN` のデータ経路が未適用のオプション（既定値と異なる解決結果）を `0A000` で
-/// 拒否するゲート。Issue #1764 が FROM 側の適用を実装したら、呼び出し 1 行を外す。
-pub(crate) fn reject_unapplied_for_from(
-    format: CopyFormat,
-    options: &CopyOptions,
-) -> Result<(), SqlSurfaceError> {
-    gate(format, options)
+/// `format` の既定値だけで構成したオプション（`COPY FROM` のデータ経路の単体テストと、
+/// オプション未指定を表す呼び出し元が使う）。
+#[cfg(test)]
+pub(crate) fn defaults_for_format(format: CopyFormat) -> CopyOptions {
+    CopyOptions::defaults_for(format)
 }
+
+const UNAPPLIED_DETAIL: &str = "COPY option is not supported yet";
 
 /// `COPY TO STDOUT` のデータ経路が未適用のオプションを `0A000` で拒否するゲート。
 /// Issue #1765 が TO 側の適用を実装したら、呼び出し 1 行を外す。
@@ -596,17 +593,10 @@ mod tests {
             raw("quote", s("\"")),
             raw("header", id("false")),
         ]);
-        assert!(reject_unapplied_for_from(f, &o).is_ok());
         assert!(reject_unapplied_for_to(f, &o).is_ok());
         let (f, o) = ok(vec![raw("header", None)]);
-        let e = reject_unapplied_for_from(f, &o).expect_err("gate");
+        let e = reject_unapplied_for_to(f, &o).expect_err("gate");
         assert_eq!(e.wire_code(), "0A000");
-        assert_eq!(
-            reject_unapplied_for_to(f, &o)
-                .expect_err("gate")
-                .wire_code(),
-            "0A000"
-        );
         assert!(!e.to_string().contains("header"));
     }
 }
