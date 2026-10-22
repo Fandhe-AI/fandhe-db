@@ -4,7 +4,7 @@
 //! 残らない）、`WITH [NO] DATA`・`IF NOT EXISTS`、RLS（他テナントの行が投入されない）、DDL 権限ゲートが
 //! 元表の存在確認より先に働くこと（存在オラクルの防止）、未対応形の fail-closed を固定する。
 //! `sql51_insert_select_exec.rs` と同じ流儀（`unique_db_path`／`CleanupGuard`）。
-//! `operation_id` の台帳・冪等な再送・入力側上限の境界テストは #1679 の担当。
+//! `operation_id` の台帳・冪等な再送・入力側／書き込み側上限の境界テストは #1679。
 //! ポインタ: `docs/design/ctas-column-inference.md`。
 
 use engine::core::EngineCore;
@@ -363,10 +363,6 @@ fn unsupported_forms_fail_closed() {
             "CREATE TABLE u (a, b) AS SELECT id FROM src LIMIT 1",
             "42601",
         ),
-        (
-            "CREATE TABLE u AS SELECT id FROM src LIMIT 1 USING OPERATION_ID 'op-1'",
-            "0A000",
-        ),
         ("CREATE TEMP TABLE u AS SELECT id FROM src LIMIT 1", "0A000"),
         (
             "CREATE TEMP TABLE u (a) AS SELECT id FROM src LIMIT 1",
@@ -564,4 +560,265 @@ fn column_types_round_trip_through_ctas() {
     );
     assert_eq!(o.rows(), Some(1));
     assert_eq!(count(&core, "alice", "ty2"), Ok(1));
+}
+
+// ---- Issue #1679: 台帳・冪等な再送・上限（SQL-52 (4)(2)・RECOVER-10/11・INDEX-4）----
+
+const Q: &str = "SELECT id, a FROM src LIMIT 100";
+
+// 対象ビヘイビア: SQL-52 (4)・RECOVER-10。同じ文の再送は 23505、別の文は 22023。表の重複判定より先に効く。
+#[test]
+fn operation_id_resend_is_idempotent_and_precedes_duplicate_check() {
+    let (core, path) = setup("sql52-resend");
+    let _g = CleanupGuard(path);
+    let sql = format!("CREATE TABLE r1 AS {Q} USING OPERATION_ID 'op-1'");
+    let o = ctas(&core, "alice", &sql);
+    assert_eq!(o.rows(), Some(2));
+    assert_eq!(code(run(&core, "alice", &sql)), "23505");
+    assert_eq!(count(&core, "alice", "r1"), Ok(2));
+    // 別の内側の問い合わせ・別の列名リストは 22023
+    assert_eq!(
+        code(run(
+            &core,
+            "alice",
+            "CREATE TABLE r1 AS SELECT id FROM src LIMIT 100 USING OPERATION_ID 'op-1'"
+        )),
+        "22023"
+    );
+    assert_eq!(
+        code(run(
+            &core,
+            "alice",
+            "CREATE TABLE r1 (x, y) AS SELECT id, a FROM src LIMIT 100 USING OPERATION_ID 'op-1'"
+        )),
+        "22023"
+    );
+    // IF NOT EXISTS の有無も別の文
+    assert_eq!(
+        code(run(
+            &core,
+            "alice",
+            &format!("CREATE TABLE IF NOT EXISTS r1 AS {Q} USING OPERATION_ID 'op-1'")
+        )),
+        "22023"
+    );
+    // 別の operation_id は通常の重複判定（42P07）
+    assert_eq!(
+        code(run(
+            &core,
+            "alice",
+            &format!("CREATE TABLE r1 AS {Q} USING OPERATION_ID 'op-2'")
+        )),
+        "42P07"
+    );
+}
+
+// 対象ビヘイビア: SQL-52 (4)・TABLE-36。operation_id 省略は台帳に触れない通常の書き込み。
+#[test]
+fn without_operation_id_resend_is_duplicate_or_noop() {
+    let (core, path) = setup("sql52-noop-id");
+    let _g = CleanupGuard(path);
+    ctas(&core, "alice", &format!("CREATE TABLE n1 AS {Q}"));
+    assert_eq!(
+        code(run(&core, "alice", &format!("CREATE TABLE n1 AS {Q}"))),
+        "42P07"
+    );
+    let o = ctas(
+        &core,
+        "alice",
+        &format!("CREATE TABLE IF NOT EXISTS n1 AS {Q}"),
+    );
+    assert!(o.skipped());
+    // 台帳なしで作られた既存の表に operation_id 付き CTAS は 42P07
+    run(&core, "alice", "CREATE TABLE plain (id BIGINT PRIMARY KEY)").expect("ddl");
+    assert_eq!(
+        code(run(
+            &core,
+            "alice",
+            &format!("CREATE TABLE plain AS {Q} USING OPERATION_ID 'op-p'")
+        )),
+        "42P07"
+    );
+}
+
+// 対象ビヘイビア: SQL-52 (4)・TABLE-36。IF NOT EXISTS の no-op でも operation_id は記録され、再送は 23505。
+#[test]
+fn if_not_exists_noop_records_ledger() {
+    let (core, path) = setup("sql52-ine-ledger");
+    let _g = CleanupGuard(path);
+    ctas(&core, "alice", &format!("CREATE TABLE e1 AS {Q}"));
+    let sql = format!("CREATE TABLE IF NOT EXISTS e1 AS {Q} USING OPERATION_ID 'op-e'");
+    assert!(ctas(&core, "alice", &sql).skipped());
+    assert_eq!(code(run(&core, "alice", &sql)), "23505");
+    assert_eq!(count(&core, "alice", "e1"), Ok(2));
+}
+
+// ビュー名への IF NOT EXISTS no-op は台帳を記録しない（DROP VIEW は台帳を消さないため）。DROP 後の
+// 同じ文の再送は 23505 ではなく通常の作成になる。
+#[test]
+fn noop_on_view_does_not_record_ledger_so_resend_after_drop_creates() {
+    let (core, path) = setup("sql52-ine-view");
+    let _g = CleanupGuard(path);
+    run(&core, "alice", &format!("CREATE VIEW vw AS {Q}")).unwrap();
+    let sql = format!("CREATE TABLE IF NOT EXISTS vw AS {Q} USING OPERATION_ID 'op-vw'");
+    assert!(ctas(&core, "alice", &sql).skipped());
+    run(&core, "alice", "DROP VIEW vw").unwrap();
+    assert!(!ctas(&core, "alice", &sql).skipped());
+    assert_eq!(count(&core, "alice", "vw"), Ok(2));
+}
+
+// 非 IF NOT EXISTS の重複（42P07）でも、記録済みの operation_id の再送は 23505 を保つ。
+#[test]
+fn duplicate_with_operation_id_keeps_ledger_contract() {
+    let (core, path) = setup("sql52-dup-ledger");
+    let _g = CleanupGuard(path);
+    let sql = format!("CREATE TABLE d1 AS {Q} USING OPERATION_ID 'op-d1'");
+    ctas(&core, "alice", &sql);
+    assert_eq!(code(run(&core, "alice", &sql)), "23505");
+    let other = "CREATE TABLE d1 AS SELECT id FROM src LIMIT 1 USING OPERATION_ID 'op-d1'";
+    assert_eq!(code(run(&core, "alice", other)), "22023");
+}
+
+// `$n` を含む CTAS は内部エラーではなく 0A000。
+#[test]
+fn bind_parameter_with_operation_id_is_unsupported_not_internal() {
+    let (core, path) = setup("sql52-param-run");
+    let _g = CleanupGuard(path);
+    let sql =
+        "CREATE TABLE p1 AS SELECT id FROM src WHERE id = $1 LIMIT 10 USING OPERATION_ID 'op-p'";
+    let e = core
+        .parse_sql_prepared(sql)
+        .err()
+        .map(|e| e.wire_code().to_string());
+    assert_eq!(e.as_deref(), Some("0A000"));
+}
+
+// 対象ビヘイビア: SQL-52 (4)。0 行・WITH NO DATA でも台帳に記録され、再送は 23505。
+#[test]
+fn zero_rows_and_no_data_record_ledger() {
+    let (core, path) = setup("sql52-zero-ledger");
+    let _g = CleanupGuard(path);
+    for (name, body) in [
+        ("z1", "SELECT id FROM src WHERE id = 999 LIMIT 10"),
+        ("z2", "SELECT id FROM src LIMIT 10 WITH NO DATA"),
+    ] {
+        let sql = format!("CREATE TABLE {name} AS {body} USING OPERATION_ID 'op-{name}'");
+        ctas(&core, "alice", &sql);
+        assert_eq!(code(run(&core, "alice", &sql)), "23505", "{sql}");
+        assert_eq!(count(&core, "alice", name), Ok(0));
+    }
+}
+
+// 対象ビヘイビア: RECOVER-1・SQL-52 (4)。台帳必須モードでは operation_id 付きの WITH DATA が通り、再送は 23505。
+#[test]
+fn ledgered_mode_accepts_operation_id() {
+    let (core, path) = setup_with("sql52-ledgered-ok", |c| {
+        c.with_ledger_mode(LedgerMode::Ledgered)
+    });
+    let _g = CleanupGuard(path);
+    let sql = format!("CREATE TABLE lg AS {Q} USING OPERATION_ID 'op-lg'");
+    assert_eq!(ctas(&core, "alice", &sql).rows(), Some(2));
+    assert_eq!(code(run(&core, "alice", &sql)), "23505");
+    assert_eq!(
+        code(run(&core, "alice", &format!("CREATE TABLE lg2 AS {Q}"))),
+        "23502"
+    );
+}
+
+// 台帳を記録しない構成では operation_id を渡しても再送は通常の重複判定。
+#[test]
+fn compare_only_mode_does_not_use_ledger() {
+    let (core, path) = setup_with("sql52-compare-only", |c| {
+        c.with_ledger_mode(LedgerMode::CompareOnlyWithoutLedger)
+    });
+    let _g = CleanupGuard(path);
+    let sql = format!("CREATE TABLE co AS {Q} USING OPERATION_ID 'op-co'");
+    ctas(&core, "alice", &sql);
+    assert_eq!(code(run(&core, "alice", &sql)), "42P07");
+}
+
+// 対象ビヘイビア: SQL-52 (2)(4)。失敗した CTAS は表も台帳も残さず、同じ operation_id で再試行できる。
+#[test]
+fn failed_ctas_leaves_no_ledger_and_retry_succeeds() {
+    let (core, path) = setup_with("sql52-atomic-ledger", |c| {
+        c.with_dml_limits(engine::sql::parser::DmlLimits {
+            max_affected_rows: None,
+            max_insert_rows_per_statement: std::num::NonZeroUsize::new(1),
+        })
+    });
+    let _g = CleanupGuard(path);
+    let sql = format!("CREATE TABLE a1 AS {Q} USING OPERATION_ID 'op-a'");
+    assert_eq!(code(run(&core, "alice", &sql)), "54000");
+    assert_eq!(count(&core, "alice", "a1"), Err("42P01".to_string()));
+    let retry = "CREATE TABLE a1 AS SELECT id FROM src LIMIT 1 USING OPERATION_ID 'op-a'";
+    assert_eq!(ctas(&core, "alice", retry).rows(), Some(1));
+}
+
+// テナント境界: 台帳は (tenant, table, operation_id) で分かれ、他テナントの台帳の有無は観測できない。
+#[test]
+fn ledger_is_tenant_scoped() {
+    let (core, path) = setup("sql52-ledger-tenant");
+    let _g = CleanupGuard(path);
+    let sql = format!("CREATE TABLE t1 AS {Q} USING OPERATION_ID 'op-t'");
+    ctas(&core, "alice", &sql);
+    assert_eq!(code(run(&core, "bob", &sql)), "42P07");
+}
+
+// 対象ビヘイビア: SQL-52 (2)。入力側上限の境界。可視行がちょうど N 行（bob の行は数えない）なら成功する。
+// 内側の LIMIT は `--max-result-rows` 以下に制限されるため N+1 行は LIMIT 段で拒否され（表は残らない）、
+// 実体化後の 54000 判定は多重防御として残る。
+#[test]
+fn input_row_limit_boundary() {
+    let (core, path) = setup_with("sql52-in-ok", |c| {
+        c.with_result_limits(ResultLimits::new(2))
+    });
+    let _g = CleanupGuard(path);
+    assert_eq!(
+        ctas(
+            &core,
+            "alice",
+            "CREATE TABLE i1 AS SELECT id, a FROM src LIMIT 2"
+        )
+        .rows(),
+        Some(2)
+    );
+    assert!(run(
+        &core,
+        "alice",
+        "CREATE TABLE i2 AS SELECT id FROM src LIMIT 3"
+    )
+    .is_err());
+    assert_eq!(count(&core, "alice", "i2"), Err("42P01".to_string()));
+}
+
+// 対象ビヘイビア: SQL-52 (2)・INDEX-4。書き込み側上限の境界（N 行は成功、N+1 行は 54000 で表が残らない）。
+#[test]
+fn insert_row_limit_boundary() {
+    let dml = |n: usize| engine::sql::parser::DmlLimits {
+        max_affected_rows: None,
+        max_insert_rows_per_statement: std::num::NonZeroUsize::new(n),
+    };
+    let (core, path) = setup_with("sql52-w-ok", |c| c.with_dml_limits(dml(2)));
+    let _g = CleanupGuard(path);
+    assert_eq!(
+        ctas(&core, "alice", &format!("CREATE TABLE w1 AS {Q}")).rows(),
+        Some(2)
+    );
+    let (core2, path2) = setup_with("sql52-w-over", |c| {
+        c.with_result_limits(ResultLimits::new(2))
+            .with_dml_limits(dml(1))
+    });
+    let _g2 = CleanupGuard(path2);
+    let e = run(
+        &core2,
+        "alice",
+        "CREATE TABLE w2 AS SELECT id, a FROM src LIMIT 2",
+    )
+    .unwrap_err();
+    assert_eq!(e.wire_code(), "54000");
+    assert!(
+        format!("{e}").contains("INSERT statement exceeds the allowed row count"),
+        "{e}"
+    );
+    assert_eq!(count(&core2, "alice", "w2"), Err("42P01".to_string()));
 }
