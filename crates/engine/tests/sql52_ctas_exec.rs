@@ -653,6 +653,46 @@ fn if_not_exists_noop_records_ledger() {
     assert_eq!(count(&core, "alice", "e1"), Ok(2));
 }
 
+// ビュー名への IF NOT EXISTS no-op は台帳を記録しない（DROP VIEW は台帳を消さないため）。DROP 後の
+// 同じ文の再送は 23505 ではなく通常の作成になる。
+#[test]
+fn noop_on_view_does_not_record_ledger_so_resend_after_drop_creates() {
+    let (core, path) = setup("sql52-ine-view");
+    let _g = CleanupGuard(path);
+    run(&core, "alice", &format!("CREATE VIEW vw AS {Q}")).unwrap();
+    let sql = format!("CREATE TABLE IF NOT EXISTS vw AS {Q} USING OPERATION_ID 'op-vw'");
+    assert!(ctas(&core, "alice", &sql).skipped());
+    run(&core, "alice", "DROP VIEW vw").unwrap();
+    assert!(!ctas(&core, "alice", &sql).skipped());
+    assert_eq!(count(&core, "alice", "vw"), Ok(2));
+}
+
+// 非 IF NOT EXISTS の重複（42P07）でも、記録済みの operation_id の再送は 23505 を保つ。
+#[test]
+fn duplicate_with_operation_id_keeps_ledger_contract() {
+    let (core, path) = setup("sql52-dup-ledger");
+    let _g = CleanupGuard(path);
+    let sql = format!("CREATE TABLE d1 AS {Q} USING OPERATION_ID 'op-d1'");
+    ctas(&core, "alice", &sql);
+    assert_eq!(code(run(&core, "alice", &sql)), "23505");
+    let other = "CREATE TABLE d1 AS SELECT id FROM src LIMIT 1 USING OPERATION_ID 'op-d1'";
+    assert_eq!(code(run(&core, "alice", other)), "22023");
+}
+
+// `$n` を含む CTAS は内部エラーではなく 0A000。
+#[test]
+fn bind_parameter_with_operation_id_is_unsupported_not_internal() {
+    let (core, path) = setup("sql52-param-run");
+    let _g = CleanupGuard(path);
+    let sql =
+        "CREATE TABLE p1 AS SELECT id FROM src WHERE id = $1 LIMIT 10 USING OPERATION_ID 'op-p'";
+    let e = core
+        .parse_sql_prepared(sql)
+        .err()
+        .map(|e| e.wire_code().to_string());
+    assert_eq!(e.as_deref(), Some("0A000"));
+}
+
 // 対象ビヘイビア: SQL-52 (4)。0 行・WITH NO DATA でも台帳に記録され、再送は 23505。
 #[test]
 fn zero_rows_and_no_data_record_ledger() {

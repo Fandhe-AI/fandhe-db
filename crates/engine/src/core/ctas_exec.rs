@@ -98,6 +98,24 @@ impl EngineCore {
             .map_err(|_| internal())?;
         if exists {
             if !stmt.if_not_exists() {
+                // `operation_id` 指定時は、事前照合から名前判定までの間に別 writer が同じ文を commit した
+                // 場合でも契約（再送は `23505`／別文は `22023`）を保つため、書き込みゲートの中で台帳を
+                // 再照合してから `42P07` を確定する。
+                if operation_id.is_some() {
+                    let write_txn = self
+                        .storage
+                        .begin_write_txn()
+                        .map_err(crate::catalog::convert_storage_error)
+                        .map_err(map_create_table_catalog_error)?;
+                    crate::sql::exec::precheck_insert_select_ledger(
+                        &WriteTarget::InTxn(&write_txn),
+                        ctx,
+                        stmt.table_name(),
+                        operation_id,
+                        self.ledger_mode,
+                        &stmt.statement_hash,
+                    )?;
+                }
                 return Err(SqlSurfaceError::duplicate_table(
                     stmt.table_name().to_string(),
                 ));
@@ -247,6 +265,17 @@ impl EngineCore {
             return Err(SqlSurfaceError::Internal {
                 detail: "CREATE TABLE AS target changed concurrently; retry".to_string(),
             });
+        }
+        // 表以外（ビュー・索引）への no-op は台帳を記録しない。DROP VIEW 等は台帳を削除しないため、
+        // 記録すると DROP 後の再送が対象不在のまま `23505` になる（台帳の寿命は表の DROP にのみ紐づく）。
+        match self.storage.get_table_schema(stmt.table_name()) {
+            Ok(_) => {}
+            Err(crate::catalog::CatalogError::TableNotFound(_)) => return Ok(skipped),
+            Err(_) => {
+                return Err(SqlSurfaceError::Internal {
+                    detail: "internal error".to_string(),
+                })
+            }
         }
         crate::sql::exec::record_insert_select_ledger_only(
             WriteTarget::InTxn(&write_txn),

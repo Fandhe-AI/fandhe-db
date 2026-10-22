@@ -13635,8 +13635,9 @@ pub(crate) fn validate_create_table_as_tokens(
     let statement_hash = crate::recovery::content_hash::for_create_table_as(
         crate::recovery::content_hash::strip_operation_id_clause(tokens),
     )
-    .map_err(|_| SqlSurfaceError::Internal {
-        detail: "internal error".to_string(),
+    // 未束縛の `$n` 等、ハッシュ化できない入力は内部エラーではなく未対応機能として拒否する。
+    .map_err(|_| {
+        SqlSurfaceError::feature_not_supported("CREATE TABLE AS does not support parameters")
     })?;
     let mut p = Parser::new(tokens);
     p.expect_contextual_keyword("CREATE")?;
