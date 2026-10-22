@@ -292,6 +292,17 @@ pub(crate) fn where_equality_literal_is_param_typed(
     tokens: &[Token],
     kinds: &[ParamLiteralKind],
 ) -> Vec<bool> {
+    let flags = where_literal_flags_in_region(tokens, kinds);
+    // 集合演算の各枝は `set_op::describe_tree` が同じ配列を序数 0 から受け取るため、
+    // 枝ごとの対応を取れない。実リテラルが 1 つでもあれば全て `false`（検証を省略しない）へ
+    // 倒し、実リテラルが `$n` のダミー扱いで素通りする事態を防ぐ（fail-closed）。
+    if flags.iter().any(|f| !*f) && has_set_operator_branch(tokens) {
+        return vec![false; flags.len()];
+    }
+    flags
+}
+
+fn where_literal_flags_in_region(tokens: &[Token], kinds: &[ParamLiteralKind]) -> Vec<bool> {
     let Some((start, end)) = where_region(tokens) else {
         return Vec::new();
     };
@@ -426,7 +437,13 @@ fn is_noneq_right_boundary(tokens: &[Token], idx: usize, end: usize) -> bool {
         None
         | Some(Token::Punct(')' | ';'))
         | Some(Token::Keyword(crate::sql::lexer::Keyword::And)) => true,
-        Some(Token::Ident(w)) => w.eq_ignore_ascii_case("OR"),
+        Some(Token::Ident(w)) => {
+            w.eq_ignore_ascii_case("OR")
+                // 集合演算の枝末（`... > 'x' UNION SELECT ...`）。`$n` の受理は集合演算文を
+                // 別途拒否するため、ここは実リテラルのフラグを数えるためだけに効く。
+                || (super::allowlist::is_set_operator_ident(w)
+                    && super::allowlist::set_operator_is_followed_by_branch(tokens, idx))
+        }
         _ => false,
     }
 }
@@ -2633,6 +2650,18 @@ mod tests {
         ] {
             assert!(positions(sql).is_err(), "{sql}");
         }
+    }
+
+    #[test]
+    fn set_op_real_literal_compare_is_not_skipped_by_dummy_flags() {
+        // 回帰（PR #2631 指摘）: 枝末の実リテラル Compare も数え、同じ文の `$n` 等価の
+        // `true` が実リテラルの検証省略へずれ込まないこと。
+        let tokens = crate::sql::lexer::tokenize_with_params(
+            "SELECT day FROM t WHERE day > 'not-a-date' UNION SELECT day FROM t WHERE day = $1 LIMIT 5",
+        )
+        .expect("lex");
+        let flags = where_equality_literal_is_param_typed(&tokens, &[]);
+        assert_eq!(flags, vec![false, false]);
     }
 
     #[test]
