@@ -1,15 +1,16 @@
 //! `COPY` の `WITH` オプション構文解析（Issue #1763・WIRE-22・TASK-294 のポインタ）の engine API
 //! 層の結合テスト。簡易クエリの `EngineCore::begin_copy` と拡張クエリの Parse
 //! （`parse_sql_prepared`）が同じ検証入口を共有し、同一の SQLSTATE を返すこと、旧構文と新構文が
-//! 同じ結果になること、データ経路が未適用の TO 側オプションが `0A000` で拒否される（無言の
-//! fail-open にならない）ことを固定する。オプションの適用は FROM が Issue #1764（適用済み）、
-//! TO が #1765 の担当。
+//! 同じ結果になること、TO 側でも非既定オプションを受理して解決済みの `CopyOptions` を
+//! `CopyPlan::To` に載せることを固定する。オプションの適用は FROM が Issue #1764、
+//! TO が Issue #1765（いずれも適用済みでゲートは無い）。
 
 use engine::catalog::{ColumnDef, ColumnType, TableSchema};
 use engine::core::{CopyPlan, EngineCore};
 use engine::kernel::CpuScalarProvider;
 use engine::policy::PolicyContext;
 use engine::sql::allowlist::CopyFormat;
+use engine::sql::copy_options::CopyHeader;
 use engine::sql::mode::SessionState;
 use engine::storage::{Storage, Visibility};
 
@@ -101,8 +102,7 @@ fn explicit_defaults_are_accepted_for_both_directions() {
     }
 }
 
-/// 非既定オプションの受理／拒否の方向差を固定する。FROM は Issue #1764 でデータ経路が適用済みのため
-/// 受理し、TO は適用（Issue #1765）まで `0A000` のまま（無言の fail-open にしない）。
+/// 非既定オプションは両方向とも受理する（FROM は Issue #1764、TO は Issue #1765 で適用済み）。
 const NON_DEFAULT_OPTIONS: [&str; 5] = [
     " WITH (HEADER)",
     " CSV HEADER",
@@ -120,17 +120,23 @@ fn non_default_options_are_accepted_for_from() {
 }
 
 #[test]
-fn non_default_options_are_0a000_for_to_until_applied() {
-    let (core, _g) = open("copy-opt-to-gate");
+fn non_default_options_are_accepted_for_to_and_carried_in_plan() {
+    let (core, _g) = open("copy-opt-to-applied");
     for opt in NON_DEFAULT_OPTIONS {
-        assert_eq!(
-            rejected_code(&core, &format!("{TO}{opt}")),
-            "0A000",
-            "{TO}{opt}"
-        );
+        accepted_in_both(&core, &format!("{TO}{opt}"));
     }
+    let sql =
+        format!("{TO} WITH (FORMAT csv, HEADER, DELIMITER ';', NULL 'x', QUOTE '''', ESCAPE '\\')");
+    let Ok(CopyPlan::To(format, _, o)) = begin(&core, &sql) else {
+        panic!("expected COPY TO plan");
+    };
+    assert_eq!(format, CopyFormat::Csv);
+    assert_eq!(o.header(), CopyHeader::True);
+    assert_eq!(o.delimiter(), b';');
+    assert_eq!(o.null_string(), "x");
+    assert_eq!(o.quote(), b'\'');
+    assert_eq!(o.escape(), b'\\');
 }
-
 #[test]
 fn unsupported_value_options_without_value_are_42601_and_with_value_0a000() {
     let (core, _g) = open("copy-opt-unsupported-value");

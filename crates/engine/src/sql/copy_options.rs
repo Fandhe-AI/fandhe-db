@@ -6,13 +6,12 @@
 //! 重複・未知名・値の型・モード制約・方向制約を PostgreSQL 17 と同じ分類で検証して、
 //! 解決済みの [`CopyOptions`] と [`CopyFormat`] を返す。トークン型（`Parser`）には依存しない。
 //!
-//! fail-closed の前提: `COPY FROM` 側のデータ経路（[`crate::sql::copy`]）は Issue #1764 で
-//! HEADER・DELIMITER・NULL・QUOTE・ESCAPE を適用済みのためゲートは無い。`COPY TO` 側は
-//! まだ適用しておらず、適用しないまま受理すると無言の fail-open になるため、format の既定値と
-//! 異なる解決結果は [`reject_unapplied_for_to`] が `0A000` で拒否する。`COPY TO` 側の適用
-//! （Issue #1765）は、その呼び出し 1 行を外すだけでよい。`FORMAT binary` は `COPY TO` のみ受理し
-//! （WIRE-23・Issue #1770）、`COPY FROM` は Issue #1769 まで従来どおり `42601` で拒否する。
-//! binary と DELIMITER・NULL・HEADER・QUOTE・ESCAPE の併用は PostgreSQL 17 と同じく `0A000`。
+//! 適用状況: HEADER・DELIMITER・NULL・QUOTE・ESCAPE は両方向とも適用済み
+//! （`COPY FROM` は [`crate::sql::copy`]・Issue #1764、`COPY TO` は wire-server の
+//! 出力経路・Issue #1765）。解決結果は `CopyPlan` が運び、未適用ゲートは無い。
+//! `FORMAT binary` は `COPY TO` のみ受理し（WIRE-23・Issue #1770）、`COPY FROM` は
+//! Issue #1769 まで従来どおり `42601` で拒否する。binary と DELIMITER・NULL・HEADER・QUOTE・
+//! ESCAPE の併用は PostgreSQL 17 と同じく `0A000`。
 //!
 //! エラー文言にはユーザー入力の値を含めない（`22023`・`0A000` は固定文言。`42601` に含めるのは
 //! 切り詰め済みのオプション名だけで、構文エラーのトークンは載せない）。
@@ -129,25 +128,6 @@ impl CopyOptions {
 #[cfg(test)]
 pub(crate) fn defaults_for_format(format: CopyFormat) -> CopyOptions {
     CopyOptions::defaults_for(format)
-}
-
-const UNAPPLIED_DETAIL: &str = "COPY option is not supported yet";
-
-/// `COPY TO STDOUT` のデータ経路が未適用のオプションを `0A000` で拒否するゲート。
-/// Issue #1765 が TO 側の適用を実装したら、呼び出し 1 行を外す。
-pub(crate) fn reject_unapplied_for_to(
-    format: CopyFormat,
-    options: &CopyOptions,
-) -> Result<(), SqlSurfaceError> {
-    gate(format, options)
-}
-
-fn gate(format: CopyFormat, options: &CopyOptions) -> Result<(), SqlSurfaceError> {
-    if options.is_default_for(format) {
-        Ok(())
-    } else {
-        Err(SqlSurfaceError::feature_not_supported(UNAPPLIED_DETAIL))
-    }
 }
 
 fn invalid(detail: &'static str) -> SqlSurfaceError {
@@ -630,20 +610,5 @@ mod tests {
         let m = vec![raw("header", id("match"))];
         assert_eq!(code(m.clone(), CopyDirection::To), "0A000");
         resolve(m, CopyDirection::From).expect("MATCH is allowed for FROM");
-    }
-
-    #[test]
-    fn gate_rejects_only_non_default_resolution() {
-        let (f, o) = ok(vec![
-            raw("format", id("csv")),
-            raw("delimiter", s(",")),
-            raw("quote", s("\"")),
-            raw("header", id("false")),
-        ]);
-        assert!(reject_unapplied_for_to(f, &o).is_ok());
-        let (f, o) = ok(vec![raw("header", None)]);
-        let e = reject_unapplied_for_to(f, &o).expect_err("gate");
-        assert_eq!(e.wire_code(), "0A000");
-        assert!(!e.to_string().contains("header"));
     }
 }

@@ -32,10 +32,10 @@
   - 拡張クエリプロトコル（TASK-216）経由の COPY の、CopyFail 等の後の Sync までの
     同期回復の詳細（Issue #1761）。Parse／Bind／Describe は Issue #1759、Execute は
     Issue #1760 で対応済み（下の 2 節）。
-  - COPY オプションの TO 側の適用（Issue #1765。構文の解析は Issue #1763、FROM 側の
-    `HEADER`／`DELIMITER`／`NULL`／`QUOTE`／`ESCAPE` の適用は Issue #1764 で実装済み。
-    下の「許可リスト」「FROM STDIN の逐次取り込み」節）、COPY FROM の binary 形式（Issue #1769）、
-    テーブル形 `COPY t TO STDOUT`、8 進・16 進エスケープ。
+  - binary 形式のうち COPY FROM（Issue #1769）、テーブル形 `COPY t TO STDOUT`、8 進・16 進
+    エスケープ、`FORCE_*` オプション。（COPY オプションの構文解析は Issue #1763、`HEADER`／
+    `DELIMITER`／`NULL`／`QUOTE`／`ESCAPE` の適用は FROM が Issue #1764、TO が Issue #1765 で
+    実装済み。COPY TO の binary は Issue #1770 で実装済み。）
 
 ## 設計（決定事項）
 
@@ -65,10 +65,9 @@
   等の制約違反が `22023`、モード不一致（text での `QUOTE`／`ESCAPE`）・1 バイトでない
   区切り文字・`HEADER MATCH` の `COPY TO` での使用・`FORCE_*` 等の未対応オプションが
   `0A000`。エラー文言には入力値を含めない。
-- ゲート: データ経路が未適用の方向では、解決結果が format の既定値と異なる指定（`HEADER` 等）を
-  `0A000` で拒否する（無言の fail-open の防止）。`COPY FROM` は Issue #1764 で適用済みのため
-  ゲートを外した。`COPY TO` は Issue #1765 が `reject_unapplied_for_to` の呼び出しを外すまで
-  残る（既定値と等しい明示指定と旧構文の `CSV` は両方向で受理する）。
+- ゲート: 両方向とも撤去済み。`COPY FROM` は Issue #1764、`COPY TO` は Issue #1765 で
+  データ経路がオプションを適用するため、適用前に設けていた「既定値と異なる指定は `0A000`」の
+  ゲートは無い（解決済みの `CopyOptions` は `CopyPlan::To` の第 3 要素として出力経路へ渡る）。
 - 既知の相違: `COPY FROM` の `FORMAT binary` は Issue #1769 まで従来どおり `42601`（`COPY TO` は
   Issue #1770 で受理。末尾の節）、`WITH` だけでオプションの
   無い指定も `42601`（PostgreSQL は受理）、エスケープ文字列 `E'...'` は字句解析が未対応のため
@@ -160,6 +159,16 @@
   土台に、text はバックスラッシュエスケープ、CSV は二重引用符エスケープへ
   再エンコードする。`COPY (...) TO STDOUT` の出力を同じテーブルへ
   `COPY ... FROM STDIN` で再投入すると元の値へ戻る対称性を持つ。
+- オプションの適用（Issue #1765・WIRE-22）: 出力は PostgreSQL 17 と同じバイト列になるよう
+  次の規則に従う。区切り文字は検証済みの ASCII 1 バイトで、行は区切りでつないで `\n` で終える。
+  - text: `\b`／`\f`／`\n`／`\r`／`\t`／`\v` と `\`、区切り文字を `\` 付きで出す。NULL は
+    `NULL` 指定の文字列をエスケープせず出す（NULL 文字列と同じ非 NULL 値が区別できなくなる
+    曖昧さは PostgreSQL と同じ既知の挙動）。
+  - csv: NULL 文字列と一致する値・区切り／`QUOTE`／改行を含む値・単一列で値が `\.` のものだけを
+    引用し、引用内では `QUOTE` と `ESCAPE` の前に `ESCAPE` を付ける。NULL は引用せず出す。
+  - `HEADER`: 最初の CopyData として列名行を出す（text でも csv でも。データと同じ
+    エスケープ規則）。ヘッダ行は `COPY n` の n に含めない。`HEADER MATCH` は構文段で拒否済みで、
+    到達した場合も出力経路は fail-closed（内部エラー）にする。
 
 ### エラー処理・PostgreSQL 本家との相違点
 

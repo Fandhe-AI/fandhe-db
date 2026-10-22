@@ -105,7 +105,7 @@ fn query_rows(core: &EngineCore, tenant: &str, s: &mut SessionState, sql: &str) 
 /// `COPY ... TO STDOUT` の入口（`CopyPlan` 経由）の応答要約。
 fn copy_outcome(core: &EngineCore, tenant: &str, s: &SessionState, sql: &str) -> String {
     match core.begin_copy(&ctx(tenant), s, sql) {
-        Ok(CopyPlan::To(_, _)) => "OK COPY TO".to_string(),
+        Ok(CopyPlan::To(_, _, _)) => "OK COPY TO".to_string(),
         Ok(_) => "OK COPY OTHER".to_string(),
         Err(e) => format!("ERR {} {e}", e.wire_code()),
     }

@@ -39,6 +39,7 @@ use engine::error_format::{ClassifiedError, ErrorClass};
 use engine::policy::PolicyContext;
 use engine::sql::allowlist::{CopyFormat, SqlSurfaceError};
 use engine::sql::copy::CopyInSession;
+use engine::sql::copy_options::{CopyHeader, CopyOptions};
 use engine::sql::exec::{Cell, ColumnMeta, QueryResult, ResultRow};
 use engine::sql::mode::SessionState;
 use engine::sql::transaction::SessionTransaction;
@@ -194,113 +195,97 @@ fn encode_copy_done() -> [u8; 5] {
 }
 
 /// `Cell` を COPY の値表現（text／CSV）へエンコードする。`result_encoder::
-/// cell_to_text_for_column`（通常の SELECT 応答と同じ値表現。列の公告型に応じた
+/// cell_to_text_for_column_in_tz`（通常の SELECT 応答と同じ値表現。列の公告型に応じた
 /// `REAL` の PostgreSQL 形式を含む。Issue #1173）を土台にすることで、
 /// `COPY (...) TO STDOUT` の出力を同じテーブルへ `COPY ... FROM STDIN` で
 /// 再投入した際に値が往復する（`sql::copy::decode_text_field`／
-/// `decode_csv_record` と対称なエスケープ規則）。
+/// `decode_csv_record` と対称なエスケープ規則）。区切り・引用・ESCAPE は
+/// `options`（`copy_options::resolve` で検証済み。Issue #1765・WIRE-22）から決める。
 fn cell_to_copy_value(
     format: CopyFormat,
     meta: &ColumnMeta,
     cell: &Cell,
     tz: &engine::datetime::SessionTimeZone,
+    options: &CopyOptions,
+    single_column: bool,
 ) -> Result<Option<String>, result_encoder::EncodeError> {
     let text = result_encoder::cell_to_text_for_column_in_tz(meta, cell, tz)?;
-    Ok(text.map(|t| match format {
-        CopyFormat::Text => escape_copy_text(&t),
-        CopyFormat::Csv => escape_copy_csv(&t),
-        // binary は専用経路（encode_binary_copy_data_into）を通る。text 系へ届いたら
-        // 到達不能の内部不整合として呼び出し側が拒否する。
-        CopyFormat::Binary => t,
-    }))
+    Ok(text.map(|t| escape_copy_value(format, &t, options, single_column)))
 }
 
-fn escape_copy_text(s: &str) -> String {
+/// 値 1 個を `format` の規則でエスケープ（CSV は必要時のみ引用）する。データ行と
+/// ヘッダ行（列名）が同じ規則を通るよう共通化している。
+fn escape_copy_value(
+    format: CopyFormat,
+    s: &str,
+    options: &CopyOptions,
+    single_column: bool,
+) -> String {
+    match format {
+        CopyFormat::Text => escape_copy_text(s, options.delimiter()),
+        CopyFormat::Csv => escape_copy_csv(s, options, single_column),
+        // binary は専用経路（encode_binary_copy_data_into）を通る。text 系へ届いても
+        // 無変換で返すだけで、呼び出し側が Binary を拒否する。
+        CopyFormat::Binary => s.to_string(),
+    }
+}
+
+/// text 形式のエスケープ（PostgreSQL の `CopyAttributeOutText` 相当）。
+/// `delim` は検証済みの ASCII 1 バイト。NULL 表現はここを通さず生のまま出す。
+fn escape_copy_text(s: &str, delim: u8) -> String {
+    let delim = char::from(delim);
     let mut out = String::with_capacity(s.len());
     for c in s.chars() {
         match c {
-            '\\' => out.push_str("\\\\"),
-            '\t' => out.push_str("\\t"),
-            '\n' => out.push_str("\\n"),
-            '\r' => out.push_str("\\r"),
             '\u{8}' => out.push_str("\\b"),
             '\u{C}' => out.push_str("\\f"),
+            '\n' => out.push_str("\\n"),
+            '\r' => out.push_str("\\r"),
+            '\t' => out.push_str("\\t"),
             '\u{B}' => out.push_str("\\v"),
+            '\\' => out.push_str("\\\\"),
+            c if c == delim => {
+                out.push('\\');
+                out.push(c);
+            }
             other => out.push(other),
         }
     }
     out
 }
 
-fn escape_copy_csv(s: &str) -> String {
-    let needs_quoting = s.is_empty() || s.contains([',', '"', '\n', '\r']);
+/// CSV 形式のエスケープ（PostgreSQL の `CopyAttributeOutCSV` 相当）。NULL 表現と
+/// 一致する値・区切り／QUOTE／改行を含む値・単一列の `\.` だけを引用し、引用内では
+/// QUOTE と ESCAPE の前に ESCAPE を付ける（ESCAPE == QUOTE なら二重化）。
+fn escape_copy_csv(s: &str, options: &CopyOptions, single_column: bool) -> String {
+    let delim = char::from(options.delimiter());
+    let quote = char::from(options.quote());
+    let escape = char::from(options.escape());
+    let needs_quoting = s == options.null_string()
+        || s.contains([delim, quote, '\n', '\r'])
+        || (single_column && s == "\\.");
     if !needs_quoting {
         return s.to_string();
     }
     let mut out = String::with_capacity(s.len() + 2);
-    out.push('"');
+    out.push(quote);
     for c in s.chars() {
-        if c == '"' {
-            out.push('"');
+        if c == quote || c == escape {
+            out.push(escape);
         }
         out.push(c);
     }
-    out.push('"');
+    out.push(quote);
     out
 }
 
-/// `ResultRow` を `CopyData`（'d'）1 個へエンコードし `out` の末尾へ追記する
-/// （`result_encoder::encode_data_row_into` と同じ in-place 追記契約。失敗時は
-/// 呼び出し前の長さへ `truncate` してから返す）。COPY の値区切りは text 形式
-/// タブ・CSV 形式カンマの固定（クライアント指定の区切り文字は許可リスト外。
-/// `sql::allowlist::validate_copy` の `FORMAT` 以外のオプション拒否と対応）。
-fn encode_copy_data_row_into(
-    format: CopyFormat,
-    columns: &[ColumnMeta],
-    row: &ResultRow,
+/// 組み立て済みの 1 行（改行込み）を `CopyData`（'d'）1 個として `out` の末尾へ追記する。
+/// 失敗時は `start`（呼び出し前の長さ）へ `truncate` する。
+fn push_copy_data_line(
+    line: &str,
     out: &mut Vec<u8>,
-    tz: &engine::datetime::SessionTimeZone,
+    start: usize,
 ) -> Result<(), result_encoder::EncodeError> {
-    // 列メタとセル数の不一致は内部不整合（fail-closed。何も書かずに拒否する）。
-    // binary はこの text 系関数の対象外（text へ黙って落とさない）。
-    if columns.len() != row.cells.len() || format == CopyFormat::Binary {
-        return Err(result_encoder::EncodeError);
-    }
-    let start = out.len();
-    let mut fields: Vec<Option<String>> = Vec::with_capacity(row.cells.len());
-    for (meta, cell) in columns.iter().zip(&row.cells) {
-        match cell_to_copy_value(format, meta, cell, tz) {
-            Ok(v) => fields.push(v),
-            Err(e) => {
-                out.truncate(start);
-                return Err(e);
-            }
-        }
-    }
-    let sep = match format {
-        CopyFormat::Text | CopyFormat::Binary => '\t',
-        CopyFormat::Csv => ',',
-    };
-    let mut line = String::new();
-    for (i, field) in fields.iter().enumerate() {
-        if i > 0 {
-            line.push(sep);
-        }
-        match (format, field) {
-            // text 形式の NULL 表現はリテラル `\N`（`sql::copy::decode_text_field`
-            // がフィールド全体一致で NULL 扱いする対称）。CSV 形式は
-            // `sql::copy::decode_csv_record`／`finish_csv_field` が「引用符なしの
-            // 空フィールド」を NULL、`""` を空文字列として区別する契約のため、
-            // ここで `\N` を出力すると再投入時に文字列 "\N" として読まれてしまい
-            // 往復が壊れる（Issue #939 レビュー指摘）。CSV の NULL は引用符なしの
-            // 空文字列で表現する。
-            (CopyFormat::Text, None) => line.push_str("\\N"),
-            (CopyFormat::Csv, None) => {}
-            (CopyFormat::Binary, None) => {}
-            (_, Some(s)) => line.push_str(s),
-        }
-    }
-    line.push('\n');
     let bytes = line.as_bytes();
     let len = match i32::try_from(bytes.len().saturating_add(4)) {
         Ok(v) => v,
@@ -385,6 +370,73 @@ fn encode_binary_copy_trailer(with_header: bool) -> Vec<u8> {
     msg
 }
 
+/// `ResultRow` を `CopyData`（'d'）1 個へエンコードし `out` の末尾へ追記する
+/// （`result_encoder::encode_data_row_into` と同じ in-place 追記契約。失敗時は
+/// 呼び出し前の長さへ `truncate` してから返す）。区切り文字・NULL 表現・引用規則は
+/// 検証済みの `options` に従う（Issue #1765・WIRE-22）。
+fn encode_copy_data_row_into(
+    format: CopyFormat,
+    columns: &[ColumnMeta],
+    row: &ResultRow,
+    out: &mut Vec<u8>,
+    tz: &engine::datetime::SessionTimeZone,
+    options: &CopyOptions,
+) -> Result<(), result_encoder::EncodeError> {
+    // 列メタとセル数の不一致は内部不整合（fail-closed。何も書かずに拒否する）。
+    // binary はこの text 系関数の対象外（text へ黙って落とさない）。
+    if columns.len() != row.cells.len() || format == CopyFormat::Binary {
+        return Err(result_encoder::EncodeError);
+    }
+    let start = out.len();
+    let single_column = columns.len() == 1;
+    let sep = char::from(options.delimiter());
+    let mut line = String::new();
+    for (i, (meta, cell)) in columns.iter().zip(&row.cells).enumerate() {
+        if i > 0 {
+            line.push(sep);
+        }
+        match cell_to_copy_value(format, meta, cell, tz, options, single_column) {
+            Ok(Some(s)) => line.push_str(&s),
+            // NULL 表現は `options.null_string()` を生のまま出す（text の既定 `\N`、
+            // CSV の既定は引用符なしの空フィールド。`sql::copy` のデコーダと対称）。
+            Ok(None) => line.push_str(options.null_string()),
+            Err(e) => {
+                out.truncate(start);
+                return Err(e);
+            }
+        }
+    }
+    line.push('\n');
+    push_copy_data_line(&line, out, start)
+}
+
+/// `HEADER` 指定時の列名行を `CopyData`（'d'）1 個として `out` へ追記する。
+/// 列名はデータと同じエスケープ規則を通す。この行は `COPY n` の n に含めない。
+fn encode_copy_header_into(
+    format: CopyFormat,
+    columns: &[ColumnMeta],
+    out: &mut Vec<u8>,
+    options: &CopyOptions,
+) -> Result<(), result_encoder::EncodeError> {
+    let start = out.len();
+    let single_column = columns.len() == 1;
+    let sep = char::from(options.delimiter());
+    let mut line = String::new();
+    for (i, meta) in columns.iter().enumerate() {
+        if i > 0 {
+            line.push(sep);
+        }
+        line.push_str(&escape_copy_value(
+            format,
+            result_encoder::column_name(meta),
+            options,
+            single_column,
+        ));
+    }
+    line.push('\n');
+    push_copy_data_line(&line, out, start)
+}
+
 /// `COPY (...) TO STDOUT`: CopyOutResponse → 各行 CopyData → CopyDone →
 /// `CommandComplete "COPY n"` → `ReadyForQuery`。実行本体
 /// （`EngineCore::begin_copy` の `CopyPlan::To` 分岐。広域取得と同じ RLS
@@ -397,8 +449,20 @@ fn run_copy_to<S: WireStream>(
     txn: &mut SessionTransaction<'_>,
     format: CopyFormat,
     result: &QueryResult,
+    options: &CopyOptions,
     finish: Finish,
 ) -> io::Result<CopyStep> {
+    // `HEADER MATCH` は engine の `resolve` が TO で拒否済みで到達しない。到達した場合は
+    // 無言で `HEADER true` 扱いにせず fail-closed とする（CopyOutResponse の前に判定）。
+    if options.header() == CopyHeader::Match {
+        return respond_error_and_ready(
+            stream,
+            txn,
+            ErrorClass::InternalError,
+            "unsupported COPY header option",
+        )
+        .map(|()| CopyStep::Failed);
+    }
     let binary = format == CopyFormat::Binary;
     // binary は WIRE-14 の対応型のみ。非対応型は CopyOutResponse を 1 バイトも送る前に
     // 0A000 で拒否する（fail-closed。列番号以外の情報を含めない）。
@@ -437,6 +501,21 @@ fn run_copy_to<S: WireStream>(
     );
     buffer.push_frame(stream, &response)?;
 
+    if options.header() == CopyHeader::True {
+        let start = buffer.frame_start();
+        if encode_copy_header_into(format, &result.columns, buffer.as_mut_vec(), options).is_err() {
+            buffer.truncate_to(start);
+            buffer.flush(stream)?;
+            return respond_error_and_ready(
+                stream,
+                txn,
+                ErrorClass::InternalError,
+                "failed to encode CopyData",
+            )
+            .map(|()| CopyStep::Failed);
+        }
+    }
+
     for (index, row) in result.rows.iter().enumerate() {
         let start = buffer.frame_start();
         let encoded = if binary {
@@ -450,6 +529,7 @@ fn run_copy_to<S: WireStream>(
                 // COPY TO は往復契約（COPY FROM の `parse_numeric_offset` は時 0〜15 のみ受理）の
                 // ため、セッション TimeZone に依らず UTC 固定で出力する（Issue #1575）。
                 &engine::datetime::SessionTimeZone::utc(),
+                options,
             )
         };
         if encoded.is_err() {
@@ -807,8 +887,8 @@ pub(crate) fn run<'e, S: WireStream>(
     let _response_boundary = engine::recovery::commit_boundary::ResponseBoundaryGuard::new();
 
     match engine.begin_copy_in_txn(ctx, session, txn, sql) {
-        Ok(CopyPlan::To(format, result)) => {
-            run_copy_to(stream, session, txn, format, &result, finish)
+        Ok(CopyPlan::To(format, result, options)) => {
+            run_copy_to(stream, session, txn, format, &result, &options, finish)
         }
         Ok(CopyPlan::From(copy_session)) => {
             run_copy_from(stream, engine, ctx, session, txn, copy_session, finish)
@@ -823,15 +903,17 @@ mod tests {
 
     #[test]
     fn escape_copy_text_escapes_control_characters() {
-        assert_eq!(escape_copy_text("a\tb\nc\\d"), "a\\tb\\nc\\\\d");
+        assert_eq!(escape_copy_text("a\tb\nc\\d", b'\t'), "a\\tb\\nc\\\\d");
     }
 
     #[test]
-    fn escape_copy_csv_quotes_when_needed() {
-        assert_eq!(escape_copy_csv("plain"), "plain");
-        assert_eq!(escape_copy_csv(""), "\"\"");
-        assert_eq!(escape_copy_csv("a,b"), "\"a,b\"");
-        assert_eq!(escape_copy_csv("a\"b"), "\"a\"\"b\"");
+    fn escape_copy_text_escapes_custom_delimiter() {
+        assert_eq!(escape_copy_text("a|b\tc", b'|'), "a\\|b\\tc");
+        // 既定のタブ区切りでは二重エスケープしない。
+        assert_eq!(escape_copy_text("a|b\tc", b'\t'), "a|b\\tc");
+        // 制御文字の区切りは前に `\` を付けた生の文字になる。
+        assert_eq!(escape_copy_text("a\u{1}b", b'\x01'), "a\\\u{1}b");
+        assert_eq!(escape_copy_text("a\u{2}b", b'\x01'), "a\u{2}b");
     }
 
     #[test]
@@ -879,17 +961,6 @@ mod tests {
             i32::from_be_bytes([next[1], next[2], next[3], next[4]]) as usize,
             next.len() - 1
         );
-        // text 系の関数に binary が届いたら何も書かずに拒否する（fail-closed）。
-        let mut out = Vec::new();
-        assert!(encode_copy_data_row_into(
-            CopyFormat::Binary,
-            &columns,
-            &row,
-            &mut out,
-            &engine::datetime::SessionTimeZone::utc()
-        )
-        .is_err());
-        assert!(out.is_empty());
     }
 
     #[test]

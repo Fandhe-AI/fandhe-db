@@ -1539,9 +1539,13 @@ pub enum CopyPlan {
     // `clippy::large_enum_variant` を解消した（`sql::copy::CopyInSession`
     // 参照）。ここでの内包型・意味論はいずれも無変更。
     From(crate::sql::copy::CopyInSession),
+    // Issue #1765（WIRE-22・TASK-294）: 第 3 要素に解決済みの COPY オプションを
+    // 載せる（破壊的変更。wire-server の出力経路が HEADER・DELIMITER・NULL・
+    // QUOTE・ESCAPE を適用するために参照する）。
     To(
         crate::sql::allowlist::CopyFormat,
         crate::sql::exec::QueryResult,
+        crate::sql::copy_options::CopyOptions,
     ),
 }
 
@@ -10753,7 +10757,7 @@ impl EngineCore {
                     &self.result_limits,
                 )?;
                 let result = self.run_scan_plan(&read_txn, ctx, &schema, &bound)?;
-                Ok(CopyPlan::To(v.format, result))
+                Ok(CopyPlan::To(v.format, result, v.options))
             }
         }
     }
@@ -10848,7 +10852,7 @@ impl EngineCore {
                     &self.result_limits,
                 )?;
                 let result = self.run_scan_plan(write_txn, ctx, &schema, &bound)?;
-                return Ok(CopyPlan::To(v.format, result));
+                return Ok(CopyPlan::To(v.format, result, v.options.clone()));
             }
         }
         self.begin_copy_validated(ctx, session, stmt, txn.txn_start_micros())
