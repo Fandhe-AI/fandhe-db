@@ -200,12 +200,15 @@ fn where_region(tokens: &[Token]) -> Option<(usize, usize)> {
     // `WHERE` は、条件が `EXCLUDED.<列>`・修飾列を取り得て、束縛側（`sql::upsert_where`）が
     // 等値リテラルの通し番号を持たないため、パターン 4 の対象にしない（序数のずれによる
     // 黙った誤解釈を作らず、`$n` は `42601` で fail-closed に拒否される）。
-    if upsert_set_region(tokens).is_some() {
-        return None;
-    }
     let start = tokens
         .iter()
         .position(|t| matches!(t, Token::Keyword(crate::sql::lexer::Keyword::Where)))?;
+    // `DO UPDATE SET` を含むだけの文では、その手前（`INSERT ... SELECT ... WHERE`）の
+    // `WHERE` は従来どおりパターン 4 の対象とする。除外するのは `DO UPDATE SET` 領域より
+    // 後ろにある `WHERE`（`DO UPDATE ... WHERE`）だけ。
+    if upsert_set_region(tokens).is_some_and(|(set_start, _)| start >= set_start) {
+        return None;
+    }
     // 括弧の深さ。`RETURNING`・`ON` は SQL/JSON 問い合わせ関数（`JSON_VALUE(... RETURNING text
     // ON ERROR)` 等。Issue #2187）の句語としても括弧内に現れるため、本物の句境界（常に深さ 0）
     // だけを境界とする。他の境界語・`ORDER`／`LIMIT` の判定は従来どおり（サブクエリ内でも境界）。
@@ -2188,6 +2191,14 @@ mod tests {
         }
         let ok = "INSERT INTO t (id, n) VALUES (1, 1) ON CONFLICT (id) DO UPDATE SET n = n + $1 WHERE n = 1";
         assert!(positions(ok).is_ok(), "{ok}");
+    }
+
+    /// `DO UPDATE SET` を含むだけの文では、手前の `INSERT ... SELECT ... WHERE col = $n`
+    /// （パターン 4）は従来どおり束縛可能（`DO UPDATE ... WHERE` の除外に巻き込まない）。
+    #[test]
+    fn accepts_select_where_param_before_do_update_set() {
+        let sql = "INSERT INTO t (id, n) SELECT id, n FROM s WHERE id = $1 ON CONFLICT (id) DO UPDATE SET n = EXCLUDED.n";
+        assert!(positions(sql).is_ok(), "{sql}");
     }
 
     #[test]

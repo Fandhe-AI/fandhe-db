@@ -72,7 +72,13 @@ fn synthetic_column(position: usize, name: &str, col: &ColumnDef) -> ColumnDef {
             ColumnType::Text,
             true,
         ),
-        _ => ColumnDef::new(name.to_string(), col.ty.clone(), true),
+        _ => {
+            // 照合順序は文字列比較の結果を左右するため、実表の列と同じものを引き継ぐ
+            // （`DO UPDATE SET` 式側の列 clone と WHERE 側の比較結果を一致させる）。
+            let mut def = ColumnDef::new(name.to_string(), col.ty.clone(), true);
+            def.collation = col.collation;
+            def
+        }
     }
 }
 
@@ -281,4 +287,22 @@ fn reject_forbidden_columns(
         }
     }
     Ok(())
+}
+
+#[cfg(test)]
+mod collation_tests {
+    use super::*;
+    use crate::collation::Collation;
+
+    /// 合成スキーマは既存行側・`EXCLUDED` 側の双方で実表列の照合順序を保持する。
+    #[test]
+    fn synthetic_schema_preserves_collation() {
+        let col = ColumnDef::new("name", ColumnType::Text, true).with_collation(Collation::C);
+        let schema = TableSchema::new("t".to_string(), vec![col]);
+        let synth = synthetic_schema(&schema);
+        assert_eq!(synth.columns.len(), 2);
+        for c in &synth.columns {
+            assert_eq!(c.collation, Some(Collation::C));
+        }
+    }
 }
