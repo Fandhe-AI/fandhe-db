@@ -459,3 +459,57 @@ fn rls_applies_to_noneq_and_between_params() {
         );
     }
 }
+// PR #2631 指摘: BOOLEAN 列の `[NOT] BETWEEN $1 AND $2` は境界が文字列リテラルへ置換され、
+// 文字列境界を書いた簡易クエリと同じ結果・`wire_code` になる（Parse/Describe/Bind が 42601 にならない）。
+#[test]
+fn boolean_between_bounds_match_string_literal_form() {
+    let (core, mut session, _g) = setup("sql78-bool-between");
+    let c = ctx("sys");
+    for (op, a, b) in [
+        ("BETWEEN", "false", "true"),
+        ("NOT BETWEEN", "false", "false"),
+        ("BETWEEN", "t", "f"),
+    ] {
+        let prepared = run_prepared(
+            &core,
+            &mut session,
+            &c,
+            &format!("SELECT n FROM t WHERE b {op} $1 AND $2 LIMIT 100"),
+            &[a, b],
+        );
+        assert!(prepared.is_ok(), "{op} {a} {b}: {prepared:?}");
+        // 束縛値は正規形（true／false）の文字列リテラルへ置換される。
+        fn canon(v: &str) -> &str {
+            match v {
+                "t" => "true",
+                "f" => "false",
+                other => other,
+            }
+        }
+        let literal = run_literal(
+            &core,
+            &mut session,
+            &c,
+            &format!(
+                "SELECT n FROM t WHERE b {op} '{}' AND '{}' LIMIT 100",
+                canon(a),
+                canon(b)
+            ),
+        );
+        assert_eq!(prepared, literal, "{op} {a} {b}");
+    }
+}
+
+// PR #2631 指摘: `intersect` 等の名前の別名があっても集合演算とみなさず、パターン 9 は無効化されない。
+#[test]
+fn set_operator_named_identifiers_do_not_disable_noneq_params() {
+    let (core, mut session, _g) = setup("sql78-setop-name");
+    let c = ctx("sys");
+    for sql in [
+        "SELECT n AS intersect FROM t WHERE n > $1 LIMIT 5",
+        "SELECT n FROM t WHERE n > $1 ORDER BY n LIMIT 5",
+    ] {
+        let r = run_prepared(&core, &mut session, &c, sql, &["1"]);
+        assert!(r.is_ok(), "{sql}: {r:?}");
+    }
+}

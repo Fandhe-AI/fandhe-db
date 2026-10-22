@@ -88,7 +88,7 @@
 //! 値は SQL テキストにも字句解析器にも戻らず、検証済みの値から直接トークンを
 //! 組み立てるため、値経由のインジェクション経路は構造的に存在しない。
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 
 use crate::sql::allowlist::SqlSurfaceError;
 use crate::sql::lexer::{self, Token};
@@ -349,6 +349,13 @@ pub(crate) fn where_equality_literal_is_param_typed(
                 }
                 _ => None,
             };
+            // BETWEEN の BOOLEAN 境界は文字列リテラルへ置換される（置換側と一致させる）。
+            let is_dummy_bound = |idx: usize| match tokens.get(idx) {
+                Some(Token::Param(n)) if kind_of(kinds, *n) == ParamLiteralKind::Boolean => {
+                    Some(true)
+                }
+                _ => is_dummy(idx),
+            };
             match leaf.kind {
                 NoneqLeafKind::Compare { rhs, .. } => {
                     if let Some(f) = is_dummy(rhs) {
@@ -356,7 +363,7 @@ pub(crate) fn where_equality_literal_is_param_typed(
                     }
                 }
                 NoneqLeafKind::Between { low, high, .. } => {
-                    if let (Some(a), Some(b)) = (is_dummy(low), is_dummy(high)) {
+                    if let (Some(a), Some(b)) = (is_dummy_bound(low), is_dummy_bound(high)) {
                         // 片側だけが `$n` の形は `validate_param_positions` が拒否する。
                         flags.push(a && b);
                     }
@@ -497,18 +504,36 @@ fn noneq_leaf_at(tokens: &[Token], i: usize, start: usize, end: usize) -> Option
 /// （`UPDATE`／`DELETE` は Issue #2431 の範囲。集合演算は枝ごとに Describe 用フラグの序数が
 /// 0 から始まり対応がずれるため対象外）。それ以外は空で、該当する `$n` は `42601` のまま。
 fn where_noneq_param_slots(tokens: &[Token]) -> HashMap<usize, WhereParamShape> {
+    where_noneq_param_slots_and_bounds(tokens).0
+}
+
+/// 文中に集合演算（`UNION`／`INTERSECT`／`EXCEPT` の直後に次の枝が続く形）があるか。
+/// 同名の識別子（表・列・別名）は集合演算とみなさない（[`set_operator_is_followed_by_branch`]
+/// と同じ判定。引用符付き識別子は字句段で `Token::Ident` と別種のため対象外）。
+fn has_set_operator_branch(tokens: &[Token]) -> bool {
+    tokens.iter().enumerate().any(|(i, t)| {
+        matches!(t, Token::Ident(n) if super::allowlist::is_set_operator_ident(n))
+            && super::allowlist::set_operator_is_followed_by_branch(tokens, i)
+    })
+}
+
+/// [`where_noneq_param_slots`] と、`BETWEEN` の境界にあたる `$n` のトークン添字集合を返す。
+/// 後者は BOOLEAN 種別の置換で文字列リテラルを使う位置の判定に使う（既存の `BETWEEN`
+/// 構文処理は文字列／数値境界のみを受理するため）。
+fn where_noneq_param_slots_and_bounds(
+    tokens: &[Token],
+) -> (HashMap<usize, WhereParamShape>, HashSet<usize>) {
     let mut out = HashMap::new();
+    let mut bounds = HashSet::new();
     if !matches!(
         tokens.first(),
         Some(Token::Keyword(crate::sql::lexer::Keyword::Select))
-    ) || tokens
-        .iter()
-        .any(|t| matches!(t, Token::Ident(n) if super::allowlist::is_set_operator_ident(n)))
+    ) || has_set_operator_branch(tokens)
     {
-        return out;
+        return (out, bounds);
     }
     let Some((start, end)) = where_region(tokens) else {
-        return out;
+        return (out, bounds);
     };
     let column_of = |idx: usize| match tokens.get(idx) {
         Some(Token::Ident(c) | Token::QuotedNull(c)) => Some(WhereParamShape::Column(c.clone())),
@@ -534,6 +559,8 @@ fn where_noneq_param_slots(tokens: &[Token]) -> HashMap<usize, WhereParamShape> 
                 {
                     out.insert(low, shape.clone());
                     out.insert(high, shape);
+                    bounds.insert(low);
+                    bounds.insert(high);
                 }
             }
             NoneqLeafKind::ParamPair { lhs, rhs } => {
@@ -543,7 +570,7 @@ fn where_noneq_param_slots(tokens: &[Token]) -> HashMap<usize, WhereParamShape> 
         }
         i = leaf.next;
     }
-    out
+    (out, bounds)
 }
 
 /// 番号 `n`（1 始まり）の置換リテラル種別。範囲外・0 は `String`（fail-closed）。
@@ -1689,13 +1716,13 @@ pub fn order_by_distance_literal_is_param(tokens: &[Token]) -> bool {
 /// `value_for` は 1 始まりのパラメータ番号を受け取る。
 fn substitute_with<E>(
     tokens: &[Token],
-    mut value_for: impl FnMut(u16) -> Result<Vec<Token>, E>,
+    mut value_for: impl FnMut(u16, usize) -> Result<Vec<Token>, E>,
 ) -> Result<Vec<Token>, E> {
     let mut out = Vec::with_capacity(tokens.len());
     for (i, token) in tokens.iter().enumerate() {
         match token {
             Token::Param(n) => {
-                let produced = value_for(*n)?;
+                let produced = value_for(*n, i)?;
                 // Issue #1593: `$n::T` の `$n` が負値（`-` + 数値の 2 トークン）になる場合は括弧で
                 // 包む。`::` は単項マイナスより強いため、包まないと `-5::int` が `-(5::int)` と
                 // 読まれ、リテラル `(-5)::int` と値の意味が食い違う。`Punct` の長さは
@@ -1729,10 +1756,15 @@ pub fn substitute_dummy(tokens: &[Token]) -> Vec<Token> {
 /// `Number("0")`、`Boolean` 種別は `Ident("false")` のダミーへ置換し、数値・真偽値
 /// 列の位置でも Describe 用の構造検証が通るようにする。
 pub(crate) fn substitute_dummy_typed(tokens: &[Token], kinds: &[ParamLiteralKind]) -> Vec<Token> {
-    substitute_with(tokens, |n| {
+    let between_bounds = where_noneq_param_slots_and_bounds(tokens).1;
+    substitute_with(tokens, |n, i| {
         Ok::<_, std::convert::Infallible>(vec![match kind_of(kinds, n) {
             ParamLiteralKind::String => Token::StringLiteral("0".to_string()),
             ParamLiteralKind::Integer | ParamLiteralKind::Float => Token::Number("0".to_string()),
+            // BETWEEN の境界は既存構文処理が文字列リテラルのみ受理するため文字列で置換する。
+            ParamLiteralKind::Boolean if between_bounds.contains(&i) => {
+                Token::StringLiteral("false".to_string())
+            }
             ParamLiteralKind::Boolean => Token::Ident("false".to_string()),
         }])
     })
@@ -1765,7 +1797,8 @@ pub(crate) fn substitute_values_typed(
     values: &[Option<String>],
     kinds: &[ParamLiteralKind],
 ) -> Result<Vec<Token>, SqlSurfaceError> {
-    substitute_with(tokens, |n| {
+    let between_bounds = where_noneq_param_slots_and_bounds(tokens).1;
+    substitute_with(tokens, |n, ti| {
         let idx = usize::from(n).checked_sub(1).ok_or_else(|| {
             SqlSurfaceError::unsupported("parameter placeholder $0 is not valid".to_string())
         })?;
@@ -1779,6 +1812,17 @@ pub(crate) fn substitute_values_typed(
             ParamLiteralKind::String => Ok(vec![Token::StringLiteral(value.clone())]),
             ParamLiteralKind::Integer => integer_literal_tokens(n, value),
             ParamLiteralKind::Float => float_literal_tokens(n, value),
+            ParamLiteralKind::Boolean if between_bounds.contains(&ti) => {
+                // BETWEEN の境界は文字列リテラルへ置換する（正規形 `true`／`false`）。
+                let canonical = boolean_literal_tokens(n, value)?;
+                Ok(canonical
+                    .into_iter()
+                    .map(|t| match t {
+                        Token::Ident(w) => Token::StringLiteral(w),
+                        other => other,
+                    })
+                    .collect())
+            }
             ParamLiteralKind::Boolean => boolean_literal_tokens(n, value),
         }
     })
