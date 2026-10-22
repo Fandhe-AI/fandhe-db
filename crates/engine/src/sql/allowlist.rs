@@ -624,6 +624,10 @@ pub enum SqlSurfaceError {
     /// ポインタ）。`param` は 1 始まりの `$n` 番号で、エラー文言には番号だけを含める
     /// （値・表の存在情報は含めない）。
     IndeterminateDatatype { param: u16 },
+    /// `COPY` 文に `$n` が含まれる（`42P02`。Issue #1759・WIRE-21 (1)・ERR-6 のポインタ）。
+    /// 拡張クエリプロトコルの Parse が返す。`param` は 1 始まりの `$n` 番号で、エラー文言には
+    /// 番号だけを含める（値・表の存在情報は含めない）。
+    UndefinedParameter { param: u16 },
     /// 式索引の式が IMMUTABLE 相当でない（`42P17`。Issue #1647・INDEX-10）。`detail` は固定文言
     /// で、値・列名・テナント情報を載せられない型にしている。
     InvalidObjectDefinition { detail: &'static str },
@@ -1341,6 +1345,7 @@ impl ClassifiedError for SqlSurfaceError {
             SqlSurfaceError::OperationIdContentMismatch => ErrorClass::OperationIdContentMismatch,
             SqlSurfaceError::InvalidParameterValue { .. } => ErrorClass::InvalidParameterValue,
             SqlSurfaceError::IndeterminateDatatype { .. } => ErrorClass::IndeterminateDatatype,
+            SqlSurfaceError::UndefinedParameter { .. } => ErrorClass::UndefinedParameter,
             SqlSurfaceError::InvalidObjectDefinition { .. } => ErrorClass::InvalidObjectDefinition,
             SqlSurfaceError::GroupingError { .. } => ErrorClass::GroupingError,
             SqlSurfaceError::WindowingError { .. } => ErrorClass::WindowingError,
@@ -1492,6 +1497,9 @@ impl std::fmt::Display for SqlSurfaceError {
             | SqlSurfaceError::SqlJsonScalarRequired { detail } => f.write_str(detail),
             SqlSurfaceError::IndeterminateDatatype { param } => {
                 write!(f, "could not determine data type of parameter ${param}")
+            }
+            SqlSurfaceError::UndefinedParameter { param } => {
+                write!(f, "there is no parameter ${param}")
             }
             SqlSurfaceError::CollationMismatch => {
                 f.write_str("collation mismatch between explicit collations")
@@ -20090,6 +20098,35 @@ pub struct ValidatedCopyTo {
 pub enum CopyStatement {
     From(ValidatedCopyFrom),
     To(ValidatedCopyTo),
+}
+
+/// 拡張クエリプロトコルの Parse で検証済みの `COPY` 文（Issue #1759・WIRE-21 (1) のポインタ）。
+/// 検証済みの構文木（[`CopyStatement`]）と、Parse で受け取った元の SQL テキストを保持する。
+/// 元テキストを残すのは、Execute 側（Issue #1760）が簡易クエリと同一の入口
+/// （`EngineCore::begin_copy`／`begin_copy_in_txn`。一時表・`search_path`・SCHEMA の解決を
+/// 自前で行う）へそのまま渡せるようにするため。Parse 時には行・台帳・世代に一切触れない。
+/// フィールドは非公開で、検証を経ない値をクレート外が組み立てられない（`ValidatedInsert` 等と同じ作法）。
+#[derive(Debug, Clone, PartialEq)]
+pub struct ValidatedCopy {
+    stmt: CopyStatement,
+    sql: String,
+}
+
+impl ValidatedCopy {
+    /// 検証済みの構文木と元の SQL テキストから組み立てる（`EngineCore` の Parse だけが呼ぶ）。
+    pub(crate) fn new(stmt: CopyStatement, sql: String) -> Self {
+        Self { stmt, sql }
+    }
+
+    /// Parse で受け取った元の SQL テキスト（Execute で `begin_copy*` へ渡す）。
+    pub fn sql(&self) -> &str {
+        &self.sql
+    }
+
+    /// 検証済みの `COPY` 構文木。
+    pub fn statement(&self) -> &CopyStatement {
+        &self.stmt
+    }
 }
 
 /// `(<items>)` の対応する丸括弧を見つけ、内側・外側後続のトークン列へ分割する

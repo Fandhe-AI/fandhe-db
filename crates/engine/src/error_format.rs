@@ -94,7 +94,7 @@ macro_rules! define_error_classes {
 pub(crate) const SHARED_WIRE_CODES: &[&str] = &["23502", "23505", "22023"];
 
 define_error_classes! {
-    count = 77;
+    count = 78;
 
     /// 構文上受理された SQL の値・引数が不正（`22000`）。
     /// [`crate::sql::allowlist::SqlSurfaceError::InvalidInput`] の写像。
@@ -401,6 +401,11 @@ define_error_classes! {
     /// （存在オラクルを作らない）。[`crate::sql::allowlist::SqlSurfaceError::IndeterminateDatatype`]
     /// の写像。
     IndeterminateDatatype => ("42P18", "INDETERMINATE_DATATYPE"),
+    /// 拡張クエリプロトコルの Parse で `COPY` 文に `$n` を置いた（`42P02`。Issue #1759・
+    /// WIRE-21 (1)・ERR-6 のポインタ）。`COPY` はバインドパラメータを持てないため、`$n` を
+    /// 含む形は Parse で fail-closed に拒否する。文言は番号だけを含め、値・表の存在情報を載せない。
+    /// [`crate::sql::allowlist::SqlSurfaceError::UndefinedParameter`] の写像。
+    UndefinedParameter => ("42P02", "UNDEFINED_PARAMETER"),
     /// 同じ式の 2 つの明示的な `COLLATE` が食い違う（`42P21`。Issue #2190・TABLE-28・ERR-6
     /// のポインタ）。照合名は固定の許可リスト由来で、テーブル名・列名・値は文言に含めない。
     /// [`crate::sql::allowlist::SqlSurfaceError::CollationMismatch`] の写像。
