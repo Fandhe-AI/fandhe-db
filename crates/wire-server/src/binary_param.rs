@@ -73,6 +73,47 @@ impl BinaryParam {
     }
 }
 
+/// 列が公告する [`WireType`] から COPY binary の復号種別を引く（WIRE-23 (3)・Issue #1768）。
+/// COPY binary はフィールドに OID を持たず列型が唯一の表現のため、Bind の宣言 OID 照合は
+/// 経由せず、`WireType::supports_binary` と同じ集合を網羅 `match` で写す（第 2 の型表を
+/// 作らない。variant 増加はコンパイルエラーで検出する）。
+#[deny(clippy::wildcard_enum_match_arm)]
+pub(crate) fn binary_param_for_wire_type(t: crate::result_encoder::WireType) -> BinaryParam {
+    use crate::result_encoder::WireType;
+    match t {
+        WireType::Text | WireType::Varchar | WireType::Bpchar => BinaryParam::Utf8Identity,
+        WireType::Numeric => BinaryParam::Numeric,
+        WireType::Int2 => BinaryParam::Int2,
+        WireType::Int4 => BinaryParam::Int4,
+        WireType::Int8 => BinaryParam::Int8,
+        WireType::Float4 => BinaryParam::Float4,
+        WireType::Float8 => BinaryParam::Float8,
+        WireType::Bool => BinaryParam::Bool,
+        WireType::Bytea => BinaryParam::Bytea,
+        WireType::Uuid => BinaryParam::Uuid,
+        WireType::Time => BinaryParam::Time,
+        WireType::TimestampTz => BinaryParam::TimestampTz,
+        WireType::Interval => BinaryParam::Interval,
+        WireType::Date
+        | WireType::Timestamp
+        | WireType::Json
+        | WireType::Jsonb
+        | WireType::TextArray
+        | WireType::BoolArray
+        | WireType::Int4Array
+        | WireType::Int8Array
+        | WireType::Float4Array
+        | WireType::Float8Array
+        | WireType::DateArray
+        | WireType::TimestampArray
+        | WireType::UuidArray
+        | WireType::NumericArray
+        | WireType::ByteaArray
+        | WireType::JsonArray
+        | WireType::JsonbArray => BinaryParam::Unsupported,
+    }
+}
+
 /// バイナリ値の復号失敗。長さ不正は `08P01`、TIME・TIMESTAMPTZ・INTERVAL 番兵の範囲外は `22008`、
 /// numeric の外部表現不正は `22P03`・範囲超過は `22003`
 /// （`extended_query` が別々の `HandlerError` へ写す）。
@@ -372,6 +413,19 @@ mod tests {
 
     fn dec(kind: BinaryParam, raw: &[u8]) -> String {
         String::from_utf8(decode_to_text(kind, raw).expect("decode")).expect("utf8")
+    }
+
+    /// 復号種別の対応可否が `WireType::supports_binary` と一致する（単一情報源。
+    /// WIRE-23 (3)・Issue #1768）。
+    #[test]
+    fn wire_type_mapping_matches_supports_binary() {
+        for t in crate::result_encoder::WireType::ALL {
+            assert_eq!(
+                binary_param_for_wire_type(t) != BinaryParam::Unsupported,
+                t.supports_binary(),
+                "{t:?}"
+            );
+        }
     }
 
     #[test]
