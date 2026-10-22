@@ -311,8 +311,10 @@ pub(crate) fn where_equality_literal_is_param_typed(
     // 位置だけが省略される（埋め草の `false` は検証側＝fail-closed）。
     let mut per_branch: Vec<Vec<bool>> = Vec::new();
     let mut seg_start = 0usize;
+    let in_cte_body = cte_body_mask(tokens);
     for (i, t) in tokens.iter().enumerate() {
         if matches!(t, Token::Ident(n) if super::allowlist::is_set_operator_ident(n))
+            && !in_cte_body.get(i).copied().unwrap_or(false)
             && super::allowlist::set_operator_is_followed_by_branch(tokens, i)
         {
             per_branch.push(where_literal_flags_in_region(
@@ -334,6 +336,50 @@ pub(crate) fn where_equality_literal_is_param_typed(
             f
         })
         .collect()
+}
+
+/// `WITH` 句の CTE 本体（`name AS [MATERIALIZED] ( ... )` の括弧内）に含まれるトークンを
+/// `true` にしたマスクを返す（PR #2631 指摘）。CTE 本体内の `UNION` 等は `SetTree` の葉に
+/// ならないため、ダミーフラグの枝分割から除外して `describe_columns` の葉数と区画数を揃える。
+/// `WITH` で始まらない文は全要素 `false`。
+fn cte_body_mask(tokens: &[Token]) -> Vec<bool> {
+    let mut mask = vec![false; tokens.len()];
+    if !matches!(tokens.first(), Some(Token::Ident(n)) if n.eq_ignore_ascii_case("WITH")) {
+        return mask;
+    }
+    // 括弧ごとに「CTE 本体か」を積む。CTE 本体の内側は入れ子の括弧も含めて true。
+    let mut stack: Vec<bool> = Vec::new();
+    for (i, t) in tokens.iter().enumerate() {
+        match t {
+            Token::Punct('(') => {
+                let prev_is = |k: usize, w: &str| {
+                    i.checked_sub(k)
+                        .and_then(|j| tokens.get(j))
+                        .is_some_and(|p| matches!(p, Token::Ident(n) if n.eq_ignore_ascii_case(w)))
+                };
+                let opens_cte = prev_is(1, "AS")
+                    || (prev_is(1, "MATERIALIZED") && (prev_is(2, "AS") || prev_is(2, "NOT")));
+                let inside = stack.iter().any(|b| *b) || opens_cte;
+                if let Some(m) = mask.get_mut(i) {
+                    *m = inside;
+                }
+                stack.push(opens_cte);
+            }
+            Token::Punct(')') => {
+                stack.pop();
+                let inside = stack.iter().any(|b| *b);
+                if let Some(m) = mask.get_mut(i) {
+                    *m = inside;
+                }
+            }
+            _ => {
+                if let Some(m) = mask.get_mut(i) {
+                    *m = stack.iter().any(|b| *b);
+                }
+            }
+        }
+    }
+    mask
 }
 
 fn where_literal_flags_in_region(tokens: &[Token], kinds: &[ParamLiteralKind]) -> Vec<bool> {
@@ -2901,6 +2947,34 @@ mod tests {
                 "sql = {sql}"
             );
         }
+    }
+
+    /// PR #2631 指摘: WITH 本体内の `UNION` はダミーフラグの枝分割に数えない（`SetTree` の葉でない）。
+    /// 本体外の集合演算は従来どおり枝ごとに分割される。
+    #[test]
+    fn cte_body_set_operator_does_not_split_dummy_flags() {
+        let flags = |sql: &str| {
+            let tokens = tokenize_with_params(sql).expect("tokenize_with_params should succeed");
+            where_equality_literal_is_param_typed(&tokens, &[])
+        };
+        assert_eq!(
+            flags(
+                "WITH c AS (SELECT a FROM t UNION SELECT a FROM t) \
+                 SELECT a FROM c WHERE a = $1"
+            ),
+            vec![true]
+        );
+        assert_eq!(
+            flags(
+                "WITH c AS MATERIALIZED (SELECT a FROM t UNION ALL SELECT a FROM t) \
+                 SELECT a FROM c WHERE a = 'x'"
+            ),
+            vec![false]
+        );
+        assert_eq!(
+            flags("SELECT a FROM t WHERE a = $1 UNION SELECT a FROM t WHERE a = 'x'"),
+            vec![true, false]
+        );
     }
 
     #[test]
