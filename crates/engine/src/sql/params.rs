@@ -34,7 +34,10 @@
 //!    先頭語が `UPDATE` の文の `SET` 節の内側、括弧深さ 0 の `(SET|,) <列> = $n (,|節末)` の
 //!    形＝右辺全体が `$n` 単独の位置のみ。`a = a + $1`・`upper($1)` のように式の内側に
 //!    置いた `$n` はパターン 7。
-//!    `INSERT ... ON CONFLICT ... DO UPDATE SET` は先頭語が `INSERT` のため対象外）
+//!    `INSERT ... ON CONFLICT ... DO UPDATE SET` は先頭語が `INSERT` のため対象外。
+//!    行値の代入 `SET (<列>, ...) = (<要素>, ...)`／`= ROW(...)`（Issue #1748）も列リストの位置で
+//!    同じ規則に従い、要素単独の `$n` はここ、式の内側はパターン 7。列と要素の数の不一致は
+//!    登録せず `42601`）
 //! 7. 式の内側の `$n`（Issue #1546・SQL-45 期待欄 (6)・WIRE-12 のポインタ）。パターン 5 の
 //!    VALUES 要素、パターン 6 の SET 右辺のうち `$n` 単独ではないもの
 //!    （`n = n + $1`・`s = upper($1)`・`VALUES (1 + $1)`・`CASE WHEN m = $1 ...`）。
@@ -584,6 +587,15 @@ fn set_param_slots(
         };
         if is_separator {
             close_set_assignment(tokens, current.take(), k, &mut table, &mut segments);
+            // 行値の代入 `(<列>, ...) = (<要素>, ...)`／`= ROW(...)`（Issue #1748）。
+            if matches!(tokens.get(k + 1), Some(Token::Punct('('))) {
+                if let Some(close) =
+                    set_row_value_slots(tokens, k + 1, end, &mut table, &mut segments)
+                {
+                    k = close.saturating_add(1);
+                    continue;
+                }
+            }
             if let (Some(Token::Ident(col) | Token::QuotedNull(col)), Some(Token::Punct('='))) =
                 (tokens.get(k + 1), tokens.get(k + 2))
             {
@@ -594,6 +606,75 @@ fn set_param_slots(
     }
     close_set_assignment(tokens, current.take(), end, &mut table, &mut segments);
     (table, segments)
+}
+
+/// [`set_param_slots`] の行値の代入 `( <列>, ... ) = ( <要素>, ... )`／`= ROW( ... )` の登録
+/// （Issue #1748。SQL-50 (3)(4)・SQL-45 (6)・WIRE-12 のポインタ）。`open` は列リストの `(`。
+/// 列と要素の数が一致したときだけ、要素ごとに列の位置規則（単独 `$n` はパターン 6、`$n` を含む式は
+/// パターン 7）で登録する。形が崩れている・数が違う場合は何も登録せず（位置検査で `42601`。
+/// fail-closed）、値リストの閉じ括弧の添字を返す。値リストの閉じ括弧が見つからなければ `None`。
+fn set_row_value_slots(
+    tokens: &[Token],
+    open: usize,
+    end: usize,
+    table: &mut HashMap<usize, String>,
+    segments: &mut Vec<ExprSegment>,
+) -> Option<usize> {
+    let mut cols: Vec<String> = Vec::new();
+    let mut j = open.checked_add(1)?;
+    loop {
+        match tokens.get(j) {
+            Some(Token::Ident(c) | Token::QuotedNull(c)) if j < end => cols.push(c.clone()),
+            _ => return None,
+        }
+        match tokens.get(j + 1) {
+            Some(Token::Punct(',')) => j += 2,
+            Some(Token::Punct(')')) => {
+                j += 2;
+                break;
+            }
+            _ => return None,
+        }
+    }
+    if !matches!(tokens.get(j), Some(Token::Punct('='))) {
+        return None;
+    }
+    j += 1;
+    if ident_eq_ignore_case(tokens.get(j), "ROW") {
+        j += 1;
+    }
+    if !matches!(tokens.get(j), Some(Token::Punct('('))) {
+        return None;
+    }
+    // 括弧深さ 1 の `,` と対応する閉じ括弧で要素を区切る（前向き 1 パス）。
+    let mut ranges: Vec<(usize, usize)> = Vec::new();
+    let mut depth: usize = 1;
+    let mut elem_start = j + 1;
+    let mut k = j + 1;
+    while k < end.min(tokens.len()) {
+        match tokens.get(k) {
+            Some(Token::Punct('(') | Token::Punct('[')) => depth = depth.saturating_add(1),
+            Some(Token::Punct(')') | Token::Punct(']')) => {
+                depth = depth.saturating_sub(1);
+                if depth == 0 {
+                    ranges.push((elem_start, k));
+                    if ranges.len() == cols.len() {
+                        for (col, (s, e)) in cols.into_iter().zip(ranges) {
+                            close_set_assignment(tokens, Some((col, s)), e, table, segments);
+                        }
+                    }
+                    return Some(k);
+                }
+            }
+            Some(Token::Punct(',')) if depth == 1 => {
+                ranges.push((elem_start, k));
+                elem_start = k + 1;
+            }
+            _ => {}
+        }
+        k += 1;
+    }
+    None
 }
 
 /// [`set_param_slots`] の 1 代入の確定（右辺 `[rhs_start, rhs_end)`）。
@@ -2076,6 +2157,59 @@ mod tests {
         .is_err());
         // RETURNING 以降の `$n` は SET 節の範囲外。
         assert!(positions("UPDATE documents SET n = 1 RETURNING n + $1").is_err());
+    }
+
+    /// Issue #1748: 行値の代入の `$n` は列リストの位置で列に対応づく（SQL-50 (3)(4)・SQL-45 (6)）。
+    #[test]
+    fn accepts_update_set_row_value_positions() {
+        for sql in [
+            "UPDATE documents SET (a, b) = ($1, $2) WHERE id = 1",
+            "UPDATE documents SET (a, b) = ROW($1, $2) WHERE id = 1",
+            "UPDATE documents SET (a) = ROW($1)",
+            "UPDATE documents SET (a, b) = ($1, upper($2)), c = $3 WHERE id = $4",
+            "UPDATE documents SET (a, b) = (DEFAULT, $1)",
+        ] {
+            assert!(positions(sql).is_ok(), "{sql}");
+        }
+    }
+
+    /// Issue #1748: 列と要素の数の不一致・形の崩れは何も登録せず `42601`（fail-closed）。
+    #[test]
+    fn rejects_malformed_update_set_row_value() {
+        for sql in [
+            "UPDATE documents SET (a, b) = ($1) WHERE id = 1",
+            "UPDATE documents SET (a, b) = ($1, $2, $3)",
+            "UPDATE documents SET (a, b) = $1",
+            "UPDATE documents SET (a, b = ($1, $2)",
+            "INSERT INTO t (id, a, b) VALUES (1, 1, 1) ON CONFLICT (id) DO UPDATE SET (a, b) = ($1, $2)",
+        ] {
+            assert_eq!(
+                positions(sql).map_err(|e| e.wire_code().to_string()),
+                Err("42601".to_string()),
+                "{sql}"
+            );
+        }
+    }
+
+    /// Issue #1748: 要素ごとにパターン 6（単独）／パターン 7（式）へ振り分け、WHERE は従来どおり。
+    #[test]
+    fn row_value_elements_infer_set_columns_and_expression_segments() {
+        let pos =
+            positions_of("UPDATE documents SET (a, b) = ($1, upper($2)), c = $3 WHERE id = $4");
+        assert_eq!(pos[0], vec![ParamPosition::SetColumn("a".to_string())]);
+        assert_eq!(pos[1], vec![ParamPosition::InExpr(0)]);
+        assert_eq!(pos[2], vec![ParamPosition::SetColumn("c".to_string())]);
+        assert_eq!(pos[3], vec![ParamPosition::WhereColumn("id".to_string())]);
+        let pos = positions_of("UPDATE documents SET (a, b) = ROW($1, $2) WHERE id = 1");
+        assert_eq!(pos[0], vec![ParamPosition::SetColumn("a".to_string())]);
+        assert_eq!(pos[1], vec![ParamPosition::SetColumn("b".to_string())]);
+    }
+
+    /// 回帰: 括弧つきの単一右辺（行値ではない）の扱いは変えない。
+    #[test]
+    fn parenthesized_scalar_set_rhs_is_unchanged() {
+        let pos = positions_of("UPDATE documents SET n = ($1) WHERE id = 1");
+        assert_eq!(pos[0], vec![ParamPosition::InExpr(0)]);
     }
 
     #[test]
