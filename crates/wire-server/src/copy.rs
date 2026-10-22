@@ -21,6 +21,12 @@
 //! `ReadyForQuery` も）までを 1 回の呼び出しで完結させる
 //! （`simple_query::run_statement` と同じ「1 文の応答を書き切る」契約）。
 //!
+//! binary 形式（`COPY ... FROM STDIN WITH (FORMAT binary)`。WIRE-23・Issue #1769・親 #1766）:
+//! `run_copy_from` が [`BinaryCopyReader`]（フレーム解析。型非依存）で CopyData をタプルへ分解し、
+//! 列型ごとの対応表（[`binary_param::for_copy_column`]）で各フィールドを正規テキストへ変換して
+//! `CopyInSession::feed_fields` へ渡す。以降の束縛・INDEX-4 上限・commit は text/csv と同一の経路で、
+//! 第 2 の書き込み経路は無い。対応表に無い列型は `CopyInResponse` を送る前に `0A000` で拒否する。
+//!
 //! **PostgreSQL 本家との既知の相違点**（`docs/design/wire-copy-protocol.md`
 //! 参照）: protocol v3 の COPY は CopyDone（'c'）で終端を表現するため、
 //! protocol v2 由来の `\.` 終端行は受理・要求しない。COPY FROM STDIN の途中で
@@ -43,6 +49,8 @@ use engine::sql::exec::{Cell, ColumnMeta, QueryResult, ResultRow};
 use engine::sql::mode::SessionState;
 use engine::sql::transaction::SessionTransaction;
 
+use crate::binary_param::{self, BinaryParam, BinaryParamError};
+use crate::copy_binary::{BinaryCopyReader, BinaryFrameLimits, CopyBinaryError};
 use crate::framing::{self, FrameError};
 use crate::result_encoder;
 use crate::simple_query::Finish;
@@ -159,17 +167,152 @@ fn respond_sql_error<S: WireStream>(
     respond_error_and_ready(stream, txn, e.error_class(), &e.client_message())
 }
 
+/// `COPY FROM STDIN` の取り込み中に保持するエラー（`errored`）。engine の SQL 表層エラーに加え、
+/// binary 形式で wire 側に生じるフレーム不正（[`CopyBinaryError`]）と値の変換失敗を表す。
+/// 文言は固定の英語文字列で、受信した値・他テナントの情報を含めない（WIRE-23・Issue #1769）。
+#[derive(Debug)]
+enum CopyFromError {
+    Sql(SqlSurfaceError),
+    Frame(CopyBinaryError),
+    /// binary フィールド 1 件の変換失敗（分類と固定文言）。
+    Value {
+        class: ErrorClass,
+        message: &'static str,
+    },
+}
+
+impl CopyFromError {
+    fn error_class(&self) -> ErrorClass {
+        match self {
+            Self::Sql(e) => e.error_class(),
+            Self::Frame(e) => e.error_class(),
+            Self::Value { class, .. } => *class,
+        }
+    }
+
+    fn client_message(&self) -> String {
+        match self {
+            Self::Sql(e) => e.client_message(),
+            Self::Frame(e) => e.client_message().to_string(),
+            Self::Value { message, .. } => (*message).to_string(),
+        }
+    }
+
+    /// [`BinaryParamError`] の COPY 経路での写像。Bind では長さ不正が `08P01`（接続を閉じる）だが、
+    /// COPY ではデータエラーとして接続を維持し、PostgreSQL の `*recv` と同じ `22P03` に揃える。
+    fn from_param(e: BinaryParamError) -> Self {
+        match e {
+            BinaryParamError::InvalidLength | BinaryParamError::InvalidRepresentation => {
+                Self::Value {
+                    class: ErrorClass::InvalidBinaryRepresentation,
+                    message: "incorrect binary data format in COPY field",
+                }
+            }
+            BinaryParamError::OutOfRange => Self::Value {
+                class: ErrorClass::DatetimeFieldOverflow,
+                message: "datetime value out of range in COPY field",
+            },
+            BinaryParamError::NumericOutOfRange => Self::Value {
+                class: ErrorClass::NumericOutOfRange,
+                message: "numeric value out of range in COPY field",
+            },
+        }
+    }
+}
+
+impl From<SqlSurfaceError> for CopyFromError {
+    fn from(e: SqlSurfaceError) -> Self {
+        Self::Sql(e)
+    }
+}
+
+impl From<CopyBinaryError> for CopyFromError {
+    fn from(e: CopyBinaryError) -> Self {
+        Self::Frame(e)
+    }
+}
+
+/// `COPY FROM STDIN` の CopyData の解釈方式。text/csv は engine の分割器へ生バイトを渡し、
+/// binary は [`BinaryCopyReader`] でタプルへ分解して列型ごとに正規テキストへ変換する。
+enum CopyInDecoder {
+    Rows,
+    Binary {
+        reader: BinaryCopyReader,
+        /// COPY 列リストの順の復号種別（`Unsupported` は含まない）。
+        kinds: Vec<BinaryParam>,
+    },
+}
+
+/// binary のタプル 1 件を、列ごとの復号種別で正規テキストのフィールド列へ変換する。
+/// 変換失敗時は固定文言のエラーを返す（受信値を含めない）。
+fn decode_binary_tuple(
+    kinds: &[BinaryParam],
+    raw: Vec<Option<Vec<u8>>>,
+) -> Result<Vec<Option<String>>, CopyFromError> {
+    if raw.len() != kinds.len() {
+        return Err(CopyFromError::Frame(CopyBinaryError::EncodeOverflow));
+    }
+    let mut out = Vec::with_capacity(raw.len());
+    for (kind, field) in kinds.iter().zip(raw) {
+        let Some(bytes) = field else {
+            out.push(None);
+            continue;
+        };
+        let text =
+            binary_param::decode_to_text(*kind, &bytes).map_err(CopyFromError::from_param)?;
+        // Bind の binary 経路（`sql::params`）と同じく、不正な UTF-8 と NUL は `22P02` で拒否する
+        // （PostgreSQL は `22021`。本リポに該当する分類が無い既知の相違）。
+        let text = String::from_utf8(text)
+            .ok()
+            .filter(|t| !t.contains('\0'))
+            .ok_or(CopyFromError::Value {
+                class: ErrorClass::InvalidTextRepresentation,
+                message: "invalid byte sequence in COPY text field",
+            })?;
+        out.push(Some(text));
+    }
+    Ok(out)
+}
+
+/// 1 個の CopyData 本文を取り込む。③（生バイト累計）は text/csv では `CopyInSession::feed` が、
+/// binary では本関数がフレーム解析より前に判定する。
+fn feed_copy_data(
+    decoder: &mut CopyInDecoder,
+    session: &mut CopyInSession,
+    body: &[u8],
+) -> Result<(), CopyFromError> {
+    match decoder {
+        CopyInDecoder::Rows => session.feed(body).map_err(CopyFromError::Sql),
+        CopyInDecoder::Binary { reader, kinds } => {
+            session.account_raw_bytes(body.len())?;
+            reader.feed(body, |raw| {
+                let fields = decode_binary_tuple(kinds, raw)?;
+                session.feed_fields(fields).map_err(CopyFromError::Sql)
+            })
+        }
+    }
+}
+
+fn respond_copy_from_error<S: WireStream>(
+    stream: &mut S,
+    txn: &mut SessionTransaction<'_>,
+    e: &CopyFromError,
+) -> io::Result<()> {
+    respond_error_and_ready(stream, txn, e.error_class(), &e.client_message())
+}
+
 /// `CopyInResponse`（'G'）／`CopyOutResponse`（'H'）を組み立てる。いずれも
-/// `Int8 format=0`（text。CSV でも overall format は 0 のまま）・
-/// `Int16 num_columns`・`Int16[num_columns]`（各列 format=0）という同一構造
-/// （PostgreSQL wire v3 の規範）。
-fn encode_copy_response(kind: u8, column_count: usize) -> Result<Vec<u8>, ()> {
+/// `Int8 format`（text／CSV は 0。CSV でも overall format は 0 のまま。binary は 1）・
+/// `Int16 num_columns`・`Int16[num_columns]`（各列の format。overall と同じ値）という同一構造
+/// （PostgreSQL wire v3 の規範）。`binary` は `COPY FROM` の binary のみ真（`'H'` は #1770）。
+fn encode_copy_response(kind: u8, binary: bool, column_count: usize) -> Result<Vec<u8>, ()> {
     let n = i16::try_from(column_count).map_err(|_| ())?;
+    let format: i16 = if binary { 1 } else { 0 };
     let mut body = Vec::new();
-    body.push(0u8);
+    body.push(u8::from(binary));
     body.extend_from_slice(&n.to_be_bytes());
     for _ in 0..column_count {
-        body.extend_from_slice(&0i16.to_be_bytes());
+        body.extend_from_slice(&format.to_be_bytes());
     }
     let total_len = body
         .len()
@@ -203,10 +346,15 @@ fn cell_to_copy_value(
     cell: &Cell,
     tz: &engine::datetime::SessionTimeZone,
 ) -> Result<Option<String>, result_encoder::EncodeError> {
+    // COPY TO の binary は #1770 が実装する。engine が TO の binary を拒否するため到達しないが、
+    // 到達した場合は text として出力せず fail-closed に拒否する。
+    if format == CopyFormat::Binary {
+        return Err(result_encoder::EncodeError);
+    }
     let text = result_encoder::cell_to_text_for_column_in_tz(meta, cell, tz)?;
     Ok(text.map(|t| match format {
-        CopyFormat::Text => escape_copy_text(&t),
         CopyFormat::Csv => escape_copy_csv(&t),
+        CopyFormat::Text | CopyFormat::Binary => escape_copy_text(&t),
     }))
 }
 
@@ -274,6 +422,11 @@ fn encode_copy_data_row_into(
     let sep = match format {
         CopyFormat::Text => '\t',
         CopyFormat::Csv => ',',
+        // `cell_to_copy_value` が先に拒否するため到達しない（fail-closed）。
+        CopyFormat::Binary => {
+            out.truncate(start);
+            return Err(result_encoder::EncodeError);
+        }
     };
     let mut line = String::new();
     for (i, field) in fields.iter().enumerate() {
@@ -289,7 +442,7 @@ fn encode_copy_data_row_into(
             // 往復が壊れる（Issue #939 レビュー指摘）。CSV の NULL は引用符なしの
             // 空文字列で表現する。
             (CopyFormat::Text, None) => line.push_str("\\N"),
-            (CopyFormat::Csv, None) => {}
+            (CopyFormat::Csv | CopyFormat::Binary, None) => {}
             (_, Some(s)) => line.push_str(s),
         }
     }
@@ -322,7 +475,7 @@ fn run_copy_to<S: WireStream>(
     result: &QueryResult,
     finish: Finish,
 ) -> io::Result<CopyStep> {
-    let response = match encode_copy_response(b'H', result.columns.len()) {
+    let response = match encode_copy_response(b'H', false, result.columns.len()) {
         Ok(b) => b,
         Err(()) => {
             return respond_error_and_ready(
@@ -399,6 +552,36 @@ fn run_copy_to<S: WireStream>(
     }
 }
 
+/// セッションの形式から CopyData の解釈方式を決める。binary は `CopyInResponse` を送る前に、
+/// 対応表（[`binary_param::for_copy_column`]）に無い列型を含む列リストを `0A000` で拒否する
+/// （copy mode へ入ってから失敗させない。fail-closed）。フレーム層のメモリ上限は、確保前の
+/// 防御としてセッションの ③（バッチ合計バイト数）を使う（実際の上限判定は engine が担う）。
+fn prepare_decoder(session: &CopyInSession) -> Result<CopyInDecoder, CopyFromError> {
+    if session.format() != CopyFormat::Binary {
+        return Ok(CopyInDecoder::Rows);
+    }
+    let kinds: Vec<BinaryParam> = session
+        .column_kinds()?
+        .iter()
+        .map(binary_param::for_copy_column)
+        .collect();
+    if kinds.contains(&BinaryParam::Unsupported) {
+        return Err(CopyFromError::Value {
+            class: ErrorClass::FeatureNotSupported,
+            message: "COPY binary does not support this column type",
+        });
+    }
+    let max = session.batch_limits().max_batch_total_bytes;
+    let reader = BinaryCopyReader::new(
+        kinds.len(),
+        BinaryFrameLimits {
+            max_field_bytes: max,
+            max_tuple_bytes: max,
+        },
+    )?;
+    Ok(CopyInDecoder::Binary { reader, kinds })
+}
+
 /// `COPY <table> (<cols>) FROM STDIN`: CopyInResponse → CopyData*／CopyDone／
 /// CopyFail のサブプロトコルを 1 回の呼び出しで完結させる。行のデコード・
 /// 束縛・INDEX-4 逐次判定は [`CopyInSession::feed`] が担う（`sql::copy`
@@ -426,7 +609,15 @@ fn run_copy_from<'e, S: WireStream>(
     mut session: CopyInSession,
     finish: Finish,
 ) -> io::Result<CopyStep> {
-    let response = match encode_copy_response(b'G', session.column_count()) {
+    let mut decoder = match prepare_decoder(&session) {
+        Ok(d) => d,
+        Err(e) => return respond_copy_from_error(stream, txn, &e).map(|()| CopyStep::Failed),
+    };
+    let response = match encode_copy_response(
+        b'G',
+        matches!(decoder, CopyInDecoder::Binary { .. }),
+        session.column_count(),
+    ) {
         Ok(b) => b,
         Err(()) => {
             return respond_error_and_ready(
@@ -440,7 +631,7 @@ fn run_copy_from<'e, S: WireStream>(
     };
     stream.write_all(&response)?;
 
-    let mut errored: Option<SqlSurfaceError> = None;
+    let mut errored: Option<CopyFromError> = None;
     let mut discarded_bytes: usize = 0;
     let mut discarded_messages: usize = 0;
 
@@ -483,7 +674,7 @@ fn run_copy_from<'e, S: WireStream>(
                         .saturating_add(crate::limits::COPY_DISCARD_FRAME_OVERHEAD_BYTES);
                     discarded_messages = discarded_messages.saturating_add(1);
                     enforce_discard_budget(stream, discarded_bytes, discarded_messages)?;
-                } else if let Err(e) = session.feed(&body) {
+                } else if let Err(e) = feed_copy_data(&mut decoder, &mut session, &body) {
                     errored = Some(e);
                 }
             }
@@ -497,6 +688,7 @@ fn run_copy_from<'e, S: WireStream>(
                     conn_session,
                     txn,
                     session,
+                    decoder,
                     errored,
                     finish,
                 );
@@ -616,11 +808,20 @@ fn finish_copy_from<'e, S: WireStream>(
     conn_session: &mut SessionState,
     txn: &mut SessionTransaction<'e>,
     session: CopyInSession,
-    errored: Option<SqlSurfaceError>,
+    decoder: CopyInDecoder,
+    errored: Option<CopyFromError>,
     finish: Finish,
 ) -> io::Result<CopyStep> {
     if let Some(e) = errored {
-        return respond_sql_error(stream, txn, &e).map(|()| CopyStep::Failed);
+        return respond_copy_from_error(stream, txn, &e).map(|()| CopyStep::Failed);
+    }
+    // binary はタプルの途中で終わった入力（CopyDone がフレームの途中に届いた）を `22P04` で拒否する。
+    // タプル境界またはトレーラ後の終端のみ成功とする（PostgreSQL と同じ）。
+    if let CopyInDecoder::Binary { reader, .. } = decoder {
+        if let Err(e) = reader.finish() {
+            return respond_copy_from_error(stream, txn, &CopyFromError::Frame(e))
+                .map(|()| CopyStep::Failed);
+        }
     }
 
     let batch = match session.finish() {
@@ -737,13 +938,42 @@ mod tests {
 
     #[test]
     fn encode_copy_response_has_expected_layout_for_two_columns() {
-        let msg = encode_copy_response(b'G', 2).expect("encode");
+        let msg = encode_copy_response(b'G', false, 2).expect("encode");
         assert_eq!(msg[0], b'G');
         let len = i32::from_be_bytes([msg[1], msg[2], msg[3], msg[4]]) as usize;
         assert_eq!(len, msg.len() - 1);
         assert_eq!(msg[5], 0); // overall format
         let ncols = i16::from_be_bytes([msg[6], msg[7]]);
         assert_eq!(ncols, 2);
+    }
+
+    #[test]
+    fn encode_copy_response_binary_sets_overall_and_column_formats_to_one() {
+        let msg = encode_copy_response(b'G', true, 3).expect("encode");
+        assert_eq!(msg[5], 1);
+        assert_eq!(i16::from_be_bytes([msg[6], msg[7]]), 3);
+        for i in 0..3 {
+            let at = 8 + i * 2;
+            assert_eq!(i16::from_be_bytes([msg[at], msg[at + 1]]), 1);
+        }
+        assert_eq!(msg.len(), 1 + 4 + 1 + 2 + 3 * 2);
+    }
+
+    #[test]
+    fn decode_binary_tuple_converts_and_rejects_with_fixed_messages() {
+        let kinds = [BinaryParam::Int4, BinaryParam::Utf8Identity];
+        let ok = decode_binary_tuple(
+            &kinds,
+            vec![Some(7i32.to_be_bytes().to_vec()), Some(b"hi".to_vec())],
+        )
+        .expect("ok");
+        assert_eq!(ok, vec![Some("7".to_string()), Some("hi".to_string())]);
+        let nul = decode_binary_tuple(&kinds, vec![None, Some(b"a\0b".to_vec())]).unwrap_err();
+        assert_eq!(nul.error_class().wire_code(), "22P02");
+        let utf8 = decode_binary_tuple(&kinds, vec![None, Some(vec![0xff])]).unwrap_err();
+        assert_eq!(utf8.error_class().wire_code(), "22P02");
+        let len = decode_binary_tuple(&kinds, vec![Some(vec![0, 0, 0]), None]).unwrap_err();
+        assert_eq!(len.error_class().wire_code(), "22P03");
     }
 
     #[test]

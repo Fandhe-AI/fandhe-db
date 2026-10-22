@@ -177,7 +177,6 @@ fn classification_matches_between_simple_and_parse() {
         ("CSV (HEADER)", "42601"),
         ("CSV BINARY", "42601"),
         ("HEADER HEADER", "42601"),
-        ("WITH (FORMAT binary)", "42601"),
         ("WITH (FORMAT json)", "22023"),
         ("WITH (HEADER maybe)", "22023"),
         ("WITH (DELIMITER 1)", "22023"),
@@ -239,4 +238,29 @@ fn unknown_option_name_is_truncated_in_message() {
         .map(|_| ())
         .expect_err("rejected");
     assert!(e.to_string().len() < 120, "{e}");
+}
+
+/// `FORMAT binary` は FROM のみ受理し（WIRE-23・Issue #1769）、TO は Issue #1770 まで `42601`。
+/// binary と行形式のオプションの併用は `0A000`。
+#[test]
+fn binary_is_accepted_for_from_only_and_rejects_row_format_options() {
+    let (core, _g) = open("copy-opt-binary");
+    assert!(begin(&core, &format!("{FROM} WITH (FORMAT binary)")).is_ok());
+    assert_eq!(
+        rejected_code(&core, &format!("{TO} WITH (FORMAT binary)")),
+        "42601"
+    );
+    for opt in [
+        "DELIMITER ','",
+        "NULL 'x'",
+        "HEADER",
+        "QUOTE ''''",
+        "ESCAPE 'x'",
+    ] {
+        assert_eq!(
+            rejected_code(&core, &format!("{FROM} WITH (FORMAT binary, {opt})")),
+            "0A000",
+            "{opt}"
+        );
+    }
 }

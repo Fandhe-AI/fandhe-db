@@ -69,7 +69,8 @@
   `0A000` で拒否する（無言の fail-open の防止）。`COPY FROM` は Issue #1764 で適用済みのため
   ゲートを外した。`COPY TO` は Issue #1765 が `reject_unapplied_for_to` の呼び出しを外すまで
   残る（既定値と等しい明示指定と旧構文の `CSV` は両方向で受理する）。
-- 既知の相違: `FORMAT binary` は WIRE-23 まで従来どおり `42601`、`WITH` だけでオプションの
+- 既知の相違: `FORMAT binary` は `COPY FROM` のみ受理し（Issue #1769）、`COPY TO` は #1770 まで
+  従来どおり `42601`。`WITH` だけでオプションの
   無い指定も `42601`（PostgreSQL は受理）、エスケープ文字列 `E'...'` は字句解析が未対応のため
   `42601`。
 
@@ -348,7 +349,7 @@ ReadyForQuery を返して接続を継続する。層 A: `crates/wire-server/tes
 
 `crates/wire-server/src/copy_binary.rs` に、列の型を知らない binary COPY のフレームコーデックを新設した
 （形式は PostgreSQL 公式ドキュメント「COPY — Binary Format」）。本番の呼び出し元はまだ無く、結線は
-兄弟 Issue が担う（モジュールは `dead_code` を許可）。
+兄弟 Issue が担う（Issue #1769 で `COPY FROM` へ結線済み。writer だけ #1770 まで `dead_code` を許可）。
 
 - 責務分割: parser（`BinaryCopyReader`）はヘッダ・タプル・トレーラをフィールド単位のバイト列へ分解するだけで、
   型変換は #1768、`CopyInSession` への結線と INDEX-4 上限との接続は #1769、`COPY TO STDOUT` は #1770。
@@ -362,4 +363,30 @@ ReadyForQuery を返して接続を継続する。層 A: `crates/wire-server/tes
   PostgreSQL では EOF 扱いになりうるが、本実装は fail-closed で `22P04` とする（既知の相違）。
   0 タプルは parser では成功とし、空バッチの扱いは #1769 で engine の契約に接続する。
 - 対象外・申し送り: `22P04` の `ErrorClass` variant と HTTP／nosql-api.md／err4 テストへの射影、
-  `CopyFormat::Binary` の許可、`CopyResponse` の format 化は #1769／#1770。binary は引き続き `42601` で拒否する。
+  `CopyFormat::Binary` の許可、`CopyResponse` の format 化は #1769／#1770（#1769 で FROM 側を実施。下の節）。
+
+## Issue #1769: binary 形式の COPY FROM 結線（親 #1766・WIRE-23 ポインタ）
+
+`COPY <t> (<cols>) FROM STDIN WITH (FORMAT binary)` を受理し、binary タプルを既存の束縛経路
+（`bind_copy_record` → `BoundInsert` → `commit_copy_in_txn_in_session`）へ流す。第 2 の書き込み経路は無い。
+
+- 責務分割: フレーム解析（`BinaryCopyReader`）と型変換は wire-server、束縛・INDEX-4 上限・commit は engine。
+  engine へは型変換済みの正規テキスト（`Vec<Option<String>>`）だけを `CopyInSession::feed_fields` で渡す。
+  text/csv の `feed` と binary の `feed_fields` は、非公開の `RecordSink::push_record` を共有する
+  （判定順序は フィールド数照合 → ① 行数 → ④ チャンク数 → 束縛 → ② 行あたりのバイト量）。
+  ③（生 CopyData 累計）は binary でも全 payload を `account_raw_bytes` で計上し、フレーム解析より前に判定する。
+- 事前拒否: 列リストに対応表（`binary_param::for_copy_column`）の外の型（VECTOR・DATE・TIMESTAMP・JSON・
+  JSONB・配列・ENUM）があれば、`CopyInResponse` を送る前に `0A000` で拒否する。表を広げるのは #1768 の担当。
+  対応表: text 系→UTF-8 恒等、int2/4/8、float4/8、bool、bytea、uuid、time、timestamptz、interval、numeric。
+- `CopyInResponse` は全体 format と各列 format を 1 で返す（`CopyOutResponse` の binary は #1770）。
+- エラー: フレーム不正は新設の `22P04`（`ErrorClass::BadCopyFileFormat`。HTTP は 400、NoSQL からは到達しない）、
+  フィールド長・フレーム上限は `54000`、値の変換失敗は `22P03`（長さ・表現）／`22008`／`22003`。Bind では
+  長さ不正が `08P01` だが、COPY は接続を維持するデータエラーとして `22P03` に揃えた。既存契約どおり
+  エラーは保持し、CopyDone／CopyFail を受けてから ErrorResponse を返す（以降の CopyData は discard 予算で読み捨て）。
+  全体ロールバックと、明示トランザクション中の失敗での `Failed` 遷移は text/csv と同じ。
+- オプションの併用: binary と DELIMITER／NULL／HEADER／QUOTE／ESCAPE の併用は `0A000` で拒否する。
+- 既知の相違: 疑似列 `id` は結果側の公告に合わせて numeric で復号する（int8 で送ると `22P03`）。0 タプルは
+  `COPY 0` ではなく空入力と同じ `22000`。不正な UTF-8 と NUL は PostgreSQL の `22021` ではなく
+  Bind の binary 経路と同じ `22P02`。タプル境界で終わりトレーラが無い入力は成功（PostgreSQL と同じ）。
+- 層 A: `crates/wire-server/tests/wire23_copy_binary_from.rs`（分割位置・上限・全体ロールバック・
+  明示 Tx・テナント境界・拡張クエリ）、`crates/engine/tests/copy_from.rs`・`copy_options_parse.rs`。

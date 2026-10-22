@@ -12,6 +12,9 @@
 //! 受信データ経路のため `unwrap`／`expect`／添字アクセスを使わず、固定長は
 //! `try_from` による完全一致で検証する（不一致は [`BinaryParamError`]・`08P01`）。
 
+use engine::catalog::ColumnType;
+use engine::sql::copy::CopyColumnKind;
+
 /// スロットのバイナリ復号種別（Parse 時に確定。`BinaryParam::Unsupported` は
 /// バイナリ指定を `0A000` で拒否する）。
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -365,10 +368,114 @@ pub(crate) fn decode_to_text(kind: BinaryParam, raw: &[u8]) -> Result<Vec<u8>, B
     Ok(text.into_bytes())
 }
 
+/// COPY の列種別から binary フィールドの復号種別を引く暫定の対応表（WIRE-23・Issue #1769）。
+/// `copy::run_copy_from` が `CopyInResponse` を送る前に呼び、`Unsupported` を含む列リストを
+/// `0A000` で拒否する（fail-closed）。ここが扱うのは [`decode_to_text`] が既に復号できる型だけで、
+/// 表を広げる（VECTOR・DATE・TIMESTAMP・JSON・配列・ENUM）のは Issue #1768 の担当。
+///
+/// 疑似列 `id` は結果側が numeric（OID 1700）で公告するため [`BinaryParam::Numeric`] で復号する
+/// （int8 で送られた `id` は長さ不正になる。PostgreSQL との既知の相違）。
+#[deny(clippy::wildcard_enum_match_arm)]
+pub(crate) fn for_copy_column(kind: &CopyColumnKind) -> BinaryParam {
+    let CopyColumnKind::Column(ty) = kind else {
+        return BinaryParam::Numeric;
+    };
+    match ty {
+        ColumnType::Text | ColumnType::Varchar(_) | ColumnType::Bpchar(_) => {
+            BinaryParam::Utf8Identity
+        }
+        ColumnType::SmallInt => BinaryParam::Int2,
+        ColumnType::Integer => BinaryParam::Int4,
+        ColumnType::BigInt => BinaryParam::Int8,
+        ColumnType::Real => BinaryParam::Float4,
+        ColumnType::Double => BinaryParam::Float8,
+        ColumnType::Boolean => BinaryParam::Bool,
+        ColumnType::Bytea => BinaryParam::Bytea,
+        ColumnType::Uuid => BinaryParam::Uuid,
+        ColumnType::Time => BinaryParam::Time,
+        ColumnType::TimestampTz => BinaryParam::TimestampTz,
+        ColumnType::Interval => BinaryParam::Interval,
+        ColumnType::Numeric { .. } => BinaryParam::Numeric,
+        ColumnType::Vector(_)
+        | ColumnType::Date
+        | ColumnType::Timestamp
+        | ColumnType::Json
+        | ColumnType::Jsonb
+        | ColumnType::Array(_)
+        | ColumnType::Enum(_) => BinaryParam::Unsupported,
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
     use crate::result_encoder::binary;
+
+    #[test]
+    fn copy_column_table_maps_supported_types_and_rejects_the_rest() {
+        let col = |t: ColumnType| CopyColumnKind::Column(t);
+        assert_eq!(
+            for_copy_column(&CopyColumnKind::PseudoId),
+            BinaryParam::Numeric
+        );
+        assert_eq!(
+            for_copy_column(&col(ColumnType::Text)),
+            BinaryParam::Utf8Identity
+        );
+        assert_eq!(
+            for_copy_column(&col(ColumnType::Varchar(None))),
+            BinaryParam::Utf8Identity
+        );
+        assert_eq!(
+            for_copy_column(&col(ColumnType::Bpchar(3))),
+            BinaryParam::Utf8Identity
+        );
+        assert_eq!(
+            for_copy_column(&col(ColumnType::SmallInt)),
+            BinaryParam::Int2
+        );
+        assert_eq!(
+            for_copy_column(&col(ColumnType::Integer)),
+            BinaryParam::Int4
+        );
+        assert_eq!(for_copy_column(&col(ColumnType::BigInt)), BinaryParam::Int8);
+        assert_eq!(for_copy_column(&col(ColumnType::Real)), BinaryParam::Float4);
+        assert_eq!(
+            for_copy_column(&col(ColumnType::Double)),
+            BinaryParam::Float8
+        );
+        assert_eq!(
+            for_copy_column(&col(ColumnType::Boolean)),
+            BinaryParam::Bool
+        );
+        assert_eq!(for_copy_column(&col(ColumnType::Bytea)), BinaryParam::Bytea);
+        assert_eq!(for_copy_column(&col(ColumnType::Uuid)), BinaryParam::Uuid);
+        assert_eq!(for_copy_column(&col(ColumnType::Time)), BinaryParam::Time);
+        assert_eq!(
+            for_copy_column(&col(ColumnType::TimestampTz)),
+            BinaryParam::TimestampTz
+        );
+        assert_eq!(
+            for_copy_column(&col(ColumnType::Interval)),
+            BinaryParam::Interval
+        );
+        assert_eq!(
+            for_copy_column(&col(ColumnType::Numeric {
+                precision: 10,
+                scale: 2
+            })),
+            BinaryParam::Numeric
+        );
+        for t in [
+            ColumnType::Vector(2),
+            ColumnType::Date,
+            ColumnType::Timestamp,
+            ColumnType::Json,
+            ColumnType::Jsonb,
+        ] {
+            assert_eq!(for_copy_column(&col(t)), BinaryParam::Unsupported);
+        }
+    }
 
     fn dec(kind: BinaryParam, raw: &[u8]) -> String {
         String::from_utf8(decode_to_text(kind, raw).expect("decode")).expect("utf8")

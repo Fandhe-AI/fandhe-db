@@ -77,7 +77,7 @@ fn validation_class_matches_simple_query_begin_copy() {
     let session = SessionState::default();
     for sql in [
         "COPY nosuch (id, embedding) FROM STDIN",
-        "COPY documents (id, embedding, body) FROM STDIN WITH (FORMAT binary)",
+        "COPY documents (id, embedding, body) FROM STDIN WITH (FORMAT binary, DELIMITER ',')",
         "COPY documents (id, id, body) FROM STDIN",
     ] {
         let simple = core

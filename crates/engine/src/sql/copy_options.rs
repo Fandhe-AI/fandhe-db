@@ -10,8 +10,9 @@
 //! HEADER・DELIMITER・NULL・QUOTE・ESCAPE を適用済みのためゲートは無い。`COPY TO` 側は
 //! まだ適用しておらず、適用しないまま受理すると無言の fail-open になるため、format の既定値と
 //! 異なる解決結果は [`reject_unapplied_for_to`] が `0A000` で拒否する。`COPY TO` 側の適用
-//! （Issue #1765）は、その呼び出し 1 行を外すだけでよい。`FORMAT binary` は WIRE-23 の領域のため、従来どおり
-//! `42601` のまま先送りする。
+//! （Issue #1765）は、その呼び出し 1 行を外すだけでよい。`FORMAT binary` は `COPY FROM` のみ
+//! 受理する（WIRE-23・Issue #1769。DELIMITER／NULL／HEADER／QUOTE／ESCAPE との併用は `0A000`）。
+//! `COPY TO` の binary は Issue #1770 が実装するまで従来どおり `42601` のまま先送りする。
 //!
 //! エラー文言にはユーザー入力の値を含めない（`22023`・`0A000` は固定文言。`42601` に含めるのは
 //! 切り詰め済みのオプション名だけで、構文エラーのトークンは載せない）。
@@ -78,7 +79,8 @@ impl CopyOptions {
     /// `format` の既定値だけで構成したオプション。
     fn defaults_for(format: CopyFormat) -> Self {
         match format {
-            CopyFormat::Text => Self {
+            // binary は行形式のオプションを参照しない。ダミーとして text の既定値を置く。
+            CopyFormat::Text | CopyFormat::Binary => Self {
                 header: CopyHeader::False,
                 delimiter: b'\t',
                 null_string: "\\N".to_string(),
@@ -243,7 +245,9 @@ pub(crate) fn resolve(
             match s.to_ascii_lowercase().as_str() {
                 "text" => CopyFormat::Text,
                 "csv" => CopyFormat::Csv,
-                // binary は WIRE-23 の領域。従来どおり 42601 で先送りする。
+                // binary は COPY FROM のみ受理する（WIRE-23・Issue #1769）。COPY TO は
+                // Issue #1770 が実装するまで従来どおり 42601 で先送りする。
+                "binary" if direction == CopyDirection::From => CopyFormat::Binary,
                 "binary" => {
                     return Err(SqlSurfaceError::unsupported(
                         "COPY FORMAT binary is not supported",
@@ -277,6 +281,26 @@ pub(crate) fn resolve(
         let e = enc.to_ascii_uppercase();
         if e != "UTF8" && e != "UTF-8" {
             return Err(not_supported("COPY encoding is not supported"));
+        }
+    }
+
+    // binary は行形式のオプションを持たない（PostgreSQL 17 の ProcessCopyOptions と同様に、
+    // 既定値を入れる前に併用を拒否する。WIRE-23・Issue #1769。エラー文言に値は含めない）。
+    if format == CopyFormat::Binary {
+        if delimiter_s.is_some() {
+            return Err(not_supported("cannot specify DELIMITER in BINARY mode"));
+        }
+        if null_s.is_some() {
+            return Err(not_supported("cannot specify NULL in BINARY mode"));
+        }
+        if header != CopyHeader::False {
+            return Err(not_supported("cannot specify HEADER in BINARY mode"));
+        }
+        if quote_s.is_some() {
+            return Err(not_supported("COPY QUOTE requires CSV mode"));
+        }
+        if escape_s.is_some() {
+            return Err(not_supported("COPY ESCAPE requires CSV mode"));
         }
     }
 
@@ -535,7 +559,33 @@ mod tests {
     fn format_errors() {
         let f = |v| vec![raw("format", id(v))];
         assert_eq!(code(f("json"), CopyDirection::From), "22023");
-        assert_eq!(code(f("binary"), CopyDirection::From), "42601");
+        assert_eq!(code(f("binary"), CopyDirection::To), "42601");
+    }
+
+    #[test]
+    fn binary_is_accepted_for_from_and_rejects_row_format_options() {
+        let (f, _) = ok(vec![raw("format", id("binary"))]);
+        assert_eq!(f, CopyFormat::Binary);
+        let b = || raw("format", id("binary"));
+        for opt in [
+            raw("delimiter", s(",")),
+            raw("null", s("x")),
+            raw("header", None),
+            raw("quote", s("'")),
+            raw("escape", s("\\")),
+        ] {
+            assert_eq!(
+                code(vec![b(), opt.clone()], CopyDirection::From),
+                "0A000",
+                "{opt:?}"
+            );
+        }
+        // HEADER false は指定なしと同じ。ENCODING UTF8 は従来どおり受理する。
+        ok(vec![
+            b(),
+            raw("header", id("false")),
+            raw("encoding", s("UTF8")),
+        ]);
     }
 
     #[test]

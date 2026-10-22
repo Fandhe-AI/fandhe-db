@@ -3,8 +3,9 @@
 //! 役割: PostgreSQL の binary COPY ストリーム（署名・フラグ・ヘッダ拡張・タプル・トレーラ。
 //! 形式は PostgreSQL 公式ドキュメント「COPY — Binary Format」）を、**列の型を知らずに**
 //! フィールド単位のバイト列へ分解する [`BinaryCopyReader`] と、同じ形式を書き出す
-//! `encode_*_into` を提供する。型ごとの変換は #1768、`run_copy_from` への結線は #1769、
-//! `run_copy_to` への結線は #1770 が担う（本モジュールの呼び出し元の予定）。
+//! `encode_*_into` を提供する。型ごとの変換は #1768（暫定の対応表は #1769 の `binary_param::for_copy_column`）、
+//! `run_copy_from` への結線は #1769（[`BinaryCopyReader`] を `copy::run_copy_from` が使う）、
+//! `run_copy_to` への結線は #1770 が担う（`encode_*_into` の呼び出し元の予定）。
 //!
 //! engine の text/csv 用 `RecordSplitter` と違い wire-server に置くのは、binary フィールドを
 //! 型コーデック（`binary_param`・`result_encoder::binary` と同じ層）で変換してから engine の
@@ -14,7 +15,8 @@
 //! で扱い、宣言長を確保量に使わない（fail-closed）。入力全体の量は #1769 が INDEX-4 の
 //! 生 CopyData 累計上限で有界にする（ヘッダ拡張はメモリ O(1) で読み飛ばす）。
 //! エラー文言は固定文字列で、受信値・他テナントの情報を含めない。
-#![cfg_attr(not(test), allow(dead_code))] // 本番の呼び出し元は #1768〜#1770 が結線する。
+
+use engine::error_format::ErrorClass;
 
 /// 署名（11 バイト）。
 const SIGNATURE: &[u8; 11] = b"PGCOPY\n\xff\r\n\0";
@@ -23,7 +25,7 @@ const FLAG_OIDS: u32 = 1 << 16;
 /// flags の critical 領域（bit 17〜31）。
 const FLAGS_CRITICAL_MASK: u32 = 0xFFFE_0000;
 
-/// binary COPY フレーム層のエラー。`sqlstate`／`client_message` で wire への写像を返す。
+/// binary COPY フレーム層のエラー。`error_class`／`client_message` で wire への写像を返す。
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum CopyBinaryError {
     /// 署名・flags・ヘッダ拡張長の不正（22P04）。
@@ -43,16 +45,16 @@ pub(crate) enum CopyBinaryError {
 }
 
 impl CopyBinaryError {
-    /// SQLSTATE（`ErrorClass` への写像は 22P04 の variant 追加を伴うため #1769 で行う）。
-    pub(crate) fn sqlstate(&self) -> &'static str {
+    /// wire へ返す `ErrorClass`（フレーム不正は `22P04`、上限超過は `54000`、内部不整合は `XX000`）。
+    pub(crate) fn error_class(&self) -> ErrorClass {
         match self {
             Self::InvalidHeader
             | Self::FieldCountMismatch
             | Self::InvalidFieldLength
             | Self::UnexpectedEof
-            | Self::DataAfterTrailer => "22P04",
-            Self::LimitExceeded => "54000",
-            Self::EncodeOverflow => "XX000",
+            | Self::DataAfterTrailer => ErrorClass::BadCopyFileFormat,
+            Self::LimitExceeded => ErrorClass::PayloadTooLarge,
+            Self::EncodeOverflow => ErrorClass::InternalError,
         }
     }
 
@@ -341,6 +343,7 @@ impl BinaryCopyReader {
 }
 
 /// ヘッダ（署名 + flags 0 + 拡張長 0 の 19 バイト）を追記する。
+#[allow(dead_code)] // 呼び出し元は COPY TO binary（#1770）が結線する。
 pub(crate) fn encode_header_into(out: &mut Vec<u8>) {
     out.extend_from_slice(SIGNATURE);
     out.extend_from_slice(&0u32.to_be_bytes());
@@ -348,6 +351,7 @@ pub(crate) fn encode_header_into(out: &mut Vec<u8>) {
 }
 
 /// 1 タプルを追記する（`None` は NULL）。失敗時は `out` を呼び出し前の長さへ戻す。
+#[allow(dead_code)] // 呼び出し元は COPY TO binary（#1770）が結線する。
 pub(crate) fn encode_tuple_into(
     fields: &[Option<&[u8]>],
     out: &mut Vec<u8>,
@@ -360,6 +364,7 @@ pub(crate) fn encode_tuple_into(
     result
 }
 
+#[allow(dead_code)]
 fn encode_tuple_inner(fields: &[Option<&[u8]>], out: &mut Vec<u8>) -> Result<(), CopyBinaryError> {
     let count = i16::try_from(fields.len()).map_err(|_| CopyBinaryError::EncodeOverflow)?;
     out.extend_from_slice(&count.to_be_bytes());
@@ -378,6 +383,7 @@ fn encode_tuple_inner(fields: &[Option<&[u8]>], out: &mut Vec<u8>) -> Result<(),
 }
 
 /// トレーラ（`-1` の i16）を追記する。
+#[allow(dead_code)] // 呼び出し元は COPY TO binary（#1770）が結線する。
 pub(crate) fn encode_trailer_into(out: &mut Vec<u8>) {
     out.extend_from_slice(&(-1i16).to_be_bytes());
 }
@@ -487,7 +493,7 @@ mod tests {
             let mut s = stream(&[], true);
             s[i] ^= 0x01;
             let e = run(1, limits(), &[&s]).unwrap_err();
-            assert_eq!(e.sqlstate(), "22P04", "byte {i}");
+            assert_eq!(e.error_class().wire_code(), "22P04", "byte {i}");
         }
     }
 
@@ -501,7 +507,7 @@ mod tests {
             if boundary {
                 assert!(r.is_ok(), "n={n}");
             } else {
-                assert_eq!(r.unwrap_err().sqlstate(), "22P04", "n={n}");
+                assert_eq!(r.unwrap_err().error_class().wire_code(), "22P04", "n={n}");
             }
         }
     }
@@ -527,7 +533,13 @@ mod tests {
         }
         let mut s = header_with(0, 4);
         s.extend_from_slice(&[0, 0]);
-        assert_eq!(run(1, limits(), &[&s]).unwrap_err().sqlstate(), "22P04");
+        assert_eq!(
+            run(1, limits(), &[&s])
+                .unwrap_err()
+                .error_class()
+                .wire_code(),
+            "22P04"
+        );
     }
 
     #[test]
@@ -562,7 +574,7 @@ mod tests {
         s.extend_from_slice(&65i32.to_be_bytes());
         let mut r = BinaryCopyReader::new(1, limits()).unwrap();
         let e = r.feed::<CopyBinaryError>(&s, |_| Ok(())).unwrap_err();
-        assert_eq!(e.sqlstate(), "54000");
+        assert_eq!(e.error_class().wire_code(), "54000");
         assert_eq!(r.body.capacity(), 0);
         let mut s2 = header_with(0, 0);
         s2.extend_from_slice(&1i16.to_be_bytes());
