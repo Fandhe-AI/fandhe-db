@@ -363,11 +363,14 @@ fn single_byte(s: &str) -> Option<u8> {
     }
 }
 
-/// 文字列系オプションの値を取り出す。値が文字列リテラルでなければ `22023`。
+/// 文字列系オプションの値を取り出す。PostgreSQL の `copy_generic_opt_arg` と `defGetString` に
+/// 合わせ、文字列リテラル・引用符なしの識別子・数値を受理する（`*`・列リストは `22023`）。
 fn string_value(opt: Option<&RawCopyOption>) -> Result<Option<&str>, SqlSurfaceError> {
     match opt.and_then(|o| o.value.as_ref()) {
         None => Ok(None),
-        Some(RawCopyValue::String(s)) => Ok(Some(s.as_str())),
+        Some(RawCopyValue::String(s))
+        | Some(RawCopyValue::Ident(s))
+        | Some(RawCopyValue::Number(s)) => Ok(Some(s.as_str())),
         Some(_) => Err(invalid("COPY option value must be a string")),
     }
 }
@@ -512,6 +515,23 @@ mod tests {
             assert_eq!(e.wire_code(), "22023", "{bad}");
             assert!(!e.to_string().contains("secretbool"), "{e}");
         }
+    }
+
+    #[test]
+    fn string_options_accept_identifier_and_number_values() {
+        for v in [id("UTF8"), id("utf8"), s("UTF8")] {
+            ok(vec![raw("encoding", v)]);
+        }
+        let latin = |v| code(vec![raw("encoding", v)], CopyDirection::From);
+        assert_eq!(latin(id("latin1")), "0A000");
+        assert_eq!(latin(Some(RawCopyValue::Star)), "22023");
+        assert_eq!(latin(Some(RawCopyValue::List(vec!["a".into()]))), "22023");
+        let (_, o) = ok(vec![
+            raw("format", id("csv")),
+            raw("delimiter", Some(RawCopyValue::Number("1".into()))),
+            raw("null", id("nil")),
+        ]);
+        assert_eq!((o.delimiter(), o.null_string()), (b'1', "nil"));
     }
 
     #[test]

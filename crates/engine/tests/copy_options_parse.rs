@@ -191,6 +191,12 @@ fn classification_matches_between_simple_and_parse() {
         rejected_code(&core, &format!("{TO} WITH (HEADER MATCH)")),
         "0A000"
     );
+    accepted_in_both(&core, &format!("{FROM} WITH (ENCODING UTF8)"));
+    accepted_in_both(&core, &format!("{TO} WITH (ENCODING utf8)"));
+    assert_eq!(
+        rejected_code(&core, &format!("{FROM} WITH (ENCODING latin1)")),
+        "0A000"
+    );
     accepted_in_both(&core, &format!("{FROM} WITH (ENCODING 'utf8')"));
     accepted_in_both(&core, &format!("{TO} WITH (ENCODING 'UTF-8')"));
 }
