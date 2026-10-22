@@ -9,6 +9,9 @@
 //! `ledger::record_in_txn` が「同一 `operation_id`・同一内容の再送（`23505`）」と
 //! 「同一 `operation_id`・内容不一致の誤用（`22023`）」を区別できるようにする。
 //!
+//! Issue #1752（SQL-53 (5)・RECOVER-11）: サブクエリつき述語形 UPDATE／DELETE は内側トークン列
+//! （構文形）だけを材料にし、内側の評価結果は材料にしない（`push_dml_where_predicate`）。
+//!
 //! 依存追加なし: 本タスクは自動運転で実行されユーザー承認を得られないため、
 //! 依存追加（`.claude/rules/dependency-policy.md`）を避ける安全側の判断として
 //! SHA-256 をこのモジュール内で安全 Rust により自作実装する（`unsafe` 不使用）。
@@ -2192,6 +2195,10 @@ fn push_dml_where_predicates(
 /// 畳んでいる〔正規化済み〕ため、`NOT NOT x` と `x` は同じハッシュになる。意図した
 /// 正規化）。タグ 1〜7 の直列化形式は本 Issue 以前と一切変えない（`AND` だけの
 /// 既存述語列の content hash は不変。回帰テストで固定する）。
+///
+/// サブクエリ葉（タグ 13 `InSubquery`・14 `Exists`・15 `ScalarSubqueryCompare`。Issue #1752）
+/// は**解決前**の述語を渡す契約で、内側を解決して `InList`／`IdCompare` へ書き換えた述語列は
+/// 決して渡さない（渡すと内側の結果が材料になり、再送が `22023` に化ける）。
 fn push_dml_where_predicate(
     b: &mut HashInputBuilder,
     pred: &crate::sql::allowlist::WherePredicate,
@@ -2308,16 +2315,46 @@ fn push_dml_where_predicate(
             b.push_u8(12);
             push_dml_where_predicate(b, inner, udf_registry, referenced)?;
         }
-        // Issue #927・SQL-29 (a)・TASK-213: サブクエリは述語形 `UPDATE`/`DELETE`
-        // の WHERE を構文段が受理する（Issue #1750・SQL-53）が、束縛段
-        // （`bind_where_predicates`）が先に `42601` で拒否するため、DML の content
-        // hash 対象へ到達しない（fail-closed の防御的経路。ハッシュ化は #1752）。
-        WherePredicate::InSubquery { .. }
-        | WherePredicate::Exists { .. }
-        | WherePredicate::ScalarSubqueryCompare { .. } => {
-            return Err(crate::sql::allowlist::SqlSurfaceError::Internal {
-                detail: "unresolved subquery reached DML content hash".to_string(),
+        // Issue #1752・SQL-53 (5)・RECOVER-11: サブクエリつき述語形 DML の内容照合は
+        // 「送られた文の構文形」だけで行う。内側 SELECT のトークン列をそのまま材料にし、
+        // 内側の評価結果（`InList`／`IdCompare` 等へ書き換えた後の形）は材料にしない
+        // （呼び出し元は解決前の述語を渡す契約。`for_update_where` の doc 参照）。
+        // 識別子の大小・数値表記の正準化はしない（差があれば `22023` 側へ倒す）。
+        // `depth` は文から導出できるため材料に入れない。
+        WherePredicate::InSubquery {
+            column,
+            inner_tokens,
+            ..
+        } => {
+            b.push_u8(13);
+            b.push_bytes(column.as_bytes())
+                .map_err(|_| dml_hash_field_too_large())?;
+            push_dml_subquery_tokens(b, inner_tokens)?;
+        }
+        WherePredicate::Exists { inner_tokens, .. } => {
+            b.push_u8(14);
+            push_dml_subquery_tokens(b, inner_tokens)?;
+        }
+        WherePredicate::ScalarSubqueryCompare {
+            column,
+            op,
+            inner_tokens,
+            ..
+        } => {
+            use crate::sql::allowlist::ScalarSubqueryOp;
+            b.push_u8(15);
+            b.push_bytes(column.as_bytes())
+                .map_err(|_| dml_hash_field_too_large())?;
+            // 宣言順に依存しないよう判別子は明示 match で固定する。
+            b.push_u8(match op {
+                ScalarSubqueryOp::Eq => 0,
+                ScalarSubqueryOp::Ne => 1,
+                ScalarSubqueryOp::Lt => 2,
+                ScalarSubqueryOp::Le => 3,
+                ScalarSubqueryOp::Gt => 4,
+                ScalarSubqueryOp::Ge => 5,
             });
+            push_dml_subquery_tokens(b, inner_tokens)?;
         }
         // `IdCompare` は `sql::subquery` が解決段で生成する内部専用の葉で、構文解析
         // からは作られない（述語形 DML の content hash 対象へ到達しない防御的経路）。
@@ -2326,6 +2363,30 @@ fn push_dml_where_predicate(
                 detail: "internal id comparison reached DML content hash".to_string(),
             });
         }
+    }
+    Ok(())
+}
+
+/// サブクエリ内側のトークン列を「件数（u32 LE）→ 各トークン」で直列化する（Issue #1752・
+/// SQL-53 (5)）。件数プレフィクスと `push_token` の長さ付き payload により連結の曖昧さを
+/// 作らない。未束縛の `Token::Param` が残っていれば fail-closed（`$n` は構文解析前に実値へ
+/// 置換済みのため通常は到達しない）。`push_dml_where_predicate` だけが呼ぶ。
+fn push_dml_subquery_tokens(
+    b: &mut HashInputBuilder,
+    tokens: &[crate::sql::lexer::Token],
+) -> Result<(), crate::sql::allowlist::SqlSurfaceError> {
+    if tokens
+        .iter()
+        .any(|t| matches!(t, crate::sql::lexer::Token::Param(_)))
+    {
+        return Err(crate::sql::allowlist::SqlSurfaceError::Internal {
+            detail: "unbound parameter reached DML content hash".to_string(),
+        });
+    }
+    let count = u32::try_from(tokens.len()).map_err(|_| dml_hash_field_too_large())?;
+    b.push_raw(&count.to_le_bytes());
+    for t in tokens {
+        push_token(b, t).map_err(|_| dml_hash_field_too_large())?;
     }
     Ok(())
 }
@@ -7121,5 +7182,192 @@ mod tests {
             for_insert_select(&toks).unwrap(),
             for_typed_insert_batch(&[]).unwrap()
         );
+    }
+
+    // ---- Issue #1752: サブクエリつき述語形 DML の内容照合（SQL-53 (5)・RECOVER-11） ----
+
+    fn sq_toks(sql: &str) -> Vec<crate::sql::lexer::Token> {
+        crate::sql::lexer::tokenize(sql).expect("tokenize")
+    }
+
+    fn in_sq(column: &str, inner: &str) -> crate::sql::allowlist::WherePredicate {
+        crate::sql::allowlist::WherePredicate::InSubquery {
+            column: column.to_string(),
+            inner_tokens: sq_toks(inner),
+            depth: 1,
+        }
+    }
+
+    fn exists_sq(inner: &str) -> crate::sql::allowlist::WherePredicate {
+        crate::sql::allowlist::WherePredicate::Exists {
+            inner_tokens: sq_toks(inner),
+            depth: 1,
+        }
+    }
+
+    fn scalar_sq(
+        column: &str,
+        op: crate::sql::allowlist::ScalarSubqueryOp,
+        inner: &str,
+    ) -> crate::sql::allowlist::WherePredicate {
+        crate::sql::allowlist::WherePredicate::ScalarSubqueryCompare {
+            column: column.to_string(),
+            op,
+            inner_tokens: sq_toks(inner),
+            depth: 1,
+        }
+    }
+
+    fn del_hash(preds: &[crate::sql::allowlist::WherePredicate]) -> ContentHash {
+        for_delete_where("t", preds, &crate::sql::udf_call::UdfRegistry::default())
+            .expect("subquery predicate must be hashable")
+    }
+
+    /// 同じ述語は決定的に同じハッシュになる。
+    #[test]
+    fn subquery_where_hash_is_deterministic() {
+        let p = [in_sq("id", "SELECT id FROM s WHERE k = 'a' LIMIT 3")];
+        assert_eq!(del_hash(&p), del_hash(&p));
+    }
+
+    /// 述語の形・演算子・外側の列・内側トークンのどれが違っても別ハッシュになる。
+    #[test]
+    fn subquery_where_hash_distinguishes_syntactic_forms() {
+        use crate::sql::allowlist::{ScalarSubqueryOp as Op, WherePredicate};
+        let inner = "SELECT id FROM s WHERE k = 'a'";
+        let base = del_hash(&[in_sq("id", inner)]);
+        let others = vec![
+            del_hash(&[exists_sq(inner)]),
+            del_hash(&[scalar_sq("id", Op::Eq, inner)]),
+            del_hash(&[in_sq("other", inner)]),
+            del_hash(&[in_sq("id", "SELECT id FROM s WHERE k = 'b'")]),
+            del_hash(&[in_sq("id", "SELECT id FROM u WHERE k = 'a'")]),
+            del_hash(&[in_sq("id", "SELECT id FROM s WHERE k = 'a' LIMIT 1")]),
+            del_hash(&[WherePredicate::Not(Box::new(in_sq("id", inner)))]),
+            del_hash(&[WherePredicate::Or(vec![vec![in_sq("id", inner)]])]),
+        ];
+        for h in &others {
+            assert_ne!(&base, h);
+        }
+        assert_ne!(
+            del_hash(&[exists_sq(inner)]),
+            del_hash(&[WherePredicate::Not(Box::new(exists_sq(inner)))])
+        );
+        let ops = [Op::Eq, Op::Ne, Op::Lt, Op::Le, Op::Gt, Op::Ge];
+        for (i, a) in ops.iter().enumerate() {
+            for b in &ops[i + 1..] {
+                assert_ne!(
+                    del_hash(&[scalar_sq("n", *a, inner)]),
+                    del_hash(&[scalar_sq("n", *b, inner)])
+                );
+            }
+        }
+    }
+
+    /// 内側の評価結果（解決済み `InList`）はサブクエリ形と別ハッシュで、結果の値を変えても
+    /// サブクエリ形のハッシュは構文形だけで決まる。
+    #[test]
+    fn subquery_where_hash_ignores_resolved_results() {
+        let p = [in_sq("id", "SELECT id FROM s")];
+        let resolved = |vals: &[&str]| {
+            del_hash(&[crate::sql::allowlist::WherePredicate::InList {
+                column: "id".to_string(),
+                values: vals.iter().map(|v| v.to_string()).collect(),
+            }])
+        };
+        assert_ne!(del_hash(&p), resolved(&["1", "2"]));
+        assert_ne!(resolved(&["1"]), resolved(&["1", "2"]));
+        assert_eq!(del_hash(&p), del_hash(&[in_sq("id", "SELECT id FROM s")]));
+    }
+
+    /// golden: タグ 13／14／15 のバイト列レイアウトを固定する（期待値は同じ builder へ
+    /// 手でバイト列を流し込んで作り、ダイジェストで比較する）。
+    #[test]
+    fn subquery_where_hash_golden_layout() {
+        use crate::sql::allowlist::ScalarSubqueryOp as Op;
+        let toks = sq_toks("SELECT 1");
+        let count = (toks.len() as u32).to_le_bytes();
+        let expected = |head: &dyn Fn(&mut HashInputBuilder)| {
+            let mut b = HashInputBuilder::new(OpTag::DeleteWhere);
+            b.push_bytes(b"t").unwrap();
+            b.push_raw(&1u32.to_le_bytes());
+            head(&mut b);
+            b.push_raw(&count);
+            for t in &toks {
+                push_token(&mut b, t).unwrap();
+            }
+            b.finish()
+        };
+        assert_eq!(
+            del_hash(&[exists_sq("SELECT 1")]),
+            expected(&|b| b.push_u8(14))
+        );
+        assert_eq!(
+            del_hash(&[in_sq("c", "SELECT 1")]),
+            expected(&|b| {
+                b.push_u8(13);
+                b.push_bytes(b"c").unwrap();
+            })
+        );
+        assert_eq!(
+            del_hash(&[scalar_sq("c", Op::Gt, "SELECT 1")]),
+            expected(&|b| {
+                b.push_u8(15);
+                b.push_bytes(b"c").unwrap();
+                b.push_u8(4);
+            })
+        );
+    }
+
+    /// 未束縛 `$n` と解決済みの内部の葉（`IdCompare`）は fail-closed。
+    #[test]
+    fn subquery_where_hash_fails_closed_on_internal_forms() {
+        use crate::sql::allowlist::{SqlSurfaceError, WherePredicate};
+        let registry = crate::sql::udf_call::UdfRegistry::default();
+        let with_param = WherePredicate::InSubquery {
+            column: "id".to_string(),
+            inner_tokens: vec![crate::sql::lexer::Token::Param(1)],
+            depth: 1,
+        };
+        assert!(matches!(
+            for_delete_where("t", &[with_param], &registry),
+            Err(SqlSurfaceError::Internal { .. })
+        ));
+        let id_cmp = WherePredicate::IdCompare {
+            op: crate::sql::udf_call::BinOp::Eq,
+            value: 1,
+        };
+        assert!(matches!(
+            for_delete_where("t", &[id_cmp], &registry),
+            Err(SqlSurfaceError::Internal { .. })
+        ));
+    }
+
+    /// 台帳レベルの再送冪等: 同じ文の再送は `Duplicate`（`23505`）、内側が違う文は
+    /// `ContentMismatch`（`22023`）。内側の結果には依存しない（ハッシュは構文形のみ）。
+    #[test]
+    fn subquery_where_resend_is_duplicate_and_changed_inner_is_mismatch() {
+        use crate::recovery::ledger::{record_in_txn, LedgerRecordError, LedgerWrite};
+        use crate::recovery::required_op_id::OperationId;
+        use crate::test_util::temp_db::{unique_db_path, CleanupGuard};
+
+        let path = unique_db_path("ch-1752");
+        let _guard = CleanupGuard(path.clone());
+        let db = redb::Database::create(&path).expect("create db");
+        let op = OperationId::parse("op-1752").expect("op id");
+        let txn = db.begin_write().expect("begin write");
+
+        let sent = del_hash(&[in_sq("id", "SELECT id FROM s LIMIT 2")]);
+        record_in_txn(&txn, "tenant-a", "t", LedgerWrite::Record(&op), &sent).expect("first");
+        let resend = del_hash(&[in_sq("id", "SELECT id FROM s LIMIT 2")]);
+        assert!(matches!(
+            record_in_txn(&txn, "tenant-a", "t", LedgerWrite::Record(&op), &resend),
+            Err(LedgerRecordError::Duplicate)
+        ));
+        let changed = del_hash(&[in_sq("id", "SELECT id FROM s LIMIT 3")]);
+        assert!(matches!(
+            record_in_txn(&txn, "tenant-a", "t", LedgerWrite::Record(&op), &changed),
+            Err(LedgerRecordError::ContentMismatch)
+        ));
     }
 }
