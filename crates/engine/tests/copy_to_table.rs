@@ -257,3 +257,31 @@ fn temp_table_supports_table_form_and_cap() {
         .expect_err("over cap (txn)");
     assert_eq!(err.wire_code(), "54000");
 }
+
+/// 引用符付きで字句段が `QuotedNull`／`QuotedBoolWord` として返す名前（`"null"`・`"true"`）の
+/// 表でも、テーブル形 `COPY ... TO STDOUT` が FROM パーサへ落ちず受理される（回帰・Issue #1771）。
+#[test]
+fn quoted_null_and_bool_word_table_names_are_accepted() {
+    let (core, _g) = open_engine("copy-to-table-quoted", None);
+    let caller = ctx("acme");
+    let mut session = SessionState::default();
+    session.allow_ddl();
+    for name in ["null", "true"] {
+        core.execute_sql_in_session(
+            &caller,
+            &mut session,
+            &format!("CREATE TEMP TABLE \"{name}\" (id BIGINT PRIMARY KEY, v TEXT)"),
+        )
+        .unwrap_or_else(|e| panic!("create {name}: {e}"));
+        for sql in [
+            format!("COPY \"{name}\" TO STDOUT"),
+            format!("COPY \"{name}\" (v, id) TO STDOUT"),
+        ] {
+            match core.begin_copy(&caller, &session, &sql) {
+                Ok(CopyPlan::To(..)) => {}
+                Ok(CopyPlan::From(_)) => panic!("{sql}: expected TO"),
+                Err(e) => panic!("{sql}: {} {e}", e.wire_code()),
+            }
+        }
+    }
+}

@@ -20493,7 +20493,9 @@ fn parse_copy_to_tail(
 /// `FROM STDIN` 形（列リスト必須）には影響しない。
 fn is_copy_table_to_form(rest: &[Token]) -> bool {
     let after_name = match rest.split_first() {
-        Some((Token::Ident(_), tail)) => tail,
+        // 引用符付き `"null"` 等は字句段が QuotedNull／QuotedBoolWord で返す。
+        // `Parser::new` が識別子へ降格するため、判定側も識別子として受理する。
+        Some((Token::Ident(_) | Token::QuotedNull(_) | Token::QuotedBoolWord(_), tail)) => tail,
         _ => return false,
     };
     let after_cols = if matches!(after_name.first(), Some(Token::Punct('('))) {
