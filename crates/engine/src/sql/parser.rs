@@ -5016,6 +5016,30 @@ pub(crate) fn insert_omits_pseudo_id(stmt: &ValidatedInsert, schema: &TableSchem
         && !is_file_form_shape(stmt, schema)
 }
 
+/// 列リスト省略の `INSERT` を、表の宣言順の先頭 `width` 列へ展開する共有ヘルパー
+/// （SQL-50・Issue #1730 の `VALUES` 形と、SQL-51・Issue #2613 の `INSERT ... SELECT` が共有する）。
+/// 疑似 `id`（`lookup_star_columns_of`）が先頭。展開結果に `id` が 2 回現れる表は曖昧なまま選ばず
+/// `0A000`、`width` が列数を超えると `42601`。少ない場合は先頭から当て、残りは呼び出し側の
+/// `DEFAULT` 補完へ回る（PostgreSQL と同じ）。
+pub(crate) fn expand_omitted_insert_columns(
+    schema: &TableSchema,
+    width: usize,
+) -> Result<Vec<String>, SqlSurfaceError> {
+    let star = crate::catalog::lookup_star_columns_of(schema);
+    if star.iter().filter(|c| c.as_str() == "id").count() > 1 {
+        return Err(SqlSurfaceError::feature_not_supported(
+            "INSERT without a column list is not supported for a table with an id column \
+             besides the id pseudo-column",
+        ));
+    }
+    if width > star.len() {
+        return Err(SqlSurfaceError::unsupported(
+            "INSERT has more expressions than target columns",
+        ));
+    }
+    Ok(star.into_iter().take(width).collect())
+}
+
 /// 列リスト省略の `INSERT INTO t VALUES (...)`（[`ValidatedInsert::columns_omitted`]。SQL-50・
 /// Issue #1730）を、表の宣言順の明示列リストへ展開する。`bind_insert_form`・`bind_insert_impl` の
 /// 入口で呼び、以降の束縛は明示列リストの文と同じ経路になる（内容照合ハッシュも列名で材料化されるため
@@ -5033,26 +5057,15 @@ fn resolve_omitted_column_list<'a>(
     if !stmt.columns_omitted {
         return Ok(std::borrow::Cow::Borrowed(stmt));
     }
-    let star = crate::catalog::lookup_star_columns_of(schema);
-    if star.iter().filter(|c| c.as_str() == "id").count() > 1 {
-        return Err(SqlSurfaceError::feature_not_supported(
-            "INSERT without a column list is not supported for a table with an id column \
-             besides the id pseudo-column",
-        ));
-    }
     let width = stmt.rows.first().map_or(0, Vec::len);
     if stmt.rows.iter().any(|row| row.len() != width) {
         return Err(SqlSurfaceError::unsupported(
             "VALUES lists must all be the same length",
         ));
     }
-    if width > star.len() {
-        return Err(SqlSurfaceError::unsupported(
-            "INSERT has more expressions than target columns",
-        ));
-    }
+    let columns = expand_omitted_insert_columns(schema, width)?;
     let mut expanded = stmt.clone();
-    expanded.columns = star.into_iter().take(width).collect();
+    expanded.columns = columns;
     expanded.columns_omitted = false;
     Ok(std::borrow::Cow::Owned(expanded))
 }

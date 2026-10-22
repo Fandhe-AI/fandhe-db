@@ -403,6 +403,7 @@ impl EngineCore {
             rows,
             stmt.operation_id(),
             clock,
+            &crate::sql::insert_select::ConversionPlan::direct_only(),
         )?;
         // 1 行でもバイト量・チャンク総量の上限（INDEX-4）を必ず通す（委譲先の書き込み段はこの検査を補わない）。
         self.validate_insert_row_batch_limits(&bounds)?;
