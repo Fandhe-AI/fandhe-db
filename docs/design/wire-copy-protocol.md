@@ -247,3 +247,23 @@
   トランザクション中は Failed へ遷移）。#1760 は `ValidatedCopy::sql()` を `begin_copy`／
   `begin_copy_in_txn` へ渡す形でこの腕を置き換える。wire-server の `is_write_statement`
   判定（`extended_query.rs`）は `_` の腕で Copy を書き込み扱いにする点も #1760 で見直す。
+
+## Issue #1767: binary 形式のフレーム層（親 #1766・WIRE-23 (1)(2) ポインタ）
+
+`crates/wire-server/src/copy_binary.rs` に、列の型を知らない binary COPY のフレームコーデックを新設した
+（形式は PostgreSQL 公式ドキュメント「COPY — Binary Format」）。本番の呼び出し元はまだ無く、結線は
+兄弟 Issue が担う（モジュールは `dead_code` を許可）。
+
+- 責務分割: parser（`BinaryCopyReader`）はヘッダ・タプル・トレーラをフィールド単位のバイト列へ分解するだけで、
+  型変換は #1768、`CopyInSession` への結線と INDEX-4 上限との接続は #1769、`COPY TO STDOUT` は #1770。
+  writer はヘッダ・タプル・トレーラを別関数にし、PostgreSQL と同じく別 CopyData で送れるようにした。
+- 状態機械: バイト単位で署名・flags・拡張長・タプルのフィールド数・フィールド長・本文を進め、
+  CopyData の分割位置に依存しない。一度エラーになると以降の入力はすべて拒否する。
+- 検証: 署名の完全一致、OID flag と critical flag の拒否、負のヘッダ拡張長の拒否（`22P04`）。
+  フィールド数不一致・`-1` 未満の長さ・トレーラ後のデータ・途中終端も `22P04`。フィールド長と
+  タプル合計の上限超過は確保前に `54000`。宣言長を確保量に使わず、ヘッダ拡張はカウンタで読み飛ばす。
+- 終端: トレーラ済み、またはタプル境界での終端は成功。フィールド数の 1 バイト端数だけで終わる入力は
+  PostgreSQL では EOF 扱いになりうるが、本実装は fail-closed で `22P04` とする（既知の相違）。
+  0 タプルは parser では成功とし、空バッチの扱いは #1769 で engine の契約に接続する。
+- 対象外・申し送り: `22P04` の `ErrorClass` variant と HTTP／nosql-api.md／err4 テストへの射影、
+  `CopyFormat::Binary` の許可、`CopyResponse` の format 化は #1769／#1770。binary は引き続き `42601` で拒否する。
