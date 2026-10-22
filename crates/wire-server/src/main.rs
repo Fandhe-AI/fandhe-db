@@ -286,6 +286,14 @@
 //! 台帳に記録しない通常の書き込み。分割実行 DML のみ常に必須。
 //! `docs/design/operation-id-optional.md` 参照）。
 //!
+//! `--require-where-for-dml`（Issue #2210・SQL-36 ポインタ）: 値を取らないスイッチ。
+//! 指定すると `WHERE` 省略の SQL `UPDATE`／`DELETE` を変更開始前に `42601` で拒否する
+//! （明示した述語は受理。MySQL の `sql_safe_updates` 相当）。重複指定・`=` 連結形・後続の値は
+//! fail-closed で起動エラー。解決は `wire_server::require_where_for_dml_opt::resolve` に
+//! 一本化し、`EngineCore::with_require_where_for_dml` へ 1 回だけ注入する（セッション・SQL・
+//! HTTP からは変更できない）。NoSQL 表層は対象外。未指定時は `WHERE` 省略を受理する
+//! （`docs/design/require-where-for-dml-cli.md` 参照）。
+//!
 //! `--tls-cert`／`--tls-key`／`--tls-mode`（Issue #967・親 #941・TASK-228。
 //! WIRE-7, WIRE-9 ポインタ）: TLS opt-in の唯一の入口。`--tls-cert`（証明書
 //! チェーン PEM）・`--tls-key`（Ed25519 PKCS#8 秘密鍵 PEM）は両方揃って
@@ -420,6 +428,7 @@ fn run_server(args: &[String]) -> ExitCode {
     let mut durability_raw: Option<String> = None;
     let mut hnsw_scope_raw: Option<String> = None;
     let mut require_operation_id = false;
+    let mut require_where_for_dml = false;
     let mut max_dml_affected_rows_raw: Option<String> = None;
     let mut max_insert_rows_raw: Option<String> = None;
     let mut batch_max_files_raw: Option<String> = None;
@@ -652,6 +661,19 @@ fn run_server(args: &[String]) -> ExitCode {
                     return ExitCode::FAILURE;
                 }
                 require_operation_id = true;
+                i += 1;
+            }
+            wire_server::require_where_for_dml_opt::FLAG => {
+                // Issue #2210: 値なしスイッチ。起動後に変更できない構成値のため、
+                // 2 回目以降の指定を fail-closed に拒否する。
+                if require_where_for_dml {
+                    engine::log_stderr!(
+                        "wire-server: {} specified more than once",
+                        wire_server::require_where_for_dml_opt::FLAG
+                    );
+                    return ExitCode::FAILURE;
+                }
+                require_where_for_dml = true;
                 i += 1;
             }
             wire_server::hnsw_scope_opt::FLAG => {
@@ -2253,6 +2275,11 @@ fn run_server(args: &[String]) -> ExitCode {
     core = core.with_ledger_mode(wire_server::require_operation_id_opt::resolve(
         require_operation_id,
     ));
+    // Issue #2210: 未指定でも常に呼ぶ（未指定は既定の `false` で、呼ばない構築とビット同一）。
+    // SQL 表層の `WHERE` 省略 DML だけが対象で、NoSQL 表層の filter 必須契約は不変。
+    core = core.with_require_where_for_dml(wire_server::require_where_for_dml_opt::resolve(
+        require_where_for_dml,
+    ));
     let core = Arc::new(core);
 
     // `guarded.bind()` は検証済みの数値アドレスへ直接 bind し、`bind_addr`
@@ -2284,6 +2311,14 @@ fn run_server(args: &[String]) -> ExitCode {
         engine::log_stderr!(
             "wire-server: {}",
             wire_server::require_operation_id_opt::STARTUP_NOTICE
+        );
+    }
+
+    // Issue #2210: フラグ指定時に限り 1 行出す（未指定時は何も出さず stderr をビット同一に保つ）。
+    if require_where_for_dml {
+        engine::log_stderr!(
+            "wire-server: {}",
+            wire_server::require_where_for_dml_opt::STARTUP_NOTICE
         );
     }
 
