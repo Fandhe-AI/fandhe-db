@@ -435,11 +435,21 @@ fn mismatched_values_fail_closed_and_the_connection_survives() {
         assert_alive(&mut s);
     }
 
-    // 非等価は #2429（SQL-78）の範囲。現状は Parse で 42601（fail-closed）。
+    // 非等価は #2431（SQL-78）で受理済み。Parse は成功し（Execute しないので表は不変）、
+    // 範囲外の形（逆向き）は引き続き Parse で 42601（fail-closed）。
     send_length_prefixed_message(
         &mut s,
         b'P',
         &parse_body("", "DELETE FROM t WHERE n <> $1", 0),
+    );
+    expect_kind(&mut s, b'1');
+    send_length_prefixed_message(&mut s, b'S', b"");
+    expect_kind(&mut s, b'Z');
+    assert_alive(&mut s);
+    send_length_prefixed_message(
+        &mut s,
+        b'P',
+        &parse_body("", "DELETE FROM t WHERE $1 <> n", 0),
     );
     let text = String::from_utf8_lossy(&expect_kind(&mut s, b'E')).to_string();
     assert!(text.contains("42601"), "{text}");

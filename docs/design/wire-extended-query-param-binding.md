@@ -170,8 +170,11 @@ node pg（`values` 付き `query`）・psql `\bind`・JDBC 等、パラメータ
    表の宣言順の列）。詳細は下記「ON CONFLICT 加算式の `$n`（パターン 8）」
 
 9. `SELECT ... WHERE <列> (< | > | <= | >= | <>) $n`・`WHERE <列> [NOT] BETWEEN $a AND $b`
-   （Issue #2430・SQL-78・SQL-24・WIRE-12 のポインタ）。先頭語が `SELECT` で集合演算を持たない文の
-   `WHERE` 節内に限る。`$n` の型は比較相手の列の型（疑似列 `id` は `id` の型）で、表・列を引けなければ
+   （Issue #2430・#2431・SQL-78・SQL-24・WIRE-12 のポインタ）。先頭語が `SELECT`／`UPDATE`／`DELETE`
+   で集合演算を持たない文〔`INSERT ... ON CONFLICT DO UPDATE ... WHERE` は対象外〕の
+   `WHERE` 節内に限る（述語形 `UPDATE`／`DELETE` は Issue #2431。Describe は `WHERE` を束縛しないため
+   ダミーフラグは関係せず、台帳の内容照合〔RECOVER-11〕は `$n` に値を代入した後の文で行うため、
+   同じ値のリテラル形と同じハッシュになる）。`$n` の型は比較相手の列の型（疑似列 `id` は `id` の型）で、表・列を引けなければ
    `text`（存在を応答コードで観測させない）。`$n op $m`（両辺とも `$n`）は型を決められず、同じ番号の
    別の出現で決まればその型、無ければ宣言型、それも無ければ Parse で `42P18`（構文エラー `42601` が先）。
    判定は `sql::params::noneq_leaf_at` の 1 関数に集約し、受理・型の分類・Describe 用ダミーフラグの
@@ -181,7 +184,7 @@ node pg（`values` 付き `query`）・psql `\bind`・JDBC 等、パラメータ
    - **範囲外（`42601` のまま）**: 逆向き `$n op <列>`（置換後が式述語へ回り、Describe のダミー値を
      省略する仕組みを通らない）、片側だけが `$n` の `BETWEEN`（1 葉 1 フラグのため実リテラル側の
      Describe 検証が省略される）、左辺が `$n` の `BETWEEN`、相手がリテラル・関数・式の比較、
-     `UPDATE`／`DELETE`（Issue #2431）、集合演算（枝ごとにフラグの序数が 0 から始まる既存の制約）、
+     集合演算（枝ごとにフラグの序数が 0 から始まる既存の制約）、
      `LIKE`・`IN` リスト
    - **序数の不変条件**: トークン走査で宣言的な葉（`Ident op (文字列リテラル|String 種別の $n)` の
      `Equality`／`Not(Equality)`／`Compare`、文字列の `Between`）を 1 つ見つけるごとにフラグを 1 つ積み、
@@ -472,7 +475,7 @@ Bind 値 `None`（SQL NULL）は、`sql::params` が裸の `Token::Ident("NULL")
   推論になることを確認した。
 - NULL パラメータ値は #2439 で解消済み（上記節）。リテラル `<列> = NULL` 自体が未対応の
   位置（`42703`）は SQL-41 系の別課題。
-- 追加のプレースホルダ位置（`LIMIT $n`・非等価 WHERE 比較〔SELECT は Issue #2430 で受理済み。UPDATE／DELETE は #2431〕・`ON CONFLICT ... SET`（加算形 `n = n + $1` は Issue #2427 で受理済み）・
+- 追加のプレースホルダ位置（`LIMIT $n`・非等価 WHERE 比較〔SELECT は Issue #2430、UPDATE／DELETE は #2431 で受理済み〕・`ON CONFLICT ... SET`（加算形 `n = n + $1` は Issue #2427 で受理済み）・
   hybrid 関数引数・`LIKE $n`。`UPDATE ... SET col = $n` は Issue #1544 で受理済み）。
 - 層 B（psycopg 3／node pg／psql 実クライアントでの `make e2e-three-client`
   相当）→ **Issue #1176 で実施済み**（`crates/wire-server/tests/

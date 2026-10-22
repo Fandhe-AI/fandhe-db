@@ -5647,7 +5647,7 @@ impl EngineCore {
     /// [`crate::sql::allowlist::SqlSurfaceError::IndeterminateDatatype`]（`42P18`）。
     /// 判定は構文の形だけで決まり、表・列の存在には依存しない（存在オラクルを作らない）。
     ///
-    /// Issue #2430・SQL-78: `SELECT` の `WHERE` の非等価比較・`BETWEEN` の `$n` は比較相手の列の型
+    /// Issue #2430・#2431・SQL-78: `SELECT`／`UPDATE`／`DELETE` の `WHERE` の非等価比較・`BETWEEN` の `$n` は比較相手の列の型
     /// （引けなければ `Text`）。`$n op $m`（両辺とも `$n`）は推論不能の出現として扱う。
     fn infer_param_types(
         &self,
@@ -5768,7 +5768,7 @@ impl EngineCore {
         {
             let mut resolved: Vec<PreparedParamType> = Vec::new();
             let param_no = u16::try_from(idx.saturating_add(1)).unwrap_or(u16::MAX);
-            // Issue #2430・SQL-78: `SELECT` の `WHERE` の `$n op $m` の出現（型を決められない）。
+            // Issue #2430・#2431・SQL-78: `SELECT`／`UPDATE`／`DELETE` の `WHERE` の `$n op $m` の出現（型を決められない）。
             let mut where_indeterminate = false;
             for pos in &positions {
                 // 列が引けた位置だけ変換可否判定の対象にする（引けない位置は従来どおり
