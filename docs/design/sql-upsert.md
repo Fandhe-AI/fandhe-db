@@ -406,3 +406,10 @@ Issue #1736 の対象省略形）。
 - 代入の value kind `2`（加算）を追加した。演算子タグ `+`、オペランド種別（`0` = EXCLUDED 列名、`1` = リテラル値）を
   含める。kind `0`／`1` のバイト列は不変。評価結果の値は含めない（RECOVER-11）。
 - 同一 `operation_id`・同一文の再送は二重加算されず、リテラルや形が違えば内容不一致（`22023`）になる。
+
+## Issue #2614 追記 INSERT ... SELECT 由来の UPSERT
+
+- `INSERT ... SELECT ... ON CONFLICT` は内側 SELECT の結果行を `build_upsert_from_select_rows` で `BoundUpsert` にして、
+  VALUES 形と同じ `execute_upsert_in` へ流す（SQL-51・SQL-49 ポインタ。詳細は [insert-select.md](insert-select.md)）。
+- 文内で衝突キーが 2 回現れた場合の扱いは INSERT ... SELECT 経路だけ PostgreSQL 17 と同じ（`DO UPDATE` は `21000`、
+  `DO NOTHING` は先勝ち）。VALUES 形は #1738 まで従来どおり `22000`。

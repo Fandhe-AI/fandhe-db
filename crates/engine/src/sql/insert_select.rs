@@ -547,6 +547,7 @@ mod bind_tests {
                 table_name: "t".to_string(),
                 columns: columns.iter().map(|c| c.to_string()).collect(),
                 query_tokens: Vec::new(),
+                on_conflict: None,
                 returning: None,
                 operation_id: None,
             },

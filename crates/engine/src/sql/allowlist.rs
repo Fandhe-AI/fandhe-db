@@ -577,6 +577,11 @@ pub enum SqlSurfaceError {
     /// fail-closed で先頭行は採用しない。行数は自テナントの可視行だけで決まり、
     /// 固定文言のため行の値・他テナントの情報は含まない。
     CardinalityViolation,
+    /// `INSERT ... SELECT ... ON CONFLICT DO UPDATE` の同一文内で衝突キーが 2 回現れた
+    /// （`21000`。SQL-49 (4)・SQL-51。Issue #2614）。PostgreSQL の
+    /// `ON CONFLICT DO UPDATE command cannot affect row a second time` と同じ分類で、文全体を
+    /// 拒否する。固定文言のため衝突キーの値・行の内容・他テナントの情報は含まない。
+    UpsertCardinalityViolation,
     /// untrusted 入力のサイズがアロケーション前の上限を超過した（ベクトルリテラル
     /// 64 KiB 超過、候補集合の容量上限超過等。ERR-2: `54000`）。
     PayloadTooLarge { detail: String },
@@ -1153,6 +1158,12 @@ impl SqlSurfaceError {
         SqlSurfaceError::CardinalityViolation
     }
 
+    /// `pub(crate)`: `sql::parser::build_upsert_from_select_rows` が `INSERT ... SELECT` の
+    /// `ON CONFLICT DO UPDATE` の文内重複（`21000`。Issue #2614）を報告するために使う。
+    pub(crate) fn upsert_cardinality_violation() -> Self {
+        SqlSurfaceError::UpsertCardinalityViolation
+    }
+
     /// `pub(crate)`: `sql::parser::bind`・`sql::exec`（TASK-75）がアロケーション前の
     /// サイズ上限超過を報告するために使う。
     pub(crate) fn payload_too_large(detail: impl Into<String>) -> Self {
@@ -1316,7 +1327,9 @@ impl ClassifiedError for SqlSurfaceError {
             SqlSurfaceError::StringDataRightTruncation { .. } => {
                 ErrorClass::StringDataRightTruncation
             }
-            SqlSurfaceError::CardinalityViolation => ErrorClass::CardinalityViolation,
+            SqlSurfaceError::CardinalityViolation | SqlSurfaceError::UpsertCardinalityViolation => {
+                ErrorClass::CardinalityViolation
+            }
             SqlSurfaceError::PayloadTooLarge { .. } => ErrorClass::PayloadTooLarge,
             SqlSurfaceError::MissingOperationId => ErrorClass::MissingOperationId,
             SqlSurfaceError::IdConflict => ErrorClass::UniqueViolation,
@@ -1433,6 +1446,10 @@ impl std::fmt::Display for SqlSurfaceError {
             SqlSurfaceError::CardinalityViolation => write!(
                 f,
                 "more than one row returned by a subquery used as an expression"
+            ),
+            SqlSurfaceError::UpsertCardinalityViolation => write!(
+                f,
+                "ON CONFLICT DO UPDATE command cannot affect row a second time"
             ),
             SqlSurfaceError::PayloadTooLarge { detail } => {
                 write!(f, "payload too large: {detail}")
@@ -9356,7 +9373,8 @@ impl<'a> Parser<'a> {
     /// `USING OPERATION_ID`・`;`・文末の手前までとする。`ON`／`USING` は 2 トークン組で判定し、JOIN の
     /// `ON`・`USING (...)`・`USING PLAN(...)`・`USING MODE` を誤って区切りにしない。範囲の中身の検証は
     /// 呼び出し元（`core.rs`）が既存の SELECT 検証器へ渡して行う（SELECT 構文を第 2 の実装にしない）。
-    /// `ON CONFLICT` との併用は別 Issue のため `0A000`。
+    /// `ON CONFLICT` との併用は VALUES 形と同じ句文法で受理する（Issue #2614。受理範囲は
+    /// [`Self::parse_on_conflict_clause`] に従い、未対応の形は従来どおり `42601`）。
     fn parse_insert_select_tail(
         &mut self,
         table_name: String,
@@ -9416,17 +9434,15 @@ impl<'a> Parser<'a> {
             ));
         }
         self.pos = end;
-        if self.peek_contextual_keyword("ON") {
-            return Err(SqlSurfaceError::feature_not_supported(
-                "INSERT ... SELECT with ON CONFLICT is not supported",
-            ));
-        }
+        // 句の順序は VALUES 形と同じ（`ON CONFLICT` → `RETURNING` → `USING OPERATION_ID`）。
+        let on_conflict = self.parse_on_conflict_clause()?;
         let returning = self.parse_returning_clause()?;
         let operation_id = self.parse_operation_id_clause()?;
         Ok(ParsedInsertSelectShape {
             table_name,
             columns,
             query_span: (start, end),
+            on_conflict,
             returning,
             operation_id,
         })
@@ -18486,6 +18502,7 @@ struct ParsedInsertSelectShape {
     table_name: String,
     columns: Vec<String>,
     query_span: (usize, usize),
+    on_conflict: Option<OnConflictClause>,
     returning: Option<Projection>,
     operation_id: Option<OperationId>,
 }
@@ -18841,6 +18858,8 @@ pub(crate) struct InsertSelectShape {
     pub(crate) table_name: String,
     pub(crate) columns: Vec<String>,
     pub(crate) query_tokens: Vec<Token>,
+    /// `ON CONFLICT` 句（Issue #2614。VALUES 形と同じ [`OnConflictClause`]）。
+    pub(crate) on_conflict: Option<OnConflictClause>,
     pub(crate) returning: Option<Projection>,
     pub(crate) operation_id: Option<OperationId>,
 }
@@ -18861,6 +18880,8 @@ pub struct ValidatedInsertSelect {
     pub(crate) columns: Vec<String>,
     pub(crate) query: Box<Statement>,
     pub(crate) query_tokens: Vec<Token>,
+    /// `ON CONFLICT` 句（Issue #2614）。ある場合、実行本体は結果行を UPSERT 経路へ流す。
+    pub(crate) on_conflict: Option<OnConflictClause>,
     pub(crate) returning: Option<Projection>,
     pub(crate) operation_id: Option<OperationId>,
     /// 台帳の内容照合ハッシュ（`recovery::content_hash::for_insert_select`。送られた文のトークン列から
@@ -18880,6 +18901,7 @@ impl ValidatedInsertSelect {
             columns: shape.columns,
             query: Box::new(query),
             query_tokens: shape.query_tokens,
+            on_conflict: shape.on_conflict,
             returning: shape.returning,
             operation_id: shape.operation_id,
             statement_hash,
@@ -18932,6 +18954,7 @@ pub(crate) fn parse_insert_any_shape_tokens_with_limit(
             table_name: shape.table_name,
             columns: shape.columns,
             query_tokens,
+            on_conflict: shape.on_conflict,
             returning: shape.returning,
             operation_id: shape.operation_id,
         }));
@@ -24800,15 +24823,44 @@ mod tests {
             panic!("expected Select shape");
         };
         assert!(shape.returning.is_some());
-        assert_eq!(
-            parse_insert_any(
-                "INSERT INTO t (a) SELECT a FROM x JOIN y ON x.a = y.a LIMIT 1 ON CONFLICT (a) DO NOTHING",
-                mode
-            )
-            .expect_err("must fail")
-            .wire_code(),
-            "0A000"
-        );
+        // JOIN の `ON` 述語の後の `ON CONFLICT` は句として認識される（Issue #2614）。
+        let ParsedInsertTokens::Select(shape) = parse_insert_any(
+            "INSERT INTO t (a) SELECT a FROM x JOIN y ON x.a = y.a LIMIT 1 ON CONFLICT (a) DO NOTHING",
+            mode,
+        )
+        .expect("parse") else {
+            panic!("expected Select shape");
+        };
+        assert!(shape.on_conflict.is_some());
+        // 内側の範囲には ON CONFLICT 句を含めない。
+        assert!(shape
+            .query_tokens
+            .iter()
+            .all(|t| !matches!(t, Token::Ident(w) if w.eq_ignore_ascii_case("CONFLICT"))));
+    }
+
+    /// `INSERT ... SELECT ... ON CONFLICT` の受理形（Issue #2614。SQL-51・SQL-49 のポインタ）。
+    #[test]
+    fn insert_select_accepts_on_conflict_forms() {
+        let mode = LedgerMode::CompareOnlyWithoutLedger;
+        for sql in [
+            "INSERT INTO t (a) SELECT a FROM x ON CONFLICT (a) DO NOTHING",
+            "INSERT INTO t (a, b) SELECT a, b FROM x ON CONFLICT (a) DO UPDATE SET b = EXCLUDED.b",
+            "INSERT INTO t (a, b) SELECT a, b FROM x ON CONFLICT ON CONSTRAINT uq DO NOTHING",
+            "INSERT INTO t (a) SELECT a FROM x ON CONFLICT DO NOTHING RETURNING a",
+            "INSERT INTO t (a, n) SELECT a, n FROM x ON CONFLICT (a) DO UPDATE SET n = n + EXCLUDED.n USING OPERATION_ID 'op1'",
+        ] {
+            let ParsedInsertTokens::Select(shape) = parse_insert_any(sql, mode).expect(sql) else {
+                panic!("expected Select shape: {sql}");
+            };
+            assert!(shape.on_conflict.is_some(), "{sql}");
+        }
+        let ParsedInsertTokens::Select(shape) =
+            parse_insert_any("INSERT INTO t (a) SELECT a FROM x", mode).expect("parse")
+        else {
+            panic!("expected Select shape");
+        };
+        assert!(shape.on_conflict.is_none());
     }
 
     #[test]
@@ -24820,9 +24872,19 @@ mod tests {
                 .wire_code()
                 .to_string()
         };
+        // 未対応の ON CONFLICT 形は従来どおり fail-closed（Issue #2614）。
         assert_eq!(
-            code("INSERT INTO t (a) SELECT a FROM x LIMIT 1 ON CONFLICT (a) DO NOTHING"),
-            "0A000"
+            code("INSERT INTO t (a) SELECT a FROM x LIMIT 1 ON CONFLICT (a) DO UPDATE SET a = EXCLUDED.a WHERE a > 0"),
+            "42601"
+        );
+        assert_eq!(
+            code("INSERT INTO t (a) SELECT a FROM x LIMIT 1 ON CONFLICT DO UPDATE SET a = EXCLUDED.a"),
+            "42601"
+        );
+        // `USING OPERATION_ID` の後ろの `ON CONFLICT` は句順違反。
+        assert_eq!(
+            code("INSERT INTO t (a) SELECT a FROM x LIMIT 1 USING OPERATION_ID 'op1' ON CONFLICT (a) DO NOTHING"),
+            "42601"
         );
         assert_eq!(code("INSERT INTO t (a) RETURNING a"), "42601");
         assert_eq!(code("INSERT INTO t SELECT a FROM x LIMIT 1"), "42601");

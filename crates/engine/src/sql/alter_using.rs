@@ -337,6 +337,7 @@ pub(crate) fn redact_row_conversion_error(e: SqlSurfaceError) -> SqlSurfaceError
         // 行の値を載せない variant（静的文字列・固定文言・コードのみ）。
         E::NegativeRowCount { .. }
         | E::CardinalityViolation
+        | E::UpsertCardinalityViolation
         | E::MissingOperationId
         | E::IdConflict
         | E::DuplicateOperationId
