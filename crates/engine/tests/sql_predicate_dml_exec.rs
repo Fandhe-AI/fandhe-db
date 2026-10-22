@@ -347,38 +347,31 @@ fn predicate_delete_with_like_general_form_matches_count_and_resend_contract() {
     assert_eq!(err.wire_code(), "22023");
 }
 
-/// fail-closed: `WHERE visible()` のみの述語つき DELETE は束縛段で拒否する
-/// （Issue #1181・SQL-19。UPDATE と同契約。副作用ゼロ）。
+/// `WHERE visible()` のみの述語つき DELETE は受理し、自テナントの全可視行を削除する
+/// （SQL-36・Issue #1744）。他テナントの行には影響しない（RLS は暗黙適用）。
 #[test]
-fn predicate_delete_visible_only_is_rejected_at_bind() {
+fn predicate_delete_visible_only_deletes_all_own_visible_rows() {
     let (core, path) = new_core_with_table();
     let _guard = CleanupGuard(path);
     let alice = ctx_for("alice", true);
+    let bob = ctx_for("bob", true);
     insert_row(&core, &alice, TABLE, 1, "ja", "a", "1");
     insert_row(&core, &alice, TABLE, 2, "en", "b", "2");
     insert_row(&core, &alice, TABLE, 3, "fr", "c", "3");
+    insert_row(&core, &bob, TABLE, 4, "ja", "d", "4");
 
-    let err = execute(
+    let outcome = execute(
         &core,
         &alice,
         &format!("DELETE FROM {TABLE} WHERE visible() USING OPERATION_ID 'op-visible'"),
     )
-    .expect_err("visible()-only predicate DELETE must be rejected");
-    assert_eq!(err.wire_code(), "42601");
-    assert_eq!(count_star(&core, &alice, TABLE), 3);
-
-    // 副作用ゼロ: 台帳に記録されていないため、同一 operation_id の正当な再送が成功する。
-    let outcome = execute(
-        &core,
-        &alice,
-        &format!("DELETE FROM {TABLE} WHERE lang = 'ja' USING OPERATION_ID 'op-visible'"),
-    )
-    .expect("operation_id must not have been consumed by the rejected statement");
+    .expect("visible()-only predicate DELETE must be accepted");
     match outcome {
-        SqlOutcome::Delete(o) => assert_eq!(o.rows_affected, 1),
+        SqlOutcome::Delete(o) => assert_eq!(o.rows_affected, 3),
         other => panic!("expected SqlOutcome::Delete, got {other:?}"),
     }
-    assert_eq!(count_star(&core, &alice, TABLE), 2);
+    assert_eq!(count_star(&core, &alice, TABLE), 0);
+    assert_eq!(count_star(&core, &bob, TABLE), 1);
 }
 
 /// `visible()` と他の述語の併用は受理し、述語に一致する行のみ削除する
@@ -426,24 +419,30 @@ fn predicate_delete_missing_operation_id_is_rejected() {
     assert_eq!(count_star(&core, &alice, TABLE), 1);
 }
 
-/// fail-closed: `WHERE visible()` のみの述語つき UPDATE は束縛段で拒否する
-/// （#869 の既存契約。実行に到達しない）。
+/// `WHERE visible()` のみの述語つき UPDATE は受理し、自テナントの全可視行を更新する
+/// （SQL-36・Issue #1744）。
 #[test]
-fn predicate_update_visible_only_is_rejected_at_bind() {
+fn predicate_update_visible_only_updates_all_own_visible_rows() {
     let (core, path) = new_core_with_table();
     let _guard = CleanupGuard(path);
     let alice = ctx_for("alice", true);
+    let bob = ctx_for("bob", true);
     insert_row(&core, &alice, TABLE, 1, "ja", "a", "1");
+    insert_row(&core, &alice, TABLE, 2, "en", "b", "2");
+    insert_row(&core, &bob, TABLE, 3, "ja", "c", "3");
 
-    let err = execute(
+    let outcome = execute(
         &core,
         &alice,
         &format!(
             "UPDATE {TABLE} SET lang = 'fr' WHERE visible() USING OPERATION_ID 'op-visible-upd'"
         ),
     )
-    .expect_err("visible()-only predicate UPDATE must be rejected");
-    assert_eq!(err.wire_code(), "42601");
+    .expect("visible()-only predicate UPDATE must be accepted");
+    match outcome {
+        SqlOutcome::Update(o) => assert_eq!(o.rows_affected, 2),
+        other => panic!("expected SqlOutcome::Update, got {other:?}"),
+    }
 }
 
 /// `execute_sql`（セッション無し）は引き続き `DELETE`／`UPDATE` を拒否する

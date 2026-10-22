@@ -9,9 +9,12 @@
 
 ### Breaking Changes
 
+- 述語形 `UPDATE`／`DELETE` の恒真述語（Issue #1744・SQL-36・SQL-41）: `WHERE TRUE`・`... OR TRUE`・`WHERE visible()` 単独を受理する。
+  `sql::parser::bind_predicate_delete`／`bind_update_form` がこれらに `42601` を返さなくなり、`BoundOrGroup::is_trivially_true` を削除した。
+  対象は自テナントの可視行で、影響行数上限は実行段が判定する。NoSQL 表層は不変。
 - `WHERE` 省略の `UPDATE`／`DELETE`（Issue #1743・SQL-36）: `DELETE FROM t`・`UPDATE t SET ...` を受理する。
   `validate_delete_statement`／`validate_update_form` が `42601` を返さなくなり、`where_predicates()` が空を返しうる。
-  単一行専用の入口（`validate_delete`・`validate_update`）・NoSQL 表層・恒真述語（`WHERE TRUE` 等）は不変。
+  単一行専用の入口（`validate_delete`・`validate_update`）・NoSQL 表層は不変（恒真述語は #1744 で変更）。
 - 対象省略の `ON CONFLICT DO NOTHING`（Issue #1736・SQL-49）: `INSERT ... ON CONFLICT DO NOTHING` を受理し、行キー・
   PRIMARY KEY・UNIQUE 制約・UNIQUE 索引（式・部分を含む）のどれかに違反した行だけを飛ばす（`NOT NULL`・`CHECK`・`FOREIGN KEY`
   は従来どおりエラー）。公開 API の変更: `sql::allowlist::OnConflictClause::target` を `Vec<String>` から

@@ -70,9 +70,9 @@ DELETE FROM <table> WHERE <predicates> USING OPERATION_ID '<id>'
 | `WHERE path LIKE 'src/%'` | 述語形 | `DeleteStatement::Predicate`（`Prefix`） |
 | `WHERE id > 5` | 述語形 | `DeleteStatement::Predicate`（`Expression`） |
 | `WHERE id = 1 AND lang = 'ja'` | 述語形 | `DeleteStatement::Predicate`（宣言順 2 件） |
-| `WHERE visible()` | 述語形 | `DeleteStatement::Predicate`（`PredicateCall`。構造段は受理、束縛段 `bind_predicate_delete` で単独形は `42601`。Issue #1181） |
+| `WHERE visible()` | 述語形 | `DeleteStatement::Predicate`（`PredicateCall`。構造段・束縛段とも受理し、自テナントの可視行の全件が対象。Issue #1181 で束縛段拒否、Issue #1744 で受理へ変更） |
 | `WHERE` 省略 | 述語形 | `DeleteStatement::Predicate`（述語列が空。SQL-36・Issue #1743。単一行専用入口 `validate_delete` は従来どおり `42601`） |
-| `WHERE TRUE`・`WHERE (TRUE OR FALSE)` 等（畳み込みで述語が消える形） | 述語形 | 省略と区別するため `visible()` を 1 件足して保持し、基表では束縛段で `42601`（#1744 まで） |
+| `WHERE TRUE`・`WHERE (TRUE OR FALSE)` 等（畳み込みで述語が消える形） | 述語形 | 省略と区別するため印つきの述語（`mark_explicit_where`）を 1 件足して保持し、述語形として受理（対象は自テナントの可視行。Issue #1744） |
 | `... HINT ORDER(...)` / `ORDER BY ...` / `LIMIT ...` / `USING MODE ...` | — | `42601`（許可形状外の余剰トークン） |
 | `... RETURNING ...`（述語形） | — | `42601`（構造上は受理するが、実行結線〔#871〕が未着手のため `validate_delete_statement_tokens` の `Predicate` 腕が単一のチョークポイントで拒否する。単一行形は実行結線済みのため受理する——Issue #873・SQL-21・`docs/design/sql-returning.md` 参照） |
 | `WHERE ... OR ...` | — | `42601`（`OR` 非対応） |
@@ -141,9 +141,9 @@ DELETE FROM <table> WHERE <predicates> USING OPERATION_ID '<id>'
   構文段の真偽リテラル畳み込み（SQL-41）で `WHERE TRUE` も空列になるため、明示した `WHERE` の結果が
   空になるときだけ `visible()` を 1 件足す（`mark_explicit_where`）。`visible()` は束縛後にフィルタを
   生まないので、基表への `WHERE TRUE` は従来どおり束縛段の「`visible()` のみ」拒否（`42601`）に落ち、
-  ビュー経由はビューの述語と合成されて従来どおり通る。#1744 が恒真述語を受理するときにこの印を外す。
+  ビュー経由はビューの述語と合成されて従来どおり通る。（Issue #1744 で基表への `WHERE TRUE` も受理に変更。印の扱いは「Issue #1744 追記」参照）
 - **束縛段ガード**: `bind_predicate_delete`／`bind_predicate_update` の拒否は述語列が非空のときだけ適用し、
-  省略（空列）は通す。`WHERE visible()` 単独・恒真になる述語（`... OR TRUE` 等）は拒否のまま。
+  省略（空列）は通す。`WHERE visible()` 単独・恒真になる述語（`... OR TRUE` 等）は #1743 時点では拒否のまま（#1744 で撤去）。
 - **NoSQL 表層**: `reject_unsupported_predicate_dml_forms` は空列を引き続き拒否する（SQL-36 (5)。意図的な非対称）。
 - **ハッシュ**: レイアウトは変えない。省略は件数 0 のプレフィクスになり、既存の記録と衝突しない。
 - **分割実行**: `PARTITIONED [CHUNK n]` は省略形にも付けられる（`operation_id` 必須は従来どおり）。
@@ -151,3 +151,21 @@ DELETE FROM <table> WHERE <predicates> USING OPERATION_ID '<id>'
 - **影響行数上限**: `--max-dml-affected-rows` の既定（上限なし）は変えない。指定時は省略形も対象で、超過は
   副作用ゼロ・台帳記録なしで全体を拒否する。省略形専用の既定上限は設けない。
 - **#2210 への申し送り**: 省略の判定は `parse_delete`／`parse_update` が返す述語列の空（`mark_explicit_where` 通過後）で取れる。
+
+## Issue #1744 追記（恒真述語の受理。SQL-36・SQL-41 ポインタ）
+
+- **束縛段ガードの撤去**: `bind_predicate_delete`／`bind_predicate_update` の「フィルタ全空・恒真は `42601`」を撤去し、
+  `WHERE TRUE`・`... OR TRUE`・`(TRUE OR FALSE)`・`visible()` 単独を受理する。対象は自テナントの可視行の全件で、
+  RLS は述語と独立に暗黙適用されるためテナント境界は広がらない。歯止めは実行段の影響行数上限
+  （`--max-dml-affected-rows`・`54000`・副作用ゼロ）に任せる。唯一の呼び出し元を失った
+  `BoundOrGroup::is_trivially_true` は削除した。
+- **`visible()` 単独の判断**: `visible() AND TRUE` は畳み込みで `visible()` 単独と同じ AST になり、
+  「`WHERE TRUE` は受理し `visible()` 単独は拒否」という線引きは作れないため、あわせて受理とした
+  （#1743 の申し送りへの回答）。
+- **印（`mark_explicit_where`）は残す**: 役目を「#1744 まで拒否するため」から「省略と明示を区別するため」に変えた。
+  opt-in の `--require-where-for-dml`（#2210）は省略だけを拒否し `WHERE TRUE` は受理する必要があり、印が無いと
+  畳み込み後の空の述語列で両者を区別できない。印はハッシュ入力から除外したままなので、`WHERE TRUE` と
+  `WHERE` 省略は同じ台帳ハッシュになり、`WHERE visible()` はこれと別のハッシュになる。
+- **NoSQL 表層**: `reject_unsupported_predicate_dml_forms` は不変（空の filter・`visible()` は拒否のまま。意図的な非対称）。
+- **構文段の補正**: 真偽リテラルの畳み込みが `PARTITIONED` を述語境界として扱うようにし、
+  `WHERE TRUE PARTITIONED CHUNK n` が他の述語形と同じく `23502`（`operation_id` 必須）で止まるようにした。

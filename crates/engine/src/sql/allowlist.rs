@@ -190,6 +190,8 @@ fn is_where_predicate_boundary_token(
             w.eq_ignore_ascii_case("USING")
                 || w.eq_ignore_ascii_case("HINT")
                 || w.eq_ignore_ascii_case("RETURNING")
+                // 分割実行句（`WHERE TRUE PARTITIONED CHUNK n`。SQL-36・Issue #1744）
+                || w.eq_ignore_ascii_case("PARTITIONED")
                 || w.eq_ignore_ascii_case("GROUP")
                 || w.eq_ignore_ascii_case("HAVING")
                 || w.eq_ignore_ascii_case("OR")
@@ -3742,9 +3744,10 @@ pub(crate) const EXPLICIT_WHERE_MARKER: &str = "\u{0}explicit_where";
 /// `WHERE` が書かれているのに述語列が空になる形（`WHERE TRUE`・`(TRUE OR FALSE)` 等、構文段の
 /// 真偽リテラル畳み込み〔SQL-41〕で述語が消えるもの）に、RLS 述語 `visible()` を 1 件足して返す。
 /// 空の述語列は「`WHERE` 省略」（SQL-36・Issue #1743）の表現と同一であり、明示した恒真を省略と
-/// 取り違えないための印。`visible()` は束縛後にフィルタを生まない（RLS は常に暗黙適用される）ので、
-/// 基表への DML は束縛段の「`visible()` のみ」拒否（`42601`）に従来どおり落ち、ビュー経由では
-/// ビューの述語と合成されて従来どおり通る。恒真述語 DML の受理は #1744 の範囲で、そこでこの関数を外す。
+/// 取り違えないための印（省略だけを拒否する opt-in の Issue #2210 の判定点。#1744 で恒真述語 DML を
+/// 受理したが、省略と明示の区別のため印は残す）。`visible()` は束縛後にフィルタを生まない（RLS は
+/// 常に暗黙適用される）ので、基表への DML は自テナント可視行の全件が対象になり、ビュー経由では
+/// ビューの述語と合成される。
 fn mark_explicit_where(mut predicates: Vec<WherePredicate>) -> Vec<WherePredicate> {
     if predicates.is_empty() {
         predicates.push(WherePredicate::PredicateCall {
@@ -19960,10 +19963,9 @@ struct ParsedUpdateShape {
 /// <述語>[ AND <述語>]* USING OPERATION_ID '<id>' [;]`（`<述語>` は `SELECT` の
 /// `WHERE` と同一形状。[`WherePredicate`]）。`WHERE` 句自体の省略は本モジュールの
 /// `expect_keyword(Keyword::Where)` が構造的に拒否する（`42601`）ため本型は
-/// 構築されない。`WHERE` 句が存在しても中身が `visible()` 単独の恒等述語のみ
-/// （非 `visible()` 述語が 1 つも無い）場合は許可リスト構造としては受理するが、
-/// 実質的な全行更新になるため [`crate::sql::parser::bind_update_form`] が
-/// 束縛時に `42601` で拒否する。
+/// 構築されない。`WHERE` 句が存在して中身が `visible()` 単独・恒真形の場合も
+/// 許可リスト・束縛とも受理する（SQL-36・SQL-41、Issue #1744。対象は自テナントの
+/// 可視行で、影響行数上限は実行段が判定する）。
 ///
 /// フィールドは `pub(crate)` のまま公開しない（[`crate::sql::parser::
 /// BoundPredicateUpdate`] と同じ作法）。本型は `validate_update_form_tokens`
@@ -24621,7 +24623,7 @@ mod tests {
             &lookup,
             LedgerMode::Ledgered,
         )
-        .expect("visible() predicate DELETE is accepted structurally (bind stage rejects visible()-only with 42601)");
+        .expect("visible() predicate DELETE is accepted structurally (visible()-only is also accepted at the bind stage, SQL-36 Issue #1744)");
         assert!(matches!(stmt, DeleteStatement::Predicate(_)));
     }
 

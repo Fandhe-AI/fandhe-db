@@ -1,7 +1,7 @@
 //! `WHERE` での真偽リテラル `TRUE`／`FALSE` の受理（SQL-41。`docs/spec/04-behavior/`
 //! のポインタのみ。Issue #1526）の結合テスト。`tests/sql_where_or.rs` と同じ流儀
 //! （実 `Storage`＋`CpuScalarProvider`、`execute_sql`／`execute_sql_in_session`）で、
-//! 検索・広域取得・集計・述語つき DML・RLS 境界・恒真 DML の fail-closed を固定する。
+//! 検索・広域取得・集計・述語つき DML・RLS 境界・恒真 DML（Issue #1744 で受理）を固定する。
 
 use engine::catalog::{ColumnDef, ColumnType, TableSchema};
 use engine::core::EngineCore;
@@ -123,13 +123,6 @@ fn seed_corpus(core: &EngineCore, ctx: &PolicyContext) {
     .expect("insert id=5 (flag NULL) should succeed");
 }
 
-fn dml_err(core: &EngineCore, ctx: &PolicyContext, sql: &str) -> String {
-    match core.execute_sql_in_session(ctx, &mut SessionState::default(), sql) {
-        Err(e) => format!("{e:?}"),
-        Ok(o) => panic!("expected rejection for {sql:?}, got {o:?}"),
-    }
-}
-
 #[test]
 fn sql41_scan_true_false_and_combinations() {
     let (core, path) = new_core();
@@ -248,12 +241,9 @@ fn sql41_predicate_dml_and_true_matches_plain_predicate() {
     assert_eq!(select_ids_where(&core, &ctx, "TRUE"), vec![1, 3, 5]);
 }
 
+/// SQL-36・SQL-41（Issue #1744）: 恒真形の述語つき DML は受理され、自テナントの全可視行に作用する。
 #[test]
-fn sql41_trivially_true_predicate_dml_is_rejected_without_side_effects() {
-    let (core, path) = new_core();
-    let _guard = CleanupGuard(path);
-    let ctx = ctx_for("tenant-a");
-    seed_corpus(&core, &ctx);
+fn sql41_trivially_true_predicate_dml_affects_all_visible_rows() {
     for (i, pred) in [
         "TRUE",
         "visible() AND TRUE",
@@ -263,27 +253,41 @@ fn sql41_trivially_true_predicate_dml_is_rejected_without_side_effects() {
     .iter()
     .enumerate()
     {
-        let e = dml_err(
-            &core,
-            &ctx,
-            &format!("DELETE FROM {TABLE} WHERE {pred} USING OPERATION_ID 'op-d-{i}'"),
-        );
-        assert!(
-            e.contains("42601") || e.contains("unconditional"),
-            "{pred}: {e}"
-        );
-        let e = dml_err(
-            &core,
-            &ctx,
-            &format!("UPDATE {TABLE} SET lang = 'xx' WHERE {pred} USING OPERATION_ID 'op-u-{i}'"),
-        );
-        assert!(
-            e.contains("42601") || e.contains("unconditional"),
-            "{pred}: {e}"
-        );
+        let (core, path) = new_core();
+        let _guard = CleanupGuard(path);
+        let ctx = ctx_for("tenant-a");
+        seed_corpus(&core, &ctx);
+        match core
+            .execute_sql_in_session(
+                &ctx,
+                &mut SessionState::default(),
+                &format!("DELETE FROM {TABLE} WHERE {pred} USING OPERATION_ID 'op-d-{i}'"),
+            )
+            .unwrap_or_else(|e| panic!("DELETE WHERE {pred} should succeed: {e:?}"))
+        {
+            SqlOutcome::Delete(o) => assert_eq!(o.rows_affected, 5, "{pred}"),
+            other => panic!("expected Delete, got {other:?}"),
+        }
+        assert_eq!(count_where(&core, &ctx, "TRUE"), 0, "{pred}");
+
+        let (core, path) = new_core();
+        let _guard = CleanupGuard(path);
+        seed_corpus(&core, &ctx);
+        match core
+            .execute_sql_in_session(
+                &ctx,
+                &mut SessionState::default(),
+                &format!(
+                    "UPDATE {TABLE} SET lang = 'xx' WHERE {pred} USING OPERATION_ID 'op-u-{i}'"
+                ),
+            )
+            .unwrap_or_else(|e| panic!("UPDATE WHERE {pred} should succeed: {e:?}"))
+        {
+            SqlOutcome::Update(o) => assert_eq!(o.rows_affected, 5, "{pred}"),
+            other => panic!("expected Update, got {other:?}"),
+        }
+        assert_eq!(count_where(&core, &ctx, "lang = 'xx'"), 5, "{pred}");
     }
-    assert_eq!(count_where(&core, &ctx, "TRUE"), 5);
-    assert_eq!(count_where(&core, &ctx, "lang = 'xx'"), 0);
 }
 
 #[test]

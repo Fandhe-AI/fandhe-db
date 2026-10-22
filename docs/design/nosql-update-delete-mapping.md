@@ -299,7 +299,8 @@ id = n`〕ではなく `filter` 相当・SQL 表層は `WHERE <述語>`）は、
 - `bind_predicate_delete` 自体に「`visible()` 単独の述語」を拒否する
   ガードが無い点（SQL 表層側の既存事項）: NoSQL の入口
   （`reject_unsupported_predicate_dml_forms`）は `PredicateCall` を拒否する
-  ため防御済みだが、SQL 表層自体のガード追加は別途申し送る
+  ため防御済み。SQL 表層は Issue #1744 で `visible()` 単独・恒真述語を受理する方針とし、
+  ガードは追加しない（NoSQL 側の拒否は維持）
 
 ## 検証
 
