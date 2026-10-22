@@ -5571,7 +5571,17 @@ impl EngineCore {
             }) {
                 return Err(crate::sql::allowlist::SqlSurfaceError::UndefinedParameter { param });
             }
-            let copy_tokens = crate::sql::lexer::demote_quoted_null(tokens.clone());
+            // 簡易クエリの `begin_copy`（印なしの `tokenize`）と同じ字句に揃えるため、引用付きの
+            // `NULL`／`ARRAY`／SQL 値関数予約語（`QuotedNull`）もすべて `Ident` へ戻す
+            // （`demote_quoted_null` は引用付き `ARRAY` を残し、表名・列名 `"array"` が 42601 になる）。
+            let copy_tokens: Vec<crate::sql::lexer::Token> = tokens
+                .iter()
+                .cloned()
+                .map(|t| match t {
+                    crate::sql::lexer::Token::QuotedNull(s) => crate::sql::lexer::Token::Ident(s),
+                    other => other,
+                })
+                .collect();
             let stmt = crate::sql::allowlist::validate_copy_tokens(
                 &copy_tokens,
                 &self.storage,
