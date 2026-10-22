@@ -240,8 +240,15 @@ fn parallel_add_on_invisible_conflict_is_always_42501_without_side_effects() {
         let (code, msg) = out.as_ref().expect_err(op_id);
         assert_eq!(*code, "42501", "{op_id}");
         // エラーにシード値・テナント ID・埋め込み値を含めない
+        // 自テナントだけでなく全テナントのシード値の漏出を検査する
+        for tj in 0..TENANTS.len() {
+            assert!(
+                !msg.contains(&seed(tj).to_string()),
+                "{op_id}: seed of tenant {tj} leaked: {msg}"
+            );
+        }
         assert!(
-            !msg.contains("7777") && !msg.contains("tenant-") && !msg.contains("0.1"),
+            !msg.contains("tenant-") && !msg.contains("0.1"),
             "{op_id}: {msg}"
         );
         assert_eq!(
