@@ -807,6 +807,21 @@ impl EngineCore {
                     &prepared.qualified_positions,
                 )?;
                 let parsed = self.bind_prepared(prepared, values)?;
+                // `COPY`（Issue #1760）は Execute で元 SQL を現在のカタログへ再解決する
+                // （`begin_copy_temp`）ため、Bind 後に一時表が作成・削除されると宛先が永続表から
+                // 一時表（または逆）へ化ける。一時カタログの世代つきで包み、Execute 前の
+                // `require_current` で陳腐化を `0A000` として拒否させる（fail-closed）。
+                if matches!(parsed, ParsedSql::Copy(_)) {
+                    // Parse 後に同名の一時表が作られていれば、他の文と同じく Bind 時点で陳腐化として
+                    // 拒否する（current と刻印して Execute で一時表へ化けさせない。fail-closed）。
+                    if crate::sql::temp_catalog::tokens_reference_temp(&prepared.tokens, temp) {
+                        return Err(crate::sql::temp_catalog::temp_statement_stale());
+                    }
+                    return Ok(ParsedSql::SessionRouted(Box::new(
+                        SessionRoutedSql::persistent_guarded(parsed, temp)
+                            .stamped_with_path(session),
+                    )));
+                }
                 // `DROP INDEX <名前>` は一時表の名前トークンが現れない。準備後に同名の一時索引が
                 // 作られていれば、通常の Parse（`route_drop_index`）なら一時索引に当たるため、
                 // 永続の索引を黙って削除せず陳腐化として拒否する（fail-closed）。

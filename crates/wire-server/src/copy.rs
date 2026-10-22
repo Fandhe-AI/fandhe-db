@@ -6,7 +6,12 @@
 //! 上限判定・commit はすべて `engine::sql::copy`（`EngineCore::begin_copy`／
 //! `commit_copy_in`）へ委譲する（第 2 の書き込み経路を作らない設計）。
 //!
-//! 呼び出し文脈: `simple_query::run_copy_statement` が、分割済みの 1 文へ
+//! 呼び出し文脈（拡張クエリ）: `extended_query::handle_execute` が COPY の portal を
+//! `simple_query::run_copy_statement`（`Finish::Continue`）経由で本モジュールへ委譲する
+//! （Issue #1760・WIRE-21 (2)）。拡張クエリでは `ReadyForQuery` を Sync が送るため、
+//! 本モジュールは `CommandComplete` または ErrorResponse だけを書く。
+//!
+//! 呼び出し文脈（簡易クエリ）: `simple_query::run_copy_statement` が、分割済みの 1 文へ
 //! `engine::sql::copy::is_copy_statement` を適用して真なら（セッションが `Idle` の
 //! ときに）ここへ委譲する（Issue #1175: 複数文メッセージの 2 文目以降の COPY も
 //! 文単位で扱う）。本モジュールは COPY サブプロトコルの開始（CopyInResponse／
@@ -377,7 +382,7 @@ fn run_copy_to<S: WireStream>(
                 )?;
             }
             buffer.flush(stream)?;
-            Ok(CopyStep::Completed)
+            Ok(CopyStep::Completed { tag })
         }
         Err(_) => {
             buffer.flush(stream)?;
@@ -630,10 +635,8 @@ fn finish_copy_from<'e, S: WireStream>(
 
     match outcome {
         Ok(insert_outcome) => {
-            match result_encoder::encode_command_complete(&format!(
-                "COPY {}",
-                insert_outcome.rows_affected
-            )) {
+            let tag = format!("COPY {}", insert_outcome.rows_affected);
+            match result_encoder::encode_command_complete(&tag) {
                 Ok(msg) => {
                     stream.write_all(&msg)?;
                     if finish == Finish::ReadyForQuery {
@@ -643,7 +646,7 @@ fn finish_copy_from<'e, S: WireStream>(
                             txn,
                         )?;
                     }
-                    Ok(CopyStep::Completed)
+                    Ok(CopyStep::Completed { tag })
                 }
                 Err(_) => respond_error_and_ready(
                     stream,
@@ -660,10 +663,12 @@ fn finish_copy_from<'e, S: WireStream>(
 
 /// COPY 1 文の実行結果（Issue #1175）。`simple_query::run_copy_statement` が、
 /// 複数文メッセージの続きの文へ進むか・打ち切るか・接続を閉じるかを判定するために使う。
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) enum CopyStep {
     /// `CommandComplete "COPY n"`（と `finish` に応じた `ReadyForQuery`）を書き終えた。
-    Completed,
+    /// `tag` は送出済みの完了タグ。拡張クエリの Execute（Issue #1760）が portal を
+    /// `Done` へ遷移させ、再 Execute でタグだけを再送するために保持する。
+    Completed { tag: String },
     /// ErrorResponse を書き終えた（`ReadyForQuery` は呼び出し元が復元後に送る）。呼び出し元は以降の文を実行しない。
     Failed,
     /// Terminate（'X'）受信・早期 EOF。呼び出し元は接続ループを終了させる。
