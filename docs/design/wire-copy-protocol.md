@@ -29,7 +29,9 @@
   ハンドシェイク層のフレーム受信期限が及び、期限超過で接続を閉じてライタを解放する
   （詳細は `docs/design/explicit-transaction.md`「wire-server への結線」）。
 - 対象外（起票済み・別 Issue／別タスクへ申し送り）:
-  - 拡張クエリプロトコル（TASK-216）経由の COPY・Sync までの同期回復。
+  - 拡張クエリプロトコル（TASK-216）経由の COPY の Execute（CopyIn／CopyOut の開始。
+    Issue #1760）と、CopyFail 等の後の Sync までの同期回復（Issue #1761）。Parse／Bind／
+    Describe までは Issue #1759 で受理済み（下の「拡張クエリの Parse／Bind／Describe」節）。
   - `HEADER`／`DELIMITER`／`NULL`／`QUOTE` などの COPY オプション、binary
     形式（WIRE-14 関連）、テーブル形 `COPY t TO STDOUT`、8 進・16 進エスケープ。
 
@@ -223,3 +225,25 @@
 `id` を省略でき、行順に所有 SEQUENCE から採番する（`\N` を渡した `id` 列は `22000`。従来方式の表は
 `id` 必須のまま）。採番は session 付きの完了処理で INSERT と同じ文脈を張って行い、autocommit・
 明示トランザクションの両方で動く。
+
+## 拡張クエリの Parse／Bind／Describe（Issue #1759。親 #1758・WIRE-21 (1)・ERR-6 ポインタ）
+
+- 受理: Parse で `COPY ... FROM STDIN`／`COPY (SELECT ...) TO STDOUT` を ParseComplete で受理する。
+  Describe（statement）は ParameterDescription（0 個）＋ NoData、Describe（portal）は NoData、
+  Bind はパラメータ 0 個で BindComplete。
+- Parse 時検証: 他の文種と同じく Parse で許可リスト検証する（`EngineCore::parse_sql_prepared` が
+  `validate_copy_tokens` を簡易クエリと共有。未定義表 `42P01`・許可外の形 `42601`・
+  `operation_id` 必須化 `23502` の分類は簡易クエリの `begin_copy` と一致）。検証済みの文は
+  `ParsedSql::Copy(ValidatedCopy)` で保持し、元の SQL テキストも持つ。`EngineCore::parse_sql`
+  （簡易クエリ側の解析）は `COPY` を受理しない。
+- `$n`: COPY に `$n` を置くと Parse で `42P02`（`ErrorClass::UndefinedParameter`・HTTP は 400）。
+  位置検査（`42601`）より前、型宣言の過剰宣言（`08P01`）より前に判定する。文字列リテラル・
+  コメント内の `$n` は字句解析で除外される。エラー後は既存の同期回復（Sync まで読み捨て）で
+  接続を維持する。
+- 一時表: 一時表を参照する COPY の Parse は `0A000`（fail-closed。一時表の経路〔`is_routable`〕が
+  COPY を含まないため）。対応は Issue #1760 以降で判断する。
+- Execute（#1760 への引き継ぎ契約）: `execute_parsed_in_session`／`execute_in_active_txn` の
+  `ParsedSql::Copy` の腕は `0A000` の fail-closed スタブ（行・台帳・世代に触れない。明示
+  トランザクション中は Failed へ遷移）。#1760 は `ValidatedCopy::sql()` を `begin_copy`／
+  `begin_copy_in_txn` へ渡す形でこの腕を置き換える。wire-server の `is_write_statement`
+  判定（`extended_query.rs`）は `_` の腕で Copy を書き込み扱いにする点も #1760 で見直す。
