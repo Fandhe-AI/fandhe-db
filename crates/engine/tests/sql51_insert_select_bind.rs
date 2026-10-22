@@ -100,11 +100,6 @@ fn parse_rejects_unsupported_forms_fail_closed() {
     let (core, path, _s) = setup("sql51-reject");
     let _g = CleanupGuard(path);
     let cases: &[(&str, &str)] = &[
-        // ON CONFLICT との併用は別 Issue
-        (
-            "INSERT INTO dst (id, a) SELECT id, a FROM src LIMIT 3 ON CONFLICT (id) DO NOTHING",
-            "0A000",
-        ),
         // 空の問い合わせ
         ("INSERT INTO dst (id, a) RETURNING id", "42601"),
         // `DEFAULT VALUES` の後ろに問い合わせは書けない

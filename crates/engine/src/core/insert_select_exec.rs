@@ -32,7 +32,7 @@ use crate::policy::PolicyContext;
 use crate::recovery::content_hash::ContentHash;
 use crate::recovery::required_op_id::OperationId;
 use crate::result_limits::{ResultLimits, MAX_RESULT_ROWS_HARD_CAP};
-use crate::sql::allowlist::{Projection, SqlSurfaceError, Statement};
+use crate::sql::allowlist::{OnConflictClause, Projection, SqlSurfaceError, Statement};
 use crate::sql::exec::{InsertOutcome, QueryResult, ReturningOutcome};
 use crate::sql::insert_select::{resolve_target_columns, rows_to_bound_inserts, ConversionPlan};
 use crate::sql::mode::SessionState;
@@ -61,8 +61,9 @@ pub(super) struct InsertSelectRequest<'a> {
     /// トークン列から算出して渡す。
     pub statement_hash: ContentHash,
     pub returning: Option<&'a Projection>,
-    /// `ON CONFLICT` が付いているか（併用は別 Issue のため `0A000`）。
-    pub has_on_conflict: bool,
+    /// `ON CONFLICT` 句（Issue #2614）。ある場合は結果行を VALUES 形と同じ UPSERT 経路
+    /// （`sql::exec::execute_upsert_in`）へ流す。`None` は従来の INSERT 経路。
+    pub on_conflict: Option<&'a OnConflictClause>,
 }
 
 impl EngineCore {
@@ -76,8 +77,8 @@ impl EngineCore {
 
     /// `ParsedSql::InsertSelect` の実行腕から呼ぶ入口（SQL-51・Issue #1732・#1733）。束縛（列数・型の
     /// 静的照合。内側 SELECT の結果列メタは Describe で導出）を挿入より前に通し、検証済みの文を
-    /// [`InsertSelectRequest`] へ詰めて [`Self::execute_insert_select`] へ渡す。`ON CONFLICT` との併用は
-    /// parser が `0A000` で拒否済みのため `has_on_conflict` は常に偽。
+    /// [`InsertSelectRequest`] へ詰めて [`Self::execute_insert_select`] へ渡す。`ON CONFLICT` 句は
+    /// そのまま実行本体へ渡す（Issue #2614）。
     pub(super) fn execute_parsed_insert_select(
         &self,
         mode: InsertSelectTxn<'_>,
@@ -99,7 +100,7 @@ impl EngineCore {
                 operation_id: stmt.operation_id.clone(),
                 statement_hash: stmt.statement_hash,
                 returning: stmt.returning.as_ref(),
-                has_on_conflict: false,
+                on_conflict: stmt.on_conflict.as_ref(),
             },
         )
     }
@@ -112,11 +113,6 @@ impl EngineCore {
         session: &mut SessionState,
         req: InsertSelectRequest<'_>,
     ) -> Result<SqlOutcome, SqlSurfaceError> {
-        if req.has_on_conflict {
-            return Err(SqlSurfaceError::feature_not_supported(
-                "ON CONFLICT is not supported with INSERT ... SELECT",
-            ));
-        }
         let schema: TableSchema =
             self.storage
                 .get_table_schema(req.table_name)
@@ -130,6 +126,19 @@ impl EngineCore {
         // RETURNING は評価より前に束縛する（未知の列は SELECT を走らせる前に `42703`）。
         let returning = crate::sql::parser::bind_returning(req.returning, &schema)?;
         let targets = resolve_target_columns(&schema, req.columns)?;
+
+        // `ON CONFLICT` の静的束縛（対象解決・SET 右辺）は台帳照合・内側 SELECT の評価より前に行う
+        // （Issue #2614。誤りは何も評価せず返す）。移行済み表で `id` を省略した UPSERT は VALUES 形と
+        // 同じく fail-closed（衝突時の欠番と `DO UPDATE` の意味が未設計。Issue #1699）。
+        let upsert_plan = match req.on_conflict {
+            None => None,
+            Some(clause) => {
+                self.reject_index_derived_conflict_constraint(req.table_name, Some(clause))?;
+                let plan = crate::sql::parser::bind_conflict_clause(clause, &schema)?;
+                crate::sql::insert_select::reject_omitted_id_upsert(&schema, &targets)?;
+                Some(plan)
+            }
+        };
 
         // 書き込み先。台帳の事前照合・0 行の台帳記録・本書き込みで同じ形に揃える。
         let make_target = || match &mode {
@@ -263,6 +272,41 @@ impl EngineCore {
                     },
                 }),
             });
+        }
+
+        // `ON CONFLICT` 付きは同じ結果行を UPSERT 経路へ流す（第 2 の書き込み経路を作らない）。
+        // 文内重複の扱い（`DO UPDATE` は `21000`、`DO NOTHING` は先勝ち）は束縛側で書き込み前に決まり、
+        // 台帳は上で張ったスコープの文ハッシュ（`ON CONFLICT` 句を含む）で照合・記録される。
+        if let Some((conflict_target, conflict_action)) = upsert_plan {
+            let bound = crate::sql::parser::build_upsert_from_select_rows(
+                req.table_name,
+                bounds,
+                conflict_target,
+                conflict_action,
+                &schema,
+                req.operation_id.clone(),
+            )?;
+            self.validate_upsert_batch_limits(&bound.rows)?;
+            let target = make_target();
+            return match returning {
+                None => crate::sql::exec::execute_upsert_in(
+                    target,
+                    ctx,
+                    &bound,
+                    self.ledger_mode,
+                    &schema,
+                )
+                .map(SqlOutcome::Insert),
+                Some(projection) => crate::sql::exec::execute_upsert_returning_in(
+                    target,
+                    ctx,
+                    &bound,
+                    self.ledger_mode,
+                    &projection,
+                    &schema,
+                )
+                .map(SqlOutcome::Returning),
+            };
         }
 
         // `id` を省略した行（移行済み表）の採番は書き込み段が文脈から行う。autocommit で文脈が無い
@@ -401,7 +445,7 @@ mod tests {
                 operation_id: Some(OperationId::parse(op).expect("op id")),
                 statement_hash: test_stmt_hash("dst", select),
                 returning: None,
-                has_on_conflict: false,
+                on_conflict: None,
             },
         )
     }
@@ -432,7 +476,7 @@ mod tests {
                     operation_id: Some(OperationId::parse("op-const").expect("op id")),
                     statement_hash: test_stmt_hash("t", "s389"),
                     returning: None,
-                    has_on_conflict: false,
+                    on_conflict: None,
                 },
             )
             .expect("const select insert");
@@ -647,7 +691,7 @@ mod tests {
                     operation_id: Some(OperationId::parse("op-is-ret").expect("op")),
                     statement_hash: test_stmt_hash("t", "s578"),
                     returning: Some(&projection),
-                    has_on_conflict: false,
+                    on_conflict: None,
                 },
             )
             .expect("insert select returning");
@@ -704,7 +748,7 @@ mod tests {
                     operation_id: Some(OperationId::parse("op-zero").expect("op")),
                     statement_hash: test_stmt_hash("t", "s634"),
                     returning: Some(&projection),
-                    has_on_conflict: false,
+                    on_conflict: None,
                 },
             )
             .expect("insert select");
@@ -716,30 +760,37 @@ mod tests {
         assert!(!r.result.columns.is_empty());
     }
 
-    // 対象ビヘイビア: SQL-51・SQL-49（ポインタ）。ON CONFLICT との併用は `0A000`。
+    // 対象ビヘイビア: SQL-51・SQL-49（ポインタ）。ON CONFLICT との併用は UPSERT 経路へ流れる（Issue #2614）。
     #[test]
-    fn on_conflict_is_rejected_fail_closed() {
+    fn on_conflict_routes_rows_through_upsert_path() {
         let dir = tempdir();
         let core = open(dir.path());
         let a = ctx("tenant-a");
-        let mut s = SessionState::default();
-        let err = core
-            .execute_insert_select(
-                InsertSelectTxn::Autocommit,
-                &a,
-                &mut s,
-                InsertSelectRequest {
-                    table_name: "dst",
-                    columns: None,
-                    select: select_stmt(&core, "SELECT id, embedding, lang FROM src LIMIT 1"),
-                    operation_id: None,
-                    statement_hash: test_stmt_hash("t", "s664"),
-                    returning: None,
-                    has_on_conflict: true,
-                },
-            )
-            .unwrap_err();
-        assert_eq!(err.wire_code(), "0A000");
+        seed(&core, &a, "src", 3, "seed-src");
+        seed(&core, &a, "dst", 1, "seed-dst");
+        let out = run(
+            &core,
+            &a,
+            "INSERT INTO dst (id, embedding, lang) SELECT id, embedding, lang FROM src LIMIT 100 \
+             ON CONFLICT (id) DO NOTHING USING OPERATION_ID 'op-oc-1'",
+        )
+        .expect("insert select on conflict");
+        let SqlOutcome::Insert(o) = out else {
+            panic!("expected insert outcome");
+        };
+        // id=1 は衝突して飛ばされ、id=2・3 だけが入る。
+        assert_eq!(o.rows_affected, 2);
+        assert_eq!(count(&core, &a, "dst"), 3);
+        // 同じ文脈で DO UPDATE の文内重複は 21000 で文全体が拒否される。
+        let err = run(
+            &core,
+            &a,
+            "INSERT INTO dst (id, embedding, lang) SELECT 1, embedding, lang FROM src LIMIT 100 \
+             ON CONFLICT (id) DO UPDATE SET lang = EXCLUDED.lang USING OPERATION_ID 'op-oc-2'",
+        )
+        .unwrap_err();
+        assert_eq!(err.wire_code(), "21000");
+        assert_eq!(count(&core, &a, "dst"), 3);
     }
 
     fn ddl(core: &EngineCore, c: &PolicyContext, sql: &str) {
@@ -770,7 +821,7 @@ mod tests {
                 operation_id: Some(OperationId::parse(op).expect("op id")),
                 statement_hash: test_stmt_hash(table, select),
                 returning: None,
-                has_on_conflict: false,
+                on_conflict: None,
             },
         )
     }
@@ -1029,7 +1080,7 @@ mod tests {
                     operation_id: Some(OperationId::parse("op-is-pre").expect("op id")),
                     statement_hash: test_stmt_hash("dst", ALL_SRC),
                     returning: None,
-                    has_on_conflict: false,
+                    on_conflict: None,
                 },
             )
             .unwrap_err();

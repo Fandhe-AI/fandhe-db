@@ -5364,49 +5364,7 @@ fn bind_upsert_form(
             if !condition.is_empty() {
                 crate::sql::upsert_where::CompiledUpsertWhere::compile(condition, schema)?;
             }
-            for row in &rows {
-                for (col_idx, value) in &bound_assignments {
-                    let BoundUpsertValue::Excluded(src_idx) = value else {
-                        continue;
-                    };
-                    // `EXCLUDED.<col>` が実際に NULL かどうかは `Value::Null`
-                    // そのもの（`src_idx` が範囲外の場合も fail-closed に NULL
-                    // 扱い）でのみ判定する。以前は `Vector`／`Text` 以外を
-                    // すべて NULL とみなしていたため、`Value::Array`（Issue
-                    // #888）を持つ NOT NULL な配列列に対する
-                    // `ON CONFLICT DO UPDATE SET <array> = EXCLUDED.<array>`
-                    // が常に拒否されていた（Cursor Bugbot 指摘・PR #1011）。
-                    let is_null = matches!(
-                        row.values.get(*src_idx),
-                        None | Some(crate::row_codec::Value::Null)
-                    );
-                    let target_nullable = schema
-                        .columns
-                        .get(*col_idx)
-                        .map(|c| c.nullable)
-                        .unwrap_or(false);
-                    if is_null && !target_nullable {
-                        let target_name = schema
-                            .columns
-                            .get(*col_idx)
-                            .map(|c| c.name.as_str())
-                            .unwrap_or("?");
-                        let src_name = schema
-                            .columns
-                            .get(*src_idx)
-                            .map(|c| c.name.as_str())
-                            .unwrap_or("?");
-                        // 文言に行 `id` を含めていた旧実装から、他分類
-                        // （`NotNullViolation`・`23502`）との一貫性のため列名の
-                        // みを含む固定形式へ変更（TABLE-16・TASK-204、
-                        // Issue #904。src_name は EXCLUDED 修飾子の参照先の
-                        // ため引き続きログ的に有用だが `client_message` の
-                        // 一般文言と型を揃える）。
-                        let _ = (src_name, row.id);
-                        return Err(SqlSurfaceError::not_null_violation(target_name));
-                    }
-                }
-            }
+            check_excluded_not_null(&rows, &bound_assignments, schema)?;
             BoundConflictAction::DoUpdate {
                 assignments: bound_assignments,
                 condition: condition.clone(),
@@ -5421,6 +5379,167 @@ fn bind_upsert_form(
         action: bound_action,
         operation_id: stmt.operation_id.clone(),
     }))
+}
+
+/// `EXCLUDED.<col>` が参照する値が `Null` かつ代入先の列が非 nullable の組を行ごとに検出し、
+/// 固定形式の `23502` で拒否する（[`bind_upsert_form`] と [`build_upsert_from_select_rows`] が共有）。
+///
+/// `EXCLUDED.<col>` が実際に NULL かどうかは `Value::Null` そのもの（`src_idx` が範囲外の場合も
+/// fail-closed に NULL 扱い）でのみ判定する。以前は `Vector`／`Text` 以外をすべて NULL と
+/// みなしていたため、`Value::Array`（Issue #888）を持つ NOT NULL な配列列に対する
+/// `ON CONFLICT DO UPDATE SET <array> = EXCLUDED.<array>` が常に拒否されていた
+/// （Cursor Bugbot 指摘・PR #1011）。文言には行 `id`・値を含めず列名のみとする
+/// （TABLE-16・TASK-204、Issue #904）。
+fn check_excluded_not_null(
+    rows: &[BoundInsert],
+    assignments: &[(usize, BoundUpsertValue)],
+    schema: &TableSchema,
+) -> Result<(), SqlSurfaceError> {
+    for row in rows {
+        for (col_idx, value) in assignments {
+            let BoundUpsertValue::Excluded(src_idx) = value else {
+                continue;
+            };
+            let is_null = matches!(
+                row.values.get(*src_idx),
+                None | Some(crate::row_codec::Value::Null)
+            );
+            let target_nullable = schema
+                .columns
+                .get(*col_idx)
+                .map(|c| c.nullable)
+                .unwrap_or(false);
+            if is_null && !target_nullable {
+                let target_name = schema
+                    .columns
+                    .get(*col_idx)
+                    .map(|c| c.name.as_str())
+                    .unwrap_or("?");
+                return Err(SqlSurfaceError::not_null_violation(target_name));
+            }
+        }
+    }
+    Ok(())
+}
+
+/// `ON CONFLICT` 句の静的束縛（対象の解決・対象省略 × `DO UPDATE` の拒否・`SET` 右辺の束縛）。
+/// 行の値に依存しないため、`INSERT ... SELECT`（Issue #2614）が内側 SELECT の評価より前に呼べる。
+/// [`bind_upsert_form`]（VALUES 形）は判定順を保つため本関数を使わず、同じ部品を従来の順で呼ぶ。
+pub(crate) fn bind_conflict_clause(
+    clause: &OnConflictClause,
+    schema: &TableSchema,
+) -> Result<(BoundConflictTarget, BoundConflictAction), SqlSurfaceError> {
+    let target = resolve_conflict_target(&clause.target, schema)?;
+    // 多層防御: 対象省略は `DO NOTHING` 専用（構文段で拒否済みでも束縛段で再検査する）。
+    if matches!(target, BoundConflictTarget::AnyUnique)
+        && !matches!(clause.action, OnConflictAction::DoNothing)
+    {
+        return Err(SqlSurfaceError::unsupported(
+            "ON CONFLICT DO UPDATE requires inference specification or constraint name",
+        ));
+    }
+    let action = match &clause.action {
+        OnConflictAction::DoNothing => BoundConflictAction::DoNothing,
+        OnConflictAction::DoUpdate {
+            assignments,
+            condition,
+        } => {
+            // `WHERE` 条件の検証（VALUES 形と同じ。束縛結果は捨て、実行段が再コンパイルする）。
+            if !condition.is_empty() {
+                crate::sql::upsert_where::CompiledUpsertWhere::compile(condition, schema)?;
+            }
+            BoundConflictAction::DoUpdate {
+                assignments: bind_upsert_assignments(assignments, schema)?,
+                condition: condition.clone(),
+            }
+        }
+    };
+    Ok((target, action))
+}
+
+/// `INSERT ... SELECT ... ON CONFLICT` の結果行（[`BoundInsert`] 列）から [`BoundUpsert`] を作る
+/// （SQL-51・SQL-49 (4)、Issue #2614。`core/insert_select_exec.rs` から呼ばれ、以降は VALUES 形と同じ
+/// `sql::exec::execute_upsert_in` の経路へ流れる）。
+///
+/// 同一文内で衝突キーが 2 回現れる場合は PostgreSQL 17 と同じにする: `DO UPDATE` は固定文言の
+/// `21000` で文全体を拒否し、`DO NOTHING` は先に現れた行を残して後の重複行を取り除く。
+/// キーに NULL を含む行は重複とみなさない（NULLS DISTINCT）。`AnyUnique`（対象省略）は
+/// 行ごとの衝突判定を書き込み段（tenant 層）が担うため素通しする。衝突対象以外の一意性違反は
+/// 取り除かず、書き込み段の既存検査（`23505`）に任せる。VALUES 形の文内重複（`22000`）は
+/// 本関数の対象外で挙動を変えない。`id` 省略行・SEQUENCE の印は fail-closed で拒否する。
+pub(crate) fn build_upsert_from_select_rows(
+    table: &str,
+    rows: Vec<BoundInsert>,
+    target: BoundConflictTarget,
+    action: BoundConflictAction,
+    schema: &TableSchema,
+    operation_id: Option<OperationId>,
+) -> Result<BoundUpsert, SqlSurfaceError> {
+    if rows.iter().any(|r| r.id_omitted) {
+        return Err(SqlSurfaceError::feature_not_supported(
+            "omitting the id pseudo-column is not supported for INSERT ... ON CONFLICT",
+        ));
+    }
+    if rows.iter().any(|r| {
+        r.volatile_default_columns.iter().any(|c| {
+            matches!(
+                c,
+                VolatileColumn::Sequence(..) | VolatileColumn::DefaultSequence(..)
+            )
+        })
+    }) {
+        return Err(reject_sequence_call_literal());
+    }
+    let do_update = matches!(action, BoundConflictAction::DoUpdate { .. });
+
+    // 重複判定の鍵は対象ごとに決める。`None` は「判定しない」（NULL を含むキー・対象省略）。
+    let key_of = |row: &BoundInsert| -> Result<Option<Vec<u8>>, SqlSurfaceError> {
+        match &target {
+            BoundConflictTarget::RowId => Ok(Some(row.id.to_be_bytes().to_vec())),
+            BoundConflictTarget::Unique(indices) => {
+                crate::constraint::unique_key_from_values(indices, &row.values)
+                    .map_err(SqlSurfaceError::invalid_input)
+            }
+            BoundConflictTarget::AnyUnique => Ok(None),
+        }
+    };
+
+    let rows = if matches!(target, BoundConflictTarget::AnyUnique) {
+        rows
+    } else {
+        let mut seen: std::collections::HashSet<Vec<u8>> = std::collections::HashSet::new();
+        seen.try_reserve(rows.len()).map_err(|_| {
+            SqlSurfaceError::payload_too_large("failed to reserve UPSERT target key set")
+        })?;
+        let mut kept: Vec<BoundInsert> = Vec::new();
+        kept.try_reserve_exact(rows.len()).map_err(|_| {
+            SqlSurfaceError::payload_too_large("failed to reserve UPSERT row batch buffer")
+        })?;
+        for row in rows {
+            if let Some(key) = key_of(&row)? {
+                if !seen.insert(key) {
+                    if do_update {
+                        return Err(SqlSurfaceError::upsert_cardinality_violation());
+                    }
+                    // `DO NOTHING`: 先の行を残し、後の重複行は飛ばす。
+                    continue;
+                }
+            }
+            kept.push(row);
+        }
+        kept
+    };
+
+    if let BoundConflictAction::DoUpdate { assignments, .. } = &action {
+        check_excluded_not_null(&rows, assignments, schema)?;
+    }
+    Ok(BoundUpsert {
+        table: table.to_string(),
+        rows,
+        target,
+        action,
+        operation_id,
+    })
 }
 
 /// `ON CONFLICT ... DO UPDATE SET` の右辺を束縛する（SQL-20・TASK-193、
