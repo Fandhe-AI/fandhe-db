@@ -25,6 +25,7 @@ use crate::catalog::{ColumnType, TableSchema};
 use crate::recovery::required_op_id::OperationId;
 use crate::row_codec::Value;
 use crate::sql::allowlist::{CopyFormat, InsertLiteral, SqlSurfaceError};
+use crate::sql::copy_options::{CopyHeader, CopyOptions};
 use crate::sql::parser::{
     bind_bytea_literal, bind_datetime_literal, bind_double_literal, bind_enum_literal,
     bind_integer_literal, bind_json_literal, bind_numeric_literal, bind_real_copy_field,
@@ -103,30 +104,54 @@ enum CsvFieldState {
     /// が続く）や `"a"\r`（改行なしで終端する単独 CR）といった、CR の後に
     /// `\n` が続かない不正な CSV も正常データとして受理してしまっていた）。
     AfterQuoteCr,
+    /// 引用符付きフィールド内で `ESCAPE`（`QUOTE` と異なる場合のみ）を受けた直後
+    /// （Issue #1764）。次バイトが `QUOTE`／`ESCAPE` ならそのバイトをデータとして積み、
+    /// それ以外なら `ESCAPE` 自体をデータとして積んでから次バイトを通常データとして扱う
+    /// （PostgreSQL の COPY CSV と同じ意味）。チャンク境界をまたいでも状態で保持する。
+    QuotedEscape,
 }
 
+/// CSV 形式のレコード走査器。区切り・引用・エスケープ・NULL 文字列は `COPY ... WITH (...)` の
+/// 解決済みオプション（[`CopyOptions`]。Issue #1764・WIRE-22 のポインタ）で決まる。
 #[derive(Debug)]
 struct CsvRecordScanner {
     state: CsvFieldState,
     quoted: bool,
     field: Vec<u8>,
     fields: Vec<Option<String>>,
+    delimiter: u8,
+    quote: u8,
+    escape: u8,
+    null_string: Vec<u8>,
 }
 
 impl CsvRecordScanner {
+    /// 既定オプション（`,`・`"`・NULL は空欄）の走査器（単体テスト用）。
+    #[cfg(test)]
     fn new() -> Self {
+        Self::with_options(&crate::sql::copy_options::defaults_for_format(
+            CopyFormat::Csv,
+        ))
+    }
+
+    fn with_options(options: &CopyOptions) -> Self {
         Self {
             state: CsvFieldState::Start,
             quoted: false,
             field: Vec::new(),
             fields: Vec::new(),
+            delimiter: options.delimiter(),
+            quote: options.quote(),
+            escape: options.escape(),
+            null_string: options.null_string().as_bytes().to_vec(),
         }
     }
 
     fn push_field(&mut self) -> Result<(), SqlSurfaceError> {
         let bytes = std::mem::take(&mut self.field);
         let quoted = std::mem::replace(&mut self.quoted, false);
-        self.fields.push(finish_csv_field(bytes, quoted)?);
+        self.fields
+            .push(finish_csv_field(bytes, quoted, &self.null_string)?);
         self.state = CsvFieldState::Start;
         Ok(())
     }
@@ -136,100 +161,112 @@ impl CsvRecordScanner {
     /// 取り出す）。
     fn push_byte(&mut self, b: u8) -> Result<bool, SqlSurfaceError> {
         match self.state {
-            CsvFieldState::Start => match b {
-                b'"' => {
+            CsvFieldState::Start => {
+                if b == self.quote {
                     self.state = CsvFieldState::Quoted;
                     self.quoted = true;
                     Ok(false)
-                }
-                b',' => {
+                } else if b == self.delimiter {
                     self.push_field()?;
                     Ok(false)
-                }
-                b'\n' => {
+                } else if b == b'\n' {
                     self.push_field()?;
                     Ok(true)
-                }
-                // 裸の `\r` はまだ「引用符なしフィールド中のデータ」か
-                // 「CRLF レコード終端の一部」かが確定できないため
-                // `UnquotedCr` へ移行し、次バイトで判定する（フィールド
-                // 先頭で受けた場合も、後続の `\n` と対にして扱う）。
-                b'\r' => {
+                } else if b == b'\r' {
+                    // 裸の `\r` はまだ「引用符なしフィールド中のデータ」か
+                    // 「CRLF レコード終端の一部」かが確定できないため
+                    // `UnquotedCr` へ移行し、次バイトで判定する（フィールド
+                    // 先頭で受けた場合も、後続の `\n` と対にして扱う）。
                     self.state = CsvFieldState::UnquotedCr;
                     Ok(false)
-                }
-                _ => {
+                } else {
                     self.state = CsvFieldState::Unquoted;
                     self.field.push(b);
                     Ok(false)
                 }
-            },
-            CsvFieldState::Unquoted => match b {
-                // フィールド先頭以外での生引用符は不正配置（`ab"cd",x` 相当）。
-                b'"' => Err(SqlSurfaceError::invalid_input(
-                    "misplaced double quote in COPY CSV field (quote allowed only at field start)",
-                )),
-                b',' => {
+            }
+            CsvFieldState::Unquoted => {
+                if b == self.quote {
+                    // フィールド先頭以外での生引用符は不正配置（`ab"cd",x` 相当）。
+                    Err(SqlSurfaceError::invalid_input(
+                        "misplaced double quote in COPY CSV field (quote allowed only at field start)",
+                    ))
+                } else if b == self.delimiter {
                     self.push_field()?;
                     Ok(false)
-                }
-                b'\n' => {
+                } else if b == b'\n' {
                     self.push_field()?;
                     Ok(true)
-                }
-                // `Start` と同じく、裸の `\r` は `UnquotedCr` へ移行して
-                // 次バイトで判定する（フィールドへは積まない）。
-                b'\r' => {
+                } else if b == b'\r' {
+                    // `Start` と同じく、裸の `\r` は `UnquotedCr` へ移行して
+                    // 次バイトで判定する（フィールドへは積まない）。
                     self.state = CsvFieldState::UnquotedCr;
                     Ok(false)
-                }
-                _ => {
+                } else {
+                    // 引用符外の `ESCAPE` バイトはリテラル（PostgreSQL と同じ）。
                     self.field.push(b);
                     Ok(false)
                 }
-            },
-            CsvFieldState::Quoted => match b {
-                // ここではエスケープ（直後にもう 1 個 `"`）か閉じ引用符かが
-                // まだ確定できないため `AfterQuote` へ移行し、次バイトで
-                // 判定する。
-                b'"' => {
+            }
+            CsvFieldState::Quoted => {
+                if self.escape != self.quote && b == self.escape {
+                    self.state = CsvFieldState::QuotedEscape;
+                } else if b == self.quote {
+                    // ここではエスケープ（`ESCAPE == QUOTE` で直後にもう 1 個
+                    // 引用符）か閉じ引用符かがまだ確定できないため `AfterQuote`
+                    // へ移行し、次バイトで判定する。
                     self.state = CsvFieldState::AfterQuote;
-                    Ok(false)
-                }
-                // 引用符内の生改行はデータ（埋め込み改行）。
-                _ => {
+                } else {
+                    // 引用符内の生改行はデータ（埋め込み改行）。
                     self.field.push(b);
-                    Ok(false)
                 }
-            },
-            CsvFieldState::AfterQuote => match b {
-                b'"' => {
-                    // 直前の `"` と合わせてエスケープされた引用符。
-                    self.field.push(b'"');
-                    self.state = CsvFieldState::Quoted;
-                    Ok(false)
+                Ok(false)
+            }
+            CsvFieldState::QuotedEscape => {
+                if b != self.quote && b != self.escape {
+                    // `ESCAPE` は後続が `QUOTE`／`ESCAPE` のときだけ特別扱いで、
+                    // それ以外では `ESCAPE` 自体がデータ。
+                    self.field.push(self.escape);
                 }
-                b',' => {
+                self.field.push(b);
+                self.state = CsvFieldState::Quoted;
+                Ok(false)
+            }
+            CsvFieldState::AfterQuote => {
+                if b == self.quote {
+                    if self.escape == self.quote {
+                        // 直前の引用符と合わせてエスケープされた引用符。
+                        self.field.push(b);
+                        self.state = CsvFieldState::Quoted;
+                        Ok(false)
+                    } else {
+                        // `ESCAPE != QUOTE` では閉じ引用符直後の引用符は不正配置
+                        // （PostgreSQL は引用の再開として受理するが、本実装は
+                        // 「引用はフィールド先頭のみ」を維持して拒否側に倒す）。
+                        Err(SqlSurfaceError::invalid_input(
+                            "unexpected byte after closing double quote in COPY CSV field",
+                        ))
+                    }
+                } else if b == self.delimiter {
                     self.push_field()?;
                     Ok(false)
-                }
-                b'\n' => {
+                } else if b == b'\n' {
                     self.push_field()?;
                     Ok(true)
-                }
-                // `\r\n` レコード終端の `\r` 側。まだ `\n` が続くかどうかが
-                // 確定していないため `AfterQuoteCr` へ移行し、次バイトで
-                // 判定する（フィールドへは積まない）。
-                b'\r' => {
+                } else if b == b'\r' {
+                    // `\r\n` レコード終端の `\r` 側。まだ `\n` が続くかどうかが
+                    // 確定していないため `AfterQuoteCr` へ移行し、次バイトで
+                    // 判定する（フィールドへは積まない）。
                     self.state = CsvFieldState::AfterQuoteCr;
                     Ok(false)
+                } else {
+                    // 閉じ引用符の直後に区切り・レコード終端・エスケープ以外の
+                    // バイトが来るのは不正配置（`"ab"junk,x` 相当）。
+                    Err(SqlSurfaceError::invalid_input(
+                        "unexpected byte after closing double quote in COPY CSV field",
+                    ))
                 }
-                // 閉じ引用符の直後に区切り・レコード終端・エスケープ以外の
-                // バイトが来るのは不正配置（`"ab"junk,x` 相当）。
-                _ => Err(SqlSurfaceError::invalid_input(
-                    "unexpected byte after closing double quote in COPY CSV field",
-                )),
-            },
+            }
             CsvFieldState::AfterQuoteCr => match b {
                 // `\r\n` が揃った。レコード終端として確定する。
                 b'\n' => {
@@ -272,7 +309,10 @@ impl CsvRecordScanner {
     /// 場合）のフィールド列を返す。引用符が閉じられないまま終わった場合は
     /// `22000` で拒否する（旧 `decode_csv_record` の未終端引用符検査を踏襲）。
     fn finish(mut self) -> Result<Option<Vec<Option<String>>>, SqlSurfaceError> {
-        if self.state == CsvFieldState::Quoted {
+        if matches!(
+            self.state,
+            CsvFieldState::Quoted | CsvFieldState::QuotedEscape
+        ) {
             return Err(SqlSurfaceError::invalid_input(
                 "unterminated quoted CSV field in COPY record",
             ));
@@ -340,18 +380,35 @@ impl CsvRecordScanner {
 /// 「行終端の一部」と決め打つ入力の無言改変だった）。
 #[derive(Debug)]
 enum RecordSplitter {
-    Text { pending: Vec<u8>, pending_cr: bool },
+    Text {
+        pending: Vec<u8>,
+        pending_cr: bool,
+        delimiter: u8,
+        null_string: Vec<u8>,
+    },
     Csv(CsvRecordScanner),
 }
 
 impl RecordSplitter {
+    /// 既定オプションの分割器（単体テスト用）。
+    #[cfg(test)]
     fn new(format: CopyFormat) -> Self {
+        Self::with_options(
+            format,
+            &crate::sql::copy_options::defaults_for_format(format),
+        )
+    }
+
+    /// `options`（区切り・NULL 文字列・引用・エスケープ）を適用する分割器。
+    fn with_options(format: CopyFormat, options: &CopyOptions) -> Self {
         match format {
             CopyFormat::Text => RecordSplitter::Text {
                 pending: Vec::new(),
                 pending_cr: false,
+                delimiter: options.delimiter(),
+                null_string: options.null_string().as_bytes().to_vec(),
             },
-            CopyFormat::Csv => RecordSplitter::Csv(CsvRecordScanner::new()),
+            CopyFormat::Csv => RecordSplitter::Csv(CsvRecordScanner::with_options(options)),
         }
     }
 
@@ -366,6 +423,8 @@ impl RecordSplitter {
             RecordSplitter::Text {
                 pending,
                 pending_cr,
+                delimiter,
+                null_string,
             } => {
                 for &b in chunk {
                     if *pending_cr {
@@ -377,7 +436,7 @@ impl RecordSplitter {
                         *pending_cr = false;
                         if b == b'\n' {
                             let record = std::mem::take(pending);
-                            on_record(decode_text_record(&record)?)?;
+                            on_record(decode_text_record(&record, *delimiter, null_string)?)?;
                             continue;
                         } else {
                             return Err(SqlSurfaceError::invalid_input(
@@ -392,7 +451,7 @@ impl RecordSplitter {
                         }
                         b'\n' => {
                             let record = std::mem::take(pending);
-                            on_record(decode_text_record(&record)?)?;
+                            on_record(decode_text_record(&record, *delimiter, null_string)?)?;
                         }
                         _ => pending.push(b),
                     }
@@ -417,6 +476,8 @@ impl RecordSplitter {
             RecordSplitter::Text {
                 pending,
                 pending_cr,
+                delimiter,
+                null_string,
             } => {
                 // CopyDone に到達した時点で「LF の続かない裸の CR」が
                 // 確定しないまま残っている場合、CRLF が完成しない不正配置
@@ -431,7 +492,7 @@ impl RecordSplitter {
                 if pending.is_empty() {
                     Ok(None)
                 } else {
-                    Ok(Some(decode_text_record(&pending)?))
+                    Ok(Some(decode_text_record(&pending, delimiter, &null_string)?))
                 }
             }
             RecordSplitter::Csv(scanner) => scanner.finish(),
@@ -439,15 +500,19 @@ impl RecordSplitter {
     }
 }
 
-/// text 形式のバックスラッシュエスケープを解決する（PostgreSQL 互換の
-/// `\\`／`\t`／`\n`／`\r`／`\b`／`\f`／`\v`。それ以外のエスケープ（8 進・
-/// 16 進を含む）は fail-closed に `22000` で拒否する。フィールド全体が
-/// リテラル `\N` の場合のみ NULL とする（`\N` が末尾以外の位置に現れた
-/// 場合は通常のエスケープ解決に入り、`N` は未対応エスケープとして拒否
-/// される。これは PostgreSQL 本家がフィールド全体一致でのみ `\N` を特別
-/// 扱いする契約と同じ）。
-fn decode_text_field(raw: &[u8]) -> Result<Option<String>, SqlSurfaceError> {
-    if raw == b"\\N" {
+/// text 形式の 1 フィールド（区切りで分割済み・エスケープ未解決の生バイト列）をデコードする。
+/// 生バイト列が `null_string`（既定 `\N`）と完全一致する場合のみ NULL とする（エスケープ解決前に
+/// 判定するため、`\N` が末尾以外の位置に現れた場合は通常のエスケープ解決に入り、`N` は未対応
+/// エスケープとして拒否される。PostgreSQL 本家がフィールド全体一致でのみ NULL 表現を特別扱い
+/// する契約と同じ）。エスケープは PostgreSQL 互換の `\\`／`\t`／`\n`／`\r`／`\b`／`\f`／`\v` と
+/// `\<区切り文字>`（区切り文字そのもの）を受理し、それ以外（8 進・16 進を含む）は fail-closed に
+/// `22000` で拒否する。
+fn decode_text_field(
+    raw: &[u8],
+    delimiter: u8,
+    null_string: &[u8],
+) -> Result<Option<String>, SqlSurfaceError> {
+    if raw == null_string {
         return Ok(None);
     }
     let mut out: Vec<u8> = Vec::with_capacity(raw.len());
@@ -465,6 +530,7 @@ fn decode_text_field(raw: &[u8]) -> Result<Option<String>, SqlSurfaceError> {
             Some(b'b') => out.push(0x08),
             Some(b'f') => out.push(0x0C),
             Some(b'v') => out.push(0x0B),
+            Some(c) if c == delimiter => out.push(c),
             _ => {
                 return Err(SqlSurfaceError::invalid_input(
                     "unsupported backslash escape in COPY text field",
@@ -477,22 +543,46 @@ fn decode_text_field(raw: &[u8]) -> Result<Option<String>, SqlSurfaceError> {
         .map_err(|_| SqlSurfaceError::invalid_input("COPY text field is not valid UTF-8"))
 }
 
-/// text 形式の 1 レコードをタブ区切りでフィールドへ分割する。生のタブ
-/// バイトは常にフィールド区切り（埋め込みタブはクライアント側で `\t` へ
-/// エスケープ済みである契約。[`RecordSplitter`] の LF と同じ考え方）。
-fn decode_text_record(record: &[u8]) -> Result<Vec<Option<String>>, SqlSurfaceError> {
-    record
-        .split(|&b| b == b'\t')
-        .map(decode_text_field)
-        .collect()
+/// text 形式の 1 レコードを `delimiter` でフィールドへ分割する。バックスラッシュは次の 1 バイトと
+/// 組で扱い、エスケープされた区切り文字（`\<区切り>`）ではフィールドを分割しない
+/// （PostgreSQL の COPY TO がカスタム区切りをこの形で出力するため）。エスケープの解決自体は
+/// [`decode_text_field`] の責務。バイト単位で安全なのは、区切り・バックスラッシュが ASCII で
+/// UTF-8 の多バイト列中に現れないため。
+fn decode_text_record(
+    record: &[u8],
+    delimiter: u8,
+    null_string: &[u8],
+) -> Result<Vec<Option<String>>, SqlSurfaceError> {
+    let mut fields = Vec::new();
+    let mut raw: Vec<u8> = Vec::new();
+    let mut iter = record.iter().copied();
+    while let Some(b) = iter.next() {
+        if b == b'\\' {
+            raw.push(b);
+            if let Some(next) = iter.next() {
+                raw.push(next);
+            }
+        } else if b == delimiter {
+            fields.push(decode_text_field(&raw, delimiter, null_string)?);
+            raw.clear();
+        } else {
+            raw.push(b);
+        }
+    }
+    fields.push(decode_text_field(&raw, delimiter, null_string)?);
+    Ok(fields)
 }
 
 /// [`CsvRecordScanner::push_field`] が使う、1 フィールド分の生バイト列を
-/// NULL／空文字列／通常値へ写像する共通処理（引用符で囲まれていない空
-/// フィールドは NULL、引用符で囲まれた空フィールド（`""`）は空文字列として
-/// 区別する）。
-fn finish_csv_field(bytes: Vec<u8>, quoted: bool) -> Result<Option<String>, SqlSurfaceError> {
-    if bytes.is_empty() && !quoted {
+/// NULL／空文字列／通常値へ写像する共通処理（引用符で囲まれておらず `NULL` 文字列と一致する
+/// フィールドは NULL〔既定は空欄〕、引用符で囲まれたフィールドは決して NULL にせず、`""` は
+/// 空文字列として区別する）。
+fn finish_csv_field(
+    bytes: Vec<u8>,
+    quoted: bool,
+    null_string: &[u8],
+) -> Result<Option<String>, SqlSurfaceError> {
+    if !quoted && bytes == null_string {
         return Ok(None);
     }
     String::from_utf8(bytes)
@@ -727,6 +817,31 @@ fn bound_insert_byte_len(bound: &BoundInsert) -> Result<usize, SqlSurfaceError> 
     Ok(total)
 }
 
+/// ヘッダ行（最初のレコード）を処理する。`HEADER true` は内容を見ずに破棄し、`HEADER MATCH` は
+/// フィールド数と各列名（NULL 不可・大小区別）が COPY の列リストと一致することを検査する
+/// （PostgreSQL 17 と同じ）。エラー文言にはヘッダの内容を含めない（Issue #1764・WIRE-22）。
+fn check_header_record(
+    header: CopyHeader,
+    columns: &[String],
+    fields: &[Option<String>],
+) -> Result<(), SqlSurfaceError> {
+    if header != CopyHeader::Match {
+        return Ok(());
+    }
+    let matches = fields.len() == columns.len()
+        && fields
+            .iter()
+            .zip(columns.iter())
+            .all(|(f, c)| f.as_deref() == Some(c.as_str()));
+    if matches {
+        Ok(())
+    } else {
+        Err(SqlSurfaceError::invalid_input(
+            "COPY header line does not match the column list",
+        ))
+    }
+}
+
 /// `COPY <table> (<cols>) FROM STDIN` の逐次取り込み状態（Issue #939・
 /// WIRE-17）。構築は [`crate::core::EngineCore::begin_copy`] のみが行う。
 /// [`Self::feed`] を CopyData ごとに呼び、INDEX-4 の 4 上限を CopyDone より
@@ -746,7 +861,13 @@ pub struct CopyInSession {
     // （`CopyPlan::From(CopyInSession)` のまま。外部クレートへの破壊的変更なし）。
     schema: Box<TableSchema>,
     limits: BatchLimits,
-    splitter: RecordSplitter,
+    // `Box`: オプション（区切り・NULL 文字列）を保持して大きくなった分で `CopyPlan::From` が
+    // `clippy::large_enum_variant` に抵触しないよう、schema と同じ理由で包む。
+    splitter: Box<RecordSplitter>,
+    /// `HEADER` 指定（Issue #1764）。`False` 以外のとき最初の 1 レコードをヘッダ行として扱う。
+    header: CopyHeader,
+    /// 最初のレコード（ヘッダ行）をまだ処理していないか。
+    header_pending: bool,
     bounds: Vec<BoundInsert>,
     running_bytes: usize,
     /// 列 `DEFAULT now()` 系の評価時刻（SQL-37・Issue #1587）。COPY は行ごとの束縛が複数の
@@ -821,17 +942,31 @@ impl CopyInSession {
         table: String,
         columns: Vec<String>,
         format: CopyFormat,
+        options: CopyOptions,
         operation_id: Option<OperationId>,
         schema: TableSchema,
         limits: BatchLimits,
         clock: crate::sql::time_fn::StatementClock,
         time_zone: crate::datetime::SessionTimeZone,
     ) -> Result<Self, SqlSurfaceError> {
+        // csv で QUOTE／ESCAPE が改行系だとレコード終端と曖昧になるため、未対応として
+        // CopyInResponse 前に拒否する（PostgreSQL は検査しないが拒否側に倒す既知の相違）。
+        if format == CopyFormat::Csv
+            && [options.quote(), options.escape()]
+                .iter()
+                .any(|b| *b == b'\n' || *b == b'\r')
+        {
+            return Err(SqlSurfaceError::feature_not_supported(
+                "COPY quote or escape cannot be newline or carriage return",
+            ));
+        }
         Self::validate_columns_against_schema(&columns, &schema)?;
         Ok(Self {
             table,
             columns,
-            splitter: RecordSplitter::new(format),
+            splitter: Box::new(RecordSplitter::with_options(format, &options)),
+            header: options.header(),
+            header_pending: options.header() != CopyHeader::False,
             operation_id,
             schema: Box::new(schema),
             limits,
@@ -883,12 +1018,19 @@ impl CopyInSession {
         let bounds = &mut self.bounds;
         let splitter = &mut self.splitter;
         let clock = self.clock;
+        let header = self.header;
+        let header_pending = &mut self.header_pending;
 
         // 行ごとの束縛が評価した時刻 DEFAULT の印をスコープ外のスレッド状態へ漏らさず、
         // 自セッションの `clock_used` へ回収する（Issue #2188）。
         let _tz_scope = crate::datetime::SessionTimeZoneScope::enter((*self.time_zone).clone());
         let scope = crate::sql::time_fn::DefaultClockScope::enter(clock);
         let result = splitter.feed(chunk, |fields| {
+            // 最初に確定したレコードはヘッダ行。破棄（または照合）するだけで、
+            // 行数①・チャンク数④・束縛の対象に含めない。
+            if std::mem::take(header_pending) {
+                return check_header_record(header, &columns, &fields);
+            }
             if fields.len() != columns.len() {
                 return Err(SqlSurfaceError::invalid_input(format!(
                     "COPY record field count {} does not match column count {}",
@@ -916,33 +1058,39 @@ impl CopyInSession {
     pub fn finish(mut self) -> Result<CopyInBatch, SqlSurfaceError> {
         let tail = self.splitter.finish()?;
         if let Some(fields) = tail {
-            if fields.len() != self.columns.len() {
-                return Err(SqlSurfaceError::invalid_input(format!(
-                    "COPY record field count {} does not match column count {}",
-                    fields.len(),
-                    self.columns.len()
-                )));
+            if std::mem::take(&mut self.header_pending) {
+                check_header_record(self.header, &self.columns, &fields)?;
+            } else {
+                if fields.len() != self.columns.len() {
+                    return Err(SqlSurfaceError::invalid_input(format!(
+                        "COPY record field count {} does not match column count {}",
+                        fields.len(),
+                        self.columns.len()
+                    )));
+                }
+                let next_count = self.bounds.len().saturating_add(1);
+                batch_limits::check_row_count(next_count, &self.limits).map_err(map_batch_err)?;
+                batch_limits::validate_chunk_total(next_count, &self.limits)
+                    .map_err(map_batch_err)?;
+                let _tz_scope =
+                    crate::datetime::SessionTimeZoneScope::enter((*self.time_zone).clone());
+                let scope = crate::sql::time_fn::DefaultClockScope::enter(self.clock);
+                let bound = bind_copy_record(
+                    &self.table,
+                    &self.columns,
+                    &fields,
+                    &self.operation_id,
+                    &self.schema,
+                    self.clock,
+                );
+                self.clock_used |= scope.was_used();
+                drop(scope);
+                let bound = bound?;
+                let row_bytes = bound_insert_byte_len(&bound)?;
+                batch_limits::check_row_body_len(self.bounds.len(), row_bytes, &self.limits)
+                    .map_err(map_batch_err)?;
+                self.bounds.push(bound);
             }
-            let next_count = self.bounds.len().saturating_add(1);
-            batch_limits::check_row_count(next_count, &self.limits).map_err(map_batch_err)?;
-            batch_limits::validate_chunk_total(next_count, &self.limits).map_err(map_batch_err)?;
-            let _tz_scope = crate::datetime::SessionTimeZoneScope::enter((*self.time_zone).clone());
-            let scope = crate::sql::time_fn::DefaultClockScope::enter(self.clock);
-            let bound = bind_copy_record(
-                &self.table,
-                &self.columns,
-                &fields,
-                &self.operation_id,
-                &self.schema,
-                self.clock,
-            );
-            self.clock_used |= scope.was_used();
-            drop(scope);
-            let bound = bound?;
-            let row_bytes = bound_insert_byte_len(&bound)?;
-            batch_limits::check_row_body_len(self.bounds.len(), row_bytes, &self.limits)
-                .map_err(map_batch_err)?;
-            self.bounds.push(bound);
         }
 
         if self.bounds.is_empty() {
@@ -1109,19 +1257,19 @@ mod tests {
     #[test]
     fn decode_text_field_resolves_standard_escapes() {
         assert_eq!(
-            decode_text_field(b"a\\tb\\nc\\\\d").unwrap(),
+            decode_text_field(b"a\\tb\\nc\\\\d", b'\t', b"\\N").unwrap(),
             Some("a\tb\nc\\d".to_string())
         );
     }
 
     #[test]
     fn decode_text_field_whole_field_backslash_n_is_null() {
-        assert_eq!(decode_text_field(b"\\N").unwrap(), None);
+        assert_eq!(decode_text_field(b"\\N", b'\t', b"\\N").unwrap(), None);
     }
 
     #[test]
     fn decode_text_field_rejects_unknown_escape() {
-        assert!(decode_text_field(b"a\\xb").is_err());
+        assert!(decode_text_field(b"a\\xb", b'\t', b"\\N").is_err());
     }
 
     #[test]
@@ -1289,5 +1437,140 @@ mod tests {
         let err =
             bind_copy_record("t", &columns, &fields, &None, &schema, test_clock()).unwrap_err();
         assert_eq!(err.wire_code(), "22000");
+    }
+    // ---- Issue #1764: WITH オプションの適用 ----
+
+    fn opts(format: &str, pairs: &[(&str, &str)]) -> (CopyFormat, CopyOptions) {
+        use crate::sql::copy_options::{resolve, CopyDirection, RawCopyOption, RawCopyValue};
+        let mut raw = vec![RawCopyOption {
+            name: "format".to_string(),
+            value: Some(RawCopyValue::Ident(format.to_string())),
+        }];
+        for (k, v) in pairs {
+            raw.push(RawCopyOption {
+                name: (*k).to_string(),
+                value: Some(RawCopyValue::String((*v).to_string())),
+            });
+        }
+        resolve(raw, CopyDirection::From).expect("resolve")
+    }
+
+    fn split_all(
+        format: CopyFormat,
+        options: &CopyOptions,
+        input: &[u8],
+        bytewise: bool,
+    ) -> Result<Vec<Vec<Option<String>>>, SqlSurfaceError> {
+        let mut splitter = RecordSplitter::with_options(format, options);
+        let mut out = Vec::new();
+        let mut on = |r| {
+            out.push(r);
+            Ok(())
+        };
+        if bytewise {
+            for i in 0..input.len() {
+                splitter.feed(&input[i..=i], &mut on)?;
+            }
+        } else {
+            splitter.feed(input, &mut on)?;
+        }
+        if let Some(r) = splitter.finish()? {
+            out.push(r);
+        }
+        Ok(out)
+    }
+
+    #[test]
+    fn csv_custom_quote_escape_null_and_delimiter() {
+        let (f, o) = opts(
+            "csv",
+            &[
+                ("delimiter", ";"),
+                ("quote", "'"),
+                ("escape", "\\"),
+                ("null", "NULL"),
+            ],
+        );
+        let input = b"NULL;'NULL';;'a\\'b';'c\\\\d';'x\\y'\n";
+        for bytewise in [false, true] {
+            let got = split_all(f, &o, input, bytewise).unwrap();
+            assert_eq!(
+                got,
+                vec![vec![
+                    None,
+                    Some("NULL".to_string()),
+                    Some(String::new()),
+                    Some("a'b".to_string()),
+                    Some("c\\d".to_string()),
+                    // ESCAPE の後が QUOTE／ESCAPE 以外なら ESCAPE 自体がデータ。
+                    Some("x\\y".to_string()),
+                ]]
+            );
+        }
+    }
+
+    #[test]
+    fn csv_escape_state_rejects_unterminated_and_reopened_quote() {
+        let (f, o) = opts("csv", &[("escape", "\\")]);
+        assert!(split_all(f, &o, b"\"abc\\", false).is_err());
+        assert!(split_all(f, &o, b"\"abc\n", false).is_err());
+        // ESCAPE != QUOTE では閉じ引用符直後の引用符は不正配置。
+        assert!(split_all(f, &o, b"\"a\"\"b\"\n", false).is_err());
+    }
+
+    #[test]
+    fn csv_unquoted_escape_byte_is_literal() {
+        let (f, o) = opts("csv", &[("escape", "\\")]);
+        let got = split_all(f, &o, b"a\\b,c\n", false).unwrap();
+        assert_eq!(
+            got,
+            vec![vec![Some("a\\b".to_string()), Some("c".to_string())]]
+        );
+    }
+
+    #[test]
+    fn text_custom_delimiter_null_and_escaped_delimiter() {
+        let (f, o) = opts("text", &[("delimiter", "|"), ("null", "NA")]);
+        for bytewise in [false, true] {
+            let got = split_all(f, &o, b"NA|a\\|b|\\N\n", bytewise);
+            // `\N` は NULL 文字列ではないため未対応エスケープとして拒否される。
+            assert!(got.is_err());
+            let got = split_all(f, &o, b"NA|a\\|b|\\\\\n", bytewise).unwrap();
+            assert_eq!(
+                got,
+                vec![vec![None, Some("a|b".to_string()), Some("\\".to_string())]]
+            );
+        }
+    }
+
+    #[test]
+    fn text_escaped_tab_is_literal_with_default_delimiter() {
+        let got = split_all(
+            CopyFormat::Text,
+            &crate::sql::copy_options::defaults_for_format(CopyFormat::Text),
+            b"a\\\tb\tc\n",
+            false,
+        )
+        .unwrap();
+        assert_eq!(
+            got,
+            vec![vec![Some("a\tb".to_string()), Some("c".to_string())]]
+        );
+    }
+
+    #[test]
+    fn check_header_record_true_discards_and_match_compares_names() {
+        let cols = vec!["id".to_string(), "body".to_string()];
+        let ok = vec![Some("id".to_string()), Some("body".to_string())];
+        assert!(check_header_record(CopyHeader::True, &cols, &[None]).is_ok());
+        assert!(check_header_record(CopyHeader::Match, &cols, &ok).is_ok());
+        for bad in [
+            vec![Some("id".to_string())],
+            vec![Some("id".to_string()), Some("Body".to_string())],
+            vec![Some("id".to_string()), None],
+        ] {
+            let e = check_header_record(CopyHeader::Match, &cols, &bad).unwrap_err();
+            assert_eq!(e.wire_code(), "22000");
+        }
     }
 }

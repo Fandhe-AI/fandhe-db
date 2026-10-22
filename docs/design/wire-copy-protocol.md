@@ -32,10 +32,10 @@
   - 拡張クエリプロトコル（TASK-216）経由の COPY の Execute（CopyIn／CopyOut の開始。
     Issue #1760）と、CopyFail 等の後の Sync までの同期回復（Issue #1761）。Parse／Bind／
     Describe までは Issue #1759 で受理済み（下の「拡張クエリの Parse／Bind／Describe」節）。
-  - `HEADER`／`DELIMITER`／`NULL`／`QUOTE` などの COPY オプションの適用（構文の解析は
-    Issue #1763 で実装済み。FROM 側の適用は Issue #1764、TO 側は Issue #1765。下の
-    「許可リスト」節）、binary 形式（WIRE-14 関連）、テーブル形 `COPY t TO STDOUT`、
-    8 進・16 進エスケープ。
+  - COPY オプションの TO 側の適用（Issue #1765。構文の解析は Issue #1763、FROM 側の
+    `HEADER`／`DELIMITER`／`NULL`／`QUOTE`／`ESCAPE` の適用は Issue #1764 で実装済み。
+    下の「許可リスト」「FROM STDIN の逐次取り込み」節）、binary 形式（WIRE-14 関連）、
+    テーブル形 `COPY t TO STDOUT`、8 進・16 進エスケープ。
 
 ## 設計（決定事項）
 
@@ -65,10 +65,10 @@
   等の制約違反が `22023`、モード不一致（text での `QUOTE`／`ESCAPE`）・1 バイトでない
   区切り文字・`HEADER MATCH` の `COPY TO` での使用・`FORCE_*` 等の未対応オプションが
   `0A000`。エラー文言には入力値を含めない。
-- ゲート: データ経路が未適用の間は、解決結果が format の既定値と異なる指定（`HEADER` 等）を
-  `0A000` で拒否する（無言の fail-open の防止）。既定値と等しい明示指定と旧構文の `CSV` は
-  受理する。Issue #1764・#1765 は自分の方向のゲート呼び出し
-  （`reject_unapplied_for_from`／`reject_unapplied_for_to`）を外す。
+- ゲート: データ経路が未適用の方向では、解決結果が format の既定値と異なる指定（`HEADER` 等）を
+  `0A000` で拒否する（無言の fail-open の防止）。`COPY FROM` は Issue #1764 で適用済みのため
+  ゲートを外した。`COPY TO` は Issue #1765 が `reject_unapplied_for_to` の呼び出しを外すまで
+  残る（既定値と等しい明示指定と旧構文の `CSV` は両方向で受理する）。
 - 既知の相違: `FORMAT binary` は WIRE-23 まで従来どおり `42601`、`WITH` だけでオプションの
   無い指定も `42601`（PostgreSQL は受理）、エスケープ文字列 `E'...'` は字句解析が未対応のため
   `42601`。
@@ -106,10 +106,29 @@
   はスキャナ自身の状態（現在の `CsvFieldState`・確定済み `fields`・構築中の
   `field` バイト列）をそのまま保持して次チャンクの継続として処理する。
 - フィールドデコード: text は PostgreSQL 互換のバックスラッシュエスケープ
-  （`\\`／`\t`／`\n`／`\r`／`\b`／`\f`／`\v`。フィールド全体一致の `\N` のみ
-  NULL）、CSV は RFC4180 風（`""` エスケープ、引用符なし空欄が NULL・引用符
-  ありの空欄が空文字列）。いずれも未対応のエスケープ・不正な UTF-8 は
-  `22000` で fail-closed に拒否する。
+  （`\\`／`\t`／`\n`／`\r`／`\b`／`\f`／`\v` と `\<区切り文字>`。生バイト列が NULL 文字列
+  〔既定 `\N`〕と全体一致するフィールドのみ NULL）、CSV は RFC4180 風（引用符なしで NULL 文字列
+  〔既定は空欄〕と一致するフィールドが NULL、引用符ありは決して NULL にせず `""` は空文字列）。
+  いずれも未対応のエスケープ・不正な UTF-8 は `22000` で fail-closed に拒否する。
+- オプションの適用（Issue #1764・WIRE-22 (1)(3)(6) ポインタ。`CopyInSession::new` が解決済みの
+  `CopyOptions` を受け取る）:
+  - `DELIMITER`／`NULL`: text は 1 パスのバックスラッシュ認識分割（エスケープされた区切りでは
+    分割しない。生バイト列で NULL 判定してからエスケープを解決する）。既定のタブ区切りでも
+    `\<TAB>` がリテラルのタブとして受理される（PostgreSQL と同じ）。
+  - `QUOTE`／`ESCAPE`（csv）: `CsvRecordScanner` が `quote`／`escape`／`delimiter` を保持する。
+    `ESCAPE != QUOTE` では引用内で `QuotedEscape` 状態を持ち、`ESCAPE` の次が `QUOTE`／`ESCAPE`
+    ならそのバイトをデータ、それ以外なら `ESCAPE` 自体をデータとして扱う（チャンク境界を
+    またいでも状態で保持。`ESCAPE` で終わるストリームは未終端引用として `22000`）。引用外の
+    `ESCAPE` はリテラル。
+  - `HEADER`: 最初に確定した 1 レコードをヘッダ行として扱う（引用付き・チャンク境界をまたぐ
+    ヘッダも同じ splitter で 1 レコードになる）。`true` は破棄、`MATCH` は列数と各列名
+    （`id` 疑似列を含む COPY 列リスト。大小区別・NULL 不可）の一致を検査し、不一致は固定文言の
+    `22000`（ヘッダの内容は含めない）。ヘッダ行は行数①・チャンク数④・束縛の対象外で、生バイトは
+    ③に従来どおり計上される（ヘッダ用の保持は 1 レコード分で③により有界）。
+  - csv で `QUOTE`／`ESCAPE` が CR／LF の場合は、レコード終端と曖昧になるため CopyInResponse
+    送出前に `0A000` で拒否する。
+  - 行形式エラー（列数過不足・未終端引用・ヘッダ不一致）は従来どおり `22000` を維持する
+    （WIRE-17 の改訂注記にある別コードへの切り替えは WIRE-22 確定時の扱い）。
 - 束縛（`bind_copy_record`）: `sql::parser::bind_insert_row`（`INSERT ...
   VALUES` 専用）とは意図的に別実装。`InsertLiteral` は文字列／数値リテラル
   のみを表現でき明示的な NULL 値を持てない（`INSERT` の許可形状自体が
@@ -168,7 +187,14 @@
    （query_canceled）を返すが、本リポは既存の分類（`InvalidInput`／`22000`）へ
    写像した（ERR-6 ポインタ）。
 4. **空の COPY（0 行）**: 既存の複数行 `INSERT` バッチ契約と同じく `22000`
-   （空バッチ拒否）とする。PostgreSQL の `COPY 0`（成功）とは異なる。
+   （空バッチ拒否）とする。PostgreSQL の `COPY 0`（成功）とは異なる。ヘッダ行のみで
+   データ行が 0 のストリームも同じ扱い（Issue #1764）。
+
+   Issue #1764 で追加した既知の相違: (a) `HEADER true` でもヘッダ行を他の行と同じ
+   デコードに通すため、不正なエスケープ・不正 UTF-8 を含むヘッダは `22000`（PostgreSQL は
+   読み飛ばす）。(b) csv の `ESCAPE != QUOTE` で閉じ引用符直後の引用符は引用の再開として
+   受理せず `22000`（PostgreSQL は受理。COPY TO はこの形を出力しない）。(c) text の
+   `\<LF>`（エスケープされた改行による行継続）は未対応で、生 LF は常に行終端。
 5. **既定の①（`max_files_per_batch`）が 64 行**: 既定設定では 65 行以上の
    COPY は `54000` になる。契約どおりの挙動だが、既知の運用上の制約
    （起動時 CLI `--batch-max-files`〔優先〕または環境変数 `FANDHE_DB_BATCH_MAX_FILES` で上書き可能）として記録する。

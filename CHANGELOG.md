@@ -9,6 +9,10 @@
 
 ### Added
 
+- `COPY ... FROM STDIN` が `HEADER`（`MATCH` を含む）・`DELIMITER`・`NULL`・`QUOTE`・`ESCAPE` を適用する（Issue #1764・WIRE-22）。
+  text 形式では `\<区切り文字>` を区切り文字そのものとして受理する（既定のタブ区切りでも `\<TAB>` がリテラルのタブになる）。
+  `COPY TO` 側の適用は Issue #1765（それまで非既定のオプションは `0A000`）。詳細は
+  [wire-copy-protocol.md](docs/design/wire-copy-protocol.md)。
 - opt-in の `--require-where-for-dml`（Issue #2210・SQL-36）: `EngineCore::with_require_where_for_dml(bool)` を追加し、
   有効時は `WHERE` 省略の SQL `UPDATE`／`DELETE` を変更開始前に `42601` で拒否する（既定は無効で挙動不変）。
   wire-server に値なしスイッチ `--require-where-for-dml` を追加した。明示した述語・NoSQL 表層・`TRUNCATE` は対象外。

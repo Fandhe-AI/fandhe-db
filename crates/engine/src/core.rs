@@ -10699,6 +10699,7 @@ impl EngineCore {
                     v.table_name,
                     v.columns,
                     v.format,
+                    v.options,
                     v.operation_id,
                     schema,
                     self.batch_limits,
