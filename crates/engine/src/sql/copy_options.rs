@@ -15,9 +15,17 @@
 //! `42601` のまま先送りする。
 //!
 //! エラー文言にはユーザー入力の値を含めない（`22023`・`0A000` は固定文言。`42601` に含めるのは
-//! 切り詰め済みのオプション名だけ）。
+//! 切り詰め済みのオプション名だけで、構文エラーのトークンは載せない）。
 
 use super::allowlist::{CopyFormat, SqlSurfaceError};
+
+/// エラー文言に載せるオプション名の最大文字数。
+const MAX_OPTION_NAME_ECHO: usize = 32;
+
+/// エラー文言用にオプション名を切り詰める（入力由来の長い識別子を応答へ反映しないため）。
+fn truncate_option_name(name: &str) -> String {
+    name.chars().take(MAX_OPTION_NAME_ECHO).collect()
+}
 
 /// 1 文が持てるオプション数の上限。既知名の数を十分上回る値で、走査中の防御（DoS 対策）に使う。
 pub(crate) const MAX_COPY_OPTIONS: usize = 32;
@@ -198,13 +206,13 @@ pub(crate) fn resolve(
         if !KNOWN_OPTIONS.contains(&opt.name.as_str()) {
             return Err(SqlSurfaceError::unsupported(format!(
                 "unknown COPY option: {}",
-                opt.name
+                truncate_option_name(&opt.name)
             )));
         }
         if seen.contains(&opt.name.as_str()) {
             return Err(SqlSurfaceError::unsupported(format!(
                 "conflicting or redundant COPY option: {}",
-                opt.name
+                truncate_option_name(&opt.name)
             )));
         }
         seen.push(opt.name.as_str());

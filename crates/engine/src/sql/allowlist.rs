@@ -20113,6 +20113,14 @@ impl Parser<'_> {
         Ok(opts)
     }
 
+    /// COPY オプション走査用の識別子取得。失敗時は入力トークンを含めない固定文言の `42601` を返す。
+    fn expect_copy_ident(&mut self) -> Result<String, SqlSurfaceError> {
+        match self.advance() {
+            Some(Token::Ident(name)) => Ok(name.clone()),
+            _ => Err(SqlSurfaceError::unsupported("invalid COPY option syntax")),
+        }
+    }
+
     /// 新構文 `( name [arg] [, name [arg]]* )`。空・末尾カンマ・閉じ括弧欠落は `42601`。
     fn parse_copy_paren_options(
         &mut self,
@@ -20124,7 +20132,7 @@ impl Parser<'_> {
             if out.len() >= copy_options::MAX_COPY_OPTIONS {
                 return Err(SqlSurfaceError::unsupported("too many COPY options"));
             }
-            let name = self.expect_ident()?.to_ascii_lowercase();
+            let name = self.expect_copy_ident()?.to_ascii_lowercase();
             let value = match self.peek() {
                 Some(Token::Punct(',')) | Some(Token::Punct(')')) => None,
                 Some(Token::StringLiteral(s)) => Some(RawCopyValue::String(s.clone())),
@@ -20162,13 +20170,13 @@ impl Parser<'_> {
         if parens {
             self.expect_punct('(')?;
         }
-        let mut cols = vec![self.expect_ident()?];
+        let mut cols = vec![self.expect_copy_ident()?];
         while matches!(self.peek(), Some(Token::Punct(','))) {
             self.advance();
             if cols.len() >= MAX_COLUMN_COUNT {
                 return Err(SqlSurfaceError::unsupported("too many COPY columns"));
             }
-            cols.push(self.expect_ident()?);
+            cols.push(self.expect_copy_ident()?);
         }
         if parens {
             self.expect_punct(')')?;

@@ -170,8 +170,20 @@ fn error_messages_do_not_echo_values() {
         format!("{FROM} WITH (FORMAT secretfmt)"),
         format!("{FROM} WITH (DELIMITER 'secretdelim')"),
         format!("{FROM} WITH (HEADER secretval)"),
+        format!("{FROM} WITH ('secret')"),
+        format!("{FROM} WITH (FORCE_QUOTE ('secret'))"),
     ] {
         let e = begin(&core, &sql).map(|_| ()).expect_err("rejected");
         assert!(!e.to_string().contains("secret"), "{e}");
     }
+}
+
+#[test]
+fn unknown_option_name_is_truncated_in_message() {
+    let (core, _g) = open("copy-opt-trunc");
+    let long = "x".repeat(200);
+    let e = begin(&core, &format!("{FROM} WITH ({long})"))
+        .map(|_| ())
+        .expect_err("rejected");
+    assert!(e.to_string().len() < 120, "{e}");
 }
