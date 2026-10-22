@@ -4398,18 +4398,22 @@ impl EngineCore {
             Some(crate::sql::lexer::Token::Ident(w)) if w.eq_ignore_ascii_case("DELETE")
         );
         if is_delete {
+            // SQL-36（Issue #2210）: 構造解析 → WHERE 省略ガード → カタログ検証の順。通常 DML 経路と
+            // 同じく、ガードを表の存在確認より前に置き、不存在表と既存表で応答を分けない。
+            let shape =
+                crate::sql::allowlist::parse_delete_statement_shape_tokens(rest, self.ledger_mode)?;
+            if let DeleteStatement::Predicate(v) = &shape {
+                crate::sql::allowlist::reject_omitted_where_for_dml(
+                    self.require_where_for_dml,
+                    v.where_predicates(),
+                )?;
+            }
             let stmt = crate::sql::allowlist::validate_delete_statement_tokens(
                 rest,
                 lookup,
                 self.ledger_mode,
             )
             .map_err(|e| self.reclassify_write_to_view_error(e))?;
-            if let DeleteStatement::Predicate(v) = &stmt {
-                crate::sql::allowlist::reject_omitted_where_for_dml(
-                    self.require_where_for_dml,
-                    v.where_predicates(),
-                )?;
-            }
             return match stmt {
                 DeleteStatement::Predicate(v) if v.partitioned().is_some() => {
                     self.check_partitioned_chunk(v.partitioned())?;
@@ -4418,15 +4422,17 @@ impl EngineCore {
                 _ => Err(reject()),
             };
         }
-        let stmt =
-            crate::sql::allowlist::validate_update_form_tokens(rest, lookup, self.ledger_mode)
-                .map_err(|e| self.reclassify_write_to_view_error(e))?;
-        if let ValidatedUpdateForm::Predicate(v) = &stmt {
+        // SQL-36（Issue #2210）: DELETE と同じ順序（構造解析 → WHERE 省略ガード → カタログ検証）。
+        let shape = crate::sql::allowlist::parse_update_form_shape_tokens(rest, self.ledger_mode)?;
+        if let ValidatedUpdateForm::Predicate(v) = &shape {
             crate::sql::allowlist::reject_omitted_where_for_dml(
                 self.require_where_for_dml,
                 v.where_predicates(),
             )?;
         }
+        let stmt =
+            crate::sql::allowlist::validate_update_form_tokens(rest, lookup, self.ledger_mode)
+                .map_err(|e| self.reclassify_write_to_view_error(e))?;
         match stmt {
             ValidatedUpdateForm::Predicate(v) if v.partitioned().is_some() => {
                 self.check_partitioned_chunk(v.partitioned())?;

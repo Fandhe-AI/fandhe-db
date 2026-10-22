@@ -272,3 +272,20 @@ fn enabled_rejects_before_table_existence_check() {
         "42601"
     );
 }
+
+/// EXPLAIN ... PARTITIONED でも WHERE 省略の拒否は表の存在確認より前: 不存在表と既存表で
+/// 応答が同じ 42601（表の存在有無を漏らさない）。
+#[test]
+fn enabled_explain_partitioned_rejects_before_table_existence_check() {
+    let (core, _g) = new_core(true);
+    let a = ctx_for("tenant-a");
+    seed(&core, &a, "a", &[1]);
+    for table in [TABLE, "nosuch"] {
+        let del = format!("EXPLAIN DELETE FROM {table} USING OPERATION_ID 'p' PARTITIONED CHUNK 2");
+        assert_eq!(run(&core, &a, &del).unwrap_err(), "42601", "{del}");
+        let upd = format!(
+            "EXPLAIN UPDATE {table} SET lang = 'en' USING OPERATION_ID 'p' PARTITIONED CHUNK 2"
+        );
+        assert_eq!(run(&core, &a, &upd).unwrap_err(), "42601", "{upd}");
+    }
+}
