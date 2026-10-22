@@ -212,6 +212,12 @@ fn rewrite_on_conflict(
                             UpsertAddOperand::Literal(l) => UpsertAddOperand::Literal(l.clone()),
                         },
                     },
+                    // 式中の列名を物理名へ写す機能は未対応（SQL-49、Issue #1739）。fail-closed。
+                    UpsertValue::Expr(_) => {
+                        return Err(SqlSurfaceError::feature_not_supported(
+                            "ON CONFLICT DO UPDATE SET expressions on a view are not supported",
+                        ));
+                    }
                 };
                 out.push((mapper.physical(col)?, value));
             }
@@ -456,8 +462,17 @@ mod tests {
         assert_eq!(r.public_names, Some(vec!["name".to_string()]));
 
         // 物理名（`title`）は公開されていない。
-        let err = rewrite(views, "INSERT INTO v (title) VALUES ('a')").expect_err("physical name");
+        let err = rewrite(views.clone(), "INSERT INTO v (title) VALUES ('a')")
+            .expect_err("physical name");
         assert!(matches!(err, SqlSurfaceError::UndefinedColumn { .. }));
+
+        // 一般の式（Issue #1739）は列名の写像が未対応のため `0A000`（fail-closed）。
+        let err = rewrite(
+            views,
+            "INSERT INTO v (name) VALUES ('a') ON CONFLICT (name) DO UPDATE SET name = upper(name)",
+        )
+        .expect_err("expression on a view");
+        assert_eq!(err.wire_code(), "0A000");
     }
 
     /// 2 つの公開名が同じ物理列へ写る場合は、公開名を示して重複を拒否する。
