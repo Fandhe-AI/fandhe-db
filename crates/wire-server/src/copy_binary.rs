@@ -7,7 +7,7 @@
 //! `run_copy_to` への結線は #1770 が担う（本モジュールの呼び出し元の予定）。
 //!
 //! engine の text/csv 用 `RecordSplitter` と違い wire-server に置くのは、binary フィールドを
-//! 型コーデック（`binary_param`・`result_encoder::binary` と同じ層）で変換してから engine の
+//! 型コーデック（`binary_param`・`result_encoder::binary` と同じ層。[`crate::copy_binary_types`]）で変換してから engine の
 //! 束縛へ渡す流れにし、型情報の無いバイト列を engine へ渡さないため。
 //!
 //! 受信データ経路のため `unwrap`／`expect`／添字アクセスを使わず、長さは `try_from`／`checked_*`

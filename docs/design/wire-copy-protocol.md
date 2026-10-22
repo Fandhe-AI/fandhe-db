@@ -363,3 +363,25 @@ ReadyForQuery を返して接続を継続する。層 A: `crates/wire-server/tes
   0 タプルは parser では成功とし、空バッチの扱いは #1769 で engine の契約に接続する。
 - 対象外・申し送り: `22P04` の `ErrorClass` variant と HTTP／nosql-api.md／err4 テストへの射影、
   `CopyFormat::Binary` の許可、`CopyResponse` の format 化は #1769／#1770。binary は引き続き `42601` で拒否する。
+
+## Issue #1768: binary 形式の型コーデック（親 #1766・WIRE-23 (3) ポインタ）
+
+`crates/wire-server/src/copy_binary_types.rs` に、列の型ごとの binary 値変換層を新設した。フレーム層
+（`copy_binary.rs`）が切り出したフィールドを正規テキストへ復号し（COPY FROM）、結果セルを binary 値へ
+符号化する（COPY TO）。本番の呼び出し元はまだ無く、結線は #1769（FROM）・#1770（TO）が担う。
+
+- 対応型の単一情報源: `result_encoder::column_binary_support`（Bind・DataRow と同一集合）。新たに足したのは
+  `WireType → BinaryParam` の網羅 `match`（`binary_param_for_wire_type`）のみで、`supports_binary()` との
+  一致を単体テストで固定している。COPY binary はフィールドに OID を持たないため Bind の OID 照合は使わない。
+- 対応型: 整数（int2/4/8）・float4/8・bool・text/varchar/bpchar・bytea・uuid・time・timestamptz・interval・
+  numeric（`id` を含む）。DATE／TIMESTAMP／JSON／JSONB／配列／ENUM／VECTOR／型を持たない式列は
+  `resolve_columns` が列集合ごと `0A000` で拒否する（CopyIn／CopyOutResponse の前に呼ぶ契約）。
+- 方式: binary → 正規テキスト → engine の型付き束縛（Bind と同じ。binary ≡ text を構造的に保証）。
+  符号化は DataRow と同じ `encode_binary_cell` を再利用し、長さ無しの `encode_binary_payload_into` で包む。
+- エラー写像: 長さ不正・numeric 表現不正・不正 UTF-8・NUL は `22P03`、範囲外は `22008`、numeric 上限超過は
+  `22003`、内部不整合は `XX000`。既存 `ErrorClass` で表せるため新 variant は無い。
+- 既知の相違: 固定長型の長さ不足は PostgreSQL では `08P01`、本実装は `22P03`（WIRE-23 (3) ポインタに従う）。
+  text の不正 UTF-8・NUL は PostgreSQL では `22021`、本実装は新 SQLSTATE を入れず `22P03`。
+  非有限 float や CHAR(n) の詰め／切り詰め、`id` の扱いは engine の text 束縛と同じ結果になる。
+- 対象外・申し送り: `copy.rs` への結線・`CopyFormat::Binary` の許可・`22P04` の `ErrorClass` は #1769／#1770。
+  date／timestamp／json／jsonb／配列／enum／vector の binary 対応は WIRE-14 側の変更を伴う別課題。

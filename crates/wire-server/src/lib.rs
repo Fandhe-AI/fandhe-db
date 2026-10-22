@@ -135,6 +135,7 @@ pub mod bind_guard;
 pub mod connection_limits_opt;
 pub(crate) mod copy;
 pub(crate) mod copy_binary;
+pub(crate) mod copy_binary_types;
 pub mod ddl_permission_opt;
 pub mod dml_limits_opt;
 pub mod durability_opt;
