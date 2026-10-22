@@ -5226,6 +5226,11 @@ impl EngineCore {
         if let Some(clause) = stmt.on_conflict.as_ref() {
             self.reject_index_derived_conflict_constraint(&stmt.table_name, Some(clause))?;
             crate::sql::parser::bind_conflict_clause(clause, &schema)?;
+            // 移行済み表で `id` 省略の UPSERT は実行本体と同じ条件で bind 時にも拒否する
+            // （Describe 成功・Execute 必ず拒否の食い違いを作らない）。
+            let targets =
+                crate::sql::insert_select::resolve_target_columns(&schema, Some(&bound.columns))?;
+            crate::sql::insert_select::reject_omitted_id_upsert(&schema, &targets)?;
         }
         Ok(bound)
     }

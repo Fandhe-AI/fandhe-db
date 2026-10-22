@@ -38,6 +38,21 @@ pub(crate) enum TargetColumn {
     Column(usize),
 }
 
+/// `ON CONFLICT` 併用時、移行済み表で疑似列 `id` を省略した文を `0A000` で拒否する（Issue #1699・#2614）。
+/// 衝突時の欠番と `DO UPDATE` の意味が未設計のため fail-closed。実行本体（`execute_insert_select`）と
+/// Describe 段（`bind_insert_select`）が同じ判定を共有し、両者の結果を一致させる。
+pub(crate) fn reject_omitted_id_upsert(
+    schema: &TableSchema,
+    targets: &[TargetColumn],
+) -> Result<(), SqlSurfaceError> {
+    if schema.has_pseudo_id() && !targets.iter().any(|t| matches!(t, TargetColumn::Id)) {
+        return Err(SqlSurfaceError::feature_not_supported(
+            "omitting the id pseudo-column is not supported for INSERT ... ON CONFLICT",
+        ));
+    }
+    Ok(())
+}
+
 /// 挿入先の列リストを解決する。`columns` が `None`（列リスト省略）のときは宣言順で、従来方式の
 /// 表では先頭に疑似列 `id` を置く（移行済み表・採番方式の表は `id` を含めない。移行済み表の `id` は
 /// 書き込み段が IDENTITY 採番する）。指定がある場合は未知の列を `42703`、重複を `42701` で拒否する。

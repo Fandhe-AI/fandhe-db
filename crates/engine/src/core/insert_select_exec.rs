@@ -135,15 +135,7 @@ impl EngineCore {
             Some(clause) => {
                 self.reject_index_derived_conflict_constraint(req.table_name, Some(clause))?;
                 let plan = crate::sql::parser::bind_conflict_clause(clause, &schema)?;
-                if schema.has_pseudo_id()
-                    && !targets
-                        .iter()
-                        .any(|t| matches!(t, crate::sql::insert_select::TargetColumn::Id))
-                {
-                    return Err(SqlSurfaceError::feature_not_supported(
-                        "omitting the id pseudo-column is not supported for INSERT ... ON CONFLICT",
-                    ));
-                }
+                crate::sql::insert_select::reject_omitted_id_upsert(&schema, &targets)?;
                 Some(plan)
             }
         };
