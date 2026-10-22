@@ -3754,6 +3754,28 @@ fn mark_explicit_where(mut predicates: Vec<WherePredicate>) -> Vec<WherePredicat
     predicates
 }
 
+/// opt-in の `--require-where-for-dml` が有効なときに `WHERE` 省略の `UPDATE`／`DELETE` を拒否する
+/// 際の固定文言（Issue #2210・SQL-36 ポインタ）。表名・テナント・入力値を含めない。
+pub(crate) const REQUIRE_WHERE_FOR_DML_DETAIL: &str =
+    "UPDATE or DELETE without a WHERE clause is rejected (require-where-for-dml is enabled)";
+
+/// `WHERE` 省略の DML（空の述語列。[`mark_explicit_where`] 通過後は明示 `WHERE` が空にならない）を
+/// 起動時 opt-in のスイッチが有効なときだけ `42601`（`UnsupportedSyntax`）で拒否する純関数
+/// （Issue #2210・SQL-36 ポインタ）。
+///
+/// 呼び出し元は `EngineCore` の `parse_tokens_in`（DELETE／UPDATE 分岐。構造検証の直後・表の
+/// 存在確認より前）と EXPLAIN の DML 経路で、`enabled` は `EngineCore::require_where_for_dml`。
+/// 表の存在確認より前に判定するので、表の有無を示す手掛かりを返さない（fail-closed）。
+pub(crate) fn reject_omitted_where_for_dml(
+    enabled: bool,
+    where_predicates: &[WherePredicate],
+) -> Result<(), SqlSurfaceError> {
+    if enabled && where_predicates.is_empty() {
+        return Err(SqlSurfaceError::unsupported(REQUIRE_WHERE_FOR_DML_DETAIL));
+    }
+    Ok(())
+}
+
 /// `id = <literal>` の述語列を、構文解析器（`WHERE` の述語文法）に通して得る（TABLE-43・Issue #1672）。
 /// ビューへの単一行形 `WHERE id = <n>` を、ビューの `WHERE` 述語と AND 合成する述語形へ変換する際、
 /// 利用者が `WHERE <述語> AND id = <n>` と書いたときと同じ AST にするために使う。SQL 文字列は組み
@@ -9952,7 +9974,8 @@ impl<'a> Parser<'a> {
         // SQL-36（Issue #1743）: `WHERE` 省略は空の述語列（`Predicates(vec![])`）で表す。
         // 明示した `WHERE` は `mark_explicit_where` で必ず 1 件以上になるため、空列は省略と一対一に対応する。
         // 単一行専用入口（`validate_delete_tokens`）は `Predicates(_)` を `42601` で拒否するので
-        // 受理範囲は広がらない。opt-in の `--require-where-for-dml`（#2210）はここで空列を見て拒否する。
+        // 受理範囲は広がらない。opt-in の `--require-where-for-dml`（#2210）の拒否は
+        // `reject_omitted_where_for_dml` が呼び出し側（`EngineCore::parse_tokens_in` と EXPLAIN 経路）で行う。
         let where_clause = if matches!(self.peek(), Some(Token::Keyword(Keyword::Where))) {
             self.advance(); // WHERE
             if self.peek_single_row_delete_id() {
@@ -10054,7 +10077,7 @@ impl<'a> Parser<'a> {
             assignments.push(self.parse_update_assignment()?);
         }
 
-        // SQL-36（Issue #1743）: `WHERE` 省略は空の述語列で表す（DELETE と同じ。#2210 の結線点）。
+        // SQL-36（Issue #1743）: `WHERE` 省略は空の述語列で表す（DELETE と同じ。#2210 の拒否は `reject_omitted_where_for_dml`）。
         let where_form = if matches!(self.peek(), Some(Token::Keyword(Keyword::Where))) {
             self.advance(); // WHERE
             match self.parse_update_where()? {
@@ -20240,6 +20263,21 @@ pub(crate) fn parse_update_form_shape_tokens(
 
 #[cfg(test)]
 mod tests {
+    /// SQL-36・Issue #2210: 空の述語列は有効時だけ `42601`、明示 `WHERE` の印や通常の述語列は常に通す。
+    #[test]
+    fn reject_omitted_where_for_dml_only_rejects_empty_when_enabled() {
+        use super::*;
+        let err = reject_omitted_where_for_dml(true, &[]).expect_err("empty + enabled");
+        assert_eq!(err.wire_code(), "42601");
+        assert!(reject_omitted_where_for_dml(false, &[]).is_ok());
+        let marker = mark_explicit_where(Vec::new());
+        assert!(reject_omitted_where_for_dml(true, &marker).is_ok());
+        let normal = vec![WherePredicate::PredicateCall {
+            name: "p".to_string(),
+        }];
+        assert!(reject_omitted_where_for_dml(true, &normal).is_ok());
+    }
+
     /// TABLE-27・Issue #1715: 引用付き `true`／`false` も `search_path` の識別子要素として受理する。
     #[test]
     fn set_search_path_accepts_quoted_bool_word_elements() {
