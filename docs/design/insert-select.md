@@ -30,7 +30,7 @@ INSERT INTO <表> (<列>[, ...]) <query> [RETURNING ...] [USING OPERATION_ID '<i
   - `ON CONFLICT`（2 トークン組）・`RETURNING`・`USING OPERATION_ID`（2 トークン組）・`;`・文末
   - JOIN の `ON`・`USING (...)`・`USING PLAN(...)`・`USING MODE` を誤って区切りにしないため、`ON`／`USING` は 2 トークン組で判定する
 - 範囲はトークン列のまま既存の検証器へ渡し、SQL 文字列を組み立て直さない（インジェクションを構造的に避ける）
-- `ON CONFLICT` との併用は Issue #2614 で受理（下の「Issue #2614 追記」）。空の問い合わせ・列リスト省略は `42601`（列リスト省略は #1730 の担当）
+- `ON CONFLICT` との併用は Issue #2614 で受理（下の「Issue #2614 追記」）。空の問い合わせ・`DEFAULT VALUES` の後ろの問い合わせは `42601`（列リスト省略は第 III 部〔Issue #2613〕で受理）
 - 既存の公開入口（`validate_insert` 等）は内側 SELECT を検証できないため、SELECT 形を受けると `0A000`
 
 ### 3. 内側 SELECT の検証
@@ -57,12 +57,12 @@ INSERT INTO <表> (<列>[, ...]) <query> [RETURNING ...] [USING OPERATION_ID '<i
 ### 5. 後続への引き継ぎ
 
 - #1733・#1734: 結線済み（第 II 部。`BoundInsertSelectTarget` の再利用と `query_tokens` による台帳ハッシュ）
-- #1730: 列リスト省略（`INSERT INTO t SELECT ...`）と `DEFAULT VALUES`
+- #1730: `DEFAULT VALUES`（列リスト省略の `INSERT ... SELECT` は第 III 部で受理）
 - SQL-34 / #2212: 内側 SELECT の LIMIT 省略の扱い
 
 ### 6. 対象外（fail-closed）
 
-列リスト省略・ビューへの挿入・一時表が関与する文・拡張クエリの `$n`・`OVERRIDING`・
+ビューへの挿入・一時表が関与する文・拡張クエリの `$n`・`OVERRIDING`・
 `PARTITIONED` との併用（構文上受理しない）。
 
 ## 第 II 部 実行（SQL-51・Issue #1733）
@@ -127,8 +127,42 @@ RLS-7・RLS-10・RECOVER-10・RECOVER-11）。
 ### 値の変換（代入変換）
 
 VARCHAR/CHAR/ENUM/JSON は VALUES 形と同じ束縛関数で再検証し、整数幅は範囲検査（`22003`）、NUMERIC は
-`apply_numeric_typmod`、整数 → 浮動小数は拡大のみ受理する。配列・浮動小数 → 整数・型族をまたぐ組は
-`0A000`（固定文言）で、静的な型照合（`42804`）は #1732 の担当。
+`apply_numeric_typmod`、整数 → 浮動小数は拡大のみ受理する（この直接変換は第 III 部でも不変）。
+それ以外の組（浮動小数 → 整数・各種 → text・配列等）は第 III 部の代入変換が担う。静的な型照合（`42804`）は #1732 の担当。
+
+## 第 III 部 列リスト省略・DEFAULT 補完・代入変換（SQL-51・Issue #2613）
+
+### 列リスト省略
+
+- `INSERT INTO t SELECT ...` と `INSERT INTO t (SELECT ...)` を受理する。構文段は省略印（`columns_omitted`）だけを持ち、
+  展開は束縛（`bind`）が行う。`(` の直後が `SELECT` のときは列リストでなく括弧付き問い合わせとして扱い、
+  問い合わせ全体を囲む 1 組の括弧は外して既存の SELECT 検証器へ渡す。`( WITH ...` は従来どおり `42601`。
+- 展開は VALUES 形（#1730）と共有のヘルパー（`expand_omitted_insert_columns`）で、表の宣言順（疑似 `id` が先頭）の
+  先頭から内側の出力列数だけを当てる。出力列が多ければ `42601`、少なければ残りは省略列として DEFAULT 補完へ回る。
+  `id` が 2 回現れる表は `0A000`。展開後の列名は `BoundInsertSelectTarget.columns` で実行側へ渡り、
+  実行側が実行時のスキーマで解決し直す（明示形と同じ TOCTOU 特性）。
+- 台帳の内容照合ハッシュは送られた文のトークン列から算出するため、省略形と明示形は別の文として扱われる（既存挙動を変えない）。
+
+### DEFAULT 補完
+
+列リスト指定時の省略列は VALUES 形・COPY と共有の `fill_omitted_columns` で補う（リテラル・`now()` は文の時刻・
+NULL 許容は NULL・DEFAULT の無い NOT NULL は `23502`）。`DEFAULT nextval`・IDENTITY の省略列は従来どおり `0A000`
+（台帳ハッシュ差し替えとの相互作用と明示トランザクションの採番スコープに追加設計が要るため。fail-closed）。
+
+### 代入変換
+
+- 文ごとに 1 回、実行時の結果列メタから変換計画（`ConversionPlan`）を組む。各列は次のどちらか。
+  - `Direct`: 従来の `cell_to_insert_value`（同一型・文字列系・JSON・VECTOR・整数幅・整数 → numeric/float・numeric → numeric）。値とエラーは不変。CTAS は全列 `Direct`。
+  - `Assign`: それ以外の組。`ALTER COLUMN TYPE` の代入変換（SQL-47。`bind_alter_conversion`）と同じ束縛・評価器を使う。
+    行ごとに変換元セルを作業用スキーマへ 1 回だけ encode して評価する。浮動小数 → 整数は偶数丸め、numeric → 整数は 0 から遠い側への四捨五入で、範囲外は `22003`。
+- 変換の失敗は書き込みの前に文全体を拒否する（部分挿入なし）。評価・変換エラーは SQLSTATE を保った固定文言へ写し、
+  行の値・他テナントの情報を載せない（`redact_row_conversion_error`）。
+- 既知差分: 内部で整数を f64 経由で運ぶ変換（`cast_value`）のため、|v| > 2^53 の BIGINT は `22003` で拒否される（黙って丸めず拒否側）。
+- 代替案（不採用）: セルから `ExprValue` へのアダプタを作り `CastFn` を直接適用する方式。既存ヘルパーが無く第 2 の変換表になるため採らない。
+
+### 対象外（追跡候補）
+
+省略列の `DEFAULT nextval`／IDENTITY の採番（COPY と共通）・`INSERT INTO t (WITH ... SELECT ...)`・ビューへの挿入・`ON CONFLICT` との併用。
 
 ## Issue #2614 追記 ON CONFLICT との併用（SQL-51・SQL-49 ポインタ。親: #1731）
 
@@ -146,5 +180,5 @@ VARCHAR/CHAR/ENUM/JSON は VALUES 形と同じ束縛関数で再検証し、整�
   （`SqlSurfaceError::UpsertCardinalityViolation`）で文全体を拒否、`DO NOTHING` は先の行を挿入して後の重複を飛ばす。
   NULL を含むキーは重複とみなさない。衝突対象以外の一意性違反は `23505`（書き込み段の既存検査）。
   VALUES 形の文内重複（`22000`）はここでは変えない（別 Issue #1738 の担当）。
-- fail-closed のまま: 移行済み表で `id` を省略した UPSERT（Issue #1699）・SEQUENCE の DEFAULT・ビュー／一時表・拡張クエリの `$n`。
+- fail-closed のまま: 移行済み表で `id` を省略した UPSERT（Issue #1699。Describe 段 `bind_insert_select` も実行本体と同じ共有判定 `reject_omitted_id_upsert` で bind 時に `0A000`）・SEQUENCE の DEFAULT・ビュー／一時表・拡張クエリの `$n`。
 - BREAKING: `SqlSurfaceError` への variant 追加、および `INSERT ... SELECT ... ON CONFLICT` が `0A000` から受理へ変わる。

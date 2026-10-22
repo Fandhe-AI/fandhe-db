@@ -60,6 +60,19 @@ pub(crate) struct BoundAlterConversion {
     pub(crate) column_name: String,
 }
 
+impl BoundAlterConversion {
+    /// 後で束縛結果に差し替える空の変換（`INSERT ... SELECT` の変換計画が、作業用スキーマの完成前に
+    /// 位置だけ確保するために使う。評価には使わない。Issue #2613）。
+    pub(crate) fn placeholder() -> Self {
+        Self {
+            bound: BoundExpr::Null,
+            target_ty: ColumnType::Text,
+            nullable: true,
+            column_name: String::new(),
+        }
+    }
+}
+
 /// `USING <列名>`（対象列だけを参照する式）か。省略と同じ扱い（行の値をそのまま代入変換）に
 /// するための判定。
 pub(crate) fn is_identity_using(expr: &Expr, column_name: &str) -> bool {

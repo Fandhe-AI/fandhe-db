@@ -11,7 +11,11 @@
 //!   複数行 `VALUES`・COPY と同じ書き込み経路（`sql::exec::execute_insert_*_in`）へ渡る
 //!   （第 2 の書き込み経路を作らない）。
 //!
-//! fail-closed 方針: 代入変換を持たない（セル種別, 列型）の組は黙って丸めず `0A000`（固定文言）で
+//! 代入変換（Issue #2613）: 直接変換（[`cell_to_insert_value`]）で扱えない組は、文ごとに組む
+//! [`ConversionPlan`] が `ALTER COLUMN TYPE` と同じ束縛・評価器（SQL-47）で PostgreSQL の代入変換どおりに
+//! 変換する。列リスト省略は [`bind`] が表の宣言順へ展開する。
+//!
+//! fail-closed 方針: 変換計画の外にある（セル種別, 列型）の組は黙って丸めず `0A000`（固定文言）で
 //! 拒否する。静的な型照合（`42804` 等）は束縛側が先に行い、変換段へ到達した不整合は値を含まない
 //! 固定文言のエラーにする。エラー文言には行の値・他テナントの情報を含めない。
 //!
@@ -103,7 +107,7 @@ fn out_of_range() -> SqlSurfaceError {
 /// - 文字列系（`VARCHAR(n)`・`CHAR(n)` の長さ検証と空白詰めを含む）・ENUM・JSON は
 ///   VALUES 形と同じ束縛関数で再検証する
 /// - 数値は整数幅の範囲検査（`22003`）・`NUMERIC(p,s)` の再検証・整数 → 浮動小数の拡大を行う
-/// - 配列・浮動小数 → 整数などこの Issue が変換を持たない組は `0A000`
+/// - 配列・浮動小数 → 整数などの組は直接変換の対象外で `0A000`（[`ConversionPlan`] が代入変換を担う）
 pub(crate) fn cell_to_insert_value(
     cell: Cell,
     column: &ColumnDef,
@@ -167,6 +171,181 @@ pub(crate) fn cell_to_insert_value(
     }
 }
 
+/// 内側 SELECT の結果列 1 本から挿入先列への値変換の方式（Issue #2613）。
+enum SlotConversion {
+    /// [`cell_to_insert_value`] の直接変換（同一型・文字列系・整数幅・整数 → numeric/float 等）。
+    /// 従来の値・エラーをそのまま保つ。
+    Direct,
+    /// PostgreSQL の代入変換表に従う変換（浮動小数 → 整数・numeric → 整数・各種 → text・配列等）。
+    /// `ALTER COLUMN TYPE` の代入変換（SQL-47）と同じ束縛・評価器を使い、第 2 の変換表を作らない。
+    Assign {
+        /// 結果列の静的な型（セルを作業用スキーマの値へ戻すために使う）。
+        src_ty: ColumnType,
+        conv: Box<crate::sql::alter_using::BoundAlterConversion>,
+    },
+}
+
+/// 文ごとに 1 回組む、結果列 → 挿入先列の変換計画（Issue #2613）。`core/insert_select_exec.rs` が
+/// 実行時の結果列メタから [`ConversionPlan::build`] で組み、[`rows_to_bound_inserts`] が行ごとに適用する。
+/// CTAS（`core/ctas_exec.rs`）は [`ConversionPlan::direct_only`] を渡し、従来の挙動を変えない。
+pub(crate) struct ConversionPlan {
+    slots: Vec<SlotConversion>,
+    /// `Assign` があるときだけ持つ作業用ソーススキーマ（列名は合成名 `c0..cN`、NULL 許可）。
+    src_schema: Option<TableSchema>,
+}
+
+/// 型 `src` → `dst` が [`cell_to_insert_value`] の直接変換で扱える組か。それ以外は代入変換へ回す。
+fn is_direct_pair(src: &ColumnType, dst: &ColumnType) -> bool {
+    use ColumnType as T;
+    let int_like = |t: &ColumnType| matches!(t, T::SmallInt | T::Integer | T::BigInt);
+    let json_like = |t: &ColumnType| matches!(t, T::Json | T::Jsonb);
+    // 配列は直接変換が常に拒否するため、同型でも代入変換（要素ごとの変換）へ回す。
+    if matches!(dst, T::Array(_)) || matches!(src, T::Array(_)) {
+        return false;
+    }
+    src == dst
+        || (src.is_text_like() && dst.is_text_like())
+        || (src.is_text_like() && matches!(dst, T::Enum(_)))
+        || (json_like(src) && json_like(dst))
+        || (matches!(src, T::Vector(_)) && matches!(dst, T::Vector(_)))
+        || (int_like(src)
+            && (int_like(dst) || matches!(dst, T::Numeric { .. } | T::Double | T::Real)))
+        || (matches!(src, T::Numeric { .. }) && matches!(dst, T::Numeric { .. }))
+}
+
+impl ConversionPlan {
+    /// すべて直接変換の計画（CTAS 用。追加コストなし）。
+    pub(crate) fn direct_only() -> Self {
+        Self {
+            slots: Vec::new(),
+            src_schema: None,
+        }
+    }
+
+    /// 実行時の結果列メタ `source` と挿入先 `schema`・`targets` から計画を組む。静的な型照合
+    /// （`42804`）は [`bind`] が済ませている前提で、ここは値変換の方式だけを決める。変換元の静的な型が
+    /// 無い列は直接変換へ残す（直接変換がセル種別で fail-closed に拒否する）。
+    pub(crate) fn build(
+        schema: &TableSchema,
+        targets: &[TargetColumn],
+        source: &[ColumnMeta],
+    ) -> Result<Self, SqlSurfaceError> {
+        if source.len() != targets.len() {
+            return Err(internal());
+        }
+        let mut slots: Vec<SlotConversion> = Vec::new();
+        slots
+            .try_reserve_exact(targets.len())
+            .map_err(|_| internal())?;
+        let mut src_cols: Vec<ColumnDef> = Vec::new();
+        src_cols
+            .try_reserve_exact(targets.len())
+            .map_err(|_| internal())?;
+        let mut any_assign = false;
+        for (i, (meta, target)) in source.iter().zip(targets).enumerate() {
+            let src_ty: ColumnType = match source_ty(meta) {
+                Ok(SourceTy::Ty(ty)) => ty.clone(),
+                Ok(SourceTy::IdLike) => ALIASED_ID_TYPE.clone(),
+                Err(_) => {
+                    slots.push(SlotConversion::Direct);
+                    src_cols.push(ColumnDef::new(format!("c{i}"), ColumnType::Text, true));
+                    continue;
+                }
+            };
+            src_cols.push(ColumnDef::new(format!("c{i}"), src_ty.clone(), true));
+            let dst = match target {
+                TargetColumn::Id => None,
+                TargetColumn::Column(idx) => {
+                    Some(&schema.columns.get(*idx).ok_or_else(internal)?.ty)
+                }
+            };
+            match dst {
+                Some(dst) if !is_direct_pair(&src_ty, dst) => {
+                    any_assign = true;
+                    slots.push(SlotConversion::Assign {
+                        src_ty,
+                        // 作業用スキーマは全列を見てから組むため、束縛は下の 2 周目で行う。
+                        conv: Box::new(
+                            crate::sql::alter_using::BoundAlterConversion::placeholder(),
+                        ),
+                    });
+                }
+                _ => slots.push(SlotConversion::Direct),
+            }
+        }
+        if !any_assign {
+            return Ok(Self::direct_only());
+        }
+        let src_schema = TableSchema::new("insert_select_source", src_cols);
+        for (i, (slot, target)) in slots.iter_mut().zip(targets).enumerate() {
+            if let (SlotConversion::Assign { conv, .. }, TargetColumn::Column(idx)) = (slot, target)
+            {
+                let dst = &schema.columns.get(*idx).ok_or_else(internal)?.ty;
+                // 束縛の拒否（ENUM・VECTOR 等の規則表の外）は固定文言。型名・値は載せない。
+                **conv = crate::sql::alter_using::bind_alter_conversion(None, &src_schema, i, dst)
+                    .map_err(|e| match e {
+                        SqlSurfaceError::DatatypeMismatch { .. } => {
+                            SqlSurfaceError::datatype_mismatch(
+                                "INSERT ... SELECT column type does not match the target column",
+                            )
+                        }
+                        _ => unsupported_pair(),
+                    })?;
+            }
+        }
+        Ok(Self {
+            slots,
+            src_schema: Some(src_schema),
+        })
+    }
+
+    /// 代入変換が 1 列でもあるか（無ければ行ごとの encode を省く）。
+    fn has_assign(&self) -> bool {
+        self.src_schema.is_some()
+    }
+
+    /// 1 行の `Assign` 列を変換する。戻り値の長さは行の列数で、`Assign` かつ非 NULL の位置だけ `Some`。
+    /// 評価・変換エラーは SQLSTATE を保った固定文言へ写す（行の値・他テナントの情報を載せない）。
+    fn convert_assigned(&self, cells: &[Cell]) -> Result<Vec<Option<Value>>, SqlSurfaceError> {
+        let Some(src_schema) = &self.src_schema else {
+            return Ok(Vec::new());
+        };
+        let mut src_values: Vec<Value> = vec![Value::Null; cells.len()];
+        for ((slot, cell), out) in self.slots.iter().zip(cells).zip(src_values.iter_mut()) {
+            if let SlotConversion::Assign { src_ty, .. } = slot {
+                if !matches!(cell, Cell::Null) {
+                    // セルの実体が静的な型と食い違えば固定文言の `0A000`（fail-closed）。
+                    *out = super::matview::cell_to_value(cell.clone(), src_ty)
+                        .map_err(|_| unsupported_pair())?;
+                }
+            }
+        }
+        let metadata = crate::row_codec::encode_scalar_columns(src_schema, &src_values)
+            .map_err(|_| unsupported_pair())?;
+        let view =
+            crate::row_codec::scan_scalar_columns(src_schema, &metadata).map_err(|_| internal())?;
+        let mut out: Vec<Option<Value>> = vec![None; cells.len()];
+        for ((slot, cell), dst) in self.slots.iter().zip(cells).zip(out.iter_mut()) {
+            if let SlotConversion::Assign { conv, .. } = slot {
+                if matches!(cell, Cell::Null) {
+                    continue;
+                }
+                let evaluated = crate::sql::udf_call::eval_with_scalars(&conv.bound, 0, &[], &view)
+                    .map_err(crate::sql::alter_using::redact_row_conversion_error)?;
+                *dst = Some(
+                    crate::sql::set_expr::expr_value_to_column_value(
+                        &conv.target_ty,
+                        true,
+                        &conv.column_name,
+                        evaluated,
+                    )
+                    .map_err(crate::sql::alter_using::redact_row_conversion_error)?,
+                );
+            }
+        }
+        Ok(out)
+    }
+}
 /// 内側 SELECT の結果行を `BoundInsert` 列へ変換する。省略列は `DEFAULT` を補完し、
 /// `DEFAULT nextval` 系の印は束縛直後に `0A000` で拒否する（COPY と同じ fail-closed）。
 /// `rows` の行数は呼び出し元が上限検査済みであることを前提に、確保は `try_reserve_exact` で行う。
@@ -177,6 +356,7 @@ pub(crate) fn rows_to_bound_inserts(
     rows: Vec<ResultRow>,
     operation_id: Option<&OperationId>,
     clock: crate::sql::time_fn::StatementClock,
+    plan: &ConversionPlan,
 ) -> Result<Vec<BoundInsert>, SqlSurfaceError> {
     let has_pseudo_id = schema.has_pseudo_id();
     let id_targeted = targets.contains(&TargetColumn::Id);
@@ -199,12 +379,28 @@ pub(crate) fn rows_to_bound_inserts(
         let mut values: Vec<Value> = vec![Value::Null; schema.columns.len()];
         let mut provided = vec![false; schema.columns.len()];
         let mut id: u64 = 0;
-        for (target, cell) in targets.iter().zip(row.cells) {
+        // 代入変換の列は行ごとに 1 回だけまとめて評価する（`Direct` だけの文は encode しない）。
+        let mut assigned = if plan.has_assign() {
+            plan.convert_assigned(&row.cells)?
+        } else {
+            Vec::new()
+        };
+        for (i, (target, cell)) in targets.iter().zip(row.cells).enumerate() {
             match target {
                 TargetColumn::Id => id = cell_to_row_id(cell)?,
                 TargetColumn::Column(idx) => {
                     let column = schema.columns.get(*idx).ok_or_else(internal)?;
-                    let value = cell_to_insert_value(cell, column)?;
+                    let value = match assigned.get_mut(i).and_then(Option::take) {
+                        Some(v) => {
+                            if matches!(v, Value::Null) && !column.nullable {
+                                return Err(SqlSurfaceError::not_null_violation(
+                                    column.name.clone(),
+                                ));
+                            }
+                            v
+                        }
+                        None => cell_to_insert_value(cell, column)?,
+                    };
                     if let Some(slot) = values.get_mut(*idx) {
                         *slot = value;
                     }
@@ -259,6 +455,8 @@ fn cell_to_row_id(cell: Cell) -> Result<u64, SqlSurfaceError> {
 /// [`bind`] の結果。
 #[derive(Debug, Clone, PartialEq)]
 pub(crate) struct BoundInsertSelectTarget {
+    /// 展開後の列名（列リスト省略時は表の宣言順の先頭列。実行側が同じ名前を解決し直す）。
+    pub(crate) columns: Vec<String>,
     /// 内側の出力列 i の書き込み先（列リストの順）。
     pub(crate) slots: Vec<TargetColumn>,
     /// 疑似列 `id` を列リストで省略したか（移行済みの表のみ真。採番は書き込み段）。
@@ -317,12 +515,19 @@ pub(crate) fn bind(
     schema: &TableSchema,
     source: &[ColumnMeta],
 ) -> Result<BoundInsertSelectTarget, SqlSurfaceError> {
-    crate::sql::parser::check_insert_column_list_duplicates(&stmt.columns)?;
+    // 列リスト省略（Issue #2613）は、内側の出力列数に応じて表の宣言順の先頭列へ展開する
+    // （`VALUES` 形と同じ共有ヘルパー。束縛と同じスキーマのスナップショットで展開する）。
+    let columns: Vec<String> = if stmt.columns_omitted {
+        crate::sql::parser::expand_omitted_insert_columns(schema, source.len())?
+    } else {
+        stmt.columns.clone()
+    };
+    crate::sql::parser::check_insert_column_list_duplicates(&columns)?;
 
     let has_pseudo_id = schema.has_pseudo_id();
-    let mut slots = Vec::with_capacity(stmt.columns.len());
+    let mut slots = Vec::with_capacity(columns.len());
     let mut provided = vec![false; schema.columns.len()];
-    for name in &stmt.columns {
+    for name in &columns {
         if has_pseudo_id && name == "id" {
             slots.push(TargetColumn::Id);
             continue;
@@ -394,6 +599,7 @@ pub(crate) fn bind(
         .collect();
     let returning = crate::sql::parser::bind_returning(stmt.returning.as_ref(), schema)?;
     Ok(BoundInsertSelectTarget {
+        columns,
         slots,
         id_omitted,
         omitted,
@@ -546,6 +752,7 @@ mod bind_tests {
             InsertSelectShape {
                 table_name: "t".to_string(),
                 columns: columns.iter().map(|c| c.to_string()).collect(),
+                columns_omitted: false,
                 query_tokens: Vec::new(),
                 on_conflict: None,
                 returning: None,

@@ -34,7 +34,7 @@ use crate::recovery::required_op_id::OperationId;
 use crate::result_limits::{ResultLimits, MAX_RESULT_ROWS_HARD_CAP};
 use crate::sql::allowlist::{OnConflictClause, Projection, SqlSurfaceError, Statement};
 use crate::sql::exec::{InsertOutcome, QueryResult, ReturningOutcome};
-use crate::sql::insert_select::{resolve_target_columns, rows_to_bound_inserts};
+use crate::sql::insert_select::{resolve_target_columns, rows_to_bound_inserts, ConversionPlan};
 use crate::sql::mode::SessionState;
 use crate::sql::SqlOutcome;
 use crate::tenant::WriteTarget;
@@ -86,14 +86,16 @@ impl EngineCore {
         session: &mut SessionState,
         stmt: &crate::sql::allowlist::ValidatedInsertSelect,
     ) -> Result<SqlOutcome, SqlSurfaceError> {
-        self.bind_insert_select(session, stmt, &self.result_limits)?;
+        // 列リスト省略（Issue #2613）は束縛が展開した列名を実行側へ渡す。実行側は実行時のスキーマで
+        // 同じ名前を解決し直す（明示形と同じ TOCTOU 特性）。
+        let bound = self.bind_insert_select(session, stmt, &self.result_limits)?;
         self.execute_insert_select(
             mode,
             ctx,
             session,
             InsertSelectRequest {
                 table_name: &stmt.table_name,
-                columns: Some(&stmt.columns),
+                columns: Some(&bound.columns),
                 select: (*stmt.query).clone(),
                 operation_id: stmt.operation_id.clone(),
                 statement_hash: stmt.statement_hash,
@@ -229,6 +231,8 @@ impl EngineCore {
         // 2 段目の上限の前に、行数だけで弾けるものを先に判定する（変換コストを払わない）。
         self.check_insert_row_count_limit(rows.len())?;
 
+        // 結果列の型から値変換の方式を文ごとに 1 回決める（代入変換は Issue #2613）。
+        let plan = ConversionPlan::build(&schema, &targets, &columns)?;
         let bounds = rows_to_bound_inserts(
             req.table_name,
             &schema,
@@ -236,6 +240,7 @@ impl EngineCore {
             rows,
             req.operation_id.as_ref(),
             clock,
+            &plan,
         )?;
         // 1 行でもバイト量・チャンク総量の上限（INDEX-4）を必ず通す（fail-closed。
         // 委譲先の書き込み段はこの検査を補わない）。0 行は台帳記録のみの経路へ進む。

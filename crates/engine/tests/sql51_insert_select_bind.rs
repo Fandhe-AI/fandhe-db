@@ -80,6 +80,10 @@ fn parse_accepts_supported_forms() {
         "INSERT INTO dst (id, a) SELECT id, a FROM src LIMIT 3 RETURNING id, a",
         "INSERT INTO dst (id, a) SELECT id, a FROM src LIMIT 3 USING OPERATION_ID 'op-1';",
         "INSERT INTO dst (id, a) SELECT id, a FROM src LIMIT 3;",
+        // 列リスト省略（Issue #2613）。括弧付き問い合わせも同じ
+        "INSERT INTO dst SELECT id, a, t FROM src LIMIT 3",
+        "INSERT INTO dst (SELECT id, a, t FROM src LIMIT 3)",
+        "INSERT INTO dst SELECT id, a FROM src LIMIT 3 RETURNING id, a",
     ] {
         let parsed = core
             .parse_sql(sql)
@@ -104,8 +108,11 @@ fn parse_rejects_unsupported_forms_fail_closed() {
         ),
         // 空の問い合わせ
         ("INSERT INTO dst (id, a) RETURNING id", "42601"),
-        // 列リスト省略（#1730 の担当）
-        ("INSERT INTO dst SELECT id, a, t FROM src LIMIT 3", "42601"),
+        // `DEFAULT VALUES` の後ろに問い合わせは書けない
+        (
+            "INSERT INTO dst DEFAULT VALUES SELECT id, a, t FROM src LIMIT 3",
+            "42601",
+        ),
         // 内側が SELECT でない
         (
             "INSERT INTO dst (id, a) EXPLAIN SELECT id FROM src LIMIT 3",
@@ -178,6 +185,20 @@ fn describe_binds_column_count_and_types() {
     );
     // 代入可能な拡張（INTEGER -> BIGINT）は受理
     describe("INSERT INTO dst (id, a, t) SELECT id, a, t FROM src LIMIT 3").expect("assignable");
+    // 列リスト省略（Issue #2613）: 宣言順（疑似 id が先頭）へ展開される。少ない分は受理、多い分は 42601
+    describe("INSERT INTO dst SELECT id, a, t FROM src LIMIT 3").expect("omitted full width");
+    describe("INSERT INTO dst SELECT id, a FROM src LIMIT 3").expect("omitted narrower");
+    assert_eq!(
+        code(describe(
+            "INSERT INTO dst SELECT id, a, t, id FROM src LIMIT 3"
+        )),
+        "42601"
+    );
+    // 展開後の位置で型照合される（2 列目 BIGINT <- TEXT は 42804）
+    assert_eq!(
+        code(describe("INSERT INTO dst SELECT id, t FROM src LIMIT 3")),
+        "42804"
+    );
     // 未知の列・重複列
     assert_eq!(
         code(describe(
@@ -225,6 +246,15 @@ fn execution_binds_before_inserting_and_moves_no_rows_on_bind_error() {
     );
     let _ = core.execute_sql_in_txn(&ctx("alice"), &mut tsession, &mut txn, "ROLLBACK");
     assert_eq!(count_rows(&core, &mut session, "dst"), before);
+}
+
+#[test]
+fn extended_query_parameters_are_rejected_for_omitted_column_list() {
+    let (core, path, _s) = setup("sql51-params-omitted");
+    let _g = CleanupGuard(path);
+    let r =
+        core.parse_sql_prepared("INSERT INTO dst SELECT id, a, t FROM src WHERE id = $1 LIMIT 3");
+    assert_eq!(code(r), "0A000");
 }
 
 #[test]
