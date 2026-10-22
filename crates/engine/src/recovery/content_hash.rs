@@ -187,6 +187,9 @@ enum OpTag {
     /// `INSERT ... SELECT`（Issue #1734・SQL-51 (5)・RECOVER-10/11）。送られた文のトークン列
     /// （内側 SELECT を含む）だけを材料にし、VALUES 形の `Insert*`・`Upsert*` とは別ドメインに分離する。
     InsertSelect = 25,
+    /// `CREATE TABLE ... AS`（Issue #1679・SQL-52 (4)・RECOVER-10/11）。送られた文のトークン列
+    /// （内側の問い合わせを含む）だけを材料にし、[`OpTag::InsertSelect`] とは別ドメインに分離する。
+    CreateTableAs = 26,
 }
 
 /// 長さプレフィクス付きフィールド連結でハッシュ入力を組み立てるビルダー
@@ -1335,6 +1338,22 @@ pub(crate) fn for_insert_select(
     statement_tokens: &[crate::sql::lexer::Token],
 ) -> Result<ContentHash, StorageError> {
     let mut b = HashInputBuilder::new(OpTag::InsertSelect);
+    b.push_u64(statement_tokens.len() as u64);
+    for t in statement_tokens {
+        push_token(&mut b, t)?;
+    }
+    Ok(b.finish())
+}
+
+/// `CREATE TABLE ... AS` の台帳照合ハッシュ（Issue #1679。ポインタ: SQL-52 (4)・RECOVER-10・RECOVER-11）。
+///
+/// 規則は [`for_insert_select`] と同じ（`USING OPERATION_ID` 句と末尾 `;` を除いた文のトークン列だけが
+/// 材料。内側の結果行の値は材料にしない）で、ドメインタグだけが異なる。未束縛の [`Token::Param`] が
+/// 残っていれば `Err`（fail-closed）。呼び出し元は `sql::allowlist` の CTAS 構文検証。
+pub(crate) fn for_create_table_as(
+    statement_tokens: &[crate::sql::lexer::Token],
+) -> Result<ContentHash, StorageError> {
+    let mut b = HashInputBuilder::new(OpTag::CreateTableAs);
     b.push_u64(statement_tokens.len() as u64);
     for t in statement_tokens {
         push_token(&mut b, t)?;
@@ -6742,6 +6761,22 @@ mod tests {
         let a_bc =
             for_insert_select(&[Token::Ident("a".into()), Token::Ident("bc".into())]).unwrap();
         assert_ne!(ab_c, a_bc);
+    }
+
+    #[test]
+    fn create_table_as_hash_is_domain_separated_and_rejects_param() {
+        use crate::sql::lexer::Token;
+        let toks =
+            crate::sql::lexer::tokenize("CREATE TABLE t AS SELECT a FROM s LIMIT 1").unwrap();
+        assert_ne!(
+            for_create_table_as(&toks).unwrap(),
+            for_insert_select(&toks).unwrap()
+        );
+        assert_eq!(
+            for_create_table_as(&toks).unwrap(),
+            for_create_table_as(&toks).unwrap()
+        );
+        assert!(for_create_table_as(&[Token::Param(1)]).is_err());
     }
 
     #[test]

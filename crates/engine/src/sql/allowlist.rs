@@ -9261,7 +9261,14 @@ impl<'a> Parser<'a> {
             // `VALUES` は必須で、続けて行は書けない（`DEFAULT VALUES (1)` は余剰トークンで `42601`）。
             self.expect_contextual_keyword("VALUES")?;
         } else {
-            if matches!(self.peek(), Some(Token::Punct('('))) {
+            // `INSERT INTO t (SELECT ...)` の `(` は列リストではなく括弧付き問い合わせの開始
+            // （Issue #2613）。直後が `SELECT` のときだけ列リスト省略として扱い、`(` は消費しない。
+            let paren_select = matches!(self.peek(), Some(Token::Punct('(')))
+                && matches!(
+                    self.tokens.get(self.pos.saturating_add(1)),
+                    Some(Token::Keyword(Keyword::Select))
+                );
+            if !paren_select && matches!(self.peek(), Some(Token::Punct('('))) {
                 self.advance();
                 columns.push(self.expect_ident()?);
                 while matches!(self.peek(), Some(Token::Punct(','))) {
@@ -9411,8 +9418,12 @@ impl<'a> Parser<'a> {
         &mut self,
         table_name: String,
         columns: Vec<String>,
+        columns_omitted: bool,
+        default_values: bool,
     ) -> Result<ParsedInsertSelectShape, SqlSurfaceError> {
-        if columns.is_empty() {
+        // 列リスト省略は受理する（Issue #2613。束縛段が表の宣言順へ展開する）。`DEFAULT VALUES`
+        // の後ろに問い合わせは書けない。列リストも省略印も無い形は到達しない防御。
+        if default_values || (columns.is_empty() && !columns_omitted) {
             return Err(SqlSurfaceError::unsupported(
                 "INSERT ... SELECT requires an explicit column list",
             ));
@@ -9465,6 +9476,39 @@ impl<'a> Parser<'a> {
                 "INSERT ... SELECT requires a query",
             ));
         }
+        // 問い合わせ全体が 1 組の括弧で囲まれた `(SELECT ...)`（Issue #2613）は外側の括弧を外した範囲を
+        // SELECT 検証器へ渡す（単独の括弧付き SELECT は検証器が受理しないため）。`(SELECT ..) UNION
+        // (SELECT ..)` のように先頭の括弧が末尾で閉じない形は、そのまま検証器へ渡す。
+        let mut query_span = (start, end);
+        if matches!(self.tokens.get(start), Some(Token::Punct('(')))
+            && matches!(
+                self.tokens.get(start.saturating_add(1)),
+                Some(Token::Keyword(Keyword::Select))
+            )
+            && matches!(
+                self.tokens.get(end.saturating_sub(1)),
+                Some(Token::Punct(')'))
+            )
+        {
+            let mut d: usize = 0;
+            let mut closes_at_end = false;
+            for i in start..end {
+                match self.tokens.get(i) {
+                    Some(Token::Punct('(')) => d = d.saturating_add(1),
+                    Some(Token::Punct(')')) => {
+                        d = d.saturating_sub(1);
+                        if d == 0 {
+                            closes_at_end = i == end.saturating_sub(1);
+                            break;
+                        }
+                    }
+                    _ => {}
+                }
+            }
+            if closes_at_end {
+                query_span = (start.saturating_add(1), end.saturating_sub(1));
+            }
+        }
         self.pos = end;
         if self.peek_contextual_keyword("ON") {
             return Err(SqlSurfaceError::feature_not_supported(
@@ -9476,7 +9520,8 @@ impl<'a> Parser<'a> {
         Ok(ParsedInsertSelectShape {
             table_name,
             columns,
-            query_span: (start, end),
+            columns_omitted,
+            query_span,
             returning,
             operation_id,
         })
@@ -13597,8 +13642,11 @@ pub struct ValidatedCreateTableAs {
     pub(crate) query_tokens: Vec<Token>,
     /// `WITH DATA`（省略時の既定）なら真。
     pub(crate) with_data: bool,
-    /// `USING OPERATION_ID`（受理するが、実行段は台帳が未実装のため `0A000`。Issue #1679 の担当）。
+    /// `USING OPERATION_ID`（台帳のキー。Issue #1679）。
     pub(crate) operation_id: Option<OperationId>,
+    /// 台帳照合用の文ハッシュ（`recovery::content_hash::for_create_table_as`。`USING OPERATION_ID` 句と
+    /// 末尾 `;` を除いた文のトークン列から導く。内側の結果行の値は材料にしない）。
+    pub(crate) statement_hash: crate::recovery::content_hash::ContentHash,
     /// 作成対象名が `public.` で明示修飾されていたか（`core::EngineCore` が名前解決から設定する）。
     pub(crate) public_qualified: bool,
 }
@@ -13750,6 +13798,13 @@ pub(crate) fn normalize_inner_query_tokens(tokens: Vec<Token>) -> Vec<Token> {
 pub(crate) fn validate_create_table_as_tokens(
     tokens: &[Token],
 ) -> Result<ValidatedCreateTableAs, SqlSurfaceError> {
+    let statement_hash = crate::recovery::content_hash::for_create_table_as(
+        crate::recovery::content_hash::strip_operation_id_clause(tokens),
+    )
+    // 未束縛の `$n` 等、ハッシュ化できない入力は内部エラーではなく未対応機能として拒否する。
+    .map_err(|_| {
+        SqlSurfaceError::feature_not_supported("CREATE TABLE AS does not support parameters")
+    })?;
     let mut p = Parser::new(tokens);
     p.expect_contextual_keyword("CREATE")?;
     p.expect_contextual_keyword("TABLE")?;
@@ -13795,6 +13850,7 @@ pub(crate) fn validate_create_table_as_tokens(
         query_tokens,
         with_data,
         operation_id,
+        statement_hash,
         public_qualified: false,
     })
 }
@@ -18606,6 +18662,8 @@ pub fn validate_statement(
 struct ParsedInsertSelectShape {
     table_name: String,
     columns: Vec<String>,
+    /// 列リスト省略（Issue #2613）。束縛段が展開する。
+    columns_omitted: bool,
     query_span: (usize, usize),
     returning: Option<Projection>,
     operation_id: Option<OperationId>,
@@ -18961,6 +19019,8 @@ pub(crate) fn parse_insert_shape_tokens_with_limit(
 pub(crate) struct InsertSelectShape {
     pub(crate) table_name: String,
     pub(crate) columns: Vec<String>,
+    /// 列リスト省略（Issue #2613。`columns` は空。束縛段が表の宣言順へ展開する）。
+    pub(crate) columns_omitted: bool,
     pub(crate) query_tokens: Vec<Token>,
     pub(crate) returning: Option<Projection>,
     pub(crate) operation_id: Option<OperationId>,
@@ -18980,6 +19040,8 @@ pub(crate) enum ParsedInsertTokens {
 pub struct ValidatedInsertSelect {
     pub(crate) table_name: String,
     pub(crate) columns: Vec<String>,
+    /// 列リスト省略（Issue #2613。`columns` は空で、束縛段が表の宣言順へ展開する）。
+    pub(crate) columns_omitted: bool,
     pub(crate) query: Box<Statement>,
     pub(crate) query_tokens: Vec<Token>,
     pub(crate) returning: Option<Projection>,
@@ -18999,6 +19061,7 @@ impl ValidatedInsertSelect {
         Self {
             table_name: shape.table_name,
             columns: shape.columns,
+            columns_omitted: shape.columns_omitted,
             query: Box::new(query),
             query_tokens: shape.query_tokens,
             returning: shape.returning,
@@ -19012,9 +19075,14 @@ impl ValidatedInsertSelect {
         &self.table_name
     }
 
-    /// 列リスト。
+    /// 列リスト。省略時（[`Self::columns_omitted`] が真）は空。
     pub fn columns(&self) -> &[String] {
         &self.columns
+    }
+
+    /// 列リストが省略されたか（Issue #2613）。
+    pub fn columns_omitted(&self) -> bool {
+        self.columns_omitted
     }
 
     /// 検証済みの内側 SELECT。
@@ -19039,7 +19107,8 @@ pub(crate) fn parse_insert_any_shape_tokens_with_limit(
     let mut p = Parser::new(tokens).with_max_insert_rows(max_insert_rows);
     let (table_name, columns, columns_omitted, default_values) = p.parse_insert_head()?;
     if p.at_insert_query_start() {
-        let shape = p.parse_insert_select_tail(table_name, columns)?;
+        let shape =
+            p.parse_insert_select_tail(table_name, columns, columns_omitted, default_values)?;
         p.expect_end_of_statement()?;
         mode.require(shape.operation_id.as_ref())?;
         let (start, end) = shape.query_span;
@@ -19052,6 +19121,7 @@ pub(crate) fn parse_insert_any_shape_tokens_with_limit(
         return Ok(ParsedInsertTokens::Select(InsertSelectShape {
             table_name: shape.table_name,
             columns: shape.columns,
+            columns_omitted: shape.columns_omitted,
             query_tokens,
             returning: shape.returning,
             operation_id: shape.operation_id,
@@ -25054,6 +25124,31 @@ mod tests {
         );
     }
 
+    // 対象ビヘイビア: SQL-51（ポインタ）。列リスト省略（括弧付き問い合わせを含む）は
+    // 省略印付きで受理され、束縛段が展開する（Issue #2613）。
+    #[test]
+    fn insert_select_accepts_omitted_column_list() {
+        let mode = LedgerMode::CompareOnlyWithoutLedger;
+        for sql in [
+            "INSERT INTO t SELECT a FROM x LIMIT 1",
+            "INSERT INTO t (SELECT a FROM x LIMIT 1)",
+            "INSERT INTO t SELECT a FROM x LIMIT 1 USING OPERATION_ID 'op-1'",
+        ] {
+            let ParsedInsertTokens::Select(shape) = parse_insert_any(sql, mode).expect("parse")
+            else {
+                panic!("expected Select shape: {sql}");
+            };
+            assert!(shape.columns_omitted, "{sql}");
+            assert!(shape.columns.is_empty(), "{sql}");
+        }
+        let ParsedInsertTokens::Select(shape) =
+            parse_insert_any("INSERT INTO t (a) SELECT a FROM x LIMIT 1", mode).expect("parse")
+        else {
+            panic!("expected Select shape");
+        };
+        assert!(!shape.columns_omitted);
+    }
+
     #[test]
     fn insert_select_rejections() {
         let mode = LedgerMode::CompareOnlyWithoutLedger;
@@ -25068,7 +25163,11 @@ mod tests {
             "0A000"
         );
         assert_eq!(code("INSERT INTO t (a) RETURNING a"), "42601");
-        assert_eq!(code("INSERT INTO t SELECT a FROM x LIMIT 1"), "42601");
+        // `DEFAULT VALUES` の後ろに問い合わせは書けない（列リスト省略は別。Issue #2613）。
+        assert_eq!(
+            code("INSERT INTO t DEFAULT VALUES SELECT a FROM x LIMIT 1"),
+            "42601"
+        );
         // 括弧の外の余剰句（`RETURNING` の後ろの `SELECT`）は後続句の解析が `42601` で拒否する。
         assert_eq!(
             code("INSERT INTO t (a) SELECT a FROM x LIMIT 1 RETURNING a SELECT 1"),
@@ -29945,6 +30044,29 @@ mod create_table_as_tests {
         )
         .expect("operation id");
         assert!(op.with_data() && op.operation_id().is_some());
+    }
+
+    #[test]
+    fn statement_hash_ignores_operation_id_and_tracks_statement_differences() {
+        let q = "CREATE TABLE t AS SELECT a FROM s LIMIT 1";
+        let base = parse(q).unwrap().statement_hash;
+        for same in [
+            format!("{q} USING OPERATION_ID 'a'"),
+            format!("{q} USING OPERATION_ID 'b';"),
+            format!("{q};"),
+        ] {
+            assert_eq!(base, parse(&same).unwrap().statement_hash, "{same}");
+        }
+        for other in [
+            "CREATE TABLE IF NOT EXISTS t AS SELECT a FROM s LIMIT 1",
+            "CREATE TABLE t AS SELECT a FROM s LIMIT 1 WITH DATA",
+            "CREATE TABLE t AS SELECT a FROM s LIMIT 1 WITH NO DATA",
+            "CREATE TABLE t (x) AS SELECT a FROM s LIMIT 1",
+            "CREATE TABLE T AS SELECT a FROM s LIMIT 1",
+            "CREATE TABLE t AS SELECT a FROM s LIMIT 2",
+        ] {
+            assert_ne!(base, parse(other).unwrap().statement_hash, "{other}");
+        }
     }
 
     #[test]

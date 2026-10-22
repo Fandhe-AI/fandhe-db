@@ -65,6 +65,31 @@ redb の単一 commit が保証する）。CTAS が作る表は FK・DEFAULT・S
 
 ### 対象外
 
-- `operation_id` の台帳・冪等な再送・入力側上限の判定点の集約（#1679）
+- `operation_id` の台帳・冪等な再送・入力側上限の判定点の集約（#1679。第 III 部で対応済み）
 - 内側の SELECT で LIMIT を省略した場合の受理（現行の SELECT 検証器の範囲のまま）
 - `CREATE TEMP TABLE ... AS`・照合順序の引き継ぎ・配列列の投入・名前のない式の既定列名
+
+## 第 III 部 台帳・冪等な再送・上限（Issue #1679）
+
+ポインタ: SQL-52 (4)・(2)、RECOVER-1・RECOVER-10・RECOVER-11、TABLE-36、SQL-34、INDEX-4。
+
+### 判定順（`core/ctas_exec.rs`）
+
+1. `operation_id` 指定時は、表の重複判定（`42P07`）より前に台帳を照合する。同じ文の再送は `23505`、別の文は `22023`
+2. 同名の関係があれば `42P07`。`IF NOT EXISTS` かつ `operation_id` 省略なら no-op。`operation_id` 指定ありなら no-op でも台帳へ記録する（後の再送が別内容で作り直す事故を防ぐ）
+3. 内側の問い合わせの実カタログ検証 → 台帳必須モードの `WITH DATA` で `operation_id` 省略は `23502`
+4. 書き込みゲート取得後に台帳を再照合する（ゲート待ちの間に同じ文が commit した場合も `42P07` でなく `23505`）
+5. 表の作成 → （`WITH DATA`）評価 → 入力側上限 → 書き込み側上限（`--max-insert-rows`・INDEX-4）→ 投入 → 世代 bump → commit は 1 回だけ
+
+### 台帳の記録
+
+- 文ハッシュは `recovery::content_hash::for_create_table_as`（`OpTag::CreateTableAs = 26`）。材料は `USING OPERATION_ID` 句と末尾 `;` を除いた文のトークン列だけで、内側の結果行の値は含めない。文字の違いはすべて別の文として扱う（`IF NOT EXISTS`・明示の `WITH DATA`・列名リスト・識別子の大小）
+- 記録は経路ごとにちょうど 1 回。1 行以上は `InsertSelectLedgerScope` で書き込み経路の記録ハッシュを文ハッシュに差し替える。0 行・`WITH NO DATA` は台帳だけを記録する。二重に記録すると自分自身に `23505` を返すため、入口を 1 つに絞る
+- 台帳エントリは表の作成と同じ commit に入る。失敗すれば表も台帳も残らず、同じ `operation_id` で再試行できる
+- `DROP TABLE` は表単位の台帳を消すため、DROP の後に同じ文を再送すると再作成される（既存の台帳の意味のとおり）
+- `CompareOnlyWithoutLedger` は台帳に触れず、再送は `42P07`。台帳のキーはテナントを含むため、他テナントの台帳の有無は観測できない
+
+### 上限
+
+- 入力側の判定は `ctas_input_row_limit`／`check_ctas_input_rows` の 1 か所に集約した（#2212 が `INSERT ... SELECT` 等と統一する際の置き換え点）。値は `--max-result-rows` 由来
+- 内側の `LIMIT` は `--max-result-rows` 以下に制限されるため、実体化後の入力側 `54000` は多重防御として残る。書き込み側は `check_insert_row_count_limit` と INDEX-4 のバッチ上限で、どちらも書き込みの前に判定する
