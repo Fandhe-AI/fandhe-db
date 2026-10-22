@@ -172,6 +172,10 @@ fn error_messages_do_not_echo_values() {
         format!("{FROM} WITH (HEADER secretval)"),
         format!("{FROM} WITH ('secret')"),
         format!("{FROM} WITH (FORCE_QUOTE ('secret'))"),
+        format!("{FROM} DELIMITER secretval"),
+        format!("{FROM} FORCE secretval"),
+        format!("{FROM} FORCE QUOTE ('secretcol')"),
+        format!("{FROM} FORCE NOT secretval"),
     ] {
         let e = begin(&core, &sql).map(|_| ()).expect_err("rejected");
         assert!(!e.to_string().contains("secret"), "{e}");

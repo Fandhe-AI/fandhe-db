@@ -20121,12 +20121,36 @@ impl Parser<'_> {
         }
     }
 
+    /// COPY オプション走査用の文字列リテラル取得。失敗時は入力トークンを含めない固定文言の `42601`。
+    fn expect_copy_string(&mut self) -> Result<String, SqlSurfaceError> {
+        match self.advance() {
+            Some(Token::StringLiteral(s)) => Ok(s.clone()),
+            _ => Err(SqlSurfaceError::unsupported("invalid COPY option syntax")),
+        }
+    }
+
+    /// COPY オプション走査用の文脈的キーワード照合。失敗時は入力トークンを含めない固定文言。
+    fn expect_copy_keyword(&mut self, word: &str) -> Result<(), SqlSurfaceError> {
+        match self.advance() {
+            Some(Token::Ident(s)) if s.eq_ignore_ascii_case(word) => Ok(()),
+            _ => Err(SqlSurfaceError::unsupported("invalid COPY option syntax")),
+        }
+    }
+
+    /// COPY オプション走査用の記号照合。失敗時は入力トークンを含めない固定文言。
+    fn expect_copy_punct(&mut self, c: char) -> Result<(), SqlSurfaceError> {
+        match self.advance() {
+            Some(Token::Punct(p)) if *p == c => Ok(()),
+            _ => Err(SqlSurfaceError::unsupported("invalid COPY option syntax")),
+        }
+    }
+
     /// 新構文 `( name [arg] [, name [arg]]* )`。空・末尾カンマ・閉じ括弧欠落は `42601`。
     fn parse_copy_paren_options(
         &mut self,
     ) -> Result<Vec<copy_options::RawCopyOption>, SqlSurfaceError> {
         use copy_options::{RawCopyOption, RawCopyValue};
-        self.expect_punct('(')?;
+        self.expect_copy_punct('(')?;
         let mut out: Vec<RawCopyOption> = Vec::new();
         loop {
             if out.len() >= copy_options::MAX_COPY_OPTIONS {
@@ -20168,7 +20192,7 @@ impl Parser<'_> {
     /// 列リスト（`force_*` 用）。`parens` が真なら `( a, b )`、偽なら括弧なしの `a, b`。
     fn parse_copy_column_list(&mut self, parens: bool) -> Result<Vec<String>, SqlSurfaceError> {
         if parens {
-            self.expect_punct('(')?;
+            self.expect_copy_punct('(')?;
         }
         let mut cols = vec![self.expect_copy_ident()?];
         while matches!(self.peek(), Some(Token::Punct(','))) {
@@ -20179,7 +20203,7 @@ impl Parser<'_> {
             cols.push(self.expect_copy_ident()?);
         }
         if parens {
-            self.expect_punct(')')?;
+            self.expect_copy_punct(')')?;
         }
         Ok(cols)
     }
@@ -20207,7 +20231,7 @@ impl Parser<'_> {
                     if self.peek_contextual_keyword("AS") {
                         self.advance();
                     }
-                    let v = self.expect_string_literal()?;
+                    let v = self.expect_copy_string()?;
                     out.push(RawCopyOption {
                         name: word.to_ascii_lowercase(),
                         value: Some(RawCopyValue::String(v)),
@@ -20229,13 +20253,13 @@ impl Parser<'_> {
                         }
                     } else if self.peek_contextual_keyword("NOT") {
                         self.advance();
-                        self.expect_contextual_keyword("NULL")?;
+                        self.expect_copy_keyword("NULL")?;
                         (
                             "force_not_null",
                             RawCopyValue::List(self.parse_copy_column_list(false)?),
                         )
                     } else {
-                        self.expect_contextual_keyword("NULL")?;
+                        self.expect_copy_keyword("NULL")?;
                         (
                             "force_null",
                             RawCopyValue::List(self.parse_copy_column_list(false)?),
