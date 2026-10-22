@@ -424,6 +424,13 @@ Bind 値 `None`（SQL NULL）は、`sql::params` が裸の `Token::Ident("NULL")
 - wire 層の第 1 パスは、binary 非対応スロットに binary format が指定された場合、値が NULL でも
   `0A000` を先に返す（既存の fail-closed）。PostgreSQL では NULL に format は無関係なため
   差分になりうる。#2440 で現行の fail-closed を層 A に固定した（仕様準拠としての固定ではない）。
+- パターン 9（非等価・BETWEEN・述語形 DML）の NULL も同じ経路で、リテラル形と同値
+  （Issue #2432・TASK-336・SQL-78・WIRE-12 ポインタ。プロダクションコードの変更なし）。
+  engine 側は `bind_prepared_null_matches_literal_null_in_noneq_between`、wire 側は
+  `crates/wire-server/tests/wire_sql78_noneq_between_param.rs` で固定する。同ファイルは
+  `ParameterDescription` の公告（列型の OID。順序比較が型として拒否される BOOLEAN の `<` 等と
+  TEXT の BETWEEN は Parse で `22000`、存在しない列・表は `42703`／`42P01`、`$n op $m` は
+  宣言なしで `42P18`、宣言 OID は echo）も現行挙動として固定する。
 
 ## 検証
 

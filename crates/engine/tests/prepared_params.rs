@@ -1835,3 +1835,62 @@ fn typed_float_bind_respects_rls_boundary() {
     assert_eq!(rows(&ctx_a, &mut session), 1);
     assert_eq!(rows(&ctx_b, &mut session), 0);
 }
+// Issue #2432（親 #2429・TASK-336・SQL-78・WIRE-12）: 非等価・BETWEEN・述語形 DML の
+// `$n` に NULL を Bind した結果が、同じ位置へリテラル `NULL` を書いた形と一致する
+// （受理なら ParsedSql 同値、拒否なら wire_code 同値）。置換側に位置別の NULL 分岐は無い。
+// 実測: 比較演算子は受理、BETWEEN は NULL 端点を拒否（リテラル形・`$n` 形で同じ wire_code）。
+#[test]
+fn bind_prepared_null_matches_literal_null_in_noneq_between() {
+    let path = unique_db_path("prepared-null-parity-noneq");
+    let _guard = CleanupGuard(path.clone());
+    let core = new_core_with_typed_table(&path);
+
+    let mut cases: Vec<(String, Vec<Option<&str>>, String)> = Vec::new();
+    for col in ["n", "b", "body"] {
+        for op in ["<", ">", "<=", ">=", "<>"] {
+            cases.push((
+                format!("SELECT id FROM typed WHERE {col} {op} $1 LIMIT 5"),
+                vec![None],
+                format!("SELECT id FROM typed WHERE {col} {op} NULL LIMIT 5"),
+            ));
+        }
+        for neg in ["", "NOT "] {
+            for (vals, lo, hi) in [
+                (vec![None, Some("5")], "NULL", "5"),
+                (vec![Some("1"), None], "1", "NULL"),
+                (vec![None, None], "NULL", "NULL"),
+            ] {
+                cases.push((
+                    format!("SELECT id FROM typed WHERE {col} {neg}BETWEEN $1 AND $2 LIMIT 5"),
+                    vals,
+                    format!("SELECT id FROM typed WHERE {col} {neg}BETWEEN {lo} AND {hi} LIMIT 5"),
+                ));
+            }
+        }
+    }
+    cases.push((
+        "SELECT id FROM typed WHERE n > $1 AND body = $2 LIMIT 5".into(),
+        vec![None, Some("x")],
+        "SELECT id FROM typed WHERE n > NULL AND body = 'x' LIMIT 5".into(),
+    ));
+    cases.push((
+        "SELECT id FROM typed WHERE n = $1 OR n < $2 LIMIT 5".into(),
+        vec![Some("1"), None],
+        "SELECT id FROM typed WHERE n = 1 OR n < NULL LIMIT 5".into(),
+    ));
+    cases.push((
+        "UPDATE typed SET body = 'x' WHERE n > $1 USING OPERATION_ID 'op-3'".into(),
+        vec![None],
+        "UPDATE typed SET body = 'x' WHERE n > NULL USING OPERATION_ID 'op-3'".into(),
+    ));
+    cases.push((
+        "DELETE FROM typed WHERE n BETWEEN $1 AND $2 USING OPERATION_ID 'op-4'".into(),
+        vec![None, Some("3")],
+        "DELETE FROM typed WHERE n BETWEEN NULL AND 3 USING OPERATION_ID 'op-4'".into(),
+    ));
+    for (template, values, literal) in &cases {
+        let accepted = assert_null_bind_matches_literal(&core, template, values, literal);
+        let between = template.contains("BETWEEN");
+        assert_eq!(accepted, !between, "{template}");
+    }
+}
