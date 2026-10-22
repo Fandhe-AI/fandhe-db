@@ -13492,8 +13492,11 @@ pub struct ValidatedCreateTableAs {
     pub(crate) query_tokens: Vec<Token>,
     /// `WITH DATA`（省略時の既定）なら真。
     pub(crate) with_data: bool,
-    /// `USING OPERATION_ID`（受理するが、実行段は台帳が未実装のため `0A000`。Issue #1679 の担当）。
+    /// `USING OPERATION_ID`（台帳のキー。Issue #1679）。
     pub(crate) operation_id: Option<OperationId>,
+    /// 台帳照合用の文ハッシュ（`recovery::content_hash::for_create_table_as`。`USING OPERATION_ID` 句と
+    /// 末尾 `;` を除いた文のトークン列から導く。内側の結果行の値は材料にしない）。
+    pub(crate) statement_hash: crate::recovery::content_hash::ContentHash,
     /// 作成対象名が `public.` で明示修飾されていたか（`core::EngineCore` が名前解決から設定する）。
     pub(crate) public_qualified: bool,
 }
@@ -13645,6 +13648,13 @@ pub(crate) fn normalize_inner_query_tokens(tokens: Vec<Token>) -> Vec<Token> {
 pub(crate) fn validate_create_table_as_tokens(
     tokens: &[Token],
 ) -> Result<ValidatedCreateTableAs, SqlSurfaceError> {
+    let statement_hash = crate::recovery::content_hash::for_create_table_as(
+        crate::recovery::content_hash::strip_operation_id_clause(tokens),
+    )
+    // 未束縛の `$n` 等、ハッシュ化できない入力は内部エラーではなく未対応機能として拒否する。
+    .map_err(|_| {
+        SqlSurfaceError::feature_not_supported("CREATE TABLE AS does not support parameters")
+    })?;
     let mut p = Parser::new(tokens);
     p.expect_contextual_keyword("CREATE")?;
     p.expect_contextual_keyword("TABLE")?;
@@ -13690,6 +13700,7 @@ pub(crate) fn validate_create_table_as_tokens(
         query_tokens,
         with_data,
         operation_id,
+        statement_hash,
         public_qualified: false,
     })
 }
@@ -29764,6 +29775,29 @@ mod create_table_as_tests {
         )
         .expect("operation id");
         assert!(op.with_data() && op.operation_id().is_some());
+    }
+
+    #[test]
+    fn statement_hash_ignores_operation_id_and_tracks_statement_differences() {
+        let q = "CREATE TABLE t AS SELECT a FROM s LIMIT 1";
+        let base = parse(q).unwrap().statement_hash;
+        for same in [
+            format!("{q} USING OPERATION_ID 'a'"),
+            format!("{q} USING OPERATION_ID 'b';"),
+            format!("{q};"),
+        ] {
+            assert_eq!(base, parse(&same).unwrap().statement_hash, "{same}");
+        }
+        for other in [
+            "CREATE TABLE IF NOT EXISTS t AS SELECT a FROM s LIMIT 1",
+            "CREATE TABLE t AS SELECT a FROM s LIMIT 1 WITH DATA",
+            "CREATE TABLE t AS SELECT a FROM s LIMIT 1 WITH NO DATA",
+            "CREATE TABLE t (x) AS SELECT a FROM s LIMIT 1",
+            "CREATE TABLE T AS SELECT a FROM s LIMIT 1",
+            "CREATE TABLE t AS SELECT a FROM s LIMIT 2",
+        ] {
+            assert_ne!(base, parse(other).unwrap().statement_hash, "{other}");
+        }
     }
 
     #[test]
