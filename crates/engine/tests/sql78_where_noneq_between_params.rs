@@ -513,3 +513,27 @@ fn set_operator_named_identifiers_do_not_disable_noneq_params() {
         assert!(r.is_ok(), "{sql}: {r:?}");
     }
 }
+
+// PR #2631 指摘: 集合演算でも枝ごとにダミーフラグを持つ。第 1 枝の `day = $1` のダミー値は
+// 日付検証を省略され、第 2 枝の実リテラルは検証されたまま Describe が成功する。
+#[test]
+fn set_op_describe_keeps_param_dummy_per_branch() {
+    let (core, session, _g) = setup("sql78-setop-flags");
+    let ok = core
+        .parse_sql_prepared(
+            "SELECT day FROM t WHERE day = $1 UNION SELECT day FROM t WHERE day = '2024-01-01' LIMIT 5",
+        )
+        .and_then(|p| core.describe_prepared_in_session(&session, &p).map(|_| ()));
+    assert!(
+        ok.is_ok(),
+        "{:?}",
+        ok.map_err(|e| e.wire_code().to_string())
+    );
+    // 実リテラルの不正値は第 2 枝でも拒否される（省略されない）。
+    let bad = core
+        .parse_sql_prepared(
+            "SELECT day FROM t WHERE day = $1 UNION SELECT day FROM t WHERE day = 'not-a-date' LIMIT 5",
+        )
+        .and_then(|p| core.describe_prepared_in_session(&session, &p).map(|_| ()));
+    assert!(bad.is_err());
+}

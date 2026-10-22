@@ -154,7 +154,7 @@ fn is_comparison_operator(token: Option<&Token>) -> bool {
 /// 境界とみなさない。安全側に倒す設計のため、この判定を追加しても許可されて
 /// いなかった位置の `$n` が新たに通ることはない（既存の `is_where_equality`
 /// 等の受理条件は無変更）。
-fn is_where_clause_boundary(tokens: &[Token], idx: usize) -> bool {
+fn is_where_clause_boundary(tokens: &[Token], idx: usize, in_where_region: bool) -> bool {
     let next1 = tokens.get(idx + 1);
     let next2 = tokens.get(idx + 2);
     let Some(Token::Ident(name)) = tokens.get(idx) else {
@@ -182,13 +182,17 @@ fn is_where_clause_boundary(tokens: &[Token], idx: usize) -> bool {
         // `returning = $1` は直後が `=` になるため、いずれも一致しない。
         // 列名 `returning` の `[NOT] BETWEEN` 比較（`WHERE returning BETWEEN $1 AND $2`。
         // リテラル BETWEEN は構文段が受理する）は RETURNING 句ではなく WHERE の述語とする
-        // （PR #2631 指摘）。
+        // （PR #2631 指摘）。この除外は WHERE 領域（`in_where_region`）の境界判定に限る。
+        // `SET`／`ON CONFLICT DO UPDATE SET` 領域では `SET c = $1 RETURNING between` の
+        // `RETURNING` が実句であるため除外しない。
         "RETURNING" => {
             matches!(
                 next1,
                 Some(Token::Ident(_) | Token::QuotedNull(_) | Token::Punct('*'))
-            ) && !ident_eq_ignore_case(next1, "BETWEEN")
-                && !(ident_eq_ignore_case(next1, "NOT") && ident_eq_ignore_case(next2, "BETWEEN"))
+            ) && !(in_where_region
+                && (ident_eq_ignore_case(next1, "BETWEEN")
+                    || (ident_eq_ignore_case(next1, "NOT")
+                        && ident_eq_ignore_case(next2, "BETWEEN"))))
         }
         // `USING OPERATION_ID $n` / `USING PLAN(...)`（`Parser` がこの 2 語の
         // みを文脈的キーワードとして照合する）。UDF 呼び出し `using(...)` は
@@ -252,7 +256,7 @@ fn where_region(tokens: &[Token]) -> Option<(usize, usize)> {
                     // `USING OPERATION_ID|PLAN`・`ON CONFLICT`）に限り境界とする
                     // （PR #1012 Bugbot・codex 指摘。詳細は
                     // [`is_where_clause_boundary`] 参照）。
-                    && is_where_clause_boundary(tokens, idx) =>
+                    && is_where_clause_boundary(tokens, idx, true) =>
             {
                 Some(idx)
             }
@@ -298,14 +302,38 @@ pub(crate) fn where_equality_literal_is_param_typed(
     tokens: &[Token],
     kinds: &[ParamLiteralKind],
 ) -> Vec<bool> {
-    let flags = where_literal_flags_in_region(tokens, kinds);
-    // 集合演算の各枝は `set_op::describe_tree` が同じ配列を序数 0 から受け取るため、
-    // 枝ごとの対応を取れない。実リテラルが 1 つでもあれば全て `false`（検証を省略しない）へ
-    // 倒し、実リテラルが `$n` のダミー扱いで素通りする事態を防ぐ（fail-closed）。
-    if flags.iter().any(|f| !*f) && has_set_operator_branch(tokens) {
-        return vec![false; flags.len()];
+    if !has_set_operator_branch(tokens) {
+        return where_literal_flags_in_region(tokens, kinds);
     }
-    flags
+    // 集合演算（PR #2631 指摘）: 枝ごとにフラグを求め、最長の枝の長さへ `false` で埋めて
+    // 枝順に連結する。`set_op::describe_columns` が枝数で等分して各枝へ自分の区画だけを渡す
+    // ため、枝をまたいだ序数のずれがなく、実リテラルの検証は維持されたままパラメータ由来の
+    // 位置だけが省略される（埋め草の `false` は検証側＝fail-closed）。
+    let mut per_branch: Vec<Vec<bool>> = Vec::new();
+    let mut seg_start = 0usize;
+    for (i, t) in tokens.iter().enumerate() {
+        if matches!(t, Token::Ident(n) if super::allowlist::is_set_operator_ident(n))
+            && super::allowlist::set_operator_is_followed_by_branch(tokens, i)
+        {
+            per_branch.push(where_literal_flags_in_region(
+                tokens.get(seg_start..i).unwrap_or(&[]),
+                kinds,
+            ));
+            seg_start = i.saturating_add(1);
+        }
+    }
+    per_branch.push(where_literal_flags_in_region(
+        tokens.get(seg_start..).unwrap_or(&[]),
+        kinds,
+    ));
+    let width = per_branch.iter().map(Vec::len).max().unwrap_or(0);
+    per_branch
+        .into_iter()
+        .flat_map(|mut f| {
+            f.resize(width, false);
+            f
+        })
+        .collect()
 }
 
 fn where_literal_flags_in_region(tokens: &[Token], kinds: &[ParamLiteralKind]) -> Vec<bool> {
@@ -803,7 +831,7 @@ fn set_region(tokens: &[Token]) -> Option<(usize, usize)> {
                 if depth == 0
                     && (name.eq_ignore_ascii_case("RETURNING")
                         || name.eq_ignore_ascii_case("USING"))
-                    && is_where_clause_boundary(tokens, idx) =>
+                    && is_where_clause_boundary(tokens, idx, false) =>
             {
                 Some(idx)
             }
@@ -989,7 +1017,7 @@ fn upsert_set_region(tokens: &[Token]) -> Option<(usize, usize)> {
                 if start.is_some()
                     && (name.eq_ignore_ascii_case("RETURNING")
                         || name.eq_ignore_ascii_case("USING"))
-                    && is_where_clause_boundary(tokens, idx) =>
+                    && is_where_clause_boundary(tokens, idx, false) =>
             {
                 return start.map(|s| (s, idx));
             }
@@ -2667,7 +2695,46 @@ mod tests {
         )
         .expect("lex");
         let flags = where_equality_literal_is_param_typed(&tokens, &[]);
-        assert_eq!(flags, vec![false, false]);
+        // 枝ごとの区画（長さ 1）を枝順に連結する。
+        assert_eq!(flags, vec![false, true]);
+    }
+
+    // 回帰（PR #2631 指摘）: 枝ごとにフラグを持ち、第 1 枝の `$n` 由来のフラグが
+    // 第 2 枝の実リテラルへ漏れず、実リテラルの検証も維持される。
+    #[test]
+    fn set_op_flags_are_per_branch_padded() {
+        let tokens = crate::sql::lexer::tokenize_with_params(
+            "SELECT day FROM t WHERE day = $1 UNION SELECT day FROM t WHERE day = '2024-01-01' LIMIT 5",
+        )
+        .expect("lex");
+        assert_eq!(
+            where_equality_literal_is_param_typed(&tokens, &[]),
+            vec![true, false]
+        );
+        let tokens = crate::sql::lexer::tokenize_with_params(
+            "SELECT day FROM t WHERE a = $1 AND b = $2 UNION SELECT day FROM t WHERE day = '2024-01-01'",
+        )
+        .expect("lex");
+        assert_eq!(
+            where_equality_literal_is_param_typed(&tokens, &[]),
+            vec![true, true, false, false]
+        );
+    }
+
+    // 回帰（PR #2631 指摘）: 列名 `between` の RETURNING は SET 領域の終端になる。
+    #[test]
+    fn update_set_region_ends_at_returning_before_between_column() {
+        for sql in [
+            "UPDATE t SET c = $1 RETURNING between",
+            "UPDATE t SET c = $1 RETURNING between WHERE x = 1",
+        ] {
+            let tokens = crate::sql::lexer::tokenize_with_params(sql).expect("lex");
+            let (_, end) = set_region(&tokens).expect("region");
+            assert!(
+                matches!(tokens.get(end), Some(Token::Ident(n)) if n.eq_ignore_ascii_case("RETURNING")),
+                "{sql}"
+            );
+        }
     }
 
     #[test]
