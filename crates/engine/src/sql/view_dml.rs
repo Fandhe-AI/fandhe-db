@@ -272,6 +272,8 @@ fn rewrite_assignments(
         }
         let value = match value {
             SetValue::Literal(l) => SetValue::Literal(l.clone()),
+            // 基表の列 DEFAULT が効く（列名の写像のみ。Issue #1746・SQL-50）。
+            SetValue::Default => SetValue::Default,
             SetValue::Expr(expr) => {
                 if let Some(columns) = rv.view_columns.as_deref() {
                     expr_columns_within(columns, expr)?;

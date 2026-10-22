@@ -4026,9 +4026,21 @@ fn bind_set_assignments(
             .columns
             .get(col_idx)
             .ok_or_else(|| SqlSurfaceError::undefined_column(name))?;
+        // `SET col = DEFAULT`（SQL-50・Issue #1746）。GENERATED ALWAYS の判定より前に解決し、
+        // IDENTITY／SEQUENCE／時刻関数の DEFAULT は `bind_set_default` が `0A000` で拒否する。
+        if matches!(set_value, crate::sql::allowlist::SetValue::Default) {
+            bound_exprs.push((
+                col_idx,
+                crate::sql::set_expr::bind_set_default(name, column)?,
+            ));
+            continue;
+        }
         reject_generated_always_value(column)?;
         let literal = match set_value {
             crate::sql::allowlist::SetValue::Literal(literal) => literal,
+            crate::sql::allowlist::SetValue::Default => {
+                return Err(reject_default_keyword_literal());
+            }
             crate::sql::allowlist::SetValue::Expr(expr) => {
                 bound_exprs.push((
                     col_idx,
