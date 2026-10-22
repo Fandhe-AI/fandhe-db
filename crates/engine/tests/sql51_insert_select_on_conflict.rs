@@ -429,3 +429,42 @@ fn unsupported_forms_stay_fail_closed() {
     }
     assert!(dst_rows(&core, "alice").is_empty());
 }
+
+// Issue #2614 レビュー指摘: UNIQUE 対象で衝突によりスキップ・更新される行は、SELECT 由来で
+// id が重複していても新規挿入されないため id 重複検査の対象外（書き込み側は実際に新規挿入する
+// 行だけを検査する）。
+#[test]
+fn skipped_or_updated_rows_with_duplicate_ids_are_not_rejected() {
+    let (core, path) = setup("sql51-oc-dupid");
+    let _g = CleanupGuard(path);
+    seed_dst(
+        &core,
+        "alice",
+        "(101, 10, 'o10'), (102, 20, 'o20')",
+        "seed-d",
+    );
+    // 2 行とも id=5 だが、どちらも既存行と k で衝突するため両方スキップされる。
+    let sel = "SELECT 5, k, t FROM src WHERE k = 10 OR k = 20 ORDER BY k LIMIT 100";
+    let n = affected(run(
+        &core,
+        "alice",
+        &format!(
+            "INSERT INTO dst (id, k, t) {sel} ON CONFLICT (k) DO NOTHING \
+             USING OPERATION_ID 'oc-dup-n'"
+        ),
+    ));
+    assert_eq!(n, 0);
+    // DO UPDATE は別々の既存行を更新する。
+    let n = affected(run(
+        &core,
+        "alice",
+        &format!(
+            "INSERT INTO dst (id, k, t) {sel} ON CONFLICT (k) DO UPDATE SET t = EXCLUDED.t \
+             USING OPERATION_ID 'oc-dup-u'"
+        ),
+    ));
+    assert_eq!(n, 2);
+    let rows = dst_rows(&core, "alice");
+    assert_eq!(rows.len(), 2, "{rows:?}");
+    assert!(rows[0].contains("a1") && rows[1].contains("a2"), "{rows:?}");
+}
