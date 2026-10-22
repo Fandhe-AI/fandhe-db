@@ -2387,6 +2387,10 @@ pub(crate) enum UpsertSetValue<'a> {
     /// `<col> = <col> + <operand>`（SQL-49、Issue #2425）。衝突した可視な既存行の
     /// pre-image へ加算する（同じ write トランザクション内の read-merge-write）。
     Add(UpsertAddOperandRef<'a>),
+    /// 一般の値式（SQL-49、Issue #1739）。既存行（pre-image）の論理列 `0..n` と、挿入しようと
+    /// した行（`EXCLUDED`）の論理列 `n..2n` を並べた行ビューに対して評価する。束縛済み式は
+    /// 列 index でスキーマに結び付くため `expected_schema` が必須。
+    Expr(&'a crate::sql::set_expr::BoundSetExpr),
 }
 
 /// [`UpsertSetValue::Add`] の右オペランド（Issue #2425）。
@@ -2575,6 +2579,22 @@ fn upsert_typed_rows_impl(
     if rows.is_empty() {
         return Ok(UpsertOutcome::default());
     }
+    // 式つきの代入は束縛時スキーマとの照合（`expected_schema`）が前提（列 index で結び付くため。
+    // SQL-49、Issue #1739）。無ければ fail-closed に拒否する。
+    if let UpsertAction::DoUpdate(assignments) = action {
+        if expected_schema.is_none()
+            && assignments
+                .iter()
+                .any(|(_, v)| matches!(v, UpsertSetValue::Expr(_)))
+        {
+            return Err(TenantWriteError::SetExpressionEvaluationFailed(
+                SqlSurfaceError::Internal {
+                    detail: "ON CONFLICT SET expression requires the bound table schema"
+                        .to_string(),
+                },
+            ));
+        }
+    }
     // 対象省略は `DO NOTHING` 専用（構文段・束縛段で拒否済みの多層防御。SQL-49、Issue #1736）。
     if matches!(target, UpsertTarget::AnyUnique) && !matches!(action, UpsertAction::DoNothing) {
         return Err(TenantWriteError::Catalog(CatalogError::Invalid(
@@ -2647,7 +2667,11 @@ fn upsert_typed_rows_impl(
             let allocated = schema.is_allocated();
             if allocated {
                 schema.require_legacy_row_identity_unless_unique_target(target)?;
-            } else if !matches!(target, UpsertTarget::AnyUnique) {
+            } else if matches!(target, UpsertTarget::RowId) {
+                // UNIQUE／対象省略の対象では事前の id 重複検査をしない（Issue #2614）。INSERT ... SELECT
+                // 由来の行は id が重複し得るが、衝突でスキップ・更新される行は新規挿入しないため
+                // id の一意性は問われない。実際に新規挿入する行は `insert_unique_row` が既存行・
+                // 同一文内の先行挿入行との id 重複を `IdConflict`（`23505`）で拒否する。
                 // バッチ内 id 重複検出（`insert_typed_rows_unchecked` と同じ設計。確保はフォール
                 // ブルにする）。呼び出し元 `sql::parser::bind_upsert_form` が束縛時点で既に `22000` として
                 // 拒否済みのため通常は到達しないが、本関数単体でも fail-closed を保つ。`VALUES` の
@@ -2777,6 +2801,9 @@ fn upsert_typed_rows_impl(
                         }
                         UpsertSetValue::Literal(v) => {
                             content_hash::UpsertAssignmentHashValue::Literal(v)
+                        }
+                        UpsertSetValue::Expr(set) => {
+                            content_hash::UpsertAssignmentHashValue::Expr(set.source())
                         }
                         UpsertSetValue::Add(UpsertAddOperandRef::Literal(v)) => {
                             content_hash::UpsertAssignmentHashValue::Add(
@@ -3123,6 +3150,47 @@ fn upsert_typed_rows_impl(
                                         })?
                                     }
                                     UpsertSetValue::Literal(v) => (*v).clone(),
+                                    UpsertSetValue::Expr(set) => {
+                                        // 所有・可視と確定した衝突行に対してだけ評価する（値に依存する
+                                        // エラーを他テナントの存在オラクルにしない）。全代入が更新前の
+                                        // 行を見る（PG と同じ）よう、書き換え前のスカラービューを使う。
+                                        let pre = crate::row_codec::scan_scalar_columns(
+                                            &schema,
+                                            &existing.metadata,
+                                        )
+                                        .map_err(|e| CatalogError::CorruptSchema(e.to_string()))?;
+                                        let scratch =
+                                            crate::sql::exec::array_payload_scratch(values)
+                                                .map_err(
+                                                    TenantWriteError::SetExpressionEvaluationFailed,
+                                                )?;
+                                        let excluded =
+                                            crate::sql::exec::candidate_scalar_view(values, &scratch);
+                                        let mut combined: Vec<Option<crate::row_codec::ScalarRef<'_>>> =
+                                            Vec::new();
+                                        combined
+                                            .try_reserve_exact(pre.len().saturating_add(excluded.len()))
+                                            .map_err(|_| {
+                                                TenantWriteError::Storage(StorageError::Codec(
+                                                    "failed to reserve upsert expression row view"
+                                                        .to_string(),
+                                                ))
+                                            })?;
+                                        combined.extend(pre);
+                                        combined.extend(excluded);
+                                        let v = crate::sql::set_expr::eval_set_expr_to_value(
+                                            set,
+                                            write_id,
+                                            &existing.embedding,
+                                            &combined,
+                                        )
+                                        .map_err(TenantWriteError::SetExpressionEvaluationFailed)?;
+                                        validate_set_assignments(
+                                            &schema,
+                                            &[(*col_idx, v.clone())],
+                                        )?;
+                                        v
+                                    }
                                     UpsertSetValue::Add(operand) => {
                                         let rhs = match operand {
                                             UpsertAddOperandRef::Literal(v) => *v,

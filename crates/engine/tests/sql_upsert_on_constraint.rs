@@ -204,7 +204,7 @@ fn undefined_and_wrong_kind_names_are_rejected_without_side_effects() {
 }
 
 #[test]
-fn view_target_and_insert_select_are_rejected() {
+fn view_target_is_rejected_and_insert_select_is_accepted_with_id() {
     let (core, path, mut s) = setup(
         "onc-view",
         &[
@@ -216,9 +216,14 @@ fn view_target_and_insert_select_are_rejected() {
     let view = "INSERT INTO v (id, a, b) VALUES (1, 'x', 'y') ON CONFLICT ON CONSTRAINT uq_a \
                 DO NOTHING USING OPERATION_ID 'v-1'";
     assert_eq!(code(&core, &mut s, "owner", view), "42704");
-    let sel = "INSERT INTO docs (a, b) SELECT a, b FROM docs ON CONFLICT ON CONSTRAINT uq_a \
-               DO NOTHING USING OPERATION_ID 'v-2'";
-    assert_eq!(code(&core, &mut s, "owner", sel), "0A000");
+    // INSERT ... SELECT との併用は受理される（SQL-51・Issue #2614）。疑似列 `id` を省略した
+    // 列リストは従来方式の表では `id` 必須のため fail-closed のまま。
+    let sel = "INSERT INTO docs (id, a, b) SELECT id, a, b FROM docs ORDER BY id LIMIT 10 \
+               ON CONFLICT ON CONSTRAINT uq_a DO NOTHING USING OPERATION_ID 'v-2'";
+    exec(&core, &mut s, "owner", sel).expect("insert select with on conflict");
+    let sel_no_id = "INSERT INTO docs (a, b) SELECT a, b FROM docs ORDER BY id LIMIT 10 \
+                     ON CONFLICT ON CONSTRAINT uq_a DO NOTHING USING OPERATION_ID 'v-3'";
+    assert_eq!(code(&core, &mut s, "owner", sel_no_id), "22000");
 }
 
 #[test]

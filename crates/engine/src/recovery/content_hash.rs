@@ -3480,6 +3480,65 @@ mod tests {
         );
     }
 
+    /// 一般の式の代入（kind 3。Issue #1739・SQL-49・RECOVER-11）の判別性: 式が違えば（演算子・
+    /// リテラル・参照列・整数/小数リテラルの別・EXCLUDED 参照か既存行の列か）ハッシュが変わり、
+    /// 同じ式なら変わらない。他の kind（0/1/2）とも衝突しない。
+    #[test]
+    fn for_typed_upsert_expr_assignment_is_discriminated() {
+        use crate::sql::udf_call::{BinOp, Expr};
+        let embedding = [0.5_f32, 1.5];
+        let n = Value::Integer(1);
+        let cols: [(&str, &Value); 1] = [("n", &n)];
+        let rows: [TypedInsertBatchRow<'_>; 1] = [(1, Visibility::Private, &embedding, &cols)];
+        let bin = |op: BinOp, lhs: Expr, rhs: Expr| Expr::Binary {
+            op,
+            lhs: Box::new(lhs),
+            rhs: Box::new(rhs),
+        };
+        let col = |s: &str| Expr::Ident(s.to_string());
+        let num = |s: &str| Expr::Number(s.to_string());
+        let hash = |e: &Expr| {
+            let a = [("n".to_string(), UpsertAssignmentHashValue::Expr(e))];
+            *for_typed_upsert(
+                &UpsertHashTarget::RowId,
+                &UpsertHashAction::DoUpdate(&a),
+                &rows,
+            )
+            .unwrap()
+            .as_bytes()
+        };
+        let times_two = bin(BinOp::Mul, col("n"), num("2"));
+        assert_eq!(hash(&times_two), hash(&bin(BinOp::Mul, col("n"), num("2"))));
+        assert_ne!(hash(&times_two), hash(&bin(BinOp::Mul, col("n"), num("3"))));
+        assert_ne!(hash(&times_two), hash(&bin(BinOp::Add, col("n"), num("2"))));
+        assert_ne!(hash(&times_two), hash(&bin(BinOp::Mul, col("m"), num("2"))));
+        // 整数除算と小数除算は別の式（`UPDATE ... SET` の式と同じ区別）。
+        assert_ne!(
+            hash(&bin(BinOp::Div, col("n"), num("2"))),
+            hash(&bin(BinOp::Div, col("n"), num("2.0")))
+        );
+        // 既存行の列と EXCLUDED 参照は別の式。
+        let excluded = Expr::Ident(format!("{}n", crate::sql::upsert_expr::EXCLUDED_PREFIX));
+        assert_ne!(
+            hash(&bin(BinOp::Add, col("n"), col("n"))),
+            hash(&bin(BinOp::Add, col("n"), excluded))
+        );
+        // 他の kind の代入とは別。
+        let one = Value::BigInt(1);
+        let add = [(
+            "n".to_string(),
+            UpsertAssignmentHashValue::Add(UpsertAddHashOperand::Literal(&one)),
+        )];
+        let add_hash = *for_typed_upsert(
+            &UpsertHashTarget::RowId,
+            &UpsertHashAction::DoUpdate(&add),
+            &rows,
+        )
+        .unwrap()
+        .as_bytes();
+        assert_ne!(hash(&bin(BinOp::Add, col("n"), num("1"))), add_hash);
+    }
+
     /// golden 固定（Issue #1692・TABLE-24 (3)・RECOVER-10・RECOVER-11）: `nextval`／`currval` の
     /// 構文形（種別 1。[`HashColumnInput::ValuesSequence`]）を含む INSERT／バッチ INSERT／UPSERT の
     /// ハッシュがバイト単位で不変であることを固定する。永続化済みの台帳エントリとの再送互換

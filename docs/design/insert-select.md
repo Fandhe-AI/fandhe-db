@@ -30,7 +30,7 @@ INSERT INTO <表> (<列>[, ...]) <query> [RETURNING ...] [USING OPERATION_ID '<i
   - `ON CONFLICT`（2 トークン組）・`RETURNING`・`USING OPERATION_ID`（2 トークン組）・`;`・文末
   - JOIN の `ON`・`USING (...)`・`USING PLAN(...)`・`USING MODE` を誤って区切りにしないため、`ON`／`USING` は 2 トークン組で判定する
 - 範囲はトークン列のまま既存の検証器へ渡し、SQL 文字列を組み立て直さない（インジェクションを構造的に避ける）
-- `ON CONFLICT` との併用は `0A000`（別 Issue）。空の問い合わせ・`DEFAULT VALUES` の後ろの問い合わせは `42601`（列リスト省略は第 III 部〔Issue #2613〕で受理）
+- `ON CONFLICT` との併用は Issue #2614 で受理（下の「Issue #2614 追記」）。空の問い合わせ・`DEFAULT VALUES` の後ろの問い合わせは `42601`（列リスト省略は第 III 部〔Issue #2613〕で受理）
 - 既存の公開入口（`validate_insert` 等）は内側 SELECT を検証できないため、SELECT 形を受けると `0A000`
 
 ### 3. 内側 SELECT の検証
@@ -62,7 +62,7 @@ INSERT INTO <表> (<列>[, ...]) <query> [RETURNING ...] [USING OPERATION_ID '<i
 
 ### 6. 対象外（fail-closed）
 
-`ON CONFLICT` との併用・ビューへの挿入・一時表が関与する文・拡張クエリの `$n`・`OVERRIDING`・
+ビューへの挿入・一時表が関与する文・拡張クエリの `$n`・`OVERRIDING`・
 `PARTITIONED` との併用（構文上受理しない）。
 
 ## 第 II 部 実行（SQL-51・Issue #1733）
@@ -73,7 +73,7 @@ RLS-7・RLS-10・RECOVER-10・RECOVER-11）。
 
 ### 実行経路
 
-1. `ON CONFLICT` 併用は `0A000`（別 Issue。SQL-49）。
+1. `ON CONFLICT` 併用は Issue #2614 で受理する（下の「Issue #2614 追記」）。
 2. 対象表のスキーマ取得（`42P01`。それ以外の失敗は固定文言の `XX000`）。RETURNING は評価より前に束縛する。
 3. 内側 SELECT を **書き込むセッションの `PolicyContext`** で既存の読み取り経路
    （`execute_read_statement_with_limits`）へ通して実体化する。独自の走査を持たないため RLS が暗黙に
@@ -111,11 +111,11 @@ RLS-7・RLS-10・RECOVER-10・RECOVER-11）。
 - RETURNING: VALUES 形と同じ経路（`execute_insert_returning_in`）。Describe は束縛結果の投影から列メタを返す。
 - 台帳ハッシュ: `ValidatedInsertSelect::statement_hash` を parse 時に
   `for_insert_select(strip_operation_id_clause(送られた文のトークン列))` で算出する（結果行は材料にしない）。
-- `ON CONFLICT` 併用は parser が `0A000` で拒否する。列リスト省略（#1730）・ビュー・一時表・拡張クエリの `$n`・`USING PLAN` も
+- `ON CONFLICT` 併用は Issue #2614 で受理する。列リスト省略（#1730）・ビュー・一時表・拡張クエリの `$n`・`USING PLAN` も
   従来どおり `0A000`／`42601`。
 - 列の解決は束縛（`bind`）が先に行い、実行側の `resolve_target_columns` は同じ列リストを `TargetColumn` へ写す。
   書き込み先を表す型は `TargetColumn` に一本化した（旧 `InsertSelectSlot` は廃止）。
-- e2e: `tests/sql51_insert_select_exec.rs`（行の挿入・RLS・再送・0 行・明示トランザクション・ON CONFLICT）。
+- e2e: `tests/sql51_insert_select_exec.rs`（行の挿入・RLS・再送・0 行・明示トランザクション）。ON CONFLICT 併用は `tests/sql51_insert_select_on_conflict.rs`。
 
 ### 台帳（#1734 への引き継ぎ）
 
@@ -163,3 +163,22 @@ NULL 許容は NULL・DEFAULT の無い NOT NULL は `23502`）。`DEFAULT nextv
 ### 対象外（追跡候補）
 
 省略列の `DEFAULT nextval`／IDENTITY の採番（COPY と共通）・`INSERT INTO t (WITH ... SELECT ...)`・ビューへの挿入・`ON CONFLICT` との併用。
+
+## Issue #2614 追記 ON CONFLICT との併用（SQL-51・SQL-49 ポインタ。親: #1731）
+
+- parser: `parse_insert_select_tail` が VALUES 形と同じ句順（`ON CONFLICT` → `RETURNING` → `USING OPERATION_ID`）で
+  `OnConflictClause` を解析し、`ValidatedInsertSelect::on_conflict` に持つ。受理範囲は VALUES 形と同じ
+  （列リスト形・`ON CONSTRAINT`・対象省略の `DO NOTHING`、`DO NOTHING`／`DO UPDATE SET`〔`EXCLUDED.<列>`・リテラル・加算式〕）。
+  `DO UPDATE ... WHERE`・SET 右辺の一般式・式／部分索引の推論形は従来どおり `42601`。
+- 実行: 内側 SELECT の結果を `BoundInsert` 列へ変換した後、`sql::parser::build_upsert_from_select_rows` で
+  `BoundUpsert` を作り、VALUES 形と同じ `sql::exec::execute_upsert_in`／`execute_upsert_returning_in` へ渡す（第 2 の書き込み経路は作らない）。
+  対象の解決・SET 右辺の束縛は台帳照合・内側 SELECT の評価より前に行い（`bind_conflict_clause`）、
+  Describe 段（`bind_insert_select`）でも同じ静的検査を通す。
+- 台帳: 照合ハッシュは送られた文（ON CONFLICT 句を含む）のトークン列から導く既存の `statement_hash` をそのまま使う。
+  句が違えば同じ `operation_id` でも `22023`、同一文の再送は `23505`。
+- 文内の衝突キー重複（PostgreSQL 17 と同じ）: `DO UPDATE` は固定文言の `21000`
+  （`SqlSurfaceError::UpsertCardinalityViolation`）で文全体を拒否、`DO NOTHING` は先の行を挿入して後の重複を飛ばす。
+  NULL を含むキーは重複とみなさない。衝突対象以外の一意性違反は `23505`（書き込み段の既存検査）。
+  VALUES 形の文内重複（`22000`）はここでは変えない（別 Issue #1738 の担当）。
+- fail-closed のまま: 移行済み表で `id` を省略した UPSERT（Issue #1699。Describe 段 `bind_insert_select` も実行本体と同じ共有判定 `reject_omitted_id_upsert` で bind 時に `0A000`）・SEQUENCE の DEFAULT・ビュー／一時表・拡張クエリの `$n`。
+- BREAKING: `SqlSurfaceError` への variant 追加、および `INSERT ... SELECT ... ON CONFLICT` が `0A000` から受理へ変わる。

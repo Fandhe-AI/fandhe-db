@@ -1,8 +1,9 @@
 //! `INSERT ... SELECT` の SQL 経路 e2e（SQL-51・Issue #1732 の parser・束縛と #1733 の実行本体の結線）。
 //!
 //! SQL 文から autocommit・明示トランザクションで実行し、行の挿入・RETURNING・RLS（他テナント行が内側
-//! SELECT に入らない）・`USING OPERATION_ID` の再送（`23505`／内容不一致 `22023`）・ON CONFLICT 併用の
-//! fail-closed を固定する。`sql51_insert_select_bind.rs` と同じ流儀（`unique_db_path`／`CleanupGuard`）。
+//! SELECT に入らない）・`USING OPERATION_ID` の再送（`23505`／内容不一致 `22023`）を固定する。
+//! ON CONFLICT 併用は `sql51_insert_select_on_conflict.rs` が担う（Issue #2614）。
+//! `sql51_insert_select_bind.rs` と同じ流儀（`unique_db_path`／`CleanupGuard`）。
 //! ポインタ: `docs/design/insert-select.md`。
 
 use engine::core::EngineCore;
@@ -208,20 +209,6 @@ fn explicit_transaction_commit_and_rollback() {
     assert_eq!(ids(&core, "alice", "dst").len(), 2);
     // bob には見えない
     assert!(ids(&core, "bob", "dst").is_empty());
-}
-
-#[test]
-fn on_conflict_with_insert_select_stays_fail_closed() {
-    let (core, path) = setup("sql51-e2e-conflict");
-    let _g = CleanupGuard(path);
-    let r = run(
-        &core,
-        "alice",
-        "INSERT INTO dst (id, a, t) SELECT id, a, t FROM src LIMIT 100 \
-         ON CONFLICT (id) DO NOTHING USING OPERATION_ID 'oc-1'",
-    );
-    assert_eq!(code(r), "0A000");
-    assert!(ids(&core, "alice", "dst").is_empty());
 }
 
 /// `ORDER BY` の方向指定の後の `RETURNING` も句境界として認識され、挿入・返却される。
