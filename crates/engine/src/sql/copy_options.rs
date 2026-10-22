@@ -176,7 +176,21 @@ const KNOWN_OPTIONS: &[&str] = &[
 ];
 
 /// 値が必須のオプション（値なしは PostgreSQL の "requires a parameter" 相当）。
-const VALUE_REQUIRED: &[&str] = &["format", "delimiter", "null", "quote", "escape", "encoding"];
+const VALUE_REQUIRED: &[&str] = &[
+    "format",
+    "delimiter",
+    "null",
+    "quote",
+    "escape",
+    "encoding",
+    // 対象外（0A000）のオプションも、値なしは先に 42601 とする（値欠落が最優先の契約）。
+    "force_quote",
+    "force_not_null",
+    "force_null",
+    "default",
+    "on_error",
+    "log_verbosity",
+];
 
 /// 本 Issue では解決せず、認識したうえで `0A000` にするオプション。
 const UNSUPPORTED_OPTIONS: &[&str] = &[
