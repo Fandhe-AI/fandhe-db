@@ -196,6 +196,13 @@ fn is_where_clause_boundary(tokens: &[Token], idx: usize) -> bool {
 /// の双方がこの 1 箇所を参照することで、境界判定がずれる余地をなくす
 /// （PR #1012 レビュー指摘の再発防止）。
 fn where_region(tokens: &[Token]) -> Option<(usize, usize)> {
+    // `INSERT ... ON CONFLICT ... DO UPDATE SET ... WHERE <条件>`（SQL-49 (3)、Issue #1740）の
+    // `WHERE` は、条件が `EXCLUDED.<列>`・修飾列を取り得て、束縛側（`sql::upsert_where`）が
+    // 等値リテラルの通し番号を持たないため、パターン 4 の対象にしない（序数のずれによる
+    // 黙った誤解釈を作らず、`$n` は `42601` で fail-closed に拒否される）。
+    if upsert_set_region(tokens).is_some() {
+        return None;
+    }
     let start = tokens
         .iter()
         .position(|t| matches!(t, Token::Keyword(crate::sql::lexer::Keyword::Where)))?;
@@ -2163,6 +2170,24 @@ mod tests {
         ] {
             assert!(positions(sql).is_err(), "{sql}");
         }
+    }
+
+    /// `DO UPDATE SET ... WHERE <条件>` 内の `$n`（SQL-49 (3)、Issue #1740）は、等値でも
+    /// 式の内側でも受理しない（束縛側が序数を持たず、黙った誤解釈になるため）。
+    /// SET 側の加算 `$n`（パターン 8）は WHERE が続いても受理を保つ。
+    #[test]
+    fn rejects_param_inside_do_update_where_region() {
+        for sql in [
+            "INSERT INTO t (id, n) VALUES (1, 1) ON CONFLICT (id) DO UPDATE SET n = EXCLUDED.n WHERE n = $1",
+            "INSERT INTO t (id, n) VALUES (1, 1) ON CONFLICT (id) DO UPDATE SET n = EXCLUDED.n WHERE n < $1",
+            "INSERT INTO t (id, n) VALUES (1, 1) ON CONFLICT (id) DO UPDATE SET n = EXCLUDED.n WHERE n + $1 > 2",
+            "INSERT INTO t (id, n) VALUES (1, 1) ON CONFLICT (id) DO UPDATE SET n = EXCLUDED.n WHERE t.n = $1",
+            "INSERT INTO t (id, n) VALUES (1, 1) ON CONFLICT (id) DO UPDATE SET n = n + $1 WHERE n = $2 USING OPERATION_ID 'a'",
+        ] {
+            assert!(positions(sql).is_err(), "{sql}");
+        }
+        let ok = "INSERT INTO t (id, n) VALUES (1, 1) ON CONFLICT (id) DO UPDATE SET n = n + $1 WHERE n = 1";
+        assert!(positions(ok).is_ok(), "{ok}");
     }
 
     #[test]

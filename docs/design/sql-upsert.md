@@ -37,8 +37,9 @@ USING OPERATION_ID '<id>'
   スキーマ列名で参照する）またはリテラル（`UPDATE ... SET` と同じ表現）のみを受理する。
   式・関数呼び出し・他列参照は許可リスト外（`42601`）。
 - `USING OPERATION_ID '<id>'` は `ON CONFLICT ...` の**後**に置く（前に置いた形は
-  `42601`）。句の重複・`DO UPDATE SET` の後ろへの `WHERE` の付加もいずれも `42601`
+  `42601`）。句の重複・`DO NOTHING` の後ろへの `WHERE` の付加はいずれも `42601`
   （`Parser::expect_end_of_statement` の余剰トークン判定に自然に落ちる）。
+  `DO UPDATE SET` の後ろの `WHERE` は Issue #1740 で受理する（末尾「Issue #1740 追記」）。
 - `EXPLAIN INSERT ... ON CONFLICT ...` は既存の `EXPLAIN`（次トークンが `SELECT` で
   あることを要求する分岐）へ流れて `42601` になる（`INSERT`・`TRUNCATE`・`DELETE` と
   同じ経路。専用の判定は持たない）。
@@ -312,7 +313,7 @@ spec 側「別途」の扱いのまま（コードでの固定テストも追加
   PK 値を入れ替える文は本実装では成功する（PostgreSQL は行ごとに検査し `23505`）。
   いずれも PostgreSQL と異なる挙動を固めないため回帰テストでは固定しない。
 - **対象外**: バッチ内の対象キー重複の `21000` 化、`ON CONFLICT ON CONSTRAINT`（Issue #1737 で対応済み。下記追記）、
-  `DO UPDATE ... WHERE`、SET 右辺の式、NoSQL 表層の `upsert`（対象省略の `DO NOTHING` は
+  `DO UPDATE ... WHERE`（Issue #1740 で対応済み。末尾の追記）、SET 右辺の式、NoSQL 表層の `upsert`（対象省略の `DO NOTHING` は
   Issue #1736 で対応。次節）。
 
 ## Issue #1736 追記: 対象省略の ON CONFLICT DO NOTHING（SQL-49 ポインタ）
@@ -418,3 +419,36 @@ Issue #1736 の対象省略形）。
 - Bind 後の文はリテラル SQL と同一のため、parser・束縛・評価・台帳ハッシュは変更しない。
 - 対象外: `SET a = $n`（`$n` 単独）と一般式中の `$n`（#1738）、並行加算・不可視衝突先 `42501`（#2428）。
   NULL の Bind はリテラル `NULL` と同じ `42601`。
+
+## Issue #1740 追記: `DO UPDATE SET ... WHERE <条件>`（SQL-49 (3)(5) ポインタ。関連: RECOVER-11・RLS-9）
+
+- 構文: `INSERT ... ON CONFLICT <対象> DO UPDATE SET ... WHERE <条件> [RETURNING ...] [USING OPERATION_ID ...]`。
+  条件の文法は通常の `WHERE`（`OR`・括弧・`NOT`・`IS [NOT] NULL`・`IN`・`BETWEEN`・`LIKE`・BOOLEAN 列・
+  式比較）と同一で、第 2 の述語パーサーは作らない（`Parser::parse_upsert_where_condition`）。
+- 列参照: 修飾なしの列と `<INSERT 対象表名>.<列>` は衝突した既存行（更新前）、`EXCLUDED.<列>` は挿入しようと
+  した行。構文段が条件区間のトークンを 1 対 1 で書き換え（`EXCLUDED.<col>` →
+  `sql::upsert_where::EXCLUDED_PREFIX` 付きの列名、`<表名>.<col>` → 素の列名）、束縛は既存行の列
+  `0..n` と `EXCLUDED` の列 `n..2n` を持つ合成スキーマに対して既存の `bind_where_predicates` で行う。それ以外の
+  修飾子は `42P01`（カタログを照会しない）、`t.*` と予約接頭辞を装う引用識別子は `42601`。
+- 評価位置と順序: 所有かつ可視と確定した衝突行を読んだ直後、書き換え・`pre_images` 記録・`RETURNING` 投影・
+  件数加算より前（`tenant::upsert_typed_rows_impl` の `DoUpdate` 腕）。条件が偽または NULL の行は何も残さず、
+  `SET` の右辺も評価しない（偽の行で加算の `22003` 等が出ない）。評価エラーは文全体を abort し、行・台帳とも
+  痕跡を残さない。評価は `sql::view_buffered::where_matches_for_row`（外側 `WHERE` と同じ規則）に共有する。
+  `sql` へ依存しない `tenant` には評価クロージャ（`UpsertWhereFn`）を渡す。
+- 不可視の自テナント衝突行は条件の真偽にかかわらず従来どおり `42501`（条件は評価しないので存在オラクルに
+  ならない）。他テナントの同じキーは非衝突として新規挿入する（評価しない）。全行が偽で挿入も無い文は
+  `INSERT 0 0` で、テーブル世代を進めず、台帳だけ commit する。
+- 拒否（いずれも固定文言で、値を含めない）: `visible()`・サブクエリ・組み込み以外の関数（`42601`）、
+  `tenant_id`／`visibility`・`EXCLUDED.id`（`42601`）、VECTOR 列と `embedding`（`0A000`）、未知の列（`42703`）、
+  ビュー経由の INSERT（`0A000`）、条件内の `$n`（`42601`。`sql::params::where_region` が `DO UPDATE SET` を持つ
+  文では `WHERE` をパターン 4 の対象にしない）。`DO NOTHING WHERE` と推論句の `WHERE`（`ON CONFLICT (...) WHERE ...`）は
+  従来どおり `42601`。
+- PostgreSQL との差異（記録のみ）: (a) 修飾なしの同名列を PostgreSQL は `42702`（あいまい）にするが、本実装は
+  既存行の列として受理する（PostgreSQL で正しく動く文の結果は変わらない）。(b) 束縛段の `EXCLUDED.<src>` が
+  NULL かつ代入先が NOT NULL の事前検査（`23502`）は、条件が偽で更新しない行でも残る（PostgreSQL は更新しない
+  行の SET を評価しない。fail-closed 側の差異）。(c) `now()` 等の現在時刻関数は受理しない。
+- 内容照合ハッシュへの `WHERE` の反映は兄弟 Issue #1741 の担当。それまでは、同じ `operation_id` で `WHERE` だけ
+  異なる再送は内容不一致（`22023`）ではなく再送重複（`23505`）で拒否される（いずれも書き込みは起きない）。
+  `CompiledUpsertWhere` の元になる述語列は `BoundConflictAction::DoUpdate::condition` に残してあり、#1741 は
+  既存の `push_dml_where_predicates` へそのまま渡せる。
+- 対象外: ビュー経由・条件内 `$n`・サブクエリ・VECTOR/埋め込み参照・UDF・INSERT 対象表の別名・NoSQL 表層。

@@ -647,7 +647,28 @@ fn where_matches(
     scanned: &[Option<ScalarRef<'_>>],
     scratch: &mut Vec<StackValue>,
 ) -> Result<bool, SqlSurfaceError> {
-    let id = 0u64;
+    where_matches_for_row(
+        metadata_filters,
+        or_filters,
+        expr_programs,
+        scanned,
+        0,
+        scratch,
+    )
+}
+
+/// [`where_matches`] の行 `id` 指定版。`ON CONFLICT DO UPDATE ... WHERE`
+/// （`sql::upsert_where`、SQL-49 (3)、Issue #1740）が衝突した既存行の `id` を渡して、
+/// 外側 `WHERE` と同じ評価規則（NULL は非該当・非 Bool は内部エラー）を共有する
+/// （第 2 の評価器を作らない）。
+pub(crate) fn where_matches_for_row(
+    metadata_filters: &[crate::declarative_filter::MetadataFilter],
+    or_filters: &[super::where_tree::BoundOrGroup],
+    expr_programs: &[super::expr_program::ExprProgram],
+    scanned: &[Option<ScalarRef<'_>>],
+    id: u64,
+    scratch: &mut Vec<StackValue>,
+) -> Result<bool, SqlSurfaceError> {
     if !crate::declarative_filter::matches_all(metadata_filters, scanned) {
         return Ok(false);
     }

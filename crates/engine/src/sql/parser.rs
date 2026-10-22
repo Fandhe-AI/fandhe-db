@@ -4895,7 +4895,14 @@ pub enum BoundConflictAction {
     DoNothing,
     /// (`schema.columns` の対象列インデックス, 右辺) 対応。宣言順を保持する
     /// （[`BoundUpdate::assignments`] と同じ契約）。
-    DoUpdate(Vec<(usize, BoundUpsertValue)>),
+    ///
+    /// `condition` は `DO UPDATE SET ... WHERE <条件>` の述語列（SQL-49 (3)、Issue #1740。
+    /// 空なら `WHERE` なし）。束縛段で `sql::upsert_where` が検証済みで、実行段が文ごとに
+    /// コンパイルし直して評価する。
+    DoUpdate {
+        assignments: Vec<(usize, BoundUpsertValue)>,
+        condition: Vec<WherePredicate>,
+    },
 }
 
 /// 束縛済みの `ON CONFLICT` 対象（TABLE-16、Issue #1074。`sql::allowlist::
@@ -5330,8 +5337,17 @@ fn bind_upsert_form(
 
     let bound_action = match action {
         OnConflictAction::DoNothing => BoundConflictAction::DoNothing,
-        OnConflictAction::DoUpdate(assignments) => {
+        OnConflictAction::DoUpdate {
+            assignments,
+            condition,
+        } => {
             let bound_assignments = bind_upsert_assignments(assignments, schema)?;
+            // `WHERE` 条件の検証（禁止要素・禁止列・型・列の存在）。束縛結果は捨て、
+            // 実行段が同じスキーマで文ごとに再コンパイルする（束縛済みの式プログラムを
+            // `BoundStatement` に持たせず、`Clone`／`PartialEq` を保つ）。
+            if !condition.is_empty() {
+                crate::sql::upsert_where::CompiledUpsertWhere::compile(condition, schema)?;
+            }
             for row in &rows {
                 for (col_idx, value) in &bound_assignments {
                     let BoundUpsertValue::Excluded(src_idx) = value else {
@@ -5375,7 +5391,10 @@ fn bind_upsert_form(
                     }
                 }
             }
-            BoundConflictAction::DoUpdate(bound_assignments)
+            BoundConflictAction::DoUpdate {
+                assignments: bound_assignments,
+                condition: condition.clone(),
+            }
         }
     };
 
@@ -11396,7 +11415,10 @@ mod tests {
             BoundInsertForm::Upsert(upsert) => {
                 assert_eq!(
                     upsert.action,
-                    BoundConflictAction::DoUpdate(vec![(0, BoundUpsertValue::Excluded(0))])
+                    BoundConflictAction::DoUpdate {
+                        assignments: vec![(0, BoundUpsertValue::Excluded(0))],
+                        condition: Vec::new(),
+                    }
                 );
             }
             other => panic!("expected BoundInsertForm::Upsert, got {other:?}"),
