@@ -443,7 +443,7 @@ NoSQL `update`／`delete` op の `filter`（述語形。TASK-186・NOSQL-12）�
 述語形 `UPDATE`／`DELETE` の `WHERE` にあるサブクエリ（`IN`／`NOT IN`／`EXISTS`／`NOT EXISTS`／
 スカラー比較）を、束縛の**前**に書き込みトランザクションのスナップショットで評価し、具体的な述語へ
 書き換えてから既存の束縛・実行経路（§3・§4）へ渡す。構文段の受理は #1750、台帳ハッシュの正規化は
-#1752 の担当で、本節は実行だけを扱う。
+Issue #1752 の担当で、本節は実行だけを扱う。
 
 - **解決の位置**: `core/dml_subquery_exec.rs`。述語形 4 form（`execute_predicate_delete_form`・
   `execute_predicate_delete_returning_form`・`execute_predicate_update_form`・
