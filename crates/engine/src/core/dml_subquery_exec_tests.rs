@@ -6,7 +6,7 @@
 //! fail-closed の境界（autocommit の `WriteTarget`・`PARTITIONED`・非セッション入口・台帳）を固定する。
 
 use super::dml_subquery_exec::where_has_subquery;
-use super::{EngineCore, ParsedSql};
+use super::{EngineCore, ParsedSql, SessionRoutedSql};
 use crate::catalog::{ColumnDef, ColumnType, TableSchema};
 use crate::kernel::CpuScalarProvider;
 use crate::policy::PolicyContext;
@@ -335,4 +335,49 @@ fn detects_subquery_leaves_recursively() {
         vec![plain.clone()],
         vec![plain],
     ])]));
+}
+
+/// 振り分け済み（永続側）のサブクエリつき DML を、session の現在の一時カタログ・path 世代つきで包む。
+fn routed_persistent(session: &SessionState, parsed: ParsedSql) -> ParsedSql {
+    ParsedSql::SessionRouted(Box::new(
+        SessionRoutedSql::persistent_guarded(parsed, session.temp_tables())
+            .stamped_with_path(session),
+    ))
+}
+
+/// 一時表を持つセッションでも、永続表へ振り分け済みのサブクエリつき DML が受理される
+/// （粗い一時表ゲートを再適用して `0A000` にしない。Issue #1751 の review 指摘）。
+#[test]
+fn persistent_subquery_dml_is_accepted_in_session_with_temp_table() {
+    let (core, _g) = new_core();
+    let (alice, bob) = setup_two_tenants(&core);
+    let mut session = SessionState::default();
+    session.allow_ddl();
+    core.execute_sql_in_session(&alice, &mut session, "CREATE TEMP TABLE scratch (n INT)")
+        .expect("create temp table");
+    let routed = routed_persistent(&session, with_where(&core, DEL, in_sub(INNER)));
+    let out = core
+        .execute_parsed_in_session(&alice, &mut session, &routed)
+        .expect("routed persistent DML with subquery");
+    assert_eq!(affected(out), 1);
+    assert_eq!(langs(&core, &alice, "docs"), s(&["en"]));
+    assert_eq!(langs(&core, &bob, "docs"), s(&["en", "ja"]));
+}
+
+/// `public` が見えない `search_path` で、解決済みの永続表のサブクエリつき DML が受理される
+/// （粗いゲートの `search_path` 検査を再適用しない）。
+#[test]
+fn routed_subquery_dml_is_accepted_when_search_path_hides_public() {
+    let (core, _g) = new_core();
+    let (alice, bob) = setup_two_tenants(&core);
+    let mut session = SessionState::default();
+    core.execute_sql_in_session(&alice, &mut session, "SET search_path = tenant_b")
+        .expect("set search_path");
+    let routed = routed_persistent(&session, with_where(&core, DEL, in_sub(INNER)));
+    let out = core
+        .execute_parsed_in_session(&alice, &mut session, &routed)
+        .expect("resolved DML with subquery");
+    assert_eq!(affected(out), 1);
+    assert_eq!(langs(&core, &alice, "docs"), s(&["en"]));
+    assert_eq!(langs(&core, &bob, "docs"), s(&["en", "ja"]));
 }

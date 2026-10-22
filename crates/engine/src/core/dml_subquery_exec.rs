@@ -200,7 +200,9 @@ impl EngineCore {
     ) -> Result<crate::sql::SqlOutcome, SqlSurfaceError> {
         let mut txn = self.new_session_transaction();
         txn.begin_implicit(&self.storage, session)?;
-        let outcome = self.execute_parsed_in_txn_unscrubbed(ctx, session, &mut txn, parsed)?;
+        // 粗い一時表ゲートは呼び出し元（`execute_parsed_in_session_inner` の振り分け展開後）で通過済み。
+        // 振り分け済みの永続側の文へ再適用すると一時表を持つセッションで `0A000` になるため inner へ委譲する。
+        let outcome = self.execute_parsed_in_txn_inner(ctx, session, &mut txn, parsed)?;
         txn.commit_implicit(session)?;
         Ok(outcome)
     }
