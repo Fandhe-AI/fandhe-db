@@ -117,6 +117,27 @@ fn row_limit_is_exact_and_overflow_is_54000() {
     assert!(!err.contains("acme"), "{err}");
 }
 
+/// 設定値がハード上限（100_000）のときも COPY は設定値そのものを上限にする
+/// （INSERT ... SELECT 用の「ハード上限 - 1」丸めを使わない。束縛が超過検出用の +1 行を
+/// 拒否せず、通常の少量行が成功することを固定する）。
+#[test]
+fn hard_cap_setting_is_not_rounded_down() {
+    let (core, _g) = open_engine(
+        "copy-to-table-hardcap",
+        Some(engine::result_limits::MAX_RESULT_ROWS_HARD_CAP),
+    );
+    for id in 1..=3 {
+        insert(&core, "acme", id);
+    }
+    assert_eq!(
+        copy_to(&core, "acme", "COPY docs TO STDOUT")
+            .expect("under hard cap")
+            .rows
+            .len(),
+        3
+    );
+}
+
 /// RLS: 他テナントの行は出力されない。
 #[test]
 fn other_tenant_rows_are_not_exported() {

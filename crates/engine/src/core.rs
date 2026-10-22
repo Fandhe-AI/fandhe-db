@@ -9284,17 +9284,22 @@ impl EngineCore {
         let internal = || SqlSurfaceError::Internal {
             detail: "internal error".to_string(),
         };
-        let cap = self.insert_select_row_cap();
+        // 上限は設定値そのもの（`--max-result-rows`）。INSERT ... SELECT 用の丸め
+        // （ハード上限 - 1）は使わない（設定値ちょうどの行数を許容するため）。
+        let cap = self.result_limits.max_result_rows();
         let fetch = cap.checked_add(1).ok_or_else(internal)?;
         let mut scan = (*v.inner).clone();
-        scan.limit = u32::try_from(fetch).map_err(|_| internal())?;
-        let bound = crate::sql::parser::bind_scan_with_dummy_flags(
+        scan.limit = u32::try_from(cap).map_err(|_| internal())?;
+        let mut bound = crate::sql::parser::bind_scan_with_dummy_flags(
             &scan,
             schema,
             session.udfs(),
             &[],
-            &crate::result_limits::ResultLimits::new(fetch),
+            &self.result_limits,
         )?;
+        // 束縛は上限 `cap` までしか LIMIT を受理しない（ハード上限での飽和）ため、超過検出用の
+        // `+1` 行は束縛後に差し替える（束縛済み値の差し替えなので検証は迂回しない）。
+        bound.limit = fetch;
         let result = self.run_scan_plan(source, ctx, schema, &bound)?;
         if result.rows.len() > cap {
             return Err(SqlSurfaceError::payload_too_large(
