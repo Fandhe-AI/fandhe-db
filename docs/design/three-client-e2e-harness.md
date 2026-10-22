@@ -1047,6 +1047,49 @@ NOT NULL への NULL（`23502`）、リテラル NULL との SQLSTATE 一致、�
 `three_client_extended_e2e` の `--ignored` 14 件 green（#2440 の新規 6 件を含む）、層 A
 `wire24_declared_param_oids` 24 件 green。
 
+## 非等価・BETWEEN の `$n` のリテラル形一致と RLS の 3 クライアント検証（Issue #2433・SQL-78）
+
+親 #2429（TASK-336）の最終検証。ポインタ: SQL-78（主）・SQL-24・SQL-19・WIRE-12。プロダクション
+コードの変更・依存の追加は無い（テストと文書のみ）。#2432 は NULL と型公告を固定したので、本節は
+**NULL 以外の値**の Bind が同じ値をリテラルで書いた簡易クエリ（'Q'）と一致すること、および RLS 3
+テナント（tenant-a・tenant-b・行なしの tenant-c）で他テナントの行・存在情報が現れないことを固定する。
+
+### 層 A（`wire_sql78_noneq_between_rls.rs`、常時 `make ci`）
+
+- 表は SQL の `CREATE TABLE`（暗黙の `id` なし）で作る。`TableSchema::new` の表では BOOLEAN の比較と
+  TEXT の BETWEEN がリテラル形でも `22000` になるため、SQL の表のほうが「受理された結果どうし」で
+  照合できる範囲が広い。行は各テナントが SQL `INSERT` し、値域は両テナントで交互に重ねる（`n > 0` が
+  漏れれば他テナントの行が見える非 vacuous な形）。
+- 4 件: 全列 × 演算子・`[NOT] BETWEEN`・複合・不正値・インジェクション風の値の行・タグ・SQLSTATE が
+  リテラル形と一致（3 テナント分。binary int4 の Bind も一致）／結果が自テナントの行だけ（carol は空）／
+  拒否応答の本文が 3 テナントでバイト一致しテナント id・他テナントの値を含まない／述語形
+  UPDATE・DELETE の影響件数・結果状態が拡張形とリテラル形（別 DB）で一致し他テナントの行が変わらない。
+
+### 層 B（`three_client_extended_e2e.rs` の `#2433` 節、`#[ignore]`）
+
+- 簡易クエリのオラクルは既存ハーネスと同じ駆動方法（psql `-c`／`psycopg_client.py`（`ClientCursor`）／
+  `pg_client.js`（values なし））。スクリプトは変更していない。
+- 比較は同一クライアント内で行う。結果は TEXT 列 `label` だけを読み（ドライバごとの値の表記差を持ち
+  込まない）、行集合はソートして比べる。拒否は SQLSTATE（psql は verbose の `ERROR:  XXXXX:`、
+  psycopg／pg は `[SQLSTATE=XXXXX]`）を取り、取れなければ panic する。値は直書きしない。
+- 状態を変える DML は、クライアント・形ごとに新しい環境（DB・サーバー）を起動して分離する。
+- 5 件（`--ignored` 4 件＋非 ignore のガード 1 件）: リテラル形一致／RLS（結果・拒否応答の同一性）／
+  述語形 DML の読み戻し一致／psycopg・node の NULL パラメータ（psql は NULL を送れない）／seed の
+  値域の重なりのガード。
+- コマンドタグの比較は層 A が担い、層 B は読み戻しの一致で代える（クライアントスクリプトを増やさない）。
+
+### 既知の差分（据え置き）
+
+- BOOLEAN 列の `BETWEEN` 境界は、リテラル形では文字列リテラル（`'true'`）だけが受理形で、素の
+  `true`／`false` は `42601`。`$n` は文字列リテラルへ置換されるため、リテラル側は引用した形と照合する。
+- 範囲外の形（逆向き `$1 < n`・片側だけ `$n` の BETWEEN・式の一部）は `42601` のまま（#2430・#2431 の
+  継続課題）。拒否の 3 テナント一致にだけ使う。
+- NULL パラメータが比較位置で `42703` になる点・binary 互換表の外は前節のとおり据え置き。
+- HTTP（NoSQL）表層には Parse／`$n` が無いため対象外。分割実行 DML の `$n` は別課題。
+
+実行記録: 実行日 2026-10-22（UTC）・psql 18.6・psycopg 3.3.6・node v24.13.0 + pg で
+`three_client_extended_e2e` の追加 4 件（`--ignored`）green、層 A `wire_sql78_noneq_between_rls` 4 件 green。
+
 ## 分割実行 DML の 3 クライアント検証（Issue #1339・SQL-32）
 
 分割実行 DML（`UPDATE`／`DELETE ... PARTITIONED`・`SHOW`／`CANCEL PARTITIONED DML`）が
