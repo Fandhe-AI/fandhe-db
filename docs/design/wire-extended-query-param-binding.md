@@ -159,9 +159,15 @@ node pg（`values` 付き `query`）・psql `\bind`・JDBC 等、パラメータ
    `(SET|,) <列> =` の境界から次の深さ 0 の `,` または節末（深さ 0 の `WHERE`／
    `RETURNING`／`USING OPERATION_ID|PLAN`）まで、VALUES 要素は深さ 1 の `,`／行の閉じ括弧
    までを 1 セグメントとし、セグメントごとに型を推論する（下記「式内 `$n` の型推論」）
+8. `INSERT ... ON CONFLICT ... DO UPDATE SET <列> = <同じ列> + $n`（Issue #2427・SQL-49・
+   WIRE-12 のポインタ）。括弧深さ 0 の `ON CONFLICT` 以降の `DO UPDATE SET` 節で、
+   `(SET|,) <列> = <同じ列> + $n (,|節末)` の形だけを受理する（衝突対象は列リスト・
+   `ON CONSTRAINT`・省略のいずれでも可。節末は深さ 0 の `WHERE`／`RETURNING`／
+   `USING OPERATION_ID|PLAN`）。`$n` の型は INSERT 対象表の代入先列の型（列リスト省略形は
+   表の宣言順の列）。詳細は下記「ON CONFLICT 加算式の `$n`（パターン 8）」
 
 `LIMIT $n`・`USING MODE $n`・`HINT ORDER($n, ...)`・`SET search_mode = $n`・
-`ON CONFLICT ... DO UPDATE SET a = $n`・hybrid 関数
+`ON CONFLICT ... DO UPDATE SET a = $n`（`$n` 単独の右辺。加算形はパターン 8）・hybrid 関数
 引数（`HYBRID_RRF(col, $n, ...)`）・非等価比較（`id > $n` 等）はいずれも
 `sql::params::validate_param_positions` の位置判定に含めておらず、構造的に
 `42601` へ落ちる（`sql::params` の単体テスト・`crates/engine/tests/
@@ -173,7 +179,7 @@ prepared_params.rs` で固定）。
 パターン 6 の表で判定する。`UPDATE ... SET a = 'x' WHERE b = $n` の `WHERE` 節内の
 等価条件はパターン 4 で受理——後者は述語形 UPDATE／DELETE の `WHERE` にも同じ判定が
 そのまま適用される）。`ON CONFLICT ... DO UPDATE SET` は先頭語が `INSERT` のため
-パターン 6 の対象外（拒否のまま）。
+パターン 6 の対象外（加算形だけがパターン 8 で受理され、それ以外は拒否のまま）。
 
 ## 式内 `$n` の型推論（パターン 7。Issue #1546）
 
@@ -212,7 +218,26 @@ prepared_params.rs` で固定）。
 - 既知の PG 差分: Parse の宣言 OID（0・705 以外で本 DB が持つ型）は #2436 で engine に渡り、推論不能な位置は宣言型で解決する（`42P18` は宣言が無い番号だけ）。宣言済みの `$k` を式内の別の `$m` の推論の相手として伝播させること（`$1::int4 + $2` で `$2` を int4 にする等）はしない（OID 0 の推論は不変）。
   小数リテラルとの演算は `DOUBLE`（PG は numeric）。`-$1` は `0 - $1` に脱糖されるため
   `INTEGER`（PG では曖昧）。`INSERT ... VALUES` の `-$1` に負の実値を Bind すると `- -n` となり
-  `42601` で fail-closed（既存の二重マイナス拒否と同じ契約）。`ON CONFLICT ... DO UPDATE SET` の式と `$n` は別担当（`42601` のまま）
+  `42601` で fail-closed（既存の二重マイナス拒否と同じ契約）。`ON CONFLICT ... DO UPDATE SET` の加算式は Issue #2427 で受理（下記パターン 8 の節）、それ以外の式と `$n` は `42601` のまま
+
+## ON CONFLICT 加算式の `$n`（パターン 8。Issue #2427）
+
+SQL-49・WIRE-12 のポインタ。#2425 の加算式 `<列> = <同じ列> + <数値リテラル>` の数値リテラル位置を
+`$n` にできる。Bind 後の文は同じ値をリテラルで書いた SQL と同一になるため、加算・範囲検査・
+台帳（`operation_id` の内容照合は置換後の文）は #2425 の経路がそのまま担う。
+
+- **型推論**: `$n` の型は INSERT 対象表の代入先列（SMALLINT／INTEGER／BIGINT／REAL／DOUBLE は
+  OID 21／23／20／700／701 を ParameterDescription で公告）。表・列が引けない場合は `Text` へ倒す
+  （Parse で存在を観測させない）。
+- **Parse の宣言型**: Operator 規則（text／bool 等は `42883`）に加え、整数の代入先へ
+  float4／float8／numeric を宣言した場合は `0A000`（整数列への非整数リテラルの加算と同じ）。
+- **数値でない代入先列**: 列が引けた場合に限り、リテラル経路が束縛段で返す `42883`（NUMERIC は
+  `0A000`）を Parse で返す。
+- **Bind**: 整数スロットへ `-?[0-9]+` 以外は `22P02`、和が範囲外は Execute で `22003`（副作用なし）。
+- **拒否（`42601`）**: `SET a = $n`（`$n` 単独の右辺）・`n = m + $1`・`$1 + n`・`n = n + $1 + 1`・
+  `-$1`・`$1::int`・`EXCLUDED.n + $1`。
+- **既知の PG 差分**: NULL の Bind はリテラル `n + NULL` と同じ `42601`（PG は NULL を受理）。
+  `$n` 単独の右辺と一般式中の `$n` は未対応（#1738）。
 
 ## Parse の型 OID 指定時の判定規則（Issue #2434・#2435。TASK-337・WIRE-24 ポインタ）
 
@@ -412,7 +437,7 @@ Bind 値 `None`（SQL NULL）は、`sql::params` が裸の `Token::Ident("NULL")
   推論になることを確認した。
 - NULL パラメータ値は #2439 で解消済み（上記節）。リテラル `<列> = NULL` 自体が未対応の
   位置（`42703`）は SQL-41 系の別課題。
-- 追加のプレースホルダ位置（`LIMIT $n`・非等価 WHERE 比較・`ON CONFLICT ... SET`・
+- 追加のプレースホルダ位置（`LIMIT $n`・非等価 WHERE 比較・`ON CONFLICT ... SET`（加算形 `n = n + $1` は Issue #2427 で受理済み）・
   hybrid 関数引数・`LIKE $n`。`UPDATE ... SET col = $n` は Issue #1544 で受理済み）。
 - 層 B（psycopg 3／node pg／psql 実クライアントでの `make e2e-three-client`
   相当）→ **Issue #1176 で実施済み**（`crates/wire-server/tests/

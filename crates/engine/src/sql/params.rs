@@ -42,9 +42,14 @@
 //!    `$n` の型は `sql::param_infer` が演算の相手・関数引数・兄弟枝から推論する
 //!    （推論できない `$n` は Parse で `42P18`）。SET 右辺の節末は深さ 0 の `WHERE`／
 //!    `RETURNING`／`USING OPERATION_ID|PLAN`。
+//! 8. `INSERT ... ON CONFLICT ... DO UPDATE SET <列> = <同じ列> + $n`（Issue #2427・SQL-49・
+//!    WIRE-12 のポインタ）。括弧深さ 0 の `(SET|,) <列> = <同じ列> + $n (,|節末)` の形のみ
+//!    （衝突対象は列リスト・`ON CONSTRAINT`・省略のいずれでも可）。`$n` の型は INSERT 対象表の
+//!    代入先列から推論する。左右の列が異なる形・`$n + <列>`・`+ $n + 1`・`EXCLUDED.<列> + $n` は
+//!    `42601`。
 //!
 //! `LIMIT $n`・`USING MODE $n`・`HINT ORDER($n, ...)`・`SET search_mode = $n`・
-//! `ON CONFLICT ... DO UPDATE SET a = $n`・hybrid 関数
+//! `ON CONFLICT ... DO UPDATE SET a = $n`（`$n` 単独の右辺。加算形はパターン 8）・hybrid 関数
 //! 引数（`HYBRID_RRF(col, $n, ...)`）・非等価比較（`id > $n` 等）はいずれも
 //! スコープ外として `42601` で拒否する（後続 Issue へ申し送り。詳細は
 //! `docs/design/wire-extended-query-param-binding.md` 参照）。
@@ -616,7 +621,104 @@ fn close_set_assignment(
     }
 }
 
-/// `$n` の位置判定表（パターン 5〜7）。[`validate_param_positions`] と
+/// パターン 8（`INSERT ... ON CONFLICT ... DO UPDATE SET` の加算式）の受理範囲
+/// `(SET の次の位置, 節末の位置)` を返す（Issue #2427・SQL-49・WIRE-12 のポインタ）。
+/// 先頭語が `INSERT` の文に限り、括弧深さ 0 の `ON CONFLICT` より後で最初に現れる
+/// `DO UPDATE SET` の `SET` の次を開始とする（衝突対象が列リスト・`ON CONSTRAINT <名>`・
+/// 省略のいずれでも通す。`ON CONSTRAINT` の `ON` は `CONFLICT` が続かないため取り違えない）。
+/// 節末は、括弧深さ 0 の `WHERE`、または実句境界（`RETURNING`／`USING OPERATION_ID|PLAN`。
+/// [`is_where_clause_boundary`] が判定し、列名・関数名としての出現は境界にしない）。無ければ文末。
+fn upsert_set_region(tokens: &[Token]) -> Option<(usize, usize)> {
+    if !ident_eq_ignore_case(tokens.first(), "INSERT") {
+        return None;
+    }
+    let mut depth: usize = 0;
+    let mut seen_conflict = false;
+    let mut start: Option<usize> = None;
+    for (idx, t) in tokens.iter().enumerate() {
+        match t {
+            Token::Punct('(') | Token::Punct('[') => depth = depth.saturating_add(1),
+            Token::Punct(')') | Token::Punct(']') => depth = depth.saturating_sub(1),
+            _ if depth != 0 => {}
+            Token::Keyword(crate::sql::lexer::Keyword::Where) if start.is_some() => {
+                return start.map(|s| (s, idx));
+            }
+            Token::Ident(name)
+                if start.is_some()
+                    && (name.eq_ignore_ascii_case("RETURNING")
+                        || name.eq_ignore_ascii_case("USING"))
+                    && is_where_clause_boundary(tokens, idx) =>
+            {
+                return start.map(|s| (s, idx));
+            }
+            Token::Ident(name) if start.is_none() => {
+                if !seen_conflict {
+                    if name.eq_ignore_ascii_case("ON")
+                        && ident_eq_ignore_case(tokens.get(idx.saturating_add(1)), "CONFLICT")
+                    {
+                        seen_conflict = true;
+                    }
+                } else if name.eq_ignore_ascii_case("DO")
+                    && ident_eq_ignore_case(tokens.get(idx.saturating_add(1)), "UPDATE")
+                    && ident_eq_ignore_case(tokens.get(idx.saturating_add(2)), "SET")
+                {
+                    start = Some(idx.saturating_add(3));
+                }
+            }
+            _ => {}
+        }
+    }
+    start.map(|s| (s, tokens.len()))
+}
+
+/// パターン 8 の走査。[`upsert_set_region`] の領域を前向きに 1 パスで走り、括弧深さ 0 の
+/// `(SET|,) <列> = <同じ列> + $n (,|節末)` の `$n` のトークン添字から代入先列名への表を返す。
+/// 左右の列が異なる形・`$n + <列>`・`+` の後ろに続きがある形・`-$n`・`::` 付きは登録しない
+/// （位置検査で `42601`）。`$n` 単独の右辺（`SET a = $n`）も登録しない（スコープ外）。
+/// 左右の列名は後段の許可リストパーサーと同じく文字列の完全一致で比べる。
+fn upsert_add_param_slots(tokens: &[Token], start: usize, end: usize) -> HashMap<usize, String> {
+    let mut table: HashMap<usize, String> = HashMap::new();
+    let end = end.min(tokens.len());
+    let mut depth: usize = 0;
+    let mut k = start;
+    while k < end {
+        match tokens.get(k) {
+            Some(Token::Punct('(') | Token::Punct('[')) => depth = depth.saturating_add(1),
+            Some(Token::Punct(')') | Token::Punct(']')) => depth = depth.saturating_sub(1),
+            _ => {}
+        }
+        let is_separator =
+            depth == 0 && (k == start || matches!(tokens.get(k), Some(Token::Punct(','))));
+        if is_separator {
+            // 代入の先頭位置（`SET` 直後はその位置自体、2 件目以降は `,` の次）。
+            let head = if k == start { k } else { k.saturating_add(1) };
+            if let (
+                Some(Token::Ident(col) | Token::QuotedNull(col)),
+                Some(Token::Punct('=')),
+                Some(Token::Ident(lhs) | Token::QuotedNull(lhs)),
+                Some(Token::Punct('+')),
+                Some(Token::Param(_)),
+            ) = (
+                tokens.get(head),
+                tokens.get(head.saturating_add(1)),
+                tokens.get(head.saturating_add(2)),
+                tokens.get(head.saturating_add(3)),
+                tokens.get(head.saturating_add(4)),
+            ) {
+                let param_idx = head.saturating_add(4);
+                let after = param_idx.saturating_add(1);
+                let closes = after >= end || matches!(tokens.get(after), Some(Token::Punct(',')));
+                if col == lhs && closes {
+                    table.insert(param_idx, col.clone());
+                }
+            }
+        }
+        k = k.saturating_add(1);
+    }
+    table
+}
+
+/// `$n` の位置判定表（パターン 5〜8）。[`validate_param_positions`] と
 /// [`infer_param_positions`] が共有する（境界判定がずれる余地をなくす）。
 struct ParamLayout {
     /// パターン 5: `$n` のトークン添字 → VALUES 行内の列序数。
@@ -625,6 +727,9 @@ struct ParamLayout {
     set_slots: HashMap<usize, String>,
     /// パターン 7: `$n` を含む式セグメント（トークン添字の昇順・互いに重ならない）。
     segments: Vec<ExprSegment>,
+    /// パターン 8: `$n` のトークン添字 → `ON CONFLICT DO UPDATE SET` 加算式の代入先列名
+    /// （Issue #2427）。
+    upsert_add_slots: HashMap<usize, String>,
 }
 
 impl ParamLayout {
@@ -639,10 +744,16 @@ impl ParamLayout {
         };
         // INSERT と UPDATE の領域は排他（先頭語が異なる）。
         segments.extend(set_segments);
+        // パターン 8 は INSERT の ON CONFLICT 側。VALUES 領域は `ON` で終わるため重ならない。
+        let upsert_add_slots = match upsert_set_region(tokens) {
+            Some((start, end)) => upsert_add_param_slots(tokens, start, end),
+            None => HashMap::new(),
+        };
         Self {
             values_slots,
             set_slots,
             segments,
+            upsert_add_slots,
         }
     }
 
@@ -777,6 +888,9 @@ pub fn validate_param_positions(tokens: &[Token]) -> Result<u16, SqlSurfaceError
         // 場合の `42P18` は Parse の型推論段が返す（ここは構造上の受理だけを判定する）。
         let is_in_expr = layout.segment_index_at(i).is_some();
 
+        // パターン 8: `ON CONFLICT ... DO UPDATE SET <col> = <col> + $n`（Issue #2427）。
+        let is_upsert_add = layout.upsert_add_slots.contains_key(&i);
+
         // Issue #1593: パターン 1〜4 の `$n` に `::` が続く形（`WHERE id = $1::int`・
         // `<=> $1::vector` 等）は許可しない。構文段で構造葉でなくなる述語と序数カウンタを
         // ずらさないための fail-closed（型推論は式の内側のパターン 7 だけが担う）。
@@ -794,7 +908,8 @@ pub fn validate_param_positions(tokens: &[Token]) -> Result<u16, SqlSurfaceError
             || is_where_equality
             || is_insert_value
             || is_update_set_value
-            || is_in_expr)
+            || is_in_expr
+            || is_upsert_add)
         {
             return Err(SqlSurfaceError::unsupported(format!(
                 "parameter placeholder ${n} is not supported at this position"
@@ -827,6 +942,9 @@ pub(crate) enum ParamPosition {
     /// `UPDATE ... SET` 右辺／`INSERT ... VALUES` 要素の式の内側（Issue #1546）。
     /// 値は [`expr_param_segments`] が返すセグメントの添字。
     InExpr(usize),
+    /// `INSERT ... ON CONFLICT ... DO UPDATE SET <列> = <列> + $n` の代入先列名
+    /// （Issue #2427・SQL-49）。型は INSERT 対象表の当該列から決める。
+    UpsertAddColumn(String),
 }
 
 /// `$n` の型公告（`ParameterDescription` の OID 決定と、バイナリ受理可否の
@@ -1202,6 +1320,10 @@ pub(crate) fn infer_param_positions(tokens: &[Token], param_count: u16) -> Vec<V
         }
         if let Some(seg) = layout.segment_index_at(i) {
             slot.push(ParamPosition::InExpr(seg));
+            continue;
+        }
+        if let Some(col) = layout.upsert_add_slots.get(&i) {
+            slot.push(ParamPosition::UpsertAddColumn(col.clone()));
             continue;
         }
         if let Some((start, end)) = where_bounds {
@@ -1942,9 +2064,9 @@ mod tests {
 
     #[test]
     fn still_rejects_expression_params_outside_set_and_values_regions() {
-        // ON CONFLICT ... DO UPDATE SET は別担当（`42601` のまま）。
+        // ON CONFLICT ... DO UPDATE SET の加算式はパターン 8（受理）。それ以外の式は `42601`。
         assert!(positions(
-            "INSERT INTO t (id, n) VALUES (1, 1) ON CONFLICT (id) DO UPDATE SET n = n + $1 USING OPERATION_ID 'a'"
+            "INSERT INTO t (id, n) VALUES (1, 1) ON CONFLICT (id) DO UPDATE SET n = upper($1) USING OPERATION_ID 'a'"
         )
         .is_err());
         // RETURNING 以降の `$n` は SET 節の範囲外。
@@ -1968,6 +2090,54 @@ mod tests {
             positions("UPDATE documents SET lang = 'ja' WHERE id_tag = $1").unwrap(),
             1
         );
+    }
+
+    #[test]
+    fn accepts_upsert_add_param_for_each_conflict_target_form() {
+        for sql in [
+            "INSERT INTO t (id, n) VALUES (1, 1) ON CONFLICT (id) DO UPDATE SET n = n + $1 USING OPERATION_ID 'a'",
+            "INSERT INTO t (id, n) VALUES (1, 1) ON CONFLICT ON CONSTRAINT t_pkey DO UPDATE SET n = n + $1",
+            "INSERT INTO t VALUES (1, 1) ON CONFLICT (id) DO UPDATE SET n = n + $1 RETURNING n",
+        ] {
+            assert_eq!(positions(sql).unwrap(), 1, "{sql}");
+            assert_eq!(
+                positions_of(sql),
+                vec![vec![ParamPosition::UpsertAddColumn("n".to_string())]],
+                "{sql}"
+            );
+        }
+    }
+
+    #[test]
+    fn upsert_add_param_handles_multiple_assignments_and_values_params() {
+        let pos = positions_of(
+            "INSERT INTO t (id, a, b) VALUES ($1, $2, 3) ON CONFLICT (id) DO UPDATE SET a = a + $3, b = EXCLUDED.b, c = c + $4",
+        );
+        assert_eq!(pos[0], vec![ParamPosition::InsertValue(0)]);
+        assert_eq!(pos[1], vec![ParamPosition::InsertValue(1)]);
+        assert_eq!(
+            pos[2],
+            vec![ParamPosition::UpsertAddColumn("a".to_string())]
+        );
+        assert_eq!(
+            pos[3],
+            vec![ParamPosition::UpsertAddColumn("c".to_string())]
+        );
+    }
+
+    #[test]
+    fn rejects_unsupported_upsert_add_param_shapes() {
+        for sql in [
+            "INSERT INTO t (id, n, m) VALUES (1, 1, 1) ON CONFLICT (id) DO UPDATE SET n = m + $1",
+            "INSERT INTO t (id, n) VALUES (1, 1) ON CONFLICT (id) DO UPDATE SET n = $1 + n",
+            "INSERT INTO t (id, n) VALUES (1, 1) ON CONFLICT (id) DO UPDATE SET n = n + $1 + 1",
+            "INSERT INTO t (id, n) VALUES (1, 1) ON CONFLICT (id) DO UPDATE SET n = n + -$1",
+            "INSERT INTO t (id, n) VALUES (1, 1) ON CONFLICT (id) DO UPDATE SET n = n + $1::int",
+            "INSERT INTO t (id, n) VALUES (1, 1) ON CONFLICT (id) DO UPDATE SET n = EXCLUDED.n + $1",
+            "INSERT INTO t (id, n) VALUES (1, 1) ON CONFLICT (id) DO UPDATE SET n = n + 1 RETURNING n + $1",
+        ] {
+            assert!(positions(sql).is_err(), "{sql}");
+        }
     }
 
     #[test]

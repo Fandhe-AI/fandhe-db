@@ -616,11 +616,12 @@ fn extended_query_rejects_indeterminate_set_params_with_42p18() {
         ),
         "0A000"
     );
-    // ON CONFLICT ... DO UPDATE SET の式内 `$n` は別担当（`42601` のまま）。
+    // ON CONFLICT ... DO UPDATE SET の加算式 `n = n + $1` は Issue #2427 で受理に変わった
+    // （`sql49_upsert_add_param.rs` が固定する）。それ以外の式内 `$n` は引き続き `42601`。
     assert_eq!(
         parse_code(
             &core,
-            "INSERT INTO docs (id, n) VALUES (9, 1) ON CONFLICT (id) DO UPDATE SET n = n + $1 \
+            "INSERT INTO docs (id, n) VALUES (9, 1) ON CONFLICT (id) DO UPDATE SET n = $1 + n \
              USING OPERATION_ID 'x'"
         ),
         "42601"

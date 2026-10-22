@@ -5518,6 +5518,9 @@ impl EngineCore {
     /// 1 つでもベクトル位置があれば `VectorText`（バイナリ不可側へ倒す）、
     /// それ以外は `Text`。
     ///
+    /// Issue #2427: `INSERT ... ON CONFLICT ... DO UPDATE SET <列> = <列> + $n` の `$n` は
+    /// INSERT 対象表の代入先列の型（整数・浮動小数）をスロット型にする（パターン 8）。
+    ///
     /// Issue #1546: `UPDATE ... SET` 右辺・`INSERT ... VALUES` 要素の式内 `$n` は
     /// `sql::param_infer` が演算の相手・関数引数・兄弟枝から推論する。`INSERT` の
     /// 表名・列リストは検証済み構文木ではなくトークン列から読む（推論を構造検証 parse の
@@ -5668,6 +5671,23 @@ impl EngineCore {
                             }),
                             Some(ParamContextKind::Assignment),
                         ),
+                        // `ON CONFLICT DO UPDATE SET <列> = <列> + $n`（Issue #2427・SQL-49）。
+                        // 型は INSERT 対象表の代入先列。数値列以外は、列が引けた場合に限り
+                        // リテラル経路が束縛段で返すのと同じ `42883`／`0A000` を Parse で返す
+                        // （静的文言のみ・値を含めない）。引けない場合は `Text`（存在を観測させない）。
+                        ParamPosition::UpsertAddColumn(col) => {
+                            let ty = insert_target
+                                .as_ref()
+                                .and_then(|(t, _)| column_type(t, col));
+                            if let Some(PreparedParamType::Column(ColumnMeta::Scalar {
+                                ty: col_ty,
+                                ..
+                            })) = &ty
+                            {
+                                crate::sql::upsert_add::check_target_type(col_ty)?;
+                            }
+                            (ty, Some(ParamContextKind::AddOperand))
+                        }
                         // 式内の出現は下で `expr_results` から合流させる。
                         ParamPosition::InExpr(_) => continue,
                     };

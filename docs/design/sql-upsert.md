@@ -377,7 +377,7 @@ Issue #1736 の対象省略形）。
 - 上記以外は従来どおり拒否する（一般の式・別列参照・`WHERE`・衝突対象の一般化は #1738）。
   `n = m + 1`・`n = 1 + n`・`n = n - 1`・`n = n + 1 + 2`・`n = (n + 1)`・`n = n + NULL`・
   `n = n + 'x'`・`n = EXCLUDED.n + 1` は `42601`。
-- `$n` の受理と ParameterDescription は #2427、並行加算・不可視衝突先 `42501` の検証は #2428。
+- `$n` の受理と ParameterDescription は #2427（下記追記）、並行加算・不可視衝突先 `42501` の検証は #2428。
 
 ### 型と分類
 
@@ -406,3 +406,15 @@ Issue #1736 の対象省略形）。
 - 代入の value kind `2`（加算）を追加した。演算子タグ `+`、オペランド種別（`0` = EXCLUDED 列名、`1` = リテラル値）を
   含める。kind `0`／`1` のバイト列は不変。評価結果の値は含めない（RECOVER-11）。
 - 同一 `operation_id`・同一文の再送は二重加算されず、リテラルや形が違えば内容不一致（`22023`）になる。
+
+## Issue #2427 追記: 加算式の `$n` の型を代入先の列から推論する（SQL-49・WIRE-12 ポインタ）
+
+- 拡張クエリ（Parse／Bind）で `DO UPDATE SET <列> = <同じ列> + $n` の `$n` を受理する。
+  位置判定は `sql::params` のパターン 8、型推論は `core.rs` の `infer_param_types`。
+- `$n` の型は INSERT 対象表の代入先列の型。ParameterDescription は整数列で int2／int4／int8、
+  REAL／DOUBLE 列で float4／float8。数値でない列は Parse で `42883`（NUMERIC は `0A000`）。
+- Parse の宣言型が合わない場合は fail-closed（text／bool は `42883`、整数列への
+  float4／float8／numeric は `0A000`）。Bind 値の不正は `22P02`、範囲外は Execute で `22003`。
+- Bind 後の文はリテラル SQL と同一のため、parser・束縛・評価・台帳ハッシュは変更しない。
+- 対象外: `SET a = $n`（`$n` 単独）と一般式中の `$n`（#1738）、並行加算・不可視衝突先 `42501`（#2428）。
+  NULL の Bind はリテラル `NULL` と同じ `42601`。
