@@ -1140,6 +1140,7 @@ Date: <IMF-fixdate>
 | `2203F` | `SQL_JSON_SCALAR_REQUIRED` | 400 | Bad Request | `JSON_VALUE` の結果がスカラーでない（配列・オブジェクト）。SQL 表層専用で、NoSQL の `op` 語彙からは到達しない。Issue #2187 |
 | `22P02` | `INVALID_TEXT_REPRESENTATION` | 400 | Bad Request | 値の形式不正: ENUM 列の語彙外ラベル・INTEGER／BIGINT 列への小数／指数表記・BYTEA の不正 base64・NUMERIC／配列／JSON 列の形式不正（`insert`／`update`／`filter`。Issue #1187） |
 | `22P03` | `INVALID_BINARY_REPRESENTATION` | 400 | Bad Request | numeric パラメータのバイナリ受信で外部表現（符号・`dscale`・桁群）が不正。SQL 表層（拡張クエリの Bind）専用で、NoSQL の `op` 語彙からは到達しない。Issue #2443 |
+| `22P04` | `BAD_COPY_FILE_FORMAT` | 400 | Bad Request | COPY binary 形式（`COPY ... FROM STDIN WITH (FORMAT binary)`）のフレーム不正（署名・フィールド数・フィールド長の不正、入力の途中終了）。SQL 表層（COPY）専用で、NoSQL の `op` 語彙からは到達しない。Issue #1769 |
 | `22P05` | `UNTRANSLATABLE_CHARACTER` | 400 | Bad Request | jsonpath リテラルに NUL 文字（`\u0000`・`\x00`）が含まれる。SQL 表層（`jsonb_path_*`）専用で、NoSQL の `op` 語彙からは到達しない。Issue #2185 |
 | `23502` | `MISSING_OPERATION_ID` | 400 | Bad Request | `--require-operation-id` の構成での書き込み op の `operation_id` 欠落、または分割実行・`show`／`cancel_partitioned_dml` の `operation_id` 欠落 |
 | `23502` | `NOT_NULL_VIOLATION` | 400 | Bad Request | `NOT NULL` 列（TABLE-16・TASK-204）への `insert`／`update` での省略・明示 `null` |

@@ -14,7 +14,7 @@
 //!
 //! 受信データ経路のため `unwrap`／`expect`／添字アクセスを使わない。エラー文言は固定文字列で、
 //! 受信値・他テナントの情報を含めない。
-#![cfg_attr(not(test), allow(dead_code))] // 本番の呼び出し元は #1769・#1770 が結線する。
+#![cfg_attr(not(test), allow(dead_code))] // COPY TO 側（`encode_row_fields`）の呼び出し元は #1770 が結線する。
 
 use engine::error_format::ErrorClass;
 use engine::sql::exec::{Cell, ColumnMeta, ResultRow};

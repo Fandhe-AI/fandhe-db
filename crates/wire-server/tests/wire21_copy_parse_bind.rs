@@ -257,8 +257,8 @@ fn invalid_copy_parse_matches_simple_query_sqlstate() {
     for (sql, state) in [
         ("COPY nosuch (id, embedding) FROM STDIN", "42P01"),
         (
-            "COPY documents (id, embedding, body) FROM STDIN WITH (FORMAT binary)",
-            "42601",
+            "COPY documents (id, embedding, body) FROM STDIN WITH (FORMAT binary, DELIMITER ',')",
+            "0A000",
         ),
     ] {
         send_simple_query(&mut stream, sql);

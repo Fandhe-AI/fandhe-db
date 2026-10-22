@@ -114,6 +114,8 @@ pub const fn http_status(class: ErrorClass) -> u16 {
         | ErrorClass::UntranslatableCharacter
         // Issue #2443: numeric バイナリ受信の外部表現不正（`22P03`）も入力起因で 400。
         | ErrorClass::InvalidBinaryRepresentation
+        // Issue #1769: COPY binary のフレーム不正（`22P04`）も入力起因で 400。
+        | ErrorClass::BadCopyFileFormat
         | ErrorClass::JsonSubscriptInvalid
         | ErrorClass::NonNumericJsonItem
         | ErrorClass::SingletonJsonItemRequired
@@ -207,7 +209,7 @@ mod tests {
 
     /// 期待表を明示的に列挙し、`ErrorClass::ALL` との突き合わせで非 vacuous に検証する。
     /// `match` にアームを足したが期待表の更新を忘れた、という乖離を (a)(b) が検出する。
-    const EXPECTED: [(ErrorClass, u16); 78] = [
+    const EXPECTED: [(ErrorClass, u16); 79] = [
         (ErrorClass::InvalidInput, 400),
         (ErrorClass::StringDataRightTruncation, 400),
         (ErrorClass::AuthInvalid, 401),
@@ -286,6 +288,7 @@ mod tests {
         (ErrorClass::SqlJsonScalarRequired, 400),
         (ErrorClass::UntranslatableCharacter, 400),
         (ErrorClass::InvalidBinaryRepresentation, 400),
+        (ErrorClass::BadCopyFileFormat, 400),
     ];
 
     #[test]

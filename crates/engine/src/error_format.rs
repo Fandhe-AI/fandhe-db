@@ -94,7 +94,7 @@ macro_rules! define_error_classes {
 pub(crate) const SHARED_WIRE_CODES: &[&str] = &["23502", "23505", "22023"];
 
 define_error_classes! {
-    count = 78;
+    count = 79;
 
     /// 構文上受理された SQL の値・引数が不正（`22000`）。
     /// [`crate::sql::allowlist::SqlSurfaceError::InvalidInput`] の写像。
@@ -215,6 +215,11 @@ define_error_classes! {
     /// パラメータのバイナリ復号（符号・`dscale`・桁群の不正。WIRE-26・TASK-339・Issue #2443）で
     /// 発生する。SQL 表層（拡張クエリ）専用で NoSQL の `op` 語彙からは到達しない。
     InvalidBinaryRepresentation => ("22P03", "INVALID_BINARY_REPRESENTATION"),
+    /// COPY binary 形式のフレーム不正（`22P04`）。署名・フィールド数・フィールド長の不正や
+    /// 入力の途中終了で、wire-server の `COPY FROM STDIN (FORMAT binary)` のフレーム層
+    /// （WIRE-23・Issue #1769）で発生する。SQL 表層（COPY binary）専用で NoSQL の `op` 語彙からは
+    /// 到達しない。
+    BadCopyFileFormat => ("22P04", "BAD_COPY_FILE_FORMAT"),
     /// 明示トランザクション（SQL-31・TASK-221）内で発生した一般的な状態不整合
     /// （`25000`）。同一トランザクション内での `operation_id` 再利用など、他の
     /// より具体的な分類に属さないトランザクション状態エラーに使う。

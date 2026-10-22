@@ -199,6 +199,120 @@ fn copy_from_stdin_text_format_inserts_all_rows_atomically() {
     assert_eq!(ids, vec![1, 2]);
 }
 
+// ---------------------------------------------------------------------
+// FROM STDIN: binary 形式の取り込み口（WIRE-23・Issue #1769）。フレーム解析と型変換は
+// wire-server の担当で、engine へは `feed_fields` が正規テキストのレコードを渡す。
+// ---------------------------------------------------------------------
+
+fn begin_binary(core: &EngineCore, op: &str) -> engine::sql::copy::CopyInSession {
+    let sql = format!(
+        "COPY {TABLE} (id, embedding, lang) FROM STDIN WITH (FORMAT binary) \
+         USING OPERATION_ID '{op}'"
+    );
+    match core
+        .begin_copy(&ctx("acme"), &SessionState::default(), &sql)
+        .expect("begin_copy")
+    {
+        CopyPlan::From(s) => s,
+        CopyPlan::To(..) => panic!("expected FROM plan"),
+    }
+}
+
+fn record(id: &str, vec: &str, lang: &str) -> Vec<Option<String>> {
+    vec![
+        Some(id.to_string()),
+        Some(vec.to_string()),
+        Some(lang.to_string()),
+    ]
+}
+
+#[test]
+fn copy_from_binary_feed_fields_shares_the_bound_insert_path() {
+    let (core, path) = open_engine("copy-from-binary-basic");
+    let _guard = CleanupGuard(path);
+    let mut s = begin_binary(&core, "copy-bin-1");
+    assert_eq!(s.format(), engine::sql::allowlist::CopyFormat::Binary);
+    assert_eq!(s.column_count(), 3);
+    let kinds = s.column_kinds().expect("kinds");
+    assert_eq!(kinds[0], engine::sql::copy::CopyColumnKind::PseudoId);
+    assert_eq!(
+        kinds[1],
+        engine::sql::copy::CopyColumnKind::Column(ColumnType::Vector(2))
+    );
+    s.account_raw_bytes(10).expect("raw bytes");
+    s.feed_fields(record("1", "[1.0,0.0]", "ja"))
+        .expect("row 1");
+    s.feed_fields(record("2", "[0.0,1.0]", "ja"))
+        .expect("row 2");
+    // 型の不正は text/csv と同じ束縛が拒否する。
+    let err = s
+        .feed_fields(record("3", "[1.0,0.0]", "ja")[..2].to_vec())
+        .expect_err("field count mismatch");
+    assert_eq!(err.wire_code(), "22000");
+    let outcome = core
+        .commit_copy_in(&ctx("acme"), s.finish().expect("finish"))
+        .expect("commit");
+    assert_eq!(outcome.rows_affected, 2);
+    let mut ids = read_back_ids(&core, "acme");
+    ids.sort_unstable();
+    assert_eq!(ids, vec![1, 2]);
+}
+
+#[test]
+fn copy_from_binary_without_rows_is_rejected_like_text() {
+    let (core, path) = open_engine("copy-from-binary-empty");
+    let _guard = CleanupGuard(path);
+    let s = begin_binary(&core, "copy-bin-2");
+    let err = s.finish().err().expect("empty batch");
+    assert_eq!(err.wire_code(), "22000");
+}
+
+#[test]
+fn copy_from_binary_enforces_row_and_raw_byte_limits() {
+    let limits = engine::batch_limits::BatchLimits {
+        max_files_per_batch: 1,
+        max_batch_total_bytes: 64,
+        ..engine::batch_limits::BatchLimits::default()
+    };
+    let path = unique_db_path("copy-from-binary-limits");
+    let _guard = CleanupGuard(path.clone());
+    let storage = Storage::open(&path).expect("open storage");
+    storage.create_table(&schema()).expect("create table");
+    let core = EngineCore::from_storage(storage, Box::new(CpuScalarProvider))
+        .with_ledger_mode(engine::recovery::required_op_id::LedgerMode::Ledgered)
+        .with_batch_limits(limits);
+
+    // ① 行数: 2 行目で 54000。
+    let mut s = begin_binary(&core, "copy-bin-3");
+    s.feed_fields(record("1", "[1.0,0.0]", "ja"))
+        .expect("row 1");
+    let err = s
+        .feed_fields(record("2", "[0.0,1.0]", "ja"))
+        .expect_err("row limit");
+    assert_eq!(err.wire_code(), "54000");
+
+    // ③ 生バイト累計: 64 バイト超で 54000。
+    let mut s = begin_binary(&core, "copy-bin-4");
+    s.account_raw_bytes(64).expect("at the limit");
+    let err = s.account_raw_bytes(1).expect_err("raw byte limit");
+    assert_eq!(err.wire_code(), "54000");
+    assert!(read_back_ids(&core, "acme").is_empty());
+}
+
+#[test]
+fn copy_from_binary_session_rejects_byte_feed() {
+    let (core, path) = open_engine("copy-from-binary-bytefeed");
+    let _guard = CleanupGuard(path);
+    let mut s = begin_binary(&core, "copy-bin-5");
+    // 内部不整合は fail-closed（成功を返さない）。
+    assert_eq!(
+        s.feed(b"1\t[1.0,0.0]\tja\n")
+            .expect_err("bytes")
+            .wire_code(),
+        "XX000"
+    );
+}
+
 #[test]
 fn copy_from_stdin_text_format_resolves_null_marker_and_escapes() {
     let (core, path) = open_engine("copy-from-text-null-escape");

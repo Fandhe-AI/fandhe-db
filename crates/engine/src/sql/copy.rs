@@ -387,6 +387,9 @@ enum RecordSplitter {
         null_string: Vec<u8>,
     },
     Csv(CsvRecordScanner),
+    /// binary 形式。フレーム解析と型変換は wire-server が担い、engine へはレコード単位で
+    /// [`CopyInSession::feed_fields`] が届くため、バイト列の分割は行わない。
+    Binary,
 }
 
 impl RecordSplitter {
@@ -402,15 +405,14 @@ impl RecordSplitter {
     /// `options`（区切り・NULL 文字列・引用・エスケープ）を適用する分割器。
     fn with_options(format: CopyFormat, options: &CopyOptions) -> Self {
         match format {
-            // Binary は CopyInSession::new が先に拒否するため到達しない（多層防御。
-            // 到達しても text として解釈する安全側の構成）。
-            CopyFormat::Text | CopyFormat::Binary => RecordSplitter::Text {
+            CopyFormat::Text => RecordSplitter::Text {
                 pending: Vec::new(),
                 pending_cr: false,
                 delimiter: options.delimiter(),
                 null_string: options.null_string().as_bytes().to_vec(),
             },
             CopyFormat::Csv => RecordSplitter::Csv(CsvRecordScanner::with_options(options)),
+            CopyFormat::Binary => RecordSplitter::Binary,
         }
     }
 
@@ -468,6 +470,11 @@ impl RecordSplitter {
                 }
                 Ok(())
             }
+            // binary セッションでは `feed` を呼ばない契約。呼ばれたら内部不整合として拒否する
+            // （fail-closed。バイト列を無視して成功を返さない）。
+            RecordSplitter::Binary => Err(SqlSurfaceError::Internal {
+                detail: "byte feed on a binary COPY session".to_string(),
+            }),
         }
     }
 
@@ -498,6 +505,7 @@ impl RecordSplitter {
                 }
             }
             RecordSplitter::Csv(scanner) => scanner.finish(),
+            RecordSplitter::Binary => Ok(None),
         }
     }
 }
@@ -852,41 +860,100 @@ fn check_header_record(
 /// [`CopyInBatch`] を返す。
 #[derive(Debug)]
 pub struct CopyInSession {
+    // `Box` で包む: オプション（区切り・NULL 文字列）を保持して大きくなった分で `CopyPlan::From` が
+    // `clippy::large_enum_variant` に抵触しないよう、公開 API の内包型を変えずにサイズを抑える。
+    splitter: Box<RecordSplitter>,
+    /// レコード 1 件分の束縛・上限判定・蓄積（text/csv の `feed`・`finish` と binary の
+    /// [`Self::feed_fields`] が同じ束縛経路を共有するための共通部分）。
+    sink: Box<RecordSink>,
+    format: CopyFormat,
+    running_bytes: usize,
+    /// 一時表（TABLE-44・Issue #1684）を対象にする COPY か。`Some` のとき commit は一時コアが
+    /// 一時 DB へ行う（`EngineCore::commit_copy_in_txn_in_session`）。永続の入口
+    /// （`commit_copy_in`／`commit_copy_in_txn`）は一時表向けのバッチを `0A000` で拒否する。
+    temp: Option<crate::sql::temp_rows::TempCopyTarget>,
+}
+
+/// COPY の 1 列分の種別（binary 形式の型変換を wire-server が選ぶための公開情報。
+/// WIRE-23・Issue #1769）。COPY 列リストの順に並ぶ。
+#[derive(Debug, Clone, PartialEq)]
+pub enum CopyColumnKind {
+    /// 疑似列 `id`（`bind_copy_record` が u64 の 10 進テキストとして解釈する。公告型は numeric）。
+    PseudoId,
+    /// 通常の列とその型。
+    Column(ColumnType),
+}
+
+/// COPY のレコード単位の束縛状態。`CopyInSession` が所有し、text/csv の分割器が確定した
+/// レコードと binary 形式で wire-server が変換済みのレコードを、同一の経路
+/// （フィールド数照合 → ① → ④ → [`bind_copy_record`] → ②）で取り込む。
+#[derive(Debug)]
+struct RecordSink {
     table: String,
     columns: Vec<String>,
     operation_id: Option<OperationId>,
-    // `Box` で包む: `TableSchema` へ墓標スロット（TABLE-19・TASK-203・Issue #901）
-    // が加わったことで `CopyInSession` 自体のサイズが増え、`CopyPlan::From` が
-    // 包む列挙子として `clippy::large_enum_variant` に抵触するようになった。
-    // ここで内側の非公開フィールドを Box 化してサイズを抑えることで、
-    // `CopyPlan::From` の内包型（公開 API）を変更せずに済ませる
-    // （`CopyPlan::From(CopyInSession)` のまま。外部クレートへの破壊的変更なし）。
+    // `Box`: `TableSchema` へ墓標スロット（TABLE-19・TASK-203・Issue #901）が加わりサイズが増えたため。
     schema: Box<TableSchema>,
     limits: BatchLimits,
-    // `Box`: オプション（区切り・NULL 文字列）を保持して大きくなった分で `CopyPlan::From` が
-    // `clippy::large_enum_variant` に抵触しないよう、schema と同じ理由で包む。
-    splitter: Box<RecordSplitter>,
     /// `HEADER` 指定（Issue #1764）。`False` 以外のとき最初の 1 レコードをヘッダ行として扱う。
     header: CopyHeader,
     /// 最初のレコード（ヘッダ行）をまだ処理していないか。
     header_pending: bool,
     bounds: Vec<BoundInsert>,
-    running_bytes: usize,
     /// 列 `DEFAULT now()` 系の評価時刻（SQL-37・Issue #1587）。COPY は行ごとの束縛が複数の
     /// wire メッセージにまたがり RAII のスレッドローカルスコープが届かないため、
     /// 開始時に `core.rs` が確定した値をここへ保持して全行で共有する（全行同じ時刻）。
     clock: crate::sql::time_fn::StatementClock,
     /// いずれかの行で時刻 DEFAULT が評価されたか（台帳 v3 の評価時刻を残す判定。Issue #2188）。
     clock_used: bool,
-    /// `COPY` 開始時点のセッション TimeZone（TABLE-33・Issue #1575）。行ごとの束縛が複数の wire
-    /// メッセージにまたがりスレッドローカルのスコープが届かないため、`clock` と同じく開始時に
-    /// 確定した値を保持し、[`Self::feed`]／[`Self::finish`] で TZ 無しの `TIMESTAMPTZ` 入力の解釈に使う。
-    // `Box`: `CopyPlan::From` の `clippy::large_enum_variant` を避けるため（schema と同じ理由）。
+    /// `COPY` 開始時点のセッション TimeZone（TABLE-33・Issue #1575）。スレッドローカルのスコープが
+    /// メッセージ間で届かないため開始時に確定した値を保持し、束縛のたびにスコープへ入れる。
     time_zone: Box<crate::datetime::SessionTimeZone>,
-    /// 一時表（TABLE-44・Issue #1684）を対象にする COPY か。`Some` のとき commit は一時コアが
-    /// 一時 DB へ行う（`EngineCore::commit_copy_in_txn_in_session`）。永続の入口
-    /// （`commit_copy_in`／`commit_copy_in_txn`）は一時表向けのバッチを `0A000` で拒否する。
-    temp: Option<crate::sql::temp_rows::TempCopyTarget>,
+}
+
+impl RecordSink {
+    /// 1 レコード分のフィールドを取り込む。判定順序は ヘッダ処理 → フィールド数照合 →
+    /// ①（行数）→ ④（チャンク数）→ 列型照合・束縛 → ②（行あたりのバイト量）。
+    fn push_record(&mut self, fields: Vec<Option<String>>) -> Result<(), SqlSurfaceError> {
+        // 最初に確定したレコードはヘッダ行。破棄（または照合）するだけで、
+        // 行数①・チャンク数④・束縛の対象に含めない。
+        if std::mem::take(&mut self.header_pending) {
+            return check_header_record(self.header, &self.columns, &fields);
+        }
+        if fields.len() != self.columns.len() {
+            return Err(SqlSurfaceError::invalid_input(format!(
+                "COPY record field count {} does not match column count {}",
+                fields.len(),
+                self.columns.len()
+            )));
+        }
+        let next_count = self.bounds.len().saturating_add(1);
+        batch_limits::check_row_count(next_count, &self.limits).map_err(map_batch_err)?;
+        batch_limits::validate_chunk_total(next_count, &self.limits).map_err(map_batch_err)?;
+        let bound = bind_copy_record(
+            &self.table,
+            &self.columns,
+            &fields,
+            &self.operation_id,
+            &self.schema,
+            self.clock,
+        )?;
+        let row_bytes = bound_insert_byte_len(&bound)?;
+        batch_limits::check_row_body_len(self.bounds.len(), row_bytes, &self.limits)
+            .map_err(map_batch_err)?;
+        self.bounds.push(bound);
+        Ok(())
+    }
+
+    /// セッション TimeZone と DEFAULT 時刻のスコープに入って `f` を実行し、時刻 DEFAULT が
+    /// 評価されたかを `clock_used` へ回収する（スコープ外のスレッド状態へ漏らさない。Issue #2188）。
+    fn with_scopes<T>(&mut self, f: impl FnOnce(&mut Self) -> T) -> T {
+        let _tz_scope = crate::datetime::SessionTimeZoneScope::enter((*self.time_zone).clone());
+        let scope = crate::sql::time_fn::DefaultClockScope::enter(self.clock);
+        let result = f(self);
+        self.clock_used |= scope.was_used();
+        result
+    }
 }
 
 impl CopyInSession {
@@ -951,12 +1018,6 @@ impl CopyInSession {
         clock: crate::sql::time_fn::StatementClock,
         time_zone: crate::datetime::SessionTimeZone,
     ) -> Result<Self, SqlSurfaceError> {
-        // FROM の binary は Issue #1769 まで未対応（resolve が先に 42601 で拒否済みの多層防御）。
-        if format == CopyFormat::Binary {
-            return Err(SqlSurfaceError::unsupported(
-                "COPY FORMAT binary is not supported",
-            ));
-        }
         // csv で QUOTE／ESCAPE が改行系だとレコード終端と曖昧になるため、未対応として
         // CopyInResponse 前に拒否する（PostgreSQL は検査しないが拒否側に倒す既知の相違）。
         if format == CopyFormat::Csv
@@ -970,19 +1031,22 @@ impl CopyInSession {
         }
         Self::validate_columns_against_schema(&columns, &schema)?;
         Ok(Self {
-            table,
-            columns,
             splitter: Box::new(RecordSplitter::with_options(format, &options)),
-            header: options.header(),
-            header_pending: options.header() != CopyHeader::False,
-            operation_id,
-            schema: Box::new(schema),
-            limits,
-            bounds: Vec::new(),
+            sink: Box::new(RecordSink {
+                table,
+                columns,
+                operation_id,
+                schema: Box::new(schema),
+                limits,
+                header: options.header(),
+                header_pending: options.header() != CopyHeader::False,
+                bounds: Vec::new(),
+                clock,
+                clock_used: false,
+                time_zone: Box::new(time_zone),
+            }),
+            format,
             running_bytes: 0,
-            clock,
-            clock_used: false,
-            time_zone: Box::new(time_zone),
             temp: None,
         })
     }
@@ -997,16 +1061,61 @@ impl CopyInSession {
     /// FROM 対象テーブル名（wire-server の CopyInResponse 送出前の分岐でも
     /// 使わないが、テスト・ログ文脈での確認用に公開する）。
     pub fn table(&self) -> &str {
-        &self.table
+        &self.sink.table
     }
 
     /// 列リストの列数（`id` 疑似列を含む）。`wire-server::copy` が
     /// `CopyInResponse` の列数フィールドを組み立てるために参照する。
     pub fn column_count(&self) -> usize {
-        self.columns.len()
+        self.sink.columns.len()
     }
 
-    /// 1 個の CopyData メッセージ本文を取り込む。判定順序:
+    /// 転送形式。`wire-server::copy::run_copy_from` が text/csv と binary の取り込み経路を
+    /// 選ぶために参照する（WIRE-23・Issue #1769）。
+    pub fn format(&self) -> CopyFormat {
+        self.format
+    }
+
+    /// セッションの INDEX-4 上限。`wire-server::copy` が binary フレーム層のメモリ上限を
+    /// 決めるために参照する（確保前の防御であり、実際の上限判定は engine が担う）。
+    pub fn batch_limits(&self) -> BatchLimits {
+        self.sink.limits
+    }
+
+    /// COPY 列リストの順に並べた各列の種別。`wire-server::copy` が binary フィールドの
+    /// 復号方式を列型から選ぶために参照する。疑似列 `id` の判定は `bind_copy_record` と同じ規則。
+    /// 列リストは `begin_copy` で検証済みのため未知の列名は到達しないが、到達した場合は
+    /// `undefined_column` で拒否する（fail-closed）。
+    pub fn column_kinds(&self) -> Result<Vec<CopyColumnKind>, SqlSurfaceError> {
+        let schema = &self.sink.schema;
+        self.sink
+            .columns
+            .iter()
+            .map(|name| {
+                if schema.has_pseudo_id() && name == "id" {
+                    return Ok(CopyColumnKind::PseudoId);
+                }
+                schema
+                    .columns
+                    .iter()
+                    .find(|c| &c.name == name)
+                    .map(|c| CopyColumnKind::Column(c.ty.clone()))
+                    .ok_or_else(|| SqlSurfaceError::undefined_column(name))
+            })
+            .collect()
+    }
+
+    /// ③（生 CopyData バイト量の累計）に `len` バイトを加算して判定する（`54000`）。
+    /// binary 形式で wire-server がフレーム解析へ渡す直前の CopyData payload 長ごとに呼ぶ
+    /// （text/csv は [`Self::feed`] が同じ判定を内部で行う）。
+    pub fn account_raw_bytes(&mut self, len: usize) -> Result<(), SqlSurfaceError> {
+        self.running_bytes =
+            batch_limits::check_running_total(self.running_bytes, len, &self.sink.limits)
+                .map_err(map_batch_err)?;
+        Ok(())
+    }
+
+    /// 1 個の CopyData メッセージ本文を取り込む（text/csv 形式）。判定順序:
     /// 1. ③（生 CopyData バイト量の累計）を `pending` へ追加する前に判定
     ///    （`54000`。超過時点で拒否し、それ以降のバイトは一切保持しない）。
     /// 2. 完了したレコードごとに、①（行数）→④（生成チャンク数。1 行=1
@@ -1014,107 +1123,48 @@ impl CopyInSession {
     ///    フィールド分割・エスケープ解決・列型照合（`22000`）→②（当該行の
     ///    デコード後バイト量）の順に判定する。
     pub fn feed(&mut self, chunk: &[u8]) -> Result<(), SqlSurfaceError> {
-        self.running_bytes =
-            batch_limits::check_running_total(self.running_bytes, chunk.len(), &self.limits)
-                .map_err(map_batch_err)?;
-
-        let table = self.table.clone();
-        let columns = self.columns.clone();
-        let operation_id = self.operation_id.clone();
-        let limits = self.limits;
-        let schema = &self.schema;
-        let bounds = &mut self.bounds;
+        self.account_raw_bytes(chunk.len())?;
         let splitter = &mut self.splitter;
-        let clock = self.clock;
-        let header = self.header;
-        let header_pending = &mut self.header_pending;
+        self.sink
+            .with_scopes(|sink| splitter.feed(chunk, |fields| sink.push_record(fields)))
+    }
 
-        // 行ごとの束縛が評価した時刻 DEFAULT の印をスコープ外のスレッド状態へ漏らさず、
-        // 自セッションの `clock_used` へ回収する（Issue #2188）。
-        let _tz_scope = crate::datetime::SessionTimeZoneScope::enter((*self.time_zone).clone());
-        let scope = crate::sql::time_fn::DefaultClockScope::enter(clock);
-        let result = splitter.feed(chunk, |fields| {
-            // 最初に確定したレコードはヘッダ行。破棄（または照合）するだけで、
-            // 行数①・チャンク数④・束縛の対象に含めない。
-            if std::mem::take(header_pending) {
-                return check_header_record(header, &columns, &fields);
-            }
-            if fields.len() != columns.len() {
-                return Err(SqlSurfaceError::invalid_input(format!(
-                    "COPY record field count {} does not match column count {}",
-                    fields.len(),
-                    columns.len()
-                )));
-            }
-            let next_count = bounds.len().saturating_add(1);
-            batch_limits::check_row_count(next_count, &limits).map_err(map_batch_err)?;
-            batch_limits::validate_chunk_total(next_count, &limits).map_err(map_batch_err)?;
-            let bound = bind_copy_record(&table, &columns, &fields, &operation_id, schema, clock)?;
-            let row_bytes = bound_insert_byte_len(&bound)?;
-            batch_limits::check_row_body_len(bounds.len(), row_bytes, &limits)
-                .map_err(map_batch_err)?;
-            bounds.push(bound);
-            Ok(())
-        });
-        self.clock_used |= scope.was_used();
-        result
+    /// binary 形式で型変換済みの 1 レコード分のフィールド（正規テキスト。`None` = NULL）を取り込む。
+    /// text/csv の [`Self::feed`] と同じ束縛経路（①→④→束縛→②）を共有する（第 2 の書き込み経路を
+    /// 作らない。WIRE-23・Issue #1769）。呼び出しは `wire-server::copy::run_copy_from` から。
+    pub fn feed_fields(&mut self, fields: Vec<Option<String>>) -> Result<(), SqlSurfaceError> {
+        self.sink.with_scopes(|sink| sink.push_record(fields))
     }
 
     /// CopyDone 到達時に呼ぶ。改行なしで終わった末尾レコード（存在する場合）を
     /// 確定させたうえで、0 行のままなら拒否する（既存の複数行 `INSERT` バッチと
     /// 同じ「空バッチ拒否」契約）。
-    pub fn finish(mut self) -> Result<CopyInBatch, SqlSurfaceError> {
-        let tail = self.splitter.finish()?;
-        if let Some(fields) = tail {
-            if std::mem::take(&mut self.header_pending) {
-                check_header_record(self.header, &self.columns, &fields)?;
-            } else {
-                if fields.len() != self.columns.len() {
-                    return Err(SqlSurfaceError::invalid_input(format!(
-                        "COPY record field count {} does not match column count {}",
-                        fields.len(),
-                        self.columns.len()
-                    )));
-                }
-                let next_count = self.bounds.len().saturating_add(1);
-                batch_limits::check_row_count(next_count, &self.limits).map_err(map_batch_err)?;
-                batch_limits::validate_chunk_total(next_count, &self.limits)
-                    .map_err(map_batch_err)?;
-                let _tz_scope =
-                    crate::datetime::SessionTimeZoneScope::enter((*self.time_zone).clone());
-                let scope = crate::sql::time_fn::DefaultClockScope::enter(self.clock);
-                let bound = bind_copy_record(
-                    &self.table,
-                    &self.columns,
-                    &fields,
-                    &self.operation_id,
-                    &self.schema,
-                    self.clock,
-                );
-                self.clock_used |= scope.was_used();
-                drop(scope);
-                let bound = bound?;
-                let row_bytes = bound_insert_byte_len(&bound)?;
-                batch_limits::check_row_body_len(self.bounds.len(), row_bytes, &self.limits)
-                    .map_err(map_batch_err)?;
-                self.bounds.push(bound);
-            }
+    pub fn finish(self) -> Result<CopyInBatch, SqlSurfaceError> {
+        let Self {
+            splitter,
+            mut sink,
+            temp,
+            ..
+        } = self;
+        if let Some(fields) = splitter.finish()? {
+            sink.with_scopes(|sink| sink.push_record(fields))?;
         }
 
-        if self.bounds.is_empty() {
+        if sink.bounds.is_empty() {
             return Err(SqlSurfaceError::invalid_input(
                 "COPY FROM STDIN received no data rows",
             ));
         }
 
+        let sink = *sink;
         Ok(CopyInBatch {
-            table: self.table,
-            row_count: self.bounds.len(),
-            operation_id: self.operation_id,
-            bounds: self.bounds,
-            schema: *self.schema,
-            evaluated_at: self.clock_used.then_some(self.clock.txn_start_micros),
-            temp: self.temp,
+            table: sink.table,
+            row_count: sink.bounds.len(),
+            operation_id: sink.operation_id,
+            bounds: sink.bounds,
+            schema: *sink.schema,
+            evaluated_at: sink.clock_used.then_some(sink.clock.txn_start_micros),
+            temp,
         })
     }
 }

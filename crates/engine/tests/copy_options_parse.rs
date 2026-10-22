@@ -207,11 +207,9 @@ fn classification_matches_between_simple_and_parse() {
         rejected_code(&core, &format!("{TO} WITH (HEADER MATCH)")),
         "0A000"
     );
-    // binary は TO のみ受理（WIRE-23・Issue #1770）。FROM は Issue #1769 まで 42601。
-    assert_eq!(
-        rejected_code(&core, &format!("{FROM} WITH (FORMAT binary)")),
-        "42601"
-    );
+    // binary は FROM／TO の双方で受理する（WIRE-23・Issue #1769／#1770）。
+    accepted_in_both(&core, &format!("{FROM} WITH (FORMAT binary)"));
+    accepted_in_both(&core, &format!("{TO} WITH (FORMAT binary)"));
     accepted_in_both(&core, &format!("{FROM} WITH (ENCODING UTF8)"));
     accepted_in_both(&core, &format!("{TO} WITH (ENCODING utf8)"));
     assert_eq!(
@@ -251,6 +249,28 @@ fn unknown_option_name_is_truncated_in_message() {
     assert!(e.to_string().len() < 120, "{e}");
 }
 
+/// `FORMAT binary` は FROM／TO の双方で受理し（WIRE-23・Issue #1769／#1770）、
+/// binary と行形式のオプションの併用は `0A000`。
+#[test]
+fn binary_is_accepted_for_from_and_rejects_row_format_options() {
+    let (core, _g) = open("copy-opt-binary");
+    assert!(begin(&core, &format!("{FROM} WITH (FORMAT binary)")).is_ok());
+    assert!(begin(&core, &format!("{TO} WITH (FORMAT binary)")).is_ok());
+    for opt in [
+        "DELIMITER ','",
+        "NULL 'x'",
+        "HEADER",
+        "QUOTE ''''",
+        "ESCAPE 'x'",
+    ] {
+        assert_eq!(
+            rejected_code(&core, &format!("{FROM} WITH (FORMAT binary, {opt})")),
+            "0A000",
+            "{opt}"
+        );
+    }
+}
+
 /// `COPY TO STDOUT` の binary 受理（WIRE-23・Issue #1770）。新構文・旧構文が同じ format へ解決され、
 /// 簡易クエリと Parse の分類が一致する。
 #[test]
@@ -272,9 +292,9 @@ fn binary_is_accepted_for_to_in_new_and_legacy_syntax() {
     }
 }
 
-/// binary と併用できないオプションは `0A000`、FROM の binary は従来どおり `42601`。
+/// binary と併用できないオプションは `0A000`（FROM は上のテストで検査済み）。
 #[test]
-fn binary_conflicting_options_and_from_are_rejected() {
+fn binary_conflicting_options_for_to_are_rejected() {
     let (core, _g) = open("copy-opt-binary-conflict");
     for opt in [
         " WITH (FORMAT binary, DELIMITER ',')",
@@ -287,13 +307,6 @@ fn binary_conflicting_options_and_from_are_rejected() {
         assert_eq!(
             rejected_code(&core, &format!("{TO}{opt}")),
             "0A000",
-            "{opt}"
-        );
-    }
-    for opt in [" WITH (FORMAT binary)", " BINARY", " WITH BINARY"] {
-        assert_eq!(
-            rejected_code(&core, &format!("{FROM}{opt}")),
-            "42601",
             "{opt}"
         );
     }
