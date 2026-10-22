@@ -19,8 +19,10 @@
 //! [`respond_error_and_await_sync`] が ErrorResponse を送出したうえで
 //! [`ExtendedQueryState::ignore_till_sync`] を立て、接続は維持したまま
 //! `handshake::post_auth_loop` が次に届く Sync（'S'）まで後続メッセージを
-//! 読み捨てる（'X' は通常どおり終了、COPY・FunctionCall・未知の型バイトは
-//! 破棄対象にせず fail-closed に切断する。詳細は `post_auth_loop` 参照）。
+//! 読み捨てる（'X' は通常どおり終了、FunctionCall・未知の型バイトは破棄対象に
+//! せず fail-closed に切断する。COPY 失敗後に届く CopyData／CopyDone／CopyFail は
+//! 有界予算つきで読み捨てて接続を継続する〔Issue #1761・WIRE-21 (3) ポインタ〕。
+//! 詳細は `post_auth_loop` 参照）。
 //! Sync 到達時にフラグを解除し、`ReadyForQuery` を返して同期を回復する。
 //! portal は、`Idle`／`Failed` ではすべて破棄し、明示トランザクション
 //! 〔`BEGIN`/`COMMIT`/`ROLLBACK`。SQL-31・TASK-221〕中（`InTransaction`）は
@@ -1067,6 +1069,10 @@ pub(crate) struct ExtendedQueryState {
     /// `handshake::post_auth_loop` は Sync（'S'）・Terminate（'X'）以外の
     /// メッセージを読み捨てる。
     pub(crate) ignore_till_sync: bool,
+    /// 同期回復中に読み捨てた COPY 系メッセージ（'d'/'c'/'f'）のバイト数・件数
+    /// （Issue #1761）。`handshake::post_auth_loop` が加算し、Sync で 0 へ戻す。
+    pub(crate) ignored_copy_bytes: usize,
+    pub(crate) ignored_copy_messages: usize,
 }
 
 impl ExtendedQueryState {
@@ -1083,6 +1089,8 @@ impl ExtendedQueryState {
             statements: PreparedStatementStore::with_max_named(limits.max_prepared_statements),
             portals: PortalStore::new(),
             ignore_till_sync: false,
+            ignored_copy_bytes: 0,
+            ignored_copy_messages: 0,
         }
     }
 
@@ -1384,11 +1392,12 @@ fn respond_error_and_close<S: WireStream>(stream: &mut S, err: &HandlerError) ->
 /// 立てる（モジュールドキュメント「エラー後の同期回復」節）。接続は維持する。
 ///
 /// 拡張クエリプロトコルのエラー応答（Parse・Bind・Describe・Execute・Close 等）は
-/// すべて本関数を通る。`handshake::post_auth_loop` は各メッセージの処理後（と次の
+/// 本関数を通る（COPY の失敗だけは `copy.rs` が ErrorResponse を書き済みのため
+/// `run_copy_portal` が旗だけを立てる。Issue #1761）。`handshake::post_auth_loop` は各メッセージの処理後（と次の
 /// メッセージの受信直後）に `ignore_till_sync` を見て、明示トランザクションが
 /// `Active` なら `Failed` へ遷移させる（SQL-31・TASK-221。PR #1041 レビュー指摘）。
 /// 各ハンドラは `SessionTransaction` を受け取らないため、この旗が唯一の受け渡し
-/// 経路になる。エラー応答を本関数以外の方法で返す経路を追加してはならない
+/// 経路になる。エラー応答を本関数・`run_copy_portal` 以外の方法で返す経路を追加してはならない
 /// （切断する経路は `respond_error_and_close`。切断で `SessionTransaction` が
 /// drop され、書き込みトランザクションは abort される）。
 fn respond_error_and_await_sync<S: WireStream>(
@@ -2148,12 +2157,17 @@ fn run_copy_portal<'e, S: WireStream>(
             if let Some(portal) = state.portals.get_mut(portal_name) {
                 portal.state = PortalState::Done { tag };
             }
+            // CommandComplete を Sync 待ちにせず届ける（バッファ付き・TLS の WireStream で、
+            // 完了応答を待ってから Sync を送るクライアントのハングを防ぐ）。
+            stream.flush()?;
             Ok(LoopSignal::Continue)
         }
         crate::copy::CopyStep::Failed => {
             // ErrorResponse は `copy.rs` が書き済み。`respond_error_and_await_sync` の
             // 例外経路として、旗だけを立てて Sync で回復する（二重送出しない）。
             engine::log_stderr!("wire-server: extended query COPY failed, awaiting Sync");
+            // Sync を待たずに ErrorResponse をクライアントへ届ける（Issue #1761）。
+            stream.flush()?;
             state.ignore_till_sync = true;
             Ok(LoopSignal::Continue)
         }
@@ -2756,6 +2770,8 @@ pub(crate) fn handle_sync<S: WireStream>(
     };
 
     state.ignore_till_sync = false;
+    state.ignored_copy_bytes = 0;
+    state.ignored_copy_messages = 0;
     // WIRE-11・SQL-31・TASK-221・Issue #1174: 明示トランザクション中
     // （`InTransaction` かつ世代確定）は、同世代で Bind した名前付き portal のみ
     // Sync を越えて保持する。それ以外（`Idle`／`Failed`・世代不明）は従来どおり
