@@ -23173,8 +23173,6 @@ mod tests {
         }
     }
 
-    /// 引用付き `"null"` 列は加算の左オペランドとして受理し、引用なしの `NULL` 定数とは
-    /// 区別する（引用なしは従来どおり `42601`）。
     /// `DO UPDATE SET ... WHERE <条件>`（SQL-49 (3)、Issue #1740）の構文段: 修飾列は 1 対 1 に
     /// 正規化され、`RETURNING`／`USING OPERATION_ID` と併用でき、`DO NOTHING WHERE`・
     /// 未知の修飾子・予約接頭辞の偽装・余剰トークンは拒否される。
@@ -23231,6 +23229,8 @@ mod tests {
         );
     }
 
+    /// 引用付き `"null"` 列は加算の左オペランドとして受理し、引用なしの `NULL` 定数とは
+    /// 区別する（引用なしは従来どおり `42601`）。
     #[test]
     fn upsert_set_add_accepts_quoted_null_column() {
         let lookup = catalog_with(&["documents"]);
