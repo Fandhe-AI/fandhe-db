@@ -152,7 +152,10 @@ node pg（`values` 付き `query`）・psql `\bind`・JDBC 等、パラメータ
    節で、括弧深さ 0 の `(SET|,) <列> = $n (,|節末)` の形＝右辺全体が `$n` 単独の
    位置のみ。`a = a + $1`・`upper($1)` 等の式の内側はパターン 7。`$n` の型は対象列の型
    〔`WhereColumn` と同じ列型解決〕。Issue #1544・SQL-45 のポインタ。位置判定と
-   型推論は `sql::params::set_param_slots` の 1 パスの表を共有する）
+   型推論は `sql::params::set_param_slots` の 1 パスの表を共有する。行値の代入
+   `SET (<列>, ...) = (<要素>, ...)`／`= ROW(...)` も Issue #1748 で同じ規則に対応し、
+   列リストの位置で要素に列を割り当てる〔要素単独の `$n` はここ、式の内側はパターン 7。
+   列と要素の数が違う・形が崩れた場合は登録せず `42601`。parser 側の受理は #2629〕）
 7. 式の内側の `$n`（Issue #1546・SQL-45 期待欄 (6)・WIRE-12 のポインタ）。パターン 5 の
    VALUES 要素・パターン 6 の SET 右辺のうち `$n` 単独ではないもの（`n = n + $1`・
    `s = upper($1)`・`VALUES (1 + $1)`・`CASE WHEN m = $1 THEN ... END`）。SET 右辺は
@@ -439,6 +442,18 @@ Bind 値 `None`（SQL NULL）は、`sql::params` が裸の `Token::Ident("NULL")
     （`54000`）・値検証（`22P02`）・NULL のリテラル同値・値件数不一致・RLS 暗黙適用（他テナントの
     行が混入しない）・Describe の同値性・Parse／Describe の副作用ゼロ・
     簡易クエリでの `$n` 拒否（既存契約）を固定。
+
+## UPDATE／DELETE の `$n`（Issue #1748。SQL-50 (4)・SQL-45 (6)・WIRE-12 のポインタ）
+
+- `UPDATE`／`DELETE` の `WHERE <列> = $n` は SELECT と同じ規則（パターン 4）で、表は
+  `UPDATE <表>`／`DELETE FROM <表>` から引く。`SET` の右辺はパターン 6・7（行値の代入を含む）。
+- 修飾付きの列・`IN`・`$1 = 列`・`LIKE`・`$n::型` は SELECT の WHERE と同じく `42601`。
+  非等価の比較と `[NOT] BETWEEN` は #2429（SQL-78）の担当で、本 Issue では `42601` のまま。
+- wire 層に UPDATE／DELETE 専用の分岐は置かない。型不一致は既存の `22P02`／`08P01`／`0A000`
+  で fail-closed に拒否し、値は応答に含めない。
+- テスト: `crates/engine/tests/sql50_update_delete_params.rs`（リテラル同値性・拒否形・RLS・
+  明示トランザクション）、`crates/wire-server/tests/wire_sql50_update_delete_param.rs`
+  （text／binary の Bind・型不一致・テナント境界）、`sql::params` の単体テスト（行値の位置判定）。
 
 ## スコープ外・申し送り
 
