@@ -4602,6 +4602,17 @@ impl EngineCore {
         Err(crate::sql::temp_catalog::temp_table_unsupported())
     }
 
+    /// 既に parse／Bind 済みの文が、現在のセッションの一時カタログ・`search_path` の世代に対して
+    /// 陳腐化していないかを検査する公開入口（粗いゲート [`Self::coarse_temp_gate`] そのもの）。
+    /// 実行を engine の外（wire-server の COPY サブプロトコル）へ委譲する文が、通常の
+    /// `execute_parsed_in_txn` と同じ世代検査を委譲前に受けるために使う。陳腐化は `0A000`。
+    pub fn check_parsed_current(
+        session: &crate::sql::mode::SessionState,
+        parsed: &ParsedSql,
+    ) -> Result<(), crate::sql::allowlist::SqlSurfaceError> {
+        Self::coarse_temp_gate(session, parsed)
+    }
+
     /// [`Self::execute_parsed_in_session_inner`] の公開入口。一時カタログが空でないセッションでは
     /// 粗いゲート（[`Self::coarse_temp_gate`]）を通してから実行する。空なら従来と同一。
     fn execute_parsed_in_session_unscrubbed(

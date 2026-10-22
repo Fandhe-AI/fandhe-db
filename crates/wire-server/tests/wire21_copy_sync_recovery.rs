@@ -331,3 +331,40 @@ fn terminate_in_recovery_closes_connection() {
     send(&mut s, b'X', b"");
     expect_connection_closed(&mut s);
 }
+
+/// 同期回復中の不正形 CopyFail（本文なし・NUL 終端なし・埋め込み NUL・末尾 NUL の二重）は
+/// `copy.rs` と同じく `08P01` で切断する。
+#[test]
+fn malformed_copy_fail_in_recovery_closes_connection() {
+    for body in [&b""[..], b"abc", b"a\0b\0", b"abc\0\0"] {
+        let (core, _g) = new_core();
+        let mut s = connect(core);
+        fail_copy(&mut s);
+        send(&mut s, b'f', body);
+        expect_error_response_with_sqlstate(&mut s, "08P01");
+        expect_connection_closed(&mut s);
+    }
+}
+
+/// Bind 後に同名の一時表が作られた COPY portal は、委譲前の世代検査で `0A000` になり、
+/// 新しい一時表へ COPY を振り分けない。
+#[test]
+fn copy_portal_stale_after_temp_table_is_rejected() {
+    let (core, _g) = new_core();
+    let mut s = connect(core);
+    parse_bind(&mut s, COPY_FROM, "p");
+    assert_eq!(
+        simple(
+            &mut s,
+            "CREATE TEMP TABLE documents (id BIGINT PRIMARY KEY, embedding TEXT, body TEXT)"
+        ),
+        b'I'
+    );
+    execute(&mut s, "p");
+    flush(&mut s);
+    let body = expect(&mut s, b'E');
+    assert!(String::from_utf8_lossy(&body).contains("0A000"));
+    sync(&mut s);
+    assert_eq!(expect(&mut s, b'Z'), b"I");
+    s.shutdown(Shutdown::Write).ok();
+}

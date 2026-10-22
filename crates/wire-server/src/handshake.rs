@@ -644,7 +644,20 @@ fn post_auth_loop<'e, S: WireStream>(
                     let body_len = total_len
                         .checked_sub(4)
                         .ok_or(FrameError::Malformed("message length below header size"))?;
-                    framing::discard_body(stream, body_len)?;
+                    if type_byte == b'f' {
+                        // CopyFail の本文は `String`（単一の末尾 NUL）の形を有界バッファで検証し、
+                        // 不正形は `copy.rs` と同じく 08P01 で切断する（Issue #1761）。
+                        if !framing::discard_c_string_body(stream, body_len)? {
+                            let _ = write_error_response_io(
+                                stream,
+                                ErrorClass::ProtocolViolation,
+                                "malformed CopyFail message",
+                            );
+                            return Ok(());
+                        }
+                    } else {
+                        framing::discard_body(stream, body_len)?;
+                    }
                     body_len
                 };
                 extended.ignored_copy_bytes = extended

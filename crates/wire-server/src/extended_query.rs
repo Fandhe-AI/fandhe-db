@@ -2153,6 +2153,9 @@ fn run_copy_portal<'e, S: WireStream>(
             if let Some(portal) = state.portals.get_mut(portal_name) {
                 portal.state = PortalState::Done { tag };
             }
+            // CommandComplete を Sync 待ちにせず届ける（バッファ付き・TLS の WireStream で、
+            // 完了応答を待ってから Sync を送るクライアントのハングを防ぐ）。
+            stream.flush()?;
             Ok(LoopSignal::Continue)
         }
         crate::copy::CopyStep::Failed => {
@@ -2321,6 +2324,10 @@ fn execute_portal<'e, S: WireStream>(
                 .get_mut(portal_name)
                 .ok_or(HandlerError::UnknownPortal)?;
             portal.state = PortalState::Failed;
+            // 元 SQL の再実行は包み（`SessionRouted`）を外すため、通常の `execute_parsed_in_txn` が
+            // 行う世代検査をここで先に適用する（Bind 後に同名の一時表が作られた portal は陳腐化として
+            // `0A000`。新しい一時表へ COPY を振り分けない）。
+            EngineCore::check_parsed_current(session, &parsed).map_err(HandlerError::Sql)?;
             return Ok(PortalExecution::Copy { sql });
         }
 
