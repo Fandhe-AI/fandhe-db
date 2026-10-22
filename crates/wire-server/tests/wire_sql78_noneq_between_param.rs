@@ -312,8 +312,11 @@ const OPS: [&str; 5] = ["<", ">", "<=", ">=", "<>"];
 fn noneq_and_between_params_are_described_with_column_types() {
     let (core, _g) = new_core();
     let mut s = connect(core);
-    // 現行挙動の固定: BOOLEAN の順序比較（`<` 等）と TEXT の BETWEEN は engine が型として
-    // 受理せず、Parse で `22000` になる（fail-closed。緩める変更は別課題）。
+    // 本フィクスチャ（`TableSchema::new` による `LegacyId` 行識別の表）に限った現行挙動の固定:
+    // BOOLEAN 列の比較全般と TEXT 列の BETWEEN は、リテラル形（`f <> TRUE`・
+    // `s BETWEEN 'a' AND 'm'`）でもこの表では `22000` になり、`$n` 形も同じ
+    // （fail-closed。リテラル形との一致を固定する）。SQL の CREATE TABLE で作った表では
+    // これらも受理・描述される（`crates/engine/tests/sql78_where_noneq_between_params.rs`）。
     let rejected = |col: &str, between: bool| (col == "f" && !between) || (col == "s" && between);
     for (col, oid) in COLS {
         for op in OPS {
