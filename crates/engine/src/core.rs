@@ -128,6 +128,20 @@ fn insert_table_without_column_list(tokens: &[crate::sql::lexer::Token]) -> Opti
     }
 }
 
+/// `INSERT INTO <表>` の表名だけを読む（Issue #2427。`DEFAULT VALUES ON CONFLICT ...` 形のように
+/// 列リストも `VALUES` も無い INSERT でも、加算式の `$n` の型を表の列から引くための補完）。
+fn insert_table_name_only(tokens: &[crate::sql::lexer::Token]) -> Option<String> {
+    use crate::sql::lexer::Token;
+    let is_word = |t: Option<&Token>, w: &str| matches!(t, Some(Token::Ident(x)) if x.eq_ignore_ascii_case(w));
+    if !is_word(tokens.first(), "INSERT") || !is_word(tokens.get(1), "INTO") {
+        return None;
+    }
+    match tokens.get(2) {
+        Some(Token::Ident(table) | Token::QuotedNull(table)) => Some(table.clone()),
+        _ => None,
+    }
+}
+
 /// トークン列のうち括弧深さ 0 で最初の `FROM` の添字を返す（Issue #1188）。`EXTRACT(field
 /// FROM src)` の括弧内 `FROM` をテーブル名の手掛かりと取り違えないための走査で、
 /// prepared statement のパラメータ型推論（`EngineCore::prepare_*`）が呼ぶ。
@@ -5526,6 +5540,9 @@ impl EngineCore {
     /// 1 つでもベクトル位置があれば `VectorText`（バイナリ不可側へ倒す）、
     /// それ以外は `Text`。
     ///
+    /// Issue #2427: `INSERT ... ON CONFLICT ... DO UPDATE SET <列> = <列> + $n` の `$n` は
+    /// INSERT 対象表の代入先列の型（整数・浮動小数）をスロット型にする（パターン 8）。
+    ///
     /// Issue #1546: `UPDATE ... SET` 右辺・`INSERT ... VALUES` 要素の式内 `$n` は
     /// `sql::param_infer` が演算の相手・関数引数・兄弟枝から推論する。`INSERT` の
     /// 表名・列リストは検証済み構文木ではなくトークン列から読む（推論を構造検証 parse の
@@ -5676,6 +5693,25 @@ impl EngineCore {
                             }),
                             Some(ParamContextKind::Assignment),
                         ),
+                        // `ON CONFLICT DO UPDATE SET <列> = <列> + $n`（Issue #2427・SQL-49）。
+                        // 型は INSERT 対象表の代入先列。数値列以外は、列が引けた場合に限り
+                        // リテラル経路が束縛段で返すのと同じ `42883`／`0A000` を Parse で返す
+                        // （静的文言のみ・値を含めない）。引けない場合は `Text`（存在を観測させない）。
+                        ParamPosition::UpsertAddColumn(col) => {
+                            let upsert_table = insert_target
+                                .as_ref()
+                                .map(|(t, _)| t.clone())
+                                .or_else(|| insert_table_name_only(tokens));
+                            let ty = upsert_table.as_deref().and_then(|t| column_type(t, col));
+                            if let Some(PreparedParamType::Column(ColumnMeta::Scalar {
+                                ty: col_ty,
+                                ..
+                            })) = &ty
+                            {
+                                crate::sql::upsert_add::check_target_type(col_ty)?;
+                            }
+                            (ty, Some(ParamContextKind::AddOperand))
+                        }
                         // 式内の出現は下で `expr_results` から合流させる。
                         ParamPosition::InExpr(_) => continue,
                     };
