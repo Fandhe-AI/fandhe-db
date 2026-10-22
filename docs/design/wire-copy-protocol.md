@@ -32,8 +32,10 @@
   - 拡張クエリプロトコル（TASK-216）経由の COPY の Execute（CopyIn／CopyOut の開始。
     Issue #1760）と、CopyFail 等の後の Sync までの同期回復（Issue #1761）。Parse／Bind／
     Describe までは Issue #1759 で受理済み（下の「拡張クエリの Parse／Bind／Describe」節）。
-  - `HEADER`／`DELIMITER`／`NULL`／`QUOTE` などの COPY オプション、binary
-    形式（WIRE-14 関連）、テーブル形 `COPY t TO STDOUT`、8 進・16 進エスケープ。
+  - `HEADER`／`DELIMITER`／`NULL`／`QUOTE` などの COPY オプションの適用（構文の解析は
+    Issue #1763 で実装済み。FROM 側の適用は Issue #1764、TO 側は Issue #1765。下の
+    「許可リスト」節）、binary 形式（WIRE-14 関連）、テーブル形 `COPY t TO STDOUT`、
+    8 進・16 進エスケープ。
 
 ## 設計（決定事項）
 
@@ -56,7 +58,19 @@
   返す `Statement::Scan`（広域取得。SQL-15・Issue #454）のみを受理する
   （第 2 の SELECT パーサーを持たない）。順位付き `SELECT`（`ORDER BY`／
   `USING PLAN`）・集計・テーブル形は `42601`。
-- `FORMAT` 以外のオプション（`HEADER`・`DELIMITER`・`NULL` 等）はいずれも
+- COPY オプションの構文（Issue #1763・WIRE-22 ポインタ。`sql/copy_options.rs`）: 新構文
+  `[WITH] (opt [value], ...)` と旧構文（`CSV HEADER`・`DELIMITER [AS] 's'` 等。順序任意）を
+  受理し、簡易クエリ・拡張クエリの Parse で共通の検証を行う。エラー分類は、構文エラー・
+  オプションの重複・未知のオプション・値の欠落が `42601`、未知の形式名・不正な値・区切り文字
+  等の制約違反が `22023`、モード不一致（text での `QUOTE`／`ESCAPE`）・1 バイトでない
+  区切り文字・`HEADER MATCH` の `COPY TO` での使用・`FORCE_*` 等の未対応オプションが
+  `0A000`。エラー文言には入力値を含めない。
+- ゲート: データ経路が未適用の間は、解決結果が format の既定値と異なる指定（`HEADER` 等）を
+  `0A000` で拒否する（無言の fail-open の防止）。既定値と等しい明示指定と旧構文の `CSV` は
+  受理する。Issue #1764・#1765 は自分の方向のゲート呼び出し
+  （`reject_unapplied_for_from`／`reject_unapplied_for_to`）を外す。
+- 既知の相違: `FORMAT binary` は WIRE-23 まで従来どおり `42601`、`WITH` だけでオプションの
+  無い指定も `42601`（PostgreSQL は受理）、エスケープ文字列 `E'...'` は字句解析が未対応のため
   `42601`。
 
 ### FROM STDIN の逐次取り込み（`sql::copy::CopyInSession`）

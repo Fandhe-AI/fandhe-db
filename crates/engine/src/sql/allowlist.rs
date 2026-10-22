@@ -14,6 +14,7 @@ use crate::catalog::{ColumnDef, ColumnType, DropBehavior, MAX_COLUMN_COUNT};
 use crate::datetime::DateTimeLiteralError;
 use crate::error_format::{ClassifiedError, ErrorClass};
 use crate::recovery::required_op_id::LedgerMode;
+use crate::sql::copy_options;
 use crate::sql::ddl_column_type::StaticColumnType;
 use crate::sql::lexer::{self, Keyword, LexError, Token};
 use crate::sql::plan::{self, EvaluationOrder, Stage};
@@ -19972,8 +19973,9 @@ pub fn validate_drop_table_tokens(
 /// `COPY ... FROM STDIN`／`COPY (...) TO STDOUT` の転送形式（Issue #939・
 /// WIRE-17）。`text`（PostgreSQL 互換のタブ区切り・バックスラッシュエスケープ）・
 /// `csv`（RFC4180 風のカンマ区切り・二重引用符エスケープ）の 2 値のみを受理し、
-/// `HEADER`・`DELIMITER`・`NULL`・`QUOTE`・binary 形式（WIRE-14）は許可リスト外
-/// （`42601`）。フィールド分割・エスケープ解決の実体は [`crate::sql::copy`] が
+/// binary 形式（WIRE-14）は許可リスト外（`42601`）。`HEADER`・`DELIMITER`・`NULL`・`QUOTE`
+/// 等のオプションは [`crate::sql::copy_options`] が構文を解析し、データ経路が未適用の間は
+/// 既定値と異なる指定を `0A000` で拒否する（Issue #1763）。フィールド分割・エスケープ解決の実体は [`crate::sql::copy`] が
 /// 担う（本モジュールは構文の許可リスト判定のみ）。
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum CopyFormat {
@@ -19982,7 +19984,7 @@ pub enum CopyFormat {
 }
 
 /// 許可形状の構造判定を通過した `COPY <table> (<col>[, <col>]*) FROM STDIN
-/// [WITH] [(FORMAT text|csv)] USING OPERATION_ID '<id>'` 文（Issue #939・
+/// [WITH] [<options>] USING OPERATION_ID '<id>'` 文（Issue #939・
 /// WIRE-17・TASK-220）。`ValidatedInsert` と同様、本モジュールが保証するのは
 /// ここまでの構造情報のみで、列名・値の意味論的妥当性・実際のフレーム
 /// デコードは [`crate::sql::copy`] の責務とする。`RETURNING`・`ON CONFLICT`・
@@ -19994,6 +19996,8 @@ pub struct ValidatedCopyFrom {
     /// 列リストの宣言順（`id` 疑似列を必ず含む。重複はここで拒否済み）。
     pub columns: Vec<String>,
     pub format: CopyFormat,
+    /// 解決済みの `WITH` オプション（Issue #1763。適用は Issue #1764。それまでは既定値のみ受理）。
+    pub options: copy_options::CopyOptions,
     /// 文末専用句で搬送された、検証済みの `operation_id`。句の欠落・明示
     /// `NULL` はいずれも `None`（`ValidatedInsert::operation_id` と同じ契約。
     /// `LedgerMode::Ledgered`（`--require-operation-id`）では `None` を書き込みトランザクション
@@ -20011,6 +20015,8 @@ pub struct ValidatedCopyFrom {
 pub struct ValidatedCopyTo {
     pub inner: Box<ValidatedScan>,
     pub format: CopyFormat,
+    /// 解決済みの `WITH` オプション（Issue #1763。適用は Issue #1765。それまでは既定値のみ受理）。
+    pub options: copy_options::CopyOptions,
 }
 
 /// [`validate_copy`]（Issue #939・WIRE-17）が返す COPY statement 種別。
@@ -20082,41 +20088,167 @@ fn split_parenthesized(tokens: &[Token]) -> Result<(&[Token], &[Token]), SqlSurf
     ))
 }
 
-/// `[WITH] (FORMAT text|csv)` を受理する（省略時は [`CopyFormat::Text`]）。
-/// `WITH` を書いた場合は直後の `(FORMAT ...)` を必須とし、無ければ `42601` で
-/// 拒否する（値を伴わない `WITH` 句を既定 `Text` として誤受理しない）。
-/// `COPY ... FROM STDIN`・`COPY (...) TO STDOUT` の両方から共有する（Issue #939）。
-fn parse_optional_copy_format(p: &mut Parser) -> Result<CopyFormat, SqlSurfaceError> {
-    // `WITH` を消費したら `(FORMAT ...)` の丸括弧を必須とする。`WITH` の直後に
-    // `(` が続かない場合（値を伴わない不正な `WITH` 句）は許可リスト外として
-    // `42601` で拒否する（WIRE-17 の許可形状〔`FORMAT text|csv` のみ〕・
-    // fail-closed 規約。Issue #939 codex-review 指摘の是正）。
-    let with_seen = p.peek_contextual_keyword("WITH");
-    if with_seen {
-        p.advance();
-    }
-    if !matches!(p.peek(), Some(Token::Punct('('))) {
+impl Parser<'_> {
+    /// COPY の `WITH` オプション列を走査して生のオプション列へ変換する（Issue #1763・WIRE-22・
+    /// TASK-294 のポインタ。検証・既定値適用は [`copy_options::resolve`] が担う）。
+    /// 新構文 `[WITH] (name [arg], ...)` と旧構文 `[WITH] CSV HEADER DELIMITER [AS] 's' ...` の
+    /// 両方を受理する。`WITH` だけでオプションが無い場合は従来の契約どおり `42601`
+    /// （PostgreSQL は受理するが、既存の厳しい契約を維持する）。
+    fn parse_copy_option_list(
+        &mut self,
+    ) -> Result<Vec<copy_options::RawCopyOption>, SqlSurfaceError> {
+        let with_seen = self.peek_contextual_keyword("WITH");
         if with_seen {
+            self.advance();
+        }
+        if matches!(self.peek(), Some(Token::Punct('('))) {
+            return self.parse_copy_paren_options();
+        }
+        let opts = self.parse_copy_legacy_options()?;
+        if with_seen && opts.is_empty() {
             return Err(SqlSurfaceError::unsupported(
-                "COPY WITH clause must be followed by (FORMAT ...)",
+                "COPY WITH clause must be followed by options",
             ));
         }
-        return Ok(CopyFormat::Text);
+        Ok(opts)
     }
-    p.advance();
-    p.expect_contextual_keyword("FORMAT")?;
-    let raw = p.expect_ident()?;
-    let format = match raw.to_ascii_lowercase().as_str() {
-        "text" => CopyFormat::Text,
-        "csv" => CopyFormat::Csv,
-        _ => {
-            return Err(SqlSurfaceError::unsupported(format!(
-                "unsupported COPY FORMAT: {raw}"
-            )))
+
+    /// 新構文 `( name [arg] [, name [arg]]* )`。空・末尾カンマ・閉じ括弧欠落は `42601`。
+    fn parse_copy_paren_options(
+        &mut self,
+    ) -> Result<Vec<copy_options::RawCopyOption>, SqlSurfaceError> {
+        use copy_options::{RawCopyOption, RawCopyValue};
+        self.expect_punct('(')?;
+        let mut out: Vec<RawCopyOption> = Vec::new();
+        loop {
+            if out.len() >= copy_options::MAX_COPY_OPTIONS {
+                return Err(SqlSurfaceError::unsupported("too many COPY options"));
+            }
+            let name = self.expect_ident()?.to_ascii_lowercase();
+            let value = match self.peek() {
+                Some(Token::Punct(',')) | Some(Token::Punct(')')) => None,
+                Some(Token::StringLiteral(s)) => Some(RawCopyValue::String(s.clone())),
+                Some(Token::Number(n)) => Some(RawCopyValue::Number(n.clone())),
+                Some(Token::Ident(i)) => Some(RawCopyValue::Ident(i.clone())),
+                Some(Token::Punct('*')) => Some(RawCopyValue::Star),
+                Some(Token::Punct('(')) => None,
+                _ => return Err(SqlSurfaceError::unsupported("invalid COPY option value")),
+            };
+            match self.peek() {
+                Some(Token::Punct('(')) => {
+                    out.push(RawCopyOption {
+                        name,
+                        value: Some(RawCopyValue::List(self.parse_copy_column_list(true)?)),
+                    });
+                }
+                Some(Token::Punct(',')) | Some(Token::Punct(')')) => {
+                    out.push(RawCopyOption { name, value });
+                }
+                _ => {
+                    self.advance();
+                    out.push(RawCopyOption { name, value });
+                }
+            }
+            match self.advance() {
+                Some(Token::Punct(',')) => continue,
+                Some(Token::Punct(')')) => return Ok(out),
+                _ => return Err(SqlSurfaceError::unsupported("malformed COPY option list")),
+            }
         }
-    };
-    p.expect_punct(')')?;
-    Ok(format)
+    }
+
+    /// 列リスト（`force_*` 用）。`parens` が真なら `( a, b )`、偽なら括弧なしの `a, b`。
+    fn parse_copy_column_list(&mut self, parens: bool) -> Result<Vec<String>, SqlSurfaceError> {
+        if parens {
+            self.expect_punct('(')?;
+        }
+        let mut cols = vec![self.expect_ident()?];
+        while matches!(self.peek(), Some(Token::Punct(','))) {
+            self.advance();
+            if cols.len() >= MAX_COLUMN_COUNT {
+                return Err(SqlSurfaceError::unsupported("too many COPY columns"));
+            }
+            cols.push(self.expect_ident()?);
+        }
+        if parens {
+            self.expect_punct(')')?;
+        }
+        Ok(cols)
+    }
+
+    /// 旧構文の項目列（順序任意）。項目でないトークン（`USING`・文末・`;`・`(`）で停止する。
+    fn parse_copy_legacy_options(
+        &mut self,
+    ) -> Result<Vec<copy_options::RawCopyOption>, SqlSurfaceError> {
+        use copy_options::{RawCopyOption, RawCopyValue};
+        let mut out: Vec<RawCopyOption> = Vec::new();
+        while let Some(Token::Ident(w)) = self.peek() {
+            let word = w.to_ascii_uppercase();
+            if out.len() >= copy_options::MAX_COPY_OPTIONS {
+                return Err(SqlSurfaceError::unsupported("too many COPY options"));
+            }
+            let (name, value): (&str, Option<RawCopyValue>) = match word.as_str() {
+                "CSV" | "BINARY" => (
+                    "format",
+                    Some(RawCopyValue::Ident(word.to_ascii_lowercase())),
+                ),
+                "HEADER" => ("header", None),
+                "FREEZE" => ("freeze", None),
+                "DELIMITER" | "NULL" | "QUOTE" | "ESCAPE" | "ENCODING" => {
+                    self.advance();
+                    if self.peek_contextual_keyword("AS") {
+                        self.advance();
+                    }
+                    let v = self.expect_string_literal()?;
+                    out.push(RawCopyOption {
+                        name: word.to_ascii_lowercase(),
+                        value: Some(RawCopyValue::String(v)),
+                    });
+                    continue;
+                }
+                "FORCE" => {
+                    self.advance();
+                    let (name, value) = if self.peek_contextual_keyword("QUOTE") {
+                        self.advance();
+                        if matches!(self.peek(), Some(Token::Punct('*'))) {
+                            self.advance();
+                            ("force_quote", RawCopyValue::Star)
+                        } else {
+                            (
+                                "force_quote",
+                                RawCopyValue::List(self.parse_copy_column_list(false)?),
+                            )
+                        }
+                    } else if self.peek_contextual_keyword("NOT") {
+                        self.advance();
+                        self.expect_contextual_keyword("NULL")?;
+                        (
+                            "force_not_null",
+                            RawCopyValue::List(self.parse_copy_column_list(false)?),
+                        )
+                    } else {
+                        self.expect_contextual_keyword("NULL")?;
+                        (
+                            "force_null",
+                            RawCopyValue::List(self.parse_copy_column_list(false)?),
+                        )
+                    };
+                    out.push(RawCopyOption {
+                        name: name.to_string(),
+                        value: Some(value),
+                    });
+                    continue;
+                }
+                _ => break,
+            };
+            self.advance();
+            out.push(RawCopyOption {
+                name: name.to_string(),
+                value,
+            });
+        }
+        Ok(out)
+    }
 }
 
 /// `COPY <table> (<col>[, <col>]*) FROM STDIN [WITH] [(FORMAT text|csv)]
@@ -20143,7 +20275,8 @@ fn validate_copy_from_tokens(
     p.expect_keyword(Keyword::From)?;
     p.expect_contextual_keyword("STDIN")?;
 
-    let format = parse_optional_copy_format(&mut p)?;
+    let raw_options = p.parse_copy_option_list()?;
+    let (format, options) = copy_options::resolve(raw_options, copy_options::CopyDirection::From)?;
 
     // 文末専用句の構造パースのみをここで行う（`parse_insert`／`parse_truncate`
     // と同じ設計。必須化の判定は `mode.require` へ委譲する）。
@@ -20165,6 +20298,8 @@ fn validate_copy_from_tokens(
             )));
         }
     }
+    // データ経路が未適用のオプションは fail-closed（Issue #1764 が外す）。
+    copy_options::reject_unapplied_for_from(format, &options)?;
     // 疑似列 `id` の要否は表の行識別方式で決まる（採番方式の表は不要。TABLE-23・Issue #2199）ため、
     // 列リストへの `id` 必須検査は束縛段（`sql::copy`）が表のスキーマを見て行う。
 
@@ -20172,6 +20307,7 @@ fn validate_copy_from_tokens(
         table_name,
         columns,
         format,
+        options,
         operation_id,
     }))
 }
@@ -20200,12 +20336,16 @@ fn validate_copy_to_tokens(
     let mut p = Parser::new(after);
     p.expect_contextual_keyword("TO")?;
     p.expect_contextual_keyword("STDOUT")?;
-    let format = parse_optional_copy_format(&mut p)?;
+    let raw_options = p.parse_copy_option_list()?;
+    let (format, options) = copy_options::resolve(raw_options, copy_options::CopyDirection::To)?;
     p.expect_end_of_statement()?;
+    // データ経路が未適用のオプションは fail-closed（Issue #1765 が外す）。
+    copy_options::reject_unapplied_for_to(format, &options)?;
 
     Ok(CopyStatement::To(ValidatedCopyTo {
         inner: Box::new(scan),
         format,
+        options,
     }))
 }
 
