@@ -1199,6 +1199,10 @@ pub struct EngineCore {
     /// [`Self::with_ledger_mode`] のみ。`crate::recovery::required_op_id` モジュール
     /// ドキュメント参照）。
     ledger_mode: LedgerMode,
+    /// `WHERE` 省略の `UPDATE`／`DELETE` を `42601` で拒否する opt-in のサーバー側構成
+    /// （Issue #2210・SQL-36 ポインタ。既定 `false`）。クエリ・セッション変数・HTTP から
+    /// 到達できる経路を持たない（差し替えは [`Self::with_require_where_for_dml`] のみ）。
+    require_where_for_dml: bool,
     /// 一括投入（複数ファイルのバッチ投入）に対する 4 種の処理量上限（TASK-122・
     /// 対象ビヘイビア: INDEX-4）。差し替えは [`Self::with_batch_limits`] のみ。
     /// `crate::batch_limits` モジュールドキュメント参照。
@@ -2624,6 +2628,7 @@ impl EngineCore {
             query_planner: None,
             incremental_config: crate::incremental::IncrementalConfig::default(),
             ledger_mode: LedgerMode::default(),
+            require_where_for_dml: false,
             batch_limits: crate::batch_limits::BatchLimits::default(),
             transaction_limits: crate::sql::transaction::TransactionLimits::default(),
             dml_limits: crate::sql::parser::DmlLimits::default(),
@@ -2808,6 +2813,15 @@ impl EngineCore {
     /// required_op_id` モジュールドキュメント参照）。
     pub fn with_ledger_mode(mut self, mode: LedgerMode) -> Self {
         self.ledger_mode = mode;
+        self
+    }
+
+    /// `WHERE` 省略の SQL `UPDATE`／`DELETE` を変更開始前に `42601` で拒否するか（Issue #2210・
+    /// SQL-36 ポインタ。MySQL の `sql_safe_updates` 相当の opt-in）を差し替えたビルダーを返す。
+    /// [`Self::with_ledger_mode`] と同型の所有権消費ビルダーで、`wire-server` が起動時に 1 回だけ
+    /// 呼ぶ。明示した `WHERE`（`WHERE TRUE` を含む）・NoSQL 表層・`TRUNCATE` は影響を受けない。
+    pub fn with_require_where_for_dml(mut self, enabled: bool) -> Self {
+        self.require_where_for_dml = enabled;
         self
     }
 
@@ -4384,6 +4398,16 @@ impl EngineCore {
             Some(crate::sql::lexer::Token::Ident(w)) if w.eq_ignore_ascii_case("DELETE")
         );
         if is_delete {
+            // SQL-36（Issue #2210）: 構造解析 → WHERE 省略ガード → カタログ検証の順。通常 DML 経路と
+            // 同じく、ガードを表の存在確認より前に置き、不存在表と既存表で応答を分けない。
+            let shape =
+                crate::sql::allowlist::parse_delete_statement_shape_tokens(rest, self.ledger_mode)?;
+            if let DeleteStatement::Predicate(v) = &shape {
+                crate::sql::allowlist::reject_omitted_where_for_dml(
+                    self.require_where_for_dml,
+                    v.where_predicates(),
+                )?;
+            }
             let stmt = crate::sql::allowlist::validate_delete_statement_tokens(
                 rest,
                 lookup,
@@ -4397,6 +4421,14 @@ impl EngineCore {
                 }
                 _ => Err(reject()),
             };
+        }
+        // SQL-36（Issue #2210）: DELETE と同じ順序（構造解析 → WHERE 省略ガード → カタログ検証）。
+        let shape = crate::sql::allowlist::parse_update_form_shape_tokens(rest, self.ledger_mode)?;
+        if let ValidatedUpdateForm::Predicate(v) = &shape {
+            crate::sql::allowlist::reject_omitted_where_for_dml(
+                self.require_where_for_dml,
+                v.where_predicates(),
+            )?;
         }
         let stmt =
             crate::sql::allowlist::validate_update_form_tokens(rest, lookup, self.ledger_mode)
@@ -4840,6 +4872,14 @@ impl EngineCore {
             // Issue #1672。書き換えは Execute 時）。
             let stmt =
                 crate::sql::allowlist::parse_delete_statement_shape_tokens(&tokens, ledger_mode)?;
+            // SQL-36（Issue #2210）: opt-in 有効時は `WHERE` 省略を表の存在確認より前に拒否する
+            // （ビュー・PARTITIONED・一時表の分類 parse も本経路を通る）。
+            if let crate::sql::allowlist::DeleteStatement::Predicate(v) = &stmt {
+                crate::sql::allowlist::reject_omitted_where_for_dml(
+                    self.require_where_for_dml,
+                    v.where_predicates(),
+                )?;
+            }
             let table_name = match &stmt {
                 crate::sql::allowlist::DeleteStatement::SingleRow(v) => v.table_name.clone(),
                 crate::sql::allowlist::DeleteStatement::Predicate(v) => v.table_name().to_string(),
@@ -4889,6 +4929,13 @@ impl EngineCore {
         if is_update_statement {
             // 構造検証 → 存在確認の順序は `validate_update_form_tokens` と同じ（TABLE-43・Issue #1672）。
             let stmt = crate::sql::allowlist::parse_update_form_shape_tokens(&tokens, ledger_mode)?;
+            // SQL-36（Issue #2210）: DELETE と同じ位置・同じ理由で `WHERE` 省略を拒否する。
+            if let crate::sql::allowlist::ValidatedUpdateForm::Predicate(v) = &stmt {
+                crate::sql::allowlist::reject_omitted_where_for_dml(
+                    self.require_where_for_dml,
+                    v.where_predicates(),
+                )?;
+            }
             let table_name = match &stmt {
                 crate::sql::allowlist::ValidatedUpdateForm::Single(v) => v.table_name.clone(),
                 crate::sql::allowlist::ValidatedUpdateForm::Predicate(v) => {
