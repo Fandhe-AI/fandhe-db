@@ -1644,6 +1644,16 @@ pub enum ParsedSql {
     /// すべて更新済み。クレート外で `ParsedSql` を網羅的にマッチするコードが
     /// あれば追随が必要。
     Cursor(crate::sql::cursor::CursorStatement),
+    /// 拡張クエリプロトコルの Parse が検証済みの `COPY` 文（Issue #1759・WIRE-21 (1)・ERR-6 の
+    /// ポインタ）。Parse／Bind／Describe だけを受理し、行・台帳・世代には一切触れない。
+    /// Execute は Issue #1760 まで `0A000` で拒否する（[`EngineCore::execute_parsed_in_session`]・
+    /// [`EngineCore::execute_parsed_in_txn`] の本 variant の腕が #1760 の差し替え位置）。
+    /// 簡易クエリ（`Q`）の `COPY` は本 variant を経由せず `begin_copy*` へ直行する。
+    /// [`EngineCore::parse_sql`] は `COPY` を受理しない（拡張クエリの Parse だけが生成する）。
+    ///
+    /// **BREAKING CHANGE**（Issue #1759）: 本 variant の追加により `ParsedSql` を網羅的に
+    /// マッチするクレート外コードは追随が必要。
+    Copy(crate::sql::allowlist::ValidatedCopy),
     /// 分割実行 DML の制御文・説明文（Issue #1129・SQL-19）: `SHOW PARTITIONED DML`・
     /// `CANCEL PARTITIONED DML`・`EXPLAIN UPDATE|DELETE ... PARTITIONED`。分割実行そのもの
     /// （`UPDATE`／`DELETE ... PARTITIONED`）は [`Self::Update`]／[`Self::Delete`] の述語形が
@@ -1854,7 +1864,8 @@ fn statement_clock_scope(
         | ParsedSql::DropSchema(_)
         | ParsedSql::AlterSchema(_)
         | ParsedSql::AlterSequence(_)
-        | ParsedSql::SequenceFunction(_) => false,
+        | ParsedSql::SequenceFunction(_)
+        | ParsedSql::Copy(_) => false,
     };
     if !is_read {
         return Ok(None);
@@ -1911,7 +1922,8 @@ fn insert_sequence_scope(
         | ParsedSql::DropSchema(_)
         | ParsedSql::AlterSchema(_)
         | ParsedSql::AlterSequence(_)
-        | ParsedSql::SequenceFunction(_) => false,
+        | ParsedSql::SequenceFunction(_)
+        | ParsedSql::Copy(_) => false,
     };
     is_insert.then(|| {
         crate::sql::sequence_scope::SequenceScope::enter(
@@ -1966,7 +1978,8 @@ fn insert_default_clock_scope(
         | ParsedSql::DropSchema(_)
         | ParsedSql::AlterSchema(_)
         | ParsedSql::AlterSequence(_)
-        | ParsedSql::SequenceFunction(_) => false,
+        | ParsedSql::SequenceFunction(_)
+        | ParsedSql::Copy(_) => false,
     };
     if !is_insert {
         return Ok(None);
@@ -5529,6 +5542,56 @@ impl EngineCore {
                 ),
             );
         }
+        // Issue #1759・WIRE-21 (1): `COPY` は拡張クエリでも Parse／Bind／Describe まで受理する。
+        // `$n` を含む形は位置検査（`42601`）より前に `42P02` で拒否する（fail-closed。`COPY` に
+        // バインドパラメータは無い）。`$n` が無ければ簡易クエリの `COPY` と同一の許可リスト検証
+        // （`validate_copy_tokens`）を Parse 時に行い、検証済みの文を保持する。
+        if matches!(
+            tokens.first(),
+            Some(crate::sql::lexer::Token::Ident(name)) if name.eq_ignore_ascii_case("COPY")
+        ) {
+            if let Some(param) = tokens.iter().find_map(|t| match t {
+                crate::sql::lexer::Token::Param(n) => Some(*n),
+                _ => None,
+            }) {
+                return Err(crate::sql::allowlist::SqlSurfaceError::UndefinedParameter { param });
+            }
+            // 簡易クエリの `begin_copy`（印なしの `tokenize`）と同じ字句に揃えるため、引用付きの
+            // `NULL`／`ARRAY`／SQL 値関数予約語（`QuotedNull`）もすべて `Ident` へ戻す
+            // （`demote_quoted_null` は引用付き `ARRAY` を残し、表名・列名 `"array"` が 42601 になる）。
+            let copy_tokens: Vec<crate::sql::lexer::Token> = tokens
+                .iter()
+                .cloned()
+                .map(|t| match t {
+                    crate::sql::lexer::Token::QuotedNull(s) => crate::sql::lexer::Token::Ident(s),
+                    other => other,
+                })
+                .collect();
+            let stmt = crate::sql::allowlist::validate_copy_tokens(
+                &copy_tokens,
+                &self.storage,
+                self.ledger_mode,
+            )
+            .map_err(|e| self.reclassify_matview_write_error(e))?;
+            return Ok(PreparedSql {
+                resolution_tenant: None,
+                tokens,
+                param_count: 0,
+                dummy_parsed: ParsedSql::Copy(crate::sql::allowlist::ValidatedCopy::new(
+                    stmt,
+                    sql.to_string(),
+                )),
+                order_by_distance_literal_is_param: false,
+                where_equality_dummy_flags: Vec::new(),
+                param_types: Vec::new(),
+                declared: Vec::new(),
+                session_tz_dependent: false,
+                public_qualified,
+                qualified_positions,
+                create_public,
+                route: temp_route::PreparedRoute::Plain,
+            });
+        }
         let param_count = crate::sql::params::validate_param_positions(&tokens)?;
         // Issue #927・SQL-29 (a)・TASK-213（拡張クエリプロトコルの注意点）:
         // `sql::params::where_equality_literal_is_param` は元トークン列全体を
@@ -5929,6 +5992,11 @@ impl EngineCore {
                     values.len()
                 ),
             ));
+        }
+        // Issue #1759: `COPY` は `$n` を持たず、Parse で検証済みの文をそのまま返す
+        // （`parse_tokens` は `COPY` を受理しないため再 parse できない）。
+        if let ParsedSql::Copy(_) = &prepared.dummy_parsed {
+            return Ok(prepared.dummy_parsed.clone());
         }
         // Issue #2436・WIRE-24: 宣言型がある値は、置換の前に宣言型として検証する。
         // NULL は検証対象外で SQL の NULL として置換される。非 UTF-8 は後段の復号が拒否する。
@@ -6571,6 +6639,14 @@ impl EngineCore {
             ParsedSql::Transaction(_) => Err(crate::sql::allowlist::SqlSurfaceError::unsupported(
                 "transaction control statements are not supported by this entry point",
             )),
+            // Issue #1759・WIRE-21 (1): 拡張クエリの `COPY` は Parse／Bind／Describe まで受理し、
+            // Execute は Issue #1760 まで `0A000` で拒否する（fail-closed・副作用なし。行・台帳・
+            // 世代には触れない。#1760 がこの腕を `begin_copy*` への結線へ差し替える）。
+            ParsedSql::Copy(_) => Err(
+                crate::sql::allowlist::SqlSurfaceError::feature_not_supported(
+                    "COPY via the extended query protocol is not supported yet",
+                ),
+            ),
             // WIRE-15・TASK-218: カーソルは明示トランザクション内でのみ有効
             // （`sql::cursor` モジュールドキュメント参照）。トランザクション
             // 文脈を持たない本エントリポイントでは、`DECLARE` は「トランザク
@@ -7052,6 +7128,11 @@ impl EngineCore {
                 txn.mark_written(ctx.tenant_id(), &stmt.table_name);
                 Ok(outcome)
             }
+            // Issue #1759: 拡張クエリの `COPY` は Execute を Issue #1760 まで拒否する（fail-closed・
+            // 副作用なし。呼び出し元がトランザクションを `Failed` へ遷移させる）。
+            ParsedSql::Copy(_) => Err(SqlSurfaceError::feature_not_supported(
+                "COPY via the extended query protocol is not supported yet",
+            )),
             // COPY・DDL 等、明示トランザクション内での対応外の文（対象外。
             // `docs/design/explicit-transaction.md` 参照）。
             _ => Err(SqlSurfaceError::transaction_feature_not_supported(
@@ -8104,6 +8185,9 @@ impl EngineCore {
             // `BEGIN`／`COMMIT`／`ROLLBACK`（SQL-31・TASK-221）は結果列を持たない
             // （`CommandComplete` のみ）。
             ParsedSql::Transaction(_) => Ok(None),
+            // Issue #1759: `COPY` は結果列を持たない（Describe は NoData。CopyIn/CopyOut の
+            // 開始は Execute 側の責務で Issue #1760）。
+            ParsedSql::Copy(_) => Ok(None),
             // WIRE-15・TASK-218: `DECLARE`／`CLOSE` は `CommandComplete` のみを
             // 返すため結果列を持たない。`FETCH` は本来カーソルの列メタデータを
             // 持つが、本メソッド（トランザクション文脈を持たない Describe。

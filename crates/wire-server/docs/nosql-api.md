@@ -1163,6 +1163,7 @@ Date: <IMF-fixdate>
 | `42883` | `UNDEFINED_FUNCTION` | 400 | Bad Request | `aggregate` の `sum`／`avg` を `DATE`／`TIMESTAMP` 列に指定した場合（SQL-26、Issue #1186）、または `sum`／`avg`（TEXT 以外は `min`／`max` も）を非数値型（TEXT・BOOLEAN・BYTEA・JSON・ARRAY・UUID・ENUM・VECTOR）の列に指定した場合（Issue #1349。未知関数・非決定的関数の呼び出しは SQL 表層専用で到達しない） |
 | `428C9` | `GENERATED_ALWAYS` | 400 | Bad Request | `GENERATED ALWAYS AS IDENTITY` 列へ値を書こうとした（TABLE-24・Issue #1695） |
 | `42939` | `RESERVED_NAME` | 400 | Bad Request | 予約名（`pg_` 接頭辞）の SCHEMA 名を指定した（TABLE-27・Issue #1713。NoSQL 表層からは到達しない） |
+| `42P02` | `UNDEFINED_PARAMETER` | 400 | Bad Request | 拡張クエリプロトコル（SQL 表層）の Parse で COPY 文に `$n` を置いた。NoSQL の `op` 語彙からは到達しない。Issue #1759 |
 | `42P10` | `INVALID_COLUMN_REFERENCE` | 400 | Bad Request | NoSQL 表層の実要求からは到達不能（`ON CONFLICT` 衝突対象の束縛は SQL 表層専用。NoSQL の `insert` は `on_conflict` を持たない） |
 | `42P16` | `INVALID_TABLE_DEFINITION` | 400 | Bad Request | `create_table.constraints` に `primary_key` を 2 個以上指定した場合（名前付きを含む。TABLE-22 (d)、Issue #1412・#1437。`ALTER TABLE ... ADD PRIMARY KEY` の重複宣言は SQL 表層専用。後述） |
 | `42P17` | `INVALID_OBJECT_DEFINITION` | 400 | Bad Request | 式索引の式が IMMUTABLE 相当でない（SQL 表層専用。NoSQL の `op` 語彙からは到達しない）。Issue #1647 |

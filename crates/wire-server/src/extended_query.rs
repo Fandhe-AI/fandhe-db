@@ -95,6 +95,9 @@
 //!   → `0A000`（`FeatureNotSupported`）
 //! - 結果 format code の個数不正・値不正（0/1 以外） → `08P01`
 //!   （`ProtocolViolation`。[`result_encoder::BinaryFormatError`]）
+//! - `COPY` 文の Parse／Bind／Describe は受理し、Execute は Issue #1760 まで `0A000`
+//!   （Issue #1759・WIRE-21 (1)）。`COPY` に `$n` を置くと Parse が `42P02`
+//!   （`UndefinedParameter`）で拒否する
 //! - 件数・名前長・保持バイト上限超過 →
 //!   `54000`（`PayloadTooLarge`。[`crate::limits`] の各定数）
 //! - body の構造不正（NUL 終端欠落・余剰バイト・負の件数・非 UTF-8・種別バイト
