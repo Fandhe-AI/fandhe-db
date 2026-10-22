@@ -233,7 +233,8 @@ fn mismatched_values_are_rejected_fail_closed_without_side_effects() {
 }
 
 /// SELECT の WHERE と同じ規則: 許可位置以外の `$n` は UPDATE／DELETE でも `42601`。
-/// 非等価・BETWEEN は #2429（SQL-78）が書き換える前提で現状の `42601` を固定する。
+/// 非等価・BETWEEN の `$n` は #2430 で SELECT が受理側へ移ったため、別テスト
+/// `noneq_and_between_positions_select_only` で SELECT との差分を固定する。
 #[test]
 fn unsupported_positions_match_select_rule() {
     let (core, _g) = setup("sql50-udp-rules");
@@ -243,9 +244,6 @@ fn unsupported_positions_match_select_rule() {
         "$1 = n",
         "s LIKE $1",
         "n = $1::int",
-        "n <> $1",
-        "n < $1",
-        "n BETWEEN $1 AND 5",
     ] {
         let sel = core
             .parse_sql_prepared(&format!("SELECT id FROM t WHERE {pred} LIMIT 5"))
@@ -260,6 +258,30 @@ fn unsupported_positions_match_select_rule() {
                 .err()
                 .map(|e| e.wire_code().to_string());
             assert_eq!(got, sel, "{sql}");
+            assert_eq!(got.as_deref(), Some("42601"), "{sql}");
+        }
+    }
+}
+
+/// 非等価・BETWEEN の `$n` は SELECT のみ受理（#2430）。UPDATE／DELETE は別 Issue で
+/// 受理するまで fail-closed の `42601` を維持する（SELECT との差分をここで固定する）。
+#[test]
+fn noneq_and_between_positions_select_only() {
+    let (core, _g) = setup("sql50-udp-noneq");
+    for pred in ["n <> $1", "n < $1", "n BETWEEN $1 AND $2"] {
+        let sel = core
+            .parse_sql_prepared(&format!("SELECT id FROM t WHERE {pred} LIMIT 5"))
+            .err()
+            .map(|e| e.wire_code().to_string());
+        assert_eq!(sel, None, "SELECT {pred}");
+        for sql in [
+            format!("UPDATE t SET s = 'x' WHERE {pred}"),
+            format!("DELETE FROM t WHERE {pred}"),
+        ] {
+            let got = core
+                .parse_sql_prepared(&sql)
+                .err()
+                .map(|e| e.wire_code().to_string());
             assert_eq!(got.as_deref(), Some("42601"), "{sql}");
         }
     }
