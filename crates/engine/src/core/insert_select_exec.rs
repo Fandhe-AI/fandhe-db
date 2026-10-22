@@ -51,8 +51,9 @@ pub(super) struct InsertSelectRequest<'a> {
     pub table_name: &'a str,
     /// 列リスト。`None` は省略（宣言順。`resolve_target_columns` 参照）。
     pub columns: Option<&'a [String]>,
-    /// 検証済みの内側 SELECT。LIMIT 省略時の `cap+1` 付与は束縛側の責務だが、実行側も
-    /// 結果行数を `cap` と照合して超過を `54000` にする。
+    /// 検証済みの内側 SELECT。`LIMIT` 省略時の `cap+1` 付与は構文段（`core.rs::parse_insert_select`。
+    /// Issue #2615）が済ませており、実行側も結果行数を `cap` と照合して超過を `54000` にする
+    /// （`LIMIT` 不要の集計・定数 SELECT は付与されないため、この照合が上限判定を担う）。
     pub select: Statement,
     pub operation_id: Option<OperationId>,
     /// 正規化済みの文から導いた台帳照合ハッシュ（`recovery::content_hash::for_insert_select`・#1734）。

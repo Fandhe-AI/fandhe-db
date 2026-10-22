@@ -926,7 +926,44 @@ pub(crate) fn describe_columns(
     if let Some(n) = limit {
         crate::sql::parser::validate_search_limit_with(n, result_limits)?;
     }
-    Ok(describe_tree(schemas, tree, udfs, dummy_equality_flags)?.0)
+    // `sql::params::where_equality_literal_is_param_typed` は集合演算で枝ごとのフラグを最長の
+    // 枝へ `false` 埋めして枝順に連結する。枝数で等分できない場合は対応を取れないため、
+    // 全枝で検証を省略しない（fail-closed）。
+    let leaves = count_leaves(tree);
+    let width = if leaves == 0 || !dummy_equality_flags.len().is_multiple_of(leaves) {
+        0
+    } else {
+        dummy_equality_flags.len() / leaves
+    };
+    let mut next_leaf = 0usize;
+    Ok(describe_tree(
+        schemas,
+        tree,
+        udfs,
+        dummy_equality_flags,
+        width,
+        &mut next_leaf,
+    )?
+    .0)
+}
+
+/// 集合演算木の枝（葉）数。
+fn count_leaves(tree: &SetTree) -> usize {
+    match tree {
+        SetTree::Op { left, right, .. } => count_leaves(left).saturating_add(count_leaves(right)),
+        _ => 1,
+    }
+}
+
+/// 枝順（左から）に `next_leaf` 番目の枝へ割り当てるダミーフラグの区画。
+fn branch_flags<'a>(flags: &'a [bool], width: usize, next_leaf: &mut usize) -> &'a [bool] {
+    let k = *next_leaf;
+    *next_leaf = k.saturating_add(1);
+    if width == 0 {
+        return &[];
+    }
+    let start = k.saturating_mul(width);
+    flags.get(start..start.saturating_add(width)).unwrap_or(&[])
 }
 
 fn describe_tree(
@@ -934,9 +971,12 @@ fn describe_tree(
     tree: &SetTree,
     udfs: &UdfRegistry,
     dummy_equality_flags: &[bool],
+    width: usize,
+    next_leaf: &mut usize,
 ) -> Result<(Vec<ColumnMeta>, bool), SqlSurfaceError> {
     match tree {
         SetTree::Branch(validated) | SetTree::LimitedBranch(validated) => {
+            let branch_dummy = branch_flags(dummy_equality_flags, width, next_leaf);
             let schema =
                 schemas
                     .get(&validated.table_name)
@@ -947,7 +987,7 @@ fn describe_tree(
                 validated,
                 schema,
                 udfs,
-                dummy_equality_flags,
+                branch_dummy,
                 // 枝の `LIMIT` は枝行数上限（`MAX_SET_OP_ROWS`）側で扱う独立上限のため
                 // 既定値のまま（設定値とは連動させない。SQL-46 (6)）。
                 &crate::result_limits::ResultLimits::default(),
@@ -957,6 +997,7 @@ fn describe_tree(
             Ok((columns, has_vector))
         }
         SetTree::AggregateBranch(branch) => {
+            let branch_dummy = branch_flags(dummy_equality_flags, width, next_leaf);
             let schema =
                 schemas
                     .get(&branch.0.table_name)
@@ -967,7 +1008,7 @@ fn describe_tree(
                 &branch.0,
                 schema,
                 udfs,
-                dummy_equality_flags,
+                branch_dummy,
             )?;
             let columns = crate::sql::describe::aggregate_columns(&bound, schema)?;
             let has_vector = columns_have_vector(&columns);
@@ -975,9 +1016,9 @@ fn describe_tree(
         }
         SetTree::Op { op, left, right } => {
             let (l_columns, l_has_vector) =
-                describe_tree(schemas, left, udfs, dummy_equality_flags)?;
+                describe_tree(schemas, left, udfs, dummy_equality_flags, width, next_leaf)?;
             let (r_columns, r_has_vector) =
-                describe_tree(schemas, right, udfs, dummy_equality_flags)?;
+                describe_tree(schemas, right, udfs, dummy_equality_flags, width, next_leaf)?;
             check_branch_type_compatibility(
                 *op,
                 &l_columns,

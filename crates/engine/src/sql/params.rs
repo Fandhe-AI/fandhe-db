@@ -34,7 +34,10 @@
 //!    先頭語が `UPDATE` の文の `SET` 節の内側、括弧深さ 0 の `(SET|,) <列> = $n (,|節末)` の
 //!    形＝右辺全体が `$n` 単独の位置のみ。`a = a + $1`・`upper($1)` のように式の内側に
 //!    置いた `$n` はパターン 7。
-//!    `INSERT ... ON CONFLICT ... DO UPDATE SET` は先頭語が `INSERT` のため対象外）
+//!    `INSERT ... ON CONFLICT ... DO UPDATE SET` は先頭語が `INSERT` のため対象外。
+//!    行値の代入 `SET (<列>, ...) = (<要素>, ...)`／`= ROW(...)`（Issue #1748）も列リストの位置で
+//!    同じ規則に従い、要素単独の `$n` はここ、式の内側はパターン 7。列と要素の数の不一致は
+//!    登録せず `42601`）
 //! 7. 式の内側の `$n`（Issue #1546・SQL-45 期待欄 (6)・WIRE-12 のポインタ）。パターン 5 の
 //!    VALUES 要素、パターン 6 の SET 右辺のうち `$n` 単独ではないもの
 //!    （`n = n + $1`・`s = upper($1)`・`VALUES (1 + $1)`・`CASE WHEN m = $1 ...`）。
@@ -48,9 +51,16 @@
 //!    代入先列から推論する。左右の列が異なる形・`$n + <列>`・`+ $n + 1`・`EXCLUDED.<列> + $n` は
 //!    `42601`。
 //!
+//! 9. `SELECT／UPDATE／DELETE ... WHERE <列> (< | > | <= | >= | <>) $n`・`WHERE <列> [NOT] BETWEEN $a AND $b`
+//!    （Issue #2430・#2431・SQL-78・SQL-24・WIRE-12 のポインタ。先頭語が `SELECT`／`UPDATE`／
+//!    `DELETE` で集合演算を持たない文〔`INSERT ... ON CONFLICT DO UPDATE ... WHERE` は対象外〕の `WHERE` 節内に限る。`$n` の型は比較相手の列の型で、列を引けなければ `text`。
+//!    `$n op $m`〔両辺とも `$n`〕は型を決められず、宣言型も無ければ Parse で `42P18`）。
+//!    受理の判定は `noneq_leaf_at` に集約する。逆向き（`$n < <列>`）・片側だけが `$n` の
+//!    `BETWEEN`・相手がリテラル／式の比較は `42601` のまま。
+//!
 //! `LIMIT $n`・`USING MODE $n`・`HINT ORDER($n, ...)`・`SET search_mode = $n`・
 //! `ON CONFLICT ... DO UPDATE SET a = $n`（`$n` 単独の右辺。加算形はパターン 8）・hybrid 関数
-//! 引数（`HYBRID_RRF(col, $n, ...)`）・非等価比較（`id > $n` 等）はいずれも
+//! 引数（`HYBRID_RRF(col, $n, ...)`）・パターン 9 以外の非等価比較（`id > $n` 等）はいずれも
 //! スコープ外として `42601` で拒否する（後続 Issue へ申し送り。詳細は
 //! `docs/design/wire-extended-query-param-binding.md` 参照）。
 //!
@@ -78,7 +88,7 @@
 //! 値は SQL テキストにも字句解析器にも戻らず、検証済みの値から直接トークンを
 //! 組み立てるため、値経由のインジェクション経路は構造的に存在しない。
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 
 use crate::sql::allowlist::SqlSurfaceError;
 use crate::sql::lexer::{self, Token};
@@ -144,7 +154,7 @@ fn is_comparison_operator(token: Option<&Token>) -> bool {
 /// 境界とみなさない。安全側に倒す設計のため、この判定を追加しても許可されて
 /// いなかった位置の `$n` が新たに通ることはない（既存の `is_where_equality`
 /// 等の受理条件は無変更）。
-fn is_where_clause_boundary(tokens: &[Token], idx: usize) -> bool {
+fn is_where_clause_boundary(tokens: &[Token], idx: usize, in_where_region: bool) -> bool {
     let next1 = tokens.get(idx + 1);
     let next2 = tokens.get(idx + 2);
     let Some(Token::Ident(name)) = tokens.get(idx) else {
@@ -170,10 +180,20 @@ fn is_where_clause_boundary(tokens: &[Token], idx: usize) -> bool {
         // 列名の列挙のみを受理し関数呼び出し項目は拒否する）。UDF 呼び出し
         // `returning(...)` は直後が `(` になり、列名としての比較
         // `returning = $1` は直後が `=` になるため、いずれも一致しない。
-        "RETURNING" => matches!(
-            next1,
-            Some(Token::Ident(_) | Token::QuotedNull(_) | Token::Punct('*'))
-        ),
+        // 列名 `returning` の `[NOT] BETWEEN` 比較（`WHERE returning BETWEEN $1 AND $2`。
+        // リテラル BETWEEN は構文段が受理する）は RETURNING 句ではなく WHERE の述語とする
+        // （PR #2631 指摘）。この除外は WHERE 領域（`in_where_region`）の境界判定に限る。
+        // `SET`／`ON CONFLICT DO UPDATE SET` 領域では `SET c = $1 RETURNING between` の
+        // `RETURNING` が実句であるため除外しない。
+        "RETURNING" => {
+            matches!(
+                next1,
+                Some(Token::Ident(_) | Token::QuotedNull(_) | Token::Punct('*'))
+            ) && !(in_where_region
+                && (ident_eq_ignore_case(next1, "BETWEEN")
+                    || (ident_eq_ignore_case(next1, "NOT")
+                        && ident_eq_ignore_case(next2, "BETWEEN"))))
+        }
         // `USING OPERATION_ID $n` / `USING PLAN(...)`（`Parser` がこの 2 語の
         // みを文脈的キーワードとして照合する）。UDF 呼び出し `using(...)` は
         // 直後が `(` になり `OPERATION_ID`／`PLAN` に一致しない。
@@ -246,7 +266,7 @@ fn where_region(tokens: &[Token]) -> Option<(usize, usize)> {
                     // `USING OPERATION_ID|PLAN`・`ON CONFLICT`）に限り境界とする
                     // （PR #1012 Bugbot・codex 指摘。詳細は
                     // [`is_where_clause_boundary`] 参照）。
-                    && is_where_clause_boundary(tokens, idx) =>
+                    && is_where_clause_boundary(tokens, idx, true) =>
             {
                 Some(idx)
             }
@@ -292,6 +312,87 @@ pub(crate) fn where_equality_literal_is_param_typed(
     tokens: &[Token],
     kinds: &[ParamLiteralKind],
 ) -> Vec<bool> {
+    if !has_set_operator_branch(tokens) {
+        return where_literal_flags_in_region(tokens, kinds);
+    }
+    // 集合演算（PR #2631 指摘）: 枝ごとにフラグを求め、最長の枝の長さへ `false` で埋めて
+    // 枝順に連結する。`set_op::describe_columns` が枝数で等分して各枝へ自分の区画だけを渡す
+    // ため、枝をまたいだ序数のずれがなく、実リテラルの検証は維持されたままパラメータ由来の
+    // 位置だけが省略される（埋め草の `false` は検証側＝fail-closed）。
+    let mut per_branch: Vec<Vec<bool>> = Vec::new();
+    let mut seg_start = 0usize;
+    let in_cte_body = cte_body_mask(tokens);
+    for (i, t) in tokens.iter().enumerate() {
+        if matches!(t, Token::Ident(n) if super::allowlist::is_set_operator_ident(n))
+            && !in_cte_body.get(i).copied().unwrap_or(false)
+            && super::allowlist::set_operator_is_followed_by_branch(tokens, i)
+        {
+            per_branch.push(where_literal_flags_in_region(
+                tokens.get(seg_start..i).unwrap_or(&[]),
+                kinds,
+            ));
+            seg_start = i.saturating_add(1);
+        }
+    }
+    per_branch.push(where_literal_flags_in_region(
+        tokens.get(seg_start..).unwrap_or(&[]),
+        kinds,
+    ));
+    let width = per_branch.iter().map(Vec::len).max().unwrap_or(0);
+    per_branch
+        .into_iter()
+        .flat_map(|mut f| {
+            f.resize(width, false);
+            f
+        })
+        .collect()
+}
+
+/// `WITH` 句の CTE 本体（`name AS [MATERIALIZED] ( ... )` の括弧内）に含まれるトークンを
+/// `true` にしたマスクを返す（PR #2631 指摘）。CTE 本体内の `UNION` 等は `SetTree` の葉に
+/// ならないため、ダミーフラグの枝分割から除外して `describe_columns` の葉数と区画数を揃える。
+/// `WITH` で始まらない文は全要素 `false`。
+fn cte_body_mask(tokens: &[Token]) -> Vec<bool> {
+    let mut mask = vec![false; tokens.len()];
+    if !matches!(tokens.first(), Some(Token::Ident(n)) if n.eq_ignore_ascii_case("WITH")) {
+        return mask;
+    }
+    // 括弧ごとに「CTE 本体か」を積む。CTE 本体の内側は入れ子の括弧も含めて true。
+    let mut stack: Vec<bool> = Vec::new();
+    for (i, t) in tokens.iter().enumerate() {
+        match t {
+            Token::Punct('(') => {
+                let prev_is = |k: usize, w: &str| {
+                    i.checked_sub(k)
+                        .and_then(|j| tokens.get(j))
+                        .is_some_and(|p| matches!(p, Token::Ident(n) if n.eq_ignore_ascii_case(w)))
+                };
+                let opens_cte = prev_is(1, "AS")
+                    || (prev_is(1, "MATERIALIZED") && (prev_is(2, "AS") || prev_is(2, "NOT")));
+                let inside = stack.iter().any(|b| *b) || opens_cte;
+                if let Some(m) = mask.get_mut(i) {
+                    *m = inside;
+                }
+                stack.push(opens_cte);
+            }
+            Token::Punct(')') => {
+                stack.pop();
+                let inside = stack.iter().any(|b| *b);
+                if let Some(m) = mask.get_mut(i) {
+                    *m = inside;
+                }
+            }
+            _ => {
+                if let Some(m) = mask.get_mut(i) {
+                    *m = stack.iter().any(|b| *b);
+                }
+            }
+        }
+    }
+    mask
+}
+
+fn where_literal_flags_in_region(tokens: &[Token], kinds: &[ParamLiteralKind]) -> Vec<bool> {
     let Some((start, end)) = where_region(tokens) else {
         return Vec::new();
     };
@@ -337,9 +438,249 @@ pub(crate) fn where_equality_literal_is_param_typed(
             i += 4;
             continue;
         }
+        // Issue #2430: `<col> (< > <= >= <>) (リテラル|$n)`・`<col> [NOT] BETWEEN ...` は構文段で
+        // `Compare`／`Between`（`<>` は `Not(Equality)`）になり、束縛段が序数を 1 つ進める。
+        // 実リテラルは `false`、String 種別の `$n` は `true`。非 String 種別の `$n` は
+        // 数値・真偽値の式述語になり序数に数えない。
+        if let Some(leaf) = noneq_leaf_at(tokens, i, start, end) {
+            let is_dummy = |idx: usize| match tokens.get(idx) {
+                Some(Token::StringLiteral(_)) => Some(false),
+                Some(Token::Param(n)) if kind_of(kinds, *n) == ParamLiteralKind::String => {
+                    Some(true)
+                }
+                _ => None,
+            };
+            // BETWEEN の BOOLEAN 境界は文字列リテラルへ置換される（置換側と一致させる）。
+            let is_dummy_bound = |idx: usize| match tokens.get(idx) {
+                Some(Token::Param(n)) if kind_of(kinds, *n) == ParamLiteralKind::Boolean => {
+                    Some(true)
+                }
+                _ => is_dummy(idx),
+            };
+            match leaf.kind {
+                NoneqLeafKind::Compare { rhs, .. } => {
+                    if let Some(f) = is_dummy(rhs) {
+                        flags.push(f);
+                    }
+                }
+                NoneqLeafKind::Between { low, high, .. } => {
+                    if let (Some(a), Some(b)) = (is_dummy_bound(low), is_dummy_bound(high)) {
+                        // 片側だけが `$n` の形は `validate_param_positions` が拒否する。
+                        flags.push(a && b);
+                    }
+                }
+                NoneqLeafKind::ParamPair { .. } => {}
+            }
+            i = leaf.next;
+            continue;
+        }
         i += 1;
     }
     flags
+}
+
+/// パターン 9 の `$n` の分類（[`where_noneq_param_slots`] が返す）。
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) enum WhereParamShape {
+    /// 比較相手の列（型の推論元）。
+    Column(String),
+    /// 両辺とも `$n` で型を決められない形（`$1 < $2`）。
+    Indeterminate,
+}
+
+/// 非等価比較・`BETWEEN` の葉 1 件（[`noneq_leaf_at`] が返す。添字はトークン列上の位置）。
+struct NoneqLeaf {
+    kind: NoneqLeafKind,
+    /// 葉の直後の添字（走査の再開位置。常に葉の先頭より大きい）。
+    next: usize,
+}
+
+enum NoneqLeafKind {
+    /// `<col> op <rhs>`（`rhs` は `$n` または文字列リテラル）。
+    Compare { col: usize, rhs: usize },
+    /// `<col> [NOT] BETWEEN <low> AND <high>`（各境界は `$n` または文字列リテラル）。
+    Between { col: usize, low: usize, high: usize },
+    /// `$lhs op $rhs`（両辺とも `$n`）。
+    ParamPair { lhs: usize, rhs: usize },
+}
+
+/// 葉の左端 `i` の直前が、単独の述語の始まりを示すトークンか
+/// （`WHERE`・`AND`・`OR`・`NOT`・`(`）。`1 + col > $1` のような式の一部を葉と取り違えない。
+fn is_noneq_left_boundary(tokens: &[Token], i: usize) -> bool {
+    match i.checked_sub(1).and_then(|j| tokens.get(j)) {
+        Some(Token::Keyword(
+            crate::sql::lexer::Keyword::Where | crate::sql::lexer::Keyword::And,
+        ))
+        | Some(Token::Punct('(')) => true,
+        Some(Token::Ident(w)) => w.eq_ignore_ascii_case("OR") || w.eq_ignore_ascii_case("NOT"),
+        _ => false,
+    }
+}
+
+/// 葉の直後 `idx` が、述語の終わりを示すか（`AND`・`OR`・`)`・`;`・領域の終端）。
+/// `col > $1 + 1`・`col > $1::int` のような式の一部を葉と取り違えない。
+fn is_noneq_right_boundary(tokens: &[Token], idx: usize, end: usize) -> bool {
+    if idx >= end {
+        return true;
+    }
+    match tokens.get(idx) {
+        None
+        | Some(Token::Punct(')' | ';'))
+        | Some(Token::Keyword(crate::sql::lexer::Keyword::And)) => true,
+        Some(Token::Ident(w)) => {
+            w.eq_ignore_ascii_case("OR")
+                // 集合演算の枝末（`... > 'x' UNION SELECT ...`）。`$n` の受理は集合演算文を
+                // 別途拒否するため、ここは実リテラルのフラグを数えるためだけに効く。
+                || (super::allowlist::is_set_operator_ident(w)
+                    && super::allowlist::set_operator_is_followed_by_branch(tokens, idx))
+        }
+        _ => false,
+    }
+}
+
+/// `tokens[i]` から始まる非等価の比較演算子（`<`・`>`・`<=`・`>=`・`<>`〔`!=` は字句段で同形〕）の
+/// トークン数。`<=>`（距離演算子）は別トークンなので含まない。
+fn noneq_op_len(tokens: &[Token], i: usize) -> Option<usize> {
+    match tokens.get(i) {
+        Some(Token::Punct('<')) if matches!(tokens.get(i + 1), Some(Token::Punct('>'))) => Some(2),
+        Some(Token::Punct('<' | '>') | Token::Le | Token::Ge) => Some(1),
+        _ => None,
+    }
+}
+
+fn is_noneq_operand(token: Option<&Token>) -> bool {
+    matches!(token, Some(Token::Param(_) | Token::StringLiteral(_)))
+}
+
+/// パターン 9 の構造判定の単一情報源（Issue #2430・SQL-78。PR #1012 で境界判定がずれた再発を
+/// 防ぐため、受理（[`validate_param_positions`]）・分類（[`infer_param_positions`]）・
+/// Describe 用ダミーフラグ（[`where_equality_literal_is_param_typed`]）の 3 箇所がここを参照する）。
+/// `tokens[i]` が `WHERE` 領域 `(start, end)` 内の葉の左端なら、その葉を返す。表・列の存在は見ない。
+/// 構文段（`sql::allowlist::Parser`）が `Compare`／`Between` へ束縛する形と同じ範囲だけを葉とする
+/// （右辺が文字列リテラルまたは `$n`。数値リテラルは式述語になるため対象外）。
+fn noneq_leaf_at(tokens: &[Token], i: usize, start: usize, end: usize) -> Option<NoneqLeaf> {
+    if i <= start || i >= end || !is_noneq_left_boundary(tokens, i) {
+        return None;
+    }
+    match tokens.get(i)? {
+        Token::Ident(_) | Token::QuotedNull(_) => {
+            if let Some(op_len) = noneq_op_len(tokens, i + 1) {
+                let rhs = i + 1 + op_len;
+                return (is_noneq_operand(tokens.get(rhs))
+                    && is_noneq_right_boundary(tokens, rhs + 1, end))
+                .then_some(NoneqLeaf {
+                    kind: NoneqLeafKind::Compare { col: i, rhs },
+                    next: rhs + 1,
+                });
+            }
+            let mut k = i + 1;
+            if ident_eq_ignore_case(tokens.get(k), "NOT") {
+                k += 1;
+            }
+            if !ident_eq_ignore_case(tokens.get(k), "BETWEEN") {
+                return None;
+            }
+            let (low, high) = (k + 1, k + 3);
+            (is_noneq_operand(tokens.get(low))
+                && matches!(
+                    tokens.get(k + 2),
+                    Some(Token::Keyword(crate::sql::lexer::Keyword::And))
+                )
+                && is_noneq_operand(tokens.get(high))
+                && is_noneq_right_boundary(tokens, high + 1, end))
+            .then_some(NoneqLeaf {
+                kind: NoneqLeafKind::Between { col: i, low, high },
+                next: high + 1,
+            })
+        }
+        Token::Param(_) => {
+            let op_len = noneq_op_len(tokens, i + 1)?;
+            let rhs = i + 1 + op_len;
+            (matches!(tokens.get(rhs), Some(Token::Param(_)))
+                && is_noneq_right_boundary(tokens, rhs + 1, end))
+            .then_some(NoneqLeaf {
+                kind: NoneqLeafKind::ParamPair { lhs: i, rhs },
+                next: rhs + 1,
+            })
+        }
+        _ => None,
+    }
+}
+
+/// パターン 9 の `$n` のトークン添字 → 分類。先頭語が `SELECT`／`UPDATE`／`DELETE`（Issue #2431）
+/// で集合演算を持たない文に限る（集合演算は枝ごとに Describe 用フラグの序数が
+/// 0 から始まり対応がずれるため対象外）。それ以外は空で、該当する `$n` は `42601` のまま。
+fn where_noneq_param_slots(tokens: &[Token]) -> HashMap<usize, WhereParamShape> {
+    where_noneq_param_slots_and_bounds(tokens).0
+}
+
+/// 文中に集合演算（`UNION`／`INTERSECT`／`EXCEPT` の直後に次の枝が続く形）があるか。
+/// 同名の識別子（表・列・別名）は集合演算とみなさない（[`set_operator_is_followed_by_branch`]
+/// と同じ判定。引用符付き識別子は字句段で `Token::Ident` と別種のため対象外）。
+fn has_set_operator_branch(tokens: &[Token]) -> bool {
+    tokens.iter().enumerate().any(|(i, t)| {
+        matches!(t, Token::Ident(n) if super::allowlist::is_set_operator_ident(n))
+            && super::allowlist::set_operator_is_followed_by_branch(tokens, i)
+    })
+}
+
+/// [`where_noneq_param_slots`] と、`BETWEEN` の境界にあたる `$n` のトークン添字集合を返す。
+/// 後者は BOOLEAN 種別の置換で文字列リテラルを使う位置の判定に使う（既存の `BETWEEN`
+/// 構文処理は文字列／数値境界のみを受理するため）。
+fn where_noneq_param_slots_and_bounds(
+    tokens: &[Token],
+) -> (HashMap<usize, WhereParamShape>, HashSet<usize>) {
+    let mut out = HashMap::new();
+    let mut bounds = HashSet::new();
+    // 先頭語の明示 allowlist（`SELECT`・`UPDATE`・`DELETE`）。`INSERT ... ON CONFLICT DO UPDATE
+    // ... WHERE`・`WITH`・`EXPLAIN` 等は対象外のまま `42601` に倒す（fail-closed）。
+    let head_ok = matches!(
+        tokens.first(),
+        Some(Token::Keyword(crate::sql::lexer::Keyword::Select))
+    ) || ident_eq_ignore_case(tokens.first(), "UPDATE")
+        || ident_eq_ignore_case(tokens.first(), "DELETE");
+    if !head_ok || has_set_operator_branch(tokens) {
+        return (out, bounds);
+    }
+    let Some((start, end)) = where_region(tokens) else {
+        return (out, bounds);
+    };
+    let column_of = |idx: usize| match tokens.get(idx) {
+        Some(Token::Ident(c) | Token::QuotedNull(c)) => Some(WhereParamShape::Column(c.clone())),
+        _ => None,
+    };
+    let mut i = start + 1;
+    while i < end {
+        let Some(leaf) = noneq_leaf_at(tokens, i, start, end) else {
+            i += 1;
+            continue;
+        };
+        match leaf.kind {
+            NoneqLeafKind::Compare { col, rhs } => {
+                if let (Some(shape), Some(Token::Param(_))) = (column_of(col), tokens.get(rhs)) {
+                    out.insert(rhs, shape);
+                }
+            }
+            NoneqLeafKind::Between { col, low, high } => {
+                // 片側だけが `$n` の形は受理しない（1 葉 1 フラグのため、実リテラル側の
+                // Describe 検証が省略されてしまう）。
+                if let (Some(shape), Some(Token::Param(_)), Some(Token::Param(_))) =
+                    (column_of(col), tokens.get(low), tokens.get(high))
+                {
+                    out.insert(low, shape.clone());
+                    out.insert(high, shape);
+                    bounds.insert(low);
+                    bounds.insert(high);
+                }
+            }
+            NoneqLeafKind::ParamPair { lhs, rhs } => {
+                out.insert(lhs, WhereParamShape::Indeterminate);
+                out.insert(rhs, WhereParamShape::Indeterminate);
+            }
+        }
+        i = leaf.next;
+    }
+    (out, bounds)
 }
 
 /// 番号 `n`（1 始まり）の置換リテラル種別。範囲外・0 は `String`（fail-closed）。
@@ -549,7 +890,7 @@ fn set_region(tokens: &[Token]) -> Option<(usize, usize)> {
                 if depth == 0
                     && (name.eq_ignore_ascii_case("RETURNING")
                         || name.eq_ignore_ascii_case("USING"))
-                    && is_where_clause_boundary(tokens, idx) =>
+                    && is_where_clause_boundary(tokens, idx, false) =>
             {
                 Some(idx)
             }
@@ -594,6 +935,15 @@ fn set_param_slots(
         };
         if is_separator {
             close_set_assignment(tokens, current.take(), k, &mut table, &mut segments);
+            // 行値の代入 `(<列>, ...) = (<要素>, ...)`／`= ROW(...)`（Issue #1748）。
+            if matches!(tokens.get(k + 1), Some(Token::Punct('('))) {
+                if let Some(close) =
+                    set_row_value_slots(tokens, k + 1, end, &mut table, &mut segments)
+                {
+                    k = close.saturating_add(1);
+                    continue;
+                }
+            }
             if let (Some(Token::Ident(col) | Token::QuotedNull(col)), Some(Token::Punct('='))) =
                 (tokens.get(k + 1), tokens.get(k + 2))
             {
@@ -604,6 +954,75 @@ fn set_param_slots(
     }
     close_set_assignment(tokens, current.take(), end, &mut table, &mut segments);
     (table, segments)
+}
+
+/// [`set_param_slots`] の行値の代入 `( <列>, ... ) = ( <要素>, ... )`／`= ROW( ... )` の登録
+/// （Issue #1748。SQL-50 (3)(4)・SQL-45 (6)・WIRE-12 のポインタ）。`open` は列リストの `(`。
+/// 列と要素の数が一致したときだけ、要素ごとに列の位置規則（単独 `$n` はパターン 6、`$n` を含む式は
+/// パターン 7）で登録する。形が崩れている・数が違う場合は何も登録せず（位置検査で `42601`。
+/// fail-closed）、値リストの閉じ括弧の添字を返す。値リストの閉じ括弧が見つからなければ `None`。
+fn set_row_value_slots(
+    tokens: &[Token],
+    open: usize,
+    end: usize,
+    table: &mut HashMap<usize, String>,
+    segments: &mut Vec<ExprSegment>,
+) -> Option<usize> {
+    let mut cols: Vec<String> = Vec::new();
+    let mut j = open.checked_add(1)?;
+    loop {
+        match tokens.get(j) {
+            Some(Token::Ident(c) | Token::QuotedNull(c)) if j < end => cols.push(c.clone()),
+            _ => return None,
+        }
+        match tokens.get(j + 1) {
+            Some(Token::Punct(',')) => j += 2,
+            Some(Token::Punct(')')) => {
+                j += 2;
+                break;
+            }
+            _ => return None,
+        }
+    }
+    if !matches!(tokens.get(j), Some(Token::Punct('='))) {
+        return None;
+    }
+    j += 1;
+    if ident_eq_ignore_case(tokens.get(j), "ROW") {
+        j += 1;
+    }
+    if !matches!(tokens.get(j), Some(Token::Punct('('))) {
+        return None;
+    }
+    // 括弧深さ 1 の `,` と対応する閉じ括弧で要素を区切る（前向き 1 パス）。
+    let mut ranges: Vec<(usize, usize)> = Vec::new();
+    let mut depth: usize = 1;
+    let mut elem_start = j + 1;
+    let mut k = j + 1;
+    while k < end.min(tokens.len()) {
+        match tokens.get(k) {
+            Some(Token::Punct('(') | Token::Punct('[')) => depth = depth.saturating_add(1),
+            Some(Token::Punct(')') | Token::Punct(']')) => {
+                depth = depth.saturating_sub(1);
+                if depth == 0 {
+                    ranges.push((elem_start, k));
+                    if ranges.len() == cols.len() {
+                        for (col, (s, e)) in cols.into_iter().zip(ranges) {
+                            close_set_assignment(tokens, Some((col, s)), e, table, segments);
+                        }
+                    }
+                    return Some(k);
+                }
+            }
+            Some(Token::Punct(',')) if depth == 1 => {
+                ranges.push((elem_start, k));
+                elem_start = k + 1;
+            }
+            _ => {}
+        }
+        k += 1;
+    }
+    None
 }
 
 /// [`set_param_slots`] の 1 代入の確定（右辺 `[rhs_start, rhs_end)`）。
@@ -657,7 +1076,7 @@ fn upsert_set_region(tokens: &[Token]) -> Option<(usize, usize)> {
                 if start.is_some()
                     && (name.eq_ignore_ascii_case("RETURNING")
                         || name.eq_ignore_ascii_case("USING"))
-                    && is_where_clause_boundary(tokens, idx) =>
+                    && is_where_clause_boundary(tokens, idx, false) =>
             {
                 return start.map(|s| (s, idx));
             }
@@ -745,6 +1164,8 @@ struct ParamLayout {
     /// パターン 8: `$n` のトークン添字 → `ON CONFLICT DO UPDATE SET` 加算式の代入先列名
     /// （Issue #2427）。
     upsert_add_slots: HashMap<usize, String>,
+    /// パターン 9: `$n` のトークン添字 → `SELECT` の `WHERE` 非等価・`BETWEEN` の分類（Issue #2430）。
+    where_noneq_slots: HashMap<usize, WhereParamShape>,
 }
 
 impl ParamLayout {
@@ -769,6 +1190,7 @@ impl ParamLayout {
             set_slots,
             segments,
             upsert_add_slots,
+            where_noneq_slots: where_noneq_param_slots(tokens),
         }
     }
 
@@ -893,6 +1315,9 @@ pub fn validate_param_positions(tokens: &[Token]) -> Result<u16, SqlSurfaceError
                 && matches!(prev2, Some(Token::Ident(_) | Token::QuotedNull(_)))
         });
 
+        // パターン 9: `SELECT` の `WHERE` 内の非等価比較・`BETWEEN`（Issue #2430）。
+        let is_where_noneq = layout.where_noneq_slots.contains_key(&i);
+
         // パターン 5: `INSERT ... VALUES (...)` の行内リテラル位置。
         let is_insert_value = layout.values_slots.contains_key(&i);
 
@@ -921,6 +1346,7 @@ pub fn validate_param_positions(tokens: &[Token]) -> Result<u16, SqlSurfaceError
             || is_using_plan
             || is_operation_id
             || is_where_equality
+            || is_where_noneq
             || is_insert_value
             || is_update_set_value
             || is_in_expr
@@ -950,6 +1376,10 @@ pub(crate) enum ParamPosition {
     Text,
     /// `WHERE <列> = $n` の列名。
     WhereColumn(String),
+    /// `SELECT` の `WHERE` で `$n op $m`（両辺とも `$n`）の出現。型を決められない
+    /// （Issue #2430。同じ番号の別の出現で決まればそれを使い、無ければ宣言型、
+    /// それも無ければ `42P18`）。
+    WhereIndeterminate,
     /// `INSERT ... VALUES` の行内 ordinal（0 始まり。列リストの添字に対応）。
     InsertValue(usize),
     /// `UPDATE ... SET <列> = $n` の対象列名（Issue #1544）。
@@ -1341,6 +1771,17 @@ pub(crate) fn infer_param_positions(tokens: &[Token], param_count: u16) -> Vec<V
             slot.push(ParamPosition::UpsertAddColumn(col.clone()));
             continue;
         }
+        match layout.where_noneq_slots.get(&i) {
+            Some(WhereParamShape::Column(col)) => {
+                slot.push(ParamPosition::WhereColumn(col.clone()));
+                continue;
+            }
+            Some(WhereParamShape::Indeterminate) => {
+                slot.push(ParamPosition::WhereIndeterminate);
+                continue;
+            }
+            None => {}
+        }
         if let Some((start, end)) = where_bounds {
             if i > start && i < end && matches!(prev1, Some(Token::Punct('='))) {
                 if let Some(Token::Ident(col) | Token::QuotedNull(col)) = prev2 {
@@ -1385,13 +1826,13 @@ pub fn order_by_distance_literal_is_param(tokens: &[Token]) -> bool {
 /// `value_for` は 1 始まりのパラメータ番号を受け取る。
 fn substitute_with<E>(
     tokens: &[Token],
-    mut value_for: impl FnMut(u16) -> Result<Vec<Token>, E>,
+    mut value_for: impl FnMut(u16, usize) -> Result<Vec<Token>, E>,
 ) -> Result<Vec<Token>, E> {
     let mut out = Vec::with_capacity(tokens.len());
     for (i, token) in tokens.iter().enumerate() {
         match token {
             Token::Param(n) => {
-                let produced = value_for(*n)?;
+                let produced = value_for(*n, i)?;
                 // Issue #1593: `$n::T` の `$n` が負値（`-` + 数値の 2 トークン）になる場合は括弧で
                 // 包む。`::` は単項マイナスより強いため、包まないと `-5::int` が `-(5::int)` と
                 // 読まれ、リテラル `(-5)::int` と値の意味が食い違う。`Punct` の長さは
@@ -1425,10 +1866,15 @@ pub fn substitute_dummy(tokens: &[Token]) -> Vec<Token> {
 /// `Number("0")`、`Boolean` 種別は `Ident("false")` のダミーへ置換し、数値・真偽値
 /// 列の位置でも Describe 用の構造検証が通るようにする。
 pub(crate) fn substitute_dummy_typed(tokens: &[Token], kinds: &[ParamLiteralKind]) -> Vec<Token> {
-    substitute_with(tokens, |n| {
+    let between_bounds = where_noneq_param_slots_and_bounds(tokens).1;
+    substitute_with(tokens, |n, i| {
         Ok::<_, std::convert::Infallible>(vec![match kind_of(kinds, n) {
             ParamLiteralKind::String => Token::StringLiteral("0".to_string()),
             ParamLiteralKind::Integer | ParamLiteralKind::Float => Token::Number("0".to_string()),
+            // BETWEEN の境界は既存構文処理が文字列リテラルのみ受理するため文字列で置換する。
+            ParamLiteralKind::Boolean if between_bounds.contains(&i) => {
+                Token::StringLiteral("false".to_string())
+            }
             ParamLiteralKind::Boolean => Token::Ident("false".to_string()),
         }])
     })
@@ -1461,7 +1907,8 @@ pub(crate) fn substitute_values_typed(
     values: &[Option<String>],
     kinds: &[ParamLiteralKind],
 ) -> Result<Vec<Token>, SqlSurfaceError> {
-    substitute_with(tokens, |n| {
+    let between_bounds = where_noneq_param_slots_and_bounds(tokens).1;
+    substitute_with(tokens, |n, ti| {
         let idx = usize::from(n).checked_sub(1).ok_or_else(|| {
             SqlSurfaceError::unsupported("parameter placeholder $0 is not valid".to_string())
         })?;
@@ -1475,6 +1922,17 @@ pub(crate) fn substitute_values_typed(
             ParamLiteralKind::String => Ok(vec![Token::StringLiteral(value.clone())]),
             ParamLiteralKind::Integer => integer_literal_tokens(n, value),
             ParamLiteralKind::Float => float_literal_tokens(n, value),
+            ParamLiteralKind::Boolean if between_bounds.contains(&ti) => {
+                // BETWEEN の境界は文字列リテラルへ置換する（正規形 `true`／`false`）。
+                let canonical = boolean_literal_tokens(n, value)?;
+                Ok(canonical
+                    .into_iter()
+                    .map(|t| match t {
+                        Token::Ident(w) => Token::StringLiteral(w),
+                        other => other,
+                    })
+                    .collect())
+            }
             ParamLiteralKind::Boolean => boolean_literal_tokens(n, value),
         }
     })
@@ -2088,6 +2546,59 @@ mod tests {
         assert!(positions("UPDATE documents SET n = 1 RETURNING n + $1").is_err());
     }
 
+    /// Issue #1748: 行値の代入の `$n` は列リストの位置で列に対応づく（SQL-50 (3)(4)・SQL-45 (6)）。
+    #[test]
+    fn accepts_update_set_row_value_positions() {
+        for sql in [
+            "UPDATE documents SET (a, b) = ($1, $2) WHERE id = 1",
+            "UPDATE documents SET (a, b) = ROW($1, $2) WHERE id = 1",
+            "UPDATE documents SET (a) = ROW($1)",
+            "UPDATE documents SET (a, b) = ($1, upper($2)), c = $3 WHERE id = $4",
+            "UPDATE documents SET (a, b) = (DEFAULT, $1)",
+        ] {
+            assert!(positions(sql).is_ok(), "{sql}");
+        }
+    }
+
+    /// Issue #1748: 列と要素の数の不一致・形の崩れは何も登録せず `42601`（fail-closed）。
+    #[test]
+    fn rejects_malformed_update_set_row_value() {
+        for sql in [
+            "UPDATE documents SET (a, b) = ($1) WHERE id = 1",
+            "UPDATE documents SET (a, b) = ($1, $2, $3)",
+            "UPDATE documents SET (a, b) = $1",
+            "UPDATE documents SET (a, b = ($1, $2)",
+            "INSERT INTO t (id, a, b) VALUES (1, 1, 1) ON CONFLICT (id) DO UPDATE SET (a, b) = ($1, $2)",
+        ] {
+            assert_eq!(
+                positions(sql).map_err(|e| e.wire_code().to_string()),
+                Err("42601".to_string()),
+                "{sql}"
+            );
+        }
+    }
+
+    /// Issue #1748: 要素ごとにパターン 6（単独）／パターン 7（式）へ振り分け、WHERE は従来どおり。
+    #[test]
+    fn row_value_elements_infer_set_columns_and_expression_segments() {
+        let pos =
+            positions_of("UPDATE documents SET (a, b) = ($1, upper($2)), c = $3 WHERE id = $4");
+        assert_eq!(pos[0], vec![ParamPosition::SetColumn("a".to_string())]);
+        assert_eq!(pos[1], vec![ParamPosition::InExpr(0)]);
+        assert_eq!(pos[2], vec![ParamPosition::SetColumn("c".to_string())]);
+        assert_eq!(pos[3], vec![ParamPosition::WhereColumn("id".to_string())]);
+        let pos = positions_of("UPDATE documents SET (a, b) = ROW($1, $2) WHERE id = 1");
+        assert_eq!(pos[0], vec![ParamPosition::SetColumn("a".to_string())]);
+        assert_eq!(pos[1], vec![ParamPosition::SetColumn("b".to_string())]);
+    }
+
+    /// 回帰: 括弧つきの単一右辺（行値ではない）の扱いは変えない。
+    #[test]
+    fn parenthesized_scalar_set_rhs_is_unchanged() {
+        let pos = positions_of("UPDATE documents SET n = ($1) WHERE id = 1");
+        assert_eq!(pos[0], vec![ParamPosition::InExpr(0)]);
+    }
+
     #[test]
     fn set_position_infers_target_column() {
         let pos = positions_of("UPDATE documents SET lang = $1, body = $2 WHERE id = $3");
@@ -2217,9 +2728,172 @@ mod tests {
         .is_err());
     }
 
+    // Issue #2430・SQL-78: SELECT の WHERE の非等価比較・BETWEEN は受理する（パターン 9）。
     #[test]
-    fn rejects_non_equality_where_comparison_position() {
-        assert!(positions("SELECT * FROM documents WHERE id > $1 LIMIT 5").is_err());
+    fn accepts_select_where_non_equality_and_between_positions() {
+        for sql in [
+            "SELECT * FROM documents WHERE id > $1 LIMIT 5",
+            "SELECT * FROM documents WHERE n < $1 LIMIT 5",
+            "SELECT * FROM documents WHERE n <= $1 LIMIT 5",
+            "SELECT * FROM documents WHERE n >= $1 LIMIT 5",
+            "SELECT * FROM documents WHERE n <> $1 LIMIT 5",
+            "SELECT * FROM documents WHERE n != $1 LIMIT 5",
+            "SELECT * FROM documents WHERE n BETWEEN $1 AND $2 LIMIT 5",
+            "SELECT * FROM documents WHERE n NOT BETWEEN $1 AND $2 AND m > $3 LIMIT 5",
+            "SELECT * FROM documents WHERE (a > $1 OR b = $2) AND c < $3 LIMIT 5",
+            "SELECT * FROM documents WHERE NOT a > $1 LIMIT 5",
+            "SELECT * FROM documents WHERE $1 < $2 LIMIT 5",
+        ] {
+            assert!(positions(sql).is_ok(), "{sql}");
+        }
+    }
+
+    // Issue #2431・SQL-78: 述語形 UPDATE／DELETE の WHERE でも同じ位置を受理する。
+    #[test]
+    fn accepts_predicate_dml_where_non_equality_and_between_positions() {
+        for sql in [
+            "UPDATE documents SET s = 'x' WHERE n > $1",
+            "UPDATE documents SET s = 'x' WHERE n <= $1 RETURNING id",
+            "UPDATE documents SET s = $1 WHERE n >= $2 USING OPERATION_ID 'x'",
+            "UPDATE documents SET s = 'x' WHERE n <> $1 AND m != $2",
+            "UPDATE documents SET s = 'x' WHERE n NOT BETWEEN $1 AND $2",
+            "DELETE FROM documents WHERE n < $1",
+            "DELETE FROM documents WHERE n BETWEEN $1 AND $2 RETURNING n",
+            "DELETE FROM documents WHERE n > $1 USING OPERATION_ID 'x'",
+            "DELETE FROM documents WHERE $1 < $2",
+        ] {
+            assert!(positions(sql).is_ok(), "{sql}");
+        }
+    }
+
+    #[test]
+    fn rejects_non_equality_positions_outside_pattern_9() {
+        for sql in [
+            // 逆向き・左辺が `$n` の BETWEEN・片側だけの BETWEEN
+            "SELECT * FROM documents WHERE $1 < n LIMIT 5",
+            "SELECT * FROM documents WHERE $1 BETWEEN 1 AND 2 LIMIT 5",
+            "SELECT * FROM documents WHERE n BETWEEN 1 AND $1 LIMIT 5",
+            "SELECT * FROM documents WHERE n BETWEEN $1 AND 2 LIMIT 5",
+            // 式の一部・型変換
+            "SELECT * FROM documents WHERE 1 + n > $1 LIMIT 5",
+            "SELECT * FROM documents WHERE n > $1 + 1 LIMIT 5",
+            "SELECT * FROM documents WHERE n > $1::int LIMIT 5",
+            // GROUP BY／HAVING の後ろ
+            "SELECT n FROM documents GROUP BY n HAVING n > $1",
+            // 述語形 UPDATE／DELETE でも範囲外の形は拒否（Issue #2431）
+            "UPDATE documents SET n = 1 WHERE $1 < n",
+            "DELETE FROM documents WHERE $1 < n",
+            "DELETE FROM documents WHERE n BETWEEN $1 AND 2",
+            "DELETE FROM documents WHERE n > $1 + 1",
+            "UPDATE documents SET n = 1 WHERE n > $1::int",
+            "UPDATE documents SET n = 1 WHERE 1 + n > $1",
+            // INSERT ... ON CONFLICT DO UPDATE ... WHERE は対象外
+            "INSERT INTO documents (id, n) VALUES (1, 2) ON CONFLICT (id) DO UPDATE SET n = 3 WHERE documents.n > $1",
+            // 集合演算
+            "SELECT id FROM t WHERE n > $1 UNION SELECT id FROM t WHERE n < 3",
+        ] {
+            assert!(positions(sql).is_err(), "{sql}");
+        }
+    }
+
+    #[test]
+    fn set_op_real_literal_compare_is_not_skipped_by_dummy_flags() {
+        // 回帰（PR #2631 指摘）: 枝末の実リテラル Compare も数え、同じ文の `$n` 等価の
+        // `true` が実リテラルの検証省略へずれ込まないこと。
+        let tokens = crate::sql::lexer::tokenize_with_params(
+            "SELECT day FROM t WHERE day > 'not-a-date' UNION SELECT day FROM t WHERE day = $1 LIMIT 5",
+        )
+        .expect("lex");
+        let flags = where_equality_literal_is_param_typed(&tokens, &[]);
+        // 枝ごとの区画（長さ 1）を枝順に連結する。
+        assert_eq!(flags, vec![false, true]);
+    }
+
+    // 回帰（PR #2631 指摘）: 枝ごとにフラグを持ち、第 1 枝の `$n` 由来のフラグが
+    // 第 2 枝の実リテラルへ漏れず、実リテラルの検証も維持される。
+    #[test]
+    fn set_op_flags_are_per_branch_padded() {
+        let tokens = crate::sql::lexer::tokenize_with_params(
+            "SELECT day FROM t WHERE day = $1 UNION SELECT day FROM t WHERE day = '2024-01-01' LIMIT 5",
+        )
+        .expect("lex");
+        assert_eq!(
+            where_equality_literal_is_param_typed(&tokens, &[]),
+            vec![true, false]
+        );
+        let tokens = crate::sql::lexer::tokenize_with_params(
+            "SELECT day FROM t WHERE a = $1 AND b = $2 UNION SELECT day FROM t WHERE day = '2024-01-01'",
+        )
+        .expect("lex");
+        assert_eq!(
+            where_equality_literal_is_param_typed(&tokens, &[]),
+            vec![true, true, false, false]
+        );
+    }
+
+    // 回帰（PR #2631 指摘）: 列名 `between` の RETURNING は SET 領域の終端になる。
+    #[test]
+    fn update_set_region_ends_at_returning_before_between_column() {
+        for sql in [
+            "UPDATE t SET c = $1 RETURNING between",
+            "UPDATE t SET c = $1 RETURNING between WHERE x = 1",
+        ] {
+            let tokens = crate::sql::lexer::tokenize_with_params(sql).expect("lex");
+            let (_, end) = set_region(&tokens).expect("region");
+            assert!(
+                matches!(tokens.get(end), Some(Token::Ident(n)) if n.eq_ignore_ascii_case("RETURNING")),
+                "{sql}"
+            );
+        }
+    }
+
+    #[test]
+    fn infer_positions_classifies_select_where_non_equality_forms() {
+        let got = positions_of(
+            "SELECT * FROM t WHERE a > $1 AND b NOT BETWEEN $2 AND $3 AND $4 < $5 LIMIT 5",
+        );
+        assert_eq!(got[0], vec![ParamPosition::WhereColumn("a".into())]);
+        assert_eq!(got[1], vec![ParamPosition::WhereColumn("b".into())]);
+        assert_eq!(got[2], vec![ParamPosition::WhereColumn("b".into())]);
+        assert_eq!(got[3], vec![ParamPosition::WhereIndeterminate]);
+        assert_eq!(got[4], vec![ParamPosition::WhereIndeterminate]);
+    }
+
+    // Describe 用ダミーフラグの序数: 実リテラル・`$n` を問わず、`Compare`／`Between`／`<>` を
+    // トークン出現順に 1 葉 1 要素で数える（束縛側の消費と一致させる不変条件）。
+    #[test]
+    fn dummy_flags_count_compare_between_and_not_equal_in_token_order() {
+        let tokens = tokenize_with_params(
+            "SELECT * FROM t WHERE d > '2024-01-01' AND e = $1 AND f <> $2 AND g BETWEEN $3 AND $4 \
+             AND h <= $5 AND i NOT BETWEEN 'a' AND 'b' LIMIT 5",
+        )
+        .expect("tokenize");
+        assert_eq!(
+            where_equality_literal_is_param(&tokens),
+            vec![false, true, true, true, true, false]
+        );
+        // 数値種別の `$n`（式述語になる）は数えない。
+        let kinds = [
+            ParamLiteralKind::String,
+            ParamLiteralKind::Integer,
+            ParamLiteralKind::Integer,
+            ParamLiteralKind::Integer,
+            ParamLiteralKind::String,
+        ];
+        assert_eq!(
+            where_equality_literal_is_param_typed(&tokens, &kinds),
+            vec![false, true, true, false]
+        );
+    }
+
+    #[test]
+    fn dummy_flags_ignore_non_leaf_comparisons() {
+        let tokens = tokenize_with_params(
+            "SELECT * FROM t WHERE 1 + a > 'x' AND b > 'y'::text AND c > $1 + 1 LIMIT 5",
+        );
+        // `$1 + 1` は式。ここでは構文検査を通さずフラグ計算だけを確認する。
+        let tokens = tokens.expect("tokenize");
+        assert_eq!(where_equality_literal_is_param(&tokens), Vec::<bool>::new());
     }
 
     // PR #1012 Bugbot 指摘: `GROUP`/`HAVING`/`RETURNING`/`USING`/`ON` は
@@ -2318,6 +2992,53 @@ mod tests {
         .expect("tokenize_with_params should succeed");
         let (_, end) = where_region(&tokens).expect("WHERE region should exist");
         assert!(matches!(tokens.get(end), Some(Token::Ident(n)) if n == "RETURNING"));
+    }
+
+    /// 列名 `returning` の `[NOT] BETWEEN $a AND $b` は RETURNING 句境界とみなさず受理する（PR #2631）。
+    #[test]
+    fn where_region_keeps_returning_column_before_between() {
+        for sql in [
+            "SELECT id FROM t WHERE returning BETWEEN $1 AND $2 LIMIT 5",
+            "SELECT id FROM t WHERE returning NOT BETWEEN $1 AND $2 LIMIT 5",
+        ] {
+            let tokens = tokenize_with_params(sql).expect("tokenize_with_params should succeed");
+            let (_, end) = where_region(&tokens).expect("WHERE region should exist");
+            assert!(
+                matches!(
+                    tokens.get(end),
+                    Some(Token::Keyword(crate::sql::lexer::Keyword::Limit))
+                ),
+                "sql = {sql}"
+            );
+        }
+    }
+
+    /// PR #2631 指摘: WITH 本体内の `UNION` はダミーフラグの枝分割に数えない（`SetTree` の葉でない）。
+    /// 本体外の集合演算は従来どおり枝ごとに分割される。
+    #[test]
+    fn cte_body_set_operator_does_not_split_dummy_flags() {
+        let flags = |sql: &str| {
+            let tokens = tokenize_with_params(sql).expect("tokenize_with_params should succeed");
+            where_equality_literal_is_param_typed(&tokens, &[])
+        };
+        assert_eq!(
+            flags(
+                "WITH c AS (SELECT a FROM t UNION SELECT a FROM t) \
+                 SELECT a FROM c WHERE a = $1"
+            ),
+            vec![true]
+        );
+        assert_eq!(
+            flags(
+                "WITH c AS MATERIALIZED (SELECT a FROM t UNION ALL SELECT a FROM t) \
+                 SELECT a FROM c WHERE a = 'x'"
+            ),
+            vec![false]
+        );
+        assert_eq!(
+            flags("SELECT a FROM t WHERE a = $1 UNION SELECT a FROM t WHERE a = 'x'"),
+            vec![true, false]
+        );
     }
 
     #[test]

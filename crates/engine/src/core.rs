@@ -1199,6 +1199,10 @@ pub struct EngineCore {
     /// [`Self::with_ledger_mode`] のみ。`crate::recovery::required_op_id` モジュール
     /// ドキュメント参照）。
     ledger_mode: LedgerMode,
+    /// `WHERE` 省略の `UPDATE`／`DELETE` を `42601` で拒否する opt-in のサーバー側構成
+    /// （Issue #2210・SQL-36 ポインタ。既定 `false`）。クエリ・セッション変数・HTTP から
+    /// 到達できる経路を持たない（差し替えは [`Self::with_require_where_for_dml`] のみ）。
+    require_where_for_dml: bool,
     /// 一括投入（複数ファイルのバッチ投入）に対する 4 種の処理量上限（TASK-122・
     /// 対象ビヘイビア: INDEX-4）。差し替えは [`Self::with_batch_limits`] のみ。
     /// `crate::batch_limits` モジュールドキュメント参照。
@@ -2624,6 +2628,7 @@ impl EngineCore {
             query_planner: None,
             incremental_config: crate::incremental::IncrementalConfig::default(),
             ledger_mode: LedgerMode::default(),
+            require_where_for_dml: false,
             batch_limits: crate::batch_limits::BatchLimits::default(),
             transaction_limits: crate::sql::transaction::TransactionLimits::default(),
             dml_limits: crate::sql::parser::DmlLimits::default(),
@@ -2808,6 +2813,15 @@ impl EngineCore {
     /// required_op_id` モジュールドキュメント参照）。
     pub fn with_ledger_mode(mut self, mode: LedgerMode) -> Self {
         self.ledger_mode = mode;
+        self
+    }
+
+    /// `WHERE` 省略の SQL `UPDATE`／`DELETE` を変更開始前に `42601` で拒否するか（Issue #2210・
+    /// SQL-36 ポインタ。MySQL の `sql_safe_updates` 相当の opt-in）を差し替えたビルダーを返す。
+    /// [`Self::with_ledger_mode`] と同型の所有権消費ビルダーで、`wire-server` が起動時に 1 回だけ
+    /// 呼ぶ。明示した `WHERE`（`WHERE TRUE` を含む）・NoSQL 表層・`TRUNCATE` は影響を受けない。
+    pub fn with_require_where_for_dml(mut self, enabled: bool) -> Self {
+        self.require_where_for_dml = enabled;
         self
     }
 
@@ -4384,6 +4398,16 @@ impl EngineCore {
             Some(crate::sql::lexer::Token::Ident(w)) if w.eq_ignore_ascii_case("DELETE")
         );
         if is_delete {
+            // SQL-36（Issue #2210）: 構造解析 → WHERE 省略ガード → カタログ検証の順。通常 DML 経路と
+            // 同じく、ガードを表の存在確認より前に置き、不存在表と既存表で応答を分けない。
+            let shape =
+                crate::sql::allowlist::parse_delete_statement_shape_tokens(rest, self.ledger_mode)?;
+            if let DeleteStatement::Predicate(v) = &shape {
+                crate::sql::allowlist::reject_omitted_where_for_dml(
+                    self.require_where_for_dml,
+                    v.where_predicates(),
+                )?;
+            }
             let stmt = crate::sql::allowlist::validate_delete_statement_tokens(
                 rest,
                 lookup,
@@ -4397,6 +4421,14 @@ impl EngineCore {
                 }
                 _ => Err(reject()),
             };
+        }
+        // SQL-36（Issue #2210）: DELETE と同じ順序（構造解析 → WHERE 省略ガード → カタログ検証）。
+        let shape = crate::sql::allowlist::parse_update_form_shape_tokens(rest, self.ledger_mode)?;
+        if let ValidatedUpdateForm::Predicate(v) = &shape {
+            crate::sql::allowlist::reject_omitted_where_for_dml(
+                self.require_where_for_dml,
+                v.where_predicates(),
+            )?;
         }
         let stmt =
             crate::sql::allowlist::validate_update_form_tokens(rest, lookup, self.ledger_mode)
@@ -4840,6 +4872,14 @@ impl EngineCore {
             // Issue #1672。書き換えは Execute 時）。
             let stmt =
                 crate::sql::allowlist::parse_delete_statement_shape_tokens(&tokens, ledger_mode)?;
+            // SQL-36（Issue #2210）: opt-in 有効時は `WHERE` 省略を表の存在確認より前に拒否する
+            // （ビュー・PARTITIONED・一時表の分類 parse も本経路を通る）。
+            if let crate::sql::allowlist::DeleteStatement::Predicate(v) = &stmt {
+                crate::sql::allowlist::reject_omitted_where_for_dml(
+                    self.require_where_for_dml,
+                    v.where_predicates(),
+                )?;
+            }
             let table_name = match &stmt {
                 crate::sql::allowlist::DeleteStatement::SingleRow(v) => v.table_name.clone(),
                 crate::sql::allowlist::DeleteStatement::Predicate(v) => v.table_name().to_string(),
@@ -4889,6 +4929,13 @@ impl EngineCore {
         if is_update_statement {
             // 構造検証 → 存在確認の順序は `validate_update_form_tokens` と同じ（TABLE-43・Issue #1672）。
             let stmt = crate::sql::allowlist::parse_update_form_shape_tokens(&tokens, ledger_mode)?;
+            // SQL-36（Issue #2210）: DELETE と同じ位置・同じ理由で `WHERE` 省略を拒否する。
+            if let crate::sql::allowlist::ValidatedUpdateForm::Predicate(v) = &stmt {
+                crate::sql::allowlist::reject_omitted_where_for_dml(
+                    self.require_where_for_dml,
+                    v.where_predicates(),
+                )?;
+            }
             let table_name = match &stmt {
                 crate::sql::allowlist::ValidatedUpdateForm::Single(v) => v.table_name.clone(),
                 crate::sql::allowlist::ValidatedUpdateForm::Predicate(v) => {
@@ -5174,12 +5221,47 @@ impl EngineCore {
         // （FROM なし SELECT は引用情報を保持する。CTAS と共有）。
         let inner_tokens =
             crate::sql::allowlist::normalize_inner_query_tokens(shape.query_tokens.clone());
-        let query = crate::sql::allowlist::validate_sql_tokens_with_subquery_ctx_limits(
-            &inner_tokens,
-            storage_lookup,
-            0,
-            self.nesting_limits,
-        )?;
+        // 内側 SELECT の `LIMIT` 省略（Issue #2615）。まず送られた形のまま検証し、受理されればそのまま使う
+        // （集計・定数 SELECT など `LIMIT` 不要の形。行数上限は実行側の `rows.len() > cap` 判定が担う）。
+        // 拒否され、かつ括弧深さ 0 に `LIMIT` が無いときだけ、末尾へ `LIMIT 行数上限+1` を付けて再検証する。
+        // `cap` ちょうどで切ると黙って切り詰める fail-open になるため、必ず `+1` で超過（`54000`）を検出する。
+        // 再検証も拒否なら元の拒否理由を返す（`OFFSET` のみ・`USING MODE` 等は従来の `42601` のまま）。
+        let validate_inner = |tokens: &[crate::sql::lexer::Token]| {
+            crate::sql::allowlist::validate_sql_tokens_with_subquery_ctx_limits(
+                tokens,
+                storage_lookup,
+                0,
+                self.nesting_limits,
+            )
+        };
+        let mut implicit_limit: Option<u32> = None;
+        let query = match validate_inner(&inner_tokens) {
+            Ok(q) => q,
+            Err(first_err) => {
+                if crate::sql::allowlist::has_top_level_limit(&inner_tokens) {
+                    return Err(first_err);
+                }
+                let fetch = self
+                    .insert_select_row_cap()
+                    .checked_add(1)
+                    .and_then(|n| u32::try_from(n).ok())
+                    .ok_or_else(|| SqlSurfaceError::Internal {
+                        detail: "internal error".to_string(),
+                    })?;
+                let mut limited = inner_tokens.clone();
+                limited.push(crate::sql::lexer::Token::Keyword(
+                    crate::sql::lexer::Keyword::Limit,
+                ));
+                limited.push(crate::sql::lexer::Token::Number(fetch.to_string()));
+                match validate_inner(&limited) {
+                    Ok(q) => {
+                        implicit_limit = Some(fetch);
+                        q
+                    }
+                    Err(_) => return Err(first_err),
+                }
+            }
+        };
         crate::sql::allowlist::require_row_query_statement(&query, "INSERT ... SELECT")?;
         // 台帳の内容照合ハッシュは送られた文のトークン列（`USING OPERATION_ID` 句・末尾 `;` を除く）から
         // 算出する（Issue #1734）。未束縛の `$n` が残る形は上流で拒否済みだが、残っていればここでも
@@ -5190,9 +5272,12 @@ impl EngineCore {
         .map_err(|_| SqlSurfaceError::Internal {
             detail: "internal error".to_string(),
         })?;
-        Ok(ParsedSql::InsertSelect(
-            crate::sql::allowlist::ValidatedInsertSelect::new(shape, query, statement_hash),
-        ))
+        let mut validated =
+            crate::sql::allowlist::ValidatedInsertSelect::new(shape, query, statement_hash);
+        if let Some(fetch) = implicit_limit {
+            validated = validated.with_implicit_limit(fetch);
+        }
+        Ok(ParsedSql::InsertSelect(validated))
     }
 
     /// `INSERT ... SELECT` の束縛（SQL-51・Issue #1732）。挿入先スキーマと内側 SELECT の結果列メタ
@@ -5207,6 +5292,13 @@ impl EngineCore {
         crate::sql::insert_select::BoundInsertSelectTarget,
         crate::sql::allowlist::SqlSurfaceError,
     > {
+        // `LIMIT` を暗黙付与した文（Issue #2615）は、付与値（行数上限 + 1）が Describe の `LIMIT` 範囲検査で
+        // `22000` にならないよう、その値を上限とする。明示 `LIMIT` の文は従来の `limits` のまま。
+        let implicit_limits = stmt
+            .implicit_limit
+            .and_then(|n| usize::try_from(n).ok())
+            .map(crate::result_limits::ResultLimits::new);
+        let limits = implicit_limits.as_ref().unwrap_or(limits);
         let source = self
             .describe_parsed_in_session_impl(
                 session,
@@ -5554,6 +5646,9 @@ impl EngineCore {
     /// 前に行うため）。型が決められない `$n`（全出現が推論不能）は
     /// [`crate::sql::allowlist::SqlSurfaceError::IndeterminateDatatype`]（`42P18`）。
     /// 判定は構文の形だけで決まり、表・列の存在には依存しない（存在オラクルを作らない）。
+    ///
+    /// Issue #2430・#2431・SQL-78: `SELECT`／`UPDATE`／`DELETE` の `WHERE` の非等価比較・`BETWEEN` の `$n` は比較相手の列の型
+    /// （引けなければ `Text`）。`$n op $m`（両辺とも `$n`）は推論不能の出現として扱う。
     fn infer_param_types(
         &self,
         tokens: &[crate::sql::lexer::Token],
@@ -5673,6 +5768,8 @@ impl EngineCore {
         {
             let mut resolved: Vec<PreparedParamType> = Vec::new();
             let param_no = u16::try_from(idx.saturating_add(1)).unwrap_or(u16::MAX);
+            // Issue #2430・#2431・SQL-78: `SELECT`／`UPDATE`／`DELETE` の `WHERE` の `$n op $m` の出現（型を決められない）。
+            let mut where_indeterminate = false;
             for pos in &positions {
                 // 列が引けた位置だけ変換可否判定の対象にする（引けない位置は従来どおり
                 // `Text` へ倒し、判定せず後段の既存エラーに委ねる）。
@@ -5719,6 +5816,12 @@ impl EngineCore {
                         }
                         // 式内の出現は下で `expr_results` から合流させる。
                         ParamPosition::InExpr(_) => continue,
+                        // 推論不能の出現は `resolved` に積まない。同じ番号の別の出現で型が決まれば
+                        // それを使い、全出現が推論不能なら宣言型、それも無ければ `42P18`。
+                        ParamPosition::WhereIndeterminate => {
+                            where_indeterminate = true;
+                            continue;
+                        }
                     };
                 if let (Some(t), Some(kind)) = (&resolved_ty, kind) {
                     if let Some(ctx) = context_kind(t) {
@@ -5766,7 +5869,7 @@ impl EngineCore {
                     continue;
                 }
             }
-            if resolved.is_empty() && expr_indeterminate {
+            if resolved.is_empty() && (expr_indeterminate || where_indeterminate) {
                 let param = u16::try_from(idx.saturating_add(1)).unwrap_or(u16::MAX);
                 return Err(SqlSurfaceError::IndeterminateDatatype { param });
             }

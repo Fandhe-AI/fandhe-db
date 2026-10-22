@@ -83,6 +83,7 @@ cargo run -p fandhe-db-wire-server -- --users <ユーザーストアのパス> -
   [--hnsw-scope all|declared] \
   [--durability immediate|none] \
   [--require-operation-id] \
+  [--require-where-for-dml] \
   [--max-dml-affected-rows <1-1000000>] [--max-insert-rows <1-1000000>] \
   [--batch-max-files <1-1000000>] \
   [--max-table-columns <1-256>] [--max-array-elements <1-1024>] [--max-enum-labels <1-256>] \
@@ -275,6 +276,14 @@ fsync 相当の同期を伴う）のまま不変です。不正な値・値欠�
 （`operation_id` の欠落・`null`・空文字を既定で受理し、成功応答は `operation_id` キーを含みません。
 Issue #2203）。分割実行 DML（`PARTITIONED`）は既定でも省略を
 `23502` で拒否します（Issue #1704）。
+
+`--require-where-for-dml`（Issue #2210）は値を取らないスイッチで、指定すると `WHERE` 句を書いていない
+SQL の `UPDATE`／`DELETE` を、変更開始前に `42601` で拒否します（全行更新・全行削除への安全弁。
+MySQL の `sql_safe_updates` 相当）。明示した述語（`WHERE TRUE` を含む）は拒否しません。未指定（既定）では
+PostgreSQL と同じく `WHERE` 省略を受理します。プロセス起動時にのみ指定でき、セッション・SQL からは変更できません。
+重複指定・`=` 連結形・後続の値は fail-closed で起動エラーとなり、指定時に限り起動ログへ英語の 1 行を出します。
+NoSQL（HTTP）の `update`／`delete` は従来どおり filter 必須で、本スイッチの影響を受けません
+（`docs/design/require-where-for-dml-cli.md`）。
 
 `--max-dml-affected-rows`・`--max-insert-rows`（Issue #997。オーナー判断の
 改訂・2026-09-27）は、それぞれ述語形 `UPDATE`／`DELETE`（`WHERE` 句付き）の

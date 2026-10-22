@@ -1864,6 +1864,28 @@ type BoundWherePredicates = (
 /// でも `dummy_equality_flags` の序数がトークン出現順（`sql::params::
 /// where_equality_literal_is_param` と同じ数え方）のまま一致し続ける
 /// （構文段の不変条件により `Not` の内側は常に深さ 1）。
+fn take_dummy_flag(equality_ordinal: &mut usize, dummy_equality_flags: &[bool]) -> bool {
+    let skip = dummy_equality_flags
+        .get(*equality_ordinal)
+        .copied()
+        .unwrap_or(false);
+    *equality_ordinal += 1;
+    skip
+}
+
+/// `Compare`／`Between`（および `Not` で包まれたそれ）か。`sql::params` の Describe 用
+/// ダミーフラグが 1 葉 1 要素で数える葉で、束縛のどの経路で処理しても序数を 1 つ進める
+/// 不変条件（Issue #2430）の対象。
+fn is_flagged_range_leaf(predicate: &WherePredicate) -> bool {
+    match predicate {
+        WherePredicate::Not(inner) => is_flagged_range_leaf(inner),
+        other => matches!(
+            other,
+            WherePredicate::Compare { .. } | WherePredicate::Between { .. }
+        ),
+    }
+}
+
 fn declarative_leaf_to_filter(
     predicate: &WherePredicate,
     schema: &TableSchema,
@@ -1917,12 +1939,13 @@ fn declarative_leaf_to_filter(
         }
         WherePredicate::Compare { column, op, value } => {
             // `< > <= >=`（TABLE-13・TASK-199、Issue #891・レーン B）。
-            // `$n` はこの述語形の右辺に束縛できない（`sql::params` の
-            // パターン 4 は `Ident '=' $n` のみ）ため、常に「実値」として
-            // 扱う（Describe 専用のダミー値スキップは対象外）。
+            // Issue #2430: SELECT の `WHERE` では右辺に `$n` を置けるため、`Equality` と同じく
+            // `dummy_equality_flags` の序数を 1 つ進め、ダミー値の位置に限り Describe の
+            // 型付きリテラル検証を省略する（`sql::params::noneq_leaf_at` と数え方を揃える）。
+            let skip = take_dummy_flag(equality_ordinal, dummy_equality_flags);
             Ok((
                 DeclarativeFilter::compare(column.clone(), (*op).into(), value.clone()),
-                false,
+                skip,
             ))
         }
         WherePredicate::Prefix { column, pattern } => {
@@ -1960,11 +1983,15 @@ fn declarative_leaf_to_filter(
             DeclarativeFilter::in_list(column.clone(), values.clone()),
             false,
         )),
-        // `<col> [NOT] BETWEEN '<low>' AND '<high>'`（SQL-24）。
-        WherePredicate::Between { column, low, high } => Ok((
-            DeclarativeFilter::between(column.clone(), low.clone(), high.clone()),
-            false,
-        )),
+        // `<col> [NOT] BETWEEN '<low>' AND '<high>'`（SQL-24）。Issue #2430: 両境界が `$n` の
+        // 形は 1 葉につき序数を 1 つ進める（`Compare` と同じ。片側だけの `$n` は構文前に拒否済み）。
+        WherePredicate::Between { column, low, high } => {
+            let skip = take_dummy_flag(equality_ordinal, dummy_equality_flags);
+            Ok((
+                DeclarativeFilter::between(column.clone(), low.clone(), high.clone()),
+                skip,
+            ))
+        }
         // `<col> IS [NOT] NULL`（SQL-24）。
         WherePredicate::IsNull { column, negated } => Ok((
             if *negated {
@@ -2187,7 +2214,16 @@ fn numeric_column_string_leaf_as_predicates(
                 CompareOp::Gt => BinOp::Gt,
                 CompareOp::Ge => BinOp::Ge,
             };
-            vec![cmp(bin, value)]
+            // Issue #2430: ダミー値（`$n` 由来）は解釈できないので `0` を仮置きする。
+            if take_dummy_flag(equality_ordinal, dummy_equality_flags) {
+                vec![WherePredicate::Expression(Expr::Binary {
+                    op: bin,
+                    lhs: Box::new(Expr::Ident(column.clone())),
+                    rhs: Box::new(Expr::Number("0".to_string())),
+                })]
+            } else {
+                vec![cmp(bin, value)]
+            }
         }
         WherePredicate::InList { values, .. } => match values.as_slice() {
             [] => return Ok(None),
@@ -2197,7 +2233,18 @@ fn numeric_column_string_leaf_as_predicates(
             )],
         },
         WherePredicate::Between { low, high, .. } => {
-            vec![cmp(BinOp::Ge, low), cmp(BinOp::Le, high)]
+            if take_dummy_flag(equality_ordinal, dummy_equality_flags) {
+                let zero = |op: BinOp| {
+                    WherePredicate::Expression(Expr::Binary {
+                        op,
+                        lhs: Box::new(Expr::Ident(column.clone())),
+                        rhs: Box::new(Expr::Number("0".to_string())),
+                    })
+                };
+                vec![zero(BinOp::Ge), zero(BinOp::Le)]
+            } else {
+                vec![cmp(BinOp::Ge, low), cmp(BinOp::Le, high)]
+            }
         }
         _ => return Ok(None),
     };
@@ -2500,6 +2547,11 @@ fn bind_where_predicates_recursive(
         } else {
             None
         };
+        // Issue #2430: 書き換えは `Compare`／`Between` を序数を持たない葉へ差し替えるため、
+        // ここで 1 つ進めて `sql::params` のダミーフラグの序数を保つ。
+        if boolean_rewritten.is_some() && is_flagged_range_leaf(predicate) {
+            *equality_ordinal += 1;
+        }
         let predicate = boolean_rewritten.as_ref().unwrap_or(predicate);
         // Issue #1183・SQL-24・SQL-26・TABLE-13 ポインタ: TEXT 列の範囲比較
         // （`<col> < 'lit'`、およびその `NOT`）は宣言的経路（レーン B）に TEXT の
@@ -2516,6 +2568,8 @@ fn bind_where_predicates_recursive(
         {
             let (bound, _ty) = crate::sql::udf_call::bind_expr(&expr, schema, udfs, node_budget)?;
             expr_filters.push(bound);
+            // Issue #2430: 序数を持つ葉（`Compare`）を式へ差し替えたので 1 つ進める。
+            *equality_ordinal += 1;
             continue;
         }
         // Issue #1408・SQL-24: 数値列 × 文字列リテラルの宣言的な葉は式レーンへ書き換える
@@ -3040,9 +3094,8 @@ impl BoundPredicateDelete {
 /// 呼び出し元から受け取り、変更開始前・副作用ゼロの時点で判定するため、本関数は
 /// 上限値を運搬しない。
 ///
-/// `WHERE visible()` のみ（`metadata_filters`・`expr_filters`・`or_filters` が
-/// すべて空）は実質的な全行削除のため `42601` で拒否する（UPDATE と同契約。
-/// Issue #1181・SQL-19。全行削除は `TRUNCATE TABLE` の管轄）。
+/// `WHERE visible()` 単独・恒真形（フィルタがすべて空）も受理する（SQL-36・SQL-41、
+/// Issue #1744。UPDATE と同契約。対象は自テナントの可視行で、上限は実行段が判定する）。
 pub fn bind_predicate_delete(
     stmt: &ValidatedPredicateDelete,
     schema: &TableSchema,
@@ -3053,27 +3106,11 @@ pub fn bind_predicate_delete(
     let (metadata_filters, expr_filters, _rls_predicate_present, or_filters) =
         bind_where_predicates(stmt.where_predicates(), schema, udfs, &mut node_budget, &[])?;
 
-    // Issue #1181・SQL-19: `WHERE visible()` のみ（全フィルタが空）は自テナント
-    // 全行削除と等価なため、UPDATE（`bind_update_form`）と同じ基準・同じ
-    // `42601` で拒否する。台帳照合・書き込みトランザクション開始より前の束縛段
-    // なので副作用ゼロ。`or_filters` を含めるのは `WHERE a OR b` を誤拒否しない
-    // ため（Issue #912）。
-    // Issue #1526・SQL-41: `TRUE` 畳み込みで恒真になる形（`WHERE TRUE`・
-    // `... OR TRUE` 等）も無条件 DML と同じく拒否する（fail-closed。`FALSE` は恒偽で
-    // 0 行影響のため受理する）。
-    // SQL-36（Issue #1743）: `WHERE` 省略（述語列が空）だけはこの拒否から外す。
-    // 述語があって束縛後に空・恒真になる形は #1744 まで従来どおり拒否する。
-    if !stmt.where_predicates().is_empty()
-        && metadata_filters.is_empty()
-        && expr_filters.is_empty()
-        && or_filters
-            .iter()
-            .all(crate::sql::where_tree::BoundOrGroup::is_trivially_true)
-    {
-        return Err(SqlSurfaceError::unsupported(
-            "predicate-form DELETE WHERE clause must contain at least one non-visible() predicate (unconditional DELETE is not supported; use TRUNCATE for whole-table operations)",
-        ));
-    }
+    // SQL-36・SQL-41（Issue #1744）: `WHERE visible()` 単独・`TRUE` 畳み込みで恒真に
+    // なる形（`WHERE TRUE`・`... OR TRUE` 等）も述語形 DML として受理する（フィルタ
+    // 全空は WHERE 省略〔#1743〕と同じ「自テナント可視行の全件」）。RLS は述語と
+    // 独立に暗黙適用されるためテナント境界は広がらない。歯止めは実行段の影響行数
+    // 上限（`check_dml_affected_rows_with_limit`・`54000`・副作用ゼロ）に任せる。
 
     let expr_filter_programs = compile_expr_filter_programs(&expr_filters);
 
@@ -4043,9 +4080,21 @@ fn bind_set_assignments(
             .columns
             .get(col_idx)
             .ok_or_else(|| SqlSurfaceError::undefined_column(name))?;
+        // `SET col = DEFAULT`（SQL-50・Issue #1746）。GENERATED ALWAYS の判定より前に解決し、
+        // IDENTITY／SEQUENCE／時刻関数の DEFAULT は `bind_set_default` が `0A000` で拒否する。
+        if matches!(set_value, crate::sql::allowlist::SetValue::Default) {
+            bound_exprs.push((
+                col_idx,
+                crate::sql::set_expr::bind_set_default(name, column)?,
+            ));
+            continue;
+        }
         reject_generated_always_value(column)?;
         let literal = match set_value {
             crate::sql::allowlist::SetValue::Literal(literal) => literal,
+            crate::sql::allowlist::SetValue::Default => {
+                return Err(reject_default_keyword_literal());
+            }
             crate::sql::allowlist::SetValue::Expr(expr) => {
                 bound_exprs.push((
                     col_idx,
@@ -4759,11 +4808,8 @@ pub enum BoundUpdateForm {
 /// （`SELECT`・集計 `SELECT`・広域取得 `SELECT` と同一の意味論。`VECTOR` 列への
 /// 等価／前方一致は `declarative_filter` が `22000`、述語件数は既存の
 /// `MAX_METADATA_FILTERS`〔54000〕、式ノードは `MAX_EXPR_NODES` が頭打ちにする）
-/// で束縛する。両フィルタが空（`WHERE` 省略に構造上相当する `visible()` 単独の
-/// 恒等述語）の場合は実質的な全行更新になるため [`SqlSurfaceError::unsupported`]
-/// （`42601`）で拒否する（`WHERE` 自体の省略は許可リスト層〔`sql::allowlist`〕が
-/// 構造的に拒否済み。ここでの判定は `visible()` のみという実質的な無条件更新
-/// への fail-closed な追加防御）。
+/// で束縛する。フィルタが全空（`visible()` 単独・恒真形）でも受理する（SQL-36・
+/// SQL-41、Issue #1744。RLS は暗黙適用、影響行数上限は実行段が判定する）。
 pub fn bind_update_form(
     stmt: &crate::sql::allowlist::ValidatedUpdateForm,
     schema: &TableSchema,
@@ -4804,27 +4850,9 @@ pub(crate) fn bind_predicate_update(
             &[],
         )?;
 
-    // TASK-208・Issue #912: `or_filters` を含めないと `WHERE a OR b`
-    // だけの述語（`metadata_filters`／`expr_filters` は両方空）が
-    // 「無条件 UPDATE」と誤判定され、正当な OR 述語つき UPDATE が
-    // 拒否される（fail-closed の過剰側ではあるが正当な入力を壊す
-    // 回帰になるため、判定漏れとして修正する）。
-    // Issue #1526・SQL-41: `TRUE` 畳み込みで恒真になる形（`WHERE TRUE`・
-    // `... OR TRUE` 等）も無条件 DML と同じく拒否する（fail-closed。`FALSE` は恒偽で
-    // 0 行影響のため受理する）。
-    // SQL-36（Issue #1743）: `WHERE` 省略（述語列が空）だけはこの拒否から外す。
-    // 述語があって束縛後に空・恒真になる形は #1744 まで従来どおり拒否する。
-    if !predicate.where_predicates.is_empty()
-        && metadata_filters.is_empty()
-        && expr_filters.is_empty()
-        && or_filters
-            .iter()
-            .all(crate::sql::where_tree::BoundOrGroup::is_trivially_true)
-    {
-        return Err(SqlSurfaceError::unsupported(
-            "predicate-form UPDATE WHERE clause must contain at least one non-visible() predicate (unconditional UPDATE is not supported; use TRUNCATE for whole-table operations)",
-        ));
-    }
+    // SQL-36・SQL-41（Issue #1744）: フィルタ全空（`visible()` 単独・恒真形）も
+    // 受理する。理由と歯止めは [`bind_predicate_delete`] と同じ（RLS は暗黙適用・
+    // 上限は実行段の `check_dml_affected_rows_with_limit`）。
 
     Ok(BoundPredicateUpdate::new(
         predicate.table_name.clone(),
@@ -10187,21 +10215,38 @@ mod tests {
     }
 
     #[test]
-    fn bind_predicate_delete_rejects_visible_only_where() {
-        let err = bind_predicate_delete_sql(
+    fn bind_predicate_delete_accepts_visible_only_where() {
+        let bound = bind_predicate_delete_sql(
             "DELETE FROM documents WHERE visible() USING OPERATION_ID 'op-0001'",
         )
-        .unwrap_err();
-        assert_eq!(err.wire_code(), "42601");
+        .expect("visible()-only is accepted (SQL-36, Issue #1744)");
+        assert!(bound.metadata_filters.is_empty());
+        assert!(bound.expr_filters.is_empty());
+        assert!(bound.or_filters.is_empty());
+    }
+
+    /// SQL-36・SQL-41（Issue #1744）: 恒真形は束縛に成功し、フィルタは空または恒真群になる。
+    #[test]
+    fn bind_predicate_delete_accepts_where_true_forms() {
+        for w in [
+            "TRUE",
+            "TRUE AND TRUE",
+            "(TRUE OR FALSE)",
+            "lang = 'ja' OR TRUE",
+        ] {
+            let sql = format!("DELETE FROM documents WHERE {w} USING OPERATION_ID 'op-0001'");
+            bind_predicate_delete_sql(&sql).unwrap_or_else(|e| panic!("{w}: {e:?}"));
+        }
     }
 
     #[test]
-    fn bind_predicate_delete_rejects_visible_twice() {
-        let err = bind_predicate_delete_sql(
+    fn bind_predicate_delete_accepts_visible_twice() {
+        let bound = bind_predicate_delete_sql(
             "DELETE FROM documents WHERE visible() AND visible() USING OPERATION_ID 'op-0001'",
         )
-        .unwrap_err();
-        assert_eq!(err.wire_code(), "42601");
+        .expect("visible() AND visible() is accepted (SQL-36, Issue #1744)");
+        assert!(bound.metadata_filters.is_empty());
+        assert!(bound.expr_filters.is_empty());
     }
 
     #[test]
@@ -10603,7 +10648,7 @@ mod tests {
     }
 
     #[test]
-    fn bind_update_form_predicate_arm_rejects_visible_only_where() {
+    fn bind_update_form_predicate_arm_accepts_visible_only_where() {
         let lookup = FakeCatalog {
             tables: ["documents"].into_iter().collect(),
         };
@@ -10613,13 +10658,13 @@ mod tests {
             crate::recovery::required_op_id::LedgerMode::Ledgered,
         )
         .expect("must pass allowlist");
-        let err = bind_update_form(
+        let bound = bind_update_form(
             &stmt,
             &docs_schema(),
             &crate::sql::udf_call::UdfRegistry::default(),
         )
-        .unwrap_err();
-        assert_eq!(err.wire_code(), "42601");
+        .expect("visible()-only is accepted (SQL-36, Issue #1744)");
+        assert!(matches!(bound, BoundUpdateForm::Predicate(_)));
     }
 
     #[test]

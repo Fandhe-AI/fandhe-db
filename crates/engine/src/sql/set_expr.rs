@@ -47,6 +47,11 @@ pub struct BoundSetExpr {
     pub(crate) nullable: bool,
     /// 代入先の列名（`23502` のエラー文言用）。
     pub(crate) column_name: String,
+    /// `SET col = DEFAULT`（SQL-50・Issue #1746）の束縛結果。`Some` のとき本項は式ではなく
+    /// 束縛時に解決済みの既定値（未定義なら NULL）で、評価は行を読まずこの値を返す。
+    /// 式項の搬送路（束縛時スキーマとの `expected_schema` 照合・分割実行・内容照合ハッシュの
+    /// 構文形印）を共有するために同じ型で運ぶ。`source` は使われない占位。
+    pub(crate) default_value: Option<Value>,
 }
 
 impl BoundSetExpr {
@@ -54,6 +59,48 @@ impl BoundSetExpr {
     pub(crate) fn source(&self) -> &Expr {
         &self.source
     }
+
+    /// `id` 指定形 UPDATE の内容照合ハッシュ用の値側（`tenant` が呼ぶ）。`DEFAULT` 項は
+    /// 解決値ではなく構文形の印（`Default`）を返す（TABLE-39 (6)・RECOVER-10 のポインタ:
+    /// 内容照合は送られた文で行い、列 DEFAULT の変更後の再送でも同一ハッシュにする）。
+    pub(crate) fn hash_item(&self) -> crate::recovery::content_hash::UpdateColumnHashItem<'_> {
+        if self.default_value.is_some() {
+            crate::recovery::content_hash::UpdateColumnHashItem::Default
+        } else {
+            crate::recovery::content_hash::UpdateColumnHashItem::Expr(&self.source)
+        }
+    }
+}
+
+/// `SET col = DEFAULT`（SQL-50・Issue #1746）を列 `column` への代入として束縛する。スキーマ
+/// （列定義）だけを参照し行には触れない。列 DEFAULT があればその定数値、無ければ NULL
+/// （`SET col = NULL` と同じ規則: NOT NULL 列は `23502`、VECTOR 列は `22000`）。
+/// 時刻関数・SEQUENCE・IDENTITY の DEFAULT は評価文脈が無いため `bind_column_default` の
+/// `0A000` をそのまま返す（fail-closed。GENERATED ALWAYS 列もこの拒否になる）。
+pub(crate) fn bind_set_default(
+    name: &str,
+    column: &ColumnDef,
+) -> Result<BoundSetExpr, SqlSurfaceError> {
+    let value = match &column.default_expr {
+        Some(default) => crate::sql::parser::bind_column_default(column, default)?,
+        None => match &column.ty {
+            ColumnType::Vector(_) => {
+                return Err(SqlSurfaceError::invalid_input(format!(
+                    "column {name:?} is a VECTOR column and cannot be set to NULL"
+                )))
+            }
+            _ if column.nullable => Value::Null,
+            _ => return Err(SqlSurfaceError::not_null_violation(name)),
+        },
+    };
+    Ok(BoundSetExpr {
+        source: Expr::Ident("DEFAULT".to_string()),
+        bound: BoundExpr::Number(0.0),
+        target_ty: column.ty.clone(),
+        nullable: column.nullable,
+        column_name: name.to_string(),
+        default_value: Some(value),
+    })
 }
 
 /// `expr` を対象列 `column` への代入として束縛する。スキーマだけを参照し、行には触れない。
@@ -151,6 +198,7 @@ pub(crate) fn bind_set_expr(
         target_ty: column.ty.clone(),
         nullable: column.nullable,
         column_name: name.to_string(),
+        default_value: None,
     })
 }
 
@@ -185,6 +233,9 @@ pub(crate) fn eval_set_expr_to_value<'a>(
     embedding: &'a [f32],
     row_scalars: &'a [Option<ScalarRef<'a>>],
 ) -> Result<Value, SqlSurfaceError> {
+    if let Some(value) = &set.default_value {
+        return Ok(value.clone());
+    }
     let evaluated = eval_with_scalars(&set.bound, id, embedding, row_scalars)?;
     expr_value_to_column_value(&set.target_ty, set.nullable, &set.column_name, evaluated)
 }

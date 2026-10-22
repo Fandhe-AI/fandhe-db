@@ -152,7 +152,10 @@ node pg（`values` 付き `query`）・psql `\bind`・JDBC 等、パラメータ
    節で、括弧深さ 0 の `(SET|,) <列> = $n (,|節末)` の形＝右辺全体が `$n` 単独の
    位置のみ。`a = a + $1`・`upper($1)` 等の式の内側はパターン 7。`$n` の型は対象列の型
    〔`WhereColumn` と同じ列型解決〕。Issue #1544・SQL-45 のポインタ。位置判定と
-   型推論は `sql::params::set_param_slots` の 1 パスの表を共有する）
+   型推論は `sql::params::set_param_slots` の 1 パスの表を共有する。行値の代入
+   `SET (<列>, ...) = (<要素>, ...)`／`= ROW(...)` も Issue #1748 で同じ規則に対応し、
+   列リストの位置で要素に列を割り当てる〔要素単独の `$n` はここ、式の内側はパターン 7。
+   列と要素の数が違う・形が崩れた場合は登録せず `42601`。parser 側の受理は #2629〕）
 7. 式の内側の `$n`（Issue #1546・SQL-45 期待欄 (6)・WIRE-12 のポインタ）。パターン 5 の
    VALUES 要素・パターン 6 の SET 右辺のうち `$n` 単独ではないもの（`n = n + $1`・
    `s = upper($1)`・`VALUES (1 + $1)`・`CASE WHEN m = $1 THEN ... END`）。SET 右辺は
@@ -166,9 +169,32 @@ node pg（`values` 付き `query`）・psql `\bind`・JDBC 等、パラメータ
    `USING OPERATION_ID|PLAN`）。`$n` の型は INSERT 対象表の代入先列の型（列リスト省略形は
    表の宣言順の列）。詳細は下記「ON CONFLICT 加算式の `$n`（パターン 8）」
 
+9. `SELECT ... WHERE <列> (< | > | <= | >= | <>) $n`・`WHERE <列> [NOT] BETWEEN $a AND $b`
+   （Issue #2430・#2431・SQL-78・SQL-24・WIRE-12 のポインタ）。先頭語が `SELECT`／`UPDATE`／`DELETE`
+   で集合演算を持たない文〔`INSERT ... ON CONFLICT DO UPDATE ... WHERE` は対象外〕の
+   `WHERE` 節内に限る（述語形 `UPDATE`／`DELETE` は Issue #2431。Describe は `WHERE` を束縛しないため
+   ダミーフラグは関係せず、台帳の内容照合〔RECOVER-11〕は `$n` に値を代入した後の文で行うため、
+   同じ値のリテラル形と同じハッシュになる）。`$n` の型は比較相手の列の型（疑似列 `id` は `id` の型）で、表・列を引けなければ
+   `text`（存在を応答コードで観測させない）。`$n op $m`（両辺とも `$n`）は型を決められず、同じ番号の
+   別の出現で決まればその型、無ければ宣言型、それも無ければ Parse で `42P18`（構文エラー `42601` が先）。
+   判定は `sql::params::noneq_leaf_at` の 1 関数に集約し、受理・型の分類・Describe 用ダミーフラグの
+   3 箇所が共有する（`1 + col > $1`・`col > $1 + 1`・`col > $1::int` を葉と取り違えないため、葉の前後の
+   境界も検査する）。置換後のトークン列は既存の構造葉（`Compare`・`Between`・`Not(Equality)`）または
+   数値の式述語になり、第 2 の実行器・パーサーを作らない。
+   - **範囲外（`42601` のまま）**: 逆向き `$n op <列>`（置換後が式述語へ回り、Describe のダミー値を
+     省略する仕組みを通らない）、片側だけが `$n` の `BETWEEN`（1 葉 1 フラグのため実リテラル側の
+     Describe 検証が省略される）、左辺が `$n` の `BETWEEN`、相手がリテラル・関数・式の比較、
+     集合演算（枝ごとにフラグの序数が 0 から始まる既存の制約）、
+     `LIKE`・`IN` リスト
+   - **序数の不変条件**: トークン走査で宣言的な葉（`Ident op (文字列リテラル|String 種別の $n)` の
+     `Equality`／`Not(Equality)`／`Compare`、文字列の `Between`）を 1 つ見つけるごとにフラグを 1 つ積み、
+     束縛側（`sql::parser::bind_where_predicates_recursive`）はその葉をどの経路（宣言的・数値列の
+     書き換え・TEXT 範囲の式化・BOOLEAN の書き換え）で処理しても序数を 1 つ進める。
+     数値・真偽値種別の `$n` は式述語になるため数えない
+
 `LIMIT $n`・`USING MODE $n`・`HINT ORDER($n, ...)`・`SET search_mode = $n`・
 `ON CONFLICT ... DO UPDATE SET a = $n`（`$n` 単独の右辺。加算形はパターン 8）・hybrid 関数
-引数（`HYBRID_RRF(col, $n, ...)`）・非等価比較（`id > $n` 等）はいずれも
+引数（`HYBRID_RRF(col, $n, ...)`）・パターン 9 以外の非等価比較（`id > $n` 等）はいずれも
 `sql::params::validate_param_positions` の位置判定に含めておらず、構造的に
 `42601` へ落ちる（`sql::params` の単体テスト・`crates/engine/tests/
 prepared_params.rs` で固定）。
@@ -398,6 +424,15 @@ Bind 値 `None`（SQL NULL）は、`sql::params` が裸の `Token::Ident("NULL")
 - wire 層の第 1 パスは、binary 非対応スロットに binary format が指定された場合、値が NULL でも
   `0A000` を先に返す（既存の fail-closed）。PostgreSQL では NULL に format は無関係なため
   差分になりうる。#2440 で現行の fail-closed を層 A に固定した（仕様準拠としての固定ではない）。
+- パターン 9（非等価・BETWEEN・述語形 DML）の NULL も同じ経路で、リテラル形と同値
+  （Issue #2432・TASK-336・SQL-78・WIRE-12 ポインタ。プロダクションコードの変更なし）。
+  engine 側は `bind_prepared_null_matches_literal_null_in_noneq_between`、wire 側は
+  `crates/wire-server/tests/wire_sql78_noneq_between_param.rs` で固定する。同ファイルは
+  `ParameterDescription` の公告（列型の OID。wire 層テストの `LegacyId` 行識別フィクスチャ表では
+  リテラル形でも `22000` になる BOOLEAN の比較と TEXT の BETWEEN は、`$n` 形も Parse で
+  `22000`（リテラル形と一致。SQL の CREATE TABLE で作った表では受理・描述される。engine 側
+  `sql78_where_noneq_between_params.rs` が固定）、存在しない列・表は `42703`／`42P01`、`$n op $m` は
+  宣言なしで `42P18`、宣言 OID は echo）も現行挙動として固定する。
 
 ## 検証
 
@@ -420,6 +455,18 @@ Bind 値 `None`（SQL NULL）は、`sql::params` が裸の `Token::Ident("NULL")
     行が混入しない）・Describe の同値性・Parse／Describe の副作用ゼロ・
     簡易クエリでの `$n` 拒否（既存契約）を固定。
 
+## UPDATE／DELETE の `$n`（Issue #1748。SQL-50 (4)・SQL-45 (6)・WIRE-12 のポインタ）
+
+- `UPDATE`／`DELETE` の `WHERE <列> = $n` は SELECT と同じ規則（パターン 4）で、表は
+  `UPDATE <表>`／`DELETE FROM <表>` から引く。`SET` の右辺はパターン 6・7（行値の代入を含む）。
+- 修飾付きの列・`IN`・`$1 = 列`・`LIKE`・`$n::型` は SELECT の WHERE と同じく `42601`。
+  非等価の比較と `[NOT] BETWEEN` は #2429（SQL-78）の担当で、本 Issue では `42601` のまま。
+- wire 層に UPDATE／DELETE 専用の分岐は置かない。型不一致は既存の `22P02`／`08P01`／`0A000`
+  で fail-closed に拒否し、値は応答に含めない。
+- テスト: `crates/engine/tests/sql50_update_delete_params.rs`（リテラル同値性・拒否形・RLS・
+  明示トランザクション）、`crates/wire-server/tests/wire_sql50_update_delete_param.rs`
+  （text／binary の Bind・型不一致・テナント境界）、`sql::params` の単体テスト（行値の位置判定）。
+
 ## スコープ外・申し送り
 
 - wire 側（Parse の宣言型受理・`ParameterDescription`・Bind の値保持・
@@ -437,7 +484,7 @@ Bind 値 `None`（SQL NULL）は、`sql::params` が裸の `Token::Ident("NULL")
   推論になることを確認した。
 - NULL パラメータ値は #2439 で解消済み（上記節）。リテラル `<列> = NULL` 自体が未対応の
   位置（`42703`）は SQL-41 系の別課題。
-- 追加のプレースホルダ位置（`LIMIT $n`・非等価 WHERE 比較・`ON CONFLICT ... SET`（加算形 `n = n + $1` は Issue #2427 で受理済み）・
+- 追加のプレースホルダ位置（`LIMIT $n`・非等価 WHERE 比較〔SELECT は Issue #2430、UPDATE／DELETE は #2431 で受理済み〕・`ON CONFLICT ... SET`（加算形 `n = n + $1` は Issue #2427 で受理済み）・
   hybrid 関数引数・`LIKE $n`。`UPDATE ... SET col = $n` は Issue #1544 で受理済み）。
 - 層 B（psycopg 3／node pg／psql 実クライアントでの `make e2e-three-client`
   相当）→ **Issue #1176 で実施済み**（`crates/wire-server/tests/

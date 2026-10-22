@@ -331,12 +331,12 @@ fn unsupported_shapes_stay_rejected() {
     ] {
         assert_eq!(code(&core, sql), "42601", "{sql}");
     }
-    // UPDATE の `SET c = DEFAULT` は従来どおり式（列参照）として解釈され、存在しない列 `DEFAULT` で拒否される
-    // （`Default` variant は UPDATE へ到達しない。UPDATE の DEFAULT 対応は後続）。
+    // UPDATE の `SET c = DEFAULT` は Issue #1746 で対応済み（`sql50_update_set_default.rs`）。
+    // 引用付き `"DEFAULT"` は従来どおり列参照で、存在しない列として拒否される。
     assert_eq!(
         code(
             &core,
-            "UPDATE u SET c = DEFAULT WHERE id = 1 USING OPERATION_ID 'u'"
+            "UPDATE u SET c = \"DEFAULT\" WHERE id = 1 USING OPERATION_ID 'u'"
         ),
         "42703"
     );

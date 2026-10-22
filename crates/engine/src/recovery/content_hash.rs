@@ -1574,6 +1574,8 @@ pub(crate) enum UpdateColumnHashItem<'a> {
     Value(&'a Value),
     /// SET 右辺の式の構文木（[`push_dml_expr`] 規則。評価前の要求由来の入力のみ）。
     Expr(&'a crate::sql::udf_call::Expr),
+    /// `SET col = DEFAULT`（SQL-50・Issue #1746）。解決値ではなく構文形の印のみ（本体なし）。
+    Default,
 }
 
 /// 単一行 `id` 指定形 `UPDATE` のうち SET 右辺に式を含むもの（Issue #1544・SQL-45 の
@@ -1582,8 +1584,8 @@ pub(crate) enum UpdateColumnHashItem<'a> {
 /// [`OpTag::UpdateColumnsExpr`]）を使う。入力は `id` と、`columns`（呼び出し元が
 /// スキーマ列順へ正規化して渡す）の (列名, 値または式) 列だけで、DB の現在状態・評価結果には
 /// 依存しない。各割当は印 1 バイト（`0` = 値 → [`push_value`]、`1` = 式 →
-/// [`push_dml_expr`]）の後に本体を置く。新しいドメインで過去の記録が無いため legacy 版は
-/// 持たない。式違いの網羅テスト・crash-test は Issue #1545 の担当（本 Issue は
+/// [`push_dml_expr`]、`2` = `DEFAULT` キーワード〔本体なし。Issue #1746〕）の後に本体を置く。
+/// 新しいドメインで過去の記録が無いため legacy 版は持たない。式違いの網羅テスト・crash-test は Issue #1545 の担当（本 Issue は
 /// fail-closed に必要な最小の直列化）。
 pub(crate) fn for_update_columns_with_exprs(
     id: u64,
@@ -1604,6 +1606,9 @@ pub(crate) fn for_update_columns_with_exprs(
             UpdateColumnHashItem::Expr(expr) => {
                 b.push_u8(1);
                 push_set_expr(&mut b, expr)?;
+            }
+            UpdateColumnHashItem::Default => {
+                b.push_u8(2);
             }
         }
     }
@@ -2027,6 +2032,13 @@ fn push_dml_assignments(
                 push_set_expr(b, expr)?;
                 continue;
             }
+            // `SET col = DEFAULT`（SQL-50・Issue #1746）はタグ 7（本体なし）。解決値は入れない
+            // （列 DEFAULT 変更後の再送を同一ハッシュにする。TABLE-39 (6)・RECOVER-10 のポインタ）。
+            // DEFAULT を含む記録は本 Issue 以前の台帳に存在しないため legacy 互換の考慮は不要。
+            SetValue::Default => {
+                b.push_u8(7);
+                continue;
+            }
         };
         match literal {
             InsertLiteral::String(s) => {
@@ -2098,8 +2110,9 @@ fn push_dml_assignments(
             InsertLiteral::SequenceCall { .. } => {
                 return Err(crate::sql::parser::reject_sequence_call_literal());
             }
-            // `DEFAULT` キーワード（SQL-50・Issue #1730）は `INSERT ... VALUES` の要素に限り、
-            // UPDATE の `SET` には現れない（構文段が `42601` で拒否済み）。到達は fail-closed で拒否する。
+            // `DEFAULT` キーワード（SQL-50・Issue #1730）のリテラル表現は `INSERT ... VALUES` の
+            // 要素に限る。UPDATE の `SET` は `SetValue::Default`（Issue #1746）を使うため、
+            // リテラルとしての到達は fail-closed で拒否する。
             InsertLiteral::Default => {
                 return Err(crate::sql::parser::reject_default_keyword_literal());
             }
@@ -6135,6 +6148,35 @@ mod tests {
         assert_ne!(hash_of(&plus1), part);
         // 式を含む SET に旧 VECTOR 文字列互換ハッシュは不要。
         assert!(!needs_legacy_vector_hash(&[("n", &plus1)], &schema));
+    }
+
+    /// `SET col = DEFAULT`（Issue #1746）の印は決定的で、値・式・NULL とは別ハッシュ。
+    #[test]
+    fn update_hash_distinguishes_default_marker() {
+        let v = Value::Text("dflt".to_string());
+        let null = Value::Null;
+        let h = |item: UpdateColumnHashItem<'_>| {
+            for_update_columns_with_exprs(3, &[("c", item)]).expect("hash")
+        };
+        let d = h(UpdateColumnHashItem::Default);
+        assert_eq!(d, h(UpdateColumnHashItem::Default));
+        assert_ne!(d, h(UpdateColumnHashItem::Value(&v)));
+        assert_ne!(d, h(UpdateColumnHashItem::Value(&null)));
+        // 述語形・分割実行の構文形ハッシュ側も印で区別される。
+        let schema = crate::catalog::TableSchema::new("t", Vec::new());
+        let enc = |value: &crate::sql::allowlist::SetValue| {
+            let mut b = HashInputBuilder::new(OpTag::UpdateColumnsExpr);
+            push_dml_assignments(&mut b, &[("c", value)], DmlVectorRepr::Canonical, &schema)
+                .expect("assignments");
+            b.finish()
+        };
+        let lit =
+            crate::sql::allowlist::SetValue::Literal(crate::sql::allowlist::InsertLiteral::Null);
+        assert_eq!(
+            enc(&crate::sql::allowlist::SetValue::Default),
+            enc(&crate::sql::allowlist::SetValue::Default)
+        );
+        assert_ne!(enc(&crate::sql::allowlist::SetValue::Default), enc(&lit));
     }
 
     /// 単一行形の式入りハッシュは専用ドメインで、リテラルだけの `for_update_columns`

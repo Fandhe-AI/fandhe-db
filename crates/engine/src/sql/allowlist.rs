@@ -190,6 +190,8 @@ fn is_where_predicate_boundary_token(
             w.eq_ignore_ascii_case("USING")
                 || w.eq_ignore_ascii_case("HINT")
                 || w.eq_ignore_ascii_case("RETURNING")
+                // 分割実行句（`WHERE TRUE PARTITIONED CHUNK n`。SQL-36・Issue #1744）
+                || w.eq_ignore_ascii_case("PARTITIONED")
                 || w.eq_ignore_ascii_case("GROUP")
                 || w.eq_ignore_ascii_case("HAVING")
                 || w.eq_ignore_ascii_case("OR")
@@ -3750,9 +3752,10 @@ pub(crate) const EXPLICIT_WHERE_MARKER: &str = "\u{0}explicit_where";
 /// `WHERE` が書かれているのに述語列が空になる形（`WHERE TRUE`・`(TRUE OR FALSE)` 等、構文段の
 /// 真偽リテラル畳み込み〔SQL-41〕で述語が消えるもの）に、RLS 述語 `visible()` を 1 件足して返す。
 /// 空の述語列は「`WHERE` 省略」（SQL-36・Issue #1743）の表現と同一であり、明示した恒真を省略と
-/// 取り違えないための印。`visible()` は束縛後にフィルタを生まない（RLS は常に暗黙適用される）ので、
-/// 基表への DML は束縛段の「`visible()` のみ」拒否（`42601`）に従来どおり落ち、ビュー経由では
-/// ビューの述語と合成されて従来どおり通る。恒真述語 DML の受理は #1744 の範囲で、そこでこの関数を外す。
+/// 取り違えないための印（省略だけを拒否する opt-in の Issue #2210 の判定点。#1744 で恒真述語 DML を
+/// 受理したが、省略と明示の区別のため印は残す）。`visible()` は束縛後にフィルタを生まない（RLS は
+/// 常に暗黙適用される）ので、基表への DML は自テナント可視行の全件が対象になり、ビュー経由では
+/// ビューの述語と合成される。
 fn mark_explicit_where(mut predicates: Vec<WherePredicate>) -> Vec<WherePredicate> {
     if predicates.is_empty() {
         predicates.push(WherePredicate::PredicateCall {
@@ -3760,6 +3763,28 @@ fn mark_explicit_where(mut predicates: Vec<WherePredicate>) -> Vec<WherePredicat
         });
     }
     predicates
+}
+
+/// opt-in の `--require-where-for-dml` が有効なときに `WHERE` 省略の `UPDATE`／`DELETE` を拒否する
+/// 際の固定文言（Issue #2210・SQL-36 ポインタ）。表名・テナント・入力値を含めない。
+pub(crate) const REQUIRE_WHERE_FOR_DML_DETAIL: &str =
+    "UPDATE or DELETE without a WHERE clause is rejected (require-where-for-dml is enabled)";
+
+/// `WHERE` 省略の DML（空の述語列。[`mark_explicit_where`] 通過後は明示 `WHERE` が空にならない）を
+/// 起動時 opt-in のスイッチが有効なときだけ `42601`（`UnsupportedSyntax`）で拒否する純関数
+/// （Issue #2210・SQL-36 ポインタ）。
+///
+/// 呼び出し元は `EngineCore` の `parse_tokens_in`（DELETE／UPDATE 分岐。構造検証の直後・表の
+/// 存在確認より前）と EXPLAIN の DML 経路で、`enabled` は `EngineCore::require_where_for_dml`。
+/// 表の存在確認より前に判定するので、表の有無を示す手掛かりを返さない（fail-closed）。
+pub(crate) fn reject_omitted_where_for_dml(
+    enabled: bool,
+    where_predicates: &[WherePredicate],
+) -> Result<(), SqlSurfaceError> {
+    if enabled && where_predicates.is_empty() {
+        return Err(SqlSurfaceError::unsupported(REQUIRE_WHERE_FOR_DML_DETAIL));
+    }
+    Ok(())
 }
 
 /// `id = <literal>` の述語列を、構文解析器（`WHERE` の述語文法）に通して得る（TABLE-43・Issue #1672）。
@@ -4624,6 +4649,16 @@ pub enum SetValue {
     Literal(InsertLiteral),
     /// 式（`SET a = a + 1`・`SET t = upper(t)` 等）。
     Expr(Expr),
+    /// 右辺が裸の `DEFAULT` キーワード（`SET a = DEFAULT`。SQL-50・Issue #1746）。
+    /// 列の既定値（未定義なら NULL）を代入する意味で、解決は束縛段
+    /// （`sql::parser::bind_set_assignments`）が担う。検出は UPDATE 専用の
+    /// `Parser::parse_update_set_item` のみで、`ON CONFLICT ... DO UPDATE SET` では
+    /// 生成されない（そちらは構文段で `42601`。`UpsertValue` への写像の防御腕は
+    /// `reject_default_keyword_literal` により `0A000` だが到達不能）。
+    ///
+    /// **BREAKING CHANGE**（Issue #1746）: variant 追加。`SetValue` を網羅 `match` する
+    /// 呼び出し元は腕の追加が必要。
+    Default,
 }
 
 /// 許可形状の構造判定を通過した UPDATE 文（SQL-17、TASK-191）。`ValidatedInsert` と
@@ -9954,7 +9989,7 @@ impl<'a> Parser<'a> {
     }
 
     /// `ON CONFLICT ... DO UPDATE SET` の 1 要素（`<col> = <右辺>`）を構造パースする
-    /// （SQL-20・TASK-193、Issue #872。`Parser::parse_update_assignment` と同じ形だが、
+    /// （SQL-20・TASK-193、Issue #872。`Parser::parse_update_set_item` と同じ形だが、
     /// 右辺に `EXCLUDED.<col>` も受理する点が異なる）。右辺は次の順に試す（SQL-49）:
     /// 1. 加算形（[`UpsertValue::Add`]。Issue #2425。右辺全体が一致するときだけ）
     /// 2. `EXCLUDED.<col>` 単独（[`UpsertValue::Excluded`]）
@@ -9988,6 +10023,9 @@ impl<'a> Parser<'a> {
         let value = match self.expect_literal_or_set_expr()? {
             SetValue::Literal(lit) => UpsertValue::Literal(lit),
             SetValue::Expr(expr) => UpsertValue::Expr(expr),
+            // `expect_literal_or_set_expr` は `Default` を返さない（上で先に拒否済み）。
+            // 到達は構築ミスのみで、黙って丸めず fail-closed に拒否する。
+            SetValue::Default => return Err(crate::sql::parser::reject_default_keyword_literal()),
         };
         Ok((column, value))
     }
@@ -10068,7 +10106,8 @@ impl<'a> Parser<'a> {
         // SQL-36（Issue #1743）: `WHERE` 省略は空の述語列（`Predicates(vec![])`）で表す。
         // 明示した `WHERE` は `mark_explicit_where` で必ず 1 件以上になるため、空列は省略と一対一に対応する。
         // 単一行専用入口（`validate_delete_tokens`）は `Predicates(_)` を `42601` で拒否するので
-        // 受理範囲は広がらない。opt-in の `--require-where-for-dml`（#2210）はここで空列を見て拒否する。
+        // 受理範囲は広がらない。opt-in の `--require-where-for-dml`（#2210）の拒否は
+        // `reject_omitted_where_for_dml` が呼び出し側（`EngineCore::parse_tokens_in` と EXPLAIN 経路）で行う。
         let where_clause = if matches!(self.peek(), Some(Token::Keyword(Keyword::Where))) {
             self.advance(); // WHERE
             if self.peek_single_row_delete_id() {
@@ -10159,18 +10198,14 @@ impl<'a> Parser<'a> {
         let table_name = self.expect_ident()?;
 
         self.expect_ident_matching("SET")?;
-        let mut assignments = vec![self.parse_update_assignment()?];
+        let mut assignments = Vec::new();
+        self.parse_update_set_item(&mut assignments)?;
         while matches!(self.peek(), Some(Token::Punct(','))) {
             self.advance();
-            if assignments.len() >= MAX_UPDATE_SET_ASSIGNMENTS {
-                return Err(SqlSurfaceError::unsupported(
-                    "too many UPDATE SET assignments",
-                ));
-            }
-            assignments.push(self.parse_update_assignment()?);
+            self.parse_update_set_item(&mut assignments)?;
         }
 
-        // SQL-36（Issue #1743）: `WHERE` 省略は空の述語列で表す（DELETE と同じ。#2210 の結線点）。
+        // SQL-36（Issue #1743）: `WHERE` 省略は空の述語列で表す（DELETE と同じ。#2210 の拒否は `reject_omitted_where_for_dml`）。
         let where_form = if matches!(self.peek(), Some(Token::Keyword(Keyword::Where))) {
             self.advance(); // WHERE
             match self.parse_update_where()? {
@@ -10259,14 +10294,134 @@ impl<'a> Parser<'a> {
         Ok(UpdateWhereForm::Predicates(predicates))
     }
 
-    /// UPDATE の SET 句の 1 要素（`<col> = <lit>`）を構造パースする。
+    /// UPDATE の SET 句の 1 要素を構造パースし、列ごとの代入として `out` へ宣言順に積む。
     ///
-    /// 右辺は [`Self::expect_literal_or_set_expr`]（Issue #1544・SQL-45 のポインタ）。
-    fn parse_update_assignment(&mut self) -> Result<(String, SetValue), SqlSurfaceError> {
+    /// `(` で始まれば行値の形（[`Self::parse_update_row_assignment`]・SQL-50 (3)・Issue #1747）、
+    /// それ以外は `<col> = <右辺>`。行値の形も列ごとの代入へ展開するため、後段（束縛・
+    /// 内容照合ハッシュ・ビュー書き換え）は両形を区別しない。個数上限
+    /// [`MAX_UPDATE_SET_ASSIGNMENTS`] は積む前に累計で検査する。
+    fn parse_update_set_item(
+        &mut self,
+        out: &mut Vec<(String, SetValue)>,
+    ) -> Result<(), SqlSurfaceError> {
+        if matches!(self.peek(), Some(Token::Punct('('))) {
+            return self.parse_update_row_assignment(out);
+        }
+        if out.len() >= MAX_UPDATE_SET_ASSIGNMENTS {
+            return Err(SqlSurfaceError::unsupported(
+                "too many UPDATE SET assignments",
+            ));
+        }
         let column = self.expect_ident()?;
         self.expect_punct('=')?;
-        let value = self.expect_literal_or_set_expr()?;
-        Ok((column, value))
+        let value = self.parse_update_set_rhs()?;
+        out.push((column, value));
+        Ok(())
+    }
+
+    /// SET 句の右辺 1 つ。裸の `DEFAULT`（SQL-50・Issue #1746）は [`SetValue::Default`]、
+    /// それ以外は [`Self::expect_literal_or_set_expr`]（Issue #1544・SQL-45）。
+    /// 引用付き `"DEFAULT"` は lexer が `quoted_null` に記録するため列参照のまま。
+    fn parse_update_set_rhs(&mut self) -> Result<SetValue, SqlSurfaceError> {
+        if self.peek_ident_matches("DEFAULT") && !self.quoted_null.contains(&self.pos) {
+            self.advance();
+            return Ok(SetValue::Default);
+        }
+        self.expect_literal_or_set_expr()
+    }
+
+    /// 行値の代入 `(<col>, ...) = (<e>, ...)` / `= ROW(<e>, ...)`（SQL-50 (3)・Issue #1747）。
+    ///
+    /// 列ごとの代入へ展開して `out` に積む（内容照合ハッシュも展開後で計算されるため、
+    /// 同じ意味の別表記は同じ操作として扱われる）。1 列の形は `ROW` 必須（PostgreSQL と同じ。
+    /// 括弧のみは `42601`）。個数不一致は `42601`、部分クエリ源は `0A000`。値が列数を
+    /// 超えた時点で解析を打ち切る。
+    fn parse_update_row_assignment(
+        &mut self,
+        out: &mut Vec<(String, SetValue)>,
+    ) -> Result<(), SqlSurfaceError> {
+        self.expect_punct('(')?;
+        let mut columns: Vec<String> = Vec::new();
+        loop {
+            if out.len().saturating_add(columns.len()) >= MAX_UPDATE_SET_ASSIGNMENTS {
+                return Err(SqlSurfaceError::unsupported(
+                    "too many UPDATE SET assignments",
+                ));
+            }
+            columns.push(self.expect_ident()?);
+            if matches!(self.peek(), Some(Token::Punct(','))) {
+                self.advance();
+                continue;
+            }
+            break;
+        }
+        self.expect_punct(')')?;
+        self.expect_punct('=')?;
+
+        let source_err = || {
+            SqlSurfaceError::unsupported(
+                "source for a multiple-column UPDATE item must be a ROW() expression",
+            )
+        };
+        let mut explicit_row = false;
+        if self.peek_ident_matches("ROW")
+            && !self.quoted_null.contains(&self.pos)
+            && matches!(self.tokens.get(self.pos + 1), Some(Token::Punct('(')))
+        {
+            self.advance();
+            explicit_row = true;
+        }
+        if !matches!(self.peek(), Some(Token::Punct('('))) {
+            return Err(source_err());
+        }
+        if !explicit_row {
+            // `values` / `with` は通常の識別子でもあるため、後続トークンが
+            // サブクエリ構文（`VALUES (` / `WITH [RECURSIVE] name [(..)] AS`）の
+            // ときだけサブクエリ扱いにし、それ以外は列参照経路へ流す。
+            let at = |n: usize| self.tokens.get(self.pos.saturating_add(n));
+            let is_word = |t: Option<&Token>, w: &str| matches!(t, Some(Token::Ident(x)) if x.eq_ignore_ascii_case(w));
+            let is_values_query =
+                is_word(at(1), "VALUES") && matches!(at(2), Some(Token::Punct('(')));
+            let is_with_query = is_word(at(1), "WITH")
+                && ((matches!(at(2), Some(Token::Ident(_)))
+                    && (is_word(at(3), "AS") || matches!(at(3), Some(Token::Punct('(')))))
+                    || (is_word(at(2), "RECURSIVE") && matches!(at(3), Some(Token::Ident(_)))));
+            let is_subquery = matches!(at(1), Some(Token::Keyword(Keyword::Select)))
+                || is_values_query
+                || is_with_query;
+            if is_subquery {
+                return Err(SqlSurfaceError::feature_not_supported(
+                    "multiple-column UPDATE with a subquery source is not supported",
+                ));
+            }
+            if columns.len() == 1 {
+                return Err(source_err());
+            }
+        }
+        self.advance(); // '('
+
+        let mismatch =
+            || SqlSurfaceError::unsupported("number of columns does not match number of values");
+        let mut values: Vec<SetValue> = Vec::new();
+        if !matches!(self.peek(), Some(Token::Punct(')'))) {
+            loop {
+                if values.len() >= columns.len() {
+                    return Err(mismatch());
+                }
+                values.push(self.parse_update_set_rhs()?);
+                if matches!(self.peek(), Some(Token::Punct(','))) {
+                    self.advance();
+                    continue;
+                }
+                break;
+            }
+        }
+        self.expect_punct(')')?;
+        if values.len() != columns.len() {
+            return Err(mismatch());
+        }
+        out.extend(columns.into_iter().zip(values));
+        Ok(())
     }
 
     /// `RETURNING <投影>`（Issue #873・SQL-21）の構造パースのみを行う。書き込み系
@@ -13911,6 +14066,21 @@ pub(crate) fn require_row_query_statement(
             "{what} requires a SELECT query"
         ))),
     }
+}
+
+/// トークン列の括弧深さ 0 に `LIMIT` があるか（`INSERT ... SELECT` の内側 SELECT が `LIMIT` を省略したかの
+/// 判定。サブクエリ・括弧内の `LIMIT` と文字列リテラル中の語は数えない。Issue #2615）。
+pub(crate) fn has_top_level_limit(tokens: &[Token]) -> bool {
+    let mut depth: usize = 0;
+    for t in tokens {
+        match t {
+            Token::Punct('(') => depth = depth.saturating_add(1),
+            Token::Punct(')') => depth = depth.saturating_sub(1),
+            Token::Keyword(lexer::Keyword::Limit) if depth == 0 => return true,
+            _ => {}
+        }
+    }
+    false
 }
 
 /// CTAS の内側トークン列を、`INSERT ... SELECT` と同じ規則で単独の SELECT と同じ引用付き `NULL` の
@@ -19186,6 +19356,9 @@ pub struct ValidatedInsertSelect {
     /// 台帳の内容照合ハッシュ（`recovery::content_hash::for_insert_select`。送られた文のトークン列から
     /// `USING OPERATION_ID` 句と末尾 `;` を除いて算出。内側 SELECT の結果行は材料にしない。Issue #1734）。
     pub(crate) statement_hash: crate::recovery::content_hash::ContentHash,
+    /// 内側 SELECT が `LIMIT` を省略したときに束縛段が付与した `LIMIT` の値（`行数上限 + 1`。Issue #2615）。
+    /// 付与しなかった文（明示 `LIMIT` あり・集計など `LIMIT` 不要の形）は `None`。`query` はこの付与後の文。
+    pub(crate) implicit_limit: Option<u32>,
 }
 
 impl ValidatedInsertSelect {
@@ -19205,7 +19378,15 @@ impl ValidatedInsertSelect {
             returning: shape.returning,
             operation_id: shape.operation_id,
             statement_hash,
+            implicit_limit: None,
         }
+    }
+
+    /// 内側 SELECT へ `LIMIT` を暗黙付与した文であることを記録する（`core.rs::parse_insert_select` が呼ぶ。
+    /// Issue #2615）。束縛段はこの値を Describe の行数上限として使う。
+    pub(crate) fn with_implicit_limit(mut self, fetch: u32) -> Self {
+        self.implicit_limit = Some(fetch);
+        self
     }
 
     /// 挿入先の表名。
@@ -20076,10 +20257,9 @@ struct ParsedUpdateShape {
 /// <述語>[ AND <述語>]* USING OPERATION_ID '<id>' [;]`（`<述語>` は `SELECT` の
 /// `WHERE` と同一形状。[`WherePredicate`]）。`WHERE` 句自体の省略は本モジュールの
 /// `expect_keyword(Keyword::Where)` が構造的に拒否する（`42601`）ため本型は
-/// 構築されない。`WHERE` 句が存在しても中身が `visible()` 単独の恒等述語のみ
-/// （非 `visible()` 述語が 1 つも無い）場合は許可リスト構造としては受理するが、
-/// 実質的な全行更新になるため [`crate::sql::parser::bind_update_form`] が
-/// 束縛時に `42601` で拒否する。
+/// 構築されない。`WHERE` 句が存在して中身が `visible()` 単独・恒真形の場合も
+/// 許可リスト・束縛とも受理する（SQL-36・SQL-41、Issue #1744。対象は自テナントの
+/// 可視行で、影響行数上限は実行段が判定する）。
 ///
 /// フィールドは `pub(crate)` のまま公開しない（[`crate::sql::parser::
 /// BoundPredicateUpdate`] と同じ作法）。本型は `validate_update_form_tokens`
@@ -20330,6 +20510,21 @@ pub(crate) fn parse_update_form_shape_tokens(
 
 #[cfg(test)]
 mod tests {
+    /// SQL-36・Issue #2210: 空の述語列は有効時だけ `42601`、明示 `WHERE` の印や通常の述語列は常に通す。
+    #[test]
+    fn reject_omitted_where_for_dml_only_rejects_empty_when_enabled() {
+        use super::*;
+        let err = reject_omitted_where_for_dml(true, &[]).expect_err("empty + enabled");
+        assert_eq!(err.wire_code(), "42601");
+        assert!(reject_omitted_where_for_dml(false, &[]).is_ok());
+        let marker = mark_explicit_where(Vec::new());
+        assert!(reject_omitted_where_for_dml(true, &marker).is_ok());
+        let normal = vec![WherePredicate::PredicateCall {
+            name: "p".to_string(),
+        }];
+        assert!(reject_omitted_where_for_dml(true, &normal).is_ok());
+    }
+
     /// TABLE-27・Issue #1715: 引用付き `true`／`false` も `search_path` の識別子要素として受理する。
     #[test]
     fn set_search_path_accepts_quoted_bool_word_elements() {
@@ -24013,6 +24208,84 @@ mod tests {
         }
     }
 
+    /// `SET c = DEFAULT`（SQL-50・Issue #1746）は大小無視で `SetValue::Default`、引用付きは列参照、
+    /// 余剰トークンは `42601`。
+    #[test]
+    fn update_set_default_keyword_is_parsed_only_when_bare() {
+        let lookup = catalog_with(&["documents"]);
+        let parse = |rhs: &str| {
+            validate_update(
+                &format!(
+                    "UPDATE documents SET n = {rhs} WHERE id = 1 USING OPERATION_ID 'op-sd-1'"
+                ),
+                &lookup,
+                LedgerMode::Ledgered,
+            )
+            .map(|u| u.assignments)
+        };
+        for rhs in ["DEFAULT", "default", "Default"] {
+            assert_eq!(parse(rhs).unwrap()[0].1, SetValue::Default, "{rhs}");
+        }
+        assert!(matches!(
+            parse("\"DEFAULT\"").unwrap()[0].1,
+            SetValue::Expr(_)
+        ));
+        for rhs in ["DEFAULT + 1", "DEFAULT::int", "DEFAULT DEFAULT"] {
+            assert_eq!(parse(rhs).unwrap_err().wire_code(), "42601", "{rhs}");
+        }
+    }
+
+    /// 行値の代入 `SET (a, b) = (...)`（SQL-50 (3)・Issue #1747）は列ごとの代入へ宣言順に展開する。
+    /// 個数不一致・1 列の括弧のみは `42601`、部分クエリ源は `0A000`、累計の個数上限は `42601`。
+    #[test]
+    fn update_set_row_value_expands_to_per_column_assignments() {
+        let lookup = catalog_with(&["documents"]);
+        let parse = |set: &str| {
+            validate_update(
+                &format!("UPDATE documents SET {set} WHERE id = 1 USING OPERATION_ID 'op-rv-1'"),
+                &lookup,
+                LedgerMode::Ledgered,
+            )
+            .map(|u| u.assignments)
+        };
+        let expected = parse("n = 1, o = 'x'").unwrap();
+        assert_eq!(parse("(n, o) = (1, 'x')").unwrap(), expected);
+        assert_eq!(parse("(n, o) = ROW(1, 'x')").unwrap(), expected);
+        assert_eq!(parse("n = 1, (o) = ROW('x')").unwrap(), expected);
+        let d = parse("(n, o) = (DEFAULT, 1 + 1)").unwrap();
+        assert_eq!(d[0].1, SetValue::Default);
+        assert!(matches!(d[1].1, SetValue::Expr(_)));
+        for set in [
+            "(n, o) = (1)",
+            "(n, o) = (1, 2, 3)",
+            "(n, o) = ROW()",
+            "(n) = (1)",
+            "() = ()",
+            "(n, o) = 1",
+            "(n, o) =",
+        ] {
+            assert_eq!(parse(set).unwrap_err().wire_code(), "42601", "{set}");
+        }
+        for set in [
+            "(n, o) = (SELECT 1, 2)",
+            "(n, o) = (VALUES (1, 2))",
+            "(n, o) = (WITH c AS (SELECT 1) SELECT 1, 2)",
+            "(n, o) = (WITH RECURSIVE c AS (SELECT 1) SELECT 1, 2)",
+        ] {
+            assert_eq!(parse(set).unwrap_err().wire_code(), "0A000", "{set}");
+        }
+        // `values` / `with` は通常の識別子: 先頭スロットの列参照として受理する。
+        for set in ["(n, o) = (values, 1)", "(n, o) = (with, 1)"] {
+            assert!(parse(set).is_ok(), "{set}");
+        }
+        let cols: Vec<String> = (0..=MAX_UPDATE_SET_ASSIGNMENTS)
+            .map(|i| format!("c{i}"))
+            .collect();
+        let vals = vec!["1"; cols.len()].join(", ");
+        let over = format!("({}) = ({vals})", cols.join(", "));
+        assert_eq!(parse(&over).unwrap_err().wire_code(), "42601");
+    }
+
     /// 式の複数 SET・述語形でも構文木のまま保持し、宣言順を保つ。
     /// `ON CONFLICT ... DO UPDATE SET` の一般の式は Issue #1739 で受理する
     /// （`UpsertValue::Expr`。加算形だけは Issue #2425 の `UpsertValue::Add` のまま）。
@@ -24812,7 +25085,7 @@ mod tests {
             &lookup,
             LedgerMode::Ledgered,
         )
-        .expect("visible() predicate DELETE is accepted structurally (bind stage rejects visible()-only with 42601)");
+        .expect("visible() predicate DELETE is accepted structurally (visible()-only is also accepted at the bind stage, SQL-36 Issue #1744)");
         assert!(matches!(stmt, DeleteStatement::Predicate(_)));
     }
 
@@ -25226,6 +25499,26 @@ mod tests {
     ) -> Result<ParsedInsertTokens, SqlSurfaceError> {
         let tokens = lexer::tokenize(sql).expect("tokenize");
         parse_insert_any_shape_tokens_with_limit(&tokens, mode, None)
+    }
+
+    /// Issue #2615: 括弧深さ 0 の `LIMIT` だけを数える（サブクエリ・括弧内・文字列リテラル中は数えない）。
+    #[test]
+    fn has_top_level_limit_ignores_nested_and_literal_limit() {
+        let tok = |sql: &str| lexer::tokenize(sql).expect("tokenize");
+        assert!(has_top_level_limit(&tok("SELECT a FROM t LIMIT 3")));
+        assert!(has_top_level_limit(&tok(
+            "SELECT a FROM t ORDER BY a LIMIT 3 OFFSET 1"
+        )));
+        assert!(!has_top_level_limit(&tok("SELECT a FROM t")));
+        assert!(!has_top_level_limit(&tok(
+            "SELECT a FROM t WHERE a IN (SELECT a FROM u LIMIT 2)"
+        )));
+        assert!(!has_top_level_limit(&tok(
+            "(SELECT a FROM t LIMIT 1) UNION ALL (SELECT a FROM u LIMIT 1)"
+        )));
+        assert!(!has_top_level_limit(&tok(
+            "SELECT a FROM t WHERE b = 'limit'"
+        )));
     }
 
     #[test]
