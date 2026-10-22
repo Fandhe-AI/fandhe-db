@@ -2015,7 +2015,8 @@ pub enum WherePredicate {
     /// 呼び出しのみが設定する）のみで、CHECK 本体・カーソル・`COPY`・`EXPLAIN` と、述語形 `UPDATE`/`DELETE` の
     /// `RETURNING`・`SET` 右辺からは構文解析段で `42601` になる。述語形
     /// `UPDATE`/`DELETE` の `WHERE` に限り [`Parser::parse_dml_where`] が文脈を差し替えて
-    /// 構文段で受理する（Issue #1750・SQL-53 (a)。実行は束縛段が `42601` で止め、#1751 で結線）。単純形の `CREATE VIEW` 本体（[`parse_view_body`]）も同様に拒否するが、
+    /// 構文段で受理する（Issue #1750・SQL-53 (a)。実行は束縛段が `42601` で止め、#1751 で結線）。
+    /// 単純形の `CREATE VIEW` 本体（[`parse_view_body`]）も同様に拒否するが、
     /// 評価後射影形の本文（`LIMIT` 付き。[`classify_view_body`]。Issue #1360）は
     /// 本文を読み取り SELECT として検証するため受理する。`NOT IN` は
     /// `Not(InSubquery)` で表す（Issue #1191）。
@@ -4768,11 +4769,12 @@ struct Parser<'a> {
     /// 検出したら `54000` にする。`sql::allowlist::validate_sql_tokens` の
     /// トップレベル呼び出し（`parse_select_shape`/`parse_aggregate_shape` の
     /// 呼び出し元）だけが `Some(0)` を設定する。
-    /// 述語形 `UPDATE`／`DELETE` の `WHERE` 解析の間だけ [`Self::subquery_ctx`] へ差し替える
-    /// 文脈深さ（Issue #1750・SQL-53）。`RETURNING` の投影・`SET` 右辺では `None` のまま
-    /// なので、これらの位置のサブクエリは従来どおり `42601`。[`Self::parse_dml_where`] が設定・復元する。
-    dml_where_subquery_ctx: Option<usize>,
     subquery_ctx: Option<usize>,
+    /// 述語形 `UPDATE`／`DELETE` の `WHERE` 解析の間だけ [`Self::subquery_ctx`] へ
+    /// 差し替える文脈深さ（Issue #1750・SQL-53）。`RETURNING` の投影・`SET` 右辺では
+    /// `None` のままなので、これらの位置のサブクエリは従来どおり `42601`。
+    /// [`Self::parse_dml_where`] が設定・復元する。
+    dml_where_subquery_ctx: Option<usize>,
     /// サブクエリ深さ・CTE 定義数の実効上限（Issue #1552）。`Parser::new` の既定は
     /// ハード上限と同値で、セッション SQL のパース入口だけが
     /// [`Self::with_nesting_limits`] で起動時設定値へ差し替える。
