@@ -115,6 +115,18 @@ impl EngineCore {
                         self.ledger_mode,
                         &stmt.statement_hash,
                     )?;
+                    // ゲート待ちの間に並行 DROP で関係が消えていた場合は、存在しない名前へ `42P07` を
+                    // 返さず再試行可能なエラーにする（再送すれば通常の作成になる）。
+                    let still_exists = self
+                        .storage
+                        .relation_name_exists(stmt.table_name())
+                        .map_err(|_| internal())?;
+                    if !still_exists {
+                        return Err(SqlSurfaceError::Internal {
+                            detail: "CREATE TABLE AS target changed concurrently; retry"
+                                .to_string(),
+                        });
+                    }
                 }
                 return Err(SqlSurfaceError::duplicate_table(
                     stmt.table_name().to_string(),
