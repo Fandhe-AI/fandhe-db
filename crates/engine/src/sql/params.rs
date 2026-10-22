@@ -180,10 +180,16 @@ fn is_where_clause_boundary(tokens: &[Token], idx: usize) -> bool {
         // 列名の列挙のみを受理し関数呼び出し項目は拒否する）。UDF 呼び出し
         // `returning(...)` は直後が `(` になり、列名としての比較
         // `returning = $1` は直後が `=` になるため、いずれも一致しない。
-        "RETURNING" => matches!(
-            next1,
-            Some(Token::Ident(_) | Token::QuotedNull(_) | Token::Punct('*'))
-        ),
+        // 列名 `returning` の `[NOT] BETWEEN` 比較（`WHERE returning BETWEEN $1 AND $2`。
+        // リテラル BETWEEN は構文段が受理する）は RETURNING 句ではなく WHERE の述語とする
+        // （PR #2631 指摘）。
+        "RETURNING" => {
+            matches!(
+                next1,
+                Some(Token::Ident(_) | Token::QuotedNull(_) | Token::Punct('*'))
+            ) && !ident_eq_ignore_case(next1, "BETWEEN")
+                && !(ident_eq_ignore_case(next1, "NOT") && ident_eq_ignore_case(next2, "BETWEEN"))
+        }
         // `USING OPERATION_ID $n` / `USING PLAN(...)`（`Parser` がこの 2 語の
         // みを文脈的キーワードとして照合する）。UDF 呼び出し `using(...)` は
         // 直後が `(` になり `OPERATION_ID`／`PLAN` に一致しない。
@@ -2809,6 +2815,25 @@ mod tests {
         .expect("tokenize_with_params should succeed");
         let (_, end) = where_region(&tokens).expect("WHERE region should exist");
         assert!(matches!(tokens.get(end), Some(Token::Ident(n)) if n == "RETURNING"));
+    }
+
+    /// 列名 `returning` の `[NOT] BETWEEN $a AND $b` は RETURNING 句境界とみなさず受理する（PR #2631）。
+    #[test]
+    fn where_region_keeps_returning_column_before_between() {
+        for sql in [
+            "SELECT id FROM t WHERE returning BETWEEN $1 AND $2 LIMIT 5",
+            "SELECT id FROM t WHERE returning NOT BETWEEN $1 AND $2 LIMIT 5",
+        ] {
+            let tokens = tokenize_with_params(sql).expect("tokenize_with_params should succeed");
+            let (_, end) = where_region(&tokens).expect("WHERE region should exist");
+            assert!(
+                matches!(
+                    tokens.get(end),
+                    Some(Token::Keyword(crate::sql::lexer::Keyword::Limit))
+                ),
+                "sql = {sql}"
+            );
+        }
     }
 
     #[test]
