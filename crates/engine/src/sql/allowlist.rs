@@ -20089,14 +20089,30 @@ pub struct ValidatedCopyFrom {
 /// (FORMAT text|csv)]` 文（Issue #939・WIRE-17・TASK-220）。内側 `SELECT` は
 /// 広域取得（[`ValidatedScan`]。SQL-15・Issue #454）の形のみを受理し
 /// （順位付け `ORDER BY`／`USING PLAN`・集計は `42601`）、[`validate_sql_tokens`]
-/// と単一の実装を共有する（第 2 の SELECT パーサーを持たない）。テーブル形
-/// `COPY <table> TO STDOUT` は対象外（許可リスト外）。
+/// と単一の実装を共有する（第 2 の SELECT パーサーを持たない）。
+///
+/// テーブル形 `COPY <table> [(<col>, ...)] TO STDOUT`（Issue #1771・WIRE-22 (5)・SQL-34 の
+/// ポインタ）も同じ型で表す。この場合 `inner` は `SELECT * FROM <table>`（列リスト付きなら
+/// その列の投影）に相当する [`ValidatedScan`] で、`limit` は**プレースホルダ `0`**
+/// （[`Self::is_table_form`] が真のとき、`EngineCore` が行数上限 + 1 へ差し替えて束縛する。
+/// 差し替え漏れは束縛段の `LIMIT` 範囲検査で拒否され、上限なし走査にはならない＝fail-closed）。
 #[derive(Debug, Clone, PartialEq)]
 pub struct ValidatedCopyTo {
     pub inner: Box<ValidatedScan>,
     pub format: CopyFormat,
     /// 解決済みの `WITH` オプション（Issue #1763。適用は Issue #1765。それまでは既定値のみ受理）。
     pub options: copy_options::CopyOptions,
+    /// テーブル形（`COPY <table> TO STDOUT`）なら真。括弧形は偽。`pub(crate)` のため
+    /// クレート外は構造体リテラルで組み立てられない（検証経路のみが生成する）。
+    pub(crate) table_form: bool,
+}
+
+impl ValidatedCopyTo {
+    /// テーブル形（`COPY <table> [(<col>, ...)] TO STDOUT`）か。真のとき `inner.limit` は
+    /// プレースホルダで、実行側が `--max-result-rows` に基づく上限へ置き換える。
+    pub fn is_table_form(&self) -> bool {
+        self.table_form
+    }
 }
 
 /// [`validate_copy`]（Issue #939・WIRE-17）が返す COPY statement 種別。
@@ -20446,17 +20462,116 @@ fn validate_copy_to_tokens(
 
     let mut p = Parser::new(after);
     p.expect_contextual_keyword("TO")?;
+    let (format, options) = parse_copy_to_tail(&mut p)?;
+
+    Ok(CopyStatement::To(ValidatedCopyTo {
+        inner: Box::new(scan),
+        format,
+        options,
+        table_form: false,
+    }))
+}
+
+/// `STDOUT [[WITH] (<option>, ...)] [;]` 以降（`TO` の後ろ）を構造判定する。括弧形と
+/// テーブル形（[`validate_copy_table_to_tokens`]）が共有し、`COPY TO` 側オプションの
+/// 解決・未適用拒否が両形に同時に効くようにする（Issue #1771）。
+fn parse_copy_to_tail(
+    p: &mut Parser<'_>,
+) -> Result<(CopyFormat, copy_options::CopyOptions), SqlSurfaceError> {
     p.expect_contextual_keyword("STDOUT")?;
     let raw_options = p.parse_copy_option_list()?;
     let (format, options) = copy_options::resolve(raw_options, copy_options::CopyDirection::To)?;
     p.expect_end_of_statement()?;
     // データ経路が未適用のオプションは fail-closed（Issue #1765 が外す）。
     copy_options::reject_unapplied_for_to(format, &options)?;
+    Ok((format, options))
+}
 
+/// `COPY <ident> [(...)] TO ...` の形か（テーブル形 `COPY ... TO STDOUT` の判定。Issue #1771）。
+/// 先頭が識別子で、任意の括弧グループの直後が文脈キーワード `TO` のときだけ真。
+/// `FROM STDIN` 形（列リスト必須）には影響しない。
+fn is_copy_table_to_form(rest: &[Token]) -> bool {
+    let after_name = match rest.split_first() {
+        Some((Token::Ident(_), tail)) => tail,
+        _ => return false,
+    };
+    let after_cols = if matches!(after_name.first(), Some(Token::Punct('('))) {
+        match split_parenthesized(after_name) {
+            Ok((_, after)) => after,
+            Err(_) => return false,
+        }
+    } else {
+        after_name
+    };
+    matches!(after_cols.first(), Some(Token::Ident(s)) if s.eq_ignore_ascii_case("TO"))
+}
+
+/// テーブル形 `COPY <table> [(<col>, ...)] TO STDOUT [[WITH] (...)] [;]` を構造判定する
+/// （Issue #1771・WIRE-22 (5)・SQL-34 のポインタ）。呼び出し元は [`validate_copy_tokens`]。
+/// 第 2 の SELECT パーサーは作らず、`SELECT * FROM <table>`（列リスト付きなら列投影）に相当する
+/// [`ValidatedScan`] を直接組み立てる。`limit` はプレースホルダ `0`（`EngineCore` が差し替える。
+/// 差し替え漏れは束縛の `LIMIT` 範囲検査で拒否される＝fail-closed）。
+/// ビューは `42809`、不在（他テナントのスキーマ配下・マテリアライズドビューを含む）は `42P01`。
+fn validate_copy_table_to_tokens(
+    rest: &[Token],
+    lookup: &impl TableLookup,
+) -> Result<CopyStatement, SqlSurfaceError> {
+    let mut p = Parser::new(rest);
+    let table_name = p.expect_ident()?;
+
+    let mut columns: Vec<String> = Vec::new();
+    if matches!(p.peek(), Some(Token::Punct('('))) {
+        p.advance();
+        columns.push(p.expect_ident()?);
+        while matches!(p.peek(), Some(Token::Punct(','))) {
+            p.advance();
+            if columns.len() >= MAX_COLUMN_COUNT {
+                return Err(SqlSurfaceError::unsupported("too many COPY columns"));
+            }
+            columns.push(p.expect_ident()?);
+        }
+        p.expect_punct(')')?;
+    }
+
+    p.expect_contextual_keyword("TO")?;
+    let (format, options) = parse_copy_to_tail(&mut p)?;
+
+    if lookup.view_definition(&table_name)?.is_some() {
+        return Err(SqlSurfaceError::WrongObjectType { name: table_name });
+    }
+    if !lookup.table_exists(&table_name)? {
+        return Err(SqlSurfaceError::undefined_table(table_name));
+    }
+
+    let mut seen: std::collections::HashSet<&str> = std::collections::HashSet::new();
+    for c in &columns {
+        if !seen.insert(c.as_str()) {
+            return Err(SqlSurfaceError::duplicate_column(c.clone()));
+        }
+    }
+
+    let projection = if columns.is_empty() {
+        Projection::All
+    } else {
+        Projection::Columns(columns)
+    };
+    let scan = ValidatedScan {
+        table_name,
+        projection,
+        where_predicates: Vec::new(),
+        limit: 0,
+        order_by: Vec::new(),
+        offset: 0,
+        window_items: Vec::new(),
+        order_keys: Vec::new(),
+        scalar_subquery_items: Vec::new(),
+        physical_order_keys: Vec::new(),
+    };
     Ok(CopyStatement::To(ValidatedCopyTo {
         inner: Box::new(scan),
         format,
         options,
+        table_form: true,
     }))
 }
 
@@ -20504,6 +20619,8 @@ pub(crate) fn validate_copy_tokens(
 
     if matches!(rest.first(), Some(Token::Punct('('))) {
         validate_copy_to_tokens(rest, lookup)
+    } else if is_copy_table_to_form(rest) {
+        validate_copy_table_to_tokens(rest, lookup)
     } else {
         validate_copy_from_tokens(rest, lookup, mode)
     }

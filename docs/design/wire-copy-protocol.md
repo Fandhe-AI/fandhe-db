@@ -35,7 +35,8 @@
   - COPY オプションの TO 側の適用（Issue #1765。構文の解析は Issue #1763、FROM 側の
     `HEADER`／`DELIMITER`／`NULL`／`QUOTE`／`ESCAPE` の適用は Issue #1764 で実装済み。
     下の「許可リスト」「FROM STDIN の逐次取り込み」節）、binary 形式（WIRE-14 関連）、
-    テーブル形 `COPY t TO STDOUT`、8 進・16 進エスケープ。
+    8 進・16 進エスケープ。テーブル形 `COPY t [(cols)] TO STDOUT` は Issue #1771 で対応済み
+    （下の「許可リスト」節）。
 
 ## 設計（決定事項）
 
@@ -57,7 +58,18 @@
   `validate_sql` から切り出した公開トークン列版。純粋なリファクタリング）が
   返す `Statement::Scan`（広域取得。SQL-15・Issue #454）のみを受理する
   （第 2 の SELECT パーサーを持たない）。順位付き `SELECT`（`ORDER BY`／
-  `USING PLAN`）・集計・テーブル形は `42601`。
+  `USING PLAN`）・集計は `42601`。
+- テーブル形 `COPY <table> [(<col>, ...)] TO STDOUT`（Issue #1771・WIRE-22 (5)・SQL-34 ポインタ）:
+  括弧形と同じ `ValidatedCopyTo`（`table_form = true`）で表し、内側の `ValidatedScan` は
+  `SELECT *`（列リスト付きなら列投影）相当を直接組み立てる（トークンの合成・第 2 の SELECT
+  パーサーなし）。ビューは `42809`、不在（他テナントのスキーマ配下を含む）は `42P01`、
+  列リスト内の重複は `42701`、存在しない列は束縛段の `42703`。オプションの解決・未適用拒否は
+  括弧形と共有ヘルパー（`parse_copy_to_tail`）で、`USING OPERATION_ID` は文末検査で `42601`。
+  行数上限は `--max-result-rows`（`ResultLimits`）で、`EngineCore::run_copy_to_scan` が
+  `LIMIT` を上限 + 1 に差し替えて取得し、超過は黙って切り詰めず `54000`
+  （`CopyOutResponse` より前に確定するため行は 1 件も送られない）。`begin_copy_validated`・
+  明示 txn の dirty 経路・一時表経路の 3 経路はすべてこの単一ヘルパーを通る。
+  プレースホルダの `limit: 0` は差し替え漏れ時に束縛の範囲検査で拒否される（fail-closed）。
 - COPY オプションの構文（Issue #1763・WIRE-22 ポインタ。`sql/copy_options.rs`）: 新構文
   `[WITH] (opt [value], ...)` と旧構文（`CSV HEADER`・`DELIMITER [AS] 's'` 等。順序任意）を
   受理し、簡易クエリ・拡張クエリの Parse で共通の検証を行う。エラー分類は、構文エラー・

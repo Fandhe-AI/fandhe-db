@@ -795,6 +795,15 @@ mod tests {
             classify_statement("COPY to TO STDOUT"),
             StatementEffect::ReadOnly
         );
+        // テーブル形 TO STDOUT（Issue #1771）は列リストの有無によらず読み取り扱い。
+        assert_eq!(
+            classify_statement("COPY t TO STDOUT"),
+            StatementEffect::ReadOnly
+        );
+        assert_eq!(
+            classify_statement("COPY t (a, b) TO STDOUT WITH (FORMAT csv)"),
+            StatementEffect::ReadOnly
+        );
     }
 
     #[test]

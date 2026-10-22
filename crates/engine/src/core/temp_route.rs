@@ -464,14 +464,7 @@ impl EngineCore {
                     let write_txn: &redb::WriteTransaction =
                         txn.temp_write_txn().ok_or_else(internal)?;
                     let schema = super::table_schema_in(write_txn, v.inner.table_name())?;
-                    let bound = crate::sql::parser::bind_scan_with_dummy_flags(
-                        &v.inner,
-                        &schema,
-                        session.udfs(),
-                        &[],
-                        &core.result_limits,
-                    )?;
-                    let result = core.run_scan_plan(write_txn, ctx, &schema, &bound)?;
+                    let result = core.run_copy_to_scan(write_txn, ctx, session, &schema, &v)?;
                     Ok(Some(super::CopyPlan::To(v.format, result)))
                 }
                 _ => Ok(Some(core.begin_copy_validated(
