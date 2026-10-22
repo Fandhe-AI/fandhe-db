@@ -455,10 +455,10 @@ Issue #1736 の対象省略形）。
   既存行の列として受理する（PostgreSQL で正しく動く文の結果は変わらない）。(b) 束縛段の `EXCLUDED.<src>` が
   NULL かつ代入先が NOT NULL の事前検査（`23502`）は、条件が偽で更新しない行でも残る（PostgreSQL は更新しない
   行の SET を評価しない。fail-closed 側の差異）。(c) `now()` 等の現在時刻関数は受理しない。
-- 内容照合ハッシュへの `WHERE` の反映は兄弟 Issue #1741 の担当。それまでは、同じ `operation_id` で `WHERE` だけ
-  異なる再送は内容不一致（`22023`）ではなく再送重複（`23505`）で拒否される（いずれも書き込みは起きない）。
-  `CompiledUpsertWhere` の元になる述語列は `BoundConflictAction::DoUpdate::condition` に残してあり、#1741 は
-  既存の `push_dml_where_predicates` へそのまま渡せる。
+- 内容照合ハッシュへ `WHERE` を反映済み（RECOVER-11。#1741 のハッシュ層契約を `tenant` が結線）。条件付き更新は
+  `UpsertHashAction::DoUpdateWhere`（述語列は `BoundConflictAction::DoUpdate::condition` から渡す）に変換される。
+  同じ `operation_id` で `WHERE` の有無・内容だけが異なる再送は内容不一致の `22023` で拒否され、同一内容の再送は
+  従来どおり `23505`（いずれも書き込みは起きない）。結合テストは `crates/engine/tests/sql49_upsert_do_update_where.rs`。
 - 対象外: ビュー経由・条件内 `$n`・サブクエリ・VECTOR/埋め込み参照・UDF・INSERT 対象表の別名・NoSQL 表層。
 
 ## Issue #1739 追記: `DO UPDATE SET` の右辺に一般の式を許可する（SQL-20・SQL-49・RECOVER-11 ポインタ）
@@ -504,7 +504,7 @@ Issue #1736 の対象省略形）。
 - 代入の value kind `3`（一般の式）を追加した。`UPDATE ... SET` の式と同じ直列化（数値リテラルの整数分類つき）。
   kind `0`／`1`／`2` のバイト列は不変。評価結果の値は含めない（RECOVER-11）。
 - `t.n` と修飾なしの `n` は同じ形になり、`EXCLUDED` 参照は予約接頭辞つきの列名として区別される。
-- #1741 に残るのは `DO UPDATE ... WHERE` のハッシュ化と、再送の冪等・不一致の網羅テスト。
+- `DO UPDATE ... WHERE` のハッシュ化は #1740 の結線で反映済み（上記「Issue #1740 追記」）。
 
 ## Issue #2428 追記: 並行加算と不可視衝突先の検証（SQL-20・SQL-49 ポインタ。`42501` 分岐は RLS-10・RLS-11）
 
@@ -539,5 +539,6 @@ Issue #1736 の対象省略形）。
 - UDF: SET の一般式（kind 3）は UPDATE の SET 式と同じく UDF 定義節を含めない。#1739 が UDF 呼び出しを受理する場合は、
   セッション UDF の拒否か定義節の追記を #1739 側の契約とする。WHERE 側は推移閉包を本層が含める。
 - 範囲: 本 Issue はハッシュ層の契約と単体テスト（golden 含む）まで。SQL 層の再送テスト
-  （同一文 → `23505`・式／WHERE 違い → `22023`）は #1739／#1740 の結線と同時に追加する。
+  （同一文 → `23505`・式／WHERE 違い → `22023`）は #1739／#1740 の結線と同時に追加した
+  （WHERE 側は `crates/engine/tests/sql49_upsert_do_update_where.rs`）。
   `INSERT ... SELECT ... ON CONFLICT` は送られた文のトークン列をハッシュするため対象外。

@@ -6,7 +6,8 @@
 //! `tenant::upsert_typed_rows_unchecked` の `DoUpdate` 腕での行ごとの評価）を production 経路として
 //! 検証する。期待値は PostgreSQL の `ON CONFLICT DO UPDATE ... WHERE`（条件が偽または NULL の
 //! 行は更新せず、件数・`RETURNING` にも数えない）に合わせてある。
-//! 内容照合ハッシュへの `WHERE` の反映（#1741）・ビュー経由・`$n` は本テストの対象外。
+//! 内容照合ハッシュへの `WHERE` の反映（再送の `22023`／`23505`）も本テストで固定する。
+//! ビュー経由・`$n` は本テストの対象外。
 
 use engine::catalog::{ColumnDef, ColumnType, TableSchema};
 use engine::core::EngineCore;
