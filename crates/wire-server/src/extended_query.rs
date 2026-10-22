@@ -2317,9 +2317,12 @@ fn execute_portal<'e, S: WireStream>(
             // 包みを外した元 SQL は `begin_copy*` が現在のカタログで再解決するため、Bind 後に
             // 同名の一時表が作られると宛先が化ける。通常経路の粗いゲートと同じ世代検査を先に行い、
             // 陳腐化した portal は `0A000` で拒否する。
-            parsed
-                .require_session_current(session)
-                .map_err(HandlerError::Sql)?;
+            if let Err(e) = parsed.require_session_current(session) {
+                // 通常経路（`execute_parsed_in_txn`）と同じく、検査失敗は明示 Tx を中断状態へ倒す
+                // （Sync 後 `E`。後続 COMMIT が以前の書き込みを確定しない）。
+                txn.fail();
+                return Err(HandlerError::Sql(e));
+            }
             return Ok(PortalExecution::Copy { sql });
         }
 

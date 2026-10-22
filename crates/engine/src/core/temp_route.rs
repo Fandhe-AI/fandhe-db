@@ -812,6 +812,11 @@ impl EngineCore {
                 // 一時表（または逆）へ化ける。一時カタログの世代つきで包み、Execute 前の
                 // `require_current` で陳腐化を `0A000` として拒否させる（fail-closed）。
                 if matches!(parsed, ParsedSql::Copy(_)) {
+                    // Parse 後に同名の一時表が作られていれば、他の文と同じく Bind 時点で陳腐化として
+                    // 拒否する（current と刻印して Execute で一時表へ化けさせない。fail-closed）。
+                    if crate::sql::temp_catalog::tokens_reference_temp(&prepared.tokens, temp) {
+                        return Err(crate::sql::temp_catalog::temp_statement_stale());
+                    }
                     return Ok(ParsedSql::SessionRouted(Box::new(
                         SessionRoutedSql::persistent_guarded(parsed, temp)
                             .stamped_with_path(session),

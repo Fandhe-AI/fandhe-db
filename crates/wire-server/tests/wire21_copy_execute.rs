@@ -495,3 +495,83 @@ fn extended_copy_respects_tenant_boundary() {
     }
     assert_eq!(errors[0], errors[1]);
 }
+/// Parse 後に同名の一時表が作られていれば、Bind の時点で `0A000` として拒否される
+/// （Bind が current と刻印して Execute で一時表へ化けさせない）。
+#[test]
+fn temp_table_created_between_parse_and_bind_is_rejected_with_0a000() {
+    let path = temp_db::unique_db_path("wire21-copy-temp-stale-parse");
+    let _g = temp_db::CleanupGuard(path.clone());
+    let storage = Storage::open(&path).expect("open storage");
+    storage
+        .create_table(&TableSchema::new(
+            "notes",
+            vec![ColumnDef::new("body", ColumnType::Text, false)],
+        ))
+        .expect("create table");
+    let core = Arc::new(EngineCore::from_storage(
+        storage,
+        Box::new(CpuScalarProvider),
+    ));
+    let mut s = connect(core);
+    send(
+        &mut s,
+        b'P',
+        &parse_body("st", "COPY notes (id, body) FROM STDIN", 0),
+    );
+    expect(&mut s, b'1');
+    send_simple_query(
+        &mut s,
+        "CREATE TEMP TABLE notes (id BIGINT PRIMARY KEY, body TEXT)",
+    );
+    expect_command_complete(&mut s, "CREATE TABLE");
+    assert_eq!(read_until_ready(&mut s), b'I');
+    send(&mut s, b'B', &bind_body("p", "st"));
+    let body = expect(&mut s, b'E');
+    assert!(
+        String::from_utf8_lossy(&body).contains("0A000"),
+        "{}",
+        String::from_utf8_lossy(&body)
+    );
+    sync(&mut s);
+    assert_eq!(expect(&mut s, b'Z'), b"I");
+    s.shutdown(Shutdown::Write).ok();
+}
+
+/// 明示 Tx の中で COPY により 1 行書き込む（Sync で Tx 状態 `T` を確認する）。
+fn load_rows_in_txn(s: &mut TcpStream) {
+    parse_bind(s, COPY_FROM, "w");
+    execute(s, "w");
+    flush(s);
+    expect(s, b'G');
+    send(s, b'd', ROW1);
+    send(s, b'c', b"");
+    expect_command_complete(s, "COPY 1");
+    sync(s);
+    assert_eq!(expect(s, b'Z'), b"T");
+}
+
+/// 明示 Tx で COPY を Bind した後に `search_path` を変えて Execute すると `0A000` となり、
+/// Tx は中断状態（Sync 後 `E`）になる。後続 COMMIT は以前の書き込みを確定しない。
+#[test]
+fn stale_copy_execute_in_explicit_transaction_fails_the_transaction() {
+    let (core, _g) = new_core();
+    let mut s = connect(core);
+    assert_eq!(simple(&mut s, "BEGIN"), b'T');
+    load_rows_in_txn(&mut s);
+    parse_bind(&mut s, COPY_FROM, "p");
+    assert_eq!(simple(&mut s, "SET search_path TO x"), b'T');
+    execute(&mut s, "p");
+    let body = expect(&mut s, b'E');
+    assert!(
+        String::from_utf8_lossy(&body).contains("0A000"),
+        "{}",
+        String::from_utf8_lossy(&body)
+    );
+    sync(&mut s);
+    assert_eq!(expect(&mut s, b'Z'), b"E");
+    // 中断状態の COMMIT は確定せず（`25P02`・状態 `E` のまま）、ROLLBACK で全て破棄される。
+    assert_eq!(simple(&mut s, "COMMIT"), b'E');
+    assert_eq!(simple(&mut s, "ROLLBACK"), b'I');
+    assert_eq!(count_rows(&mut s), 0);
+    s.shutdown(Shutdown::Write).ok();
+}
