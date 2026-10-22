@@ -4619,6 +4619,16 @@ pub enum SetValue {
     Literal(InsertLiteral),
     /// 式（`SET a = a + 1`・`SET t = upper(t)` 等）。
     Expr(Expr),
+    /// 右辺が裸の `DEFAULT` キーワード（`SET a = DEFAULT`。SQL-50・Issue #1746）。
+    /// 列の既定値（未定義なら NULL）を代入する意味で、解決は束縛段
+    /// （`sql::parser::bind_set_assignments`）が担う。検出は UPDATE 専用の
+    /// `Parser::parse_update_assignment` のみで、`ON CONFLICT ... DO UPDATE SET` では
+    /// 生成されない（そちらは構文段で `42601`。`UpsertValue` への写像の防御腕は
+    /// `reject_default_keyword_literal` により `0A000` だが到達不能）。
+    ///
+    /// **BREAKING CHANGE**（Issue #1746）: variant 追加。`SetValue` を網羅 `match` する
+    /// 呼び出し元は腕の追加が必要。
+    Default,
 }
 
 /// 許可形状の構造判定を通過した UPDATE 文（SQL-17、TASK-191）。`ValidatedInsert` と
@@ -9875,6 +9885,9 @@ impl<'a> Parser<'a> {
         let value = match self.expect_literal_or_set_expr()? {
             SetValue::Literal(lit) => UpsertValue::Literal(lit),
             SetValue::Expr(expr) => UpsertValue::Expr(expr),
+            // `expect_literal_or_set_expr` は `Default` を返さない（上で先に拒否済み）。
+            // 到達は構築ミスのみで、黙って丸めず fail-closed に拒否する。
+            SetValue::Default => return Err(crate::sql::parser::reject_default_keyword_literal()),
         };
         Ok((column, value))
     }
@@ -10152,6 +10165,13 @@ impl<'a> Parser<'a> {
     fn parse_update_assignment(&mut self) -> Result<(String, SetValue), SqlSurfaceError> {
         let column = self.expect_ident()?;
         self.expect_punct('=')?;
+        // 裸の `DEFAULT`（SQL-50・Issue #1746）。引用付き `"DEFAULT"` は lexer が
+        // `quoted_null` に記録するため列参照のまま。直後の余剰トークン（`DEFAULT + 1` 等）は
+        // 文末検査が `42601` に落とす。
+        if self.peek_ident_matches("DEFAULT") && !self.quoted_null.contains(&self.pos) {
+            self.advance();
+            return Ok((column, SetValue::Default));
+        }
         let value = self.expect_literal_or_set_expr()?;
         Ok((column, value))
     }
@@ -23856,6 +23876,33 @@ mod tests {
         );
         // 構造として受理しない形は従来どおり `42601`。
         for rhs in ["+n", "n +", "n + (", "1 2"] {
+            assert_eq!(parse(rhs).unwrap_err().wire_code(), "42601", "{rhs}");
+        }
+    }
+
+    /// `SET c = DEFAULT`（SQL-50・Issue #1746）は大小無視で `SetValue::Default`、引用付きは列参照、
+    /// 余剰トークンは `42601`。
+    #[test]
+    fn update_set_default_keyword_is_parsed_only_when_bare() {
+        let lookup = catalog_with(&["documents"]);
+        let parse = |rhs: &str| {
+            validate_update(
+                &format!(
+                    "UPDATE documents SET n = {rhs} WHERE id = 1 USING OPERATION_ID 'op-sd-1'"
+                ),
+                &lookup,
+                LedgerMode::Ledgered,
+            )
+            .map(|u| u.assignments)
+        };
+        for rhs in ["DEFAULT", "default", "Default"] {
+            assert_eq!(parse(rhs).unwrap()[0].1, SetValue::Default, "{rhs}");
+        }
+        assert!(matches!(
+            parse("\"DEFAULT\"").unwrap()[0].1,
+            SetValue::Expr(_)
+        ));
+        for rhs in ["DEFAULT + 1", "DEFAULT::int", "DEFAULT DEFAULT"] {
             assert_eq!(parse(rhs).unwrap_err().wire_code(), "42601", "{rhs}");
         }
     }

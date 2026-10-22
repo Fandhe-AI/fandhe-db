@@ -383,5 +383,29 @@ fail-closed で拒否していた。Issue #1169 で読み出し時補完（行�
   （表でない・引けない場合は従来どおり `Text`）。`DEFAULT` は序数を 1 つ消費するだけ。
 - **fail-closed**: `InsertLiteral::Default` を想定外の束縛経路（数値・整数列の共通ヘルパー・UPSERT の
   `DO UPDATE`・ファイル形・内容照合ハッシュの UPDATE 材料化）で受け取ったら固定文言の `0A000` で拒否する。
-- **後続候補（範囲外）**: ビューへの列リスト省略 INSERT、`UPDATE ... SET c = DEFAULT`、複数行 `id` 列の
+- **後続候補（範囲外）**: ビューへの列リスト省略 INSERT、複数行 `id` 列の
   明示値と `DEFAULT` の混在。
+
+## Issue #1746 追記: UPDATE の `SET col = DEFAULT`（SQL-50）
+
+親 #1730 の対象外だった UPDATE 側を実装した（TABLE-16・TABLE-39 (1)(6)・RECOVER-10・RECOVER-11・
+RLS-9・RLS-10 のポインタ。spec 本文は転記しない）。
+
+- **構文**: `SetValue::Default` を追加（公開 enum への variant 追加＝破壊的変更）。検出は UPDATE 専用の
+  `parse_update_assignment` に限り、裸の `DEFAULT`（大小無視）のみ。引用付き `"DEFAULT"` は列参照のまま
+  （存在しなければ `42703`）。`DEFAULT + 1` 等の余剰トークンは `42601`。`ON CONFLICT ... DO UPDATE SET` は
+  従来どおり `42601` 拒否（`UpsertValue` 写像の防御腕は `0A000`）。
+- **束縛**: 疑似列・RLS 内部列（`42601`）→ 重複 → 未知列（`42703`）の後、`GENERATED ALWAYS` 判定より前に
+  解決する。列 DEFAULT があればその定数、無ければ `SET c = NULL` と同じ規則（nullable は NULL、NOT NULL は
+  `23502`、VECTOR は `22000`）。束縛段のエラーは行の有無に依存しない（存在オラクルを作らない）。
+- **搬送**: 解決値は式項と同じ `set_exprs` 経路（`BoundSetExpr::default_value`）で運ぶ。これにより束縛時
+  スキーマとの `expected_schema` 照合（束縛後の `ALTER ... SET DEFAULT` で古い既定を書かない）・分割実行・
+  スキーマ無しの公開入口での拒否が式と同じく得られる。
+- **内容照合ハッシュ**: 解決値ではなく構文形の印を入れる。述語形・分割実行はタグ 7（本体なし）、id 指定形は
+  `UpdateColumnHashItem::Default`（印 2）。したがって列 DEFAULT 変更を挟んだ同一文の再送は `23505`、
+  `DEFAULT` を等価リテラルへ替えた同一 OPERATION_ID は `22023`。DEFAULT を含まない文のバイト列は不変。
+- **ビュー**: 名前写像のみで通し、基表の列 DEFAULT が効く。
+- **PG との差分（fail-closed）**: 時刻関数・SEQUENCE・IDENTITY の列 DEFAULT は UPDATE では評価文脈が無く
+  `0A000`（PG は受理）。`GENERATED ALWAYS` 列への `SET id = DEFAULT` も同じく `0A000`。
+- **後続候補（範囲外）**: UPSERT の `DO UPDATE SET c = DEFAULT`、行値代入 `SET (a, b) = (...)`、上記
+  評価文脈つき DEFAULT の UPDATE 評価。NoSQL 表層は SQL-50 の定義どおり対象外。
