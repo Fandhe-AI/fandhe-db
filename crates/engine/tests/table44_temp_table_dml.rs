@@ -848,7 +848,7 @@ fn copy_out<'e>(
     sql: &str,
 ) -> Result<usize, String> {
     match core.begin_copy_in_txn(&ctx(TENANT), s, t, sql) {
-        Ok(CopyPlan::To(_, result)) => Ok(result.rows.len()),
+        Ok(CopyPlan::To(_, result, _)) => Ok(result.rows.len()),
         Ok(CopyPlan::From(_)) => panic!("expected COPY TO plan"),
         Err(e) => Err(e.wire_code().to_string()),
     }

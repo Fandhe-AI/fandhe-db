@@ -1,9 +1,9 @@
 //! `COPY ... FROM STDIN` の `WITH` オプション適用（HEADER・DELIMITER・NULL・QUOTE・ESCAPE。
 //! Issue #1764・WIRE-22・WIRE-17・INDEX-4 のポインタ）の engine API 層の結合テスト。
 //! `EngineCore::begin_copy`／`CopyInSession::feed`／`finish`／`commit_copy_in` を wire-server の
-//! CopyIn ハンドラと同じ順で駆動する。オプション付き COPY TO は Issue #1765 の担当のため、
-//! 往復は「PostgreSQL 17 が当該オプションで出力するのと同じバイト列」を入力として取り込み、
-//! SELECT で読み戻した値と一致することで確かめる。
+//! CopyIn ハンドラと同じ順で駆動する。オプション付き COPY TO との往復は wire-server の
+//! 結合テスト（Issue #1765）が担い、ここでは「PostgreSQL 17 が当該オプションで出力するのと
+//! 同じバイト列」を入力として取り込み、SELECT で読み戻した値と一致することで確かめる。
 
 use engine::catalog::{ColumnDef, ColumnType, TableSchema};
 use engine::core::{CopyPlan, EngineCore};

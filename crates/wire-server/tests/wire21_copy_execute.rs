@@ -575,3 +575,28 @@ fn stale_copy_execute_in_explicit_transaction_fails_the_transaction() {
     assert_eq!(count_rows(&mut s), 0);
     s.shutdown(Shutdown::Write).ok();
 }
+/// WIRE-22・Issue #1765: 拡張クエリ経由の COPY TO も同じ出力経路を通り、HEADER・DELIMITER が
+/// 適用される（ヘッダは先頭の CopyData で、`COPY n` の n に含まれない）。
+#[test]
+fn copy_to_stdout_applies_header_and_delimiter_via_extended_query() {
+    let (core, _g) = new_core();
+    let mut s = connect(core);
+    load_two_rows_extended(&mut s);
+    parse_bind(
+        &mut s,
+        "COPY (SELECT id, body FROM documents LIMIT 100) TO STDOUT WITH (FORMAT csv, HEADER, DELIMITER ';')",
+        "o",
+    );
+    execute(&mut s, "o");
+    flush(&mut s);
+    expect(&mut s, b'H');
+    assert_eq!(expect(&mut s, b'd'), b"id;body\n");
+    let mut rows = vec![expect(&mut s, b'd'), expect(&mut s, b'd')];
+    rows.sort();
+    assert_eq!(rows, vec![b"1;alpha\n".to_vec(), b"2;beta\n".to_vec()]);
+    expect(&mut s, b'c');
+    expect_command_complete(&mut s, "COPY 2");
+    sync(&mut s);
+    assert_eq!(expect(&mut s, b'Z'), b"I");
+    s.shutdown(Shutdown::Write).ok();
+}
