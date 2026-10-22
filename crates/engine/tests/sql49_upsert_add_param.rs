@@ -375,3 +375,35 @@ fn other_tenants_rows_are_not_added_to() {
     assert_eq!(cell(&core, &bob, 1, "n"), int(100));
     assert_eq!(cell(&core, &carol, 1, "n"), int(1000));
 }
+
+#[test]
+fn param_type_is_inferred_for_default_values_and_trailing_semicolon() {
+    let (core, path) = open_engine("sql49-addp-defvals");
+    let _g = CleanupGuard(path);
+    // `DEFAULT VALUES` 形は列リストも VALUES も無いが、表名から代入先列の型を引く。
+    for sql in [
+        format!(
+            "INSERT INTO {TABLE} DEFAULT VALUES ON CONFLICT (id) DO UPDATE SET n = n + $1 \
+             USING OPERATION_ID '{}'",
+            op()
+        ),
+        // 末尾の `;` を伴う形でも位置検査を通り、型が引ける。
+        format!(
+            "INSERT INTO {TABLE} (id, embedding, n) VALUES (1, '[0.1,0.2]', 0) \
+             ON CONFLICT (id) DO UPDATE SET n = n + $1 \
+             USING OPERATION_ID '{}';",
+            op()
+        ),
+    ] {
+        assert!(
+            matches!(
+                slot_type(&core, &sql),
+                PreparedParamType::Column(ColumnMeta::Scalar {
+                    ty: ColumnType::Integer,
+                    ..
+                })
+            ),
+            "{sql}"
+        );
+    }
+}

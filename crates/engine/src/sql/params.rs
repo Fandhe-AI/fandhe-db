@@ -668,7 +668,12 @@ fn upsert_set_region(tokens: &[Token]) -> Option<(usize, usize)> {
             _ => {}
         }
     }
-    start.map(|s| (s, tokens.len()))
+    // 末尾の文終端 `;` は節の一部ではないため領域から除く（`... n + $1;` を受理する）。
+    let mut end = tokens.len();
+    while end > 0 && matches!(tokens.get(end.saturating_sub(1)), Some(Token::Punct(';'))) {
+        end = end.saturating_sub(1);
+    }
+    start.map(|s| (s, end.max(s)))
 }
 
 /// パターン 8 の走査。[`upsert_set_region`] の領域を前向きに 1 パスで走り、括弧深さ 0 の
@@ -2106,6 +2111,26 @@ mod tests {
                 "{sql}"
             );
         }
+    }
+
+    #[test]
+    fn accepts_upsert_add_param_with_trailing_semicolon() {
+        let sql = "INSERT INTO t (id, n) VALUES (1, 0) ON CONFLICT (id) DO UPDATE SET n = n + $1;";
+        assert_eq!(positions(sql).unwrap(), 1, "{sql}");
+        assert_eq!(
+            positions_of(sql),
+            vec![vec![ParamPosition::UpsertAddColumn("n".to_string())]],
+        );
+    }
+
+    #[test]
+    fn accepts_upsert_add_param_with_default_values() {
+        let sql = "INSERT INTO t DEFAULT VALUES ON CONFLICT (id) DO UPDATE SET n = n + $1";
+        assert_eq!(positions(sql).unwrap(), 1, "{sql}");
+        assert_eq!(
+            positions_of(sql),
+            vec![vec![ParamPosition::UpsertAddColumn("n".to_string())]],
+        );
     }
 
     #[test]

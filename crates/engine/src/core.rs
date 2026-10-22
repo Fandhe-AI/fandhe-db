@@ -128,6 +128,20 @@ fn insert_table_without_column_list(tokens: &[crate::sql::lexer::Token]) -> Opti
     }
 }
 
+/// `INSERT INTO <表>` の表名だけを読む（Issue #2427。`DEFAULT VALUES ON CONFLICT ...` 形のように
+/// 列リストも `VALUES` も無い INSERT でも、加算式の `$n` の型を表の列から引くための補完）。
+fn insert_table_name_only(tokens: &[crate::sql::lexer::Token]) -> Option<String> {
+    use crate::sql::lexer::Token;
+    let is_word = |t: Option<&Token>, w: &str| matches!(t, Some(Token::Ident(x)) if x.eq_ignore_ascii_case(w));
+    if !is_word(tokens.first(), "INSERT") || !is_word(tokens.get(1), "INTO") {
+        return None;
+    }
+    match tokens.get(2) {
+        Some(Token::Ident(table) | Token::QuotedNull(table)) => Some(table.clone()),
+        _ => None,
+    }
+}
+
 /// トークン列のうち括弧深さ 0 で最初の `FROM` の添字を返す（Issue #1188）。`EXTRACT(field
 /// FROM src)` の括弧内 `FROM` をテーブル名の手掛かりと取り違えないための走査で、
 /// prepared statement のパラメータ型推論（`EngineCore::prepare_*`）が呼ぶ。
@@ -5676,9 +5690,11 @@ impl EngineCore {
                         // リテラル経路が束縛段で返すのと同じ `42883`／`0A000` を Parse で返す
                         // （静的文言のみ・値を含めない）。引けない場合は `Text`（存在を観測させない）。
                         ParamPosition::UpsertAddColumn(col) => {
-                            let ty = insert_target
+                            let upsert_table = insert_target
                                 .as_ref()
-                                .and_then(|(t, _)| column_type(t, col));
+                                .map(|(t, _)| t.clone())
+                                .or_else(|| insert_table_name_only(tokens));
+                            let ty = upsert_table.as_deref().and_then(|t| column_type(t, col));
                             if let Some(PreparedParamType::Column(ColumnMeta::Scalar {
                                 ty: col_ty,
                                 ..
