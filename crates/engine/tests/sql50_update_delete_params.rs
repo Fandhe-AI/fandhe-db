@@ -4,7 +4,7 @@
 //! 固定する内容: (1) `WHERE <列> = $n`（SELECT と同じ位置規則）と `SET <列> = $n`／式内 `$n` の
 //! 束縛結果が同じ値を書いたリテラル文の `parse_sql` 結果・実行結果と一致すること、
 //! (2) `param_types()` の型、(3) 型の合わない値の fail-closed な拒否（値は応答に含めず、
-//! 表は変わらない）、(4) SELECT と同じ規則で `42601` になる形（非等価は #2429 の範囲）、
+//! 表は変わらない）、(4) SELECT と同じ規則で `42601` になる形（非等価・BETWEEN は #2431 で受理済み）、
 //! (5) NULL の Bind がリテラル `= NULL` と同値、(6) テナント境界と明示トランザクション。
 //! wire 層（text／binary の Bind）は `crates/wire-server/tests/wire_sql50_update_delete_param.rs`。
 
@@ -234,7 +234,7 @@ fn mismatched_values_are_rejected_fail_closed_without_side_effects() {
 
 /// SELECT の WHERE と同じ規則: 許可位置以外の `$n` は UPDATE／DELETE でも `42601`。
 /// 非等価・BETWEEN の `$n` は #2430 で SELECT が受理側へ移ったため、別テスト
-/// `noneq_and_between_positions_select_only` で SELECT との差分を固定する。
+/// `noneq_and_between_positions_match_select` で SELECT との一致を固定する。
 #[test]
 fn unsupported_positions_match_select_rule() {
     let (core, _g) = setup("sql50-udp-rules");
@@ -263,10 +263,9 @@ fn unsupported_positions_match_select_rule() {
     }
 }
 
-/// 非等価・BETWEEN の `$n` は SELECT のみ受理（#2430）。UPDATE／DELETE は別 Issue で
-/// 受理するまで fail-closed の `42601` を維持する（SELECT との差分をここで固定する）。
+/// 非等価・BETWEEN の `$n` は SELECT と同じく UPDATE／DELETE でも受理（#2430・#2431）。
 #[test]
-fn noneq_and_between_positions_select_only() {
+fn noneq_and_between_positions_match_select() {
     let (core, _g) = setup("sql50-udp-noneq");
     for pred in ["n <> $1", "n < $1", "n BETWEEN $1 AND $2"] {
         let sel = core
@@ -282,8 +281,19 @@ fn noneq_and_between_positions_select_only() {
                 .parse_sql_prepared(&sql)
                 .err()
                 .map(|e| e.wire_code().to_string());
-            assert_eq!(got.as_deref(), Some("42601"), "{sql}");
+            assert_eq!(got, sel, "{sql}");
         }
+    }
+    // 範囲外の形（逆向き）は引き続き fail-closed。
+    for sql in [
+        "UPDATE t SET s = 'x' WHERE $1 < n",
+        "DELETE FROM t WHERE $1 < n",
+    ] {
+        let got = core
+            .parse_sql_prepared(sql)
+            .err()
+            .map(|e| e.wire_code().to_string());
+        assert_eq!(got.as_deref(), Some("42601"), "{sql}");
     }
 }
 

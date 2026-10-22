@@ -1,5 +1,5 @@
 //! `SELECT` の `WHERE` の非等価比較（`<`・`>`・`<=`・`>=`・`<>`／`!=`）と `[NOT] BETWEEN` で
-//! `$n` を受理し、比較相手の列の型を推論する契約（Issue #2430）の結合テスト。
+//! `$n` を受理し、比較相手の列の型を推論する契約（Issue #2430。述語形 UPDATE／DELETE は Issue #2431 の別ファイル）の結合テスト。
 //!
 //! ポインタ: SQL-78（主）・SQL-24・WIRE-12、TASK-336。`parse_sql_prepared*` → `param_types` →
 //! Describe → `bind_prepared` → `execute_parsed_in_session` の本番経路を実 `Storage` 越しに通し、
@@ -402,9 +402,9 @@ fn out_of_scope_forms_stay_42601() {
         "SELECT id FROM t WHERE n > $1 + 1 LIMIT 5",
         // 相手が数値リテラル・関数
         "SELECT id FROM t WHERE $1 < 5 LIMIT 5",
-        // UPDATE／DELETE は #2431 の範囲
-        "UPDATE t SET n = 1 WHERE n > $1 USING OPERATION_ID 'x'",
-        "DELETE FROM t WHERE n BETWEEN $1 AND $2 USING OPERATION_ID 'x'",
+        // UPDATE／DELETE は #2431 で受理済み。ここでは範囲外の形（逆向き）の拒否を維持する
+        "UPDATE t SET n = 1 WHERE $1 < n USING OPERATION_ID 'x'",
+        "DELETE FROM t WHERE n BETWEEN 1 AND $1 USING OPERATION_ID 'x'",
         // 集合演算
         "SELECT id FROM t WHERE n > $1 UNION SELECT id FROM t WHERE n < 3 LIMIT 5",
         // GROUP BY の後ろ

@@ -51,12 +51,12 @@
 //!    代入先列から推論する。左右の列が異なる形・`$n + <列>`・`+ $n + 1`・`EXCLUDED.<列> + $n` は
 //!    `42601`。
 //!
-//! 9. `SELECT ... WHERE <列> (< | > | <= | >= | <>) $n`・`WHERE <列> [NOT] BETWEEN $a AND $b`
-//!    （Issue #2430・SQL-78・SQL-24・WIRE-12 のポインタ。先頭語が `SELECT` で集合演算を持たない
-//!    文の `WHERE` 節内に限る。`$n` の型は比較相手の列の型で、列を引けなければ `text`。
+//! 9. `SELECT／UPDATE／DELETE ... WHERE <列> (< | > | <= | >= | <>) $n`・`WHERE <列> [NOT] BETWEEN $a AND $b`
+//!    （Issue #2430・#2431・SQL-78・SQL-24・WIRE-12 のポインタ。先頭語が `SELECT`／`UPDATE`／
+//!    `DELETE` で集合演算を持たない文〔`INSERT ... ON CONFLICT DO UPDATE ... WHERE` は対象外〕の `WHERE` 節内に限る。`$n` の型は比較相手の列の型で、列を引けなければ `text`。
 //!    `$n op $m`〔両辺とも `$n`〕は型を決められず、宣言型も無ければ Parse で `42P18`）。
 //!    受理の判定は `noneq_leaf_at` に集約する。逆向き（`$n < <列>`）・片側だけが `$n` の
-//!    `BETWEEN`・相手がリテラル／式の比較・`UPDATE`／`DELETE` は `42601` のまま。
+//!    `BETWEEN`・相手がリテラル／式の比較は `42601` のまま。
 //!
 //! `LIMIT $n`・`USING MODE $n`・`HINT ORDER($n, ...)`・`SET search_mode = $n`・
 //! `ON CONFLICT ... DO UPDATE SET a = $n`（`$n` 単独の右辺。加算形はパターン 8）・hybrid 関数
@@ -597,8 +597,8 @@ fn noneq_leaf_at(tokens: &[Token], i: usize, start: usize, end: usize) -> Option
     }
 }
 
-/// パターン 9 の `$n` のトークン添字 → 分類。先頭語が `SELECT` で集合演算を持たない文に限る
-/// （`UPDATE`／`DELETE` は Issue #2431 の範囲。集合演算は枝ごとに Describe 用フラグの序数が
+/// パターン 9 の `$n` のトークン添字 → 分類。先頭語が `SELECT`／`UPDATE`／`DELETE`（Issue #2431）
+/// で集合演算を持たない文に限る（集合演算は枝ごとに Describe 用フラグの序数が
 /// 0 から始まり対応がずれるため対象外）。それ以外は空で、該当する `$n` は `42601` のまま。
 fn where_noneq_param_slots(tokens: &[Token]) -> HashMap<usize, WhereParamShape> {
     where_noneq_param_slots_and_bounds(tokens).0
@@ -622,11 +622,14 @@ fn where_noneq_param_slots_and_bounds(
 ) -> (HashMap<usize, WhereParamShape>, HashSet<usize>) {
     let mut out = HashMap::new();
     let mut bounds = HashSet::new();
-    if !matches!(
+    // 先頭語の明示 allowlist（`SELECT`・`UPDATE`・`DELETE`）。`INSERT ... ON CONFLICT DO UPDATE
+    // ... WHERE`・`WITH`・`EXPLAIN` 等は対象外のまま `42601` に倒す（fail-closed）。
+    let head_ok = matches!(
         tokens.first(),
         Some(Token::Keyword(crate::sql::lexer::Keyword::Select))
-    ) || has_set_operator_branch(tokens)
-    {
+    ) || ident_eq_ignore_case(tokens.first(), "UPDATE")
+        || ident_eq_ignore_case(tokens.first(), "DELETE");
+    if !head_ok || has_set_operator_branch(tokens) {
         return (out, bounds);
     }
     let Some((start, end)) = where_region(tokens) else {
@@ -2709,6 +2712,24 @@ mod tests {
         }
     }
 
+    // Issue #2431・SQL-78: 述語形 UPDATE／DELETE の WHERE でも同じ位置を受理する。
+    #[test]
+    fn accepts_predicate_dml_where_non_equality_and_between_positions() {
+        for sql in [
+            "UPDATE documents SET s = 'x' WHERE n > $1",
+            "UPDATE documents SET s = 'x' WHERE n <= $1 RETURNING id",
+            "UPDATE documents SET s = $1 WHERE n >= $2 USING OPERATION_ID 'x'",
+            "UPDATE documents SET s = 'x' WHERE n <> $1 AND m != $2",
+            "UPDATE documents SET s = 'x' WHERE n NOT BETWEEN $1 AND $2",
+            "DELETE FROM documents WHERE n < $1",
+            "DELETE FROM documents WHERE n BETWEEN $1 AND $2 RETURNING n",
+            "DELETE FROM documents WHERE n > $1 USING OPERATION_ID 'x'",
+            "DELETE FROM documents WHERE $1 < $2",
+        ] {
+            assert!(positions(sql).is_ok(), "{sql}");
+        }
+    }
+
     #[test]
     fn rejects_non_equality_positions_outside_pattern_9() {
         for sql in [
@@ -2723,9 +2744,16 @@ mod tests {
             "SELECT * FROM documents WHERE n > $1::int LIMIT 5",
             // GROUP BY／HAVING の後ろ
             "SELECT n FROM documents GROUP BY n HAVING n > $1",
-            // SELECT 以外・集合演算
-            "UPDATE documents SET n = 1 WHERE n > $1 USING OPERATION_ID 'x'",
-            "DELETE FROM documents WHERE n > $1 USING OPERATION_ID 'x'",
+            // 述語形 UPDATE／DELETE でも範囲外の形は拒否（Issue #2431）
+            "UPDATE documents SET n = 1 WHERE $1 < n",
+            "DELETE FROM documents WHERE $1 < n",
+            "DELETE FROM documents WHERE n BETWEEN $1 AND 2",
+            "DELETE FROM documents WHERE n > $1 + 1",
+            "UPDATE documents SET n = 1 WHERE n > $1::int",
+            "UPDATE documents SET n = 1 WHERE 1 + n > $1",
+            // INSERT ... ON CONFLICT DO UPDATE ... WHERE は対象外
+            "INSERT INTO documents (id, n) VALUES (1, 2) ON CONFLICT (id) DO UPDATE SET n = 3 WHERE documents.n > $1",
+            // 集合演算
             "SELECT id FROM t WHERE n > $1 UNION SELECT id FROM t WHERE n < 3",
         ] {
             assert!(positions(sql).is_err(), "{sql}");
