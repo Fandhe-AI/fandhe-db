@@ -169,9 +169,29 @@ node pg（`values` 付き `query`）・psql `\bind`・JDBC 等、パラメータ
    `USING OPERATION_ID|PLAN`）。`$n` の型は INSERT 対象表の代入先列の型（列リスト省略形は
    表の宣言順の列）。詳細は下記「ON CONFLICT 加算式の `$n`（パターン 8）」
 
+9. `SELECT ... WHERE <列> (< | > | <= | >= | <>) $n`・`WHERE <列> [NOT] BETWEEN $a AND $b`
+   （Issue #2430・SQL-78・SQL-24・WIRE-12 のポインタ）。先頭語が `SELECT` で集合演算を持たない文の
+   `WHERE` 節内に限る。`$n` の型は比較相手の列の型（疑似列 `id` は `id` の型）で、表・列を引けなければ
+   `text`（存在を応答コードで観測させない）。`$n op $m`（両辺とも `$n`）は型を決められず、同じ番号の
+   別の出現で決まればその型、無ければ宣言型、それも無ければ Parse で `42P18`（構文エラー `42601` が先）。
+   判定は `sql::params::noneq_leaf_at` の 1 関数に集約し、受理・型の分類・Describe 用ダミーフラグの
+   3 箇所が共有する（`1 + col > $1`・`col > $1 + 1`・`col > $1::int` を葉と取り違えないため、葉の前後の
+   境界も検査する）。置換後のトークン列は既存の構造葉（`Compare`・`Between`・`Not(Equality)`）または
+   数値の式述語になり、第 2 の実行器・パーサーを作らない。
+   - **範囲外（`42601` のまま）**: 逆向き `$n op <列>`（置換後が式述語へ回り、Describe のダミー値を
+     省略する仕組みを通らない）、片側だけが `$n` の `BETWEEN`（1 葉 1 フラグのため実リテラル側の
+     Describe 検証が省略される）、左辺が `$n` の `BETWEEN`、相手がリテラル・関数・式の比較、
+     `UPDATE`／`DELETE`（Issue #2431）、集合演算（枝ごとにフラグの序数が 0 から始まる既存の制約）、
+     `LIKE`・`IN` リスト
+   - **序数の不変条件**: トークン走査で宣言的な葉（`Ident op (文字列リテラル|String 種別の $n)` の
+     `Equality`／`Not(Equality)`／`Compare`、文字列の `Between`）を 1 つ見つけるごとにフラグを 1 つ積み、
+     束縛側（`sql::parser::bind_where_predicates_recursive`）はその葉をどの経路（宣言的・数値列の
+     書き換え・TEXT 範囲の式化・BOOLEAN の書き換え）で処理しても序数を 1 つ進める。
+     数値・真偽値種別の `$n` は式述語になるため数えない
+
 `LIMIT $n`・`USING MODE $n`・`HINT ORDER($n, ...)`・`SET search_mode = $n`・
 `ON CONFLICT ... DO UPDATE SET a = $n`（`$n` 単独の右辺。加算形はパターン 8）・hybrid 関数
-引数（`HYBRID_RRF(col, $n, ...)`）・非等価比較（`id > $n` 等）はいずれも
+引数（`HYBRID_RRF(col, $n, ...)`）・パターン 9 以外の非等価比較（`id > $n` 等）はいずれも
 `sql::params::validate_param_positions` の位置判定に含めておらず、構造的に
 `42601` へ落ちる（`sql::params` の単体テスト・`crates/engine/tests/
 prepared_params.rs` で固定）。
@@ -452,7 +472,7 @@ Bind 値 `None`（SQL NULL）は、`sql::params` が裸の `Token::Ident("NULL")
   推論になることを確認した。
 - NULL パラメータ値は #2439 で解消済み（上記節）。リテラル `<列> = NULL` 自体が未対応の
   位置（`42703`）は SQL-41 系の別課題。
-- 追加のプレースホルダ位置（`LIMIT $n`・非等価 WHERE 比較・`ON CONFLICT ... SET`（加算形 `n = n + $1` は Issue #2427 で受理済み）・
+- 追加のプレースホルダ位置（`LIMIT $n`・非等価 WHERE 比較〔SELECT は Issue #2430 で受理済み。UPDATE／DELETE は #2431〕・`ON CONFLICT ... SET`（加算形 `n = n + $1` は Issue #2427 で受理済み）・
   hybrid 関数引数・`LIKE $n`。`UPDATE ... SET col = $n` は Issue #1544 で受理済み）。
 - 層 B（psycopg 3／node pg／psql 実クライアントでの `make e2e-three-client`
   相当）→ **Issue #1176 で実施済み**（`crates/wire-server/tests/
