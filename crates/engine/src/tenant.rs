@@ -4496,11 +4496,7 @@ pub(crate) fn update_row_columns_capturing_unchecked(
                                 .to_string(),
                         ))
                     })?;
-                    items.push((
-                        *idx,
-                        column.name.as_str(),
-                        content_hash::UpdateColumnHashItem::Expr(set.source()),
-                    ));
+                    items.push((*idx, column.name.as_str(), set.hash_item()));
                 }
                 items.sort_by_key(|(idx, _, _)| *idx);
                 let ordered: Vec<(&str, content_hash::UpdateColumnHashItem<'_>)> = items
