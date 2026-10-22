@@ -58,6 +58,10 @@
 //!   （Issue #1703。`engine::recovery::required_op_id::LedgerMode` へ CLI から
 //!   到達する唯一の入口。`EngineCore::with_ledger_mode` への注入は
 //!   `main.rs::run_server` の責務）
+//! - [`require_where_for_dml_opt`]: `--require-where-for-dml` 値なしスイッチの解決
+//!   （Issue #2210。`WHERE` 省略の `UPDATE`／`DELETE` を拒否する engine の opt-in へ CLI から
+//!   到達する唯一の入口。`EngineCore::with_require_where_for_dml` への注入は
+//!   `main.rs::run_server` の責務）
 //! - [`server`]: 接続受け付けループ・同時接続数の有界化・I/O タイムアウト適用
 //!   （契約値・実装は [`limits`] に委譲）
 //! - [`limits`]: 読み取りタイムアウト・共有接続数リミッター（TASK-69・WIRE-5, WIRE-6）
@@ -148,6 +152,7 @@ pub mod limits;
 pub mod nesting_limits_opt;
 pub mod protocol_dispatch;
 pub mod require_operation_id_opt;
+pub mod require_where_for_dml_opt;
 pub(crate) mod response_buffer;
 pub mod result_encoder;
 pub mod result_limits_opt;
