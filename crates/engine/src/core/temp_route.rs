@@ -465,7 +465,7 @@ impl EngineCore {
                         txn.temp_write_txn().ok_or_else(internal)?;
                     let schema = super::table_schema_in(write_txn, v.inner.table_name())?;
                     let result = core.run_copy_to_scan(write_txn, ctx, session, &schema, &v)?;
-                    Ok(Some(super::CopyPlan::To(v.format, result)))
+                    Ok(Some(super::CopyPlan::To(v.format, result, v.options)))
                 }
                 _ => Ok(Some(core.begin_copy_validated(
                     ctx,

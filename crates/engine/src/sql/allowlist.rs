@@ -20100,7 +20100,7 @@ pub struct ValidatedCopyFrom {
 pub struct ValidatedCopyTo {
     pub inner: Box<ValidatedScan>,
     pub format: CopyFormat,
-    /// 解決済みの `WITH` オプション（Issue #1763。適用は Issue #1765。それまでは既定値のみ受理）。
+    /// 解決済みの `WITH` オプション（Issue #1763。TO 側の出力経路が Issue #1765 で適用する）。
     pub options: copy_options::CopyOptions,
     /// テーブル形（`COPY <table> TO STDOUT`）なら真。括弧形は偽。`pub(crate)` のため
     /// クレート外は構造体リテラルで組み立てられない（検証経路のみが生成する）。
@@ -20482,8 +20482,6 @@ fn parse_copy_to_tail(
     let raw_options = p.parse_copy_option_list()?;
     let (format, options) = copy_options::resolve(raw_options, copy_options::CopyDirection::To)?;
     p.expect_end_of_statement()?;
-    // データ経路が未適用のオプションは fail-closed（Issue #1765 が外す）。
-    copy_options::reject_unapplied_for_to(format, &options)?;
     Ok((format, options))
 }
 

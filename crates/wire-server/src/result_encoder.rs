@@ -1450,6 +1450,30 @@ fn encode_binary_cell(
     }
 }
 
+/// 非 NULL セル 1 個の binary 値を **長さプレフィックス無し** で `out` へ追記する
+/// （COPY binary のフィールド本体用。WIRE-23 (3)・Issue #1768）。DataRow と同じ
+/// [`encode_binary_cell`] を単一の符号化本体として再利用し、先頭の int4 長だけを除く
+/// （第 2 の符号化器を作らない）。失敗時は `out` を呼び出し前の長さへ戻す。
+pub(crate) fn encode_binary_payload_into(
+    wire_type: Option<WireType>,
+    cell: &Cell,
+    out: &mut Vec<u8>,
+) -> Result<(), EncodeError> {
+    let start = out.len();
+    let result = encode_binary_cell(wire_type, cell, out).and_then(|()| {
+        let end = start.checked_add(4).ok_or(EncodeError)?;
+        if out.len() < end {
+            return Err(EncodeError);
+        }
+        out.drain(start..end);
+        Ok(())
+    });
+    if result.is_err() {
+        out.truncate(start);
+    }
+    result
+}
+
 /// [`encode_data_row_into`]／[`encode_data_row_into_with_formats`]／
 /// [`encode_data_row_into_with_columns`] が共有するフレーム組み立て本体。
 /// `encoding_at(i)` は列インデックス `i` の符号化方式を返す。

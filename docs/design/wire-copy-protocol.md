@@ -32,11 +32,11 @@
   - 拡張クエリプロトコル（TASK-216）経由の COPY の、CopyFail 等の後の Sync までの
     同期回復の詳細（Issue #1761）。Parse／Bind／Describe は Issue #1759、Execute は
     Issue #1760 で対応済み（下の 2 節）。
-  - COPY オプションの TO 側の適用（Issue #1765。構文の解析は Issue #1763、FROM 側の
-    `HEADER`／`DELIMITER`／`NULL`／`QUOTE`／`ESCAPE` の適用は Issue #1764 で実装済み。
-    下の「許可リスト」「FROM STDIN の逐次取り込み」節）、binary 形式（WIRE-14 関連）、
-    8 進・16 進エスケープ。テーブル形 `COPY t [(cols)] TO STDOUT` は Issue #1771 で対応済み
-    （下の「許可リスト」節）。
+  - binary 形式（WIRE-14 関連）、8 進・16 進エスケープ、`FORCE_*` オプション。
+    （COPY オプションの構文解析は Issue #1763、`HEADER`／`DELIMITER`／`NULL`／`QUOTE`／
+    `ESCAPE` の適用は FROM が Issue #1764、TO が Issue #1765 で実装済み。テーブル形
+    `COPY t [(cols)] TO STDOUT` は Issue #1771 で対応済み。下の「許可リスト」
+    「FROM STDIN の逐次取り込み」「TO STDOUT」節。）
 
 ## 設計（決定事項）
 
@@ -77,10 +77,9 @@
   等の制約違反が `22023`、モード不一致（text での `QUOTE`／`ESCAPE`）・1 バイトでない
   区切り文字・`HEADER MATCH` の `COPY TO` での使用・`FORCE_*` 等の未対応オプションが
   `0A000`。エラー文言には入力値を含めない。
-- ゲート: データ経路が未適用の方向では、解決結果が format の既定値と異なる指定（`HEADER` 等）を
-  `0A000` で拒否する（無言の fail-open の防止）。`COPY FROM` は Issue #1764 で適用済みのため
-  ゲートを外した。`COPY TO` は Issue #1765 が `reject_unapplied_for_to` の呼び出しを外すまで
-  残る（既定値と等しい明示指定と旧構文の `CSV` は両方向で受理する）。
+- ゲート: 両方向とも撤去済み。`COPY FROM` は Issue #1764、`COPY TO` は Issue #1765 で
+  データ経路がオプションを適用するため、適用前に設けていた「既定値と異なる指定は `0A000`」の
+  ゲートは無い（解決済みの `CopyOptions` は `CopyPlan::To` の第 3 要素として出力経路へ渡る）。
 - 既知の相違: `FORMAT binary` は WIRE-23 まで従来どおり `42601`、`WITH` だけでオプションの
   無い指定も `42601`（PostgreSQL は受理）、エスケープ文字列 `E'...'` は字句解析が未対応のため
   `42601`。
@@ -171,6 +170,16 @@
   土台に、text はバックスラッシュエスケープ、CSV は二重引用符エスケープへ
   再エンコードする。`COPY (...) TO STDOUT` の出力を同じテーブルへ
   `COPY ... FROM STDIN` で再投入すると元の値へ戻る対称性を持つ。
+- オプションの適用（Issue #1765・WIRE-22）: 出力は PostgreSQL 17 と同じバイト列になるよう
+  次の規則に従う。区切り文字は検証済みの ASCII 1 バイトで、行は区切りでつないで `\n` で終える。
+  - text: `\b`／`\f`／`\n`／`\r`／`\t`／`\v` と `\`、区切り文字を `\` 付きで出す。NULL は
+    `NULL` 指定の文字列をエスケープせず出す（NULL 文字列と同じ非 NULL 値が区別できなくなる
+    曖昧さは PostgreSQL と同じ既知の挙動）。
+  - csv: NULL 文字列と一致する値・区切り／`QUOTE`／改行を含む値・単一列で値が `\.` のものだけを
+    引用し、引用内では `QUOTE` と `ESCAPE` の前に `ESCAPE` を付ける。NULL は引用せず出す。
+  - `HEADER`: 最初の CopyData として列名行を出す（text でも csv でも。データと同じ
+    エスケープ規則）。ヘッダ行は `COPY n` の n に含めない。`HEADER MATCH` は構文段で拒否済みで、
+    到達した場合も出力経路は fail-closed（内部エラー）にする。
 
 ### エラー処理・PostgreSQL 本家との相違点
 
@@ -375,3 +384,25 @@ ReadyForQuery を返して接続を継続する。層 A: `crates/wire-server/tes
   0 タプルは parser では成功とし、空バッチの扱いは #1769 で engine の契約に接続する。
 - 対象外・申し送り: `22P04` の `ErrorClass` variant と HTTP／nosql-api.md／err4 テストへの射影、
   `CopyFormat::Binary` の許可、`CopyResponse` の format 化は #1769／#1770。binary は引き続き `42601` で拒否する。
+
+## Issue #1768: binary 形式の型コーデック（親 #1766・WIRE-23 (3) ポインタ）
+
+`crates/wire-server/src/copy_binary_types.rs` に、列の型ごとの binary 値変換層を新設した。フレーム層
+（`copy_binary.rs`）が切り出したフィールドを正規テキストへ復号し（COPY FROM）、結果セルを binary 値へ
+符号化する（COPY TO）。本番の呼び出し元はまだ無く、結線は #1769（FROM）・#1770（TO）が担う。
+
+- 対応型の単一情報源: `result_encoder::column_binary_support`（Bind・DataRow と同一集合）。新たに足したのは
+  `WireType → BinaryParam` の網羅 `match`（`binary_param_for_wire_type`）のみで、`supports_binary()` との
+  一致を単体テストで固定している。COPY binary はフィールドに OID を持たないため Bind の OID 照合は使わない。
+- 対応型: 整数（int2/4/8）・float4/8・bool・text/varchar/bpchar・bytea・uuid・time・timestamptz・interval・
+  numeric（`id` を含む）。DATE／TIMESTAMP／JSON／JSONB／配列／ENUM／VECTOR／型を持たない式列は
+  `resolve_columns` が列集合ごと `0A000` で拒否する（CopyIn／CopyOutResponse の前に呼ぶ契約）。
+- 方式: binary → 正規テキスト → engine の型付き束縛（Bind と同じ。binary ≡ text を構造的に保証）。
+  符号化は DataRow と同じ `encode_binary_cell` を再利用し、長さ無しの `encode_binary_payload_into` で包む。
+- エラー写像: 長さ不正・numeric 表現不正・不正 UTF-8・NUL は `22P03`、範囲外は `22008`、numeric 上限超過は
+  `22003`、内部不整合は `XX000`。既存 `ErrorClass` で表せるため新 variant は無い。
+- 既知の相違: 固定長型の長さ不足は PostgreSQL では `08P01`、本実装は `22P03`（WIRE-23 (3) ポインタに従う）。
+  text の不正 UTF-8・NUL は PostgreSQL では `22021`、本実装は新 SQLSTATE を入れず `22P03`。
+  非有限 float や CHAR(n) の詰め／切り詰め、`id` の扱いは engine の text 束縛と同じ結果になる。
+- 対象外・申し送り: `copy.rs` への結線・`CopyFormat::Binary` の許可・`22P04` の `ErrorClass` は #1769／#1770。
+  date／timestamp／json／jsonb／配列／enum／vector の binary 対応は WIRE-14 側の変更を伴う別課題。

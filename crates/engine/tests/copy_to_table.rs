@@ -60,7 +60,7 @@ fn insert(core: &EngineCore, tenant: &str, id: u64) {
 
 fn copy_to(core: &EngineCore, tenant: &str, sql: &str) -> Result<QueryResult, String> {
     match core.begin_copy(&ctx(tenant), &SessionState::default(), sql) {
-        Ok(CopyPlan::To(_, r)) => Ok(r),
+        Ok(CopyPlan::To(_, r, _)) => Ok(r),
         Ok(CopyPlan::From(_)) => panic!("expected TO plan"),
         Err(e) => Err(format!("{} {e}", e.wire_code())),
     }
@@ -199,7 +199,7 @@ fn explicit_transaction_sees_uncommitted_rows_and_enforces_cap() {
         .begin_copy_in_txn(&caller, &session, &mut txn, "COPY docs TO STDOUT")
         .expect("copy in txn")
     {
-        CopyPlan::To(_, r) => assert_eq!(ids(&r), vec![1, 2]),
+        CopyPlan::To(_, r, _) => assert_eq!(ids(&r), vec![1, 2]),
         CopyPlan::From(_) => panic!("expected TO"),
     }
     core.execute_sql_in_txn(
@@ -235,7 +235,7 @@ fn temp_table_supports_table_form_and_cap() {
         .begin_copy(&caller, &session, "COPY tt TO STDOUT")
         .expect("auto")
     {
-        CopyPlan::To(_, r) => assert_eq!(r.rows.len(), 2),
+        CopyPlan::To(_, r, _) => assert_eq!(r.rows.len(), 2),
         CopyPlan::From(_) => panic!("expected TO"),
     }
     core.execute_sql_in_session(
