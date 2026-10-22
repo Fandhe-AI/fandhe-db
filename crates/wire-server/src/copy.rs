@@ -161,16 +161,18 @@ fn respond_sql_error<S: WireStream>(
 }
 
 /// `CopyInResponse`（'G'）／`CopyOutResponse`（'H'）を組み立てる。いずれも
-/// `Int8 format=0`（text。CSV でも overall format は 0 のまま）・
-/// `Int16 num_columns`・`Int16[num_columns]`（各列 format=0）という同一構造
+/// `Int8 format`（text。CSV でも overall format は 0 のまま。`binary` のとき 1）・
+/// `Int16 num_columns`・`Int16[num_columns]`（各列 format は overall と同じ）という同一構造
 /// （PostgreSQL wire v3 の規範）。
-fn encode_copy_response(kind: u8, column_count: usize) -> Result<Vec<u8>, ()> {
+fn encode_copy_response(kind: u8, column_count: usize, binary: bool) -> Result<Vec<u8>, ()> {
     let n = i16::try_from(column_count).map_err(|_| ())?;
+    // binary（WIRE-23・Issue #1770）は全体・列ごとともに format=1。text／csv は 0。
+    let format: i16 = if binary { 1 } else { 0 };
     let mut body = Vec::new();
-    body.push(0u8);
+    body.push(format as u8);
     body.extend_from_slice(&n.to_be_bytes());
     for _ in 0..column_count {
-        body.extend_from_slice(&0i16.to_be_bytes());
+        body.extend_from_slice(&format.to_be_bytes());
     }
     let total_len = body
         .len()
@@ -222,6 +224,9 @@ fn escape_copy_value(
     match format {
         CopyFormat::Text => escape_copy_text(s, options.delimiter()),
         CopyFormat::Csv => escape_copy_csv(s, options, single_column),
+        // binary は専用経路（encode_binary_copy_data_into）を通る。text 系へ届いても
+        // 無変換で返すだけで、呼び出し側が Binary を拒否する。
+        CopyFormat::Binary => s.to_string(),
     }
 }
 
@@ -295,6 +300,76 @@ fn push_copy_data_line(
     Ok(())
 }
 
+/// binary COPY の 1 行を `CopyData`（'d'）1 個として `out` の末尾へ追記する
+/// （WIRE-23・Issue #1770）。`first` が真なら本文の先頭にストリームヘッダを置く
+/// （PostgreSQL と同じくヘッダは最初の行と同じ CopyData）。tuple は
+/// `Int16 フィールド数` + 各フィールド（`result_encoder::encode_binary_field_into`）で、
+/// `copy_binary::encode_tuple_into` と同じバイト列。失敗時は `out` を呼び出し前の長さへ戻す。
+fn encode_binary_copy_data_into(
+    columns: &[ColumnMeta],
+    row: &ResultRow,
+    first: bool,
+    out: &mut Vec<u8>,
+) -> Result<(), result_encoder::EncodeError> {
+    if columns.len() != row.cells.len() {
+        return Err(result_encoder::EncodeError);
+    }
+    let start = out.len();
+    let r = (|| {
+        let count = i16::try_from(row.cells.len()).map_err(|_| result_encoder::EncodeError)?;
+        out.push(b'd');
+        out.extend_from_slice(&0i32.to_be_bytes());
+        let body_start = out.len();
+        if first {
+            crate::copy_binary::encode_header_into(out);
+        }
+        out.extend_from_slice(&count.to_be_bytes());
+        for (meta, cell) in columns.iter().zip(&row.cells) {
+            result_encoder::encode_binary_field_into(meta, cell, out)?;
+        }
+        patch_copy_data_len(out, body_start)
+    })();
+    if r.is_err() {
+        out.truncate(start);
+    }
+    r
+}
+
+/// `body_start` 直前の 4 バイト長プレースホルダへ、そこから末尾までの本文長を書き戻す。
+fn patch_copy_data_len(
+    out: &mut [u8],
+    body_start: usize,
+) -> Result<(), result_encoder::EncodeError> {
+    let body_len = out
+        .len()
+        .checked_sub(body_start)
+        .ok_or(result_encoder::EncodeError)?;
+    let total = result_encoder::frame_len(body_len)?;
+    let pos = body_start
+        .checked_sub(4)
+        .ok_or(result_encoder::EncodeError)?;
+    let slot = out
+        .get_mut(pos..body_start)
+        .ok_or(result_encoder::EncodeError)?;
+    slot.copy_from_slice(&total.to_be_bytes());
+    Ok(())
+}
+
+/// binary COPY の終端 CopyData（トレーラ。0 行のときはヘッダ付き）を組み立てる。
+fn encode_binary_copy_trailer(with_header: bool) -> Vec<u8> {
+    let mut body = Vec::new();
+    if with_header {
+        crate::copy_binary::encode_header_into(&mut body);
+    }
+    crate::copy_binary::encode_trailer_into(&mut body);
+    let mut msg = Vec::with_capacity(body.len() + 5);
+    msg.push(b'd');
+    // 本文は高々 21 バイトのため i32 に必ず収まる。
+    msg.extend_from_slice(&i32::try_from(body.len() + 4).unwrap_or(4).to_be_bytes());
+    msg.extend_from_slice(&body);
+    msg
+}
+
 /// `ResultRow` を `CopyData`（'d'）1 個へエンコードし `out` の末尾へ追記する
 /// （`result_encoder::encode_data_row_into` と同じ in-place 追記契約。失敗時は
 /// 呼び出し前の長さへ `truncate` してから返す）。区切り文字・NULL 表現・引用規則は
@@ -308,7 +383,8 @@ fn encode_copy_data_row_into(
     options: &CopyOptions,
 ) -> Result<(), result_encoder::EncodeError> {
     // 列メタとセル数の不一致は内部不整合（fail-closed。何も書かずに拒否する）。
-    if columns.len() != row.cells.len() {
+    // binary はこの text 系関数の対象外（text へ黙って落とさない）。
+    if columns.len() != row.cells.len() || format == CopyFormat::Binary {
         return Err(result_encoder::EncodeError);
     }
     let start = out.len();
@@ -387,18 +463,34 @@ fn run_copy_to<S: WireStream>(
         )
         .map(|()| CopyStep::Failed);
     }
-    let response = match encode_copy_response(b'H', result.columns.len()) {
-        Ok(b) => b,
-        Err(()) => {
+    let binary = format == CopyFormat::Binary;
+    // binary は WIRE-14 の対応型のみ。非対応型は CopyOutResponse を 1 バイトも送る前に
+    // 0A000 で拒否する（fail-closed。列番号以外の情報を含めない）。
+    if binary {
+        let formats = vec![result_encoder::FormatCode::Binary; result.columns.len()];
+        if let Err(e) = result_encoder::validate_binary_formats(&result.columns, &formats) {
             return respond_error_and_ready(
                 stream,
                 txn,
-                ErrorClass::InternalError,
-                "failed to encode CopyOutResponse",
+                e.error_class(),
+                "COPY BINARY does not support the column type",
             )
-            .map(|()| CopyStep::Failed)
+            .map(|()| CopyStep::Failed);
         }
-    };
+    }
+    let response =
+        match encode_copy_response(b'H', result.columns.len(), format == CopyFormat::Binary) {
+            Ok(b) => b,
+            Err(()) => {
+                return respond_error_and_ready(
+                    stream,
+                    txn,
+                    ErrorClass::InternalError,
+                    "failed to encode CopyOutResponse",
+                )
+                .map(|()| CopyStep::Failed)
+            }
+        };
 
     let hint = response
         .len()
@@ -424,20 +516,23 @@ fn run_copy_to<S: WireStream>(
         }
     }
 
-    for row in &result.rows {
+    for (index, row) in result.rows.iter().enumerate() {
         let start = buffer.frame_start();
-        if encode_copy_data_row_into(
-            format,
-            &result.columns,
-            row,
-            buffer.as_mut_vec(),
-            // COPY TO は往復契約（COPY FROM の `parse_numeric_offset` は時 0〜15 のみ受理）の
-            // ため、セッション TimeZone に依らず UTC 固定で出力する（Issue #1575）。
-            &engine::datetime::SessionTimeZone::utc(),
-            options,
-        )
-        .is_err()
-        {
+        let encoded = if binary {
+            encode_binary_copy_data_into(&result.columns, row, index == 0, buffer.as_mut_vec())
+        } else {
+            encode_copy_data_row_into(
+                format,
+                &result.columns,
+                row,
+                buffer.as_mut_vec(),
+                // COPY TO は往復契約（COPY FROM の `parse_numeric_offset` は時 0〜15 のみ受理）の
+                // ため、セッション TimeZone に依らず UTC 固定で出力する（Issue #1575）。
+                &engine::datetime::SessionTimeZone::utc(),
+                options,
+            )
+        };
+        if encoded.is_err() {
             buffer.truncate_to(start);
             buffer.flush(stream)?;
             return respond_error_and_ready(
@@ -453,6 +548,9 @@ fn run_copy_to<S: WireStream>(
         }
     }
 
+    if binary {
+        buffer.push_frame(stream, &encode_binary_copy_trailer(result.rows.is_empty()))?;
+    }
     buffer.push_frame(stream, &encode_copy_done())?;
     let tag = format!("COPY {}", result.rows.len());
     match result_encoder::encode_command_complete(&tag) {
@@ -507,7 +605,7 @@ fn run_copy_from<'e, S: WireStream>(
     mut session: CopyInSession,
     finish: Finish,
 ) -> io::Result<CopyStep> {
-    let response = match encode_copy_response(b'G', session.column_count()) {
+    let response = match encode_copy_response(b'G', session.column_count(), false) {
         Ok(b) => b,
         Err(()) => {
             return respond_error_and_ready(
@@ -820,13 +918,49 @@ mod tests {
 
     #[test]
     fn encode_copy_response_has_expected_layout_for_two_columns() {
-        let msg = encode_copy_response(b'G', 2).expect("encode");
+        let msg = encode_copy_response(b'G', 2, false).expect("encode");
         assert_eq!(msg[0], b'G');
         let len = i32::from_be_bytes([msg[1], msg[2], msg[3], msg[4]]) as usize;
         assert_eq!(len, msg.len() - 1);
         assert_eq!(msg[5], 0); // overall format
         let ncols = i16::from_be_bytes([msg[6], msg[7]]);
         assert_eq!(ncols, 2);
+    }
+
+    #[test]
+    fn encode_copy_response_binary_sets_overall_and_per_column_format_to_one() {
+        // WIRE-23・Issue #1770: binary は全体・列ごとともに format=1。
+        let msg = encode_copy_response(b'H', 2, true).expect("encode");
+        assert_eq!(msg[5], 1);
+        assert_eq!(&msg[6..8], &2i16.to_be_bytes());
+        assert_eq!(&msg[8..10], &1i16.to_be_bytes());
+        assert_eq!(&msg[10..12], &1i16.to_be_bytes());
+    }
+
+    #[test]
+    fn binary_copy_data_row_has_header_only_on_first_and_rejects_text_path() {
+        use engine::catalog::ColumnType;
+        let columns = vec![ColumnMeta::Scalar {
+            name: "n".to_string(),
+            ty: ColumnType::Integer,
+        }];
+        let row = ResultRow {
+            id: 1,
+            score: 0.0,
+            cells: vec![Cell::Null],
+        };
+        let mut first = Vec::new();
+        encode_binary_copy_data_into(&columns, &row, true, &mut first).expect("first");
+        let mut next = Vec::new();
+        encode_binary_copy_data_into(&columns, &row, false, &mut next).expect("next");
+        assert_eq!(first.len(), next.len() + 19);
+        // NULL は Int32 の -1。
+        assert_eq!(&next[5..], &[0, 1, 0xff, 0xff, 0xff, 0xff]);
+        // 長さフィールドは本文長 + 4。
+        assert_eq!(
+            i32::from_be_bytes([next[1], next[2], next[3], next[4]]) as usize,
+            next.len() - 1
+        );
     }
 
     #[test]

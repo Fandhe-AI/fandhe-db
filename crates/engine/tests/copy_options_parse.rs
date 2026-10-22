@@ -183,7 +183,6 @@ fn classification_matches_between_simple_and_parse() {
         ("CSV (HEADER)", "42601"),
         ("CSV BINARY", "42601"),
         ("HEADER HEADER", "42601"),
-        ("WITH (FORMAT binary)", "42601"),
         ("WITH (FORMAT json)", "22023"),
         ("WITH (HEADER maybe)", "22023"),
         ("WITH (DELIMITER 1)", "22023"),
@@ -207,6 +206,11 @@ fn classification_matches_between_simple_and_parse() {
     assert_eq!(
         rejected_code(&core, &format!("{TO} WITH (HEADER MATCH)")),
         "0A000"
+    );
+    // binary は TO のみ受理（WIRE-23・Issue #1770）。FROM は Issue #1769 まで 42601。
+    assert_eq!(
+        rejected_code(&core, &format!("{FROM} WITH (FORMAT binary)")),
+        "42601"
     );
     accepted_in_both(&core, &format!("{FROM} WITH (ENCODING UTF8)"));
     accepted_in_both(&core, &format!("{TO} WITH (ENCODING utf8)"));
@@ -245,4 +249,52 @@ fn unknown_option_name_is_truncated_in_message() {
         .map(|_| ())
         .expect_err("rejected");
     assert!(e.to_string().len() < 120, "{e}");
+}
+
+/// `COPY TO STDOUT` の binary 受理（WIRE-23・Issue #1770）。新構文・旧構文が同じ format へ解決され、
+/// 簡易クエリと Parse の分類が一致する。
+#[test]
+fn binary_is_accepted_for_to_in_new_and_legacy_syntax() {
+    let (core, _g) = open("copy-opt-binary-to");
+    for opt in [
+        " WITH (FORMAT binary)",
+        " WITH (FORMAT 'BINARY')",
+        " BINARY",
+        " WITH BINARY",
+        " WITH (FORMAT binary, HEADER false)",
+        " WITH (FORMAT binary, ENCODING 'UTF8')",
+    ] {
+        accepted_in_both(&core, &format!("{TO}{opt}"));
+        let Ok(CopyPlan::To(format, ..)) = begin(&core, &format!("{TO}{opt}")) else {
+            panic!("expected COPY TO plan: {opt}");
+        };
+        assert_eq!(format, CopyFormat::Binary, "{opt}");
+    }
+}
+
+/// binary と併用できないオプションは `0A000`、FROM の binary は従来どおり `42601`。
+#[test]
+fn binary_conflicting_options_and_from_are_rejected() {
+    let (core, _g) = open("copy-opt-binary-conflict");
+    for opt in [
+        " WITH (FORMAT binary, DELIMITER ',')",
+        " WITH (FORMAT binary, NULL 'x')",
+        " WITH (FORMAT binary, HEADER)",
+        " WITH (FORMAT binary, QUOTE '''')",
+        " WITH (FORMAT binary, ESCAPE 'x')",
+        " BINARY DELIMITER ','",
+    ] {
+        assert_eq!(
+            rejected_code(&core, &format!("{TO}{opt}")),
+            "0A000",
+            "{opt}"
+        );
+    }
+    for opt in [" WITH (FORMAT binary)", " BINARY", " WITH BINARY"] {
+        assert_eq!(
+            rejected_code(&core, &format!("{FROM}{opt}")),
+            "42601",
+            "{opt}"
+        );
+    }
 }

@@ -1358,6 +1358,29 @@ fn push_fixed(out: &mut Vec<u8>, wire_type: WireType, bytes: &[u8]) -> Result<()
     push_len_prefixed(out, bytes)
 }
 
+/// セル 1 個を「Int32 長 + バイト列（NULL は `-1`）」のバイナリ形式で `out` へ追記する
+/// （WIRE-14 の DataRow フィールドと WIRE-23 の COPY binary tuple のフィールドは同一レイアウト。
+/// `copy.rs` の `run_copy_to` が呼ぶ。型エンコーダを DataRow と共有し、#1768 の型拡充が
+/// COPY TO にも自動で反映される）。失敗時は `out` を呼び出し前の長さへ戻す。
+pub(crate) fn encode_binary_field_into(
+    meta: &ColumnMeta,
+    cell: &Cell,
+    out: &mut Vec<u8>,
+) -> Result<(), EncodeError> {
+    let start = out.len();
+    let result = match cell {
+        Cell::Null => {
+            out.extend_from_slice(&(-1i32).to_be_bytes());
+            Ok(())
+        }
+        other => encode_binary_cell(Some(column_wire_type(meta)), other, out),
+    };
+    if result.is_err() {
+        out.truncate(start);
+    }
+    result
+}
+
 /// 非 NULL セル 1 個をバイナリ形式で `out` へ追記する（WIRE-14・Issue #1172）。
 /// `wire_type` は列が公告する型。`None`（旧 API）は `Cell::Text` のみ受理する。
 /// 型と `Cell` の不一致・範囲外・無損失でない float4 縮小は `EncodeError`
