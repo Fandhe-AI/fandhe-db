@@ -659,6 +659,33 @@ Issue #871（述語つき UPDATE/DELETE の実行結線）は自動運転モー�
 - **ドメイン**: `OpTag::CreateTableAs = 26` で `InsertSelect` とは別ドメイン。既存の OpTag のバイト列は変えない
 - **呼び出し**: 構文検証（`validate_create_table_as_tokens`）が算出して `ValidatedCreateTableAs` に保持し、実行段が事前照合・再照合・記録に使う。詳細は [ctas-column-inference.md](ctas-column-inference.md) の第 III 部
 
+## Issue #1752 追記（サブクエリつき述語形 DML の内容照合ハッシュ）
+
+親 #1749・SQL-53 (5)・RECOVER-10・RECOVER-11 のポインタ。述語形 UPDATE／DELETE の WHERE に置かれる
+サブクエリ（`IN (SELECT ...)`・`EXISTS`・スカラー比較。`NOT` 形・`OR` 分岐内を含む）の内容照合の材料を定める。
+
+- **材料**: 送られた文の構文形。サブクエリは内側トークン列そのまま（件数 u32 LE → 各トークンを `push_token`
+  で直列化）とし、内側の評価結果は材料にしない。正準化はしない（差があれば `22023` 側へ倒す）。`depth` は
+  文から導出できるので入れない。
+- **タグ**: `InSubquery`=13（外側の列 → 内側トークン）・`Exists`=14（内側トークン）・
+  `ScalarSubqueryCompare`=15（外側の列 → 演算子判別子 `Eq=0..Ge=5`〔明示 match〕→ 内側トークン）。
+  タグ 1〜12 と `OpTag` は不変で、サブクエリを含まない文のハッシュはビット同一。`NOT` は既存のタグ 12 の
+  再帰で別ハッシュになる。`IdCompare`（解決後の内部の葉）と未束縛 `$n` は `Internal` で fail-closed。
+- **計算位置の契約**: ハッシュは `Validated*` が持つ**解決前**の述語から計算する。内側を解決して
+  `InList`／`IdCompare` へ書き換えた述語列は `for_update_where`／`for_delete_where`（分割実行版を含む）へ
+  渡さない（渡すと再送が `22023` に化ける）。
+- **不採用案**: 文全体のトークン列を新しい `OpTag` でハッシュする方式（#1734 型）。述語形 DML の方式が二系統に
+  分かれ、SET 割当の VECTOR 正準化・UDF 定義節との一貫性が崩れるため。
+- **#1751 への申し送り（台帳の照合順）**: 結果によらず再送を `23505` にするには、内側を評価する前に台帳を
+  事前照合する必要がある（内側が `54000`／`21000`／`42P01` で失敗すると台帳に届かない）。`INSERT ... SELECT`
+  の先例（`sql::exec::precheck_insert_select_ledger`・#1733）にならい、解決前の述語でハッシュを算出した直後・
+  内側の評価の前に事前照合を呼ぶこと。確定記録は従来どおり書き込み txn 内の `record_in_txn`。e2e の再送テスト
+  （内側結果の変化・0 行・上限超過・RETURNING 有無・InTxn・再オープン）は結線する #1751 側で追加する。
+- **対象外**: 分割実行 DML と `ON CONFLICT DO UPDATE ... WHERE` でのサブクエリ受理（parser のゲートは維持。
+  直列化が共有されるだけ）、`FROM`／`USING` つき DML。
+- **残余リスク**: 内側だけで参照される宣言的 UDF の定義は材料に入れない（内側の結果を材料にしない方針と同じ）。
+  分割実行版の TimeZone 材料は外側の式と表の列型だけで判定し、内側トークンは見ない。
+
 ## 参照
 
 - `docs/spec/04-behavior/recovery.md`（RECOVER-2・RECOVER-3・RECOVER-7・
