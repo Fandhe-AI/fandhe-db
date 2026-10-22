@@ -1586,8 +1586,8 @@ pub(crate) enum UpdateColumnHashItem<'a> {
 /// [`OpTag::UpdateColumnsExpr`]）を使う。入力は `id` と、`columns`（呼び出し元が
 /// スキーマ列順へ正規化して渡す）の (列名, 値または式) 列だけで、DB の現在状態・評価結果には
 /// 依存しない。各割当は印 1 バイト（`0` = 値 → [`push_value`]、`1` = 式 →
-/// [`push_dml_expr`]、`2` = `DEFAULT` キーワード〔本体なし。Issue #1746〕）の後に本体を置く。新しいドメインで過去の記録が無いため legacy 版は
-/// 持たない。式違いの網羅テスト・crash-test は Issue #1545 の担当（本 Issue は
+/// [`push_dml_expr`]、`2` = `DEFAULT` キーワード〔本体なし。Issue #1746〕）の後に本体を置く。
+/// 新しいドメインで過去の記録が無いため legacy 版は持たない。式違いの網羅テスト・crash-test は Issue #1545 の担当（本 Issue は
 /// fail-closed に必要な最小の直列化）。
 pub(crate) fn for_update_columns_with_exprs(
     id: u64,
