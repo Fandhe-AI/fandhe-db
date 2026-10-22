@@ -432,3 +432,25 @@ Issue #1736 の対象省略形）。
   他スレッドから不可視になり `42501` が非決定的に混ざるため。
 - 自テナント所有で呼び出し元から不可視な衝突先への加算は、並行でも全件が評価前に `42501` で拒否される
   （`55P03` も許容しない）。エラー文にシード値・テナント ID・埋め込み値を含めず、値・行数・台帳は不変で、他テナントへの副作用も無い。
+
+## Issue #1741 追記: 式つき upsert の内容照合ハッシュ（SQL-49・RECOVER-11 ポインタ）
+
+親 #1738。`ON CONFLICT ... DO UPDATE SET <col> = <式> [WHERE <条件>]` を台帳（`USING OPERATION_ID`）の内容照合へ
+載せるためのハッシュ層。送られた文の**構文形**だけを含め、評価結果の値（既存行の値・加算結果）は含めない。
+実装は `crates/engine/src/recovery/content_hash.rs` の `push_upsert_header`（`for_typed_upsert`・`for_typed_upsert_expr` が共有）。
+
+- 割当の value kind: 既存の 0（`EXCLUDED.<col>`）・1（リテラル）・2（加算）は不変。**kind 3 = 一般式**
+  （`push_set_expr`。UPDATE の SET 式と同じく `n / 2` と `n / 2.0` を区別）。kind 2 と kind 3 は別ハッシュ
+  （同じ見た目でも経路が違えば `22023` 側へ倒す fail-closed）。#1739 は既存の加算形を kind 2 のまま保つことを推奨する。
+- `DO UPDATE ... WHERE`: action tag は `(id)` 対象 6／UNIQUE 対象 7。バイト順は
+  `tag → 割当件数・各割当 → WHERE 述語列 → （UNIQUE のみ）対象列数・列名 → 行部`。
+  述語列は UPDATE／DELETE の WHERE と同じ直列化（ADR §4.3・§4.4.1。参照 UDF の推移閉包を含み、WASM UDF・サブクエリ述語は
+  `Err`）。対象省略（tag 4 系）との組はハッシュ層でも `Err`。tag 5 は未到達値の欠番で再利用しない。
+- 予約タグ: 修飾付き列参照（`EXCLUDED.<col>`・`<表>.<col>`）を一般式に導入する場合の式タグは **20**
+  （修飾子種別 1 バイト〔0=対象表・1=`EXCLUDED`〕＋長さ前置の列名）、WHERE 述語側は述語タグ **13**。
+  `"excluded.b"` のような連結文字列を `Ident` や列名に入れる表現は、裸の識別子と衝突するため禁止。
+- UDF: SET の一般式（kind 3）は UPDATE の SET 式と同じく UDF 定義節を含めない。#1739 が UDF 呼び出しを受理する場合は、
+  セッション UDF の拒否か定義節の追記を #1739 側の契約とする。WHERE 側は推移閉包を本層が含める。
+- 範囲: 本 Issue はハッシュ層の契約と単体テスト（golden 含む）まで。SQL 層の再送テスト
+  （同一文 → `23505`・式／WHERE 違い → `22023`）は #1739／#1740 の結線と同時に追加する。
+  `INSERT ... SELECT ... ON CONFLICT` は送られた文のトークン列をハッシュするため対象外。
