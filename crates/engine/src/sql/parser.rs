@@ -1864,6 +1864,28 @@ type BoundWherePredicates = (
 /// でも `dummy_equality_flags` の序数がトークン出現順（`sql::params::
 /// where_equality_literal_is_param` と同じ数え方）のまま一致し続ける
 /// （構文段の不変条件により `Not` の内側は常に深さ 1）。
+fn take_dummy_flag(equality_ordinal: &mut usize, dummy_equality_flags: &[bool]) -> bool {
+    let skip = dummy_equality_flags
+        .get(*equality_ordinal)
+        .copied()
+        .unwrap_or(false);
+    *equality_ordinal += 1;
+    skip
+}
+
+/// `Compare`／`Between`（および `Not` で包まれたそれ）か。`sql::params` の Describe 用
+/// ダミーフラグが 1 葉 1 要素で数える葉で、束縛のどの経路で処理しても序数を 1 つ進める
+/// 不変条件（Issue #2430）の対象。
+fn is_flagged_range_leaf(predicate: &WherePredicate) -> bool {
+    match predicate {
+        WherePredicate::Not(inner) => is_flagged_range_leaf(inner),
+        other => matches!(
+            other,
+            WherePredicate::Compare { .. } | WherePredicate::Between { .. }
+        ),
+    }
+}
+
 fn declarative_leaf_to_filter(
     predicate: &WherePredicate,
     schema: &TableSchema,
@@ -1917,12 +1939,13 @@ fn declarative_leaf_to_filter(
         }
         WherePredicate::Compare { column, op, value } => {
             // `< > <= >=`（TABLE-13・TASK-199、Issue #891・レーン B）。
-            // `$n` はこの述語形の右辺に束縛できない（`sql::params` の
-            // パターン 4 は `Ident '=' $n` のみ）ため、常に「実値」として
-            // 扱う（Describe 専用のダミー値スキップは対象外）。
+            // Issue #2430: SELECT の `WHERE` では右辺に `$n` を置けるため、`Equality` と同じく
+            // `dummy_equality_flags` の序数を 1 つ進め、ダミー値の位置に限り Describe の
+            // 型付きリテラル検証を省略する（`sql::params::noneq_leaf_at` と数え方を揃える）。
+            let skip = take_dummy_flag(equality_ordinal, dummy_equality_flags);
             Ok((
                 DeclarativeFilter::compare(column.clone(), (*op).into(), value.clone()),
-                false,
+                skip,
             ))
         }
         WherePredicate::Prefix { column, pattern } => {
@@ -1960,11 +1983,15 @@ fn declarative_leaf_to_filter(
             DeclarativeFilter::in_list(column.clone(), values.clone()),
             false,
         )),
-        // `<col> [NOT] BETWEEN '<low>' AND '<high>'`（SQL-24）。
-        WherePredicate::Between { column, low, high } => Ok((
-            DeclarativeFilter::between(column.clone(), low.clone(), high.clone()),
-            false,
-        )),
+        // `<col> [NOT] BETWEEN '<low>' AND '<high>'`（SQL-24）。Issue #2430: 両境界が `$n` の
+        // 形は 1 葉につき序数を 1 つ進める（`Compare` と同じ。片側だけの `$n` は構文前に拒否済み）。
+        WherePredicate::Between { column, low, high } => {
+            let skip = take_dummy_flag(equality_ordinal, dummy_equality_flags);
+            Ok((
+                DeclarativeFilter::between(column.clone(), low.clone(), high.clone()),
+                skip,
+            ))
+        }
         // `<col> IS [NOT] NULL`（SQL-24）。
         WherePredicate::IsNull { column, negated } => Ok((
             if *negated {
@@ -2187,7 +2214,16 @@ fn numeric_column_string_leaf_as_predicates(
                 CompareOp::Gt => BinOp::Gt,
                 CompareOp::Ge => BinOp::Ge,
             };
-            vec![cmp(bin, value)]
+            // Issue #2430: ダミー値（`$n` 由来）は解釈できないので `0` を仮置きする。
+            if take_dummy_flag(equality_ordinal, dummy_equality_flags) {
+                vec![WherePredicate::Expression(Expr::Binary {
+                    op: bin,
+                    lhs: Box::new(Expr::Ident(column.clone())),
+                    rhs: Box::new(Expr::Number("0".to_string())),
+                })]
+            } else {
+                vec![cmp(bin, value)]
+            }
         }
         WherePredicate::InList { values, .. } => match values.as_slice() {
             [] => return Ok(None),
@@ -2197,7 +2233,18 @@ fn numeric_column_string_leaf_as_predicates(
             )],
         },
         WherePredicate::Between { low, high, .. } => {
-            vec![cmp(BinOp::Ge, low), cmp(BinOp::Le, high)]
+            if take_dummy_flag(equality_ordinal, dummy_equality_flags) {
+                let zero = |op: BinOp| {
+                    WherePredicate::Expression(Expr::Binary {
+                        op,
+                        lhs: Box::new(Expr::Ident(column.clone())),
+                        rhs: Box::new(Expr::Number("0".to_string())),
+                    })
+                };
+                vec![zero(BinOp::Ge), zero(BinOp::Le)]
+            } else {
+                vec![cmp(BinOp::Ge, low), cmp(BinOp::Le, high)]
+            }
         }
         _ => return Ok(None),
     };
@@ -2500,6 +2547,11 @@ fn bind_where_predicates_recursive(
         } else {
             None
         };
+        // Issue #2430: 書き換えは `Compare`／`Between` を序数を持たない葉へ差し替えるため、
+        // ここで 1 つ進めて `sql::params` のダミーフラグの序数を保つ。
+        if boolean_rewritten.is_some() && is_flagged_range_leaf(predicate) {
+            *equality_ordinal += 1;
+        }
         let predicate = boolean_rewritten.as_ref().unwrap_or(predicate);
         // Issue #1183・SQL-24・SQL-26・TABLE-13 ポインタ: TEXT 列の範囲比較
         // （`<col> < 'lit'`、およびその `NOT`）は宣言的経路（レーン B）に TEXT の
@@ -2516,6 +2568,8 @@ fn bind_where_predicates_recursive(
         {
             let (bound, _ty) = crate::sql::udf_call::bind_expr(&expr, schema, udfs, node_budget)?;
             expr_filters.push(bound);
+            // Issue #2430: 序数を持つ葉（`Compare`）を式へ差し替えたので 1 つ進める。
+            *equality_ordinal += 1;
             continue;
         }
         // Issue #1408・SQL-24: 数値列 × 文字列リテラルの宣言的な葉は式レーンへ書き換える
