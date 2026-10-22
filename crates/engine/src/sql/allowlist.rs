@@ -4623,7 +4623,8 @@ pub enum SetValue {
     /// 列の既定値（未定義なら NULL）を代入する意味で、解決は束縛段
     /// （`sql::parser::bind_set_assignments`）が担う。検出は UPDATE 専用の
     /// `Parser::parse_update_assignment` のみで、`ON CONFLICT ... DO UPDATE SET` では
-    /// 生成されない（そちらは従来どおり `0A000` 拒否）。
+    /// 生成されない（そちらは構文段で `42601`。`UpsertValue` への写像の防御腕は
+    /// `reject_default_keyword_literal` により `0A000` だが到達不能）。
     ///
     /// **BREAKING CHANGE**（Issue #1746）: variant 追加。`SetValue` を網羅 `match` する
     /// 呼び出し元は腕の追加が必要。
