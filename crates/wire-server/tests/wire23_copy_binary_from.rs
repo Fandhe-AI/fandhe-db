@@ -558,7 +558,7 @@ fn unsupported_column_type_is_0a000_before_copy_in_response() {
 }
 
 #[test]
-fn binary_with_row_format_options_and_copy_to_binary_are_rejected() {
+fn binary_with_row_format_options_is_rejected() {
     let (core, _g) = new_core(wide_limits());
     let mut s = connect(core);
     for (sql, state) in [
@@ -569,10 +569,6 @@ fn binary_with_row_format_options_and_copy_to_binary_are_rejected() {
         (
             "COPY bin_docs (id, n) FROM STDIN WITH (FORMAT binary, DELIMITER ',')",
             "0A000",
-        ),
-        (
-            "COPY (SELECT id FROM bin_docs LIMIT 1) TO STDOUT WITH (FORMAT binary)",
-            "42601",
         ),
     ] {
         send_simple_query(&mut s, sql);

@@ -20052,8 +20052,8 @@ pub fn validate_drop_table_tokens(
 
 /// `COPY ... FROM STDIN`／`COPY (...) TO STDOUT` の転送形式（Issue #939・
 /// WIRE-17）。`text`（PostgreSQL 互換のタブ区切り・バックスラッシュエスケープ）・
-/// `csv`（RFC4180 風のカンマ区切り・二重引用符エスケープ）に加え、`binary`（`COPY FROM` のみ。
-/// WIRE-23・Issue #1769。`COPY TO` の binary は Issue #1770 まで `42601`）を受理する。binary は
+/// `csv`（RFC4180 風のカンマ区切り・二重引用符エスケープ）に加え、`binary`（`COPY FROM`・
+/// `COPY TO STDOUT` の双方。WIRE-23・Issue #1769／#1770）を受理する。binary は
 /// 行分割を持たず、フレーム解析と型変換を wire-server が担う。`HEADER`・`DELIMITER`・`NULL`・`QUOTE`
 /// 等のオプションは [`crate::sql::copy_options`] が構文を解析し、データ経路が未適用の間は
 /// 既定値と異なる指定を `0A000` で拒否する（Issue #1763）。フィールド分割・エスケープ解決の実体は [`crate::sql::copy`] が
@@ -20062,7 +20062,7 @@ pub fn validate_drop_table_tokens(
 pub enum CopyFormat {
     Text,
     Csv,
-    /// PostgreSQL の binary COPY 形式（`COPY FROM` 専用。WIRE-23・Issue #1769）。
+    /// PostgreSQL の binary COPY 形式（`COPY FROM`・`COPY TO STDOUT` の双方。WIRE-23・Issue #1769／#1770）。
     Binary,
 }
 

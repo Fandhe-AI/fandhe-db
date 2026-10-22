@@ -207,6 +207,9 @@ fn classification_matches_between_simple_and_parse() {
         rejected_code(&core, &format!("{TO} WITH (HEADER MATCH)")),
         "0A000"
     );
+    // binary は FROM／TO の双方で受理する（WIRE-23・Issue #1769／#1770）。
+    accepted_in_both(&core, &format!("{FROM} WITH (FORMAT binary)"));
+    accepted_in_both(&core, &format!("{TO} WITH (FORMAT binary)"));
     accepted_in_both(&core, &format!("{FROM} WITH (ENCODING UTF8)"));
     accepted_in_both(&core, &format!("{TO} WITH (ENCODING utf8)"));
     assert_eq!(
@@ -246,16 +249,13 @@ fn unknown_option_name_is_truncated_in_message() {
     assert!(e.to_string().len() < 120, "{e}");
 }
 
-/// `FORMAT binary` は FROM のみ受理し（WIRE-23・Issue #1769）、TO は Issue #1770 まで `42601`。
+/// `FORMAT binary` は FROM／TO の双方で受理し（WIRE-23・Issue #1769／#1770）、
 /// binary と行形式のオプションの併用は `0A000`。
 #[test]
-fn binary_is_accepted_for_from_only_and_rejects_row_format_options() {
+fn binary_is_accepted_for_from_and_rejects_row_format_options() {
     let (core, _g) = open("copy-opt-binary");
     assert!(begin(&core, &format!("{FROM} WITH (FORMAT binary)")).is_ok());
-    assert_eq!(
-        rejected_code(&core, &format!("{TO} WITH (FORMAT binary)")),
-        "42601"
-    );
+    assert!(begin(&core, &format!("{TO} WITH (FORMAT binary)")).is_ok());
     for opt in [
         "DELIMITER ','",
         "NULL 'x'",
@@ -265,6 +265,47 @@ fn binary_is_accepted_for_from_only_and_rejects_row_format_options() {
     ] {
         assert_eq!(
             rejected_code(&core, &format!("{FROM} WITH (FORMAT binary, {opt})")),
+            "0A000",
+            "{opt}"
+        );
+    }
+}
+
+/// `COPY TO STDOUT` の binary 受理（WIRE-23・Issue #1770）。新構文・旧構文が同じ format へ解決され、
+/// 簡易クエリと Parse の分類が一致する。
+#[test]
+fn binary_is_accepted_for_to_in_new_and_legacy_syntax() {
+    let (core, _g) = open("copy-opt-binary-to");
+    for opt in [
+        " WITH (FORMAT binary)",
+        " WITH (FORMAT 'BINARY')",
+        " BINARY",
+        " WITH BINARY",
+        " WITH (FORMAT binary, HEADER false)",
+        " WITH (FORMAT binary, ENCODING 'UTF8')",
+    ] {
+        accepted_in_both(&core, &format!("{TO}{opt}"));
+        let Ok(CopyPlan::To(format, ..)) = begin(&core, &format!("{TO}{opt}")) else {
+            panic!("expected COPY TO plan: {opt}");
+        };
+        assert_eq!(format, CopyFormat::Binary, "{opt}");
+    }
+}
+
+/// binary と併用できないオプションは `0A000`（FROM は上のテストで検査済み）。
+#[test]
+fn binary_conflicting_options_for_to_are_rejected() {
+    let (core, _g) = open("copy-opt-binary-conflict");
+    for opt in [
+        " WITH (FORMAT binary, DELIMITER ',')",
+        " WITH (FORMAT binary, NULL 'x')",
+        " WITH (FORMAT binary, HEADER)",
+        " WITH (FORMAT binary, QUOTE '''')",
+        " WITH (FORMAT binary, ESCAPE 'x')",
+        " BINARY DELIMITER ','",
+    ] {
+        assert_eq!(
+            rejected_code(&core, &format!("{TO}{opt}")),
             "0A000",
             "{opt}"
         );
