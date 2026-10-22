@@ -437,3 +437,39 @@ NoSQL `update`／`delete` op の `filter`（述語形。TASK-186・NOSQL-12）�
   rows_where_unchecked_writes_byte_identical_rows_to_legacy_reencode_
   algorithm`）。SET 列が重複指定された場合の意味論が後勝ちから先勝ちへ変わる
   （束縛段で拒否済みのため表層からは到達しない）。
+
+## 11. WHERE 内サブクエリの実行（Issue #1751。SQL-53・SQL-29・RLS-10 ポインタ）
+
+述語形 `UPDATE`／`DELETE` の `WHERE` にあるサブクエリ（`IN`／`NOT IN`／`EXISTS`／`NOT EXISTS`／
+スカラー比較）を、束縛の**前**に書き込みトランザクションのスナップショットで評価し、具体的な述語へ
+書き換えてから既存の束縛・実行経路（§3・§4）へ渡す。構文段の受理は #1750、台帳ハッシュの正規化は
+#1752 の担当で、本節は実行だけを扱う。
+
+- **解決の位置**: `core/dml_subquery_exec.rs`。述語形 4 form（`execute_predicate_delete_form`・
+  `execute_predicate_delete_returning_form`・`execute_predicate_update_form`・
+  `execute_update_returning_form`）がスキーマ取得の後・束縛の前に呼ぶ。NoSQL 表層と共有する
+  `run_predicate_*` は解決済みの述語だけを受け取る契約のまま（`run_predicate_*_resolved` が
+  束縛用の文とハッシュ用の元の文を別々に受け取る。サブクエリの無い文は同一の文で挙動不変）。
+- **スナップショット**: `WriteTarget::InTxn` の共有 write txn を読み取り源にする（同じ
+  トランザクションの未 commit の変更が見え、対象行の変更より前に全部解決するため、自己参照も
+  文の開始時点を読む）。autocommit の文は `execute_parsed_in_session_inner` の入口で
+  文単位の暗黙トランザクション（`begin_implicit`〜`commit_implicit`）に包み、同じ経路へ流す。
+  遅延 FK の検査・commit 境界は暗黙トランザクションの commit が担い、第 2 の実行器は作らない。
+  失敗時は txn を drop して abort する（部分書き込みなし）。
+- **RLS・上限**: 内側は `sql::subquery::resolve_where_predicates`（SELECT 腕と同じ）で、書き込む
+  セッションの `PolicyContext`・同じ予算（実行回数・内側の可視行数・IN 値数。SQL-29）で評価する。
+  外側の変更対象は既存の `ctx` 所有行の列挙のまま。影響行数上限は解決後の対象行数に掛かる。
+- **台帳ハッシュ**: 解決前の文から計算する方針（解決結果の値を入れない。RECOVER-11）。#1752 が
+  入るまでの暫定措置として、`operation_id` を記録する構成・指定は内側の実行前に `0A000` で拒否し、
+  記録しない場合（台帳がハッシュを読まない）だけ代替ハッシュを渡す。**#1752 で撤去する**。
+  このため `Ledgered` 構成のサブクエリつき DML は #1752 まで常に `0A000` になる。
+- **fail-closed**: `WriteTarget::Autocommit` でサブクエリつき述語が来た場合は解決せず固定文言の
+  `0A000`。`PARTITIONED` との組合せは束縛段の `42601` を維持し、`run_partitioned_*` の冒頭にも
+  明示ガードを置く。非セッション入口（`execute_delete_sql`／`execute_update_sql`）は従来どおり `42601`。
+- **エラー優先順位（サブクエリつき）**: 構文・カタログ → スキーマ取得 → `RETURNING` の投影束縛 →
+  暫定 `operation_id` ゲート（`0A000`。#1752 まで）→ サブクエリ解決（相関 `42601`・予算／行数 `54000`・
+  複数行スカラー `21000`・型不一致 `22000`）→ 解決済み文の束縛 → ハッシュ計算 → 実行本体。
+- **テスト**: `core/dml_subquery_exec_tests.rs`。#1750 が未マージの間は、parse 済みの述語形 DML の
+  WHERE の葉をサブクエリの葉へ差し替えて検証する（2 テナントの RLS・自己参照・RETURNING 同値・
+  `21000` の副作用なし・`0A000`／`42601` の fail-closed）。SQL 文字列による結合テストは #1750 の
+  マージ後に追加する。
