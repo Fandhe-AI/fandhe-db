@@ -969,8 +969,6 @@ pub(crate) enum UpsertHashAction<'a> {
     /// の WHERE と同じ [`push_dml_where_predicates`]（参照 UDF の推移閉包を含み、WASM UDF と
     /// サブクエリ述語は `Err`）で直列化し、割当の直後に置く。`udf_registry` を持たせて
     /// `for_typed_upsert*` のシグネチャを変えない。
-    // 結線は #1740（DO UPDATE ... WHERE の parser・評価）で行う。それまでは単体テストからのみ構築される。
-    #[cfg_attr(not(test), allow(dead_code))]
     DoUpdateWhere {
         assignments: &'a [(String, UpsertAssignmentHashValue<'a>)],
         predicates: &'a [crate::sql::allowlist::WherePredicate],

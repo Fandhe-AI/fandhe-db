@@ -550,3 +550,77 @@ fn unique_target_conditions_see_the_conflicting_row() {
     assert_eq!(result.rows.len(), 1);
     assert_eq!(result.rows[0].cells[0], int(8));
 }
+
+/// 同じ `operation_id` で WHERE の有無・内容だけが異なる再送は、内容照合ハッシュ不一致の
+/// `22023` で拒否される（RECOVER-11。`23505` の冪等再送扱いにしない）。
+#[test]
+fn differing_where_under_same_operation_id_is_a_content_mismatch() {
+    let (core, path) = open_engine("sql49-where-hash");
+    let _g = CleanupGuard(path);
+    let ctx = ctx_for("tenant-a");
+    seed(&core, &ctx, 1, "1", "1", "'x'");
+    let mk = |wh: Option<&str>| {
+        let w = wh.map(|c| format!(" WHERE {c}")).unwrap_or_default();
+        format!(
+            "INSERT INTO {TABLE} (id, embedding, nn, n) VALUES (1, '[0.1,0.2]', 0, 5) \
+             ON CONFLICT (id) DO UPDATE SET n = EXCLUDED.n{w} USING OPERATION_ID 'op-where-hash'"
+        )
+    };
+    run(&core, &ctx, &mk(Some("n < 100"))).expect("first");
+    assert_eq!(code(&core, &ctx, &mk(Some("n < 200"))), "22023");
+    assert_eq!(code(&core, &ctx, &mk(None)), "22023");
+    // 同一内容の再送は従来どおり冪等拒否。
+    assert_eq!(code(&core, &ctx, &mk(Some("n < 100"))), "23505");
+}
+
+/// `using`／`returning` という名前の列（引用付き含む）は条件区間を閉じない。
+#[test]
+fn using_and_returning_named_columns_do_not_end_the_condition() {
+    let path = unique_db_path("sql49-where-kwcols");
+    let _g = CleanupGuard(path.clone());
+    let storage = Storage::open(&path).expect("open storage");
+    let schema = TableSchema::new(
+        "kw",
+        vec![
+            ColumnDef::new("embedding", ColumnType::Vector(2), false),
+            ColumnDef::new("using", ColumnType::Integer, true),
+            ColumnDef::new("returning", ColumnType::Integer, true),
+        ],
+    );
+    storage.create_table(&schema).expect("create table");
+    let core = EngineCore::from_storage(storage, Box::new(CpuScalarProvider))
+        .with_ledger_mode(engine::recovery::required_op_id::LedgerMode::Ledgered);
+    let ctx = ctx_for("tenant-a");
+    run(
+        &core,
+        &ctx,
+        "INSERT INTO kw (id, embedding, \"using\", \"returning\") VALUES (1, '[0.1,0.2]', 1, 1) \
+         USING OPERATION_ID 'op-kw-seed'",
+    )
+    .expect("seed");
+    for (i, wh) in [
+        "\"using\" = 1",
+        "using = 1",
+        "\"returning\" = 1",
+        "returning = 1",
+        "\"using\" = 1 AND \"returning\" = 1",
+    ]
+    .iter()
+    .enumerate()
+    {
+        let sql = format!(
+            "INSERT INTO kw (id, embedding, \"using\") VALUES (1, '[0.1,0.2]', 7) \
+             ON CONFLICT (id) DO UPDATE SET \"using\" = 7 WHERE {wh} \
+             RETURNING id USING OPERATION_ID 'op-kw-{i}'"
+        );
+        let out = run(&core, &ctx, &sql).unwrap_or_else(|e| panic!("{sql}: {e:?}"));
+        assert_eq!(affected(out), 1, "{sql}");
+        // 次の反復も WHERE を真にするため元に戻す。
+        let reset = format!(
+            "INSERT INTO kw (id, embedding, \"using\") VALUES (1, '[0.1,0.2]', 1) \
+             ON CONFLICT (id) DO UPDATE SET \"using\" = 1 WHERE id = 1 \
+             USING OPERATION_ID 'op-kw-reset-{i}'"
+        );
+        run(&core, &ctx, &reset).expect("reset");
+    }
+}

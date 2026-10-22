@@ -9787,10 +9787,18 @@ impl<'a> Parser<'a> {
                     depth -= 1;
                 }
                 Token::Punct(';') if depth == 0 => break,
+                // `RETURNING`／`USING` は予約語でないため列名（引用付き含む）と区別が要る。
+                // 実句境界（`RETURNING <射影>`／`USING OPERATION_ID`）のときだけ区間を閉じる
+                // （`sql::params::is_where_clause_boundary` と同じ方針）。
                 Token::Ident(w)
                     if depth == 0
-                        && (w.eq_ignore_ascii_case("RETURNING")
-                            || w.eq_ignore_ascii_case("USING")) =>
+                        && ((w.eq_ignore_ascii_case("RETURNING")
+                            && self.returning_is_clause_boundary(start, end))
+                            || (w.eq_ignore_ascii_case("USING")
+                                && matches!(
+                                    self.tokens.get(end.saturating_add(1)),
+                                    Some(Token::Ident(n)) if n.eq_ignore_ascii_case("OPERATION_ID")
+                                ))) =>
                 {
                     break;
                 }

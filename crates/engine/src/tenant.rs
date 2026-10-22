@@ -2412,7 +2412,16 @@ pub(crate) enum UpsertAction<'a> {
     /// Issue #1740。`None` なら `WHERE` なし）。`sql` へ依存しない設計を保つため、
     /// 束縛・評価は呼び出し元（`sql::exec::execute_upsert_inner`）が
     /// [`UpsertWhereFn`] に閉じ込めて渡す。
-    DoUpdate(&'a [(usize, UpsertSetValue<'a>)], Option<UpsertWhereFn<'a>>),
+    DoUpdate(&'a [(usize, UpsertSetValue<'a>)], Option<UpsertWhere<'a>>),
+}
+
+/// `DO UPDATE ... WHERE` の条件（Issue #1740）。`eval` は評価クロージャ、`predicates` は
+/// 内容照合ハッシュ（`content_hash::UpsertHashAction::DoUpdateWhere`）へ渡す述語列で、
+/// WHERE の有無・内容が異なる同一 `operation_id` の再送を `22023` で弾くために使う。
+#[derive(Clone, Copy)]
+pub(crate) struct UpsertWhere<'a> {
+    pub(crate) eval: UpsertWhereFn<'a>,
+    pub(crate) predicates: &'a [crate::sql::allowlist::WherePredicate],
 }
 
 /// `DO UPDATE ... WHERE` 条件の評価関数（Issue #1740）。引数は (衝突した既存行の
@@ -2850,10 +2859,19 @@ fn upsert_typed_rows_impl(
                     hash_assignments.push((col_name.to_string(), hash_value));
                 }
             }
+            // WHERE 条件は束縛時に空の UDF レジストリで検証済み（UDF 参照は束縛段で拒否）。
+            let hash_udf_registry = crate::sql::udf_call::UdfRegistry::default();
             let hash_action = match action {
                 UpsertAction::DoNothing => content_hash::UpsertHashAction::DoNothing,
-                UpsertAction::DoUpdate(..) => {
+                UpsertAction::DoUpdate(_, None) => {
                     content_hash::UpsertHashAction::DoUpdate(&hash_assignments)
+                }
+                UpsertAction::DoUpdate(_, Some(w)) => {
+                    content_hash::UpsertHashAction::DoUpdateWhere {
+                        assignments: &hash_assignments,
+                        predicates: w.predicates,
+                        udf_registry: &hash_udf_registry,
+                    }
                 }
             };
             // UNIQUE 対象の列名（解決した制約の宣言順。`target` の `indices` と同じ
@@ -3129,7 +3147,7 @@ fn upsert_typed_rows_impl(
                                     &existing.metadata,
                                 )
                                 .map_err(|e| CatalogError::Invalid(e.to_string()))?;
-                                let take = condition(&existing_view, values, write_id)
+                                let take = (condition.eval)(&existing_view, values, write_id)
                                     .map_err(TenantWriteError::SetExpressionEvaluationFailed)?;
                                 if !take {
                                     continue;
@@ -9597,7 +9615,13 @@ mod tests {
             Visibility::Private,
             &rows,
             &UpsertTarget::RowId,
-            &UpsertAction::DoUpdate(&assignments, Some(&skip)),
+            &UpsertAction::DoUpdate(
+                &assignments,
+                Some(UpsertWhere {
+                    eval: &skip,
+                    predicates: &[],
+                }),
+            ),
             LedgerWrite::Disabled,
             Some(&schema("docs")),
             &[],
@@ -9630,7 +9654,13 @@ mod tests {
             Visibility::Private,
             &rows,
             &UpsertTarget::RowId,
-            &UpsertAction::DoUpdate(&assignments, Some(&fail)),
+            &UpsertAction::DoUpdate(
+                &assignments,
+                Some(UpsertWhere {
+                    eval: &fail,
+                    predicates: &[],
+                }),
+            ),
             LedgerWrite::Disabled,
             Some(&schema("docs")),
             &[],
@@ -9649,7 +9679,13 @@ mod tests {
             Visibility::Private,
             &rows,
             &UpsertTarget::RowId,
-            &UpsertAction::DoUpdate(&assignments, Some(&skip)),
+            &UpsertAction::DoUpdate(
+                &assignments,
+                Some(UpsertWhere {
+                    eval: &skip,
+                    predicates: &[],
+                }),
+            ),
             LedgerWrite::Disabled,
             None,
             &[],

@@ -5655,9 +5655,12 @@ fn execute_upsert_inner(
     };
     let tenant_action = match &bound.action {
         BoundConflictAction::DoNothing => crate::tenant::UpsertAction::DoNothing,
-        BoundConflictAction::DoUpdate { .. } => crate::tenant::UpsertAction::DoUpdate(
+        BoundConflictAction::DoUpdate { condition, .. } => crate::tenant::UpsertAction::DoUpdate(
             &tenant_assignments,
-            compiled_where.as_ref().map(|_| &where_fn as _),
+            compiled_where.as_ref().map(|_| crate::tenant::UpsertWhere {
+                eval: &where_fn,
+                predicates: condition,
+            }),
         ),
     };
     // `sql::parser::BoundConflictTarget` を `tenant::UpsertTarget`（`sql` へ
