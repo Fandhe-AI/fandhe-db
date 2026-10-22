@@ -4644,7 +4644,7 @@ pub enum SetValue {
     /// 右辺が裸の `DEFAULT` キーワード（`SET a = DEFAULT`。SQL-50・Issue #1746）。
     /// 列の既定値（未定義なら NULL）を代入する意味で、解決は束縛段
     /// （`sql::parser::bind_set_assignments`）が担う。検出は UPDATE 専用の
-    /// `Parser::parse_update_assignment` のみで、`ON CONFLICT ... DO UPDATE SET` では
+    /// `Parser::parse_update_set_item` のみで、`ON CONFLICT ... DO UPDATE SET` では
     /// 生成されない（そちらは構文段で `42601`。`UpsertValue` への写像の防御腕は
     /// `reject_default_keyword_literal` により `0A000` だが到達不能）。
     ///
@@ -9873,7 +9873,7 @@ impl<'a> Parser<'a> {
     }
 
     /// `ON CONFLICT ... DO UPDATE SET` の 1 要素（`<col> = <右辺>`）を構造パースする
-    /// （SQL-20・TASK-193、Issue #872。`Parser::parse_update_assignment` と同じ形だが、
+    /// （SQL-20・TASK-193、Issue #872。`Parser::parse_update_set_item` と同じ形だが、
     /// 右辺に `EXCLUDED.<col>` も受理する点が異なる）。右辺は次の順に試す（SQL-49）:
     /// 1. 加算形（[`UpsertValue::Add`]。Issue #2425。右辺全体が一致するときだけ）
     /// 2. `EXCLUDED.<col>` 単独（[`UpsertValue::Excluded`]）
@@ -10082,15 +10082,11 @@ impl<'a> Parser<'a> {
         let table_name = self.expect_ident()?;
 
         self.expect_ident_matching("SET")?;
-        let mut assignments = vec![self.parse_update_assignment()?];
+        let mut assignments = Vec::new();
+        self.parse_update_set_item(&mut assignments)?;
         while matches!(self.peek(), Some(Token::Punct(','))) {
             self.advance();
-            if assignments.len() >= MAX_UPDATE_SET_ASSIGNMENTS {
-                return Err(SqlSurfaceError::unsupported(
-                    "too many UPDATE SET assignments",
-                ));
-            }
-            assignments.push(self.parse_update_assignment()?);
+            self.parse_update_set_item(&mut assignments)?;
         }
 
         // SQL-36（Issue #1743）: `WHERE` 省略は空の述語列で表す（DELETE と同じ。#2210 の拒否は `reject_omitted_where_for_dml`）。
@@ -10182,21 +10178,134 @@ impl<'a> Parser<'a> {
         Ok(UpdateWhereForm::Predicates(predicates))
     }
 
-    /// UPDATE の SET 句の 1 要素（`<col> = <lit>`）を構造パースする。
+    /// UPDATE の SET 句の 1 要素を構造パースし、列ごとの代入として `out` へ宣言順に積む。
     ///
-    /// 右辺は [`Self::expect_literal_or_set_expr`]（Issue #1544・SQL-45 のポインタ）。
-    fn parse_update_assignment(&mut self) -> Result<(String, SetValue), SqlSurfaceError> {
+    /// `(` で始まれば行値の形（[`Self::parse_update_row_assignment`]・SQL-50 (3)・Issue #1747）、
+    /// それ以外は `<col> = <右辺>`。行値の形も列ごとの代入へ展開するため、後段（束縛・
+    /// 内容照合ハッシュ・ビュー書き換え）は両形を区別しない。個数上限
+    /// [`MAX_UPDATE_SET_ASSIGNMENTS`] は積む前に累計で検査する。
+    fn parse_update_set_item(
+        &mut self,
+        out: &mut Vec<(String, SetValue)>,
+    ) -> Result<(), SqlSurfaceError> {
+        if matches!(self.peek(), Some(Token::Punct('('))) {
+            return self.parse_update_row_assignment(out);
+        }
+        if out.len() >= MAX_UPDATE_SET_ASSIGNMENTS {
+            return Err(SqlSurfaceError::unsupported(
+                "too many UPDATE SET assignments",
+            ));
+        }
         let column = self.expect_ident()?;
         self.expect_punct('=')?;
-        // 裸の `DEFAULT`（SQL-50・Issue #1746）。引用付き `"DEFAULT"` は lexer が
-        // `quoted_null` に記録するため列参照のまま。直後の余剰トークン（`DEFAULT + 1` 等）は
-        // 文末検査が `42601` に落とす。
+        let value = self.parse_update_set_rhs()?;
+        out.push((column, value));
+        Ok(())
+    }
+
+    /// SET 句の右辺 1 つ。裸の `DEFAULT`（SQL-50・Issue #1746）は [`SetValue::Default`]、
+    /// それ以外は [`Self::expect_literal_or_set_expr`]（Issue #1544・SQL-45）。
+    /// 引用付き `"DEFAULT"` は lexer が `quoted_null` に記録するため列参照のまま。
+    fn parse_update_set_rhs(&mut self) -> Result<SetValue, SqlSurfaceError> {
         if self.peek_ident_matches("DEFAULT") && !self.quoted_null.contains(&self.pos) {
             self.advance();
-            return Ok((column, SetValue::Default));
+            return Ok(SetValue::Default);
         }
-        let value = self.expect_literal_or_set_expr()?;
-        Ok((column, value))
+        self.expect_literal_or_set_expr()
+    }
+
+    /// 行値の代入 `(<col>, ...) = (<e>, ...)` / `= ROW(<e>, ...)`（SQL-50 (3)・Issue #1747）。
+    ///
+    /// 列ごとの代入へ展開して `out` に積む（内容照合ハッシュも展開後で計算されるため、
+    /// 同じ意味の別表記は同じ操作として扱われる）。1 列の形は `ROW` 必須（PostgreSQL と同じ。
+    /// 括弧のみは `42601`）。個数不一致は `42601`、部分クエリ源は `0A000`。値が列数を
+    /// 超えた時点で解析を打ち切る。
+    fn parse_update_row_assignment(
+        &mut self,
+        out: &mut Vec<(String, SetValue)>,
+    ) -> Result<(), SqlSurfaceError> {
+        self.expect_punct('(')?;
+        let mut columns: Vec<String> = Vec::new();
+        loop {
+            if out.len().saturating_add(columns.len()) >= MAX_UPDATE_SET_ASSIGNMENTS {
+                return Err(SqlSurfaceError::unsupported(
+                    "too many UPDATE SET assignments",
+                ));
+            }
+            columns.push(self.expect_ident()?);
+            if matches!(self.peek(), Some(Token::Punct(','))) {
+                self.advance();
+                continue;
+            }
+            break;
+        }
+        self.expect_punct(')')?;
+        self.expect_punct('=')?;
+
+        let source_err = || {
+            SqlSurfaceError::unsupported(
+                "source for a multiple-column UPDATE item must be a ROW() expression",
+            )
+        };
+        let mut explicit_row = false;
+        if self.peek_ident_matches("ROW")
+            && !self.quoted_null.contains(&self.pos)
+            && matches!(self.tokens.get(self.pos + 1), Some(Token::Punct('(')))
+        {
+            self.advance();
+            explicit_row = true;
+        }
+        if !matches!(self.peek(), Some(Token::Punct('('))) {
+            return Err(source_err());
+        }
+        if !explicit_row {
+            // `values` / `with` は通常の識別子でもあるため、後続トークンが
+            // サブクエリ構文（`VALUES (` / `WITH [RECURSIVE] name [(..)] AS`）の
+            // ときだけサブクエリ扱いにし、それ以外は列参照経路へ流す。
+            let at = |n: usize| self.tokens.get(self.pos.saturating_add(n));
+            let is_word = |t: Option<&Token>, w: &str| matches!(t, Some(Token::Ident(x)) if x.eq_ignore_ascii_case(w));
+            let is_values_query =
+                is_word(at(1), "VALUES") && matches!(at(2), Some(Token::Punct('(')));
+            let is_with_query = is_word(at(1), "WITH")
+                && ((matches!(at(2), Some(Token::Ident(_)))
+                    && (is_word(at(3), "AS") || matches!(at(3), Some(Token::Punct('(')))))
+                    || (is_word(at(2), "RECURSIVE") && matches!(at(3), Some(Token::Ident(_)))));
+            let is_subquery = matches!(at(1), Some(Token::Keyword(Keyword::Select)))
+                || is_values_query
+                || is_with_query;
+            if is_subquery {
+                return Err(SqlSurfaceError::feature_not_supported(
+                    "multiple-column UPDATE with a subquery source is not supported",
+                ));
+            }
+            if columns.len() == 1 {
+                return Err(source_err());
+            }
+        }
+        self.advance(); // '('
+
+        let mismatch =
+            || SqlSurfaceError::unsupported("number of columns does not match number of values");
+        let mut values: Vec<SetValue> = Vec::new();
+        if !matches!(self.peek(), Some(Token::Punct(')'))) {
+            loop {
+                if values.len() >= columns.len() {
+                    return Err(mismatch());
+                }
+                values.push(self.parse_update_set_rhs()?);
+                if matches!(self.peek(), Some(Token::Punct(','))) {
+                    self.advance();
+                    continue;
+                }
+                break;
+            }
+        }
+        self.expect_punct(')')?;
+        if values.len() != columns.len() {
+            return Err(mismatch());
+        }
+        out.extend(columns.into_iter().zip(values));
+        Ok(())
     }
 
     /// `RETURNING <投影>`（Issue #873・SQL-21）の構造パースのみを行う。書き込み系
@@ -23943,6 +24052,57 @@ mod tests {
         for rhs in ["DEFAULT + 1", "DEFAULT::int", "DEFAULT DEFAULT"] {
             assert_eq!(parse(rhs).unwrap_err().wire_code(), "42601", "{rhs}");
         }
+    }
+
+    /// 行値の代入 `SET (a, b) = (...)`（SQL-50 (3)・Issue #1747）は列ごとの代入へ宣言順に展開する。
+    /// 個数不一致・1 列の括弧のみは `42601`、部分クエリ源は `0A000`、累計の個数上限は `42601`。
+    #[test]
+    fn update_set_row_value_expands_to_per_column_assignments() {
+        let lookup = catalog_with(&["documents"]);
+        let parse = |set: &str| {
+            validate_update(
+                &format!("UPDATE documents SET {set} WHERE id = 1 USING OPERATION_ID 'op-rv-1'"),
+                &lookup,
+                LedgerMode::Ledgered,
+            )
+            .map(|u| u.assignments)
+        };
+        let expected = parse("n = 1, o = 'x'").unwrap();
+        assert_eq!(parse("(n, o) = (1, 'x')").unwrap(), expected);
+        assert_eq!(parse("(n, o) = ROW(1, 'x')").unwrap(), expected);
+        assert_eq!(parse("n = 1, (o) = ROW('x')").unwrap(), expected);
+        let d = parse("(n, o) = (DEFAULT, 1 + 1)").unwrap();
+        assert_eq!(d[0].1, SetValue::Default);
+        assert!(matches!(d[1].1, SetValue::Expr(_)));
+        for set in [
+            "(n, o) = (1)",
+            "(n, o) = (1, 2, 3)",
+            "(n, o) = ROW()",
+            "(n) = (1)",
+            "() = ()",
+            "(n, o) = 1",
+            "(n, o) =",
+        ] {
+            assert_eq!(parse(set).unwrap_err().wire_code(), "42601", "{set}");
+        }
+        for set in [
+            "(n, o) = (SELECT 1, 2)",
+            "(n, o) = (VALUES (1, 2))",
+            "(n, o) = (WITH c AS (SELECT 1) SELECT 1, 2)",
+            "(n, o) = (WITH RECURSIVE c AS (SELECT 1) SELECT 1, 2)",
+        ] {
+            assert_eq!(parse(set).unwrap_err().wire_code(), "0A000", "{set}");
+        }
+        // `values` / `with` は通常の識別子: 先頭スロットの列参照として受理する。
+        for set in ["(n, o) = (values, 1)", "(n, o) = (with, 1)"] {
+            assert!(parse(set).is_ok(), "{set}");
+        }
+        let cols: Vec<String> = (0..=MAX_UPDATE_SET_ASSIGNMENTS)
+            .map(|i| format!("c{i}"))
+            .collect();
+        let vals = vec!["1"; cols.len()].join(", ");
+        let over = format!("({}) = ({vals})", cols.join(", "));
+        assert_eq!(parse(&over).unwrap_err().wire_code(), "42601");
     }
 
     /// 式の複数 SET・述語形でも構文木のまま保持し、宣言順を保つ。
