@@ -240,7 +240,9 @@ pub(crate) fn execute_and_respond<'e, S: WireStream>(
 fn copy_step_to_signal(step: crate::copy::CopyStep) -> LoopSignal {
     match step {
         crate::copy::CopyStep::Closed => LoopSignal::Closed,
-        crate::copy::CopyStep::Completed | crate::copy::CopyStep::Failed => LoopSignal::Continue,
+        crate::copy::CopyStep::Completed { .. } | crate::copy::CopyStep::Failed => {
+            LoopSignal::Continue
+        }
     }
 }
 
@@ -277,7 +279,7 @@ fn run_sequential_statements<'e, S: WireStream>(
         let before = txn.status();
         let status = if engine::sql::copy::is_copy_statement(stmt) {
             match run_copy_statement(stream, engine, ctx, session, txn, stmt, finish)? {
-                crate::copy::CopyStep::Completed => StatementStatus::Completed,
+                crate::copy::CopyStep::Completed { .. } => StatementStatus::Completed,
                 crate::copy::CopyStep::Failed => StatementStatus::Failed,
                 crate::copy::CopyStep::Closed => return Ok(LoopSignal::Closed),
             }
@@ -412,7 +414,9 @@ fn run_implicit_statements<'e, S: WireStream>(
 /// - 暗黙トランザクション中の `InTransaction`: 未対応。`fail()` の後に `0A000`。
 ///   暗黙トランザクションでは `fail()` が `Idle` へ戻すので `ReadyForQuery('I')`。
 /// - `Failed`: 他の文と同じく `25P02`（期限切れ未報告なら `54000`）で拒否する。
-fn run_copy_statement<'e, S: WireStream>(
+///
+/// 拡張クエリの Execute（Issue #1760）も `Finish::Continue` で本関数を呼び、gating を共有する。
+pub(crate) fn run_copy_statement<'e, S: WireStream>(
     stream: &mut S,
     engine: &'e EngineCore,
     ctx: &PolicyContext,
