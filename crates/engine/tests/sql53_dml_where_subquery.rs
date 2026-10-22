@@ -1,9 +1,10 @@
-//! 述語形 `UPDATE`／`DELETE` の `WHERE` 内サブクエリ（構文段の受理と束縛段のゲート）の結合テスト
+//! 述語形 `UPDATE`／`DELETE` の `WHERE` 内サブクエリ（構文段の受理と実行経路）の結合テスト
 //! （Issue #1750・親 #1749・SQL-53 (a)）。
 //!
-//! 現段階の契約: 構文段は SELECT と同じ AST で受理するが、内側 SELECT の評価は未結線のため
-//! 束縛段が `42601` で fail-closed に止める（実行結線は #1751 で受理へ反転する）。
-//! 拒否時は書き込み・台帳消費の副作用を持たない。`PARTITIONED` 併用・`$n` 併用は構文／Parse 段で `42601`。
+//! 契約: 構文段は SELECT と同じ AST で受理し、受理した文は #1751 の実行経路
+//! （`resolve_predicate_*_subqueries`）が束縛前に解決する。`USING OPERATION_ID` 付きは暫定ゲートが
+//! 内側の実行前に `0A000` で拒否し（副作用なし）、`operation_id` 省略（既定の `Optional` 台帳モード）
+//! は実行して内側を評価する。`PARTITIONED` 併用・`$n` 併用は構文／Parse 段で `42601`。
 
 use engine::catalog::{ColumnDef, ColumnType, TableSchema};
 use engine::core::EngineCore;
@@ -86,9 +87,9 @@ fn assert_42601(err: &SqlSurfaceError) {
     assert_eq!(err.wire_code(), "42601", "{err:?}");
 }
 
-/// 受理した各形の UPDATE／DELETE は束縛段で `42601` となり、表の内容を変えない。
+/// `USING OPERATION_ID` 付きの各形は内側の実行前に `0A000` で拒否され、表の内容を変えない。
 #[test]
-fn subquery_where_dml_is_gated_at_bind_without_side_effects() {
+fn subquery_where_dml_with_operation_id_is_rejected_without_side_effects() {
     let (core, path) = new_core();
     let _guard = CleanupGuard(path);
     seed(&core);
@@ -99,15 +100,37 @@ fn subquery_where_dml_is_gated_at_bind_without_side_effects() {
             &format!("DELETE FROM docs WHERE {w} USING OPERATION_ID 'del-{i}'"),
         )
         .expect_err("delete gated");
-        assert_42601(&err);
+        assert_eq!(err.wire_code(), "0A000", "{err:?}");
         let err = run(
             &core,
             &format!("UPDATE docs SET lang = 'xx' WHERE {w} USING OPERATION_ID 'upd-{i}'"),
         )
         .expect_err("update gated");
-        assert_42601(&err);
+        assert_eq!(err.wire_code(), "0A000", "{err:?}");
     }
     assert_eq!(before, doc_rows(&core));
+}
+
+/// `operation_id` 省略（既定の `Optional` 台帳モード）では内側を評価して実行する。
+#[test]
+fn subquery_where_dml_without_operation_id_executes() {
+    let (core, path) = new_core();
+    let _guard = CleanupGuard(path);
+    seed(&core);
+    run(
+        &core,
+        "UPDATE docs SET lang = 'xx' WHERE lang IN (SELECT lang FROM langs LIMIT 10)",
+    )
+    .expect("update executes");
+    let rows = doc_rows(&core);
+    assert!(rows.contains("xx") && rows.contains("en"), "{rows}");
+    run(
+        &core,
+        "DELETE FROM docs WHERE EXISTS (SELECT id FROM langs LIMIT 1) AND lang = 'xx'",
+    )
+    .expect("delete executes");
+    let rows = doc_rows(&core);
+    assert!(!rows.contains("xx") && rows.contains("en"), "{rows}");
 }
 
 /// `PARTITIONED` 併用（`EXPLAIN` 経路を含む）は構文段で `42601`。
@@ -140,7 +163,8 @@ fn subquery_in_returning_projection_stays_rejected() {
     assert_42601(&err);
 }
 
-/// 拡張クエリプロトコル: `$n` との併用は Parse で `42601`、`$n` なしは実行で `42601`（副作用なし）。
+/// 拡張クエリプロトコル: `$n` との併用は Parse で `42601`、`$n` なしの `USING OPERATION_ID` 付きは
+/// 実行で `0A000`（副作用なし）。
 #[test]
 fn subquery_where_dml_over_extended_protocol() {
     let (core, path) = new_core();
@@ -158,6 +182,6 @@ fn subquery_where_dml_over_extended_protocol() {
         "DELETE FROM docs WHERE lang IN (SELECT lang FROM langs LIMIT 10) USING OPERATION_ID 'e-2'",
     )
     .expect_err("gated");
-    assert_42601(&err);
+    assert_eq!(err.wire_code(), "0A000", "{err:?}");
     assert_eq!(before, doc_rows(&core));
 }
