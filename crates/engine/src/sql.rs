@@ -191,6 +191,7 @@ mod temp_rows_tests;
 #[cfg(test)]
 mod truncate_restart_identity_tests;
 pub(crate) mod upsert_add;
+pub(crate) mod upsert_expr;
 #[cfg(test)]
 mod write_time_ledger_tests;
 // `SELECT DISTINCT`・`COUNT(DISTINCT <expr>)`（SQL-25 (c)・TASK-209）が共有する

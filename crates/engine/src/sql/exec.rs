@@ -594,7 +594,9 @@ fn candidate_value_to_scalar_ref<'a>(
 /// 候補行の `Value::Array` を [`candidate_value_to_scalar_ref`] が借用する正準
 /// ペイロードへエンコードしたスクラッチ（列位置ごとに `Some`／`None`）。行ごとに
 /// 高々 1 列あたり `MAX_ARRAY_PAYLOAD_LEN` バイト（Top-k 行のみが対象）。
-fn array_payload_scratch(values: &[Value]) -> Result<Vec<Option<Vec<u8>>>, SqlSurfaceError> {
+pub(crate) fn array_payload_scratch(
+    values: &[Value],
+) -> Result<Vec<Option<Vec<u8>>>, SqlSurfaceError> {
     values
         .iter()
         .map(|v| match v {
@@ -613,7 +615,7 @@ fn array_payload_scratch(values: &[Value]) -> Result<Vec<Option<Vec<u8>>>, SqlSu
 
 /// 候補行の値列を `ScalarRef` ビューへ変換する（`scratch` は
 /// [`array_payload_scratch`] の戻り値で、`values` と同じ添字を持つ）。
-fn candidate_scalar_view<'a>(
+pub(crate) fn candidate_scalar_view<'a>(
     values: &'a [Value],
     scratch: &'a [Option<Vec<u8>>],
 ) -> Vec<Option<ScalarRef<'a>>> {
@@ -5612,6 +5614,9 @@ fn execute_upsert_inner(
                         crate::tenant::UpsertSetValue::Excluded(*src_idx)
                     }
                     BoundUpsertValue::Literal(v) => crate::tenant::UpsertSetValue::Literal(v),
+                    BoundUpsertValue::Expr(expr) => {
+                        crate::tenant::UpsertSetValue::Expr(expr.set_expr())
+                    }
                     BoundUpsertValue::Add(operand) => {
                         crate::tenant::UpsertSetValue::Add(match operand {
                             crate::sql::parser::BoundUpsertAddOperand::Literal(v) => {
