@@ -648,6 +648,14 @@ Issue #871（述語つき UPDATE/DELETE の実行結線）は自動運転モー�
 - **残余リスク**: 送られた文のテキストで照合するため、`search_path` の違いで内側の参照表の解決先が変わってもハッシュは同じになる（対象表は台帳のキーで区別される。照合は文単位とする定めのとおり）。
 - **申し送り**: 実行経路への結線と e2e の回帰テストは #1733（INSERT ... SELECT の実行経路の Issue）で行う。
 
+## Issue #1679 追記（CREATE TABLE AS の内容照合ハッシュ）
+
+ポインタ: SQL-52 (4)・RECOVER-10・RECOVER-11。実装は `recovery/content_hash.rs` の `for_create_table_as`。
+
+- **材料と規則**: `for_insert_select` と同じ（`USING OPERATION_ID` 句と末尾 `;` を除いた文のトークン列だけ。結果行の値は材料にしない。正準化しない。未束縛の `$n` は `Err`）
+- **ドメイン**: `OpTag::CreateTableAs = 26` で `InsertSelect` とは別ドメイン。既存の OpTag のバイト列は変えない
+- **呼び出し**: 構文検証（`validate_create_table_as_tokens`）が算出して `ValidatedCreateTableAs` に保持し、実行段が事前照合・再照合・記録に使う。詳細は [ctas-column-inference.md](ctas-column-inference.md) の第 III 部
+
 ## 参照
 
 - `docs/spec/04-behavior/recovery.md`（RECOVER-2・RECOVER-3・RECOVER-7・
