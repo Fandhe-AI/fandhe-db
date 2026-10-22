@@ -96,8 +96,12 @@ type Outcome = Result<i64, &'static str>;
 
 #[test]
 fn parallel_add_on_same_key_counts_every_success_across_three_tenants() {
-    let (core, path) = open_engine("sql49-par-add");
-    let _g = CleanupGuard(path);
+    // ガードを core より先に束縛する。ローカルは宣言の逆順に破棄されるため、
+    // core（DB ハンドル）を先に閉じてから一時 DB を削除できる（Windows 対策）。
+    let (_g, core) = {
+        let (core, path) = open_engine("sql49-par-add");
+        (CleanupGuard(path), core)
+    };
     let barrier = Barrier::new(TENANTS.len() * PARALLEL);
 
     // キー id = 1 は事前に作らない（最初の挿入と衝突による加算の競合も対象に含める）。
@@ -189,8 +193,12 @@ fn parallel_add_on_same_key_counts_every_success_across_three_tenants() {
 
 #[test]
 fn parallel_add_on_invisible_conflict_is_always_42501_without_side_effects() {
-    let (core, path) = open_engine("sql49-par-invisible");
-    let _g = CleanupGuard(path);
+    // ガードを core より先に束縛する。ローカルは宣言の逆順に破棄されるため、
+    // core（DB ハンドル）を先に閉じてから一時 DB を削除できる（Windows 対策）。
+    let (_g, core) = {
+        let (core, path) = open_engine("sql49-par-invisible");
+        (CleanupGuard(path), core)
+    };
 
     // SQL 表層の挿入は常に Private。テナントごとに特徴的なシード値を置く。
     let seed = |ti: usize| 7777 + i64::try_from(ti).expect("small") * 1000;
