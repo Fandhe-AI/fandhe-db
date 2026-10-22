@@ -13,7 +13,8 @@
 //!
 //! engine 層の同値性は `crates/engine/tests/prepared_params.rs`
 //! （`bind_prepared_null_matches_literal_null_in_noneq_between`）。3 クライアントの層 B と
-//! RLS 3 テナントの網羅は後続 Issue #2433 の担当で、追記先は別ファイルとする。
+//! RLS 3 テナントの網羅（非 NULL 値のリテラル形との一致）は Issue #2433 の担当で、層 A は
+//! `wire_sql78_noneq_between_rls.rs`、層 B は `three_client_extended_e2e.rs` が持つ。
 
 #[path = "common/mod.rs"]
 mod common;
