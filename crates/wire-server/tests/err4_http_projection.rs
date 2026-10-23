@@ -308,7 +308,7 @@ fn query_as_alice(addr: SocketAddr, body: &[u8]) -> HttpResponse {
 /// `status.rs::EXPECTED`（`#[cfg(test)]` 内で外部から参照不可）と同値の
 /// 期待表。両者の乖離は [`err4_projection_table_is_closed_over_all_error_classes`]
 /// が `http_status` 経由で検出する。
-const EXPECTED_STATUS: [(&str, u16); 76] = [
+const EXPECTED_STATUS: [(&str, u16); 77] = [
     ("22000", 400),
     ("22001", 400),
     ("22012", 400),
@@ -418,6 +418,8 @@ const EXPECTED_STATUS: [(&str, u16); 76] = [
     ("2203F", 400),
     // `UntranslatableCharacter`（`22P05`。Issue #2185）: jsonpath リテラルの NUL 文字。400。
     ("22P05", 400),
+    // `InvalidEscapeSequence`（`22025`。Issue #1779）: LIKE の不正エスケープ。400。
+    ("22025", 400),
     // `InvalidBinaryRepresentation`（`22P03`。Issue #2443）: numeric バイナリ受信の外部表現不正。400。
     ("22P03", 400),
     // `BadCopyFileFormat`（`22P04`。Issue #1769）: COPY binary のフレーム不正。400。
@@ -518,7 +520,7 @@ fn assert_projected_as(resp: &HttpResponse, expected_class: ErrorClass) {
 
 // --- R7: 射影表が ErrorClass::ALL 全体を閉じて覆うことの機械検証 -----------
 
-const _: () = assert!(ErrorClass::ALL.len() == 79);
+const _: () = assert!(ErrorClass::ALL.len() == 80);
 
 /// `wire_code` を共有する分類と、逆引き（`from_wire_code`）が返す分類の組
 /// （ERR-6。`23502`: TABLE-16・TASK-204・Issue #904、`23505`: Issue #1180）。
@@ -1123,6 +1125,22 @@ fn err4_f_ambiguous_sort_reachable_via_nosql_aggregate() {
         "group_by":"lang","sort":[{"column":"count","dir":"asc"}]}"#;
     let resp = query_as_alice(addr, body);
     assert_projected(&resp, "42702");
+    http_common::assert_message_does_not_echo(&resp, "tenant-a");
+}
+
+/// `InvalidEscapeSequence`（`22025`。Issue #1779・SQL-54）は NoSQL 表層の実要求から到達可能:
+/// `filter` の `like` op で末尾が単独の `\` のパターンは engine の LIKE トークン化が拒否する。
+/// 400 に射影し、応答にパターン・テナントを含めない。
+#[test]
+fn err4_f_invalid_escape_reachable_via_nosql_like_filter() {
+    let (core, _guard) = new_core();
+    let addr = spawn(core);
+    let resp = query_as_alice(
+        addr,
+        br#"{"op":"scan","table":"docs","limit":10,"filter":[{"column":"path","op":"like","value":"docs\\"}]}"#,
+    );
+    assert_projected_as(&resp, ErrorClass::InvalidEscapeSequence);
+    assert_eq!(resp.status, 400, "{resp:?}");
     http_common::assert_message_does_not_echo(&resp, "tenant-a");
 }
 
