@@ -327,6 +327,8 @@ fn value_bytes(v: &Value) -> usize {
         Value::Bytes(b) => b.len(),
         Value::Json(s) => s.len(),
         Value::Vector(x) => x.len().saturating_mul(std::mem::size_of::<f32>()),
+        // 配列の SET 結果も候補数に比例して保持されるため共有予算へ計上する。
+        Value::Array(a) => a.approx_heap_bytes(),
         _ => 0,
     }
 }
@@ -530,6 +532,8 @@ fn source_scalar<'a>(
         (ColumnType::TimestampTz, Cell::TimestampTz(t)) => Some(ScalarRef::TimestampTz(*t)),
         (ColumnType::Interval, Cell::Interval(i)) => Some(ScalarRef::Interval(*i)),
         (ColumnType::Bpchar(_), Cell::Text(s)) => Some(ScalarRef::Text(s)),
+        // JSONB は JSON と値表現を共有するため、既存の式評価と同じ Json 借用形へ写す。
+        (ColumnType::Jsonb, Cell::Json(s)) => Some(ScalarRef::Json(s)),
         (ColumnType::Array(_), Cell::Array(a)) => {
             let payload = array_payload.ok_or_else(|| internal("source array payload missing"))?;
             let count = u32::try_from(a.len())

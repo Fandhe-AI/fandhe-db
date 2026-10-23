@@ -101,3 +101,23 @@ fn source_columns_append_missing_key_columns_after_the_requested_ones() {
     let p = plan(vec![key(1, 2)]);
     assert_eq!(p.source_columns(), vec![2]);
 }
+
+/// JSONB の source 列は JSON と同じ借用形へ写像される（`->>` 等の式評価で XX000 にしない）。
+#[test]
+fn source_scalar_maps_jsonb_cell_to_json_scalar() {
+    let cell = Cell::Json("{\"a\":1}".to_string());
+    let got = source_scalar(&cell, &ColumnType::Jsonb, None).expect("jsonb");
+    assert!(matches!(got, Some(ScalarRef::Json("{\"a\":1}"))));
+    let null = source_scalar(&Cell::Null, &ColumnType::Jsonb, None).expect("null");
+    assert!(null.is_none());
+}
+
+/// 配列の SET 結果は共有バイト予算へ計上される（0 バイト扱いにしない）。
+#[test]
+fn value_bytes_counts_array_heap() {
+    let arr = Value::Array(crate::row_codec::ArrayValue::Text(vec![
+        Some("x".repeat(1000)),
+        None,
+    ]));
+    assert!(value_bytes(&arr) >= 1000);
+}
