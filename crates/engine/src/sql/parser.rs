@@ -7272,7 +7272,14 @@ fn bind_string_agg_text_arg(
     let bytea_unsupported = || SqlSurfaceError::FeatureNotSupported {
         detail: "string_agg over bytea is not supported".to_string(),
     };
-    let (bound, collation) = if let Expr::Ident(name) = expr {
+    let (bound, collation) = if matches!(expr, Expr::Null) {
+        // 型が text と確定する引数位置の NULL リテラル。NULL 値の行は読み飛ばし、NULL 区切りは
+        // 何も置かない（PostgreSQL と同じ）ため、そのまま通常の評価経路へ流す。
+        *node_budget = node_budget
+            .checked_sub(1)
+            .ok_or_else(|| SqlSurfaceError::payload_too_large("expression is too large"))?;
+        (BoundExpr::Null, crate::collation::Collation::DEFAULT)
+    } else if let Expr::Ident(name) = expr {
         if let Some((index, column)) = schema
             .columns
             .iter()

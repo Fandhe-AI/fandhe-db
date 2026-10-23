@@ -165,6 +165,9 @@ fn build_core(tag: &str) -> (EngineCore, std::path::PathBuf) {
         3 * MIB,
         Visibility::Public,
     );
+    // `dup`: 同一の 3 MiB が 2 行。`DISTINCT` では捨てられる重複行が予算で 54000 にならないこと。
+    insert_big(&storage, "tenant-a", 7, "dup", 3 * MIB, Visibility::Public);
+    insert_big(&storage, "tenant-a", 8, "dup", 3 * MIB, Visibility::Public);
     insert_big(&storage, "tenant-b", 6, "ok", 3 * MIB, Visibility::Private);
     (
         EngineCore::from_storage(storage, Box::new(CpuScalarProvider)),
@@ -497,6 +500,37 @@ fn unsupported_contexts_are_rejected_explicitly() {
         "SELECT string_agg(a.s, ',') FROM t a JOIN t b ON a.g = b.g",
     );
     assert_eq!(c, "0A000");
+}
+
+#[test]
+fn distinct_duplicates_do_not_consume_limits() {
+    let (core, path) = build_core("sql57-distinct-dup");
+    let _g = CleanupGuard(path);
+    for sql in [
+        "SELECT string_agg(DISTINCT s, ',') FROM big WHERE g = 'dup'",
+        "SELECT string_agg(DISTINCT s, ',' ORDER BY s) FROM big WHERE g = 'dup'",
+    ] {
+        let out = one(&core, sql).expect("non-null");
+        assert_eq!(out.len(), 3 * MIB, "{sql}");
+    }
+    // DISTINCT なしでは 6 MiB + 区切りで結果長超過。
+    assert_eq!(
+        code_of(&core, "SELECT string_agg(s, ',') FROM big WHERE g = 'dup'"),
+        "54000"
+    );
+}
+
+#[test]
+fn null_literal_arguments_are_bound_as_text() {
+    let (core, path) = build_core("sql57-null-literal");
+    let _g = CleanupGuard(path);
+    // NULL 区切りは何も置かない。
+    assert_eq!(
+        one(&core, "SELECT string_agg(s, NULL) FROM t WHERE g = 'a'"),
+        s("xyx")
+    );
+    // NULL 値は全行読み飛ばされ、結果は NULL。
+    assert_eq!(one(&core, "SELECT string_agg(NULL, ',') FROM t"), None);
 }
 
 #[test]

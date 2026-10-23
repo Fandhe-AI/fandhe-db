@@ -201,6 +201,17 @@ impl StringAggState {
         delimiter: Option<&str>,
         keys: Vec<Option<OrderValue>>,
     ) -> Result<(), SqlSurfaceError> {
+        // `DISTINCT` の既出（値, 区切り）は捨てられる行なので、状態・結果長の予算を
+        // 消費させる前に判定して戻る（重複行で誤って 54000 にしない）。
+        let canon = if self.distinct {
+            let canon = canonical_pair(value, delimiter)?;
+            if self.seen.contains(&canon) {
+                return Ok(());
+            }
+            Some(canon)
+        } else {
+            None
+        };
         let mut key_bytes = 0usize;
         for k in keys.iter().flatten() {
             key_bytes = key_bytes.saturating_add(order_value_bytes(k));
@@ -224,11 +235,7 @@ impl StringAggState {
         if next_values > MAX_STRING_AGG_RESULT_BYTES {
             return Err(SqlSurfaceError::payload_too_large(RESULT_TOO_LARGE_DETAIL));
         }
-        if self.distinct {
-            let canon = canonical_pair(value, delimiter)?;
-            if self.seen.contains(&canon) {
-                return Ok(());
-            }
+        if let Some(canon) = canon {
             self.seen_bytes = self
                 .seen_bytes
                 .checked_add(canon.len())

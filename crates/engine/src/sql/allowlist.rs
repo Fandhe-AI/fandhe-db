@@ -5952,7 +5952,11 @@ impl<'a> Parser<'a> {
             let saved_calls = self.agg_calls.take();
             let saved_minus = self.allow_unary_minus;
             self.allow_unary_minus = false;
+            // `string_agg` の引数位置は text と確定するため、裸の `NULL` をリテラルとして解析する。
+            let saved_null = self.allow_null_literal;
+            self.allow_null_literal = func == AggregateFunc::StringAgg;
             let parsed = self.parse_value_expr(0);
+            self.allow_null_literal = saved_null;
             self.allow_unary_minus = saved_minus;
             self.agg_calls = saved_calls;
             AggregateArg::Expr(parsed?)
@@ -5971,7 +5975,10 @@ impl<'a> Parser<'a> {
             let saved_calls = self.agg_calls.take();
             let saved_minus = self.allow_unary_minus;
             self.allow_unary_minus = false;
+            let saved_null = self.allow_null_literal;
+            self.allow_null_literal = true;
             let parsed = self.parse_value_expr(0);
+            self.allow_null_literal = saved_null;
             self.allow_unary_minus = saved_minus;
             self.agg_calls = saved_calls;
             extra_args.push(parsed?);
