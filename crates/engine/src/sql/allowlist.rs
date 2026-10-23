@@ -5919,7 +5919,18 @@ impl<'a> Parser<'a> {
         // 消費する（[`is_distinct_modifier`] と同じ判定規則。列名 `distinct` を
         // 引数に持つ `COUNT(distinct)` を壊さないよう、次のトークンが識別子・`*`
         // でない場合は消費しない）。
-        let distinct = if is_distinct_modifier(&self.tokens, self.pos) {
+        // `string_agg` の引数位置に限り、`DISTINCT` 直後の文字列リテラル・`(` も修飾子と判定する
+        // （`string_agg(DISTINCT 'x', ',')`・`DISTINCT ('x')`。PostgreSQL と同じ読み）。
+        let string_agg_modifier = func == AggregateFunc::StringAgg
+            && matches!(
+                self.tokens.get(self.pos),
+                Some(Token::Ident(n)) if n.eq_ignore_ascii_case("DISTINCT")
+            )
+            && matches!(
+                self.tokens.get(self.pos + 1),
+                Some(Token::StringLiteral(_)) | Some(Token::Punct('('))
+            );
+        let distinct = if string_agg_modifier || is_distinct_modifier(&self.tokens, self.pos) {
             self.advance();
             true
         } else {
@@ -6021,7 +6032,12 @@ impl<'a> Parser<'a> {
             let saved_calls = self.agg_calls.take();
             let saved_minus = self.allow_unary_minus;
             self.allow_unary_minus = false;
+            // 引数と同じく裸の `NULL` をリテラルとして解析する（DISTINCT 時の ORDER BY 式一致判定と
+            // 非 DISTINCT 時の評価を引数側と揃える）。
+            let saved_null = self.allow_null_literal;
+            self.allow_null_literal = true;
             let parsed = self.parse_value_expr(0);
+            self.allow_null_literal = saved_null;
             self.allow_unary_minus = saved_minus;
             self.agg_calls = saved_calls;
             let expr = parsed?;
@@ -28263,6 +28279,40 @@ mod tests {
         assert!(second.order_by.is_empty());
         assert_eq!(second.alias.as_deref(), Some("names"));
         assert_eq!(second.func.default_alias(), "string_agg");
+    }
+
+    /// PR #2671 レビュー対応: `DISTINCT` 直後の文字列リテラル・括弧式を修飾子と判定し、
+    /// 裸の `NULL` は引数と内側 `ORDER BY` で同じリテラルとして解析される。
+    #[test]
+    fn string_agg_distinct_modifier_before_literal_paren_and_null_order_key() {
+        let lookup = catalog_with(&["documents"]);
+        for sql in [
+            "SELECT string_agg(DISTINCT 'x', ',') FROM documents",
+            "SELECT string_agg(DISTINCT ('x'), ',') FROM documents",
+        ] {
+            let agg = expect_aggregate(sql, &lookup);
+            assert!(expect_agg_item(&agg.items()[0]).distinct, "{sql}");
+        }
+        let agg = expect_aggregate(
+            "SELECT string_agg(DISTINCT NULL, ',' ORDER BY NULL) FROM documents",
+            &lookup,
+        );
+        let item = expect_agg_item(&agg.items()[0]);
+        assert!(item.distinct);
+        assert_eq!(item.order_by.len(), 1);
+        assert_eq!(
+            format!("{:?}", item.order_by[0].expr),
+            format!(
+                "{:?}",
+                match &item.arg {
+                    AggregateArg::Expr(e) => e,
+                    _ => panic!("expr arg expected"),
+                }
+            )
+        );
+        // 列名 `distinct` を引数に取る既存形は維持する。
+        let agg = expect_aggregate("SELECT string_agg(distinct, ',') FROM documents", &lookup);
+        assert!(!expect_agg_item(&agg.items()[0]).distinct);
     }
 
     /// SQL-57: 引数の個数違いは `42883`、`*` は `42601`、キー数の超過は確保前に `54000`、
