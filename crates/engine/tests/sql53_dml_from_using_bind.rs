@@ -113,6 +113,11 @@ const ACCEPTED: &[&str] = &[
     "DELETE FROM docs USING langs WHERE docs.lang = langs.lang USING OPERATION_ID 'op-d1'",
     "DELETE FROM docs USING langs USING OPERATION_ID 'op-d2'",
     "DELETE FROM docs USING langs",
+    // 裸の bool 列 WHERE の後ろに DML の後続句が続く形（同上）
+    "UPDATE docs SET lang = 'x' FROM langs WHERE langs.flag USING OPERATION_ID 'op-u3'",
+    "UPDATE docs SET lang = 'x' FROM langs WHERE langs.flag;",
+    "DELETE FROM docs USING langs WHERE langs.flag USING OPERATION_ID 'op-d3'",
+    "DELETE FROM docs USING langs WHERE langs.flag;",
 ];
 
 /// 受理形は `parse_sql` が専用 variant を返す。
@@ -345,14 +350,13 @@ fn identifier_named_using_is_not_routed_to_delete_using() {
     );
     let (core, path) = new_core("sql53-from-using-ident", false);
     let _g = CleanupGuard(path);
-    for sql in ["DELETE FROM docs WHERE using = 1"] {
-        // 単一表 DELETE（述語形）として構文解析できる。FROM／USING 経路なら別 variant になる。
-        let parsed = core.parse_sql(sql).expect("single-table delete parses");
-        assert!(
-            format!("{parsed:?}").starts_with("Delete(Predicate"),
-            "{sql}: {parsed:?}"
-        );
-    }
+    let sql = "DELETE FROM docs WHERE using = 1";
+    // 単一表 DELETE（述語形）として構文解析できる。FROM／USING 経路なら別 variant になる。
+    let parsed = core.parse_sql(sql).expect("single-table delete parses");
+    assert!(
+        format!("{parsed:?}").starts_with("Delete(Predicate"),
+        "{sql}: {parsed:?}"
+    );
 }
 
 /// 既存の `DELETE ... USING OPERATION_ID`（`WHERE` 省略形）と単一表 DML は挙動を変えない。
@@ -414,6 +418,10 @@ fn search_path_gate_covers_from_and_using_relations() {
         "UPDATE public.docs SET lang = 'x' FROM langs WHERE docs.lang = langs.lang",
         "DELETE FROM public.docs USING langs WHERE docs.lang = langs.lang",
         "DELETE FROM public.docs USING public.langs, langs b WHERE docs.lang = b.lang",
+        // 対象表の別名が式の語（case／when／is）でも USING 直後の非修飾表はゲートに掛かる
+        "DELETE FROM public.docs AS case USING langs WHERE case.lang = langs.lang",
+        "DELETE FROM public.docs AS when USING langs WHERE when.lang = langs.lang",
+        "DELETE FROM public.docs AS is USING langs WHERE is.lang = langs.lang",
     ] {
         let err = core
             .execute_sql_in_session(&ctx(), &mut session, sql)
@@ -530,4 +538,16 @@ fn view_relations_are_rejected_with_0a000() {
     ] {
         assert_eq!(code(core.parse_sql(sql)), "0A000", "{sql}");
     }
+}
+
+/// SET 右辺が列名 `distinct`（引用形）でも FROM 形（`UpdateFrom`）として解析される
+/// （単一表パーサへ落ちた `42601` ではない。Issue #1754 レビュー対応）。
+#[test]
+fn quoted_distinct_column_still_routes_to_update_from() {
+    let (core, path) = new_core("sql53-from-distinct", false);
+    let _g = CleanupGuard(path);
+    let parsed = core
+        .parse_sql("UPDATE docs SET lang = \"distinct\" FROM langs WHERE docs.lang = langs.lang")
+        .expect("update from parses");
+    assert!(matches!(parsed, ParsedSql::UpdateFrom(_)), "{parsed:?}");
 }

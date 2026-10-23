@@ -292,6 +292,8 @@ pub(crate) fn relation_positions(tokens: &[Token]) -> RelationWalk {
                         && ((is("ON") && index_on_pending)
                             || is("INTO")
                             || is("REFERENCES")
+                            // `DELETE FROM t AS case USING u`: 別名が式の語でも USING 直後は表参照
+                            || (is("USING") && delete_using_opener(tokens, i.saturating_sub(1)))
                             || ((is("JOIN") || is("ONLY")) && level.list)))
             }
             _ => false,

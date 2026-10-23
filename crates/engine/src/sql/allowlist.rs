@@ -16321,7 +16321,13 @@ pub(crate) fn looks_like_update_from(tokens: &[Token]) -> bool {
             Token::Punct(')') => depth = depth.saturating_sub(1),
             Token::Keyword(Keyword::From) if depth == 0 => {
                 let prev = i.checked_sub(1).and_then(|p| tokens.get(p));
-                if !matches!(prev, Some(Token::Ident(w)) if w.eq_ignore_ascii_case("DISTINCT")) {
+                // `IS [NOT] DISTINCT FROM` だけを除外する（列名 `distinct` の SET 右辺は FROM 形）。
+                let is_distinct = |t: Option<&Token>| matches!(t, Some(Token::Ident(w)) if w.eq_ignore_ascii_case("DISTINCT"));
+                let at = |back: usize| i.checked_sub(back).and_then(|p| tokens.get(p));
+                let is_word = |t: Option<&Token>, k: &str| matches!(t, Some(Token::Ident(w)) if w.eq_ignore_ascii_case(k));
+                let is_not_distinct_from = is_distinct(prev)
+                    && (is_word(at(2), "IS") || (is_word(at(2), "NOT") && is_word(at(3), "IS")));
+                if !is_not_distinct_from {
                     return true;
                 }
             }
@@ -16958,12 +16964,21 @@ fn parse_join_where_leaf(p: &mut Parser<'_>) -> Result<JoinWherePredicate, SqlSu
         Some(Token::Keyword(Keyword::And))
         | Some(Token::Keyword(Keyword::Limit))
         | Some(Token::Keyword(Keyword::Order))
-        | Some(Token::Punct(')'))
+        | Some(Token::Punct(')' | ';'))
         | None => JoinWherePredicate::BoolColumn { column },
+        // DML（`UPDATE ... FROM`／`DELETE ... USING`）の WHERE 後続句（Issue #1754）。
         Some(Token::Ident(w))
-            if ["OFFSET", "OR", "GROUP", "HAVING"]
-                .iter()
-                .any(|t| w.eq_ignore_ascii_case(t)) =>
+            if [
+                "OFFSET",
+                "OR",
+                "GROUP",
+                "HAVING",
+                "USING",
+                "RETURNING",
+                "PARTITIONED",
+            ]
+            .iter()
+            .any(|t| w.eq_ignore_ascii_case(t)) =>
         {
             JoinWherePredicate::BoolColumn { column }
         }
@@ -21462,6 +21477,13 @@ mod tests {
             "UPDATE a SET x = 1 WHERE id IN (SELECT id FROM b LIMIT 1)"
         )));
         assert!(!looks_like_update_from(&t("DELETE FROM a USING b")));
+        // 列名 `distinct`（引用形）は `IS DISTINCT FROM` ではない（Issue #1754 レビュー対応）。
+        assert!(looks_like_update_from(&t(
+            "UPDATE a SET x = \"distinct\" FROM b"
+        )));
+        assert!(!looks_like_update_from(&t(
+            "UPDATE a SET x = 1 WHERE y IS NOT DISTINCT FROM 2"
+        )));
         assert!(looks_like_delete_using(&t(
             "DELETE FROM a USING b WHERE a.id = b.id"
         )));
