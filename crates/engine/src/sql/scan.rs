@@ -63,9 +63,9 @@ use crate::sql::allowlist::SqlSurfaceError;
 use crate::sql::exec::{Cell, ColumnMeta, QueryResult, ResultRow};
 use crate::sql::expr_program::{ExprProgram, StackValue};
 use crate::sql::order_value::{
-    compare_ref_and_owned_values, compare_statement_order, expr_value_to_jsonb_key,
-    expr_value_to_key_ref, extract_order_value_ref, scalar_key_ref_to_owned, OrderValue,
-    ScalarKeyRef,
+    compare_nullable, compare_ref_and_owned_values, compare_statement_order,
+    expr_value_to_jsonb_key, expr_value_to_key_ref, extract_order_value_ref,
+    scalar_key_ref_to_owned, NullPlacement, OrderValue, ScalarKeyRef,
 };
 use crate::sql::parser::{BoundOrderKey, BoundOrderTarget, BoundScan, OrderKind, ProjectedColumn};
 use crate::sql::udf_call::{self, ExprValue};
@@ -369,32 +369,9 @@ fn compare_ref_key(
     a: Option<&ScalarKeyRef<'_>>,
     b: Option<&OrderValue>,
     descending: bool,
+    nulls: NullPlacement,
 ) -> Ordering {
-    match (a, b) {
-        (None, None) => Ordering::Equal,
-        (None, Some(_)) => {
-            if descending {
-                Ordering::Less
-            } else {
-                Ordering::Greater
-            }
-        }
-        (Some(_), None) => {
-            if descending {
-                Ordering::Greater
-            } else {
-                Ordering::Less
-            }
-        }
-        (Some(x), Some(y)) => {
-            let base = compare_ref_and_owned_values(x, y);
-            if descending {
-                base.reverse()
-            } else {
-                base
-            }
-        }
-    }
+    compare_nullable(a, b, descending, nulls, compare_ref_and_owned_values)
 }
 
 /// 経路 (B) パス 1 の候補（借用のまま、`refs`・`id`・`tenant_id`）を、ヒープが
@@ -415,7 +392,7 @@ fn compare_candidate_ref_to_entry(
     for (idx, key) in order_by.iter().enumerate() {
         let a = refs.get(idx).and_then(|o| o.as_ref());
         let b = other.keys.get(idx).and_then(|o| o.as_ref());
-        let ord = compare_ref_key(a, b, key.descending);
+        let ord = compare_ref_key(a, b, key.descending, key.nulls);
         if ord != Ordering::Equal {
             return ord;
         }
@@ -2027,6 +2004,7 @@ mod tests {
                 target: crate::sql::parser::BoundOrderTarget::Column(1),
                 kind: crate::sql::parser::OrderKind::Bytes,
                 descending: false,
+                nulls: NullPlacement::Last,
                 collation: crate::collation::Collation::DEFAULT,
             }],
             offset: 0,
@@ -2386,6 +2364,7 @@ mod tests {
                 target: crate::sql::parser::BoundOrderTarget::Column(0),
                 kind: crate::sql::parser::OrderKind::Bytes,
                 descending: false,
+                nulls: NullPlacement::Last,
                 collation: crate::collation::Collation::DEFAULT,
             }],
             offset: 0,
@@ -2465,6 +2444,7 @@ mod tests {
                 target: crate::sql::parser::BoundOrderTarget::Column(0),
                 kind: crate::sql::parser::OrderKind::Bytes,
                 descending: false,
+                nulls: NullPlacement::Last,
                 collation: crate::collation::Collation::DEFAULT,
             }],
             offset: 0,
@@ -2545,6 +2525,7 @@ mod tests {
                 target: crate::sql::parser::BoundOrderTarget::Column(0),
                 kind: crate::sql::parser::OrderKind::Bytes,
                 descending: false,
+                nulls: NullPlacement::Last,
                 collation: crate::collation::Collation::DEFAULT,
             }],
             offset: 0,
@@ -2648,6 +2629,7 @@ mod tests {
                 target: crate::sql::parser::BoundOrderTarget::Column(0),
                 kind: crate::sql::parser::OrderKind::Bytes,
                 descending: false,
+                nulls: NullPlacement::Last,
                 collation: crate::collation::Collation::DEFAULT,
             }],
             offset: 5,

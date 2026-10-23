@@ -27,6 +27,7 @@ use crate::sql::allowlist::{
     Projection, SqlSurfaceError, ValidatedJoin, ValidatedScan, WherePredicate,
 };
 use crate::sql::exec::ColumnMeta;
+use crate::sql::order_value::NullPlacement;
 use crate::sql::parser::{AggregateInput, AggregateTarget, BoundAggregateItem};
 use crate::sql::relation::{BindingScope, ColumnRef, ColumnSlot, TableRef};
 use crate::sql::udf_call::{BinOp, UdfRegistry};
@@ -102,6 +103,7 @@ pub(super) struct PlainOrder {
     pub(super) pos: usize,
     pub(super) class: CmpClass,
     pub(super) descending: bool,
+    pub(super) nulls: NullPlacement,
 }
 
 pub(super) enum Shape {
@@ -145,6 +147,7 @@ pub(super) enum AggOrderTarget {
 pub(super) struct AggOrder {
     pub(super) target: AggOrderTarget,
     pub(super) descending: bool,
+    pub(super) nulls: NullPlacement,
 }
 
 pub(super) struct AggPlan {
@@ -908,6 +911,7 @@ fn build_plain_shape(
             pos: c.pos,
             class,
             descending: key.descending,
+            nulls: NullPlacement::pg_default(key.descending),
         });
     }
     Ok(Shape::Plain { output, order })
@@ -1143,6 +1147,7 @@ fn build_aggregate_shape(
         order.push(AggOrder {
             target: resolved,
             descending: key.descending,
+            nulls: NullPlacement::pg_default(key.descending),
         });
     }
 
