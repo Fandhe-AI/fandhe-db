@@ -152,6 +152,12 @@ pub enum FilterOp {
     /// （`bind_all`/`bind_all_for_describe` は常にこの variant を解決済みに
     /// 変換する）。
     LikeUnbound(String),
+    /// [`FilterOp::LikeUnbound`] の `ILIKE` 版（SQL-54、Issue #1778）。
+    /// [`DeclarativeFilter::bind`] が [`compile_ilike_pattern`] で解析し、
+    /// 常に `fold_ascii` 付きの [`FilterOp::Like`] へ確定させる（`Equals`／
+    /// `StartsWith` へは振り分けない。索引が大文字小文字を区別するため、
+    /// 索引経由の候補削減が結果を変えてしまうのを構造的に防ぐ）。
+    ILikeUnbound(String),
 }
 
 /// 配列等価述語の束縛済み右辺（Issue #1193）。行バイトと同じ正準エンコード
@@ -334,7 +340,8 @@ impl FilterOp {
             FilterOp::Compare { .. }
             | FilterOp::InListLiteral { .. }
             | FilterOp::BetweenLiteral { .. }
-            | FilterOp::LikeUnbound(_) => None,
+            | FilterOp::LikeUnbound(_)
+            | FilterOp::ILikeUnbound(_) => None,
         }
     }
 }
@@ -694,6 +701,17 @@ impl DeclarativeFilter {
         }
     }
 
+    /// `TEXT` 列に対する `ILIKE` フィルタを宣言する（SQL-54、Issue #1778）。
+    /// `pattern` は生パターン。[`Self::bind`] 時に [`compile_ilike_pattern`] で
+    /// 解析し、ASCII 英字のみ小文字へ畳み込んだ [`FilterOp::Like`] へ確定させる。
+    /// ICU 照合の列は束縛時に `0A000` で拒否する（fail-closed）。
+    pub fn ilike(column: impl Into<String>, pattern: impl Into<String>) -> Self {
+        Self {
+            column: column.into(),
+            op: FilterOp::ILikeUnbound(pattern.into()),
+        }
+    }
+
     /// `schema` と照合して [`MetadataFilter`] へ束縛する。列名解決・列型検査
     /// （`Equals`/`StartsWith` は `TEXT` 列限定・`BoolEquals` は `BOOLEAN` 列限定。
     /// いずれも不一致は `22000`）・リテラル長上限（[`MAX_TEXT_FIELD_LEN`] 超は
@@ -725,6 +743,12 @@ impl DeclarativeFilter {
             .columns
             .get(column_index)
             .ok_or_else(|| SqlSurfaceError::undefined_column(&self.column))?;
+        // SQL-54（Issue #1778）: ICU 照合列への `ILIKE` は ASCII 畳み込みが照合の
+        // 大文字小文字規則と食い違うため `0A000` で拒否する（fail-closed）。型検査
+        // （`22000`）より後・パターン検査（`54000`／`22000`）より前に判定する。
+        if column.ty.is_text_like() && is_ilike_op(&self.op) {
+            crate::sql::udf_call::require_wired_collation(column.collation)?;
+        }
         let op = bind_filter_op(
             &self.op,
             &self.column,
@@ -736,6 +760,15 @@ impl DeclarativeFilter {
             op,
             bpchar: matches!(column.ty, ColumnType::Bpchar(_)),
         })
+    }
+}
+
+/// `op` が `ILIKE`（または `NOT ILIKE`）の未束縛述語か判定する。
+fn is_ilike_op(op: &FilterOp) -> bool {
+    match op {
+        FilterOp::ILikeUnbound(_) => true,
+        FilterOp::Not(inner) => is_ilike_op(inner),
+        _ => false,
     }
 }
 
@@ -864,6 +897,14 @@ fn bind_filter_op(
                 }
                 CompiledLike::General(pattern) => FilterOp::Like(pattern),
             }
+        }
+        FilterOp::ILikeUnbound(pattern) => {
+            if !ty.is_text_like() {
+                return Err(SqlSurfaceError::invalid_input(format!(
+                    "column {column_name:?} is not a TEXT column"
+                )));
+            }
+            FilterOp::Like(compile_ilike_pattern(pattern)?)
         }
         FilterOp::BoolEquals(value) => {
             if !matches!(ty, ColumnType::Boolean) {
@@ -1375,6 +1416,12 @@ enum LikeToken {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct LikePattern {
     tokens: Vec<LikeToken>,
+    /// `ILIKE`（SQL-54、Issue #1778）のとき真。`tokens` の `Char` は構築時に
+    /// ASCII 小文字へ畳み込み済みで、[`Self::matches`] は値側の 1 文字も
+    /// `A-Z`→`a-z` のみ畳み込んで比較する（非 ASCII はバイト完全一致）。
+    /// derive された `PartialEq` に含まれるため、部分索引の含意判定は
+    /// `LIKE` と `ILIKE` を別の項として扱う。
+    fold_ascii: bool,
 }
 
 impl LikePattern {
@@ -1399,7 +1446,11 @@ impl LikePattern {
         let mut star_at: Option<usize> = None;
         let mut resume_at = 0usize;
 
-        while let Some(current) = s.get(ti..).and_then(|rest| rest.chars().next()) {
+        let fold = self.fold_ascii;
+        while let Some(raw) = s.get(ti..).and_then(|rest| rest.chars().next()) {
+            // `ILIKE` は値側の ASCII 英字だけを畳む（1 文字 → 1 文字で長さ不変）。
+            // `ti` 進行は元の文字のバイト長で行うため `raw` を保持する。
+            let current = if fold { raw.to_ascii_lowercase() } else { raw };
             let advanced = match pat.get(pi) {
                 Some(LikeToken::Char(c)) if *c == current => {
                     ti += current.len_utf8();
@@ -1457,22 +1508,11 @@ pub enum CompiledLike {
     General(LikePattern),
 }
 
-/// `pattern`（`LIKE` 句の右辺リテラル。生パターン・エスケープ解除前）を
-/// コンパイルする（SQL-24／TASK-208、Issue #914。PostgreSQL 互換のワイルドカード
-/// 意味論。詳細な契約は ADR `docs/design/like-wildcard-patterns.md` 参照）。
-///
-/// 意味論:
-/// - `%`: 空列を含む任意の文字列に一致する（連続する `%%` は 1 つに正規化）。
-/// - `_`: ちょうど 1 文字（Unicode scalar）に一致する。
-/// - `\`: 既定のエスケープ文字。`\%`・`\_`・`\\` はそれぞれリテラルの
-///   `%`・`_`・`\` として扱い、`\<その他>` はリテラル `<その他>` として扱う。
-///   パターン末尾の単独 `\`（次の文字が無い）は `22000`。
-/// - `ESCAPE` 句は未対応（構文層で受理しない。呼び出し元は本関数に到達しない）。
-///
-/// 長さ検証はアロケーション・パース**より前**に行う（`.claude/rules/
-/// coding-rust.md`「untrusted 入力の扱い」）。[`MAX_LIKE_PATTERN_LEN`] 超は
-/// `54000`。`unwrap`/`expect`/添字アクセス `[]` は使わない。
-pub fn parse_like_pattern(pattern: &str) -> Result<CompiledLike, SqlSurfaceError> {
+/// `LIKE`／`ILIKE` 共通のトークン化。長さ検証（[`MAX_LIKE_PATTERN_LEN`] 超は
+/// `54000`）をアロケーション・解析より前に行い、エスケープ解除と `%%` の
+/// 正規化を済ませたトークン列を返す（[`parse_like_pattern`]・
+/// [`compile_ilike_pattern`] から呼ばれる）。
+fn tokenize_like_pattern(pattern: &str) -> Result<Vec<LikeToken>, SqlSurfaceError> {
     if pattern.len() > MAX_LIKE_PATTERN_LEN {
         return Err(SqlSurfaceError::payload_too_large(format!(
             "LIKE pattern length {} exceeds limit {MAX_LIKE_PATTERN_LEN}",
@@ -1501,6 +1541,45 @@ pub fn parse_like_pattern(pattern: &str) -> Result<CompiledLike, SqlSurfaceError
             other => tokens.push(LikeToken::Char(other)),
         }
     }
+    Ok(tokens)
+}
+
+/// `ILIKE` の右辺リテラルをコンパイルする（SQL-54、Issue #1778。畳み込み範囲の
+/// 決定は ADR `docs/design/like-wildcard-patterns.md` 参照）。リテラル文字は
+/// ASCII 英字のみ小文字へ畳み込み、`Equals`／`StartsWith` へは振り分けず
+/// 常に `fold_ascii` 付きの [`LikePattern`] を返す（索引非使用の契約）。
+/// 長さ検証・エスケープ規則は [`parse_like_pattern`] と同一。
+pub fn compile_ilike_pattern(pattern: &str) -> Result<LikePattern, SqlSurfaceError> {
+    let tokens = tokenize_like_pattern(pattern)?
+        .into_iter()
+        .map(|t| match t {
+            LikeToken::Char(c) => LikeToken::Char(c.to_ascii_lowercase()),
+            other => other,
+        })
+        .collect();
+    Ok(LikePattern {
+        tokens,
+        fold_ascii: true,
+    })
+}
+
+/// `pattern`（`LIKE` 句の右辺リテラル。生パターン・エスケープ解除前）を
+/// コンパイルする（SQL-24／TASK-208、Issue #914。PostgreSQL 互換のワイルドカード
+/// 意味論。詳細な契約は ADR `docs/design/like-wildcard-patterns.md` 参照）。
+///
+/// 意味論:
+/// - `%`: 空列を含む任意の文字列に一致する（連続する `%%` は 1 つに正規化）。
+/// - `_`: ちょうど 1 文字（Unicode scalar）に一致する。
+/// - `\`: 既定のエスケープ文字。`\%`・`\_`・`\\` はそれぞれリテラルの
+///   `%`・`_`・`\` として扱い、`\<その他>` はリテラル `<その他>` として扱う。
+///   パターン末尾の単独 `\`（次の文字が無い）は `22000`。
+/// - `ESCAPE` 句は未対応（構文層で受理しない。呼び出し元は本関数に到達しない）。
+///
+/// 長さ検証はアロケーション・パース**より前**に行う（`.claude/rules/
+/// coding-rust.md`「untrusted 入力の扱い」）。[`MAX_LIKE_PATTERN_LEN`] 超は
+/// `54000`。`unwrap`/`expect`/添字アクセス `[]` は使わない。
+pub fn parse_like_pattern(pattern: &str) -> Result<CompiledLike, SqlSurfaceError> {
+    let tokens = tokenize_like_pattern(pattern)?;
 
     let has_any = tokens.iter().any(|t| matches!(t, LikeToken::Any));
     let star_count = tokens
@@ -1537,7 +1616,10 @@ pub fn parse_like_pattern(pattern: &str) -> Result<CompiledLike, SqlSurfaceError
         }
     }
 
-    Ok(CompiledLike::General(LikePattern { tokens }))
+    Ok(CompiledLike::General(LikePattern {
+        tokens,
+        fold_ascii: false,
+    }))
 }
 
 /// 束縛済みのメタデータフィルタ 1 件（列インデックス解決済み）。
@@ -2572,6 +2654,48 @@ mod tests {
     }
 
     #[test]
+    fn ilike_folds_ascii_only_on_both_sides() {
+        let p = compile_ilike_pattern("A%c_").unwrap();
+        assert!(p.matches("abcd"));
+        assert!(p.matches("ABCD"));
+        assert!(p.matches("aXXC9"));
+        assert!(!p.matches("abd"));
+        // 非 ASCII は畳み込まずバイト一致のみ（ケルビン記号 U+212A は `k` に一致しない）。
+        assert!(compile_ilike_pattern("é").unwrap().matches("é"));
+        assert!(!compile_ilike_pattern("é").unwrap().matches("É"));
+        assert!(!compile_ilike_pattern("k").unwrap().matches("\u{212A}"));
+        assert!(!compile_ilike_pattern("ａ").unwrap().matches("Ａ"));
+        // エスケープは畳み込み下でも維持される。
+        let esc = compile_ilike_pattern("a\\%b\\_").unwrap();
+        assert!(esc.matches("A%B_"));
+        assert!(!esc.matches("AxBy"));
+        // `''` は空文字列だけ、`%` は任意。
+        assert!(compile_ilike_pattern("").unwrap().matches(""));
+        assert!(!compile_ilike_pattern("").unwrap().matches("a"));
+        assert!(compile_ilike_pattern("%").unwrap().matches("Z"));
+    }
+
+    #[test]
+    fn ilike_pattern_differs_from_like_and_keeps_length_limit() {
+        let like = match parse_like_pattern("a%b").unwrap() {
+            CompiledLike::General(p) => p,
+            other => panic!("expected General, got {other:?}"),
+        };
+        assert_ne!(like, compile_ilike_pattern("a%b").unwrap());
+        assert!(compile_ilike_pattern(&"a".repeat(MAX_LIKE_PATTERN_LEN)).is_ok());
+        assert_eq!(
+            compile_ilike_pattern(&"a".repeat(MAX_LIKE_PATTERN_LEN + 1))
+                .unwrap_err()
+                .wire_code(),
+            "54000"
+        );
+        assert_eq!(
+            compile_ilike_pattern("src\\").unwrap_err().wire_code(),
+            "22000"
+        );
+    }
+
+    #[test]
     fn like_pattern_matches_suffix_middle_and_wildcard() {
         let suffix = match parse_like_pattern("%.rs").unwrap() {
             CompiledLike::General(p) => p,
@@ -2685,11 +2809,15 @@ mod tests {
                 Ok(CompiledLike::General(p)) => p,
                 Ok(CompiledLike::Exact(literal)) => LikePattern {
                     tokens: literal.chars().map(LikeToken::Char).collect(),
+                    fold_ascii: false,
                 },
                 Ok(CompiledLike::Prefix(prefix)) => {
                     let mut tokens: Vec<LikeToken> = prefix.chars().map(LikeToken::Char).collect();
                     tokens.push(LikeToken::Star);
-                    LikePattern { tokens }
+                    LikePattern {
+                        tokens,
+                        fold_ascii: false,
+                    }
                 }
                 Err(_) => continue,
             };

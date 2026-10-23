@@ -2,7 +2,7 @@
 
 Issue #914・対象ビヘイビア: SQL-24（TASK-208）。関連ポインタ:
 EXT-3・TASK-147（前方一致限定の既存実装）。`ILIKE` の畳み込み範囲は Issue #1777
-（親 #1776・SQL-54・TABLE-28 ポインタ）で決定し、実装は #1778 が担う。
+（親 #1776・SQL-54・TABLE-28 ポインタ）で決定し、Issue #1778 で実装した。
 
 spec 本文は転記しない（`.claude/rules/spec-confidentiality.md` 準拠）。本ドキュメントは
 本リポ側の実装判断・設計記録のみを扱う。
@@ -39,8 +39,8 @@ EXT-3（TASK-147）時点の SQL 表層 `WHERE <col> LIKE '<pattern>'` は「末
    識別子は述語の区切りにならず文として受け付けられない（`42601`）。
 5. **NULL**: 常に不一致（既存の三値論理の契約を踏襲）。
 6. **大文字小文字**: `LIKE` は区別する。`ILIKE` の畳み込み範囲は後述の
-   「`ILIKE` の大文字小文字の畳み込み範囲」節で決定済みで、受理は #1778 で
-   実装する（それまでは `42601`）。
+   「`ILIKE` の大文字小文字の畳み込み範囲」節で決定済みで、`ILIKE`／`NOT ILIKE` は
+   #1778 で受理する（実装は同節末尾の「実装メモ」参照）。
 7. **`'%'` 単独**: 非 NULL の全行に一致する（PostgreSQL 互換）。EXT-3 時代の
    「空 prefix は無意味なので拒否する」という規約を SQL の `LIKE` に限って
    置き換える。Rust API の `DeclarativeFilter::starts_with("")` は従来どおり
@@ -143,12 +143,30 @@ EXT-3（TASK-147）時点の SQL 表層 `WHERE <col> LIKE '<pattern>'` は「末
 爆発は起きない）。計算量は最悪 O(n·m)（n = 値の文字数、m = パターンの文字数。
 m は `MAX_LIKE_PATTERN_LEN` で定数に抑える）。
 
+### 実装メモ（Issue #1778）
+
+- 構文: `WherePredicate::Prefix` に `case_insensitive` を追加し、`LIKE` と同じ構造葉の
+  経路で `ILIKE`／`NOT ILIKE` を受理する。`ILIKE` は文脈的キーワードで、`ilike` という
+  名前の列は壊さない。
+- 評価: 束縛時にパターンの文字を ASCII 小文字へ畳み、`LikePattern` の `fold_ascii` が
+  真のとき値側の 1 文字も畳んで比べる（行ごとの確保なし）。`fold_ascii` は `PartialEq` に
+  含まれるため、部分索引の含意判定は `LIKE` と `ILIKE` を同一視しない。常に一般形の
+  `FilterOp::Like` に束縛し、`Equals`／`StartsWith` へ振り分けないので、二次索引は使わない。
+- 照合: 束縛時に ICU 照合の列を `0A000` で拒否する（新しい `wire_code` は無い）。
+- 台帳: 述語つき DML の content_hash は `ILIKE` にタグ 16 を割り当て、`LIKE`（タグ 2）の
+  バイト列は変えない。
+- 対象外（`42601` のまま）: JOIN の WHERE と `UPDATE … FROM`／`DELETE … USING`（独自文法で
+  `NOT LIKE` も受理しない）、NoSQL `filter` の `ilike`。
+- 制約（追跡）: 評価後射影形ビュー（本文に集計・`LIMIT` を持つ形）の外側 `WHERE` の `ILIKE` は、
+  合成スキーマが元の列の照合を持たないため `0A000` で拒否する。照合の伝搬は後続。
+- `CHAR(n)` 列は `LIKE` と同じく `ILIKE` も `22000` で拒否される（既存の挙動との対称）。
+
 ## PostgreSQL との差分（既知の簡略化）
 
 - パターン末尾の単独エスケープ文字は PostgreSQL の `22025` ではなく `22000`
   で拒否する（3 章参照。`wire_code` 契約の新設が前提になるためスコープ外）。
 - `ESCAPE '<c>'` 句・`SIMILAR TO` は未対応。
-- `ILIKE` は方針決定済み・実装は #1778（それまでは `42601`）。方針は次節。
+- `ILIKE`／`NOT ILIKE` は #1778 で実装済み。方針は次節。
   `C` 系の照合では PostgreSQL と同じ結果になる。ICU 照合の列に対する
   `ILIKE` は `0A000`（PostgreSQL は受理する）。
 - `lower(col) LIKE lower('p')` と `col ILIKE 'p'` は、`C` 系の照合でも非 ASCII
@@ -159,7 +177,7 @@ m は `MAX_LIKE_PATTERN_LEN` で定数に抑える）。
 ## スコープ外（Issue 起票はしない。実装 PR の note として記録）
 
 - `22025`（invalid escape sequence）の `wire_code` 追加と HTTP 射影
-- `LIKE ... ESCAPE '<c>'` 句・`SIMILAR TO`（`ILIKE` は #1778 で実装）
+- `LIKE ... ESCAPE '<c>'` 句・`SIMILAR TO`（`ILIKE` は #1778 で実装済み）
 - `NOT LIKE`（別 Issue の `NOT` 対応に委ねる）
 - NoSQL `filter` の `like` op（NOSQL-14）
 - `LIKE` パターンへの `$n` 束縛
