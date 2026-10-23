@@ -3808,14 +3808,16 @@ fn bind_nullif(
     })
 }
 
-/// 型なし文字列リテラルを、比較相手の型（DATE／TIMESTAMP）として解釈する
-/// （[`bind_is_distinct_from`] 専用。INTERVAL は式経路の `=` が未対応のため対象外）。相手がそれ以外の型なら `None`。解析失敗の SQLSTATE と
+/// 型なし文字列リテラルを、比較相手の型（DATE／TIMESTAMP／TIME／TIMESTAMPTZ）の型付きリテラル
+/// 式へ解釈する（[`bind_is_distinct_from`] 専用。INTERVAL は式経路の `=` が未対応のため対象外）。
+/// 相手がそれ以外の型なら `None`。返す [`Expr`] は呼び出し側が [`bind_expr_any`] で束縛する
+/// （TIMESTAMPTZ のゾーン無し入力は束縛時のセッション TZ で確定する）。解析失敗の SQLSTATE と
 /// メッセージは型付きリテラル（`sql::allowlist::Parser::parse_primary_expr`）と同じ写像で、
 /// エラーにリテラル本文は含めない。
 fn bind_datetime_text_literal(
     s: &str,
     other_ty: ExprType,
-) -> Option<Result<BoundExpr, SqlSurfaceError>> {
+) -> Option<Result<Expr, SqlSurfaceError>> {
     use crate::datetime::DateTimeLiteralError;
     let map_dt = |e: DateTimeLiteralError| match e {
         DateTimeLiteralError::Format(d) => SqlSurfaceError::invalid_datetime_format(d),
@@ -3824,14 +3826,20 @@ fn bind_datetime_text_literal(
     match other_ty {
         ExprType::Date => Some(
             crate::datetime::parse_date(s)
-                .map(BoundExpr::Date)
+                .map(Expr::DateLiteral)
                 .map_err(map_dt),
         ),
         ExprType::Timestamp => Some(
             crate::datetime::parse_timestamp(s)
-                .map(BoundExpr::Timestamp)
+                .map(Expr::TimestampLiteral)
                 .map_err(map_dt),
         ),
+        ExprType::Time => Some(
+            crate::datetime::parse_time(s)
+                .map(Expr::TimeLiteral)
+                .map_err(map_dt),
+        ),
+        ExprType::TimestampTz => Some(crate::sql::allowlist::parse_timestamptz_expr_literal(s)),
         _ => None,
     }
 }
@@ -3919,10 +3927,8 @@ fn bind_is_distinct_from(
                 let budget_before = *node_budget;
                 let (other_b, other_t) = bind_expr_any(other, env, node_budget)?;
                 if let Some(lit) = bind_datetime_text_literal(s, other_t) {
-                    *node_budget = node_budget.checked_sub(1).ok_or_else(|| {
-                        SqlSurfaceError::payload_too_large("expression is too large")
-                    })?;
-                    let lit = lit?;
+                    // リテラル 1 ノード分の課金は `bind_expr_any` が行う。
+                    let (lit, _) = bind_expr_any(&lit?, env, node_budget)?;
                     return Ok(if literal_on_left {
                         mk(lit, other_b)
                     } else {
@@ -10194,6 +10200,49 @@ mod tests {
         let mut budget = MAX_EXPR_NODES;
         let (_, ty) = bind_expr(&expr, &schema, &registry, &mut budget).expect("bind");
         assert_eq!(ty, ExprType::Bool);
+    }
+
+    /// TIME／TIMESTAMPTZ 列と型なし文字列リテラルの `IS [NOT] DISTINCT FROM` は、相手の型で
+    /// リテラルを解釈して束縛できる（両辺の順序・否定の両方）。
+    #[test]
+    fn is_distinct_from_time_and_timestamptz_text_literals() {
+        let schema = TableSchema::new(
+            "docs",
+            vec![
+                ColumnDef::new("embedding", ColumnType::Vector(3), false),
+                ColumnDef::new("t", ColumnType::Time, true),
+                ColumnDef::new("tz", ColumnType::TimestampTz, true),
+            ],
+        );
+        let registry = UdfRegistry::default();
+        for (col, lit) in [("t", "12:00:00"), ("tz", "2024-01-01 00:00:00+00")] {
+            for (negated, lit_left) in [(false, false), (true, false), (false, true), (true, true)]
+            {
+                let (l, r) = if lit_left {
+                    (Expr::String(lit.to_string()), ident(col))
+                } else {
+                    (ident(col), Expr::String(lit.to_string()))
+                };
+                let expr = Expr::IsDistinctFrom {
+                    negated,
+                    lhs: Box::new(l),
+                    rhs: Box::new(r),
+                };
+                let mut budget = MAX_EXPR_NODES;
+                let (bound, ty) =
+                    bind_expr(&expr, &schema, &registry, &mut budget).expect("bind should succeed");
+                assert_eq!(ty, ExprType::Bool);
+                assert!(matches!(bound, BoundExpr::IsDistinctFrom { .. }));
+            }
+        }
+        // 不正な書式は拒否する。
+        let bad = Expr::IsDistinctFrom {
+            negated: false,
+            lhs: Box::new(ident("t")),
+            rhs: Box::new(Expr::String("not-a-time".to_string())),
+        };
+        let mut budget = MAX_EXPR_NODES;
+        assert!(bind_expr(&bad, &schema, &registry, &mut budget).is_err());
     }
 
     /// jsonb 列と素の `NULL` の `IS [NOT] DISTINCT FROM` は束縛できる。
