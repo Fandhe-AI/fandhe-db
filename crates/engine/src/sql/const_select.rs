@@ -215,7 +215,11 @@ fn reject_non_constant_with(expr: &Expr, allow_placeholders: bool) -> Result<(),
         Expr::Coalesce(args) => args
             .iter()
             .try_for_each(|a| reject_non_constant_with(a, allow_placeholders)),
-        Expr::NullIf(lhs, rhs) | Expr::IsDistinctFrom { lhs, rhs, .. } => {
+        Expr::NullIf(lhs, rhs)
+        | Expr::IsDistinctFrom { lhs, rhs, .. }
+        | Expr::RegexMatch {
+            lhs, pattern: rhs, ..
+        } => {
             reject_non_constant_with(lhs, allow_placeholders)?;
             reject_non_constant_with(rhs, allow_placeholders)
         }
@@ -269,9 +273,11 @@ fn expr_uses_schema_fn(expr: &Expr) -> bool {
                 || else_result.as_deref().is_some_and(expr_uses_schema_fn)
         }
         Expr::Coalesce(args) => args.iter().any(expr_uses_schema_fn),
-        Expr::NullIf(lhs, rhs) | Expr::IsDistinctFrom { lhs, rhs, .. } => {
-            expr_uses_schema_fn(lhs) || expr_uses_schema_fn(rhs)
-        }
+        Expr::NullIf(lhs, rhs)
+        | Expr::IsDistinctFrom { lhs, rhs, .. }
+        | Expr::RegexMatch {
+            lhs, pattern: rhs, ..
+        } => expr_uses_schema_fn(lhs) || expr_uses_schema_fn(rhs),
     }
 }
 

@@ -808,7 +808,11 @@ pub(crate) fn expr_columns_within(columns: &[String], expr: &Expr) -> Result<(),
             }
             Ok(())
         }
-        Expr::NullIf(lhs, rhs) | Expr::IsDistinctFrom { lhs, rhs, .. } => {
+        Expr::NullIf(lhs, rhs)
+        | Expr::IsDistinctFrom { lhs, rhs, .. }
+        | Expr::RegexMatch {
+            lhs, pattern: rhs, ..
+        } => {
             expr_columns_within(columns, lhs)?;
             expr_columns_within(columns, rhs)
         }

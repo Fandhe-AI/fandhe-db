@@ -9,6 +9,10 @@
 
 ### Added
 
+- `WHERE <列または式> ~ | ~* | !~ | !~* '<pattern>'`（正規表現マッチ演算子）を受理して評価する（Issue #1787・SQL-55）。
+  パターンは文字列リテラルか `NULL`（拡張クエリでは `<列> ~ $n`。`$n` は常に text）。ASCII のみ大小無視（`~*`）、
+  NULL は三値論理、不正パターンは `2201B`、非対応構文は `0A000`、上限超過は `54000`。索引は使わず常に残余述語。
+  詳細は [regex-matcher.md](docs/design/regex-matcher.md)。
 - `ORDER BY <key> [ASC|DESC] NULLS FIRST|LAST` を広域取得・ウィンドウ・`GROUP BY` 集計・`SELECT DISTINCT`・JOIN・
   ビューの各経路で受理する（Issue #1791・SQL-56）。指定なしは従来どおり（ASC は末尾・DESC は先頭）。
   不正な指定と kNN 距離順への併用は `42601`。詳細は [order-by-having-expressions.md](docs/design/order-by-having-expressions.md)。
@@ -38,6 +42,10 @@
 
 ### Breaking Changes
 
+- `sql::lexer::Token`・`sql::udf_call::Expr`・`sql::udf_call::BoundExpr`・`sql::allowlist::SqlSurfaceError`（Issue #1787・SQL-55）:
+  variant を追加した（`Token::RegexMatch`／`RegexMatchCi`／`RegexNotMatch`／`RegexNotMatchCi`、`Expr::RegexMatch`、
+  `BoundExpr::RegexMatch`、`SqlSurfaceError::Regex`）。網羅 `match` する外部コードは腕を足す
+  （`wire_code()`／`classify()` 経由で扱うコードは変更不要）。
 - `error_format::ErrorClass::InvalidEscapeSequence`（`22025`）・`sql::allowlist::SqlSurfaceError::InvalidEscapeSequence`
   （Issue #1779・SQL-54）: variant を追加した（網羅 `match` するコードは腕を足す。HTTP は 400）。
   あわせて `LIKE` パターン末尾の単独 `\` のエラーを `22000` から `22025` へ変えた（`ILIKE`・NoSQL `like` も同じ。HTTP は 400 のまま）。

@@ -4,8 +4,9 @@
 //! 親 Issue #1784 の方針に従い、線形時間保証のある `regex` クレート
 //! （`docs/design/regex-crate-adoption.md`）を engine 内部 API で包む。公開シグネチャに
 //! `regex` の型は出さない（呼び出し側は [`CompiledRegex`]・[`RegexError`]・[`RegexCaseMode`]
-//! だけを見る）。SQL 表層への配線（`~` 系は Issue #1787、`SIMILAR TO` は #1788、jsonpath の
-//! `like_regex` は #1784）は本モジュールの範囲外で、ここは評価器の部品だけを提供する。
+//! だけを見る）。SQL 表層への配線（`~` 系は Issue #1787 で配線済みで、呼び出し元は `sql::regex_op`。
+//! `SIMILAR TO` は #1788、jsonpath の `like_regex` は #1784）は本モジュールの範囲外で、ここは
+//! 評価器の部品だけを提供する。
 //!
 //! 処理順序（`docs/design/regex-matcher.md`）:
 //!

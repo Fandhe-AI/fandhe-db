@@ -290,6 +290,8 @@ impl Inferrer<'_> {
             // `IS [NOT] DISTINCT FROM`（SQL-54）は比較と同じく結果が真偽値のため、兄弟の
             // 型付けには使わない（型なし）。
             Expr::IsDistinctFrom { .. } => Ty::Untyped,
+            // 正規表現マッチ（SQL-55・Issue #1787）も結果は真偽値。兄弟の型付けには使わない。
+            Expr::RegexMatch { .. } => Ty::Untyped,
             Expr::Null => Ty::Untyped,
             // 照合指定（TABLE-28・Issue #1609）は内側の式と同じ型。
             Expr::Collate { expr, .. } => self.type_of(expr),
@@ -475,6 +477,9 @@ impl Inferrer<'_> {
                 lhs: lhs.clone(),
                 rhs: rhs.clone(),
             })?,
+            // 正規表現マッチ（SQL-55・Issue #1787）のパターンは文字列リテラル（`$n` は Bind で
+            // 置換済み）。左辺だけを辿る。
+            Expr::RegexMatch { lhs, .. } => self.walk(lhs)?,
             // jsonb パス演算子の被演算子に `$n` は置けない（型を推論できないため
             // `Untyped` として割り当て、不定扱い。Issue #1596）。
             Expr::JsonAccess { lhs, rhs, .. } => {

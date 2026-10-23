@@ -6304,6 +6304,8 @@ impl EngineCore {
         // 限って `jsonpath_limits` を現スレッドへ張る（`ClockScope` と同じ RAII。大域状態ではない）。
         let _jsonpath_limits_scope =
             crate::sql::jsonpath_fn::JsonPathLimitsScope::enter(self.jsonpath_limits);
+        // Issue #1787: `~` 系の束縛が起動時 CLI の正規表現上限を焼き込めるよう同じ区間に張る。
+        let _regex_limits_scope = crate::sql::regex_op::RegexLimitsScope::enter(self.regex_limits);
         // TABLE-33・Issue #1575: TZ 無しの TIMESTAMPTZ リテラル束縛・DDL 既定値の正規化が読む
         // セッション TimeZone を文ごとに張る（`SET TIME ZONE; INSERT` の後続文が新しい値を見る）。
         let _session_tz_scope = session_time_zone_scope(session);
@@ -7014,6 +7016,8 @@ impl EngineCore {
         // 限って `jsonpath_limits` を現スレッドへ張る（`ClockScope` と同じ RAII。大域状態ではない）。
         let _jsonpath_limits_scope =
             crate::sql::jsonpath_fn::JsonPathLimitsScope::enter(self.jsonpath_limits);
+        // Issue #1787: `~` 系の束縛が起動時 CLI の正規表現上限を焼き込めるよう同じ区間に張る。
+        let _regex_limits_scope = crate::sql::regex_op::RegexLimitsScope::enter(self.regex_limits);
         // TABLE-33・Issue #1575: TZ 無しの TIMESTAMPTZ リテラル束縛・DDL 既定値の正規化が読む
         // セッション TimeZone を文ごとに張る（`SET TIME ZONE; INSERT` の後続文が新しい値を見る）。
         let _session_tz_scope = session_time_zone_scope(session);
@@ -7906,6 +7910,8 @@ impl EngineCore {
         // 限って `jsonpath_limits` を現スレッドへ張る（`ClockScope` と同じ RAII。大域状態ではない）。
         let _jsonpath_limits_scope =
             crate::sql::jsonpath_fn::JsonPathLimitsScope::enter(self.jsonpath_limits);
+        // Issue #1787: `~` 系の束縛が起動時 CLI の正規表現上限を焼き込めるよう同じ区間に張る。
+        let _regex_limits_scope = crate::sql::regex_op::RegexLimitsScope::enter(self.regex_limits);
         // TABLE-33・Issue #1575: TZ 無しの TIMESTAMPTZ リテラル束縛・DDL 既定値の正規化が読む
         // セッション TimeZone を文ごとに張る（`SET TIME ZONE; INSERT` の後続文が新しい値を見る）。
         let _session_tz_scope = session_time_zone_scope(session);
@@ -8381,6 +8387,8 @@ impl EngineCore {
         // 起動時の評価上限を使えるようにする（`execute_parsed_in_session` 等と同じ RAII）。
         let _jsonpath_limits_scope =
             crate::sql::jsonpath_fn::JsonPathLimitsScope::enter(self.jsonpath_limits);
+        // Issue #1787: `~` 系の束縛が起動時 CLI の正規表現上限を焼き込めるよう同じ区間に張る。
+        let _regex_limits_scope = crate::sql::regex_op::RegexLimitsScope::enter(self.regex_limits);
         // TABLE-33・Issue #1575: TZ 無しの TIMESTAMPTZ リテラル束縛・DDL 既定値の正規化が読む
         // セッション TimeZone を文ごとに張る（`SET TIME ZONE; INSERT` の後続文が新しい値を見る）。
         let _session_tz_scope = session_time_zone_scope(session);

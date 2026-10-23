@@ -64,6 +64,13 @@
 //!     列型に依らず束縛が通るよう `NULL` へ置換する）。逆向き（`$n IS DISTINCT FROM <列>`）・
 //!     両辺 `$n`・式の内側の `$n` は `42601` のまま。判定は `noneq_leaf_at` に集約する。
 //!
+//! 11. `SELECT／UPDATE／DELETE ... WHERE <列> (~ | ~* | !~ | !~*) $n`（Issue #1787・SQL-55・
+//!     WIRE-12 のポインタ。パターン 9 と同じ文種・`WHERE` 領域・左右の境界規則で、左辺が列・右辺が
+//!     `$n` 単独の形だけ）。パターンは常に文字列なので `$n` の型は左辺の列に依らず `text`。
+//!     NULL のバインドは裸の `NULL` へ置換され、構文段がパターン NULL として受理する。
+//!     等価の葉ではないため序数に数えない。逆向き（`$n ~ <列>`）・両辺 `$n`・式の内側の `$n`
+//!     （`lower(s) ~ $1`）・`$1::text` は `42601` のまま。判定は `noneq_leaf_at` に集約する。
+//!
 //! `LIMIT $n`・`USING MODE $n`・`HINT ORDER($n, ...)`・`SET search_mode = $n`・
 //! `ON CONFLICT ... DO UPDATE SET a = $n`（`$n` 単独の右辺。加算形はパターン 8）・hybrid 関数
 //! 引数（`HYBRID_RRF(col, $n, ...)`）・パターン 9 以外の非等価比較（`id > $n` 等）はいずれも
@@ -477,7 +484,10 @@ fn where_literal_flags_in_region(tokens: &[Token], kinds: &[ParamLiteralKind]) -
                 }
                 // `IS [NOT] DISTINCT FROM` は等価の葉ではなく、`$n` は NULL ダミーへ置換される
                 // ため序数に数えない（パターン 10）。
-                NoneqLeafKind::ParamPair { .. } | NoneqLeafKind::DistinctFrom { .. } => {}
+                // 正規表現マッチ（パターン 11）の `$n` も等価の葉ではないため数えない。
+                NoneqLeafKind::ParamPair { .. }
+                | NoneqLeafKind::DistinctFrom { .. }
+                | NoneqLeafKind::Regex { .. } => {}
             }
             i = leaf.next;
             continue;
@@ -494,6 +504,8 @@ pub(crate) enum WhereParamShape {
     Column(String),
     /// 両辺とも `$n` で型を決められない形（`$1 < $2`）。
     Indeterminate,
+    /// 正規表現マッチのパターン（パターン 11）。左辺の列に依らず常に `text`。
+    Text,
 }
 
 /// 非等価比較・`BETWEEN` の葉 1 件（[`noneq_leaf_at`] が返す。添字はトークン列上の位置）。
@@ -512,6 +524,8 @@ enum NoneqLeafKind {
     ParamPair { lhs: usize, rhs: usize },
     /// `<col> IS [NOT] DISTINCT FROM $n`（パターン 10。Issue #1783・SQL-54）。
     DistinctFrom { col: usize, rhs: usize },
+    /// `<col> (~|~*|!~|!~*) $n`（パターン 11。Issue #1787・SQL-55）。
+    Regex { col: usize, rhs: usize },
 }
 
 /// 葉の左端 `i` の直前が、単独の述語の始まりを示すトークンか
@@ -580,6 +594,24 @@ fn noneq_leaf_at(tokens: &[Token], i: usize, start: usize, end: usize) -> Option
                     && is_noneq_right_boundary(tokens, rhs + 1, end))
                 .then_some(NoneqLeaf {
                     kind: NoneqLeafKind::Compare { col: i, rhs },
+                    next: rhs + 1,
+                });
+            }
+            // パターン 11: `<col> (~|~*|!~|!~*) $n`（右辺は `$n` 単独で直後が右境界）。
+            if matches!(
+                tokens.get(i + 1),
+                Some(
+                    Token::RegexMatch
+                        | Token::RegexMatchCi
+                        | Token::RegexNotMatch
+                        | Token::RegexNotMatchCi
+                )
+            ) {
+                let rhs = i + 2;
+                return (matches!(tokens.get(rhs), Some(Token::Param(_)))
+                    && is_noneq_right_boundary(tokens, rhs + 1, end))
+                .then_some(NoneqLeaf {
+                    kind: NoneqLeafKind::Regex { col: i, rhs },
                     next: rhs + 1,
                 });
             }
@@ -720,6 +752,12 @@ fn where_noneq_param_slots_and_bounds(
                 if let (Some(shape), Some(Token::Param(_))) = (column_of(col), tokens.get(rhs)) {
                     out.insert(rhs, shape);
                     distinct.insert(rhs);
+                }
+            }
+            NoneqLeafKind::Regex { col, rhs } => {
+                // 左辺が識別子のときだけ受理する（`column_of` と同じ条件）。型は常に `text`。
+                if column_of(col).is_some() && matches!(tokens.get(rhs), Some(Token::Param(_))) {
+                    out.insert(rhs, WhereParamShape::Text);
                 }
             }
         }
@@ -1825,6 +1863,10 @@ pub(crate) fn infer_param_positions(tokens: &[Token], param_count: u16) -> Vec<V
                 slot.push(ParamPosition::WhereIndeterminate);
                 continue;
             }
+            Some(WhereParamShape::Text) => {
+                slot.push(ParamPosition::Text);
+                continue;
+            }
             None => {}
         }
         if let Some((start, end)) = where_bounds {
@@ -2113,6 +2155,10 @@ pub(crate) fn decode_bind_values_nullable(
             | Token::JsonExistsAny
             | Token::JsonExistsAll
             | Token::ArrayOverlap
+            | Token::RegexMatch
+            | Token::RegexMatchCi
+            | Token::RegexNotMatch
+            | Token::RegexNotMatchCi
             | Token::TypeCast
             | Token::Concat => 0,
         };
@@ -2858,6 +2904,53 @@ mod tests {
             dummy.contains(&Token::Ident("NULL".to_string())),
             "{dummy:?}"
         );
+        assert!(dummy.contains(&Token::StringLiteral("0".to_string())));
+        assert_eq!(
+            where_equality_literal_is_param_typed(&tokens, &[]),
+            vec![true]
+        );
+    }
+
+    // Issue #1787・SQL-55: `<列> (~|~*|!~|!~*) $n`（パターン 11）の受理・分類・拒否位置・ダミー置換。
+    #[test]
+    fn accepts_regex_match_position_and_classifies_as_text() {
+        for sql in [
+            "SELECT * FROM documents WHERE s ~ $1 LIMIT 5",
+            "SELECT * FROM documents WHERE s ~* $1 AND m > $2 LIMIT 5",
+            "SELECT * FROM documents WHERE NOT (a = 1 OR s !~ $1) LIMIT 5",
+            "UPDATE documents SET s = 'x' WHERE s !~* $1 USING OPERATION_ID 'x'",
+            "DELETE FROM documents WHERE s ~ $1 RETURNING n",
+        ] {
+            assert!(positions(sql).is_ok(), "{sql}");
+        }
+        // 左辺が数値列でも型は常に text。
+        let got = positions_of("SELECT * FROM documents WHERE n ~ $1 LIMIT 5");
+        assert_eq!(got, vec![vec![ParamPosition::Text]]);
+    }
+
+    #[test]
+    fn rejects_regex_match_positions_outside_pattern_11() {
+        for sql in [
+            // 逆向き・両辺 `$n`・式の内側・型変換・右辺の続き
+            "SELECT * FROM documents WHERE $1 ~ s LIMIT 5",
+            "SELECT * FROM documents WHERE $1 ~ $2 LIMIT 5",
+            "SELECT * FROM documents WHERE lower(s) ~ $1 LIMIT 5",
+            "SELECT * FROM documents WHERE s ~ $1::text LIMIT 5",
+            "SELECT * FROM documents WHERE s ~ $1 || 'x' LIMIT 5",
+            // 集合演算は対象外
+            "SELECT s FROM a WHERE s ~ $1 UNION SELECT s FROM b",
+        ] {
+            assert!(positions(sql).is_err(), "{sql}");
+        }
+    }
+
+    /// 正規表現マッチの `$n` は等価の序数に数えず、Describe 用ダミーは正しい正規表現 `'0'`。
+    #[test]
+    fn regex_match_dummy_is_valid_pattern_and_not_counted_as_equality_literal() {
+        let sql = "SELECT * FROM t WHERE a = $1 AND s ~* $2";
+        let tokens = crate::sql::lexer::tokenize_with_params(sql).expect("tokenize");
+        let dummy = substitute_dummy_typed(&tokens, &[]);
+        assert!(dummy.contains(&Token::RegexMatchCi));
         assert!(dummy.contains(&Token::StringLiteral("0".to_string())));
         assert_eq!(
             where_equality_literal_is_param_typed(&tokens, &[]),
