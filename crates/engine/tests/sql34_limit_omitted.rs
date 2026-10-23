@@ -386,3 +386,21 @@ fn insert_select_omitted_stays_within_the_same_cap() {
         "54000"
     );
 }
+
+/// 集合演算全体の `OFFSET`（`LIMIT ALL OFFSET n`・`OFFSET n` 単独・`LIMIT n OFFSET m`）。
+/// OFFSET を先に適用し、読み飛ばし後の件数で結果行数上限を判定する。
+#[test]
+fn set_operation_offset_is_applied_before_the_cap() {
+    let (core, _g) = open("sql34-setop-offset");
+    seed_t(&core, "alice", 1..=2);
+    seed_u(&core, "alice", 3..=4);
+    let sql = "SELECT k FROM t UNION ALL SELECT k FROM u";
+    // 4 行 - OFFSET 1 = 3 行 = CAP（ちょうど許容）。
+    assert_eq!(rows(&core, &format!("{sql} LIMIT ALL OFFSET 1")), 3);
+    assert_eq!(rows(&core, &format!("{sql} OFFSET 1")), 3);
+    assert_eq!(rows(&core, &format!("{sql} OFFSET 4")), 0);
+    // OFFSET 0 では 4 行 > CAP。
+    assert_eq!(code(&core, &format!("{sql} OFFSET 0")), "54000");
+    assert_eq!(code(&core, &format!("{sql} LIMIT ALL OFFSET 0")), "54000");
+    assert_eq!(rows(&core, &format!("{sql} LIMIT 2 OFFSET 3")), 1);
+}

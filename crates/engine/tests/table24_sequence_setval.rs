@@ -513,8 +513,10 @@ fn unsupported_positions_are_rejected_without_side_effects() {
         ("SELECT setval('s', 5, true, 1)", "0A000"),
         ("SELECT lastval(1)", "42601"),
         ("SELECT setval('bad name', 50)", "42601"),
-        ("SELECT n, setval('s', 50) FROM t LIMIT 1", "42601"),
-        ("SELECT * FROM t WHERE n = setval('s', 50)", "42601"),
+        // Issue #1796: `LIMIT` 省略が構文上有効になり、従来 `LIMIT` 欠落の 42601 で
+        // 隠れていた「非対応位置での setval」が本来の 0A000 で拒否される。
+        ("SELECT n, setval('s', 50) FROM t LIMIT 1", "0A000"),
+        ("SELECT * FROM t WHERE n = setval('s', 50)", "0A000"),
         ("UPDATE t SET n = setval('s', 50) WHERE id = 1", "42601"),
         (
             "INSERT INTO t (id, n) VALUES (1, setval('s', 50)) USING OPERATION_ID 'rj1'",

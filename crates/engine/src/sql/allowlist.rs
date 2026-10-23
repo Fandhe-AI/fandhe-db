@@ -3035,6 +3035,10 @@ pub struct ValidatedSetOperation {
     /// describe_columns` が Describe 経路で同じ検証を行う（PR #1105 レビュー
     /// 指摘対応。Execute／Describe の受理・拒否を一致させる）。
     pub(crate) limit: Option<u32>,
+    /// 全体 `OFFSET m`（省略時 `0`。`LIMIT ALL OFFSET m`・`OFFSET m` 単独を含む。
+    /// Issue #1796）。範囲検証（`0..=core::MAX_SEARCH_K`）は `limit` と同じく実行・
+    /// Describe 双方が行い、適用順は OFFSET が先・LIMIT／結果行数上限の判定が後。
+    pub(crate) offset: u32,
 }
 
 /// `EXPLAIN` の対象文（Issue #922・SQL-27。TASK-78・SQL-6 の `USING PLAN` 付き
@@ -18185,7 +18189,11 @@ fn parse_set_branch(
     // `parse_set_operation` の末尾 `expect_end_of_statement` にも一致しないため、
     // 結局は同じ `42601` へ自然に落ちる（`limit_inside_branch_is_rejected` で固定）。
     //
-    // `GROUP BY`／`ORDER BY`／`USING PLAN`／`OFFSET`／`DISTINCT` はいずれも
+    // `OFFSET` も `LIMIT` と同じく全体 `OFFSET m`（`parse_set_operation` が消費する）が
+    // 最後の枝の直後に置かれる正当な形のため、ここでは拒否しない（枝の中の `OFFSET` は
+    // `LIMIT` と同様に後続の検査で `42601` へ落ちる）。Issue #1796。
+    //
+    // `GROUP BY`／`ORDER BY`／`USING PLAN`／`DISTINCT` はいずれも
     // 集合演算の文法上どの位置にも現れ得ないため、ここで拒否しなくても
     // 同じ理由で最終的に `expect_end_of_statement` が `42601` に落とす。
     // ただし早期に拒否した方が構造的に読みやすいため、明示的に残す。
@@ -18194,11 +18202,10 @@ fn parse_set_branch(
     if has_group_by
         || matches!(p.peek(), Some(Token::Keyword(Keyword::Order)))
         || p.peek_ident_matches("USING")
-        || p.peek_ident_matches("OFFSET")
         || p.peek_ident_matches("DISTINCT")
     {
         return Err(SqlSurfaceError::unsupported(
-            "GROUP BY/ORDER BY/OFFSET/USING PLAN/DISTINCT are not allowed inside a set operation branch",
+            "GROUP BY/ORDER BY/USING PLAN/DISTINCT are not allowed inside a set operation branch",
         ));
     }
 
@@ -18621,8 +18628,13 @@ fn parse_set_operation(
     let mut branch_count = 0usize;
     let tree = parse_set_expr(&mut p, lookup, 0, &mut branch_count)?;
     let limit = p.parse_optional_limit()?;
+    let offset = p.parse_optional_offset()?.unwrap_or(0);
     p.expect_end_of_statement()?;
-    Ok(ValidatedSetOperation { tree, limit })
+    Ok(ValidatedSetOperation {
+        tree,
+        limit,
+        offset,
+    })
 }
 
 /// 許可した `SELECT` statement 形状を先頭から再帰下降で判定する（TASK-74 由来。

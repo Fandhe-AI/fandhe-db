@@ -8275,6 +8275,7 @@ impl EngineCore {
                     session.udfs(),
                     dummy_equality_flags,
                     validated.limit,
+                    validated.offset,
                     limits,
                 )?;
                 Ok(Some(columns))
@@ -8977,6 +8978,7 @@ impl EngineCore {
                     &validated.tree,
                     session.udfs(),
                     validated.limit,
+                    validated.offset,
                     self.group_by_limits,
                     limits,
                 )?;
