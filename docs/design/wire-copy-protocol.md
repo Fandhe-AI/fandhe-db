@@ -473,4 +473,31 @@ binary COPY 形式で結果を返す。`COPY FROM` の binary は Issue #1769 �
   待つが、保持時間はフレーム受信期限とトランザクションの `max_duration` で有界（明示トランザクションの COPY と同じ）。
 - 既知の相違: COPY TO が最後の文のとき commit を CopyOut の前に行う（commit 失敗時の応答の形だけが
   PostgreSQL と異なりうる）。拡張クエリは暗黙トランザクションを持たないため本節の対象外。
-- 網羅的なロールバックの組み合わせと `25P02` の整合は #1774。
+- 網羅的なロールバックの組み合わせと `25P02` の整合は、次の「Issue #1774」節。
+
+## Issue #1774: 複数文メッセージ中の COPY の原子性とエラー伝播（親 #1772・WIRE-20 ポインタ）
+
+Issue #1773 の実装に対し、失敗要因と COPY の位置の組み合わせを層 A（`wire20_copy_atomicity.rs`）で固定した。
+実装コードの変更は不要だった（各失敗経路が `fail()`／`abort_implicit()` を通り `Idle`／`Failed` へ収束する）。
+
+暗黙トランザクション（`Idle` から開始。いずれも `ErrorResponse` の後に `ReadyForQuery('I')` が 1 回だけ来て、
+以降の文は実行されず、先行文の行・`operation_id` 台帳・セッション状態が残らない）:
+
+| 失敗要因 | COPY の位置 | SQLSTATE |
+| -------- | ----------- | -------- |
+| 後続文のエラー | 先頭／途中（COPY FROM・COPY TO） | 後続文の SQLSTATE |
+| デコード失敗 | 途中 | `22000` |
+| INDEX-4 超過 | 最後 | `54000` |
+| commit 失敗（遅延 FK） | 最後（FROM は `COPY n` 前、TO は CopyOutResponse 前）／途中 | `23503` |
+| COPY TO の binary 非対応型 | 途中 | `0A000` |
+| 同一メッセージ内の `operation_id` 再利用 | 先頭 | `25000` |
+| 読み捨て予算超過・早期 EOF | 最後 | `08P01` の後に切断／切断。ライタは解放される |
+
+明示トランザクション（25P02 規則との整合）:
+
+- COPY の失敗（CopyFail・デコード失敗・binary 非対応型）で `Failed`（`'E'`）へ遷移し、同じメッセージの
+  後続文（`COMMIT` を含む）は実行されない。
+- `Failed` 中の COPY は CopyIn へ入らず `25P02`（複数文でも先頭で停止）。`ROLLBACK` の後の COPY は通常どおり実行される。
+- 既知の相違: `Failed` 中の `COMMIT` は `25P02` で `'E'` のまま（PostgreSQL は `ROLLBACK` タグを返す。
+  既存の fail-closed 契約を維持）。
+- 対象外: COPY 位置での commit 後 panic の緊急応答検査（新しい障害注入点が必要）。
