@@ -12,7 +12,7 @@ spec 本文は転記せず、ID のポインタのみを記す。
 | #1754（本書） | 構文の解析、表の存在確認、列参照の解決、SET 右辺の型照合 |
 | #1755 | 結合の実行、多重一致時の 1 回だけの更新、影響行数上限 |
 | #1756 | 全参照への RLS 適用、`RETURNING` |
-| #1757 | 台帳の content_hash と operation_id の再送冪等 |
+| #1757 | 台帳の content_hash と operation_id の再送冪等（文ハッシュは構文段で算出済み。実行入口で事前照合） |
 
 ## 構文
 
@@ -48,7 +48,7 @@ DELETE FROM <表> [[AS] <別名>] USING <rel>[, <rel>]* [WHERE <join_where>]
 `ParsedSql::UpdateFrom`／`ParsedSql::DeleteUsing` を追加した（BREAKING CHANGE）。既存の `ValidatedPredicateUpdate`／`ValidatedPredicateDelete` に `from` を足すと、既存の実行腕が
 FROM を黙って無視する（単一表として処理する）fail-open 経路ができるため、別 variant にして網羅 `match` の追随漏れをコンパイラに検出させる。
 
-- `parsed_operation_id` は `None` を返す。拒否される文の operation_id を `SessionTransaction` に登録しないため。#1755／#1757 で見直す
+- `parsed_operation_id` は `None` を返す。拒否される文の operation_id を `SessionTransaction` に登録しないため。SQL 経路の dispatch 結線時に見直す（#1755・#1757 は実行入口と台帳ハッシュまで）
 - 一時表が関与する形は `is_routable` が `false` を返し `0A000`。ビューが関与する形は `0A000`
 
 ## 束縛（`sql::dml_from`）

@@ -480,7 +480,7 @@ Issue #1752 の担当で、本節は実行だけを扱う。
 
 親 #1753 のうち「書き込みトランザクション内での結合実行」を担当する。構文・束縛（別名・修飾列の解決）は
 Issue #1754、全参照表への RLS 回帰と FROM 側列の RETURNING は Issue #1756、結合を含む文の content_hash は
-Issue #1757 の担当。
+Issue #1757（実装済み）。
 
 - **方式**: 対象側を probe 側にしたハッシュ結合。FROM／USING 側は JOIN の側スキャンと同じ経路
   （`sql::scan::execute_scan_with_budget`）を書き込む側の `ctx`（RLS 暗黙適用）・同じ write txn で走査し、
@@ -511,12 +511,12 @@ Issue #1757 の担当。
   `tenant::update_rows_joined_unchecked`（`update_rows_where_impl` と同じ処理順序）と既存の
   `delete_rows_where_unchecked`。`tenant::enumerate_dml_candidates` は述語が値を運べる
   `enumerate_dml_candidates_with<T>` へ汎用化し、既存関数は `T = ()` の薄いラッパーにした。
-- **fail-closed**: `WriteTarget::InTxn` 以外・FROM 側列を参照する RETURNING・台帳記録を伴う構成は固定文言の
+- **fail-closed**: `WriteTarget::InTxn` 以外・FROM 側列を参照する RETURNINGは固定文言の
   `0A000`。
 - **暫定事項と申し送り**:
-  - 台帳（#1757）: `joined_dml_operation_id_gate` が `operation_id` 指定・Ledgered 構成を `0A000` で拒否する
-    暫定ゲート。渡す content_hash も記録に使われない暫定値。#1757 で撤去して正規化 content_hash へ結線する
-    （前例: Issue #2650）。
+  - 台帳（#1757・実装済み）: 構文段で算出した正規化文ハッシュ（結合結果は材料外）を `execute_joined_dml_in` が
+    受け取り、source 走査の前に `precheck_in_write_txn` で事前照合する。暫定ゲートは撤去した
+    （詳細は [multi-row-dml-operation-id.md](multi-row-dml-operation-id.md) の「Issue #1757 追記」）。
   - 結線（#1754）: 構文段は従来どおり FROM／USING を拒否しており、SQL 経路への dispatch はまだ無い。#1754 の
     マージ後に `core.rs` の UPDATE／DELETE 分岐から `execute_joined_dml_in` を呼び（autocommit は
     `execute_subquery_dml_autocommit` と同じ暗黙トランザクション）、書き込み後に `mark_written` を呼ぶ。

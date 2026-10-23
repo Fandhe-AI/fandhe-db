@@ -1605,7 +1605,7 @@ pub enum ParsedSql {
     /// `UPDATE <表> [[AS] <別名>] SET ... FROM <表の並び> [WHERE ...]`（SQL-53 (b)・Issue #1754）。
     /// 構文と表の存在確認までを担い、列の解決・型照合は束縛（`sql::dml_from::bind_update_from`）が
     /// 実行腕・Describe 腕で行う。実行腕は束縛の後に `0A000` で止める（副作用ゼロ。結合の実行は
-    /// #1755、RLS と `RETURNING` は #1756、台帳の content_hash は #1757）。既存の [`Self::Update`] に
+    /// #1755、RLS と `RETURNING` は #1756、台帳の content_hash は #1757 で構文段に実装済み）。既存の [`Self::Update`] に
     /// フィールドを足さず別 variant にしているのは、FROM を黙って無視する実行経路（fail-open）を
     /// 作らず、網羅 `match` の追随漏れをコンパイラに検出させるため。
     ///
@@ -2179,7 +2179,7 @@ fn parsed_operation_id(parsed: &ParsedSql) -> Option<&str> {
         }
         // SQL-53 (b)・Issue #1754: 実行腕が束縛後に必ず `0A000` で拒否する間は、同一トランザクションの
         // operation_id 登録を変えない（拒否される文が再利用検査の状態を汚さない）。実行を結線する
-        // #1755／#1757 でここを見直す。
+        // SQL 経路の dispatch 結線時にここを見直す（#1755・#1757 は実行入口と台帳ハッシュまで）。
         ParsedSql::UpdateFrom(_) | ParsedSql::DeleteUsing(_) => None,
         // 永続側の文を包んだ形は中身の `operation_id` を使う（一時表の文は `operation_id` を持たない）。
         ParsedSql::SessionRouted(routed) if routed.is_persistent() => {
