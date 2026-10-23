@@ -3116,14 +3116,16 @@ impl EngineCore {
     /// `GROUP BY`／`SELECT DISTINCT` 集計の結果へ暗黙の結果行数上限を適用する（Issue #1796）。
     /// `LIMIT` が省略・`ALL`（`limit: None`）の `GROUP BY` 文だけが対象で、HAVING と OFFSET を
     /// 適用した後の件数で判定する。単一行の集計（`GROUP BY` なし）は対象外。
+    /// `limits` は呼び出し段の上限（ビュー本文の評価では本文用の既定値、外側では呼び出し段の
+    /// 設定値。本文と外側の上限を分ける契約を保つため `self.result_limits` は参照しない）。
     fn enforce_group_result_cap(
-        &self,
         validated: &crate::sql::allowlist::ValidatedAggregate,
         result: crate::sql::exec::QueryResult,
+        limits: &crate::result_limits::ResultLimits,
     ) -> Result<crate::sql::exec::QueryResult, crate::sql::allowlist::SqlSurfaceError> {
         match &validated.group_by {
             Some(g) if g.limit.is_none() => {
-                Self::enforce_result_cap(result, self.result_limits.max_result_rows())
+                Self::enforce_result_cap(result, limits.max_result_rows())
             }
             _ => Ok(result),
         }
@@ -7403,7 +7405,7 @@ impl EngineCore {
             let bound = crate::sql::parser::bind_aggregate(validated, &schema, session.udfs())?;
             let result =
                 self.run_aggregate_plan(read_txn, ctx, &schema, &bound, max_result_bytes)?;
-            let result = self.enforce_group_result_cap(validated, result)?;
+            let result = Self::enforce_group_result_cap(validated, result, &self.result_limits)?;
             return Ok(crate::sql::SqlOutcome::Query(result));
         }
         self.execute_read_statement(ctx, session, inner.clone(), read_txn)
@@ -8912,7 +8914,7 @@ impl EngineCore {
                     &bound,
                     crate::sql::aggregate::MAX_AGGREGATE_RESULT_BYTES,
                 )?;
-                let result = self.enforce_group_result_cap(&validated, result)?;
+                let result = Self::enforce_group_result_cap(&validated, result, &limits)?;
                 Ok(crate::sql::SqlOutcome::Query(result))
             }
             crate::sql::allowlist::Statement::Scan(mut validated) => {
@@ -9031,6 +9033,11 @@ impl EngineCore {
                         let processed = match &validated.outer {
                             crate::sql::allowlist::BufferedOuter::Rows(r) if r.limit_implicit => {
                                 Self::enforce_result_cap(processed, limits.max_result_rows())?
+                            }
+                            // 外側の `GROUP BY` も同様（`limit: None` のときだけ HAVING・OFFSET
+                            // 適用後の件数を呼び出し段の上限で検査する）。
+                            crate::sql::allowlist::BufferedOuter::Aggregate(agg) => {
+                                Self::enforce_group_result_cap(agg, processed, &limits)?
                             }
                             _ => processed,
                         };

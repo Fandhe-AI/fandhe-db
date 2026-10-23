@@ -244,6 +244,50 @@ fn buffered_view_outer_omitted_enforces_the_cap() {
     assert_eq!(rows(&core, "SELECT * FROM bv WHERE k <= 2"), 2);
 }
 
+/// 評価後射影形ビューの外側 `GROUP BY` の省略・`LIMIT ALL` も cap を超えたら `54000`。
+#[test]
+fn buffered_view_outer_group_by_enforces_the_cap() {
+    let (core, _g) = open("sql34-buffered-agg");
+    let mut session = SessionState::default();
+    session.allow_ddl();
+    core.execute_sql_in_session(
+        &ctx("alice"),
+        &mut session,
+        "CREATE VIEW bv AS SELECT id, k FROM t ORDER BY id LIMIT 4",
+    )
+    .expect("create buffered view");
+    seed_t(&core, "alice", 1..=5);
+    assert_eq!(
+        code(&core, "SELECT k, COUNT(*) FROM bv GROUP BY k LIMIT ALL"),
+        "54000"
+    );
+    assert_eq!(
+        code(&core, "SELECT k, COUNT(*) FROM bv GROUP BY k"),
+        "54000"
+    );
+    // OFFSET 適用後に cap 内へ収まれば成功する。
+    assert_eq!(
+        rows(&core, "SELECT k, COUNT(*) FROM bv GROUP BY k OFFSET 1"),
+        CAP
+    );
+}
+
+/// ビュー本文の集計は本文用の上限で評価され、外側が cap 内へ絞れば成功する。
+#[test]
+fn buffered_view_body_group_by_uses_body_limits() {
+    let (core, _g) = open("sql34-buffered-body-agg");
+    let mut session = SessionState::default();
+    session.allow_ddl();
+    core.execute_sql_in_session(
+        &ctx("alice"),
+        &mut session,
+        "CREATE VIEW gv AS SELECT k, COUNT(*) AS n FROM t GROUP BY k",
+    )
+    .expect("create buffered view");
+    seed_t(&core, "alice", 1..=4);
+    assert_eq!(rows(&core, "SELECT * FROM gv LIMIT 2"), 2);
+}
+
 /// `DECLARE` は全件を数え、超過なら `54000` で拒否してカーソルを登録しない。
 #[test]
 fn declare_rejects_over_cap_and_registers_nothing() {
