@@ -68,6 +68,16 @@ icu_collator = "=2.3.1"
 # 別データに差し替わるため、CI・release・開発環境では設定しないこと。
 icu_collator_data = "=2.3.0"
 
+# Issue #1786（SQL-55 正規表現マッチ。ビヘイビア ID のポインタのみ）: 線形時間の正規表現エンジン。
+# **オーナー承認済み: 2026-10-23。承認記録は Issue #1785 のコメント、および
+# `docs/design/regex-crate-adoption.md`（Accepted）**。
+#   - クレート: regex = "=1.13.1"（default features）
+#   - 目的: PG 互換の `~`／`~*`・`SIMILAR TO`・jsonpath `like_regex` の評価器（ReDoS を避ける線形時間保証）
+#   - ライセンス: MIT OR Apache-2.0
+#   - 非 optional の理由: feature ゲートを作るとビルド構成で述語の挙動が変わる経路になるため
+# .claude/rules/dependency-policy.md に従い完全固定（=x.y.z）で管理する。
+regex = "=1.13.1"
+
 # Issue #1574（TABLE-33 TIMESTAMPTZ。ビヘイビア ID のポインタのみ）: TZ データ源。
 # **オーナー承認済み: 2026-10-16。承認記録は Issue #1573 のコメント、および
 # `docs/design/timestamptz-tz-data-adoption.md`（Accepted）**。

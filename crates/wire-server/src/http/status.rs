@@ -118,6 +118,8 @@ pub const fn http_status(class: ErrorClass) -> u16 {
         | ErrorClass::InvalidBinaryRepresentation
         // Issue #1769: COPY binary のフレーム不正（`22P04`）も入力起因で 400。
         | ErrorClass::BadCopyFileFormat
+        // Issue #1786: 正規表現パターンの構文誤り（`2201B`）も入力起因で 400（SQL 表層専用）。
+        | ErrorClass::InvalidRegularExpression
         | ErrorClass::JsonSubscriptInvalid
         | ErrorClass::NonNumericJsonItem
         | ErrorClass::SingletonJsonItemRequired
@@ -211,7 +213,7 @@ mod tests {
 
     /// 期待表を明示的に列挙し、`ErrorClass::ALL` との突き合わせで非 vacuous に検証する。
     /// `match` にアームを足したが期待表の更新を忘れた、という乖離を (a)(b) が検出する。
-    const EXPECTED: [(ErrorClass, u16); 80] = [
+    const EXPECTED: [(ErrorClass, u16); 81] = [
         (ErrorClass::InvalidInput, 400),
         (ErrorClass::StringDataRightTruncation, 400),
         (ErrorClass::AuthInvalid, 401),
@@ -292,6 +294,7 @@ mod tests {
         (ErrorClass::UntranslatableCharacter, 400),
         (ErrorClass::InvalidBinaryRepresentation, 400),
         (ErrorClass::BadCopyFileFormat, 400),
+        (ErrorClass::InvalidRegularExpression, 400),
     ];
 
     #[test]

@@ -94,7 +94,7 @@ macro_rules! define_error_classes {
 pub(crate) const SHARED_WIRE_CODES: &[&str] = &["23502", "23505", "22023"];
 
 define_error_classes! {
-    count = 80;
+    count = 81;
 
     /// 構文上受理された SQL の値・引数が不正（`22000`）。
     /// [`crate::sql::allowlist::SqlSurfaceError::InvalidInput`] の写像。
@@ -220,6 +220,10 @@ define_error_classes! {
     /// （WIRE-23・Issue #1769）で発生する。SQL 表層（COPY binary）専用で NoSQL の `op` 語彙からは
     /// 到達しない。
     BadCopyFileFormat => ("22P04", "BAD_COPY_FILE_FORMAT"),
+    /// 正規表現パターンが PG の構文としても不正（`2201B`。SQL-55・Issue #1786）。
+    /// [`crate::regex_match::RegexError`] の写像。SQL 表層（`~`／`~*`・`SIMILAR TO`）専用で
+    /// NoSQL の `op` 語彙からは到達しない。
+    InvalidRegularExpression => ("2201B", "INVALID_REGULAR_EXPRESSION"),
     /// 明示トランザクション（SQL-31・TASK-221）内で発生した一般的な状態不整合
     /// （`25000`）。同一トランザクション内での `operation_id` 再利用など、他の
     /// より具体的な分類に属さないトランザクション状態エラーに使う。

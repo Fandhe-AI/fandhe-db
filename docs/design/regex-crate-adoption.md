@@ -105,3 +105,11 @@ PG の構文に関する記述は PostgreSQL 公式ドキュメント（POSIX Re
 - 2026-10-23: 自動運転（implement-issue-tree）で作成。オーナー承認は代筆できないためステータスを Proposed とした。**承認は未取得**
 - 承認後の手順: オーナーが Issue #1785 にコメントで承認 → ステータスを Accepted に変更し、承認日・承認範囲（第 4 節の決定事項の番号）・コメントへのリンクを本節に追記する。承認済みと事実以上に書かない
 - 2026-10-23: オーナーが [Issue #1785 のコメント](https://github.com/Fandhe-AI/fandhe-db/issues/1785#issuecomment-6366408726)で承認し、ステータスを Accepted とした。承認範囲は `regex = "=1.13.1"` の直接依存 1 行と、第 4 節の決定事項 1〜5 の推奨案（1: 非 optional、2: default features、3: 案 b、4: 上限超過は `54000`、5: 範囲外の変更は再承認）
+
+## 10. #1786 での確定
+
+- `regex::Error` は `#[non_exhaustive]` で `Syntax(String)` と `CompiledTooBig(usize)` だけを持つ。`CompiledTooBig` は `54000`、それ以外（未知の variant を含む）は拒否側（`2201B`）に倒した。`RegexBuilder` の `size_limit`・`dfa_size_limit`・`nest_limit` を使う
+- 字句走査で非対応構文（`0A000`）と PG でも構文誤りになるもの（`2201B`）を先に決める第 4 節の案 b を採用した。走査が正しければ `regex` の `Syntax` は起きない（PG 17 の採取表の全行で確認済み）
+- 第 5 節の差分の確定先は [regex-matcher.md](regex-matcher.md)。照合は C に限り、ICU 照合の式の拒否は #1787 の責務として申し送る
+- `make deny` は通過（advisories・bans・licenses・sources）。`wire-server` の既定ビルドで新たにリンクされる crate は `regex`・`regex-automata`・`regex-syntax`・`aho-corasick`・`memchr` の 5 件（見込みどおり。`Cargo.lock` の差分は engine の依存リストへの `regex` 追加 1 行だけ）
+- 上限の CLI は [regex-limits-cli.md](regex-limits-cli.md)
