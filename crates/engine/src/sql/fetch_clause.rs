@@ -77,6 +77,7 @@ fn follows_operand(prev: Option<&Token>) -> bool {
                 | Token::StringLiteral(_)
                 | Token::QuotedBoolWord(_)
                 | Token::QuotedNull(_)
+                | Token::QuotedCollationName(_)
                 | Token::Punct(')' | ']')
         )
     )
@@ -330,6 +331,18 @@ mod tests {
         assert!(
             matches!(norm(sql), Err(SqlSurfaceError::UnsupportedSyntax { .. })),
             "{sql}"
+        );
+    }
+
+    #[test]
+    fn quoted_collation_name_precedes_row_count_clause() {
+        same(
+            "SELECT id FROM t ORDER BY title COLLATE \"und-x-icu\" FETCH FIRST 2 ROWS ONLY",
+            "SELECT id FROM t ORDER BY title COLLATE \"und-x-icu\" LIMIT 2",
+        );
+        same(
+            "SELECT id FROM t ORDER BY title COLLATE \"und-x-icu\" OFFSET 1 ROWS FETCH NEXT 2 ROWS ONLY",
+            "SELECT id FROM t ORDER BY title COLLATE \"und-x-icu\" LIMIT 2 OFFSET 1",
         );
     }
 
