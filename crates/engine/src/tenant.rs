@@ -4316,13 +4316,21 @@ fn merge_row_for_update_set(
     id: u64,
     assignments: &[(usize, crate::row_codec::Value)],
     set_exprs: &[(usize, crate::sql::set_expr::BoundSetExpr)],
+    // 結合形 `UPDATE ... FROM`（Issue #1755・SQL-53）が probe 時点で確定した当該行の SET 値。
+    // 空なら従来どおり。非空のときは式項と同様に全項を再検証してから merge する。
+    row_extra: &[(usize, crate::row_codec::Value)],
 ) -> Result<(Vec<f32>, Vec<u8>), TenantWriteError> {
-    if set_exprs.is_empty() {
+    if set_exprs.is_empty() && row_extra.is_empty() {
         return Ok(merge_row_for_update(schema, existing, assignments)?);
     }
     let mut resolved: Vec<(usize, crate::row_codec::Value)> = Vec::new();
     resolved
-        .try_reserve_exact(assignments.len().saturating_add(set_exprs.len()))
+        .try_reserve_exact(
+            assignments
+                .len()
+                .saturating_add(set_exprs.len())
+                .saturating_add(row_extra.len()),
+        )
         .map_err(|_| {
             TenantWriteError::Catalog(CatalogError::Invalid(
                 "failed to reserve SET assignment buffer".to_string(),
@@ -4343,6 +4351,7 @@ fn merge_row_for_update_set(
             resolved.push((*idx, value));
         }
     }
+    resolved.extend(row_extra.iter().cloned());
     validate_set_assignments(schema, &resolved)?;
     Ok(merge_row_for_update(schema, existing, &resolved)?)
 }
@@ -4672,7 +4681,7 @@ pub(crate) fn update_row_columns_capturing_unchecked(
                         }
                     }
                     let (embedding, metadata) =
-                        merge_row_for_update_set(&schema, row, id, assignments, set_exprs)?;
+                        merge_row_for_update_set(&schema, row, id, assignments, set_exprs, &[])?;
                     let row_input = RowInput {
                         tenant_id: ctx.tenant_id(),
                         visibility,
@@ -5396,11 +5405,35 @@ fn enumerate_dml_candidates<E>(
     max_scanned_rows: usize,
     predicate: &mut impl FnMut(&DmlCandidate<'_>) -> Result<bool, E>,
 ) -> Result<Vec<u64>, PredicateDmlError<E>> {
+    let with_payload = enumerate_dml_candidates_with(
+        row_table,
+        ctx,
+        needs_embedding,
+        limit,
+        max_scanned_rows,
+        &mut |c: &DmlCandidate<'_>| predicate(c).map(|hit| hit.then_some(())),
+    )?;
+    Ok(with_payload.into_iter().map(|(id, ())| id).collect())
+}
+
+/// [`enumerate_dml_candidates`] の汎用版（Issue #1755・SQL-53）。述語が一致行ごとに値 `T` を
+/// 返せる（`Some(t)` が一致、`None` が不一致）ようにし、`(id, t)` の列を候補列挙順で返す。
+/// 結合形 `UPDATE ... FROM` が「probe 時点で確定した行ごとの SET 値」を候補と同じ並びで運ぶための
+/// 拡張で、走査範囲・総走査上限・所有かつ可視の選定・`limit` の早期終了は上記と完全に同一
+/// （`T = ()` の薄いラッパーが既存の呼び出し元のビット同一性を保つ）。
+fn enumerate_dml_candidates_with<E, T>(
+    row_table: &redb::Table<'_, (&'static str, u64), &'static [u8]>,
+    ctx: &PolicyContext,
+    needs_embedding: bool,
+    limit: Option<std::num::NonZeroUsize>,
+    max_scanned_rows: usize,
+    predicate: &mut impl FnMut(&DmlCandidate<'_>) -> Result<Option<T>, E>,
+) -> Result<Vec<(u64, T)>, PredicateDmlError<E>> {
     // 書き込み経路でも読み取り経路（`visible_rows_with_scan_limit`）と同じく
     // `ScanLimits` で飽和させる（fail-closed）。`usize::MAX` 等が直接渡されても
     // `saturating_add` の飽和で上限が効かなくなる迂回を防ぐ（Issue #1549）。
     let max_scanned_rows = crate::scan_limits::ScanLimits::new(max_scanned_rows).max_scanned_rows();
-    let mut candidate_ids: Vec<u64> = Vec::new();
+    let mut candidate_ids: Vec<(u64, T)> = Vec::new();
     let mut embedding_scratch: Vec<f32> = Vec::new();
     // 総走査行数（対象テナント所有行のみを対象に加算する）。`visible_rows` の
     // `MAX_SCANNED_ROWS` と同じ計算量 DoS 対策（codex-review P1 指摘・Issue #871）:
@@ -5475,8 +5508,8 @@ fn enumerate_dml_candidates<E>(
             embedding,
             metadata,
         };
-        if predicate(&candidate).map_err(PredicateDmlError::Predicate)? {
-            candidate_ids.push(id);
+        if let Some(payload) = predicate(&candidate).map_err(PredicateDmlError::Predicate)? {
+            candidate_ids.push((id, payload));
             // `limit` が `Some` のときのみ `limit + 1` 件に達した時点で打ち切る
             // （副作用ゼロで `54000` を返すために、呼び出し元が超過を判定できる
             // 最小限の 1 件超過分だけ余分に蓄積する。ADR `docs/design/
@@ -5847,6 +5880,112 @@ fn update_rows_where_impl<E>(
             &candidate_ids,
             assignments,
             set_exprs,
+            None,
+            target.fk_check_mode(),
+            project,
+            None,
+        )?;
+        debug_assert_eq!(applied, candidate_ids.len());
+
+        let rows_affected = candidate_ids.len();
+        if rows_affected > 0 {
+            crate::catalog::bump_table_generation_in_txn(write_txn, table)
+                .map_err(dml_write_err)?;
+        }
+        Ok((
+            PredicateDmlOutcome::Applied { rows_affected },
+            TxnEffect::Wrote,
+        ))
+    })
+}
+
+/// 結合形 `UPDATE <t> SET ... FROM <s> WHERE ...`（Issue #1755・SQL-53 (b)）の書き込み入口。
+///
+/// 責務境界: [`update_rows_where_impl`] と処理順序・候補列挙・上限・適用段を完全に共有し
+/// （スキーマ照合 → `validate_set_assignments` → 台帳記録 → 候補列挙 → 上限判定 → 適用 →
+/// 世代 bump → commit。第 2 の書き込み経路を作らない）、違いは述語の戻り値だけである。
+/// `predicate` は一致した候補ごとに `Some(行ごとの SET 値)` を返し、FROM 側の行に依存する
+/// 値（結合タプルの先頭の一致行から評価したもの）を候補と同じ並びで適用段へ運ぶ。
+/// 候補列挙は対象表の所有かつ可視の行に閉じる（テナント境界は既存の列挙が担保する。
+/// 呼び出し元 `core::dml_join_exec` が FROM 側を `ctx`＝RLS 暗黙適用で別途走査する）。
+///
+/// 台帳（RECOVER-11）の結線は Issue #1757 の担当で、呼び出し元が `LedgerWrite::Omitted`／
+/// `Disabled` のときだけ呼ぶ暫定ゲートを置いている（`content_hash_value` は記録に使われない）。
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn update_rows_joined_unchecked<E>(
+    target: WriteTarget<'_>,
+    table: &str,
+    ctx: &PolicyContext,
+    ledger_write: LedgerWrite<'_>,
+    content_hash_value: &content_hash::ContentHash,
+    expected_schema: Option<&crate::catalog::TableSchema>,
+    assignments: &[(usize, crate::row_codec::Value)],
+    needs_embedding: bool,
+    limit: Option<std::num::NonZeroUsize>,
+    max_scanned_rows: usize,
+    mut predicate: impl FnMut(
+        &DmlCandidate<'_>,
+    ) -> Result<Option<Vec<(usize, crate::row_codec::Value)>>, E>,
+    project: Option<&mut ReturningProjectFn<'_>>,
+) -> Result<PredicateDmlOutcome, PredicateDmlError<E>> {
+    validate_relation_key(table).map_err(dml_write_err)?;
+    target.with_txn(|write_txn| {
+        let (candidates, schema) = {
+            let schema =
+                require_table_schema_write_any_identity(write_txn, table).map_err(dml_write_err)?;
+            if let Some(expected) = expected_schema {
+                if expected != &schema {
+                    return Err(dml_write_err(CatalogError::Invalid(
+                        "table schema changed after the statement was bound".to_string(),
+                    )));
+                }
+            }
+            validate_set_assignments(&schema, assignments).map_err(dml_write_err)?;
+            ledger::record_in_txn_accepting(
+                write_txn,
+                ctx.tenant_id(),
+                table,
+                ledger_write,
+                content_hash_value,
+                &[],
+            )
+            .map_err(dml_write_err)?;
+
+            let row_table_name = user_rows_table_name(table);
+            let row_table = write_txn
+                .open_table(user_rows_table_def(&row_table_name))
+                .map_err(|e| dml_write_err(map_row_table_error(e)))?;
+            let candidates = enumerate_dml_candidates_with(
+                &row_table,
+                ctx,
+                needs_embedding,
+                limit,
+                max_scanned_rows,
+                &mut predicate,
+            )?;
+            (candidates, schema)
+        };
+
+        if limit.is_some_and(|limit| candidates.len() > limit.get()) {
+            return Ok((
+                PredicateDmlOutcome::LimitExceeded {
+                    count: candidates.len(),
+                },
+                TxnEffect::NoOp,
+            ));
+        }
+
+        let (candidate_ids, overrides): (Vec<u64>, Vec<Vec<(usize, crate::row_codec::Value)>>) =
+            candidates.into_iter().unzip();
+        let applied = apply_predicate_update_in_txn(
+            write_txn,
+            table,
+            ctx,
+            &schema,
+            &candidate_ids,
+            assignments,
+            &[],
+            Some(&overrides),
             target.fk_check_mode(),
             project,
             None,
@@ -6002,10 +6141,19 @@ fn apply_predicate_update_in_txn<E>(
     candidate_ids: &[u64],
     assignments: &[(usize, crate::row_codec::Value)],
     set_exprs: &[(usize, crate::sql::set_expr::BoundSetExpr)],
+    // 結合形 `UPDATE ... FROM`（Issue #1755・SQL-53）の行ごとの SET 値。`candidate_ids` と
+    // 同じ並び・同じ長さ（不一致は内部不整合として fail-closed）。原子経路の他の呼び出し元と
+    // 分割実行器は `None`（挙動不変）。
+    row_overrides: Option<&[Vec<(usize, crate::row_codec::Value)>]>,
     fk_mode: crate::constraint::FkCheckMode,
     mut project: Option<&mut ReturningProjectFn<'_>>,
     mut should_stop: Option<&mut dyn FnMut() -> bool>,
 ) -> Result<usize, PredicateDmlError<E>> {
+    if row_overrides.is_some_and(|o| o.len() != candidate_ids.len()) {
+        return Err(dml_write_err(CatalogError::Invalid(
+            "internal: per-row SET values do not match the candidate rows".to_string(),
+        )));
+    }
     // `FOREIGN KEY` の `ON UPDATE` 参照アクション（Issue #1076）の連鎖起点。
     let mut pre_images = crate::constraint::UpdatedKeyPreImages::new();
     let mut applied = 0usize;
@@ -6014,13 +6162,21 @@ fn apply_predicate_update_in_txn<E>(
         let mut row_table = write_txn
             .open_table(user_rows_table_def(&row_table_name))
             .map_err(|e| dml_write_err(map_row_table_error(e)))?;
-        for id in candidate_ids {
+        for (pos, id) in candidate_ids.iter().enumerate() {
             // 分割実行の writer 保持時間打ち切り（1 件以上適用した後のみ判定。
             // 原子経路は `None` を渡すため常に全件適用する）。
             if applied > 0 && should_stop.as_mut().is_some_and(|f| f()) {
                 break;
             }
             applied += 1;
+            let row_extra: &[(usize, crate::row_codec::Value)] = match row_overrides {
+                Some(o) => o.get(pos).map(Vec::as_slice).ok_or_else(|| {
+                    dml_write_err(CatalogError::Invalid(
+                        "internal: per-row SET values missing for a candidate row".to_string(),
+                    ))
+                })?,
+                None => &[],
+            };
             let key = row_key(ctx.tenant_id(), RowId::from_legacy_id(*id));
             let existing = match row_table
                 .get(&key)
@@ -6063,7 +6219,7 @@ fn apply_predicate_update_in_txn<E>(
             // 借用版デコードによるピーク確保回避・SET 列重複時の意味論
             // （先勝ち）などの設計判断は同関数のドキュメント参照）。
             let (embedding_value, metadata) =
-                merge_row_for_update_set(schema, existing, *id, assignments, set_exprs)
+                merge_row_for_update_set(schema, existing, *id, assignments, set_exprs, row_extra)
                     .map_err(dml_write_err)?;
             let row = RowInput {
                 tenant_id: ctx.tenant_id(),
@@ -6116,11 +6272,22 @@ fn apply_predicate_update_in_txn<E>(
         // このテーブルを参照先とする `FOREIGN KEY` の参照先側（TABLE-17・TASK-205、
         // Issue #907。SET 列が主キー・UNIQUE 構成列を含む場合のみ検査。永続
         // キー索引の差分は直前の同期をそのまま再利用する）。
-        let updated_columns: Vec<usize> = assignments
+        let mut updated_columns: Vec<usize> = assignments
             .iter()
             .map(|(idx, _)| *idx)
             .chain(set_exprs.iter().map(|(idx, _)| *idx))
+            .chain(
+                row_overrides
+                    .into_iter()
+                    .flatten()
+                    .flat_map(|row| row.iter().map(|(idx, _)| *idx)),
+            )
             .collect();
+        // 行ごとの上書き値由来の重複列を畳む（FK 検査の入力を一意にする。安定ソート）。
+        if row_overrides.is_some() {
+            updated_columns.sort();
+            updated_columns.dedup();
+        }
         crate::constraint::enforce_referencing_rows_in_txn(
             write_txn,
             table,

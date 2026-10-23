@@ -35,6 +35,8 @@
 //! （TASK-212 基盤）による結合入力のキャッシュ。
 
 mod aggregate;
+// `UPDATE ... FROM`/`DELETE ... USING` の結合実行（Issue #1755・SQL-53）。
+pub(crate) mod dml;
 mod exec;
 mod plan;
 mod residual;
