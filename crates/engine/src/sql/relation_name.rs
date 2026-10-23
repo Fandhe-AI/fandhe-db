@@ -284,7 +284,7 @@ pub(crate) fn relation_positions(tokens: &[Token]) -> RelationWalk {
             }
             Some(Token::Ident(w)) => [
                 "AND", "OR", "NOT", "ON", "HAVING", "WHEN", "THEN", "ELSE", "IS", "IN", "LIKE",
-                "BETWEEN", "CASE", "BY",
+                "ILIKE", "BETWEEN", "CASE", "BY",
             ]
             .iter()
             .any(|k| w.eq_ignore_ascii_case(k)),
@@ -829,6 +829,7 @@ pub(crate) fn collides_with_syntax_word(name: &str) -> bool {
         "IS",
         "NULL",
         "LIKE",
+        "ILIKE",
         "BETWEEN",
         "FOR",
         "SHARE",

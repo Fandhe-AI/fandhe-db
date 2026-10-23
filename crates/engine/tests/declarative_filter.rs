@@ -437,7 +437,7 @@ fn ext3_rejects_unsupported_like_forms_with_42601() {
     // `tests/sql24_in_between_null_not.rs`／`sql::allowlist::tests::
     // accepts_not_like_as_negated_prefix` が固定する）。
     for sql in [
-        "SELECT * FROM docs WHERE path ILIKE 'src/%' ORDER BY embedding <=> '[1.0,0.0]' LIMIT 10",
+        "SELECT * FROM docs WHERE path ILIKE kind ORDER BY embedding <=> '[1.0,0.0]' LIMIT 10",
         "SELECT * FROM docs WHERE path LIKE kind ORDER BY embedding <=> '[1.0,0.0]' LIMIT 10",
         "SELECT * FROM docs WHERE path LIKE 1 ORDER BY embedding <=> '[1.0,0.0]' LIMIT 10",
     ] {

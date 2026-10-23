@@ -2254,8 +2254,15 @@ fn push_dml_where_predicate(
             b.push_bytes(value.as_bytes())
                 .map_err(|_| dml_hash_field_too_large())?;
         }
-        WherePredicate::Prefix { column, pattern } => {
-            b.push_u8(2);
+        WherePredicate::Prefix {
+            column,
+            pattern,
+            case_insensitive,
+        } => {
+            // `ILIKE`（SQL-54、Issue #1778）は `LIKE` と評価結果が異なるため別タグ 16 を
+            // 割り当てる（`LIKE` はタグ 2 のまま不変。台帳の再送互換を保ち、同一
+            // operation_id での LIKE／ILIKE 取り違えを `22023` で検出する）。
+            b.push_u8(if *case_insensitive { 16 } else { 2 });
             b.push_bytes(column.as_bytes())
                 .map_err(|_| dml_hash_field_too_large())?;
             b.push_bytes(pattern.as_bytes())
@@ -5995,6 +6002,40 @@ mod tests {
             h1, h2,
             "AND-only predicate hashing must remain deterministic across calls"
         );
+    }
+
+    /// `ILIKE`（SQL-54、Issue #1778）は `LIKE` と別タグ（16）で直列化し、`LIKE` の
+    /// 既存バイト列（タグ 2）は変えない。同一 operation_id での LIKE／ILIKE の取り違え
+    /// と、ILIKE／NOT ILIKE の取り違えをハッシュ不一致（`22023`）で検出できる。
+    #[test]
+    fn ilike_predicate_hash_is_distinct_from_like_and_like_bytes_unchanged() {
+        use crate::sql::allowlist::WherePredicate;
+        use crate::sql::udf_call::UdfRegistry;
+
+        let prefix = |ci: bool| WherePredicate::Prefix {
+            column: "name".to_string(),
+            pattern: "A%".to_string(),
+            case_insensitive: ci,
+        };
+        let registry = UdfRegistry::default();
+        let hash = |p: WherePredicate| for_delete_where("t", &[p], &registry).expect("hash");
+        assert_ne!(hash(prefix(false)), hash(prefix(true)));
+        assert_ne!(
+            hash(prefix(true)),
+            hash(WherePredicate::Not(Box::new(prefix(true))))
+        );
+
+        let mut expected = HashInputBuilder::new(OpTag::DeleteWhere);
+        expected.push_bytes(b"t").expect("push");
+        let mut referenced = std::collections::BTreeMap::new();
+        push_dml_where_predicate(&mut expected, &prefix(false), &registry, &mut referenced)
+            .expect("push");
+        let mut legacy = HashInputBuilder::new(OpTag::DeleteWhere);
+        legacy.push_bytes(b"t").expect("push");
+        legacy.push_u8(2);
+        legacy.push_bytes(b"name").expect("push");
+        legacy.push_bytes(b"A%").expect("push");
+        assert_eq!(expected.finish(), legacy.finish());
     }
 
     /// NUMERIC 値（TABLE-13〔検討中〕・TASK-197、Issue #885・D7）のハッシュは、

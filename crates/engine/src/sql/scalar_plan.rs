@@ -486,7 +486,8 @@ pub(crate) fn classify_scalar_plan_with(
             //
             // `Like` は上の事前判定で既に `PlainScan` を返し済みのため
             // ここへは到達しないが、網羅性のため保険腕として同じ結果を返す
-            // （SQL-24／TASK-208、Issue #914）。`LikeUnbound`（未束縛）は
+            // （SQL-24／TASK-208、Issue #914）。`ILIKE`（SQL-54、Issue #1778）も束縛後は
+            // `Like`（`fold_ascii` 付き）になるため同じく `PlainScan`。`LikeUnbound`（未束縛）は
             // `bind` 済み `MetadataFilter` には現れない契約（`Compare` と同じ
             // fail-closed の保険腕）。
             crate::declarative_filter::FilterOp::Compare { .. }
@@ -501,7 +502,8 @@ pub(crate) fn classify_scalar_plan_with(
             | crate::declarative_filter::FilterOp::JsonEquals(_)
             | crate::declarative_filter::FilterOp::InJson(_)
             | crate::declarative_filter::FilterOp::Like(_)
-            | crate::declarative_filter::FilterOp::LikeUnbound(_) => ScalarPlan::PlainScan,
+            | crate::declarative_filter::FilterOp::LikeUnbound(_)
+            | crate::declarative_filter::FilterOp::ILikeUnbound(_) => ScalarPlan::PlainScan,
         }
     }
 }

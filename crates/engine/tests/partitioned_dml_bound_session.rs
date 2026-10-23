@@ -104,6 +104,7 @@ fn all_rows() -> Vec<WherePredicate> {
     vec![WherePredicate::Prefix {
         column: "u".to_string(),
         pattern: "%".to_string(),
+        case_insensitive: false,
     }]
 }
 

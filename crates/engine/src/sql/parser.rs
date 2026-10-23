@@ -1948,7 +1948,11 @@ fn declarative_leaf_to_filter(
                 skip,
             ))
         }
-        WherePredicate::Prefix { column, pattern } => {
+        WherePredicate::Prefix {
+            column,
+            pattern,
+            case_insensitive,
+        } => {
             // SQL-24／TASK-208、Issue #914: `WherePredicate::Prefix`
             // （名前は互換性のため据え置き）は LIKE の生パターン全般を
             // 保持する。意味論・振り分け（Equals／StartsWith／Like）は
@@ -1957,10 +1961,14 @@ fn declarative_leaf_to_filter(
             // `LIKE` パターン右辺には `$n` を束縛できない（`sql::params`
             // モジュールドキュメント。パターン 4 は `Ident '=' $n` のみ）ため
             // 常に「実値」として扱う。
-            Ok((
-                DeclarativeFilter::like(column.clone(), pattern.clone()),
-                false,
-            ))
+            // SQL-54（Issue #1778）: `ILIKE` は `ilike` で束縛する（ASCII 畳み込み・
+            // ICU 照合の拒否は束縛段の責務）。
+            let filter = if *case_insensitive {
+                DeclarativeFilter::ilike(column.clone(), pattern.clone())
+            } else {
+                DeclarativeFilter::like(column.clone(), pattern.clone())
+            };
+            Ok((filter, false))
         }
         WherePredicate::BoolEquality { column, value } => {
             // Issue #1342: BOOLEAN 列位置の `$n` は Bind 時に `Ident("true"/"false")`
