@@ -686,16 +686,18 @@ fn copy_to_stdout_rejects_ranked_select() {
 }
 
 #[test]
-fn copy_to_stdout_rejects_table_form() {
+fn copy_to_stdout_rejects_table_form_to_file() {
+    // テーブル形 `COPY <table> TO STDOUT` は Issue #1771 で受理される（`copy_to_table.rs`）。
+    // `TO '<file>'` は従来どおり許可リスト外。
     let (core, path) = open_engine("copy-to-stdout-table-form");
     let _guard = CleanupGuard(path);
 
     let policy = ctx("acme");
     let session = SessionState::default();
-    let sql = format!("COPY {TABLE} TO STDOUT");
+    let sql = format!("COPY {TABLE} TO '/tmp/x'");
     let err = core
         .begin_copy(&policy, &session, &sql)
-        .expect_err("table-form COPY TO STDOUT must be rejected");
+        .expect_err("COPY TO file must be rejected");
     assert_eq!(err.wire_code(), "42601");
 }
 
