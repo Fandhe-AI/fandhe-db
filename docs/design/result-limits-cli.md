@@ -42,7 +42,7 @@
 
 ## 対象外
 
-- `LIMIT 0`・`LIMIT ALL`・`LIMIT` 省略の受理、結果行数上限（`54000`）の適用（別 Issue。本フラグ・アクセサを再利用する）
+- `LIMIT 0`・`LIMIT ALL`・`LIMIT` 省略の受理、結果行数上限（`54000`）の適用（別 Issue。本フラグ・アクセサを再利用する。設計は [limit-omitted-result-cap.md](limit-omitted-result-cap.md)）
 - `OFFSET` 範囲の設定化、集計の `LIMIT` 範囲の設定値連動
 - セッション変数・テナント単位・環境変数での設定
 - 直接 Rust API（`EngineCore::search`・`PrefilterIndex::search`）の `k` 上限（`MAX_SEARCH_K` のまま）
