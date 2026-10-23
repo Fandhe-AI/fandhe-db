@@ -541,7 +541,7 @@ fn simple_unsupported_forms_return_exact_sqlstate_and_session_continues() {
         "SELECT EXTRACT(year FROM d extra) FROM docs LIMIT 1".to_string(),
         "SELECT EXTRACT(year FROM) FROM docs LIMIT 1".to_string(),
         "SELECT id FROM docs ORDER BY count(*) LIMIT 5".to_string(),
-        "SELECT id FROM docs ORDER BY 1 LIMIT 5".to_string(),
+        "SELECT id FROM docs ORDER BY 1 + 0 LIMIT 5".to_string(),
         "SELECT id FROM docs ORDER BY lower(title), embedding <=> '[1.0,0.0]' LIMIT 5".to_string(),
         format!("{AGG} HAVING count(*) > 1"),
         format!("{AGG} ORDER BY sum(n)"),

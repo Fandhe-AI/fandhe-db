@@ -344,7 +344,7 @@ fn scan_order_by_expression_error_contract() {
         "SELECT id FROM docs ORDER BY lower(title), embedding <=> '[1.0,0.0]' LIMIT 3",
         "SELECT id FROM docs ORDER BY lower(title) <=> '[1.0,0.0]' LIMIT 3",
         "SELECT id FROM docs ORDER BY count(*) LIMIT 3",
-        "SELECT id FROM docs ORDER BY 1 LIMIT 3",
+        "SELECT id FROM docs ORDER BY 1 + 0 LIMIT 3",
         "SELECT id FROM docs ORDER BY lower(title) LIMIT",
     ] {
         assert_eq!(run_err(&core, &ctx, sql), "42601", "{sql}");

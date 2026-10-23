@@ -202,6 +202,7 @@ pub(crate) fn rewrite_order_keys(
             ScanOrderKey::Expr { expr, .. } => {
                 super::parser::collect_expr_idents(expr, &mut idents)
             }
+            ScanOrderKey::Ordinal { .. } => {}
         }
     }
     map.reject_aliased_id_refs(&idents)?;
@@ -221,6 +222,9 @@ pub(crate) fn rewrite_order_keys(
                 expr: map_expr_idents(&expr, &|c| map.physical(c)),
                 descending,
             },
+            // 位置による参照は公開名から物理名への書き換えの影響を受けない（書き換え済みの
+            // 投影の出力列順が公開列順のまま）。
+            ordinal @ ScanOrderKey::Ordinal { .. } => ordinal,
         });
     }
     Ok((out, positions))
@@ -380,6 +384,9 @@ pub(crate) fn rewrite_aggregate(
             for key in &gb.order_by {
                 // 項目の実効名を指すキーだけ受理する（公開列を直接指すキーは物理名との対応が
                 // 項目名と曖昧になるため未対応）。
+                if key.ordinal.is_some() {
+                    continue;
+                }
                 if key.expr.is_some() || !effective_names.iter().any(|n| n == &key.target) {
                     return Err(unsupported_position());
                 }

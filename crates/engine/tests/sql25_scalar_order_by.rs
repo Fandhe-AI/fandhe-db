@@ -533,7 +533,7 @@ fn unsupported_order_by_forms_are_rejected_with_42601() {
     expect_sqlstate(
         &core,
         &ctx,
-        "SELECT id FROM docs ORDER BY 1 LIMIT 5",
+        "SELECT id FROM docs ORDER BY 1 + 0 LIMIT 5",
         "42601",
     );
     expect_sqlstate(&core, &ctx, "SELECT id FROM docs ORDER BY lang", "42601");

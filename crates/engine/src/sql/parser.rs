@@ -7456,6 +7456,12 @@ pub(crate) fn bind_aggregate_with_dummy_flags(
             dummy_equality_flags,
         )?;
 
+    // SQL-56 (2): 序数キーが集計式の項目を指す場合に式を行ビューへ束縛し直すための材料
+    // （`(SELECT リスト上の位置, 式, 内部集計項目の添字)`）。
+    let projection_expr_refs: Vec<(usize, &Expr, &[usize])> = pending_exprs
+        .iter()
+        .map(|p| (p.position, p.expr, p.hidden_items.as_slice()))
+        .collect();
     let group_by = match stmt.group_by() {
         None => None,
         Some(clause) => Some(bind_group_by_clause(
@@ -7463,6 +7469,8 @@ pub(crate) fn bind_aggregate_with_dummy_flags(
             schema,
             &items,
             &group_key_aliases,
+            &projection,
+            &projection_expr_refs,
             udfs,
             &mut node_budget,
         )?),
@@ -7738,28 +7746,7 @@ fn bind_scalar_order_by(
     let mut bound = Vec::new();
     for key in order_by {
         if let Some(index) = schema.columns.iter().position(|c| c.name == key.column) {
-            let column = schema
-                .columns
-                .get(index)
-                .ok_or_else(|| SqlSurfaceError::Internal {
-                    detail: "order key column index out of range".to_string(),
-                })?;
-            let kind = resolve_order_kind(&column.ty).ok_or_else(|| {
-                SqlSurfaceError::invalid_input(format!(
-                    "unsupported ORDER BY column type: {}",
-                    key.column
-                ))
-            })?;
-            let collation = crate::collation::Collation::effective(None, column.collation);
-            // ICU 照合の比較器が使えない場合は実行時ではなく束縛時に `XX000` で拒否する。
-            collation.ensure_available()?;
-            bound.push(BoundOrderKey {
-                target: BoundOrderTarget::Column(index),
-                kind,
-                descending: key.descending,
-                nulls: NullPlacement::pg_default(key.descending),
-                collation,
-            });
+            bound.push(bind_order_column_at(schema, index, key.descending)?);
             continue;
         }
         if key.column == "id" && schema.has_pseudo_id() {
@@ -7775,6 +7762,34 @@ fn bind_scalar_order_by(
         return Err(SqlSurfaceError::undefined_column(&key.column));
     }
     Ok(bound)
+}
+
+/// スキーマの列 `index` を並べ替えキーへ束縛する（名前解決後の共通部。[`bind_scalar_order_by`] と
+/// 序数キー〔SQL-56 (2)・Issue #1792〕が共有する）。並べ替え不能な型は `22000`。
+fn bind_order_column_at(
+    schema: &TableSchema,
+    index: usize,
+    descending: bool,
+) -> Result<BoundOrderKey, SqlSurfaceError> {
+    let column = schema
+        .columns
+        .get(index)
+        .ok_or_else(|| SqlSurfaceError::Internal {
+            detail: "order key column index out of range".to_string(),
+        })?;
+    let kind = resolve_order_kind(&column.ty).ok_or_else(|| {
+        SqlSurfaceError::invalid_input(format!("unsupported ORDER BY column type: {}", column.name))
+    })?;
+    let collation = crate::collation::Collation::effective(None, column.collation);
+    // ICU 照合の比較器が使えない場合は実行時ではなく束縛時に `XX000` で拒否する。
+    collation.ensure_available()?;
+    Ok(BoundOrderKey {
+        target: BoundOrderTarget::Column(index),
+        kind,
+        descending,
+        nulls: NullPlacement::pg_default(descending),
+        collation,
+    })
 }
 
 /// 式キーの静的型から比較規約を決める（Issue #1188）。`VECTOR` 値の式は VECTOR 列を
@@ -7826,6 +7841,11 @@ enum ResolvedScanOrderKey<'a> {
         ty: crate::sql::udf_call::ExprType,
         descending: bool,
     },
+    /// 序数が出力列の実列（`ProjectedColumn::Column`）を指す（SQL-56 (2)・Issue #1792）。
+    /// 名前で引き直すと別名・疑似列 `id` との衝突で別の列を指しうるため、添字で束縛する。
+    ColumnIndex { index: usize, descending: bool },
+    /// 序数が疑似列 `id`（別名付きを含む）の出力列を指す。
+    Id { descending: bool },
 }
 
 /// 式キーを含む広域取得 `ORDER BY`（[`crate::sql::allowlist::ScanOrderKey`]）を束縛する
@@ -7939,7 +7959,43 @@ fn bind_scan_order_keys(
                     });
                     exprs.push((be, program));
                 }
+                // 序数は `resolve_scan_order_aliases` が `ColumnIndex`／`Id`／`ProjectedExpr` へ
+                // 解決済み。ここへ届くのは構築側の不変条件違反（fail-closed）。
+                ScanOrderKey::Ordinal { .. } => {
+                    return Err(SqlSurfaceError::Internal {
+                        detail: "unresolved ORDER BY position".to_string(),
+                    });
+                }
             },
+            ResolvedScanOrderKey::ColumnIndex { index, descending } => {
+                // jsonb 列は裸の列キーと同じく式キー（列参照）として登録する（Issue #1597）。
+                if matches!(
+                    schema.columns.get(*index).map(|c| &c.ty),
+                    Some(ColumnType::Jsonb)
+                ) {
+                    let be = crate::sql::udf_call::BoundExpr::JsonbColumnRef { index: *index };
+                    let program = crate::sql::expr_program::ExprProgram::compile(&be);
+                    bound.push(BoundOrderKey {
+                        target: BoundOrderTarget::Expr(exprs.len()),
+                        kind: OrderKind::Jsonb,
+                        descending: *descending,
+                        nulls: NullPlacement::pg_default(*descending),
+                        collation: crate::collation::Collation::DEFAULT,
+                    });
+                    exprs.push((be, program));
+                } else {
+                    bound.push(bind_order_column_at(schema, *index, *descending)?);
+                }
+            }
+            ResolvedScanOrderKey::Id { descending } => {
+                bound.push(BoundOrderKey {
+                    target: BoundOrderTarget::Id,
+                    kind: OrderKind::Id,
+                    descending: *descending,
+                    nulls: NullPlacement::pg_default(*descending),
+                    collation: crate::collation::Collation::DEFAULT,
+                });
+            }
             ResolvedScanOrderKey::ProjectedExpr {
                 expr,
                 ty,
@@ -7980,12 +8036,21 @@ fn resolve_scan_order_aliases<'a>(
     projection: &Projection,
     bound_projection: &[ProjectedColumn],
     keys: Vec<std::borrow::Cow<'a, crate::sql::allowlist::ScanOrderKey>>,
-    has_windows: bool,
+    windows: &[crate::sql::allowlist::WindowSelectItem],
     physical_keys: &[usize],
 ) -> Result<Vec<ResolvedScanOrderKey<'a>>, SqlSurfaceError> {
     use crate::sql::allowlist::{ScalarOrderKey, ScanOrderKey, SelectItem};
-    let Projection::Items(items) = projection else {
-        return Ok(keys.into_iter().map(ResolvedScanOrderKey::Plain).collect());
+    let has_windows = !windows.is_empty();
+    let has_ordinal = keys
+        .iter()
+        .any(|k| matches!(k.as_ref(), ScanOrderKey::Ordinal { .. }));
+    let items: &[SelectItem] = match projection {
+        Projection::Items(items) => items,
+        _ if !has_ordinal => {
+            return Ok(keys.into_iter().map(ResolvedScanOrderKey::Plain).collect());
+        }
+        // 序数だけは `*`・列リストでも解決する（別名解決の対象項目は無い）。
+        _ => &[],
     };
     // 出力名の対象: 基底列名（列・`id`）か、束縛済み投影の式項目。
     enum Target<'e> {
@@ -8021,6 +8086,19 @@ fn resolve_scan_order_aliases<'a>(
 
     let mut resolved = Vec::with_capacity(keys.len());
     for (key_pos, key) in keys.into_iter().enumerate() {
+        if let ScanOrderKey::Ordinal {
+            position,
+            descending,
+        } = key.as_ref()
+        {
+            resolved.push(resolve_order_ordinal(
+                *position,
+                *descending,
+                bound_projection,
+                windows,
+            )?);
+            continue;
+        }
         let ScanOrderKey::Column(k) = key.as_ref() else {
             resolved.push(ResolvedScanOrderKey::Plain(key));
             continue;
@@ -8081,6 +8159,60 @@ fn resolve_scan_order_aliases<'a>(
         }
     }
     Ok(resolved)
+}
+
+/// 序数キー（`ORDER BY <n>`。SQL-56 (2)・Issue #1792）を出力列の位置から束縛先へ解決する。
+///
+/// 出力列の並び（RowDescription の並び）は「束縛済み投影 `bound_projection` の項目」に
+/// 「ウィンドウ項目 `windows`（SELECT リスト上の位置 `position` を持つ）」を差し込んだもの。
+/// `1..=出力列数` の外（`0`・負・超過）は `42P10`。可否は文とスキーマだけで決まり、行の内容・
+/// テナントに依存しない。ウィンドウ項目の位置は並べ替えに使えず（値が走査後に確定する）
+/// `42601`、式の項目は別名参照と同じく束縛済み投影の式を再利用し、ウィンドウ併用時は
+/// 式キーと同じ規則で `42601`。
+fn resolve_order_ordinal<'a>(
+    position: i64,
+    descending: bool,
+    bound_projection: &[ProjectedColumn],
+    windows: &[crate::sql::allowlist::WindowSelectItem],
+) -> Result<ResolvedScanOrderKey<'a>, SqlSurfaceError> {
+    let out_of_range = || SqlSurfaceError::OrderByPositionNotInSelectList { position };
+    let total = bound_projection.len().saturating_add(windows.len());
+    let out_index = usize::try_from(position)
+        .ok()
+        .filter(|p| *p >= 1 && *p <= total)
+        .map(|p| p - 1)
+        .ok_or_else(out_of_range)?;
+    if windows.iter().any(|w| w.position == out_index) {
+        return Err(SqlSurfaceError::unsupported(
+            "ORDER BY cannot reference a window function alias",
+        ));
+    }
+    let before = windows.iter().filter(|w| w.position < out_index).count();
+    let plain_index = out_index.checked_sub(before).ok_or_else(out_of_range)?;
+    match bound_projection.get(plain_index) {
+        Some(ProjectedColumn::Column { index, .. }) => Ok(ResolvedScanOrderKey::ColumnIndex {
+            index: *index,
+            descending,
+        }),
+        Some(ProjectedColumn::Id | ProjectedColumn::AliasedId { .. }) => {
+            Ok(ResolvedScanOrderKey::Id { descending })
+        }
+        Some(ProjectedColumn::Computed { expr, ty, .. }) => {
+            if !windows.is_empty() {
+                return Err(SqlSurfaceError::unsupported(
+                    "expression ORDER BY keys are not supported with window functions",
+                ));
+            }
+            Ok(ResolvedScanOrderKey::ProjectedExpr {
+                expr: expr.clone(),
+                ty: *ty,
+                descending,
+            })
+        }
+        None => Err(SqlSurfaceError::Internal {
+            detail: "ORDER BY position does not map to a projected column".to_string(),
+        }),
+    }
 }
 
 impl BoundScan {
@@ -8613,10 +8745,19 @@ pub(crate) fn bind_scan_with_dummy_flags(
         // Issue #1189: 文全体の ORDER BY がウィンドウ別名を参照する形も同じ理由
         // （ウィンドウ値は base scan の並べ替えより後に確定する）で 42601。
         // 実在列・疑似列 `id` が同名なら列参照として解釈する。
-        for key in stmt.order_by() {
-            if window_aliases.contains(key.column.as_str())
-                && !(key.column == "id" && schema.has_pseudo_id())
-                && !schema.columns.iter().any(|c| c.name == key.column)
+        // 序数・式キーが混在すると `order_by` は空で `order_keys` が正本になるため、
+        // 両方から素の列キー名を集めて検査する。
+        let mut order_key_names: Vec<&str> =
+            stmt.order_by().iter().map(|k| k.column.as_str()).collect();
+        for key in &stmt.order_keys {
+            if let crate::sql::allowlist::ScanOrderKey::Column(k) = key {
+                order_key_names.push(k.column.as_str());
+            }
+        }
+        for name in order_key_names {
+            if window_aliases.contains(name)
+                && !(name == "id" && schema.has_pseudo_id())
+                && !schema.columns.iter().any(|c| c.name == name)
             {
                 return Err(SqlSurfaceError::unsupported(
                     "ORDER BY cannot reference a window function alias",
@@ -8673,7 +8814,7 @@ pub(crate) fn bind_scan_with_dummy_flags(
         stmt.projection(),
         &projection,
         raw_keys,
-        !stmt.window_items.is_empty(),
+        &stmt.window_items,
         &stmt.physical_order_keys,
     )?;
     let (order_by, order_exprs) =
@@ -8851,11 +8992,14 @@ fn resolve_group_reference<S: AsRef<str>>(
 /// codex-review P1 指摘対応）。複数キーに一致する識別子（例: 2 つのキーへ同じ
 /// 別名を付けた場合）・キーと集計項目の双方に一致する識別子はいずれも曖昧
 /// として `22000` で拒否する（§計画 3.2）。
+#[allow(clippy::too_many_arguments)]
 fn bind_group_by_clause(
     clause: &crate::sql::allowlist::GroupByClause,
     schema: &TableSchema,
     items: &[BoundAggregateItem],
     group_key_aliases: &[(usize, String)],
+    projection: &[ProjectionColumn],
+    projection_exprs: &[(usize, &Expr, &[usize])],
     udfs: &crate::sql::udf_call::UdfRegistry,
     node_budget: &mut usize,
 ) -> Result<BoundGroupBy, SqlSurfaceError> {
@@ -8912,6 +9056,7 @@ fn bind_group_by_clause(
     // 解決してから合成列名へ置換するため、`id` 等の疑似列やベースの列が黙って参照される
     // ことはない。
     let view_schema = group_row_schema(schema, &keys, items, false);
+    let precise_view_schema = group_row_schema(schema, &keys, items, true);
     let mut group_row_mask = vec![false; keys.len().saturating_add(items.len())];
     let mut having_exprs = Vec::with_capacity(clause.having_exprs.len());
     for pred in &clause.having_exprs {
@@ -8934,9 +9079,90 @@ fn bind_group_by_clause(
     let mut order_by = Vec::with_capacity(clause.order_by.len());
     let mut order_exprs = Vec::new();
     for ob in &clause.order_by {
-        let target = match &ob.expr {
-            None => {
-                let target = resolve_target(&ob.target)?;
+        let target = match (&ob.expr, ob.ordinal) {
+            (None, ordinal) => {
+                let target = match ordinal {
+                    None => resolve_target(&ob.target)?,
+                    Some(position) => {
+                        // SQL-56 (2)・Issue #1792: 序数は SELECT リストの出力列（`projection` の
+                        // 宣言順）の位置。範囲外は `42P10`（文だけで決まり行内容に依存しない）。
+                        let out_index = usize::try_from(position)
+                            .ok()
+                            .filter(|p| *p >= 1 && *p <= projection.len())
+                            .map(|p| p - 1)
+                            .ok_or(SqlSurfaceError::OrderByPositionNotInSelectList { position })?;
+                        if let Some((_, expr, hidden)) =
+                            projection_exprs.iter().find(|(pos, ..)| *pos == out_index)
+                        {
+                            // 集計式の項目（Issue #1541）は式キーと同じ経路で、式を行ビューへ
+                            // 束縛し直して並べる（識別子は集計呼び出しの内部名・`GROUP BY` 列名のみ）。
+                            let resolve_item =
+                                |name: &str| -> Result<OrderTarget, SqlSurfaceError> {
+                                    if let Some(j) =
+                                        crate::sql::allowlist::aggregate_placeholder_index(name)
+                                    {
+                                        return hidden
+                                            .get(j)
+                                            .map(|idx| OrderTarget::Aggregate(*idx))
+                                            .ok_or_else(|| {
+                                                crate::sql::aggregate::accumulator_bug(
+                                                    "aggregate placeholder out of range",
+                                                )
+                                            });
+                                    }
+                                    clause
+                                    .columns
+                                    .iter()
+                                    .position(|c| c == name)
+                                    .map(OrderTarget::GroupKey)
+                                    .ok_or_else(|| {
+                                        crate::sql::aggregate::accumulator_bug(
+                                            "aggregate expression column does not match a GROUP BY column",
+                                        )
+                                    })
+                                };
+                            let rewritten = rewrite_group_row_idents(expr, &resolve_item)?;
+                            // 投影側と同じ精密な行スキーマ・束縛（整数除算等を保つ）で評価し、
+                            // 序数キーの順序を出力列の値と一致させる（Issue #1792 レビュー指摘）。
+                            let (bound, ty, _) =
+                                crate::sql::udf_call::bind_aggregate_projection_expr_top(
+                                    &rewritten,
+                                    &precise_view_schema,
+                                    udfs,
+                                    node_budget,
+                                )?;
+                            let kind = order_kind_for_expr_type(ty)?;
+                            crate::sql::udf_call::mark_referenced_scalar_columns(
+                                &bound,
+                                &mut group_row_mask,
+                            );
+                            order_exprs.push((
+                                crate::sql::expr_program::ExprProgram::compile(&bound),
+                                kind,
+                            ));
+                            order_by.push(BoundOrderBy {
+                                target: OrderTarget::Expr(order_exprs.len() - 1),
+                                descending: ob.descending,
+                                nulls: NullPlacement::pg_default(ob.descending),
+                            });
+                            continue;
+                        }
+                        match projection.get(out_index) {
+                            Some(ProjectionColumn::GroupKey { key_index, .. }) => {
+                                OrderTarget::GroupKey(*key_index)
+                            }
+                            Some(ProjectionColumn::Aggregate { item_index, .. }) => {
+                                OrderTarget::Aggregate(*item_index)
+                            }
+                            _ => {
+                                return Err(SqlSurfaceError::Internal {
+                                    detail: "ORDER BY position does not map to an output column"
+                                        .to_string(),
+                                });
+                            }
+                        }
+                    }
+                };
                 // 集計結果（`Cell`）の ORDER BY は項目の照合を運ばずバイト列順で比較するため、
                 // 非バイト列順の照合の MIN/MAX は `0A000` で拒否する（TABLE-28・Issue #2190）。
                 if let OrderTarget::Aggregate(idx) = target {
@@ -8952,7 +9178,7 @@ fn bind_group_by_clause(
                 }
                 target
             }
-            Some(expr) => {
+            (Some(expr), _) => {
                 let rewritten = rewrite_group_row_idents(expr, &resolve_target)?;
                 let (bound, ty) =
                     crate::sql::udf_call::bind_expr(&rewritten, &view_schema, udfs, node_budget)?;

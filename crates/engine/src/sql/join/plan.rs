@@ -830,6 +830,20 @@ pub(super) fn build_plan<'a>(
     })
 }
 
+/// 解決済みの列から非集計 JOIN の並べ替えキーを作る（列キー・序数キー共通。並べ替え不能な型は `22000`）。
+fn plain_order_for(c: &Col, descending: bool) -> Result<PlainOrder, SqlSurfaceError> {
+    let class = cmp_class(c.ty.as_ref()).ok_or_else(|| {
+        SqlSurfaceError::invalid_input(format!("unsupported ORDER BY column type: {}", c.name))
+    })?;
+    Ok(PlainOrder {
+        rel: c.rel,
+        pos: c.pos,
+        class,
+        descending,
+        nulls: NullPlacement::pg_default(descending),
+    })
+}
+
 fn build_plain_shape(
     validated: &ValidatedJoin,
     b: &mut Binder<'_, '_>,
@@ -881,6 +895,61 @@ fn build_plain_shape(
     }
     let mut order: Vec<PlainOrder> = Vec::with_capacity(validated.order_by.len());
     for key in &validated.order_by {
+        // SQL-56 (2)・Issue #1792: 序数は出力列（`*` 展開後・SELECT リスト順）の位置。
+        // 範囲外は `42P10`（文とスキーマだけで決まり、行の内容に依存しない）。
+        if let Some(position) = key.ordinal {
+            let out_index = usize::try_from(position)
+                .ok()
+                .filter(|p| *p >= 1 && *p <= output.len())
+                .map(|p| p - 1)
+                .ok_or(SqlSurfaceError::OrderByPositionNotInSelectList { position })?;
+            let (rel, slot, ty) = match &validated.projection {
+                JoinProjection::Columns(colrefs) => {
+                    let colref =
+                        colrefs
+                            .get(out_index)
+                            .ok_or_else(|| SqlSurfaceError::Internal {
+                                detail: "JOIN ORDER BY position out of range".to_string(),
+                            })?;
+                    let c = b.col(colref)?;
+                    order.push(plain_order_for(&c, key.descending)?);
+                    continue;
+                }
+                JoinProjection::All => {
+                    // `*` は関係ごとに `id`（従来方式の表のみ）＋宣言列の順に展開済み。
+                    let mut remaining = out_index;
+                    let mut found = None;
+                    for (rel, schema) in b.schemas.iter().enumerate() {
+                        let width = usize::from(schema.has_pseudo_id())
+                            .saturating_add(schema.columns.len());
+                        if remaining < width {
+                            found = Some((rel, *schema, remaining));
+                            break;
+                        }
+                        remaining -= width;
+                    }
+                    let (rel, schema, local) = found.ok_or_else(|| SqlSurfaceError::Internal {
+                        detail: "JOIN ORDER BY position out of range".to_string(),
+                    })?;
+                    if schema.has_pseudo_id() && local == 0 {
+                        (rel, ColumnSlot::Id, None)
+                    } else {
+                        let idx = local - usize::from(schema.has_pseudo_id());
+                        let def =
+                            schema
+                                .columns
+                                .get(idx)
+                                .ok_or_else(|| SqlSurfaceError::Internal {
+                                    detail: "JOIN ORDER BY position out of range".to_string(),
+                                })?;
+                        (rel, ColumnSlot::Column(idx), Some(def.ty.clone()))
+                    }
+                }
+            };
+            let c = b.col_from(rel, slot, ty.as_ref())?;
+            order.push(plain_order_for(&c, key.descending)?);
+            continue;
+        }
         // 非修飾の ORDER BY 対象が SELECT リストの別名に一致するときは、PostgreSQL と
         // 同じく出力列（別名の指す列）を優先する。実在列の同名があっても別名側を採る。
         let target = match (&validated.projection, key.target.qualifier()) {
@@ -1077,6 +1146,29 @@ fn build_aggregate_shape(
     // ORDER BY: GROUP BY キー（修飾／非修飾／別名）か集計項目名。
     let mut order: Vec<AggOrder> = Vec::with_capacity(validated.order_by.len());
     for key in &validated.order_by {
+        // SQL-56 (2)・Issue #1792: 序数は SELECT リスト（`out`）の位置。範囲外は `42P10`。
+        if let Some(position) = key.ordinal {
+            let out_index = usize::try_from(position)
+                .ok()
+                .filter(|p| *p >= 1 && *p <= out.len())
+                .map(|p| p - 1)
+                .ok_or(SqlSurfaceError::OrderByPositionNotInSelectList { position })?;
+            let target = match out.get(out_index) {
+                Some(AggOut::Key(k)) => AggOrderTarget::Key(*k),
+                Some(AggOut::Item(i)) => AggOrderTarget::Item(*i),
+                None => {
+                    return Err(SqlSurfaceError::Internal {
+                        detail: "JOIN ORDER BY position out of range".to_string(),
+                    })
+                }
+            };
+            order.push(AggOrder {
+                target,
+                descending: key.descending,
+                nulls: NullPlacement::pg_default(key.descending),
+            });
+            continue;
+        }
         let target = &key.target;
         // 非修飾名は、非集計 JOIN 経路と同じく SELECT の出力名（キー別名・集計項目名）を
         // 実在列より優先する。一致が無い場合と修飾名は列参照として解決し、束縛エラー
