@@ -2808,8 +2808,9 @@ pub struct ValidatedJoin {
 /// 既存の [`SetValue`] のまま運ぶ。
 #[derive(Debug, Clone, PartialEq)]
 pub enum DmlFromSetValue {
-    /// リテラル・`DEFAULT`・対象表の列だけを使う式。
-    Value(SetValue),
+    /// リテラル・`DEFAULT`・対象表の列だけを使う式。第 2 要素は式中に非修飾で書かれた識別子名
+    /// （曖昧性検査〔`42702`〕の対象。対象表修飾つきの列は含まない）。
+    Value(SetValue, Vec<String>),
     /// 列参照 1 個（`SET a = t.b` / `SET a = b`）。
     Column(ColumnRef),
 }
@@ -4944,6 +4945,11 @@ struct Parser<'a> {
     /// （SQL-53 (b)、Issue #1754）。式中の修飾列参照のうち対象表の公開名で修飾されたものだけを非修飾へ
     /// 正規化し、FROM 側の表を指す修飾は `0A000`（FROM 表の列を使う式は #1755 以降）にする。
     dml_from_target: Option<String>,
+    /// [`Self::dml_from_target`] が `Some` の間に、実際に非修飾で書かれた識別子の名前を集める
+    /// （Issue #1754 レビュー対応）。対象表修飾つき列（`t.col`）は束縛まで修飾情報を保てないため
+    /// 非修飾の `Expr::Ident` へ正規化するが、曖昧性検査（`42702`）は非修飾で書かれた名前にだけ
+    /// 適用する必要があり、その区別をここで運ぶ。
+    dml_from_unqualified: Vec<String>,
 }
 
 /// WHERE の式述語 1 葉の解析結果（[`Parser::parse_expression_predicate`]）。`<>` は式の AST に
@@ -5008,6 +5014,7 @@ impl<'a> Parser<'a> {
             agg_slots_used: 0,
             upsert_table: None,
             dml_from_target: None,
+            dml_from_unqualified: Vec::new(),
             legacy_implicit_id: false,
         }
     }
@@ -8047,6 +8054,9 @@ impl<'a> Parser<'a> {
                     self.parse_call_expr(name, depth)
                 } else {
                     self.consume_expr_node()?;
+                    if self.dml_from_target.is_some() {
+                        self.dml_from_unqualified.push(name.clone());
+                    }
                     Ok(Expr::Ident(name))
                 }
             }
@@ -10579,6 +10589,56 @@ impl<'a> Parser<'a> {
             ));
         }
         Ok(Some(projection))
+    }
+
+    /// FROM／USING つき UPDATE／DELETE 専用の `RETURNING` 句（Issue #1756・SQL-53 のポインタ）。
+    /// `*`・`<公開名>.*`・列参照（修飾あり・なし）の並びだけを受理し、式・関数呼び出し・
+    /// `AS` 別名は従来の `RETURNING` と同じく `42601`（受理範囲を従来より広げない）。
+    /// FROM／USING の構文本体（#1754）が結線されるまで呼び出し元は無い
+    /// （`sql::dml_from_returning` が束縛する）。
+    #[allow(dead_code)]
+    pub(crate) fn parse_dml_from_returning_clause(
+        &mut self,
+    ) -> Result<Option<crate::sql::dml_from_returning::DmlFromReturning>, SqlSurfaceError> {
+        use crate::sql::dml_from_returning::{
+            DmlFromReturning, DmlFromReturningItem, MAX_DML_FROM_RETURNING_ITEMS,
+        };
+        if !self.peek_contextual_keyword("RETURNING") {
+            return Ok(None);
+        }
+        self.advance();
+        let mut items: Vec<DmlFromReturningItem> = Vec::new();
+        loop {
+            if items.len() >= MAX_DML_FROM_RETURNING_ITEMS {
+                return Err(SqlSurfaceError::payload_too_large(
+                    "too many RETURNING items",
+                ));
+            }
+            let item = match self.peek() {
+                Some(Token::Punct('*')) => {
+                    self.advance();
+                    DmlFromReturningItem::All
+                }
+                Some(Token::QualifiedStar { qualifier }) => {
+                    let qualifier = qualifier.clone();
+                    self.advance();
+                    DmlFromReturningItem::QualifiedAll(qualifier)
+                }
+                _ => DmlFromReturningItem::Column(self.parse_join_colref()?),
+            };
+            if self.peek_ident_matches("AS") || matches!(self.peek(), Some(Token::Punct('('))) {
+                return Err(SqlSurfaceError::unsupported(
+                    "RETURNING does not support aliases or function-call items",
+                ));
+            }
+            items.push(item);
+            if matches!(self.peek(), Some(Token::Punct(','))) {
+                self.advance();
+                continue;
+            }
+            break;
+        }
+        Ok(Some(DmlFromReturning { items }))
     }
 
     /// 文末専用句 `PARTITIONED [CHUNK <n>]`（Issue #1129・SQL-19）の構造パース。
@@ -16278,27 +16338,28 @@ pub(crate) fn looks_like_update_from(tokens: &[Token]) -> bool {
 pub(crate) fn looks_like_delete_using(tokens: &[Token]) -> bool {
     if !matches!(tokens.first(), Some(Token::Ident(w)) if w.eq_ignore_ascii_case("DELETE"))
         || !matches!(tokens.get(1), Some(Token::Keyword(Keyword::From)))
+        || !matches!(tokens.get(2), Some(Token::Ident(_)))
     {
         return false;
     }
-    let mut depth: i32 = 0;
-    for (i, tok) in tokens.iter().enumerate() {
-        match tok {
-            Token::Punct('(') => depth = depth.saturating_add(1),
-            Token::Punct(')') => depth = depth.saturating_sub(1),
-            Token::Ident(w) if depth == 0 && w.eq_ignore_ascii_case("USING") => {
-                let next_is_op_id = matches!(
-                    tokens.get(i.saturating_add(1)),
-                    Some(Token::Ident(n)) if n.eq_ignore_ascii_case("OPERATION_ID")
-                );
-                if !next_is_op_id {
-                    return true;
-                }
-            }
-            _ => {}
-        }
+    // `USING` は予約語ではなく識別子のため、対象表名（位置 2）と `[AS] <別名>` の直後の位置だけを
+    // USING 節として検出する。表名・列名が `using` の単一表 DELETE を誤ってルーティングしない。
+    let is_using =
+        |t: Option<&Token>| matches!(t, Some(Token::Ident(w)) if w.eq_ignore_ascii_case("USING"));
+    let mut pos: usize = 3;
+    if matches!(tokens.get(pos), Some(Token::Ident(w)) if w.eq_ignore_ascii_case("AS")) {
+        pos = pos.saturating_add(2);
+    } else if matches!(tokens.get(pos), Some(Token::Ident(w)) if !is_dml_target_reserved_word(w)) {
+        pos = pos.saturating_add(1);
     }
-    false
+    if !is_using(tokens.get(pos)) {
+        return false;
+    }
+    // `USING OPERATION_ID` は operation_id 句であり USING 表リストではない。
+    !matches!(
+        tokens.get(pos.saturating_add(1)),
+        Some(Token::Ident(n)) if n.eq_ignore_ascii_case("OPERATION_ID")
+    )
 }
 
 /// `UPDATE ... FROM`／`DELETE ... USING` 専用の `Parser` ヘルパー（SQL-53 (b)、Issue #1754）。
@@ -16413,7 +16474,9 @@ impl<'a> Parser<'a> {
         let value = if self.peek_set_rhs_single_column() {
             DmlFromSetValue::Column(self.parse_join_colref()?)
         } else {
-            DmlFromSetValue::Value(self.parse_update_set_rhs()?)
+            self.dml_from_unqualified.clear();
+            let v = self.parse_update_set_rhs()?;
+            DmlFromSetValue::Value(v, std::mem::take(&mut self.dml_from_unqualified))
         };
         out.push((column, value));
         Ok(())
@@ -21413,6 +21476,18 @@ mod tests {
             "DELETE FROM a USING operation_id"
         )));
         assert!(!looks_like_delete_using(&t("UPDATE a SET x = 1 FROM b")));
+        // Issue #1754 レビュー対応: `using` という名前の表・列を持つ単一表 DELETE は従来どおり。
+        assert!(!looks_like_delete_using(&t(
+            "DELETE FROM using WHERE id = 1"
+        )));
+        assert!(!looks_like_delete_using(&t(
+            "DELETE FROM t WHERE using = 1"
+        )));
+        assert!(!looks_like_delete_using(&t(
+            "DELETE FROM t d WHERE using = 1"
+        )));
+        assert!(looks_like_delete_using(&t("DELETE FROM using USING b")));
+        assert!(looks_like_delete_using(&t("DELETE FROM a AS d USING b")));
     }
 
     /// SQL-53 (b)・Issue #1754: 構文段の受理形と拒否コード（カタログに触れない解析器単体）。
@@ -21443,6 +21518,40 @@ mod tests {
             ("DELETE FROM a USING b PARTITIONED", "42601"),
         ] {
             assert_eq!(ok(sql).expect_err(sql).wire_code(), code, "{sql}");
+        }
+    }
+
+    /// SQL-53・Issue #1756: FROM／USING つき DML の RETURNING は `*`・`t.*`・列参照だけを受理する。
+    #[test]
+    fn dml_from_returning_clause_accepts_star_and_column_refs_only() {
+        use super::*;
+        use crate::sql::dml_from_returning::DmlFromReturningItem;
+        let parse = |sql: &str| {
+            let toks = crate::sql::lexer::tokenize(sql).expect("lex");
+            Parser::new(&toks).parse_dml_from_returning_clause()
+        };
+        let ok = parse("RETURNING *, t.*, a, s.b")
+            .expect("accepted")
+            .expect("present");
+        assert_eq!(ok.items.len(), 4);
+        assert_eq!(ok.items[0], DmlFromReturningItem::All);
+        assert_eq!(
+            ok.items[1],
+            DmlFromReturningItem::QualifiedAll("t".to_string())
+        );
+        assert!(parse("").expect("empty").is_none());
+        for bad in [
+            "RETURNING a AS x",
+            "RETURNING lower(a)",
+            "RETURNING a + 1",
+            "RETURNING",
+        ] {
+            let tokens = crate::sql::lexer::tokenize(bad).expect("lex");
+            let mut p = Parser::new(&tokens);
+            let res = p
+                .parse_dml_from_returning_clause()
+                .and_then(|r| p.expect_end_of_statement().map(|_| r));
+            assert!(res.is_err(), "must reject: {bad}");
         }
     }
 

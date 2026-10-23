@@ -185,13 +185,13 @@ fn check_set_target(name: &str, schema: &TableSchema) -> Result<usize, SqlSurfac
 /// 既存の式束縛（対象表のスキーマ）が未知列として扱う。
 fn check_set_expr_scope(
     scope: &BindingScope<'_>,
-    expr: &crate::sql::udf_call::Expr,
+    unqualified: &[String],
 ) -> Result<(), SqlSurfaceError> {
-    let mut idents: HashSet<String> = HashSet::new();
-    crate::sql::parser::collect_expr_idents(expr, &mut idents);
-    let mut names: Vec<String> = idents.into_iter().collect();
-    // HashSet の走査順に依存せず、同じ入力には常に同じエラーを返す。
+    // 対象表修飾つきの列は構文段で非修飾へ正規化済みのため、実際に非修飾で書かれた名前
+    // （`unqualified`）だけを検査する。重複を除き、同じ入力には常に同じ順序・同じエラーを返す。
+    let mut names: Vec<String> = unqualified.to_vec();
     names.sort();
+    names.dedup();
     for name in names {
         match scope.resolve(&ColumnRef::unqualified(name)) {
             Ok(r) if r.relation() == 0 => {}
@@ -246,9 +246,9 @@ pub fn bind_update_from(
                 }
                 set_columns.push((idx, resolved));
             }
-            DmlFromSetValue::Value(v) => {
-                if let SetValue::Expr(expr) = v {
-                    check_set_expr_scope(&scope, expr)?;
+            DmlFromSetValue::Value(v, unqualified) => {
+                if let SetValue::Expr(_) = v {
+                    check_set_expr_scope(&scope, unqualified)?;
                 }
                 plain.push((name.clone(), v.clone()));
             }

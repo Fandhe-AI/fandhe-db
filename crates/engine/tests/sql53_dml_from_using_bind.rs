@@ -99,6 +99,10 @@ const ACCEPTED: &[&str] = &[
     "UPDATE docs SET lang = 'x' FROM langs a, langs b WHERE docs.lang = a.lang AND a.lang = b.lang",
     // 対象表の列だけを使う式
     "UPDATE docs SET n = n + 1 FROM langs WHERE docs.lang = langs.lang",
+    // 対象表修飾つき列の式は両表に同名列があっても曖昧にならない（Issue #1754 レビュー対応）
+    "UPDATE docs SET lang = upper(docs.lang) FROM langs WHERE docs.lang = langs.lang",
+    "UPDATE docs SET n = docs.id + 1 FROM langs WHERE docs.lang = langs.lang",
+    "UPDATE docs SET lang = upper(docs.lang) FROM docs AS d2 WHERE docs.id = d2.id",
     "UPDATE docs SET lang = 'x' FROM langs WHERE docs.lang = langs.lang USING OPERATION_ID 'op-u1'",
     "UPDATE docs SET lang = 'x' FROM langs USING OPERATION_ID NULL",
     "UPDATE docs SET lang = 'x' FROM langs WHERE docs.lang = langs.lang;",
@@ -311,6 +315,44 @@ fn rejected_forms_fail_closed_with_expected_codes() {
         doc_rows(&core),
         run(&core, "SELECT id, lang FROM docs ORDER BY id LIMIT 10").expect("select")
     );
+}
+
+/// 非修飾で曖昧な式中の列は従来どおり `42702`（対象表修飾つきの列とは区別される）。
+#[test]
+fn unqualified_ambiguous_column_in_set_expr_is_still_42702() {
+    let (core, path) = new_core("sql53-from-set-amb", false);
+    let _g = CleanupGuard(path);
+    seed(&core);
+    assert_eq!(
+        code(run(
+            &core,
+            "UPDATE docs SET lang = upper(lang) FROM langs WHERE docs.lang = langs.lang"
+        )),
+        "42702"
+    );
+}
+
+/// `using` は予約語ではなく識別子。表名・列名が `using` の単一表 DELETE は FROM／USING 形へ
+/// 誤ルーティングされない（Issue #1754 レビュー対応）。
+#[test]
+fn identifier_named_using_is_not_routed_to_delete_using() {
+    // 表名が `using`（存在しない表）は単一表経路の 42P01（FROM／USING 経路の 42601 ではない）。
+    let (core0, path0) = new_core("sql53-from-using-table", false);
+    let _g0 = CleanupGuard(path0);
+    assert_eq!(
+        code(core0.parse_sql("DELETE FROM using WHERE id = 1")),
+        "42P01"
+    );
+    let (core, path) = new_core("sql53-from-using-ident", false);
+    let _g = CleanupGuard(path);
+    for sql in ["DELETE FROM docs WHERE using = 1"] {
+        // 単一表 DELETE（述語形）として構文解析できる。FROM／USING 経路なら別 variant になる。
+        let parsed = core.parse_sql(sql).expect("single-table delete parses");
+        assert!(
+            format!("{parsed:?}").starts_with("Delete(Predicate"),
+            "{sql}: {parsed:?}"
+        );
+    }
 }
 
 /// 既存の `DELETE ... USING OPERATION_ID`（`WHERE` 省略形）と単一表 DML は挙動を変えない。
