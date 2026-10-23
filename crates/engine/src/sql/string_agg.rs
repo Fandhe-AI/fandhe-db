@@ -44,9 +44,9 @@ pub(crate) const MAX_STRING_AGG_STATE_BYTES: usize = 16 * 1024 * 1024;
 /// `GROUP BY` 側の `MAX_TEXT_ACCUMULATOR_TOTAL_BYTES` と同じ規模。
 pub(crate) const MAX_STRING_AGG_STATEMENT_BYTES: usize = 16 * 1024 * 1024;
 
-/// 溜めた 1 件あたりの固定見積り（`Vec`・`String`・キー配列のヘッダ分。空文字列を大量に
-/// 溜める DoS を状態の大きさで有界にする）。
-const ENTRY_FIXED_BYTES: usize = 64;
+/// 溜めた 1 件あたりの固定領域（`Entry` 自体＝`String`/`Option<String>`/`Vec` のヘッダと、
+/// `Vec<Entry>` 内の 1 要素分。空文字列・NULL キーを大量に溜める DoS を状態の大きさで有界にする）。
+const ENTRY_FIXED_BYTES: usize = std::mem::size_of::<Entry>();
 
 /// 結果長の超過（固定の英語文言。値・列名・他テナントの情報を含めない）。
 const RESULT_TOO_LARGE_DETAIL: &str = "string_agg result exceeds the allowed size";
@@ -212,9 +212,12 @@ impl StringAggState {
         } else {
             None
         };
-        let mut key_bytes = 0usize;
+        // キー配列の固定領域（NULL キーを含む全スロット分）＋各キーのヒープ内容。
+        let mut key_bytes = keys
+            .len()
+            .saturating_mul(std::mem::size_of::<Option<OrderValue>>());
         for k in keys.iter().flatten() {
-            key_bytes = key_bytes.saturating_add(order_value_bytes(k));
+            key_bytes = key_bytes.saturating_add(order_value_heap_bytes(k));
         }
         let entry_bytes = ENTRY_FIXED_BYTES
             .checked_add(value.len())
@@ -446,11 +449,45 @@ fn canonical_pair(value: &str, delimiter: Option<&str>) -> Result<Vec<u8>, SqlSu
     Ok(key)
 }
 
-/// 溜めたキー値の大きさの見積り（ヒープを持つ variant は長さ、それ以外は固定 16）。
-fn order_value_bytes(v: &OrderValue) -> usize {
+/// 溜めたキー値のヒープ内容のバイト数（固定領域は呼び出し側が `size_of` で計上する）。
+fn order_value_heap_bytes(v: &OrderValue) -> usize {
     match v {
         OrderValue::Bytes(b) | OrderValue::JsonbKey(b) => b.len(),
         OrderValue::Collated { text, .. } => text.len(),
-        _ => 16,
+        _ => 0,
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// 空文字列の値と NULL キー複数でも、1 件ごとに `Entry` 自体とキー配列の固定領域が
+    /// 状態の予算へ計上され、`MAX_STRING_AGG_STATE_BYTES` で `54000` になる（SQL-57 (5)）。
+    #[test]
+    fn empty_values_with_null_keys_are_bounded_by_fixed_footprint() {
+        let mut st = StringAggState {
+            collect: true,
+            distinct: false,
+            specs: Vec::new(),
+            buf: String::new(),
+            has_value: false,
+            entries: Vec::new(),
+            entries_bytes: 0,
+            value_bytes: 0,
+            seen: HashSet::new(),
+            seen_bytes: 0,
+        };
+        let per_entry = ENTRY_FIXED_BYTES + 4 * std::mem::size_of::<Option<OrderValue>>();
+        let mut pushed = 0usize;
+        let err = loop {
+            match st.push_entry("", None, vec![None, None, None, None]) {
+                Ok(()) => pushed += 1,
+                Err(e) => break e,
+            }
+        };
+        assert_eq!(err.wire_code(), "54000");
+        assert_eq!(pushed, MAX_STRING_AGG_STATE_BYTES / per_entry);
+        assert!(st.text_len() <= MAX_STRING_AGG_STATE_BYTES);
     }
 }

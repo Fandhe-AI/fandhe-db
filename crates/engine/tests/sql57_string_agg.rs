@@ -589,6 +589,44 @@ fn result_length_limit_is_exact_and_independent_of_other_tenants() {
         "54000"
     );
 }
+
+/// `string_agg` と併用した `MIN`/`MAX(TEXT)` も文全体の 16 MiB 予算に含まれる
+/// （`string_agg` の保持量が 0 でも、事前に決めた予算が観測順に依らず全項目へ効く）。
+#[test]
+fn statement_budget_covers_min_max_text_alongside_string_agg() {
+    let (core, path) = build_core("sql57-stmt-minmax");
+    let _g = CleanupGuard(path);
+    let mins = |n: usize| (0..n).map(|_| "MIN(s)").collect::<Vec<_>>().join(", ");
+    // 3 MiB × 5 = 15 MiB は成功、6 項目（18 MiB）は 54000。
+    run(
+        &core,
+        &format!(
+            "SELECT string_agg(NULL, ','), {} FROM big WHERE g = 'three'",
+            mins(5)
+        ),
+    );
+    assert_eq!(
+        code_of(
+            &core,
+            &format!(
+                "SELECT string_agg(NULL, ','), {} FROM big WHERE g = 'three'",
+                mins(6)
+            )
+        ),
+        "54000"
+    );
+    assert_eq!(
+        code_of(
+            &core,
+            &format!(
+                "SELECT {}, string_agg(NULL, ',') FROM big WHERE g = 'three'",
+                mins(6)
+            )
+        ),
+        "54000"
+    );
+}
+
 /// NoSQL 表層の直接構築入口（`BoundAggregateItem::bind`）は `string_agg` を `42601` で拒否する
 /// （SQL-57 (6)。NoSQL は対象外。2 引数・内側 ORDER BY を表せない入口で黙って通さない）。
 #[test]

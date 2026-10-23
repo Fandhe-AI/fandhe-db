@@ -168,6 +168,21 @@ fn accumulate_text_budget(
     Ok(())
 }
 
+/// 単一行集計の文全体の TEXT 状態予算を、項目の構成から事前に決める（SQL-57）。
+/// `string_agg` が 1 項目でもあれば、観測順や `string_agg` の保持量に依らず全項目
+/// （`MIN`/`MAX(TEXT)` を含む）の累計へ [`crate::sql::string_agg::MAX_STRING_AGG_STATEMENT_BYTES`]
+/// を適用する（単一行集計の既定予算 1 GiB は項目 32 個 × 状態上限を許すため安全でない）。
+fn statement_text_budget(accumulators: &[Accumulator], max_result_bytes: usize) -> usize {
+    if accumulators
+        .iter()
+        .any(|a| matches!(a, Accumulator::StringAgg(_)))
+    {
+        max_result_bytes.min(crate::sql::string_agg::MAX_STRING_AGG_STATEMENT_BYTES)
+    } else {
+        max_result_bytes
+    }
+}
+
 /// `Accumulator::observe` 1 回分の呼び出しと、`MIN`/`MAX(<TEXT 列>)`・
 /// `COUNT(DISTINCT)`（SQL-25 (c)・TASK-209）の両方の累計予算判定をまとめた
 /// 薄いヘルパ。`sql::aggregate` 内の 3 つの observe 呼び出し箇所
@@ -194,18 +209,11 @@ fn observe_with_budgets(
     let (entries_before, bytes_before) = accumulator.distinct_footprint();
     accumulator.observe(input, id, vector, scanned, scratch)?;
     let text_after = accumulator.text_len();
-    // SQL-57: `string_agg` の状態は文全体で 16 MiB に頭打ちにする（単一行集計の既定予算 1 GiB は
-    // 項目 32 個 × 状態上限を許してしまい安全な既定値ではない）。
-    let effective_max = if matches!(accumulator, Accumulator::StringAgg(_)) {
-        max_result_bytes.min(crate::sql::string_agg::MAX_STRING_AGG_STATEMENT_BYTES)
-    } else {
-        max_result_bytes
-    };
     accumulate_text_budget(
         text_before,
         text_after,
         total_text_accumulator_bytes,
-        effective_max,
+        max_result_bytes,
     )?;
     let (entries_after, bytes_after) = accumulator.distinct_footprint();
     if entries_after > entries_before {
@@ -2397,6 +2405,7 @@ pub(crate) fn execute_aggregate_with_group_limits(
     for item in &bound.items {
         accumulators.push(Accumulator::for_item(item)?);
     }
+    let max_result_bytes = statement_text_budget(&accumulators, max_result_bytes);
     // SQL-25 (c)・TASK-209: `COUNT(DISTINCT)` の中間状態はクエリ全体
     // （`GROUP BY` なしの単一行集計なので `accumulators` の全項目の合計）で
     // 1 つ。Fast 経路（`visible_ids` のみ走査）・全走査のどちらから observe
@@ -3348,6 +3357,7 @@ pub(crate) fn observe_candidate_slots(
     // 検査を独立して適用する。
     max_result_bytes: usize,
 ) -> Result<usize, SqlSurfaceError> {
+    let max_result_bytes = statement_text_budget(accumulators, max_result_bytes);
     let arena = snapshot.arena();
     let mut expr_scratch: Vec<StackValue> = Vec::new();
     let mut total_text_accumulator_bytes: usize = 0;
