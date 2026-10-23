@@ -481,6 +481,7 @@ dependencies = [
  "jiff-tzdb",
  "ort",
  "redb",
+ "regex",
  "tokenizers",
  "usearch",
  "wgpu",
