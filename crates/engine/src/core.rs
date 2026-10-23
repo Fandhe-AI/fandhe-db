@@ -9257,6 +9257,62 @@ impl EngineCore {
         crate::sql::scan::execute_scan(read_txn, ctx, schema, bound)
     }
 
+    /// `COPY ... TO STDOUT` の読み取り（束縛 → 走査）を担う単一の入口（Issue #1771・WIRE-22 (5)・
+    /// SQL-34 のポインタ）。`begin_copy_validated`・`begin_copy_active`（明示 txn の dirty 分岐）・
+    /// `core/temp_route.rs::begin_copy_temp` の 3 経路がここを通る（行数上限の判定を 1 か所に
+    /// 集約し、経路の増減でテーブル形が上限なしになる fail-open を防ぐ）。
+    ///
+    /// - 括弧形: 内側 `SELECT` の明示 `LIMIT` を従来どおり束縛する（挙動不変）。
+    /// - テーブル形: `LIMIT` を行数上限 + 1 に差し替えて取得し、上限を超えたら黙って切り詰めず
+    ///   `54000` で拒否する（`CopyOutResponse` より前に確定するため行は 1 件も送られない）。
+    ///   エラー文言は固定で、行の内容・テナント ID を含めない。
+    pub(super) fn run_copy_to_scan(
+        &self,
+        source: &impl crate::storage::read_source::ReadSource,
+        ctx: &PolicyContext,
+        session: &crate::sql::mode::SessionState,
+        schema: &crate::catalog::TableSchema,
+        v: &crate::sql::allowlist::ValidatedCopyTo,
+    ) -> Result<crate::sql::exec::QueryResult, crate::sql::allowlist::SqlSurfaceError> {
+        use crate::sql::allowlist::SqlSurfaceError;
+        if !v.is_table_form() {
+            let bound = crate::sql::parser::bind_scan_with_dummy_flags(
+                &v.inner,
+                schema,
+                session.udfs(),
+                &[],
+                &self.result_limits,
+            )?;
+            return self.run_scan_plan(source, ctx, schema, &bound);
+        }
+        let internal = || SqlSurfaceError::Internal {
+            detail: "internal error".to_string(),
+        };
+        // 上限は設定値そのもの（`--max-result-rows`）。INSERT ... SELECT 用の丸め
+        // （ハード上限 - 1）は使わない（設定値ちょうどの行数を許容するため）。
+        let cap = self.result_limits.max_result_rows();
+        let fetch = cap.checked_add(1).ok_or_else(internal)?;
+        let mut scan = (*v.inner).clone();
+        scan.limit = u32::try_from(cap).map_err(|_| internal())?;
+        let mut bound = crate::sql::parser::bind_scan_with_dummy_flags(
+            &scan,
+            schema,
+            session.udfs(),
+            &[],
+            &self.result_limits,
+        )?;
+        // 束縛は上限 `cap` までしか LIMIT を受理しない（ハード上限での飽和）ため、超過検出用の
+        // `+1` 行は束縛後に差し替える（束縛済み値の差し替えなので検証は迂回しない）。
+        bound.limit = fetch;
+        let result = self.run_scan_plan(source, ctx, schema, &bound)?;
+        if result.rows.len() > cap {
+            return Err(SqlSurfaceError::payload_too_large(
+                "COPY result exceeds the row limit",
+            ));
+        }
+        Ok(result)
+    }
+
     /// [`Self::execute_validated_in_session`] の `Statement::Aggregate` アーム・
     /// [`Self::execute_bound_aggregate_in_session`] が共有する実行本体
     /// （TASK-186・NOSQL-4・NOSQL-5）。`read_txn`・`schema` は呼び出し元が同一
@@ -10749,14 +10805,7 @@ impl EngineCore {
             }
             crate::sql::allowlist::CopyStatement::To(v) => {
                 let (read_txn, schema) = self.read_txn_with_schema(v.inner.table_name())?;
-                let bound = crate::sql::parser::bind_scan_with_dummy_flags(
-                    &v.inner,
-                    &schema,
-                    session.udfs(),
-                    &[],
-                    &self.result_limits,
-                )?;
-                let result = self.run_scan_plan(&read_txn, ctx, &schema, &bound)?;
+                let result = self.run_copy_to_scan(&read_txn, ctx, session, &schema, &v)?;
                 Ok(CopyPlan::To(v.format, result, v.options))
             }
         }
@@ -10844,14 +10893,7 @@ impl EngineCore {
                     }
                 })?;
                 let schema = table_schema_in(write_txn, v.inner.table_name())?;
-                let bound = crate::sql::parser::bind_scan_with_dummy_flags(
-                    &v.inner,
-                    &schema,
-                    session.udfs(),
-                    &[],
-                    &self.result_limits,
-                )?;
-                let result = self.run_scan_plan(write_txn, ctx, &schema, &bound)?;
+                let result = self.run_copy_to_scan(write_txn, ctx, session, &schema, v)?;
                 return Ok(CopyPlan::To(v.format, result, v.options.clone()));
             }
         }
