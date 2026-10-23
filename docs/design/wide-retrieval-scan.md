@@ -169,4 +169,4 @@ TASK-170 が新設・main へマージされたため（fandhe-db-spec#12）、�
 
 ## 追記（Issue #1795）: LIMIT 省略との関係
 
-「`LIMIT` 必須」は SQL-34 の確定を受けて #1796 で改訂する予定。省略時は結果行数上限（`54000`）で有界にし、走査行数上限とは別軸として扱う。判定位置・SQLSTATE・カーソルとの関係は [limit-omitted-result-cap.md](limit-omitted-result-cap.md) を参照。
+「`LIMIT` 必須」は SQL-34 の確定を受けて Issue #1796 で改訂済み（`LIMIT` 省略・`LIMIT ALL` を受理）。省略時は結果行数上限（`54000`）で有界にし、走査行数上限とは別軸として扱う。判定位置・SQLSTATE・カーソルとの関係は [limit-omitted-result-cap.md](limit-omitted-result-cap.md) を参照。

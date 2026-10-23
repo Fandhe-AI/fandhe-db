@@ -125,7 +125,7 @@ fn unknown_and_invalid_types_are_rejected_with_42601() {
         "CREATE TABLE t (a INTEGER[-1])",
         "CREATE TABLE t (a VECTOR(2)[])",
         "CREATE TABLE t (a INTEGER[ )",
-        "SELECT a[1] FROM t",
+        "SELECT a[1] FROM t LIMIT 1",
     ] {
         assert_eq!(code(&core, &mut s, sql), "42601", "{sql}");
     }

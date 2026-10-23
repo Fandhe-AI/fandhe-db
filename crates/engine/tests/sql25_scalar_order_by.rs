@@ -536,7 +536,14 @@ fn unsupported_order_by_forms_are_rejected_with_42601() {
         "SELECT id FROM docs ORDER BY 1 + 0 LIMIT 5",
         "42601",
     );
-    expect_sqlstate(&core, &ctx, "SELECT id FROM docs ORDER BY lang", "42601");
+    // Issue #1796・SQL-34: `LIMIT` 省略はスカラー `ORDER BY` でも受理する（暗黙の結果行数上限。
+    // 受理側は sql34_limit_omitted.rs）。ベクトル順位付けの省略は従来どおり `42601`。
+    expect_sqlstate(
+        &core,
+        &ctx,
+        "SELECT id FROM docs ORDER BY embedding <=> '[1,0,0]'",
+        "42601",
+    );
 }
 
 /// `EXPLAIN` はスカラー ORDER BY 付き広域取得を受理する（Issue #1189。本体は

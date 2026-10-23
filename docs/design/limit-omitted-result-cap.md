@@ -2,7 +2,7 @@
 
 ## ステータス・対象
 
-- ステータス: 採用（設計記録。実装は #1796〜#1798）
+- ステータス: 採用（設計記録。#1796 で構文・計画への接続を実装済み。#1797〜#1798 は未着手）
 - ポインタ: SQL-34・SQL-15・WIRE-15・ERR-6（spec 本文は転記しない）
 - 対象: `LIMIT` 省略・`LIMIT ALL` の SELECT を「全件実体化 + 結果行数上限の超過でエラー」で受理するときの、上限判定の位置・超過時の SQLSTATE・カーソルとの関係・広域取得 Scan の走査上限との関係
 - 先行: [result-limits-cli.md](result-limits-cli.md)（Issue #1555。フラグ `--max-result-rows`・`ResultLimits` を本 ADR が再利用する）
@@ -104,3 +104,13 @@
 - 距離 ORDER BY の省略・内側 `LIMIT` の省略・CLI の統一
 - `LIMIT 0`・負値の扱い
 - SELECT への走査行数上限の適用
+
+## 実装メモ（Issue #1796）
+
+- 構文段: `LIMIT {n | ALL}` と `OFFSET` 単独を `Parser::parse_optional_limit` が受理する（`ALL` と省略は同義の `None`）。広域取得は `ValidatedScan::limit_implicit`（番兵 `limit = u32::MAX`）、評価後射影形ビューの外側は `BufferedRows::limit_implicit` で印を持つ。印を見落とした経路は番兵値が `22000` で落ちる（fail-closed）
+- 束縛段: `bind_scan_with_dummy_flags` が印付きの文を取得上限 `cap + 1`・`BoundScan::result_cap = Some(cap)` に差し替える。`EngineCore::check_bound_scan_limit` は印付きの計画を「`cap` が設定値と一致し取得上限が `cap + 1` 以下」のときだけ通す。NoSQL 表層の `BoundScan::new` は印を持たず契約は不変
+- 実行段: 広域取得は `sql::scan::execute_scan_with_budget` の入口 1 か所で `rows.len() > cap` を `54000` にする（Scan・ウィンドウ・cursor の内側・COPY・INSERT…SELECT・CTE・ビュー畳み込みが共有）。JOIN・`GROUP BY`／DISTINCT（HAVING と OFFSET の適用後）・集合演算全体・評価後射影形ビューの外側は各経路の結果に同じ判定をかける。文言は固定で件数・テナントを含めない
+- `MAX_SET_OP_ROWS`（固定 10,000）は別軸として残る。cap を 10,000 より上げても集合演算は 10,000 で `54000` になる
+- 従来どおり `42601`: 距離 ORDER BY・`USING PLAN` の省略（#2242）、サブクエリ内側・集合演算の括弧付き枝・ビュー／CTAS／matview の本文の省略（#1852／#1853／#2212）
+- 現行契約を維持（本 Issue では見送り）: `LIMIT 0`・明示 `LIMIT n (n > cap)` は `22000`（SQL-34・ERR-6 ポインタ）。`validate_search_limit_with` は kNN と `FETCH n` でも共有されるため影響範囲が広い
+- #1797 へ: `cap + 1` 件到達時の走査・結合・集約の早期中断、メモリ頭打ちのテスト、キャンセル。#1798 へ: wire の分割送出

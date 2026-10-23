@@ -901,7 +901,17 @@ pub(crate) fn execute_with_budget_and_result_limits(
     // 完結している（`eval_tree` が既に検証済み）。
     let rows = match validated_limit {
         Some(n) => outcome.rows.into_iter().take(n).collect(),
-        None => outcome.rows,
+        None => {
+            // Issue #1796・SQL-34: 全体 `LIMIT` の省略・`LIMIT ALL` は結果行数上限（設定値）を
+            // 超えたら `54000`（黙って切り詰めない。`MAX_SET_OP_ROWS` は別軸の固定上限で、
+            // 設定値を上げても 10,000 で頭打ちになる）。
+            if outcome.rows.len() > result_limits.max_result_rows() {
+                return Err(SqlSurfaceError::payload_too_large(
+                    "result exceeds the row limit",
+                ));
+            }
+            outcome.rows
+        }
     };
     Ok(QueryResult {
         columns: outcome.columns,
@@ -1073,6 +1083,7 @@ mod tests {
             projection: Projection::Columns(vec!["body".to_string()]),
             where_predicates: Vec::new(),
             limit: crate::core::MAX_SEARCH_K as u32,
+            limit_implicit: false,
             order_by: Vec::new(),
             offset: 0,
             window_items: Vec::new(),
@@ -1300,6 +1311,7 @@ mod tests {
             projection: Projection::Columns(vec!["score".to_string()]),
             where_predicates: Vec::new(),
             limit: crate::core::MAX_SEARCH_K as u32,
+            limit_implicit: false,
             order_by: Vec::new(),
             offset: 0,
             window_items: Vec::new(),
@@ -1469,6 +1481,7 @@ mod tests {
             projection: Projection::Columns(vec!["at".to_string()]),
             where_predicates: Vec::new(),
             limit: crate::core::MAX_SEARCH_K as u32,
+            limit_implicit: false,
             order_by: Vec::new(),
             offset: 0,
             window_items: Vec::new(),

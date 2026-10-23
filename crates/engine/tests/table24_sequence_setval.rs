@@ -513,7 +513,7 @@ fn unsupported_positions_are_rejected_without_side_effects() {
         ("SELECT setval('s', 5, true, 1)", "0A000"),
         ("SELECT lastval(1)", "42601"),
         ("SELECT setval('bad name', 50)", "42601"),
-        ("SELECT n, setval('s', 50) FROM t", "42601"),
+        ("SELECT n, setval('s', 50) FROM t LIMIT 1", "42601"),
         ("SELECT * FROM t WHERE n = setval('s', 50)", "42601"),
         ("UPDATE t SET n = setval('s', 50) WHERE id = 1", "42601"),
         (

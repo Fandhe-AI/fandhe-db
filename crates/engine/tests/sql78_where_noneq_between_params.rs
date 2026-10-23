@@ -372,9 +372,15 @@ fn real_literal_before_param_is_still_validated_at_describe() {
     let (core, session, _g) = setup("sql78-ordinal");
     // 実リテラルの `Compare` の後ろに `$n` の等価が来ても、実リテラルの検証が省略されない
     // （序数がずれない）。簡易クエリと同じエラーになる。
-    let literal = core.parse_sql("SELECT n FROM t WHERE day > 'not-a-date' AND s = 'x'");
+    // 簡易クエリ側は実行まで通す（日付リテラルの検証は束縛段で `22007`）。
+    let mut literal_session = SessionState::default();
+    let literal = core.execute_sql_in_session(
+        &ctx("sys"),
+        &mut literal_session,
+        "SELECT n FROM t WHERE day > 'not-a-date' AND s = 'x' LIMIT 5",
+    );
     let prepared = core
-        .parse_sql_prepared("SELECT n FROM t WHERE day > 'not-a-date' AND s = $1")
+        .parse_sql_prepared("SELECT n FROM t WHERE day > 'not-a-date' AND s = $1 LIMIT 5")
         .and_then(|p| core.describe_prepared_in_session(&session, &p).map(|_| ()));
     assert_eq!(
         prepared.map_err(|e| e.wire_code().to_string()),
