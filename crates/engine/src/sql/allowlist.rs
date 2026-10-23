@@ -16300,7 +16300,7 @@ impl<'a> Parser<'a> {
 /// `UPDATE ... FROM`／`DELETE ... USING` の対象表・FROM 側の表の暗黙別名にできない語（SQL-53 (b)、
 /// Issue #1754）。JOIN の予約語に加え、DML の句境界（`SET`・`FROM`・`RETURNING`・`PARTITIONED`・
 /// `OPERATION_ID`）を別名として誤って消費しない。
-fn is_dml_target_reserved_word(w: &str) -> bool {
+pub(crate) fn is_dml_target_reserved_word(w: &str) -> bool {
     is_join_reserved_word(w)
         || ["SET", "FROM", "RETURNING", "PARTITIONED", "OPERATION_ID"]
             .iter()

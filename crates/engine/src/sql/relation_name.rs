@@ -103,14 +103,30 @@ pub(crate) struct RelPos {
     pub matview: bool,
 }
 
-/// `tokens[i]` が `DELETE ... USING <表の並び>` の `USING`（表参照リストを導く語）か。文頭が `DELETE` で、
-/// 直後が `OPERATION_ID`（operation_id 句）・`PLAN`・`MODE` でないときだけ真（SQL-53 (b)、Issue #1754）。
+/// `tokens[i]` が `DELETE FROM <表> [[AS] <別名>] USING <表の並び>` の `USING`（表参照リストを導く語）か。
+/// 文頭が `DELETE FROM <表>` で、`USING` が対象表と別名の直後の構文位置にあり、直後が
+/// `OPERATION_ID`（operation_id 句）でないときだけ真（SQL-53 (b)、Issue #1754）。`USING` は予約語では
+/// ないため、WHERE 内の列名 `using` を USING 句と誤判定しないよう位置で限定する
+/// （`allowlist::looks_like_delete_using` と同じ規則。こちらは修飾表名も許す）。
 fn delete_using_opener(tokens: &[Token], i: usize) -> bool {
-    ident_is(tokens.first(), "DELETE")
-        && ident_is(tokens.get(i), "USING")
-        && !["OPERATION_ID", "PLAN", "MODE"]
-            .iter()
-            .any(|k| ident_is(tokens.get(i + 1), k))
+    if !ident_is(tokens.first(), "DELETE")
+        || !matches!(tokens.get(1), Some(Token::Keyword(Keyword::From)))
+        || !matches!(
+            tokens.get(2),
+            Some(Token::Ident(_) | Token::QualifiedIdent { .. })
+        )
+    {
+        return false;
+    }
+    let mut pos: usize = 3;
+    if ident_is(tokens.get(pos), "AS") {
+        pos = pos.saturating_add(2);
+    } else if matches!(tokens.get(pos), Some(Token::Ident(w))
+        if !crate::sql::allowlist::is_dml_target_reserved_word(w))
+    {
+        pos = pos.saturating_add(1);
+    }
+    pos == i && ident_is(tokens.get(i), "USING") && !ident_is(tokens.get(i + 1), "OPERATION_ID")
 }
 
 /// [`relation_positions`] の結果。

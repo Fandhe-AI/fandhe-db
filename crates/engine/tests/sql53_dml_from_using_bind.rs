@@ -551,3 +551,20 @@ fn quoted_distinct_column_still_routes_to_update_from() {
         .expect("update from parses");
     assert!(matches!(parsed, ParsedSql::UpdateFrom(_)), "{parsed:?}");
 }
+
+/// WHERE 内の列名 `using` は USING 句ではない。`using` 列を持つ表への単一表 DELETE が、
+/// 修飾表名＋`search_path` 下でも従来どおり通る（Issue #1754 レビュー対応）。
+#[test]
+fn where_clause_using_column_is_not_a_using_clause() {
+    let (core, path) = new_core("sql53-using-col", false);
+    let _g = CleanupGuard(path);
+    let parsed = core
+        .parse_sql("DELETE FROM public.docs WHERE lang = 'x' OR using IN ('y')")
+        .map(|p| format!("{p:?}"));
+    if let Ok(p) = &parsed {
+        assert!(!p.contains("DeleteUsing"), "{p}");
+    }
+    if let Err(e) = &parsed {
+        assert!(!format!("{e:?}").contains("42P01"), "{e:?}");
+    }
+}
