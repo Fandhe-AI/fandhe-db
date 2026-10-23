@@ -324,8 +324,8 @@ fn wire20_atomic_deferred_fk_commit_failure_at_copy_from_last() {
     assert_eq!(count_table(&mut stream, "c"), 0);
 }
 
-/// A4b: COPY が孤児行を持ち込む。FK 検査が遅延されるなら後続 `SELECT 1` の暗黙 commit で、
-/// 即時なら CopyDone で `23503` になる。どちらでも行は残らない（fail-closed）。
+/// A4b: COPY が孤児行を持ち込む。FK 検査は遅延されるため CopyDone 後に `COPY 1` が先に返り、
+/// 後続 `SELECT 1` の暗黙 commit で `23503` になる。行は残らない（fail-closed）。
 #[test]
 fn wire20_atomic_copy_from_orphan_row_never_persists() {
     let (core, _guard) = new_core_with_fk();
