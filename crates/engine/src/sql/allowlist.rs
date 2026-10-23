@@ -800,6 +800,10 @@ pub enum SqlSurfaceError {
     /// 一致しない（`42P10`。SQL-49・ERR-6、Issue #1707。`id` と他列の混在・未知列を含む）。
     /// 束縛段（`sql::parser::resolve_conflict_target`）が返す。固定文言で列名・値を含めない。
     InvalidColumnReference,
+    /// `ORDER BY <整数>` の位置が SELECT リストの出力列の範囲外（`0`・負・列数超過。`42P10`。
+    /// SQL-56 (2)・Issue #1792）。束縛段が返す。含めるのは利用者が書いた位置の値だけで、
+    /// 列名・テナント情報は含めない。可否は文とスキーマだけで決まり、行の内容に依存しない。
+    OrderByPositionNotInSelectList { position: i64 },
     /// DDL 文（`CREATE TABLE`・`DROP TABLE` 等。SQL-23、TASK-202・TASK-203、
     /// Issue #899・#902）を、DDL 実行権限（[`crate::sql::mode::SessionState::
     /// ddl_allowed`]）を持たないセッションが実行しようとした（ERR-2 拡張:
@@ -1399,7 +1403,10 @@ impl ClassifiedError for SqlSurfaceError {
             SqlSurfaceError::PartitionedDmlInTransaction => ErrorClass::ActiveSqlTransaction,
             SqlSurfaceError::PartitionedJobBusy { .. } => ErrorClass::LockNotAvailable,
             SqlSurfaceError::DuplicateColumn { .. } => ErrorClass::DuplicateColumn,
-            SqlSurfaceError::InvalidColumnReference => ErrorClass::InvalidColumnReference,
+            SqlSurfaceError::InvalidColumnReference
+            | SqlSurfaceError::OrderByPositionNotInSelectList { .. } => {
+                ErrorClass::InvalidColumnReference
+            }
             SqlSurfaceError::InsufficientPrivilege
             | SqlSurfaceError::ConflictTargetNotVisible
             | SqlSurfaceError::SchemaDependencyForbidden => ErrorClass::ForbiddenTenantMismatch,
@@ -1647,6 +1654,9 @@ impl std::fmt::Display for SqlSurfaceError {
                 f,
                 "there is no unique or exclusion constraint matching the ON CONFLICT specification"
             ),
+            SqlSurfaceError::OrderByPositionNotInSelectList { position } => {
+                write!(f, "ORDER BY position {position} is not in select list")
+            }
             // テーブル名・ユーザー名を含めない固定文言（security.md P0。
             // `SqlSurfaceError::InsufficientPrivilege` ドキュメント参照）。
             SqlSurfaceError::InsufficientPrivilege => {
@@ -1912,6 +1922,10 @@ pub(crate) enum ScanOrderKey {
     Column(ScalarOrderKey),
     /// 式キー。意味論（未知関数・型不整合・列参照の解決）は束縛段が判定する。
     Expr { expr: Expr, descending: bool },
+    /// 序数キー（`ORDER BY 1`。SQL-56 (2)・Issue #1792）。SELECT リストの出力列の位置
+    /// （1 始まり。`*` は展開後の位置）。範囲検査と列への解決は束縛段が行う（`*` の展開後の
+    /// 列数・ウィンドウ項目の位置が構文段では確定しないため、位置のまま運ぶ）。
+    Ordinal { position: i64, descending: bool },
 }
 
 /// スカラー `ORDER BY` に指定できるキー数の上限（Issue #915 実装既定値）。
@@ -2727,8 +2741,12 @@ pub(crate) struct JoinStep {
 /// 非修飾識別子が集計項目名にも一致しうるため、対象の解決は束縛段で行う。
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) struct JoinOrderKey {
+    /// 列参照キー。序数キー（`ordinal` が `Some`）のときは未使用（空名）。
     pub(crate) target: ColumnRef,
     pub(crate) descending: bool,
+    /// 序数キー（`ORDER BY 1`。SQL-56 (2)・Issue #1792）。SELECT リストの出力列の位置
+    /// （1 始まり。`*` は左→右の `id`＋全列の展開後の位置）。範囲外は束縛段が `42P10`。
+    pub(crate) ordinal: Option<i64>,
 }
 
 /// JOIN 集計形の SELECT リスト項目（Issue #1190）。宣言順を出力列順として保持する。
@@ -3281,6 +3299,10 @@ pub struct AggregateOrderBy {
     /// そのエイリアス・集計項目の実効名を参照し、束縛段
     /// （`sql::parser::bind_group_by_clause`）が解決する。
     pub(crate) expr: Option<Expr>,
+    /// 序数キー（`ORDER BY 1`。SQL-56 (2)・Issue #1792）。`Some` のとき `target` は空文字・
+    /// `expr` は `None` で、SELECT リストの出力列の位置（1 始まり）として束縛段
+    /// （`sql::parser::bind_group_by_clause`）が解決し、範囲外は `42P10` にする。
+    pub(crate) ordinal: Option<i64>,
 }
 
 /// `HAVING` の式述語 1 つ（Issue #1188・SQL-26）。`<lhs> <cmp> <rhs>` で、少なくとも一方の
@@ -6135,10 +6157,15 @@ impl<'a> Parser<'a> {
             // Issue #1188・SQL-26: `GROUP BY` 集計（`allow_expr`）に限り、キー先頭が
             // `CASE WHEN` または `ident '('` なら式キー。`SELECT DISTINCT ... ORDER BY` は
             // 式キー非対応（従来どおり識別子のみ）。
-            let (target, expr) = if allow_expr && self.order_key_starts_expression() {
-                (String::new(), Some(self.parse_value_expr(0)?))
+            // SQL-56 (2)・Issue #1792: 整数リテラルだけのキーは出力列の位置（序数）。
+            // `GROUP BY` 集計・`SELECT DISTINCT` のどちらでも受理する（先読みのみで判定）。
+            let (target, expr, ordinal) = if let Some((position, len)) = self.peek_order_ordinal() {
+                self.pos = self.pos.saturating_add(len);
+                (String::new(), None, Some(position))
+            } else if allow_expr && self.order_key_starts_expression() {
+                (String::new(), Some(self.parse_value_expr(0)?), None)
             } else {
-                (self.expect_ident()?, None)
+                (self.expect_ident()?, None, None)
             };
             let descending = if self.peek_ident_matches("DESC") {
                 self.advance();
@@ -6153,6 +6180,7 @@ impl<'a> Parser<'a> {
                 target,
                 descending,
                 expr,
+                ordinal,
             });
             if matches!(self.peek(), Some(Token::Punct(','))) {
                 self.advance();
@@ -8789,6 +8817,11 @@ impl<'a> Parser<'a> {
     /// の排他規定により `42601` で拒否する。キー数の上限は
     /// [`MAX_SCALAR_ORDER_KEYS`]（超過は `54000`）。
     fn parse_scalar_order_by(&mut self) -> Result<Vec<ScanOrderKey>, SqlSurfaceError> {
+        enum Key {
+            Column(String),
+            Expr(Expr),
+            Ordinal(i64),
+        }
         let mut keys = Vec::new();
         loop {
             if keys.len() >= MAX_SCALAR_ORDER_KEYS {
@@ -8796,16 +8829,20 @@ impl<'a> Parser<'a> {
                     "too many scalar ORDER BY keys",
                 ));
             }
-            // Issue #1188・SQL-26: キー先頭が `CASE WHEN` または `ident '('`（順位付け
-            // 関数 `HYBRID`／`HYBRID_RRF` を除く。それらは呼び出し元の
-            // `parse_select_shape` がベクトル順位付け経路へ振り分け済み）なら式キー。
-            // `COALESCE`／`NULLIF`／`EXTRACT` も `ident '('` に含まれる。
-            // 算術で始まるキー・括弧始まり・位置指定は従来どおり構文拒否（`42601`）。
-            let starts_expr = self.order_key_starts_expression();
-            let column_or_expr = if starts_expr {
-                Err(self.parse_value_expr(0)?)
+            // SQL-56 (2)・Issue #1792: 整数リテラルだけのキーは出力列の位置（序数）。
+            // 判定は先読みだけで行い、序数でなければ従来の判定へそのまま流す。
+            let key = if let Some((position, len)) = self.peek_order_ordinal() {
+                self.pos = self.pos.saturating_add(len);
+                Key::Ordinal(position)
+            } else if self.order_key_starts_expression() {
+                // Issue #1188・SQL-26: キー先頭が `CASE WHEN` または `ident '('`（順位付け
+                // 関数 `HYBRID`／`HYBRID_RRF` を除く。それらは呼び出し元の
+                // `parse_select_shape` がベクトル順位付け経路へ振り分け済み）なら式キー。
+                // `COALESCE`／`NULLIF`／`EXTRACT` も `ident '('` に含まれる。
+                // 算術で始まるキー・括弧始まりは従来どおり構文拒否（`42601`）。
+                Key::Expr(self.parse_value_expr(0)?)
             } else {
-                Ok(self.expect_ident()?)
+                Key::Column(self.expect_ident()?)
             };
             if matches!(
                 self.peek(),
@@ -8824,9 +8861,13 @@ impl<'a> Parser<'a> {
             } else {
                 false
             };
-            keys.push(match column_or_expr {
-                Ok(column) => ScanOrderKey::Column(ScalarOrderKey { column, descending }),
-                Err(expr) => ScanOrderKey::Expr { expr, descending },
+            keys.push(match key {
+                Key::Column(column) => ScanOrderKey::Column(ScalarOrderKey { column, descending }),
+                Key::Expr(expr) => ScanOrderKey::Expr { expr, descending },
+                Key::Ordinal(position) => ScanOrderKey::Ordinal {
+                    position,
+                    descending,
+                },
             });
             if matches!(self.peek(), Some(Token::Punct(','))) {
                 self.advance();
@@ -8835,6 +8876,44 @@ impl<'a> Parser<'a> {
             break;
         }
         Ok(keys)
+    }
+
+    /// 現在位置が `ORDER BY` の序数キー（整数リテラルだけのキー。SQL-56 (2)・Issue #1792）か
+    /// を、トークンを消費せず先読みだけで判定する。序数なら `(位置, 消費するトークン数)`。
+    ///
+    /// 序数とみなす条件（両方を満たすときだけ。PostgreSQL の「整数定数だけのキー」に合わせる）:
+    /// 1. `Number` が ASCII 数字だけからなり `i32` に収まる（小数・桁あふれは序数にしない）。
+    ///    先頭に単項 `-` が 1 つ付く形も序数候補にする（`0`・負の位置は束縛段が `42P10`）
+    /// 2. 直後がキーの終端（文末・`,`・`;`・`)`・`LIMIT`・`ASC`・`DESC`・`OFFSET`）
+    ///
+    /// 当てはまらないもの（`1 + 0`・`1.5`・`1::int` 等）は序数にせず、従来の判定
+    /// （式キー／`42601`）へ流す。
+    fn peek_order_ordinal(&self) -> Option<(i64, usize)> {
+        let (negative, number_at) = match self.peek() {
+            Some(Token::Punct('-')) => (true, 1usize),
+            _ => (false, 0usize),
+        };
+        let Some(Token::Number(raw)) = self.tokens.get(self.pos.saturating_add(number_at)) else {
+            return None;
+        };
+        if raw.is_empty() || !raw.bytes().all(|b| b.is_ascii_digit()) {
+            return None;
+        }
+        let magnitude: i32 = raw.parse().ok()?;
+        let len = number_at.saturating_add(1);
+        let at_end = match self.tokens.get(self.pos.saturating_add(len)) {
+            None => true,
+            Some(Token::Punct(',' | ';' | ')')) | Some(Token::Keyword(Keyword::Limit)) => true,
+            Some(Token::Ident(w)) => ["ASC", "DESC", "OFFSET"]
+                .iter()
+                .any(|k| w.eq_ignore_ascii_case(k)),
+            _ => false,
+        };
+        if !at_end {
+            return None;
+        }
+        let value = i64::from(magnitude);
+        Some((if negative { -value } else { value }, len))
     }
 
     /// 現在位置が広域取得 `ORDER BY` の式キー（Issue #1188）の先頭かを 1〜2 トークンの
@@ -17151,7 +17230,13 @@ fn parse_join_order_by(p: &mut Parser<'_>) -> Result<Vec<JoinOrderKey>, SqlSurfa
                 "too many JOIN ORDER BY keys",
             ));
         }
-        let target = p.parse_join_colref()?;
+        // SQL-56 (2)・Issue #1792: 整数リテラルだけのキーは出力列の位置（序数）。
+        let (target, ordinal) = if let Some((position, len)) = p.peek_order_ordinal() {
+            p.pos = p.pos.saturating_add(len);
+            (ColumnRef::unqualified(""), Some(position))
+        } else {
+            (p.parse_join_colref()?, None)
+        };
         if matches!(p.peek(), Some(Token::DistanceOp) | Some(Token::Punct('('))) {
             return Err(SqlSurfaceError::unsupported(
                 "ORDER BY with vector ranking cannot be combined with JOIN",
@@ -17166,7 +17251,11 @@ fn parse_join_order_by(p: &mut Parser<'_>) -> Result<Vec<JoinOrderKey>, SqlSurfa
             }
             false
         };
-        keys.push(JoinOrderKey { target, descending });
+        keys.push(JoinOrderKey {
+            target,
+            descending,
+            ordinal,
+        });
         if matches!(p.peek(), Some(Token::Punct(','))) {
             p.advance();
             continue;
@@ -18001,9 +18090,24 @@ fn parse_select_shape(
         let (order_by, order_keys) = split_scan_order_keys(scan_keys);
         // Issue #1188: 式キーの `ORDER BY` とウィンドウ関数の併用は非対応（Issue #1189 で
         // 併用可能になったのは列名キーのみ。`sql::window` の出力順計算は列キーだけを扱う）。
-        if !window_items.is_empty() && !order_keys.is_empty() {
+        if !window_items.is_empty()
+            && order_keys
+                .iter()
+                .any(|k| matches!(k, ScanOrderKey::Expr { .. }))
+        {
             return Err(SqlSurfaceError::unsupported(
                 "window functions cannot be combined with expression ORDER BY keys",
+            ));
+        }
+        // SQL-56 (2): 投影位置のスカラーサブクエリは束縛前に項目が取り除かれ、出力列の位置を
+        // 束縛段が復元できない。序数との併用は黙って誤った列で並べず `42601` で拒否する。
+        if !scalar_subquery_items.is_empty()
+            && order_keys
+                .iter()
+                .any(|k| matches!(k, ScanOrderKey::Ordinal { .. }))
+        {
+            return Err(SqlSurfaceError::unsupported(
+                "ORDER BY position cannot be combined with scalar subqueries in the SELECT list",
             ));
         }
 
@@ -18110,14 +18214,17 @@ fn expr_contains_scalar_function(expr: &Expr) -> bool {
 /// 振り分ける（Issue #1188）。式キーを含まなければ従来の `order_by` だけを埋めて既存契約を
 /// 完全に維持し、含む場合は全キーを出現順のまま `order_keys` へ保持して `order_by` は空にする。
 fn split_scan_order_keys(keys: Vec<ScanOrderKey>) -> (Vec<ScalarOrderKey>, Vec<ScanOrderKey>) {
-    if keys.iter().any(|k| matches!(k, ScanOrderKey::Expr { .. })) {
+    if keys
+        .iter()
+        .any(|k| matches!(k, ScanOrderKey::Expr { .. } | ScanOrderKey::Ordinal { .. }))
+    {
         return (Vec::new(), keys);
     }
     let columns = keys
         .into_iter()
         .filter_map(|k| match k {
             ScanOrderKey::Column(c) => Some(c),
-            ScanOrderKey::Expr { .. } => None,
+            ScanOrderKey::Expr { .. } | ScanOrderKey::Ordinal { .. } => None,
         })
         .collect();
     (columns, Vec::new())
@@ -28466,12 +28573,76 @@ mod tests {
             "SELECT id FROM documents ORDER BY lower(title) <=> '[0.1]' LIMIT 5",
             "SELECT id FROM documents ORDER BY lang, hybrid(embedding, 'q') LIMIT 5",
             "SELECT id FROM documents ORDER BY count(*) LIMIT 5",
-            "SELECT id FROM documents ORDER BY 1 LIMIT 5",
+            "SELECT id FROM documents ORDER BY 1 + 0 LIMIT 5",
             "SELECT id FROM documents ORDER BY lower(title) LIMIT 5 USING MODE 'x'",
         ] {
             let err = validate_sql(sql, &lookup).expect_err("must be rejected");
             assert_eq!(err.wire_code(), "42601", "sql={sql:?}");
         }
+    }
+
+    /// SQL-56 (2)・Issue #1792: 整数リテラルだけのキーは序数として受理し、`ASC`/`DESC` や
+    /// 他のキーとも併用できる。範囲の検査は束縛段（ここでは位置のまま運ぶ）。
+    #[test]
+    fn scan_order_by_accepts_ordinal_keys() {
+        let lookup = catalog_with(&["documents"]);
+        let Ok(Statement::Scan(scan)) = validate_sql(
+            "SELECT id, lang FROM documents ORDER BY 2 DESC, lang, 1, -1, 0 LIMIT 5",
+            &lookup,
+        ) else {
+            panic!("expected a scan statement");
+        };
+        assert!(
+            scan.order_by().is_empty(),
+            "ordinal keys live in order_keys"
+        );
+        assert!(matches!(
+            scan.order_keys.as_slice(),
+            [
+                ScanOrderKey::Ordinal {
+                    position: 2,
+                    descending: true
+                },
+                ScanOrderKey::Column(_),
+                ScanOrderKey::Ordinal {
+                    position: 1,
+                    descending: false
+                },
+                ScanOrderKey::Ordinal { position: -1, .. },
+                ScanOrderKey::Ordinal { position: 0, .. },
+            ]
+        ));
+    }
+
+    /// SQL-56 (2)・Issue #1792: 定数式・小数・int4 範囲外・パラメータは序数にしない（従来どおり
+    /// 構文拒否 `42601`）。ベクトル順位付けとの混在も拒否のまま。
+    #[test]
+    fn scan_order_by_does_not_treat_non_integer_literals_as_ordinals() {
+        let lookup = catalog_with(&["documents"]);
+        for sql in [
+            "SELECT id FROM documents ORDER BY 1 + 0 LIMIT 5",
+            "SELECT id FROM documents ORDER BY 1.5 LIMIT 5",
+            "SELECT id FROM documents ORDER BY 99999999999 LIMIT 5",
+            "SELECT id FROM documents ORDER BY -1 + 0 LIMIT 5",
+            "SELECT id FROM documents ORDER BY 1 <=> '[0.1]' LIMIT 5",
+            "SELECT id FROM documents ORDER BY 1 NULLS LAST LIMIT 5",
+        ] {
+            let err = validate_sql(sql, &lookup).expect_err("must be rejected");
+            assert_eq!(err.wire_code(), "42601", "sql={sql:?}");
+        }
+    }
+
+    /// SQL-56 (2)・Issue #1792: 投影位置のスカラーサブクエリとの併用は位置を復元できないため
+    /// `42601`（黙って誤った列で並べない）。
+    #[test]
+    fn scan_order_by_ordinal_rejects_scalar_subquery_projection() {
+        let lookup = catalog_with(&["documents"]);
+        let err = validate_sql(
+            "SELECT id, (SELECT lang FROM documents LIMIT 1) AS l FROM documents ORDER BY 2 LIMIT 5",
+            &lookup,
+        )
+        .expect_err("must be rejected");
+        assert_eq!(err.wire_code(), "42601");
     }
 
     /// SQL-37・Issue #1586: 括弧なし時刻関数は ORDER BY でも式キーとして解析される

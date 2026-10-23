@@ -75,7 +75,8 @@
 ## 対象外（Issue 起票なし・後続の管轄を除く）
 
 - `HAVING`／`ORDER BY` 内の集計関数呼び出し（`HAVING count(*) > 1`・`ORDER BY sum(x)`）は `42601` のまま。
-- 式位置での単項マイナス、`ORDER BY (expr)`・算術で始まるキー、位置指定 `ORDER BY 1`、`NULLS FIRST/LAST`。
+- 式位置での単項マイナス、`ORDER BY (expr)`・算術で始まるキー、`NULLS FIRST/LAST`。位置指定 `ORDER BY 1` は
+  Issue #1792 で対応した（下の「Issue #1792 追記」）。
 - `SELECT DISTINCT ... ORDER BY <式>`・`GROUP BY` なしの `HAVING`・GROUP BY キー自体の式化。
 - NoSQL（HTTP）表層、JOIN・集合演算・ウィンドウと式 `ORDER BY` の併用。
 - 評価後射影形ビュー（集計・`LIMIT` 本文のビュー。Issue #1192）への外側 `ORDER BY` の式キー（列名キーと
@@ -83,8 +84,30 @@
   後続（Issue #1189・#1191）とは別に、式キーを含む場合は `42601` とする（並べ替えを黙って落とさない）。
 - SQLSTATE の `42883`／`42804` への移行（既存の束縛エラー経路を使うため移行はそのまま効く）。
 
+## Issue #1792 追記（ORDER BY の序数指定。SQL-56 (2)・TASK-298 のポインタ）
+
+- 判定（構文段・先読みのみ）: キーが「ASCII 数字だけで `i32` に収まる整数リテラル（先頭に単項 `-` 1 つ可）」で、
+  直後がキーの終端（文末・`,`・`;`・`)`・`LIMIT`・`ASC`・`DESC`・`OFFSET`）のときだけ序数とする。
+  `1 + 0`・`1.5`・`99999999999`・`-1 + 0`・`$1` は序数にせず従来どおり `42601`（`1::int` は従来の式キー）。
+- 解決（束縛段）: 序数は位置のまま運び（`ScanOrderKey::Ordinal`・`AggregateOrderBy::ordinal`・
+  `JoinOrderKey::ordinal`）、`*` 展開後の SELECT リストの出力列へ解決する。範囲外（`0`・負・列数超過）は
+  `42P10`（`SqlSurfaceError::OrderByPositionNotInSelectList`。文言は書かれた位置だけで、判定は文とスキーマだけで
+  決まり可視行・テナントに依存しない）。
+  - 広域取得: 実列は列の添字、`id`（別名付き含む）は疑似列、式の項目は束縛済み投影の式を再利用する。
+    ウィンドウ項目を挟んだ出力順は項目の位置から復元する。ウィンドウ項目の位置を指す序数は `42601`。
+    ウィンドウ併用の `ORDER BY` は式キーだけを拒否し、序数は受理する。
+  - 集計・`SELECT DISTINCT`: `GROUP BY` キー・集計項目・集計式の項目（式は行ビューへ束縛し直す）。
+  - JOIN: 非集計形は `*` 展開後の列、集計形は SELECT リストの項目。
+  - ビュー: 公開列の並びに従う（列別名つきビューも書き換え後の投影順）。
+- 拒否のまま（fail-closed）: 投影位置のスカラーサブクエリとの併用（束縛前に項目が取り除かれ位置を復元できない）、
+  評価後射影形ビューへの外側の序数、集合演算の枝内の序数は `42601`。
+- 意図的に変えない: ウィンドウの `OVER (ORDER BY 1)`（PostgreSQL でも序数ではない）、`GROUP BY 1`
+  （SQL-58 側の管轄）、NoSQL（HTTP）表層。
+- テスト: `tests/sql56_order_by_ordinal.rs`、`crates/wire-server/tests/wire_sql56_order_by_ordinal.rs`。
+
 ## PostgreSQL との既知の差分
 
+- 定数式（`ORDER BY 1 + 0`）・`$n` を定数として並べ替える受理は未実装（`42601`。序数としては扱わない）。
 - `EXTRACT` の戻り型は `numeric` ではなく `f64`。`EXTRACT(hour FROM date)` はエラーにせず 0（`date_part` と同じ）。
 - 式形の `HAVING`／`ORDER BY` は `f64` 意味論。`2^53` を超える整数（`id`・`COUNT`・`SUM` 等の結果を含む）は
   `WHERE`・投影の式と同じく丸めずに `22000` で拒否する。従来形の `HAVING` は厳密比較のまま。

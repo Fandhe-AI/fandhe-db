@@ -29,6 +29,9 @@
 
 ### Breaking Changes
 
+- `sql::allowlist::SqlSurfaceError`（Issue #1792・SQL-56 (2)）: variant `OrderByPositionNotInSelectList { position: i64 }`
+  （`42P10`。`ORDER BY` の序数が出力列の範囲外）を追加した。列挙型を網羅的に `match` する外部コードは
+  コンパイルできなくなる。移行: 腕を追加する（`wire_code()`／`classify()` 経由で扱うコードは変更不要）。
 - `sql::allowlist::ValidatedCopyTo`（Issue #1771・WIRE-22 (5)・SQL-34）: クレート内専用のフィールド `table_form`
   （`pub(crate)`）を追加した。構造体リテラルで生成する外部コードと、全フィールドを列挙して分解するコードは
   コンパイルできなくなる。移行: 構造体を自前で組み立てず、`validate_copy` 等の公開入口が返す検証済み値を使う。
