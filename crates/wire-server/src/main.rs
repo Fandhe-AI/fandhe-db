@@ -157,6 +157,15 @@
 //! `EngineCore::with_jsonpath_limits` へ 1 回だけ注入する
 //! （`docs/design/jsonpath-limits-cli.md`。SQL 表層からの利用は Issue #2185 以降）。
 //!
+//! `--max-regex-pattern-len`／`--max-regex-input-len`／`--max-regex-compiled-size`（Issue #1786。
+//! SQL-55）: 正規表現マッチャのパターン長（`1`〜`4096` バイト）・入力長（`1`〜`4194304` バイト）・
+//! コンパイル後サイズ（`1`〜`10485760` バイト）の上限を、プロセス全体に対して起動時に
+//! **下げる方向だけ**設定できる opt-in 注入点（未指定はハード上限と同値）。超過は `54000`
+//! （`silent` でも抑止されない）。範囲外・非数値・値欠落・重複指定はいずれも fail-closed で
+//! 起動エラー。値の解決は `wire_server::regex_limits_opt::resolve` に一本化し、
+//! `EngineCore::with_regex_limits` へ 1 回だけ注入する（`docs/design/regex-limits-cli.md`。
+//! SQL 表層からの利用は Issue #1787 以降）。
+//!
 //! `--max-subquery-depth`／`--max-subquery-executions`／`--max-cte-definitions`／
 //! `--max-cte-nesting-depth`（Issue #1552。SQL-46）: サブクエリの入れ子深さ（`1`〜`4`）・
 //! 1 文あたりの内側サブクエリ実行回数（`1`〜`16`）・CTE 定義数（`1`〜`16`）・CTE 連鎖深さ
@@ -442,6 +451,9 @@ fn run_server(args: &[String]) -> ExitCode {
     let mut max_temp_bytes_raw: Option<String> = None;
     let mut max_jsonpath_steps_raw: Option<String> = None;
     let mut max_jsonpath_depth_raw: Option<String> = None;
+    let mut max_regex_pattern_len_raw: Option<String> = None;
+    let mut max_regex_input_len_raw: Option<String> = None;
+    let mut max_regex_compiled_size_raw: Option<String> = None;
     let mut max_subquery_depth_raw: Option<String> = None;
     let mut max_subquery_executions_raw: Option<String> = None;
     let mut max_cte_definitions_raw: Option<String> = None;
@@ -957,6 +969,66 @@ fn run_server(args: &[String]) -> ExitCode {
                     return ExitCode::FAILURE;
                 }
                 max_jsonpath_depth_raw = Some(v.clone());
+                i += 2;
+            }
+            wire_server::regex_limits_opt::MAX_REGEX_PATTERN_LEN_FLAG => {
+                let Some(v) = args.get(i + 1) else {
+                    engine::log_stderr!(
+                        "wire-server: {} requires a non-negative integer argument",
+                        wire_server::regex_limits_opt::MAX_REGEX_PATTERN_LEN_FLAG
+                    );
+                    return ExitCode::FAILURE;
+                };
+                // Issue #1786: 他の起動時構成フラグと同じく 2 回目以降の指定を
+                // fail-closed に拒否する（last-wins にしない）。
+                if max_regex_pattern_len_raw.is_some() {
+                    engine::log_stderr!(
+                        "wire-server: {} specified more than once",
+                        wire_server::regex_limits_opt::MAX_REGEX_PATTERN_LEN_FLAG
+                    );
+                    return ExitCode::FAILURE;
+                }
+                max_regex_pattern_len_raw = Some(v.clone());
+                i += 2;
+            }
+            wire_server::regex_limits_opt::MAX_REGEX_INPUT_LEN_FLAG => {
+                let Some(v) = args.get(i + 1) else {
+                    engine::log_stderr!(
+                        "wire-server: {} requires a non-negative integer argument",
+                        wire_server::regex_limits_opt::MAX_REGEX_INPUT_LEN_FLAG
+                    );
+                    return ExitCode::FAILURE;
+                };
+                // Issue #1786: 他の起動時構成フラグと同じく 2 回目以降の指定を
+                // fail-closed に拒否する（last-wins にしない）。
+                if max_regex_input_len_raw.is_some() {
+                    engine::log_stderr!(
+                        "wire-server: {} specified more than once",
+                        wire_server::regex_limits_opt::MAX_REGEX_INPUT_LEN_FLAG
+                    );
+                    return ExitCode::FAILURE;
+                }
+                max_regex_input_len_raw = Some(v.clone());
+                i += 2;
+            }
+            wire_server::regex_limits_opt::MAX_REGEX_COMPILED_SIZE_FLAG => {
+                let Some(v) = args.get(i + 1) else {
+                    engine::log_stderr!(
+                        "wire-server: {} requires a non-negative integer argument",
+                        wire_server::regex_limits_opt::MAX_REGEX_COMPILED_SIZE_FLAG
+                    );
+                    return ExitCode::FAILURE;
+                };
+                // Issue #1786: 他の起動時構成フラグと同じく 2 回目以降の指定を
+                // fail-closed に拒否する（last-wins にしない）。
+                if max_regex_compiled_size_raw.is_some() {
+                    engine::log_stderr!(
+                        "wire-server: {} specified more than once",
+                        wire_server::regex_limits_opt::MAX_REGEX_COMPILED_SIZE_FLAG
+                    );
+                    return ExitCode::FAILURE;
+                }
+                max_regex_compiled_size_raw = Some(v.clone());
                 i += 2;
             }
             wire_server::nesting_limits_opt::MAX_SUBQUERY_DEPTH_FLAG => {
@@ -1736,6 +1808,23 @@ fn run_server(args: &[String]) -> ExitCode {
         }
     };
 
+    // Issue #1786: 正規表現マッチャのパターン長・入力長・コンパイル後サイズ上限を bind・
+    // ユーザーストア読込より前に解決する（fail-closed。範囲外・非数値は listen へ進まず起動
+    // エラー）。未指定は `RegexLimits::default()`＝ハード上限。
+    let regex_limits = match wire_server::regex_limits_opt::resolve(
+        wire_server::regex_limits_opt::RegexLimitsRawFlags {
+            max_pattern_len: max_regex_pattern_len_raw.as_deref(),
+            max_input_len: max_regex_input_len_raw.as_deref(),
+            max_compiled_size: max_regex_compiled_size_raw.as_deref(),
+        },
+    ) {
+        Ok(limits) => limits,
+        Err(e) => {
+            engine::log_stderr!("wire-server: invalid regex limit configuration: {e}");
+            return ExitCode::FAILURE;
+        }
+    };
+
     // Issue #1552: サブクエリ深さ・実行回数・CTE 定義数・CTE 連鎖深さの上限を bind・
     // ユーザーストア読込より前に解決する（fail-closed。範囲外・非数値は listen へ進まず
     // 起動エラー）。未指定は `NestingLimits::default()`＝ハード上限＝現行挙動。
@@ -2238,6 +2327,9 @@ fn run_server(args: &[String]) -> ExitCode {
     // Issue #2184: 未指定でも常に呼ぶ（`jsonpath_limits` は既定まで解決済み。既定は
     // ハード上限と同値）。SQL 表層からの利用は Issue #2185 以降。
     core = core.with_jsonpath_limits(jsonpath_limits);
+    // Issue #1786: 未指定でも常に呼ぶ（`regex_limits` は既定まで解決済み。既定は
+    // ハード上限と同値）。SQL 表層からの利用は Issue #1787 以降。
+    core = core.with_regex_limits(regex_limits);
     // Issue #1552: 未指定でも常に呼ぶ（`nesting_limits` は既定まで解決済み。既定は
     // ハード上限と同値で、未注入と挙動が同一）。
     core = core.with_nesting_limits(nesting_limits);
