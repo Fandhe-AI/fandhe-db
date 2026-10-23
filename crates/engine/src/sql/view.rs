@@ -587,7 +587,7 @@ pub(crate) fn check_order_exprs_within_view(
     };
     for key in order_keys {
         match key {
-            ScanOrderKey::Column(k) => {
+            ScanOrderKey::Column { key: k, .. } => {
                 if !columns.iter().any(|vc| vc == &k.column) {
                     return Err(SqlSurfaceError::undefined_column(&k.column));
                 }
@@ -821,7 +821,8 @@ pub(crate) fn check_window_columns_within_view(
                 return Err(SqlSurfaceError::undefined_column(col));
             }
         }
-        for (col, _) in &item.order_by {
+        for ob in &item.order_by {
+            let col = &ob.column;
             if !columns.iter().any(|vc| vc == col) {
                 return Err(SqlSurfaceError::undefined_column(col));
             }

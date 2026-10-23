@@ -287,7 +287,7 @@ fn plan_rows(
     let mut idents = HashSet::new();
     for item in &rows.window_items {
         idents.extend(item.partition_by.iter().cloned());
-        idents.extend(item.order_by.iter().map(|(c, _)| c.clone()));
+        idents.extend(item.order_by.iter().map(|ob| ob.column.clone()));
         if let Some(AggregateArg::Expr(e)) = &item.arg {
             super::parser::collect_expr_idents(e, &mut idents);
         }
@@ -298,7 +298,7 @@ fn plan_rows(
     }
     for key in &rows.order_keys {
         match key {
-            ScanOrderKey::Column(k) => {
+            ScanOrderKey::Column { key: k, .. } => {
                 idents.insert(k.column.clone());
             }
             ScanOrderKey::Expr { expr, .. } => {
@@ -1369,6 +1369,7 @@ mod tests {
                 args: vec![Expr::Ident(column.to_string())],
             },
             descending,
+            nulls: None,
         };
         let mk = |keys: Vec<ScanOrderKey>| ValidatedBufferedView {
             view_name: "v".to_string(),

@@ -831,7 +831,11 @@ pub(super) fn build_plan<'a>(
 }
 
 /// 解決済みの列から非集計 JOIN の並べ替えキーを作る（列キー・序数キー共通。並べ替え不能な型は `22000`）。
-fn plain_order_for(c: &Col, descending: bool) -> Result<PlainOrder, SqlSurfaceError> {
+fn plain_order_for(
+    c: &Col,
+    descending: bool,
+    nulls: Option<NullPlacement>,
+) -> Result<PlainOrder, SqlSurfaceError> {
     let class = cmp_class(c.ty.as_ref()).ok_or_else(|| {
         SqlSurfaceError::invalid_input(format!("unsupported ORDER BY column type: {}", c.name))
     })?;
@@ -840,7 +844,7 @@ fn plain_order_for(c: &Col, descending: bool) -> Result<PlainOrder, SqlSurfaceEr
         pos: c.pos,
         class,
         descending,
-        nulls: NullPlacement::pg_default(descending),
+        nulls: nulls.unwrap_or_else(|| NullPlacement::pg_default(descending)),
     })
 }
 
@@ -912,7 +916,7 @@ fn build_plain_shape(
                                 detail: "JOIN ORDER BY position out of range".to_string(),
                             })?;
                     let c = b.col(colref)?;
-                    order.push(plain_order_for(&c, key.descending)?);
+                    order.push(plain_order_for(&c, key.descending, key.nulls)?);
                     continue;
                 }
                 JoinProjection::All => {
@@ -947,7 +951,7 @@ fn build_plain_shape(
                 }
             };
             let c = b.col_from(rel, slot, ty.as_ref())?;
-            order.push(plain_order_for(&c, key.descending)?);
+            order.push(plain_order_for(&c, key.descending, key.nulls)?);
             continue;
         }
         // 非修飾の ORDER BY 対象が SELECT リストの別名に一致するときは、PostgreSQL と
@@ -980,7 +984,9 @@ fn build_plain_shape(
             pos: c.pos,
             class,
             descending: key.descending,
-            nulls: NullPlacement::pg_default(key.descending),
+            nulls: key
+                .nulls
+                .unwrap_or_else(|| NullPlacement::pg_default(key.descending)),
         });
     }
     Ok(Shape::Plain { output, order })
@@ -1165,7 +1171,9 @@ fn build_aggregate_shape(
             order.push(AggOrder {
                 target,
                 descending: key.descending,
-                nulls: NullPlacement::pg_default(key.descending),
+                nulls: key
+                    .nulls
+                    .unwrap_or_else(|| NullPlacement::pg_default(key.descending)),
             });
             continue;
         }
@@ -1239,7 +1247,9 @@ fn build_aggregate_shape(
         order.push(AggOrder {
             target: resolved,
             descending: key.descending,
-            nulls: NullPlacement::pg_default(key.descending),
+            nulls: key
+                .nulls
+                .unwrap_or_else(|| NullPlacement::pg_default(key.descending)),
         });
     }
 

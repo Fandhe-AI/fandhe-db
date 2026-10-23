@@ -75,8 +75,8 @@
 ## 対象外（Issue 起票なし・後続の管轄を除く）
 
 - `HAVING`／`ORDER BY` 内の集計関数呼び出し（`HAVING count(*) > 1`・`ORDER BY sum(x)`）は `42601` のまま。
-- 式位置での単項マイナス、`ORDER BY (expr)`・算術で始まるキー、`NULLS FIRST/LAST`。位置指定 `ORDER BY 1` は
-  Issue #1792 で対応した（下の「Issue #1792 追記」）。
+- 式位置での単項マイナス、`ORDER BY (expr)`・算術で始まるキー。位置指定 `ORDER BY 1` は
+  Issue #1792、`NULLS FIRST/LAST` は Issue #1791 で対応した（下の各「追記」）。
 - `SELECT DISTINCT ... ORDER BY <式>`・`GROUP BY` なしの `HAVING`・GROUP BY キー自体の式化。
 - NoSQL（HTTP）表層、JOIN・集合演算・ウィンドウと式 `ORDER BY` の併用。
 - 評価後射影形ビュー（集計・`LIMIT` 本文のビュー。Issue #1192）への外側 `ORDER BY` の式キー（列名キーと
@@ -104,6 +104,25 @@
 - 意図的に変えない: ウィンドウの `OVER (ORDER BY 1)`（PostgreSQL でも序数ではない）、`GROUP BY 1`
   （SQL-58 側の管轄）、NoSQL（HTTP）表層。
 - テスト: `tests/sql56_order_by_ordinal.rs`、`crates/wire-server/tests/wire_sql56_order_by_ordinal.rs`。
+
+## Issue #1791 追記（NULLS FIRST / LAST。SQL-56・TASK-298 のポインタ）
+
+- 構文: 各キーの `ASC`／`DESC` の直後に `NULLS FIRST|LAST` を受理する（`NULLS`／`FIRST`／`LAST` は予約語化せず
+  文脈的に照合するため、同名の列名キーは従来どおり使える）。対象は広域取得（列・式・序数・別名・`COLLATE` キー）、
+  ウィンドウの `OVER (ORDER BY ...)`、`GROUP BY` 集計、`SELECT DISTINCT`、JOIN（非集計・集計）、ビューの外側。
+  `NULLS` の後ろが `FIRST`/`LAST` でない形・順序違い（`NULLS FIRST DESC`）・重複・kNN 距離順（`<=>`・`HYBRID`）
+  への併用は `42601`（fail-closed）。
+- 設計: 公開型 `ScalarOrderKey` は変えない。明示キーを含む広域取得は、序数・式キーと同じく crate 内の完全形
+  （`order_keys`）へ振り分け、束縛段が `NullPlacement` を確定して比較器（#1790）へ渡す。指定なしは従来どおり
+  `pg_default(descending)`（ASC は末尾・DESC は先頭）で、既存クエリの経路・結果は変わらない。
+  `qualified_column` の再解釈防止に `x.nulls FIRST`／`NULLS x.first` を追加した。
+- 経路ごとの判断: 疑似列 `id` は NULL にならず一意なので `NULLS` は順序に影響しない（範囲走査の早期打ち切りを
+  そのまま使う）。式索引の順序付き走査 API（ASC NULLS LAST 前提）は本番の ORDER BY 経路から呼ばれていない。
+- 該当なし／対象外: 集計関数内の `ORDER BY`（`string_agg(x ORDER BY y)` 等）と集合演算の `ORDER BY` は構文自体が
+  未実装（`42601` のまま）。NoSQL（HTTP）`sort` での NULL 位置指定は対象外。
+- テスト: `tests/sql56_order_by_nulls.rs`（経路 × ASC/DESC × NULLS FIRST/LAST の独立オラクル照合・RLS・拒否形）。
+  従来 `NULLS LAST` を `42601` としていた `sql25_scalar_order_by.rs`・`sql25_aggregate_order_by_scalar_keys.rs`・
+  `sql27_explain_targets.rs`・`sql30_window.rs` の拒否ケースは、受理後も拒否される `NULLS MIDDLE` へ置き換えた。
 
 ## PostgreSQL との既知の差分
 

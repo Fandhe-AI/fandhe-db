@@ -43,7 +43,7 @@
 //! 決め、投影段がその順列で base scan の出力行とウィンドウ値を対応付ける。
 //!
 //! 対象外（`42601`／`54000` で fail-closed に拒否。allowlist・parser 側で既に拒否
-//! 済みの形も含む）: フレーム句（`ROWS`/`RANGE`/`GROUPS`）・`NULLS FIRST/LAST`・
+//! 済みの形も含む）: フレーム句（`ROWS`/`RANGE`/`GROUPS`）・
 //! 名前付きウィンドウ・`FILTER (...)`・関数内 `DISTINCT`・複合式の引数・
 //! ベクトル順位付け（`ORDER BY embedding <=> ...`）／`USING PLAN` との併用・
 //! ウィンドウ別名による文全体の `ORDER BY`・`GROUP BY`／集計 SELECT との併用。

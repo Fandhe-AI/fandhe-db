@@ -36,7 +36,7 @@
 | 文全体のスカラー `ORDER BY [ASC\|DESC][, ...]`（`LIMIT`／`OFFSET` 付き。Issue #1189） | 受理（ウィンドウ値は全母集合で評価し、並べ替え・`LIMIT`／`OFFSET` は出力行にのみ効く） |
 | 文全体のベクトル `ORDER BY`（検索 SELECT）・`USING PLAN`・`GROUP BY`／集計 SELECT・`SELECT DISTINCT` との併用 | `42601`（構造的に相互排他） |
 | 文全体の `ORDER BY` でのウィンドウ別名参照（実在する同名列がある場合はその列として解釈） | `42601` |
-| フレーム句（`ROWS`/`RANGE`/`GROUPS`）・`NULLS FIRST/LAST`・名前付きウィンドウ（`WINDOW`/`OVER w`）・`FILTER (...)`・関数内 `DISTINCT`・複合式の引数・式の中へのウィンドウ呼び出し（`ROW_NUMBER() OVER () + 1` 等）・`*` とウィンドウ項目の混在 | `42601` |
+| フレーム句（`ROWS`/`RANGE`/`GROUPS`）・名前付きウィンドウ（`WINDOW`/`OVER w`）・`FILTER (...)`・関数内 `DISTINCT`・複合式の引数・式の中へのウィンドウ呼び出し（`ROW_NUMBER() OVER () + 1` 等）・`*` とウィンドウ項目の混在 | `42601` |
 | `WHERE` でのウィンドウ別名参照（実在する同名列がある場合はその列として解釈） | `42601` |
 | `CREATE VIEW` 本文への `OVER` 混入 | `42601`（`parse_view_body` が構造上受理しない） |
 
@@ -126,7 +126,7 @@
 - ウィンドウ関数の結果による文全体の `ORDER BY`（`ORDER BY rn`）。base scan への委譲方式では評価できない
 - `EXPLAIN` とウィンドウ関数の併用（`ORDER BY` の有無を問わず `42601`）
 - `GROUP BY`／集計 SELECT とウィンドウの併用
-- フレーム指定・`NULLS FIRST/LAST`・名前付きウィンドウ・`FILTER (...)`・
+- フレーム指定・名前付きウィンドウ・`FILTER (...)`・
   関数内 `DISTINCT`・複合式の引数
 - 式の中へのウィンドウ呼び出しの埋め込み
 - 検索 SELECT（ベクトル `ORDER BY`・`HYBRID`・`USING PLAN`）へのウィンドウ追加

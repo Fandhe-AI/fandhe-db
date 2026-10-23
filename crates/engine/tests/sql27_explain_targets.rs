@@ -954,7 +954,7 @@ fn scalar_order_by_aggregate_explain_error_codes_match_non_explain() {
     );
     let cases: Vec<(String, &str)> = vec![
         (
-            "SELECT lang, COUNT(*) AS c FROM docs GROUP BY lang ORDER BY lang NULLS LAST".into(),
+            "SELECT lang, COUNT(*) AS c FROM docs GROUP BY lang ORDER BY lang NULLS MIDDLE".into(),
             "42601",
         ),
         (

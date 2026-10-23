@@ -229,7 +229,31 @@ fn is_contextual_syntax_use(tokens: &[Token], i: usize, name: &str) -> bool {
     if name.eq_ignore_ascii_case("partition") {
         return matches!(next, Some(Token::Keyword(Keyword::By)));
     }
+    // `ORDER BY ... NULLS FIRST|LAST`（SQL-56・Issue #1791）。`x.nulls FIRST`／`NULLS x.first` を
+    // 修飾が外れた後に NULL 位置指定と誤読し、列の検証なしで受理されるのを防ぐ。
+    if name.eq_ignore_ascii_case("nulls") {
+        // 隣接語は素の `Ident` だけでなく修飾付き（`docs.first`）も対象にする
+        // （両語が修飾された `docs.nulls docs.first` が正規化後に NULLS FIRST と誤読されるため）。
+        return next
+            .and_then(token_word)
+            .is_some_and(|w| w.eq_ignore_ascii_case("first") || w.eq_ignore_ascii_case("last"));
+    }
+    if name.eq_ignore_ascii_case("first") || name.eq_ignore_ascii_case("last") {
+        let prev = i.checked_sub(1).and_then(|p| tokens.get(p));
+        return prev
+            .and_then(token_word)
+            .is_some_and(|w| w.eq_ignore_ascii_case("nulls"));
+    }
     false
+}
+
+/// 識別子語として読めるトークンの語（素の `Ident` と修飾付き `QualifiedIdent` の名前部）。
+fn token_word(tok: &Token) -> Option<&str> {
+    match tok {
+        Token::Ident(w) => Some(w.as_str()),
+        Token::QualifiedIdent { name, .. } => Some(name.as_str()),
+        _ => None,
+    }
 }
 
 /// 後段パーサが `Ident` を構文語として消費しうる語か（修飾列名の再解釈防止用）。

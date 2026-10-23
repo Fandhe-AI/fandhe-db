@@ -9,6 +9,9 @@
 
 ### Added
 
+- `ORDER BY <key> [ASC|DESC] NULLS FIRST|LAST` を広域取得・ウィンドウ・`GROUP BY` 集計・`SELECT DISTINCT`・JOIN・
+  ビューの各経路で受理する（Issue #1791・SQL-56）。指定なしは従来どおり（ASC は末尾・DESC は先頭）。
+  不正な指定と kNN 距離順への併用は `42601`。詳細は [order-by-having-expressions.md](docs/design/order-by-having-expressions.md)。
 - `WHERE <col> [NOT] LIKE|ILIKE '<pattern>' ESCAPE '<c>'` を受理する（Issue #1779・SQL-54）。構文層で既定の `\` 形へ
   正規化するため評価・索引・台帳の扱いは ESCAPE 無しと同じ。`ESCAPE ''` はエスケープ無効。
   詳細は [like-wildcard-patterns.md](docs/design/like-wildcard-patterns.md)。
