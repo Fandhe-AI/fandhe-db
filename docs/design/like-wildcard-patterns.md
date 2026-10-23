@@ -1,7 +1,8 @@
 # SQL `LIKE` のワイルドカード拡張（中間一致・後方一致・`_`）
 
 Issue #914・対象ビヘイビア: SQL-24（TASK-208）。関連ポインタ:
-EXT-3・TASK-147（前方一致限定の既存実装）。
+EXT-3・TASK-147（前方一致限定の既存実装）。`ILIKE` の畳み込み範囲は Issue #1777
+（親 #1776・SQL-54・TABLE-28 ポインタ）で決定し、実装は #1778 が担う。
 
 spec 本文は転記しない（`.claude/rules/spec-confidentiality.md` 準拠）。本ドキュメントは
 本リポ側の実装判断・設計記録のみを扱う。
@@ -37,7 +38,9 @@ EXT-3（TASK-147）時点の SQL 表層 `WHERE <col> LIKE '<pattern>'` は「末
 4. **`ESCAPE '<c>'` 句**: 対応しない。構文上、パターン直後の `ESCAPE`
    識別子は述語の区切りにならず文として受け付けられない（`42601`）。
 5. **NULL**: 常に不一致（既存の三値論理の契約を踏襲）。
-6. **大文字小文字**: 区別する（`ILIKE` は引き続き `42601`）。
+6. **大文字小文字**: `LIKE` は区別する。`ILIKE` の畳み込み範囲は後述の
+   「`ILIKE` の大文字小文字の畳み込み範囲」節で決定済みで、受理は #1778 で
+   実装する（それまでは `42601`）。
 7. **`'%'` 単独**: 非 NULL の全行に一致する（PostgreSQL 互換）。EXT-3 時代の
    「空 prefix は無意味なので拒否する」という規約を SQL の `LIKE` に限って
    置き換える。Rust API の `DeclarativeFilter::starts_with("")` は従来どおり
@@ -68,6 +71,65 @@ EXT-3（TASK-147）時点の SQL 表層 `WHERE <col> LIKE '<pattern>'` は「末
   `None` を返す（「一致 0 件」`Some(vec![])` と区別する。呼び出し元は全行
   走査へ縮退する）。
 
+## `ILIKE` の大文字小文字の畳み込み範囲（Issue #1777）
+
+ドキュメントのみの決定で、コードは変えない。実装は #1778。根拠は PostgreSQL 17
+の公開挙動（`like.c`・`formatting.c` の読解。実測は未実施）と本実装の性質だけ
+で説明し、spec 本文は転記しない。
+
+### 決定
+
+- 実効照合（`Collation::effective` の導出結果）が `C`／`POSIX`／照合指定なしの
+  場合、**ASCII の英字（`A-Z`↔`a-z`）だけ**を畳み込む。現状の TEXT 列は
+  すべてこれに当たる。
+- 非 ASCII の文字（`É`・`Σ`・全角 `Ａ`・ケルビン記号 U+212A など）は**拒否せず
+  そのまま比べる**。バイトが完全一致するときだけ一致とし、大文字小文字は
+  区別する。
+- 実効照合が ICU（`und-x-icu`・`ja-x-icu`）の場合は `0A000` で拒否する
+  （fail-closed）。黙って ASCII で畳み込まない。照合依存の畳み込みを結線
+  するまでの措置で、追跡は既存の対象外項目「照合依存の `LOWER`／`UPPER`／
+  `ILIKE`」（implementation-status の #2190 項）に寄せる。
+- 照合の衝突は既存の導出規則に従う（明示同士は `42P21`、暗黙同士は `42P22`）。
+  新しい `wire_code` は追加しない。
+
+### PostgreSQL 17 の挙動と本実装の採否
+
+| 照合 | PostgreSQL の畳み込み | 本実装 |
+| ---- | -------------------- | ------ |
+| `C`／`POSIX` | `lower()` が ASCII の `A-Z` だけ変換 | ASCII だけ畳み込む |
+| libc ロケール | 1 文字ごとの `towlower`（単純変換） | 対象外（本実装に無い） |
+| ICU | `u_strToLower`（ロケール依存のフル変換） | `0A000` |
+| 非決定的照合 | `ILIKE` 非対応のエラー（`0A000`） | 同左（導入時） |
+
+### 理由
+
+1. PostgreSQL の `C` 照合下の `ILIKE` と結果が一致する
+   （例: `'É' ILIKE 'é'` は偽）。非 ASCII を拒否するとデータの中身で
+   クエリがエラーになり互換も壊れる。Unicode で畳み込むと PostgreSQL と
+   結果が食い違う。
+2. ASCII の畳み込みは 1 文字が 1 文字・1 バイトが 1 バイトに対応する。`_`
+   の意味、`MAX_LIKE_PATTERN_LEN`、値の長さが変わらない。Unicode のフル
+   変換は文字数・バイト長を変える（`İ`、`ß`→`SS`）。
+3. 決定的で、ロケールにも OS にも依存しない。DoS 上限（O(n·m)）も保たれる。
+4. 新しい依存が要らない（ロケール依存変換には ICU4X の casemap 系クレートが
+   必要で、dependency-policy の承認を要する）。
+
+### #1778 への実装制約
+
+- パターンのリテラル文字はコンパイル時に、値は照合時に ASCII で小文字化し、
+  既存の `LikePattern::matches` を再利用する。畳み込みは `%`・`_`・`\` を
+  生まず消さないので、エスケープの意味論は変わらない。
+- `string_fn::lower` を `ILIKE` の評価に再利用しない（文字数が変わり `_` の
+  意味が壊れ、PostgreSQL の `C` とも食い違う）。
+- `ILIKE` はワイルドカードなし・純粋な前方一致でも `Equals`／`StartsWith`
+  へ振り分けない（スカラー二次索引は大文字小文字を区別する）。
+  `classify_scalar_plan` と `ScalarIndex::candidates_for` の両方で
+  `PlainScan` へ縮退させ、索引の有無で結果を変えない。
+- NULL は不一致、`NOT ILIKE` は否定、パターン長の上限（生パターンのバイト長
+  を確保前に検査し超過は `54000`）は `LIKE` と同じ。RLS の適用は変えない。
+- NoSQL `filter` には `ilike` を加えない（`42601` のまま）。`ESCAPE` 句
+  （#1779）と左辺の式（#1780）は別 Issue。
+
 ## パターン長の上限
 
 `MAX_LIKE_PATTERN_LEN = 4096` バイト。判定対象は生パターン（エスケープ解除
@@ -85,12 +147,19 @@ m は `MAX_LIKE_PATTERN_LEN` で定数に抑える）。
 
 - パターン末尾の単独エスケープ文字は PostgreSQL の `22025` ではなく `22000`
   で拒否する（3 章参照。`wire_code` 契約の新設が前提になるためスコープ外）。
-- `ESCAPE '<c>'` 句・`ILIKE`・`SIMILAR TO` は未対応。
+- `ESCAPE '<c>'` 句・`SIMILAR TO` は未対応。
+- `ILIKE` は方針決定済み・実装は #1778（それまでは `42601`）。方針は次節。
+  `C` 系の照合では PostgreSQL と同じ結果になる。ICU 照合の列に対する
+  `ILIKE` は `0A000`（PostgreSQL は受理する）。
+- `lower(col) LIKE lower('p')` と `col ILIKE 'p'` は、`C` 系の照合でも非 ASCII
+  を含む値で結果が異なりうる。`string_fn::lower` は Unicode のフル変換で、
+  `ILIKE` は ASCII だけを畳み込むため（PostgreSQL の `C` 照合では `lower()`
+  も ASCII だけなので両者は一致する。挙動変更は対象外）。
 
 ## スコープ外（Issue 起票はしない。実装 PR の note として記録）
 
 - `22025`（invalid escape sequence）の `wire_code` 追加と HTTP 射影
-- `LIKE ... ESCAPE '<c>'` 句・`ILIKE`・`SIMILAR TO`
+- `LIKE ... ESCAPE '<c>'` 句・`SIMILAR TO`（`ILIKE` は #1778 で実装）
 - `NOT LIKE`（別 Issue の `NOT` 対応に委ねる）
 - NoSQL `filter` の `like` op（NOSQL-14）
 - `LIKE` パターンへの `$n` 束縛
