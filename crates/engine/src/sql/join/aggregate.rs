@@ -28,6 +28,7 @@ use super::plan::{AggOrderTarget, AggOut, AggPlan};
 use super::residual::row_at;
 use super::values::{cell_scalar, cmp_val, compare_order, encode_key_component};
 use super::{cell_payload_bytes, JoinBudget};
+use crate::sql::order_value::NullPlacement;
 
 struct Group {
     key_cells: Vec<Cell>,
@@ -275,20 +276,20 @@ pub(super) fn run_aggregate(
     }
     // 検証済みのため、比較器内の `get`／`cmp_val` の失敗は起こらない（起きても
     // Equal で順序を変えないだけで値は返さない）。
-    let key_cmp = |a: &Finished, b: &Finished, k: usize, descending: bool| {
+    let key_cmp = |a: &Finished, b: &Finished, k: usize, descending: bool, nulls: NullPlacement| {
         let (Some(ca), Some(cb), Some(kp)) =
             (a.key_cells.get(k), b.key_cells.get(k), agg.keys.get(k))
         else {
             return std::cmp::Ordering::Equal;
         };
         match (cmp_val(ca, &kp.cmp_class), cmp_val(cb, &kp.cmp_class)) {
-            (Ok(va), Ok(vb)) => compare_order(va.as_ref(), vb.as_ref(), descending),
+            (Ok(va), Ok(vb)) => compare_order(va.as_ref(), vb.as_ref(), descending, nulls),
             _ => std::cmp::Ordering::Equal,
         }
     };
     finished.sort_by(|a, b| {
         for k in 0..agg.keys.len() {
-            let ord = key_cmp(a, b, k, false);
+            let ord = key_cmp(a, b, k, false, NullPlacement::Last);
             if ord != std::cmp::Ordering::Equal {
                 return ord;
             }
@@ -299,10 +300,10 @@ pub(super) fn run_aggregate(
         finished.sort_by(|a, b| {
             for o in &agg.order {
                 let ord = match o.target {
-                    AggOrderTarget::Key(k) => key_cmp(a, b, k, o.descending),
+                    AggOrderTarget::Key(k) => key_cmp(a, b, k, o.descending, o.nulls),
                     AggOrderTarget::Item(i) => match (a.item_cells.get(i), b.item_cells.get(i)) {
                         (Some(x), Some(y)) => {
-                            crate::sql::group_by::cmp_cells_pg_nulls(x, y, o.descending)
+                            crate::sql::group_by::cmp_cells_pg_nulls(x, y, o.descending, o.nulls)
                         }
                         _ => std::cmp::Ordering::Equal,
                     },

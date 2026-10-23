@@ -21,6 +21,7 @@ use crate::sql::allowlist::{
     OrderByForm, Projection, ScalarOrderKey, UpsertAddOperand, UpsertValue, ValidatedDelete,
     ValidatedInsert, ValidatedPredicateDelete, ValidatedStatement, WherePredicate,
 };
+use crate::sql::order_value::NullPlacement;
 use crate::sql::plan::EvaluationOrder;
 use crate::sql::udf_call::Expr;
 use crate::sql::using_operation_id::OperationId;
@@ -6422,6 +6423,8 @@ pub(crate) enum OrderTarget {
 pub(crate) struct BoundOrderBy {
     pub(crate) target: OrderTarget,
     pub(crate) descending: bool,
+    /// NULL の出力位置（SQL-56）。束縛段が既定値で確定させ、比較器へそのまま渡す。
+    pub(crate) nulls: NullPlacement,
 }
 
 /// 束縛済みの `GROUP BY` 句（TASK-167・SQL-14。SQL-25 (d) で複数列へ拡張）。
@@ -6642,6 +6645,7 @@ impl BoundAggregate {
             order_by.push(BoundOrderBy {
                 target,
                 descending: key.descending,
+                nulls: NullPlacement::pg_default(key.descending),
             });
         }
         group_by.order_by = order_by;
@@ -7673,6 +7677,10 @@ pub(crate) struct BoundOrderKey {
     pub(crate) target: BoundOrderTarget,
     pub(crate) kind: OrderKind,
     pub(crate) descending: bool,
+    /// NULL の出力位置（SQL-56）。束縛段が `NullPlacement::pg_default(descending)` で確定させ、
+    /// 比較器（`sql::order_value::compare_nullable`）へそのまま渡す。`GROUP BY` キーとして使う場合は
+    /// 比較に参照されない（`descending` と同じく未使用）。
+    pub(crate) nulls: NullPlacement,
     /// キーの実効照合（TABLE-28・Issue #1610。明示 `COLLATE` → 列の照合 → 既定の順）。
     /// TEXT 系以外のキー（`Id`・数値・日時等）は常に [`crate::collation::Collation::DEFAULT`]
     /// （照合を持たない型では意味を持たない）。キー抽出（`sql::order_value`）が値をソートキーへ
@@ -7741,6 +7749,7 @@ fn bind_scalar_order_by(
                 target: BoundOrderTarget::Column(index),
                 kind,
                 descending: key.descending,
+                nulls: NullPlacement::pg_default(key.descending),
                 collation,
             });
             continue;
@@ -7750,6 +7759,7 @@ fn bind_scalar_order_by(
                 target: BoundOrderTarget::Id,
                 kind: OrderKind::Id,
                 descending: key.descending,
+                nulls: NullPlacement::pg_default(key.descending),
                 collation: crate::collation::Collation::DEFAULT,
             });
             continue;
@@ -7844,6 +7854,7 @@ fn bind_scan_order_keys(
                             target: BoundOrderTarget::Expr(exprs.len()),
                             kind: OrderKind::Jsonb,
                             descending: k.descending,
+                            nulls: NullPlacement::pg_default(k.descending),
                             collation: crate::collation::Collation::DEFAULT,
                         });
                         exprs.push((be, program));
@@ -7915,6 +7926,7 @@ fn bind_scan_order_keys(
                         target: BoundOrderTarget::Expr(exprs.len()),
                         kind,
                         descending: *descending,
+                        nulls: NullPlacement::pg_default(*descending),
                         collation: key_collation,
                     });
                     exprs.push((be, program));
@@ -7931,6 +7943,7 @@ fn bind_scan_order_keys(
                     target: BoundOrderTarget::Expr(exprs.len()),
                     kind,
                     descending: *descending,
+                    nulls: NullPlacement::pg_default(*descending),
                     collation: crate::collation::Collation::DEFAULT,
                 });
                 exprs.push((expr.clone(), program));
@@ -8246,9 +8259,17 @@ pub(crate) struct BoundWindowItem {
     pub(crate) func: crate::sql::allowlist::WindowFunc,
     pub(crate) input: Option<AggregateInput>,
     pub(crate) partition_by: Vec<WindowKeyRef>,
-    /// `(キー, 降順か)` の順序保持リスト。
-    pub(crate) order_by: Vec<(WindowKeyRef, bool)>,
+    /// 宣言順のウィンドウ `ORDER BY` キー列（SQL-30・SQL-56）。
+    pub(crate) order_by: Vec<BoundWindowOrderKey>,
     pub(crate) name: String,
+}
+
+/// ウィンドウ `ORDER BY` の束縛済み 1 キー（キー参照・降順指定・NULL 位置。SQL-30・SQL-56）。
+#[derive(Debug, Clone, PartialEq)]
+pub(crate) struct BoundWindowOrderKey {
+    pub(crate) key: WindowKeyRef,
+    pub(crate) descending: bool,
+    pub(crate) nulls: NullPlacement,
 }
 
 /// ウィンドウ項目の `PARTITION BY`／`ORDER BY` キー 1 つの列名を `schema` と
@@ -8359,7 +8380,11 @@ fn bind_window_item(
     }
     let mut order_by = Vec::with_capacity(item.order_by.len());
     for (name, descending) in &item.order_by {
-        order_by.push((resolve_window_key(name, schema)?, *descending));
+        order_by.push(BoundWindowOrderKey {
+            key: resolve_window_key(name, schema)?,
+            descending: *descending,
+            nulls: NullPlacement::pg_default(*descending),
+        });
     }
 
     let name = item
@@ -8706,6 +8731,7 @@ fn resolve_group_by_key(
             target: BoundOrderTarget::Column(index),
             kind,
             descending: false,
+            nulls: NullPlacement::pg_default(false),
             collation,
         });
     }
@@ -8714,6 +8740,7 @@ fn resolve_group_by_key(
             target: BoundOrderTarget::Id,
             kind: OrderKind::Id,
             descending: false,
+            nulls: NullPlacement::pg_default(false),
             collation: crate::collation::Collation::DEFAULT,
         });
     }
@@ -8930,6 +8957,7 @@ fn bind_group_by_clause(
         order_by.push(BoundOrderBy {
             target,
             descending: ob.descending,
+            nulls: NullPlacement::pg_default(ob.descending),
         });
     }
 
@@ -11332,11 +11360,13 @@ mod tests {
             vec![
                 BoundOrderBy {
                     target: OrderTarget::Aggregate(0),
-                    descending: true
+                    descending: true,
+                    nulls: NullPlacement::pg_default(true),
                 },
                 BoundOrderBy {
                     target: OrderTarget::GroupKey(0),
-                    descending: false
+                    descending: false,
+                    nulls: NullPlacement::pg_default(false),
                 },
             ]
         );

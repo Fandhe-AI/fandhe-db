@@ -14,7 +14,7 @@ use crate::catalog::ColumnType;
 use crate::row_codec::ScalarRef;
 use crate::sql::allowlist::SqlSurfaceError;
 use crate::sql::exec::Cell;
-use crate::sql::order_value::compare_f64;
+use crate::sql::order_value::{compare_f64, compare_nullable, NullPlacement};
 use crate::sql::udf_call::BinOp;
 
 /// JOIN 結合キー・グループキーの型クラス（Issue #925 §2.3）。整数クラス（疑似列
@@ -250,32 +250,9 @@ pub(crate) fn compare_order(
     a: Option<&CmpVal<'_>>,
     b: Option<&CmpVal<'_>>,
     descending: bool,
+    nulls: NullPlacement,
 ) -> Ordering {
-    match (a, b) {
-        (None, None) => Ordering::Equal,
-        (None, Some(_)) => {
-            if descending {
-                Ordering::Less
-            } else {
-                Ordering::Greater
-            }
-        }
-        (Some(_), None) => {
-            if descending {
-                Ordering::Greater
-            } else {
-                Ordering::Less
-            }
-        }
-        (Some(x), Some(y)) => {
-            let base = compare_vals(x, y);
-            if descending {
-                base.reverse()
-            } else {
-                base
-            }
-        }
-    }
+    compare_nullable(a, b, descending, nulls, compare_vals)
 }
 
 /// 比較演算子（`= < <= > >=`）の適用。`Ordering` が定まらない（どちらかが
@@ -351,9 +328,18 @@ mod tests {
     #[test]
     fn order_places_nulls_last_for_asc_and_first_for_desc() {
         let one = CmpVal::Int(1);
-        assert_eq!(compare_order(Some(&one), None, false), Ordering::Less);
-        assert_eq!(compare_order(Some(&one), None, true), Ordering::Greater);
-        assert_eq!(compare_order(None, None, true), Ordering::Equal);
+        assert_eq!(
+            compare_order(Some(&one), None, false, NullPlacement::pg_default(false)),
+            Ordering::Less
+        );
+        assert_eq!(
+            compare_order(Some(&one), None, true, NullPlacement::pg_default(true)),
+            Ordering::Greater
+        );
+        assert_eq!(
+            compare_order(None, None, true, NullPlacement::pg_default(true)),
+            Ordering::Equal
+        );
     }
 
     #[test]
