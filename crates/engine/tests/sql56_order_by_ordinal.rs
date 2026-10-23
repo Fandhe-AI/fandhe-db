@@ -415,6 +415,35 @@ fn aggregate_ordinal_resolves_keys_aggregates_and_expression_items() {
     assert_eq!(first_texts(&by_expr), vec!["fr", "en", "ja"]);
 }
 
+/// 集計式の序数キーは投影と同じ整数演算で評価する（MIN(n) / 2 は整数除算）。
+#[test]
+fn aggregate_expr_ordinal_uses_projection_integer_arithmetic() {
+    let (core, _g) = build("sql56-agg-intdiv");
+    let ctx = ctx_for("tenant-a");
+    // ja=MIN 2 → 1、en=MIN 0 → 0、fr=MIN 3 → 1。第 2 キーは整数除算の値で tie になり第 1 キーで解く。
+    let result = run(
+        &core,
+        &ctx,
+        "SELECT lang, MIN(n) / 2 FROM docs GROUP BY lang ORDER BY 2, 1",
+    );
+    assert_eq!(first_texts(&result), vec!["en", "fr", "ja"]);
+}
+
+/// ウィンドウ別名と序数の混在 ORDER BY も別名参照は 42601（42703 に落ちない）。
+#[test]
+fn scan_window_alias_mixed_with_ordinal_is_42601() {
+    let (core, _g) = build("sql56-win-mixed");
+    let ctx = ctx_for("tenant-a");
+    assert_eq!(
+        run_err(
+            &core,
+            &ctx,
+            "SELECT lang, ROW_NUMBER() OVER () AS rn FROM docs ORDER BY 1, rn LIMIT 100"
+        ),
+        "42601"
+    );
+}
+
 #[test]
 fn aggregate_ordinal_out_of_range_is_42p10() {
     let (core, _g) = build("sql56-agg-range");

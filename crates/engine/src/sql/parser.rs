@@ -8710,10 +8710,19 @@ pub(crate) fn bind_scan_with_dummy_flags(
         // Issue #1189: 文全体の ORDER BY がウィンドウ別名を参照する形も同じ理由
         // （ウィンドウ値は base scan の並べ替えより後に確定する）で 42601。
         // 実在列・疑似列 `id` が同名なら列参照として解釈する。
-        for key in stmt.order_by() {
-            if window_aliases.contains(key.column.as_str())
-                && !(key.column == "id" && schema.has_pseudo_id())
-                && !schema.columns.iter().any(|c| c.name == key.column)
+        // 序数・式キーが混在すると `order_by` は空で `order_keys` が正本になるため、
+        // 両方から素の列キー名を集めて検査する。
+        let mut order_key_names: Vec<&str> =
+            stmt.order_by().iter().map(|k| k.column.as_str()).collect();
+        for key in &stmt.order_keys {
+            if let crate::sql::allowlist::ScanOrderKey::Column(k) = key {
+                order_key_names.push(k.column.as_str());
+            }
+        }
+        for name in order_key_names {
+            if window_aliases.contains(name)
+                && !(name == "id" && schema.has_pseudo_id())
+                && !schema.columns.iter().any(|c| c.name == name)
             {
                 return Err(SqlSurfaceError::unsupported(
                     "ORDER BY cannot reference a window function alias",
@@ -9010,6 +9019,7 @@ fn bind_group_by_clause(
     // 解決してから合成列名へ置換するため、`id` 等の疑似列やベースの列が黙って参照される
     // ことはない。
     let view_schema = group_row_schema(schema, &keys, items, false);
+    let precise_view_schema = group_row_schema(schema, &keys, items, true);
     let mut group_row_mask = vec![false; keys.len().saturating_add(items.len())];
     let mut having_exprs = Vec::with_capacity(clause.having_exprs.len());
     for pred in &clause.having_exprs {
@@ -9075,12 +9085,15 @@ fn bind_group_by_clause(
                                     })
                                 };
                             let rewritten = rewrite_group_row_idents(expr, &resolve_item)?;
-                            let (bound, ty) = crate::sql::udf_call::bind_expr(
-                                &rewritten,
-                                &view_schema,
-                                udfs,
-                                node_budget,
-                            )?;
+                            // 投影側と同じ精密な行スキーマ・束縛（整数除算等を保つ）で評価し、
+                            // 序数キーの順序を出力列の値と一致させる（Issue #1792 レビュー指摘）。
+                            let (bound, ty, _) =
+                                crate::sql::udf_call::bind_aggregate_projection_expr_top(
+                                    &rewritten,
+                                    &precise_view_schema,
+                                    udfs,
+                                    node_budget,
+                                )?;
                             let kind = order_kind_for_expr_type(ty)?;
                             crate::sql::udf_call::mark_referenced_scalar_columns(
                                 &bound,
