@@ -302,6 +302,14 @@ pub(crate) fn render_expr(expr: &Expr) -> String {
         Expr::NullIf(lhs, rhs) => {
             format!("NULLIF({}, {})", render_expr(lhs), render_expr(rhs))
         }
+        // 構文段が CHECK 本体での `IS [NOT] DISTINCT FROM` を拒否するため通常は到達しない
+        // （網羅のための PG 構文描画。常に丸括弧で囲み往復の一意性を保つ。SQL-54）。
+        Expr::IsDistinctFrom { negated, lhs, rhs } => format!(
+            "({} IS {}DISTINCT FROM {})",
+            render_expr(lhs),
+            if *negated { "NOT " } else { "" },
+            render_expr(rhs)
+        ),
         // `DATE`／`TIMESTAMP` 型付きリテラル（対象ビヘイビア: SQL-26。
         // Issue #920）。解析済みの内部表現から正規化済みテキストを再構成する
         // （生文字列を保持しないため、区切り文字の表記揺れが往復で発生しない）。
@@ -362,7 +370,7 @@ fn normalize_session_local_expr(expr: &mut Expr) {
             normalize_session_local_expr(lhs);
             normalize_session_local_expr(rhs);
         }
-        Expr::NullIf(lhs, rhs) => {
+        Expr::NullIf(lhs, rhs) | Expr::IsDistinctFrom { lhs, rhs, .. } => {
             normalize_session_local_expr(lhs);
             normalize_session_local_expr(rhs);
         }
@@ -658,7 +666,7 @@ fn referenced_column_names(
                     collect_idents(a, acc);
                 }
             }
-            Expr::NullIf(lhs, rhs) => {
+            Expr::NullIf(lhs, rhs) | Expr::IsDistinctFrom { lhs, rhs, .. } => {
                 collect_idents(lhs, acc);
                 collect_idents(rhs, acc);
             }
@@ -1053,6 +1061,11 @@ pub(crate) fn map_expr_idents(expr: &Expr, f: &dyn Fn(&str) -> String) -> Expr {
         }
         Expr::Coalesce(args) => Expr::Coalesce(args.iter().map(rec).collect()),
         Expr::NullIf(a, b) => Expr::NullIf(Box::new(rec(a)), Box::new(rec(b))),
+        Expr::IsDistinctFrom { negated, lhs, rhs } => Expr::IsDistinctFrom {
+            negated: *negated,
+            lhs: Box::new(rec(lhs)),
+            rhs: Box::new(rec(rhs)),
+        },
         Expr::Collate { expr, collation } => Expr::Collate {
             expr: Box::new(rec(expr)),
             collation: *collation,

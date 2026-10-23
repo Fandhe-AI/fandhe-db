@@ -260,6 +260,9 @@ origin/main 取り込み時の是正: 並行実装していた Issue #921 のタ
 - `Cast{expr, ty}`＝タグ 16・変換先の正規の綴り（`CastType::to_sql`。固定語彙のみ。長さ前置）・`expr`
   （Issue #1590・SQL-47。`UPDATE` の `SET` 式や述語形の WHERE に `CAST` が入りうるためハッシュする。
   型だけ・被演算子だけ・`CAST` の有無だけが異なる式は互いに異なるハッシュになる。既存タグ 1〜15 は不変）
+- `IsDistinctFrom{negated, lhs, rhs}`＝タグ 20・`negated` 1 バイト（`0`＝`IS DISTINCT FROM`・`1`＝`IS NOT DISTINCT FROM`）・
+  `lhs`・`rhs`（Issue #1783・SQL-54。述語形の WHERE に入りうるためハッシュする。否定の有無・左右の入れ替えは
+  別ハッシュ。既存タグは不変）
 
 型バイトで `DATE`／`TIMESTAMP` を区別するのは、同じ暦日を表す
 `DATE '2024-01-01'` と `TIMESTAMP '2024-01-01 00:00:00'` を型バイトなしで

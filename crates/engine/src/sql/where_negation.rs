@@ -26,6 +26,7 @@
 //! | `Expression(a > b)` 等 | 演算子反転（`>`↔`<=`、`<`↔`>=`） |
 //! | `Expression(a = b)` | `Or([a < b], [a > b])`（`BinOp` に `<>` が無いため。`a <> b` もこの形へ脱糖） |
 //! | `Expression(x op ANY\|ALL (a))` | 量化子を反転し演算子を否定（TABLE-35・Issue #1603） |
+//! | `Expression(a IS [NOT] DISTINCT FROM b)` | `negated` を反転（結果が NULL にならず厳密に同値。SQL-54・Issue #1783） |
 //! | `visible()` | `42601`（RLS-7: 否定越しに RLS 述語を扱わせない） |
 //! | `IN (SELECT)`／`EXISTS` | `Not(..)`（解決段 `sql::subquery` が NULL 規則込みで否定形を評価する。Issue #1191） |
 //! | `<col> <op> (SELECT)` | 演算子反転（`=`↔`<>`・`<`↔`>=`・`>`↔`<=`。Issue #1191） |
@@ -47,7 +48,7 @@ pub(crate) fn expr_node_count(expr: &Expr) -> usize {
         Expr::Call { args, .. } | Expr::Coalesce(args) => args
             .iter()
             .fold(1usize, |acc, a| acc.saturating_add(expr_node_count(a))),
-        Expr::NullIf(a, b) => 1usize
+        Expr::NullIf(a, b) | Expr::IsDistinctFrom { lhs: a, rhs: b, .. } => 1usize
             .saturating_add(expr_node_count(a))
             .saturating_add(expr_node_count(b)),
         Expr::Collate { expr, .. } | Expr::Cast { expr, .. } => {
@@ -167,6 +168,15 @@ fn negate_one(
             lhs,
             rhs,
         })]),
+        // `IS [NOT] DISTINCT FROM` は結果が NULL にならない（常に真偽値）ため、`negated` の反転が
+        // 三値論理でも厳密な否定になる（SQL-54・Issue #1783）。
+        WherePredicate::Expression(Expr::IsDistinctFrom { negated, lhs, rhs }) => {
+            Ok(vec![WherePredicate::Expression(Expr::IsDistinctFrom {
+                negated: !negated,
+                lhs,
+                rhs,
+            })])
+        }
         WherePredicate::Expression(Expr::Binary { op, lhs, rhs }) => match op {
             BinOp::Gt | BinOp::Lt | BinOp::Ge | BinOp::Le => {
                 let flipped = match op {
@@ -249,6 +259,38 @@ mod tests {
                 column: "a".into(),
                 negated: true
             }]
+        );
+    }
+
+    fn distinct(negated: bool) -> WherePredicate {
+        WherePredicate::Expression(Expr::IsDistinctFrom {
+            negated,
+            lhs: Box::new(Expr::Ident("a".to_string())),
+            rhs: Box::new(Expr::Ident("b".to_string())),
+        })
+    }
+
+    /// SQL-54: `NOT (a IS DISTINCT FROM b)` は `negated` の反転で、二重否定は元へ戻る。
+    #[test]
+    fn is_distinct_from_flips_negated_and_double_negation_restores() {
+        let mut b = 100;
+        let once = negate_conjunction(vec![distinct(false)], &mut b).unwrap();
+        assert_eq!(once, vec![distinct(true)]);
+        let twice = negate_conjunction(once, &mut b).unwrap();
+        assert_eq!(twice, vec![distinct(false)]);
+    }
+
+    /// SQL-54: 連言の否定（De Morgan）でも各項の `negated` が反転される。
+    #[test]
+    fn is_distinct_from_under_de_morgan() {
+        let mut b = 100;
+        let out = negate_conjunction(vec![distinct(false), distinct(true)], &mut b).unwrap();
+        assert_eq!(
+            out,
+            vec![WherePredicate::Or(vec![
+                vec![distinct(true)],
+                vec![distinct(false)]
+            ])]
         );
     }
 

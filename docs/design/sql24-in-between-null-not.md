@@ -185,6 +185,34 @@ flatten()` で NULL と同一視すると、`IsNull` が誤って真になる（
 - 対象外: `Or`／`Not` を含む述語の索引和集合、`BinOp::Ne` の追加（公開 enum の変更を伴う）、
   `$n` を要素にした `IN`、NoSQL の `filter`（#1197）。
 
+## Issue #1783: `IS [NOT] DISTINCT FROM`（SQL-54 ポインタ）
+
+NULL 安全な等価比較。両辺とも NULL なら「区別なし」、片側だけ NULL なら「区別あり」、
+両辺とも非 NULL なら `=` の否定で、結果は常に真偽値（NULL を返さない）。
+
+- **構文段**: `Parser::try_parse_structural_leaf` の `<col> IS ...` 腕は、`IS [NOT] DISTINCT FROM`
+  の並びだけ位置を変えずに式述語（`parse_expression_predicate`）へ回す（他の `IS` 形は従来どおり
+  `42601`）。式述語は `Expr::IsDistinctFrom { negated, lhs, rhs }`（公開 enum への variant 追加は
+  破壊的変更）を作る。左辺の裸の `NULL` は直後が `IS [NOT] DISTINCT FROM` のときだけリテラル、
+  右辺の `NULL` は常にリテラル。サブクエリ右辺と CHECK 本体は `0A000`。
+- **否定**: 前置 `NOT` は `where_negation` が `negated` を反転する。結果が NULL にならないため
+  三値論理でも厳密（二重否定・De Morgan と併用しても同値）。
+- **束縛・評価**（`udf_call::bind_is_distinct_from`／`eval_is_distinct_from`）: 非 NULL 同士は
+  `Binary { Eq }` を既存の `bind_expr_any` に通し（未知型リテラルの解釈・照合導出・型不一致の
+  SQLSTATE を `=` と共有）、結果が素の `Eq` のときだけ両辺を載せ替える。NULL 判定は `eval_binary`
+  （入口で NULL を伝播する）の呼び出しより前に行う。DATE／TIMESTAMP 列と型なし文字列リテラルは
+  反対側の型でリテラルを解釈する。段コンパイル（`expr_program`）は木評価へ委ねる。
+- **索引**: `BoundExpr::IsDistinctFrom` は `scalar_plan`／宣言的レーンのどちらにも一致せず、
+  常に残余述語（全走査）になる。NULL 意味論を索引が壊さない。
+- **再送判定**: `content_hash` の式タグ 20（negated 1 バイト・左・右の順）。否定の有無・左右の
+  入れ替えで別ハッシュ。
+- **`$n`**: `sql::params` のパターン 10（`<列> IS [NOT] DISTINCT FROM $n`。型は左辺の列、Describe 用
+  ダミーは列型に依らず通る `NULL`）。逆向き・両辺 `$n`・式の内側は `42601` のまま。
+- **対象外（fail-closed）**: SELECT リスト・`CASE WHEN`・`HAVING`・JOIN の WHERE・UDF 本体・
+  式索引／部分索引の述語、`IS DISTINCT FROM (SELECT ...)`、BOOLEAN 列・ICU 照合・配列・INTERVAL・
+  UUID など `=` の束縛結果が素の `Eq` にならない／式経路の `=` が未対応の被演算子
+  （`0A000`／`42883`）、`IS TRUE` 等の他の `IS` 形（`42601`）。
+
 ## 対象外・申し送り
 
 - CHECK 制約での新しい形の対応（`enforce` の三値化）

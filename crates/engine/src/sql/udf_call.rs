@@ -263,6 +263,16 @@ pub enum Expr {
     /// `NULLIF(<lhs>, <rhs>)`（対象ビヘイビア: SQL-26）。両辺が等しければ NULL、
     /// 異なれば `lhs` を返す。
     NullIf(Box<Expr>, Box<Expr>),
+    /// `<lhs> IS [NOT] DISTINCT FROM <rhs>`（対象ビヘイビア: SQL-54。Issue #1783）。
+    /// NULL 安全な等価比較で、結果は常に真偽値（NULL を返さない）。`negated` が真なら
+    /// `IS NOT DISTINCT FROM`。構文段（`allowlist::Parser::parse_expression_predicate`）が
+    /// 生成し、`where_negation` が前置 `NOT` を `negated` の反転へ押し下げる。
+    /// 変更履歴: 本 variant の追加は `Expr` の網羅的 match を持つ外部コードへの破壊的変更。
+    IsDistinctFrom {
+        negated: bool,
+        lhs: Box<Expr>,
+        rhs: Box<Expr>,
+    },
     /// `DATE '<literal>'`（型付きリテラル。対象ビヘイビア: SQL-26。Issue #920）。
     /// 構文段（`allowlist::Parser::parse_primary_expr`）で
     /// `crate::datetime::parse_date` を即座に解析済みの値を保持する（生文字列を
@@ -858,6 +868,15 @@ pub enum BoundExpr {
         lhs: Box<BoundExpr>,
         rhs: Box<BoundExpr>,
     },
+    /// `IS [NOT] DISTINCT FROM`（対象ビヘイビア: SQL-54。Issue #1783）。束縛段は
+    /// `=` と同じ束縛（[`bind_expr_any`] へ `Binary{Eq}` を通す）が `BinOp::Eq` を
+    /// 返した場合だけ、その両辺を本ノードへ載せ替える。評価は NULL 判定を先に行う
+    /// ため結果は常に `Bool`。スカラー索引・宣言的レーンの対象外（常に残余述語）。
+    IsDistinctFrom {
+        negated: bool,
+        lhs: Box<BoundExpr>,
+        rhs: Box<BoundExpr>,
+    },
     /// `DATE` 定数（対象ビヘイビア: SQL-26。Issue #920）。内部表現は
     /// 1970-01-01 起点の日数（`crate::datetime` 参照）。
     Date(i32),
@@ -1345,6 +1364,18 @@ impl PartialEq for BoundExpr {
                 la == lb && ra == rb
             }
             (
+                BoundExpr::IsDistinctFrom {
+                    negated: na,
+                    lhs: la,
+                    rhs: ra,
+                },
+                BoundExpr::IsDistinctFrom {
+                    negated: nb,
+                    lhs: lb,
+                    rhs: rb,
+                },
+            ) => na == nb && la == lb && ra == rb,
+            (
                 BoundExpr::WasmCall {
                     name: na,
                     backend: ba,
@@ -1752,6 +1783,7 @@ pub(crate) fn first_non_builtin_call_with(
         }
         Expr::Binary { lhs, rhs, .. }
         | Expr::NullIf(lhs, rhs)
+        | Expr::IsDistinctFrom { lhs, rhs, .. }
         | Expr::JsonAccess { lhs, rhs, .. } => {
             first_non_builtin_call_with(lhs, allow_current_time, allow_json_fns)
                 .or_else(|| first_non_builtin_call_with(rhs, allow_current_time, allow_json_fns))
@@ -2501,6 +2533,10 @@ fn validate_closed_expr(
             validate_closed_expr(lhs, params, registry, node_budget)?;
             validate_closed_expr(rhs, params, registry, node_budget)
         }
+        // UDF 本体では `IS [NOT] DISTINCT FROM` を受理しない（SQL-54・Issue #1783。fail-closed）。
+        Expr::IsDistinctFrom { .. } => Err(SqlSurfaceError::FeatureNotSupported {
+            detail: "IS DISTINCT FROM is not supported in a function body".to_string(),
+        }),
         Expr::DateLiteral(_)
         | Expr::TimestampLiteral(_)
         | Expr::IntervalLiteral(_)
@@ -2664,7 +2700,9 @@ fn count_bound_nodes(expr: &BoundExpr) -> usize {
                 + count_bound_nodes(else_result)
         }
         BoundExpr::Coalesce(args) => 1 + args.iter().map(count_bound_nodes).sum::<usize>(),
-        BoundExpr::NullIf { lhs, rhs } => 1 + count_bound_nodes(lhs) + count_bound_nodes(rhs),
+        BoundExpr::NullIf { lhs, rhs } | BoundExpr::IsDistinctFrom { lhs, rhs, .. } => {
+            1 + count_bound_nodes(lhs) + count_bound_nodes(rhs)
+        }
     }
 }
 
@@ -2765,7 +2803,7 @@ fn max_bound_case_nesting(expr: &BoundExpr) -> usize {
             1 + branches_max.max(max_bound_case_nesting(else_result))
         }
         BoundExpr::Coalesce(args) => 1 + args.iter().map(max_bound_case_nesting).max().unwrap_or(0),
-        BoundExpr::NullIf { lhs, rhs } => {
+        BoundExpr::NullIf { lhs, rhs } | BoundExpr::IsDistinctFrom { lhs, rhs, .. } => {
             1 + max_bound_case_nesting(lhs).max(max_bound_case_nesting(rhs))
         }
     }
@@ -2854,7 +2892,9 @@ pub(crate) fn references_embedding(expr: &BoundExpr) -> bool {
                 || references_embedding(else_result)
         }
         BoundExpr::Coalesce(args) => args.iter().any(references_embedding),
-        BoundExpr::NullIf { lhs, rhs } => references_embedding(lhs) || references_embedding(rhs),
+        BoundExpr::NullIf { lhs, rhs } | BoundExpr::IsDistinctFrom { lhs, rhs, .. } => {
+            references_embedding(lhs) || references_embedding(rhs)
+        }
     }
 }
 
@@ -2965,7 +3005,7 @@ pub(crate) fn visit_referenced_scalar_columns(expr: &BoundExpr, visit: &mut dyn 
                 visit_referenced_scalar_columns(a, visit);
             }
         }
-        BoundExpr::NullIf { lhs, rhs } => {
+        BoundExpr::NullIf { lhs, rhs } | BoundExpr::IsDistinctFrom { lhs, rhs, .. } => {
             visit_referenced_scalar_columns(lhs, visit);
             visit_referenced_scalar_columns(rhs, visit);
         }
@@ -3143,7 +3183,7 @@ pub(crate) fn mark_referenced_scalar_columns(expr: &BoundExpr, mask: &mut [bool]
             }
             any
         }
-        BoundExpr::NullIf { lhs, rhs } => {
+        BoundExpr::NullIf { lhs, rhs } | BoundExpr::IsDistinctFrom { lhs, rhs, .. } => {
             let l = mark_referenced_scalar_columns(lhs, mask);
             let r = mark_referenced_scalar_columns(rhs, mask);
             l || r
@@ -3768,6 +3808,143 @@ fn bind_nullif(
     })
 }
 
+/// 型なし文字列リテラルを、比較相手の型（DATE／TIMESTAMP）として解釈する
+/// （[`bind_is_distinct_from`] 専用。INTERVAL は式経路の `=` が未対応のため対象外）。相手がそれ以外の型なら `None`。解析失敗の SQLSTATE と
+/// メッセージは型付きリテラル（`sql::allowlist::Parser::parse_primary_expr`）と同じ写像で、
+/// エラーにリテラル本文は含めない。
+fn bind_datetime_text_literal(
+    s: &str,
+    other_ty: ExprType,
+) -> Option<Result<BoundExpr, SqlSurfaceError>> {
+    use crate::datetime::DateTimeLiteralError;
+    let map_dt = |e: DateTimeLiteralError| match e {
+        DateTimeLiteralError::Format(d) => SqlSurfaceError::invalid_datetime_format(d),
+        DateTimeLiteralError::Overflow(d) => SqlSurfaceError::datetime_field_overflow(d),
+    };
+    match other_ty {
+        ExprType::Date => Some(
+            crate::datetime::parse_date(s)
+                .map(BoundExpr::Date)
+                .map_err(map_dt),
+        ),
+        ExprType::Timestamp => Some(
+            crate::datetime::parse_timestamp(s)
+                .map(BoundExpr::Timestamp)
+                .map_err(map_dt),
+        ),
+        _ => None,
+    }
+}
+
+/// `<lhs> IS [NOT] DISTINCT FROM <rhs>` を束縛する（対象ビヘイビア: SQL-54。Issue #1783）。
+///
+/// `sql::allowlist::Parser::parse_expression_predicate` が作る [`Expr::IsDistinctFrom`] を
+/// 受け、結果型は常に [`ExprType::Bool`]（NULL を返さない）。両辺が非 NULL リテラルでない
+/// 通常の組は `=` と完全に同じ束縛（未知型リテラルの解釈・float リテラル・照合導出・型不一致の
+/// SQLSTATE）を共有するため、`Binary { Eq }` を [`bind_expr_any`] へ通し、結果が素の
+/// `BoundExpr::Binary { op: Eq }` のときだけ両辺を載せ替える。それ以外（ICU 照合・配列どうし等）
+/// は v1 の対象外として `0A000` で fail-closed に拒否する。裸の `NULL` 側は型を決められないため
+/// 反対側だけを束縛し、`=` が存在しない型（json・vector 等）は拒否する。
+fn bind_is_distinct_from(
+    negated: bool,
+    lhs: &Expr,
+    rhs: &Expr,
+    env: &mut BindEnv<'_>,
+    node_budget: &mut usize,
+) -> Result<(BoundExpr, ExprType), SqlSurfaceError> {
+    let mk = |l: BoundExpr, r: BoundExpr| {
+        (
+            BoundExpr::IsDistinctFrom {
+                negated,
+                lhs: Box::new(l),
+                rhs: Box::new(r),
+            },
+            ExprType::Bool,
+        )
+    };
+    let unsupported_operand = || SqlSurfaceError::FeatureNotSupported {
+        detail: "IS DISTINCT FROM is not supported for this operand type".to_string(),
+    };
+    match (matches!(lhs, Expr::Null), matches!(rhs, Expr::Null)) {
+        (true, true) => {
+            *node_budget = node_budget
+                .checked_sub(2)
+                .ok_or_else(|| SqlSurfaceError::payload_too_large("expression is too large"))?;
+            Ok(mk(BoundExpr::Null, BoundExpr::Null))
+        }
+        (true, false) | (false, true) => {
+            *node_budget = node_budget
+                .checked_sub(1)
+                .ok_or_else(|| SqlSurfaceError::payload_too_large("expression is too large"))?;
+            let other = if matches!(lhs, Expr::Null) { rhs } else { lhs };
+            let (bound, ty) = bind_expr_any(other, env, node_budget)?;
+            if !matches!(
+                ty,
+                ExprType::Scalar
+                    | ExprType::Text
+                    | ExprType::Date
+                    | ExprType::Timestamp
+                    | ExprType::Time
+                    | ExprType::TimestampTz
+                    | ExprType::Interval
+                    | ExprType::Bool
+            ) {
+                return Err(unsupported_operand());
+            }
+            Ok(if matches!(lhs, Expr::Null) {
+                mk(BoundExpr::Null, bound)
+            } else {
+                mk(bound, BoundExpr::Null)
+            })
+        }
+        (false, false) => {
+            // 日付時刻系の列・式と型なし文字列リテラルの比較。`=` の列×リテラルは宣言的レーン
+            // （`Compare`）が担うが、式経路の `=` は文字列を TEXT と見て `42883` になるため、
+            // ここでは反対側の型（DATE／TIMESTAMP）でリテラルを解釈する（PostgreSQL の
+            // unknown 型リテラルの解決と同じ。解析失敗の SQLSTATE は型付きリテラルと同じ）。
+            let literal_side = match (lhs, rhs) {
+                (Expr::String(s), other) if !matches!(other, Expr::String(_)) => {
+                    Some((true, s, other))
+                }
+                (other, Expr::String(s)) if !matches!(other, Expr::String(_)) => {
+                    Some((false, s, other))
+                }
+                _ => None,
+            };
+            if let Some((literal_on_left, s, other)) = literal_side {
+                let (other_b, other_t) = bind_expr_any(other, env, node_budget)?;
+                if let Some(lit) = bind_datetime_text_literal(s, other_t) {
+                    *node_budget = node_budget.checked_sub(1).ok_or_else(|| {
+                        SqlSurfaceError::payload_too_large("expression is too large")
+                    })?;
+                    let lit = lit?;
+                    return Ok(if literal_on_left {
+                        mk(lit, other_b)
+                    } else {
+                        mk(other_b, lit)
+                    });
+                }
+            }
+            let eq = Expr::Binary {
+                op: BinOp::Eq,
+                lhs: Box::new(lhs.clone()),
+                rhs: Box::new(rhs.clone()),
+            };
+            match bind_expr_any(&eq, env, node_budget)? {
+                (
+                    BoundExpr::Binary {
+                        op: BinOp::Eq,
+                        lhs,
+                        rhs,
+                    },
+                    ExprType::Bool,
+                ) => Ok(mk(*lhs, *rhs)),
+                _ => Err(unsupported_operand()),
+            }
+        }
+    }
+}
+
 fn bind_expr_in(
     expr: &Expr,
     env: &mut BindEnv<'_>,
@@ -4203,6 +4380,9 @@ pub(super) fn bind_expr_any(
         Expr::Case { whens, else_result } => bind_case(whens, else_result, env, node_budget),
         Expr::Coalesce(args) => bind_coalesce(args, env, node_budget),
         Expr::NullIf(lhs, rhs) => bind_nullif(lhs, rhs, env, node_budget),
+        Expr::IsDistinctFrom { negated, lhs, rhs } => {
+            bind_is_distinct_from(*negated, lhs, rhs, env, node_budget)
+        }
         // `DATE`／`TIMESTAMP` 型付きリテラル（対象ビヘイビア: SQL-26。Issue #920）。
         // 構文段（`allowlist::Parser::parse_primary_expr`）が既に
         // `crate::datetime::parse_date`／`parse_timestamp` で解析・範囲検証済みの
@@ -7754,7 +7934,36 @@ pub(crate) fn eval_with_scalars<'a>(
             let r = eval_with_scalars(rhs, id, embedding, row_scalars)?;
             eval_nullif(l, r)
         }
+        BoundExpr::IsDistinctFrom { negated, lhs, rhs } => {
+            let l = eval_with_scalars(lhs, id, embedding, row_scalars)?;
+            let r = eval_with_scalars(rhs, id, embedding, row_scalars)?;
+            eval_is_distinct_from(*negated, l, r)
+        }
     }
+}
+
+/// `IS [NOT] DISTINCT FROM` を値ベースで評価する（対象ビヘイビア: SQL-54。Issue #1783）。
+/// 両辺とも NULL なら「区別なし」、片側だけ NULL なら「区別あり」、両辺とも非 NULL なら
+/// `=` の否定。結果は常に `Bool`（NULL を返さない）。`eval_binary` は入口で NULL を伝播する
+/// ため、NULL 判定は必ずその呼び出しの前に行う。
+pub(crate) fn eval_is_distinct_from<'a>(
+    negated: bool,
+    l: ExprValue<'a>,
+    r: ExprValue<'a>,
+) -> Result<ExprValue<'a>, SqlSurfaceError> {
+    let distinct = match (matches!(l, ExprValue::Null), matches!(r, ExprValue::Null)) {
+        (true, true) => false,
+        (true, false) | (false, true) => true,
+        (false, false) => match eval_binary(BinOp::Eq, l, r)? {
+            ExprValue::Bool(eq) => !eq,
+            _ => {
+                return Err(SqlSurfaceError::Internal {
+                    detail: "IS DISTINCT FROM comparison did not yield a boolean".to_string(),
+                })
+            }
+        },
+    };
+    Ok(ExprValue::Bool(distinct != negated))
 }
 
 /// `NULLIF(lhs, rhs)` を値ベースで評価する（`CASE WHEN lhs = rhs THEN NULL ELSE
@@ -9872,6 +10081,93 @@ mod tests {
             panic!("expected timestamps");
         };
         assert!(a > clock.txn_start_micros && b >= a);
+    }
+
+    // --- IS [NOT] DISTINCT FROM（対象ビヘイビア: SQL-54。Issue #1783） --------
+
+    /// 値レベルの真理値表: 両辺 NULL は区別なし・片側 NULL は区別あり・非 NULL 同士は `=` の否定。
+    /// 結果は常に `Bool`（NULL を返さない）で、`negated` は反転するだけ。
+    #[test]
+    fn eval_is_distinct_from_truth_table() {
+        let one = || ExprValue::Scalar(1.0);
+        let two = || ExprValue::Scalar(2.0);
+        let null = || ExprValue::Null;
+        for (l, r, distinct) in [
+            (one(), one(), false),
+            (one(), two(), true),
+            (one(), null(), true),
+            (null(), one(), true),
+            (null(), null(), false),
+        ] {
+            assert_eq!(
+                eval_is_distinct_from(false, l.clone(), r.clone()).expect("distinct"),
+                ExprValue::Bool(distinct)
+            );
+            assert_eq!(
+                eval_is_distinct_from(true, l, r).expect("not distinct"),
+                ExprValue::Bool(!distinct)
+            );
+        }
+        // TEXT・DATE も `=` の否定と同じ。
+        assert_eq!(
+            eval_is_distinct_from(
+                false,
+                ExprValue::Text(std::borrow::Cow::Borrowed("a")),
+                ExprValue::Text(std::borrow::Cow::Borrowed("b"))
+            )
+            .expect("text"),
+            ExprValue::Bool(true)
+        );
+        assert_eq!(
+            eval_is_distinct_from(true, ExprValue::Date(5), ExprValue::Date(5)).expect("date"),
+            ExprValue::Bool(true)
+        );
+    }
+
+    /// 束縛と評価: 結果型は `Bool`。`NULL` 側は `BoundExpr::Null` で、片側・両側 `NULL` も束縛できる。
+    #[test]
+    fn bind_and_eval_is_distinct_from_with_null_operands() {
+        let schema = schema_with_vector();
+        let registry = UdfRegistry::default();
+        let mk = |negated: bool, lhs: Expr, rhs: Expr| Expr::IsDistinctFrom {
+            negated,
+            lhs: Box::new(lhs),
+            rhs: Box::new(rhs),
+        };
+        let run = |expr: &Expr, id: u64| {
+            let mut budget = MAX_EXPR_NODES;
+            let (bound, ty) =
+                bind_expr(expr, &schema, &registry, &mut budget).expect("bind should succeed");
+            assert_eq!(ty, ExprType::Bool);
+            assert!(matches!(bound, BoundExpr::IsDistinctFrom { .. }));
+            eval(&bound, id, &[0.0, 0.0, 0.0]).expect("eval")
+        };
+        // 非 NULL 同士（`id` は疑似列）。
+        assert_eq!(
+            run(&mk(false, ident("id"), num("2")), 2),
+            ExprValue::Bool(false)
+        );
+        assert_eq!(
+            run(&mk(false, ident("id"), num("2")), 3),
+            ExprValue::Bool(true)
+        );
+        assert_eq!(
+            run(&mk(true, ident("id"), num("2")), 2),
+            ExprValue::Bool(true)
+        );
+        // 片側 NULL（常に「区別あり」）・両側 NULL（常に「区別なし」）。
+        assert_eq!(
+            run(&mk(false, Expr::Null, ident("id")), 1),
+            ExprValue::Bool(true)
+        );
+        assert_eq!(
+            run(&mk(false, Expr::Null, Expr::Null), 1),
+            ExprValue::Bool(false)
+        );
+        assert_eq!(
+            run(&mk(true, Expr::Null, Expr::Null), 1),
+            ExprValue::Bool(true)
+        );
     }
 
     // --- CASE／COALESCE／NULLIF（対象ビヘイビア: SQL-26。Issue #921） ----------

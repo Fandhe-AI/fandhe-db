@@ -203,6 +203,7 @@ fn prescan(expr: &Expr) -> Result<(), SqlSurfaceError> {
         Expr::Call { args, .. } => args.iter().try_for_each(prescan),
         Expr::Binary { lhs, rhs, .. }
         | Expr::NullIf(lhs, rhs)
+        | Expr::IsDistinctFrom { lhs, rhs, .. }
         | Expr::JsonAccess { lhs, rhs, .. } => {
             prescan(lhs)?;
             prescan(rhs)
@@ -269,7 +270,7 @@ fn check_intermediate_precision(expr: &Expr) -> Result<(), SqlSurfaceError> {
         }
         // jsonb パス演算子は列参照を要し、定数式では `prescan` が列参照として拒否する。
         Expr::JsonAccess { .. } => Ok(()),
-        Expr::NullIf(lhs, rhs) => {
+        Expr::NullIf(lhs, rhs) | Expr::IsDistinctFrom { lhs, rhs, .. } => {
             check_intermediate_precision(lhs)?;
             check_intermediate_precision(rhs)
         }

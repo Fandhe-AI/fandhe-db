@@ -6598,7 +6598,21 @@ impl<'a> Parser<'a> {
     /// 否定押し下げ（`where_negation`）が `Expression(_)` を `42601` で拒否する（fail-closed。
     /// 三値論理で fail-open にしない）。
     fn parse_expression_predicate(&mut self) -> Result<ExprLeaf, SqlSurfaceError> {
-        let lhs = self.parse_value_expr(0)?;
+        // 左辺が引用なしの裸の `NULL` で直後が `IS [NOT] DISTINCT FROM` なら `NULL` リテラル
+        // （SQL-54・Issue #1783。それ以外の位置の `NULL` は従来どおり列参照として読む）。
+        let null_lhs = matches!(self.peek(), Some(Token::Ident(w)) if w.eq_ignore_ascii_case("NULL"))
+            && !self.quoted_null.contains(&self.pos)
+            && self.distinct_from_at(self.pos + 1).is_some();
+        let lhs = if null_lhs {
+            self.advance();
+            self.consume_expr_node()?;
+            Expr::Null
+        } else {
+            self.parse_value_expr(0)?
+        };
+        if let Some((negated, len)) = self.distinct_from_at(self.pos) {
+            return self.parse_distinct_from_rest(negated, len, lhs);
+        }
         if let Expr::JsonAccess { op, .. } = &lhs {
             if op.is_predicate() && !self.peek_is_cmp_op() {
                 return Ok(ExprLeaf::Plain(lhs));
@@ -6655,6 +6669,69 @@ impl<'a> Parser<'a> {
             ArrayCmpOp::Gt => ExprLeaf::Plain(binary(BinOp::Gt, lhs, rhs)),
             ArrayCmpOp::Ge => ExprLeaf::Plain(binary(BinOp::Ge, lhs, rhs)),
         })
+    }
+
+    /// `tokens[idx]` から `IS [NOT] DISTINCT FROM` が並んでいれば `(negated, 消費するトークン数)` を
+    /// 返す（消費しない。SQL-54・Issue #1783）。`DISTINCT`・`NOT`・`IS` は文脈照合（`Keyword` には
+    /// 無い語）で、`FROM` は [`Keyword::From`]。先読みは `get()` のみで範囲外は `None`。
+    fn distinct_from_at(&self, idx: usize) -> Option<(bool, usize)> {
+        let word = |i: usize, k: &str| matches!(self.tokens.get(i), Some(Token::Ident(w)) if w.eq_ignore_ascii_case(k));
+        if !word(idx, "IS") {
+            return None;
+        }
+        let (negated, d) = if word(idx.checked_add(1)?, "NOT") {
+            (true, idx.checked_add(2)?)
+        } else {
+            (false, idx.checked_add(1)?)
+        };
+        if word(d, "DISTINCT")
+            && matches!(
+                self.tokens.get(d.checked_add(1)?),
+                Some(Token::Keyword(Keyword::From))
+            )
+        {
+            let len = d.checked_add(2)?.checked_sub(idx)?;
+            Some((negated, len))
+        } else {
+            None
+        }
+    }
+
+    /// `IS [NOT] DISTINCT FROM <右辺>` の続きを読み [`Expr::IsDistinctFrom`] を作る
+    /// （対象ビヘイビア: SQL-54。Issue #1783）。右辺の裸の `NULL` はリテラルとして読む。
+    /// サブクエリ形（`( SELECT ...)`）と CHECK 本体は `0A000`（内側は実行しない。fail-closed）。
+    /// 右辺の後ろに比較演算子等が続く形は呼び出し元の終端検査が `42601` で拒否する。
+    fn parse_distinct_from_rest(
+        &mut self,
+        negated: bool,
+        len: usize,
+        lhs: Expr,
+    ) -> Result<ExprLeaf, SqlSurfaceError> {
+        if self.in_check_body {
+            return Err(SqlSurfaceError::FeatureNotSupported {
+                detail: "IS DISTINCT FROM is not supported in a CHECK constraint".to_string(),
+            });
+        }
+        for _ in 0..len {
+            self.advance();
+        }
+        if matches!(self.peek(), Some(Token::Punct('(')))
+            && matches!(
+                self.tokens.get(self.pos.saturating_add(1)),
+                Some(Token::Keyword(Keyword::Select))
+            )
+        {
+            return Err(SqlSurfaceError::FeatureNotSupported {
+                detail: "IS DISTINCT FROM with a subquery is not supported".to_string(),
+            });
+        }
+        let rhs = self.parse_value_expr_with_null_context(0, true)?;
+        self.consume_expr_node()?;
+        Ok(ExprLeaf::Plain(Expr::IsDistinctFrom {
+            negated,
+            lhs: Box::new(lhs),
+            rhs: Box::new(rhs),
+        }))
     }
 
     /// 比較演算子の直後が量化子 `ANY`／`SOME`／`ALL` と `(` の並びなら量化子を返す（消費しない）。
@@ -7104,10 +7181,14 @@ impl<'a> Parser<'a> {
             }
         }
         // `<col> IS [NOT] NULL`（SQL-24。TASK-208 ポインタ）。`IS` に一致した
-        // 以上、`NULL`／`NOT NULL` 以外の形（`IS TRUE`・`IS DISTINCT FROM` 等）は
-        // 未対応として `42601` で拒否する（式フォールバックへは回さない）。
+        // 以上、`NULL`／`NOT NULL` 以外の形（`IS TRUE` 等）は未対応として `42601` で拒否する
+        // （式フォールバックへは回さない）。ただし `IS [NOT] DISTINCT FROM`（SQL-54・Issue #1783）
+        // だけは位置を変えずに式述語（`parse_expression_predicate`）へ委ねる。
         if matches!(self.tokens.get(self.pos + 1), Some(Token::Ident(w)) if w.eq_ignore_ascii_case("IS"))
         {
+            if self.distinct_from_at(self.pos + 1).is_some() {
+                return Ok(None);
+            }
             if matches!(self.tokens.get(self.pos + 2), Some(Token::Ident(w)) if w.eq_ignore_ascii_case("NULL"))
             {
                 self.advance();
@@ -18082,6 +18163,8 @@ fn sql_json_query_kind_from_name(name: &str) -> Option<SqlJsonQueryKind> {
 fn expr_contains_scalar_function(expr: &Expr) -> bool {
     match expr {
         Expr::Call { .. } | Expr::Case { .. } | Expr::Coalesce(_) | Expr::NullIf(..) => true,
+        // `IS [NOT] DISTINCT FROM`（SQL-54）も従来形では書けない式述語。
+        Expr::IsDistinctFrom { .. } => true,
         Expr::Binary { lhs, rhs, .. } | Expr::JsonAccess { lhs, rhs, .. } => {
             expr_contains_scalar_function(lhs) || expr_contains_scalar_function(rhs)
         }
@@ -30542,6 +30625,88 @@ mod tests {
                 other => panic!("expected SelectItem::Expr(Call), got {other:?}"),
             }
         }
+    }
+
+    fn distinct_where(where_clause: &str) -> Result<Vec<WherePredicate>, SqlSurfaceError> {
+        let lookup = catalog_with(&["documents"]);
+        validate_statement(
+            &format!(
+                "SELECT id FROM documents WHERE {where_clause} \
+                 ORDER BY embedding <=> '[0.1,0.2]' LIMIT 10"
+            ),
+            &lookup,
+        )
+        .map(|stmt| stmt.where_predicates)
+    }
+
+    /// SQL-54・Issue #1783: `IS [NOT] DISTINCT FROM` は式述語として受理され、前置 `NOT` は
+    /// `negated` の反転へ押し下げられる。`NULL` は左右どちらでもリテラルとして読む。
+    #[test]
+    fn is_distinct_from_parses_to_expression_predicate() {
+        let preds = distinct_where("a IS DISTINCT FROM b").expect("parse");
+        assert!(matches!(
+            preds.as_slice(),
+            [WherePredicate::Expression(Expr::IsDistinctFrom {
+                negated: false,
+                ..
+            })]
+        ));
+        let preds = distinct_where("a IS NOT DISTINCT FROM b").expect("parse");
+        assert!(matches!(
+            preds.as_slice(),
+            [WherePredicate::Expression(Expr::IsDistinctFrom {
+                negated: true,
+                ..
+            })]
+        ));
+        let preds = distinct_where("NOT a IS DISTINCT FROM b").expect("parse");
+        assert!(matches!(
+            preds.as_slice(),
+            [WherePredicate::Expression(Expr::IsDistinctFrom {
+                negated: true,
+                ..
+            })]
+        ));
+        let preds = distinct_where("NULL IS DISTINCT FROM a").expect("parse");
+        let [WherePredicate::Expression(Expr::IsDistinctFrom { lhs, .. })] = preds.as_slice()
+        else {
+            panic!("expected IsDistinctFrom, got {preds:?}");
+        };
+        assert_eq!(**lhs, Expr::Null);
+        let preds = distinct_where("a IS DISTINCT FROM NULL").expect("parse");
+        let [WherePredicate::Expression(Expr::IsDistinctFrom { rhs, .. })] = preds.as_slice()
+        else {
+            panic!("expected IsDistinctFrom, got {preds:?}");
+        };
+        assert_eq!(**rhs, Expr::Null);
+        // 式の被演算子・AND／OR・括弧。
+        assert!(distinct_where("a + 1 IS NOT DISTINCT FROM lower(b)").is_ok());
+        assert!(
+            distinct_where("(a IS DISTINCT FROM 1 OR b IS NOT DISTINCT FROM 2) AND c = 3").is_ok()
+        );
+    }
+
+    /// SQL-54・Issue #1783: 未対応の `IS` 形・サブクエリ右辺・右辺の続きは fail-closed。
+    #[test]
+    fn is_distinct_from_rejects_unsupported_forms() {
+        for (clause, code) in [
+            ("a IS TRUE", "42601"),
+            ("a IS DISTINCT b", "42601"),
+            ("a IS DISTINCT FROM", "42601"),
+            ("a IS NOT DISTINCT", "42601"),
+            ("a IS DISTINCT FROM b = 1", "42601"),
+            ("a IS DISTINCT FROM (SELECT a FROM documents)", "0A000"),
+        ] {
+            let err = distinct_where(clause).expect_err(clause);
+            assert_eq!(err.wire_code(), code, "{clause}");
+        }
+        // 従来の `IS [NOT] NULL` は回帰しない。
+        assert!(matches!(
+            distinct_where("a IS NOT NULL")
+                .expect("is not null")
+                .as_slice(),
+            [WherePredicate::IsNull { negated: true, .. }]
+        ));
     }
 
     #[test]
