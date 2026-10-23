@@ -344,7 +344,7 @@ fn where_compare_op_token(token: &Token) -> Option<CompareOp> {
 pub(crate) fn is_aggregate_function_name(name: &str) -> bool {
     matches!(
         name.to_ascii_uppercase().as_str(),
-        "COUNT" | "SUM" | "AVG" | "MIN" | "MAX"
+        "COUNT" | "SUM" | "AVG" | "MIN" | "MAX" | "STRING_AGG"
     )
 }
 
@@ -808,6 +808,10 @@ pub enum SqlSurfaceError {
     /// SQL-56 (2)・Issue #1792）。束縛段が返す。含めるのは利用者が書いた位置の値だけで、
     /// 列名・テナント情報は含めない。可否は文とスキーマだけで決まり、行の内容に依存しない。
     OrderByPositionNotInSelectList { position: i64 },
+    /// `string_agg(DISTINCT ...)` の内側 `ORDER BY` の式が引数に現れない（`42P10`。
+    /// SQL-57・Issue #1800）。束縛段が返す固定文言で、列名・値を含めない。可否は文だけで
+    /// 決まり、行の内容に依存しない。
+    AggregateOrderByNotInArguments,
     /// DDL 文（`CREATE TABLE`・`DROP TABLE` 等。SQL-23、TASK-202・TASK-203、
     /// Issue #899・#902）を、DDL 実行権限（[`crate::sql::mode::SessionState::
     /// ddl_allowed`]）を持たないセッションが実行しようとした（ERR-2 拡張:
@@ -1416,9 +1420,8 @@ impl ClassifiedError for SqlSurfaceError {
             SqlSurfaceError::PartitionedJobBusy { .. } => ErrorClass::LockNotAvailable,
             SqlSurfaceError::DuplicateColumn { .. } => ErrorClass::DuplicateColumn,
             SqlSurfaceError::InvalidColumnReference
-            | SqlSurfaceError::OrderByPositionNotInSelectList { .. } => {
-                ErrorClass::InvalidColumnReference
-            }
+            | SqlSurfaceError::OrderByPositionNotInSelectList { .. }
+            | SqlSurfaceError::AggregateOrderByNotInArguments => ErrorClass::InvalidColumnReference,
             SqlSurfaceError::InsufficientPrivilege
             | SqlSurfaceError::ConflictTargetNotVisible
             | SqlSurfaceError::SchemaDependencyForbidden => ErrorClass::ForbiddenTenantMismatch,
@@ -1670,6 +1673,10 @@ impl std::fmt::Display for SqlSurfaceError {
             SqlSurfaceError::OrderByPositionNotInSelectList { position } => {
                 write!(f, "ORDER BY position {position} is not in select list")
             }
+            SqlSurfaceError::AggregateOrderByNotInArguments => write!(
+                f,
+                "in an aggregate with DISTINCT, ORDER BY expressions must appear in argument list"
+            ),
             // テーブル名・ユーザー名を含めない固定文言（security.md P0。
             // `SqlSurfaceError::InsufficientPrivilege` ドキュメント参照）。
             SqlSurfaceError::InsufficientPrivilege => {
@@ -3063,6 +3070,9 @@ pub enum AggregateFunc {
     Avg,
     Min,
     Max,
+    /// `string_agg(<値>, <区切り> [ORDER BY ...])`（SQL-57・Issue #1800）。結果は常に text。
+    /// 集計の内側の `ORDER BY`・`DISTINCT` を受理する唯一の関数（SQL 表層のみ）。
+    StringAgg,
 }
 
 impl AggregateFunc {
@@ -3074,6 +3084,7 @@ impl AggregateFunc {
             "AVG" => Some(AggregateFunc::Avg),
             "MIN" => Some(AggregateFunc::Min),
             "MAX" => Some(AggregateFunc::Max),
+            "STRING_AGG" => Some(AggregateFunc::StringAgg),
             _ => None,
         }
     }
@@ -3086,6 +3097,7 @@ impl AggregateFunc {
             AggregateFunc::Avg => "avg",
             AggregateFunc::Min => "min",
             AggregateFunc::Max => "max",
+            AggregateFunc::StringAgg => "string_agg",
         }
     }
 }
@@ -3109,6 +3121,23 @@ pub struct AggregateItem {
     pub(crate) arg: AggregateArg,
     pub(crate) alias: Option<String>,
     pub(crate) distinct: bool,
+    /// 2 つめ以降の引数（SQL-57。`string_agg` の区切り式。それ以外の関数では常に空。
+    /// 個数は構文段が関数ごとに固定する）。
+    pub(crate) extra_args: Vec<Expr>,
+    /// 集計の内側の `ORDER BY`（SQL-57。`string_agg` のみ非空になりうる。キー数の上限は
+    /// [`MAX_SCALAR_ORDER_KEYS`]）。文レベルの `ORDER BY`（[`AggregateOrderBy`]）とは別物。
+    pub(crate) order_by: Vec<AggregateOrderKey>,
+}
+
+/// 集計の内側の `ORDER BY` 1 キー（SQL-57・Issue #1800。`string_agg(x, ',' ORDER BY y DESC)`）。
+/// 式は行ごとに評価する（序数は式＝定数として読み、出力列の位置とは解釈しない）。
+/// 意味論の解決（型・照合・NULL 位置の確定）は `sql::parser::resolve_string_agg_input` の責務。
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct AggregateOrderKey {
+    pub(crate) expr: Expr,
+    pub(crate) descending: bool,
+    /// 明示した `NULLS FIRST|LAST`（省略時は束縛段が PostgreSQL 既定へ確定させる。SQL-56）。
+    pub(crate) nulls: Option<NullPlacement>,
 }
 
 /// ウィンドウ関数（SQL-30・TASK-214、Issue #930）の種別。順位関数
@@ -3286,6 +3315,14 @@ impl AggregateSelectItem {
         let agg_args = |agg: &AggregateItem, out: &mut std::collections::HashSet<String>| {
             if let AggregateArg::Expr(e) = &agg.arg {
                 super::parser::collect_expr_idents(e, out);
+            }
+            // SQL-57: `string_agg` の区切り・内側 `ORDER BY` の式の識別子も参照列に含める
+            // （漏れると列の公開範囲検査・参照列の導出をすり抜けて非公開列を参照できてしまう）。
+            for e in &agg.extra_args {
+                super::parser::collect_expr_idents(e, out);
+            }
+            for k in &agg.order_by {
+                super::parser::collect_expr_idents(&k.expr, out);
             }
         };
         match self {
@@ -5889,15 +5926,26 @@ impl<'a> Parser<'a> {
         // 消費する（[`is_distinct_modifier`] と同じ判定規則。列名 `distinct` を
         // 引数に持つ `COUNT(distinct)` を壊さないよう、次のトークンが識別子・`*`
         // でない場合は消費しない）。
-        let distinct = if is_distinct_modifier(&self.tokens, self.pos) {
+        // `string_agg` の引数位置に限り、`DISTINCT` 直後の文字列リテラル・`(` も修飾子と判定する
+        // （`string_agg(DISTINCT 'x', ',')`・`DISTINCT ('x')`。PostgreSQL と同じ読み）。
+        let string_agg_modifier = func == AggregateFunc::StringAgg
+            && matches!(
+                self.tokens.get(self.pos),
+                Some(Token::Ident(n)) if n.eq_ignore_ascii_case("DISTINCT")
+            )
+            && matches!(
+                self.tokens.get(self.pos + 1),
+                Some(Token::StringLiteral(_)) | Some(Token::Punct('('))
+            );
+        let distinct = if string_agg_modifier || is_distinct_modifier(&self.tokens, self.pos) {
             self.advance();
             true
         } else {
             false
         };
-        if distinct && func != AggregateFunc::Count {
+        if distinct && !matches!(func, AggregateFunc::Count | AggregateFunc::StringAgg) {
             return Err(SqlSurfaceError::unsupported(
-                "DISTINCT is only allowed inside COUNT(DISTINCT ...)",
+                "DISTINCT is only allowed inside COUNT(DISTINCT ...) and string_agg",
             ));
         }
         let arg = if matches!(self.peek(), Some(Token::Punct('*'))) {
@@ -5922,18 +5970,106 @@ impl<'a> Parser<'a> {
             let saved_calls = self.agg_calls.take();
             let saved_minus = self.allow_unary_minus;
             self.allow_unary_minus = false;
+            // `string_agg` の引数位置は text と確定するため、裸の `NULL` をリテラルとして解析する。
+            let saved_null = self.allow_null_literal;
+            self.allow_null_literal = func == AggregateFunc::StringAgg;
             let parsed = self.parse_value_expr(0);
+            self.allow_null_literal = saved_null;
             self.allow_unary_minus = saved_minus;
             self.agg_calls = saved_calls;
             AggregateArg::Expr(parsed?)
         };
+        let mut extra_args = Vec::new();
+        let mut order_by = Vec::new();
+        if func == AggregateFunc::StringAgg {
+            // `string_agg(<値>, <区切り> [ORDER BY ...])`（SQL-57）。引数の個数が誤りの形は
+            // PostgreSQL と同じく該当シグネチャの関数が無い扱い（`42883`。Issue #1349 の前例）。
+            if !matches!(self.peek(), Some(Token::Punct(','))) {
+                return Err(SqlSurfaceError::undefined_function(
+                    "function string_agg requires exactly two arguments",
+                ));
+            }
+            self.advance();
+            let saved_calls = self.agg_calls.take();
+            let saved_minus = self.allow_unary_minus;
+            self.allow_unary_minus = false;
+            let saved_null = self.allow_null_literal;
+            self.allow_null_literal = true;
+            let parsed = self.parse_value_expr(0);
+            self.allow_null_literal = saved_null;
+            self.allow_unary_minus = saved_minus;
+            self.agg_calls = saved_calls;
+            extra_args.push(parsed?);
+            if matches!(self.peek(), Some(Token::Punct(','))) {
+                return Err(SqlSurfaceError::undefined_function(
+                    "function string_agg requires exactly two arguments",
+                ));
+            }
+            if matches!(self.peek(), Some(Token::Keyword(Keyword::Order))) {
+                order_by = self.parse_in_aggregate_order_by()?;
+            }
+        }
         self.expect_punct(')')?;
         Ok(AggregateItem {
             func,
             arg,
             alias: None,
             distinct,
+            extra_args,
+            order_by,
         })
+    }
+
+    /// 集計呼び出しの内側の `ORDER BY <式> [ASC|DESC] [NULLS FIRST|LAST] (',' ...)*`（SQL-57・
+    /// Issue #1800）。呼び出し元は [`Self::parse_aggregate_call_after_name`]（`string_agg` のみ）。
+    /// 文レベルの [`Self::parse_aggregate_order_by`] と違い、キーは常に値式（集計の内側では
+    /// 整数リテラルも定数式であり、出力列の位置〔序数〕とは解釈しない）。キー数の上限
+    /// （[`MAX_SCALAR_ORDER_KEYS`]）は確保前に検査し、超過は `54000`。引数と同じく入れ子の
+    /// 集計・単項マイナス拡張は無効にして解析する（入れ子集計は従来どおり `42601`）。
+    fn parse_in_aggregate_order_by(&mut self) -> Result<Vec<AggregateOrderKey>, SqlSurfaceError> {
+        self.expect_keyword(Keyword::Order)?;
+        self.expect_keyword(Keyword::By)?;
+        let mut keys = Vec::new();
+        loop {
+            if keys.len() >= MAX_SCALAR_ORDER_KEYS {
+                return Err(SqlSurfaceError::payload_too_large(
+                    "too many aggregate ORDER BY keys",
+                ));
+            }
+            let saved_calls = self.agg_calls.take();
+            let saved_minus = self.allow_unary_minus;
+            self.allow_unary_minus = false;
+            // 引数と同じく裸の `NULL` をリテラルとして解析する（DISTINCT 時の ORDER BY 式一致判定と
+            // 非 DISTINCT 時の評価を引数側と揃える）。
+            let saved_null = self.allow_null_literal;
+            self.allow_null_literal = true;
+            let parsed = self.parse_value_expr(0);
+            self.allow_null_literal = saved_null;
+            self.allow_unary_minus = saved_minus;
+            self.agg_calls = saved_calls;
+            let expr = parsed?;
+            let descending = if self.peek_ident_matches("DESC") {
+                self.advance();
+                true
+            } else {
+                if self.peek_ident_matches("ASC") {
+                    self.advance();
+                }
+                false
+            };
+            let nulls = self.parse_order_nulls();
+            keys.push(AggregateOrderKey {
+                expr,
+                descending,
+                nulls,
+            });
+            if matches!(self.peek(), Some(Token::Punct(','))) {
+                self.advance();
+                continue;
+            }
+            break;
+        }
+        Ok(keys)
     }
 
     /// 式モード解析中（[`Self::agg_calls`] が `Some`）に現れた集計関数呼び出しを読み、
@@ -13789,6 +13925,10 @@ fn check_body_aggregate(
     for item in &v.items {
         match item {
             AggregateSelectItem::Aggregate(agg) => {
+                // `string_agg`（SQL-57）はビュー本体には含めさせない（fail-closed）。
+                if agg.func == AggregateFunc::StringAgg {
+                    return Err(body_form_unsupported());
+                }
                 if let AggregateArg::Expr(e) = &agg.arg {
                     if !matches!(e, Expr::Ident(_)) {
                         return Err(body_form_unsupported());
@@ -17202,6 +17342,13 @@ fn parse_join_aggregate_item(p: &mut Parser<'_>) -> Result<JoinSelectItem, SqlSu
     let func = AggregateFunc::from_name(&name).ok_or_else(|| {
         SqlSurfaceError::unsupported(format!("unsupported aggregate function: {name}"))
     })?;
+    // `string_agg` の JOIN 対応は SQL-57 の対象外（1 引数形が列参照として通り、実行時に
+    // 内部エラーになるのを避けるため、構文段で明示的に拒否する）。
+    if func == AggregateFunc::StringAgg {
+        return Err(SqlSurfaceError::FeatureNotSupported {
+            detail: "string_agg is not supported in JOIN".to_string(),
+        });
+    }
     p.expect_punct('(')?;
     if p.peek_ident_matches("DISTINCT") {
         return Err(SqlSurfaceError::unsupported(
@@ -19277,6 +19424,12 @@ fn aggregate_statement_from_resolved(
         for item in &items {
             match item {
                 AggregateSelectItem::Aggregate(agg) => {
+                    // `string_agg`（SQL-57）は評価後射影形ビューの外側では評価しない（fail-closed）。
+                    if agg.func == AggregateFunc::StringAgg {
+                        return Err(SqlSurfaceError::unsupported(
+                            "aggregate over a view with an aggregate/LIMIT body supports only column arguments",
+                        ));
+                    }
                     if let AggregateArg::Expr(e) = &agg.arg {
                         if !matches!(e, Expr::Ident(_)) {
                             return Err(SqlSurfaceError::unsupported(
@@ -28205,6 +28358,91 @@ mod tests {
         }
     }
 
+    /// SQL-57・Issue #1800: `string_agg` の構文。2 引数・`DISTINCT`・内側 `ORDER BY`（複数キー・
+    /// 方向・`NULLS`）が `AggregateItem` へ載り、式の引数（区切り）も保持される。
+    #[test]
+    fn string_agg_parses_arguments_distinct_and_inner_order_by() {
+        let lookup = catalog_with(&["documents"]);
+        let agg = expect_aggregate(
+            "SELECT string_agg(DISTINCT a, ',' ORDER BY a DESC NULLS LAST, b), \
+             STRING_AGG(a, b) AS names FROM documents",
+            &lookup,
+        );
+        let first = expect_agg_item(&agg.items()[0]);
+        assert_eq!(first.func, AggregateFunc::StringAgg);
+        assert!(first.distinct);
+        assert_eq!(first.extra_args.len(), 1);
+        assert_eq!(first.order_by.len(), 2);
+        assert!(first.order_by[0].descending);
+        assert_eq!(first.order_by[0].nulls, Some(NullPlacement::Last));
+        assert!(!first.order_by[1].descending);
+        assert_eq!(first.order_by[1].nulls, None);
+        let second = expect_agg_item(&agg.items()[1]);
+        assert!(!second.distinct);
+        assert!(second.order_by.is_empty());
+        assert_eq!(second.alias.as_deref(), Some("names"));
+        assert_eq!(second.func.default_alias(), "string_agg");
+    }
+
+    /// PR #2671 レビュー対応: `DISTINCT` 直後の文字列リテラル・括弧式を修飾子と判定し、
+    /// 裸の `NULL` は引数と内側 `ORDER BY` で同じリテラルとして解析される。
+    #[test]
+    fn string_agg_distinct_modifier_before_literal_paren_and_null_order_key() {
+        let lookup = catalog_with(&["documents"]);
+        for sql in [
+            "SELECT string_agg(DISTINCT 'x', ',') FROM documents",
+            "SELECT string_agg(DISTINCT ('x'), ',') FROM documents",
+        ] {
+            let agg = expect_aggregate(sql, &lookup);
+            assert!(expect_agg_item(&agg.items()[0]).distinct, "{sql}");
+        }
+        let agg = expect_aggregate(
+            "SELECT string_agg(DISTINCT NULL, ',' ORDER BY NULL) FROM documents",
+            &lookup,
+        );
+        let item = expect_agg_item(&agg.items()[0]);
+        assert!(item.distinct);
+        assert_eq!(item.order_by.len(), 1);
+        assert_eq!(
+            format!("{:?}", item.order_by[0].expr),
+            format!(
+                "{:?}",
+                match &item.arg {
+                    AggregateArg::Expr(e) => e,
+                    _ => panic!("expr arg expected"),
+                }
+            )
+        );
+        // 列名 `distinct` を引数に取る既存形は維持する。
+        let agg = expect_aggregate("SELECT string_agg(distinct, ',') FROM documents", &lookup);
+        assert!(!expect_agg_item(&agg.items()[0]).distinct);
+    }
+
+    /// SQL-57: 引数の個数違いは `42883`、`*` は `42601`、キー数の超過は確保前に `54000`、
+    /// 他の集計へは 2 引数・内側 `ORDER BY`・`DISTINCT` を広げない（`42601`）。JOIN は `0A000`。
+    #[test]
+    fn string_agg_rejects_malformed_shapes_fail_closed() {
+        let lookup = catalog_with(&["documents"]);
+        let code = |sql: &str| validate_sql(sql, &lookup).expect_err(sql).wire_code();
+        assert_eq!(code("SELECT string_agg(a) FROM documents"), "42883");
+        assert_eq!(
+            code("SELECT string_agg(a, ',', ',') FROM documents"),
+            "42883"
+        );
+        assert_eq!(code("SELECT string_agg() FROM documents"), "42601");
+        assert_eq!(code("SELECT string_agg(*) FROM documents"), "42601");
+        assert_eq!(code("SELECT sum(a, b) FROM documents"), "42601");
+        assert_eq!(code("SELECT count(a ORDER BY a) FROM documents"), "42601");
+        assert_eq!(code("SELECT sum(DISTINCT a) FROM documents"), "42601");
+        let keys = ["a"; MAX_SCALAR_ORDER_KEYS + 1].join(", ");
+        assert_eq!(
+            code(&format!(
+                "SELECT string_agg(a, ',' ORDER BY {keys}) FROM documents"
+            )),
+            "54000"
+        );
+        assert!(is_aggregate_function_name("String_Agg"));
+    }
     /// Issue #1541（SQL-42 (5) のポインタ）: 集計呼び出しの直後の算術演算子で集計式項目になり、
     /// 式中の集計呼び出しは内部名へ置換されて `aggregates` に出現順で抽出される。
     #[test]
