@@ -4541,6 +4541,8 @@ impl EngineCore {
         session: &crate::sql::mode::SessionState,
         resolver: Option<crate::sql::relation_name::SchemaResolver<'_>>,
     ) -> Result<ParsedSql, crate::sql::allowlist::SqlSurfaceError> {
+        // 標準 SQL の行数制限句の正規化は、参照ゲート・一時カタログ走査より前に行う（Issue #1793）。
+        let tokens = Self::normalize_row_count_clauses(tokens)?;
         // 実効 `search_path` に `public` が含まれる既定のセッションは何も足さない（追加コストなし）。
         if !session.search_path_hides_public() {
             return self.parse_tokens_gated_inner(tokens, session, resolver);
@@ -4742,7 +4744,20 @@ impl EngineCore {
         &self,
         tokens: Vec<crate::sql::lexer::Token>,
     ) -> Result<ParsedSql, crate::sql::allowlist::SqlSurfaceError> {
+        let tokens = Self::normalize_row_count_clauses(tokens)?;
         self.parse_tokens_r(tokens, None)
+    }
+
+    /// 標準 SQL の `FETCH FIRST n ROWS ONLY`／`OFFSET n ROWS`／`WITH TIES` をトークン段で
+    /// 正規形（`LIMIT n`／`OFFSET n`、`WITH TIES` は専用の正規形）へ書き換える（SQL-56 (3)・
+    /// TASK-298 のポインタ。Issue #1793。実体は `sql::fetch_clause`）。構文検証・名前解決・
+    /// 一時カタログ走査のいずれより前に、各パース入口が呼ぶ。冪等で、`FETCH`／`OFFSET` を
+    /// 含まない文は何も変えない。`WITH TIES` を解釈できるのは「`SELECT` で始まる最上位の問い合わせ」
+    /// だけなので、それ以外の文種・括弧内の使用は黙って `ONLY` 扱いにせず `0A000` で拒否する。
+    fn normalize_row_count_clauses(
+        tokens: Vec<crate::sql::lexer::Token>,
+    ) -> Result<Vec<crate::sql::lexer::Token>, crate::sql::allowlist::SqlSurfaceError> {
+        crate::sql::fetch_clause::normalize_statement_tokens(tokens)
     }
 
     /// [`Self::parse_tokens`] のテナント SCHEMA 解決つき版（`resolver` は ctx を持つ入口だけが渡す。
@@ -4769,12 +4784,14 @@ impl EngineCore {
     /// 緩めたモードを渡す。
     fn parse_tokens_in(
         &self,
-        mut tokens: Vec<crate::sql::lexer::Token>,
+        tokens: Vec<crate::sql::lexer::Token>,
         temp: &crate::sql::temp_catalog::SessionTempCatalog,
         hits: &crate::sql::temp_catalog::RelationHits,
         ledger_mode: LedgerMode,
         resolver: Option<crate::sql::relation_name::SchemaResolver<'_>>,
     ) -> Result<ParsedSql, crate::sql::allowlist::SqlSurfaceError> {
+        // 各入口で正規化済みでも冪等のため、ここでも最終的な保証として適用する（Issue #1793）。
+        let mut tokens = Self::normalize_row_count_clauses(tokens)?;
         // `schema.table` のテーブル参照を解決して未修飾の名前（public）または内部キー
         // （テナントの SCHEMA 配下。`#<id>.<name>`）へ置き換える（TABLE-27・Issue #1714・#1717）。
         // 以降の検証は 1 個の名前として扱うため、修飾の有無で経路・エラー契約が変わらない。
@@ -5550,7 +5567,8 @@ impl EngineCore {
         declared: &[Option<crate::sql::params::DeclaredParamType>],
         tenant: Option<&str>,
     ) -> Result<PreparedSql, crate::sql::allowlist::SqlSurfaceError> {
-        let mut tokens = crate::sql::lexer::tokenize_with_params(sql)?;
+        let mut tokens =
+            Self::normalize_row_count_clauses(crate::sql::lexer::tokenize_with_params(sql)?)?;
         // `schema.table` のテーブル参照を解決して未修飾の名前（public）または内部キー（テナントの
         // SCHEMA 配下）へ置き換える（TABLE-27・Issue #1714・#1717）。位置推論・型推論・Bind の再
         // parse が同じ（解決済みの）トークン列を見るよう、最初に行う。

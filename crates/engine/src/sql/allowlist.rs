@@ -3387,6 +3387,8 @@ pub struct GroupByClause {
     /// で単一識別子から複数キーへ一般化。上限は [`MAX_SCALAR_ORDER_KEYS`]）。
     pub(crate) order_by: Vec<AggregateOrderBy>,
     pub(crate) limit: Option<u32>,
+    /// `FETCH FIRST n ROWS WITH TIES`（SQL-56 (3)・Issue #1793）。`limit` が `Some` のときだけ真。
+    pub(crate) with_ties: bool,
     /// `OFFSET` の生値（Issue #916・SQL-25 (b)・TASK-209）。`limit` が `None` のとき
     /// `OFFSET` 単独は構文段（[`parse_aggregate_shape`]）で `42601` に落ちるため常に
     /// `0`。範囲検証は `sql::parser::bind_group_by_clause` が束縛時に行う。
@@ -3486,6 +3488,10 @@ pub struct ValidatedScan {
     /// 別名として再解決せず、基底列名として束縛する（物理名が生成投影の別名と偶然一致して
     /// 別の列で並べ替わるのを防ぐ）。通常の文では空。
     pub(crate) physical_order_keys: Vec<usize>,
+    /// `FETCH FIRST n ROWS WITH TIES`（SQL-56 (3)・Issue #1793）。最後の行と `ORDER BY` の
+    /// 値が等しい行を結果へ加える。単一表のスカラー `ORDER BY` 広域取得だけが真になり、
+    /// 束縛段（`sql::parser::bind_scan_with_dummy_flags`）が `BoundScan` へ伝える。
+    pub(crate) with_ties: bool,
 }
 
 impl ValidatedScan {
@@ -6280,11 +6286,33 @@ impl<'a> Parser<'a> {
     /// 集計 `GROUP BY` の `LIMIT <n>`（TASK-167・SQL-14）。構文段では `u32` として
     /// 受理するのみで、範囲検査（`1..=MAX_GROUPS`）は束縛段
     /// （`sql::parser::bind_aggregate`）が行う。
-    fn parse_aggregate_limit(&mut self) -> Result<u32, SqlSurfaceError> {
-        self.expect_keyword(Keyword::Limit)?;
+    fn parse_aggregate_limit(&mut self) -> Result<(u32, bool), SqlSurfaceError> {
+        self.parse_limit_or_ties()
+    }
+
+    /// `LIMIT <n>`、または `sql::fetch_clause` が書き換えた `WITH TIES` の正規形
+    /// `FETCH FIRST <n> ROWS WITH TIES` を消費し、`(n, with_ties)` を返す（SQL-56 (3)・
+    /// Issue #1793）。件数の字句・`u32` 変換は `LIMIT` と同一の経路で、範囲検証は束縛段が担う。
+    /// 正規形を受理する呼び出し元は、広域取得のスカラー `ORDER BY` 分岐と集計 `GROUP BY` だけ。
+    fn parse_limit_or_ties(&mut self) -> Result<(u32, bool), SqlSurfaceError> {
+        let with_ties = if self.peek_ident_matches("FETCH") {
+            self.advance();
+            self.expect_ident_matching("FIRST")?;
+            true
+        } else {
+            self.expect_keyword(Keyword::Limit)?;
+            false
+        };
         let raw = self.expect_number()?;
-        raw.parse()
-            .map_err(|_| SqlSurfaceError::unsupported(format!("malformed LIMIT value: {raw}")))
+        let limit: u32 = raw
+            .parse()
+            .map_err(|_| SqlSurfaceError::unsupported(format!("malformed LIMIT value: {raw}")))?;
+        if with_ties {
+            self.expect_ident_matching("ROWS")?;
+            self.expect_ident_matching("WITH")?;
+            self.expect_ident_matching("TIES")?;
+        }
+        Ok((limit, with_ties))
     }
 
     /// WHERE 句の許可形状（等価条件・前方一致条件（TASK-147・EXT-3）・述語呼び出し形・
@@ -9110,7 +9138,7 @@ impl<'a> Parser<'a> {
         let at_end = match self.tokens.get(self.pos.saturating_add(len)) {
             None => true,
             Some(Token::Punct(',' | ';' | ')')) | Some(Token::Keyword(Keyword::Limit)) => true,
-            Some(Token::Ident(w)) => ["ASC", "DESC", "OFFSET", "NULLS"]
+            Some(Token::Ident(w)) => ["ASC", "DESC", "OFFSET", "NULLS", "FETCH"]
                 .iter()
                 .any(|k| w.eq_ignore_ascii_case(k)),
             _ => false,
@@ -16354,6 +16382,9 @@ struct ParsedScanShape {
     order_keys: Vec<ScanOrderKey>,
     /// 投影位置のスカラーサブクエリ（Issue #1352）。
     scalar_subquery_items: Vec<ScalarSubqueryItem>,
+    /// `FETCH FIRST n ROWS WITH TIES`（SQL-56 (3)・Issue #1793）。スカラー `ORDER BY` 付き
+    /// 広域取得だけが真になりうる（`sql::fetch_clause` が書き換えた正規形を受理する）。
+    with_ties: bool,
 }
 
 /// [`parse_select_shape`] の戻り値。`WHERE`（省略可）の直後に現れる分岐トークン
@@ -17762,6 +17793,7 @@ fn parse_set_branch(
             order_keys: Vec::new(),
             scalar_subquery_items: Vec::new(),
             physical_order_keys: Vec::new(),
+            with_ties: false,
         },
         super::view::Resolved::View {
             base_table,
@@ -17801,6 +17833,7 @@ fn parse_set_branch(
                 order_keys: Vec::new(),
                 scalar_subquery_items: Vec::new(),
                 physical_order_keys: Vec::new(),
+                with_ties: false,
             }
         }
         // Issue #1192: 評価後射影形ビューは集合演算の枝として参照できない。
@@ -17902,6 +17935,11 @@ fn parse_set_limited_branch(
             false,
             crate::nesting_limits::NestingLimits::default(),
         )?;
+        if shape.group_by.as_ref().is_some_and(|g| g.with_ties) {
+            return Err(SqlSurfaceError::feature_not_supported(
+                "WITH TIES is not supported inside a set operation branch",
+            ));
+        }
         return build_set_aggregate_branch(shape, lookup);
     }
     let shape = match parse_select_shape(
@@ -17917,6 +17955,11 @@ fn parse_set_limited_branch(
             ));
         }
     };
+    if shape.with_ties {
+        return Err(SqlSurfaceError::feature_not_supported(
+            "WITH TIES is not supported inside a set operation branch",
+        ));
+    }
     if !shape.window_items.is_empty() {
         return Err(SqlSurfaceError::unsupported(
             "window functions are not allowed inside a set operation branch",
@@ -18285,6 +18328,7 @@ fn parse_select_shape(
             window_items,
             order_keys: Vec::new(),
             scalar_subquery_items,
+            with_ties: false,
         }));
     }
 
@@ -18350,11 +18394,19 @@ fn parse_select_shape(
             ));
         }
 
-        p.expect_keyword(Keyword::Limit)?;
-        let limit_str = p.expect_number()?;
-        let limit: u32 = limit_str.parse().map_err(|_| {
-            SqlSurfaceError::unsupported(format!("malformed LIMIT value: {limit_str}"))
-        })?;
+        // SQL-56 (3)・Issue #1793: `WITH TIES` の正規形もここ（単一表のスカラー `ORDER BY`
+        // 広域取得）だけが受理する。サブクエリ内・ウィンドウ併用・投影位置のスカラー
+        // サブクエリ併用は結果行数の意味が定まらないため `0A000`（fail-closed）。
+        let (limit, with_ties) = p.parse_limit_or_ties()?;
+        if with_ties
+            && (subquery_ctx.is_some_and(|d| d > 0)
+                || !window_items.is_empty()
+                || !scalar_subquery_items.is_empty())
+        {
+            return Err(SqlSurfaceError::feature_not_supported(
+                "WITH TIES is not supported in a subquery or with window functions or scalar subqueries",
+            ));
+        }
 
         // Issue #916・SQL-25 (b)・TASK-209: スカラー `ORDER BY` 付き広域取得も
         // `LIMIT n` 直後の任意 `OFFSET m` を受理する（`ORDER BY` なし広域取得と
@@ -18381,6 +18433,7 @@ fn parse_select_shape(
             window_items,
             order_keys,
             scalar_subquery_items,
+            with_ties,
         }));
     }
 
@@ -18583,15 +18636,22 @@ fn parse_aggregate_shape(
         } else {
             Vec::new()
         };
-        let (limit, offset) = if matches!(p.peek(), Some(Token::Keyword(Keyword::Limit))) {
-            let limit = p.parse_aggregate_limit()?;
+        let (limit, with_ties, offset) = if matches!(p.peek(), Some(Token::Keyword(Keyword::Limit)))
+            || p.peek_ident_matches("FETCH")
+        {
+            let (limit, with_ties) = p.parse_aggregate_limit()?;
+            if with_ties && subquery_ctx.is_some_and(|d| d > 0) {
+                return Err(SqlSurfaceError::feature_not_supported(
+                    "WITH TIES is not supported in a subquery",
+                ));
+            }
             // Issue #916・SQL-25 (b)・TASK-209: `OFFSET` は `LIMIT` を伴う場合のみ
             // 受理する（`LIMIT` なしの `OFFSET` 単独は後続の `expect_end_of_statement`
             // が `42601` へ落とす。§計画 3.1）。
             let offset = p.parse_optional_offset()?.unwrap_or(0);
-            (Some(limit), offset)
+            (Some(limit), with_ties, offset)
         } else {
-            (None, 0)
+            (None, false, 0)
         };
         Some(GroupByClause {
             columns,
@@ -18599,6 +18659,7 @@ fn parse_aggregate_shape(
             having_exprs,
             order_by,
             limit,
+            with_ties,
             offset,
         })
     } else {
@@ -18696,7 +18757,7 @@ fn parse_distinct_shape(tokens: &[Token]) -> Result<ParsedAggregateShape, SqlSur
         Vec::new()
     };
     let limit = if matches!(p.peek(), Some(Token::Keyword(Keyword::Limit))) {
-        Some(p.parse_aggregate_limit()?)
+        Some(p.parse_aggregate_limit()?.0)
     } else {
         None
     };
@@ -18712,6 +18773,7 @@ fn parse_distinct_shape(tokens: &[Token]) -> Result<ParsedAggregateShape, SqlSur
             having_exprs: Vec::new(),
             order_by,
             limit,
+            with_ties: false,
             // `SELECT DISTINCT <column> ...` 構文自体が `OFFSET` を持たない
             // ため常に `0`。
             offset: 0,
@@ -19014,6 +19076,7 @@ fn build_scan_from_resolved(
             order_keys,
             scalar_subquery_items,
             physical_order_keys: Vec::new(),
+            with_ties: false,
         }),
         super::view::Resolved::View {
             base_table,
@@ -19081,6 +19144,7 @@ fn build_scan_from_resolved(
                 order_keys,
                 scalar_subquery_items,
                 physical_order_keys,
+                with_ties: false,
             })
         }
         // 評価後射影形ビュー（Issue #1192）は CTE・集合演算の枝など、広域取得の
@@ -19171,6 +19235,11 @@ fn aggregate_statement_from_resolved(
     group_by: Option<GroupByClause>,
 ) -> Result<Statement, SqlSurfaceError> {
     if let super::view::Resolved::Buffered { view_name, body } = resolved {
+        if group_by.as_ref().is_some_and(|g| g.with_ties) {
+            return Err(SqlSurfaceError::feature_not_supported(
+                "WITH TIES is not supported over a view with an aggregate/LIMIT body",
+            ));
+        }
         for item in &items {
             match item {
                 AggregateSelectItem::Aggregate(agg) => {
@@ -19404,6 +19473,16 @@ fn validate_sql_tokens_impl(
                     }
                 }
             };
+            // SQL-56 (3)・Issue #1793: `WITH TIES` は CTE を伴う文では未対応（fail-closed）。
+            let main_has_ties = match &main {
+                MainShape::Scan(shape) => shape.with_ties,
+                MainShape::Aggregate(shape) => shape.group_by.as_ref().is_some_and(|g| g.with_ties),
+            };
+            if main_has_ties {
+                return Err(SqlSurfaceError::feature_not_supported(
+                    "WITH TIES is not supported in a statement with CTEs",
+                ));
+            }
             let main_table_name = match &main {
                 MainShape::Scan(shape) => shape.table_name.clone(),
                 MainShape::Aggregate(shape) => shape.table_name.clone(),
@@ -19786,6 +19865,11 @@ fn validate_select_statement(
             // 宣言的な葉と NOT／OR・式述語のみ。式項目・投影位置のスカラーサブクエリは
             // `42601`。
             if let super::view::Resolved::Buffered { view_name, body } = resolved {
+                if shape.with_ties {
+                    return Err(SqlSurfaceError::feature_not_supported(
+                        "WITH TIES is not supported over a view with an aggregate/LIMIT body",
+                    ));
+                }
                 if !shape.scalar_subquery_items.is_empty()
                     || matches!(shape.projection, Projection::Items(_))
                 {
@@ -19816,7 +19900,7 @@ fn validate_select_statement(
                     column_aliases: Vec::new(),
                 }));
             }
-            Ok(Statement::Scan(build_scan_from_resolved(
+            let mut scan = build_scan_from_resolved(
                 shape.table_name,
                 resolved,
                 shape.projection,
@@ -19827,7 +19911,9 @@ fn validate_select_statement(
                 shape.window_items,
                 shape.order_keys,
                 shape.scalar_subquery_items,
-            )?))
+            )?;
+            scan.with_ties = shape.with_ties;
+            Ok(Statement::Scan(scan))
         }
     }
 }
@@ -21469,6 +21555,7 @@ fn validate_copy_table_to_tokens(
         order_keys: Vec::new(),
         scalar_subquery_items: Vec::new(),
         physical_order_keys: Vec::new(),
+        with_ties: false,
     };
     Ok(CopyStatement::To(ValidatedCopyTo {
         inner: Box::new(scan),

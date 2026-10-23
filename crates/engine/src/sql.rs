@@ -208,6 +208,7 @@ pub mod exec;
 pub mod explain;
 pub(crate) mod expr_program;
 pub(crate) mod expression_key_index;
+pub(crate) mod fetch_clause;
 pub mod generation_key;
 pub(crate) mod gin_scan;
 pub mod group_by;

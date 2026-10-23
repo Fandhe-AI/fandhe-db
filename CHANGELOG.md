@@ -9,6 +9,11 @@
 
 ### Added
 
+- `FETCH {FIRST|NEXT} [n] {ROW|ROWS} ONLY` と `OFFSET m {ROW|ROWS}` を受理する（Issue #1793・SQL-56）。トークン段で
+  `LIMIT n`／`OFFSET m` へ正規化するため範囲・上限・エラー契約は `LIMIT` と同一。`FETCH ... WITH TIES` は
+  単一表のスカラー `ORDER BY` 広域取得と `GROUP BY` 集計で受理し（同値行も結果行数の上限に数え、超過は `54000`）、
+  それ以外の経路は `0A000`／`42601`。`LIMIT` との併記・`PERCENT` は `42601`。
+  詳細は [order-by-having-expressions.md](docs/design/order-by-having-expressions.md)。
 - `ORDER BY <key> [ASC|DESC] NULLS FIRST|LAST` を広域取得・ウィンドウ・`GROUP BY` 集計・`SELECT DISTINCT`・JOIN・
   ビューの各経路で受理する（Issue #1791・SQL-56）。指定なしは従来どおり（ASC は末尾・DESC は先頭）。
   不正な指定と kNN 距離順への併用は `42601`。詳細は [order-by-having-expressions.md](docs/design/order-by-having-expressions.md)。

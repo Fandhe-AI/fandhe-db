@@ -2039,6 +2039,7 @@ mod budget_regression_tests {
                 name: "min_body".to_string(),
             }],
             order_exprs: Vec::new(),
+            ties_row_cap: None,
         }
     }
 
