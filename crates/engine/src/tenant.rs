@@ -5909,8 +5909,8 @@ fn update_rows_where_impl<E>(
 /// 候補列挙は対象表の所有かつ可視の行に閉じる（テナント境界は既存の列挙が担保する。
 /// 呼び出し元 `core::dml_join_exec` が FROM 側を `ctx`＝RLS 暗黙適用で別途走査する）。
 ///
-/// 台帳（RECOVER-11）の結線は Issue #1757 の担当で、呼び出し元が `LedgerWrite::Omitted`／
-/// `Disabled` のときだけ呼ぶ暫定ゲートを置いている（`content_hash_value` は記録に使われない）。
+/// 台帳（RECOVER-11・Issue #1757）は、呼び出し元が構文段で算出した正規化文ハッシュ
+/// （`content_hash_value`。結合結果は材料外）で記録する。事前照合は呼び出し元が行う。
 #[allow(clippy::too_many_arguments)]
 pub(crate) fn update_rows_joined_unchecked<E>(
     target: WriteTarget<'_>,

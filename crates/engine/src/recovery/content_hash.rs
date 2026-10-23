@@ -193,6 +193,11 @@ enum OpTag {
     /// `CREATE TABLE ... AS`（Issue #1679・SQL-52 (4)・RECOVER-10/11）。送られた文のトークン列
     /// （内側の問い合わせを含む）だけを材料にし、[`OpTag::InsertSelect`] とは別ドメインに分離する。
     CreateTableAs = 26,
+    /// `UPDATE ... FROM`（Issue #1757・SQL-53 (5)・RECOVER-10/11）。送られた文のトークン列だけを材料にし、
+    /// 述語形の [`OpTag::UpdateWhere`] や [`OpTag::InsertSelect`] とは別ドメインに分離する。
+    UpdateFrom = 27,
+    /// `DELETE ... USING`（Issue #1757。[`OpTag::UpdateFrom`] と同じ規則で、UPDATE とは別ドメイン）。
+    DeleteUsing = 28,
 }
 
 /// 長さプレフィクス付きフィールド連結でハッシュ入力を組み立てるビルダー
@@ -1403,6 +1408,40 @@ pub(crate) fn for_create_table_as(
     statement_tokens: &[crate::sql::lexer::Token],
 ) -> Result<ContentHash, StorageError> {
     let mut b = HashInputBuilder::new(OpTag::CreateTableAs);
+    b.push_u64(statement_tokens.len() as u64);
+    for t in statement_tokens {
+        push_token(&mut b, t)?;
+    }
+    Ok(b.finish())
+}
+
+/// `UPDATE ... FROM` の台帳照合ハッシュ（Issue #1757。ポインタ: SQL-53 (5)・RECOVER-10・RECOVER-11）。
+///
+/// 材料は [`strip_operation_id_clause`] で `USING OPERATION_ID` 句と末尾 `;` を除いた文のトークン列
+/// **だけ**。結合結果の行の集合・値は材料にしないため、再送時に結合結果やデータが変わっていても
+/// 同一文なら同一ハッシュになる（`23505`）。識別子の大小・数値表記は畳まない（差があれば `22023` 側）。
+/// 未束縛の [`Token::Param`] が残っていれば `Err`（fail-closed）。呼び出し元は `sql::allowlist` の
+/// 結合形検証入口。残余リスク: 宣言的 UDF の定義そのものは材料に入らない（#1752・#2650 と同じ）。
+pub(crate) fn for_update_from(
+    statement_tokens: &[crate::sql::lexer::Token],
+) -> Result<ContentHash, StorageError> {
+    token_statement_hash(OpTag::UpdateFrom, statement_tokens)
+}
+
+/// `DELETE ... USING` の台帳照合ハッシュ（Issue #1757）。規則は [`for_update_from`] と同じで、
+/// ドメインタグだけが異なる。
+pub(crate) fn for_delete_using(
+    statement_tokens: &[crate::sql::lexer::Token],
+) -> Result<ContentHash, StorageError> {
+    token_statement_hash(OpTag::DeleteUsing, statement_tokens)
+}
+
+/// 文のトークン列を長さプレフィクス付きで直列化したハッシュ（結合形 DML 用の共通本体）。
+fn token_statement_hash(
+    tag: OpTag,
+    statement_tokens: &[crate::sql::lexer::Token],
+) -> Result<ContentHash, StorageError> {
+    let mut b = HashInputBuilder::new(tag);
     b.push_u64(statement_tokens.len() as u64);
     for t in statement_tokens {
         push_token(&mut b, t)?;
@@ -7146,6 +7185,87 @@ mod tests {
         let a = sel_hash("INSERT INTO t (a) SELECT a FROM s USING MODE recall");
         let b = sel_hash("INSERT INTO t (a) SELECT a FROM s");
         assert_ne!(a, b);
+    }
+
+    // ---- Issue #1757: UPDATE ... FROM／DELETE ... USING の content_hash（SQL-53 (5)）----
+
+    const UPD: &str = "UPDATE t SET x = s.v FROM s WHERE t.k = s.k";
+    const DEL: &str = "DELETE FROM t USING s WHERE t.k = s.k";
+
+    fn join_hash(sql: &str, update: bool) -> ContentHash {
+        let toks = crate::sql::lexer::tokenize(sql).expect("tokenize");
+        let toks = strip_operation_id_clause(&toks);
+        if update {
+            for_update_from(toks).expect("hash")
+        } else {
+            for_delete_using(toks).expect("hash")
+        }
+    }
+
+    #[test]
+    fn join_dml_hash_ignores_operation_id_and_terminator() {
+        let base = join_hash(UPD, true);
+        assert_eq!(base, join_hash(&format!("{UPD};"), true));
+        assert_eq!(
+            base,
+            join_hash(&format!("{UPD} USING OPERATION_ID 'a'"), true)
+        );
+        assert_eq!(
+            base,
+            join_hash(&format!("{UPD} using operation_id 'b';"), true)
+        );
+        assert_eq!(
+            base,
+            join_hash(&format!("{UPD} USING OPERATION_ID NULL"), true)
+        );
+        let d = join_hash(DEL, false);
+        assert_eq!(
+            d,
+            join_hash(&format!("{DEL} USING OPERATION_ID 'z';"), false)
+        );
+    }
+
+    #[test]
+    fn join_dml_hash_is_sensitive_and_domain_separated() {
+        let base = join_hash(UPD, true);
+        for other in [
+            "UPDATE t SET x = 1 FROM s WHERE t.k = s.k",
+            "UPDATE t SET x = s.v FROM s2 WHERE t.k = s.k",
+            "UPDATE t SET x = s.v FROM s WHERE t.k = s.v",
+        ] {
+            assert_ne!(base, join_hash(other, true), "{other}");
+        }
+        // 同じトークン列でもタグが違えば別ハッシュ。
+        let toks = crate::sql::lexer::tokenize(UPD).expect("tokenize");
+        assert_ne!(
+            for_update_from(&toks).unwrap(),
+            for_delete_using(&toks).unwrap()
+        );
+        assert_ne!(
+            for_update_from(&toks).unwrap(),
+            for_insert_select(&toks).unwrap()
+        );
+        assert_ne!(
+            for_delete_using(&toks).unwrap(),
+            for_create_table_as(&toks).unwrap()
+        );
+        assert!(for_update_from(&[crate::sql::lexer::Token::Param(1)]).is_err());
+        assert!(for_delete_using(&[crate::sql::lexer::Token::Param(1)]).is_err());
+    }
+
+    #[test]
+    fn join_dml_hash_layout_is_golden() {
+        let hex = |h: ContentHash| -> String {
+            h.as_bytes().iter().map(|b| format!("{b:02x}")).collect()
+        };
+        assert_eq!(
+            hex(join_hash(UPD, true)),
+            "6fb4fe941d2727527f2f73fae21cda26672b68b772fc3313f47c0b9e37a68398"
+        );
+        assert_eq!(
+            hex(join_hash(DEL, false)),
+            "35da3e4fa9998f5b5103930616fa45429264f4a2f4dae7a80b88d515df23e6e9"
+        );
     }
 
     #[test]

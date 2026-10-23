@@ -10,6 +10,9 @@ use super::EngineCore;
 use crate::catalog::{ColumnDef, ColumnType, TableSchema};
 use crate::kernel::CpuScalarProvider;
 use crate::policy::PolicyContext;
+use crate::recovery::content_hash::{
+    for_delete_using, for_update_from, strip_operation_id_clause, ContentHash,
+};
 use crate::recovery::required_op_id::{LedgerMode, OperationId};
 use crate::row_codec::Value;
 use crate::sql::allowlist::SqlSurfaceError;
@@ -198,6 +201,29 @@ fn delete_using() -> JoinedDmlPlan {
     plan(vec![key_k()], None)
 }
 
+const UPD_SQL: &str = "UPDATE t SET x = s.v FROM s WHERE t.k = s.k";
+const DEL_SQL: &str = "DELETE FROM t USING s WHERE t.k = s.k";
+
+/// 構文段（`sql::allowlist`）と同じ関数で文ハッシュを作る（`USING OPERATION_ID` 句と `;` は材料外）。
+fn upd_hash(sql: &str) -> ContentHash {
+    let toks = crate::sql::lexer::tokenize(sql).expect("tokenize");
+    for_update_from(strip_operation_id_clause(&toks)).expect("hash")
+}
+
+fn del_hash(sql: &str) -> ContentHash {
+    let toks = crate::sql::lexer::tokenize(sql).expect("tokenize");
+    for_delete_using(strip_operation_id_clause(&toks)).expect("hash")
+}
+
+/// 計画の種別に応じた既定の文ハッシュ（台帳を使わないテスト用）。
+fn default_hash(plan: &JoinedDmlPlan) -> ContentHash {
+    if plan.update.is_some() {
+        upd_hash(UPD_SQL)
+    } else {
+        del_hash(DEL_SQL)
+    }
+}
+
 fn exec_with(
     core: &EngineCore,
     ctx: &PolicyContext,
@@ -216,6 +242,7 @@ fn exec_with(
         &session,
         plan,
         None,
+        &default_hash(plan),
         None,
         limits,
         max_affected.and_then(std::num::NonZeroUsize::new),
@@ -525,6 +552,7 @@ fn autocommit_target_is_rejected_with_0a000() {
             &session,
             &delete_using(),
             None,
+            &del_hash(DEL_SQL),
             None,
         )
         .err()
@@ -543,59 +571,308 @@ fn returning_that_references_the_source_is_rejected_with_0a000() {
     assert_eq!(xs(&core, &alice).len(), 3);
 }
 
-#[test]
-fn operation_id_is_gated_until_the_ledger_hash_is_wired() {
-    let (core, _g) = new_core_with(LedgerMode::Ledgered);
+/// Ledgered 構成の core。t = {1:(10,a), 2:(20,b), 3:(30,c)}、s = {1:(a,100), 2:(a,200), 3:(b,300)}
+/// （alice。台帳が必須のため id・operation_id を明示して挿入する）。
+fn ledgered_setup() -> (EngineCore, CleanupGuard, PolicyContext) {
+    let (core, guard) = new_core_with(LedgerMode::Ledgered);
     let alice = ctx("alice");
-    seed_t_with_op(&core, &alice);
-    let session = SessionState::default();
-    let mut txn = core.new_session_transaction();
-    let s = SessionState::default();
-    txn.begin_implicit(&core.storage, &s).expect("begin");
-    let write_txn = txn.write_txn().expect("write txn");
-    let op = OperationId::parse("join-op-1").expect("op id");
-    let err = core
-        .execute_joined_dml_in(
-            WriteTarget::InTxn(write_txn),
-            &alice,
-            &session,
-            &delete_using(),
-            Some(&op),
-            None,
-        )
-        .err()
-        .expect("gate");
-    assert_eq!(err.wire_code(), "0A000");
-    // operation_id を省略した Ledgered 構成は従来どおり 23502。
-    let err = core
-        .execute_joined_dml_in(
-            WriteTarget::InTxn(write_txn),
-            &alice,
-            &session,
-            &delete_using(),
-            None,
-            None,
-        )
-        .err()
-        .expect("missing op id");
-    assert_eq!(err.wire_code(), "23502");
+    for (id, x, k) in [(1u64, 10i64, "a"), (2, 20, "b"), (3, 30, "c")] {
+        seed_t_ledgered(&core, &alice, id, x, k);
+    }
+    for (id, k, v) in [(1u64, "a", 100i64), (2, "a", 200), (3, "b", 300)] {
+        seed_s_ledgered(&core, &alice, id, k, v);
+    }
+    (core, guard, alice)
 }
 
-fn seed_t_with_op(core: &EngineCore, ctx: &PolicyContext) {
+fn seed_t_ledgered(core: &EngineCore, ctx: &PolicyContext, id: u64, x: i64, k: &str) {
     crate::tenant::insert_typed_row(
         &core.storage,
         "t",
         ctx,
-        1,
+        id,
         Visibility::Private,
         &[
             Value::Vector(vec![0.1, 0.2]),
-            Value::BigInt(1),
-            Value::Text("a".to_string()),
+            Value::BigInt(x),
+            Value::Text(k.to_string()),
         ],
-        &OperationId::parse("seed-t-1").expect("op id"),
+        &OperationId::parse(&format!("seed-t-{}-{id}", ctx.tenant_id())).expect("op id"),
     )
-    .expect("seed");
+    .expect("seed t");
+}
+
+fn seed_s_ledgered(core: &EngineCore, ctx: &PolicyContext, id: u64, k: &str, v: i64) {
+    crate::tenant::insert_typed_row(
+        &core.storage,
+        "s",
+        ctx,
+        id,
+        Visibility::Private,
+        &[
+            Value::Vector(vec![0.1, 0.2]),
+            Value::Text(k.to_string()),
+            Value::BigInt(v),
+        ],
+        &OperationId::parse(&format!("seed-s-{}-{id}", ctx.tenant_id())).expect("op id"),
+    )
+    .expect("seed s");
+}
+
+/// 1 文を暗黙トランザクションで実行して commit する（失敗時は txn を drop して abort）。
+fn exec_op(
+    core: &EngineCore,
+    ctx: &PolicyContext,
+    plan: &JoinedDmlPlan,
+    op: Option<&str>,
+    hash: &ContentHash,
+    limits: &JoinLimits,
+) -> Result<JoinedDmlOutcome, SqlSurfaceError> {
+    let op = op.map(|o| OperationId::parse(o).expect("op id"));
+    let mut session = SessionState::default();
+    let mut txn = core.new_session_transaction();
+    txn.begin_implicit(&core.storage, &session)?;
+    let write_txn = txn.write_txn().expect("write txn");
+    let out = core.execute_joined_dml_with_limits(
+        WriteTarget::InTxn(write_txn),
+        ctx,
+        &session,
+        plan,
+        op.as_ref(),
+        hash,
+        None,
+        limits,
+        None,
+        1_000_000,
+    )?;
+    txn.mark_written(ctx.tenant_id(), &plan.target.table);
+    txn.commit_implicit(&mut session)?;
+    Ok(out)
+}
+
+fn code(r: Result<JoinedDmlOutcome, SqlSurfaceError>) -> &'static str {
+    r.err().expect("must fail").wire_code()
+}
+
+#[test]
+fn update_from_replay_is_rejected_with_23505_and_does_not_reapply() {
+    let (core, _g, alice) = ledgered_setup();
+    let h = upd_hash(UPD_SQL);
+    let lim = JoinLimits::default();
+    exec_op(&core, &alice, &update_from_s_v(), Some("u-1"), &h, &lim).expect("first");
+    let after = xs(&core, &alice);
+    assert_eq!(after, vec![(1, 100), (2, 300), (3, 30)]);
+    // 同じ operation_id・同じ文（`USING OPERATION_ID` 句だけ違う文字列でも同一ハッシュ）の再送。
+    let h2 = upd_hash(&format!("{UPD_SQL} USING OPERATION_ID 'u-1';"));
+    assert_eq!(h, h2);
+    let r = exec_op(&core, &alice, &update_from_s_v(), Some("u-1"), &h2, &lim);
+    assert_eq!(code(r), "23505");
+    assert_eq!(xs(&core, &alice), after);
+}
+
+#[test]
+fn delete_using_replay_is_rejected_with_23505_and_does_not_reapply() {
+    let (core, _g, alice) = ledgered_setup();
+    let h = del_hash(DEL_SQL);
+    let lim = JoinLimits::default();
+    exec_op(&core, &alice, &delete_using(), Some("d-1"), &h, &lim).expect("first");
+    assert_eq!(xs(&core, &alice), vec![(3, 30)]);
+    seed_t_ledgered(&core, &alice, 9, 90, "a");
+    let r = exec_op(&core, &alice, &delete_using(), Some("d-1"), &h, &lim);
+    assert_eq!(code(r), "23505");
+    // 再送で新しい一致行（id 9）が消えていない。
+    assert_eq!(xs(&core, &alice), vec![(3, 30), (9, 90)]);
+}
+
+#[test]
+fn replay_is_independent_of_join_result_and_source_limits() {
+    let (core, _g, alice) = ledgered_setup();
+    let h = upd_hash(UPD_SQL);
+    exec_op(
+        &core,
+        &alice,
+        &update_from_s_v(),
+        Some("u-2"),
+        &h,
+        &JoinLimits::default(),
+    )
+    .expect("first");
+    // source を増やして結合結果を変えても 23505。
+    seed_s_ledgered(&core, &alice, 4, "c", 400);
+    seed_s_ledgered(&core, &alice, 5, "c", 500);
+    let r = exec_op(
+        &core,
+        &alice,
+        &update_from_s_v(),
+        Some("u-2"),
+        &h,
+        &JoinLimits::default(),
+    );
+    assert_eq!(code(r), "23505");
+    // 再送時だけ source の入力行数上限を超えても、走査前の事前照合で 23505（54000 ではない）。
+    let tight = JoinLimits {
+        max_input_rows: 2,
+        ..JoinLimits::default()
+    };
+    let r = exec_op(&core, &alice, &update_from_s_v(), Some("u-2"), &h, &tight);
+    assert_eq!(code(r), "23505");
+}
+
+#[test]
+fn zero_match_statement_is_also_recorded_and_replay_is_23505() {
+    // 空の表への文は 0 行一致。それでも台帳は記録され、再送は 23505。
+    let (core, _g) = new_core_with(LedgerMode::Ledgered);
+    let alice = ctx("alice");
+    let h = del_hash(DEL_SQL);
+    let lim = JoinLimits::default();
+    let out = exec_op(&core, &alice, &delete_using(), Some("d-0"), &h, &lim).expect("first");
+    assert_eq!(out.rows_affected, 0);
+    seed_t_ledgered(&core, &alice, 1, 1, "a");
+    let r = exec_op(&core, &alice, &delete_using(), Some("d-0"), &h, &lim);
+    assert_eq!(code(r), "23505");
+}
+
+#[test]
+fn reusing_operation_id_for_a_different_statement_is_22023_without_side_effects() {
+    let (core, _g, alice) = ledgered_setup();
+    let lim = JoinLimits::default();
+    exec_op(
+        &core,
+        &alice,
+        &update_from_s_v(),
+        Some("m-1"),
+        &upd_hash(UPD_SQL),
+        &lim,
+    )
+    .expect("first");
+    let after = xs(&core, &alice);
+    for h in [
+        upd_hash("UPDATE t SET x = 1 FROM s WHERE t.k = s.k"),
+        upd_hash("UPDATE t SET x = s.v FROM s2 WHERE t.k = s.k"),
+        del_hash(DEL_SQL),
+    ] {
+        let r = exec_op(&core, &alice, &delete_using(), Some("m-1"), &h, &lim);
+        assert_eq!(code(r), "22023");
+    }
+    assert_eq!(xs(&core, &alice), after);
+}
+
+#[test]
+fn predicate_form_and_join_form_do_not_share_a_ledger_hash() {
+    let (core, _g, alice) = ledgered_setup();
+    let lim = JoinLimits::default();
+    // 述語形を先に実行 → 同じ op_id・同じ対象表の結合形は 22023。
+    let mut session = SessionState::default();
+    core.execute_sql_in_session(
+        &alice,
+        &mut session,
+        "UPDATE t SET x = 5 WHERE x = 10 USING OPERATION_ID 'x-1'",
+    )
+    .expect("predicate form");
+    let r = exec_op(
+        &core,
+        &alice,
+        &update_from_s_v(),
+        Some("x-1"),
+        &upd_hash(UPD_SQL),
+        &lim,
+    );
+    assert_eq!(code(r), "22023");
+    // 結合形を先に実行 → 同じ op_id の述語形は 22023。
+    exec_op(
+        &core,
+        &alice,
+        &update_from_s_v(),
+        Some("x-2"),
+        &upd_hash(UPD_SQL),
+        &lim,
+    )
+    .expect("join form");
+    let err = core
+        .execute_sql_in_session(
+            &alice,
+            &mut session,
+            "UPDATE t SET x = 5 WHERE x = 10 USING OPERATION_ID 'x-2'",
+        )
+        .expect_err("reuse");
+    assert_eq!(err.wire_code(), "22023");
+}
+
+#[test]
+fn same_transaction_replay_is_23505() {
+    let (core, _g, alice) = ledgered_setup();
+    let session = SessionState::default();
+    let mut txn = core.new_session_transaction();
+    txn.begin_implicit(&core.storage, &session).expect("begin");
+    let write_txn = txn.write_txn().expect("write txn");
+    let op = OperationId::parse("t-1").expect("op id");
+    let h = upd_hash(UPD_SQL);
+    for expect_ok in [true, false] {
+        let r = core.execute_joined_dml_with_limits(
+            WriteTarget::InTxn(write_txn),
+            &alice,
+            &session,
+            &update_from_s_v(),
+            Some(&op),
+            &h,
+            None,
+            &JoinLimits::default(),
+            None,
+            1_000_000,
+        );
+        if expect_ok {
+            r.expect("first");
+        } else {
+            assert_eq!(code(r), "23505");
+        }
+    }
+}
+
+#[test]
+fn ledgered_without_operation_id_is_23502() {
+    let (core, _g, alice) = ledgered_setup();
+    let r = exec_op(
+        &core,
+        &alice,
+        &delete_using(),
+        None,
+        &del_hash(DEL_SQL),
+        &JoinLimits::default(),
+    );
+    assert_eq!(code(r), "23502");
+    assert_eq!(xs(&core, &alice).len(), 3);
+}
+
+#[test]
+fn omitted_mode_applies_without_ledger_and_allows_repeat() {
+    let (core, _g, alice) = setup();
+    let h = upd_hash(UPD_SQL);
+    let lim = JoinLimits::default();
+    exec_op(&core, &alice, &update_from_s_v(), None, &h, &lim).expect("first");
+    // 台帳を使わない構成では同じ文を繰り返し適用できる（台帳に何も残らない）。
+    exec_op(&core, &alice, &update_from_s_v(), None, &h, &lim).expect("second");
+}
+
+#[test]
+fn other_tenant_with_same_operation_id_and_statement_is_unaffected() {
+    let (core, _g, alice) = ledgered_setup();
+    let bob = ctx("bob");
+    seed_t_ledgered(&core, &bob, 11, 1, "a");
+    seed_s_ledgered(&core, &bob, 12, "a", 777);
+    let h = upd_hash(UPD_SQL);
+    let lim = JoinLimits::default();
+    exec_op(
+        &core,
+        &alice,
+        &update_from_s_v(),
+        Some("shared-op"),
+        &h,
+        &lim,
+    )
+    .expect("alice");
+    exec_op(&core, &bob, &update_from_s_v(), Some("shared-op"), &h, &lim).expect("bob");
+    assert_eq!(xs(&core, &bob), vec![(11, 777)]);
+    assert_eq!(xs(&core, &alice), vec![(1, 100), (2, 300), (3, 30)]);
 }
 
 #[test]
@@ -630,6 +907,7 @@ fn explicit_transaction_sees_uncommitted_source_rows_and_rolls_back() {
             &session,
             &update_from_s_v(),
             None,
+            &upd_hash(UPD_SQL),
             None,
             &JoinLimits::default(),
             None,
@@ -733,4 +1011,29 @@ fn update_from_assigns_time_timestamptz_interval_bpchar_and_array_source_columns
     assert_eq!(got.rows.len(), 1);
     assert_eq!(got.rows[0].cells, want.rows[0].cells);
     assert!(got.rows[0].cells.iter().all(|c| !matches!(c, Cell::Null)));
+}
+
+/// 構文段（`parse_sql`）が `statement_hash` に正規化文ハッシュを載せる（Issue #1757。SQL-53 (5)）。
+/// `USING OPERATION_ID` 句・末尾 `;` は材料外で、文の差は別ハッシュになる。
+#[test]
+fn parse_sql_carries_statement_hash_without_operation_id() {
+    use crate::core::ParsedSql;
+    let (core, _g) = new_core_with(LedgerMode::Ledgered);
+    let upd = |sql: &str| match core.parse_sql(sql).expect("parse") {
+        ParsedSql::UpdateFrom(s) => *s.statement_hash(),
+        other => panic!("unexpected {other:?}"),
+    };
+    let del = |sql: &str| match core.parse_sql(sql).expect("parse") {
+        ParsedSql::DeleteUsing(s) => *s.statement_hash(),
+        other => panic!("unexpected {other:?}"),
+    };
+    let u1 = format!("{UPD_SQL} USING OPERATION_ID 'a'");
+    let u2 = format!("{UPD_SQL} USING OPERATION_ID 'b';");
+    assert_eq!(upd(&u1), upd(&u2));
+    assert_eq!(upd(&u1), upd_hash(UPD_SQL));
+    let other = "UPDATE t SET x = 1 FROM s WHERE t.k = s.k USING OPERATION_ID 'a'";
+    assert_ne!(upd(&u1), upd(other));
+    let d1 = format!("{DEL_SQL} USING OPERATION_ID 'a'");
+    assert_eq!(del(&d1), del_hash(DEL_SQL));
+    assert_ne!(del(&d1), upd(&u1));
 }

@@ -700,6 +700,24 @@ SQL-53 (5)・RECOVER-11 のポインタ。#1752 の申し送り（台帳の事�
 - **テスト**: engine 単体（`core/dml_subquery_exec_tests.rs`）・結合（`tests/sql53_dml_where_subquery.rs`）・
   wire 経由 e2e（`wire-server/tests/wire_sql53_dml_subquery_operation_id.rs`。簡易・拡張クエリ）。
 
+## Issue #1757 追記（UPDATE … FROM／DELETE … USING の台帳 content_hash）
+
+SQL-53 (5)・RECOVER-10/11 ポインタ。結合形 DML の `USING OPERATION_ID` を台帳へ結線した。
+
+- **タグ**: `OpTag::UpdateFrom = 27`・`DeleteUsing = 28`。述語形（9・10）・`InsertSelect`・`CreateTableAs` と
+  別ドメイン。既存タグのバイト列は変えない。
+- **材料**: 送られた文のトークン列から `strip_operation_id_clause` で `USING OPERATION_ID` 句と末尾 `;` を
+  除いたものだけ（`for_update_from`／`for_delete_using`）。**結合結果の行の集合・値は含めない**ため、再送は
+  結合結果やデータの変化に関係なく `23505`、別文への再利用は `22023`。識別子の大小・数値表記は畳まない。
+- **算出位置**: `sql::allowlist` の結合形検証入口が全検証の後に算出し、`ValidatedUpdateFrom`／
+  `ValidatedDeleteUsing` の `statement_hash` に持たせる（検証順とエラーコードは不変）。
+- **事前照合**: `execute_joined_dml_in` が `precheck_in_write_txn` で FROM／USING 側の走査より前に照合する。
+  再送時に source の行数上限（`54000`）やデータ変化があっても `23505` になる。確定記録は書き込み本体が
+  同じ txn で行う。暫定ゲート（`0A000`）は撤去した。
+- **残余リスク**: 宣言的 UDF の定義そのものは材料に入らない（#1752・#2650 と同じ）。
+- **テスト**: `core/dml_join_exec_tests.rs`（再送冪等・別文・述語形との相互・同一 txn・テナント別）と
+  `recovery::content_hash` の単体テスト（golden を含む）。SQL 経路の dispatch 結線は別途。
+
 ## 参照
 
 - `docs/spec/04-behavior/recovery.md`（RECOVER-2・RECOVER-3・RECOVER-7・

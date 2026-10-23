@@ -2818,7 +2818,7 @@ pub enum DmlFromSetValue {
 /// 許可形状の構造判定を通過した `UPDATE <表> [[AS] <別名>] SET ... FROM <表の並び> [WHERE ...]`
 /// （SQL-53 (b)、Issue #1754。親 #1753）。保証するのは構文と表の存在確認（ビュー拒否）まで。
 /// 列の解決・型検証は `sql::dml_from` の束縛、結合の実行は #1755、RLS と `RETURNING` は #1756、
-/// 台帳の content_hash は #1757 の担当。
+/// 台帳の content_hash は構文段で算出して保持する（Issue #1757。[`Self::statement_hash`]）。
 ///
 /// 既存の述語形 [`ValidatedPredicateUpdate`] にフィールドを足さず別型にしているのは、`ParsedSql::Update`
 /// の既存の実行腕が FROM を黙って無視する（単一表として処理する fail-open）経路を作らないため。
@@ -2835,9 +2835,18 @@ pub struct ValidatedUpdateFrom {
     pub(crate) where_clause: Option<Box<JoinWhereExpr>>,
     /// 文末の `USING OPERATION_ID` で搬送された検証済みの operation_id。
     pub(crate) operation_id: Option<OperationId>,
+    /// 台帳照合用の文ハッシュ（Issue #1757。`USING OPERATION_ID` 句と末尾 `;` を除いたトークン列だけが
+    /// 材料で、結合結果は含まない）。
+    pub(crate) statement_hash: crate::recovery::content_hash::ContentHash,
 }
 
 impl ValidatedUpdateFrom {
+    /// 台帳（RECOVER-11）の content_hash に使う正規化済みの文ハッシュ。
+    #[allow(dead_code)] // SQL 経路の dispatch 結線（実行腕）で使う。
+    pub(crate) fn statement_hash(&self) -> &crate::recovery::content_hash::ContentHash {
+        &self.statement_hash
+    }
+
     /// 更新対象の表名（別名ではなく実表名）。
     pub fn target_table(&self) -> &str {
         self.target.table()
@@ -2862,9 +2871,17 @@ pub struct ValidatedDeleteUsing {
     pub(crate) where_clause: Option<Box<JoinWhereExpr>>,
     /// 文末の `USING OPERATION_ID` で搬送された検証済みの operation_id。
     pub(crate) operation_id: Option<OperationId>,
+    /// 台帳照合用の文ハッシュ（[`ValidatedUpdateFrom::statement_hash`] と同じ規則）。
+    pub(crate) statement_hash: crate::recovery::content_hash::ContentHash,
 }
 
 impl ValidatedDeleteUsing {
+    /// 台帳（RECOVER-11）の content_hash に使う正規化済みの文ハッシュ。
+    #[allow(dead_code)] // SQL 経路の dispatch 結線（実行腕）で使う。
+    pub(crate) fn statement_hash(&self) -> &crate::recovery::content_hash::ContentHash {
+        &self.statement_hash
+    }
+
     /// 削除対象の表名（別名ではなく実表名）。
     pub fn target_table(&self) -> &str {
         self.target.table()
@@ -16514,6 +16531,8 @@ impl<'a> Parser<'a> {
         let where_clause = self.parse_dml_from_where()?;
         let returning = self.parse_returning_clause()?;
         let operation_id = self.parse_operation_id_clause()?;
+        // 文ハッシュは検証入口が元のトークン列から算出して差し替える（QuotedNull 正規化前の列を使うため）。
+        let statement_hash = placeholder_statement_hash()?;
         Ok(ParsedUpdateFrom {
             stmt: ValidatedUpdateFrom {
                 target,
@@ -16521,6 +16540,7 @@ impl<'a> Parser<'a> {
                 assignments,
                 where_clause,
                 operation_id,
+                statement_hash,
             },
             has_returning: returning.is_some(),
         })
@@ -16537,16 +16557,26 @@ impl<'a> Parser<'a> {
         let where_clause = self.parse_dml_from_where()?;
         let returning = self.parse_returning_clause()?;
         let operation_id = self.parse_operation_id_clause()?;
+        let statement_hash = placeholder_statement_hash()?;
         Ok(ParsedDeleteUsing {
             stmt: ValidatedDeleteUsing {
                 target,
                 using,
                 where_clause,
                 operation_id,
+                statement_hash,
             },
             has_returning: returning.is_some(),
         })
     }
+}
+
+/// パーサが返す構造体の `statement_hash` の仮値（空トークン列のハッシュ。検証入口が必ず差し替える）。
+fn placeholder_statement_hash(
+) -> Result<crate::recovery::content_hash::ContentHash, SqlSurfaceError> {
+    crate::recovery::content_hash::for_update_from(&[]).map_err(|_| SqlSurfaceError::Internal {
+        detail: "internal error".to_string(),
+    })
 }
 
 /// [`Parser::parse_update_from`] の結果。`RETURNING` は構造だけ解析し、`0A000` の拒否は検証入口が行う。
@@ -16612,10 +16642,17 @@ pub(crate) fn validate_update_from_tokens_with_limits(
             "RETURNING is not supported in UPDATE ... FROM yet",
         ));
     }
-    let stmt = parsed.stmt;
+    let mut stmt = parsed.stmt;
     mode.require(stmt.operation_id.as_ref())?;
     reject_omitted_join_where_for_dml(require_where_for_dml, stmt.where_clause.is_some())?;
     resolve_dml_from_relations(lookup, &stmt.target, &stmt.from)?;
+    // 台帳の文ハッシュ（Issue #1757。SQL-53 (5)）。全検証の後に算出し、検証順とエラーコードは変えない。
+    stmt.statement_hash = crate::recovery::content_hash::for_update_from(
+        crate::recovery::content_hash::strip_operation_id_clause(tokens),
+    )
+    .map_err(|_| SqlSurfaceError::Internal {
+        detail: "internal error".to_string(),
+    })?;
     Ok(stmt)
 }
 
@@ -16636,10 +16673,16 @@ pub(crate) fn validate_delete_using_tokens_with_limits(
             "RETURNING is not supported in DELETE ... USING yet",
         ));
     }
-    let stmt = parsed.stmt;
+    let mut stmt = parsed.stmt;
     mode.require(stmt.operation_id.as_ref())?;
     reject_omitted_join_where_for_dml(require_where_for_dml, stmt.where_clause.is_some())?;
     resolve_dml_from_relations(lookup, &stmt.target, &stmt.using)?;
+    stmt.statement_hash = crate::recovery::content_hash::for_delete_using(
+        crate::recovery::content_hash::strip_operation_id_clause(tokens),
+    )
+    .map_err(|_| SqlSurfaceError::Internal {
+        detail: "internal error".to_string(),
+    })?;
     Ok(stmt)
 }
 
