@@ -641,3 +641,96 @@ fn explicit_transaction_sees_uncommitted_source_rows_and_rolls_back() {
     drop(txn);
     assert_eq!(xs(&core, &alice), vec![(1, 10), (2, 20), (3, 30)]);
 }
+
+/// 回帰（PR #2655 指摘）: source 列が TIME／TIMESTAMPTZ／INTERVAL／CHAR(n)／配列の `SET col = s.col` が
+/// `cell_scalar` 未対応で `XX000` にならず、値が代入される。
+#[test]
+fn update_from_assigns_time_timestamptz_interval_bpchar_and_array_source_columns() {
+    use crate::catalog::{ArrayElemType, ArrayType};
+    fn cols(prefix: &str) -> Vec<ColumnDef> {
+        let arr = ColumnType::Array(ArrayType::new(ArrayElemType::Integer, 8).expect("array ty"));
+        vec![
+            ColumnDef::new("embedding", ColumnType::Vector(2), false),
+            ColumnDef::new("k", ColumnType::Text, true),
+            ColumnDef::new(format!("{prefix}tm"), ColumnType::Time, true),
+            ColumnDef::new(format!("{prefix}tz"), ColumnType::TimestampTz, true),
+            ColumnDef::new(format!("{prefix}iv"), ColumnType::Interval, true),
+            ColumnDef::new(format!("{prefix}bp"), ColumnType::Bpchar(4), true),
+            ColumnDef::new(format!("{prefix}arr"), arr, true),
+        ]
+    }
+    let tt = TableSchema::new("tt", cols(""));
+    let ss = TableSchema::new("ss", cols(""));
+    let (core, _g) = new_core();
+    core.storage.create_table(&tt).expect("create tt");
+    core.storage.create_table(&ss).expect("create ss");
+    let alice = ctx("alice");
+    run(
+        &core,
+        &alice,
+        "INSERT INTO tt (id, embedding, k) VALUES (1, '[0.1,0.2]', 'a')",
+    );
+    run(
+        &core,
+        &alice,
+        "INSERT INTO ss (id, embedding, k, tm, tz, iv, bp, arr) VALUES (1, '[0.1,0.2]', 'a', \
+         '12:34:56', '2020-01-02 03:04:05+00', '1 day', 'ab', ARRAY[1, 2])",
+    );
+    // 結合ビュー: 対象列 ++ source の取り出し列（束縛用スキーマは s_ 接頭辞）。
+    let mut combined = cols("");
+    combined.extend(cols("s_").into_iter().skip(2));
+    let combined = TableSchema::new("tt_ss", combined);
+    let items = ["tm", "tz", "iv", "bp", "arr"]
+        .iter()
+        .enumerate()
+        .map(|(i, name)| {
+            let col = tt.columns[2 + i].clone();
+            let set = crate::sql::set_expr::bind_set_expr(
+                name,
+                &Expr::Ident(format!("s_{name}")),
+                &col,
+                &combined,
+            )
+            .expect("bind SET");
+            JoinedSetItem {
+                column_index: 2 + i,
+                set,
+            }
+        })
+        .collect();
+    let plan = JoinedDmlPlan {
+        target: JoinedDmlTarget {
+            table: "tt".to_string(),
+            schema: tt.clone(),
+            metadata_filters: Vec::new(),
+            expr_filters: Vec::new(),
+            or_filters: Vec::new(),
+        },
+        source: JoinedDmlSource {
+            table: "ss".to_string(),
+            schema: ss,
+            where_predicates: Vec::new(),
+            columns: vec![2, 3, 4, 5, 6],
+        },
+        keys: vec![EquiKey {
+            target_column: Some(1),
+            source_column: Some(1),
+        }],
+        update: Some(JoinedUpdateSet {
+            literal_assignments: Vec::new(),
+            items,
+        }),
+        returning_references_source: false,
+    };
+    let out = exec(&core, &alice, &plan).expect("update");
+    assert_eq!(out.rows_affected, 1);
+    let got = core
+        .execute_sql(&alice, "SELECT tm, tz, iv, bp, arr FROM tt LIMIT 10")
+        .expect("select");
+    let want = core
+        .execute_sql(&alice, "SELECT tm, tz, iv, bp, arr FROM ss LIMIT 10")
+        .expect("select");
+    assert_eq!(got.rows.len(), 1);
+    assert_eq!(got.rows[0].cells, want.rows[0].cells);
+    assert!(got.rows[0].cells.iter().all(|c| !matches!(c, Cell::Null)));
+}

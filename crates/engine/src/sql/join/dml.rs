@@ -34,7 +34,7 @@
 
 use std::collections::HashMap;
 
-use crate::catalog::TableSchema;
+use crate::catalog::{ColumnType, TableSchema};
 use crate::declarative_filter::MetadataFilter;
 use crate::policy::PolicyContext;
 use crate::row_codec::{ScalarRef, Value};
@@ -464,9 +464,12 @@ impl<'a> JoinedProbe<'a> {
             .get(pos as usize)
             .ok_or_else(|| internal("matched source row out of range"))?;
         // 結合スカラービュー: 対象列 ++ source 列（取り出した列の並び）。
-        let mut view: Vec<Option<ScalarRef<'_>>> =
-            Vec::with_capacity(scanned.len().saturating_add(self.source_columns.len()));
-        view.extend(scanned.iter().copied());
+        // 配列セルは借用形（`ArrayRef`）が正準ペイロードを要するため、先に所有バッファへ
+        // 書き出す（ビューはそれを借用する）。
+        let mut source_cells: Vec<(&Cell, &ColumnType)> =
+            Vec::with_capacity(self.source_columns.len());
+        let mut array_payloads: Vec<Option<Vec<u8>>> =
+            Vec::with_capacity(self.source_columns.len());
         for (k, &col_idx) in self.source_columns.iter().enumerate() {
             let col = self
                 .plan
@@ -479,7 +482,24 @@ impl<'a> JoinedProbe<'a> {
                 .cells
                 .get(self.cell_offset.saturating_add(k))
                 .ok_or_else(|| internal("source cell out of range"))?;
-            view.push(cell_scalar(cell, &col.ty)?);
+            let payload = match cell {
+                Cell::Array(a) => {
+                    let mut buf = Vec::new();
+                    crate::row_codec::write_array_elements_payload(&mut buf, a)
+                        .map_err(|_| internal("source array column could not be re-encoded"))?;
+                    self.budget.charge(buf.len())?;
+                    Some(buf)
+                }
+                _ => None,
+            };
+            source_cells.push((cell, &col.ty));
+            array_payloads.push(payload);
+        }
+        let mut view: Vec<Option<ScalarRef<'_>>> =
+            Vec::with_capacity(scanned.len().saturating_add(source_cells.len()));
+        view.extend(scanned.iter().copied());
+        for ((cell, ty), payload) in source_cells.iter().zip(&array_payloads) {
+            view.push(source_scalar(cell, ty, payload.as_deref())?);
         }
         let mut out: Vec<(usize, Value)> = Vec::with_capacity(items.len());
         for item in items {
@@ -492,6 +512,37 @@ impl<'a> JoinedProbe<'a> {
         }
         Ok(Some(out))
     }
+}
+
+/// 結合 `UPDATE ... FROM` の SET 式が参照する source 列のセルを、借用形（[`ScalarRef`]）へ写像する。
+/// [`cell_scalar`] が扱わない `TIME`／`TIMESTAMPTZ`／`INTERVAL`／`CHAR(n)`／配列を加える
+/// （`bind_set_expr` が受理する列型と一致させる。対象表側は行 codec の走査結果をそのまま使う）。
+/// 配列は呼び出し側が `write_array_elements_payload` で作った `array_payload` を借用する。
+/// 想定外の型・セルの組は `cell_scalar` と同じく `Internal`（fail-closed）。
+fn source_scalar<'a>(
+    cell: &'a Cell,
+    ty: &ColumnType,
+    array_payload: Option<&'a [u8]>,
+) -> Result<Option<ScalarRef<'a>>, SqlSurfaceError> {
+    Ok(match (ty, cell) {
+        (_, Cell::Null) => None,
+        (ColumnType::Time, Cell::Time(t)) => Some(ScalarRef::Time(*t)),
+        (ColumnType::TimestampTz, Cell::TimestampTz(t)) => Some(ScalarRef::TimestampTz(*t)),
+        (ColumnType::Interval, Cell::Interval(i)) => Some(ScalarRef::Interval(*i)),
+        (ColumnType::Bpchar(_), Cell::Text(s)) => Some(ScalarRef::Text(s)),
+        (ColumnType::Array(_), Cell::Array(a)) => {
+            let payload = array_payload.ok_or_else(|| internal("source array payload missing"))?;
+            let count = u32::try_from(a.len())
+                .map_err(|_| internal("source array length exceeds limit"))?;
+            Some(ScalarRef::Array(crate::row_codec::ArrayRef::from_owned(
+                a.elem(),
+                count,
+                a.frame_flags(),
+                payload,
+            )))
+        }
+        _ => cell_scalar(cell, ty)?,
+    })
 }
 
 #[cfg(test)]
