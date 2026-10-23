@@ -1959,7 +1959,16 @@ pub enum WherePredicate {
     /// 据え置く。`LIKE` は [`Keyword`] へ追加せず、TASK-80 と同じ
     /// 「`Token::Ident` をパーサー位置でのみ文脈照合」方式にして `like` という
     /// 列名を壊さない（[`Parser::parse_where`] 参照）。
-    Prefix { column: String, pattern: String },
+    ///
+    /// **SQL-54（Issue #1778）で追加した破壊的変更（BREAKING CHANGE）**:
+    /// `case_insensitive` を追加した（`ILIKE` のとき真。意味論は
+    /// `declarative_filter::DeclarativeFilter::ilike` の責務。構築側は
+    /// `case_insensitive: false` を足し、分解側は `..` を付ける）。
+    Prefix {
+        column: String,
+        pattern: String,
+        case_insensitive: bool,
+    },
     /// 許可された名前の述語呼び出し形（空引数）。
     PredicateCall { name: String },
     /// 式の比較述語（TASK-79・SQL-9）。`Expr::Binary` の比較演算子（`> < >= <= =`）
@@ -7043,16 +7052,20 @@ impl<'a> Parser<'a> {
                 },
             ))));
         }
-        if matches!(self.tokens.get(self.pos + 1), Some(Token::Ident(w)) if w.eq_ignore_ascii_case("LIKE"))
+        // `ILIKE` は `LIKE` と同じ構文経路で受理し、`case_insensitive` だけが異なる
+        // （SQL-54、Issue #1778。`ilike` という列名を壊さないため文脈照合）。
+        if matches!(self.tokens.get(self.pos + 1), Some(Token::Ident(w)) if w.eq_ignore_ascii_case("LIKE") || w.eq_ignore_ascii_case("ILIKE"))
             && matches!(self.tokens.get(self.pos + 2), Some(Token::StringLiteral(_)))
             && !literal_followed_by_typecast(&self.tokens, self.pos + 2)
         {
+            let case_insensitive = matches!(self.tokens.get(self.pos + 1), Some(Token::Ident(w)) if w.eq_ignore_ascii_case("ILIKE"));
             self.advance();
             self.advance();
             let pattern = self.expect_string_literal()?;
             return Ok(Some(WherePredicate::Prefix {
                 column: name,
                 pattern,
+                case_insensitive,
             }));
         }
         // `<col> NOT LIKE '<lit>'`（SQL-24。後置 NOT を `Not(Prefix)` として受理する。
@@ -7060,10 +7073,11 @@ impl<'a> Parser<'a> {
         // （`declarative_filter::DeclarativeFilter::like`）が処理する中間一致・
         // 後方一致等の一般形〔#914〕にも `NOT` 越しに対応する）。
         if matches!(self.tokens.get(self.pos + 1), Some(Token::Ident(w)) if w.eq_ignore_ascii_case("NOT"))
-            && matches!(self.tokens.get(self.pos + 2), Some(Token::Ident(w)) if w.eq_ignore_ascii_case("LIKE"))
+            && matches!(self.tokens.get(self.pos + 2), Some(Token::Ident(w)) if w.eq_ignore_ascii_case("LIKE") || w.eq_ignore_ascii_case("ILIKE"))
             && matches!(self.tokens.get(self.pos + 3), Some(Token::StringLiteral(_)))
             && !literal_followed_by_typecast(&self.tokens, self.pos + 3)
         {
+            let case_insensitive = matches!(self.tokens.get(self.pos + 2), Some(Token::Ident(w)) if w.eq_ignore_ascii_case("ILIKE"));
             self.advance();
             self.advance();
             self.advance();
@@ -7072,6 +7086,7 @@ impl<'a> Parser<'a> {
                 WherePredicate::Prefix {
                     column: name,
                     pattern,
+                    case_insensitive,
                 },
             ))));
         }
@@ -13123,6 +13138,15 @@ pub(crate) fn strip_trailing_semicolons(tokens: &[Token]) -> &[Token] {
 /// レジストリで束縛される）。
 fn check_buffered_outer_pred(pred: &WherePredicate) -> Result<(), SqlSurfaceError> {
     match pred {
+        // SQL-54（Issue #1778）: 評価後射影形ビューの合成スキーマは元の列の照合を
+        // 持たないため、ICU 照合列を黙って ASCII 畳み込みしないよう `ILIKE` を
+        // 拒否する（fail-closed。照合の伝搬は対象外として追跡）。
+        WherePredicate::Prefix {
+            case_insensitive: true,
+            ..
+        } => Err(SqlSurfaceError::FeatureNotSupported {
+            detail: "ILIKE is not supported on a view with an aggregate/LIMIT body".to_string(),
+        }),
         WherePredicate::Equality { .. }
         | WherePredicate::Prefix { .. }
         | WherePredicate::BoolEquality { .. }
@@ -13740,10 +13764,15 @@ fn render_where_predicate(pred: &WherePredicate) -> String {
         // parse_where` の LIKE 分岐参照）。意味論的な検証・振り分けは
         // `declarative_filter::DeclarativeFilter::like` の責務で、ここでは
         // 追加のワイルドカードを付与しない。
-        WherePredicate::Prefix { column, pattern } => {
+        WherePredicate::Prefix {
+            column,
+            pattern,
+            case_insensitive,
+        } => {
             format!(
-                "{} LIKE '{}'",
+                "{} {} '{}'",
                 render_column_name(column),
+                if *case_insensitive { "ILIKE" } else { "LIKE" },
                 escape_string_literal(pattern)
             )
         }
@@ -22522,7 +22551,42 @@ mod tests {
             vec![WherePredicate::Not(Box::new(WherePredicate::Prefix {
                 column: "path".to_string(),
                 pattern: "src/%".to_string(),
+                case_insensitive: false,
             }))]
+        );
+    }
+
+    #[test]
+    fn accepts_ilike_and_not_ilike_as_case_insensitive_prefix() {
+        let leaf = WherePredicate::Prefix {
+            column: "path".to_string(),
+            pattern: "Src/%".to_string(),
+            case_insensitive: true,
+        };
+        assert_eq!(
+            where_predicates_of(
+                "SELECT * FROM documents WHERE path IlIkE 'Src/%' \
+                 ORDER BY embedding <=> '[0.1]' LIMIT 5"
+            ),
+            vec![leaf.clone()]
+        );
+        assert_eq!(
+            where_predicates_of(
+                "SELECT * FROM documents WHERE path NOT ILIKE 'Src/%' \
+                 ORDER BY embedding <=> '[0.1]' LIMIT 5"
+            ),
+            vec![WherePredicate::Not(Box::new(leaf))]
+        );
+        // `ilike` という名前の列は壊さない。
+        assert_eq!(
+            where_predicates_of(
+                "SELECT * FROM documents WHERE ilike = 'x' \
+                 ORDER BY embedding <=> '[0.1]' LIMIT 5"
+            ),
+            vec![WherePredicate::Equality {
+                column: "ilike".to_string(),
+                value: "x".to_string(),
+            }]
         );
     }
 
@@ -22960,6 +23024,7 @@ mod tests {
             vec![WherePredicate::Prefix {
                 column: "in".to_string(),
                 pattern: "a%".to_string(),
+                case_insensitive: false,
             }]
         );
     }

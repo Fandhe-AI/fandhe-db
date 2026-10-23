@@ -9,6 +9,9 @@
 
 ### Added
 
+- `WHERE <col> [NOT] ILIKE '<pattern>'` を受理して評価する（Issue #1778・SQL-54）。ASCII 英字のみを畳み込み、
+  非 ASCII はバイト完全一致で比べる。ICU 照合の列は `0A000`。索引は使わない。
+  詳細は [like-wildcard-patterns.md](docs/design/like-wildcard-patterns.md)。
 - 複数文メッセージの暗黙トランザクション内の `COPY` を受理する（Issue #1773・WIRE-20）。COPY の文で CopyIn／CopyOut へ入り、
   CopyDone の後に続きの文へ進む（従来は `0A000`）。最後の文が COPY のときは応答の前に commit する。
   詳細は [wire-copy-protocol.md](docs/design/wire-copy-protocol.md)。
@@ -32,6 +35,11 @@
 - `sql::allowlist::SqlSurfaceError`（Issue #1792・SQL-56 (2)）: variant `OrderByPositionNotInSelectList { position: i64 }`
   （`42P10`。`ORDER BY` の序数が出力列の範囲外）を追加した。列挙型を網羅的に `match` する外部コードは
   コンパイルできなくなる。移行: 腕を追加する（`wire_code()`／`classify()` 経由で扱うコードは変更不要）。
+- `sql::allowlist::WherePredicate::Prefix`（Issue #1778・SQL-54）: 必須フィールド `case_insensitive: bool` を追加した
+  （`ILIKE` のとき真）。構築する外部コードと、全フィールドを列挙して分解するコードはコンパイルできなくなる。
+  移行: 構築側は `case_insensitive: false` を足し、分解側は `..` を付ける。あわせて
+  `declarative_filter::FilterOp` に `ILikeUnbound`、`LikePattern` に非公開フィールドを追加した
+  （`FilterOp` を網羅 `match` するコードは腕を足す）。
 - `sql::allowlist::ValidatedCopyTo`（Issue #1771・WIRE-22 (5)・SQL-34）: クレート内専用のフィールド `table_form`
   （`pub(crate)`）を追加した。構造体リテラルで生成する外部コードと、全フィールドを列挙して分解するコードは
   コンパイルできなくなる。移行: 構造体を自前で組み立てず、`validate_copy` 等の公開入口が返す検証済み値を使う。

@@ -2539,7 +2539,8 @@ impl ScalarIndex {
             | FilterOp::IsNotNull
             | FilterOp::Not(_)
             | FilterOp::Like(_)
-            | FilterOp::LikeUnbound(_) => return None,
+            | FilterOp::LikeUnbound(_)
+            | FilterOp::ILikeUnbound(_) => return None,
         };
         result.sort_unstable();
         result.dedup();

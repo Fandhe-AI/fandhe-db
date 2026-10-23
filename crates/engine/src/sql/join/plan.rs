@@ -462,6 +462,8 @@ fn leaf_to_where(
         JoinWherePredicate::Prefix { pattern, .. } => WherePredicate::Prefix {
             column: name,
             pattern: pattern.clone(),
+            // JOIN の WHERE 文法は `ILIKE` を受理しない（SQL-54、Issue #1778 の対象外）。
+            case_insensitive: false,
         },
         JoinWherePredicate::Compare { op, value, .. } => WherePredicate::Compare {
             column: name,

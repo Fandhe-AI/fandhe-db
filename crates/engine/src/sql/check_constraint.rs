@@ -48,8 +48,13 @@ fn render_predicate(predicate: &WherePredicate) -> String {
         WherePredicate::Equality { column, value } => {
             format!("{column} = '{}'", escape_literal(value))
         }
-        WherePredicate::Prefix { column, pattern } => {
-            format!("{column} LIKE '{}'", escape_literal(pattern))
+        WherePredicate::Prefix {
+            column,
+            pattern,
+            case_insensitive,
+        } => {
+            let kw = if *case_insensitive { "ILIKE" } else { "LIKE" };
+            format!("{column} {kw} '{}'", escape_literal(pattern))
         }
         WherePredicate::PredicateCall { name } => format!("{name}()"),
         WherePredicate::BoolEquality { column, value } => {
@@ -950,9 +955,14 @@ pub(crate) fn map_predicate_columns(
             column: col(column),
             value: value.clone(),
         },
-        WherePredicate::Prefix { column, pattern } => WherePredicate::Prefix {
+        WherePredicate::Prefix {
+            column,
+            pattern,
+            case_insensitive,
+        } => WherePredicate::Prefix {
             column: col(column),
             pattern: pattern.clone(),
+            case_insensitive: *case_insensitive,
         },
         WherePredicate::PredicateCall { name } => {
             WherePredicate::PredicateCall { name: name.clone() }
