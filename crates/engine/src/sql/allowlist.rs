@@ -638,6 +638,9 @@ pub enum SqlSurfaceError {
     WindowingError { detail: &'static str },
     /// 明示的な `COLLATE` 同士の食い違い（`42P21`。Issue #2190・TABLE-28）。固定文言のみ。
     CollationMismatch,
+    /// `LIKE`／`ILIKE` のエスケープ不正（`22025`。Issue #1779・SQL-54）。末尾の孤立した
+    /// エスケープ文字、または `ESCAPE` の値が 1 文字でない。固定文言のみ（パターン・値を載せない）。
+    InvalidEscapeSequence { detail: &'static str },
     /// 暗黙の照合の衝突を照合が必要な演算が消費した（`42P22`。Issue #2190・TABLE-28）。
     /// 固定文言のみ。
     IndeterminateCollation,
@@ -1224,6 +1227,13 @@ impl SqlSurfaceError {
         }
     }
 
+    /// `pub(crate)`: `declarative_filter` の LIKE トークン化・`ESCAPE` 正規化
+    /// （SQL-54、Issue #1779）が、末尾の孤立エスケープ・不正な `ESCAPE` 値を
+    /// `22025` で報告するために使う。`detail` は固定文言（値・列名を載せない）。
+    pub(crate) fn invalid_escape_sequence(detail: &'static str) -> Self {
+        SqlSurfaceError::InvalidEscapeSequence { detail }
+    }
+
     /// `pub(crate)`: `sql::parser::bind_datetime_literal`（TABLE-34・Issue #1579）が
     /// `INTERVAL` リテラルのフィールド値の範囲外を報告するために使う。
     pub(crate) fn interval_field_overflow(detail: impl Into<String>) -> Self {
@@ -1351,6 +1361,7 @@ impl ClassifiedError for SqlSurfaceError {
             SqlSurfaceError::GroupingError { .. } => ErrorClass::GroupingError,
             SqlSurfaceError::WindowingError { .. } => ErrorClass::WindowingError,
             SqlSurfaceError::CollationMismatch => ErrorClass::CollationMismatch,
+            SqlSurfaceError::InvalidEscapeSequence { .. } => ErrorClass::InvalidEscapeSequence,
             SqlSurfaceError::CannotCoerce { .. } => ErrorClass::CannotCoerce,
             SqlSurfaceError::IndeterminateCollation => ErrorClass::IndeterminateCollation,
             SqlSurfaceError::NullValueNotAllowed { .. } => ErrorClass::NullValueNotAllowed,
@@ -1505,6 +1516,7 @@ impl std::fmt::Display for SqlSurfaceError {
             SqlSurfaceError::CollationMismatch => {
                 f.write_str("collation mismatch between explicit collations")
             }
+            SqlSurfaceError::InvalidEscapeSequence { detail } => f.write_str(detail),
             SqlSurfaceError::CannotCoerce { from, to } => {
                 write!(f, "cannot cast type {from} to {to}")
             }
@@ -1933,8 +1945,9 @@ pub const MAX_SCALAR_ORDER_KEYS: usize = 8;
 /// 振り分け（等価・前方一致・SQL-24・TASK-208・Issue #914 で追加した中間一致・
 /// 後方一致・`_` を含む一般形）は `declarative_filter::DeclarativeFilter::like`
 /// （内部で `parse_like_pattern` を呼ぶ。`sql::parser::bind_in_session` から
-/// 呼ばれる）の責務とする。`ESCAPE` 句は本構文層で受理しない（後続トークンが
-/// 境界と一致せず `42601` になる）。
+/// 呼ばれる）の責務とする。`ESCAPE '<c>'` 句は Issue #1779 で受理し、本構文層が既定の
+/// `\` エスケープ形へ正規化してから格納する（`Prefix.pattern` に ESCAPE 情報は残らない）。
+/// `ESCAPE` の値が単純な文字列リテラルでない形は消費せず `42601` になる。
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum WherePredicate {
     /// 列と文字列リテラルの等価条件（TASK-75: リテラル値を保持する）。
@@ -5297,6 +5310,26 @@ impl<'a> Parser<'a> {
         Ok(())
     }
 
+    /// `LIKE`／`ILIKE` のパターンリテラル直後の `ESCAPE '<c>'` を判定・消費し、パターンを
+    /// 既定エスケープ `\` 形へ正規化して返す（SQL-54、Issue #1779。`WHERE` 述語の構造葉
+    /// [`WherePredicate::Prefix`] から呼ばれる）。`ESCAPE` は [`crate::sql::lexer::Keyword`] へ
+    /// 追加せず文脈照合する（`escape` という列名・表名を壊さないため。直後が常に文字列
+    /// リテラルのときだけ句として扱う）。`ESCAPE` の後ろが単純な文字列リテラルでない
+    /// （識別子・`NULL`・`$n`・`::` 型キャスト付き等）形は何も消費せず、従来どおり述語の
+    /// 区切りとして通らず `42601` で fail-closed になる。値の検証（1 文字）は
+    /// [`crate::declarative_filter::apply_like_escape`] が `22025` で行う。
+    fn consume_like_escape_clause(&mut self, pattern: String) -> Result<String, SqlSurfaceError> {
+        let is_clause = matches!(self.tokens.get(self.pos), Some(Token::Ident(w)) if w.eq_ignore_ascii_case("ESCAPE"))
+            && matches!(self.tokens.get(self.pos + 1), Some(Token::StringLiteral(_)))
+            && !literal_followed_by_typecast(&self.tokens, self.pos + 1);
+        if !is_clause {
+            return Ok(pattern);
+        }
+        self.advance();
+        let escape = self.expect_string_literal()?;
+        crate::declarative_filter::apply_like_escape(&pattern, &escape)
+    }
+
     fn expect_string_literal(&mut self) -> Result<String, SqlSurfaceError> {
         match self.advance() {
             Some(Token::StringLiteral(s)) => Ok(s.clone()),
@@ -7034,6 +7067,7 @@ impl<'a> Parser<'a> {
             self.advance();
             self.advance();
             let pattern = self.expect_string_literal()?;
+            let pattern = self.consume_like_escape_clause(pattern)?;
             return Ok(Some(WherePredicate::Prefix {
                 column: name,
                 pattern,
@@ -7054,6 +7088,7 @@ impl<'a> Parser<'a> {
             self.advance();
             self.advance();
             let pattern = self.expect_string_literal()?;
+            let pattern = self.consume_like_escape_clause(pattern)?;
             return Ok(Some(WherePredicate::Not(Box::new(
                 WherePredicate::Prefix {
                     column: name,

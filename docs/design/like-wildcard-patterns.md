@@ -26,17 +26,19 @@ EXT-3（TASK-147）時点の SQL 表層 `WHERE <col> LIKE '<pattern>'` は「末
    - `\%`・`\_`・`\\` は、それぞれリテラルの `%`・`_`・`\` として扱う。
    - `\<その他の文字>` はリテラル `<その他の文字>` として扱う（PostgreSQL の
      挙動に倣う）。
-   - パターン末尾の単独 `\` は `22000`（PostgreSQL は `22025` を返すが、`ErrorClass` に
-     相当する分類が無く、追加すると HTTP 射影の変更も必要になるためスコープ外
-     とした。ERR-6 ポインタ。8 章参照）。
+   - パターン末尾の単独 `\` は `22025`（PostgreSQL と同じ。Issue #1779 で `ErrorClass` に
+     `InvalidEscapeSequence` を追加した。従来は `22000`。ERR-6 ポインタ）。
    - 互換性の根拠: EXT-3 時点では `\` を含むパターンは無条件に `22000` で
      拒否していたため、永続化済みの `CHECK` 制約・`VIEW` 本体に `\` を含む
      `LIKE` は存在しえない。意味を再定義しても後方互換は壊れない。
    - lexer は文字列リテラル内の `\` を加工せずに保持する（`''` のみを
      エスケープとして扱う。`standard_conforming_strings=on` の PostgreSQL と
      同じ）。パターン層で `\` を解釈すればよい。
-4. **`ESCAPE '<c>'` 句**: 対応しない。構文上、パターン直後の `ESCAPE`
-   識別子は述語の区切りにならず文として受け付けられない（`42601`）。
+4. **`ESCAPE '<c>'` 句**（Issue #1779）: `LIKE`／`NOT LIKE`／`ILIKE`／`NOT ILIKE` の
+   パターンリテラル直後に書ける。エスケープ文字の直後の文字（`%`・`_`・エスケープ文字自身・
+   その他）はリテラルになる。`ESCAPE ''` はエスケープの無効化で、`\` もただの文字になる。
+   `ESCAPE '\'` は ESCAPE を書かない場合と同じ。値が 2 文字以上は `22025`。値が単純な
+   文字列リテラルでない形（識別子・`NULL`・`$n`・数値・`::` キャスト付き）は `42601` のまま。
 5. **NULL**: 常に不一致（既存の三値論理の契約を踏襲）。
 6. **大文字小文字**: `LIKE` は区別する。`ILIKE` の畳み込み範囲は後述の
    「`ILIKE` の大文字小文字の畳み込み範囲」節で決定済みで、`ILIKE`／`NOT ILIKE` は
@@ -128,7 +130,7 @@ EXT-3（TASK-147）時点の SQL 表層 `WHERE <col> LIKE '<pattern>'` は「末
 - NULL は不一致、`NOT ILIKE` は否定、パターン長の上限（生パターンのバイト長
   を確保前に検査し超過は `54000`）は `LIKE` と同じ。RLS の適用は変えない。
 - NoSQL `filter` には `ilike` を加えない（`42601` のまま）。`ESCAPE` 句
-  （#1779）と左辺の式（#1780）は別 Issue。
+  は #1779 で実装済み（次々節）。左辺の式（#1780）は別 Issue。
 
 ## パターン長の上限
 
@@ -161,11 +163,33 @@ m は `MAX_LIKE_PATTERN_LEN` で定数に抑える）。
   合成スキーマが元の列の照合を持たないため `0A000` で拒否する。照合の伝搬は後続。
 - `CHAR(n)` 列は `LIKE` と同じく `ILIKE` も `22000` で拒否される（既存の挙動との対称）。
 
+### 実装メモ（Issue #1779）
+
+- 方針: PostgreSQL の `like_escape` と同じく、構文層で `ESCAPE` を既定の `\` エスケープ形へ
+  正規化する（`declarative_filter::apply_like_escape`）。`WherePredicate::Prefix` にフィールドは
+  足さず、正規化後のパターンを `pattern` に格納する。以降は ESCAPE 無しの経路と同一で、
+  `'a!%' ESCAPE '!'`（正規化後 `a\%`）は等価の索引経路、`'ab!%c%' ESCAPE '!'` は前方一致に
+  振り分けられる。`ILIKE` は従来どおり索引を使わない。
+- 正規化の順序: ESCAPE の正規化は `ILIKE` の畳み込みより前。エスケープ文字の比較は畳み込まない。
+- 変換規則: ESCAPE が空なら `\` を `\\` に、独自の 1 文字 `e` なら `e` → `\`（直後の文字は
+  リテラル）、素の `\` → `\\`。末尾に `e` が残ると変換後が単独 `\` で終わり、トークン化段が
+  `22025` で拒否する。
+- 台帳（RECOVER-10）: content_hash のバイト列は変えない（タグの追加なし）。`LIKE 'a!%' ESCAPE '!'` と
+  `LIKE 'a\%'` は同じ述語として同じハッシュ、ESCAPE を落とした `LIKE 'a!%'` は別ハッシュ（再送は
+  `22023`）。ESCAPE は従来 `42601` で台帳に記録済みの例が無く、再送互換は壊れない。
+- CHECK 制約・ビュー: 格納形が `\` エスケープ形のため往復が成立する。再表示は ESCAPE を含まない
+  正規化形になる。
+- `22025`: 末尾の孤立エスケープは従来の `22000` から `22025` へ変えた（ESCAPE 無しの `LIKE 'src\'`・
+  `ILIKE`・NoSQL `like` も同じ。HTTP は 400 のまま）。`ESCAPE` の値が 2 文字以上でも `22025`。
+- `ESCAPE` は文脈的キーワード（`Keyword` に追加しない）。`escape` という名前の列・表は壊れない。
+- 対象外（`42601` のまま）: JOIN の WHERE と `UPDATE … FROM`／`DELETE … USING`、NoSQL `filter` の
+  `like` への escape 指定、`ESCAPE` の値が式・`$n`・`NULL` の形。
+
 ## PostgreSQL との差分（既知の簡略化）
 
-- パターン末尾の単独エスケープ文字は PostgreSQL の `22025` ではなく `22000`
-  で拒否する（3 章参照。`wire_code` 契約の新設が前提になるためスコープ外）。
-- `ESCAPE '<c>'` 句・`SIMILAR TO` は未対応。
+- `ESCAPE` 付きのパターンは、正規化後（`\` を多く含むと最大 2 倍）の長さが 4096 バイトを超えると
+  `54000` になる。PostgreSQL は受理する（fail-closed の簡略化）。
+- `SIMILAR TO` は未対応。
 - `ILIKE`／`NOT ILIKE` は #1778 で実装済み。方針は次節。
   `C` 系の照合では PostgreSQL と同じ結果になる。ICU 照合の列に対する
   `ILIKE` は `0A000`（PostgreSQL は受理する）。
@@ -176,8 +200,7 @@ m は `MAX_LIKE_PATTERN_LEN` で定数に抑える）。
 
 ## スコープ外（Issue 起票はしない。実装 PR の note として記録）
 
-- `22025`（invalid escape sequence）の `wire_code` 追加と HTTP 射影
-- `LIKE ... ESCAPE '<c>'` 句・`SIMILAR TO`（`ILIKE` は #1778 で実装済み）
+- `SIMILAR TO`（`ILIKE` は #1778、`LIKE ... ESCAPE '<c>'` と `22025` は #1779 で実装済み）
 - `NOT LIKE`（別 Issue の `NOT` 対応に委ねる）
 - NoSQL `filter` の `like` op（NOSQL-14）
 - `LIKE` パターンへの `$n` 束縛

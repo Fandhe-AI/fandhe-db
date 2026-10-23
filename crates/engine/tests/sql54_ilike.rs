@@ -246,7 +246,7 @@ fn unsupported_ilike_forms_stay_42601() {
     let _guard = CleanupGuard(path.clone());
     let core = open_core(&path);
 
-    for pred in ["name ILIKE tc", "name ILIKE 1", "name ILIKE 'a' ESCAPE '!'"] {
+    for pred in ["name ILIKE tc", "name ILIKE 1", "name ILIKE 'a' ESCAPE tc"] {
         assert_eq!(code_of_pred(&core, pred), "42601", "pred={pred}");
     }
 }

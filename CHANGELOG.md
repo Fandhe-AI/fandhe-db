@@ -9,6 +9,9 @@
 
 ### Added
 
+- `WHERE <col> [NOT] LIKE|ILIKE '<pattern>' ESCAPE '<c>'` を受理する（Issue #1779・SQL-54）。構文層で既定の `\` 形へ
+  正規化するため評価・索引・台帳の扱いは ESCAPE 無しと同じ。`ESCAPE ''` はエスケープ無効。
+  詳細は [like-wildcard-patterns.md](docs/design/like-wildcard-patterns.md)。
 - `WHERE <col> [NOT] ILIKE '<pattern>'` を受理して評価する（Issue #1778・SQL-54）。ASCII 英字のみを畳み込み、
   非 ASCII はバイト完全一致で比べる。ICU 照合の列は `0A000`。索引は使わない。
   詳細は [like-wildcard-patterns.md](docs/design/like-wildcard-patterns.md)。
@@ -32,6 +35,9 @@
 
 ### Breaking Changes
 
+- `error_format::ErrorClass::InvalidEscapeSequence`（`22025`）・`sql::allowlist::SqlSurfaceError::InvalidEscapeSequence`
+  （Issue #1779・SQL-54）: variant を追加した（網羅 `match` するコードは腕を足す。HTTP は 400）。
+  あわせて `LIKE` パターン末尾の単独 `\` のエラーを `22000` から `22025` へ変えた（`ILIKE`・NoSQL `like` も同じ。HTTP は 400 のまま）。
 - `sql::allowlist::WherePredicate::Prefix`（Issue #1778・SQL-54）: 必須フィールド `case_insensitive: bool` を追加した
   （`ILIKE` のとき真）。構築する外部コードと、全フィールドを列挙して分解するコードはコンパイルできなくなる。
   移行: 構築側は `case_insensitive: false` を足し、分解側は `..` を付ける。あわせて

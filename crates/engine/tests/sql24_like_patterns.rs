@@ -220,10 +220,10 @@ fn underscore_matches_exactly_one_unicode_scalar() {
     );
 }
 
-// --- `ESCAPE` 句は未対応（42601） ------------------------------------------------------
+// --- `ESCAPE` 句（SQL-54、Issue #1779。詳細は `tests/sql54_like_escape.rs`）--------------
 
 #[test]
-fn escape_clause_is_rejected_as_unsupported_syntax() {
+fn escape_clause_with_non_literal_operand_is_rejected_as_unsupported_syntax() {
     let path = unique_db_path("sql24-escape-clause-unsupported");
     let _guard = CleanupGuard(path.clone());
     let storage = open_storage(&path);
@@ -234,9 +234,9 @@ fn escape_clause_is_rejected_as_unsupported_syntax() {
     let err = core
         .execute_sql(
             &ctx,
-            "SELECT * FROM docs WHERE path LIKE 'a!%%' ESCAPE '!' ORDER BY embedding <=> '[1.0,0.0]' LIMIT 10",
+            "SELECT * FROM docs WHERE path LIKE 'a!%%' ESCAPE kind ORDER BY embedding <=> '[1.0,0.0]' LIMIT 10",
         )
-        .expect_err("ESCAPE clause must be rejected (unsupported syntax)");
+        .expect_err("non-literal ESCAPE operand must be rejected (unsupported syntax)");
     assert_eq!(err.wire_code(), "42601");
 }
 

@@ -154,7 +154,7 @@ fn accepts_where_like_prefix_against_real_catalog() {
 }
 
 // SQL-54（Issue #1778）で `ILIKE`／`NOT ILIKE` を受理するようになった。不正形の
-// 固定は、右辺が非リテラルの `ILIKE` と未対応の `ESCAPE` 句（#1779）で行う。
+// 固定は、右辺が非リテラルの `ILIKE` と非リテラルの `ESCAPE` 値（`ESCAPE` 句自体は #1779 で受理）で行う。
 #[test]
 fn accepts_ilike_and_rejects_unsupported_ilike_forms_against_real_catalog() {
     let (storage, _guard) = open_storage_with_documents_table("like-reject");
@@ -166,7 +166,7 @@ fn accepts_ilike_and_rejects_unsupported_ilike_forms_against_real_catalog() {
     }
     for sql in [
         "SELECT * FROM documents WHERE lang ILIKE lang ORDER BY embedding <=> '[0.1,0.2,0.3,0.4]' LIMIT 10",
-        "SELECT * FROM documents WHERE lang ILIKE 'j%' ESCAPE '!' ORDER BY embedding <=> '[0.1,0.2,0.3,0.4]' LIMIT 10",
+        "SELECT * FROM documents WHERE lang ILIKE 'j%' ESCAPE lang ORDER BY embedding <=> '[0.1,0.2,0.3,0.4]' LIMIT 10",
     ] {
         let err = validate_statement(sql, &storage).expect_err("unsupported ILIKE form");
         assert_eq!(err.wire_code(), "42601", "sql={sql:?}");
