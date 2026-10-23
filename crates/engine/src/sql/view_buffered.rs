@@ -1287,6 +1287,8 @@ mod tests {
             },
             alias: None,
             distinct: false,
+            extra_args: Vec::new(),
+            order_by: Vec::new(),
         })
     }
 

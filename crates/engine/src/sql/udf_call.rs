@@ -8956,6 +8956,14 @@ fn apply_vector_scalar_op<'a>(
 mod tests {
     use super::*;
 
+    /// SQL-57・Issue #1800: `string_agg` は集計関数名として予約され、同名の UDF は定義できない
+    /// （呼び出しが集計として解析されるため、定義しても呼べない）。
+    #[test]
+    fn string_agg_is_a_reserved_function_name() {
+        assert!(is_reserved_function_name("string_agg"));
+        assert!(is_reserved_function_name("STRING_AGG"));
+    }
+
     /// Issue #1438: 浮動小数列相手のリテラルは 2^53 exactness 判定をかけず f64 範囲で解釈する。
     #[test]
     fn float_operand_literal_accepts_large_values_and_normalizes() {

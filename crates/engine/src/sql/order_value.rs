@@ -240,15 +240,28 @@ pub(crate) fn extract_order_value_ref<'a>(
             ))
         }
     };
-    let value = match scanned.get(index) {
-        Some(Some(v)) => v,
-        Some(None) | None => return Ok(None),
-    };
     let column = schema
         .columns
         .get(index)
         .ok_or_else(|| scan_bug("order key column index out of range"))?;
-    match (&column.ty, key.kind, value) {
+    extract_column_order_value_ref(&column.ty, index, key, scanned)
+}
+
+/// [`extract_order_value_ref`] の列キー部分（列型 `ty` と添字 `index` が既知の呼び出し元向け）。
+/// スキーマを持ち込めない実行層（`sql::aggregate` の `string_agg(.. ORDER BY <列>)` の
+/// アキュムレータ。束縛段が列型を複製して保持する。SQL-57・Issue #1800）が、広域取得・
+/// 集計文と同じ抽出規約（NULL・CHAR の rtrim・照合・ENUM の宣言順）を共有するために分離した。
+pub(crate) fn extract_column_order_value_ref<'a>(
+    ty: &ColumnType,
+    index: usize,
+    key: &BoundOrderKey,
+    scanned: &'a [Option<row_codec::ScalarRef<'a>>],
+) -> Result<Option<ScalarKeyRef<'a>>, SqlSurfaceError> {
+    let value = match scanned.get(index) {
+        Some(Some(v)) => v,
+        Some(None) | None => return Ok(None),
+    };
+    match (ty, key.kind, value) {
         (
             ColumnType::Text | ColumnType::Varchar(_),
             OrderKind::Bytes,

@@ -1339,21 +1339,26 @@ pub(crate) fn cmp_cells_pg_nulls(
 }
 
 /// codex-review P1 指摘（PR #603）: `bound.items` に `MIN`/`MAX(<TEXT 列>)`
-/// 集計が 1 つでも含まれるかを判定する。列挙形（[`observe_group_enumeration`]）
+/// 集計、または `string_agg`（SQL-57・Issue #1800。`ORDER BY` なしだと処理順が連結順になる）が
+/// 1 つでも含まれるかを判定する。列挙形（[`observe_group_enumeration`]）
 /// はこの判定が真の場合、[`execute_grouped_aggregate`] から呼ばれない
 /// （下記「列挙形を使わない理由」参照）。`pub(crate)`: `sql::aggregate::
 /// classify_aggregate_access`（Issue #922・SQL-27の EXPLAIN 静的判定）が
 /// executor と同じ単一情報源として本関数を共有する。
 pub(crate) fn has_text_min_max_aggregate(items: &[crate::sql::parser::BoundAggregateItem]) -> bool {
     items.iter().any(|item| {
-        matches!(
-            item.func,
-            crate::sql::allowlist::AggregateFunc::Min | crate::sql::allowlist::AggregateFunc::Max
-        ) && matches!(
-            item.input,
-            crate::sql::parser::AggregateInput::TextColumn(_)
-                | crate::sql::parser::AggregateInput::CollatedTextColumn { .. }
-        )
+        // SQL-57: ORDER BY なしの `string_agg` は行の処理順が結果の連結順になるため、キー順の
+        // 列挙形（グループ単位に処理順が変わる）を使わず物理行順の全走査・候補走査に揃える。
+        item.func == crate::sql::allowlist::AggregateFunc::StringAgg
+            || matches!(
+                item.func,
+                crate::sql::allowlist::AggregateFunc::Min
+                    | crate::sql::allowlist::AggregateFunc::Max
+            ) && matches!(
+                item.input,
+                crate::sql::parser::AggregateInput::TextColumn(_)
+                    | crate::sql::parser::AggregateInput::CollatedTextColumn { .. }
+            )
     })
 }
 

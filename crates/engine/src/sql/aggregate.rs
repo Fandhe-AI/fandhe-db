@@ -194,11 +194,18 @@ fn observe_with_budgets(
     let (entries_before, bytes_before) = accumulator.distinct_footprint();
     accumulator.observe(input, id, vector, scanned, scratch)?;
     let text_after = accumulator.text_len();
+    // SQL-57: `string_agg` の状態は文全体で 16 MiB に頭打ちにする（単一行集計の既定予算 1 GiB は
+    // 項目 32 個 × 状態上限を許してしまい安全な既定値ではない）。
+    let effective_max = if matches!(accumulator, Accumulator::StringAgg(_)) {
+        max_result_bytes.min(crate::sql::string_agg::MAX_STRING_AGG_STATEMENT_BYTES)
+    } else {
+        max_result_bytes
+    };
     accumulate_text_budget(
         text_before,
         text_after,
         total_text_accumulator_bytes,
-        max_result_bytes,
+        effective_max,
     )?;
     let (entries_after, bytes_after) = accumulator.distinct_footprint();
     if entries_after > entries_before {
@@ -320,6 +327,35 @@ impl ReferencedColumns {
                     }
                 }
                 AggregateInput::VectorColumnPresence => needs_vector_presence = true,
+                // SQL-57: 値・区切り・内側 ORDER BY の参照列をすべて反映する（漏れると
+                // 列を縮小デコードした行で式が NULL と取り違えられる／内部エラーになる）。
+                AggregateInput::StringAgg(inp) => {
+                    let mut exprs: Vec<&BoundExpr> = vec![&inp.value.source, &inp.delimiter.source];
+                    for key in &inp.keys {
+                        match &key.source {
+                            crate::sql::parser::StringAggKeySource::Column { index, .. } => {
+                                has_scalar_reference = true;
+                                if let Some(slot) = scalar_mask.get_mut(*index) {
+                                    *slot = true;
+                                }
+                            }
+                            crate::sql::parser::StringAggKeySource::Expr { source, .. } => {
+                                exprs.push(source)
+                            }
+                            crate::sql::parser::StringAggKeySource::Value
+                            | crate::sql::parser::StringAggKeySource::Delimiter
+                            | crate::sql::parser::StringAggKeySource::Id => {}
+                        }
+                    }
+                    for expr in exprs {
+                        if udf_call::references_embedding(expr) {
+                            needs_embedding = true;
+                        }
+                        if udf_call::mark_referenced_scalar_columns(expr, &mut scalar_mask) {
+                            has_scalar_reference = true;
+                        }
+                    }
+                }
                 AggregateInput::AllVisible | AggregateInput::IdU64 => {}
             }
         }
@@ -731,6 +767,10 @@ pub(crate) enum Accumulator {
         seen: std::collections::HashSet<Vec<u8>>,
         bytes: usize,
     },
+    /// `string_agg(<値>, <区切り> [ORDER BY ...])`（SQL-57・Issue #1800）。状態と意味論は
+    /// [`crate::sql::string_agg`] が持つ。`DISTINCT` もこの variant の内部で扱う
+    /// （`COUNT(DISTINCT)` の [`Accumulator::CountDistinct`] とは別物）。
+    StringAgg(Box<crate::sql::string_agg::StringAggState>),
 }
 
 impl Accumulator {
@@ -750,6 +790,10 @@ impl Accumulator {
             // を構造的に拒否済みのため、ここへ到達する `item.func` は常に
             // `Count`。念のため多層防御として確認する（`accumulator_bug` は
             // untrusted 入力起因ではなく実装バグ検出用）。
+            if item.func == AggregateFunc::StringAgg {
+                // `string_agg(DISTINCT ...)` は状態の内部で重複を除く（SQL-57）。
+                return Self::new(item.func, &item.input);
+            }
             if item.func != AggregateFunc::Count {
                 return Err(accumulator_bug(
                     "distinct flag set on a non-COUNT aggregate item",
@@ -770,6 +814,7 @@ impl Accumulator {
     pub(crate) fn distinct_footprint(&self) -> (usize, usize) {
         match self {
             Accumulator::CountDistinct { seen, bytes } => (seen.len(), *bytes),
+            Accumulator::StringAgg(state) => state.distinct_footprint(),
             _ => (0, 0),
         }
     }
@@ -785,6 +830,9 @@ impl Accumulator {
         use AggregateFunc::{Avg, Count, Max, Min, Sum};
         Ok(match (func, input) {
             (Count, _) => Accumulator::Count(0),
+            (AggregateFunc::StringAgg, AggregateInput::StringAgg(inp)) => {
+                Accumulator::StringAgg(Box::new(crate::sql::string_agg::StringAggState::new(inp)))
+            }
             (Sum, AggregateInput::IdU64) => Accumulator::IdSum(None),
             (Avg, AggregateInput::IdU64) => Accumulator::IdAvg {
                 sum: None,
@@ -931,7 +979,19 @@ impl Accumulator {
         if matches!(self, Accumulator::CountDistinct { .. }) {
             return self.observe_distinct(input, id, vector, scanned, scratch);
         }
+        // SQL-57: `string_agg` は入力の評価（値・区切り・ORDER BY の式）も状態側が持つ。
+        if let Accumulator::StringAgg(state) = self {
+            return match input {
+                AggregateInput::StringAgg(inp) => state.observe(inp, id, vector, scanned, scratch),
+                _ => Err(accumulator_bug(
+                    "string_agg accumulator observed a non-string_agg input",
+                )),
+            };
+        }
         match input {
+            AggregateInput::StringAgg(_) => Err(accumulator_bug(
+                "string_agg input observed by a non-string_agg accumulator",
+            )),
             AggregateInput::AllVisible => self.observe_present(),
             // nullable な `VECTOR` 列（TABLE-5 の `ALTER TABLE ADD COLUMN` で追加
             // された列を含む）の裸の列参照。`row.embedding` が空 = 未設定（NULL）
@@ -1440,7 +1500,8 @@ impl Accumulator {
             AggregateInput::AllVisible
             | AggregateInput::VectorColumnPresence
             | AggregateInput::ArrayColumn(_)
-            | AggregateInput::JsonColumn(_) => {
+            | AggregateInput::JsonColumn(_)
+            | AggregateInput::StringAgg(_) => {
                 return Err(accumulator_bug(
                     "COUNT(DISTINCT) accumulator observed an input type that bind-time resolution should have rejected",
                 ))
@@ -1994,6 +2055,7 @@ impl Accumulator {
             Accumulator::TextMin(m, _) | Accumulator::TextMax(m, _) => {
                 m.as_ref().map(String::len).unwrap_or(0)
             }
+            Accumulator::StringAgg(state) => state.text_len(),
             _ => 0,
         }
     }
@@ -2164,6 +2226,10 @@ impl Accumulator {
             // （PostgreSQL の `COUNT(DISTINCT ...)` と同じ契約。`COUNT` 一般の
             // 「空集合で NULL ではなく 0」という既存契約とも一致する）。
             Accumulator::CountDistinct { seen, .. } => Cell::Integer(seen.len() as u64),
+            Accumulator::StringAgg(state) => match state.finish()? {
+                Some(text) => Cell::Text(text),
+                None => Cell::Null,
+            },
         })
     }
 }
@@ -2818,6 +2884,7 @@ pub(crate) fn aggregate_result_type(
         (Min | Max, AggregateInput::TextColumn(_) | AggregateInput::CollatedTextColumn { .. }) => {
             ColumnType::Text
         }
+        (AggregateFunc::StringAgg, AggregateInput::StringAgg(_)) => ColumnType::Text,
         _ => return None,
     })
 }

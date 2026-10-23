@@ -184,6 +184,7 @@ pub(crate) mod matview;
 #[cfg(test)]
 mod serial_expansion_tests;
 pub(crate) mod set_expr;
+pub(crate) mod string_agg;
 pub(crate) mod temp_catalog;
 #[cfg(test)]
 mod temp_catalog_tests;
