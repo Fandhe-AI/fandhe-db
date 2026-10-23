@@ -1599,6 +1599,17 @@ pub fn apply_like_escape(pattern: &str, escape: &str) -> Result<String, SqlSurfa
     }
 }
 
+/// `LIKE` の右辺リテラルを常に一般形（`fold_ascii` なし）の [`LikePattern`] へコンパイルする
+/// （SQL-54 (3)。Issue #1782）。式左辺の `LIKE`（`sql::udf_call::bind_like_predicate`）が使う。
+/// 宣言的レーンの [`parse_like_pattern`] は `Equals`／`StartsWith` へ振り分けて索引を使うが、
+/// 式左辺は索引を使わない（全行評価）ため振り分けない。長さ検証・エスケープ規則は同一。
+pub(crate) fn compile_like_pattern(pattern: &str) -> Result<LikePattern, SqlSurfaceError> {
+    Ok(LikePattern {
+        tokens: tokenize_like_pattern(pattern)?,
+        fold_ascii: false,
+    })
+}
+
 /// `ILIKE` の右辺リテラルをコンパイルする（SQL-54、Issue #1778。畳み込み範囲の
 /// 決定は ADR `docs/design/like-wildcard-patterns.md` 参照）。リテラル文字は
 /// ASCII 英字のみ小文字へ畳み込み、`Equals`／`StartsWith` へは振り分けず

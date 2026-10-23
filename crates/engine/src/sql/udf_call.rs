@@ -887,6 +887,18 @@ pub enum BoundExpr {
         lhs: Box<BoundExpr>,
         rhs: Box<BoundExpr>,
     },
+    /// 式左辺の `<lhs> [NOT] LIKE|ILIKE '<pattern>'`（対象ビヘイビア: SQL-54 (3)。Issue #1782）。
+    /// 束縛段（[`bind_like_predicate`]）が `lhs` を TEXT 型として検査し、パターンを
+    /// [`crate::declarative_filter::LikePattern`] へコンパイル済みで保持する（`ILIKE` の畳み込みは
+    /// パターン側の `fold_ascii` が持つため別フィールドは無い）。左辺が NULL の行は否定の
+    /// 有無に関わらず `NULL`（三値論理。WHERE は真の行だけ通すので `NOT LIKE` でも除外される）。
+    /// スカラー索引・宣言的レーンの対象外（常に残余述語で全行評価。SQL-54 (5)）。
+    /// 変更履歴: 本 variant の追加は `BoundExpr` の網羅的 match を持つ外部コードへの破壊的変更。
+    Like {
+        lhs: Box<BoundExpr>,
+        pattern: crate::declarative_filter::LikePattern,
+        negated: bool,
+    },
     /// `DATE` 定数（対象ビヘイビア: SQL-26。Issue #920）。内部表現は
     /// 1970-01-01 起点の日数（`crate::datetime` 参照）。
     Date(i32),
@@ -1385,6 +1397,18 @@ impl PartialEq for BoundExpr {
                     rhs: rb,
                 },
             ) => na == nb && la == lb && ra == rb,
+            (
+                BoundExpr::Like {
+                    lhs: la,
+                    pattern: pa,
+                    negated: na,
+                },
+                BoundExpr::Like {
+                    lhs: lb,
+                    pattern: pb,
+                    negated: nb,
+                },
+            ) => na == nb && la == lb && pa == pb,
             (
                 BoundExpr::WasmCall {
                     name: na,
@@ -2710,6 +2734,7 @@ fn count_bound_nodes(expr: &BoundExpr) -> usize {
                 + count_bound_nodes(else_result)
         }
         BoundExpr::Coalesce(args) => 1 + args.iter().map(count_bound_nodes).sum::<usize>(),
+        BoundExpr::Like { lhs, .. } => 1 + count_bound_nodes(lhs),
         BoundExpr::NullIf { lhs, rhs } | BoundExpr::IsDistinctFrom { lhs, rhs, .. } => {
             1 + count_bound_nodes(lhs) + count_bound_nodes(rhs)
         }
@@ -2813,6 +2838,7 @@ fn max_bound_case_nesting(expr: &BoundExpr) -> usize {
             1 + branches_max.max(max_bound_case_nesting(else_result))
         }
         BoundExpr::Coalesce(args) => 1 + args.iter().map(max_bound_case_nesting).max().unwrap_or(0),
+        BoundExpr::Like { lhs, .. } => max_bound_case_nesting(lhs),
         BoundExpr::NullIf { lhs, rhs } | BoundExpr::IsDistinctFrom { lhs, rhs, .. } => {
             1 + max_bound_case_nesting(lhs).max(max_bound_case_nesting(rhs))
         }
@@ -2902,6 +2928,7 @@ pub(crate) fn references_embedding(expr: &BoundExpr) -> bool {
                 || references_embedding(else_result)
         }
         BoundExpr::Coalesce(args) => args.iter().any(references_embedding),
+        BoundExpr::Like { lhs, .. } => references_embedding(lhs),
         BoundExpr::NullIf { lhs, rhs } | BoundExpr::IsDistinctFrom { lhs, rhs, .. } => {
             references_embedding(lhs) || references_embedding(rhs)
         }
@@ -3015,6 +3042,7 @@ pub(crate) fn visit_referenced_scalar_columns(expr: &BoundExpr, visit: &mut dyn 
                 visit_referenced_scalar_columns(a, visit);
             }
         }
+        BoundExpr::Like { lhs, .. } => visit_referenced_scalar_columns(lhs, visit),
         BoundExpr::NullIf { lhs, rhs } | BoundExpr::IsDistinctFrom { lhs, rhs, .. } => {
             visit_referenced_scalar_columns(lhs, visit);
             visit_referenced_scalar_columns(rhs, visit);
@@ -3193,6 +3221,7 @@ pub(crate) fn mark_referenced_scalar_columns(expr: &BoundExpr, mask: &mut [bool]
             }
             any
         }
+        BoundExpr::Like { lhs, .. } => mark_referenced_scalar_columns(lhs, mask),
         BoundExpr::NullIf { lhs, rhs } | BoundExpr::IsDistinctFrom { lhs, rhs, .. } => {
             let l = mark_referenced_scalar_columns(lhs, mask);
             let r = mark_referenced_scalar_columns(rhs, mask);
@@ -3243,6 +3272,44 @@ pub fn bind_expr(
         collation_leaf: false,
     };
     bind_expr_in(expr, &mut env, node_budget)
+}
+
+/// 式左辺の `<lhs> [NOT] LIKE|ILIKE '<pattern>'` を束縛する（対象ビヘイビア: SQL-54 (3)。
+/// Issue #1782）。`sql::parser::bind_where_predicates_recursive` が、左辺が裸の列でない
+/// [`WherePredicate::Prefix`](crate::sql::allowlist::WherePredicate::Prefix) に対して呼ぶ。
+/// 左辺は [`bind_expr`] で束縛し（ICU 照合の列・非バイト列順の `COLLATE` は式の内側として
+/// `0A000` で拒否される）、TEXT 以外は `42883`（undefined_function。SQL-54 (3)）で拒否する。
+/// パターンは `ILIKE` なら ASCII 畳み込み付き、`LIKE` なら一般形でコンパイルする（長さ超過は
+/// `54000`・末尾の孤立エスケープは `22025`）。Like ノード 1 個分を `node_budget` へ課金する。
+/// エラー文言は固定の英語で、値・列名を含めない。
+pub(crate) fn bind_like_predicate(
+    lhs: &Expr,
+    pattern: &str,
+    case_insensitive: bool,
+    negated: bool,
+    schema: &TableSchema,
+    registry: &UdfRegistry,
+    node_budget: &mut usize,
+) -> Result<BoundExpr, SqlSurfaceError> {
+    *node_budget = node_budget
+        .checked_sub(1)
+        .ok_or_else(|| SqlSurfaceError::payload_too_large("WHERE expression is too large"))?;
+    let (bound, ty) = bind_expr(lhs, schema, registry, node_budget)?;
+    if ty != ExprType::Text {
+        return Err(SqlSurfaceError::undefined_function(
+            "operator does not exist: LIKE/ILIKE on a non-text operand",
+        ));
+    }
+    let pattern = if case_insensitive {
+        crate::declarative_filter::compile_ilike_pattern(pattern)?
+    } else {
+        crate::declarative_filter::compile_like_pattern(pattern)?
+    };
+    Ok(BoundExpr::Like {
+        lhs: Box::new(bound),
+        pattern,
+        negated,
+    })
 }
 
 /// 投影項目の式を束縛し、結果の列型も返す（Issue #1539・SQL-42。`sql::parser::
@@ -7961,6 +8028,19 @@ pub(crate) fn eval_with_scalars<'a>(
             let r = eval_with_scalars(rhs, id, embedding, row_scalars)?;
             eval_is_distinct_from(*negated, l, r)
         }
+        BoundExpr::Like {
+            lhs,
+            pattern,
+            negated,
+        } => match eval_with_scalars(lhs, id, embedding, row_scalars)? {
+            // 左辺 NULL は否定の有無に関わらず NULL（三値論理。WHERE は真の行だけ通す）。
+            ExprValue::Null => Ok(ExprValue::Null),
+            ExprValue::Text(s) => Ok(ExprValue::Bool(pattern.matches(&s) != *negated)),
+            // 束縛段が TEXT 型を保証するため到達しない。fail-closed。
+            _ => Err(SqlSurfaceError::Internal {
+                detail: "LIKE operand did not evaluate to text".to_string(),
+            }),
+        },
     }
 }
 
