@@ -1248,6 +1248,11 @@ pub struct EngineCore {
     /// 差し替えは [`Self::with_jsonpath_limits`] のみ（起動時 1 回）。SQL 表層の `jsonb_path_*`
     /// （Issue #2185）は、文実行入口が張る `JsonPathLimitsScope` 経由で束縛時にこの値を焼き込む。
     jsonpath_limits: crate::jsonpath_limits::JsonPathLimits,
+    /// 正規表現マッチャのパターン長・入力長・コンパイル後サイズの上限（Issue #1786・SQL-55
+    /// ポインタ）。差し替えは [`Self::with_regex_limits`] のみ（起動時 1 回）。SQL 表層の
+    /// `~` 系（Issue #1787）等が束縛時に [`Self::regex_limits`] を取り出して
+    /// [`crate::regex_match::CompiledRegex::compile`] へ渡す。
+    regex_limits: crate::regex_limits::RegexLimits,
     /// サブクエリ深さ・実行回数・CTE 定義数・CTE 連鎖深さの上限（Issue #1552）。
     /// 差し替えは [`Self::with_nesting_limits`] のみ（起動時 1 回）。構文解析段と
     /// サブクエリ解決段にだけ効き、格納済みビュー本文の再パースはハード上限のまま。
@@ -2710,6 +2715,7 @@ impl EngineCore {
             group_by_limits: crate::group_by_limits::GroupByLimits::default(),
             temp_table_limits: crate::temp_table_limits::TempTableLimits::default(),
             jsonpath_limits: crate::jsonpath_limits::JsonPathLimits::default(),
+            regex_limits: crate::regex_limits::RegexLimits::default(),
             nesting_limits: crate::nesting_limits::NestingLimits::default(),
             join_limits: crate::join_limits::JoinSizeLimits::default(),
             result_limits: crate::result_limits::ResultLimits::default(),
@@ -3032,6 +3038,20 @@ impl EngineCore {
     /// 現在の jsonpath 評価上限（Issue #2184）。
     pub fn jsonpath_limits(&self) -> crate::jsonpath_limits::JsonPathLimits {
         self.jsonpath_limits
+    }
+
+    /// 正規表現マッチャの上限（[`crate::regex_limits::RegexLimits`]）を差し替えたビルダーを返す
+    /// （Issue #1786）。`wire-server` の起動時 CLI フラグ（`--max-regex-pattern-len`・
+    /// `--max-regex-input-len`・`--max-regex-compiled-size`）からのみ呼ぶ。未呼び出しなら
+    /// ハード上限と同値の既定。
+    pub fn with_regex_limits(mut self, limits: crate::regex_limits::RegexLimits) -> Self {
+        self.regex_limits = limits;
+        self
+    }
+
+    /// 現在の正規表現マッチャ上限（Issue #1786）。
+    pub fn regex_limits(&self) -> crate::regex_limits::RegexLimits {
+        self.regex_limits
     }
 
     /// サブクエリ深さ・実行回数・CTE 定義数・CTE 連鎖深さの上限
