@@ -95,6 +95,15 @@ pub enum Token {
     JsonExistsAll,
     /// `&&`（配列の重なり。TABLE-35・Issue #1603）。単独の `&` は未対応文字のまま。
     ArrayOverlap,
+    /// `~`（正規表現マッチ。大文字小文字を区別する。SQL-55・Issue #1787）。
+    /// 構文段（`sql::allowlist`）は WHERE の式述語位置でだけ受理し、他の位置では `42601`。
+    RegexMatch,
+    /// `~*`（正規表現マッチ。ASCII の大文字小文字を区別しない。最長一致で `~` より優先。SQL-55・Issue #1787）。
+    RegexMatchCi,
+    /// `!~`（正規表現の否定マッチ。SQL-55・Issue #1787）。
+    RegexNotMatch,
+    /// `!~*`（正規表現の否定マッチ・大文字小文字無視。最長一致で `!~` より優先。SQL-55・Issue #1787）。
+    RegexNotMatchCi,
     /// `::`（SQL-42・Issue #1520）。
     TypeCast,
     /// `||`（SQL-42・Issue #1520）。
@@ -245,6 +254,10 @@ pub(crate) fn render_tokens(tokens: &[Token]) -> Option<String> {
             Token::JsonExistsAny => out.push_str("?|"),
             Token::JsonExistsAll => out.push_str("?&"),
             Token::ArrayOverlap => out.push_str("&&"),
+            Token::RegexMatch => out.push('~'),
+            Token::RegexMatchCi => out.push_str("~*"),
+            Token::RegexNotMatch => out.push_str("!~"),
+            Token::RegexNotMatchCi => out.push_str("!~*"),
             Token::TypeCast => out.push_str("::"),
             Token::Concat => out.push_str("||"),
             Token::QualifiedIdent { qualifier, name } => {
@@ -807,8 +820,20 @@ fn tokenize_impl(
             // 字句段で `<>` と同じ 2 つの `Punct` へ写し、構文段の `<>` 文法
             // （`allowlist::Parser`）にそのまま合流させる（新しい `Token` は作らない）。
             // `!` 単独は従来どおり未対応文字として拒否する（fail-closed）。
+            // `!~*`→`!~` は正規表現の否定マッチ演算子（SQL-55・Issue #1787。最長一致）。
             let mut lookahead = chars.clone();
             lookahead.next();
+            if matches!(lookahead.peek(), Some(&(_, '~'))) {
+                lookahead.next();
+                if matches!(lookahead.peek(), Some(&(_, '*'))) {
+                    lookahead.next();
+                    tokens.push(Token::RegexNotMatchCi);
+                } else {
+                    tokens.push(Token::RegexNotMatch);
+                }
+                chars = lookahead;
+                continue;
+            }
             if matches!(lookahead.peek(), Some(&(_, '='))) {
                 lookahead.next();
                 tokens.push(Token::Punct('<'));
@@ -820,6 +845,20 @@ fn tokenize_impl(
                 message: format!("unsupported character: {c:?}"),
                 byte_offset: offset,
             });
+        }
+
+        if c == '~' {
+            // `~*`（大文字小文字無視）→ `~` の最長一致（SQL-55・Issue #1787）。
+            let mut lookahead = chars.clone();
+            lookahead.next();
+            if matches!(lookahead.peek(), Some(&(_, '*'))) {
+                lookahead.next();
+                tokens.push(Token::RegexMatchCi);
+            } else {
+                tokens.push(Token::RegexMatch);
+            }
+            chars = lookahead;
+            continue;
         }
 
         if c == '>' {
@@ -1633,6 +1672,32 @@ mod tests {
         assert_eq!(toks("a #-- b"), vec![ident("a"), Punct('#')]);
         assert_eq!(toks("a || b")[1], Concat);
         assert!(render_tokens(&toks("a #- b")).unwrap().contains("#-"));
+    }
+
+    /// SQL-55・Issue #1787: 正規表現マッチ演算子の字句化（最長一致・境界・描画の往復）。
+    #[test]
+    fn regex_match_operators_lex_with_longest_match() {
+        use Token::*;
+        let a = || ident("a");
+        let b = || ident("b");
+        assert_eq!(toks("a~b"), vec![a(), RegexMatch, b()]);
+        assert_eq!(toks("a ~* b"), vec![a(), RegexMatchCi, b()]);
+        assert_eq!(toks("a!~b"), vec![a(), RegexNotMatch, b()]);
+        assert_eq!(toks("a !~* b"), vec![a(), RegexNotMatchCi, b()]);
+        // `~` と `*` の間に空白があれば別トークン。
+        assert_eq!(toks("a ~ *"), vec![a(), RegexMatch, Punct('*')]);
+        // リテラル内は不変。
+        assert_eq!(
+            toks("'~' '!~*'"),
+            vec![StringLiteral("~".into()), StringLiteral("!~*".into())]
+        );
+        // `!=` は従来どおり `<>` 相当、`!` 単独は拒否のまま。
+        assert_eq!(toks("a != b"), vec![a(), Punct('<'), Punct('>'), b()]);
+        assert!(tokenize("a ! b").is_err());
+        assert!(tokenize("a !").is_err());
+        // 描画→再字句化で同じトークン列に戻る。
+        let t = toks("a ~ 'x' b ~* 'y' c !~ 'z' d !~* 'w'");
+        assert_eq!(toks(&render_tokens(&t).unwrap()), t);
     }
 
     /// TABLE-25・Issue #1598: jsonb 包含・存在演算子の字句化（最長一致・境界）。

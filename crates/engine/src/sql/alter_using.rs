@@ -393,7 +393,8 @@ pub(crate) fn redact_row_conversion_error(e: SqlSurfaceError) -> SqlSurfaceError
         | E::ColumnReferenceWithoutFrom
         | E::ForeignKeyViolation
         | E::JsonPathEval(_)
-        | E::JsonPathParse(_) => e,
+        | E::JsonPathParse(_)
+        | E::Regex(_) => e,
         // スキーマ由来の名前だけを持つ variant（行の値ではない）。
         E::UndefinedTable { .. }
         | E::DuplicateTable { .. }

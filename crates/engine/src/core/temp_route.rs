@@ -296,6 +296,7 @@ impl EngineCore {
         core.group_by_limits = template.group_by_limits;
         core.temp_table_limits = template.temp_table_limits;
         core.jsonpath_limits = template.jsonpath_limits;
+        core.regex_limits = template.regex_limits;
         core.nesting_limits = template.nesting_limits;
         core.join_limits = template.join_limits;
         core.result_limits = template.result_limits;

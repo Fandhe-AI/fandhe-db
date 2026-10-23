@@ -242,6 +242,10 @@ fn is_where_group_operator_token(token: &Token) -> bool {
             | Token::Punct('-')
             | Token::Punct('*')
             | Token::Punct('/')
+            | Token::RegexMatch
+            | Token::RegexMatchCi
+            | Token::RegexNotMatch
+            | Token::RegexNotMatchCi
     ) || is_json_operator_token(token)
 }
 
@@ -945,6 +949,10 @@ pub enum SqlSurfaceError {
     /// jsonpath 文字列の解析失敗（束縛時。Issue #2185）。分類・文言は内側の
     /// [`crate::json::jsonpath::JsonPathParseError`] に委譲する。
     JsonPathParse(crate::json::jsonpath::JsonPathParseError),
+    /// 正規表現マッチ（`~` 系。SQL-55・Issue #1787）の失敗。分類・文言は内側の
+    /// [`crate::regex_match::RegexError`] に委譲する（`2201B`／`0A000`／`54000`。固定の英語文で
+    /// パターン・入力の断片を含めない）。
+    Regex(crate::regex_match::RegexError),
 }
 
 impl SqlSurfaceError {
@@ -1447,6 +1455,7 @@ impl ClassifiedError for SqlSurfaceError {
             SqlSurfaceError::AmbiguousColumn { .. } => ErrorClass::AmbiguousColumn,
             SqlSurfaceError::JsonPathEval(e) => e.error_class(),
             SqlSurfaceError::JsonPathParse(e) => e.error_class(),
+            SqlSurfaceError::Regex(e) => e.error_class(),
         }
     }
 
@@ -1455,6 +1464,7 @@ impl ClassifiedError for SqlSurfaceError {
             SqlSurfaceError::Internal { .. } => "internal error".to_string(),
             SqlSurfaceError::JsonPathEval(e) => e.client_message(),
             SqlSurfaceError::JsonPathParse(e) => e.client_message(),
+            SqlSurfaceError::Regex(e) => e.client_message(),
             other => other.to_string(),
         }
     }
@@ -1771,6 +1781,7 @@ impl std::fmt::Display for SqlSurfaceError {
             }
             SqlSurfaceError::JsonPathEval(e) => f.write_str(&e.client_message()),
             SqlSurfaceError::JsonPathParse(e) => f.write_str(&e.client_message()),
+            SqlSurfaceError::Regex(e) => f.write_str(&e.client_message()),
         }
     }
 }
@@ -6880,6 +6891,9 @@ impl<'a> Parser<'a> {
         if let Some((negated, case_insensitive, len)) = self.like_at(self.pos) {
             return self.parse_like_rest(negated, case_insensitive, len, lhs);
         }
+        if let Some((negated, case_insensitive)) = self.regex_op_at(self.pos) {
+            return self.parse_regex_rest(negated, case_insensitive, lhs);
+        }
         if let Expr::JsonAccess { op, .. } = &lhs {
             if op.is_predicate() && !self.peek_is_cmp_op() {
                 return Ok(ExprLeaf::Plain(lhs));
@@ -6967,6 +6981,68 @@ impl<'a> Parser<'a> {
             case_insensitive,
             kw.checked_add(1)?.checked_sub(idx)?,
         ))
+    }
+
+    /// `tokens[idx]` が正規表現マッチ演算子（`~` `~*` `!~` `!~*`）で、直後がパターンとして
+    /// 受理できる形（`::` の続かない文字列リテラル、または引用なしの裸の `NULL`）なら
+    /// `(negated, case_insensitive)` を返す（消費しない。SQL-55・Issue #1787）。それ以外の
+    /// パターン（列・式・`::` 付き・数値）は `None` にして、呼び出し元の比較演算子検査が
+    /// `42601` で fail-closed にする。`$n` は Bind で文字列リテラル（または `NULL`）へ置換済み。
+    fn regex_op_at(&self, idx: usize) -> Option<(bool, bool)> {
+        let (negated, case_insensitive) = match self.tokens.get(idx)? {
+            Token::RegexMatch => (false, false),
+            Token::RegexMatchCi => (false, true),
+            Token::RegexNotMatch => (true, false),
+            Token::RegexNotMatchCi => (true, true),
+            _ => return None,
+        };
+        let pat = idx.checked_add(1)?;
+        let ok = match self.tokens.get(pat) {
+            Some(Token::StringLiteral(_)) => !literal_followed_by_typecast(&self.tokens, pat),
+            Some(Token::Ident(w)) => {
+                w.eq_ignore_ascii_case("NULL")
+                    && !self.quoted_null.contains(&pat)
+                    && !matches!(
+                        self.tokens.get(pat.saturating_add(1)),
+                        Some(Token::TypeCast)
+                    )
+            }
+            _ => false,
+        };
+        ok.then_some((negated, case_insensitive))
+    }
+
+    /// 式左辺 `lhs` の `~`／`~*`／`!~`／`!~*` `<pattern>` の続きを読み [`Expr::RegexMatch`] を作る
+    /// （対象ビヘイビア: SQL-55。Issue #1787）。パターンは文字列リテラルか裸の `NULL` のみ
+    /// （[`Self::regex_op_at`] が検証済み）。CHECK 本体は評価経路が未結線のため `0A000`
+    /// （fail-closed）。パターンの後ろに演算子等が続く形は呼び出し元の終端検査が `42601` で拒否する。
+    fn parse_regex_rest(
+        &mut self,
+        negated: bool,
+        case_insensitive: bool,
+        lhs: Expr,
+    ) -> Result<ExprLeaf, SqlSurfaceError> {
+        if self.in_check_body {
+            return Err(SqlSurfaceError::FeatureNotSupported {
+                detail: "regular expression operators are not supported in a CHECK constraint"
+                    .to_string(),
+            });
+        }
+        self.advance();
+        let pattern = if matches!(self.peek(), Some(Token::StringLiteral(_))) {
+            Expr::String(self.expect_string_literal()?)
+        } else {
+            self.advance();
+            Expr::Null
+        };
+        self.consume_expr_node()?;
+        self.consume_expr_node()?;
+        Ok(ExprLeaf::Plain(Expr::RegexMatch {
+            negated,
+            case_insensitive,
+            lhs: Box::new(lhs),
+            pattern: Box::new(pattern),
+        }))
     }
 
     /// `)` の位置 `close_idx` の直後が `[NOT] LIKE|ILIKE` なら真。括弧付き左辺
@@ -18677,6 +18753,8 @@ fn expr_contains_scalar_function(expr: &Expr) -> bool {
         Expr::Call { .. } | Expr::Case { .. } | Expr::Coalesce(_) | Expr::NullIf(..) => true,
         // `IS [NOT] DISTINCT FROM`（SQL-54）も従来形では書けない式述語。
         Expr::IsDistinctFrom { .. } => true,
+        // 正規表現マッチ（SQL-55）も従来形では書けない式述語。
+        Expr::RegexMatch { .. } => true,
         Expr::Binary { lhs, rhs, .. } | Expr::JsonAccess { lhs, rhs, .. } => {
             expr_contains_scalar_function(lhs) || expr_contains_scalar_function(rhs)
         }
