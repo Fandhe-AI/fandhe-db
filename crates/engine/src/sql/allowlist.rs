@@ -6894,6 +6894,9 @@ impl<'a> Parser<'a> {
         if let Some((negated, case_insensitive)) = self.regex_op_at(self.pos) {
             return self.parse_regex_rest(negated, case_insensitive, lhs);
         }
+        if let Some((negated, kw_len)) = self.similar_at(self.pos) {
+            return self.parse_similar_rest(negated, kw_len, lhs);
+        }
         if let Expr::JsonAccess { op, .. } = &lhs {
             if op.is_predicate() && !self.peek_is_cmp_op() {
                 return Ok(ExprLeaf::Plain(lhs));
@@ -7042,10 +7045,111 @@ impl<'a> Parser<'a> {
             case_insensitive,
             lhs: Box::new(lhs),
             pattern: Box::new(pattern),
+            raw_pattern_len: None,
         }))
     }
 
-    /// `)` の位置 `close_idx` の直後が `[NOT] LIKE|ILIKE` なら真。括弧付き左辺
+    /// `tokens[idx]` から `[NOT] SIMILAR TO` に続けてパターン（`::` の続かない文字列リテラル、
+    /// または引用なしの裸の `NULL`）が並んでいれば `(negated, キーワード部のトークン数)` を返す
+    /// （消費しない。SQL-55・Issue #1788）。`SIMILAR`／`TO` は [`crate::sql::lexer::Keyword`] へ
+    /// 追加せず文脈照合する（`similar`・`to` という列名を壊さないため）。パターンが列・式・
+    /// `::` 付きの形は `None` にして、呼び出し元の比較演算子検査が `42601` で fail-closed にする
+    /// （[`Self::regex_op_at`] と同じ判定）。`$n` は Bind で文字列リテラルへ置換済み。
+    fn similar_at(&self, idx: usize) -> Option<(bool, usize)> {
+        let word = |i: usize, k: &str| matches!(self.tokens.get(i), Some(Token::Ident(w)) if w.eq_ignore_ascii_case(k));
+        let (negated, kw) = if word(idx, "NOT") {
+            (true, idx.checked_add(1)?)
+        } else {
+            (false, idx)
+        };
+        if !word(kw, "SIMILAR") || !word(kw.checked_add(1)?, "TO") {
+            return None;
+        }
+        let pat = kw.checked_add(2)?;
+        let ok = match self.tokens.get(pat) {
+            Some(Token::StringLiteral(_)) => !literal_followed_by_typecast(&self.tokens, pat),
+            Some(Token::Ident(w)) => {
+                w.eq_ignore_ascii_case("NULL")
+                    && !self.quoted_null.contains(&pat)
+                    && !matches!(
+                        self.tokens.get(pat.saturating_add(1)),
+                        Some(Token::TypeCast)
+                    )
+            }
+            _ => false,
+        };
+        ok.then_some((negated, pat.checked_sub(idx)?))
+    }
+
+    /// 式左辺 `lhs` の `[NOT] SIMILAR TO <pattern> [ESCAPE '<c>']` の続きを読み、SQL 正規表現を
+    /// ARE（全体一致の `^(?:…)$`）へ変換して [`Expr::RegexMatch`]（`~` と同じ AST）を作る
+    /// （対象ビヘイビア: SQL-55。Issue #1788）。変換を構文段で行うのは、束縛・評価・索引の判定を
+    /// `~` 系と完全に共有し、`SIMILAR TO` 専用の経路を増やさないため。パターンの検証
+    /// （ARE としての構文誤り `2201B`・非対応 `0A000`・長さ `54000`）は束縛時の
+    /// `sql::regex_op::compile_regex_pattern` が行う。`ESCAPE` 句は文脈照合で、直後が `::` の
+    /// 続かない文字列リテラルのときだけ句として消費する（`ESCAPE NULL`・`ESCAPE $n` は消費せず
+    /// 呼び出し元の終端検査が `42601` にする）。値が 2 文字以上なら `22025`、空文字列はエスケープ
+    /// 無し。CHECK 本体は評価経路が未結線のため `0A000`（fail-closed）。パターンが NULL なら
+    /// 変換せず NULL のまま（結果は否定の有無に関わらず NULL）。
+    fn parse_similar_rest(
+        &mut self,
+        negated: bool,
+        kw_len: usize,
+        lhs: Expr,
+    ) -> Result<ExprLeaf, SqlSurfaceError> {
+        if self.in_check_body {
+            return Err(SqlSurfaceError::FeatureNotSupported {
+                detail: "SIMILAR TO is not supported in a CHECK constraint".to_string(),
+            });
+        }
+        for _ in 0..kw_len {
+            self.advance();
+        }
+        let raw = if matches!(self.peek(), Some(Token::StringLiteral(_))) {
+            Some(self.expect_string_literal()?)
+        } else {
+            self.advance();
+            None
+        };
+        let is_escape_clause = matches!(self.tokens.get(self.pos), Some(Token::Ident(w)) if w.eq_ignore_ascii_case("ESCAPE"))
+            && matches!(
+                self.tokens.get(self.pos.saturating_add(1)),
+                Some(Token::StringLiteral(_))
+            )
+            && !literal_followed_by_typecast(&self.tokens, self.pos.saturating_add(1));
+        let escape = if is_escape_clause {
+            self.advance();
+            let raw_escape = self.expect_string_literal()?;
+            let mut chars = raw_escape.chars();
+            let first = chars.next();
+            if chars.next().is_some() {
+                return Err(SqlSurfaceError::invalid_escape_sequence(
+                    "invalid escape string",
+                ));
+            }
+            first
+        } else {
+            Some('\\')
+        };
+        let raw_len = raw.as_ref().map(String::len);
+        let pattern = match raw {
+            Some(raw) => Expr::String(
+                crate::regex_match::similar_to_are(&raw, escape).map_err(SqlSurfaceError::Regex)?,
+            ),
+            None => Expr::Null,
+        };
+        self.consume_expr_node()?;
+        self.consume_expr_node()?;
+        Ok(ExprLeaf::Plain(Expr::RegexMatch {
+            negated,
+            case_insensitive: false,
+            lhs: Box::new(lhs),
+            pattern: Box::new(pattern),
+            raw_pattern_len: raw_len,
+        }))
+    }
+
+    /// `)` の位置 `close_idx` の直後が `[NOT] LIKE|ILIKE|SIMILAR TO` なら真。括弧付き左辺
     /// （`(lower(name)) LIKE 'a%'`）を真偽値グループでなく値式グループとして扱うための先読み
     /// （SQL-54・Issue #1782）。
     fn like_follows_group(&self, close_idx: usize) -> bool {
@@ -7056,12 +7160,15 @@ impl<'a> Parser<'a> {
 
     fn like_keyword_at(&self, idx: usize) -> bool {
         let word = |i: usize, k: &str| matches!(self.tokens.get(i), Some(Token::Ident(w)) if w.eq_ignore_ascii_case(k));
+        let similar_to =
+            |i: usize| word(i, "SIMILAR") && i.checked_add(1).is_some_and(|n| word(n, "TO"));
         word(idx, "LIKE")
             || word(idx, "ILIKE")
+            || similar_to(idx)
             || (word(idx, "NOT")
                 && idx
                     .checked_add(1)
-                    .is_some_and(|n| word(n, "LIKE") || word(n, "ILIKE")))
+                    .is_some_and(|n| word(n, "LIKE") || word(n, "ILIKE") || similar_to(n)))
     }
 
     /// 式左辺 `lhs` の `[NOT] LIKE|ILIKE '<lit>' [ESCAPE '<c>']` の続きを読み、

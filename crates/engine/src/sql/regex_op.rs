@@ -45,17 +45,25 @@ pub(crate) fn current_regex_limits() -> RegexLimits {
 }
 
 /// パターンを現在の上限でコンパイルする。`~*` 系は ASCII のみ大小無視。
+/// `raw_pattern_len` が `Some` のとき（`SIMILAR TO`）は、変換前の生パターン長へ設定済み上限を
+/// 適用する（変換後の長さは見ない）。
 /// 不正・非対応・上限超過は [`SqlSurfaceError::Regex`]（`2201B`／`0A000`／`54000`）。
 pub(crate) fn compile_regex_pattern(
     pattern: &str,
     case_insensitive: bool,
+    raw_pattern_len: Option<usize>,
 ) -> Result<CompiledRegex, SqlSurfaceError> {
     let case = if case_insensitive {
         RegexCaseMode::AsciiInsensitive
     } else {
         RegexCaseMode::Sensitive
     };
-    CompiledRegex::compile(pattern, case, current_regex_limits()).map_err(SqlSurfaceError::Regex)
+    let limits = current_regex_limits();
+    let compiled = match raw_pattern_len {
+        Some(raw_len) => CompiledRegex::compile_converted(pattern, raw_len, case, limits),
+        None => CompiledRegex::compile(pattern, case, limits),
+    };
+    compiled.map_err(SqlSurfaceError::Regex)
 }
 
 #[cfg(test)]
@@ -81,16 +89,16 @@ mod tests {
 
     #[test]
     fn compile_maps_errors_to_regex_variant() {
-        assert!(compile_regex_pattern("a+", false).is_ok());
+        assert!(compile_regex_pattern("a+", false, None).is_ok());
         assert!(matches!(
-            compile_regex_pattern("(", false),
+            compile_regex_pattern("(", false, None),
             Err(SqlSurfaceError::Regex(
                 crate::regex_match::RegexError::InvalidPattern
             ))
         ));
         let _s = RegexLimitsScope::enter(RegexLimits::new(2, 8, 1024 * 1024));
         assert!(matches!(
-            compile_regex_pattern("abc", true),
+            compile_regex_pattern("abc", true, None),
             Err(SqlSurfaceError::Regex(
                 crate::regex_match::RegexError::PatternTooLong
             ))

@@ -5,8 +5,8 @@
 //! `--max-regex-input-len`・`--max-regex-compiled-size`）を厳密パースし、本モジュールの
 //! `validate_*` で範囲検証したうえで [`RegexLimits`] を組み立て、
 //! `EngineCore::with_regex_limits` へ 1 回だけ注入する（`jsonpath_limits` と同じ流儀）。
-//! 述語評価（`~` 系は Issue #1787 で配線済みで `sql::regex_op` が文の束縛区間へ運ぶ。`SIMILAR TO`・
-//! jsonpath `like_regex` は #1788・#1784）は `EngineCore::regex_limits` から取り出して
+//! 述語評価（`~` 系は Issue #1787 で配線済みで `sql::regex_op` が文の束縛区間へ運ぶ。`SIMILAR TO` も
+//! Issue #1788 で同じ経路。jsonpath `like_regex` は #1784）は `EngineCore::regex_limits` から取り出して
 //! [`crate::regex_match::CompiledRegex::compile`] へ渡す。範囲検証の単一情報源は本モジュール。
 //!
 //! 設計上の不変条件（`docs/design/regex-limits-cli.md`）:

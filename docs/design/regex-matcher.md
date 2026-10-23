@@ -4,7 +4,7 @@
 
 - ステータス: 採用（Issue #1786・SQL-55 のポインタのみ。spec 本文は転記しない）
 - 対象: `engine::regex_match`（`CompiledRegex`・`RegexCaseMode`・`RegexError`）と、その字句変換器 `regex_match/translate.rs`
-- 位置づけ: 評価器の部品のみ。SQL 表層への配線は含まない（`~`／`~*` は #1787、`SIMILAR TO` は #1788、jsonpath の `like_regex` は #1784）。上限の CLI は [regex-limits-cli.md](regex-limits-cli.md)
+- 位置づけ: 評価器の部品のみ。SQL 表層への配線は含まない（`~`／`~*` は #1787、`SIMILAR TO` は #1788 で配線済み（末尾の節）、jsonpath の `like_regex` は #1784）。上限の CLI は [regex-limits-cli.md](regex-limits-cli.md)
 - 依存: [regex-crate-adoption.md](regex-crate-adoption.md)（Accepted）
 
 ## 方針
@@ -65,8 +65,35 @@
 | 拡張クエリ | `<列> (~\|~*\|!~\|!~*) $n`（`sql::params` のパターン 11）。`$n` の型は左辺の列に依らず text。NULL のバインドは裸の `NULL` へ置換。逆向き・両辺 `$n`・式の内側・`$n::text` は `42601` |
 | 索引 | 使わない（常に残余述語で RLS 後の可視行だけを評価する） |
 | 台帳 | `content_hash` は式タグ 21（`negated`・`case_insensitive`・左辺・パターンの順）、トークンタグ 30〜33 |
-| 対象外 | CHECK（`0A000`）、索引の式・述語（`0A000`）、UDF 本体（`0A000`）、ビュー本体・JOIN・HAVING・サブクエリ・SELECT リスト（`42601`）、列・式のパターン、`SIMILAR TO`（#1788）、jsonpath の `like_regex`（#1784） |
+| 対象外 | CHECK（`0A000`）、索引の式・述語（`0A000`）、UDF 本体（`0A000`）、ビュー本体・JOIN・HAVING・サブクエリ・SELECT リスト（`42601`）、列・式のパターン、jsonpath の `like_regex`（#1784） |
 
 PG との意図的な差分: PG は評価される行が 0 件なら不正パターンでもエラーにしないが、本実装は束縛時に `2201B`／`0A000`／`54000` で拒否する（`LIKE` の `22025` と同じ fail-closed）。
 
 あわせて、一時表の経路（`core/temp_route.rs`）が `regex_limits` を一時コアへ引き継いでいなかった漏れを直した（運用者が CLI で下げた上限が効かない fail-open の防止）。
+
+## SIMILAR TO への配線（Issue #1788）
+
+ポインタ: SQL-55（正常系）・ERR-2／ERR-6（SQLSTATE 写像）。`[NOT] SIMILAR TO '<pattern>' [ESCAPE '<c>']` を `~` と同じ WHERE の式述語として受理する。PG 自身の 2 段構成（SQL 正規表現 → ARE → 正規表現エンジン）に倣い、変換器 `regex_match/similar.rs` が SQL 正規表現を ARE へ写し、既存のマッチャへ渡す。
+
+| 項目 | 内容 |
+| ---- | ---- |
+| 字句 | 追加なし。`SIMILAR`・`TO`・`ESCAPE` は文脈照合の識別子で、`similar`／`to` という列名を壊さない |
+| 構文 | `parse_expression_predicate` が `[NOT] SIMILAR TO` を検出し、変換済みの ARE を `pattern` に持つ `Expr::RegexMatch { case_insensitive: false }` を作る（専用の AST・束縛・評価の経路を持たず、`~` 系の束縛・評価・索引判定・台帳をそのまま共有する）。パターンは `::` の続かない文字列リテラルか裸の `NULL`。`括弧付き左辺 (…) SIMILAR TO` も値式グループとして読む |
+| 変換 | 出力は `^(?:` … `)$`（全体一致）。`%`→`.*`、`_`→`.`、`(`→`(?:`、`.`・`^`・`$`・`\`→リテラル化、`\|`・`*`・`+`・`?`・`{}`・`)` はそのまま、ブラケット式は内容を通す（`\` は二重化。先頭の `]`・`[^]`・`[:alpha:]` の入れ子を扱う）。エスケープ文字＋文字は `\` ＋文字（`\d` 等の ARE エスケープも通る）。エスケープ文字＋`"` は部分抽出用の区切り（1 個目 `){1,1}?(`、2 個目 `){1,1}(?:`）。変換後の ARE は `translate` が再検証する |
+| ESCAPE | 句なしは `\`。`ESCAPE ''` はエスケープなし。2 文字以上は `22025`（固定文言）。多バイト 1 文字は可。`ESCAPE NULL`・`ESCAPE $n`・`::` 付きは句として消費せず `42601`。末尾の孤立したエスケープ文字は PG と同じく無視 |
+| 束縛・評価 | `~` と同じ。パターンは束縛時に 1 回コンパイル。左辺 NULL またはパターン NULL は NULL（否定の有無に関わらず）。TEXT 以外は `42883`、ICU 照合は `0A000` |
+| 上限 | 生パターンのバイト長をハード上限（4096）で変換の前に検査（`54000`）。CLI で下げた上限も変換前の生パターンのバイト長に対して束縛時に検査する（変換後の ARE には別途コンパイラのサイズ制限が掛かる） |
+| 拡張クエリ | 受理しない（`sql::params` に対応する形が無く、`$n` は Parse で `42601`） |
+| 台帳 | `~` と同じ式タグ 21（変換後の ARE で直列化する。意味が同じなら同じ内容として扱う） |
+| 対象外 | CHECK・索引の式・述語・UDF 本体（`0A000`）、ビュー本体・JOIN・HAVING・サブクエリ・SELECT リスト・CASE（`42601`）、列・式のパターン、`substring(… SIMILAR … ESCAPE …)`（SQL-55 の別項目） |
+
+PG 17.11 との一致は `crates/engine/tests/data/similar_to_pg17.tsv`（`postgres:17`、`initdb --locale=C --encoding=UTF8`、各式に `COLLATE "C"`。入力 × パターン × ESCAPE〔句なし・`#`・`''`・`\`・`é`・記号〕× 結果の 26,000 行超）を `crates/engine/tests/similar_to_match.rs` が全行検査する。
+
+意図的な差分:
+
+| 差分 | 理由 |
+| ---- | ---- |
+| `"` 区切りが 3 個以上のとき `2201B`（PG は `2200C`） | SQLSTATE の写像表に該当行が無く、新しい分類を足さず構文誤りの分類で拒否する（fail-closed）。写像表の追加が必要かは spec 側で判断する |
+| ARE として写せない構文（照合要素 `[[.a.]]`・`[[=a=]]`・語境界 `[[:<:]]`・`\u`／`\x` エスケープ等）は `0A000` | `~` と同じ方針（`regex` は線形時間と引き換えに一部の構文を持たない） |
+| 評価される行が 0 件でも不正パターンは束縛時に `2201B`／`54000` で拒否 | `~` と同じ fail-closed |
+| パターン長の CLI 上限は構文段でなく束縛時に検査する | 構文段は CLI 上限を持たないため、生パターンのバイト長を束縛時に `raw_pattern_len` で渡して検査する（ハード上限は構文段で検査） |

@@ -2865,6 +2865,8 @@ fn push_dml_expr(
             case_insensitive,
             lhs,
             pattern,
+            // 生パターン長は変換後の ARE（`pattern`）から決まる補助情報なのでハッシュに含めない。
+            raw_pattern_len: _,
         } => {
             b.push_u8(21);
             b.push_u8(u8::from(*negated));
@@ -5336,6 +5338,7 @@ mod tests {
             case_insensitive: ci,
             lhs: Box::new(Expr::Ident(col.to_string())),
             pattern: Box::new(pat),
+            raw_pattern_len: None,
         };
         let pat = |s: &str| Expr::String(s.to_string());
         let hash =

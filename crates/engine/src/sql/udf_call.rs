@@ -284,6 +284,10 @@ pub enum Expr {
         case_insensitive: bool,
         lhs: Box<Expr>,
         pattern: Box<Expr>,
+        /// `SIMILAR TO` 由来のとき、変換前の生パターンのバイト長（Issue #1788）。`pattern` は変換後の
+        /// ARE（ラッパー付き・ESCAPE 除去済み）で長さが生パターンとずれるため、設定済みの
+        /// パターン長上限は束縛時にこの値へ適用する（`regex-limits-cli.md` D2）。`~` 系は `None`。
+        raw_pattern_len: Option<usize>,
     },
     /// `DATE '<literal>'`（型付きリテラル。対象ビヘイビア: SQL-26。Issue #920）。
     /// 構文段（`allowlist::Parser::parse_primary_expr`）で
@@ -3994,6 +3998,7 @@ fn bind_regex_match(
     case_insensitive: bool,
     lhs: &Expr,
     pattern: &Expr,
+    raw_pattern_len: Option<usize>,
     env: &mut BindEnv<'_>,
     node_budget: &mut usize,
 ) -> Result<(BoundExpr, ExprType), SqlSurfaceError> {
@@ -4009,7 +4014,8 @@ fn bind_regex_match(
     let (pattern, compiled) = match pattern {
         Expr::Null => (None, None),
         Expr::String(p) => {
-            let c = crate::sql::regex_op::compile_regex_pattern(p, case_insensitive)?;
+            let c =
+                crate::sql::regex_op::compile_regex_pattern(p, case_insensitive, raw_pattern_len)?;
             (Some(p.clone()), Some(c))
         }
         // 構文段が来させない形。多層防御として fail-closed。
@@ -4585,7 +4591,16 @@ pub(super) fn bind_expr_any(
             case_insensitive,
             lhs,
             pattern,
-        } => bind_regex_match(*negated, *case_insensitive, lhs, pattern, env, node_budget),
+            raw_pattern_len,
+        } => bind_regex_match(
+            *negated,
+            *case_insensitive,
+            lhs,
+            pattern,
+            *raw_pattern_len,
+            env,
+            node_budget,
+        ),
         // `DATE`／`TIMESTAMP` 型付きリテラル（対象ビヘイビア: SQL-26。Issue #920）。
         // 構文段（`allowlist::Parser::parse_primary_expr`）が既に
         // `crate::datetime::parse_date`／`parse_timestamp` で解析・範囲検証済みの
