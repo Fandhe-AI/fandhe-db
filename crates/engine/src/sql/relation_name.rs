@@ -103,6 +103,32 @@ pub(crate) struct RelPos {
     pub matview: bool,
 }
 
+/// `tokens[i]` が `DELETE FROM <表> [[AS] <別名>] USING <表の並び>` の `USING`（表参照リストを導く語）か。
+/// 文頭が `DELETE FROM <表>` で、`USING` が対象表と別名の直後の構文位置にあり、直後が
+/// `OPERATION_ID`（operation_id 句）でないときだけ真（SQL-53 (b)、Issue #1754）。`USING` は予約語では
+/// ないため、WHERE 内の列名 `using` を USING 句と誤判定しないよう位置で限定する
+/// （`allowlist::looks_like_delete_using` と同じ規則。こちらは修飾表名も許す）。
+fn delete_using_opener(tokens: &[Token], i: usize) -> bool {
+    if !ident_is(tokens.first(), "DELETE")
+        || !matches!(tokens.get(1), Some(Token::Keyword(Keyword::From)))
+        || !matches!(
+            tokens.get(2),
+            Some(Token::Ident(_) | Token::QualifiedIdent { .. })
+        )
+    {
+        return false;
+    }
+    let mut pos: usize = 3;
+    if ident_is(tokens.get(pos), "AS") {
+        pos = pos.saturating_add(2);
+    } else if matches!(tokens.get(pos), Some(Token::Ident(w))
+        if !crate::sql::allowlist::is_dml_target_reserved_word(w))
+    {
+        pos = pos.saturating_add(1);
+    }
+    pos == i && ident_is(tokens.get(i), "USING") && !ident_is(tokens.get(i + 1), "OPERATION_ID")
+}
+
 /// [`relation_positions`] の結果。
 pub(crate) struct RelationWalk {
     /// テーブル参照位置にある `Token::Ident`／`Token::QualifiedIdent`（出現順）。
@@ -191,6 +217,9 @@ pub(crate) fn relation_positions(tokens: &[Token]) -> RelationWalk {
             Token::Ident(w) => {
                 if w.eq_ignore_ascii_case("UPDATE") || w.eq_ignore_ascii_case("DELETE") {
                     next.from_ok = true;
+                } else if delete_using_opener(tokens, i) {
+                    // `DELETE FROM t USING a, b`（SQL-53 (b)、Issue #1754）。以降のカンマは表参照リストの区切り。
+                    next.list = true;
                 } else if (w.eq_ignore_ascii_case("TRUNCATE") && i == 0)
                     || (w.eq_ignore_ascii_case("TABLE") && ddl_head && i < 4)
                     || (head_drop
@@ -279,6 +308,8 @@ pub(crate) fn relation_positions(tokens: &[Token]) -> RelationWalk {
                         && ((is("ON") && index_on_pending)
                             || is("INTO")
                             || is("REFERENCES")
+                            // `DELETE FROM t AS case USING u`: 別名が式の語でも USING 直後は表参照
+                            || (is("USING") && delete_using_opener(tokens, i.saturating_sub(1)))
                             || ((is("JOIN") || is("ONLY")) && level.list)))
             }
             _ => false,
@@ -328,6 +359,9 @@ pub(crate) fn relation_positions(tokens: &[Token]) -> RelationWalk {
                         ok
                     } else if is("COPY") {
                         i == 1
+                    } else if is("USING") {
+                        // `DELETE ... USING <表>`（SQL-53 (b)、Issue #1754）。
+                        delete_using_opener(tokens, i.saturating_sub(1))
                     } else if is("ON") {
                         index_on_pending
                     } else {
@@ -964,6 +998,29 @@ mod tests {
             tokenize(plain).expect("lex"),
             "{qualified}"
         );
+    }
+
+    /// SQL-53 (b)・Issue #1754: `DELETE ... USING` の表参照リストと `UPDATE ... FROM` の各表が
+    /// 表参照位置になる（`search_path` ゲートの素通りを防ぐ）。`USING OPERATION_ID` は参照位置にしない。
+    #[test]
+    fn delete_using_and_update_from_lists_are_relation_positions() {
+        same(
+            "DELETE FROM public.a USING public.b, public.c WHERE a.id = b.id",
+            "DELETE FROM a USING b, c WHERE a.id = b.id",
+        );
+        same(
+            "UPDATE public.a SET x = b.x FROM public.b, public.c WHERE a.id = b.id",
+            "UPDATE a SET x = b.x FROM b, c WHERE a.id = b.id",
+        );
+        // 後続の `USING OPERATION_ID` は表参照ではない（従来どおり位置は DELETE FROM の表のみ）。
+        let t = tokenize("DELETE FROM public.a USING OPERATION_ID 'x'").expect("lex");
+        assert_eq!(relation_positions(&t).positions.len(), 1);
+        let t = tokenize("DELETE FROM a USING b WHERE a.id = b.id USING OPERATION_ID 'x'")
+            .expect("lex");
+        assert_eq!(relation_positions(&t).positions.len(), 2);
+        // `DELETE` で始まらない文の `USING`（`ALTER ... USING <式>`・JOIN の USING）は影響を受けない。
+        let t = tokenize("ALTER TABLE t ALTER COLUMN c TYPE int USING c").expect("lex");
+        assert_eq!(relation_positions(&t).positions.len(), 1);
     }
 
     #[test]
