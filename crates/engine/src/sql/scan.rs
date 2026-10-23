@@ -1442,13 +1442,14 @@ pub(crate) fn execute_scan_with_budget(
                 // ヒープが満杯でなければ同値で溢れる行は存在しない（全可視行が既に選抜済み）。
                 match heap.peek() {
                     Some(w) if heap.len() >= heap_capacity => {
-                        let w = w.clone();
+                        // 予算検査は借用のまま行い、通過後にだけ所有キーを複製する
+                        // （`max_result_bytes` 超過分を先に確保しないため）。
                         heap_budget = try_accumulate_budget(
                             heap_budget,
-                            heap_entry_bytes(&w),
+                            heap_entry_bytes(w),
                             max_result_bytes,
                         )?;
-                        tie_worst = Some(w);
+                        tie_worst = Some(w.clone());
                     }
                     _ => break,
                 }

@@ -62,6 +62,24 @@ fn is_count_value(token: Option<&Token>) -> bool {
     matches!(token, Some(Token::Number(_) | Token::Param(_)))
 }
 
+/// `prev`（直前の入力トークン）が式・表参照・`LIMIT` 値などの「オペランドの終端」かどうか。
+/// `OFFSET`／`FETCH` は予約語ではなく識別子（列名・表名）としても使えるため、句として
+/// 解釈するのは直前がオペランド終端のときだけに限る（`SELECT offset + 1 rows`・
+/// `FROM fetch first` のように直前が `SELECT`／`FROM`／演算子・`,` ・`(` なら識別子）。
+fn follows_operand(prev: Option<&Token>) -> bool {
+    matches!(
+        prev,
+        Some(
+            Token::Ident(_)
+                | Token::Number(_)
+                | Token::Param(_)
+                | Token::StringLiteral(_)
+                | Token::QuotedBoolWord(_)
+                | Token::Punct(')' | ']')
+        )
+    )
+}
+
 fn syntax(detail: &str) -> SqlSurfaceError {
     SqlSurfaceError::unsupported(detail)
 }
@@ -151,7 +169,9 @@ pub(crate) fn normalize_fetch_clauses(tokens: Vec<Token>) -> Result<Normalized, 
                 out.push(tok.clone());
                 i += 1;
             }
-            _ if is_word(tok, "OFFSET") => {
+            _ if is_word(tok, "OFFSET")
+                && follows_operand(i.checked_sub(1).and_then(|p| tokens.get(p))) =>
+            {
                 // `OFFSET [+|-] <値>`。値の形の検証は従来の `OFFSET` 解析に任せ、ここでは
                 // 直後の `ROW`／`ROWS` を取り除くだけにする。
                 let mut j = i + 1;
@@ -174,6 +194,7 @@ pub(crate) fn normalize_fetch_clauses(tokens: Vec<Token>) -> Result<Normalized, 
                 }
             }
             _ if is_word(tok, "FETCH")
+                && follows_operand(i.checked_sub(1).and_then(|p| tokens.get(p)))
                 && matches!(tokens.get(i + 1), Some(t) if is_word(t, "FIRST") || is_word(t, "NEXT")) =>
             {
                 if g.fetch_seen || g.limit_seen {
@@ -407,6 +428,24 @@ mod tests {
         let sql = "SELECT 1; FETCH FIRST FROM c";
         let n = norm(sql).expect("ok");
         assert_eq!(n.tokens, tokenize_with_params(sql).expect("tokenize"));
+    }
+
+    #[test]
+    fn identifiers_named_offset_and_fetch_are_untouched() {
+        for sql in [
+            "SELECT offset + 1 rows FROM t FETCH FIRST 2 ROWS ONLY",
+            "SELECT fetch first FROM t",
+            "SELECT id FROM fetch first",
+            "SELECT id FROM t WHERE offset + 1 = 2",
+        ] {
+            let n = norm(sql).unwrap_or_else(|e| panic!("{sql}: {e:?}"));
+            let expected = sql.replace("FETCH FIRST 2 ROWS ONLY", "LIMIT 2");
+            assert_eq!(
+                n.tokens,
+                tokenize_with_params(&expected).expect("tokenize"),
+                "{sql}"
+            );
+        }
     }
 
     #[test]
