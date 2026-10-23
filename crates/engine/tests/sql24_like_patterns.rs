@@ -346,6 +346,29 @@ fn setup_explain_table(storage: &Storage) {
     .expect("insert row");
 }
 
+/// 式左辺の LIKE（SQL-54 (5)、Issue #1782）は前方一致形でも索引候補にせず `plain_scan` になる。
+#[test]
+fn explain_reports_plain_scan_for_expression_left_operand() {
+    let path = unique_db_path("sql24-explain-expr-lhs");
+    let _guard = CleanupGuard(path.clone());
+    let storage = open_storage(&path);
+    setup_explain_table(&storage);
+    let core = new_core(storage).with_query_planner(Box::new(StubLlmClient {
+        response: EXPANSION_RESPONSE_NO_HINTS,
+    }));
+    let mut session = SessionState::default();
+    let ctx = PolicyContext::new("tenant-a").expect("valid tenant");
+
+    let outcome = core
+        .execute_sql_in_session(
+            &ctx,
+            &mut session,
+            "EXPLAIN SELECT id FROM docs WHERE lower(path) LIKE 'src/%' USING PLAN('find content') LIMIT 5",
+        )
+        .expect("EXPLAIN should succeed");
+    assert!(explain_lines(outcome).contains(&"scalar_plan: plain_scan".to_string()));
+}
+
 #[test]
 fn explain_reports_plain_scan_for_middle_match_and_index_prefix_for_pure_prefix() {
     let path = unique_db_path("sql24-explain-scalar-plan");
@@ -469,24 +492,25 @@ fn tenant_boundary_is_enforced_for_percent_wildcard() {
     );
 }
 
-// --- 式左辺（SQL-54、Issue #1781）---------------------------------------------------
+// --- 式左辺（SQL-54、Issue #1781・#1782）---------------------------------------------------
 
-/// LIKE 述語の AST は左辺を式ノードで保持するが、構文層は現状、式左辺を受理しない
-/// （`lower(path) LIKE ...` は従来どおり `42601`）。式左辺の受理・評価は後続 Issue で反転する。
+/// 式左辺の LIKE（SQL-54、Issue #1782）は受理され、式として全行評価される（索引候補にしない）。
+/// 結果の網羅的な検証は `tests/sql54_like_expr_lhs.rs`。
 #[test]
-fn expression_left_operand_is_still_rejected_as_unsupported_syntax() {
+fn expression_left_operand_is_evaluated_without_index() {
     let path = unique_db_path("sql24-like-expr-lhs");
     let _guard = CleanupGuard(path.clone());
     let storage = open_storage(&path);
-    setup_single_tenant_table(&storage, &[(1, "abc", "code")]);
+    setup_single_tenant_table(&storage, &[(1, "Abc", "code"), (2, "xyz", "code")]);
     let core = new_core(storage);
     let ctx = PolicyContext::new("tenant-a").expect("valid tenant");
 
-    let err = core
+    let outcome = core
         .execute_sql(
             &ctx,
             "SELECT * FROM docs WHERE lower(path) LIKE 'a%' ORDER BY embedding <=> '[1.0,0.0]' LIMIT 10",
         )
-        .expect_err("expression left operand must still be rejected");
-    assert_eq!(err.wire_code(), "42601");
+        .expect("expression left operand must be accepted");
+    let ids: Vec<u64> = outcome.rows.iter().map(|r| r.id).collect();
+    assert_eq!(ids, vec![1]);
 }
