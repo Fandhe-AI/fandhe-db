@@ -54,7 +54,7 @@ use crate::copy_binary::{BinaryCopyReader, BinaryFrameLimits, CopyBinaryError};
 use crate::copy_binary_types::{self, CopyBinaryColumn, CopyBinaryValueError};
 use crate::framing::{self, FrameError};
 use crate::result_encoder;
-use crate::simple_query::Finish;
+use crate::simple_query::{Finish, StatementRole};
 use crate::wire_stream::WireStream;
 
 /// [`FrameError`] を `io::Result` の失敗へ変換する。`Truncated`（相手が既に
@@ -722,6 +722,7 @@ fn prepare_decoder(session: &CopyInSession) -> Result<CopyInDecoder, CopyFromErr
 /// が通常のクエリループへ戻ってクライアントが実際にソケットを閉じるまで
 /// 接続スロットを保持し続けていた。`Closed` はループを終了させるべき
 /// 場合——Terminate 受信・ストリーム側の早期 EOF——にのみ返す）。
+#[allow(clippy::too_many_arguments)]
 fn run_copy_from<'e, S: WireStream>(
     stream: &mut S,
     engine: &'e EngineCore,
@@ -730,6 +731,7 @@ fn run_copy_from<'e, S: WireStream>(
     txn: &mut SessionTransaction<'e>,
     mut session: CopyInSession,
     finish: Finish,
+    role: StatementRole,
 ) -> io::Result<CopyStep> {
     let mut decoder = match prepare_decoder(&session) {
         Ok(d) => d,
@@ -813,6 +815,7 @@ fn run_copy_from<'e, S: WireStream>(
                     decoder,
                     errored,
                     finish,
+                    role,
                 );
             }
             b'f' => {
@@ -933,6 +936,7 @@ fn finish_copy_from<'e, S: WireStream>(
     decoder: CopyInDecoder,
     errored: Option<CopyFromError>,
     finish: Finish,
+    role: StatementRole,
 ) -> io::Result<CopyStep> {
     if let Some(e) = errored {
         return respond_copy_from_error(stream, txn, &e).map(|()| CopyStep::Failed);
@@ -955,7 +959,17 @@ fn finish_copy_from<'e, S: WireStream>(
         let _emergency_registration = crate::simple_query::register_emergency_response(stream);
         // セッション対応版: 一時表向けのバッチの commit と、自動コミットの COPY 後の `ON COMMIT`
         // 適用（TABLE-44・Issue #1684）に接続の `SessionState` が要る。
-        engine.commit_copy_in_txn_in_session(ctx, conn_session, txn, batch)
+        // 暗黙トランザクション（複数文メッセージ。WIRE-20）の最後の文が COPY のときは、
+        // 通常の文の `ImplicitFinal` と同じく commit を緊急応答の登録区間の内側で行い、
+        // `CommandComplete` はその後に書く（commit 失敗時は `CommandComplete` を送らない）。
+        engine
+            .commit_copy_in_txn_in_session(ctx, conn_session, txn, batch)
+            .and_then(|insert_outcome| {
+                if role == StatementRole::ImplicitFinal {
+                    txn.commit_implicit(conn_session)?;
+                }
+                Ok(insert_outcome)
+            })
     };
 
     match outcome {
@@ -1002,7 +1016,8 @@ pub(crate) enum CopyStep {
 
 /// `simple_query::run_copy_statement` から、`engine::sql::copy::
 /// is_copy_statement(stmt)` が真の 1 文について、セッションが `Idle` または明示
-/// トランザクション中（Issue #1179。暗黙トランザクション中・`Failed` 中は呼ばれない）
+/// トランザクション中（Issue #1179）、または暗黙トランザクション中（複数文メッセージ内。
+/// WIRE-20・Issue #1773。`role` で位置を渡す。`Failed` 中は呼ばれない）
 /// に呼ばれる唯一の入口（`handshake::post_auth_loop` の 'Q' 分岐は `simple_query::
 /// execute_and_respond` へ一本化した。Issue #1175）。
 /// `EngineCore::begin_copy` の構造検証・`operation_id` 必須化ガード・
@@ -1014,9 +1029,14 @@ pub(crate) enum CopyStep {
 /// 後に `ReadyForQuery` を送らず、複数文メッセージの次の文へ制御を返す
 /// （エラー経路は常に ErrorResponse＋`ReadyForQuery`）。
 ///
+/// `role` は暗黙トランザクション内での位置（[`StatementRole`]）。`ImplicitFinal` のときだけ
+/// 本関数が `commit_implicit` を行う（COPY FROM は `CommandComplete` の前、COPY TO は
+/// CopyOutResponse の前）。それ以外（`Standalone`・`ImplicitIntermediate`）は commit しない。
+///
 /// 戻り値 [`CopyStep::Closed`] は `run_copy_from` が Terminate（'X'）受信を
 /// 返してきた場合で、呼び出し元はそのまま伝播して接続ループを終了させる
 /// （[`run_copy_from`] のドキュメント参照）。
+#[allow(clippy::too_many_arguments)]
 pub(crate) fn run<'e, S: WireStream>(
     stream: &mut S,
     engine: &'e EngineCore,
@@ -1025,18 +1045,42 @@ pub(crate) fn run<'e, S: WireStream>(
     txn: &mut SessionTransaction<'e>,
     sql: &str,
     finish: Finish,
+    role: StatementRole,
 ) -> io::Result<CopyStep> {
     // commit 成功から本関数が応答を書き終えるまでの区間全体を覆う RAII ガード
     // （RECOVER-5 (3)。`simple_query::execute_and_respond` と同じ設計）。
     let _response_boundary = engine::recovery::commit_boundary::ResponseBoundaryGuard::new();
 
-    match engine.begin_copy_in_txn(ctx, session, txn, sql) {
+    // COPY TO の結果は `begin_copy_in_txn` の時点で実体化済みなので、暗黙トランザクションの
+    // 最後の文なら CopyOutResponse を送る前に commit する（通常の SELECT の
+    // `ImplicitFinal` と同じ「commit してから応答を書く」順序。WIRE-20）。commit は緊急応答の
+    // 登録区間の内側で行い、失敗時は CopyOutResponse を 1 バイトも送らず ErrorResponse を返す。
+    let plan = {
+        let _emergency_registration = (role == StatementRole::ImplicitFinal)
+            .then(|| crate::simple_query::register_emergency_response(stream));
+        engine
+            .begin_copy_in_txn(ctx, session, txn, sql)
+            .and_then(|plan| {
+                if role == StatementRole::ImplicitFinal && matches!(plan, CopyPlan::To(..)) {
+                    txn.commit_implicit(session)?;
+                }
+                Ok(plan)
+            })
+    };
+    match plan {
         Ok(CopyPlan::To(format, result, options)) => {
             run_copy_to(stream, session, txn, format, &result, &options, finish)
         }
-        Ok(CopyPlan::From(copy_session)) => {
-            run_copy_from(stream, engine, ctx, session, txn, copy_session, finish)
-        }
+        Ok(CopyPlan::From(copy_session)) => run_copy_from(
+            stream,
+            engine,
+            ctx,
+            session,
+            txn,
+            copy_session,
+            finish,
+            role,
+        ),
         Err(e) => respond_sql_error(stream, txn, &e).map(|()| CopyStep::Failed),
     }
 }

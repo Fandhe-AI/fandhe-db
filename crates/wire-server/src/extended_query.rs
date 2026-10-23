@@ -2319,7 +2319,7 @@ fn execute_portal<'e, S: WireStream>(
         // COPY の portal は CopyIn／CopyOut サブプロトコルが要る（stream を持たない engine では
         // 実行できない）ため、`execute_parsed_in_txn` へ渡さず呼び出し元へ委譲する
         // （Issue #1760）。先頭の `25P02` 検査・未登録／Empty／Done の処理は通過済みで、
-        // gating（暗黙 Tx の `0A000`・`Failed` の `25P02`）は `run_copy_statement` が担う。
+        // gating（`Failed` の `25P02`）は `run_copy_statement` が担う（拡張クエリは暗黙 Tx を持たない）。
         // 実行を試みる portal は終端 `Failed` へ倒し、成功時のみ呼び出し元が `Done` へ上書きする。
         if let ParsedSql::Copy(v) = parsed.peel_session_route() {
             let sql = v.sql().to_owned();

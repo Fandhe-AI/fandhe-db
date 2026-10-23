@@ -355,30 +355,34 @@ fn run_implicit_statements<'e, S: WireStream>(
     let last_index = stmts.len().saturating_sub(1);
     for (i, stmt) in stmts.iter().enumerate() {
         let is_last = i == last_index;
-        if engine::sql::copy::is_copy_statement(stmt) {
-            // トランザクション内の COPY は未対応（`0A000`）。`run_copy_statement` が
-            // 暗黙トランザクションを `Idle` へ戻し、`ReadyForQuery('I')` を送る。
-            // 原子性を優先し、CopyIn へは入らずメッセージ全体をロールバックする。
-            let step = run_copy_statement(
-                stream,
-                engine,
-                ctx,
-                session,
-                txn,
-                stmt,
-                Finish::ReadyForQuery,
-            )?;
-            *session = snapshot.clone();
-            if matches!(step, crate::copy::CopyStep::Failed) {
-                finish_failed(stream, session, txn)?;
-            }
-            return Ok(copy_step_to_signal(step));
-        }
         let (finish, role) = if is_last {
             (Finish::ReadyForQuery, StatementRole::ImplicitFinal)
         } else {
             (Finish::Continue, StatementRole::ImplicitIntermediate)
         };
+        if engine::sql::copy::is_copy_statement(stmt) {
+            // 暗黙トランザクション内の COPY（WIRE-20・Issue #1773）。COPY の文でサブプロトコルへ
+            // 入り、CopyDone／CopyFail の後に同じメッセージの続きの文へ進む。続きの文は
+            // 本ループの次の添字そのもの（'Q' 本文の借用スライス）であり、保留データの上限は
+            // `MAX_MESSAGE_LEN` と `MAX_STATEMENTS_PER_QUERY` で構造的に有界（新規確保なし）。
+            match run_copy_statement_as(stream, engine, ctx, session, txn, stmt, finish, role)? {
+                crate::copy::CopyStep::Completed { .. } => {
+                    if !is_last && !txn.is_implicit_active() {
+                        respond_error(stream, ErrorClass::InternalError, "internal error")?;
+                        *session = snapshot.clone();
+                        finish_failed(stream, session, txn)?;
+                        return Ok(LoopSignal::Continue);
+                    }
+                    continue;
+                }
+                crate::copy::CopyStep::Failed => {
+                    *session = snapshot.clone();
+                    finish_failed(stream, session, txn)?;
+                    return Ok(LoopSignal::Continue);
+                }
+                crate::copy::CopyStep::Closed => return Ok(LoopSignal::Closed),
+            }
+        }
         match run_statement_as(stream, engine, ctx, session, txn, stmt, finish, role)? {
             StatementStatus::Completed => {
                 if !is_last && !txn.is_implicit_active() {
@@ -411,8 +415,8 @@ fn run_implicit_statements<'e, S: WireStream>(
 /// `Failed` 中の COPY も autocommit として実行させない）:
 /// - `Idle`・明示トランザクション中の `InTransaction`（Issue #1179）:
 ///   [`crate::copy::run`] へ委譲する。
-/// - 暗黙トランザクション中の `InTransaction`: 未対応。`fail()` の後に `0A000`。
-///   暗黙トランザクションでは `fail()` が `Idle` へ戻すので `ReadyForQuery('I')`。
+/// - 暗黙トランザクション中の `InTransaction`: 本関数（`Standalone`）では未対応で
+///   `fail()` の後に `0A000`。複数文メッセージは [`run_copy_statement_as`] で役割を渡して委譲する。
 /// - `Failed`: 他の文と同じく `25P02`（期限切れ未報告なら `54000`）で拒否する。
 ///
 /// 拡張クエリの Execute（Issue #1760）も `Finish::Continue` で本関数を呼び、gating を共有する。
@@ -425,19 +429,49 @@ pub(crate) fn run_copy_statement<'e, S: WireStream>(
     stmt: &str,
     finish: Finish,
 ) -> io::Result<crate::copy::CopyStep> {
+    run_copy_statement_as(
+        stream,
+        engine,
+        ctx,
+        session,
+        txn,
+        stmt,
+        finish,
+        StatementRole::Standalone,
+    )
+}
+
+/// [`run_copy_statement`] の本体。`role` は暗黙トランザクション（WIRE-20・Issue #1773）内の
+/// 位置で、`Standalone` 以外のときだけ暗黙トランザクション中の COPY を [`crate::copy::run`]
+/// へ委譲する。`Standalone` のまま暗黙トランザクションに到達した場合は本来起きないため、
+/// 従来どおり `0A000` で拒否する（fail-closed の防御）。
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn run_copy_statement_as<'e, S: WireStream>(
+    stream: &mut S,
+    engine: &'e EngineCore,
+    ctx: &PolicyContext,
+    session: &mut SessionState,
+    txn: &mut SessionTransaction<'e>,
+    stmt: &str,
+    finish: Finish,
+    role: StatementRole,
+) -> io::Result<crate::copy::CopyStep> {
     use engine::sql::transaction::TransactionStatus;
     match txn.status() {
         TransactionStatus::Idle => {
-            crate::copy::run(stream, engine, ctx, session, txn, stmt, finish)
+            crate::copy::run(stream, engine, ctx, session, txn, stmt, finish, role)
         }
         // 明示トランザクション中の COPY は共有書き込みトランザクションへ委譲する
         // （Issue #1179。`COPY FROM STDIN` は複数行 INSERT、`COPY ... TO STDOUT` は
         // 読み取り。失敗時は `copy::run` がトランザクションを `Failed` へ遷移させる）。
         TransactionStatus::InTransaction if !txn.is_implicit_active() => {
-            crate::copy::run(stream, engine, ctx, session, txn, stmt, finish)
+            crate::copy::run(stream, engine, ctx, session, txn, stmt, finish, role)
         }
-        // 暗黙トランザクション（Issue #1175）中の COPY は未対応（原子性を優先し、
-        // CopyIn へは入らずメッセージ全体をロールバックする）。
+        // 暗黙トランザクション（Issue #1175）中の COPY は、複数文メッセージ側が役割を
+        // 渡した場合（WIRE-20・Issue #1773）に限り委譲する。
+        TransactionStatus::InTransaction if role != StatementRole::Standalone => {
+            crate::copy::run(stream, engine, ctx, session, txn, stmt, finish, role)
+        }
         TransactionStatus::InTransaction => {
             txn.fail();
             respond_error(
@@ -582,7 +616,7 @@ fn run_statement<'e, S: WireStream>(
 /// 文が暗黙トランザクション（Issue #1175）の中でどの位置にあるか。commit を行う
 /// 区間と緊急応答の登録区間を一致させるために [`run_statement_as`] が使う。
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-enum StatementRole {
+pub(crate) enum StatementRole {
     /// 暗黙トランザクション外の文（単一文・逐次実行の各文）。
     Standalone,
     /// 暗黙トランザクションの最後以外の文。commit は起きないので、緊急応答の登録・
