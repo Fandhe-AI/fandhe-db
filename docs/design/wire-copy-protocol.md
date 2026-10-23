@@ -477,7 +477,7 @@ binary COPY 形式で結果を返す。`COPY FROM` の binary は Issue #1769 �
 
 ## Issue #1774: 複数文メッセージ中の COPY の原子性とエラー伝播（親 #1772・WIRE-20 ポインタ）
 
-#1773 の実装に対し、失敗要因と COPY の位置の組み合わせを層 A（`wire20_copy_atomicity.rs`）で固定した。
+Issue #1773 の実装に対し、失敗要因と COPY の位置の組み合わせを層 A（`wire20_copy_atomicity.rs`）で固定した。
 実装コードの変更は不要だった（各失敗経路が `fail()`／`abort_implicit()` を通り `Idle`／`Failed` へ収束する）。
 
 暗黙トランザクション（`Idle` から開始。いずれも `ErrorResponse` の後に `ReadyForQuery('I')` が 1 回だけ来て、
