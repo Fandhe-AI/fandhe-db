@@ -58,6 +58,12 @@
 //!    受理の判定は `noneq_leaf_at` に集約する。逆向き（`$n < <列>`）・片側だけが `$n` の
 //!    `BETWEEN`・相手がリテラル／式の比較は `42601` のまま。
 //!
+//! 10. `SELECT／UPDATE／DELETE ... WHERE <列> IS [NOT] DISTINCT FROM $n`（Issue #1783・SQL-54・
+//!     WIRE-12 のポインタ。パターン 9 と同じ文種・`WHERE` 領域・左右の境界規則で、左辺が列・右辺が
+//!     `$n` 単独の形だけ。`$n` の型は左辺の列の型で、列を引けなければ `text`。Describe 用ダミーは
+//!     列型に依らず束縛が通るよう `NULL` へ置換する）。逆向き（`$n IS DISTINCT FROM <列>`）・
+//!     両辺 `$n`・式の内側の `$n` は `42601` のまま。判定は `noneq_leaf_at` に集約する。
+//!
 //! `LIMIT $n`・`USING MODE $n`・`HINT ORDER($n, ...)`・`SET search_mode = $n`・
 //! `ON CONFLICT ... DO UPDATE SET a = $n`（`$n` 単独の右辺。加算形はパターン 8）・hybrid 関数
 //! 引数（`HYBRID_RRF(col, $n, ...)`）・パターン 9 以外の非等価比較（`id > $n` 等）はいずれも
@@ -469,7 +475,9 @@ fn where_literal_flags_in_region(tokens: &[Token], kinds: &[ParamLiteralKind]) -
                         flags.push(a && b);
                     }
                 }
-                NoneqLeafKind::ParamPair { .. } => {}
+                // `IS [NOT] DISTINCT FROM` は等価の葉ではなく、`$n` は NULL ダミーへ置換される
+                // ため序数に数えない（パターン 10）。
+                NoneqLeafKind::ParamPair { .. } | NoneqLeafKind::DistinctFrom { .. } => {}
             }
             i = leaf.next;
             continue;
@@ -502,6 +510,8 @@ enum NoneqLeafKind {
     Between { col: usize, low: usize, high: usize },
     /// `$lhs op $rhs`（両辺とも `$n`）。
     ParamPair { lhs: usize, rhs: usize },
+    /// `<col> IS [NOT] DISTINCT FROM $n`（パターン 10。Issue #1783・SQL-54）。
+    DistinctFrom { col: usize, rhs: usize },
 }
 
 /// 葉の左端 `i` の直前が、単独の述語の始まりを示すトークンか
@@ -573,6 +583,28 @@ fn noneq_leaf_at(tokens: &[Token], i: usize, start: usize, end: usize) -> Option
                     next: rhs + 1,
                 });
             }
+            // パターン 10: `<col> IS [NOT] DISTINCT FROM $n`（右辺は `$n` 単独で直後が右境界）。
+            if ident_eq_ignore_case(tokens.get(i + 1), "IS") {
+                let mut d = i + 2;
+                if ident_eq_ignore_case(tokens.get(d), "NOT") {
+                    d += 1;
+                }
+                if !(ident_eq_ignore_case(tokens.get(d), "DISTINCT")
+                    && matches!(
+                        tokens.get(d + 1),
+                        Some(Token::Keyword(crate::sql::lexer::Keyword::From))
+                    ))
+                {
+                    return None;
+                }
+                let rhs = d + 2;
+                return (matches!(tokens.get(rhs), Some(Token::Param(_)))
+                    && is_noneq_right_boundary(tokens, rhs + 1, end))
+                .then_some(NoneqLeaf {
+                    kind: NoneqLeafKind::DistinctFrom { col: i, rhs },
+                    next: rhs + 1,
+                });
+            }
             let mut k = i + 1;
             if ident_eq_ignore_case(tokens.get(k), "NOT") {
                 k += 1;
@@ -629,9 +661,16 @@ fn has_set_operator_branch(tokens: &[Token]) -> bool {
 /// 構文処理は文字列／数値境界のみを受理するため）。
 fn where_noneq_param_slots_and_bounds(
     tokens: &[Token],
-) -> (HashMap<usize, WhereParamShape>, HashSet<usize>) {
+) -> (
+    HashMap<usize, WhereParamShape>,
+    HashSet<usize>,
+    HashSet<usize>,
+) {
     let mut out = HashMap::new();
     let mut bounds = HashSet::new();
+    // パターン 10（`IS [NOT] DISTINCT FROM $n`）の `$n` のトークン添字。Describe 用ダミーを
+    // `NULL` へ置換する位置の判定に使う。
+    let mut distinct = HashSet::new();
     // 先頭語の明示 allowlist（`SELECT`・`UPDATE`・`DELETE`）。`INSERT ... ON CONFLICT DO UPDATE
     // ... WHERE`・`WITH`・`EXPLAIN` 等は対象外のまま `42601` に倒す（fail-closed）。
     let head_ok = matches!(
@@ -640,10 +679,10 @@ fn where_noneq_param_slots_and_bounds(
     ) || ident_eq_ignore_case(tokens.first(), "UPDATE")
         || ident_eq_ignore_case(tokens.first(), "DELETE");
     if !head_ok || has_set_operator_branch(tokens) {
-        return (out, bounds);
+        return (out, bounds, distinct);
     }
     let Some((start, end)) = where_region(tokens) else {
-        return (out, bounds);
+        return (out, bounds, distinct);
     };
     let column_of = |idx: usize| match tokens.get(idx) {
         Some(Token::Ident(c) | Token::QuotedNull(c)) => Some(WhereParamShape::Column(c.clone())),
@@ -677,10 +716,16 @@ fn where_noneq_param_slots_and_bounds(
                 out.insert(lhs, WhereParamShape::Indeterminate);
                 out.insert(rhs, WhereParamShape::Indeterminate);
             }
+            NoneqLeafKind::DistinctFrom { col, rhs } => {
+                if let (Some(shape), Some(Token::Param(_))) = (column_of(col), tokens.get(rhs)) {
+                    out.insert(rhs, shape);
+                    distinct.insert(rhs);
+                }
+            }
         }
         i = leaf.next;
     }
-    (out, bounds)
+    (out, bounds, distinct)
 }
 
 /// 番号 `n`（1 始まり）の置換リテラル種別。範囲外・0 は `String`（fail-closed）。
@@ -1866,8 +1911,13 @@ pub fn substitute_dummy(tokens: &[Token]) -> Vec<Token> {
 /// `Number("0")`、`Boolean` 種別は `Ident("false")` のダミーへ置換し、数値・真偽値
 /// 列の位置でも Describe 用の構造検証が通るようにする。
 pub(crate) fn substitute_dummy_typed(tokens: &[Token], kinds: &[ParamLiteralKind]) -> Vec<Token> {
-    let between_bounds = where_noneq_param_slots_and_bounds(tokens).1;
+    let (_, between_bounds, distinct_slots) = where_noneq_param_slots_and_bounds(tokens);
     substitute_with(tokens, |n, i| {
+        // パターン 10: `IS [NOT] DISTINCT FROM $n` は列型に依らず束縛が通る `NULL` ダミーにする
+        // （`'0'` だと DATE／UUID 等の列で Describe 用の束縛が `22007`／`22P02` になるため）。
+        if distinct_slots.contains(&i) {
+            return Ok::<_, std::convert::Infallible>(vec![Token::Ident("NULL".to_string())]);
+        }
         Ok::<_, std::convert::Infallible>(vec![match kind_of(kinds, n) {
             ParamLiteralKind::String => Token::StringLiteral("0".to_string()),
             ParamLiteralKind::Integer | ParamLiteralKind::Float => Token::Number("0".to_string()),
@@ -1907,7 +1957,7 @@ pub(crate) fn substitute_values_typed(
     values: &[Option<String>],
     kinds: &[ParamLiteralKind],
 ) -> Result<Vec<Token>, SqlSurfaceError> {
-    let between_bounds = where_noneq_param_slots_and_bounds(tokens).1;
+    let (_, between_bounds, _) = where_noneq_param_slots_and_bounds(tokens);
     substitute_with(tokens, |n, ti| {
         let idx = usize::from(n).checked_sub(1).ok_or_else(|| {
             SqlSurfaceError::unsupported("parameter placeholder $0 is not valid".to_string())
@@ -2764,6 +2814,55 @@ mod tests {
         ] {
             assert!(positions(sql).is_ok(), "{sql}");
         }
+    }
+
+    // Issue #1783・SQL-54: `<列> IS [NOT] DISTINCT FROM $n`（パターン 10）の受理・分類・ダミー置換。
+    #[test]
+    fn accepts_is_distinct_from_position_and_infers_column() {
+        for sql in [
+            "SELECT * FROM documents WHERE n IS DISTINCT FROM $1 LIMIT 5",
+            "SELECT * FROM documents WHERE n IS NOT DISTINCT FROM $1 AND m > $2 LIMIT 5",
+            "SELECT * FROM documents WHERE NOT (a = 1 OR n IS DISTINCT FROM $1) LIMIT 5",
+            "UPDATE documents SET s = 'x' WHERE n IS NOT DISTINCT FROM $1 USING OPERATION_ID 'x'",
+            "DELETE FROM documents WHERE n IS DISTINCT FROM $1 RETURNING n",
+        ] {
+            assert!(positions(sql).is_ok(), "{sql}");
+        }
+        let got = positions_of("SELECT * FROM documents WHERE s IS NOT DISTINCT FROM $1 LIMIT 5");
+        assert_eq!(got, vec![vec![ParamPosition::WhereColumn("s".to_string())]]);
+    }
+
+    #[test]
+    fn rejects_is_distinct_from_positions_outside_pattern_10() {
+        for sql in [
+            // 逆向き・両辺 `$n`・式の内側・型変換・右辺の続き
+            "SELECT * FROM documents WHERE $1 IS DISTINCT FROM n LIMIT 5",
+            "SELECT * FROM documents WHERE $1 IS DISTINCT FROM $2 LIMIT 5",
+            "SELECT * FROM documents WHERE n + 1 IS DISTINCT FROM $1 LIMIT 5",
+            "SELECT * FROM documents WHERE n IS DISTINCT FROM $1 + 1 LIMIT 5",
+            "SELECT * FROM documents WHERE n IS DISTINCT FROM $1::int LIMIT 5",
+            // 集合演算・INSERT ... ON CONFLICT DO UPDATE ... WHERE は対象外
+            "SELECT n FROM a WHERE n IS DISTINCT FROM $1 UNION SELECT n FROM b",
+        ] {
+            assert!(positions(sql).is_err(), "{sql}");
+        }
+    }
+
+    /// Describe 用ダミーは列型に依らず `NULL` に置換される（序数フラグは増えない）。
+    #[test]
+    fn is_distinct_from_dummy_is_null_and_not_counted_as_equality_literal() {
+        let sql = "SELECT * FROM t WHERE a = $1 AND d IS NOT DISTINCT FROM $2";
+        let tokens = crate::sql::lexer::tokenize_with_params(sql).expect("tokenize");
+        let dummy = substitute_dummy_typed(&tokens, &[]);
+        assert!(
+            dummy.contains(&Token::Ident("NULL".to_string())),
+            "{dummy:?}"
+        );
+        assert!(dummy.contains(&Token::StringLiteral("0".to_string())));
+        assert_eq!(
+            where_equality_literal_is_param_typed(&tokens, &[]),
+            vec![true]
+        );
     }
 
     #[test]

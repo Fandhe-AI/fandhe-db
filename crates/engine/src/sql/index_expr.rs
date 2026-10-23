@@ -321,6 +321,11 @@ pub(crate) fn check_index_expression_determinism(
             check_index_expression_determinism(a, site)?;
             check_index_expression_determinism(b, site)
         }
+        // `IS [NOT] DISTINCT FROM` は索引の式・述語では対象外（fail-closed。設計文書の対象外節）。
+        Expr::IsDistinctFrom { .. } => Err(SqlSurfaceError::FeatureNotSupported {
+            detail: "IS [NOT] DISTINCT FROM is not supported in an index expression or predicate"
+                .to_string(),
+        }),
         Expr::Collate { expr, .. } | Expr::Cast { expr, .. } => {
             check_index_expression_determinism(expr, site)
         }
@@ -424,7 +429,9 @@ pub(crate) fn expr_contains_collate(expr: &Expr) -> bool {
         Expr::Coalesce(items) | Expr::ArrayConstructor(items) => {
             items.iter().any(expr_contains_collate)
         }
-        Expr::NullIf(a, b) => expr_contains_collate(a) || expr_contains_collate(b),
+        Expr::NullIf(a, b) | Expr::IsDistinctFrom { lhs: a, rhs: b, .. } => {
+            expr_contains_collate(a) || expr_contains_collate(b)
+        }
         Expr::Cast { expr, .. } => expr_contains_collate(expr),
         Expr::SqlJsonQuery(q) => q.children().into_iter().any(expr_contains_collate),
         Expr::Subscript { base, subscript } => {
@@ -544,6 +551,11 @@ pub(crate) fn fold_session_local_literals(expr: &Expr) -> Result<Expr, SqlSurfac
         }
         Expr::Coalesce(args) => Expr::Coalesce(args.iter().map(rec).collect::<Result<_, _>>()?),
         Expr::NullIf(a, b) => Expr::NullIf(Box::new(rec(a)?), Box::new(rec(b)?)),
+        Expr::IsDistinctFrom { negated, lhs, rhs } => Expr::IsDistinctFrom {
+            negated: *negated,
+            lhs: Box::new(rec(lhs)?),
+            rhs: Box::new(rec(rhs)?),
+        },
         Expr::Collate { expr, collation } => Expr::Collate {
             expr: Box::new(rec(expr)?),
             collation: *collation,
@@ -690,7 +702,7 @@ pub(crate) fn check_bound_index_expression_determinism(
             }
             items.iter().try_for_each(rec)
         }
-        Expr::NullIf(a, b) => {
+        Expr::NullIf(a, b) | Expr::IsDistinctFrom { lhs: a, rhs: b, .. } => {
             if tz_vs_string_literal(a, b, ty_of(a), ty_of(b)) {
                 return Err(not_immutable());
             }

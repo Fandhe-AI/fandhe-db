@@ -8654,7 +8654,7 @@ pub(crate) fn collect_expr_idents(expr: &Expr, out: &mut std::collections::HashS
                 collect_expr_idents(arg, out);
             }
         }
-        Expr::NullIf(lhs, rhs) => {
+        Expr::NullIf(lhs, rhs) | Expr::IsDistinctFrom { lhs, rhs, .. } => {
             collect_expr_idents(lhs, out);
             collect_expr_idents(rhs, out);
         }
@@ -9407,6 +9407,11 @@ fn rewrite_group_row_idents(
         }
         Expr::Coalesce(args) => Expr::Coalesce(args.iter().map(rec).collect::<Result<_, _>>()?),
         Expr::NullIf(a, b) => Expr::NullIf(Box::new(rec(a)?), Box::new(rec(b)?)),
+        Expr::IsDistinctFrom { negated, lhs, rhs } => Expr::IsDistinctFrom {
+            negated: *negated,
+            lhs: Box::new(rec(lhs)?),
+            rhs: Box::new(rec(rhs)?),
+        },
         Expr::Collate { expr, collation } => Expr::Collate {
             expr: Box::new(rec(expr)?),
             collation: *collation,

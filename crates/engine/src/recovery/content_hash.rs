@@ -2538,7 +2538,7 @@ fn collect_referenced_udfs(
             }
             Ok(())
         }
-        Expr::NullIf(lhs, rhs) => {
+        Expr::NullIf(lhs, rhs) | Expr::IsDistinctFrom { lhs, rhs, .. } => {
             collect_referenced_udfs(lhs, udf_registry, out)?;
             collect_referenced_udfs(rhs, udf_registry, out)
         }
@@ -2639,6 +2639,7 @@ fn push_set_expr(
             }
             Expr::Binary { lhs, rhs, .. }
             | Expr::NullIf(lhs, rhs)
+            | Expr::IsDistinctFrom { lhs, rhs, .. }
             | Expr::JsonAccess { lhs, rhs, .. } => {
                 walk(b, lhs);
                 walk(b, rhs);
@@ -2818,6 +2819,15 @@ fn push_dml_expr(
         }
         Expr::NullIf(lhs, rhs) => {
             b.push_u8(8);
+            push_dml_expr(b, lhs, params)?;
+            push_dml_expr(b, rhs, params)?;
+        }
+        // タグ 20（対象ビヘイビア: SQL-54。Issue #1783。変更禁止）。`IS [NOT] DISTINCT FROM` を
+        // 「negated 1 バイト（0=IS DISTINCT・1=IS NOT DISTINCT）・左辺・右辺」の順で直列化する。
+        // 否定の有無・左右の入れ替えを同一内容と誤判定しない（RECOVER-10）。既存タグは不変。
+        Expr::IsDistinctFrom { negated, lhs, rhs } => {
+            b.push_u8(20);
+            b.push_u8(u8::from(*negated));
             push_dml_expr(b, lhs, params)?;
             push_dml_expr(b, rhs, params)?;
         }
@@ -5233,6 +5243,44 @@ mod tests {
         assert_ne!(h_coalesce, h_nullif);
         assert_ne!(h_coalesce, h_coalesce_reordered);
         assert_eq!(h_null, h_null_again);
+    }
+
+    /// `Expr::IsDistinctFrom`（タグ 20。SQL-54・Issue #1783）は、否定の有無・左右の入れ替え・
+    /// 他の 2 項ノード（`NullIf`）と異なるハッシュを持ち、同一内容は同一ハッシュになる。
+    #[test]
+    fn is_distinct_from_hash_distinguishes_negation_and_operand_order() {
+        use crate::sql::udf_call::{Expr, UdfRegistry};
+
+        let registry = UdfRegistry::default();
+        let n = || Box::new(Expr::Ident("n".to_string()));
+        let m = || Box::new(Expr::Ident("m".to_string()));
+        let hash =
+            |e: Expr| for_delete_where("t", &[where_predicate_id_gt_zero(e)], &registry).unwrap();
+        let base = hash(Expr::IsDistinctFrom {
+            negated: false,
+            lhs: n(),
+            rhs: m(),
+        });
+        let negated = hash(Expr::IsDistinctFrom {
+            negated: true,
+            lhs: n(),
+            rhs: m(),
+        });
+        let swapped = hash(Expr::IsDistinctFrom {
+            negated: false,
+            lhs: m(),
+            rhs: n(),
+        });
+        let nullif = hash(Expr::NullIf(n(), m()));
+        let again = hash(Expr::IsDistinctFrom {
+            negated: false,
+            lhs: n(),
+            rhs: m(),
+        });
+        assert_ne!(base, negated);
+        assert_ne!(base, swapped);
+        assert_ne!(base, nullif);
+        assert_eq!(base, again);
     }
 
     /// ADR §4.4.1「WASM UDF は本節の対象外」の拒否判定（`collect_referenced_udfs` の

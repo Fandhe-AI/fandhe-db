@@ -287,6 +287,9 @@ impl Inferrer<'_> {
             }
             Expr::Coalesce(args) => self.sibling_type(args.iter()),
             Expr::NullIf(a, b) => self.sibling_type([a.as_ref(), b.as_ref()].into_iter()),
+            // `IS [NOT] DISTINCT FROM`（SQL-54）は比較と同じく結果が真偽値のため、兄弟の
+            // 型付けには使わない（型なし）。
+            Expr::IsDistinctFrom { .. } => Ty::Untyped,
             Expr::Null => Ty::Untyped,
             // 照合指定（TABLE-28・Issue #1609）は内側の式と同じ型。
             Expr::Collate { expr, .. } => self.type_of(expr),
@@ -465,6 +468,13 @@ impl Inferrer<'_> {
                 self.walk_siblings(&refs)?;
             }
             Expr::NullIf(a, b) => self.walk_siblings(&[a.as_ref(), b.as_ref()])?,
+            // `IS [NOT] DISTINCT FROM`（SQL-54）の `$n` 推論は `=` 比較と同じ扱い（被演算子の型を
+            // 相手側へ割り当てる）。
+            Expr::IsDistinctFrom { lhs, rhs, .. } => self.walk(&Expr::Binary {
+                op: BinOp::Eq,
+                lhs: lhs.clone(),
+                rhs: rhs.clone(),
+            })?,
             // jsonb パス演算子の被演算子に `$n` は置けない（型を推論できないため
             // `Untyped` として割り当て、不定扱い。Issue #1596）。
             Expr::JsonAccess { lhs, rhs, .. } => {
