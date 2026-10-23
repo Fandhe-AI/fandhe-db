@@ -173,6 +173,8 @@ fn for_each_expr(
     for predicate in predicates {
         match predicate {
             WherePredicate::Expression(expr) => f(expr)?,
+            // SQL-54（Issue #1781）: 式左辺の LIKE も式として走査する（検査の迂回防止）。
+            WherePredicate::Prefix { lhs, .. } if lhs.as_bare_column().is_none() => f(lhs)?,
             WherePredicate::Not(inner) => for_each_expr(std::slice::from_ref(inner), f)?,
             WherePredicate::Or(branches) => {
                 for branch in branches {

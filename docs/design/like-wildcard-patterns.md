@@ -185,6 +185,17 @@ m は `MAX_LIKE_PATTERN_LEN` で定数に抑える）。
 - 対象外（`42601` のまま）: JOIN の WHERE と `UPDATE … FROM`／`DELETE … USING`、NoSQL `filter` の
   `like` への escape 指定、`ESCAPE` の値が式・`$n`・`NULL` の形。
 
+### 実装メモ（Issue #1781）
+
+- `WherePredicate::Prefix` の左辺を `column: String` から `lhs: Expr` に変えた（挙動不変の refactor。SQL-54 ポインタ）。
+  構文層が作る左辺は引き続き裸の列（`Expr::Ident`）だけ。
+- 裸の列かどうかは `Expr::as_bare_column()` に集約する。宣言的フィルタ（`MetadataFilter`）への束縛と
+  スカラー索引の候補抽出は、左辺が裸の列のときだけ従来経路に乗る。
+- 台帳の content_hash は裸の列なら従来のバイト列（タグ 2／16）のまま。式左辺には新タグを割り当てない。
+- 式左辺は束縛段・content_hash・NoSQL の update/delete ゲート・ビュー本体・CHECK で `42601`（fail-closed）。
+  列スコープ検査・決定性検査・ON CONFLICT の式走査は式左辺を式として辿る。
+- 式左辺の受理・評価・タグ割り当ては #1782 の責務。`lower(name) LIKE 'a%'` は本 Issue 時点では `42601` のまま。
+
 ## PostgreSQL との差分（既知の簡略化）
 
 - `ESCAPE` 付きのパターンは、正規化後（`\` を多く含むと最大 2 倍）の長さが 4096 バイトを超えると

@@ -188,7 +188,7 @@ fn accepts_not_like_as_negated_prefix_against_real_catalog() {
         stmt.where_predicates(),
         vec![engine::sql::allowlist::WherePredicate::Not(Box::new(
             engine::sql::allowlist::WherePredicate::Prefix {
-                column: "lang".to_string(),
+                lhs: engine::sql::udf_call::Expr::Ident("lang".to_string()),
                 pattern: "j%".to_string(),
                 case_insensitive: false,
             }

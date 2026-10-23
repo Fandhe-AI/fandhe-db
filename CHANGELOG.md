@@ -44,6 +44,10 @@
 - `sql::allowlist::SqlSurfaceError`（Issue #1792・SQL-56 (2)）: variant `OrderByPositionNotInSelectList { position: i64 }`
   （`42P10`。`ORDER BY` の序数が出力列の範囲外）を追加した。列挙型を網羅的に `match` する外部コードは
   コンパイルできなくなる。移行: 腕を追加する（`wire_code()`／`classify()` 経由で扱うコードは変更不要）。
+- `sql::allowlist::WherePredicate::Prefix`（Issue #1781・SQL-54）: フィールド `column: String` を `lhs: Expr`
+  （左辺の式ノード）へ置き換えた。構文層が生成する左辺は引き続き裸の列だけで、挙動は変わらない。
+  構築側は `lhs: Expr::Ident(col)`、分解側は `Expr::as_bare_column()` か `..` を使う。
+  あわせて `Expr::as_bare_column()` を追加した。
 - `sql::allowlist::WherePredicate::Prefix`（Issue #1778・SQL-54）: 必須フィールド `case_insensitive: bool` を追加した
   （`ILIKE` のとき真）。構築する外部コードと、全フィールドを列挙して分解するコードはコンパイルできなくなる。
   移行: 構築側は `case_insensitive: false` を足し、分解側は `..` を付ける。あわせて

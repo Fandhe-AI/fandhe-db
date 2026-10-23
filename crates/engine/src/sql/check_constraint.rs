@@ -49,12 +49,16 @@ fn render_predicate(predicate: &WherePredicate) -> String {
             format!("{column} = '{}'", escape_literal(value))
         }
         WherePredicate::Prefix {
-            column,
+            lhs,
             pattern,
             case_insensitive,
         } => {
             let kw = if *case_insensitive { "ILIKE" } else { "LIKE" };
-            format!("{column} {kw} '{}'", escape_literal(pattern))
+            let lhs_sql = match lhs.as_bare_column() {
+                Some(column) => column.to_string(),
+                None => render_expr(lhs),
+            };
+            format!("{lhs_sql} {kw} '{}'", escape_literal(pattern))
         }
         WherePredicate::PredicateCall { name } => format!("{name}()"),
         WherePredicate::BoolEquality { column, value } => {
@@ -539,10 +543,16 @@ fn reject_forbidden_elements(predicates: &[WherePredicate]) -> Result<(), SqlSur
                 ));
             }
             WherePredicate::Equality { .. }
-            | WherePredicate::Prefix { .. }
             | WherePredicate::BoolEquality { .. }
             | WherePredicate::BoolColumn { .. }
             | WherePredicate::Compare { .. } => {}
+            WherePredicate::Prefix { lhs, .. } if lhs.as_bare_column().is_some() => {}
+            // 式左辺の LIKE（SQL-54、Issue #1781）は CHECK では未対応のため fail-closed。
+            WherePredicate::Prefix { .. } => {
+                return Err(SqlSurfaceError::unsupported(
+                    "LIKE with a non-column left operand is not supported in CHECK constraints",
+                ));
+            }
             // `parse_check_clause` が構文段で既に拒否するため到達しない
             // （TASK-208・Issue #912）。防御的に fail-closed で拒否する。
             WherePredicate::Or(_) => {
@@ -964,11 +974,14 @@ pub(crate) fn map_predicate_columns(
             value: value.clone(),
         },
         WherePredicate::Prefix {
-            column,
+            lhs,
             pattern,
             case_insensitive,
         } => WherePredicate::Prefix {
-            column: col(column),
+            lhs: match lhs.as_bare_column() {
+                Some(column) => Expr::Ident(f(column)),
+                None => map_expr_idents(lhs, f),
+            },
             pattern: pattern.clone(),
             case_insensitive: *case_insensitive,
         },

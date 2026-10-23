@@ -1990,8 +1990,14 @@ pub enum WherePredicate {
     /// `case_insensitive` を追加した（`ILIKE` のとき真。意味論は
     /// `declarative_filter::DeclarativeFilter::ilike` の責務。構築側は
     /// `case_insensitive: false` を足し、分解側は `..` を付ける）。
+    ///
+    /// **SQL-54（Issue #1781）で追加した破壊的変更（BREAKING CHANGE）**:
+    /// `column: String` を `lhs: Expr`（左辺の式ノード）へ置き換えた。裸の列は
+    /// `Expr::Ident(col)` で表し、構築側は `lhs: Expr::Ident(col)`、分解側は
+    /// [`Expr::as_bare_column`] か `..` を使う。スカラー索引の候補抽出・宣言的フィルタへの
+    /// 束縛は左辺が裸の列のときだけ働く。構文層は引き続き裸の列しか生成しない。
     Prefix {
-        column: String,
+        lhs: Expr,
         pattern: String,
         case_insensitive: bool,
     },
@@ -7212,7 +7218,7 @@ impl<'a> Parser<'a> {
             let pattern = self.expect_string_literal()?;
             let pattern = self.consume_like_escape_clause(pattern)?;
             return Ok(Some(WherePredicate::Prefix {
-                column: name,
+                lhs: Expr::Ident(name),
                 pattern,
                 case_insensitive,
             }));
@@ -7234,7 +7240,7 @@ impl<'a> Parser<'a> {
             let pattern = self.consume_like_escape_clause(pattern)?;
             return Ok(Some(WherePredicate::Not(Box::new(
                 WherePredicate::Prefix {
-                    column: name,
+                    lhs: Expr::Ident(name),
                     pattern,
                     case_insensitive,
                 },
@@ -13223,13 +13229,14 @@ pub(crate) fn parse_view_body(tokens: &[Token]) -> Result<ParsedViewBody, SqlSur
     for pred in &where_predicates {
         match pred {
             WherePredicate::Equality { .. }
-            | WherePredicate::Prefix { .. }
             | WherePredicate::BoolEquality { .. }
             | WherePredicate::BoolColumn { .. }
             | WherePredicate::Compare { .. } => {}
+            WherePredicate::Prefix { lhs, .. } if lhs.as_bare_column().is_some() => {}
             // SQL-24（TASK-208 ポインタ）: ビュー本体の `WHERE` は本 Issue の
             // スコープ外のまま据え置く（fail-closed。対応は別 Issue へ申し送り）。
             WherePredicate::PredicateCall { .. }
+            | WherePredicate::Prefix { .. }
             | WherePredicate::Expression(_)
             | WherePredicate::InList { .. }
             | WherePredicate::Between { .. }
@@ -13333,7 +13340,6 @@ fn check_buffered_outer_pred(pred: &WherePredicate) -> Result<(), SqlSurfaceErro
             detail: "ILIKE is not supported on a view with an aggregate/LIMIT body".to_string(),
         }),
         WherePredicate::Equality { .. }
-        | WherePredicate::Prefix { .. }
         | WherePredicate::BoolEquality { .. }
         | WherePredicate::BoolColumn { .. }
         | WherePredicate::Compare { .. }
@@ -13341,6 +13347,8 @@ fn check_buffered_outer_pred(pred: &WherePredicate) -> Result<(), SqlSurfaceErro
         | WherePredicate::Between { .. }
         | WherePredicate::IsNull { .. }
         | WherePredicate::Expression(_) => Ok(()),
+        // 式左辺（SQL-54、Issue #1781）は評価経路が未対応のため下の腕で fail-closed 拒否する。
+        WherePredicate::Prefix { lhs, .. } if lhs.as_bare_column().is_some() => Ok(()),
         WherePredicate::Not(inner) => check_buffered_outer_pred(inner),
         WherePredicate::Or(branches) => branches
             .iter()
@@ -13350,6 +13358,7 @@ fn check_buffered_outer_pred(pred: &WherePredicate) -> Result<(), SqlSurfaceErro
         | WherePredicate::InSubquery { .. }
         | WherePredicate::Exists { .. }
         | WherePredicate::IdCompare { .. }
+        | WherePredicate::Prefix { .. }
         | WherePredicate::ScalarSubqueryCompare { .. } => Err(SqlSurfaceError::unsupported(
             "a view with an aggregate/LIMIT body does not support UDF predicates or subqueries in WHERE",
         )),
@@ -13872,7 +13881,10 @@ pub(crate) fn rename_column_in_view_body(
     for pred in &mut body.where_predicates {
         match pred {
             WherePredicate::Equality { column, .. }
-            | WherePredicate::Prefix { column, .. }
+            | WherePredicate::Prefix {
+                lhs: Expr::Ident(column),
+                ..
+            }
             | WherePredicate::BoolEquality { column, .. }
             | WherePredicate::BoolColumn { column }
             | WherePredicate::Compare { column, .. } => {
@@ -13881,6 +13893,7 @@ pub(crate) fn rename_column_in_view_body(
             WherePredicate::Or(branches) if branches.is_empty() => {}
             WherePredicate::Or(_)
             | WherePredicate::PredicateCall { .. }
+            | WherePredicate::Prefix { .. }
             | WherePredicate::Expression(_)
             | WherePredicate::InList { .. }
             | WherePredicate::Between { .. }
@@ -13950,13 +13963,18 @@ fn render_where_predicate(pred: &WherePredicate) -> String {
         // `declarative_filter::DeclarativeFilter::like` の責務で、ここでは
         // 追加のワイルドカードを付与しない。
         WherePredicate::Prefix {
-            column,
+            lhs,
             pattern,
             case_insensitive,
         } => {
+            // 裸の列は従来の引用規則、式左辺（SQL-54、Issue #1781）は式描画器で描く。
+            let lhs_sql = match lhs.as_bare_column() {
+                Some(column) => render_column_name(column),
+                None => crate::sql::check_constraint::render_expr(lhs),
+            };
             format!(
                 "{} {} '{}'",
-                render_column_name(column),
+                lhs_sql,
                 if *case_insensitive { "ILIKE" } else { "LIKE" },
                 escape_string_literal(pattern)
             )
@@ -22754,7 +22772,7 @@ mod tests {
                  ORDER BY embedding <=> '[0.1]' LIMIT 5"
             ),
             vec![WherePredicate::Not(Box::new(WherePredicate::Prefix {
-                column: "path".to_string(),
+                lhs: crate::sql::udf_call::Expr::Ident("path".to_string()),
                 pattern: "src/%".to_string(),
                 case_insensitive: false,
             }))]
@@ -22764,7 +22782,7 @@ mod tests {
     #[test]
     fn accepts_ilike_and_not_ilike_as_case_insensitive_prefix() {
         let leaf = WherePredicate::Prefix {
-            column: "path".to_string(),
+            lhs: crate::sql::udf_call::Expr::Ident("path".to_string()),
             pattern: "Src/%".to_string(),
             case_insensitive: true,
         };
@@ -23227,7 +23245,7 @@ mod tests {
                  ORDER BY embedding <=> '[0.1]' LIMIT 5"
             ),
             vec![WherePredicate::Prefix {
-                column: "in".to_string(),
+                lhs: crate::sql::udf_call::Expr::Ident("in".to_string()),
                 pattern: "a%".to_string(),
                 case_insensitive: false,
             }]
