@@ -1527,8 +1527,8 @@ fn tokenize_like_pattern(pattern: &str) -> Result<Vec<LikeToken>, SqlSurfaceErro
             '\\' => match chars.next() {
                 Some(escaped) => tokens.push(LikeToken::Char(escaped)),
                 None => {
-                    return Err(SqlSurfaceError::invalid_input(
-                        "LIKE pattern must not end with a trailing escape character '\\'",
+                    return Err(SqlSurfaceError::invalid_escape_sequence(
+                        "LIKE pattern must not end with escape character",
                     ));
                 }
             },
@@ -1542,6 +1542,61 @@ fn tokenize_like_pattern(pattern: &str) -> Result<Vec<LikeToken>, SqlSurfaceErro
         }
     }
     Ok(tokens)
+}
+
+/// `LIKE ... ESCAPE '<escape>'` のパターンを、既定エスケープ `\` 形へ正規化する
+/// （SQL-54、Issue #1779。構文層 `sql::allowlist` の `LIKE`／`ILIKE` 分岐から呼ばれ、
+/// 戻り値が `WherePredicate::Prefix.pattern` に格納されて以降は ESCAPE 無しの
+/// パターンと同じ経路〔[`parse_like_pattern`]・[`compile_ilike_pattern`]〕で処理される）。
+///
+/// PostgreSQL の `like_escape` と同じ変換規則:
+/// - `escape` が 0 文字: パターン中の `\` をすべて `\\` にする（エスケープ無効。`%`／`_` は
+///   ワイルドカードのまま）。
+/// - `escape` が `\`: 無変換（ESCAPE を書かない場合と同一）。
+/// - `escape` が 1 文字 `e`: 直前がエスケープでない `e` を `\` へ置き換えて「直後リテラル」状態に
+///   入る。`\` は直前がエスケープなら `\` 1 個（`\\`）、そうでなければ `\\`（リテラルの `\`）。
+///   末尾に `e` が残ると変換後は単独の `\` で終わり、トークン化段が `22025` で拒否する。
+/// - `escape` が 2 文字以上は `22025`（`invalid escape string`）。
+///
+/// 長さ上限（[`MAX_LIKE_PATTERN_LEN`]）は確保より前に生パターンへ適用する（出力は最大 2 倍で
+/// 有界。正規化後の長さもトークン化段が再検査する）。エラー文言は固定でパターン・値を含まない。
+pub fn apply_like_escape(pattern: &str, escape: &str) -> Result<String, SqlSurfaceError> {
+    if pattern.len() > MAX_LIKE_PATTERN_LEN {
+        return Err(SqlSurfaceError::payload_too_large(format!(
+            "LIKE pattern length {} exceeds limit {MAX_LIKE_PATTERN_LEN}",
+            pattern.len()
+        )));
+    }
+    let mut esc_chars = escape.chars();
+    let esc = esc_chars.next();
+    if esc_chars.next().is_some() {
+        return Err(SqlSurfaceError::invalid_escape_sequence(
+            "invalid escape string",
+        ));
+    }
+    match esc {
+        Some('\\') => Ok(pattern.to_string()),
+        None => Ok(pattern.replace('\\', "\\\\")),
+        Some(e) => {
+            let mut out = String::with_capacity(pattern.len());
+            let mut after_escape = false;
+            for c in pattern.chars() {
+                if after_escape {
+                    // 直前が ESCAPE 文字: 直後の文字はリテラル。`\` は `\\` の 2 個目になる。
+                    out.push(c);
+                    after_escape = false;
+                } else if c == e {
+                    out.push('\\');
+                    after_escape = true;
+                } else if c == '\\' {
+                    out.push_str("\\\\");
+                } else {
+                    out.push(c);
+                }
+            }
+            Ok(out)
+        }
+    }
 }
 
 /// `ILIKE` の右辺リテラルをコンパイルする（SQL-54、Issue #1778。畳み込み範囲の
@@ -1572,7 +1627,7 @@ pub fn compile_ilike_pattern(pattern: &str) -> Result<LikePattern, SqlSurfaceErr
 /// - `_`: ちょうど 1 文字（Unicode scalar）に一致する。
 /// - `\`: 既定のエスケープ文字。`\%`・`\_`・`\\` はそれぞれリテラルの
 ///   `%`・`_`・`\` として扱い、`\<その他>` はリテラル `<その他>` として扱う。
-///   パターン末尾の単独 `\`（次の文字が無い）は `22000`。
+///   パターン末尾の単独 `\`（次の文字が無い）は `22025`。
 /// - `ESCAPE` 句は未対応（構文層で受理しない。呼び出し元は本関数に到達しない）。
 ///
 /// 長さ検証はアロケーション・パース**より前**に行う（`.claude/rules/
@@ -2638,7 +2693,48 @@ mod tests {
     fn parse_like_pattern_rejects_trailing_backslash() {
         assert_eq!(
             parse_like_pattern("src\\").unwrap_err().wire_code(),
-            "22000"
+            "22025"
+        );
+    }
+
+    #[test]
+    fn apply_like_escape_converts_to_backslash_form() {
+        // 空エスケープ: `\` だけが二重化される。
+        assert_eq!(apply_like_escape("a\\%_", "").unwrap(), "a\\\\%_");
+        // `\` エスケープ: 無変換。
+        assert_eq!(apply_like_escape("a\\%b", "\\").unwrap(), "a\\%b");
+        // 独自エスケープ: `!%` → `\%`、`!!` → `\!`、`!x` → `\x`、素の `\` → `\\`。
+        assert_eq!(apply_like_escape("a!%b", "!").unwrap(), "a\\%b");
+        assert_eq!(apply_like_escape("a!!b", "!").unwrap(), "a\\!b");
+        assert_eq!(apply_like_escape("!x", "!").unwrap(), "\\x");
+        assert_eq!(apply_like_escape("a\\b", "!").unwrap(), "a\\\\b");
+        // エスケープ直後の `\` は `\\`（リテラルのバックスラッシュ）。
+        assert_eq!(apply_like_escape("!\\", "!").unwrap(), "\\\\");
+        // マルチバイトのエスケープ文字。
+        assert_eq!(apply_like_escape("日%a日_", "日").unwrap(), "\\%a\\_");
+    }
+
+    #[test]
+    fn apply_like_escape_rejects_invalid_escape_string_and_over_limit() {
+        assert_eq!(
+            apply_like_escape("a", "ab").unwrap_err().wire_code(),
+            "22025"
+        );
+        let over = "a".repeat(MAX_LIKE_PATTERN_LEN + 1);
+        assert_eq!(
+            apply_like_escape(&over, "!").unwrap_err().wire_code(),
+            "54000"
+        );
+        let at = "a".repeat(MAX_LIKE_PATTERN_LEN);
+        assert!(apply_like_escape(&at, "!").is_ok());
+    }
+
+    #[test]
+    fn apply_like_escape_trailing_escape_fails_at_tokenize() {
+        let normalized = apply_like_escape("abc!", "!").unwrap();
+        assert_eq!(
+            parse_like_pattern(&normalized).unwrap_err().wire_code(),
+            "22025"
         );
     }
 
@@ -2691,7 +2787,7 @@ mod tests {
         );
         assert_eq!(
             compile_ilike_pattern("src\\").unwrap_err().wire_code(),
-            "22000"
+            "22025"
         );
     }
 

@@ -778,7 +778,7 @@ NOSQL-14 で範囲比較・`IN`・`OR` へ拡張。それ以前は `eq`／`prefi
   - `eq`（一致）・`prefix`（前方一致。従来どおり）
   - `ne`（`NOT col = <値>` と同じ。値のレーンは `eq` と同じ。NULL 行は除外）
   - `like`（`TEXT` 列。文字列のみ。`%`・`_`・`\` をワイルドカード・エスケープと
-    して解釈する。列型違反は `22000`、パターン長超過は `54000`）
+    して解釈する。列型違反は `22000`、パターン長超過は `54000`、末尾の単独 `\` は `22025`）
   - `between`（`[low, high]` の要素ちょうど 2 個のスカラー配列。違反は `42601`。
     `DATE`／`TIMESTAMP`／`UUID`／`BYTEA`／`NUMERIC` と `INTEGER`／`BIGINT`／`REAL`／
     `DOUBLE PRECISION`（JSON 数値のみ。`>= low AND <= high` の式レーン）。
@@ -1128,6 +1128,7 @@ Date: <IMF-fixdate>
 | `22015` | `INTERVAL_FIELD_OVERFLOW` | 400 | Bad Request | `INTERVAL` リテラルのフィールド値が範囲外（数値が `i64` に収まらない・単位換算や累積があふれる）。SQL 表層に加え、NoSQL の INTERVAL 列への `insert`／`update`／`filter` の文字列束縛からも到達する（型束縛は #1583 で対応）。Issue #1579 |
 | `22023` | `OPERATION_ID_CONTENT_MISMATCH` | 400 | Bad Request | `insert` の `operation_id` 再送時の内容不一致 |
 | `22023` | `INVALID_PARAMETER_VALUE` | 400 | Bad Request | 型名の引数が範囲外（`FLOAT(p)` の精度。SQL 表層の DDL 専用で、NoSQL の `op` 語彙からは到達しない。Issue #2304） |
+| `22025` | `INVALID_ESCAPE_SEQUENCE` | 400 | Bad Request | `like` op のパターンが末尾の単独 `\`（エスケープの次の文字が無い）で終わる。SQL 表層の `LIKE ... ESCAPE` の不正な ESCAPE 値・末尾エスケープも同じ分類。NoSQL の `like` から到達する。Issue #1779 |
 | `22033` | `JSON_SUBSCRIPT_INVALID` | 400 | Bad Request | jsonpath の配列添字が不正（strict）。engine の jsonpath 評価器の分類で、SQL 表層へは `jsonb_path_*`（#2185）・`@?`／`@@`（#2186）・`JSON_EXISTS` 等（#2187）で配線済み。NoSQL の `op` 語彙からは到達しない。Issue #2184 |
 | `22034` | `MORE_THAN_ONE_SQL_JSON_ITEM` | 400 | Bad Request | SQL/JSON 問い合わせ関数（`JSON_VALUE`・ラッパーなしの `JSON_QUERY`）が単一項目を要する位置で 2 件以上を得た。SQL 表層専用で、NoSQL の `op` 語彙からは到達しない。Issue #2187 |
 | `22035` | `NO_SQL_JSON_ITEM` | 400 | Bad Request | `ERROR ON EMPTY` 指定で path の結果が空だった。SQL 表層専用で、NoSQL の `op` 語彙からは到達しない。Issue #2187 |

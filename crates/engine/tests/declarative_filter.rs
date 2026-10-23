@@ -350,7 +350,7 @@ fn ext3_rls_is_enforced_before_metadata_filter() {
     }
 }
 
-// --- SQL-24・TASK-208、Issue #914: 不正な LIKE パターン形状は 22000 --------------------
+// --- SQL-24・TASK-208、Issue #914: 不正な LIKE パターン形状は 22025（Issue #1779 で 22000 から変更） --------------------
 //
 // EXT-3 時代（Issue #914 以前）はここに掲げた形状（`abc`・`%`・`a%b%`・`a_%`・
 // `a\%`・`%abc`）を前方一致以外として拒否していたが、SQL-24 でこれらはすべて
@@ -359,7 +359,7 @@ fn ext3_rls_is_enforced_before_metadata_filter() {
 // 拒否対象になった形（パターン末尾の単独エスケープ文字）の固定に転用する。
 
 #[test]
-fn ext3_rejects_invalid_like_patterns_with_22000() {
+fn ext3_rejects_invalid_like_patterns_with_22025() {
     let path = unique_db_path("ext3-invalid-like-patterns");
     let _guard = CleanupGuard(path.clone());
     let storage = open_storage(&path);
@@ -374,7 +374,7 @@ fn ext3_rejects_invalid_like_patterns_with_22000() {
             "SELECT * FROM docs WHERE path LIKE '{pattern}' ORDER BY embedding <=> '[1.0,0.0]' LIMIT 10"
         );
         let err = core.execute_sql(&ctx, &sql).unwrap_err_or_else_panic(&sql);
-        assert_eq!(err.wire_code(), "22000", "pattern={pattern:?}");
+        assert_eq!(err.wire_code(), "22025", "pattern={pattern:?}");
     }
 }
 
@@ -458,7 +458,7 @@ fn ext3_wire_code_is_deterministic_across_repeated_calls() {
     let ctx = PolicyContext::new("tenant-a").expect("valid tenant");
     // SQL-24（Issue #914）以降 `LIKE '%'` は非 NULL 全行に一致する受理形へ
     // 変わったため（本ファイルの LIKE '%' 依存テストは
-    // `ext3_rejects_invalid_like_patterns_with_22000` 参照）、決定性の検証は
+    // `ext3_rejects_invalid_like_patterns_with_22025` 参照）、決定性の検証は
     // 引き続き拒否される形（末尾の単独エスケープ文字パターン）に差し替える。
     let sql =
         "SELECT * FROM docs WHERE path LIKE 'src\\' ORDER BY embedding <=> '[1.0,0.0]' LIMIT 10";

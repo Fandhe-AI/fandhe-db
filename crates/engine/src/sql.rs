@@ -114,7 +114,8 @@
 //! `<col> LIKE '<prefix>%'` を追加した（[`allowlist`] が構造を、
 //! `crate::declarative_filter` が意味論を検証する。`LIKE` は末尾ちょうど 1 つの
 //! `%` のみを許可し、`NOT LIKE`・中間 `%`・`_`・エスケープは後続 Issue で受理済み。`ILIKE`／`NOT ILIKE` は
-//! SQL-54〔Issue #1778〕で受理し、ASCII 英字のみ畳み込む）。
+//! SQL-54〔Issue #1778〕で受理し、ASCII 英字のみ畳み込む）。`ESCAPE '<c>'` 句も
+//! SQL-54〔Issue #1779〕で受理する（構文層で既定の `\` 形へ正規化）。
 //! 既存の等価条件 `<col> = '<literal>'`（SQL-2）と合わせ、両者は
 //! `crate::declarative_filter::MetadataFilter`（汎用 API。任意の `TEXT` 列に
 //! 対する宣言的フィルタ）として一本化した（**BREAKING CHANGE**: 旧

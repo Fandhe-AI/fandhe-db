@@ -94,7 +94,7 @@ macro_rules! define_error_classes {
 pub(crate) const SHARED_WIRE_CODES: &[&str] = &["23502", "23505", "22023"];
 
 define_error_classes! {
-    count = 79;
+    count = 80;
 
     /// 構文上受理された SQL の値・引数が不正（`22000`）。
     /// [`crate::sql::allowlist::SqlSurfaceError::InvalidInput`] の写像。
@@ -415,6 +415,12 @@ define_error_classes! {
     /// のポインタ）。照合名は固定の許可リスト由来で、テーブル名・列名・値は文言に含めない。
     /// [`crate::sql::allowlist::SqlSurfaceError::CollationMismatch`] の写像。
     CollationMismatch => ("42P21", "COLLATION_MISMATCH"),
+    /// `LIKE`／`ILIKE` のエスケープ不正（`22025`。Issue #1779・SQL-54・ERR-6 のポインタ）。
+    /// パターン末尾の孤立したエスケープ文字、または `ESCAPE` 句の値が 1 文字でない場合に返す。
+    /// SQL 表層の `LIKE ... ESCAPE` に加え、NoSQL 表層の `like` op（既定エスケープ `\` の
+    /// 末尾単独）からも到達する。文言は固定の英語で、パターン・エスケープの値を載せない。
+    /// [`crate::sql::allowlist::SqlSurfaceError::InvalidEscapeSequence`] の写像。
+    InvalidEscapeSequence => ("22025", "INVALID_ESCAPE_SEQUENCE"),
     /// 式索引の式が IMMUTABLE 相当でない（`42P17`。Issue #1647・INDEX-10 のポインタ）。
     /// 構文だけで決まる確定の非決定式を拒否する。文言は固定で、値・列名・テナント情報を含めない。
     /// [`crate::sql::allowlist::SqlSurfaceError::InvalidObjectDefinition`] の写像。
