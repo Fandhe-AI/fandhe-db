@@ -47,6 +47,8 @@
 検出は既存の `SessionTransaction::release_if_expired`（wire 層の受信待ち
 タイムアウトの切り詰めを含む）がそのまま担う。
 
+`LIMIT` 省略時の結果行数上限も `DECLARE` 時点で数える（[limit-omitted-result-cap.md](limit-omitted-result-cap.md) D5）。
+
 遅延評価（`FETCH` のたびに検索本体を再実行する方式）を採らない理由: 後から
 同じテーブルへ自分で書き込んだときに結果が変わってしまい（INSENSITIVE を満たせない）、
 読み取りトランザクションの寿命を管理するコードを新たに引き回す必要が出る。
@@ -127,6 +129,7 @@ RLS-7 の暗黙適用がそのまま効く。カーソルは接続ごとの `Ses
 | トランザクション外の `DECLARE` | `25P01` | `sql::allowlist::SqlSurfaceError::NoActiveSqlTransaction` を再利用 |
 | 不在のカーソル名に対する `FETCH`／`CLOSE`（トランザクション外も含む） | `34000` | 新設 `ErrorClass::InvalidCursorName` |
 | `n` の範囲外 | `22000` | `validate_search_limit` を再利用 |
+| `DECLARE` 内側 SELECT の結果行数上限超過（`LIMIT` 省略・`ALL` の受理後） | `54000` | `DECLARE` を拒否しカーソルは登録しない。設計は [limit-omitted-result-cap.md](limit-omitted-result-cap.md) |
 | 同時カーソル数の上限超過（`MAX_CURSORS_PER_SESSION`＝16 本目の次） | `54000` | 内側の `SELECT` を実行する**前**に判定する |
 | セッション内でカーソルが保持する確定行の合計バイト数の上限超過（`MAX_CURSOR_BYTES_PER_SESSION`＝16 MiB） | `54000` | `wire-server::limits::MAX_SUSPENDED_PORTAL_BYTES_PER_SESSION` と同じ根拠 |
 | カーソル名の重複 | `22000` | PostgreSQL は `42P03` を返すが、本リポは既存の `22000`（`InvalidInput`）へ写像した（実装既定値。ERR-6 ポインタ） |
