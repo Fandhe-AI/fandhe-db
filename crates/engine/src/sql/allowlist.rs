@@ -2802,6 +2802,79 @@ pub struct ValidatedJoin {
     pub(crate) offset: u32,
 }
 
+/// `UPDATE ... FROM` の SET 右辺 1 個（SQL-53 (b)、Issue #1754）。列参照 1 個（修飾あり・なし）は
+/// FROM 側の表の列を指しうるため [`Self::Column`] として別に保持し、対象表と FROM 表を合わせた
+/// 束縛スコープ（`sql::dml_from`）で解決する。それ以外（リテラル・`DEFAULT`・対象表の列だけを使う式）は
+/// 既存の [`SetValue`] のまま運ぶ。
+#[derive(Debug, Clone, PartialEq)]
+pub enum DmlFromSetValue {
+    /// リテラル・`DEFAULT`・対象表の列だけを使う式。
+    Value(SetValue),
+    /// 列参照 1 個（`SET a = t.b` / `SET a = b`）。
+    Column(ColumnRef),
+}
+
+/// 許可形状の構造判定を通過した `UPDATE <表> [[AS] <別名>] SET ... FROM <表の並び> [WHERE ...]`
+/// （SQL-53 (b)、Issue #1754。親 #1753）。保証するのは構文と表の存在確認（ビュー拒否）まで。
+/// 列の解決・型検証は `sql::dml_from` の束縛、結合の実行は #1755、RLS と `RETURNING` は #1756、
+/// 台帳の content_hash は #1757 の担当。
+///
+/// 既存の述語形 [`ValidatedPredicateUpdate`] にフィールドを足さず別型にしているのは、`ParsedSql::Update`
+/// の既存の実行腕が FROM を黙って無視する（単一表として処理する fail-open）経路を作らないため。
+#[derive(Debug, Clone, PartialEq)]
+#[non_exhaustive]
+pub struct ValidatedUpdateFrom {
+    /// 更新対象の表参照（別名を含む）。
+    pub(crate) target: TableRef,
+    /// FROM 句の表参照（宣言順。1..=`MAX_TABLE_REFS - 1` 個）。
+    pub(crate) from: Vec<TableRef>,
+    /// SET 句の (列名, 右辺)。宣言順を保持する。
+    pub(crate) assignments: Vec<(String, DmlFromSetValue)>,
+    /// `WHERE` 句（JOIN と同じ文法）。省略は `None`。
+    pub(crate) where_clause: Option<Box<JoinWhereExpr>>,
+    /// 文末の `USING OPERATION_ID` で搬送された検証済みの operation_id。
+    pub(crate) operation_id: Option<OperationId>,
+}
+
+impl ValidatedUpdateFrom {
+    /// 更新対象の表名（別名ではなく実表名）。
+    pub fn target_table(&self) -> &str {
+        self.target.table()
+    }
+
+    /// 検証済みの `operation_id`。
+    pub fn operation_id(&self) -> Option<&OperationId> {
+        self.operation_id.as_ref()
+    }
+}
+
+/// 許可形状の構造判定を通過した `DELETE FROM <表> [[AS] <別名>] USING <表の並び> [WHERE ...]`
+/// （SQL-53 (b)、Issue #1754）。契約は [`ValidatedUpdateFrom`] と同じ。
+#[derive(Debug, Clone, PartialEq)]
+#[non_exhaustive]
+pub struct ValidatedDeleteUsing {
+    /// 削除対象の表参照（別名を含む）。
+    pub(crate) target: TableRef,
+    /// USING 句の表参照（宣言順）。
+    pub(crate) using: Vec<TableRef>,
+    /// `WHERE` 句（JOIN と同じ文法）。省略は `None`。
+    pub(crate) where_clause: Option<Box<JoinWhereExpr>>,
+    /// 文末の `USING OPERATION_ID` で搬送された検証済みの operation_id。
+    pub(crate) operation_id: Option<OperationId>,
+}
+
+impl ValidatedDeleteUsing {
+    /// 削除対象の表名（別名ではなく実表名）。
+    pub fn target_table(&self) -> &str {
+        self.target.table()
+    }
+
+    /// 検証済みの `operation_id`。
+    pub fn operation_id(&self) -> Option<&OperationId> {
+        self.operation_id.as_ref()
+    }
+}
+
 /// 集合演算の演算子（SQL-29 (c)・TASK-213）。
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum SetOperator {
@@ -4867,6 +4940,10 @@ struct Parser<'a> {
     /// `ON CONFLICT ... DO UPDATE SET` の右辺を解析している間だけ `Some(<INSERT 対象表名>)`
     /// （SQL-49、Issue #1739）。式中の修飾列参照 `t.col`／`EXCLUDED.col` の解決に使う。
     upsert_table: Option<String>,
+    /// `UPDATE ... SET <col> = <式> ... FROM` の SET 右辺を解析している間だけ `Some(<対象表の公開名>)`
+    /// （SQL-53 (b)、Issue #1754）。式中の修飾列参照のうち対象表の公開名で修飾されたものだけを非修飾へ
+    /// 正規化し、FROM 側の表を指す修飾は `0A000`（FROM 表の列を使う式は #1755 以降）にする。
+    dml_from_target: Option<String>,
 }
 
 /// WHERE の式述語 1 葉の解析結果（[`Parser::parse_expression_predicate`]）。`<>` は式の AST に
@@ -4930,6 +5007,7 @@ impl<'a> Parser<'a> {
             agg_calls: None,
             agg_slots_used: 0,
             upsert_table: None,
+            dml_from_target: None,
             legacy_implicit_id: false,
         }
     }
@@ -7945,6 +8023,17 @@ impl<'a> Parser<'a> {
                 self.consume_expr_node()?;
                 self.resolve_upsert_qualified_column(&qualifier, name)
             }
+            // `UPDATE ... SET <式> ... FROM` の右辺だけで有効な修飾列参照（SQL-53 (b)、Issue #1754）。
+            Some(Token::QualifiedIdent { qualifier, name }) if self.dml_from_target.is_some() => {
+                self.advance();
+                self.consume_expr_node()?;
+                if self.dml_from_target.as_deref() == Some(qualifier.as_str()) {
+                    return Ok(Expr::Ident(name));
+                }
+                Err(SqlSurfaceError::feature_not_supported(
+                    "UPDATE ... FROM: expressions referencing FROM-clause tables are not supported yet",
+                ))
+            }
             Some(Token::Ident(name)) => {
                 // 予約接頭辞で始まる識別子（引用識別子での偽装）は `EXCLUDED.<列>` の解決結果と
                 // 区別できないため拒否する（fail-closed。SQL-49、Issue #1739）。
@@ -9189,6 +9278,9 @@ impl<'a> Parser<'a> {
                         || s.eq_ignore_ascii_case("null"));
                 !plain_keyword
             }
+            // `UPDATE ... FROM` の右辺だけ、修飾列参照で始まる式（`t.a + 1`）を式として解析する
+            // （SQL-53 (b)、Issue #1754。それ以外の文脈では従来どおり `42601`）。
+            Some(Token::QualifiedIdent { .. }) => self.dml_from_target.is_some(),
             _ => false,
         };
         if !is_expr_start {
@@ -16145,6 +16237,343 @@ impl<'a> Parser<'a> {
     }
 }
 
+/// `UPDATE ... FROM`／`DELETE ... USING` の対象表・FROM 側の表の暗黙別名にできない語（SQL-53 (b)、
+/// Issue #1754）。JOIN の予約語に加え、DML の句境界（`SET`・`FROM`・`RETURNING`・`PARTITIONED`・
+/// `OPERATION_ID`）を別名として誤って消費しない。
+fn is_dml_target_reserved_word(w: &str) -> bool {
+    is_join_reserved_word(w)
+        || ["SET", "FROM", "RETURNING", "PARTITIONED", "OPERATION_ID"]
+            .iter()
+            .any(|r| w.eq_ignore_ascii_case(r))
+}
+
+/// `UPDATE <表> ... FROM <表の並び>` 形かをトークンの先読みだけで判定する（SQL-53 (b)、Issue #1754）。
+/// 括弧深さ 0 に `FROM`（`IS [NOT] DISTINCT FROM` を除く）がある `UPDATE` 文のみ真。`EXTRACT(.. FROM ..)`・
+/// サブクエリの `FROM` は括弧内なので対象外。`core.rs` の文解析が既存の `UPDATE` 解析器より前に呼ぶ。
+pub(crate) fn looks_like_update_from(tokens: &[Token]) -> bool {
+    if !matches!(tokens.first(), Some(Token::Ident(w)) if w.eq_ignore_ascii_case("UPDATE")) {
+        return false;
+    }
+    let mut depth: i32 = 0;
+    for (i, tok) in tokens.iter().enumerate() {
+        match tok {
+            Token::Punct('(') => depth = depth.saturating_add(1),
+            Token::Punct(')') => depth = depth.saturating_sub(1),
+            Token::Keyword(Keyword::From) if depth == 0 => {
+                let prev = i.checked_sub(1).and_then(|p| tokens.get(p));
+                if !matches!(prev, Some(Token::Ident(w)) if w.eq_ignore_ascii_case("DISTINCT")) {
+                    return true;
+                }
+            }
+            _ => {}
+        }
+    }
+    false
+}
+
+/// `DELETE FROM <表> ... USING <表の並び>` 形かをトークンの先読みだけで判定する（SQL-53 (b)、
+/// Issue #1754）。括弧深さ 0 の `USING` の直後が `OPERATION_ID` でないときのみ真。`USING OPERATION_ID`
+/// で始まる句は operation_id 句であり、`operation_id` という名前の表を USING に書く形は
+/// 判定上 operation_id 句として扱う（既存の解析器が `42601` で拒否する。fail-closed）。
+pub(crate) fn looks_like_delete_using(tokens: &[Token]) -> bool {
+    if !matches!(tokens.first(), Some(Token::Ident(w)) if w.eq_ignore_ascii_case("DELETE"))
+        || !matches!(tokens.get(1), Some(Token::Keyword(Keyword::From)))
+    {
+        return false;
+    }
+    let mut depth: i32 = 0;
+    for (i, tok) in tokens.iter().enumerate() {
+        match tok {
+            Token::Punct('(') => depth = depth.saturating_add(1),
+            Token::Punct(')') => depth = depth.saturating_sub(1),
+            Token::Ident(w) if depth == 0 && w.eq_ignore_ascii_case("USING") => {
+                let next_is_op_id = matches!(
+                    tokens.get(i.saturating_add(1)),
+                    Some(Token::Ident(n)) if n.eq_ignore_ascii_case("OPERATION_ID")
+                );
+                if !next_is_op_id {
+                    return true;
+                }
+            }
+            _ => {}
+        }
+    }
+    false
+}
+
+/// `UPDATE ... FROM`／`DELETE ... USING` 専用の `Parser` ヘルパー（SQL-53 (b)、Issue #1754）。
+/// 既存の `parse_update`／`parse_delete` を変えず、FROM／USING 形だけをここで解析する。
+impl<'a> Parser<'a> {
+    /// 対象表 `<表> [[AS] <別名>]`。別名は DML の句境界語を拒否する。
+    fn parse_dml_target_relation(&mut self) -> Result<TableRef, SqlSurfaceError> {
+        let table = self.expect_ident()?;
+        crate::catalog::validate_relation_key(&table)
+            .map_err(|e| SqlSurfaceError::unsupported(format!("invalid table name: {e}")))?;
+        let alias = self.parse_relation_alias(is_dml_target_reserved_word, "DML target")?;
+        Ok(match alias {
+            Some(a) => TableRef::with_alias(table, a),
+            None => TableRef::new(table),
+        })
+    }
+
+    /// FROM／USING 側の表の並び `<rel>[, <rel>]*`。対象表を含む参照数を [`crate::sql::relation::MAX_TABLE_REFS`]
+    /// で積む前に検査し（超過は `54000`）、公開名の重複は `42601`（`BindingScope::new` と同じ契約）。
+    fn parse_dml_relation_list(
+        &mut self,
+        target: &TableRef,
+    ) -> Result<Vec<TableRef>, SqlSurfaceError> {
+        let mut rels: Vec<TableRef> = Vec::new();
+        loop {
+            if rels.len().saturating_add(1) >= crate::sql::relation::MAX_TABLE_REFS {
+                return Err(SqlSurfaceError::payload_too_large(
+                    "too many table references in UPDATE/DELETE",
+                ));
+            }
+            let table = self.expect_ident()?;
+            crate::catalog::validate_relation_key(&table)
+                .map_err(|e| SqlSurfaceError::unsupported(format!("invalid table name: {e}")))?;
+            let alias = self.parse_relation_alias(is_dml_target_reserved_word, "FROM")?;
+            let rel = match alias {
+                Some(a) => TableRef::with_alias(table, a),
+                None => TableRef::new(table),
+            };
+            if rel.exposed_name() == target.exposed_name()
+                || rels.iter().any(|r| r.exposed_name() == rel.exposed_name())
+            {
+                return Err(SqlSurfaceError::unsupported(
+                    "duplicate table reference name in UPDATE/DELETE",
+                ));
+            }
+            rels.push(rel);
+            if matches!(self.peek(), Some(Token::Punct(','))) {
+                self.advance();
+                continue;
+            }
+            break;
+        }
+        Ok(rels)
+    }
+
+    /// `[WHERE <join_where>]`（JOIN と同じ文法。数値リテラル・`IS NULL`・`NOT`・サブクエリは構造的に `42601`）。
+    fn parse_dml_from_where(&mut self) -> Result<Option<Box<JoinWhereExpr>>, SqlSurfaceError> {
+        if matches!(self.peek(), Some(Token::Keyword(Keyword::Where))) {
+            self.advance();
+            Ok(Some(Box::new(parse_join_where(self)?)))
+        } else {
+            Ok(None)
+        }
+    }
+
+    /// SET 右辺が列参照 1 個（直後が句境界）かを先読みだけで判定する。`true`／`false`／`NULL`／`DEFAULT` と
+    /// 関数呼び出し・演算子つきの式は含めない。
+    fn peek_set_rhs_single_column(&self) -> bool {
+        let is_column = match self.peek() {
+            Some(Token::QualifiedIdent { .. }) => true,
+            Some(Token::QuotedBoolWord(_)) => true,
+            Some(Token::Ident(w)) => {
+                self.quoted_null.contains(&self.pos)
+                    || !(w.eq_ignore_ascii_case("true")
+                        || w.eq_ignore_ascii_case("false")
+                        || w.eq_ignore_ascii_case("null")
+                        || w.eq_ignore_ascii_case("default"))
+            }
+            _ => false,
+        };
+        if !is_column {
+            return false;
+        }
+        match self.tokens.get(self.pos.saturating_add(1)) {
+            None => true,
+            Some(Token::Punct(',' | ';')) => true,
+            Some(Token::Keyword(Keyword::From | Keyword::Where)) => true,
+            Some(Token::Ident(w)) => ["USING", "RETURNING", "PARTITIONED"]
+                .iter()
+                .any(|k| w.eq_ignore_ascii_case(k)),
+            _ => false,
+        }
+    }
+
+    /// `UPDATE ... FROM` の SET 句 1 要素。行値の代入は `0A000`、左辺の修飾は `42601`（`expect_ident`）。
+    fn parse_update_from_set_item(
+        &mut self,
+        out: &mut Vec<(String, DmlFromSetValue)>,
+    ) -> Result<(), SqlSurfaceError> {
+        if matches!(self.peek(), Some(Token::Punct('('))) {
+            return Err(SqlSurfaceError::feature_not_supported(
+                "row-value assignment is not supported in UPDATE ... FROM",
+            ));
+        }
+        if out.len() >= MAX_UPDATE_SET_ASSIGNMENTS {
+            return Err(SqlSurfaceError::unsupported(
+                "too many UPDATE SET assignments",
+            ));
+        }
+        let column = self.expect_ident()?;
+        self.expect_punct('=')?;
+        let value = if self.peek_set_rhs_single_column() {
+            DmlFromSetValue::Column(self.parse_join_colref()?)
+        } else {
+            DmlFromSetValue::Value(self.parse_update_set_rhs()?)
+        };
+        out.push((column, value));
+        Ok(())
+    }
+
+    /// `UPDATE <表> [[AS] <別名>] SET <代入>[, ...] FROM <rel>[, ...] [WHERE <join_where>]
+    /// [RETURNING ...] [USING OPERATION_ID '<id>']`（SQL-53 (b)、Issue #1754）の構造解析。
+    /// `PARTITIONED` は解析せず、余剰トークンとして呼び出し元の `expect_end_of_statement` が `42601` にする。
+    fn parse_update_from(&mut self) -> Result<ParsedUpdateFrom, SqlSurfaceError> {
+        self.expect_contextual_keyword("UPDATE")?;
+        let target = self.parse_dml_target_relation()?;
+        self.expect_ident_matching("SET")?;
+        let prev = self
+            .dml_from_target
+            .replace(target.exposed_name().to_string());
+        let mut assignments = Vec::new();
+        let items = (|| {
+            self.parse_update_from_set_item(&mut assignments)?;
+            while matches!(self.peek(), Some(Token::Punct(','))) {
+                self.advance();
+                self.parse_update_from_set_item(&mut assignments)?;
+            }
+            Ok::<(), SqlSurfaceError>(())
+        })();
+        self.dml_from_target = prev;
+        items?;
+        self.expect_keyword(Keyword::From)?;
+        let from = self.parse_dml_relation_list(&target)?;
+        let where_clause = self.parse_dml_from_where()?;
+        let returning = self.parse_returning_clause()?;
+        let operation_id = self.parse_operation_id_clause()?;
+        Ok(ParsedUpdateFrom {
+            stmt: ValidatedUpdateFrom {
+                target,
+                from,
+                assignments,
+                where_clause,
+                operation_id,
+            },
+            has_returning: returning.is_some(),
+        })
+    }
+
+    /// `DELETE FROM <表> [[AS] <別名>] USING <rel>[, ...] [WHERE <join_where>] [RETURNING ...]
+    /// [USING OPERATION_ID '<id>']`（SQL-53 (b)、Issue #1754）の構造解析。
+    fn parse_delete_using(&mut self) -> Result<ParsedDeleteUsing, SqlSurfaceError> {
+        self.expect_contextual_keyword("DELETE")?;
+        self.expect_keyword(Keyword::From)?;
+        let target = self.parse_dml_target_relation()?;
+        self.expect_contextual_keyword("USING")?;
+        let using = self.parse_dml_relation_list(&target)?;
+        let where_clause = self.parse_dml_from_where()?;
+        let returning = self.parse_returning_clause()?;
+        let operation_id = self.parse_operation_id_clause()?;
+        Ok(ParsedDeleteUsing {
+            stmt: ValidatedDeleteUsing {
+                target,
+                using,
+                where_clause,
+                operation_id,
+            },
+            has_returning: returning.is_some(),
+        })
+    }
+}
+
+/// [`Parser::parse_update_from`] の結果。`RETURNING` は構造だけ解析し、`0A000` の拒否は検証入口が行う。
+struct ParsedUpdateFrom {
+    stmt: ValidatedUpdateFrom,
+    has_returning: bool,
+}
+
+/// [`Parser::parse_delete_using`] の結果（[`ParsedUpdateFrom`] と同じ）。
+struct ParsedDeleteUsing {
+    stmt: ValidatedDeleteUsing,
+    has_returning: bool,
+}
+
+/// FROM／USING 形の `WHERE` 省略を opt-in のスイッチが有効なときだけ `42601` で拒否する
+/// （[`reject_omitted_where_for_dml`] の JOIN 文法 `WHERE` 版。SQL-36、Issue #2210）。
+fn reject_omitted_join_where_for_dml(
+    enabled: bool,
+    has_where: bool,
+) -> Result<(), SqlSurfaceError> {
+    if enabled && !has_where {
+        return Err(SqlSurfaceError::unsupported(REQUIRE_WHERE_FOR_DML_DETAIL));
+    }
+    Ok(())
+}
+
+/// FROM／USING 形の DML の対象表・FROM 側の表をカタログで確認する（ビューは `0A000`、未知は `42P01`）。
+/// 構文の完全な解析（`42601`）の後に呼ぶ（`parse_join_statement` と同じ検証順序）。
+fn resolve_dml_from_relations(
+    lookup: &impl TableLookup,
+    target: &TableRef,
+    others: &[TableRef],
+) -> Result<(), SqlSurfaceError> {
+    for r in std::iter::once(target).chain(others.iter()) {
+        match crate::sql::view::resolve_from(lookup, r.table())? {
+            crate::sql::view::Resolved::Table => {}
+            crate::sql::view::Resolved::View { .. }
+            | crate::sql::view::Resolved::Buffered { .. } => {
+                return Err(SqlSurfaceError::feature_not_supported(
+                    "UPDATE ... FROM / DELETE ... USING does not support view references",
+                ));
+            }
+        }
+    }
+    Ok(())
+}
+
+/// `UPDATE ... FROM` の検証入口（SQL-53 (b)、Issue #1754）。検証順序: 構造（`42601`）→ `RETURNING`
+/// （`0A000`。#1756）→ `operation_id` 必須化 → `WHERE` 省略ガード（opt-in）→ 各表のカタログ確認。
+/// `core.rs` の文解析が [`looks_like_update_from`] 真のときだけ呼ぶ。
+pub(crate) fn validate_update_from_tokens_with_limits(
+    tokens: &[Token],
+    mode: LedgerMode,
+    require_where_for_dml: bool,
+    limits: crate::nesting_limits::NestingLimits,
+    lookup: &impl TableLookup,
+) -> Result<ValidatedUpdateFrom, SqlSurfaceError> {
+    let mut p = Parser::new(tokens).with_nesting_limits(limits);
+    let parsed = p.parse_update_from()?;
+    p.expect_end_of_statement()?;
+    if parsed.has_returning {
+        return Err(SqlSurfaceError::feature_not_supported(
+            "RETURNING is not supported in UPDATE ... FROM yet",
+        ));
+    }
+    let stmt = parsed.stmt;
+    mode.require(stmt.operation_id.as_ref())?;
+    reject_omitted_join_where_for_dml(require_where_for_dml, stmt.where_clause.is_some())?;
+    resolve_dml_from_relations(lookup, &stmt.target, &stmt.from)?;
+    Ok(stmt)
+}
+
+/// `DELETE ... USING` の検証入口（SQL-53 (b)、Issue #1754）。検証順序は
+/// [`validate_update_from_tokens_with_limits`] と同じ。
+pub(crate) fn validate_delete_using_tokens_with_limits(
+    tokens: &[Token],
+    mode: LedgerMode,
+    require_where_for_dml: bool,
+    limits: crate::nesting_limits::NestingLimits,
+    lookup: &impl TableLookup,
+) -> Result<ValidatedDeleteUsing, SqlSurfaceError> {
+    let mut p = Parser::new(tokens).with_nesting_limits(limits);
+    let parsed = p.parse_delete_using()?;
+    p.expect_end_of_statement()?;
+    if parsed.has_returning {
+        return Err(SqlSurfaceError::feature_not_supported(
+            "RETURNING is not supported in DELETE ... USING yet",
+        ));
+    }
+    let stmt = parsed.stmt;
+    mode.require(stmt.operation_id.as_ref())?;
+    reject_omitted_join_where_for_dml(require_where_for_dml, stmt.where_clause.is_some())?;
+    resolve_dml_from_relations(lookup, &stmt.target, &stmt.using)?;
+    Ok(stmt)
+}
+
 /// JOIN の SELECT リスト項目数の構文段上限（無制限確保の防止用）。集計形は別途
 /// [`MAX_AGGREGATE_ITEMS`] で頭打ちにし、非集計形は従来の受理範囲を維持する。
 const MAX_JOIN_SELECT_ITEMS: usize = 4096;
@@ -20950,6 +21379,73 @@ pub(crate) fn parse_update_form_shape_tokens_with_limits(
 
 #[cfg(test)]
 mod tests {
+    /// SQL-53 (b)・Issue #1754: FROM／USING 形の先読み判定。`EXTRACT(.. FROM ..)`・`IS DISTINCT FROM`・
+    /// サブクエリの `FROM` と `USING OPERATION_ID` は FROM／USING 形ではない。
+    #[test]
+    fn looks_like_update_from_and_delete_using_are_precise() {
+        use super::*;
+        let t = |sql: &str| crate::sql::lexer::tokenize(sql).expect("lex");
+        assert!(looks_like_update_from(&t("UPDATE a SET x = b.x FROM b")));
+        assert!(looks_like_update_from(&t(
+            "UPDATE a AS z SET x = 1 FROM b WHERE z.id = b.id"
+        )));
+        assert!(!looks_like_update_from(&t(
+            "UPDATE a SET x = 1 WHERE id = 1"
+        )));
+        assert!(!looks_like_update_from(&t(
+            "UPDATE a SET x = EXTRACT(year FROM d) WHERE y IS DISTINCT FROM 2"
+        )));
+        assert!(!looks_like_update_from(&t(
+            "UPDATE a SET x = 1 WHERE id IN (SELECT id FROM b LIMIT 1)"
+        )));
+        assert!(!looks_like_update_from(&t("DELETE FROM a USING b")));
+        assert!(looks_like_delete_using(&t(
+            "DELETE FROM a USING b WHERE a.id = b.id"
+        )));
+        assert!(looks_like_delete_using(&t("DELETE FROM a d USING b, c")));
+        assert!(!looks_like_delete_using(&t(
+            "DELETE FROM a USING OPERATION_ID 'x'"
+        )));
+        assert!(!looks_like_delete_using(&t(
+            "DELETE FROM a WHERE x = 1 USING OPERATION_ID 'x'"
+        )));
+        assert!(!looks_like_delete_using(&t(
+            "DELETE FROM a USING operation_id"
+        )));
+        assert!(!looks_like_delete_using(&t("UPDATE a SET x = 1 FROM b")));
+    }
+
+    /// SQL-53 (b)・Issue #1754: 構文段の受理形と拒否コード（カタログに触れない解析器単体）。
+    #[test]
+    fn parse_update_from_and_delete_using_structure() {
+        use super::*;
+        let t = |sql: &str| crate::sql::lexer::tokenize(sql).expect("lex");
+        let ok = |sql: &str| {
+            let toks = t(sql);
+            let mut p = Parser::new(&toks);
+            let r = if looks_like_update_from(&toks) {
+                p.parse_update_from().map(|_| ())
+            } else {
+                p.parse_delete_using().map(|_| ())
+            };
+            r.and_then(|()| p.expect_end_of_statement())
+        };
+        ok("UPDATE a SET x = b.y FROM b WHERE a.id = b.id").expect("column rhs");
+        ok("UPDATE a z SET x = 'k', y = DEFAULT FROM b q, c WHERE z.id = q.id").expect("alias");
+        ok("DELETE FROM a z USING b q WHERE z.id = q.id USING OPERATION_ID 'o'").expect("delete");
+        for (sql, code) in [
+            ("UPDATE a SET a.x = 1 FROM b", "42601"),
+            ("UPDATE a SET x = 1 FROM b JOIN c ON b.id = c.id", "42601"),
+            ("UPDATE a SET x = 1 FROM a", "42601"),
+            ("UPDATE a SET x = c.y + 1 FROM b", "0A000"),
+            ("UPDATE a SET (x, y) = (1, 2) FROM b", "0A000"),
+            ("DELETE FROM a USING b WHERE a.n = 1", "42601"),
+            ("DELETE FROM a USING b PARTITIONED", "42601"),
+        ] {
+            assert_eq!(ok(sql).expect_err(sql).wire_code(), code, "{sql}");
+        }
+    }
+
     /// SQL-36・Issue #2210: 空の述語列は有効時だけ `42601`、明示 `WHERE` の印や通常の述語列は常に通す。
     #[test]
     fn reject_omitted_where_for_dml_only_rejects_empty_when_enabled() {

@@ -173,6 +173,7 @@ pub(crate) mod ddl_column_type;
 /// SQL テキスト経由束縛と同一の実行意味論を共有する。第 2 の評価器を作らない）。
 pub mod declarative_predicate;
 pub(crate) mod describe;
+pub mod dml_from;
 #[cfg(test)]
 mod identity_column_tests;
 pub(crate) mod insert_select;

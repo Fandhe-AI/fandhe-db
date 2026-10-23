@@ -75,6 +75,9 @@ mod matview_exec;
 // INSERT ... SELECT の実行本体（SQL-51・Issue #1733）。
 mod insert_select_exec;
 
+// UPDATE ... FROM／DELETE ... USING の束縛と実行腕（SQL-53 (b)・Issue #1754。実行は #1755 以降）。
+mod dml_from_exec;
+
 // 述語形 UPDATE／DELETE の WHERE 内サブクエリの実行（SQL-53・Issue #1751）。
 mod dml_subquery_exec;
 #[cfg(test)]
@@ -1595,6 +1598,22 @@ pub enum ParsedSql {
     /// `UPDATE`（単一行・`id` 完全一致形／述語形。SQL-17・SQL-19。`RETURNING` は
     /// セッション経路（autocommit・明示/暗黙トランザクション内。Issue #1272）のみ。SQL-21）。
     Update(crate::sql::allowlist::ValidatedUpdateForm),
+    /// `UPDATE <表> [[AS] <別名>] SET ... FROM <表の並び> [WHERE ...]`（SQL-53 (b)・Issue #1754）。
+    /// 構文と表の存在確認までを担い、列の解決・型照合は束縛（`sql::dml_from::bind_update_from`）が
+    /// 実行腕・Describe 腕で行う。実行腕は束縛の後に `0A000` で止める（副作用ゼロ。結合の実行は
+    /// #1755、RLS と `RETURNING` は #1756、台帳の content_hash は #1757）。既存の [`Self::Update`] に
+    /// フィールドを足さず別 variant にしているのは、FROM を黙って無視する実行経路（fail-open）を
+    /// 作らず、網羅 `match` の追随漏れをコンパイラに検出させるため。
+    ///
+    /// **BREAKING CHANGE**（Issue #1754）: 本 variant の追加により `ParsedSql` を網羅的に
+    /// マッチするクレート外コードは追随が必要。
+    UpdateFrom(Box<crate::sql::allowlist::ValidatedUpdateFrom>),
+    /// `DELETE FROM <表> [[AS] <別名>] USING <表の並び> [WHERE ...]`（SQL-53 (b)・Issue #1754）。
+    /// 契約は [`Self::UpdateFrom`] と同じ。
+    ///
+    /// **BREAKING CHANGE**（Issue #1754）: 本 variant の追加により `ParsedSql` を網羅的に
+    /// マッチするクレート外コードは追随が必要。
+    DeleteUsing(Box<crate::sql::allowlist::ValidatedDeleteUsing>),
     /// `BEGIN`／`COMMIT`／`ROLLBACK`（SQL-31・TASK-221）。トランザクション文脈を
     /// 持たない [`EngineCore::execute_parsed_in_session`] はこの variant を
     /// `0A000` で拒否する（トランザクション対応の実行入口は
@@ -1857,7 +1876,9 @@ fn statement_clock_scope(
         | ParsedSql::ViewDelete(_)
         | ParsedSql::ViewUpdate(_)
         | ParsedSql::Delete(_)
-        | ParsedSql::Update(_) => true,
+        | ParsedSql::Update(_)
+        | ParsedSql::UpdateFrom(_)
+        | ParsedSql::DeleteUsing(_) => true,
         ParsedSql::Truncate(_)
         | ParsedSql::Transaction(_)
         | ParsedSql::DropTable(_)
@@ -1916,6 +1937,8 @@ fn insert_sequence_scope(
         | ParsedSql::Truncate(_)
         | ParsedSql::Delete(_)
         | ParsedSql::Update(_)
+        | ParsedSql::UpdateFrom(_)
+        | ParsedSql::DeleteUsing(_)
         | ParsedSql::ViewDelete(_)
         | ParsedSql::ViewUpdate(_)
         | ParsedSql::Transaction(_)
@@ -1972,6 +1995,8 @@ fn insert_default_clock_scope(
         | ParsedSql::Truncate(_)
         | ParsedSql::Delete(_)
         | ParsedSql::Update(_)
+        | ParsedSql::UpdateFrom(_)
+        | ParsedSql::DeleteUsing(_)
         | ParsedSql::ViewDelete(_)
         | ParsedSql::ViewUpdate(_)
         | ParsedSql::Transaction(_)
@@ -2148,6 +2173,10 @@ fn parsed_operation_id(parsed: &ParsedSql) -> Option<&str> {
         ParsedSql::Update(crate::sql::allowlist::ValidatedUpdateForm::Predicate(v)) => {
             v.operation_id().map(|id| id.as_str())
         }
+        // SQL-53 (b)・Issue #1754: 実行腕が束縛後に必ず `0A000` で拒否する間は、同一トランザクションの
+        // operation_id 登録を変えない（拒否される文が再利用検査の状態を汚さない）。実行を結線する
+        // #1755／#1757 でここを見直す。
+        ParsedSql::UpdateFrom(_) | ParsedSql::DeleteUsing(_) => None,
         // 永続側の文を包んだ形は中身の `operation_id` を使う（一時表の文は `operation_id` を持たない）。
         ParsedSql::SessionRouted(routed) if routed.is_persistent() => {
             parsed_operation_id(routed.inner())
@@ -4911,6 +4940,30 @@ impl EngineCore {
             return Ok(ParsedSql::Truncate(stmt));
         }
 
+        // SQL-53 (b)・Issue #1754: `DELETE ... USING <表の並び>`／`UPDATE ... FROM <表の並び>` は既存の
+        // 単一表 DML の解析器より前に専用の解析器へ回す（既存の解析器は FROM／USING 形を `42601` で
+        // 拒否したままにし、受理範囲を広げない）。
+        if crate::sql::allowlist::looks_like_delete_using(&tokens) {
+            let stmt = crate::sql::allowlist::validate_delete_using_tokens_with_limits(
+                &tokens,
+                ledger_mode,
+                self.require_where_for_dml,
+                self.nesting_limits,
+                &storage_lookup,
+            )?;
+            return Ok(ParsedSql::DeleteUsing(Box::new(stmt)));
+        }
+        if crate::sql::allowlist::looks_like_update_from(&tokens) {
+            let stmt = crate::sql::allowlist::validate_update_from_tokens_with_limits(
+                &tokens,
+                ledger_mode,
+                self.require_where_for_dml,
+                self.nesting_limits,
+                &storage_lookup,
+            )?;
+            return Ok(ParsedSql::UpdateFrom(Box::new(stmt)));
+        }
+
         let is_delete_statement = matches!(
             tokens.first(),
             Some(crate::sql::lexer::Token::Ident(name)) if name.eq_ignore_ascii_case("DELETE")
@@ -5566,6 +5619,18 @@ impl EngineCore {
                     "bind parameters are not supported in INSERT ... SELECT",
                 ),
             );
+        }
+        // SQL-53 (b)・Issue #1754: `UPDATE ... FROM`／`DELETE ... USING` の `$n` は位置規則の対象外のため、
+        // Parse 段で `42601` として拒否する（fail-closed。`#1750` の WHERE 内サブクエリと同じ扱い）。
+        if (crate::sql::allowlist::looks_like_update_from(&tokens)
+            || crate::sql::allowlist::looks_like_delete_using(&tokens))
+            && tokens
+                .iter()
+                .any(|t| matches!(t, crate::sql::lexer::Token::Param(_)))
+        {
+            return Err(crate::sql::allowlist::SqlSurfaceError::unsupported(
+                "bind parameters are not supported in UPDATE ... FROM / DELETE ... USING",
+            ));
         }
         // SQL-52・Issue #1678: `CREATE TABLE ... AS` も DDL であり内側の問い合わせは `$n` の位置規則の
         // 対象外のため、`$n` を含む形は位置検査より前に `0A000` で拒否する（fail-closed）。
@@ -6333,6 +6398,9 @@ impl EngineCore {
                     Ok(crate::sql::SqlOutcome::Delete(outcome))
                 }
             },
+            // SQL-53 (b)・Issue #1754: 束縛（列解決・型照合）を通した後に `0A000` で止める。実行は #1755 以降。
+            ParsedSql::UpdateFrom(stmt) => self.execute_update_from_stub(stmt),
+            ParsedSql::DeleteUsing(stmt) => self.execute_delete_using_stub(stmt),
             ParsedSql::Update(stmt) => {
                 // Issue #1129: `PARTITIONED` 付きは分割実行（非原子・autocommit 専用）。
                 if let crate::sql::allowlist::ValidatedUpdateForm::Predicate(v) = stmt {
@@ -7152,6 +7220,10 @@ impl EngineCore {
                 }
                 Ok(crate::sql::SqlOutcome::Query(result))
             }
+            // SQL-53 (b)・Issue #1754: 書き込みトランザクションに触れず、束縛の後に `0A000` で止める。
+            // 呼び出し元が明示トランザクションを `Failed` へ遷移させる（他の失敗文と同じ契約）。
+            ParsedSql::UpdateFrom(stmt) => self.execute_update_from_stub(stmt),
+            ParsedSql::DeleteUsing(stmt) => self.execute_delete_using_stub(stmt),
             // SQL-51・Issue #1732・#1733: autocommit と同じ実行本体へ共有 write txn を渡す
             // （読み取り源にも書き込み先にもなる）。台帳・世代の単位は挿入先の表。
             ParsedSql::InsertSelect(stmt) => {
@@ -8041,6 +8113,16 @@ impl EngineCore {
                     )?)),
                     None => Ok(None),
                 }
+            }
+            // SQL-53 (b)・Issue #1754: 束縛エラーは Execute と同じコードで返す。`RETURNING` は未対応
+            // （Parse で `0A000`）のため結果列は無い。
+            ParsedSql::UpdateFrom(stmt) => {
+                self.bind_update_from_stmt(stmt)?;
+                Ok(None)
+            }
+            ParsedSql::DeleteUsing(stmt) => {
+                self.bind_delete_using_stmt(stmt)?;
+                Ok(None)
             }
             // Issue #1129: `SHOW`／`CANCEL` は `status`・`rows` の 2 列、`EXPLAIN` は
             // `QUERY PLAN` 単一列（いずれも入力文の内容によらず固定のため実行しない）。

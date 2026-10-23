@@ -4047,7 +4047,7 @@ pub fn bind_update(
 /// 項は `sql::set_expr::bind_set_expr` で静的に型照合して第 2 要素へ分け、リテラル項は
 /// 従来の分岐で第 1 要素へ束縛する（疑似列・重複・未知列の判定順序は共通）。
 #[allow(clippy::type_complexity)]
-fn bind_set_assignments(
+pub(crate) fn bind_set_assignments(
     assignments: &[(String, crate::sql::allowlist::SetValue)],
     schema: &TableSchema,
 ) -> Result<

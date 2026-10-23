@@ -512,7 +512,7 @@ fn is_integer_type(ty: &ColumnType) -> bool {
 
 /// 型 `from` の値を列 `to` へ代入できるか。規則表の外にある型（`VECTOR`・`ENUM`）は同じ値ドメインの
 /// ときだけ受理する（暗黙の型変換を作らない）。
-fn assignable(from: &ColumnType, to: &ColumnType) -> bool {
+pub(crate) fn assignable(from: &ColumnType, to: &ColumnType) -> bool {
     match crate::sql::cast::column_assignment_convertible(from, to) {
         Some(ok) => ok,
         None => from.same_value_domain(to),

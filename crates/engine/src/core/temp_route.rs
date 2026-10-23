@@ -237,6 +237,8 @@ fn is_routable(parsed: &ParsedSql) -> bool {
             | Statement::SetOperation(_),
         ) => true,
         ParsedSql::CreateIndex(_) | ParsedSql::DropIndex(_) => true,
+        // SQL-53 (b)・Issue #1754: 一時表が関与する FROM／USING 形は一時コアの結合実行に未対応（`0A000`）。
+        ParsedSql::UpdateFrom(_) | ParsedSql::DeleteUsing(_) => false,
         _ => false,
     }
 }
@@ -262,6 +264,8 @@ fn is_write(parsed: &ParsedSql) -> bool {
             | ParsedSql::Truncate(_)
             | ParsedSql::Delete(_)
             | ParsedSql::Update(_)
+            | ParsedSql::UpdateFrom(_)
+            | ParsedSql::DeleteUsing(_)
     )
 }
 
