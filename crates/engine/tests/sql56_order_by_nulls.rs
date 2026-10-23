@@ -669,10 +669,22 @@ fn qualified_column_named_like_nulls_clause_is_not_reinterpreted() {
     for sql in [
         "SELECT docs.id FROM docs ORDER BY n NULLS docs.first LIMIT 5",
         "SELECT docs.id FROM docs ORDER BY n docs.nulls FIRST LIMIT 5",
+        "SELECT id FROM docs ORDER BY n docs.nulls docs.first LIMIT 5",
+        "SELECT id FROM docs ORDER BY n docs.nulls docs.last LIMIT 5",
     ] {
         let code = run_err(&core, &ctx, sql);
         assert!(["42601", "42703"].contains(&code), "{sql}: {code}");
     }
+}
+
+#[test]
+fn set_operation_branch_accepts_column_key_with_nulls_placement() {
+    let (core, _g) = build("sql56n-setop");
+    let ctx = ctx_for("tenant-a");
+    let sql = "(SELECT id FROM docs ORDER BY n NULLS FIRST LIMIT 3) \
+               UNION ALL (SELECT id FROM docs ORDER BY n DESC NULLS LAST LIMIT 3)";
+    let got = run(&core, &ctx, sql);
+    assert_eq!(got.rows.len(), 6, "{sql}");
 }
 
 // ---------- RLS ----------

@@ -17913,7 +17913,12 @@ fn parse_set_limited_branch(
     }
     // Issue #1188: 式キーの `ORDER BY` は集合演算の枝では非対応（式キーを含む文は
     // `order_by` が空になるため、黙って渡すと並べ替えなしで LIMIT が適用される）。
-    if !shape.order_keys.is_empty() {
+    // 列キー（`NULLS FIRST|LAST` 付きを含む）は `bind_scan` が処理できるため拒否しない。
+    if shape
+        .order_keys
+        .iter()
+        .any(|k| !matches!(k, ScanOrderKey::Column { .. }))
+    {
         return Err(SqlSurfaceError::unsupported(
             "expression ORDER BY keys are not allowed inside a set operation branch",
         ));
