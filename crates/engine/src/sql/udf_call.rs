@@ -3844,7 +3844,8 @@ fn bind_datetime_text_literal(
 /// SQLSTATE）を共有するため、`Binary { Eq }` を [`bind_expr_any`] へ通し、結果が素の
 /// `BoundExpr::Binary { op: Eq }` のときだけ両辺を載せ替える。それ以外（ICU 照合・配列どうし等）
 /// は v1 の対象外として `0A000` で fail-closed に拒否する。裸の `NULL` 側は型を決められないため
-/// 反対側だけを束縛し、`=` が存在しない型（json・vector 等）は拒否する。
+/// 反対側だけを束縛し、`=` が存在しない型（`json`・vector 等）は拒否する（jsonb は
+/// 非 NULL 経路の等価と同じく受理する）。
 fn bind_is_distinct_from(
     negated: bool,
     lhs: &Expr,
@@ -3888,6 +3889,7 @@ fn bind_is_distinct_from(
                     | ExprType::TimestampTz
                     | ExprType::Interval
                     | ExprType::Bool
+                    | ExprType::Json
             ) {
                 return Err(unsupported_operand());
             }
@@ -3912,6 +3914,9 @@ fn bind_is_distinct_from(
                 _ => None,
             };
             if let Some((literal_on_left, s, other)) = literal_side {
+                // 事前束縛は日時型の判定専用。日時型でなければ結果を捨てて下の `=` 経路で
+                // 再束縛するため、予算を巻き戻して同じ部分木を二重に課金しない。
+                let budget_before = *node_budget;
                 let (other_b, other_t) = bind_expr_any(other, env, node_budget)?;
                 if let Some(lit) = bind_datetime_text_literal(s, other_t) {
                     *node_budget = node_budget.checked_sub(1).ok_or_else(|| {
@@ -3924,6 +3929,7 @@ fn bind_is_distinct_from(
                         mk(other_b, lit)
                     });
                 }
+                *node_budget = budget_before;
             }
             let eq = Expr::Binary {
                 op: BinOp::Eq,
@@ -10168,6 +10174,47 @@ mod tests {
             run(&mk(true, Expr::Null, Expr::Null), 1),
             ExprValue::Bool(true)
         );
+    }
+
+    /// 日時型でない被演算子は事前束縛と `=` 経路で二重に課金されない（約 600 ノードの数値式と
+    /// 文字列リテラルの比較が `MAX_EXPR_NODES` 以内で成功する）。
+    #[test]
+    fn is_distinct_from_string_literal_does_not_double_charge_node_budget() {
+        let schema = schema_with_vector();
+        let registry = UdfRegistry::default();
+        let mut big = ident("id");
+        for _ in 0..290 {
+            big = bin(BinOp::Add, big, num("1"));
+        }
+        let expr = Expr::IsDistinctFrom {
+            negated: false,
+            lhs: Box::new(big),
+            rhs: Box::new(Expr::String("1".to_string())),
+        };
+        let mut budget = MAX_EXPR_NODES;
+        let (_, ty) = bind_expr(&expr, &schema, &registry, &mut budget).expect("bind");
+        assert_eq!(ty, ExprType::Bool);
+    }
+
+    /// jsonb 列と素の `NULL` の `IS [NOT] DISTINCT FROM` は束縛できる。
+    #[test]
+    fn is_distinct_from_accepts_jsonb_with_bare_null() {
+        let schema = TableSchema::new(
+            "docs",
+            vec![
+                ColumnDef::new("embedding", ColumnType::Vector(3), false),
+                ColumnDef::new("doc", ColumnType::Jsonb, true),
+            ],
+        );
+        let registry = UdfRegistry::default();
+        let expr = Expr::IsDistinctFrom {
+            negated: false,
+            lhs: Box::new(ident("doc")),
+            rhs: Box::new(Expr::Null),
+        };
+        let mut budget = MAX_EXPR_NODES;
+        let (_, ty) = bind_expr(&expr, &schema, &registry, &mut budget).expect("bind");
+        assert_eq!(ty, ExprType::Bool);
     }
 
     // --- CASE／COALESCE／NULLIF（対象ビヘイビア: SQL-26。Issue #921） ----------
