@@ -12,7 +12,9 @@
 - 複数文メッセージの暗黙トランザクション内の `COPY` を受理する（Issue #1773・WIRE-20）。COPY の文で CopyIn／CopyOut へ入り、
   CopyDone の後に続きの文へ進む（従来は `0A000`）。最後の文が COPY のときは応答の前に commit する。
   詳細は [wire-copy-protocol.md](docs/design/wire-copy-protocol.md)。
-- `COPY ... FROM STDIN` が `HEADER`（`MATCH` を含む）・`DELIMITER`・`NULL`・`QUOTE`・`ESCAPE` を適用する（Issue #1764・WIRE-22）。
+- 複数文メッセージ中の `COPY` の原子性とエラー伝播の検証を網羅した（Issue #1774・WIRE-20。挙動変更なし）。
+  失敗要因と位置の組み合わせで先行文の変更が残らないこと、明示トランザクションの `Failed`／`25P02` の整合を固定。
+- `COPY ... FROM STDIN` が `HEADER（`MATCH` を含む）・`DELIMITER`・`NULL`・`QUOTE`・`ESCAPE` を適用する（Issue #1764・WIRE-22）。
   text 形式では `\<区切り文字>` を区切り文字そのものとして受理する（既定のタブ区切りでも `\<TAB>` がリテラルのタブになる）。
   詳細は [wire-copy-protocol.md](docs/design/wire-copy-protocol.md)。
 - `COPY (...) TO STDOUT` が `HEADER`・`DELIMITER`・`NULL`・`QUOTE`・`ESCAPE` を適用する（Issue #1765・WIRE-22）。

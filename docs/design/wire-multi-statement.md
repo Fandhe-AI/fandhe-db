@@ -239,7 +239,7 @@ SQL-31（`BEGIN`/`COMMIT`/`ROLLBACK`）・RECOVER-12（複数文単位の
 - 暗黙トランザクション内の COPY（Issue #1773・WIRE-20 ポインタ）: `COPY t FROM STDIN ...; SELECT 1`・
   `INSERT ...; COPY t FROM STDIN` は暗黙トランザクションになるが、COPY の文で CopyIn／CopyOut へ入り、
   CopyDone の後に続きの文へ進む（当初は `0A000` で拒否していた）。最後の文が COPY のときの commit 位置・
-  保留データの上限は [wire-copy-protocol.md](wire-copy-protocol.md) の「Issue #1773」節を参照。
+  保留データの上限は [wire-copy-protocol.md](wire-copy-protocol.md) の「Issue #1773」節を参照。失敗時の原子性と `25P02` の整合は「Issue #1774」節。
 
 ## 挙動変化の明記（受理範囲の拡大）
 
@@ -281,6 +281,8 @@ Issue #1175 による変化:
   暗黙トランザクション内の 0 行 `DELETE`（`RETURNING` 有無）の再送が台帳由来の
   `23505`・`ReadyForQuery('I')` になること、途中エラーで全体ロールバックされた場合は
   台帳が残らないこと。
+- `crates/wire-server/tests/wire20_copy_atomicity.rs`（Issue #1774）: 暗黙トランザクション内の COPY の
+  失敗要因 × 位置ごとのロールバックと、明示トランザクションの `Failed`／`25P02` の整合。
 - 回帰: `crates/engine/tests/rls_implicit.rs`（engine API の単一文 `42601`
   契約）・既存 wire 結合テスト一式（`wire1_simple_query.rs` 等）・
   `wire_fault_injection_cli.rs`（commit 後 panic の緊急応答経路が文単位の
