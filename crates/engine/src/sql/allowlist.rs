@@ -4958,8 +4958,8 @@ impl<'a> Parser<'a> {
 
     /// 述語形 DML の `WHERE` でサブクエリ構文を受理する構築（Issue #1750・SQL-53）。
     /// 受理するのは構文段まで。受理した文は core の `execute_subquery_dml_autocommit` が
-    /// 束縛前に `resolve_predicate_*_subqueries` で解決する（#1751。`USING OPERATION_ID` 付きは
-    /// 暫定ゲートが `0A000`、省略時は実行する）。
+    /// 束縛前に `resolve_predicate_*_subqueries` で解決する（#1751）。`USING OPERATION_ID` 付きも
+    /// 解決前の文の正規化ハッシュで台帳を事前照合して実行する（#2650）。
     fn with_dml_where_subquery_ctx(mut self, depth: usize) -> Self {
         self.dml_where_subquery_ctx = Some(depth);
         self

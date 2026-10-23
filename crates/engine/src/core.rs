@@ -12822,7 +12822,6 @@ impl EngineCore {
             session.udfs(),
             resolved.as_ref().unwrap_or(stmt),
             stmt,
-            resolved.is_some(),
             &schema,
         )
     }
@@ -12845,12 +12844,12 @@ impl EngineCore {
         stmt: &crate::sql::allowlist::ValidatedPredicateDelete,
         schema: &crate::catalog::TableSchema,
     ) -> Result<crate::sql::exec::DeleteOutcome, crate::sql::allowlist::SqlSurfaceError> {
-        self.run_predicate_delete_resolved(target, ctx, udfs, stmt, stmt, false, schema)
+        self.run_predicate_delete_resolved(target, ctx, udfs, stmt, stmt, schema)
     }
 
     /// [`Self::run_predicate_delete`] の本体。`bind_stmt` は束縛に使う文（サブクエリ解決済み）、
     /// `hash_stmt` は台帳ハッシュに使う元の文（解決前。SQL-53 (5)・RECOVER-11）。
-    /// `has_subquery` が真のとき、#1752 までの暫定ハッシュを使う（`operation_id` ゲート通過済み）。
+    /// サブクエリつきでも台帳ハッシュは解決前の `hash_stmt` から出す（Issue #2650）。
     #[allow(clippy::too_many_arguments)]
     fn run_predicate_delete_resolved(
         &self,
@@ -12859,7 +12858,6 @@ impl EngineCore {
         udfs: &crate::sql::udf_call::UdfRegistry,
         bind_stmt: &crate::sql::allowlist::ValidatedPredicateDelete,
         hash_stmt: &crate::sql::allowlist::ValidatedPredicateDelete,
-        has_subquery: bool,
         schema: &crate::catalog::TableSchema,
     ) -> Result<crate::sql::exec::DeleteOutcome, crate::sql::allowlist::SqlSurfaceError> {
         // 多層防御（Issue #1129）: 分割実行修飾付きの文は原子実行器へ到達させない
@@ -12868,7 +12866,7 @@ impl EngineCore {
             return Err(crate::sql::allowlist::SqlSurfaceError::PartitionedDmlInTransaction);
         }
         let (bound, content_hash_value) =
-            Self::prepare_predicate_delete(bind_stmt, hash_stmt, has_subquery, schema, udfs)?;
+            Self::prepare_predicate_delete(bind_stmt, hash_stmt, schema, udfs)?;
         crate::sql::exec::execute_predicate_delete_in(
             target,
             ctx,
@@ -13210,12 +13208,12 @@ impl EngineCore {
     /// の有無で再送判定が変わらない契約〔Issue #1182〕をコード上でも 1 箇所に固定）。
     ///
     /// `bind_stmt` は束縛用（サブクエリ解決済み）、`hash_stmt` はハッシュ用の元の文
-    /// （サブクエリのない文では同一。SQL-53 (5)）。`has_subquery` の文は #1752 まで暫定ハッシュ
-    /// （`operation_id` ゲート通過済みで台帳が読まない）を使う。
+    /// （サブクエリのない文では同一。SQL-53 (5)）。サブクエリつきの文も解決**前**の `hash_stmt` から
+    /// 正規化ハッシュを出す（Issue #2650。`dml_subquery_exec` の事前照合と同じ入力・同じ関数なので
+    /// 事前照合と確定記録のハッシュは一致する）。
     fn prepare_predicate_delete(
         bind_stmt: &crate::sql::allowlist::ValidatedPredicateDelete,
         hash_stmt: &crate::sql::allowlist::ValidatedPredicateDelete,
-        has_subquery: bool,
         schema: &crate::catalog::TableSchema,
         udfs: &crate::sql::udf_call::UdfRegistry,
     ) -> Result<
@@ -13226,15 +13224,11 @@ impl EngineCore {
         crate::sql::allowlist::SqlSurfaceError,
     > {
         let bound = crate::sql::parser::bind_predicate_delete(bind_stmt, schema, udfs)?;
-        let content_hash_value = if has_subquery {
-            dml_subquery_exec::provisional_hash_delete(hash_stmt.table_name(), udfs)?
-        } else {
-            crate::recovery::content_hash::for_delete_where(
-                hash_stmt.table_name(),
-                hash_stmt.where_predicates(),
-                udfs,
-            )?
-        };
+        let content_hash_value = crate::recovery::content_hash::for_delete_where(
+            hash_stmt.table_name(),
+            hash_stmt.where_predicates(),
+            udfs,
+        )?;
         Ok((bound, content_hash_value))
     }
 
@@ -13282,7 +13276,6 @@ impl EngineCore {
         let (bound, content_hash_value) = Self::prepare_predicate_delete(
             resolved.as_ref().unwrap_or(stmt),
             stmt,
-            resolved.is_some(),
             &schema,
             session.udfs(),
         )?;
@@ -13483,7 +13476,6 @@ impl EngineCore {
             session.udfs(),
             resolved.as_ref().unwrap_or(validated),
             validated,
-            resolved.is_some(),
             &schema,
         )
     }
@@ -13495,13 +13487,12 @@ impl EngineCore {
     /// が共有する（`RETURNING` の有無で再送判定が変わらない契約〔Issue #1182〕を
     /// コード上でも 1 箇所に固定）。
     ///
-    /// `bind_stmt`／`validated`（ハッシュ用の元の文）／`has_subquery` の意味は
-    /// [`Self::prepare_predicate_delete`] と同じ（`has_subquery` の文は `legacy_hashes` を空にし
-    /// 暫定ハッシュを使う。#1752 で撤去）。
+    /// `bind_stmt`／`validated`（ハッシュ用の元の文）の意味は
+    /// [`Self::prepare_predicate_delete`] と同じ。サブクエリつきの文でも `legacy_hashes` は一律に計算する
+    /// （サブクエリつきは従来 `0A000` で記録されず正準化前エントリは存在しないため判定は弱まらない）。
     fn prepare_predicate_update(
         bind_stmt: &crate::sql::allowlist::ValidatedPredicateUpdate,
         validated: &crate::sql::allowlist::ValidatedPredicateUpdate,
-        has_subquery: bool,
         schema: &crate::catalog::TableSchema,
         udfs: &crate::sql::udf_call::UdfRegistry,
     ) -> Result<
@@ -13513,11 +13504,6 @@ impl EngineCore {
         crate::sql::allowlist::SqlSurfaceError,
     > {
         let predicate = crate::sql::parser::bind_predicate_update(bind_stmt, schema, udfs)?;
-        if has_subquery {
-            let hash = dml_subquery_exec::provisional_hash_update(validated, schema, udfs)?;
-            return Ok((predicate, hash, Vec::new()));
-        }
-
         let assignment_refs: Vec<(&str, &crate::sql::allowlist::SetValue)> = validated
             .assignments()
             .iter()
@@ -13605,7 +13591,6 @@ impl EngineCore {
                 let (bound, content_hash_value, legacy_hashes) = Self::prepare_predicate_update(
                     resolved.as_ref().unwrap_or(validated),
                     validated,
-                    resolved.is_some(),
                     &schema,
                     session.udfs(),
                 )?;
@@ -13643,10 +13628,10 @@ impl EngineCore {
         validated: &crate::sql::allowlist::ValidatedPredicateUpdate,
         schema: &crate::catalog::TableSchema,
     ) -> Result<crate::sql::exec::UpdateOutcome, crate::sql::allowlist::SqlSurfaceError> {
-        self.run_predicate_update_resolved(target, ctx, udfs, validated, validated, false, schema)
+        self.run_predicate_update_resolved(target, ctx, udfs, validated, validated, schema)
     }
 
-    /// [`Self::run_predicate_update`] の本体（`bind_stmt`／`hash_stmt`／`has_subquery` の意味は
+    /// [`Self::run_predicate_update`] の本体（`bind_stmt`／`hash_stmt` の意味は
     /// [`Self::run_predicate_delete_resolved`] と同じ）。
     #[allow(clippy::too_many_arguments)]
     fn run_predicate_update_resolved(
@@ -13656,7 +13641,6 @@ impl EngineCore {
         udfs: &crate::sql::udf_call::UdfRegistry,
         bind_stmt: &crate::sql::allowlist::ValidatedPredicateUpdate,
         hash_stmt: &crate::sql::allowlist::ValidatedPredicateUpdate,
-        has_subquery: bool,
         schema: &crate::catalog::TableSchema,
     ) -> Result<crate::sql::exec::UpdateOutcome, crate::sql::allowlist::SqlSurfaceError> {
         // 多層防御（Issue #1129）: 分割実行修飾付きの文は原子実行器へ到達させない。
@@ -13664,7 +13648,7 @@ impl EngineCore {
             return Err(crate::sql::allowlist::SqlSurfaceError::PartitionedDmlInTransaction);
         }
         let (predicate, content_hash_value, legacy_hash) =
-            Self::prepare_predicate_update(bind_stmt, hash_stmt, has_subquery, schema, udfs)?;
+            Self::prepare_predicate_update(bind_stmt, hash_stmt, schema, udfs)?;
         let legacy_hashes: &[crate::recovery::content_hash::ContentHash] = legacy_hash.as_slice();
         crate::sql::exec::execute_predicate_update_in(
             target,

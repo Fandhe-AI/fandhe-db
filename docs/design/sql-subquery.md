@@ -39,7 +39,7 @@
 | 拡張クエリプロトコル（Parse/Bind、`$n`） | **非対応**（`42601`。理由は後述） |
 | Describe（拡張クエリプロトコルの投影列導出） | 対象外（拡張クエリプロトコル自体が非対応のため） |
 | `EXPLAIN`・カーソル `DECLARE`・`COPY (SELECT ...) TO`・CHECK 制約本体・`CREATE VIEW` 本体・明示トランザクション内 | **非対応**（`42601`。すべて構文解析段でゲート） |
-| 述語形 `UPDATE`/`DELETE` の `WHERE`（Issue #1750・SQL-53 (a)） | 構文段は受理（`Parser::parse_dml_where` が WHERE 解析の間だけ文脈を有効化。`RETURNING`・`SET` 右辺・`PARTITIONED` 併用・ビュー経由は `42601`）。実行は #1751 の経路（束縛前に内側を RLS つきで解決）。`USING OPERATION_ID` 付きは暫定ゲートが内側の実行前に `0A000` で拒否し、省略時（`Optional` 台帳モード）は実行する |
+| 述語形 `UPDATE`/`DELETE` の `WHERE`（Issue #1750・SQL-53 (a)） | 構文段は受理（`Parser::parse_dml_where` が WHERE 解析の間だけ文脈を有効化。`RETURNING`・`SET` 右辺・`PARTITIONED` 併用・ビュー経由は `42601`）。実行は #1751 の経路（束縛前に内側を RLS つきで解決）。`USING OPERATION_ID` 付きも受理し、解決前の文の正規化ハッシュで内側の評価前に台帳を事前照合する（Issue #2650。再送 `23505`・別文の再利用 `22023`） |
 
 ## 設計
 
