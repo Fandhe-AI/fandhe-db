@@ -75,6 +75,7 @@ fn follows_operand(prev: Option<&Token>) -> bool {
                 | Token::Param(_)
                 | Token::StringLiteral(_)
                 | Token::QuotedBoolWord(_)
+                | Token::QuotedNull(_)
                 | Token::Punct(')' | ']')
         )
     )
@@ -348,6 +349,15 @@ mod tests {
         same(
             "SELECT id FROM t FETCH NEXT ROWS ONLY",
             "SELECT id FROM t LIMIT 1",
+        );
+    }
+
+    #[test]
+    fn quoted_value_function_name_is_operand_end() {
+        // 引用付きの値関数名（`"current_date"` 等）は QuotedNull になるが識別子の終端
+        same(
+            "SELECT id FROM q ORDER BY \"current_date\" FETCH FIRST 2 ROWS ONLY",
+            "SELECT id FROM q ORDER BY \"current_date\" LIMIT 2",
         );
     }
 
