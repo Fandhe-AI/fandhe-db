@@ -4575,7 +4575,7 @@ pub(crate) fn execute_predicate_delete_returning(
 /// `sql/scan.rs::execute_scan` の走査ループと同一の意味論。第 2 の述語評価器を
 /// 作らない）。`run` の第 1 引数は候補列挙で embedding を復号する必要があるか
 /// （`WHERE` が embedding を参照するか）、第 2 引数が述語。
-fn run_where_predicate<R>(
+pub(crate) fn run_where_predicate<R>(
     schema: &TableSchema,
     metadata_filters: &[crate::declarative_filter::MetadataFilter],
     expr_filters: &[udf_call::BoundExpr],

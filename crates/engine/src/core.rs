@@ -77,6 +77,10 @@ mod insert_select_exec;
 
 // 述語形 UPDATE／DELETE の WHERE 内サブクエリの実行（SQL-53・Issue #1751）。
 mod dml_subquery_exec;
+// 述語形 UPDATE ... FROM／DELETE ... USING の結合実行（SQL-53・Issue #1755）。
+mod dml_join_exec;
+#[cfg(test)]
+mod dml_join_exec_tests;
 #[cfg(test)]
 mod dml_subquery_exec_tests;
 

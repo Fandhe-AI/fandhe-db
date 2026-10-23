@@ -555,6 +555,7 @@ fn chunk_loop<E>(
                 &candidate_ids,
                 assignments,
                 set_exprs,
+                None,
                 fk_mode,
                 None,
                 Some(&mut stop_by_hold),

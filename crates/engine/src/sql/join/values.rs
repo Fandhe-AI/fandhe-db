@@ -105,6 +105,37 @@ pub(super) fn encode_key_component(
     }
 }
 
+/// 行ストアの借用スカラー（[`ScalarRef`]）を、結合キー用の [`Cell`] へ写像する
+/// （`UPDATE ... FROM`／`DELETE ... USING` の対象側 probe キー用。Issue #1755・SQL-53）。
+///
+/// 責務境界: 対象表の行は `sql::scan` を経由せず、DML の候補列挙が渡す `ScalarRef` の形で届く。
+/// FROM／USING 側（走査結果の [`Cell`]）と同じ [`encode_key_component`] へ流し込むための
+/// 最小アダプタで、結合キーとして許可する型クラス（[`key_class`]）だけを扱い、キーの正準化を
+/// 2 系統にしない（両経路のバイト列一致は単体テストで固定する）。`class` と値が整合しない
+/// 組は内部バグとして `Internal`（fail-closed）。
+pub(super) fn key_cell_from_scalar(
+    scalar: &ScalarRef<'_>,
+    class: &JoinKeyClass,
+) -> Result<Cell, SqlSurfaceError> {
+    let cell = match (class, scalar) {
+        (JoinKeyClass::Integer, ScalarRef::Integer(v)) => Cell::SignedInteger(i64::from(*v)),
+        (JoinKeyClass::Integer, ScalarRef::BigInt(v)) => Cell::SignedInteger(*v),
+        (JoinKeyClass::Text, ScalarRef::Text(s)) => Cell::Text((*s).to_string()),
+        (JoinKeyClass::Enum(_), ScalarRef::Enum(s)) => Cell::Text((*s).to_string()),
+        (JoinKeyClass::Bool, ScalarRef::Bool(b)) => Cell::Bool(*b),
+        (JoinKeyClass::Date, ScalarRef::Date(d)) => Cell::Date(*d),
+        (JoinKeyClass::Timestamp, ScalarRef::Timestamp(t)) => Cell::Timestamp(*t),
+        (JoinKeyClass::Uuid, ScalarRef::Uuid(u)) => Cell::Uuid(*u),
+        (JoinKeyClass::Bytea, ScalarRef::Bytes(b)) => Cell::Bytes((*b).to_vec()),
+        _ => {
+            return Err(SqlSurfaceError::Internal {
+                detail: "JOIN key scalar/class mismatch".to_string(),
+            })
+        }
+    };
+    Ok(cell)
+}
+
 /// 列同士の比較・スカラー `ORDER BY` の型クラス（Issue #1190）。結合キーと異なり
 /// 浮動小数・`NUMERIC` も比較できる。クラスが一致しない比較は `42804`。
 #[derive(Debug, Clone, PartialEq)]
@@ -331,6 +362,71 @@ mod tests {
         assert!(op_holds(BinOp::Lt, Ordering::Less));
         assert!(!op_holds(BinOp::Gt, Ordering::Equal));
         assert!(!op_holds(BinOp::Add, Ordering::Equal));
+    }
+
+    #[test]
+    fn key_cell_from_scalar_encodes_identically_to_the_cell_path() {
+        let enc = |c: &Cell, class: &JoinKeyClass| {
+            let mut out = Vec::new();
+            encode_key_component(c, class, &mut out).expect("encode");
+            out
+        };
+        let uuid = crate::uuid::Uuid::from_bytes([7u8; 16]);
+        let cases: Vec<(ScalarRef<'_>, JoinKeyClass, Cell)> = vec![
+            (
+                ScalarRef::Integer(-5),
+                JoinKeyClass::Integer,
+                Cell::SignedInteger(-5),
+            ),
+            (
+                ScalarRef::BigInt(i64::MIN),
+                JoinKeyClass::Integer,
+                Cell::SignedInteger(i64::MIN),
+            ),
+            (
+                ScalarRef::Text("ab"),
+                JoinKeyClass::Text,
+                Cell::Text("ab".to_string()),
+            ),
+            (
+                ScalarRef::Enum("red"),
+                JoinKeyClass::Enum("color".to_string()),
+                Cell::Text("red".to_string()),
+            ),
+            (ScalarRef::Bool(true), JoinKeyClass::Bool, Cell::Bool(true)),
+            (
+                ScalarRef::Date(19000),
+                JoinKeyClass::Date,
+                Cell::Date(19000),
+            ),
+            (
+                ScalarRef::Timestamp(123),
+                JoinKeyClass::Timestamp,
+                Cell::Timestamp(123),
+            ),
+            (ScalarRef::Uuid(uuid), JoinKeyClass::Uuid, Cell::Uuid(uuid)),
+            (
+                ScalarRef::Bytes(&[1, 2, 3]),
+                JoinKeyClass::Bytea,
+                Cell::Bytes(vec![1, 2, 3]),
+            ),
+        ];
+        for (scalar, class, expected_cell) in cases {
+            let via_scalar = key_cell_from_scalar(&scalar, &class).expect("convert");
+            assert_eq!(
+                enc(&via_scalar, &class),
+                enc(&expected_cell, &class),
+                "{class:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn key_cell_from_scalar_rejects_mismatched_class_fail_closed() {
+        let err = key_cell_from_scalar(&ScalarRef::Text("x"), &JoinKeyClass::Integer)
+            .expect_err("mismatch");
+        assert_eq!(err.wire_code(), "XX000");
+        assert!(key_cell_from_scalar(&ScalarRef::Double(1.0), &JoinKeyClass::Integer).is_err());
     }
 
     #[test]
