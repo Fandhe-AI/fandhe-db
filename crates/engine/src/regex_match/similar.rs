@@ -32,6 +32,8 @@ struct Bracket {
     depth: usize,
     /// ブラケット先頭からの位置（`[` を 1 とする）。`]` が先頭直後ならリテラル扱いにする。
     pos: usize,
+    /// `[` 直後の否定マーカー `^` を既に読み飛ばしたか。2 個目以降の `^` は通常のメンバー。
+    negated: bool,
 }
 
 /// SQL 正規表現 `pattern` を ARE へ変換する。
@@ -44,7 +46,11 @@ pub(super) fn convert(pattern: &str, escape: Option<char>) -> Result<String, Sim
     let cap = chars.len().saturating_mul(8).saturating_add(8);
     let mut out = String::with_capacity(cap.min(64 * 1024));
     out.push_str("^(?:");
-    let mut bracket = Bracket { depth: 0, pos: 0 };
+    let mut bracket = Bracket {
+        depth: 0,
+        pos: 0,
+        negated: false,
+    };
     let mut after_escape = false;
     let mut quotes: u8 = 0;
     let mut i = 0usize;
@@ -89,8 +95,11 @@ pub(super) fn convert(pattern: &str, escape: Option<char>) -> Result<String, Sim
             } else if c == '[' && matches!(next, Some(':' | '.' | '=')) {
                 bracket.depth = bracket.depth.saturating_add(1);
             }
-            // `[^` の `^` は位置を進めない（`[^]a]` の `]` はリテラル）。
-            if !(c == '^' && bracket.pos == 1) {
+            // `[` 直後の否定マーカー `^`（1 回だけ）は位置を進めない（`[^]a]` の `]` はリテラル）。
+            // 2 個目の `^`（`[^^]`）は通常のメンバーとして位置を進める。
+            if c == '^' && bracket.pos == 1 && !bracket.negated {
+                bracket.negated = true;
+            } else {
                 bracket.pos = bracket.pos.saturating_add(1);
             }
             continue;
@@ -98,7 +107,11 @@ pub(super) fn convert(pattern: &str, escape: Option<char>) -> Result<String, Sim
         match c {
             '[' => {
                 out.push('[');
-                bracket = Bracket { depth: 1, pos: 1 };
+                bracket = Bracket {
+                    depth: 1,
+                    pos: 1,
+                    negated: false,
+                };
             }
             '%' => out.push_str(".*"),
             '_' => out.push('.'),
@@ -120,6 +133,16 @@ mod tests {
 
     fn c(p: &str) -> Result<String, SimilarError> {
         convert(p, Some('\\'))
+    }
+
+    #[test]
+    fn double_caret_is_negation_plus_member() {
+        // `[^^]` は否定マーカー 1 個＋メンバー `^`。直後の `]` でクラスが閉じ、後続の
+        // SQL メタ文字は通常どおり変換される。
+        assert_eq!(c("[^^]%").unwrap(), "^(?:[^^].*)$");
+        assert_eq!(c("[^^]_(a)").unwrap(), "^(?:[^^].(?:a))$");
+        // 否定マーカー直後の `]` は従来どおりリテラル。
+        assert_eq!(c("[^]a]%").unwrap(), "^(?:[^]a].*)$");
     }
 
     #[test]

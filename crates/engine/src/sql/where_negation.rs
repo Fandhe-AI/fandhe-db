@@ -189,11 +189,13 @@ fn negate_one(
             case_insensitive,
             lhs,
             pattern,
+            raw_pattern_len,
         }) => Ok(vec![WherePredicate::Expression(Expr::RegexMatch {
             negated: !negated,
             case_insensitive,
             lhs,
             pattern,
+            raw_pattern_len,
         })]),
         WherePredicate::Expression(Expr::Binary { op, lhs, rhs }) => match op {
             BinOp::Gt | BinOp::Lt | BinOp::Ge | BinOp::Le => {
@@ -304,6 +306,7 @@ mod tests {
             case_insensitive: true,
             lhs: Box::new(Expr::Ident("a".to_string())),
             pattern: Box::new(Expr::String("x".to_string())),
+            raw_pattern_len: None,
         })
     }
 

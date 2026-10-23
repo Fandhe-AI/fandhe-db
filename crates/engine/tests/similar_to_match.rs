@@ -138,3 +138,28 @@ fn pathological_patterns_terminate() {
     let r = run(&"a".repeat(1000), "(a*)*b", Some('\\'));
     assert_eq!(r, Ok(false));
 }
+
+#[test]
+fn double_caret_bracket_closes_and_following_meta_is_converted() {
+    assert_eq!(run("a", "[^^]%", Some('\\')), Ok(true));
+    assert_eq!(run("^", "[^^]%", Some('\\')), Ok(false));
+    assert_eq!(run("axyz", "[^^]%", Some('\\')), Ok(true));
+    assert_eq!(run("a%", "[^^]%", Some('\\')), Ok(true));
+}
+
+#[test]
+fn converted_pattern_is_checked_against_raw_length_limit() {
+    // 変換前 90 バイト・変換後 66 バイト。上限 70 では生パターン長で拒否する。
+    let raw = "é%".repeat(30);
+    let are = similar_to_are(&raw, Some('é')).unwrap();
+    assert!(are.len() < 70 && raw.len() > 70);
+    let l = RegexLimits::new(70, 1024, 1_000_000);
+    assert_eq!(
+        CompiledRegex::compile_converted(&are, raw.len(), RegexCaseMode::Sensitive, l).unwrap_err(),
+        RegexError::PatternTooLong
+    );
+    // 上限 1 でも 1 文字のパターンはラッパー分で弾かれない。
+    let one = similar_to_are("a", Some('\\')).unwrap();
+    let l1 = RegexLimits::new(1, 1024, 1_000_000);
+    assert!(CompiledRegex::compile_converted(&one, 1, RegexCaseMode::Sensitive, l1).is_ok());
+}

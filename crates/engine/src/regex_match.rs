@@ -118,8 +118,8 @@ impl From<similar::SimilarError> for RegexError {
 ///
 /// `escape` は ESCAPE 句の文字（`None` は `ESCAPE ''` でエスケープなし。句が無い場合の既定
 /// `\` は呼び出し元が `Some('\\')` で渡す）。確保の前に生パターンのバイト長をハード上限
-/// ([`MAX_REGEX_PATTERN_LEN`]) で検査する（`54000`）。CLI で下げた上限は、変換後の ARE に対する
-/// `compile` の長さ検査が担う。出力は `^(?:` … `)$` で囲まれ、全体一致になる。
+/// ([`MAX_REGEX_PATTERN_LEN`]) で検査する（`54000`）。CLI で下げた上限は、変換前の生パターン長に
+/// 対して束縛時に [`CompiledRegex::compile_converted`] が適用する。出力は `^(?:` … `)$` で囲まれ、全体一致になる。
 pub fn similar_to_are(pattern: &str, escape: Option<char>) -> Result<String, RegexError> {
     if pattern.len() > MAX_REGEX_PATTERN_LEN {
         return Err(RegexError::PatternTooLong);
@@ -144,6 +144,36 @@ impl CompiledRegex {
         if pattern.len() > limits.max_pattern_len() {
             return Err(RegexError::PatternTooLong);
         }
+        Self::compile_checked(pattern, case, limits)
+    }
+
+    /// [`similar_to_are`] の出力（変換済み ARE）をコンパイルする。設定済みのパターン長上限は
+    /// 変換前の生パターン長 `raw_len` に適用する（変換でラッパーが付き ESCAPE 分が縮むため、
+    /// 変換後の長さで測ると CLI 上限の契約とずれる）。変換後の ARE は生パターンがハード上限
+    /// 以下である限り有界（1 文字あたり最大 8 文字）なので、変換後の長さは検査せず
+    /// コンパイルサイズ上限に委ねる。
+    pub fn compile_converted(
+        are: &str,
+        raw_len: usize,
+        case: RegexCaseMode,
+        limits: RegexLimits,
+    ) -> Result<Self, RegexError> {
+        if raw_len > limits.max_pattern_len() {
+            return Err(RegexError::PatternTooLong);
+        }
+        // 多層防御: 呼び出し元の取り違えでも変換後の長さを無制限にしない。
+        let are_cap = MAX_REGEX_PATTERN_LEN.saturating_mul(8).saturating_add(8);
+        if are.len() > are_cap {
+            return Err(RegexError::PatternTooLong);
+        }
+        Self::compile_checked(are, case, limits)
+    }
+
+    fn compile_checked(
+        pattern: &str,
+        case: RegexCaseMode,
+        limits: RegexLimits,
+    ) -> Result<Self, RegexError> {
         let translated = translate::translate(pattern, case == RegexCaseMode::AsciiInsensitive)?;
         // 自前の深さ上限に、変換が足すラッパー（量指定・クラス）の分の余裕を持たせた多重防御。
         let nest_limit = u32::try_from(MAX_REGEX_NEST_DEPTH.saturating_mul(4).saturating_add(16))

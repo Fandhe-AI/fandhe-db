@@ -10,6 +10,7 @@
     "^docs/spec/",
     "^LICENSE-APACHE$",
     "^LICENSE-MIT$",
-    "^crates/engine/tests/fixtures/.*\\.redb$"
+    "^crates/engine/tests/fixtures/.*\\.redb$",
+    "^crates/engine/tests/data/.*\\.tsv$"
   ]
 }

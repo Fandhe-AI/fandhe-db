@@ -579,11 +579,13 @@ pub(crate) fn fold_session_local_literals(expr: &Expr) -> Result<Expr, SqlSurfac
             case_insensitive,
             lhs,
             pattern,
+            raw_pattern_len,
         } => Expr::RegexMatch {
             negated: *negated,
             case_insensitive: *case_insensitive,
             lhs: Box::new(rec(lhs)?),
             pattern: Box::new(rec(pattern)?),
+            raw_pattern_len: *raw_pattern_len,
         },
         Expr::Collate { expr, collation } => Expr::Collate {
             expr: Box::new(rec(expr)?),

@@ -7045,6 +7045,7 @@ impl<'a> Parser<'a> {
             case_insensitive,
             lhs: Box::new(lhs),
             pattern: Box::new(pattern),
+            raw_pattern_len: None,
         }))
     }
 
@@ -7130,6 +7131,7 @@ impl<'a> Parser<'a> {
         } else {
             Some('\\')
         };
+        let raw_len = raw.as_ref().map(String::len);
         let pattern = match raw {
             Some(raw) => Expr::String(
                 crate::regex_match::similar_to_are(&raw, escape).map_err(SqlSurfaceError::Regex)?,
@@ -7143,6 +7145,7 @@ impl<'a> Parser<'a> {
             case_insensitive: false,
             lhs: Box::new(lhs),
             pattern: Box::new(pattern),
+            raw_pattern_len: raw_len,
         }))
     }
 
