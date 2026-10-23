@@ -328,3 +328,91 @@ fn wire20_insert_then_copy_to_binary_unsupported_type_does_not_commit_insert() {
     assert_eq!(read_ready_for_query_status(&mut stream), b'I');
     assert_eq!(count_docs(&mut stream), 0);
 }
+/// 持続時間上限つきのエンジンで暗黙トランザクションの COPY を受信させるサーバーを起動する。
+fn spawn_with_short_max_duration() -> (
+    std::net::SocketAddr,
+    temp_db::CleanupGuard,
+    common::UserStoreFile,
+) {
+    let limits = wire_server::transaction_limits_opt::resolve(
+        wire_server::transaction_limits_opt::TransactionLimitsRawFlags {
+            max_duration_ms: Some("300"),
+            max_statements: None,
+        },
+    )
+    .expect("valid --max-transaction-duration-ms");
+    let (core, guard) = new_core_with_docs_table();
+    let core = Arc::try_unwrap(core)
+        .unwrap_or_else(|_| panic!("sole owner"))
+        .with_transaction_limits(limits);
+    let users = write_user_store_file(&[("alice", "tenant-a", "pw-alice")]);
+    let addr = spawn_server_with_engine(&users, Arc::new(core));
+    (addr, guard, users)
+}
+
+/// 接続が応答なしで閉じられた（EOF またはリセット）ことを確認する。
+fn assert_closed_without_response(stream: &mut std::net::TcpStream) {
+    stream
+        .set_read_timeout(Some(std::time::Duration::from_secs(3)))
+        .expect("client read timeout");
+    let mut buf = [0u8; 1];
+    match stream.read(&mut buf) {
+        Ok(0) | Err(_) => {}
+        other => panic!("connection must close without a response: {other:?}"),
+    }
+}
+
+/// 別接続の書き込みがライタ待ちで失敗せず完了する（ライタが解放済み）ことを確認する。
+fn assert_writer_released(addr: std::net::SocketAddr) {
+    let mut other = authenticate_to_ready_for_query(addr, "alice", "pw-alice");
+    send_simple_query(
+        &mut other,
+        "COPY docs (id, embedding, lang) FROM STDIN USING OPERATION_ID 'w20-released'",
+    );
+    assert_eq!(read_copy_in_response(&mut other), 3);
+    send_copy_data(&mut other, b"9\t[1.0,0.0]\tja\n");
+    send_copy_done(&mut other);
+    assert_eq!(read_command_complete(&mut other), "COPY 1");
+    read_ready_for_query(&mut other);
+}
+
+/// Issue #1773 レビュー指摘: 暗黙トランザクションの COPY 受信が無通信のまま持続時間上限を
+/// 越えたら、応答なしで接続を閉じてライタを解放する。
+#[test]
+fn wire20_implicit_copy_idle_past_max_duration_releases_writer() {
+    let (addr, _guard, _users) = spawn_with_short_max_duration();
+    let mut stream = authenticate_to_ready_for_query(addr, "alice", "pw-alice");
+    send_simple_query(
+        &mut stream,
+        "COPY docs (id, embedding, lang) FROM STDIN USING OPERATION_ID 'w20-idle'; SELECT 1",
+    );
+    assert_eq!(read_copy_in_response(&mut stream), 3);
+    assert_closed_without_response(&mut stream);
+    assert_writer_released(addr);
+}
+
+/// Issue #1773 レビュー指摘: CopyData の本文を少しずつ送り続けても、持続時間上限で
+/// 接続が閉じられライタが解放される。
+#[test]
+fn wire20_implicit_copy_slow_body_past_max_duration_releases_writer() {
+    use std::io::Write;
+    let (addr, _guard, _users) = spawn_with_short_max_duration();
+    let mut stream = authenticate_to_ready_for_query(addr, "alice", "pw-alice");
+    send_simple_query(
+        &mut stream,
+        "COPY docs (id, embedding, lang) FROM STDIN USING OPERATION_ID 'w20-slow'; SELECT 1",
+    );
+    assert_eq!(read_copy_in_response(&mut stream), 3);
+    // 長さ 1004 の CopyData を宣言し、本文を 1 バイトずつ送る。
+    let mut frame = vec![b'd'];
+    frame.extend_from_slice(&1004i32.to_be_bytes());
+    let _ = stream.write_all(&frame);
+    for _ in 0..40 {
+        if stream.write_all(b"x").is_err() {
+            break;
+        }
+        std::thread::sleep(std::time::Duration::from_millis(30));
+    }
+    assert_closed_without_response(&mut stream);
+    assert_writer_released(addr);
+}

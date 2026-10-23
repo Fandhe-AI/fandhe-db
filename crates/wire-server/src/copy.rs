@@ -39,6 +39,7 @@
 //! ErrorResponse は CopyDone／CopyFail 受信後にまとめて送る）。
 
 use std::io;
+use std::time::{Duration, Instant};
 
 use engine::core::{CopyPlan, EngineCore};
 use engine::error_format::{ClassifiedError, ErrorClass};
@@ -706,6 +707,58 @@ fn prepare_decoder(session: &CopyInSession) -> Result<CopyInDecoder, CopyFromErr
     Ok(CopyInDecoder::Binary { reader, columns })
 }
 
+/// COPY FROM STDIN の次フレームの型バイトを読む。トランザクションが `Active`（暗黙・明示とも
+/// 単一ライタを保持中）の間は、型バイト待ちと続く長さ・本文の受信全体に「持続時間の残り
+/// （と接続の読み取りタイムアウト）」までの期限を課す（SQL-31・Issue #1773 レビュー指摘。
+/// `handshake::post_auth_loop` の期限は 'Q' の受信前に決まるため COPY のフレームには及ばない）。
+/// 期限超過は `TimedOut` の I/O エラーを返し、接続は応答なしで閉じられてライタが解放される。
+/// 戻り値のガードは呼び出し元が 1 フレームの受信が済むまで保持する。`Active` でなければ従来どおり。
+fn read_copy_frame_header<S: WireStream>(
+    stream: &mut S,
+    txn: &SessionTransaction<'_>,
+    base_timeout: Option<Duration>,
+) -> io::Result<(Option<u8>, Option<framing::FrameDeadlineGuard>)> {
+    let Some(remaining) = txn.remaining_duration() else {
+        return match framing::read_typed_frame_header(stream) {
+            Ok(h) => Ok((h, None)),
+            Err(e) => Err(respond_frame_error_and_terminate(stream, e)),
+        };
+    };
+    let budget = base_timeout.map_or(remaining, |b| remaining.min(b));
+    let poll = budget
+        .min(crate::handshake::FRAME_DEADLINE_POLL)
+        .max(crate::handshake::MIN_BOUNDED_READ_WAIT);
+    stream.set_read_timeout(Some(poll))?;
+    let deadline = Instant::now()
+        .checked_add(budget)
+        .unwrap_or_else(Instant::now);
+    loop {
+        if Instant::now() >= deadline {
+            return Err(io::Error::new(
+                io::ErrorKind::TimedOut,
+                "COPY receive deadline exceeded",
+            ));
+        }
+        match framing::read_typed_frame_header(stream) {
+            Ok(h) => {
+                let body_budget = txn
+                    .remaining_duration()
+                    .map_or(budget, |r| base_timeout.map_or(r, |b| r.min(b)));
+                let body_deadline = Instant::now()
+                    .checked_add(body_budget)
+                    .unwrap_or_else(Instant::now);
+                return Ok((h, Some(framing::FrameDeadlineGuard::set(body_deadline))));
+            }
+            Err(FrameError::Io(e))
+                if matches!(
+                    e.kind(),
+                    io::ErrorKind::WouldBlock | io::ErrorKind::TimedOut
+                ) => {}
+            Err(e) => return Err(respond_frame_error_and_terminate(stream, e)),
+        }
+    }
+}
+
 /// `COPY <table> (<cols>) FROM STDIN`: CopyInResponse → CopyData*／CopyDone／
 /// CopyFail のサブプロトコルを 1 回の呼び出しで完結させる。行のデコード・
 /// 束縛・INDEX-4 逐次判定は [`CopyInSession::feed`] が担う（`sql::copy`
@@ -725,7 +778,38 @@ fn prepare_decoder(session: &CopyInSession) -> Result<CopyInDecoder, CopyFromErr
 /// 接続スロットを保持し続けていた。`Closed` はループを終了させるべき
 /// 場合——Terminate 受信・ストリーム側の早期 EOF——にのみ返す）。
 #[allow(clippy::too_many_arguments)]
+/// [`run_copy_from_inner`] の呼び出しを挟み、受信期限のために変更した読み取りタイムアウトを
+/// 呼び出し前の値へ戻す（`post_auth_loop` が現在値をキャッシュしているため）。
 fn run_copy_from<'e, S: WireStream>(
+    stream: &mut S,
+    engine: &'e EngineCore,
+    ctx: &PolicyContext,
+    conn_session: &mut SessionState,
+    txn: &mut SessionTransaction<'e>,
+    session: CopyInSession,
+    finish: Finish,
+    role: StatementRole,
+) -> io::Result<CopyStep> {
+    let base_timeout = stream.read_timeout()?;
+    let result = run_copy_from_inner(
+        stream,
+        engine,
+        ctx,
+        conn_session,
+        txn,
+        session,
+        finish,
+        role,
+        base_timeout,
+    );
+    if result.is_ok() {
+        stream.set_read_timeout(base_timeout)?;
+    }
+    result
+}
+
+#[allow(clippy::too_many_arguments)]
+fn run_copy_from_inner<'e, S: WireStream>(
     stream: &mut S,
     engine: &'e EngineCore,
     ctx: &PolicyContext,
@@ -734,6 +818,7 @@ fn run_copy_from<'e, S: WireStream>(
     mut session: CopyInSession,
     finish: Finish,
     role: StatementRole,
+    base_timeout: Option<Duration>,
 ) -> io::Result<CopyStep> {
     let mut decoder = match prepare_decoder(&session) {
         Ok(d) => d,
@@ -762,10 +847,10 @@ fn run_copy_from<'e, S: WireStream>(
     let mut discarded_messages: usize = 0;
 
     loop {
-        let type_byte = match framing::read_typed_frame_header(stream) {
-            Ok(Some(b)) => b,
-            Ok(None) => return Ok(CopyStep::Closed),
-            Err(e) => return Err(respond_frame_error_and_terminate(stream, e)),
+        let (header, _frame_deadline) = read_copy_frame_header(stream, txn, base_timeout)?;
+        let type_byte = match header {
+            Some(b) => b,
+            None => return Ok(CopyStep::Closed),
         };
         match type_byte {
             b'd' => {
