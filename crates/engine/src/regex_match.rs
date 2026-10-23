@@ -5,8 +5,12 @@
 //! （`docs/design/regex-crate-adoption.md`）を engine 内部 API で包む。公開シグネチャに
 //! `regex` の型は出さない（呼び出し側は [`CompiledRegex`]・[`RegexError`]・[`RegexCaseMode`]
 //! だけを見る）。SQL 表層への配線（`~` 系は Issue #1787 で配線済みで、呼び出し元は `sql::regex_op`。
-//! `SIMILAR TO` は #1788、jsonpath の `like_regex` は #1784）は本モジュールの範囲外で、ここは
+//! `SIMILAR TO` は Issue #1788 で配線済み。jsonpath の `like_regex` は #1784）は本モジュールの範囲外で、ここは
 //! 評価器の部品だけを提供する。
+//!
+//! `SIMILAR TO`（Issue #1788）は、構文段（`sql::allowlist`）が [`similar_to_are`] で SQL 正規表現を
+//! ARE へ変換して `~` と同じ [`CompiledRegex::compile`] へ渡す（PG 自身の `similar_to_escape()` →
+//! 正規表現エンジンの 2 段構成と同じ）。変換結果も [`translate`] が 1 文字ずつ再検証する。
 //!
 //! 処理順序（`docs/design/regex-matcher.md`）:
 //!
@@ -21,10 +25,13 @@
 //! エラー文言は固定の英語で、パターン・入力の断片や `regex::Error` の文面
 //! （パターン文字列を含む）はクライアントへ運ばない（fail-closed・情報漏えい防止）。
 
+mod similar;
 mod translate;
 
 use crate::error_format::{ClassifiedError, ErrorClass};
-use crate::regex_limits::{RegexLimits, MAX_REGEX_NEST_DEPTH, REGEX_DFA_CACHE_BYTES};
+use crate::regex_limits::{
+    RegexLimits, MAX_REGEX_NEST_DEPTH, MAX_REGEX_PATTERN_LEN, REGEX_DFA_CACHE_BYTES,
+};
 
 /// 大文字小文字の扱い。bool にしないのは、照合依存の畳み込み（ICU）を将来足す余地を
 /// 残すため。
@@ -96,6 +103,28 @@ impl From<translate::TranslateError> for RegexError {
             translate::TranslateError::TooDeep => Self::TooComplex,
         }
     }
+}
+
+impl From<similar::SimilarError> for RegexError {
+    fn from(e: similar::SimilarError) -> Self {
+        match e {
+            similar::SimilarError::Invalid => Self::InvalidPattern,
+        }
+    }
+}
+
+/// `SIMILAR TO` の SQL 正規表現 `pattern` を ARE へ変換する（Issue #1788。呼び出し元は
+/// `sql::allowlist` の `SIMILAR TO` 構文段。結果は [`CompiledRegex::compile`] に渡す）。
+///
+/// `escape` は ESCAPE 句の文字（`None` は `ESCAPE ''` でエスケープなし。句が無い場合の既定
+/// `\` は呼び出し元が `Some('\\')` で渡す）。確保の前に生パターンのバイト長をハード上限
+/// ([`MAX_REGEX_PATTERN_LEN`]) で検査する（`54000`）。CLI で下げた上限は、変換後の ARE に対する
+/// `compile` の長さ検査が担う。出力は `^(?:` … `)$` で囲まれ、全体一致になる。
+pub fn similar_to_are(pattern: &str, escape: Option<char>) -> Result<String, RegexError> {
+    if pattern.len() > MAX_REGEX_PATTERN_LEN {
+        return Err(RegexError::PatternTooLong);
+    }
+    Ok(similar::convert(pattern, escape)?)
 }
 
 /// コンパイル済みの正規表現。`Clone` は内部の `Arc` 共有で安価。
