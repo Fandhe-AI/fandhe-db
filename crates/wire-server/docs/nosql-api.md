@@ -1126,6 +1126,7 @@ Date: <IMF-fixdate>
 | `2200H` | `SEQUENCE_GENERATOR_LIMIT_EXCEEDED` | 400 | Bad Request | `DEFAULT nextval('<SEQUENCE>')` を持つ列を省略した `insert` で、NO CYCLE の SEQUENCE が上限・下限に達した（TABLE-24・Issue #1690。副作用ゼロ。値・SEQUENCE 名は含めない） |
 | `22012` | `DIVISION_BY_ZERO` | 400 | Bad Request | `insert`／`update` が書き込む行の `CHECK` 制約（TABLE-16・TASK-204）の式評価での 0 除算 |
 | `22015` | `INTERVAL_FIELD_OVERFLOW` | 400 | Bad Request | `INTERVAL` リテラルのフィールド値が範囲外（数値が `i64` に収まらない・単位換算や累積があふれる）。SQL 表層に加え、NoSQL の INTERVAL 列への `insert`／`update`／`filter` の文字列束縛からも到達する（型束縛は #1583 で対応）。Issue #1579 |
+| `2201B` | `INVALID_REGULAR_EXPRESSION` | 400 | Bad Request | 正規表現パターンの構文誤り（括弧の不整合・量指定の対象不在・回数の範囲外など）。SQL 表層（`~`／`~*`・`SIMILAR TO`）専用で、NoSQL の `op` 語彙からは到達しない。Issue #1786 |
 | `22023` | `OPERATION_ID_CONTENT_MISMATCH` | 400 | Bad Request | `insert` の `operation_id` 再送時の内容不一致 |
 | `22023` | `INVALID_PARAMETER_VALUE` | 400 | Bad Request | 型名の引数が範囲外（`FLOAT(p)` の精度。SQL 表層の DDL 専用で、NoSQL の `op` 語彙からは到達しない。Issue #2304） |
 | `22025` | `INVALID_ESCAPE_SEQUENCE` | 400 | Bad Request | `like` op のパターンが末尾の単独 `\`（エスケープの次の文字が無い）で終わる。SQL 表層の `LIKE ... ESCAPE` の不正な ESCAPE 値・末尾エスケープも同じ分類。NoSQL の `like` から到達する。Issue #1779 |

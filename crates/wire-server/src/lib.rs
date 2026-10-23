@@ -153,6 +153,7 @@ pub mod jsonpath_limits_opt;
 pub mod limits;
 pub mod nesting_limits_opt;
 pub mod protocol_dispatch;
+pub mod regex_limits_opt;
 pub mod require_operation_id_opt;
 pub mod require_where_for_dml_opt;
 pub(crate) mod response_buffer;
