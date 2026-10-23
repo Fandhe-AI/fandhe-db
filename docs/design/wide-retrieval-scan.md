@@ -166,3 +166,7 @@ TASK-170 が新設・main へマージされたため（fandhe-db-spec#12）、�
 全行走査の代わりに永続一意索引の点検索で候補を絞る（`sql::pk_point`）。候補も全走査と同じ
 `with_visible_row` を通るので、行・順序・OFFSET の数え方は全走査と同一。それ以外は従来の全行走査。
 詳細は [primary-key-point-lookup.md](primary-key-point-lookup.md)。
+
+## 追記（Issue #1795）: LIMIT 省略との関係
+
+「`LIMIT` 必須」は SQL-34 の確定を受けて #1796 で改訂する予定。省略時は結果行数上限（`54000`）で有界にし、走査行数上限とは別軸として扱う。判定位置・SQLSTATE・カーソルとの関係は [limit-omitted-result-cap.md](limit-omitted-result-cap.md) を参照。
