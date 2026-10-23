@@ -600,3 +600,26 @@ fn copy_to_stdout_applies_header_and_delimiter_via_extended_query() {
     assert_eq!(expect(&mut s, b'Z'), b"I");
     s.shutdown(Shutdown::Write).ok();
 }
+
+/// Issue #1773 レビュー指摘（PR #2649）: 明示トランザクション中の拡張クエリ COPY FROM は、
+/// CopyData を poll 間隔（約 100ms）以上送らなくても切断されない。
+#[test]
+fn copy_in_idle_beyond_poll_interval_inside_explicit_txn_is_not_disconnected() {
+    let (core, _g) = new_core();
+    let mut s = connect(core);
+    assert_eq!(simple(&mut s, "BEGIN"), b'T');
+    parse_bind(&mut s, COPY_FROM, "p");
+    execute(&mut s, "p");
+    flush(&mut s);
+    expect(&mut s, b'G');
+    std::thread::sleep(std::time::Duration::from_millis(500));
+    send(&mut s, b'd', ROW1);
+    std::thread::sleep(std::time::Duration::from_millis(500));
+    send(&mut s, b'c', b"");
+    expect_command_complete(&mut s, "COPY 1");
+    sync(&mut s);
+    assert_eq!(expect(&mut s, b'Z'), b"T");
+    assert_eq!(simple(&mut s, "COMMIT"), b'I');
+    assert_eq!(count_rows(&mut s), 1);
+    s.shutdown(Shutdown::Write).ok();
+}

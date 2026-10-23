@@ -555,6 +555,8 @@ fn post_auth_loop<'e, S: WireStream>(
     // が受理直後に設定する）。明示トランザクション中に一時的に切り詰めた後は
     // 必ずこの値へ戻す（[`read_next_frame_header`] 参照）。
     let base_timeout = stream.read_timeout()?;
+    // COPY が接続本来のタイムアウトを引けるようにする（poll 値へ変更中でも）。
+    let _base_timeout_guard = framing::ConnectionBaseTimeoutGuard::set(base_timeout);
     let mut applied_timeout = base_timeout;
     loop {
         let type_byte =
@@ -1022,12 +1024,12 @@ fn post_auth_loop<'e, S: WireStream>(
 
 /// 読み取りタイムアウトの切り詰め後に設定する最小値（`set_read_timeout` は
 /// `Duration::ZERO` を受け付けないため、残り時間が 0 でもこの値で待つ）。
-const MIN_BOUNDED_READ_WAIT: Duration = Duration::from_millis(1);
+pub(crate) const MIN_BOUNDED_READ_WAIT: Duration = Duration::from_millis(1);
 
 /// `Active` な明示トランザクション中にフレームの長さ・本文を受信する間の、
 /// 読み取り 1 回あたりの待機上限（この間隔で `framing::FrameDeadlineGuard` の
 /// 期限を確認する。期限超過の検出遅れの上限でもある）。
-const FRAME_DEADLINE_POLL: Duration = Duration::from_millis(100);
+pub(crate) const FRAME_DEADLINE_POLL: Duration = Duration::from_millis(100);
 
 /// [`post_auth_loop`] が次の要求の型バイトを待つ（SQL-31・TASK-221。PR #1041
 /// レビュー指摘）。

@@ -1033,31 +1033,35 @@ fn wire17_copy_from_stdin_with_trailing_semicolon_is_accepted() {
     read_ready_for_query(&mut stream);
 }
 
-/// (2) `COPY ... FROM STDIN ...; SELECT 1`（Issue #1175）: COPY が書き込みで最後以外に
-/// あるため、メッセージ全体が暗黙トランザクションになる。トランザクション内の COPY は
-/// 未対応（`0A000`）なので CopyIn サブプロトコルへは入らず（`CopyInResponse` は
-/// 一度も送出されない）、`ReadyForQuery` は `'I'`。エラー後も接続はデシンクせず、
-/// 後続の通常クエリを正しく処理できる。
+/// (2) `COPY ... FROM STDIN ...; SELECT id FROM docs`（Issue #1175・#1773・WIRE-20）: COPY が
+/// 書き込みで最後以外にあるため、メッセージ全体が暗黙トランザクションになる。COPY の文で
+/// CopyIn サブプロトコルへ入り、`COPY n` の後に同じメッセージの続きの文の応答が届く
+/// （COPY した行は続きの文から見える）。`ReadyForQuery` は最後にちょうど 1 回で `'I'`。
 #[test]
-fn wire17_copy_from_stdin_followed_by_another_statement_is_rejected_without_entering_copy_in() {
+fn wire17_copy_from_stdin_followed_by_another_statement_runs_copy_in_then_continues() {
     let (core, _guard) = new_core_with_docs_table();
     let mut stream = spawn_with_alice(core);
 
     send_simple_query(
         &mut stream,
-        "COPY docs (id, embedding, lang) FROM STDIN USING OPERATION_ID 'trailing-stmt'; SELECT 1",
+        "COPY docs (id, embedding, lang) FROM STDIN USING OPERATION_ID 'trailing-stmt'; SELECT id FROM docs LIMIT 10",
     );
-    expect_error_response_with_sqlstate(&mut stream, "0A000");
+    assert_eq!(read_copy_in_response(&mut stream), 3);
+    send_copy_data(&mut stream, b"5\t[1.0,0.0]\tja\n");
+    send_copy_done(&mut stream);
+    assert_eq!(read_command_complete(&mut stream), "COPY 1");
+    let _cols = read_row_description(&mut stream);
+    let row = read_data_row(&mut stream);
+    assert_eq!(row[0].as_deref(), Some("5"));
+    assert_eq!(read_command_complete(&mut stream), "SELECT 1");
     assert_eq!(read_ready_for_query_status(&mut stream), b'I');
 
-    // デシンクしていなければ後続クエリは通常どおり処理される。
+    // commit 済みで、後続クエリは通常どおり処理される。
     send_simple_query(&mut stream, "SELECT id FROM docs LIMIT 10");
     let _cols = read_row_description(&mut stream);
-    let tag = read_command_complete(&mut stream);
-    assert_eq!(
-        tag, "SELECT 0",
-        "rejected COPY must not have inserted any row"
-    );
+    let row = read_data_row(&mut stream);
+    assert_eq!(row[0].as_deref(), Some("5"));
+    assert_eq!(read_command_complete(&mut stream), "SELECT 1");
     read_ready_for_query(&mut stream);
 }
 
@@ -1122,10 +1126,11 @@ fn wire17_copy_to_stdout_followed_by_select_responds_in_order() {
     assert_eq!(read_ready_for_query_status(&mut stream), b'I');
 }
 
-/// (5) `INSERT ...; COPY ... FROM STDIN`（Issue #1175）: 暗黙トランザクション内の COPY は
-/// 未対応（`0A000`）。先行する INSERT の応答は届くが、INSERT もロールバックされる。
+/// (5) `INSERT ...; COPY ... FROM STDIN`（Issue #1175・#1773・WIRE-20）: 暗黙トランザクション内の
+/// 最後の文が COPY のとき、INSERT の応答の後に CopyIn へ入り、`COPY n` の前に commit される。
+/// INSERT の行も COPY の行も永続化される。
 #[test]
-fn wire17_insert_then_copy_from_stdin_is_rejected_and_rolled_back() {
+fn wire17_insert_then_copy_from_stdin_commits_both() {
     let (core, _guard) = new_core_with_docs_table();
     let mut stream = spawn_with_alice(core);
 
@@ -1135,14 +1140,20 @@ fn wire17_insert_then_copy_from_stdin_is_rejected_and_rolled_back() {
          COPY docs (id, embedding, lang) FROM STDIN USING OPERATION_ID 'copy-after-insert'",
     );
     assert_eq!(read_command_complete(&mut stream), "INSERT 0 1");
-    expect_error_response_with_sqlstate(&mut stream, "0A000");
+    assert_eq!(read_copy_in_response(&mut stream), 3);
+    send_copy_data(&mut stream, b"2\t[0.0,1.0]\ten\n");
+    send_copy_done(&mut stream);
+    assert_eq!(read_command_complete(&mut stream), "COPY 1");
     assert_eq!(read_ready_for_query_status(&mut stream), b'I');
 
     send_simple_query(&mut stream, "SELECT id FROM docs LIMIT 10");
     let _cols = read_row_description(&mut stream);
-    assert_eq!(read_command_complete(&mut stream), "SELECT 0");
+    let _ = read_data_row(&mut stream);
+    let _ = read_data_row(&mut stream);
+    assert_eq!(read_command_complete(&mut stream), "SELECT 2");
     read_ready_for_query(&mut stream);
 }
+
 /// `REAL` 列の値が PostgreSQL の float4 出力形式（指数表記 `1e+06`・`1e-05` を
 /// 含む。Issue #1173・WIRE-13）で `COPY (...) TO STDOUT` へ出力され、その出力を
 /// そのまま `COPY ... FROM STDIN` へ再投入しても同じ値へ往復すること（WIRE-17 の

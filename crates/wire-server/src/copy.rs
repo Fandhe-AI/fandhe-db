@@ -39,6 +39,7 @@
 //! ErrorResponse は CopyDone／CopyFail 受信後にまとめて送る）。
 
 use std::io;
+use std::time::{Duration, Instant};
 
 use engine::core::{CopyPlan, EngineCore};
 use engine::error_format::{ClassifiedError, ErrorClass};
@@ -54,7 +55,7 @@ use crate::copy_binary::{BinaryCopyReader, BinaryFrameLimits, CopyBinaryError};
 use crate::copy_binary_types::{self, CopyBinaryColumn, CopyBinaryValueError};
 use crate::framing::{self, FrameError};
 use crate::result_encoder;
-use crate::simple_query::Finish;
+use crate::simple_query::{Finish, StatementRole};
 use crate::wire_stream::WireStream;
 
 /// [`FrameError`] を `io::Result` の失敗へ変換する。`Truncated`（相手が既に
@@ -530,6 +531,31 @@ fn encode_copy_header_into(
     push_copy_data_line(&line, out, start)
 }
 
+/// COPY TO の応答開始前に確定できる拒否条件を検査する。`run` が暗黙 commit より前に呼び、
+/// 拒否時は commit せず ErrorResponse を返す（暗黙トランザクションの原子性。WIRE-20）。
+/// `HEADER MATCH` は engine の `resolve` が TO で拒否済みで到達しないが、到達した場合は
+/// 無言で `HEADER true` 扱いにせず fail-closed とする。binary は WIRE-14 の対応型のみで、
+/// 非対応型は 0A000（列番号以外の情報を含めない）。
+fn precheck_copy_to(
+    format: CopyFormat,
+    result: &QueryResult,
+    options: &CopyOptions,
+) -> Result<(), (ErrorClass, &'static str)> {
+    if options.header() == CopyHeader::Match {
+        return Err((ErrorClass::InternalError, "unsupported COPY header option"));
+    }
+    if format == CopyFormat::Binary {
+        let formats = vec![result_encoder::FormatCode::Binary; result.columns.len()];
+        if let Err(e) = result_encoder::validate_binary_formats(&result.columns, &formats) {
+            return Err((
+                e.error_class(),
+                "COPY BINARY does not support the column type",
+            ));
+        }
+    }
+    Ok(())
+}
+
 /// `COPY (...) TO STDOUT`: CopyOutResponse → 各行 CopyData → CopyDone →
 /// `CommandComplete "COPY n"` → `ReadyForQuery`。実行本体
 /// （`EngineCore::begin_copy` の `CopyPlan::To` 分岐。広域取得と同じ RLS
@@ -545,32 +571,9 @@ fn run_copy_to<S: WireStream>(
     options: &CopyOptions,
     finish: Finish,
 ) -> io::Result<CopyStep> {
-    // `HEADER MATCH` は engine の `resolve` が TO で拒否済みで到達しない。到達した場合は
-    // 無言で `HEADER true` 扱いにせず fail-closed とする（CopyOutResponse の前に判定）。
-    if options.header() == CopyHeader::Match {
-        return respond_error_and_ready(
-            stream,
-            txn,
-            ErrorClass::InternalError,
-            "unsupported COPY header option",
-        )
-        .map(|()| CopyStep::Failed);
-    }
+    // 応答開始前に拒否できる検証（HEADER MATCH・binary 非対応型）は `precheck_copy_to` が
+    // 暗黙 commit より前に済ませている（呼び出し元 `run`）。
     let binary = format == CopyFormat::Binary;
-    // binary は WIRE-14 の対応型のみ。非対応型は CopyOutResponse を 1 バイトも送る前に
-    // 0A000 で拒否する（fail-closed。列番号以外の情報を含めない）。
-    if binary {
-        let formats = vec![result_encoder::FormatCode::Binary; result.columns.len()];
-        if let Err(e) = result_encoder::validate_binary_formats(&result.columns, &formats) {
-            return respond_error_and_ready(
-                stream,
-                txn,
-                e.error_class(),
-                "COPY BINARY does not support the column type",
-            )
-            .map(|()| CopyStep::Failed);
-        }
-    }
     let response =
         match encode_copy_response(b'H', result.columns.len(), format == CopyFormat::Binary) {
             Ok(b) => b,
@@ -704,6 +707,58 @@ fn prepare_decoder(session: &CopyInSession) -> Result<CopyInDecoder, CopyFromErr
     Ok(CopyInDecoder::Binary { reader, columns })
 }
 
+/// COPY FROM STDIN の次フレームの型バイトを読む。トランザクションが `Active`（暗黙・明示とも
+/// 単一ライタを保持中）の間は、型バイト待ちと続く長さ・本文の受信全体に「持続時間の残り
+/// （と接続の読み取りタイムアウト）」までの期限を課す（SQL-31・Issue #1773 レビュー指摘。
+/// `handshake::post_auth_loop` の期限は 'Q' の受信前に決まるため COPY のフレームには及ばない）。
+/// 期限超過は `TimedOut` の I/O エラーを返し、接続は応答なしで閉じられてライタが解放される。
+/// 戻り値のガードは呼び出し元が 1 フレームの受信が済むまで保持する。`Active` でなければ従来どおり。
+fn read_copy_frame_header<S: WireStream>(
+    stream: &mut S,
+    txn: &SessionTransaction<'_>,
+    base_timeout: Option<Duration>,
+) -> io::Result<(Option<u8>, Option<framing::FrameDeadlineGuard>)> {
+    let Some(remaining) = txn.remaining_duration() else {
+        return match framing::read_typed_frame_header(stream) {
+            Ok(h) => Ok((h, None)),
+            Err(e) => Err(respond_frame_error_and_terminate(stream, e)),
+        };
+    };
+    let budget = base_timeout.map_or(remaining, |b| remaining.min(b));
+    let poll = budget
+        .min(crate::handshake::FRAME_DEADLINE_POLL)
+        .max(crate::handshake::MIN_BOUNDED_READ_WAIT);
+    stream.set_read_timeout(Some(poll))?;
+    let deadline = Instant::now()
+        .checked_add(budget)
+        .unwrap_or_else(Instant::now);
+    loop {
+        if Instant::now() >= deadline {
+            return Err(io::Error::new(
+                io::ErrorKind::TimedOut,
+                "COPY receive deadline exceeded",
+            ));
+        }
+        match framing::read_typed_frame_header(stream) {
+            Ok(h) => {
+                let body_budget = txn
+                    .remaining_duration()
+                    .map_or(budget, |r| base_timeout.map_or(r, |b| r.min(b)));
+                let body_deadline = Instant::now()
+                    .checked_add(body_budget)
+                    .unwrap_or_else(Instant::now);
+                return Ok((h, Some(framing::FrameDeadlineGuard::set(body_deadline))));
+            }
+            Err(FrameError::Io(e))
+                if matches!(
+                    e.kind(),
+                    io::ErrorKind::WouldBlock | io::ErrorKind::TimedOut
+                ) => {}
+            Err(e) => return Err(respond_frame_error_and_terminate(stream, e)),
+        }
+    }
+}
+
 /// `COPY <table> (<cols>) FROM STDIN`: CopyInResponse → CopyData*／CopyDone／
 /// CopyFail のサブプロトコルを 1 回の呼び出しで完結させる。行のデコード・
 /// 束縛・INDEX-4 逐次判定は [`CopyInSession::feed`] が担う（`sql::copy`
@@ -722,7 +777,42 @@ fn prepare_decoder(session: &CopyInSession) -> Result<CopyInDecoder, CopyFromErr
 /// が通常のクエリループへ戻ってクライアントが実際にソケットを閉じるまで
 /// 接続スロットを保持し続けていた。`Closed` はループを終了させるべき
 /// 場合——Terminate 受信・ストリーム側の早期 EOF——にのみ返す）。
+#[allow(clippy::too_many_arguments)]
+/// [`run_copy_from_inner`] の呼び出しを挟み、受信期限のために変更した読み取りタイムアウトを
+/// 呼び出し前の値へ戻す（`post_auth_loop` が現在値をキャッシュしているため）。
 fn run_copy_from<'e, S: WireStream>(
+    stream: &mut S,
+    engine: &'e EngineCore,
+    ctx: &PolicyContext,
+    conn_session: &mut SessionState,
+    txn: &mut SessionTransaction<'e>,
+    session: CopyInSession,
+    finish: Finish,
+    role: StatementRole,
+) -> io::Result<CopyStep> {
+    // 復元用の現在値（post_auth_loop が poll 値へ変更済みの場合がある）と、COPY 受信予算に
+    // 使う接続本来のタイムアウトを分離する。後者は接続ループが設定していなければ現在値。
+    let restore_timeout = stream.read_timeout()?;
+    let base_timeout = framing::connection_base_timeout().unwrap_or(restore_timeout);
+    let result = run_copy_from_inner(
+        stream,
+        engine,
+        ctx,
+        conn_session,
+        txn,
+        session,
+        finish,
+        role,
+        base_timeout,
+    );
+    if result.is_ok() {
+        stream.set_read_timeout(restore_timeout)?;
+    }
+    result
+}
+
+#[allow(clippy::too_many_arguments)]
+fn run_copy_from_inner<'e, S: WireStream>(
     stream: &mut S,
     engine: &'e EngineCore,
     ctx: &PolicyContext,
@@ -730,6 +820,8 @@ fn run_copy_from<'e, S: WireStream>(
     txn: &mut SessionTransaction<'e>,
     mut session: CopyInSession,
     finish: Finish,
+    role: StatementRole,
+    base_timeout: Option<Duration>,
 ) -> io::Result<CopyStep> {
     let mut decoder = match prepare_decoder(&session) {
         Ok(d) => d,
@@ -758,10 +850,10 @@ fn run_copy_from<'e, S: WireStream>(
     let mut discarded_messages: usize = 0;
 
     loop {
-        let type_byte = match framing::read_typed_frame_header(stream) {
-            Ok(Some(b)) => b,
-            Ok(None) => return Ok(CopyStep::Closed),
-            Err(e) => return Err(respond_frame_error_and_terminate(stream, e)),
+        let (header, _frame_deadline) = read_copy_frame_header(stream, txn, base_timeout)?;
+        let type_byte = match header {
+            Some(b) => b,
+            None => return Ok(CopyStep::Closed),
         };
         match type_byte {
             b'd' => {
@@ -813,6 +905,7 @@ fn run_copy_from<'e, S: WireStream>(
                     decoder,
                     errored,
                     finish,
+                    role,
                 );
             }
             b'f' => {
@@ -933,6 +1026,7 @@ fn finish_copy_from<'e, S: WireStream>(
     decoder: CopyInDecoder,
     errored: Option<CopyFromError>,
     finish: Finish,
+    role: StatementRole,
 ) -> io::Result<CopyStep> {
     if let Some(e) = errored {
         return respond_copy_from_error(stream, txn, &e).map(|()| CopyStep::Failed);
@@ -955,7 +1049,17 @@ fn finish_copy_from<'e, S: WireStream>(
         let _emergency_registration = crate::simple_query::register_emergency_response(stream);
         // セッション対応版: 一時表向けのバッチの commit と、自動コミットの COPY 後の `ON COMMIT`
         // 適用（TABLE-44・Issue #1684）に接続の `SessionState` が要る。
-        engine.commit_copy_in_txn_in_session(ctx, conn_session, txn, batch)
+        // 暗黙トランザクション（複数文メッセージ。WIRE-20）の最後の文が COPY のときは、
+        // 通常の文の `ImplicitFinal` と同じく commit を緊急応答の登録区間の内側で行い、
+        // `CommandComplete` はその後に書く（commit 失敗時は `CommandComplete` を送らない）。
+        engine
+            .commit_copy_in_txn_in_session(ctx, conn_session, txn, batch)
+            .and_then(|insert_outcome| {
+                if role == StatementRole::ImplicitFinal {
+                    txn.commit_implicit(conn_session)?;
+                }
+                Ok(insert_outcome)
+            })
     };
 
     match outcome {
@@ -1002,7 +1106,8 @@ pub(crate) enum CopyStep {
 
 /// `simple_query::run_copy_statement` から、`engine::sql::copy::
 /// is_copy_statement(stmt)` が真の 1 文について、セッションが `Idle` または明示
-/// トランザクション中（Issue #1179。暗黙トランザクション中・`Failed` 中は呼ばれない）
+/// トランザクション中（Issue #1179）、または暗黙トランザクション中（複数文メッセージ内。
+/// WIRE-20・Issue #1773。`role` で位置を渡す。`Failed` 中は呼ばれない）
 /// に呼ばれる唯一の入口（`handshake::post_auth_loop` の 'Q' 分岐は `simple_query::
 /// execute_and_respond` へ一本化した。Issue #1175）。
 /// `EngineCore::begin_copy` の構造検証・`operation_id` 必須化ガード・
@@ -1014,9 +1119,14 @@ pub(crate) enum CopyStep {
 /// 後に `ReadyForQuery` を送らず、複数文メッセージの次の文へ制御を返す
 /// （エラー経路は常に ErrorResponse＋`ReadyForQuery`）。
 ///
+/// `role` は暗黙トランザクション内での位置（[`StatementRole`]）。`ImplicitFinal` のときだけ
+/// 本関数が `commit_implicit` を行う（COPY FROM は `CommandComplete` の前、COPY TO は
+/// CopyOutResponse の前）。それ以外（`Standalone`・`ImplicitIntermediate`）は commit しない。
+///
 /// 戻り値 [`CopyStep::Closed`] は `run_copy_from` が Terminate（'X'）受信を
 /// 返してきた場合で、呼び出し元はそのまま伝播して接続ループを終了させる
 /// （[`run_copy_from`] のドキュメント参照）。
+#[allow(clippy::too_many_arguments)]
 pub(crate) fn run<'e, S: WireStream>(
     stream: &mut S,
     engine: &'e EngineCore,
@@ -1025,18 +1135,55 @@ pub(crate) fn run<'e, S: WireStream>(
     txn: &mut SessionTransaction<'e>,
     sql: &str,
     finish: Finish,
+    role: StatementRole,
 ) -> io::Result<CopyStep> {
     // commit 成功から本関数が応答を書き終えるまでの区間全体を覆う RAII ガード
     // （RECOVER-5 (3)。`simple_query::execute_and_respond` と同じ設計）。
     let _response_boundary = engine::recovery::commit_boundary::ResponseBoundaryGuard::new();
 
-    match engine.begin_copy_in_txn(ctx, session, txn, sql) {
+    // COPY TO の結果は `begin_copy_in_txn` の時点で実体化済みなので、暗黙トランザクションの
+    // 最後の文なら CopyOutResponse を送る前に commit する（通常の SELECT の
+    // `ImplicitFinal` と同じ「commit してから応答を書く」順序。WIRE-20）。commit は緊急応答の
+    // 登録区間の内側で行い、失敗時は CopyOutResponse を 1 バイトも送らず ErrorResponse を返す。
+    let plan = {
+        let _emergency_registration = (role == StatementRole::ImplicitFinal)
+            .then(|| crate::simple_query::register_emergency_response(stream));
+        engine
+            .begin_copy_in_txn(ctx, session, txn, sql)
+            .and_then(|plan| {
+                if let CopyPlan::To(format, result, options) = &plan {
+                    if let Err(rejection) = precheck_copy_to(*format, result, options) {
+                        return Ok(Err(rejection));
+                    }
+                    if role == StatementRole::ImplicitFinal {
+                        txn.commit_implicit(session)?;
+                    }
+                }
+                Ok(Ok(plan))
+            })
+    };
+    let plan = match plan {
+        Ok(Ok(plan)) => Ok(plan),
+        // 応答開始前の拒否。commit しておらず、`respond_error_and_ready` が暗黙トランザクションを破棄する。
+        Ok(Err((class, message))) => {
+            return respond_error_and_ready(stream, txn, class, message).map(|()| CopyStep::Failed)
+        }
+        Err(e) => Err(e),
+    };
+    match plan {
         Ok(CopyPlan::To(format, result, options)) => {
             run_copy_to(stream, session, txn, format, &result, &options, finish)
         }
-        Ok(CopyPlan::From(copy_session)) => {
-            run_copy_from(stream, engine, ctx, session, txn, copy_session, finish)
-        }
+        Ok(CopyPlan::From(copy_session)) => run_copy_from(
+            stream,
+            engine,
+            ctx,
+            session,
+            txn,
+            copy_session,
+            finish,
+            role,
+        ),
         Err(e) => respond_sql_error(stream, txn, &e).map(|()| CopyStep::Failed),
     }
 }

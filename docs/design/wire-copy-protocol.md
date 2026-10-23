@@ -236,11 +236,9 @@
      `COPY n`、続きの文の応答、`ReadyForQuery`（PostgreSQL と一致。`copy::run` は
      `Finish` を受け取り、途中の COPY では `ReadyForQuery` を送らない）。
    - `COPY t FROM STDIN ...; <他の文>`・`<書き込み>; COPY t FROM STDIN ...` →
-     書き込みが最後以外にあるためメッセージ全体が暗黙トランザクションになり、
-     トランザクション内の COPY は未対応（`0A000`）。CopyIn へは入らず、暗黙
-     トランザクションは全体をロールバックして `ReadyForQuery('I')`。**既知の相違**:
-     PostgreSQL は COPY を受理するが、後続文のエラー時に COPY を巻き戻せないため
-     原子性を優先して拒否する（従来は `42601`）。
+     書き込みが最後以外にあるためメッセージ全体が暗黙トランザクションになる。COPY の文で
+     CopyIn／CopyOut へ入り、CopyDone の後に続きの文へ進む（Issue #1773・WIRE-20 ポインタ。
+     詳細は「Issue #1773」節）。
    いずれの形でも接続はデシンクしない
    （`crates/wire-server/tests/wire17_copy.rs` の複数文相互作用テスト参照）。
 
@@ -315,7 +313,7 @@
 - 分岐位置: CopyIn／CopyOut は stream を要するため engine では実行できない。wire-server の
   `extended_query::execute_portal` が `ParsedSql::Copy` の portal を `execute_parsed_in_txn` へ渡さず
   横取りし、`handle_execute` が `simple_query::run_copy_statement`（`Finish::Continue`）経由で
-  `copy.rs` へ委譲する。簡易クエリと同じ gating（暗黙 Tx の `0A000`・`Failed` の `25P02`）と
+  `copy.rs` へ委譲する。簡易クエリと同じ gating（`Failed` の `25P02`。拡張クエリは暗黙 Tx を持たない）と
   完了タグ・Tx 遷移を共有し、第 2 の COPY 実行器を作らない。engine の `ParsedSql::Copy` の
   `0A000` 腕は他の呼び出し元向けの防御的な fail-closed として残す。
 - ReadyForQuery: Sync が送るため `copy.rs` は `CommandComplete` か ErrorResponse だけを書く。
@@ -458,3 +456,21 @@ binary COPY 形式で結果を返す。`COPY FROM` の binary は Issue #1769 �
 - 表形 `COPY t TO STDOUT` は Issue #1771。`run_copy_to` は `CopyPlan::To` の format に依存するだけなので、
   表形が同じ plan を返せば binary も引き継ぐ。
 - 対象外: COPY FROM binary と TO→FROM の往復（#1769）、型の拡充（#1768）、TO 側のオプション適用（#1765）。
+
+## Issue #1773: 複数文メッセージ内の COPY の分割実行（親 #1772・WIRE-20 ポインタ）
+
+- 暗黙トランザクション内の COPY を受理する。`simple_query::run_implicit_statements` が COPY の文で
+  `run_copy_statement_as` を呼び、`copy::run` が CopyIn／CopyOut を完結させてから次の添字の文へ進む。
+  応答順は、先行文の応答、COPY のサブプロトコル、`COPY n`、後続文の応答、`ReadyForQuery`（1 回）。
+- 後続文の「保留」は 'Q' 本文の借用スライス上の次の添字であり、新しいバッファは作らない。保留データの
+  上限は `MAX_MESSAGE_LEN`（1 MiB）と `MAX_STATEMENTS_PER_QUERY`（16 文。超過は COPY に入る前に `54000`）で
+  構造的に有界。CopyData は COPY ごとの `CopyInSession`（INDEX-4 の逐次判定）と読み捨て予算で有界。
+- commit 位置: 最後の文が COPY のとき、通常の文の `ImplicitFinal` と同じく緊急応答の登録区間の内側で
+  `commit_implicit` を行う。COPY FROM は `CommandComplete "COPY n"` の前、COPY TO は CopyOutResponse の前。
+  commit 失敗時は `CommandComplete`／CopyOutResponse を送らず ErrorResponse を返す。途中の COPY は commit しない。
+- 失敗経路（CopyFail・デコード失敗・上限超過・Terminate）は暗黙トランザクションを `Idle` へ戻して
+  先行文の書き込みも破棄する（fail-closed）。暗黙トランザクションはライタゲートを保持したまま CopyData を
+  待つが、保持時間はフレーム受信期限とトランザクションの `max_duration` で有界（明示トランザクションの COPY と同じ）。
+- 既知の相違: COPY TO が最後の文のとき commit を CopyOut の前に行う（commit 失敗時の応答の形だけが
+  PostgreSQL と異なりうる）。拡張クエリは暗黙トランザクションを持たないため本節の対象外。
+- 網羅的なロールバックの組み合わせと `25P02` の整合は #1774。

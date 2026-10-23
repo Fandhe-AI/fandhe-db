@@ -218,7 +218,7 @@ SQL-31（`BEGIN`/`COMMIT`/`ROLLBACK`）・RECOVER-12（複数文単位の
   対象外であり、HTTP への射影変更もない。
 - 3 クライアント e2e（`three_client_e2e.rs` 等）への追加は opt-in の任意
   追加に留め、本 Issue では必須にしない。
-- 暗黙トランザクション内での DDL・COPY（ファイル形 `INSERT` と書き込み済みテーブルの読み取りは
+- 暗黙トランザクション内での DDL（COPY は Issue #1773 で対応済み。ファイル形 `INSERT` と書き込み済みテーブルの読み取りは
   #1179・#1353 の成果を自動的に引き継いで受理済み）。`BEGIN` より前の書き込みを明示ブロックへ昇格させる PostgreSQL の
   意味論（`INSERT; BEGIN; ...`）、lexer でのコメント・二重引用符識別子・ドル引用・
   E 文字列の受理、拡張クエリプロトコルでの暗黙トランザクション（Sync 単位）も対象外。
@@ -236,10 +236,10 @@ SQL-31（`BEGIN`/`COMMIT`/`ROLLBACK`）・RECOVER-12（複数文単位の
   途中の COPY では `CommandComplete` の後に `ReadyForQuery` を送らない。
 - `classify_statement` は括弧の深さ 0 で最初に現れる `TO` なら `ReadOnly`、`FROM`・
   どちらも無い場合は `Write`（fail-closed）に分類する。
-- **既知の相違**: `COPY t FROM STDIN ...; SELECT 1`・`INSERT ...; COPY t FROM STDIN` は
-  暗黙トランザクションになり、トランザクション内の COPY は未対応のため `0A000`
-  （CopyIn に入らず、`ReadyForQuery('I')`。全体をロールバック）。後続文のエラー時に
-  COPY を巻き戻せないため原子性を優先して拒否する（従来は `42601`）。
+- 暗黙トランザクション内の COPY（Issue #1773・WIRE-20 ポインタ）: `COPY t FROM STDIN ...; SELECT 1`・
+  `INSERT ...; COPY t FROM STDIN` は暗黙トランザクションになるが、COPY の文で CopyIn／CopyOut へ入り、
+  CopyDone の後に続きの文へ進む（当初は `0A000` で拒否していた）。最後の文が COPY のときの commit 位置・
+  保留データの上限は [wire-copy-protocol.md](wire-copy-protocol.md) の「Issue #1773」節を参照。
 
 ## 挙動変化の明記（受理範囲の拡大）
 
@@ -263,7 +263,7 @@ Issue #1175 による変化:
   トランザクションで対応できない形は、従来「1 文も実行せず `0A000`」だったが、
   対応できない文の位置で `0A000`（それ以前の文の応答は届き、全体をロールバックする）。
   通常状態に `$` を含むメッセージは分割されず全文が `42601`（従来は断片ごとに実行を
-  試みた）。`COPY ...; 他の文`（COPY が書き込みの場合）は `42601` から `0A000`。
+  試みた）。`COPY ...; 他の文`（COPY が書き込みの場合）は `42601` から受理（Issue #1773）。
 
 ## 検証
 
