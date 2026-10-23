@@ -593,6 +593,8 @@ pub(crate) fn check_order_exprs_within_view(
                 }
             }
             ScanOrderKey::Expr { expr, .. } => expr_columns_within(columns, expr)?,
+            // 序数は列を参照せず、外側の出力列（公開列）の位置にしか届かない。
+            ScanOrderKey::Ordinal { .. } => {}
         }
     }
     Ok(())
@@ -669,6 +671,10 @@ pub(crate) fn check_aggregate_columns_within_view(
         let mut allowed: Vec<String> = columns.to_vec();
         allowed.extend(effective_names.iter().cloned());
         for key in &gb.order_by {
+            // 序数は出力列の位置にしか届かない（列名を参照しない）。
+            if key.ordinal.is_some() {
+                continue;
+            }
             if let Some(expr) = &key.expr {
                 expr_columns_within(&allowed, expr)?;
                 continue;

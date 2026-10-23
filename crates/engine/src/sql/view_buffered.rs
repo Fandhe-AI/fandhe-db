@@ -304,6 +304,13 @@ fn plan_rows(
             ScanOrderKey::Expr { expr, .. } => {
                 super::parser::collect_expr_idents(expr, &mut idents)
             }
+            // SQL-56 (2): 評価後射影形ビューの外側は本文の結果列で並べ替えるため、序数を外側の
+            // 出力列へ解決する経路を持たない。黙って本文の列へ解決せず拒否する（fail-closed）。
+            ScanOrderKey::Ordinal { .. } => {
+                return Err(SqlSurfaceError::unsupported(
+                    "ORDER BY position is not supported over a view with an aggregate/LIMIT body",
+                ));
+            }
         }
     }
     check_unambiguous(body_columns, &idents)?;
