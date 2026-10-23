@@ -530,6 +530,31 @@ fn encode_copy_header_into(
     push_copy_data_line(&line, out, start)
 }
 
+/// COPY TO の応答開始前に確定できる拒否条件を検査する。`run` が暗黙 commit より前に呼び、
+/// 拒否時は commit せず ErrorResponse を返す（暗黙トランザクションの原子性。WIRE-20）。
+/// `HEADER MATCH` は engine の `resolve` が TO で拒否済みで到達しないが、到達した場合は
+/// 無言で `HEADER true` 扱いにせず fail-closed とする。binary は WIRE-14 の対応型のみで、
+/// 非対応型は 0A000（列番号以外の情報を含めない）。
+fn precheck_copy_to(
+    format: CopyFormat,
+    result: &QueryResult,
+    options: &CopyOptions,
+) -> Result<(), (ErrorClass, &'static str)> {
+    if options.header() == CopyHeader::Match {
+        return Err((ErrorClass::InternalError, "unsupported COPY header option"));
+    }
+    if format == CopyFormat::Binary {
+        let formats = vec![result_encoder::FormatCode::Binary; result.columns.len()];
+        if let Err(e) = result_encoder::validate_binary_formats(&result.columns, &formats) {
+            return Err((
+                e.error_class(),
+                "COPY BINARY does not support the column type",
+            ));
+        }
+    }
+    Ok(())
+}
+
 /// `COPY (...) TO STDOUT`: CopyOutResponse → 各行 CopyData → CopyDone →
 /// `CommandComplete "COPY n"` → `ReadyForQuery`。実行本体
 /// （`EngineCore::begin_copy` の `CopyPlan::To` 分岐。広域取得と同じ RLS
@@ -545,32 +570,9 @@ fn run_copy_to<S: WireStream>(
     options: &CopyOptions,
     finish: Finish,
 ) -> io::Result<CopyStep> {
-    // `HEADER MATCH` は engine の `resolve` が TO で拒否済みで到達しない。到達した場合は
-    // 無言で `HEADER true` 扱いにせず fail-closed とする（CopyOutResponse の前に判定）。
-    if options.header() == CopyHeader::Match {
-        return respond_error_and_ready(
-            stream,
-            txn,
-            ErrorClass::InternalError,
-            "unsupported COPY header option",
-        )
-        .map(|()| CopyStep::Failed);
-    }
+    // 応答開始前に拒否できる検証（HEADER MATCH・binary 非対応型）は `precheck_copy_to` が
+    // 暗黙 commit より前に済ませている（呼び出し元 `run`）。
     let binary = format == CopyFormat::Binary;
-    // binary は WIRE-14 の対応型のみ。非対応型は CopyOutResponse を 1 バイトも送る前に
-    // 0A000 で拒否する（fail-closed。列番号以外の情報を含めない）。
-    if binary {
-        let formats = vec![result_encoder::FormatCode::Binary; result.columns.len()];
-        if let Err(e) = result_encoder::validate_binary_formats(&result.columns, &formats) {
-            return respond_error_and_ready(
-                stream,
-                txn,
-                e.error_class(),
-                "COPY BINARY does not support the column type",
-            )
-            .map(|()| CopyStep::Failed);
-        }
-    }
     let response =
         match encode_copy_response(b'H', result.columns.len(), format == CopyFormat::Binary) {
             Ok(b) => b,
@@ -1061,11 +1063,24 @@ pub(crate) fn run<'e, S: WireStream>(
         engine
             .begin_copy_in_txn(ctx, session, txn, sql)
             .and_then(|plan| {
-                if role == StatementRole::ImplicitFinal && matches!(plan, CopyPlan::To(..)) {
-                    txn.commit_implicit(session)?;
+                if let CopyPlan::To(format, result, options) = &plan {
+                    if let Err(rejection) = precheck_copy_to(*format, result, options) {
+                        return Ok(Err(rejection));
+                    }
+                    if role == StatementRole::ImplicitFinal {
+                        txn.commit_implicit(session)?;
+                    }
                 }
-                Ok(plan)
+                Ok(Ok(plan))
             })
+    };
+    let plan = match plan {
+        Ok(Ok(plan)) => Ok(plan),
+        // 応答開始前の拒否。commit しておらず、`respond_error_and_ready` が暗黙トランザクションを破棄する。
+        Ok(Err((class, message))) => {
+            return respond_error_and_ready(stream, txn, class, message).map(|()| CopyStep::Failed)
+        }
+        Err(e) => Err(e),
     };
     match plan {
         Ok(CopyPlan::To(format, result, options)) => {

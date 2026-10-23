@@ -310,3 +310,21 @@ fn wire20_copy_inside_explicit_transaction_responds_in_order() {
     assert_eq!(read_ready_for_query_status(&mut stream), b'I');
     assert_eq!(count_docs(&mut stream), 1);
 }
+
+/// T10: 暗黙トランザクション最後の COPY TO が binary 非対応型（vector）で拒否されるとき、
+/// 暗黙 commit より前に拒否されるので先行 INSERT は永続化されない（原子性。PR #2649 指摘）。
+#[test]
+fn wire20_insert_then_copy_to_binary_unsupported_type_does_not_commit_insert() {
+    let (core, _guard) = new_core_with_docs_table();
+    let mut stream = spawn_with_alice(core);
+    send_simple_query(
+        &mut stream,
+        "INSERT INTO docs (id, embedding, lang) VALUES (1, '[1.0,0.0]', 'ja') USING OPERATION_ID 'w20-t10'; \
+         COPY (SELECT embedding FROM docs LIMIT 10) TO STDOUT WITH (FORMAT binary)",
+    );
+    assert_eq!(read_command_complete(&mut stream), "INSERT 0 1");
+    let (t, _) = read_message(&mut stream);
+    assert_eq!(t, b'E', "expected ErrorResponse");
+    assert_eq!(read_ready_for_query_status(&mut stream), b'I');
+    assert_eq!(count_docs(&mut stream), 0);
+}
