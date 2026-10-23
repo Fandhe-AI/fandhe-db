@@ -14,6 +14,8 @@
   `ESCAPE` は句なし（`\`）・指定文字・`''`（無効）、2 文字以上は `22025`。不正パターンは `2201B`、
   上限超過は `54000`。NULL は三値論理。索引は使わず常に残余述語。
   詳細は [regex-matcher.md](docs/design/regex-matcher.md)。
+  BREAKING CHANGE: 公開 enum `Expr::RegexMatch` に必須フィールド `raw_pattern_len: Option<usize>` を追加したため、
+  構築コードと網羅的な `match` は更新が要る。既存の `~` 系の構築では `raw_pattern_len: None` を指定する。
 - `WHERE <列または式> ~ | ~* | !~ | !~* '<pattern>'`（正規表現マッチ演算子）を受理して評価する（Issue #1787・SQL-55）。
   パターンは文字列リテラルか `NULL`（拡張クエリでは `<列> ~ $n`。`$n` は常に text）。ASCII のみ大小無視（`~*`）、
   NULL は三値論理、不正パターンは `2201B`、非対応構文は `0A000`、上限超過は `54000`。索引は使わず常に残余述語。
