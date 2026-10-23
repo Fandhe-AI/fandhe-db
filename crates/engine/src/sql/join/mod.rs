@@ -132,7 +132,7 @@ fn result_bytes(column_count: usize, rows: &[ResultRow]) -> usize {
     total
 }
 
-pub(super) fn cell_payload_bytes(cell: &Cell) -> usize {
+pub(crate) fn cell_payload_bytes(cell: &Cell) -> usize {
     match cell {
         Cell::Text(s) => s.len(),
         Cell::Bytes(b) => b.len(),

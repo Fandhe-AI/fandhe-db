@@ -297,6 +297,23 @@ MAX_SCAN_RESULT_BYTES`・`sql::exec::MAX_CANDIDATE_SCALAR_BYTES` と同じ
 永続化されない（副作用ゼロ）ため、クライアントに見える差は返却コードのみ。
 単一行 `UPDATE` は制約検査の後に投影する（単一行 `DELETE` と同じ順序）。
 
+## FROM／USING つき UPDATE／DELETE の RETURNING（Issue #1756・SQL-53・RLS-10 のポインタ）
+
+`sql::dml_from_returning` が束縛・投影・収集を担う（構文本体 #1754・結合実行 #1755 の結果を受ける）。
+
+| 項目 | 方針 |
+| ---- | ---- |
+| 名前解決 | `sql::relation::BindingScope`（`relations[0]` = 対象表、以降 FROM／USING の宣言順）を再利用。第 2 の解決器は作らない |
+| 受理する形 | `*`・`<公開名>.*`・列参照（修飾あり・なし）の並び。式・関数呼び出し・`AS` 別名は従来どおり `42601` |
+| 裸の `*` | 対象表の展開に続けて FROM／USING の各表を宣言順に並べる（JOIN の `SELECT *` と同規則。採番方式の表は疑似列 `id` なし）。PG 17 の実挙動との照合は結線時に行う |
+| 出力列名・型 | 修飾つきでも列名のみ。型は `ColumnMeta` |
+| 対象表の列 | `returning::project_row` へ委譲。対象表の列だけを参照する場合は従来と同じ列・行（単体テストで完全一致を固定） |
+| RLS | 対象行は収集時に `PolicyContext::is_visible` で再判定。FROM／USING 側の各表は呼び出し側が書き込むセッションの `ctx` で独立に走査する（システム文脈を使わない）。結合の上限は可視行だけで数える |
+| 予算 | FROM／USING 側セルも確保前に `MAX_RETURNING_RESULT_BYTES` で検証（`54000`）。範囲外参照・一致行欠落は `XX000` |
+
+**申し送り（モード B）**: #1754／#1755 が未マージの時点の実装のため、`parse_update`／`parse_delete` と `core.rs` への結線、
+e2e の RLS 回帰テスト（差分比較・独立オラクル・自己結合・明示 txn）は後着側で行う。未接続の入口は従来どおり `42601` で fail-closed。
+
 ## 対象外・申し送り
 
 - **ファイル形 `INSERT`**: 従来どおり `42601`（サーバー側チャンク化行を返す応答形が未定義）。
