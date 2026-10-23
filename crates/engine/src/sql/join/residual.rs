@@ -206,7 +206,7 @@ pub(super) fn sort_by_keys(
         for (j, k) in keys.iter().enumerate() {
             let x = flat.get(a * nkeys + j).and_then(|v| v.as_ref());
             let y = flat.get(b * nkeys + j).and_then(|v| v.as_ref());
-            let ord = compare_order(x, y, k.descending);
+            let ord = compare_order(x, y, k.descending, k.nulls);
             if ord != std::cmp::Ordering::Equal {
                 return ord;
             }

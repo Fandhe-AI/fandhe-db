@@ -23,7 +23,7 @@ fn scan_bug(detail: &str) -> SqlSurfaceError {
 }
 
 /// スカラー ORDER BY 1 キー分の実行時比較値（`sql::group_by` の NULL 規約とは
-/// 異なる PostgreSQL 既定〔ASC 末尾・DESC 先頭〕を実装する比較器の入力）。
+/// 異なる NULL 位置規約〔既定は ASC 末尾・DESC 先頭。[`NullPlacement::pg_default`]〕を実装する比較器の入力）。
 /// `None`（SQL NULL）は [`compare_order_key`] が型を問わず統一的に扱う。
 #[derive(Debug, Clone, PartialEq)]
 pub(crate) enum OrderValue {
@@ -98,32 +98,52 @@ pub(crate) fn compare_order_values(a: &OrderValue, b: &OrderValue) -> Ordering {
     }
 }
 
-/// 1 キー分の最終比較（NULL 位置・降順を適用済み。ASC は NULL を末尾、DESC は
-/// NULL を先頭に置く PostgreSQL 既定。§受入基準 2）。戻り値は「昇順に安定ソートすると
-/// 最終的な出力順になる」意味の `Ordering`（`Less` が先頭）。
-pub(crate) fn compare_order_key(
-    a: Option<&OrderValue>,
-    b: Option<&OrderValue>,
+/// NULL の出力位置（`NULLS FIRST`／`NULLS LAST` 相当。SQL-56）。降順反転の影響を受けない
+/// 「出力上の絶対位置」を表す。比較器（[`compare_nullable`]）とバインド済みソートキー型
+/// （`BoundOrderKey` 等）が `descending` とは独立に保持し、構文からの明示指定は束縛段が流し込む。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum NullPlacement {
+    /// NULL を先頭に置く。
+    First,
+    /// NULL を末尾に置く。
+    Last,
+}
+
+impl NullPlacement {
+    /// PostgreSQL 17 既定（ASC は末尾・DESC は先頭）。明示指定が無い束縛段・内部生成キーが
+    /// 構築時にここで値を確定させ、比較器には常に明示値を渡す。
+    pub(crate) const fn pg_default(descending: bool) -> NullPlacement {
+        if descending {
+            NullPlacement::First
+        } else {
+            NullPlacement::Last
+        }
+    }
+}
+
+/// NULL 許容 1 キー分の最終比較の唯一の実装（NULL 位置・降順を適用済み）。戻り値は
+/// 「昇順に安定ソートすると最終的な出力順になる」意味の `Ordering`（`Less` が先頭）。
+/// NULL 位置は絶対位置のため `descending` で反転せず、非 NULL 同士のみ降順で反転する。
+/// 各型固有の比較器（scan・group_by・window・join）はこの関数へ委譲する。
+pub(crate) fn compare_nullable<A, B>(
+    a: Option<A>,
+    b: Option<B>,
     descending: bool,
+    nulls: NullPlacement,
+    cmp_non_null: impl FnOnce(A, B) -> Ordering,
 ) -> Ordering {
     match (a, b) {
         (None, None) => Ordering::Equal,
-        (None, Some(_)) => {
-            if descending {
-                Ordering::Less
-            } else {
-                Ordering::Greater
-            }
-        }
-        (Some(_), None) => {
-            if descending {
-                Ordering::Greater
-            } else {
-                Ordering::Less
-            }
-        }
+        (None, Some(_)) => match nulls {
+            NullPlacement::First => Ordering::Less,
+            NullPlacement::Last => Ordering::Greater,
+        },
+        (Some(_), None) => match nulls {
+            NullPlacement::First => Ordering::Greater,
+            NullPlacement::Last => Ordering::Less,
+        },
         (Some(x), Some(y)) => {
-            let base = compare_order_values(x, y);
+            let base = cmp_non_null(x, y);
             if descending {
                 base.reverse()
             } else {
@@ -131,6 +151,16 @@ pub(crate) fn compare_order_key(
             }
         }
     }
+}
+
+/// 1 キー分の最終比較（[`compare_nullable`] への委譲。SQL-56）。
+pub(crate) fn compare_order_key(
+    a: Option<&OrderValue>,
+    b: Option<&OrderValue>,
+    descending: bool,
+    nulls: NullPlacement,
+) -> Ordering {
+    compare_nullable(a, b, descending, nulls, compare_order_values)
 }
 
 /// [`OrderValue`] の借用版（Issue #915 追加是正: codex-review・Cursor Bugbot
@@ -353,7 +383,7 @@ pub(crate) fn compare_statement_order(
     for (idx, key) in spec.iter().enumerate() {
         let a = a_keys.get(idx).and_then(|o| o.as_ref());
         let b = b_keys.get(idx).and_then(|o| o.as_ref());
-        let ord = compare_order_key(a, b, key.descending);
+        let ord = compare_order_key(a, b, key.descending, key.nulls);
         if ord != Ordering::Equal {
             return ord;
         }
@@ -596,6 +626,73 @@ pub(crate) fn expr_value_to_jsonb_key(
 mod tests {
     use super::*;
     use crate::collation::Collation;
+
+    /// SQL-56: 既定の NULL 位置は ASC 末尾・DESC 先頭（PG 17 準拠）。
+    #[test]
+    fn pg_default_places_nulls_last_for_asc_and_first_for_desc() {
+        assert_eq!(NullPlacement::pg_default(false), NullPlacement::Last);
+        assert_eq!(NullPlacement::pg_default(true), NullPlacement::First);
+    }
+
+    /// SQL-56: 降順 × NULL 位置の 4 通り。NULL 位置は降順で反転せず、非 NULL のみ反転する。
+    #[test]
+    fn compare_order_key_applies_null_placement_independently_of_direction() {
+        let one = OrderValue::SignedInt(1);
+        let two = OrderValue::SignedInt(2);
+        for (descending, nulls, null_vs_val) in [
+            (false, NullPlacement::Last, Ordering::Greater),
+            (false, NullPlacement::First, Ordering::Less),
+            (true, NullPlacement::Last, Ordering::Greater),
+            (true, NullPlacement::First, Ordering::Less),
+        ] {
+            assert_eq!(
+                compare_order_key(None, Some(&one), descending, nulls),
+                null_vs_val
+            );
+            assert_eq!(
+                compare_order_key(Some(&one), None, descending, nulls),
+                null_vs_val.reverse()
+            );
+            assert_eq!(
+                compare_order_key(None, None, descending, nulls),
+                Ordering::Equal
+            );
+            let non_null = compare_order_key(Some(&one), Some(&two), descending, nulls);
+            assert_eq!(
+                non_null,
+                if descending {
+                    Ordering::Greater
+                } else {
+                    Ordering::Less
+                }
+            );
+        }
+    }
+
+    /// 既定値（`pg_default`）を渡した場合の結果が旧実装（降順フラグのみで決める分岐）の
+    /// 期待値と一致する回帰（リテラルで固定）。
+    #[test]
+    fn compare_order_key_with_default_placement_keeps_legacy_results() {
+        let v = OrderValue::SignedInt(1);
+        let asc = NullPlacement::pg_default(false);
+        let desc = NullPlacement::pg_default(true);
+        assert_eq!(
+            compare_order_key(None, Some(&v), false, asc),
+            Ordering::Greater
+        );
+        assert_eq!(
+            compare_order_key(Some(&v), None, false, asc),
+            Ordering::Less
+        );
+        assert_eq!(
+            compare_order_key(None, Some(&v), true, desc),
+            Ordering::Less
+        );
+        assert_eq!(
+            compare_order_key(Some(&v), None, true, desc),
+            Ordering::Greater
+        );
+    }
 
     /// TABLE-28・Issue #2190: バイト列順の照合は従来どおり `Bytes`（借用）、ICU は `Collated`。
     #[test]

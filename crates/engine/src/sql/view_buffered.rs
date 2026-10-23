@@ -54,7 +54,7 @@ use super::expr_program::StackValue;
 use super::join::values::{cell_scalar, cmp_class, cmp_val, compare_order, CmpClass, CmpVal};
 use super::order_value::{
     compare_order_key, expr_value_to_order_value, extract_order_value_ref, scalar_key_ref_to_owned,
-    OrderValue,
+    NullPlacement, OrderValue,
 };
 use super::parser::{BoundAggregate, BoundOrderKey, BoundOrderTarget, BoundScan, BoundWindowItem};
 use super::udf_call::{ExprValue, UdfRegistry};
@@ -119,6 +119,7 @@ struct OrderKeyPlan {
     index: usize,
     class: CmpClass,
     descending: bool,
+    nulls: NullPlacement,
 }
 
 /// 本文の結果列から合成したスキーマに束縛した外側の述語・式キー。`types` は結果列ごとの
@@ -591,6 +592,7 @@ fn plan_order(
             index,
             class,
             descending: key.descending,
+            nulls: NullPlacement::pg_default(key.descending),
         });
     }
     Ok(out)
@@ -851,7 +853,7 @@ fn sort_rows(
                 return Ordering::Equal;
             };
             for (o, (va, vb)) in order.iter().zip(ka.iter().zip(kb.iter())) {
-                let ord = compare_order(va.as_ref(), vb.as_ref(), o.descending);
+                let ord = compare_order(va.as_ref(), vb.as_ref(), o.descending, o.nulls);
                 if ord != Ordering::Equal {
                     return ord;
                 }
@@ -910,7 +912,7 @@ fn sort_rows_by_keys(
         for (n, key) in spec.iter().enumerate() {
             let va = ka.get(n).and_then(Option::as_ref);
             let vb = kb.get(n).and_then(Option::as_ref);
-            let ord = compare_order_key(va, vb, key.descending);
+            let ord = compare_order_key(va, vb, key.descending, key.nulls);
             if ord != Ordering::Equal {
                 return ord;
             }

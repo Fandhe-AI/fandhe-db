@@ -57,8 +57,8 @@ use crate::sql::allowlist::{SqlSurfaceError, WindowFunc};
 use crate::sql::exec::{Cell, ColumnMeta, QueryResult, ResultRow};
 use crate::sql::expr_program::{ExprProgram, StackValue};
 use crate::sql::order_value::{
-    compare_statement_order, extract_order_value_ref, scalar_key_ref_to_owned, OrderValue,
-    ScalarKeyRef,
+    compare_nullable, compare_statement_order, extract_order_value_ref, scalar_key_ref_to_owned,
+    NullPlacement, OrderValue, ScalarKeyRef,
 };
 use crate::sql::parser::{
     AggregateInput, BoundScan, BoundWindowItem, ProjectedColumn, WindowKeyKind, WindowKeyRef,
@@ -672,7 +672,8 @@ fn collect_window_row_values(
         check_partition_row_count(*count, MAX_WINDOW_FRAME_ROWS)?;
 
         let mut okeys = Vec::with_capacity(item.order_by.len());
-        for (key, _descending) in &item.order_by {
+        for ordering in &item.order_by {
+            let key = &ordering.key;
             let value = extract_window_key(key, id, scanned)?;
             *state_bytes = try_accumulate_state_budget(
                 *state_bytes,
@@ -728,7 +729,7 @@ impl<'a> CellWindowEvaluator<'a> {
             let uses_pseudo_id = item
                 .partition_by
                 .iter()
-                .chain(item.order_by.iter().map(|(k, _)| k))
+                .chain(item.order_by.iter().map(|o| &o.key))
                 .any(|k| matches!(k, WindowKeyRef::Id))
                 || matches!(item.input, Some(AggregateInput::IdU64));
             if uses_pseudo_id {
@@ -876,7 +877,7 @@ fn decode_tier_for_window(schema: &TableSchema, bound: &BoundScan) -> (DecodeTie
         for key in item
             .partition_by
             .iter()
-            .chain(item.order_by.iter().map(|(k, _)| k))
+            .chain(item.order_by.iter().map(|o| &o.key))
         {
             if let WindowKeyRef::Column { index, .. } = key {
                 has_scalar_reference = true;
@@ -1241,33 +1242,15 @@ fn cmp_window_key(
     a: &Option<WindowKeyValue>,
     b: &Option<WindowKeyValue>,
     descending: bool,
+    nulls: NullPlacement,
 ) -> std::cmp::Ordering {
-    use std::cmp::Ordering;
-    match (a, b) {
-        (None, None) => Ordering::Equal,
-        (None, Some(_)) => {
-            if descending {
-                Ordering::Less
-            } else {
-                Ordering::Greater
-            }
-        }
-        (Some(_), None) => {
-            if descending {
-                Ordering::Greater
-            } else {
-                Ordering::Less
-            }
-        }
-        (Some(x), Some(y)) => {
-            let raw = cmp_window_key_value(x, y);
-            if descending {
-                raw.reverse()
-            } else {
-                raw
-            }
-        }
-    }
+    compare_nullable(
+        a.as_ref(),
+        b.as_ref(),
+        descending,
+        nulls,
+        cmp_window_key_value,
+    )
 }
 
 fn cmp_window_key_value(a: &WindowKeyValue, b: &WindowKeyValue) -> std::cmp::Ordering {
@@ -1375,11 +1358,12 @@ fn evaluate_partition(
     indices.sort_by(|&a, &b| {
         let ra = &materialized[a];
         let rb = &materialized[b];
-        for (key_idx, (_, descending)) in item.order_by.iter().enumerate() {
+        for (key_idx, ordering) in item.order_by.iter().enumerate() {
             let ord = cmp_window_key(
                 &ra.order_keys[item_index][key_idx],
                 &rb.order_keys[item_index][key_idx],
-                *descending,
+                ordering.descending,
+                ordering.nulls,
             );
             if ord != std::cmp::Ordering::Equal {
                 return ord;
