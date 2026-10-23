@@ -686,6 +686,20 @@ Issue #871（述語つき UPDATE/DELETE の実行結線）は自動運転モー�
 - **残余リスク**: 内側だけで参照される宣言的 UDF の定義は材料に入れない（内側の結果を材料にしない方針と同じ）。
   分割実行版の TimeZone 材料は外側の式と表の列型だけで判定し、内側トークンは見ない。
 
+## Issue #2650 追記（サブクエリつき述語形 DML の台帳結線）
+
+SQL-53 (5)・RECOVER-11 のポインタ。#1752 の申し送り（台帳の事前照合の位置・e2e の再送テスト）を解消した。
+
+- **撤去**: `operation_id` 暫定ゲート（`0A000`）と暫定ハッシュを撤去し、`has_subquery` 引数も廃止した。
+- **結線**: `resolve_predicate_*_subqueries` が、解決前の文から正規化ハッシュを出した直後・内側の評価の前に
+  `precheck_in_write_txn`（読み取り専用・台帳表を作らない）で事前照合する。確定記録は従来どおり実行本体の
+  `record_in_txn` で、`prepare_predicate_*` が同じ入力・同じ関数で再計算するため一致する。
+- **legacy ハッシュ**: UPDATE の `legacy_hashes` はサブクエリつきでも一律に計算する。サブクエリつきは従来
+  記録されたことが無く正準化前のエントリは存在しないため、判定は弱まらない。
+- **順序の変化**: サブクエリつきの文だけ、ハッシュ計算の失敗が束縛より前に出る。
+- **テスト**: engine 単体（`core/dml_subquery_exec_tests.rs`）・結合（`tests/sql53_dml_where_subquery.rs`）・
+  wire 経由 e2e（`wire-server/tests/wire_sql53_dml_subquery_operation_id.rs`。簡易・拡張クエリ）。
+
 ## 参照
 
 - `docs/spec/04-behavior/recovery.md`（RECOVER-2・RECOVER-3・RECOVER-7・

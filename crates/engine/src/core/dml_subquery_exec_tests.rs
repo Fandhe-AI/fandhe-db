@@ -259,18 +259,95 @@ fn returning_matches_literal_form() {
     }
 }
 
+/// SQL-53 (5)・RECOVER-11: `USING OPERATION_ID` 付きも受理し、同一文の再送は `23505`（副作用なし）。
 #[test]
-fn operation_id_with_subquery_is_rejected_without_side_effects() {
+fn operation_id_with_subquery_is_accepted_and_resend_is_23505() {
     let (core, _g) = new_core();
-    let (alice, _bob) = setup_two_tenants(&core);
+    let (alice, bob) = setup_two_tenants(&core);
     let parsed = with_where(
         &core,
         "DELETE FROM docs WHERE lang = 'x' USING OPERATION_ID 'op-sub-1'",
         in_sub(INNER),
     );
-    let err = exec(&core, &alice, &parsed).expect_err("gate");
-    assert_eq!(err.wire_code(), "0A000");
-    assert_eq!(langs(&core, &alice, "docs").len(), 2);
+    assert_eq!(affected(exec(&core, &alice, &parsed).expect("first")), 1);
+    assert_eq!(langs(&core, &alice, "docs"), s(&["en"]));
+    let err = exec(&core, &alice, &parsed).expect_err("resend");
+    assert_eq!(err.wire_code(), "23505");
+    assert_eq!(langs(&core, &alice, "docs"), s(&["en"]));
+    assert_eq!(langs(&core, &bob, "docs"), s(&["en", "ja"]));
+}
+
+/// 同じ `operation_id` で内側だけ違う文は `22023`（副作用なし）。
+#[test]
+fn operation_id_reuse_with_different_subquery_is_22023() {
+    let (core, _g) = new_core();
+    let (alice, _bob) = setup_two_tenants(&core);
+    let sql = "DELETE FROM docs WHERE lang = 'x' USING OPERATION_ID 'op-sub-2'";
+    let first = with_where(&core, sql, in_sub(INNER));
+    exec(&core, &alice, &first).expect("first");
+    let other = with_where(
+        &core,
+        sql,
+        in_sub("SELECT lang FROM allowed WHERE lang = 'en' LIMIT 10"),
+    );
+    let err = exec(&core, &alice, &other).expect_err("different statement");
+    assert_eq!(err.wire_code(), "22023");
+    assert_eq!(langs(&core, &alice, "docs"), s(&["en"]));
+}
+
+/// 事前照合は内側の評価より前: 再送時に内側が 21000 になる状態でも `23505`。
+#[test]
+fn ledger_precheck_runs_before_inner_subquery_evaluation() {
+    let (core, _g) = new_core();
+    let (alice, _bob) = setup_two_tenants(&core);
+    let scalar = || WherePredicate::ScalarSubqueryCompare {
+        column: "lang".to_string(),
+        op: ScalarSubqueryOp::Eq,
+        inner_tokens: inner(INNER),
+        depth: 1,
+    };
+    let sql = "DELETE FROM docs WHERE lang = 'x' USING OPERATION_ID 'op-sub-3'";
+    let parsed = with_where(&core, sql, scalar());
+    assert_eq!(affected(exec(&core, &alice, &parsed).expect("first")), 1);
+    seed(&core, &alice, "allowed", 9, "en");
+    let err = exec(&core, &alice, &parsed).expect_err("resend");
+    assert_eq!(err.wire_code(), "23505");
+}
+
+/// 内側の結果が 0 行に変わっても再送は `23505`。
+#[test]
+fn resend_after_inner_result_changes_to_zero_rows_is_23505() {
+    let (core, _g) = new_core();
+    let (alice, _bob) = setup_two_tenants(&core);
+    let sql = "DELETE FROM docs WHERE lang = 'x' USING OPERATION_ID 'op-sub-4'";
+    let parsed = with_where(&core, sql, exists_sub(INNER));
+    assert_eq!(affected(exec(&core, &alice, &parsed).expect("first")), 2);
+    run(&core, &alice, "DELETE FROM allowed WHERE lang = 'ja'").expect("empty inner");
+    let err = exec(&core, &alice, &parsed).expect_err("resend");
+    assert_eq!(err.wire_code(), "23505");
+}
+
+/// UPDATE でも再送 `23505`・別文 `22023`。
+#[test]
+fn update_with_subquery_operation_id_resend_and_reuse() {
+    let (core, _g) = new_core();
+    let (alice, bob) = setup_two_tenants(&core);
+    let sql = "UPDATE docs SET lang = 'fr' WHERE lang = 'x' USING OPERATION_ID 'op-sub-5'";
+    let parsed = with_where(&core, sql, in_sub(INNER));
+    assert_eq!(affected(exec(&core, &alice, &parsed).expect("first")), 1);
+    assert_eq!(langs(&core, &alice, "docs"), s(&["en", "fr"]));
+    assert_eq!(
+        exec(&core, &alice, &parsed)
+            .expect_err("resend")
+            .wire_code(),
+        "23505"
+    );
+    let other = with_where(&core, sql, exists_sub(INNER));
+    assert_eq!(
+        exec(&core, &alice, &other).expect_err("reuse").wire_code(),
+        "22023"
+    );
+    assert_eq!(langs(&core, &bob, "docs"), s(&["en", "ja"]));
 }
 
 #[test]

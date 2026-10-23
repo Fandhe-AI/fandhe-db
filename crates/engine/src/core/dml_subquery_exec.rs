@@ -21,9 +21,10 @@
 //! 包んで同じ経路へ流す（評価と書き込みの間に他 writer の commit が挟まらない）。
 //!
 //! 台帳ハッシュ（RECOVER-11・SQL-53 (5)）: ハッシュは常に解決**前**の文から計算し、解決結果の値は
-//! 入れない。#1752 が未対応の間の暫定措置として、`operation_id` を記録する構成・指定は内側の実行前に
-//! `0A000` で拒否し、記録しない場合（台帳が読まない）だけ代替ハッシュを渡す。この暫定措置は
-//! #1752 で撤去する（[`EngineCore::subquery_dml_operation_id_gate`]・[`provisional_hash_*`]）。
+//! 入れない。Issue #2650 で #1752 の正規化ハッシュ（`content_hash` のサブクエリ葉）へ結線済みで、
+//! 解決前の述語でハッシュを出した直後・内側の評価の前に台帳を事前照合する
+//! （[`EngineCore::precheck_subquery_dml_ledger`]）。再送は内側の結果に左右されず `23505`、
+//! 別文の再利用は `22023` になる。
 //!
 //! fail-closed: autocommit の `WriteTarget` でサブクエリつき述語が来た場合（暗黙トランザクションを
 //! 通らない未知の経路）は解決せず、固定文言の `0A000` で拒否する。`PARTITIONED` との組合せは
@@ -49,28 +50,6 @@ pub(super) fn where_has_subquery(preds: &[WherePredicate]) -> bool {
         WherePredicate::Or(branches) => branches.iter().any(|b| where_has_subquery(b)),
         _ => false,
     })
-}
-
-/// `DELETE` 用の暫定ハッシュ（#1752 まで。`operation_id` が無く台帳が読まないときだけ使う）。
-pub(super) fn provisional_hash_delete(
-    table: &str,
-    udfs: &crate::sql::udf_call::UdfRegistry,
-) -> Result<ContentHash, SqlSurfaceError> {
-    crate::recovery::content_hash::for_delete_where(table, &[], udfs)
-}
-
-/// `UPDATE` 用の暫定ハッシュ（[`provisional_hash_delete`] と同じ位置付け）。
-pub(super) fn provisional_hash_update(
-    stmt: &ValidatedPredicateUpdate,
-    schema: &crate::catalog::TableSchema,
-    udfs: &crate::sql::udf_call::UdfRegistry,
-) -> Result<ContentHash, SqlSurfaceError> {
-    let refs: Vec<(&str, &crate::sql::allowlist::SetValue)> = stmt
-        .assignments()
-        .iter()
-        .map(|(n, v)| (n.as_str(), v))
-        .collect();
-    crate::recovery::content_hash::for_update_where(stmt.table_name(), &refs, &[], udfs, schema)
 }
 
 fn not_supported(detail: &str) -> SqlSurfaceError {
@@ -112,22 +91,39 @@ impl EngineCore {
         )
     }
 
-    /// #1752 までの暫定ゲート: `operation_id` を台帳へ記録する文は、内側の実行前に `0A000` で拒否する
-    /// （台帳にもデータにも触れない。結果に依存するハッシュを記録しない）。#1752 で撤去する。
-    fn subquery_dml_operation_id_gate(
+    /// 台帳の事前照合（Issue #2650・RECOVER-11・SQL-53 (5)）。解決**前**の文から出した正規化ハッシュで、
+    /// 内側の評価より前に再送（`23505`）・別文の `operation_id` 再利用（`22023`）を判定する。
+    /// 読み取り専用で台帳表を作らない。確定記録は実行本体の `record_in_txn` が同じ txn で行い、
+    /// そのハッシュは `prepare_predicate_*` が同じ入力・同じ関数で計算するため一致する。
+    /// `InTxn` 以外は解決しない target と同じく `0A000` で fail-closed（照合より先に確かめる）。
+    fn precheck_subquery_dml_ledger(
         &self,
+        target: &WriteTarget<'_>,
+        ctx: &PolicyContext,
+        table: &str,
         op_id: Option<&crate::recovery::required_op_id::OperationId>,
+        hash: &ContentHash,
+        op: &'static str,
     ) -> Result<(), SqlSurfaceError> {
-        let write = self
+        let WriteTarget::InTxn(write_txn) = target else {
+            return Err(not_supported(
+                "subquery in WHERE is not supported for this statement",
+            ));
+        };
+        let ledger_write = self
             .ledger_mode
             .resolve(op_id)
             .map_err(|_| SqlSurfaceError::MissingOperationId)?;
-        if write.op_id().is_some() {
-            return Err(not_supported(
-                "USING OPERATION_ID is not yet supported with a subquery in WHERE",
-            ));
-        }
-        Ok(())
+        crate::recovery::ledger::precheck_in_write_txn(
+            write_txn,
+            ctx.tenant_id(),
+            table,
+            ledger_write,
+            hash,
+        )
+        .map_err(|e| {
+            crate::sql::exec::map_write_error(crate::tenant::TenantWriteError::from(e), op)
+        })
     }
 
     /// 述語形 `DELETE` のサブクエリを解決した文を返す。サブクエリが無い・`PARTITIONED` 付き
@@ -143,7 +139,19 @@ impl EngineCore {
         if stmt.partitioned().is_some() || !where_has_subquery(stmt.where_predicates()) {
             return Ok(None);
         }
-        self.subquery_dml_operation_id_gate(stmt.operation_id())?;
+        let hash = crate::recovery::content_hash::for_delete_where(
+            stmt.table_name(),
+            stmt.where_predicates(),
+            session.udfs(),
+        )?;
+        self.precheck_subquery_dml_ledger(
+            target,
+            ctx,
+            stmt.table_name(),
+            stmt.operation_id(),
+            &hash,
+            "delete",
+        )?;
         let preds =
             self.resolve_dml_where(target, ctx, session, schema, stmt.where_predicates())?;
         let mut resolved = stmt.clone();
@@ -167,7 +175,26 @@ impl EngineCore {
         if v.partitioned().is_some() || !where_has_subquery(v.where_predicates()) {
             return Ok(None);
         }
-        self.subquery_dml_operation_id_gate(v.operation_id())?;
+        let refs: Vec<(&str, &crate::sql::allowlist::SetValue)> = v
+            .assignments()
+            .iter()
+            .map(|(n, val)| (n.as_str(), val))
+            .collect();
+        let hash = crate::recovery::content_hash::for_update_where(
+            v.table_name(),
+            &refs,
+            v.where_predicates(),
+            session.udfs(),
+            schema,
+        )?;
+        self.precheck_subquery_dml_ledger(
+            target,
+            ctx,
+            v.table_name(),
+            v.operation_id(),
+            &hash,
+            "update",
+        )?;
         let preds = self.resolve_dml_where(target, ctx, session, schema, v.where_predicates())?;
         let mut resolved = v.clone();
         resolved.where_predicates = preds;

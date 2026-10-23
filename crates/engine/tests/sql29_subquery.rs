@@ -1116,35 +1116,26 @@ fn exists_subquery_in_ranked_select_is_rejected() {
     ));
 }
 
-/// `USING OPERATION_ID` 付きの述語形 UPDATE のサブクエリは内側の実行前に `0A000` で拒否され、
-/// 表の内容を変えない（暫定ゲート。SQL-53 の結合テストと同じ契約）。
+/// `USING OPERATION_ID` 付きの述語形 UPDATE のサブクエリは受理され、同一文の再送は `23505`
+/// （SQL-53・RECOVER-11、Issue #2650。SQL-53 の結合テストと同じ契約）。
 #[test]
-fn in_subquery_in_update_where_with_operation_id_is_gated_without_side_effects() {
+fn in_subquery_in_update_where_with_operation_id_is_accepted_and_resend_is_23505() {
     let (core, path) = new_core();
     let _guard = CleanupGuard(path);
     let ctx = ctx_for("tenant-a");
     seed_docs(&core, &ctx);
     insert_allowed_lang(&core, &ctx, 100, "ja");
 
-    let err = core
-        .execute_sql_in_session(
-            &ctx,
-            &mut SessionState::default(),
-            &format!(
-                "UPDATE {DOCS} SET lang = 'xx' WHERE id IN (SELECT id FROM {ALLOWED_LANGS} LIMIT 100) \
-                 USING OPERATION_ID 'update-subquery'"
-            ),
-        )
-        .expect_err("subquery in UPDATE WHERE with OPERATION_ID must be gated");
-    assert_eq!(err.wire_code(), "0A000", "{err:?}");
-    let all = select_ids(
-        &core,
-        &ctx,
-        &format!(
-            "SELECT id FROM {DOCS} WHERE lang = 'xx' ORDER BY embedding <=> '[0.1,0.1]' LIMIT 100"
-        ),
+    let sql = format!(
+        "UPDATE {DOCS} SET lang = 'xx' WHERE id IN (SELECT id FROM {ALLOWED_LANGS} LIMIT 100) \
+         USING OPERATION_ID 'update-subquery'"
     );
-    assert!(all.is_empty(), "no row may be updated: {all:?}");
+    core.execute_sql_in_session(&ctx, &mut SessionState::default(), &sql)
+        .expect("subquery in UPDATE WHERE with OPERATION_ID is accepted");
+    let err = core
+        .execute_sql_in_session(&ctx, &mut SessionState::default(), &sql)
+        .expect_err("resend");
+    assert_eq!(err.wire_code(), "23505", "{err:?}");
 }
 
 #[test]
