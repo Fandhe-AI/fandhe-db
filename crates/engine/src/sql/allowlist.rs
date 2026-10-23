@@ -1995,7 +1995,11 @@ pub enum WherePredicate {
     /// `column: String` を `lhs: Expr`（左辺の式ノード）へ置き換えた。裸の列は
     /// `Expr::Ident(col)` で表し、構築側は `lhs: Expr::Ident(col)`、分解側は
     /// [`Expr::as_bare_column`] か `..` を使う。スカラー索引の候補抽出・宣言的フィルタへの
-    /// 束縛は左辺が裸の列のときだけ働く。構文層は引き続き裸の列しか生成しない。
+    /// 束縛は左辺が裸の列のときだけ働く。
+    ///
+    /// **SQL-54（Issue #1782）**: 構文層は式左辺（関数呼び出し・`||`・算術・`CASE` 等）も生成する
+    /// （`Parser::parse_like_rest`）。式左辺は宣言的フィルタ／索引候補にせず、束縛段が
+    /// `BoundExpr::Like` として式レーンの残余述語にする。
     Prefix {
         lhs: Expr,
         pattern: String,
@@ -5056,6 +5060,9 @@ enum ExprLeaf {
     Plain(Expr),
     /// `a <> b` を表す `a = b` の式（呼び出し元が否定を押し下げる）。
     NotEqual(Expr),
+    /// 式左辺の `<式> [NOT] LIKE|ILIKE '<lit>' [ESCAPE '<c>']`（SQL-54・Issue #1782）。
+    /// 中身は [`WherePredicate::Prefix`]、後置 `NOT` ありなら `Not(Prefix)`。
+    Like(WherePredicate),
 }
 
 impl<'a> Parser<'a> {
@@ -6446,7 +6453,7 @@ impl<'a> Parser<'a> {
                 let is_value_group = matches!(
                     self.tokens.get(close_idx + 1),
                     Some(token) if is_where_group_operator_token(token)
-                );
+                ) || self.like_follows_group(close_idx);
                 if !is_value_group {
                     let next_depth = depth
                         .checked_add(1)
@@ -6474,7 +6481,7 @@ impl<'a> Parser<'a> {
             let is_value_group = matches!(
                 self.tokens.get(close_idx + 1),
                 Some(token) if is_where_group_operator_token(token)
-            );
+            ) || self.like_follows_group(close_idx);
             if !is_value_group {
                 let next_depth = depth
                     .checked_add(1)
@@ -6633,6 +6640,12 @@ impl<'a> Parser<'a> {
                             pred
                         }
                     }
+                    // 式左辺の LIKE（Issue #1782）。前置 `NOT` の奇数個は `Not(..)` の付け外しで表す。
+                    ExprLeaf::Like(WherePredicate::Not(x)) if negate_odd => vec![*x],
+                    ExprLeaf::Like(pred) if negate_odd => {
+                        vec![WherePredicate::Not(Box::new(pred))]
+                    }
+                    ExprLeaf::Like(pred) => vec![pred],
                     // `NOT a <> b` は `a = b` そのもの（二重否定を畳む）。
                     ExprLeaf::NotEqual(eq) if negate_odd => {
                         vec![WherePredicate::Expression(eq)]
@@ -6646,6 +6659,7 @@ impl<'a> Parser<'a> {
         } else {
             match self.parse_expression_predicate()? {
                 ExprLeaf::Plain(expr) => vec![WherePredicate::Expression(expr)],
+                ExprLeaf::Like(pred) => vec![pred],
                 // `a <> b` は `NOT a = b` と同じ形（`a < b OR a > b`）へ脱糖する。
                 ExprLeaf::NotEqual(eq) => negate_conjunction(
                     vec![WherePredicate::Expression(eq)],
@@ -6727,6 +6741,9 @@ impl<'a> Parser<'a> {
         if let Some((negated, len)) = self.distinct_from_at(self.pos) {
             return self.parse_distinct_from_rest(negated, len, lhs);
         }
+        if let Some((negated, case_insensitive, len)) = self.like_at(self.pos) {
+            return self.parse_like_rest(negated, case_insensitive, len, lhs);
+        }
         if let Expr::JsonAccess { op, .. } = &lhs {
             if op.is_predicate() && !self.peek_is_cmp_op() {
                 return Ok(ExprLeaf::Plain(lhs));
@@ -6783,6 +6800,92 @@ impl<'a> Parser<'a> {
             ArrayCmpOp::Gt => ExprLeaf::Plain(binary(BinOp::Gt, lhs, rhs)),
             ArrayCmpOp::Ge => ExprLeaf::Plain(binary(BinOp::Ge, lhs, rhs)),
         })
+    }
+
+    /// `tokens[idx]` から `[NOT] LIKE|ILIKE '<文字列リテラル>'` が並んでいれば
+    /// `(negated, case_insensitive, キーワード部のトークン数)` を返す（消費しない。SQL-54・
+    /// Issue #1782）。パターンが文字列リテラルでない形（`$n`・列・式・`::` 型キャスト付き）は
+    /// `None` にして、呼び出し元の比較演算子検査が `42601` で fail-closed にする。
+    fn like_at(&self, idx: usize) -> Option<(bool, bool, usize)> {
+        let word = |i: usize, k: &str| matches!(self.tokens.get(i), Some(Token::Ident(w)) if w.eq_ignore_ascii_case(k));
+        let (negated, kw) = if word(idx, "NOT") {
+            (true, idx.checked_add(1)?)
+        } else {
+            (false, idx)
+        };
+        let case_insensitive = if word(kw, "ILIKE") {
+            true
+        } else if word(kw, "LIKE") {
+            false
+        } else {
+            return None;
+        };
+        let lit = kw.checked_add(1)?;
+        if !matches!(self.tokens.get(lit), Some(Token::StringLiteral(_)))
+            || literal_followed_by_typecast(&self.tokens, lit)
+        {
+            return None;
+        }
+        Some((
+            negated,
+            case_insensitive,
+            kw.checked_add(1)?.checked_sub(idx)?,
+        ))
+    }
+
+    /// `)` の位置 `close_idx` の直後が `[NOT] LIKE|ILIKE` なら真。括弧付き左辺
+    /// （`(lower(name)) LIKE 'a%'`）を真偽値グループでなく値式グループとして扱うための先読み
+    /// （SQL-54・Issue #1782）。
+    fn like_follows_group(&self, close_idx: usize) -> bool {
+        close_idx
+            .checked_add(1)
+            .is_some_and(|i| self.like_keyword_at(i))
+    }
+
+    fn like_keyword_at(&self, idx: usize) -> bool {
+        let word = |i: usize, k: &str| matches!(self.tokens.get(i), Some(Token::Ident(w)) if w.eq_ignore_ascii_case(k));
+        word(idx, "LIKE")
+            || word(idx, "ILIKE")
+            || (word(idx, "NOT")
+                && idx
+                    .checked_add(1)
+                    .is_some_and(|n| word(n, "LIKE") || word(n, "ILIKE")))
+    }
+
+    /// 式左辺 `lhs` の `[NOT] LIKE|ILIKE '<lit>' [ESCAPE '<c>']` の続きを読み、
+    /// [`WherePredicate::Prefix`]（後置 `NOT` は `Not(Prefix)`）を作る（SQL-54・Issue #1782）。
+    /// 左辺が裸の列になった場合（括弧付き列等）は構造葉と同じ AST になり宣言的経路へ乗る。
+    /// CHECK 本体は評価経路が未結線のため `0A000`（fail-closed）。パターンは文字列リテラルのみ。
+    fn parse_like_rest(
+        &mut self,
+        negated: bool,
+        case_insensitive: bool,
+        len: usize,
+        lhs: Expr,
+    ) -> Result<ExprLeaf, SqlSurfaceError> {
+        if self.in_check_body {
+            return Err(SqlSurfaceError::FeatureNotSupported {
+                detail:
+                    "LIKE with a non-column left operand is not supported in a CHECK constraint"
+                        .to_string(),
+            });
+        }
+        for _ in 0..len {
+            self.advance();
+        }
+        let pattern = self.expect_string_literal()?;
+        let pattern = self.consume_like_escape_clause(pattern)?;
+        self.consume_expr_node()?;
+        let pred = WherePredicate::Prefix {
+            lhs,
+            pattern,
+            case_insensitive,
+        };
+        Ok(ExprLeaf::Like(if negated {
+            WherePredicate::Not(Box::new(pred))
+        } else {
+            pred
+        }))
     }
 
     /// `tokens[idx]` から `IS [NOT] DISTINCT FROM` が並んでいれば `(negated, 消費するトークン数)` を
@@ -31160,6 +31263,42 @@ mod tests {
                 .as_slice(),
             [WherePredicate::IsNull { negated: true, .. }]
         ));
+    }
+
+    /// SQL-54・Issue #1782: 式左辺の `[NOT] LIKE|ILIKE` は `Prefix { lhs: <式> }`（後置・前置 `NOT` は
+    /// `Not(Prefix)`、二重否定は畳む）として受理され、括弧付き左辺も値式グループとして読む。
+    #[test]
+    fn like_with_expression_lhs_parses_to_prefix() {
+        let preds = distinct_where("lower(name) LIKE 'a%'").expect("parse");
+        assert!(matches!(
+            preds.as_slice(),
+            [WherePredicate::Prefix {
+                lhs: Expr::Call { .. },
+                case_insensitive: false,
+                ..
+            }]
+        ));
+        let preds = distinct_where("lower(name) NOT ILIKE 'a%'").expect("parse");
+        assert!(matches!(
+            preds.as_slice(),
+            [WherePredicate::Not(inner)]
+                if matches!(inner.as_ref(), WherePredicate::Prefix { case_insensitive: true, .. })
+        ));
+        let preds = distinct_where("NOT lower(name) LIKE 'a%'").expect("parse");
+        assert!(matches!(preds.as_slice(), [WherePredicate::Not(_)]));
+        let preds = distinct_where("NOT lower(name) NOT LIKE 'a%'").expect("parse");
+        assert!(matches!(preds.as_slice(), [WherePredicate::Prefix { .. }]));
+        let preds = distinct_where("(lower(name)) LIKE 'a%' AND id = 1").expect("parse");
+        assert_eq!(preds.len(), 2);
+        // パターンが文字列リテラルでない形・CHECK 外でない `ESCAPE` の不正は fail-closed。
+        for clause in [
+            "lower(name) LIKE name",
+            "lower(name) LIKE $1",
+            "lower(name) LIKE 'a'::text",
+        ] {
+            let err = distinct_where(clause).expect_err(clause);
+            assert_eq!(err.wire_code(), "42601", "{clause}");
+        }
     }
 
     #[test]

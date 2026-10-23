@@ -366,9 +366,15 @@ pub(crate) fn check_index_predicate_determinism(
 fn check_one_predicate(pred: &WherePredicate) -> Result<(), SqlSurfaceError> {
     let site = IndexExprSite::Predicate;
     match pred {
-        // 式左辺（SQL-54、Issue #1781）は式として決定性を検査する。
+        // 式左辺の LIKE（SQL-54、Issue #1782）は部分索引の述語として扱えない。含意判定・索引再構築の
+        // 経路が式左辺を評価できないため、決定性にかかわらず `0A000` で fail-closed に拒否する
+        // （IS DISTINCT FROM〔Issue #1783〕と同じ方針）。
         WherePredicate::Prefix { lhs, .. } if lhs.as_bare_column().is_none() => {
-            check_index_expression_determinism(lhs, site)
+            Err(SqlSurfaceError::FeatureNotSupported {
+                detail:
+                    "LIKE with a non-column left operand is not supported in an index predicate"
+                        .to_string(),
+            })
         }
         WherePredicate::Equality { .. }
         | WherePredicate::Prefix { .. }
@@ -1099,7 +1105,7 @@ mod like_lhs_expr_tests {
     }
 
     #[test]
-    fn bare_column_lhs_is_accepted_and_nondeterministic_expr_lhs_is_rejected() {
+    fn bare_column_lhs_is_accepted_and_expr_lhs_is_rejected() {
         let col = like_with_lhs(Expr::Ident("name".to_string()));
         assert!(check_index_predicate_determinism(&[col]).is_ok());
         let nondet = like_with_lhs(Expr::Call {
@@ -1107,5 +1113,13 @@ mod like_lhs_expr_tests {
             args: vec![],
         });
         assert!(check_index_predicate_determinism(&[nondet]).is_err());
+        let det = like_with_lhs(Expr::Call {
+            name: "lower".to_string(),
+            args: vec![Expr::Ident("name".to_string())],
+        });
+        assert!(matches!(
+            check_index_predicate_determinism(&[det]),
+            Err(SqlSurfaceError::FeatureNotSupported { .. })
+        ));
     }
 }

@@ -194,7 +194,26 @@ m は `MAX_LIKE_PATTERN_LEN` で定数に抑える）。
 - 台帳の content_hash は裸の列なら従来のバイト列（タグ 2／16）のまま。式左辺には新タグを割り当てない。
 - 式左辺は束縛段・content_hash・NoSQL の update/delete ゲート・ビュー本体・CHECK で `42601`（fail-closed）。
   列スコープ検査・決定性検査・ON CONFLICT の式走査は式左辺を式として辿る。
-- 式左辺の受理・評価・タグ割り当ては #1782 の責務。`lower(name) LIKE 'a%'` は本 Issue 時点では `42601` のまま。
+- 式左辺の受理・評価・タグ割り当ては #1782 で実装した（次節）。
+
+### 実装メモ（Issue #1782）
+
+- 構文層は `<式> [NOT] LIKE|ILIKE '<lit>' [ESCAPE '<c>']` を受理する（SQL-54 (3)）。左辺は式パーサで読み、
+  関数呼び出し・`concat`・算術・`CASE`・括弧付き左辺を許す。後置・前置 `NOT` は `Not(Prefix)` で表し、
+  二重否定は畳む。パターンは文字列リテラルのみで、列・式・`$n` は `42601` のまま。
+- 束縛段は `BoundExpr::Like { lhs, pattern, negated }`（BREAKING: `BoundExpr` の variant 追加）にして
+  式レーンの残余述語にする。宣言的フィルタ・スカラー索引の候補にしないため、前方一致形でも常に全行評価
+  （EXPLAIN は `plain_scan`。SQL-54 (5)）。左辺が裸の列の既存経路（`index_prefix`／`index_equality`）は不変。
+- 左辺が NULL の行は否定の有無に関わらず `NULL`（三値論理）。WHERE は真の行だけ通すので
+  `NOT LIKE`・`NOT (... LIKE ...)` でもその行は除外される。
+- 左辺が文字列型でなければ `42883`（`42804` ではない）。文言は固定の英語で値・列名を含まない。
+- 照合: 式の内側の ICU 列・非バイト列順の `COLLATE` は `0A000`（`C`／`POSIX` は受理）。
+- 台帳の content_hash は述語タグ 17（ILIKE 有無 1 バイト・左辺式・長さ前置のパターン）。
+  列左辺のタグ 2／16 は不変。
+- fail-closed のまま: CHECK 本体・部分索引の述語（`0A000`）、ビュー本体の WHERE・集計／LIMIT 本体ビュー
+  の外側 WHERE・NoSQL update/delete ゲート・JOIN の WHERE と `UPDATE … FROM`／`DELETE … USING`（`42601` 等）。
+- 対象外: パターン右辺の式・`$n`、式索引による候補絞り込み、SELECT リスト・HAVING・JOIN ON での式左辺 LIKE、
+  左辺が列の非テキスト型 LIKE の `22000`（SQL-54 (3) の `42883` との差。別 Issue の候補）。
 
 ## PostgreSQL との差分（既知の簡略化）
 
