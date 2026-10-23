@@ -339,14 +339,11 @@ fn wire20_atomic_copy_from_orphan_row_never_persists() {
     send_copy_data(&mut stream, b"1\t999\n");
     send_copy_done(&mut stream);
     let (t, body) = read_message(&mut stream);
-    if t == b'C' {
-        // 遅延: `COPY n` の後、最後の文 `SELECT 1` の暗黙 commit が失敗し、その結果は送られない。
-        assert!(body.starts_with(b"COPY 1"));
-        assert_eq!(read_error_sqlstate(&mut stream), "23503");
-    } else {
-        assert_eq!(t, b'E');
-        assert!(String::from_utf8_lossy(&body).contains("23503"));
-    }
+    // 遅延 FK は COPY の行適用時には検査されず、最後の文 `SELECT 1` の暗黙 commit で失敗する。
+    // よって `COPY 1` が先に送られ、その後に `23503`（commit 失敗）が来る順序で固定する。
+    assert_eq!(t, b'C', "body={:?}", String::from_utf8_lossy(&body));
+    assert!(body.starts_with(b"COPY 1"));
+    assert_eq!(read_error_sqlstate(&mut stream), "23503");
     assert_eq!(read_ready_for_query_status(&mut stream), b'I');
     assert_eq!(count_table(&mut stream, "c"), 0);
 }

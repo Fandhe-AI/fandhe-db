@@ -239,7 +239,8 @@ SQL-31（`BEGIN`/`COMMIT`/`ROLLBACK`）・RECOVER-12（複数文単位の
 - 暗黙トランザクション内の COPY（Issue #1773・WIRE-20 ポインタ）: `COPY t FROM STDIN ...; SELECT 1`・
   `INSERT ...; COPY t FROM STDIN` は暗黙トランザクションになるが、COPY の文で CopyIn／CopyOut へ入り、
   CopyDone の後に続きの文へ進む（当初は `0A000` で拒否していた）。最後の文が COPY のときの commit 位置・
-  保留データの上限は [wire-copy-protocol.md](wire-copy-protocol.md) の「Issue #1773」節を参照。失敗時の原子性と `25P02` の整合は「Issue #1774」節。
+  保留データの上限は [wire-copy-protocol.md](wire-copy-protocol.md) の「Issue #1773」節を参照。
+  失敗時の原子性と `25P02` の整合は同ファイルの「Issue #1774」節。
 
 ## 挙動変化の明記（受理範囲の拡大）
 
