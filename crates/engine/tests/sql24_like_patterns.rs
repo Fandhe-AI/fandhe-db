@@ -468,3 +468,25 @@ fn tenant_boundary_is_enforced_for_percent_wildcard() {
         vec![1]
     );
 }
+
+// --- 式左辺（SQL-54、Issue #1781）---------------------------------------------------
+
+/// LIKE 述語の AST は左辺を式ノードで保持するが、構文層は現状、式左辺を受理しない
+/// （`lower(path) LIKE ...` は従来どおり `42601`）。式左辺の受理・評価は後続 Issue で反転する。
+#[test]
+fn expression_left_operand_is_still_rejected_as_unsupported_syntax() {
+    let path = unique_db_path("sql24-like-expr-lhs");
+    let _guard = CleanupGuard(path.clone());
+    let storage = open_storage(&path);
+    setup_single_tenant_table(&storage, &[(1, "abc", "code")]);
+    let core = new_core(storage);
+    let ctx = PolicyContext::new("tenant-a").expect("valid tenant");
+
+    let err = core
+        .execute_sql(
+            &ctx,
+            "SELECT * FROM docs WHERE lower(path) LIKE 'a%' ORDER BY embedding <=> '[1.0,0.0]' LIMIT 10",
+        )
+        .expect_err("expression left operand must still be rejected");
+    assert_eq!(err.wire_code(), "42601");
+}

@@ -366,6 +366,10 @@ pub(crate) fn check_index_predicate_determinism(
 fn check_one_predicate(pred: &WherePredicate) -> Result<(), SqlSurfaceError> {
     let site = IndexExprSite::Predicate;
     match pred {
+        // 式左辺（SQL-54、Issue #1781）は式として決定性を検査する。
+        WherePredicate::Prefix { lhs, .. } if lhs.as_bare_column().is_none() => {
+            check_index_expression_determinism(lhs, site)
+        }
         WherePredicate::Equality { .. }
         | WherePredicate::Prefix { .. }
         | WherePredicate::BoolEquality { .. }
@@ -1076,5 +1080,32 @@ mod tests {
             bind_index_expression(&expr, &bind_schema()),
             Err(SqlSurfaceError::FeatureNotSupported { .. })
         ));
+    }
+}
+
+/// 式左辺の LIKE 述語（SQL-54、Issue #1781）が部分索引述語の決定性検査で
+/// 式として検査されることの単体テスト。
+#[cfg(test)]
+mod like_lhs_expr_tests {
+    use super::*;
+    use crate::sql::udf_call::Expr;
+
+    fn like_with_lhs(lhs: Expr) -> WherePredicate {
+        WherePredicate::Prefix {
+            lhs,
+            pattern: "a%".to_string(),
+            case_insensitive: false,
+        }
+    }
+
+    #[test]
+    fn bare_column_lhs_is_accepted_and_nondeterministic_expr_lhs_is_rejected() {
+        let col = like_with_lhs(Expr::Ident("name".to_string()));
+        assert!(check_index_predicate_determinism(&[col]).is_ok());
+        let nondet = like_with_lhs(Expr::Call {
+            name: "random".to_string(),
+            args: vec![],
+        });
+        assert!(check_index_predicate_determinism(&[nondet]).is_err());
     }
 }

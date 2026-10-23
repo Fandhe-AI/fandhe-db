@@ -1296,7 +1296,7 @@ fn where_predicate_for(
                 raw.to_string()
             };
             return Ok(WherePredicate::Prefix {
-                column: column.to_string(),
+                lhs: Expr::Ident(column.to_string()),
                 pattern,
                 // NoSQL の `filter` に `ilike` は無い（SQL-54、Issue #1778 の決定）。
                 case_insensitive: false,
@@ -2242,7 +2242,7 @@ mod tests {
         assert_eq!(
             bound,
             vec![WherePredicate::Prefix {
-                column: "path".to_string(),
+                lhs: Expr::Ident("path".to_string()),
                 pattern: r"a\%b\_c\\d%".to_string(),
                 case_insensitive: false,
             }]
@@ -2496,7 +2496,7 @@ mod tests {
                     value: "ja".to_string(),
                 },
                 WherePredicate::Prefix {
-                    column: "path".to_string(),
+                    lhs: Expr::Ident("path".to_string()),
                     pattern: "src/%".to_string(),
                     case_insensitive: false,
                 },
@@ -2643,7 +2643,7 @@ mod tests {
         assert_eq!(
             map(r#"[{"column":"lang","op":"like","value":"%a_"}]"#).expect("like"),
             vec![WherePredicate::Prefix {
-                column: col("lang"),
+                lhs: Expr::Ident(col("lang")),
                 pattern: col("%a_"),
                 case_insensitive: false,
             }]

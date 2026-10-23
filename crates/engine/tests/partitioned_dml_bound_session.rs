@@ -102,7 +102,7 @@ fn three_rows() -> Vec<(u64, i64, &'static str)> {
 /// 全行に一致する述語（SQL 側は `WHERE u LIKE '%'`）。
 fn all_rows() -> Vec<WherePredicate> {
     vec![WherePredicate::Prefix {
-        column: "u".to_string(),
+        lhs: engine::sql::udf_call::Expr::Ident("u".to_string()),
         pattern: "%".to_string(),
         case_insensitive: false,
     }]

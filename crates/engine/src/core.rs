@@ -1429,21 +1429,23 @@ fn reject_unsupported_predicate_dml_conjunction(
         match predicate {
             WherePredicate::Equality { .. }
             | WherePredicate::BoolEquality { .. }
-            | WherePredicate::Prefix { .. }
             | WherePredicate::Between { .. }
             | WherePredicate::IsNull { .. }
             | WherePredicate::Compare { .. }
             | WherePredicate::InList { .. } => {}
+            // SQL-54（Issue #1781）: 左辺が裸の列の LIKE／ILIKE だけを許可する（式左辺は拒否）。
+            WherePredicate::Prefix { lhs, .. } if lhs.as_bare_column().is_some() => {}
             // `Not` は内側が許可葉のいずれかである場合に限り通す（再帰しない）。
             WherePredicate::Not(inner) => match inner.as_ref() {
                 WherePredicate::Equality { .. }
                 | WherePredicate::BoolEquality { .. }
-                | WherePredicate::Prefix { .. }
                 | WherePredicate::Between { .. }
                 | WherePredicate::IsNull { .. }
                 | WherePredicate::Compare { .. }
                 | WherePredicate::InList { .. } => {}
-                WherePredicate::PredicateCall { .. }
+                WherePredicate::Prefix { lhs, .. } if lhs.as_bare_column().is_some() => {}
+                WherePredicate::Prefix { .. }
+                | WherePredicate::PredicateCall { .. }
                 | WherePredicate::Expression(_)
                 | WherePredicate::BoolColumn { .. }
                 | WherePredicate::Not(_)
@@ -1474,7 +1476,8 @@ fn reject_unsupported_predicate_dml_conjunction(
                     reject_unsupported_predicate_dml_conjunction(branch, depth.saturating_add(1))?;
                 }
             }
-            WherePredicate::PredicateCall { .. }
+            WherePredicate::Prefix { .. }
+            | WherePredicate::PredicateCall { .. }
             | WherePredicate::BoolColumn { .. }
             | WherePredicate::InSubquery { .. }
             | WherePredicate::Exists { .. }
@@ -16312,7 +16315,7 @@ mod tests {
                 value: true,
             },
             WherePredicate::Prefix {
-                column: "path".to_string(),
+                lhs: crate::sql::udf_call::Expr::Ident("path".to_string()),
                 pattern: "src/%".to_string(),
                 case_insensitive: false,
             },
@@ -16407,5 +16410,35 @@ mod tests {
                 .wire_code(),
             "42601"
         );
+    }
+}
+
+/// NoSQL update/delete フィルタのゲートが式左辺の LIKE を拒否することの単体テスト
+/// （SQL-54、Issue #1781）。
+#[cfg(test)]
+mod like_lhs_expr_gate_tests {
+    use super::*;
+    use crate::sql::allowlist::WherePredicate;
+    use crate::sql::udf_call::Expr;
+
+    fn like(lhs: Expr) -> WherePredicate {
+        WherePredicate::Prefix {
+            lhs,
+            pattern: "a%".to_string(),
+            case_insensitive: false,
+        }
+    }
+
+    #[test]
+    fn expression_lhs_is_rejected_and_bare_column_is_accepted() {
+        let expr = Expr::Call {
+            name: "lower".to_string(),
+            args: vec![Expr::Ident("path".to_string())],
+        };
+        let col = Expr::Ident("path".to_string());
+        assert!(reject_unsupported_predicate_dml_conjunction(&[like(col)], 0).is_ok());
+        assert!(reject_unsupported_predicate_dml_conjunction(&[like(expr.clone())], 0).is_err());
+        let negated = WherePredicate::Not(Box::new(like(expr)));
+        assert!(reject_unsupported_predicate_dml_conjunction(&[negated], 0).is_err());
     }
 }

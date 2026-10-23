@@ -1950,10 +1950,20 @@ fn declarative_leaf_to_filter(
             ))
         }
         WherePredicate::Prefix {
-            column,
+            lhs,
             pattern,
             case_insensitive,
         } => {
+            // SQL-54（Issue #1781）: 宣言的フィルタ（`MetadataFilter`。スカラー索引の候補抽出
+            // `scalar_plan`／`scalar_index::candidates_for` の入力）へ落とせるのは左辺が裸の列の
+            // ときだけ。式左辺は索引候補抽出の対象外で、評価は式経路の責務のため、ここでは
+            // 決して `MetadataFilter` へ変換せず fail-closed で拒否する（構文層は現状、式左辺を
+            // 生成しない。式左辺の受理・評価は後続 Issue の責務）。
+            let Some(column) = lhs.as_bare_column() else {
+                return Err(SqlSurfaceError::unsupported(
+                    "LIKE with a non-column left operand is not supported",
+                ));
+            };
             // SQL-24／TASK-208、Issue #914: `WherePredicate::Prefix`
             // （名前は互換性のため据え置き）は LIKE の生パターン全般を
             // 保持する。意味論・振り分け（Equals／StartsWith／Like）は
@@ -1965,9 +1975,9 @@ fn declarative_leaf_to_filter(
             // SQL-54（Issue #1778）: `ILIKE` は `ilike` で束縛する（ASCII 畳み込み・
             // ICU 照合の拒否は束縛段の責務）。
             let filter = if *case_insensitive {
-                DeclarativeFilter::ilike(column.clone(), pattern.clone())
+                DeclarativeFilter::ilike(column, pattern.clone())
             } else {
-                DeclarativeFilter::like(column.clone(), pattern.clone())
+                DeclarativeFilter::like(column, pattern.clone())
             };
             Ok((filter, false))
         }
@@ -8553,7 +8563,6 @@ pub(crate) fn collect_where_predicate_idents(
     for pred in predicates {
         match pred {
             WherePredicate::Equality { column, .. }
-            | WherePredicate::Prefix { column, .. }
             | WherePredicate::BoolEquality { column, .. }
             | WherePredicate::Compare { column, .. }
             // SQL-24（TASK-208 ポインタ）。
@@ -8565,6 +8574,13 @@ pub(crate) fn collect_where_predicate_idents(
             WherePredicate::BoolColumn { column } => {
                 out.insert(column.clone());
             }
+            // SQL-54（Issue #1781）: 左辺が裸の列なら列名、式なら式中の識別子を集める。
+            WherePredicate::Prefix { lhs, .. } => match lhs.as_bare_column() {
+                Some(column) => {
+                    out.insert(column.to_string());
+                }
+                None => collect_expr_idents(lhs, out),
+            },
             WherePredicate::PredicateCall { .. } => {}
             // Issue #927・SQL-29 (a)・TASK-213: `IN (SELECT ...)` の対象列
             // `column` は外側スコープの通常の列参照であり、`Equality` 等と

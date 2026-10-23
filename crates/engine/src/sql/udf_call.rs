@@ -463,6 +463,16 @@ impl BoundExpr {
 }
 
 impl Expr {
+    /// 裸の列参照（`Expr::Ident`）のときだけ列名を返す。LIKE／ILIKE 述語の左辺
+    /// （`WherePredicate::Prefix.lhs`、SQL-54・Issue #1781）が「従来経路（宣言的フィルタ・
+    /// スカラー索引・content_hash）に乗る裸の列か、式左辺か」を判定する唯一の入口。
+    pub fn as_bare_column(&self) -> Option<&str> {
+        match self {
+            Expr::Ident(name) => Some(name.as_str()),
+            _ => None,
+        }
+    }
+
     /// 配列コンストラクタ・添字の子式を出現順に返す（それ以外の variant は `None`）。
     /// 子を再帰で辿るだけの網羅 match（ビューの参照列収集・名前収集・CHECK 描画等）が
     /// 同じ分解を共有するための補助（TABLE-35。Issue #1602）。
@@ -10827,5 +10837,26 @@ mod tests {
         assert_eq!(NotCollatable.consume().expect("none"), C::DEFAULT);
         assert_eq!(Implicit(C::JaIcu).consume().expect("ja"), C::JaIcu);
         assert_eq!(Explicit(C::UndIcu).consume().expect("und"), C::UndIcu);
+    }
+}
+
+/// `Expr::as_bare_column` の単体テスト（SQL-54、Issue #1781。LIKE 述語の左辺が
+/// 裸の列か式かの判定）。
+#[cfg(test)]
+mod as_bare_column_tests {
+    use super::*;
+
+    #[test]
+    fn only_bare_identifier_is_a_column() {
+        assert_eq!(
+            Expr::Ident("name".to_string()).as_bare_column(),
+            Some("name")
+        );
+        let call = Expr::Call {
+            name: "lower".to_string(),
+            args: vec![Expr::Ident("name".to_string())],
+        };
+        assert_eq!(call.as_bare_column(), None);
+        assert_eq!(Expr::String("a".to_string()).as_bare_column(), None);
     }
 }

@@ -709,6 +709,13 @@ fn check_predicate_columns_within(
 ) -> Result<(), SqlSurfaceError> {
     match pred {
         WherePredicate::Expression(expr) => expr_columns_within(columns, expr),
+        // SQL-54（Issue #1781）: 式左辺の LIKE は式中の列参照を検査する（非公開列の漏えい防止）。
+        WherePredicate::Prefix { lhs, .. } if lhs.as_bare_column().is_none() => {
+            expr_columns_within(columns, lhs)
+        }
+        WherePredicate::Not(inner) if matches!(inner.as_ref(), WherePredicate::Prefix { lhs, .. } if lhs.as_bare_column().is_none()) => {
+            check_predicate_columns_within(columns, inner)
+        }
         WherePredicate::Or(branches) => {
             for branch in branches {
                 for leaf in branch {
@@ -842,7 +849,8 @@ pub(crate) fn check_window_columns_within_view(
 fn predicate_column(pred: &WherePredicate) -> Option<&str> {
     match pred {
         WherePredicate::Equality { column, .. } => Some(column),
-        WherePredicate::Prefix { column, .. } => Some(column),
+        // 式左辺は呼び出し元（`check_predicate_columns_within`）が式として個別に検査する。
+        WherePredicate::Prefix { lhs, .. } => lhs.as_bare_column(),
         WherePredicate::BoolEquality { column, .. } => Some(column),
         WherePredicate::BoolColumn { column } => Some(column),
         WherePredicate::Compare { column, .. } => Some(column),

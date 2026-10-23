@@ -2255,10 +2255,18 @@ fn push_dml_where_predicate(
                 .map_err(|_| dml_hash_field_too_large())?;
         }
         WherePredicate::Prefix {
-            column,
+            lhs,
             pattern,
             case_insensitive,
         } => {
+            // 左辺が裸の列のときだけ従来のバイト列で直列化する（SQL-54、Issue #1781）。
+            // 式左辺には新タグを割り当てず fail-closed とする（構文層は式左辺を生成しない。
+            // タグ割り当てと式の直列化は式左辺を受理する後続 Issue の責務）。
+            let Some(column) = lhs.as_bare_column() else {
+                return Err(crate::sql::allowlist::SqlSurfaceError::unsupported(
+                    "LIKE with a non-column left operand is not supported",
+                ));
+            };
             // `ILIKE`（SQL-54、Issue #1778）は `LIKE` と評価結果が異なるため別タグ 16 を
             // 割り当てる（`LIKE` はタグ 2 のまま不変。台帳の再送互換を保ち、同一
             // operation_id での LIKE／ILIKE 取り違えを `22023` で検出する）。
@@ -6013,7 +6021,7 @@ mod tests {
         use crate::sql::udf_call::UdfRegistry;
 
         let prefix = |ci: bool| WherePredicate::Prefix {
-            column: "name".to_string(),
+            lhs: crate::sql::udf_call::Expr::Ident("name".to_string()),
             pattern: "A%".to_string(),
             case_insensitive: ci,
         };
@@ -7578,5 +7586,27 @@ mod tests {
             record_in_txn(&txn, "tenant-a", "t", LedgerWrite::Record(&op), &changed),
             Err(LedgerRecordError::ContentMismatch)
         ));
+    }
+}
+
+/// 式左辺の LIKE 述語（SQL-54、Issue #1781）は新タグを持たず fail-closed で拒否する。
+#[cfg(test)]
+mod like_lhs_expr_tests {
+    use super::*;
+
+    #[test]
+    fn non_column_lhs_is_rejected_for_content_hash() {
+        use crate::sql::allowlist::WherePredicate;
+        use crate::sql::udf_call::{Expr, UdfRegistry};
+
+        let pred = WherePredicate::Prefix {
+            lhs: Expr::Call {
+                name: "lower".to_string(),
+                args: vec![Expr::Ident("name".to_string())],
+            },
+            pattern: "a%".to_string(),
+            case_insensitive: false,
+        };
+        assert!(for_delete_where("t", &[pred], &UdfRegistry::default()).is_err());
     }
 }
