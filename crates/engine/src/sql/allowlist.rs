@@ -3447,9 +3447,8 @@ pub struct GroupByClause {
     /// で単一識別子から複数キーへ一般化。上限は [`MAX_SCALAR_ORDER_KEYS`]）。
     pub(crate) order_by: Vec<AggregateOrderBy>,
     pub(crate) limit: Option<u32>,
-    /// `OFFSET` の生値（Issue #916・SQL-25 (b)・TASK-209）。`limit` が `None` のとき
-    /// `OFFSET` 単独は構文段（[`parse_aggregate_shape`]）で `42601` に落ちるため常に
-    /// `0`。範囲検証は `sql::parser::bind_group_by_clause` が束縛時に行う。
+    /// `OFFSET` の生値（Issue #916・SQL-25 (b)・TASK-209）。`LIMIT` 省略・`LIMIT ALL` でも
+    /// `OFFSET` 単独を受理する（Issue #1796。`SELECT DISTINCT` 形を含む）。範囲検証は `sql::parser::bind_group_by_clause` が束縛時に行う。
     pub(crate) offset: u32,
 }
 
@@ -13952,6 +13951,10 @@ pub(crate) fn check_buffered_body_shape(
         Statement::Scan(v) if v.limit_implicit => Err(body_form_unsupported()),
         Statement::Scan(v) => check_body_scan(v, lookup, top_policy, out),
         Statement::Aggregate(v) => check_body_aggregate(v, lookup, top_policy, out),
+        // Issue #1796・SQL-34: 非集計 JOIN の `LIMIT` 省略・`LIMIT ALL` も本文では `42601`。
+        Statement::Join(v) if v.aggregate.is_none() && v.limit.is_none() => {
+            Err(body_form_unsupported())
+        }
         Statement::Join(v) => {
             for t in super::join::collect_join_tables(v) {
                 push_relation(out, &t);
@@ -19158,6 +19161,8 @@ fn parse_distinct_shape(tokens: &[Token]) -> Result<ParsedAggregateShape, SqlSur
         Vec::new()
     };
     let limit = p.parse_aggregate_limit()?;
+    // Issue #1796・SQL-34: GROUP BY と同様に `OFFSET` 単独（`LIMIT` 省略・`ALL` 含む）を受理する。
+    let offset = p.parse_optional_offset()?.unwrap_or(0);
     p.expect_end_of_statement()?;
 
     Ok(ParsedAggregateShape {
@@ -19170,9 +19175,7 @@ fn parse_distinct_shape(tokens: &[Token]) -> Result<ParsedAggregateShape, SqlSur
             having_exprs: Vec::new(),
             order_by,
             limit,
-            // `SELECT DISTINCT <column> ...` 構文自体が `OFFSET` を持たない
-            // ため常に `0`。
-            offset: 0,
+            offset,
         }),
     })
 }
@@ -28845,6 +28848,23 @@ mod tests {
     }
 
     #[test]
+    fn accepts_distinct_offset_with_limit_omitted_or_all() {
+        let lookup = catalog_with(&["documents"]);
+        for sql in [
+            "SELECT DISTINCT lang FROM documents OFFSET 2",
+            "SELECT DISTINCT lang FROM documents LIMIT ALL OFFSET 2",
+        ] {
+            let stmt = validate_sql(sql, &lookup).expect(sql);
+            let Statement::Aggregate(agg) = stmt else {
+                panic!("expected aggregate");
+            };
+            let gb = agg.group_by().expect("GROUP BY clause");
+            assert_eq!(gb.limit, None, "{sql}");
+            assert_eq!(gb.offset, 2, "{sql}");
+        }
+    }
+
+    #[test]
     fn rejects_group_key_not_in_select_list_alone() {
         // 集計項目を 1 つも持たない SELECT リスト（`DISTINCT` 相当）は許可しない。
         let lookup = catalog_with(&["documents"]);
@@ -32476,6 +32496,25 @@ mod body_expr_policy_tests {
             }
             ViewBodyKind::Simple(_) => panic!("expected buffered"),
         }
+    }
+
+    #[test]
+    fn non_aggregate_join_body_rejects_omitted_or_all_limit() {
+        // Issue #1796・SQL-34: 非集計 JOIN 本文の `LIMIT` 省略・`ALL` は `42601`、明示は受理。
+        for sql in [
+            "SELECT t.id FROM t JOIN u ON t.k = u.k",
+            "SELECT t.id FROM t JOIN u ON t.k = u.k LIMIT ALL",
+        ] {
+            let err = classify(sql, ViewBodyCheck::Structural)
+                .err()
+                .expect("rejected");
+            assert_eq!(err.wire_code(), "42601", "{sql}");
+        }
+        classify(
+            "SELECT t.id FROM t JOIN u ON t.k = u.k LIMIT 5",
+            ViewBodyCheck::Structural,
+        )
+        .expect("explicit LIMIT is accepted");
     }
 
     #[test]
