@@ -71,6 +71,7 @@ fn follows_operand(prev: Option<&Token>) -> bool {
         prev,
         Some(
             Token::Ident(_)
+                | Token::QualifiedIdent { .. }
                 | Token::Number(_)
                 | Token::Param(_)
                 | Token::StringLiteral(_)
@@ -349,6 +350,22 @@ mod tests {
         same(
             "SELECT id FROM t FETCH NEXT ROWS ONLY",
             "SELECT id FROM t LIMIT 1",
+        );
+    }
+
+    #[test]
+    fn qualified_identifier_is_operand_end() {
+        same(
+            "SELECT id FROM docs ORDER BY docs.n FETCH FIRST 2 ROWS ONLY",
+            "SELECT id FROM docs ORDER BY docs.n LIMIT 2",
+        );
+        same(
+            "SELECT id FROM public.docs FETCH FIRST 2 ROWS ONLY",
+            "SELECT id FROM public.docs LIMIT 2",
+        );
+        same(
+            "SELECT id FROM docs ORDER BY docs.n OFFSET 1 ROW FETCH FIRST 2 ROWS ONLY",
+            "SELECT id FROM docs ORDER BY docs.n LIMIT 2 OFFSET 1",
         );
     }
 
