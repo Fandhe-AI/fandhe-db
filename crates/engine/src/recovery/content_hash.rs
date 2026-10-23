@@ -2259,13 +2259,19 @@ fn push_dml_where_predicate(
             pattern,
             case_insensitive,
         } => {
-            // 左辺が裸の列のときだけ従来のバイト列で直列化する（SQL-54、Issue #1781）。
-            // 式左辺には新タグを割り当てず fail-closed とする（構文層は式左辺を生成しない。
-            // タグ割り当てと式の直列化は式左辺を受理する後続 Issue の責務）。
+            // 左辺が裸の列のときだけ従来のバイト列（タグ 2／16。変更禁止）で直列化する
+            // （SQL-54、Issue #1781）。式左辺（Issue #1782）は新タグ 17 で
+            // 「case_insensitive 1 バイト・左辺式・パターン（長さ前置）」の順に直列化し、
+            // 列左辺と式左辺・LIKE と ILIKE・左辺式の違い・パターンの違いを別ハッシュにする
+            // （同一 operation_id での取り違えを `22023` で検出する。RECOVER-10）。
             let Some(column) = lhs.as_bare_column() else {
-                return Err(crate::sql::allowlist::SqlSurfaceError::unsupported(
-                    "LIKE with a non-column left operand is not supported",
-                ));
+                b.push_u8(17);
+                b.push_u8(u8::from(*case_insensitive));
+                push_dml_expr(b, lhs, None)?;
+                b.push_bytes(pattern.as_bytes())
+                    .map_err(|_| dml_hash_field_too_large())?;
+                collect_referenced_udfs(lhs, udf_registry, referenced)?;
+                return Ok(());
             };
             // `ILIKE`（SQL-54、Issue #1778）は `LIKE` と評価結果が異なるため別タグ 16 を
             // 割り当てる（`LIKE` はタグ 2 のまま不変。台帳の再送互換を保ち、同一
@@ -7589,24 +7595,37 @@ mod tests {
     }
 }
 
-/// 式左辺の LIKE 述語（SQL-54、Issue #1781）は新タグを持たず fail-closed で拒否する。
+/// 式左辺の LIKE 述語（SQL-54、Issue #1782）は述語タグ 17 で直列化し、
+/// 列左辺・LIKE／ILIKE・左辺式・パターンの違いを別ハッシュにする。
 #[cfg(test)]
 mod like_lhs_expr_tests {
     use super::*;
+    use crate::sql::allowlist::WherePredicate;
+    use crate::sql::udf_call::{Expr, UdfRegistry};
+
+    fn lower_of(col: &str) -> Expr {
+        Expr::Call {
+            name: "lower".to_string(),
+            args: vec![Expr::Ident(col.to_string())],
+        }
+    }
+
+    fn hash(lhs: Expr, pattern: &str, ci: bool) -> ContentHash {
+        let pred = WherePredicate::Prefix {
+            lhs,
+            pattern: pattern.to_string(),
+            case_insensitive: ci,
+        };
+        for_delete_where("t", &[pred], &UdfRegistry::default()).expect("hash")
+    }
 
     #[test]
-    fn non_column_lhs_is_rejected_for_content_hash() {
-        use crate::sql::allowlist::WherePredicate;
-        use crate::sql::udf_call::{Expr, UdfRegistry};
-
-        let pred = WherePredicate::Prefix {
-            lhs: Expr::Call {
-                name: "lower".to_string(),
-                args: vec![Expr::Ident("name".to_string())],
-            },
-            pattern: "a%".to_string(),
-            case_insensitive: false,
-        };
-        assert!(for_delete_where("t", &[pred], &UdfRegistry::default()).is_err());
+    fn expr_lhs_hashes_are_distinct_per_component() {
+        let base = hash(lower_of("name"), "a%", false);
+        assert_eq!(base, hash(lower_of("name"), "a%", false));
+        assert_ne!(base, hash(Expr::Ident("name".to_string()), "a%", false));
+        assert_ne!(base, hash(lower_of("name"), "a%", true));
+        assert_ne!(base, hash(lower_of("other"), "a%", false));
+        assert_ne!(base, hash(lower_of("name"), "b%", false));
     }
 }

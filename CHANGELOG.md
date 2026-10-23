@@ -49,6 +49,9 @@
 - `sql::allowlist::SqlSurfaceError`（Issue #1792・SQL-56 (2)）: variant `OrderByPositionNotInSelectList { position: i64 }`
   （`42P10`。`ORDER BY` の序数が出力列の範囲外）を追加した。列挙型を網羅的に `match` する外部コードは
   コンパイルできなくなる。移行: 腕を追加する（`wire_code()`／`classify()` 経由で扱うコードは変更不要）。
+- `sql::udf_call::BoundExpr`（Issue #1782・SQL-54）: variant `Like { lhs, pattern, negated }` を追加した
+  （式左辺の `LIKE`／`ILIKE`。網羅 `match` するコードは腕を足す）。あわせて構文層が式左辺の
+  `WherePredicate::Prefix` を生成するようになった（`lower(name) LIKE 'a%'` が受理される。左辺が文字列型でなければ `42883`）。
 - `sql::allowlist::WherePredicate::Prefix`（Issue #1781・SQL-54）: フィールド `column: String` を `lhs: Expr`
   （左辺の式ノード）へ置き換えた。構文層が生成する左辺は引き続き裸の列だけで、挙動は変わらない。
   構築側は `lhs: Expr::Ident(col)`、分解側は `Expr::as_bare_column()` か `..` を使う。

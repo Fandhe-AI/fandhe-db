@@ -585,6 +585,7 @@ fn try_fold_scalar(expr: &BoundExpr) -> Option<FoldedConst> {
         | BoundExpr::JsonPredicate { .. }
         | BoundExpr::JsonModify { .. }
         | BoundExpr::IsDistinctFrom { .. }
+        | BoundExpr::Like { .. }
         | BoundExpr::NullIf { .. } => None,
     }
 }
@@ -724,7 +725,9 @@ fn compile_node(
         | BoundExpr::JsonModify { .. }
         // `IS [NOT] DISTINCT FROM`（SQL-54。Issue #1783）は NULL 判定を先に行う専用評価の
         // ため、段コンパイルせず木評価（`udf_call::eval_with_scalars`）へ委ねる。
-        | BoundExpr::IsDistinctFrom { .. } => {
+        | BoundExpr::IsDistinctFrom { .. }
+        // 式左辺の `LIKE`（SQL-54。Issue #1782）も同様に木評価へ委ねる。
+        | BoundExpr::Like { .. } => {
             steps.push(ExprStep::JsonSubtree(Box::new(expr.clone())));
             *current_depth += 1;
             *max_stack = (*max_stack).max(*current_depth);

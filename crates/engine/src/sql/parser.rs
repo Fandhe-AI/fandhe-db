@@ -1957,8 +1957,9 @@ fn declarative_leaf_to_filter(
             // SQL-54（Issue #1781）: 宣言的フィルタ（`MetadataFilter`。スカラー索引の候補抽出
             // `scalar_plan`／`scalar_index::candidates_for` の入力）へ落とせるのは左辺が裸の列の
             // ときだけ。式左辺は索引候補抽出の対象外で、評価は式経路の責務のため、ここでは
-            // 決して `MetadataFilter` へ変換せず fail-closed で拒否する（構文層は現状、式左辺を
-            // 生成しない。式左辺の受理・評価は後続 Issue の責務）。
+            // 決して `MetadataFilter` へ変換せず fail-closed で拒否する。式左辺（Issue #1782 で構文層が
+            // 生成するようになった）は呼び出し元の `bind_where_predicates_recursive` が先行する腕で
+            // `BoundExpr::Like` へ束縛するため、ここへ来たら不変条件違反（多層防御として拒否を残す）。
             let Some(column) = lhs.as_bare_column() else {
                 return Err(SqlSurfaceError::unsupported(
                     "LIKE with a non-column left operand is not supported",
@@ -2646,6 +2647,42 @@ fn bind_where_predicates_recursive(
                 // （`is_allowed_where_predicate_name`）。名前の再検証はしない
                 // （許可リスト層の責務。ここでは可観測性のためのフラグのみ立てる）。
                 rls_predicate_present = true;
+            }
+            // SQL-54（Issue #1782）: 左辺が式の LIKE／ILIKE（および後置 `NOT`）は宣言的フィルタへ
+            // 落とさず式レーンの残余述語（`BoundExpr::Like`）にする。索引候補にならないため全行評価
+            // （SQL-54 (5)）。`Prefix` は `dummy_equality_flags` の序数を持たないので序数は進めない。
+            WherePredicate::Prefix {
+                lhs,
+                pattern,
+                case_insensitive,
+            } if lhs.as_bare_column().is_none() => {
+                expr_filters.push(crate::sql::udf_call::bind_like_predicate(
+                    lhs,
+                    pattern,
+                    *case_insensitive,
+                    false,
+                    schema,
+                    udfs,
+                    node_budget,
+                )?);
+            }
+            WherePredicate::Not(inner) if matches!(inner.as_ref(), WherePredicate::Prefix { lhs, .. } if lhs.as_bare_column().is_none()) => {
+                if let WherePredicate::Prefix {
+                    lhs,
+                    pattern,
+                    case_insensitive,
+                } = inner.as_ref()
+                {
+                    expr_filters.push(crate::sql::udf_call::bind_like_predicate(
+                        lhs,
+                        pattern,
+                        *case_insensitive,
+                        true,
+                        schema,
+                        udfs,
+                        node_budget,
+                    )?);
+                }
             }
             WherePredicate::Expression(expr) => {
                 // Issue #1430・SQL-24: NUMERIC 列 × 裸の数値リテラルの単純比較は宣言的
