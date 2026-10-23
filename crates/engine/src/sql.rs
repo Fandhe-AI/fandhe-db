@@ -200,6 +200,7 @@ mod write_time_ledger_tests;
 // 正準キー化・予算管理。`allowlist`（構文の脱糖先）と `aggregate`／`group_by`
 // （`Accumulator::CountDistinct` の予算管理）の双方から参照される。
 pub(crate) mod distinct;
+pub(crate) mod dml_from_returning;
 pub mod exec;
 pub mod explain;
 pub(crate) mod expr_program;

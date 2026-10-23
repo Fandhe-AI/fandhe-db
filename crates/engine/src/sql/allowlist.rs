@@ -10489,6 +10489,56 @@ impl<'a> Parser<'a> {
         Ok(Some(projection))
     }
 
+    /// FROM／USING つき UPDATE／DELETE 専用の `RETURNING` 句（Issue #1756・SQL-53 のポインタ）。
+    /// `*`・`<公開名>.*`・列参照（修飾あり・なし）の並びだけを受理し、式・関数呼び出し・
+    /// `AS` 別名は従来の `RETURNING` と同じく `42601`（受理範囲を従来より広げない）。
+    /// FROM／USING の構文本体（#1754）が結線されるまで呼び出し元は無い
+    /// （`sql::dml_from_returning` が束縛する）。
+    #[allow(dead_code)]
+    pub(crate) fn parse_dml_from_returning_clause(
+        &mut self,
+    ) -> Result<Option<crate::sql::dml_from_returning::DmlFromReturning>, SqlSurfaceError> {
+        use crate::sql::dml_from_returning::{
+            DmlFromReturning, DmlFromReturningItem, MAX_DML_FROM_RETURNING_ITEMS,
+        };
+        if !self.peek_contextual_keyword("RETURNING") {
+            return Ok(None);
+        }
+        self.advance();
+        let mut items: Vec<DmlFromReturningItem> = Vec::new();
+        loop {
+            if items.len() >= MAX_DML_FROM_RETURNING_ITEMS {
+                return Err(SqlSurfaceError::payload_too_large(
+                    "too many RETURNING items",
+                ));
+            }
+            let item = match self.peek() {
+                Some(Token::Punct('*')) => {
+                    self.advance();
+                    DmlFromReturningItem::All
+                }
+                Some(Token::QualifiedStar { qualifier }) => {
+                    let qualifier = qualifier.clone();
+                    self.advance();
+                    DmlFromReturningItem::QualifiedAll(qualifier)
+                }
+                _ => DmlFromReturningItem::Column(self.parse_join_colref()?),
+            };
+            if self.peek_ident_matches("AS") || matches!(self.peek(), Some(Token::Punct('('))) {
+                return Err(SqlSurfaceError::unsupported(
+                    "RETURNING does not support aliases or function-call items",
+                ));
+            }
+            items.push(item);
+            if matches!(self.peek(), Some(Token::Punct(','))) {
+                self.advance();
+                continue;
+            }
+            break;
+        }
+        Ok(Some(DmlFromReturning { items }))
+    }
+
     /// 文末専用句 `PARTITIONED [CHUNK <n>]`（Issue #1129・SQL-19）の構造パース。
     /// [`Self::parse_operation_id_clause`] の**直後**にだけ置ける（`parse_delete`／
     /// `parse_update` が呼ぶ。`INSERT`（UPSERT を含む）・`TRUNCATE` のパーサーは呼ばない
@@ -20950,6 +21000,40 @@ pub(crate) fn parse_update_form_shape_tokens_with_limits(
 
 #[cfg(test)]
 mod tests {
+    /// SQL-53・Issue #1756: FROM／USING つき DML の RETURNING は `*`・`t.*`・列参照だけを受理する。
+    #[test]
+    fn dml_from_returning_clause_accepts_star_and_column_refs_only() {
+        use super::*;
+        use crate::sql::dml_from_returning::DmlFromReturningItem;
+        let parse = |sql: &str| {
+            let toks = crate::sql::lexer::tokenize(sql).expect("lex");
+            Parser::new(&toks).parse_dml_from_returning_clause()
+        };
+        let ok = parse("RETURNING *, t.*, a, s.b")
+            .expect("accepted")
+            .expect("present");
+        assert_eq!(ok.items.len(), 4);
+        assert_eq!(ok.items[0], DmlFromReturningItem::All);
+        assert_eq!(
+            ok.items[1],
+            DmlFromReturningItem::QualifiedAll("t".to_string())
+        );
+        assert!(parse("").expect("empty").is_none());
+        for bad in [
+            "RETURNING a AS x",
+            "RETURNING lower(a)",
+            "RETURNING a + 1",
+            "RETURNING",
+        ] {
+            let tokens = crate::sql::lexer::tokenize(bad).expect("lex");
+            let mut p = Parser::new(&tokens);
+            let res = p
+                .parse_dml_from_returning_clause()
+                .and_then(|r| p.expect_end_of_statement().map(|_| r));
+            assert!(res.is_err(), "must reject: {bad}");
+        }
+    }
+
     /// SQL-36・Issue #2210: 空の述語列は有効時だけ `42601`、明示 `WHERE` の印や通常の述語列は常に通す。
     #[test]
     fn reject_omitted_where_for_dml_only_rejects_empty_when_enabled() {
