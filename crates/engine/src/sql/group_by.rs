@@ -44,8 +44,9 @@ use crate::sql::allowlist::{SqlSurfaceError, MAX_GROUP_BY_COLUMNS};
 use crate::sql::exec::{Cell, ColumnMeta, QueryResult, ResultRow};
 use crate::sql::expr_program::StackValue;
 use crate::sql::order_value::{
-    compare_key_refs, compare_order_key, expr_value_to_order_value, extract_order_value_ref,
-    order_value_to_cell, scalar_key_ref_to_owned, OrderValue, ScalarKeyRef,
+    compare_key_refs, compare_nullable, compare_order_key, expr_value_to_order_value,
+    extract_order_value_ref, order_value_to_cell, scalar_key_ref_to_owned, NullPlacement,
+    OrderValue, ScalarKeyRef,
 };
 use crate::sql::parser::{
     BoundAggregate, BoundGroupBy, BoundOrderTarget, OrderKind, OrderTarget, ProjectionColumn,
@@ -1321,33 +1322,20 @@ fn cmp_cell_values(a: &Cell, b: &Cell) -> std::cmp::Ordering {
 /// グループキー成分の [`compare_order_key`] と同じ規約）。非 `NULL` 同士の大小は
 /// [`cmp_cell_values`]。戻り値は「昇順に安定ソートすると最終的な出力順になる」意味の
 /// `Ordering`（`Less` が先頭）。
-pub(crate) fn cmp_cells_pg_nulls(a: &Cell, b: &Cell, descending: bool) -> std::cmp::Ordering {
-    use std::cmp::Ordering;
-    match (matches!(a, Cell::Null), matches!(b, Cell::Null)) {
-        (true, true) => Ordering::Equal,
-        (true, false) => {
-            if descending {
-                Ordering::Less
-            } else {
-                Ordering::Greater
-            }
-        }
-        (false, true) => {
-            if descending {
-                Ordering::Greater
-            } else {
-                Ordering::Less
-            }
-        }
-        (false, false) => {
-            let base = cmp_cell_values(a, b);
-            if descending {
-                base.reverse()
-            } else {
-                base
-            }
+pub(crate) fn cmp_cells_pg_nulls(
+    a: &Cell,
+    b: &Cell,
+    descending: bool,
+    nulls: NullPlacement,
+) -> std::cmp::Ordering {
+    fn to_opt(c: &Cell) -> Option<&Cell> {
+        if matches!(c, Cell::Null) {
+            None
+        } else {
+            Some(c)
         }
     }
+    compare_nullable(to_opt(a), to_opt(b), descending, nulls, cmp_cell_values)
 }
 
 /// codex-review P1 指摘（PR #603）: `bound.items` に `MIN`/`MAX(<TEXT 列>)`
@@ -2097,11 +2085,13 @@ fn finish_groups(
                         ka.0.get(key_index).and_then(Option::as_ref),
                         kb.0.get(key_index).and_then(Option::as_ref),
                         order_by.descending,
+                        order_by.nulls,
                     ),
                     OrderTarget::Aggregate(idx) => cmp_cells_pg_nulls(
                         ca.get(idx).unwrap_or(&Cell::Null),
                         cb.get(idx).unwrap_or(&Cell::Null),
                         order_by.descending,
+                        order_by.nulls,
                     ),
                     // 式キー（Issue #1188）: 事前評価済みの値を PostgreSQL 既定の NULL 位置
                     // （ASC 末尾・DESC 先頭）で比較する（広域取得の式 `ORDER BY` と同じ比較器）。
@@ -2109,6 +2099,7 @@ fn finish_groups(
                         va.get(idx).and_then(Option::as_ref),
                         vb.get(idx).and_then(Option::as_ref),
                         order_by.descending,
+                        order_by.nulls,
                     ),
                 };
                 if ord != std::cmp::Ordering::Equal {
@@ -2844,6 +2835,7 @@ mod tests {
                     target: BoundOrderTarget::Column(1),
                     kind: OrderKind::Bytes,
                     descending: false,
+                    nulls: NullPlacement::Last,
                     collation: crate::collation::Collation::DEFAULT,
                 }],
                 having: Vec::new(),
@@ -2993,6 +2985,7 @@ mod tests {
                     target: BoundOrderTarget::Column(1),
                     kind: OrderKind::Bytes,
                     descending: false,
+                    nulls: NullPlacement::Last,
                     collation: crate::collation::Collation::DEFAULT,
                 }],
                 having: Vec::new(),
@@ -3463,6 +3456,7 @@ mod tests {
                     target: BoundOrderTarget::Column(1),
                     kind: OrderKind::Bytes,
                     descending: false,
+                    nulls: NullPlacement::Last,
                     collation: crate::collation::Collation::DEFAULT,
                 }],
                 having: Vec::new(),
