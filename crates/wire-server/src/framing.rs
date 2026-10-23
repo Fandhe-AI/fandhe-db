@@ -16,7 +16,7 @@
 
 use std::cell::Cell;
 use std::io::{self, Read};
-use std::time::Instant;
+use std::time::{Duration, Instant};
 
 /// 1 メッセージあたりの長さフィールド（自身の 4 バイトを含む）の上限（WIRE-4）。
 /// これを超える宣言長は `TooLarge` として分類し、length 検証の時点で読み取りを
@@ -166,6 +166,37 @@ impl Drop for FrameDeadlineGuard {
     fn drop(&mut self) {
         FRAME_DEADLINE.with(|d| d.set(self.previous));
     }
+}
+
+thread_local! {
+    /// `post_auth_loop` が保持する接続本来の読み取りタイムアウト（WIRE-5）。
+    /// 外側 `None` は未設定、内側 `None` は接続にタイムアウト無し。
+    static CONNECTION_BASE_TIMEOUT: Cell<Option<Option<Duration>>> = const { Cell::new(None) };
+}
+
+/// 接続本来の読み取りタイムアウトをスレッドローカルへ設定するガード（Issue #1773 レビュー指摘）。
+/// `post_auth_loop` が一時的にソケットの読み取りタイムアウトを短い poll 値へ変える間も、
+/// `copy::run_copy_from` が COPY 受信予算として本来の値を引けるようにする（1 接続 1 スレッド）。
+pub(crate) struct ConnectionBaseTimeoutGuard {
+    previous: Option<Option<Duration>>,
+}
+
+impl ConnectionBaseTimeoutGuard {
+    pub(crate) fn set(base: Option<Duration>) -> Self {
+        let previous = CONNECTION_BASE_TIMEOUT.with(|c| c.replace(Some(base)));
+        Self { previous }
+    }
+}
+
+impl Drop for ConnectionBaseTimeoutGuard {
+    fn drop(&mut self) {
+        CONNECTION_BASE_TIMEOUT.with(|c| c.set(self.previous));
+    }
+}
+
+/// [`ConnectionBaseTimeoutGuard`] が設定中なら接続本来の読み取りタイムアウトを返す。
+pub(crate) fn connection_base_timeout() -> Option<Option<Duration>> {
+    CONNECTION_BASE_TIMEOUT.with(Cell::get)
 }
 
 /// `buf` を満たすまで読む。[`FrameDeadlineGuard`] の期限が無ければ

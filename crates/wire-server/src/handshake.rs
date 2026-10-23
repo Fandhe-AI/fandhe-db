@@ -555,6 +555,8 @@ fn post_auth_loop<'e, S: WireStream>(
     // が受理直後に設定する）。明示トランザクション中に一時的に切り詰めた後は
     // 必ずこの値へ戻す（[`read_next_frame_header`] 参照）。
     let base_timeout = stream.read_timeout()?;
+    // COPY が接続本来のタイムアウトを引けるようにする（poll 値へ変更中でも）。
+    let _base_timeout_guard = framing::ConnectionBaseTimeoutGuard::set(base_timeout);
     let mut applied_timeout = base_timeout;
     loop {
         let type_byte =

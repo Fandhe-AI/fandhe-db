@@ -790,7 +790,10 @@ fn run_copy_from<'e, S: WireStream>(
     finish: Finish,
     role: StatementRole,
 ) -> io::Result<CopyStep> {
-    let base_timeout = stream.read_timeout()?;
+    // 復元用の現在値（post_auth_loop が poll 値へ変更済みの場合がある）と、COPY 受信予算に
+    // 使う接続本来のタイムアウトを分離する。後者は接続ループが設定していなければ現在値。
+    let restore_timeout = stream.read_timeout()?;
+    let base_timeout = framing::connection_base_timeout().unwrap_or(restore_timeout);
     let result = run_copy_from_inner(
         stream,
         engine,
@@ -803,7 +806,7 @@ fn run_copy_from<'e, S: WireStream>(
         base_timeout,
     );
     if result.is_ok() {
-        stream.set_read_timeout(base_timeout)?;
+        stream.set_read_timeout(restore_timeout)?;
     }
     result
 }

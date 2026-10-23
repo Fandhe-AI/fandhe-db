@@ -416,3 +416,30 @@ fn wire20_implicit_copy_slow_body_past_max_duration_releases_writer() {
     assert_closed_without_response(&mut stream);
     assert_writer_released(addr);
 }
+
+/// Issue #1773 レビュー指摘（PR #2649）: 明示トランザクション中の COPY FROM は、`post_auth_loop` が
+/// 読み取りタイムアウトを短い poll 値（約 100ms）へ変更していても、CopyData を 100ms 以上
+/// 送らないだけでは切断されない（受信予算は接続本来のタイムアウト）。
+#[test]
+fn wire20_explicit_txn_copy_idle_beyond_poll_interval_is_not_disconnected() {
+    let (core, _guard) = new_core_with_docs_table();
+    let mut stream = spawn_with_alice(core);
+    send_simple_query(&mut stream, "BEGIN");
+    assert_eq!(read_command_complete(&mut stream), "BEGIN");
+    assert_eq!(read_ready_for_query_status(&mut stream), b'T');
+    send_simple_query(
+        &mut stream,
+        "COPY docs (id, embedding, lang) FROM STDIN USING OPERATION_ID 'w20-poll'",
+    );
+    assert_eq!(read_copy_in_response(&mut stream), 3);
+    std::thread::sleep(std::time::Duration::from_millis(500));
+    send_copy_data(&mut stream, b"1\t[1.0,0.0]\tja\n");
+    std::thread::sleep(std::time::Duration::from_millis(500));
+    send_copy_done(&mut stream);
+    assert_eq!(read_command_complete(&mut stream), "COPY 1");
+    assert_eq!(read_ready_for_query_status(&mut stream), b'T');
+    send_simple_query(&mut stream, "COMMIT");
+    assert_eq!(read_command_complete(&mut stream), "COMMIT");
+    assert_eq!(read_ready_for_query_status(&mut stream), b'I');
+    assert_eq!(count_docs(&mut stream), 1);
+}
