@@ -7840,12 +7840,20 @@ enum ResolvedScanOrderKey<'a> {
         expr: crate::sql::udf_call::BoundExpr,
         ty: crate::sql::udf_call::ExprType,
         descending: bool,
+        nulls: Option<NullPlacement>,
     },
     /// 序数が出力列の実列（`ProjectedColumn::Column`）を指す（SQL-56 (2)・Issue #1792）。
     /// 名前で引き直すと別名・疑似列 `id` との衝突で別の列を指しうるため、添字で束縛する。
-    ColumnIndex { index: usize, descending: bool },
+    ColumnIndex {
+        index: usize,
+        descending: bool,
+        nulls: Option<NullPlacement>,
+    },
     /// 序数が疑似列 `id`（別名付きを含む）の出力列を指す。
-    Id { descending: bool },
+    Id {
+        descending: bool,
+        nulls: Option<NullPlacement>,
+    },
 }
 
 /// 式キーを含む広域取得 `ORDER BY`（[`crate::sql::allowlist::ScanOrderKey`]）を束縛する
@@ -7865,152 +7873,182 @@ fn bind_scan_order_keys(
     let mut bound = Vec::with_capacity(keys.len());
     let mut exprs = Vec::new();
     for key in keys {
-        match key {
+        // `NULLS FIRST|LAST` の明示指定（SQL-56・Issue #1791）。各分岐は `pg_default` で
+        // 1 キーを積むため、積んだ直後に明示値で上書きする（未指定は既定のまま）。
+        let explicit_nulls = match key {
             ResolvedScanOrderKey::Plain(k) => match k.as_ref() {
-                ScanOrderKey::Column(k) => {
-                    // Issue #1597: jsonb 列の裸のキーは列比較器（`resolve_order_kind` は
-                    // GROUP BY・DISTINCT と共有で jsonb を返さない）ではなく、列参照の式キー
-                    // として登録し、行ごとにソートキーを作って並べ替える。
-                    if let Some(index) = schema
-                        .columns
-                        .iter()
-                        .position(|c| c.name == k.column && matches!(c.ty, ColumnType::Jsonb))
-                    {
-                        let be = crate::sql::udf_call::BoundExpr::JsonbColumnRef { index };
+                ScanOrderKey::Column { nulls, .. }
+                | ScanOrderKey::Expr { nulls, .. }
+                | ScanOrderKey::Ordinal { nulls, .. } => *nulls,
+            },
+            ResolvedScanOrderKey::ProjectedExpr { nulls, .. }
+            | ResolvedScanOrderKey::ColumnIndex { nulls, .. }
+            | ResolvedScanOrderKey::Id { nulls, .. } => *nulls,
+        };
+        let bound_before = bound.len();
+        'bind: {
+            match key {
+                ResolvedScanOrderKey::Plain(k) => match k.as_ref() {
+                    ScanOrderKey::Column { key: k, .. } => {
+                        // Issue #1597: jsonb 列の裸のキーは列比較器（`resolve_order_kind` は
+                        // GROUP BY・DISTINCT と共有で jsonb を返さない）ではなく、列参照の式キー
+                        // として登録し、行ごとにソートキーを作って並べ替える。
+                        if let Some(index) = schema
+                            .columns
+                            .iter()
+                            .position(|c| c.name == k.column && matches!(c.ty, ColumnType::Jsonb))
+                        {
+                            let be = crate::sql::udf_call::BoundExpr::JsonbColumnRef { index };
+                            let program = crate::sql::expr_program::ExprProgram::compile(&be);
+                            bound.push(BoundOrderKey {
+                                target: BoundOrderTarget::Expr(exprs.len()),
+                                kind: OrderKind::Jsonb,
+                                descending: k.descending,
+                                nulls: NullPlacement::pg_default(k.descending),
+                                collation: crate::collation::Collation::DEFAULT,
+                            });
+                            exprs.push((be, program));
+                            break 'bind;
+                        }
+                        bound.extend(bind_scalar_order_by(std::slice::from_ref(k), schema)?);
+                    }
+                    ScanOrderKey::Expr {
+                        expr, descending, ..
+                    } => {
+                        // 最上位の `COLLATE "x"` は明示照合としてキーに記録する（TABLE-28・
+                        // Issue #1610）。内側が TEXT 系の列識別子なら列キーに束縛し直し、列の
+                        // 高速経路（抽出の借用比較）を外れないようにする。
+                        let explicit = match expr {
+                            crate::sql::udf_call::Expr::Collate { collation, .. } => {
+                                Some(*collation)
+                            }
+                            _ => None,
+                        };
+                        if let crate::sql::udf_call::Expr::Collate { expr: inner, .. } = expr {
+                            if let crate::sql::udf_call::Expr::Ident(name) = inner.as_ref() {
+                                let is_text_column = schema.columns.iter().any(|c| {
+                                    c.name == *name
+                                        && matches!(
+                                            c.ty,
+                                            ColumnType::Text
+                                                | ColumnType::Varchar(_)
+                                                | ColumnType::Bpchar(_)
+                                        )
+                                });
+                                if is_text_column {
+                                    let mut keys = bind_scalar_order_by(
+                                        &[ScalarOrderKey {
+                                            column: name.clone(),
+                                            descending: *descending,
+                                        }],
+                                        schema,
+                                    )?;
+                                    for key in &mut keys {
+                                        key.collation = crate::collation::Collation::effective(
+                                            explicit,
+                                            Some(key.collation),
+                                        );
+                                        key.collation.ensure_available()?;
+                                    }
+                                    bound.extend(keys);
+                                    break 'bind;
+                                }
+                            }
+                        }
+                        // 最上位の `COLLATE` は明示照合としてキーに運ぶため、内側の式だけを束縛する
+                        // （内側の式に非バイト列順の列が混じれば束縛側の `0A000` が拒否する）。
+                        let bind_target = match expr {
+                            crate::sql::udf_call::Expr::Collate { expr: inner, .. } => {
+                                inner.as_ref()
+                            }
+                            other => other,
+                        };
+                        let (be, ty) = crate::sql::udf_call::bind_order_expr(
+                            bind_target,
+                            schema,
+                            udfs,
+                            node_budget,
+                        )?;
+                        if explicit.is_some() && ty != crate::sql::udf_call::ExprType::Text {
+                            return Err(SqlSurfaceError::datatype_mismatch(
+                                "collations are not supported by this expression type",
+                            ));
+                        }
+                        let key_collation = crate::collation::Collation::effective(explicit, None);
+                        key_collation.ensure_available()?;
+                        let kind = order_kind_for_expr_type(ty)?;
+                        let program = crate::sql::expr_program::ExprProgram::compile(&be);
+                        bound.push(BoundOrderKey {
+                            target: BoundOrderTarget::Expr(exprs.len()),
+                            kind,
+                            descending: *descending,
+                            nulls: NullPlacement::pg_default(*descending),
+                            collation: key_collation,
+                        });
+                        exprs.push((be, program));
+                    }
+                    // 序数は `resolve_scan_order_aliases` が `ColumnIndex`／`Id`／`ProjectedExpr` へ
+                    // 解決済み。ここへ届くのは構築側の不変条件違反（fail-closed）。
+                    ScanOrderKey::Ordinal { .. } => {
+                        return Err(SqlSurfaceError::Internal {
+                            detail: "unresolved ORDER BY position".to_string(),
+                        });
+                    }
+                },
+                ResolvedScanOrderKey::ColumnIndex {
+                    index, descending, ..
+                } => {
+                    // jsonb 列は裸の列キーと同じく式キー（列参照）として登録する（Issue #1597）。
+                    if matches!(
+                        schema.columns.get(*index).map(|c| &c.ty),
+                        Some(ColumnType::Jsonb)
+                    ) {
+                        let be = crate::sql::udf_call::BoundExpr::JsonbColumnRef { index: *index };
                         let program = crate::sql::expr_program::ExprProgram::compile(&be);
                         bound.push(BoundOrderKey {
                             target: BoundOrderTarget::Expr(exprs.len()),
                             kind: OrderKind::Jsonb,
-                            descending: k.descending,
-                            nulls: NullPlacement::pg_default(k.descending),
+                            descending: *descending,
+                            nulls: NullPlacement::pg_default(*descending),
                             collation: crate::collation::Collation::DEFAULT,
                         });
                         exprs.push((be, program));
-                        continue;
+                    } else {
+                        bound.push(bind_order_column_at(schema, *index, *descending)?);
                     }
-                    bound.extend(bind_scalar_order_by(std::slice::from_ref(k), schema)?);
                 }
-                ScanOrderKey::Expr { expr, descending } => {
-                    // 最上位の `COLLATE "x"` は明示照合としてキーに記録する（TABLE-28・
-                    // Issue #1610）。内側が TEXT 系の列識別子なら列キーに束縛し直し、列の
-                    // 高速経路（抽出の借用比較）を外れないようにする。
-                    let explicit = match expr {
-                        crate::sql::udf_call::Expr::Collate { collation, .. } => Some(*collation),
-                        _ => None,
-                    };
-                    if let crate::sql::udf_call::Expr::Collate { expr: inner, .. } = expr {
-                        if let crate::sql::udf_call::Expr::Ident(name) = inner.as_ref() {
-                            let is_text_column = schema.columns.iter().any(|c| {
-                                c.name == *name
-                                    && matches!(
-                                        c.ty,
-                                        ColumnType::Text
-                                            | ColumnType::Varchar(_)
-                                            | ColumnType::Bpchar(_)
-                                    )
-                            });
-                            if is_text_column {
-                                let mut keys = bind_scalar_order_by(
-                                    &[ScalarOrderKey {
-                                        column: name.clone(),
-                                        descending: *descending,
-                                    }],
-                                    schema,
-                                )?;
-                                for key in &mut keys {
-                                    key.collation = crate::collation::Collation::effective(
-                                        explicit,
-                                        Some(key.collation),
-                                    );
-                                    key.collation.ensure_available()?;
-                                }
-                                bound.extend(keys);
-                                continue;
-                            }
-                        }
-                    }
-                    // 最上位の `COLLATE` は明示照合としてキーに運ぶため、内側の式だけを束縛する
-                    // （内側の式に非バイト列順の列が混じれば束縛側の `0A000` が拒否する）。
-                    let bind_target = match expr {
-                        crate::sql::udf_call::Expr::Collate { expr: inner, .. } => inner.as_ref(),
-                        other => other,
-                    };
-                    let (be, ty) = crate::sql::udf_call::bind_order_expr(
-                        bind_target,
-                        schema,
-                        udfs,
-                        node_budget,
-                    )?;
-                    if explicit.is_some() && ty != crate::sql::udf_call::ExprType::Text {
-                        return Err(SqlSurfaceError::datatype_mismatch(
-                            "collations are not supported by this expression type",
-                        ));
-                    }
-                    let key_collation = crate::collation::Collation::effective(explicit, None);
-                    key_collation.ensure_available()?;
-                    let kind = order_kind_for_expr_type(ty)?;
-                    let program = crate::sql::expr_program::ExprProgram::compile(&be);
+                ResolvedScanOrderKey::Id { descending, .. } => {
+                    bound.push(BoundOrderKey {
+                        target: BoundOrderTarget::Id,
+                        kind: OrderKind::Id,
+                        descending: *descending,
+                        nulls: NullPlacement::pg_default(*descending),
+                        collation: crate::collation::Collation::DEFAULT,
+                    });
+                }
+                ResolvedScanOrderKey::ProjectedExpr {
+                    expr,
+                    ty,
+                    descending,
+                    ..
+                } => {
+                    let kind = order_kind_for_expr_type(*ty)?;
+                    let program = crate::sql::expr_program::ExprProgram::compile(expr);
                     bound.push(BoundOrderKey {
                         target: BoundOrderTarget::Expr(exprs.len()),
                         kind,
                         descending: *descending,
                         nulls: NullPlacement::pg_default(*descending),
-                        collation: key_collation,
-                    });
-                    exprs.push((be, program));
-                }
-                // 序数は `resolve_scan_order_aliases` が `ColumnIndex`／`Id`／`ProjectedExpr` へ
-                // 解決済み。ここへ届くのは構築側の不変条件違反（fail-closed）。
-                ScanOrderKey::Ordinal { .. } => {
-                    return Err(SqlSurfaceError::Internal {
-                        detail: "unresolved ORDER BY position".to_string(),
-                    });
-                }
-            },
-            ResolvedScanOrderKey::ColumnIndex { index, descending } => {
-                // jsonb 列は裸の列キーと同じく式キー（列参照）として登録する（Issue #1597）。
-                if matches!(
-                    schema.columns.get(*index).map(|c| &c.ty),
-                    Some(ColumnType::Jsonb)
-                ) {
-                    let be = crate::sql::udf_call::BoundExpr::JsonbColumnRef { index: *index };
-                    let program = crate::sql::expr_program::ExprProgram::compile(&be);
-                    bound.push(BoundOrderKey {
-                        target: BoundOrderTarget::Expr(exprs.len()),
-                        kind: OrderKind::Jsonb,
-                        descending: *descending,
-                        nulls: NullPlacement::pg_default(*descending),
                         collation: crate::collation::Collation::DEFAULT,
                     });
-                    exprs.push((be, program));
-                } else {
-                    bound.push(bind_order_column_at(schema, *index, *descending)?);
+                    exprs.push((expr.clone(), program));
                 }
             }
-            ResolvedScanOrderKey::Id { descending } => {
-                bound.push(BoundOrderKey {
-                    target: BoundOrderTarget::Id,
-                    kind: OrderKind::Id,
-                    descending: *descending,
-                    nulls: NullPlacement::pg_default(*descending),
-                    collation: crate::collation::Collation::DEFAULT,
-                });
-            }
-            ResolvedScanOrderKey::ProjectedExpr {
-                expr,
-                ty,
-                descending,
-            } => {
-                let kind = order_kind_for_expr_type(*ty)?;
-                let program = crate::sql::expr_program::ExprProgram::compile(expr);
-                bound.push(BoundOrderKey {
-                    target: BoundOrderTarget::Expr(exprs.len()),
-                    kind,
-                    descending: *descending,
-                    nulls: NullPlacement::pg_default(*descending),
-                    collation: crate::collation::Collation::DEFAULT,
-                });
-                exprs.push((expr.clone(), program));
+        }
+        if let Some(nulls) = explicit_nulls {
+            // 1 キー入力につき束縛済みキーはちょうど 1 つ積まれる。
+            for bound_key in bound.iter_mut().skip(bound_before) {
+                bound_key.nulls = nulls;
             }
         }
     }
@@ -8089,17 +8127,19 @@ fn resolve_scan_order_aliases<'a>(
         if let ScanOrderKey::Ordinal {
             position,
             descending,
+            nulls,
         } = key.as_ref()
         {
             resolved.push(resolve_order_ordinal(
                 *position,
                 *descending,
+                *nulls,
                 bound_projection,
                 windows,
             )?);
             continue;
         }
-        let ScanOrderKey::Column(k) = key.as_ref() else {
+        let ScanOrderKey::Column { key: k, nulls } = key.as_ref() else {
             resolved.push(ResolvedScanOrderKey::Plain(key));
             continue;
         };
@@ -8128,10 +8168,13 @@ fn resolve_scan_order_aliases<'a>(
         match first {
             Target::Base(base) => {
                 resolved.push(ResolvedScanOrderKey::Plain(std::borrow::Cow::Owned(
-                    ScanOrderKey::Column(ScalarOrderKey {
-                        column: (*base).to_string(),
-                        descending: k.descending,
-                    }),
+                    ScanOrderKey::Column {
+                        key: ScalarOrderKey {
+                            column: (*base).to_string(),
+                            descending: k.descending,
+                        },
+                        nulls: *nulls,
+                    },
                 )));
             }
             Target::Expr(i, _) => {
@@ -8146,6 +8189,7 @@ fn resolve_scan_order_aliases<'a>(
                             expr: expr.clone(),
                             ty: *ty,
                             descending: k.descending,
+                            nulls: *nulls,
                         });
                     }
                     _ => {
@@ -8172,6 +8216,7 @@ fn resolve_scan_order_aliases<'a>(
 fn resolve_order_ordinal<'a>(
     position: i64,
     descending: bool,
+    nulls: Option<NullPlacement>,
     bound_projection: &[ProjectedColumn],
     windows: &[crate::sql::allowlist::WindowSelectItem],
 ) -> Result<ResolvedScanOrderKey<'a>, SqlSurfaceError> {
@@ -8193,9 +8238,10 @@ fn resolve_order_ordinal<'a>(
         Some(ProjectedColumn::Column { index, .. }) => Ok(ResolvedScanOrderKey::ColumnIndex {
             index: *index,
             descending,
+            nulls,
         }),
         Some(ProjectedColumn::Id | ProjectedColumn::AliasedId { .. }) => {
-            Ok(ResolvedScanOrderKey::Id { descending })
+            Ok(ResolvedScanOrderKey::Id { descending, nulls })
         }
         Some(ProjectedColumn::Computed { expr, ty, .. }) => {
             if !windows.is_empty() {
@@ -8207,6 +8253,7 @@ fn resolve_order_ordinal<'a>(
                 expr: expr.clone(),
                 ty: *ty,
                 descending,
+                nulls,
             })
         }
         None => Err(SqlSurfaceError::Internal {
@@ -8519,11 +8566,13 @@ fn bind_window_item(
         partition_by.push(resolve_window_key(name, schema)?);
     }
     let mut order_by = Vec::with_capacity(item.order_by.len());
-    for (name, descending) in &item.order_by {
+    for ob in &item.order_by {
         order_by.push(BoundWindowOrderKey {
-            key: resolve_window_key(name, schema)?,
-            descending: *descending,
-            nulls: NullPlacement::pg_default(*descending),
+            key: resolve_window_key(&ob.column, schema)?,
+            descending: ob.descending,
+            nulls: ob
+                .nulls
+                .unwrap_or_else(|| NullPlacement::pg_default(ob.descending)),
         });
     }
 
@@ -8750,7 +8799,7 @@ pub(crate) fn bind_scan_with_dummy_flags(
         let mut order_key_names: Vec<&str> =
             stmt.order_by().iter().map(|k| k.column.as_str()).collect();
         for key in &stmt.order_keys {
-            if let crate::sql::allowlist::ScanOrderKey::Column(k) = key {
+            if let crate::sql::allowlist::ScanOrderKey::Column { key: k, .. } = key {
                 order_key_names.push(k.column.as_str());
             }
         }
@@ -8801,7 +8850,10 @@ pub(crate) fn bind_scan_with_dummy_flags(
             stmt.order_by()
                 .iter()
                 .map(|k| {
-                    std::borrow::Cow::Owned(crate::sql::allowlist::ScanOrderKey::Column(k.clone()))
+                    std::borrow::Cow::Owned(crate::sql::allowlist::ScanOrderKey::Column {
+                        key: k.clone(),
+                        nulls: None,
+                    })
                 })
                 .collect()
         } else {
@@ -9143,7 +9195,9 @@ fn bind_group_by_clause(
                             order_by.push(BoundOrderBy {
                                 target: OrderTarget::Expr(order_exprs.len() - 1),
                                 descending: ob.descending,
-                                nulls: NullPlacement::pg_default(ob.descending),
+                                nulls: ob
+                                    .nulls
+                                    .unwrap_or_else(|| NullPlacement::pg_default(ob.descending)),
                             });
                             continue;
                         }
@@ -9191,7 +9245,9 @@ fn bind_group_by_clause(
         order_by.push(BoundOrderBy {
             target,
             descending: ob.descending,
-            nulls: NullPlacement::pg_default(ob.descending),
+            nulls: ob
+                .nulls
+                .unwrap_or_else(|| NullPlacement::pg_default(ob.descending)),
         });
     }
 

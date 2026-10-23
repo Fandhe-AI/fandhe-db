@@ -337,6 +337,13 @@ fn scan_referenced_columns(validated: &ValidatedScan) -> HashSet<String> {
     }
     super::parser::collect_where_predicate_idents(&validated.where_predicates, &mut cols);
     cols.extend(validated.order_by.iter().map(|k| k.column.clone()));
+    // `NULLS FIRST|LAST` を明示した列キーは完全形（`order_keys`）に載る（SQL-56・Issue #1791）。
+    // 振り分けで相関参照の検出が変わらないよう、列キーの名前もここで集める。
+    for key in &validated.order_keys {
+        if let super::allowlist::ScanOrderKey::Column { key, .. } = key {
+            cols.insert(key.column.clone());
+        }
+    }
     cols
 }
 

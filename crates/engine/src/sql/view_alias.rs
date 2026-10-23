@@ -196,7 +196,7 @@ pub(crate) fn rewrite_order_keys(
     let mut idents = HashSet::new();
     for key in &keys {
         match key {
-            ScanOrderKey::Column(k) => {
+            ScanOrderKey::Column { key: k, .. } => {
                 idents.insert(k.column.clone());
             }
             ScanOrderKey::Expr { expr, .. } => {
@@ -211,16 +211,21 @@ pub(crate) fn rewrite_order_keys(
     let mut out = Vec::with_capacity(keys.len());
     for (i, key) in keys.into_iter().enumerate() {
         out.push(match key {
-            ScanOrderKey::Column(k) => {
+            ScanOrderKey::Column { key: k, nulls } => {
                 let (k, physical) = rewrite_order_column(map, &aliases, k);
                 if physical {
                     positions.push(i);
                 }
-                ScanOrderKey::Column(k)
+                ScanOrderKey::Column { key: k, nulls }
             }
-            ScanOrderKey::Expr { expr, descending } => ScanOrderKey::Expr {
+            ScanOrderKey::Expr {
+                expr,
+                descending,
+                nulls,
+            } => ScanOrderKey::Expr {
                 expr: map_expr_idents(&expr, &|c| map.physical(c)),
                 descending,
+                nulls,
             },
             // 位置による参照は公開名から物理名への書き換えの影響を受けない（書き換え済みの
             // 投影の出力列順が公開列順のまま）。

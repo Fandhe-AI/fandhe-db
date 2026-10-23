@@ -9,6 +9,9 @@
 
 ### Added
 
+- `ORDER BY <key> [ASC|DESC] NULLS FIRST|LAST` を広域取得・ウィンドウ・`GROUP BY` 集計・`SELECT DISTINCT`・JOIN・
+  ビューの各経路で受理する（Issue #1791・SQL-56）。指定なしは従来どおり（ASC は末尾・DESC は先頭）。
+  不正な指定と kNN 距離順への併用は `42601`。詳細は [order-by-having-expressions.md](docs/design/order-by-having-expressions.md)。
 - `WHERE <col> [NOT] ILIKE '<pattern>'` を受理して評価する（Issue #1778・SQL-54）。ASCII 英字のみを畳み込み、
   非 ASCII はバイト完全一致で比べる。ICU 照合の列は `0A000`。索引は使わない。
   詳細は [like-wildcard-patterns.md](docs/design/like-wildcard-patterns.md)。

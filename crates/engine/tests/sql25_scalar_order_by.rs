@@ -514,7 +514,7 @@ fn using_mode_and_hint_order_are_rejected_after_scalar_order_by() {
     );
 }
 
-/// `NULLS LAST`・位置指定・式は許可リスト外。`LIMIT` を伴わない形も拒否する。
+/// `NULLS` の後ろが FIRST/LAST でない形・定数式は許可リスト外（`NULLS FIRST/LAST` の受理は SQL-56・Issue #1791）。`LIMIT` を伴わない形も拒否する。
 #[test]
 fn unsupported_order_by_forms_are_rejected_with_42601() {
     let path = unique_db_path("order-reject-forms");
@@ -527,7 +527,7 @@ fn unsupported_order_by_forms_are_rejected_with_42601() {
     expect_sqlstate(
         &core,
         &ctx,
-        "SELECT id FROM docs ORDER BY lang NULLS LAST LIMIT 5",
+        "SELECT id FROM docs ORDER BY lang NULLS MIDDLE LIMIT 5",
         "42601",
     );
     expect_sqlstate(
@@ -608,7 +608,7 @@ fn explain_error_codes_match_non_explain() {
             "SELECT id FROM docs ORDER BY score, score, score, score, score, score, score, score, score LIMIT 5",
             "54000",
         ),
-        ("SELECT id FROM docs ORDER BY lang NULLS LAST LIMIT 5", "42601"),
+        ("SELECT id FROM docs ORDER BY lang NULLS MIDDLE LIMIT 5", "42601"),
         ("SELECT id FROM missing ORDER BY lang LIMIT 5", "42P01"),
     ] {
         let plain = core

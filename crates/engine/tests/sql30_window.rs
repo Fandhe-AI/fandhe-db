@@ -1072,11 +1072,11 @@ fn scalar_order_by_with_window_rejects_unsupported_combinations() {
         "SELECT id, ROW_NUMBER() OVER () AS rn FROM docs ORDER BY rn LIMIT 10",
         "42601",
     );
-    // NULLS LAST は未対応。
+    // NULLS の後ろが FIRST/LAST でない形は構文拒否（NULLS FIRST/LAST の受理は sql56_order_by_nulls.rs）。
     expect_rejected(
         &core,
         &ctx,
-        "SELECT id, ROW_NUMBER() OVER () FROM docs ORDER BY score NULLS LAST LIMIT 10",
+        "SELECT id, ROW_NUMBER() OVER () FROM docs ORDER BY score NULLS MIDDLE LIMIT 10",
         "42601",
     );
     // 未知列。

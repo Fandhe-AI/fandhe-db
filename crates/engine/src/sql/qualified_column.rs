@@ -229,6 +229,18 @@ fn is_contextual_syntax_use(tokens: &[Token], i: usize, name: &str) -> bool {
     if name.eq_ignore_ascii_case("partition") {
         return matches!(next, Some(Token::Keyword(Keyword::By)));
     }
+    // `ORDER BY ... NULLS FIRST|LAST`（SQL-56・Issue #1791）。`x.nulls FIRST`／`NULLS x.first` を
+    // 修飾が外れた後に NULL 位置指定と誤読し、列の検証なしで受理されるのを防ぐ。
+    if name.eq_ignore_ascii_case("nulls") {
+        return matches!(
+            next,
+            Some(Token::Ident(w)) if w.eq_ignore_ascii_case("first") || w.eq_ignore_ascii_case("last")
+        );
+    }
+    if name.eq_ignore_ascii_case("first") || name.eq_ignore_ascii_case("last") {
+        let prev = i.checked_sub(1).and_then(|p| tokens.get(p));
+        return matches!(prev, Some(Token::Ident(w)) if w.eq_ignore_ascii_case("nulls"));
+    }
     false
 }
 

@@ -46,7 +46,7 @@ SELECT <投影> FROM <table | view>
   昇順。キー数の上限は `MAX_SCALAR_ORDER_KEYS`（8。NOSQL-15 の同種上限と揃えた
   実装既定値）。超過は `54000`。
 - `LIMIT <n> [OFFSET <m>]` の後は文末のみを許可する（`USING MODE`／
-  `HINT ORDER`／`NULLS FIRST|LAST` はいずれも `42601`）。取得モード・評価順の
+  `HINT ORDER` は `42601`。`NULLS FIRST|LAST` は各キー直後で Issue #1791 により受理）。取得モード・評価順の
   余地を持たないという広域取得本体の契約（TASK-161・SQL-12 との関係）をその
   まま引き継ぐ。`OFFSET` は #916（`docs/design/sql-offset-paging.md`）で
   `LIMIT` に後続する任意句として受理されており、本 `ORDER BY` との組み合わせ

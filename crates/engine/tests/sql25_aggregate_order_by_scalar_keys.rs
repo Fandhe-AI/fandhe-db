@@ -450,7 +450,7 @@ fn aggregate_order_by_rejects_unsupported_forms_and_unknown_names() {
     let _guard = CleanupGuard(path);
     let ctx = ctx_for("tenant-a", true);
     for sql in [
-        "SELECT n, COUNT(*) AS c FROM t GROUP BY n ORDER BY n NULLS LAST",
+        "SELECT n, COUNT(*) AS c FROM t GROUP BY n ORDER BY n NULLS MIDDLE",
         "SELECT n, COUNT(*) AS c FROM t GROUP BY n ORDER BY 1 + 0",
         "SELECT n, COUNT(*) AS c FROM t GROUP BY n ORDER BY n, ",
     ] {

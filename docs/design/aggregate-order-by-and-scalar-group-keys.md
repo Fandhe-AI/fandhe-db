@@ -34,8 +34,8 @@
 
 `ORDER BY <識別子> [ASC|DESC] (, ...)*`。キー数の上限は `MAX_SCALAR_ORDER_KEYS`（8）で、
 超過は `54000`。各識別子は既存の解決規則（`GROUP BY` 列名・そのエイリアス・集計項目の
-実効名のうち一意に一致するもの。曖昧は `42702`、未知は `22000`。Issue #1270）を使う。式・位置番号・
-`NULLS FIRST/LAST` は `42601` のまま。
+実効名のうち一意に一致するもの。曖昧は `42702`、未知は `22000`。Issue #1270）を使う。`NULLS FIRST/LAST` は
+Issue #1791 で受理する（[order-by-having-expressions.md](order-by-having-expressions.md) 参照）。
 
 ### D3: NULL 位置（挙動変更）
 

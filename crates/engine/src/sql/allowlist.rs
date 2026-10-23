@@ -17,6 +17,7 @@ use crate::recovery::required_op_id::LedgerMode;
 use crate::sql::copy_options;
 use crate::sql::ddl_column_type::StaticColumnType;
 use crate::sql::lexer::{self, Keyword, LexError, Token};
+use crate::sql::order_value::NullPlacement;
 use crate::sql::plan::{self, EvaluationOrder, Stage};
 use crate::sql::relation::{ColumnRef, TableRef};
 use crate::sql::udf_call::{
@@ -1918,14 +1919,26 @@ pub struct ScalarOrderKey {
 /// 公開型 [`ScalarOrderKey`] のフィールドを変えずに式キーを運ぶために別 enum とした。
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) enum ScanOrderKey {
-    /// 列名（疑似列 `id` を含みうる）キー。
-    Column(ScalarOrderKey),
+    /// 列名（疑似列 `id` を含みうる）キー。`nulls` は `NULLS FIRST|LAST` の明示指定
+    /// （SQL-56・Issue #1791。`None` は未指定で、束縛段が `pg_default(descending)` で確定させる）。
+    Column {
+        key: ScalarOrderKey,
+        nulls: Option<NullPlacement>,
+    },
     /// 式キー。意味論（未知関数・型不整合・列参照の解決）は束縛段が判定する。
-    Expr { expr: Expr, descending: bool },
+    Expr {
+        expr: Expr,
+        descending: bool,
+        nulls: Option<NullPlacement>,
+    },
     /// 序数キー（`ORDER BY 1`。SQL-56 (2)・Issue #1792）。SELECT リストの出力列の位置
     /// （1 始まり。`*` は展開後の位置）。範囲検査と列への解決は束縛段が行う（`*` の展開後の
     /// 列数・ウィンドウ項目の位置が構文段では確定しないため、位置のまま運ぶ）。
-    Ordinal { position: i64, descending: bool },
+    Ordinal {
+        position: i64,
+        descending: bool,
+        nulls: Option<NullPlacement>,
+    },
 }
 
 /// スカラー `ORDER BY` に指定できるキー数の上限（Issue #915 実装既定値）。
@@ -2756,6 +2769,8 @@ pub(crate) struct JoinOrderKey {
     /// 序数キー（`ORDER BY 1`。SQL-56 (2)・Issue #1792）。SELECT リストの出力列の位置
     /// （1 始まり。`*` は左→右の `id`＋全列の展開後の位置）。範囲外は束縛段が `42P10`。
     pub(crate) ordinal: Option<i64>,
+    /// `NULLS FIRST|LAST` の明示指定（SQL-56・Issue #1791。`None` は未指定で束縛段が既定で確定）。
+    pub(crate) nulls: Option<NullPlacement>,
 }
 
 /// JOIN 集計形の SELECT リスト項目（Issue #1190）。宣言順を出力列順として保持する。
@@ -3149,9 +3164,19 @@ pub(crate) struct WindowSelectItem {
     pub(crate) arg: Option<AggregateArg>,
     /// `PARTITION BY` の列名一覧（順序保持。最大 [`MAX_WINDOW_KEYS`]）。
     pub(crate) partition_by: Vec<String>,
-    /// `ORDER BY` の (列名, 降順か) 一覧（順序保持。最大 [`MAX_WINDOW_KEYS`]）。
-    pub(crate) order_by: Vec<(String, bool)>,
+    /// `ORDER BY` の (列名, 降順か, NULL 位置) 一覧（順序保持。最大 [`MAX_WINDOW_KEYS`]）。
+    pub(crate) order_by: Vec<WindowOrderItem>,
     pub(crate) alias: Option<String>,
+}
+
+/// ウィンドウ項目 `OVER (ORDER BY ...)` の 1 キー分（SQL-56・Issue #1791）。従来の
+/// `(列名, 降順か)` タプルに `NULLS FIRST|LAST` の明示指定を足した crate 内専用型。
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct WindowOrderItem {
+    pub(crate) column: String,
+    pub(crate) descending: bool,
+    /// `None` は未指定で、束縛段（`sql::parser::bind_window_item`）が `pg_default(descending)` で確定させる。
+    pub(crate) nulls: Option<NullPlacement>,
 }
 
 /// 広域取得 SELECT の投影位置にあるスカラーサブクエリ 1 項目
@@ -3312,6 +3337,9 @@ pub struct AggregateOrderBy {
     /// `expr` は `None` で、SELECT リストの出力列の位置（1 始まり）として束縛段
     /// （`sql::parser::bind_group_by_clause`）が解決し、範囲外は `42P10` にする。
     pub(crate) ordinal: Option<i64>,
+    /// `NULLS FIRST|LAST` の明示指定（SQL-56・Issue #1791。`None` は未指定で束縛段が
+    /// `pg_default(descending)` で確定させる）。
+    pub(crate) nulls: Option<NullPlacement>,
 }
 
 /// `HAVING` の式述語 1 つ（Issue #1188・SQL-26）。`<lhs> <cmp> <rhs>` で、少なくとも一方の
@@ -3477,7 +3505,8 @@ impl ValidatedScan {
     }
 
     /// `ORDER BY` が式キー（関数呼び出し・`CASE` 等。Issue #1188）を含むか。`true` の
-    /// とき [`Self::order_by`] は空で、キーの正本は crate 内の `order_keys`。
+    /// とき [`Self::order_by`] は空で、キーの正本は crate 内の `order_keys`（序数キー・
+    /// `NULLS FIRST|LAST` を明示したキー〔SQL-56・Issue #1791〕でも同様に空になる）。
     pub fn has_expression_order_by(&self) -> bool {
         !self.order_keys.is_empty()
     }
@@ -5663,7 +5692,7 @@ impl<'a> Parser<'a> {
     /// （ここでは常に `0`）。
     ///
     /// スコープ縮小（`docs/design/window-functions.md` 参照。§計画 2「対象外」）:
-    /// フレーム句（`ROWS`/`RANGE`/`GROUPS`）・`NULLS FIRST/LAST`・名前付き
+    /// フレーム句（`ROWS`/`RANGE`/`GROUPS`）・名前付き
     /// ウィンドウ（`WINDOW w AS (...)`/`OVER w`）・`FILTER (...)`・関数内
     /// `DISTINCT`・複合式の引数はいずれも許可リスト外として `42601` に落ちる
     /// （該当する構文を消費する分岐を意図的に持たない）。
@@ -5748,7 +5777,12 @@ impl<'a> Parser<'a> {
                 } else {
                     false
                 };
-                order_by.push((column, descending));
+                let nulls = self.parse_order_nulls();
+                order_by.push(WindowOrderItem {
+                    column,
+                    descending,
+                    nulls,
+                });
                 if matches!(self.peek(), Some(Token::Punct(','))) {
                     self.advance();
                     continue;
@@ -6146,9 +6180,11 @@ impl<'a> Parser<'a> {
     /// （TASK-167・SQL-14。Issue #1185・SQL-25 (a) で複数キーへ一般化）。
     /// 各 `<target>` は `GROUP BY` 列名（またはそのエイリアス）か SELECT リスト集計項目の
     /// 実効名のいずれか 1 つの識別子（意味論的な解決は束縛段）。`ASC`/`DESC` は
-    /// 予約語化せず文脈的に照合し、省略時は昇順として扱う。式・位置番号・
-    /// `NULLS FIRST/LAST` は識別子でない／未知のトークンとして後続の構文検査で
-    /// `42601` に落ちる。キー数の上限は [`MAX_SCALAR_ORDER_KEYS`]（超過は `54000`。
+    /// 予約語化せず文脈的に照合し、省略時は昇順として扱う。式・位置番号は
+    /// 別途受理し、それ以外は識別子でない／未知のトークンとして後続の構文検査で
+    /// `42601` に落ちる。
+    /// 各キーの方向指定の直後に `NULLS FIRST|LAST` を受理する（SQL-56・Issue #1791。
+    /// [`Self::parse_order_nulls`]）。キー数の上限は [`MAX_SCALAR_ORDER_KEYS`]（超過は `54000`。
     /// 確保前検査）。
     fn parse_aggregate_order_by(
         &mut self,
@@ -6185,11 +6221,13 @@ impl<'a> Parser<'a> {
             } else {
                 false
             };
+            let nulls = self.parse_order_nulls();
             keys.push(AggregateOrderBy {
                 target,
                 descending,
                 expr,
                 ordinal,
+                nulls,
             });
             if matches!(self.peek(), Some(Token::Punct(','))) {
                 self.advance();
@@ -8957,12 +8995,21 @@ impl<'a> Parser<'a> {
             } else {
                 false
             };
+            let nulls = self.parse_order_nulls();
             keys.push(match key {
-                Key::Column(column) => ScanOrderKey::Column(ScalarOrderKey { column, descending }),
-                Key::Expr(expr) => ScanOrderKey::Expr { expr, descending },
+                Key::Column(column) => ScanOrderKey::Column {
+                    key: ScalarOrderKey { column, descending },
+                    nulls,
+                },
+                Key::Expr(expr) => ScanOrderKey::Expr {
+                    expr,
+                    descending,
+                    nulls,
+                },
                 Key::Ordinal(position) => ScanOrderKey::Ordinal {
                     position,
                     descending,
+                    nulls,
                 },
             });
             if matches!(self.peek(), Some(Token::Punct(','))) {
@@ -8972,6 +9019,28 @@ impl<'a> Parser<'a> {
             break;
         }
         Ok(keys)
+    }
+
+    /// `ORDER BY` キーの方向指定（`ASC`/`DESC`）の直後にある `NULLS FIRST|LAST`（SQL-56・
+    /// Issue #1791）を読み取る。`NULLS` の次が `FIRST`/`LAST` のときだけ 2 トークンを消費して
+    /// 明示値を返し、それ以外は何も消費せず `None`（未指定。`NULLS` 単独・`NULLS MIDDLE` は
+    /// 呼び出し元の後続の構文検査が `42601` にする。fail-closed）。`NULLS`/`FIRST`/`LAST` は予約語化
+    /// せず文脈的に照合する（同名の列名キーは先に `expect_ident` で消費されるため壊れない）。
+    /// 順序違い（`NULLS FIRST DESC`）・重複（`NULLS FIRST NULLS LAST`）は 2 つ目を消費せず `42601`。
+    /// kNN の距離順（`parse_order_by`）からは呼ばない（`NULLS` が付けば従来どおり `42601`）。
+    fn parse_order_nulls(&mut self) -> Option<NullPlacement> {
+        if !self.peek_ident_matches("NULLS") {
+            return None;
+        }
+        let placement = if self.peek_ident_matches_at(1, "FIRST") {
+            NullPlacement::First
+        } else if self.peek_ident_matches_at(1, "LAST") {
+            NullPlacement::Last
+        } else {
+            return None;
+        };
+        self.pos = self.pos.saturating_add(2);
+        Some(placement)
     }
 
     /// 現在位置が `ORDER BY` の序数キー（整数リテラルだけのキー。SQL-56 (2)・Issue #1792）か
@@ -9000,7 +9069,7 @@ impl<'a> Parser<'a> {
         let at_end = match self.tokens.get(self.pos.saturating_add(len)) {
             None => true,
             Some(Token::Punct(',' | ';' | ')')) | Some(Token::Keyword(Keyword::Limit)) => true,
-            Some(Token::Ident(w)) => ["ASC", "DESC", "OFFSET"]
+            Some(Token::Ident(w)) => ["ASC", "DESC", "OFFSET", "NULLS"]
                 .iter()
                 .any(|k| w.eq_ignore_ascii_case(k)),
             _ => false,
@@ -17361,10 +17430,12 @@ fn parse_join_order_by(p: &mut Parser<'_>) -> Result<Vec<JoinOrderKey>, SqlSurfa
             }
             false
         };
+        let nulls = p.parse_order_nulls();
         keys.push(JoinOrderKey {
             target,
             descending,
             ordinal,
+            nulls,
         });
         if matches!(p.peek(), Some(Token::Punct(','))) {
             p.advance();
@@ -18326,16 +18397,18 @@ fn expr_contains_scalar_function(expr: &Expr) -> bool {
 /// 振り分ける（Issue #1188）。式キーを含まなければ従来の `order_by` だけを埋めて既存契約を
 /// 完全に維持し、含む場合は全キーを出現順のまま `order_keys` へ保持して `order_by` は空にする。
 fn split_scan_order_keys(keys: Vec<ScanOrderKey>) -> (Vec<ScalarOrderKey>, Vec<ScanOrderKey>) {
-    if keys
-        .iter()
-        .any(|k| matches!(k, ScanOrderKey::Expr { .. } | ScanOrderKey::Ordinal { .. }))
-    {
+    // `NULLS FIRST|LAST` を明示したキー（SQL-56・Issue #1791）が 1 つでもあれば完全形へ寄せる
+    // （公開型 `ScalarOrderKey` に NULL 位置を持たせず、指定が黙って落ちる経路を構造的に塞ぐ）。
+    if keys.iter().any(|k| match k {
+        ScanOrderKey::Column { nulls, .. } => nulls.is_some(),
+        ScanOrderKey::Expr { .. } | ScanOrderKey::Ordinal { .. } => true,
+    }) {
         return (Vec::new(), keys);
     }
     let columns = keys
         .into_iter()
         .filter_map(|k| match k {
-            ScanOrderKey::Column(c) => Some(c),
+            ScanOrderKey::Column { key, .. } => Some(key),
             ScanOrderKey::Expr { .. } | ScanOrderKey::Ordinal { .. } => None,
         })
         .collect();
@@ -28701,16 +28774,19 @@ mod tests {
         assert!(scan.has_expression_order_by());
         assert!(scan.order_by().is_empty());
         assert_eq!(scan.order_keys.len(), 3);
-        assert!(matches!(&scan.order_keys[0], ScanOrderKey::Column(k) if k.column == "lang"));
+        assert!(
+            matches!(&scan.order_keys[0], ScanOrderKey::Column { key: k, .. } if k.column == "lang")
+        );
         assert!(matches!(
             &scan.order_keys[1],
-            ScanOrderKey::Expr { descending: true, expr: Expr::Call { name, .. } } if name == "lower"
+            ScanOrderKey::Expr { descending: true, expr: Expr::Call { name, .. }, .. } if name == "lower"
         ));
         assert!(matches!(
             &scan.order_keys[2],
             ScanOrderKey::Expr {
                 descending: false,
-                expr: Expr::Case { .. }
+                expr: Expr::Case { .. },
+                ..
             }
         ));
         // 列キーのみ: 従来どおり `order_by` が正本で `order_keys` は空。
@@ -28758,17 +28834,91 @@ mod tests {
             [
                 ScanOrderKey::Ordinal {
                     position: 2,
-                    descending: true
+                    descending: true,
+                    nulls: None
                 },
-                ScanOrderKey::Column(_),
+                ScanOrderKey::Column { .. },
                 ScanOrderKey::Ordinal {
                     position: 1,
-                    descending: false
+                    descending: false,
+                    nulls: None
                 },
                 ScanOrderKey::Ordinal { position: -1, .. },
                 ScanOrderKey::Ordinal { position: 0, .. },
             ]
         ));
+    }
+
+    /// SQL-56・Issue #1791: `NULLS FIRST|LAST` は列・式・序数キーのすべてで受理し、AST に
+    /// 明示値が入る。明示キーを含む文は列キーだけでも完全形（`order_keys`）へ振り分ける。
+    #[test]
+    fn scan_order_by_accepts_nulls_placement_on_all_key_forms() {
+        use crate::sql::order_value::NullPlacement::{First, Last};
+        let lookup = catalog_with(&["documents"]);
+        let scan = expect_scan(
+            "SELECT id, lang FROM documents ORDER BY lang DESC NULLS LAST, lower(title) nulls first, 2 ASC NULLS LAST, id LIMIT 5",
+            &lookup,
+        );
+        assert!(scan.order_by().is_empty());
+        assert!(matches!(
+            scan.order_keys.as_slice(),
+            [
+                ScanOrderKey::Column { nulls: Some(Last), key },
+                ScanOrderKey::Expr { nulls: Some(First), .. },
+                ScanOrderKey::Ordinal { nulls: Some(Last), position: 2, .. },
+                ScanOrderKey::Column { nulls: None, .. },
+            ] if key.descending
+        ));
+        // 列キー 1 つでも明示があれば完全形、無ければ従来どおり `order_by`。
+        let explicit = expect_scan(
+            "SELECT id FROM documents ORDER BY lang NULLS FIRST LIMIT 5",
+            &lookup,
+        );
+        assert!(explicit.order_by().is_empty());
+        assert_eq!(explicit.order_keys.len(), 1);
+        let plain = expect_scan(
+            "SELECT id FROM documents ORDER BY lang DESC LIMIT 5",
+            &lookup,
+        );
+        assert_eq!(plain.order_by().len(), 1);
+        assert!(plain.order_keys.is_empty());
+    }
+
+    /// SQL-56・Issue #1791: 式キーの直後の `NULLS` は式の一部として消費されず、NULL 位置指定になる。
+    #[test]
+    fn scan_order_by_nulls_after_expression_keys_is_not_swallowed() {
+        let lookup = catalog_with(&["documents"]);
+        for sql in [
+            "SELECT id FROM documents ORDER BY lower(title) NULLS FIRST LIMIT 5",
+            "SELECT id FROM documents ORDER BY CASE WHEN n > 1 THEN 0 ELSE 1 END NULLS LAST LIMIT 5",
+            "SELECT id FROM documents ORDER BY n::text NULLS FIRST LIMIT 5",
+            "SELECT id FROM documents ORDER BY title COLLATE \"C\" NULLS LAST LIMIT 5",
+        ] {
+            let scan = expect_scan(sql, &lookup);
+            assert!(
+                matches!(scan.order_keys.as_slice(), [ScanOrderKey::Expr { nulls: Some(_), .. }]),
+                "sql={sql:?}"
+            );
+        }
+    }
+
+    /// SQL-56・Issue #1791: 不正な NULL 位置指定・ベクトル順位付けとの併用は `42601`（fail-closed）。
+    /// 列名 `nulls`／`first`／`last` は従来どおりキーとして使える。
+    #[test]
+    fn scan_order_by_rejects_malformed_nulls_clauses() {
+        let lookup = catalog_with(&["documents"]);
+        for sql in [
+            "SELECT id FROM documents ORDER BY lang NULLS LIMIT 5",
+            "SELECT id FROM documents ORDER BY lang NULLS MIDDLE LIMIT 5",
+            "SELECT id FROM documents ORDER BY lang NULLS FIRST DESC LIMIT 5",
+            "SELECT id FROM documents ORDER BY lang NULLS FIRST NULLS LAST LIMIT 5",
+            "SELECT id FROM documents ORDER BY lang NULLS FIRST, LIMIT 5",
+            "SELECT id FROM documents ORDER BY embedding <=> '[0.1]' NULLS LAST LIMIT 5",
+            "SELECT id FROM documents ORDER BY lang, embedding <=> '[0.1]' NULLS FIRST LIMIT 5",
+        ] {
+            let err = validate_sql(sql, &lookup).expect_err("must be rejected");
+            assert_eq!(err.wire_code(), "42601", "sql={sql:?}");
+        }
     }
 
     /// SQL-56 (2)・Issue #1792: 定数式・小数・int4 範囲外・パラメータは序数にしない（従来どおり
@@ -28782,7 +28932,7 @@ mod tests {
             "SELECT id FROM documents ORDER BY 99999999999 LIMIT 5",
             "SELECT id FROM documents ORDER BY -1 + 0 LIMIT 5",
             "SELECT id FROM documents ORDER BY 1 <=> '[0.1]' LIMIT 5",
-            "SELECT id FROM documents ORDER BY 1 NULLS LAST LIMIT 5",
+            "SELECT id FROM documents ORDER BY 1 NULLS LIMIT 5",
         ] {
             let err = validate_sql(sql, &lookup).expect_err("must be rejected");
             assert_eq!(err.wire_code(), "42601", "sql={sql:?}");
