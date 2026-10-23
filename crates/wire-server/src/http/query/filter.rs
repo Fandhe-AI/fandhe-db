@@ -1298,6 +1298,8 @@ fn where_predicate_for(
             return Ok(WherePredicate::Prefix {
                 column: column.to_string(),
                 pattern,
+                // NoSQL の `filter` に `ilike` は無い（SQL-54、Issue #1778 の決定）。
+                case_insensitive: false,
             });
         }
         "is_null" | "not_null" => {
@@ -2242,6 +2244,7 @@ mod tests {
             vec![WherePredicate::Prefix {
                 column: "path".to_string(),
                 pattern: r"a\%b\_c\\d%".to_string(),
+                case_insensitive: false,
             }]
         );
     }
@@ -2495,6 +2498,7 @@ mod tests {
                 WherePredicate::Prefix {
                     column: "path".to_string(),
                     pattern: "src/%".to_string(),
+                    case_insensitive: false,
                 },
             ]
         );
@@ -2641,6 +2645,7 @@ mod tests {
             vec![WherePredicate::Prefix {
                 column: col("lang"),
                 pattern: col("%a_"),
+                case_insensitive: false,
             }]
         );
         assert_eq!(

@@ -153,18 +153,24 @@ fn accepts_where_like_prefix_against_real_catalog() {
     .expect("LIKE prefix shape against a real table must be accepted");
 }
 
-// SQL-24（TASK-208 ポインタ）で `NOT LIKE` は `Not(Prefix)` として受理する
-// ようになったため、`ILIKE` のみを不正形として固定する（`NOT LIKE` の受理は
-// `accepts_not_like_as_negated_prefix_against_real_catalog` が別途固定する）。
+// SQL-54（Issue #1778）で `ILIKE`／`NOT ILIKE` を受理するようになった。不正形の
+// 固定は、右辺が非リテラルの `ILIKE` と未対応の `ESCAPE` 句（#1779）で行う。
 #[test]
-fn rejects_ilike_against_real_catalog() {
+fn accepts_ilike_and_rejects_unsupported_ilike_forms_against_real_catalog() {
     let (storage, _guard) = open_storage_with_documents_table("like-reject");
-    let ilike = validate_statement(
+    for sql in [
         "SELECT * FROM documents WHERE lang ILIKE 'j%' ORDER BY embedding <=> '[0.1,0.2,0.3,0.4]' LIMIT 10",
-        &storage,
-    )
-    .expect_err("ILIKE must be rejected");
-    assert_eq!(ilike.wire_code(), "42601");
+        "SELECT * FROM documents WHERE lang NOT ILIKE 'j%' ORDER BY embedding <=> '[0.1,0.2,0.3,0.4]' LIMIT 10",
+    ] {
+        validate_statement(sql, &storage).expect("ILIKE must be accepted");
+    }
+    for sql in [
+        "SELECT * FROM documents WHERE lang ILIKE lang ORDER BY embedding <=> '[0.1,0.2,0.3,0.4]' LIMIT 10",
+        "SELECT * FROM documents WHERE lang ILIKE 'j%' ESCAPE '!' ORDER BY embedding <=> '[0.1,0.2,0.3,0.4]' LIMIT 10",
+    ] {
+        let err = validate_statement(sql, &storage).expect_err("unsupported ILIKE form");
+        assert_eq!(err.wire_code(), "42601", "sql={sql:?}");
+    }
 }
 
 /// SQL-24（TASK-208 ポインタ）: `<col> NOT LIKE '<lit>'` は `Not(Prefix)` として
@@ -184,6 +190,7 @@ fn accepts_not_like_as_negated_prefix_against_real_catalog() {
             engine::sql::allowlist::WherePredicate::Prefix {
                 column: "lang".to_string(),
                 pattern: "j%".to_string(),
+                case_insensitive: false,
             }
         ))]
     );

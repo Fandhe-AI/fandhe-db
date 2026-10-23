@@ -16314,6 +16314,7 @@ mod tests {
             WherePredicate::Prefix {
                 column: "path".to_string(),
                 pattern: "src/%".to_string(),
+                case_insensitive: false,
             },
             WherePredicate::Between {
                 column: "amount".to_string(),
