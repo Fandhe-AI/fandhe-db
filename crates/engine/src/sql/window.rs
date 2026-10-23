@@ -2025,6 +2025,7 @@ mod budget_regression_tests {
     /// （`AggregateFunc` は不使用。`window_func_to_aggregate_func` が変換する）。
     fn bound_min_body_over() -> BoundScan {
         BoundScan {
+            result_cap: None,
             table: "docs".to_string(),
             projection: vec![ProjectedColumn::Id],
             metadata_filters: Vec::new(),

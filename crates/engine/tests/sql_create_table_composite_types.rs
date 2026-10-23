@@ -125,10 +125,12 @@ fn unknown_and_invalid_types_are_rejected_with_42601() {
         "CREATE TABLE t (a INTEGER[-1])",
         "CREATE TABLE t (a VECTOR(2)[])",
         "CREATE TABLE t (a INTEGER[ )",
-        "SELECT a[1] FROM t",
     ] {
         assert_eq!(code(&core, &mut s, sql), "42601", "{sql}");
     }
+    // Issue #1796: `LIMIT` 省略が構文上有効になったため、添字付き投影は構文段を通り、
+    // 存在しない表の解決で止まる（従来は `LIMIT` 欠落の 42601 で見かけ上拒否されていた）。
+    assert_eq!(code(&core, &mut s, "SELECT a[1] FROM t"), "42P01");
     // NUMERIC の精度・位取りが範囲外の配列要素は 42601（Issue #1357 で NUMERIC 要素は受理）。
     assert_eq!(
         code(&core, &mut s, "CREATE TABLE t (a NUMERIC(5,9)[])"),

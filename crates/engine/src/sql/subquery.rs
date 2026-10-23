@@ -546,6 +546,11 @@ fn inner_scan_prechecks(
     outer_scopes: &[&TableSchema],
     read_txn: &impl crate::storage::read_source::ReadSource,
 ) -> Result<TableSchema, SqlSurfaceError> {
+    // Issue #1796・SQL-34: 内側の `LIMIT` 省略・`LIMIT ALL` は従来どおり `42601`
+    // （サブクエリ内側の暗黙上限は #1852／#1853 の範囲。受理範囲を黙って広げない）。
+    if validated.limit_implicit {
+        return Err(unsupported_inner_statement());
+    }
     // Cursor Bugbot 指摘対応: ウィンドウ関数（SQL-30・TASK-214、Issue #930）を
     // 含む内側は一律拒否する。`window_items` が非空だと `sql::scan::execute_scan` は
     // `sql::window::execute_window_scan` へ分岐し、`LIMIT` による早期終了なしに

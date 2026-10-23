@@ -3098,6 +3098,59 @@ impl EngineCore {
         Ok(())
     }
 
+    /// `LIMIT` 省略・`LIMIT ALL` の結果が結果行数上限 `cap` を超えたら `54000` で文全体を拒否する
+    /// （Issue #1796・SQL-34）。黙って切り詰めない。文言は固定の英語で、件数・テナント・行の
+    /// 内容を含めない。JOIN・GROUP BY・集合演算・評価後射影形ビューの外側が共有する。
+    fn enforce_result_cap(
+        result: crate::sql::exec::QueryResult,
+        cap: usize,
+    ) -> Result<crate::sql::exec::QueryResult, crate::sql::allowlist::SqlSurfaceError> {
+        if result.rows.len() > cap {
+            return Err(crate::sql::allowlist::SqlSurfaceError::payload_too_large(
+                "result exceeds the row limit",
+            ));
+        }
+        Ok(result)
+    }
+
+    /// `GROUP BY`／`SELECT DISTINCT` 集計の結果へ暗黙の結果行数上限を適用する（Issue #1796）。
+    /// `LIMIT` が省略・`ALL`（`limit: None`）の `GROUP BY` 文だけが対象で、HAVING と OFFSET を
+    /// 適用した後の件数で判定する。単一行の集計（`GROUP BY` なし）は対象外。
+    /// `limits` は呼び出し段の上限（ビュー本文の評価では本文用の既定値、外側では呼び出し段の
+    /// 設定値。本文と外側の上限を分ける契約を保つため `self.result_limits` は参照しない）。
+    fn enforce_group_result_cap(
+        validated: &crate::sql::allowlist::ValidatedAggregate,
+        result: crate::sql::exec::QueryResult,
+        limits: &crate::result_limits::ResultLimits,
+    ) -> Result<crate::sql::exec::QueryResult, crate::sql::allowlist::SqlSurfaceError> {
+        match &validated.group_by {
+            Some(g) if g.limit.is_none() => {
+                Self::enforce_result_cap(result, limits.max_result_rows())
+            }
+            _ => Ok(result),
+        }
+    }
+
+    /// 束縛済み広域取得計画の取得上限を設定値で再検査する（Issue #1796・SQL-34 の多層防御）。
+    /// 暗黙上限の印（`result_cap`）付きの計画は「`cap` が設定値と一致し、取得上限が
+    /// `cap + 1` 以下」のときだけ通す（印を偽装して巨大な取得上限を通す経路を作らない）。
+    /// それ以外（明示 `LIMIT`・NoSQL 表層の直接構築）は従来どおり [`Self::check_bound_limit`]。
+    fn check_bound_scan_limit(
+        &self,
+        bound: &crate::sql::parser::BoundScan,
+    ) -> Result<(), crate::sql::allowlist::SqlSurfaceError> {
+        let Some(cap) = bound.result_cap() else {
+            return self.check_bound_limit(bound.limit());
+        };
+        let max = self.result_limits.max_result_rows();
+        if cap != max || bound.limit() > max.saturating_add(1) {
+            return Err(crate::sql::allowlist::SqlSurfaceError::invalid_input(
+                format!("LIMIT {} out of range (must be 1..={max})", bound.limit()),
+            ));
+        }
+        Ok(())
+    }
+
     /// 評価後射影形ビューの外側 `LIMIT`（行形のみ）を設定値の範囲で再検査する
     /// （Issue #1555）。構文段（`sql::allowlist`）は設定値を持たないため範囲検査をここへ
     /// 一任する。`limits` は呼び出し段の上限（ビュー本文の再帰先では既定値）。
@@ -7352,6 +7405,7 @@ impl EngineCore {
             let bound = crate::sql::parser::bind_aggregate(validated, &schema, session.udfs())?;
             let result =
                 self.run_aggregate_plan(read_txn, ctx, &schema, &bound, max_result_bytes)?;
+            let result = Self::enforce_group_result_cap(validated, result, &self.result_limits)?;
             return Ok(crate::sql::SqlOutcome::Query(result));
         }
         self.execute_read_statement(ctx, session, inner.clone(), read_txn)
@@ -8221,6 +8275,7 @@ impl EngineCore {
                     session.udfs(),
                     dummy_equality_flags,
                     validated.limit,
+                    validated.offset,
                     limits,
                 )?;
                 Ok(Some(columns))
@@ -8860,6 +8915,7 @@ impl EngineCore {
                     &bound,
                     crate::sql::aggregate::MAX_AGGREGATE_RESULT_BYTES,
                 )?;
+                let result = Self::enforce_group_result_cap(&validated, result, &limits)?;
                 Ok(crate::sql::SqlOutcome::Query(result))
             }
             crate::sql::allowlist::Statement::Scan(mut validated) => {
@@ -8922,6 +8978,7 @@ impl EngineCore {
                     &validated.tree,
                     session.udfs(),
                     validated.limit,
+                    validated.offset,
                     self.group_by_limits,
                     limits,
                 )?;
@@ -8973,6 +9030,19 @@ impl EngineCore {
                             &plan,
                             self.group_by_limits,
                         )?;
+                        // Issue #1796・SQL-34: 外側の `LIMIT` 省略・`LIMIT ALL` は後処理後の
+                        // 件数が結果行数上限を超えたら `54000`（連鎖の素通しは対象外）。
+                        let processed = match &validated.outer {
+                            crate::sql::allowlist::BufferedOuter::Rows(r) if r.limit_implicit => {
+                                Self::enforce_result_cap(processed, limits.max_result_rows())?
+                            }
+                            // 外側の `GROUP BY` も同様（`limit: None` のときだけ HAVING・OFFSET
+                            // 適用後の件数を呼び出し段の上限で検査する）。
+                            crate::sql::allowlist::BufferedOuter::Aggregate(agg) => {
+                                Self::enforce_group_result_cap(agg, processed, &limits)?
+                            }
+                            _ => processed,
+                        };
                         Ok(crate::sql::SqlOutcome::Query(processed))
                     }
                     _ => Err(crate::sql::allowlist::SqlSurfaceError::Internal {
@@ -10472,7 +10542,7 @@ impl EngineCore {
                 "bound scan plan targets a different table than requested",
             ));
         }
-        self.check_bound_limit(bound.limit())?;
+        self.check_bound_scan_limit(&bound)?;
         self.run_scan_plan(&read_txn, ctx, &schema, &bound)
     }
 
@@ -10591,7 +10661,7 @@ impl EngineCore {
                 "bound scan plan targets a different table than requested",
             ));
         }
-        self.check_bound_limit(bound.limit())?;
+        self.check_bound_scan_limit(&bound)?;
         let gins = Self::gin_decls_for_explain(&read_txn, &bound)?;
         Ok(Self::scan_explain_result(&schema, &bound, &gins))
     }

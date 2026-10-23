@@ -2679,6 +2679,10 @@ pub(crate) struct BufferedRows {
     /// 利用者が `LIMIT` を明示したか。false は連鎖の素通し外側（`LIMIT` なし＝無制限で
     /// `limit` は `u32::MAX`）。明示値は `u32::MAX` でも必ず設定上限で検査する（Issue #1555）。
     pub(crate) limit_explicit: bool,
+    /// 利用者の文が外側 `LIMIT` を省略または `LIMIT ALL` にしたか（Issue #1796・SQL-34）。
+    /// true のとき `limit` は `u32::MAX`・`limit_explicit` は false で、外側の後処理後の
+    /// 件数が結果行数上限を超えたら `54000`（連鎖の素通しの `limit_explicit: false` と区別する）。
+    pub(crate) limit_implicit: bool,
     /// 外側 `OFFSET`（範囲検証済み。既定 0）。
     pub(crate) offset: u32,
 }
@@ -3031,6 +3035,10 @@ pub struct ValidatedSetOperation {
     /// describe_columns` が Describe 経路で同じ検証を行う（PR #1105 レビュー
     /// 指摘対応。Execute／Describe の受理・拒否を一致させる）。
     pub(crate) limit: Option<u32>,
+    /// 全体 `OFFSET m`（省略時 `0`。`LIMIT ALL OFFSET m`・`OFFSET m` 単独を含む。
+    /// Issue #1796）。範囲検証（`0..=core::MAX_SEARCH_K`）は `limit` と同じく実行・
+    /// Describe 双方が行い、適用順は OFFSET が先・LIMIT／結果行数上限の判定が後。
+    pub(crate) offset: u32,
 }
 
 /// `EXPLAIN` の対象文（Issue #922・SQL-27。TASK-78・SQL-6 の `USING PLAN` 付き
@@ -3439,9 +3447,8 @@ pub struct GroupByClause {
     /// で単一識別子から複数キーへ一般化。上限は [`MAX_SCALAR_ORDER_KEYS`]）。
     pub(crate) order_by: Vec<AggregateOrderBy>,
     pub(crate) limit: Option<u32>,
-    /// `OFFSET` の生値（Issue #916・SQL-25 (b)・TASK-209）。`limit` が `None` のとき
-    /// `OFFSET` 単独は構文段（[`parse_aggregate_shape`]）で `42601` に落ちるため常に
-    /// `0`。範囲検証は `sql::parser::bind_group_by_clause` が束縛時に行う。
+    /// `OFFSET` の生値（Issue #916・SQL-25 (b)・TASK-209）。`LIMIT` 省略・`LIMIT ALL` でも
+    /// `OFFSET` 単独を受理する（Issue #1796。`SELECT DISTINCT` 形を含む）。範囲検証は `sql::parser::bind_group_by_clause` が束縛時に行う。
     pub(crate) offset: u32,
 }
 
@@ -3509,6 +3516,12 @@ pub struct ValidatedScan {
     /// （早期終了。`order_by` が空の場合、順序保証はスナップショット内の物理
     /// 走査順のみで `ORDER BY` 相当の意味的順序を持たない）。
     pub(crate) limit: u32,
+    /// `LIMIT` が省略または `LIMIT ALL` だったか（Issue #1796・SQL-34）。true のとき
+    /// [`Self::limit`] は番兵値 `u32::MAX` で、束縛段（`sql::parser::bind_scan_with_dummy_flags`）
+    /// が結果行数上限 + 1 の取得上限へ差し替え、実行段が超過を `54000` にする。範囲検証を
+    /// 通る経路が印を見落としても `u32::MAX` は `22000` で拒否される（fail-closed）。
+    /// 構文段の検証経路だけが立てる（`pub(crate)`）。
+    pub(crate) limit_implicit: bool,
     /// スカラー列 `ORDER BY`（Issue #915・SQL-25・TASK-209）。空ならソート
     /// なし（従来どおりの物理走査順。§1「広域取得」ドキュメント参照）。
     pub(crate) order_by: Vec<ScalarOrderKey>,
@@ -5460,6 +5473,26 @@ impl<'a> Parser<'a> {
         }
     }
 
+    /// 任意の `LIMIT {n | ALL}` を判定・消費する（Issue #1796・SQL-34）。`LIMIT` が無い
+    /// 場合と `LIMIT ALL` はどちらも `None`（件数の制限なし。PostgreSQL と同じ）を返す。
+    /// `ALL` は [`Self::peek_ident_matches`] と同じ理由で文脈識別子として照合する。
+    /// 暗黙の結果行数上限（`--max-result-rows`）の適用は束縛段・実行段の責務で、
+    /// ここでは構文を受理するのみ。数値の構文エラーは従来どおり `42601`。
+    fn parse_optional_limit(&mut self) -> Result<Option<u32>, SqlSurfaceError> {
+        if !matches!(self.peek(), Some(Token::Keyword(Keyword::Limit))) {
+            return Ok(None);
+        }
+        self.advance();
+        if self.peek_ident_matches("ALL") {
+            self.advance();
+            return Ok(None);
+        }
+        let raw = self.expect_number()?;
+        raw.parse()
+            .map(Some)
+            .map_err(|_| SqlSurfaceError::unsupported(format!("malformed LIMIT value: {raw}")))
+    }
+
     /// `LIMIT n` の直後に現れうる任意の `OFFSET m` を判定・消費する（Issue #916・
     /// SQL-25 (b)・TASK-209）。`USING`・`SET` と同じ理由（[`Self::peek_ident_matches`]
     /// 参照）で `OFFSET` は [`crate::sql::lexer::Keyword`] に追加せず、この位置限定の
@@ -6434,11 +6467,9 @@ impl<'a> Parser<'a> {
     /// 集計 `GROUP BY` の `LIMIT <n>`（TASK-167・SQL-14）。構文段では `u32` として
     /// 受理するのみで、範囲検査（`1..=MAX_GROUPS`）は束縛段
     /// （`sql::parser::bind_aggregate`）が行う。
-    fn parse_aggregate_limit(&mut self) -> Result<u32, SqlSurfaceError> {
-        self.expect_keyword(Keyword::Limit)?;
-        let raw = self.expect_number()?;
-        raw.parse()
-            .map_err(|_| SqlSurfaceError::unsupported(format!("malformed LIMIT value: {raw}")))
+    fn parse_aggregate_limit(&mut self) -> Result<Option<u32>, SqlSurfaceError> {
+        // `LIMIT ALL` は `None`（Issue #1796・SQL-34。実行段が暗黙上限を適用する）。
+        self.parse_optional_limit()
     }
 
     /// WHERE 句の許可形状（等価条件・前方一致条件（TASK-147・EXT-3）・述語呼び出し形・
@@ -13915,8 +13946,15 @@ pub(crate) fn check_buffered_body_shape(
         ViewBodyCheck::Resolved => BodyExprPolicy::Reject,
     };
     match stmt {
+        // Issue #1796・SQL-34: 本文の `LIMIT` 省略・`LIMIT ALL` は従来どおり `42601`
+        // （ビュー・CTAS・matview の本文の暗黙上限は #1853／#2212 の範囲。受理範囲を広げない）。
+        Statement::Scan(v) if v.limit_implicit => Err(body_form_unsupported()),
         Statement::Scan(v) => check_body_scan(v, lookup, top_policy, out),
         Statement::Aggregate(v) => check_body_aggregate(v, lookup, top_policy, out),
+        // Issue #1796・SQL-34: 非集計 JOIN の `LIMIT` 省略・`LIMIT ALL` も本文では `42601`。
+        Statement::Join(v) if v.aggregate.is_none() && v.limit.is_none() => {
+            Err(body_form_unsupported())
+        }
         Statement::Join(v) => {
             for t in super::join::collect_join_tables(v) {
                 push_relation(out, &t);
@@ -13961,7 +13999,7 @@ fn check_body_buffered_view(
 ) -> Result<(), SqlSurfaceError> {
     match &v.outer {
         BufferedOuter::Rows(rows) => {
-            if !rows.order_keys.is_empty() || !rows.window_items.is_empty() {
+            if !rows.order_keys.is_empty() || !rows.window_items.is_empty() || rows.limit_implicit {
                 return Err(body_form_unsupported());
             }
             push_relation(out, &v.view_name);
@@ -14013,6 +14051,7 @@ pub(crate) fn buffered_layer_statement(
             window_items: Vec::new(),
             limit: u32::MAX,
             limit_explicit: false,
+            limit_implicit: false,
             offset: 0,
         })),
         column_aliases: Vec::new(),
@@ -14039,6 +14078,7 @@ pub(crate) fn buffered_alias_layer(
             window_items: Vec::new(),
             limit: u32::MAX,
             limit_explicit: false,
+            limit_implicit: false,
             offset: 0,
         })),
         column_aliases,
@@ -16769,7 +16809,9 @@ struct ParsedScanShape {
     table_name: String,
     projection: Projection,
     where_predicates: Vec<WherePredicate>,
-    limit: u32,
+    /// `LIMIT n` の値。`None` は `LIMIT` 省略または `LIMIT ALL`（Issue #1796・SQL-34。
+    /// 暗黙の結果行数上限の対象）。
+    limit: Option<u32>,
     /// スカラー列 `ORDER BY`（Issue #915・SQL-25）。空ならソートなし。
     order_by: Vec<ScalarOrderKey>,
     offset: u32,
@@ -16879,7 +16921,9 @@ fn is_join_reserved_word(w: &str) -> bool {
 /// 単一テーブル FROM の暗黙別名にできない語（JOIN 予約語 + 集合演算子。Issue #1534）。
 /// JOIN 側の受理範囲を変えないよう [`is_join_reserved_word`] とは別関数にする。
 fn is_single_table_reserved_word(w: &str) -> bool {
-    is_join_reserved_word(w) || is_set_operator_ident(w)
+    // `WITH` は `LIMIT` 省略を受理した（Issue #1796）後も、`CREATE MATERIALIZED VIEW ... WITH
+    // [NO] DATA` の末尾句の取り違えを別名として黙って受理しないための予約語。
+    is_join_reserved_word(w) || is_set_operator_ident(w) || w.eq_ignore_ascii_case("WITH")
 }
 
 /// `FROM` 直後のトークン列から `<table> [[AS] alias]` を試し解析し、`TableRef` と
@@ -18044,19 +18088,9 @@ fn parse_join_statement(
 
     let order_by = parse_join_order_by(&mut p)?;
 
-    let limit: Option<u32> = if matches!(p.peek(), Some(Token::Keyword(Keyword::Limit))) {
-        p.advance();
-        let limit_str = p.expect_number()?;
-        Some(limit_str.parse().map_err(|_| {
-            SqlSurfaceError::unsupported(format!("malformed LIMIT value: {limit_str}"))
-        })?)
-    } else if aggregate.is_some() {
-        None
-    } else {
-        // 非集計形（広域取得形）は `LIMIT` 必須。
-        p.expect_keyword(Keyword::Limit)?;
-        None
-    };
+    // Issue #1796・SQL-34: 非集計形も `LIMIT` 省略・`LIMIT ALL` を受理する
+    // （`None` は暗黙の結果行数上限の対象。実行段が超過を `54000` にする）。
+    let limit: Option<u32> = p.parse_optional_limit()?;
     let offset = p.parse_optional_offset()?.unwrap_or(0);
     p.expect_end_of_statement()?;
 
@@ -18158,7 +18192,11 @@ fn parse_set_branch(
     // `parse_set_operation` の末尾 `expect_end_of_statement` にも一致しないため、
     // 結局は同じ `42601` へ自然に落ちる（`limit_inside_branch_is_rejected` で固定）。
     //
-    // `GROUP BY`／`ORDER BY`／`USING PLAN`／`OFFSET`／`DISTINCT` はいずれも
+    // `OFFSET` も `LIMIT` と同じく全体 `OFFSET m`（`parse_set_operation` が消費する）が
+    // 最後の枝の直後に置かれる正当な形のため、ここでは拒否しない（枝の中の `OFFSET` は
+    // `LIMIT` と同様に後続の検査で `42601` へ落ちる）。Issue #1796。
+    //
+    // `GROUP BY`／`ORDER BY`／`USING PLAN`／`DISTINCT` はいずれも
     // 集合演算の文法上どの位置にも現れ得ないため、ここで拒否しなくても
     // 同じ理由で最終的に `expect_end_of_statement` が `42601` に落とす。
     // ただし早期に拒否した方が構造的に読みやすいため、明示的に残す。
@@ -18167,11 +18205,10 @@ fn parse_set_branch(
     if has_group_by
         || matches!(p.peek(), Some(Token::Keyword(Keyword::Order)))
         || p.peek_ident_matches("USING")
-        || p.peek_ident_matches("OFFSET")
         || p.peek_ident_matches("DISTINCT")
     {
         return Err(SqlSurfaceError::unsupported(
-            "GROUP BY/ORDER BY/OFFSET/USING PLAN/DISTINCT are not allowed inside a set operation branch",
+            "GROUP BY/ORDER BY/USING PLAN/DISTINCT are not allowed inside a set operation branch",
         ));
     }
 
@@ -18183,6 +18220,7 @@ fn parse_set_branch(
             projection,
             where_predicates,
             limit: crate::core::MAX_SEARCH_K as u32,
+            limit_implicit: false,
             // Issue #915（SQL-25）: 集合演算の枝は上の構文検査
             // （`Keyword::Order` を明示的に拒否）でスカラー ORDER BY も
             // 受理しないため、常に空。
@@ -18226,6 +18264,7 @@ fn parse_set_branch(
                 projection,
                 where_predicates: merged_where,
                 limit: crate::core::MAX_SEARCH_K as u32,
+                limit_implicit: false,
                 // 上と同じ理由（集合演算の枝は ORDER BY 非対応）。
                 order_by: Vec::new(),
                 offset: 0,
@@ -18372,6 +18411,13 @@ fn parse_set_limited_branch(
     {
         return Err(SqlSurfaceError::unsupported(
             "expression ORDER BY keys are not allowed inside a set operation branch",
+        ));
+    }
+    // Issue #1796・SQL-34: 枝内の `LIMIT` 省略・`LIMIT ALL` は従来どおり `42601`
+    // （集合演算の枝の暗黙上限は本 Issue の対象外。全体の `LIMIT` 省略は受理する）。
+    if shape.limit.is_none() {
+        return Err(SqlSurfaceError::unsupported(
+            "a parenthesized set operation branch requires LIMIT",
         ));
     }
     let resolved = super::view::resolve_from(lookup, &shape.table_name)?;
@@ -18584,18 +18630,14 @@ fn parse_set_operation(
     let mut p = Parser::new(tokens);
     let mut branch_count = 0usize;
     let tree = parse_set_expr(&mut p, lookup, 0, &mut branch_count)?;
-    let limit = if matches!(p.peek(), Some(Token::Keyword(Keyword::Limit))) {
-        p.advance();
-        let limit_str = p.expect_number()?;
-        let limit: u32 = limit_str.parse().map_err(|_| {
-            SqlSurfaceError::unsupported(format!("malformed LIMIT value: {limit_str}"))
-        })?;
-        Some(limit)
-    } else {
-        None
-    };
+    let limit = p.parse_optional_limit()?;
+    let offset = p.parse_optional_offset()?.unwrap_or(0);
     p.expect_end_of_statement()?;
-    Ok(ValidatedSetOperation { tree, limit })
+    Ok(ValidatedSetOperation {
+        tree,
+        limit,
+        offset,
+    })
 }
 
 /// 許可した `SELECT` statement 形状を先頭から再帰下降で判定する（TASK-74 由来。
@@ -18694,12 +18736,10 @@ fn parse_select_shape(
     // 広域取得（ソートなしのフィルタ取得）として受理する。`LIMIT` 直後は文末のみを
     // 許可し（`USING MODE`・`HINT ORDER` は受理しない。§3.1「本リポの実装既定値」）、
     // それ以外の余剰トークンは `expect_end_of_statement` が `42601` へ落とす。
-    if matches!(p.peek(), Some(Token::Keyword(Keyword::Limit))) {
-        p.advance();
-        let limit_str = p.expect_number()?;
-        let limit: u32 = limit_str.parse().map_err(|_| {
-            SqlSurfaceError::unsupported(format!("malformed LIMIT value: {limit_str}"))
-        })?;
+    // Issue #1796・SQL-34: `LIMIT` 省略・`LIMIT ALL`・`OFFSET` 単独・文末も同じ広域取得
+    // として受理する（`ORDER` 以外の余剰トークンは `expect_end_of_statement` が `42601`）。
+    if !matches!(p.peek(), Some(Token::Keyword(Keyword::Order))) {
+        let limit = p.parse_optional_limit()?;
 
         // Issue #916・SQL-25 (b)・TASK-209: `LIMIT n` の直後に任意で `OFFSET m` を
         // 受理する（広域取得のみ。検索 SELECT の `ORDER BY`／`USING PLAN` 経路は
@@ -18783,11 +18823,7 @@ fn parse_select_shape(
             ));
         }
 
-        p.expect_keyword(Keyword::Limit)?;
-        let limit_str = p.expect_number()?;
-        let limit: u32 = limit_str.parse().map_err(|_| {
-            SqlSurfaceError::unsupported(format!("malformed LIMIT value: {limit_str}"))
-        })?;
+        let limit = p.parse_optional_limit()?;
 
         // Issue #916・SQL-25 (b)・TASK-209: スカラー `ORDER BY` 付き広域取得も
         // `LIMIT n` 直後の任意 `OFFSET m` を受理する（`ORDER BY` なし広域取得と
@@ -19018,16 +19054,10 @@ fn parse_aggregate_shape(
         } else {
             Vec::new()
         };
-        let (limit, offset) = if matches!(p.peek(), Some(Token::Keyword(Keyword::Limit))) {
-            let limit = p.parse_aggregate_limit()?;
-            // Issue #916・SQL-25 (b)・TASK-209: `OFFSET` は `LIMIT` を伴う場合のみ
-            // 受理する（`LIMIT` なしの `OFFSET` 単独は後続の `expect_end_of_statement`
-            // が `42601` へ落とす。§計画 3.1）。
-            let offset = p.parse_optional_offset()?.unwrap_or(0);
-            (Some(limit), offset)
-        } else {
-            (None, 0)
-        };
+        // Issue #1796・SQL-34: `LIMIT ALL`・`LIMIT` 省略・`OFFSET` 単独を受理する
+        // （`limit: None` は暗黙の結果行数上限の対象。実行段が超過を `54000` にする）。
+        let limit = p.parse_aggregate_limit()?;
+        let offset = p.parse_optional_offset()?.unwrap_or(0);
         Some(GroupByClause {
             columns,
             having,
@@ -19130,11 +19160,9 @@ fn parse_distinct_shape(tokens: &[Token]) -> Result<ParsedAggregateShape, SqlSur
     } else {
         Vec::new()
     };
-    let limit = if matches!(p.peek(), Some(Token::Keyword(Keyword::Limit))) {
-        Some(p.parse_aggregate_limit()?)
-    } else {
-        None
-    };
+    let limit = p.parse_aggregate_limit()?;
+    // Issue #1796・SQL-34: GROUP BY と同様に `OFFSET` 単独（`LIMIT` 省略・`ALL` 含む）を受理する。
+    let offset = p.parse_optional_offset()?.unwrap_or(0);
     p.expect_end_of_statement()?;
 
     Ok(ParsedAggregateShape {
@@ -19147,9 +19175,7 @@ fn parse_distinct_shape(tokens: &[Token]) -> Result<ParsedAggregateShape, SqlSur
             having_exprs: Vec::new(),
             order_by,
             limit,
-            // `SELECT DISTINCT <column> ...` 構文自体が `OFFSET` を持たない
-            // ため常に `0`。
-            offset: 0,
+            offset,
         }),
     })
 }
@@ -19424,7 +19450,7 @@ fn build_scan_from_resolved(
     resolved: super::view::Resolved,
     projection: Projection,
     where_predicates: Vec<WherePredicate>,
-    limit: u32,
+    limit: Option<u32>,
     // Issue #915・SQL-25: CTE・ビュー経由の広域取得もスカラー ORDER BY を
     // 持ちうる（`ParsedScanShape::order_by`）ため、キー列の可視性検査
     // （`check_columns_within_view`）へそのまま橋渡しする。
@@ -19442,7 +19468,8 @@ fn build_scan_from_resolved(
             table_name,
             projection,
             where_predicates,
-            limit,
+            limit: limit.unwrap_or(u32::MAX),
+            limit_implicit: limit.is_none(),
             order_by,
             offset,
             window_items,
@@ -19509,7 +19536,8 @@ fn build_scan_from_resolved(
                 table_name: base_table,
                 projection,
                 where_predicates: merged,
-                limit,
+                limit: limit.unwrap_or(u32::MAX),
+                limit_implicit: limit.is_none(),
                 order_by,
                 offset,
                 window_items,
@@ -20250,8 +20278,9 @@ fn validate_select_statement(
                         order_by: shape.order_by,
                         order_keys: shape.order_keys,
                         window_items: shape.window_items,
-                        limit: shape.limit,
-                        limit_explicit: true,
+                        limit: shape.limit.unwrap_or(u32::MAX),
+                        limit_explicit: shape.limit.is_some(),
+                        limit_implicit: shape.limit.is_none(),
                         offset: shape.offset,
                     })),
                     column_aliases: Vec::new(),
@@ -21904,6 +21933,7 @@ fn validate_copy_table_to_tokens(
         projection,
         where_predicates: Vec::new(),
         limit: 0,
+        limit_implicit: false,
         order_by: Vec::new(),
         offset: 0,
         window_items: Vec::new(),
@@ -28786,16 +28816,52 @@ mod tests {
     }
 
     #[test]
-    fn rejects_group_by_offset_without_limit() {
-        // Issue #916・SQL-25 (b)・TASK-209: `LIMIT` を伴わない `OFFSET` 単独は
-        // `GROUP BY` 集計でも受理しない（後続の `expect_end_of_statement` が拒否）。
+    fn accepts_group_by_offset_without_limit() {
+        // Issue #1796・SQL-34: `LIMIT` を伴わない `OFFSET` 単独も `GROUP BY` 集計で受理する
+        // （`limit: None` は暗黙の結果行数上限の対象）。
         let lookup = catalog_with(&["documents"]);
-        let err = validate_sql(
+        let stmt = validate_sql(
             "SELECT lang, COUNT(*) FROM documents GROUP BY lang OFFSET 2",
             &lookup,
         )
-        .expect_err("OFFSET without LIMIT must be rejected for GROUP BY aggregates");
-        assert_eq!(err.wire_code(), "42601");
+        .expect("OFFSET without LIMIT must be accepted for GROUP BY aggregates");
+        let Statement::Aggregate(agg) = stmt else {
+            panic!("expected aggregate");
+        };
+        let group_by = agg.group_by().expect("GROUP BY clause");
+        assert_eq!(group_by.limit, None);
+        assert_eq!(group_by.offset, 2);
+    }
+
+    #[test]
+    fn accepts_group_by_limit_all() {
+        let lookup = catalog_with(&["documents"]);
+        let stmt = validate_sql(
+            "SELECT lang, COUNT(*) FROM documents GROUP BY lang LIMIT ALL",
+            &lookup,
+        )
+        .expect("LIMIT ALL must be accepted for GROUP BY aggregates");
+        let Statement::Aggregate(agg) = stmt else {
+            panic!("expected aggregate");
+        };
+        assert_eq!(agg.group_by().expect("GROUP BY clause").limit, None);
+    }
+
+    #[test]
+    fn accepts_distinct_offset_with_limit_omitted_or_all() {
+        let lookup = catalog_with(&["documents"]);
+        for sql in [
+            "SELECT DISTINCT lang FROM documents OFFSET 2",
+            "SELECT DISTINCT lang FROM documents LIMIT ALL OFFSET 2",
+        ] {
+            let stmt = validate_sql(sql, &lookup).expect(sql);
+            let Statement::Aggregate(agg) = stmt else {
+                panic!("expected aggregate");
+            };
+            let gb = agg.group_by().expect("GROUP BY clause");
+            assert_eq!(gb.limit, None, "{sql}");
+            assert_eq!(gb.offset, 2, "{sql}");
+        }
     }
 
     #[test]
@@ -29736,11 +29802,38 @@ mod tests {
     }
 
     #[test]
-    fn rejects_scan_missing_limit() {
+    fn accepts_scan_missing_limit_as_implicit() {
+        // Issue #1796・SQL-34: `LIMIT` 省略・`LIMIT ALL`・`OFFSET` 単独は広域取得として受理し、
+        // 暗黙上限の印（`limit_implicit`）を立てる（番兵値 `u32::MAX`）。
         let lookup = catalog_with(&["documents"]);
-        let err = validate_sql("SELECT * FROM documents", &lookup)
-            .expect_err("SELECT without ORDER BY/USING PLAN/LIMIT must be rejected");
-        assert_eq!(err.wire_code(), "42601");
+        for sql in [
+            "SELECT * FROM documents",
+            "SELECT * FROM documents LIMIT ALL",
+            "SELECT * FROM documents limit all",
+            "SELECT * FROM documents OFFSET 3",
+            "SELECT * FROM documents LIMIT ALL OFFSET 3",
+            "SELECT * FROM documents ORDER BY lang",
+            "SELECT * FROM documents ORDER BY lang LIMIT ALL OFFSET 1",
+        ] {
+            let scan = expect_scan(sql, &lookup);
+            assert!(scan.limit_implicit, "{sql}");
+            assert_eq!(scan.limit, u32::MAX, "{sql}");
+        }
+        let explicit = expect_scan("SELECT * FROM documents LIMIT 5", &lookup);
+        assert!(!explicit.limit_implicit);
+        assert_eq!(explicit.limit, 5);
+    }
+
+    #[test]
+    fn rejects_ranked_select_missing_limit() {
+        // Issue #1796・SQL-34: ベクトル順位付け・`USING PLAN` の `LIMIT` 省略・`LIMIT ALL` は
+        // 従来どおり `42601`（距離 ORDER BY の省略は #2242 の範囲）。
+        assert_rejected_as_syntax_error("SELECT * FROM documents ORDER BY embedding <=> '[1,0]'");
+        assert_rejected_as_syntax_error(
+            "SELECT * FROM documents ORDER BY embedding <=> '[1,0]' LIMIT ALL",
+        );
+        assert_rejected_as_syntax_error("SELECT * FROM documents USING PLAN('q')");
+        assert_rejected_as_syntax_error("SELECT * FROM documents USING PLAN('q') LIMIT ALL");
     }
 
     #[test]
@@ -32406,6 +32499,25 @@ mod body_expr_policy_tests {
     }
 
     #[test]
+    fn non_aggregate_join_body_rejects_omitted_or_all_limit() {
+        // Issue #1796・SQL-34: 非集計 JOIN 本文の `LIMIT` 省略・`ALL` は `42601`、明示は受理。
+        for sql in [
+            "SELECT t.id FROM t JOIN u ON t.k = u.k",
+            "SELECT t.id FROM t JOIN u ON t.k = u.k LIMIT ALL",
+        ] {
+            let err = classify(sql, ViewBodyCheck::Structural)
+                .err()
+                .expect("rejected");
+            assert_eq!(err.wire_code(), "42601", "{sql}");
+        }
+        classify(
+            "SELECT t.id FROM t JOIN u ON t.k = u.k LIMIT 5",
+            ViewBodyCheck::Structural,
+        )
+        .expect("explicit LIMIT is accepted");
+    }
+
+    #[test]
     fn structural_rejects_non_builtin_call() {
         let err = classify(
             "SELECT id FROM x WHERE myfn(lang) = 'ja' LIMIT 5",
@@ -32634,7 +32746,6 @@ mod body_expr_policy_tests {
             "CREATE MATERIALIZED VIEW mv WITH (fillfactor = 70) AS SELECT a FROM docs",
             "CREATE MATERIALIZED VIEW mv TABLESPACE ts AS SELECT a FROM docs",
             "CREATE MATERIALIZED VIEW mv USING heap AS SELECT a FROM docs",
-            "CREATE MATERIALIZED VIEW mv AS SELECT a FROM docs DATA",
             "CREATE MATERIALIZED VIEW mv AS SELECT a FROM docs NO DATA",
             "CREATE MATERIALIZED VIEW mv AS SELECT a FROM docs WITH",
             "CREATE MATERIALIZED VIEW mv AS",

@@ -9,6 +9,12 @@
 
 ### Added
 
+- 行を返す SELECT で `LIMIT` の省略・`LIMIT ALL`・`OFFSET` 単独を受理する（Issue #1796・SQL-34）。広域取得・
+  スカラー `ORDER BY`・ウィンドウ・JOIN・`GROUP BY`／`SELECT DISTINCT`・集合演算全体・ビュー参照・CTE の主クエリが対象。
+  可視結果が結果行数上限（`--max-result-rows`・既定 10,000）を超えたら黙って切り詰めず `54000` で文全体を拒否する。
+  従来これらの形を `42601` で拒否していたクライアントの挙動が変わる。距離 `ORDER BY`・`USING PLAN`・
+  サブクエリ内側・ビュー／CTAS／matview 本文の省略は引き続き `42601`。
+  詳細は [limit-omitted-result-cap.md](docs/design/limit-omitted-result-cap.md)。
 - `WHERE <列または式> [NOT] SIMILAR TO '<pattern>' [ESCAPE '<c>']` を受理して評価する（Issue #1788・SQL-55）。
   SQL 正規表現を ARE へ変換し、`~` と同じマッチャで全体一致を判定する（PG 17 の実測表で検証）。
   `ESCAPE` は句なし（`\`）・指定文字・`''`（無効）、2 文字以上は `22025`。不正パターンは `2201B`、

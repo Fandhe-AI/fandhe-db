@@ -807,6 +807,8 @@ pub(crate) fn execute(
     tree: &SetTree,
     udfs: &UdfRegistry,
     limit: Option<u32>,
+    // Issue #1796: 全体 `OFFSET`（省略時 0）。評価後の行から先に読み飛ばす。
+    offset: u32,
     // Issue #1550: 集計形の枝へ渡す `GROUP BY` の列数・グループ数上限（`EngineCore` 保持）。
     group_limits: crate::group_by_limits::GroupByLimits,
     // Issue #1555: 全体 `LIMIT` の範囲上限（`EngineCore` 保持。枝行数上限
@@ -820,6 +822,7 @@ pub(crate) fn execute(
         tree,
         udfs,
         limit,
+        offset,
         crate::arena::MAX_ARENA_TOTAL_BYTES,
         group_limits,
         &result_limits,
@@ -850,6 +853,7 @@ pub(crate) fn execute_with_budget(
         tree,
         udfs,
         limit,
+        0,
         budget_cap,
         group_limits,
         &crate::result_limits::ResultLimits::default(),
@@ -865,6 +869,7 @@ pub(crate) fn execute_with_budget_and_result_limits(
     tree: &SetTree,
     udfs: &UdfRegistry,
     limit: Option<u32>,
+    offset: u32,
     budget_cap: usize,
     group_limits: crate::group_by_limits::GroupByLimits,
     result_limits: &crate::result_limits::ResultLimits,
@@ -881,6 +886,7 @@ pub(crate) fn execute_with_budget_and_result_limits(
         )?),
         None => None,
     };
+    let validated_offset = crate::sql::parser::validate_search_offset(offset)?;
     // PR #1105 レビュー指摘対応: 列数・列型整合（`DatatypeMismatch`・`42804`）を
     // 全枝の走査・合成より前に確定させる（[`validate_tree_types`] のドキュメン
     // テーションコメント参照）。従来は `eval_tree` が左右の枝を実際に走査して
@@ -900,8 +906,25 @@ pub(crate) fn execute_with_budget_and_result_limits(
     // §2.4: 上限判定（`MAX_SET_OP_ROWS`）は全体 `LIMIT` による切り詰めより前に
     // 完結している（`eval_tree` が既に検証済み）。
     let rows = match validated_limit {
-        Some(n) => outcome.rows.into_iter().take(n).collect(),
-        None => outcome.rows,
+        Some(n) => outcome
+            .rows
+            .into_iter()
+            .skip(validated_offset)
+            .take(n)
+            .collect(),
+        None => {
+            // Issue #1796・SQL-34: 全体 `LIMIT` の省略・`LIMIT ALL` は結果行数上限（設定値）を
+            // 超えたら `54000`（黙って切り詰めない。`MAX_SET_OP_ROWS` は別軸の固定上限で、
+            // 設定値を上げても 10,000 で頭打ちになる）。
+            // OFFSET を先に適用し、読み飛ばし後の件数で判定する。
+            let remaining = outcome.rows.len().saturating_sub(validated_offset);
+            if remaining > result_limits.max_result_rows() {
+                return Err(SqlSurfaceError::payload_too_large(
+                    "result exceeds the row limit",
+                ));
+            }
+            outcome.rows.into_iter().skip(validated_offset).collect()
+        }
     };
     Ok(QueryResult {
         columns: outcome.columns,
@@ -921,11 +944,13 @@ pub(crate) fn describe_columns(
     udfs: &UdfRegistry,
     dummy_equality_flags: &[bool],
     limit: Option<u32>,
+    offset: u32,
     result_limits: &crate::result_limits::ResultLimits,
 ) -> Result<Vec<ColumnMeta>, SqlSurfaceError> {
     if let Some(n) = limit {
         crate::sql::parser::validate_search_limit_with(n, result_limits)?;
     }
+    crate::sql::parser::validate_search_offset(offset)?;
     // `sql::params::where_equality_literal_is_param_typed` は集合演算で枝ごとのフラグを最長の
     // 枝へ `false` 埋めして枝順に連結する。枝数で等分できない場合は対応を取れないため、
     // 全枝で検証を省略しない（fail-closed）。
@@ -1073,6 +1098,7 @@ mod tests {
             projection: Projection::Columns(vec!["body".to_string()]),
             where_predicates: Vec::new(),
             limit: crate::core::MAX_SEARCH_K as u32,
+            limit_implicit: false,
             order_by: Vec::new(),
             offset: 0,
             window_items: Vec::new(),
@@ -1240,6 +1266,7 @@ mod tests {
             &tree,
             &udfs,
             Some(0),
+            0,
             crate::group_by_limits::GroupByLimits::default(),
             crate::result_limits::ResultLimits::default(),
         )
@@ -1253,6 +1280,7 @@ mod tests {
             &tree,
             &udfs,
             Some(crate::core::MAX_SEARCH_K as u32 + 1),
+            0,
             crate::group_by_limits::GroupByLimits::default(),
             crate::result_limits::ResultLimits::default(),
         )
@@ -1268,7 +1296,7 @@ mod tests {
         let schemas: HashMap<String, TableSchema> = HashMap::new();
         let udfs = UdfRegistry::default();
 
-        let err = describe_columns(&schemas, &tree, &udfs, &[], Some(0), &Default::default())
+        let err = describe_columns(&schemas, &tree, &udfs, &[], Some(0), 0, &Default::default())
             .expect_err("LIMIT 0 must be rejected by describe_columns");
         assert_eq!(err.wire_code(), "22000");
 
@@ -1278,6 +1306,7 @@ mod tests {
             &udfs,
             &[],
             Some(crate::core::MAX_SEARCH_K as u32 + 1),
+            0,
             &Default::default(),
         )
         .expect_err("LIMIT over MAX_SEARCH_K must be rejected by describe_columns");
@@ -1300,6 +1329,7 @@ mod tests {
             projection: Projection::Columns(vec!["score".to_string()]),
             where_predicates: Vec::new(),
             limit: crate::core::MAX_SEARCH_K as u32,
+            limit_implicit: false,
             order_by: Vec::new(),
             offset: 0,
             window_items: Vec::new(),
@@ -1469,6 +1499,7 @@ mod tests {
             projection: Projection::Columns(vec!["at".to_string()]),
             where_predicates: Vec::new(),
             limit: crate::core::MAX_SEARCH_K as u32,
+            limit_implicit: false,
             order_by: Vec::new(),
             offset: 0,
             window_items: Vec::new(),
@@ -1545,7 +1576,7 @@ mod tests {
                     SetOperator::Except => 0,
                 };
                 assert_eq!(result.rows.len(), expected, "{op:?} {state}");
-                describe_columns(&schemas, &tree, &udfs, &[], None, &Default::default())
+                describe_columns(&schemas, &tree, &udfs, &[], None, 0, &Default::default())
                     .unwrap_or_else(|e| panic!("describe {op:?} {state}: {e:?}"));
             }
         }

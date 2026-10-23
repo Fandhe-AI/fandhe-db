@@ -8000,6 +8000,12 @@ pub struct BoundScan {
     pub(crate) or_filters: Vec<crate::sql::where_tree::BoundOrGroup>,
     /// `LIMIT` の検証済み値（`1..=core::MAX_SEARCH_K`。[`validate_search_limit`]）。
     pub(crate) limit: usize,
+    /// 暗黙の結果行数上限（Issue #1796・SQL-34）。`LIMIT` 省略・`LIMIT ALL` の文で
+    /// `Some(cap)`（`cap = ResultLimits::max_result_rows()`）。このとき [`Self::limit`] は
+    /// `cap + 1` で、実行段（`sql::scan::execute_scan_with_budget`）が結果の
+    /// `rows.len() > cap` を `54000` で拒否する（黙って切り詰めない）。明示 `LIMIT`・
+    /// [`Self::new`]（NoSQL 表層の直接構築）は `None`。
+    pub(crate) result_cap: Option<usize>,
     /// スカラー列 `ORDER BY`（Issue #915・SQL-25・TASK-209）。SQL テキスト経由の
     /// [`bind_scan`]・[`bind_scan_with_dummy_flags`]、または NoSQL 表層の直接構築
     /// 経路（TASK-186・NOSQL-3）から [`Self::with_order_by`] を呼んだ場合に非空
@@ -8682,6 +8688,7 @@ impl BoundScan {
             expr_filter_programs,
             or_filters: Vec::new(),
             limit,
+            result_cap: None,
             order_exprs: Vec::new(),
             // Issue #915・SQL-25: `Self::new` 単体は既存契約どおり常に空。
             // NoSQL `sort`（NOSQL-15・Issue #946）を付与する場合は呼び出し元が
@@ -8786,6 +8793,11 @@ impl BoundScan {
     /// `LIMIT` 句の値。
     pub fn limit(&self) -> usize {
         self.limit
+    }
+
+    /// 暗黙の結果行数上限（`LIMIT` 省略・`LIMIT ALL` の文のみ `Some`。Issue #1796・SQL-34）。
+    pub(crate) fn result_cap(&self) -> Option<usize> {
+        self.result_cap
     }
 
     /// ウィンドウ項目（SQL-30・TASK-214、Issue #930）。空なら通常の広域取得。
@@ -9234,7 +9246,22 @@ pub(crate) fn bind_scan_with_dummy_flags(
             dummy_equality_flags,
         )?;
 
-    let limit = validate_search_limit_with(stmt.limit(), result_limits)?;
+    // Issue #1796・SQL-34: `LIMIT` 省略・`LIMIT ALL` は範囲検証せず、結果行数上限 + 1 を
+    // 取得上限にして実行段が超過を `54000` にする（明示 `LIMIT` の `22000` 契約は不変）。
+    let (limit, result_cap) = if stmt.limit_implicit {
+        let cap = result_limits.max_result_rows();
+        let fetch = cap
+            .checked_add(1)
+            .ok_or_else(|| SqlSurfaceError::Internal {
+                detail: "result row limit overflows the fetch bound".to_string(),
+            })?;
+        (fetch, Some(cap))
+    } else {
+        (
+            validate_search_limit_with(stmt.limit(), result_limits)?,
+            None,
+        )
+    };
     // Issue #916・SQL-25 (b)・TASK-209: `OFFSET` は `LIMIT` と同じ束縛段で検証する
     // （構文段の許可リストは値の上限を持たない生値のまま通すため）。
     let offset = validate_search_offset(stmt.offset())?;
@@ -9295,6 +9322,7 @@ pub(crate) fn bind_scan_with_dummy_flags(
         expr_filter_programs,
         or_filters,
         limit,
+        result_cap,
         order_by,
         offset,
         windows,

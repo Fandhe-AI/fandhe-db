@@ -1057,7 +1057,32 @@ fn leading_key_is_id(bound: &BoundScan) -> bool {
     matches!(bound.order_by.first(), Some(key) if key.target == BoundOrderTarget::Id)
 }
 
+/// 広域取得の実行入口（`core` の Scan 腕・`DECLARE CURSOR` の内側・COPY の括弧形・
+/// INSERT…SELECT・CTE・ビュー畳み込みが共有する）。実体は
+/// [`execute_scan_with_budget_inner`] で、本関数は `LIMIT` 省略・`LIMIT ALL` の文
+/// （Issue #1796・SQL-34。[`BoundScan::result_cap`] が `Some`）の超過判定を 1 か所に
+/// まとめる: 可視行のみを数えた結果が `cap` を超えたら黙って切り詰めず `54000` で文全体を
+/// 拒否する（件数・テナント・行の内容は含めない固定文言）。`cap + 1` 件に達した時点での
+/// 走査の早期中断は #1797 の範囲。
 pub(crate) fn execute_scan_with_budget(
+    read_txn: &impl crate::storage::read_source::ReadSource,
+    ctx: &PolicyContext,
+    schema: &TableSchema,
+    bound: &BoundScan,
+    max_result_bytes: usize,
+) -> Result<QueryResult, SqlSurfaceError> {
+    let result = execute_scan_with_budget_inner(read_txn, ctx, schema, bound, max_result_bytes)?;
+    if let Some(cap) = bound.result_cap {
+        if result.rows.len() > cap {
+            return Err(SqlSurfaceError::payload_too_large(
+                "result exceeds the row limit",
+            ));
+        }
+    }
+    Ok(result)
+}
+
+fn execute_scan_with_budget_inner(
     read_txn: &impl crate::storage::read_source::ReadSource,
     ctx: &PolicyContext,
     schema: &TableSchema,
@@ -1846,6 +1871,7 @@ mod tests {
 
     fn bound_star_scan(limit: usize) -> BoundScan {
         BoundScan {
+            result_cap: None,
             table: "docs".to_string(),
             projection: vec![
                 ProjectedColumn::Id,
@@ -1987,6 +2013,7 @@ mod tests {
         let read_txn = storage.db().begin_read().expect("begin_read");
 
         let bound = BoundScan {
+            result_cap: None,
             table: "docs".to_string(),
             projection: vec![
                 ProjectedColumn::Id,
@@ -2353,6 +2380,7 @@ mod tests {
         let ctx = PolicyContext::new(tenant_id).expect("valid tenant");
         let read_txn = storage.db().begin_read().expect("begin_read");
         let bound = BoundScan {
+            result_cap: None,
             table: "docs".to_string(),
             projection: vec![ProjectedColumn::Id],
             metadata_filters: Vec::new(),
@@ -2433,6 +2461,7 @@ mod tests {
         let ctx = PolicyContext::new("tenant-a").expect("valid tenant");
         let read_txn = storage.db().begin_read().expect("begin_read");
         let bound = BoundScan {
+            result_cap: None,
             table: "docs".to_string(),
             projection: vec![ProjectedColumn::Id],
             metadata_filters: Vec::new(),
@@ -2514,6 +2543,7 @@ mod tests {
         let ctx = PolicyContext::new("tenant-a").expect("valid tenant");
         let read_txn = storage.db().begin_read().expect("begin_read");
         let bound = BoundScan {
+            result_cap: None,
             table: "docs".to_string(),
             projection: vec![ProjectedColumn::Id],
             metadata_filters: Vec::new(),
@@ -2612,6 +2642,7 @@ mod tests {
         let ctx = PolicyContext::new("tenant-a").expect("valid tenant");
         let read_txn = storage.db().begin_read().expect("begin_read");
         let bound = BoundScan {
+            result_cap: None,
             table: "docs".to_string(),
             projection: vec![
                 ProjectedColumn::Id,
@@ -2682,6 +2713,7 @@ mod tests {
     /// （Cursor Bugbot 指摘の回帰テスト用ヘルパー）。
     fn bound_scan_with_vec_norm_projection(limit: usize) -> BoundScan {
         BoundScan {
+            result_cap: None,
             table: "docs".to_string(),
             projection: vec![
                 ProjectedColumn::Id,
@@ -2762,6 +2794,7 @@ mod tests {
         };
         let program = ExprProgram::compile(&expr);
         let bound = BoundScan {
+            result_cap: None,
             table: "docs".to_string(),
             projection: vec![ProjectedColumn::Id],
             metadata_filters: Vec::new(),
@@ -2839,6 +2872,7 @@ mod tests {
 
         let program = ExprProgram::compile(&expr);
         let bound = BoundScan {
+            result_cap: None,
             table: "docs".to_string(),
             projection: vec![ProjectedColumn::Id],
             metadata_filters: Vec::new(),
@@ -2902,6 +2936,7 @@ mod tests {
         assert!(udf_call::references_embedding(&expr));
 
         let bound = BoundScan {
+            result_cap: None,
             table: "docs".to_string(),
             projection: vec![
                 ProjectedColumn::Id,
@@ -2960,6 +2995,7 @@ mod tests {
             ],
         };
         let bound = BoundScan {
+            result_cap: None,
             table: "docs".to_string(),
             projection: vec![
                 ProjectedColumn::Id,
@@ -3128,6 +3164,7 @@ mod tests {
     fn decode_tier_for_new_type_projection_is_dim_and_scalar() {
         let schema = many_new_scalar_types_schema();
         let bound = BoundScan {
+            result_cap: None,
             table: "docs".to_string(),
             projection: vec![
                 ProjectedColumn::Id,
@@ -3159,6 +3196,7 @@ mod tests {
     fn decode_tier_for_id_only_projection_on_new_type_schema_is_fast() {
         let schema = many_new_scalar_types_schema();
         let bound = BoundScan {
+            result_cap: None,
             table: "docs".to_string(),
             projection: vec![ProjectedColumn::Id],
             metadata_filters: Vec::new(),
@@ -3180,6 +3218,7 @@ mod tests {
     fn decode_tier_for_vector_projection_is_embedding() {
         let schema = many_new_scalar_types_schema();
         let bound = BoundScan {
+            result_cap: None,
             table: "docs".to_string(),
             projection: vec![
                 ProjectedColumn::Id,

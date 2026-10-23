@@ -307,26 +307,44 @@ pub(crate) fn execute_with_limits(
     let order = residual::filter_tuples(order, &tuples, &plan.residual, &sides, &mut budget)?;
 
     match &plan.shape {
-        Shape::Aggregate(agg) => aggregate::run_aggregate(
-            agg,
-            &sides,
-            &tuples,
-            &order,
-            (limit, offset),
-            limits.max_groups,
-            &mut budget,
-        ),
+        Shape::Aggregate(agg) => {
+            let result = aggregate::run_aggregate(
+                agg,
+                &sides,
+                &tuples,
+                &order,
+                (limit, offset),
+                limits.max_groups,
+                &mut budget,
+            )?;
+            // Issue #1796・SQL-34: `LIMIT` 省略・`LIMIT ALL` は OFFSET 適用後の件数が結果行数上限を
+            // 超えたら `54000`（黙って切り詰めない）。
+            if limit.is_none() && result.rows.len() > limits.max_result_rows {
+                return Err(SqlSurfaceError::payload_too_large(
+                    "result exceeds the row limit",
+                ));
+            }
+            Ok(result)
+        }
         Shape::Plain {
             output,
             order: keys,
         } => {
             let order = residual::sort_by_keys(order, &tuples, keys, &sides, &mut budget)?;
-            // 非集計形は構文段が `LIMIT` を必須にしている。
-            let limit = limit.ok_or_else(|| SqlSurfaceError::Internal {
-                detail: "JOIN plain shape without LIMIT".to_string(),
-            })?;
+            // Issue #1796・SQL-34: `LIMIT` 省略・`LIMIT ALL`（`None`）は OFFSET 以降の全件を対象にし、
+            // 行を組み立てる前に件数が結果行数上限を超えるかを判定する（超過は `54000`）。
             let start = offset.min(order.len());
-            let end = start.saturating_add(limit).min(order.len());
+            let end = match limit {
+                Some(n) => start.saturating_add(n).min(order.len()),
+                None => {
+                    if order.len().saturating_sub(start) > limits.max_result_rows {
+                        return Err(SqlSurfaceError::payload_too_large(
+                            "result exceeds the row limit",
+                        ));
+                    }
+                    order.len()
+                }
+            };
             let sliced = order
                 .get(start..end)
                 .ok_or_else(|| SqlSurfaceError::Internal {
