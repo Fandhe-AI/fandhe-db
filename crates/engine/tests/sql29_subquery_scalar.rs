@@ -760,7 +760,7 @@ fn scalar_subquery_stays_rejected_in_non_subquery_contexts() {
 }
 
 /// 述語形 UPDATE／DELETE の WHERE 内スカラーサブクエリは受理され、内側の値で対象行が決まる
-/// （`operation_id` 省略時。`USING OPERATION_ID` 付きは暫定ゲートで `0A000`・副作用なし）。
+/// （`USING OPERATION_ID` 付きも受理し、同一文の再送は `23505`。Issue #2650）。
 #[test]
 fn scalar_subquery_executes_in_predicate_dml() {
     let (core, path) = new_core();
@@ -771,13 +771,6 @@ fn scalar_subquery_executes_in_predicate_dml() {
     ins(&core, &ctx, REFS, 1, &[("qty", "1")]);
     let run = |sql: &str| core.execute_sql_in_session(&ctx, &mut SessionState::default(), sql);
     let all = format!("SELECT id FROM {ITEMS} WHERE qty >= 0 LIMIT 100");
-
-    let err = run(&format!(
-        "DELETE FROM {ITEMS} WHERE qty = (SELECT qty FROM {REFS} LIMIT 1) USING OPERATION_ID 'd1'"
-    ))
-    .expect_err("gated with OPERATION_ID");
-    assert_eq!(err.wire_code(), "0A000", "{err:?}");
-    assert_eq!(ids(&core, &ctx, &all), vec![1, 2]);
 
     run(&format!(
         "UPDATE {ITEMS} SET name = 'x' WHERE qty = (SELECT qty FROM {REFS} LIMIT 1)"
@@ -796,6 +789,15 @@ fn scalar_subquery_executes_in_predicate_dml() {
     ))
     .expect("delete executes");
     assert_eq!(ids(&core, &ctx, &all), vec![2]);
+    ins(&core, &ctx, ITEMS, 3, &[("qty", "1")]);
+    // op 付きで実行して該当行を消し、再送は 23505（内側の結果に左右されない）。
+    let op_del = format!(
+        "DELETE FROM {ITEMS} WHERE qty = (SELECT qty FROM {REFS} LIMIT 1) USING OPERATION_ID 'd1'"
+    );
+    run(&op_del).expect("executes with OPERATION_ID");
+    assert_eq!(ids(&core, &ctx, &all), vec![2]);
+    let err = run(&op_del).expect_err("resend");
+    assert_eq!(err.wire_code(), "23505", "{err:?}");
 }
 
 /// Issue #2270 回帰（PR #2463 レビュー指摘）: 非 0 scale の numeric 投影を DOUBLE／BIGINT 列の
