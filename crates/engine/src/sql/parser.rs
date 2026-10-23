@@ -6575,6 +6575,10 @@ pub(crate) struct BoundGroupBy {
     /// 常に `0`。[`BoundAggregate::new_grouped`]（TASK-186・NOSQL-5）は本 Issue の
     /// 対象外のため `0` 固定（NoSQL 表層の offset 写像は #947・NOSQL-15 の管轄）。
     pub(crate) offset: usize,
+    /// `LIMIT` 省略・`LIMIT ALL` の結果行数上限 `cap`（Issue #1797・SQL-34）。束縛段は上限を
+    /// 知らないため既定 `None`。呼び出し段（`core`）が [`BoundAggregate::with_result_cap`] で
+    /// 設定し、HAVING なしのときだけ新規グループ追加時に `offset + cap` 超過で中断する。
+    pub(crate) result_cap: Option<usize>,
 }
 
 impl BoundGroupBy {
@@ -6629,6 +6633,18 @@ pub struct BoundAggregate {
 }
 
 impl BoundAggregate {
+    /// `LIMIT` 省略・`LIMIT ALL` の `GROUP BY`／`SELECT DISTINCT` に呼び出し段の結果行数上限
+    /// `cap` を設定する（Issue #1797。`core` の主経路・カーソル内側・ビュー外側が束縛直後に
+    /// 呼ぶ。明示 `LIMIT` つき・`GROUP BY` なしは変更しない）。
+    pub(crate) fn with_result_cap(mut self, cap: usize) -> Self {
+        if let Some(g) = self.group_by.as_mut() {
+            if g.limit.is_none() {
+                g.result_cap = Some(cap);
+            }
+        }
+        self
+    }
+
     /// クレート外から `BoundAggregate` を直接構築する constructor（TASK-186・
     /// NOSQL-4。SQL テキストの構文解析・[`crate::sql::allowlist::validate_sql`]
     /// を経由せずに束縛済み実行計画を組み立てる入口。[`BoundScan::new`] と同じ
@@ -6927,6 +6943,7 @@ impl BoundAggregate {
                 order_by: Vec::new(),
                 limit: None,
                 offset: 0,
+                result_cap: None,
             }),
         })
     }
@@ -9714,6 +9731,7 @@ fn bind_group_by_clause(
         order_by,
         limit,
         offset,
+        result_cap: None,
     })
 }
 

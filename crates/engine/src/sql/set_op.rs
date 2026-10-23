@@ -919,9 +919,7 @@ pub(crate) fn execute_with_budget_and_result_limits(
             // OFFSET を先に適用し、読み飛ばし後の件数で判定する。
             let remaining = outcome.rows.len().saturating_sub(validated_offset);
             if remaining > result_limits.max_result_rows() {
-                return Err(SqlSurfaceError::payload_too_large(
-                    "result exceeds the row limit",
-                ));
+                return Err(crate::sql::scan::row_limit_exceeded());
             }
             outcome.rows.into_iter().skip(validated_offset).collect()
         }

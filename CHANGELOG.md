@@ -9,6 +9,9 @@
 
 ### Added
 
+- `LIMIT` 省略・`LIMIT ALL` の結果行数上限超過（`54000`）を、`cap + 1` 件目の確定時点で走査・結合・集約を中断して返す（Issue #1797・SQL-34）。
+  広域取得・ウィンドウ・HAVING なしの `GROUP BY`／`SELECT DISTINCT`・残余述語なしの JOIN が対象で、上限を超える行は保持しない。
+  エラーコードと文言は変わらない。
 - 行を返す SELECT で `LIMIT` の省略・`LIMIT ALL`・`OFFSET` 単独を受理する（Issue #1796・SQL-34）。広域取得・
   スカラー `ORDER BY`・ウィンドウ・JOIN・`GROUP BY`／`SELECT DISTINCT`・集合演算全体・ビュー参照・CTE の主クエリが対象。
   可視結果が結果行数上限（`--max-result-rows`・既定 10,000）を超えたら黙って切り詰めず `54000` で文全体を拒否する。

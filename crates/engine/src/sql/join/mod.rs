@@ -303,7 +303,14 @@ pub(crate) fn execute_with_limits(
         sides.push(result.rows);
     }
 
-    let (tuples, order) = exec::run_joins(&sides, &plan.steps, &mut budget, limits)?;
+    // Issue #1797・SQL-34: 非集計形・`LIMIT` 省略・残余述語なしのときに限り、最終段の一致ペアが
+    // `offset + cap` を超えた時点で結合を中断できる（残余述語・集計で件数が減りうる形は
+    // 完了後判定のまま）。
+    let final_stop = match (&plan.shape, limit, plan.residual.is_empty()) {
+        (Shape::Plain { .. }, None, true) => offset.checked_add(limits.max_result_rows),
+        _ => None,
+    };
+    let (tuples, order) = exec::run_joins(&sides, &plan.steps, &mut budget, limits, final_stop)?;
     let order = residual::filter_tuples(order, &tuples, &plan.residual, &sides, &mut budget)?;
 
     match &plan.shape {
@@ -320,9 +327,7 @@ pub(crate) fn execute_with_limits(
             // Issue #1796・SQL-34: `LIMIT` 省略・`LIMIT ALL` は OFFSET 適用後の件数が結果行数上限を
             // 超えたら `54000`（黙って切り詰めない）。
             if limit.is_none() && result.rows.len() > limits.max_result_rows {
-                return Err(SqlSurfaceError::payload_too_large(
-                    "result exceeds the row limit",
-                ));
+                return Err(crate::sql::scan::row_limit_exceeded());
             }
             Ok(result)
         }
@@ -330,20 +335,18 @@ pub(crate) fn execute_with_limits(
             output,
             order: keys,
         } => {
+            // Issue #1797: 件数判定（`LIMIT` 省略）は並べ替え・行組み立ての前に行う。
+            if limit.is_none() && order.len().saturating_sub(offset) > limits.max_result_rows {
+                return Err(crate::sql::scan::row_limit_exceeded());
+            }
             let order = residual::sort_by_keys(order, &tuples, keys, &sides, &mut budget)?;
             // Issue #1796・SQL-34: `LIMIT` 省略・`LIMIT ALL`（`None`）は OFFSET 以降の全件を対象にし、
             // 行を組み立てる前に件数が結果行数上限を超えるかを判定する（超過は `54000`）。
             let start = offset.min(order.len());
             let end = match limit {
                 Some(n) => start.saturating_add(n).min(order.len()),
-                None => {
-                    if order.len().saturating_sub(start) > limits.max_result_rows {
-                        return Err(SqlSurfaceError::payload_too_large(
-                            "result exceeds the row limit",
-                        ));
-                    }
-                    order.len()
-                }
+                // 件数超過は上のソート前判定で拒否済み。
+                None => order.len(),
             };
             let sliced = order
                 .get(start..end)

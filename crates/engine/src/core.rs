@@ -3106,9 +3106,7 @@ impl EngineCore {
         cap: usize,
     ) -> Result<crate::sql::exec::QueryResult, crate::sql::allowlist::SqlSurfaceError> {
         if result.rows.len() > cap {
-            return Err(crate::sql::allowlist::SqlSurfaceError::payload_too_large(
-                "result exceeds the row limit",
-            ));
+            return Err(crate::sql::scan::row_limit_exceeded());
         }
         Ok(result)
     }
@@ -7402,7 +7400,8 @@ impl EngineCore {
         }
         if let crate::sql::allowlist::Statement::Aggregate(validated) = inner {
             let schema = table_schema_in(read_txn, &validated.table_name)?;
-            let bound = crate::sql::parser::bind_aggregate(validated, &schema, session.udfs())?;
+            let bound = crate::sql::parser::bind_aggregate(validated, &schema, session.udfs())?
+                .with_result_cap(self.result_limits.max_result_rows());
             let result =
                 self.run_aggregate_plan(read_txn, ctx, &schema, &bound, max_result_bytes)?;
             let result = Self::enforce_group_result_cap(validated, result, &self.result_limits)?;
@@ -8907,7 +8906,8 @@ impl EngineCore {
                     &mut subquery_in_value_budget,
                 )?;
                 let bound =
-                    crate::sql::parser::bind_aggregate(&validated, &schema, session.udfs())?;
+                    crate::sql::parser::bind_aggregate(&validated, &schema, session.udfs())?
+                        .with_result_cap(limits.max_result_rows());
                 let result = self.run_aggregate_plan(
                     read_txn,
                     ctx,
