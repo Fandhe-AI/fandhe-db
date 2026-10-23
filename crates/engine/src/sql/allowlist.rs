@@ -22045,6 +22045,15 @@ mod tests {
             ("CREATE INDEX i ON t ((SELECT 1))", "0A000"),
             ("CREATE INDEX i ON t ((a IN (SELECT b FROM u)))", "0A000"),
             ("CREATE INDEX i ON t ((unnest(a)))", "0A000"),
+            // IS [NOT] DISTINCT FROM は部分索引の述語では対象外（fail-closed）。
+            (
+                "CREATE INDEX i ON t (a) WHERE a IS DISTINCT FROM NULL",
+                "0A000",
+            ),
+            (
+                "CREATE INDEX i ON t (a) WHERE a IS NOT DISTINCT FROM 1",
+                "0A000",
+            ),
             // 構文: 括弧で式がちょうど終わらない形・関数呼び出し形の後置は 42601。
             ("CREATE INDEX i ON t ((a) + 1)", "42601"),
             ("CREATE INDEX i ON t (lower(a) + 1)", "42601"),

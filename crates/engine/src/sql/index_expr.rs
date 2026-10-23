@@ -317,10 +317,15 @@ pub(crate) fn check_index_expression_determinism(
         Expr::Coalesce(items) | Expr::ArrayConstructor(items) => items
             .iter()
             .try_for_each(|e| check_index_expression_determinism(e, site)),
-        Expr::NullIf(a, b) | Expr::IsDistinctFrom { lhs: a, rhs: b, .. } => {
+        Expr::NullIf(a, b) => {
             check_index_expression_determinism(a, site)?;
             check_index_expression_determinism(b, site)
         }
+        // `IS [NOT] DISTINCT FROM` は索引の式・述語では対象外（fail-closed。設計文書の対象外節）。
+        Expr::IsDistinctFrom { .. } => Err(SqlSurfaceError::FeatureNotSupported {
+            detail: "IS [NOT] DISTINCT FROM is not supported in an index expression or predicate"
+                .to_string(),
+        }),
         Expr::Collate { expr, .. } | Expr::Cast { expr, .. } => {
             check_index_expression_determinism(expr, site)
         }
