@@ -7489,7 +7489,19 @@ fn bind_string_agg_free_order_key(
             });
         }
     }
-    let (bound, ty) = crate::sql::udf_call::bind_order_expr(&k.expr, schema, udfs, node_budget)?;
+    // 裸の `NULL` 定数は型未確定のため `bind_order_expr` が拒否する。全行 NULL の同値キーとして
+    // 束縛し、値・区切り引数との一致の有無で受理可否が変わらないようにする。
+    let (bound, ty) = if matches!(k.expr, Expr::Null) {
+        *node_budget = node_budget
+            .checked_sub(1)
+            .ok_or_else(|| SqlSurfaceError::payload_too_large("expression is too large"))?;
+        (
+            crate::sql::udf_call::BoundExpr::Null,
+            crate::sql::udf_call::ExprType::Scalar,
+        )
+    } else {
+        crate::sql::udf_call::bind_order_expr(&k.expr, schema, udfs, node_budget)?
+    };
     let kind = order_kind_for_expr_type(ty)?;
     let program = crate::sql::expr_program::ExprProgram::compile(&bound);
     Ok(StringAggOrderKey {

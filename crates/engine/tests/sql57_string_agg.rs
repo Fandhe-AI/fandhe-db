@@ -738,3 +738,21 @@ fn views_scope_string_agg_columns_and_keep_results() {
     let c = code_of(&core, "SELECT string_agg(g, ',') FROM vb");
     assert!(c == "42601" || c == "0A000", "{c}");
 }
+
+/// PR #2671 レビュー対応: 集計内 `ORDER BY NULL` は引数との一致の有無によらず受理される
+/// （全行同値キー。順序は不定なので要素の多重集合で比較する）。
+#[test]
+fn order_by_null_constant_is_accepted_with_and_without_matching_argument() {
+    let (core, path) = build_core("sql57-order-null");
+    let _g = CleanupGuard(path);
+    // 値引数と一致しない場合。
+    let r = one(&core, "SELECT string_agg(s, ',' ORDER BY NULL) FROM t").expect("non-null");
+    let mut parts: Vec<&str> = r.split(',').collect();
+    parts.sort_unstable();
+    assert_eq!(parts, vec!["w", "x", "x", "x", "y", "z"]);
+    // 値引数と一致する場合（全行 NULL の値は集計から外れ結果は NULL）。
+    assert_eq!(
+        one(&core, "SELECT string_agg(NULL, ',' ORDER BY NULL) FROM t"),
+        None
+    );
+}
