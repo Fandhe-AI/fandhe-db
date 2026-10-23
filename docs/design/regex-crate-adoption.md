@@ -1,7 +1,7 @@
 # ADR: 正規表現エンジンとしての regex クレート導入（承認資料）
 
-- ステータス: Proposed（オーナー承認待ち。自動運転で作成したため承認は未取得）
-  - **承認が記録されるまで #1786・#1787・#1788 および #1784 の `like_regex` 結線は着手しない**（第 8 節）
+- ステータス: Accepted（2026-10-23 オーナー承認。範囲は第 9 節）
+  - 承認前は #1786・#1787・#1788 および #1784 の `like_regex` 結線に着手しない運用だった（第 8 節）
 - 対応: Issue #1785（親 #1784。後続は #1786 → #1787 → #1788）
 - 関連ビヘイビア: SQL-55（親は TABLE-25 も。エスケープ不正は ERR-6）。ポインタ: `docs/spec/04-behavior/`。本文は転記しない（[spec-confidentiality](../../.claude/rules/spec-confidentiality.md)）
 - 関連コード: `crates/engine/src/json/jsonpath/parser.rs`・`eval.rs`（`like_regex` を構文解析後に `0A000` で拒否）、`crates/engine/src/error_format.rs`（`2201B` の `ErrorClass` は未定義）
@@ -104,3 +104,4 @@ PG の構文に関する記述は PostgreSQL 公式ドキュメント（POSIX Re
 
 - 2026-10-23: 自動運転（implement-issue-tree）で作成。オーナー承認は代筆できないためステータスを Proposed とした。**承認は未取得**
 - 承認後の手順: オーナーが Issue #1785 にコメントで承認 → ステータスを Accepted に変更し、承認日・承認範囲（第 4 節の決定事項の番号）・コメントへのリンクを本節に追記する。承認済みと事実以上に書かない
+- 2026-10-23: オーナーが [Issue #1785 のコメント](https://github.com/Fandhe-AI/fandhe-db/issues/1785#issuecomment-6366408726)で承認し、ステータスを Accepted とした。承認範囲は `regex = "=1.13.1"` の直接依存 1 行と、第 4 節の決定事項 1〜5 の推奨案（1: 非 optional、2: default features、3: 案 b、4: 上限超過は `54000`、5: 範囲外の変更は再承認）
