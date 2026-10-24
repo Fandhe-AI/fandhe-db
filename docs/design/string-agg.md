@@ -16,7 +16,7 @@
 Issue 本文は「集計内 `ORDER BY` の既存経路へ接続する」としていたが、既存の `ORDER BY` はすべて
 文レベル（結果行の並べ替え）で、集計の内側の並べ替えは存在しなかった。このため構文・束縛・比較器の
 部品（`parse_order_nulls`・`bind_order_column_at`・`bind_order_expr`・`order_value`）を再利用して新設した。
-後続の `array_agg`（#1801）が同じ仕組みを使えるよう、`AggregateItem` には汎用の拡張フィールド
+後続の `array_agg`（#1801。[array-agg.md](array-agg.md)）が同じ仕組みを使えるよう、`AggregateItem` には汎用の拡張フィールド
 （`extra_args`・`order_by`）を置いた。
 
 ## 決定

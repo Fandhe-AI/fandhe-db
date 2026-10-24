@@ -348,7 +348,7 @@ fn where_compare_op_token(token: &Token) -> Option<CompareOp> {
 pub(crate) fn is_aggregate_function_name(name: &str) -> bool {
     matches!(
         name.to_ascii_uppercase().as_str(),
-        "COUNT" | "SUM" | "AVG" | "MIN" | "MAX" | "STRING_AGG"
+        "COUNT" | "SUM" | "AVG" | "MIN" | "MAX" | "STRING_AGG" | "ARRAY_AGG"
     )
 }
 
@@ -3092,6 +3092,10 @@ pub enum AggregateFunc {
     /// `string_agg(<値>, <区切り> [ORDER BY ...])`（SQL-57・Issue #1800）。結果は常に text。
     /// 集計の内側の `ORDER BY`・`DISTINCT` を受理する唯一の関数（SQL 表層のみ）。
     StringAgg,
+    /// `array_agg([DISTINCT] <式> [ORDER BY ...])`（SQL-57・Issue #1801）。結果は入力の型の
+    /// 1 次元配列（NULL 入力は NULL 要素・入力なしは NULL）。内側の `ORDER BY`・`DISTINCT` を
+    /// 受理する（SQL 表層のみ。`string_agg` と同じ仕組みを共有する）。
+    ArrayAgg,
 }
 
 impl AggregateFunc {
@@ -3104,6 +3108,7 @@ impl AggregateFunc {
             "MIN" => Some(AggregateFunc::Min),
             "MAX" => Some(AggregateFunc::Max),
             "STRING_AGG" => Some(AggregateFunc::StringAgg),
+            "ARRAY_AGG" => Some(AggregateFunc::ArrayAgg),
             _ => None,
         }
     }
@@ -3117,6 +3122,7 @@ impl AggregateFunc {
             AggregateFunc::Min => "min",
             AggregateFunc::Max => "max",
             AggregateFunc::StringAgg => "string_agg",
+            AggregateFunc::ArrayAgg => "array_agg",
         }
     }
 }
@@ -5978,24 +5984,40 @@ impl<'a> Parser<'a> {
         // でない場合は消費しない）。
         // `string_agg` の引数位置に限り、`DISTINCT` 直後の文字列リテラル・`(` も修飾子と判定する
         // （`string_agg(DISTINCT 'x', ',')`・`DISTINCT ('x')`。PostgreSQL と同じ読み）。
-        let string_agg_modifier = func == AggregateFunc::StringAgg
-            && matches!(
-                self.tokens.get(self.pos),
-                Some(Token::Ident(n)) if n.eq_ignore_ascii_case("DISTINCT")
-            )
-            && matches!(
-                self.tokens.get(self.pos + 1),
-                Some(Token::StringLiteral(_)) | Some(Token::Punct('('))
-            );
+        // `array_agg` は数値リテラルも同じ読み（`array_agg(DISTINCT 1)`。SQL-57・Issue #1801）。
+        let at_distinct = matches!(
+            self.tokens.get(self.pos),
+            Some(Token::Ident(n)) if n.eq_ignore_ascii_case("DISTINCT")
+        );
+        let after_distinct = self.tokens.get(self.pos + 1);
+        let string_agg_modifier = at_distinct
+            && match func {
+                AggregateFunc::StringAgg => matches!(
+                    after_distinct,
+                    Some(Token::StringLiteral(_)) | Some(Token::Punct('('))
+                ),
+                AggregateFunc::ArrayAgg => matches!(
+                    after_distinct,
+                    Some(Token::StringLiteral(_))
+                        | Some(Token::Punct('('))
+                        | Some(Token::Number(_))
+                ),
+                _ => false,
+            };
         let distinct = if string_agg_modifier || is_distinct_modifier(&self.tokens, self.pos) {
             self.advance();
             true
         } else {
             false
         };
-        if distinct && !matches!(func, AggregateFunc::Count | AggregateFunc::StringAgg) {
+        if distinct
+            && !matches!(
+                func,
+                AggregateFunc::Count | AggregateFunc::StringAgg | AggregateFunc::ArrayAgg
+            )
+        {
             return Err(SqlSurfaceError::unsupported(
-                "DISTINCT is only allowed inside COUNT(DISTINCT ...) and string_agg",
+                "DISTINCT is only allowed inside COUNT(DISTINCT ...), string_agg and array_agg",
             ));
         }
         let arg = if matches!(self.peek(), Some(Token::Punct('*'))) {
@@ -6022,7 +6044,8 @@ impl<'a> Parser<'a> {
             self.allow_unary_minus = false;
             // `string_agg` の引数位置は text と確定するため、裸の `NULL` をリテラルとして解析する。
             let saved_null = self.allow_null_literal;
-            self.allow_null_literal = func == AggregateFunc::StringAgg;
+            self.allow_null_literal =
+                matches!(func, AggregateFunc::StringAgg | AggregateFunc::ArrayAgg);
             let parsed = self.parse_value_expr(0);
             self.allow_null_literal = saved_null;
             self.allow_unary_minus = saved_minus;
@@ -6053,6 +6076,18 @@ impl<'a> Parser<'a> {
             if matches!(self.peek(), Some(Token::Punct(','))) {
                 return Err(SqlSurfaceError::undefined_function(
                     "function string_agg requires exactly two arguments",
+                ));
+            }
+            if matches!(self.peek(), Some(Token::Keyword(Keyword::Order))) {
+                order_by = self.parse_in_aggregate_order_by()?;
+            }
+        }
+        if func == AggregateFunc::ArrayAgg {
+            // `array_agg(<式> [ORDER BY ...])`（SQL-57・Issue #1801）。引数が 2 つ以上の形は
+            // 該当シグネチャの関数が無い扱い（`42883`。`string_agg` と同じ）。
+            if matches!(self.peek(), Some(Token::Punct(','))) {
+                return Err(SqlSurfaceError::undefined_function(
+                    "function array_agg requires exactly one argument",
                 ));
             }
             if matches!(self.peek(), Some(Token::Keyword(Keyword::Order))) {
@@ -14174,8 +14209,8 @@ fn check_body_aggregate(
     for item in &v.items {
         match item {
             AggregateSelectItem::Aggregate(agg) => {
-                // `string_agg`（SQL-57）はビュー本体には含めさせない（fail-closed）。
-                if agg.func == AggregateFunc::StringAgg {
+                // `string_agg`・`array_agg`（SQL-57）はビュー本体には含めさせない（fail-closed）。
+                if matches!(agg.func, AggregateFunc::StringAgg | AggregateFunc::ArrayAgg) {
                     return Err(body_form_unsupported());
                 }
                 if let AggregateArg::Expr(e) = &agg.arg {
@@ -17605,6 +17640,12 @@ fn parse_join_aggregate_item(p: &mut Parser<'_>) -> Result<JoinSelectItem, SqlSu
             detail: "string_agg is not supported in JOIN".to_string(),
         });
     }
+    // `array_agg` も同じ理由で JOIN は対象外（SQL-57・Issue #1801）。
+    if func == AggregateFunc::ArrayAgg {
+        return Err(SqlSurfaceError::FeatureNotSupported {
+            detail: "array_agg is not supported in JOIN".to_string(),
+        });
+    }
     p.expect_punct('(')?;
     if p.peek_ident_matches("DISTINCT") {
         return Err(SqlSurfaceError::unsupported(
@@ -19714,7 +19755,7 @@ fn aggregate_statement_from_resolved(
             match item {
                 AggregateSelectItem::Aggregate(agg) => {
                     // `string_agg`（SQL-57）は評価後射影形ビューの外側では評価しない（fail-closed）。
-                    if agg.func == AggregateFunc::StringAgg {
+                    if matches!(agg.func, AggregateFunc::StringAgg | AggregateFunc::ArrayAgg) {
                         return Err(SqlSurfaceError::unsupported(
                             "aggregate over a view with an aggregate/LIMIT body supports only column arguments",
                         ));
@@ -28752,6 +28793,55 @@ mod tests {
         );
         assert!(is_aggregate_function_name("String_Agg"));
     }
+    /// SQL-57・Issue #1801: `array_agg` の構文。1 引数・`DISTINCT`・内側 `ORDER BY`（複数キー・
+    /// 方向・NULL 位置）が AST に載り、数値リテラル・括弧式の前の `DISTINCT` も修飾子と読まれる。
+    #[test]
+    fn array_agg_parses_distinct_and_inner_order_by() {
+        let lookup = catalog_with(&["documents"]);
+        let agg = expect_aggregate(
+            "SELECT array_agg(DISTINCT a ORDER BY a DESC NULLS LAST), ARRAY_AGG(b) AS xs, \
+             array_agg(DISTINCT 1), array_agg(DISTINCT ('x')) FROM documents",
+            &lookup,
+        );
+        let first = expect_agg_item(&agg.items()[0]);
+        assert_eq!(first.func, AggregateFunc::ArrayAgg);
+        assert!(first.distinct);
+        assert!(first.extra_args.is_empty());
+        assert_eq!(first.order_by.len(), 1);
+        assert!(first.order_by[0].descending);
+        assert_eq!(first.order_by[0].nulls, Some(NullPlacement::Last));
+        let second = expect_agg_item(&agg.items()[1]);
+        assert!(!second.distinct);
+        assert!(second.order_by.is_empty());
+        assert_eq!(second.alias.as_deref(), Some("xs"));
+        assert_eq!(second.func.default_alias(), "array_agg");
+        assert!(expect_agg_item(&agg.items()[2]).distinct);
+        assert!(expect_agg_item(&agg.items()[3]).distinct);
+        // 列名 `distinct` を引数に取る形は維持する。
+        let agg = expect_aggregate("SELECT array_agg(distinct) FROM documents", &lookup);
+        assert!(!expect_agg_item(&agg.items()[0]).distinct);
+    }
+
+    /// SQL-57・Issue #1801: 引数の個数違いは `42883`（2 引数以上）・`42601`（0 引数・`*`）、
+    /// キー数の超過は確保前に `54000`。他の集計へ内側 `ORDER BY`・`DISTINCT` を広げない。
+    #[test]
+    fn array_agg_rejects_malformed_shapes_fail_closed() {
+        let lookup = catalog_with(&["documents"]);
+        let code = |sql: &str| validate_sql(sql, &lookup).expect_err(sql).wire_code();
+        assert_eq!(code("SELECT array_agg(a, b) FROM documents"), "42883");
+        assert_eq!(code("SELECT array_agg() FROM documents"), "42601");
+        assert_eq!(code("SELECT array_agg(*) FROM documents"), "42601");
+        assert_eq!(code("SELECT min(a ORDER BY a) FROM documents"), "42601");
+        let keys = ["a"; MAX_SCALAR_ORDER_KEYS + 1].join(", ");
+        assert_eq!(
+            code(&format!(
+                "SELECT array_agg(a ORDER BY {keys}) FROM documents"
+            )),
+            "54000"
+        );
+        assert!(is_aggregate_function_name("Array_Agg"));
+    }
+
     /// Issue #1541（SQL-42 (5) のポインタ）: 集計呼び出しの直後の算術演算子で集計式項目になり、
     /// 式中の集計呼び出しは内部名へ置換されて `aggregates` に出現順で抽出される。
     #[test]

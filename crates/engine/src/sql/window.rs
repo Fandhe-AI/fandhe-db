@@ -941,7 +941,7 @@ fn decode_tier_for_window(schema: &TableSchema, bound: &BoundScan) -> (DecodeTie
                 has_scalar_reference = true;
             }
             // `string_agg` はウィンドウ関数ではない（`WindowFunc::from_name` が拒否済み）。
-            Some(AggregateInput::StringAgg(_)) => {
+            Some(AggregateInput::StringAgg(_) | AggregateInput::ArrayAgg(_)) => {
                 has_scalar_reference = true;
             }
         }
@@ -1142,7 +1142,9 @@ fn extract_window_input(
         }
         // 構文段（`Parser::parse_window_item`）が裸の列参照・`*` のみを受理する
         // ため到達しない。
-        AggregateInput::ScalarExpr { .. } | AggregateInput::StringAgg(_) => {
+        AggregateInput::ScalarExpr { .. }
+        | AggregateInput::StringAgg(_)
+        | AggregateInput::ArrayAgg(_) => {
             return Err(window_bug(
                 "window aggregate input unexpectedly carries a compound expression",
             ))
