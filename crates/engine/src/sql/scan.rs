@@ -482,6 +482,10 @@ fn with_visible_row<T>(
     where_expr_scratch: &mut Vec<StackValue>,
     build: impl FnOnce(u32, &[Option<row_codec::ScalarRef<'_>>], &[f32]) -> Result<T, SqlSurfaceError>,
 ) -> Result<Option<T>, SqlSurfaceError> {
+    // Issue #1798: 協調的中断の確認点。全走査経路（順序なし・経路 (A)・(B) の両パス・PK 点検索・
+    // GIN 候補）が 1 行ごとに必ず通る単一の入口に置き、切断などで中断が確定した後に
+    // 後続行（毒行を含む）の RLS・WHERE 評価へ進まない。commit 前の読み取り経路のみ。
+    crate::interrupt::check()?;
     // RLS 段（無条件・デコード前）。`sql::aggregate::execute_aggregate` の
     // 走査ループと同一の順序（security.md P0「テナント境界」）。
     let (tenant_id, visibility, offset) =

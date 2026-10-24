@@ -109,21 +109,25 @@ pub(crate) fn delete_rows_where_partitioned_unchecked<E>(
     fixed_time: Option<i64>,
     predicate: impl FnMut(&DmlCandidate<'_>) -> Result<bool, E>,
 ) -> Result<PartitionedDmlOutcome, PartitionedDmlFailure<E>> {
-    run_partitioned(
-        storage,
-        table,
-        ctx,
-        ledger_write,
-        content_hash_value,
-        expected_schema,
-        needs_embedding,
-        limits,
-        max_affected_total,
-        fixed_time,
-        Kind::Delete,
-        predicate,
-        &mut Hooks::production(),
-    )
+    // Issue #1798: チャンク commit 後に 57014 を返すと SQL-32／SQL-71 (4) の契約（commit 済みなら
+    // `VD001`）とずれるため、ジョブ全体を協調的中断の対象外にする（statement_timeout は #1950）。
+    crate::interrupt::suppressed(|| {
+        run_partitioned(
+            storage,
+            table,
+            ctx,
+            ledger_write,
+            content_hash_value,
+            expected_schema,
+            needs_embedding,
+            limits,
+            max_affected_total,
+            fixed_time,
+            Kind::Delete,
+            predicate,
+            &mut Hooks::production(),
+        )
+    })
 }
 
 /// 述語形 `UPDATE` の分割実行入口（`core.rs` の分割実行 form から呼ばれる）。UPDATE は
@@ -147,24 +151,28 @@ pub(crate) fn update_rows_where_partitioned_unchecked<E>(
     fixed_time: Option<i64>,
     predicate: impl FnMut(&DmlCandidate<'_>) -> Result<bool, E>,
 ) -> Result<PartitionedDmlOutcome, PartitionedDmlFailure<E>> {
-    run_partitioned(
-        storage,
-        table,
-        ctx,
-        ledger_write,
-        content_hash_value,
-        expected_schema,
-        needs_embedding,
-        limits,
-        max_affected_total,
-        fixed_time,
-        Kind::Update {
-            assignments,
-            set_exprs,
-        },
-        predicate,
-        &mut Hooks::production(),
-    )
+    // Issue #1798: チャンク commit 後に 57014 を返すと SQL-32／SQL-71 (4) の契約（commit 済みなら
+    // `VD001`）とずれるため、ジョブ全体を協調的中断の対象外にする（statement_timeout は #1950）。
+    crate::interrupt::suppressed(|| {
+        run_partitioned(
+            storage,
+            table,
+            ctx,
+            ledger_write,
+            content_hash_value,
+            expected_schema,
+            needs_embedding,
+            limits,
+            max_affected_total,
+            fixed_time,
+            Kind::Update {
+                assignments,
+                set_exprs,
+            },
+            predicate,
+            &mut Hooks::production(),
+        )
+    })
 }
 
 /// 実行種別。

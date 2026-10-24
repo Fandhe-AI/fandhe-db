@@ -1651,6 +1651,9 @@ pub(crate) fn execute_grouped_aggregate(
                 let (key_tenant, id) = k.value();
                 let buf = v.value();
 
+                // Issue #1798: 協調的中断の確認点（commit 前の読み取りループ）。
+                crate::interrupt::check()?;
+
                 // RLS 段（無条件・デコード前）: `aggregate.rs` の単一行経路と同一順序。
                 // `offset` は本体デコードの再開位置（Issue #349: ヘッダの二重デコード
                 // 排除。`aggregate.rs::execute_aggregate` のドキュメント参照）。
