@@ -142,6 +142,9 @@ struct ResultBudget {
     per_group_bytes: usize,
     /// グループ数の上限（Issue #1550。既定は [`MAX_GROUPS`]。起動時設定で下げられる）。
     max_groups: usize,
+    /// 結果行数上限の早期中断閾値 `offset + cap`（Issue #1797。`result_cap` が `Some` かつ
+    /// HAVING なしのときだけ `Some`。HAVING はグループ確定後に評価するため早期確定できない）。
+    max_result_groups: Option<usize>,
 }
 
 impl ResultBudget {
@@ -166,10 +169,17 @@ impl ResultBudget {
             .ok_or_else(|| {
                 SqlSurfaceError::payload_too_large(TEXT_BUDGET_ACCOUNTING_OVERFLOW_DETAIL)
             })?;
+        let max_result_groups = match bound.group_by.as_ref() {
+            Some(g) if g.having.is_empty() && g.having_exprs.is_empty() => {
+                crate::sql::scan::early_stop_threshold(g.result_cap, g.offset)?
+            }
+            _ => None,
+        };
         Ok(Self {
             max_result_bytes,
             per_group_bytes,
             max_groups,
+            max_result_groups,
         })
     }
 
@@ -452,6 +462,10 @@ fn check_new_group_budget(
     total_text_accumulator_bytes: usize,
     budget: &ResultBudget,
 ) -> Result<(), SqlSurfaceError> {
+    // Issue #1797・SQL-34: `cap + 1` 件目のグループ（OFFSET 適用後）が確定した時点で中断する。
+    if matches!(budget.max_result_groups, Some(m) if current_group_count >= m) {
+        return Err(crate::sql::scan::row_limit_exceeded());
+    }
     if current_group_count >= budget.max_groups {
         return Err(SqlSurfaceError::payload_too_large(
             "GROUP BY result exceeds the allowed number of groups",
@@ -2847,6 +2861,7 @@ mod tests {
                 order_by: Vec::new(),
                 limit: None,
                 offset: 0,
+                result_cap: None,
             }),
         }
     }
@@ -2997,6 +3012,7 @@ mod tests {
                 order_by: Vec::new(),
                 limit: None,
                 offset: 0,
+                result_cap: None,
             }),
         }
     }
@@ -3361,6 +3377,7 @@ mod tests {
             max_groups: MAX_GROUPS,
             max_result_bytes: 1_000,
             per_group_bytes: 16,
+            max_result_groups: None,
         };
         let long = "x".repeat(400);
         let mut held = 0usize;
@@ -3468,6 +3485,7 @@ mod tests {
                 order_by: Vec::new(),
                 limit: None,
                 offset: 0,
+                result_cap: None,
             }),
         }
     }

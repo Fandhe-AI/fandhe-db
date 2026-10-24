@@ -10,7 +10,8 @@
 //! 実行する。
 //!
 //! 1. **materialize 段**（[`materialize_rows`]）: 対象テーブルを 1 回、`LIMIT` に
-//!    よる早期終了なしで走査し、可視かつ `WHERE` を満たす行**全体**について
+//!    よる早期終了なし（結果行数上限 `result_cap` の超過確定時のみ `54000` で中断。
+//!    Issue #1797）で走査し、可視かつ `WHERE` を満たす行**全体**について
 //!    ウィンドウ項目ごとの `PARTITION BY`／`ORDER BY` キー・集計引数の値を集める。
 //!    RLS 適用順序（ヘッダのみで可視性判定 → TABLE-12 のキー/ヘッダ tenant 整合
 //!    検査 → 必要範囲のみのデコード → SCALAR 段〔`WHERE`〕→ 可視性の再適用）は
@@ -387,7 +388,8 @@ fn compute_output_order(
     Ok(Some(order))
 }
 
-/// 対象テーブルを 1 回、`LIMIT` による早期終了なしで走査し、可視かつ `WHERE` を
+/// 対象テーブルを 1 回、`LIMIT` による早期終了なし（`result_cap` 超過確定時のみ `54000` で中断。
+/// Issue #1797）で走査し、可視かつ `WHERE` を
 /// 満たす行**全体**について [`MaterializedRow`] を集める（§モジュールドキュメント
 /// 「materialize 段」参照）。`state_cap` は [`MAX_WINDOW_STATE_BYTES`] 相当の上限
 /// （本体は常にその定数を渡す。単体テストが小さい cap を注入できるよう引数化した。
@@ -429,6 +431,8 @@ fn materialize_rows(
     let mut materialized: Vec<MaterializedRow> = Vec::new();
     let mut tenants: Vec<String> = Vec::new();
     let mut seq: usize = 0;
+    let stop_threshold =
+        crate::sql::scan::early_stop_threshold(bound.result_cap(), bound.offset())?;
     let mut state_bytes: usize = 0;
     let mut partition_counts: Vec<HashMap<Vec<u8>, usize>> =
         vec![HashMap::new(); bound.windows().len()];
@@ -532,6 +536,13 @@ fn materialize_rows(
             // defense-in-depth（`sql::scan` と同趣旨）。
             if !ctx.is_visible(tenant_id, visibility) {
                 continue;
+            }
+
+            // Issue #1797・SQL-34: ウィンドウ関数は行数を減らさないため、可視かつ WHERE 一致の
+            // 行が `offset + cap` を超えた時点で `cap + 1` 件目が確定する。状態予算の計上・
+            // キー抽出の前に拒否し、以降の走査を止める。
+            if matches!(stop_threshold, Some(t) if materialized.len() >= t) {
+                return Err(crate::sql::scan::row_limit_exceeded());
             }
 
             state_bytes = try_accumulate_state_budget(
