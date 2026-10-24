@@ -525,3 +525,24 @@ fn cursor_fetch_statements_still_parse() {
         );
     }
 }
+
+/// GROUP BY の `WITH TIES` も、同値グループ追加後の件数に実行時の `ResultLimits` を適用する
+/// （超過は黙って返さず `54000`。Issue #1793 のレビュー対応）。
+#[test]
+fn with_ties_on_group_by_respects_result_limits() {
+    // lang ごとの COUNT(*) は ja・en・fr がすべて 3 で、先頭 1 件の同値で 3 グループになる。
+    let sql =
+        "SELECT lang, COUNT(*) AS c FROM docs GROUP BY lang ORDER BY c FETCH FIRST 1 ROW WITH TIES";
+    let (core, _g) = build("sql56f-ties-group-cap", Some(ResultLimits::new(2)));
+    assert_eq!(code(&core, &ctx_for("tenant-a"), sql), "54000");
+    let (core3, _g3) = build("sql56f-ties-group-cap3", Some(ResultLimits::new(3)));
+    assert_eq!(run(&core3, &ctx_for("tenant-a"), sql).rows.len(), 3);
+}
+
+/// スカラー `ORDER BY` の `WITH TIES` も同値行追加後に `ResultLimits` で `54000` になる。
+#[test]
+fn with_ties_on_scalar_respects_result_limits() {
+    let sql = "SELECT id FROM docs ORDER BY n DESC NULLS LAST FETCH FIRST 1 ROW WITH TIES";
+    let (core, _g) = build("sql56f-ties-scalar-cap", Some(ResultLimits::new(2)));
+    assert_eq!(code(&core, &ctx_for("tenant-a"), sql), "54000");
+}

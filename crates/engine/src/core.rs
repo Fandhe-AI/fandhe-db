@@ -3122,7 +3122,9 @@ impl EngineCore {
         limits: &crate::result_limits::ResultLimits,
     ) -> Result<crate::sql::exec::QueryResult, crate::sql::allowlist::SqlSurfaceError> {
         match &validated.group_by {
-            Some(g) if g.limit.is_none() => {
+            // `WITH TIES` は同値グループの追加で `LIMIT` を超えうるため、明示件数でも設定上限を
+            // 適用する（超過は黙って切り詰めず `54000`。Issue #1793）。
+            Some(g) if g.limit.is_none() || g.with_ties => {
                 Self::enforce_result_cap(result, limits.max_result_rows())
             }
             _ => Ok(result),
