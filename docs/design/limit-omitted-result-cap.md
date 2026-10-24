@@ -23,7 +23,7 @@
   - `INSERT ... SELECT` の `LIMIT cap + 1` 注入（[insert-select.md](insert-select.md)）
   - CTAS／MATERIALIZED VIEW（`core/ctas_exec.rs`・`core/matview_exec.rs`）
 - 計数は、最終結果件数の下限が確定した時点（`cap + 1` 件そろった時点）で走査・結合を中断する。ただし中断してよいのは、後続の処理で件数が減らない経路に限る（次項）。上限を超える行は保持しない。走査停止の実装と境界テストは #1797 が担う
-- `cap` の算出法は経路間で揃っていない（COPY は設定値そのまま、`INSERT ... SELECT`・matview は `min(cap, HARD_CAP - 1)`）。LIMIT 省略の読み取り経路は **COPY 方式（設定値 `cap` そのもの、`cap + 1` で取得）** に揃える。書き込み系の統一は #2212 で完了（末尾「insert-select.md」の「Issue #2212 追記」参照）。注入形のみハード上限で 99,999 へ丸める差分が残り、ここでは元の記述を維持る
+- `cap` の算出法は経路間で揃っていない（COPY は設定値そのまま、`INSERT ... SELECT`・matview は `min(cap, HARD_CAP - 1)`）。LIMIT 省略の読み取り経路は **COPY 方式（設定値 `cap` そのもの、`cap + 1` で取得）** に揃える。書き込み系の統一は #2212 で完了（末尾「insert-select.md」の「Issue #2212 追記」参照）。注入形のみハード上限で 99,999 へ丸める差分が残り、ここでは元の記述を維持する
   - 申し送り: `cap = 100,000` のとき `cap + 1` が下流の固定上限（`hybrid::MAX_POOL_DEPTH`・`MAX_SET_OP_ROWS`・`storage::MAX_SCAN_TOTAL_ROWS`・JOIN の行数上限）にかからないか、経路ごとに確認する
 - ORDER BY（スカラー）・JOIN・ウィンドウは、全行を見ないと順序は確定しないが、行数は後続処理で減らない。「可視かつ一致する結果行が `cap + 1` 件に達した時点で超過は確定する」ので、ソートの完了を待たず中断してよい
 - 早期中断（超過確定）は、最終結果件数の下限が確定する経路だけに限る。走査途中の暫定件数が、後続行の到着で減りうる経路では、暫定件数で超過を確定してはならない
