@@ -186,7 +186,7 @@
 //! 一本化し、`EngineCore::with_join_limits` へ 1 回だけ注入する
 //! （`docs/design/join-limits-cli.md`）。
 //!
-//! `--max-result-rows`（Issue #1555。SQL-34・SQL-46）: 明示 `LIMIT` の範囲上限
+//! `--max-result-rows`（Issue #1555・#2211。SQL-34・SQL-46）: 明示 `LIMIT` の範囲上限と `LIMIT` 省略時の結果行数上限
 //! （`1`〜`100000`・既定 10000）を、プロセス全体に対して起動時に**上げ下げ両方向**へ設定できる
 //! opt-in 注入点（未指定は従来の 10000 と同値＝挙動不変）。走査・kNN の `LIMIT k`・`FETCH n`・
 //! 集合演算全体／JOIN 文の `LIMIT`・NoSQL の `limit` の範囲判定にだけ効き、超過は従来どおり
