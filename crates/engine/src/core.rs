@@ -75,6 +75,9 @@ mod matview_exec;
 // INSERT ... SELECT の実行本体（SQL-51・Issue #1733）。
 mod insert_select_exec;
 
+// 書き込み・実体化の入力 SELECT の行数上限（SQL-34・Issue #2212）。
+mod write_input_cap;
+
 // UPDATE ... FROM／DELETE ... USING の束縛と実行腕（SQL-53 (b)・Issue #1754。実行は #1755 以降）。
 mod dml_from_exec;
 
@@ -5460,10 +5463,8 @@ impl EngineCore {
                 if crate::sql::allowlist::has_top_level_limit(&inner_tokens) {
                     return Err(first_err);
                 }
-                let fetch = self
-                    .insert_select_row_cap()
-                    .checked_add(1)
-                    .and_then(|n| u32::try_from(n).ok())
+                let fetch = u32::try_from(self.write_input_cap_injected()?.fetch)
+                    .ok()
                     .ok_or_else(|| SqlSurfaceError::Internal {
                         detail: "internal error".to_string(),
                     })?;

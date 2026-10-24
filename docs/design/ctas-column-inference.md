@@ -91,5 +91,5 @@ redb の単一 commit が保証する）。CTAS が作る表は FK・DEFAULT・S
 
 ### 上限
 
-- 入力側の判定は `ctas_input_row_limit`／`check_ctas_input_rows` の 1 か所に集約した（#2212 が `INSERT ... SELECT` 等と統一する際の置き換え点）。値は `--max-result-rows` 由来
+- 入力側の判定は `ctas_input_row_limit`／`check_ctas_input_rows` の 1 か所に集約した（算出は `INSERT ... SELECT`・matview と共有の `write_input_cap`〔`core/write_input_cap.rs`〕を呼ぶ。#2212）。値は `--max-result-rows` 由来
 - 内側の `LIMIT` は `--max-result-rows` 以下に制限されるため、実体化後の入力側 `54000` は多重防御として残る。書き込み側は `check_insert_row_count_limit` と INDEX-4 のバッチ上限で、どちらも書き込みの前に判定する

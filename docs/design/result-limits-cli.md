@@ -32,6 +32,7 @@
 | 集合演算全体の `LIMIT`・JOIN 文の `LIMIT`・評価後射影形ビューの外側 `LIMIT` | 効く |
 | `USING PLAN` の前段検証（LLM 呼び出しより前に拒否） | 効く |
 | NoSQL（HTTP）`search`／`scan`／`explain` の `limit` | 効く |
+| 書き込み・実体化の入力行数（`INSERT ... SELECT`・CTAS・MATERIALIZED VIEW・COPY TO。超過は `54000`。Issue #2212） | 効く（評価後射影形 matview 本文の暗黙上限は既定値と `cap + 1` の大きい方） |
 | `OFFSET` の範囲（`0..=10000`） | 連動しない |
 | 集合演算の枝 `LIMIT`・サブクエリ／CTE／ビュー本文内側の `LIMIT` | 連動しない（既定の 10,000 のまま。各々の行数上限が別軸で有界） |
 | 集計（`GROUP BY`）の `LIMIT` 範囲 | 連動しない |

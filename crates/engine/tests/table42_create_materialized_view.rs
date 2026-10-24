@@ -461,8 +461,8 @@ fn row_limit_at_the_hard_cap_still_creates() {
     let (storage, _p, _g) = open_storage("t42-limit-cap");
     let core = EngineCore::from_storage(storage, Box::new(CpuScalarProvider))
         .with_result_limits(ResultLimits::new(usize::MAX));
-    // 上限をハード上限に設定しても作成は成功する（8 行は上限未満。内部の取得上限は +1 で
-    // ハード上限を超えないよう 1 つ手前に丸めている）。
+    // 上限をハード上限に設定しても作成は成功する（8 行は上限未満。注入しない形は設定値そのもの、
+    // 注入する形は +1 がハード上限を超えないよう 1 つ手前へ丸める。#2212）。
     create_ok(
         &core,
         "CREATE MATERIALIZED VIEW mv_c AS SELECT body FROM docs",
@@ -800,4 +800,25 @@ fn aggregate_result_columns_roundtrip_through_the_entity() {
         };
         assert_matches_direct_for(&core, &mv_sql, &direct_sql);
     }
+}
+
+// 対象ビヘイビア: SQL-34・TABLE-42（Issue #2212）。評価後射影形（GROUP BY・LIMIT 省略）の本文も
+// `--max-result-rows` に従う。alice の可視行は 5 件で、上限ちょうどは成功し、1 つ下げると 54000 で何も残らない。
+#[test]
+fn buffered_body_follows_the_setting() {
+    let sql = "CREATE MATERIALIZED VIEW mv_b AS SELECT body, COUNT(*) AS n FROM docs GROUP BY body";
+    let (storage, _p, _g) = open_storage("t42-buf-ok");
+    let core = EngineCore::from_storage(storage, Box::new(CpuScalarProvider))
+        .with_result_limits(ResultLimits::new(5));
+    let outcome = create_ok(&core, sql);
+    assert_eq!(tag_rows(&outcome), (false, true, Some(5)));
+
+    let (storage, _p, _g2) = open_storage("t42-buf-over");
+    let core = EngineCore::from_storage(storage, Box::new(CpuScalarProvider))
+        .with_result_limits(ResultLimits::new(4));
+    assert_eq!(create_err(&core, sql), "54000");
+    assert_eq!(
+        err_code(&core, "alice", "SELECT body FROM mv_b LIMIT 1"),
+        "42P01"
+    );
 }
