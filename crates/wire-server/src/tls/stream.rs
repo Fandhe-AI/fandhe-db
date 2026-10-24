@@ -384,6 +384,11 @@ impl<S: WireStream> WireStream for TlsStream<S> {
     fn tls_server_end_point(&self) -> Option<&[u8]> {
         self.session.tls_server_end_point()
     }
+
+    fn liveness_probe_socket(&self) -> Option<std::net::TcpStream> {
+        // peek だけに使うため TLS レコードは触らない。下層の複製をそのまま借りる。
+        self.inner.liveness_probe_socket()
+    }
 }
 
 #[cfg(test)]

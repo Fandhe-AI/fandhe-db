@@ -557,6 +557,9 @@ fn post_auth_loop<'e, S: WireStream>(
     let base_timeout = stream.read_timeout()?;
     // COPY が接続本来のタイムアウトを引けるようにする（poll 値へ変更中でも）。
     let _base_timeout_guard = framing::ConnectionBaseTimeoutGuard::set(base_timeout);
+    // Issue #1798: 実行中の文が切断を検出して中断できるよう、切断検出用のソケット複製を
+    // 接続ごとに 1 回だけ取る（メッセージごとの dup を避ける）。取れない接続は検出なし。
+    let probe_sock = stream.liveness_probe_socket().map(std::rc::Rc::new);
     let mut applied_timeout = base_timeout;
     loop {
         let type_byte =
@@ -748,6 +751,9 @@ fn post_auth_loop<'e, S: WireStream>(
                 // 同じ fail-closed 分岐（`0A000`）へ倒す。
                 match (engine, txn.as_mut()) {
                     (Some(engine), Some(txn)) => {
+                        // Issue #1798: この Query（COPY のサブプロトコルを含む）の実行中だけ
+                        // 切断検出の中断スコープを有効にする。
+                        let _interrupt = crate::liveness::install(probe_sock.as_ref());
                         // Issue #1175: `COPY`（WIRE-17）を含むすべての 'Q' 本文を
                         // `execute_and_respond` へ委譲する。COPY の判定・状態検査・
                         // サブプロトコルは文単位で `simple_query::run_copy_statement`
@@ -881,6 +887,8 @@ fn post_auth_loop<'e, S: WireStream>(
             // `Some` の場合は engine 未接続と同じ fail-closed 分岐へ倒す。
             b'E' => match (engine, txn.as_mut()) {
                 (Some(engine), Some(txn)) => {
+                    // Issue #1798: この Execute の実行中だけ切断検出の中断スコープを有効にする。
+                    let _interrupt = crate::liveness::install(probe_sock.as_ref());
                     match crate::extended_query::handle_execute(
                         stream, engine, ctx, session, txn, extended,
                     )? {

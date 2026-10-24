@@ -308,7 +308,7 @@ fn query_as_alice(addr: SocketAddr, body: &[u8]) -> HttpResponse {
 /// `status.rs::EXPECTED`（`#[cfg(test)]` 内で外部から参照不可）と同値の
 /// 期待表。両者の乖離は [`err4_projection_table_is_closed_over_all_error_classes`]
 /// が `http_status` 経由で検出する。
-const EXPECTED_STATUS: [(&str, u16); 78] = [
+const EXPECTED_STATUS: [(&str, u16); 79] = [
     ("22000", 400),
     ("22001", 400),
     ("22012", 400),
@@ -416,6 +416,7 @@ const EXPECTED_STATUS: [(&str, u16); 78] = [
     ("22034", 400),
     ("22035", 400),
     ("2203F", 400),
+    ("57014", 503),
     // `UntranslatableCharacter`（`22P05`。Issue #2185）: jsonpath リテラルの NUL 文字。400。
     ("22P05", 400),
     // `InvalidEscapeSequence`（`22025`。Issue #1779）: LIKE の不正エスケープ。400。
@@ -522,7 +523,7 @@ fn assert_projected_as(resp: &HttpResponse, expected_class: ErrorClass) {
 
 // --- R7: 射影表が ErrorClass::ALL 全体を閉じて覆うことの機械検証 -----------
 
-const _: () = assert!(ErrorClass::ALL.len() == 81);
+const _: () = assert!(ErrorClass::ALL.len() == 82);
 
 /// `wire_code` を共有する分類と、逆引き（`from_wire_code`）が返す分類の組
 /// （ERR-6。`23502`: TABLE-16・TASK-204・Issue #904、`23505`: Issue #1180）。
@@ -1057,6 +1058,9 @@ fn err4_f_unreachable_classes_project_via_production_encoder() {
         ErrorClass::BadCopyFileFormat,
         // `InvalidRegularExpression`（`2201B`。Issue #1786）: 正規表現マッチャ専用で NoSQL 表層からは到達不能。
         ErrorClass::InvalidRegularExpression,
+        // `QueryCanceled`（`57014`。Issue #1798）: 接続スレッドの切断検出による中断で、NoSQL（HTTP）表層からは
+        // 現状到達不能（statement_timeout の導入〔#1951〕で到達しうる）。
+        ErrorClass::QueryCanceled,
         // （`IntervalFieldOverflow`〔`22015`〕は Issue #1583 で NoSQL の INTERVAL 型束縛から
         // 到達可能になったため外した。固定は `err4_f_interval_field_overflow_reachable_via_nosql_insert`
         // が担う）

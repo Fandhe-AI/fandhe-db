@@ -88,6 +88,16 @@ pub trait WireStream: Read + Write {
     fn tls_server_end_point(&self) -> Option<&[u8]> {
         None
     }
+
+    /// 実行中の文がクライアント切断を検出するための生ソケット複製
+    /// （[`crate::liveness`]・Issue #1798）。peek するだけで、TLS 接続でも
+    /// 下層の TCP ソケットの複製を返す（レコードの読み書きはしない）。
+    ///
+    /// 既定実装は `None`（切断検出なし。既存の `WireStream` 実装を壊さないための
+    /// 互換維持で、検出不能な接続は従来どおり中断されない）。
+    fn liveness_probe_socket(&self) -> Option<TcpStream> {
+        None
+    }
 }
 
 impl WireStream for TcpStream {
@@ -124,5 +134,9 @@ impl WireStream for TcpStream {
         // 平文接続は TLS を経由しないため、構造的にチャネルバインディング
         // 値を持たない。
         None
+    }
+
+    fn liveness_probe_socket(&self) -> Option<TcpStream> {
+        self.try_clone().ok()
     }
 }
