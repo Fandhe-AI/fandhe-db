@@ -287,16 +287,16 @@ fn max_rows_splits_result_without_reexecuting() {
     let (kind, _) = read_message(&mut stream);
     assert_eq!(kind, b's');
 
-    // 3 回目: 残り 1 行 + CommandComplete（再実行なし）。タグは今回バッチの
-    // 件数（1）ではなく portal 全体の累計送出行数（2+2+1=5）から組み立てる
-    // （PostgreSQL の契約。PR #1013 レビュー指摘・P1）。
+    // 3 回目: 残り 1 行 + CommandComplete（再実行なし）。タグはその回の Execute で
+    // 送った件数（1）から組み立てる（PostgreSQL 17 の `PortalRun`。pquery.c の
+    // `qc->nprocessed = nprocessed`。累計ではない。Issue #1798 で是正）。
     send_length_prefixed_message(&mut stream, b'E', &execute_body("p1", 2));
     let (kind, body) = read_message(&mut stream);
     assert_eq!(kind, b'D');
     all_ids.push(body);
     let (kind, tag) = read_message(&mut stream);
     assert_eq!(kind, b'C');
-    assert_eq!(String::from_utf8_lossy(&tag[..tag.len() - 1]), "SELECT 5");
+    assert_eq!(String::from_utf8_lossy(&tag[..tag.len() - 1]), "SELECT 1");
 
     assert_eq!(all_ids.len(), 5, "no duplicate or missing rows");
     let mut dedup = all_ids.clone();
@@ -1383,4 +1383,37 @@ fn post_commit_suspended_bytes_overflow_carries_may_be_committed_detail() {
     let _row = read_data_row(&mut stream);
     let _tag = read_command_complete(&mut stream);
     read_ready_for_query(&mut stream);
+}
+
+/// Issue #1798（WIRE-11）: 残り行が `max_rows` ちょうどで尽きる回も PostgreSQL 17 では
+/// `PortalSuspended` で終え（pquery.c `PortalRunSelect` の `atEnd` は
+/// `nprocessed < count` のときだけ立つ）、次の Execute が 0 行と `SELECT 0` を返す。
+#[test]
+fn max_rows_exact_boundary_suspends_then_completes_with_zero_rows() {
+    let (core, _guard) = new_core_with_documents_table();
+    seed_rows(&core, 4);
+    let users_path = write_user_store_file(&[("alice", "tenant-a", "correct-horse")]);
+    let addr = spawn_server_with_engine(&users_path, Arc::clone(&core));
+    let mut stream = tcp_connect(addr);
+
+    let sql = "SELECT id FROM documents ORDER BY embedding <=> '[0.1,0.2,0.3]' LIMIT 4";
+    parse_and_bind(&mut stream, "s1", "p1", sql);
+
+    for _ in 0..2 {
+        send_length_prefixed_message(&mut stream, b'E', &execute_body("p1", 2));
+        for _ in 0..2 {
+            let (kind, _) = read_message(&mut stream);
+            assert_eq!(kind, b'D');
+        }
+        let (kind, _) = read_message(&mut stream);
+        assert_eq!(
+            kind, b's',
+            "exact exhaustion still ends with PortalSuspended"
+        );
+    }
+
+    send_length_prefixed_message(&mut stream, b'E', &execute_body("p1", 2));
+    let (kind, tag) = read_message(&mut stream);
+    assert_eq!(kind, b'C', "no DataRow remains");
+    assert_eq!(String::from_utf8_lossy(&tag[..tag.len() - 1]), "SELECT 0");
 }
