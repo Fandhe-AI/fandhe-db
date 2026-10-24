@@ -2,7 +2,7 @@
 
 ## ステータス・対象
 
-- ステータス: 採用（設計記録。#1796 で構文・計画への接続、#1797 で上限付き実体化の早期中断を実装済み。#1798 は未着手）
+- ステータス: 採用（設計記録。#1796 で構文・計画への接続、#1797 で上限付き実体化の早期中断を実装済み。#1798 は未着手。#2211 で境界テストと記述を整合）
 - ポインタ: SQL-34・SQL-15・WIRE-15・ERR-6（spec 本文は転記しない）
 - 対象: `LIMIT` 省略・`LIMIT ALL` の SELECT を「全件実体化 + 結果行数上限の超過でエラー」で受理するときの、上限判定の位置・超過時の SQLSTATE・カーソルとの関係・広域取得 Scan の走査上限との関係
 - 先行: [result-limits-cli.md](result-limits-cli.md)（Issue #1555。フラグ `--max-result-rows`・`ResultLimits` を本 ADR が再利用する）
@@ -126,3 +126,12 @@
 - 多層防御: `execute_scan_with_budget` 入口の事後判定と既存のバイト予算は残す
 - テスト: `crates/engine/tests/sql1797_early_stop.rs`。物理順で先頭に `cap + 1` 件の一致行、末尾に WHERE 評価で `22012` となる行を置き、中断していれば `54000`、走査を続ければ `22012` になることで停止を判定する
 - 未実施: 協調的キャンセル（engine のキャンセルフラグと `57014`）と、保持量の件数観測カウンタ（feature `test-sync-points`）。キャンセルは wire の CancelRequest／切断監視と結線して初めて意味を持つため #1798／#1950 で導入する
+
+## 実装メモ（Issue #2211）
+
+- 位置づけ: フラグ `--max-result-rows` の追加・検証・LIMIT 省略時への接続は #1555・#1796・#1797 で実装済み。#2211 は受け入れ条件の検証（テスト）と記述の整合のみで、実装コードの挙動は変えない
+- 既定の境界（wire 層）: `crates/wire-server/tests/wire_result_rows_cap.rs`。`with_result_limits` を呼ばない構成で、10,000 行は成功、10,001 行は simple・extended（`max_rows = 0`）とも `54000` で DataRow 0 件、接続は維持される
+- 上げた側の境界: `crates/engine/tests/sql34_result_rows_raised_cap.rs`。cap 10,001 で省略・`LIMIT ALL` の ちょうど成功と +1 の `54000`、明示 `LIMIT` は設定値まで受理
+- D1 の申し送り（ハード上限）: cap 100,000 で取得上限 100,001 を設定しても、走査上限（`storage::MAX_SCAN_TOTAL_ROWS`）・可視行上限（`tenant::MAX_VISIBLE_ROWS`）に先に当たらず、100,000 行ちょうどは成功（順序なし・`ORDER BY`）、100,001 行は `54000` になることをテストで確認した。修正は不要
+- 別軸の上限: 集合演算の枝・全体は `MAX_SET_OP_ROWS`（10,000 固定）、`GROUP BY` は `MAX_GROUPS`、JOIN は出力行数上限が先に効く。本フラグとは連動させない（result-limits-cli.md D7・SQL-46 (6)）。現行挙動をテストで固定した
+- 申し送り: サブクエリ内側・派生テーブル・CTE 本文・ビュー本文の省略は #1852・#1853、書き込み・実体化の入力は #2212、`max_rows` 分割送出・キャンセルは #1798、距離 `ORDER BY`・`USING PLAN` は #2242

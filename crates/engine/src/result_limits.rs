@@ -10,12 +10,13 @@
 //!
 //! - 既定値は従来のコンパイル時定数と同値（10,000）で、フラグ未指定なら挙動不変。
 //!   上げ下げ両方向に設定でき、ハード上限は [`MAX_RESULT_ROWS_HARD_CAP`]。
-//! - 設定値は文の `LIMIT`（走査・kNN の `LIMIT k`・`FETCH n`・集合演算全体の `LIMIT`・
-//!   JOIN 文の `LIMIT`・`USING PLAN` 前段検証・NoSQL の `limit`）の範囲判定にだけ効く。
+//! - 設定値は明示 `LIMIT`（走査・kNN の `LIMIT k`・`FETCH n`・集合演算全体の `LIMIT`・
+//!   JOIN 文の `LIMIT`・`USING PLAN` 前段検証・NoSQL の `limit`）の範囲判定と、`LIMIT` 省略・
+//!   `LIMIT ALL` の SELECT の結果行数上限（超過は `54000`。Issue #1796・#2211）にだけ効く。
 //!   `OFFSET`・集合演算の枝行数・サブクエリ内側行数などの他上限とは連動させない
 //!   （SQL-46 (6)）。
-//! - 後続の結果行数上限（LIMIT 省略時の `54000`）も同じフラグ・同じ
-//!   `EngineCore::result_limits()` を参照する想定。
+//! - `LIMIT` 省略時の結果行数上限（`54000`）も同じフラグ・同じ
+//!   `EngineCore::result_limits()` を参照する（`docs/design/limit-omitted-result-cap.md`）。
 
 /// 明示 `LIMIT` 上限の既定値（従来の `core::MAX_SEARCH_K` と同値）。
 pub const DEFAULT_MAX_RESULT_ROWS: usize = 10_000;
