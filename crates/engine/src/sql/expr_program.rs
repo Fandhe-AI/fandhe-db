@@ -585,6 +585,7 @@ fn try_fold_scalar(expr: &BoundExpr) -> Option<FoldedConst> {
         | BoundExpr::JsonPredicate { .. }
         | BoundExpr::JsonModify { .. }
         | BoundExpr::IsDistinctFrom { .. }
+        | BoundExpr::RegexMatch { .. }
         | BoundExpr::Like { .. }
         | BoundExpr::NullIf { .. } => None,
     }
@@ -726,6 +727,8 @@ fn compile_node(
         // `IS [NOT] DISTINCT FROM`（SQL-54。Issue #1783）は NULL 判定を先に行う専用評価の
         // ため、段コンパイルせず木評価（`udf_call::eval_with_scalars`）へ委ねる。
         | BoundExpr::IsDistinctFrom { .. }
+        // 正規表現マッチ（SQL-55。Issue #1787）はコンパイル済みマッチャを持つため同様に木評価へ委ねる。
+        | BoundExpr::RegexMatch { .. }
         // 式左辺の `LIKE`（SQL-54。Issue #1782）も同様に木評価へ委ねる。
         | BoundExpr::Like { .. } => {
             steps.push(ExprStep::JsonSubtree(Box::new(expr.clone())));

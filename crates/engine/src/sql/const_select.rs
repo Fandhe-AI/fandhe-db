@@ -215,7 +215,11 @@ fn reject_non_constant_with(expr: &Expr, allow_placeholders: bool) -> Result<(),
         Expr::Coalesce(args) => args
             .iter()
             .try_for_each(|a| reject_non_constant_with(a, allow_placeholders)),
-        Expr::NullIf(lhs, rhs) | Expr::IsDistinctFrom { lhs, rhs, .. } => {
+        Expr::NullIf(lhs, rhs)
+        | Expr::IsDistinctFrom { lhs, rhs, .. }
+        | Expr::RegexMatch {
+            lhs, pattern: rhs, ..
+        } => {
             reject_non_constant_with(lhs, allow_placeholders)?;
             reject_non_constant_with(rhs, allow_placeholders)
         }
@@ -269,9 +273,11 @@ fn expr_uses_schema_fn(expr: &Expr) -> bool {
                 || else_result.as_deref().is_some_and(expr_uses_schema_fn)
         }
         Expr::Coalesce(args) => args.iter().any(expr_uses_schema_fn),
-        Expr::NullIf(lhs, rhs) | Expr::IsDistinctFrom { lhs, rhs, .. } => {
-            expr_uses_schema_fn(lhs) || expr_uses_schema_fn(rhs)
-        }
+        Expr::NullIf(lhs, rhs)
+        | Expr::IsDistinctFrom { lhs, rhs, .. }
+        | Expr::RegexMatch {
+            lhs, pattern: rhs, ..
+        } => expr_uses_schema_fn(lhs) || expr_uses_schema_fn(rhs),
     }
 }
 
@@ -416,6 +422,13 @@ fn bind_aggregate_call(
     registry: &UdfRegistry,
     budget: &mut usize,
 ) -> Result<(BoundAggArg, ColumnType), SqlSurfaceError> {
+    // `string_agg` の FROM なし集計は SQL-57 の対象外（2 引数・内側 ORDER BY の束縛・実行を
+    // この経路へ持ち込まない。fail-closed で明示的に拒否する）。
+    if agg.func == AggregateFunc::StringAgg {
+        return Err(SqlSurfaceError::FeatureNotSupported {
+            detail: "string_agg without FROM is not supported".to_string(),
+        });
+    }
     let (arg, arg_ty) = match &agg.arg {
         AggregateArg::Star => (BoundAggArg::Star, None),
         AggregateArg::Expr(Expr::Number(raw)) => {

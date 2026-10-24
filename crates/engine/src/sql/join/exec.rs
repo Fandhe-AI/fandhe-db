@@ -94,11 +94,16 @@ fn extract_key(
 }
 
 /// 結合連鎖を実行し、決定的な順序に並べたタプル列（実体＋順序の置換）を返す。
+///
+/// `final_stop`（Issue #1797・SQL-34）は最終段の一致ペア数がこの値を超えたら `54000` で
+/// 中断する閾値（`offset + cap`）。残余述語・集計・重複除去で後段の件数が減りうる場合は
+/// 呼び出し元が `None` を渡す（完了後判定に倒す）。
 pub(super) fn run_joins(
     sides: &[Vec<ResultRow>],
     steps: &[StepPlan],
     budget: &mut JoinBudget,
     limits: &JoinLimits,
+    final_stop: Option<usize>,
 ) -> Result<(Tuples, Vec<u32>), SqlSurfaceError> {
     let n = sides.len();
     let first = sides.first().ok_or_else(|| SqlSurfaceError::Internal {
@@ -121,7 +126,12 @@ pub(super) fn run_joins(
             .ok_or_else(|| SqlSurfaceError::Internal {
                 detail: "JOIN relation index out of range".to_string(),
             })?;
-        acc = join_step(sides, step, new_rel, new_rows, &acc, budget, limits)?;
+        let stop = if k + 1 == steps.len() {
+            final_stop
+        } else {
+            None
+        };
+        acc = join_step(sides, step, new_rel, new_rows, &acc, budget, limits, stop)?;
     }
 
     budget.charge(
@@ -164,6 +174,8 @@ fn push_charged_pair(
 
 /// 1 段のハッシュ結合。`acc`（relation 0..=k の結合結果）に relation `new_rel` を
 /// 加える。新 relation 側をビルド側にし、蓄積タプルをプローブする。
+// `run_joins` からのみ呼ばれる内部関数。最終段の停止閾値（Issue #1797）を足して引数が 8 個になった。
+#[allow(clippy::too_many_arguments)]
 fn join_step(
     sides: &[Vec<ResultRow>],
     step: &StepPlan,
@@ -172,6 +184,7 @@ fn join_step(
     acc: &Tuples,
     budget: &mut JoinBudget,
     limits: &JoinLimits,
+    stop_after_pairs: Option<usize>,
 ) -> Result<Tuples, SqlSurfaceError> {
     let n = acc.n;
     let mut table: HashMap<Vec<u8>, Vec<u32>> = HashMap::new();
@@ -241,6 +254,11 @@ fn join_step(
                     return Err(SqlSurfaceError::payload_too_large(
                         "JOIN result exceeds the row limit",
                     ));
+                }
+                // Issue #1797: 最終段の一致ペアが `offset + cap` を超えたら、以降のプローブ・
+                // 実体化を行わず拒否する（保存側の NULL 補完行は件数を増やすのみ）。
+                if matches!(stop_after_pairs, Some(t) if pairs.len() > t) {
+                    return Err(crate::sql::scan::row_limit_exceeded());
                 }
             }
         }

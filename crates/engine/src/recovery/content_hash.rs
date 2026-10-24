@@ -1503,6 +1503,11 @@ fn push_token(b: &mut HashInputBuilder, t: &crate::sql::lexer::Token) -> Result<
         }
         Token::QualifiedStar { qualifier } => push_token_str(b, 28, qualifier)?,
         Token::QuotedNull(s) => push_token_str(b, 29, s)?,
+        // 正規表現マッチ演算子（SQL-55・Issue #1787）。既存タグと衝突しない 30 以降を割り当てる。
+        Token::RegexMatch => b.push_u8(30),
+        Token::RegexMatchCi => b.push_u8(31),
+        Token::RegexNotMatch => b.push_u8(32),
+        Token::RegexNotMatchCi => b.push_u8(33),
         Token::Param(_) => {
             return Err(StorageError::Codec(
                 "content hash: unbound parameter placeholder".to_string(),
@@ -2552,7 +2557,11 @@ fn collect_referenced_udfs(
             }
             Ok(())
         }
-        Expr::NullIf(lhs, rhs) | Expr::IsDistinctFrom { lhs, rhs, .. } => {
+        Expr::NullIf(lhs, rhs)
+        | Expr::IsDistinctFrom { lhs, rhs, .. }
+        | Expr::RegexMatch {
+            lhs, pattern: rhs, ..
+        } => {
             collect_referenced_udfs(lhs, udf_registry, out)?;
             collect_referenced_udfs(rhs, udf_registry, out)
         }
@@ -2654,6 +2663,9 @@ fn push_set_expr(
             Expr::Binary { lhs, rhs, .. }
             | Expr::NullIf(lhs, rhs)
             | Expr::IsDistinctFrom { lhs, rhs, .. }
+            | Expr::RegexMatch {
+                lhs, pattern: rhs, ..
+            }
             | Expr::JsonAccess { lhs, rhs, .. } => {
                 walk(b, lhs);
                 walk(b, rhs);
@@ -2844,6 +2856,23 @@ fn push_dml_expr(
             b.push_u8(u8::from(*negated));
             push_dml_expr(b, lhs, params)?;
             push_dml_expr(b, rhs, params)?;
+        }
+        // タグ 21（対象ビヘイビア: SQL-55。Issue #1787）。否定・大小無視の有無と左辺・パターンを
+        // 順に直列化し、演算子違い・パターン違い・左右の入れ替えを同一内容と誤判定しない
+        // （RECOVER-10）。既存タグは不変。
+        Expr::RegexMatch {
+            negated,
+            case_insensitive,
+            lhs,
+            pattern,
+            // 生パターン長は変換後の ARE（`pattern`）から決まる補助情報なのでハッシュに含めない。
+            raw_pattern_len: _,
+        } => {
+            b.push_u8(21);
+            b.push_u8(u8::from(*negated));
+            b.push_u8(u8::from(*case_insensitive));
+            push_dml_expr(b, lhs, params)?;
+            push_dml_expr(b, pattern, params)?;
         }
         // タグ 10（対象ビヘイビア: SQL-26。Issue #920。ADR §4.4 タグ表に追記）。
         // `DATE`／`TIMESTAMP` を型バイト（0/1）で区別してから内部表現（LE）を
@@ -5295,6 +5324,33 @@ mod tests {
         assert_ne!(base, swapped);
         assert_ne!(base, nullif);
         assert_eq!(base, again);
+    }
+
+    /// `Expr::RegexMatch`（タグ 21。SQL-55・Issue #1787）は、演算子（否定・大小無視）・パターン・
+    /// 左辺の違いで別ハッシュになり、同一内容は同一ハッシュになる。
+    #[test]
+    fn regex_match_hash_distinguishes_operator_pattern_and_lhs() {
+        use crate::sql::udf_call::{Expr, UdfRegistry};
+
+        let registry = UdfRegistry::default();
+        let mk = |negated: bool, ci: bool, col: &str, pat: Expr| Expr::RegexMatch {
+            negated,
+            case_insensitive: ci,
+            lhs: Box::new(Expr::Ident(col.to_string())),
+            pattern: Box::new(pat),
+            raw_pattern_len: None,
+        };
+        let pat = |s: &str| Expr::String(s.to_string());
+        let hash =
+            |e: Expr| for_delete_where("t", &[where_predicate_id_gt_zero(e)], &registry).unwrap();
+        let base = hash(mk(false, false, "n", pat("a")));
+        assert_eq!(base, hash(mk(false, false, "n", pat("a"))));
+        assert_ne!(base, hash(mk(true, false, "n", pat("a"))));
+        assert_ne!(base, hash(mk(false, true, "n", pat("a"))));
+        assert_ne!(base, hash(mk(true, true, "n", pat("a"))));
+        assert_ne!(base, hash(mk(false, false, "n", pat("b"))));
+        assert_ne!(base, hash(mk(false, false, "m", pat("a"))));
+        assert_ne!(base, hash(mk(false, false, "n", Expr::Null)));
     }
 
     /// ADR §4.4.1「WASM UDF は本節の対象外」の拒否判定（`collect_referenced_udfs` の

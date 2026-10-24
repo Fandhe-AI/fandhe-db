@@ -483,6 +483,7 @@ fn bind_scan_plan(
         projection: Projection::All,
         where_predicates: rows.where_predicates.clone(),
         limit: 1,
+        limit_implicit: false,
         order_by: rows.order_by.clone(),
         offset: 0,
         window_items: rows.window_items.clone(),
@@ -996,6 +997,7 @@ mod tests {
                 window_items: Vec::new(),
                 limit,
                 limit_explicit: true,
+                limit_implicit: false,
                 offset,
             })),
             column_aliases: Vec::new(),
@@ -1288,6 +1290,8 @@ mod tests {
             },
             alias: None,
             distinct: false,
+            extra_args: Vec::new(),
+            order_by: Vec::new(),
         })
     }
 
@@ -1385,6 +1389,7 @@ mod tests {
                 window_items: vec![],
                 limit: 10,
                 limit_explicit: true,
+                limit_implicit: false,
                 offset: 0,
             })),
             column_aliases: Vec::new(),

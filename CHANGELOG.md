@@ -9,6 +9,26 @@
 
 ### Added
 
+- `LIMIT` 省略・`LIMIT ALL` の結果行数上限超過（`54000`）を、`cap + 1` 件目の確定時点で走査・結合・集約を中断して返す（Issue #1797・SQL-34）。
+  広域取得・ウィンドウ・HAVING なしの `GROUP BY`／`SELECT DISTINCT`・残余述語なしの JOIN が対象で、上限を超える行は保持しない。
+  エラーコードと文言は変わらない。
+- 行を返す SELECT で `LIMIT` の省略・`LIMIT ALL`・`OFFSET` 単独を受理する（Issue #1796・SQL-34）。広域取得・
+  スカラー `ORDER BY`・ウィンドウ・JOIN・`GROUP BY`／`SELECT DISTINCT`・集合演算全体・ビュー参照・CTE の主クエリが対象。
+  可視結果が結果行数上限（`--max-result-rows`・既定 10,000）を超えたら黙って切り詰めず `54000` で文全体を拒否する。
+  従来これらの形を `42601` で拒否していたクライアントの挙動が変わる。距離 `ORDER BY`・`USING PLAN`・
+  サブクエリ内側・ビュー／CTAS／matview 本文の省略は引き続き `42601`。
+  詳細は [limit-omitted-result-cap.md](docs/design/limit-omitted-result-cap.md)。
+- `WHERE <列または式> [NOT] SIMILAR TO '<pattern>' [ESCAPE '<c>']` を受理して評価する（Issue #1788・SQL-55）。
+  SQL 正規表現を ARE へ変換し、`~` と同じマッチャで全体一致を判定する（PG 17 の実測表で検証）。
+  `ESCAPE` は句なし（`\`）・指定文字・`''`（無効）、2 文字以上は `22025`。不正パターンは `2201B`、
+  上限超過は `54000`。NULL は三値論理。索引は使わず常に残余述語。
+  詳細は [regex-matcher.md](docs/design/regex-matcher.md)。
+  BREAKING CHANGE: 公開 enum `Expr::RegexMatch` に必須フィールド `raw_pattern_len: Option<usize>` を追加したため、
+  構築コードと網羅的な `match` は更新が要る。既存の `~` 系の構築では `raw_pattern_len: None` を指定する。
+- `WHERE <列または式> ~ | ~* | !~ | !~* '<pattern>'`（正規表現マッチ演算子）を受理して評価する（Issue #1787・SQL-55）。
+  パターンは文字列リテラルか `NULL`（拡張クエリでは `<列> ~ $n`。`$n` は常に text）。ASCII のみ大小無視（`~*`）、
+  NULL は三値論理、不正パターンは `2201B`、非対応構文は `0A000`、上限超過は `54000`。索引は使わず常に残余述語。
+  詳細は [regex-matcher.md](docs/design/regex-matcher.md)。
 - `FETCH {FIRST|NEXT} [n] {ROW|ROWS} ONLY` と `OFFSET m {ROW|ROWS}` を受理する（Issue #1793・SQL-56）。トークン段で
   `LIMIT n`／`OFFSET m` へ正規化するため範囲・上限・エラー契約は `LIMIT` と同一。`FETCH ... WITH TIES` は
   単一表のスカラー `ORDER BY` 広域取得と `GROUP BY` 集計で受理し（同値行も結果行数の上限に数え、超過は `54000`）、
@@ -43,6 +63,10 @@
 
 ### Breaking Changes
 
+- `sql::lexer::Token`・`sql::udf_call::Expr`・`sql::udf_call::BoundExpr`・`sql::allowlist::SqlSurfaceError`（Issue #1787・SQL-55）:
+  variant を追加した（`Token::RegexMatch`／`RegexMatchCi`／`RegexNotMatch`／`RegexNotMatchCi`、`Expr::RegexMatch`、
+  `BoundExpr::RegexMatch`、`SqlSurfaceError::Regex`）。網羅 `match` する外部コードは腕を足す
+  （`wire_code()`／`classify()` 経由で扱うコードは変更不要）。
 - `error_format::ErrorClass::InvalidEscapeSequence`（`22025`）・`sql::allowlist::SqlSurfaceError::InvalidEscapeSequence`
   （Issue #1779・SQL-54）: variant を追加した（網羅 `match` するコードは腕を足す。HTTP は 400）。
   あわせて `LIKE` パターン末尾の単独 `\` のエラーを `22000` から `22025` へ変えた（`ILIKE`・NoSQL `like` も同じ。HTTP は 400 のまま）。

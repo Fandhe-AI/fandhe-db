@@ -812,6 +812,7 @@ pub(super) fn build_plan<'a>(
             projection: side.to_projection(),
             where_predicates: pushdown.get_mut(i).map(std::mem::take).unwrap_or_default(),
             limit: 1,
+            limit_implicit: false,
             order_by: Vec::new(),
             offset: 0,
             window_items: Vec::new(),

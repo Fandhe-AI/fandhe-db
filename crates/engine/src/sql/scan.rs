@@ -1057,7 +1057,57 @@ fn leading_key_is_id(bound: &BoundScan) -> bool {
     matches!(bound.order_by.first(), Some(key) if key.target == BoundOrderTarget::Id)
 }
 
+/// 結果行数上限超過（`LIMIT` 省略・`LIMIT ALL` の `cap + 1` 件目確定。Issue #1796/#1797・
+/// SQL-34）の `54000`。固定英語文言のみで、件数・テナント・行の内容を含めない
+/// （他テナントの存在・件数の観測を防ぐ）。scan／window／group_by／join／core が共有する
+/// 文言の単一情報源。
+pub(crate) fn row_limit_exceeded() -> SqlSurfaceError {
+    SqlSurfaceError::payload_too_large("result exceeds the row limit")
+}
+
+/// 早期中断の閾値 `offset + cap`（Issue #1797。可視一致行の件数がこれを超えたら
+/// `cap + 1` 件目が確定する）。`result_cap` が `None`（明示 `LIMIT`・NoSQL）なら `None`。
+/// 加算が溢れる場合は fail-closed で `Internal`。
+pub(crate) fn early_stop_threshold(
+    result_cap: Option<usize>,
+    offset: usize,
+) -> Result<Option<usize>, SqlSurfaceError> {
+    match result_cap {
+        None => Ok(None),
+        Some(cap) => offset
+            .checked_add(cap)
+            .map(Some)
+            .ok_or_else(|| SqlSurfaceError::Internal {
+                detail: "result row limit threshold overflowed".to_string(),
+            }),
+    }
+}
+
+/// 広域取得の実行入口（`core` の Scan 腕・`DECLARE CURSOR` の内側・COPY の括弧形・
+/// INSERT…SELECT・CTE・ビュー畳み込みが共有する）。実体は
+/// [`execute_scan_with_budget_inner`] で、本関数は `LIMIT` 省略・`LIMIT ALL` の文
+/// （Issue #1796・SQL-34。[`BoundScan::result_cap`] が `Some`）の超過判定を 1 か所に
+/// まとめる: 可視行のみを数えた結果が `cap` を超えたら黙って切り詰めず `54000` で文全体を
+/// 拒否する（件数・テナント・行の内容は含めない固定文言）。`cap + 1` 件目が確定した時点
+/// （Issue #1797）で走査を中断する（順序なし・経路 (A) は `cap + 1` 件目を投影・保持する前、
+/// 経路 (B) はパス 1 の可視一致行が `offset + cap` を超えた時点）。本関数の事後判定は多層防御。
 pub(crate) fn execute_scan_with_budget(
+    read_txn: &impl crate::storage::read_source::ReadSource,
+    ctx: &PolicyContext,
+    schema: &TableSchema,
+    bound: &BoundScan,
+    max_result_bytes: usize,
+) -> Result<QueryResult, SqlSurfaceError> {
+    let result = execute_scan_with_budget_inner(read_txn, ctx, schema, bound, max_result_bytes)?;
+    if let Some(cap) = bound.result_cap {
+        if result.rows.len() > cap {
+            return Err(row_limit_exceeded());
+        }
+    }
+    Ok(result)
+}
+
+fn execute_scan_with_budget_inner(
     read_txn: &impl crate::storage::read_source::ReadSource,
     ctx: &PolicyContext,
     schema: &TableSchema,
@@ -1157,6 +1207,9 @@ pub(crate) fn execute_scan_with_budget(
     // ことで、不可視行・WHERE 不一致行が読み飛ばし数に一切現れないようにする
     // （不可視行のスキップ手段にしない。RLS-7/8）。
     let mut skipped: usize = 0;
+    // Issue #1797: 出力済み（OFFSET 読み飛ばし後に確定した）行数。`result_cap` が `Some` のとき
+    // `cap + 1` 件目を投影・保持する前に `54000` で中断するための計数。
+    let mut emitted: usize = 0;
 
     // codex-review P1 指摘対応: `cells`（`Vec<Cell>`）・`rows`（`Vec<ResultRow>`）
     // 双方の確保量を累計予算へ計上する。テキスト・ベクトルの実体バイトのみを
@@ -1211,6 +1264,12 @@ pub(crate) fn execute_scan_with_budget(
                         skipped += 1;
                         return Ok(None);
                     }
+                    // Issue #1797・SQL-34: 可視かつ WHERE 一致の `cap + 1` 件目が確定した。
+                    // 投影・予算計上・保持の前に拒否する（部分結果は返さない）。
+                    if matches!(bound.result_cap, Some(cap) if emitted >= cap) {
+                        return Err(row_limit_exceeded());
+                    }
+                    emitted += 1;
                     // `cells`／`rows` 確保前に累計予算を検証（確保そのものを
                     // 許可する前に拒否できるよう `Vec::try_reserve` 系より先に
                     // 判定する）。
@@ -1344,6 +1403,12 @@ pub(crate) fn execute_scan_with_budget(
                         skipped += 1;
                         return Ok(None);
                     }
+                    // Issue #1797・SQL-34: 可視かつ WHERE 一致の `cap + 1` 件目が確定した。
+                    // 投影・予算計上・保持の前に拒否する（部分結果は返さない）。
+                    if matches!(bound.result_cap, Some(cap) if emitted >= cap) {
+                        return Err(row_limit_exceeded());
+                    }
+                    emitted += 1;
                     byte_budget =
                         try_accumulate_budget(byte_budget, per_row_struct_bytes, max_result_bytes)?;
                     let cells = build_projected_cells(
@@ -1436,6 +1501,8 @@ pub(crate) fn execute_scan_with_budget(
         let scan_passes: usize = if bound.ties_row_cap.is_some() { 2 } else { 1 };
         let mut tie_worst: Option<HeapEntry> = None;
         let mut ties_extra: Vec<HeapEntry> = Vec::new();
+        let stop_threshold = early_stop_threshold(bound.result_cap, bound.offset)?;
+        let mut matched: usize = 0;
 
         for scan_pass in 0..scan_passes {
             if scan_pass == 1 {
@@ -1483,6 +1550,16 @@ pub(crate) fn execute_scan_with_budget(
                     &mut embedding_scratch,
                     &mut where_expr_scratch,
                     |_dim, scanned, embedding| {
+                        // Issue #1797・SQL-34: 可視かつ WHERE 一致の行を数え、`offset + cap` を
+                        // 超えた（= OFFSET 適用後に `cap + 1` 件目が確定した）時点で、並べ替えキー評価・
+                        // ヒープ投入の前に拒否する。パス 2 には進まない。`WITH TIES` は明示件数
+                        // （`result_cap` が `None`）のため `stop_threshold` は常に `None`。
+                        if let Some(threshold) = stop_threshold {
+                            matched += 1;
+                            if matched > threshold {
+                                return Err(row_limit_exceeded());
+                            }
+                        }
                         // Issue #1188: 式キーは行ごとに評価し、評価結果（`ExprValue`。TEXT は
                         // 列参照なら借用・関数結果なら評価時に構築済みの所有値）を借用したまま
                         // 採否判定・予算照合に使う。複製（所有値化）は採用が決まった候補に
@@ -1946,6 +2023,7 @@ mod tests {
 
     fn bound_star_scan(limit: usize) -> BoundScan {
         BoundScan {
+            result_cap: None,
             table: "docs".to_string(),
             projection: vec![
                 ProjectedColumn::Id,
@@ -2088,6 +2166,7 @@ mod tests {
         let read_txn = storage.db().begin_read().expect("begin_read");
 
         let bound = BoundScan {
+            result_cap: None,
             table: "docs".to_string(),
             projection: vec![
                 ProjectedColumn::Id,
@@ -2455,6 +2534,7 @@ mod tests {
         let ctx = PolicyContext::new(tenant_id).expect("valid tenant");
         let read_txn = storage.db().begin_read().expect("begin_read");
         let bound = BoundScan {
+            result_cap: None,
             table: "docs".to_string(),
             projection: vec![ProjectedColumn::Id],
             metadata_filters: Vec::new(),
@@ -2536,6 +2616,7 @@ mod tests {
         let ctx = PolicyContext::new("tenant-a").expect("valid tenant");
         let read_txn = storage.db().begin_read().expect("begin_read");
         let bound = BoundScan {
+            result_cap: None,
             table: "docs".to_string(),
             projection: vec![ProjectedColumn::Id],
             metadata_filters: Vec::new(),
@@ -2618,6 +2699,7 @@ mod tests {
         let ctx = PolicyContext::new("tenant-a").expect("valid tenant");
         let read_txn = storage.db().begin_read().expect("begin_read");
         let bound = BoundScan {
+            result_cap: None,
             table: "docs".to_string(),
             projection: vec![ProjectedColumn::Id],
             metadata_filters: Vec::new(),
@@ -2717,6 +2799,7 @@ mod tests {
         let ctx = PolicyContext::new("tenant-a").expect("valid tenant");
         let read_txn = storage.db().begin_read().expect("begin_read");
         let bound = BoundScan {
+            result_cap: None,
             table: "docs".to_string(),
             projection: vec![
                 ProjectedColumn::Id,
@@ -2788,6 +2871,7 @@ mod tests {
     /// （Cursor Bugbot 指摘の回帰テスト用ヘルパー）。
     fn bound_scan_with_vec_norm_projection(limit: usize) -> BoundScan {
         BoundScan {
+            result_cap: None,
             table: "docs".to_string(),
             projection: vec![
                 ProjectedColumn::Id,
@@ -2869,6 +2953,7 @@ mod tests {
         };
         let program = ExprProgram::compile(&expr);
         let bound = BoundScan {
+            result_cap: None,
             table: "docs".to_string(),
             projection: vec![ProjectedColumn::Id],
             metadata_filters: Vec::new(),
@@ -2947,6 +3032,7 @@ mod tests {
 
         let program = ExprProgram::compile(&expr);
         let bound = BoundScan {
+            result_cap: None,
             table: "docs".to_string(),
             projection: vec![ProjectedColumn::Id],
             metadata_filters: Vec::new(),
@@ -3011,6 +3097,7 @@ mod tests {
         assert!(udf_call::references_embedding(&expr));
 
         let bound = BoundScan {
+            result_cap: None,
             table: "docs".to_string(),
             projection: vec![
                 ProjectedColumn::Id,
@@ -3070,6 +3157,7 @@ mod tests {
             ],
         };
         let bound = BoundScan {
+            result_cap: None,
             table: "docs".to_string(),
             projection: vec![
                 ProjectedColumn::Id,
@@ -3239,6 +3327,7 @@ mod tests {
     fn decode_tier_for_new_type_projection_is_dim_and_scalar() {
         let schema = many_new_scalar_types_schema();
         let bound = BoundScan {
+            result_cap: None,
             table: "docs".to_string(),
             projection: vec![
                 ProjectedColumn::Id,
@@ -3271,6 +3360,7 @@ mod tests {
     fn decode_tier_for_id_only_projection_on_new_type_schema_is_fast() {
         let schema = many_new_scalar_types_schema();
         let bound = BoundScan {
+            result_cap: None,
             table: "docs".to_string(),
             projection: vec![ProjectedColumn::Id],
             metadata_filters: Vec::new(),
@@ -3293,6 +3383,7 @@ mod tests {
     fn decode_tier_for_vector_projection_is_embedding() {
         let schema = many_new_scalar_types_schema();
         let bound = BoundScan {
+            result_cap: None,
             table: "docs".to_string(),
             projection: vec![
                 ProjectedColumn::Id,

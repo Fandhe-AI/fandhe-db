@@ -634,6 +634,13 @@ pub(crate) fn check_aggregate_columns_within_view(
                 if let AggregateArg::Expr(expr) = &agg.arg {
                     expr_columns_within(columns, expr)?;
                 }
+                // SQL-57: `string_agg` の区切り・内側 `ORDER BY` の式も公開列に限定する。
+                for e in &agg.extra_args {
+                    expr_columns_within(columns, e)?;
+                }
+                for k in &agg.order_by {
+                    expr_columns_within(columns, &k.expr)?;
+                }
                 effective_names.push(
                     agg.alias
                         .clone()
@@ -648,6 +655,12 @@ pub(crate) fn check_aggregate_columns_within_view(
                 for agg in aggregates {
                     if let AggregateArg::Expr(e) = &agg.arg {
                         expr_columns_within(columns, e)?;
+                    }
+                    for e in &agg.extra_args {
+                        expr_columns_within(columns, e)?;
+                    }
+                    for k in &agg.order_by {
+                        expr_columns_within(columns, &k.expr)?;
                     }
                 }
                 for c in crate::sql::allowlist::expr_bare_idents(expr) {
@@ -795,7 +808,11 @@ pub(crate) fn expr_columns_within(columns: &[String], expr: &Expr) -> Result<(),
             }
             Ok(())
         }
-        Expr::NullIf(lhs, rhs) | Expr::IsDistinctFrom { lhs, rhs, .. } => {
+        Expr::NullIf(lhs, rhs)
+        | Expr::IsDistinctFrom { lhs, rhs, .. }
+        | Expr::RegexMatch {
+            lhs, pattern: rhs, ..
+        } => {
             expr_columns_within(columns, lhs)?;
             expr_columns_within(columns, rhs)
         }

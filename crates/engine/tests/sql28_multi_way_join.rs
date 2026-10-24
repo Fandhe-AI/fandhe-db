@@ -606,9 +606,8 @@ fn unsupported_where_forms_and_other_shapes_stay_rejected() {
         "WHERE emp.ename <> 'ann' LIMIT 10",
         "WHERE emp.ename NOT IN ('ann') LIMIT 10",
         "WHERE emp.ename = 'ann' ORDER BY emp.embedding <=> '[0.1,0.1]' LIMIT 10",
-        "ORDER BY emp.salary",
-        "",
     ] {
+        // Issue #1796・SQL-34: `LIMIT` 省略の JOIN は受理する（sql34_limit_omitted.rs）。
         assert_rejected(&core, &format!("{base} {tail}"), "42601");
     }
     for sql in [

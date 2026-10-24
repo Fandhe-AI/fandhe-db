@@ -253,6 +253,7 @@ fn build_source_index(
         projection: Projection::Columns(names),
         where_predicates: plan.source.where_predicates.clone(),
         limit: 1,
+        limit_implicit: false,
         order_by: Vec::new(),
         offset: 0,
         window_items: Vec::new(),

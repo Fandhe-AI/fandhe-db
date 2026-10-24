@@ -27,6 +27,7 @@
 //! | `Expression(a = b)` | `Or([a < b], [a > b])`（`BinOp` に `<>` が無いため。`a <> b` もこの形へ脱糖） |
 //! | `Expression(x op ANY\|ALL (a))` | 量化子を反転し演算子を否定（TABLE-35・Issue #1603） |
 //! | `Expression(a IS [NOT] DISTINCT FROM b)` | `negated` を反転（結果が NULL にならず厳密に同値。SQL-54・Issue #1783） |
+//! | `Expression(a ~ b)` 等の正規表現マッチ | `negated` を反転（左辺・パターンが NULL なら否定の有無に関わらず NULL のため三値論理でも同値。SQL-55・Issue #1787） |
 //! | `visible()` | `42601`（RLS-7: 否定越しに RLS 述語を扱わせない） |
 //! | `IN (SELECT)`／`EXISTS` | `Not(..)`（解決段 `sql::subquery` が NULL 規則込みで否定形を評価する。Issue #1191） |
 //! | `<col> <op> (SELECT)` | 演算子反転（`=`↔`<>`・`<`↔`>=`・`>`↔`<=`。Issue #1191） |
@@ -48,7 +49,11 @@ pub(crate) fn expr_node_count(expr: &Expr) -> usize {
         Expr::Call { args, .. } | Expr::Coalesce(args) => args
             .iter()
             .fold(1usize, |acc, a| acc.saturating_add(expr_node_count(a))),
-        Expr::NullIf(a, b) | Expr::IsDistinctFrom { lhs: a, rhs: b, .. } => 1usize
+        Expr::NullIf(a, b)
+        | Expr::IsDistinctFrom { lhs: a, rhs: b, .. }
+        | Expr::RegexMatch {
+            lhs: a, pattern: b, ..
+        } => 1usize
             .saturating_add(expr_node_count(a))
             .saturating_add(expr_node_count(b)),
         Expr::Collate { expr, .. } | Expr::Cast { expr, .. } => {
@@ -177,6 +182,21 @@ fn negate_one(
                 rhs,
             })])
         }
+        // 正規表現マッチは左辺・パターンのどちらかが NULL なら否定の有無に関わらず NULL なので、
+        // `negated` の反転が三値論理でも同値（SQL-55・Issue #1787）。
+        WherePredicate::Expression(Expr::RegexMatch {
+            negated,
+            case_insensitive,
+            lhs,
+            pattern,
+            raw_pattern_len,
+        }) => Ok(vec![WherePredicate::Expression(Expr::RegexMatch {
+            negated: !negated,
+            case_insensitive,
+            lhs,
+            pattern,
+            raw_pattern_len,
+        })]),
         WherePredicate::Expression(Expr::Binary { op, lhs, rhs }) => match op {
             BinOp::Gt | BinOp::Lt | BinOp::Ge | BinOp::Le => {
                 let flipped = match op {
@@ -278,6 +298,36 @@ mod tests {
         assert_eq!(once, vec![distinct(true)]);
         let twice = negate_conjunction(once, &mut b).unwrap();
         assert_eq!(twice, vec![distinct(false)]);
+    }
+
+    fn regex(negated: bool) -> WherePredicate {
+        WherePredicate::Expression(Expr::RegexMatch {
+            negated,
+            case_insensitive: true,
+            lhs: Box::new(Expr::Ident("a".to_string())),
+            pattern: Box::new(Expr::String("x".to_string())),
+            raw_pattern_len: None,
+        })
+    }
+
+    /// SQL-55: `NOT (a ~* 'x')` は `negated` の反転で、二重否定・De Morgan でも保たれる。
+    #[test]
+    fn regex_match_flips_negated() {
+        let mut b = 100;
+        let once = negate_conjunction(vec![regex(false)], &mut b).unwrap();
+        assert_eq!(once, vec![regex(true)]);
+        assert_eq!(
+            negate_conjunction(once, &mut b).unwrap(),
+            vec![regex(false)]
+        );
+        let out = negate_conjunction(vec![regex(false), regex(true)], &mut b).unwrap();
+        assert_eq!(
+            out,
+            vec![WherePredicate::Or(vec![
+                vec![regex(true)],
+                vec![regex(false)]
+            ])]
+        );
     }
 
     /// SQL-54: 連言の否定（De Morgan）でも各項の `negated` が反転される。

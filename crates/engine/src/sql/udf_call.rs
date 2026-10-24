@@ -273,6 +273,22 @@ pub enum Expr {
         lhs: Box<Expr>,
         rhs: Box<Expr>,
     },
+    /// `<lhs> ~ | ~* | !~ | !~* <pattern>`（正規表現マッチ。対象ビヘイビア: SQL-55。Issue #1787）。
+    /// `pattern` に置けるのは [`Expr::String`] か [`Expr::Null`] だけで、構文段
+    /// （`allowlist::Parser::parse_regex_rest`）がこれを保証する（`$n` は Bind 時に文字列
+    /// リテラルへ置換済み）。`negated` は `!~`／`!~*` と前置 `NOT` の合成結果で、
+    /// `where_negation` が反転する。左辺・パターンが NULL なら否定の有無に関わらず NULL。
+    /// 変更履歴: 本 variant の追加は `Expr` の網羅的 match を持つ外部コードへの破壊的変更。
+    RegexMatch {
+        negated: bool,
+        case_insensitive: bool,
+        lhs: Box<Expr>,
+        pattern: Box<Expr>,
+        /// `SIMILAR TO` 由来のとき、変換前の生パターンのバイト長（Issue #1788）。`pattern` は変換後の
+        /// ARE（ラッパー付き・ESCAPE 除去済み）で長さが生パターンとずれるため、設定済みの
+        /// パターン長上限は束縛時にこの値へ適用する（`regex-limits-cli.md` D2）。`~` 系は `None`。
+        raw_pattern_len: Option<usize>,
+    },
     /// `DATE '<literal>'`（型付きリテラル。対象ビヘイビア: SQL-26。Issue #920）。
     /// 構文段（`allowlist::Parser::parse_primary_expr`）で
     /// `crate::datetime::parse_date` を即座に解析済みの値を保持する（生文字列を
@@ -887,6 +903,19 @@ pub enum BoundExpr {
         lhs: Box<BoundExpr>,
         rhs: Box<BoundExpr>,
     },
+    /// `~`／`~*`／`!~`／`!~*`（対象ビヘイビア: SQL-55。Issue #1787）。束縛段
+    /// （[`bind_regex_match`]）が左辺を TEXT 型として検査し、パターンを束縛時に 1 回だけ
+    /// コンパイルして保持する（行ごとの再コンパイルはしない）。パターンが NULL のときは
+    /// `pattern`／`compiled` とも `None` で、評価結果は常に NULL。左辺 NULL も否定の有無に
+    /// 関わらず NULL（三値論理）。スカラー索引・宣言的レーンの対象外（常に残余述語）。
+    /// 変更履歴: 本 variant の追加は `BoundExpr` の網羅的 match を持つ外部コードへの破壊的変更。
+    RegexMatch {
+        negated: bool,
+        case_insensitive: bool,
+        lhs: Box<BoundExpr>,
+        pattern: Option<String>,
+        compiled: Option<crate::regex_match::CompiledRegex>,
+    },
     /// 式左辺の `<lhs> [NOT] LIKE|ILIKE '<pattern>'`（対象ビヘイビア: SQL-54 (3)。Issue #1782）。
     /// 束縛段（[`bind_like_predicate`]）が `lhs` を TEXT 型として検査し、パターンを
     /// [`crate::declarative_filter::LikePattern`] へコンパイル済みで保持する（`ILIKE` の畳み込みは
@@ -1397,6 +1426,24 @@ impl PartialEq for BoundExpr {
                     rhs: rb,
                 },
             ) => na == nb && la == lb && ra == rb,
+            // `CompiledRegex` は比較できないため、コンパイル元の `pattern`・大小指定で比べる
+            // （同じ入力から常に同じコンパイル結果になる）。
+            (
+                BoundExpr::RegexMatch {
+                    negated: na,
+                    case_insensitive: ca,
+                    lhs: la,
+                    pattern: pa,
+                    ..
+                },
+                BoundExpr::RegexMatch {
+                    negated: nb,
+                    case_insensitive: cb,
+                    lhs: lb,
+                    pattern: pb,
+                    ..
+                },
+            ) => na == nb && ca == cb && la == lb && pa == pb,
             (
                 BoundExpr::Like {
                     lhs: la,
@@ -1818,6 +1865,9 @@ pub(crate) fn first_non_builtin_call_with(
         Expr::Binary { lhs, rhs, .. }
         | Expr::NullIf(lhs, rhs)
         | Expr::IsDistinctFrom { lhs, rhs, .. }
+        | Expr::RegexMatch {
+            lhs, pattern: rhs, ..
+        }
         | Expr::JsonAccess { lhs, rhs, .. } => {
             first_non_builtin_call_with(lhs, allow_current_time, allow_json_fns)
                 .or_else(|| first_non_builtin_call_with(rhs, allow_current_time, allow_json_fns))
@@ -2571,6 +2621,10 @@ fn validate_closed_expr(
         Expr::IsDistinctFrom { .. } => Err(SqlSurfaceError::FeatureNotSupported {
             detail: "IS DISTINCT FROM is not supported in a function body".to_string(),
         }),
+        // 同様に UDF 本体では正規表現演算子を受理しない（SQL-55・Issue #1787。fail-closed）。
+        Expr::RegexMatch { .. } => Err(SqlSurfaceError::FeatureNotSupported {
+            detail: "regular expression operators are not supported in a function body".to_string(),
+        }),
         Expr::DateLiteral(_)
         | Expr::TimestampLiteral(_)
         | Expr::IntervalLiteral(_)
@@ -2734,7 +2788,9 @@ fn count_bound_nodes(expr: &BoundExpr) -> usize {
                 + count_bound_nodes(else_result)
         }
         BoundExpr::Coalesce(args) => 1 + args.iter().map(count_bound_nodes).sum::<usize>(),
-        BoundExpr::Like { lhs, .. } => 1 + count_bound_nodes(lhs),
+        BoundExpr::Like { lhs, .. } | BoundExpr::RegexMatch { lhs, .. } => {
+            1 + count_bound_nodes(lhs)
+        }
         BoundExpr::NullIf { lhs, rhs } | BoundExpr::IsDistinctFrom { lhs, rhs, .. } => {
             1 + count_bound_nodes(lhs) + count_bound_nodes(rhs)
         }
@@ -2838,7 +2894,9 @@ fn max_bound_case_nesting(expr: &BoundExpr) -> usize {
             1 + branches_max.max(max_bound_case_nesting(else_result))
         }
         BoundExpr::Coalesce(args) => 1 + args.iter().map(max_bound_case_nesting).max().unwrap_or(0),
-        BoundExpr::Like { lhs, .. } => max_bound_case_nesting(lhs),
+        BoundExpr::Like { lhs, .. } | BoundExpr::RegexMatch { lhs, .. } => {
+            max_bound_case_nesting(lhs)
+        }
         BoundExpr::NullIf { lhs, rhs } | BoundExpr::IsDistinctFrom { lhs, rhs, .. } => {
             1 + max_bound_case_nesting(lhs).max(max_bound_case_nesting(rhs))
         }
@@ -2928,7 +2986,9 @@ pub(crate) fn references_embedding(expr: &BoundExpr) -> bool {
                 || references_embedding(else_result)
         }
         BoundExpr::Coalesce(args) => args.iter().any(references_embedding),
-        BoundExpr::Like { lhs, .. } => references_embedding(lhs),
+        BoundExpr::Like { lhs, .. } | BoundExpr::RegexMatch { lhs, .. } => {
+            references_embedding(lhs)
+        }
         BoundExpr::NullIf { lhs, rhs } | BoundExpr::IsDistinctFrom { lhs, rhs, .. } => {
             references_embedding(lhs) || references_embedding(rhs)
         }
@@ -3042,7 +3102,9 @@ pub(crate) fn visit_referenced_scalar_columns(expr: &BoundExpr, visit: &mut dyn 
                 visit_referenced_scalar_columns(a, visit);
             }
         }
-        BoundExpr::Like { lhs, .. } => visit_referenced_scalar_columns(lhs, visit),
+        BoundExpr::Like { lhs, .. } | BoundExpr::RegexMatch { lhs, .. } => {
+            visit_referenced_scalar_columns(lhs, visit)
+        }
         BoundExpr::NullIf { lhs, rhs } | BoundExpr::IsDistinctFrom { lhs, rhs, .. } => {
             visit_referenced_scalar_columns(lhs, visit);
             visit_referenced_scalar_columns(rhs, visit);
@@ -3221,7 +3283,9 @@ pub(crate) fn mark_referenced_scalar_columns(expr: &BoundExpr, mask: &mut [bool]
             }
             any
         }
-        BoundExpr::Like { lhs, .. } => mark_referenced_scalar_columns(lhs, mask),
+        BoundExpr::Like { lhs, .. } | BoundExpr::RegexMatch { lhs, .. } => {
+            mark_referenced_scalar_columns(lhs, mask)
+        }
         BoundExpr::NullIf { lhs, rhs } | BoundExpr::IsDistinctFrom { lhs, rhs, .. } => {
             let l = mark_referenced_scalar_columns(lhs, mask);
             let r = mark_referenced_scalar_columns(rhs, mask);
@@ -3923,6 +3987,56 @@ fn bind_datetime_text_literal(
 
 /// `<lhs> IS [NOT] DISTINCT FROM <rhs>` を束縛する（対象ビヘイビア: SQL-54。Issue #1783）。
 ///
+/// `sql::allowlist::Parser::parse_regex_rest` が作る [`Expr::RegexMatch`] を束縛する
+/// （対象ビヘイビア: SQL-55。Issue #1787）。左辺は通常の式束縛（ICU 照合の列・非バイト列順の
+/// `COLLATE` は式の内側として `0A000`）で、TEXT 以外は `42883`。パターンは文字列リテラルなら
+/// 現在の上限（`sql::regex_op`）で 1 回だけコンパイルし（不正は `2201B`・非対応は `0A000`・
+/// 上限超過は `54000`）、`NULL` なら結果が常に NULL の形で保持する。PG と違い行が 0 件でも
+/// 不正パターンを拒否する（fail-closed）。結果型は [`ExprType::Bool`]。
+fn bind_regex_match(
+    negated: bool,
+    case_insensitive: bool,
+    lhs: &Expr,
+    pattern: &Expr,
+    raw_pattern_len: Option<usize>,
+    env: &mut BindEnv<'_>,
+    node_budget: &mut usize,
+) -> Result<(BoundExpr, ExprType), SqlSurfaceError> {
+    *node_budget = node_budget
+        .checked_sub(1)
+        .ok_or_else(|| SqlSurfaceError::payload_too_large("WHERE expression is too large"))?;
+    let (bound, ty) = bind_expr_in(lhs, env, node_budget)?;
+    if ty != ExprType::Text {
+        return Err(SqlSurfaceError::undefined_function(
+            "operator does not exist: regular expression match on a non-text operand",
+        ));
+    }
+    let (pattern, compiled) = match pattern {
+        Expr::Null => (None, None),
+        Expr::String(p) => {
+            let c =
+                crate::sql::regex_op::compile_regex_pattern(p, case_insensitive, raw_pattern_len)?;
+            (Some(p.clone()), Some(c))
+        }
+        // 構文段が来させない形。多層防御として fail-closed。
+        _ => {
+            return Err(SqlSurfaceError::Internal {
+                detail: "regular expression pattern must be a string literal".to_string(),
+            })
+        }
+    };
+    Ok((
+        BoundExpr::RegexMatch {
+            negated,
+            case_insensitive,
+            lhs: Box::new(bound),
+            pattern,
+            compiled,
+        },
+        ExprType::Bool,
+    ))
+}
+
 /// `sql::allowlist::Parser::parse_expression_predicate` が作る [`Expr::IsDistinctFrom`] を
 /// 受け、結果型は常に [`ExprType::Bool`]（NULL を返さない）。両辺が非 NULL リテラルでない
 /// 通常の組は `=` と完全に同じ束縛（未知型リテラルの解釈・float リテラル・照合導出・型不一致の
@@ -4472,6 +4586,21 @@ pub(super) fn bind_expr_any(
         Expr::IsDistinctFrom { negated, lhs, rhs } => {
             bind_is_distinct_from(*negated, lhs, rhs, env, node_budget)
         }
+        Expr::RegexMatch {
+            negated,
+            case_insensitive,
+            lhs,
+            pattern,
+            raw_pattern_len,
+        } => bind_regex_match(
+            *negated,
+            *case_insensitive,
+            lhs,
+            pattern,
+            *raw_pattern_len,
+            env,
+            node_budget,
+        ),
         // `DATE`／`TIMESTAMP` 型付きリテラル（対象ビヘイビア: SQL-26。Issue #920）。
         // 構文段（`allowlist::Parser::parse_primary_expr`）が既に
         // `crate::datetime::parse_date`／`parse_timestamp` で解析・範囲検証済みの
@@ -8028,6 +8157,26 @@ pub(crate) fn eval_with_scalars<'a>(
             let r = eval_with_scalars(rhs, id, embedding, row_scalars)?;
             eval_is_distinct_from(*negated, l, r)
         }
+        BoundExpr::RegexMatch {
+            negated,
+            lhs,
+            compiled,
+            ..
+        } => {
+            let l = eval_with_scalars(lhs, id, embedding, row_scalars)?;
+            match (l, compiled) {
+                // 左辺 NULL・パターン NULL は否定の有無に関わらず NULL（三値論理）。
+                (ExprValue::Null, _) | (_, None) => Ok(ExprValue::Null),
+                (ExprValue::Text(s), Some(re)) => {
+                    let m = re.is_match(&s).map_err(SqlSurfaceError::Regex)?;
+                    Ok(ExprValue::Bool(m != *negated))
+                }
+                // 束縛段が TEXT 型を保証するため到達しない。fail-closed。
+                _ => Err(SqlSurfaceError::Internal {
+                    detail: "regular expression operand did not evaluate to text".to_string(),
+                }),
+            }
+        }
         BoundExpr::Like {
             lhs,
             pattern,
@@ -9035,6 +9184,14 @@ fn apply_vector_scalar_op<'a>(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// SQL-57・Issue #1800: `string_agg` は集計関数名として予約され、同名の UDF は定義できない
+    /// （呼び出しが集計として解析されるため、定義しても呼べない）。
+    #[test]
+    fn string_agg_is_a_reserved_function_name() {
+        assert!(is_reserved_function_name("string_agg"));
+        assert!(is_reserved_function_name("STRING_AGG"));
+    }
 
     /// Issue #1438: 浮動小数列相手のリテラルは 2^53 exactness 判定をかけず f64 範囲で解釈する。
     #[test]

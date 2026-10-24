@@ -142,6 +142,9 @@ struct ResultBudget {
     per_group_bytes: usize,
     /// グループ数の上限（Issue #1550。既定は [`MAX_GROUPS`]。起動時設定で下げられる）。
     max_groups: usize,
+    /// 結果行数上限の早期中断閾値 `offset + cap`（Issue #1797。`result_cap` が `Some` かつ
+    /// HAVING なしのときだけ `Some`。HAVING はグループ確定後に評価するため早期確定できない）。
+    max_result_groups: Option<usize>,
 }
 
 impl ResultBudget {
@@ -166,10 +169,17 @@ impl ResultBudget {
             .ok_or_else(|| {
                 SqlSurfaceError::payload_too_large(TEXT_BUDGET_ACCOUNTING_OVERFLOW_DETAIL)
             })?;
+        let max_result_groups = match bound.group_by.as_ref() {
+            Some(g) if g.having.is_empty() && g.having_exprs.is_empty() => {
+                crate::sql::scan::early_stop_threshold(g.result_cap, g.offset)?
+            }
+            _ => None,
+        };
         Ok(Self {
             max_result_bytes,
             per_group_bytes,
             max_groups,
+            max_result_groups,
         })
     }
 
@@ -452,6 +462,10 @@ fn check_new_group_budget(
     total_text_accumulator_bytes: usize,
     budget: &ResultBudget,
 ) -> Result<(), SqlSurfaceError> {
+    // Issue #1797・SQL-34: `cap + 1` 件目のグループ（OFFSET 適用後）が確定した時点で中断する。
+    if matches!(budget.max_result_groups, Some(m) if current_group_count >= m) {
+        return Err(crate::sql::scan::row_limit_exceeded());
+    }
     if current_group_count >= budget.max_groups {
         return Err(SqlSurfaceError::payload_too_large(
             "GROUP BY result exceeds the allowed number of groups",
@@ -1339,21 +1353,26 @@ pub(crate) fn cmp_cells_pg_nulls(
 }
 
 /// codex-review P1 指摘（PR #603）: `bound.items` に `MIN`/`MAX(<TEXT 列>)`
-/// 集計が 1 つでも含まれるかを判定する。列挙形（[`observe_group_enumeration`]）
+/// 集計、または `string_agg`（SQL-57・Issue #1800。`ORDER BY` なしだと処理順が連結順になる）が
+/// 1 つでも含まれるかを判定する。列挙形（[`observe_group_enumeration`]）
 /// はこの判定が真の場合、[`execute_grouped_aggregate`] から呼ばれない
 /// （下記「列挙形を使わない理由」参照）。`pub(crate)`: `sql::aggregate::
 /// classify_aggregate_access`（Issue #922・SQL-27の EXPLAIN 静的判定）が
 /// executor と同じ単一情報源として本関数を共有する。
 pub(crate) fn has_text_min_max_aggregate(items: &[crate::sql::parser::BoundAggregateItem]) -> bool {
     items.iter().any(|item| {
-        matches!(
-            item.func,
-            crate::sql::allowlist::AggregateFunc::Min | crate::sql::allowlist::AggregateFunc::Max
-        ) && matches!(
-            item.input,
-            crate::sql::parser::AggregateInput::TextColumn(_)
-                | crate::sql::parser::AggregateInput::CollatedTextColumn { .. }
-        )
+        // SQL-57: ORDER BY なしの `string_agg` は行の処理順が結果の連結順になるため、キー順の
+        // 列挙形（グループ単位に処理順が変わる）を使わず物理行順の全走査・候補走査に揃える。
+        item.func == crate::sql::allowlist::AggregateFunc::StringAgg
+            || matches!(
+                item.func,
+                crate::sql::allowlist::AggregateFunc::Min
+                    | crate::sql::allowlist::AggregateFunc::Max
+            ) && matches!(
+                item.input,
+                crate::sql::parser::AggregateInput::TextColumn(_)
+                    | crate::sql::parser::AggregateInput::CollatedTextColumn { .. }
+            )
     })
 }
 
@@ -2872,6 +2891,7 @@ mod tests {
                 order_by: Vec::new(),
                 limit: None,
                 offset: 0,
+                result_cap: None,
             }),
         }
     }
@@ -3023,6 +3043,7 @@ mod tests {
                 order_by: Vec::new(),
                 limit: None,
                 offset: 0,
+                result_cap: None,
             }),
         }
     }
@@ -3387,6 +3408,7 @@ mod tests {
             max_groups: MAX_GROUPS,
             max_result_bytes: 1_000,
             per_group_bytes: 16,
+            max_result_groups: None,
         };
         let long = "x".repeat(400);
         let mut held = 0usize;
@@ -3495,6 +3517,7 @@ mod tests {
                 order_by: Vec::new(),
                 limit: None,
                 offset: 0,
+                result_cap: None,
             }),
         }
     }

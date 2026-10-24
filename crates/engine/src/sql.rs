@@ -184,6 +184,7 @@ pub(crate) mod matview;
 #[cfg(test)]
 mod serial_expansion_tests;
 pub(crate) mod set_expr;
+pub(crate) mod string_agg;
 pub(crate) mod temp_catalog;
 #[cfg(test)]
 mod temp_catalog_tests;
@@ -238,6 +239,7 @@ pub mod partitioned;
 pub(crate) mod pk_point;
 pub mod plan;
 pub(crate) mod qualified_column;
+pub(crate) mod regex_op;
 pub mod relation;
 pub(crate) mod relation_name;
 pub mod relation_snapshot;

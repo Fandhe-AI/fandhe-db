@@ -319,6 +319,25 @@ pub(crate) fn render_expr(expr: &Expr) -> String {
             if *negated { "NOT " } else { "" },
             render_expr(rhs)
         ),
+        // 構文段が CHECK 本体での `~` 系を `0A000` で拒否するため通常は到達しない
+        // （網羅のための PG 構文描画。パターンの `'` は二重化。SQL-55・Issue #1787）。
+        Expr::RegexMatch {
+            negated,
+            case_insensitive,
+            lhs,
+            pattern,
+            raw_pattern_len: _,
+        } => format!(
+            "({} {} {})",
+            render_expr(lhs),
+            match (*negated, *case_insensitive) {
+                (false, false) => "~",
+                (false, true) => "~*",
+                (true, false) => "!~",
+                (true, true) => "!~*",
+            },
+            render_expr(pattern)
+        ),
         // `DATE`／`TIMESTAMP` 型付きリテラル（対象ビヘイビア: SQL-26。
         // Issue #920）。解析済みの内部表現から正規化済みテキストを再構成する
         // （生文字列を保持しないため、区切り文字の表記揺れが往復で発生しない）。
@@ -379,7 +398,11 @@ fn normalize_session_local_expr(expr: &mut Expr) {
             normalize_session_local_expr(lhs);
             normalize_session_local_expr(rhs);
         }
-        Expr::NullIf(lhs, rhs) | Expr::IsDistinctFrom { lhs, rhs, .. } => {
+        Expr::NullIf(lhs, rhs)
+        | Expr::IsDistinctFrom { lhs, rhs, .. }
+        | Expr::RegexMatch {
+            lhs, pattern: rhs, ..
+        } => {
             normalize_session_local_expr(lhs);
             normalize_session_local_expr(rhs);
         }
@@ -681,7 +704,11 @@ fn referenced_column_names(
                     collect_idents(a, acc);
                 }
             }
-            Expr::NullIf(lhs, rhs) | Expr::IsDistinctFrom { lhs, rhs, .. } => {
+            Expr::NullIf(lhs, rhs)
+            | Expr::IsDistinctFrom { lhs, rhs, .. }
+            | Expr::RegexMatch {
+                lhs, pattern: rhs, ..
+            } => {
                 collect_idents(lhs, acc);
                 collect_idents(rhs, acc);
             }
@@ -1088,6 +1115,19 @@ pub(crate) fn map_expr_idents(expr: &Expr, f: &dyn Fn(&str) -> String) -> Expr {
             negated: *negated,
             lhs: Box::new(rec(lhs)),
             rhs: Box::new(rec(rhs)),
+        },
+        Expr::RegexMatch {
+            negated,
+            case_insensitive,
+            lhs,
+            pattern,
+            raw_pattern_len,
+        } => Expr::RegexMatch {
+            negated: *negated,
+            case_insensitive: *case_insensitive,
+            lhs: Box::new(rec(lhs)),
+            pattern: Box::new(rec(pattern)),
+            raw_pattern_len: *raw_pattern_len,
         },
         Expr::Collate { expr, collation } => Expr::Collate {
             expr: Box::new(rec(expr)),

@@ -326,6 +326,12 @@ pub(crate) fn check_index_expression_determinism(
             detail: "IS [NOT] DISTINCT FROM is not supported in an index expression or predicate"
                 .to_string(),
         }),
+        // 正規表現マッチも同様（SQL-55・Issue #1787。fail-closed）。
+        Expr::RegexMatch { .. } => Err(SqlSurfaceError::FeatureNotSupported {
+            detail:
+                "regular expression operators are not supported in an index expression or predicate"
+                    .to_string(),
+        }),
         Expr::Collate { expr, .. } | Expr::Cast { expr, .. } => {
             check_index_expression_determinism(expr, site)
         }
@@ -439,9 +445,11 @@ pub(crate) fn expr_contains_collate(expr: &Expr) -> bool {
         Expr::Coalesce(items) | Expr::ArrayConstructor(items) => {
             items.iter().any(expr_contains_collate)
         }
-        Expr::NullIf(a, b) | Expr::IsDistinctFrom { lhs: a, rhs: b, .. } => {
-            expr_contains_collate(a) || expr_contains_collate(b)
-        }
+        Expr::NullIf(a, b)
+        | Expr::IsDistinctFrom { lhs: a, rhs: b, .. }
+        | Expr::RegexMatch {
+            lhs: a, pattern: b, ..
+        } => expr_contains_collate(a) || expr_contains_collate(b),
         Expr::Cast { expr, .. } => expr_contains_collate(expr),
         Expr::SqlJsonQuery(q) => q.children().into_iter().any(expr_contains_collate),
         Expr::Subscript { base, subscript } => {
@@ -565,6 +573,19 @@ pub(crate) fn fold_session_local_literals(expr: &Expr) -> Result<Expr, SqlSurfac
             negated: *negated,
             lhs: Box::new(rec(lhs)?),
             rhs: Box::new(rec(rhs)?),
+        },
+        Expr::RegexMatch {
+            negated,
+            case_insensitive,
+            lhs,
+            pattern,
+            raw_pattern_len,
+        } => Expr::RegexMatch {
+            negated: *negated,
+            case_insensitive: *case_insensitive,
+            lhs: Box::new(rec(lhs)?),
+            pattern: Box::new(rec(pattern)?),
+            raw_pattern_len: *raw_pattern_len,
         },
         Expr::Collate { expr, collation } => Expr::Collate {
             expr: Box::new(rec(expr)?),
@@ -718,6 +739,10 @@ pub(crate) fn check_bound_index_expression_determinism(
             }
             rec(a)?;
             rec(b)
+        }
+        Expr::RegexMatch { lhs, pattern, .. } => {
+            rec(lhs)?;
+            rec(pattern)
         }
         Expr::Collate { expr, .. } => rec(expr),
         Expr::Cast { expr: inner, ty } => {

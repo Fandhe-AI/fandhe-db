@@ -190,17 +190,23 @@ fn scan_rejects_using_mode_suffix_with_42601() {
     read_ready_for_query(&mut stream);
 }
 
-/// Issue #454: `ORDER BY`／`USING PLAN`／`LIMIT` のいずれも無い形は許可リスト外
-/// （`42601`）のまま（広域取得の追加が既存の必須句判定を緩めていないことの
-/// 回帰確認）。
+/// Issue #1796（SQL-34）: `ORDER BY`／`USING PLAN`／`LIMIT` のいずれも無い形と `LIMIT ALL` は
+/// 広域取得として受理され、上限（既定 10,000）以内なら全可視行を返す（分割送出は #1798）。
 #[test]
-fn plain_select_without_order_by_or_limit_still_rejected_with_42601() {
+fn plain_select_without_limit_is_accepted_as_scan() {
     let (core, _guard) = new_core_scan_docs();
     let (mut stream, _users_path) = spawn_with_alice(core);
 
-    send_simple_query(&mut stream, "SELECT id FROM docs");
-    expect_error_response_with_sqlstate(&mut stream, "42601");
-    read_ready_for_query(&mut stream);
+    for sql in ["SELECT id FROM docs", "SELECT id FROM docs LIMIT ALL"] {
+        send_simple_query(&mut stream, sql);
+        let _columns = read_row_description(&mut stream);
+        // alice の可視行は Public 3 件 + 自テナント Private 1 件の計 4 件。
+        for _ in 0..4 {
+            let _ = read_data_row(&mut stream);
+        }
+        assert_eq!(read_command_complete(&mut stream), "SELECT 4", "{sql}");
+        read_ready_for_query(&mut stream);
+    }
 }
 
 /// Issue #922（SQL-27）: `EXPLAIN` の対象を広域取得へ拡大したため、bare LIMIT

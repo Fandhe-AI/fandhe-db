@@ -375,6 +375,15 @@ pub(crate) fn rewrite_aggregate(
                 if let AggregateArg::Expr(e) = &agg.arg {
                     agg.arg = AggregateArg::Expr(map_expr_idents(e, &|c| map.physical(c)));
                 }
+                // SQL-57: `string_agg` の区切り・内側 `ORDER BY` の式も物理列名へ写す。
+                agg.extra_args = agg
+                    .extra_args
+                    .iter()
+                    .map(|e| map_expr_idents(e, &|c| map.physical(c)))
+                    .collect();
+                for k in &mut agg.order_by {
+                    k.expr = map_expr_idents(&k.expr, &|c| map.physical(c));
+                }
                 AggregateSelectItem::Aggregate(agg)
             }
             AggregateSelectItem::Expr { .. } => return Err(unsupported_position()),

@@ -242,6 +242,10 @@ fn is_where_group_operator_token(token: &Token) -> bool {
             | Token::Punct('-')
             | Token::Punct('*')
             | Token::Punct('/')
+            | Token::RegexMatch
+            | Token::RegexMatchCi
+            | Token::RegexNotMatch
+            | Token::RegexNotMatchCi
     ) || is_json_operator_token(token)
 }
 
@@ -344,7 +348,7 @@ fn where_compare_op_token(token: &Token) -> Option<CompareOp> {
 pub(crate) fn is_aggregate_function_name(name: &str) -> bool {
     matches!(
         name.to_ascii_uppercase().as_str(),
-        "COUNT" | "SUM" | "AVG" | "MIN" | "MAX"
+        "COUNT" | "SUM" | "AVG" | "MIN" | "MAX" | "STRING_AGG"
     )
 }
 
@@ -808,6 +812,10 @@ pub enum SqlSurfaceError {
     /// SQL-56 (2)・Issue #1792）。束縛段が返す。含めるのは利用者が書いた位置の値だけで、
     /// 列名・テナント情報は含めない。可否は文とスキーマだけで決まり、行の内容に依存しない。
     OrderByPositionNotInSelectList { position: i64 },
+    /// `string_agg(DISTINCT ...)` の内側 `ORDER BY` の式が引数に現れない（`42P10`。
+    /// SQL-57・Issue #1800）。束縛段が返す固定文言で、列名・値を含めない。可否は文だけで
+    /// 決まり、行の内容に依存しない。
+    AggregateOrderByNotInArguments,
     /// DDL 文（`CREATE TABLE`・`DROP TABLE` 等。SQL-23、TASK-202・TASK-203、
     /// Issue #899・#902）を、DDL 実行権限（[`crate::sql::mode::SessionState::
     /// ddl_allowed`]）を持たないセッションが実行しようとした（ERR-2 拡張:
@@ -941,6 +949,10 @@ pub enum SqlSurfaceError {
     /// jsonpath 文字列の解析失敗（束縛時。Issue #2185）。分類・文言は内側の
     /// [`crate::json::jsonpath::JsonPathParseError`] に委譲する。
     JsonPathParse(crate::json::jsonpath::JsonPathParseError),
+    /// 正規表現マッチ（`~` 系。SQL-55・Issue #1787）の失敗。分類・文言は内側の
+    /// [`crate::regex_match::RegexError`] に委譲する（`2201B`／`0A000`／`54000`。固定の英語文で
+    /// パターン・入力の断片を含めない）。
+    Regex(crate::regex_match::RegexError),
 }
 
 impl SqlSurfaceError {
@@ -1416,9 +1428,8 @@ impl ClassifiedError for SqlSurfaceError {
             SqlSurfaceError::PartitionedJobBusy { .. } => ErrorClass::LockNotAvailable,
             SqlSurfaceError::DuplicateColumn { .. } => ErrorClass::DuplicateColumn,
             SqlSurfaceError::InvalidColumnReference
-            | SqlSurfaceError::OrderByPositionNotInSelectList { .. } => {
-                ErrorClass::InvalidColumnReference
-            }
+            | SqlSurfaceError::OrderByPositionNotInSelectList { .. }
+            | SqlSurfaceError::AggregateOrderByNotInArguments => ErrorClass::InvalidColumnReference,
             SqlSurfaceError::InsufficientPrivilege
             | SqlSurfaceError::ConflictTargetNotVisible
             | SqlSurfaceError::SchemaDependencyForbidden => ErrorClass::ForbiddenTenantMismatch,
@@ -1444,6 +1455,7 @@ impl ClassifiedError for SqlSurfaceError {
             SqlSurfaceError::AmbiguousColumn { .. } => ErrorClass::AmbiguousColumn,
             SqlSurfaceError::JsonPathEval(e) => e.error_class(),
             SqlSurfaceError::JsonPathParse(e) => e.error_class(),
+            SqlSurfaceError::Regex(e) => e.error_class(),
         }
     }
 
@@ -1452,6 +1464,7 @@ impl ClassifiedError for SqlSurfaceError {
             SqlSurfaceError::Internal { .. } => "internal error".to_string(),
             SqlSurfaceError::JsonPathEval(e) => e.client_message(),
             SqlSurfaceError::JsonPathParse(e) => e.client_message(),
+            SqlSurfaceError::Regex(e) => e.client_message(),
             other => other.to_string(),
         }
     }
@@ -1670,6 +1683,10 @@ impl std::fmt::Display for SqlSurfaceError {
             SqlSurfaceError::OrderByPositionNotInSelectList { position } => {
                 write!(f, "ORDER BY position {position} is not in select list")
             }
+            SqlSurfaceError::AggregateOrderByNotInArguments => write!(
+                f,
+                "in an aggregate with DISTINCT, ORDER BY expressions must appear in argument list"
+            ),
             // テーブル名・ユーザー名を含めない固定文言（security.md P0。
             // `SqlSurfaceError::InsufficientPrivilege` ドキュメント参照）。
             SqlSurfaceError::InsufficientPrivilege => {
@@ -1764,6 +1781,7 @@ impl std::fmt::Display for SqlSurfaceError {
             }
             SqlSurfaceError::JsonPathEval(e) => f.write_str(&e.client_message()),
             SqlSurfaceError::JsonPathParse(e) => f.write_str(&e.client_message()),
+            SqlSurfaceError::Regex(e) => f.write_str(&e.client_message()),
         }
     }
 }
@@ -2661,6 +2679,10 @@ pub(crate) struct BufferedRows {
     /// 利用者が `LIMIT` を明示したか。false は連鎖の素通し外側（`LIMIT` なし＝無制限で
     /// `limit` は `u32::MAX`）。明示値は `u32::MAX` でも必ず設定上限で検査する（Issue #1555）。
     pub(crate) limit_explicit: bool,
+    /// 利用者の文が外側 `LIMIT` を省略または `LIMIT ALL` にしたか（Issue #1796・SQL-34）。
+    /// true のとき `limit` は `u32::MAX`・`limit_explicit` は false で、外側の後処理後の
+    /// 件数が結果行数上限を超えたら `54000`（連鎖の素通しの `limit_explicit: false` と区別する）。
+    pub(crate) limit_implicit: bool,
     /// 外側 `OFFSET`（範囲検証済み。既定 0）。
     pub(crate) offset: u32,
 }
@@ -3013,6 +3035,10 @@ pub struct ValidatedSetOperation {
     /// describe_columns` が Describe 経路で同じ検証を行う（PR #1105 レビュー
     /// 指摘対応。Execute／Describe の受理・拒否を一致させる）。
     pub(crate) limit: Option<u32>,
+    /// 全体 `OFFSET m`（省略時 `0`。`LIMIT ALL OFFSET m`・`OFFSET m` 単独を含む。
+    /// Issue #1796）。範囲検証（`0..=core::MAX_SEARCH_K`）は `limit` と同じく実行・
+    /// Describe 双方が行い、適用順は OFFSET が先・LIMIT／結果行数上限の判定が後。
+    pub(crate) offset: u32,
 }
 
 /// `EXPLAIN` の対象文（Issue #922・SQL-27。TASK-78・SQL-6 の `USING PLAN` 付き
@@ -3063,6 +3089,9 @@ pub enum AggregateFunc {
     Avg,
     Min,
     Max,
+    /// `string_agg(<値>, <区切り> [ORDER BY ...])`（SQL-57・Issue #1800）。結果は常に text。
+    /// 集計の内側の `ORDER BY`・`DISTINCT` を受理する唯一の関数（SQL 表層のみ）。
+    StringAgg,
 }
 
 impl AggregateFunc {
@@ -3074,6 +3103,7 @@ impl AggregateFunc {
             "AVG" => Some(AggregateFunc::Avg),
             "MIN" => Some(AggregateFunc::Min),
             "MAX" => Some(AggregateFunc::Max),
+            "STRING_AGG" => Some(AggregateFunc::StringAgg),
             _ => None,
         }
     }
@@ -3086,6 +3116,7 @@ impl AggregateFunc {
             AggregateFunc::Avg => "avg",
             AggregateFunc::Min => "min",
             AggregateFunc::Max => "max",
+            AggregateFunc::StringAgg => "string_agg",
         }
     }
 }
@@ -3109,6 +3140,23 @@ pub struct AggregateItem {
     pub(crate) arg: AggregateArg,
     pub(crate) alias: Option<String>,
     pub(crate) distinct: bool,
+    /// 2 つめ以降の引数（SQL-57。`string_agg` の区切り式。それ以外の関数では常に空。
+    /// 個数は構文段が関数ごとに固定する）。
+    pub(crate) extra_args: Vec<Expr>,
+    /// 集計の内側の `ORDER BY`（SQL-57。`string_agg` のみ非空になりうる。キー数の上限は
+    /// [`MAX_SCALAR_ORDER_KEYS`]）。文レベルの `ORDER BY`（[`AggregateOrderBy`]）とは別物。
+    pub(crate) order_by: Vec<AggregateOrderKey>,
+}
+
+/// 集計の内側の `ORDER BY` 1 キー（SQL-57・Issue #1800。`string_agg(x, ',' ORDER BY y DESC)`）。
+/// 式は行ごとに評価する（序数は式＝定数として読み、出力列の位置とは解釈しない）。
+/// 意味論の解決（型・照合・NULL 位置の確定）は `sql::parser::resolve_string_agg_input` の責務。
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct AggregateOrderKey {
+    pub(crate) expr: Expr,
+    pub(crate) descending: bool,
+    /// 明示した `NULLS FIRST|LAST`（省略時は束縛段が PostgreSQL 既定へ確定させる。SQL-56）。
+    pub(crate) nulls: Option<NullPlacement>,
 }
 
 /// ウィンドウ関数（SQL-30・TASK-214、Issue #930）の種別。順位関数
@@ -3287,6 +3335,14 @@ impl AggregateSelectItem {
             if let AggregateArg::Expr(e) = &agg.arg {
                 super::parser::collect_expr_idents(e, out);
             }
+            // SQL-57: `string_agg` の区切り・内側 `ORDER BY` の式の識別子も参照列に含める
+            // （漏れると列の公開範囲検査・参照列の導出をすり抜けて非公開列を参照できてしまう）。
+            for e in &agg.extra_args {
+                super::parser::collect_expr_idents(e, out);
+            }
+            for k in &agg.order_by {
+                super::parser::collect_expr_idents(&k.expr, out);
+            }
         };
         match self {
             AggregateSelectItem::GroupKey { column, .. } => {
@@ -3393,9 +3449,8 @@ pub struct GroupByClause {
     pub(crate) limit: Option<u32>,
     /// `FETCH FIRST n ROWS WITH TIES`（SQL-56 (3)・Issue #1793）。`limit` が `Some` のときだけ真。
     pub(crate) with_ties: bool,
-    /// `OFFSET` の生値（Issue #916・SQL-25 (b)・TASK-209）。`limit` が `None` のとき
-    /// `OFFSET` 単独は構文段（[`parse_aggregate_shape`]）で `42601` に落ちるため常に
-    /// `0`。範囲検証は `sql::parser::bind_group_by_clause` が束縛時に行う。
+    /// `OFFSET` の生値（Issue #916・SQL-25 (b)・TASK-209）。`LIMIT` 省略・`LIMIT ALL` でも
+    /// `OFFSET` 単独を受理する（Issue #1796。`SELECT DISTINCT` 形を含む）。範囲検証は `sql::parser::bind_group_by_clause` が束縛時に行う。
     pub(crate) offset: u32,
 }
 
@@ -3463,6 +3518,12 @@ pub struct ValidatedScan {
     /// （早期終了。`order_by` が空の場合、順序保証はスナップショット内の物理
     /// 走査順のみで `ORDER BY` 相当の意味的順序を持たない）。
     pub(crate) limit: u32,
+    /// `LIMIT` が省略または `LIMIT ALL` だったか（Issue #1796・SQL-34）。true のとき
+    /// [`Self::limit`] は番兵値 `u32::MAX` で、束縛段（`sql::parser::bind_scan_with_dummy_flags`）
+    /// が結果行数上限 + 1 の取得上限へ差し替え、実行段が超過を `54000` にする。範囲検証を
+    /// 通る経路が印を見落としても `u32::MAX` は `22000` で拒否される（fail-closed）。
+    /// 構文段の検証経路だけが立てる（`pub(crate)`）。
+    pub(crate) limit_implicit: bool,
     /// スカラー列 `ORDER BY`（Issue #915・SQL-25・TASK-209）。空ならソート
     /// なし（従来どおりの物理走査順。§1「広域取得」ドキュメント参照）。
     pub(crate) order_by: Vec<ScalarOrderKey>,
@@ -5418,6 +5479,26 @@ impl<'a> Parser<'a> {
         }
     }
 
+    /// 任意の `LIMIT {n | ALL}` を判定・消費する（Issue #1796・SQL-34）。`LIMIT` が無い
+    /// 場合と `LIMIT ALL` はどちらも `None`（件数の制限なし。PostgreSQL と同じ）を返す。
+    /// `ALL` は [`Self::peek_ident_matches`] と同じ理由で文脈識別子として照合する。
+    /// 暗黙の結果行数上限（`--max-result-rows`）の適用は束縛段・実行段の責務で、
+    /// ここでは構文を受理するのみ。数値の構文エラーは従来どおり `42601`。
+    fn parse_optional_limit(&mut self) -> Result<Option<u32>, SqlSurfaceError> {
+        if !matches!(self.peek(), Some(Token::Keyword(Keyword::Limit))) {
+            return Ok(None);
+        }
+        self.advance();
+        if self.peek_ident_matches("ALL") {
+            self.advance();
+            return Ok(None);
+        }
+        let raw = self.expect_number()?;
+        raw.parse()
+            .map(Some)
+            .map_err(|_| SqlSurfaceError::unsupported(format!("malformed LIMIT value: {raw}")))
+    }
+
     /// `LIMIT n` の直後に現れうる任意の `OFFSET m` を判定・消費する（Issue #916・
     /// SQL-25 (b)・TASK-209）。`USING`・`SET` と同じ理由（[`Self::peek_ident_matches`]
     /// 参照）で `OFFSET` は [`crate::sql::lexer::Keyword`] に追加せず、この位置限定の
@@ -5895,15 +5976,26 @@ impl<'a> Parser<'a> {
         // 消費する（[`is_distinct_modifier`] と同じ判定規則。列名 `distinct` を
         // 引数に持つ `COUNT(distinct)` を壊さないよう、次のトークンが識別子・`*`
         // でない場合は消費しない）。
-        let distinct = if is_distinct_modifier(&self.tokens, self.pos) {
+        // `string_agg` の引数位置に限り、`DISTINCT` 直後の文字列リテラル・`(` も修飾子と判定する
+        // （`string_agg(DISTINCT 'x', ',')`・`DISTINCT ('x')`。PostgreSQL と同じ読み）。
+        let string_agg_modifier = func == AggregateFunc::StringAgg
+            && matches!(
+                self.tokens.get(self.pos),
+                Some(Token::Ident(n)) if n.eq_ignore_ascii_case("DISTINCT")
+            )
+            && matches!(
+                self.tokens.get(self.pos + 1),
+                Some(Token::StringLiteral(_)) | Some(Token::Punct('('))
+            );
+        let distinct = if string_agg_modifier || is_distinct_modifier(&self.tokens, self.pos) {
             self.advance();
             true
         } else {
             false
         };
-        if distinct && func != AggregateFunc::Count {
+        if distinct && !matches!(func, AggregateFunc::Count | AggregateFunc::StringAgg) {
             return Err(SqlSurfaceError::unsupported(
-                "DISTINCT is only allowed inside COUNT(DISTINCT ...)",
+                "DISTINCT is only allowed inside COUNT(DISTINCT ...) and string_agg",
             ));
         }
         let arg = if matches!(self.peek(), Some(Token::Punct('*'))) {
@@ -5928,18 +6020,106 @@ impl<'a> Parser<'a> {
             let saved_calls = self.agg_calls.take();
             let saved_minus = self.allow_unary_minus;
             self.allow_unary_minus = false;
+            // `string_agg` の引数位置は text と確定するため、裸の `NULL` をリテラルとして解析する。
+            let saved_null = self.allow_null_literal;
+            self.allow_null_literal = func == AggregateFunc::StringAgg;
             let parsed = self.parse_value_expr(0);
+            self.allow_null_literal = saved_null;
             self.allow_unary_minus = saved_minus;
             self.agg_calls = saved_calls;
             AggregateArg::Expr(parsed?)
         };
+        let mut extra_args = Vec::new();
+        let mut order_by = Vec::new();
+        if func == AggregateFunc::StringAgg {
+            // `string_agg(<値>, <区切り> [ORDER BY ...])`（SQL-57）。引数の個数が誤りの形は
+            // PostgreSQL と同じく該当シグネチャの関数が無い扱い（`42883`。Issue #1349 の前例）。
+            if !matches!(self.peek(), Some(Token::Punct(','))) {
+                return Err(SqlSurfaceError::undefined_function(
+                    "function string_agg requires exactly two arguments",
+                ));
+            }
+            self.advance();
+            let saved_calls = self.agg_calls.take();
+            let saved_minus = self.allow_unary_minus;
+            self.allow_unary_minus = false;
+            let saved_null = self.allow_null_literal;
+            self.allow_null_literal = true;
+            let parsed = self.parse_value_expr(0);
+            self.allow_null_literal = saved_null;
+            self.allow_unary_minus = saved_minus;
+            self.agg_calls = saved_calls;
+            extra_args.push(parsed?);
+            if matches!(self.peek(), Some(Token::Punct(','))) {
+                return Err(SqlSurfaceError::undefined_function(
+                    "function string_agg requires exactly two arguments",
+                ));
+            }
+            if matches!(self.peek(), Some(Token::Keyword(Keyword::Order))) {
+                order_by = self.parse_in_aggregate_order_by()?;
+            }
+        }
         self.expect_punct(')')?;
         Ok(AggregateItem {
             func,
             arg,
             alias: None,
             distinct,
+            extra_args,
+            order_by,
         })
+    }
+
+    /// 集計呼び出しの内側の `ORDER BY <式> [ASC|DESC] [NULLS FIRST|LAST] (',' ...)*`（SQL-57・
+    /// Issue #1800）。呼び出し元は [`Self::parse_aggregate_call_after_name`]（`string_agg` のみ）。
+    /// 文レベルの [`Self::parse_aggregate_order_by`] と違い、キーは常に値式（集計の内側では
+    /// 整数リテラルも定数式であり、出力列の位置〔序数〕とは解釈しない）。キー数の上限
+    /// （[`MAX_SCALAR_ORDER_KEYS`]）は確保前に検査し、超過は `54000`。引数と同じく入れ子の
+    /// 集計・単項マイナス拡張は無効にして解析する（入れ子集計は従来どおり `42601`）。
+    fn parse_in_aggregate_order_by(&mut self) -> Result<Vec<AggregateOrderKey>, SqlSurfaceError> {
+        self.expect_keyword(Keyword::Order)?;
+        self.expect_keyword(Keyword::By)?;
+        let mut keys = Vec::new();
+        loop {
+            if keys.len() >= MAX_SCALAR_ORDER_KEYS {
+                return Err(SqlSurfaceError::payload_too_large(
+                    "too many aggregate ORDER BY keys",
+                ));
+            }
+            let saved_calls = self.agg_calls.take();
+            let saved_minus = self.allow_unary_minus;
+            self.allow_unary_minus = false;
+            // 引数と同じく裸の `NULL` をリテラルとして解析する（DISTINCT 時の ORDER BY 式一致判定と
+            // 非 DISTINCT 時の評価を引数側と揃える）。
+            let saved_null = self.allow_null_literal;
+            self.allow_null_literal = true;
+            let parsed = self.parse_value_expr(0);
+            self.allow_null_literal = saved_null;
+            self.allow_unary_minus = saved_minus;
+            self.agg_calls = saved_calls;
+            let expr = parsed?;
+            let descending = if self.peek_ident_matches("DESC") {
+                self.advance();
+                true
+            } else {
+                if self.peek_ident_matches("ASC") {
+                    self.advance();
+                }
+                false
+            };
+            let nulls = self.parse_order_nulls();
+            keys.push(AggregateOrderKey {
+                expr,
+                descending,
+                nulls,
+            });
+            if matches!(self.peek(), Some(Token::Punct(','))) {
+                self.advance();
+                continue;
+            }
+            break;
+        }
+        Ok(keys)
     }
 
     /// 式モード解析中（[`Self::agg_calls`] が `Some`）に現れた集計関数呼び出しを読み、
@@ -6293,33 +6473,29 @@ impl<'a> Parser<'a> {
     /// 集計 `GROUP BY` の `LIMIT <n>`（TASK-167・SQL-14）。構文段では `u32` として
     /// 受理するのみで、範囲検査（`1..=MAX_GROUPS`）は束縛段
     /// （`sql::parser::bind_aggregate`）が行う。
-    fn parse_aggregate_limit(&mut self) -> Result<(u32, bool), SqlSurfaceError> {
+    fn parse_aggregate_limit(&mut self) -> Result<(Option<u32>, bool), SqlSurfaceError> {
         self.parse_limit_or_ties()
     }
 
-    /// `LIMIT <n>`、または `sql::fetch_clause` が書き換えた `WITH TIES` の正規形
-    /// `FETCH FIRST <n> ROWS WITH TIES` を消費し、`(n, with_ties)` を返す（SQL-56 (3)・
-    /// Issue #1793）。件数の字句・`u32` 変換は `LIMIT` と同一の経路で、範囲検証は束縛段が担う。
-    /// 正規形を受理する呼び出し元は、広域取得のスカラー `ORDER BY` 分岐と集計 `GROUP BY` だけ。
-    fn parse_limit_or_ties(&mut self) -> Result<(u32, bool), SqlSurfaceError> {
-        let with_ties = if self.peek_ident_matches("FETCH") {
-            self.advance();
-            self.expect_ident_matching("FIRST")?;
-            true
-        } else {
-            self.expect_keyword(Keyword::Limit)?;
-            false
-        };
+    /// `LIMIT <n>`・`LIMIT ALL`・省略（Issue #1796・SQL-34。`None`）、または `sql::fetch_clause` が
+    /// 書き換えた `WITH TIES` の正規形 `FETCH FIRST <n> ROWS WITH TIES` を消費し、
+    /// `(limit, with_ties)` を返す（SQL-56 (3)・Issue #1793）。件数の字句・`u32` 変換は `LIMIT` と
+    /// 同一の経路で、範囲検証は束縛段が担う。正規形を受理する呼び出し元は、広域取得のスカラー
+    /// `ORDER BY` 分岐と集計 `GROUP BY` だけ。
+    fn parse_limit_or_ties(&mut self) -> Result<(Option<u32>, bool), SqlSurfaceError> {
+        if !self.peek_ident_matches("FETCH") {
+            return Ok((self.parse_optional_limit()?, false));
+        }
+        self.advance();
+        self.expect_ident_matching("FIRST")?;
         let raw = self.expect_number()?;
         let limit: u32 = raw
             .parse()
             .map_err(|_| SqlSurfaceError::unsupported(format!("malformed LIMIT value: {raw}")))?;
-        if with_ties {
-            self.expect_ident_matching("ROWS")?;
-            self.expect_ident_matching("WITH")?;
-            self.expect_ident_matching("TIES")?;
-        }
-        Ok((limit, with_ties))
+        self.expect_ident_matching("ROWS")?;
+        self.expect_ident_matching("WITH")?;
+        self.expect_ident_matching("TIES")?;
+        Ok((Some(limit), true))
     }
 
     /// WHERE 句の許可形状（等価条件・前方一致条件（TASK-147・EXT-3）・述語呼び出し形・
@@ -6772,6 +6948,12 @@ impl<'a> Parser<'a> {
         if let Some((negated, case_insensitive, len)) = self.like_at(self.pos) {
             return self.parse_like_rest(negated, case_insensitive, len, lhs);
         }
+        if let Some((negated, case_insensitive)) = self.regex_op_at(self.pos) {
+            return self.parse_regex_rest(negated, case_insensitive, lhs);
+        }
+        if let Some((negated, kw_len)) = self.similar_at(self.pos) {
+            return self.parse_similar_rest(negated, kw_len, lhs);
+        }
         if let Expr::JsonAccess { op, .. } = &lhs {
             if op.is_predicate() && !self.peek_is_cmp_op() {
                 return Ok(ExprLeaf::Plain(lhs));
@@ -6861,7 +7043,170 @@ impl<'a> Parser<'a> {
         ))
     }
 
-    /// `)` の位置 `close_idx` の直後が `[NOT] LIKE|ILIKE` なら真。括弧付き左辺
+    /// `tokens[idx]` が正規表現マッチ演算子（`~` `~*` `!~` `!~*`）で、直後がパターンとして
+    /// 受理できる形（`::` の続かない文字列リテラル、または引用なしの裸の `NULL`）なら
+    /// `(negated, case_insensitive)` を返す（消費しない。SQL-55・Issue #1787）。それ以外の
+    /// パターン（列・式・`::` 付き・数値）は `None` にして、呼び出し元の比較演算子検査が
+    /// `42601` で fail-closed にする。`$n` は Bind で文字列リテラル（または `NULL`）へ置換済み。
+    fn regex_op_at(&self, idx: usize) -> Option<(bool, bool)> {
+        let (negated, case_insensitive) = match self.tokens.get(idx)? {
+            Token::RegexMatch => (false, false),
+            Token::RegexMatchCi => (false, true),
+            Token::RegexNotMatch => (true, false),
+            Token::RegexNotMatchCi => (true, true),
+            _ => return None,
+        };
+        let pat = idx.checked_add(1)?;
+        let ok = match self.tokens.get(pat) {
+            Some(Token::StringLiteral(_)) => !literal_followed_by_typecast(&self.tokens, pat),
+            Some(Token::Ident(w)) => {
+                w.eq_ignore_ascii_case("NULL")
+                    && !self.quoted_null.contains(&pat)
+                    && !matches!(
+                        self.tokens.get(pat.saturating_add(1)),
+                        Some(Token::TypeCast)
+                    )
+            }
+            _ => false,
+        };
+        ok.then_some((negated, case_insensitive))
+    }
+
+    /// 式左辺 `lhs` の `~`／`~*`／`!~`／`!~*` `<pattern>` の続きを読み [`Expr::RegexMatch`] を作る
+    /// （対象ビヘイビア: SQL-55。Issue #1787）。パターンは文字列リテラルか裸の `NULL` のみ
+    /// （[`Self::regex_op_at`] が検証済み）。CHECK 本体は評価経路が未結線のため `0A000`
+    /// （fail-closed）。パターンの後ろに演算子等が続く形は呼び出し元の終端検査が `42601` で拒否する。
+    fn parse_regex_rest(
+        &mut self,
+        negated: bool,
+        case_insensitive: bool,
+        lhs: Expr,
+    ) -> Result<ExprLeaf, SqlSurfaceError> {
+        if self.in_check_body {
+            return Err(SqlSurfaceError::FeatureNotSupported {
+                detail: "regular expression operators are not supported in a CHECK constraint"
+                    .to_string(),
+            });
+        }
+        self.advance();
+        let pattern = if matches!(self.peek(), Some(Token::StringLiteral(_))) {
+            Expr::String(self.expect_string_literal()?)
+        } else {
+            self.advance();
+            Expr::Null
+        };
+        self.consume_expr_node()?;
+        self.consume_expr_node()?;
+        Ok(ExprLeaf::Plain(Expr::RegexMatch {
+            negated,
+            case_insensitive,
+            lhs: Box::new(lhs),
+            pattern: Box::new(pattern),
+            raw_pattern_len: None,
+        }))
+    }
+
+    /// `tokens[idx]` から `[NOT] SIMILAR TO` に続けてパターン（`::` の続かない文字列リテラル、
+    /// または引用なしの裸の `NULL`）が並んでいれば `(negated, キーワード部のトークン数)` を返す
+    /// （消費しない。SQL-55・Issue #1788）。`SIMILAR`／`TO` は [`crate::sql::lexer::Keyword`] へ
+    /// 追加せず文脈照合する（`similar`・`to` という列名を壊さないため）。パターンが列・式・
+    /// `::` 付きの形は `None` にして、呼び出し元の比較演算子検査が `42601` で fail-closed にする
+    /// （[`Self::regex_op_at`] と同じ判定）。`$n` は Bind で文字列リテラルへ置換済み。
+    fn similar_at(&self, idx: usize) -> Option<(bool, usize)> {
+        let word = |i: usize, k: &str| matches!(self.tokens.get(i), Some(Token::Ident(w)) if w.eq_ignore_ascii_case(k));
+        let (negated, kw) = if word(idx, "NOT") {
+            (true, idx.checked_add(1)?)
+        } else {
+            (false, idx)
+        };
+        if !word(kw, "SIMILAR") || !word(kw.checked_add(1)?, "TO") {
+            return None;
+        }
+        let pat = kw.checked_add(2)?;
+        let ok = match self.tokens.get(pat) {
+            Some(Token::StringLiteral(_)) => !literal_followed_by_typecast(&self.tokens, pat),
+            Some(Token::Ident(w)) => {
+                w.eq_ignore_ascii_case("NULL")
+                    && !self.quoted_null.contains(&pat)
+                    && !matches!(
+                        self.tokens.get(pat.saturating_add(1)),
+                        Some(Token::TypeCast)
+                    )
+            }
+            _ => false,
+        };
+        ok.then_some((negated, pat.checked_sub(idx)?))
+    }
+
+    /// 式左辺 `lhs` の `[NOT] SIMILAR TO <pattern> [ESCAPE '<c>']` の続きを読み、SQL 正規表現を
+    /// ARE（全体一致の `^(?:…)$`）へ変換して [`Expr::RegexMatch`]（`~` と同じ AST）を作る
+    /// （対象ビヘイビア: SQL-55。Issue #1788）。変換を構文段で行うのは、束縛・評価・索引の判定を
+    /// `~` 系と完全に共有し、`SIMILAR TO` 専用の経路を増やさないため。パターンの検証
+    /// （ARE としての構文誤り `2201B`・非対応 `0A000`・長さ `54000`）は束縛時の
+    /// `sql::regex_op::compile_regex_pattern` が行う。`ESCAPE` 句は文脈照合で、直後が `::` の
+    /// 続かない文字列リテラルのときだけ句として消費する（`ESCAPE NULL`・`ESCAPE $n` は消費せず
+    /// 呼び出し元の終端検査が `42601` にする）。値が 2 文字以上なら `22025`、空文字列はエスケープ
+    /// 無し。CHECK 本体は評価経路が未結線のため `0A000`（fail-closed）。パターンが NULL なら
+    /// 変換せず NULL のまま（結果は否定の有無に関わらず NULL）。
+    fn parse_similar_rest(
+        &mut self,
+        negated: bool,
+        kw_len: usize,
+        lhs: Expr,
+    ) -> Result<ExprLeaf, SqlSurfaceError> {
+        if self.in_check_body {
+            return Err(SqlSurfaceError::FeatureNotSupported {
+                detail: "SIMILAR TO is not supported in a CHECK constraint".to_string(),
+            });
+        }
+        for _ in 0..kw_len {
+            self.advance();
+        }
+        let raw = if matches!(self.peek(), Some(Token::StringLiteral(_))) {
+            Some(self.expect_string_literal()?)
+        } else {
+            self.advance();
+            None
+        };
+        let is_escape_clause = matches!(self.tokens.get(self.pos), Some(Token::Ident(w)) if w.eq_ignore_ascii_case("ESCAPE"))
+            && matches!(
+                self.tokens.get(self.pos.saturating_add(1)),
+                Some(Token::StringLiteral(_))
+            )
+            && !literal_followed_by_typecast(&self.tokens, self.pos.saturating_add(1));
+        let escape = if is_escape_clause {
+            self.advance();
+            let raw_escape = self.expect_string_literal()?;
+            let mut chars = raw_escape.chars();
+            let first = chars.next();
+            if chars.next().is_some() {
+                return Err(SqlSurfaceError::invalid_escape_sequence(
+                    "invalid escape string",
+                ));
+            }
+            first
+        } else {
+            Some('\\')
+        };
+        let raw_len = raw.as_ref().map(String::len);
+        let pattern = match raw {
+            Some(raw) => Expr::String(
+                crate::regex_match::similar_to_are(&raw, escape).map_err(SqlSurfaceError::Regex)?,
+            ),
+            None => Expr::Null,
+        };
+        self.consume_expr_node()?;
+        self.consume_expr_node()?;
+        Ok(ExprLeaf::Plain(Expr::RegexMatch {
+            negated,
+            case_insensitive: false,
+            lhs: Box::new(lhs),
+            pattern: Box::new(pattern),
+            raw_pattern_len: raw_len,
+        }))
+    }
+
+    /// `)` の位置 `close_idx` の直後が `[NOT] LIKE|ILIKE|SIMILAR TO` なら真。括弧付き左辺
     /// （`(lower(name)) LIKE 'a%'`）を真偽値グループでなく値式グループとして扱うための先読み
     /// （SQL-54・Issue #1782）。
     fn like_follows_group(&self, close_idx: usize) -> bool {
@@ -6872,12 +7217,15 @@ impl<'a> Parser<'a> {
 
     fn like_keyword_at(&self, idx: usize) -> bool {
         let word = |i: usize, k: &str| matches!(self.tokens.get(i), Some(Token::Ident(w)) if w.eq_ignore_ascii_case(k));
+        let similar_to =
+            |i: usize| word(i, "SIMILAR") && i.checked_add(1).is_some_and(|n| word(n, "TO"));
         word(idx, "LIKE")
             || word(idx, "ILIKE")
+            || similar_to(idx)
             || (word(idx, "NOT")
                 && idx
                     .checked_add(1)
-                    .is_some_and(|n| word(n, "LIKE") || word(n, "ILIKE")))
+                    .is_some_and(|n| word(n, "LIKE") || word(n, "ILIKE") || similar_to(n)))
     }
 
     /// 式左辺 `lhs` の `[NOT] LIKE|ILIKE '<lit>' [ESCAPE '<c>']` の続きを読み、
@@ -13624,8 +13972,15 @@ pub(crate) fn check_buffered_body_shape(
         ViewBodyCheck::Resolved => BodyExprPolicy::Reject,
     };
     match stmt {
+        // Issue #1796・SQL-34: 本文の `LIMIT` 省略・`LIMIT ALL` は従来どおり `42601`
+        // （ビュー・CTAS・matview の本文の暗黙上限は #1853／#2212 の範囲。受理範囲を広げない）。
+        Statement::Scan(v) if v.limit_implicit => Err(body_form_unsupported()),
         Statement::Scan(v) => check_body_scan(v, lookup, top_policy, out),
         Statement::Aggregate(v) => check_body_aggregate(v, lookup, top_policy, out),
+        // Issue #1796・SQL-34: 非集計 JOIN の `LIMIT` 省略・`LIMIT ALL` も本文では `42601`。
+        Statement::Join(v) if v.aggregate.is_none() && v.limit.is_none() => {
+            Err(body_form_unsupported())
+        }
         Statement::Join(v) => {
             for t in super::join::collect_join_tables(v) {
                 push_relation(out, &t);
@@ -13670,7 +14025,7 @@ fn check_body_buffered_view(
 ) -> Result<(), SqlSurfaceError> {
     match &v.outer {
         BufferedOuter::Rows(rows) => {
-            if !rows.order_keys.is_empty() || !rows.window_items.is_empty() {
+            if !rows.order_keys.is_empty() || !rows.window_items.is_empty() || rows.limit_implicit {
                 return Err(body_form_unsupported());
             }
             push_relation(out, &v.view_name);
@@ -13722,6 +14077,7 @@ pub(crate) fn buffered_layer_statement(
             window_items: Vec::new(),
             limit: u32::MAX,
             limit_explicit: false,
+            limit_implicit: false,
             offset: 0,
         })),
         column_aliases: Vec::new(),
@@ -13748,6 +14104,7 @@ pub(crate) fn buffered_alias_layer(
             window_items: Vec::new(),
             limit: u32::MAX,
             limit_explicit: false,
+            limit_implicit: false,
             offset: 0,
         })),
         column_aliases,
@@ -13817,6 +14174,10 @@ fn check_body_aggregate(
     for item in &v.items {
         match item {
             AggregateSelectItem::Aggregate(agg) => {
+                // `string_agg`（SQL-57）はビュー本体には含めさせない（fail-closed）。
+                if agg.func == AggregateFunc::StringAgg {
+                    return Err(body_form_unsupported());
+                }
                 if let AggregateArg::Expr(e) = &agg.arg {
                     if !matches!(e, Expr::Ident(_)) {
                         return Err(body_form_unsupported());
@@ -16474,7 +16835,9 @@ struct ParsedScanShape {
     table_name: String,
     projection: Projection,
     where_predicates: Vec<WherePredicate>,
-    limit: u32,
+    /// `LIMIT n` の値。`None` は `LIMIT` 省略または `LIMIT ALL`（Issue #1796・SQL-34。
+    /// 暗黙の結果行数上限の対象）。
+    limit: Option<u32>,
     /// スカラー列 `ORDER BY`（Issue #915・SQL-25）。空ならソートなし。
     order_by: Vec<ScalarOrderKey>,
     offset: u32,
@@ -16587,7 +16950,9 @@ fn is_join_reserved_word(w: &str) -> bool {
 /// 単一テーブル FROM の暗黙別名にできない語（JOIN 予約語 + 集合演算子。Issue #1534）。
 /// JOIN 側の受理範囲を変えないよう [`is_join_reserved_word`] とは別関数にする。
 fn is_single_table_reserved_word(w: &str) -> bool {
-    is_join_reserved_word(w) || is_set_operator_ident(w)
+    // `WITH` は `LIMIT` 省略を受理した（Issue #1796）後も、`CREATE MATERIALIZED VIEW ... WITH
+    // [NO] DATA` の末尾句の取り違えを別名として黙って受理しないための予約語。
+    is_join_reserved_word(w) || is_set_operator_ident(w) || w.eq_ignore_ascii_case("WITH")
 }
 
 /// `FROM` 直後のトークン列から `<table> [[AS] alias]` を試し解析し、`TableRef` と
@@ -17233,6 +17598,13 @@ fn parse_join_aggregate_item(p: &mut Parser<'_>) -> Result<JoinSelectItem, SqlSu
     let func = AggregateFunc::from_name(&name).ok_or_else(|| {
         SqlSurfaceError::unsupported(format!("unsupported aggregate function: {name}"))
     })?;
+    // `string_agg` の JOIN 対応は SQL-57 の対象外（1 引数形が列参照として通り、実行時に
+    // 内部エラーになるのを避けるため、構文段で明示的に拒否する）。
+    if func == AggregateFunc::StringAgg {
+        return Err(SqlSurfaceError::FeatureNotSupported {
+            detail: "string_agg is not supported in JOIN".to_string(),
+        });
+    }
     p.expect_punct('(')?;
     if p.peek_ident_matches("DISTINCT") {
         return Err(SqlSurfaceError::unsupported(
@@ -17745,19 +18117,9 @@ fn parse_join_statement(
 
     let order_by = parse_join_order_by(&mut p)?;
 
-    let limit: Option<u32> = if matches!(p.peek(), Some(Token::Keyword(Keyword::Limit))) {
-        p.advance();
-        let limit_str = p.expect_number()?;
-        Some(limit_str.parse().map_err(|_| {
-            SqlSurfaceError::unsupported(format!("malformed LIMIT value: {limit_str}"))
-        })?)
-    } else if aggregate.is_some() {
-        None
-    } else {
-        // 非集計形（広域取得形）は `LIMIT` 必須。
-        p.expect_keyword(Keyword::Limit)?;
-        None
-    };
+    // Issue #1796・SQL-34: 非集計形も `LIMIT` 省略・`LIMIT ALL` を受理する
+    // （`None` は暗黙の結果行数上限の対象。実行段が超過を `54000` にする）。
+    let limit: Option<u32> = p.parse_optional_limit()?;
     let offset = p.parse_optional_offset()?.unwrap_or(0);
     p.expect_end_of_statement()?;
 
@@ -17859,7 +18221,11 @@ fn parse_set_branch(
     // `parse_set_operation` の末尾 `expect_end_of_statement` にも一致しないため、
     // 結局は同じ `42601` へ自然に落ちる（`limit_inside_branch_is_rejected` で固定）。
     //
-    // `GROUP BY`／`ORDER BY`／`USING PLAN`／`OFFSET`／`DISTINCT` はいずれも
+    // `OFFSET` も `LIMIT` と同じく全体 `OFFSET m`（`parse_set_operation` が消費する）が
+    // 最後の枝の直後に置かれる正当な形のため、ここでは拒否しない（枝の中の `OFFSET` は
+    // `LIMIT` と同様に後続の検査で `42601` へ落ちる）。Issue #1796。
+    //
+    // `GROUP BY`／`ORDER BY`／`USING PLAN`／`DISTINCT` はいずれも
     // 集合演算の文法上どの位置にも現れ得ないため、ここで拒否しなくても
     // 同じ理由で最終的に `expect_end_of_statement` が `42601` に落とす。
     // ただし早期に拒否した方が構造的に読みやすいため、明示的に残す。
@@ -17868,11 +18234,10 @@ fn parse_set_branch(
     if has_group_by
         || matches!(p.peek(), Some(Token::Keyword(Keyword::Order)))
         || p.peek_ident_matches("USING")
-        || p.peek_ident_matches("OFFSET")
         || p.peek_ident_matches("DISTINCT")
     {
         return Err(SqlSurfaceError::unsupported(
-            "GROUP BY/ORDER BY/OFFSET/USING PLAN/DISTINCT are not allowed inside a set operation branch",
+            "GROUP BY/ORDER BY/USING PLAN/DISTINCT are not allowed inside a set operation branch",
         ));
     }
 
@@ -17884,6 +18249,7 @@ fn parse_set_branch(
             projection,
             where_predicates,
             limit: crate::core::MAX_SEARCH_K as u32,
+            limit_implicit: false,
             // Issue #915（SQL-25）: 集合演算の枝は上の構文検査
             // （`Keyword::Order` を明示的に拒否）でスカラー ORDER BY も
             // 受理しないため、常に空。
@@ -17928,6 +18294,7 @@ fn parse_set_branch(
                 projection,
                 where_predicates: merged_where,
                 limit: crate::core::MAX_SEARCH_K as u32,
+                limit_implicit: false,
                 // 上と同じ理由（集合演算の枝は ORDER BY 非対応）。
                 order_by: Vec::new(),
                 offset: 0,
@@ -18085,6 +18452,13 @@ fn parse_set_limited_branch(
     {
         return Err(SqlSurfaceError::unsupported(
             "expression ORDER BY keys are not allowed inside a set operation branch",
+        ));
+    }
+    // Issue #1796・SQL-34: 枝内の `LIMIT` 省略・`LIMIT ALL` は従来どおり `42601`
+    // （集合演算の枝の暗黙上限は本 Issue の対象外。全体の `LIMIT` 省略は受理する）。
+    if shape.limit.is_none() {
+        return Err(SqlSurfaceError::unsupported(
+            "a parenthesized set operation branch requires LIMIT",
         ));
     }
     let resolved = super::view::resolve_from(lookup, &shape.table_name)?;
@@ -18297,18 +18671,14 @@ fn parse_set_operation(
     let mut p = Parser::new(tokens);
     let mut branch_count = 0usize;
     let tree = parse_set_expr(&mut p, lookup, 0, &mut branch_count)?;
-    let limit = if matches!(p.peek(), Some(Token::Keyword(Keyword::Limit))) {
-        p.advance();
-        let limit_str = p.expect_number()?;
-        let limit: u32 = limit_str.parse().map_err(|_| {
-            SqlSurfaceError::unsupported(format!("malformed LIMIT value: {limit_str}"))
-        })?;
-        Some(limit)
-    } else {
-        None
-    };
+    let limit = p.parse_optional_limit()?;
+    let offset = p.parse_optional_offset()?.unwrap_or(0);
     p.expect_end_of_statement()?;
-    Ok(ValidatedSetOperation { tree, limit })
+    Ok(ValidatedSetOperation {
+        tree,
+        limit,
+        offset,
+    })
 }
 
 /// 許可した `SELECT` statement 形状を先頭から再帰下降で判定する（TASK-74 由来。
@@ -18407,12 +18777,10 @@ fn parse_select_shape(
     // 広域取得（ソートなしのフィルタ取得）として受理する。`LIMIT` 直後は文末のみを
     // 許可し（`USING MODE`・`HINT ORDER` は受理しない。§3.1「本リポの実装既定値」）、
     // それ以外の余剰トークンは `expect_end_of_statement` が `42601` へ落とす。
-    if matches!(p.peek(), Some(Token::Keyword(Keyword::Limit))) {
-        p.advance();
-        let limit_str = p.expect_number()?;
-        let limit: u32 = limit_str.parse().map_err(|_| {
-            SqlSurfaceError::unsupported(format!("malformed LIMIT value: {limit_str}"))
-        })?;
+    // Issue #1796・SQL-34: `LIMIT` 省略・`LIMIT ALL`・`OFFSET` 単独・文末も同じ広域取得
+    // として受理する（`ORDER` 以外の余剰トークンは `expect_end_of_statement` が `42601`）。
+    if !matches!(p.peek(), Some(Token::Keyword(Keyword::Order))) {
+        let limit = p.parse_optional_limit()?;
 
         // Issue #916・SQL-25 (b)・TASK-209: `LIMIT n` の直後に任意で `OFFSET m` を
         // 受理する（広域取得のみ。検索 SELECT の `ORDER BY`／`USING PLAN` 経路は
@@ -18583,6 +18951,8 @@ fn expr_contains_scalar_function(expr: &Expr) -> bool {
         Expr::Call { .. } | Expr::Case { .. } | Expr::Coalesce(_) | Expr::NullIf(..) => true,
         // `IS [NOT] DISTINCT FROM`（SQL-54）も従来形では書けない式述語。
         Expr::IsDistinctFrom { .. } => true,
+        // 正規表現マッチ（SQL-55）も従来形では書けない式述語。
+        Expr::RegexMatch { .. } => true,
         Expr::Binary { lhs, rhs, .. } | Expr::JsonAccess { lhs, rhs, .. } => {
             expr_contains_scalar_function(lhs) || expr_contains_scalar_function(rhs)
         }
@@ -18739,23 +19109,16 @@ fn parse_aggregate_shape(
         } else {
             Vec::new()
         };
-        let (limit, with_ties, offset) = if matches!(p.peek(), Some(Token::Keyword(Keyword::Limit)))
-            || p.peek_ident_matches("FETCH")
-        {
-            let (limit, with_ties) = p.parse_aggregate_limit()?;
-            if with_ties && subquery_ctx.is_some_and(|d| d > 0) {
-                return Err(SqlSurfaceError::feature_not_supported(
-                    "WITH TIES is not supported in a subquery",
-                ));
-            }
-            // Issue #916・SQL-25 (b)・TASK-209: `OFFSET` は `LIMIT` を伴う場合のみ
-            // 受理する（`LIMIT` なしの `OFFSET` 単独は後続の `expect_end_of_statement`
-            // が `42601` へ落とす。§計画 3.1）。
-            let offset = p.parse_optional_offset()?.unwrap_or(0);
-            (Some(limit), with_ties, offset)
-        } else {
-            (None, false, 0)
-        };
+        // Issue #1796・SQL-34: `LIMIT ALL`・`LIMIT` 省略・`OFFSET` 単独を受理する
+        // （`limit: None` は暗黙の結果行数上限の対象。実行段が超過を `54000` にする）。
+        // SQL-56 (3)・Issue #1793: `WITH TIES` 正規形はここ（GROUP BY）でも受理する。
+        let (limit, with_ties) = p.parse_aggregate_limit()?;
+        if with_ties && subquery_ctx.is_some_and(|d| d > 0) {
+            return Err(SqlSurfaceError::feature_not_supported(
+                "WITH TIES is not supported in a subquery",
+            ));
+        }
+        let offset = p.parse_optional_offset()?.unwrap_or(0);
         Some(GroupByClause {
             columns,
             having,
@@ -18859,11 +19222,15 @@ fn parse_distinct_shape(tokens: &[Token]) -> Result<ParsedAggregateShape, SqlSur
     } else {
         Vec::new()
     };
-    let limit = if matches!(p.peek(), Some(Token::Keyword(Keyword::Limit))) {
-        Some(p.parse_aggregate_limit()?.0)
-    } else {
-        None
-    };
+    let (limit, with_ties) = p.parse_aggregate_limit()?;
+    // SQL-56 (3): `SELECT DISTINCT` 形は `WITH TIES` 非対応（黙って `ONLY` へ落とさず fail-closed）。
+    if with_ties {
+        return Err(SqlSurfaceError::unsupported(
+            "WITH TIES is not supported with SELECT DISTINCT",
+        ));
+    }
+    // Issue #1796・SQL-34: GROUP BY と同様に `OFFSET` 単独（`LIMIT` 省略・`ALL` 含む）を受理する。
+    let offset = p.parse_optional_offset()?.unwrap_or(0);
     p.expect_end_of_statement()?;
 
     Ok(ParsedAggregateShape {
@@ -18877,9 +19244,7 @@ fn parse_distinct_shape(tokens: &[Token]) -> Result<ParsedAggregateShape, SqlSur
             order_by,
             limit,
             with_ties: false,
-            // `SELECT DISTINCT <column> ...` 構文自体が `OFFSET` を持たない
-            // ため常に `0`。
-            offset: 0,
+            offset,
         }),
     })
 }
@@ -19154,7 +19519,7 @@ fn build_scan_from_resolved(
     resolved: super::view::Resolved,
     projection: Projection,
     where_predicates: Vec<WherePredicate>,
-    limit: u32,
+    limit: Option<u32>,
     // Issue #915・SQL-25: CTE・ビュー経由の広域取得もスカラー ORDER BY を
     // 持ちうる（`ParsedScanShape::order_by`）ため、キー列の可視性検査
     // （`check_columns_within_view`）へそのまま橋渡しする。
@@ -19172,7 +19537,8 @@ fn build_scan_from_resolved(
             table_name,
             projection,
             where_predicates,
-            limit,
+            limit: limit.unwrap_or(u32::MAX),
+            limit_implicit: limit.is_none(),
             order_by,
             offset,
             window_items,
@@ -19240,7 +19606,8 @@ fn build_scan_from_resolved(
                 table_name: base_table,
                 projection,
                 where_predicates: merged,
-                limit,
+                limit: limit.unwrap_or(u32::MAX),
+                limit_implicit: limit.is_none(),
                 order_by,
                 offset,
                 window_items,
@@ -19346,6 +19713,12 @@ fn aggregate_statement_from_resolved(
         for item in &items {
             match item {
                 AggregateSelectItem::Aggregate(agg) => {
+                    // `string_agg`（SQL-57）は評価後射影形ビューの外側では評価しない（fail-closed）。
+                    if agg.func == AggregateFunc::StringAgg {
+                        return Err(SqlSurfaceError::unsupported(
+                            "aggregate over a view with an aggregate/LIMIT body supports only column arguments",
+                        ));
+                    }
                     if let AggregateArg::Expr(e) = &agg.arg {
                         if !matches!(e, Expr::Ident(_)) {
                             return Err(SqlSurfaceError::unsupported(
@@ -19996,8 +20369,9 @@ fn validate_select_statement(
                         order_by: shape.order_by,
                         order_keys: shape.order_keys,
                         window_items: shape.window_items,
-                        limit: shape.limit,
-                        limit_explicit: true,
+                        limit: shape.limit.unwrap_or(u32::MAX),
+                        limit_explicit: shape.limit.is_some(),
+                        limit_implicit: shape.limit.is_none(),
                         offset: shape.offset,
                     })),
                     column_aliases: Vec::new(),
@@ -21652,6 +22026,7 @@ fn validate_copy_table_to_tokens(
         projection,
         where_predicates: Vec::new(),
         limit: 0,
+        limit_implicit: false,
         order_by: Vec::new(),
         offset: 0,
         window_items: Vec::new(),
@@ -28292,6 +28667,91 @@ mod tests {
         }
     }
 
+    /// SQL-57・Issue #1800: `string_agg` の構文。2 引数・`DISTINCT`・内側 `ORDER BY`（複数キー・
+    /// 方向・`NULLS`）が `AggregateItem` へ載り、式の引数（区切り）も保持される。
+    #[test]
+    fn string_agg_parses_arguments_distinct_and_inner_order_by() {
+        let lookup = catalog_with(&["documents"]);
+        let agg = expect_aggregate(
+            "SELECT string_agg(DISTINCT a, ',' ORDER BY a DESC NULLS LAST, b), \
+             STRING_AGG(a, b) AS names FROM documents",
+            &lookup,
+        );
+        let first = expect_agg_item(&agg.items()[0]);
+        assert_eq!(first.func, AggregateFunc::StringAgg);
+        assert!(first.distinct);
+        assert_eq!(first.extra_args.len(), 1);
+        assert_eq!(first.order_by.len(), 2);
+        assert!(first.order_by[0].descending);
+        assert_eq!(first.order_by[0].nulls, Some(NullPlacement::Last));
+        assert!(!first.order_by[1].descending);
+        assert_eq!(first.order_by[1].nulls, None);
+        let second = expect_agg_item(&agg.items()[1]);
+        assert!(!second.distinct);
+        assert!(second.order_by.is_empty());
+        assert_eq!(second.alias.as_deref(), Some("names"));
+        assert_eq!(second.func.default_alias(), "string_agg");
+    }
+
+    /// PR #2671 レビュー対応: `DISTINCT` 直後の文字列リテラル・括弧式を修飾子と判定し、
+    /// 裸の `NULL` は引数と内側 `ORDER BY` で同じリテラルとして解析される。
+    #[test]
+    fn string_agg_distinct_modifier_before_literal_paren_and_null_order_key() {
+        let lookup = catalog_with(&["documents"]);
+        for sql in [
+            "SELECT string_agg(DISTINCT 'x', ',') FROM documents",
+            "SELECT string_agg(DISTINCT ('x'), ',') FROM documents",
+        ] {
+            let agg = expect_aggregate(sql, &lookup);
+            assert!(expect_agg_item(&agg.items()[0]).distinct, "{sql}");
+        }
+        let agg = expect_aggregate(
+            "SELECT string_agg(DISTINCT NULL, ',' ORDER BY NULL) FROM documents",
+            &lookup,
+        );
+        let item = expect_agg_item(&agg.items()[0]);
+        assert!(item.distinct);
+        assert_eq!(item.order_by.len(), 1);
+        assert_eq!(
+            format!("{:?}", item.order_by[0].expr),
+            format!(
+                "{:?}",
+                match &item.arg {
+                    AggregateArg::Expr(e) => e,
+                    _ => panic!("expr arg expected"),
+                }
+            )
+        );
+        // 列名 `distinct` を引数に取る既存形は維持する。
+        let agg = expect_aggregate("SELECT string_agg(distinct, ',') FROM documents", &lookup);
+        assert!(!expect_agg_item(&agg.items()[0]).distinct);
+    }
+
+    /// SQL-57: 引数の個数違いは `42883`、`*` は `42601`、キー数の超過は確保前に `54000`、
+    /// 他の集計へは 2 引数・内側 `ORDER BY`・`DISTINCT` を広げない（`42601`）。JOIN は `0A000`。
+    #[test]
+    fn string_agg_rejects_malformed_shapes_fail_closed() {
+        let lookup = catalog_with(&["documents"]);
+        let code = |sql: &str| validate_sql(sql, &lookup).expect_err(sql).wire_code();
+        assert_eq!(code("SELECT string_agg(a) FROM documents"), "42883");
+        assert_eq!(
+            code("SELECT string_agg(a, ',', ',') FROM documents"),
+            "42883"
+        );
+        assert_eq!(code("SELECT string_agg() FROM documents"), "42601");
+        assert_eq!(code("SELECT string_agg(*) FROM documents"), "42601");
+        assert_eq!(code("SELECT sum(a, b) FROM documents"), "42601");
+        assert_eq!(code("SELECT count(a ORDER BY a) FROM documents"), "42601");
+        assert_eq!(code("SELECT sum(DISTINCT a) FROM documents"), "42601");
+        let keys = ["a"; MAX_SCALAR_ORDER_KEYS + 1].join(", ");
+        assert_eq!(
+            code(&format!(
+                "SELECT string_agg(a, ',' ORDER BY {keys}) FROM documents"
+            )),
+            "54000"
+        );
+        assert!(is_aggregate_function_name("String_Agg"));
+    }
     /// Issue #1541（SQL-42 (5) のポインタ）: 集計呼び出しの直後の算術演算子で集計式項目になり、
     /// 式中の集計呼び出しは内部名へ置換されて `aggregates` に出現順で抽出される。
     #[test]
@@ -28450,16 +28910,52 @@ mod tests {
     }
 
     #[test]
-    fn rejects_group_by_offset_without_limit() {
-        // Issue #916・SQL-25 (b)・TASK-209: `LIMIT` を伴わない `OFFSET` 単独は
-        // `GROUP BY` 集計でも受理しない（後続の `expect_end_of_statement` が拒否）。
+    fn accepts_group_by_offset_without_limit() {
+        // Issue #1796・SQL-34: `LIMIT` を伴わない `OFFSET` 単独も `GROUP BY` 集計で受理する
+        // （`limit: None` は暗黙の結果行数上限の対象）。
         let lookup = catalog_with(&["documents"]);
-        let err = validate_sql(
+        let stmt = validate_sql(
             "SELECT lang, COUNT(*) FROM documents GROUP BY lang OFFSET 2",
             &lookup,
         )
-        .expect_err("OFFSET without LIMIT must be rejected for GROUP BY aggregates");
-        assert_eq!(err.wire_code(), "42601");
+        .expect("OFFSET without LIMIT must be accepted for GROUP BY aggregates");
+        let Statement::Aggregate(agg) = stmt else {
+            panic!("expected aggregate");
+        };
+        let group_by = agg.group_by().expect("GROUP BY clause");
+        assert_eq!(group_by.limit, None);
+        assert_eq!(group_by.offset, 2);
+    }
+
+    #[test]
+    fn accepts_group_by_limit_all() {
+        let lookup = catalog_with(&["documents"]);
+        let stmt = validate_sql(
+            "SELECT lang, COUNT(*) FROM documents GROUP BY lang LIMIT ALL",
+            &lookup,
+        )
+        .expect("LIMIT ALL must be accepted for GROUP BY aggregates");
+        let Statement::Aggregate(agg) = stmt else {
+            panic!("expected aggregate");
+        };
+        assert_eq!(agg.group_by().expect("GROUP BY clause").limit, None);
+    }
+
+    #[test]
+    fn accepts_distinct_offset_with_limit_omitted_or_all() {
+        let lookup = catalog_with(&["documents"]);
+        for sql in [
+            "SELECT DISTINCT lang FROM documents OFFSET 2",
+            "SELECT DISTINCT lang FROM documents LIMIT ALL OFFSET 2",
+        ] {
+            let stmt = validate_sql(sql, &lookup).expect(sql);
+            let Statement::Aggregate(agg) = stmt else {
+                panic!("expected aggregate");
+            };
+            let gb = agg.group_by().expect("GROUP BY clause");
+            assert_eq!(gb.limit, None, "{sql}");
+            assert_eq!(gb.offset, 2, "{sql}");
+        }
     }
 
     #[test]
@@ -29400,11 +29896,38 @@ mod tests {
     }
 
     #[test]
-    fn rejects_scan_missing_limit() {
+    fn accepts_scan_missing_limit_as_implicit() {
+        // Issue #1796・SQL-34: `LIMIT` 省略・`LIMIT ALL`・`OFFSET` 単独は広域取得として受理し、
+        // 暗黙上限の印（`limit_implicit`）を立てる（番兵値 `u32::MAX`）。
         let lookup = catalog_with(&["documents"]);
-        let err = validate_sql("SELECT * FROM documents", &lookup)
-            .expect_err("SELECT without ORDER BY/USING PLAN/LIMIT must be rejected");
-        assert_eq!(err.wire_code(), "42601");
+        for sql in [
+            "SELECT * FROM documents",
+            "SELECT * FROM documents LIMIT ALL",
+            "SELECT * FROM documents limit all",
+            "SELECT * FROM documents OFFSET 3",
+            "SELECT * FROM documents LIMIT ALL OFFSET 3",
+            "SELECT * FROM documents ORDER BY lang",
+            "SELECT * FROM documents ORDER BY lang LIMIT ALL OFFSET 1",
+        ] {
+            let scan = expect_scan(sql, &lookup);
+            assert!(scan.limit_implicit, "{sql}");
+            assert_eq!(scan.limit, u32::MAX, "{sql}");
+        }
+        let explicit = expect_scan("SELECT * FROM documents LIMIT 5", &lookup);
+        assert!(!explicit.limit_implicit);
+        assert_eq!(explicit.limit, 5);
+    }
+
+    #[test]
+    fn rejects_ranked_select_missing_limit() {
+        // Issue #1796・SQL-34: ベクトル順位付け・`USING PLAN` の `LIMIT` 省略・`LIMIT ALL` は
+        // 従来どおり `42601`（距離 ORDER BY の省略は #2242 の範囲）。
+        assert_rejected_as_syntax_error("SELECT * FROM documents ORDER BY embedding <=> '[1,0]'");
+        assert_rejected_as_syntax_error(
+            "SELECT * FROM documents ORDER BY embedding <=> '[1,0]' LIMIT ALL",
+        );
+        assert_rejected_as_syntax_error("SELECT * FROM documents USING PLAN('q')");
+        assert_rejected_as_syntax_error("SELECT * FROM documents USING PLAN('q') LIMIT ALL");
     }
 
     #[test]
@@ -32070,6 +32593,25 @@ mod body_expr_policy_tests {
     }
 
     #[test]
+    fn non_aggregate_join_body_rejects_omitted_or_all_limit() {
+        // Issue #1796・SQL-34: 非集計 JOIN 本文の `LIMIT` 省略・`ALL` は `42601`、明示は受理。
+        for sql in [
+            "SELECT t.id FROM t JOIN u ON t.k = u.k",
+            "SELECT t.id FROM t JOIN u ON t.k = u.k LIMIT ALL",
+        ] {
+            let err = classify(sql, ViewBodyCheck::Structural)
+                .err()
+                .expect("rejected");
+            assert_eq!(err.wire_code(), "42601", "{sql}");
+        }
+        classify(
+            "SELECT t.id FROM t JOIN u ON t.k = u.k LIMIT 5",
+            ViewBodyCheck::Structural,
+        )
+        .expect("explicit LIMIT is accepted");
+    }
+
+    #[test]
     fn structural_rejects_non_builtin_call() {
         let err = classify(
             "SELECT id FROM x WHERE myfn(lang) = 'ja' LIMIT 5",
@@ -32298,7 +32840,6 @@ mod body_expr_policy_tests {
             "CREATE MATERIALIZED VIEW mv WITH (fillfactor = 70) AS SELECT a FROM docs",
             "CREATE MATERIALIZED VIEW mv TABLESPACE ts AS SELECT a FROM docs",
             "CREATE MATERIALIZED VIEW mv USING heap AS SELECT a FROM docs",
-            "CREATE MATERIALIZED VIEW mv AS SELECT a FROM docs DATA",
             "CREATE MATERIALIZED VIEW mv AS SELECT a FROM docs NO DATA",
             "CREATE MATERIALIZED VIEW mv AS SELECT a FROM docs WITH",
             "CREATE MATERIALIZED VIEW mv AS",

@@ -6320,6 +6320,62 @@ pub(crate) enum AggregateInput {
     /// （`row.embedding` が空 = 未設定という [`crate::storage::Row`] の既存契約に
     /// 従う。PR #229 codex-review 指摘対応）。
     VectorColumnPresence,
+    /// `string_agg(<値>, <区切り> [ORDER BY ...])`（SQL-57・Issue #1800）。区切り・内側の
+    /// `ORDER BY` のプログラムを `input` の内側へ閉じ込め、`Accumulator::observe` が
+    /// この 1 variant だけで評価できる自己完結な形にする（`BoundAggregateItem` の
+    /// 構築箇所を増やさない）。`func == StringAgg` のときだけこの variant になる。
+    StringAgg(Box<StringAggInput>),
+}
+
+/// `string_agg` の束縛済み入力（SQL-57・Issue #1800）。[`resolve_string_agg_input`] が作り、
+/// `sql::aggregate::Accumulator::StringAgg` が行ごとに評価する。
+#[derive(Debug, Clone, PartialEq)]
+pub(crate) struct StringAggInput {
+    /// 値の式（text。bpchar は text へ変換済み）。
+    pub(crate) value: BoundTextArg,
+    /// 区切りの式（text。行ごとに評価する。PostgreSQL と同じ）。
+    pub(crate) delimiter: BoundTextArg,
+    /// 内側の `ORDER BY` のキー。`DISTINCT` では PostgreSQL の並べ替えによる重複排除に合わせて
+    /// 未指定の引数（値, 区切り）を昇順キーとして合成する。空なら入力順（行の処理順）。
+    pub(crate) keys: Vec<StringAggOrderKey>,
+    /// `DISTINCT`（重複判定は引数の組〔値, 区切り〕全体。SQL-25 (c) と同じ同値）。
+    pub(crate) distinct: bool,
+}
+
+/// 束縛済みの text 引数 1 つ（束縛済み式とコンパイル済みプログラム）。
+#[derive(Debug, Clone, PartialEq)]
+pub(crate) struct BoundTextArg {
+    pub(crate) source: crate::sql::udf_call::BoundExpr,
+    pub(crate) program: crate::sql::expr_program::ExprProgram,
+    /// 引数が裸の text 列のときのその列の実効照合（それ以外は既定）。`DISTINCT` の
+    /// 並べ替えと、同じ式を指す `ORDER BY` キーの比較に使う。
+    pub(crate) collation: crate::collation::Collation,
+}
+
+/// `string_agg` の内側 `ORDER BY` の 1 キー（束縛済み）。
+#[derive(Debug, Clone, PartialEq)]
+pub(crate) struct StringAggOrderKey {
+    pub(crate) source: StringAggKeySource,
+    /// 比較規約・降順・NULL 位置・照合（広域取得・集計文と同じ比較器が使う）。
+    pub(crate) key: BoundOrderKey,
+}
+
+/// [`StringAggOrderKey`] の値の取得元。
+#[derive(Debug, Clone, PartialEq)]
+pub(crate) enum StringAggKeySource {
+    /// 値引数そのもの（構文上等しい式。評価を重ねない）。
+    Value,
+    /// 区切り引数そのもの。
+    Delimiter,
+    /// 疑似列 `id`。
+    Id,
+    /// 裸の列（スキーマを持ち込めない実行層向けに列型を複製して保持する）。
+    Column { index: usize, ty: ColumnType },
+    /// 行ごとに評価する式。
+    Expr {
+        source: crate::sql::udf_call::BoundExpr,
+        program: crate::sql::expr_program::ExprProgram,
+    },
 }
 
 /// 集計項目 1 つの引数を SQL テキスト非経由で表す形（TASK-186・NOSQL-4）。
@@ -6390,6 +6446,13 @@ impl BoundAggregateItem {
 
         if matches!(target, AggregateTarget::Star) && func != AggregateFunc::Count {
             return Err(SqlSurfaceError::unsupported("* is only allowed with COUNT"));
+        }
+        // `string_agg` は SQL 表層のみ（SQL-57。NoSQL 表層は対象外）。2 引数・内側 ORDER BY を
+        // 持てないこの入口では構文層の拒否（`42601`）と同じ分類で拒否する。
+        if func == AggregateFunc::StringAgg {
+            return Err(SqlSurfaceError::unsupported(
+                "string_agg is not supported by this interface",
+            ));
         }
 
         let arg = match target {
@@ -6516,6 +6579,10 @@ pub(crate) struct BoundGroupBy {
     /// 常に `0`。[`BoundAggregate::new_grouped`]（TASK-186・NOSQL-5）は本 Issue の
     /// 対象外のため `0` 固定（NoSQL 表層の offset 写像は #947・NOSQL-15 の管轄）。
     pub(crate) offset: usize,
+    /// `LIMIT` 省略・`LIMIT ALL` の結果行数上限 `cap`（Issue #1797・SQL-34）。束縛段は上限を
+    /// 知らないため既定 `None`。呼び出し段（`core`）が [`BoundAggregate::with_result_cap`] で
+    /// 設定し、HAVING なしのときだけ新規グループ追加時に `offset + cap` 超過で中断する。
+    pub(crate) result_cap: Option<usize>,
 }
 
 impl BoundGroupBy {
@@ -6570,6 +6637,18 @@ pub struct BoundAggregate {
 }
 
 impl BoundAggregate {
+    /// `LIMIT` 省略・`LIMIT ALL` の `GROUP BY`／`SELECT DISTINCT` に呼び出し段の結果行数上限
+    /// `cap` を設定する（Issue #1797。`core` の主経路・カーソル内側・ビュー外側が束縛直後に
+    /// 呼ぶ。明示 `LIMIT` つき・`GROUP BY` なしは変更しない）。
+    pub(crate) fn with_result_cap(mut self, cap: usize) -> Self {
+        if let Some(g) = self.group_by.as_mut() {
+            if g.limit.is_none() {
+                g.result_cap = Some(cap);
+            }
+        }
+        self
+    }
+
     /// クレート外から `BoundAggregate` を直接構築する constructor（TASK-186・
     /// NOSQL-4。SQL テキストの構文解析・[`crate::sql::allowlist::validate_sql`]
     /// を経由せずに束縛済み実行計画を組み立てる入口。[`BoundScan::new`] と同じ
@@ -6869,6 +6948,7 @@ impl BoundAggregate {
                 limit: None,
                 with_ties: false,
                 offset: 0,
+                result_cap: None,
             }),
         })
     }
@@ -7211,6 +7291,293 @@ fn resolve_aggregate_input(
     }
 }
 
+/// 集計項目 1 つの入力解決の振り分け（[`bind_aggregate`] の可視項目・集計式項目の内部項目が共有する）。
+/// `string_agg`（SQL-57）は常に専用の [`resolve_string_agg_input`] へ送る（汎用の
+/// [`resolve_aggregate_input`] へ落とすと非 text の引数が束縛に成功し、実行時に内部エラーになる）。
+fn resolve_aggregate_item_input(
+    item: &crate::sql::allowlist::AggregateItem,
+    schema: &TableSchema,
+    udfs: &crate::sql::udf_call::UdfRegistry,
+    node_budget: &mut usize,
+) -> Result<AggregateInput, SqlSurfaceError> {
+    if item.func == crate::sql::allowlist::AggregateFunc::StringAgg {
+        return resolve_string_agg_input(item, schema, udfs, node_budget);
+    }
+    if item.distinct {
+        resolve_count_distinct_input(&item.arg, schema, udfs, node_budget)
+    } else {
+        resolve_aggregate_input(item.func, &item.arg, schema, udfs, node_budget)
+    }
+}
+
+/// `string_agg` の text 引数 1 つを束縛する（SQL-57・Issue #1800）。裸の text 列は式束縛を
+/// 経由せず列参照へ直接束縛する（式束縛は非バイト列順の照合の列を `0A000` で拒否するが、
+/// `string_agg` の値は照合に依存しないため。照合は `DISTINCT`／`ORDER BY` の比較にだけ使う）。
+/// 型の扱い: text（`VARCHAR`・`CHAR(n)` を含む）だけを受理し、bytea は `0A000`（対象外）、
+/// それ以外は該当シグネチャの関数が無いとして `42883`（PostgreSQL と同じ）。
+fn bind_string_agg_text_arg(
+    expr: &Expr,
+    schema: &TableSchema,
+    udfs: &crate::sql::udf_call::UdfRegistry,
+    node_budget: &mut usize,
+) -> Result<BoundTextArg, SqlSurfaceError> {
+    use crate::sql::udf_call::{BoundExpr, BuiltinFn, ExprType};
+
+    let no_function = || {
+        SqlSurfaceError::undefined_function(
+            "function string_agg is only defined for text arguments",
+        )
+    };
+    let bytea_unsupported = || SqlSurfaceError::FeatureNotSupported {
+        detail: "string_agg over bytea is not supported".to_string(),
+    };
+    let (bound, collation) = if matches!(expr, Expr::Null) {
+        // 型が text と確定する引数位置の NULL リテラル。NULL 値の行は読み飛ばし、NULL 区切りは
+        // 何も置かない（PostgreSQL と同じ）ため、そのまま通常の評価経路へ流す。
+        *node_budget = node_budget
+            .checked_sub(1)
+            .ok_or_else(|| SqlSurfaceError::payload_too_large("expression is too large"))?;
+        (BoundExpr::Null, crate::collation::Collation::DEFAULT)
+    } else if let Expr::Ident(name) = expr {
+        if let Some((index, column)) = schema
+            .columns
+            .iter()
+            .enumerate()
+            .find(|(_, c)| &c.name == name)
+        {
+            match &column.ty {
+                ColumnType::Text | ColumnType::Varchar(_) | ColumnType::Bpchar(_) => {
+                    *node_budget = node_budget.checked_sub(1).ok_or_else(|| {
+                        SqlSurfaceError::payload_too_large("expression is too large")
+                    })?;
+                    let collation = crate::collation::Collation::effective(None, column.collation);
+                    collation.ensure_available()?;
+                    let leaf = BoundExpr::TextColumnRef { index };
+                    // `CHAR(n)` は text へ変換した値（末尾の半角空白を除く）で連結する
+                    // （PostgreSQL の bpchar→text 変換と同じ。TABLE-31）。
+                    let bound = if matches!(column.ty, ColumnType::Bpchar(_)) {
+                        BoundExpr::Builtin {
+                            f: BuiltinFn::BpcharToText,
+                            args: vec![leaf],
+                        }
+                    } else {
+                        leaf
+                    };
+                    (bound, collation)
+                }
+                ColumnType::Bytea => return Err(bytea_unsupported()),
+                _ => return Err(no_function()),
+            }
+        } else if name == "id" && schema.has_pseudo_id() {
+            return Err(no_function());
+        } else {
+            return Err(SqlSurfaceError::undefined_column(name));
+        }
+    } else {
+        let (bound, ty) = crate::sql::udf_call::bind_expr(expr, schema, udfs, node_budget)?;
+        match ty {
+            ExprType::Text => (bound, crate::collation::Collation::DEFAULT),
+            ExprType::Bytea => return Err(bytea_unsupported()),
+            _ => return Err(no_function()),
+        }
+    };
+    let program = crate::sql::expr_program::ExprProgram::compile(&bound);
+    Ok(BoundTextArg {
+        source: bound,
+        program,
+        collation,
+    })
+}
+
+/// 値・区切りに対応する合成／再利用キー 1 つ（[`resolve_string_agg_input`] 用）。
+fn string_agg_arg_key(
+    source: StringAggKeySource,
+    descending: bool,
+    nulls: Option<NullPlacement>,
+    collation: crate::collation::Collation,
+) -> StringAggOrderKey {
+    StringAggOrderKey {
+        source,
+        key: BoundOrderKey {
+            // 取得元が `Value`／`Delimiter` のキーでは参照されない（取得元で値を決める）。
+            target: BoundOrderTarget::Id,
+            kind: OrderKind::Bytes,
+            descending,
+            nulls: nulls.unwrap_or_else(|| NullPlacement::pg_default(descending)),
+            collation,
+        },
+    }
+}
+
+/// `string_agg([DISTINCT] <値>, <区切り> [ORDER BY ...])`（SQL-57・Issue #1800）の入力解決。
+///
+/// - 引数は text だけ（[`bind_string_agg_text_arg`]）。構文層が引数の個数を `42883` で検査済み
+/// - 内側 `ORDER BY` のキーは、値・区切りと構文上等しければその引数を再利用（評価を重ねない）、
+///   裸の列・疑似列 `id` は広域取得・集計文と同じ列比較（型ごとの比較規約・照合）、それ以外は
+///   式として束縛する（テーブルの列スコープ。集計の別名・出力列は参照できない）
+/// - `DISTINCT` では、全キーが値または区切りと構文上等しくなければ `42P10`。`ORDER BY` が無い
+///   `DISTINCT` は PostgreSQL の並べ替えによる重複排除に合わせて（値, 区切り）の昇順キーを合成し、
+///   `ORDER BY` がある場合は引数のうち未指定のものを昇順キーとして後ろへ足す
+fn resolve_string_agg_input(
+    item: &crate::sql::allowlist::AggregateItem,
+    schema: &TableSchema,
+    udfs: &crate::sql::udf_call::UdfRegistry,
+    node_budget: &mut usize,
+) -> Result<AggregateInput, SqlSurfaceError> {
+    use crate::sql::allowlist::AggregateArg;
+
+    let value_expr = match &item.arg {
+        AggregateArg::Expr(e) => e,
+        AggregateArg::Star => {
+            return Err(SqlSurfaceError::unsupported(
+                "'*' is only allowed inside COUNT(*)",
+            ))
+        }
+    };
+    let delimiter_expr = match item.extra_args.as_slice() {
+        [d] => d,
+        _ => {
+            return Err(SqlSurfaceError::undefined_function(
+                "function string_agg requires exactly two arguments",
+            ))
+        }
+    };
+    let value = bind_string_agg_text_arg(value_expr, schema, udfs, node_budget)?;
+    let delimiter = bind_string_agg_text_arg(delimiter_expr, schema, udfs, node_budget)?;
+
+    let mut keys: Vec<StringAggOrderKey> =
+        Vec::with_capacity(item.order_by.len().saturating_add(2));
+    for k in &item.order_by {
+        let key = if k.expr == *value_expr {
+            string_agg_arg_key(
+                StringAggKeySource::Value,
+                k.descending,
+                k.nulls,
+                value.collation,
+            )
+        } else if k.expr == *delimiter_expr {
+            string_agg_arg_key(
+                StringAggKeySource::Delimiter,
+                k.descending,
+                k.nulls,
+                delimiter.collation,
+            )
+        } else if item.distinct {
+            // 値・区切りに現れない式は、重複排除後の行へ一意に対応しないため拒否する。
+            return Err(SqlSurfaceError::AggregateOrderByNotInArguments);
+        } else {
+            bind_string_agg_free_order_key(k, schema, udfs, node_budget)?
+        };
+        keys.push(key);
+    }
+    if item.distinct {
+        // 未指定の引数を昇順キーとして足す（PostgreSQL の DISTINCT 集計の並べ替え規則）。
+        if !keys.iter().any(|k| k.source == StringAggKeySource::Value) {
+            keys.push(string_agg_arg_key(
+                StringAggKeySource::Value,
+                false,
+                None,
+                value.collation,
+            ));
+        }
+        if !keys
+            .iter()
+            .any(|k| k.source == StringAggKeySource::Delimiter)
+        {
+            keys.push(string_agg_arg_key(
+                StringAggKeySource::Delimiter,
+                false,
+                None,
+                delimiter.collation,
+            ));
+        }
+    }
+    Ok(AggregateInput::StringAgg(Box::new(StringAggInput {
+        value,
+        delimiter,
+        keys,
+        distinct: item.distinct,
+    })))
+}
+
+/// 値・区切りと等しくない `ORDER BY` キー 1 つを束縛する（[`resolve_string_agg_input`] 用）。
+fn bind_string_agg_free_order_key(
+    k: &crate::sql::allowlist::AggregateOrderKey,
+    schema: &TableSchema,
+    udfs: &crate::sql::udf_call::UdfRegistry,
+    node_budget: &mut usize,
+) -> Result<StringAggOrderKey, SqlSurfaceError> {
+    let explicit_nulls = k
+        .nulls
+        .unwrap_or_else(|| NullPlacement::pg_default(k.descending));
+    // 裸の識別子は列（実カラムを疑似列 `id` より優先）として束縛する。jsonb 列だけは式経路
+    // （ソートキーを行ごとに作る）へ流す。
+    if let Expr::Ident(name) = &k.expr {
+        if let Some(index) = schema.columns.iter().position(|c| &c.name == name) {
+            let ty = schema
+                .columns
+                .get(index)
+                .map(|c| c.ty.clone())
+                .ok_or_else(|| SqlSurfaceError::Internal {
+                    detail: "order key column index out of range".to_string(),
+                })?;
+            if !matches!(ty, ColumnType::Jsonb) {
+                *node_budget = node_budget
+                    .checked_sub(1)
+                    .ok_or_else(|| SqlSurfaceError::payload_too_large("expression is too large"))?;
+                let mut key = bind_order_column_at(schema, index, k.descending)?;
+                key.nulls = explicit_nulls;
+                return Ok(StringAggOrderKey {
+                    source: StringAggKeySource::Column { index, ty },
+                    key,
+                });
+            }
+        } else if name == "id" && schema.has_pseudo_id() {
+            *node_budget = node_budget
+                .checked_sub(1)
+                .ok_or_else(|| SqlSurfaceError::payload_too_large("expression is too large"))?;
+            return Ok(StringAggOrderKey {
+                source: StringAggKeySource::Id,
+                key: BoundOrderKey {
+                    target: BoundOrderTarget::Id,
+                    kind: OrderKind::Id,
+                    descending: k.descending,
+                    nulls: explicit_nulls,
+                    collation: crate::collation::Collation::DEFAULT,
+                },
+            });
+        }
+    }
+    // 裸の `NULL` 定数は型未確定のため `bind_order_expr` が拒否する。全行 NULL の同値キーとして
+    // 束縛し、値・区切り引数との一致の有無で受理可否が変わらないようにする。
+    let (bound, ty) = if matches!(k.expr, Expr::Null) {
+        *node_budget = node_budget
+            .checked_sub(1)
+            .ok_or_else(|| SqlSurfaceError::payload_too_large("expression is too large"))?;
+        (
+            crate::sql::udf_call::BoundExpr::Null,
+            crate::sql::udf_call::ExprType::Scalar,
+        )
+    } else {
+        crate::sql::udf_call::bind_order_expr(&k.expr, schema, udfs, node_budget)?
+    };
+    let kind = order_kind_for_expr_type(ty)?;
+    let program = crate::sql::expr_program::ExprProgram::compile(&bound);
+    Ok(StringAggOrderKey {
+        source: StringAggKeySource::Expr {
+            source: bound,
+            program,
+        },
+        key: BoundOrderKey {
+            // 式キーの取得元は `source`。この添字は参照されない。
+            target: BoundOrderTarget::Expr(0),
+            kind,
+            descending: k.descending,
+            nulls: explicit_nulls,
+            collation: crate::collation::Collation::DEFAULT,
+        },
+    })
+}
 /// `COUNT(DISTINCT <expr>)`（SQL-25 (c)・TASK-209）の入力解決。関数は常に
 /// `COUNT` のため `resolve_aggregate_input` と異なり `func` を引数に取らない。
 /// `resolve_aggregate_input` との差分:
@@ -7417,11 +7784,7 @@ pub(crate) fn bind_aggregate_with_dummy_flags(
                 // （`resolve_count_distinct_input` は `id`/`VECTOR`/`ARRAY`/
                 // `JSON` の扱いが非 DISTINCT の `resolve_aggregate_input` と
                 // 異なる。`item.distinct` は構文層で `COUNT` 限定に絞り込み済み）。
-                let input = if item.distinct {
-                    resolve_count_distinct_input(&item.arg, schema, udfs, &mut node_budget)?
-                } else {
-                    resolve_aggregate_input(item.func, &item.arg, schema, udfs, &mut node_budget)?
-                };
+                let input = resolve_aggregate_item_input(item, schema, udfs, &mut node_budget)?;
                 let name = item
                     .alias
                     .clone()
@@ -7470,11 +7833,7 @@ pub(crate) fn bind_aggregate_with_dummy_flags(
             } => {
                 let mut hidden = Vec::with_capacity(aggregates.len());
                 for agg in aggregates {
-                    let input = if agg.distinct {
-                        resolve_count_distinct_input(&agg.arg, schema, udfs, &mut node_budget)?
-                    } else {
-                        resolve_aggregate_input(agg.func, &agg.arg, schema, udfs, &mut node_budget)?
-                    };
+                    let input = resolve_aggregate_item_input(agg, schema, udfs, &mut node_budget)?;
                     let item_index = items.len();
                     items.push(BoundAggregateItem {
                         func: agg.func,
@@ -7663,6 +8022,12 @@ pub struct BoundScan {
     pub(crate) or_filters: Vec<crate::sql::where_tree::BoundOrGroup>,
     /// `LIMIT` の検証済み値（`1..=core::MAX_SEARCH_K`。[`validate_search_limit`]）。
     pub(crate) limit: usize,
+    /// 暗黙の結果行数上限（Issue #1796・SQL-34）。`LIMIT` 省略・`LIMIT ALL` の文で
+    /// `Some(cap)`（`cap = ResultLimits::max_result_rows()`）。このとき [`Self::limit`] は
+    /// `cap + 1` で、実行段（`sql::scan::execute_scan_with_budget`）が結果の
+    /// `rows.len() > cap` を `54000` で拒否する（黙って切り詰めない）。明示 `LIMIT`・
+    /// [`Self::new`]（NoSQL 表層の直接構築）は `None`。
+    pub(crate) result_cap: Option<usize>,
     /// スカラー列 `ORDER BY`（Issue #915・SQL-25・TASK-209）。SQL テキスト経由の
     /// [`bind_scan`]・[`bind_scan_with_dummy_flags`]、または NoSQL 表層の直接構築
     /// 経路（TASK-186・NOSQL-3）から [`Self::with_order_by`] を呼んだ場合に非空
@@ -8351,6 +8716,7 @@ impl BoundScan {
             expr_filter_programs,
             or_filters: Vec::new(),
             limit,
+            result_cap: None,
             order_exprs: Vec::new(),
             ties_row_cap: None,
             // Issue #915・SQL-25: `Self::new` 単体は既存契約どおり常に空。
@@ -8456,6 +8822,11 @@ impl BoundScan {
     /// `LIMIT` 句の値。
     pub fn limit(&self) -> usize {
         self.limit
+    }
+
+    /// 暗黙の結果行数上限（`LIMIT` 省略・`LIMIT ALL` の文のみ `Some`。Issue #1796・SQL-34）。
+    pub(crate) fn result_cap(&self) -> Option<usize> {
+        self.result_cap
     }
 
     /// ウィンドウ項目（SQL-30・TASK-214、Issue #930）。空なら通常の広域取得。
@@ -8768,7 +9139,11 @@ pub(crate) fn collect_expr_idents(expr: &Expr, out: &mut std::collections::HashS
                 collect_expr_idents(arg, out);
             }
         }
-        Expr::NullIf(lhs, rhs) | Expr::IsDistinctFrom { lhs, rhs, .. } => {
+        Expr::NullIf(lhs, rhs)
+        | Expr::IsDistinctFrom { lhs, rhs, .. }
+        | Expr::RegexMatch {
+            lhs, pattern: rhs, ..
+        } => {
             collect_expr_idents(lhs, out);
             collect_expr_idents(rhs, out);
         }
@@ -8900,7 +9275,22 @@ pub(crate) fn bind_scan_with_dummy_flags(
             dummy_equality_flags,
         )?;
 
-    let limit = validate_search_limit_with(stmt.limit(), result_limits)?;
+    // Issue #1796・SQL-34: `LIMIT` 省略・`LIMIT ALL` は範囲検証せず、結果行数上限 + 1 を
+    // 取得上限にして実行段が超過を `54000` にする（明示 `LIMIT` の `22000` 契約は不変）。
+    let (limit, result_cap) = if stmt.limit_implicit {
+        let cap = result_limits.max_result_rows();
+        let fetch = cap
+            .checked_add(1)
+            .ok_or_else(|| SqlSurfaceError::Internal {
+                detail: "result row limit overflows the fetch bound".to_string(),
+            })?;
+        (fetch, Some(cap))
+    } else {
+        (
+            validate_search_limit_with(stmt.limit(), result_limits)?,
+            None,
+        )
+    };
     // Issue #916・SQL-25 (b)・TASK-209: `OFFSET` は `LIMIT` と同じ束縛段で検証する
     // （構文段の許可リストは値の上限を持たない生値のまま通すため）。
     let offset = validate_search_offset(stmt.offset())?;
@@ -8961,6 +9351,7 @@ pub(crate) fn bind_scan_with_dummy_flags(
         expr_filter_programs,
         or_filters,
         limit,
+        result_cap,
         order_by,
         offset,
         windows,
@@ -9358,6 +9749,7 @@ fn bind_group_by_clause(
         limit,
         with_ties: clause.with_ties,
         offset,
+        result_cap: None,
     })
 }
 
@@ -9375,6 +9767,7 @@ fn aggregate_result_column_type(item: &BoundAggregateItem) -> ColumnType {
     use crate::sql::allowlist::AggregateFunc;
     match item.func {
         AggregateFunc::Count => ColumnType::BigInt,
+        AggregateFunc::StringAgg => ColumnType::Text,
         AggregateFunc::Avg => match item.input {
             // Issue #2270（TABLE-13）: 整数・`id` の AVG も `Cell::Numeric` を返すため、
             // 式内では扱えない列として `22000` で拒否する（numeric 算術は別 Issue）。
@@ -9538,6 +9931,19 @@ fn rewrite_group_row_idents(
             negated: *negated,
             lhs: Box::new(rec(lhs)?),
             rhs: Box::new(rec(rhs)?),
+        },
+        Expr::RegexMatch {
+            negated,
+            case_insensitive,
+            lhs,
+            pattern,
+            raw_pattern_len,
+        } => Expr::RegexMatch {
+            negated: *negated,
+            case_insensitive: *case_insensitive,
+            lhs: Box::new(rec(lhs)?),
+            pattern: Box::new(rec(pattern)?),
+            raw_pattern_len: *raw_pattern_len,
         },
         Expr::Collate { expr, collation } => Expr::Collate {
             expr: Box::new(rec(expr)?),
@@ -11599,6 +12005,8 @@ mod tests {
                 }),
                 alias: None,
                 distinct: false,
+                extra_args: Vec::new(),
+                order_by: Vec::new(),
             })],
             where_predicates: Vec::new(),
             group_by: None,
