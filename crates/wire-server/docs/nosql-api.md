@@ -1196,6 +1196,7 @@ Date: <IMF-fixdate>
 | `0A000` | `FEATURE_NOT_SUPPORTED` | 501 | Not Implemented | 語彙外の `op` 指定 |
 | `53300` | `CONNECTION_LIMIT_EXCEEDED` | 503 | Service Unavailable | 接続数上限（64）超過、同時有効セッション数上限（256）超過 |
 | `55P03` | `LOCK_NOT_AVAILABLE` | 503 | Service Unavailable | SQL 表層の明示トランザクション（SQL-31・TASK-221）が単一ライタを保持している間に、書き込み op（`insert`／`update`／`delete`）が書き込みゲートの待機上限を超えた |
+| `57014` | `QUERY_CANCELED` | 503 | Service Unavailable | 実行中の文を協調的に打ち切った（クライアント切断の検出。Issue #1798）。SQL 表層の接続スレッドが起点で、現状 NoSQL の `op` からは到達しない |
 
 到達不能な 18 分類（`21000`・`42501`・`34000`・`P0002`・`42701`・`42P07`・`2BP01`・
 `42809`・`42703`・`42804`・`42710`・`42723`・`25000`・`25001`・`25P01`・`25P02`・`55000`・`44000`）の理由: NoSQL 表層はテナントをセッション

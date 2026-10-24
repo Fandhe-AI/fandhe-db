@@ -9,6 +9,13 @@
 
 ### Added
 
+- 実行中の文の協調的中断を追加した（Issue #1798・SQL-34・WIRE-11）。公開 API は `engine::interrupt`
+  （`InterruptScope`・`InterruptGuard`・`InterruptReason`）と `ErrorClass::QueryCanceled`（`57014`）。
+  wire-server は実行中のクライアント切断を検出して走査を止める（切断済みの接続の資源占有を防ぐ）。
+  CancelRequest の受け付けは含まない。HTTP への射影は 503。詳細は
+  [statement-interrupt.md](docs/design/statement-interrupt.md)。
+  BREAKING CHANGE: 公開 enum `ErrorClass` と `SqlSurfaceError` に variant（`QueryCanceled`）を追加したため、
+  網羅的な `match` は更新が要る。
 - `LIMIT` 省略・`LIMIT ALL` の結果行数上限超過（`54000`）を、`cap + 1` 件目の確定時点で走査・結合・集約を中断して返す（Issue #1797・SQL-34）。
   広域取得・ウィンドウ・HAVING なしの `GROUP BY`／`SELECT DISTINCT`・残余述語なしの JOIN が対象で、上限を超える行は保持しない。
   エラーコードと文言は変わらない。
@@ -60,6 +67,13 @@
   有効時は `WHERE` 省略の SQL `UPDATE`／`DELETE` を変更開始前に `42601` で拒否する（既定は無効で挙動不変）。
   wire-server に値なしスイッチ `--require-where-for-dml` を追加した。明示した述語・NoSQL 表層・`TRUNCATE` は対象外。
   詳細は [require-where-for-dml-cli.md](docs/design/require-where-for-dml-cli.md)。
+
+### Changed
+
+- 拡張クエリの Execute の `max_rows` 分割で、完了タグの件数を累計からその回の件数に変え、`max_rows` ちょうどで
+  残りが尽きた回も `PortalSuspended` で終えるようにした（Issue #1798・WIRE-11。PostgreSQL 17 と同じ）。
+  BREAKING CHANGE: 分割送出の最終 Execute の完了タグ（例: 5 行を `max_rows=2` で 3 回に分けた最後が `SELECT 5` から
+  `SELECT 1`）と、行がちょうど尽きた回の応答（`CommandComplete` から `PortalSuspended`）が変わる。
 
 ### Breaking Changes
 

@@ -113,8 +113,11 @@ psycopg 3 の既定 Cursor・node pg・JDBC・psql の `\bind` 等、拡張プ�
   1 行ずつエンコード→送出する（`max_rows<=0`／非常に大きい `max_rows` でも
   送出予定分のメモリ使用量が結果セット規模に応じて無制限に膨らまない。
   PR #1013 レビュー指摘・P0）。分割送出時の `CommandComplete` の件数は
-  「portal 全体の累計送出行数」（PostgreSQL の `PortalRun` と同じ契約。
-  PR #1013 レビュー指摘・P1: 直近 Execute の件数だけでは過小になる）。
+  「その回の Execute で送った行数」（PostgreSQL 17 の `PortalRun` と同じ。
+  pquery.c の `qc->nprocessed = nprocessed`）。`max_rows` ちょうどで残りが尽きた
+  回も `PortalSuspended` で終え、次の Execute が 0 行と `SELECT 0` を返す
+  （`PortalRunSelect` の `atEnd` は `nprocessed < count` のときだけ立つ）。
+  Issue #1798 で PR #1013 の「累計件数」から是正した。
 - Sync は、`Idle`／`Failed` では名前付き・無名を問わず全 portal を破棄する
   （PR #1013 レビュー指摘・codex P1）。明示トランザクション中は、同じ
   トランザクション世代で Bind した名前付き portal だけを Sync を越えて保持し

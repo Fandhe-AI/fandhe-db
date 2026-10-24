@@ -216,6 +216,8 @@ fn join_step(
     // 結果に影響しない。
     let mut pairs: Vec<(u32, u32)> = Vec::new();
     for ti in 0..acc_len {
+        // Issue #1798: 協調的中断の確認点（プローブ側の行ごと。commit 前の読み取り経路）。
+        crate::interrupt::check()?;
         let tuple = acc.get(ti).ok_or_else(|| SqlSurfaceError::Internal {
             detail: "JOIN accumulated tuple index out of range".to_string(),
         })?;
@@ -243,6 +245,8 @@ fn join_step(
         if let Some(matched) = table.get(&key) {
             let ti_u32 = to_u32(ti, "JOIN row count exceeds limit")?;
             for &new_idx in matched {
+                // Issue #1798: 協調的中断の確認点（一致ペアの実体化ループ。commit 前の読み取り経路）。
+                crate::interrupt::check()?;
                 push_charged_pair(&mut pairs, budget, (ti_u32, new_idx))?;
                 if let Some(m) = matched_acc.get_mut(ti) {
                     *m = true;

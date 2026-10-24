@@ -251,6 +251,7 @@ pub mod group_by_limits;
 pub mod hnsw;
 pub mod hybrid;
 pub mod incremental;
+pub mod interrupt;
 pub mod isa;
 pub mod join_limits;
 pub mod json;
