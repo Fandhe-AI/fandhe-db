@@ -1119,6 +1119,12 @@ fn execute_scan_with_budget_inner(
     // dispatch 1 行に留めることで、`sql::scan` を編集する他 PR との衝突を
     // 最小化する（`docs/design/window-functions.md` 参照）。
     if !bound.windows().is_empty() {
+        // `WITH TIES` を解釈しない実行器へ黙って渡さない（構文段で併用は拒否済みの多層防御）。
+        if bound.ties_row_cap.is_some() {
+            return Err(SqlSurfaceError::feature_not_supported(
+                "WITH TIES is not supported with window functions",
+            ));
+        }
         return crate::sql::window::execute_window_scan(
             read_txn,
             ctx,
@@ -1487,189 +1493,284 @@ fn execute_scan_with_budget_inner(
         let spec: Rc<[BoundOrderKey]> = Rc::from(bound.order_by.clone());
         let mut heap: BinaryHeap<HeapEntry> = BinaryHeap::new();
         let mut heap_budget: usize = 0;
+        // SQL-56 (3)・Issue #1793: `FETCH FIRST n ROWS WITH TIES`。1 回目の走査（通常の上位
+        // `limit + offset` 件選抜）の後、ヒープの最悪要素 `tie_worst` と `ORDER BY` キーが等しく
+        // `(id, tenant_id)` がそれより後ろの可視行だけを `ties_extra` へ集める 2 回目の走査を
+        // 行う（`ONLY`／通常の `LIMIT` は 1 回だけ）。2 回目も `with_visible_row` を通るため
+        // RLS・WHERE・可視性の順序は 1 回目と同一で、他テナントの行は同値判定・件数に現れない。
+        let scan_passes: usize = if bound.ties_row_cap.is_some() { 2 } else { 1 };
+        let mut tie_worst: Option<HeapEntry> = None;
+        let mut ties_extra: Vec<HeapEntry> = Vec::new();
         let stop_threshold = early_stop_threshold(bound.result_cap, bound.offset)?;
         let mut matched: usize = 0;
 
-        for entry in table.iter().map_err(storage_internal)? {
-            let (k, v) = entry.map_err(storage_internal)?;
-            let (key_tenant, id) = k.value();
-            let buf = v.value();
-            // codex-review PR #1096 追加是正（P1 2 件・Cursor Bugbot 1 件の統合
-            // 是正）: 複製（`scalar_key_ref_to_owned`）はこの build クロージャの
-            // 「最後」でのみ行う。まず `extract_order_value_ref` で全キーを
-            // 借用のまま取り出し、(1) ヒープが満杯なら複製前に
-            // `compare_candidate_ref_to_entry` で現在の最悪候補と比較し、
-            // 採用されない（`Ordering::Less` でない）候補は一切複製・確保せず
-            // `Ok(None)` で抜ける（上位候補にならない大きな TEXT キーの行が
-            // クエリ全体を不要に拒否するのを防ぐ）。(2) 採用される・またはヒープに
-            // まだ空きがある場合のみ、全キー合計長・`keys` 配列容量・候補保持量を
-            // 単一の [`predicted_heap_entry_bytes`] で確保前に照合する
-            // （複数 TEXT キーの合計長を見ずに 1 キーずつしか照合しない旧実装の
-            // 抜け穴を解消）。
-            let decision = with_visible_row(
-                buf,
-                key_tenant,
-                id,
-                schema,
-                bound,
-                tier,
-                &scalar_mask,
-                expected_dim,
-                ctx,
-                &mut embedding_scratch,
-                &mut where_expr_scratch,
-                |_dim, scanned, embedding| {
-                    // Issue #1797・SQL-34: 可視かつ WHERE 一致の行を数え、`offset + cap` を
-                    // 超えた（= OFFSET 適用後に `cap + 1` 件目が確定した）時点で、並べ替えキー評価・
-                    // ヒープ投入の前に拒否する。パス 2 には進まない。
-                    if let Some(threshold) = stop_threshold {
-                        matched += 1;
-                        if matched > threshold {
-                            return Err(row_limit_exceeded());
-                        }
+        for scan_pass in 0..scan_passes {
+            if scan_pass == 1 {
+                // ヒープが満杯でなければ同値で溢れる行は存在しない（全可視行が既に選抜済み）。
+                match heap.peek() {
+                    Some(w) if heap.len() >= heap_capacity => {
+                        // 予算検査は借用のまま行い、通過後にだけ所有キーを複製する
+                        // （`max_result_bytes` 超過分を先に確保しないため）。
+                        heap_budget = try_accumulate_budget(
+                            heap_budget,
+                            heap_entry_bytes(w),
+                            max_result_bytes,
+                        )?;
+                        tie_worst = Some(w.clone());
                     }
-                    // Issue #1188: 式キーは行ごとに評価し、評価結果（`ExprValue`。TEXT は
-                    // 列参照なら借用・関数結果なら評価時に構築済みの所有値）を借用したまま
-                    // 採否判定・予算照合に使う。複製（所有値化）は採用が決まった候補に
-                    // 対してだけ下の `scalar_key_ref_to_owned` で 1 回行う（列キーの経路と
-                    // 同じ「採用前に複製しない」契約）。RLS・WHERE を通過した可視行に対して
-                    // のみ評価される（`with_visible_row` の順序）。評価エラー（`22012`／
-                    // `22003`／`22008` 等）は可視行の値のみから生じ、そのまま fail-closed で返す。
-                    let mut expr_values: Vec<ExprValue<'_>> =
-                        Vec::with_capacity(bound.order_exprs.len());
-                    for key in &bound.order_by {
-                        if let BoundOrderTarget::Expr(i) = key.target {
-                            let (_, program) = bound.order_exprs.get(i).ok_or_else(|| {
-                                SqlSurfaceError::Internal {
-                                    detail: "expression order key program missing".to_string(),
+                    _ => break,
+                }
+            }
+            for entry in table.iter().map_err(storage_internal)? {
+                let (k, v) = entry.map_err(storage_internal)?;
+                let (key_tenant, id) = k.value();
+                let buf = v.value();
+                // codex-review PR #1096 追加是正（P1 2 件・Cursor Bugbot 1 件の統合
+                // 是正）: 複製（`scalar_key_ref_to_owned`）はこの build クロージャの
+                // 「最後」でのみ行う。まず `extract_order_value_ref` で全キーを
+                // 借用のまま取り出し、(1) ヒープが満杯なら複製前に
+                // `compare_candidate_ref_to_entry` で現在の最悪候補と比較し、
+                // 採用されない（`Ordering::Less` でない）候補は一切複製・確保せず
+                // `Ok(None)` で抜ける（上位候補にならない大きな TEXT キーの行が
+                // クエリ全体を不要に拒否するのを防ぐ）。(2) 採用される・またはヒープに
+                // まだ空きがある場合のみ、全キー合計長・`keys` 配列容量・候補保持量を
+                // 単一の [`predicted_heap_entry_bytes`] で確保前に照合する
+                // （複数 TEXT キーの合計長を見ずに 1 キーずつしか照合しない旧実装の
+                // 抜け穴を解消）。
+                let decision = with_visible_row(
+                    buf,
+                    key_tenant,
+                    id,
+                    schema,
+                    bound,
+                    tier,
+                    &scalar_mask,
+                    expected_dim,
+                    ctx,
+                    &mut embedding_scratch,
+                    &mut where_expr_scratch,
+                    |_dim, scanned, embedding| {
+                        // Issue #1797・SQL-34: 可視かつ WHERE 一致の行を数え、`offset + cap` を
+                        // 超えた（= OFFSET 適用後に `cap + 1` 件目が確定した）時点で、並べ替えキー評価・
+                        // ヒープ投入の前に拒否する。パス 2 には進まない。`WITH TIES` は明示件数
+                        // （`result_cap` が `None`）のため `stop_threshold` は常に `None`。
+                        if let Some(threshold) = stop_threshold {
+                            matched += 1;
+                            if matched > threshold {
+                                return Err(row_limit_exceeded());
+                            }
+                        }
+                        // Issue #1188: 式キーは行ごとに評価し、評価結果（`ExprValue`。TEXT は
+                        // 列参照なら借用・関数結果なら評価時に構築済みの所有値）を借用したまま
+                        // 採否判定・予算照合に使う。複製（所有値化）は採用が決まった候補に
+                        // 対してだけ下の `scalar_key_ref_to_owned` で 1 回行う（列キーの経路と
+                        // 同じ「採用前に複製しない」契約）。RLS・WHERE を通過した可視行に対して
+                        // のみ評価される（`with_visible_row` の順序）。評価エラー（`22012`／
+                        // `22003`／`22008` 等）は可視行の値のみから生じ、そのまま fail-closed で返す。
+                        let mut expr_values: Vec<ExprValue<'_>> =
+                            Vec::with_capacity(bound.order_exprs.len());
+                        for key in &bound.order_by {
+                            if let BoundOrderTarget::Expr(i) = key.target {
+                                let (_, program) = bound.order_exprs.get(i).ok_or_else(|| {
+                                    SqlSurfaceError::Internal {
+                                        detail: "expression order key program missing".to_string(),
+                                    }
+                                })?;
+                                expr_values.push(program.eval(
+                                    id,
+                                    embedding,
+                                    scanned,
+                                    &mut order_expr_scratch,
+                                )?);
+                            }
+                        }
+                        // Issue #1597: jsonb 式キーは行ごとにソートキー（バイト列）を 1 回だけ作り、
+                        // 下の `refs` がそれを借用する（比較器は失敗しないため、格納値の破損・
+                        // 長さ超過はこの段で fail-closed に返す）。式キーと同じ並びで保持する。
+                        let mut jsonb_keys: Vec<Option<Vec<u8>>> =
+                            Vec::with_capacity(expr_values.len());
+                        {
+                            let mut kinds = bound
+                                .order_by
+                                .iter()
+                                .filter(|k| matches!(k.target, BoundOrderTarget::Expr(_)))
+                                .map(|k| k.kind);
+                            for v in &expr_values {
+                                let kind =
+                                    kinds.next().ok_or_else(|| SqlSurfaceError::Internal {
+                                        detail: "expression order key kind missing".to_string(),
+                                    })?;
+                                jsonb_keys.push(if kind == OrderKind::Jsonb {
+                                    expr_value_to_jsonb_key(v)?
+                                } else {
+                                    None
+                                });
+                            }
+                        }
+                        let mut expr_iter = expr_values.iter().zip(jsonb_keys.iter());
+                        let mut refs: Vec<Option<ScalarKeyRef<'_>>> =
+                            Vec::with_capacity(bound.order_by.len());
+                        for key in &bound.order_by {
+                            if matches!(key.target, BoundOrderTarget::Expr(_)) {
+                                let (v, jk) =
+                                    expr_iter.next().ok_or_else(|| SqlSurfaceError::Internal {
+                                        detail: "expression order key value missing".to_string(),
+                                    })?;
+                                if key.kind == OrderKind::Jsonb {
+                                    refs.push(jk.as_deref().map(ScalarKeyRef::JsonbKey));
+                                } else {
+                                    refs.push(expr_value_to_key_ref(v, key.kind, key.collation)?);
                                 }
-                            })?;
-                            expr_values.push(program.eval(
-                                id,
-                                embedding,
-                                scanned,
-                                &mut order_expr_scratch,
-                            )?);
-                        }
-                    }
-                    // Issue #1597: jsonb 式キーは行ごとにソートキー（バイト列）を 1 回だけ作り、
-                    // 下の `refs` がそれを借用する（比較器は失敗しないため、格納値の破損・
-                    // 長さ超過はこの段で fail-closed に返す）。式キーと同じ並びで保持する。
-                    let mut jsonb_keys: Vec<Option<Vec<u8>>> =
-                        Vec::with_capacity(expr_values.len());
-                    {
-                        let mut kinds = bound
-                            .order_by
-                            .iter()
-                            .filter(|k| matches!(k.target, BoundOrderTarget::Expr(_)))
-                            .map(|k| k.kind);
-                        for v in &expr_values {
-                            let kind = kinds.next().ok_or_else(|| SqlSurfaceError::Internal {
-                                detail: "expression order key kind missing".to_string(),
-                            })?;
-                            jsonb_keys.push(if kind == OrderKind::Jsonb {
-                                expr_value_to_jsonb_key(v)?
                             } else {
-                                None
+                                refs.push(extract_order_value_ref(schema, key, id, scanned)?);
+                            }
+                        }
+                        if let Some(w) = &tie_worst {
+                            // 2 回目の走査: `w` と同じ `(id, tenant_id)` を渡すと比較は `ORDER BY`
+                            // キー部分だけになり、`Equal` が「キーが等しい」を意味する。
+                            if compare_candidate_ref_to_entry(
+                                &bound.order_by,
+                                &refs,
+                                w.id,
+                                &w.tenant_id,
+                                w,
+                            ) != Ordering::Equal
+                            {
+                                return Ok(None);
+                            }
+                            // 1 回目の選抜はキー同値のうち `(id, tenant_id)` が最小のものを残すため、
+                            // `w` 以前は選抜済み。`w` より後ろの同値行だけが追加対象。
+                            let after_worst = match id.cmp(&w.id) {
+                                Ordering::Equal => {
+                                    key_tenant.as_bytes().cmp(w.tenant_id.as_bytes())
+                                }
+                                o => o,
+                            };
+                            if after_worst != Ordering::Greater {
+                                return Ok(None);
+                            }
+                            let predicted = predicted_heap_entry_bytes(&refs, key_tenant.len());
+                            try_accumulate_budget(heap_budget, predicted, max_result_bytes)?;
+                        } else if heap.len() >= heap_capacity {
+                            let worst = heap.peek().ok_or_else(|| SqlSurfaceError::Internal {
+                                detail: "heap reported at capacity but is empty".to_string(),
+                            })?;
+                            let cmp = compare_candidate_ref_to_entry(
+                                &bound.order_by,
+                                &refs,
+                                id,
+                                key_tenant,
+                                worst,
+                            );
+                            if cmp != Ordering::Less {
+                                // 現在の最悪候補以上（採用されない）。複製せずスキップ。
+                                return Ok(None);
+                            }
+                            // codex-review PR #1096 追加是正（最新ラウンド）: 採用が
+                            // 決まった時点では最悪候補（`worst`）はまだヒープ内に
+                            // 残っており（`heap.pop()` は複製・push が終わった後で
+                            // 呼ぶ）実メモリ上も生存し続けている。複製前の見積り
+                            // （`predicted`）は、この一時的な同時保持（`worst` を
+                            // 含む現在の `heap_budget` 全体 + 新候補）を基準に照合
+                            // する（`worst` を先に差し引いた残り予算と照合すると、
+                            // 複製〜実際の追い出しまでの間、実際の同時保持量が
+                            // 計上額を超えうる。「計上額 ≥ 実際の同時保持量」を
+                            // 常に保つ不変条件）。
+                            let predicted = predicted_heap_entry_bytes(&refs, key_tenant.len());
+                            try_accumulate_budget(heap_budget, predicted, max_result_bytes)?;
+                        } else {
+                            let predicted = predicted_heap_entry_bytes(&refs, key_tenant.len());
+                            try_accumulate_budget(heap_budget, predicted, max_result_bytes)?;
+                        }
+                        let mut keys = Vec::with_capacity(refs.len());
+                        for r in refs {
+                            keys.push(match r {
+                                Some(v) => Some(scalar_key_ref_to_owned(v)?),
+                                None => None,
                             });
                         }
+                        Ok(Some(keys))
+                    },
+                )?;
+                let Some(Some(keys)) = decision else {
+                    continue;
+                };
+                let candidate = HeapEntry {
+                    keys,
+                    tenant_id: key_tenant.to_string(),
+                    id,
+                    spec: Rc::clone(&spec),
+                };
+                if tie_worst.is_some() {
+                    // 同値行も結果行数の上限に数える。超過は結果を打ち切らず `54000`。
+                    // 数えるのは可視行だけなので、他テナントの行の有無は成否に影響しない。
+                    let cap = bound.ties_row_cap.unwrap_or(usize::MAX);
+                    let total = heap
+                        .len()
+                        .saturating_sub(bound.offset)
+                        .saturating_add(ties_extra.len())
+                        .saturating_add(1);
+                    if total > cap {
+                        return Err(SqlSurfaceError::payload_too_large(format!(
+                            "WITH TIES result exceeds the maximum result rows ({cap})"
+                        )));
                     }
-                    let mut expr_iter = expr_values.iter().zip(jsonb_keys.iter());
-                    let mut refs: Vec<Option<ScalarKeyRef<'_>>> =
-                        Vec::with_capacity(bound.order_by.len());
-                    for key in &bound.order_by {
-                        if matches!(key.target, BoundOrderTarget::Expr(_)) {
-                            let (v, jk) =
-                                expr_iter.next().ok_or_else(|| SqlSurfaceError::Internal {
-                                    detail: "expression order key value missing".to_string(),
-                                })?;
-                            if key.kind == OrderKind::Jsonb {
-                                refs.push(jk.as_deref().map(ScalarKeyRef::JsonbKey));
-                            } else {
-                                refs.push(expr_value_to_key_ref(v, key.kind, key.collation)?);
-                            }
-                        } else {
-                            refs.push(extract_order_value_ref(schema, key, id, scanned)?);
-                        }
-                    }
-                    if heap.len() >= heap_capacity {
-                        let worst = heap.peek().ok_or_else(|| SqlSurfaceError::Internal {
-                            detail: "heap reported at capacity but is empty".to_string(),
+                    let bytes = heap_entry_bytes(&candidate);
+                    heap_budget = try_accumulate_budget(heap_budget, bytes, max_result_bytes)?;
+                    ties_extra
+                        .try_reserve(1)
+                        .map_err(|e| SqlSurfaceError::Internal {
+                            detail: format!("failed to reserve tied rows: {e}"),
                         })?;
-                        let cmp = compare_candidate_ref_to_entry(
-                            &bound.order_by,
-                            &refs,
-                            id,
-                            key_tenant,
-                            worst,
-                        );
-                        if cmp != Ordering::Less {
-                            // 現在の最悪候補以上（採用されない）。複製せずスキップ。
-                            return Ok(None);
-                        }
-                        // codex-review PR #1096 追加是正（最新ラウンド）: 採用が
-                        // 決まった時点では最悪候補（`worst`）はまだヒープ内に
-                        // 残っており（`heap.pop()` は複製・push が終わった後で
-                        // 呼ぶ）実メモリ上も生存し続けている。複製前の見積り
-                        // （`predicted`）は、この一時的な同時保持（`worst` を
-                        // 含む現在の `heap_budget` 全体 + 新候補）を基準に照合
-                        // する（`worst` を先に差し引いた残り予算と照合すると、
-                        // 複製〜実際の追い出しまでの間、実際の同時保持量が
-                        // 計上額を超えうる。「計上額 ≥ 実際の同時保持量」を
-                        // 常に保つ不変条件）。
-                        let predicted = predicted_heap_entry_bytes(&refs, key_tenant.len());
-                        try_accumulate_budget(heap_budget, predicted, max_result_bytes)?;
-                    } else {
-                        let predicted = predicted_heap_entry_bytes(&refs, key_tenant.len());
-                        try_accumulate_budget(heap_budget, predicted, max_result_bytes)?;
-                    }
-                    let mut keys = Vec::with_capacity(refs.len());
-                    for r in refs {
-                        keys.push(match r {
-                            Some(v) => Some(scalar_key_ref_to_owned(v)?),
-                            None => None,
-                        });
-                    }
-                    Ok(Some(keys))
-                },
-            )?;
-            let Some(Some(keys)) = decision else {
-                continue;
-            };
-            let candidate = HeapEntry {
-                keys,
-                tenant_id: key_tenant.to_string(),
-                id,
-                spec: Rc::clone(&spec),
-            };
-            if heap.len() < heap_capacity {
-                let bytes = heap_entry_bytes(&candidate);
-                heap_budget = try_accumulate_budget(heap_budget, bytes, max_result_bytes)?;
-                heap.push(candidate);
-            } else {
-                // codex-review PR #1096 追加是正（最新ラウンド）: 新候補を先に
-                // 計上・push してから最悪候補を追い出す（追い出し中は新旧
-                // 両方が実際にヒープ内へ同時に存在するため、計上額はこの
-                // 一時的な合計を下回ってはならない。閉包内の
-                // `try_accumulate_budget(heap_budget, predicted, ...)` と
-                // 対称）。追い出した候補（`popped`）は明示的に `drop` して
-                // 実際に破棄したことを確定させてから、その分だけ解放する
-                // （解放が実際の破棄より先に起きないことを保証する。
-                // 「計上額 ≥ 実際の同時保持量」の不変条件）。
-                let bytes = heap_entry_bytes(&candidate);
-                heap_budget = try_accumulate_budget(heap_budget, bytes, max_result_bytes)?;
-                heap.push(candidate);
-                if let Some(popped) = heap.pop() {
-                    let popped_bytes = heap_entry_bytes(&popped);
-                    drop(popped);
-                    heap_budget = heap_budget.checked_sub(popped_bytes).ok_or_else(
+                    ties_extra.push(candidate);
+                    continue;
+                }
+                if heap.len() < heap_capacity {
+                    let bytes = heap_entry_bytes(&candidate);
+                    heap_budget = try_accumulate_budget(heap_budget, bytes, max_result_bytes)?;
+                    heap.push(candidate);
+                } else {
+                    // codex-review PR #1096 追加是正（最新ラウンド）: 新候補を先に
+                    // 計上・push してから最悪候補を追い出す（追い出し中は新旧
+                    // 両方が実際にヒープ内へ同時に存在するため、計上額はこの
+                    // 一時的な合計を下回ってはならない。閉包内の
+                    // `try_accumulate_budget(heap_budget, predicted, ...)` と
+                    // 対称）。追い出した候補（`popped`）は明示的に `drop` して
+                    // 実際に破棄したことを確定させてから、その分だけ解放する
+                    // （解放が実際の破棄より先に起きないことを保証する。
+                    // 「計上額 ≥ 実際の同時保持量」の不変条件）。
+                    let bytes = heap_entry_bytes(&candidate);
+                    heap_budget = try_accumulate_budget(heap_budget, bytes, max_result_bytes)?;
+                    heap.push(candidate);
+                    if let Some(popped) = heap.pop() {
+                        let popped_bytes = heap_entry_bytes(&popped);
+                        drop(popped);
+                        heap_budget = heap_budget.checked_sub(popped_bytes).ok_or_else(
                         || SqlSurfaceError::Internal {
                             detail: "scan result byte budget underflow while evicting the worst heap candidate"
                                 .to_string(),
                         },
                     )?;
+                    }
                 }
             }
+        }
+        // 2 回目の走査で控えた最悪要素の複製を破棄し、同値行を通常の候補としてヒープへ戻す
+        // （予算は集めた時点で計上済み。以降の全順序ソート・OFFSET 読み飛ばし・投影は共通）。
+        if let Some(w) = tie_worst.take() {
+            let bytes = heap_entry_bytes(&w);
+            drop(w);
+            heap_budget =
+                heap_budget
+                    .checked_sub(bytes)
+                    .ok_or_else(|| SqlSurfaceError::Internal {
+                        detail:
+                            "scan result byte budget underflow while releasing the tie boundary row"
+                                .to_string(),
+                    })?;
+        }
+        for extra in ties_extra {
+            heap.push(extra);
         }
 
         // codex-review PR #1096 P1 是正: パス 1 のヒープ候補（`heap_budget`）と
@@ -1940,6 +2041,7 @@ mod tests {
             offset: 0,
             windows: Vec::new(),
             order_exprs: Vec::new(),
+            ties_row_cap: None,
         }
     }
 
@@ -2088,6 +2190,7 @@ mod tests {
             offset: 0,
             windows: Vec::new(),
             order_exprs: Vec::new(),
+            ties_row_cap: None,
         };
 
         // パス 1 のヒープ候補 1 件分の内訳（[`heap_entry_keys_bytes`]・
@@ -2449,6 +2552,7 @@ mod tests {
             offset: 0,
             windows: Vec::new(),
             order_exprs: Vec::new(),
+            ties_row_cap: None,
         };
 
         let err = execute_scan_with_budget(&read_txn, &ctx, &schema, &bound, 4096)
@@ -2530,6 +2634,7 @@ mod tests {
             offset: 0,
             windows: Vec::new(),
             order_exprs: Vec::new(),
+            ties_row_cap: None,
         };
 
         // 巨大なキーを複製すれば単独でも超過するが、上位候補にならないため
@@ -2612,6 +2717,7 @@ mod tests {
             offset: 0,
             windows: Vec::new(),
             order_exprs: Vec::new(),
+            ties_row_cap: None,
         };
 
         // 十分大きい既定予算では、最終的に id=2（"a"）だけが残る。
@@ -2717,6 +2823,7 @@ mod tests {
             offset: 5,
             windows: Vec::new(),
             order_exprs: Vec::new(),
+            ties_row_cap: None,
         };
 
         // パス 1 終了時点のヒープ候補 7 件分（`heap_entry_bytes` と同じ計算式。
@@ -2787,6 +2894,7 @@ mod tests {
             offset: 0,
             windows: Vec::new(),
             order_exprs: Vec::new(),
+            ties_row_cap: None,
         }
     }
 
@@ -2857,6 +2965,7 @@ mod tests {
             offset: 0,
             windows: Vec::new(),
             order_exprs: Vec::new(),
+            ties_row_cap: None,
         };
 
         let ctx = PolicyContext::new("tenant-a").expect("valid tenant");
@@ -2935,6 +3044,7 @@ mod tests {
             offset: 0,
             windows: Vec::new(),
             order_exprs: Vec::new(),
+            ties_row_cap: None,
         };
 
         let ctx = PolicyContext::new("tenant-a").expect("valid tenant");
@@ -3007,6 +3117,7 @@ mod tests {
             offset: 0,
             windows: Vec::new(),
             order_exprs: Vec::new(),
+            ties_row_cap: None,
         };
 
         let ctx = PolicyContext::new("tenant-a").expect("valid tenant");
@@ -3066,6 +3177,7 @@ mod tests {
             offset: 0,
             windows: Vec::new(),
             order_exprs: Vec::new(),
+            ties_row_cap: None,
         };
 
         let ctx = PolicyContext::new("tenant-a").expect("valid tenant");
@@ -3237,6 +3349,7 @@ mod tests {
             offset: 0,
             windows: Vec::new(),
             order_exprs: Vec::new(),
+            ties_row_cap: None,
         };
         let (tier, mask) = decode_tier_for(&schema, &bound);
         assert_eq!(tier, DecodeTier::DimAndScalar);
@@ -3259,6 +3372,7 @@ mod tests {
             offset: 0,
             windows: Vec::new(),
             order_exprs: Vec::new(),
+            ties_row_cap: None,
         };
         let (tier, mask) = decode_tier_for(&schema, &bound);
         assert_eq!(tier, DecodeTier::Fast);
@@ -3287,6 +3401,7 @@ mod tests {
             offset: 0,
             windows: Vec::new(),
             order_exprs: Vec::new(),
+            ties_row_cap: None,
         };
         let (tier, _mask) = decode_tier_for(&schema, &bound);
         assert_eq!(tier, DecodeTier::Embedding);

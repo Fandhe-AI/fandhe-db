@@ -6568,6 +6568,10 @@ pub(crate) struct BoundGroupBy {
     pub(crate) group_row_mask: Vec<bool>,
     pub(crate) order_by: Vec<BoundOrderBy>,
     pub(crate) limit: Option<usize>,
+    /// `FETCH FIRST n ROWS WITH TIES`（SQL-56 (3)・Issue #1793）。真のとき、`OFFSET` 適用後の
+    /// `limit` 件目のグループと `ORDER BY` キーが等しいグループを `limit` を超えて返す
+    /// （`sql::group_by`。件数が `MAX_GROUPS` を超えたら `54000`）。
+    pub(crate) with_ties: bool,
     /// `OFFSET` の検証済み値（`0..=core::MAX_SEARCH_K`。Issue #916・SQL-25 (b)・
     /// TASK-209）。ソート済みグループ列に対し `truncate(limit)` の前に適用する
     /// （`sql::group_by`）。`limit` が `None`（`LIMIT` 句なし）のときは構文段
@@ -6942,6 +6946,7 @@ impl BoundAggregate {
                 group_row_mask: Vec::new(),
                 order_by: Vec::new(),
                 limit: None,
+                with_ties: false,
                 offset: 0,
                 result_cap: None,
             }),
@@ -8043,6 +8048,12 @@ pub struct BoundScan {
     /// コンパイル結果（Issue #1188・SQL-26）。式キーを持たない文・[`Self::new`] 経由の
     /// 直接構築は空。
     pub(crate) order_exprs: BoundOrderExprs,
+    /// `FETCH FIRST n ROWS WITH TIES`（SQL-56 (3)・Issue #1793）の結果行数上限。`Some(cap)`
+    /// のとき、`LIMIT + OFFSET` 件目の行と `ORDER BY` キーが等しい行を `limit` を超えて返す
+    /// （`sql::scan` の経路 (B)）。`cap` は結果行数の上限（`ResultLimits::max_result_rows`）で、
+    /// 同値を加えた件数が超えたら結果を打ち切らず `54000`。`None` は通常の `LIMIT`。
+    /// [`Self::new`]（NoSQL 表層）は常に `None`。
+    pub(crate) ties_row_cap: Option<usize>,
 }
 
 /// 広域取得の式キーの `(束縛済み式, コンパイル済みプログラム)` 列（[`BoundScan::order_exprs`]）。
@@ -8707,6 +8718,7 @@ impl BoundScan {
             limit,
             result_cap: None,
             order_exprs: Vec::new(),
+            ties_row_cap: None,
             // Issue #915・SQL-25: `Self::new` 単体は既存契約どおり常に空。
             // NoSQL `sort`（NOSQL-15・Issue #946）を付与する場合は呼び出し元が
             // 続けて `with_order_by` を呼ぶ（builder 形。シグネチャは変えない）。
@@ -9344,6 +9356,11 @@ pub(crate) fn bind_scan_with_dummy_flags(
         offset,
         windows,
         order_exprs,
+        ties_row_cap: if stmt.with_ties {
+            Some(result_limits.max_result_rows())
+        } else {
+            None
+        },
     })
 }
 
@@ -9730,6 +9747,7 @@ fn bind_group_by_clause(
         group_row_mask,
         order_by,
         limit,
+        with_ties: clause.with_ties,
         offset,
         result_cap: None,
     })

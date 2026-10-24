@@ -124,6 +124,36 @@
   従来 `NULLS LAST` を `42601` としていた `sql25_scalar_order_by.rs`・`sql25_aggregate_order_by_scalar_keys.rs`・
   `sql27_explain_targets.rs`・`sql30_window.rs` の拒否ケースは、受理後も拒否される `NULLS MIDDLE` へ置き換えた。
 
+## Issue #1793 追記（FETCH FIRST／OFFSET ROWS／WITH TIES。SQL-56 (3)・TASK-298 のポインタ）
+
+標準 SQL の `FETCH {FIRST|NEXT} [n] {ROW|ROWS} {ONLY|WITH TIES}` と `OFFSET m {ROW|ROWS}` を受理する。
+
+- **正規化方針**: 実体は `sql::fetch_clause`（トークン段）。`ONLY` は `LIMIT n`、`OFFSET m ROWS` は
+  `OFFSET m` へ書き換え、構文検証の各経路は従来どおり `LIMIT`／`OFFSET` だけを解析する。範囲・上限・
+  エラー契約は `LIMIT` と完全に同一（独自検証なし。`$n` の受理位置も同じ）。件数省略は 1 件。`FETCH` と
+  `OFFSET` はどちらの順でも受け付け、エンジンの文法（`LIMIT n OFFSET m`）へ並べ直す。
+- **階層**: 括弧グループごとに判定する。同じ階層での `LIMIT` と `FETCH` の併記、`FETCH` の重複、
+  `PERCENT` など PostgreSQL 17 に無い形、`ONLY`／`WITH TIES` の欠落は `42601`。文頭の `FETCH`／`MOVE`
+  （カーソル文）は書き換えない。適用位置は各パース入口と `relation_name::tokenize_resolved_with`
+  （構文検証・名前解決より前。冪等）。
+- **WITH TIES**: 正規形 `FETCH FIRST <n> ROWS WITH TIES` を、単一表のスカラー `ORDER BY` 広域取得
+  （ウィンドウ・投影内スカラーサブクエリなし）と `GROUP BY` 集計の `ORDER BY` だけが解釈する。
+  `ORDER BY` が同じ階層に無ければ `42601`。それ以外は黙って `ONLY` 扱いにせず拒否する:
+  `SELECT` で始まらない文（`WITH`・`EXPLAIN`・`CREATE VIEW`・`DECLARE`・`INSERT`・`COPY` など）と
+  括弧の内側は `0A000`、ウィンドウ・サブクエリ・CTE・評価後射影形ビュー・集合演算の枝も `0A000`、
+  kNN・`USING PLAN`・DISTINCT・JOIN・集合演算・FROM 無し SELECT は構文が正規形を知らず `42601`。
+- **実行**: 経路 (A)（先頭キーが `id`）は `id` が自テナント内で一意のため `ONLY` と同じ。経路 (B) は
+  上位 `limit + offset` 件の選抜後に、最悪要素と `ORDER BY` キーが等しく `(id, tenant_id)` が後ろの
+  可視行だけを 2 回目の走査で集める（`with_visible_row` を共有するため RLS・TABLE-12・WHERE・可視性の
+  順序は同一）。同値行も結果行数の上限（`ResultLimits`）に数え、超過したら打ち切らず `54000`。
+  `GROUP BY` 集計はソート・OFFSET 後の `limit` 件目と `ORDER BY` キーが等しい後続グループを残す
+  （上限は `MAX_GROUPS`）。同値行の順序は経路の既存のタイブレーク（広域取得は `id` 昇順）。
+  他テナントの同値行は同値判定にも件数にも現れない。
+- **PostgreSQL との差分**: 上記の対応範囲外の `WITH TIES`（kNN・DISTINCT・JOIN・集合演算・ウィンドウ・
+  サブクエリ・CTE など）は受理しない。`OFFSET m ROWS` と `LIMIT` の順（`OFFSET` 先）は `FETCH` を伴う
+  場合のみ並べ替える（`OFFSET m LIMIT n` は従来どおり `42601`）。
+- テスト: `tests/sql56_fetch_first.rs`、単体 `sql::fetch_clause`。
+
 ## PostgreSQL との既知の差分
 
 - 定数式（`ORDER BY 1 + 0`）・`$n` を定数として並べ替える受理は未実装（`42601`。序数としては扱わない）。

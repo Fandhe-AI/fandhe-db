@@ -2094,39 +2094,43 @@ fn finish_groups(
     // しない想定）は NULL 相当へ安全側にフォールバックする（panic させない。束縛段の
     // 保証によりそもそも到達しない防御的分岐）。`sort_by`（安定ソート）を使い、
     // `sort_unstable*` は使わない（決定性。`make sort-determinism-check`）。
+    // `ORDER BY` キー部分だけの比較（タイブレークのグループキー昇順を含まない）。`WITH TIES`
+    // （SQL-56 (3)・Issue #1793）の同値判定と全順序の比較が同じ実装を共有する。
+    type FinishedGroup = (GroupKey, Vec<Cell>, Vec<Option<OrderValue>>);
+    let order_keys_cmp = |(ka, ca, va): &FinishedGroup, (kb, cb, vb): &FinishedGroup| {
+        for order_by in &group_by.order_by {
+            let ord = match order_by.target {
+                OrderTarget::GroupKey(key_index) => compare_order_key(
+                    ka.0.get(key_index).and_then(Option::as_ref),
+                    kb.0.get(key_index).and_then(Option::as_ref),
+                    order_by.descending,
+                    order_by.nulls,
+                ),
+                OrderTarget::Aggregate(idx) => cmp_cells_pg_nulls(
+                    ca.get(idx).unwrap_or(&Cell::Null),
+                    cb.get(idx).unwrap_or(&Cell::Null),
+                    order_by.descending,
+                    order_by.nulls,
+                ),
+                // 式キー（Issue #1188）: 事前評価済みの値を PostgreSQL 既定の NULL 位置
+                // （ASC 末尾・DESC 先頭）で比較する（広域取得の式 `ORDER BY` と同じ比較器）。
+                OrderTarget::Expr(idx) => compare_order_key(
+                    va.get(idx).and_then(Option::as_ref),
+                    vb.get(idx).and_then(Option::as_ref),
+                    order_by.descending,
+                    order_by.nulls,
+                ),
+            };
+            if ord != std::cmp::Ordering::Equal {
+                return ord;
+            }
+        }
+        std::cmp::Ordering::Equal
+    };
     if group_by.order_by.is_empty() {
         finished.sort_by(|(ka, _, _), (kb, _, _)| ka.cmp(kb));
     } else {
-        finished.sort_by(|(ka, ca, va), (kb, cb, vb)| {
-            for order_by in &group_by.order_by {
-                let ord = match order_by.target {
-                    OrderTarget::GroupKey(key_index) => compare_order_key(
-                        ka.0.get(key_index).and_then(Option::as_ref),
-                        kb.0.get(key_index).and_then(Option::as_ref),
-                        order_by.descending,
-                        order_by.nulls,
-                    ),
-                    OrderTarget::Aggregate(idx) => cmp_cells_pg_nulls(
-                        ca.get(idx).unwrap_or(&Cell::Null),
-                        cb.get(idx).unwrap_or(&Cell::Null),
-                        order_by.descending,
-                        order_by.nulls,
-                    ),
-                    // 式キー（Issue #1188）: 事前評価済みの値を PostgreSQL 既定の NULL 位置
-                    // （ASC 末尾・DESC 先頭）で比較する（広域取得の式 `ORDER BY` と同じ比較器）。
-                    OrderTarget::Expr(idx) => compare_order_key(
-                        va.get(idx).and_then(Option::as_ref),
-                        vb.get(idx).and_then(Option::as_ref),
-                        order_by.descending,
-                        order_by.nulls,
-                    ),
-                };
-                if ord != std::cmp::Ordering::Equal {
-                    return ord;
-                }
-            }
-            ka.cmp(kb)
-        });
+        finished.sort_by(|a, b| order_keys_cmp(a, b).then_with(|| a.0.cmp(&b.0)));
     }
 
     // Issue #916・SQL-25 (b)・TASK-209: `OFFSET` はソート確定後・`LIMIT` 適用前に
@@ -2142,7 +2146,32 @@ fn finish_groups(
     }
 
     if let Some(limit) = group_by.limit {
-        finished.truncate(limit);
+        // `WITH TIES`: `limit` 件目のグループと `ORDER BY` キーが等しい後続グループも残す。
+        // 数えるのは自テナントの可視行から作られたグループだけ。件数が `MAX_GROUPS` を
+        // 超えたら結果を打ち切らず `54000`。
+        let keep = if group_by.with_ties && !group_by.order_by.is_empty() {
+            let boundary = limit.checked_sub(1).and_then(|i| finished.get(i));
+            let mut keep = limit.min(finished.len());
+            if let Some(boundary) = boundary {
+                keep = keep.max(
+                    finished
+                        .iter()
+                        .skip(limit)
+                        .take_while(|g| order_keys_cmp(boundary, g) == std::cmp::Ordering::Equal)
+                        .count()
+                        .saturating_add(limit),
+                );
+            }
+            if keep > MAX_GROUPS {
+                return Err(SqlSurfaceError::payload_too_large(format!(
+                    "WITH TIES result exceeds the maximum number of groups ({MAX_GROUPS})"
+                )));
+            }
+            keep
+        } else {
+            limit
+        };
+        finished.truncate(keep);
     }
 
     // PROJECT 段: `bound.projection` の列順で `GroupKey`／集計結果を組み立てる。
@@ -2849,6 +2878,7 @@ mod tests {
             group_by: Some(BoundGroupBy {
                 having_exprs: Vec::new(),
                 order_exprs: Vec::new(),
+                with_ties: false,
                 group_row_mask: Vec::new(),
                 keys: vec![crate::sql::parser::BoundOrderKey {
                     target: BoundOrderTarget::Column(1),
@@ -3000,6 +3030,7 @@ mod tests {
             group_by: Some(BoundGroupBy {
                 having_exprs: Vec::new(),
                 order_exprs: Vec::new(),
+                with_ties: false,
                 group_row_mask: Vec::new(),
                 keys: vec![crate::sql::parser::BoundOrderKey {
                     target: BoundOrderTarget::Column(1),
@@ -3473,6 +3504,7 @@ mod tests {
             group_by: Some(BoundGroupBy {
                 having_exprs: Vec::new(),
                 order_exprs: Vec::new(),
+                with_ties: false,
                 group_row_mask: Vec::new(),
                 keys: vec![crate::sql::parser::BoundOrderKey {
                     target: BoundOrderTarget::Column(1),

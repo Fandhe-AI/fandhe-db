@@ -973,11 +973,13 @@ pub(crate) fn tokenize_resolved_with(
     marked: bool,
     resolver: Option<SchemaResolver<'_>>,
 ) -> Result<Vec<Token>, SqlSurfaceError> {
-    let mut tokens = if marked {
+    let tokens = if marked {
         crate::sql::lexer::tokenize_marked(sql)?
     } else {
         crate::sql::lexer::tokenize(sql)?
     };
+    // 標準 SQL の行数制限句（`FETCH FIRST n ROWS ONLY` 等）を正規形へ書き換える（Issue #1793）。
+    let mut tokens = crate::sql::fetch_clause::normalize_statement_tokens(tokens)?;
     rewrite_relation_names(&mut tokens, resolver)?;
     Ok(tokens)
 }
