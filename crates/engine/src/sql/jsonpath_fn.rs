@@ -25,8 +25,8 @@ use std::cell::Cell;
 use std::sync::Arc;
 
 use crate::json::jsonpath::{
-    jsonpath_exists, jsonpath_match, jsonpath_query, parse_jsonpath, JsonPathEvalOptions,
-    SqlJsonPath,
+    jsonpath_exists, jsonpath_match, jsonpath_query, parse_jsonpath_with_regex_limits,
+    JsonPathEvalOptions, SqlJsonPath,
 };
 use crate::json::{serialize_jsonb_bounded, JsonValue};
 use crate::jsonpath_limits::JsonPathLimits;
@@ -172,7 +172,9 @@ fn bind_path_arg(
         }
         Expr::String(s) => {
             charge_node(node_budget)?;
-            let parsed = parse_jsonpath(s).map_err(SqlSurfaceError::JsonPathParse)?;
+            let parsed =
+                parse_jsonpath_with_regex_limits(s, crate::sql::regex_op::current_regex_limits())
+                    .map_err(SqlSurfaceError::JsonPathParse)?;
             Ok(Some(Arc::new(parsed)))
         }
         _ => Err(path_arg_error(name)),
@@ -915,7 +917,7 @@ mod tests {
             "$.a.size()",
             "$.a[0] / 3",
         ] {
-            let parsed = parse_jsonpath(path).expect("valid path");
+            let parsed = crate::json::jsonpath::parse_jsonpath(path).expect("valid path");
             let items =
                 jsonpath_query(&parsed, &root, JsonPathEvalOptions::new()).expect("evaluates");
             let text = serialize_jsonb_bounded(&JsonValue::Array(items)).expect("bounded");
