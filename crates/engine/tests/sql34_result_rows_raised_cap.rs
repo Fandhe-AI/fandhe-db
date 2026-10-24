@@ -112,9 +112,14 @@ fn raised_cap_explicit_limit_range() {
 #[test]
 fn set_operation_branch_limit_is_independent_of_the_flag() {
     let (core, _g) = open("sql34-raised-setop");
+    // 片方の枝のみ 10,001 行・他方は空: 合計は引き上げ後の cap（10,001）以内なので、
+    // 54000 の原因は枝ごとの固定上限だけに分離される。
     let sql =
-        format!("SELECT id FROM t WHERE id <= {RAISED} UNION ALL SELECT id FROM t WHERE id <= 1");
+        format!("SELECT id FROM t WHERE id <= {RAISED} UNION ALL SELECT id FROM t WHERE id <= 0");
     assert_eq!(code(&core, &sql), "54000");
+    // 対照: 同じ構成で枝が固定上限ちょうど（10,000 行）なら成功する。
+    let ok_branch = "SELECT id FROM t WHERE id <= 10000 UNION ALL SELECT id FROM t WHERE id <= 0";
+    assert_eq!(rows(&core, ok_branch), 10_000);
     // 全体件数も 10,000 固定（cap が 10,001 でも 10,001 件の結果は拒否される）。
     let total = "SELECT id FROM t WHERE id <= 5001 UNION ALL SELECT id FROM t WHERE id <= 5000";
     assert_eq!(code(&core, total), "54000");
