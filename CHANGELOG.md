@@ -9,6 +9,9 @@
 
 ### Added
 
+- `INSERT ... SELECT`・CTAS・MATERIALIZED VIEW の入力行数上限の算出を共有化した（Issue #2212・SQL-34）。設定が
+  ハード上限（100,000）のとき、LIMIT を注入しない形は 99,999 行ではなく 100,000 行まで通る。matview の評価後射影形
+  （`GROUP BY` 等）の本文は `--max-result-rows` を既定値より上げると上限も上がる。超過は従来どおり書き込み前に `54000`。
 - `LIMIT` 省略・`LIMIT ALL` の結果行数上限超過（`54000`）を、`cap + 1` 件目の確定時点で走査・結合・集約を中断して返す（Issue #1797・SQL-34）。
   広域取得・ウィンドウ・HAVING なしの `GROUP BY`／`SELECT DISTINCT`・残余述語なしの JOIN が対象で、上限を超える行は保持しない。
   エラーコードと文言は変わらない。

@@ -822,3 +822,41 @@ fn insert_row_limit_boundary() {
     );
     assert_eq!(count(&core2, "alice", "w2"), Err("42P01".to_string()));
 }
+
+// 対象ビヘイビア: SQL-34・SQL-52 (2)（Issue #2212）。LIMIT 省略形の入力側上限。上限ちょうどは成功し、
+// 超過は 54000 で表も残らない。bob の行は数えず、上限を変えると境界も動く。
+#[test]
+fn input_row_limit_with_omitted_limit_follows_the_setting() {
+    // alice の可視行は 2 件（bob の 1 件は数えない）。
+    let (core, path) = setup_with("sql52-lo-ok", |c| {
+        c.with_result_limits(ResultLimits::new(2))
+    });
+    let _g = CleanupGuard(path);
+    let ok = ctas(&core, "alice", "CREATE TABLE o1 AS SELECT id, a FROM src");
+    assert_eq!(ok.rows(), Some(2));
+    // 上限を 1 に下げると同じ文が 54000 になり、表は残らない。
+    let (core1, path1) = setup_with("sql52-lo-over", |c| {
+        c.with_result_limits(ResultLimits::new(1))
+    });
+    let _g1 = CleanupGuard(path1);
+    assert_eq!(
+        code(run(
+            &core1,
+            "alice",
+            "CREATE TABLE o2 AS SELECT id, a FROM src"
+        )),
+        "54000"
+    );
+    assert_eq!(count(&core1, "alice", "o2"), Err("42P01".to_string()));
+}
+
+// 対象ビヘイビア: SQL-34・SQL-52 (2)（Issue #2212）。上限をハード上限にしても少量の入力は成功する。
+#[test]
+fn hard_cap_setting_still_creates_small_input() {
+    let (core, path) = setup_with("sql52-hard", |c| {
+        c.with_result_limits(ResultLimits::new(usize::MAX))
+    });
+    let _g = CleanupGuard(path);
+    let r = ctas(&core, "alice", "CREATE TABLE h1 AS SELECT id, a FROM src");
+    assert_eq!(r.rows(), Some(2));
+}

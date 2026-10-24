@@ -342,3 +342,29 @@ fn pg_parity_self_reference_conflict() {
     assert_eq!(affected(run(&core, "alice", nothing)), 0);
     assert_eq!(count(&core, "alice", "self_t"), 2);
 }
+
+// 対象ビヘイビア: SQL-34・SQL-51（Issue #2212）。`--max-result-rows` を変えると入力側の境界も動く。
+#[test]
+fn row_cap_follows_the_setting() {
+    let sql = "INSERT INTO dst (id, a, t) SELECT id, a, t FROM src";
+    for cap in [3usize, 6] {
+        let (core, path) = open(&format!("sql51-lo-follow-{cap}"), Some(cap));
+        let _g = CleanupGuard(path);
+        seed_src(&core, "alice", 1..=cap as i64);
+        assert_eq!(affected(run(&core, "alice", sql)), cap as u64);
+        clear_dst(&core);
+        seed_src(&core, "alice", (cap as i64 + 1)..=(cap as i64 + 1));
+        assert_eq!(code(run(&core, "alice", sql)), "54000");
+        assert_eq!(count_lim(&core, "alice", "dst", cap), 0);
+    }
+}
+
+// 対象ビヘイビア: SQL-34・SQL-51（Issue #2212）。上限をハード上限にしても少量の入力は成功する。
+#[test]
+fn hard_cap_setting_still_inserts_small_input() {
+    let (core, path) = open("sql51-lo-hard", Some(usize::MAX));
+    let _g = CleanupGuard(path);
+    seed_src(&core, "alice", 1..=4);
+    let sql = "INSERT INTO dst (id, a, t) SELECT id, a, t FROM src";
+    assert_eq!(affected(run(&core, "alice", sql)), 4);
+}
