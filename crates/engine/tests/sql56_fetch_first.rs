@@ -546,3 +546,21 @@ fn with_ties_on_scalar_respects_result_limits() {
     let (core, _g) = build("sql56f-ties-scalar-cap", Some(ResultLimits::new(2)));
     assert_eq!(code(&core, &ctx_for("tenant-a"), sql), "54000");
 }
+
+/// `public` が見えない `search_path` では、入れ子の `WITH TIES`（`0A000`）より未修飾表の
+/// `42P01` を優先する（`42601` → `42P01` → その他の順を保つ）。
+#[test]
+fn nested_with_ties_keeps_search_path_gate_priority() {
+    let (core, _g) = build("sql56f-ties-gate", None);
+    let ctx = ctx_for("tenant-a");
+    let mut session = SessionState::default();
+    core.execute_sql_in_session(&ctx, &mut session, "SET search_path = tenant_b")
+        .expect("set search_path");
+    let sql = "SELECT id FROM docs WHERE id IN (SELECT id FROM docs ORDER BY n FETCH FIRST 1 ROW WITH TIES)";
+    let err = core
+        .execute_sql_in_session(&ctx, &mut session, sql)
+        .expect_err("must fail");
+    assert_eq!(err.wire_code(), "42P01");
+    // `public` が見えるセッションでは従来どおり `0A000`。
+    assert_eq!(code(&core, &ctx, sql), "0A000");
+}

@@ -4615,7 +4615,20 @@ impl EngineCore {
         resolver: Option<crate::sql::relation_name::SchemaResolver<'_>>,
     ) -> Result<ParsedSql, crate::sql::allowlist::SqlSurfaceError> {
         // 標準 SQL の行数制限句の正規化は、参照ゲート・一時カタログ走査より前に行う（Issue #1793）。
-        let tokens = Self::normalize_row_count_clauses(tokens)?;
+        // 正規化が `0A000`（入れ子・非 SELECT の `WITH TIES`）で失敗した場合も、`search_path` が
+        // `public` を隠すセッションでは参照ゲートの `42P01` を優先する（`42601` → `42P01` → その他）。
+        let original = session.search_path_hides_public().then(|| tokens.clone());
+        let tokens = match Self::normalize_row_count_clauses(tokens) {
+            Ok(t) => t,
+            Err(e) => {
+                if let Some(orig) = original {
+                    if e.wire_code() != "42601" {
+                        crate::sql::search_path::check_unqualified_refs(session, &orig, &[])?;
+                    }
+                }
+                return Err(e);
+            }
+        };
         // 実効 `search_path` に `public` が含まれる既定のセッションは何も足さない（追加コストなし）。
         if !session.search_path_hides_public() {
             return self.parse_tokens_gated_inner(tokens, session, resolver);
