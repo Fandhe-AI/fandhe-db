@@ -199,6 +199,24 @@ pub(super) fn bind_array_constructor(
     for item in items {
         classes.push(classify_item(item, env, node_budget)?);
     }
+    let (elem, bound_items) = unify_and_bind_items(items, classes, env, node_budget)?;
+    Ok((
+        BoundExpr::ArrayConstructor {
+            elem,
+            items: bound_items,
+        },
+        ExprType::Array,
+    ))
+}
+
+/// 分類済みの要素列から共通の要素型を決め、各要素をその型へ変換して束縛する
+/// （[`bind_array_constructor`] と [`bind_single_array_element`] が共有する単一実装）。
+fn unify_and_bind_items(
+    items: &[Expr],
+    classes: Vec<ItemClass>,
+    env: &mut BindEnv<'_>,
+    node_budget: &mut usize,
+) -> Result<(ArrayElemType, Vec<BoundExpr>), SqlSurfaceError> {
     let kinds: Vec<CastKind> = classes.iter().filter_map(ItemClass::kind).collect();
     let target = common_element_type(&kinds)?;
     let array_ty = CastType::Array(Box::new(target.clone()));
@@ -219,13 +237,39 @@ pub(super) fn bind_array_constructor(
         };
         bound_items.push(bound);
     }
-    Ok((
-        BoundExpr::ArrayConstructor {
-            elem,
-            items: bound_items,
-        },
-        ExprType::Array,
-    ))
+    Ok((elem, bound_items))
+}
+
+/// 集計 `array_agg(<式>)` の引数 1 つを、`ARRAY[<式>]` の 1 要素と同じ型規則で束縛し、結果配列の
+/// 要素型を返す（SQL-57・Issue #1801。`sql::parser::resolve_array_agg_input` が
+/// `udf_call::bind_array_agg_element` 経由で呼ぶ）。コンストラクタと異なり、型を持たない
+/// 引数（裸の `NULL`・型なし文字列リテラル）は PG と同じく多相型を決められないとして `42804`
+/// （text 配列へ黙って倒さない）。数値・smallint・`character(n)`・入れ子の配列などの `0A000` /
+/// `42804` はコンストラクタと共通。`CHECK` 本体での束縛は拒否する。
+pub(super) fn bind_single_array_element(
+    item: &Expr,
+    env: &mut BindEnv<'_>,
+    node_budget: &mut usize,
+) -> Result<(BoundExpr, ArrayElemType), SqlSurfaceError> {
+    if crate::sql::udf_call::in_check_binding() {
+        return Err(unsupported(
+            "array_agg is not supported in a CHECK constraint",
+        ));
+    }
+    let class = classify_item(item, env, node_budget)?;
+    if matches!(class, ItemClass::Null | ItemClass::Untyped) {
+        return Err(SqlSurfaceError::datatype_mismatch(
+            "could not determine the element type of array_agg; cast the argument explicitly",
+        ));
+    }
+    let (elem, mut bound) =
+        unify_and_bind_items(std::slice::from_ref(item), vec![class], env, node_budget)?;
+    match (bound.pop(), bound.is_empty()) {
+        (Some(b), true) => Ok((b, elem)),
+        _ => Err(SqlSurfaceError::Internal {
+            detail: "array_agg element binding produced an unexpected item count".to_string(),
+        }),
+    }
 }
 
 /// 空の `ARRAY[]` を変換先の要素型の空配列にする（`CAST(ARRAY[] AS t[])`・`ARRAY[]::t[]`。

@@ -429,6 +429,12 @@ fn bind_aggregate_call(
             detail: "string_agg without FROM is not supported".to_string(),
         });
     }
+    // `array_agg` も同じ理由で FROM なしは対象外（SQL-57・Issue #1801）。
+    if agg.func == AggregateFunc::ArrayAgg {
+        return Err(SqlSurfaceError::FeatureNotSupported {
+            detail: "array_agg without FROM is not supported".to_string(),
+        });
+    }
     let (arg, arg_ty) = match &agg.arg {
         AggregateArg::Star => (BoundAggArg::Star, None),
         AggregateArg::Expr(Expr::Number(raw)) => {
