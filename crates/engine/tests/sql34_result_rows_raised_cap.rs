@@ -121,3 +121,30 @@ fn set_operation_branch_limit_is_independent_of_the_flag() {
     let ok = "SELECT id FROM t WHERE id <= 5000 UNION ALL SELECT id FROM t WHERE id <= 5000";
     assert_eq!(rows(&core, ok), 10_000);
 }
+
+/// ハード上限（100,000）: 取得上限 `cap + 1` が下流の固定上限（走査・可視行数）に先に当たらず、
+/// ちょうどは成功し +1 は `54000` になる（limit-omitted-result-cap.md D1 の申し送りの確認）。
+#[test]
+fn hard_cap_boundary_is_not_masked_by_downstream_limits() {
+    let hard = engine::result_limits::MAX_RESULT_ROWS_HARD_CAP;
+    let path = unique_db_path("sql34-hard-cap");
+    let _g = CleanupGuard(path.clone());
+    let storage = Storage::open(&path).expect("open storage");
+    let core = EngineCore::from_storage(storage, Box::new(CpuScalarProvider))
+        .with_result_limits(ResultLimits::new(hard));
+    let mut session = SessionState::default();
+    session.allow_ddl();
+    core.execute_sql_in_session(
+        &ctx("alice"),
+        &mut session,
+        "CREATE TABLE t (id BIGINT PRIMARY KEY, k INTEGER)",
+    )
+    .expect("ddl");
+    seed(&core, "alice", 1..=(hard as i64 + 1));
+    let at_cap = format!("SELECT id FROM t WHERE id <= {hard}");
+    assert_eq!(rows(&core, &at_cap), hard);
+    assert_eq!(rows(&core, &format!("{at_cap} ORDER BY id DESC")), hard);
+    assert_eq!(code(&core, "SELECT id FROM t"), "54000");
+    assert_eq!(code(&core, "SELECT id FROM t ORDER BY id DESC"), "54000");
+    assert_eq!(code(&core, "SELECT id FROM t LIMIT ALL"), "54000");
+}
