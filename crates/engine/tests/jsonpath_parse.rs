@@ -774,14 +774,11 @@ const DIVERGENCES: &[(&str, &str)] = &[
     (r####"$.a/* */ b"####, "42601"),
 ];
 
-/// 期待値。`like_regex` を含む入力で PostgreSQL が構文を受理（`OK`）または正規表現を
-/// 拒否（`2201B`）する場合、本リポジトリは正規表現の依存が未承認のため一律 `0A000`。
+/// 期待値。`like_regex` は Issue #2677 で束縛時にコンパイルされるため、PostgreSQL の
+/// 受理／`2201B`／`0A000` とそのまま一致する（意図的な差分は `DIVERGENCES` のみ）。
 fn expected(input: &str, pg: &'static str) -> &'static str {
     if let Some((_, w)) = DIVERGENCES.iter().find(|(i, _)| *i == input) {
         return w;
-    }
-    if input.contains("like_regex \"") && (pg == "OK" || pg == "2201B") {
-        return "0A000";
     }
     pg
 }
@@ -1004,7 +1001,8 @@ fn error_messages_do_not_echo_input() {
     for secret in [
         "$.secret_tenant_key.",
         "\"\\ud800secret",
-        "$.a ? (@ like_regex \"secret\")",
+        "$.a ? (@ like_regex \"secret(\")",
+        "$.a ? (@ like_regex \"secret\" flag \"x\")",
     ] {
         let e = parse_jsonpath(secret).unwrap_err();
         assert!(!engine::error_format::ClassifiedError::client_message(&e).contains("secret"));
@@ -1021,6 +1019,17 @@ fn wire_codes_per_variant() {
         (UnsupportedUnicodeEscape, "22P05"),
         (IntegerOutOfRange, "22003"),
         (RegexNotSupported, "0A000"),
+        (
+            Regex(engine::regex_match::RegexError::InvalidPattern),
+            "2201B",
+        ),
+        (Regex(engine::regex_match::RegexError::Unsupported), "0A000"),
+        (
+            Regex(engine::regex_match::RegexError::PatternTooLong),
+            "54000",
+        ),
+        (Regex(engine::regex_match::RegexError::TooComplex), "54000"),
+        (TooManyRegex, "54000"),
         (TooLong, "54000"),
         (TooDeep, "54000"),
         (LiteralTooLong, "54000"),

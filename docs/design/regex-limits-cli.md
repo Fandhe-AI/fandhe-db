@@ -24,4 +24,4 @@
 
 - ハード上限の引き上げ
 - セッション単位の `SET` による変更
-- SQL 表層への配線（`~`／`~*` は #1787、`SIMILAR TO` は #1788、jsonpath の `like_regex` は #1784）
+- SQL 表層への配線（`~`／`~*` は #1787、`SIMILAR TO` は #1788、jsonpath の `like_regex` は #2677 で配線済み）
