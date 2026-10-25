@@ -4,7 +4,7 @@
 
 - ステータス: 採用（Issue #1786・SQL-55 のポインタのみ。spec 本文は転記しない）
 - 対象: `engine::regex_match`（`CompiledRegex`・`RegexCaseMode`・`RegexError`）と、その字句変換器 `regex_match/translate.rs`
-- 位置づけ: 評価器の部品のみ。SQL 表層への配線は含まない（`~`／`~*` は #1787、`SIMILAR TO` は #1788 で配線済み（末尾の節）、jsonpath の `like_regex` は #1784）。上限の CLI は [regex-limits-cli.md](regex-limits-cli.md)
+- 位置づけ: 評価器の部品のみ。SQL 表層への配線は含まない（`~`／`~*` は #1787、`SIMILAR TO` は #1788 で配線済み（末尾の節）、jsonpath の `like_regex` は #2677 で配線済み（末尾の節））。上限の CLI は [regex-limits-cli.md](regex-limits-cli.md)
 - 依存: [regex-crate-adoption.md](regex-crate-adoption.md)（Accepted）
 
 ## 方針
@@ -65,7 +65,7 @@
 | 拡張クエリ | `<列> (~\|~*\|!~\|!~*) $n`（`sql::params` のパターン 11）。`$n` の型は左辺の列に依らず text。NULL のバインドは裸の `NULL` へ置換。逆向き・両辺 `$n`・式の内側・`$n::text` は `42601` |
 | 索引 | 使わない（常に残余述語で RLS 後の可視行だけを評価する） |
 | 台帳 | `content_hash` は式タグ 21（`negated`・`case_insensitive`・左辺・パターンの順）、トークンタグ 30〜33 |
-| 対象外 | CHECK（`0A000`）、索引の式・述語（`0A000`）、UDF 本体（`0A000`）、ビュー本体・JOIN・HAVING・サブクエリ・SELECT リスト（`42601`）、列・式のパターン、jsonpath の `like_regex`（#1784） |
+| 対象外 | CHECK（`0A000`）、索引の式・述語（`0A000`）、UDF 本体（`0A000`）、ビュー本体・JOIN・HAVING・サブクエリ・SELECT リスト（`42601`）、列・式のパターン、列・式のパターン（jsonpath の `like_regex` は #2677 で配線済み） |
 
 PG との意図的な差分: PG は評価される行が 0 件なら不正パターンでもエラーにしないが、本実装は束縛時に `2201B`／`0A000`／`54000` で拒否する（`LIKE` の `22025` と同じ fail-closed）。
 
@@ -97,3 +97,30 @@ PG 17.11 との一致は `crates/engine/tests/data/similar_to_pg17.tsv`（`postg
 | ARE として写せない構文（照合要素 `[[.a.]]`・`[[=a=]]`・語境界 `[[:<:]]`・`\u`／`\x` エスケープ等）は `0A000` | `~` と同じ方針（`regex` は線形時間と引き換えに一部の構文を持たない） |
 | 評価される行が 0 件でも不正パターンは束縛時に `2201B`／`54000` で拒否 | `~` と同じ fail-closed |
 | パターン長の CLI 上限は構文段でなく束縛時に検査する | 構文段は CLI 上限を持たないため、生パターンのバイト長を束縛時に `raw_pattern_len` で渡して検査する（ハード上限は構文段で検査） |
+
+## jsonpath `like_regex` への配線（Issue #2677）
+
+ポインタ: SQL-55・TABLE-25。親 #1784 の残り。jsonpath の `like_regex "<pattern>" [flag "<flags>"]` を、`~` と同じマッチャ（`CompiledRegex`）へ結線した。PG 17.11（`postgres:17-alpine`、`initdb --locale=C --encoding=UTF8`）との一致は `crates/engine/tests/data/jsonpath_like_regex_pg17.tsv`（フラグ × 入力 × パターン、10,707 行）を `crates/engine/tests/jsonpath_like_regex.rs` が全行照合して固定している。
+
+| 項目 | 内容 |
+| ---- | ---- |
+| コンパイル時期 | 解析時（`parse_jsonpath` の `like_regex` の枝）に 1 回だけ。AST（`PathNode::LikeRegex.matcher`）が保持し、評価器はコンパイルしない。SQL 表層では `bind_path_arg` の束縛時に 1 回（行が 0 件でも `2201B`／`0A000`／`54000` が出る）。行ごとの再コンパイルや無制限のキャッシュは持たない |
+| 上限の運搬 | `parse_jsonpath_with_regex_limits` が `RegexLimits` を受ける。`sql::jsonpath_fn` が `current_regex_limits()` を渡す（CLI で下げた上限が効く）。`parse_jsonpath` はハード上限 |
+| 評価 | `starts with` と同型。左辺は lax で配列展開し、文字列でない項目は unknown。strict は最初の unknown で unknown、lax は最初の true で true。一致は部分一致。項目ごとにステップと走査バイト数を課金する。入力長の上限超過は抑止不可の `54000`（`RegexInputTooLong`。silent でも返る） |
+| エラー | `x` フラグ（`q` なし）は `0A000`。構文誤りは `2201B`、非対応構文は `0A000`、上限超過は `54000`（`JsonPathParseError::Regex`）。文言は固定の英語で、パターンの断片を含めない |
+| 件数上限 | 1 つの jsonpath が持てる `like_regex` は `MAX_JSONPATH_LIKE_REGEX`（16）個まで。超過は `54000`（`TooManyRegex`）。入力上限の中に、短くてもコンパイル後サイズが大きいパターンを多数並べる DoS を抑える意図的な差分 |
+
+フラグの写像（`RegexSyntaxOptions` → `translate::TranslateOptions`）:
+
+| フラグ | 写像 |
+| ------ | ---- |
+| なし | 改行区別（`.` と否定ブラケット `[^…]` が `\n` にマッチしない）。`\D`・`\W`・ブラケット内の否定クラスは `\n` にマッチする（PG の実測）。`^`／`$` は文字列の端だけ |
+| `s` | 改行区別を外す（`~` の既定と同じ） |
+| `m` | `^`／`$` が改行の直後・直前でもマッチする。`s` が無ければ改行区別も残る。`\A`・`\Z` は影響を受けない |
+| `i` | ASCII 英字だけ大文字小文字を区別しない（`~*` と同じ） |
+| `q` | パターン全体をリテラルとして扱う（director・埋め込みオプションも解釈しない）。`i` は併用でき、`x`・`s`・`m` は無視される |
+| `x` | `q` なしは `0A000`（`q` があれば受理） |
+
+埋め込みオプション `(?s)` はフラグを上書きして改行区別と行アンカーの両方を外す。`(?t)` は効果なし、`(?c)` は `i` を上書きする。
+
+意図的な差分は `~` と同じ（PG が受理する後方参照・lookaround・`(?b)`／`(?e)`／`(?m)`／`(?n)`／`(?p)`／`(?w)`／`(?x)`・照合要素は `0A000`、複雑さは `54000`、非 ASCII の大文字小文字は畳み込まない）。表の照合では `intended_difference` が `q` なしの行に限って列挙する。

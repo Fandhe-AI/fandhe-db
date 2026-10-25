@@ -4,7 +4,7 @@
   - 承認前は #1786・#1787・#1788 および #1784 の `like_regex` 結線に着手しない運用だった（第 8 節）
 - 対応: Issue #1785（親 #1784。後続は #1786 → #1787 → #1788）
 - 関連ビヘイビア: SQL-55（親は TABLE-25 も。エスケープ不正は ERR-6）。ポインタ: `docs/spec/04-behavior/`。本文は転記しない（[spec-confidentiality](../../.claude/rules/spec-confidentiality.md)）
-- 関連コード: `crates/engine/src/json/jsonpath/parser.rs`・`eval.rs`（`like_regex` を構文解析後に `0A000` で拒否）、`crates/engine/src/error_format.rs`（`2201B` の `ErrorClass` は未定義）
+- 関連コード: `crates/engine/src/json/jsonpath/parser.rs`・`eval.rs`（`like_regex` は Issue #2677 でコンパイル済みマッチャへ配線済み）、`crates/engine/src/error_format.rs`（`2201B` の `ErrorClass` は未定義）
 - 関連 doc: [like-wildcard-patterns.md](like-wildcard-patterns.md)、[json-expr-type-mapping.md](json-expr-type-mapping.md)、[icu-collator-adoption.md](icu-collator-adoption.md)（承認資料の先例）、[jsonpath-limits-cli.md](jsonpath-limits-cli.md)（上限を CLI で下げる流儀）
 - 本 ADR は docs のみの変更であり、`Cargo.toml`・`Cargo.lock`・`deny.toml`・コードを変更しない
 

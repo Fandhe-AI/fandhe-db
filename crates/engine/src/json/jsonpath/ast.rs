@@ -71,7 +71,8 @@ pub enum StartsWithOperand {
     Variable(Box<str>),
 }
 
-/// `like_regex` のフラグ。解析は行うが、現状は 0A000 で拒否するため評価器には届かない。
+/// `like_regex` のフラグ（解析結果。AST に残して等価性・診断に使う。評価は同ノードの
+/// [`LikeRegexMatcher`] が束縛時にコンパイル済みの正規表現で行う）。
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
 pub struct RegexFlags {
     pub case_insensitive: bool,
@@ -79,6 +80,35 @@ pub struct RegexFlags {
     pub multiline: bool,
     pub literal: bool,
     pub extended: bool,
+}
+
+/// 束縛時（`parse_jsonpath` の中）にコンパイル済みの `like_regex` マッチャ（Issue #2677）。
+/// 評価器はコンパイルせず、これを `is_match` で引くだけ。`Clone` は内部 `Arc` 共有で安価。
+///
+/// `PartialEq` は常に `true`: 等価性は兄弟フィールドの `pattern`／`flags` が決める
+/// （`BoundExpr::RegexMatch` の前例に倣う）。`Debug` はパターンを出さない不透明表現。
+#[derive(Clone)]
+pub struct LikeRegexMatcher(pub(crate) crate::regex_match::CompiledRegex);
+
+impl LikeRegexMatcher {
+    /// 入力にマッチするか（入力長上限超過は `Err`）。
+    pub(crate) fn is_match(&self, input: &str) -> Result<bool, crate::regex_match::RegexError> {
+        self.0.is_match(input)
+    }
+}
+
+impl PartialEq for LikeRegexMatcher {
+    fn eq(&self, _other: &Self) -> bool {
+        true
+    }
+}
+
+impl Eq for LikeRegexMatcher {}
+
+impl std::fmt::Debug for LikeRegexMatcher {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str("LikeRegexMatcher(..)")
+    }
 }
 
 /// 式・述語のノード。
@@ -124,6 +154,7 @@ pub enum PathNode {
         lhs: Box<PathNode>,
         pattern: Box<str>,
         flags: RegexFlags,
+        matcher: LikeRegexMatcher,
     },
 }
 
