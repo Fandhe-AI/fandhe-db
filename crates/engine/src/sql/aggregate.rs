@@ -1655,10 +1655,6 @@ impl Accumulator {
         Ok(())
     }
 
-    /// NULL・非存在の概念を持たない入力（`*`・`id`・`Scalar` 式）を数えるだけの
-    /// 経路。`VECTOR` 列は nullable のため別経路
-    /// （[`AggregateInput::VectorColumnPresence`]）を使う。`COUNT` 以外がこの
-    /// 経路に来ることはない（[`Accumulator::new`] の型検査）。
     /// 真偽値 1 件（`None` は NULL で無視）を観測する。`Count`（`COUNT(<boolean 列>)`）は非 NULL を
     /// 数え、`BoolAnd`／`BoolOr`（SQL-57・Issue #1805）は畳み込む。それ以外は束縛層のバグ。
     fn observe_bool(&mut self, value: Option<bool>) -> Result<(), SqlSurfaceError> {
@@ -1684,6 +1680,10 @@ impl Accumulator {
         }
     }
 
+    /// NULL・非存在の概念を持たない入力（`*`・`id`・`Scalar` 式）を数えるだけの
+    /// 経路。`VECTOR` 列は nullable のため別経路
+    /// （[`AggregateInput::VectorColumnPresence`]）を使う。`COUNT` 以外がこの
+    /// 経路に来ることはない（[`Accumulator::new`] の型検査）。
     fn observe_present(&mut self) -> Result<(), SqlSurfaceError> {
         match self {
             Accumulator::Count(n) => {
