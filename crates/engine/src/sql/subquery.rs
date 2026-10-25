@@ -357,6 +357,7 @@ fn aggregate_referenced_columns(validated: &ValidatedAggregate) -> HashSet<Strin
     }
     if let Some(group_by) = &validated.group_by {
         cols.extend(group_by.columns.iter().cloned());
+        group_by.collect_having_aggregate_idents(&mut cols);
     }
     super::parser::collect_where_predicate_idents(&validated.where_predicates, &mut cols);
     cols
