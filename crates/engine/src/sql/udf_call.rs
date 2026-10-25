@@ -9213,6 +9213,14 @@ mod tests {
         assert!(is_reserved_function_name("ARRAY_AGG"));
     }
 
+    /// SQL-57・Issue #1805: `bool_and` / `bool_or` / `every` も集計関数名として予約される。
+    #[test]
+    fn bool_aggregates_are_reserved_function_names() {
+        for name in ["bool_and", "BOOL_OR", "every"] {
+            assert!(is_reserved_function_name(name), "{name}");
+        }
+    }
+
     /// SQL-57・Issue #1800: `string_agg` は集計関数名として予約され、同名の UDF は定義できない
     /// （呼び出しが集計として解析されるため、定義しても呼べない）。
     #[test]
