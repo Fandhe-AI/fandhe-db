@@ -3,13 +3,19 @@
 //! 責務: `lexer.rs` のトークン列を [`SqlJsonPath`] へ組み立てる。PostgreSQL と同じく「式」と
 //! 「述語」を別カテゴリとして扱い（`Kind`）、`&&`／`||`／`!`／比較の両辺のカテゴリ違反を
 //! 構文エラーにする。`@`（フィルタ外）・`last`（添字外）の位置違反はここで検査し、
-//! `like_regex` は構文を解析したうえで最後に 0A000 で拒否する（fail-closed）。
+//! `like_regex` はフラグ確定直後に正規表現をコンパイルして AST に保持する（Issue #2677。
+//! 評価器はコンパイルしない。1 つの jsonpath が持てる件数は `MAX_JSONPATH_LIKE_REGEX` まで）。
 //! 再帰は `depth` 引数で入れ子深さを数え、式木の高さは `Parsed::h` で数えて上限を超える
 //! 入力を拒否する。連続アクセサはループで畳むため再帰しない。
 
 use super::ast::*;
 use super::lexer::{Lexer, Token};
-use super::{JsonPathParseError as E, MAX_JSONPATH_NESTING_DEPTH, MAX_JSONPATH_NODE_HEIGHT};
+use super::{
+    JsonPathParseError as E, MAX_JSONPATH_LIKE_REGEX, MAX_JSONPATH_NESTING_DEPTH,
+    MAX_JSONPATH_NODE_HEIGHT,
+};
+use crate::regex_limits::RegexLimits;
+use crate::regex_match::{CompiledRegex, RegexCaseMode, RegexSyntaxOptions};
 
 #[derive(Clone, Copy, PartialEq, Eq)]
 enum Kind {
@@ -31,16 +37,18 @@ struct Parser {
     peeked: Option<Token>,
     filter_depth: usize,
     subscript_depth: usize,
-    saw_regex: bool,
+    regex_limits: RegexLimits,
+    regex_count: usize,
 }
 
-pub(super) fn parse(input: &str) -> Result<SqlJsonPath, E> {
+pub(super) fn parse(input: &str, regex_limits: RegexLimits) -> Result<SqlJsonPath, E> {
     let mut p = Parser {
         lex: Lexer::new(input),
         peeked: None,
         filter_depth: 0,
         subscript_depth: 0,
-        saw_regex: false,
+        regex_limits,
+        regex_count: 0,
     };
     if *p.peek()? == Token::Eof {
         return Err(E::Empty);
@@ -56,9 +64,6 @@ pub(super) fn parse(input: &str) -> Result<SqlJsonPath, E> {
     let body = p.parse_or(0)?;
     if p.next()? != Token::Eof {
         return Err(E::Syntax);
-    }
-    if p.saw_regex {
-        return Err(E::RegexNotSupported);
     }
     Ok(SqlJsonPath {
         mode: mode.unwrap_or(PathMode::Lax),
@@ -255,19 +260,50 @@ impl Parser {
                     }
                 }
             }
-            self.saw_regex = true;
+            let matcher = self.compile_like_regex(&pattern, flags)?;
             let h = lhs.h + 1;
             return mk(
                 PathNode::LikeRegex {
                     lhs: Box::new(lhs.node),
                     pattern: pattern.into(),
                     flags,
+                    matcher,
                 },
                 Kind::Pred,
                 h,
             );
         }
         Ok(lhs)
+    }
+
+    /// `like_regex` をフラグ写像してコンパイルする。順序は `x`（`q` なし）→ 件数上限 → コンパイル。
+    /// `q` はパターン全体をリテラル化し `x`・`s`・`m` を無視する。それ以外は改行区別が `s` の
+    /// 有無で決まり（`s` で解除）、`m` が `^`／`$` を行境界にする。
+    fn compile_like_regex(
+        &mut self,
+        pattern: &str,
+        flags: RegexFlags,
+    ) -> Result<LikeRegexMatcher, E> {
+        if flags.extended && !flags.literal {
+            return Err(E::RegexNotSupported);
+        }
+        if self.regex_count >= MAX_JSONPATH_LIKE_REGEX {
+            return Err(E::TooManyRegex);
+        }
+        self.regex_count += 1;
+        let opts = RegexSyntaxOptions {
+            case: if flags.case_insensitive {
+                RegexCaseMode::AsciiInsensitive
+            } else {
+                RegexCaseMode::Sensitive
+            },
+            newline_stop: !flags.dot_all,
+            newline_anchor: flags.multiline,
+            quote: flags.literal,
+        };
+        let re = CompiledRegex::compile_with_options(pattern, opts, self.regex_limits)
+            .map_err(E::Regex)?;
+        Ok(LikeRegexMatcher(re))
     }
 
     /// `!` の直後: `( 述語 )` または `exists( 式 )`（アクセサ・`is unknown` は続けられない）。
