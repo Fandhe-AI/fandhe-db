@@ -28,7 +28,7 @@ use crate::catalog::materialized::{
 };
 use crate::catalog::CatalogError;
 use crate::policy::PolicyContext;
-use crate::result_limits::{ResultLimits, MAX_RESULT_ROWS_HARD_CAP};
+use crate::result_limits::ResultLimits;
 use crate::row_codec::Value;
 use crate::sql::allowlist::{
     classify_view_body, validate_sql_tokens, SqlSurfaceError, Statement,
@@ -45,6 +45,8 @@ use crate::sql::mode::SessionState;
 struct EvalPlan {
     stmt: Statement,
     limits: ResultLimits,
+    /// 1 文脈あたりの行数上限（超過は `54000`）。
+    cap: usize,
 }
 
 impl EngineCore {
@@ -69,17 +71,13 @@ impl EngineCore {
         Ok(contexts)
     }
 
-    /// 1 文脈あたりの行数上限。`--max-result-rows` を上限とし、`+1` で超過を検出するため
-    /// ハード上限の 1 つ手前に丸める（設定がハード上限のときは 99,999 行まで。fail-closed）。
-    fn matview_row_cap(&self) -> usize {
-        self.result_limits
-            .max_result_rows()
-            .min(MAX_RESULT_ROWS_HARD_CAP.saturating_sub(1))
-    }
-
-    /// 本文（格納形）を、文脈ごとに実行できる 1 つの読み取り文へ変える。単純形は `LIMIT cap+1` を
-    /// 付けて超過を検出できるようにし、評価後射影形（集計・LIMIT・JOIN 等）は検証済みの文をそのまま使う。
-    fn matview_eval_plan(&self, body_sql: &str, cap: usize) -> Result<EvalPlan, SqlSurfaceError> {
+    /// 本文（格納形）を、文脈ごとに実行できる 1 つの読み取り文へ変える。1 文脈あたりの行数上限
+    /// （`--max-result-rows`。算出は共有の `write_input_cap`・SQL-34・Issue #2212）も併せて決める。
+    /// 単純形は、まず `LIMIT` を足さずに検証し、読み取り経路の暗黙上限（#1796）が受ける形なら設定値
+    /// そのものを上限とする。受理されない形だけ `LIMIT cap+1` を注入して超過を検出する
+    /// （ハード上限の 1 つ手前へ丸める）。評価後射影形（集計・LIMIT・JOIN 等）は検証済みの文をそのまま使い、
+    /// 評価上限は既定値と `cap+1` の大きい方（設定値を上げれば本文の暗黙上限も上がる）。
+    fn matview_eval_plan(&self, body_sql: &str) -> Result<EvalPlan, SqlSurfaceError> {
         let invalid_body = || SqlSurfaceError::Internal {
             detail: "invalid materialized view definition".to_string(),
         };
@@ -87,21 +85,35 @@ impl EngineCore {
             crate::sql::lexer::tokenize_stored_view_body(body_sql).map_err(|_| invalid_body())?;
         match classify_view_body(&tokens, &self.storage, ViewBodyCheck::Resolved)? {
             ViewBodyKind::Simple(_) => {
-                let fetch = cap.checked_add(1).ok_or_else(invalid_body)?;
+                if let Ok(stmt) = validate_sql_tokens(&tokens, &self.storage) {
+                    let c = self.write_input_cap()?;
+                    return Ok(EvalPlan {
+                        stmt,
+                        limits: c.eval_limits,
+                        cap: c.cap,
+                    });
+                }
+                let c = self.write_input_cap_injected()?;
                 let mut limited = tokens;
                 limited.push(Token::Keyword(Keyword::Limit));
-                limited.push(Token::Number(fetch.to_string()));
+                limited.push(Token::Number(c.fetch.to_string()));
                 let stmt = validate_sql_tokens(&limited, &self.storage)?;
                 Ok(EvalPlan {
                     stmt,
-                    limits: ResultLimits::new(fetch),
+                    limits: c.eval_limits,
+                    cap: c.cap,
                 })
             }
-            ViewBodyKind::Buffered { stmt, .. } => Ok(EvalPlan {
-                stmt: *stmt,
-                // 評価後射影形の本文は外側の設定値と連動させない（`BufferedView` の本文と同じ）。
-                limits: ResultLimits::default(),
-            }),
+            ViewBodyKind::Buffered { stmt, .. } => {
+                let c = self.write_input_cap()?;
+                Ok(EvalPlan {
+                    stmt: *stmt,
+                    limits: ResultLimits::new(
+                        crate::result_limits::DEFAULT_MAX_RESULT_ROWS.max(c.fetch),
+                    ),
+                    cap: c.cap,
+                })
+            }
         }
     }
 
@@ -140,7 +152,6 @@ impl EngineCore {
             .map_err(crate::catalog::convert_storage_error)
             .map_err(map_create_matview_error)?;
 
-        let cap = self.matview_row_cap();
         let columns = {
             let view_columns =
                 self.view_output_columns(session, stmt.body_sql(), stmt.column_aliases())?;
@@ -158,7 +169,8 @@ impl EngineCore {
         // 本文を実行可能な文へ束縛し、実体は列照合を運ばないため非バイト順照合の列を持つ表を読む本文は
         // 拒否する（後続の ORDER BY・比較がバイト順で黙って行われる意味論のずれを作らない）。
         // `WITH NO DATA` でも同じ本文が後で `REFRESH` されるため、定義時に弾いておく。
-        let plan = self.matview_eval_plan(stmt.body_sql(), cap)?;
+        let plan = self.matview_eval_plan(stmt.body_sql())?;
+        let cap = plan.cap;
         self.check_matview_body_collations(&*write_txn, &plan.stmt)?;
 
         // 定義の登録。`WITH DATA` では文脈ごとに評価した直後に同じ write txn へ保存し行値を解放する
@@ -305,8 +317,8 @@ impl EngineCore {
             ));
         }
 
-        let cap = self.matview_row_cap();
-        let plan = self.matview_eval_plan(&def.body_sql, cap)?;
+        let plan = self.matview_eval_plan(&def.body_sql)?;
+        let cap = plan.cap;
         self.check_matview_body_collations(&*write_txn, &plan.stmt)?;
 
         let contexts = self.materialization_contexts_for(refresher)?;
