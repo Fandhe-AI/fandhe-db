@@ -95,9 +95,21 @@ impl Elem {
 
     /// `DISTINCT` の重複判定キー（同値の要素は同じバイト列になる正準形）。
     /// 型は列で固定のため型タグは持たず、浮動小数は `-0.0`・NaN を正規化する。
-    fn canonical(&self, out: &mut Vec<u8>) {
+    ///
+    /// `jsonb` は格納表記ではなく値等価の正規形（[`crate::json::canonical_equality_text`]。
+    /// UNIQUE 制約と共通）で比べる（`1`・`1.0`・`1e0` は同値）。`numeric` は末尾の 0 を
+    /// 落として scale 違いの同値（`1` と `1.0`）を同じキーにする。出力要素は元の表記のまま。
+    fn canonical(&self, out: &mut Vec<u8>) -> Result<(), SqlSurfaceError> {
         match self {
-            Elem::Text(s) | Elem::Json(s) | Elem::Jsonb(s) => out.extend_from_slice(s.as_bytes()),
+            Elem::Jsonb(s) => {
+                let canon = crate::json::canonical_equality_text(s).map_err(|_| {
+                    accumulator_bug("array_agg observed an invalid stored jsonb value")
+                })?;
+                out.try_reserve(canon.len())
+                    .map_err(|_| SqlSurfaceError::payload_too_large(STATE_TOO_LARGE_DETAIL))?;
+                out.extend_from_slice(canon.as_bytes());
+            }
+            Elem::Text(s) | Elem::Json(s) => out.extend_from_slice(s.as_bytes()),
             Elem::Bytea(b) => out.extend_from_slice(b),
             Elem::Bool(b) => out.push(u8::from(*b)),
             Elem::Integer(v) | Elem::Date(v) => out.extend_from_slice(&v.to_be_bytes()),
@@ -106,10 +118,16 @@ impl Elem {
             Elem::Double(v) => out.extend_from_slice(&canon_f64(*v)),
             Elem::Uuid(u) => out.extend_from_slice(u.as_bytes()),
             Elem::Numeric(d) => {
-                out.push(d.scale());
-                out.extend_from_slice(&d.unscaled().to_be_bytes());
+                let (mut unscaled, mut scale) = (d.unscaled(), d.scale());
+                while scale > 0 && unscaled % 10 == 0 {
+                    unscaled /= 10;
+                    scale -= 1;
+                }
+                out.push(scale);
+                out.extend_from_slice(&unscaled.to_be_bytes());
             }
         }
+        Ok(())
     }
 }
 
@@ -536,7 +554,8 @@ fn eval_key(
 /// 正準形を置く。確保は `try_reserve_exact` で行い失敗は `54000`。
 fn canonical_key(elem: Option<&Elem>, payload: usize) -> Result<Vec<u8>, SqlSurfaceError> {
     let mut key = Vec::new();
-    // 固定長の型は高々 17 バイト（numeric: scale 1 + i128 16）。
+    // 固定長の型は高々 17 バイト（numeric: scale 1 + i128 16）。jsonb の正規形は元の表記より
+    // 長くなりうるため、本文の確保は `Elem::canonical` が正規形の長さで別途検査する。
     let cap = payload
         .checked_add(18)
         .ok_or_else(|| SqlSurfaceError::payload_too_large(STATE_TOO_LARGE_DETAIL))?;
@@ -546,7 +565,7 @@ fn canonical_key(elem: Option<&Elem>, payload: usize) -> Result<Vec<u8>, SqlSurf
         None => key.push(0),
         Some(e) => {
             key.push(1);
-            e.canonical(&mut key);
+            e.canonical(&mut key)?;
         }
     }
     Ok(key)
@@ -647,6 +666,48 @@ mod tests {
                 .expect("duplicates are dropped");
         }
         assert_eq!(dup.entries.len(), 1);
+    }
+
+    /// `jsonb` の `DISTINCT` は格納表記でなく値等価で重複を除く（`1`・`1.0`・`1e0` は同値）。
+    /// 出力要素は最初の表記のまま。重複だけの大量入力で `54000` にならない。
+    #[test]
+    fn distinct_jsonb_uses_value_equality() {
+        let mut st = state(ArrayElemType::Jsonb, true);
+        for v in [
+            "1",
+            "1.0",
+            "1e0",
+            "{\"a\":1,\"b\":2}",
+            "{\"b\":2.0,\"a\":1}",
+        ] {
+            st.push_entry(Some(Elem::Jsonb(v.to_string())), Vec::new())
+                .expect("push");
+        }
+        assert_eq!(st.entries.len(), 2);
+        let mut dup = state(ArrayElemType::Jsonb, true);
+        for i in 0..(MAX_ARRAY_AGG_ELEMENTS + 10) {
+            let v = if i % 2 == 0 { "1" } else { "1.00" };
+            dup.push_entry(Some(Elem::Jsonb(v.to_string())), Vec::new())
+                .expect("duplicates are dropped");
+        }
+        assert_eq!(dup.entries.len(), 1);
+    }
+
+    /// `numeric` の `DISTINCT` は scale 違いの同値（`1` と `1.0`）を同一視する。
+    #[test]
+    fn distinct_numeric_ignores_scale() {
+        let d = |u, sc| Elem::Numeric(Decimal::from_parts(u, sc).expect("decimal"));
+        let mut st = state(
+            ArrayElemType::Numeric {
+                precision: 20,
+                scale: 4,
+            },
+            true,
+        );
+        for e in [d(1, 0), d(10, 1), d(100, 2), d(0, 0), d(0, 3), d(15, 1)] {
+            st.push_entry(Some(e), Vec::new()).expect("push");
+        }
+        assert_eq!(st.entries.len(), 3);
     }
 
     /// 空集合は `None`、NULL のみの入力は NULL 要素の配列になる。
