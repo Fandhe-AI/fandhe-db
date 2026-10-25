@@ -7500,7 +7500,7 @@ fn resolve_string_agg_input(
             // 値・区切りに現れない式は、重複排除後の行へ一意に対応しないため拒否する。
             return Err(SqlSurfaceError::AggregateOrderByNotInArguments);
         } else {
-            bind_aggregate_free_order_key(k, schema, udfs, node_budget)?
+            bind_aggregate_free_order_key(k, schema, udfs, node_budget, order_kind_for_expr_type)?
         };
         keys.push(key);
     }
@@ -7669,7 +7669,13 @@ fn resolve_array_agg_input(
         if item.distinct && k.expr != *value_expr {
             return Err(SqlSurfaceError::AggregateOrderByNotInArguments);
         }
-        keys.push(bind_aggregate_free_order_key(k, schema, udfs, node_budget)?);
+        keys.push(bind_aggregate_free_order_key(
+            k,
+            schema,
+            udfs,
+            node_budget,
+            order_kind_for_array_agg_key_type,
+        )?);
     }
     if item.distinct && !item.order_by.iter().any(|k| k.expr == *value_expr) {
         let synthesized = AggregateOrderKey {
@@ -7682,6 +7688,7 @@ fn resolve_array_agg_input(
             schema,
             udfs,
             node_budget,
+            order_kind_for_array_agg_key_type,
         )?);
     }
     Ok(AggregateInput::ArrayAgg(Box::new(ArrayAggInput {
@@ -7694,11 +7701,13 @@ fn resolve_array_agg_input(
 
 /// 値・区切りと等しくない `ORDER BY` キー 1 つを束縛する（[`resolve_string_agg_input`] と
 /// [`resolve_array_agg_input`] が共有する。後者は `array_agg` の内側 `ORDER BY` の全キーに使う）。
+/// `kind_of` は式キーの静的型から比較規約を決める関数（`array_agg` だけ uuid を許す）。
 fn bind_aggregate_free_order_key(
     k: &crate::sql::allowlist::AggregateOrderKey,
     schema: &TableSchema,
     udfs: &crate::sql::udf_call::UdfRegistry,
     node_budget: &mut usize,
+    kind_of: fn(crate::sql::udf_call::ExprType) -> Result<OrderKind, SqlSurfaceError>,
 ) -> Result<StringAggOrderKey, SqlSurfaceError> {
     let explicit_nulls = k
         .nulls
@@ -7754,7 +7763,7 @@ fn bind_aggregate_free_order_key(
     } else {
         crate::sql::udf_call::bind_order_expr(&k.expr, schema, udfs, node_budget)?
     };
-    let kind = order_kind_for_expr_type(ty)?;
+    let kind = kind_of(ty)?;
     let program = crate::sql::expr_program::ExprProgram::compile(&bound);
     Ok(StringAggOrderKey {
         source: StringAggKeySource::Expr {
@@ -8440,6 +8449,21 @@ fn order_kind_for_expr_type(
                 detail: "ORDER BY a CAST result expression is not supported yet".to_string(),
             })
         }
+    }
+}
+
+/// `array_agg` の内側 `ORDER BY`／`DISTINCT` の式キーの比較規約（SQL-57・Issue #1801）。
+/// 素の列キーが受理する uuid は、式の引数でも同じく受理する（`DISTINCT` と引数一致の
+/// `ORDER BY` は引数を式キーとして再束縛するため、ここで拒否すると列と式で挙動が割れる）。
+/// numeric 式は要素にも束縛できず（`0A000`）、bytea は束縛前に要素型で `0A000`。他の型は
+/// [`order_kind_for_expr_type`] に従う。他の ORDER BY 経路は [`order_kind_for_expr_type`] のまま変えない。
+fn order_kind_for_array_agg_key_type(
+    ty: crate::sql::udf_call::ExprType,
+) -> Result<OrderKind, SqlSurfaceError> {
+    use crate::sql::udf_call::ExprType;
+    match ty {
+        ExprType::Uuid => Ok(OrderKind::Uuid),
+        other => order_kind_for_expr_type(other),
     }
 }
 

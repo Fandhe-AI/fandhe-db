@@ -914,3 +914,39 @@ fn array_results_reject_positional_order_by_and_stay_correct_elsewhere() {
     );
     assert!(e.rows.is_empty());
 }
+
+/// Bugbot 指摘: 引数が uuid の式（裸の列でない）でも、`DISTINCT` と引数一致の内側 `ORDER BY` が
+/// 素の列と同じく動く。numeric・bytea の式要素は列と同じく `0A000`（fail-closed）。
+#[test]
+fn distinct_and_order_by_accept_uuid_expressions_like_columns() {
+    let (core, path) = build_core("sql57-arr-expr-keys");
+    let _g = CleanupGuard(path);
+    let expr = "CAST(u AS uuid)";
+    let by_col = arr(&core, "SELECT array_agg(DISTINCT u) FROM t");
+    assert_eq!(
+        arr(&core, &format!("SELECT array_agg(DISTINCT {expr}) FROM t")),
+        by_col
+    );
+    let desc_col = arr(&core, "SELECT array_agg(u ORDER BY u DESC) FROM t");
+    assert_eq!(
+        arr(
+            &core,
+            &format!("SELECT array_agg({expr} ORDER BY {expr} DESC) FROM t")
+        ),
+        desc_col
+    );
+    assert!(arr(
+        &core,
+        &format!("SELECT array_agg(DISTINCT {expr} ORDER BY {expr} DESC) FROM t")
+    )
+    .is_some());
+    // 引数と異なる uuid の式キーも列キーと同じく並べ替えに使える。
+    assert!(arr(&core, "SELECT array_agg(k ORDER BY CAST(u AS uuid)) FROM t").is_some());
+    for sql in [
+        "SELECT array_agg(DISTINCT CAST(n AS numeric)) FROM t",
+        "SELECT array_agg(DISTINCT b) FROM t",
+        "SELECT array_agg(DISTINCT CAST(b AS bytea)) FROM t",
+    ] {
+        assert_eq!(code_of(&core, sql), "0A000", "{sql}");
+    }
+}
