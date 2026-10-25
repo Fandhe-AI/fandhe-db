@@ -549,7 +549,7 @@ fn having_and_order_by_expression_error_contract() {
     let ctx = ctx_for("tenant-a");
     // 構文段: 集計関数の直接記述・関数を含まない述語（従来どおり）は 42601。
     for sql in [
-        format!("{AGG} HAVING count(*) > 1"),
+        format!("{AGG} HAVING sum(count(*)) > 1"),
         format!("{AGG} HAVING lang = 'ja'"),
         format!("{AGG} HAVING c + 1 > 3"),
         format!("{AGG} ORDER BY sum(n)"),
@@ -707,7 +707,7 @@ fn explain_expression_error_codes_match_non_explain() {
         "SELECT id FROM docs ORDER BY count(*) LIMIT 3".to_string(),
         "SELECT DISTINCT lang FROM docs ORDER BY lower(lang)".to_string(),
         "SELECT id FROM missing ORDER BY lower(title) LIMIT 3".to_string(),
-        format!("{AGG} HAVING count(*) > 1"),
+        format!("{AGG} HAVING sum(count(*)) > 1"),
         format!("{AGG} HAVING lang = 'ja'"),
         format!("{AGG} HAVING abs(zzz) > 1"),
         format!("{AGG} HAVING lower(title) = 'a'"),

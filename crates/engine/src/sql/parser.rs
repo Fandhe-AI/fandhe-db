@@ -6567,9 +6567,22 @@ fn hidden_aggregate_name(item_index: usize) -> String {
     format!("\u{1}hidden{item_index}")
 }
 
+/// 2 つの集計呼び出しが別名を除いて同一か（Issue #1814・SQL-58。`HAVING` 内の集計呼び出しを
+/// SELECT リストの同じ集計へまとめ、アキュムレータを共有する判定）。
+fn same_aggregate_call(
+    a: &crate::sql::allowlist::AggregateItem,
+    b: &crate::sql::allowlist::AggregateItem,
+) -> bool {
+    a.func == b.func
+        && a.arg == b.arg
+        && a.distinct == b.distinct
+        && a.extra_args == b.extra_args
+        && a.order_by == b.order_by
+}
+
 /// HAVING 述語 1 つを束縛した形（TASK-167・SQL-14）。`item_index` は
-/// [`BoundAggregate::items`] の添字（HAVING は SELECT リストの集計項目のみを
-/// 参照できるため、常に既存の `items` を指す。新規アキュムレータを追加しない）。
+/// [`BoundAggregate::items`] の添字（SELECT リストの集計項目、または `HAVING` 内の集計呼び出しを
+/// 脱糖した隠し集計項目〔Issue #1814・SQL-58〕を指す）。
 #[derive(Debug, Clone, Copy, PartialEq)]
 pub(crate) struct BoundHaving {
     pub(crate) item_index: usize,
@@ -8085,6 +8098,9 @@ pub(crate) fn bind_aggregate_with_dummy_flags(
     let group_by_columns: &[String] = stmt.group_by().map(|g| g.columns.as_slice()).unwrap_or(&[]);
 
     let mut items = Vec::new();
+    // `items` と同じ添字で、各項目の元になった集計呼び出し（Issue #1814・SQL-58。`HAVING` 内の
+    // 集計呼び出しを SELECT リストの同じ集計へ重複排除するための照合キー）。
+    let mut item_asts: Vec<&crate::sql::allowlist::AggregateItem> = Vec::new();
     let mut projection = Vec::with_capacity(stmt.items().len());
     // `GROUP BY` 列に SELECT リストで `AS` エイリアスが付いた場合の実効名一覧
     // （`ORDER BY`/`HAVING` がこれらのエイリアスを参照できるよう
@@ -8124,6 +8140,7 @@ pub(crate) fn bind_aggregate_with_dummy_flags(
                     name: name.clone(),
                     distinct: item.distinct,
                 });
+                item_asts.push(item);
                 projection.push(ProjectionColumn::Aggregate { item_index, name });
             }
             // `allowlist::parse_aggregate_shape` が `GROUP BY` 句自体の有無・
@@ -8169,6 +8186,7 @@ pub(crate) fn bind_aggregate_with_dummy_flags(
                         name: hidden_aggregate_name(item_index),
                         distinct: agg.distinct,
                     });
+                    item_asts.push(agg);
                     hidden.push(item_index);
                 }
                 pending_exprs.push(PendingProjectionExpr {
@@ -8201,12 +8219,41 @@ pub(crate) fn bind_aggregate_with_dummy_flags(
         .iter()
         .map(|p| (p.position, p.expr, p.hidden_items.as_slice()))
         .collect();
+    // Issue #1814・SQL-58: `HAVING` 内の集計呼び出しを隠し集計項目として `items` へ積む。
+    // SELECT リストに同じ集計があれば項目を共有し、無ければ可視項目と同じ入力解決・同じ
+    // WHERE／RLS 適用の走査・アキュムレータに乗せる（別経路を作らない）。隠し項目は
+    // `projection` に積まないため RowDescription には現れない。隠し項目込みの総数は
+    // `MAX_AGGREGATE_ITEMS` 以下（超過は `54000`）。
+    let mut having_hidden: Vec<usize> = Vec::new();
+    if let Some(clause) = stmt.group_by() {
+        for agg in &clause.having_aggregates {
+            if let Some(existing) = item_asts
+                .iter()
+                .position(|known| same_aggregate_call(known, agg))
+            {
+                having_hidden.push(existing);
+                continue;
+            }
+            let input = resolve_aggregate_item_input(agg, schema, udfs, &mut node_budget)?;
+            let item_index = items.len();
+            items.push(BoundAggregateItem {
+                func: agg.func,
+                input,
+                name: hidden_aggregate_name(item_index),
+                distinct: agg.distinct,
+            });
+            item_asts.push(agg);
+            having_hidden.push(item_index);
+        }
+        crate::sql::allowlist::check_aggregate_item_count(items.len())?;
+    }
     let group_by = match stmt.group_by() {
         None => None,
         Some(clause) => Some(bind_group_by_clause(
             clause,
             schema,
             &items,
+            &having_hidden,
             &group_key_aliases,
             &projection,
             &projection_expr_refs,
@@ -9870,6 +9917,7 @@ fn bind_group_by_clause(
     clause: &crate::sql::allowlist::GroupByClause,
     schema: &TableSchema,
     items: &[BoundAggregateItem],
+    having_hidden: &[usize],
     group_key_aliases: &[(usize, String)],
     projection: &[ProjectionColumn],
     projection_exprs: &[(usize, &Expr, &[usize])],
@@ -9893,9 +9941,31 @@ fn bind_group_by_clause(
         resolve_group_reference(&clause.columns, group_key_aliases, items, name)
     };
 
+    // `HAVING` 専用の解決: 集計呼び出しの内部名（Issue #1814・SQL-58）は隠し集計項目（または
+    // 共有した SELECT リストの項目）へ、それ以外は `resolve_target` と同じ規則で解決する。
+    // `ORDER BY` は内部名を持たないため `resolve_target` のまま。
+    let resolve_having = |name: &str| -> Result<OrderTarget, SqlSurfaceError> {
+        if let Some(j) = crate::sql::allowlist::aggregate_placeholder_index(name) {
+            let idx = having_hidden.get(j).copied().ok_or_else(|| {
+                crate::sql::aggregate::accumulator_bug("HAVING aggregate placeholder out of range")
+            })?;
+            if items
+                .get(idx)
+                .is_some_and(|it| it.func == crate::sql::allowlist::AggregateFunc::ArrayAgg)
+            {
+                return Err(SqlSurfaceError::FeatureNotSupported {
+                    detail: "ORDER BY or HAVING on an array_agg result is not supported"
+                        .to_string(),
+                });
+            }
+            return Ok(OrderTarget::Aggregate(idx));
+        }
+        resolve_target(name)
+    };
+
     let mut having = Vec::with_capacity(clause.having.len());
     for pred in &clause.having {
-        let target = resolve_target(&pred.item_name)?;
+        let target = resolve_having(&pred.item_name)?;
         let item_index = match target {
             OrderTarget::Aggregate(idx) => idx,
             OrderTarget::GroupKey(_) | OrderTarget::Expr(_) => {
@@ -9915,7 +9985,14 @@ fn bind_group_by_clause(
             .ok_or_else(|| SqlSurfaceError::Internal {
                 detail: "HAVING item_index resolved out of bounds".to_string(),
             })?;
-        check_having_target_is_numeric(bound_item, &pred.item_name)?;
+        // 内部名は利用者に見せない（エラー文言には関数の既定名を使う）。
+        let display_name =
+            if crate::sql::allowlist::aggregate_placeholder_index(&pred.item_name).is_some() {
+                bound_item.func.default_alias()
+            } else {
+                pred.item_name.as_str()
+            };
+        check_having_target_is_numeric(bound_item, display_name)?;
         having.push(BoundHaving {
             item_index,
             op: pred.op,
@@ -9935,8 +10012,8 @@ fn bind_group_by_clause(
     for pred in &clause.having_exprs {
         let expr = Expr::Binary {
             op: pred.op,
-            lhs: Box::new(rewrite_group_row_idents(&pred.lhs, &resolve_target)?),
-            rhs: Box::new(rewrite_group_row_idents(&pred.rhs, &resolve_target)?),
+            lhs: Box::new(rewrite_group_row_idents(&pred.lhs, &resolve_having)?),
+            rhs: Box::new(rewrite_group_row_idents(&pred.rhs, &resolve_having)?),
         };
         let (bound, ty) = crate::sql::udf_call::bind_expr(&expr, &view_schema, udfs, node_budget)?;
         if ty != crate::sql::udf_call::ExprType::Bool {
