@@ -9888,6 +9888,17 @@ fn bind_group_by_clause(
                 // 集計結果（`Cell`）の ORDER BY は項目の照合を運ばずバイト列順で比較するため、
                 // 非バイト列順の照合の MIN/MAX は `0A000` で拒否する（TABLE-28・Issue #2190）。
                 if let OrderTarget::Aggregate(idx) = target {
+                    // 位置指定（`ORDER BY 2`）は名前解決を経ないため、配列値の拒否はここでも行う
+                    // （`resolve_group_reference` と同じ理由。SQL-57）。
+                    if items
+                        .get(idx)
+                        .is_some_and(|it| it.func == crate::sql::allowlist::AggregateFunc::ArrayAgg)
+                    {
+                        return Err(SqlSurfaceError::FeatureNotSupported {
+                            detail: "ORDER BY or HAVING on an array_agg result is not supported"
+                                .to_string(),
+                        });
+                    }
                     if matches!(
                         items.get(idx).map(|item| &item.input),
                         Some(AggregateInput::CollatedTextColumn { .. })

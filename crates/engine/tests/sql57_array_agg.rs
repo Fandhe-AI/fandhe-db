@@ -876,3 +876,41 @@ fn view_body_is_rejected_and_index_path_is_stable() {
     assert_eq!(arr(&core, sql), cold);
     assert_eq!(arr(&core, sql), cold);
 }
+
+/// 位置指定の `ORDER BY`（`ORDER BY 2`）でも配列結果は並べ替えに使えず `0A000`（名前指定と同じ。
+/// 未定義の比較で行が黙って誤順序になるのを防ぐ）。`DISTINCT`・集合演算の挙動も固定する。
+#[test]
+fn array_results_reject_positional_order_by_and_stay_correct_elsewhere() {
+    let (core, path) = build_core("sql57-arr-pos");
+    let _g = CleanupGuard(path);
+    for sql in [
+        "SELECT g, array_agg(k) FROM t GROUP BY g ORDER BY 2",
+        "SELECT g, array_agg(k) FROM t GROUP BY g ORDER BY 2 DESC",
+        "SELECT array_agg(k), g FROM t GROUP BY g ORDER BY 1",
+    ] {
+        assert_eq!(code_of(&core, sql), "0A000", "{sql}");
+    }
+    // 位置指定でも配列以外の列は従来どおり並べ替えられる。
+    let r = run(
+        &core,
+        "SELECT g, array_agg(k) FROM t GROUP BY g ORDER BY 1 DESC",
+    );
+    assert_eq!(r.rows.len(), 3);
+    assert_eq!(r.rows[0].cells[0], Cell::Text("c".to_string()));
+    // `SELECT DISTINCT` は配列結果と併用できない（fail-closed）。
+    assert_eq!(
+        code_of(&core, "SELECT DISTINCT array_agg(k) FROM t"),
+        "42601"
+    );
+    // 集合演算は配列の正準バイト列で同値判定する（同じ配列は 1 行へ、EXCEPT は空）。
+    let u = run(
+        &core,
+        "SELECT g, array_agg(k) FROM t GROUP BY g UNION SELECT g, array_agg(k) FROM t GROUP BY g",
+    );
+    assert_eq!(u.rows.len(), 3);
+    let e = run(
+        &core,
+        "SELECT g, array_agg(k) FROM t GROUP BY g EXCEPT SELECT g, array_agg(k) FROM t GROUP BY g",
+    );
+    assert!(e.rows.is_empty());
+}
