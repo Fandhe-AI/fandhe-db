@@ -348,7 +348,16 @@ fn where_compare_op_token(token: &Token) -> Option<CompareOp> {
 pub(crate) fn is_aggregate_function_name(name: &str) -> bool {
     matches!(
         name.to_ascii_uppercase().as_str(),
-        "COUNT" | "SUM" | "AVG" | "MIN" | "MAX" | "STRING_AGG" | "ARRAY_AGG"
+        "COUNT"
+            | "SUM"
+            | "AVG"
+            | "MIN"
+            | "MAX"
+            | "STRING_AGG"
+            | "ARRAY_AGG"
+            | "BOOL_AND"
+            | "BOOL_OR"
+            | "EVERY"
     )
 }
 
@@ -3106,9 +3115,27 @@ pub enum AggregateFunc {
     /// 1 次元配列（NULL 入力は NULL 要素・入力なしは NULL）。内側の `ORDER BY`・`DISTINCT` を
     /// 受理する（SQL 表層のみ。`string_agg` と同じ仕組みを共有する）。
     ArrayAgg,
+    /// `bool_and(<boolean 式>)`（SQL-57・Issue #1805）。全行が真なら真。NULL 入力は無視し、
+    /// 入力なし・全行 NULL は NULL。結果は boolean。
+    BoolAnd,
+    /// `bool_or(<boolean 式>)`（SQL-57・Issue #1805）。どれか 1 行が真なら真。それ以外は
+    /// `bool_and` と同じ（NULL 無視・入力なしは NULL）。
+    BoolOr,
+    /// `every(<boolean 式>)`（SQL-57・Issue #1805）。`bool_and` の SQL 標準名（同一意味論。
+    /// 既定列名だけが `every`）。
+    Every,
 }
 
 impl AggregateFunc {
+    /// `bool_and` / `bool_or` / `every` か（SQL-57・Issue #1805）。引数が boolean 式で、
+    /// 非対応の文脈（FROM なし・JOIN・ビュー・NoSQL 等）では fail-closed に拒否する関数群。
+    pub(crate) fn is_bool_agg(self) -> bool {
+        matches!(
+            self,
+            AggregateFunc::BoolAnd | AggregateFunc::BoolOr | AggregateFunc::Every
+        )
+    }
+
     /// `name` が [`is_aggregate_function_name`] を通過済みの前提で呼ぶ。
     fn from_name(name: &str) -> Option<Self> {
         match name.to_ascii_uppercase().as_str() {
@@ -3119,6 +3146,9 @@ impl AggregateFunc {
             "MAX" => Some(AggregateFunc::Max),
             "STRING_AGG" => Some(AggregateFunc::StringAgg),
             "ARRAY_AGG" => Some(AggregateFunc::ArrayAgg),
+            "BOOL_AND" => Some(AggregateFunc::BoolAnd),
+            "BOOL_OR" => Some(AggregateFunc::BoolOr),
+            "EVERY" => Some(AggregateFunc::Every),
             _ => None,
         }
     }
@@ -3133,6 +3163,9 @@ impl AggregateFunc {
             AggregateFunc::Max => "max",
             AggregateFunc::StringAgg => "string_agg",
             AggregateFunc::ArrayAgg => "array_agg",
+            AggregateFunc::BoolAnd => "bool_and",
+            AggregateFunc::BoolOr => "bool_or",
+            AggregateFunc::Every => "every",
         }
     }
 }
@@ -6090,7 +6123,12 @@ impl<'a> Parser<'a> {
             let saved_null = self.allow_null_literal;
             self.allow_null_literal =
                 matches!(func, AggregateFunc::StringAgg | AggregateFunc::ArrayAgg);
-            let parsed = self.parse_value_expr(0);
+            let mut parsed = self.parse_value_expr(0);
+            // `bool_and` 系に限り引数に比較式（`<値式> <比較演算子> <値式>`）を受理する
+            // （SQL-57・Issue #1805）。ほかの集計関数の引数文法は変えない。
+            if func.is_bool_agg() && parsed.is_ok() && self.peek_is_cmp_op() {
+                parsed = self.parse_bool_agg_comparison_rest(parsed);
+            }
             self.allow_null_literal = saved_null;
             self.allow_unary_minus = saved_minus;
             self.agg_calls = saved_calls;
@@ -6126,6 +6164,12 @@ impl<'a> Parser<'a> {
                 order_by = self.parse_in_aggregate_order_by()?;
             }
         }
+        if func.is_bool_agg() && matches!(self.peek(), Some(Token::Punct(','))) {
+            return Err(SqlSurfaceError::undefined_function(format!(
+                "function {} requires exactly one argument",
+                func.default_alias()
+            )));
+        }
         if func == AggregateFunc::ArrayAgg {
             // `array_agg(<式> [ORDER BY ...])`（SQL-57・Issue #1801）。引数が 2 つ以上の形は
             // 該当シグネチャの関数が無い扱い（`42883`。`string_agg` と同じ）。
@@ -6146,6 +6190,24 @@ impl<'a> Parser<'a> {
             distinct,
             extra_args,
             order_by,
+        })
+    }
+
+    /// `bool_and` 系の引数で左辺を読んだ直後に比較演算子が続く場合の残り（演算子と右辺）を読み、
+    /// 比較の `Expr::Binary` に包む（SQL-57・Issue #1805）。論理演算・述語形は読まない
+    /// （呼び出し側が `)` を期待して `42601` に落ちる）。ノード予算は比較ノード分を課金する。
+    fn parse_bool_agg_comparison_rest(
+        &mut self,
+        lhs: Result<Expr, SqlSurfaceError>,
+    ) -> Result<Expr, SqlSurfaceError> {
+        let lhs = lhs?;
+        let op = self.expect_cmp_op()?;
+        let rhs = self.parse_value_expr(0)?;
+        self.consume_expr_node()?;
+        Ok(Expr::Binary {
+            op,
+            lhs: Box::new(lhs),
+            rhs: Box::new(rhs),
         })
     }
 
@@ -14330,7 +14392,9 @@ fn check_body_aggregate(
         match item {
             AggregateSelectItem::Aggregate(agg) => {
                 // `string_agg`・`array_agg`（SQL-57）はビュー本体には含めさせない（fail-closed）。
-                if matches!(agg.func, AggregateFunc::StringAgg | AggregateFunc::ArrayAgg) {
+                if matches!(agg.func, AggregateFunc::StringAgg | AggregateFunc::ArrayAgg)
+                    || agg.func.is_bool_agg()
+                {
                     return Err(body_form_unsupported());
                 }
                 if let AggregateArg::Expr(e) = &agg.arg {
@@ -17766,6 +17830,12 @@ fn parse_join_aggregate_item(p: &mut Parser<'_>) -> Result<JoinSelectItem, SqlSu
             detail: "array_agg is not supported in JOIN".to_string(),
         });
     }
+    // `bool_and` / `bool_or` / `every` も JOIN は対象外（SQL-57・Issue #1805）。
+    if func.is_bool_agg() {
+        return Err(SqlSurfaceError::FeatureNotSupported {
+            detail: format!("{} is not supported in JOIN", func.default_alias()),
+        });
+    }
     p.expect_punct('(')?;
     if p.peek_ident_matches("DISTINCT") {
         return Err(SqlSurfaceError::unsupported(
@@ -19911,7 +19981,9 @@ fn aggregate_statement_from_resolved(
             match item {
                 AggregateSelectItem::Aggregate(agg) => {
                     // `string_agg`（SQL-57）は評価後射影形ビューの外側では評価しない（fail-closed）。
-                    if matches!(agg.func, AggregateFunc::StringAgg | AggregateFunc::ArrayAgg) {
+                    if matches!(agg.func, AggregateFunc::StringAgg | AggregateFunc::ArrayAgg)
+                        || agg.func.is_bool_agg()
+                    {
                         return Err(SqlSurfaceError::unsupported(
                             "aggregate over a view with an aggregate/LIMIT body supports only column arguments",
                         ));
@@ -28976,6 +29048,38 @@ mod tests {
         // 列名 `distinct` を引数に取る形は維持する。
         let agg = expect_aggregate("SELECT array_agg(distinct) FROM documents", &lookup);
         assert!(!expect_agg_item(&agg.items()[0]).distinct);
+    }
+
+    /// SQL-57・Issue #1805: `bool_and` 系の構文。既定別名・比較式の引数が AST に載り、
+    /// 2 引数は `42883`、`DISTINCT`・内側 `ORDER BY`・論理演算の引数は `42601`。
+    #[test]
+    fn bool_aggregates_parse_comparison_arguments() {
+        let lookup = catalog_with(&["documents"]);
+        let agg = expect_aggregate(
+            "SELECT bool_and(a), BOOL_OR(a > 1), every(a = b) AS e FROM documents",
+            &lookup,
+        );
+        let first = expect_agg_item(&agg.items()[0]);
+        assert_eq!(first.func, AggregateFunc::BoolAnd);
+        assert!(matches!(first.arg, AggregateArg::Expr(Expr::Ident(_))));
+        let second = expect_agg_item(&agg.items()[1]);
+        assert_eq!(second.func, AggregateFunc::BoolOr);
+        assert!(matches!(
+            second.arg,
+            AggregateArg::Expr(Expr::Binary { op: BinOp::Gt, .. })
+        ));
+        let third = expect_agg_item(&agg.items()[2]);
+        assert_eq!(third.func, AggregateFunc::Every);
+        assert_eq!(third.func.default_alias(), "every");
+        assert_eq!(third.alias.as_deref(), Some("e"));
+        let code = |sql: &str| validate_sql(sql, &lookup).expect_err(sql).wire_code();
+        assert_eq!(code("SELECT bool_and(a, b) FROM documents"), "42883");
+        assert_eq!(code("SELECT bool_and(DISTINCT a) FROM documents"), "42601");
+        assert_eq!(
+            code("SELECT bool_and(a ORDER BY a) FROM documents"),
+            "42601"
+        );
+        assert!(is_aggregate_function_name("Every"));
     }
 
     /// SQL-57・Issue #1801: 引数の個数違いは `42883`（2 引数以上）・`42601`（0 引数・`*`）、
