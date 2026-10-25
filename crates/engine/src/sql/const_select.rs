@@ -435,6 +435,13 @@ fn bind_aggregate_call(
             detail: "array_agg without FROM is not supported".to_string(),
         });
     }
+    // 分散系（SQL-57・Issue #1803）も FROM なしは対象外。型の取りこぼしで誤解を招く `42883` に
+    // ならないよう、ここで明示的に `0A000` で拒否する。
+    if agg.func.is_variance_family() {
+        return Err(SqlSurfaceError::FeatureNotSupported {
+            detail: format!("{} without FROM is not supported", agg.func.default_alias()),
+        });
+    }
     let (arg, arg_ty) = match &agg.arg {
         AggregateArg::Star => (BoundAggArg::Star, None),
         AggregateArg::Expr(Expr::Number(raw)) => {

@@ -829,6 +829,17 @@ pub(crate) enum Accumulator {
     /// `array_agg([DISTINCT] <式> [ORDER BY ...])`（SQL-57・Issue #1801）。状態と意味論は
     /// [`crate::sql::array_agg`] が持つ（`DISTINCT` もこの variant の内部で扱う）。
     ArrayAgg(Box<crate::sql::array_agg::ArrayAggState>),
+    /// `variance`／`var_pop`／`var_samp` の正確演算版（整数系・`id`・`NUMERIC(p,s)` 列。
+    /// SQL-57・Issue #1803）。状態と意味論は [`crate::sql::variance`] が持つ。結果は numeric。
+    VarianceExact {
+        kind: crate::sql::variance::VarianceKind,
+        state: Box<crate::sql::variance::VarianceExact>,
+    },
+    /// 同・浮動小数版（`REAL`／`DOUBLE PRECISION` 列・数値スカラー式）。結果は double。
+    VarianceFloat {
+        kind: crate::sql::variance::VarianceKind,
+        state: crate::sql::variance::VarianceFloat,
+    },
 }
 
 impl Accumulator {
@@ -898,6 +909,11 @@ impl Accumulator {
             (AggregateFunc::StringAgg, AggregateInput::StringAgg(inp)) => {
                 Accumulator::StringAgg(Box::new(crate::sql::string_agg::StringAggState::new(inp)))
             }
+            // SQL-57・Issue #1803: 分散系。型の受理行列は `resolve_aggregate_input` が先に絞る。
+            (
+                AggregateFunc::Variance | AggregateFunc::VarPop | AggregateFunc::VarSamp,
+                variance_input,
+            ) => new_variance_accumulator(func, variance_input)?,
             (Sum, AggregateInput::IdU64) => Accumulator::IdSum(None),
             (Avg, AggregateInput::IdU64) => Accumulator::IdAvg {
                 sum: None,
@@ -1688,6 +1704,7 @@ impl Accumulator {
                 });
                 Ok(())
             }
+            Accumulator::VarianceExact { state, .. } => state.observe(i128::from(id)),
             _ => Err(accumulator_bug("observe_id on an incompatible accumulator")),
         }
     }
@@ -1793,6 +1810,7 @@ impl Accumulator {
                 });
                 Ok(())
             }
+            Accumulator::VarianceFloat { state, .. } => state.observe(v),
             _ => Err(accumulator_bug(
                 "observe_float on an incompatible accumulator",
             )),
@@ -1860,6 +1878,7 @@ impl Accumulator {
                 });
                 Ok(())
             }
+            Accumulator::VarianceExact { state, .. } => state.observe(i128::from(value)),
             _ => Err(accumulator_bug(
                 "observe_int on an incompatible accumulator",
             )),
@@ -1926,6 +1945,7 @@ impl Accumulator {
                 });
                 Ok(())
             }
+            Accumulator::VarianceExact { state, .. } => state.observe(value),
             _ => Err(accumulator_bug(
                 "observe_numeric on an incompatible accumulator",
             )),
@@ -2313,8 +2333,52 @@ impl Accumulator {
                 Some(array) => Cell::Array(array),
                 None => Cell::Null,
             },
+            Accumulator::VarianceExact { kind, state } => match state.finish_decimal(kind)? {
+                Some(decimal) => Cell::Numeric(decimal),
+                None => Cell::Null,
+            },
+            Accumulator::VarianceFloat { kind, state } => match state.finish_f64(kind)? {
+                Some(v) => Cell::Float(v),
+                None => Cell::Null,
+            },
         })
     }
+}
+
+/// 分散系関数（`variance`／`var_pop`／`var_samp`。SQL-57・Issue #1803）の累積器を入力の型から
+/// 選ぶ。整数系・`id`・`NUMERIC(p,s)` は正確演算（numeric 結果）、`REAL`／`DOUBLE PRECISION` 列と
+/// 数値スカラー式は浮動小数（double 結果）。それ以外は束縛層の実装バグとして `XX000`。
+fn new_variance_accumulator(
+    func: AggregateFunc,
+    input: &AggregateInput,
+) -> Result<Accumulator, SqlSurfaceError> {
+    use crate::sql::variance::{VarianceExact, VarianceFloat, VarianceKind};
+    let kind = VarianceKind::from_func(func)
+        .ok_or_else(|| accumulator_bug("variance accumulator requested for a non-variance func"))?;
+    Ok(match input {
+        AggregateInput::IdU64
+        | AggregateInput::IntegerColumn(_)
+        | AggregateInput::SmallIntColumn(_)
+        | AggregateInput::BigIntColumn(_) => Accumulator::VarianceExact {
+            kind,
+            state: Box::new(VarianceExact::new(0)),
+        },
+        AggregateInput::NumericColumn { scale, .. } => Accumulator::VarianceExact {
+            kind,
+            state: Box::new(VarianceExact::new(*scale)),
+        },
+        AggregateInput::RealColumn(_)
+        | AggregateInput::DoubleColumn(_)
+        | AggregateInput::ScalarExpr { .. } => Accumulator::VarianceFloat {
+            kind,
+            state: VarianceFloat::new(),
+        },
+        _ => {
+            return Err(accumulator_bug(
+                "unsupported (variance func, input) combination",
+            ))
+        }
+    })
 }
 
 /// `AVG(<NUMERIC(p,s)>)` の結果 scale（Issue #892・D6）。列の scale `s` を
@@ -2977,6 +3041,30 @@ pub(crate) fn aggregate_result_type(
         (AggregateFunc::ArrayAgg, AggregateInput::ArrayAgg(inp)) => ColumnType::Array(
             crate::catalog::ArrayType::new(inp.elem, crate::catalog::MAX_ARRAY_ELEMENTS).ok()?,
         ),
+        // SQL-57・Issue #1803: 分散系は整数系・`id`・numeric 列が numeric（名目 scale は列メタ用で、
+        // セルの scale は値ごとに変わる）、浮動小数列・数値式が double。
+        (
+            AggregateFunc::Variance | AggregateFunc::VarPop | AggregateFunc::VarSamp,
+            AggregateInput::IdU64
+            | AggregateInput::IntegerColumn(_)
+            | AggregateInput::SmallIntColumn(_)
+            | AggregateInput::BigIntColumn(_),
+        ) => AVG_INTEGER_RESULT_TYPE,
+        (
+            AggregateFunc::Variance | AggregateFunc::VarPop | AggregateFunc::VarSamp,
+            AggregateInput::NumericColumn { scale, .. },
+        ) => ColumnType::Numeric {
+            precision: crate::numeric::MAX_PRECISION,
+            scale: scale
+                .saturating_mul(2)
+                .clamp(16, crate::numeric::MAX_PRECISION),
+        },
+        (
+            AggregateFunc::Variance | AggregateFunc::VarPop | AggregateFunc::VarSamp,
+            AggregateInput::RealColumn(_)
+            | AggregateInput::DoubleColumn(_)
+            | AggregateInput::ScalarExpr { .. },
+        ) => ColumnType::Double,
         _ => return None,
     })
 }
@@ -4193,6 +4281,58 @@ mod tests {
         assert_eq!(acc.finish().unwrap_err().wire_code(), "22003");
 
         assert_eq!(Accumulator::RealSum(None).finish().unwrap(), Cell::Null);
+    }
+
+    /// Issue #1803: 分散系の variant を足しても `Accumulator` は大きくならない（GROUP BY のグループごとに
+    /// 持つため、`join::aggregate` の予算計算の前提）。最大の既存 variant は `CountDistinct`。
+    #[test]
+    fn variance_variants_do_not_grow_accumulator() {
+        let largest_existing =
+            std::mem::size_of::<(std::collections::HashSet<Vec<u8>>, usize)>() + 8;
+        assert!(std::mem::size_of::<Accumulator>() <= largest_existing);
+    }
+
+    /// Issue #1803: 分散系の結果型は整数系・numeric 入力が numeric、浮動小数・数値式が double。
+    #[test]
+    fn variance_result_type_follows_input_type() {
+        use crate::catalog::ColumnType;
+        for func in [
+            AggregateFunc::Variance,
+            AggregateFunc::VarPop,
+            AggregateFunc::VarSamp,
+        ] {
+            for input in [
+                AggregateInput::IdU64,
+                AggregateInput::IntegerColumn(0),
+                AggregateInput::SmallIntColumn(0),
+                AggregateInput::BigIntColumn(0),
+            ] {
+                assert_eq!(
+                    aggregate_result_type(func, &input),
+                    Some(AVG_INTEGER_RESULT_TYPE)
+                );
+            }
+            let numeric = AggregateInput::NumericColumn {
+                index: 0,
+                precision: 10,
+                scale: 2,
+            };
+            assert!(matches!(
+                aggregate_result_type(func, &numeric),
+                Some(ColumnType::Numeric { .. })
+            ));
+            for input in [
+                AggregateInput::RealColumn(0),
+                AggregateInput::DoubleColumn(0),
+            ] {
+                assert_eq!(
+                    aggregate_result_type(func, &input),
+                    Some(ColumnType::Double)
+                );
+            }
+            // 非数値の入力は束縛層が先に拒否するため、累積器の生成は内部エラーで fail-closed。
+            assert!(Accumulator::new(func, &AggregateInput::TextColumn(0)).is_err());
+        }
     }
 
     #[test]
