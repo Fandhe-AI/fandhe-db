@@ -18,6 +18,8 @@
 //! 文へ届く経路は存在しない。
 
 use std::cell::{Cell, RefCell};
+use std::marker::PhantomData;
+use std::rc::Rc;
 
 /// 中断の理由。エラー文言には出さない（固定文言。件数・テナント情報を含めない）。
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -51,8 +53,23 @@ thread_local! {
 
 /// [`InterruptScope::install`] が返す RAII ガード。drop でスコープを外す（入れ子対応）。
 #[must_use = "dropping the guard immediately uninstalls the interrupt scope"]
+///
+/// drop は「drop したスレッド」の thread-local スタックを切り詰めるため、別スレッドへ移すと
+/// 作成元のスコープが残り後続の文までキャンセルされる。`PhantomData<Rc<()>>` で `!Send`・`!Sync`
+/// にして、スレッド間の移動をコンパイル時に禁止する（下記 `compile_fail` doc test が保証）。
+///
+/// ```compile_fail
+/// fn assert_send<T: Send>() {}
+/// assert_send::<engine::interrupt::InterruptGuard>();
+/// ```
+///
+/// ```compile_fail
+/// fn assert_sync<T: Sync>() {}
+/// assert_sync::<engine::interrupt::InterruptGuard>();
+/// ```
 pub struct InterruptGuard {
     depth: usize,
+    _not_send: PhantomData<Rc<()>>,
 }
 
 impl Drop for InterruptGuard {
@@ -87,7 +104,10 @@ impl InterruptScope {
             });
             depth
         });
-        InterruptGuard { depth }
+        InterruptGuard {
+            depth,
+            _not_send: PhantomData,
+        }
     }
 }
 
