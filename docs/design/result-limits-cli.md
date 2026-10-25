@@ -8,7 +8,7 @@
 
 ## 背景
 
-明示 `LIMIT n` の範囲上限はコンパイル時定数 `core::MAX_SEARCH_K`（10,000）で固定されていた。これを起動時の CLI フラグで上げ下げ両方向に設定できるようにする。同じフラグは、`LIMIT` 省略時の結果行数上限（`54000`）を導入する後続作業も共有する想定（`EngineCore::result_limits()` と `result_limits_opt::MAX_RESULT_ROWS_FLAG` を再利用する）。
+明示 `LIMIT n` の範囲上限はコンパイル時定数 `core::MAX_SEARCH_K`（10,000）で固定されていた。これを起動時の CLI フラグで上げ下げ両方向に設定できるようにする。同じフラグは、`LIMIT` 省略時の結果行数上限（`54000`）も共有する（Issue #1796・#2211 で実装済み。`EngineCore::result_limits()` と `result_limits_opt::MAX_RESULT_ROWS_FLAG` を再利用する）。
 
 ## 決定
 
@@ -32,7 +32,9 @@
 | 集合演算全体の `LIMIT`・JOIN 文の `LIMIT`・評価後射影形ビューの外側 `LIMIT` | 効く |
 | `USING PLAN` の前段検証（LLM 呼び出しより前に拒否） | 効く |
 | NoSQL（HTTP）`search`／`scan`／`explain` の `limit` | 効く |
+| `LIMIT` 省略・`LIMIT ALL`・`OFFSET` 単独の結果行数（超過は `54000`。Issue #1796） | 効く |
 | `OFFSET` の範囲（`0..=10000`） | 連動しない |
+| 集合演算の枝・全体件数（`MAX_SET_OP_ROWS`＝10,000 固定）・`GROUP BY` のグループ数・JOIN の出力行数 | 連動しない（上げても先にこれらで `54000` になりうる。Issue #2211 で挙動を固定） |
 | 集合演算の枝 `LIMIT`・サブクエリ／CTE／ビュー本文内側の `LIMIT` | 連動しない（既定の 10,000 のまま。各々の行数上限が別軸で有界） |
 | 集計（`GROUP BY`）の `LIMIT` 範囲 | 連動しない |
 
