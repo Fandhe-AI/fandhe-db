@@ -83,6 +83,7 @@
   残りが尽きた回も `PortalSuspended` で終えるようにした（Issue #1798・WIRE-11。PostgreSQL 17 と同じ）。
   BREAKING CHANGE: 分割送出の最終 Execute の完了タグ（例: 5 行を `max_rows=2` で 3 回に分けた最後が `SELECT 5` から
   `SELECT 1`）と、行がちょうど尽きた回の応答（`CommandComplete` から `PortalSuspended`）が変わる。
+  `FETCH` は utility 文のため対象外で、完了タグは分割しても FETCH 文全体の取得件数（`FETCH 5`）のまま。
 
 ### Breaking Changes
 

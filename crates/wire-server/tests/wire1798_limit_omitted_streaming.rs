@@ -286,3 +286,59 @@ fn pipelined_execute_sync_then_disconnect_releases_the_slot() {
     drop(first);
     wait_for_active_exact(&limiter, 0, Duration::from_secs(20));
 }
+
+/// extended・FETCH の完了タグは FETCH 文全体の取得件数（PostgreSQL の utility 文と同じ）。
+/// SELECT のように Execute ごとの送出件数にはならず、`max_rows` 分割でも総件数を保つ。
+#[test]
+fn extended_fetch_tag_keeps_total_rows_across_max_rows_splits() {
+    let (addr, _g) = start("wire1798-ext-fetch", CAP as i64);
+    let mut stream = tcp_connect(addr);
+    send_simple_query(&mut stream, "BEGIN");
+    assert_eq!(read_command_complete(&mut stream), "BEGIN");
+    assert_eq!(read_ready_for_query_status(&mut stream), b'T');
+    send_simple_query(
+        &mut stream,
+        "DECLARE c CURSOR FOR SELECT id FROM t ORDER BY id",
+    );
+    assert_eq!(read_command_complete(&mut stream), "DECLARE CURSOR");
+    assert_eq!(read_ready_for_query_status(&mut stream), b'T');
+
+    // FETCH FORWARD 5 を max_rows=2 で分割: 2s, 2s, 1 + 総件数の FETCH 5。
+    parse_and_bind(&mut stream, "FETCH FORWARD 5 FROM c");
+    for (batch, last) in [(2, false), (2, false), (1, true)] {
+        send_length_prefixed_message(&mut stream, b'E', &execute_body("", 2));
+        for _ in 0..batch {
+            assert_eq!(read_message(&mut stream).0, b'D');
+        }
+        let (k, body) = read_message(&mut stream);
+        if last {
+            assert_eq!(k, b'C');
+            assert_eq!(tag_of(&body), "FETCH 5");
+        } else {
+            assert_eq!(k, b's');
+        }
+    }
+    assert_eq!(sync_and_status(&mut stream), b'T');
+
+    // カーソルを先頭へ戻せないため、新しいカーソルでちょうど尽きる回（max_rows=5）を確認する。
+    send_simple_query(&mut stream, "CLOSE c");
+    assert_eq!(read_command_complete(&mut stream), "CLOSE CURSOR");
+    assert_eq!(read_ready_for_query_status(&mut stream), b'T');
+    send_simple_query(
+        &mut stream,
+        "DECLARE d CURSOR FOR SELECT id FROM t ORDER BY id",
+    );
+    assert_eq!(read_command_complete(&mut stream), "DECLARE CURSOR");
+    assert_eq!(read_ready_for_query_status(&mut stream), b'T');
+    parse_and_bind(&mut stream, "FETCH FORWARD 5 FROM d");
+    send_length_prefixed_message(&mut stream, b'E', &execute_body("", CAP as i32));
+    for _ in 0..CAP {
+        assert_eq!(read_message(&mut stream).0, b'D');
+    }
+    assert_eq!(read_message(&mut stream).0, b's');
+    send_length_prefixed_message(&mut stream, b'E', &execute_body("", CAP as i32));
+    let (k, body) = read_message(&mut stream);
+    assert_eq!(k, b'C');
+    assert_eq!(tag_of(&body), "FETCH 5");
+    assert_eq!(sync_and_status(&mut stream), b'T');
+}
