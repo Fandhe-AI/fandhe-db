@@ -150,6 +150,7 @@
 pub mod aggregate;
 #[cfg(test)]
 mod aggregate_embedding_decode_tests;
+pub(crate) mod aggregate_input;
 pub mod allowlist;
 pub(crate) mod alter_using;
 pub(crate) mod arena_cache;
