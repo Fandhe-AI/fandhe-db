@@ -1328,6 +1328,8 @@ fn cmp_cell_values(a: &Cell, b: &Cell) -> std::cmp::Ordering {
         // 複数グループ分の結果であり、`Cell` の variant は常に揃っている
         // （束縛段が集計関数・入力列型から一意に決まる結果型を割り当てるため）。
         (Cell::SignedInteger(x), Cell::SignedInteger(y)) => x.cmp(y),
+        // `bool_and` / `bool_or` / `every` の結果（SQL-57・Issue #1805）。PostgreSQL と同じく false < true。
+        (Cell::Bool(x), Cell::Bool(y)) => x.cmp(y),
         (Cell::Date(x), Cell::Date(y)) => x.cmp(y),
         (Cell::Timestamp(x), Cell::Timestamp(y)) => x.cmp(y),
         (Cell::Time(x), Cell::Time(y)) => x.cmp(y),
@@ -3456,6 +3458,20 @@ mod tests {
     }
 
     // --- cmp_cell_values（Issue #892・D9） ---------------------------------
+
+    /// SQL-57・Issue #1805: boolean の集計結果は false < true で並ぶ。
+    #[test]
+    fn cmp_cell_values_orders_bool_false_before_true() {
+        use std::cmp::Ordering;
+        assert_eq!(
+            cmp_cell_values(&Cell::Bool(false), &Cell::Bool(true)),
+            Ordering::Less
+        );
+        assert_eq!(
+            cmp_cell_values(&Cell::Bool(true), &Cell::Bool(true)),
+            Ordering::Equal
+        );
+    }
 
     #[test]
     fn cmp_cell_values_orders_signed_integer_date_timestamp_and_numeric() {
