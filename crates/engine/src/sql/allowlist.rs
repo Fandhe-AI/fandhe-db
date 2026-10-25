@@ -5985,22 +5985,25 @@ impl<'a> Parser<'a> {
         // `string_agg` の引数位置に限り、`DISTINCT` 直後の文字列リテラル・`(` も修飾子と判定する
         // （`string_agg(DISTINCT 'x', ',')`・`DISTINCT ('x')`。PostgreSQL と同じ読み）。
         // `array_agg` は数値リテラルも同じ読み（`array_agg(DISTINCT 1)`。SQL-57・Issue #1801）。
+        // 符号 `-`／`+` の続く形（`DISTINCT -1`）も両関数で修飾子とする。
         let at_distinct = matches!(
             self.tokens.get(self.pos),
             Some(Token::Ident(n)) if n.eq_ignore_ascii_case("DISTINCT")
         );
         let after_distinct = self.tokens.get(self.pos + 1);
+        // 式の先頭になり得るトークン（文字列・`(`・符号。`array_agg` は数値も）が続けば修飾子。
+        // `DISTINCT` は予約語のため `DISTINCT - 1` を列 `distinct` からの減算とは読まない。
         let string_agg_modifier = at_distinct
             && match func {
                 AggregateFunc::StringAgg => matches!(
                     after_distinct,
-                    Some(Token::StringLiteral(_)) | Some(Token::Punct('('))
+                    Some(Token::StringLiteral(_)) | Some(Token::Punct('(' | '-' | '+'))
                 ),
                 AggregateFunc::ArrayAgg => matches!(
                     after_distinct,
                     Some(Token::StringLiteral(_))
-                        | Some(Token::Punct('('))
                         | Some(Token::Number(_))
+                        | Some(Token::Punct('(' | '-' | '+'))
                 ),
                 _ => false,
             };

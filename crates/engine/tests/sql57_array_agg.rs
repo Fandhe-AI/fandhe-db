@@ -950,3 +950,33 @@ fn distinct_and_order_by_accept_uuid_expressions_like_columns() {
         assert_eq!(code_of(&core, sql), "0A000", "{sql}");
     }
 }
+
+/// Bugbot 指摘: `DISTINCT` の直後が符号付き数値・`NULL` でも修飾子として読む（`distinct` 列からの
+/// 減算と取り違えない）。
+#[test]
+fn distinct_modifier_is_recognized_before_signed_literals_and_null() {
+    let (core, path) = build_core("sql57-arr-distinct-sign");
+    let _g = CleanupGuard(path);
+    // 符号付き数値: DISTINCT を落とさず、重複排除した 1 要素になる。
+    assert_eq!(
+        arr(&core, "SELECT array_agg(DISTINCT -1) FROM t"),
+        ints(&[Some(-1)])
+    );
+    // 単項 `+` は DISTINCT なしと同じ理由で拒否される（修飾子が列 `distinct` の参照にならない）。
+    assert_eq!(code_of(&core, "SELECT array_agg(+1) FROM t"), "42601");
+    assert_eq!(
+        code_of(&core, "SELECT array_agg(DISTINCT +1) FROM t"),
+        "42601"
+    );
+    // 型の決まらない NULL は DISTINCT の有無によらず同じ SQLSTATE。
+    assert_eq!(code_of(&core, "SELECT array_agg(NULL) FROM t"), "42804");
+    assert_eq!(
+        code_of(&core, "SELECT array_agg(DISTINCT NULL) FROM t"),
+        "42804"
+    );
+    // string_agg も同じ先読み（値は text のみなので型不一致の 42883）。
+    assert_eq!(
+        code_of(&core, "SELECT string_agg(DISTINCT -1, ',') FROM t"),
+        "42883"
+    );
+}
