@@ -41,6 +41,8 @@ pub(crate) enum AggregateRowValue<'a> {
     /// 中身を見ない非 NULL（`*`・VECTOR 列の存在・ARRAY／JSON 列）。
     Present,
     Id(u64),
+    /// 真偽値の式（`bool_and` 等の比較式入力。SQL-57・Issue #1805）。
+    Bool(bool),
     Text(&'a str),
     /// `INTEGER`／`SMALLINT`。distinct キー長（4 バイト）を保つため BigInt と分ける。
     Int32(i32),
@@ -200,6 +202,30 @@ pub(crate) fn eval_aggregate_input<'a>(
             }
             None => V::Null,
         },
+        AggregateInput::BoolExpr { source, program } => {
+            let embedding: &[f32] = if udf_call::references_embedding(source) {
+                match vector.values {
+                    Some(v) => v,
+                    None => {
+                        return Err(accumulator_bug(
+                            "BoolExpr references the VECTOR column but the row's embedding was not decoded",
+                        ))
+                    }
+                }
+            } else {
+                &[]
+            };
+            match program.eval(id, embedding, scanned, scratch)? {
+                ExprValue::Bool(b) => V::Bool(b),
+                // 比較の片側が NULL の行は集計対象外（3 値論理の UNKNOWN を無視する）。
+                ExprValue::Null => V::Null,
+                _ => {
+                    return Err(accumulator_bug(
+                        "boolean-typed BoundExpr evaluated to a non-boolean value",
+                    ))
+                }
+            }
+        }
         AggregateInput::ScalarExpr { source, program } => {
             // 式木が実際に embedding へ到達する場合のみ `vector.values` を要求する
             // （`ReferencedColumns::derive` と同じ判定関数）。未デコードは導出漏れという
@@ -244,6 +270,7 @@ impl AggregateRowValue<'_> {
                 ))
             }
             AggregateRowValue::Id(id) => Some(id.to_be_bytes().to_vec()),
+            AggregateRowValue::Bool(b) => Some(vec![u8::from(*b)]),
             AggregateRowValue::Text(s) => Some(s.as_bytes().to_vec()),
             AggregateRowValue::Int32(v) => Some(v.to_be_bytes().to_vec()),
             AggregateRowValue::Int64(v) => Some(v.to_be_bytes().to_vec()),
