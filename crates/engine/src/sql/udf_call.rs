@@ -9213,6 +9213,14 @@ mod tests {
         assert!(is_reserved_function_name("ARRAY_AGG"));
     }
 
+    /// SQL-57・Issue #1803: 分散系の 3 関数も集計関数名として予約され、同名の UDF は定義できない。
+    #[test]
+    fn variance_family_are_reserved_function_names() {
+        for name in ["variance", "var_pop", "var_samp", "VAR_POP", "Var_Samp"] {
+            assert!(is_reserved_function_name(name), "{name}");
+        }
+    }
+
     /// SQL-57・Issue #1805: `bool_and` / `bool_or` / `every` も集計関数名として予約される。
     #[test]
     fn bool_aggregates_are_reserved_function_names() {

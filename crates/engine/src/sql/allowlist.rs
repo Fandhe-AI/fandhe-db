@@ -355,6 +355,9 @@ pub(crate) fn is_aggregate_function_name(name: &str) -> bool {
             | "MAX"
             | "STRING_AGG"
             | "ARRAY_AGG"
+            | "VARIANCE"
+            | "VAR_POP"
+            | "VAR_SAMP"
             | "BOOL_AND"
             | "BOOL_OR"
             | "EVERY"
@@ -3115,6 +3118,13 @@ pub enum AggregateFunc {
     /// 1 次元配列（NULL 入力は NULL 要素・入力なしは NULL）。内側の `ORDER BY`・`DISTINCT` を
     /// 受理する（SQL 表層のみ。`string_agg` と同じ仕組みを共有する）。
     ArrayAgg,
+    /// `variance(<数値>)`（SQL-57・Issue #1803）。`var_samp` と同義（標本分散）。入力が整数系・
+    /// numeric なら numeric、浮動小数・数値式なら double を返す。行数 0 は NULL、1 も NULL。
+    Variance,
+    /// `var_pop(<数値>)`（SQL-57・Issue #1803）。母分散。行数 0 は NULL、1 は 0。
+    VarPop,
+    /// `var_samp(<数値>)`（SQL-57・Issue #1803）。標本分散。行数 0・1 は NULL。
+    VarSamp,
     /// `bool_and(<boolean 式>)`（SQL-57・Issue #1805）。全行が真なら真。NULL 入力は無視し、
     /// 入力なし・全行 NULL は NULL。結果は boolean。
     BoolAnd,
@@ -3127,6 +3137,15 @@ pub enum AggregateFunc {
 }
 
 impl AggregateFunc {
+    /// 分散系の集計関数か（`variance`／`var_pop`／`var_samp`。Issue #1803）。
+    /// 引数の型検査・結果型・累積器の選択がこの 3 関数で共通になる。
+    pub(crate) fn is_variance_family(self) -> bool {
+        matches!(
+            self,
+            AggregateFunc::Variance | AggregateFunc::VarPop | AggregateFunc::VarSamp
+        )
+    }
+
     /// `bool_and` / `bool_or` / `every` か（SQL-57・Issue #1805）。引数が boolean 式で、
     /// 非対応の文脈（FROM なし・JOIN・ビュー・NoSQL 等）では fail-closed に拒否する関数群。
     pub(crate) fn is_bool_agg(self) -> bool {
@@ -3146,6 +3165,9 @@ impl AggregateFunc {
             "MAX" => Some(AggregateFunc::Max),
             "STRING_AGG" => Some(AggregateFunc::StringAgg),
             "ARRAY_AGG" => Some(AggregateFunc::ArrayAgg),
+            "VARIANCE" => Some(AggregateFunc::Variance),
+            "VAR_POP" => Some(AggregateFunc::VarPop),
+            "VAR_SAMP" => Some(AggregateFunc::VarSamp),
             "BOOL_AND" => Some(AggregateFunc::BoolAnd),
             "BOOL_OR" => Some(AggregateFunc::BoolOr),
             "EVERY" => Some(AggregateFunc::Every),
@@ -3163,6 +3185,9 @@ impl AggregateFunc {
             AggregateFunc::Max => "max",
             AggregateFunc::StringAgg => "string_agg",
             AggregateFunc::ArrayAgg => "array_agg",
+            AggregateFunc::Variance => "variance",
+            AggregateFunc::VarPop => "var_pop",
+            AggregateFunc::VarSamp => "var_samp",
             AggregateFunc::BoolAnd => "bool_and",
             AggregateFunc::BoolOr => "bool_or",
             AggregateFunc::Every => "every",
@@ -14286,6 +14311,7 @@ fn check_body_aggregate(
             AggregateSelectItem::Aggregate(agg) => {
                 // `string_agg`・`array_agg`（SQL-57）はビュー本体には含めさせない（fail-closed）。
                 if matches!(agg.func, AggregateFunc::StringAgg | AggregateFunc::ArrayAgg)
+                    || agg.func.is_variance_family()
                     || agg.func.is_bool_agg()
                 {
                     return Err(body_form_unsupported());
@@ -17723,6 +17749,12 @@ fn parse_join_aggregate_item(p: &mut Parser<'_>) -> Result<JoinSelectItem, SqlSu
             detail: "array_agg is not supported in JOIN".to_string(),
         });
     }
+    // 分散系（SQL-57・Issue #1803）も JOIN は対象外（明示拒否で fail-closed に保つ）。
+    if func.is_variance_family() {
+        return Err(SqlSurfaceError::FeatureNotSupported {
+            detail: format!("{} is not supported in JOIN", func.default_alias()),
+        });
+    }
     // `bool_and` / `bool_or` / `every` も JOIN は対象外（SQL-57・Issue #1805）。
     if func.is_bool_agg() {
         return Err(SqlSurfaceError::FeatureNotSupported {
@@ -19839,6 +19871,7 @@ fn aggregate_statement_from_resolved(
                 AggregateSelectItem::Aggregate(agg) => {
                     // `string_agg`（SQL-57）は評価後射影形ビューの外側では評価しない（fail-closed）。
                     if matches!(agg.func, AggregateFunc::StringAgg | AggregateFunc::ArrayAgg)
+                        || agg.func.is_variance_family()
                         || agg.func.is_bool_agg()
                     {
                         return Err(SqlSurfaceError::unsupported(

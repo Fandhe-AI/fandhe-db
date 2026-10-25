@@ -6492,6 +6492,12 @@ impl BoundAggregateItem {
                 "string_agg and array_agg are not supported by this interface",
             ));
         }
+        // 分散系（SQL-57・Issue #1803）も SQL 表層のみ（NoSQL 表層は対象外）。多層防御として拒否する。
+        if func.is_variance_family() {
+            return Err(SqlSurfaceError::unsupported(
+                "variance aggregates are not supported by this interface",
+            ));
+        }
         // `bool_and` / `bool_or` / `every` も SQL 表層のみ（SQL-57・Issue #1805）。
         if func.is_bool_agg() {
             return Err(SqlSurfaceError::unsupported(
@@ -7111,6 +7117,30 @@ fn resolve_aggregate_input(
         }
     }
 
+    // 分散系（`variance`／`var_pop`／`var_samp`。SQL-57・Issue #1803）は数値型だけを受理する。
+    // 汎用の列分岐は `Sum`／`Avg` 以外の関数に非数値列を素通しするため、ここで先に許可型へ絞り、
+    // それ以外は該当シグネチャの関数が無い（`42883`）として拒否する（実行時の内部エラーにしない）。
+    if func.is_variance_family() {
+        if let AggregateArg::Expr(Expr::Ident(name)) = arg {
+            if let Some(column) = schema.columns.iter().find(|c| &c.name == name) {
+                if !matches!(
+                    column.ty,
+                    ColumnType::SmallInt
+                        | ColumnType::Integer
+                        | ColumnType::BigInt
+                        | ColumnType::Real
+                        | ColumnType::Double
+                        | ColumnType::Numeric { .. }
+                ) {
+                    return Err(SqlSurfaceError::undefined_function(format!(
+                        "function {}() does not exist for the type of column {name:?}",
+                        func.default_alias()
+                    )));
+                }
+            }
+        }
+    }
+
     match arg {
         AggregateArg::Star => Ok(AggregateInput::AllVisible),
         AggregateArg::Expr(Expr::Ident(name)) => {
@@ -7283,6 +7313,28 @@ fn resolve_aggregate_input(
                 // 集計引数としては対象外とする。
                 // Issue #1186: `SUM`／`AVG` に `DATE`／`TIMESTAMP` 式を渡す組み合わせ
                 // は列参照と同じく `42883`（undefined_function）で拒否する。
+                // 分散系（SQL-57・Issue #1803）は数値スカラー式だけを受理する。numeric 式
+                // （`CAST` の結果）は他の集計と同じく後続課題として `0A000`（下の腕）に残す。
+                ExprType::Text
+                | ExprType::Bool
+                | ExprType::Vector
+                | ExprType::Date
+                | ExprType::Timestamp
+                | ExprType::Time
+                | ExprType::TimestampTz
+                | ExprType::Json
+                | ExprType::JsonText
+                | ExprType::Interval
+                | ExprType::Uuid
+                | ExprType::Bytea
+                | ExprType::Array
+                    if func.is_variance_family() =>
+                {
+                    Err(SqlSurfaceError::undefined_function(format!(
+                        "function {}() does not exist for a non-numeric expression",
+                        func.default_alias()
+                    )))
+                }
                 ExprType::Date | ExprType::Timestamp | ExprType::Time | ExprType::TimestampTz
                     if matches!(func, AggregateFunc::Sum | AggregateFunc::Avg) =>
                 {
@@ -10092,6 +10144,16 @@ fn aggregate_result_column_type(item: &BoundAggregateItem) -> ColumnType {
         }
         // 配列は式中の列として扱えない（`array_agg(x) || ...` などは `22000`。SQL-57）。
         AggregateFunc::ArrayAgg => EXPR_UNSUPPORTED_COLUMN_TYPE,
+        // 分散系（SQL-57・Issue #1803）: numeric 結果（整数系・`id`・numeric 列）は式内で扱えない列、
+        // 浮動小数列・数値式の入力は double 結果。
+        AggregateFunc::Variance | AggregateFunc::VarPop | AggregateFunc::VarSamp => {
+            match item.input {
+                AggregateInput::RealColumn(_)
+                | AggregateInput::DoubleColumn(_)
+                | AggregateInput::ScalarExpr { .. } => ColumnType::Double,
+                _ => EXPR_UNSUPPORTED_COLUMN_TYPE,
+            }
+        }
         AggregateFunc::Avg => match item.input {
             // Issue #2270（TABLE-13）: 整数・`id` の AVG も `Cell::Numeric` を返すため、
             // 式内では扱えない列として `22000` で拒否する（numeric 算術は別 Issue）。
