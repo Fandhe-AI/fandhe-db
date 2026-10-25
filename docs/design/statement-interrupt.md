@@ -34,9 +34,9 @@ statement_timeout のデッドラインは、同じ `interrupt::check()` の判�
 
 ### wire の切断検出
 
-- `WireStream::liveness_probe_socket()`（既定は `None`）が接続ソケットの複製を返す。TLS 接続も下層 TCP ソケットの複製を返し、peek するだけで TLS レコードには触れない
+- `WireStream::liveness_probe()`（既定は `None`）が、接続ソケットの複製と受信経路と共有する side buffer の組を返す。認証後セッションの受信経路は `SideBufTcp` で包み、TLS 接続でも TLS レコード復号より下層（生バイト列）に置くため順序が保たれる
 - `post_auth_loop` が `'Q'`（COPY のサブプロトコルを含む）と `'E'` の処理中だけ、`liveness::install` で切断検出のスコープを入れる。接続ごとに複製を 1 回だけ取り、メッセージごとの dup を避ける
-- probe は `PROBE_INTERVAL`（250ms）以上の間隔で、非ブロッキングにして 1 バイトを peek し、必ず blocking へ戻す。`Ok(0)`・`ECONNRESET` 等は `ClientGone`、`WouldBlock` と未読バイトあり（パイプライン送信の後続）は継続、blocking へ戻せなければ接続を閉じる側へ倒す
+- probe は `PROBE_INTERVAL`（250ms）以上の間隔で、非ブロッキングにして読めるバイトを上限（`SIDE_BUF_CAP` = 64KiB）つきの side buffer へ実際に読み取り、必ず blocking へ戻す。peek は未読バイトが残ると FIN 到達後も同じバイトを返し切断を判別できないため使わない（Execute と Sync を続けて送って閉じる通常の拡張クエリで起きる）。read が `Ok(0)`・`ECONNRESET` 等なら `ClientGone`、`WouldBlock` は継続、blocking へ戻せなければ接続を閉じる側へ倒す。受信経路は次の読み取りでまず side buffer を消費するのでバイトは欠けず順序も崩れない。side buffer が満杯の間は切断判定をせず生存扱い（クライアントが送信中。64KiB を超える未読パイプラインの後に閉じた場合は走査終了まで検出しない）
 - 中断後は通常のエラー経路に乗る。ErrorResponse の書き込み失敗で接続が終わり、`SessionTransaction` の drop でライタが解放される
 - PostgreSQL 17 との差: PG は既定（`client_connection_check_interval = 0`）では実行中の切断を検出しない。本実装は資源保護のために常に検出する。書き込み側だけ閉じた（半閉じ）クライアントも切断として扱い中断する。CLI での切り替えは足していない
 

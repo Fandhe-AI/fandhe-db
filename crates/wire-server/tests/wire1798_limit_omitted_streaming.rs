@@ -263,3 +263,26 @@ fn client_disconnect_during_scan_releases_the_slot() {
     assert_eq!(read_command_complete(&mut second), "SELECT 2");
     read_ready_for_query(&mut second);
 }
+
+/// 切断（ベストエフォート）: Execute と Sync を続けて送り、未読の Sync を残したまま閉じても
+/// 接続スロットが返る（未読バイトがあっても FIN を検出する。Issue #1798 の Codex P1）。
+#[test]
+fn pipelined_execute_sync_then_disconnect_releases_the_slot() {
+    let (core, _g) = new_core("wire1798-disconnect-pipelined", 100_000);
+    seed(&core, 1, 3000);
+    let users = write_user_store_file(&[("alice", "tenant-a", "correct-horse")]);
+    let (addr, limiter) = spawn_server_with_engine_and_limits(
+        &users,
+        core,
+        1,
+        Duration::from_secs(20),
+        SessionLimits::default(),
+    );
+
+    let mut first = tcp_connect(addr);
+    parse_and_bind(&mut first, "SELECT id, v FROM t ORDER BY v");
+    send_length_prefixed_message(&mut first, b'E', &execute_body("", 0));
+    send_length_prefixed_message(&mut first, b'S', b"");
+    drop(first);
+    wait_for_active_exact(&limiter, 0, Duration::from_secs(20));
+}

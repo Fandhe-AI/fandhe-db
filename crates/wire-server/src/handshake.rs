@@ -559,7 +559,7 @@ fn post_auth_loop<'e, S: WireStream>(
     let _base_timeout_guard = framing::ConnectionBaseTimeoutGuard::set(base_timeout);
     // Issue #1798: 実行中の文が切断を検出して中断できるよう、切断検出用のソケット複製を
     // 接続ごとに 1 回だけ取る（メッセージごとの dup を避ける）。取れない接続は検出なし。
-    let probe_sock = stream.liveness_probe_socket().map(std::rc::Rc::new);
+    let probe_sock = stream.liveness_probe().map(std::rc::Rc::new);
     let mut applied_timeout = base_timeout;
     loop {
         let type_byte =
@@ -1723,11 +1723,13 @@ fn handle_connection_inner_with_tls(
             Ok(u) => u,
             Err(e) => return respond_and_close(&mut stream, e, "invalid startup packet"),
         };
+        let mut stream = crate::liveness::SideBufTcp::new(stream);
         return run_authenticated_session(&mut stream, store, engine, username, session_limits);
     };
 
     match negotiate_startup_or_upgrade(&mut stream, mode) {
         Ok(PreTlsOutcome::Ready(username)) => {
+            let mut stream = crate::liveness::SideBufTcp::new(stream);
             run_authenticated_session(&mut stream, store, engine, username, session_limits)
         }
         Ok(PreTlsOutcome::UpgradeTls) => {
@@ -1793,7 +1795,8 @@ fn handle_tls_upgrade(
         ));
     }
 
-    let mut tls_stream = crate::tls::stream::TlsStream::new(stream, session);
+    let mut tls_stream =
+        crate::tls::stream::TlsStream::new(crate::liveness::SideBufTcp::new(stream), session);
 
     let username = match negotiate_after_tls(&mut tls_stream) {
         Ok(u) => u,
