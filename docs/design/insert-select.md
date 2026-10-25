@@ -58,7 +58,7 @@ INSERT INTO <表> (<列>[, ...]) <query> [RETURNING ...] [USING OPERATION_ID '<i
 
 - #1733・#1734: 結線済み（第 II 部。`BoundInsertSelectTarget` の再利用と `query_tokens` による台帳ハッシュ）
 - #1730: `DEFAULT VALUES`（列リスト省略の `INSERT ... SELECT` は第 III 部で受理）
-- SQL-34: 内側 SELECT の LIMIT 省略は #2615 で受理（末尾「Issue #2615 追記」）。`--max-result-rows` の CLI 統一は #2212
+- SQL-34: 内側 SELECT の LIMIT 省略は #2615 で受理（末尾「Issue #2615 追記」）。`--max-result-rows` の統一は #2212 で完了（末尾「Issue #2212 追記」）
 
 ### 6. 対象外（fail-closed）
 
@@ -190,7 +190,7 @@ NULL 許容は NULL・DEFAULT の無い NOT NULL は `23502`）。`DEFAULT nextv
   matview と同じ骨格）。再検証も拒否なら元の拒否理由（`42601`）を返す。集計・定数 SELECT など `LIMIT` 不要の形は
   最初の検証で通るため注入せず、上限判定は実行側の `rows.len() > cap`（`54000`）が担う。
 - `cap` ちょうどの `LIMIT` は黙って切り詰める fail-open になるため付けない。必ず `cap + 1` で読み、超過は `54000`
-  （1 行も挿入せず、台帳にも残さない）。`cap` の算出元は `insert_select_row_cap()` の 1 か所（#2212 の置き換え点）。
+  （1 行も挿入せず、台帳にも残さない）。`cap` の算出元は共有ヘルパー `write_input_cap`／`write_input_cap_injected`（#2212）。
 - `ValidatedInsertSelect::implicit_limit`（`pub(crate)`）に付与値を記録し、`bind_insert_select` はその値を Describe の
   `LIMIT` 範囲検査の上限にする（`22000` を避ける）。明示 `LIMIT` の文は従来どおり（`n > max_result_rows` は `22000`）。
   公開アクセサ `query()` は付与後の文を返す。
@@ -201,3 +201,13 @@ NULL 許容は NULL・DEFAULT の無い NOT NULL は `23502`）。`DEFAULT nextv
   移行済み表で `id` を省略した UPSERT（#1699。fail-closed のまま）。
 - テスト: `tests/sql51_insert_select_limit_omitted.rs`（受理・上限境界・RLS・Describe・台帳・自己参照・PG 照合の期待値）、
   `tests/sql51_insert_select_migrated_id.rs`（移行済み表の IDENTITY 採番・再送・明示トランザクション・自己参照）。
+
+## Issue #2212 追記（入力側上限の統一）
+
+- 対象ビヘイビア: SQL-34・SQL-15（ポインタ）。`INSERT ... SELECT`・CTAS・MATERIALIZED VIEW（CREATE／REFRESH）・COPY の入力行数上限は `--max-result-rows` で、算出は `core/write_input_cap.rs` に集約した。
+- 注入しない形（構文段が LIMIT を足さなかった文）は `cap` を設定値そのものとし、評価にも設定値を渡す。読み取り経路が `cap + 1` 件で超過を検出するため、ハード上限でも黙って切り詰めない。
+- 注入する形（#2615 のフォールバックで `LIMIT cap + 1` を足した文。matview の単純形で LIMIT なしの検証が通らない本文）だけ、`cap` をハード上限の 1 つ手前へ丸める（`ResultLimits::new` の飽和で `cap + 1` が `cap` に潰れる fail-open を避けるため）。
+- 適用順序（いずれも書き込みの前に判定する）: `INSERT ... SELECT`・CTAS は入力の実体化で `--max-result-rows`（`54000`）、続いて `--max-insert-rows`（`54000`）、INDEX-4 のバッチ／バイト上限、書き込み。matview は文脈数上限（`MAX_MATVIEW_CONTEXTS`）の後に文脈ごとの `--max-result-rows`。COPY TO は `CopyOutResponse` より前に判定し、書き込み側の上限はない。
+- `--max-dml-affected-rows` は UPDATE／DELETE 系の上限で、これらの入力経路には作用しない（対象外）。
+- matview の評価後射影形（GROUP BY 等）の本文は、評価上限を「既定値 10,000 と `cap + 1` の大きい方」にした。設定値を上げれば本文の暗黙上限も上がる。
+- 残る差分: 設定がハード上限のときの注入形は 99,999 行まで。ビュー・matview 本文の明示 `LIMIT` の範囲検査は既定値のまま（ビュー本文の LIMIT を設定値と連動させない既存契約）。集合演算の `MAX_SET_OP_ROWS`（10,000）は別軸の上限として残る。本文・サブクエリ内側・集合演算の括弧付き枝の LIMIT 省略の受理拡大は #1852／#1853 の範囲。

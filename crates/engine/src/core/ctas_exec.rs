@@ -303,17 +303,12 @@ impl EngineCore {
         Ok(skipped)
     }
 
-    /// CTAS の入力側行数上限（SQL-52 (2)。`--max-result-rows` 由来）と、`cap + 1` 件で打ち切る取得上限。
-    /// 入力側の判定点は本関数と [`Self::check_ctas_input_rows`] の 1 か所に集約する（#2212 が
-    /// `INSERT ... SELECT`・MATERIALIZED VIEW・COPY と統一する際の置き換え点）。
+    /// CTAS の入力側行数上限（SQL-52 (2)・SQL-34。`--max-result-rows` 由来）。算出は
+    /// `INSERT ... SELECT`・MATERIALIZED VIEW・COPY と共有の `write_input_cap`（Issue #2212）。
+    /// 内側の文は構文段で検証済みで `LIMIT` を注入しないため、設定値そのものを `cap` にする。
     fn ctas_input_row_limit(&self) -> Result<(usize, ResultLimits), SqlSurfaceError> {
-        let cap = self.insert_select_row_cap();
-        let fetch = cap
-            .checked_add(1)
-            .ok_or_else(|| SqlSurfaceError::Internal {
-                detail: "internal error".to_string(),
-            })?;
-        Ok((cap, ResultLimits::new(fetch)))
+        let c = self.write_input_cap()?;
+        Ok((c.cap, c.eval_limits))
     }
 
     /// 入力を実体化した時点の入力側上限判定（超過は `54000`。書き込みの前に行う）。
