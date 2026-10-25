@@ -1012,6 +1012,60 @@ fn static_validation_predicates(preds: &[WherePredicate]) -> Vec<WherePredicate>
     out
 }
 
+/// 集計項目の `FILTER (WHERE ...)` 中の部分クエリを解決する（SQL-57・Issue #1806）。
+/// `core.rs` の `Statement::Aggregate` 実行アームが、文の `WHERE` の解決（
+/// [`resolve_where_predicates`]）の直後・束縛の前に呼ぶ。内側は外側と同じ `PolicyContext`・
+/// 同じ読み取りスナップショット・同じ予算で実行されるため、テナント境界は文の `WHERE` の
+/// 部分クエリと同一（他テナント行は内側にも見えない）。部分クエリを含む述語を持つ集計だけを
+/// 書き換え、それ以外は触らない。本関数を経ない経路（カーソル・ビュー・EXPLAIN 等）の
+/// 未解決の部分クエリは束縛段が `42601` で拒否する（fail-closed）。
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn resolve_aggregate_item_filters(
+    items: &mut [crate::sql::allowlist::AggregateSelectItem],
+    outer_scopes: &[&TableSchema],
+    read_txn: &impl crate::storage::read_source::ReadSource,
+    ctx: &PolicyContext,
+    lookup: &impl TableLookup,
+    udfs: &UdfRegistry,
+    group_limits: crate::group_by_limits::GroupByLimits,
+    nesting_limits: crate::nesting_limits::NestingLimits,
+    budget: &mut usize,
+    in_value_budget: &mut usize,
+) -> Result<(), SqlSurfaceError> {
+    use crate::sql::allowlist::AggregateSelectItem;
+    let mut resolve =
+        |agg: &mut crate::sql::allowlist::AggregateItem| -> Result<(), SqlSurfaceError> {
+            if !agg.filter.iter().any(predicate_contains_subquery) {
+                return Ok(());
+            }
+            agg.filter = resolve_where_predicates(
+                std::mem::take(&mut agg.filter),
+                outer_scopes,
+                read_txn,
+                ctx,
+                lookup,
+                udfs,
+                group_limits,
+                nesting_limits,
+                budget,
+                in_value_budget,
+            )?;
+            Ok(())
+        };
+    for item in items {
+        match item {
+            AggregateSelectItem::GroupKey { .. } => {}
+            AggregateSelectItem::Aggregate(agg) => resolve(agg)?,
+            AggregateSelectItem::Expr { aggregates, .. } => {
+                for agg in aggregates {
+                    resolve(agg)?;
+                }
+            }
+        }
+    }
+    Ok(())
+}
+
 /// 述語がサブクエリ（`IN`／`EXISTS`／スカラー比較）を含むかを再帰的に判定する。
 /// 入れ子 WHERE の実行時エラー時に、サブクエリを含まない述語だけで静的検証を
 /// 完了させるために使う（`execute_inner_query` 系から呼ばれる）。

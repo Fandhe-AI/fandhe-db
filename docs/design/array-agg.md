@@ -105,7 +105,8 @@
 
 ## 対象外（追跡）
 
-- FROM のない `array_agg`、JOIN、ウィンドウ（SQL-64）、NoSQL 表層、`FILTER (WHERE ...)`
+- FROM のない `array_agg`、JOIN、ウィンドウ（SQL-64）、NoSQL 表層
+  （`FILTER (WHERE ...)` は Issue #1806 で対応済み。[aggregate-filter-clause.md](aggregate-filter-clause.md)）
 - ビュー本体・評価後射影形ビューの外側での `array_agg`
 - 配列を入力にした多次元の結果、ENUM・smallint・char(n)・time・timestamptz・interval の要素
 - `array_agg(...)[i]` などの式・HAVING・文レベル ORDER BY で配列結果を使う形

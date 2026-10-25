@@ -6448,6 +6448,48 @@ pub struct BoundAggregateItem {
     /// `DISTINCT` を構造的に拒否済み）。[`Self::bind`]（クレート外からの直接
     /// 構築経路）は常に `false` 固定（NoSQL 表層での DISTINCT はスコープ外）。
     pub(crate) distinct: bool,
+    /// `FILTER (WHERE ...)` の束縛結果（SQL-57・Issue #1806）。`None` なら FILTER なし。
+    /// 直接構築経路（[`Self::bind`]）は常に `None`。
+    pub(crate) filter: Option<Box<BoundAggregateFilter>>,
+}
+
+/// 集計項目 1 つの `FILTER (WHERE ...)` を束縛した結果（SQL-57・Issue #1806）。
+///
+/// 文の `WHERE` と同じ束縛経路（[`bind_where_predicates`]）を通した 4 つ組を、その項目の
+/// アキュムレータへ行を入れるか否かの判定にだけ使う。評価は `sql::aggregate::
+/// item_filter_matches` の 1 箇所に集約し、可視性判定（RLS）・文の `WHERE` の**後**の
+/// AGG 段でのみ行う（RLS 段には一切干渉せず、`BoundAggregate::rls_predicate_present` にも
+/// 反映しない）。`expr_filter_programs` は `expr_filters` と 1 対 1 対応。
+#[derive(Debug, Clone, PartialEq)]
+pub(crate) struct BoundAggregateFilter {
+    pub(crate) metadata_filters: Vec<MetadataFilter>,
+    pub(crate) expr_filters: Vec<crate::sql::udf_call::BoundExpr>,
+    pub(crate) expr_filter_programs: Vec<crate::sql::expr_program::ExprProgram>,
+    pub(crate) or_filters: Vec<crate::sql::where_tree::BoundOrGroup>,
+}
+
+/// 集計項目の `FILTER` 述語列を束縛する（[`bind_aggregate_with_dummy_flags`] の `Aggregate`
+/// 腕・`Expr` 腕〔隠し集計〕が共有）。空なら `None`。式ノード予算は文全体で共有する
+/// （DoS 有界）。`dummy_equality_flags` は渡さず全値検証（FILTER 内に `$n` は存在しない）。
+/// `bind_where_predicates` が返す RLS 述語フラグは捨てる（FILTER は RLS の根拠にならない）。
+fn bind_aggregate_filter(
+    filter: &[WherePredicate],
+    schema: &TableSchema,
+    udfs: &crate::sql::udf_call::UdfRegistry,
+    node_budget: &mut usize,
+) -> Result<Option<Box<BoundAggregateFilter>>, SqlSurfaceError> {
+    if filter.is_empty() {
+        return Ok(None);
+    }
+    let (metadata_filters, expr_filters, _rls, or_filters) =
+        bind_where_predicates(filter, schema, udfs, node_budget, &[])?;
+    let expr_filter_programs = compile_expr_filter_programs(&expr_filters);
+    Ok(Some(Box::new(BoundAggregateFilter {
+        metadata_filters,
+        expr_filters,
+        expr_filter_programs,
+        or_filters,
+    })))
 }
 
 impl BoundAggregateItem {
@@ -6501,6 +6543,7 @@ impl BoundAggregateItem {
             input,
             name,
             distinct: false,
+            filter: None,
         })
     }
 
@@ -7991,12 +8034,14 @@ pub(crate) fn bind_aggregate_with_dummy_flags(
                     .alias
                     .clone()
                     .unwrap_or_else(|| item.func.default_alias().to_string());
+                let filter = bind_aggregate_filter(&item.filter, schema, udfs, &mut node_budget)?;
                 let item_index = items.len();
                 items.push(BoundAggregateItem {
                     func: item.func,
                     input,
                     name: name.clone(),
                     distinct: item.distinct,
+                    filter,
                 });
                 projection.push(ProjectionColumn::Aggregate { item_index, name });
             }
@@ -8036,12 +8081,15 @@ pub(crate) fn bind_aggregate_with_dummy_flags(
                 let mut hidden = Vec::with_capacity(aggregates.len());
                 for agg in aggregates {
                     let input = resolve_aggregate_item_input(agg, schema, udfs, &mut node_budget)?;
+                    let filter =
+                        bind_aggregate_filter(&agg.filter, schema, udfs, &mut node_budget)?;
                     let item_index = items.len();
                     items.push(BoundAggregateItem {
                         func: agg.func,
                         input,
                         name: hidden_aggregate_name(item_index),
                         distinct: agg.distinct,
+                        filter,
                     });
                     hidden.push(item_index);
                 }
@@ -12251,6 +12299,7 @@ mod tests {
                 distinct: false,
                 extra_args: Vec::new(),
                 order_by: Vec::new(),
+                filter: Vec::new(),
             })],
             where_predicates: Vec::new(),
             group_by: None,

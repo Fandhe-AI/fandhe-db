@@ -384,6 +384,9 @@ pub(crate) fn rewrite_aggregate(
                 for k in &mut agg.order_by {
                     k.expr = map_expr_idents(&k.expr, &|c| map.physical(c));
                 }
+                // SQL-57・Issue #1806: `FILTER` 条件も物理列名へ写す（部分クエリ・行 identity
+                // 参照は `rewrite_where` の既存規則で `0A000`）。
+                agg.filter = rewrite_where(map, std::mem::take(&mut agg.filter))?;
                 AggregateSelectItem::Aggregate(agg)
             }
             AggregateSelectItem::Expr { .. } => return Err(unsupported_position()),

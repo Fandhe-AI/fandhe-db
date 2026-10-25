@@ -8939,6 +8939,20 @@ impl EngineCore {
                     &mut subquery_budget,
                     &mut subquery_in_value_budget,
                 )?;
+                // SQL-57・Issue #1806: 集計項目の `FILTER (WHERE ...)` 中の部分クエリも
+                // 同じ文脈・同じ予算で解決する。
+                crate::sql::subquery::resolve_aggregate_item_filters(
+                    &mut validated.items,
+                    &[&schema],
+                    read_txn,
+                    ctx,
+                    &self.storage,
+                    session.udfs(),
+                    self.group_by_limits,
+                    self.nesting_limits,
+                    &mut subquery_budget,
+                    &mut subquery_in_value_budget,
+                )?;
                 let bound =
                     crate::sql::parser::bind_aggregate(&validated, &schema, session.udfs())?
                         .with_result_cap(limits.max_result_rows());

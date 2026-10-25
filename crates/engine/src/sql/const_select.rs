@@ -435,6 +435,12 @@ fn bind_aggregate_call(
             detail: "array_agg without FROM is not supported".to_string(),
         });
     }
+    // `FILTER (WHERE ...)` の FROM なし集計は対象外（SQL-57・Issue #1806。fail-closed）。
+    if !agg.filter.is_empty() {
+        return Err(SqlSurfaceError::FeatureNotSupported {
+            detail: "FILTER without FROM is not supported".to_string(),
+        });
+    }
     let (arg, arg_ty) = match &agg.arg {
         AggregateArg::Star => (BoundAggArg::Star, None),
         AggregateArg::Expr(Expr::Number(raw)) => {

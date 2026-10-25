@@ -203,7 +203,7 @@ fn statement_text_budget(accumulators: &[Accumulator], max_result_bytes: usize) 
 #[allow(clippy::too_many_arguments)]
 fn observe_with_budgets(
     accumulator: &mut Accumulator,
-    input: &AggregateInput,
+    item: &crate::sql::parser::BoundAggregateItem,
     id: u64,
     vector: &RowVector<'_>,
     scanned: &[Option<row_codec::ScalarRef<'_>>],
@@ -212,6 +212,14 @@ fn observe_with_budgets(
     max_result_bytes: usize,
     distinct_budget: &mut crate::sql::distinct::DistinctBudget,
 ) -> Result<(), SqlSurfaceError> {
+    // SQL-57・Issue #1806: `FILTER (WHERE ...)` が偽・NULL の行はこの項目のアキュムレータへ
+    // 入れない（他の項目・文の `WHERE`・RLS には影響しない）。
+    if let Some(filter) = &item.filter {
+        if !item_filter_matches(filter, id, vector, scanned, scratch)? {
+            return Ok(());
+        }
+    }
+    let input = &item.input;
     let text_before = accumulator.text_len();
     let (entries_before, bytes_before) = accumulator.distinct_footprint();
     accumulator.observe(input, id, vector, scanned, scratch)?;
@@ -230,6 +238,60 @@ fn observe_with_budgets(
         distinct_budget.charge(delta)?;
     }
     Ok(())
+}
+
+/// 集計項目の `FILTER (WHERE ...)` を 1 行について評価する（SQL-57・Issue #1806）。
+/// 全走査・Fast 経路・索引候補経路（[`observe_with_budgets`]）と `GROUP BY` 経路
+/// （`sql::group_by::accumulate_row`）が共有する唯一の評価点で、文の `WHERE` の SCALAR 段
+/// と同じ意味論（宣言的フィルタ → 式述語〔`Bool(true)` のみ通過。偽・NULL は除外〕→ OR 群）。
+/// 呼び出し時点で可視性判定（RLS）と文の `WHERE` は通過済みであり、本関数はそれらを
+/// 緩めない。FILTER が embedding を参照するのに `vector.values` が `None` の場合は、
+/// 参照列の導出漏れ（実装バグ）として `XX000` で fail-closed にする。
+pub(crate) fn item_filter_matches(
+    filter: &crate::sql::parser::BoundAggregateFilter,
+    id: u64,
+    vector: &RowVector<'_>,
+    scanned: &[Option<row_codec::ScalarRef<'_>>],
+    scratch: &mut Vec<StackValue>,
+) -> Result<bool, SqlSurfaceError> {
+    if !declarative_filter::matches_all(&filter.metadata_filters, scanned) {
+        return Ok(false);
+    }
+    for (expr, program) in filter.expr_filters.iter().zip(&filter.expr_filter_programs) {
+        let embedding: &[f32] = if udf_call::references_embedding(expr) {
+            vector.values.ok_or_else(|| {
+                accumulator_bug(
+                    "FILTER expression references the VECTOR column but it was not decoded",
+                )
+            })?
+        } else {
+            &[]
+        };
+        match program.eval(id, embedding, scanned, scratch)? {
+            ExprValue::Bool(true) => {}
+            ExprValue::Bool(false) | ExprValue::Null => return Ok(false),
+            _ => {
+                return Err(SqlSurfaceError::invalid_input(
+                    "FILTER expression did not evaluate to a boolean",
+                ))
+            }
+        }
+    }
+    for group in &filter.or_filters {
+        let embedding: &[f32] = if group.references_embedding() {
+            vector.values.ok_or_else(|| {
+                accumulator_bug(
+                    "FILTER expression references the VECTOR column but it was not decoded",
+                )
+            })?
+        } else {
+            &[]
+        };
+        if !group.matches(scanned, id, embedding, vector.dim as usize, scratch)? {
+            return Ok(false);
+        }
+    }
+    Ok(true)
 }
 
 /// 可視行 1 件から取り出した `VECTOR` 列の値のビュー（Issue #350）。
@@ -296,6 +358,34 @@ impl ReferencedColumns {
         let mut has_scalar_reference = false;
 
         for item in items {
+            // SQL-57・Issue #1806: `FILTER (WHERE ...)` の参照列・embedding を文の `WHERE`
+            // と同じ手順で反映する（漏れると縮小デコードした行で条件が NULL と取り違えられ、
+            // 黙った誤集計になる）。FILTER つき項目があれば `has_scalar_reference` を立て、
+            // 行を観測しない `DecodeTier::Fast`（visible cache 経路）を構造的に選ばせない。
+            if let Some(filter) = &item.filter {
+                has_scalar_reference = true;
+                for f in &filter.metadata_filters {
+                    if let Some(slot) = scalar_mask.get_mut(f.column_index()) {
+                        *slot = true;
+                    }
+                }
+                for expr in &filter.expr_filters {
+                    if udf_call::references_embedding(expr) {
+                        needs_embedding = true;
+                    }
+                    udf_call::mark_referenced_scalar_columns(expr, &mut scalar_mask);
+                }
+                for group in &filter.or_filters {
+                    group.visit_column_indices(&mut |idx| {
+                        if let Some(slot) = scalar_mask.get_mut(idx) {
+                            *slot = true;
+                        }
+                    });
+                    if group.references_embedding() {
+                        needs_embedding = true;
+                    }
+                }
+            }
             match &item.input {
                 AggregateInput::TextColumn(index)
                 | AggregateInput::CollatedTextColumn { index, .. }
@@ -2594,7 +2684,7 @@ pub(crate) fn execute_aggregate_with_group_limits(
                     for (accumulator, item) in accumulators.iter_mut().zip(&bound.items) {
                         observe_with_budgets(
                             accumulator,
-                            &item.input,
+                            item,
                             id,
                             &empty_vector,
                             &[],
@@ -2859,7 +2949,7 @@ pub(crate) fn execute_aggregate_with_group_limits(
             for (accumulator, item) in accumulators.iter_mut().zip(&bound.items) {
                 observe_with_budgets(
                     accumulator,
-                    &item.input,
+                    item,
                     id,
                     &vector,
                     &scanned,
@@ -3139,6 +3229,9 @@ pub(crate) fn count_star_only(items: &[crate::sql::parser::BoundAggregateItem]) 
                 // 除外する（索引経由の候補数カウントは異なり値の判定を行わない
                 // ため、`distinct` 項目を誤って通すと不正な結果になる）。
                 && !item.distinct
+                // SQL-57・Issue #1806: `FILTER` つきは行ごとの判定が要るため、索引由来の
+                // 候補数をそのまま加算する近道は使えない（全走査・候補再適用へ落とす）。
+                && item.filter.is_none()
         })
 }
 
@@ -3538,7 +3631,7 @@ pub(crate) fn observe_candidate_slots(
         for (accumulator, item) in accumulators.iter_mut().zip(&bound.items) {
             observe_with_budgets(
                 accumulator,
-                &item.input,
+                item,
                 id,
                 &vector,
                 &scanned,
@@ -3795,6 +3888,7 @@ mod tests {
                 input,
                 name: "result".to_string(),
                 distinct: false,
+                filter: None,
             }],
             metadata_filters: Vec::new(),
             expr_filters: Vec::new(),
@@ -3820,6 +3914,7 @@ mod tests {
                 input: input.clone(),
                 name: format!("result_{i}"),
                 distinct: false,
+                filter: None,
             })
             .collect();
         let projection = (0..count)
@@ -5038,6 +5133,7 @@ mod tests {
                 input: input.clone(),
                 name: "result".to_string(),
                 distinct: false,
+                filter: None,
             }];
             let referenced = ReferencedColumns::derive(&schema, &items, &[], &[], &[], &[]);
             assert!(
@@ -5079,9 +5175,53 @@ mod tests {
             input: AggregateInput::AllVisible,
             name: "result".to_string(),
             distinct: false,
+            filter: None,
         }];
         let referenced = ReferencedColumns::derive(&schema, &items, &[], &[], &[], &[]);
         assert_eq!(select_decode_tier(&referenced, false), DecodeTier::Fast);
+    }
+
+    /// SQL-57・Issue #1806: FILTER つきの `COUNT(*)` は、FILTER の参照列を `scalar_mask` へ
+    /// 反映し、`DecodeTier::Fast`（行を観測しない近道）を選ばず、件数近道も使わない。
+    #[test]
+    fn derive_marks_filter_columns_and_disables_row_skipping_shortcuts() {
+        let schema = many_new_scalar_types_schema();
+        let filter = crate::sql::parser::BoundAggregateFilter {
+            metadata_filters: vec![declarative_filter::MetadataFilter::for_test(
+                2,
+                declarative_filter::FilterOp::BoolEquals(true),
+            )],
+            expr_filters: Vec::new(),
+            expr_filter_programs: Vec::new(),
+            or_filters: Vec::new(),
+        };
+        let items = vec![BoundAggregateItem {
+            func: AggregateFunc::Count,
+            input: AggregateInput::AllVisible,
+            name: "result".to_string(),
+            distinct: false,
+            filter: Some(Box::new(filter.clone())),
+        }];
+        let referenced = ReferencedColumns::derive(&schema, &items, &[], &[], &[], &[]);
+        assert!(referenced.scalar_mask()[2], "FILTER column must be decoded");
+        assert!(!referenced.needs_embedding());
+        assert_eq!(
+            select_decode_tier(&referenced, false),
+            DecodeTier::DimAndScalar
+        );
+        assert!(!count_star_only(&items));
+        // 評価: 参照列が真の行だけを通し、NULL・偽は除外する。
+        let vector = RowVector {
+            dim: 0,
+            values: None,
+        };
+        let mut scratch = Vec::new();
+        let hit = [None, None, Some(row_codec::ScalarRef::Bool(true))];
+        let miss = [None, None, Some(row_codec::ScalarRef::Bool(false))];
+        let null = [None, None, None];
+        assert!(item_filter_matches(&filter, 1, &vector, &hit, &mut scratch).unwrap());
+        assert!(!item_filter_matches(&filter, 1, &vector, &miss, &mut scratch).unwrap());
+        assert!(!item_filter_matches(&filter, 1, &vector, &null, &mut scratch).unwrap());
     }
 
     #[test]
@@ -5094,6 +5234,7 @@ mod tests {
             input: AggregateInput::VectorColumnPresence,
             name: "result".to_string(),
             distinct: false,
+            filter: None,
         }];
         let referenced = ReferencedColumns::derive(&schema, &items, &[], &[], &[], &[]);
         assert!(!referenced.needs_embedding());

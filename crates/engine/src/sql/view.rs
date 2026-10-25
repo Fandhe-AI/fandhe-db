@@ -641,6 +641,11 @@ pub(crate) fn check_aggregate_columns_within_view(
                 for k in &agg.order_by {
                     expr_columns_within(columns, &k.expr)?;
                 }
+                // SQL-57・Issue #1806: `FILTER` 条件の参照列も公開列に限定する（非公開列を
+                // 条件経由で推測させない）。
+                for p in &agg.filter {
+                    check_predicate_columns_within(columns, p)?;
+                }
                 effective_names.push(
                     agg.alias
                         .clone()
@@ -661,6 +666,9 @@ pub(crate) fn check_aggregate_columns_within_view(
                     }
                     for k in &agg.order_by {
                         expr_columns_within(columns, &k.expr)?;
+                    }
+                    for p in &agg.filter {
+                        check_predicate_columns_within(columns, p)?;
                     }
                 }
                 for c in crate::sql::allowlist::expr_bare_idents(expr) {
