@@ -26,12 +26,12 @@
 //! 呼び出し元: `core.rs` の autocommit 腕・明示トランザクション腕の `ParsedSql::InsertSelect`
 //! （入口は `execute_parsed_insert_select`。束縛は #1732 の `sql::insert_select::bind`）。
 
+use super::write_input_cap::WriteInputCap;
 use super::EngineCore;
 use crate::catalog::{CatalogError, TableSchema};
 use crate::policy::PolicyContext;
 use crate::recovery::content_hash::ContentHash;
 use crate::recovery::required_op_id::OperationId;
-use crate::result_limits::{ResultLimits, MAX_RESULT_ROWS_HARD_CAP};
 use crate::sql::allowlist::{OnConflictClause, Projection, SqlSurfaceError, Statement};
 use crate::sql::exec::{InsertOutcome, QueryResult, ReturningOutcome};
 use crate::sql::insert_select::{resolve_target_columns, rows_to_bound_inserts, ConversionPlan};
@@ -65,17 +65,13 @@ pub(super) struct InsertSelectRequest<'a> {
     /// `ON CONFLICT` 句（Issue #2614）。ある場合は結果行を VALUES 形と同じ UPSERT 経路
     /// （`sql::exec::execute_upsert_in`）へ流す。`None` は従来の INSERT 経路。
     pub on_conflict: Option<&'a OnConflictClause>,
+    /// 構文段が内側 SELECT へ `LIMIT cap+1` を注入した文か（`ValidatedInsertSelect::implicit_limit` 由来）。
+    /// 注入した文はハード上限の 1 つ手前へ丸めた上限、注入しない文は設定値そのものを使う
+    /// （`core/write_input_cap.rs`。Issue #2212）。
+    pub limit_injected: bool,
 }
 
 impl EngineCore {
-    /// 内側 SELECT の行数上限。`--max-result-rows` を上限に、`+1` で超過を検出するため
-    /// ハード上限の 1 つ手前へ丸める（matview の文脈ごと上限と同じ式。fail-closed）。
-    pub(super) fn insert_select_row_cap(&self) -> usize {
-        self.result_limits
-            .max_result_rows()
-            .min(MAX_RESULT_ROWS_HARD_CAP.saturating_sub(1))
-    }
-
     /// `ParsedSql::InsertSelect` の実行腕から呼ぶ入口（SQL-51・Issue #1732・#1733）。束縛（列数・型の
     /// 静的照合。内側 SELECT の結果列メタは Describe で導出）を挿入より前に通し、検証済みの文を
     /// [`InsertSelectRequest`] へ詰めて [`Self::execute_insert_select`] へ渡す。`ON CONFLICT` 句は
@@ -102,6 +98,7 @@ impl EngineCore {
                 statement_hash: stmt.statement_hash,
                 returning: stmt.returning.as_ref(),
                 on_conflict: stmt.on_conflict.as_ref(),
+                limit_injected: stmt.implicit_limit.is_some(),
             },
         )
     }
@@ -159,13 +156,16 @@ impl EngineCore {
             &req.statement_hash,
         )?;
 
-        let cap = self.insert_select_row_cap();
-        let fetch = cap
-            .checked_add(1)
-            .ok_or_else(|| SqlSurfaceError::Internal {
-                detail: "internal error".to_string(),
-            })?;
-        let limits = ResultLimits::new(fetch);
+        // 入力側の上限は行 SELECT と同じ `--max-result-rows`（SQL-34・Issue #2212。算出は共有ヘルパー）。
+        let WriteInputCap {
+            cap,
+            eval_limits: limits,
+            ..
+        } = if req.limit_injected {
+            self.write_input_cap_injected()?
+        } else {
+            self.write_input_cap()?
+        };
 
         // 時刻は文の先頭で 1 度だけ確定し、内側 SELECT の `now()` と省略列の `DEFAULT now()` で共有する
         // （SQL-37・Issue #2188）。外側の式スコープ（明示トランザクション等）が確定済みならそれを使い、
@@ -351,6 +351,7 @@ impl EngineCore {
 mod tests {
     use super::*;
     use crate::catalog::{ColumnDef, ColumnType};
+    use crate::result_limits::ResultLimits;
     use crate::sql::exec::Cell;
     use crate::storage::{Storage, Visibility};
     use crate::test_util::temp_db::tempdir;
@@ -447,6 +448,7 @@ mod tests {
                 statement_hash: test_stmt_hash("dst", select),
                 returning: None,
                 on_conflict: None,
+                limit_injected: false,
             },
         )
     }
@@ -478,6 +480,7 @@ mod tests {
                     statement_hash: test_stmt_hash("t", "s389"),
                     returning: None,
                     on_conflict: None,
+                    limit_injected: false,
                 },
             )
             .expect("const select insert");
@@ -558,7 +561,7 @@ mod tests {
         let err = insert_select(
             &core,
             &a,
-            "SELECT id, embedding, lang FROM src LIMIT 3",
+            "SELECT id, embedding, lang FROM src",
             "op-is-cap",
         )
         .unwrap_err();
@@ -693,6 +696,7 @@ mod tests {
                     statement_hash: test_stmt_hash("t", "s578"),
                     returning: Some(&projection),
                     on_conflict: None,
+                    limit_injected: false,
                 },
             )
             .expect("insert select returning");
@@ -750,6 +754,7 @@ mod tests {
                     statement_hash: test_stmt_hash("t", "s634"),
                     returning: Some(&projection),
                     on_conflict: None,
+                    limit_injected: false,
                 },
             )
             .expect("insert select");
@@ -823,6 +828,7 @@ mod tests {
                 statement_hash: test_stmt_hash(table, select),
                 returning: None,
                 on_conflict: None,
+                limit_injected: false,
             },
         )
     }
@@ -1082,6 +1088,7 @@ mod tests {
                     statement_hash: test_stmt_hash("dst", ALL_SRC),
                     returning: None,
                     on_conflict: None,
+                    limit_injected: false,
                 },
             )
             .unwrap_err();

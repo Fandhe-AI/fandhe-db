@@ -33,6 +33,7 @@
 | `USING PLAN` の前段検証（LLM 呼び出しより前に拒否） | 効く |
 | NoSQL（HTTP）`search`／`scan`／`explain` の `limit` | 効く |
 | `LIMIT` 省略・`LIMIT ALL`・`OFFSET` 単独の結果行数（超過は `54000`。Issue #1796） | 効く |
+| 書き込み・実体化の入力行数（`INSERT ... SELECT`・CTAS・MATERIALIZED VIEW・COPY TO。超過は `54000`。Issue #2212） | 効く（評価後射影形 matview 本文の暗黙上限は既定値と `cap + 1` の大きい方） |
 | `OFFSET` の範囲（`0..=10000`） | 連動しない |
 | 集合演算の枝・全体件数（`MAX_SET_OP_ROWS`＝10,000 固定）・`GROUP BY` のグループ数・JOIN の出力行数 | 連動しない（上げても先にこれらで `54000` になりうる。Issue #2211 で挙動を固定） |
 | 集合演算の枝 `LIMIT`・サブクエリ／CTE／ビュー本文内側の `LIMIT` | 連動しない（既定の 10,000 のまま。各々の行数上限が別軸で有界） |

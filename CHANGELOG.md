@@ -10,6 +10,14 @@
 ### Added
 
 - `--max-result-rows` の受け入れ条件（既定 10,000 の境界・上げた側とハード上限 100,000 の境界・超過時に DataRow を送らない）をテストで固定し、README と設計記録を `LIMIT` 省略時の上限の現状に整合（Issue #2211・SQL-34。挙動変更なし）。
+- jsonpath の `like_regex` を評価する（Issue #2677・SQL-55・TABLE-25）。`jsonb_path_*`・`@?`／`@@`・`JSON_EXISTS` 等が
+  PG 17 と同じ結果を返す。フラグ `i`・`s`・`m`・`q` を受理し、`x`（`q` なし）は `0A000`、正規表現の構文誤りは `2201B`、
+  上限超過は `54000`。1 つの jsonpath が持てる `like_regex` は 16 個まで（超過は `54000`）。
+  `parse_jsonpath_with_regex_limits` と `regex_match::RegexSyntaxOptions` を追加。
+  詳細は [regex-matcher.md](docs/design/regex-matcher.md)。
+- `INSERT ... SELECT`・CTAS・MATERIALIZED VIEW の入力行数上限の算出を共有化した（Issue #2212・SQL-34）。設定が
+  ハード上限（100,000）のとき、LIMIT を注入しない形は 99,999 行ではなく 100,000 行まで通る。matview の評価後射影形
+  （`GROUP BY` 等）の本文は `--max-result-rows` を既定値より上げると上限も上がる。超過は従来どおり書き込み前に `54000`。
 - `LIMIT` 省略・`LIMIT ALL` の結果行数上限超過（`54000`）を、`cap + 1` 件目の確定時点で走査・結合・集約を中断して返す（Issue #1797・SQL-34）。
   広域取得・ウィンドウ・HAVING なしの `GROUP BY`／`SELECT DISTINCT`・残余述語なしの JOIN が対象で、上限を超える行は保持しない。
   エラーコードと文言は変わらない。
@@ -64,6 +72,9 @@
 
 ### Breaking Changes
 
+- jsonpath の `like_regex` 配線（Issue #2677）に伴う公開型の変更。`PathNode::LikeRegex` に `matcher: LikeRegexMatcher` を追加、
+  `JsonPathParseError` に `Regex(RegexError)`・`TooManyRegex`、`JsonPathEvalError` に `RegexInputTooLong` を追加し、
+  `RegexNotSupported` は `x` フラグ専用になった。従来 `like_regex` を一律 `0A000` で拒否していた挙動が変わる。
 - `sql::lexer::Token`・`sql::udf_call::Expr`・`sql::udf_call::BoundExpr`・`sql::allowlist::SqlSurfaceError`（Issue #1787・SQL-55）:
   variant を追加した（`Token::RegexMatch`／`RegexMatchCi`／`RegexNotMatch`／`RegexNotMatchCi`、`Expr::RegexMatch`、
   `BoundExpr::RegexMatch`、`SqlSurfaceError::Regex`）。網羅 `match` する外部コードは腕を足す

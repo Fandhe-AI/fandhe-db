@@ -312,7 +312,10 @@ fn path_literal_errors_are_raised_at_bind_time_even_without_rows() {
         ("$.", "42601"),
         ("", "22P02"),
         (r#""\u0000""#, "22P05"),
-        (r#"$ ? (@ like_regex "a")"#, "0A000"),
+        // like_regex は Issue #2677 で束縛時にコンパイルされる（SQL-55）。
+        (r#"$ ? (@ like_regex "a" flag "x")"#, "0A000"),
+        (r#"$ ? (@ like_regex "(")"#, "2201B"),
+        (r#"$ ? (@ like_regex "(a)\\1")"#, "0A000"),
     ] {
         let sql = format!("SELECT jsonb_path_exists(docb, '{lit}') FROM {TABLE} LIMIT 1");
         assert_eq!(code(&core, &alice, &sql), wire, "{lit:?}");
@@ -515,4 +518,199 @@ fn unsupported_contexts_match_existing_jsonb_functions() {
             assert_eq!(x, y, "{new}");
         }
     }
+}
+
+// --- like_regex（Issue #2677。SQL-55・TABLE-25） ---
+
+#[test]
+fn like_regex_evaluates_through_every_path_function() {
+    let (core, _g, alice) = setup();
+    assert_eq!(
+        cell(
+            &core,
+            &alice,
+            r#"jsonb_path_exists(docb, '$ ? (@.b.c like_regex "^x$")')"#,
+            1
+        ),
+        Cell::Bool(true)
+    );
+    assert_eq!(
+        cell(
+            &core,
+            &alice,
+            r#"jsonb_path_exists(docb, '$ ? (@.b.c like_regex "X")')"#,
+            1
+        ),
+        Cell::Bool(false)
+    );
+    assert_eq!(
+        cell(
+            &core,
+            &alice,
+            r#"jsonb_path_exists(docb, '$ ? (@.b.c like_regex "X" flag "i")')"#,
+            1
+        ),
+        Cell::Bool(true)
+    );
+    assert_eq!(
+        cell(
+            &core,
+            &alice,
+            r#"jsonb_path_match(docb, '$.b.c like_regex "x"')"#,
+            1
+        ),
+        Cell::Bool(true)
+    );
+    assert_eq!(
+        cell(
+            &core,
+            &alice,
+            r#"jsonb_path_query_first(docb, '$.b ? (@.c like_regex "x").c')"#,
+            1
+        ),
+        json("\"x\"")
+    );
+    // 文字列でない項目は unknown（フィルタを通らない）。
+    assert_eq!(
+        cell(
+            &core,
+            &alice,
+            r#"jsonb_path_query_array(docb, '$.a[*] ? (@ like_regex "1")')"#,
+            1
+        ),
+        json("[]")
+    );
+    assert_eq!(
+        matching(&core, &alice, r#"docb @? '$ ? (@.b.c like_regex "x")'"#),
+        vec![1]
+    );
+    assert_eq!(
+        matching(&core, &alice, r#"docb @@ '$.b.c like_regex "x"'"#),
+        vec![1]
+    );
+}
+
+#[test]
+fn like_regex_respects_configured_regex_limits() {
+    use engine::regex_limits::RegexLimits;
+    let alice = ctx_for("alice");
+    let path = unique_db_path("json-path-functions-regex-limits");
+    let _g = CleanupGuard(path.clone());
+    let storage = Storage::open(&path).expect("open storage");
+    storage.create_table(&schema()).expect("create table");
+    let core = EngineCore::from_storage(storage, Box::new(CpuScalarProvider))
+        .with_regex_limits(RegexLimits::new(4, 64, 1024 * 1024));
+    seed(&core, &alice, &[Some(DOC)]);
+    // パターン長 4 は受理、5 は束縛時に 54000。
+    assert_eq!(
+        cell(
+            &core,
+            &alice,
+            r#"jsonb_path_exists(docb, '$ ? (@.b.c like_regex "x{1}")')"#,
+            1
+        ),
+        Cell::Bool(true)
+    );
+    assert_eq!(
+        err_code(
+            &core,
+            &alice,
+            r#"jsonb_path_exists(docb, '$ ? (@.b.c like_regex "x{1,2}")')"#,
+            1
+        ),
+        "54000"
+    );
+}
+
+#[test]
+fn like_regex_input_over_limit_is_54000_even_when_silent() {
+    use engine::regex_limits::RegexLimits;
+    let alice = ctx_for("alice");
+    let path = unique_db_path("json-path-functions-regex-input");
+    let _g = CleanupGuard(path.clone());
+    let storage = Storage::open(&path).expect("open storage");
+    storage.create_table(&schema()).expect("create table");
+    let core = EngineCore::from_storage(storage, Box::new(CpuScalarProvider))
+        .with_regex_limits(RegexLimits::new(64, 3, 1024 * 1024));
+    seed(&core, &alice, &[Some(r#"{"s":"abcd","t":"abc"}"#)]);
+    assert_eq!(
+        err_code(
+            &core,
+            &alice,
+            r#"jsonb_path_exists(docb, '$ ? (@.s like_regex "a")', '{}', true)"#,
+            1
+        ),
+        "54000"
+    );
+    assert_eq!(
+        cell(
+            &core,
+            &alice,
+            r#"jsonb_path_exists(docb, '$ ? (@.t like_regex "a")', '{}', true)"#,
+            1
+        ),
+        Cell::Bool(true)
+    );
+}
+
+#[test]
+fn like_regex_count_limit_and_error_texts_do_not_echo_pattern() {
+    let (core, _g, alice) = setup();
+    let many = |n: usize| {
+        let preds = vec![r#"@.b.c like_regex "x""#; n].join(" || ");
+        format!(r#"jsonb_path_exists(docb, '$ ? ({preds})')"#)
+    };
+    assert_eq!(
+        cell(
+            &core,
+            &alice,
+            &many(engine::json::jsonpath::MAX_JSONPATH_LIKE_REGEX),
+            1
+        ),
+        Cell::Bool(true)
+    );
+    assert_eq!(
+        err_code(
+            &core,
+            &alice,
+            &many(engine::json::jsonpath::MAX_JSONPATH_LIKE_REGEX + 1),
+            1
+        ),
+        "54000"
+    );
+    for lit in [
+        r#"$ ? (@ like_regex "secret(")"#,
+        r#"$ ? (@ like_regex "secret" flag "x")"#,
+        r#"$ ? (@ like_regex "(secret)\\1")"#,
+    ] {
+        let e = core
+            .execute_sql(
+                &alice,
+                &format!("SELECT jsonb_path_exists(docb, '{lit}') FROM {TABLE} LIMIT 1"),
+            )
+            .expect_err("bind-time error");
+        assert!(!e.to_string().contains("secret"), "{lit}");
+    }
+}
+
+#[test]
+fn like_regex_never_exposes_other_tenants_rows() {
+    let (core, _g, alice) = setup();
+    let bob = ctx_for("bob");
+    assert_eq!(
+        matching(
+            &core,
+            &bob,
+            r#"jsonb_path_exists(docb, '$ ? (@.b.c like_regex "x")')"#
+        ),
+        Vec::<i64>::new()
+    );
+    assert_eq!(
+        matching(
+            &core,
+            &alice,
+            r#"jsonb_path_exists(docb, '$ ? (@.b.c like_regex "x")')"#
+        ),
+        vec![1]
+    );
 }

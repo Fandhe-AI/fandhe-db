@@ -62,8 +62,26 @@ struct Prefix {
     literal: bool,
     /// 大文字小文字を区別しない（`~*` または `(?i)`。`(?c)` は区別する側へ上書き）。
     insensitive: bool,
+    /// 改行区別（`.`・否定ブラケットが `\n` にマッチしない）。埋め込み `(?s)` で解除される。
+    newline_stop: bool,
+    /// `^`／`$` の行境界化。埋め込み `(?s)` で解除される（PG はフラグを上書きする）。
+    newline_anchor: bool,
     /// パターン本体の開始位置（文字単位）。
     start: usize,
+}
+
+/// 変換の入力オプション。`~`／`SIMILAR TO` は既定値（すべて false）で呼ぶ。`like_regex` の
+/// フラグ（Issue #2677）は呼び出し側 [`super::CompiledRegex::compile_with_options`] が写す。
+#[derive(Debug, Clone, Copy, Default)]
+pub(super) struct TranslateOptions {
+    /// ASCII 英字の大文字小文字を区別しない。
+    pub insensitive: bool,
+    /// 改行区別（PG の REG_NLSTOP 相当。`.` と否定ブラケットが `\n` にマッチしない）。
+    pub newline_stop: bool,
+    /// `^`／`$` が改行の直後・直前でもマッチする（REG_NLANCH 相当）。
+    pub newline_anchor: bool,
+    /// パターン全体をリテラルとして扱う（`like_regex` の `q` フラグ）。
+    pub quote: bool,
 }
 
 const DIGITS: &str = "0-9";
@@ -124,10 +142,17 @@ fn hex_val(c: char) -> Option<u32> {
 }
 
 /// 先頭の director（`***:`／`***=`）と埋め込みオプション（`(?letters)`）を解析する。
-fn parse_prefix(chars: &[char], base_insensitive: bool) -> Res<Prefix> {
+fn parse_prefix(
+    chars: &[char],
+    base_insensitive: bool,
+    base_newline_stop: bool,
+    base_newline_anchor: bool,
+) -> Res<Prefix> {
     let mut cur = Cursor { chars, pos: 0 };
     let mut literal = false;
     let mut insensitive = base_insensitive;
+    let mut newline_stop = base_newline_stop;
+    let mut newline_anchor = base_newline_anchor;
     if cur.starts_with("***") {
         match cur.peek_at(3) {
             Some(':') => cur.pos = 4,
@@ -149,8 +174,13 @@ fn parse_prefix(chars: &[char], base_insensitive: bool) -> Res<Prefix> {
                         Some('c') => insensitive = false,
                         Some('i') => insensitive = true,
                         Some('q') => literal = true,
-                        // 受理される既定・同義のオプション。
-                        Some('s') | Some('t') => {}
+                        // `s`: 改行区別と行アンカーを外す（`~` の既定と同じ。`like_regex` の `m` も
+                        // 上書きされる）。`t`: 効果なし。
+                        Some('s') => {
+                            newline_stop = false;
+                            newline_anchor = false;
+                        }
+                        Some('t') => {}
                         // PG は受理するが意味論が異なる（BRE/ERE・newline-sensitive・拡張構文等）。
                         Some('b' | 'e' | 'm' | 'n' | 'p' | 'w' | 'x') => {
                             return Err(TranslateError::Unsupported)
@@ -165,6 +195,8 @@ fn parse_prefix(chars: &[char], base_insensitive: bool) -> Res<Prefix> {
     Ok(Prefix {
         literal,
         insensitive,
+        newline_stop,
+        newline_anchor,
         start: cur.pos,
     })
 }
@@ -277,7 +309,12 @@ fn fold_ranges(items: &mut Vec<Item>) {
 }
 
 /// ブラケット式（`[` を消費済みの位置から）を解析して `out` へ出力する。
-fn bracket(cur: &mut Cursor<'_>, out: &mut String, insensitive: bool) -> Res<()> {
+fn bracket(
+    cur: &mut Cursor<'_>,
+    out: &mut String,
+    insensitive: bool,
+    newline_stop: bool,
+) -> Res<()> {
     let negated = cur.peek() == Some('^');
     if negated {
         cur.pos = cur.pos.saturating_add(1);
@@ -426,6 +463,10 @@ fn bracket(cur: &mut Cursor<'_>, out: &mut String, insensitive: bool) -> Res<()>
     if insensitive {
         fold_ranges(&mut items);
     }
+    // 改行区別では否定ブラケットも `\n` にマッチしない（折り畳みの後に除外集合へ足す）。
+    if negated && newline_stop {
+        items.push(Item::Range('\n', '\n'));
+    }
     out.push('[');
     if negated {
         out.push('^');
@@ -487,12 +528,27 @@ fn read_bound(cur: &mut Cursor<'_>, out: &mut String) -> Res<()> {
     Ok(())
 }
 
-/// PG の ARE を `regex` 構文へ変換する。`base_insensitive` は `~*` 相当（`AsciiInsensitive`）。
+/// PG の ARE を `regex` 構文へ変換する。`opts.insensitive` は `~*` 相当（`AsciiInsensitive`）。
 /// 呼び出し側（`regex_match`）がパターン長の上限を検査済みである前提。
-pub(super) fn translate(pattern: &str, base_insensitive: bool) -> Res<String> {
+pub(super) fn translate(pattern: &str, opts: TranslateOptions) -> Res<String> {
     let chars: Vec<char> = pattern.chars().collect();
-    let prefix = parse_prefix(&chars, base_insensitive)?;
+    if opts.quote {
+        // `like_regex` の `q`: director・埋め込みオプションも解釈せず全体をリテラルにする。
+        let mut out = String::new();
+        for &c in &chars {
+            push_literal(&mut out, c, opts.insensitive);
+        }
+        return Ok(out);
+    }
+    let prefix = parse_prefix(
+        &chars,
+        opts.insensitive,
+        opts.newline_stop,
+        opts.newline_anchor,
+    )?;
     let insensitive = prefix.insensitive;
+    let newline_stop = prefix.newline_stop;
+    let newline_anchor = prefix.newline_anchor;
     let mut cur = Cursor {
         chars: &chars,
         pos: prefix.start,
@@ -566,15 +622,15 @@ pub(super) fn translate(pattern: &str, base_insensitive: bool) -> Res<String> {
                 last = Last::Quantifier;
             }
             '.' => {
-                out.push_str("(?s:.)");
+                out.push_str(if newline_stop { "[^\\x{a}]" } else { "(?s:.)" });
                 last = Last::Atom;
             }
             '^' => {
-                out.push_str("\\A");
+                out.push_str(if newline_anchor { "(?m:^)" } else { "\\A" });
                 last = Last::Anchor;
             }
             '$' => {
-                out.push_str("\\z");
+                out.push_str(if newline_anchor { "(?m:$)" } else { "\\z" });
                 last = Last::Anchor;
             }
             '[' => {
@@ -587,7 +643,7 @@ pub(super) fn translate(pattern: &str, base_insensitive: bool) -> Res<String> {
                     out.push_str("(?-u:\\b{end})");
                     last = Last::Anchor;
                 } else {
-                    bracket(&mut cur, &mut out, insensitive)?;
+                    bracket(&mut cur, &mut out, insensitive, newline_stop)?;
                     last = Last::Atom;
                 }
             }
@@ -678,7 +734,13 @@ mod tests {
     use super::*;
 
     fn t(p: &str) -> Result<String, TranslateError> {
-        translate(p, false)
+        translate(p, TranslateOptions::default())
+    }
+
+    fn to(p: &str, f: impl FnOnce(&mut TranslateOptions)) -> Result<String, TranslateError> {
+        let mut o = TranslateOptions::default();
+        f(&mut o);
+        translate(p, o)
     }
 
     #[test]
@@ -689,8 +751,8 @@ mod tests {
 
     #[test]
     fn insensitive_expands_ascii_letters_only() {
-        assert_eq!(translate("aé", true).unwrap(), "[Aa]é");
-        assert_eq!(translate("[a-c]", true).unwrap(), "[a-cA-C]");
+        assert_eq!(to("aé", |o| o.insensitive = true).unwrap(), "[Aa]é");
+        assert_eq!(to("[a-c]", |o| o.insensitive = true).unwrap(), "[a-cA-C]");
     }
 
     #[test]
@@ -756,5 +818,44 @@ mod tests {
         assert!(t("a{255}").is_ok());
         assert_eq!(t("a{256}"), Err(TranslateError::Syntax));
         assert!(t("a{0,255}").is_ok());
+    }
+
+    #[test]
+    fn newline_stop_maps_dot_and_negated_bracket() {
+        let ns = |p: &str| to(p, |o| o.newline_stop = true).unwrap();
+        assert_eq!(ns("a.b"), "a[^\\x{a}]b");
+        assert_eq!(ns("[^x]"), "[^x\\x{a}]");
+        // 否定形のクラス（`\D`・`\W`）は PG の実測で `\n` にマッチするため変えない。
+        assert_eq!(ns("\\D"), "[^0-9]");
+        assert_eq!(ns("\\W"), "[^0-9A-Za-z_]");
+        // 埋め込み `(?s)` は改行区別を外す。
+        assert_eq!(ns("(?s)a.b"), "a(?s:.)b");
+        // `t` は効果なし。
+        assert_eq!(ns("(?t)a.b"), "a[^\\x{a}]b");
+    }
+
+    #[test]
+    fn newline_anchor_maps_caret_and_dollar_only() {
+        let na = |p: &str| to(p, |o| o.newline_anchor = true).unwrap();
+        assert_eq!(na("^a$"), "(?m:^)a(?m:$)");
+        assert_eq!(na("\\Aa\\Z"), "\\Aa\\z");
+        // 埋め込み `(?s)` は行アンカーも外す。
+        assert_eq!(na("(?s)^a$"), "\\Aa\\z");
+    }
+
+    #[test]
+    fn quote_treats_everything_as_literal() {
+        let q = |p: &str| to(p, |o| o.quote = true);
+        assert_eq!(q("a.b").unwrap(), "a\\x{2e}b");
+        assert_eq!(q("***=").unwrap(), "\\x{2a}\\x{2a}\\x{2a}\\x{3d}");
+        assert_eq!(q("(?i)").unwrap(), "\\x{28}\\x{3f}i\\x{29}");
+        assert_eq!(
+            to("a.", |o| {
+                o.quote = true;
+                o.insensitive = true
+            })
+            .unwrap(),
+            "[Aa]\\x{2e}"
+        );
     }
 }

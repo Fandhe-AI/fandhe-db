@@ -24,14 +24,15 @@
 //!   [`MAX_SEQUENCE_ITEMS`] を検査する。`.**` の JSON 走査は再帰でなく明示スタックで行う。
 //!
 //! 意図的な差分（`docs/design/json-expr-type-mapping.md` に記録）: 数値演算は `i128`／
-//! `scale <= 38` に収まる範囲（超過は `22003`）、`.keyvalue()` の `id`、datetime 系メソッドと
-//! `like_regex` は `0A000`、文字列比較はバイト順、エラー文言は固定の英語文で PostgreSQL と
+//! `scale <= 38` に収まる範囲（超過は `22003`）、`.keyvalue()` の `id`、datetime 系メソッドは
+//! `0A000`（`like_regex` は Issue #2677 で配線済み。正規表現の意味差は `docs/design/regex-matcher.md`）、文字列比較はバイト順、エラー文言は固定の英語文で PostgreSQL と
 //! 一致させない（入力の断片を含めない）。
 
 use std::borrow::Cow;
 use std::cmp::Ordering;
 use std::collections::{BTreeMap, HashMap};
 
+use super::ast::LikeRegexMatcher;
 use super::ast::{
     AccessorOp, AnyLevel, ArithOp, CompareOp, Method, PathMode, PathNode, PathNumeric, SqlJsonPath,
     StartsWithOperand, UnaryOp,
@@ -106,7 +107,9 @@ pub enum JsonPathEvalError {
     DepthLimitExceeded,
     /// 評価器が作る値・項目列の大きさ上限超過（`54000`）。抑止不可。
     ResultTooLarge,
-    /// 未対応機能（datetime 系メソッド・`like_regex`。`0A000`）。抑止不可。
+    /// `like_regex` の入力文字列が正規表現入力長の上限を超えた（`54000`）。抑止不可。
+    RegexInputTooLong,
+    /// 未対応機能（datetime 系メソッド等。`0A000`）。抑止不可。
     Unsupported,
     /// 解析器が排除しているはずの不整合（`XX000`）。抑止不可。
     Internal,
@@ -161,7 +164,8 @@ impl ClassifiedError for JsonPathEvalError {
             }
             JsonPathEvalError::StepLimitExceeded
             | JsonPathEvalError::DepthLimitExceeded
-            | JsonPathEvalError::ResultTooLarge => ErrorClass::PayloadTooLarge,
+            | JsonPathEvalError::ResultTooLarge
+            | JsonPathEvalError::RegexInputTooLong => ErrorClass::PayloadTooLarge,
             JsonPathEvalError::Unsupported => ErrorClass::FeatureNotSupported,
             JsonPathEvalError::Internal => ErrorClass::InternalError,
         }
@@ -203,6 +207,7 @@ impl ClassifiedError for JsonPathEvalError {
             JsonPathEvalError::StepLimitExceeded => "jsonpath evaluation exceeds the step limit",
             JsonPathEvalError::DepthLimitExceeded => "jsonpath evaluation exceeds the depth limit",
             JsonPathEvalError::ResultTooLarge => "jsonpath evaluation result is too large",
+            JsonPathEvalError::RegexInputTooLong => "like_regex input is too long",
             JsonPathEvalError::Unsupported => "jsonpath feature is not supported",
             JsonPathEvalError::Internal => "internal jsonpath evaluation error",
         }
@@ -1832,7 +1837,7 @@ impl<'a> Ev<'a> {
             PathNode::Compare { op, lhs, rhs } => self.bool_compare(*op, lhs, rhs, jb),
             PathNode::StartsWith { lhs, prefix } => self.bool_starts_with(lhs, prefix, jb),
             PathNode::Exists(arg) => self.bool_exists(arg, jb),
-            PathNode::LikeRegex { .. } => Err(hard(JsonPathEvalError::Unsupported)),
+            PathNode::LikeRegex { lhs, matcher, .. } => self.bool_like_regex(lhs, matcher, jb),
             _ => Err(hard(JsonPathEvalError::Internal)),
         }
     }
@@ -1873,6 +1878,60 @@ impl<'a> Ev<'a> {
             }
         };
         self.pair_loop(&lseq, &rseq, starts_with_items)
+    }
+
+    /// `like_regex`（Issue #2677）。左辺は lax で配列展開し、文字列でない項目は unknown。
+    /// strict は最初の unknown で unknown、lax は最初の true で true（`pair_loop` と同じ規則）。
+    /// 項目ごとにステップと走査バイト数を課金してから判定し、入力長上限超過は抑止不可の `54000`。
+    #[inline(never)]
+    fn bool_like_regex(
+        &mut self,
+        lhs: &'a PathNode,
+        matcher: &'a LikeRegexMatcher,
+        jb: &Item<'a>,
+    ) -> R<Tri> {
+        let Some(lseq) = self.eval_operand(lhs, jb, true)? else {
+            return Ok(Tri::Unknown);
+        };
+        let strict = !self.lax;
+        let mut error = false;
+        let mut hit = false;
+        for l in &lseq {
+            self.tick(1)?;
+            let verdict = match l.str() {
+                None => Tri::Unknown,
+                Some(s) => {
+                    self.charge_scan(s.len())?;
+                    match matcher.is_match(s) {
+                        Ok(true) => Tri::True,
+                        Ok(false) => Tri::False,
+                        Err(_) => return Err(hard(JsonPathEvalError::RegexInputTooLong)),
+                    }
+                }
+            };
+            match verdict {
+                Tri::Unknown => {
+                    if strict {
+                        return Ok(Tri::Unknown);
+                    }
+                    error = true;
+                }
+                Tri::True => {
+                    if !strict {
+                        return Ok(Tri::True);
+                    }
+                    hit = true;
+                }
+                Tri::False => {}
+            }
+        }
+        Ok(if hit {
+            Tri::True
+        } else if error {
+            Tri::Unknown
+        } else {
+            Tri::False
+        })
     }
 
     /// `exists(...)`。

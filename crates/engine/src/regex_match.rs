@@ -5,7 +5,7 @@
 //! （`docs/design/regex-crate-adoption.md`）を engine 内部 API で包む。公開シグネチャに
 //! `regex` の型は出さない（呼び出し側は [`CompiledRegex`]・[`RegexError`]・[`RegexCaseMode`]
 //! だけを見る）。SQL 表層への配線（`~` 系は Issue #1787 で配線済みで、呼び出し元は `sql::regex_op`。
-//! `SIMILAR TO` は Issue #1788 で配線済み。jsonpath の `like_regex` は #1784）は本モジュールの範囲外で、ここは
+//! `SIMILAR TO` は Issue #1788、jsonpath の `like_regex` は Issue #2677 で配線済み）は本モジュールの範囲外で、ここは
 //! 評価器の部品だけを提供する。
 //!
 //! `SIMILAR TO`（Issue #1788）は、構文段（`sql::allowlist`）が [`similar_to_are`] で SQL 正規表現を
@@ -127,6 +127,31 @@ pub fn similar_to_are(pattern: &str, escape: Option<char>) -> Result<String, Reg
     Ok(similar::convert(pattern, escape)?)
 }
 
+/// 構文オプション（Issue #2677。jsonpath `like_regex` のフラグ写像先）。`regex` の型は含まない。
+/// 既定値（すべて false / `Sensitive`）は `~` と同じ挙動で、[`CompiledRegex::compile`] が使う。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct RegexSyntaxOptions {
+    /// 大文字小文字の扱い。
+    pub case: RegexCaseMode,
+    /// 改行区別（`.` と否定ブラケットが `\n` にマッチしない。埋め込み `(?s)` で解除される）。
+    pub newline_stop: bool,
+    /// `^`／`$` が改行の直後・直前でもマッチする。
+    pub newline_anchor: bool,
+    /// パターン全体をリテラルとして扱う（director・埋め込みオプションも解釈しない）。
+    pub quote: bool,
+}
+
+impl Default for RegexSyntaxOptions {
+    fn default() -> Self {
+        Self {
+            case: RegexCaseMode::Sensitive,
+            newline_stop: false,
+            newline_anchor: false,
+            quote: false,
+        }
+    }
+}
+
 /// コンパイル済みの正規表現。`Clone` は内部の `Arc` 共有で安価。
 #[derive(Debug, Clone)]
 pub struct CompiledRegex {
@@ -144,7 +169,27 @@ impl CompiledRegex {
         if pattern.len() > limits.max_pattern_len() {
             return Err(RegexError::PatternTooLong);
         }
-        Self::compile_checked(pattern, case, limits)
+        Self::compile_checked(
+            pattern,
+            RegexSyntaxOptions {
+                case,
+                ..RegexSyntaxOptions::default()
+            },
+            limits,
+        )
+    }
+
+    /// 構文オプション付きでコンパイルする（jsonpath `like_regex`。Issue #2677）。パターン長は
+    /// 確保・解析より前に検査する。
+    pub fn compile_with_options(
+        pattern: &str,
+        opts: RegexSyntaxOptions,
+        limits: RegexLimits,
+    ) -> Result<Self, RegexError> {
+        if pattern.len() > limits.max_pattern_len() {
+            return Err(RegexError::PatternTooLong);
+        }
+        Self::compile_checked(pattern, opts, limits)
     }
 
     /// [`similar_to_are`] の出力（変換済み ARE）をコンパイルする。設定済みのパターン長上限は
@@ -166,15 +211,30 @@ impl CompiledRegex {
         if are.len() > are_cap {
             return Err(RegexError::PatternTooLong);
         }
-        Self::compile_checked(are, case, limits)
+        Self::compile_checked(
+            are,
+            RegexSyntaxOptions {
+                case,
+                ..RegexSyntaxOptions::default()
+            },
+            limits,
+        )
     }
 
     fn compile_checked(
         pattern: &str,
-        case: RegexCaseMode,
+        opts: RegexSyntaxOptions,
         limits: RegexLimits,
     ) -> Result<Self, RegexError> {
-        let translated = translate::translate(pattern, case == RegexCaseMode::AsciiInsensitive)?;
+        let translated = translate::translate(
+            pattern,
+            translate::TranslateOptions {
+                insensitive: opts.case == RegexCaseMode::AsciiInsensitive,
+                newline_stop: opts.newline_stop,
+                newline_anchor: opts.newline_anchor,
+                quote: opts.quote,
+            },
+        )?;
         // 自前の深さ上限に、変換が足すラッパー（量指定・クラス）の分の余裕を持たせた多重防御。
         let nest_limit = u32::try_from(MAX_REGEX_NEST_DEPTH.saturating_mul(4).saturating_add(16))
             .unwrap_or(u32::MAX);
@@ -228,6 +288,26 @@ mod tests {
         assert_eq!(c("abc", "ABC"), Ok(true));
         assert_eq!(c("é", "É"), Ok(false));
         assert_eq!(c("k", "\u{212a}"), Ok(false));
+    }
+
+    #[test]
+    fn syntax_options_newline_and_quote() {
+        let c = |p: &str, f: fn(&mut RegexSyntaxOptions), i: &str| {
+            let mut o = RegexSyntaxOptions::default();
+            f(&mut o);
+            CompiledRegex::compile_with_options(p, o, RegexLimits::default())
+                .unwrap()
+                .is_match(i)
+        };
+        assert_eq!(c("a.b", |o| o.newline_stop = true, "a\nb"), Ok(false));
+        assert_eq!(c("a.b", |_| {}, "a\nb"), Ok(true));
+        assert_eq!(c("(?s)a.b", |o| o.newline_stop = true, "a\nb"), Ok(true));
+        assert_eq!(c("a\\Db", |o| o.newline_stop = true, "a\nb"), Ok(true));
+        assert_eq!(c("a[^x]b", |o| o.newline_stop = true, "a\nb"), Ok(false));
+        assert_eq!(c("^b$", |o| o.newline_anchor = true, "a\nb\nc"), Ok(true));
+        assert_eq!(c("^b$", |_| {}, "a\nb\nc"), Ok(false));
+        assert_eq!(c("a.b", |o| o.quote = true, "axb"), Ok(false));
+        assert_eq!(c("a.b", |o| o.quote = true, "a.b"), Ok(true));
     }
 
     #[test]
