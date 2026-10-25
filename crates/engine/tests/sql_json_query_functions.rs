@@ -402,8 +402,8 @@ fn unsupported_clauses_and_types_are_0a000() {
         "JSON_VALUE(doc, '$.a')",
         // datetime・vector の PASSING 値
         "JSON_EXISTS(docb, '$' PASSING embedding AS v)",
-        // 評価器が未対応の構文は ON ERROR でも捕捉しない
-        "JSON_EXISTS(docb, '$ ? (@.b.c like_regex \"x\")' FALSE ON ERROR)",
+        // `x` フラグは未対応（Issue #2677）。束縛時の拒否は ON ERROR でも捕捉しない
+        "JSON_EXISTS(docb, '$ ? (@.b.c like_regex \"x\" flag \"x\")' FALSE ON ERROR)",
     ];
     for expr in cases {
         assert_eq!(err_code(&core, &alice, expr, 1), "0A000", "{expr}");
@@ -614,4 +614,37 @@ fn other_tenants_rows_never_leak_into_results_or_errors() {
             assert!(!msg.contains(leaked), "{expr}: {msg}");
         }
     }
+}
+
+/// `like_regex` は評価される（Issue #2677。SQL-55・TABLE-25）。
+#[test]
+fn like_regex_filters_in_json_exists_and_json_value() {
+    let (core, _g, alice) = setup();
+    assert_eq!(
+        cell(
+            &core,
+            &alice,
+            "JSON_EXISTS(docb, '$ ? (@.b.c like_regex \"^x$\")' FALSE ON ERROR)",
+            1
+        ),
+        Cell::Bool(true)
+    );
+    assert_eq!(
+        cell(
+            &core,
+            &alice,
+            "JSON_EXISTS(docb, '$ ? (@.b.c like_regex \"y\")' FALSE ON ERROR)",
+            1
+        ),
+        Cell::Bool(false)
+    );
+    assert_eq!(
+        cell(
+            &core,
+            &alice,
+            "JSON_VALUE(docb, '$.b ? (@.c like_regex \"X\" flag \"i\").c')",
+            1
+        ),
+        text("x")
+    );
 }

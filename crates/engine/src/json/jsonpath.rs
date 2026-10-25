@@ -10,8 +10,10 @@
 //!
 //! 受理文法は PostgreSQL 17 の `jsonpath` に合わせる。意図的な差分は 2 点。
 //! (1) 長さ・入れ子深さ・数値リテラル長・式の高さに上限を設ける（PostgreSQL には無い。
-//! fail-closed の DoS 対策。超過は `54000`）。(2) `like_regex` は構文を解析した上で
-//! 0A000 で拒否する（正規表現の依存が未承認のため）。
+//! fail-closed の DoS 対策。超過は `54000`）。(2) `like_regex` は束縛時に正規表現へ
+//! コンパイルし（Issue #2677。SQL-55・TABLE-25 ポインタ）、1 つの jsonpath が持てる件数を
+//! [`MAX_JSONPATH_LIKE_REGEX`] までに制限する（超過は `54000`）。PG が受理する後方参照・
+//! lookaround 等は `~` と同じ規則で `0A000` にする。
 //! エラーは固定の英語文のみを返し、入力の断片を含めない。
 
 pub mod ast;
@@ -21,8 +23,8 @@ mod numeric;
 mod parser;
 
 pub use ast::{
-    AccessorOp, AnyLevel, ArithOp, CompareOp, Method, PathMode, PathNode, PathNumeric, RegexFlags,
-    SqlJsonPath, StartsWithOperand, Subscript, UnaryOp,
+    AccessorOp, AnyLevel, ArithOp, CompareOp, LikeRegexMatcher, Method, PathMode, PathNode,
+    PathNumeric, RegexFlags, SqlJsonPath, StartsWithOperand, Subscript, UnaryOp,
 };
 
 pub use eval::{
@@ -31,6 +33,8 @@ pub use eval::{
 };
 
 use crate::error_format::{ClassifiedError, ErrorClass};
+use crate::regex_limits::RegexLimits;
+use crate::regex_match::RegexError;
 
 /// 入力の最大バイト長（字句解析の前に判定する）。
 pub const MAX_JSONPATH_INPUT_LEN: usize = 65_536;
@@ -42,6 +46,10 @@ pub const MAX_JSONPATH_NUMERIC_LITERAL_LEN: usize = 1_024;
 /// 式木の高さの上限。`1+1+1+...` のような左結合の連鎖が AST を深くし、再帰的な drop・
 /// 評価でスタックを使い切ることを防ぐ。
 pub const MAX_JSONPATH_NODE_HEIGHT: usize = 1_024;
+
+/// 1 つの jsonpath が持てる `like_regex` の最大個数（超過は `54000`）。入力上限の中に、短くても
+/// コンパイル後サイズが大きいパターンを多数並べる DoS を抑える意図的な差分（Issue #2677）。
+pub const MAX_JSONPATH_LIKE_REGEX: usize = 16;
 
 /// [`parse_jsonpath`] の失敗。`wire_code()` は PostgreSQL の解析段階の SQLSTATE に
 /// 合わせる（`2203x` 系は評価時のエラーで本モジュールでは発生しない）。
@@ -57,8 +65,12 @@ pub enum JsonPathParseError {
     UnsupportedUnicodeEscape,
     /// `**{n}` の n が int4 の範囲外（22003）。
     IntegerOutOfRange,
-    /// `like_regex`（0A000）。
+    /// `like_regex` の `x` フラグ（`q` なし。0A000）。
     RegexNotSupported,
+    /// `like_regex` のパターンが拒否された（`2201B`／`0A000`／`54000`。[`RegexError`] の分類）。
+    Regex(RegexError),
+    /// `like_regex` が [`MAX_JSONPATH_LIKE_REGEX`] 個を超えた（54000）。
+    TooManyRegex,
     /// [`MAX_JSONPATH_INPUT_LEN`] 超過（54000）。
     TooLong,
     /// [`MAX_JSONPATH_NESTING_DEPTH`]・[`MAX_JSONPATH_NODE_HEIGHT`] 超過（54000）。
@@ -77,8 +89,10 @@ impl ClassifiedError for JsonPathParseError {
             JsonPathParseError::UnsupportedUnicodeEscape => ErrorClass::UntranslatableCharacter,
             JsonPathParseError::IntegerOutOfRange => ErrorClass::NumericOutOfRange,
             JsonPathParseError::RegexNotSupported => ErrorClass::FeatureNotSupported,
+            JsonPathParseError::Regex(e) => e.error_class(),
             JsonPathParseError::TooLong
             | JsonPathParseError::TooDeep
+            | JsonPathParseError::TooManyRegex
             | JsonPathParseError::LiteralTooLong => ErrorClass::PayloadTooLarge,
         }
     }
@@ -92,7 +106,11 @@ impl ClassifiedError for JsonPathParseError {
                 "unsupported Unicode escape sequence in jsonpath"
             }
             JsonPathParseError::IntegerOutOfRange => "jsonpath integer is out of range",
-            JsonPathParseError::RegexNotSupported => "like_regex is not supported in jsonpath",
+            JsonPathParseError::RegexNotSupported => {
+                "XQuery \"x\" flag is not supported in like_regex"
+            }
+            JsonPathParseError::Regex(e) => return e.client_message(),
+            JsonPathParseError::TooManyRegex => "jsonpath has too many like_regex predicates",
             JsonPathParseError::TooLong => "jsonpath exceeds maximum length",
             JsonPathParseError::TooDeep => "jsonpath exceeds maximum nesting depth",
             JsonPathParseError::LiteralTooLong => "jsonpath numeric literal is too long",
@@ -109,10 +127,21 @@ impl JsonPathParseError {
 }
 
 /// jsonpath 文字列を解析する。成功値だけが [`SqlJsonPath`] を作れるため、評価器へ渡る
-/// AST は `@`／`last` の位置検査と `like_regex` 拒否を通過済みである。
+/// AST は `@`／`last` の位置検査と `like_regex` のコンパイルを通過済みである。正規表現の上限は
+/// ハード上限（[`RegexLimits::default`]）。CLI で下げた上限を使う SQL 表層は
+/// [`parse_jsonpath_with_regex_limits`] を呼ぶ。
 pub fn parse_jsonpath(input: &str) -> Result<SqlJsonPath, JsonPathParseError> {
+    parse_jsonpath_with_regex_limits(input, RegexLimits::default())
+}
+
+/// [`parse_jsonpath`] の正規表現上限指定版（`sql::jsonpath_fn` の束縛が
+/// `current_regex_limits()` を渡す。層を逆転させないため、thread-local は本モジュールで読まない）。
+pub fn parse_jsonpath_with_regex_limits(
+    input: &str,
+    regex_limits: RegexLimits,
+) -> Result<SqlJsonPath, JsonPathParseError> {
     if input.len() > MAX_JSONPATH_INPUT_LEN {
         return Err(JsonPathParseError::TooLong);
     }
-    parser::parse(input)
+    parser::parse(input, regex_limits)
 }
