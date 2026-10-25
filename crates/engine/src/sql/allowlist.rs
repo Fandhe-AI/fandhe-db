@@ -19104,9 +19104,6 @@ fn sql_json_query_kind_from_name(name: &str) -> Option<SqlJsonQueryKind> {
     }
 }
 
-/// 式木が関数呼び出し・`CASE`・`COALESCE`・`NULLIF` のいずれかを含むか（Issue #1188。
-/// `HAVING` の式述語を「従来形では書けない形」に限定する判定。`EXTRACT` は構文段で
-/// `date_part` 呼び出しへ脱糖済みのため `Call` に含まれる）。
 /// 式木が集計呼び出しの内部名（[`aggregate_placeholder`]）の識別子を含むか（Issue #1814・SQL-58。
 /// `HAVING` 内の集計呼び出しを含む式述語を受理するための判定）。
 fn expr_contains_aggregate_placeholder(expr: &Expr) -> bool {
@@ -19117,6 +19114,9 @@ fn expr_contains_aggregate_placeholder(expr: &Expr) -> bool {
         .any(|n| aggregate_placeholder_index(n).is_some())
 }
 
+/// 式木が関数呼び出し・`CASE`・`COALESCE`・`NULLIF` のいずれかを含むか（Issue #1188。
+/// `HAVING` の式述語を「従来形では書けない形」に限定する判定。`EXTRACT` は構文段で
+/// `date_part` 呼び出しへ脱糖済みのため `Call` に含まれる）。
 fn expr_contains_scalar_function(expr: &Expr) -> bool {
     match expr {
         Expr::Call { .. } | Expr::Case { .. } | Expr::Coalesce(_) | Expr::NullIf(..) => true,
