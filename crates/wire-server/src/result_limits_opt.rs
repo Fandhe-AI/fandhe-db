@@ -9,12 +9,12 @@
 //! 解決結果は `main.rs` が bind・ユーザーストア読込より前に [`resolve`] で確定し、
 //! `EngineCore::with_result_limits` へ 1 回だけ注入する（`docs/design/result-limits-cli.md`）。
 //! 範囲外・非数値・値欠落・重複指定は fail-closed で起動エラー（既定へ黙って読み替えない）。
-//! 同じフラグは後続の結果行数上限（LIMIT 省略時の `54000`）も共有するため、フラグ名定数は
-//! 本モジュールを唯一の定義とする。
+//! 同じフラグは `LIMIT` 省略時の結果行数上限（`54000`。Issue #1796・#2211）も共有するため、
+//! フラグ名定数は本モジュールを唯一の定義とする。
 
 use engine::result_limits::{validate_max_result_rows, ResultLimits};
 
-/// 明示 `LIMIT` の範囲上限（結果行数上限）を設定する CLI フラグ名。
+/// 明示 `LIMIT` の範囲上限と、`LIMIT` 省略時の結果行数上限を設定する CLI フラグ名。
 pub const MAX_RESULT_ROWS_FLAG: &str = "--max-result-rows";
 
 /// ASCII 数字だけを受理する厳密な 10 進パース（`str::parse::<usize>` が受理する先頭 `+` 等を弾く）。
