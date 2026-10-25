@@ -6325,6 +6325,37 @@ pub(crate) enum AggregateInput {
     /// この 1 variant だけで評価できる自己完結な形にする（`BoundAggregateItem` の
     /// 構築箇所を増やさない）。`func == StringAgg` のときだけこの variant になる。
     StringAgg(Box<StringAggInput>),
+    /// `array_agg([DISTINCT] <式> [ORDER BY ...])`（SQL-57・Issue #1801）。値・内側の
+    /// `ORDER BY` のプログラムを `input` の内側へ閉じ込める自己完結な形（`StringAgg` と同じ）。
+    /// `func == ArrayAgg` のときだけこの variant になる。
+    ArrayAgg(Box<ArrayAggInput>),
+}
+
+/// `array_agg` の束縛済み入力（SQL-57・Issue #1801）。[`resolve_array_agg_input`] が作り、
+/// `sql::aggregate::Accumulator::ArrayAgg` が行ごとに評価する。
+#[derive(Debug, Clone, PartialEq)]
+pub(crate) struct ArrayAggInput {
+    /// 要素の取得元（裸の列はネイティブ値を複製し、式は評価結果を要素型へ写す）。
+    pub(crate) value: ArrayAggValue,
+    /// 結果配列の要素型（結果列型は `Array(elem)`）。
+    pub(crate) elem: crate::catalog::ArrayElemType,
+    /// 内側の `ORDER BY` のキー（`string_agg` と同じ束縛済みキー）。`DISTINCT` で `ORDER BY` が
+    /// 無いときは引数の昇順キーを合成する。空なら入力順（行の処理順）。
+    pub(crate) keys: Vec<StringAggOrderKey>,
+    /// `DISTINCT`（重複判定は要素値の正準形。NULL 要素は 1 個だけ残す）。
+    pub(crate) distinct: bool,
+}
+
+/// [`ArrayAggInput`] の要素の取得元。
+#[derive(Debug, Clone, PartialEq)]
+pub(crate) enum ArrayAggValue {
+    /// 裸の列（`schema.columns` の添字）。`bigint` を f64 経由にせずネイティブに複製する。
+    Column { index: usize },
+    /// 式（`ARRAY[<式>]` の要素と同じ型規則で束縛済み）。
+    Expr {
+        source: crate::sql::udf_call::BoundExpr,
+        program: crate::sql::expr_program::ExprProgram,
+    },
 }
 
 /// `string_agg` の束縛済み入力（SQL-57・Issue #1800）。[`resolve_string_agg_input`] が作り、
@@ -6449,9 +6480,9 @@ impl BoundAggregateItem {
         }
         // `string_agg` は SQL 表層のみ（SQL-57。NoSQL 表層は対象外）。2 引数・内側 ORDER BY を
         // 持てないこの入口では構文層の拒否（`42601`）と同じ分類で拒否する。
-        if func == AggregateFunc::StringAgg {
+        if matches!(func, AggregateFunc::StringAgg | AggregateFunc::ArrayAgg) {
             return Err(SqlSurfaceError::unsupported(
-                "string_agg is not supported by this interface",
+                "string_agg and array_agg are not supported by this interface",
             ));
         }
 
@@ -7303,6 +7334,9 @@ fn resolve_aggregate_item_input(
     if item.func == crate::sql::allowlist::AggregateFunc::StringAgg {
         return resolve_string_agg_input(item, schema, udfs, node_budget);
     }
+    if item.func == crate::sql::allowlist::AggregateFunc::ArrayAgg {
+        return resolve_array_agg_input(item, schema, udfs, node_budget);
+    }
     if item.distinct {
         resolve_count_distinct_input(&item.arg, schema, udfs, node_budget)
     } else {
@@ -7466,7 +7500,7 @@ fn resolve_string_agg_input(
             // 値・区切りに現れない式は、重複排除後の行へ一意に対応しないため拒否する。
             return Err(SqlSurfaceError::AggregateOrderByNotInArguments);
         } else {
-            bind_string_agg_free_order_key(k, schema, udfs, node_budget)?
+            bind_aggregate_free_order_key(k, schema, udfs, node_budget, order_kind_for_expr_type)?
         };
         keys.push(key);
     }
@@ -7500,12 +7534,180 @@ fn resolve_string_agg_input(
     })))
 }
 
-/// 値・区切りと等しくない `ORDER BY` キー 1 つを束縛する（[`resolve_string_agg_input`] 用）。
-fn bind_string_agg_free_order_key(
+/// `array_agg` の引数を束縛し、要素の取得元と要素型を返す（SQL-57・Issue #1801）。
+///
+/// - 裸の列: 列の値をネイティブに複製する（`bigint` を f64 へ落とさない）。対応する型は
+///   text・varchar・boolean・integer・bigint・real・double・date・timestamp・uuid・
+///   numeric(p,s)・bytea・json・jsonb。smallint・char(n)・time・timestamptz・interval・vector・
+///   配列・ENUM と疑似列 `id` は `0A000`（fail-closed。`char(n)` を text 配列へ黙って変換しない）
+/// - それ以外の式: `ARRAY[<式>]` の 1 要素と同じ型規則（[`crate::sql::udf_call::bind_array_agg_element`]）
+fn bind_array_agg_value(
+    expr: &Expr,
+    schema: &TableSchema,
+    udfs: &crate::sql::udf_call::UdfRegistry,
+    node_budget: &mut usize,
+) -> Result<(ArrayAggValue, crate::catalog::ArrayElemType), SqlSurfaceError> {
+    use crate::catalog::ArrayElemType;
+
+    let unsupported = |detail: &str| SqlSurfaceError::FeatureNotSupported {
+        detail: detail.to_string(),
+    };
+    if let Expr::Ident(name) = expr {
+        let Some((index, column)) = schema
+            .columns
+            .iter()
+            .enumerate()
+            .find(|(_, c)| &c.name == name)
+        else {
+            if name == "id" && schema.has_pseudo_id() {
+                return Err(unsupported(
+                    "array_agg over the id pseudo column is not supported",
+                ));
+            }
+            return Err(SqlSurfaceError::undefined_column(name));
+        };
+        let elem = match &column.ty {
+            ColumnType::Text | ColumnType::Varchar(_) => ArrayElemType::Text,
+            ColumnType::Boolean => ArrayElemType::Bool,
+            ColumnType::Integer => ArrayElemType::Integer,
+            ColumnType::BigInt => ArrayElemType::BigInt,
+            ColumnType::Real => ArrayElemType::Real,
+            ColumnType::Double => ArrayElemType::Double,
+            ColumnType::Date => ArrayElemType::Date,
+            ColumnType::Timestamp => ArrayElemType::Timestamp,
+            ColumnType::Uuid => ArrayElemType::Uuid,
+            ColumnType::Numeric { precision, scale } => ArrayElemType::Numeric {
+                precision: *precision,
+                scale: *scale,
+            },
+            ColumnType::Bytea => ArrayElemType::Bytea,
+            ColumnType::Json => ArrayElemType::Json,
+            ColumnType::Jsonb => ArrayElemType::Jsonb,
+            ColumnType::SmallInt
+            | ColumnType::Bpchar(_)
+            | ColumnType::Time
+            | ColumnType::TimestampTz
+            | ColumnType::Interval
+            | ColumnType::Vector(_)
+            | ColumnType::Array(_)
+            | ColumnType::Enum(_) => {
+                return Err(unsupported(
+                    "array_agg over this column type is not supported yet",
+                ))
+            }
+        };
+        *node_budget = node_budget
+            .checked_sub(1)
+            .ok_or_else(|| SqlSurfaceError::payload_too_large("expression is too large"))?;
+        return Ok((ArrayAggValue::Column { index }, elem));
+    }
+    let (bound, elem) =
+        crate::sql::udf_call::bind_array_agg_element(expr, schema, udfs, node_budget)?;
+    let program = crate::sql::expr_program::ExprProgram::compile(&bound);
+    Ok((
+        ArrayAggValue::Expr {
+            source: bound,
+            program,
+        },
+        elem,
+    ))
+}
+
+/// `array_agg([DISTINCT] <式> [ORDER BY ...])`（SQL-57・Issue #1801）の入力解決。
+///
+/// - 引数は 1 つ（個数違いは構文層が `42883`/`42601`）。要素型は [`bind_array_agg_value`]
+/// - 内側 `ORDER BY` のキーは `string_agg` と同じ自由キー束縛
+///   （[`bind_aggregate_free_order_key`]。引数と構文上等しいキーも同じ経路で再評価する）
+/// - `DISTINCT` は全キーが引数と構文上等しくなければ `42P10`。`ORDER BY` に引数が無ければ
+///   引数の昇順キーを合成する（PostgreSQL の並べ替えによる重複排除と同じ出力順）
+/// - 順序・等価の演算子が無い型（`json`）は `42883`、本実装が比較キーを持たない `bytea` は
+///   `0A000`（`DISTINCT`／引数を指す `ORDER BY` のときだけ。通常の集約は受理する）
+fn resolve_array_agg_input(
+    item: &crate::sql::allowlist::AggregateItem,
+    schema: &TableSchema,
+    udfs: &crate::sql::udf_call::UdfRegistry,
+    node_budget: &mut usize,
+) -> Result<AggregateInput, SqlSurfaceError> {
+    use crate::catalog::ArrayElemType;
+    use crate::sql::allowlist::{AggregateArg, AggregateOrderKey};
+
+    let value_expr = match &item.arg {
+        AggregateArg::Expr(e) => e,
+        AggregateArg::Star => {
+            return Err(SqlSurfaceError::unsupported(
+                "'*' is only allowed inside COUNT(*)",
+            ))
+        }
+    };
+    if !item.extra_args.is_empty() {
+        return Err(SqlSurfaceError::undefined_function(
+            "function array_agg requires exactly one argument",
+        ));
+    }
+    let (value, elem) = bind_array_agg_value(value_expr, schema, udfs, node_budget)?;
+    let orders_by_value = item.distinct || item.order_by.iter().any(|k| k.expr == *value_expr);
+    if orders_by_value {
+        match elem {
+            ArrayElemType::Json => {
+                return Err(SqlSurfaceError::undefined_function(
+                    "could not identify an equality or ordering operator for type json",
+                ))
+            }
+            ArrayElemType::Bytea => {
+                return Err(SqlSurfaceError::FeatureNotSupported {
+                    detail: "DISTINCT or ORDER BY over bytea in array_agg is not supported yet"
+                        .to_string(),
+                })
+            }
+            _ => {}
+        }
+    }
+    let mut keys: Vec<StringAggOrderKey> =
+        Vec::with_capacity(item.order_by.len().saturating_add(1));
+    for k in &item.order_by {
+        // `DISTINCT` では重複排除後の行へ一意に対応しない式を拒否する。
+        if item.distinct && k.expr != *value_expr {
+            return Err(SqlSurfaceError::AggregateOrderByNotInArguments);
+        }
+        keys.push(bind_aggregate_free_order_key(
+            k,
+            schema,
+            udfs,
+            node_budget,
+            order_kind_for_array_agg_key_type,
+        )?);
+    }
+    if item.distinct && !item.order_by.iter().any(|k| k.expr == *value_expr) {
+        let synthesized = AggregateOrderKey {
+            expr: value_expr.clone(),
+            descending: false,
+            nulls: None,
+        };
+        keys.push(bind_aggregate_free_order_key(
+            &synthesized,
+            schema,
+            udfs,
+            node_budget,
+            order_kind_for_array_agg_key_type,
+        )?);
+    }
+    Ok(AggregateInput::ArrayAgg(Box::new(ArrayAggInput {
+        value,
+        elem,
+        keys,
+        distinct: item.distinct,
+    })))
+}
+
+/// 値・区切りと等しくない `ORDER BY` キー 1 つを束縛する（[`resolve_string_agg_input`] と
+/// [`resolve_array_agg_input`] が共有する。後者は `array_agg` の内側 `ORDER BY` の全キーに使う）。
+/// `kind_of` は式キーの静的型から比較規約を決める関数（`array_agg` だけ uuid を許す）。
+fn bind_aggregate_free_order_key(
     k: &crate::sql::allowlist::AggregateOrderKey,
     schema: &TableSchema,
     udfs: &crate::sql::udf_call::UdfRegistry,
     node_budget: &mut usize,
+    kind_of: fn(crate::sql::udf_call::ExprType) -> Result<OrderKind, SqlSurfaceError>,
 ) -> Result<StringAggOrderKey, SqlSurfaceError> {
     let explicit_nulls = k
         .nulls
@@ -7561,7 +7763,7 @@ fn bind_string_agg_free_order_key(
     } else {
         crate::sql::udf_call::bind_order_expr(&k.expr, schema, udfs, node_budget)?
     };
-    let kind = order_kind_for_expr_type(ty)?;
+    let kind = kind_of(ty)?;
     let program = crate::sql::expr_program::ExprProgram::compile(&bound);
     Ok(StringAggOrderKey {
         source: StringAggKeySource::Expr {
@@ -8247,6 +8449,21 @@ fn order_kind_for_expr_type(
                 detail: "ORDER BY a CAST result expression is not supported yet".to_string(),
             })
         }
+    }
+}
+
+/// `array_agg` の内側 `ORDER BY`／`DISTINCT` の式キーの比較規約（SQL-57・Issue #1801）。
+/// 素の列キーが受理する uuid は、式の引数でも同じく受理する（`DISTINCT` と引数一致の
+/// `ORDER BY` は引数を式キーとして再束縛するため、ここで拒否すると列と式で挙動が割れる）。
+/// numeric 式は要素にも束縛できず（`0A000`）、bytea は束縛前に要素型で `0A000`。他の型は
+/// [`order_kind_for_expr_type`] に従う。他の ORDER BY 経路は [`order_kind_for_expr_type`] のまま変えない。
+fn order_kind_for_array_agg_key_type(
+    ty: crate::sql::udf_call::ExprType,
+) -> Result<OrderKind, SqlSurfaceError> {
+    use crate::sql::udf_call::ExprType;
+    match ty {
+        ExprType::Uuid => Ok(OrderKind::Uuid),
+        other => order_kind_for_expr_type(other),
     }
 }
 
@@ -9447,6 +9664,7 @@ pub(crate) fn check_having_target_is_numeric(
                 | AggregateInput::TimeColumn(_)
                 | AggregateInput::TimestampTzColumn(_)
                 | AggregateInput::IntervalColumn(_)
+                | AggregateInput::ArrayAgg(_)
         );
     if is_unsupported {
         return Err(SqlSurfaceError::invalid_input(format!(
@@ -9488,7 +9706,20 @@ fn resolve_group_reference<S: AsRef<str>>(
         .collect();
     match (key_matches.as_slice(), item_matches.as_slice()) {
         ([key_idx], []) => Ok(OrderTarget::GroupKey(*key_idx)),
-        ([], [idx]) => Ok(OrderTarget::Aggregate(*idx)),
+        ([], [idx]) => {
+            // 配列値には文レベルの比較規約が無い（`group_by::cmp_cell_values` は未定義の組を
+            // 等値として扱うため、通すと並びが黙って崩れる）。束縛時に拒否する（SQL-57）。
+            if items
+                .get(*idx)
+                .is_some_and(|it| it.func == crate::sql::allowlist::AggregateFunc::ArrayAgg)
+            {
+                return Err(SqlSurfaceError::FeatureNotSupported {
+                    detail: "ORDER BY or HAVING on an array_agg result is not supported"
+                        .to_string(),
+                });
+            }
+            Ok(OrderTarget::Aggregate(*idx))
+        }
         ([], []) => Err(SqlSurfaceError::undefined_column(name)),
         _ => Err(SqlSurfaceError::ambiguous_column(name)),
     }
@@ -9681,6 +9912,17 @@ fn bind_group_by_clause(
                 // 集計結果（`Cell`）の ORDER BY は項目の照合を運ばずバイト列順で比較するため、
                 // 非バイト列順の照合の MIN/MAX は `0A000` で拒否する（TABLE-28・Issue #2190）。
                 if let OrderTarget::Aggregate(idx) = target {
+                    // 位置指定（`ORDER BY 2`）は名前解決を経ないため、配列値の拒否はここでも行う
+                    // （`resolve_group_reference` と同じ理由。SQL-57）。
+                    if items
+                        .get(idx)
+                        .is_some_and(|it| it.func == crate::sql::allowlist::AggregateFunc::ArrayAgg)
+                    {
+                        return Err(SqlSurfaceError::FeatureNotSupported {
+                            detail: "ORDER BY or HAVING on an array_agg result is not supported"
+                                .to_string(),
+                        });
+                    }
                     if matches!(
                         items.get(idx).map(|item| &item.input),
                         Some(AggregateInput::CollatedTextColumn { .. })
@@ -9768,6 +10010,8 @@ fn aggregate_result_column_type(item: &BoundAggregateItem) -> ColumnType {
     match item.func {
         AggregateFunc::Count => ColumnType::BigInt,
         AggregateFunc::StringAgg => ColumnType::Text,
+        // 配列は式中の列として扱えない（`array_agg(x) || ...` などは `22000`。SQL-57）。
+        AggregateFunc::ArrayAgg => EXPR_UNSUPPORTED_COLUMN_TYPE,
         AggregateFunc::Avg => match item.input {
             // Issue #2270（TABLE-13）: 整数・`id` の AVG も `Cell::Numeric` を返すため、
             // 式内では扱えない列として `22000` で拒否する（numeric 算術は別 Issue）。

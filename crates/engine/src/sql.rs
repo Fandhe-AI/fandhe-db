@@ -153,6 +153,7 @@ mod aggregate_embedding_decode_tests;
 pub mod allowlist;
 pub(crate) mod alter_using;
 pub(crate) mod arena_cache;
+pub(crate) mod array_agg;
 mod array_expr;
 pub(crate) mod array_fn;
 mod array_ops;

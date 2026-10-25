@@ -595,6 +595,9 @@ pub(crate) fn expr_value_to_key_ref<'v>(
         (ExprValue::Timestamp(t), OrderKind::SignedInt) => Ok(Some(ScalarKeyRef::SignedInt(*t))),
         (ExprValue::TimestampTz(t), OrderKind::SignedInt) => Ok(Some(ScalarKeyRef::SignedInt(*t))),
         (ExprValue::Time(t), OrderKind::SignedInt) => Ok(Some(ScalarKeyRef::SignedInt(*t))),
+        // uuid の式キーは `array_agg` の内側 ORDER BY／DISTINCT だけが束縛する
+        // （`order_kind_for_array_agg_key_type`。他の ORDER BY 経路は束縛段で拒否済み）。
+        (ExprValue::Uuid(u), OrderKind::Uuid) => Ok(Some(ScalarKeyRef::Uuid(*u))),
         // jsonb はソートキーを呼び出し元が先に作って借用させる（[`expr_value_to_jsonb_key`]）。
         // ここへ到達するのは配線不備のみ。
         (ExprValue::Json(_), OrderKind::Jsonb) => Err(scan_bug(
