@@ -821,14 +821,6 @@ struct PortalRows {
     /// 行の見積りと合算する（中断 portal 数に比例して列メタが無計上で残らないようにする）。
     columns_bytes: usize,
     shape: crate::simple_query::TagShape,
-    /// この portal がこれまでの Execute 呼び出し（今回分を含まない）で
-    /// 既に送出済みの行数。完了時の `CommandComplete` タグは PostgreSQL の
-    /// 契約どおり「portal 全体の累計送出行数」から組み立てる必要があり、
-    /// 直近 1 回の Execute で送った行数だけでは分割送出時に過小な値になる
-    /// （PR #1013 レビュー指摘・P1。例: 5 行を `max_rows=2` で 3 回に分けて
-    /// 取得すると完了タグは `SELECT 5` であるべきだが、直近バッチの件数
-    /// だけを使うと `SELECT 1` になってしまう）。
-    sent_so_far: usize,
     /// この portal の実行が書き込み系文（`INSERT`/`UPDATE`/`DELETE`/
     /// `TRUNCATE` 等の `RETURNING` 込み）を commit 済みかどうか（PR #1013
     /// レビュー指摘・codex P1）。`true` の場合、この中断保持分の続きを送出する
@@ -2472,11 +2464,20 @@ fn execute_portal<'e, S: WireStream>(
                         state.portals.total_suspended_bytes_excluding(portal_name);
                     // 列メタの保持分は中断が確定する（`take` 以降に行がある）場合のみ加算する。
                     let columns_bytes = retained_columns_bytes(&result.columns);
-                    let mut remaining_bytes: usize = if result.rows.len() > take {
-                        columns_bytes
-                    } else {
-                        0
-                    };
+                    // `max_rows` ちょうどで行が尽きた回も PostgreSQL 17 では
+                    // `PortalSuspended` で終える（`atEnd` は `nprocessed < count` の
+                    // ときだけ立つ。pquery.c `PortalRunSelect`）ため、中断判定は
+                    // 残り行の有無ではなく「`max_rows` 件を送り切ったか」で行う。
+                    let suspends = max_rows > 0 && take == max_rows as usize;
+                    let mut remaining_bytes: usize = if suspends { columns_bytes } else { 0 };
+                    // 全行を送り切って尽きる回（`skip(take)` の行ループが空）でも列メタ分は
+                    // 保持されるため、行ループの前に他 portal の保持量との合計を検査する。
+                    // 送出前に fail-closed で拒否し、1 バイトも送らない契約を保つ。
+                    if other_suspended_bytes.saturating_add(remaining_bytes)
+                        > MAX_SUSPENDED_PORTAL_BYTES_PER_SESSION
+                    {
+                        return Err(commit_wrap(HandlerError::SuspendedBytesExceeded));
+                    }
                     let mut frames = std::collections::VecDeque::new();
                     for row in result.rows.iter().skip(take) {
                         // Bind 時点で確定した結果 format code（WIRE-14。
@@ -2535,10 +2536,10 @@ fn execute_portal<'e, S: WireStream>(
                         }
                     }
 
-                    if frames.is_empty() {
-                        // 全行を今回の Execute で送出済み。`CommandComplete` の
-                        // タグは portal 全体の累計送出行数（この場合は `take`
-                        // そのもの）から組み立てる（PR #1013 レビュー指摘・P1）。
+                    if !suspends {
+                        // `max_rows` 未満（または無制限）で行が尽きた。`CommandComplete`
+                        // のタグは PostgreSQL 17 の `PortalRun` と同じくその回の Execute
+                        // で送った件数（`take`）から組み立てる（累計ではない）。
                         let tag = shape.render(take);
                         let msg = result_encoder::encode_command_complete(&tag).map_err(|_| {
                             commit_wrap(internal_error("failed to encode command complete"))
@@ -2575,7 +2576,6 @@ fn execute_portal<'e, S: WireStream>(
                         columns: result.columns.clone(),
                         columns_bytes,
                         shape,
-                        sent_so_far: take,
                         committed: is_write_statement,
                     });
                     portal.cursor_binding = cursor_binding;
@@ -2698,16 +2698,14 @@ fn execute_portal<'e, S: WireStream>(
                     .map_err(|e| commit_wrap(io_to_handler(e)))?;
             }
         }
-        rows.sent_so_far = rows.sent_so_far.saturating_add(take);
 
-        if rows.frames.is_empty() {
-            // `CommandComplete` のタグは今回のバッチ件数（`take`）ではなく
-            // portal 全体の累計送出行数（`sent_so_far`）から組み立てる
-            // ―― PostgreSQL の契約では分割送出（`PortalRun`）を跨いだ
-            // 累計件数を返す（PR #1013 レビュー指摘・P1。例:
-            // 5 行を `max_rows=2` で 3 回に分けて取得した場合の完了タグは
-            // `SELECT 5` であるべきで、直近バッチの `1` 件だけではない）。
-            let tag = rows.shape.render(rows.sent_so_far);
+        // PostgreSQL 17 の `PortalRun` は完了タグの件数に「その回の Execute で処理した
+        // 件数」を使い（pquery.c の `qc->nprocessed = nprocessed`）、`max_rows` ちょうどで
+        // 残りが尽きた回も `PortalSuspended` で終える（`PortalRunSelect` の `atEnd` は
+        // `nprocessed < count` のときだけ立つ）。次の Execute が 0 行と `SELECT 0` を返す。
+        let suspends = max_rows > 0 && take == max_rows as usize;
+        if !suspends {
+            let tag = rows.shape.render(take);
             let msg = result_encoder::encode_command_complete(&tag)
                 .map_err(|_| commit_wrap(internal_error("failed to encode command complete")))?;
             buffer

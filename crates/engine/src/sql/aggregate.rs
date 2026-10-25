@@ -2669,6 +2669,9 @@ pub(crate) fn execute_aggregate_with_group_limits(
             let (key_tenant, id) = k.value();
             let buf = v.value();
 
+            // Issue #1798: 協調的中断の確認点（commit 前の読み取りループ）。
+            crate::interrupt::check()?;
+
             // RLS 段（無条件・デコード前）: `arena.rs` の走査ループと同一の順序
             // （ヘッダのみ読み `predicate` 相当を通過しない行は embedding・
             // metadata を一切デコードしない）。不可視行の破損状態が対象テナントの

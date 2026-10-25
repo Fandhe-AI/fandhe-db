@@ -9,6 +9,13 @@
 
 ### Added
 
+- 実行中の文の協調的中断を追加した（Issue #1798・SQL-34・WIRE-11）。公開 API は `engine::interrupt`
+  （`InterruptScope`・`InterruptGuard`・`InterruptReason`）と `ErrorClass::QueryCanceled`（`57014`）。
+  wire-server は実行中のクライアント切断を検出して走査を止める（切断済みの接続の資源占有を防ぐ）。
+  CancelRequest の受け付けは含まない。HTTP への射影は 503。詳細は
+  [statement-interrupt.md](docs/design/statement-interrupt.md)。
+  BREAKING CHANGE: 公開 enum `ErrorClass` と `SqlSurfaceError` に variant（`QueryCanceled`）を追加したため、
+  網羅的な `match` は更新が要る。
 - `--max-result-rows` の受け入れ条件（既定 10,000 の境界・上げた側とハード上限 100,000 の境界・超過時に DataRow を送らない）をテストで固定し、README と設計記録を `LIMIT` 省略時の上限の現状に整合（Issue #2211・SQL-34。挙動変更なし）。
 - jsonpath の `like_regex` を評価する（Issue #2677・SQL-55・TABLE-25）。`jsonb_path_*`・`@?`／`@@`・`JSON_EXISTS` 等が
   PG 17 と同じ結果を返す。フラグ `i`・`s`・`m`・`q` を受理し、`x`（`q` なし）は `0A000`、正規表現の構文誤りは `2201B`、
@@ -69,6 +76,14 @@
   有効時は `WHERE` 省略の SQL `UPDATE`／`DELETE` を変更開始前に `42601` で拒否する（既定は無効で挙動不変）。
   wire-server に値なしスイッチ `--require-where-for-dml` を追加した。明示した述語・NoSQL 表層・`TRUNCATE` は対象外。
   詳細は [require-where-for-dml-cli.md](docs/design/require-where-for-dml-cli.md)。
+
+### Changed
+
+- 拡張クエリの Execute の `max_rows` 分割で、完了タグの件数を累計からその回の件数に変え、`max_rows` ちょうどで
+  残りが尽きた回も `PortalSuspended` で終えるようにした（Issue #1798・WIRE-11。PostgreSQL 17 と同じ）。
+  BREAKING CHANGE: 分割送出の最終 Execute の完了タグ（例: 5 行を `max_rows=2` で 3 回に分けた最後が `SELECT 5` から
+  `SELECT 1`）と、行がちょうど尽きた回の応答（`CommandComplete` から `PortalSuspended`）が変わる。
+  `FETCH` は utility 文のため対象外で、完了タグは分割しても FETCH 文全体の取得件数（`FETCH 5`）のまま。
 
 ### Breaking Changes
 

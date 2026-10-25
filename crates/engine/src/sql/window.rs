@@ -443,6 +443,9 @@ fn materialize_rows(
             let (key_tenant, id) = k.value();
             let buf = v.value();
 
+            // Issue #1798: 協調的中断の確認点（commit 前の読み取りループ）。
+            crate::interrupt::check()?;
+
             // RLS 段（無条件・デコード前）。`sql::scan`・`sql::aggregate` の走査
             // ループと同一の順序（security.md P0「テナント境界」）。
             let (tenant_id, visibility, offset) =

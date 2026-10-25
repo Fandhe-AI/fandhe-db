@@ -94,7 +94,7 @@ macro_rules! define_error_classes {
 pub(crate) const SHARED_WIRE_CODES: &[&str] = &["23502", "23505", "22023"];
 
 define_error_classes! {
-    count = 81;
+    count = 82;
 
     /// 構文上受理された SQL の値・引数が不正（`22000`）。
     /// [`crate::sql::allowlist::SqlSurfaceError::InvalidInput`] の写像。
@@ -479,6 +479,12 @@ define_error_classes! {
     /// `JSON_VALUE` の結果がスカラーでない（配列・オブジェクト。`2203F`。Issue #2187）。
     /// [`crate::sql::allowlist::SqlSurfaceError::SqlJsonScalarRequired`] の写像。
     SqlJsonScalarRequired => ("2203F", "SQL_JSON_SCALAR_REQUIRED"),
+    /// 実行中の文を協調的に打ち切った（`57014`。ERR-6 の管轄行・Issue #1798）。クライアント切断の
+    /// 検出が最初の発生経路で、`statement_timeout`（SQL-71・#1950／#1951）も同じ分類を使う。
+    /// 中断は commit 前の `Err` としてのみ起き、autocommit は副作用ゼロ・明示トランザクションは
+    /// `Failed` になる。文言は固定で件数・テナント・行の内容を含めない。
+    /// [`crate::sql::allowlist::SqlSurfaceError::QueryCanceled`] の写像。
+    QueryCanceled => ("57014", "QUERY_CANCELED"),
 }
 
 impl ErrorClass {

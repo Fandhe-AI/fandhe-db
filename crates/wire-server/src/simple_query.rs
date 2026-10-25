@@ -904,15 +904,18 @@ pub(crate) fn map_outcome(outcome: SqlOutcome) -> OutcomeResponse {
         },
         // WIRE-15・TASK-218: `DECLARE`／`CLOSE` は件数を持たない固定タグの
         // `CommandComplete`。`FETCH` は検索 SELECT と同じ `RowDescription`／
-        // `DataRow`* エンコードを再利用し、タグの数値部分は実際に送出した
-        // 行数（分割送出時は 1 回の Execute で送った行数）にする。
+        // `DataRow`* エンコードを再利用し、タグの数値部分は FETCH 文の総取得件数にする。
         SqlOutcome::DeclareCursor => OutcomeResponse::Command {
             tag: "DECLARE CURSOR".to_string(),
         },
-        SqlOutcome::Fetch(result) => OutcomeResponse::Rows {
-            result,
-            shape: TagShape::Dynamic("FETCH"),
-        },
+        // PostgreSQL の FETCH は utility 文で、完了タグは FETCH 文自体が取得した総件数
+        // （`PortalRunUtility` が全行を実体化して確定した値。Execute の `max_rows` 分割の
+        // 影響を受けない）。SELECT の「Execute ごとの送出件数」規則は適用せず、実行時の総件数を
+        // 固定タグとして保持する。
+        SqlOutcome::Fetch(result) => {
+            let shape = TagShape::FixedTag(format!("FETCH {}", result.rows.len()));
+            OutcomeResponse::Rows { result, shape }
+        }
         SqlOutcome::CloseCursor => OutcomeResponse::Command {
             tag: "CLOSE CURSOR".to_string(),
         },

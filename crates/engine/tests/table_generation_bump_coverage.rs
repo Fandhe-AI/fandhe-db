@@ -462,7 +462,7 @@ const ALLOWLIST: &[(&str, u32)] = &[
     // 実行器側（`tenant/partitioned_dml.rs::finalize_cancel`）と `CANCEL PARTITIONED DML`
     // 文（`sql/partitioned.rs::execute_cancel`）の 2 箇所。
     // Issue #1544（`Kind::Update` への `set_exprs` 追加）で行が移動したための追随（旧: 254）。
-    ("tenant/partitioned_dml.rs", 266),
+    ("tenant/partitioned_dml.rs", 274),
     ("sql/partitioned.rs", 333),
     // `tenant::WriteTarget::with_txn`（SQL-31・TASK-221。`insert_row_unchecked`・
     // `insert_rows_unchecked`・`insert_typed_row_unchecked`・

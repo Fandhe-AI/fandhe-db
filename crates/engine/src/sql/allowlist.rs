@@ -851,6 +851,11 @@ pub enum SqlSurfaceError {
     /// 存在しない名前のいずれも区別しない固定文言のみを保持し、カーソル名
     /// 自体を含めない（security.md「存在情報を漏らさない」対応。ERR-6: `34000`）。
     InvalidCursorName,
+    /// 実行中の文を協調的に打ち切った（Issue #1798。ERR-6: `57014`）。`crate::interrupt`
+    /// の確認点が返し、commit 前の `Err` としてのみ起きる。理由は応答に出さない。
+    QueryCanceled {
+        reason: crate::interrupt::InterruptReason,
+    },
     /// `DROP TABLE`／`DROP VIEW` の対象を、それを参照するビューが 1 つ以上
     /// 残っているため削除できない（TABLE-18・SQL-23・TASK-205、Issue #909。
     /// ERR-6: `2BP01`）。依存元の名前一覧はエラー文言に含めない
@@ -1434,6 +1439,7 @@ impl ClassifiedError for SqlSurfaceError {
             | SqlSurfaceError::ConflictTargetNotVisible
             | SqlSurfaceError::SchemaDependencyForbidden => ErrorClass::ForbiddenTenantMismatch,
             SqlSurfaceError::InvalidCursorName => ErrorClass::InvalidCursorName,
+            SqlSurfaceError::QueryCanceled { .. } => ErrorClass::QueryCanceled,
             SqlSurfaceError::DependentObjectsStillExist { .. } => {
                 ErrorClass::DependentObjectsStillExist
             }
@@ -1708,6 +1714,10 @@ impl std::fmt::Display for SqlSurfaceError {
             // 参照）。
             SqlSurfaceError::InvalidCursorName => {
                 write!(f, "cursor does not exist")
+            }
+            // PostgreSQL と同じ固定文言。理由（切断・取り消し等）は含めない。
+            SqlSurfaceError::QueryCanceled { .. } => {
+                write!(f, "canceling statement due to user request")
             }
             // 依存元の名前一覧は含めない固定文言（security.md P0）。
             SqlSurfaceError::DependentObjectsStillExist { name } => {

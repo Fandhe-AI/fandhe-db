@@ -384,6 +384,11 @@ impl<S: WireStream> WireStream for TlsStream<S> {
     fn tls_server_end_point(&self) -> Option<&[u8]> {
         self.session.tls_server_end_point()
     }
+
+    fn liveness_probe(&self) -> Option<crate::liveness::LivenessProbe> {
+        // TLS レコードは触らない。下層（生バイト列）の probe をそのまま借りる。
+        self.inner.liveness_probe()
+    }
 }
 
 #[cfg(test)]

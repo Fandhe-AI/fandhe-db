@@ -88,6 +88,16 @@ pub trait WireStream: Read + Write {
     fn tls_server_end_point(&self) -> Option<&[u8]> {
         None
     }
+
+    /// 実行中の文がクライアント切断を検出するための probe
+    /// （[`crate::liveness`]・Issue #1798）。下層 TCP ソケットの複製と、受信経路と共有する
+    /// side buffer の組で、TLS 接続でも下層のものを返す（レコードの読み書きはしない）。
+    ///
+    /// 既定実装は `None`（切断検出なし。既存の `WireStream` 実装を壊さないための
+    /// 互換維持で、検出不能な接続は従来どおり中断されない）。
+    fn liveness_probe(&self) -> Option<crate::liveness::LivenessProbe> {
+        None
+    }
 }
 
 impl WireStream for TcpStream {
@@ -124,5 +134,46 @@ impl WireStream for TcpStream {
         // 平文接続は TLS を経由しないため、構造的にチャネルバインディング
         // 値を持たない。
         None
+    }
+
+    // `liveness_probe` は既定の `None`: 生の `TcpStream` は side buffer を持てず、
+    // 未読バイトがあると切断を判別できないため、検出は `SideBufTcp` 経由の接続に限る。
+}
+
+/// 認証後セッション用の受信経路ラッパー（[`crate::liveness::SideBufTcp`]）。ソケット操作は
+/// すべて下層へ委譲し、`liveness_probe` だけ side buffer を共有する probe を返す。
+impl WireStream for crate::liveness::SideBufTcp {
+    fn read_timeout(&self) -> io::Result<Option<Duration>> {
+        self.socket().read_timeout()
+    }
+
+    fn set_read_timeout(&mut self, timeout: Option<Duration>) -> io::Result<()> {
+        self.socket().set_read_timeout(timeout)
+    }
+
+    fn set_write_timeout(&mut self, timeout: Option<Duration>) -> io::Result<()> {
+        self.socket().set_write_timeout(timeout)
+    }
+
+    fn shutdown_both(&mut self) -> io::Result<()> {
+        self.socket().shutdown(std::net::Shutdown::Both)
+    }
+
+    fn shutdown_write(&mut self) -> io::Result<()> {
+        self.socket().shutdown(std::net::Shutdown::Write)
+    }
+
+    fn emergency_channel(&self) -> Option<TcpStream> {
+        self.socket().try_clone().ok()
+    }
+
+    fn graceful_close(&mut self) {}
+
+    fn tls_server_end_point(&self) -> Option<&[u8]> {
+        None
+    }
+
+    fn liveness_probe(&self) -> Option<crate::liveness::LivenessProbe> {
+        self.probe()
     }
 }

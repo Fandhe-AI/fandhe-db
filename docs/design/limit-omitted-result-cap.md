@@ -2,7 +2,7 @@
 
 ## ステータス・対象
 
-- ステータス: 採用（設計記録。#1796 で構文・計画への接続、#1797 で上限付き実体化の早期中断を実装済み。#1798 は未着手。#2211 で境界テストと記述を整合）
+- ステータス: 採用（設計記録。#1796 で構文・計画への接続、#1797 で上限付き実体化の早期中断を実装済み。#1798 で wire の分割送出の PG 17 整合と切断時の協調的中断を実装済み。CancelRequest の受け付けは spec 判断待ち。#2211 で境界テストと記述を整合）
 - ポインタ: SQL-34・SQL-15・WIRE-15・ERR-6（spec 本文は転記しない）
 - 対象: `LIMIT` 省略・`LIMIT ALL` の SELECT を「全件実体化 + 結果行数上限の超過でエラー」で受理するときの、上限判定の位置・超過時の SQLSTATE・カーソルとの関係・広域取得 Scan の走査上限との関係
 - 先行: [result-limits-cli.md](result-limits-cli.md)（Issue #1555。フラグ `--max-result-rows`・`ResultLimits` を本 ADR が再利用する）
@@ -126,6 +126,13 @@
 - 多層防御: `execute_scan_with_budget` 入口の事後判定と既存のバイト予算は残す
 - テスト: `crates/engine/tests/sql1797_early_stop.rs`。物理順で先頭に `cap + 1` 件の一致行、末尾に WHERE 評価で `22012` となる行を置き、中断していれば `54000`、走査を続ければ `22012` になることで停止を判定する
 - 未実施: 協調的キャンセル（engine のキャンセルフラグと `57014`）と、保持量の件数観測カウンタ（feature `test-sync-points`）。キャンセルは wire の CancelRequest／切断監視と結線して初めて意味を持つため #1798／#1950 で導入する
+
+## 実装メモ（Issue #1798）
+
+- 部分結果を送らない: simple は engine が全件そろえてからエンコードし、extended は初回 Execute で全件をそろえてから `max_rows` で分割する。上限判定は分割より上流なので、超過は DataRow を 1 行も送らず ErrorResponse（`54000`）だけになる。wire の結合テスト（`wire1798_limit_omitted_streaming.rs`）で simple・extended の両方を固定した
+- `max_rows` 分割を PostgreSQL 17 に揃えた（BREAKING）: 完了タグはその回の Execute で送った件数で、`max_rows` ちょうどで残りが尽きた回も `PortalSuspended` で終え、次の Execute が 0 行と `SELECT 0` を返す。根拠は [wire-extended-query-bind-execute-sync.md](wire-extended-query-bind-execute-sync.md)
+- 協調的中断: `engine::interrupt`（thread-local のスコープ）と `57014`（`ErrorClass::QueryCanceled`）を追加し、#1797 の早期中断と同じ行ループに確認点を置いた。切断の検出は wire の `liveness`。詳細は [statement-interrupt.md](statement-interrupt.md)
+- 未実施: CancelRequest の受け付け（spec 側の判断待ち。設計メモは statement-interrupt.md）、分割実行 DML の中断（#1950）
 
 ## 実装メモ（Issue #2211）
 
