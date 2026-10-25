@@ -1363,16 +1363,18 @@ pub(crate) fn has_text_min_max_aggregate(items: &[crate::sql::parser::BoundAggre
     items.iter().any(|item| {
         // SQL-57: ORDER BY なしの `string_agg` は行の処理順が結果の連結順になるため、キー順の
         // 列挙形（グループ単位に処理順が変わる）を使わず物理行順の全走査・候補走査に揃える。
-        item.func == crate::sql::allowlist::AggregateFunc::StringAgg
-            || matches!(
-                item.func,
-                crate::sql::allowlist::AggregateFunc::Min
-                    | crate::sql::allowlist::AggregateFunc::Max
-            ) && matches!(
-                item.input,
-                crate::sql::parser::AggregateInput::TextColumn(_)
-                    | crate::sql::parser::AggregateInput::CollatedTextColumn { .. }
-            )
+        matches!(
+            item.func,
+            crate::sql::allowlist::AggregateFunc::StringAgg
+                | crate::sql::allowlist::AggregateFunc::ArrayAgg
+        ) || matches!(
+            item.func,
+            crate::sql::allowlist::AggregateFunc::Min | crate::sql::allowlist::AggregateFunc::Max
+        ) && matches!(
+            item.input,
+            crate::sql::parser::AggregateInput::TextColumn(_)
+                | crate::sql::parser::AggregateInput::CollatedTextColumn { .. }
+        )
     })
 }
 

@@ -3338,6 +3338,27 @@ pub fn bind_expr(
     bind_expr_in(expr, &mut env, node_budget)
 }
 
+/// `array_agg(<式>)` の引数を `ARRAY[<式>]` の 1 要素と同じ型規則で束縛し、結果配列の要素型を返す
+/// （SQL-57・Issue #1801。`sql::parser::resolve_array_agg_input` の式経路から呼ばれる。
+/// 束縛環境の組み立ては [`bind_expr`] と同じ）。
+pub(crate) fn bind_array_agg_element(
+    expr: &Expr,
+    schema: &TableSchema,
+    registry: &UdfRegistry,
+    node_budget: &mut usize,
+) -> Result<(BoundExpr, crate::catalog::ArrayElemType), SqlSurfaceError> {
+    let mut env = BindEnv {
+        schema: Some(schema),
+        params: std::collections::HashMap::new(),
+        registry,
+        case_nesting: 0,
+        typed_arith: false,
+        clock: time_fn::current_clock(),
+        collation_leaf: false,
+    };
+    crate::sql::array_expr::bind_single_array_element(expr, &mut env, node_budget)
+}
+
 /// 式左辺の `<lhs> [NOT] LIKE|ILIKE '<pattern>'` を束縛する（対象ビヘイビア: SQL-54 (3)。
 /// Issue #1782）。`sql::parser::bind_where_predicates_recursive` が、左辺が裸の列でない
 /// [`WherePredicate::Prefix`](crate::sql::allowlist::WherePredicate::Prefix) に対して呼ぶ。
@@ -9184,6 +9205,13 @@ fn apply_vector_scalar_op<'a>(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// SQL-57・Issue #1801: `array_agg` も集計関数名として予約され、同名の UDF は定義できない。
+    #[test]
+    fn array_agg_is_a_reserved_function_name() {
+        assert!(is_reserved_function_name("array_agg"));
+        assert!(is_reserved_function_name("ARRAY_AGG"));
+    }
 
     /// SQL-57・Issue #1800: `string_agg` は集計関数名として予約され、同名の UDF は定義できない
     /// （呼び出しが集計として解析されるため、定義しても呼べない）。
