@@ -2470,6 +2470,14 @@ fn execute_portal<'e, S: WireStream>(
                     // 残り行の有無ではなく「`max_rows` 件を送り切ったか」で行う。
                     let suspends = max_rows > 0 && take == max_rows as usize;
                     let mut remaining_bytes: usize = if suspends { columns_bytes } else { 0 };
+                    // 全行を送り切って尽きる回（`skip(take)` の行ループが空）でも列メタ分は
+                    // 保持されるため、行ループの前に他 portal の保持量との合計を検査する。
+                    // 送出前に fail-closed で拒否し、1 バイトも送らない契約を保つ。
+                    if other_suspended_bytes.saturating_add(remaining_bytes)
+                        > MAX_SUSPENDED_PORTAL_BYTES_PER_SESSION
+                    {
+                        return Err(commit_wrap(HandlerError::SuspendedBytesExceeded));
+                    }
                     let mut frames = std::collections::VecDeque::new();
                     for row in result.rows.iter().skip(take) {
                         // Bind 時点で確定した結果 format code（WIRE-14。
