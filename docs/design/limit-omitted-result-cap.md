@@ -2,7 +2,7 @@
 
 ## ステータス・対象
 
-- ステータス: 採用（設計記録。#1796 で構文・計画への接続、#1797 で上限付き実体化の早期中断を実装済み。#1798 で wire の分割送出の PG 17 整合と切断時の協調的中断を実装済み。CancelRequest の受け付けは spec 判断待ち）
+- ステータス: 採用（設計記録。#1796 で構文・計画への接続、#1797 で上限付き実体化の早期中断を実装済み。#1798 で wire の分割送出の PG 17 整合と切断時の協調的中断を実装済み。CancelRequest の受け付けは spec 判断待ち。#2211 で境界テストと記述を整合）
 - ポインタ: SQL-34・SQL-15・WIRE-15・ERR-6（spec 本文は転記しない）
 - 対象: `LIMIT` 省略・`LIMIT ALL` の SELECT を「全件実体化 + 結果行数上限の超過でエラー」で受理するときの、上限判定の位置・超過時の SQLSTATE・カーソルとの関係・広域取得 Scan の走査上限との関係
 - 先行: [result-limits-cli.md](result-limits-cli.md)（Issue #1555。フラグ `--max-result-rows`・`ResultLimits` を本 ADR が再利用する）
@@ -133,3 +133,12 @@
 - `max_rows` 分割を PostgreSQL 17 に揃えた（BREAKING）: 完了タグはその回の Execute で送った件数で、`max_rows` ちょうどで残りが尽きた回も `PortalSuspended` で終え、次の Execute が 0 行と `SELECT 0` を返す。根拠は [wire-extended-query-bind-execute-sync.md](wire-extended-query-bind-execute-sync.md)
 - 協調的中断: `engine::interrupt`（thread-local のスコープ）と `57014`（`ErrorClass::QueryCanceled`）を追加し、#1797 の早期中断と同じ行ループに確認点を置いた。切断の検出は wire の `liveness`。詳細は [statement-interrupt.md](statement-interrupt.md)
 - 未実施: CancelRequest の受け付け（spec 側の判断待ち。設計メモは statement-interrupt.md）、分割実行 DML の中断（#1950）
+
+## 実装メモ（Issue #2211）
+
+- 位置づけ: フラグ `--max-result-rows` の追加・検証・LIMIT 省略時への接続は #1555・#1796・#1797 で実装済み。#2211 は受け入れ条件の検証（テスト）と記述の整合のみで、実装コードの挙動は変えない
+- 既定の境界（wire 層）: `crates/wire-server/tests/wire_result_rows_cap.rs`。`with_result_limits` を呼ばない構成で、10,000 行は成功、10,001 行は simple・extended（`max_rows = 0`）とも `54000` で DataRow 0 件、接続は維持される
+- 上げた側の境界: `crates/engine/tests/sql34_result_rows_raised_cap.rs`。cap 10,001 で省略・`LIMIT ALL` の ちょうど成功と +1 の `54000`、明示 `LIMIT` は設定値まで受理
+- D1 の申し送り（ハード上限）: cap 100,000 で取得上限 100,001 を設定しても、走査上限（`storage::MAX_SCAN_TOTAL_ROWS`）・可視行上限（`tenant::MAX_VISIBLE_ROWS`）に先に当たらず、100,000 行ちょうどは成功（順序なし・`ORDER BY`）、100,001 行は `54000` になることをテストで確認した。修正は不要
+- 別軸の上限: 集合演算の枝・全体は `MAX_SET_OP_ROWS`（10,000 固定）、`GROUP BY` は `MAX_GROUPS`、JOIN は出力行数上限が先に効く。本フラグとは連動させない（result-limits-cli.md D7・SQL-46 (6)）。現行挙動をテストで固定した
+- 申し送り: サブクエリ内側・派生テーブル・CTE 本文・ビュー本文の省略は #1852・#1853、書き込み・実体化の入力は #2212、`max_rows` 分割送出・キャンセルは #1798、距離 `ORDER BY`・`USING PLAN` は #2242
