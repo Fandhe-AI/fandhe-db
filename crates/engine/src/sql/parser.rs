@@ -6329,6 +6329,13 @@ pub(crate) enum AggregateInput {
     /// `ORDER BY` のプログラムを `input` の内側へ閉じ込める自己完結な形（`StringAgg` と同じ）。
     /// `func == ArrayAgg` のときだけこの variant になる。
     ArrayAgg(Box<ArrayAggInput>),
+    /// `bool_and` / `bool_or` / `every` の比較式引数（SQL-57・Issue #1805。`n > 1` 等）。
+    /// `ExprType::Bool` に束縛された式で、`program`（束縛時コンパイル済み）を行ごとに評価する。
+    /// 裸の boolean 列は [`AggregateInput::BooleanColumn`] を再利用する。
+    BoolExpr {
+        source: crate::sql::udf_call::BoundExpr,
+        program: crate::sql::expr_program::ExprProgram,
+    },
 }
 
 /// `array_agg` の束縛済み入力（SQL-57・Issue #1801）。[`resolve_array_agg_input`] が作り、
@@ -6489,6 +6496,12 @@ impl BoundAggregateItem {
         if func.is_variance_family() {
             return Err(SqlSurfaceError::unsupported(
                 "variance aggregates are not supported by this interface",
+            ));
+        }
+        // `bool_and` / `bool_or` / `every` も SQL 表層のみ（SQL-57・Issue #1805）。
+        if func.is_bool_agg() {
+            return Err(SqlSurfaceError::unsupported(
+                "bool_and, bool_or and every are not supported by this interface",
             ));
         }
 
@@ -7389,10 +7402,71 @@ fn resolve_aggregate_item_input(
     if item.func == crate::sql::allowlist::AggregateFunc::ArrayAgg {
         return resolve_array_agg_input(item, schema, udfs, node_budget);
     }
+    if item.func.is_bool_agg() {
+        return resolve_bool_agg_input(item.func, &item.arg, schema, udfs, node_budget);
+    }
     if item.distinct {
         resolve_count_distinct_input(&item.arg, schema, udfs, node_budget)
     } else {
         resolve_aggregate_input(item.func, &item.arg, schema, udfs, node_budget)
+    }
+}
+
+/// `bool_and` / `bool_or` / `every` の引数を束縛する（SQL-57・Issue #1805）。受理するのは
+/// boolean 列の裸参照（[`AggregateInput::BooleanColumn`]）と、`ExprType::Bool` に束縛される式
+/// （比較式。[`AggregateInput::BoolExpr`]）だけ。それ以外の型は該当シグネチャの関数が無い
+/// 扱い（`42883`）、未知の列は `42703`。汎用の [`resolve_aggregate_input`] へ落とすと非 boolean の
+/// 引数が束縛に成功し実行時に内部エラーになるため、専用に絞る。
+fn resolve_bool_agg_input(
+    func: crate::sql::allowlist::AggregateFunc,
+    arg: &crate::sql::allowlist::AggregateArg,
+    schema: &TableSchema,
+    udfs: &crate::sql::udf_call::UdfRegistry,
+    node_budget: &mut usize,
+) -> Result<AggregateInput, SqlSurfaceError> {
+    use crate::sql::allowlist::AggregateArg;
+    use crate::sql::udf_call::ExprType;
+
+    let fname = func.default_alias();
+    let no_function = || {
+        SqlSurfaceError::undefined_function(format!(
+            "function {fname} is only defined for boolean arguments"
+        ))
+    };
+    match arg {
+        AggregateArg::Star => Err(SqlSurfaceError::unsupported(
+            "'*' is only allowed inside COUNT(*)",
+        )),
+        AggregateArg::Expr(Expr::Ident(name)) => {
+            if let Some((index, column)) = schema
+                .columns
+                .iter()
+                .enumerate()
+                .find(|(_, c)| &c.name == name)
+            {
+                return match column.ty {
+                    ColumnType::Boolean => Ok(AggregateInput::BooleanColumn(index)),
+                    _ => Err(no_function()),
+                };
+            }
+            if name == "id" && schema.has_pseudo_id() {
+                return Err(no_function());
+            }
+            Err(SqlSurfaceError::undefined_column(name))
+        }
+        AggregateArg::Expr(expr) => {
+            let (bound, ty) = crate::sql::udf_call::bind_expr(expr, schema, udfs, node_budget)?;
+            match ty {
+                ExprType::Bool => {
+                    let program = crate::sql::expr_program::ExprProgram::compile(&bound);
+                    Ok(AggregateInput::BoolExpr {
+                        source: bound,
+                        program,
+                    })
+                }
+                _ => Err(no_function()),
+            }
+        }
     }
 }
 
@@ -9705,19 +9779,22 @@ pub(crate) fn check_having_target_is_numeric(
     use crate::sql::allowlist::AggregateFunc;
 
     let is_non_count = !matches!(item.func, AggregateFunc::Count);
-    let is_unsupported = is_non_count
-        && matches!(
-            item.input,
-            AggregateInput::TextColumn(_)
-                | AggregateInput::CollatedTextColumn { .. }
-                | AggregateInput::NumericColumn { .. }
-                | AggregateInput::DateColumn(_)
-                | AggregateInput::TimestampColumn(_)
-                | AggregateInput::TimeColumn(_)
-                | AggregateInput::TimestampTzColumn(_)
-                | AggregateInput::IntervalColumn(_)
-                | AggregateInput::ArrayAgg(_)
-        );
+    // `bool_and` 系の結果は boolean で、数値リテラルとの比較は意味を持たない（SQL-57・Issue #1805）。
+    let is_bool_result = item.func.is_bool_agg();
+    let is_unsupported = is_bool_result
+        || is_non_count
+            && matches!(
+                item.input,
+                AggregateInput::TextColumn(_)
+                    | AggregateInput::CollatedTextColumn { .. }
+                    | AggregateInput::NumericColumn { .. }
+                    | AggregateInput::DateColumn(_)
+                    | AggregateInput::TimestampColumn(_)
+                    | AggregateInput::TimeColumn(_)
+                    | AggregateInput::TimestampTzColumn(_)
+                    | AggregateInput::IntervalColumn(_)
+                    | AggregateInput::ArrayAgg(_)
+            );
     if is_unsupported {
         return Err(SqlSurfaceError::invalid_input(format!(
             "HAVING target {target_name:?} is not a numerically comparable aggregate result"
@@ -10062,6 +10139,9 @@ fn aggregate_result_column_type(item: &BoundAggregateItem) -> ColumnType {
     match item.func {
         AggregateFunc::Count => ColumnType::BigInt,
         AggregateFunc::StringAgg => ColumnType::Text,
+        AggregateFunc::BoolAnd | AggregateFunc::BoolOr | AggregateFunc::Every => {
+            ColumnType::Boolean
+        }
         // 配列は式中の列として扱えない（`array_agg(x) || ...` などは `22000`。SQL-57）。
         AggregateFunc::ArrayAgg => EXPR_UNSUPPORTED_COLUMN_TYPE,
         // 分散系（SQL-57・Issue #1803）: numeric 結果（整数系・`id`・numeric 列）は式内で扱えない列、

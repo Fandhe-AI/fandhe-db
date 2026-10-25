@@ -442,6 +442,12 @@ fn bind_aggregate_call(
             detail: format!("{} without FROM is not supported", agg.func.default_alias()),
         });
     }
+    // `bool_and` / `bool_or` / `every` も FROM なしは対象外（SQL-57・Issue #1805）。
+    if agg.func.is_bool_agg() {
+        return Err(SqlSurfaceError::FeatureNotSupported {
+            detail: format!("{} without FROM is not supported", agg.func.default_alias()),
+        });
+    }
     let (arg, arg_ty) = match &agg.arg {
         AggregateArg::Star => (BoundAggArg::Star, None),
         AggregateArg::Expr(Expr::Number(raw)) => {

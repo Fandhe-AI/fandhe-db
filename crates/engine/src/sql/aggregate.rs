@@ -341,6 +341,16 @@ impl ReferencedColumns {
                         has_scalar_reference = true;
                     }
                 }
+                // SQL-57・Issue #1805: `bool_and` 系の比較式引数も `ScalarExpr` と同じ導出を行う
+                // （漏れると縮小デコードした行で列が NULL と取り違えられ結果が黙って誤る）。
+                AggregateInput::BoolExpr { source, .. } => {
+                    if udf_call::references_embedding(source) {
+                        needs_embedding = true;
+                    }
+                    if udf_call::mark_referenced_scalar_columns(source, &mut scalar_mask) {
+                        has_scalar_reference = true;
+                    }
+                }
                 AggregateInput::VectorColumnPresence => needs_vector_presence = true,
                 // SQL-57: 値・区切り・内側 ORDER BY の参照列をすべて反映する（漏れると
                 // 列を縮小デコードした行で式が NULL と取り違えられる／内部エラーになる）。
@@ -826,6 +836,10 @@ pub(crate) enum Accumulator {
     /// [`crate::sql::string_agg`] が持つ。`DISTINCT` もこの variant の内部で扱う
     /// （`COUNT(DISTINCT)` の [`Accumulator::CountDistinct`] とは別物）。
     StringAgg(Box<crate::sql::string_agg::StringAggState>),
+    /// `bool_and` / `every`（SQL-57・Issue #1805）。`None` は未観測（確定時 NULL）。
+    BoolAnd(Option<bool>),
+    /// `bool_or`（SQL-57・Issue #1805）。`None` は未観測（確定時 NULL）。
+    BoolOr(Option<bool>),
     /// `array_agg([DISTINCT] <式> [ORDER BY ...])`（SQL-57・Issue #1801）。状態と意味論は
     /// [`crate::sql::array_agg`] が持つ（`DISTINCT` もこの variant の内部で扱う）。
     ArrayAgg(Box<crate::sql::array_agg::ArrayAggState>),
@@ -903,6 +917,14 @@ impl Accumulator {
         use AggregateFunc::{Avg, Count, Max, Min, Sum};
         Ok(match (func, input) {
             (Count, _) => Accumulator::Count(0),
+            (
+                AggregateFunc::BoolAnd | AggregateFunc::Every,
+                AggregateInput::BooleanColumn(_) | AggregateInput::BoolExpr { .. },
+            ) => Accumulator::BoolAnd(None),
+            (
+                AggregateFunc::BoolOr,
+                AggregateInput::BooleanColumn(_) | AggregateInput::BoolExpr { .. },
+            ) => Accumulator::BoolOr(None),
             (AggregateFunc::ArrayAgg, AggregateInput::ArrayAgg(inp)) => {
                 Accumulator::ArrayAgg(Box::new(crate::sql::array_agg::ArrayAggState::new(inp)))
             }
@@ -1112,11 +1134,39 @@ impl Accumulator {
             // BOOLEAN 列の裸参照は COUNT（非 NULL 行数）専用（`resolve_aggregate_input`
             // が SUM/AVG/MIN/MAX を 42883（undefined_function）で拒否済み。Issue #883）。値の真偽は
             // 問わず「NULL でない」ことだけを数える。
+            // `bool_and` / `bool_or` / `every`（SQL-57・Issue #1805）は同じ入力で真偽値を観測する。
             AggregateInput::BooleanColumn(index) => {
-                if scanned.get(*index).copied().flatten().is_some() {
-                    self.observe_present()
+                let value = match scanned.get(*index).copied().flatten() {
+                    Some(row_codec::ScalarRef::Bool(b)) => Some(b),
+                    Some(_) => {
+                        return Err(accumulator_bug(
+                            "BooleanColumn observed a ScalarRef that is not Bool",
+                        ))
+                    }
+                    None => None,
+                };
+                self.observe_bool(value)
+            }
+            AggregateInput::BoolExpr { source, program } => {
+                let embedding: &[f32] = if udf_call::references_embedding(source) {
+                    match vector.values {
+                        Some(v) => v,
+                        None => {
+                            return Err(accumulator_bug(
+                                "BoolExpr references the VECTOR column but the row's embedding was not decoded",
+                            ))
+                        }
+                    }
                 } else {
-                    Ok(())
+                    &[]
+                };
+                match program.eval(id, embedding, scanned, scratch)? {
+                    ExprValue::Bool(b) => self.observe_bool(Some(b)),
+                    // 比較の片側が NULL の行は集計対象外（3 値論理の UNKNOWN を無視する）。
+                    ExprValue::Null => Ok(()),
+                    _ => Err(accumulator_bug(
+                        "boolean-typed BoundExpr evaluated to a non-boolean value",
+                    )),
                 }
             }
             // `DATE`／`TIMESTAMP` 列の裸参照は `COUNT`・`MIN`/`MAX` を受理する
@@ -1595,7 +1645,8 @@ impl Accumulator {
             | AggregateInput::ArrayColumn(_)
             | AggregateInput::JsonColumn(_)
             | AggregateInput::StringAgg(_)
-            | AggregateInput::ArrayAgg(_) => {
+            | AggregateInput::ArrayAgg(_)
+            | AggregateInput::BoolExpr { .. } => {
                 return Err(accumulator_bug(
                     "COUNT(DISTINCT) accumulator observed an input type that bind-time resolution should have rejected",
                 ))
@@ -1618,6 +1669,31 @@ impl Accumulator {
             }
         }
         Ok(())
+    }
+
+    /// 真偽値 1 件（`None` は NULL で無視）を観測する。`Count`（`COUNT(<boolean 列>)`）は非 NULL を
+    /// 数え、`BoolAnd`／`BoolOr`（SQL-57・Issue #1805）は畳み込む。それ以外は束縛層のバグ。
+    fn observe_bool(&mut self, value: Option<bool>) -> Result<(), SqlSurfaceError> {
+        match (self, value) {
+            (Accumulator::Count(_) | Accumulator::BoolAnd(_) | Accumulator::BoolOr(_), None) => {
+                Ok(())
+            }
+            (Accumulator::Count(n), Some(_)) => {
+                *n = n.checked_add(1).ok_or_else(|| {
+                    SqlSurfaceError::numeric_out_of_range("COUNT exceeds u64 range")
+                })?;
+                Ok(())
+            }
+            (Accumulator::BoolAnd(state), Some(v)) => {
+                *state = Some(state.unwrap_or(true) && v);
+                Ok(())
+            }
+            (Accumulator::BoolOr(state), Some(v)) => {
+                *state = Some(state.unwrap_or(false) || v);
+                Ok(())
+            }
+            _ => Err(accumulator_bug("observe_bool on a non-boolean accumulator")),
+        }
     }
 
     /// NULL・非存在の概念を持たない入力（`*`・`id`・`Scalar` 式）を数えるだけの
@@ -2329,6 +2405,9 @@ impl Accumulator {
                 Some(text) => Cell::Text(text),
                 None => Cell::Null,
             },
+            Accumulator::BoolAnd(b) | Accumulator::BoolOr(b) => {
+                b.map(Cell::Bool).unwrap_or(Cell::Null)
+            }
             Accumulator::ArrayAgg(state) => match state.finish()? {
                 Some(array) => Cell::Array(array),
                 None => Cell::Null,
@@ -3036,6 +3115,10 @@ pub(crate) fn aggregate_result_type(
             ColumnType::Text
         }
         (AggregateFunc::StringAgg, AggregateInput::StringAgg(_)) => ColumnType::Text,
+        (
+            AggregateFunc::BoolAnd | AggregateFunc::BoolOr | AggregateFunc::Every,
+            AggregateInput::BooleanColumn(_) | AggregateInput::BoolExpr { .. },
+        ) => ColumnType::Boolean,
         // `array_agg` は入力の型の 1 次元配列（要素数の上限は `MAX_ARRAY_ELEMENTS`）。公告できない
         // 要素型（`ArrayType::new` が拒否する位取り）は `None`（wire では text フォールバック）。
         (AggregateFunc::ArrayAgg, AggregateInput::ArrayAgg(inp)) => ColumnType::Array(
