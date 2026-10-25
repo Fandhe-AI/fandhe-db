@@ -46,6 +46,14 @@ impl SideBuf {
         self.buf.len().saturating_sub(self.pos)
     }
 
+    /// 消費済み領域を詰める。追記前に必ず呼び、保持量（`buf.len()`・確保量）を未消費分で抑える。
+    fn compact(&mut self) {
+        if self.pos > 0 {
+            self.buf.drain(..self.pos.min(self.buf.len()));
+            self.pos = 0;
+        }
+    }
+
     /// 先頭から最大 `out.len()` バイトを `out` へ移して件数を返す。
     fn drain_into(&mut self, out: &mut [u8]) -> usize {
         let src = self.buf.get(self.pos..).unwrap_or(&[]);
@@ -142,6 +150,7 @@ pub(crate) fn peer_is_gone(probe: &LivenessProbe) -> bool {
 /// 非ブロッキングの `probe.sock` から side buffer の残量まで読み取り、FIN／エラーなら真。
 fn drain_to_side(probe: &LivenessProbe) -> bool {
     let mut side = probe.side.borrow_mut();
+    side.compact();
     let mut chunk = [0u8; 4096];
     loop {
         let room = SIDE_BUF_CAP.saturating_sub(side.pending());
@@ -298,6 +307,29 @@ mod tests {
         server.read_exact(&mut all).expect("read all");
         assert!(all.iter().all(|&b| b == 7));
         drop(writer.join().expect("join"));
+    }
+
+    /// 未消費データを常に残したまま probe と部分 read を繰り返しても、保持量（len・capacity）が
+    /// 上限内に収まる（消費済み領域を詰めずに追記し続けるとメモリが増え続けた）。
+    #[test]
+    fn repeated_probe_and_partial_read_keeps_memory_bounded() {
+        let (mut server, mut client) = pair();
+        let probe = probe_of(&server);
+        for _ in 0..2000 {
+            client.write_all(&[1u8; 100]).expect("write");
+            std::thread::sleep(Duration::from_millis(1));
+            assert!(!peer_is_gone(&probe));
+            // 常に未消費データを残すため、書いた量より少なく読む。
+            let mut small = [0u8; 90];
+            server.read_exact(&mut small).expect("partial read");
+            let side = probe.side.borrow();
+            assert!(side.buf.len() <= SIDE_BUF_CAP, "len {}", side.buf.len());
+            assert!(
+                side.buf.capacity() <= 2 * SIDE_BUF_CAP,
+                "cap {}",
+                side.buf.capacity()
+            );
+        }
     }
 
     #[test]
