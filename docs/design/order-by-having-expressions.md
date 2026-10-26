@@ -74,7 +74,8 @@
 
 ## 対象外（Issue 起票なし・後続の管轄を除く）
 
-- `HAVING`／`ORDER BY` 内の集計関数呼び出し（`HAVING count(*) > 1`・`ORDER BY sum(x)`）は `42601` のまま。
+- `ORDER BY` 内の集計関数呼び出し（`ORDER BY sum(x)`）は `42601` のまま（Issue #1815 の管轄）。`HAVING` 内の
+  集計関数呼び出しは Issue #1814 で対応した（下の「Issue #1814 追記」）。
 - 式位置での単項マイナス、`ORDER BY (expr)`・算術で始まるキー。位置指定 `ORDER BY 1` は
   Issue #1792、`NULLS FIRST/LAST` は Issue #1791 で対応した（下の各「追記」）。
 - `SELECT DISTINCT ... ORDER BY <式>`・`GROUP BY` なしの `HAVING`・GROUP BY キー自体の式化。
@@ -153,6 +154,29 @@
   サブクエリ・CTE など）は受理しない。`OFFSET m ROWS` と `LIMIT` の順（`OFFSET` 先）は `FETCH` を伴う
   場合のみ並べ替える（`OFFSET m LIMIT n` は従来どおり `42601`）。
 - テスト: `tests/sql56_fetch_first.rs`、単体 `sql::fetch_clause`。
+
+## Issue #1814 追記（HAVING 内の集計呼び出し。SQL-58 のポインタ）
+
+- 構文段: トップレベルの集計 `SELECT`（`allow_aggregate_expr_items` が真の文）に限り、`HAVING` 内の集計呼び出しを
+  読む。同一の呼び出し（別名を除いて同じ関数・引数・`DISTINCT`・内側 `ORDER BY`）は 1 つにまとめ、述語側は
+  内部名（制御文字で始まる識別子。利用者の識別子と衝突しない）に置換して `GroupByClause::having_aggregates` へ
+  出現順に溜める。呼び出し数は積む前に上限 32 で頭打ちにする（`54000`）。
+- 従来形への脱糖: `<集計呼び出し> <cmp> [-]<数値>` は従来形の述語（`HavingPredicate`）にする。`sum(bigint)`・
+  整数の `avg` のような `NUMERIC` 結果も、従来形の厳密比較で評価される。それ以外（`coalesce(max(x), 0) > 1`・
+  `sum(a) > max(b)`・`count(*) * 2 > 3`）は式形で、既存の式 `HAVING` の経路で評価する。
+- 束縛段: `HAVING` の集計呼び出しを、SELECT リストの同じ集計があればそれと共有し、無ければ隠し集計項目として
+  `BoundAggregate::items` へ積む（可視項目と同じ入力解決・同じ WHERE／RLS 適用の走査・アキュムレータ）。
+  隠し項目は `projection` に積まないため `RowDescription` に現れない。隠し項目込みの総数が 32 を超える
+  場合は `54000`。`array_agg` は `0A000`、TEXT・日時の `MIN`／`MAX` は `22000`（従来形）、式内の `NUMERIC` 結果の
+  算術は `22000`。エラー文言に内部名は出さない。
+- SELECT リストに集計項目が無い形（`SELECT lang FROM t GROUP BY lang HAVING count(*) > 1`）は、`HAVING` が
+  集計呼び出しを持つ場合に限り受理する。`GROUP BY` なしの `HAVING` は従来どおり `42601`。
+- fail-closed の境界: CTE 主クエリ・集合演算の枝・サブクエリ内部・ビュー本体・評価後射影形ビューの外側は `42601`、
+  列別名ビューは `0A000`。単純形ビューでは `HAVING` 内の集計の引数をビューの公開列に限定する（非公開列は `42703`）。
+  参照列の収集（サブクエリ・評価後射影形ビュー）にも `HAVING` の集計引数を含める。
+- 対象外: `GROUP BY` なしの `HAVING`、JOIN 集計の `HAVING`、NoSQL（HTTP）表層、`$n` を含む `HAVING`、
+  式形の中の `NUMERIC` 結果の算術（`sum(bigint) + 1 > 10` は `22000`）、左右を入れ替えた `10 < sum(bigint)`。
+- テスト: `tests/sql58_having_aggregate_calls.rs`、wire 層は `wire_sql58_having_aggregate_calls.rs`。
 
 ## PostgreSQL との既知の差分
 

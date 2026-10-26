@@ -543,7 +543,7 @@ fn simple_unsupported_forms_return_exact_sqlstate_and_session_continues() {
         "SELECT id FROM docs ORDER BY count(*) LIMIT 5".to_string(),
         "SELECT id FROM docs ORDER BY 1 + 0 LIMIT 5".to_string(),
         "SELECT id FROM docs ORDER BY lower(title), embedding <=> '[1.0,0.0]' LIMIT 5".to_string(),
-        format!("{AGG} HAVING count(*) > 1"),
+        format!("{AGG} HAVING sum(count(*)) > 1"),
         format!("{AGG} ORDER BY sum(n)"),
     ] {
         assert_simple_error(&mut s, &sql, "42601");

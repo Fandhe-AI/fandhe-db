@@ -702,6 +702,215 @@ pub(crate) fn avg_unscaled(
     })
 }
 
+/// 分散系集計（`variance`／`var_pop`／`var_samp`。SQL-57・Issue #1803）の中間値用の
+/// 256 bit 符号なし整数。`bigint` の二乗和 × 行数は `i128` を容易に超えるため、
+/// 外部クレートを足さずに最小限の演算だけを自作する（`sql::variance` が唯一の利用者）。
+/// 全演算は checked で、`unsafe` を使わない。
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
+pub(crate) struct U256 {
+    // フィールド順が比較順（上位 → 下位）になるよう hi を先に置く。
+    hi: u128,
+    lo: u128,
+}
+
+impl U256 {
+    pub(crate) const ZERO: U256 = U256 { hi: 0, lo: 0 };
+
+    pub(crate) fn from_u128(v: u128) -> Self {
+        U256 { hi: 0, lo: v }
+    }
+
+    pub(crate) fn is_zero(&self) -> bool {
+        self.hi == 0 && self.lo == 0
+    }
+
+    /// 2 つの `u128` の積（256 bit に必ず収まる）。64 bit limb の部分積から組み立てる。
+    pub(crate) fn mul_wide(a: u128, b: u128) -> Self {
+        const M: u128 = u64::MAX as u128;
+        let (a0, a1) = (a & M, a >> 64);
+        let (b0, b1) = (b & M, b >> 64);
+        let p00 = a0 * b0;
+        let p01 = a0 * b1;
+        let p10 = a1 * b0;
+        let p11 = a1 * b1;
+        // 各部分積は 2^128 未満。mid は高々 3 * (2^64 - 1) で u128 に収まる。
+        let mid = (p00 >> 64) + (p01 & M) + (p10 & M);
+        let lo = (p00 & M) | ((mid & M) << 64);
+        let hi = p11 + (p01 >> 64) + (p10 >> 64) + (mid >> 64);
+        U256 { hi, lo }
+    }
+
+    pub(crate) fn checked_add(self, other: U256) -> Option<U256> {
+        let (lo, carry) = self.lo.overflowing_add(other.lo);
+        let hi = self
+            .hi
+            .checked_add(other.hi)?
+            .checked_add(u128::from(carry))?;
+        Some(U256 { hi, lo })
+    }
+
+    pub(crate) fn checked_add_u128(self, other: u128) -> Option<U256> {
+        self.checked_add(U256::from_u128(other))
+    }
+
+    /// `self - other`。`self < other` なら `None`。
+    pub(crate) fn checked_sub(self, other: U256) -> Option<U256> {
+        if self < other {
+            return None;
+        }
+        let (lo, borrow) = self.lo.overflowing_sub(other.lo);
+        let hi = self.hi - other.hi - u128::from(borrow);
+        Some(U256 { hi, lo })
+    }
+
+    pub(crate) fn checked_mul_u128(self, m: u128) -> Option<U256> {
+        let low = U256::mul_wide(self.lo, m);
+        let high = U256::mul_wide(self.hi, m);
+        // `self.hi * m` が 128 bit を超える（256 bit 超過）なら桁あふれ。
+        if high.hi != 0 {
+            return None;
+        }
+        let hi = low.hi.checked_add(high.lo)?;
+        Some(U256 { hi, lo: low.lo })
+    }
+
+    /// `self / d` の商と剰余（`d != 0` が前提。0 は `None`）。剰余は `d` 未満なので `u128`。
+    /// 二進の shift-subtract（256 反復）。呼び出しは確定時の数回だけで性能は問題にならない。
+    pub(crate) fn divmod_u128(self, d: u128) -> Option<(U256, u128)> {
+        if d == 0 {
+            return None;
+        }
+        let mut quotient = U256::ZERO;
+        let mut rem: u128 = 0;
+        for i in (0..256u32).rev() {
+            let bit = if i >= 128 {
+                (self.hi >> (i - 128)) & 1
+            } else {
+                (self.lo >> i) & 1
+            };
+            let carry = rem >> 127;
+            rem = (rem << 1) | bit;
+            // carry が立つ場合の真の値は 2^128 + rem で、必ず d 以上（d < 2^128）。
+            if carry == 1 || rem >= d {
+                rem = rem.wrapping_sub(d);
+                if i >= 128 {
+                    quotient.hi |= 1u128 << (i - 128);
+                } else {
+                    quotient.lo |= 1u128 << i;
+                }
+            }
+        }
+        Some((quotient, rem))
+    }
+
+    /// `i128` に収まるなら変換する。
+    pub(crate) fn to_i128(self) -> Option<i128> {
+        if self.hi != 0 {
+            return None;
+        }
+        i128::try_from(self.lo).ok()
+    }
+}
+
+/// `value = u / 10^dscale`（`u` は非負）の NBASE(=10000) 表現での weight と先頭桁を返す
+/// （PostgreSQL の numeric の `weight`／`digits[0]` 相当。小数点位置に揃えた 4 桁区切り）。
+/// 0 は `(0, 0)`。
+fn nbase_weight_first(u: U256, dscale: u32) -> Result<(i64, u128), NumericError> {
+    if u.is_zero() {
+        return Ok((0, 0));
+    }
+    // 小数部の桁数を 4 の倍数にそろえる（値は変えず unscaled だけを 10 倍する）。
+    let pad = (4 - dscale % 4) % 4;
+    let factor = pow10(u8::try_from(pad).map_err(|_| NumericError::OutOfRange)?)
+        .ok_or(NumericError::OutOfRange)?;
+    let aligned = u
+        .checked_mul_u128(factor.unsigned_abs())
+        .ok_or(NumericError::OutOfRange)?;
+    let frac_groups = i64::from((dscale + pad) / 4);
+    let mut groups: i64 = 0;
+    let mut rest = aligned;
+    loop {
+        let (q, r) = rest
+            .divmod_u128(10_000)
+            .ok_or_else(|| NumericError::Malformed("NBASE divisor must not be zero".to_string()))?;
+        groups += 1;
+        if q.is_zero() {
+            return Ok((groups - 1 - frac_groups, r));
+        }
+        rest = q;
+    }
+}
+
+/// PostgreSQL の `select_div_scale`（`numeric.c`）の一般化。被除数 `num / 10^num_dscale` と
+/// 除数 `den / 10^den_dscale` の NBASE 先頭桁と weight から `16 - 4 * qweight` を求め、
+/// 双方の dscale 以上・`0..=1000` に収める（Issue #1803。分散の除算結果 scale の決定）。
+pub(crate) fn select_div_scale_wide(
+    num: U256,
+    num_dscale: u32,
+    den: u128,
+    den_dscale: u32,
+) -> Result<u32, NumericError> {
+    let (w_num, first_num) = nbase_weight_first(num, num_dscale)?;
+    let (w_den, first_den) = nbase_weight_first(U256::from_u128(den), den_dscale)?;
+    let mut qweight = w_num - w_den;
+    if first_num <= first_den {
+        qweight -= 1;
+    }
+    let rscale = 16i64
+        .saturating_sub(qweight.saturating_mul(4))
+        .max(i64::from(num_dscale))
+        .max(i64::from(den_dscale))
+        .clamp(0, 1000);
+    u32::try_from(rscale).map_err(|_| NumericError::OutOfRange)
+}
+
+/// `num / (10^num_scale * den)` を `result_scale` 桁の unscaled 整数へ丸める（half away from
+/// zero。`num`・`den` は非負）。`result_scale < num_scale` と `den == 0` は
+/// [`NumericError::Malformed`]（呼び出し元の不変条件違反）、`result_scale` が [`MAX_PRECISION`]
+/// 超または結果が `i128` を超える場合は [`NumericError::OutOfRange`]。
+/// 1 桁ずつ商を確定する長除算で、中間剰余は常に `den` 未満。
+pub(crate) fn div_round_wide(
+    num: U256,
+    num_scale: u32,
+    den: u128,
+    result_scale: u32,
+) -> Result<i128, NumericError> {
+    if den == 0 || result_scale < num_scale {
+        return Err(NumericError::Malformed(
+            "invalid division operands".to_string(),
+        ));
+    }
+    if result_scale > u32::from(MAX_PRECISION) {
+        return Err(NumericError::OutOfRange);
+    }
+    let (mut quotient, mut rem) = num
+        .divmod_u128(den)
+        .ok_or_else(|| NumericError::Malformed("division by zero".to_string()))?;
+    for _ in 0..(result_scale - num_scale) {
+        let (digit_wide, next_rem) = U256::mul_wide(rem, 10)
+            .divmod_u128(den)
+            .ok_or_else(|| NumericError::Malformed("division by zero".to_string()))?;
+        // `rem < den` なので 10 * rem / den は 10 未満。
+        if digit_wide.hi != 0 || digit_wide.lo >= 10 {
+            return Err(NumericError::Malformed(
+                "long division digit out of range".to_string(),
+            ));
+        }
+        quotient = quotient
+            .checked_mul_u128(10)
+            .and_then(|q| q.checked_add_u128(digit_wide.lo))
+            .ok_or(NumericError::OutOfRange)?;
+        rem = next_rem;
+    }
+    // half away from zero: `2 * rem >= den`（`rem < den` なので桁あふれしない書き方）。
+    if rem >= den - rem {
+        quotient = quotient
+            .checked_add_u128(1)
+            .ok_or(NumericError::OutOfRange)?;
+    }
+    quotient.to_i128().ok_or(NumericError::OutOfRange)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1164,5 +1373,117 @@ mod tests {
             parse_literal_exact("1e"),
             Err(NumericError::Malformed(_))
         ));
+    }
+
+    fn u(v: u128) -> U256 {
+        U256::from_u128(v)
+    }
+
+    #[test]
+    fn u256_mul_wide_and_arith() {
+        // (2^128 - 1)^2 = 2^256 - 2^129 + 1
+        let m = U256::mul_wide(u128::MAX, u128::MAX);
+        assert_eq!(
+            m,
+            U256 {
+                hi: u128::MAX - 1,
+                lo: 1
+            }
+        );
+        assert_eq!(U256::mul_wide(3, 4), u(12));
+        assert_eq!(u(u128::MAX).checked_add(u(1)), Some(U256 { hi: 1, lo: 0 }));
+        assert_eq!(U256 { hi: 1, lo: 0 }.checked_sub(u(1)), Some(u(u128::MAX)));
+        assert_eq!(u(1).checked_sub(u(2)), None);
+        assert_eq!(
+            U256 {
+                hi: u128::MAX,
+                lo: 0
+            }
+            .checked_mul_u128(2),
+            None
+        );
+        assert_eq!(
+            u(1 << 100).checked_mul_u128(1 << 100),
+            Some(U256::mul_wide(1 << 100, 1 << 100))
+        );
+        assert_eq!(
+            U256 {
+                hi: u128::MAX,
+                lo: u128::MAX
+            }
+            .checked_add(u(1)),
+            None
+        );
+    }
+
+    #[test]
+    fn u256_divmod_matches_known_values() {
+        assert_eq!(u(100).divmod_u128(7), Some((u(14), 2)));
+        assert_eq!(u(5).divmod_u128(0), None);
+        // 商 * 除数 + 剰余 が元の値に戻る。
+        let n = U256 { hi: 1 << 72, lo: 0 };
+        let (q, r) = n.divmod_u128(3).expect("nonzero divisor");
+        assert_eq!(
+            q.checked_mul_u128(3).and_then(|v| v.checked_add_u128(r)),
+            Some(n)
+        );
+        // 除数が 2^127 以上でも剰余が正しい。
+        let d = u128::MAX - 5;
+        let big = U256::mul_wide(d, 12345).checked_add_u128(77).expect("fits");
+        assert_eq!(big.divmod_u128(d), Some((u(12345), 77)));
+    }
+
+    #[test]
+    fn select_div_scale_wide_matches_pg_examples() {
+        // 整数 1,2,3: 分子 6、母分散の分母 9 → 20。標本の分母 6 → 20。
+        assert_eq!(select_div_scale_wide(u(6), 0, 9, 0), Ok(20));
+        assert_eq!(select_div_scale_wide(u(6), 0, 6, 0), Ok(20));
+        // 整数 1,2,3,4: 分子 20、標本 12 → 16、母 16 → 16。
+        assert_eq!(select_div_scale_wide(u(20), 0, 12, 0), Ok(16));
+        assert_eq!(select_div_scale_wide(u(20), 0, 16, 0), Ok(16));
+        // 既存の整数 AVG 用関数と同じ入力で一致する。
+        for (sum, count) in [(10i128, 4u64), (1, 3), (123_456_789, 7), (5, 1)] {
+            assert_eq!(
+                select_div_scale_wide(u(sum.unsigned_abs()), 0, u128::from(count), 0),
+                Ok(u32::from(pg_div_result_scale(sum, count)))
+            );
+        }
+        // 分子 dscale 以上になる。
+        assert!(select_div_scale_wide(u(2), 4, 9, 0).expect("scale") >= 4);
+    }
+
+    #[test]
+    fn div_round_wide_rounds_half_away() {
+        // 6 / 9 = 0.66666666666666666667（20 桁）
+        assert_eq!(
+            div_round_wide(u(6), 0, 9, 20),
+            Ok(66_666_666_666_666_666_667)
+        );
+        assert_eq!(
+            div_round_wide(u(6), 0, 6, 20),
+            Ok(100_000_000_000_000_000_000)
+        );
+        // 20 / 12 = 1.6666666666666667（16 桁）
+        assert_eq!(div_round_wide(u(20), 0, 12, 16), Ok(16_666_666_666_666_667));
+        // ちょうど半分は切り上げ。
+        assert_eq!(div_round_wide(u(1), 0, 2, 0), Ok(1));
+        assert_eq!(div_round_wide(u(1), 0, 3, 0), Ok(0));
+        // 不変条件違反と範囲超過。
+        assert!(matches!(
+            div_round_wide(u(1), 0, 0, 0),
+            Err(NumericError::Malformed(_))
+        ));
+        assert!(matches!(
+            div_round_wide(u(1), 2, 1, 1),
+            Err(NumericError::Malformed(_))
+        ));
+        assert_eq!(
+            div_round_wide(u(1), 0, 1, 39),
+            Err(NumericError::OutOfRange)
+        );
+        assert_eq!(
+            div_round_wide(U256 { hi: 1, lo: 0 }, 0, 1, 0),
+            Err(NumericError::OutOfRange)
+        );
     }
 }

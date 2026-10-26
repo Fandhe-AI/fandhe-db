@@ -359,6 +359,7 @@ fn plan_aggregate(
         for c in &gb.columns {
             idents.insert(c.clone());
         }
+        gb.collect_having_aggregate_idents(&mut idents);
     }
     check_unambiguous(body_columns, &idents)?;
     let (schema, types) = synth_schema(&agg.table_name, body_columns);

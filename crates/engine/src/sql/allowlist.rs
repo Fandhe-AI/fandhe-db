@@ -355,6 +355,9 @@ pub(crate) fn is_aggregate_function_name(name: &str) -> bool {
             | "MAX"
             | "STRING_AGG"
             | "ARRAY_AGG"
+            | "VARIANCE"
+            | "VAR_POP"
+            | "VAR_SAMP"
             | "BOOL_AND"
             | "BOOL_OR"
             | "EVERY"
@@ -3115,6 +3118,13 @@ pub enum AggregateFunc {
     /// 1 次元配列（NULL 入力は NULL 要素・入力なしは NULL）。内側の `ORDER BY`・`DISTINCT` を
     /// 受理する（SQL 表層のみ。`string_agg` と同じ仕組みを共有する）。
     ArrayAgg,
+    /// `variance(<数値>)`（SQL-57・Issue #1803）。`var_samp` と同義（標本分散）。入力が整数系・
+    /// numeric なら numeric、浮動小数・数値式なら double を返す。行数 0 は NULL、1 も NULL。
+    Variance,
+    /// `var_pop(<数値>)`（SQL-57・Issue #1803）。母分散。行数 0 は NULL、1 は 0。
+    VarPop,
+    /// `var_samp(<数値>)`（SQL-57・Issue #1803）。標本分散。行数 0・1 は NULL。
+    VarSamp,
     /// `bool_and(<boolean 式>)`（SQL-57・Issue #1805）。全行が真なら真。NULL 入力は無視し、
     /// 入力なし・全行 NULL は NULL。結果は boolean。
     BoolAnd,
@@ -3127,6 +3137,15 @@ pub enum AggregateFunc {
 }
 
 impl AggregateFunc {
+    /// 分散系の集計関数か（`variance`／`var_pop`／`var_samp`。Issue #1803）。
+    /// 引数の型検査・結果型・累積器の選択がこの 3 関数で共通になる。
+    pub(crate) fn is_variance_family(self) -> bool {
+        matches!(
+            self,
+            AggregateFunc::Variance | AggregateFunc::VarPop | AggregateFunc::VarSamp
+        )
+    }
+
     /// `bool_and` / `bool_or` / `every` か（SQL-57・Issue #1805）。引数が boolean 式で、
     /// 非対応の文脈（FROM なし・JOIN・ビュー・NoSQL 等）では fail-closed に拒否する関数群。
     pub(crate) fn is_bool_agg(self) -> bool {
@@ -3146,6 +3165,9 @@ impl AggregateFunc {
             "MAX" => Some(AggregateFunc::Max),
             "STRING_AGG" => Some(AggregateFunc::StringAgg),
             "ARRAY_AGG" => Some(AggregateFunc::ArrayAgg),
+            "VARIANCE" => Some(AggregateFunc::Variance),
+            "VAR_POP" => Some(AggregateFunc::VarPop),
+            "VAR_SAMP" => Some(AggregateFunc::VarSamp),
             "BOOL_AND" => Some(AggregateFunc::BoolAnd),
             "BOOL_OR" => Some(AggregateFunc::BoolOr),
             "EVERY" => Some(AggregateFunc::Every),
@@ -3163,6 +3185,9 @@ impl AggregateFunc {
             AggregateFunc::Max => "max",
             AggregateFunc::StringAgg => "string_agg",
             AggregateFunc::ArrayAgg => "array_agg",
+            AggregateFunc::Variance => "variance",
+            AggregateFunc::VarPop => "var_pop",
+            AggregateFunc::VarSamp => "var_samp",
             AggregateFunc::BoolAnd => "bool_and",
             AggregateFunc::BoolOr => "bool_or",
             AggregateFunc::Every => "every",
@@ -3374,25 +3399,46 @@ pub(crate) fn expr_bare_idents(expr: &Expr) -> Vec<String> {
     v
 }
 
+/// 集計呼び出し 1 つが参照する表の列名（引数・`string_agg` の区切り・内側 `ORDER BY` の式の
+/// 識別子）を `out` へ集める。SELECT リストの集計項目と `HAVING` 内の集計呼び出し
+/// （Issue #1814・SQL-58）が共有する単一実装。
+pub(crate) fn collect_aggregate_item_idents(
+    agg: &AggregateItem,
+    out: &mut std::collections::HashSet<String>,
+) {
+    if let AggregateArg::Expr(e) = &agg.arg {
+        super::parser::collect_expr_idents(e, out);
+    }
+    // SQL-57: `string_agg` の区切り・内側 `ORDER BY` の式の識別子も参照列に含める
+    // （漏れると列の公開範囲検査・参照列の導出をすり抜けて非公開列を参照できてしまう）。
+    for e in &agg.extra_args {
+        super::parser::collect_expr_idents(e, out);
+    }
+    for k in &agg.order_by {
+        super::parser::collect_expr_idents(&k.expr, out);
+    }
+}
+
+impl GroupByClause {
+    /// `HAVING` 内の集計呼び出し（[`Self::having_aggregates`]）が参照する表の列名を `out` へ集める
+    /// （参照列収集・列の公開範囲検査から漏れないようにするための共通入口。Issue #1814）。
+    pub(crate) fn collect_having_aggregate_idents(
+        &self,
+        out: &mut std::collections::HashSet<String>,
+    ) {
+        for agg in &self.having_aggregates {
+            collect_aggregate_item_idents(agg, out);
+        }
+    }
+}
+
 impl AggregateSelectItem {
     /// この項目が参照する表の列名を `out` へ集める（ビューの公開列検査・相関参照検査・
     /// 評価後射影形ビューの参照列収集が共有する単一実装）。集計式項目は、式中の裸識別子
     /// （内部名を除く）と各集計呼び出しの引数の識別子を必ず含める（列の公開範囲検査から
     /// 漏れると非公開列を式経由で参照できてしまうため。security.md「アクセス制御の不備」）。
     pub(crate) fn collect_referenced_idents(&self, out: &mut std::collections::HashSet<String>) {
-        let agg_args = |agg: &AggregateItem, out: &mut std::collections::HashSet<String>| {
-            if let AggregateArg::Expr(e) = &agg.arg {
-                super::parser::collect_expr_idents(e, out);
-            }
-            // SQL-57: `string_agg` の区切り・内側 `ORDER BY` の式の識別子も参照列に含める
-            // （漏れると列の公開範囲検査・参照列の導出をすり抜けて非公開列を参照できてしまう）。
-            for e in &agg.extra_args {
-                super::parser::collect_expr_idents(e, out);
-            }
-            for k in &agg.order_by {
-                super::parser::collect_expr_idents(&k.expr, out);
-            }
-        };
+        let agg_args = collect_aggregate_item_idents;
         match self {
             AggregateSelectItem::GroupKey { column, .. } => {
                 out.insert(column.clone());
@@ -3437,9 +3483,9 @@ impl AggregateSelectItem {
 }
 
 /// `HAVING` 述語 1 つ（TASK-167・SQL-14）。左辺は SELECT リストに現れる集計項目の
-/// 実効名（別名または既定名）への参照のみを許可し、右辺は数値リテラルに限定する
-/// （集計関数呼び出し形の直接記述・列同士の比較・文字列リテラルはいずれも許可
-/// リスト外）。意味論的な名前解決（存在確認・型検査）は
+/// 実効名（別名または既定名）への参照、または `HAVING` 内の集計呼び出し（Issue #1814・SQL-58。
+/// 内部名 [`aggregate_placeholder`] に置換済み）を許可し、右辺は数値リテラルに限定する
+/// （列同士の比較・文字列リテラルは許可リスト外）。意味論的な名前解決（存在確認・型検査）は
 /// `sql::parser::bind_aggregate` の責務。
 #[derive(Debug, Clone, PartialEq)]
 pub struct HavingPredicate {
@@ -3474,7 +3520,7 @@ pub struct AggregateOrderBy {
 /// 辺が関数呼び出し・`CASE`・`COALESCE`・`NULLIF`（`EXTRACT` 含む）を含む。従来形
 /// （[`HavingPredicate`]。`<ident> <cmp> [-]<number>`）はそのまま残し、本型は従来形で
 /// 表せない述語だけを保持する。式内の識別子は `GROUP BY` 列名・そのエイリアス・集計項目の
-/// 実効名を参照し、束縛段が解決する（集計関数呼び出しの直接記述は構文段で `42601`）。
+/// 実効名、または `HAVING` 内の集計呼び出しの内部名（Issue #1814）を参照し、束縛段が解決する。
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) struct HavingExprPredicate {
     pub(crate) lhs: Expr,
@@ -3492,6 +3538,11 @@ pub struct GroupByClause {
     pub(crate) having: Vec<HavingPredicate>,
     /// 式述語の `HAVING`（Issue #1188・SQL-26）。`having` と AND 結合される。
     pub(crate) having_exprs: Vec<HavingExprPredicate>,
+    /// `HAVING` 内に直接書かれた集計呼び出し（Issue #1814・SQL-58）。出現順・重複排除済みで、
+    /// 述語側は内部名 [`aggregate_placeholder`]`(j)`（`j` はこの配列の添字）の識別子に置換済み。
+    /// 束縛段（`sql::parser::bind_aggregate_with_dummy_flags`）が隠し集計項目として
+    /// `BoundAggregate::items` へ積み、述語の内部名をその項目への参照へ解決する。
+    pub(crate) having_aggregates: Vec<AggregateItem>,
     /// `ORDER BY` のキー列（宣言順。空なら `ORDER BY` なし。Issue #1185・SQL-25 (a)
     /// で単一識別子から複数キーへ一般化。上限は [`MAX_SCALAR_ORDER_KEYS`]）。
     pub(crate) order_by: Vec<AggregateOrderBy>,
@@ -5151,6 +5202,10 @@ struct Parser<'a> {
     /// 暗黙主キー正規化）を行うか（TABLE-23・Issue #2199。NoSQL 表層の表作成専用）。
     legacy_implicit_id: bool,
     agg_calls: Option<Vec<AggregateItem>>,
+    /// `true` の間は [`Self::parse_embedded_aggregate_call`] が同一の集計呼び出しを 1 つの内部名へ
+    /// まとめ、枠数検査を `HAVING` 専用（呼び出し数の頭打ちのみ。総数の最終判定は束縛段）にする
+    /// （Issue #1814・SQL-58。`HAVING` を読む間だけ真）。
+    agg_calls_dedup: bool,
     /// SELECT リストで既に確定した項目が占める集計項目枠数（[`AggregateSelectItem::slot_count`]
     /// の合計）。式中の集計呼び出しを溜める前に [`MAX_AGGREGATE_ITEMS`] を検査するための基点。
     agg_slots_used: usize,
@@ -5230,6 +5285,7 @@ impl<'a> Parser<'a> {
             reject_from_alias: false,
             allow_aggregate_expr_items: false,
             agg_calls: None,
+            agg_calls_dedup: false,
             agg_slots_used: 0,
             upsert_table: None,
             dml_from_target: None,
@@ -6237,16 +6293,27 @@ impl<'a> Parser<'a> {
     /// **前**に検査する（1 項目へ多数の集計を詰めてアキュムレータを無制限に確保させる
     /// DoS の防止。超過は `54000`）。
     fn parse_embedded_aggregate_call(&mut self, name: &str) -> Result<Expr, SqlSurfaceError> {
-        let used = self
-            .agg_slots_used
-            .saturating_add(self.agg_calls.as_ref().map_or(0, Vec::len));
-        check_aggregate_item_count(used.saturating_add(2))?;
+        let dedup = self.agg_calls_dedup;
+        if !dedup {
+            let used = self
+                .agg_slots_used
+                .saturating_add(self.agg_calls.as_ref().map_or(0, Vec::len));
+            check_aggregate_item_count(used.saturating_add(2))?;
+        }
         let item = self.parse_aggregate_call_after_name(name)?;
         self.consume_expr_node()?;
         let calls = self
             .agg_calls
             .as_mut()
             .ok_or_else(|| SqlSurfaceError::unsupported("aggregate call is not allowed here"))?;
+        if dedup {
+            // Issue #1814・SQL-58: `HAVING` 内の同一呼び出しは 1 つのアキュムレータにまとめる。
+            // 呼び出し数は積む前に頭打ちにする（`54000`。SELECT リストとの合算上限は束縛段）。
+            if let Some(j) = calls.iter().position(|c| *c == item) {
+                return Ok(Expr::Ident(aggregate_placeholder(j)));
+            }
+            check_aggregate_item_count(calls.len().saturating_add(1))?;
+        }
         let j = calls.len();
         calls.push(item);
         Ok(Expr::Ident(aggregate_placeholder(j)))
@@ -6434,10 +6501,44 @@ impl<'a> Parser<'a> {
     /// 数値リテラル限定（文字列リテラル・両辺集計・括弧・`OR` はいずれも許可リスト
     /// 外）。条件数は [`MAX_AGGREGATE_ITEMS`] で頭打ちにする（`54000`。無制限
     /// `Vec` 確保を避ける方針を HAVING 条件にも適用）。
+    ///
+    /// Issue #1814・SQL-58: `allow_aggregate_expr_items` が真の文（トップレベルの集計 `SELECT`）
+    /// に限り、`HAVING` 内の集計呼び出し（`HAVING count(*) > 1`）を受理し、重複排除した
+    /// 集計項目の配列を第 3 要素で返す。述語側は内部名（[`aggregate_placeholder`]）の識別子に
+    /// 置換される。それ以外の文脈（CTE 主クエリ・集合演算の枝・サブクエリ・ビュー本体）は
+    /// `agg_calls` が `None` のままで、従来どおり `42601`。
+    #[allow(clippy::type_complexity)]
     fn parse_having(
         &mut self,
-    ) -> Result<(Vec<HavingPredicate>, Vec<HavingExprPredicate>), SqlSurfaceError> {
+    ) -> Result<
+        (
+            Vec<HavingPredicate>,
+            Vec<HavingExprPredicate>,
+            Vec<AggregateItem>,
+        ),
+        SqlSurfaceError,
+    > {
         self.expect_contextual_keyword("HAVING")?;
+        if !self.allow_aggregate_expr_items {
+            let (p, e) = self.parse_having_predicates()?;
+            return Ok((p, e, Vec::new()));
+        }
+        let saved_calls = self.agg_calls.take();
+        let saved_dedup = self.agg_calls_dedup;
+        self.agg_calls = Some(Vec::new());
+        self.agg_calls_dedup = true;
+        let parsed = self.parse_having_predicates();
+        let calls = self.agg_calls.take();
+        self.agg_calls = saved_calls;
+        self.agg_calls_dedup = saved_dedup;
+        let (p, e) = parsed?;
+        Ok((p, e, calls.unwrap_or_default()))
+    }
+
+    /// [`Self::parse_having`] の述語列本体（`HAVING` キーワード消費後）。
+    fn parse_having_predicates(
+        &mut self,
+    ) -> Result<(Vec<HavingPredicate>, Vec<HavingExprPredicate>), SqlSurfaceError> {
         let mut predicates = Vec::new();
         let mut expr_predicates = Vec::new();
         loop {
@@ -6450,16 +6551,25 @@ impl<'a> Parser<'a> {
             // 比較する既存契約）を先に試し、述語の直後が境界（`AND`／`ORDER`／`LIMIT`／
             // `OFFSET`／文末）でなければ巻き戻して式形として解析し直す。
             let start = self.pos;
+            let calls_before = self.agg_calls.as_ref().map(Vec::len);
             if let Some(pred) = self.try_parse_legacy_having_predicate()? {
                 predicates.push(pred);
             } else {
                 self.pos = start;
+                // 従来形の試行で積んだ集計呼び出しを巻き戻す（式形が読み直して積み直す）。
+                if let (Some(calls), Some(len)) = (self.agg_calls.as_mut(), calls_before) {
+                    calls.truncate(len);
+                }
                 let lhs = self.parse_value_expr(0)?;
                 let op = self.expect_cmp_op()?;
                 let rhs = self.parse_value_expr(0)?;
-                // 関数・`CASE` 系を含まない述語（`HAVING lang = 'ja'`・`HAVING n + 1 > 3`）は
-                // 従来どおり許可リスト外（`42601`）。
-                if !expr_contains_scalar_function(&lhs) && !expr_contains_scalar_function(&rhs) {
+                // 関数・`CASE` 系・集計呼び出しを含まない述語（`HAVING lang = 'ja'`・
+                // `HAVING n + 1 > 3`）は従来どおり許可リスト外（`42601`）。
+                if !expr_contains_scalar_function(&lhs)
+                    && !expr_contains_scalar_function(&rhs)
+                    && !expr_contains_aggregate_placeholder(&lhs)
+                    && !expr_contains_aggregate_placeholder(&rhs)
+                {
                     return Err(SqlSurfaceError::unsupported(
                         "HAVING predicate must be '<aggregate name> <cmp> <number>' or contain a scalar function/CASE expression",
                     ));
@@ -6486,6 +6596,20 @@ impl<'a> Parser<'a> {
             return Ok(None);
         };
         self.advance();
+        // Issue #1814・SQL-58: `<集計関数名> '(' ... ')' <cmp> [-]<number>` も従来形へ脱糖する
+        // （`sum(bigint)`・整数の `avg` などの `NUMERIC` 結果を `having_matches` の厳密比較で
+        // 評価するため）。左辺は内部名の識別子になり、束縛段が隠し集計項目へ解決する。
+        let item_name = if self.agg_calls_dedup
+            && is_aggregate_function_name(&item_name)
+            && matches!(self.peek(), Some(Token::Punct('(')))
+        {
+            match self.parse_embedded_aggregate_call(&item_name)? {
+                Expr::Ident(placeholder) => placeholder,
+                _ => return Ok(None),
+            }
+        } else {
+            item_name
+        };
         let Ok(op) = self.expect_cmp_op() else {
             return Ok(None);
         };
@@ -14281,11 +14405,20 @@ fn check_body_aggregate(
     policy: BodyExprPolicy,
     out: &mut Vec<String>,
 ) -> Result<(), SqlSurfaceError> {
+    // Issue #1814・SQL-58: `HAVING` 内の集計呼び出しはビュー本体には含めさせない（fail-closed。
+    // 本体の集計は構文段が `allow_aggregate_expr_items` を偽にするため通常は到達しない多層防御）。
+    if v.group_by
+        .as_ref()
+        .is_some_and(|g| !g.having_aggregates.is_empty())
+    {
+        return Err(body_form_unsupported());
+    }
     for item in &v.items {
         match item {
             AggregateSelectItem::Aggregate(agg) => {
                 // `string_agg`・`array_agg`（SQL-57）はビュー本体には含めさせない（fail-closed）。
                 if matches!(agg.func, AggregateFunc::StringAgg | AggregateFunc::ArrayAgg)
+                    || agg.func.is_variance_family()
                     || agg.func.is_bool_agg()
                 {
                     return Err(body_form_unsupported());
@@ -17723,6 +17856,12 @@ fn parse_join_aggregate_item(p: &mut Parser<'_>) -> Result<JoinSelectItem, SqlSu
             detail: "array_agg is not supported in JOIN".to_string(),
         });
     }
+    // 分散系（SQL-57・Issue #1803）も JOIN は対象外（明示拒否で fail-closed に保つ）。
+    if func.is_variance_family() {
+        return Err(SqlSurfaceError::FeatureNotSupported {
+            detail: format!("{} is not supported in JOIN", func.default_alias()),
+        });
+    }
     // `bool_and` / `bool_or` / `every` も JOIN は対象外（SQL-57・Issue #1805）。
     if func.is_bool_agg() {
         return Err(SqlSurfaceError::FeatureNotSupported {
@@ -19067,6 +19206,16 @@ fn sql_json_query_kind_from_name(name: &str) -> Option<SqlJsonQueryKind> {
     }
 }
 
+/// 式木が集計呼び出しの内部名（[`aggregate_placeholder`]）の識別子を含むか（Issue #1814・SQL-58。
+/// `HAVING` 内の集計呼び出しを含む式述語を受理するための判定）。
+fn expr_contains_aggregate_placeholder(expr: &Expr) -> bool {
+    let mut idents = std::collections::HashSet::new();
+    super::parser::collect_expr_idents(expr, &mut idents);
+    idents
+        .iter()
+        .any(|n| aggregate_placeholder_index(n).is_some())
+}
+
 /// 式木が関数呼び出し・`CASE`・`COALESCE`・`NULLIF` のいずれかを含むか（Issue #1188。
 /// `HAVING` の式述語を「従来形では書けない形」に限定する判定。`EXTRACT` は構文段で
 /// `date_part` 呼び出しへ脱糖済みのため `Call` に含まれる）。
@@ -19171,15 +19320,23 @@ fn parse_aggregate_shape(
     // SELECT リストに集計項目が 1 つも無い（`GroupKey` のみ、いわゆる
     // `SELECT DISTINCT` 相当）形は許可しない（TASK-167・SQL-14 の受理形は集計
     // 結果を持つ行のみを対象とする）。集計式項目は構文上 1 つ以上の集計呼び出しを持つ。
-    if !items.iter().any(|i| {
+    // 例外（Issue #1814・SQL-58）: `GROUP BY` ありで `HAVING` が集計呼び出しを持つ形
+    // （`SELECT lang FROM t GROUP BY lang HAVING count(*) > 1`）は、`HAVING` を読んだ後に判定する。
+    let has_aggregate_item = items.iter().any(|i| {
         matches!(
             i,
             AggregateSelectItem::Aggregate(_) | AggregateSelectItem::Expr { .. }
         )
-    }) {
-        return Err(SqlSurfaceError::unsupported(
-            "aggregate SELECT list requires at least one aggregate item",
-        ));
+    });
+    let no_aggregate_item_error = || {
+        SqlSurfaceError::unsupported("aggregate SELECT list requires at least one aggregate item")
+    };
+    let deferred_item_check = !has_aggregate_item
+        && tokens
+            .iter()
+            .any(|t| matches!(t, Token::Ident(n) if n.eq_ignore_ascii_case("HAVING")));
+    if !has_aggregate_item && !deferred_item_check {
+        return Err(no_aggregate_item_error());
     }
     p.expect_keyword(Keyword::From)?;
     let table_name = p.parse_from_table_ref()?;
@@ -19222,12 +19379,15 @@ fn parse_aggregate_shape(
                 AggregateSelectItem::Aggregate(_) => {}
             }
         }
-        let (having, having_exprs) = if matches!(p.peek(), Some(Token::Ident(name)) if name.eq_ignore_ascii_case("HAVING"))
+        let (having, having_exprs, having_aggregates) = if matches!(p.peek(), Some(Token::Ident(name)) if name.eq_ignore_ascii_case("HAVING"))
         {
             p.parse_having()?
         } else {
-            (Vec::new(), Vec::new())
+            (Vec::new(), Vec::new(), Vec::new())
         };
+        if !has_aggregate_item && having_aggregates.is_empty() {
+            return Err(no_aggregate_item_error());
+        }
         let order_by = if matches!(p.peek(), Some(Token::Keyword(Keyword::Order))) {
             p.parse_aggregate_order_by(true)?
         } else {
@@ -19247,12 +19407,16 @@ fn parse_aggregate_shape(
             columns,
             having,
             having_exprs,
+            having_aggregates,
             order_by,
             limit,
             with_ties,
             offset,
         })
     } else {
+        if !has_aggregate_item {
+            return Err(no_aggregate_item_error());
+        }
         // `GROUP BY` 句が無いのに SELECT リストへ裸の識別子（`GroupKey` 候補）が
         // 混在する形（例: `SELECT lang, COUNT(*) FROM t`）は許可しない。
         if items
@@ -19365,6 +19529,7 @@ fn parse_distinct_shape(tokens: &[Token]) -> Result<ParsedAggregateShape, SqlSur
             columns,
             having: Vec::new(),
             having_exprs: Vec::new(),
+            having_aggregates: Vec::new(),
             order_by,
             limit,
             with_ties: false,
@@ -19834,11 +19999,22 @@ fn aggregate_statement_from_resolved(
                 "WITH TIES is not supported over a view with an aggregate/LIMIT body",
             ));
         }
+        // Issue #1814・SQL-58: 評価後射影形ビューの外側集計では `HAVING` 内の集計呼び出しを
+        // 評価しない（集計式項目と同じ扱い。fail-closed）。
+        if group_by
+            .as_ref()
+            .is_some_and(|g| !g.having_aggregates.is_empty())
+        {
+            return Err(SqlSurfaceError::unsupported(
+                "aggregate over a view with an aggregate/LIMIT body supports only column arguments",
+            ));
+        }
         for item in &items {
             match item {
                 AggregateSelectItem::Aggregate(agg) => {
                     // `string_agg`（SQL-57）は評価後射影形ビューの外側では評価しない（fail-closed）。
                     if matches!(agg.func, AggregateFunc::StringAgg | AggregateFunc::ArrayAgg)
+                        || agg.func.is_variance_family()
                         || agg.func.is_bool_agg()
                     {
                         return Err(SqlSurfaceError::unsupported(
@@ -29259,6 +29435,49 @@ mod tests {
         assert_eq!(err.wire_code(), "54000");
     }
 
+    /// SQL-58（Issue #1814）: `HAVING` 内の集計呼び出しは内部名へ脱糖され、重複排除される。
+    #[test]
+    fn having_aggregate_calls_are_desugared_and_deduplicated() {
+        let lookup = catalog_with(&["documents"]);
+        let parse = |sql: &str| match validate_sql(sql, &lookup).expect("must be accepted") {
+            Statement::Aggregate(agg) => agg,
+            other => panic!("unexpected statement: {other:?}"),
+        };
+        let agg = parse(
+            "SELECT lang, SUM(n) AS s FROM documents GROUP BY lang \
+             HAVING count(*) > 1 AND count(*) < 5 AND coalesce(max(n), 0) > 1",
+        );
+        let clause = agg.group_by().expect("GROUP BY clause");
+        assert_eq!(clause.having.len(), 2);
+        assert_eq!(clause.having[0].item_name, aggregate_placeholder(0));
+        assert_eq!(clause.having[1].item_name, aggregate_placeholder(0));
+        assert_eq!(clause.having_exprs.len(), 1);
+        assert_eq!(clause.having_aggregates.len(), 2);
+        // SELECT リストに集計項目が無い形も、HAVING が集計を持てば受理する。
+        let agg = parse("SELECT lang FROM documents GROUP BY lang HAVING count(*) > 1");
+        assert_eq!(agg.group_by().expect("clause").having_aggregates.len(), 1);
+        // 列名の `count`（括弧なし）は従来どおり項目名参照。
+        let agg =
+            parse("SELECT lang, COUNT(*) AS count FROM documents GROUP BY lang HAVING count > 1");
+        assert!(agg.group_by().expect("clause").having_aggregates.is_empty());
+    }
+
+    #[test]
+    fn having_aggregate_calls_reject_unsupported_forms() {
+        let lookup = catalog_with(&["documents"]);
+        for sql in [
+            "SELECT lang FROM documents GROUP BY lang",
+            "SELECT lang FROM documents GROUP BY lang HAVING lang = 'ja'",
+            "SELECT lang FROM documents GROUP BY lang HAVING sum(count(*)) > 1",
+            "SELECT lang, COUNT(*) FROM documents GROUP BY lang HAVING c + 1 > 2",
+            "SELECT lang FROM documents HAVING count(*) > 1",
+            "SELECT COUNT(*) FROM documents HAVING count(*) > 1",
+        ] {
+            let err = validate_sql(sql, &lookup).expect_err("must be rejected");
+            assert_eq!(err.wire_code(), "42601", "sql={sql:?}");
+        }
+    }
+
     #[test]
     fn rejects_having_without_group_by() {
         let lookup = catalog_with(&["documents"]);
@@ -29995,7 +30214,7 @@ mod tests {
         for sql in [
             "SELECT lang, COUNT(*) AS c FROM documents GROUP BY lang HAVING lang = 'ja'",
             "SELECT lang, COUNT(*) AS c FROM documents GROUP BY lang HAVING c + 1 > 2",
-            "SELECT lang, COUNT(*) AS c FROM documents GROUP BY lang HAVING count(*) > 1",
+            "SELECT lang, COUNT(*) AS c FROM documents GROUP BY lang HAVING sum(count(*)) > 1",
             "SELECT DISTINCT lang FROM documents ORDER BY lower(lang)",
         ] {
             let err = validate_sql(sql, &lookup).expect_err("must be rejected");
