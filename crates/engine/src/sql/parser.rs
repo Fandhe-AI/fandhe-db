@@ -6741,6 +6741,13 @@ pub struct BoundAggregate {
     pub(crate) projection: Vec<ProjectionColumn>,
     /// `GROUP BY` 句（TASK-167・SQL-14）。`None` なら TASK-166・SQL-13 の単一行集計。
     pub(crate) group_by: Option<BoundGroupBy>,
+    /// `GROUP BY` なしの `HAVING`（Issue #1819・SQL-58 (4)）。表全体（`WHERE`・RLS を通った
+    /// 可視行）を 1 グループとする単一行集計の結果に当てる条件で、キー 0 個で束縛する。
+    /// 偽・`NULL` なら 0 行、真なら 1 行を返す（可視行 0 件でも集計の 1 行は作られ、それに
+    /// 当たる）。`group_by` は `None` のまま（グループ化の実行器・上限・`has_group_by` を
+    /// 「グループ化あり」と取り違えさせない）。適用は単一行の終端処理
+    /// （`sql::aggregate::finish_aggregate_result`）が担う。SQL テキスト経由の束縛でのみ `Some`。
+    pub(crate) ungrouped_having: Option<BoundGroupBy>,
 }
 
 impl BoundAggregate {
@@ -6808,6 +6815,7 @@ impl BoundAggregate {
             rls_predicate_present: false,
             projection,
             group_by: None,
+            ungrouped_having: None,
         })
     }
 
@@ -7057,6 +7065,7 @@ impl BoundAggregate {
                 offset: 0,
                 result_cap: None,
             }),
+            ungrouped_having: None,
         })
     }
 
@@ -8196,6 +8205,11 @@ pub(crate) fn bind_aggregate_with_dummy_flags(
             AggregateSelectItem::GroupKey { column, alias } => {
                 let key_index = match group_by_columns.iter().position(|c| c == column) {
                     Some(index) => index,
+                    // Issue #1819・SQL-58 (4): `GROUP BY` なしの `HAVING` では SELECT リストの裸の
+                    // 列は集計の外の参照になる（`42803`。列が無ければ `42703`）。
+                    None if group_by_columns.is_empty() => {
+                        return Err(ungrouped_column_error(schema, column));
+                    }
                     None => {
                         // 構文層が既に列名一致を検証済み（上記コメント参照）。
                         // 到達しないはずの分岐だが、行経路の `unwrap`/`expect`
@@ -8222,6 +8236,13 @@ pub(crate) fn bind_aggregate_with_dummy_flags(
                 aggregates,
                 alias,
             } => {
+                // Issue #1819: `GROUP BY` なしの `HAVING` では、集計式項目の集計の外の裸識別子も
+                // 集計の外の列参照（`42803`／`42703`）。
+                if group_by_columns.is_empty() {
+                    if let Some(c) = crate::sql::allowlist::expr_bare_idents(expr).first() {
+                        return Err(ungrouped_column_error(schema, c));
+                    }
+                }
                 let mut hidden = Vec::with_capacity(aggregates.len());
                 for agg in aggregates {
                     let input = resolve_aggregate_item_input(agg, schema, udfs, &mut node_budget)?;
@@ -8298,7 +8319,7 @@ pub(crate) fn bind_aggregate_with_dummy_flags(
         }
         crate::sql::allowlist::check_aggregate_item_count(items.len())?;
     }
-    let group_by = match stmt.group_by() {
+    let bound_clause = match stmt.group_by() {
         None => None,
         Some(clause) => Some(bind_group_by_clause(
             clause,
@@ -8311,6 +8332,12 @@ pub(crate) fn bind_aggregate_with_dummy_flags(
             udfs,
             &mut node_budget,
         )?),
+    };
+    // Issue #1819・SQL-58 (4): キー 0 個の句（`GROUP BY` なしの `HAVING`）は `group_by` に入れず
+    // `ungrouped_having` へ分ける（単一行集計のまま、終端処理が `HAVING` を当てる）。
+    let (group_by, ungrouped_having) = match (stmt.group_by(), bound_clause) {
+        (Some(clause), Some(bound)) if clause.columns.is_empty() => (None, Some(bound)),
+        (_, bound) => (bound, None),
     };
 
     // Issue #1541: 集計式項目を投影モードで束縛する（`GROUP BY` キー列は束縛済みの
@@ -8357,7 +8384,22 @@ pub(crate) fn bind_aggregate_with_dummy_flags(
         rls_predicate_present,
         projection,
         group_by,
+        ungrouped_having,
     })
+}
+
+/// `GROUP BY` なしの `HAVING`（Issue #1819・SQL-58 (4)）で、集計の外に書かれた列参照 `name` の
+/// エラーを分類する。名前解決を先に行う PostgreSQL の順序に合わせ、`schema` に列（疑似列 `id`
+/// を含む）があれば `42803`（grouping_error）、無ければ `42703`。文言は固定で、列名・値を
+/// 載せない（`42703` は呼び出し元の列名を既存の切り詰め規約で載せる）。
+fn ungrouped_column_error(schema: &TableSchema, name: &str) -> SqlSurfaceError {
+    if name == "id" || schema.columns.iter().any(|c| c.name == name) {
+        SqlSurfaceError::GroupingError {
+            detail: "column must appear in the GROUP BY clause or be used in an aggregate function",
+        }
+    } else {
+        SqlSurfaceError::undefined_column(name)
+    }
 }
 
 /// 集計式項目 1 つ（[`ProjectionColumn::Expr`]）を束縛する（Issue #1541・SQL-42 (5)）。
@@ -9989,7 +10031,14 @@ fn bind_group_by_clause(
     // `items` のいずれか 1 つの実効名に一意に一致する識別子のみを受理する
     // （非存在は `22000`、曖昧は `42702`。Issue #1270）。
     let resolve_target = |name: &str| -> Result<OrderTarget, SqlSurfaceError> {
-        resolve_group_reference(&clause.columns, group_key_aliases, items, name)
+        match resolve_group_reference(&clause.columns, group_key_aliases, items, name) {
+            // Issue #1819: キー 0 個（`GROUP BY` なしの `HAVING`）では、集計項目に解決できない
+            // 識別子は集計の外の列参照。列があれば `42803`、無ければ `42703`。
+            Err(SqlSurfaceError::UndefinedColumn { .. }) if clause.columns.is_empty() => {
+                Err(ungrouped_column_error(schema, name))
+            }
+            other => other,
+        }
     };
 
     // `HAVING`・`ORDER BY` 共用の解決: 集計呼び出しの内部名（Issue #1814・#1815・SQL-58）は

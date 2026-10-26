@@ -2905,10 +2905,24 @@ fn finish_aggregate_result(
     // 列メタは実行経路・Describe・GROUP BY 経路が共有する
     // `aggregate_projection_columns` で組み立てる（Issue #1173）。
     let columns = aggregate_projection_columns(bound, schema)?;
-    let cells = if bound
-        .projection
-        .iter()
-        .any(|c| matches!(c, crate::sql::parser::ProjectionColumn::Expr { .. }))
+    // Issue #1819・SQL-58 (4): `GROUP BY` なしの `HAVING` は、可視行（WHERE・RLS 適用後。0 件でも
+    // 集計の 1 行は作られる）から確定した単一行に当てる。偽・`NULL` なら 0 行を返す。
+    // キャッシュヒット・索引経路・全走査の 3 経路がこの終端処理を共有するため、判定はここだけに置く。
+    if let Some(having) = bound.ungrouped_having.as_ref() {
+        if !crate::sql::group_by::ungrouped_having_passes(having, schema, &cells)? {
+            return Ok(QueryResult {
+                columns,
+                rows: Vec::new(),
+            });
+        }
+    }
+    // `HAVING` だけが使う隠し集計項目は `projection` に現れない。セルをそのまま返すと列数が
+    // `columns` とずれるため、`ungrouped_having` があるときは必ず投影を通す。
+    let cells = if bound.ungrouped_having.is_some()
+        || bound
+            .projection
+            .iter()
+            .any(|c| matches!(c, crate::sql::parser::ProjectionColumn::Expr { .. }))
     {
         crate::sql::group_by::project_ungrouped_row(
             bound,
@@ -3644,6 +3658,7 @@ mod tests {
                 name: "result".to_string(),
             }],
             group_by: None,
+            ungrouped_having: None,
         }
     }
 
@@ -3677,6 +3692,7 @@ mod tests {
             rls_predicate_present: false,
             projection,
             group_by: None,
+            ungrouped_having: None,
         }
     }
 
