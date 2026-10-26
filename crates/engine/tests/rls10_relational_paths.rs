@@ -900,7 +900,8 @@ fn error_responses_are_identical_with_and_without_other_tenant_private_rows() {
         "SELECT id FROM nonexistent_table_xyz LIMIT 5",
         "SELECT * FROM documents NATURAL JOIN authors LIMIT 5",
         "SELECT * FROM documents CROSS JOIN authors LIMIT 5",
-        "SELECT * FROM documents JOIN authors USING (id) LIMIT 5",
+        // `USING (...)` は受理対象（Issue #1826）。存在しない列の USING は静的に拒否される。
+        "SELECT * FROM documents JOIN authors USING (no_such_col) LIMIT 5",
         // 意味検証段（`sql::subquery::validate_in_target_column` 相当。SQL-29
         // (a)）の拒否。対象列 `lang`（TEXT）と内側投影 `id`（疑似列。整数）の
         // 型不整合は列定義（スキーマ）のみで決まり、内側の行内容・行数

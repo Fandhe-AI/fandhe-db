@@ -3015,13 +3015,25 @@ pub(crate) enum JoinKind {
     Full,
 }
 
+/// JOIN 1 段の結合条件（Issue #1826・SQL-60 (1)）。`On` は等値結合条件
+/// （`AND` 結合順。1 個以上・[`MAX_JOIN_CONDITIONS`] 以下）、`Using` は `USING (c1, c2, ...)`
+/// の列名列（宣言順。1 個以上・[`MAX_JOIN_CONDITIONS`] 以下。重複・存在・型の検証と
+/// 等価 ON への脱糖・結合列の統合は束縛段 `sql::join` の責務で、構文段は列名だけを保持する）。
+/// `NATURAL JOIN`（Issue #1827）は束縛時に導出した列名列を `Using` と同じ経路へ流す想定で、
+/// variant はその Issue が追加する。
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) enum JoinCondition {
+    On(Vec<(ColumnRef, ColumnRef)>),
+    Using(Vec<String>),
+}
+
 /// left-deep 連鎖 JOIN の 1 段（Issue #1190）。`kind` は「これまでの結合結果」
-/// （relation 0..=k）と「新しく加わる relation（k+1）」の間の種別で、`on` は
-/// 等値結合条件（`AND` 結合順。1 個以上・[`MAX_JOIN_CONDITIONS`] 以下）。
+/// （relation 0..=k）と「新しく加わる relation（k+1）」の間の種別で、`condition` は
+/// その段の結合条件（[`JoinCondition`]）。
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) struct JoinStep {
     pub(crate) kind: JoinKind,
-    pub(crate) on: Vec<(ColumnRef, ColumnRef)>,
+    pub(crate) condition: JoinCondition,
 }
 
 /// 非集計形の JOIN のスカラー列 `ORDER BY` の 1 キー（Issue #1190）。集計形では
@@ -5744,6 +5756,15 @@ impl<'a> Parser<'a> {
         matches!(
             self.tokens.get(self.pos.saturating_add(offset)),
             Some(Token::Ident(name)) if name.eq_ignore_ascii_case(word)
+        )
+    }
+
+    /// `offset` 個先のトークンが区切り文字 `c` かを消費せずに判定する
+    /// （`JOIN ... USING (` の 2 トークン組の判定。Issue #1826）。
+    fn peek_punct_at(&self, offset: usize, c: char) -> bool {
+        matches!(
+            self.tokens.get(self.pos.saturating_add(offset)),
+            Some(Token::Punct(p)) if *p == c
         )
     }
 
@@ -18491,6 +18512,31 @@ fn parse_join_on_conditions(
     Ok(conditions)
 }
 
+/// `USING (<ident> {, <ident>})` の列名列（Issue #1826・SQL-60 (1)。`USING` は消費済みで
+/// 現在位置は `(`）。空リスト・修飾名・式は `42601`、列数は `Vec` へ積む**前**に
+/// [`MAX_JOIN_CONDITIONS`] で検査する（超過は `54000`）。重複・存在・型の検証は
+/// PostgreSQL と同じ判定順（列ごと）にするため束縛段が行う。
+fn parse_join_using_list(p: &mut Parser<'_>) -> Result<Vec<String>, SqlSurfaceError> {
+    p.expect_punct('(')?;
+    let mut names: Vec<String> = Vec::new();
+    loop {
+        let name = p.expect_ident()?;
+        if names.len() >= MAX_JOIN_CONDITIONS {
+            return Err(SqlSurfaceError::payload_too_large(
+                "too many JOIN USING columns",
+            ));
+        }
+        names.push(name);
+        if matches!(p.peek(), Some(Token::Punct(','))) {
+            p.advance();
+            continue;
+        }
+        break;
+    }
+    p.expect_punct(')')?;
+    Ok(names)
+}
+
 /// JOIN の `WHERE` 句（Issue #925・#1190）:
 /// `or_expr := and_expr { OR and_expr }`、`and_expr := atom { AND atom }`、
 /// `atom := '(' or_expr ')' | leaf`。葉は `colref (= | LIKE | < <= > >= | IN)
@@ -18890,9 +18936,16 @@ fn parse_join_statement(
             ));
         }
         relations.push(rel);
-        p.expect_ident_matching("ON")?;
-        let on = parse_join_on_conditions(&mut p)?;
-        steps.push(JoinStep { kind, on });
+        // `USING` は直後が `(` のときだけ結合条件として扱う（`USING PLAN(...)` 等の
+        // 他の句と取り違えず、それ以外は従来どおり `ON` を要求して `42601`）。
+        let condition = if p.peek_ident_matches("USING") && p.peek_punct_at(1, '(') {
+            p.advance();
+            JoinCondition::Using(parse_join_using_list(&mut p)?)
+        } else {
+            p.expect_ident_matching("ON")?;
+            JoinCondition::On(parse_join_on_conditions(&mut p)?)
+        };
+        steps.push(JoinStep { kind, condition });
     }
 
     let where_clause = if matches!(p.peek(), Some(Token::Keyword(Keyword::Where))) {
@@ -33535,6 +33588,61 @@ mod tests {
                 assert_eq!(v.column_aliases, vec![Some("x".to_string())]);
             }
             other => panic!("expected Join, got {other:?}"),
+        }
+    }
+
+    /// Issue #1826・SQL-60 (1): `USING (...)` は列名列のまま `JoinCondition::Using` で保持し、
+    /// 空リスト・修飾名・別名・上限超過・`NATURAL` は構文段で fail-closed に拒否する。
+    #[test]
+    fn join_using_clause_is_parsed_into_column_name_list() {
+        let lookup = catalog_with(&["a", "b", "c"]);
+        let stmt = validate_sql(
+            "SELECT * FROM a LEFT JOIN b USING (x, y) JOIN c ON b.id = c.id LIMIT 1",
+            &lookup,
+        )
+        .expect("USING list should be accepted");
+        match stmt {
+            Statement::Join(v) => {
+                assert_eq!(v.steps.len(), 2);
+                assert_eq!(v.steps[0].kind, JoinKind::Left);
+                assert_eq!(
+                    v.steps[0].condition,
+                    JoinCondition::Using(vec!["x".to_string(), "y".to_string()])
+                );
+                assert!(matches!(v.steps[1].condition, JoinCondition::On(_)));
+            }
+            other => panic!("expected Join, got {other:?}"),
+        }
+
+        let nine = "c1, c2, c3, c4, c5, c6, c7, c8, c9";
+        for (sql, code) in [
+            (
+                "SELECT * FROM a JOIN b USING () LIMIT 1".to_string(),
+                "42601",
+            ),
+            (
+                "SELECT * FROM a JOIN b USING (a.x) LIMIT 1".to_string(),
+                "42601",
+            ),
+            (
+                "SELECT * FROM a JOIN b USING (x) AS j LIMIT 1".to_string(),
+                "42601",
+            ),
+            (
+                "SELECT * FROM a JOIN b USING PLAN(x) LIMIT 1".to_string(),
+                "42601",
+            ),
+            (
+                "SELECT * FROM a NATURAL JOIN b LIMIT 1".to_string(),
+                "42601",
+            ),
+            (
+                format!("SELECT * FROM a JOIN b USING ({nine}) LIMIT 1"),
+                "54000",
+            ),
+        ] {
+            let err = validate_sql(&sql, &lookup).expect_err("must be rejected");
+            assert_eq!(err.wire_code(), code, "sql={sql:?} err={err:?}");
         }
     }
 

@@ -461,15 +461,17 @@ fn rejects_cross_join() {
 }
 
 #[test]
-fn rejects_join_using_clause() {
+fn rejects_join_using_unknown_column() {
     let (storage, path) = seeded_basic();
     let _guard = CleanupGuard(path);
     let core = new_core(storage);
     assert_rejected(
         &core,
         "tenant-a",
-        "SELECT * FROM documents JOIN authors USING (id) LIMIT 10",
-        "42601",
+        // `USING (...)` は Issue #1826（SQL-60 (1)）で受理対象になった（意味論は
+        // `tests/sql60_join_using.rs`）。ここでは存在しない列の USING の静的拒否を残す。
+        "SELECT * FROM documents JOIN authors USING (no_such_col) LIMIT 10",
+        "42703",
     );
 }
 

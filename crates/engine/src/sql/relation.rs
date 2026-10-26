@@ -150,6 +150,17 @@ pub struct ResolvedColumn {
 }
 
 impl ResolvedColumn {
+    /// 解決結果を直接組み立てる。`JOIN ... USING` の統合列（`sql::join::using`）が、
+    /// 統合元の列の解決結果を再現するために使う（`BindingScope` を経由すると疑似列 `id` と
+    /// 同名の実カラムが区別できなくなるため）。
+    pub(crate) fn new(relation: usize, slot: ColumnSlot, column_type: Option<ColumnType>) -> Self {
+        Self {
+            relation,
+            slot,
+            column_type,
+        }
+    }
+
     /// スコープ内の参照位置（[`BindingScope`] 構築時の `relations` 添字）。
     pub fn relation(&self) -> usize {
         self.relation

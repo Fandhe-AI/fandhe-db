@@ -38,6 +38,49 @@ pub(super) fn row_at<'a>(
     }
 }
 
+/// 結合タプルの `(rel, pos)` のセルを返す。`fallbacks` が空でなければ（FULL JOIN USING の
+/// 統合列 `COALESCE(左, 右)`）、先頭ソースが NULL 補完または NULL セルのとき、代替ソースを
+/// 順に見て最初の非 NULL セルを採る。全て NULL なら先頭ソースの結果（`None` または NULL セル）を
+/// そのまま返す。行を複製せず借用で返すため、呼び出し元は複製前にバイト見積もりを計上できる。
+pub(super) fn cell_with_fallbacks<'a>(
+    sides: &'a [Vec<ResultRow>],
+    tuple: &[Option<u32>],
+    rel: usize,
+    pos: usize,
+    fallbacks: &[(usize, usize)],
+) -> Result<Option<&'a crate::sql::exec::Cell>, SqlSurfaceError> {
+    let first = cell_at(sides, tuple, rel, pos)?;
+    if fallbacks.is_empty() || first.is_some_and(|c| !matches!(c, crate::sql::exec::Cell::Null)) {
+        return Ok(first);
+    }
+    for &(r, p) in fallbacks {
+        if let Some(c) = cell_at(sides, tuple, r, p)? {
+            if !matches!(c, crate::sql::exec::Cell::Null) {
+                return Ok(Some(c));
+            }
+        }
+    }
+    Ok(first)
+}
+
+fn cell_at<'a>(
+    sides: &'a [Vec<ResultRow>],
+    tuple: &[Option<u32>],
+    rel: usize,
+    pos: usize,
+) -> Result<Option<&'a crate::sql::exec::Cell>, SqlSurfaceError> {
+    match row_at(sides, tuple, rel)? {
+        None => Ok(None),
+        Some(row) => row
+            .cells
+            .get(pos)
+            .map(Some)
+            .ok_or_else(|| SqlSurfaceError::Internal {
+                detail: "JOIN column position out of range".to_string(),
+            }),
+    }
+}
+
 fn eval_single(
     f: &SingleFilter,
     sides: &[Vec<ResultRow>],
@@ -186,17 +229,9 @@ pub(super) fn sort_by_keys(
                 detail: "JOIN tuple index out of range".to_string(),
             })?;
         for k in keys {
-            let v = match row_at(sides, tuple, k.rel)? {
+            let v = match cell_with_fallbacks(sides, tuple, k.rel, k.pos, &k.fallbacks)? {
                 None => None,
-                Some(row) => {
-                    let cell = row
-                        .cells
-                        .get(k.pos)
-                        .ok_or_else(|| SqlSurfaceError::Internal {
-                            detail: "JOIN ORDER BY column position out of range".to_string(),
-                        })?;
-                    cmp_val(cell, &k.class)?
-                }
+                Some(cell) => cmp_val(cell, &k.class)?,
             };
             flat.push(v);
         }
