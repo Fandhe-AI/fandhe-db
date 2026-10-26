@@ -703,6 +703,11 @@ pub(crate) fn check_aggregate_columns_within_view(
             for k in &agg.order_by {
                 expr_columns_within(columns, &k.expr)?;
             }
+            // SQL-57・Issue #1806: `HAVING` 内の集計の `FILTER` 条件も公開列に限定する
+            // （SELECT リスト側と同じ fail-closed。非公開列の推測を防ぐ）。
+            for p in &agg.filter {
+                check_predicate_columns_within(columns, p)?;
+            }
         }
         // 式述語中の集計呼び出しの内部名は列ではない（エラー文言へ出さないため許可名に含める）。
         allowed.extend(

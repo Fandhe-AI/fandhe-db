@@ -8943,6 +8943,10 @@ impl EngineCore {
                 // 同じ文脈・同じ予算で解決する。
                 crate::sql::subquery::resolve_aggregate_item_filters(
                     &mut validated.items,
+                    validated
+                        .group_by
+                        .as_mut()
+                        .map_or(&mut [][..], |g| g.having_aggregates.as_mut_slice()),
                     &[&schema],
                     read_txn,
                     ctx,

@@ -1013,7 +1013,7 @@ fn static_validation_predicates(preds: &[WherePredicate]) -> Vec<WherePredicate>
     out
 }
 
-/// 集計項目の `FILTER (WHERE ...)` 中の部分クエリを解決する（SQL-57・Issue #1806）。
+/// 集計項目（`HAVING` 内の集計呼び出しを含む）の `FILTER (WHERE ...)` 中の部分クエリを解決する（SQL-57・Issue #1806）。
 /// `core.rs` の `Statement::Aggregate` 実行アームが、文の `WHERE` の解決（
 /// [`resolve_where_predicates`]）の直後・束縛の前に呼ぶ。内側は外側と同じ `PolicyContext`・
 /// 同じ読み取りスナップショット・同じ予算で実行されるため、テナント境界は文の `WHERE` の
@@ -1023,6 +1023,7 @@ fn static_validation_predicates(preds: &[WherePredicate]) -> Vec<WherePredicate>
 #[allow(clippy::too_many_arguments)]
 pub(crate) fn resolve_aggregate_item_filters(
     items: &mut [crate::sql::allowlist::AggregateSelectItem],
+    having_aggregates: &mut [crate::sql::allowlist::AggregateItem],
     outer_scopes: &[&TableSchema],
     read_txn: &impl crate::storage::read_source::ReadSource,
     ctx: &PolicyContext,
@@ -1063,6 +1064,10 @@ pub(crate) fn resolve_aggregate_item_filters(
                 }
             }
         }
+    }
+    // `HAVING` 内の集計呼び出しの `FILTER` も SELECT 項目と同じ文脈・予算で解決する。
+    for agg in having_aggregates {
+        resolve(agg)?;
     }
     Ok(())
 }

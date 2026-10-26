@@ -591,3 +591,26 @@ fn unsupported_shapes_fail_closed_and_buffered_views_work() {
         vec![strs(&["5"])]
     );
 }
+
+/// HAVING 内の集計 FILTER: 部分クエリは SELECT 側と同じく解決され、ビューの非公開列は拒否される。
+#[test]
+fn having_aggregate_filter_resolves_subqueries_and_respects_view_columns() {
+    let (core, _g) = build_core("sql57-flt-having");
+    assert_eq!(
+        run(
+            &core,
+            "SELECT g, count(*) FROM t GROUP BY g \
+             HAVING count(*) FILTER (WHERE k = (SELECT max(k) FROM t)) > 0 ORDER BY g"
+        ),
+        vec![strs(&["a", "4"])]
+    );
+    ddl(&core, "CREATE VIEW pv AS SELECT g FROM t");
+    assert_eq!(
+        code_of(
+            &core,
+            "SELECT g, count(*) FROM pv GROUP BY g \
+             HAVING count(*) FILTER (WHERE s = 'SECRET') > 0"
+        ),
+        "42703"
+    );
+}
