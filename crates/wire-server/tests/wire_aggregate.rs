@@ -426,7 +426,8 @@ fn sql_aggregate_rejections_are_fail_closed_and_connection_survives() {
     for (sql, expected_sqlstate) in [
         ("SELECT SUM(embedding) FROM docs", "42883"),
         ("SELECT COUNT(*) FROM docs GROUP BY embedding", "22000"),
-        ("SELECT COUNT(*), lang FROM docs", "42601"),
+        // 集計の外の `GROUP BY` に無い列は 42803（Issue #1818・SQL-58）。
+        ("SELECT COUNT(*), lang FROM docs", "42803"),
         (
             "SELECT lang, COUNT(*) AS n FROM docs GROUP BY lang HAVING lang = 'ja'",
             "42601",

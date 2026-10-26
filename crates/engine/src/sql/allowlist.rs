@@ -3631,8 +3631,8 @@ pub(crate) fn aggregate_placeholder_index(name: &str) -> Option<usize> {
 const GROUP_KEY_EXPR_PLACEHOLDER_PREFIX: &str = "\u{1}gkexpr";
 
 /// `GROUP BY` の `j` 番目の式キー（[`GroupByClause::key_exprs`] の添字）の予約内部名。
-/// [`GroupByClause::columns`] の当該位置に入り、利用者の識別子とは一致しないため SELECT の
-/// `GroupKey` 照合は従来どおり `42601` になる（式キーの値の出力は #1818 の管轄）。
+/// [`GroupByClause::columns`] の当該位置に入り、利用者の識別子とは一致しない。SELECT／HAVING／
+/// ORDER BY の式との構造一致（Issue #1818）では、一致した部分木がこの名前の識別子へ置き換わる。
 pub(crate) fn group_key_expr_placeholder(j: usize) -> String {
     format!("{GROUP_KEY_EXPR_PLACEHOLDER_PREFIX}{j}")
 }
@@ -5467,6 +5467,10 @@ struct Parser<'a> {
     /// サブクエリ内部・ビュー本体は既定の `false` のまま従来どおり `42601` で拒否する
     /// （それらの経路は式項目の評価・列公開範囲検査を持たないため fail-closed）。
     allow_aggregate_expr_items: bool,
+    /// `GROUP BY` が式キー（Issue #1817・SQL-58）を持つ文を解析中かどうか。真の間だけ、`HAVING` の
+    /// 関数・`CASE` を含まない式述語（`HAVING n / 2 > 1`）と `ORDER BY` の算術式キーを受理する
+    /// （Issue #1818。式キーと構造一致するかどうかは束縛段が判定し、一致しない列参照は `42803`）。
+    group_key_exprs_present: bool,
     /// 集計式項目の式モード解析中に、式の途中に現れた集計関数呼び出しを溜める先。
     /// `Some` の間だけ [`Self::parse_call_expr`] が集計関数名を受理し、内部名の
     /// `Expr::Ident` に置き換えて返す。`None`（既定）では従来どおり `42601`
@@ -5557,6 +5561,7 @@ impl<'a> Parser<'a> {
             from_ref: None,
             reject_from_alias: false,
             allow_aggregate_expr_items: false,
+            group_key_exprs_present: false,
             agg_calls: None,
             agg_calls_dedup: false,
             agg_slots_used: 0,
@@ -6663,17 +6668,27 @@ impl<'a> Parser<'a> {
         self.allow_unary_minus = saved_minus;
         let expr = parsed?;
         let aggregates = calls.unwrap_or_default();
-        if aggregates.is_empty() {
-            return Err(SqlSurfaceError::unsupported(
-                "arithmetic expression in aggregate SELECT list requires an aggregate function call",
-            ));
-        }
         let alias = if self.peek_ident_matches("AS") {
             self.advance();
             Some(self.expect_ident()?)
         } else {
             None
         };
+        // Issue #1818・SQL-58: 集計呼び出しを持たない式項目は、`GROUP BY` の式キーとの構造一致
+        // （束縛段）でのみ有効になる。括弧だけで包んだ裸の列（`(lang)`）は通常の `GroupKey` と同じ。
+        // 集計呼び出しを 1 つも持たない文全体は `has_aggregate_item` が従来どおり拒否する。
+        if aggregates.is_empty() {
+            if let Expr::Ident(name) = &expr {
+                if aggregate_placeholder_index(name).is_none()
+                    && group_key_expr_placeholder_index(name).is_none()
+                {
+                    return Ok(AggregateSelectItem::GroupKey {
+                        column: name.clone(),
+                        alias,
+                    });
+                }
+            }
+        }
         // Issue #1811: 括弧だけで包んだ単独の集計呼び出し（`(sum(n))`）は素の集計項目と同じ。
         // 既定列名・HAVING／ORDER BY の名前解決を PostgreSQL と同じく関数名のままにする。
         if let Expr::Ident(name) = &expr {
@@ -6822,10 +6837,9 @@ impl<'a> Parser<'a> {
             // Issue #1811・SQL-42 ポインタ: 項目の途中に集計呼び出しを含み、`parse_select_item` と
             // 同じ式トリガーで始まる形（`coalesce(sum(n), 0)`・`CASE WHEN count(*) > 1 ...`・
             // `upper(max(g))`）は式モードで読む。集計を含まない裸識別子・式は従来どおり。
-            if self.allow_aggregate_expr_items
-                && self.aggregate_item_starts_expr()
-                && select_range_contains_aggregate_call(&self.tokens, self.pos, true)
-            {
+            // Issue #1818・SQL-58: トップレベルでは集計呼び出しを含まない式（`upper(lang)`・`n / 2`）も
+            // 式項目として読む。`GROUP BY` の式キーとの構造一致は束縛段が判定する。
+            if self.allow_aggregate_expr_items && self.aggregate_item_starts_expr() {
                 return self.parse_aggregate_expr_item(None);
             }
             // `CAST(<集計を含む式> AS <型>)`（Issue #1592）。集計呼び出しの内側ではなく項目の
@@ -6852,7 +6866,6 @@ impl<'a> Parser<'a> {
         if self.allow_aggregate_expr_items
             && !matches!(self.peek(), Some(Token::Ident(_)))
             && self.aggregate_item_starts_expr()
-            && select_range_contains_aggregate_call(&self.tokens, self.pos, true)
         {
             return self.parse_aggregate_expr_item(None);
         }
@@ -7036,6 +7049,7 @@ impl<'a> Parser<'a> {
                 // 関数・`CASE` 系・集計呼び出しを含まない述語（`HAVING lang = 'ja'`・
                 // `HAVING n + 1 > 3`）は従来どおり許可リスト外（`42601`）。
                 if !ungrouped
+                    && !self.group_key_exprs_present
                     && !expr_contains_scalar_function(&lhs)
                     && !expr_contains_scalar_function(&rhs)
                     && !expr_contains_aggregate_placeholder(&lhs)
@@ -7211,7 +7225,10 @@ impl<'a> Parser<'a> {
             let (target, expr, ordinal) = if let Some((position, len)) = self.peek_order_ordinal() {
                 self.pos = self.pos.saturating_add(len);
                 (String::new(), None, Some(position))
-            } else if allow_expr && self.order_key_starts_expression() {
+            } else if allow_expr
+                && (self.order_key_starts_expression()
+                    || (self.group_key_exprs_present && self.order_key_starts_arithmetic()))
+            {
                 // Issue #1815: キー全体が集計呼び出し 1 つ（内部名の識別子へ脱糖済み）なら
                 // 識別子キーへ正規化し、束縛段で `OrderTarget::Aggregate` として扱う。
                 match self.parse_value_expr(0)? {
@@ -10378,6 +10395,20 @@ impl<'a> Parser<'a> {
         }
         let value = i64::from(magnitude);
         Some((if negative { -value } else { value }, len))
+    }
+
+    /// 式キー付き `GROUP BY` の `ORDER BY` で、識別子・数値の直後が算術演算子（`n / 2`）の形か
+    /// （Issue #1818・SQL-58）。式キーとの構造一致は束縛段が判定する。
+    fn order_key_starts_arithmetic(&self) -> bool {
+        // 括弧始まり（`(n / 2)`）も式キー。照合は束縛段が行い、不一致は fail-closed で拒否される。
+        if matches!(self.peek(), Some(Token::Punct('('))) {
+            return true;
+        }
+        matches!(self.peek(), Some(Token::Ident(_) | Token::Number(_)))
+            && matches!(
+                self.tokens.get(self.pos + 1),
+                Some(Token::Punct('+' | '-' | '*' | '/'))
+            )
     }
 
     /// 現在位置が広域取得 `ORDER BY` の式キー（Issue #1188）の先頭かを 1〜2 トークンの
@@ -19913,11 +19944,11 @@ fn parse_aggregate_shape(
     // 結果を持つ行のみを対象とする）。集計式項目は構文上 1 つ以上の集計呼び出しを持つ。
     // 例外（Issue #1814・SQL-58）: `GROUP BY` ありで `HAVING` が集計呼び出しを持つ形
     // （`SELECT lang FROM t GROUP BY lang HAVING count(*) > 1`）は、`HAVING` を読んだ後に判定する。
-    let has_aggregate_item = items.iter().any(|i| {
-        matches!(
-            i,
-            AggregateSelectItem::Aggregate(_) | AggregateSelectItem::Expr { .. }
-        )
+    let has_aggregate_item = items.iter().any(|i| match i {
+        AggregateSelectItem::Aggregate(_) => true,
+        // Issue #1818: 集計呼び出しを持たない式項目（グループキー式の候補）は数えない。
+        AggregateSelectItem::Expr { aggregates, .. } => !aggregates.is_empty(),
+        AggregateSelectItem::GroupKey { .. } => false,
     });
     let no_aggregate_item_error = || {
         SqlSurfaceError::unsupported("aggregate SELECT list requires at least one aggregate item")
@@ -19946,11 +19977,15 @@ fn parse_aggregate_shape(
         matches!(p.peek(), Some(Token::Ident(name)) if name.eq_ignore_ascii_case("GROUP"));
     let group_by = if has_group_by {
         let (columns, key_exprs) = p.parse_group_by_clause()?;
+        p.group_key_exprs_present = !key_exprs.is_empty();
         // SELECT リストの `GroupKey` 項目は、いずれかの `GROUP BY` 列と同名で
         // なければならない（§計画 3.1）。不一致・`GROUP BY` 句を持たない
         // `GroupKey` 項目（下の `else` 分岐）はいずれも許可リスト外として
         // `42601` に落とす。
-        for item in &items {
+        // 例外（Issue #1818・SQL-58）: トップレベルの集計 `SELECT` は、スキーマを要する分類
+        // （`42803` grouping_error／`42703`）と式キーとの構造一致を束縛段へ移すため、ここでは照合しない。
+        let defer_group_match = p.allow_aggregate_expr_items;
+        for item in items.iter().filter(|_| !defer_group_match) {
             match item {
                 AggregateSelectItem::GroupKey { column: c, .. } => {
                     if !columns.contains(c) {
@@ -20040,18 +20075,22 @@ fn parse_aggregate_shape(
         }
         // `GROUP BY` 句が無いのに SELECT リストへ裸の識別子（`GroupKey` 候補）が
         // 混在する形（例: `SELECT lang, COUNT(*) FROM t`）は許可しない。
-        if items
-            .iter()
-            .any(|i| matches!(i, AggregateSelectItem::GroupKey { .. }))
+        // トップレベルは束縛段が `42803` で分類する（Issue #1818・SQL-58）。
+        if !p.allow_aggregate_expr_items
+            && items
+                .iter()
+                .any(|i| matches!(i, AggregateSelectItem::GroupKey { .. }))
         {
             return Err(SqlSurfaceError::unsupported(
                 "bare column reference in aggregate SELECT list requires GROUP BY",
             ));
         }
-        if items.iter().any(|i| match i {
-            AggregateSelectItem::Expr { expr, .. } => !expr_bare_idents(expr).is_empty(),
-            _ => false,
-        }) {
+        if !p.allow_aggregate_expr_items
+            && items.iter().any(|i| match i {
+                AggregateSelectItem::Expr { expr, .. } => !expr_bare_idents(expr).is_empty(),
+                _ => false,
+            })
+        {
             return Err(SqlSurfaceError::unsupported(
                 "bare column reference in aggregate SELECT list requires GROUP BY",
             ));
@@ -30028,9 +30067,15 @@ mod tests {
     #[test]
     fn aggregate_arithmetic_rejections_and_limits() {
         let lookup = catalog_with(&["documents"]);
+        // Issue #1818・SQL-58: トップレベルは SELECT の列参照と `GROUP BY` の照合（`42803`）を束縛段で
+        // 行うため、構文段は受理する（分類は束縛段の結合テストが検証する）。
         for sql in [
             "SELECT sum(n)+m FROM documents",
             "SELECT lang, sum(n)+m FROM documents GROUP BY lang",
+        ] {
+            validate_sql(sql, &lookup).expect(sql);
+        }
+        for sql in [
             "SELECT sum(count(*))+1 FROM documents",
             "SELECT lang+lang FROM documents GROUP BY lang",
             "SELECT sum(n)+1 FROM documents WHERE count(*) > 1",
@@ -30178,19 +30223,33 @@ mod tests {
         assert_eq!(err.wire_code(), "42601");
     }
 
+    /// Issue #1818・SQL-58: トップレベルの `GROUP BY` なしの裸の列は構文段では受理し、束縛段が
+    /// `42803` で分類する。CTE 主クエリ・集合演算の枝・サブクエリでは従来どおり `42601`。
     #[test]
-    fn rejects_bare_column_in_select_list_without_group_by() {
+    fn defers_bare_column_without_group_by_to_binding_at_top_level() {
         let lookup = catalog_with(&["documents"]);
-        let err = validate_sql("SELECT lang, COUNT(*) FROM documents", &lookup)
-            .expect_err("bare column reference without GROUP BY must be rejected");
+        validate_sql("SELECT lang, COUNT(*) FROM documents", &lookup)
+            .expect("top-level classification is deferred to the binder");
+        let err = validate_sql(
+            "WITH x AS (SELECT lang FROM documents) SELECT lang, COUNT(*) FROM x",
+            &lookup,
+        )
+        .expect_err("bare column reference without GROUP BY must be rejected in a CTE main query");
         assert_eq!(err.wire_code(), "42601");
     }
 
+    /// Issue #1818・SQL-58: トップレベルは `GROUP BY` 列との不一致の分類（`42803`）を束縛段へ移す。
+    /// 非トップレベル（CTE 主クエリ）は従来どおり構文段が `42601`。
     #[test]
-    fn rejects_select_list_bare_identifier_mismatching_group_by_column() {
+    fn defers_select_list_bare_identifier_mismatch_to_binding_at_top_level() {
         let lookup = catalog_with(&["documents"]);
-        let err = validate_sql("SELECT id, COUNT(*) FROM documents GROUP BY lang", &lookup)
-            .expect_err("mismatching bare identifier must be rejected");
+        validate_sql("SELECT id, COUNT(*) FROM documents GROUP BY lang", &lookup)
+            .expect("top-level classification is deferred to the binder");
+        let err = validate_sql(
+            "WITH x AS (SELECT lang, id FROM documents) SELECT id, COUNT(*) FROM x GROUP BY lang",
+            &lookup,
+        )
+        .expect_err("mismatching bare identifier must be rejected in a CTE main query");
         assert_eq!(err.wire_code(), "42601");
     }
 
@@ -30409,14 +30468,21 @@ mod tests {
                 "SELECT count(*) FROM documents GROUP BY a, b, c, d, e, f, g, h, i + 1",
                 "54000",
             ),
+            // Issue #1818: 集計呼び出しを持たない SELECT は従来どおり拒否する（式キーでも同じ）。
             (
-                "SELECT upper(lang), count(*) FROM documents GROUP BY upper(lang)",
+                "SELECT upper(lang) FROM documents GROUP BY upper(lang)",
                 "42601",
             ),
         ] {
             let err = validate_sql(sql, &lookup).expect_err(sql);
             assert_eq!(err.wire_code(), code, "{sql}");
         }
+        // Issue #1818: 式の SELECT 項目は構文段で受理し、式キーとの構造一致は束縛段が判定する。
+        validate_sql(
+            "SELECT upper(lang), count(*) FROM documents GROUP BY upper(lang)",
+            &lookup,
+        )
+        .expect("expression select item is accepted at the syntax layer");
     }
 
     /// Issue #1819・SQL-58 (4): `GROUP BY` なしの `HAVING` は、キー 0 個の `GroupByClause` で受理する。
@@ -30458,7 +30524,6 @@ mod tests {
             "SELECT COUNT(*) FROM documents HAVING COUNT(*) > $1",
             "WITH x AS (SELECT lang FROM documents) SELECT COUNT(*) FROM x HAVING COUNT(*) > 1",
             "SELECT COUNT(*) FROM documents HAVING COUNT(*) > 1 UNION ALL SELECT COUNT(*) FROM documents",
-            "SELECT lang, COUNT(*) FROM documents",
         ] {
             let err = validate_sql(sql, &lookup).expect_err("must be rejected");
             assert_eq!(err.wire_code(), "42601", "sql={sql:?}");
@@ -30554,21 +30619,27 @@ mod tests {
         assert_eq!(err.wire_code(), "42601");
     }
 
+    /// Issue #1818・SQL-58: 集計と裸の列の混在（`GROUP BY` なし）はトップレベルでは構文段が受理し、
+    /// 束縛段が `42803` で拒否する。非トップレベル（CTE 主クエリ）は従来どおり `42601`。
     #[test]
-    fn rejects_mixed_aggregate_and_non_aggregate_items_either_order() {
+    fn defers_mixed_aggregate_and_non_aggregate_items_to_binding_at_top_level() {
         let lookup = catalog_with(&["documents"]);
-        assert_eq!(
-            validate_sql("SELECT id, COUNT(*) FROM documents", &lookup)
-                .expect_err("mixing non-aggregate then aggregate must be rejected")
-                .wire_code(),
-            "42601"
-        );
-        assert_eq!(
-            validate_sql("SELECT COUNT(*), id FROM documents", &lookup)
-                .expect_err("mixing aggregate then non-aggregate must be rejected")
-                .wire_code(),
-            "42601"
-        );
+        validate_sql("SELECT id, COUNT(*) FROM documents", &lookup)
+            .expect("classification is deferred to the binder");
+        validate_sql("SELECT COUNT(*), id FROM documents", &lookup)
+            .expect("classification is deferred to the binder");
+        for sql in [
+            "WITH x AS (SELECT id FROM documents) SELECT id, COUNT(*) FROM x",
+            "WITH x AS (SELECT id FROM documents) SELECT COUNT(*), id FROM x",
+        ] {
+            assert_eq!(
+                validate_sql(sql, &lookup)
+                    .expect_err("mixing must be rejected in a CTE main query")
+                    .wire_code(),
+                "42601",
+                "{sql}"
+            );
+        }
     }
 
     /// `ARRAY[...]`・添字の角括弧内の `,` を項目終端と誤認しない（Issue #1811 レビュー指摘）。

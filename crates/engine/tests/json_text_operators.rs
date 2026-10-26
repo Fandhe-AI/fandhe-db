@@ -508,9 +508,17 @@ fn unsupported_positions_fail_closed_with_fixed_codes() {
             .cloned(),
         Some(json("{\"a\" : 1}"))
     );
-    // json 式の GROUP BY・DISTINCT・集計引数は構文段で受理されない（42601）。
+    // json 式の GROUP BY は等価演算子を持たない型として 42883（PostgreSQL と同じ。Issue #1817・#1818）。
+    assert_eq!(
+        code_sql(
+            &core,
+            &alice,
+            &format!("SELECT doc -> 'a' AS v, COUNT(*) FROM {TABLE} GROUP BY doc -> 'a' LIMIT 10")
+        ),
+        "42883"
+    );
+    // json 式の DISTINCT・集計引数は構文段で受理されない（42601）。
     for sql in [
-        format!("SELECT doc -> 'a' AS v, COUNT(*) FROM {TABLE} GROUP BY doc -> 'a' LIMIT 10"),
         format!("SELECT DISTINCT doc -> 'a' FROM {TABLE} LIMIT 10"),
         format!("SELECT COUNT(doc -> 'a') FROM {TABLE} LIMIT 1"),
     ] {

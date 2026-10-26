@@ -2917,9 +2917,16 @@ pub(crate) fn aggregate_projection_columns(
                         .ok_or_else(|| accumulator_bug("group key column index out of range"))?
                         .ty
                         .clone(),
-                    BoundOrderTarget::Expr(_) => {
-                        return Err(accumulator_bug("group key must not be an expression key"))
-                    }
+                    // Issue #1818・SQL-58: 式キーは束縛時に確定した結果列型を公告する。
+                    // 型を公告できない式キーは束縛段が参照を拒否済みで、到達したら不変条件違反。
+                    BoundOrderTarget::Expr(j) => bound
+                        .group_by
+                        .as_ref()
+                        .and_then(|g| g.key_exprs.get(j))
+                        .and_then(|k| k.result_ty.clone())
+                        .ok_or_else(|| {
+                            accumulator_bug("group key expression has no result type")
+                        })?,
                 };
                 Ok(ColumnMeta::Computed {
                     name: name.clone(),

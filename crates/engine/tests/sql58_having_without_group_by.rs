@@ -314,7 +314,8 @@ fn having_without_group_by_classifies_ungrouped_columns() {
         // 対応外の形は従来どおり 42601。
         ("SELECT count(*) FROM docs HAVING count(*) > $1", "42601"),
         ("SELECT * FROM docs HAVING count(*) > 1", "42601"),
-        ("SELECT lang, count(*) FROM docs", "42601"),
+        // `GROUP BY` も `HAVING` も無い裸の列は集計の外の参照として 42803（Issue #1818）。
+        ("SELECT lang, count(*) FROM docs", "42803"),
         (
             "SELECT count(*) FROM docs HAVING count(*) > 1 ORDER BY 1",
             "42601",

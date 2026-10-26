@@ -244,7 +244,7 @@
   `42601`（`HAVING` を黙って落とさない）。後続の `ORDER BY`／`LIMIT`／`OFFSET`、`OR`、`$n` は `42601`。
   単純形ビューでは集計の引数を公開列に限定する（非公開列は `42703`）。テナント境界は単一行集計の走査経路を
   共有するため、他テナントの行は集計にも判定にも現れない。
-- 対象外: `GROUP BY` も `HAVING` も無い文での集計の外の列参照（`42601` のまま。`42803` への移行は #1818）、
+- 対象外: `GROUP BY` も `HAVING` も無い文での集計の外の列参照（#1818 で `42803` へ移行済み。下の「Issue #1818 追記」）、
   `HAVING <bool 列>`・`NOT`・`OR` など比較の形をとらない真偽式（`TRUE`／`FALSE`／`NULL` の単独リテラルを除く）、
   JOIN 集計・NoSQL（HTTP）表層・`$n` を含む形。
 - テスト: engine `tests/sql58_having_without_group_by.rs`、wire `tests/wire_sql58_having_without_group_by.rs`、
@@ -254,7 +254,7 @@
 ## Issue #1817 追記（GROUP BY キー式の束縛と評価。SQL-58 のポインタ）
 
 `GROUP BY upper(lang)`・`GROUP BY n / 2` のように、グループキーに式を書けるようにした。親は #1816、
-SELECT／HAVING／ORDER BY の式とグループキー式の照合（式キーの値の出力）は兄弟の #1818。
+SELECT／HAVING／ORDER BY の式とグループキー式の照合（式キーの値の出力）は兄弟の #1818（下の「Issue #1818 追記」）。
 
 - 受理形: トップレベルの集計 `SELECT` に限り、キーに式（関数呼び出し・算術・`CASE`・`COALESCE`・`NULLIF`・
   `date_trunc` 等）を書ける。列キーとの混在も可。括弧で囲んだだけの列（`(lang)`）は列キーに正規化する。
@@ -262,7 +262,7 @@ SELECT／HAVING／ORDER BY の式とグループキー式の照合（式キー�
   合算で数え、超過は `54000`。起動時設定のキー数・グループ数の上限も式キーに効く。
 - 構文段: `GroupByClause::key_exprs` に式木を積み、`columns` の当該位置には利用者が書けない予約内部名
   （制御文字の接頭辞）を入れる。このため既存の `columns` 前提の判定（キー 0 個の判定・SELECT の裸の列の
-  照合）は変わらず、SELECT にキー式を書く形は従来どおり `42601` のまま（#1818 の管轄）。式の範囲は括弧の深さ 0 の
+  照合）は #1817 の時点では変わらず、SELECT にキー式を書く形は `42601` だった（#1818 で受理へ更新）。式の範囲は括弧の深さ 0 の
   区切り（`,`・`HAVING`・`ORDER BY`・`LIMIT`・`FETCH`・`OFFSET`・`;`）までを先読みで決め、解析後に区間の末尾へ
   届かなければ `42601`。先読み検査: 集計呼び出しは `42803`、ウィンドウ関数は `42P20`、`$n` と部分クエリは `42601`。
 - 束縛段: 基表スキーマに対して投影モード（PostgreSQL の結果型の算術。`n / 2` は整数除算）で束縛し、
@@ -270,7 +270,7 @@ SELECT／HAVING／ORDER BY の式とグループキー式の照合（式キー�
   `BoundOrderKey { target: Expr(j), .. }`。比較規約は型で決める: 数値は Float、TEXT は Bytes、真偽は Bool、
   日付・時刻系は SignedInt。VECTOR は `22000`、INTERVAL・jsonb・numeric・uuid・bytea・配列は `0A000`、
   `json` は `42883`（等値演算子が無い）。行ビュー上の型は番兵（`BYTEA`）のままなので、式キーを SELECT／HAVING／
-  ORDER BY から参照する形は `22000` で拒否される（#1818 で差し替える）。
+  ORDER BY から参照する形は `22000` で拒否された（#1818 で結果列型へ差し替え）。
 - 実行段: 式キーを含む文は必ず全走査の `multi_groups` 経路を通る（単一 TEXT キー専用の索引経路は使わない）。
   行ごとのキー式の評価は、可視性判定・本体デコード・`WHERE`・可視性の再検査を通った行に限る（不可視行・
   `WHERE` 非該当行の値で評価エラーが起きると他テナントの行の存在が漏れるため）。評価エラーは文全体を失敗させ、
@@ -287,3 +287,46 @@ SELECT／HAVING／ORDER BY の式とグループキー式の照合（式キー�
 - テスト: engine `tests/sql58_group_by_key_expressions.rs`、wire `tests/wire_sql58_group_by_key_expressions.rs`、
   構文段の単体テスト `group_by_expression_keys_are_collected_with_placeholders`・
   `group_by_key_precheck_classifies_aggregates_windows_and_params`・`group_by_expression_keys_reject_unsupported_forms`。
+
+## Issue #1818 追記（SELECT／HAVING／ORDER BY の式とグループキー式の構造一致。SQL-58 のポインタ）
+
+`GROUP BY upper(lang)` のとき `SELECT upper(lang), count(*)`・`HAVING upper(lang) > 'A'`・
+`ORDER BY upper(lang)` のように、同じ式をグループキーとして投影・参照できるようにした（親 #1816、
+前提の #1817）。集計の外で `GROUP BY` に無い列を参照する形は `42803`（grouping_error）で拒否する
+（ERR-6・SQL-14 の改訂注記のポインタ。集計の外の列参照の旧 `42601` からの契約変更）。
+
+- 構造一致の単一実装: `sql::parser::substitute_group_key_exprs`。式を上から順に調べ、`GROUP BY` の式キーと
+  構造が一致する最大の部分木を、そのキーの予約内部名（#1817 の `columns` 上の名前）の識別子へ置き換える。
+  比較前に関数名を ASCII 小文字へ揃える（括弧は構文木に残らない）。識別子・リテラルの表記は揃えない
+  （`2` と `2.0` は別の式）。集計呼び出しは構文段で内部名へ脱糖済みのため、集計の中は照合の対象外
+  （集計の中では非グループ列を参照できる）。SELECT の式項目・HAVING の式述語・ORDER BY の式キー・序数
+  `ORDER BY n` の再束縛が同じ関数を使う。
+- SELECT 項目: トップレベルの集計 `SELECT` に限り、集計呼び出しを持たない式（`upper(lang)`・`n / 2`・
+  `CASE`・`date_trunc`）も `AggregateSelectItem::Expr`（`aggregates` が空）として構文段が受理する。置換後に
+  式全体が 1 つの式キーなら `ProjectionColumn::GroupKey`（列名は `AS` 別名、無ければ PostgreSQL の既定名
+  〔`upper`・`?column?`〕。予約内部名は列名へ出ない）、部分一致（`n / 2 + 1`・`upper(lang) || ...`）は
+  `ProjectionColumn::Expr` で投影する。集計呼び出しを 1 つも持たない文は従来どおり `42601`
+  （`SELECT upper(lang) FROM t GROUP BY upper(lang)` を含む）。
+- 照合の移動: トップレベルでは、SELECT の裸の列と `GROUP BY` 列の照合・`GROUP BY` なしの裸の列の検査を
+  構文段（`42601`）から束縛段へ移した（スキーマを要する分類のため）。置換後に残った集計の外の列が
+  `GROUP BY` 列でなければ、スキーマに列（疑似列 `id` を含む）があれば `42803`、無ければ `42703`
+  （文言は固定で列値を載せない）。HAVING／ORDER BY で集計項目・キー・別名のいずれにも解決できない識別子も
+  同じ分類（従来は `GROUP BY` なしの `HAVING` を除き `42703`）。CTE 主クエリ・集合演算の枝・サブクエリ・
+  ビュー本体は従来どおり構文段が `42601`。
+- HAVING／ORDER BY の構文: `GROUP BY` に式キーがある文に限り、関数・`CASE` を含まない式述語
+  （`HAVING n / 2 > 1`）と、識別子・数値の直後が算術演算子の ORDER BY キー（`ORDER BY n / 2`）を受理する。
+  キーを含まない列参照は束縛段が `42803`。式キーの無い文の挙動（`HAVING lang = 'ja'` の `42601` 等）は不変。
+- 行ビュー・実行段: 行ビューの式キー列の型は `BoundGroupKeyExpr` の結果列型（無ければ静的型の既定写像。
+  整数は `precise` でない行ビューでは BIGINT、REAL は DOUBLE へ正規化。列キーと同じ）。キー値は
+  `group_by::group_key_expr_cell` が投影式と同じ写像（`expr_value_to_cell`）で `Cell` へ復元する。値の種別が
+  静的型と食い違う場合は `XX000`（fail-closed）。RowDescription の型は結果列型。評価位置（可視性判定・
+  `WHERE` を通った行のみ）は #1817 のまま不変で、出力は確定したグループのキー値から作る。
+- 既知の差分・対象外（追跡）: SELECT の出力別名を `GROUP BY` で参照する形（`GROUP BY u`）は未対応
+  （`42703` のまま。PostgreSQL は入力列を優先して出力別名も解決する）。位置指定 `GROUP BY 1`・重複キー・
+  2^53 超の bigint 式キーの精度は #1817 の差分を引き継ぐ。単純形ビュー・評価後射影形ビュー経由の式キー、
+  CTE・集合演算の枝・サブクエリ、JOIN 集計、NoSQL（HTTP）表層は対象外（fail-closed）。
+- テスト: engine `tests/sql58_group_key_expr_matching.rs`、wire `tests/wire_sql58_group_key_expr_matching.rs`、
+  `sql::parser` の単体テスト `substitute_group_key_exprs_*`。契約変更に伴い、`GROUP BY` に無い列の参照を
+  `42601`／`42703` と期待していた既存テストの期待値を `42803`／`42703` へ更新した
+  （`sql42_aggregate_*`・`sql26_order_by_having_expressions`・`sql58_having_without_group_by`・
+  `wire_aggregate`・`wire_sql26_extract_order_having` 等）。

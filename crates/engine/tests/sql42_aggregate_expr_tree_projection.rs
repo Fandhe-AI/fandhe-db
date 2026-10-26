@@ -258,8 +258,6 @@ fn unsupported_shapes_stay_rejected() {
     let (core, ctx, _g) = setup();
     for sql in [
         "SELECT coalesce(sum(count(*)), 0) FROM t",
-        "SELECT coalesce(sum(n), n) FROM t",
-        "SELECT g, coalesce(sum(n), m) FROM t GROUP BY g",
         "SELECT upper(g) FROM t GROUP BY g",
         "SELECT coalesce(sum(n), 0) FROM t WHERE coalesce(sum(n), 0) > 1",
         "WITH w AS (SELECT * FROM t) SELECT coalesce(sum(n), 0) FROM w",
@@ -269,6 +267,13 @@ fn unsupported_shapes_stay_rejected() {
         "SELECT coalesce(sum(n), $1) FROM t",
     ] {
         assert_eq!(code(&core, &ctx, sql), "42601", "{sql}");
+    }
+    // 集計の外の `GROUP BY` に無い列は 42803（Issue #1818・SQL-58）。
+    for sql in [
+        "SELECT coalesce(sum(n), n) FROM t",
+        "SELECT g, coalesce(sum(n), m) FROM t GROUP BY g",
+    ] {
+        assert_eq!(code(&core, &ctx, sql), "42803", "{sql}");
     }
     // 式の被演算子にできない結果は 0A000（成功させない）。
     assert_eq!(

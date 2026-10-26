@@ -555,14 +555,15 @@ fn simple_unsupported_forms_return_exact_sqlstate_and_session_continues() {
         format!("{AGG} HAVING abs(id) > 1"),
         format!("{AGG} HAVING lower(title) = 'a'"),
     ] {
-        // 未知列（`nosuchcol`・`title`・集計文脈の `id`）は 42703、VECTOR 式などの型不正は 22000。
-        let expected =
-            if sql.contains("nosuchcol") || sql.contains("abs(id)") || sql.contains("lower(title)")
-            {
-                "42703"
-            } else {
-                "22000"
-            };
+        // 未知列（`nosuchcol`）は 42703、集計文脈で `GROUP BY` に無い列（`title`・`id`）は
+        // 集計の外の参照として 42803（Issue #1818・SQL-58）、VECTOR 式などの型不正は 22000。
+        let expected = if sql.contains("nosuchcol") {
+            "42703"
+        } else if sql.contains("abs(id)") || sql.contains("lower(title)") {
+            "42803"
+        } else {
+            "22000"
+        };
         assert_simple_error(&mut s, &sql, expected);
     }
 
@@ -714,7 +715,7 @@ fn extended_unsupported_forms_return_exact_sqlstate_and_recover() {
         &mut s,
         "SELECT lang, COUNT(*) AS c FROM docs WHERE lang = $1 GROUP BY lang HAVING abs(id) > 1",
         &["ja"],
-        "42703",
+        "42803",
     );
 }
 
