@@ -203,3 +203,34 @@ TABLE-12 のキー/ヘッダ tenant 整合検査・`decode_row_dim_and_metadata_
   （`select_decode_tier`）へ抽出するリファクタは、既存構造のまま
   `ReferencedColumns::derive` の拡張のみで受入条件 4 を満たせたため見送った
   （挙動は不変。将来の重複解消候補として記録）。
+
+## Issue #1809 追記（集計引数の式の束縛。親 #1807・SQL-57 ポインタ）
+
+算術・関数・CASE の式を集計引数に取れる範囲を、列参照と同じ型の行列まで広げた。
+式の評価は #1808 の `sql::aggregate_input::eval_aggregate_input` に集約済みで、
+本 Issue は束縛段と型検査を広げて評価段へ結線した。
+
+- **受理行列**（束縛後の式の型 × 集計関数）:
+  - `Scalar`: 従来どおり `AggregateInput::ScalarExpr`（変更なし）。
+  - `Text`: `COUNT`・`COUNT(DISTINCT)`・`MIN`/`MAX`（`Collation::DEFAULT` のバイト列順）。
+    `SUM`/`AVG`・分散系は `42883`。
+  - `Bool`: `COUNT`・`COUNT(DISTINCT)`。`MIN`/`MAX`・`SUM`/`AVG` は `42883`。
+  - `Date`/`Timestamp`/`Time`/`TimestampTz`: `COUNT`・`COUNT(DISTINCT)`・`MIN`/`MAX`
+    （結果型は式の型）。`SUM`/`AVG` は `42883`。
+  - `Interval`・CAST 結果（`Numeric`/`Uuid`/`Bytea`/`Array`）は `0A000`、`Json`/`Vector` は
+    従来の `22000`/`42883` を据え置く。
+- **`AggregateInput::TypedExpr { source, program, ty }`** を新設した。評価結果が束縛時の
+  型 `ty` と食い違えば `XX000` で fail-closed に拒否する。`ReferencedColumns::derive`・
+  `has_text_min_max_aggregate`（TEXT の累計バイト予算）・`aggregate_result_type` を結線した。
+- **`AggregateRowValue::Text` を `Cow` 化**した（列参照は借用、関数結果は所有）。
+  `COUNT(DISTINCT)` のキーのバイト表現は変えていない。
+- **構文段**: 集計の第 1 引数で単項マイナスを受理し（`sum(-n)`）、`COUNT(DISTINCT (a + b))`・
+  `COUNT(DISTINCT -a)` の `DISTINCT` を修飾子と読む。入れ子集計は従来どおり `42601`。
+- **テナント境界**: 式の評価は RLS 可視性判定と TABLE-12 の検査を通った行だけに行う。
+  `tenant_id`/`visibility` は式の中でも `42703`（結合テストで固定）。
+
+### 対象外（追跡）
+
+- 整数系の式の結果型（`sum(k * 2)` は式エンジンの f64 のため double。PG は bigint）。
+- 比較式を裸で引数にする形（`count(n > 1)`。bool 系以外）、ウィンドウ集計・ビュー本体の式引数。
+- `FILTER` 句との併用（別 Issue の担当）。

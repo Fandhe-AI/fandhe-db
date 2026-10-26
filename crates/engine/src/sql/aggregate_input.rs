@@ -14,13 +14,15 @@
 //! 変えていない）。型不一致は従来どおり [`accumulator_bug`]（XX000）で fail-closed に
 //! 拒否し、受信データ経路のため添字アクセス・`unwrap` は使わない。
 
+use std::borrow::Cow;
+
 use crate::datetime::Interval;
 use crate::row_codec::ScalarRef;
 use crate::sql::aggregate::{accumulator_bug, RowVector};
 use crate::sql::allowlist::SqlSurfaceError;
 use crate::sql::expr_program::StackValue;
 use crate::sql::parser::AggregateInput;
-use crate::sql::udf_call::{self, ExprValue};
+use crate::sql::udf_call::{self, ExprType, ExprValue};
 
 /// 非 NULL を数えるだけの列型（`COUNT` 専用）。非 distinct 経路は型を確かめず
 /// 数え、`COUNT(DISTINCT)` 経路だけが期待する型を確かめてキーを作る。
@@ -34,7 +36,7 @@ pub(crate) enum CountOnlyKind {
 
 /// 1 行分の集計入力の評価結果。アキュムレータの入口（`observe_*`）と distinct
 /// キーに 1 対 1 で対応させ、情報を落とさない。
-#[derive(Clone, Copy, Debug, PartialEq)]
+#[derive(Clone, Debug, PartialEq)]
 pub(crate) enum AggregateRowValue<'a> {
     /// NULL（その行は集計対象外）。
     Null,
@@ -43,7 +45,8 @@ pub(crate) enum AggregateRowValue<'a> {
     Id(u64),
     /// 真偽値の式（`bool_and` 等の比較式入力。SQL-57・Issue #1805）。
     Bool(bool),
-    Text(&'a str),
+    /// TEXT。列参照は借用、式（関数結果）は所有（SQL-57・Issue #1809）。
+    Text(Cow<'a, str>),
     /// `INTEGER`／`SMALLINT`。distinct キー長（4 バイト）を保つため BigInt と分ける。
     Int32(i32),
     Int64(i64),
@@ -60,6 +63,31 @@ pub(crate) enum AggregateRowValue<'a> {
         kind: CountOnlyKind,
         value: ScalarRef<'a>,
     },
+}
+
+/// 式木が実際に embedding へ到達する場合のみ `vector.values` を要求して返す
+/// （`ReferencedColumns::derive` と同じ判定関数）。未デコードは導出漏れという
+/// 実装バグとして fail-closed に拒否する。
+fn expr_embedding<'v>(
+    source: &udf_call::BoundExpr,
+    vector: &RowVector<'v>,
+    kind: &'static str,
+) -> Result<&'v [f32], SqlSurfaceError> {
+    if !udf_call::references_embedding(source) {
+        return Ok(&[]);
+    }
+    match vector.values {
+        Some(v) => Ok(v),
+        None => Err(accumulator_bug(match kind {
+            "BoolExpr" => {
+                "BoolExpr references the VECTOR column but the row's embedding was not decoded"
+            }
+            "ScalarExpr" => {
+                "ScalarExpr references the VECTOR column but the row's embedding was not decoded"
+            }
+            _ => "TypedExpr references the VECTOR column but the row's embedding was not decoded",
+        })),
+    }
 }
 
 /// `input` を 1 行分評価する。`scanned`／`vector`／`scratch` の意味は
@@ -101,7 +129,7 @@ pub(crate) fn eval_aggregate_input<'a>(
         // TEXT 以外は NULL 扱い（従来どおりの寛容さ）。
         AggregateInput::TextColumn(index) | AggregateInput::CollatedTextColumn { index, .. } => {
             match cell(index).and_then(|v| v.as_text()) {
-                Some(s) => V::Text(s),
+                Some(s) => V::Text(Cow::Borrowed(s)),
                 None => V::Null,
             }
         }
@@ -203,18 +231,7 @@ pub(crate) fn eval_aggregate_input<'a>(
             None => V::Null,
         },
         AggregateInput::BoolExpr { source, program } => {
-            let embedding: &[f32] = if udf_call::references_embedding(source) {
-                match vector.values {
-                    Some(v) => v,
-                    None => {
-                        return Err(accumulator_bug(
-                            "BoolExpr references the VECTOR column but the row's embedding was not decoded",
-                        ))
-                    }
-                }
-            } else {
-                &[]
-            };
+            let embedding = expr_embedding(source, vector, "BoolExpr")?;
             match program.eval(id, embedding, scanned, scratch)? {
                 ExprValue::Bool(b) => V::Bool(b),
                 // 比較の片側が NULL の行は集計対象外（3 値論理の UNKNOWN を無視する）。
@@ -227,21 +244,7 @@ pub(crate) fn eval_aggregate_input<'a>(
             }
         }
         AggregateInput::ScalarExpr { source, program } => {
-            // 式木が実際に embedding へ到達する場合のみ `vector.values` を要求する
-            // （`ReferencedColumns::derive` と同じ判定関数）。未デコードは導出漏れという
-            // 実装バグとして fail-closed に拒否する。
-            let embedding: &[f32] = if udf_call::references_embedding(source) {
-                match vector.values {
-                    Some(v) => v,
-                    None => {
-                        return Err(accumulator_bug(
-                            "ScalarExpr references the VECTOR column but the row's embedding was not decoded",
-                        ))
-                    }
-                }
-            } else {
-                &[]
-            };
+            let embedding = expr_embedding(source, vector, "ScalarExpr")?;
             match program.eval(id, embedding, scanned, scratch)? {
                 ExprValue::Scalar(v) => V::Float(v),
                 // NULL は集計対象から除外する（SQL-26 の共有契約）。
@@ -250,6 +253,29 @@ pub(crate) fn eval_aggregate_input<'a>(
                 _ => {
                     return Err(accumulator_bug(
                         "scalar-typed BoundExpr evaluated to a non-scalar value",
+                    ))
+                }
+            }
+        }
+        // SQL-57・Issue #1809: Scalar 以外の式。評価結果が束縛時の型 `ty` と一致しなければ
+        // 黙って縮退せず fail-closed に拒否する。NULL は集計対象外。
+        AggregateInput::TypedExpr {
+            source,
+            program,
+            ty,
+        } => {
+            let embedding = expr_embedding(source, vector, "TypedExpr")?;
+            match (ty, program.eval(id, embedding, scanned, scratch)?) {
+                (_, ExprValue::Null) => V::Null,
+                (ExprType::Text, ExprValue::Text(s)) => V::Text(s),
+                (ExprType::Bool, ExprValue::Bool(b)) => V::Bool(b),
+                (ExprType::Date, ExprValue::Date(v)) => V::Date(v),
+                (ExprType::Timestamp, ExprValue::Timestamp(v)) => V::Timestamp(v),
+                (ExprType::Time, ExprValue::Time(v)) => V::Time(v),
+                (ExprType::TimestampTz, ExprValue::TimestampTz(v)) => V::TimestampTz(v),
+                _ => {
+                    return Err(accumulator_bug(
+                        "typed BoundExpr evaluated to a value that does not match its bound type",
                     ))
                 }
             }
@@ -364,7 +390,7 @@ mod tests {
         );
         assert_eq!(
             eval(&AggregateInput::TextColumn(0), &row).unwrap(),
-            AggregateRowValue::Text("a")
+            AggregateRowValue::Text(Cow::Borrowed("a"))
         );
     }
 
@@ -416,5 +442,17 @@ mod tests {
             eval(&AggregateInput::VectorColumnPresence, &[]).unwrap(),
             AggregateRowValue::Null
         );
+    }
+
+    #[test]
+    fn owned_and_borrowed_text_share_the_distinct_key() {
+        let borrowed = AggregateRowValue::Text(Cow::Borrowed("ab"));
+        let owned = AggregateRowValue::Text(Cow::Owned("ab".to_string()));
+        assert_eq!(borrowed, owned);
+        assert_eq!(
+            borrowed.distinct_key().unwrap(),
+            owned.distinct_key().unwrap()
+        );
+        assert_eq!(owned.distinct_key().unwrap(), Some(b"ab".to_vec()));
     }
 }

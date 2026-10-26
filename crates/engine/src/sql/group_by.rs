@@ -1389,6 +1389,11 @@ pub(crate) fn has_text_min_max_aggregate(items: &[crate::sql::parser::BoundAggre
             item.input,
             crate::sql::parser::AggregateInput::TextColumn(_)
                 | crate::sql::parser::AggregateInput::CollatedTextColumn { .. }
+                // SQL-57・Issue #1809: Text 式の MIN/MAX も TEXT 列と同じ累計バイト予算の対象。
+                | crate::sql::parser::AggregateInput::TypedExpr {
+                    ty: crate::sql::udf_call::ExprType::Text,
+                    ..
+                }
         )
     })
 }

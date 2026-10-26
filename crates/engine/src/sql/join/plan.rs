@@ -1077,6 +1077,7 @@ fn build_aggregate_shape(
                         if matches!(
                             item.input,
                             AggregateInput::ScalarExpr { .. }
+                                | AggregateInput::TypedExpr { .. }
                                 | AggregateInput::VectorColumnPresence
                         ) {
                             return Err(SqlSurfaceError::unsupported(
