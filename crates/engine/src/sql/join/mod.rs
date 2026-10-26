@@ -32,7 +32,9 @@
 //! 設計判断の詳細は `docs/design/inner-join.md`・`docs/design/outer-join.md`・
 //! `docs/design/multi-way-join.md`・`docs/design/join-using.md` 参照。
 //!
-//! スコープ外: `CROSS`／`NATURAL` JOIN・`USING (...) AS <alias>`・FULL JOIN USING の統合列の
+//! `NATURAL JOIN`（Issue #1827）は共通列名を導出して USING と同じ束縛へ流す
+//! （`using::natural_using_names`）。
+//! スコープ外: `CROSS` JOIN・`USING (...) AS <alias>`・FULL JOIN USING の統合列の
 //! WHERE／GROUP BY／集計／後続段の結合キーでの参照（`0A000`）・ベクトル順位付け
 //! （`ORDER BY ... <=>` 等）との併用・FROM でのビュー参照・`RelationSnapshotCache`
 //! （TASK-212 基盤）による結合入力のキャッシュ。

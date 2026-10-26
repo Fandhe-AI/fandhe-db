@@ -610,11 +610,10 @@ fn rejects_invalid_using_lists_and_unsupported_forms() {
             "SELECT * FROM a FULL JOIN b USING (k) JOIN c USING (k) LIMIT 5",
             "0A000",
         ),
-        // 構文: 空リスト・修飾名・USING の別名・NATURAL。
+        // 構文: 空リスト・修飾名・USING の別名。
         ("SELECT * FROM a JOIN b USING () LIMIT 5", "42601"),
         ("SELECT * FROM a JOIN b USING (a.k) LIMIT 5", "42601"),
         ("SELECT * FROM a JOIN b USING (k) AS j LIMIT 5", "42601"),
-        ("SELECT * FROM a NATURAL JOIN b LIMIT 5", "42601"),
         (
             "SELECT * FROM a JOIN b USING (c1, c2, c3, c4, c5, c6, c7, c8, c9) LIMIT 5",
             "54000",

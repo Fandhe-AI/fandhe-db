@@ -417,7 +417,7 @@ fn limit_and_offset_apply_after_full_result_is_computed() {
 
 // `LEFT`／`RIGHT`／`FULL [OUTER]` JOIN は Issue #926 で受理対象になった
 // （結合テストは `tests/sql28_outer_join.rs` 参照）。ここでは引き続き対象外の
-// `CROSS`／`NATURAL`・単独の `OUTER JOIN` だけを確認する。
+// `CROSS`・`NATURAL ... ON ...`・単独の `OUTER JOIN` だけを確認する（`NATURAL JOIN` 自体は Issue #1827 で受理対象）。
 
 #[test]
 fn rejects_bare_outer_join_without_side() {
@@ -435,14 +435,14 @@ fn rejects_bare_outer_join_without_side() {
 }
 
 #[test]
-fn rejects_natural_join() {
+fn rejects_natural_join_with_on_clause() {
     let (storage, path) = seeded_basic();
     let _guard = CleanupGuard(path);
     let core = new_core(storage);
     assert_rejected(
         &core,
         "tenant-a",
-        "SELECT * FROM documents NATURAL JOIN authors LIMIT 10",
+        "SELECT * FROM documents NATURAL JOIN authors ON documents.author_id = authors.id LIMIT 10",
         "42601",
     );
 }

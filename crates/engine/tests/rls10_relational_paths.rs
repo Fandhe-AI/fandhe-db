@@ -898,7 +898,7 @@ fn error_responses_are_identical_with_and_without_other_tenant_private_rows() {
         // 構文解析段（データに触れる前）の拒否。他テナント行の有無で変化し
         // ようがないことを固定する。
         "SELECT id FROM nonexistent_table_xyz LIMIT 5",
-        "SELECT * FROM documents NATURAL JOIN authors LIMIT 5",
+        "SELECT * FROM documents NATURAL JOIN authors ON documents.id = authors.id LIMIT 5",
         "SELECT * FROM documents CROSS JOIN authors LIMIT 5",
         // `USING (...)` は受理対象（Issue #1826）。存在しない列の USING は静的に拒否される。
         "SELECT * FROM documents JOIN authors USING (no_such_col) LIMIT 5",

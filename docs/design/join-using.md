@@ -8,7 +8,7 @@ Accepted・実装済み。
 
 - spec: `docs/spec/04-behavior/sql-surface.md` SQL-60 (1)（期待値は PostgreSQL 17 と同じ）
 - 前提: `docs/design/inner-join.md`・`docs/design/outer-join.md`・`docs/design/multi-way-join.md`
-- 後続: `NATURAL JOIN`（Issue #1827）は束縛時に導出した列名列を本 Issue の USING 束縛へ流し込む
+- 後続: `NATURAL JOIN`（Issue #1827）は束縛時に導出した列名列を本 Issue の USING 束縛へ流し込む（下記「NATURAL JOIN」節）
 
 ## 目的
 
@@ -51,9 +51,32 @@ FULL の統合列だけが複数ソースを持つ。`OutputColumn`／`PlainOrde
 - FULL の統合列は「投影（`*` 展開・明示列）」と「非集計形の `ORDER BY`（列名・序数）」だけが
   値を組み立てられる。WHERE・GROUP BY・集計の引数・後続段の結合キー（後続の USING／ON）からの
   非修飾参照は `0A000`（固定文言。列名・行データを含めない）で拒否する。
-- `USING (...) AS <alias>` は未対応（`42601`）。`NATURAL JOIN` は従来どおり `42601`（Issue #1827）。
+- `USING (...) AS <alias>` は未対応（`42601`）。
 - 同じ型クラスで型が異なる USING 列の共通型への寄せ、FULL 統合列の WHERE 等での参照、
   `USING ... AS` は後続課題。
+
+## NATURAL JOIN（Issue #1827）
+
+`NATURAL [INNER|LEFT|RIGHT|FULL [OUTER]] JOIN` を受理し、両入力に共通する列名から USING 列リストを
+導出して上記の USING 束縛（`bind_using_step`）へそのまま流す。出力規則（統合列の値・`SELECT *` の
+列順・NULL 補完・FULL の制約）は USING と同一で、`NATURAL ... JOIN` と明示 `USING (<導出列>)` は
+結果・列メタとも一致する（`tests/sql60_natural_join.rs`）。
+
+- 構文段: `JoinCondition::Natural`（列名列は持たない）。`NATURAL` の後に `ON`／`USING (...)` が続く形、
+  `NATURAL CROSS JOIN`・`NATURAL OUTER JOIN`・結合語を伴わない `NATURAL` は `42601`。
+- 導出（`sql::join::using::natural_using_names`）: 左の可視列の並び（連鎖時は統合列 → 左の残り →
+  右の残り）を走査し、新しい relation に同名列があるものを採る（重複除去）。列名は完全一致
+  （大文字小文字を区別。USING・他の列解決と同じ規則）。疑似列 `id` を持つ従来方式の表では `id` も
+  共通列になる。左に未統合の同名列が複数あれば USING と同じ `42702`。型の検査は USING と同じ
+  （クラス不一致 `42804`・同クラス非同一型 `0A000`・結合キー不可型は既存エラー）。
+- 共通列が 0 個のときは条件なしの直積（PostgreSQL 17 の `ON TRUE` 相当）。外部結合では空側を
+  NULL 補完する。キー 0 個でも一致ペア数の上限（逐次判定）と共有バイト予算はそのまま効く。統合を伴わ
+  ないので USING 扱い（`has_using`）にはせず、従来の列解決経路を保つ。
+- 導出した共通列数は ON／USING と同じ上限 `MAX_JOIN_CONDITIONS`（8）を超えると `54000`
+  （PostgreSQL にはない制約）。
+- 対象外（USING と同じ既存分類で fail-closed）: FULL NATURAL の統合列の WHERE 等での参照や後続
+  NATURAL の共通列化（`0A000`）、同クラス非同一型の共通型への寄せ（`0A000`）、VECTOR 等の結合キー
+  不可型が共通列になる場合。`CROSS JOIN` は引き続き `42601`。
 
 ## セキュリティ
 
@@ -65,5 +88,6 @@ FULL の統合列だけが複数ソースを持つ。`OutputColumn`／`PlainOrde
 
 ## テスト
 
-`crates/engine/tests/sql60_join_using.rs`（INNER／LEFT／RIGHT／FULL・複数列・連鎖・ON との混在・
+`crates/engine/tests/sql60_natural_join.rs`（NATURAL の各種別・導出規則・直積・拒否形・上限・
+テナント境界）、`crates/engine/tests/sql60_join_using.rs`（INNER／LEFT／RIGHT／FULL・複数列・連鎖・ON との混在・
 WHERE・集計・疑似列 `id`・拒否形・上限・テナント境界）と `sql::allowlist` の構文段ユニットテスト。

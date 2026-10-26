@@ -1,4 +1,4 @@
-//! `JOIN ... USING (...)` の束縛と結合列の統合規則（Issue #1826・SQL-60 (1)）。
+//! `JOIN ... USING (...)`／`NATURAL JOIN` の束縛と結合列の統合規則（Issue #1826・#1827・SQL-60 (1)）。
 //!
 //! 責務境界: `sql::join::plan` の段ループから呼ばれ、(a) USING 列リストの検証
 //! （重複・存在・型）と等価結合キーへの脱糖、(b) 統合列（結合列を 1 列にまとめた出力列）
@@ -12,9 +12,11 @@
 //! （`OutputColumn`／`PlainOrder` の代替ソース）。WHERE・GROUP BY・集計・後続段の結合キーからの
 //! 参照は `0A000` で fail-closed に拒否する（`docs/design/join-using.md`）。USING を 1 度も
 //! 使わない JOIN では [`JoinScope`] は [`BindingScope`] への完全委譲で、挙動は変わらない。
+//! NATURAL JOIN は [`natural_using_names`] が両入力の共通列名を導出し、USING と同じ
+//! [`bind_using_step`] へ渡す（共通列 0 個は統合なしの直積）。
 
 use crate::catalog::{ColumnType, TableSchema};
-use crate::sql::allowlist::{JoinKind, SqlSurfaceError};
+use crate::sql::allowlist::{JoinKind, SqlSurfaceError, MAX_JOIN_CONDITIONS};
 use crate::sql::relation::{BindingScope, ColumnRef, ColumnSlot, ResolvedColumn};
 
 use super::values::{key_class, JoinKeyClass};
@@ -68,6 +70,20 @@ pub(super) fn slot_type(schema: &TableSchema, slot: ColumnSlot) -> Option<Column
     }
 }
 
+/// スロットが指す列名（疑似列 `id` は `"id"`）。
+fn slot_name(schema: &TableSchema, slot: ColumnSlot) -> Result<&str, SqlSurfaceError> {
+    match slot {
+        ColumnSlot::Id => Ok("id"),
+        ColumnSlot::Column(i) => schema
+            .columns
+            .get(i)
+            .map(|c| c.name.as_str())
+            .ok_or_else(|| SqlSurfaceError::Internal {
+                detail: "JOIN column index out of range".to_string(),
+            }),
+    }
+}
+
 /// relation 1 個の可視列（`SELECT *` の展開規則と同じ。疑似列 `id` が先頭、続いて宣言列）。
 pub(super) fn relation_columns(rel: usize, schema: &TableSchema) -> Vec<VisibleCol> {
     let mut out = Vec::with_capacity(schema.columns.len().saturating_add(1));
@@ -112,6 +128,23 @@ impl<'a> JoinScope<'a> {
             merged,
             visible,
             has_using,
+        }
+    }
+
+    /// 可視列 1 件の列名（元の列は所属 relation のスキーマ、統合列は統合名）。疑似列 `id` は `"id"`。
+    fn visible_name(&self, v: &VisibleCol) -> Result<&str, SqlSurfaceError> {
+        match v {
+            VisibleCol::Merged(i) => Ok(self.merged(*i)?.name.as_str()),
+            VisibleCol::Base { rel, slot } => {
+                let (_, schema) =
+                    self.base
+                        .relations()
+                        .get(*rel)
+                        .ok_or_else(|| SqlSurfaceError::Internal {
+                            detail: "JOIN relation index out of range".to_string(),
+                        })?;
+                slot_name(schema, *slot)
+            }
         }
     }
 
@@ -227,8 +260,8 @@ pub(super) struct UsingBinding {
 /// だけを持つ左側スコープ、`right_base` は新しい relation `new_rel` を含む基底スコープ。
 /// 列ごとに USING リスト順で判定する（PostgreSQL と同じ順序）: 重複 `42701` → 左に無い
 /// `42703`／複数ある `42702` → 右に無い `42703` → 型（`key_class` 不一致は ON と同じ `42804`、
-/// 同クラスで型が完全一致しない組は `0A000`）。#1827 の NATURAL JOIN は導出した列名列を
-/// そのまま渡せる。
+/// 同クラスで型が完全一致しない組は `0A000`）。NATURAL JOIN（#1827）は
+/// [`natural_using_names`] が導出した列名列をそのまま渡す。
 pub(super) fn bind_using_step(
     left: &JoinScope<'_>,
     right_base: &BindingScope<'_>,
@@ -332,4 +365,37 @@ pub(super) fn bind_using_step(
         merged,
         visible,
     })
+}
+
+/// NATURAL JOIN の共通列名を導出する（Issue #1827・SQL-60 (1)）。左側の可視列を並び順に
+/// 走査し、新しい relation `new_rel`（スキーマ `new_schema`）に同名列がある名前を採る
+/// （PostgreSQL と同じく左列順。連鎖時は統合列が先頭）。名前は完全一致で比較する（USING・
+/// 他の列解決と同じ規則）。左に同名の未統合列が複数あっても導出リストへは 1 回だけ入れ、
+/// 曖昧性の検出（`42702`）は [`bind_using_step`] の左照合に委ねる。共通列が 0 個なら空リスト
+/// （条件なしの直積）。導出数は USING と同じ [`MAX_JOIN_CONDITIONS`] を超えると `54000`。
+/// スキーマと文だけで決まり、行データには依存しない（他テナント行の有無で結果が変わらない）。
+pub(super) fn natural_using_names(
+    left: &JoinScope<'_>,
+    new_rel: usize,
+    new_schema: &TableSchema,
+) -> Result<Vec<String>, SqlSurfaceError> {
+    let mut right_names: Vec<&str> = Vec::new();
+    for v in relation_columns(new_rel, new_schema) {
+        if let VisibleCol::Base { slot, .. } = v {
+            right_names.push(slot_name(new_schema, slot)?);
+        }
+    }
+    let mut names: Vec<String> = Vec::new();
+    for v in left.visible() {
+        let name = left.visible_name(v)?;
+        if right_names.contains(&name) && !names.iter().any(|n| n == name) {
+            if names.len() >= MAX_JOIN_CONDITIONS {
+                return Err(SqlSurfaceError::payload_too_large(
+                    "too many NATURAL JOIN common columns",
+                ));
+            }
+            names.push(name.to_string());
+        }
+    }
+    Ok(names)
 }
