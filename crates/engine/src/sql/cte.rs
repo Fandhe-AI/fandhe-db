@@ -21,7 +21,10 @@
 //! 実リレーションへ解決される）。
 
 use super::allowlist::{ParsedViewBody, Projection, SqlSurfaceError, TableLookup};
-use super::view::{check_columns_within_view, resolve_from, Resolved};
+use super::view::{
+    apply_column_aliases, check_columns_within_view, physical_of, resolve_from, Resolved,
+};
+use super::view_alias::{rewrite_where, ColumnMap};
 
 /// CTE の定義数の**ハード上限（＝既定値）**（超過は `54000`。SQL-29 (b) の受入基準 3）。
 /// Issue #1552: 運用者は起動時に [`crate::nesting_limits::NestingLimits`] で下げられる。
@@ -46,11 +49,13 @@ pub(crate) const MAX_CTE_NESTING_DEPTH: u32 = 4;
 /// 誤って `54000` で拒否してしまう。
 pub(crate) const MAX_CTE_REFERENCES: usize = 32;
 
-/// `WITH <name> AS (<body>)` 1 件分の定義（`sql::allowlist::parse_with_clause`
+/// `WITH <name> [(<列名>, ...)] AS (<body>)` 1 件分の定義（`sql::allowlist::parse_with_clause`
 /// が構築する）。
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) struct CteDef {
     pub(crate) name: String,
+    /// 列名リスト `WITH <name>(a, b)`（SQL-62 (2)・Issue #1857）。空ならリストなし。
+    pub(crate) column_aliases: Vec<String>,
     pub(crate) body: ParsedViewBody,
 }
 
@@ -135,7 +140,7 @@ pub(crate) fn resolve_relation(
             max_depth_usize(max_depth),
             budget,
         )?;
-        return compose(inner, def);
+        return compose(lookup, inner, def);
     }
 
     resolve_from(lookup, name)
@@ -143,25 +148,40 @@ pub(crate) fn resolve_relation(
 
 /// CTE 本文 1 段分を、内側（`inner`）の解決結果へ合成する。`sql::view::
 /// resolve_from` 第 2 パスの「内側から外側へ畳み込む」処理を CTE 向けに
-/// 1 段分だけ切り出したもの。
-fn compose(inner: Resolved, def: &CteDef) -> Result<Resolved, SqlSurfaceError> {
-    let (base_table, mut acc_predicates, exposed) = match inner {
-        Resolved::Table => (def.body.table_name.clone(), Vec::new(), None),
+/// 1 段分だけ切り出したもの。`sql::allowlist::validate_sql_tokens` の `WITH`
+/// 分岐も、参照されない CTE の検証（列名リストの長さ検査を含む）に結果を捨てて呼ぶ。
+///
+/// 列名リスト（SQL-62 (2)・Issue #1857）は [`super::view::apply_column_aliases`]
+/// （ビューの列別名と共有）で「公開名 → 物理名」の対応にし、`column_map` として
+/// 外側へ渡す。列スコープは公開名で書き換えの**前**に検査する（`view_alias` の順序の
+/// 不変条件）。内側が `column_map` を持つ（別名付き CTE・ビューの上に重なる）ときは、
+/// この段の `WHERE` を物理名へ書き換えてから合成し、対応を伝播する。長すぎる列名リストは
+/// `42P10`（[`SqlSurfaceError::CteColumnListTooLong`]）。
+pub(crate) fn compose(
+    lookup: &impl TableLookup,
+    inner: Resolved,
+    def: &CteDef,
+) -> Result<Resolved, SqlSurfaceError> {
+    let (base_table, mut acc_predicates, exposed, column_map, base_allocated) = match inner {
+        Resolved::Table => {
+            let base_table = def.body.table_name.clone();
+            let allocated = lookup.table_is_allocated(&base_table)?;
+            (base_table, Vec::new(), None, None, allocated)
+        }
         Resolved::View {
             base_table,
             view_predicates,
             view_columns,
             column_map,
+            base_allocated,
             ..
-        } => {
-            // 列別名付きビュー（TABLE-41・Issue #1659）は CTE の本文からは未対応（fail-closed）。
-            if column_map.is_some() {
-                return Err(SqlSurfaceError::feature_not_supported(
-                    "a view with column aliases cannot be used in a CTE",
-                ));
-            }
-            (base_table, view_predicates, view_columns)
-        }
+        } => (
+            base_table,
+            view_predicates,
+            view_columns,
+            column_map,
+            base_allocated,
+        ),
         // Issue #1192: 評価後射影形ビューは CTE から参照できない
         // （外側の合成ができないため）。
         Resolved::Buffered { .. } => {
@@ -183,23 +203,58 @@ fn compose(inner: Resolved, def: &CteDef) -> Result<Resolved, SqlSurfaceError> {
         &[],
     )?;
 
-    let next_exposed = if let Projection::Columns(cols) = &def.body.projection {
-        Some(cols.clone())
-    } else {
-        exposed
+    // この段の `WHERE` は内側の公開名で書かれている。内側が列別名を持つなら物理名へ書き換える。
+    let layer_predicates = match &column_map {
+        Some(map) => rewrite_where(
+            &ColumnMap::new(map, !base_allocated),
+            def.body.where_predicates.clone(),
+        )?,
+        None => def.body.where_predicates.clone(),
     };
 
-    acc_predicates.extend(def.body.where_predicates.clone());
+    let (next_exposed, next_map) = if !def.column_aliases.is_empty() {
+        let name = def.name.clone();
+        let specified = def.column_aliases.len();
+        let map = apply_column_aliases(
+            lookup,
+            &base_table,
+            &def.body.projection,
+            exposed.as_deref(),
+            column_map.as_deref(),
+            &def.column_aliases,
+            |available| SqlSurfaceError::CteColumnListTooLong {
+                name,
+                available,
+                specified,
+            },
+        )?;
+        (
+            Some(map.iter().map(|(p, _)| p.clone()).collect()),
+            Some(map),
+        )
+    } else if let Projection::Columns(cols) = &def.body.projection {
+        // 内側の別名対応を通して物理名を引き継ぐ（内側に無い列は検査済みのため到達しない）。
+        let map = column_map.as_ref().map(|m| {
+            cols.iter()
+                .map(|c| (c.clone(), physical_of(m, c)))
+                .collect::<Vec<_>>()
+        });
+        (Some(cols.clone()), map)
+    } else {
+        (exposed, column_map)
+    };
+
+    acc_predicates.extend(layer_predicates);
 
     Ok(Resolved::View {
         base_table,
         view_predicates: acc_predicates,
         view_columns: next_exposed,
-        column_map: None,
+        column_map: next_map,
         // CTE 経由の参照は読み取り専用（書き込み検査の対象外）。
         check_predicates: Vec::new(),
-        // CTE 経由は `column_map` を持たない（別名の書き換えが走らない）ため参照されない。
-        base_allocated: false,
+        // `column_map` の疑似列 `id` の扱い（`ColumnMap::new` の第 2 引数）が参照する。
+        base_allocated,
     })
 }
 
