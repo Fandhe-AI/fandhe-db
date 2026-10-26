@@ -203,6 +203,115 @@ fn is_where_predicate_boundary_token(
     }
 }
 
+/// `GROUP BY` キーの終端を表すトークンか（Issue #1817・SQL-58）。キー列の区切り `,`、後続句
+/// （`HAVING`・`ORDER BY`・`LIMIT`・`FETCH`・`OFFSET`）、文末 `;`、囲み括弧の閉じ `)` が該当する。
+fn is_group_key_boundary(tok: &Token) -> bool {
+    match tok {
+        Token::Punct(',' | ';' | ')') | Token::Keyword(Keyword::Order | Keyword::Limit) => true,
+        Token::Ident(w) => {
+            w.eq_ignore_ascii_case("HAVING")
+                || w.eq_ignore_ascii_case("FETCH")
+                || w.eq_ignore_ascii_case("OFFSET")
+        }
+        _ => false,
+    }
+}
+
+/// `start` から始まる `GROUP BY` キー 1 つの終端位置（排他）を括弧の深さ 0 で探す
+/// （Issue #1817・SQL-58）。終端が無ければ `tokens.len()`。線形走査で再帰しない。
+fn group_key_range_end(tokens: &[Token], start: usize) -> usize {
+    let mut depth = 0usize;
+    for (i, tok) in tokens.iter().enumerate().skip(start) {
+        match tok {
+            Token::Punct('(') => depth = depth.saturating_add(1),
+            Token::Punct(')') => {
+                if depth == 0 {
+                    return i;
+                }
+                depth -= 1;
+            }
+            t if depth == 0 && is_group_key_boundary(t) => return i,
+            _ => {}
+        }
+    }
+    tokens.len()
+}
+
+/// `GROUP BY` 式キーのトークン区間 `[start, end)` を、構文解析の前に先読み検査する
+/// （Issue #1817・SQL-58。[`precheck_aggregate_filter_tokens`] と同じ方針）。汎用の式パーサは
+/// 集計呼び出し・`OVER (...)` を `42601` で落とすため、PostgreSQL と同じ SQLSTATE をここで
+/// 分類する: ウィンドウ関数（`name(...) OVER`）は `42P20`、集計関数呼び出しは `42803`
+/// （判定は OVER を優先）、`$n` と部分クエリは `42601`（Prepared の序数フラグがずれる fail-open
+/// と、キー式内での不可視行の参照を防ぐ）。
+fn precheck_group_key_tokens(
+    tokens: &[Token],
+    start: usize,
+    end: usize,
+) -> Result<(), SqlSurfaceError> {
+    let range = tokens.get(start..end).unwrap_or_default();
+    if range.iter().any(|t| matches!(t, Token::Param(_))) {
+        return Err(SqlSurfaceError::unsupported(
+            "parameters are not supported in GROUP BY expressions",
+        ));
+    }
+    // 各 `(` の対応 `)` 位置（区間相対）。
+    let mut close: Vec<Option<usize>> = vec![None; range.len()];
+    let mut stack: Vec<usize> = Vec::new();
+    for (i, tok) in range.iter().enumerate() {
+        match tok {
+            Token::Punct('(') => stack.push(i),
+            Token::Punct(')') => {
+                if let Some(o) = stack.pop() {
+                    if let Some(slot) = close.get_mut(o) {
+                        *slot = Some(i);
+                    }
+                }
+            }
+            _ => {}
+        }
+    }
+    for (i, tok) in range.iter().enumerate() {
+        match tok {
+            Token::Punct('(')
+                if matches!(
+                    range.get(i.saturating_add(1)),
+                    Some(Token::Keyword(Keyword::Select))
+                ) =>
+            {
+                return Err(SqlSurfaceError::unsupported(
+                    "subqueries are not supported in GROUP BY expressions",
+                ));
+            }
+            Token::Ident(name)
+                if matches!(range.get(i.saturating_add(1)), Some(Token::Punct('('))) =>
+            {
+                let o = i.saturating_add(1);
+                let has_over = close
+                    .get(o)
+                    .copied()
+                    .flatten()
+                    .and_then(|c| range.get(c.saturating_add(1)))
+                    .is_some_and(
+                        |t| matches!(t, Token::Ident(n) if n.eq_ignore_ascii_case("OVER")),
+                    );
+                let is_agg = is_aggregate_function_name(name);
+                if has_over && (is_agg || WindowFunc::from_name(name).is_some()) {
+                    return Err(SqlSurfaceError::WindowingError {
+                        detail: "window functions are not allowed in GROUP BY",
+                    });
+                }
+                if is_agg {
+                    return Err(SqlSurfaceError::GroupingError {
+                        detail: "aggregate functions are not allowed in GROUP BY",
+                    });
+                }
+            }
+            _ => {}
+        }
+    }
+    Ok(())
+}
+
 /// `FILTER (WHERE ...)` の括弧区間（`open` は `FILTER` 直後の `(` の位置）を、構文解析の前に
 /// 先読み検査する（SQL-57・Issue #1806）。汎用の述語パーサは `count(*)`・`OVER (...)` を
 /// `42601` で落とすため、PostgreSQL と同じ SQLSTATE をここで分類する:
@@ -3517,6 +3626,24 @@ pub(crate) fn aggregate_placeholder_index(name: &str) -> Option<usize> {
     name.strip_prefix(AGG_PLACEHOLDER_PREFIX)?.parse().ok()
 }
 
+/// `GROUP BY` 式キーの予約内部名の接頭辞（Issue #1817・SQL-58）。先頭の制御文字により
+/// 利用者の識別子と衝突せず、[`AGG_PLACEHOLDER_PREFIX`] とも別の接頭辞にする。
+const GROUP_KEY_EXPR_PLACEHOLDER_PREFIX: &str = "\u{1}gkexpr";
+
+/// `GROUP BY` の `j` 番目の式キー（[`GroupByClause::key_exprs`] の添字）の予約内部名。
+/// [`GroupByClause::columns`] の当該位置に入り、利用者の識別子とは一致しないため SELECT の
+/// `GroupKey` 照合は従来どおり `42601` になる（式キーの値の出力は #1818 の管轄）。
+pub(crate) fn group_key_expr_placeholder(j: usize) -> String {
+    format!("{GROUP_KEY_EXPR_PLACEHOLDER_PREFIX}{j}")
+}
+
+/// 予約内部名から式キーの添字を引く（式キーでなければ `None`）。
+pub(crate) fn group_key_expr_placeholder_index(name: &str) -> Option<usize> {
+    name.strip_prefix(GROUP_KEY_EXPR_PLACEHOLDER_PREFIX)?
+        .parse()
+        .ok()
+}
+
 /// 集計式項目の式中の裸識別子（内部名を除く。名前順）。
 pub(crate) fn expr_bare_idents(expr: &Expr) -> Vec<String> {
     let mut idents = std::collections::HashSet::new();
@@ -3673,7 +3800,13 @@ pub(crate) struct HavingExprPredicate {
 /// 意味論的検査は束縛段）、`having`/`order_by`/`limit` はいずれも省略可能。
 #[derive(Debug, Clone, PartialEq)]
 pub struct GroupByClause {
+    /// キーの宣言順の名前列。式キー（Issue #1817・SQL-58）の位置には予約内部名
+    /// [`group_key_expr_placeholder`]`(j)` が入り、実体は `key_exprs[j]` にある。
     pub(crate) columns: Vec<String>,
+    /// 式キー（`GROUP BY upper(name)`・`GROUP BY n / 2`。Issue #1817・SQL-58）の式木。
+    /// トップレベルの集計 `SELECT` だけが埋め（それ以外の文脈は構文段が `42601`）、束縛段
+    /// （`sql::parser::bind_group_by_clause`）が基表スキーマに束縛して行ごとに評価する。
+    pub(crate) key_exprs: Vec<Expr>,
     pub(crate) having: Vec<HavingPredicate>,
     /// 式述語の `HAVING`（Issue #1188・SQL-26）。`having` と AND 結合される。
     pub(crate) having_exprs: Vec<HavingExprPredicate>,
@@ -6733,33 +6866,85 @@ impl<'a> Parser<'a> {
         Ok(AggregateSelectItem::GroupKey { column, alias })
     }
 
-    /// `GROUP BY <column> (',' <column>)*`（TASK-167・SQL-14。SQL-25 (d) で複数列へ
-    /// 拡張）。裸識別子のカンマ区切り列のみ受理する（式・関数・位置番号・`$n` は
-    /// いずれも `expect_ident` の失敗で `42601`）。`GROUP` は予約語化せず
-    /// [`Parser::expect_contextual_keyword`] で文脈的に照合する（PR #189 の方針）。
-    /// 列数は [`check_group_by_column_count`] で `push` 前に検査し（`54000`。
-    /// [`Parser::parse_having`] と同じ「確保前検査」）、重複する列名は `42601` で
-    /// 拒否する（spec に規定が無いため fail-closed に倒す）。
-    fn parse_group_by_clause(&mut self) -> Result<Vec<String>, SqlSurfaceError> {
+    /// `GROUP BY <key> (',' <key>)*`（TASK-167・SQL-14。SQL-25 (d) で複数列へ拡張。
+    /// Issue #1817・SQL-58 で式キーを追加）。`<key>` は裸識別子（従来経路）か、トップレベルの
+    /// 集計 `SELECT`（`allow_aggregate_expr_items`）に限り式（関数呼び出し・算術・`CASE` 等）。
+    /// 式キーは `key_exprs` へ積み、`columns` の当該位置には予約内部名
+    /// （[`group_key_expr_placeholder`]）を入れる。整数リテラル単独（位置指定 `GROUP BY 1`）は
+    /// 位置参照として扱わず `42601`（fail-closed）。式キー内の集計呼び出しは `42803`・
+    /// ウィンドウ関数は `42P20`・`$n` と部分クエリは `42601`（[`precheck_group_key_tokens`]）。
+    /// `GROUP` は予約語化せず [`Parser::expect_contextual_keyword`] で文脈的に照合する
+    /// （PR #189 の方針）。キー数は [`check_group_by_column_count`] で `push` 前に検査し
+    /// （`54000`。列キーと式キーの合算）、重複するキーは `42601` で拒否する
+    /// （spec に規定が無いため fail-closed に倒す）。
+    fn parse_group_by_clause(&mut self) -> Result<(Vec<String>, Vec<Expr>), SqlSurfaceError> {
         self.expect_contextual_keyword("GROUP")?;
         self.expect_keyword(Keyword::By)?;
-        let mut columns = Vec::new();
+        let mut columns: Vec<String> = Vec::new();
+        let mut key_exprs: Vec<Expr> = Vec::new();
         loop {
-            let column = self.expect_ident()?;
-            if columns.contains(&column) {
-                return Err(SqlSurfaceError::unsupported(format!(
-                    "duplicate GROUP BY column {column:?}"
-                )));
+            let is_plain_column = matches!(self.peek(), Some(Token::Ident(_)))
+                && self
+                    .tokens
+                    .get(self.pos.saturating_add(1))
+                    .is_none_or(is_group_key_boundary);
+            if is_plain_column || !self.allow_aggregate_expr_items {
+                let column = self.expect_ident()?;
+                if columns.contains(&column) {
+                    return Err(SqlSurfaceError::unsupported(format!(
+                        "duplicate GROUP BY column {column:?}"
+                    )));
+                }
+                check_group_by_column_count(columns.len() + 1)?;
+                columns.push(column);
+            } else {
+                let start = self.pos;
+                let end = group_key_range_end(&self.tokens, start);
+                if end == start {
+                    return Err(SqlSurfaceError::unsupported("empty GROUP BY key"));
+                }
+                if end == start.saturating_add(1) && matches!(self.peek(), Some(Token::Number(_))) {
+                    return Err(SqlSurfaceError::unsupported(
+                        "positional GROUP BY is not supported",
+                    ));
+                }
+                precheck_group_key_tokens(&self.tokens, start, end)?;
+                let expr = self.parse_value_expr(0)?;
+                if self.pos != end {
+                    return Err(SqlSurfaceError::unsupported(
+                        "unsupported GROUP BY expression",
+                    ));
+                }
+                match expr {
+                    // `GROUP BY (lang)` のように括弧で囲んだだけの列は列キーへ正規化する。
+                    Expr::Ident(column) => {
+                        if columns.contains(&column) {
+                            return Err(SqlSurfaceError::unsupported(format!(
+                                "duplicate GROUP BY column {column:?}"
+                            )));
+                        }
+                        check_group_by_column_count(columns.len() + 1)?;
+                        columns.push(column);
+                    }
+                    other => {
+                        if key_exprs.contains(&other) {
+                            return Err(SqlSurfaceError::unsupported(
+                                "duplicate GROUP BY expression",
+                            ));
+                        }
+                        check_group_by_column_count(columns.len() + 1)?;
+                        columns.push(group_key_expr_placeholder(key_exprs.len()));
+                        key_exprs.push(other);
+                    }
+                }
             }
-            check_group_by_column_count(columns.len() + 1)?;
-            columns.push(column);
             if matches!(self.peek(), Some(Token::Punct(','))) {
                 self.advance();
                 continue;
             }
             break;
         }
-        Ok(columns)
+        Ok((columns, key_exprs))
     }
 
     /// `HAVING <having_pred> [AND <having_pred>]*`（TASK-167・SQL-14）。
@@ -14767,11 +14952,11 @@ fn check_body_aggregate(
 ) -> Result<(), SqlSurfaceError> {
     // Issue #1814・SQL-58: `HAVING` 内の集計呼び出しはビュー本体には含めさせない（fail-closed。
     // 本体の集計は構文段が `allow_aggregate_expr_items` を偽にするため通常は到達しない多層防御）。
-    if v.group_by
-        .as_ref()
-        .is_some_and(|g| !g.having_aggregates.is_empty() || g.columns.is_empty())
-    {
+    if v.group_by.as_ref().is_some_and(|g| {
+        !g.having_aggregates.is_empty() || g.columns.is_empty() || !g.key_exprs.is_empty()
+    }) {
         // Issue #1819: `GROUP BY` なしの `HAVING`（キー 0 個の句）も本体には含めさせない。
+        // Issue #1817: `GROUP BY` 式キーも本体には含めさせない（多層防御。構文段が拒否済み）。
         return Err(body_form_unsupported());
     }
     for item in &v.items {
@@ -19760,7 +19945,7 @@ fn parse_aggregate_shape(
     let has_group_by =
         matches!(p.peek(), Some(Token::Ident(name)) if name.eq_ignore_ascii_case("GROUP"));
     let group_by = if has_group_by {
-        let columns = p.parse_group_by_clause()?;
+        let (columns, key_exprs) = p.parse_group_by_clause()?;
         // SELECT リストの `GroupKey` 項目は、いずれかの `GROUP BY` 列と同名で
         // なければならない（§計画 3.1）。不一致・`GROUP BY` 句を持たない
         // `GroupKey` 項目（下の `else` 分岐）はいずれも許可リスト外として
@@ -19816,6 +20001,7 @@ fn parse_aggregate_shape(
         let offset = p.parse_optional_offset()?.unwrap_or(0);
         Some(GroupByClause {
             columns,
+            key_exprs,
             having,
             having_exprs,
             having_aggregates,
@@ -19839,6 +20025,7 @@ fn parse_aggregate_shape(
         let (having, having_exprs, having_aggregates) = p.parse_having(true)?;
         Some(GroupByClause {
             columns: Vec::new(),
+            key_exprs: Vec::new(),
             having,
             having_exprs,
             having_aggregates,
@@ -19961,6 +20148,7 @@ fn parse_distinct_shape(tokens: &[Token]) -> Result<ParsedAggregateShape, SqlSur
         where_predicates,
         group_by: Some(GroupByClause {
             columns,
+            key_exprs: Vec::new(),
             having: Vec::new(),
             having_exprs: Vec::new(),
             having_aggregates: Vec::new(),
@@ -20436,10 +20624,9 @@ fn aggregate_statement_from_resolved(
         // Issue #1814・SQL-58: 評価後射影形ビューの外側集計では `HAVING` 内の集計呼び出しを
         // 評価しない（集計式項目と同じ扱い。fail-closed）。Issue #1819: `GROUP BY` なしの
         // `HAVING`（キー 0 個の句）も評価しない（`HAVING` を黙って落とさず拒否する）。
-        if group_by
-            .as_ref()
-            .is_some_and(|g| !g.having_aggregates.is_empty() || g.columns.is_empty())
-        {
+        if group_by.as_ref().is_some_and(|g| {
+            !g.having_aggregates.is_empty() || g.columns.is_empty() || !g.key_exprs.is_empty()
+        }) {
             return Err(SqlSurfaceError::unsupported(
                 "aggregate over a view with an aggregate/LIMIT body supports only column arguments",
             ));
@@ -30150,6 +30337,85 @@ mod tests {
         ] {
             let err = validate_sql(sql, &lookup).expect_err("must be rejected");
             assert_eq!(err.wire_code(), "42601", "sql={sql:?}");
+        }
+    }
+
+    /// Issue #1817・SQL-58: `GROUP BY` の式キーは `key_exprs` へ積み、`columns` の当該位置には
+    /// 予約内部名が入る。括弧で囲んだだけの列は列キーへ正規化される。
+    #[test]
+    fn group_by_expression_keys_are_collected_with_placeholders() {
+        let lookup = catalog_with(&["documents"]);
+        let stmt = validate_sql(
+            "SELECT count(*) FROM documents GROUP BY lang, upper(lang), (title), n / 2",
+            &lookup,
+        )
+        .expect("expression keys are accepted");
+        let Statement::Aggregate(agg) = stmt else {
+            panic!("expected aggregate");
+        };
+        let gb = agg.group_by().expect("GROUP BY clause");
+        assert_eq!(
+            gb.columns,
+            vec![
+                "lang".to_string(),
+                group_key_expr_placeholder(0),
+                "title".to_string(),
+                group_key_expr_placeholder(1),
+            ]
+        );
+        assert_eq!(gb.key_exprs.len(), 2);
+        assert_eq!(group_key_expr_placeholder_index(&gb.columns[1]), Some(0));
+        assert_eq!(group_key_expr_placeholder_index("lang"), None);
+    }
+
+    /// Issue #1817・SQL-58: 式キー内の分類（先読み検査）。`OVER` を含む文は文全体の分類が
+    /// 先に走るため、`42P20` は先読み検査の関数を直接検証する。
+    #[test]
+    fn group_by_key_precheck_classifies_aggregates_windows_and_params() {
+        let check = |sql: &str| {
+            let tokens = lexer::tokenize_with_params(sql).expect("tokenize");
+            precheck_group_key_tokens(&tokens, 0, tokens.len())
+                .expect_err(sql)
+                .wire_code()
+        };
+        assert_eq!(check("count(*)"), "42803");
+        assert_eq!(check("n + sum(n)"), "42803");
+        assert_eq!(check("row_number() OVER ()"), "42P20");
+        assert_eq!(check("sum(n) OVER ()"), "42P20");
+        assert_eq!(check("n + $1"), "42601");
+        assert_eq!(check("n + (SELECT 1)"), "42601");
+        let ok = lexer::tokenize("upper(lang) || 'x'").expect("tokenize");
+        assert!(precheck_group_key_tokens(&ok, 0, ok.len()).is_ok());
+    }
+
+    /// Issue #1817・SQL-58: 式キーはトップレベルの集計 `SELECT` だけが受理する。位置指定・
+    /// 重複・キー数超過・式が境界まで届かない形は拒否する（fail-closed）。
+    #[test]
+    fn group_by_expression_keys_reject_unsupported_forms() {
+        let lookup = catalog_with(&["documents"]);
+        for (sql, code) in [
+            ("SELECT count(*) FROM documents GROUP BY 1", "42601"),
+            (
+                "SELECT count(*) FROM documents GROUP BY n / 2, n / 2",
+                "42601",
+            ),
+            (
+                "SELECT count(*) FROM documents GROUP BY lang, (lang)",
+                "42601",
+            ),
+            ("SELECT count(*) FROM documents GROUP BY n / 2 n", "42601"),
+            ("SELECT count(*) FROM documents GROUP BY ", "42601"),
+            (
+                "SELECT count(*) FROM documents GROUP BY a, b, c, d, e, f, g, h, i + 1",
+                "54000",
+            ),
+            (
+                "SELECT upper(lang), count(*) FROM documents GROUP BY upper(lang)",
+                "42601",
+            ),
+        ] {
+            let err = validate_sql(sql, &lookup).expect_err(sql);
+            assert_eq!(err.wire_code(), code, "{sql}");
         }
     }
 

@@ -569,6 +569,23 @@ impl ReferencedColumns {
         }
     }
 
+    /// `GROUP BY` 式キー（Issue #1817・SQL-58）が参照する列・embedding を反映する。
+    /// `sql::group_by::execute_grouped_aggregate` が [`Self::derive`] の直後に呼ぶ。漏れると縮小
+    /// デコードした行でキー式が列を NULL と取り違え、黙って誤ったグループ化になる。
+    pub(crate) fn include_group_key_exprs<'e>(
+        &mut self,
+        exprs: impl Iterator<Item = &'e BoundExpr>,
+    ) {
+        for expr in exprs {
+            if udf_call::references_embedding(expr) {
+                self.needs_embedding = true;
+            }
+            if udf_call::mark_referenced_scalar_columns(expr, &mut self.scalar_mask) {
+                self.has_scalar_reference = true;
+            }
+        }
+    }
+
     /// `DecodeTier::Fast` 選択可否の判定に使う。`scalar_mask`（`get_mut` が
     /// 範囲外インデックスで無視された場合に値が反映されない可能性がある）
     /// ではなく `has_scalar_reference`（参照の有無を直接記録した値）を主とし、

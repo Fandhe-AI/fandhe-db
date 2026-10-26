@@ -350,6 +350,11 @@ pub(crate) fn rewrite_aggregate(
     where_predicates: Vec<WherePredicate>,
     group_by: Option<GroupByClause>,
 ) -> Result<RewrittenAggregate, SqlSurfaceError> {
+    // Issue #1817・SQL-58: `GROUP BY` 式キーは単純ビューの外側では未対応（fail-closed。予約内部名が
+    // 物理名の写像へ流れて分かりにくい `42703` になるのも防ぐ）。
+    if group_by.as_ref().is_some_and(|gb| !gb.key_exprs.is_empty()) {
+        return Err(unsupported_position());
+    }
     let mut idents = HashSet::new();
     for item in &items {
         item.collect_referenced_idents(&mut idents);
