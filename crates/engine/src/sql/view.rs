@@ -241,37 +241,19 @@ pub(crate) fn resolve_from(
                 exposed = Some(cols);
             }
         } else {
-            let out_names: Vec<String> = match &view.projection {
-                Projection::Columns(cols) => cols.clone(),
-                Projection::All => match &exposed {
-                    Some(cols) => cols.clone(),
-                    None => star_columns_of_table(lookup, &base_table)?,
+            let next = apply_column_aliases(
+                lookup,
+                &base_table,
+                &view.projection,
+                exposed.as_deref(),
+                column_map.as_deref(),
+                &aliases,
+                |_available| {
+                    SqlSurfaceError::unsupported(
+                        "view column alias list is longer than the view's output columns",
+                    )
                 },
-                // 単純形の段は列射影のみを許す（式項目への別名は未対応。fail-closed）。
-                Projection::Items(_) => {
-                    return Err(SqlSurfaceError::feature_not_supported(
-                        "view column aliases over a computed projection are not supported",
-                    ));
-                }
-            };
-            if aliases.len() > out_names.len() {
-                return Err(SqlSurfaceError::unsupported(
-                    "view column alias list is longer than the view's output columns",
-                ));
-            }
-            let mut next: Vec<(String, String)> = Vec::with_capacity(out_names.len());
-            for (i, out) in out_names.iter().enumerate() {
-                let physical = match &column_map {
-                    Some(map) => physical_of(map, out),
-                    None => out.clone(),
-                };
-                let public = aliases.get(i).cloned().unwrap_or_else(|| out.clone());
-                // 公開名の重複は曖昧なまま片方を選ばず拒否する（`42702`。fail-closed）。
-                if next.iter().any(|(p, _)| p == &public) {
-                    return Err(SqlSurfaceError::ambiguous_column(public));
-                }
-                next.push((public, physical));
-            }
+            )?;
             exposed = Some(next.iter().map(|(p, _)| p.clone()).collect());
             column_map = Some(next);
         }
@@ -371,9 +353,59 @@ pub(crate) fn body_output(
     }
 }
 
+/// 列別名の段（ビューの `(a, b)` ・CTE の `WITH x(a, b)`）を 1 段分適用し、「公開名 → 物理名」
+/// の対応表を返す（TABLE-41・Issue #1659、SQL-62 (2)・Issue #1857）。ビュー参照
+/// （[`resolve_from`]）と CTE 合成（`sql::cte::compose`）が共有する唯一の実装で、第 2 の実装は
+/// 作らない。
+///
+/// 出力名は `Columns` なら列リスト、`All` なら親の公開列（無ければ基底表の `*` 展開）。別名は
+/// 先頭から順に付け、足りない分は元の名前のまま残す。別名が出力列より多いときは `too_long` が
+/// 作るエラー（ビューは `42601`、CTE は `42P10`）。公開名の重複は `42702`（fail-closed）。
+/// `exposed` は親の公開列、`column_map` は親の別名対応（無ければ公開名＝物理名）。
+pub(crate) fn apply_column_aliases(
+    lookup: &impl TableLookup,
+    base_table: &str,
+    projection: &Projection,
+    exposed: Option<&[String]>,
+    column_map: Option<&[(String, String)]>,
+    aliases: &[String],
+    too_long: impl FnOnce(usize) -> SqlSurfaceError,
+) -> Result<Vec<(String, String)>, SqlSurfaceError> {
+    let out_names: Vec<String> = match projection {
+        Projection::Columns(cols) => cols.clone(),
+        Projection::All => match exposed {
+            Some(cols) => cols.to_vec(),
+            None => star_columns_of_table(lookup, base_table)?,
+        },
+        // 単純形の段は列射影のみを許す（式項目への別名は未対応。fail-closed）。
+        Projection::Items(_) => {
+            return Err(SqlSurfaceError::feature_not_supported(
+                "view column aliases over a computed projection are not supported",
+            ));
+        }
+    };
+    if aliases.len() > out_names.len() {
+        return Err(too_long(out_names.len()));
+    }
+    let mut next: Vec<(String, String)> = Vec::with_capacity(out_names.len());
+    for (i, out) in out_names.iter().enumerate() {
+        let physical = match column_map {
+            Some(map) => physical_of(map, out),
+            None => out.clone(),
+        };
+        let public = aliases.get(i).cloned().unwrap_or_else(|| out.clone());
+        // 公開名の重複は曖昧なまま片方を選ばず拒否する（`42702`。fail-closed）。
+        if next.iter().any(|(p, _)| p == &public) {
+            return Err(SqlSurfaceError::ambiguous_column(public));
+        }
+        next.push((public, physical));
+    }
+    Ok(next)
+}
+
 /// 公開名 `public` に対応する物理列名（対応表に無ければ同名。呼び出し元は公開列の範囲検査を
 /// 済ませているため、無い場合は別名を持たない段の列）。
-fn physical_of(map: &[(String, String)], public: &str) -> String {
+pub(crate) fn physical_of(map: &[(String, String)], public: &str) -> String {
     map.iter()
         .find(|(p, _)| p == public)
         .map(|(_, phys)| phys.clone())
