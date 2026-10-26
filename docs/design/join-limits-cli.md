@@ -35,5 +35,6 @@ JOIN のリレーション数（`sql::relation::MAX_TABLE_REFS` = 8）・1 辺�
 
 - ハード上限の引き上げ（`BindingScope`・`relation_snapshot`・`generation_key`・relation マスク・`JoinBudget` の見直しとオーナー判断が必要）
 - `MAX_JOIN_CONDITIONS`（ON 条件数）等、他の JOIN 構文上限の設定化
+- 比較回数上限 `--max-join-comparisons` の CLI 化（設計は [nested-loop-join.md](nested-loop-join.md)）
 - セッション単位の `SET` による変更
 - JOIN 以外の複数リレーション経路（集合演算・サブクエリ・CTE）のリレーション数上限
