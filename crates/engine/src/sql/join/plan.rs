@@ -23,8 +23,8 @@ use std::collections::HashMap;
 
 use crate::catalog::{ColumnType, TableSchema};
 use crate::sql::allowlist::{
-    JoinAggregate, JoinKind, JoinProjection, JoinSelectItem, JoinWhereExpr, JoinWherePredicate,
-    Projection, SqlSurfaceError, ValidatedJoin, ValidatedScan, WherePredicate,
+    JoinAggregate, JoinCondition, JoinKind, JoinProjection, JoinSelectItem, JoinWhereExpr,
+    JoinWherePredicate, Projection, SqlSurfaceError, ValidatedJoin, ValidatedScan, WherePredicate,
 };
 use crate::sql::exec::ColumnMeta;
 use crate::sql::order_value::NullPlacement;
@@ -32,6 +32,9 @@ use crate::sql::parser::{AggregateInput, AggregateTarget, BoundAggregateItem};
 use crate::sql::relation::{BindingScope, ColumnRef, ColumnSlot, TableRef};
 use crate::sql::udf_call::{BinOp, UdfRegistry};
 
+use super::using::{
+    bind_using_step, relation_columns, slot_type, JoinScope, MergedColumn, VisibleCol,
+};
 use super::values::{cmp_class, key_class, CmpClass, JoinKeyClass};
 
 /// 解決済みの列参照（どの relation の、側スキャン結果の何番目のセルか）。
@@ -94,6 +97,9 @@ pub(super) struct ColCompare {
 pub(super) struct OutputColumn {
     pub(super) rel: usize,
     pub(super) pos: usize,
+    /// FULL JOIN USING の統合列（`COALESCE`）の代替ソース `(rel, pos)`。`rel`／`pos` が
+    /// NULL（NULL 補完または NULL セル）のとき先頭から順に最初の非 NULL を採る。通常列は空。
+    pub(super) fallbacks: Vec<(usize, usize)>,
     pub(super) meta: ColumnMeta,
 }
 
@@ -101,6 +107,8 @@ pub(super) struct OutputColumn {
 pub(super) struct PlainOrder {
     pub(super) rel: usize,
     pub(super) pos: usize,
+    /// [`OutputColumn::fallbacks`] と同じ（統合列でキー値を組み立てるための代替ソース）。
+    pub(super) fallbacks: Vec<(usize, usize)>,
     pub(super) class: CmpClass,
     pub(super) descending: bool,
     pub(super) nulls: NullPlacement,
@@ -259,7 +267,7 @@ impl SideProjection {
 struct Binder<'a, 'b> {
     schemas: Vec<&'a TableSchema>,
     relations: &'b [TableRef],
-    scope: BindingScope<'a>,
+    scope: JoinScope<'a>,
     sides: Vec<SideProjection>,
 }
 
@@ -297,7 +305,24 @@ impl<'a, 'b> Binder<'a, 'b> {
             .ok_or_else(|| SqlSurfaceError::Internal {
                 detail: "JOIN side projection index out of range".to_string(),
             })?;
-        let pos = side.ensure(&name, schema)?;
+        // `All` 投影は名前で再解決しない（疑似列 `id` と実カラム `id` が共存する表で、
+        // 名前照合は実カラムを優先するため疑似列の位置が実カラムへ化ける）。
+        // スロットから直接セル位置を計算し、疑似列と実カラムの区別を保つ。
+        let pos = match side {
+            SideProjection::All => match slot {
+                ColumnSlot::Id => {
+                    if schema.has_pseudo_id() {
+                        0
+                    } else {
+                        return Err(SqlSurfaceError::Internal {
+                            detail: "JOIN pseudo id slot on table without pseudo id".to_string(),
+                        });
+                    }
+                }
+                ColumnSlot::Column(i) => i.saturating_add(usize::from(schema.has_pseudo_id())),
+            },
+            SideProjection::Columns(_) => side.ensure(&name, schema)?,
+        };
         Ok(Col {
             rel,
             pos,
@@ -383,7 +408,7 @@ fn relation_bit(rel: usize) -> Result<u32, SqlSurfaceError> {
         })
 }
 
-fn leaf_mask(pred: &JoinWherePredicate, scope: &BindingScope<'_>) -> Result<u32, SqlSurfaceError> {
+fn leaf_mask(pred: &JoinWherePredicate, scope: &JoinScope<'_>) -> Result<u32, SqlSurfaceError> {
     let mut mask = 0u32;
     for c in leaf_colrefs(pred) {
         let rel = scope.resolve(c)?.relation();
@@ -393,7 +418,7 @@ fn leaf_mask(pred: &JoinWherePredicate, scope: &BindingScope<'_>) -> Result<u32,
 }
 
 /// 式が参照する relation 集合（ビットマスク）。
-fn refs_mask(expr: &JoinWhereExpr, scope: &BindingScope<'_>) -> Result<u32, SqlSurfaceError> {
+fn refs_mask(expr: &JoinWhereExpr, scope: &JoinScope<'_>) -> Result<u32, SqlSurfaceError> {
     match expr {
         JoinWhereExpr::Leaf(p) => leaf_mask(p, scope),
         JoinWhereExpr::And(ch) | JoinWhereExpr::Or(ch) => {
@@ -408,7 +433,7 @@ fn refs_mask(expr: &JoinWhereExpr, scope: &BindingScope<'_>) -> Result<u32, SqlS
 
 /// 式が strict（その relation が NULL 補完されていれば偽）になる relation 集合。
 /// 葉は参照集合（受理する全葉が strict）、`AND` は和集合、`OR` は共通集合。
-fn strict_mask(expr: &JoinWhereExpr, scope: &BindingScope<'_>) -> Result<u32, SqlSurfaceError> {
+fn strict_mask(expr: &JoinWhereExpr, scope: &JoinScope<'_>) -> Result<u32, SqlSurfaceError> {
     match expr {
         JoinWhereExpr::Leaf(p) => {
             if is_null_rejecting(p) {
@@ -494,7 +519,7 @@ fn leaf_to_where(
 /// 変換する（`OR` は分岐ごとの `Vec` を持つ [`WherePredicate::Or`]）。
 fn to_where_predicates(
     expr: &JoinWhereExpr,
-    scope: &BindingScope<'_>,
+    scope: &JoinScope<'_>,
     schemas: &[&TableSchema],
 ) -> Result<Vec<WherePredicate>, SqlSurfaceError> {
     match expr {
@@ -678,13 +703,13 @@ pub(super) fn build_plan<'a>(
                 })?,
         );
     }
-    let scope = BindingScope::new(
+    let scope = JoinScope::plain(BindingScope::new(
         relations
             .iter()
             .cloned()
             .zip(rel_schemas.iter().copied())
             .collect(),
-    )?;
+    )?);
     let all_star =
         validated.aggregate.is_none() && matches!(validated.projection, JoinProjection::All);
     let sides: Vec<SideProjection> = relations
@@ -707,10 +732,21 @@ pub(super) fn build_plan<'a>(
     // 結合段（ON）。段 k のスコープは relation 0..=k+1 だけで構築する——未出現の
     // relation を前方参照すると `BindingScope::resolve` が `42P01` で拒否する
     // （PostgreSQL と同じ分類）。
+    //
+    // `USING (...)` 段（Issue #1826・SQL-60 (1)）は等価結合キーへ脱糖し、結合列を 1 列に
+    // 統合した可視列並び・統合列を段ごとに引き継ぐ（`sql::join::using`）。ON 段は従来どおり
+    // 可視列を「左の可視列 ++ 右の全列」に伸ばすだけで、統合列の解決規則だけが共通になる。
     let mut steps: Vec<StepPlan> = Vec::with_capacity(validated.steps.len());
+    let mut merged: Vec<MergedColumn> = Vec::new();
+    let mut visible: Vec<VisibleCol> = match b.schemas.first() {
+        Some(schema) => relation_columns(0, schema),
+        None => Vec::new(),
+    };
+    let mut has_using = false;
     for (k, step) in validated.steps.iter().enumerate() {
         let upto = k + 2;
-        let step_scope = BindingScope::new(
+        let new_rel = k + 1;
+        let step_base = BindingScope::new(
             b.relations
                 .iter()
                 .take(upto)
@@ -718,35 +754,75 @@ pub(super) fn build_plan<'a>(
                 .zip(b.schemas.iter().take(upto).copied())
                 .collect(),
         )?;
-        let mut keys: Vec<StepKey> = Vec::with_capacity(step.on.len());
-        for (lhs, rhs) in &step.on {
-            let l = step_scope.resolve(lhs)?;
-            let r = step_scope.resolve(rhs)?;
-            let new_rel = k + 1;
-            let (acc, new) = match (l.relation() == new_rel, r.relation() == new_rel) {
-                (false, true) => (l, r),
-                (true, false) => (r, l),
-                _ => {
-                    return Err(SqlSurfaceError::unsupported(
-                        "JOIN ON condition must reference both sides of the join",
-                    ))
+        let mut keys: Vec<StepKey> = Vec::new();
+        match &step.condition {
+            JoinCondition::On(on) => {
+                let new_schema =
+                    *b.schemas
+                        .get(new_rel)
+                        .ok_or_else(|| SqlSurfaceError::Internal {
+                            detail: "JOIN relation index out of range".to_string(),
+                        })?;
+                visible.extend(relation_columns(new_rel, new_schema));
+                let step_scope =
+                    JoinScope::new(step_base, merged.clone(), visible.clone(), has_using);
+                keys.reserve(on.len());
+                for (lhs, rhs) in on {
+                    let l = step_scope.resolve(lhs)?;
+                    let r = step_scope.resolve(rhs)?;
+                    let (acc, new) = match (l.relation() == new_rel, r.relation() == new_rel) {
+                        (false, true) => (l, r),
+                        (true, false) => (r, l),
+                        _ => {
+                            return Err(SqlSurfaceError::unsupported(
+                                "JOIN ON condition must reference both sides of the join",
+                            ))
+                        }
+                    };
+                    let acc_class = key_class(acc.column_type())?;
+                    let new_class = key_class(new.column_type())?;
+                    if acc_class != new_class {
+                        return Err(SqlSurfaceError::datatype_mismatch(
+                            "JOIN key type mismatch between the two sides",
+                        ));
+                    }
+                    let acc_col = b.col_from(acc.relation(), acc.slot(), acc.column_type())?;
+                    let new_col = b.col_from(new.relation(), new.slot(), new.column_type())?;
+                    keys.push(StepKey {
+                        acc_rel: acc_col.rel,
+                        acc_pos: acc_col.pos,
+                        new_pos: new_col.pos,
+                        class: acc_class,
+                    });
                 }
-            };
-            let acc_class = key_class(acc.column_type())?;
-            let new_class = key_class(new.column_type())?;
-            if acc_class != new_class {
-                return Err(SqlSurfaceError::datatype_mismatch(
-                    "JOIN key type mismatch between the two sides",
-                ));
             }
-            let acc_col = b.col_from(acc.relation(), acc.slot(), acc.column_type())?;
-            let new_col = b.col_from(new.relation(), new.slot(), new.column_type())?;
-            keys.push(StepKey {
-                acc_rel: acc_col.rel,
-                acc_pos: acc_col.pos,
-                new_pos: new_col.pos,
-                class: acc_class,
-            });
+            JoinCondition::Using(names) => {
+                let left_base = BindingScope::new(
+                    b.relations
+                        .iter()
+                        .take(new_rel)
+                        .cloned()
+                        .zip(b.schemas.iter().take(new_rel).copied())
+                        .collect(),
+                )?;
+                let left_scope =
+                    JoinScope::new(left_base, merged.clone(), visible.clone(), has_using);
+                let bound = bind_using_step(&left_scope, &step_base, step.kind, names, new_rel)?;
+                keys.reserve(bound.keys.len());
+                for key in &bound.keys {
+                    let acc_col = b.col_from(key.acc.0, key.acc.1, key.acc.2.as_ref())?;
+                    let new_col = b.col_from(key.new.0, key.new.1, key.new.2.as_ref())?;
+                    keys.push(StepKey {
+                        acc_rel: acc_col.rel,
+                        acc_pos: acc_col.pos,
+                        new_pos: new_col.pos,
+                        class: key.class.clone(),
+                    });
+                }
+                merged = bound.merged;
+                visible = bound.visible;
+                has_using = true;
+            }
         }
         steps.push(StepPlan {
             preserve_acc: matches!(step.kind, JoinKind::Left | JoinKind::Full),
@@ -754,6 +830,15 @@ pub(super) fn build_plan<'a>(
             keys,
         });
     }
+    // 以降（WHERE・投影・並べ替え・集計）は、全段適用後の統合列・可視列を持つスコープで解決する。
+    let final_base = BindingScope::new(
+        b.relations
+            .iter()
+            .cloned()
+            .zip(b.schemas.iter().copied())
+            .collect(),
+    )?;
+    b.scope = JoinScope::new(final_base, merged, visible, has_using);
 
     // WHERE: conjunct ごとに外部結合を簡約し、プッシュダウンか残余へ振り分ける。
     let mut pushdown: Vec<Vec<WherePredicate>> = relations.iter().map(|_| Vec::new()).collect();
@@ -833,8 +918,10 @@ pub(super) fn build_plan<'a>(
 }
 
 /// 解決済みの列から非集計 JOIN の並べ替えキーを作る（列キー・序数キー共通。並べ替え不能な型は `22000`）。
+/// `fallbacks` は FULL JOIN USING の統合列の代替ソース（通常列は空）。
 fn plain_order_for(
     c: &Col,
+    fallbacks: Vec<(usize, usize)>,
     descending: bool,
     nulls: Option<NullPlacement>,
 ) -> Result<PlainOrder, SqlSurfaceError> {
@@ -844,10 +931,55 @@ fn plain_order_for(
     Ok(PlainOrder {
         rel: c.rel,
         pos: c.pos,
+        fallbacks,
         class,
         descending,
         nulls: nulls.unwrap_or_else(|| NullPlacement::pg_default(descending)),
     })
+}
+
+impl Binder<'_, '_> {
+    /// USING の統合列 `idx` の値ソースを側投影へ含め、先頭ソースの [`Col`] と代替ソース
+    /// （FULL の `COALESCE` の 2 番目以降）を返す。投影・非集計 `ORDER BY` が使う。
+    fn merged_cols(&mut self, idx: usize) -> Result<(Col, Vec<(usize, usize)>), SqlSurfaceError> {
+        let sources = self.scope.merged(idx)?.sources.clone();
+        let mut cols: Vec<Col> = Vec::with_capacity(sources.len());
+        for (rel, slot) in sources {
+            let schema = *self
+                .schemas
+                .get(rel)
+                .ok_or_else(|| SqlSurfaceError::Internal {
+                    detail: "JOIN relation index out of range".to_string(),
+                })?;
+            let ty = slot_type(schema, slot);
+            cols.push(self.col_from(rel, slot, ty.as_ref())?);
+        }
+        let mut it = cols.into_iter();
+        let first = it.next().ok_or_else(|| SqlSurfaceError::Internal {
+            detail: "JOIN merged column has no source".to_string(),
+        })?;
+        Ok((first, it.map(|c| (c.rel, c.pos)).collect()))
+    }
+
+    /// 可視列 1 個を [`Col`]（と代替ソース）へ解決する（USING を含む結合の `*` 展開・序数 `ORDER BY`）。
+    fn visible_cols(
+        &mut self,
+        v: VisibleCol,
+    ) -> Result<(Col, Vec<(usize, usize)>), SqlSurfaceError> {
+        match v {
+            VisibleCol::Base { rel, slot } => {
+                let schema = *self
+                    .schemas
+                    .get(rel)
+                    .ok_or_else(|| SqlSurfaceError::Internal {
+                        detail: "JOIN relation index out of range".to_string(),
+                    })?;
+                let ty = slot_type(schema, slot);
+                Ok((self.col_from(rel, slot, ty.as_ref())?, Vec::new()))
+            }
+            VisibleCol::Merged(idx) => self.merged_cols(idx),
+        }
+    }
 }
 
 fn build_plain_shape(
@@ -856,6 +988,20 @@ fn build_plain_shape(
 ) -> Result<Shape, SqlSurfaceError> {
     let mut output: Vec<OutputColumn> = Vec::new();
     match &validated.projection {
+        JoinProjection::All if b.scope.has_using() => {
+            // USING を含む結合の `*`: 統合列（USING 順）→ 左の残り → 右の残り（PostgreSQL 17 と
+            // 同じ可視列の並び。`sql::join::using`）。
+            let visible: Vec<VisibleCol> = b.scope.visible().to_vec();
+            for v in visible {
+                let (c, fallbacks) = b.visible_cols(v)?;
+                output.push(OutputColumn {
+                    rel: c.rel,
+                    pos: c.pos,
+                    fallbacks,
+                    meta: Binder::meta(&c),
+                });
+            }
+        }
         JoinProjection::All => {
             for rel in 0..b.schemas.len() {
                 let schema = *b
@@ -871,6 +1017,7 @@ fn build_plain_shape(
                     output.push(OutputColumn {
                         rel,
                         pos: 0,
+                        fallbacks: Vec::new(),
                         meta: ColumnMeta::Id,
                     });
                 }
@@ -878,6 +1025,7 @@ fn build_plain_shape(
                     output.push(OutputColumn {
                         rel,
                         pos: idx + id_offset,
+                        fallbacks: Vec::new(),
                         meta: ColumnMeta::Scalar {
                             name: col.name.clone(),
                             ty: col.ty.clone(),
@@ -888,12 +1036,17 @@ fn build_plain_shape(
         }
         JoinProjection::Columns(colrefs) => {
             for (i, colref) in colrefs.iter().enumerate() {
-                let c = b.col(colref)?;
+                // FULL JOIN USING の統合列は `COALESCE(左, 右)` の代替ソース付きで出力する。
+                let (c, fallbacks) = match b.scope.resolve_coalesce(colref)? {
+                    Some(idx) => b.merged_cols(idx)?,
+                    None => (b.col(colref)?, Vec::new()),
+                };
                 let alias = validated.column_aliases.get(i).and_then(Option::as_ref);
                 let meta = Binder::meta_with_alias(Binder::meta(&c), alias);
                 output.push(OutputColumn {
                     rel: c.rel,
                     pos: c.pos,
+                    fallbacks,
                     meta,
                 });
             }
@@ -909,7 +1062,7 @@ fn build_plain_shape(
                 .filter(|p| *p >= 1 && *p <= output.len())
                 .map(|p| p - 1)
                 .ok_or(SqlSurfaceError::OrderByPositionNotInSelectList { position })?;
-            let (rel, slot, ty) = match &validated.projection {
+            let (c, fallbacks) = match &validated.projection {
                 JoinProjection::Columns(colrefs) => {
                     let colref =
                         colrefs
@@ -917,9 +1070,20 @@ fn build_plain_shape(
                             .ok_or_else(|| SqlSurfaceError::Internal {
                                 detail: "JOIN ORDER BY position out of range".to_string(),
                             })?;
-                    let c = b.col(colref)?;
-                    order.push(plain_order_for(&c, key.descending, key.nulls)?);
-                    continue;
+                    match b.scope.resolve_coalesce(colref)? {
+                        Some(idx) => b.merged_cols(idx)?,
+                        None => (b.col(colref)?, Vec::new()),
+                    }
+                }
+                // USING を含む結合の `*` は可視列の並び（統合列が先頭）に従う。スキーマから
+                // 位置を再計算すると列並びがずれるため、可視列から直接引く。
+                JoinProjection::All if b.scope.has_using() => {
+                    let v = b.scope.visible().get(out_index).copied().ok_or_else(|| {
+                        SqlSurfaceError::Internal {
+                            detail: "JOIN ORDER BY position out of range".to_string(),
+                        }
+                    })?;
+                    b.visible_cols(v)?
                 }
                 JoinProjection::All => {
                     // `*` は関係ごとに `id`（従来方式の表のみ）＋宣言列の順に展開済み。
@@ -937,23 +1101,22 @@ fn build_plain_shape(
                     let (rel, schema, local) = found.ok_or_else(|| SqlSurfaceError::Internal {
                         detail: "JOIN ORDER BY position out of range".to_string(),
                     })?;
-                    if schema.has_pseudo_id() && local == 0 {
-                        (rel, ColumnSlot::Id, None)
-                    } else {
-                        let idx = local - usize::from(schema.has_pseudo_id());
-                        let def =
-                            schema
-                                .columns
-                                .get(idx)
-                                .ok_or_else(|| SqlSurfaceError::Internal {
+                    let (slot, ty) =
+                        if schema.has_pseudo_id() && local == 0 {
+                            (ColumnSlot::Id, None)
+                        } else {
+                            let idx = local - usize::from(schema.has_pseudo_id());
+                            let def = schema.columns.get(idx).ok_or_else(|| {
+                                SqlSurfaceError::Internal {
                                     detail: "JOIN ORDER BY position out of range".to_string(),
-                                })?;
-                        (rel, ColumnSlot::Column(idx), Some(def.ty.clone()))
-                    }
+                                }
+                            })?;
+                            (ColumnSlot::Column(idx), Some(def.ty.clone()))
+                        };
+                    (b.col_from(rel, slot, ty.as_ref())?, Vec::new())
                 }
             };
-            let c = b.col_from(rel, slot, ty.as_ref())?;
-            order.push(plain_order_for(&c, key.descending, key.nulls)?);
+            order.push(plain_order_for(&c, fallbacks, key.descending, key.nulls)?);
             continue;
         }
         // 非修飾の ORDER BY 対象が SELECT リストの別名に一致するときは、PostgreSQL と
@@ -977,19 +1140,11 @@ fn build_plain_shape(
             }
             _ => &key.target,
         };
-        let c = b.col(target)?;
-        let class = cmp_class(c.ty.as_ref()).ok_or_else(|| {
-            SqlSurfaceError::invalid_input(format!("unsupported ORDER BY column type: {}", c.name))
-        })?;
-        order.push(PlainOrder {
-            rel: c.rel,
-            pos: c.pos,
-            class,
-            descending: key.descending,
-            nulls: key
-                .nulls
-                .unwrap_or_else(|| NullPlacement::pg_default(key.descending)),
-        });
+        let (c, fallbacks) = match b.scope.resolve_coalesce(target)? {
+            Some(idx) => b.merged_cols(idx)?,
+            None => (b.col(target)?, Vec::new()),
+        };
+        order.push(plain_order_for(&c, fallbacks, key.descending, key.nulls)?);
     }
     Ok(Shape::Plain { output, order })
 }

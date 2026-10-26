@@ -26,11 +26,14 @@
 //! - `residual`: WHERE 残余の行単位評価とスカラー `ORDER BY`。
 //! - `aggregate`: 集計形（既存の `Accumulator` を再利用）。
 //! - `values`: 型クラス・キー正準化・比較・`Cell` → `ScalarRef` アダプタ。
+//! - `using`: `JOIN ... USING (...)` の束縛（等価 ON への脱糖）と結合列の統合規則・
+//!   統合列を考慮した列解決（Issue #1826・SQL-60 (1)）。
 //!
 //! 設計判断の詳細は `docs/design/inner-join.md`・`docs/design/outer-join.md`・
-//! `docs/design/multi-way-join.md` 参照。
+//! `docs/design/multi-way-join.md`・`docs/design/join-using.md` 参照。
 //!
-//! スコープ外: `CROSS`／`NATURAL` JOIN・`JOIN ... USING (...)`・ベクトル順位付け
+//! スコープ外: `CROSS`／`NATURAL` JOIN・`USING (...) AS <alias>`・FULL JOIN USING の統合列の
+//! WHERE／GROUP BY／集計／後続段の結合キーでの参照（`0A000`）・ベクトル順位付け
 //! （`ORDER BY ... <=>` 等）との併用・FROM でのビュー参照・`RelationSnapshotCache`
 //! （TASK-212 基盤）による結合入力のキャッシュ。
 
@@ -40,6 +43,7 @@ pub(crate) mod dml;
 mod exec;
 mod plan;
 mod residual;
+mod using;
 // `sql::view_buffered`（評価後射影形ビューの外側の WHERE・ORDER BY。Issue #1360）が
 // 評価済みセルの比較・述語評価に同じ部品を再利用する（第 2 の比較器を作らない）。
 pub(crate) mod values;
@@ -380,14 +384,15 @@ pub(crate) fn execute_with_limits(
                 let mut row_payload_bytes = 0usize;
                 let mut picked: Vec<Option<&Cell>> = Vec::with_capacity(output.len());
                 for out_col in output {
-                    let cell = match residual::row_at(&sides, tuple, out_col.rel)? {
-                        None => None,
-                        Some(row) => Some(row.cells.get(out_col.pos).ok_or_else(|| {
-                            SqlSurfaceError::Internal {
-                                detail: "JOIN output column position out of range".to_string(),
-                            }
-                        })?),
-                    };
+                    // FULL JOIN USING の統合列は代替ソースから `COALESCE` 相当で値を採る
+                    // （借用のまま選ぶため、複製前の見積もり計上の順序は変わらない）。
+                    let cell = residual::cell_with_fallbacks(
+                        &sides,
+                        tuple,
+                        out_col.rel,
+                        out_col.pos,
+                        &out_col.fallbacks,
+                    )?;
                     if let Some(c) = cell {
                         row_payload_bytes = row_payload_bytes.saturating_add(cell_payload_bytes(c));
                     }
@@ -454,8 +459,8 @@ mod tests {
     use crate::recovery::required_op_id::OperationId;
     use crate::row_codec::Value;
     use crate::sql::allowlist::{
-        JoinKind, JoinProjection, JoinStep, JoinWhereExpr, JoinWherePredicate, Projection,
-        ValidatedJoin,
+        JoinCondition, JoinKind, JoinProjection, JoinStep, JoinWhereExpr, JoinWherePredicate,
+        Projection, ValidatedJoin,
     };
     use crate::sql::relation::{ColumnRef, TableRef};
     use plan::SideProjection;
@@ -478,7 +483,10 @@ mod tests {
     ) -> ValidatedJoin {
         ValidatedJoin {
             relations,
-            steps: vec![JoinStep { kind, on }],
+            steps: vec![JoinStep {
+                kind,
+                condition: JoinCondition::On(on),
+            }],
             projection,
             column_aliases: Vec::new(),
             where_clause: where_clause.map(Box::new),
@@ -1059,17 +1067,17 @@ mod tests {
             steps: vec![
                 JoinStep {
                     kind,
-                    on: vec![(
+                    condition: JoinCondition::On(vec![(
                         ColumnRef::qualified("l", "tag"),
                         ColumnRef::qualified("r", "tag"),
-                    )],
+                    )]),
                 },
                 JoinStep {
                     kind: JoinKind::Inner,
-                    on: vec![(
+                    condition: JoinCondition::On(vec![(
                         ColumnRef::qualified("r", "tag"),
                         ColumnRef::qualified("s", "tag"),
-                    )],
+                    )]),
                 },
             ],
             projection: JoinProjection::Columns(vec![ColumnRef::qualified("l", "tag")]),

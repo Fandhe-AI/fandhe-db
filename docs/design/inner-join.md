@@ -37,7 +37,8 @@ conj        := colref <op> <literal>        -- op: = < <= > >= / LIKE '<pattern>
 
 relation は常にちょうど 2 個。以下はいずれも `42601`（fail-closed）:
 
-- `CROSS`／`NATURAL` JOIN、`JOIN ... USING (...)`（`LEFT`／`RIGHT`／`FULL [OUTER]` は
+- `CROSS`／`NATURAL` JOIN（`JOIN ... USING (...)` は Issue #1826 で受理対象になった。
+  `docs/design/join-using.md` 参照。`LEFT`／`RIGHT`／`FULL [OUTER]` は
   Issue #926 で受理対象になった。`docs/design/outer-join.md` 参照）
 - 非等価の `ON`、左右が同じ relation を指す `ON`
 - `ORDER BY`・`<=>`・`HYBRID`・`USING PLAN`・`USING MODE`・`HINT ORDER` との併用
@@ -188,7 +189,8 @@ JOIN の「整数クラスを跨いで結合できる」という要件（`id`�
 
 ## 対象外（Issue は起票しない。申し送りのみ）
 
-- `CROSS`／`NATURAL` JOIN・`JOIN ... USING (...)`（`LEFT`／`RIGHT`／`FULL [OUTER]` は
+- `CROSS`／`NATURAL` JOIN（`JOIN ... USING (...)` は Issue #1826 で受理対象になった。
+  `docs/design/join-using.md` 参照。`LEFT`/`RIGHT`/`FULL [OUTER]` は
   Issue #926 で受理対象になった。`docs/design/outer-join.md` 参照）
 - ウィンドウ・`DISTINCT` と JOIN の組み合わせ
 - WHERE の `BETWEEN`・サブクエリ
