@@ -3,7 +3,7 @@
 //! 行を返す SELECT は `LIMIT` を省略でき、`LIMIT ALL` と同じく件数の制限なしとして扱う。
 //! 安全弁は結果行数の上限（`EngineCore::with_result_limits`。CLI の `--max-result-rows` 相当）で、
 //! 超過は黙って切り詰めず `54000` で文全体を拒否する。ここでは cap を小さく注入して境界を固定する。
-//! 距離 ORDER BY・サブクエリ内側の省略は従来どおり `42601`（#2242／#1852／#1853 の範囲）。
+//! サブクエリ内側の省略は `sql34_subquery_limit_omitted.rs`（Issue #1853）が扱う。
 //! cap + 1 件での走査の早期中断・wire の分割送出は #1797／#1798 の範囲でここでは扱わない。
 
 use engine::core::EngineCore;
@@ -331,21 +331,6 @@ fn declare_rejects_over_cap_and_registers_nothing() {
         panic!("expected Fetch outcome");
     };
     assert_eq!(result.rows.len(), CAP);
-}
-
-/// 距離 ORDER BY・`USING PLAN` の省略、サブクエリ内側の省略・`ALL` は従来どおり `42601`。
-#[test]
-fn ranked_and_subquery_forms_still_require_limit() {
-    let (core, _g) = open("sql34-regress");
-    seed_t(&core, "alice", 1..=2);
-    for sql in [
-        "SELECT id FROM t WHERE k IN (SELECT k FROM u)",
-        "SELECT id FROM t WHERE k IN (SELECT k FROM u LIMIT ALL)",
-        "SELECT id FROM t WHERE EXISTS (SELECT k FROM u)",
-        "SELECT id FROM t WHERE k = (SELECT k FROM u)",
-    ] {
-        assert_eq!(code(&core, sql), "42601", "{sql}");
-    }
 }
 
 /// Describe（拡張クエリプロトコル）でも省略形が `22000` にならない。

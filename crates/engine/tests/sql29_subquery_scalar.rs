@@ -396,8 +396,6 @@ fn scalar_static_validation_and_unsupported_forms() {
         (format!("SELECT (SELECT qty FROM {REFS} LIMIT 1) + 1 FROM {ITEMS} LIMIT 100"), "42601"),
         // ランキング付き検索・集合演算の内側。
         (format!("SELECT id FROM {ITEMS} WHERE qty = (SELECT qty FROM {REFS} UNION SELECT qty FROM {REFS}) LIMIT 100"), "42601"),
-        // `LIMIT` 省略（Scan 形）。
-        (format!("SELECT id FROM {ITEMS} WHERE qty = (SELECT qty FROM {REFS}) LIMIT 100"), "42601"),
     ];
     for (sql, code) in cases {
         assert_eq!(err_code(&core, &ctx, &sql).0, code, "sql={sql}");

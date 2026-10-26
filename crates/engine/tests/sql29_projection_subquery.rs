@@ -218,10 +218,9 @@ fn projection_subquery_static_and_context_rejections() {
     seed(&core, &ctx);
 
     for sql in [
-        // 投影 2 列・全列・LIMIT 省略・相関・内側の投影サブクエリ。
+        // 投影 2 列・全列・相関・内側の投影サブクエリ。
         format!("SELECT (SELECT qty, name FROM {REFS} LIMIT 1) FROM {ITEMS} LIMIT 10"),
         format!("SELECT (SELECT * FROM {REFS} LIMIT 1) FROM {ITEMS} LIMIT 10"),
-        format!("SELECT (SELECT qty FROM {REFS}) FROM {ITEMS} LIMIT 10"),
         format!("SELECT (SELECT qty FROM {REFS} WHERE qty = 1 AND name = outer_only LIMIT 1) FROM {ITEMS} LIMIT 10"),
         format!("SELECT (SELECT (SELECT qty FROM {REFS} LIMIT 1) FROM {REFS} LIMIT 1) FROM {ITEMS} LIMIT 10"),
         // 式の内側への埋め込み・演算。

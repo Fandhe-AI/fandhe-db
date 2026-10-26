@@ -8936,6 +8936,7 @@ impl EngineCore {
                     session.udfs(),
                     self.group_by_limits,
                     self.nesting_limits,
+                    limits,
                     &mut subquery_budget,
                     &mut subquery_in_value_budget,
                 )?;
@@ -8954,6 +8955,7 @@ impl EngineCore {
                     session.udfs(),
                     self.group_by_limits,
                     self.nesting_limits,
+                    limits,
                     &mut subquery_budget,
                     &mut subquery_in_value_budget,
                 )?;
@@ -8984,6 +8986,7 @@ impl EngineCore {
                     session.udfs(),
                     self.group_by_limits,
                     self.nesting_limits,
+                    limits,
                     &mut subquery_budget,
                     &mut subquery_in_value_budget,
                 )?;
@@ -9009,6 +9012,7 @@ impl EngineCore {
                     session.udfs(),
                     self.group_by_limits,
                     self.nesting_limits,
+                    limits,
                     &mut subquery_budget,
                     &mut subquery_in_value_budget,
                 )?;

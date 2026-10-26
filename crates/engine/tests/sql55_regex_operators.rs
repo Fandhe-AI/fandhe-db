@@ -289,8 +289,9 @@ fn temp_table_inherits_configured_limits() {
     .expect("within limit");
 }
 
-/// JOIN の WHERE・HAVING・サブクエリ・CASE の条件・ビュー本体・式索引は本 Issue の対象外で、
+/// JOIN の WHERE・HAVING・CASE の条件・ビュー本体・式索引は本 Issue の対象外で、
 /// 黙って誤評価せず `42601` で fail-closed になる。
+/// （サブクエリ内側の素の Scan は Issue #1853 で `LIMIT` 省略を受理したため、通常の WHERE と同じく評価される。）
 #[test]
 fn other_contexts_fail_closed() {
     let (core, _g) = setup("sql55-other");
@@ -298,7 +299,6 @@ fn other_contexts_fail_closed() {
     for q in [
         "SELECT a.id FROM t a JOIN t b ON a.id = b.id WHERE a.s ~ 'src' LIMIT 10",
         "SELECT k FROM t GROUP BY k HAVING k ~ 'a' LIMIT 10",
-        "SELECT id FROM t WHERE id IN (SELECT id FROM t WHERE s ~ 'src') LIMIT 10",
         "SELECT CASE WHEN s ~ 'a' THEN 1 ELSE 0 END FROM t LIMIT 10",
     ] {
         assert_eq!(exec(&core, "tenant-a", q).expect_err(q), "42601", "{q}");
