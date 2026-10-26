@@ -305,7 +305,24 @@ impl<'a, 'b> Binder<'a, 'b> {
             .ok_or_else(|| SqlSurfaceError::Internal {
                 detail: "JOIN side projection index out of range".to_string(),
             })?;
-        let pos = side.ensure(&name, schema)?;
+        // `All` 投影は名前で再解決しない（疑似列 `id` と実カラム `id` が共存する表で、
+        // 名前照合は実カラムを優先するため疑似列の位置が実カラムへ化ける）。
+        // スロットから直接セル位置を計算し、疑似列と実カラムの区別を保つ。
+        let pos = match side {
+            SideProjection::All => match slot {
+                ColumnSlot::Id => {
+                    if schema.has_pseudo_id() {
+                        0
+                    } else {
+                        return Err(SqlSurfaceError::Internal {
+                            detail: "JOIN pseudo id slot on table without pseudo id".to_string(),
+                        });
+                    }
+                }
+                ColumnSlot::Column(i) => i.saturating_add(usize::from(schema.has_pseudo_id())),
+            },
+            SideProjection::Columns(_) => side.ensure(&name, schema)?,
+        };
         Ok(Col {
             rel,
             pos,

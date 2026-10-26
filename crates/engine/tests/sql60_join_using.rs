@@ -504,6 +504,72 @@ fn using_on_pseudo_id_on_both_sides_is_accepted_and_merged() {
     assert_eq!(result.rows.len(), 4);
 }
 
+// ---------- 疑似列 id と実カラム id の共存 ----------
+
+/// 疑似列 `id`（行キー）と実カラム `id`（TEXT）を併せ持つ表を USING 結合した `SELECT *` と
+/// 序数 `ORDER BY` は、疑似列と実カラムを取り違えない（セル位置はスロットから決める）。
+#[test]
+fn using_star_and_ordinal_order_keep_pseudo_id_distinct_from_real_id_column() {
+    let path = unique_db_path("join-using-real-id");
+    let storage = Storage::open(&path).expect("open storage");
+    let _guard = CleanupGuard(path);
+    storage
+        .create_table(&TableSchema::new(
+            "p",
+            vec![
+                ColumnDef::new("k", ColumnType::BigInt, false),
+                ColumnDef::new("id", ColumnType::Text, false),
+            ],
+        ))
+        .expect("create p");
+    storage
+        .create_table(&kv_schema("q", "w", ColumnType::BigInt))
+        .expect("create q");
+    for (rid, real) in [(100_u64, "real-b"), (101, "real-a")] {
+        insert(
+            &storage,
+            "p",
+            "tenant-a",
+            rid,
+            Visibility::Public,
+            &[Value::BigInt(1), Value::Text(real.to_string())],
+        );
+    }
+    insert_kv(&storage, "q", 200, Some(1), "w1");
+    let core = new_core(storage);
+
+    let result = run(
+        &core,
+        "SELECT * FROM p JOIN q USING (k) ORDER BY 2 LIMIT 20",
+    );
+    assert_eq!(col_names(&result), ["k", "id", "id", "id", "w"]);
+    assert_eq!(result.columns.get(1), Some(&ColumnMeta::Id));
+    assert!(matches!(
+        result.columns.get(2),
+        Some(ColumnMeta::Scalar { .. })
+    ));
+    assert_eq!(
+        rows_of(&result),
+        strs(&[
+            &["1", "100", "real-b", "200", "w1"],
+            &["1", "101", "real-a", "200", "w1"],
+        ])
+    );
+
+    // 序数 3（実カラム `id`）で並べ替えると real-a（行キー 101）が先頭になる。
+    let result = run(
+        &core,
+        "SELECT * FROM p JOIN q USING (k) ORDER BY 3 LIMIT 20",
+    );
+    assert_eq!(
+        rows_of(&result),
+        strs(&[
+            &["1", "101", "real-a", "200", "w1"],
+            &["1", "100", "real-b", "200", "w1"],
+        ])
+    );
+}
+
 // ---------- 拒否（fail-closed） ----------
 
 #[test]
