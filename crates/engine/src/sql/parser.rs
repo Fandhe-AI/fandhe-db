@@ -6336,6 +6336,16 @@ pub(crate) enum AggregateInput {
         source: crate::sql::udf_call::BoundExpr,
         program: crate::sql::expr_program::ExprProgram,
     },
+    /// `Scalar` 以外の型へ束縛された式の集計引数（SQL-57・Issue #1809）。`COUNT`／
+    /// `COUNT(DISTINCT)` は Text／Bool／Date／Timestamp／Time／TimestampTz、`MIN`／`MAX` は
+    /// Bool を除く同じ型を受理する（`SUM`／`AVG`・分散系は `42883`）。`ty` は束縛時の
+    /// 式の型で、評価結果が `ty` と食い違えば fail-closed（`XX000`）に拒否する。
+    /// `Scalar` 式は [`AggregateInput::ScalarExpr`] を使う。
+    TypedExpr {
+        source: crate::sql::udf_call::BoundExpr,
+        program: crate::sql::expr_program::ExprProgram,
+        ty: crate::sql::udf_call::ExprType,
+    },
 }
 
 /// `array_agg` の束縛済み入力（SQL-57・Issue #1801）。[`resolve_array_agg_input`] が作り、
@@ -7372,17 +7382,26 @@ fn resolve_aggregate_input(
                         "MIN/MAX cannot be applied to a BOOLEAN or VECTOR expression",
                     ))
                 }
-                ExprType::Vector
+                // SQL-57・Issue #1809: Text／Bool／日時式は `COUNT`・`MIN`／`MAX`（Bool を除く）を
+                // 受理する（`SUM`／`AVG`・分散系・Bool／Vector の `MIN`／`MAX` は上の腕で `42883`）。
+                ExprType::Text
                 | ExprType::Bool
-                | ExprType::Text
                 | ExprType::Date
                 | ExprType::Timestamp
                 | ExprType::Time
-                | ExprType::TimestampTz
-                | ExprType::Json
-                | ExprType::JsonText => Err(SqlSurfaceError::invalid_input(
-                    "aggregate argument must evaluate to a scalar",
-                )),
+                | ExprType::TimestampTz => {
+                    let program = crate::sql::expr_program::ExprProgram::compile(&bound);
+                    Ok(AggregateInput::TypedExpr {
+                        source: bound,
+                        program,
+                        ty,
+                    })
+                }
+                ExprType::Vector | ExprType::Json | ExprType::JsonText => {
+                    Err(SqlSurfaceError::invalid_input(
+                        "aggregate argument must evaluate to a scalar",
+                    ))
+                }
                 // INTERVAL 式の集計は未対応（Issue #1581 の対象外。列の集計・比較は #1580）。
                 ExprType::Interval => Err(SqlSurfaceError::FeatureNotSupported {
                     detail: "aggregates over INTERVAL expressions are not supported yet"
@@ -8024,17 +8043,23 @@ fn resolve_count_distinct_input(
                 // 対象ビヘイビア: SQL-26（Issue #920）。`DATE`／`TIMESTAMP` を
                 // 直接返す式（集計せず素通しする形）も、上記 TEXT と同じ理由で
                 // 集計引数としては対象外とする。
-                ExprType::Vector
+                // SQL-57・Issue #1809: Text／Bool／日時式の `COUNT(DISTINCT ...)` を受理する。
+                ExprType::Text
                 | ExprType::Bool
-                | ExprType::Text
                 | ExprType::Date
                 | ExprType::Timestamp
                 | ExprType::Time
-                | ExprType::TimestampTz
-                | ExprType::Json
-                | ExprType::JsonText => Err(SqlSurfaceError::invalid_input(
-                    "aggregate argument must evaluate to a scalar",
-                )),
+                | ExprType::TimestampTz => {
+                    let program = crate::sql::expr_program::ExprProgram::compile(&bound);
+                    Ok(AggregateInput::TypedExpr {
+                        source: bound,
+                        program,
+                        ty,
+                    })
+                }
+                ExprType::Vector | ExprType::Json | ExprType::JsonText => Err(
+                    SqlSurfaceError::invalid_input("aggregate argument must evaluate to a scalar"),
+                ),
                 // INTERVAL 式の集計は未対応（Issue #1581 の対象外。列の集計・比較は #1580）。
                 ExprType::Interval => Err(SqlSurfaceError::FeatureNotSupported {
                     detail: "aggregates over INTERVAL expressions are not supported yet"
@@ -10265,6 +10290,11 @@ fn aggregate_result_column_type(item: &BoundAggregateItem) -> ColumnType {
             AggregateInput::TimestampColumn(_) => ColumnType::Timestamp,
             AggregateInput::TimeColumn(_) => ColumnType::Time,
             AggregateInput::TimestampTzColumn(_) => ColumnType::TimestampTz,
+            // SQL-57・Issue #1809: 非スカラー式の `MIN`/`MAX` は式の型が結果型。
+            AggregateInput::TypedExpr { ty, .. } => {
+                crate::sql::aggregate::typed_expr_column_type(*ty)
+                    .unwrap_or(EXPR_UNSUPPORTED_COLUMN_TYPE)
+            }
             _ => EXPR_UNSUPPORTED_COLUMN_TYPE,
         },
     }
@@ -12514,6 +12544,38 @@ mod tests {
             bound.items[4].input,
             AggregateInput::TextColumn(_)
         ));
+    }
+
+    /// SQL-57・Issue #1809: Text 式の `COUNT`／`MIN`／`MAX` は `TypedExpr` に束縛され、
+    /// `SUM`／`AVG` は `42883`、未知の列は `42703`、`Json`／`Vector` 式は従来どおり `22000`。
+    #[test]
+    fn binds_non_scalar_expression_arguments_to_typed_expr() {
+        let bound = bind_aggregate_sql(
+            "SELECT COUNT(lower(body)), MIN(lower(body)), MAX(upper(lang)), \
+             COUNT(DISTINCT lower(body)) FROM documents",
+        )
+        .expect("bind should succeed");
+        for item in &bound.items {
+            assert!(
+                matches!(
+                    item.input,
+                    AggregateInput::TypedExpr {
+                        ty: crate::sql::udf_call::ExprType::Text,
+                        ..
+                    }
+                ),
+                "{:?}",
+                item.input
+            );
+        }
+        let code = |sql: &str| {
+            bind_aggregate_sql(sql)
+                .expect_err("bind must fail")
+                .wire_code()
+        };
+        assert_eq!(code("SELECT SUM(lower(body)) FROM documents"), "42883");
+        assert_eq!(code("SELECT AVG(lower(body)) FROM documents"), "42883");
+        assert_eq!(code("SELECT MAX(lower(nope)) FROM documents"), "42703");
     }
 
     #[test]

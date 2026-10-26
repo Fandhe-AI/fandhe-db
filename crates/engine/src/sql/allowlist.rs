@@ -6126,6 +6126,11 @@ impl<'a> Parser<'a> {
                         | Some(Token::Number(_))
                         | Some(Token::Punct('(' | '-' | '+'))
                 ),
+                // SQL-57・Issue #1809: `COUNT(DISTINCT (a + b))`・`COUNT(DISTINCT -n)` も修飾子と読む
+                // （数値・文字列リテラルは従来どおり対象外。`COUNT(distinct)` の列名互換を保つ）。
+                AggregateFunc::Count => {
+                    matches!(after_distinct, Some(Token::Punct('(' | '-' | '+')))
+                }
                 _ => false,
             };
         let distinct = if string_agg_modifier || is_distinct_modifier(&self.tokens, self.pos) {
@@ -6165,7 +6170,9 @@ impl<'a> Parser<'a> {
             }
             let saved_calls = self.agg_calls.take();
             let saved_minus = self.allow_unary_minus;
-            self.allow_unary_minus = false;
+            // SQL-57・Issue #1809: 第 1 引数は投影式（Issue #1538）と同じく単項マイナスを受理する
+            // （`sum(-n)`・`sum(abs(-n))`）。入れ子集計の拒否（`agg_calls` の退避）は維持する。
+            self.allow_unary_minus = true;
             // `string_agg` の引数位置は text と確定するため、裸の `NULL` をリテラルとして解析する。
             let saved_null = self.allow_null_literal;
             self.allow_null_literal =
@@ -29103,6 +29110,27 @@ mod tests {
         // 列名 `distinct` を引数に取る形は維持する。
         let agg = expect_aggregate("SELECT array_agg(distinct) FROM documents", &lookup);
         assert!(!expect_agg_item(&agg.items()[0]).distinct);
+    }
+
+    /// SQL-57・Issue #1809: 集計引数の単項マイナスと `COUNT(DISTINCT (式))`・`COUNT(DISTINCT -式)`。
+    /// `COUNT(distinct)` の列名読みと、入れ子集計の `42601` は維持する。
+    #[test]
+    fn aggregate_arguments_accept_unary_minus_and_distinct_before_paren() {
+        let lookup = catalog_with(&["documents"]);
+        let agg = expect_aggregate(
+            "SELECT sum(-a), sum(abs(-a)), count(DISTINCT (a + b)), count(DISTINCT -a), \
+             count(distinct), count(a - b) FROM documents",
+            &lookup,
+        );
+        let item = |i: usize| expect_agg_item(&agg.items()[i]);
+        assert!(!item(0).distinct && !item(1).distinct);
+        assert!(item(2).distinct && item(3).distinct);
+        assert!(!item(4).distinct);
+        assert!(matches!(item(4).arg, AggregateArg::Expr(Expr::Ident(_))));
+        assert!(!item(5).distinct);
+        let err = validate_sql("SELECT sum(count(*)) FROM documents", &lookup)
+            .expect_err("nested aggregate must be rejected");
+        assert_eq!(err.wire_code(), "42601");
     }
 
     /// SQL-57・Issue #1805: `bool_and` 系の構文。既定別名・比較式の引数が AST に載り、
