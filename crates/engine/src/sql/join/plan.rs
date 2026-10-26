@@ -18,6 +18,9 @@
 //! - 単一 relation で完結し列同士の比較を含まない conjunct は、その relation の
 //!   走査へプッシュダウンする（型解析・評価は単一テーブル経路を完全に共有する）。
 //!   それ以外は結合後に行単位で評価する残余（[`ResNode`]）になる。
+//!
+//! ON は `on_split` が結合キー／残余述語へ分類し、キー無しは `42601`、残余ありは
+//! `0A000`（評価は Issue #1830）で拒否する（Issue #1829）。
 
 use std::collections::HashMap;
 
@@ -32,6 +35,7 @@ use crate::sql::parser::{AggregateInput, AggregateTarget, BoundAggregateItem};
 use crate::sql::relation::{BindingScope, ColumnRef, ColumnSlot, TableRef};
 use crate::sql::udf_call::{BinOp, UdfRegistry};
 
+use super::on_split::classify_on;
 use super::using::{
     bind_using_step, natural_using_names, relation_columns, slot_type, JoinScope, MergedColumn,
     VisibleCol,
@@ -369,7 +373,7 @@ impl<'a, 'b> Binder<'a, 'b> {
 }
 
 /// [`JoinWherePredicate`] の葉が参照する列参照。
-fn leaf_colrefs(pred: &JoinWherePredicate) -> Vec<&ColumnRef> {
+pub(super) fn leaf_colrefs(pred: &JoinWherePredicate) -> Vec<&ColumnRef> {
     match pred {
         JoinWherePredicate::Equality { column, .. }
         | JoinWherePredicate::Prefix { column, .. }
@@ -400,7 +404,7 @@ pub(super) fn is_null_rejecting(pred: &JoinWherePredicate) -> bool {
 
 /// relation 番号に対応するビット。32 relation 以上は表現できないため `Internal`
 /// （通常は `MAX_TABLE_REFS` で先に弾かれる。0 へ倒すと述語の参照集合が空になる）。
-fn relation_bit(rel: usize) -> Result<u32, SqlSurfaceError> {
+pub(super) fn relation_bit(rel: usize) -> Result<u32, SqlSurfaceError> {
     u32::try_from(rel)
         .ok()
         .and_then(|s| 1u32.checked_shl(s))
@@ -767,19 +771,23 @@ pub(super) fn build_plan<'a>(
                 visible.extend(relation_columns(new_rel, new_schema));
                 let step_scope =
                     JoinScope::new(step_base, merged.clone(), visible.clone(), has_using);
-                keys.reserve(on.len());
-                for (lhs, rhs) in on {
-                    let l = step_scope.resolve(lhs)?;
-                    let r = step_scope.resolve(rhs)?;
-                    let (acc, new) = match (l.relation() == new_rel, r.relation() == new_rel) {
-                        (false, true) => (l, r),
-                        (true, false) => (r, l),
-                        _ => {
-                            return Err(SqlSurfaceError::unsupported(
-                                "JOIN ON condition must reference both sides of the join",
-                            ))
-                        }
-                    };
+                // ON の AND 連鎖を結合キーと残余述語へ分解する（Issue #1829・SQL-60 ポインタ）。
+                // 列解決エラーは分類より前に確定する。
+                let split = classify_on(on, &step_scope, new_rel)?;
+                if split.keys.is_empty() {
+                    return Err(SqlSurfaceError::unsupported(
+                        "JOIN ON condition must reference both sides of the join",
+                    ));
+                }
+                // 残余述語（左のみ・右のみ・混在）の評価は #1830 の責務。評価できない述語を
+                // 黙殺すると過剰返却（fail-open）になるため、それまでは fail-closed に拒否する。
+                if split.has_residual() {
+                    return Err(SqlSurfaceError::feature_not_supported(
+                        "JOIN ON predicates other than equi-join keys are not supported yet",
+                    ));
+                }
+                keys.reserve(split.keys.len());
+                for (acc, new) in split.keys {
                     let acc_class = key_class(acc.column_type())?;
                     let new_class = key_class(new.column_type())?;
                     if acc_class != new_class {

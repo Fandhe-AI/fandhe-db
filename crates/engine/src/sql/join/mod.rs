@@ -26,6 +26,8 @@
 //! - `residual`: WHERE 残余の行単位評価とスカラー `ORDER BY`。
 //! - `aggregate`: 集計形（既存の `Accumulator` を再利用）。
 //! - `values`: 型クラス・キー正準化・比較・`Cell` → `ScalarRef` アダプタ。
+//! - `on_split`: ON の AND 連鎖を結合キー／残余述語（左のみ・右のみ・混在）へ分類する
+//!   （Issue #1829・SQL-60 ポインタ）。
 //! - `using`: `JOIN ... USING (...)` の束縛（等価 ON への脱糖）と結合列の統合規則・
 //!   統合列を考慮した列解決（Issue #1826・SQL-60 (1)）。
 //!
@@ -43,6 +45,7 @@ mod aggregate;
 // `UPDATE ... FROM`/`DELETE ... USING` の結合実行（Issue #1755・SQL-53）。
 pub(crate) mod dml;
 mod exec;
+mod on_split;
 mod plan;
 mod residual;
 mod using;
@@ -487,7 +490,15 @@ mod tests {
             relations,
             steps: vec![JoinStep {
                 kind,
-                condition: JoinCondition::On(on),
+                condition: JoinCondition::On(
+                    on.into_iter()
+                        .map(|(lhs, rhs)| JoinWherePredicate::ColumnCompare {
+                            lhs,
+                            op: crate::sql::udf_call::BinOp::Eq,
+                            rhs,
+                        })
+                        .collect(),
+                ),
             }],
             projection,
             column_aliases: Vec::new(),
@@ -1069,17 +1080,19 @@ mod tests {
             steps: vec![
                 JoinStep {
                     kind,
-                    condition: JoinCondition::On(vec![(
-                        ColumnRef::qualified("l", "tag"),
-                        ColumnRef::qualified("r", "tag"),
-                    )]),
+                    condition: JoinCondition::On(vec![JoinWherePredicate::ColumnCompare {
+                        lhs: ColumnRef::qualified("l", "tag"),
+                        op: crate::sql::udf_call::BinOp::Eq,
+                        rhs: ColumnRef::qualified("r", "tag"),
+                    }]),
                 },
                 JoinStep {
                     kind: JoinKind::Inner,
-                    condition: JoinCondition::On(vec![(
-                        ColumnRef::qualified("r", "tag"),
-                        ColumnRef::qualified("s", "tag"),
-                    )]),
+                    condition: JoinCondition::On(vec![JoinWherePredicate::ColumnCompare {
+                        lhs: ColumnRef::qualified("r", "tag"),
+                        op: crate::sql::udf_call::BinOp::Eq,
+                        rhs: ColumnRef::qualified("s", "tag"),
+                    }]),
                 },
             ],
             projection: JoinProjection::Columns(vec![ColumnRef::qualified("l", "tag")]),
