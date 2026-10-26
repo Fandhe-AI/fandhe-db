@@ -19089,7 +19089,7 @@ fn parse_join_where_leaf(p: &mut Parser<'_>) -> Result<JoinWherePredicate, SqlSu
         // ON の葉（Issue #1829）の直後に来る WHERE と結合語。WHERE／DML 文脈でこれらが葉の直後に
         // 来ても後段の文パーサが `42601` にするため既存の挙動は変わらない。
         | Some(Token::Keyword(Keyword::Where))
-        | Some(Token::Punct(')' | ';'))
+        | Some(Token::Punct(')' | ';' | ','))
         | None => JoinWherePredicate::BoolColumn { column },
         // DML（`UPDATE ... FROM`／`DELETE ... USING`）の WHERE 後続句（Issue #1754）。
         Some(Token::Ident(w))
@@ -34374,6 +34374,14 @@ mod tests {
             ("SELECT * FROM a x, b, c", vec![true, true]),
             (
                 "SELECT * FROM a JOIN b ON a.id = b.id, c LIMIT 1",
+                vec![false, true],
+            ),
+            (
+                "SELECT * FROM a JOIN b ON a.k = b.k AND b.active, c LIMIT 10",
+                vec![false, true],
+            ),
+            (
+                "SELECT * FROM a JOIN b ON a.k = b.k AND b.active CROSS JOIN c LIMIT 10",
                 vec![false, true],
             ),
             (
