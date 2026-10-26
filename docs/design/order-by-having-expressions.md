@@ -74,8 +74,7 @@
 
 ## 対象外（Issue 起票なし・後続の管轄を除く）
 
-- `ORDER BY` 内の集計関数呼び出し（`ORDER BY sum(x)`）は `42601` のまま（Issue #1815 の管轄）。`HAVING` 内の
-  集計関数呼び出しは Issue #1814 で対応した（下の「Issue #1814 追記」）。
+- `ORDER BY` 内・`HAVING` 内の集計関数呼び出しは Issue #1815・#1814 で対応した（下の各「追記」）。
 - 式位置での単項マイナス、`ORDER BY (expr)`・算術で始まるキー。位置指定 `ORDER BY 1` は
   Issue #1792、`NULLS FIRST/LAST` は Issue #1791 で対応した（下の各「追記」）。
 - `SELECT DISTINCT ... ORDER BY <式>`・`GROUP BY` なしの `HAVING`・GROUP BY キー自体の式化。
@@ -200,3 +199,22 @@
   `explain_accepts_expression_order_by_and_having_in_session`・`explain_expression_error_codes_match_non_explain`、
   wire 層 `crates/wire-server/tests/wire_sql26_explain_expression_order_having.rs`（簡易・拡張両経路の受理・
   SQLSTATE パリティ・本体非評価・テナント文脈間での応答同一性）。
+
+## Issue #1815 追記（ORDER BY 内の集計呼び出し。SQL-58 のポインタ）
+
+- 対象: `GROUP BY` ありの集計 `SELECT` の `ORDER BY` に集計関数の呼び出しを直接書ける
+  （`ORDER BY sum(n) DESC NULLS LAST`・`ORDER BY coalesce(max(n), 0)`・序数キーとの併用）。
+- 構文段: `HAVING` が積んだ隠し集計配列（`GroupByClause::having_aggregates`）を `ORDER BY` の解析へ引き継ぎ、
+  同じ配列・同じ内部名の添字空間へ重複排除して積む（`HAVING sum(n) > 1 ORDER BY sum(n)` は 1 項目）。
+  キー全体が集計呼び出し 1 つなら識別子キー（内部名）へ正規化し、それ以外は式キーのまま。
+- 束縛段: `HAVING` と同じ解決関数で内部名を隠し集計項目へ解決する。識別子キーは `OrderTarget::Aggregate`
+  となり既存の比較器（NUMERIC の厳密比較・NULL 位置）と `array_agg`／照合の拒否がそのまま効く。
+  SELECT リストに集計が無い形（`SELECT lang ... GROUP BY lang ORDER BY count(*)`）は `ORDER BY` を読んだ後に判定する。
+- fail-closed: 隠し集計は `HAVING` と配列を共有するため、ビュー本体・評価後射影形ビューの外側・列別名ビュー・
+  参照列収集・単純形ビューの引数の公開列限定（非公開列は `42703`）は `HAVING` と同じ契約で効く。
+  呼び出し数の上限 32（`54000`）は SELECT・`HAVING`・`ORDER BY` の合算。CTE 主クエリ・集合演算の枝・
+  サブクエリ・`SELECT DISTINCT`・`GROUP BY` なしは従来どおり `42601`。入れ子の集計は `42601`。
+- 対象外: 式キー内での NUMERIC 結果の算術（`ORDER BY sum(bigint) + 1` は `22000`。`HAVING` と同じ制限）、
+  JOIN 集計・NoSQL（HTTP）表層・`$n` を含む形。
+- テスト: engine `tests/sql58_order_by_aggregate_calls.rs`、wire `tests/wire_sql58_order_by_aggregate_calls.rs`、
+  構文段の単体テスト `order_by_aggregate_calls_are_desugared_and_shared_with_having`。

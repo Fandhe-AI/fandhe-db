@@ -552,7 +552,7 @@ fn having_and_order_by_expression_error_contract() {
         format!("{AGG} HAVING sum(count(*)) > 1"),
         format!("{AGG} HAVING lang = 'ja'"),
         format!("{AGG} HAVING c + 1 > 3"),
-        format!("{AGG} ORDER BY sum(n)"),
+        format!("{AGG} ORDER BY sum(count(*))"),
     ] {
         assert_eq!(run_err(&core, &ctx, &sql), "42601", "{sql}");
     }

@@ -3519,6 +3519,8 @@ pub struct HavingPredicate {
 /// `GROUP BY` 集計の `ORDER BY` 対象（TASK-167・SQL-14）。`GROUP BY` 列名、または
 /// SELECT リストの集計項目の実効名のいずれかの識別子を指す（解決は
 /// `sql::parser::bind_aggregate`）。
+/// Issue #1815・SQL-58: 素の集計呼び出しキー（`ORDER BY sum(n)`）は `target` が内部名
+/// （[`aggregate_placeholder`]）になり、`expr` は `None`（隠し集計項目への参照）。
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct AggregateOrderBy {
     /// 識別子キーの参照名。式キー（`expr` が `Some`）のときは空文字（未使用）。
@@ -3560,8 +3562,8 @@ pub struct GroupByClause {
     pub(crate) having: Vec<HavingPredicate>,
     /// 式述語の `HAVING`（Issue #1188・SQL-26）。`having` と AND 結合される。
     pub(crate) having_exprs: Vec<HavingExprPredicate>,
-    /// `HAVING` 内に直接書かれた集計呼び出し（Issue #1814・SQL-58）。出現順・重複排除済みで、
-    /// 述語側は内部名 [`aggregate_placeholder`]`(j)`（`j` はこの配列の添字）の識別子に置換済み。
+    /// `HAVING`・`ORDER BY` 内に直接書かれた集計呼び出し（Issue #1814・#1815・SQL-58）。両句で
+    /// 1 つの配列・添字空間を共有し、出現順・重複排除済み。呼び出し側は内部名 [`aggregate_placeholder`]`(j)`（`j` はこの配列の添字）の識別子に置換済み。
     /// 束縛段（`sql::parser::bind_aggregate_with_dummy_flags`）が隠し集計項目として
     /// `BoundAggregate::items` へ積み、述語の内部名をその項目への参照へ解決する。
     pub(crate) having_aggregates: Vec<AggregateItem>,
@@ -6674,6 +6676,30 @@ impl<'a> Parser<'a> {
     /// 各キーの方向指定の直後に `NULLS FIRST|LAST` を受理する（SQL-56・Issue #1791。
     /// [`Self::parse_order_nulls`]）。キー数の上限は [`MAX_SCALAR_ORDER_KEYS`]（超過は `54000`。
     /// 確保前検査）。
+    /// 集計 `GROUP BY` の `ORDER BY`（Issue #1815・SQL-58）。`HAVING` が積んだ隠し集計配列を
+    /// 受け取り、`ORDER BY` 内の集計呼び出しも同じ配列・同じ内部名の添字空間へ重複排除して積んで
+    /// 返す（`HAVING sum(n) > 1 ORDER BY sum(n)` は 1 項目に集約）。`allow_aggregate_expr_items`
+    /// が偽の文脈（CTE 主クエリ・集合演算の枝・サブクエリ・ビュー本体）は `agg_calls` が
+    /// `None` のままで、集計呼び出しは従来どおり `42601`。
+    fn parse_aggregate_order_by_with_hidden(
+        &mut self,
+        hidden: Vec<AggregateItem>,
+    ) -> Result<(Vec<AggregateOrderBy>, Vec<AggregateItem>), SqlSurfaceError> {
+        if !self.allow_aggregate_expr_items {
+            return Ok((self.parse_aggregate_order_by(true)?, hidden));
+        }
+        let saved_calls = self.agg_calls.take();
+        let saved_dedup = self.agg_calls_dedup;
+        self.agg_calls = Some(hidden);
+        self.agg_calls_dedup = true;
+        let parsed = self.parse_aggregate_order_by(true);
+        let calls = self.agg_calls.take();
+        self.agg_calls = saved_calls;
+        self.agg_calls_dedup = saved_dedup;
+        let keys = parsed?;
+        Ok((keys, calls.unwrap_or_default()))
+    }
+
     fn parse_aggregate_order_by(
         &mut self,
         allow_expr: bool,
@@ -6696,7 +6722,14 @@ impl<'a> Parser<'a> {
                 self.pos = self.pos.saturating_add(len);
                 (String::new(), None, Some(position))
             } else if allow_expr && self.order_key_starts_expression() {
-                (String::new(), Some(self.parse_value_expr(0)?), None)
+                // Issue #1815: キー全体が集計呼び出し 1 つ（内部名の識別子へ脱糖済み）なら
+                // 識別子キーへ正規化し、束縛段で `OrderTarget::Aggregate` として扱う。
+                match self.parse_value_expr(0)? {
+                    Expr::Ident(name) if aggregate_placeholder_index(&name).is_some() => {
+                        (name, None, None)
+                    }
+                    other => (String::new(), Some(other), None),
+                }
             } else {
                 (self.expect_ident()?, None, None)
             };
@@ -19353,10 +19386,13 @@ fn parse_aggregate_shape(
     let no_aggregate_item_error = || {
         SqlSurfaceError::unsupported("aggregate SELECT list requires at least one aggregate item")
     };
+    // 例外（Issue #1815・SQL-58）: `ORDER BY` 内の集計呼び出し（`... GROUP BY lang ORDER BY count(*)`）
+    // も同様に、`ORDER BY` を読んだ後に判定する。
     let deferred_item_check = !has_aggregate_item
-        && tokens
-            .iter()
-            .any(|t| matches!(t, Token::Ident(n) if n.eq_ignore_ascii_case("HAVING")));
+        && tokens.iter().any(|t| {
+            matches!(t, Token::Ident(n) if n.eq_ignore_ascii_case("HAVING"))
+                || matches!(t, Token::Keyword(Keyword::Order))
+        });
     if !has_aggregate_item && !deferred_item_check {
         return Err(no_aggregate_item_error());
     }
@@ -19407,14 +19443,16 @@ fn parse_aggregate_shape(
         } else {
             (Vec::new(), Vec::new(), Vec::new())
         };
+        // `ORDER BY` の集計呼び出しは `HAVING` と同じ隠し集計配列へ積む（Issue #1815・SQL-58）。
+        let (order_by, having_aggregates) =
+            if matches!(p.peek(), Some(Token::Keyword(Keyword::Order))) {
+                p.parse_aggregate_order_by_with_hidden(having_aggregates)?
+            } else {
+                (Vec::new(), having_aggregates)
+            };
         if !has_aggregate_item && having_aggregates.is_empty() {
             return Err(no_aggregate_item_error());
         }
-        let order_by = if matches!(p.peek(), Some(Token::Keyword(Keyword::Order))) {
-            p.parse_aggregate_order_by(true)?
-        } else {
-            Vec::new()
-        };
         // Issue #1796・SQL-34: `LIMIT ALL`・`LIMIT` 省略・`OFFSET` 単独を受理する
         // （`limit: None` は暗黙の結果行数上限の対象。実行段が超過を `54000` にする）。
         // SQL-56 (3)・Issue #1793: `WITH TIES` 正規形はここ（GROUP BY）でも受理する。
@@ -29455,6 +29493,42 @@ mod tests {
         let err = validate_sql(&sql, &lookup)
             .expect_err("GROUP BY column count over limit must be rejected");
         assert_eq!(err.wire_code(), "54000");
+    }
+
+    /// SQL-58（Issue #1815）: `ORDER BY` 内の集計呼び出しは `HAVING` と共有の隠し集計配列へ
+    /// 脱糖され、素の呼び出しキーは識別子キー（内部名）へ正規化される。
+    #[test]
+    fn order_by_aggregate_calls_are_desugared_and_shared_with_having() {
+        let lookup = catalog_with(&["documents"]);
+        let parse = |sql: &str| match validate_sql(sql, &lookup).expect("must be accepted") {
+            Statement::Aggregate(agg) => agg,
+            other => panic!("unexpected statement: {other:?}"),
+        };
+        let agg =
+            parse("SELECT lang, COUNT(*) AS c FROM documents GROUP BY lang ORDER BY sum(n) DESC");
+        let clause = agg.group_by().expect("clause");
+        assert_eq!(clause.order_by[0].target, aggregate_placeholder(0));
+        assert!(clause.order_by[0].expr.is_none());
+        assert_eq!(clause.having_aggregates.len(), 1);
+        let agg = parse(
+            "SELECT lang, COUNT(*) AS c FROM documents GROUP BY lang \
+             HAVING sum(n) > 1 ORDER BY sum(n)",
+        );
+        assert_eq!(agg.group_by().expect("clause").having_aggregates.len(), 1);
+        let agg = parse(
+            "SELECT lang, COUNT(*) AS c FROM documents GROUP BY lang ORDER BY coalesce(max(n), 0)",
+        );
+        assert!(agg.group_by().expect("clause").order_by[0].expr.is_some());
+        parse("SELECT lang FROM documents GROUP BY lang ORDER BY count(*)");
+        for sql in [
+            "SELECT lang, COUNT(*) FROM documents GROUP BY lang ORDER BY sum(count(*))",
+            "SELECT lang FROM documents GROUP BY lang ORDER BY lang",
+            "SELECT DISTINCT lang FROM documents ORDER BY count(*)",
+            "SELECT COUNT(*) FROM documents ORDER BY count(*)",
+        ] {
+            let err = validate_sql(sql, &lookup).expect_err(sql);
+            assert_eq!(err.wire_code(), "42601", "{sql}");
+        }
     }
 
     /// SQL-58（Issue #1814）: `HAVING` 内の集計呼び出しは内部名へ脱糖され、重複排除される。

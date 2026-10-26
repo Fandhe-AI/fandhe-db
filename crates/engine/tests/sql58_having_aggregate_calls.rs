@@ -286,8 +286,8 @@ fn rejected_forms_keep_their_sqlstate() {
         // 未知の列。
         ("HAVING sum(zzz) > 1", "42703"),
         ("HAVING coalesce(sum(zzz), 0) > 1", "42703"),
-        // ORDER BY 内の集計呼び出しは別 Issue（#1815）で扱う。
-        ("ORDER BY sum(n)", "42601"),
+        // ORDER BY 内の入れ子の集計呼び出しは Issue #1815 の導入後も拒否する。
+        ("ORDER BY sum(count(*))", "42601"),
         // 式内では NUMERIC 結果の算術は不可。
         ("HAVING sum(b) + 1 > 10", "22000"),
         // 括弧なしの列名参照は従来どおり未知名。
@@ -433,7 +433,7 @@ fn explain_error_codes_match_non_explain() {
         format!("{BASE} HAVING max(title) > 1"),
         format!("{BASE} HAVING array_agg(n) > 1"),
         format!("{BASE} HAVING sum(zzz) > 1"),
-        format!("{BASE} ORDER BY sum(n)"),
+        format!("{BASE} ORDER BY sum(count(*))"),
     ] {
         let mut s1 = SessionState::default();
         let plain = session_err(&core, &ctx, &mut s1, &body);

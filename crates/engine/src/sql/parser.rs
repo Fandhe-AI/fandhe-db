@@ -9941,9 +9941,9 @@ fn bind_group_by_clause(
         resolve_group_reference(&clause.columns, group_key_aliases, items, name)
     };
 
-    // `HAVING` 専用の解決: 集計呼び出しの内部名（Issue #1814・SQL-58）は隠し集計項目（または
-    // 共有した SELECT リストの項目）へ、それ以外は `resolve_target` と同じ規則で解決する。
-    // `ORDER BY` は内部名を持たないため `resolve_target` のまま。
+    // `HAVING`・`ORDER BY` 共用の解決: 集計呼び出しの内部名（Issue #1814・#1815・SQL-58）は
+    // 隠し集計項目（または共有した SELECT リストの項目）へ、それ以外は `resolve_target` と同じ
+    // 規則で解決する。両句の隠し集計は同一配列（`having_aggregates`）で添字空間を共有する。
     let resolve_having = |name: &str| -> Result<OrderTarget, SqlSurfaceError> {
         if let Some(j) = crate::sql::allowlist::aggregate_placeholder_index(name) {
             let idx = having_hidden.get(j).copied().ok_or_else(|| {
@@ -10032,7 +10032,7 @@ fn bind_group_by_clause(
         let target = match (&ob.expr, ob.ordinal) {
             (None, ordinal) => {
                 let target = match ordinal {
-                    None => resolve_target(&ob.target)?,
+                    None => resolve_having(&ob.target)?,
                     Some(position) => {
                         // SQL-56 (2)・Issue #1792: 序数は SELECT リストの出力列（`projection` の
                         // 宣言順）の位置。範囲外は `42P10`（文だけで決まり行内容に依存しない）。
@@ -10142,7 +10142,7 @@ fn bind_group_by_clause(
                 target
             }
             (Some(expr), _) => {
-                let rewritten = rewrite_group_row_idents(expr, &resolve_target)?;
+                let rewritten = rewrite_group_row_idents(expr, &resolve_having)?;
                 let (bound, ty) =
                     crate::sql::udf_call::bind_expr(&rewritten, &view_schema, udfs, node_budget)?;
                 let kind = order_kind_for_expr_type(ty)?;
