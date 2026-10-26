@@ -4688,17 +4688,51 @@ pub(super) fn bind_expr_any(
             // （`reject_json_operand`）を被演算子の束縛後へ遅らせ、NUMERIC を含まない組は従来どおり拒否する。
             let numeric_mode = env.numeric_arith
                 && matches!(op, BinOp::Add | BinOp::Sub | BinOp::Mul | BinOp::Div);
-            let (l, lt) = if let Some(pre) = prebound_lhs {
-                pre
-            } else if is_comparison || numeric_mode {
-                bind_expr_any(lhs, env, node_budget)?
-            } else {
-                bind_expr_in(lhs, env, node_budget)?
+            // codex-review 指摘対応（Issue #1812）: NUMERIC 算術の数値リテラルは、相手が NUMERIC
+            // 式なら `f64` 経由（`parse_number_literal` の 2^53 検証）を通さず `Decimal` へ直接
+            // 束縛する（`sum(b) + 9007199254740993`）。そのため非リテラル側を先に束縛する。
+            let literal_exact = |e: &Expr| -> Option<BoundExpr> {
+                match e {
+                    Expr::Number(raw) => crate::numeric::parse_literal_exact(raw)
+                        .ok()
+                        .map(BoundExpr::Numeric),
+                    _ => None,
+                }
             };
-            let (r, rt) = if is_comparison || numeric_mode {
+            let defer_lhs = numeric_mode
+                && prebound_lhs.is_none()
+                && matches!(&**lhs, Expr::Number(_))
+                && !matches!(&**rhs, Expr::Number(_));
+            let lhs_first = if let Some(pre) = prebound_lhs {
+                Some(pre)
+            } else if defer_lhs {
+                None
+            } else if is_comparison || numeric_mode {
+                Some(bind_expr_any(lhs, env, node_budget)?)
+            } else {
+                Some(bind_expr_in(lhs, env, node_budget)?)
+            };
+            let lhs_is_numeric = lhs_first
+                .as_ref()
+                .is_some_and(|(_, t)| *t == ExprType::Numeric);
+            let exact_rhs = if numeric_mode && lhs_is_numeric {
+                literal_exact(rhs)
+            } else {
+                None
+            };
+            let (r, rt) = if let Some(b) = exact_rhs {
+                (b, ExprType::Numeric)
+            } else if is_comparison || numeric_mode {
                 bind_expr_any(rhs, env, node_budget)?
             } else {
                 bind_expr_in(rhs, env, node_budget)?
+            };
+            let (l, lt) = match lhs_first {
+                Some(x) => x,
+                None => match (rt == ExprType::Numeric, literal_exact(lhs)) {
+                    (true, Some(b)) => (b, ExprType::Numeric),
+                    _ => bind_expr_any(lhs, env, node_budget)?,
+                },
             };
             if numeric_mode {
                 if lt == ExprType::Numeric || rt == ExprType::Numeric {
@@ -5742,8 +5776,19 @@ pub(crate) fn projection_kind(
             }
             return acc;
         }
-        (Expr::NullIf(l, _), BoundExpr::NullIf { lhs, .. }) => {
-            return projection_kind(l, lhs, schema);
+        // 結果型は比較演算子の解決と同じ昇格規則（codex-review 指摘対応）。整数同士は広い方、
+        // 同種の `real` 同士は `real`、整数と `real`・倍精度・不明が混ざれば倍精度（`Other`）。
+        (Expr::NullIf(l, r), BoundExpr::NullIf { lhs, rhs }) => {
+            let a = projection_kind(l, lhs, schema);
+            let b = projection_kind(r, rhs, schema);
+            return match (a, b) {
+                (ProjKind::Null, x) | (x, ProjKind::Null) => x,
+                (ProjKind::Num(NumericKind::Float4), ProjKind::Num(NumericKind::Float4)) => a,
+                (ProjKind::Num(NumericKind::Float4), _)
+                | (_, ProjKind::Num(NumericKind::Float4)) => ProjKind::Other,
+                (ProjKind::Num(_), ProjKind::Num(_)) => common_proj_kind(a, b),
+                _ => ProjKind::Other,
+            };
         }
         (
             Expr::Call { args, .. },

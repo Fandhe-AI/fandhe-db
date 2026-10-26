@@ -317,3 +317,43 @@ fn extended_describe_matches_runtime_for_conditional_and_numeric_expressions() {
     expect(&mut s, b'C');
     assert_eq!(expect(&mut s, b'Z'), [b'I']);
 }
+
+/// Issue #1812（codex-review 指摘）: `NULLIF` の結果型は両辺の昇格で決まる。左辺が整数でも
+/// 右辺が小数なら倍精度として扱い、後続の `/ 2` が整数除算にならない（PostgreSQL は 2.5）。
+#[test]
+fn nullif_promotes_integer_lhs_with_fractional_rhs_before_division() {
+    let (mut s, _g) = connect();
+    send_simple_query(&mut s, "SELECT NULLIF(5, 0.5) / 2 FROM t");
+    let _ = read_row_description_with_types(&mut s);
+    assert_eq!(read_data_row(&mut s), vec![Some("2.5".to_string())]);
+    assert_eq!(read_command_complete(&mut s), "SELECT 1");
+    read_ready_for_query(&mut s);
+
+    // 両辺が整数なら従来どおり整数除算。
+    send_simple_query(&mut s, "SELECT NULLIF(5, 1) / 2 FROM t");
+    let _ = read_row_description_with_types(&mut s);
+    assert_eq!(read_data_row(&mut s), vec![Some("2".to_string())]);
+    assert_eq!(read_command_complete(&mut s), "SELECT 1");
+    read_ready_for_query(&mut s);
+}
+
+/// Issue #1812（codex-review 指摘）: NUMERIC 式との算術では数値リテラルを `f64` 経由にせず
+/// `Decimal` へ直接束縛するため、2^53 を超える整数リテラルも `22003` にならない。
+#[test]
+fn numeric_arith_accepts_integer_literal_beyond_two_pow_53() {
+    let (mut s, _g) = connect();
+    send_simple_query(
+        &mut s,
+        "SELECT sum(b) + 9007199254740993, 9007199254740993 + sum(b) FROM t",
+    );
+    let _ = read_row_description_with_types(&mut s);
+    assert_eq!(
+        read_data_row(&mut s),
+        vec![
+            Some("9007199254740996".to_string()),
+            Some("9007199254740996".to_string())
+        ]
+    );
+    assert_eq!(read_command_complete(&mut s), "SELECT 1");
+    read_ready_for_query(&mut s);
+}
