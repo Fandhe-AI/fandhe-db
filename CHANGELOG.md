@@ -13,6 +13,10 @@
   展開前に上限（展開後 4,096 セット・`CUBE` 12 要素）を検査し、超過は `54001`・`54011` で拒否する。詳細は [grouping-sets.md](docs/design/grouping-sets.md)。
   BREAKING CHANGE: 公開 enum `ErrorClass` と `SqlSurfaceError` に variant（`StatementTooComplex`・`TooManyColumns`）を
   追加したため、網羅的な `match` は更新が要る。
+- `GROUPING(<キー>, ...)` 関数を追加する（Issue #1823・SQL-59）。引数 i はそのキーが現在のセットに含まれないとき 1、
+  最初の引数が最上位ビットの int4 を返す（通常の `GROUP BY` は常に 0）。引数は 31 個までで、超過は `54023`。
+  BREAKING CHANGE: 公開 enum `AggregateFunc` に `Grouping`、`ErrorClass`・`SqlSurfaceError` に `TooManyArguments` を
+  追加したため網羅的な `match` は更新が要る。`grouping` は集計関数名として予約され、同名の `CREATE FUNCTION` は拒否される。
 - `ROLLUP`・`CUBE`・`GROUPING SETS` をセットごとに集約して結果を合成する（Issue #1822・SQL-59）。セットに含まれない
   キー列は NULL で出力し、空のセットは入力 0 行でも総計 1 行を返す。グループ数などの上限は全セット合計で検査する。
   従来 `0A000` で拒否していた構文が実行可能になる挙動変更。ビュー経由の外側集計は未対応のまま拒否する。
