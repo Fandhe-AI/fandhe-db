@@ -556,6 +556,10 @@ fn where_compare_op_token(token: &Token) -> Option<CompareOp> {
     }
 }
 
+/// `GROUPING()` の引数個数の上限（SQL-59・Issue #1823。PostgreSQL 17 と同値。結果は int4 の
+/// ビットマスクで、32 個目以降は符号ビットを超えるため）。超過は `54023`。
+pub(crate) const MAX_GROUPING_ARGS: usize = 31;
+
 /// 集計関数（TASK-166・SQL-13）で許可する関数名を照合する（大文字小文字を区別
 /// しない）。未知の名前は fail-closed に拒否する（[`is_allowed_where_predicate_name`]
 /// と同方針）。`sql::udf_call::is_reserved_function_name` から名前空間一本化の
@@ -580,6 +584,7 @@ pub(crate) fn is_aggregate_function_name(name: &str) -> bool {
             | "BOOL_AND"
             | "BOOL_OR"
             | "EVERY"
+            | "GROUPING"
     )
 }
 
@@ -878,6 +883,8 @@ pub enum SqlSurfaceError {
     /// `CUBE` の要素数が上限を超えた（`54011`。Issue #1821・SQL-59）。固定文言のみ。
     /// `CatalogError::TooManyColumns`（`54000`。変更しない）とは別物。
     TooManyColumns { detail: &'static str },
+    /// `GROUPING()` の引数が上限（31 個）を超えた（`54023`。Issue #1823・SQL-59）。固定文言のみ。
+    TooManyArguments { detail: &'static str },
     /// 明示的な `COLLATE` 同士の食い違い（`42P21`。Issue #2190・TABLE-28）。固定文言のみ。
     CollationMismatch,
     /// `LIKE`／`ILIKE` のエスケープ不正（`22025`。Issue #1779・SQL-54）。末尾の孤立した
@@ -1621,6 +1628,7 @@ impl ClassifiedError for SqlSurfaceError {
             SqlSurfaceError::WindowingError { .. } => ErrorClass::WindowingError,
             SqlSurfaceError::StatementTooComplex { .. } => ErrorClass::StatementTooComplex,
             SqlSurfaceError::TooManyColumns { .. } => ErrorClass::TooManyColumns,
+            SqlSurfaceError::TooManyArguments { .. } => ErrorClass::TooManyArguments,
             SqlSurfaceError::CollationMismatch => ErrorClass::CollationMismatch,
             SqlSurfaceError::InvalidEscapeSequence { .. } => ErrorClass::InvalidEscapeSequence,
             SqlSurfaceError::CannotCoerce { .. } => ErrorClass::CannotCoerce,
@@ -1771,7 +1779,8 @@ impl std::fmt::Display for SqlSurfaceError {
             | SqlSurfaceError::GroupingError { detail }
             | SqlSurfaceError::WindowingError { detail }
             | SqlSurfaceError::StatementTooComplex { detail }
-            | SqlSurfaceError::TooManyColumns { detail } => f.write_str(detail),
+            | SqlSurfaceError::TooManyColumns { detail }
+            | SqlSurfaceError::TooManyArguments { detail } => f.write_str(detail),
             SqlSurfaceError::MoreThanOneSqlJsonItem { detail }
             | SqlSurfaceError::NoSqlJsonItem { detail }
             | SqlSurfaceError::SqlJsonScalarRequired { detail } => f.write_str(detail),
@@ -3382,9 +3391,21 @@ pub enum AggregateFunc {
     /// `every(<boolean 式>)`（SQL-57・Issue #1805）。`bool_and` の SQL 標準名（同一意味論。
     /// 既定列名だけが `every`）。
     Every,
+    /// `GROUPING(<式>, ...)`（SQL-59 (1)・Issue #1823）。集計ではなく「擬似集計」で、既存の集計呼び出し
+    /// （SELECT・`HAVING`・`ORDER BY`・式項目での重複排除と内部名への脱糖）の仕組みに相乗りする。
+    /// 値は行を観測せず、`sql::group_by::finish_groups` がセット番号から計算する（引数 i は
+    /// そのキーが現在のセットに無いとき 1、最初の引数が最上位ビット。結果は `integer`）。
+    /// 引数は `GROUP BY` のキー（列名または構造一致するキー式）に限る。
+    Grouping,
 }
 
 impl AggregateFunc {
+    /// `GROUPING()` か（Issue #1823・SQL-59）。値が行ではなくセット番号で決まるため、JOIN・ビュー・
+    /// ウィンドウ・FROM なしなど集計表を持たない文脈では fail-closed に拒否する関数。
+    pub(crate) fn is_grouping(self) -> bool {
+        matches!(self, AggregateFunc::Grouping)
+    }
+
     /// 分散系の集計関数か（`variance`／`var_pop`／`var_samp` と `stddev`／`stddev_pop`／
     /// `stddev_samp`。Issue #1803・#1804）。引数の型検査・結果型・累積器の選択がこの 6 関数で
     /// 共通になる。
@@ -3428,6 +3449,7 @@ impl AggregateFunc {
             "BOOL_AND" => Some(AggregateFunc::BoolAnd),
             "BOOL_OR" => Some(AggregateFunc::BoolOr),
             "EVERY" => Some(AggregateFunc::Every),
+            "GROUPING" => Some(AggregateFunc::Grouping),
             _ => None,
         }
     }
@@ -3451,6 +3473,7 @@ impl AggregateFunc {
             AggregateFunc::BoolAnd => "bool_and",
             AggregateFunc::BoolOr => "bool_or",
             AggregateFunc::Every => "every",
+            AggregateFunc::Grouping => "grouping",
         }
     }
 }
@@ -6413,6 +6436,9 @@ impl<'a> Parser<'a> {
             SqlSurfaceError::unsupported(format!("unsupported aggregate function: {name}"))
         })?;
         self.expect_punct('(')?;
+        if func.is_grouping() {
+            return self.parse_grouping_call_rest();
+        }
         // `DISTINCT` は `'('` の直後・引数の直前という文脈でのみ修飾子として
         // 消費する（[`is_distinct_modifier`] と同じ判定規則。列名 `distinct` を
         // 引数に持つ `COUNT(distinct)` を壊さないよう、次のトークンが識別子・`*`
@@ -6560,6 +6586,55 @@ impl<'a> Parser<'a> {
             extra_args,
             order_by,
             filter,
+        })
+    }
+
+    /// `GROUPING(` を読み終えた位置から `<式> [, <式> ...] ')'` までを読む（SQL-59 (1)・Issue #1823。
+    /// [`Self::parse_aggregate_call_after_name`] からのみ呼ばれる）。第 1 引数を `arg`、残りを
+    /// `extra_args` に積む。`DISTINCT`・`*`・空引数・内側 `ORDER BY`・`FILTER` は受理しない
+    /// （いずれも `42601`。`FILTER` は呼び出し後の構文検査で落ちる）。引数は 31 個が上限で、
+    /// 32 個目へ進む時点で確保前に `54023` を返す（untrusted 入力の無制限確保を作らない）。
+    /// 引数の解析中は入れ子集計の収集だけを止め、単項マイナスは `GROUP BY` 式と同様に受理する
+    /// （`GROUPING(-n)` が `GROUP BY ROLLUP(-n)` のキーと構造一致できるようにするため）。
+    fn parse_grouping_call_rest(&mut self) -> Result<AggregateItem, SqlSurfaceError> {
+        if matches!(self.peek(), Some(Token::Punct(')'))) {
+            return Err(SqlSurfaceError::unsupported(
+                "GROUPING requires at least one argument",
+            ));
+        }
+        let mut args: Vec<Expr> = Vec::new();
+        loop {
+            if args.len() >= MAX_GROUPING_ARGS {
+                return Err(SqlSurfaceError::TooManyArguments {
+                    detail: "GROUPING must have fewer than 32 arguments",
+                });
+            }
+            let saved_calls = self.agg_calls.take();
+            let saved_minus = self.allow_unary_minus;
+            self.allow_unary_minus = true;
+            let parsed = self.parse_value_expr(0);
+            self.allow_unary_minus = saved_minus;
+            self.agg_calls = saved_calls;
+            args.push(parsed?);
+            if matches!(self.peek(), Some(Token::Punct(','))) {
+                self.advance();
+                continue;
+            }
+            break;
+        }
+        self.expect_punct(')')?;
+        let mut args = args.into_iter();
+        let first = args.next().ok_or_else(|| {
+            SqlSurfaceError::unsupported("GROUPING requires at least one argument")
+        })?;
+        Ok(AggregateItem {
+            func: AggregateFunc::Grouping,
+            arg: AggregateArg::Expr(first),
+            alias: None,
+            distinct: false,
+            extra_args: args.collect(),
+            order_by: Vec::new(),
+            filter: Vec::new(),
         })
     }
 
@@ -6963,7 +7038,13 @@ impl<'a> Parser<'a> {
             ));
         }
         precheck_group_key_tokens(&self.tokens, start, end)?;
-        let expr = self.parse_value_expr(0)?;
+        // 式キーは投影項目・集計引数と同じく単項マイナスを受理する（`GROUP BY -n`・`ROLLUP(-n)`。
+        // `GROUPING(-n)` が構造一致で引けるようにする。SQL-59）。
+        let saved_minus = self.allow_unary_minus;
+        self.allow_unary_minus = true;
+        let parsed = self.parse_value_expr(0);
+        self.allow_unary_minus = saved_minus;
+        let expr = parsed?;
         if self.pos != end {
             return Err(SqlSurfaceError::unsupported(
                 "unsupported GROUP BY expression",
@@ -15288,6 +15369,7 @@ fn check_body_aggregate(
                 if matches!(agg.func, AggregateFunc::StringAgg | AggregateFunc::ArrayAgg)
                     || agg.func.is_variance_family()
                     || agg.func.is_bool_agg()
+                    || agg.func.is_grouping()
                 {
                     return Err(body_form_unsupported());
                 }
@@ -18730,6 +18812,12 @@ fn parse_join_aggregate_item(p: &mut Parser<'_>) -> Result<JoinSelectItem, SqlSu
             detail: format!("{} is not supported in JOIN", func.default_alias()),
         });
     }
+    // `GROUPING()` も JOIN は対象外（SQL-59・Issue #1823。JOIN 集計はグルーピングセットを持たない）。
+    if func.is_grouping() {
+        return Err(SqlSurfaceError::FeatureNotSupported {
+            detail: "grouping is not supported in JOIN".to_string(),
+        });
+    }
     // `bool_and` / `bool_or` / `every` も JOIN は対象外（SQL-57・Issue #1805）。
     if func.is_bool_agg() {
         return Err(SqlSurfaceError::FeatureNotSupported {
@@ -21010,6 +21098,7 @@ fn aggregate_statement_from_resolved(
                     if matches!(agg.func, AggregateFunc::StringAgg | AggregateFunc::ArrayAgg)
                         || agg.func.is_variance_family()
                         || agg.func.is_bool_agg()
+                        || agg.func.is_grouping()
                     {
                         return Err(SqlSurfaceError::unsupported(
                             "aggregate over a view with an aggregate/LIMIT body supports only column arguments",

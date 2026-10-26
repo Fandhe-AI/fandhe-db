@@ -6336,6 +6336,11 @@ pub(crate) enum AggregateInput {
         source: crate::sql::udf_call::BoundExpr,
         program: crate::sql::expr_program::ExprProgram,
     },
+    /// `GROUPING(<式>, ...)` の引数（SQL-59 (1)・Issue #1823）。各要素は `BoundGroupBy::keys`
+    /// （= `GroupByClause::columns`）の添字で、引数順・重複可。行を観測しない擬似集計の入力で、
+    /// 値は `sql::group_by::finish_groups` が「現在のセットにそのキーが含まれるか」から計算する。
+    /// `func == Grouping` のときだけこの variant になる。
+    GroupingKeys(Vec<usize>),
     /// `Scalar` 以外の型へ束縛された式の集計引数（SQL-57・Issue #1809）。`COUNT`／
     /// `COUNT(DISTINCT)` は Text／Bool／Date／Timestamp／Time／TimestampTz、`MIN`／`MAX` は
     /// Bool を除く同じ型を受理する（`SUM`／`AVG`・分散系は `42883`）。`ty` は束縛時の
@@ -6548,6 +6553,12 @@ impl BoundAggregateItem {
         if func.is_variance_family() {
             return Err(SqlSurfaceError::unsupported(
                 "variance aggregates are not supported by this interface",
+            ));
+        }
+        // `GROUPING()` も SQL 表層のみ（SQL-59・Issue #1823。NoSQL の `aggregate` は対象外）。
+        if func.is_grouping() {
+            return Err(SqlSurfaceError::unsupported(
+                "GROUPING is not supported by this interface",
             ));
         }
         // `bool_and` / `bool_or` / `every` も SQL 表層のみ（SQL-57・Issue #1805）。
@@ -7507,6 +7518,8 @@ fn resolve_aggregate_item_input(
     schema: &TableSchema,
     udfs: &crate::sql::udf_call::UdfRegistry,
     node_budget: &mut usize,
+    group_by_columns: &[String],
+    key_exprs_norm: &[Expr],
 ) -> Result<AggregateInput, SqlSurfaceError> {
     if item.func == crate::sql::allowlist::AggregateFunc::StringAgg {
         return resolve_string_agg_input(item, schema, udfs, node_budget);
@@ -7517,11 +7530,60 @@ fn resolve_aggregate_item_input(
     if item.func.is_bool_agg() {
         return resolve_bool_agg_input(item.func, &item.arg, schema, udfs, node_budget);
     }
+    if item.func.is_grouping() {
+        return resolve_grouping_input(item, group_by_columns, key_exprs_norm, schema);
+    }
     if item.distinct {
         resolve_count_distinct_input(&item.arg, schema, udfs, node_budget)
     } else {
         resolve_aggregate_input(item.func, &item.arg, schema, udfs, node_budget)
     }
+}
+
+/// `GROUPING(<式>, ...)` の引数を `GROUP BY` キーの添字列へ束縛する（SQL-59 (1)・Issue #1823。
+/// [`resolve_aggregate_item_input`] からのみ呼ばれる）。各引数は、式キーと構造一致する部分木を
+/// 予約内部名へ置き換えた（[`substitute_group_key_exprs`]）うえで、`group_by_columns`（全セットの
+/// キーの和集合）のいずれかの裸識別子でなければならない。キーでない既存の列は `42803`、未知の
+/// 列は `42703`、それ以外の式（キーと一致しない式・`$n`・部分クエリ等）は `42803`。
+/// `GROUP BY` が無い文（`group_by_columns` が空）は常に `42803`。エラー文言は固定で、列の値・
+/// 他テナントの情報を含めない。判定は文の形とスキーマだけで決まり、行には依存しない。
+fn resolve_grouping_input(
+    item: &crate::sql::allowlist::AggregateItem,
+    group_by_columns: &[String],
+    key_exprs_norm: &[Expr],
+    schema: &TableSchema,
+) -> Result<AggregateInput, SqlSurfaceError> {
+    use crate::sql::allowlist::AggregateArg;
+
+    let not_a_key = || SqlSurfaceError::GroupingError {
+        detail: "arguments to GROUPING must be grouping expressions of the associated query level",
+    };
+    let AggregateArg::Expr(first) = &item.arg else {
+        return Err(not_a_key());
+    };
+    let mut keys = Vec::with_capacity(item.extra_args.len().saturating_add(1));
+    for arg in std::iter::once(first).chain(item.extra_args.iter()) {
+        match substitute_group_key_exprs(arg, key_exprs_norm) {
+            Expr::Ident(name) => match group_by_columns.iter().position(|c| *c == name) {
+                Some(index) => keys.push(index),
+                None => return Err(ungrouped_column_error(schema, &name)),
+            },
+            other => {
+                // キーと一致しない式でも、式中の未知列は裸の列参照と同じく `42703` を先に返す
+                // （式の形で公開エラー契約が変わらないようにする）。
+                for name in crate::sql::allowlist::expr_bare_idents(&other) {
+                    if crate::sql::allowlist::group_key_expr_placeholder_index(&name).is_none()
+                        && name != "id"
+                        && !schema.columns.iter().any(|c| c.name == name)
+                    {
+                        return Err(SqlSurfaceError::undefined_column(&name));
+                    }
+                }
+                return Err(not_a_key());
+            }
+        }
+    }
+    Ok(AggregateInput::GroupingKeys(keys))
 }
 
 /// `bool_and` / `bool_or` / `every` の引数を束縛する（SQL-57・Issue #1805）。受理するのは
@@ -8240,7 +8302,14 @@ pub(crate) fn bind_aggregate_with_dummy_flags(
                 // （`resolve_count_distinct_input` は `id`/`VECTOR`/`ARRAY`/
                 // `JSON` の扱いが非 DISTINCT の `resolve_aggregate_input` と
                 // 異なる。`item.distinct` は構文層で `COUNT` 限定に絞り込み済み）。
-                let input = resolve_aggregate_item_input(item, schema, udfs, &mut node_budget)?;
+                let input = resolve_aggregate_item_input(
+                    item,
+                    schema,
+                    udfs,
+                    &mut node_budget,
+                    group_by_columns,
+                    &key_exprs_norm,
+                )?;
                 let name = item
                     .alias
                     .clone()
@@ -8323,7 +8392,14 @@ pub(crate) fn bind_aggregate_with_dummy_flags(
                         hidden.push(existing);
                         continue;
                     }
-                    let input = resolve_aggregate_item_input(agg, schema, udfs, &mut node_budget)?;
+                    let input = resolve_aggregate_item_input(
+                        agg,
+                        schema,
+                        udfs,
+                        &mut node_budget,
+                        group_by_columns,
+                        &key_exprs_norm,
+                    )?;
                     let filter =
                         bind_aggregate_filter(&agg.filter, schema, udfs, &mut node_budget)?;
                     let item_index = items.len();
@@ -8384,7 +8460,14 @@ pub(crate) fn bind_aggregate_with_dummy_flags(
                 having_hidden.push(existing);
                 continue;
             }
-            let input = resolve_aggregate_item_input(agg, schema, udfs, &mut node_budget)?;
+            let input = resolve_aggregate_item_input(
+                agg,
+                schema,
+                udfs,
+                &mut node_budget,
+                group_by_columns,
+                &key_exprs_norm,
+            )?;
             let filter = bind_aggregate_filter(&agg.filter, schema, udfs, &mut node_budget)?;
             let item_index = items.len();
             items.push(BoundAggregateItem {
@@ -10634,6 +10717,8 @@ fn aggregate_result_column_type(item: &BoundAggregateItem) -> ColumnType {
     match item.func {
         AggregateFunc::Count => ColumnType::BigInt,
         AggregateFunc::StringAgg => ColumnType::Text,
+        // Issue #1823: セルは `Cell::SignedInteger`（`MIN(integer)` と同じ）。
+        AggregateFunc::Grouping => ColumnType::BigInt,
         AggregateFunc::BoolAnd | AggregateFunc::BoolOr | AggregateFunc::Every => {
             ColumnType::Boolean
         }

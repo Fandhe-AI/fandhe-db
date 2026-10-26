@@ -514,7 +514,9 @@ impl ReferencedColumns {
                         }
                     }
                 }
-                AggregateInput::AllVisible | AggregateInput::IdU64 => {}
+                AggregateInput::AllVisible
+                | AggregateInput::IdU64
+                | AggregateInput::GroupingKeys(_) => {}
             }
         }
         if !metadata_filters.is_empty() {
@@ -950,6 +952,10 @@ pub(crate) enum Accumulator {
     BoolAnd(Option<bool>),
     /// `bool_or`（SQL-57・Issue #1805）。`None` は未観測（確定時 NULL）。
     BoolOr(Option<bool>),
+    /// `GROUPING(...)`（SQL-59 (1)・Issue #1823）。行を観測せず状態も持たない擬似集計。
+    /// [`Accumulator::finish`] は仮の NULL を返し、実値は `sql::group_by::finish_groups` が
+    /// セット番号から計算して上書きする（累積器には現在のセットが見えないため）。
+    Grouping,
     /// `array_agg([DISTINCT] <式> [ORDER BY ...])`（SQL-57・Issue #1801）。状態と意味論は
     /// [`crate::sql::array_agg`] が持つ（`DISTINCT` もこの variant の内部で扱う）。
     ArrayAgg(Box<crate::sql::array_agg::ArrayAggState>),
@@ -1029,6 +1035,7 @@ impl Accumulator {
         use AggregateFunc::{Avg, Count, Max, Min, Sum};
         Ok(match (func, input) {
             (Count, _) => Accumulator::Count(0),
+            (AggregateFunc::Grouping, AggregateInput::GroupingKeys(_)) => Accumulator::Grouping,
             (
                 AggregateFunc::BoolAnd | AggregateFunc::Every,
                 AggregateInput::BooleanColumn(_) | AggregateInput::BoolExpr { .. },
@@ -1231,6 +1238,10 @@ impl Accumulator {
         if matches!(self, Accumulator::CountDistinct { .. }) {
             return self.observe_distinct(input, id, vector, scanned, scratch);
         }
+        // Issue #1823: `GROUPING()` は行を観測しない（値は `finish_groups` が計算する）。
+        if matches!(self, Accumulator::Grouping) {
+            return Ok(());
+        }
         // SQL-57: `string_agg` は入力の評価（値・区切り・ORDER BY の式）も状態側が持つ。
         if let Accumulator::StringAgg(state) = self {
             return match input {
@@ -1390,6 +1401,7 @@ impl Accumulator {
     /// 拒否する（[`Self::observe_present`] と同じ方針）。
     pub(crate) fn observe_present_n(&mut self, n: u64) -> Result<(), SqlSurfaceError> {
         match self {
+            Accumulator::Grouping => Ok(()),
             Accumulator::Count(current) => {
                 *current = current.checked_add(n).ok_or_else(|| {
                     SqlSurfaceError::numeric_out_of_range("COUNT exceeds u64 range")
@@ -2075,6 +2087,8 @@ impl Accumulator {
             Accumulator::BoolAnd(b) | Accumulator::BoolOr(b) => {
                 b.map(Cell::Bool).unwrap_or(Cell::Null)
             }
+            // 仮の値。`sql::group_by::finish_groups` が直後にセット番号から確定値で上書きする。
+            Accumulator::Grouping => Cell::Null,
             Accumulator::ArrayAgg(state) => match state.finish()? {
                 Some(array) => Cell::Array(array),
                 None => Cell::Null,
@@ -2830,6 +2844,8 @@ pub(crate) fn aggregate_result_type(
         // SQL-57・Issue #1809: 非スカラー式の `MIN`/`MAX` は式の型がそのまま結果型。
         (Min | Max, AggregateInput::TypedExpr { ty, .. }) => typed_expr_column_type(*ty)?,
         (AggregateFunc::StringAgg, AggregateInput::StringAgg(_)) => ColumnType::Text,
+        // Issue #1823・SQL-59: `GROUPING()` は int4 のビットマスク（セルは `Cell::SignedInteger`）。
+        (AggregateFunc::Grouping, AggregateInput::GroupingKeys(_)) => ColumnType::Integer,
         (
             AggregateFunc::BoolAnd | AggregateFunc::BoolOr | AggregateFunc::Every,
             AggregateInput::BooleanColumn(_) | AggregateInput::BoolExpr { .. },
@@ -3052,7 +3068,10 @@ fn finish_aggregate_result(
 pub(crate) fn count_star_only(items: &[crate::sql::parser::BoundAggregateItem]) -> bool {
     !items.is_empty()
         && items.iter().all(|item| {
-            item.func == crate::sql::allowlist::AggregateFunc::Count
+            // Issue #1823: `GROUPING()` は行を観測しない（値は `finish_groups` が計算する）ため、
+            // 近道の可否に影響しない。
+            item.func.is_grouping()
+                || (item.func == crate::sql::allowlist::AggregateFunc::Count
                 && matches!(item.input, AggregateInput::AllVisible)
                 // SQL-25 (c)・TASK-209: `COUNT(DISTINCT *)` は構文段
                 // （`Parser::parse_aggregate_item`）で既に `42601` として拒否
@@ -3063,7 +3082,7 @@ pub(crate) fn count_star_only(items: &[crate::sql::parser::BoundAggregateItem]) 
                 && !item.distinct
                 // SQL-57・Issue #1806: `FILTER` つきは行ごとの判定が要るため、索引由来の
                 // 候補数をそのまま加算する近道は使えない（全走査・候補再適用へ落とす）。
-                && item.filter.is_none()
+                && item.filter.is_none())
         })
 }
 

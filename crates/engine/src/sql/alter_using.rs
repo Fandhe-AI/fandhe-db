@@ -363,6 +363,7 @@ pub(crate) fn redact_row_conversion_error(e: SqlSurfaceError) -> SqlSurfaceError
         | E::WindowingError { .. }
         | E::StatementTooComplex { .. }
         | E::TooManyColumns { .. }
+        | E::TooManyArguments { .. }
         | E::CollationMismatch
         | E::InvalidEscapeSequence { .. }
         | E::IndeterminateCollation

@@ -2173,6 +2173,39 @@ fn grouping_set_masks(
     Ok(Some(masks))
 }
 
+/// `GROUPING(<キー>, ...)` の値（SQL-59 (1)・Issue #1823）を計算する。`keys` は引数のキー添字
+/// （引数順）、`in_set` は「そのキーが現在のグルーピングセットに含まれるか」。含まれない引数 i が
+/// ビット 1 で、最初の引数が最上位ビット（`n` 個なら i 番目は `1 << (n - 1 - i)`）。引数は構文段が
+/// 31 個以下に制限済みのため結果は int4 に収まるが、シフト・加算は `checked_*` で行い、
+/// 範囲外は内部不整合として `XX000`（panic・黙った切り詰めにしない）。
+fn grouping_value(
+    keys: &[usize],
+    in_set: impl Fn(usize) -> Result<bool, SqlSurfaceError>,
+) -> Result<i64, SqlSurfaceError> {
+    let n = u32::try_from(keys.len())
+        .map_err(|_| accumulator_bug("GROUPING argument count does not fit in u32"))?;
+    let mut value: i64 = 0;
+    for (i, &key_index) in keys.iter().enumerate() {
+        if in_set(key_index)? {
+            continue;
+        }
+        let shift = u32::try_from(i)
+            .ok()
+            .and_then(|i| n.checked_sub(1)?.checked_sub(i))
+            .ok_or_else(|| accumulator_bug("GROUPING bit position out of range"))?;
+        let bit = 1i64
+            .checked_shl(shift)
+            .ok_or_else(|| accumulator_bug("GROUPING bit position out of range"))?;
+        value = value
+            .checked_add(bit)
+            .ok_or_else(|| accumulator_bug("GROUPING value overflowed"))?;
+    }
+    if i32::try_from(value).is_err() {
+        return Err(accumulator_bug("GROUPING value exceeds int4"));
+    }
+    Ok(value)
+}
+
 /// 複数キー集計表 `groups` へ可視行 1 件を累積する（既存グループなら累積のみ、新規なら予算検査 →
 /// 成分の所有化 → 累積 → 挿入）。通常の複数キー経路と、グルーピングセット（Issue #1822・SQL-59）の
 /// セットごとの集計表が共有する。`group_total` は予算判定に使う「全表合計のグループ数」で、
@@ -2280,11 +2313,31 @@ fn finish_groups(
     // 式キーの所有値（`finished` がソート完了まで全グループ分保持する）の累計見積り
     // バイト数。所有値化の前に [`OrderKeyCharge`] 経由で [`ResultBudget`] へ課金する。
     let mut order_key_bytes: usize = 0;
+    // Issue #1823・SQL-59 (1): `GROUPING()` 項目の値はセット番号から決まるため、セットごとの
+    // キー所属マスクを 1 回だけ作る（通常の `GROUP BY` は `None` で常に 0）。
+    let set_masks = grouping_set_masks(group_by)?;
     for (set_index, key, accs) in group_entries {
-        let cells: Vec<Cell> = accs
+        let mut cells: Vec<Cell> = accs
             .into_iter()
             .map(Accumulator::finish)
             .collect::<Result<Vec<_>, _>>()?;
+        // 従来形の `HAVING`・式の `HAVING`／`ORDER BY`・投影が同じセルを読むよう、`finish` 直後に
+        // 仮の NULL を確定値へ上書きする。
+        for (item, cell) in bound.items.iter().zip(cells.iter_mut()) {
+            if let crate::sql::parser::AggregateInput::GroupingKeys(keys) = &item.input {
+                let in_set = |key_index: usize| -> Result<bool, SqlSurfaceError> {
+                    match &set_masks {
+                        None => Ok(true),
+                        Some(masks) => masks
+                            .get(set_index)
+                            .and_then(|mask| mask.get(key_index))
+                            .copied()
+                            .ok_or_else(|| accumulator_bug("GROUPING key index out of bounds")),
+                    }
+                };
+                *cell = Cell::SignedInteger(grouping_value(keys, in_set)?);
+            }
+        }
         let mut keep = true;
         for h in &group_by.having {
             let cell = cells
@@ -2675,6 +2728,13 @@ impl<'a> GroupedRowAccumulator<'a> {
         max_result_bytes: usize,
         group_limits: crate::group_by_limits::GroupByLimits,
     ) -> Result<Self, SqlSurfaceError> {
+        // Issue #1823・SQL-59 (1): `GROUPING()` はビューの外側では未対応（fail-closed。グルーピング
+        // セットと同じく、集計表のセット番号を持たない文脈で値を黙って作らない）。
+        if bound.items.iter().any(|item| item.func.is_grouping()) {
+            return Err(SqlSurfaceError::feature_not_supported(
+                "GROUPING is not supported over a view",
+            ));
+        }
         if let Some(group_by) = bound.group_by.as_ref() {
             check_configured_column_count(group_by.keys.len(), group_limits)?;
             // Issue #1822・SQL-59: 評価後射影形ビューの外側集計はグルーピングセットの実行段を

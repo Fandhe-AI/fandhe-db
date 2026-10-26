@@ -2,7 +2,7 @@
 
 ## ステータス
 
-Accepted・構文段と展開（Issue #1821）に加え、実行段（セットごとの集約と結果の合成。Issue #1822）も実装済み。
+Accepted・構文段と展開（Issue #1821）に加え、実行段（セットごとの集約と結果の合成。Issue #1822）と `GROUPING()` 関数（Issue #1823）も実装済み。
 
 ## ポインタ
 
@@ -10,7 +10,7 @@ Accepted・構文段と展開（Issue #1821）に加え、実行段（セット�
   エラー分類は `docs/spec/04-behavior/error-format.md` の `54001`・`54011` の行
 - 前提: [multi-column-group-by.md](multi-column-group-by.md)・[order-by-having-expressions.md](order-by-having-expressions.md)（式キー・構造一致。Issue #1817・#1818）
 - 後続: セットごとの集約の実行と結果の合成（Issue #1822）、`GROUPING()` 関数（Issue #1823）、
-  他機能との併用の検証（Issue #1824）
+  他機能との併用の検証（Issue #1824）。`54023` の行は #1823
 
 ## 目的
 
@@ -102,9 +102,37 @@ Issue #1821 の時点では、実行段が無いまま通常の `GROUP BY` と�
 - **fail-closed の維持**: ビュー本体・ビュー外側集計・`GroupedRowAccumulator`（評価後射影形ビュー）は
   `0A000`（または構文段の `42601`）のまま。通常の `GROUP BY` として誤った行を返す経路は作らない
 
+## Issue #1823 追記: `GROUPING()` 関数
+
+エラー分類は `docs/spec/04-behavior/error-format.md` の `54023` の行（SQL-59 (1)）。
+
+- **方式（擬似集計）**: `GROUPING` を集計関数名として扱い（`AggregateFunc::Grouping`）、既存の集計呼び出しの
+  仕組み（SELECT・`HAVING`・`ORDER BY`・式項目での内部名への脱糖と重複排除、参照列の公開範囲検査）に乗せる。
+  累積器（`Accumulator::Grouping`）は行を観測せず状態を持たない。値は `finish_groups` が `finish` の直後
+  （従来形の `HAVING`・式の `HAVING`／`ORDER BY`・投影より前）に、セット番号とセットごとのキー所属マスクから
+  計算して上書きする。値を NULL かどうかから推定しない（データ上の NULL と小計の NULL を区別するため）
+- **ビット規則**: 引数 i は、そのキーが現在のセットに含まれないとき 1。最初の引数が最上位ビット
+  （`n` 個なら i 番目は `1 << (n - 1 - i)`）。結果型は `integer`（int4）で、既定の列名は `grouping`。
+  通常の `GROUP BY`（グルーピングセットなし）は常に 0。同じキーの重複引数は引数ごとにビットを持つ
+- **引数**: `GROUP BY` のキー（列名、または構造一致するキー式。全セットの和集合）に限る。キーでない既存の列・
+  キーと一致しない式・`GROUP BY` なし・`GROUP BY ()` は `42803`、未知の列は `42703`
+- **上限と判定順**: 引数は 31 個まで。32 個目へ進む時点で確保・束縛の前に `54023`（`ErrorClass::TooManyArguments`。
+  HTTP 400）。構文エラー（`42601`）→ `54023` → 既存の `54011`・`54001` → 束縛段の `42703`・`42803` の順
+- **構文**: 引数 0 個・`*`・`DISTINCT`・`FILTER`・内側 `ORDER BY` は `42601`。入れ子の集計・`GROUPING` も
+  既存規約どおり `42601`。`WHERE` など集計を置けない位置は既存の拒否のまま
+- **fail-closed**: FROM なしは `42803`、JOIN 集計は `0A000`、ビュー（本体・外側集計）は `0A000`、
+  NoSQL の直接構築入口（`BoundAggregateItem::bind`）は `42601`。CTE の主クエリ・集合演算の枝・
+  サブクエリは従来どおり集計式項目を許さず `42601`
+- **索引経路**: `GROUPING()` は行を観測しないため、単一 `TEXT` キーの索引の列挙形・候補走査形でも
+  `COUNT(*)` のみの近道を妨げない（値は常に 0）
+- **互換性**: `grouping` は集計関数名になり、`CREATE FUNCTION grouping(...)` は予約名として拒否される
+  （PostgreSQL でも `GROUPING` は関数名に使えない）。`AggregateFunc`・`ErrorClass` の variant 追加は
+  公開 enum の破壊的変更
+- **検証**: PostgreSQL 17 の公開仕様から導出した固定値で検証した（実機との照合は未実施）。
+  `crates/engine/tests/sql59_grouping_function.rs`
+
 ## 対象外
 
-- `GROUPING()` 関数と `54023`（Issue #1823）
 - FILTER・DISTINCT・HAVING・ORDER BY・ウィンドウとの併用の検証（Issue #1824）
 - `GROUP BY DISTINCT`・`GROUP BY ALL`、トップレベルの複合 `GROUP BY (a, b)` の平坦化（`42601` のまま）
 - 上限（4,096・12・8 段）の設定化

@@ -632,6 +632,21 @@ pub(crate) fn check_aggregate_columns_within_view(
             "GROUPING SETS, ROLLUP and CUBE are not supported over a view",
         ));
     }
+    // Issue #1823・SQL-59 (1): `GROUPING()` もビューの外側では未対応（fail-closed）。SELECT 項目・
+    // 式項目の中・`HAVING`／`ORDER BY` の集計呼び出しのいずれも対象にする。
+    let has_grouping = items.iter().any(|item| match item {
+        AggregateSelectItem::Aggregate(agg) => agg.func.is_grouping(),
+        AggregateSelectItem::Expr { aggregates, .. } => {
+            aggregates.iter().any(|agg| agg.func.is_grouping())
+        }
+        AggregateSelectItem::GroupKey { .. } => false,
+    }) || group_by
+        .is_some_and(|g| g.having_aggregates.iter().any(|agg| agg.func.is_grouping()));
+    if has_grouping {
+        return Err(SqlSurfaceError::feature_not_supported(
+            "GROUPING is not supported over a view",
+        ));
+    }
     let Some(columns) = view_columns else {
         return Ok(());
     };

@@ -116,7 +116,9 @@ pub(crate) fn eval_aggregate_input<'a>(
                 "array_agg input observed by a non-array_agg accumulator",
             ))
         }
-        AggregateInput::AllVisible => V::Present,
+        // `GROUPING()`（Issue #1823）は行を観測しない擬似集計。値は `finish_groups` が計算し、
+        // 累積器は何も保持しないため「行あり」だけを渡す（`Accumulator::Grouping` は無視する）。
+        AggregateInput::AllVisible | AggregateInput::GroupingKeys(_) => V::Present,
         // `row.embedding` が空 = 未設定（NULL）という既存契約。`dim` だけで判定する。
         AggregateInput::VectorColumnPresence => {
             if vector.dim == 0 {

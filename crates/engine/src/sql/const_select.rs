@@ -448,6 +448,14 @@ fn bind_aggregate_call(
             detail: format!("{} without FROM is not supported", agg.func.default_alias()),
         });
     }
+    // `GROUPING()` は `GROUP BY` のキーだけを引数に取れる。FROM なしの SELECT には `GROUP BY` が
+    // 無いため常に `42803`（SQL-59・Issue #1823。固定文言のみ）。
+    if agg.func.is_grouping() {
+        return Err(SqlSurfaceError::GroupingError {
+            detail:
+                "arguments to GROUPING must be grouping expressions of the associated query level",
+        });
+    }
     // `bool_and` / `bool_or` / `every` も FROM なしは対象外（SQL-57・Issue #1805）。
     if agg.func.is_bool_agg() {
         return Err(SqlSurfaceError::FeatureNotSupported {

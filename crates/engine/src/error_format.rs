@@ -94,7 +94,7 @@ macro_rules! define_error_classes {
 pub(crate) const SHARED_WIRE_CODES: &[&str] = &["23502", "23505", "22023"];
 
 define_error_classes! {
-    count = 84;
+    count = 85;
 
     /// 構文上受理された SQL の値・引数が不正（`22000`）。
     /// [`crate::sql::allowlist::SqlSurfaceError::InvalidInput`] の写像。
@@ -443,6 +443,10 @@ define_error_classes! {
     /// `CUBE` の要素数が上限を超えた（`54011`。Issue #1821・SQL-59 のポインタ）。固定文言のみ。
     /// [`crate::sql::allowlist::SqlSurfaceError::TooManyColumns`] の写像。
     TooManyColumns => ("54011", "TOO_MANY_COLUMNS"),
+    /// `GROUPING()` の引数が上限（31 個）を超えた（`54023`。Issue #1823・SQL-59 のポインタ）。
+    /// 文の形だけで決まり、行・テナントに依存しない。固定文言のみ。
+    /// [`crate::sql::allowlist::SqlSurfaceError::TooManyArguments`] の写像。
+    TooManyArguments => ("54023", "TOO_MANY_ARGUMENTS"),
     /// 明示の `CAST`／`::` で、型の組に変換の対応が無い（`42846`。Issue #1590・SQL-47 のポインタ。
     /// 規則表は `docs/design/cast-conversion-rules.md`）。型の組だけで束縛時に決まり、値が NULL でも
     /// 同じく返る。文言は静的な型名だけで、値・列名・テナント情報を含めない。
