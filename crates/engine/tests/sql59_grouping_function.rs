@@ -435,6 +435,33 @@ fn arguments_must_be_grouping_keys() {
         err_code(&core, T, "SELECT grouping(zzz) FROM docs GROUP BY lang"),
         "42703"
     );
+    // キーでない式の中の未知列も 42703（式の形でエラー契約を変えない）。
+    assert_eq!(
+        err_code(
+            &core,
+            T,
+            "SELECT grouping(upper(zzz)) FROM docs GROUP BY lang"
+        ),
+        "42703"
+    );
+}
+
+#[test]
+fn unary_minus_key_is_accepted_in_grouping() {
+    let (core, _g) = build("sql1823-minus", None);
+    // 単項マイナスの式キーは GROUP BY と同様に GROUPING の引数へ書ける（構文・束縛で拒否されない）。
+    let mut failures = Vec::new();
+    for sql in [
+        "SELECT grouping(-n) FROM docs GROUP BY ROLLUP(-n)",
+        "SELECT grouping(-n) FROM docs GROUP BY -n",
+        "SELECT count(*) FROM docs GROUP BY -n",
+        "SELECT count(*) FROM docs GROUP BY ROLLUP(-n)",
+    ] {
+        if let Err(e) = core.execute_sql(&ctx_for(T), sql) {
+            failures.push(format!("{sql}: {}", e.wire_code()));
+        }
+    }
+    assert!(failures.is_empty(), "{failures:?}");
 }
 
 #[test]

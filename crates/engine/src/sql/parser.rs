@@ -7568,7 +7568,19 @@ fn resolve_grouping_input(
                 Some(index) => keys.push(index),
                 None => return Err(ungrouped_column_error(schema, &name)),
             },
-            _ => return Err(not_a_key()),
+            other => {
+                // キーと一致しない式でも、式中の未知列は裸の列参照と同じく `42703` を先に返す
+                // （式の形で公開エラー契約が変わらないようにする）。
+                for name in crate::sql::allowlist::expr_bare_idents(&other) {
+                    if crate::sql::allowlist::group_key_expr_placeholder_index(&name).is_none()
+                        && name != "id"
+                        && !schema.columns.iter().any(|c| c.name == name)
+                    {
+                        return Err(SqlSurfaceError::undefined_column(&name));
+                    }
+                }
+                return Err(not_a_key());
+            }
         }
     }
     Ok(AggregateInput::GroupingKeys(keys))

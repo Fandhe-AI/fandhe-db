@@ -6594,7 +6594,8 @@ impl<'a> Parser<'a> {
     /// `extra_args` に積む。`DISTINCT`・`*`・空引数・内側 `ORDER BY`・`FILTER` は受理しない
     /// （いずれも `42601`。`FILTER` は呼び出し後の構文検査で落ちる）。引数は 31 個が上限で、
     /// 32 個目へ進む時点で確保前に `54023` を返す（untrusted 入力の無制限確保を作らない）。
-    /// 引数の解析中は入れ子集計の収集と単項マイナス拡張を止める（他の集計引数と同じ規約）。
+    /// 引数の解析中は入れ子集計の収集だけを止め、単項マイナスは `GROUP BY` 式と同様に受理する
+    /// （`GROUPING(-n)` が `GROUP BY ROLLUP(-n)` のキーと構造一致できるようにするため）。
     fn parse_grouping_call_rest(&mut self) -> Result<AggregateItem, SqlSurfaceError> {
         if matches!(self.peek(), Some(Token::Punct(')'))) {
             return Err(SqlSurfaceError::unsupported(
@@ -6610,7 +6611,7 @@ impl<'a> Parser<'a> {
             }
             let saved_calls = self.agg_calls.take();
             let saved_minus = self.allow_unary_minus;
-            self.allow_unary_minus = false;
+            self.allow_unary_minus = true;
             let parsed = self.parse_value_expr(0);
             self.allow_unary_minus = saved_minus;
             self.agg_calls = saved_calls;
@@ -7037,7 +7038,13 @@ impl<'a> Parser<'a> {
             ));
         }
         precheck_group_key_tokens(&self.tokens, start, end)?;
-        let expr = self.parse_value_expr(0)?;
+        // 式キーは投影項目・集計引数と同じく単項マイナスを受理する（`GROUP BY -n`・`ROLLUP(-n)`。
+        // `GROUPING(-n)` が構造一致で引けるようにする。SQL-59）。
+        let saved_minus = self.allow_unary_minus;
+        self.allow_unary_minus = true;
+        let parsed = self.parse_value_expr(0);
+        self.allow_unary_minus = saved_minus;
+        let expr = parsed?;
         if self.pos != end {
             return Err(SqlSurfaceError::unsupported(
                 "unsupported GROUP BY expression",
