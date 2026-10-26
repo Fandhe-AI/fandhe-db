@@ -6705,6 +6705,11 @@ pub(crate) struct BoundGroupBy {
     /// 知らないため既定 `None`。呼び出し段（`core`）が [`BoundAggregate::with_result_cap`] で
     /// 設定し、HAVING なしのときだけ新規グループ追加時に `offset + cap` 超過で中断する。
     pub(crate) result_cap: Option<usize>,
+    /// `ROLLUP`・`CUBE`・`GROUPING SETS` の展開後のセット列（Issue #1822・SQL-59）。各要素は
+    /// `keys` の添字を昇順・重複なしで並べたもの（空は総計）。`keys` は
+    /// `GroupByClause::columns` と 1:1 で同順のため添字をそのまま引き継ぐ。`None` は通常の
+    /// 単一セット。直接構築経路（NoSQL）は常に `None`。
+    pub(crate) grouping_sets: Option<Vec<Vec<usize>>>,
 }
 
 /// 束縛済みの `GROUP BY` 式キー 1 つ（Issue #1817・SQL-58）。基表スキーマに対して投影モード
@@ -7095,6 +7100,7 @@ impl BoundAggregate {
                 with_ties: false,
                 offset: 0,
                 result_cap: None,
+                grouping_sets: None,
             }),
             ungrouped_having: None,
         })
@@ -8190,16 +8196,6 @@ pub(crate) fn bind_aggregate_with_dummy_flags(
 ) -> Result<BoundAggregate, SqlSurfaceError> {
     use crate::sql::allowlist::AggregateSelectItem;
 
-    // Issue #1821・SQL-59: `ROLLUP`・`CUBE`・`GROUPING SETS` の実行段（セットごとの集約と結果の
-    // 合成）は Issue #1822 で実装する。それまでに通常の `GROUP BY` として実行すると誤った行を
-    // 黙って返すため、束縛の入口で拒否する（fail-closed）。`GROUP BY ()` を「GROUP BY なしの
-    // HAVING」（`columns` が空）と取り違えないよう、その判定より前に置く。
-    if stmt.group_by().is_some_and(|g| g.grouping_sets.is_some()) {
-        return Err(SqlSurfaceError::feature_not_supported(
-            "GROUPING SETS, ROLLUP and CUBE are not supported yet",
-        ));
-    }
-
     let mut node_budget = crate::sql::udf_call::MAX_EXPR_NODES;
 
     // GROUP BY 列名一覧（`SELECT` リストの `GroupKey` 項目の照合・`ORDER BY`/
@@ -8420,7 +8416,13 @@ pub(crate) fn bind_aggregate_with_dummy_flags(
     // Issue #1819・SQL-58 (4): キー 0 個の句（`GROUP BY` なしの `HAVING`）は `group_by` に入れず
     // `ungrouped_having` へ分ける（単一行集計のまま、終端処理が `HAVING` を当てる）。
     let (group_by, ungrouped_having) = match (stmt.group_by(), bound_clause) {
-        (Some(clause), Some(bound)) if clause.columns.is_empty() => (None, Some(bound)),
+        // Issue #1822・SQL-59: `GROUP BY ()`・`GROUPING SETS ((), ())` はキー 0 個でも
+        // グループ化あり（セット列を持つ）として実行器へ回す。
+        (Some(clause), Some(bound))
+            if clause.columns.is_empty() && clause.grouping_sets.is_none() =>
+        {
+            (None, Some(bound))
+        }
         (_, bound) => (bound, None),
     };
 
@@ -10590,6 +10592,17 @@ fn bind_group_by_clause(
     if having_exprs.is_empty() && order_exprs.is_empty() {
         group_row_mask.clear();
     }
+    // Issue #1822・SQL-59: 展開後のセット列の添字が `keys` の範囲内であることを多層防御で確認する
+    // （構文段が保証する不変条件。破れていれば内部不整合として拒否する）。
+    let grouping_sets = clause.grouping_sets.clone();
+    if let Some(sets) = &grouping_sets {
+        let key_count = keys.len();
+        if sets.iter().flatten().any(|&i| i >= key_count) {
+            return Err(crate::sql::aggregate::accumulator_bug(
+                "grouping set index out of bounds",
+            ));
+        }
+    }
     Ok(BoundGroupBy {
         keys,
         key_exprs,
@@ -10602,6 +10615,7 @@ fn bind_group_by_clause(
         with_ties: clause.with_ties,
         offset,
         result_cap: None,
+        grouping_sets,
     })
 }
 

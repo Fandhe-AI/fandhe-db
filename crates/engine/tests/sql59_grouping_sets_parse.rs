@@ -2,7 +2,7 @@
 //! （Issue #1821、対象ビヘイビア: SQL-59。ポインタ: `docs/spec/04-behavior/` の SQL-59）。
 //!
 //! `EngineCore::execute_sql` の production 経路で、(1) 構文を受理して展開した上で、実行段
-//! （Issue #1822）が入るまで `0A000` で fail-closed に拒否し行を返さないこと、(2) 上限超過の
+//! （Issue #1822）が実行して行を返すこと（結果の網羅は `sql59_grouping_sets_exec`）、(2) 上限超過の
 //! エラー契約（`54011`・`54001`・`54000`。`wire_code`）とその判定順、(3) 従来形の `GROUP BY`
 //! が変わらないこと、(4) トップレベル以外の文脈での拒否を固定する。展開結果そのものの網羅は
 //! `sql::grouping_sets` と `sql::allowlist` の単体テストが担う。
@@ -80,7 +80,7 @@ fn err_code(core: &EngineCore, sql: &str) -> &'static str {
 }
 
 #[test]
-fn valid_grouping_syntax_is_fail_closed_until_the_executor_lands() {
+fn valid_grouping_syntax_is_accepted_and_executed() {
     let (core, _g) = build("sql59-parse-gate");
     for gb in [
         "ROLLUP(lang, kind)",
@@ -92,8 +92,11 @@ fn valid_grouping_syntax_is_fail_closed_until_the_executor_lands() {
         "()",
     ] {
         let sql = format!("SELECT count(*) FROM docs GROUP BY {gb}");
-        // 構文は受理して展開するが、実行はせず行も返さない（0A000）。
-        assert_eq!(err_code(&core, &sql), "0A000", "{sql}");
+        // 構文を受理して展開し、実行段（Issue #1822）がセットごとの集計を返す。
+        let result = core
+            .execute_sql(&ctx_for("tenant-a"), &sql)
+            .unwrap_or_else(|e| panic!("query must succeed: {sql}: {e:?}"));
+        assert!(!result.rows.is_empty(), "{sql}");
     }
 }
 
@@ -131,13 +134,18 @@ fn limits_are_checked_before_execution_in_a_fixed_order() {
         (["CUBE(lang, kind, n, lang)"; 4].join(", "), "54001"),
         // 一意キー 9 個は 54000。
         (format!("ROLLUP({})", names(9)), "54000"),
-        // ちょうど 4,096 セットは上限内（構文・展開は通り、実行段が未実装の 0A000）。
-        (format!("CUBE({cube12_dup})"), "0A000"),
     ];
     for (gb, code) in cases {
         let sql = format!("SELECT count(*) FROM docs GROUP BY {gb}");
         assert_eq!(err_code(&core, &sql), code, "{sql}");
     }
+    // ちょうど 4,096 セットは上限内。2 値の lang で 4,095 × 2 + 1 = 8,191 グループとなり、
+    // 既定のグループ数上限（10,000）以内なので実行も成功する。
+    let sql = format!("SELECT count(*) FROM docs GROUP BY CUBE({cube12_dup})");
+    let result = core
+        .execute_sql(&ctx_for("tenant-a"), &sql)
+        .expect("exactly 4096 sets within the group limit must succeed");
+    assert_eq!(result.rows.len(), 8_191);
 }
 
 #[test]

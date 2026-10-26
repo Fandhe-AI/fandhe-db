@@ -625,6 +625,13 @@ pub(crate) fn check_aggregate_columns_within_view(
             "GROUP BY expressions are not supported over a view",
         ));
     }
+    // Issue #1822・SQL-59: グルーピングセット（`ROLLUP`・`CUBE`・`GROUPING SETS`）も式キーと同じく
+    // ビューの外側では未対応（fail-closed。通常の `GROUP BY` として誤った行を返さない）。
+    if group_by.is_some_and(|g| g.grouping_sets.is_some()) {
+        return Err(SqlSurfaceError::feature_not_supported(
+            "GROUPING SETS, ROLLUP and CUBE are not supported over a view",
+        ));
+    }
     let Some(columns) = view_columns else {
         return Ok(());
     };
