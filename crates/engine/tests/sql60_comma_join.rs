@@ -195,10 +195,23 @@ fn comma_join_output_limit_is_judged_on_the_product() {
     let core = core.with_join_limits(JoinSizeLimits::new(8, 100, 5));
     assert_rejected(&core, "SELECT * FROM a, b LIMIT 100", "54000");
     assert_rejected(&core, "SELECT * FROM a, b LIMIT 1", "54000");
-    // 側を跨ぐ等価 WHERE も、昇格が無いため直積の件数で判定される。
+    // 側を跨ぐ等価 WHERE は結合キーへ昇格する（Issue #1834）ため、直積（6 行）が上限 5 を
+    // 超えても一致件数（2 行）で判定され成功する。昇格できない形（非等価・OR 内の等価）は
+    // 直積の件数で判定され 54000 のまま。
+    assert_eq!(
+        run(&core, "SELECT a.v FROM a, b WHERE a.k = b.k LIMIT 100")
+            .rows
+            .len(),
+        2
+    );
     assert_rejected(
         &core,
-        "SELECT a.v FROM a, b WHERE a.k = b.k LIMIT 100",
+        "SELECT a.v FROM a, b WHERE a.k < b.k LIMIT 100",
+        "54000",
+    );
+    assert_rejected(
+        &core,
+        "SELECT a.v FROM a, b WHERE (a.k = b.k OR a.k = b.k) LIMIT 100",
         "54000",
     );
     let core = core.with_join_limits(JoinSizeLimits::new(8, 100, 6));

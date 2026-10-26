@@ -72,6 +72,9 @@ JOIN の WHERE 内のサブクエリ・`EXISTS`、`$n` パラメータ、`NOT`�
    すべて r が NULL の行で、その行は strict な述語で必ず落ちるため結果は変わらない。
    従来の 2 テーブルの簡約規則（欠損側に述語があれば `INNER` 相当）はこの一般規則の
    特殊ケースになる。判定できないとき（relation を跨ぐ `OR` 等）は簡約せず残余評価に倒す
+3'. **結合キーへの昇格**（Issue #1834）: 側を跨ぐ `列 = 列` の conjunct でキー化可能な型のものは、
+   両列が初めて揃う段が INNER ならその段の結合キーへ移し、残余へは入れない（条件の詳細は
+   [inner-join.md](inner-join.md) の「Issue #1834 追記」）。満たさない場合は従来どおり残余へ回る。
 4. **プッシュダウン**: 単一 relation で完結し列同士の比較を含まない conjunct（`OR`・`IN` を
    含む）は、その relation の側スキャン（`ValidatedScan::where_predicates`）へ非修飾の
    `WherePredicate` として渡す。リテラルの型解析・評価は単一テーブル経路
