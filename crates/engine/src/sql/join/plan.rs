@@ -18,6 +18,9 @@
 //! - 単一 relation で完結し列同士の比較を含まない conjunct は、その relation の
 //!   走査へプッシュダウンする（型解析・評価は単一テーブル経路を完全に共有する）。
 //!   それ以外は結合後に行単位で評価する残余（[`ResNode`]）になる。
+//! - 側を跨ぐ `列 = 列` の conjunct でキー化可能な型のものは、両列が初めて揃う段が INNER
+//!   なら、その段の結合キーへ昇格して残余から外す（Issue #1834・`where_promote`）。
+//!   空キー段（CROSS／カンマ）はハッシュ結合になり、出力行数上限は一致件数で判定される。
 //!
 //! ON は `on_split` が結合キー／残余述語へ分類し、キー無しは `42601` で拒否する
 //! （Issue #1829）。残余述語（左のみ・右のみ・混在）は一致条件の一部として
@@ -43,6 +46,7 @@ use super::using::{
     VisibleCol,
 };
 use super::values::{cmp_class, key_class, CmpClass, JoinKeyClass};
+use super::where_promote::promotable_where_key;
 
 /// 解決済みの列参照（どの relation の、側スキャン結果の何番目のセルか）。
 #[derive(Debug, Clone)]
@@ -944,6 +948,30 @@ pub(super) fn build_plan<'a>(
                         step.preserve_acc = false;
                     } else if r <= j {
                         step.preserve_new = false;
+                    }
+                }
+            }
+            // 結合キーへの昇格（Issue #1834・SQL-60 ポインタ）。側を跨ぐ等価葉は `r1`・`r2` の
+            // 両方で null-rejecting なので、上の簡約により段 `r2 - 1` は必ず INNER になる
+            // （INNER 段ではキーと結合後フィルタは連言の順序違いで結果が同一）。それでも
+            // 保存側フラグを実行時に確認し、満たさなければ残余へ回す（フォールバックは常に正しい）。
+            if let Some(p) = promotable_where_key(c, &b.scope)? {
+                let inner = steps
+                    .get(p.step)
+                    .is_some_and(|s| !s.preserve_acc && !s.preserve_new);
+                if inner {
+                    let acc_col =
+                        b.col_from(p.acc.relation(), p.acc.slot(), p.acc.column_type())?;
+                    let new_col =
+                        b.col_from(p.new.relation(), p.new.slot(), p.new.column_type())?;
+                    if let Some(step) = steps.get_mut(p.step) {
+                        step.keys.push(StepKey {
+                            acc_rel: acc_col.rel,
+                            acc_pos: acc_col.pos,
+                            new_pos: new_col.pos,
+                            class: p.class,
+                        });
+                        continue;
                     }
                 }
             }
