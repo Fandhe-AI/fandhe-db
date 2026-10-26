@@ -329,7 +329,7 @@ pub(crate) fn scalar_cell_for(
         Some(ColumnType::SmallInt) => {
             if v.is_finite() && v.fract() == 0.0 && v.abs() <= f64::from(i16::MAX) + 1.0 {
                 let i = i16::try_from(v as i64)
-                    .map_err(|_| invariant("smallint projection value is out of range"))?;
+                    .map_err(|_| SqlSurfaceError::numeric_out_of_range("smallint out of range"))?;
                 Ok(Cell::SignedInteger(i64::from(i)))
             } else {
                 Err(invariant("smallint projection value is not an int2"))
@@ -337,8 +337,10 @@ pub(crate) fn scalar_cell_for(
         }
         Some(ColumnType::Integer) => {
             if v.is_finite() && v.fract() == 0.0 && v.abs() <= f64::from(i32::MAX) + 1.0 {
+                // `abs(int4 の最小値)` のように、整数として正しいが型の範囲を 1 だけ超える値は
+                // PostgreSQL と同じ `22003`（束縛段の不変条件違反ではない。Issue #1812）。
                 let i = i32::try_from(v as i64)
-                    .map_err(|_| invariant("integer projection value is out of range"))?;
+                    .map_err(|_| SqlSurfaceError::numeric_out_of_range("integer out of range"))?;
                 Ok(Cell::SignedInteger(i64::from(i)))
             } else {
                 Err(invariant("integer projection value is not an int4"))

@@ -197,7 +197,7 @@ fn float_arithmetic_keeps_float_types() {
         &core,
         &ctx,
         "SELECT abs(n)+1 FROM t LIMIT 10",
-        ColumnType::Double,
+        ColumnType::Integer,
     );
     assert_type(
         &core,

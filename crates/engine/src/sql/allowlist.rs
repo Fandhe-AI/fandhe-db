@@ -3494,6 +3494,24 @@ pub(crate) fn aggregate_placeholder(j: usize) -> String {
     format!("{AGG_PLACEHOLDER_PREFIX}{j}")
 }
 
+/// 集計式項目（[`AggregateSelectItem::Expr`]）の `AS` 省略時の既定列名（Issue #1812・SQL-42
+/// ポインタ）。通常の投影と同じ PostgreSQL の `FigureColname` 規則（`default_expr_alias`）を
+/// 使い、式の頂点が集計呼び出しの内部名（`CAST` の被演算子など）だった場合は、その集計関数の
+/// 既定名（`sum` 等）へ写す。内部名（制御文字入り）が列名として RowDescription へ漏れない
+/// ようにする。呼び出し元: `parser::bind_aggregate`（結果列名）と
+/// [`AggregateSelectItem::effective_name`]（`HAVING`／`ORDER BY` の名前解決）。
+pub(crate) fn aggregate_expr_default_name(expr: &Expr, aggregates: &[AggregateItem]) -> String {
+    let name = super::parser::default_expr_alias(expr);
+    match aggregate_placeholder_index(&name).and_then(|j| aggregates.get(j)) {
+        Some(agg) => agg.func.default_alias().to_string(),
+        // 内部名接頭辞を持つのに添字が解決できない場合は匿名名へ倒す（漏えい防止）。
+        None if name.starts_with(AGG_PLACEHOLDER_PREFIX) => {
+            super::parser::ANONYMOUS_COLUMN_NAME.to_string()
+        }
+        None => name,
+    }
+}
+
 /// 内部名から集計呼び出しの添字を取り出す。内部名でなければ `None`。
 pub(crate) fn aggregate_placeholder_index(name: &str) -> Option<usize> {
     name.strip_prefix(AGG_PLACEHOLDER_PREFIX)?.parse().ok()
@@ -3581,9 +3599,13 @@ impl AggregateSelectItem {
                 .alias
                 .clone()
                 .unwrap_or_else(|| agg.func.default_alias().to_string()),
-            AggregateSelectItem::Expr { alias, .. } => {
-                alias.clone().unwrap_or_else(|| "?column?".to_string())
-            }
+            AggregateSelectItem::Expr {
+                expr,
+                aggregates,
+                alias,
+            } => alias
+                .clone()
+                .unwrap_or_else(|| aggregate_expr_default_name(expr, aggregates)),
         }
     }
 

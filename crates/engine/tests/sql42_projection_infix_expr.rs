@@ -117,7 +117,8 @@ fn accepts_top_level_arithmetic() {
     let r = run(&core, &ctx, "SELECT -n*2 AS m FROM t LIMIT 10");
     assert_eq!(ints(&r, 0), vec![-2, -4, -6]);
     let r = run(&core, &ctx, "SELECT abs(n)+1 AS m FROM t LIMIT 10");
-    assert_eq!(floats(&r, 0), vec![2.0, 3.0, 4.0]);
+    // Issue #1812: `abs(integer)` は PostgreSQL と同じく integer（整数算術のまま）。
+    assert_eq!(ints(&r, 0), vec![2, 3, 4]);
     let r = run(&core, &ctx, "SELECT id * 2 AS m FROM t LIMIT 10");
     assert_eq!(floats(&r, 0), vec![2.0, 4.0, 6.0]);
     let r = run(&core, &ctx, "SELECT t.n + 1 AS m FROM t LIMIT 10");

@@ -951,17 +951,20 @@ fn sum_bigint_group_by_having_and_order_by_use_exact_numeric() {
     assert_eq!(r.rows[0].cells[0], Cell::Text("small".to_string()));
 }
 
-/// 式内での SUM(BIGINT) は numeric 算術未対応のため fail-closed（22000）。
+/// 式内での SUM(BIGINT) は numeric 算術で正確に計算される（Issue #1812。結果は numeric）。
 #[test]
-fn sum_bigint_inside_expression_is_rejected_fail_closed() {
+fn sum_bigint_inside_expression_is_exact_numeric() {
     let (core, path) = new_core();
     let _guard = CleanupGuard(path);
     let alice = ctx_for("alice");
     insert_b(&core, &alice, 1, "ja", 1, 1);
-    let err = core
+    let r = core
         .execute_sql(&alice, &format!("SELECT SUM(b) + 1 FROM {TABLE}"))
-        .unwrap_err();
-    assert_eq!(err.wire_code(), "22000");
+        .expect("numeric arithmetic over SUM(bigint) must succeed");
+    assert_eq!(
+        r.rows[0].cells[0],
+        Cell::Numeric(engine::numeric::Decimal::from_parts(2, 0).expect("decimal"))
+    );
 }
 
 /// ウィンドウ関数の SUM(BIGINT) も numeric（i64 超の累積も値を返す）。

@@ -138,7 +138,7 @@ fn aggregate_inside_function_arguments() {
             &ctx,
             "SELECT coalesce(sum(n), 0) FROM t WHERE n > 100"
         ),
-        vec![vec![Cell::Float(0.0)]]
+        vec![vec![Cell::SignedInteger(0)]]
     );
     assert_eq!(
         cells(&core, &ctx, "SELECT upper(max(g)) FROM t"),
@@ -154,7 +154,7 @@ fn aggregate_inside_function_arguments() {
     );
     assert_eq!(
         cells(&core, &ctx, "SELECT abs(min(n) - max(n)) FROM t"),
-        vec![vec![Cell::Float(9.0)]]
+        vec![vec![Cell::SignedInteger(9)]]
     );
     assert_eq!(
         cells(&core, &ctx, "SELECT round(avg(d), 1) FROM t"),
@@ -181,8 +181,8 @@ fn aggregate_inside_case_and_cast() {
              FROM t GROUP BY g ORDER BY g"
         ),
         vec![
-            vec![text("a"), Cell::Float(0.0)],
-            vec![text("b"), Cell::Float(1.0)]
+            vec![text("a"), Cell::SignedInteger(0)],
+            vec![text("b"), Cell::SignedInteger(1)]
         ]
     );
     assert_eq!(
@@ -208,7 +208,7 @@ fn filter_clause_inside_expression() {
             &ctx,
             "SELECT coalesce(sum(n) FILTER (WHERE g = 'z'), 0) FROM t"
         ),
-        vec![vec![Cell::Float(0.0)]]
+        vec![vec![Cell::SignedInteger(0)]]
     );
 }
 

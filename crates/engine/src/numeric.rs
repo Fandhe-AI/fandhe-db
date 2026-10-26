@@ -702,6 +702,94 @@ pub(crate) fn avg_unscaled(
     })
 }
 
+/// `NUMERIC` 式の四則演算の種類（[`decimal_arith`]。`sql::udf_call` の
+/// `BuiltinFn::NumericArith` が唯一の呼び出し元。Issue #1812・SQL-42 ポインタ）。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum DecimalOp {
+    Add,
+    Sub,
+    Mul,
+    Div,
+}
+
+/// [`decimal_arith`] の失敗。呼び出し元が `22012`／`22003` へ写像する。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum DecimalArithError {
+    /// 除数が 0。
+    DivisionByZero,
+    /// 結果が 38 桁・scale 38 を超える、または中間値が `i128` を超える（近似せず拒否する）。
+    OutOfRange,
+}
+
+/// 2 つの `Decimal` の四則演算を、丸め以外の近似なしで行う（PostgreSQL の numeric 演算に
+/// 合わせる。加減は scale の大きい方、乗算は scale の和、除算は `select_div_scale` の scale で
+/// half away from zero に丸める）。全演算は checked で、結果は 38 桁以内に収まらなければ
+/// [`DecimalArithError::OutOfRange`]。
+pub(crate) fn decimal_arith(
+    op: DecimalOp,
+    a: &Decimal,
+    b: &Decimal,
+) -> Result<Decimal, DecimalArithError> {
+    let oor = |_| DecimalArithError::OutOfRange;
+    let result = match op {
+        DecimalOp::Add | DecimalOp::Sub => {
+            let scale = a.scale.max(b.scale);
+            let x = rescale_up(a, scale)?;
+            let y = rescale_up(b, scale)?;
+            let v = if op == DecimalOp::Add {
+                x.checked_add(y)
+            } else {
+                x.checked_sub(y)
+            }
+            .ok_or(DecimalArithError::OutOfRange)?;
+            Decimal::from_parts(v, scale).map_err(oor)?
+        }
+        DecimalOp::Mul => {
+            let scale = a.scale.saturating_add(b.scale);
+            let v = a
+                .unscaled
+                .checked_mul(b.unscaled)
+                .ok_or(DecimalArithError::OutOfRange)?;
+            Decimal::from_parts(v, scale).map_err(oor)?
+        }
+        DecimalOp::Div => {
+            if b.unscaled == 0 {
+                return Err(DecimalArithError::DivisionByZero);
+            }
+            let negative = (a.unscaled < 0) != (b.unscaled < 0);
+            let num_abs = a.unscaled.unsigned_abs();
+            let den = b.unscaled.unsigned_abs();
+            let rscale = select_div_scale_wide(
+                U256::from_u128(num_abs),
+                u32::from(a.scale),
+                den,
+                u32::from(b.scale),
+            )
+            .map_err(oor)?;
+            let factor = pow10(b.scale).ok_or(DecimalArithError::OutOfRange)?;
+            let num = U256::from_u128(num_abs)
+                .checked_mul_u128(factor.unsigned_abs())
+                .ok_or(DecimalArithError::OutOfRange)?;
+            let q = div_round_wide(num, u32::from(a.scale), den, rscale).map_err(oor)?;
+            let q = if negative { -q } else { q };
+            let scale = u8::try_from(rscale).map_err(|_| DecimalArithError::OutOfRange)?;
+            Decimal::from_parts(q, scale).map_err(oor)?
+        }
+    };
+    if result.fits_precision(MAX_PRECISION) {
+        Ok(result)
+    } else {
+        Err(DecimalArithError::OutOfRange)
+    }
+}
+
+/// `d` の unscaled を `scale`（`d.scale` 以上）へ桁上げする（checked）。
+fn rescale_up(d: &Decimal, scale: u8) -> Result<i128, DecimalArithError> {
+    let factor = pow10(scale - d.scale).ok_or(DecimalArithError::OutOfRange)?;
+    d.unscaled
+        .checked_mul(factor)
+        .ok_or(DecimalArithError::OutOfRange)
+}
 /// 分散系集計（`variance`／`var_pop`／`var_samp`。SQL-57・Issue #1803）の中間値用の
 /// 256 bit 符号なし整数。`bigint` の二乗和 × 行数は `i128` を容易に超えるため、
 /// 外部クレートを足さずに最小限の演算だけを自作する（`sql::variance` が唯一の利用者）。
@@ -964,6 +1052,52 @@ mod tests {
 
     fn d(unscaled: i128, scale: u8) -> Decimal {
         Decimal::from_parts(unscaled, scale).expect("test scale must be within MAX_PRECISION")
+    }
+
+    #[test]
+    fn decimal_arith_matches_postgres_scales() {
+        use DecimalOp::{Add, Div, Mul, Sub};
+        // 加減は scale の大きい方、乗算は scale の和。
+        assert_eq!(decimal_arith(Add, &d(150, 2), &d(1, 0)), Ok(d(250, 2)));
+        assert_eq!(decimal_arith(Sub, &d(0, 0), &d(275, 2)), Ok(d(-275, 2)));
+        assert_eq!(decimal_arith(Mul, &d(1375, 2), &d(15, 1)), Ok(d(20625, 3)));
+        // 13.75 / 4 = 3.4375（select_div_scale で scale 16）、符号は別に扱う。
+        assert_eq!(
+            decimal_arith(Div, &d(1375, 2), &d(4, 0)),
+            Ok(d(34_375_000_000_000_000, 16))
+        );
+        assert_eq!(
+            decimal_arith(Div, &d(-1375, 2), &d(4, 0)),
+            Ok(d(-34_375_000_000_000_000, 16))
+        );
+        // 被除数の先頭桁 <= 除数の先頭桁なら scale 20（PostgreSQL 17: 2/3 = 0.66666666666666666667）。
+        assert_eq!(
+            decimal_arith(Div, &d(2, 0), &d(3, 0)),
+            Ok(d(66_666_666_666_666_666_667, 20))
+        );
+        assert_eq!(
+            decimal_arith(Div, &d(1, 0), &d(0, 0)),
+            Err(DecimalArithError::DivisionByZero)
+        );
+    }
+
+    #[test]
+    fn decimal_arith_rejects_overflow_instead_of_approximating() {
+        use DecimalOp::{Add, Mul};
+        let big = d(10i128.pow(37) * 9, 0);
+        assert_eq!(
+            decimal_arith(Add, &big, &big),
+            Err(DecimalArithError::OutOfRange)
+        );
+        assert_eq!(
+            decimal_arith(Mul, &big, &big),
+            Err(DecimalArithError::OutOfRange)
+        );
+        // scale の和が 38 を超える乗算も拒否する。
+        assert_eq!(
+            decimal_arith(Mul, &d(1, 30), &d(1, 30)),
+            Err(DecimalArithError::OutOfRange)
+        );
     }
 
     #[test]

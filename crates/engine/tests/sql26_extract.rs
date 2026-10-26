@@ -263,7 +263,8 @@ fn extract_works_in_where_case_call_args_and_aggregates() {
     let flags: Vec<Option<f64>> = cells
         .iter()
         .map(|c| match c {
-            Cell::Float(v) => Some(*v),
+            // Issue #1812: 整数リテラルのみの `CASE` は PostgreSQL と同じく integer。
+            Cell::SignedInteger(v) => Some(*v as f64),
             Cell::Null => None,
             other => panic!("unexpected cell {other:?}"),
         })

@@ -8298,7 +8298,9 @@ pub(crate) fn bind_aggregate_with_dummy_flags(
                     position: projection.len(),
                     expr,
                     hidden_items: hidden,
-                    name: alias.clone().unwrap_or_else(|| "?column?".to_string()),
+                    name: alias.clone().unwrap_or_else(|| {
+                        super::allowlist::aggregate_expr_default_name(expr, aggregates)
+                    }),
                 });
                 // 式の束縛後に差し替える一時項目（差し替え漏れは下で `Internal`）。
                 projection.push(ProjectionColumn::Aggregate {
@@ -10419,13 +10421,22 @@ fn aggregate_result_column_type(item: &BoundAggregateItem) -> ColumnType {
 }
 
 /// 投影式（Issue #1541）が参照する行ビューの集計列型。実セルの型と 1 対 1 の
-/// [`crate::sql::aggregate::aggregate_result_type`] をそのまま使う。ただし `NUMERIC`
-/// （`SUM/MIN/MAX` の疑似列 `id` を含む）と型を決められない組み合わせは `BYTEA` にし、
-/// 束縛が「式で使えない列」として `22000` で拒否する（`NUMERIC` の算術を `f64` で黙って
-/// 近似しない。fail-closed）。
+/// [`crate::sql::aggregate::aggregate_result_type`] をそのまま使う。`NUMERIC` を返す集計
+/// （`sum(bigint)`・整数の `avg`・NUMERIC 列の `sum/avg/min/max` 等。実セルは `Cell::Numeric`）は
+/// `NUMERIC` のまま渡し、式側は [`crate::sql::udf_call::BuiltinFn::NumericArith`] で正確に計算する
+/// （Issue #1812。`f64` で黙って近似しない）。実セルが整数になりうる疑似列 `id` の
+/// `SUM/MIN/MAX` と型を決められない組み合わせは `BYTEA` にし、束縛が「式で使えない列」として
+/// `22000` で拒否する（fail-closed）。
 fn projection_row_column_type(item: &BoundAggregateItem) -> ColumnType {
     match crate::sql::aggregate::aggregate_result_type(item.func, &item.input) {
-        Some(ColumnType::Numeric { .. }) | None => ColumnType::Bytea,
+        Some(ColumnType::Numeric { .. })
+            if matches!(item.input, AggregateInput::IdU64)
+                && !matches!(item.func, crate::sql::allowlist::AggregateFunc::Avg) =>
+        {
+            ColumnType::Bytea
+        }
+        Some(ty @ ColumnType::Numeric { .. }) => ty,
+        None => ColumnType::Bytea,
         Some(ty) => ty,
     }
 }

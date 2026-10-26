@@ -203,13 +203,28 @@ fn integer_overflow_and_division_by_zero_use_postgres_sqlstates() {
     read_ready_for_query(&mut s);
 }
 
-/// Issue #2270（TABLE-13）: 整数の AVG は numeric を返すため、式の中では numeric 算術が
-/// 未対応の間 22000 で拒否される（接続は維持される）。
+/// Issue #1812: 整数の AVG（numeric）は式の中でも numeric 算術で使え、結果は numeric
+/// （OID 1700・typlen -1）で公告される。値は PG 17 と同じ scale のテキストになる。
 #[test]
-fn avg_of_integer_in_expression_is_rejected_with_22000() {
+fn avg_of_integer_in_expression_is_numeric() {
     let (mut s, _g) = connect();
-    send_simple_query(&mut s, "SELECT avg(n)*2 FROM t");
-    expect_error_response_with_sqlstate(&mut s, "22000");
+    send_simple_query(&mut s, "SELECT avg(n)*2, sum(b)+1 FROM t");
+    let fields = read_row_description_with_types(&mut s);
+    assert_eq!(
+        fields,
+        vec![
+            ("?column?".to_string(), 1700, -1),
+            ("?column?".to_string(), 1700, -1)
+        ]
+    );
+    assert_eq!(
+        read_data_row(&mut s),
+        vec![
+            Some("14.0000000000000000".to_string()),
+            Some("4".to_string())
+        ]
+    );
+    assert_eq!(read_command_complete(&mut s), "SELECT 1");
     read_ready_for_query(&mut s);
 
     // 式の外の AVG(整数) は numeric（OID 1700）で、PG 17 と同じ小数 16 桁のテキストになる。
@@ -222,4 +237,83 @@ fn avg_of_integer_in_expression_is_rejected_with_22000() {
     );
     assert_eq!(read_command_complete(&mut s), "SELECT 1");
     read_ready_for_query(&mut s);
+}
+
+/// Issue #1812: 条件式を含む集計式項目の既定列名（PostgreSQL の `FigureColname`）と結果型。
+#[test]
+fn conditional_aggregate_expressions_advertise_names_and_types() {
+    let (mut s, _g) = connect();
+    send_simple_query(
+        &mut s,
+        "SELECT coalesce(sum(n), 0), CASE WHEN sum(n) > 5 THEN 1 ELSE 0 END, \
+         abs(min(n) - max(n)), sum(n)::text FROM t",
+    );
+    assert_eq!(
+        read_row_description_with_types(&mut s),
+        vec![
+            ("coalesce".to_string(), 20, 8),
+            ("case".to_string(), 23, 4),
+            ("abs".to_string(), 23, 4),
+            ("sum".to_string(), 25, -1),
+        ]
+    );
+    assert_eq!(
+        read_data_row(&mut s),
+        vec![
+            Some("7".to_string()),
+            Some("1".to_string()),
+            Some("0".to_string()),
+            Some("7".to_string())
+        ]
+    );
+    assert_eq!(read_command_complete(&mut s), "SELECT 1");
+    read_ready_for_query(&mut s);
+}
+
+const TYPED_SQL: &str = "SELECT coalesce(sum(n), 0), sum(b) + 1, avg(n) * 2 FROM t";
+
+/// Issue #1812: 条件式・numeric 算術を含む集計式項目の Describe（statement／portal）と実行時
+/// RowDescription が列名・型 OID・typlen で一致し、binary の DataRow が復号できる。
+#[test]
+fn extended_describe_matches_runtime_for_conditional_and_numeric_expressions() {
+    let (mut s, _g) = connect();
+    send(&mut s, b'P', &parse_body("s1", TYPED_SQL, 0));
+    send(&mut s, b'D', &describe_body(b'S', "s1"));
+    send(&mut s, b'S', b"");
+    expect(&mut s, b'1');
+    assert_eq!(expect(&mut s, b't'), [0, 0], "no parameters");
+    let stmt_fields = parse_row_description(&expect(&mut s, b'T'));
+    assert_eq!(expect(&mut s, b'Z'), [b'I']);
+
+    send(&mut s, b'B', &bind_body_result_format("", "s1", 1));
+    send(&mut s, b'D', &describe_body(b'P', ""));
+    send(&mut s, b'E', &execute_body("", 0));
+    send(&mut s, b'S', b"");
+    expect(&mut s, b'2');
+    let portal_fields = parse_row_description(&expect(&mut s, b'T'));
+    let want: [(&str, i32, i16); 3] = [
+        ("coalesce", 20, 8),
+        ("?column?", 1700, -1),
+        ("?column?", 1700, -1),
+    ];
+    for (i, (name, oid, len)) in want.iter().enumerate() {
+        assert_eq!(&stmt_fields[i].0, name);
+        assert_eq!(&portal_fields[i].0, name);
+        assert_eq!(stmt_fields[i].1, *oid, "statement describe oid");
+        assert_eq!(portal_fields[i].1, *oid, "portal describe oid");
+        assert_eq!(stmt_fields[i].2, *len);
+        assert_eq!(portal_fields[i].2, *len);
+        assert_eq!(portal_fields[i].3, 1, "binary format");
+    }
+    let row = parse_data_row(&expect(&mut s, b'D'));
+    assert_eq!(row[0], Some(7i64.to_be_bytes().to_vec()), "int8 binary");
+    // numeric binary: ndigits, weight, sign, dscale, digits（sum(b)+1 = 4）。
+    assert_eq!(
+        row[1],
+        Some(vec![0, 1, 0, 0, 0, 0, 0, 0, 0, 4]),
+        "numeric binary"
+    );
+    assert_eq!(row[2].as_ref().map(|v| v.len() >= 8), Some(true));
+    expect(&mut s, b'C');
+    assert_eq!(expect(&mut s, b'Z'), [b'I']);
 }

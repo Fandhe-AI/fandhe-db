@@ -864,10 +864,16 @@ fn numeric_cast_in_aggregate_select_never_fails_internally() {
     for sql in [
         "SELECT CAST(i4 AS numeric) FROM c GROUP BY i4",
         "SELECT CAST(i4 AS numeric), count(*) FROM c GROUP BY i4",
-        "SELECT count(*) + CAST(i4 AS numeric) FROM c GROUP BY i4",
         "SELECT count(*) + CAST(1 AS numeric) FROM c",
     ] {
         let e = select_as(&core, "alice", sql).unwrap_err();
         assert_ne!(e.wire_code(), "XX000", "{sql}: {e:?}");
     }
+    // Issue #1812: bigint と numeric の集計式項目は numeric 算術として受理される（PostgreSQL と同じ）。
+    select_as(
+        &core,
+        "alice",
+        "SELECT count(*) + CAST(i4 AS numeric) FROM c GROUP BY i4",
+    )
+    .expect("bigint + numeric is numeric arithmetic");
 }

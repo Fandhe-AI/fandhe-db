@@ -220,16 +220,27 @@ fn float_results_use_postgres_like_types() {
     }
 }
 
-/// Issue #2270（TABLE-13）: 整数の AVG は numeric を返すため、式の中（numeric 算術は
-/// 別 Issue）では fail-closed の 22000 で拒否する。Describe と実行の結果も一致する。
+/// Issue #1812: 整数の AVG（numeric）は式の中でも正確な numeric 算術で使える。疑似列 `id` の
+/// `SUM/MIN/MAX`（実セルが整数になりうる）は従来どおり fail-closed の 22000 で拒否する。
+/// Describe と実行の結果は一致する。
 #[test]
-fn avg_of_integer_in_expression_is_rejected_with_22000() {
+fn numeric_aggregates_in_expressions_and_unsupported_id_aggregates() {
     let (core, ctx, _g) = setup();
     for sql in [
         "SELECT avg(n)*2 FROM t",
         "SELECT g, avg(n)+1 FROM t GROUP BY g",
         "SELECT avg(id)+1 FROM t",
     ] {
+        let r = run(&core, &ctx, sql);
+        assert!(
+            matches!(
+                col_ty(&r, r.columns.len() - 1),
+                Some(ColumnType::Numeric { .. })
+            ),
+            "{sql}"
+        );
+    }
+    for sql in ["SELECT sum(id)+1 FROM t", "SELECT max(id)*2 FROM t"] {
         assert_eq!(code(&core, &ctx, sql), "22000", "{sql}");
         let parsed = core.parse_sql(sql).expect("parse");
         let described = core.describe_parsed_in_session(&SessionState::default(), &parsed);
