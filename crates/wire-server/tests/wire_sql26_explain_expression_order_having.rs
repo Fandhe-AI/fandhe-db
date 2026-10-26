@@ -374,7 +374,7 @@ fn explain_expression_errors_match_non_explain_in_both_protocols() {
         "SELECT id FROM docs ORDER BY count(*) LIMIT 3".to_string(),
         "SELECT DISTINCT lang FROM docs ORDER BY lower(lang)".to_string(),
         "SELECT id FROM missing ORDER BY lower(title) LIMIT 3".to_string(),
-        format!("{AGG} HAVING count(*) > 1"),
+        format!("{AGG} HAVING sum(count(*)) > 1"),
         format!("{AGG} HAVING lang = 'ja'"),
         format!("{AGG} HAVING lower(title) = 'a'"),
         format!("{AGG} ORDER BY lower(title)"),

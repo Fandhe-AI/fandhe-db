@@ -691,6 +691,23 @@ pub(crate) fn check_aggregate_columns_within_view(
         // 名前にしか解決しないが、非公開列を式経由で参照させない多層防御）。
         let mut allowed: Vec<String> = columns.to_vec();
         allowed.extend(effective_names.iter().cloned());
+        // Issue #1814・SQL-58: `HAVING` 内の集計呼び出しの引数・区切り・内側 `ORDER BY` の式も
+        // 公開列に限定する（非公開列を `HAVING` の集計経由で推測させない。filter oracle 防止）。
+        for agg in &gb.having_aggregates {
+            if let AggregateArg::Expr(e) = &agg.arg {
+                expr_columns_within(columns, e)?;
+            }
+            for e in &agg.extra_args {
+                expr_columns_within(columns, e)?;
+            }
+            for k in &agg.order_by {
+                expr_columns_within(columns, &k.expr)?;
+            }
+        }
+        // 式述語中の集計呼び出しの内部名は列ではない（エラー文言へ出さないため許可名に含める）。
+        allowed.extend(
+            (0..gb.having_aggregates.len()).map(crate::sql::allowlist::aggregate_placeholder),
+        );
         for key in &gb.order_by {
             // 序数は出力列の位置にしか届かない（列名を参照しない）。
             if key.ordinal.is_some() {

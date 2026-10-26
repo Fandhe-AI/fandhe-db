@@ -395,7 +395,8 @@ pub(crate) fn rewrite_aggregate(
     let new_group_by = match group_by {
         None => None,
         Some(mut gb) => {
-            if !gb.having_exprs.is_empty() {
+            // Issue #1814・SQL-58: `HAVING` 内の集計呼び出しも集計式項目と同じく未対応（fail-closed）。
+            if !gb.having_exprs.is_empty() || !gb.having_aggregates.is_empty() {
                 return Err(unsupported_position());
             }
             for key in &gb.order_by {
