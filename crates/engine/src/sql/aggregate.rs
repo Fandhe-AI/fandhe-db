@@ -434,7 +434,9 @@ impl ReferencedColumns {
                 }
                 // SQL-57・Issue #1805: `bool_and` 系の比較式引数も `ScalarExpr` と同じ導出を行う
                 // （漏れると縮小デコードした行で列が NULL と取り違えられ結果が黙って誤る）。
-                AggregateInput::BoolExpr { source, .. } => {
+                // SQL-57・Issue #1809: 非スカラー式（`TypedExpr`）も同じ導出が必須。
+                AggregateInput::BoolExpr { source, .. }
+                | AggregateInput::TypedExpr { source, .. } => {
                     if udf_call::references_embedding(source) {
                         needs_embedding = true;
                     }
@@ -1146,6 +1148,35 @@ impl Accumulator {
             },
             (Min, AggregateInput::TimestampTzColumn(_)) => Accumulator::TimestampTzMin(None),
             (Max, AggregateInput::TimestampTzColumn(_)) => Accumulator::TimestampTzMax(None),
+            // SQL-57・Issue #1809: 非スカラー式の `MIN`/`MAX`。Text は列参照と同じバイト列順
+            // （`Collation::DEFAULT`。非バイト列順の照合は式束縛が `0A000` で拒否済み）。
+            // Bool は束縛段が `42883` で拒否するためここへは到達せず、到達すれば下の腕で拒否する。
+            (Min, AggregateInput::TypedExpr { ty, .. }) => {
+                use crate::sql::udf_call::ExprType;
+                match ty {
+                    ExprType::Text => {
+                        Accumulator::TextMin(None, crate::collation::Collation::DEFAULT)
+                    }
+                    ExprType::Date => Accumulator::DateMin(None),
+                    ExprType::Timestamp => Accumulator::TimestampMin(None),
+                    ExprType::Time => Accumulator::TimeMin(None),
+                    ExprType::TimestampTz => Accumulator::TimestampTzMin(None),
+                    _ => return Err(accumulator_bug("unsupported TypedExpr type for MIN")),
+                }
+            }
+            (Max, AggregateInput::TypedExpr { ty, .. }) => {
+                use crate::sql::udf_call::ExprType;
+                match ty {
+                    ExprType::Text => {
+                        Accumulator::TextMax(None, crate::collation::Collation::DEFAULT)
+                    }
+                    ExprType::Date => Accumulator::DateMax(None),
+                    ExprType::Timestamp => Accumulator::TimestampMax(None),
+                    ExprType::Time => Accumulator::TimeMax(None),
+                    ExprType::TimestampTz => Accumulator::TimestampTzMax(None),
+                    _ => return Err(accumulator_bug("unsupported TypedExpr type for MAX")),
+                }
+            }
             _ => return Err(accumulator_bug("unsupported (func, input) combination")),
         })
     }
@@ -1225,7 +1256,7 @@ impl Accumulator {
             AggregateRowValue::CountOnly { .. } => self.observe_present(),
             AggregateRowValue::Bool(b) => self.observe_bool(Some(b)),
             AggregateRowValue::Id(id) => self.observe_id(id),
-            AggregateRowValue::Text(s) => self.observe_text(Some(s)),
+            AggregateRowValue::Text(s) => self.observe_text(Some(s.as_ref())),
             AggregateRowValue::Int32(v) => self.observe_int(Some(i64::from(v))),
             AggregateRowValue::Int64(v) => self.observe_int(Some(v)),
             AggregateRowValue::Float(v) => self.observe_float(v),
@@ -2688,6 +2719,23 @@ pub(crate) fn execute_aggregate_with_group_limits(
     )
 }
 
+/// [`AggregateInput::TypedExpr`] の式の型に対応する結果列型（SQL-57・Issue #1809）。
+/// `MIN`/`MAX` の結果型・アキュムレータ選択が共有する。束縛段が受理しない型は `None`。
+pub(crate) fn typed_expr_column_type(
+    ty: crate::sql::udf_call::ExprType,
+) -> Option<crate::catalog::ColumnType> {
+    use crate::catalog::ColumnType;
+    use crate::sql::udf_call::ExprType;
+    match ty {
+        ExprType::Text => Some(ColumnType::Text),
+        ExprType::Date => Some(ColumnType::Date),
+        ExprType::Timestamp => Some(ColumnType::Timestamp),
+        ExprType::Time => Some(ColumnType::Time),
+        ExprType::TimestampTz => Some(ColumnType::TimestampTz),
+        _ => None,
+    }
+}
+
 /// 集計項目の結果列の静的型（Issue #1173。WIRE-13・TABLE-13 のポインタ）。
 ///
 /// wire-server が型 OID を公告する根拠（[`ColumnMeta::Computed`] の `ty`）で、
@@ -2762,6 +2810,8 @@ pub(crate) fn aggregate_result_type(
         (Min | Max, AggregateInput::TextColumn(_) | AggregateInput::CollatedTextColumn { .. }) => {
             ColumnType::Text
         }
+        // SQL-57・Issue #1809: 非スカラー式の `MIN`/`MAX` は式の型がそのまま結果型。
+        (Min | Max, AggregateInput::TypedExpr { ty, .. }) => typed_expr_column_type(*ty)?,
         (AggregateFunc::StringAgg, AggregateInput::StringAgg(_)) => ColumnType::Text,
         (
             AggregateFunc::BoolAnd | AggregateFunc::BoolOr | AggregateFunc::Every,
