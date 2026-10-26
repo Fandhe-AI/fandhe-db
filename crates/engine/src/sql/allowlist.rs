@@ -10400,6 +10400,10 @@ impl<'a> Parser<'a> {
     /// 式キー付き `GROUP BY` の `ORDER BY` で、識別子・数値の直後が算術演算子（`n / 2`）の形か
     /// （Issue #1818・SQL-58）。式キーとの構造一致は束縛段が判定する。
     fn order_key_starts_arithmetic(&self) -> bool {
+        // 括弧始まり（`(n / 2)`）も式キー。照合は束縛段が行い、不一致は fail-closed で拒否される。
+        if matches!(self.peek(), Some(Token::Punct('('))) {
+            return true;
+        }
         matches!(self.peek(), Some(Token::Ident(_) | Token::Number(_)))
             && matches!(
                 self.tokens.get(self.pos + 1),

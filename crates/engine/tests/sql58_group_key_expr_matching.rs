@@ -488,3 +488,27 @@ fn evaluation_error_fails_without_partial_rows() {
         "22012"
     );
 }
+
+/// 括弧付き `ORDER BY` キーは、一致すれば受理し、一致しなければ fail-closed で拒否する（Issue #1818）。
+#[test]
+fn parenthesized_order_by_keys_are_matched_against_group_keys() {
+    let (core, _g) = build("sql58-gm-order-paren");
+    let expected = vec![
+        vec![V::Null, V::Int(1)],
+        vec![V::Int(2), V::Int(2)],
+        vec![V::Int(1), V::Int(3)],
+        vec![V::Int(0), V::Int(2)],
+    ];
+    assert_eq!(
+        rows(
+            &core,
+            "SELECT n / 2, count(*) FROM docs GROUP BY n / 2 ORDER BY (n / 2) DESC"
+        ),
+        expected
+    );
+    let (c, _) = run_err(
+        &core,
+        "SELECT n / 2, count(*) FROM docs GROUP BY n / 2 ORDER BY (n + 1)",
+    );
+    assert_eq!(c, "42803");
+}
