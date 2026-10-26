@@ -3055,10 +3055,11 @@ pub(crate) enum JoinKind {
     Full,
 }
 
-/// JOIN 1 段の結合条件（Issue #1826・SQL-60 (1)）。`On` は `AND` 連鎖の葉
-/// （[`JoinWherePredicate`]。WHERE と共有する葉で、宣言順・1 個以上・[`MAX_JOIN_CONDITIONS`]
-/// 以下）。結合キー／残余述語への分類は束縛段 `sql::join::on_split` の責務で、構文段は
-/// 葉を保持するだけ（Issue #1829・SQL-60 ポインタ）。`Using` は `USING (c1, c2, ...)`
+/// JOIN 1 段の結合条件（Issue #1826・SQL-60 (1)）。`On` は `AND`／`OR`／括弧の論理木
+/// （[`JoinWhereExpr`]。葉は WHERE と共有する [`JoinWherePredicate`] で、葉数は 1 個以上・
+/// [`MAX_JOIN_CONDITIONS`] 以下、括弧の深さは [`MAX_WHERE_GROUP_DEPTH`] 以下。`NOT` を持たない
+/// 単調な木）。結合キー／残余述語への分類は束縛段 `sql::join::on_split` の責務で、構文段は
+/// 木を保持するだけ（Issue #1829・#1839・SQL-60 ポインタ）。`Using` は `USING (c1, c2, ...)`
 /// の列名列（宣言順。1 個以上・[`MAX_JOIN_CONDITIONS`] 以下。重複・存在・型の検証と
 /// 等価 ON への脱糖・結合列の統合は束縛段 `sql::join` の責務で、構文段は列名だけを保持する）。
 /// `Natural`（Issue #1827）は `NATURAL [INNER|LEFT|RIGHT|FULL [OUTER]] JOIN` で、列名列は
@@ -3068,7 +3069,7 @@ pub(crate) enum JoinKind {
 /// 常に [`JoinKind::Inner`]。束縛段では結合キー・ON 残余ともに空の段になる。
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) enum JoinCondition {
-    On(Vec<JoinWherePredicate>),
+    On(JoinWhereExpr),
     Using(Vec<String>),
     Natural,
     Cross,
@@ -18863,29 +18864,18 @@ fn parse_join_aggregate_item(p: &mut Parser<'_>) -> Result<JoinSelectItem, SqlSu
     Ok(JoinSelectItem::Aggregate { func, arg, alias })
 }
 
-/// `ON` 条件（`on := leaf { AND leaf }`。Issue #1829・SQL-60 ポインタ）。葉は WHERE と共通の
-/// [`parse_join_where_leaf`] で読み、`OR`・括弧は受理しない（`OR` は ON 解析後の残りとして
-/// 文パーサが `42601` にする）。結合キーか残余かの分類は束縛段の責務。葉数の上限
-/// （[`MAX_JOIN_CONDITIONS`]、超過は `54000`）は `Vec` へ積む前に検査する。
-fn parse_join_on_conditions(
-    p: &mut Parser<'_>,
-) -> Result<Vec<JoinWherePredicate>, SqlSurfaceError> {
-    let mut conditions = Vec::new();
-    loop {
-        let leaf = parse_join_where_leaf(p)?;
-        if conditions.len() >= MAX_JOIN_CONDITIONS {
-            return Err(SqlSurfaceError::payload_too_large(
-                "too many JOIN ON conditions",
-            ));
-        }
-        conditions.push(leaf);
-        if matches!(p.peek(), Some(Token::Keyword(Keyword::And))) {
-            p.advance();
-            continue;
-        }
-        break;
-    }
-    Ok(conditions)
+/// `ON` 条件（Issue #1829・#1839・SQL-60 ポインタ）。WHERE と同じ文法
+/// （`or_expr := and_expr { OR and_expr }`、`and_expr := atom { AND atom }`、
+/// `atom := '(' or_expr ')' | leaf`）で論理木として読む。結合キーか残余かの分類は束縛段の責務。
+/// 葉数の上限（[`MAX_JOIN_CONDITIONS`]）・括弧の深さ（[`MAX_WHERE_GROUP_DEPTH`]）は積む／再帰する
+/// **前**に検査する（超過は `54000`）。
+fn parse_join_on_conditions(p: &mut Parser<'_>) -> Result<JoinWhereExpr, SqlSurfaceError> {
+    let cap = LeafCap {
+        max: MAX_JOIN_CONDITIONS,
+        msg: "too many JOIN ON conditions",
+    };
+    let mut leaves = 0usize;
+    parse_join_where_or(p, 0, &mut leaves, &cap)
 }
 
 /// `USING (<ident> {, <ident>})` の列名列（Issue #1826・SQL-60 (1)。`USING` は消費済みで
@@ -18923,22 +18913,34 @@ fn parse_join_using_list(p: &mut Parser<'_>) -> Result<Vec<String>, SqlSurfaceEr
 /// （超過は `54000`）。
 fn parse_join_where(p: &mut Parser<'_>) -> Result<JoinWhereExpr, SqlSurfaceError> {
     let mut leaves = 0usize;
-    parse_join_where_or(p, 0, &mut leaves)
+    let cap = LeafCap {
+        max: MAX_JOIN_WHERE_CONJUNCTS,
+        msg: "too many JOIN WHERE predicates",
+    };
+    parse_join_where_or(p, 0, &mut leaves, &cap)
+}
+
+/// 共有パーサ（WHERE／ON）の葉数上限と超過時の文言。呼び出し元（`parse_join_where`・
+/// `parse_join_on_conditions`）が句ごとに渡す。
+struct LeafCap {
+    max: usize,
+    msg: &'static str,
 }
 
 fn parse_join_where_or(
     p: &mut Parser<'_>,
     depth: usize,
     leaves: &mut usize,
+    cap: &LeafCap,
 ) -> Result<JoinWhereExpr, SqlSurfaceError> {
-    let first = parse_join_where_and(p, depth, leaves)?;
+    let first = parse_join_where_and(p, depth, leaves, cap)?;
     if !p.peek_ident_matches("OR") {
         return Ok(first);
     }
     let mut branches = vec![first];
     while p.peek_ident_matches("OR") {
         p.advance();
-        branches.push(parse_join_where_and(p, depth, leaves)?);
+        branches.push(parse_join_where_and(p, depth, leaves, cap)?);
     }
     Ok(JoinWhereExpr::Or(branches))
 }
@@ -18947,15 +18949,16 @@ fn parse_join_where_and(
     p: &mut Parser<'_>,
     depth: usize,
     leaves: &mut usize,
+    cap: &LeafCap,
 ) -> Result<JoinWhereExpr, SqlSurfaceError> {
-    let first = parse_join_where_atom(p, depth, leaves)?;
+    let first = parse_join_where_atom(p, depth, leaves, cap)?;
     if !matches!(p.peek(), Some(Token::Keyword(Keyword::And))) {
         return Ok(first);
     }
     let mut children = vec![first];
     while matches!(p.peek(), Some(Token::Keyword(Keyword::And))) {
         p.advance();
-        children.push(parse_join_where_atom(p, depth, leaves)?);
+        children.push(parse_join_where_atom(p, depth, leaves, cap)?);
     }
     Ok(JoinWhereExpr::And(children))
 }
@@ -18964,6 +18967,7 @@ fn parse_join_where_atom(
     p: &mut Parser<'_>,
     depth: usize,
     leaves: &mut usize,
+    cap: &LeafCap,
 ) -> Result<JoinWhereExpr, SqlSurfaceError> {
     if matches!(p.peek(), Some(Token::Punct('('))) {
         let next_depth = depth
@@ -18975,14 +18979,12 @@ fn parse_join_where_atom(
                 ))
             })?;
         p.advance();
-        let inner = parse_join_where_or(p, next_depth, leaves)?;
+        let inner = parse_join_where_or(p, next_depth, leaves, cap)?;
         p.expect_punct(')')?;
         return Ok(inner);
     }
-    if *leaves >= MAX_JOIN_WHERE_CONJUNCTS {
-        return Err(SqlSurfaceError::payload_too_large(
-            "too many JOIN WHERE predicates",
-        ));
+    if *leaves >= cap.max {
+        return Err(SqlSurfaceError::payload_too_large(cap.msg));
     }
     let leaf = parse_join_where_leaf(p)?;
     *leaves += 1;
@@ -34163,13 +34165,19 @@ mod tests {
         .expect("ON leaf chain should be accepted");
         match stmt {
             Statement::Join(v) => match &v.steps[0].condition {
-                JoinCondition::On(leaves) => {
+                JoinCondition::On(JoinWhereExpr::And(leaves)) => {
                     assert_eq!(leaves.len(), 2);
                     assert!(matches!(
                         leaves[0],
-                        JoinWherePredicate::ColumnCompare { op: BinOp::Eq, .. }
+                        JoinWhereExpr::Leaf(JoinWherePredicate::ColumnCompare {
+                            op: BinOp::Eq,
+                            ..
+                        })
                     ));
-                    assert!(matches!(leaves[1], JoinWherePredicate::Equality { .. }));
+                    assert!(matches!(
+                        leaves[1],
+                        JoinWhereExpr::Leaf(JoinWherePredicate::Equality { .. })
+                    ));
                 }
                 other => panic!("expected On, got {other:?}"),
             },
@@ -34179,23 +34187,30 @@ mod tests {
             "SELECT * FROM a JOIN b ON a.id = b.id AND b.active JOIN c ON b.id = c.id LIMIT 1",
             "SELECT * FROM a LEFT JOIN b ON a.id = b.id AND b.active WHERE a.id = 'q' LIMIT 1",
             "SELECT * FROM a JOIN b ON a.x > b.y AND a.id = b.id LIMIT 1",
+            // Issue #1839: OR・括弧付き ON は論理木として受理する。
+            "SELECT * FROM a JOIN b ON a.x = b.y OR a.z = b.w LIMIT 1",
+            "SELECT * FROM a JOIN b ON (a.x = b.y) LIMIT 1",
+            "SELECT * FROM a JOIN b ON (a.id = b.id AND a.x < b.y) OR b.tag = 'x' LIMIT 1",
+            "SELECT * FROM a JOIN b ON a.flag OR b.flag JOIN c ON (b.flag) LIMIT 1",
         ] {
             validate_sql(sql, &lookup).unwrap_or_else(|e| panic!("{sql}: {e:?}"));
         }
         for sql in [
-            "SELECT * FROM a JOIN b ON a.x = b.y OR a.z = b.w LIMIT 1",
-            "SELECT * FROM a JOIN b ON (a.x = b.y) LIMIT 1",
+            "SELECT * FROM a JOIN b ON NOT a.x = b.y LIMIT 1",
+            "SELECT * FROM a JOIN b ON a.x BETWEEN b.y AND b.z LIMIT 1",
+            "SELECT * FROM a JOIN b ON (a.x = b.y LIMIT 1",
         ] {
             let e = validate_sql(sql, &lookup).unwrap_err();
             assert_eq!(e.wire_code(), "42601", "{sql}");
         }
         let nine = ["a.id = b.id"; 9].join(" AND ");
-        let e = validate_sql(
-            &format!("SELECT * FROM a JOIN b ON {nine} LIMIT 1"),
-            &lookup,
-        )
-        .unwrap_err();
-        assert_eq!(e.wire_code(), "54000");
+        let nine_or = ["a.id = b.id"; 9].join(" OR ");
+        let deep = format!("{}a.id = b.id{}", "(".repeat(40), ")".repeat(40));
+        for on in [nine, nine_or, deep] {
+            let e = validate_sql(&format!("SELECT * FROM a JOIN b ON {on} LIMIT 1"), &lookup)
+                .unwrap_err();
+            assert_eq!(e.wire_code(), "54000", "{on}");
+        }
     }
 
     /// Issue #1826・SQL-60 (1): `USING (...)` は列名列のまま `JoinCondition::Using` で保持し、

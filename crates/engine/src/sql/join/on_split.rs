@@ -1,8 +1,8 @@
-//! `JOIN ... ON` の AND 連鎖を結合キーと残余述語へ分解する分類器（Issue #1829・
+//! `JOIN ... ON` の論理木を結合キーと残余述語へ分解する分類器（Issue #1829・#1839・
 //! SQL-60 ポインタ）。
 //!
-//! 責務境界: 構文段（`sql::allowlist`）が保持した ON の葉列
-//! （[`JoinWherePredicate`]）を、束縛段 `plan::build_plan` の結合段ごとに分類する。
+//! 責務境界: 構文段（`sql::allowlist`）が保持した ON の論理木
+//! （[`JoinWhereExpr`]。最上位 `AND` の conjunct 単位）を、束縛段 `plan::build_plan` の結合段ごとに分類する。
 //! 型には依存しない構造分類のみを担い、キーの型クラス一致検査（`42804`）は呼び出し元
 //! （`build_plan`）が `StepKey` 化の際に行う。
 //!
@@ -12,16 +12,19 @@
 //! - [`OnClass::NewOnly`]: 参照が `new` だけ
 //! - [`OnClass::Mixed`]: 両側を跨ぐ非キー（`a.x > b.y` 等）
 //!
+//! `OR` を含む conjunct は結合キーにならず、参照 relation 集合から残余（左のみ・右のみ・
+//! 混在）にだけ分類する（Issue #1839）。
+//!
 //! #1830 との契約: [`OnSplit`] の各 `Vec` は宣言順を保つ。残余（左のみ・右のみ・
 //! 混在）は `build_plan` が `StepPlan` の `on_*` へ束縛し、`exec::join_step` が一致条件の
 //! 一部として評価する（述語を黙殺する fail-open を作らない）。外部結合の ON 残余は WHERE の
 //! strict マスク簡約へ流さない（ON 述語は NULL 補完の有無を決めるのみ）。
 
-use crate::sql::allowlist::{JoinWherePredicate, SqlSurfaceError};
+use crate::sql::allowlist::{JoinWhereExpr, JoinWherePredicate, SqlSurfaceError};
 use crate::sql::relation::ResolvedColumn;
 use crate::sql::udf_call::BinOp;
 
-use super::plan::{leaf_colrefs, relation_bit};
+use super::plan::{collect_leaf_colrefs, flatten_conjuncts, relation_bit};
 use super::using::JoinScope;
 
 /// ON の葉 1 個の分類結果。
@@ -39,9 +42,9 @@ pub(super) enum OnClass {
 /// 分類済みの ON。`keys` は `(acc 側, new 側)` に正規化した解決列。
 pub(super) struct OnSplit<'p> {
     pub(super) keys: Vec<(ResolvedColumn, ResolvedColumn)>,
-    pub(super) acc_only: Vec<&'p JoinWherePredicate>,
-    pub(super) new_only: Vec<&'p JoinWherePredicate>,
-    pub(super) mixed: Vec<&'p JoinWherePredicate>,
+    pub(super) acc_only: Vec<&'p JoinWhereExpr>,
+    pub(super) new_only: Vec<&'p JoinWhereExpr>,
+    pub(super) mixed: Vec<&'p JoinWhereExpr>,
 }
 
 #[cfg(test)]
@@ -65,6 +68,11 @@ pub(super) fn classify_leaf(
             _ => {}
         }
     }
+    classify_refs(rels, new_rel)
+}
+
+/// 参照 relation 添字の集合だけで残余の側（左のみ・右のみ・混在）を決める。
+fn classify_refs(rels: &[usize], new_rel: usize) -> Result<OnClass, SqlSurfaceError> {
     let new_bit = relation_bit(new_rel)?;
     let mut mask = 0u32;
     for r in rels {
@@ -79,18 +87,25 @@ pub(super) fn classify_leaf(
     })
 }
 
-/// ON の葉列を分類する。全葉の列参照を分類より前に解決する（未知列 `42703`・未知修飾子
-/// `42P01`・曖昧列等を WHERE 経路と同じ順序で確定する）。
+/// ON の論理木を分類する。最上位の `AND` を conjunct に平坦化し、全 conjunct の全列参照を
+/// 分類より前に解決する（未知列 `42703`・未知修飾子 `42P01`・曖昧列等を WHERE 経路と
+/// 同じ順序で確定する）。葉の conjunct は [`classify_leaf`]、`OR` を含む conjunct は
+/// 結合キーにせず、参照 relation 集合から残余（左のみ・右のみ・混在）へ分類する
+/// （Issue #1839。`OR` は残余評価器 `build_residual` が束縛する）。
 pub(super) fn classify_on<'p>(
-    conds: &'p [JoinWherePredicate],
+    on: &'p JoinWhereExpr,
     scope: &JoinScope<'_>,
     new_rel: usize,
 ) -> Result<OnSplit<'p>, SqlSurfaceError> {
-    let mut resolved: Vec<Vec<ResolvedColumn>> = Vec::with_capacity(conds.len());
-    for leaf in conds {
-        let mut cols = Vec::new();
-        for c in leaf_colrefs(leaf) {
-            cols.push(scope.resolve(c)?);
+    let mut conjuncts: Vec<&'p JoinWhereExpr> = Vec::new();
+    flatten_conjuncts(on, &mut conjuncts);
+    let mut resolved: Vec<Vec<ResolvedColumn>> = Vec::with_capacity(conjuncts.len());
+    for c in &conjuncts {
+        let mut refs = Vec::new();
+        collect_leaf_colrefs(c, &mut refs);
+        let mut cols = Vec::with_capacity(refs.len());
+        for r in refs {
+            cols.push(scope.resolve(r)?);
         }
         resolved.push(cols);
     }
@@ -100,9 +115,14 @@ pub(super) fn classify_on<'p>(
         new_only: Vec::new(),
         mixed: Vec::new(),
     };
-    for (leaf, cols) in conds.iter().zip(resolved) {
+    for (conj, cols) in conjuncts.into_iter().zip(resolved) {
         let rels: Vec<usize> = cols.iter().map(ResolvedColumn::relation).collect();
-        match classify_leaf(leaf, &rels, new_rel)? {
+        let class = match conj {
+            JoinWhereExpr::Leaf(leaf) => classify_leaf(leaf, &rels, new_rel)?,
+            // 非葉（OR の部分木）は等価キーにしない。参照 relation 集合だけで分類する。
+            _ => classify_refs(&rels, new_rel)?,
+        };
+        match class {
             OnClass::EquiKey { lhs_is_new } => {
                 let mut it = cols.into_iter();
                 match (it.next(), it.next()) {
@@ -114,9 +134,9 @@ pub(super) fn classify_on<'p>(
                     }
                 }
             }
-            OnClass::AccOnly => out.acc_only.push(leaf),
-            OnClass::NewOnly => out.new_only.push(leaf),
-            OnClass::Mixed => out.mixed.push(leaf),
+            OnClass::AccOnly => out.acc_only.push(conj),
+            OnClass::NewOnly => out.new_only.push(conj),
+            OnClass::Mixed => out.mixed.push(conj),
         }
     }
     Ok(out)
@@ -150,6 +170,83 @@ mod tests {
         }
     }
 
+    fn and_of(conds: &[JoinWherePredicate]) -> JoinWhereExpr {
+        JoinWhereExpr::And(conds.iter().cloned().map(JoinWhereExpr::Leaf).collect())
+    }
+
+    fn leaf(p: JoinWherePredicate) -> JoinWhereExpr {
+        JoinWhereExpr::Leaf(p)
+    }
+
+    /// `names` の relation を並べたスコープで木を分類し、`(keys, acc, new, mixed)` 件数を返す。
+    fn run_tree(
+        names: &[&str],
+        on: &JoinWhereExpr,
+    ) -> Result<(usize, usize, usize, usize), SqlSurfaceError> {
+        let schemas: Vec<TableSchema> = names.iter().map(|n| schema(n)).collect();
+        let scope = JoinScope::plain(BindingScope::new(
+            names
+                .iter()
+                .map(|n| TableRef::new(*n))
+                .zip(schemas.iter())
+                .collect(),
+        )?);
+        let s = classify_on(on, &scope, names.len() - 1)?;
+        Ok((
+            s.keys.len(),
+            s.acc_only.len(),
+            s.new_only.len(),
+            s.mixed.len(),
+        ))
+    }
+
+    #[test]
+    fn or_conjunct_is_residual_only_never_a_key() {
+        // Issue #1839: OR の部分木は等価葉を含んでも結合キーにならず、混在残余になる。
+        let on = JoinWhereExpr::Or(vec![
+            leaf(cc(("a", "x"), BinOp::Eq, ("b", "y"))),
+            leaf(cc(("a", "x"), BinOp::Gt, ("b", "y"))),
+        ]);
+        assert_eq!(run_tree(&["a", "b"], &on).unwrap(), (0, 0, 0, 1));
+        // 単側だけの OR は右のみ／左のみ残余。
+        let on = JoinWhereExpr::Or(vec![
+            leaf(eq(("b", "tag"), "x")),
+            leaf(eq(("b", "tag"), "z")),
+        ]);
+        assert_eq!(run_tree(&["a", "b"], &on).unwrap(), (0, 0, 1, 0));
+        let on = JoinWhereExpr::Or(vec![
+            leaf(eq(("a", "tag"), "x")),
+            leaf(eq(("a", "tag"), "z")),
+        ]);
+        assert_eq!(run_tree(&["a", "b"], &on).unwrap(), (0, 1, 0, 0));
+    }
+
+    #[test]
+    fn nested_and_yields_key_and_or_residual() {
+        // ON (a.x = b.y AND a.x < b.y) AND (a.tag = 'x' OR b.tag = 'x')
+        let on = JoinWhereExpr::And(vec![
+            JoinWhereExpr::And(vec![
+                leaf(cc(("a", "x"), BinOp::Eq, ("b", "y"))),
+                leaf(cc(("a", "x"), BinOp::Lt, ("b", "y"))),
+            ]),
+            JoinWhereExpr::Or(vec![
+                leaf(eq(("a", "tag"), "x")),
+                leaf(eq(("b", "tag"), "x")),
+            ]),
+        ]);
+        assert_eq!(run_tree(&["a", "b"], &on).unwrap(), (1, 0, 0, 2));
+    }
+
+    #[test]
+    fn unknown_column_inside_or_is_42703_before_classification() {
+        let on = JoinWhereExpr::Or(vec![
+            leaf(eq(("b", "tag"), "x")),
+            leaf(eq(("b", "nope"), "x")),
+        ]);
+        let e = run_tree(&["a", "b"], &on).unwrap_err();
+        assert_eq!(e.wire_code(), "42703");
+    }
+
     fn eq(c: (&str, &str), v: &str) -> JoinWherePredicate {
         JoinWherePredicate::Equality {
             column: ColumnRef::qualified(c.0, c.1),
@@ -170,7 +267,8 @@ mod tests {
                 .zip(schemas.iter())
                 .collect(),
         )?);
-        let s = classify_on(conds, &scope, names.len() - 1)?;
+        let on = and_of(conds);
+        let s = classify_on(&on, &scope, names.len() - 1)?;
         Ok((
             s.keys.len(),
             s.acc_only.len(),
@@ -247,7 +345,8 @@ mod tests {
             ])
             .unwrap(),
         );
-        let s = classify_on(&c, &scope, 1).unwrap();
+        let on = and_of(&c);
+        let s = classify_on(&on, &scope, 1).unwrap();
         assert_eq!(
             (
                 s.keys.len(),
@@ -257,9 +356,9 @@ mod tests {
             ),
             (1, 1, 1, 1)
         );
-        assert_eq!(s.new_only[0], &c[1]);
-        assert_eq!(s.mixed[0], &c[2]);
-        assert_eq!(s.acc_only[0], &c[3]);
+        assert_eq!(s.new_only[0], &JoinWhereExpr::Leaf(c[1].clone()));
+        assert_eq!(s.mixed[0], &JoinWhereExpr::Leaf(c[2].clone()));
+        assert_eq!(s.acc_only[0], &JoinWhereExpr::Leaf(c[3].clone()));
         assert!(s.has_residual());
     }
 
