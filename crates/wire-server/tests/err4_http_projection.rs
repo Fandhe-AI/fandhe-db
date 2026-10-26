@@ -308,7 +308,7 @@ fn query_as_alice(addr: SocketAddr, body: &[u8]) -> HttpResponse {
 /// `status.rs::EXPECTED`（`#[cfg(test)]` 内で外部から参照不可）と同値の
 /// 期待表。両者の乖離は [`err4_projection_table_is_closed_over_all_error_classes`]
 /// が `http_status` 経由で検出する。
-const EXPECTED_STATUS: [(&str, u16); 79] = [
+const EXPECTED_STATUS: [(&str, u16); 81] = [
     ("22000", 400),
     ("22001", 400),
     ("22012", 400),
@@ -397,6 +397,10 @@ const EXPECTED_STATUS: [(&str, u16); 79] = [
     // `InvalidObjectDefinition`（`42P17`）・`GroupingError`（`42803`）・`WindowingError`（`42P20`。
     // Issue #1647）: 式索引の式の拒否。SQL 表層専用で 400。
     ("42P17", 400),
+    // `StatementTooComplex`（`54001`）・`TooManyColumns`（`54011`。Issue #1821・SQL-59）:
+    // グルーピングセットの上限超過。SQL 表層専用で 400。
+    ("54001", 400),
+    ("54011", 400),
     ("42803", 400),
     ("42P20", 400),
     ("42P22", 400),
@@ -523,7 +527,7 @@ fn assert_projected_as(resp: &HttpResponse, expected_class: ErrorClass) {
 
 // --- R7: 射影表が ErrorClass::ALL 全体を閉じて覆うことの機械検証 -----------
 
-const _: () = assert!(ErrorClass::ALL.len() == 82);
+const _: () = assert!(ErrorClass::ALL.len() == 84);
 
 /// `wire_code` を共有する分類と、逆引き（`from_wire_code`）が返す分類の組
 /// （ERR-6。`23502`: TABLE-16・TASK-204・Issue #904、`23505`: Issue #1180）。
@@ -1028,6 +1032,9 @@ fn err4_f_unreachable_classes_project_via_production_encoder() {
         ErrorClass::InvalidObjectDefinition,
         ErrorClass::GroupingError,
         ErrorClass::WindowingError,
+        // グルーピングセットの上限超過（Issue #1821・SQL-59）: NoSQL の `aggregate` は対象外で到達不能。
+        ErrorClass::StatementTooComplex,
+        ErrorClass::TooManyColumns,
         ErrorClass::IndeterminateCollation,
         // `CannotCoerce`（`42846`。Issue #1590）: `CAST` は NoSQL 表層の `op` 語彙に無く到達不能。
         ErrorClass::CannotCoerce,

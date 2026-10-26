@@ -216,6 +216,7 @@ pub(crate) mod fetch_clause;
 pub mod generation_key;
 pub(crate) mod gin_scan;
 pub mod group_by;
+pub(crate) mod grouping_sets;
 pub(crate) mod hnsw_cache;
 pub(crate) mod hnsw_hybrid;
 pub(crate) mod index_expr;

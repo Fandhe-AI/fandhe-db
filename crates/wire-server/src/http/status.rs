@@ -110,6 +110,9 @@ pub const fn http_status(class: ErrorClass) -> u16 {
         | ErrorClass::InvalidObjectDefinition
         | ErrorClass::GroupingError
         | ErrorClass::WindowingError
+        // Issue #1821・SQL-59: グルーピングセットの上限超過（`54001`・`54011`）も入力起因で 400。
+        | ErrorClass::StatementTooComplex
+        | ErrorClass::TooManyColumns
         | ErrorClass::CannotCoerce
         | ErrorClass::IndeterminateCollation
         // Issue #1599: `jsonb_build_object` の NULL キー（`22004`）も入力起因の拒否として 400。
@@ -216,7 +219,7 @@ mod tests {
 
     /// 期待表を明示的に列挙し、`ErrorClass::ALL` との突き合わせで非 vacuous に検証する。
     /// `match` にアームを足したが期待表の更新を忘れた、という乖離を (a)(b) が検出する。
-    const EXPECTED: [(ErrorClass, u16); 82] = [
+    const EXPECTED: [(ErrorClass, u16); 84] = [
         (ErrorClass::InvalidInput, 400),
         (ErrorClass::StringDataRightTruncation, 400),
         (ErrorClass::AuthInvalid, 401),
@@ -281,6 +284,8 @@ mod tests {
         (ErrorClass::InvalidObjectDefinition, 400),
         (ErrorClass::GroupingError, 400),
         (ErrorClass::WindowingError, 400),
+        (ErrorClass::StatementTooComplex, 400),
+        (ErrorClass::TooManyColumns, 400),
         (ErrorClass::CannotCoerce, 400),
         (ErrorClass::IndeterminateCollation, 400),
         (ErrorClass::NullValueNotAllowed, 400),

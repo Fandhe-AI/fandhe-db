@@ -9,6 +9,11 @@
 
 ### Added
 
+- `GROUP BY` の `ROLLUP`・`CUBE`・`GROUPING SETS` を構文解析し、グルーピングセットの列へ展開する（Issue #1821・SQL-59）。
+  展開前に上限（展開後 4,096 セット・`CUBE` 12 要素）を検査し、超過は `54001`・`54011` で拒否する。実行段
+  （Issue #1822）が入るまで、構文が通った文は `0A000` で拒否する。詳細は [grouping-sets.md](docs/design/grouping-sets.md)。
+  BREAKING CHANGE: 公開 enum `ErrorClass` と `SqlSurfaceError` に variant（`StatementTooComplex`・`TooManyColumns`）を
+  追加したため、網羅的な `match` は更新が要る。
 - 実行中の文の協調的中断を追加した（Issue #1798・SQL-34・WIRE-11）。公開 API は `engine::interrupt`
   （`InterruptScope`・`InterruptGuard`・`InterruptReason`）と `ErrorClass::QueryCanceled`（`57014`）。
   wire-server は実行中のクライアント切断を検出して走査を止める（切断済みの接続の資源占有を防ぐ）。
