@@ -26,6 +26,12 @@ pub const MAX_JOIN_INPUT_ROWS: usize = 100_000;
 /// Issue #925 §2.4）。`LIMIT`／`OFFSET` の値によらず、結合の各段で判定する。超過は `54000`。
 pub const MAX_JOIN_OUTPUT_ROWS: usize = 100_000;
 
+/// 非等価 JOIN（ネステッドループ結合）の比較回数の上限（実装既定値。Issue #1837・
+/// SQL-60 ポインタ、設計記録 `docs/design/nested-loop-join.md` D4）。出力上限の 100 倍で、
+/// 比較 1 回 = `on_mixed` を評価するペア 1 組。文全体で 1 つの予算を共有し、超過は
+/// 評価前の事前判定または累計で `54000`（fail-closed）。CLI 化は対象外。
+pub const MAX_JOIN_COMPARISONS: usize = 10_000_000;
+
 /// リレーション数に設定できる最小値（JOIN は 2 リレーション以上）。
 pub const MIN_JOIN_RELATIONS: usize = 2;
 

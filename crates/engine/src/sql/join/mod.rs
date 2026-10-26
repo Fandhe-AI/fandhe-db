@@ -23,6 +23,8 @@
 //! - `plan`: 束縛（列解決・型検証・外部結合の簡約・WHERE のプッシュダウン／残余の
 //!   分離・側スキャン投影の確定・集計／並べ替えの束縛）。Describe も同じ計画を使う。
 //! - `exec`: N 方向ハッシュ結合（段ごとのカーディナリティ上限・決定的順序）。
+//! - `nlj`: 等価キーの無い ON 残余のある段のネステッドループ結合（INNER のみ。比較回数上限・
+//!   Issue #1837。SQL からの到達は #1839。設計は `docs/design/nested-loop-join.md`）。
 //! - `residual`: WHERE 残余の行単位評価（ON 残余の一致条件評価 `eval_all` も共有。Issue #1830）と
 //!   スカラー `ORDER BY`。
 //! - `aggregate`: 集計形（既存の `Accumulator` を再利用）。
@@ -48,6 +50,7 @@ mod aggregate;
 // `UPDATE ... FROM`/`DELETE ... USING` の結合実行（Issue #1755・SQL-53）。
 pub(crate) mod dml;
 mod exec;
+mod nlj;
 mod on_split;
 mod plan;
 mod residual;
@@ -67,13 +70,18 @@ use crate::sql::udf_call::UdfRegistry;
 
 use plan::{build_plan, JoinPlan, Shape};
 
-pub(crate) use crate::join_limits::{MAX_JOIN_INPUT_ROWS, MAX_JOIN_OUTPUT_ROWS};
+pub(crate) use crate::join_limits::{
+    MAX_JOIN_COMPARISONS, MAX_JOIN_INPUT_ROWS, MAX_JOIN_OUTPUT_ROWS,
+};
 
 /// テスト専用に上限を差し替えられるようにした構造体（`sql::scan::execute_scan`／
 /// `sql::set_op::execute_with_budget` と同じ設計判断）。
 pub(crate) struct JoinLimits {
     pub(crate) max_input_rows: usize,
     pub(crate) max_output_rows: usize,
+    /// 非等価 ON のネステッドループ結合の比較回数上限（Issue #1837。既定は
+    /// `MAX_JOIN_COMPARISONS`。文全体で共有し、超過は `54000`）。
+    pub(crate) max_comparisons: usize,
     pub(crate) budget_cap: usize,
     /// 集計形のグループ数上限（既定は `sql::group_by::MAX_GROUPS`。超過は `54000`）。
     pub(crate) max_groups: usize,
@@ -92,6 +100,7 @@ impl Default for JoinLimits {
         Self {
             max_input_rows: MAX_JOIN_INPUT_ROWS,
             max_output_rows: MAX_JOIN_OUTPUT_ROWS,
+            max_comparisons: MAX_JOIN_COMPARISONS,
             budget_cap: crate::arena::MAX_ARENA_TOTAL_BYTES,
             max_groups: crate::sql::group_by::MAX_GROUPS,
             max_group_by_columns: crate::sql::allowlist::MAX_GROUP_BY_COLUMNS,
@@ -106,11 +115,39 @@ impl Default for JoinLimits {
 pub(super) struct JoinBudget {
     used: usize,
     cap: usize,
+    /// NLJ の比較回数の文全体の累計（Issue #1837・D5）。バイト予算とは別軸。
+    comparisons_used: usize,
 }
 
 impl JoinBudget {
     fn new(cap: usize) -> Self {
-        Self { used: 0, cap }
+        Self {
+            used: 0,
+            cap,
+            comparisons_used: 0,
+        }
+    }
+
+    /// 比較回数を `n` 件計上する。オーバーフローも `cap` 超過も `54000`（部分結果は返さない）。
+    pub(super) fn charge_comparisons(
+        &mut self,
+        n: usize,
+        cap: usize,
+    ) -> Result<(), SqlSurfaceError> {
+        match self.comparisons_used.checked_add(n) {
+            Some(t) if t <= cap => {
+                self.comparisons_used = t;
+                Ok(())
+            }
+            _ => Err(SqlSurfaceError::payload_too_large(
+                "JOIN comparison count exceeds the limit",
+            )),
+        }
+    }
+
+    /// 比較回数の残り（D6 の事前判定用）。
+    pub(super) fn remaining_comparisons(&self, cap: usize) -> usize {
+        cap.saturating_sub(self.comparisons_used)
     }
 
     fn remaining(&self) -> usize {

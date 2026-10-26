@@ -7,6 +7,8 @@
 //! （`Option<u32>`。`None` は NULL 補完）を持つ。WHERE の残余評価・並べ替え・
 //! 集計・投影は本モジュールの外（`residual`・`aggregate`・`mod.rs`）が担う。
 //!
+//! 等価キーの無い ON 残余のある段は `nlj`（Issue #1837）へ振り分ける。
+//!
 //! 上限（`54000`。いずれも可視行だけで判定し、`LIMIT`／`OFFSET` の値には依存させない）:
 //! 段ごとの結合カーディナリティ（一致ペア＋NULL 補完行）が
 //! [`super::JoinLimits::max_output_rows`] を超えたら、実体化する前に拒否する。確保は
@@ -36,6 +38,19 @@ pub(super) struct Tuples {
 }
 
 impl Tuples {
+    /// フラット配置のスロット列から組み立てる（`nlj` の実体化用）。長さが `n` の倍数でなければ
+    /// 内部エラー（fail-closed）。
+    pub(super) fn from_flat(n: usize, data: Vec<Option<u32>>) -> Result<Self, SqlSurfaceError> {
+        if n == 0 || !data.len().is_multiple_of(n) {
+            return Err(SqlSurfaceError::Internal {
+                detail: "JOIN tuple buffer length mismatch".to_string(),
+            });
+        }
+        Ok(Self { n, data })
+    }
+}
+
+impl Tuples {
     pub(super) fn len(&self) -> usize {
         self.data.len().checked_div(self.n).unwrap_or(0)
     }
@@ -59,9 +74,9 @@ impl Tuples {
     }
 }
 
-const SLOT_BYTES: usize = std::mem::size_of::<Option<u32>>();
+pub(super) const SLOT_BYTES: usize = std::mem::size_of::<Option<u32>>();
 
-fn to_u32(v: usize, what: &str) -> Result<u32, SqlSurfaceError> {
+pub(super) fn to_u32(v: usize, what: &str) -> Result<u32, SqlSurfaceError> {
     u32::try_from(v).map_err(|_| SqlSurfaceError::payload_too_large(what.to_string()))
 }
 
@@ -163,7 +178,7 @@ pub(super) fn run_joins(
 /// 一致ペアを 1 件追加する。`Vec` へ push する前に 1 ペア分のバイト量を共有予算へ
 /// 計上し、超過なら確保せずに `54000`（fail-closed）を返す。`join_step` から
 /// 呼ばれ、行数上限に達する前でも共有バイト予算で確保を止める。
-fn push_charged_pair(
+pub(super) fn push_charged_pair(
     pairs: &mut Vec<(u32, u32)>,
     budget: &mut JoinBudget,
     pair: (u32, u32),
@@ -191,6 +206,20 @@ fn join_step(
     // ON 残余（Issue #1830）の評価用。タプルの組み立て領域（長さ n）は確保前に計上する。
     let has_on_residual =
         !(step.on_acc.is_empty() && step.on_new.is_empty() && step.on_mixed.is_empty());
+    // Issue #1837: キー無し・ON 残余ありの段はネステッドループ結合へ振り分ける（D1。ハッシュ表を
+    // 作る前）。SQL からの到達（束縛段の `42601` 解除）は #1839。キー無し・残余無しは下の直積経路。
+    if step.keys.is_empty() && has_on_residual {
+        return super::nlj::nlj_step(
+            sides,
+            step,
+            new_rel,
+            new_rows,
+            acc,
+            budget,
+            limits,
+            stop_after_pairs,
+        );
+    }
     // Issue #1831（SQL-60）: 結合キーも ON 残余も無い段（CROSS JOIN・共通列 0 個の NATURAL）の
     // 件数は左 × 右で確定する。ハッシュ表・ペア列を確保する前に出力上限・暗黙の結果行数上限を
     // 判定する（`checked_mul` のオーバーフローも `54000`）。逐次判定は後段の安全網として残す。
