@@ -7168,8 +7168,12 @@ impl<'a> Parser<'a> {
         self.expect_keyword(Keyword::By)?;
         let mut columns: Vec<String> = Vec::new();
         let mut key_exprs: Vec<Expr> = Vec::new();
-        // グルーピング構文を読んだ後だけ `Some`（キー出現のプールとトップレベル項目の列）。
-        let mut grouping: Option<(Vec<RawGroupKey>, Vec<GroupingElement>)> = None;
+        // 句全体のキー出現のプールとトップレベル項目の列。グルーピング構文の有無は句を最後まで
+        // 読んで確定し、従来形の重複拒否・キー数上限（42601・54000）はその後に適用する
+        // （構文の出現位置・トークン順で判定が変わらないようにする）。
+        let mut pool: Vec<RawGroupKey> = Vec::new();
+        let mut items: Vec<GroupingElement> = Vec::new();
+        let mut has_grouping_syntax = false;
         loop {
             let syntax = self.peek_grouping_syntax();
             if syntax.is_some() && !self.allow_aggregate_expr_items {
@@ -7177,38 +7181,29 @@ impl<'a> Parser<'a> {
                     "GROUPING SETS, ROLLUP and CUBE are not supported in this context",
                 ));
             }
-            if syntax.is_some() && grouping.is_none() {
-                // これまでの従来形のキーを、グルーピング項目の先頭へ引き継ぐ。
-                let mut pool = Vec::new();
-                let mut items = Vec::new();
-                for name in std::mem::take(&mut columns) {
-                    let key = match group_key_expr_placeholder_index(&name) {
-                        Some(j) => {
-                            RawGroupKey::Expr(key_exprs.get(j).cloned().ok_or_else(|| {
-                                SqlSurfaceError::unsupported("invalid GROUP BY key")
-                            })?)
-                        }
-                        None => RawGroupKey::Column(name),
-                    };
-                    items.push(GroupingElement::Key(pool.len()));
-                    pool.push(key);
+            let el = match syntax {
+                Some(s) => {
+                    has_grouping_syntax = true;
+                    self.parse_grouping_syntax_element(s, 0, &mut pool)?
                 }
-                key_exprs.clear();
-                grouping = Some((pool, items));
+                None => {
+                    let key = self.parse_one_group_key()?;
+                    let id = pool.len();
+                    pool.push(key);
+                    GroupingElement::Key(id)
+                }
+            };
+            items.push(el);
+            if matches!(self.peek(), Some(Token::Punct(','))) {
+                self.advance();
+                continue;
             }
-            if let Some((pool, items)) = grouping.as_mut() {
-                let el = match syntax {
-                    Some(s) => self.parse_grouping_syntax_element(s, 0, pool)?,
-                    None => {
-                        let key = self.parse_one_group_key()?;
-                        let id = pool.len();
-                        pool.push(key);
-                        GroupingElement::Key(id)
-                    }
-                };
-                items.push(el);
-            } else {
-                match self.parse_one_group_key()? {
+            break;
+        }
+        if !has_grouping_syntax {
+            // 従来形: 重複を 42601、キー数超過を 54000 で拒否する（push 前検査と同じ順序）。
+            for key in pool {
+                match key {
                     RawGroupKey::Column(column) => {
                         if columns.contains(&column) {
                             return Err(SqlSurfaceError::unsupported(format!(
@@ -7230,19 +7225,12 @@ impl<'a> Parser<'a> {
                     }
                 }
             }
-            if matches!(self.peek(), Some(Token::Punct(','))) {
-                self.advance();
-                continue;
-            }
-            break;
-        }
-        let Some((pool, items)) = grouping else {
             return Ok(ParsedGroupBy {
                 columns,
                 key_exprs,
                 grouping_sets: None,
             });
-        };
+        }
         let expanded = expand_grouping(pool, &items)?;
         for key in expanded.keys {
             match key {
@@ -30887,6 +30875,10 @@ mod tests {
         assert_eq!(c.columns.len(), 2);
         assert_eq!(c.key_exprs.len(), 1);
         assert_eq!(c.grouping_sets, Some(vec![vec![0, 1], vec![0, 1], vec![1]]));
+        // 重複キーが構文の前後どちらにあっても同じく受理する。
+        for gb in ["lang, lang, ROLLUP(kind)", "lang, ROLLUP(kind), lang"] {
+            assert!(clause_of(gb).grouping_sets.is_some(), "{gb}");
+        }
         // 空のセットのみ。キーは 0 個。
         let c = clause_of("()");
         assert!(c.columns.is_empty());
@@ -30932,6 +30924,8 @@ mod tests {
             (format!("CUBE({cube12_dup}), ROLLUP(a)"), "54001"),
             (nested, "54001"),
             (format!("ROLLUP({})", names(9)), "54000"),
+            // 9 キーの後に 13 要素の CUBE は 54011 が先（従来形の上限検査に先取りされない）。
+            (format!("{}, CUBE({})", names(9), names(13)), "54011"),
         ] {
             let sql = format!("SELECT count(*) FROM documents GROUP BY {gb}");
             let err = validate_sql(&sql, &lookup).expect_err(&sql);
