@@ -9,6 +9,9 @@
 
 ### Added
 
+- CTE の列名リスト `WITH x(a, b) AS (...)` を受理する（Issue #1857・SQL-62 (2)）。出力列へ先頭から順に名前を付け、短いリストは残りを元の名前のまま受理する。
+  出力列より長いリストだけ `42P10`（参照されない CTE も同様）。別名付きビューの CTE 内参照も受理する。詳細は [cte.md](docs/design/cte.md)。
+  BREAKING CHANGE: 公開 enum `SqlSurfaceError` に variant（`CteColumnListTooLong`）を追加したため、網羅的な `match` は更新が要る。
 - `GROUP BY` の `ROLLUP`・`CUBE`・`GROUPING SETS` を構文解析し、グルーピングセットの列へ展開する（Issue #1821・SQL-59）。
   展開前に上限（展開後 4,096 セット・`CUBE` 12 要素）を検査し、超過は `54001`・`54011` で拒否する。詳細は [grouping-sets.md](docs/design/grouping-sets.md)。
   BREAKING CHANGE: 公開 enum `ErrorClass` と `SqlSurfaceError` に variant（`StatementTooComplex`・`TooManyColumns`）を

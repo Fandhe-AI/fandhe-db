@@ -18,8 +18,8 @@ VIEW` 本文と同一の許可パーサー（`sql::allowlist::parse_view_body`�
 ## 受理する構文
 
 ```
-WITH <name> AS (SELECT <* | 列名リスト> FROM <table | view | cte> [WHERE <単純述語> [AND ...]])
-    [, <name> AS (...)]*
+WITH <name> [(<列名>, ...)] AS (SELECT <* | 列名リスト> FROM <table | view | cte> [WHERE <単純述語> [AND ...]])
+    [, <name> [(<列名>, ...)] AS (...)]*
 <主クエリ: SELECT <* | 列名リスト> FROM <name> [WHERE ...] LIMIT n>
 ```
 
@@ -38,7 +38,7 @@ WITH <name> AS (SELECT <* | 列名リスト> FROM <table | view | cte> [WHERE <�
   指すため列検査の対象外。順位付き（`ORDER BY <ベクトル>`／`USING PLAN`）は明示的な
   メッセージで `42601` に拒否し、`WITH` 句を剥がして後段へ流すことは絶対にしない
   （同名の実テーブルを黙って読む危険があるため）。
-- `WITH RECURSIVE`・列名リスト `<name>(a, b)`・`AS MATERIALIZED`／
+- `WITH RECURSIVE`・`AS MATERIALIZED`／
   `AS NOT MATERIALIZED`・CTE 名の重複・データ変更 CTE（`WITH x AS (DELETE
   ...)` 等。body が `SELECT` 以外は受理しない）はいずれも `42601`。
 - 定義数上限（`MAX_CTE_DEFINITIONS = 16`）・連鎖の深さ上限
@@ -116,5 +116,28 @@ CTE は実体化しない（インライン展開のみ）。主クエリ（`Par
   主クエリの述語の前へ挿入される（`build_scan_from_resolved`）ため、束縛時に
   `$n` の対応先が組み立て後の述語列とトークン列上の位置とでずれる恐れがある。
   この対応ずれを解消してから別 Issue で扱う。
-- `WITH RECURSIVE`（SQL-29 で対象外）、列名リスト、`MATERIALIZED` 指定。
+- `WITH RECURSIVE`（SQL-29 で対象外）、`MATERIALIZED` 指定。
 - NoSQL（HTTP）表層での CTE（SQL-28〜30 は非対応のまま）。
+
+## Issue #1857 追記: 列名リスト（SQL-62 (2) ポインタ）
+
+`WITH <name>(a, b) AS (...)` を受理し、CTE 本文の出力列へ先頭から順に名前を付け直す。
+
+- 実現方式はビューの列別名（TABLE-41）と同じ「公開名 → 物理名」の対応表（`column_map`）。
+  読み取りは `parse_optional_view_column_aliases`、適用は `sql::view::apply_column_aliases` を
+  ビューと共有し、第 2 の実装は持たない。外側の `WHERE`・`ORDER BY`・集計は別名で書け、
+  元の名前は公開列の外として既存の列スコープ検査で拒否される。
+- リストが出力列より短いときは残りを元の名前のまま受理し、**長いときだけ `42P10`**
+  （PostgreSQL 17 と同じ。エラーコードの対応は `docs/spec/04-behavior/error-format.md`）。
+  文言には利用者が書いた CTE 名と件数だけを含める。
+- 参照されない CTE も事前検証ループで同じ検査を受ける（長すぎるリストは参照の有無に関係なく `42P10`）。
+- リスト内の重複は構文段で `42701`、短いリストの別名が残りの元の列名と重なる場合は `42702`、
+  空リスト `()` は `42601`、件数超過は `54000`。PostgreSQL は重複を参照時の曖昧エラーにするが、
+  本実装は fail-closed 側に倒して早期に拒否する（差分）。
+- CTE の連鎖（`WITH a(x) AS (...), b AS (SELECT x FROM a) ...`）では内側の対応表を伝播する。
+  従来の「列別名付きビューを CTE から参照すると `0A000`」は外し、同じ伝播で受理する。
+  段の `WHERE` は内側の公開名で検査してから物理名へ書き換える。
+- 疑似列 `id` に別名が付く形（`WITH c(x) AS (SELECT * FROM t)`）を外側の述語で参照すると、
+  ビューの列別名と同じく `0A000`（fail-closed）。投影だけなら受理される。
+- 元の名前での参照は本実装では既存の列スコープ検査の結果（`42703` 相当）に従う。
+- RLS-10 (b) の不変条件は不変。`CteDef` は列名の写像だけを追加で持ち、テナント情報を持たない。
