@@ -1052,6 +1052,13 @@ pub enum SqlSurfaceError {
     /// 一致しない（`42P10`。SQL-49・ERR-6、Issue #1707。`id` と他列の混在・未知列を含む）。
     /// 束縛段（`sql::parser::resolve_conflict_target`）が返す。固定文言で列名・値を含めない。
     InvalidColumnReference,
+    /// `WITH <name>(a, b, ...)` の列名リストが CTE 本文の出力列数より長い（`42P10`。SQL-62 (2)・
+    /// Issue #1857）。含めるのは利用者が書いた CTE 名と件数だけで、列名・値・テナント情報は含めない。
+    CteColumnListTooLong {
+        name: String,
+        available: usize,
+        specified: usize,
+    },
     /// `ORDER BY <整数>` の位置が SELECT リストの出力列の範囲外（`0`・負・列数超過。`42P10`。
     /// SQL-56 (2)・Issue #1792）。束縛段が返す。含めるのは利用者が書いた位置の値だけで、
     /// 列名・テナント情報は含めない。可否は文とスキーマだけで決まり、行の内容に依存しない。
@@ -1680,6 +1687,7 @@ impl ClassifiedError for SqlSurfaceError {
             SqlSurfaceError::PartitionedJobBusy { .. } => ErrorClass::LockNotAvailable,
             SqlSurfaceError::DuplicateColumn { .. } => ErrorClass::DuplicateColumn,
             SqlSurfaceError::InvalidColumnReference
+            | SqlSurfaceError::CteColumnListTooLong { .. }
             | SqlSurfaceError::OrderByPositionNotInSelectList { .. }
             | SqlSurfaceError::AggregateOrderByNotInArguments => ErrorClass::InvalidColumnReference,
             SqlSurfaceError::InsufficientPrivilege
@@ -1935,6 +1943,14 @@ impl std::fmt::Display for SqlSurfaceError {
             SqlSurfaceError::InvalidColumnReference => write!(
                 f,
                 "there is no unique or exclusion constraint matching the ON CONFLICT specification"
+            ),
+            SqlSurfaceError::CteColumnListTooLong {
+                name,
+                available,
+                specified,
+            } => write!(
+                f,
+                "WITH query \"{name}\" has {available} columns available but {specified} columns specified"
             ),
             SqlSurfaceError::OrderByPositionNotInSelectList { position } => {
                 write!(f, "ORDER BY position {position} is not in select list")
@@ -14867,7 +14883,7 @@ impl<'a> Parser<'a> {
         Ok((names, if_exists, behavior))
     }
 
-    /// `WITH <name> AS (<body>)[, <name> AS (<body>)]*`（非再帰 CTE。SQL-29 (b)・
+    /// `WITH <name> [(<列名>, ...)] AS (<body>)[, ...]*`（非再帰 CTE。SQL-29 (b)・
     /// RLS-10 (b)、TASK-213、Issue #928）を切り出し、各定義を
     /// [`super::cte::CteDef`] へ積む。`<body>` は [`parse_view_body`]（`CREATE
     /// VIEW` 本文と同一の許可パーサー）で検証する——本関数は第 2 の SELECT
@@ -14876,7 +14892,7 @@ impl<'a> Parser<'a> {
     /// （主クエリ）を [`super::cte::resolve_relation`] へ渡す。
     ///
     /// 受理しない形（いずれも `42601`。SQL-29 (b) の対象外規定）:
-    /// `WITH RECURSIVE`・列名リスト `<name>(a, b)`・`MATERIALIZED`／
+    /// `WITH RECURSIVE`・`MATERIALIZED`／
     /// `NOT MATERIALIZED` 指定・本文内の `;`（`split_parenthesized` で切り出した
     /// 括弧内トークン列に対して明示的に検査する。`parse_view_body` の
     /// `expect_end_of_statement` は末尾の単一 `;` を許容してしまうため、
@@ -14893,13 +14909,10 @@ impl<'a> Parser<'a> {
         let mut ctes: Vec<super::cte::CteDef> = Vec::new();
         loop {
             let name = self.expect_ident()?;
-            // `AS` を消費する前に `(` が現れるのは列名リスト形のみ（本文の
-            // `(` は必ず `AS` の後）。
-            if matches!(self.peek(), Some(Token::Punct('('))) {
-                return Err(SqlSurfaceError::unsupported(
-                    "CTE column name list is not supported",
-                ));
-            }
+            // `AS` を消費する前に `(` が現れるのは列名リスト形のみ（本文の `(` は必ず `AS` の後）。
+            // ビューの列別名リストと同じ読み取り（件数上限 `54000`・リスト内重複 `42701`・
+            // 空リスト `42601`）を共有する（SQL-62 (2)・Issue #1857）。
+            let column_aliases = self.parse_optional_view_column_aliases()?;
             self.expect_ident_matching("AS")?;
             if self.peek_ident_matches("MATERIALIZED") || self.peek_ident_matches("NOT") {
                 return Err(SqlSurfaceError::unsupported(
@@ -14919,7 +14932,11 @@ impl<'a> Parser<'a> {
             }
             let body = parse_view_body(inner)?;
             super::cte::check_no_duplicate_name(&ctes, &name)?;
-            ctes.push(super::cte::CteDef { name, body });
+            ctes.push(super::cte::CteDef {
+                name,
+                column_aliases,
+                body,
+            });
             super::cte::check_definition_count(
                 ctes.len(),
                 self.nesting_limits.max_cte_definitions(),
@@ -21587,6 +21604,11 @@ fn validate_sql_tokens_impl(
                     &def.body.where_predicates,
                     &[],
                 )?;
+                // 列名リスト（SQL-62 (2)・Issue #1857）の長さ・重複も、参照の有無に関係なく
+                // ここで検査する（参照されない CTE の長すぎるリストを通さない）。結果は捨てる。
+                if !def.column_aliases.is_empty() {
+                    super::cte::compose(lookup, resolved, def)?;
+                }
             }
             let mut budget = super::cte::ResolveBudget::new();
             let resolved = super::cte::resolve_relation(
@@ -34867,15 +34889,49 @@ mod tests {
         assert_eq!(err.wire_code(), "42601");
     }
 
+    /// SQL-62 (2)・Issue #1857: CTE 列名リストの受理・`42P10`・各種拒否。
     #[test]
-    fn rejects_cte_column_name_list() {
+    fn cte_column_name_list_accept_and_reject() {
         let lookup = catalog_with(&["documents"]);
-        let err = validate_sql(
-            "WITH x (a) AS (SELECT id FROM documents) SELECT * FROM x LIMIT 10",
-            &lookup,
-        )
-        .expect_err("CTE column name list must be rejected");
-        assert_eq!(err.wire_code(), "42601");
+        for sql in [
+            // 全件のリスト・短いリスト・リスト無し
+            "WITH x (a, b) AS (SELECT id, lang FROM documents) SELECT a, b FROM x LIMIT 10",
+            "WITH x (a) AS (SELECT id, lang FROM documents) SELECT a, lang FROM x LIMIT 10",
+            // 連鎖（別名の上に別名・別名なしの段）
+            "WITH x (a) AS (SELECT id FROM documents), y AS (SELECT a FROM x) SELECT a FROM y LIMIT 10",
+        ] {
+            validate_sql(sql, &lookup).unwrap_or_else(|e| panic!("sql={sql} err={e}"));
+        }
+        let cases: [(&str, &str); 5] = [
+            // 長いリストは参照の有無によらず 42P10
+            (
+                "WITH x (a, b, c) AS (SELECT id, lang FROM documents) SELECT a FROM x LIMIT 10",
+                "42P10",
+            ),
+            (
+                "WITH x (a, b, c) AS (SELECT id, lang FROM documents) SELECT id FROM documents LIMIT 10",
+                "42P10",
+            ),
+            // 空リストは構文エラー
+            (
+                "WITH x () AS (SELECT id FROM documents) SELECT id FROM x LIMIT 10",
+                "42601",
+            ),
+            // リスト内の重複は 42701
+            (
+                "WITH x (a, a) AS (SELECT id, lang FROM documents) SELECT a FROM x LIMIT 10",
+                "42701",
+            ),
+            // 短いリストの別名が残りの元の列名と重なる場合は 42702
+            (
+                "WITH x (lang) AS (SELECT id, lang FROM documents) SELECT lang FROM x LIMIT 10",
+                "42702",
+            ),
+        ];
+        for (sql, code) in cases {
+            let err = validate_sql(sql, &lookup).expect_err(sql);
+            assert_eq!(err.wire_code(), code, "sql={sql}");
+        }
     }
 
     #[test]
