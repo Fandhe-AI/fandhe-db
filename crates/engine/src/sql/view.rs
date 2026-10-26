@@ -617,6 +617,14 @@ pub(crate) fn check_aggregate_columns_within_view(
     group_by: Option<&GroupByClause>,
     where_predicates: &[WherePredicate],
 ) -> Result<(), SqlSurfaceError> {
+    // Issue #1817・SQL-58: `GROUP BY` 式キーは単純ビューの外側では未対応（fail-closed。式が
+    // 非公開列を参照して filter oracle になる経路を作らない。予約内部名が公開列検査へ流れて
+    // 分かりにくい `42703` になるのも防ぐ）。
+    if group_by.is_some_and(|g| !g.key_exprs.is_empty()) {
+        return Err(SqlSurfaceError::feature_not_supported(
+            "GROUP BY expressions are not supported over a view",
+        ));
+    }
     let Some(columns) = view_columns else {
         return Ok(());
     };

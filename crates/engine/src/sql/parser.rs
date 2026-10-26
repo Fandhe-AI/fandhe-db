@@ -6670,6 +6670,11 @@ pub(crate) struct BoundOrderBy {
 #[derive(Debug, Clone, PartialEq)]
 pub(crate) struct BoundGroupBy {
     pub(crate) keys: Vec<BoundOrderKey>,
+    /// 式キー（`GROUP BY upper(name)`・`GROUP BY n / 2`。Issue #1817・SQL-58）の実行形。
+    /// [`BoundOrderTarget::Expr`] の添字先。`sql::group_by` の全走査が可視性判定・`WHERE`・
+    /// 可視性の再検査を通った行に限って行ごとに評価し、その値でグループ化する。
+    /// 直接構築経路（NoSQL）は常に空。
+    pub(crate) key_exprs: Vec<BoundGroupKeyExpr>,
     pub(crate) having: Vec<BoundHaving>,
     /// 式述語の `HAVING`（Issue #1188・SQL-26）をステップ列コンパイルした実行形。
     /// 「グループ出力行ビュー」（[`group_row_schema`]。`keys`・`items` の順に並ぶ列）を
@@ -6700,6 +6705,20 @@ pub(crate) struct BoundGroupBy {
     /// 知らないため既定 `None`。呼び出し段（`core`）が [`BoundAggregate::with_result_cap`] で
     /// 設定し、HAVING なしのときだけ新規グループ追加時に `offset + cap` 超過で中断する。
     pub(crate) result_cap: Option<usize>,
+}
+
+/// 束縛済みの `GROUP BY` 式キー 1 つ（Issue #1817・SQL-58）。基表スキーマに対して投影モード
+/// （PostgreSQL の結果型の算術）で束縛した式で、`sql::group_by` が行ごとに `program` を評価する。
+#[derive(Debug, Clone, PartialEq)]
+pub(crate) struct BoundGroupKeyExpr {
+    /// デコードマスク（`ReferencedColumns`）導出用の束縛済み式木。
+    pub(crate) source: crate::sql::udf_call::BoundExpr,
+    /// コンパイル済みステップ列。
+    pub(crate) program: crate::sql::expr_program::ExprProgram,
+    /// 式の静的型。
+    pub(crate) ty: crate::sql::udf_call::ExprType,
+    /// 結果列型（RowDescription 用。式キーの値の出力は #1818 が使う。`None` は公告できない型）。
+    pub(crate) result_ty: Option<ColumnType>,
 }
 
 impl BoundGroupBy {
@@ -7065,6 +7084,7 @@ impl BoundAggregate {
             projection,
             group_by: Some(BoundGroupBy {
                 keys,
+                key_exprs: Vec::new(),
                 having: bound_having,
                 having_exprs: Vec::new(),
                 order_exprs: Vec::new(),
@@ -8581,8 +8601,8 @@ pub(crate) type BoundOrderExprs = Vec<(
 pub(crate) enum BoundOrderTarget {
     Id,
     Column(usize),
-    /// 式キー（Issue #1188）。[`BoundScan::order_exprs`] の添字。広域取得の
-    /// `ORDER BY` 専用で、`GROUP BY` キーには現れない。
+    /// 式キー（Issue #1188）。広域取得の `ORDER BY` では [`BoundScan::order_exprs`] の添字、
+    /// 集計の `GROUP BY` キー（Issue #1817・SQL-58）では [`BoundGroupBy::key_exprs`] の添字。
     Expr(usize),
 }
 
@@ -8760,6 +8780,39 @@ fn order_kind_for_expr_type(
                 detail: "ORDER BY a CAST result expression is not supported yet".to_string(),
             })
         }
+    }
+}
+
+/// `GROUP BY` 式キーの静的型からグループ化の比較規約を決める（Issue #1817・SQL-58）。
+/// [`order_kind_for_expr_type`] との違いは拒否の分類で、VECTOR は列キーと同じ `22000`、
+/// INTERVAL・jsonb・numeric・uuid・bytea・配列は代表値（正規化等価）や比較キーの規則が
+/// 未確定のため `0A000`、`json`（原文保存）は等値演算子が無いため PostgreSQL と同じ `42883`
+/// （fail-closed。黙って別の等価で束ねない）。
+fn group_key_kind_for_expr_type(
+    ty: crate::sql::udf_call::ExprType,
+) -> Result<OrderKind, SqlSurfaceError> {
+    use crate::sql::udf_call::ExprType;
+    match ty {
+        ExprType::Scalar => Ok(OrderKind::Float),
+        ExprType::Text => Ok(OrderKind::Bytes),
+        ExprType::Bool => Ok(OrderKind::Bool),
+        ExprType::Date | ExprType::Timestamp | ExprType::Time | ExprType::TimestampTz => {
+            Ok(OrderKind::SignedInt)
+        }
+        ExprType::Vector => Err(SqlSurfaceError::invalid_input(
+            "GROUP BY expression must not be of type VECTOR",
+        )),
+        ExprType::JsonText => Err(SqlSurfaceError::undefined_function(
+            "could not identify an equality operator for type json",
+        )),
+        ExprType::Interval
+        | ExprType::Json
+        | ExprType::Numeric
+        | ExprType::Uuid
+        | ExprType::Bytea
+        | ExprType::Array => Err(SqlSurfaceError::FeatureNotSupported {
+            detail: "GROUP BY on an expression of this type is not supported yet".to_string(),
+        }),
     }
 }
 
@@ -10067,7 +10120,38 @@ fn bind_group_by_clause(
     // 直接構築経由（[`BoundAggregate::new_grouped_by_columns`]・TASK-186・
     // NOSQL-5）が [`resolve_group_by_key`] を共有する。
     let mut keys = Vec::with_capacity(clause.columns.len());
+    let mut key_exprs: Vec<BoundGroupKeyExpr> = Vec::with_capacity(clause.key_exprs.len());
     for column in &clause.columns {
+        // Issue #1817・SQL-58: 予約内部名の位置は式キー。基表スキーマへ投影モード（整数除算等の
+        // PostgreSQL の結果型の算術）で束縛する。行ビュー上の型は `BYTEA` 番兵のままなので、
+        // 式キーを SELECT／HAVING／ORDER BY から参照する形は式束縛が `22000` で拒否する
+        // （構造一致による参照は #1818）。
+        if let Some(j) = crate::sql::allowlist::group_key_expr_placeholder_index(column) {
+            let expr = clause.key_exprs.get(j).ok_or_else(|| {
+                crate::sql::aggregate::accumulator_bug("GROUP BY expression key out of range")
+            })?;
+            let (bound, ty, result_ty) = crate::sql::udf_call::bind_projection_expr_json_ok(
+                expr,
+                schema,
+                udfs,
+                node_budget,
+            )?;
+            let kind = group_key_kind_for_expr_type(ty)?;
+            keys.push(BoundOrderKey {
+                target: BoundOrderTarget::Expr(key_exprs.len()),
+                kind,
+                descending: false,
+                nulls: NullPlacement::pg_default(false),
+                collation: crate::collation::Collation::DEFAULT,
+            });
+            key_exprs.push(BoundGroupKeyExpr {
+                program: crate::sql::expr_program::ExprProgram::compile(&bound),
+                source: bound,
+                ty,
+                result_ty,
+            });
+            continue;
+        }
         keys.push(resolve_group_by_key(schema, column)?);
     }
 
@@ -10334,6 +10418,7 @@ fn bind_group_by_clause(
     }
     Ok(BoundGroupBy {
         keys,
+        key_exprs,
         having,
         having_exprs,
         order_exprs,

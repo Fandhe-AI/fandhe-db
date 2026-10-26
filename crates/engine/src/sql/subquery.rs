@@ -356,7 +356,18 @@ fn aggregate_referenced_columns(validated: &ValidatedAggregate) -> HashSet<Strin
         item.collect_referenced_idents(&mut cols);
     }
     if let Some(group_by) = &validated.group_by {
-        cols.extend(group_by.columns.iter().cloned());
+        // Issue #1817・SQL-58: 式キーの予約内部名は列名ではないため除き、式木の識別子を集める
+        // （サブクエリ内の式キーは構文段が拒否済みのため通常は到達しない多層防御）。
+        cols.extend(
+            group_by
+                .columns
+                .iter()
+                .filter(|c| crate::sql::allowlist::group_key_expr_placeholder_index(c).is_none())
+                .cloned(),
+        );
+        for e in &group_by.key_exprs {
+            super::parser::collect_expr_idents(e, &mut cols);
+        }
         group_by.collect_having_aggregate_idents(&mut cols);
     }
     super::parser::collect_where_predicate_idents(&validated.where_predicates, &mut cols);

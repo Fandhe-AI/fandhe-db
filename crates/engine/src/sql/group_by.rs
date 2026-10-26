@@ -31,6 +31,12 @@
 //! （[`new_accumulators`]・[`accumulate_row`] 参照）。FINISH 段では
 //! `string_groups` の昇順走査のあとに `null_group` を末尾へ連結することで、
 //! 分割前の `GroupKey::Ord`（非 NULL 昇順 → NULL 末尾）と同一の走査順を保つ。
+//!
+//! Issue #1817（SQL-58）: `GROUP BY` キー式（[`BoundGroupBy::key_exprs`]）を含む文は、単一 TEXT
+//! キー専用の索引経路を使わず全走査の `multi_groups` で集計する。キー式は可視性判定・`WHERE`・
+//! 可視性の再検査を通った行に限って評価する（不可視行の値で評価エラーが起きると他テナントの行の
+//! 存在が漏れるため。評価エラーは文全体の失敗で、部分結果は返さない）。式キーの値の出力
+//! （SELECT／HAVING／ORDER BY との構造一致）は #1818 の管轄で、出力経路の式キー分岐は fail-closed。
 
 use crate::catalog::{self, TableSchema};
 use crate::declarative_filter;
@@ -44,9 +50,9 @@ use crate::sql::allowlist::{SqlSurfaceError, MAX_GROUP_BY_COLUMNS};
 use crate::sql::exec::{Cell, ColumnMeta, QueryResult, ResultRow};
 use crate::sql::expr_program::StackValue;
 use crate::sql::order_value::{
-    compare_key_refs, compare_nullable, compare_order_key, expr_value_to_order_value,
-    extract_order_value_ref, order_value_to_cell, scalar_key_ref_to_owned, NullPlacement,
-    OrderValue, ScalarKeyRef,
+    compare_key_refs, compare_nullable, compare_order_key, expr_value_to_key_ref,
+    expr_value_to_order_value, extract_order_value_ref, order_value_to_cell,
+    scalar_key_ref_to_owned, NullPlacement, OrderValue, ScalarKeyRef,
 };
 use crate::sql::parser::{
     BoundAggregate, BoundGroupBy, BoundOrderTarget, OrderKind, OrderTarget, ProjectionColumn,
@@ -1445,7 +1451,7 @@ pub(crate) fn execute_grouped_aggregate(
     // DecodeTier::Fast`（ヘッダのみ）は選ばず、embedding 参照の有無だけで
     // `DimAndScalar`／`Embedding` の 2 段階を切り替える。
     let key_columns = group_by.column_indices();
-    let referenced = ReferencedColumns::derive(
+    let mut referenced = ReferencedColumns::derive(
         schema,
         &bound.items,
         &bound.metadata_filters,
@@ -1453,6 +1459,8 @@ pub(crate) fn execute_grouped_aggregate(
         &bound.or_filters,
         &key_columns,
     );
+    // Issue #1817・SQL-58: 式キーが参照する列・embedding もデコード対象へ反映する。
+    referenced.include_group_key_exprs(group_by.key_exprs.iter().map(|k| &k.source));
     let tier = if referenced.needs_embedding() {
         DecodeTier::Embedding
     } else {
@@ -1918,11 +1926,41 @@ pub(crate) fn execute_grouped_aggregate(
                             "GROUP BY column count exceeds MAX_GROUP_BY_COLUMNS at execution time",
                         ));
                     }
+                    // Issue #1817・SQL-58: 式キーはこの行（可視性判定・本体デコード・`WHERE`・
+                    // 可視性の再検査を通過済み）に限って評価する。不可視行・`WHERE` 非該当行の
+                    // 値で評価エラー（`22012` 等）が起きると他テナントの行の存在が漏れるため、
+                    // 評価位置をここ以前へ移してはならない。評価エラーは文全体を失敗させる
+                    // （部分結果を返さない）。
+                    let key_embedding: &[f32] = match tier {
+                        DecodeTier::Embedding => embedding_scratch.as_slice(),
+                        DecodeTier::Fast | DecodeTier::DimAndScalar => &[],
+                    };
+                    let mut evaluated: [Option<ExprValue<'_>>; MAX_GROUP_BY_COLUMNS] =
+                        Default::default();
+                    for (slot, key_expr) in evaluated.iter_mut().zip(&group_by.key_exprs) {
+                        *slot = Some(key_expr.program.eval(
+                            id,
+                            key_embedding,
+                            &scanned,
+                            &mut expr_scratch,
+                        )?);
+                    }
                     let mut borrowed_storage: [Option<ScalarKeyRef<'_>>; MAX_GROUP_BY_COLUMNS] =
                         [None; MAX_GROUP_BY_COLUMNS];
                     let mut key_len: usize = 0;
                     for (slot, key) in borrowed_storage.iter_mut().zip(&group_by.keys) {
-                        let value = extract_order_value_ref(schema, key, id, &scanned)?;
+                        let value = match key.target {
+                            BoundOrderTarget::Expr(j) => {
+                                let evaluated_value =
+                                    evaluated.get(j).and_then(Option::as_ref).ok_or_else(|| {
+                                        accumulator_bug("GROUP BY expression key was not evaluated")
+                                    })?;
+                                expr_value_to_key_ref(evaluated_value, key.kind, key.collation)?
+                            }
+                            BoundOrderTarget::Id | BoundOrderTarget::Column(_) => {
+                                extract_order_value_ref(schema, key, id, &scanned)?
+                            }
+                        };
                         key_len = key_len
                             .checked_add(key_component_budget_bytes(value.as_ref()))
                             .ok_or_else(|| {
@@ -2966,6 +3004,7 @@ mod tests {
                 },
             ],
             group_by: Some(BoundGroupBy {
+                key_exprs: Vec::new(),
                 having_exprs: Vec::new(),
                 order_exprs: Vec::new(),
                 with_ties: false,
@@ -3121,6 +3160,7 @@ mod tests {
                 },
             ],
             group_by: Some(BoundGroupBy {
+                key_exprs: Vec::new(),
                 having_exprs: Vec::new(),
                 order_exprs: Vec::new(),
                 with_ties: false,
@@ -3611,6 +3651,7 @@ mod tests {
                 },
             ],
             group_by: Some(BoundGroupBy {
+                key_exprs: Vec::new(),
                 having_exprs: Vec::new(),
                 order_exprs: Vec::new(),
                 with_ties: false,
