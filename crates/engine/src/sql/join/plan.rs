@@ -799,6 +799,8 @@ pub(super) fn build_plan<'a>(
         None => Vec::new(),
     };
     let mut has_using = false;
+    // キー無し ON の FULL の段番号（Issue #1838）。束縛完了後に判定する。
+    let mut keyless_full_on: Vec<usize> = Vec::new();
     for (k, step) in validated.steps.iter().enumerate() {
         let upto = k + 2;
         let new_rel = k + 1;
@@ -826,7 +828,11 @@ pub(super) fn build_plan<'a>(
                 // ON の AND 連鎖を結合キーと残余述語へ分解する（Issue #1829・SQL-60 ポインタ）。
                 // 列解決エラーは分類より前に確定する。
                 let split = classify_on(on, &step_scope, new_rel)?;
-                if split.keys.is_empty() {
+                if split.keys.is_empty() && step.kind == JoinKind::Full {
+                    // Issue #1838（D11）: キー無し FULL はここでは拒否せず、束縛をすべて終えた後
+                    // （WHERE の外部結合簡約の後）で `0A000` か従来の `42601` を決める。
+                    keyless_full_on.push(k);
+                } else if split.keys.is_empty() {
                     return Err(SqlSurfaceError::unsupported(
                         "JOIN ON condition must reference both sides of the join",
                     ));
@@ -1016,6 +1022,23 @@ pub(super) fn build_plan<'a>(
             physical_order_keys: Vec::new(),
             with_ties: false,
         });
+    }
+
+    // Issue #1838（D11）: キー無し ON の FULL の判定。列解決・型エラー（解析段）がすべて済んだ後に、
+    // WHERE の strict 述語による外部結合の簡約結果で決める（PostgreSQL も簡約を結合方式の選択より
+    // 先に行う）。両側の保存が残る段は `0A000`。片側以下に簡約された段は NLJ 経路の SQL 到達（#1839）
+    // まで従来の `42601`。判定は束縛結果だけで決まり、行データ（テナントの可視行）に依存しない。
+    for &k in &keyless_full_on {
+        if let Some(s) = steps.get(k) {
+            if s.keys.is_empty() && s.preserve_acc && s.preserve_new {
+                return Err(SqlSurfaceError::feature_not_supported(
+                    "FULL JOIN is only supported with merge-joinable or hash-joinable join conditions",
+                ));
+            }
+            return Err(SqlSurfaceError::unsupported(
+                "JOIN ON condition must reference both sides of the join",
+            ));
+        }
     }
 
     Ok(JoinPlan {
