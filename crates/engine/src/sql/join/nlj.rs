@@ -6,9 +6,10 @@
 //! 比較回数・事前判定の積はいずれも自テナントの可視データだけで決まる。述語の評価は
 //! `residual::eval_all`（`ResNode`）を共有し、第 2 の評価器は作らない。
 //!
-//! 現状は INNER のみ。外部結合（`preserve_acc`／`preserve_new`）の未一致追跡は #1838、
-//! SQL からの到達（束縛段の `42601` 解除）は #1839 で行うため、外部結合の段は黙って INNER として
-//! 実行せず fail-closed の内部エラーで拒否する。
+//! 外部結合（Issue #1838。D10・D11）: 保存側（`preserve_acc`／`preserve_new`）ごとに一致フラグを
+//! 持ち、`on_acc`／`on_new` で落ちた要素も未一致として NULL 補完行にする。キー無し FULL は
+//! 束縛段（`plan.rs`）が `0A000` で拒否し、ここにも多重防御を置く。SQL からの到達
+//! （束縛段の `42601` 解除）は #1839。
 //!
 //! 上限（いずれも `54000`。部分結果は返さない）: 比較回数は文全体で 1 つの予算
 //! （[`super::JoinBudget::charge_comparisons`]。D5）で、`on_mixed` の評価前に
@@ -21,7 +22,7 @@ use crate::sql::allowlist::SqlSurfaceError;
 use crate::sql::exec::ResultRow;
 use crate::sql::expr_program::StackValue;
 
-use super::exec::{push_charged_pair, to_u32, Tuples, SLOT_BYTES};
+use super::exec::{materialize_step, push_charged_pair, to_u32, Tuples, SLOT_BYTES};
 use super::plan::StepPlan;
 use super::residual::eval_all;
 use super::{JoinBudget, JoinLimits};
@@ -32,7 +33,8 @@ fn relation_out_of_range() -> SqlSurfaceError {
     }
 }
 
-/// NLJ 1 段（INNER）。`acc`（relation 0..=k の結合結果）に relation `new_rel` を加える。
+/// NLJ 1 段（INNER／LEFT／RIGHT。キー無し FULL は `0A000`）。
+/// `acc`（relation 0..=k の結合結果）に relation `new_rel` を加える。
 /// 引数は `exec::join_step` と同じ（呼び出し元は `join_step` のみ）。
 // `join_step` と同じ 8 引数（最終段の停止閾値 Issue #1797 を含む）。
 #[allow(clippy::too_many_arguments)]
@@ -46,11 +48,12 @@ pub(super) fn nlj_step(
     limits: &JoinLimits,
     stop_after_pairs: Option<usize>,
 ) -> Result<Tuples, SqlSurfaceError> {
-    // 外部結合の未一致追跡は #1838。ここで INNER として黙って返すと行が欠落する（fail-open）ため拒否する。
-    if step.preserve_acc || step.preserve_new {
-        return Err(SqlSurfaceError::Internal {
-            detail: "nested-loop join does not support outer joins yet".to_string(),
-        });
+    // 多重防御（D11）: キー無し FULL は束縛段（plan.rs）が `0A000` で拒否済み。ここへ届いた場合も
+    // 黙って片側を落とさず同じ `0A000` で拒否する（fail-closed）。
+    if step.preserve_acc && step.preserve_new {
+        return Err(SqlSurfaceError::feature_not_supported(
+            "FULL JOIN is only supported with merge-joinable or hash-joinable join conditions",
+        ));
     }
     if !step.keys.is_empty() {
         return Err(SqlSurfaceError::Internal {
@@ -96,13 +99,44 @@ pub(super) fn nlj_step(
         inner.push(idx_u32);
     }
 
+    // 保存側の未一致フラグ（D10）。`on_acc`／`on_new` で落ちた要素は `false` のまま残り、
+    // 保存側なら NULL 補完の対象になる。確保前に予算へ計上する（D8）。
+    let mut matched_acc: Vec<bool> = if step.preserve_acc {
+        budget.charge(acc_len)?;
+        vec![false; acc_len]
+    } else {
+        Vec::new()
+    };
+    let mut matched_new: Vec<bool> = if step.preserve_new {
+        budget.charge(new_rows.len())?;
+        vec![false; new_rows.len()]
+    } else {
+        Vec::new()
+    };
+
     // 事前判定（確保・評価の前。可視行の件数だけで決まり、LIMIT／OFFSET に依存しない）。
     let product = outer.len().checked_mul(inner.len());
     if step.on_mixed.is_empty() {
-        // D3: 比較 0 回。出力件数（通過 acc × 通過 new）を出力上限・停止閾値で判定する。
-        match product {
-            Some(p) if p <= limits.max_output_rows => {
-                if matches!(stop_after_pairs, Some(t) if p > t) {
+        // D3: 比較 0 回。出力件数（一致ペア＋保存側の未一致＝NULL 補完行）を出力上限で、
+        // 一致ペア数を停止閾値で判定する。未一致件数は走査前に確定する。
+        let unmatched_acc = if step.preserve_acc {
+            acc_len.saturating_sub(if inner.is_empty() { 0 } else { outer.len() })
+        } else {
+            0
+        };
+        let unmatched_new = if step.preserve_new {
+            new_rows
+                .len()
+                .saturating_sub(if outer.is_empty() { 0 } else { inner.len() })
+        } else {
+            0
+        };
+        let total = product
+            .and_then(|p| p.checked_add(unmatched_acc))
+            .and_then(|t| t.checked_add(unmatched_new));
+        match (product, total) {
+            (Some(p), Some(t)) if t <= limits.max_output_rows => {
+                if matches!(stop_after_pairs, Some(s) if p > s) {
                     return Err(crate::sql::scan::row_limit_exceeded());
                 }
             }
@@ -146,6 +180,12 @@ pub(super) fn nlj_step(
                 }
             }
             push_charged_pair(&mut pairs, budget, (ti, ni))?;
+            if let Some(m) = matched_acc.get_mut(ti as usize) {
+                *m = true;
+            }
+            if let Some(m) = matched_new.get_mut(ni as usize) {
+                *m = true;
+            }
             if pairs.len() > limits.max_output_rows {
                 return Err(SqlSurfaceError::payload_too_large(
                     "JOIN result exceeds the row limit",
@@ -157,25 +197,17 @@ pub(super) fn nlj_step(
         }
     }
 
-    // 実体化（INNER なので一致ペアだけ）。
-    let total = pairs.len();
-    budget.charge(total.saturating_mul(n).saturating_mul(SLOT_BYTES))?;
-    let mut data: Vec<Option<u32>> = Vec::with_capacity(total.saturating_mul(n));
-    for &(ti, ni) in &pairs {
-        let base = acc
-            .get(ti as usize)
-            .ok_or_else(|| SqlSurfaceError::Internal {
-                detail: "JOIN accumulated tuple index out of range".to_string(),
-            })?;
-        for j in 0..n {
-            if j == new_rel {
-                data.push(Some(ni));
-            } else {
-                data.push(base.get(j).copied().flatten());
-            }
-        }
-    }
-    Tuples::from_flat(n, data)
+    // 実体化（一致ペア＋保存側の NULL 補完行。合計を出力上限と照合してから確保する）。
+    materialize_step(
+        acc,
+        new_rel,
+        &pairs,
+        &matched_acc,
+        &matched_new,
+        step,
+        budget,
+        limits,
+    )
 }
 
 #[cfg(test)]
@@ -420,17 +452,264 @@ mod nlj_tests {
         assert_eq!(r.err().unwrap().wire_code(), "57014");
     }
 
-    /// 外部結合の段は黙って INNER として実行せず fail-closed で拒否する（#1838 で置換）。
+    fn opt_pairs(t: &Tuples) -> Vec<(Option<u32>, Option<u32>)> {
+        (0..t.len())
+            .map(|i| {
+                let x = t.get(i).unwrap();
+                (x[0], x[1])
+            })
+            .collect()
+    }
+
+    fn outer_step(
+        pa: bool,
+        pn: bool,
+        on_acc: Vec<ResNode>,
+        on_new: Vec<ResNode>,
+        on_mixed: Vec<ResNode>,
+    ) -> StepPlan {
+        let mut st = step(on_acc, on_new, on_mixed);
+        st.preserve_acc = pa;
+        st.preserve_new = pn;
+        st
+    }
+
+    fn lt() -> ResNode {
+        cmp((0, 0), BinOp::Lt, (1, 0))
+    }
+
+    /// SQL-60 (D11): 両側保存（FULL）の段は実行器でも `0A000` で拒否する。LEFT／RIGHT 単独は受け付ける。
     #[test]
-    fn outer_join_step_is_rejected() {
+    fn full_step_is_rejected_with_0a000() {
         let sides = vec![col(&[1]), col(&[2])];
+        let st = outer_step(true, true, vec![], vec![], vec![lt()]);
+        let (r, _) = run_one(&sides, &st, &limits(100, 100), None);
+        assert_eq!(r.err().unwrap().wire_code(), "0A000");
         for (pa, pn) in [(true, false), (false, true)] {
-            let mut st = step(vec![], vec![], vec![cmp((0, 0), BinOp::Lt, (1, 0))]);
-            st.preserve_acc = pa;
-            st.preserve_new = pn;
-            let (r, _) = run_one(&sides, &st, &limits(100, 100), None);
-            assert!(r.is_err());
+            let st = outer_step(pa, pn, vec![], vec![], vec![lt()]);
+            assert!(run_one(&sides, &st, &limits(100, 100), None).0.is_ok());
         }
+    }
+
+    /// SQL-60 (D10): LEFT。一致なし・複数一致・混在で未一致の acc が NULL 補完される。
+    #[test]
+    fn left_join_preserves_unmatched_acc() {
+        let st = outer_step(true, false, vec![], vec![], vec![lt()]);
+        // 一致なし
+        let sides = vec![col(&[5, 6]), col(&[1, 2])];
+        let (r, _) = run_one(&sides, &st, &limits(100, 100), None);
+        assert_eq!(
+            opt_pairs(&r.unwrap()),
+            vec![(Some(0), None), (Some(1), None)]
+        );
+        // 複数一致 + 混在（acc=1 は 2 行に一致、acc=9 は未一致）
+        let sides = vec![col(&[1, 9]), col(&[2, 3])];
+        let (r, _) = run_one(&sides, &st, &limits(100, 100), None);
+        assert_eq!(
+            opt_pairs(&r.unwrap()),
+            vec![(Some(0), Some(0)), (Some(0), Some(1)), (Some(1), None)]
+        );
+        // 新 relation が空: 比較 0 回で全件補完
+        let sides = vec![col(&[1, 2]), col(&[])];
+        let (r, b) = run_one(&sides, &st, &limits(100, 100), None);
+        assert_eq!(
+            opt_pairs(&r.unwrap()),
+            vec![(Some(0), None), (Some(1), None)]
+        );
+        assert_eq!(b.comparisons_used, 0);
+        // acc が空
+        let sides = vec![col(&[]), col(&[1])];
+        assert_eq!(
+            run_one(&sides, &st, &limits(100, 100), None)
+                .0
+                .unwrap()
+                .len(),
+            0
+        );
+    }
+
+    /// SQL-60 (D10): LEFT。NULL セルは一致せず補完される。`on_acc` が偽のタプルは比較されず補完される。
+    #[test]
+    fn left_join_null_and_on_acc_filtered() {
+        let st = outer_step(true, false, vec![], vec![], vec![lt()]);
+        let sides = vec![rel(&[&[None], &[Some(1)]]), col(&[2])];
+        let (r, _) = run_one(&sides, &st, &limits(100, 100), None);
+        assert_eq!(
+            opt_pairs(&r.unwrap()),
+            vec![(Some(1), Some(0)), (Some(0), None)]
+        );
+        // on_acc が常に偽（a.x > a.x）のタプルは比較されず全件補完される（比較 0 回）
+        let st = outer_step(
+            true,
+            false,
+            vec![cmp((0, 0), BinOp::Gt, (0, 0))],
+            vec![],
+            vec![lt()],
+        );
+        let sides = vec![col(&[1, 2]), col(&[3])];
+        let (r, b) = run_one(&sides, &st, &limits(100, 100), None);
+        assert_eq!(
+            opt_pairs(&r.unwrap()),
+            vec![(Some(0), None), (Some(1), None)]
+        );
+        assert_eq!(b.comparisons_used, 0);
+    }
+
+    /// SQL-60 (D10): RIGHT。一致なし・複数一致・`on_new` で落ちた行の補完・acc 空。
+    #[test]
+    fn right_join_preserves_unmatched_new() {
+        let st = outer_step(false, true, vec![], vec![], vec![lt()]);
+        let sides = vec![col(&[5]), col(&[1, 2])];
+        let (r, _) = run_one(&sides, &st, &limits(100, 100), None);
+        assert_eq!(
+            opt_pairs(&r.unwrap()),
+            vec![(None, Some(0)), (None, Some(1))]
+        );
+        // 1 つの新行に複数 acc が一致
+        let sides = vec![col(&[1, 2]), col(&[3, 0])];
+        let (r, _) = run_one(&sides, &st, &limits(100, 100), None);
+        assert_eq!(
+            opt_pairs(&r.unwrap()),
+            vec![(Some(0), Some(0)), (Some(1), Some(0)), (None, Some(1))]
+        );
+        // on_new が偽の行（b.y > 0 を b.y <= b.y ではなく自己比較 Lt で常に偽にする）も補完される
+        let st = outer_step(
+            false,
+            true,
+            vec![],
+            vec![cmp((1, 0), BinOp::Lt, (1, 0))],
+            vec![lt()],
+        );
+        let sides = vec![col(&[1]), col(&[3, 4])];
+        let (r, b) = run_one(&sides, &st, &limits(100, 100), None);
+        assert_eq!(
+            opt_pairs(&r.unwrap()),
+            vec![(None, Some(0)), (None, Some(1))]
+        );
+        assert_eq!(b.comparisons_used, 0);
+        // acc が空: 全新行が補完される
+        let st = outer_step(false, true, vec![], vec![], vec![lt()]);
+        let sides = vec![col(&[]), col(&[1, 2])];
+        let (r, _) = run_one(&sides, &st, &limits(100, 100), None);
+        assert_eq!(opt_pairs(&r.unwrap()).len(), 2);
+    }
+
+    /// SQL-60 (D3・D7・D10): `on_mixed` 無しの外部結合は、ペア＋補完行の合計を確保前に出力上限と照合する。
+    #[test]
+    fn outer_no_mixed_counts_null_fill_rows() {
+        // on_new 通過は b.y <= b.y（常に真）。ペア 3x1=3 + 補完なし = 3。
+        let st = outer_step(
+            true,
+            false,
+            vec![],
+            vec![cmp((1, 0), BinOp::Le, (1, 0))],
+            vec![],
+        );
+        let sides = vec![col(&[1, 2, 3]), col(&[1])];
+        assert_eq!(
+            run_one(&sides, &st, &limits(3, 100), None).0.unwrap().len(),
+            3
+        );
+        // inner が空（on_new 常に偽）なら acc 3 件が全て補完行（合計 3）。
+        let st = outer_step(
+            true,
+            false,
+            vec![],
+            vec![cmp((1, 0), BinOp::Lt, (1, 0))],
+            vec![],
+        );
+        let (r, b) = run_one(&sides, &st, &limits(3, 100), None);
+        assert_eq!(r.unwrap().len(), 3);
+        assert_eq!(b.comparisons_used, 0);
+        let (r, _) = run_one(&sides, &st, &limits(2, 100), None);
+        assert_eq!(r.err().unwrap().wire_code(), "54000");
+        // RIGHT: acc 3 件 × inner 2 件 = 6 ペア。+ 補完 0。上限 5 なら拒否。
+        let st = outer_step(false, true, vec![], vec![], vec![]);
+        let sides = vec![col(&[1, 2, 3]), col(&[1, 2])];
+        assert_eq!(
+            run_one(&sides, &st, &limits(6, 100), None).0.unwrap().len(),
+            6
+        );
+        let (r, _) = run_one(&sides, &st, &limits(5, 100), None);
+        assert_eq!(r.err().unwrap().wire_code(), "54000");
+        // 停止閾値は一致ペア数にだけ効く（補完行は数えない）。
+        let st = outer_step(
+            true,
+            false,
+            vec![],
+            vec![cmp((1, 0), BinOp::Lt, (1, 0))],
+            vec![],
+        );
+        let sides = vec![col(&[1, 2, 3]), col(&[1])];
+        assert!(run_one(&sides, &st, &limits(100, 100), Some(0)).0.is_ok());
+    }
+
+    /// SQL-60 (D7・D10): 一致ペアは上限内でも NULL 補完行を足して超えるなら `54000`。
+    #[test]
+    fn null_fill_rows_count_toward_output_cap() {
+        let st = outer_step(true, false, vec![], vec![], vec![lt()]);
+        let sides = vec![col(&[1, 9, 9]), col(&[2])];
+        // ペア 1 + 補完 2 = 3
+        assert_eq!(
+            run_one(&sides, &st, &limits(3, 100), None).0.unwrap().len(),
+            3
+        );
+        let (r, _) = run_one(&sides, &st, &limits(2, 100), None);
+        assert_eq!(r.err().unwrap().wire_code(), "54000");
+    }
+
+    /// SQL-60 (D6・D9): 外部結合でも比較回数の事前判定と中断は効く。
+    #[test]
+    fn outer_comparison_cap_and_interrupt() {
+        let st = outer_step(true, false, vec![], vec![], vec![lt()]);
+        let sides = vec![col(&[1, 2, 3]), col(&[2, 3])];
+        let (r, b) = run_one(&sides, &st, &limits(100, 5), None);
+        assert_eq!(r.err().unwrap().wire_code(), "54000");
+        assert_eq!(b.comparisons_used, 0);
+        let _g = crate::interrupt::InterruptScope::install(Box::new(|| {
+            Some(crate::interrupt::InterruptReason::ClientGone)
+        }));
+        let (r, _) = run_one(&sides, &st, &limits(100, 100), None);
+        assert_eq!(r.err().unwrap().wire_code(), "57014");
+    }
+
+    /// SQL-60 (D10): 多段。LEFT の NULL 補完スロットが後段の述語で偽になり、最終順序は辞書順（NULL は後ろ）。
+    #[test]
+    fn left_then_inner_step_propagates_null_fill() {
+        let sides = vec![col(&[1, 9]), col(&[2]), col(&[5])];
+        let s1 = outer_step(true, false, vec![], vec![], vec![lt()]);
+        // 2 段目: rel1.y < rel2.z（INNER）。補完された rel1 スロットは NULL なので偽。
+        let s2 = step(vec![], vec![], vec![cmp((1, 0), BinOp::Lt, (2, 0))]);
+        let mut budget = JoinBudget::new(usize::MAX / 2);
+        let (acc, order) =
+            super::super::exec::run_joins(&sides, &[s1, s2], &mut budget, &limits(100, 100), None)
+                .unwrap();
+        let got: Vec<_> = order
+            .iter()
+            .map(|&i| acc.get(i as usize).unwrap().to_vec())
+            .collect();
+        assert_eq!(got, vec![vec![Some(0), Some(0), Some(0)]]);
+        // 2 段目も LEFT なら補完行が残り、辞書順（None は後ろ）で並ぶ。
+        let s1 = outer_step(true, false, vec![], vec![], vec![lt()]);
+        let s2 = outer_step(
+            true,
+            false,
+            vec![],
+            vec![],
+            vec![cmp((1, 0), BinOp::Lt, (2, 0))],
+        );
+        let mut budget = JoinBudget::new(usize::MAX / 2);
+        let (acc, order) =
+            super::super::exec::run_joins(&sides, &[s1, s2], &mut budget, &limits(100, 100), None)
+                .unwrap();
+        let got: Vec<_> = order
+            .iter()
+            .map(|&i| acc.get(i as usize).unwrap().to_vec())
+            .collect();
+        assert_eq!(
+            got,
+            vec![vec![Some(0), Some(0), Some(0)], vec![Some(1), None, None]]
+        );
     }
 
     /// D4 の実測用（時間は出力するだけで検証しない）。件数と比較回数の正しさだけを検証する。

@@ -38,19 +38,6 @@ pub(super) struct Tuples {
 }
 
 impl Tuples {
-    /// フラット配置のスロット列から組み立てる（`nlj` の実体化用）。長さが `n` の倍数でなければ
-    /// 内部エラー（fail-closed）。
-    pub(super) fn from_flat(n: usize, data: Vec<Option<u32>>) -> Result<Self, SqlSurfaceError> {
-        if n == 0 || !data.len().is_multiple_of(n) {
-            return Err(SqlSurfaceError::Internal {
-                detail: "JOIN tuple buffer length mismatch".to_string(),
-            });
-        }
-        Ok(Self { n, data })
-    }
-}
-
-impl Tuples {
     pub(super) fn len(&self) -> usize {
         self.data.len().checked_div(self.n).unwrap_or(0)
     }
@@ -65,6 +52,16 @@ impl Tuples {
 
 #[cfg(test)]
 impl Tuples {
+    /// フラット配置のスロット列から組み立てる（テスト用）。長さが `n` の倍数でなければ
+    /// 内部エラー（fail-closed）。
+    pub(super) fn from_flat(n: usize, data: Vec<Option<u32>>) -> Result<Self, SqlSurfaceError> {
+        if n == 0 || !data.len().is_multiple_of(n) {
+            return Err(SqlSurfaceError::Internal {
+                detail: "JOIN tuple buffer length mismatch".to_string(),
+            });
+        }
+        Ok(Self { n, data })
+    }
     /// 単一 relation の `n_rows` 個のタプル（走査位置 0..n_rows）をテスト用に組み立てる。
     pub(super) fn single_relation_for_test(n_rows: u32) -> Self {
         Self {
@@ -367,6 +364,33 @@ fn join_step(
         }
     }
 
+    materialize_step(
+        acc,
+        new_rel,
+        &pairs,
+        &matched_acc,
+        &matched_new,
+        step,
+        budget,
+        limits,
+    )
+}
+
+/// 一致ペアと保存側の未一致（NULL 補完行）を合わせた件数を実体化前に出力上限と照合し、
+/// 共有バイト予算へ計上してから `Tuples` へ実体化する。ハッシュ経路（`join_step`）と
+/// NLJ（`nlj::nlj_step`）が共有する。並びは「ペア → 未一致 acc → 未一致 new」。
+#[allow(clippy::too_many_arguments)]
+pub(super) fn materialize_step(
+    acc: &Tuples,
+    new_rel: usize,
+    pairs: &[(u32, u32)],
+    matched_acc: &[bool],
+    matched_new: &[bool],
+    step: &StepPlan,
+    budget: &mut JoinBudget,
+    limits: &JoinLimits,
+) -> Result<Tuples, SqlSurfaceError> {
+    let n = acc.n;
     // 未一致行は保存側（preserve_*）だけ数える。非保存側は NULL 補完行を出さないため、
     // 総数へ加算すると 0 一致の INNER JOIN が誤って上限超過になる。
     let unmatched_acc = if step.preserve_acc {
@@ -405,7 +429,7 @@ fn join_step(
             }
         }
     };
-    for &(ti, ni) in &pairs {
+    for &(ti, ni) in pairs {
         push_tuple(acc.get(ti as usize), Some(ni));
     }
     if step.preserve_acc {

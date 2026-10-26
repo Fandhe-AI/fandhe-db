@@ -326,3 +326,82 @@ fn on_residual_does_not_leak_across_tenants() {
         assert!(!run_sorted(&core, "tenant-a", sql).is_empty());
     }
 }
+
+/// Issue #1838（D11・SQL-60 ポインタ）: キー無し ON の FULL JOIN は PostgreSQL 17 と同じく
+/// `0A000`。判定は束縛段で行い、データに依存しない。
+#[test]
+fn keyless_full_join_is_feature_not_supported() {
+    let (core, path) = seeded();
+    let _guard = CleanupGuard(path);
+    for sql in [
+        "SELECT l.k FROM l FULL JOIN r ON l.n > r.n LIMIT 10",
+        "SELECT l.k FROM l FULL JOIN r ON l.k = l.n LIMIT 10",
+        "SELECT l.k FROM l FULL JOIN r ON r.tag = 'x' LIMIT 10",
+        "SELECT l.k FROM l FULL OUTER JOIN r ON l.n > r.n LIMIT 10",
+        "SELECT l.k FROM l JOIN r ON l.k = r.k FULL JOIN r r2 ON r.n > r2.n LIMIT 10",
+    ] {
+        assert_rejected(&core, sql, "0A000");
+    }
+}
+
+/// キー無し FULL でも、解析段のエラー（未知列・型不一致）は `0A000` より先に出る。
+#[test]
+fn keyless_full_join_analysis_errors_take_precedence() {
+    let (core, path) = seeded();
+    let _guard = CleanupGuard(path);
+    assert_rejected(
+        &core,
+        "SELECT l.k FROM l FULL JOIN r ON l.n > r.nonexistent LIMIT 10",
+        "42703",
+    );
+    assert_rejected(
+        &core,
+        "SELECT l.k FROM l FULL JOIN r ON l.n > r.tag LIMIT 10",
+        "42804",
+    );
+    assert_rejected(
+        &core,
+        "SELECT l.k FROM l FULL JOIN r ON l.n > r.n WHERE l.nonexistent = 'x' LIMIT 10",
+        "42703",
+    );
+}
+
+/// WHERE の strict 述語で FULL が片側以下に簡約された段は、NLJ の SQL 到達（#1839）まで
+/// 従来どおり `42601`（暫定）。LEFT／RIGHT のキー無し ON も同様。
+#[test]
+fn keyless_reduced_full_and_other_kinds_stay_42601_until_1839() {
+    let (core, path) = seeded();
+    let _guard = CleanupGuard(path);
+    for sql in [
+        "SELECT l.k FROM l FULL JOIN r ON l.n > r.n WHERE l.k = 1 AND r.k = 1 LIMIT 10",
+        "SELECT l.k FROM l LEFT JOIN r ON l.n > r.n LIMIT 10",
+        "SELECT l.k FROM l RIGHT JOIN r ON l.n > r.n LIMIT 10",
+    ] {
+        assert_rejected(&core, sql, "42601");
+    }
+}
+
+/// キー有り＋残余の FULL は従来どおり受け付けられる。
+#[test]
+fn keyed_full_join_with_residual_is_still_accepted() {
+    let (core, path) = seeded();
+    let _guard = CleanupGuard(path);
+    let rows = run_sorted(
+        &core,
+        "tenant-a",
+        "SELECT l.k, r.k FROM l FULL JOIN r ON l.k = r.k AND r.tag = 'x' LIMIT 10",
+    );
+    assert!(!rows.is_empty());
+}
+
+/// キー無し FULL の `0A000` はテナントの可視行に依存せず、エラー文に件数・行情報を含まない。
+#[test]
+fn keyless_full_join_rejection_is_tenant_independent() {
+    let (core, path) = seeded();
+    let _guard = CleanupGuard(path);
+    let sql = "SELECT l.k FROM l FULL JOIN r ON l.n > r.n LIMIT 10";
+    let a = err_of(&core, "tenant-a", sql);
+    let b = err_of(&core, "tenant-b", sql);
+    assert_eq!(a.0, "0A000");
+    assert_eq!(a, b);
+}
