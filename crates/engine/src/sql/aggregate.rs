@@ -847,11 +847,13 @@ pub(crate) enum Accumulator {
     /// SQL-57・Issue #1803）。状態と意味論は [`crate::sql::variance`] が持つ。結果は numeric。
     VarianceExact {
         kind: crate::sql::variance::VarianceKind,
+        output: crate::sql::variance::VarianceOutput,
         state: Box<crate::sql::variance::VarianceExact>,
     },
     /// 同・浮動小数版（`REAL`／`DOUBLE PRECISION` 列・数値スカラー式）。結果は double。
     VarianceFloat {
         kind: crate::sql::variance::VarianceKind,
+        output: crate::sql::variance::VarianceOutput,
         state: crate::sql::variance::VarianceFloat,
     },
 }
@@ -933,7 +935,12 @@ impl Accumulator {
             }
             // SQL-57・Issue #1803: 分散系。型の受理行列は `resolve_aggregate_input` が先に絞る。
             (
-                AggregateFunc::Variance | AggregateFunc::VarPop | AggregateFunc::VarSamp,
+                AggregateFunc::Variance
+                | AggregateFunc::VarPop
+                | AggregateFunc::VarSamp
+                | AggregateFunc::Stddev
+                | AggregateFunc::StddevPop
+                | AggregateFunc::StddevSamp,
                 variance_input,
             ) => new_variance_accumulator(func, variance_input)?,
             (Sum, AggregateInput::IdU64) => Accumulator::IdSum(None),
@@ -2412,14 +2419,38 @@ impl Accumulator {
                 Some(array) => Cell::Array(array),
                 None => Cell::Null,
             },
-            Accumulator::VarianceExact { kind, state } => match state.finish_decimal(kind)? {
-                Some(decimal) => Cell::Numeric(decimal),
-                None => Cell::Null,
-            },
-            Accumulator::VarianceFloat { kind, state } => match state.finish_f64(kind)? {
-                Some(v) => Cell::Float(v),
-                None => Cell::Null,
-            },
+            Accumulator::VarianceExact {
+                kind,
+                output,
+                state,
+            } => {
+                let finished = match output {
+                    crate::sql::variance::VarianceOutput::Variance => state.finish_decimal(kind)?,
+                    crate::sql::variance::VarianceOutput::Stddev => {
+                        state.finish_stddev_decimal(kind)?
+                    }
+                };
+                match finished {
+                    Some(decimal) => Cell::Numeric(decimal),
+                    None => Cell::Null,
+                }
+            }
+            Accumulator::VarianceFloat {
+                kind,
+                output,
+                state,
+            } => {
+                let finished = match output {
+                    crate::sql::variance::VarianceOutput::Variance => state.finish_f64(kind)?,
+                    crate::sql::variance::VarianceOutput::Stddev => {
+                        state.finish_stddev_f64(kind)?
+                    }
+                };
+                match finished {
+                    Some(v) => Cell::Float(v),
+                    None => Cell::Null,
+                }
+            }
         })
     }
 }
@@ -2431,8 +2462,10 @@ fn new_variance_accumulator(
     func: AggregateFunc,
     input: &AggregateInput,
 ) -> Result<Accumulator, SqlSurfaceError> {
-    use crate::sql::variance::{VarianceExact, VarianceFloat, VarianceKind};
+    use crate::sql::variance::{VarianceExact, VarianceFloat, VarianceKind, VarianceOutput};
     let kind = VarianceKind::from_func(func)
+        .ok_or_else(|| accumulator_bug("variance accumulator requested for a non-variance func"))?;
+    let output = VarianceOutput::from_func(func)
         .ok_or_else(|| accumulator_bug("variance accumulator requested for a non-variance func"))?;
     Ok(match input {
         AggregateInput::IdU64
@@ -2440,16 +2473,19 @@ fn new_variance_accumulator(
         | AggregateInput::SmallIntColumn(_)
         | AggregateInput::BigIntColumn(_) => Accumulator::VarianceExact {
             kind,
+            output,
             state: Box::new(VarianceExact::new(0)),
         },
         AggregateInput::NumericColumn { scale, .. } => Accumulator::VarianceExact {
             kind,
+            output,
             state: Box::new(VarianceExact::new(*scale)),
         },
         AggregateInput::RealColumn(_)
         | AggregateInput::DoubleColumn(_)
         | AggregateInput::ScalarExpr { .. } => Accumulator::VarianceFloat {
             kind,
+            output,
             state: VarianceFloat::new(),
         },
         _ => {
@@ -3127,14 +3163,24 @@ pub(crate) fn aggregate_result_type(
         // SQL-57・Issue #1803: 分散系は整数系・`id`・numeric 列が numeric（名目 scale は列メタ用で、
         // セルの scale は値ごとに変わる）、浮動小数列・数値式が double。
         (
-            AggregateFunc::Variance | AggregateFunc::VarPop | AggregateFunc::VarSamp,
+            AggregateFunc::Variance
+            | AggregateFunc::VarPop
+            | AggregateFunc::VarSamp
+            | AggregateFunc::Stddev
+            | AggregateFunc::StddevPop
+            | AggregateFunc::StddevSamp,
             AggregateInput::IdU64
             | AggregateInput::IntegerColumn(_)
             | AggregateInput::SmallIntColumn(_)
             | AggregateInput::BigIntColumn(_),
         ) => AVG_INTEGER_RESULT_TYPE,
         (
-            AggregateFunc::Variance | AggregateFunc::VarPop | AggregateFunc::VarSamp,
+            AggregateFunc::Variance
+            | AggregateFunc::VarPop
+            | AggregateFunc::VarSamp
+            | AggregateFunc::Stddev
+            | AggregateFunc::StddevPop
+            | AggregateFunc::StddevSamp,
             AggregateInput::NumericColumn { scale, .. },
         ) => ColumnType::Numeric {
             precision: crate::numeric::MAX_PRECISION,
@@ -3143,7 +3189,12 @@ pub(crate) fn aggregate_result_type(
                 .clamp(16, crate::numeric::MAX_PRECISION),
         },
         (
-            AggregateFunc::Variance | AggregateFunc::VarPop | AggregateFunc::VarSamp,
+            AggregateFunc::Variance
+            | AggregateFunc::VarPop
+            | AggregateFunc::VarSamp
+            | AggregateFunc::Stddev
+            | AggregateFunc::StddevPop
+            | AggregateFunc::StddevSamp,
             AggregateInput::RealColumn(_)
             | AggregateInput::DoubleColumn(_)
             | AggregateInput::ScalarExpr { .. },
@@ -4383,6 +4434,9 @@ mod tests {
             AggregateFunc::Variance,
             AggregateFunc::VarPop,
             AggregateFunc::VarSamp,
+            AggregateFunc::Stddev,
+            AggregateFunc::StddevPop,
+            AggregateFunc::StddevSamp,
         ] {
             for input in [
                 AggregateInput::IdU64,

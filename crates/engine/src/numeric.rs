@@ -803,6 +803,25 @@ impl U256 {
         Some((quotient, rem))
     }
 
+    /// `floor(sqrt(self))`。結果は必ず `u128` に収まる（`sqrt(2^256 - 1) < 2^128`）。
+    /// `stddev` 系（Issue #1804）の確定時に 1 回だけ呼ぶ。`u128` の二分探索（128 反復）で、
+    /// Newton 法のように `x + N/x` が桁あふれする中間値を作らない。
+    pub(crate) fn isqrt(self) -> u128 {
+        let mut lo: u128 = 0;
+        let mut hi: u128 = u128::MAX;
+        // 不変条件: lo^2 <= self、答えは [lo, hi]。
+        while lo < hi {
+            let gap = hi - lo;
+            let mid = lo + gap / 2 + (gap & 1);
+            if U256::mul_wide(mid, mid) <= self {
+                lo = mid;
+            } else {
+                hi = mid - 1;
+            }
+        }
+        lo
+    }
+
     /// `i128` に収まるなら変換する。
     pub(crate) fn to_i128(self) -> Option<i128> {
         if self.hi != 0 {
@@ -810,6 +829,34 @@ impl U256 {
         }
         i128::try_from(self.lo).ok()
     }
+}
+
+/// 非負の `Decimal` の平方根を、入力と同じ scale へ half-up で丸めて返す
+/// （`stddev` 系。Issue #1804）。PostgreSQL 17 の `numeric_stddev_internal` が
+/// 丸め済みの分散に対し同じ除算 scale で `sqrt_var` を取る手順に対応する。
+/// 負の入力は呼び出し元の不変条件違反として `Malformed`、結果が `i128` に収まらなければ
+/// `OutOfRange`。
+pub(crate) fn sqrt_round_decimal(d: &Decimal) -> Result<Decimal, NumericError> {
+    let unscaled = u128::try_from(d.unscaled())
+        .map_err(|_| NumericError::Malformed("square root of a negative value".to_string()))?;
+    let factor = pow10(d.scale())
+        .ok_or(NumericError::OutOfRange)?
+        .unsigned_abs();
+    // sqrt(u / 10^s) を 10^s 倍した値の 2 乗は u * 10^s。
+    let n = U256::mul_wide(unscaled, factor);
+    let r = n.isqrt();
+    let r_sq = U256::mul_wide(r, r);
+    let rem = n
+        .checked_sub(r_sq)
+        .ok_or_else(|| NumericError::Malformed("isqrt remainder underflow".to_string()))?;
+    // N が整数なので、(r + 1/2)^2 = r^2 + r + 1/4 との比較は rem > r で厳密に判定できる。
+    let rounded = if rem > U256::from_u128(r) {
+        r.checked_add(1).ok_or(NumericError::OutOfRange)?
+    } else {
+        r
+    };
+    let rounded = i128::try_from(rounded).map_err(|_| NumericError::OutOfRange)?;
+    Decimal::from_parts(rounded, d.scale())
 }
 
 /// `value = u / 10^dscale`（`u` は非負）の NBASE(=10000) 表現での weight と先頭桁を返す
@@ -1485,5 +1532,49 @@ mod tests {
             div_round_wide(U256 { hi: 1, lo: 0 }, 0, 1, 0),
             Err(NumericError::OutOfRange)
         );
+    }
+
+    #[test]
+    fn isqrt_floor_boundaries() {
+        assert_eq!(U256::ZERO.isqrt(), 0);
+        assert_eq!(U256::from_u128(1).isqrt(), 1);
+        assert_eq!(U256::from_u128(15).isqrt(), 3);
+        assert_eq!(U256::from_u128(16).isqrt(), 4);
+        let sq = U256::mul_wide(u128::MAX, u128::MAX);
+        assert_eq!(sq.isqrt(), u128::MAX);
+        assert_eq!(
+            sq.checked_sub(U256::from_u128(1)).expect("sub").isqrt(),
+            u128::MAX - 1
+        );
+        let ten38 = 10u128.pow(38);
+        let n = U256::mul_wide(ten38, ten38);
+        assert_eq!(n.isqrt(), ten38);
+        assert_eq!(
+            n.checked_sub(U256::from_u128(1)).expect("sub").isqrt(),
+            ten38 - 1
+        );
+    }
+
+    #[test]
+    fn sqrt_round_decimal_rounds_half_up() {
+        let sq = |u: i128, s: u8| {
+            sqrt_round_decimal(&Decimal::from_parts(u, s).expect("decimal"))
+                .expect("sqrt")
+                .to_string()
+        };
+        assert_eq!(sq(0, 0), "0");
+        assert_eq!(sq(4, 0), "2");
+        // sqrt(2) = 1.41..., sqrt(3) = 1.73..., sqrt(6) = 2.449..., sqrt(7) = 2.645...
+        assert_eq!(sq(2, 0), "1");
+        assert_eq!(sq(3, 0), "2");
+        assert_eq!(sq(6, 0), "2");
+        assert_eq!(sq(7, 0), "3");
+        // scale 1: sqrt(0.2) = 0.447 -> 0.4、scale 2: sqrt(2.00) -> 1.41
+        assert_eq!(sq(2, 1), "0.4");
+        assert_eq!(sq(200, 2), "1.41");
+        assert_eq!(sq(2_500, 4), "0.5000");
+        let big = 10i128.pow(38) - 1;
+        assert!(sqrt_round_decimal(&Decimal::from_parts(big, 38).expect("decimal")).is_ok());
+        assert!(sqrt_round_decimal(&Decimal::from_parts(-1, 0).expect("decimal")).is_err());
     }
 }
