@@ -1175,6 +1175,8 @@ Date: <IMF-fixdate>
 | `42P21` | `COLLATION_MISMATCH` | 400 | Bad Request | 式の明示的な `COLLATE` 同士の食い違い（SQL 表層専用。NoSQL の `op` 語彙からは到達しない）。Issue #2190 |
 | `42P22` | `INDETERMINATE_COLLATION` | 400 | Bad Request | 暗黙の照合の衝突を照合が必要な演算が消費した（SQL 表層専用。NoSQL の `op` 語彙からは到達しない）。Issue #2190 |
 | `44000` | `WITH_CHECK_OPTION_VIOLATION` | 400 | Bad Request | NoSQL 表層の実要求からは到達不能（ビューへの書き込みは SQL 表層のみ。ビューの `WITH CHECK OPTION`〔TABLE-43〕違反。後述） |
+| `54001` | `STATEMENT_TOO_COMPLEX` | 400 | Bad Request | `GROUP BY` のグルーピングセットの展開後セット数・入れ子の上限超過（SQL 表層専用。NoSQL の `op` 語彙からは到達しない）。Issue #1821・SQL-59 |
+| `54011` | `TOO_MANY_COLUMNS` | 400 | Bad Request | `CUBE` の要素数の上限超過（SQL 表層専用。NoSQL の `op` 語彙からは到達しない）。Issue #1821・SQL-59 |
 | `28000` | `AUTH_REQUIRED` | 401 | Unauthorized | `Authorization` ヘッダ欠落 |
 | `28P01` | `AUTH_INVALID` | 401 | Unauthorized | トークン形式不正・失効・セッション未存在 |
 | `42501` | `FORBIDDEN_TENANT_MISMATCH` | 403 | Forbidden | NoSQL 表層の実要求からは到達不能（射影のみ production エンコーダで固定。後述） |

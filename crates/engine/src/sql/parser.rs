@@ -8190,6 +8190,16 @@ pub(crate) fn bind_aggregate_with_dummy_flags(
 ) -> Result<BoundAggregate, SqlSurfaceError> {
     use crate::sql::allowlist::AggregateSelectItem;
 
+    // Issue #1821・SQL-59: `ROLLUP`・`CUBE`・`GROUPING SETS` の実行段（セットごとの集約と結果の
+    // 合成）は Issue #1822 で実装する。それまでに通常の `GROUP BY` として実行すると誤った行を
+    // 黙って返すため、束縛の入口で拒否する（fail-closed）。`GROUP BY ()` を「GROUP BY なしの
+    // HAVING」（`columns` が空）と取り違えないよう、その判定より前に置く。
+    if stmt.group_by().is_some_and(|g| g.grouping_sets.is_some()) {
+        return Err(SqlSurfaceError::feature_not_supported(
+            "GROUPING SETS, ROLLUP and CUBE are not supported yet",
+        ));
+    }
+
     let mut node_budget = crate::sql::udf_call::MAX_EXPR_NODES;
 
     // GROUP BY 列名一覧（`SELECT` リストの `GroupKey` 項目の照合・`ORDER BY`/

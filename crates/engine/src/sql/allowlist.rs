@@ -16,6 +16,10 @@ use crate::error_format::{ClassifiedError, ErrorClass};
 use crate::recovery::required_op_id::LedgerMode;
 use crate::sql::copy_options;
 use crate::sql::ddl_column_type::StaticColumnType;
+use crate::sql::grouping_sets::{
+    expand_grouping, GroupingElement, KeyId, RawGroupKey, MAX_CUBE_ELEMENTS,
+    MAX_GROUPING_SETS_DEPTH,
+};
 use crate::sql::lexer::{self, Keyword, LexError, Token};
 use crate::sql::order_value::NullPlacement;
 use crate::sql::plan::{self, EvaluationOrder, Stage};
@@ -215,6 +219,23 @@ fn is_group_key_boundary(tok: &Token) -> bool {
         }
         _ => false,
     }
+}
+
+/// 構文段が読んだ `GROUP BY` 句のキー部分（Issue #1821・SQL-59）。[`Parser::parse_group_by_clause`]
+/// の戻り値で、[`GroupByClause`] の同名フィールドへそのまま入る。
+struct ParsedGroupBy {
+    columns: Vec<String>,
+    key_exprs: Vec<Expr>,
+    grouping_sets: Option<Vec<Vec<usize>>>,
+}
+
+/// `GROUP BY` 内のグルーピング構文の種別（Issue #1821・SQL-59）。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum GroupingSyntax {
+    Rollup,
+    Cube,
+    Sets,
+    EmptySet,
 }
 
 /// `start` から始まる `GROUP BY` キー 1 つの終端位置（排他）を括弧の深さ 0 で探す
@@ -851,6 +872,12 @@ pub enum SqlSurfaceError {
     GroupingError { detail: &'static str },
     /// 式索引の式にウィンドウ関数がある（`42P20`。Issue #1647・INDEX-10）。固定文言のみ。
     WindowingError { detail: &'static str },
+    /// `GROUP BY` のグルーピングセットの展開後セット数・入れ子の深さが上限を超えた
+    /// （`54001`。Issue #1821・SQL-59）。固定文言のみ。
+    StatementTooComplex { detail: &'static str },
+    /// `CUBE` の要素数が上限を超えた（`54011`。Issue #1821・SQL-59）。固定文言のみ。
+    /// `CatalogError::TooManyColumns`（`54000`。変更しない）とは別物。
+    TooManyColumns { detail: &'static str },
     /// 明示的な `COLLATE` 同士の食い違い（`42P21`。Issue #2190・TABLE-28）。固定文言のみ。
     CollationMismatch,
     /// `LIKE`／`ILIKE` のエスケープ不正（`22025`。Issue #1779・SQL-54）。末尾の孤立した
@@ -1592,6 +1619,8 @@ impl ClassifiedError for SqlSurfaceError {
             SqlSurfaceError::InvalidObjectDefinition { .. } => ErrorClass::InvalidObjectDefinition,
             SqlSurfaceError::GroupingError { .. } => ErrorClass::GroupingError,
             SqlSurfaceError::WindowingError { .. } => ErrorClass::WindowingError,
+            SqlSurfaceError::StatementTooComplex { .. } => ErrorClass::StatementTooComplex,
+            SqlSurfaceError::TooManyColumns { .. } => ErrorClass::TooManyColumns,
             SqlSurfaceError::CollationMismatch => ErrorClass::CollationMismatch,
             SqlSurfaceError::InvalidEscapeSequence { .. } => ErrorClass::InvalidEscapeSequence,
             SqlSurfaceError::CannotCoerce { .. } => ErrorClass::CannotCoerce,
@@ -1740,7 +1769,9 @@ impl std::fmt::Display for SqlSurfaceError {
             SqlSurfaceError::NullValueNotAllowed { detail } => f.write_str(detail),
             SqlSurfaceError::InvalidObjectDefinition { detail }
             | SqlSurfaceError::GroupingError { detail }
-            | SqlSurfaceError::WindowingError { detail } => f.write_str(detail),
+            | SqlSurfaceError::WindowingError { detail }
+            | SqlSurfaceError::StatementTooComplex { detail }
+            | SqlSurfaceError::TooManyColumns { detail } => f.write_str(detail),
             SqlSurfaceError::MoreThanOneSqlJsonItem { detail }
             | SqlSurfaceError::NoSqlJsonItem { detail }
             | SqlSurfaceError::SqlJsonScalarRequired { detail } => f.write_str(detail),
@@ -3819,6 +3850,11 @@ pub struct GroupByClause {
     /// トップレベルの集計 `SELECT` だけが埋め（それ以外の文脈は構文段が `42601`）、束縛段
     /// （`sql::parser::bind_group_by_clause`）が基表スキーマに束縛して行ごとに評価する。
     pub(crate) key_exprs: Vec<Expr>,
+    /// 展開後のグルーピングセット（Issue #1821・SQL-59）。各要素は `columns` の添字の昇順・
+    /// 重複なしの列で、空の内側は総計のセット。`None` は通常の単一セット `GROUP BY`。`Some` の
+    /// とき `columns`・`key_exprs` は全セットのキーの和集合（初出順）。実行段（Issue #1822）が
+    /// 実装されるまで、束縛段が `0A000` で拒否する（誤った行を黙って返さない fail-closed）。
+    pub(crate) grouping_sets: Option<Vec<Vec<usize>>>,
     pub(crate) having: Vec<HavingPredicate>,
     /// 式述語の `HAVING`（Issue #1188・SQL-26）。`having` と AND 結合される。
     pub(crate) having_exprs: Vec<HavingExprPredicate>,
@@ -6900,58 +6936,275 @@ impl<'a> Parser<'a> {
         Ok(AggregateSelectItem::GroupKey { column, alias })
     }
 
-    /// `GROUP BY <key> (',' <key>)*`（TASK-167・SQL-14。SQL-25 (d) で複数列へ拡張。
-    /// Issue #1817・SQL-58 で式キーを追加）。`<key>` は裸識別子（従来経路）か、トップレベルの
-    /// 集計 `SELECT`（`allow_aggregate_expr_items`）に限り式（関数呼び出し・算術・`CASE` 等）。
-    /// 式キーは `key_exprs` へ積み、`columns` の当該位置には予約内部名
-    /// （[`group_key_expr_placeholder`]）を入れる。整数リテラル単独（位置指定 `GROUP BY 1`）は
-    /// 位置参照として扱わず `42601`（fail-closed）。式キー内の集計呼び出しは `42803`・
-    /// ウィンドウ関数は `42P20`・`$n` と部分クエリは `42601`（[`precheck_group_key_tokens`]）。
-    /// `GROUP` は予約語化せず [`Parser::expect_contextual_keyword`] で文脈的に照合する
-    /// （PR #189 の方針）。キー数は [`check_group_by_column_count`] で `push` 前に検査し
-    /// （`54000`。列キーと式キーの合算）、重複するキーは `42601` で拒否する
-    /// （spec に規定が無いため fail-closed に倒す）。
-    fn parse_group_by_clause(&mut self) -> Result<(Vec<String>, Vec<Expr>), SqlSurfaceError> {
-        self.expect_contextual_keyword("GROUP")?;
-        self.expect_keyword(Keyword::By)?;
-        let mut columns: Vec<String> = Vec::new();
-        let mut key_exprs: Vec<Expr> = Vec::new();
-        loop {
-            let is_plain_column = matches!(self.peek(), Some(Token::Ident(_)))
-                && self
-                    .tokens
-                    .get(self.pos.saturating_add(1))
-                    .is_none_or(is_group_key_boundary);
-            if is_plain_column || !self.allow_aggregate_expr_items {
-                let column = self.expect_ident()?;
-                if columns.contains(&column) {
-                    return Err(SqlSurfaceError::unsupported(format!(
-                        "duplicate GROUP BY column {column:?}"
-                    )));
+    /// `GROUP BY` キー 1 つ（裸識別子、またはトップレベルの集計 `SELECT`
+    /// （`allow_aggregate_expr_items`）に限り式）を読む（Issue #1817・SQL-58。Issue #1821 で
+    /// [`Self::parse_group_by_clause`] から分離）。整数リテラル単独（位置指定 `GROUP BY 1`）は
+    /// `42601`、式キー内の集計呼び出しは `42803`・ウィンドウ関数は `42P20`・`$n` と部分クエリは
+    /// `42601`（[`precheck_group_key_tokens`]）。括弧で囲んだだけの列（`(lang)`）は列キーへ正規化する。
+    /// キーの終端は括弧の深さ 0 の `,`・`)`・後続句のため、`ROLLUP(...)` 等の要素にも使える。
+    fn parse_one_group_key(&mut self) -> Result<RawGroupKey, SqlSurfaceError> {
+        let is_plain_column = matches!(self.peek(), Some(Token::Ident(_)))
+            && self
+                .tokens
+                .get(self.pos.saturating_add(1))
+                .is_none_or(is_group_key_boundary);
+        if is_plain_column || !self.allow_aggregate_expr_items {
+            return Ok(RawGroupKey::Column(self.expect_ident()?));
+        }
+        let start = self.pos;
+        let end = group_key_range_end(&self.tokens, start);
+        if end == start {
+            return Err(SqlSurfaceError::unsupported("empty GROUP BY key"));
+        }
+        if end == start.saturating_add(1) && matches!(self.peek(), Some(Token::Number(_))) {
+            return Err(SqlSurfaceError::unsupported(
+                "positional GROUP BY is not supported",
+            ));
+        }
+        precheck_group_key_tokens(&self.tokens, start, end)?;
+        let expr = self.parse_value_expr(0)?;
+        if self.pos != end {
+            return Err(SqlSurfaceError::unsupported(
+                "unsupported GROUP BY expression",
+            ));
+        }
+        Ok(match expr {
+            Expr::Ident(column) => RawGroupKey::Column(column),
+            other => RawGroupKey::Expr(other),
+        })
+    }
+
+    /// 現在位置が `ROLLUP (`・`CUBE (`・`GROUPING SETS (`・`( )` のいずれかで始まるか
+    /// （Issue #1821・SQL-59）。`ROLLUP`・`CUBE`・`GROUPING`・`SETS` は予約語化せず（PR #189 の
+    /// 方針）、この並びのときだけ構文として扱う。`GROUP BY rollup` は従来どおり列キー。
+    fn peek_grouping_syntax(&self) -> Option<GroupingSyntax> {
+        let at = |o: usize| self.tokens.get(self.pos.saturating_add(o));
+        match at(0)? {
+            Token::Ident(w) if matches!(at(1), Some(Token::Punct('('))) => {
+                if w.eq_ignore_ascii_case("ROLLUP") {
+                    Some(GroupingSyntax::Rollup)
+                } else if w.eq_ignore_ascii_case("CUBE") {
+                    Some(GroupingSyntax::Cube)
+                } else {
+                    None
                 }
-                check_group_by_column_count(columns.len() + 1)?;
-                columns.push(column);
-            } else {
-                let start = self.pos;
-                let end = group_key_range_end(&self.tokens, start);
-                if end == start {
-                    return Err(SqlSurfaceError::unsupported("empty GROUP BY key"));
+            }
+            Token::Ident(w)
+                if w.eq_ignore_ascii_case("GROUPING")
+                    && matches!(at(1), Some(Token::Ident(s)) if s.eq_ignore_ascii_case("SETS"))
+                    && matches!(at(2), Some(Token::Punct('('))) =>
+            {
+                Some(GroupingSyntax::Sets)
+            }
+            Token::Punct('(') if matches!(at(1), Some(Token::Punct(')'))) => {
+                Some(GroupingSyntax::EmptySet)
+            }
+            _ => None,
+        }
+    }
+
+    /// 現在位置の `(` が複合要素 `(a, b)`（深さ 1 に `,` を含む）か。対応する `)` が無ければ偽
+    /// （後続のキー解析が `42601` にする）。線形走査で再帰しない。
+    fn paren_is_composite(&self) -> bool {
+        let mut depth = 0usize;
+        for tok in self.tokens.iter().skip(self.pos) {
+            match tok {
+                Token::Punct('(') => depth = depth.saturating_add(1),
+                Token::Punct(')') => {
+                    depth = depth.saturating_sub(1);
+                    if depth == 0 {
+                        return false;
+                    }
                 }
-                if end == start.saturating_add(1) && matches!(self.peek(), Some(Token::Number(_))) {
-                    return Err(SqlSurfaceError::unsupported(
-                        "positional GROUP BY is not supported",
-                    ));
+                Token::Punct(',') if depth == 1 => return true,
+                _ => {}
+            }
+        }
+        false
+    }
+
+    /// `ROLLUP`・`CUBE`・`GROUPING SETS` の要素に現れる「単一キー、または複合要素 `(a, b)`」を
+    /// 読み、キーをプールへ積んで添字列と複合か否かを返す（Issue #1821・SQL-59）。
+    fn parse_key_group(
+        &mut self,
+        pool: &mut Vec<RawGroupKey>,
+    ) -> Result<(Vec<KeyId>, bool), SqlSurfaceError> {
+        if matches!(self.peek(), Some(Token::Punct('('))) && self.paren_is_composite() {
+            self.advance();
+            let mut ids = Vec::new();
+            loop {
+                let key = self.parse_one_group_key()?;
+                ids.push(pool.len());
+                pool.push(key);
+                if matches!(self.peek(), Some(Token::Punct(','))) {
+                    self.advance();
+                    continue;
                 }
-                precheck_group_key_tokens(&self.tokens, start, end)?;
-                let expr = self.parse_value_expr(0)?;
-                if self.pos != end {
+                break;
+            }
+            if !matches!(self.peek(), Some(Token::Punct(')'))) {
+                return Err(SqlSurfaceError::unsupported(
+                    "unsupported GROUP BY expression",
+                ));
+            }
+            self.advance();
+            return Ok((ids, true));
+        }
+        let key = self.parse_one_group_key()?;
+        let id = pool.len();
+        pool.push(key);
+        Ok((vec![id], false))
+    }
+
+    /// グルーピング構文 1 つ（[`Self::peek_grouping_syntax`] が `Some` の位置）を読む
+    /// （Issue #1821・SQL-59）。`depth` は `GROUPING SETS` の入れ子の深さ（トップレベルは 0）。
+    fn parse_grouping_syntax_element(
+        &mut self,
+        syntax: GroupingSyntax,
+        depth: usize,
+        pool: &mut Vec<RawGroupKey>,
+    ) -> Result<GroupingElement, SqlSurfaceError> {
+        match syntax {
+            GroupingSyntax::EmptySet => {
+                self.advance();
+                self.advance();
+                Ok(GroupingElement::Empty)
+            }
+            GroupingSyntax::Rollup | GroupingSyntax::Cube => {
+                let cube = syntax == GroupingSyntax::Cube;
+                self.advance();
+                self.advance();
+                let mut elems: Vec<Vec<KeyId>> = Vec::new();
+                loop {
+                    if self.peek_grouping_syntax().is_some() {
+                        return Err(SqlSurfaceError::unsupported(
+                            "grouping constructs cannot be nested in ROLLUP or CUBE",
+                        ));
+                    }
+                    let (ids, _) = self.parse_key_group(pool)?;
+                    elems.push(ids);
+                    // 13 個目を読んだ時点で中断する（展開・確保の前。`54011`）。
+                    if cube && elems.len() > MAX_CUBE_ELEMENTS {
+                        return Err(SqlSurfaceError::TooManyColumns {
+                            detail: "CUBE is limited to 12 elements",
+                        });
+                    }
+                    if matches!(self.peek(), Some(Token::Punct(','))) {
+                        self.advance();
+                        continue;
+                    }
+                    break;
+                }
+                if !matches!(self.peek(), Some(Token::Punct(')'))) {
                     return Err(SqlSurfaceError::unsupported(
                         "unsupported GROUP BY expression",
                     ));
                 }
-                match expr {
-                    // `GROUP BY (lang)` のように括弧で囲んだだけの列は列キーへ正規化する。
-                    Expr::Ident(column) => {
+                self.advance();
+                Ok(if cube {
+                    GroupingElement::Cube(elems)
+                } else {
+                    GroupingElement::Rollup(elems)
+                })
+            }
+            GroupingSyntax::Sets => {
+                let depth = depth.saturating_add(1);
+                // 再帰に入る前に深さを検査する（`54001`）。
+                if depth > MAX_GROUPING_SETS_DEPTH {
+                    return Err(SqlSurfaceError::StatementTooComplex {
+                        detail: "grouping sets nesting exceeds limit",
+                    });
+                }
+                self.advance();
+                self.advance();
+                self.advance();
+                let mut children: Vec<GroupingElement> = Vec::new();
+                loop {
+                    let el = match self.peek_grouping_syntax() {
+                        Some(inner) => self.parse_grouping_syntax_element(inner, depth, pool)?,
+                        None => {
+                            let (ids, composite) = self.parse_key_group(pool)?;
+                            match (composite, ids.first()) {
+                                (false, Some(id)) => GroupingElement::Key(*id),
+                                _ => GroupingElement::Composite(ids),
+                            }
+                        }
+                    };
+                    children.push(el);
+                    if matches!(self.peek(), Some(Token::Punct(','))) {
+                        self.advance();
+                        continue;
+                    }
+                    break;
+                }
+                if !matches!(self.peek(), Some(Token::Punct(')'))) {
+                    return Err(SqlSurfaceError::unsupported(
+                        "unsupported GROUP BY expression",
+                    ));
+                }
+                self.advance();
+                Ok(GroupingElement::Sets(children))
+            }
+        }
+    }
+
+    /// `GROUP BY <key> (',' <key>)*`（TASK-167・SQL-14。SQL-25 (d) で複数列へ拡張。
+    /// Issue #1817・SQL-58 で式キーを追加。Issue #1821・SQL-59 で `ROLLUP`・`CUBE`・
+    /// `GROUPING SETS` を追加）。`<key>` は [`Self::parse_one_group_key`] の形。
+    /// 式キーは `key_exprs` へ積み、`columns` の当該位置には予約内部名
+    /// （[`group_key_expr_placeholder`]）を入れる。
+    /// `GROUP` は予約語化せず [`Parser::expect_contextual_keyword`] で文脈的に照合する
+    /// （PR #189 の方針）。従来形（グルーピング構文なし）のキー数は
+    /// [`check_group_by_column_count`] で `push` 前に検査し（`54000`。列キーと式キーの合算）、
+    /// 重複するキーは `42601` で拒否する（spec に規定が無いため fail-closed に倒す）。
+    ///
+    /// グルーピング構文（`ROLLUP(..)`・`CUBE(..)`・`GROUPING SETS (..)`・`()`）を 1 つでも含む
+    /// 句は、トップレベルの集計 `SELECT` に限り受理し、`columns`・`key_exprs` を全セットのキーの
+    /// 和集合（初出順・一意）、`grouping_sets` を展開後のセット列にして返す（展開と上限は
+    /// [`crate::sql::grouping_sets::expand_grouping`]）。この形ではキーの重複参照を受理する
+    /// （PostgreSQL と同じ）。それ以外の文脈で構文が現れたら `42601`（fail-closed）。
+    fn parse_group_by_clause(&mut self) -> Result<ParsedGroupBy, SqlSurfaceError> {
+        self.expect_contextual_keyword("GROUP")?;
+        self.expect_keyword(Keyword::By)?;
+        let mut columns: Vec<String> = Vec::new();
+        let mut key_exprs: Vec<Expr> = Vec::new();
+        // 句全体のキー出現のプールとトップレベル項目の列。グルーピング構文の有無は句を最後まで
+        // 読んで確定し、従来形の重複拒否・キー数上限（42601・54000）はその後に適用する
+        // （構文の出現位置・トークン順で判定が変わらないようにする）。
+        let mut pool: Vec<RawGroupKey> = Vec::new();
+        let mut items: Vec<GroupingElement> = Vec::new();
+        let mut has_grouping_syntax = false;
+        loop {
+            let syntax = self.peek_grouping_syntax();
+            if syntax.is_some() && !self.allow_aggregate_expr_items {
+                return Err(SqlSurfaceError::unsupported(
+                    "GROUPING SETS, ROLLUP and CUBE are not supported in this context",
+                ));
+            }
+            let el = match syntax {
+                Some(s) => {
+                    has_grouping_syntax = true;
+                    self.parse_grouping_syntax_element(s, 0, &mut pool)?
+                }
+                None => {
+                    let key = self.parse_one_group_key()?;
+                    let id = pool.len();
+                    pool.push(key);
+                    GroupingElement::Key(id)
+                }
+            };
+            items.push(el);
+            if matches!(self.peek(), Some(Token::Punct(','))) {
+                self.advance();
+                continue;
+            }
+            break;
+        }
+        if !has_grouping_syntax {
+            // 従来形: 重複を 42601、キー数超過を 54000 で拒否する（push 前検査と同じ順序）。
+            for key in pool {
+                match key {
+                    RawGroupKey::Column(column) => {
                         if columns.contains(&column) {
                             return Err(SqlSurfaceError::unsupported(format!(
                                 "duplicate GROUP BY column {column:?}"
@@ -6960,7 +7213,7 @@ impl<'a> Parser<'a> {
                         check_group_by_column_count(columns.len() + 1)?;
                         columns.push(column);
                     }
-                    other => {
+                    RawGroupKey::Expr(other) => {
                         if key_exprs.contains(&other) {
                             return Err(SqlSurfaceError::unsupported(
                                 "duplicate GROUP BY expression",
@@ -6972,15 +7225,28 @@ impl<'a> Parser<'a> {
                     }
                 }
             }
-            if matches!(self.peek(), Some(Token::Punct(','))) {
-                self.advance();
-                continue;
-            }
-            break;
+            return Ok(ParsedGroupBy {
+                columns,
+                key_exprs,
+                grouping_sets: None,
+            });
         }
-        Ok((columns, key_exprs))
+        let expanded = expand_grouping(pool, &items)?;
+        for key in expanded.keys {
+            match key {
+                RawGroupKey::Column(c) => columns.push(c),
+                RawGroupKey::Expr(e) => {
+                    columns.push(group_key_expr_placeholder(key_exprs.len()));
+                    key_exprs.push(e);
+                }
+            }
+        }
+        Ok(ParsedGroupBy {
+            columns,
+            key_exprs,
+            grouping_sets: Some(expanded.sets),
+        })
     }
-
     /// `HAVING <having_pred> [AND <having_pred>]*`（TASK-167・SQL-14）。
     /// `<having_pred> := <ident> <cmp> ['-'] <number>`。左辺は SELECT リスト集計
     /// 項目の実効名への参照のみを構造上許可し（存在確認・型検査は束縛段）、右辺は
@@ -15005,7 +15271,10 @@ fn check_body_aggregate(
     // Issue #1814・SQL-58: `HAVING` 内の集計呼び出しはビュー本体には含めさせない（fail-closed。
     // 本体の集計は構文段が `allow_aggregate_expr_items` を偽にするため通常は到達しない多層防御）。
     if v.group_by.as_ref().is_some_and(|g| {
-        !g.having_aggregates.is_empty() || g.columns.is_empty() || !g.key_exprs.is_empty()
+        !g.having_aggregates.is_empty()
+            || g.columns.is_empty()
+            || !g.key_exprs.is_empty()
+            || g.grouping_sets.is_some()
     }) {
         // Issue #1819: `GROUP BY` なしの `HAVING`（キー 0 個の句）も本体には含めさせない。
         // Issue #1817: `GROUP BY` 式キーも本体には含めさせない（多層防御。構文段が拒否済み）。
@@ -20029,7 +20298,11 @@ fn parse_aggregate_shape(
     let has_group_by =
         matches!(p.peek(), Some(Token::Ident(name)) if name.eq_ignore_ascii_case("GROUP"));
     let group_by = if has_group_by {
-        let (columns, key_exprs) = p.parse_group_by_clause()?;
+        let ParsedGroupBy {
+            columns,
+            key_exprs,
+            grouping_sets,
+        } = p.parse_group_by_clause()?;
         p.group_key_exprs_present = !key_exprs.is_empty();
         // SELECT リストの `GroupKey` 項目は、いずれかの `GROUP BY` 列と同名で
         // なければならない（§計画 3.1）。不一致・`GROUP BY` 句を持たない
@@ -20090,6 +20363,7 @@ fn parse_aggregate_shape(
         Some(GroupByClause {
             columns,
             key_exprs,
+            grouping_sets,
             having,
             having_exprs,
             having_aggregates,
@@ -20114,6 +20388,7 @@ fn parse_aggregate_shape(
         Some(GroupByClause {
             columns: Vec::new(),
             key_exprs: Vec::new(),
+            grouping_sets: None,
             having,
             having_exprs,
             having_aggregates,
@@ -20241,6 +20516,7 @@ fn parse_distinct_shape(tokens: &[Token]) -> Result<ParsedAggregateShape, SqlSur
         group_by: Some(GroupByClause {
             columns,
             key_exprs: Vec::new(),
+            grouping_sets: None,
             having: Vec::new(),
             having_exprs: Vec::new(),
             having_aggregates: Vec::new(),
@@ -20717,7 +20993,10 @@ fn aggregate_statement_from_resolved(
         // 評価しない（集計式項目と同じ扱い。fail-closed）。Issue #1819: `GROUP BY` なしの
         // `HAVING`（キー 0 個の句）も評価しない（`HAVING` を黙って落とさず拒否する）。
         if group_by.as_ref().is_some_and(|g| {
-            !g.having_aggregates.is_empty() || g.columns.is_empty() || !g.key_exprs.is_empty()
+            !g.having_aggregates.is_empty()
+                || g.columns.is_empty()
+                || !g.key_exprs.is_empty()
+                || g.grouping_sets.is_some()
         }) {
             return Err(SqlSurfaceError::unsupported(
                 "aggregate over a view with an aggregate/LIMIT body supports only column arguments",
@@ -30562,6 +30841,115 @@ mod tests {
         assert_eq!(agg.group_by().expect("clause").having_aggregates.len(), 1);
     }
 
+    /// Issue #1821・SQL-59: `ROLLUP`・`CUBE`・`GROUPING SETS`・複合指定を構文段で受理し、
+    /// キーの和集合（`columns`）と展開後のセット列（`grouping_sets`）へ正規化する。
+    #[test]
+    fn expands_grouping_syntax_into_grouping_sets() {
+        let lookup = catalog_with(&["documents"]);
+        let clause_of = |gb: &str| {
+            let sql = format!("SELECT count(*) FROM documents GROUP BY {gb}");
+            match validate_sql(&sql, &lookup).expect(&sql) {
+                Statement::Aggregate(a) => a.group_by().expect("clause").clone(),
+                other => panic!("expected aggregate, got {other:?}"),
+            }
+        };
+        let c = clause_of("ROLLUP(a, b)");
+        assert_eq!(c.columns, vec!["a", "b"]);
+        assert_eq!(c.grouping_sets, Some(vec![vec![0, 1], vec![0], vec![]]));
+        let c = clause_of("a, cube(b, c)");
+        assert_eq!(c.columns, vec!["a", "b", "c"]);
+        assert_eq!(
+            c.grouping_sets,
+            Some(vec![vec![0, 1, 2], vec![0, 1], vec![0, 2], vec![0]])
+        );
+        let c = clause_of("GROUPING SETS ((a, b), (a), ())");
+        assert_eq!(c.grouping_sets, Some(vec![vec![0, 1], vec![0], vec![]]));
+        let c = clause_of("grouping sets (a, rollup(b), grouping sets (c, ()))");
+        assert_eq!(c.columns, vec!["a", "b", "c"]);
+        assert_eq!(
+            c.grouping_sets,
+            Some(vec![vec![0], vec![1], vec![], vec![2], vec![]])
+        );
+        // 重複参照は一意化して受理する。式キーは和集合へ入る。
+        let c = clause_of("ROLLUP(a, a), upper(b)");
+        assert_eq!(c.columns.len(), 2);
+        assert_eq!(c.key_exprs.len(), 1);
+        assert_eq!(c.grouping_sets, Some(vec![vec![0, 1], vec![0, 1], vec![1]]));
+        // 重複キーが構文の前後どちらにあっても同じく受理する。
+        for gb in ["lang, lang, ROLLUP(kind)", "lang, ROLLUP(kind), lang"] {
+            assert!(clause_of(gb).grouping_sets.is_some(), "{gb}");
+        }
+        // 空のセットのみ。キーは 0 個。
+        let c = clause_of("()");
+        assert!(c.columns.is_empty());
+        assert_eq!(c.grouping_sets, Some(vec![vec![]]));
+        // 構文を含まない句は従来どおり。語は予約語化されない。
+        for gb in ["rollup", "cube", "grouping", "a, b"] {
+            assert_eq!(clause_of(gb).grouping_sets, None, "{gb}");
+        }
+        assert_eq!(clause_of("rollup").columns, vec!["rollup"]);
+    }
+
+    /// Issue #1821・SQL-59: グルーピング構文の拒否と上限の分類（`42601`・`42803`・
+    /// `54000`・`54001`・`54011`）。
+    #[test]
+    fn rejects_malformed_or_over_limit_grouping_syntax() {
+        let lookup = catalog_with(&["documents"]);
+        let names = |n: usize| {
+            (0..n)
+                .map(|i| format!("c{i}"))
+                .collect::<Vec<_>>()
+                .join(", ")
+        };
+        let cube12_dup = ["a"; 12].join(", ");
+        let nested = format!("{}a{}", "GROUPING SETS (".repeat(9), ")".repeat(9));
+        for (gb, code) in [
+            ("ROLLUP()".to_string(), "42601"),
+            ("CUBE()".to_string(), "42601"),
+            ("GROUPING SETS ()".to_string(), "42601"),
+            ("ROLLUP(a,)".to_string(), "42601"),
+            ("ROLLUP(a".to_string(), "42601"),
+            ("ROLLUP(CUBE(a))".to_string(), "42601"),
+            ("CUBE(a, ())".to_string(), "42601"),
+            ("ROLLUP(count(*))".to_string(), "42803"),
+            ("ROLLUP($1)".to_string(), "42601"),
+            ("ROLLUP(1)".to_string(), "42601"),
+            ("ROLLUP((SELECT 1))".to_string(), "42601"),
+            ("(a, b)".to_string(), "42601"),
+            ("a, a".to_string(), "42601"),
+            ("DISTINCT a".to_string(), "42601"),
+            // 上限: CUBE は 13 要素で 54011、4,096 セット超・入れ子超過は 54001、
+            // 一意キー 9 個は 54000（判定順は 54011 → 54001 → 54000）。
+            (format!("CUBE({})", names(13)), "54011"),
+            (format!("CUBE({cube12_dup}), ROLLUP(a)"), "54001"),
+            (nested, "54001"),
+            (format!("ROLLUP({})", names(9)), "54000"),
+            // 9 キーの後に 13 要素の CUBE は 54011 が先（従来形の上限検査に先取りされない）。
+            (format!("{}, CUBE({})", names(9), names(13)), "54011"),
+        ] {
+            let sql = format!("SELECT count(*) FROM documents GROUP BY {gb}");
+            let err = validate_sql(&sql, &lookup).expect_err(&sql);
+            assert_eq!(err.wire_code(), code, "{sql}");
+        }
+        // ちょうど 4,096 セットは受理する。
+        let sql = format!("SELECT count(*) FROM documents GROUP BY CUBE({cube12_dup})");
+        validate_sql(&sql, &lookup).expect("4096 sets");
+    }
+
+    /// Issue #1821: トップレベルの集計 `SELECT` 以外（サブクエリ・CTE 主クエリ・集合演算の枝）
+    /// ではグルーピング構文を `42601` で拒否する。
+    #[test]
+    fn rejects_grouping_syntax_outside_top_level_aggregate_select() {
+        let lookup = catalog_with(&["documents"]);
+        for sql in [
+            "SELECT id FROM documents WHERE id IN (SELECT id FROM documents GROUP BY ROLLUP(lang))",
+            "WITH c AS (SELECT 1 FROM documents) SELECT count(*) FROM documents GROUP BY ROLLUP(lang)",
+            "SELECT count(*) FROM documents GROUP BY lang UNION SELECT count(*) FROM documents GROUP BY ROLLUP(lang)",
+        ] {
+            let err = validate_sql(sql, &lookup).expect_err(sql);
+            assert_eq!(err.wire_code(), "42601", "{sql}");
+        }
+    }
     /// Issue #1819: `GROUP BY` なしの `HAVING` を受理するのはトップレベルの集計 `SELECT` だけ。
     /// 後続の `ORDER BY`／`LIMIT`／`OFFSET`・`OR`・CTE 主クエリ・集合演算の枝・ウィンドウ併用は
     /// 従来どおり `42601`。`GROUP BY` も `HAVING` も無い裸の列は `42601` のまま。

@@ -94,7 +94,7 @@ macro_rules! define_error_classes {
 pub(crate) const SHARED_WIRE_CODES: &[&str] = &["23502", "23505", "22023"];
 
 define_error_classes! {
-    count = 82;
+    count = 84;
 
     /// 構文上受理された SQL の値・引数が不正（`22000`）。
     /// [`crate::sql::allowlist::SqlSurfaceError::InvalidInput`] の写像。
@@ -435,6 +435,14 @@ define_error_classes! {
     /// 式索引の式にウィンドウ関数がある（`42P20`。Issue #1647・INDEX-10 のポインタ）。固定文言のみ。
     /// [`crate::sql::allowlist::SqlSurfaceError::WindowingError`] の写像。
     WindowingError => ("42P20", "WINDOWING_ERROR"),
+    /// `GROUP BY` の `ROLLUP`／`CUBE`／`GROUPING SETS` の展開後セット数が上限を超えた、または
+    /// 入れ子が深すぎる（`54001`。Issue #1821・SQL-59 のポインタ）。文の形だけで決まり、行・
+    /// テナントに依存しない。固定文言のみ。
+    /// [`crate::sql::allowlist::SqlSurfaceError::StatementTooComplex`] の写像。
+    StatementTooComplex => ("54001", "STATEMENT_TOO_COMPLEX"),
+    /// `CUBE` の要素数が上限を超えた（`54011`。Issue #1821・SQL-59 のポインタ）。固定文言のみ。
+    /// [`crate::sql::allowlist::SqlSurfaceError::TooManyColumns`] の写像。
+    TooManyColumns => ("54011", "TOO_MANY_COLUMNS"),
     /// 明示の `CAST`／`::` で、型の組に変換の対応が無い（`42846`。Issue #1590・SQL-47 のポインタ。
     /// 規則表は `docs/design/cast-conversion-rules.md`）。型の組だけで束縛時に決まり、値が NULL でも
     /// 同じく返る。文言は静的な型名だけで、値・列名・テナント情報を含めない。
