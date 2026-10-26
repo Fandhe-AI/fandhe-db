@@ -416,6 +416,12 @@ impl Ord for GroupKey {
 /// TABLE-28・Issue #1610。ICU 順の辞書を持つ列は `column_groups` 自体が `None` を返す。
 /// ICU キーの列挙形は集計表側の照合対応が要るため #2191 の対象外）。
 pub(crate) fn single_text_key_column(group_by: &crate::sql::parser::BoundGroupBy) -> Option<usize> {
+    // Issue #1822・SQL-59: グルーピングセット（`ROLLUP(lang)` のように単一 `TEXT` キーでも）は
+    // セットごとの集計表（`set_groups`）で全走査するため、索引の列挙形・候補走査形へ流さない。
+    // EXPLAIN の静的判定も本関数を共有するので、全走査として一致する。
+    if group_by.grouping_sets.is_some() {
+        return None;
+    }
     match group_by.keys.as_slice() {
         [key] if key.kind == OrderKind::Bytes && key.collation.is_byte_order() => {
             match key.target {
@@ -1498,6 +1504,39 @@ pub(crate) fn execute_grouped_aggregate(
     // 使い回せる（二重計上しない）。
     let mut distinct_budget = crate::sql::distinct::DistinctBudget::new();
 
+    // Issue #1822・SQL-59: グルーピングセット（`ROLLUP`・`CUBE`・`GROUPING SETS`）は 1 パスで
+    // セットごとの集計表を持つ。同内容のセットも重複排除せず別の表にする（PostgreSQL と同じく
+    // 行は重複して出る）。`set_group_total` は全セット合計のグループ数で、グループ数上限・
+    // 結果行数上限・結果バイト予算の判定はすべてこの合計で行う。
+    let set_masks = grouping_set_masks(group_by)?;
+    let mut set_groups: Vec<BTreeMap<GroupKey, Vec<Accumulator>>> = Vec::new();
+    let mut set_group_total: usize = 0;
+    if let Some(masks) = set_masks.as_ref() {
+        set_groups.try_reserve_exact(masks.len()).map_err(|_| {
+            SqlSurfaceError::payload_too_large("GROUPING SETS allocation exceeds available memory")
+        })?;
+        for mask in masks {
+            let mut table = BTreeMap::new();
+            // 空のセット（総計）は入力 0 行でも 1 行出す（PostgreSQL と同じ）。可視行に依存しない
+            // 行（0 件の集計）なので、テナント境界の情報は含まない。
+            if !mask.iter().any(|m| *m) {
+                check_new_group_budget(
+                    set_group_total,
+                    &mut total_key_bytes,
+                    0,
+                    total_text_accumulator_bytes,
+                    &budget,
+                )?;
+                table.insert(
+                    GroupKey(vec![None; group_by.keys.len()]),
+                    new_accumulators(&bound.items)?,
+                );
+                set_group_total = set_group_total.saturating_add(1);
+            }
+            set_groups.push(table);
+        }
+    }
+
     // Issue #475: `WHERE` なしの `GROUP BY`（列挙形。`ScalarIndex::column_groups`/
     // `slots_without_value` で索引済みの値ごとにグループを直接構築する）、また
     // 索引対応述語のみの `WHERE` を持つ `GROUP BY`（候補走査形。
@@ -1974,65 +2013,70 @@ pub(crate) fn execute_grouped_aggregate(
                     let borrowed_components = borrowed_storage
                         .get(..key_count)
                         .ok_or_else(|| accumulator_bug("GROUP BY key slice out of range"))?;
-                    let probe = BorrowedGroupKey(borrowed_components);
-                    let total_group_count = multi_groups.len();
-                    if let Some(accs) = multi_groups.get_mut(&probe as &dyn GroupKeyView) {
-                        accumulate_row(
-                            accs,
-                            &bound.items,
-                            id,
-                            &vector,
-                            &scanned,
-                            &mut total_text_accumulator_bytes,
-                            total_group_count,
-                            total_key_bytes,
-                            &budget,
-                            &mut expr_scratch,
-                            &mut distinct_budget,
-                        )?;
-                    } else {
-                        check_new_group_budget(
-                            total_group_count,
-                            &mut total_key_bytes,
-                            key_len,
-                            total_text_accumulator_bytes,
-                            &budget,
-                        )?;
-                        // 予算検査を通過した行のみ、各成分を所有化する
-                        // （`try_reserve_exact` ベースの確保。untrusted な格納済み
-                        // TEXT 列値のサイズに対して確保失敗時に abort し得る無条件の
-                        // 確保は使わない。`.claude/rules/security.md`「不安全な設計」
-                        // 対応）。
-                        let mut key_components: Vec<Option<OrderValue>> = Vec::new();
-                        key_components
-                            .try_reserve_exact(borrowed_components.len())
-                            .map_err(|_| {
-                                SqlSurfaceError::payload_too_large(
-                                    "GROUP BY key allocation exceeds available memory",
-                                )
+                    if let Some(masks) = set_masks.as_ref() {
+                        // Issue #1822・SQL-59: 和集合キーは上で 1 回だけ評価済み。セットごとに、
+                        // そのセットに含まれないキー成分を NULL（`None`）にしたキーで、セット専用の
+                        // 集計表へ累積する（予算は全セット合計で計上）。
+                        for (set_index, mask) in masks.iter().enumerate() {
+                            let mut set_components: [Option<ScalarKeyRef<'_>>;
+                                MAX_GROUP_BY_COLUMNS] = [None; MAX_GROUP_BY_COLUMNS];
+                            let mut set_key_len: usize = 0;
+                            for (i, (dst, src)) in set_components
+                                .iter_mut()
+                                .zip(borrowed_components.iter())
+                                .enumerate()
+                            {
+                                if mask.get(i).copied().unwrap_or(false) {
+                                    *dst = *src;
+                                    set_key_len = set_key_len
+                                        .checked_add(key_component_budget_bytes(src.as_ref()))
+                                        .ok_or_else(|| {
+                                            accumulator_bug(
+                                                "GROUP BY key length accounting overflowed",
+                                            )
+                                        })?;
+                                }
+                            }
+                            let set_components =
+                                set_components.get(..key_count).ok_or_else(|| {
+                                    accumulator_bug("GROUP BY key slice out of range")
+                                })?;
+                            let groups = set_groups.get_mut(set_index).ok_or_else(|| {
+                                accumulator_bug("grouping set table out of range")
                             })?;
-                        for value in borrowed_components {
-                            key_components.push(match value {
-                                Some(v) => Some(scalar_key_ref_to_owned(*v)?),
-                                None => None,
-                            });
+                            accumulate_into_multi_group(
+                                groups,
+                                set_components,
+                                set_key_len,
+                                &mut set_group_total,
+                                &mut total_key_bytes,
+                                &mut total_text_accumulator_bytes,
+                                bound,
+                                id,
+                                &vector,
+                                &scanned,
+                                &budget,
+                                &mut expr_scratch,
+                                &mut distinct_budget,
+                            )?;
                         }
-                        let group_key = GroupKey(key_components);
-                        let mut accs = new_accumulators(&bound.items)?;
-                        accumulate_row(
-                            &mut accs,
-                            &bound.items,
+                    } else {
+                        let mut group_total = multi_groups.len();
+                        accumulate_into_multi_group(
+                            &mut multi_groups,
+                            borrowed_components,
+                            key_len,
+                            &mut group_total,
+                            &mut total_key_bytes,
+                            &mut total_text_accumulator_bytes,
+                            bound,
                             id,
                             &vector,
                             &scanned,
-                            &mut total_text_accumulator_bytes,
-                            total_group_count.saturating_add(1),
-                            total_key_bytes,
                             &budget,
                             &mut expr_scratch,
                             &mut distinct_budget,
                         )?;
-                        multi_groups.insert(group_key, accs);
                     }
                 }
             }
@@ -2052,15 +2096,20 @@ pub(crate) fn execute_grouped_aggregate(
     // （Issue #351。`sort-determinism-check`・決定性テストが前提とする順序を
     // 維持）。複数キー（SQL-25 (d)）は `multi_groups`（`BTreeMap<GroupKey, _>`。
     // 既に `GroupKey::Ord` の昇順）をそのまま使う。
-    let total_group_count =
-        string_groups.len() + usize::from(null_group.is_some()) + multi_groups.len();
-    let group_entries: Box<dyn Iterator<Item = (GroupKey, Vec<Accumulator>)>> =
+    let total_group_count = string_groups.len()
+        + usize::from(null_group.is_some())
+        + multi_groups.len()
+        + set_group_total;
+    // 要素の先頭はセット番号（グルーピングセット以外は 0）。並び順（セット宣言順 → キー昇順）と、
+    // 同じキーを持つ別セットの行（データ上の NULL と総計の NULL 等）の区別に使う。
+    let group_entries: Box<dyn Iterator<Item = (usize, GroupKey, Vec<Accumulator>)>> =
         if single_text_column.is_some() {
             Box::new(
                 string_groups
                     .into_iter()
                     .map(|(k, accs)| {
                         (
+                            0,
                             GroupKey(vec![Some(OrderValue::Bytes(k.into_bytes()))]),
                             accs,
                         )
@@ -2068,11 +2117,20 @@ pub(crate) fn execute_grouped_aggregate(
                     .chain(
                         null_group
                             .into_iter()
-                            .map(|accs| (GroupKey(vec![None]), accs)),
+                            .map(|accs| (0, GroupKey(vec![None]), accs)),
                     ),
             )
+        } else if set_masks.is_some() {
+            Box::new(
+                set_groups
+                    .into_iter()
+                    .enumerate()
+                    .flat_map(|(set_index, table)| {
+                        table.into_iter().map(move |(k, accs)| (set_index, k, accs))
+                    }),
+            )
         } else {
-            Box::new(multi_groups.into_iter())
+            Box::new(multi_groups.into_iter().map(|(k, accs)| (0, k, accs)))
         };
 
     finish_groups(
@@ -2086,12 +2144,119 @@ pub(crate) fn execute_grouped_aggregate(
     )
 }
 
+/// 束縛済みのセット列（[`crate::sql::parser::BoundGroupBy::grouping_sets`]）を、セットごとの
+/// 「キー所属マスク」へ変換する（Issue #1822・SQL-59）。セット数は構文段が上限検査済みだが、
+/// 確保は `try_reserve_exact` で行う。キー添字の範囲外は内部不整合として `XX000`。
+fn grouping_set_masks(
+    group_by: &crate::sql::parser::BoundGroupBy,
+) -> Result<Option<Vec<[bool; MAX_GROUP_BY_COLUMNS]>>, SqlSurfaceError> {
+    let Some(sets) = group_by.grouping_sets.as_ref() else {
+        return Ok(None);
+    };
+    let mut masks: Vec<[bool; MAX_GROUP_BY_COLUMNS]> = Vec::new();
+    masks.try_reserve_exact(sets.len()).map_err(|_| {
+        SqlSurfaceError::payload_too_large("GROUPING SETS allocation exceeds available memory")
+    })?;
+    for set in sets {
+        let mut mask = [false; MAX_GROUP_BY_COLUMNS];
+        for &index in set {
+            if index >= group_by.keys.len() {
+                return Err(accumulator_bug("grouping set index out of bounds"));
+            }
+            let slot = mask
+                .get_mut(index)
+                .ok_or_else(|| accumulator_bug("grouping set index exceeds key limit"))?;
+            *slot = true;
+        }
+        masks.push(mask);
+    }
+    Ok(Some(masks))
+}
+
+/// 複数キー集計表 `groups` へ可視行 1 件を累積する（既存グループなら累積のみ、新規なら予算検査 →
+/// 成分の所有化 → 累積 → 挿入）。通常の複数キー経路と、グルーピングセット（Issue #1822・SQL-59）の
+/// セットごとの集計表が共有する。`group_total` は予算判定に使う「全表合計のグループ数」で、
+/// 新規挿入のたびに加算する（グルーピングセットでは全セット合計。上限を展開後の合計に適用するため）。
+/// `key_len` は `components` のうち予算計上する成分（セットに含まれるキー）のバイト数合計。
+#[allow(clippy::too_many_arguments)]
+fn accumulate_into_multi_group(
+    groups: &mut BTreeMap<GroupKey, Vec<Accumulator>>,
+    components: &[Option<ScalarKeyRef<'_>>],
+    key_len: usize,
+    group_total: &mut usize,
+    total_key_bytes: &mut usize,
+    total_text_accumulator_bytes: &mut usize,
+    bound: &BoundAggregate,
+    id: u64,
+    vector: &RowVector<'_>,
+    scanned: &[Option<row_codec::ScalarRef<'_>>],
+    budget: &ResultBudget,
+    expr_scratch: &mut Vec<StackValue>,
+    distinct_budget: &mut crate::sql::distinct::DistinctBudget,
+) -> Result<(), SqlSurfaceError> {
+    let probe = BorrowedGroupKey(components);
+    if let Some(accs) = groups.get_mut(&probe as &dyn GroupKeyView) {
+        return accumulate_row(
+            accs,
+            &bound.items,
+            id,
+            vector,
+            scanned,
+            total_text_accumulator_bytes,
+            *group_total,
+            *total_key_bytes,
+            budget,
+            expr_scratch,
+            distinct_budget,
+        );
+    }
+    check_new_group_budget(
+        *group_total,
+        total_key_bytes,
+        key_len,
+        *total_text_accumulator_bytes,
+        budget,
+    )?;
+    // 予算検査を通過した行のみ、各成分を所有化する（`try_reserve_exact` ベースの確保。
+    // untrusted な格納済み TEXT 列値のサイズに対して abort し得る無条件の確保は使わない）。
+    let mut key_components: Vec<Option<OrderValue>> = Vec::new();
+    key_components
+        .try_reserve_exact(components.len())
+        .map_err(|_| {
+            SqlSurfaceError::payload_too_large("GROUP BY key allocation exceeds available memory")
+        })?;
+    for value in components {
+        key_components.push(match value {
+            Some(v) => Some(scalar_key_ref_to_owned(*v)?),
+            None => None,
+        });
+    }
+    let group_key = GroupKey(key_components);
+    let mut accs = new_accumulators(&bound.items)?;
+    accumulate_row(
+        &mut accs,
+        &bound.items,
+        id,
+        vector,
+        scanned,
+        total_text_accumulator_bytes,
+        group_total.saturating_add(1),
+        *total_key_bytes,
+        budget,
+        expr_scratch,
+        distinct_budget,
+    )?;
+    groups.insert(group_key, accs);
+    *group_total = group_total.saturating_add(1);
+    Ok(())
+}
+
 /// 確定したグループ表（キー昇順。[`GroupKey`] の `Ord`）から結果を組み立てる終端処理
 /// （FINISH／ORDER BY／OFFSET・LIMIT／PROJECT 段）。[`execute_grouped_aggregate`]（ストレージ
 /// 走査）と [`GroupedRowAccumulator`]（評価済みセル。`sql::view_buffered`・Issue #1411）が
 /// 共有し、`HAVING`・`ORDER BY`・結果列の組み立てを第 2 の実装にしない。
 fn finish_groups(
-    group_entries: Box<dyn Iterator<Item = (GroupKey, Vec<Accumulator>)>>,
+    group_entries: Box<dyn Iterator<Item = (usize, GroupKey, Vec<Accumulator>)>>,
     total_group_count: usize,
     bound: &BoundAggregate,
     schema: &TableSchema,
@@ -2109,12 +2274,13 @@ fn finish_groups(
     let mut row_expr_scratch: Vec<StackValue> = Vec::new();
     // 第 3 要素は式キーの事前評価値（`sort_by` のクロージャは `Result` を返せないため、
     // ソート前に 1 グループ 1 回だけ評価してエラーをここで返す）。
-    let mut finished: Vec<(GroupKey, Vec<Cell>, Vec<Option<OrderValue>>)> =
-        Vec::with_capacity(total_group_count);
+    // `(セット番号, グループキー, 集計セル, 式キーの事前評価値)`。
+    type FinishedGroup = (usize, GroupKey, Vec<Cell>, Vec<Option<OrderValue>>);
+    let mut finished: Vec<FinishedGroup> = Vec::with_capacity(total_group_count);
     // 式キーの所有値（`finished` がソート完了まで全グループ分保持する）の累計見積り
     // バイト数。所有値化の前に [`OrderKeyCharge`] 経由で [`ResultBudget`] へ課金する。
     let mut order_key_bytes: usize = 0;
-    for (key, accs) in group_entries {
+    for (set_index, key, accs) in group_entries {
         let cells: Vec<Cell> = accs
             .into_iter()
             .map(Accumulator::finish)
@@ -2147,7 +2313,7 @@ fn finish_groups(
             )?;
         }
         if keep {
-            finished.push((key, cells, order_values));
+            finished.push((set_index, key, cells, order_values));
         }
     }
 
@@ -2162,8 +2328,7 @@ fn finish_groups(
     // `sort_unstable*` は使わない（決定性。`make sort-determinism-check`）。
     // `ORDER BY` キー部分だけの比較（タイブレークのグループキー昇順を含まない）。`WITH TIES`
     // （SQL-56 (3)・Issue #1793）の同値判定と全順序の比較が同じ実装を共有する。
-    type FinishedGroup = (GroupKey, Vec<Cell>, Vec<Option<OrderValue>>);
-    let order_keys_cmp = |(ka, ca, va): &FinishedGroup, (kb, cb, vb): &FinishedGroup| {
+    let order_keys_cmp = |(_, ka, ca, va): &FinishedGroup, (_, kb, cb, vb): &FinishedGroup| {
         for order_by in &group_by.order_by {
             let ord = match order_by.target {
                 OrderTarget::GroupKey(key_index) => compare_order_key(
@@ -2194,9 +2359,15 @@ fn finish_groups(
         std::cmp::Ordering::Equal
     };
     if group_by.order_by.is_empty() {
-        finished.sort_by(|(ka, _, _), (kb, _, _)| ka.cmp(kb));
+        // Issue #1822: グルーピングセットはセット宣言順 → キー昇順（単一セットは常に 0）。
+        finished.sort_by(|(sa, ka, _, _), (sb, kb, _, _)| sa.cmp(sb).then_with(|| ka.cmp(kb)));
     } else {
-        finished.sort_by(|a, b| order_keys_cmp(a, b).then_with(|| a.0.cmp(&b.0)));
+        // 同じキーの別セット行（データ上の NULL と総計の NULL 等）はセット番号で決定的にする。
+        finished.sort_by(|a, b| {
+            order_keys_cmp(a, b)
+                .then_with(|| a.1.cmp(&b.1))
+                .then_with(|| a.0.cmp(&b.0))
+        });
     }
 
     // Issue #916・SQL-25 (b)・TASK-209: `OFFSET` はソート確定後・`LIMIT` 適用前に
@@ -2248,7 +2419,7 @@ fn finish_groups(
     let mut project_scratch: Vec<StackValue> = Vec::new();
     // 式列が返す BYTEA／配列セルの累計見積りバイト数（結果バイト予算への課金。Issue #1592）。
     let mut computed_bytes: usize = 0;
-    for (key, cells, _) in finished {
+    for (_, key, cells, _) in finished {
         let row_cells = project_row(
             bound,
             schema,
@@ -2506,6 +2677,13 @@ impl<'a> GroupedRowAccumulator<'a> {
     ) -> Result<Self, SqlSurfaceError> {
         if let Some(group_by) = bound.group_by.as_ref() {
             check_configured_column_count(group_by.keys.len(), group_limits)?;
+            // Issue #1822・SQL-59: 評価後射影形ビューの外側集計はグルーピングセットの実行段を
+            // 持たない。通常の `GROUP BY` として誤った行を返さないよう fail-closed で拒否する。
+            if group_by.grouping_sets.is_some() {
+                return Err(SqlSurfaceError::feature_not_supported(
+                    "GROUPING SETS, ROLLUP and CUBE are not supported over a view",
+                ));
+            }
         }
         let single = if bound.group_by.is_none() {
             Some(new_accumulators(&bound.items)?)
@@ -2677,7 +2855,7 @@ impl<'a> GroupedRowAccumulator<'a> {
         }
         let total_group_count = groups.len();
         finish_groups(
-            Box::new(groups.into_iter()),
+            Box::new(groups.into_iter().map(|(k, accs)| (0, k, accs))),
             total_group_count,
             bound,
             schema,
@@ -3079,6 +3257,7 @@ mod tests {
                 limit: None,
                 offset: 0,
                 result_cap: None,
+                grouping_sets: None,
             }),
             ungrouped_having: None,
         }
@@ -3235,6 +3414,7 @@ mod tests {
                 limit: None,
                 offset: 0,
                 result_cap: None,
+                grouping_sets: None,
             }),
             ungrouped_having: None,
         }
@@ -3726,6 +3906,7 @@ mod tests {
                 limit: None,
                 offset: 0,
                 result_cap: None,
+                grouping_sets: None,
             }),
             ungrouped_having: None,
         }

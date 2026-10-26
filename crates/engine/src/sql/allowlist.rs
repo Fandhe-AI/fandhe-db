@@ -3852,8 +3852,9 @@ pub struct GroupByClause {
     pub(crate) key_exprs: Vec<Expr>,
     /// 展開後のグルーピングセット（Issue #1821・SQL-59）。各要素は `columns` の添字の昇順・
     /// 重複なしの列で、空の内側は総計のセット。`None` は通常の単一セット `GROUP BY`。`Some` の
-    /// とき `columns`・`key_exprs` は全セットのキーの和集合（初出順）。実行段（Issue #1822）が
-    /// 実装されるまで、束縛段が `0A000` で拒否する（誤った行を黙って返さない fail-closed）。
+    /// とき `columns`・`key_exprs` は全セットのキーの和集合（初出順）。実行段（Issue #1822）は
+    /// `sql::group_by` がセットごとの集計表で実行する。ビュー本体・ビュー外側集計など実行段を
+    /// 持たない文脈は `0A000` で拒否する（誤った行を黙って返さない fail-closed）。
     pub(crate) grouping_sets: Option<Vec<Vec<usize>>>,
     pub(crate) having: Vec<HavingPredicate>,
     /// 式述語の `HAVING`（Issue #1188・SQL-26）。`having` と AND 結合される。
