@@ -482,7 +482,7 @@ fn correlated_subqueries_are_rejected_with_42601() {
         ),
         vec![1]
     );
-    // 修飾参照は内側の構文解析が 42601 で拒否する。
+    // 外側表で修飾した参照は束縛段（SQL-61・Issue #1841）まで届き、相関として 42601 で拒否する。
     let (code, _) = err_code(
         &core,
         &ctx,

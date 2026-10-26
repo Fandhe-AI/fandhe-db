@@ -11,7 +11,10 @@
 //!
 //! fail-closed の判断:
 //! - 公開名に一致しない修飾子は `42P01`。カタログは照会しない（存在オラクルにしない）。
-//! - 外側スコープの公開名に一致する修飾（相関参照）は `42601`（SQL-29 の契約を維持）。
+//! - 外側スコープの公開名に一致する修飾（相関参照）は、内側優先で近い順に照合して予約内部名
+//!   （`sql::correlation::outer_ref_placeholder`）へ置き換え、`sql::correlation` が束縛する
+//!   （SQL-61・Issue #1841）。相関の実行は未対応のため、束縛後に `42601` で拒否される。
+//!   不透明スコープを挟む外側一致と外側表の `t.*` は従来どおり `42601`。
 //! - スキーマ修飾 FROM・JOIN・集合演算・FROM なし・解析不能なスコープは「不透明」として
 //!   書き換えず、従来のパーサー判定（`42601` 等）に委ねる。
 //! - 関数名位置（直後が `(`）・`AS` の直後・`::` の直後・`EXTRACT(` 直後のフィールド名は
@@ -126,7 +129,15 @@ pub(crate) fn normalize_single_table_qualifiers(
         {
             continue;
         }
-        if info.from_ref.matches_qualifier(qualifier) {
+        // 自スコープの公開名に一致しなければ、祖先スコープへ近い順に照合する（内側優先。
+        // Issue #1841・SQL-61）。一致すれば相関参照として予約内部名へ置き換える。
+        let own = info.from_ref.matches_qualifier(qualifier);
+        let outer_levels_up = if own {
+            None
+        } else {
+            Some(resolve_outer_levels_up(&scopes, cur, qualifier)?)
+        };
+        if own || outer_levels_up.is_some() {
             let buf = out.get_or_insert_with(|| tokens.to_vec());
             if let Some(slot) = buf.get_mut(i) {
                 // `x.true`／`x.false` は列参照であり真偽リテラルではない。WHERE の述語葉位置では
@@ -162,6 +173,18 @@ pub(crate) fn normalize_single_table_qualifiers(
                         "qualified boolean-word column reference is only supported as a WHERE predicate",
                     ));
                 }
+                if let Some(levels_up) = outer_levels_up {
+                    // 外側参照は真偽語の列扱い（引用付き相当）を再現できないため拒否する。
+                    if is_bool_word {
+                        return Err(SqlSurfaceError::unsupported(
+                            "qualified boolean-word column reference is only supported as a WHERE predicate",
+                        ));
+                    }
+                    *slot = Token::Ident(crate::sql::correlation::outer_ref_placeholder(
+                        levels_up, name,
+                    ));
+                    continue;
+                }
                 *slot = if leaf {
                     Token::QuotedBoolWord(name.clone())
                 } else if crate::sql::lexer::is_value_function_keyword(name) {
@@ -175,12 +198,44 @@ pub(crate) fn normalize_single_table_qualifiers(
             }
             continue;
         }
-        return Err(mismatched_qualifier_error(&scopes, cur, qualifier));
     }
     Ok(match out {
         Some(v) => Cow::Owned(v),
         None => Cow::Borrowed(tokens),
     })
+}
+
+/// 自スコープの公開名に一致しない修飾子を祖先スコープへ近い順に照合し、一致した祖先までの
+/// 段数（直近の外側 = 1）を返す。`sql::correlation` の束縛段が同じ段数で外側スコープ連鎖を
+/// 引く。一致した祖先の手前に不透明スコープ（JOIN 等）がある場合は連鎖の段数が揃う保証が
+/// 無いため従来どおり `42601`、どの祖先にも一致しなければ `42P01`（カタログは照会しない）。
+fn resolve_outer_levels_up(
+    scopes: &[Scope],
+    cur: usize,
+    qualifier: &str,
+) -> Result<usize, SqlSurfaceError> {
+    let mut anc = scopes.get(cur).and_then(|s| s.parent);
+    let mut levels_up = 0usize;
+    let mut crossed_opaque = false;
+    while let Some(a) = anc {
+        levels_up = levels_up.saturating_add(1);
+        let s = scopes.get(a);
+        match s.and_then(|s| s.info.as_ref()) {
+            Some(ai) => {
+                if ai.from_ref.matches_qualifier(qualifier) {
+                    if crossed_opaque {
+                        return Err(SqlSurfaceError::unsupported(
+                            "correlated column reference to an outer query is not supported",
+                        ));
+                    }
+                    return Ok(levels_up);
+                }
+            }
+            None => crossed_opaque = true,
+        }
+        anc = s.and_then(|s| s.parent);
+    }
+    Err(SqlSurfaceError::undefined_table(qualifier.to_string()))
 }
 
 /// FROM の公開名に一致しない修飾子のエラー。外側スコープの公開名に一致すれば相関参照
@@ -516,10 +571,15 @@ mod tests {
     }
 
     #[test]
-    fn outer_qualifier_inside_subquery_is_unsupported_inner_wins() {
+    fn outer_qualifier_inside_subquery_becomes_placeholder_inner_wins() {
+        // 外側表での修飾は予約内部名へ置き換わる（束縛は sql::correlation）。
         assert_eq!(
             code("SELECT id FROM docs WHERE lang IN (SELECT lang FROM langs WHERE docs.id = 1) LIMIT 1"),
-            "42601"
+            "ok"
+        );
+        assert_eq!(
+            code("SELECT id FROM docs WHERE lang IN (SELECT lang FROM langs WHERE zzz.id = 1) LIMIT 1"),
+            "42P01"
         );
         assert_eq!(
             code("SELECT id FROM docs WHERE lang IN (SELECT lang FROM langs WHERE langs.id = 1) LIMIT 1"),
@@ -529,6 +589,54 @@ mod tests {
         assert_eq!(
             code("SELECT id FROM docs WHERE lang IN (SELECT lang FROM docs WHERE docs.id = 1) LIMIT 1"),
             "ok"
+        );
+    }
+
+    fn placeholders(sql: &str) -> Vec<String> {
+        norm(sql)
+            .expect("normalize")
+            .iter()
+            .filter_map(|t| match t {
+                Token::Ident(s)
+                    if crate::sql::correlation::parse_outer_ref_placeholder(s).is_some() =>
+                {
+                    Some(s.clone())
+                }
+                _ => None,
+            })
+            .collect()
+    }
+
+    #[test]
+    fn outer_levels_up_counts_ancestors_nearest_first() {
+        use crate::sql::correlation::outer_ref_placeholder as ph;
+        assert_eq!(
+            placeholders(
+                "SELECT id FROM docs a WHERE EXISTS (SELECT id FROM langs b WHERE b.id = a.id) LIMIT 1"
+            ),
+            vec![ph(1, "id")]
+        );
+        assert_eq!(
+            placeholders(
+                "SELECT id FROM docs a WHERE EXISTS (SELECT id FROM langs b WHERE EXISTS \
+                 (SELECT id FROM t c WHERE c.id = a.lang AND c.id = b.id) LIMIT 1) LIMIT 1"
+            ),
+            vec![ph(2, "lang"), ph(1, "id")]
+        );
+    }
+
+    #[test]
+    fn outer_qualified_star_and_opaque_ancestor_stay_unsupported() {
+        assert_eq!(
+            code("SELECT id FROM docs a WHERE EXISTS (SELECT a.* FROM langs b LIMIT 1) LIMIT 1"),
+            "42601"
+        );
+        assert_eq!(
+            code(
+                "SELECT id FROM docs a WHERE EXISTS (SELECT b.id FROM langs b JOIN t j ON b.id = j.id \
+                 WHERE EXISTS (SELECT id FROM t c WHERE c.id = a.id) LIMIT 1) LIMIT 1"
+            ),
+            "42601"
         );
     }
 

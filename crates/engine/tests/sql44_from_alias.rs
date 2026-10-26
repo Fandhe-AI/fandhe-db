@@ -284,6 +284,12 @@ fn sql44_correlated_outer_qualifier_stays_unsupported() {
         "SELECT id FROM docs x WHERE lang IN (SELECT x.lang FROM langs LIMIT 10) LIMIT 10",
     ] {
         assert_eq!(code(&core, &ctx, sql), "42601", "{sql}");
+        // 理由は構文段ではなく、束縛段（SQL-61）の相関拒否であることを文言で固定する。
+        let msg = core
+            .execute_sql(&ctx, sql)
+            .expect_err("rejected")
+            .to_string();
+        assert!(msg.contains("correlated"), "{sql}: {msg}");
     }
     // 外側を別名にした後で元の表名を内側から使うのは未定義の表。
     assert_eq!(

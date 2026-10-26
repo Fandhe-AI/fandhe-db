@@ -1299,8 +1299,15 @@ impl SqlSurfaceError {
     /// view 等の列束縛箇所から呼ばれ、従来 `22000` で返していた未知列を ERR-2 の決定的分類へ揃える
     /// （Issue #2332）。識別子は `truncate_for_error` で切り詰め、他の情報は加えない。
     pub(crate) fn undefined_column(name: impl Into<String>) -> Self {
+        let name = name.into();
+        // 外側参照の予約内部名（制御文字の接頭辞）が束縛段を素通りして到達しても、
+        // 文言には利用者が書いた列名だけを出す（Issue #1841・SQL-61）。
+        let shown = match crate::sql::correlation::parse_outer_ref_placeholder(&name) {
+            Some((_, column)) => column,
+            None => name.as_str(),
+        };
         SqlSurfaceError::UndefinedColumn {
-            name: truncate_for_error(&name.into()),
+            name: truncate_for_error(shown),
         }
     }
 

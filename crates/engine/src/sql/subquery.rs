@@ -78,6 +78,7 @@ use super::allowlist::{
     CompareOp, Projection, ScalarSubqueryItem, ScalarSubqueryOp, SelectItem, SqlSurfaceError,
     Statement, TableLookup, ValidatedAggregate, ValidatedScan, WherePredicate,
 };
+use super::correlation;
 use super::exec::{Cell, ColumnMeta};
 use super::lexer::Token;
 use super::udf_call::{BinOp, Expr, UdfRegistry};
@@ -123,7 +124,7 @@ const MAX_INT_NOT_IN_VALUES: usize = crate::declarative_filter::MAX_IN_LIST_ITEM
 /// （末尾が `predicates` を含む文自身のテーブル）。末尾は対象列の存在・型検証
 /// （[`validate_in_target_column`] 等。PR #1103 codex-review P1 指摘対応: 内側の
 /// 結果行数に関わらず必ず検証する）に使い、全体は内側クエリの相関参照検出
-/// （[`reject_correlated`]）に使う。ネストしたサブクエリを解決する再帰呼び出し
+/// （[`bind_and_reject_correlated`]）に使う。ネストしたサブクエリを解決する再帰呼び出し
 /// （[`execute_inner_query`]）は、内側クエリ自身のスキーマを末尾へ積んで渡す。
 ///
 /// `budget` は呼び出し階層全体（ネストしたサブクエリを含む）で共有する残り
@@ -336,11 +337,34 @@ fn scan_referenced_columns(validated: &ValidatedScan) -> HashSet<String> {
         }
     }
     super::parser::collect_where_predicate_idents(&validated.where_predicates, &mut cols);
-    cols.extend(validated.order_by.iter().map(|k| k.column.clone()));
+    // `ORDER BY` の素の名前が投影の出力別名と一致する場合は、PostgreSQL と同じく出力列を
+    // 優先するため、外側の同名列への相関候補にしない（Issue #1841）。
+    let output_aliases: HashSet<&str> = match &validated.projection {
+        Projection::Items(items) => items
+            .iter()
+            .filter_map(|item| match item {
+                SelectItem::Expr {
+                    alias: Some(alias), ..
+                } => Some(alias.as_str()),
+                _ => None,
+            })
+            .collect(),
+        _ => HashSet::new(),
+    };
+    cols.extend(
+        validated
+            .order_by
+            .iter()
+            .filter(|k| !output_aliases.contains(k.column.as_str()))
+            .map(|k| k.column.clone()),
+    );
     // `NULLS FIRST|LAST` を明示した列キーは完全形（`order_keys`）に載る（SQL-56・Issue #1791）。
     // 振り分けで相関参照の検出が変わらないよう、列キーの名前もここで集める。
     for key in &validated.order_keys {
         if let super::allowlist::ScanOrderKey::Column { key, .. } = key {
+            if output_aliases.contains(key.column.as_str()) {
+                continue;
+            }
             cols.insert(key.column.clone());
         }
     }
@@ -374,32 +398,28 @@ fn aggregate_referenced_columns(validated: &ValidatedAggregate) -> HashSet<Strin
     cols
 }
 
-/// 内側クエリの参照列に相関参照（内側スキーマに無く、外側スコープのいずれかに
-/// 有る名前）が含まれれば `42601` で拒否する（Issue #1191・SQL-29。相関
-/// サブクエリは対象外）。PostgreSQL の名前解決順（内側優先）に合わせ、内側に
-/// 同名列が有れば内側の列として扱う。疑似列 `id` は全テーブルにあるため対象外。
-/// エラー文言は静的文字列のみ（他テナントの情報・列名を含めない）。
-fn reject_correlated(
+/// 内側クエリの事前検査結果。`correlation` は外側スコープへの束縛結果（相関の IR。
+/// SQL-61・Issue #1841）。相関の実行が未対応の間は、相関があれば事前検査が
+/// [`correlation::reject_if_correlated`] で拒否するため、返る時点では相関なしである。
+/// #1842 以降は拒否を半結合・反結合の書き換えへ置き換え、この IR を使う。
+struct InnerPrecheck {
+    schema: TableSchema,
+    #[allow(dead_code)] // #1842 以降の半結合・反結合への書き換えが読む。
+    correlation: correlation::Correlation,
+}
+
+/// 内側クエリの参照列を内側スキーマ・外側スコープ連鎖に束縛し（`sql::correlation`。
+/// 内側優先で近い外側へ。曖昧は `42702`、外側表で修飾した存在しない列は `42703`）、
+/// 相関があれば `42601` で拒否する（Issue #1191・#1841。相関サブクエリの実行は対象外）。
+/// エラー文言は静的文字列と利用者自身が書いた列名のみ（他テナントの情報を含めない）。
+fn bind_and_reject_correlated(
     referenced: &HashSet<String>,
     inner_schema: &TableSchema,
     outer_scopes: &[&TableSchema],
-) -> Result<(), SqlSurfaceError> {
-    for name in referenced {
-        if (name == "id" && inner_schema.has_pseudo_id())
-            || inner_schema.columns.iter().any(|c| &c.name == name)
-        {
-            continue;
-        }
-        if outer_scopes
-            .iter()
-            .any(|scope| scope.columns.iter().any(|c| &c.name == name))
-        {
-            return Err(SqlSurfaceError::unsupported(
-                "correlated subqueries are not supported",
-            ));
-        }
-    }
-    Ok(())
+) -> Result<correlation::Correlation, SqlSurfaceError> {
+    let bound = correlation::bind_correlation(referenced, inner_schema, outer_scopes)?;
+    correlation::reject_if_correlated(&bound)?;
+    Ok(bound)
 }
 
 /// 内側スキーマを取得する（存在しないテーブルは `42P01`）。
@@ -557,7 +577,7 @@ fn inner_scan_prechecks(
     intent: InnerScanIntent,
     outer_scopes: &[&TableSchema],
     read_txn: &impl crate::storage::read_source::ReadSource,
-) -> Result<TableSchema, SqlSurfaceError> {
+) -> Result<InnerPrecheck, SqlSurfaceError> {
     // Issue #1796・SQL-34: 内側の `LIMIT` 省略・`LIMIT ALL` は従来どおり `42601`
     // （サブクエリ内側の暗黙上限は #1852／#1853 の範囲。受理範囲を黙って広げない）。
     if validated.limit_implicit {
@@ -577,7 +597,7 @@ fn inner_scan_prechecks(
     let inner_schema = inner_table_schema(read_txn, &validated.table_name)?;
 
     // 相関サブクエリは束縛・走査より前に静的に拒否する（Issue #1191）。
-    reject_correlated(
+    let correlation = bind_and_reject_correlated(
         &scan_referenced_columns(validated),
         &inner_schema,
         outer_scopes,
@@ -612,7 +632,10 @@ fn inner_scan_prechecks(
             ));
         }
     }
-    Ok(inner_schema)
+    Ok(InnerPrecheck {
+        schema: inner_schema,
+        correlation,
+    })
 }
 
 /// 内側の集計形（スカラー用途）の、WHERE 解決・束縛より前に行う静的検査（集計項目数・
@@ -621,19 +644,22 @@ fn inner_aggregate_prechecks(
     validated: &ValidatedAggregate,
     outer_scopes: &[&TableSchema],
     read_txn: &impl crate::storage::read_source::ReadSource,
-) -> Result<TableSchema, SqlSurfaceError> {
+) -> Result<InnerPrecheck, SqlSurfaceError> {
     if validated.items.len() != 1 {
         return Err(SqlSurfaceError::unsupported(
             "subquery used as a value must select exactly one column",
         ));
     }
     let inner_schema = inner_table_schema(read_txn, &validated.table_name)?;
-    reject_correlated(
+    let correlation = bind_and_reject_correlated(
         &aggregate_referenced_columns(validated),
         &inner_schema,
         outer_scopes,
     )?;
-    Ok(inner_schema)
+    Ok(InnerPrecheck {
+        schema: inner_schema,
+        correlation,
+    })
 }
 
 /// [`execute_inner_query`] の広域取得（`Statement::Scan`）側の本体。
@@ -652,7 +678,7 @@ fn execute_inner_scan_statement(
     in_value_budget: &mut usize,
     meta_sink: &mut Option<Vec<ColumnMeta>>,
 ) -> Result<super::exec::QueryResult, SqlSurfaceError> {
-    let inner_schema = inner_scan_prechecks(&validated, intent, outer_scopes, read_txn)?;
+    let inner_schema = inner_scan_prechecks(&validated, intent, outer_scopes, read_txn)?.schema;
 
     // 自身の WHERE に含まれるさらに深いサブクエリを、束縛（`bind_scan`）の前に
     // 解決する（深さ優先。`depth` は構文解析段で `MAX_SUBQUERY_DEPTH` 検査
@@ -748,7 +774,7 @@ fn execute_inner_aggregate_statement(
     in_value_budget: &mut usize,
     meta_sink: &mut Option<Vec<ColumnMeta>>,
 ) -> Result<super::exec::QueryResult, SqlSurfaceError> {
-    let inner_schema = inner_aggregate_prechecks(&validated, outer_scopes, read_txn)?;
+    let inner_schema = inner_aggregate_prechecks(&validated, outer_scopes, read_txn)?.schema;
     // 実行時エラー時に、解決前の述語で静的検証を完了させるための控え。
     let original_preds: Vec<WherePredicate> = validated.where_predicates.clone();
     let mut chain: Vec<&TableSchema> = outer_scopes.to_vec();
@@ -944,7 +970,8 @@ fn static_validate_inner_query(
     )?;
     match (stmt, intent) {
         (Statement::Scan(mut validated), _) => {
-            let inner_schema = inner_scan_prechecks(&validated, intent, outer_scopes, read_txn)?;
+            let inner_schema =
+                inner_scan_prechecks(&validated, intent, outer_scopes, read_txn)?.schema;
             let mut chain: Vec<&TableSchema> = outer_scopes.to_vec();
             chain.push(&inner_schema);
             static_validate_subquery_predicates(
@@ -984,7 +1011,8 @@ fn static_validate_inner_query(
             Statement::Aggregate(mut validated),
             InnerScanIntent::Scalar | InnerScanIntent::ScalarValue,
         ) => {
-            let inner_schema = inner_aggregate_prechecks(&validated, outer_scopes, read_txn)?;
+            let inner_schema =
+                inner_aggregate_prechecks(&validated, outer_scopes, read_txn)?.schema;
             let mut chain: Vec<&TableSchema> = outer_scopes.to_vec();
             chain.push(&inner_schema);
             static_validate_subquery_predicates(
