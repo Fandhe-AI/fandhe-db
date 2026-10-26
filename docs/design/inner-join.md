@@ -40,7 +40,7 @@ relation は常にちょうど 2 個。以下はいずれも `42601`（fail-clos
 - （`CROSS JOIN` は Issue #1831、`JOIN ... USING (...)` は Issue #1826、`NATURAL JOIN` は Issue #1827 で受理対象に
   なった。`docs/design/join-using.md` 参照。`LEFT`／`RIGHT`／`FULL [OUTER]` は
   Issue #926 で受理対象になった。`docs/design/outer-join.md` 参照）
-- 非等価の `ON`、左右が同じ relation を指す `ON`
+- 非等価の `ON`（#1835 系で解除予定。[nested-loop-join.md](nested-loop-join.md)）、左右が同じ relation を指す `ON`
 - `ORDER BY`・`<=>`・`HYBRID`・`USING PLAN`・`USING MODE`・`HINT ORDER` との併用
 - 集計・`GROUP BY`・`DISTINCT`・ウィンドウ関数・式項目・`t.*`
 - WHERE の `OR`・括弧・`BETWEEN`・`IN`・`NOT`・式・列同士の比較
@@ -218,7 +218,7 @@ JOIN の「整数クラスを跨いで結合できる」という要件（`id`�
   がある ON は `0A000`（fail-closed）。残余の評価は Issue #1830 で行い、そこで拒否を解除する。
   外部結合の ON 残余は WHERE の簡約規則へ流さない。
 - Issue #1830 で残余付き ON の `0A000` 拒否を解除した（一致条件として結合段で評価する。意味論は
-  [outer-join.md](outer-join.md) の「Issue #1830 追記」）。キー無し ON の `42601` は維持する。
+  [outer-join.md](outer-join.md) の「Issue #1830 追記」）。キー無し ON の `42601` は維持する（#1835 系の #1837〜#1839 でネステッドループ結合により解除予定。設計は [nested-loop-join.md](nested-loop-join.md)）。
 
 ## Issue #1831 追記（CROSS JOIN。SQL-60 ポインタ）
 

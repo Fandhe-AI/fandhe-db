@@ -31,7 +31,7 @@ join_type := [INNER] JOIN | LEFT [OUTER] JOIN | RIGHT [OUTER] JOIN | FULL [OUTER
 `inner-join.md` の文法をこの `join_type` の拡張だけ差し替える。それ以外（`ON`・`WHERE`・
 `LIMIT`／`OFFSET`・別名・対象外事項）は INNER と共通。引き続き `42601`（fail-closed）:
 `OUTER JOIN` 単独（`LEFT`／`RIGHT`／`FULL` を伴わない形）、`CROSS`／`NATURAL` JOIN、
-`JOIN ... USING (...)`、非等価の `ON`、ベクトル順位付けとの併用、`$n` パラメータ、ビュー参照
+`JOIN ... USING (...)`、非等価の `ON`（ネステッドループ結合で解除予定。FULL の非等価は `0A000`。[nested-loop-join.md](nested-loop-join.md)）、ベクトル順位付けとの併用、`$n` パラメータ、ビュー参照
 （3 テーブル以上の連鎖・スカラー `ORDER BY`・集計形・`OR`／`IN`／列同士の比較は Issue #1190 で
 受理対象になった。`multi-way-join.md` 参照。本書の 2 テーブルの WHERE 簡約規則は、そこでの
 一般規則〔strict な relation を NULL 補完しうる段の保存側フラグを落とす〕の特殊ケース）。
