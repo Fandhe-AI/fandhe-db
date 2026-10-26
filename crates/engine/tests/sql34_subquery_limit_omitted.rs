@@ -280,3 +280,31 @@ fn unsupported_inner_forms_stay_rejected() {
         assert_eq!(code(&core, sql), "42601", "{sql}");
     }
 }
+
+/// cap が最小値（1）でも、省略形スカラーは 0 行・1 行で成功し、2 行以上は `21000`。
+/// 基数判定用の 2 件取得は内部プローブであり、利用者の明示 `LIMIT` の範囲検証や
+/// 事後の行数ガードで `22000` にならない。
+#[test]
+fn scalar_with_omitted_limit_works_at_minimum_cap() {
+    for (n_inner, label) in [(0i64, "zero"), (1, "one"), (2, "two"), (3, "three")] {
+        let (core, _g) = open(&format!("sql34-sub-mincap-{label}"), 1);
+        seed_t(&core, "alice", 1..=1);
+        if n_inner > 0 {
+            seed_u(&core, "alice", 1..=n_inner);
+        }
+        let projection = "SELECT (SELECT k FROM u) FROM t LIMIT 1";
+        let predicate = "SELECT id FROM t WHERE k = (SELECT k FROM u) LIMIT 1";
+        if n_inner <= 1 {
+            assert_eq!(rows(&core, projection), 1, "{projection} (inner={n_inner})");
+            assert_eq!(
+                rows(&core, predicate),
+                usize::try_from(n_inner).expect("small"),
+                "{predicate} (inner={n_inner})"
+            );
+        } else {
+            for sql in [projection, predicate] {
+                assert_eq!(code(&core, sql), "21000", "{sql} (inner={n_inner})");
+            }
+        }
+    }
+}

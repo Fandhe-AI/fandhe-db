@@ -545,7 +545,16 @@ fn execute_inner_query_with_meta(
     // （security.md「不安全な設計」対応）。`LIMIT` 省略形は scan 側の
     // `row_limit_exceeded()` が先に `54000` を返すため、本ガードは明示 `LIMIT` と
     // 集計形のための保険として残す。
-    let max_rows = result_limits.max_result_rows();
+    // スカラー用途は基数判定用に最大 2 件取得するため、cap が 1 でも 2 件目までは
+    // 許容する（2 件以上は呼び出し側が `21000` を返す）。
+    let max_rows = if matches!(
+        intent,
+        InnerScanIntent::Scalar | InnerScanIntent::ScalarValue
+    ) {
+        result_limits.max_result_rows().max(2)
+    } else {
+        result_limits.max_result_rows()
+    };
     if result.rows.len() > max_rows {
         return Err(SqlSurfaceError::payload_too_large(format!(
             "subquery result row count exceeds limit {max_rows}"
@@ -749,14 +758,14 @@ fn execute_inner_scan_statement(
         validated.limit_implicit = false;
     }
 
-    apply_scalar_inner_limit(&mut validated, intent, &result_limits)?;
+    let bind_limits = apply_scalar_inner_limit(&mut validated, intent, &result_limits)?;
 
     let bound = super::parser::bind_scan_with_dummy_flags(
         &validated,
         &inner_schema,
         udfs,
         &[],
-        &result_limits,
+        &bind_limits,
     )?;
     *meta_sink = super::describe::scan_columns(&bound, &inner_schema).ok();
     super::scan::execute_scan(read_txn, ctx, &inner_schema, &bound)
@@ -768,27 +777,32 @@ fn execute_inner_scan_statement(
 /// `ScalarValue` のみ 2 へ頭打ちにする（`Scalar` は従来どおり値を保つ）。
 /// 検証は差し替えより先に行い、差し替えで迂回されないようにする（fail-closed）。
 /// 実行経路と静的検証経路の両方から呼び、2 系統の挙動を分岐させない。
+/// 戻り値は bind に渡す上限。省略形の 2 件は基数判定用の内部プローブであり利用者の
+/// 明示 `LIMIT` ではないため、cap が 1 でも bind の範囲検証で `22000` にならないよう
+/// `max(cap, 2)` の上限を返す（`Scalar`／`ScalarValue` 以外と明示 `LIMIT` は cap のまま）。
 fn apply_scalar_inner_limit(
     validated: &mut ValidatedScan,
     intent: InnerScanIntent,
     result_limits: &crate::result_limits::ResultLimits,
-) -> Result<(), SqlSurfaceError> {
+) -> Result<crate::result_limits::ResultLimits, SqlSurfaceError> {
     if !matches!(
         intent,
         InnerScanIntent::Scalar | InnerScanIntent::ScalarValue
     ) {
-        return Ok(());
+        return Ok(*result_limits);
     }
     if validated.limit_implicit {
         validated.limit = 2;
         validated.limit_implicit = false;
-        return Ok(());
+        return Ok(crate::result_limits::ResultLimits::new(
+            result_limits.max_result_rows().max(2),
+        ));
     }
     super::parser::validate_search_limit_with(validated.limit, result_limits)?;
     if intent == InnerScanIntent::ScalarValue {
         validated.limit = validated.limit.min(2);
     }
-    Ok(())
+    Ok(*result_limits)
 }
 
 /// [`execute_inner_query`] の集計（`Statement::Aggregate`。スカラー用途のみ）側の
@@ -1027,6 +1041,7 @@ fn static_validate_inner_query(
                 result_limits,
             )?;
             validated.where_predicates = static_validation_predicates(&validated.where_predicates);
+            let mut scalar_bind_limits = result_limits;
             match intent {
                 InnerScanIntent::ExistenceOnly => {
                     // 実行経路（`execute_inner_scan_statement`）と同じく、差し替え前の
@@ -1046,7 +1061,8 @@ fn static_validate_inner_query(
                     validated.limit_implicit = false;
                 }
                 InnerScanIntent::ScalarValue | InnerScanIntent::Scalar => {
-                    apply_scalar_inner_limit(&mut validated, intent, &result_limits)?;
+                    scalar_bind_limits =
+                        apply_scalar_inner_limit(&mut validated, intent, &result_limits)?;
                 }
                 InnerScanIntent::Values => {}
             }
@@ -1055,7 +1071,7 @@ fn static_validate_inner_query(
                 &inner_schema,
                 udfs,
                 &[],
-                &result_limits,
+                &scalar_bind_limits,
             )?;
             super::describe::scan_columns(&bound, &inner_schema)
         }
