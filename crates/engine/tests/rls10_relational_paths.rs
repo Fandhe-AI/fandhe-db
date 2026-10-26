@@ -505,6 +505,11 @@ fn shapes() -> Vec<Shape> {
             check: Check::Token,
         },
         Shape {
+            axis: "join_cross",
+            sql: "SELECT documents.title, authors.name FROM documents CROSS JOIN authors LIMIT 50",
+            check: Check::Token,
+        },
+        Shape {
             axis: "join_order_by",
             sql: "SELECT documents.title, authors.name FROM documents JOIN authors ON documents.author_id = authors.id ORDER BY authors.name DESC, documents.title LIMIT 50",
             check: Check::Token,
@@ -651,6 +656,7 @@ fn shape_matrix_is_accepted_and_covers_each_axis() {
         "join_full",
         "join_three_way",
         "join_three_way_left_or",
+        "join_cross",
         "join_order_by",
         "join_aggregate",
         "subquery_in",
@@ -899,7 +905,7 @@ fn error_responses_are_identical_with_and_without_other_tenant_private_rows() {
         // ようがないことを固定する。
         "SELECT id FROM nonexistent_table_xyz LIMIT 5",
         "SELECT * FROM documents NATURAL JOIN authors ON documents.id = authors.id LIMIT 5",
-        "SELECT * FROM documents CROSS JOIN authors LIMIT 5",
+        "SELECT * FROM documents CROSS JOIN authors ON documents.id = authors.id LIMIT 5",
         // `USING (...)` は受理対象（Issue #1826）。存在しない列の USING は静的に拒否される。
         "SELECT * FROM documents JOIN authors USING (no_such_col) LIMIT 5",
         // 意味検証段（`sql::subquery::validate_in_target_column` 相当。SQL-29

@@ -417,7 +417,8 @@ fn limit_and_offset_apply_after_full_result_is_computed() {
 
 // `LEFT`／`RIGHT`／`FULL [OUTER]` JOIN は Issue #926 で受理対象になった
 // （結合テストは `tests/sql28_outer_join.rs` 参照）。ここでは引き続き対象外の
-// `CROSS`・`NATURAL ... ON ...`・単独の `OUTER JOIN` だけを確認する（`NATURAL JOIN` 自体は Issue #1827 で受理対象）。
+// `NATURAL ... ON ...`・単独の `OUTER JOIN` だけを確認する（`NATURAL JOIN` は Issue #1827、
+// `CROSS JOIN` は Issue #1831 で受理対象）。
 
 #[test]
 fn rejects_bare_outer_join_without_side() {
@@ -448,16 +449,19 @@ fn rejects_natural_join_with_on_clause() {
 }
 
 #[test]
-fn rejects_cross_join() {
+fn accepts_cross_join() {
+    // Issue #1831 で受理対象に反転した。詳細な意味論は `tests/sql60_cross_join.rs` 参照。
     let (storage, path) = seeded_basic();
     let _guard = CleanupGuard(path);
     let core = new_core(storage);
-    assert_rejected(
+    let cross = run(
         &core,
         "tenant-a",
-        "SELECT * FROM documents CROSS JOIN authors LIMIT 10",
-        "42601",
+        "SELECT * FROM documents CROSS JOIN authors LIMIT 10000",
     );
+    let docs = run(&core, "tenant-a", "SELECT id FROM documents LIMIT 10000");
+    let authors = run(&core, "tenant-a", "SELECT id FROM authors LIMIT 10000");
+    assert_eq!(cross.rows.len(), docs.rows.len() * authors.rows.len());
 }
 
 #[test]

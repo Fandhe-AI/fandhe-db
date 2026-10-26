@@ -1,4 +1,4 @@
-//! `[INNER|LEFT|RIGHT|FULL [OUTER]] JOIN`（等価結合の left-deep 連鎖。2 テーブル以上・
+//! `CROSS JOIN`・`[INNER|LEFT|RIGHT|FULL [OUTER]] JOIN`（等価結合の left-deep 連鎖。2 テーブル以上・
 //! 結合での集計形・スカラー `ORDER BY`・`OR`／`IN`／列同士の比較）の束縛・実行本体
 //! （SQL-28・RLS-10、TASK-212、Issue #925・#926・#1190）。
 //!
@@ -37,7 +37,9 @@
 //!
 //! `NATURAL JOIN`（Issue #1827）は共通列名を導出して USING と同じ束縛へ流す
 //! （`using::natural_using_names`）。
-//! スコープ外: `CROSS` JOIN・`USING (...) AS <alias>`・FULL JOIN USING の統合列の
+//! `CROSS JOIN`（Issue #1831）は空キー段（条件なしの直積）で、件数 `左 × 右` を確保前に
+//! 出力上限と照合する（`exec::join_step`）。
+//! スコープ外: `USING (...) AS <alias>`・FULL JOIN USING の統合列の
 //! WHERE／GROUP BY／集計／後続段の結合キーでの参照（`0A000`）・ベクトル順位付け
 //! （`ORDER BY ... <=>` 等）との併用・FROM でのビュー参照・`RelationSnapshotCache`
 //! （TASK-212 基盤）による結合入力のキャッシュ。
