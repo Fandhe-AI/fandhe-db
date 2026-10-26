@@ -70,8 +70,10 @@
 >
 > - `GROUP BY` の `ORDER BY` は `cmp_exact`、単純形 `HAVING` は `Decimal` と `f64` リテラル
 >   （最短往復表現の 10 進として読む）の厳密比較にする（scale 不一致で黙って縮退させない）。
-> - 式内（投影式・`HAVING` 式・`ORDER BY` 式）の整数 `AVG` は numeric 算術が未対応のため
->   `22000` で拒否する（算術は #1810・#1812 の範囲）。バイナリ結果形式は numeric で送出できる
+> - 式内の整数 `AVG`: SELECT リストの集計式項目（投影式）では Issue #1812 により numeric 算術
+>   （`+ - * /`。整数・数値リテラルとの混在、`coalesce(sum(b), 0)`、`CAST`）で正確に計算する
+>   （`numeric::decimal_arith`。`f64` へ近似せず、桁あふれは `22003`、0 除算は `22012`）。
+>   `HAVING` 式・`ORDER BY` 式は numeric 算術が未対応のため従来どおり `22000` で拒否する。バイナリ結果形式は numeric で送出できる
 >   （Issue #2442。WIRE-14・WIRE-26）。
 > - スカラーサブクエリ比較は端数のある numeric を整数列とは floor による厳密な整数比較、
 >   浮動小数列とは `f64` 変換で比べる。

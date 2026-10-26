@@ -2392,6 +2392,13 @@ fn expr_value_to_cell(
     result_ty: Option<&crate::catalog::ColumnType>,
 ) -> Result<Cell, SqlSurfaceError> {
     Ok(match value {
+        // Issue #1812: 結果型が NUMERIC の式（`coalesce(sum(bigint), 0)` 等）で整数の分岐が選ばれた
+        // 場合、値は 2^53 以内の整数（束縛段が整数種別の分岐だけを通す）。scale 0 の numeric へ正確に変換する。
+        ExprValue::Scalar(v)
+            if matches!(result_ty, Some(crate::catalog::ColumnType::Numeric { .. })) =>
+        {
+            Cell::Numeric(crate::sql::udf_call::scalar_to_decimal(v)?)
+        }
         ExprValue::Scalar(v) => crate::sql::exec::scalar_cell_for(v, result_ty)?,
         ExprValue::Bool(b) => Cell::Bool(b),
         ExprValue::Text(t) => Cell::Text(t.into_owned()),

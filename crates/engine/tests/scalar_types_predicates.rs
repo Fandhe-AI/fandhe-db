@@ -398,7 +398,7 @@ fn integer_column_expression_projection_and_aggregate_work() {
         .expect("projection over an INTEGER column must succeed");
     let cells: Vec<_> = result.rows.iter().map(|r| r.cells.clone()).collect();
     assert_eq!(cells.len(), 2);
-    assert!(cells.iter().any(|c| c[1] == Cell::Float(4.0)));
+    assert!(cells.iter().any(|c| c[1] == Cell::SignedInteger(4)));
 
     let result = core
         .execute_sql(&alice, &format!("SELECT SUM(qty * 2) FROM {TABLE}"))

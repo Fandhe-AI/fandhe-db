@@ -1726,6 +1726,11 @@ pub enum BuiltinFn {
     /// と checked オーバーフロー（`22003`）をノード単位で行うため、f64 一括計算では
     /// なく専用の演算ノードにしている（`(7/2)*2` が PostgreSQL と同じく 6 になる）。
     TypedArith(BinOp, NumericKind),
+    /// 集計式項目の NUMERIC 算術（`+ - * /`。Issue #1812・SQL-42 ポインタ）を表す内部専用関数。
+    /// 引数 2 個は NUMERIC 値か 2^53 以内の整数（`Scalar`）で、`numeric::decimal_arith` が
+    /// 近似なしで計算する（桁あふれは `22003`、0 除算は `22012`）。`bind_expr_any` の
+    /// `Expr::Binary` 腕が [`BindEnv::numeric_arith`] のときだけ挿入する。
+    NumericArith(BinOp),
     /// `clock_timestamp() -> Timestamp`（呼び出しごとに壁時計を読む。SQL-37・Issue #1586）。
     /// 他の時刻関数と違い束縛時に定数化せず、評価のたびに `sql::time_fn::now_micros` を呼ぶ。
     /// 畳み込み・共通部分式の 1 回化の対象外（[`is_foldable_builtin`]）。
@@ -2036,6 +2041,7 @@ pub(crate) fn builtin_signature(f: BuiltinFn) -> (&'static [ExprType], ExprType)
         BuiltinFn::DateToTimestamp => (&[ExprType::Date], ExprType::Timestamp),
         BuiltinFn::BpcharToText => (&[ExprType::Text], ExprType::Text),
         BuiltinFn::TypedArith(_, _) => (&[ExprType::Scalar, ExprType::Scalar], ExprType::Scalar),
+        BuiltinFn::NumericArith(_) => (&[ExprType::Numeric, ExprType::Numeric], ExprType::Numeric),
         // 戻り値型は TIMESTAMP（D8 の暫定。TIMESTAMPTZ 型の実装時に切り替える）。
         BuiltinFn::ClockTimestamp => (&[], ExprType::Timestamp),
         BuiltinFn::TextCompare(_, _) => (&[ExprType::Text, ExprType::Text], ExprType::Bool),
@@ -2156,6 +2162,8 @@ pub(crate) fn is_foldable_builtin(f: BuiltinFn) -> bool {
         // Issue #1539・SQL-42: 型付き算術は `Binary` と同じく `Scalar` を返す純関数で、
         // 0 除算・オーバーフローは defer-on-error（畳み込み失敗時は実行時に評価）。
         BuiltinFn::TypedArith(_, _) => true,
+        // NUMERIC を `FoldedConst`（`Scalar`／`Bool` のみ）で表せないため畳み込まない。
+        BuiltinFn::NumericArith(_) => false,
     }
 }
 
@@ -2662,6 +2670,11 @@ pub(super) struct BindEnv<'a> {
     /// ガードを外す印（Issue #2190）。照合を導出して比較ノードへ運ぶ比較演算子の腕
     /// （[`bind_collated_comparison`]）だけが立て、[`bind_expr_any`] が入口で消費して下げる。
     collation_leaf: bool,
+    /// 集計式項目の投影モード（Issue #1812・SQL-42 ポインタ）。`true` のとき、NUMERIC 値
+    /// （`sum(bigint)`・整数の `avg` 等の行ビュー列）を `+ - * /` の被演算子と
+    /// `CASE`／`COALESCE` の分岐に使え、結果は [`BuiltinFn::NumericArith`] で正確に計算する
+    /// （f64 へ近似しない）。集計式項目の入口（[`bind_aggregate_projection_expr_top`]）だけが立てる。
+    numeric_arith: bool,
 }
 
 impl BindEnv<'_> {
@@ -3334,6 +3347,7 @@ pub fn bind_expr(
         typed_arith: false,
         clock: time_fn::current_clock(),
         collation_leaf: false,
+        numeric_arith: false,
     };
     bind_expr_in(expr, &mut env, node_budget)
 }
@@ -3355,6 +3369,7 @@ pub(crate) fn bind_array_agg_element(
         typed_arith: false,
         clock: time_fn::current_clock(),
         collation_leaf: false,
+        numeric_arith: false,
     };
     crate::sql::array_expr::bind_single_array_element(expr, &mut env, node_budget)
 }
@@ -3423,7 +3438,7 @@ pub(crate) fn bind_aggregate_projection_expr_top(
     registry: &UdfRegistry,
     node_budget: &mut usize,
 ) -> Result<(BoundExpr, ExprType, Option<ColumnType>), SqlSurfaceError> {
-    let r = bind_projection_expr_json_ok(expr, schema, registry, node_budget)?;
+    let r = bind_projection_expr_inner(expr, schema, registry, node_budget, true)?;
     if !is_cast_only_type(r.1) {
         reject_json_operand(r.1)?;
     }
@@ -3439,6 +3454,17 @@ pub(crate) fn bind_projection_expr_json_ok(
     registry: &UdfRegistry,
     node_budget: &mut usize,
 ) -> Result<(BoundExpr, ExprType, Option<ColumnType>), SqlSurfaceError> {
+    bind_projection_expr_inner(expr, schema, registry, node_budget, false)
+}
+
+/// [`bind_projection_expr_json_ok`] の本体。`numeric_arith` は集計式項目（Issue #1812）だけが立てる。
+fn bind_projection_expr_inner(
+    expr: &Expr,
+    schema: &TableSchema,
+    registry: &UdfRegistry,
+    node_budget: &mut usize,
+    numeric_arith: bool,
+) -> Result<(BoundExpr, ExprType, Option<ColumnType>), SqlSurfaceError> {
     let mut env = BindEnv {
         schema: Some(schema),
         params: std::collections::HashMap::new(),
@@ -3447,9 +3473,10 @@ pub(crate) fn bind_projection_expr_json_ok(
         typed_arith: true,
         clock: time_fn::current_clock(),
         collation_leaf: false,
+        numeric_arith,
     };
     let (bound, ty) = bind_expr_any(expr, &mut env, node_budget)?;
-    let col = expr_result_column_type(expr, &bound, ty);
+    let col = expr_result_column_type(expr, &bound, ty, Some(schema));
     Ok((bound, ty, col))
 }
 
@@ -3471,9 +3498,10 @@ pub(crate) fn bind_array_assignment_source(
         typed_arith: true,
         clock: time_fn::current_clock(),
         collation_leaf: false,
+        numeric_arith: false,
     };
     let (bound, ty) = crate::sql::cast::bind_operand(expr, &mut env, node_budget)?;
-    let col = expr_result_column_type(expr, &bound, ty);
+    let col = expr_result_column_type(expr, &bound, ty, Some(schema));
     Ok((bound, ty, col))
 }
 
@@ -3523,6 +3551,7 @@ pub(crate) fn bind_order_expr(
         typed_arith: false,
         clock: time_fn::current_clock(),
         collation_leaf: false,
+        numeric_arith: false,
     };
     bind_expr_any(expr, &mut env, node_budget)
 }
@@ -3536,6 +3565,7 @@ pub(crate) fn expr_result_column_type(
     expr: &Expr,
     bound: &BoundExpr,
     ty: ExprType,
+    schema: Option<&TableSchema>,
 ) -> Option<ColumnType> {
     // `CAST`／`<type> '<literal>'` の結果列の型は変換先の型で決める（SQL-47・Issue #1590）。
     // 値を変えない変換は被演算子の束縛結果をそのまま返す（Issue #1591）ため、型付き算術など
@@ -3563,17 +3593,30 @@ pub(crate) fn expr_result_column_type(
     ) {
         return Some(ColumnType::Integer);
     }
+    let kind_column = |kind: NumericKind| match kind {
+        NumericKind::Int2 => ColumnType::SmallInt,
+        NumericKind::Int4 => ColumnType::Integer,
+        NumericKind::Int8 => ColumnType::BigInt,
+        NumericKind::Float4 => ColumnType::Real,
+    };
     if let BoundExpr::Builtin {
         f: BuiltinFn::TypedArith(_, kind),
         ..
     } = bound
     {
-        return Some(match kind {
-            NumericKind::Int2 => ColumnType::SmallInt,
-            NumericKind::Int4 => ColumnType::Integer,
-            NumericKind::Int8 => ColumnType::BigInt,
-            NumericKind::Float4 => ColumnType::Real,
-        });
+        return Some(kind_column(*kind));
+    }
+    // `CASE`／`COALESCE`／`NULLIF`／`abs` は分岐・引数の型を透過した PostgreSQL の結果型
+    // （整数・real）を公告する（Issue #1812。従来は一律 double precision）。
+    if ty == ExprType::Scalar
+        && matches!(
+            expr,
+            Expr::Case { .. } | Expr::Coalesce(_) | Expr::NullIf(..) | Expr::Call { .. }
+        )
+    {
+        if let ProjKind::Num(kind) = projection_kind(expr, bound, schema) {
+            return Some(kind_column(kind));
+        }
     }
     if let Expr::Number(raw) = expr {
         if let Some((_, kind)) = classify_projection_integer_literal(raw) {
@@ -3637,9 +3680,10 @@ pub(crate) fn bind_const_projection_expr(
         typed_arith: true,
         clock: time_fn::current_clock(),
         collation_leaf: false,
+        numeric_arith: false,
     };
     let (bound, ty) = bind_expr_any(expr, &mut env, node_budget)?;
-    let col = expr_result_column_type(expr, &bound, ty);
+    let col = expr_result_column_type(expr, &bound, ty, None);
     Ok((bound, ty, col))
 }
 
@@ -3711,9 +3755,10 @@ pub(crate) fn bind_const_expr(
         typed_arith: true,
         clock: time_fn::current_clock(),
         collation_leaf: false,
+        numeric_arith: false,
     };
     let (bound, ty) = bind_expr_in(expr, &mut env, node_budget)?;
-    let col = expr_result_column_type(expr, &bound, ty);
+    let col = expr_result_column_type(expr, &bound, ty, None);
     Ok((bound, ty, col))
 }
 
@@ -3734,12 +3779,13 @@ pub(crate) fn bind_const_expr_array_top(
         typed_arith: true,
         clock: time_fn::current_clock(),
         collation_leaf: false,
+        numeric_arith: false,
     };
     let (bound, ty) = bind_expr_any(expr, &mut env, node_budget)?;
     if ty != ExprType::Array {
         reject_json_operand(ty)?;
     }
-    let col = expr_result_column_type(expr, &bound, ty);
+    let col = expr_result_column_type(expr, &bound, ty, None);
     Ok((bound, ty, col))
 }
 
@@ -3790,6 +3836,15 @@ pub(super) fn bind_null_aware(
             .ok_or_else(|| SqlSurfaceError::payload_too_large("expression is too large"))?;
         return Ok((BoundExpr::Null, None));
     }
+    // Issue #1812: 集計式項目では NUMERIC 値を分岐に使える（整数との混在は
+    // [`unify_branch_type_numeric`]・[`validate_numeric_branches`] が検査する）。
+    if env.numeric_arith {
+        let (bound, ty) = bind_expr_any(expr, env, node_budget)?;
+        if ty != ExprType::Numeric {
+            reject_json_operand(ty)?;
+        }
+        return Ok((bound, Some(ty)));
+    }
     let (bound, ty) = bind_expr_in(expr, env, node_budget)?;
     Ok((bound, Some(ty)))
 }
@@ -3832,6 +3887,7 @@ fn bind_case(
     bind_with_case_nesting(env, |env| {
         let mut bound_whens = Vec::with_capacity(whens.len());
         let mut unified: Option<ExprType> = None;
+        let mut branch_tys: Vec<Option<ExprType>> = Vec::new();
         for (cond, result) in whens {
             let (cond_bound, cond_ty) = bind_expr_in(cond, env, node_budget)?;
             if cond_ty != ExprType::Bool {
@@ -3840,17 +3896,26 @@ fn bind_case(
                 });
             }
             let (result_bound, result_ty) = bind_null_aware(result, env, node_budget)?;
-            unify_branch_type(
+            unify_branch_type_numeric(
+                env,
                 &mut unified,
                 result_ty,
                 "CASE branches must have the same type",
             )?;
+            branch_tys.push(result_ty);
             bound_whens.push((cond_bound, result_bound));
         }
+        let mut else_ty = None;
         let else_bound = match else_result {
             Some(expr) => {
                 let (b, t) = bind_null_aware(expr, env, node_budget)?;
-                unify_branch_type(&mut unified, t, "CASE branches must have the same type")?;
+                unify_branch_type_numeric(
+                    env,
+                    &mut unified,
+                    t,
+                    "CASE branches must have the same type",
+                )?;
+                else_ty = t;
                 b
             }
             None => BoundExpr::Null,
@@ -3858,6 +3923,35 @@ fn bind_case(
         let final_ty = unified.ok_or_else(|| SqlSurfaceError::FeatureNotSupported {
             detail: "CASE expression with only NULL results has no determinable type".to_string(),
         })?;
+        let mut branches: Vec<(&Expr, &BoundExpr, Option<ExprType>)> = whens
+            .iter()
+            .zip(bound_whens.iter())
+            .zip(branch_tys.iter())
+            .map(|(((_, r), (_, br)), t)| (r, br, *t))
+            .collect();
+        if let Some(e) = else_result {
+            branches.push((e, &else_bound, else_ty));
+        }
+        if final_ty == ExprType::Numeric && env.numeric_arith {
+            validate_numeric_branches(
+                &branches,
+                env.schema,
+                "CASE branches must have the same type",
+            )?;
+        }
+        // 統一後の結果型へ各分岐の値を実際に変換する（NUMERIC・real。評価値の型と結果型を一致させる）。
+        let coercion = branch_coercion(env, final_ty, &branches);
+        let schema = env.schema;
+        let bound_whens: Vec<(BoundExpr, BoundExpr)> = bound_whens
+            .into_iter()
+            .zip(whens.iter())
+            .zip(branch_tys.iter())
+            .map(|(((c, r), (_, re)), t)| (c, coerce_branch(coercion, re, r, *t, schema)))
+            .collect();
+        let else_bound = match else_result {
+            Some(e) => coerce_branch(coercion, e, else_bound, else_ty, schema),
+            None => else_bound,
+        };
         Ok((
             BoundExpr::Case {
                 whens: bound_whens,
@@ -3882,18 +3976,42 @@ fn bind_coalesce(
     bind_with_case_nesting(env, |env| {
         let mut bound_args = Vec::with_capacity(args.len());
         let mut unified: Option<ExprType> = None;
+        let mut arg_tys: Vec<Option<ExprType>> = Vec::with_capacity(args.len());
         for a in args {
             let (b, t) = bind_null_aware(a, env, node_budget)?;
-            unify_branch_type(
+            unify_branch_type_numeric(
+                env,
                 &mut unified,
                 t,
                 "COALESCE arguments must have the same type",
             )?;
+            arg_tys.push(t);
             bound_args.push(b);
         }
         let final_ty = unified.ok_or_else(|| SqlSurfaceError::FeatureNotSupported {
             detail: "COALESCE with only NULL arguments has no determinable type".to_string(),
         })?;
+        let branches: Vec<(&Expr, &BoundExpr, Option<ExprType>)> = args
+            .iter()
+            .zip(bound_args.iter())
+            .zip(arg_tys.iter())
+            .map(|((a, b), t)| (a, b, *t))
+            .collect();
+        if final_ty == ExprType::Numeric && env.numeric_arith {
+            validate_numeric_branches(
+                &branches,
+                env.schema,
+                "COALESCE arguments must have the same type",
+            )?;
+        }
+        let coercion = branch_coercion(env, final_ty, &branches);
+        let schema = env.schema;
+        let bound_args: Vec<BoundExpr> = bound_args
+            .into_iter()
+            .zip(args.iter())
+            .zip(arg_tys.iter())
+            .map(|((b, a), t)| coerce_branch(coercion, a, b, *t, schema))
+            .collect();
         Ok((BoundExpr::Coalesce(bound_args), final_ty))
     })
 }
@@ -4457,6 +4575,11 @@ pub(super) fn bind_expr_any(
                     ColumnType::Enum(_) => Err(SqlSurfaceError::invalid_input(format!(
                         "column {name:?} cannot be used in an expression (ENUM columns are not supported)"
                     ))),
+                    // 集計式項目の行ビューの NUMERIC 列（`sum(bigint)` 等の結果）は、算術・条件式の
+                    // 被演算子として受理する（Issue #1812。`BindEnv::numeric_arith`）。
+                    ColumnType::Numeric { .. } if env.numeric_arith => {
+                        Ok((BoundExpr::DecimalColumnRef { index }, ExprType::Numeric))
+                    }
                     // 式中の NUMERIC 列参照は対象外（TABLE-13〔検討中〕・
                     // TASK-197、Issue #885。別 Issue #891 の担当）。
                     ColumnType::Numeric { .. } => Err(SqlSurfaceError::invalid_input(format!(
@@ -4561,18 +4684,71 @@ pub(super) fn bind_expr_any(
                 op,
                 BinOp::Gt | BinOp::Lt | BinOp::Ge | BinOp::Le | BinOp::Eq
             );
-            let (l, lt) = if let Some(pre) = prebound_lhs {
-                pre
-            } else if is_comparison {
-                bind_expr_any(lhs, env, node_budget)?
-            } else {
-                bind_expr_in(lhs, env, node_budget)?
+            // Issue #1812: 集計式項目では NUMERIC 値を算術の被演算子に使える。ゲート
+            // （`reject_json_operand`）を被演算子の束縛後へ遅らせ、NUMERIC を含まない組は従来どおり拒否する。
+            let numeric_mode = env.numeric_arith
+                && matches!(op, BinOp::Add | BinOp::Sub | BinOp::Mul | BinOp::Div);
+            // codex-review 指摘対応（Issue #1812）: NUMERIC 算術の数値リテラルは、相手が NUMERIC
+            // 式なら `f64` 経由（`parse_number_literal` の 2^53 検証）を通さず `Decimal` へ直接
+            // 束縛する（`sum(b) + 9007199254740993`）。そのため非リテラル側を先に束縛する。
+            let literal_exact = |e: &Expr| -> Option<BoundExpr> {
+                match e {
+                    Expr::Number(raw) => crate::numeric::parse_literal_exact(raw)
+                        .ok()
+                        .map(BoundExpr::Numeric),
+                    _ => None,
+                }
             };
-            let (r, rt) = if is_comparison {
+            let defer_lhs = numeric_mode
+                && prebound_lhs.is_none()
+                && matches!(&**lhs, Expr::Number(_))
+                && !matches!(&**rhs, Expr::Number(_));
+            let lhs_first = if let Some(pre) = prebound_lhs {
+                Some(pre)
+            } else if defer_lhs {
+                None
+            } else if is_comparison || numeric_mode {
+                Some(bind_expr_any(lhs, env, node_budget)?)
+            } else {
+                Some(bind_expr_in(lhs, env, node_budget)?)
+            };
+            let lhs_is_numeric = lhs_first
+                .as_ref()
+                .is_some_and(|(_, t)| *t == ExprType::Numeric);
+            let exact_rhs = if numeric_mode && lhs_is_numeric {
+                literal_exact(rhs)
+            } else {
+                None
+            };
+            let (r, rt) = if let Some(b) = exact_rhs {
+                (b, ExprType::Numeric)
+            } else if is_comparison || numeric_mode {
                 bind_expr_any(rhs, env, node_budget)?
             } else {
                 bind_expr_in(rhs, env, node_budget)?
             };
+            let (l, lt) = match lhs_first {
+                Some(x) => x,
+                None => match (rt == ExprType::Numeric, literal_exact(lhs)) {
+                    (true, Some(b)) => (b, ExprType::Numeric),
+                    _ => bind_expr_any(lhs, env, node_budget)?,
+                },
+            };
+            if numeric_mode {
+                if lt == ExprType::Numeric || rt == ExprType::Numeric {
+                    let l = numeric_operand(lhs, l, lt, env)?;
+                    let r = numeric_operand(rhs, r, rt, env)?;
+                    return Ok((
+                        BoundExpr::Builtin {
+                            f: BuiltinFn::NumericArith(*op),
+                            args: vec![l, r],
+                        },
+                        ExprType::Numeric,
+                    ));
+                }
+                reject_json_operand(lt)?;
+                reject_json_operand(rt)?;
+            }
             // Issue #1539・SQL-42: 投影モードの `Scalar` 同士の算術は、オペランドの数値
             // 種別（整数／単精度／倍精度）から結果型を PostgreSQL に揃える。
             if env.typed_arith
@@ -5530,6 +5706,116 @@ pub(super) fn numeric_kind(
     bound: &BoundExpr,
     env: &BindEnv<'_>,
 ) -> Option<NumericKind> {
+    match projection_kind(expr, bound, env.schema) {
+        ProjKind::Num(k) => Some(k),
+        ProjKind::Null | ProjKind::Other => None,
+    }
+}
+
+/// 投影式の数値種別の三値（Issue #1812）。`Null` は型を持たない `NULL`（条件式の分岐では中立）。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum ProjKind {
+    Null,
+    Num(NumericKind),
+    /// 倍精度・不明（従来どおり f64 意味論のまま）。
+    Other,
+}
+
+/// `CASE`／`COALESCE` の分岐型の統一（PostgreSQL の UNION 型解決。`smallint < integer < bigint <
+/// real`。`real` と整数が混ざれば `real` で、二項算術の [`combine_numeric_kind`] とは別規則）。
+/// `NULL` は中立、`Other`（倍精度など）が混ざれば `Other`。
+fn common_proj_kind(a: ProjKind, b: ProjKind) -> ProjKind {
+    use NumericKind::{Float4, Int2, Int4, Int8};
+    let rank = |k: NumericKind| match k {
+        Int2 => 0,
+        Int4 => 1,
+        Int8 => 2,
+        Float4 => 3,
+    };
+    match (a, b) {
+        (ProjKind::Null, x) | (x, ProjKind::Null) => x,
+        (ProjKind::Other, _) | (_, ProjKind::Other) => ProjKind::Other,
+        (ProjKind::Num(x), ProjKind::Num(y)) => {
+            ProjKind::Num(if rank(x) >= rank(y) { x } else { y })
+        }
+    }
+}
+
+/// 束縛済みの式（`expr` と `bound` は同形）の数値種別。`CASE`／`COALESCE`／`NULLIF`／`abs` は
+/// 分岐・引数の種別を透過して求める（結果列型の唯一の導出元。非集計の投影・`FROM` なし
+/// SELECT・集計式項目が共有する。Issue #1812・SQL-42 ポインタ）。
+pub(crate) fn projection_kind(
+    expr: &Expr,
+    bound: &BoundExpr,
+    schema: Option<&TableSchema>,
+) -> ProjKind {
+    match (expr, bound) {
+        (Expr::Null, _) => return ProjKind::Null,
+        (
+            Expr::Case { whens, else_result },
+            BoundExpr::Case {
+                whens: bound_whens,
+                else_result: bound_else,
+            },
+        ) if whens.len() == bound_whens.len() => {
+            let mut acc = ProjKind::Null;
+            for ((_, r), (_, br)) in whens.iter().zip(bound_whens.iter()) {
+                acc = common_proj_kind(acc, projection_kind(r, br, schema));
+            }
+            if let Some(e) = else_result {
+                acc = common_proj_kind(acc, projection_kind(e, bound_else, schema));
+            }
+            return acc;
+        }
+        (Expr::Coalesce(args), BoundExpr::Coalesce(bound_args))
+            if args.len() == bound_args.len() =>
+        {
+            let mut acc = ProjKind::Null;
+            for (a, b) in args.iter().zip(bound_args.iter()) {
+                acc = common_proj_kind(acc, projection_kind(a, b, schema));
+            }
+            return acc;
+        }
+        // 結果型は比較演算子の解決と同じ昇格規則（codex-review 指摘対応）。整数同士は広い方、
+        // 同種の `real` 同士は `real`、整数と `real`・倍精度・不明が混ざれば倍精度（`Other`）。
+        (Expr::NullIf(l, r), BoundExpr::NullIf { lhs, rhs }) => {
+            let a = projection_kind(l, lhs, schema);
+            let b = projection_kind(r, rhs, schema);
+            return match (a, b) {
+                (ProjKind::Null, x) | (x, ProjKind::Null) => x,
+                (ProjKind::Num(NumericKind::Float4), ProjKind::Num(NumericKind::Float4)) => a,
+                (ProjKind::Num(NumericKind::Float4), _)
+                | (_, ProjKind::Num(NumericKind::Float4)) => ProjKind::Other,
+                (ProjKind::Num(_), ProjKind::Num(_)) => common_proj_kind(a, b),
+                _ => ProjKind::Other,
+            };
+        }
+        (
+            Expr::Call { args, .. },
+            BoundExpr::Builtin {
+                f: BuiltinFn::Abs,
+                args: bound_args,
+            },
+        ) => {
+            if let (Some(a), Some(b)) = (args.first(), bound_args.first()) {
+                return projection_kind(a, b, schema);
+            }
+            return ProjKind::Other;
+        }
+        _ => {}
+    }
+    match scalar_numeric_kind(expr, bound, schema) {
+        Some(k) => ProjKind::Num(k),
+        None => ProjKind::Other,
+    }
+}
+
+/// [`numeric_kind`] の葉の判定（条件式・`abs` の透過を含まない）。
+fn scalar_numeric_kind(
+    expr: &Expr,
+    bound: &BoundExpr,
+    schema: Option<&TableSchema>,
+) -> Option<NumericKind> {
     if let Expr::Number(raw) = expr {
         return classify_projection_integer_literal(raw).map(|(_, k)| k);
     }
@@ -5539,7 +5825,7 @@ pub(super) fn numeric_kind(
     }
     match bound {
         BoundExpr::ColumnRef { index } => {
-            let column = env.schema?.columns.get(*index)?;
+            let column = schema?.columns.get(*index)?;
             match column.ty {
                 ColumnType::SmallInt => Some(NumericKind::Int2),
                 ColumnType::Integer => Some(NumericKind::Int4),
@@ -5552,6 +5838,17 @@ pub(super) fn numeric_kind(
             f: BuiltinFn::TypedArith(_, k),
             ..
         } => Some(*k),
+        // 分岐の値変換・整数 `abs` の範囲検査が挿入する変換ノードは変換先の種別を持つ。
+        BoundExpr::Builtin {
+            f: BuiltinFn::Cast(c),
+            ..
+        } => match c.to {
+            crate::sql::cast_value::CastDst::Int2 => Some(NumericKind::Int2),
+            crate::sql::cast_value::CastDst::Int4 => Some(NumericKind::Int4),
+            crate::sql::cast_value::CastDst::Int8 => Some(NumericKind::Int8),
+            crate::sql::cast_value::CastDst::Float4 => Some(NumericKind::Float4),
+            _ => None,
+        },
         // `json_array_length` は int4（Issue #2180）。整数除算・添字の型解決に反映する。
         BoundExpr::JsonTextFn(f) if f.result_is_int4() => Some(NumericKind::Int4),
         // 配列関数の長さ・位置は int4（TABLE-35・Issue #1604）。
@@ -5570,6 +5867,193 @@ pub(super) fn numeric_kind(
         } => Some(NumericKind::Int4),
         _ => None,
     }
+}
+
+/// NUMERIC 算術（[`BuiltinFn::NumericArith`]）の被演算子を検査する。NUMERIC 値はそのまま、
+/// 数値リテラルは正確な `Decimal` へ、整数種別の式（`Scalar` で運ばれる 2^53 以内の整数）は
+/// そのまま通す。倍精度・単精度などの浮動小数との混在は近似を避けて `0A000` で拒否する
+/// （PostgreSQL は double precision へ寄せるが、本実装は NUMERIC を f64 へ落とさない。fail-closed）。
+fn numeric_operand(
+    expr: &Expr,
+    bound: BoundExpr,
+    ty: ExprType,
+    env: &BindEnv<'_>,
+) -> Result<BoundExpr, SqlSurfaceError> {
+    let unsupported = || SqlSurfaceError::FeatureNotSupported {
+        detail: "NUMERIC arithmetic supports only NUMERIC and integer operands".to_string(),
+    };
+    match ty {
+        ExprType::Numeric => Ok(bound),
+        ExprType::Scalar => {
+            if let Expr::Number(raw) = expr {
+                return crate::numeric::parse_literal_exact(raw)
+                    .map(BoundExpr::Numeric)
+                    .map_err(|_| unsupported());
+            }
+            match projection_kind(expr, &bound, env.schema) {
+                ProjKind::Num(NumericKind::Int2 | NumericKind::Int4 | NumericKind::Int8) => {
+                    Ok(bound)
+                }
+                _ => Err(unsupported()),
+            }
+        }
+        _ => Err(unsupported()),
+    }
+}
+
+/// `CASE`／`COALESCE` の分岐に NUMERIC と `Scalar` が混在するとき、`Scalar` 側がすべて整数種別
+/// （整数リテラル・整数型の式。評価値は 2^53 以内の整数）であることを確かめる。満たさなければ
+/// 従来と同じ `42804`（分岐型の不一致）で拒否する（浮動小数が NUMERIC 列へ黙って混ざらない）。
+fn validate_numeric_branches(
+    branches: &[(&Expr, &BoundExpr, Option<ExprType>)],
+    schema: Option<&TableSchema>,
+    mismatch_detail: &str,
+) -> Result<(), SqlSurfaceError> {
+    for (expr, bound, ty) in branches {
+        if *ty != Some(ExprType::Scalar) {
+            continue;
+        }
+        let integer = match expr {
+            Expr::Number(raw) => classify_projection_integer_literal(raw).is_some(),
+            _ => matches!(
+                projection_kind(expr, bound, schema),
+                ProjKind::Num(NumericKind::Int2 | NumericKind::Int4 | NumericKind::Int8)
+            ),
+        };
+        if !integer {
+            return Err(SqlSurfaceError::DatatypeMismatch {
+                detail: mismatch_detail.to_string(),
+            });
+        }
+    }
+    Ok(())
+}
+
+/// 投影モードの `abs(<整数型>)` を、引数の整数種別への checked な変換で包む（Issue #1812）。
+/// `Abs` の評価は f64 の絶対値だけなので、int2／int4 の最小値の `abs` が範囲外のまま通らないよう、
+/// 結果を引数と同じ整数種別へ `CAST` 相当で戻して `22003` を発生させる（int8 は 2^53 以内の
+/// 不変条件で運ばれるため対象外）。`abs` 以外・非投影モード・整数以外の引数は素通し。
+fn wrap_integer_abs_range_check(
+    builtin: BuiltinFn,
+    args: &[Expr],
+    node: BoundExpr,
+    env: &BindEnv<'_>,
+) -> BoundExpr {
+    use crate::sql::cast_value::{CastDst, CastFn, CastSrc};
+    if builtin != BuiltinFn::Abs || !env.typed_arith {
+        return node;
+    }
+    let (Some(arg), BoundExpr::Builtin { args: bound, .. }) = (args.first(), &node) else {
+        return node;
+    };
+    let Some(b) = bound.first() else {
+        return node;
+    };
+    let to = match numeric_kind(arg, b, env) {
+        Some(NumericKind::Int2) => CastDst::Int2,
+        Some(NumericKind::Int4) => CastDst::Int4,
+        _ => return node,
+    };
+    BoundExpr::Builtin {
+        f: BuiltinFn::Cast(CastFn {
+            from: CastSrc::Int8,
+            to,
+        }),
+        args: vec![node],
+    }
+}
+
+/// `CASE`／`COALESCE` の統一済み結果型へ分岐の値を揃える変換の種類。
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum BranchCoercion {
+    None,
+    /// 結果型が NUMERIC。`Scalar` で運ばれる整数分岐を `Decimal` に変える。
+    Numeric,
+    /// 結果が `real`。整数分岐を単精度へ丸める。
+    Float4,
+}
+
+/// 統一後の分岐に必要な値変換を決める。`exprs`／`bounds`／`tys` は分岐ごとに同順。
+fn branch_coercion(
+    env: &BindEnv<'_>,
+    final_ty: ExprType,
+    branches: &[(&Expr, &BoundExpr, Option<ExprType>)],
+) -> BranchCoercion {
+    if final_ty == ExprType::Numeric && env.numeric_arith {
+        return BranchCoercion::Numeric;
+    }
+    if final_ty == ExprType::Scalar && (env.typed_arith || env.numeric_arith) {
+        let mut acc = ProjKind::Null;
+        for (e, b, _) in branches {
+            acc = common_proj_kind(acc, projection_kind(e, b, env.schema));
+        }
+        if acc == ProjKind::Num(NumericKind::Float4) {
+            return BranchCoercion::Float4;
+        }
+    }
+    BranchCoercion::None
+}
+
+/// 分岐 1 つの値を [`BranchCoercion`] に従って変換する。変換対象は整数種別の `Scalar` 分岐だけ
+/// （NUMERIC・単精度・NULL 分岐はそのまま）。
+fn coerce_branch(
+    coercion: BranchCoercion,
+    expr: &Expr,
+    bound: BoundExpr,
+    ty: Option<ExprType>,
+    schema: Option<&TableSchema>,
+) -> BoundExpr {
+    use crate::sql::cast_value::{CastDst, CastFn, CastSrc};
+    if coercion == BranchCoercion::None || ty != Some(ExprType::Scalar) {
+        return bound;
+    }
+    let is_int = matches!(expr, Expr::Number(raw) if classify_projection_integer_literal(raw).is_some())
+        || matches!(
+            projection_kind(expr, &bound, schema),
+            ProjKind::Num(NumericKind::Int2 | NumericKind::Int4 | NumericKind::Int8)
+        );
+    if !is_int {
+        return bound;
+    }
+    if coercion == BranchCoercion::Numeric {
+        if let Expr::Number(raw) = expr {
+            if let Ok(d) = crate::numeric::parse_literal_exact(raw) {
+                return BoundExpr::Numeric(d);
+            }
+        }
+    }
+    let to = match coercion {
+        BranchCoercion::Numeric => CastDst::Numeric(None),
+        _ => CastDst::Float4,
+    };
+    BoundExpr::Builtin {
+        f: BuiltinFn::Cast(CastFn {
+            from: CastSrc::Int8,
+            to,
+        }),
+        args: vec![bound],
+    }
+}
+
+/// 分岐型の単一化（[`unify_branch_type`]）に、集計式項目の `NUMERIC` と整数の混在
+/// （`coalesce(sum(bigint), 0)`）を足したもの。混在は NUMERIC に統一する。
+fn unify_branch_type_numeric(
+    env: &BindEnv<'_>,
+    unified: &mut Option<ExprType>,
+    ty: Option<ExprType>,
+    mismatch_detail: &str,
+) -> Result<(), SqlSurfaceError> {
+    if env.numeric_arith {
+        match (*unified, ty) {
+            (Some(ExprType::Numeric), Some(ExprType::Scalar))
+            | (Some(ExprType::Scalar), Some(ExprType::Numeric)) => {
+                *unified = Some(ExprType::Numeric);
+                return Ok(());
+            }
+            _ => {}
+        }
+    }
+    unify_branch_type(unified, ty, mismatch_detail)
 }
 
 /// 二項算術の結果種別（PostgreSQL の演算子解決に合わせる）。`None` は倍精度
@@ -6519,13 +7003,11 @@ fn bind_call(
             }
             bound_args.push(b);
         }
-        return Ok((
-            BoundExpr::Builtin {
-                f: builtin,
-                args: bound_args,
-            },
-            ret,
-        ));
+        let node = BoundExpr::Builtin {
+            f: builtin,
+            args: bound_args,
+        };
+        return Ok((wrap_integer_abs_range_check(builtin, args, node, env), ret));
     }
 
     // 解決順（組み込み → 宣言的 UDF → WASM UDF）。組み込みは上で既に処理済みなので
@@ -6567,6 +7049,7 @@ fn bind_call(
             // 呼び出し側の確定時刻を継承する（本体中の時刻関数は呼び出し文の時刻で束縛される）。
             clock: env.clock,
             collation_leaf: false,
+            numeric_arith: false,
         };
         return bind_expr_in(&def.body, &mut inner_env, node_budget);
     }
@@ -8643,6 +9126,11 @@ pub(crate) fn apply_builtin<'a>(
             let b = take_scalar_arg(args, 1)?;
             typed_arith(op, kind, a, b).map(ExprValue::Scalar)
         }
+        BuiltinFn::NumericArith(op) => {
+            let a = take_decimal_arg(args, 0)?;
+            let b = take_decimal_arg(args, 1)?;
+            numeric_arith_eval(op, &a, &b).map(ExprValue::Numeric)
+        }
         // SQL-37（Issue #1586）: 評価のたびに壁時計を読む（束縛時に定数化しない）。
         BuiltinFn::ClockTimestamp => time_fn::now_micros().map(ExprValue::Timestamp),
         // Issue #2190: 照合付きの TEXT 比較。等値は deterministic な照合でバイト列の等値と
@@ -8743,6 +9231,61 @@ fn typed_arith(op: BinOp, kind: NumericKind, a: f64, b: f64) -> Result<f64, SqlS
             Ok(f64::from(r32))
         }
     }
+}
+
+/// `args[idx]` を `Decimal` として取り出す。`Numeric` はそのまま、`Scalar` は 2^53 以内の整数に限り
+/// scale 0 の `Decimal` にする（束縛段が整数種別の被演算子だけを通す不変条件。破れたら `Internal`）。
+fn take_decimal_arg(
+    args: &mut [Option<ExprValue<'_>>],
+    idx: usize,
+) -> Result<crate::numeric::Decimal, SqlSurfaceError> {
+    match args.get_mut(idx).and_then(Option::take) {
+        Some(ExprValue::Numeric(d)) => Ok(d),
+        Some(ExprValue::Scalar(v)) => scalar_to_decimal(v),
+        Some(_) => Err(SqlSurfaceError::Internal {
+            detail: "function argument type mismatch at evaluation time".to_string(),
+        }),
+        None => Err(SqlSurfaceError::Internal {
+            detail: "missing function argument at evaluation time".to_string(),
+        }),
+    }
+}
+
+/// 整数として f64 で運ばれた値（|v| <= 2^53）を scale 0 の `Decimal` へ正確に変換する。
+pub(crate) fn scalar_to_decimal(v: f64) -> Result<crate::numeric::Decimal, SqlSurfaceError> {
+    exact_int(v).and_then(|i| {
+        crate::numeric::Decimal::from_parts(i128::from(i), 0).map_err(|_| {
+            SqlSurfaceError::Internal {
+                detail: "integer operand could not be converted to numeric".to_string(),
+            }
+        })
+    })
+}
+
+/// [`BuiltinFn::NumericArith`] の評価本体。桁あふれは `22003`、0 除算は `22012`（固定の英語文言）。
+fn numeric_arith_eval(
+    op: BinOp,
+    a: &crate::numeric::Decimal,
+    b: &crate::numeric::Decimal,
+) -> Result<crate::numeric::Decimal, SqlSurfaceError> {
+    use crate::numeric::{decimal_arith, DecimalArithError, DecimalOp};
+    let dop = match op {
+        BinOp::Add => DecimalOp::Add,
+        BinOp::Sub => DecimalOp::Sub,
+        BinOp::Mul => DecimalOp::Mul,
+        BinOp::Div => DecimalOp::Div,
+        BinOp::Gt | BinOp::Lt | BinOp::Ge | BinOp::Le | BinOp::Eq => {
+            return Err(SqlSurfaceError::Internal {
+                detail: "comparison operator in numeric arithmetic evaluation".to_string(),
+            });
+        }
+    };
+    decimal_arith(dop, a, b).map_err(|e| match e {
+        DecimalArithError::DivisionByZero => SqlSurfaceError::division_by_zero("/"),
+        DecimalArithError::OutOfRange => {
+            SqlSurfaceError::numeric_out_of_range("numeric field overflow")
+        }
+    })
 }
 
 /// f64 で運ばれた整数値を i64 へ戻す。整数でない・|v| > 2^53 は束縛段の不変条件違反
