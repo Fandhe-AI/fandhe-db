@@ -20940,7 +20940,10 @@ fn select_range_contains_aggregate_call(tokens: &[Token], start: usize, item_onl
                     depth = depth.saturating_add(1);
                 }
             }
-            Token::Punct(')') => depth = depth.saturating_sub(1),
+            // `ARRAY[a, sum(x)]`・添字 `a[1]` のネストも括弧と同じ深さで数え、角括弧内の `,` を
+            // 項目の終端と誤認しない。
+            Token::Punct('[') => depth = depth.saturating_add(1),
+            Token::Punct(')' | ']') => depth = depth.saturating_sub(1),
             Token::Keyword(Keyword::From) if depth == 0 => return false,
             Token::Punct(',') if depth == 0 && item_only => return false,
             Token::Ident(name) => {
@@ -30278,6 +30281,24 @@ mod tests {
                 .wire_code(),
             "42601"
         );
+    }
+
+    /// `ARRAY[...]`・添字の角括弧内の `,` を項目終端と誤認しない（Issue #1811 レビュー指摘）。
+    #[test]
+    fn aggregate_call_detected_after_comma_inside_brackets() {
+        for sql in [
+            "SELECT ARRAY[1, sum(x)] FROM t",
+            "SELECT ARRAY[ARRAY[1, 2], ARRAY[3, max(x)]] FROM t",
+            "SELECT arr[1] + sum(x) FROM t",
+        ] {
+            let tokens = crate::sql::lexer::tokenize(sql).expect("tokenize");
+            assert!(
+                select_range_contains_aggregate_call(&tokens, 1, true),
+                "{sql}"
+            );
+        }
+        let tokens = crate::sql::lexer::tokenize("SELECT ARRAY[1, 2], sum(x) FROM t").expect("tok");
+        assert!(!select_range_contains_aggregate_call(&tokens, 1, true));
     }
 
     #[test]
