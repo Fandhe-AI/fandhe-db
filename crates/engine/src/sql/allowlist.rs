@@ -3563,7 +3563,8 @@ pub struct GroupByClause {
     /// 式述語の `HAVING`（Issue #1188・SQL-26）。`having` と AND 結合される。
     pub(crate) having_exprs: Vec<HavingExprPredicate>,
     /// `HAVING`・`ORDER BY` 内に直接書かれた集計呼び出し（Issue #1814・#1815・SQL-58）。両句で
-    /// 1 つの配列・添字空間を共有し、出現順・重複排除済み。呼び出し側は内部名 [`aggregate_placeholder`]`(j)`（`j` はこの配列の添字）の識別子に置換済み。
+    /// 1 つの配列・添字空間を共有し、出現順・重複排除済み。呼び出し側は内部名 [`aggregate_placeholder`]`(j)`（`j` はこの配列の添字）の
+    /// 識別子に置換済み。
     /// 束縛段（`sql::parser::bind_aggregate_with_dummy_flags`）が隠し集計項目として
     /// `BoundAggregate::items` へ積み、述語の内部名をその項目への参照へ解決する。
     pub(crate) having_aggregates: Vec<AggregateItem>,
@@ -6666,16 +6667,6 @@ impl<'a> Parser<'a> {
         }))
     }
 
-    /// 集計 `GROUP BY` の `ORDER BY <target> [ASC|DESC] (',' <target> [ASC|DESC])*`
-    /// （TASK-167・SQL-14。Issue #1185・SQL-25 (a) で複数キーへ一般化）。
-    /// 各 `<target>` は `GROUP BY` 列名（またはそのエイリアス）か SELECT リスト集計項目の
-    /// 実効名のいずれか 1 つの識別子（意味論的な解決は束縛段）。`ASC`/`DESC` は
-    /// 予約語化せず文脈的に照合し、省略時は昇順として扱う。式・位置番号は
-    /// 別途受理し、それ以外は識別子でない／未知のトークンとして後続の構文検査で
-    /// `42601` に落ちる。
-    /// 各キーの方向指定の直後に `NULLS FIRST|LAST` を受理する（SQL-56・Issue #1791。
-    /// [`Self::parse_order_nulls`]）。キー数の上限は [`MAX_SCALAR_ORDER_KEYS`]（超過は `54000`。
-    /// 確保前検査）。
     /// 集計 `GROUP BY` の `ORDER BY`（Issue #1815・SQL-58）。`HAVING` が積んだ隠し集計配列を
     /// 受け取り、`ORDER BY` 内の集計呼び出しも同じ配列・同じ内部名の添字空間へ重複排除して積んで
     /// 返す（`HAVING sum(n) > 1 ORDER BY sum(n)` は 1 項目に集約）。`allow_aggregate_expr_items`
@@ -6700,6 +6691,16 @@ impl<'a> Parser<'a> {
         Ok((keys, calls.unwrap_or_default()))
     }
 
+    /// 集計 `GROUP BY` の `ORDER BY <target> [ASC|DESC] (',' <target> [ASC|DESC])*`
+    /// （TASK-167・SQL-14。Issue #1185・SQL-25 (a) で複数キーへ一般化）。
+    /// 各 `<target>` は `GROUP BY` 列名（またはそのエイリアス）か SELECT リスト集計項目の
+    /// 実効名のいずれか 1 つの識別子（意味論的な解決は束縛段）。`ASC`/`DESC` は
+    /// 予約語化せず文脈的に照合し、省略時は昇順として扱う。式・位置番号は
+    /// 別途受理し、それ以外は識別子でない／未知のトークンとして後続の構文検査で
+    /// `42601` に落ちる。
+    /// 各キーの方向指定の直後に `NULLS FIRST|LAST` を受理する（SQL-56・Issue #1791。
+    /// [`Self::parse_order_nulls`]）。キー数の上限は [`MAX_SCALAR_ORDER_KEYS`]（超過は `54000`。
+    /// 確保前検査）。
     fn parse_aggregate_order_by(
         &mut self,
         allow_expr: bool,
