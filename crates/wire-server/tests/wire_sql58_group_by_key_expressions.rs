@@ -309,9 +309,10 @@ fn rejected_forms_return_exact_sqlstate_and_session_continues() {
         ("SELECT COUNT(*) FROM docs GROUP BY 1", "42601"),
         ("SELECT COUNT(*) FROM docs GROUP BY upper(nope)", "42703"),
         ("SELECT COUNT(*) FROM docs GROUP BY 10 / (n - 3)", "22012"),
+        // 式キーとの構造一致は #1818。一致しない列参照は集計の外の参照として 42803。
         (
-            "SELECT upper(lang), COUNT(*) FROM docs GROUP BY upper(lang)",
-            "42601",
+            "SELECT lang, COUNT(*) FROM docs GROUP BY upper(lang)",
+            "42803",
         ),
     ] {
         let out = simple(&mut s, sql);

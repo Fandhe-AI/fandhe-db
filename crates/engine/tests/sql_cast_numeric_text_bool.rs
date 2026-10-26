@@ -863,12 +863,20 @@ fn numeric_cast_in_aggregate_select_never_fails_internally() {
     let (core, _g) = setup("cast-numeric-agg");
     for sql in [
         "SELECT CAST(i4 AS numeric) FROM c GROUP BY i4",
-        "SELECT CAST(i4 AS numeric), count(*) FROM c GROUP BY i4",
         "SELECT count(*) + CAST(1 AS numeric) FROM c",
     ] {
         let e = select_as(&core, "alice", sql).unwrap_err();
         assert_ne!(e.wire_code(), "XX000", "{sql}: {e:?}");
     }
+    // Issue #1818・SQL-58: `GROUP BY i4` のキー列を使う numeric 変換は、集計項目があれば
+    // 集計の外のグループキー式として受理される（PostgreSQL と同じ）。
+    let r = select_as(
+        &core,
+        "alice",
+        "SELECT CAST(i4 AS numeric), count(*) FROM c GROUP BY i4",
+    )
+    .expect("grouped column cast to numeric is accepted");
+    assert_eq!(r.rows.len(), 2);
     // Issue #1812: bigint と numeric の集計式項目は numeric 算術として受理される（PostgreSQL と同じ）。
     select_as(
         &core,

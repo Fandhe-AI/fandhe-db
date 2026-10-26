@@ -7,8 +7,7 @@
 //! 評価エラーで部分結果を返さないこと・RLS 境界（不可視行を評価しない）・キー数／グループ数
 //! 上限・fail-closed の境界（`wire_code`）を固定する。期待値は PostgreSQL 17 の意味論で、
 //! fixture から手計算した値。式キーの値の出力と SELECT／HAVING／ORDER BY との構造一致は
-//! 兄弟 Issue #1818 の管轄のため、本テストでは従来どおり `42601` になることだけを固定する
-//! （#1818 で期待値を更新する）。
+//! Issue #1818 の `tests/sql58_group_key_expr_matching.rs` が固定する。
 
 use engine::catalog::{ColumnDef, ColumnType, TableSchema};
 use engine::core::EngineCore;
@@ -482,13 +481,21 @@ fn unsupported_forms_are_rejected_fail_closed() {
         let sql = format!("SELECT count(*) FROM docs {tail}");
         assert_eq!(run_err(&core, &a(), &sql), code, "{sql}");
     }
-    // 式キーの値の出力・構造一致は #1818 の管轄（ここでは従来どおり 42601）。
-    for sql in [
+    // 式キーの値の出力・構造一致は #1818（tests/sql58_group_key_expr_matching.rs）。一致する式は
+    // 受理し、一致しない列参照は集計の外の参照として 42803。
+    run(
+        &core,
+        &a(),
         "SELECT upper(lang), count(*) FROM docs GROUP BY upper(lang)",
-        "SELECT lang, count(*) FROM docs GROUP BY upper(lang)",
-    ] {
-        assert_eq!(run_err(&core, &a(), sql), "42601", "{sql}");
-    }
+    );
+    assert_eq!(
+        run_err(
+            &core,
+            &a(),
+            "SELECT lang, count(*) FROM docs GROUP BY upper(lang)"
+        ),
+        "42803"
+    );
 }
 
 #[test]

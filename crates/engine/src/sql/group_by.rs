@@ -35,8 +35,11 @@
 //! Issue #1817（SQL-58）: `GROUP BY` キー式（[`BoundGroupBy::key_exprs`]）を含む文は、単一 TEXT
 //! キー専用の索引経路を使わず全走査の `multi_groups` で集計する。キー式は可視性判定・`WHERE`・
 //! 可視性の再検査を通った行に限って評価する（不可視行の値で評価エラーが起きると他テナントの行の
-//! 存在が漏れるため。評価エラーは文全体の失敗で、部分結果は返さない）。式キーの値の出力
-//! （SELECT／HAVING／ORDER BY との構造一致）は #1818 の管轄で、出力経路の式キー分岐は fail-closed。
+//! 存在が漏れるため。評価エラーは文全体の失敗で、部分結果は返さない）。
+//!
+//! Issue #1818（SQL-58）: 式キーの値の出力（SELECT の `GroupKey` 投影・HAVING／ORDER BY／投影式の
+//! 行ビュー）は、束縛時に確定した型情報（`BoundGroupKeyExpr`）から投影式と同じ結果型の写像で `Cell`
+//! へ復元する（[`group_key_expr_cell`]）。構造一致の判定自体は束縛段（`sql::parser`）の責務。
 
 use crate::catalog::{self, TableSchema};
 use crate::declarative_filter;
@@ -2295,6 +2298,11 @@ fn project_row(
         .as_ref()
         .map(|g| g.keys.as_slice())
         .unwrap_or(&[]);
+    let group_key_exprs: &[crate::sql::parser::BoundGroupKeyExpr] = bound
+        .group_by
+        .as_ref()
+        .map(|g| g.key_exprs.as_slice())
+        .unwrap_or(&[]);
     // 式列が参照する行ビュー列のマスク（全式列の和）。式列が無ければ行ビューは作らない。
     let mut union_mask: Option<Vec<bool>> = None;
     for col in &bound.projection {
@@ -2309,7 +2317,7 @@ fn project_row(
         }
     }
     let key_cells: Vec<Cell> = match &union_mask {
-        Some(mask) => group_key_cells(group_keys, mask, schema, key)?,
+        Some(mask) => group_key_cells(group_keys, group_key_exprs, mask, schema, key)?,
         None => Vec::new(),
     };
     let scalars: Option<Vec<Option<row_codec::ScalarRef<'_>>>> = match &union_mask {
@@ -2334,10 +2342,13 @@ fn project_row(
                         .ok_or_else(|| accumulator_bug("projection key_index has no bound key"))?;
                     let ty = match target {
                         BoundOrderTarget::Id => None,
-                        // `GROUP BY` キーは式キーを持たない（Issue #1188 は広域取得の
-                        // `ORDER BY` 専用）。到達は束縛の不変条件違反のみ。
-                        BoundOrderTarget::Expr(_) => {
-                            return Err(accumulator_bug("group key must not be an expression key"))
+                        // Issue #1818・SQL-58: 式キーは束縛時に確定した型情報から出力セルを復元する。
+                        BoundOrderTarget::Expr(j) => {
+                            let key_expr = group_key_exprs.get(j).ok_or_else(|| {
+                                accumulator_bug("group key expression out of range")
+                            })?;
+                            row_cells.push(group_key_expr_cell(value, key_expr)?);
+                            continue;
                         }
                         BoundOrderTarget::Column(index) => Some(
                             &schema
@@ -2731,7 +2742,13 @@ fn eval_group_row_exprs(
     scratch: &mut Vec<StackValue>,
     charge: &mut OrderKeyCharge<'_>,
 ) -> Result<(bool, Vec<Option<OrderValue>>), SqlSurfaceError> {
-    let key_cells = group_key_cells(&group_by.keys, &group_by.group_row_mask, schema, key)?;
+    let key_cells = group_key_cells(
+        &group_by.keys,
+        &group_by.key_exprs,
+        &group_by.group_row_mask,
+        schema,
+        key,
+    )?;
     let scalars = group_row_scalars(&key_cells, cells, &group_by.group_row_mask)?;
 
     if !having_exprs_pass(group_by, &scalars, scratch)? {
@@ -2799,6 +2816,7 @@ pub(crate) fn ungrouped_having_passes(
     }
     let key_cells = group_key_cells(
         &having.keys,
+        &having.key_exprs,
         &having.group_row_mask,
         schema,
         &GroupKey(Vec::new()),
@@ -2814,6 +2832,7 @@ pub(crate) fn ungrouped_having_passes(
 /// （投影式。Issue #1541）が共有する。
 fn group_key_cells(
     keys: &[crate::sql::parser::BoundOrderKey],
+    key_exprs: &[crate::sql::parser::BoundGroupKeyExpr],
     mask: &[bool],
     schema: &TableSchema,
     key: &GroupKey,
@@ -2833,8 +2852,13 @@ fn group_key_cells(
                             .ok_or_else(|| accumulator_bug("group key column index out of range"))?
                             .ty,
                     ),
-                    BoundOrderTarget::Expr(_) => {
-                        return Err(accumulator_bug("group key must not be an expression key"))
+                    // Issue #1818・SQL-58: 式キーは評価時の型情報（`BoundGroupKeyExpr`）から復元する。
+                    BoundOrderTarget::Expr(j) => {
+                        let key_expr = key_exprs
+                            .get(j)
+                            .ok_or_else(|| accumulator_bug("group key expression out of range"))?;
+                        key_cells.push(group_key_expr_cell(value, key_expr)?);
+                        continue;
                     }
                 };
                 order_value_to_cell(value, ty)?
@@ -2844,6 +2868,40 @@ fn group_key_cells(
         key_cells.push(cell);
     }
     Ok(key_cells)
+}
+
+/// `GROUP BY` 式キー（Issue #1817・SQL-58）の比較値を、投影式と同じ結果型の写像で出力セルへ
+/// 復元する（Issue #1818）。呼び出し元は [`project_row`]（SELECT の `GroupKey` 投影）と
+/// [`group_key_cells`]（HAVING／ORDER BY／投影式の行ビュー）。値の種別が式の静的型と食い違う場合は
+/// 束縛の不変条件違反として `XX000`（fail-closed。黙って丸めない）。
+fn group_key_expr_cell(
+    value: &OrderValue,
+    key_expr: &crate::sql::parser::BoundGroupKeyExpr,
+) -> Result<Cell, SqlSurfaceError> {
+    use crate::sql::udf_call::ExprType;
+    let text_of = |bytes: &[u8]| -> Result<ExprValue<'static>, SqlSurfaceError> {
+        String::from_utf8(bytes.to_vec())
+            .map(|s| ExprValue::Text(std::borrow::Cow::Owned(s)))
+            .map_err(|_| accumulator_bug("group key expression text is not valid UTF-8"))
+    };
+    let evaluated = match (value, key_expr.ty) {
+        (OrderValue::Float(f), ExprType::Scalar) => ExprValue::Scalar(*f),
+        (OrderValue::Bytes(b), ExprType::Text) => text_of(b)?,
+        (OrderValue::Collated { text, .. }, ExprType::Text) => text_of(text)?,
+        (OrderValue::Bool(b), ExprType::Bool) => ExprValue::Bool(*b),
+        (OrderValue::SignedInt(v), ExprType::Date) => ExprValue::Date(
+            i32::try_from(*v).map_err(|_| accumulator_bug("group key DATE value out of range"))?,
+        ),
+        (OrderValue::SignedInt(v), ExprType::Timestamp) => ExprValue::Timestamp(*v),
+        (OrderValue::SignedInt(v), ExprType::TimestampTz) => ExprValue::TimestampTz(*v),
+        (OrderValue::SignedInt(v), ExprType::Time) => ExprValue::Time(*v),
+        _ => {
+            return Err(accumulator_bug(
+                "group key expression value does not match its static type",
+            ))
+        }
+    };
+    expr_value_to_cell(evaluated, key_expr.result_ty.as_ref())
 }
 
 /// グループ出力行ビュー（`keys`→集計項目の順。束縛側 `sql::parser::group_row_schema` と同じ

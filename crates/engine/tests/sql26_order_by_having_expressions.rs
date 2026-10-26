@@ -556,15 +556,19 @@ fn having_and_order_by_expression_error_contract() {
     ] {
         assert_eq!(run_err(&core, &ctx, &sql), "42601", "{sql}");
     }
-    // 名前解決: 疑似列 `id`・未知名・ベースの非キー列は黙って解決せず 22000。
+    // 名前解決: 疑似列 `id`・ベースの非キー列は集計の外の参照として 42803（Issue #1818・SQL-58。
+    // 黙って解決しない）、未知名は 42703。
     for sql in [
         format!("{AGG} HAVING abs(id) > 1"),
-        format!("{AGG} HAVING abs(zzz) > 1"),
         format!("{AGG} HAVING lower(title) = 'a'"),
         format!("{AGG} ORDER BY lower(title)"),
     ] {
-        assert_eq!(run_err(&core, &ctx, &sql), "42703", "{sql}");
+        assert_eq!(run_err(&core, &ctx, &sql), "42803", "{sql}");
     }
+    assert_eq!(
+        run_err(&core, &ctx, &format!("{AGG} HAVING abs(zzz) > 1")),
+        "42703"
+    );
     // 出力名が複数一致する識別子は式形でも 42702（Issue #1270）。未知名は上で 22000。
     for tail in ["ORDER BY abs(t)", "HAVING abs(t) > 0"] {
         let sql = format!("SELECT lang, SUM(n) AS t, SUM(n) AS t FROM docs GROUP BY lang {tail}");

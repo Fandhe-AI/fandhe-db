@@ -255,14 +255,14 @@ fn numeric_aggregates_in_expressions_and_unsupported_id_aggregates() {
 #[test]
 fn bare_column_outside_aggregate_is_rejected_with_existing_contract() {
     let (core, ctx, _g) = setup();
-    // 現行契約（SQL-14）の 42601 を維持する。
+    // 集計の外の `GROUP BY` に無い列は 42803（Issue #1818・SQL-58。SQL-14 の改訂注記のポインタ）。
     for sql in [
         "SELECT sum(n)+m FROM t",
         "SELECT n+sum(n) FROM t",
         "SELECT g, sum(n)+m FROM t GROUP BY g",
         "SELECT g, sum(n)+n FROM t GROUP BY g",
     ] {
-        assert_eq!(code(&core, &ctx, sql), "42601", "{sql}");
+        assert_eq!(code(&core, &ctx, sql), "42803", "{sql}");
     }
 }
 
@@ -320,8 +320,8 @@ fn internal_aggregates_are_invisible_to_having_and_order_by() {
             Cell::SignedInteger(11)
         ]]
     );
-    // 別名を持つ式項目の別名は他の式から参照できない。
-    assert_eq!(code(&core, &ctx, "SELECT sum(n) AS s, s+1 FROM t"), "42601");
+    // 別名を持つ式項目の別名は他の式から参照できない（未知の列は 42703。Issue #1818）。
+    assert_eq!(code(&core, &ctx, "SELECT sum(n) AS s, s+1 FROM t"), "42703");
 }
 
 #[test]

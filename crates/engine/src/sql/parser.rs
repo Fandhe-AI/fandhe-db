@@ -6717,7 +6717,8 @@ pub(crate) struct BoundGroupKeyExpr {
     pub(crate) program: crate::sql::expr_program::ExprProgram,
     /// 式の静的型。
     pub(crate) ty: crate::sql::udf_call::ExprType,
-    /// 結果列型（RowDescription 用。式キーの値の出力は #1818 が使う。`None` は公告できない型）。
+    /// 結果列型（RowDescription・行ビューの列型。式キーの値の出力（Issue #1818）が使う。
+    /// `None` は公告できない型で、静的型の既定写像へ倒す）。
     pub(crate) result_ty: Option<ColumnType>,
 }
 
@@ -8194,6 +8195,12 @@ pub(crate) fn bind_aggregate_with_dummy_flags(
     // GROUP BY 列名一覧（`SELECT` リストの `GroupKey` 項目の照合・`ORDER BY`/
     // `LIMIT` 束縛より前に確定させる。`GROUP BY` なしなら空スライス）。
     let group_by_columns: &[String] = stmt.group_by().map(|g| g.columns.as_slice()).unwrap_or(&[]);
+    // Issue #1818・SQL-58: 式キーの構造一致用に正規化した `GROUP BY` 式キー（SELECT／HAVING／ORDER BY の
+    // 式の部分木と比べ、一致したものを予約内部名へ置き換える）。
+    let key_exprs_norm: Vec<Expr> = stmt
+        .group_by()
+        .map(|g| g.key_exprs.iter().map(normalize_group_match_expr).collect())
+        .unwrap_or_default();
 
     let mut items = Vec::new();
     // `items` と同じ添字で、各項目の元になった集計呼び出し（Issue #1814・SQL-58。`HAVING` 内の
@@ -8212,13 +8219,14 @@ pub(crate) fn bind_aggregate_with_dummy_flags(
     // `Vec<(usize, String)>` にする）。
     let mut group_key_aliases: Vec<(usize, String)> = Vec::new();
     // 集計式項目（Issue #1541）。`GROUP BY` キー確定後に束縛するため位置と材料を保持する。
-    struct PendingProjectionExpr<'a> {
+    struct PendingProjectionExpr {
         position: usize,
-        expr: &'a Expr,
+        /// 式キーの構造一致を適用済みの式（一致した部分木は予約内部名の識別子）。
+        expr: Expr,
         hidden_items: Vec<usize>,
         name: String,
     }
-    let mut pending_exprs: Vec<PendingProjectionExpr<'_>> = Vec::new();
+    let mut pending_exprs: Vec<PendingProjectionExpr> = Vec::new();
     for item in stmt.items() {
         match item {
             AggregateSelectItem::Aggregate(item) => {
@@ -8250,22 +8258,10 @@ pub(crate) fn bind_aggregate_with_dummy_flags(
             AggregateSelectItem::GroupKey { column, alias } => {
                 let key_index = match group_by_columns.iter().position(|c| c == column) {
                     Some(index) => index,
-                    // Issue #1819・SQL-58 (4): `GROUP BY` なしの `HAVING` では SELECT リストの裸の
-                    // 列は集計の外の参照になる（`42803`。列が無ければ `42703`）。
-                    None if group_by_columns.is_empty() => {
-                        return Err(ungrouped_column_error(schema, column));
-                    }
-                    None => {
-                        // 構文層が既に列名一致を検証済み（上記コメント参照）。
-                        // 到達しないはずの分岐だが、行経路の `unwrap`/`expect`
-                        // 相当を避けるため internal エラーへ落とし panic も
-                        // fail-open な既定値継続もさせず、`Err` を返す
-                        // （`.claude/rules/coding-rust.md`・`security.md`
-                        // 「fail-open にする変更は P0」）。
-                        return Err(crate::sql::aggregate::accumulator_bug(
-                            "GroupKey column must match a GROUP BY column at this point",
-                        ));
-                    }
+                    // Issue #1819・#1818・SQL-58: トップレベルの集計 `SELECT` は構文段が列名一致を
+                    // 検査しないため、`GROUP BY` に無い列（`GROUP BY` なし・式キーのみの場合を含む）の
+                    // 参照は集計の外の参照として束縛段が分類する（`42803`。列が無ければ `42703`）。
+                    None => return Err(ungrouped_column_error(schema, column)),
                 };
                 let name = alias.clone().unwrap_or_else(|| column.clone());
                 if let Some(alias) = alias.clone() {
@@ -8277,15 +8273,36 @@ pub(crate) fn bind_aggregate_with_dummy_flags(
             // 内部集計項目として `items` へ積む（WHERE／RLS を適用する走査・アキュムレータを
             // 共有し、別経路を作らない）。式本体は `GROUP BY` キーの解決後（下）に束縛する。
             AggregateSelectItem::Expr {
-                expr,
+                expr: original_expr,
                 aggregates,
                 alias,
             } => {
-                // Issue #1819: `GROUP BY` なしの `HAVING` では、集計式項目の集計の外の裸識別子も
-                // 集計の外の列参照（`42803`／`42703`）。
-                if group_by_columns.is_empty() {
-                    if let Some(c) = crate::sql::allowlist::expr_bare_idents(expr).first() {
-                        return Err(ungrouped_column_error(schema, c));
+                let expr = original_expr;
+                // Issue #1818・SQL-58: 式キーと構造一致する部分木を予約内部名へ置き換えたうえで、
+                // 集計の外に残った裸識別子は `GROUP BY` 列（式キーの内部名を含む）でなければならない
+                // （`GROUP BY` なしの `HAVING`〔Issue #1819〕を含め、違反は `42803`／`42703`）。
+                let expr = &substitute_group_key_exprs(expr, &key_exprs_norm);
+                for c in crate::sql::allowlist::expr_bare_idents(expr) {
+                    if !group_by_columns.contains(&c) {
+                        return Err(ungrouped_column_error(schema, &c));
+                    }
+                }
+                // 集計呼び出しを持たない式項目が式キーそのものなら、通常のグループキー投影にする
+                // （列名は元の式の既定名。内部名は列名へ漏らさない）。
+                if aggregates.is_empty() {
+                    if let Expr::Ident(placeholder) = expr {
+                        if let Some(key_index) =
+                            group_by_columns.iter().position(|c| c == placeholder)
+                        {
+                            let name = alias
+                                .clone()
+                                .unwrap_or_else(|| default_expr_alias(original_expr));
+                            if let Some(alias) = alias.clone() {
+                                group_key_aliases.push((key_index, alias));
+                            }
+                            projection.push(ProjectionColumn::GroupKey { key_index, name });
+                            continue;
+                        }
                     }
                 }
                 let mut hidden = Vec::with_capacity(aggregates.len());
@@ -8316,10 +8333,10 @@ pub(crate) fn bind_aggregate_with_dummy_flags(
                 }
                 pending_exprs.push(PendingProjectionExpr {
                     position: projection.len(),
-                    expr,
+                    expr: expr.clone(),
                     hidden_items: hidden,
                     name: alias.clone().unwrap_or_else(|| {
-                        super::allowlist::aggregate_expr_default_name(expr, aggregates)
+                        super::allowlist::aggregate_expr_default_name(original_expr, aggregates)
                     }),
                 });
                 // 式の束縛後に差し替える一時項目（差し替え漏れは下で `Internal`）。
@@ -8344,7 +8361,7 @@ pub(crate) fn bind_aggregate_with_dummy_flags(
     // （`(SELECT リスト上の位置, 式, 内部集計項目の添字)`）。
     let projection_expr_refs: Vec<(usize, &Expr, &[usize])> = pending_exprs
         .iter()
-        .map(|p| (p.position, p.expr, p.hidden_items.as_slice()))
+        .map(|p| (p.position, &p.expr, p.hidden_items.as_slice()))
         .collect();
     // Issue #1814・SQL-58: `HAVING` 内の集計呼び出しを隠し集計項目として `items` へ積む。
     // SELECT リストに同じ集計があれば項目を共有し、無ければ可視項目と同じ入力解決・同じ
@@ -8401,12 +8418,17 @@ pub(crate) fn bind_aggregate_with_dummy_flags(
     // `group_by.keys`。`GROUP BY` なしは空）。
     if !pending_exprs.is_empty() {
         let keys: &[BoundOrderKey] = group_by.as_ref().map(|g| g.keys.as_slice()).unwrap_or(&[]);
+        let bound_key_exprs: &[BoundGroupKeyExpr] = group_by
+            .as_ref()
+            .map(|g| g.key_exprs.as_slice())
+            .unwrap_or(&[]);
         for pending in pending_exprs {
             let (program, result_ty, mask) = bind_aggregate_projection_expr(
-                pending.expr,
+                &pending.expr,
                 &pending.hidden_items,
                 group_by_columns,
                 keys,
+                bound_key_exprs,
                 schema,
                 &items,
                 udfs,
@@ -8445,6 +8467,120 @@ pub(crate) fn bind_aggregate_with_dummy_flags(
     })
 }
 
+/// 式の子式を `f` で写した複製を返す（葉・内部名はそのまま複製）。[`rewrite_group_row_idents`] と
+/// 同じ網羅的な `match` で、`Expr` に variant が増えたときにコンパイルエラーで気付けるようにする。
+/// グループキー式の構造一致（[`normalize_group_match_expr`]・[`substitute_group_key_exprs`]）が使う。
+fn map_expr_children(expr: &Expr, f: &mut dyn FnMut(&Expr) -> Expr) -> Expr {
+    use std::convert::Infallible;
+    match expr {
+        Expr::Ident(_)
+        | Expr::Number(_)
+        | Expr::String(_)
+        | Expr::Null
+        | Expr::DateLiteral(_)
+        | Expr::TimestampLiteral(_)
+        | Expr::IntervalLiteral(_)
+        | Expr::TimeLiteral(_)
+        | Expr::TimestampTzLiteral { .. }
+        | Expr::ValueFunction { .. } => expr.clone(),
+        Expr::Call { name, args } => Expr::Call {
+            name: name.clone(),
+            args: args.iter().map(&mut *f).collect(),
+        },
+        Expr::Binary { op, lhs, rhs } => Expr::Binary {
+            op: *op,
+            lhs: Box::new(f(lhs)),
+            rhs: Box::new(f(rhs)),
+        },
+        Expr::Case { whens, else_result } => Expr::Case {
+            whens: whens.iter().map(|(c, r)| (f(c), f(r))).collect(),
+            else_result: else_result.as_ref().map(|e| Box::new(f(e))),
+        },
+        Expr::JsonAccess { op, lhs, rhs } => Expr::JsonAccess {
+            op: *op,
+            lhs: Box::new(f(lhs)),
+            rhs: Box::new(f(rhs)),
+        },
+        Expr::ArrayConstructor(_) | Expr::Subscript { .. } | Expr::Quantified { .. } => {
+            match expr.try_map_array_children(&mut |e| Ok::<Expr, Infallible>(f(e))) {
+                Some(Ok(mapped)) => mapped,
+                _ => expr.clone(),
+            }
+        }
+        Expr::Coalesce(args) => Expr::Coalesce(args.iter().map(&mut *f).collect()),
+        Expr::NullIf(a, b) => Expr::NullIf(Box::new(f(a)), Box::new(f(b))),
+        Expr::IsDistinctFrom { negated, lhs, rhs } => Expr::IsDistinctFrom {
+            negated: *negated,
+            lhs: Box::new(f(lhs)),
+            rhs: Box::new(f(rhs)),
+        },
+        Expr::RegexMatch {
+            negated,
+            case_insensitive,
+            lhs,
+            pattern,
+            raw_pattern_len,
+        } => Expr::RegexMatch {
+            negated: *negated,
+            case_insensitive: *case_insensitive,
+            lhs: Box::new(f(lhs)),
+            pattern: Box::new(f(pattern)),
+            raw_pattern_len: *raw_pattern_len,
+        },
+        Expr::Collate {
+            expr: inner,
+            collation,
+        } => Expr::Collate {
+            expr: Box::new(f(inner)),
+            collation: *collation,
+        },
+        Expr::SqlJsonQuery(q) => match q.try_map_children(&mut |e| Ok::<Expr, Infallible>(f(e))) {
+            Ok(mapped) => Expr::SqlJsonQuery(Box::new(mapped)),
+            Err(_) => expr.clone(),
+        },
+        Expr::Cast { expr: inner, ty } => Expr::Cast {
+            expr: Box::new(f(inner)),
+            ty: ty.clone(),
+        },
+    }
+}
+
+/// グループキー式の構造一致（Issue #1818・SQL-58）で比較する前の正規化。関数名を ASCII 小文字へ
+/// 揃える（括弧は構文木に残らないため対象外）。識別子・リテラルの表記は列解決・型の区別を保つため
+/// そのまま比べる（`2` と `2.0` は別の式）。
+pub(crate) fn normalize_group_match_expr(expr: &Expr) -> Expr {
+    let mapped = map_expr_children(expr, &mut |e| normalize_group_match_expr(e));
+    match mapped {
+        Expr::Call { name, args } => Expr::Call {
+            name: name.to_ascii_lowercase(),
+            args,
+        },
+        other => other,
+    }
+}
+
+/// `SELECT`／`HAVING`／`ORDER BY` の式 `expr` の部分木のうち、`GROUP BY` の式キーと構造一致する
+/// もの（`normalized_keys` は [`normalize_group_match_expr`] 済みの `key_exprs`）を、キーの予約内部名
+/// （[`crate::sql::allowlist::group_key_expr_placeholder`]）の識別子へ置き換えた式を返す。上から順に
+/// 試すので最大の部分木が優先される。集計呼び出しは構文段で内部名の識別子へ脱糖済みのため、
+/// 集計の引数の中は照合対象にならない（集計の中では非グループ列を参照できる）。置換後に残った裸識別子が
+/// `GROUP BY` 列でなければ、呼び出し元が `42803` で拒否する。呼び出し元: `bind_aggregate_with_dummy_flags`
+/// （SELECT 項目）・`bind_group_by_clause`（HAVING／ORDER BY）。再帰の深さは構文段の式節点予算が抑える。
+pub(crate) fn substitute_group_key_exprs(expr: &Expr, normalized_keys: &[Expr]) -> Expr {
+    if normalized_keys.is_empty() {
+        return expr.clone();
+    }
+    if !matches!(expr, Expr::Ident(_)) {
+        let normalized = normalize_group_match_expr(expr);
+        if let Some(j) = normalized_keys.iter().position(|k| *k == normalized) {
+            return Expr::Ident(crate::sql::allowlist::group_key_expr_placeholder(j));
+        }
+    }
+    map_expr_children(expr, &mut |e| {
+        substitute_group_key_exprs(e, normalized_keys)
+    })
+}
+
 /// `GROUP BY` なしの `HAVING`（Issue #1819・SQL-58 (4)）で、集計の外に書かれた列参照 `name` の
 /// エラーを分類する。名前解決を先に行う PostgreSQL の順序に合わせ、`schema` に列（疑似列 `id`
 /// を含む）があれば `42803`（grouping_error）、無ければ `42703`。文言は固定で、列名・値を
@@ -8473,6 +8609,7 @@ fn bind_aggregate_projection_expr(
     hidden_items: &[usize],
     group_by_columns: &[String],
     keys: &[BoundOrderKey],
+    key_exprs: &[BoundGroupKeyExpr],
     schema: &TableSchema,
     items: &[BoundAggregateItem],
     udfs: &crate::sql::udf_call::UdfRegistry,
@@ -8513,7 +8650,7 @@ fn bind_aggregate_projection_expr(
             })
     };
     let rewritten = rewrite_group_row_idents(expr, &resolve)?;
-    let view_schema = group_row_schema(schema, keys, items, true);
+    let view_schema = group_row_schema(schema, keys, key_exprs, items, true);
     let (bound, _ty, result_ty) = crate::sql::udf_call::bind_aggregate_projection_expr_top(
         &rewritten,
         &view_schema,
@@ -10123,9 +10260,8 @@ fn bind_group_by_clause(
     let mut key_exprs: Vec<BoundGroupKeyExpr> = Vec::with_capacity(clause.key_exprs.len());
     for column in &clause.columns {
         // Issue #1817・SQL-58: 予約内部名の位置は式キー。基表スキーマへ投影モード（整数除算等の
-        // PostgreSQL の結果型の算術）で束縛する。行ビュー上の型は `BYTEA` 番兵のままなので、
-        // 式キーを SELECT／HAVING／ORDER BY から参照する形は式束縛が `22000` で拒否する
-        // （構造一致による参照は #1818）。
+        // PostgreSQL の結果型の算術）で束縛する。行ビュー上の型は [`group_row_schema`] が結果列型から
+        // 決め、SELECT／HAVING／ORDER BY の式との構造一致（Issue #1818）で参照される。
         if let Some(j) = crate::sql::allowlist::group_key_expr_placeholder_index(column) {
             let expr = clause.key_exprs.get(j).ok_or_else(|| {
                 crate::sql::aggregate::accumulator_bug("GROUP BY expression key out of range")
@@ -10155,15 +10291,22 @@ fn bind_group_by_clause(
         keys.push(resolve_group_by_key(schema, column)?);
     }
 
+    // Issue #1818・SQL-58: HAVING／ORDER BY の式と構造一致を取る正規化済み式キー。
+    let key_exprs_norm: Vec<Expr> = clause
+        .key_exprs
+        .iter()
+        .map(normalize_group_match_expr)
+        .collect();
+
     // HAVING/ORDER BY の対象名解決: いずれかの `GROUP BY` 列名そのもの、その
     // キーの SELECT リストでの実効名（`group_key_aliases` のいずれか）、または
     // `items` のいずれか 1 つの実効名に一意に一致する識別子のみを受理する
     // （非存在は `22000`、曖昧は `42702`。Issue #1270）。
     let resolve_target = |name: &str| -> Result<OrderTarget, SqlSurfaceError> {
         match resolve_group_reference(&clause.columns, group_key_aliases, items, name) {
-            // Issue #1819: キー 0 個（`GROUP BY` なしの `HAVING`）では、集計項目に解決できない
-            // 識別子は集計の外の列参照。列があれば `42803`、無ければ `42703`。
-            Err(SqlSurfaceError::UndefinedColumn { .. }) if clause.columns.is_empty() => {
+            // Issue #1819・#1818: キー・別名・集計項目のいずれにも解決できない識別子は集計の外の
+            // 列参照。列があれば `42803`（`GROUP BY` なし・式キーのみの場合を含む）、無ければ `42703`。
+            Err(SqlSurfaceError::UndefinedColumn { .. }) => {
                 Err(ungrouped_column_error(schema, name))
             }
             other => other,
@@ -10234,15 +10377,21 @@ fn bind_group_by_clause(
     // 従来の `resolve_target` と同じ規則（キー名・キーの別名・集計項目名。未知は `22000`・曖昧は `42702`）で
     // 解決してから合成列名へ置換するため、`id` 等の疑似列やベースの列が黙って参照される
     // ことはない。
-    let view_schema = group_row_schema(schema, &keys, items, false);
-    let precise_view_schema = group_row_schema(schema, &keys, items, true);
+    let view_schema = group_row_schema(schema, &keys, &key_exprs, items, false);
+    let precise_view_schema = group_row_schema(schema, &keys, &key_exprs, items, true);
     let mut group_row_mask = vec![false; keys.len().saturating_add(items.len())];
     let mut having_exprs = Vec::with_capacity(clause.having_exprs.len());
     for pred in &clause.having_exprs {
         let expr = Expr::Binary {
             op: pred.op,
-            lhs: Box::new(rewrite_group_row_idents(&pred.lhs, &resolve_having)?),
-            rhs: Box::new(rewrite_group_row_idents(&pred.rhs, &resolve_having)?),
+            lhs: Box::new(rewrite_group_row_idents(
+                &substitute_group_key_exprs(&pred.lhs, &key_exprs_norm),
+                &resolve_having,
+            )?),
+            rhs: Box::new(rewrite_group_row_idents(
+                &substitute_group_key_exprs(&pred.rhs, &key_exprs_norm),
+                &resolve_having,
+            )?),
         };
         let (bound, ty) = crate::sql::udf_call::bind_expr(&expr, &view_schema, udfs, node_budget)?;
         if ty != crate::sql::udf_call::ExprType::Bool {
@@ -10371,6 +10520,21 @@ fn bind_group_by_clause(
                 target
             }
             (Some(expr), _) => {
+                let expr = &substitute_group_key_exprs(expr, &key_exprs_norm);
+                // キー全体が式キーと構造一致する場合は、グループキーそのものでの並べ替えにする。
+                if let Expr::Ident(name) = expr {
+                    if crate::sql::allowlist::group_key_expr_placeholder_index(name).is_some() {
+                        let target = resolve_having(name)?;
+                        order_by.push(BoundOrderBy {
+                            target,
+                            descending: ob.descending,
+                            nulls: ob
+                                .nulls
+                                .unwrap_or_else(|| NullPlacement::pg_default(ob.descending)),
+                        });
+                        continue;
+                    }
+                }
                 let rewritten = rewrite_group_row_idents(expr, &resolve_having)?;
                 let (bound, ty) =
                     crate::sql::udf_call::bind_expr(&rewritten, &view_schema, udfs, node_budget)?;
@@ -10526,6 +10690,22 @@ fn projection_row_column_type(item: &BoundAggregateItem) -> ColumnType {
     }
 }
 
+/// 式キーの出力セルに対応する静的な列型（Issue #1818）。結果列型が公告されていればそれを、
+/// 無ければ式の静的型の既定写像を使う。実セルは `sql::group_by::group_key_expr_cell` が同じ型で作る。
+fn group_key_expr_column_type(key_expr: &BoundGroupKeyExpr) -> Option<ColumnType> {
+    use crate::sql::udf_call::ExprType;
+    key_expr.result_ty.clone().or(match key_expr.ty {
+        ExprType::Scalar => Some(ColumnType::Double),
+        ExprType::Text => Some(ColumnType::Text),
+        ExprType::Bool => Some(ColumnType::Boolean),
+        ExprType::Date => Some(ColumnType::Date),
+        ExprType::Timestamp => Some(ColumnType::Timestamp),
+        ExprType::Time => Some(ColumnType::Time),
+        ExprType::TimestampTz => Some(ColumnType::TimestampTz),
+        _ => None,
+    })
+}
+
 /// グループ出力行ビューの合成スキーマ（Issue #1188・SQL-26）。列は `GROUP BY` キー
 /// （`__gk<i>`）→ 集計項目（`__ga<j>`）の順で、`HAVING`／`ORDER BY` の式束縛
 /// （[`crate::sql::udf_call::bind_expr`]）と実行時の行スカラービュー
@@ -10535,6 +10715,7 @@ fn projection_row_column_type(item: &BoundAggregateItem) -> ColumnType {
 fn group_row_schema(
     schema: &TableSchema,
     keys: &[BoundOrderKey],
+    key_exprs: &[BoundGroupKeyExpr],
     items: &[BoundAggregateItem],
     precise: bool,
 ) -> TableSchema {
@@ -10551,7 +10732,18 @@ fn group_row_schema(
                 None => ColumnType::Bytea,
             },
             BoundOrderTarget::Id => ColumnType::BigInt,
-            BoundOrderTarget::Expr(_) => ColumnType::Bytea,
+            // Issue #1818・SQL-58: 式キーの列型は束縛時に確定した結果型。公告できない型は
+            // `BYTEA` 番兵のままにして、参照した式束縛を `22000` で fail-closed にする。
+            BoundOrderTarget::Expr(j) => {
+                match key_exprs.get(j).and_then(group_key_expr_column_type) {
+                    Some(ColumnType::Integer | ColumnType::SmallInt) if !precise => {
+                        ColumnType::BigInt
+                    }
+                    Some(ColumnType::Real) if !precise => ColumnType::Double,
+                    Some(other) => other,
+                    None => ColumnType::Bytea,
+                }
+            }
         };
         let mut def = ColumnDef::new(format!("__gk{i}"), ty, true);
         // グループキーの照合を行ビューの列へ運ぶ。非バイト列順（ICU。Issue #2190）の照合の
@@ -13637,5 +13829,95 @@ mod tests {
             let insert_err = parse_array_literal(lit, at).expect_err("insert path");
             assert_eq!(insert_err.wire_code(), code, "{lit}");
         }
+    }
+
+    // --- グループキー式の構造一致（Issue #1818・SQL-58） ----------------------------
+
+    fn call(name: &str, args: Vec<Expr>) -> Expr {
+        Expr::Call {
+            name: name.to_string(),
+            args,
+        }
+    }
+
+    fn ident(name: &str) -> Expr {
+        Expr::Ident(name.to_string())
+    }
+
+    fn div(lhs: Expr, rhs: Expr) -> Expr {
+        Expr::Binary {
+            op: crate::sql::udf_call::BinOp::Div,
+            lhs: Box::new(lhs),
+            rhs: Box::new(rhs),
+        }
+    }
+
+    fn key_placeholder(j: usize) -> Expr {
+        Expr::Ident(crate::sql::allowlist::group_key_expr_placeholder(j))
+    }
+
+    /// 関数名の大文字小文字を吸収し、全体一致・部分木一致の両方を内部名へ置き換える。
+    #[test]
+    fn substitute_group_key_exprs_matches_whole_and_sub_expressions() {
+        let keys = vec![
+            normalize_group_match_expr(&call("upper", vec![ident("lang")])),
+            normalize_group_match_expr(&div(ident("n"), Expr::Number("2".to_string()))),
+        ];
+        // 関数名の大文字小文字が違っても全体一致する。
+        assert_eq!(
+            substitute_group_key_exprs(&call("UPPER", vec![ident("lang")]), &keys),
+            key_placeholder(0)
+        );
+        // 部分木（上から順に最大一致）。
+        let wrapped = call("lower", vec![call("Upper", vec![ident("lang")])]);
+        assert_eq!(
+            substitute_group_key_exprs(&wrapped, &keys),
+            call("lower", vec![key_placeholder(0)])
+        );
+        let sum = Expr::Binary {
+            op: crate::sql::udf_call::BinOp::Add,
+            lhs: Box::new(div(ident("n"), Expr::Number("2".to_string()))),
+            rhs: Box::new(Expr::Number("1".to_string())),
+        };
+        assert_eq!(
+            substitute_group_key_exprs(&sum, &keys),
+            Expr::Binary {
+                op: crate::sql::udf_call::BinOp::Add,
+                lhs: Box::new(key_placeholder(1)),
+                rhs: Box::new(Expr::Number("1".to_string())),
+            }
+        );
+    }
+
+    /// 一致しない式（別の列・別のリテラル表記）・識別子単独・キー無しは置換しない。
+    #[test]
+    fn substitute_group_key_exprs_leaves_non_matching_expressions() {
+        let keys = vec![normalize_group_match_expr(&div(
+            ident("n"),
+            Expr::Number("2".to_string()),
+        ))];
+        for expr in [
+            div(ident("m"), Expr::Number("2".to_string())),
+            // `2` と `2.0` は別の式（PostgreSQL と同じく型が異なる）。
+            div(ident("n"), Expr::Number("2.0".to_string())),
+            ident("n"),
+            call("upper", vec![ident("lang")]),
+        ] {
+            assert_eq!(substitute_group_key_exprs(&expr, &keys), expr);
+        }
+        let empty: Vec<Expr> = Vec::new();
+        let e = div(ident("n"), Expr::Number("2".to_string()));
+        assert_eq!(substitute_group_key_exprs(&e, &empty), e);
+    }
+
+    /// 集計呼び出しの内部名は識別子として残るため、集計の引数側は照合の対象にならない。
+    #[test]
+    fn substitute_group_key_exprs_does_not_touch_aggregate_placeholders() {
+        let keys = vec![normalize_group_match_expr(&call(
+            "upper",
+            vec![ident("lang")],
+        ))];
+        let agg = Expr::Ident(crate::sql::allowlist::aggregate_placeholder(0));
+        assert_eq!(substitute_group_key_exprs(&agg, &keys), agg);
     }
 }
