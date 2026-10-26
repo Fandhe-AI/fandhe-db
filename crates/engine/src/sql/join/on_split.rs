@@ -12,10 +12,10 @@
 //! - [`OnClass::NewOnly`]: 参照が `new` だけ
 //! - [`OnClass::Mixed`]: 両側を跨ぐ非キー（`a.x > b.y` 等）
 //!
-//! #1830 への引き継ぎ契約: [`OnSplit`] の各 `Vec` は宣言順を保つ。残余（左のみ・右のみ・
-//! 混在）の評価は #1830 の責務で、現状 `build_plan` は残余を持つ ON を `0A000` で
-//! 拒否する（述語を黙殺する fail-open を作らない）。外部結合の ON 残余は WHERE の
-//! strict マスク簡約へ流してはならない（ON 述語は NULL 補完の有無を決めるのみ）。
+//! #1830 との契約: [`OnSplit`] の各 `Vec` は宣言順を保つ。残余（左のみ・右のみ・
+//! 混在）は `build_plan` が `StepPlan` の `on_*` へ束縛し、`exec::join_step` が一致条件の
+//! 一部として評価する（述語を黙殺する fail-open を作らない）。外部結合の ON 残余は WHERE の
+//! strict マスク簡約へ流さない（ON 述語は NULL 補完の有無を決めるのみ）。
 
 use crate::sql::allowlist::{JoinWherePredicate, SqlSurfaceError};
 use crate::sql::relation::ResolvedColumn;
@@ -44,8 +44,9 @@ pub(super) struct OnSplit<'p> {
     pub(super) mixed: Vec<&'p JoinWherePredicate>,
 }
 
+#[cfg(test)]
 impl OnSplit<'_> {
-    /// 等価キー以外の残余述語が 1 つでもあるか。
+    /// 等価キー以外の残余述語が 1 つでもあるか（分類の単体テスト用）。
     pub(super) fn has_residual(&self) -> bool {
         !(self.acc_only.is_empty() && self.new_only.is_empty() && self.mixed.is_empty())
     }
