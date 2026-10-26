@@ -3055,8 +3055,10 @@ pub(crate) enum JoinKind {
     Full,
 }
 
-/// JOIN 1 段の結合条件（Issue #1826・SQL-60 (1)）。`On` は等値結合条件
-/// （`AND` 結合順。1 個以上・[`MAX_JOIN_CONDITIONS`] 以下）、`Using` は `USING (c1, c2, ...)`
+/// JOIN 1 段の結合条件（Issue #1826・SQL-60 (1)）。`On` は `AND` 連鎖の葉
+/// （[`JoinWherePredicate`]。WHERE と共有する葉で、宣言順・1 個以上・[`MAX_JOIN_CONDITIONS`]
+/// 以下）。結合キー／残余述語への分類は束縛段 `sql::join::on_split` の責務で、構文段は
+/// 葉を保持するだけ（Issue #1829・SQL-60 ポインタ）。`Using` は `USING (c1, c2, ...)`
 /// の列名列（宣言順。1 個以上・[`MAX_JOIN_CONDITIONS`] 以下。重複・存在・型の検証と
 /// 等価 ON への脱糖・結合列の統合は束縛段 `sql::join` の責務で、構文段は列名だけを保持する）。
 /// `Natural`（Issue #1827）は `NATURAL [INNER|LEFT|RIGHT|FULL [OUTER]] JOIN` で、列名列は
@@ -3064,7 +3066,7 @@ pub(crate) enum JoinKind {
 /// 同じ経路で束縛する（共通列が 0 個なら条件なしの直積）。
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) enum JoinCondition {
-    On(Vec<(ColumnRef, ColumnRef)>),
+    On(Vec<JoinWherePredicate>),
     Using(Vec<String>),
     Natural,
 }
@@ -18848,21 +18850,22 @@ fn parse_join_aggregate_item(p: &mut Parser<'_>) -> Result<JoinSelectItem, SqlSu
     Ok(JoinSelectItem::Aggregate { func, arg, alias })
 }
 
-/// `ON` の等値結合条件（`cond := colref '=' colref { AND colref '=' colref }`）。
+/// `ON` 条件（`on := leaf { AND leaf }`。Issue #1829・SQL-60 ポインタ）。葉は WHERE と共通の
+/// [`parse_join_where_leaf`] で読み、`OR`・括弧は受理しない（`OR` は ON 解析後の残りとして
+/// 文パーサが `42601` にする）。結合キーか残余かの分類は束縛段の責務。葉数の上限
+/// （[`MAX_JOIN_CONDITIONS`]、超過は `54000`）は `Vec` へ積む前に検査する。
 fn parse_join_on_conditions(
     p: &mut Parser<'_>,
-) -> Result<Vec<(ColumnRef, ColumnRef)>, SqlSurfaceError> {
+) -> Result<Vec<JoinWherePredicate>, SqlSurfaceError> {
     let mut conditions = Vec::new();
     loop {
-        let lhs = p.parse_join_colref()?;
-        p.expect_punct('=')?;
-        let rhs = p.parse_join_colref()?;
+        let leaf = parse_join_where_leaf(p)?;
         if conditions.len() >= MAX_JOIN_CONDITIONS {
             return Err(SqlSurfaceError::payload_too_large(
                 "too many JOIN ON conditions",
             ));
         }
-        conditions.push((lhs, rhs));
+        conditions.push(leaf);
         if matches!(p.peek(), Some(Token::Keyword(Keyword::And))) {
             p.advance();
             continue;
@@ -19070,6 +19073,9 @@ fn parse_join_where_leaf(p: &mut Parser<'_>) -> Result<JoinWherePredicate, SqlSu
         Some(Token::Keyword(Keyword::And))
         | Some(Token::Keyword(Keyword::Limit))
         | Some(Token::Keyword(Keyword::Order))
+        // ON の葉（Issue #1829）の直後に来る WHERE と結合語。WHERE／DML 文脈でこれらが葉の直後に
+        // 来ても後段の文パーサが `42601` にするため既存の挙動は変わらない。
+        | Some(Token::Keyword(Keyword::Where))
         | Some(Token::Punct(')' | ';'))
         | None => JoinWherePredicate::BoolColumn { column },
         // DML（`UPDATE ... FROM`／`DELETE ... USING`）の WHERE 後続句（Issue #1754）。
@@ -19082,6 +19088,13 @@ fn parse_join_where_leaf(p: &mut Parser<'_>) -> Result<JoinWherePredicate, SqlSu
                 "USING",
                 "RETURNING",
                 "PARTITIONED",
+                "JOIN",
+                "INNER",
+                "LEFT",
+                "RIGHT",
+                "FULL",
+                "NATURAL",
+                "CROSS",
             ]
             .iter()
             .any(|t| w.eq_ignore_ascii_case(t)) =>
@@ -34081,6 +34094,53 @@ mod tests {
             }
             other => panic!("expected Join, got {other:?}"),
         }
+    }
+
+    /// Issue #1829・SQL-60 ポインタ: ON は WHERE と共通の葉の AND 連鎖として保持する
+    /// （分類は束縛段）。裸 bool 列は後続の WHERE・結合語で終端し、OR・括弧は拒否する。
+    #[test]
+    fn join_on_clause_is_parsed_into_leaf_chain() {
+        let lookup = catalog_with(&["a", "b", "c"]);
+        let stmt = validate_sql(
+            "SELECT * FROM a JOIN b ON a.id = b.a_id AND b.tag = 'x' LIMIT 1",
+            &lookup,
+        )
+        .expect("ON leaf chain should be accepted");
+        match stmt {
+            Statement::Join(v) => match &v.steps[0].condition {
+                JoinCondition::On(leaves) => {
+                    assert_eq!(leaves.len(), 2);
+                    assert!(matches!(
+                        leaves[0],
+                        JoinWherePredicate::ColumnCompare { op: BinOp::Eq, .. }
+                    ));
+                    assert!(matches!(leaves[1], JoinWherePredicate::Equality { .. }));
+                }
+                other => panic!("expected On, got {other:?}"),
+            },
+            other => panic!("expected Join, got {other:?}"),
+        }
+        for sql in [
+            "SELECT * FROM a JOIN b ON a.id = b.id AND b.active JOIN c ON b.id = c.id LIMIT 1",
+            "SELECT * FROM a LEFT JOIN b ON a.id = b.id AND b.active WHERE a.id = 'q' LIMIT 1",
+            "SELECT * FROM a JOIN b ON a.x > b.y AND a.id = b.id LIMIT 1",
+        ] {
+            validate_sql(sql, &lookup).unwrap_or_else(|e| panic!("{sql}: {e:?}"));
+        }
+        for sql in [
+            "SELECT * FROM a JOIN b ON a.x = b.y OR a.z = b.w LIMIT 1",
+            "SELECT * FROM a JOIN b ON (a.x = b.y) LIMIT 1",
+        ] {
+            let e = validate_sql(sql, &lookup).unwrap_err();
+            assert_eq!(e.wire_code(), "42601", "{sql}");
+        }
+        let nine = ["a.id = b.id"; 9].join(" AND ");
+        let e = validate_sql(
+            &format!("SELECT * FROM a JOIN b ON {nine} LIMIT 1"),
+            &lookup,
+        )
+        .unwrap_err();
+        assert_eq!(e.wire_code(), "54000");
     }
 
     /// Issue #1826・SQL-60 (1): `USING (...)` は列名列のまま `JoinCondition::Using` で保持し、
