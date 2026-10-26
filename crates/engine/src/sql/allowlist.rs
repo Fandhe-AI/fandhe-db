@@ -18178,11 +18178,11 @@ pub(super) fn probe_from_table_ref(tokens: &[Token]) -> Option<(TableRef, usize)
 }
 
 /// JOIN 構文かどうかをバックトラックせず先読みだけで判定する（Issue #925
-/// §2.2・#926。Issue #1833 でカンマ区切りの表参照〔`FROM a, b`〕も対象に加えた）。`validate_sql_tokens_impl` の集計・`DISTINCT`・集合演算の判定
-/// より前に呼ぶ。括弧深さ 0 の最初の `FROM` の直後が `<ident> [[AS] <alias>]
+/// §2.2・#926。Issue #1833 でカンマ区切りの表参照〔`FROM a, b`〕も対象に加えた）。
+/// `validate_sql_tokens_impl` の集計・`DISTINCT`・集合演算の判定より前に呼ぶ。括弧深さ 0 の最初の `FROM` の直後が `<ident> [[AS] <alias>]
 /// (JOIN|INNER JOIN|LEFT|RIGHT|FULL|CROSS|NATURAL)` の並びのときのみ真になる
-/// （`CROSS` は Issue #1831 で受理対象。`NATURAL` は Issue #1827 で受理対象になった——構文段の判定順序〔`42601` が `42P01` に先行する〕を
-/// 保つため。`LEFT`／`RIGHT`／`FULL [OUTER]` は Issue #926 で受理対象になった）。
+/// （`CROSS` は Issue #1831 で受理対象。`NATURAL` は Issue #1827 で受理対象になった
+/// ——構文段の判定順序〔`42601` が `42P01` に先行する〕を保つため。`LEFT`／`RIGHT`／`FULL [OUTER]` は Issue #926 で受理対象になった）。
 pub(crate) fn looks_like_join(tokens: &[Token]) -> bool {
     if !matches!(tokens.first(), Some(Token::Keyword(Keyword::Select))) {
         return false;
