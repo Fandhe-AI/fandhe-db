@@ -10274,14 +10274,17 @@ fn aggregate_result_column_type(item: &BoundAggregateItem) -> ColumnType {
         AggregateFunc::ArrayAgg => EXPR_UNSUPPORTED_COLUMN_TYPE,
         // 分散系（SQL-57・Issue #1803）: numeric 結果（整数系・`id`・numeric 列）は式内で扱えない列、
         // 浮動小数列・数値式の入力は double 結果。
-        AggregateFunc::Variance | AggregateFunc::VarPop | AggregateFunc::VarSamp => {
-            match item.input {
-                AggregateInput::RealColumn(_)
-                | AggregateInput::DoubleColumn(_)
-                | AggregateInput::ScalarExpr { .. } => ColumnType::Double,
-                _ => EXPR_UNSUPPORTED_COLUMN_TYPE,
-            }
-        }
+        AggregateFunc::Variance
+        | AggregateFunc::VarPop
+        | AggregateFunc::VarSamp
+        | AggregateFunc::Stddev
+        | AggregateFunc::StddevPop
+        | AggregateFunc::StddevSamp => match item.input {
+            AggregateInput::RealColumn(_)
+            | AggregateInput::DoubleColumn(_)
+            | AggregateInput::ScalarExpr { .. } => ColumnType::Double,
+            _ => EXPR_UNSUPPORTED_COLUMN_TYPE,
+        },
         AggregateFunc::Avg => match item.input {
             // Issue #2270（TABLE-13）: 整数・`id` の AVG も `Cell::Numeric` を返すため、
             // 式内では扱えない列として `22000` で拒否する（numeric 算術は別 Issue）。

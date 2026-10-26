@@ -444,6 +444,9 @@ pub(crate) fn is_aggregate_function_name(name: &str) -> bool {
             | "VARIANCE"
             | "VAR_POP"
             | "VAR_SAMP"
+            | "STDDEV"
+            | "STDDEV_POP"
+            | "STDDEV_SAMP"
             | "BOOL_AND"
             | "BOOL_OR"
             | "EVERY"
@@ -3211,6 +3214,13 @@ pub enum AggregateFunc {
     VarPop,
     /// `var_samp(<数値>)`（SQL-57・Issue #1803）。標本分散。行数 0・1 は NULL。
     VarSamp,
+    /// `stddev(<数値>)`（SQL-57・Issue #1804）。`stddev_samp` と同義（標本標準偏差）。
+    /// 分散の平方根。結果型・NULL の扱いは分散系と同じ。
+    Stddev,
+    /// `stddev_pop(<数値>)`（SQL-57・Issue #1804）。母標準偏差。行数 1 は 0。
+    StddevPop,
+    /// `stddev_samp(<数値>)`（SQL-57・Issue #1804）。標本標準偏差。行数 0・1 は NULL。
+    StddevSamp,
     /// `bool_and(<boolean 式>)`（SQL-57・Issue #1805）。全行が真なら真。NULL 入力は無視し、
     /// 入力なし・全行 NULL は NULL。結果は boolean。
     BoolAnd,
@@ -3223,12 +3233,18 @@ pub enum AggregateFunc {
 }
 
 impl AggregateFunc {
-    /// 分散系の集計関数か（`variance`／`var_pop`／`var_samp`。Issue #1803）。
-    /// 引数の型検査・結果型・累積器の選択がこの 3 関数で共通になる。
+    /// 分散系の集計関数か（`variance`／`var_pop`／`var_samp` と `stddev`／`stddev_pop`／
+    /// `stddev_samp`。Issue #1803・#1804）。引数の型検査・結果型・累積器の選択がこの 6 関数で
+    /// 共通になる。
     pub(crate) fn is_variance_family(self) -> bool {
         matches!(
             self,
-            AggregateFunc::Variance | AggregateFunc::VarPop | AggregateFunc::VarSamp
+            AggregateFunc::Variance
+                | AggregateFunc::VarPop
+                | AggregateFunc::VarSamp
+                | AggregateFunc::Stddev
+                | AggregateFunc::StddevPop
+                | AggregateFunc::StddevSamp
         )
     }
 
@@ -3254,6 +3270,9 @@ impl AggregateFunc {
             "VARIANCE" => Some(AggregateFunc::Variance),
             "VAR_POP" => Some(AggregateFunc::VarPop),
             "VAR_SAMP" => Some(AggregateFunc::VarSamp),
+            "STDDEV" => Some(AggregateFunc::Stddev),
+            "STDDEV_POP" => Some(AggregateFunc::StddevPop),
+            "STDDEV_SAMP" => Some(AggregateFunc::StddevSamp),
             "BOOL_AND" => Some(AggregateFunc::BoolAnd),
             "BOOL_OR" => Some(AggregateFunc::BoolOr),
             "EVERY" => Some(AggregateFunc::Every),
@@ -3274,6 +3293,9 @@ impl AggregateFunc {
             AggregateFunc::Variance => "variance",
             AggregateFunc::VarPop => "var_pop",
             AggregateFunc::VarSamp => "var_samp",
+            AggregateFunc::Stddev => "stddev",
+            AggregateFunc::StddevPop => "stddev_pop",
+            AggregateFunc::StddevSamp => "stddev_samp",
             AggregateFunc::BoolAnd => "bool_and",
             AggregateFunc::BoolOr => "bool_or",
             AggregateFunc::Every => "every",

@@ -12,9 +12,11 @@
 //! - [`VarianceFloat`]: `real`／`double precision` 列と数値スカラー式。PostgreSQL の
 //!   `float8_accum` と同じ Youngs–Cramer 更新で数値的に安定に累積し、double を返す。
 //!
-//! 後続の `stddev` 系（Issue #1804）は [`VarianceExact::finish_decimal`]／
-//! [`VarianceFloat::finish_f64`] が返す分散の確定値に平方根をかぶせるだけで済むよう、
-//! 状態の更新と確定を分けて公開している。
+//! `stddev`／`stddev_pop`／`stddev_samp`（Issue #1804）は同じ状態を共有し、
+//! [`VarianceExact::finish_stddev_decimal`]／[`VarianceFloat::finish_stddev_f64`] が
+//! 分散の確定値（丸め済み）に平方根をかぶせる。numeric は PostgreSQL 17 と同じく
+//! 丸め済みの分散を同じ scale で平方根へ half-up 丸めする（`N·Σx²/den` の平方根を
+//! 直接取ると PG とずれる）。範囲超過は分散段階の判定をそのまま継承する。
 //!
 //! 契約: 行数 0 は `None`（SQL の NULL）。行数 1 は標本分散が `None`、母分散が 0。
 //! 範囲超過（累積のあふれ・numeric の 38 桁超過・結果 scale が 38 超）は `22003`
@@ -22,7 +24,8 @@
 //! 内部不変条件の違反は `XX000`。全演算は checked で、`unsafe` は使わない。
 
 use crate::numeric::{
-    div_round_wide, select_div_scale_wide, Decimal, NumericError, MAX_PRECISION, U256,
+    div_round_wide, select_div_scale_wide, sqrt_round_decimal, Decimal, NumericError,
+    MAX_PRECISION, U256,
 };
 use crate::sql::aggregate::accumulator_bug;
 use crate::sql::allowlist::{AggregateFunc, SqlSurfaceError};
@@ -38,8 +41,33 @@ impl VarianceKind {
     /// 分散系の関数から種別を決める。分散系以外は `None`。
     pub(crate) fn from_func(func: AggregateFunc) -> Option<Self> {
         match func {
-            AggregateFunc::VarPop => Some(VarianceKind::Pop),
-            AggregateFunc::Variance | AggregateFunc::VarSamp => Some(VarianceKind::Samp),
+            AggregateFunc::VarPop | AggregateFunc::StddevPop => Some(VarianceKind::Pop),
+            AggregateFunc::Variance
+            | AggregateFunc::VarSamp
+            | AggregateFunc::Stddev
+            | AggregateFunc::StddevSamp => Some(VarianceKind::Samp),
+            _ => None,
+        }
+    }
+}
+
+/// 結果が分散そのものか、その平方根（標準偏差）か。累積状態は共通で確定時だけ分かれる。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum VarianceOutput {
+    Variance,
+    Stddev,
+}
+
+impl VarianceOutput {
+    /// 分散系 6 関数から出力種別を決める。分散系以外は `None`。
+    pub(crate) fn from_func(func: AggregateFunc) -> Option<Self> {
+        match func {
+            AggregateFunc::Variance | AggregateFunc::VarPop | AggregateFunc::VarSamp => {
+                Some(VarianceOutput::Variance)
+            }
+            AggregateFunc::Stddev | AggregateFunc::StddevPop | AggregateFunc::StddevSamp => {
+                Some(VarianceOutput::Stddev)
+            }
             _ => None,
         }
     }
@@ -133,6 +161,19 @@ impl VarianceExact {
         }
         Ok(Some(decimal))
     }
+
+    /// 標準偏差の確定値。丸め済みの分散を同じ scale で平方根にする（PostgreSQL 17 と同手順）。
+    pub(crate) fn finish_stddev_decimal(
+        &self,
+        kind: VarianceKind,
+    ) -> Result<Option<Decimal>, SqlSurfaceError> {
+        match self.finish_decimal(kind)? {
+            None => Ok(None),
+            Some(variance) => sqrt_round_decimal(&variance)
+                .map(Some)
+                .map_err(map_numeric_error),
+        }
+    }
 }
 
 fn zero_decimal() -> Result<Decimal, SqlSurfaceError> {
@@ -202,6 +243,23 @@ impl VarianceFloat {
             return Err(overflow("variance overflowed to a non-finite value"));
         }
         Ok(Some(result))
+    }
+
+    /// 標準偏差の確定値（分散の平方根）。非有限は防御として `22003`。
+    pub(crate) fn finish_stddev_f64(
+        &self,
+        kind: VarianceKind,
+    ) -> Result<Option<f64>, SqlSurfaceError> {
+        match self.finish_f64(kind)? {
+            None => Ok(None),
+            Some(variance) => {
+                let result = variance.sqrt();
+                if !result.is_finite() {
+                    return Err(overflow("stddev overflowed to a non-finite value"));
+                }
+                Ok(Some(result))
+            }
+        }
     }
 }
 
@@ -336,5 +394,91 @@ mod tests {
             Some(VarianceKind::Pop)
         );
         assert_eq!(VarianceKind::from_func(AggregateFunc::Sum), None);
+    }
+
+    #[test]
+    fn output_from_func() {
+        assert_eq!(
+            VarianceOutput::from_func(AggregateFunc::VarPop),
+            Some(VarianceOutput::Variance)
+        );
+        assert_eq!(
+            VarianceOutput::from_func(AggregateFunc::Stddev),
+            Some(VarianceOutput::Stddev)
+        );
+        assert_eq!(VarianceOutput::from_func(AggregateFunc::Sum), None);
+        assert_eq!(
+            VarianceKind::from_func(AggregateFunc::StddevPop),
+            Some(VarianceKind::Pop)
+        );
+        assert_eq!(
+            VarianceKind::from_func(AggregateFunc::Stddev),
+            Some(VarianceKind::Samp)
+        );
+    }
+
+    #[test]
+    fn stddev_exact_matches_pg17_procedure() {
+        let s = exact(0, &[1, 2, 3]);
+        assert_eq!(
+            text(s.finish_stddev_decimal(VarianceKind::Pop).expect("ok")),
+            Some("0.81649658092772603273".to_string())
+        );
+        assert_eq!(
+            text(s.finish_stddev_decimal(VarianceKind::Samp).expect("ok")),
+            Some("1.00000000000000000000".to_string())
+        );
+        let s = exact(0, &[1, 2, 3, 4]);
+        assert_eq!(
+            text(s.finish_stddev_decimal(VarianceKind::Samp).expect("ok")),
+            Some("1.2909944487358056".to_string())
+        );
+        assert_eq!(
+            text(s.finish_stddev_decimal(VarianceKind::Pop).expect("ok")),
+            Some("1.1180339887498948".to_string())
+        );
+    }
+
+    #[test]
+    fn stddev_exact_endpoints() {
+        let equal = exact(2, &[500, 500, 500]);
+        assert_eq!(
+            text(equal.finish_stddev_decimal(VarianceKind::Samp).expect("ok")),
+            Some("0".to_string())
+        );
+        assert_eq!(
+            exact(0, &[])
+                .finish_stddev_decimal(VarianceKind::Pop)
+                .expect("ok"),
+            None
+        );
+        let one = exact(0, &[7]);
+        assert_eq!(
+            one.finish_stddev_decimal(VarianceKind::Samp).expect("ok"),
+            None
+        );
+        assert_eq!(
+            text(one.finish_stddev_decimal(VarianceKind::Pop).expect("ok")),
+            Some("0".to_string())
+        );
+    }
+
+    #[test]
+    fn stddev_float_matches_known_values() {
+        let mut s = VarianceFloat::new();
+        assert_eq!(s.finish_stddev_f64(VarianceKind::Pop).expect("ok"), None);
+        for v in [1.0, 2.0, 3.0, 4.0] {
+            s.observe(v).expect("observe");
+        }
+        let pop = s
+            .finish_stddev_f64(VarianceKind::Pop)
+            .expect("ok")
+            .expect("some");
+        assert!((pop - 1.118033988749895).abs() < 1e-12);
+        let samp = s
+            .finish_stddev_f64(VarianceKind::Samp)
+            .expect("ok")
+            .expect("some");
+        assert!((samp - 1.2909944487358056).abs() < 1e-12);
     }
 }
