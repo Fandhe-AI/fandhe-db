@@ -623,6 +623,62 @@ mod tests {
         assert_eq!(err.wire_code(), "54000");
     }
 
+    /// Issue #1830 の回帰: ON 残余（混在述語）で全候補が落ちて一致ペアが 0 件でも、キー一致の
+    /// 候補数が出力上限を超えたら `54000`（残余が上限検査を素通りしない）。
+    #[test]
+    fn on_residual_dropping_all_candidates_still_hits_output_row_limit() {
+        let path = unique_db_path("join-on-residual-candidate-cap");
+        let storage = Storage::open(&path).expect("open storage");
+        let _guard = CleanupGuard(path);
+        storage.create_table(&schema("l")).expect("create l");
+        storage.create_table(&schema("r")).expect("create r");
+        let ctx = PolicyContext::new("tenant-a").expect("valid tenant");
+        // 全行が同じ tag（結合キー）で 3x3=9 候補。l.id(10..) < r.id(0..) は常に偽。
+        for i in 0..3u64 {
+            insert_row(&storage, "l", &ctx, 10 + i, "k");
+            insert_row(&storage, "r", &ctx, i, "k");
+        }
+        let eq = |a: &str, b: &str, op| JoinWherePredicate::ColumnCompare {
+            lhs: ColumnRef::qualified(a, "tag"),
+            op,
+            rhs: ColumnRef::qualified(b, "tag"),
+        };
+        let mut validated = id_join("l", "r");
+        let mixed = JoinWherePredicate::ColumnCompare {
+            lhs: ColumnRef::qualified("l", "id"),
+            op: crate::sql::udf_call::BinOp::Lt,
+            rhs: ColumnRef::qualified("r", "id"),
+        };
+        if let Some(step) = validated.steps.first_mut() {
+            step.condition =
+                JoinCondition::On(vec![eq("l", "r", crate::sql::udf_call::BinOp::Eq), mixed]);
+        }
+        let read_txn = storage.db().begin_read().expect("begin_read");
+        let mut schemas = HashMap::new();
+        schemas.insert("l".to_string(), schema("l"));
+        schemas.insert("r".to_string(), schema("r"));
+        let udfs = UdfRegistry::default();
+
+        let ok = execute_with_limits(
+            &read_txn,
+            &ctx,
+            &schemas,
+            &validated,
+            &udfs,
+            &JoinLimits::default(),
+        )
+        .expect("residual drops every candidate under the default limit");
+        assert!(ok.rows.is_empty());
+
+        let limits = JoinLimits {
+            max_output_rows: 4,
+            ..JoinLimits::default()
+        };
+        let err = execute_with_limits(&read_txn, &ctx, &schemas, &validated, &udfs, &limits)
+            .expect_err("9 key-matched candidates must exceed the injected output row limit");
+        assert_eq!(err.wire_code(), "54000");
+    }
+
     /// PR #1105（`sql::set_op`）と同じ設計判断の回帰: 文全体（両辺の走査・
     /// ハッシュ表・出力行）で 1 つの累計バイト予算を共有すること。1 辺だけなら
     /// 収まるが両辺合計では超える上限を注入すると `54000` になることを確認する。
