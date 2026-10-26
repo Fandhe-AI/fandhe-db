@@ -710,7 +710,9 @@ pub(crate) fn check_aggregate_columns_within_view(
                 continue;
             }
             let known = effective_names.iter().any(|n| n == &key.target)
-                || columns.iter().any(|vc| vc == &key.target);
+                || columns.iter().any(|vc| vc == &key.target)
+                // Issue #1815: 素の集計呼び出しキーは内部名（引数の公開列検査は上の集計ループ済み）。
+                || crate::sql::allowlist::aggregate_placeholder_index(&key.target).is_some();
             if !known {
                 return Err(unknown(&key.target));
             }
