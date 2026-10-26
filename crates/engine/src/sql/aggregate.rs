@@ -48,6 +48,7 @@ use crate::catalog::{self, TableSchema};
 use crate::declarative_filter;
 use crate::policy::PolicyContext;
 use crate::row_codec;
+use crate::sql::aggregate_input::{eval_aggregate_input, AggregateRowValue, CountOnlyKind};
 use crate::sql::allowlist::{AggregateFunc, SqlSurfaceError};
 use crate::sql::exec::{Cell, ColumnMeta, QueryResult, ResultRow};
 use crate::sql::expr_program::StackValue;
@@ -1072,6 +1073,9 @@ impl Accumulator {
     /// 行ごとに異なるライフタイムを持つ呼び出し元（`embedding_scratch` を毎行
     /// `&mut` 上書きデコードする `execute_aggregate`）でも `scratch` を行ループの
     /// 外から使い回せる。`ScalarExpr` 以外の入力では参照されない。
+    ///
+    /// Issue #1808: 「行ごとの入力評価（[`eval_aggregate_input`]）→ 観測
+    /// （`observe_value`）」の 2 段構成。値の取り出しは評価ステージに集約している。
     pub(crate) fn observe(
         &mut self,
         input: &AggregateInput,
@@ -1107,314 +1111,40 @@ impl Accumulator {
                 )),
             };
         }
-        match input {
-            AggregateInput::StringAgg(_) => Err(accumulator_bug(
-                "string_agg input observed by a non-string_agg accumulator",
-            )),
-            AggregateInput::ArrayAgg(_) => Err(accumulator_bug(
-                "array_agg input observed by a non-array_agg accumulator",
-            )),
-            AggregateInput::AllVisible => self.observe_present(),
-            // nullable な `VECTOR` 列（TABLE-5 の `ALTER TABLE ADD COLUMN` で追加
-            // された列を含む）の裸の列参照。`row.embedding` が空 = 未設定（NULL）
-            // という `storage::Row` の既存契約に従い、NULL 行は数えない
-            // （PR #229 codex-review 指摘対応）。embedding 自体は不要なため
-            // `dim`（`storage::decode_row_dim_and_metadata_borrowed` 由来）だけで
-            // 判定する。
-            AggregateInput::VectorColumnPresence => {
-                if vector.dim == 0 {
-                    Ok(())
-                } else {
-                    self.observe_present()
-                }
-            }
-            AggregateInput::IdU64 => self.observe_id(id),
-            AggregateInput::TextColumn(index)
-            | AggregateInput::CollatedTextColumn { index, .. } => {
-                let value = scanned
-                    .get(*index)
-                    .copied()
-                    .flatten()
-                    .and_then(|v| v.as_text());
-                self.observe_text(value)
-            }
-            // BOOLEAN 列の裸参照は COUNT（非 NULL 行数）専用（`resolve_aggregate_input`
-            // が SUM/AVG/MIN/MAX を 42883（undefined_function）で拒否済み。Issue #883）。値の真偽は
-            // 問わず「NULL でない」ことだけを数える。
-            // `bool_and` / `bool_or` / `every`（SQL-57・Issue #1805）は同じ入力で真偽値を観測する。
-            AggregateInput::BooleanColumn(index) => {
-                let value = match scanned.get(*index).copied().flatten() {
-                    Some(row_codec::ScalarRef::Bool(b)) => Some(b),
-                    Some(_) => {
-                        return Err(accumulator_bug(
-                            "BooleanColumn observed a ScalarRef that is not Bool",
-                        ))
-                    }
-                    None => None,
-                };
-                self.observe_bool(value)
-            }
-            AggregateInput::BoolExpr { source, program } => {
-                let embedding: &[f32] = if udf_call::references_embedding(source) {
-                    match vector.values {
-                        Some(v) => v,
-                        None => {
-                            return Err(accumulator_bug(
-                                "BoolExpr references the VECTOR column but the row's embedding was not decoded",
-                            ))
-                        }
-                    }
-                } else {
-                    &[]
-                };
-                match program.eval(id, embedding, scanned, scratch)? {
-                    ExprValue::Bool(b) => self.observe_bool(Some(b)),
-                    // 比較の片側が NULL の行は集計対象外（3 値論理の UNKNOWN を無視する）。
-                    ExprValue::Null => Ok(()),
-                    _ => Err(accumulator_bug(
-                        "boolean-typed BoundExpr evaluated to a non-boolean value",
-                    )),
-                }
-            }
-            // `DATE`／`TIMESTAMP` 列の裸参照は `COUNT`・`MIN`/`MAX` を受理する
-            // （TABLE-13・TASK-197、Issue #884・#892）。`resolve_aggregate_input`
-            // が `SUM`/`AVG` を型不整合として既に拒否済みのため、`observe_date`/
-            // `observe_timestamp` が到達する `Accumulator` は `Count`／
-            // `DateMin`/`DateMax`（`TimestampMin`/`TimestampMax`）のいずれか。
-            AggregateInput::DateColumn(index) => {
-                let value = match scanned.get(*index).copied().flatten() {
-                    Some(v) => Some(v.as_date().ok_or_else(|| {
-                        accumulator_bug("DateColumn observed a ScalarRef that is not Date")
-                    })?),
-                    None => None,
-                };
-                self.observe_date(value)
-            }
-            AggregateInput::TimestampColumn(index) => {
-                let value = match scanned.get(*index).copied().flatten() {
-                    Some(v) => Some(v.as_timestamp().ok_or_else(|| {
-                        accumulator_bug(
-                            "TimestampColumn observed a ScalarRef that is not Timestamp",
-                        )
-                    })?),
-                    None => None,
-                };
-                self.observe_timestamp(value)
-            }
-            // `TIME` 列は `COUNT`・`MIN`/`MAX` のみ（`SUM`/`AVG` は構文段で 42883。
-            // Issue #1570）。
-            AggregateInput::TimeColumn(index) => {
-                let value = match scanned.get(*index).copied().flatten() {
-                    Some(v) => Some(v.as_time().ok_or_else(|| {
-                        accumulator_bug("TimeColumn observed a ScalarRef that is not Time")
-                    })?),
-                    None => None,
-                };
-                self.observe_time(value)
-            }
-            // `INTERVAL` 列は `COUNT`・`MIN`/`MAX`・`SUM`/`AVG`（Issue #1580）。
-            AggregateInput::IntervalColumn(index) => {
-                let value = match scanned.get(*index).copied().flatten() {
-                    Some(v) => Some(v.as_interval().ok_or_else(|| {
-                        accumulator_bug("IntervalColumn observed a ScalarRef that is not Interval")
-                    })?),
-                    None => None,
-                };
-                self.observe_interval(value)
-            }
-            // `TIMESTAMPTZ` 列は `COUNT`・`MIN`/`MAX` のみ（`SUM`/`AVG` は構文段で 42883。
-            // Issue #1576）。比較は UTC の時点で行う。
-            AggregateInput::TimestampTzColumn(index) => {
-                let value = match scanned.get(*index).copied().flatten() {
-                    Some(v) => Some(v.as_timestamptz().ok_or_else(|| {
-                        accumulator_bug(
-                            "TimestampTzColumn observed a ScalarRef that is not TimestampTz",
-                        )
-                    })?),
-                    None => None,
-                };
-                self.observe_timestamptz(value)
-            }
-            // `INTEGER`／`BIGINT` 列は `COUNT`/`SUM`/`AVG`/`MIN`/`MAX` の
-            // すべてを受理する（TABLE-13・TASK-196、Issue #881・#892）。`SUM`/
-            // `AVG` は `i128` で累積し、確定時（`finish`）に `i64` 範囲を
-            // 検査する（D2）。
-            AggregateInput::IntegerColumn(index) | AggregateInput::SmallIntColumn(index) => {
-                let value = match scanned.get(*index).copied().flatten() {
-                    Some(row_codec::ScalarRef::Integer(v)) => Some(i64::from(v)),
-                    Some(_) => {
-                        return Err(accumulator_bug(
-                            "IntegerColumn observed a ScalarRef that is not Integer",
-                        ))
-                    }
-                    None => None,
-                };
-                self.observe_int(value)
-            }
-            AggregateInput::BigIntColumn(index) => {
-                let value = match scanned.get(*index).copied().flatten() {
-                    Some(row_codec::ScalarRef::BigInt(v)) => Some(v),
-                    Some(_) => {
-                        return Err(accumulator_bug(
-                            "BigIntColumn observed a ScalarRef that is not BigInt",
-                        ))
-                    }
-                    None => None,
-                };
-                self.observe_int(value)
-            }
-            // `REAL`／`DOUBLE PRECISION` 列も `COUNT`/`SUM`/`AVG`/`MIN`/`MAX`
-            // のすべてを受理する（Issue #892・D4）。既存の `ScalarExpr` と同じ
-            // `f64` 累積アキュムレータへ観測する（`observe_float` は
-            // `is_finite()` 検査込みで累積・非有限化は `22003`）。
-            AggregateInput::RealColumn(index) => {
-                let value = match scanned.get(*index).copied().flatten() {
-                    Some(row_codec::ScalarRef::Real(v)) => Some(f64::from(v)),
-                    Some(_) => {
-                        return Err(accumulator_bug(
-                            "RealColumn observed a ScalarRef that is not Real",
-                        ))
-                    }
-                    None => None,
-                };
-                match value {
-                    Some(v) => self.observe_float(v),
-                    None => Ok(()),
-                }
-            }
-            AggregateInput::DoubleColumn(index) => {
-                let value = match scanned.get(*index).copied().flatten() {
-                    Some(row_codec::ScalarRef::Double(v)) => Some(v),
-                    Some(_) => {
-                        return Err(accumulator_bug(
-                            "DoubleColumn observed a ScalarRef that is not Double",
-                        ))
-                    }
-                    None => None,
-                };
-                match value {
-                    Some(v) => self.observe_float(v),
-                    None => Ok(()),
-                }
-            }
-            // ARRAY 列の裸参照も BOOLEAN と同じく COUNT（非 NULL 行数）専用
-            // （TABLE-14・Issue #888・D-A8）。要素の中身は問わず、列自体が
-            // NULL でないことだけを数える。
-            AggregateInput::ArrayColumn(index) => {
-                if scanned.get(*index).copied().flatten().is_some() {
-                    self.observe_present()
-                } else {
-                    Ok(())
-                }
-            }
-            // BYTEA 列の裸参照も COUNT（非 NULL 行数）専用（`resolve_aggregate_input`
-            // が SUM/AVG/MIN/MAX を 42883（undefined_function）で拒否済み。Issue #886）。
-            AggregateInput::ByteaColumn(index) => {
-                if scanned.get(*index).copied().flatten().is_some() {
-                    self.observe_present()
-                } else {
-                    Ok(())
-                }
-            }
-            // JSON／JSONB 列の裸参照も COUNT（非 NULL 行数）専用
-            // （`resolve_aggregate_input` が SUM/AVG/MIN/MAX を 42883 で
-            // 拒否済み。TABLE-14・Issue #889）。
-            AggregateInput::JsonColumn(index) => {
-                if scanned.get(*index).copied().flatten().is_some() {
-                    self.observe_present()
-                } else {
-                    Ok(())
-                }
-            }
-            // ENUM 列の裸参照も COUNT（非 NULL 行数）専用（`resolve_aggregate_input`
-            // が SUM/AVG/MIN/MAX を 42883（undefined_function）で拒否済み。TABLE-14・TASK-198、
-            // Issue #890）。
-            AggregateInput::EnumColumn(index) => {
-                if scanned.get(*index).copied().flatten().is_some() {
-                    self.observe_present()
-                } else {
-                    Ok(())
-                }
-            }
-            // `NUMERIC(p, s)` 列は `COUNT`/`SUM`/`AVG`/`MIN`/`MAX` のすべてを
-            // 受理する（TABLE-13〔検討中〕・TASK-197、Issue #885・#892）。
-            // 格納された `Decimal` の scale は常に列の scale と一致する契約
-            // （`row_codec`/`catalog` の TABLE-13 検証）のため、不一致は
-            // デコード側の実装バグとして fail-closed に拒否する。
-            AggregateInput::NumericColumn { index, scale, .. } => {
-                let value = match scanned.get(*index).copied().flatten() {
-                    Some(row_codec::ScalarRef::Numeric(d)) => {
-                        if d.scale() != *scale {
-                            return Err(accumulator_bug(
-                                "NumericColumn observed a Decimal whose scale does not match the column",
-                            ));
-                        }
-                        Some(d.unscaled())
-                    }
-                    Some(_) => {
-                        return Err(accumulator_bug(
-                            "NumericColumn observed a ScalarRef that is not Numeric",
-                        ))
-                    }
-                    None => None,
-                };
-                self.observe_numeric(value)
-            }
-            // UUID 列の裸参照も COUNT（非 NULL 行数）専用（`resolve_aggregate_input`
-            // が SUM/AVG/MIN/MAX を 42883（undefined_function）で拒否済み。TABLE-13〔検討中〕・
-            // TASK-197、Issue #887）。
-            AggregateInput::UuidColumn(index) => {
-                if scanned.get(*index).copied().flatten().is_some() {
-                    self.observe_present()
-                } else {
-                    Ok(())
-                }
-            }
-            AggregateInput::ScalarExpr { source, program } => {
-                // 式木が実際に embedding へ到達する場合のみ `vector.values` を
-                // 要求する（`references_embedding` は `ReferencedColumns::derive`
-                // が `needs_embedding` を立てる際と同じ判定関数。式木に
-                // `VectorRef` が無ければ `eval` は embedding を一切参照しないため
-                // 空スライスで安全に評価できる）。`None` に到達したら
-                // `ReferencedColumns` の導出漏れという実装バグとして fail-closed
-                // に拒否する（黙って空 embedding へ縮退しない）。
-                let embedding: &[f32] = if udf_call::references_embedding(source) {
-                    match vector.values {
-                        Some(v) => v,
-                        None => {
-                            return Err(accumulator_bug(
-                                "ScalarExpr references the VECTOR column but the row's embedding was not decoded",
-                            ))
-                        }
-                    }
-                } else {
-                    &[]
-                };
-                // Issue #919・SQL-26: 集計関数引数（`ScalarExpr`）の返り値は
-                // `ExprType::Scalar` に限定されるが、その部分式は `TEXT` 列を
-                // 参照しうる（例: `SUM(LENGTH(text_col))`）。`ReferencedColumns::derive`
-                // が `source` の `TextColumnRef` を `scalar_mask` へ反映済みのため、
-                // `scanned` をそのまま `.as_text()` へ写せばよい（`sql::scan` の
-                // `WHERE` 評価と同じ契約）。
-                match program.eval(id, embedding, scanned, scratch)? {
-                    ExprValue::Scalar(v) => self.observe_float(v),
-                    // NULL は集計対象から除外する（Issue #919・SQL-26 の
-                    // `TEXT` 列参照〔例: `SUM(LENGTH(text_col))`〕と Issue #921・
-                    // SQL-26 の `CASE`／`COALESCE`／`NULLIF` の共有契約）。他の
-                    // 列型（`RealColumn` 等）の `None` と同じ「その行を観測対象
-                    // から除外する」扱いに揃え、`SUM`/`AVG`/`MIN`/`MAX` の
-                    // NULL 無視規則（PostgreSQL 互換）を満たす。`COUNT(expr)` は
-                    // `observe_float` が共有する `Count` 腕が非 NULL のみを
-                    // 数える契約に自然に合流する。
-                    ExprValue::Null => Ok(()),
-                    // `resolve_aggregate_input` が `ExprType::Scalar` のみを
-                    // `ScalarExpr` として束縛するため到達しない（束縛段の型検査と
-                    // 評価結果の型が食い違う実装バグの検出用）。
-                    _ => Err(accumulator_bug(
-                        "scalar-typed BoundExpr evaluated to a non-scalar value",
-                    )),
-                }
-            }
+        let value = eval_aggregate_input(input, id, vector, scanned, scratch)?;
+        self.observe_value(value)
+    }
+
+    /// 評価済みの行値をアキュムレータの入口（`observe_*`）へ振り分ける
+    /// （Issue #1808。評価は [`eval_aggregate_input`]）。NULL は集計対象外。
+    fn observe_value(&mut self, value: AggregateRowValue<'_>) -> Result<(), SqlSurfaceError> {
+        match value {
+            AggregateRowValue::Null => Ok(()),
+            AggregateRowValue::Present => self.observe_present(),
+            // BOOLEAN 列の裸参照は真偽値を観測する（`COUNT` は非 NULL を数え、
+            // `bool_and`／`bool_or`／`every` は畳み込む。SQL-57・Issue #1805）。
+            AggregateRowValue::CountOnly {
+                kind: CountOnlyKind::Bool,
+                value,
+            } => match value {
+                row_codec::ScalarRef::Bool(b) => self.observe_bool(Some(b)),
+                _ => Err(accumulator_bug(
+                    "BooleanColumn observed a ScalarRef that is not Bool",
+                )),
+            },
+            AggregateRowValue::CountOnly { .. } => self.observe_present(),
+            AggregateRowValue::Bool(b) => self.observe_bool(Some(b)),
+            AggregateRowValue::Id(id) => self.observe_id(id),
+            AggregateRowValue::Text(s) => self.observe_text(Some(s)),
+            AggregateRowValue::Int32(v) => self.observe_int(Some(i64::from(v))),
+            AggregateRowValue::Int64(v) => self.observe_int(Some(v)),
+            AggregateRowValue::Float(v) => self.observe_float(v),
+            AggregateRowValue::Numeric(v) => self.observe_numeric(Some(v)),
+            AggregateRowValue::Date(v) => self.observe_date(Some(v)),
+            AggregateRowValue::Timestamp(v) => self.observe_timestamp(Some(v)),
+            AggregateRowValue::Time(v) => self.observe_time(Some(v)),
+            AggregateRowValue::TimestampTz(v) => self.observe_timestamptz(Some(v)),
+            AggregateRowValue::Interval(v) => self.observe_interval(Some(v)),
         }
     }
 
@@ -1433,232 +1163,24 @@ impl Accumulator {
         scanned: &[Option<row_codec::ScalarRef<'_>>],
         scratch: &mut Vec<StackValue>,
     ) -> Result<(), SqlSurfaceError> {
-        let key: Option<Vec<u8>> = match input {
-            AggregateInput::IdU64 => Some(id.to_be_bytes().to_vec()),
-            AggregateInput::TextColumn(index)
-            | AggregateInput::CollatedTextColumn { index, .. } => scanned
-                .get(*index)
-                .copied()
-                .flatten()
-                .and_then(|v| v.as_text())
-                .map(|s| s.as_bytes().to_vec()),
-            AggregateInput::IntegerColumn(index) | AggregateInput::SmallIntColumn(index) => match scanned.get(*index).copied().flatten() {
-                Some(row_codec::ScalarRef::Integer(v)) => Some(v.to_be_bytes().to_vec()),
-                Some(_) => {
-                    return Err(accumulator_bug(
-                        "IntegerColumn observed a ScalarRef that is not Integer (distinct)",
-                    ))
-                }
-                None => None,
-            },
-            AggregateInput::BigIntColumn(index) => match scanned.get(*index).copied().flatten() {
-                Some(row_codec::ScalarRef::BigInt(v)) => Some(v.to_be_bytes().to_vec()),
-                Some(_) => {
-                    return Err(accumulator_bug(
-                        "BigIntColumn observed a ScalarRef that is not BigInt (distinct)",
-                    ))
-                }
-                None => None,
-            },
-            AggregateInput::RealColumn(index) => match scanned.get(*index).copied().flatten() {
-                Some(row_codec::ScalarRef::Real(v)) => {
-                    Some(crate::sql::distinct::canon_f64(f64::from(v)).to_vec())
-                }
-                Some(_) => {
-                    return Err(accumulator_bug(
-                        "RealColumn observed a ScalarRef that is not Real (distinct)",
-                    ))
-                }
-                None => None,
-            },
-            AggregateInput::DoubleColumn(index) => match scanned.get(*index).copied().flatten() {
-                Some(row_codec::ScalarRef::Double(v)) => {
-                    Some(crate::sql::distinct::canon_f64(v).to_vec())
-                }
-                Some(_) => {
-                    return Err(accumulator_bug(
-                        "DoubleColumn observed a ScalarRef that is not Double (distinct)",
-                    ))
-                }
-                None => None,
-            },
-            AggregateInput::BooleanColumn(index) => match scanned.get(*index).copied().flatten() {
-                Some(row_codec::ScalarRef::Bool(b)) => Some(vec![u8::from(b)]),
-                Some(_) => {
-                    return Err(accumulator_bug(
-                        "BooleanColumn observed a ScalarRef that is not Bool (distinct)",
-                    ))
-                }
-                None => None,
-            },
-            AggregateInput::DateColumn(index) => match scanned.get(*index).copied().flatten() {
-                Some(v) => Some(
-                    v.as_date()
-                        .ok_or_else(|| {
-                            accumulator_bug(
-                                "DateColumn observed a ScalarRef that is not Date (distinct)",
-                            )
-                        })?
-                        .to_be_bytes()
-                        .to_vec(),
-                ),
-                None => None,
-            },
-            AggregateInput::TimestampColumn(index) => match scanned.get(*index).copied().flatten()
-            {
-                Some(v) => Some(
-                    v.as_timestamp()
-                        .ok_or_else(|| {
-                            accumulator_bug(
-                                "TimestampColumn observed a ScalarRef that is not Timestamp (distinct)",
-                            )
-                        })?
-                        .to_be_bytes()
-                        .to_vec(),
-                ),
-                None => None,
-            },
-            AggregateInput::TimestampTzColumn(index) => {
-                match scanned.get(*index).copied().flatten() {
-                    Some(v) => Some(
-                        v.as_timestamptz()
-                            .ok_or_else(|| {
-                                accumulator_bug(
-                                    "TimestampTzColumn observed a ScalarRef that is not TimestampTz (distinct)",
-                                )
-                            })?
-                            .to_be_bytes()
-                            .to_vec(),
-                    ),
-                    None => None,
-                }
-            }
-            // 正規化キー（16 バイト）で重複を除く。`1 mon` と `30 days` は同じキー（Issue #1580）。
-            AggregateInput::IntervalColumn(index) => match scanned.get(*index).copied().flatten() {
-                Some(v) => Some(
-                    crate::datetime::interval_cmp_key(&v.as_interval().ok_or_else(|| {
-                        accumulator_bug(
-                            "IntervalColumn observed a ScalarRef that is not Interval (distinct)",
-                        )
-                    })?)
-                    .to_be_bytes()
-                    .to_vec(),
-                ),
-                None => None,
-            },
-            AggregateInput::TimeColumn(index) => match scanned.get(*index).copied().flatten() {
-                Some(v) => Some(
-                    v.as_time()
-                        .ok_or_else(|| {
-                            accumulator_bug(
-                                "TimeColumn observed a ScalarRef that is not Time (distinct)",
-                            )
-                        })?
-                        .to_be_bytes()
-                        .to_vec(),
-                ),
-                None => None,
-            },
-            AggregateInput::ByteaColumn(index) => match scanned.get(*index).copied().flatten() {
-                Some(row_codec::ScalarRef::Bytes(b)) => Some(b.to_vec()),
-                Some(_) => {
-                    return Err(accumulator_bug(
-                        "ByteaColumn observed a ScalarRef that is not Bytes (distinct)",
-                    ))
-                }
-                None => None,
-            },
-            AggregateInput::EnumColumn(index) => match scanned.get(*index).copied().flatten() {
-                Some(row_codec::ScalarRef::Enum(s)) => Some(s.as_bytes().to_vec()),
-                Some(_) => {
-                    return Err(accumulator_bug(
-                        "EnumColumn observed a ScalarRef that is not Enum (distinct)",
-                    ))
-                }
-                None => None,
-            },
-            AggregateInput::UuidColumn(index) => match scanned.get(*index).copied().flatten() {
-                Some(row_codec::ScalarRef::Uuid(u)) => Some(u.as_bytes().to_vec()),
-                Some(_) => {
-                    return Err(accumulator_bug(
-                        "UuidColumn observed a ScalarRef that is not Uuid (distinct)",
-                    ))
-                }
-                None => None,
-            },
-            AggregateInput::NumericColumn { index, scale, .. } => {
-                match scanned.get(*index).copied().flatten() {
-                    Some(row_codec::ScalarRef::Numeric(d)) => {
-                        if d.scale() != *scale {
-                            return Err(accumulator_bug(
-                                "NumericColumn observed a Decimal whose scale does not match the column (distinct)",
-                            ));
-                        }
-                        Some(d.unscaled().to_be_bytes().to_vec())
-                    }
-                    Some(_) => {
-                        return Err(accumulator_bug(
-                            "NumericColumn observed a ScalarRef that is not Numeric (distinct)",
-                        ))
-                    }
-                    None => None,
-                }
-            }
-            AggregateInput::ScalarExpr { source, program } => {
-                let embedding: &[f32] = if udf_call::references_embedding(source) {
-                    match vector.values {
-                        Some(v) => v,
-                        None => {
-                            return Err(accumulator_bug(
-                                "ScalarExpr references the VECTOR column but the row's embedding was not decoded (distinct)",
-                            ))
-                        }
-                    }
-                } else {
-                    &[]
-                };
-                // Issue #919・SQL-26: `COUNT(DISTINCT <expr>)` の `expr` も
-                // 部分式が `TEXT` 列を参照しうる（例:
-                // `COUNT(DISTINCT LENGTH(text_col))`。非 distinct 経路と同じ
-                // `ReferencedColumns::derive` を共有するため `scalar_mask` は
-                // 反映済み）。`scanned` をそのまま `.as_text()` へ写す。
-                match program.eval(id, embedding, scanned, scratch)? {
-                    ExprValue::Scalar(v) => Some(crate::sql::distinct::canon_f64(v).to_vec()),
-                    // NULL は COUNT(DISTINCT expr) の対象から除外する（Issue
-                    // #919・SQL-26 の `TEXT` 列参照の NULL 伝播、AC2）と Issue
-                    // #921・SQL-26 の `CASE`／`COALESCE`／`NULLIF` の共有契約）。
-                    // 非 distinct 経路〔本ファイル `ScalarExpr` 分岐の
-                    // `ExprValue::Null => Ok(())`〕と同じ「NULL は集計対象外」
-                    // 契約を distinct 側でも成立させる。他列型（`*Column`）の
-                    // `None` 分岐と同様、この `None` は「この行は distinct 集合へ
-                    // 加えない」を表し、内部バグとしては扱わない
-                    // （`COUNT(DISTINCT NULLIF(...))` のように NULL を返す式で
-                    // 誤って内部エラーにしない）。
-                    ExprValue::Null => None,
-                    _ => {
-                        return Err(accumulator_bug(
-                            "scalar-typed BoundExpr evaluated to a non-scalar value (distinct)",
-                        ))
-                    }
-                }
-            }
-            // `resolve_count_distinct_input` は `AllVisible`／
-            // `VectorColumnPresence`／`ArrayColumn`／`JsonColumn` をいずれも
-            // 生成しない（`VECTOR`／`ARRAY`／`JSON` 列は `22000` で束縛段階で
-            // 拒否し、`COUNT(DISTINCT *)` は構文段階で `42601` で拒否済み）。
-            // 到達したら束縛層の実装バグ。
+        // `resolve_count_distinct_input` は `AllVisible`／`VectorColumnPresence`／
+        // `ArrayColumn`／`JsonColumn` を生成しない。到達したら束縛層の実装バグ。
+        // 値が NULL の行でも拒否するため、評価の前に入力の種別で検査する。
+        if matches!(
+            input,
             AggregateInput::AllVisible
-            | AggregateInput::VectorColumnPresence
-            | AggregateInput::ArrayColumn(_)
-            | AggregateInput::JsonColumn(_)
-            | AggregateInput::StringAgg(_)
-            | AggregateInput::ArrayAgg(_)
-            | AggregateInput::BoolExpr { .. } => {
-                return Err(accumulator_bug(
-                    "COUNT(DISTINCT) accumulator observed an input type that bind-time resolution should have rejected",
-                ))
-            }
-        };
+                | AggregateInput::VectorColumnPresence
+                | AggregateInput::ArrayColumn(_)
+                | AggregateInput::JsonColumn(_)
+                | AggregateInput::StringAgg(_)
+                | AggregateInput::ArrayAgg(_)
+                | AggregateInput::BoolExpr { .. }
+        ) {
+            return Err(accumulator_bug(
+                "COUNT(DISTINCT) accumulator observed an input type that bind-time resolution should have rejected",
+            ));
+        }
+        let key = eval_aggregate_input(input, id, vector, scanned, scratch)?.distinct_key()?;
 
         let (seen, bytes) = match self {
             Accumulator::CountDistinct { seen, bytes } => (seen, bytes),
