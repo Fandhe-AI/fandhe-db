@@ -8270,6 +8270,16 @@ pub(crate) fn bind_aggregate_with_dummy_flags(
                 }
                 let mut hidden = Vec::with_capacity(aggregates.len());
                 for agg in aggregates {
+                    // Issue #1811・SQL-42 ポインタ: 既存の項目（可視項目・先に積んだ隠し項目）と
+                    // 同じ呼び出しはアキュムレータを共有する（`HAVING` の Issue #1814 と同方式。
+                    // `same_aggregate_call` は FILTER まで比較するため別条件の値は混ざらない）。
+                    if let Some(existing) = item_asts
+                        .iter()
+                        .position(|known| same_aggregate_call(known, agg))
+                    {
+                        hidden.push(existing);
+                        continue;
+                    }
                     let input = resolve_aggregate_item_input(agg, schema, udfs, &mut node_budget)?;
                     let filter =
                         bind_aggregate_filter(&agg.filter, schema, udfs, &mut node_budget)?;
@@ -8455,12 +8465,20 @@ fn bind_aggregate_projection_expr(
 > {
     let resolve = |name: &str| -> Result<OrderTarget, SqlSurfaceError> {
         if let Some(j) = crate::sql::allowlist::aggregate_placeholder_index(name) {
-            return hidden_items
-                .get(j)
-                .map(|idx| OrderTarget::Aggregate(*idx))
-                .ok_or_else(|| {
-                    crate::sql::aggregate::accumulator_bug("aggregate placeholder out of range")
+            let idx = *hidden_items.get(j).ok_or_else(|| {
+                crate::sql::aggregate::accumulator_bug("aggregate placeholder out of range")
+            })?;
+            // Issue #1811: `array_agg` の結果は式の被演算子にできない（`HAVING`／`ORDER BY` と同じく
+            // 配列結果の行ビュー列を持たないため、成功させず fail-closed で拒否する）。
+            if items
+                .get(idx)
+                .is_some_and(|it| it.func == crate::sql::allowlist::AggregateFunc::ArrayAgg)
+            {
+                return Err(SqlSurfaceError::FeatureNotSupported {
+                    detail: "array_agg result cannot be used inside an expression".to_string(),
                 });
+            }
+            return Ok(OrderTarget::Aggregate(idx));
         }
         group_by_columns
             .iter()

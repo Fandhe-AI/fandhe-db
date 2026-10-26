@@ -6519,6 +6519,19 @@ impl<'a> Parser<'a> {
         } else {
             None
         };
+        // Issue #1811: 括弧だけで包んだ単独の集計呼び出し（`(sum(n))`）は素の集計項目と同じ。
+        // 既定列名・HAVING／ORDER BY の名前解決を PostgreSQL と同じく関数名のままにする。
+        if let Expr::Ident(name) = &expr {
+            if aggregates.len() == 1 && aggregate_placeholder_index(name) == Some(0) {
+                if let Some(mut only) = aggregates.into_iter().next() {
+                    only.alias = alias;
+                    return Ok(AggregateSelectItem::Aggregate(only));
+                }
+                return Err(SqlSurfaceError::unsupported(
+                    "aggregate call is not allowed here",
+                ));
+            }
+        }
         Ok(AggregateSelectItem::Expr {
             expr,
             aggregates,
@@ -6544,6 +6557,41 @@ impl<'a> Parser<'a> {
                 self.parse_json_access_rest(add, 0)
             }
             None => self.parse_value_expr(0),
+        }
+    }
+
+    /// 現在位置が、集計 SELECT リストで式項目として読み始めてよい形かを返す（Issue #1811・
+    /// SQL-42 ポインタ）。トリガー集合は通常投影の [`Self::parse_select_item`] に合わせる
+    /// （数値・`(`〔スカラーサブクエリを除く〕・`-`・`CASE WHEN`・`ARRAY[`/`ARRAY(`・括弧なし値関数・
+    /// `ident (`・識別子の直後の演算子・文字列リテラルの直後の `::`）。集計呼び出しを含むかは
+    /// 呼び出し側が [`select_range_contains_aggregate_call`] で別に確認する。
+    fn aggregate_item_starts_expr(&self) -> bool {
+        match self.peek() {
+            Some(Token::Number(_)) | Some(Token::Punct('-')) => true,
+            Some(Token::Punct('(')) => !self.peek_is_scalar_subquery_start(),
+            Some(Token::StringLiteral(_)) => {
+                matches!(self.tokens.get(self.pos + 1), Some(Token::TypeCast))
+            }
+            Some(Token::Ident(name)) => {
+                let next = self.tokens.get(self.pos + 1);
+                (name.eq_ignore_ascii_case("CASE") && self.peek_ident_matches_at(1, "WHEN"))
+                    || (name.eq_ignore_ascii_case("ARRAY")
+                        && !self.quoted_null.contains(&self.pos)
+                        && matches!(next, Some(Token::Punct('[' | '('))))
+                    || self.is_value_function_keyword_at(self.pos)
+                    || matches!(next, Some(Token::Punct('(')))
+                    || next.is_some_and(|t| {
+                        matches!(t, Token::Punct('+' | '-' | '*' | '/' | '['))
+                            || matches!(t, Token::TypeCast)
+                            || is_json_operator_token(t)
+                    })
+                    || self.peek_ident_matches_at(1, "COLLATE")
+                    || (self.peek_ident_matches_at(1, "AT")
+                        && (self.peek_ident_matches_at(2, "LOCAL")
+                            || (self.peek_ident_matches_at(2, "TIME")
+                                && self.peek_ident_matches_at(3, "ZONE"))))
+            }
+            _ => false,
         }
     }
 
@@ -6576,6 +6624,8 @@ impl<'a> Parser<'a> {
         false
     }
 
+    /// Issue #1811・SQL-42 ポインタ: トップレベル文では、項目の途中に集計呼び出しを含む式
+    /// （`coalesce(sum(n), 0)`・`1 + count(*)` 等）も式項目として読む（以下の 2 形に加えた拡張）。
     /// 集計 SELECT リストの 1 項目（TASK-167・SQL-14 で拡張）。次のトークンが
     /// 集計関数名 `'('` なら従来どおり集計項目（[`Parser::parse_aggregate_item`]）、
     /// それ以外は `GROUP BY` 列と同名の裸の識別子（任意で `AS <alias>`）として
@@ -6595,7 +6645,15 @@ impl<'a> Parser<'a> {
                 // 従来の集計項目（AST・既定列名は不変）。
                 let name = self.expect_ident()?;
                 let mut head = self.parse_aggregate_call_after_name(&name)?;
-                if matches!(self.peek(), Some(Token::Punct('+' | '-' | '*' | '/'))) {
+                // Issue #1811: 後続が `parse_select_item` の関数始まりと同じ継続（`::`・json 演算子・
+                // `COLLATE`・`AT TIME ZONE`）でも式モードで読む。
+                if self.peek_ident_matches("COLLATE")
+                    || self.peek_at_time_zone()
+                    || self.peek().is_some_and(|t| {
+                        matches!(t, Token::Punct('+' | '-' | '*' | '/') | Token::TypeCast)
+                            || is_json_operator_token(t)
+                    })
+                {
                     return self.parse_aggregate_expr_item(Some(head));
                 }
                 head.alias = if self.peek_ident_matches("AS") {
@@ -6605,6 +6663,15 @@ impl<'a> Parser<'a> {
                     None
                 };
                 return Ok(AggregateSelectItem::Aggregate(head));
+            }
+            // Issue #1811・SQL-42 ポインタ: 項目の途中に集計呼び出しを含み、`parse_select_item` と
+            // 同じ式トリガーで始まる形（`coalesce(sum(n), 0)`・`CASE WHEN count(*) > 1 ...`・
+            // `upper(max(g))`）は式モードで読む。集計を含まない裸識別子・式は従来どおり。
+            if self.allow_aggregate_expr_items
+                && self.aggregate_item_starts_expr()
+                && select_range_contains_aggregate_call(&self.tokens, self.pos, true)
+            {
+                return self.parse_aggregate_expr_item(None);
             }
             // `CAST(<集計を含む式> AS <型>)`（Issue #1592）。集計呼び出しの内側ではなく項目の
             // 先頭が CAST の場合も式モードで読み、結果型（bytea・配列等）は集計後の投影として束縛する。
@@ -6625,6 +6692,14 @@ impl<'a> Parser<'a> {
             {
                 return self.parse_aggregate_expr_item(None);
             }
+        }
+        // Issue #1811: 識別子以外で始まる式（数値・`(`・`-`・文字列リテラル `::`）。
+        if self.allow_aggregate_expr_items
+            && !matches!(self.peek(), Some(Token::Ident(_)))
+            && self.aggregate_item_starts_expr()
+            && select_range_contains_aggregate_call(&self.tokens, self.pos, true)
+        {
+            return self.parse_aggregate_expr_item(None);
         }
         let column = self.expect_ident()?;
         let alias = if self.peek_ident_matches("AS") {
@@ -20829,6 +20904,62 @@ fn validate_sql_tokens_impl(
     }
 }
 
+/// `tokens[start..]` の SELECT リスト（括弧の深さ 0 の `FROM` 手前まで。`item_only` が真なら
+/// 深さ 0 の `,`・`AS` の手前まで＝ 1 項目）に集計関数呼び出し（集計関数名の直後が `(`）が
+/// あるかを返す（Issue #1811・SQL-42 ポインタ）。スカラーサブクエリ・`EXISTS (SELECT ...)` 等の
+/// `( SELECT` で始まる括弧は丸ごと読み飛ばす（内側の集計は外側の集計形の目印にならない）。
+/// 呼び出し元は `validate_select_statement` の文の振り分けと
+/// [`Parser::parse_aggregate_select_item`] の項目単位の先読み。トークン数に比例し確保しない。
+fn select_range_contains_aggregate_call(tokens: &[Token], start: usize, item_only: bool) -> bool {
+    let mut depth = 0usize;
+    let mut i = start;
+    while let Some(t) = tokens.get(i) {
+        match t {
+            Token::Punct('(') => {
+                if matches!(
+                    tokens.get(i.saturating_add(1)),
+                    Some(Token::Keyword(Keyword::Select))
+                ) {
+                    // 対応する `)` まで読み飛ばす。
+                    let mut d = 1usize;
+                    i = i.saturating_add(1);
+                    while let Some(u) = tokens.get(i) {
+                        match u {
+                            Token::Punct('(') => d = d.saturating_add(1),
+                            Token::Punct(')') => {
+                                d = d.saturating_sub(1);
+                                if d == 0 {
+                                    break;
+                                }
+                            }
+                            _ => {}
+                        }
+                        i = i.saturating_add(1);
+                    }
+                } else {
+                    depth = depth.saturating_add(1);
+                }
+            }
+            Token::Punct(')') => depth = depth.saturating_sub(1),
+            Token::Keyword(Keyword::From) if depth == 0 => return false,
+            Token::Punct(',') if depth == 0 && item_only => return false,
+            Token::Ident(name) => {
+                if depth == 0 && item_only && name.eq_ignore_ascii_case("AS") {
+                    return false;
+                }
+                if is_aggregate_function_name(name)
+                    && matches!(tokens.get(i.saturating_add(1)), Some(Token::Punct('(')))
+                {
+                    return true;
+                }
+            }
+            _ => {}
+        }
+        i = i.saturating_add(1);
+    }
+    false
+}
+
 /// 通常 SELECT・集計 SELECT（`GROUP BY` の有無いずれも）・`SELECT DISTINCT`
 /// の脱糖形・広域取得（ビュー展開後の形を含む）の共有振り分け（TASK-166・
 /// SQL-13／TASK-167・SQL-14／SQL-25 (c)・TASK-209／Issue #454 の先読み判定と
@@ -20909,11 +21040,17 @@ fn validate_select_statement(
     });
     // Issue #1819・SQL-58 (4): 括弧の深さ 0 の句としての `HAVING`（`GROUP BY` なし）も集計形の目印。
     let contains_having_clause = has_top_level_having_clause(tokens);
+    // Issue #1811・SQL-42 ポインタ: トップレベル文に限り、SELECT リストのどこかに集計呼び出しを
+    // 含む形（`coalesce(sum(n), 0)`・`1 + count(*)` 等）も集計形へ振り分ける。サブクエリ・CTE 主
+    // クエリ・集合演算の枝は式項目を受理しない文脈のため従来の判定のまま。
+    let list_has_aggregate_call = subquery_ctx.is_none_or(|d| d == 0)
+        && select_range_contains_aggregate_call(tokens, 1, false);
     let is_aggregate_select = !contains_window_over
         && ((matches!(tokens.get(1), Some(Token::Ident(name)) if is_aggregate_function_name(name))
             && matches!(tokens.get(2), Some(Token::Punct('('))))
             || contains_group_by
-            || contains_having_clause);
+            || contains_having_clause
+            || list_has_aggregate_call);
     // SQL-30・TASK-214: ウィンドウ項目は `GROUP BY`・集計 SELECT・`SELECT DISTINCT`
     // のいずれとも併用しない（§計画 2「対象外」）。`is_aggregate_select` の判定
     // から除外しただけでは `contains_group_by` 単独の形（`SELECT ... OVER (...)
