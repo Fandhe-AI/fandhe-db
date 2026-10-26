@@ -175,3 +175,4 @@ PostgreSQL と同じ意味論に従ってテスト内で手計算した値に固
 - JOIN 経路の性能計測（#1204）
 
 `CROSS JOIN` は Issue #1831 で受理対象になった（[inner-join.md](inner-join.md) の「Issue #1831 追記」参照）。
+カンマ区切りの FROM（`FROM a, b`）は Issue #1833 で `Cross` 段として受理される（「Issue #1833 追記」参照）。

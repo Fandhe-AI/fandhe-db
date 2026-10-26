@@ -336,7 +336,6 @@ fn cross_join_syntax_misuse_is_rejected() {
         "SELECT * FROM a NATURAL CROSS JOIN b LIMIT 10",
         "SELECT * FROM a CROSS OUTER JOIN b LIMIT 10",
         "SELECT * FROM a CROSS JOIN LIMIT 10",
-        "SELECT * FROM a, b LIMIT 10",
     ] {
         assert_rejected(&core, sql, "42601");
     }

@@ -505,6 +505,11 @@ fn shapes() -> Vec<Shape> {
             check: Check::Token,
         },
         Shape {
+            axis: "join_comma",
+            sql: "SELECT documents.title, authors.name FROM documents, authors LIMIT 50",
+            check: Check::Token,
+        },
+        Shape {
             axis: "join_cross",
             sql: "SELECT documents.title, authors.name FROM documents CROSS JOIN authors LIMIT 50",
             check: Check::Token,

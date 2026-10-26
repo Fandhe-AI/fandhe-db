@@ -57,7 +57,7 @@ OUTER CROSS NATURAL ON USING WHERE LIMIT OFFSET AS`）は大小文字を無視�
 
 JOIN の判定はトークン列の先読み（`sql::allowlist::looks_like_join`）で行う。括弧深さ 0 の
 最初の `FROM` の直後が `<ident> [[AS] <alias>] (JOIN|INNER JOIN|LEFT|RIGHT|FULL|CROSS|
-NATURAL)` の並びのときだけ真になり、`validate_sql_tokens_impl` の集計・`DISTINCT`・
+NATURAL|`,`)` の並びのときだけ真になり、`validate_sql_tokens_impl` の集計・`DISTINCT`・
 集合演算の判定より前に呼んで `parse_join_statement` へ分岐する。`CROSS`・`NATURAL`（Issue #1827 で受理対象）・
 単独の `OUTER JOIN`（対象外事項）も検出対象に含め、`parse_join_statement` 側で `42601`
 に分類させる（構文段の判定順序を `looks_like_join` 側の複雑な除外リストに分散させない）。
@@ -233,4 +233,19 @@ JOIN の「整数クラスを跨いで結合できる」という要件（`id`�
   従来の逐次判定は後段の安全網として残す。
 - 側を跨ぐ WHERE（`a.x = b.y` 等）は結合後の残余として評価するため、上限判定は直積の件数に対して行われる
   （fail-closed。WHERE の等価条件を結合キーへ昇格する最適化は対象外）。
-- 対象外: カンマ結合 `FROM a, b`、DML の `FROM`／`USING` での CROSS、`CROSS JOIN LATERAL`・派生テーブル。
+- 対象外: DML の `FROM`／`USING` での CROSS、`CROSS JOIN LATERAL`・派生テーブル。
+
+## Issue #1833 追記（カンマ結合の構文。SQL-60 ポインタ）
+
+- 文法: `rel { ',' rel }`（別名可、2..=8 表）。明示 JOIN 連鎖の後のカンマ（`a JOIN b ON ..., c`）と、
+  カンマの後の `CROSS JOIN`（`a, b CROSS JOIN c`）も受理する。いずれも left-deep と行集合・`SELECT *` の列順が一致する。
+- 表現: カンマ 1 個を `JoinStep { kind: Inner, condition: Cross }` 1 段にする（#1831 の `CROSS JOIN` と同一）。
+  束縛・実行・上限判定（`左 × 右` の確保前判定）・RLS の独立適用は CROSS JOIN の経路をそのまま通る。
+- 混在規則: PG では JOIN がカンマより強く結合する。カンマの後に CROSS 以外の明示 JOIN
+  （`INNER`／`LEFT`／`RIGHT`／`FULL`／`NATURAL`／`USING`）が続く形は、left-deep の束縛では NULL 補完の範囲・
+  ON から見える表・共通列の導出範囲が PG とずれるため `0A000` で拒否する（fail-closed）。
+- エラー: 末尾カンマ・カンマ後の派生テーブル／関数・`ON`／`USING` の後置・公開名の重複は `42601`、
+  表参照数の超過は確保前に `54000`、ビュー参照は `42601`、存在しない表は `42P01`（構文段が先）。
+- 側を跨ぐ WHERE は結合後の残余として評価し、上限判定は直積の件数に対して行う（結合キーへの昇格は #1834）。
+- 対象外: カンマの後の明示 JOIN の PG 優先順位どおりの束縛・実行（フォローアップが必要）、
+  WHERE の等価条件の昇格（#1834）、DML の `FROM`／`USING`、LATERAL・派生テーブル。

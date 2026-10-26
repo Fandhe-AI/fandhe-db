@@ -18178,11 +18178,11 @@ pub(super) fn probe_from_table_ref(tokens: &[Token]) -> Option<(TableRef, usize)
 }
 
 /// JOIN 構文かどうかをバックトラックせず先読みだけで判定する（Issue #925
-/// §2.2・#926）。`validate_sql_tokens_impl` の集計・`DISTINCT`・集合演算の判定
-/// より前に呼ぶ。括弧深さ 0 の最初の `FROM` の直後が `<ident> [[AS] <alias>]
+/// §2.2・#926。Issue #1833 でカンマ区切りの表参照〔`FROM a, b`〕も対象に加えた）。
+/// `validate_sql_tokens_impl` の集計・`DISTINCT`・集合演算の判定より前に呼ぶ。括弧深さ 0 の最初の `FROM` の直後が `<ident> [[AS] <alias>]
 /// (JOIN|INNER JOIN|LEFT|RIGHT|FULL|CROSS|NATURAL)` の並びのときのみ真になる
-/// （`CROSS` は Issue #1831 で受理対象。`NATURAL` は Issue #1827 で受理対象になった——構文段の判定順序〔`42601` が `42P01` に先行する〕を
-/// 保つため。`LEFT`／`RIGHT`／`FULL [OUTER]` は Issue #926 で受理対象になった）。
+/// （`CROSS` は Issue #1831 で受理対象。`NATURAL` は Issue #1827 で受理対象になった
+/// ——構文段の判定順序〔`42601` が `42P01` に先行する〕を保つため。`LEFT`／`RIGHT`／`FULL [OUTER]` は Issue #926 で受理対象になった）。
 pub(crate) fn looks_like_join(tokens: &[Token]) -> bool {
     if !matches!(tokens.first(), Some(Token::Keyword(Keyword::Select))) {
         return false;
@@ -18201,7 +18201,7 @@ pub(crate) fn looks_like_join(tokens: &[Token]) -> bool {
     false
 }
 
-/// `FROM` 直後（`idx`）から見て、`<ident> [[AS] <alias>] JOIN...` の並びかどうかを
+/// `FROM` 直後（`idx`）から見て、`<ident> [[AS] <alias>] (JOIN...|,)` の並びかどうかを
 /// 判定する（[`looks_like_join`] 参照）。
 pub(super) fn from_clause_starts_join(tokens: &[Token], idx: usize) -> bool {
     // 引用付きの値関数予約語名（`"current_date"` 等）は QuotedNull で残るため、
@@ -18229,6 +18229,8 @@ pub(super) fn from_clause_starts_join(tokens: &[Token], idx: usize) -> bool {
 
 fn is_join_keyword_at(tokens: &[Token], i: usize) -> bool {
     match tokens.get(i) {
+        // Issue #1833（SQL-60）: FROM 句のカンマ区切り表参照は CROSS JOIN の left-deep 連鎖として扱う。
+        Some(Token::Punct(',')) => true,
         Some(Token::Ident(w)) if w.eq_ignore_ascii_case("JOIN") => true,
         Some(Token::Ident(w)) if w.eq_ignore_ascii_case("INNER") => {
             matches!(tokens.get(i + 1), Some(Token::Ident(w2)) if w2.eq_ignore_ascii_case("JOIN"))
@@ -19087,7 +19089,7 @@ fn parse_join_where_leaf(p: &mut Parser<'_>) -> Result<JoinWherePredicate, SqlSu
         // ON の葉（Issue #1829）の直後に来る WHERE と結合語。WHERE／DML 文脈でこれらが葉の直後に
         // 来ても後段の文パーサが `42601` にするため既存の挙動は変わらない。
         | Some(Token::Keyword(Keyword::Where))
-        | Some(Token::Punct(')' | ';'))
+        | Some(Token::Punct(')' | ';' | ','))
         | None => JoinWherePredicate::BoolColumn { column },
         // DML（`UPDATE ... FROM`／`DELETE ... USING`）の WHERE 後続句（Issue #1754）。
         Some(Token::Ident(w))
@@ -19287,6 +19289,10 @@ fn parse_join_order_by(p: &mut Parser<'_>) -> Result<Vec<JoinOrderKey>, SqlSurfa
     Ok(keys)
 }
 
+/// カンマ区切りの表参照（Issue #1833・SQL-60）は `Cross` 段（`CROSS JOIN` と同じ内部表現）として
+/// 連鎖に積む。カンマの後の CROSS 以外の明示 JOIN は PG の優先順位と束縛がずれるため
+/// `0A000` で拒否する（fail-closed）。
+///
 /// `[INNER|LEFT|RIGHT|FULL [OUTER]] JOIN` の left-deep 連鎖（2..=
 /// [`crate::sql::relation::MAX_TABLE_REFS`] テーブル。Issue #925・#926・#1190・
 /// SQL-28・RLS-10、TASK-212）の許可形状を先頭から再帰下降で判定する。
@@ -19306,15 +19312,31 @@ fn parse_join_statement(
     let mut relations = vec![first];
     let mut steps: Vec<JoinStep> = Vec::new();
 
+    // Issue #1833: カンマを 1 度でも消費したか。PG ではカンマより JOIN が強く結合するため、
+    // カンマの後の CROSS 以外の明示 JOIN は束縛の意味論がずれる。fail-closed で `0A000` にする。
+    let mut after_comma = false;
     loop {
-        let (kind, form) = match parse_join_kind(&mut p)? {
-            Some(k) => k,
-            None if steps.is_empty() => {
-                return Err(SqlSurfaceError::unsupported(
-                    "only CROSS JOIN or [NATURAL] INNER/LEFT/RIGHT/FULL [OUTER] JOIN (or bare JOIN) is supported",
-                ));
+        let (kind, form) = if matches!(p.peek(), Some(Token::Punct(','))) {
+            p.advance();
+            after_comma = true;
+            (JoinKind::Inner, JoinForm::Cross)
+        } else {
+            match parse_join_kind(&mut p)? {
+                Some((kind, form)) => {
+                    if after_comma && form != JoinForm::Cross {
+                        return Err(SqlSurfaceError::feature_not_supported(
+                            "explicit JOIN after a comma-separated FROM item is not supported",
+                        ));
+                    }
+                    (kind, form)
+                }
+                None if steps.is_empty() => {
+                    return Err(SqlSurfaceError::unsupported(
+                        "only comma-separated tables, CROSS JOIN or [NATURAL] INNER/LEFT/RIGHT/FULL [OUTER] JOIN (or bare JOIN) is supported",
+                    ));
+                }
+                None => break,
             }
-            None => break,
         };
         // 確保前に relation 数の上限を検査する（超過は `54000`）。
         if relations.len() >= crate::sql::relation::MAX_TABLE_REFS {
@@ -19340,7 +19362,7 @@ fn parse_join_statement(
                 || (p.peek_ident_matches("USING") && p.peek_punct_at(1, '('))
             {
                 return Err(SqlSurfaceError::unsupported(
-                    "CROSS JOIN cannot have an ON or USING clause",
+                    "CROSS JOIN or comma-separated FROM item cannot have an ON or USING clause",
                 ));
             }
             JoinCondition::Cross
@@ -26218,7 +26240,9 @@ mod tests {
     }
 
     #[test]
-    fn rejects_multiple_from_tables() {
+    fn rejects_comma_join_with_vector_ranking() {
+        // Issue #1833 以降、カンマ区切りの FROM は JOIN 経路へ入る。JOIN はベクトル順位付けと
+        // 併用できないため、従来と同じ 42601 で拒否される。
         assert_rejected_as_syntax_error(
             "SELECT * FROM documents, other ORDER BY embedding <=> '[0.1]' LIMIT 5",
         );
@@ -34338,6 +34362,86 @@ mod tests {
             let err = validate_sql(sql, &lookup).expect_err("must be rejected");
             assert_eq!(err.wire_code(), "42601", "sql={sql:?} err={err:?}");
         }
+    }
+
+    /// Issue #1833・SQL-60: カンマ区切りの FROM 句は `Cross` 段の left-deep 連鎖へ変換される。
+    #[test]
+    fn comma_join_is_parsed_as_cross_steps() {
+        let lookup = catalog_with(&["a", "b", "c"]);
+        for (sql, conds) in [
+            ("SELECT * FROM a, b LIMIT 1", vec![true]),
+            ("SELECT * FROM a AS x, b y LIMIT 1", vec![true]),
+            ("SELECT * FROM a x, b, c", vec![true, true]),
+            (
+                "SELECT * FROM a JOIN b ON a.id = b.id, c LIMIT 1",
+                vec![false, true],
+            ),
+            (
+                "SELECT * FROM a JOIN b ON a.k = b.k AND b.active, c LIMIT 10",
+                vec![false, true],
+            ),
+            (
+                "SELECT * FROM a JOIN b ON a.k = b.k AND b.active CROSS JOIN c LIMIT 10",
+                vec![false, true],
+            ),
+            (
+                "SELECT * FROM a NATURAL JOIN b, c LIMIT 1",
+                vec![false, true],
+            ),
+            ("SELECT * FROM a, b CROSS JOIN c LIMIT 1", vec![true, true]),
+            ("SELECT a.id, COUNT(*) FROM a, b GROUP BY a.id", vec![true]),
+        ] {
+            match validate_sql(sql, &lookup).expect("comma join should be accepted") {
+                Statement::Join(v) => {
+                    assert_eq!(v.steps.len(), conds.len(), "sql={sql:?}");
+                    for (step, is_cross) in v.steps.iter().zip(&conds) {
+                        assert_eq!(
+                            step.condition == JoinCondition::Cross,
+                            *is_cross,
+                            "sql={sql:?}"
+                        );
+                        if *is_cross {
+                            assert_eq!(step.kind, JoinKind::Inner, "sql={sql:?}");
+                        }
+                    }
+                }
+                other => panic!("expected Join, got {other:?}"),
+            }
+        }
+        for (sql, code) in [
+            ("SELECT * FROM a, LIMIT 1", "42601"),
+            ("SELECT * FROM a, b, LIMIT 1", "42601"),
+            ("SELECT * FROM a, b ON a.id = b.id LIMIT 1", "42601"),
+            ("SELECT * FROM a, b USING (x) LIMIT 1", "42601"),
+            ("SELECT * FROM a, (SELECT 1) s LIMIT 1", "42601"),
+            ("SELECT * FROM a, a LIMIT 1", "42601"),
+            ("SELECT * FROM a x, b x LIMIT 1", "42601"),
+            ("SELECT * FROM a, b JOIN c ON b.id = c.id", "0A000"),
+            ("SELECT * FROM a, b LEFT JOIN c ON b.id = c.id", "0A000"),
+            ("SELECT * FROM a, b RIGHT JOIN c ON b.id = c.id", "0A000"),
+            ("SELECT * FROM a, b FULL JOIN c ON b.id = c.id", "0A000"),
+            ("SELECT * FROM a, b NATURAL JOIN c", "0A000"),
+            ("SELECT * FROM a, b JOIN c USING (id)", "0A000"),
+        ] {
+            let err = validate_sql(sql, &lookup).expect_err("must be rejected");
+            assert_eq!(err.wire_code(), code, "sql={sql:?} err={err:?}");
+        }
+        // 表参照数: 8 表は受理、9 表は 54000。
+        let names: Vec<String> = (0..9).map(|i| format!("t{i}")).collect();
+        let lookup = catalog_with(&["t0", "t1", "t2", "t3", "t4", "t5", "t6", "t7", "t8"]);
+        assert!(validate_sql(&format!("SELECT * FROM {}", names[..8].join(", ")), &lookup).is_ok());
+        let err = validate_sql(&format!("SELECT * FROM {}", names.join(", ")), &lookup)
+            .expect_err("9 tables must be rejected");
+        assert_eq!(err.wire_code(), "54000");
+        let err = validate_sql(
+            &format!(
+                "SELECT * FROM {} JOIN t8 ON t0.id = t8.id",
+                names[..8].join(", ")
+            ),
+            &lookup,
+        )
+        .expect_err("must be rejected");
+        assert!(matches!(err.wire_code(), "54000" | "0A000"), "{err:?}");
     }
 
     #[test]
