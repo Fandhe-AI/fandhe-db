@@ -6680,6 +6680,7 @@ impl<'a> Parser<'a> {
     #[allow(clippy::type_complexity)]
     fn parse_having(
         &mut self,
+        ungrouped: bool,
     ) -> Result<
         (
             Vec<HavingPredicate>,
@@ -6690,14 +6691,14 @@ impl<'a> Parser<'a> {
     > {
         self.expect_contextual_keyword("HAVING")?;
         if !self.allow_aggregate_expr_items {
-            let (p, e) = self.parse_having_predicates()?;
+            let (p, e) = self.parse_having_predicates(ungrouped)?;
             return Ok((p, e, Vec::new()));
         }
         let saved_calls = self.agg_calls.take();
         let saved_dedup = self.agg_calls_dedup;
         self.agg_calls = Some(Vec::new());
         self.agg_calls_dedup = true;
-        let parsed = self.parse_having_predicates();
+        let parsed = self.parse_having_predicates(ungrouped);
         let calls = self.agg_calls.take();
         self.agg_calls = saved_calls;
         self.agg_calls_dedup = saved_dedup;
@@ -6706,8 +6707,15 @@ impl<'a> Parser<'a> {
     }
 
     /// [`Self::parse_having`] の述語列本体（`HAVING` キーワード消費後）。
+    ///
+    /// `ungrouped`（Issue #1819・SQL-58 (4)）は `GROUP BY` なしの `HAVING` を解析する場合に真。
+    /// 表全体を 1 グループとして扱うため、式形の「関数・`CASE`・集計呼び出しを含むこと」の
+    /// 要求を外し（`HAVING 1 = 1`・裸の列参照は束縛段が `42803` で分類する）、句境界に単独で
+    /// 置かれた `TRUE`／`FALSE`／`NULL` を比較述語へ畳み込む。偽のとき（`GROUP BY` あり）は
+    /// 従来の挙動を一切変えない。
     fn parse_having_predicates(
         &mut self,
+        ungrouped: bool,
     ) -> Result<(Vec<HavingPredicate>, Vec<HavingExprPredicate>), SqlSurfaceError> {
         let mut predicates = Vec::new();
         let mut expr_predicates = Vec::new();
@@ -6722,6 +6730,16 @@ impl<'a> Parser<'a> {
             // `OFFSET`／文末）でなければ巻き戻して式形として解析し直す。
             let start = self.pos;
             let calls_before = self.agg_calls.as_ref().map(Vec::len);
+            if ungrouped {
+                if let Some(pred) = self.try_parse_having_bool_literal() {
+                    expr_predicates.push(pred);
+                    if matches!(self.peek(), Some(Token::Keyword(Keyword::And))) {
+                        self.advance();
+                        continue;
+                    }
+                    break;
+                }
+            }
             if let Some(pred) = self.try_parse_legacy_having_predicate()? {
                 predicates.push(pred);
             } else {
@@ -6735,7 +6753,8 @@ impl<'a> Parser<'a> {
                 let rhs = self.parse_value_expr(0)?;
                 // 関数・`CASE` 系・集計呼び出しを含まない述語（`HAVING lang = 'ja'`・
                 // `HAVING n + 1 > 3`）は従来どおり許可リスト外（`42601`）。
-                if !expr_contains_scalar_function(&lhs)
+                if !ungrouped
+                    && !expr_contains_scalar_function(&lhs)
                     && !expr_contains_scalar_function(&rhs)
                     && !expr_contains_aggregate_placeholder(&lhs)
                     && !expr_contains_aggregate_placeholder(&rhs)
@@ -6753,6 +6772,49 @@ impl<'a> Parser<'a> {
             break;
         }
         Ok((predicates, expr_predicates))
+    }
+
+    /// `GROUP BY` なしの `HAVING` で、述語が単独の `TRUE`／`FALSE`／`NULL` リテラル（直後が
+    /// `AND`／文末／`;`）なら比較述語へ畳み込んで消費する（Issue #1819。式木に variant を
+    /// 足さず、束縛・実行は既存の式述語経路を共有する）。`TRUE`→`1 = 1`、`FALSE`→`1 = 0`、
+    /// `NULL`→`NULLIF(1, 1) = 1`（結果は NULL。`NULL = 1` は束縛段が型を決められず拒否するため）。
+    /// 他の形（`HAVING TRUE = x` 等）は消費せず `None`（呼び出し元が通常の式形として解析する）。
+    fn try_parse_having_bool_literal(&mut self) -> Option<HavingExprPredicate> {
+        let Some(Token::Ident(word)) = self.peek() else {
+            return None;
+        };
+        let word = word.to_ascii_uppercase();
+        if !matches!(word.as_str(), "TRUE" | "FALSE" | "NULL")
+            || self.quoted_null.contains(&self.pos)
+        {
+            return None;
+        }
+        let at_boundary = matches!(
+            self.tokens.get(self.pos.saturating_add(1)),
+            None | Some(Token::Keyword(Keyword::And)) | Some(Token::Punct(';'))
+        );
+        if !at_boundary {
+            return None;
+        }
+        self.advance();
+        let one = || Expr::Number("1".to_string());
+        Some(match word.as_str() {
+            "TRUE" => HavingExprPredicate {
+                lhs: one(),
+                op: BinOp::Eq,
+                rhs: one(),
+            },
+            "FALSE" => HavingExprPredicate {
+                lhs: one(),
+                op: BinOp::Eq,
+                rhs: Expr::Number("0".to_string()),
+            },
+            _ => HavingExprPredicate {
+                lhs: Expr::NullIf(Box::new(one()), Box::new(one())),
+                op: BinOp::Eq,
+                rhs: one(),
+            },
+        })
     }
 
     /// 従来形の `HAVING` 述語 `<ident> <cmp> ['-'] <number>` を 1 つ試行解析する
@@ -14610,8 +14672,9 @@ fn check_body_aggregate(
     // 本体の集計は構文段が `allow_aggregate_expr_items` を偽にするため通常は到達しない多層防御）。
     if v.group_by
         .as_ref()
-        .is_some_and(|g| !g.having_aggregates.is_empty())
+        .is_some_and(|g| !g.having_aggregates.is_empty() || g.columns.is_empty())
     {
+        // Issue #1819: `GROUP BY` なしの `HAVING`（キー 0 個の句）も本体には含めさせない。
         return Err(body_form_unsupported());
     }
     for item in &v.items {
@@ -18827,7 +18890,52 @@ fn looks_like_aggregate_select(tokens: &[Token]) -> bool {
         && !contains_window_over
         && ((matches!(tokens.get(1), Some(Token::Ident(name)) if is_aggregate_function_name(name))
             && matches!(tokens.get(2), Some(Token::Punct('('))))
-            || contains_group_by)
+            || contains_group_by
+            || has_top_level_having_clause(tokens))
+}
+
+/// 括弧の深さ 0 に句としての `HAVING`（`GROUP BY` なしの `HAVING`。Issue #1819・SQL-58 (4)）が
+/// あるか。`validate_select_statement` と [`looks_like_aggregate_select`] が集計 `SELECT` の形へ
+/// 振り分ける目印に使う。
+///
+/// 引用識別子 `"having"` も字句上は `Ident("HAVING")` と同じため、列名・別名・表名・比較の
+/// 右辺に使う既存の文を誤って振り分けないよう、句とみなす条件を絞る。直前が式または表参照の
+/// 終端（識別子〔`AS` を除く〕・数値・文字列・`)`）で、かつ直後が式の開始（句境界・`,`・
+/// `)`・`;`・文末・`GROUP`／`OFFSET`／`FETCH`／`AS` ではない）のときだけ真。サブクエリ内の
+/// `HAVING` は深さ 1 以上のため対象外（従来どおり）。
+fn has_top_level_having_clause(tokens: &[Token]) -> bool {
+    let mut depth = 0usize;
+    for (i, token) in tokens.iter().enumerate() {
+        match token {
+            Token::Punct('(') => depth = depth.saturating_add(1),
+            Token::Punct(')') => depth = depth.saturating_sub(1),
+            Token::Ident(name) if depth == 0 && name.eq_ignore_ascii_case("HAVING") && i > 0 => {
+                let prev_ends_expr = match tokens.get(i - 1) {
+                    Some(Token::Ident(prev)) => !prev.eq_ignore_ascii_case("AS"),
+                    Some(Token::Number(_) | Token::StringLiteral(_) | Token::Punct(')')) => true,
+                    _ => false,
+                };
+                let next_starts_expr = match tokens.get(i + 1) {
+                    Some(Token::Ident(next)) => !["GROUP", "OFFSET", "FETCH", "AS"]
+                        .iter()
+                        .any(|w| next.eq_ignore_ascii_case(w)),
+                    Some(
+                        Token::Number(_)
+                        | Token::StringLiteral(_)
+                        | Token::QuotedBoolWord(_)
+                        | Token::Param(_)
+                        | Token::Punct('(' | '-' | '+'),
+                    ) => true,
+                    _ => false,
+                };
+                if prev_ends_expr && next_starts_expr {
+                    return true;
+                }
+            }
+            _ => {}
+        }
+    }
+    false
 }
 
 /// 集計形の枝を [`SetTree::AggregateBranch`] へ組み立てる。FROM は通常の集計 SELECT と
@@ -19585,7 +19693,7 @@ fn parse_aggregate_shape(
         }
         let (having, having_exprs, having_aggregates) = if matches!(p.peek(), Some(Token::Ident(name)) if name.eq_ignore_ascii_case("HAVING"))
         {
-            p.parse_having()?
+            p.parse_having(false)?
         } else {
             (Vec::new(), Vec::new(), Vec::new())
         };
@@ -19618,6 +19726,29 @@ fn parse_aggregate_shape(
             limit,
             with_ties,
             offset,
+        })
+    } else if matches!(p.peek(), Some(Token::Ident(name)) if name.eq_ignore_ascii_case("HAVING")) {
+        // Issue #1819・SQL-58 (4): `GROUP BY` なしの `HAVING`。表全体（`WHERE`・RLS を通った
+        // 可視行）を 1 グループとして集計し、その 1 行に `HAVING` を当てる。構文段ではキー 0 個の
+        // `GroupByClause`（`columns` が空）で表す（空の `columns` は他の経路では生成されない）。
+        // SELECT リストの裸識別子・`HAVING` 内の集計の外の列参照は、スキーマを要する分類
+        // （`42703`／`42803`）のため束縛段が判定する。トップレベルの集計 `SELECT` 以外
+        // （CTE 主クエリ・集合演算の枝・サブクエリ・ビュー本体）は従来どおり `42601`。
+        if !p.allow_aggregate_expr_items {
+            return Err(SqlSurfaceError::unsupported(
+                "HAVING without GROUP BY is not supported in this context",
+            ));
+        }
+        let (having, having_exprs, having_aggregates) = p.parse_having(true)?;
+        Some(GroupByClause {
+            columns: Vec::new(),
+            having,
+            having_exprs,
+            having_aggregates,
+            order_by: Vec::new(),
+            limit: None,
+            with_ties: false,
+            offset: 0,
         })
     } else {
         if !has_aggregate_item {
@@ -20206,10 +20337,11 @@ fn aggregate_statement_from_resolved(
             ));
         }
         // Issue #1814・SQL-58: 評価後射影形ビューの外側集計では `HAVING` 内の集計呼び出しを
-        // 評価しない（集計式項目と同じ扱い。fail-closed）。
+        // 評価しない（集計式項目と同じ扱い。fail-closed）。Issue #1819: `GROUP BY` なしの
+        // `HAVING`（キー 0 個の句）も評価しない（`HAVING` を黙って落とさず拒否する）。
         if group_by
             .as_ref()
-            .is_some_and(|g| !g.having_aggregates.is_empty())
+            .is_some_and(|g| !g.having_aggregates.is_empty() || g.columns.is_empty())
         {
             return Err(SqlSurfaceError::unsupported(
                 "aggregate over a view with an aggregate/LIMIT body supports only column arguments",
@@ -20775,16 +20907,19 @@ fn validate_select_statement(
             && matches!(&w[1], Token::Ident(name) if name.eq_ignore_ascii_case("OVER"))
             && matches!(w[2], Token::Punct('('))
     });
+    // Issue #1819・SQL-58 (4): 括弧の深さ 0 の句としての `HAVING`（`GROUP BY` なし）も集計形の目印。
+    let contains_having_clause = has_top_level_having_clause(tokens);
     let is_aggregate_select = !contains_window_over
         && ((matches!(tokens.get(1), Some(Token::Ident(name)) if is_aggregate_function_name(name))
             && matches!(tokens.get(2), Some(Token::Punct('('))))
-            || contains_group_by);
+            || contains_group_by
+            || contains_having_clause);
     // SQL-30・TASK-214: ウィンドウ項目は `GROUP BY`・集計 SELECT・`SELECT DISTINCT`
     // のいずれとも併用しない（§計画 2「対象外」）。`is_aggregate_select` の判定
     // から除外しただけでは `contains_group_by` 単独の形（`SELECT ... OVER (...)
     // ... GROUP BY ...`）が `parse_select_shape`（広域取得）へ素通りしてしまうため、
     // ここで明示的に `42601` へ倒す。
-    if contains_window_over && contains_group_by {
+    if contains_window_over && (contains_group_by || contains_having_clause) {
         return Err(SqlSurfaceError::unsupported(
             "window functions cannot be combined with GROUP BY",
         ));
@@ -29850,23 +29985,83 @@ mod tests {
             "SELECT lang FROM documents GROUP BY lang HAVING lang = 'ja'",
             "SELECT lang FROM documents GROUP BY lang HAVING sum(count(*)) > 1",
             "SELECT lang, COUNT(*) FROM documents GROUP BY lang HAVING c + 1 > 2",
-            "SELECT lang FROM documents HAVING count(*) > 1",
-            "SELECT COUNT(*) FROM documents HAVING count(*) > 1",
         ] {
             let err = validate_sql(sql, &lookup).expect_err("must be rejected");
             assert_eq!(err.wire_code(), "42601", "sql={sql:?}");
         }
     }
 
+    /// Issue #1819・SQL-58 (4): `GROUP BY` なしの `HAVING` は、キー 0 個の `GroupByClause` で受理する。
     #[test]
-    fn rejects_having_without_group_by() {
+    fn accepts_having_without_group_by_as_a_zero_key_clause() {
         let lookup = catalog_with(&["documents"]);
-        let err = validate_sql(
-            "SELECT COUNT(*) FROM documents HAVING COUNT(*) > 1",
-            &lookup,
-        )
-        .expect_err("HAVING without GROUP BY must be rejected");
-        assert_eq!(err.wire_code(), "42601");
+        let parse = |sql: &str| match validate_sql(sql, &lookup).expect("must be accepted") {
+            Statement::Aggregate(a) => a,
+            other => panic!("expected aggregate, got {other:?}"),
+        };
+        let agg = parse("SELECT COUNT(*) FROM documents HAVING COUNT(*) > 1");
+        let clause = agg.group_by().expect("zero-key clause");
+        assert!(clause.columns.is_empty());
+        assert_eq!(clause.having.len(), 1);
+        assert_eq!(clause.having_aggregates.len(), 1);
+        assert!(clause.order_by.is_empty() && clause.limit.is_none() && clause.offset == 0);
+        // 集計を含まない HAVING・TRUE/FALSE/NULL の畳み込み。
+        let agg = parse("SELECT COUNT(*) FROM documents HAVING 1 = 1 AND TRUE AND FALSE AND NULL");
+        let clause = agg.group_by().expect("zero-key clause");
+        assert_eq!(clause.having_exprs.len(), 4);
+        // SELECT リストに集計が無くても、HAVING が集計を持てば構文段は受理する
+        // （裸の列の分類は束縛段の `42803`）。
+        let agg = parse("SELECT lang FROM documents HAVING count(*) > 1");
+        assert_eq!(agg.group_by().expect("clause").having_aggregates.len(), 1);
+    }
+
+    /// Issue #1819: `GROUP BY` なしの `HAVING` を受理するのはトップレベルの集計 `SELECT` だけ。
+    /// 後続の `ORDER BY`／`LIMIT`／`OFFSET`・`OR`・CTE 主クエリ・集合演算の枝・ウィンドウ併用は
+    /// 従来どおり `42601`。`GROUP BY` も `HAVING` も無い裸の列は `42601` のまま。
+    #[test]
+    fn having_without_group_by_rejects_unsupported_contexts() {
+        let lookup = catalog_with(&["documents"]);
+        for sql in [
+            "SELECT COUNT(*) FROM documents HAVING COUNT(*) > 1 ORDER BY 1",
+            "SELECT COUNT(*) FROM documents HAVING COUNT(*) > 1 LIMIT 1",
+            "SELECT COUNT(*) FROM documents HAVING COUNT(*) > 1 OFFSET 1",
+            "SELECT COUNT(*) FROM documents HAVING COUNT(*) > 1 OR COUNT(*) < 0",
+            "SELECT COUNT(*) OVER () FROM documents HAVING COUNT(*) > 1",
+            "SELECT COUNT(*) FROM documents HAVING COUNT(*) > $1",
+            "WITH x AS (SELECT lang FROM documents) SELECT COUNT(*) FROM x HAVING COUNT(*) > 1",
+            "SELECT COUNT(*) FROM documents HAVING COUNT(*) > 1 UNION ALL SELECT COUNT(*) FROM documents",
+            "SELECT lang, COUNT(*) FROM documents",
+        ] {
+            let err = validate_sql(sql, &lookup).expect_err("must be rejected");
+            assert_eq!(err.wire_code(), "42601", "sql={sql:?}");
+        }
+    }
+
+    /// Issue #1819: 句としての `HAVING` の判定。引用識別子 `"having"`（列名・別名・表名・比較の
+    /// 右辺）とサブクエリ内の `HAVING` は、トップレベルの句とみなさない。
+    #[test]
+    fn has_top_level_having_clause_distinguishes_quoted_identifiers() {
+        let toks = |sql: &str| lexer::tokenize(sql).expect("tokenize");
+        for sql in [
+            "SELECT COUNT(*) FROM t HAVING COUNT(*) > 1",
+            "SELECT lang FROM t HAVING 1 = 1",
+            "SELECT COUNT(*) FROM t WHERE a = 1 HAVING (COUNT(*) > 1)",
+            "SELECT COUNT(*) FROM t HAVING -1 < COUNT(*)",
+        ] {
+            assert!(has_top_level_having_clause(&toks(sql)), "{sql}");
+        }
+        for sql in [
+            "SELECT \"having\" FROM t LIMIT 5",
+            "SELECT a AS \"having\" FROM t LIMIT 5",
+            "SELECT a \"having\" FROM t LIMIT 5",
+            "SELECT a, \"having\" FROM t LIMIT 5",
+            "SELECT a FROM t WHERE x = \"having\" LIMIT 5",
+            "SELECT a FROM t \"having\" WHERE x = 1 LIMIT 5",
+            "SELECT a FROM t ORDER BY \"having\" LIMIT 5",
+            "SELECT a FROM t WHERE n IN (SELECT n FROM u GROUP BY n HAVING COUNT(*) > 1)",
+        ] {
+            assert!(!has_top_level_having_clause(&toks(sql)), "{sql}");
+        }
     }
 
     #[test]

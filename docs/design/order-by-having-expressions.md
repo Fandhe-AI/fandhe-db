@@ -77,7 +77,7 @@
 - `ORDER BY` 内・`HAVING` 内の集計関数呼び出しは Issue #1815・#1814 で対応した（下の各「追記」）。
 - 式位置での単項マイナス、`ORDER BY (expr)`・算術で始まるキー。位置指定 `ORDER BY 1` は
   Issue #1792、`NULLS FIRST/LAST` は Issue #1791 で対応した（下の各「追記」）。
-- `SELECT DISTINCT ... ORDER BY <式>`・`GROUP BY` なしの `HAVING`・GROUP BY キー自体の式化。
+- `SELECT DISTINCT ... ORDER BY <式>`・GROUP BY キー自体の式化。`GROUP BY` なしの `HAVING` は Issue #1819 で対応した（下の「追記」）。
 - NoSQL（HTTP）表層、JOIN・集合演算・ウィンドウと式 `ORDER BY` の併用。
 - 評価後射影形ビュー（集計・`LIMIT` 本文のビュー。Issue #1192）への外側 `ORDER BY` の式キー（列名キーと
   同じく `42601`）。ウィンドウ関数・集合演算の枝内 `ORDER BY` との併用も、列名キーに限り併用可能にした
@@ -169,11 +169,11 @@
   場合は `54000`。`array_agg` は `0A000`、TEXT・日時の `MIN`／`MAX` は `22000`（従来形）、式内の `NUMERIC` 結果の
   算術は `22000`。エラー文言に内部名は出さない。
 - SELECT リストに集計項目が無い形（`SELECT lang FROM t GROUP BY lang HAVING count(*) > 1`）は、`HAVING` が
-  集計呼び出しを持つ場合に限り受理する。`GROUP BY` なしの `HAVING` は従来どおり `42601`。
+  集計呼び出しを持つ場合に限り受理する。`GROUP BY` なしの `HAVING` は Issue #1819 で対応した。
 - fail-closed の境界: CTE 主クエリ・集合演算の枝・サブクエリ内部・ビュー本体・評価後射影形ビューの外側は `42601`、
   列別名ビューは `0A000`。単純形ビューでは `HAVING` 内の集計の引数をビューの公開列に限定する（非公開列は `42703`）。
   参照列の収集（サブクエリ・評価後射影形ビュー）にも `HAVING` の集計引数を含める。
-- 対象外: `GROUP BY` なしの `HAVING`、JOIN 集計の `HAVING`、NoSQL（HTTP）表層、`$n` を含む `HAVING`、
+- 対象外: JOIN 集計の `HAVING`、NoSQL（HTTP）表層、`$n` を含む `HAVING`、
   式形の中の `NUMERIC` 結果の算術（`sum(bigint) + 1 > 10` は `22000`）、左右を入れ替えた `10 < sum(bigint)`。
 - テスト: `tests/sql58_having_aggregate_calls.rs`、wire 層は `wire_sql58_having_aggregate_calls.rs`。
 
@@ -181,6 +181,9 @@
 
 - 定数式（`ORDER BY 1 + 0`）・`$n` を定数として並べ替える受理は未実装（`42601`。序数としては扱わない）。
 - `EXTRACT` の戻り型は `numeric` ではなく `f64`。`EXTRACT(hour FROM date)` はエラーにせず 0（`date_part` と同じ）。
+- `GROUP BY` なしの `HAVING` から SELECT リストの別名を参照する形（`SELECT count(*) AS n FROM t HAVING n > 1`）は、
+  `GROUP BY` ありと同じ解決器を共有して受理する（PostgreSQL は `42703`）。`SELECT * ... HAVING` は `42601`
+  （PostgreSQL は `42803`）。
 - 式形の `HAVING`／`ORDER BY` は `f64` 意味論。`2^53` を超える整数（`id`・`COUNT`・`SUM` 等の結果を含む）は
   `WHERE`・投影の式と同じく丸めずに `22000` で拒否する。従来形の `HAVING` は厳密比較のまま。
 
@@ -218,3 +221,32 @@
   JOIN 集計・NoSQL（HTTP）表層・`$n` を含む形。
 - テスト: engine `tests/sql58_order_by_aggregate_calls.rs`、wire `tests/wire_sql58_order_by_aggregate_calls.rs`、
   構文段の単体テスト `order_by_aggregate_calls_are_desugared_and_shared_with_having`。
+
+## Issue #1819 追記（GROUP BY なしの HAVING。SQL-58 (4) のポインタ）
+
+- 意味: 表全体（`WHERE`・RLS を通った可視行）を 1 つのグループとして集計し、その 1 行に `HAVING` を当てる。
+  真なら 1 行、偽か `NULL` なら 0 行。可視行が 0 件でも集計の 1 行（`count` は 0、他は `NULL`）は作られ、
+  それに `HAVING` を当てる（PostgreSQL 17 と同じ）。集計を含まない `HAVING 1 = 1` も受理する。
+- 構文段: 振り分けは括弧の深さ 0 にある句位置の `HAVING`（`has_top_level_having_clause`）も集計形の目印にする。
+  引用識別子 `"having"` を列名・別名・表名に使う既存の文は、直前が式の終端でなく直後が式の開始でないため
+  句とみなさない。`GROUP BY` なしの `HAVING` は、キー 0 個の `GroupByClause`（`columns` が空）で表す。
+  単独の `TRUE`／`FALSE`／`NULL` は比較述語へ畳み込む（式木に variant を足さない）。
+- 束縛段: `BoundAggregate::group_by` は `None` のまま、別フィールド `ungrouped_having` にキー 0 個で束縛した
+  句を入れる（`group_by` を `Some` にすると、グループ化の実行器が入力 0 行で 0 グループを返し、空テーブルでの
+  PostgreSQL との一致が崩れるため）。SELECT リストの裸の列と `HAVING` 内の集計の外の列参照は、スキーマに
+  列（疑似列 `id` を含む）があれば `42803`（固定文言。列名・値を載せない）、無ければ `42703`、曖昧なら `42702`。
+- 実行段: 単一行の終端処理 `finish_aggregate_result`（キャッシュヒット・索引経路・全走査の 3 経路が共有）と
+  評価後射影形の外側集計の終端 `GroupedRowAccumulator::finish` が `group_by::ungrouped_having_passes` を呼ぶ。
+  判定はグループごとの `HAVING` と同じ規則（従来形の厳密比較・式形の 3 値論理）を共有する。`HAVING` だけが使う
+  隠し集計項目があるときは必ず投影を通し、`RowDescription` との列数のずれを防ぐ。上限 32（`54000`）は SELECT・
+  `HAVING` の合算。
+- fail-closed の境界: CTE 主クエリ・集合演算の枝・サブクエリ・ビュー本体は `42601`。評価後射影形ビューの外側は
+  `42601`（`HAVING` を黙って落とさない）。後続の `ORDER BY`／`LIMIT`／`OFFSET`、`OR`、`$n` は `42601`。
+  単純形ビューでは集計の引数を公開列に限定する（非公開列は `42703`）。テナント境界は単一行集計の走査経路を
+  共有するため、他テナントの行は集計にも判定にも現れない。
+- 対象外: `GROUP BY` も `HAVING` も無い文での集計の外の列参照（`42601` のまま。`42803` への移行は #1818）、
+  `HAVING <bool 列>`・`NOT`・`OR` など比較の形をとらない真偽式（`TRUE`／`FALSE`／`NULL` の単独リテラルを除く）、
+  JOIN 集計・NoSQL（HTTP）表層・`$n` を含む形。
+- テスト: engine `tests/sql58_having_without_group_by.rs`、wire `tests/wire_sql58_having_without_group_by.rs`、
+  構文段・振り分けの単体テスト `accepts_having_without_group_by_as_a_zero_key_clause`・
+  `having_without_group_by_rejects_unsupported_contexts`・`has_top_level_having_clause_distinguishes_quoted_identifiers`。

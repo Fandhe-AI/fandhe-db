@@ -2593,6 +2593,16 @@ impl<'a> GroupedRowAccumulator<'a> {
                 cells.push(acc.finish()?);
             }
             let columns = crate::sql::aggregate::aggregate_projection_columns(bound, schema)?;
+            // Issue #1819: `GROUP BY` なしの `HAVING` は構文段が評価後射影形ビューの外側を拒否する
+            // が、`HAVING` を黙って落とす経路を残さないよう、ここでも同じ判定を当てる。
+            if let Some(having) = bound.ungrouped_having.as_ref() {
+                if !ungrouped_having_passes(having, schema, &cells)? {
+                    return Ok(QueryResult {
+                        columns,
+                        rows: Vec::new(),
+                    });
+                }
+            }
             let row_cells = project_ungrouped_row(
                 bound,
                 schema,
@@ -2679,16 +2689,8 @@ fn eval_group_row_exprs(
     let key_cells = group_key_cells(&group_by.keys, &group_by.group_row_mask, schema, key)?;
     let scalars = group_row_scalars(&key_cells, cells, &group_by.group_row_mask)?;
 
-    for program in &group_by.having_exprs {
-        match program.eval(0, &[], &scalars, scratch)? {
-            ExprValue::Bool(true) => {}
-            ExprValue::Bool(false) | ExprValue::Null => return Ok((false, Vec::new())),
-            _ => {
-                return Err(SqlSurfaceError::invalid_input(
-                    "HAVING expression did not evaluate to a boolean",
-                ))
-            }
-        }
+    if !having_exprs_pass(group_by, &scalars, scratch)? {
+        return Ok((false, Vec::new()));
     }
     let mut order_values = Vec::with_capacity(group_by.order_exprs.len());
     for (program, kind) in &group_by.order_exprs {
@@ -2704,6 +2706,61 @@ fn eval_group_row_exprs(
         )?);
     }
     Ok((true, order_values))
+}
+
+/// 行ビューのスカラー `scalars` に対し、式述語の `HAVING`（[`BoundGroupBy::having_exprs`]）が
+/// すべて `Bool(true)` か（`false`／`NULL` は不通過。PostgreSQL の 3 値論理）。
+/// [`eval_group_row_exprs`]（グループごと）と [`ungrouped_having_passes`]（単一行）が共有する。
+fn having_exprs_pass(
+    group_by: &BoundGroupBy,
+    scalars: &[Option<row_codec::ScalarRef<'_>>],
+    scratch: &mut Vec<StackValue>,
+) -> Result<bool, SqlSurfaceError> {
+    for program in &group_by.having_exprs {
+        match program.eval(0, &[], scalars, scratch)? {
+            ExprValue::Bool(true) => {}
+            ExprValue::Bool(false) | ExprValue::Null => return Ok(false),
+            _ => {
+                return Err(SqlSurfaceError::invalid_input(
+                    "HAVING expression did not evaluate to a boolean",
+                ))
+            }
+        }
+    }
+    Ok(true)
+}
+
+/// `GROUP BY` なしの `HAVING`（Issue #1819・SQL-58 (4)。[`BoundAggregate::ungrouped_having`]）を、
+/// 確定済みの単一行の集計セル `cells`（`bound.items` 順）へ当てて、行を返すか判定する。
+/// 従来形・式形の述語を [`finish_groups`] のグループ判定と同じ規則（`having_matches`・
+/// [`having_exprs_pass`]）で評価する。`cells` は WHERE・RLS を通った可視行だけから作られた
+/// ため、評価エラー（`22012`／`22003` 等）をそのまま返しても他テナントの情報は載らない。
+/// `sql::aggregate::finish_aggregate_result` と [`GroupedRowAccumulator::finish`] が呼ぶ。
+pub(crate) fn ungrouped_having_passes(
+    having: &BoundGroupBy,
+    schema: &TableSchema,
+    cells: &[Cell],
+) -> Result<bool, SqlSurfaceError> {
+    for h in &having.having {
+        let cell = cells
+            .get(h.item_index)
+            .ok_or_else(|| accumulator_bug("HAVING item_index out of bounds"))?;
+        if !having_matches(cell, h.op, h.literal) {
+            return Ok(false);
+        }
+    }
+    if having.having_exprs.is_empty() {
+        return Ok(true);
+    }
+    let key_cells = group_key_cells(
+        &having.keys,
+        &having.group_row_mask,
+        schema,
+        &GroupKey(Vec::new()),
+    )?;
+    let scalars = group_row_scalars(&key_cells, cells, &having.group_row_mask)?;
+    let mut scratch: Vec<StackValue> = Vec::new();
+    having_exprs_pass(having, &scalars, &mut scratch)
 }
 
 /// 行ビューのキー成分を出力セルと同じ復元規則（`order_value_to_cell`）で `Cell` 化する
@@ -2919,6 +2976,7 @@ mod tests {
                 offset: 0,
                 result_cap: None,
             }),
+            ungrouped_having: None,
         }
     }
 
@@ -3073,6 +3131,7 @@ mod tests {
                 offset: 0,
                 result_cap: None,
             }),
+            ungrouped_having: None,
         }
     }
 
@@ -3562,6 +3621,7 @@ mod tests {
                 offset: 0,
                 result_cap: None,
             }),
+            ungrouped_having: None,
         }
     }
 

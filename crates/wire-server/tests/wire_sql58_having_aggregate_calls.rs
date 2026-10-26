@@ -330,7 +330,6 @@ fn unsupported_forms_return_exact_sqlstate_and_session_continues() {
             "SELECT lang FROM docs GROUP BY lang HAVING sum(zzz) > 1",
             "42703",
         ),
-        ("SELECT COUNT(*) FROM docs HAVING count(*) > 1", "42601"),
     ] {
         let out = simple(&mut s, sql);
         assert_eq!(out.sqlstate.as_deref(), Some(code), "{sql}: {out:?}");

@@ -297,12 +297,8 @@ fn rejected_forms_keep_their_sqlstate() {
         let sql = format!("{BASE} {tail}");
         assert_eq!(run_err(&core, &ctx, &sql), code, "{sql}");
     }
-    for sql in [
-        "SELECT COUNT(*) FROM docs HAVING count(*) > 1",
-        "SELECT lang FROM docs GROUP BY lang",
-    ] {
-        assert_eq!(run_err(&core, &ctx, sql), "42601", "{sql}");
-    }
+    let sql = "SELECT lang FROM docs GROUP BY lang";
+    assert_eq!(run_err(&core, &ctx, sql), "42601", "{sql}");
     // エラー文言に内部名（制御文字）を出さない。
     for sql in [
         format!("{BASE} HAVING max(title) > 1"),
