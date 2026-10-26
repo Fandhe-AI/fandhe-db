@@ -27,6 +27,7 @@
   [statement-interrupt.md](docs/design/statement-interrupt.md)。
   BREAKING CHANGE: 公開 enum `ErrorClass` と `SqlSurfaceError` に variant（`QueryCanceled`）を追加したため、
   網羅的な `match` は更新が要る。
+- `GROUPING SETS`・`ROLLUP`・`CUBE` と `FILTER`・集計 `DISTINCT`・`ORDER BY`・`LIMIT` 等の併用と上限境界（結果行数・グループ数・`COUNT(DISTINCT)` 予算の全セット合計）をテストで固定（Issue #1824・SQL-59。挙動変更なし・公開 API 変更なし）。
 - `--max-result-rows` の受け入れ条件（既定 10,000 の境界・上げた側とハード上限 100,000 の境界・超過時に DataRow を送らない）をテストで固定し、README と設計記録を `LIMIT` 省略時の上限の現状に整合（Issue #2211・SQL-34。挙動変更なし）。
 - jsonpath の `like_regex` を評価する（Issue #2677・SQL-55・TABLE-25）。`jsonb_path_*`・`@?`／`@@`・`JSON_EXISTS` 等が
   PG 17 と同じ結果を返す。フラグ `i`・`s`・`m`・`q` を受理し、`x`（`q` なし）は `0A000`、正規表現の構文誤りは `2201B`、

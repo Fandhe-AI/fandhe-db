@@ -2,7 +2,7 @@
 
 ## ステータス
 
-Accepted・構文段と展開（Issue #1821）に加え、実行段（セットごとの集約と結果の合成。Issue #1822）と `GROUPING()` 関数（Issue #1823）も実装済み。
+Accepted・構文段と展開（Issue #1821）に加え、実行段（セットごとの集約と結果の合成。Issue #1822）と `GROUPING()` 関数（Issue #1823）、他機能との併用・上限境界の回帰テスト（Issue #1824）も実装済み。
 
 ## ポインタ
 
@@ -10,7 +10,7 @@ Accepted・構文段と展開（Issue #1821）に加え、実行段（セット�
   エラー分類は `docs/spec/04-behavior/error-format.md` の `54001`・`54011` の行
 - 前提: [multi-column-group-by.md](multi-column-group-by.md)・[order-by-having-expressions.md](order-by-having-expressions.md)（式キー・構造一致。Issue #1817・#1818）
 - 後続: セットごとの集約の実行と結果の合成（Issue #1822）、`GROUPING()` 関数（Issue #1823）、
-  他機能との併用の検証（Issue #1824）。`54023` の行は #1823
+  他機能との併用の検証（Issue #1824。上記「Issue #1824 追記」）。`54023` の行は #1823
 
 ## 目的
 
@@ -131,9 +131,27 @@ Issue #1821 の時点では、実行段が無いまま通常の `GROUP BY` と�
 - **検証**: PostgreSQL 17 の公開仕様から導出した固定値で検証した（実機との照合は未実施）。
   `crates/engine/tests/sql59_grouping_function.rs`
 
+## Issue #1824 追記: 他機能との併用と上限境界の固定
+
+挙動変更なし（テストのみ）。`crates/engine/tests/sql59_grouping_sets_combos.rs`（期待値は PostgreSQL 17 の
+公開仕様から導出した固定値。実機との照合は未実施）。
+
+- **`FILTER`**: 述語はセット射影後の NULL ではなく入力行で評価する（総計行でも元の行を数える）。
+  `GROUPING()` との併用（`GROUPING()` は `HAVING`、`FILTER` は選択リスト）も固定
+- **集計引数の `DISTINCT`・非分解集計**: `count(DISTINCT ...)`・`array_agg(DISTINCT ... ORDER BY ...)`・
+  `array_agg(... ORDER BY ...)` はセットごとに累積され、総計は小計の和ではない。`COUNT(DISTINCT)` の
+  中間状態予算（異なり値 10 万件）は全セット合計で計上する（4,000 セット × 25 値で成功、26 値で `54000`）
+- **`HAVING`・`ORDER BY ... NULLS`・`LIMIT`・`OFFSET`・`FETCH FIRST ... WITH TIES`**: 全セットの合成後に適用する。
+  データ上の NULL と小計の NULL は `lang` では同値のため、区別は `GROUPING()` で行う（`HAVING` は `IS NULL` 非対応）
+- **上限境界**: 結果行数上限は全セット合計（`HAVING`・`OFFSET` 適用後、`WITH TIES` の同値追加後）で判定し、
+  超過は `54000` で `Err` のみ（部分結果を返さない）。グループ数上限も `FILTER`・`DISTINCT` 併用時に全セット合計
+- **fail-closed のまま**: 窓関数との併用・`SELECT DISTINCT` と `GROUP BY` の併用・JOIN 集計・集合演算の枝は
+  いずれも `42601`（誤った行を返さない）。サポート追加は本記録の対象外
+- **RLS**: 併用時も他テナントの Private 行の値はどのセットにも現れない
+
 ## 対象外
 
-- FILTER・DISTINCT・HAVING・ORDER BY・ウィンドウとの併用の検証（Issue #1824）
+- 窓関数・`SELECT DISTINCT`・JOIN 集計との併用のサポート（現状 `42601` で fail-closed）
 - `GROUP BY DISTINCT`・`GROUP BY ALL`、トップレベルの複合 `GROUP BY (a, b)` の平坦化（`42601` のまま）
 - 上限（4,096・12・8 段）の設定化
 - NoSQL の `aggregate` は対象外（`42601` のまま）
