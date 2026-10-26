@@ -23,7 +23,8 @@
 //! - `plan`: 束縛（列解決・型検証・外部結合の簡約・WHERE のプッシュダウン／残余の
 //!   分離・側スキャン投影の確定・集計／並べ替えの束縛）。Describe も同じ計画を使う。
 //! - `exec`: N 方向ハッシュ結合（段ごとのカーディナリティ上限・決定的順序）。
-//! - `residual`: WHERE 残余の行単位評価とスカラー `ORDER BY`。
+//! - `residual`: WHERE 残余の行単位評価（ON 残余の一致条件評価 `eval_all` も共有。Issue #1830）と
+//!   スカラー `ORDER BY`。
 //! - `aggregate`: 集計形（既存の `Accumulator` を再利用）。
 //! - `values`: 型クラス・キー正準化・比較・`Cell` → `ScalarRef` アダプタ。
 //! - `on_split`: ON の AND 連鎖を結合キー／残余述語（左のみ・右のみ・混在）へ分類する

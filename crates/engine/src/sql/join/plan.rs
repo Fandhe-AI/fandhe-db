@@ -19,8 +19,10 @@
 //!   走査へプッシュダウンする（型解析・評価は単一テーブル経路を完全に共有する）。
 //!   それ以外は結合後に行単位で評価する残余（[`ResNode`]）になる。
 //!
-//! ON は `on_split` が結合キー／残余述語へ分類し、キー無しは `42601`、残余ありは
-//! `0A000`（評価は Issue #1830）で拒否する（Issue #1829）。
+//! ON は `on_split` が結合キー／残余述語へ分類し、キー無しは `42601` で拒否する
+//! （Issue #1829）。残余述語（左のみ・右のみ・混在）は一致条件の一部として
+//! [`StepPlan`] の `on_*` へ束縛し、`exec::join_step` が評価する（Issue #1830）。
+//! ON 残余は WHERE の strict マスク簡約へは流さない（外部結合の保存側を消さないため）。
 
 use std::collections::HashMap;
 
@@ -71,6 +73,14 @@ pub(super) struct StepPlan {
     /// 新しく加わる relation 側の未一致行を NULL 補完して残すか（同上）。
     pub(super) preserve_new: bool,
     pub(super) keys: Vec<StepKey>,
+    /// ON の残余のうち、これまでの結合結果側だけを参照するもの（Issue #1830・SQL-60）。
+    /// 一致条件の一部として `exec::join_step` がプローブ前に評価する。WHERE の残余とは
+    /// 別物で、外部結合の strict マスク簡約には一切使わない。
+    pub(super) on_acc: Vec<ResNode>,
+    /// ON の残余のうち、新しく加わる relation だけを参照するもの（ビルド時に評価）。
+    pub(super) on_new: Vec<ResNode>,
+    /// ON の残余のうち、両側を跨ぐ非キー比較（キー一致の候補ペアごとに評価）。
+    pub(super) on_mixed: Vec<ResNode>,
 }
 
 /// 結合後に行単位で評価する WHERE の残余ノード。
@@ -682,6 +692,43 @@ fn item_effective_name(
         .unwrap_or_else(|| func.default_alias().to_string())
 }
 
+/// 1 段分の ON 残余の束縛結果（宣言順を保つ）。
+#[derive(Default)]
+struct OnResiduals {
+    acc: Vec<ResNode>,
+    new: Vec<ResNode>,
+    mixed: Vec<ResNode>,
+}
+
+/// ON 残余（左のみ・右のみ・混在）を段のスコープで [`ResNode`] へ束縛する（Issue #1830）。
+///
+/// `b.scope` は段のループ中は全 relation の plain スコープで、USING の統合列を含まず
+/// 前方参照も許してしまうため、呼び出しの間だけ段のスコープへ差し替え、成否に関わらず
+/// 元へ戻してから返す。`build_plan` からのみ呼ばれる。
+fn bind_on_residuals<'a>(
+    b: &mut Binder<'a, '_>,
+    step_scope: JoinScope<'a>,
+    split: &super::on_split::OnSplit<'_>,
+    udfs: &UdfRegistry,
+) -> Result<OnResiduals, SqlSurfaceError> {
+    let saved = std::mem::replace(&mut b.scope, step_scope);
+    let r = (|| {
+        let mut bind = |leaves: &[&JoinWherePredicate]| -> Result<Vec<ResNode>, SqlSurfaceError> {
+            leaves
+                .iter()
+                .map(|leaf| build_residual(&JoinWhereExpr::Leaf((*leaf).clone()), b, udfs))
+                .collect()
+        };
+        Ok(OnResiduals {
+            acc: bind(&split.acc_only)?,
+            new: bind(&split.new_only)?,
+            mixed: bind(&split.mixed)?,
+        })
+    })();
+    b.scope = saved;
+    r
+}
+
 /// 結合連鎖の束縛（[`JoinPlan`] を返す）。列解決・結合キー型検証・外部結合簡約・
 /// WHERE 分離・投影展開・並べ替え／集計の型検証をすべて行走査より前に確定させる。
 pub(super) fn build_plan<'a>(
@@ -760,6 +807,7 @@ pub(super) fn build_plan<'a>(
                 .collect(),
         )?;
         let mut keys: Vec<StepKey> = Vec::new();
+        let mut on_res: OnResiduals = OnResiduals::default();
         match &step.condition {
             JoinCondition::On(on) => {
                 let new_schema =
@@ -779,15 +827,8 @@ pub(super) fn build_plan<'a>(
                         "JOIN ON condition must reference both sides of the join",
                     ));
                 }
-                // 残余述語（左のみ・右のみ・混在）の評価は #1830 の責務。評価できない述語を
-                // 黙殺すると過剰返却（fail-open）になるため、それまでは fail-closed に拒否する。
-                if split.has_residual() {
-                    return Err(SqlSurfaceError::feature_not_supported(
-                        "JOIN ON predicates other than equi-join keys are not supported yet",
-                    ));
-                }
                 keys.reserve(split.keys.len());
-                for (acc, new) in split.keys {
+                for (acc, new) in &split.keys {
                     let acc_class = key_class(acc.column_type())?;
                     let new_class = key_class(new.column_type())?;
                     if acc_class != new_class {
@@ -804,6 +845,8 @@ pub(super) fn build_plan<'a>(
                         class: acc_class,
                     });
                 }
+                // 残余述語は一致条件として段のスコープで束縛する（Issue #1830）。
+                on_res = bind_on_residuals(&mut b, step_scope, &split, udfs)?;
             }
             JoinCondition::Using(_) | JoinCondition::Natural => {
                 let left_base = BindingScope::new(
@@ -853,6 +896,9 @@ pub(super) fn build_plan<'a>(
             preserve_acc: matches!(step.kind, JoinKind::Left | JoinKind::Full),
             preserve_new: matches!(step.kind, JoinKind::Right | JoinKind::Full),
             keys,
+            on_acc: on_res.acc,
+            on_new: on_res.new,
+            on_mixed: on_res.mixed,
         });
     }
     // 以降（WHERE・投影・並べ替え・集計）は、全段適用後の統合列・可視列を持つスコープで解決する。

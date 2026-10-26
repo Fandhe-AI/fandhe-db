@@ -165,6 +165,23 @@ fn eval(
     }
 }
 
+/// 残余 conjunct 列（`AND` 結合）がタプルに対してすべて真か（空なら真）。WHERE 残余
+/// （[`filter_tuples`]）と ON 残余（`exec::join_step` の一致条件。Issue #1830）が共有する
+/// 唯一の評価入口で、評価規則の第 2 実装を作らない。
+pub(super) fn eval_all(
+    nodes: &[ResNode],
+    sides: &[Vec<ResultRow>],
+    tuple: &[Option<u32>],
+    scratch: &mut Vec<StackValue>,
+) -> Result<bool, SqlSurfaceError> {
+    for node in nodes {
+        if !eval(node, sides, tuple, scratch)? {
+            return Ok(false);
+        }
+    }
+    Ok(true)
+}
+
 /// 残余 conjunct（`AND` 結合）をすべて満たすタプルだけを、順序を保って残す。
 pub(super) fn filter_tuples(
     order: Vec<u32>,
@@ -185,14 +202,7 @@ pub(super) fn filter_tuples(
             .ok_or_else(|| SqlSurfaceError::Internal {
                 detail: "JOIN tuple index out of range".to_string(),
             })?;
-        let mut ok = true;
-        for node in residual {
-            if !eval(node, sides, tuple, &mut scratch)? {
-                ok = false;
-                break;
-            }
-        }
-        if ok {
+        if eval_all(residual, sides, tuple, &mut scratch)? {
             kept.push(ti);
         }
     }

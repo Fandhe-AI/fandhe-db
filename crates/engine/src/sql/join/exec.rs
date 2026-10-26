@@ -25,6 +25,7 @@ use crate::sql::allowlist::SqlSurfaceError;
 use crate::sql::exec::{Cell, ResultRow};
 
 use super::plan::{StepKey, StepPlan};
+use super::residual::eval_all;
 use super::values::encode_key_component;
 use super::{JoinBudget, JoinLimits};
 
@@ -187,9 +188,32 @@ fn join_step(
     stop_after_pairs: Option<usize>,
 ) -> Result<Tuples, SqlSurfaceError> {
     let n = acc.n;
+    // ON 残余（Issue #1830）の評価用。タプルの組み立て領域（長さ n）は確保前に計上する。
+    let has_on_residual =
+        !(step.on_acc.is_empty() && step.on_new.is_empty() && step.on_mixed.is_empty());
+    let mut probe: Vec<Option<u32>> = Vec::new();
+    if has_on_residual {
+        budget.charge(n.saturating_mul(SLOT_BYTES))?;
+        probe.resize(n, None);
+    }
+    let mut scratch: Vec<crate::sql::expr_program::StackValue> = Vec::new();
     let mut table: HashMap<Vec<u8>, Vec<u32>> = HashMap::new();
     for (idx, row) in new_rows.iter().enumerate() {
         let idx_u32 = to_u32(idx, "JOIN build side row count exceeds limit")?;
+        // 右のみの ON 残余: 偽の行は一致候補にならない（保存側なら未一致のまま NULL 補完される）。
+        if !step.on_new.is_empty() {
+            crate::interrupt::check()?;
+            probe.fill(None);
+            let slot = probe
+                .get_mut(new_rel)
+                .ok_or_else(|| SqlSurfaceError::Internal {
+                    detail: "JOIN relation index out of range".to_string(),
+                })?;
+            *slot = Some(idx_u32);
+            if !eval_all(&step.on_new, sides, &probe, &mut scratch)? {
+                continue;
+            }
+        }
         if let Some(key) = extract_key(Some(row), &step.keys, |k| k.new_pos)? {
             budget.charge(key.len().saturating_add(std::mem::size_of::<u32>()))?;
             table.entry(key).or_default().push(idx_u32);
@@ -215,12 +239,17 @@ fn join_step(
     // 判定に使うのは可視行だけ（RLS・WHERE 適用済み）なので、他テナントの行数は
     // 結果に影響しない。
     let mut pairs: Vec<(u32, u32)> = Vec::new();
+    let mut candidates: usize = 0;
     for ti in 0..acc_len {
         // Issue #1798: 協調的中断の確認点（プローブ側の行ごと。commit 前の読み取り経路）。
         crate::interrupt::check()?;
         let tuple = acc.get(ti).ok_or_else(|| SqlSurfaceError::Internal {
             detail: "JOIN accumulated tuple index out of range".to_string(),
         })?;
+        // 左のみの ON 残余: 偽の acc タプルは一致しない（保存側なら未一致のまま NULL 補完）。
+        if !step.on_acc.is_empty() && !eval_all(&step.on_acc, sides, tuple, &mut scratch)? {
+            continue;
+        }
         // 複数条件の成分は relation が異なりうるため、成分ごとに行を引く。
         let mut key: Vec<u8> = Vec::new();
         let mut has_key = true;
@@ -247,6 +276,29 @@ fn join_step(
             for &new_idx in matched {
                 // Issue #1798: 協調的中断の確認点（一致ペアの実体化ループ。commit 前の読み取り経路）。
                 crate::interrupt::check()?;
+                // 残余で落ちる候補も評価回数を伴うため、キー一致の候補数を出力上限で止める
+                // （残余による絞り込みが上限検査を素通りしない。WHERE 側に書いた場合と揃える）。
+                candidates = candidates.saturating_add(1);
+                if candidates > limits.max_output_rows {
+                    return Err(SqlSurfaceError::payload_too_large(
+                        "JOIN result exceeds the row limit",
+                    ));
+                }
+                // 両側を跨ぐ ON 残余: 偽のペアは一致とみなさない。
+                if !step.on_mixed.is_empty() {
+                    for (j, slot) in probe.iter_mut().enumerate() {
+                        *slot = tuple.get(j).copied().flatten();
+                    }
+                    let slot = probe
+                        .get_mut(new_rel)
+                        .ok_or_else(|| SqlSurfaceError::Internal {
+                            detail: "JOIN relation index out of range".to_string(),
+                        })?;
+                    *slot = Some(new_idx);
+                    if !eval_all(&step.on_mixed, sides, &probe, &mut scratch)? {
+                        continue;
+                    }
+                }
                 push_charged_pair(&mut pairs, budget, (ti_u32, new_idx))?;
                 if let Some(m) = matched_acc.get_mut(ti) {
                     *m = true;
