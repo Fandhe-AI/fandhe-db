@@ -37,8 +37,8 @@ conj        := colref <op> <literal>        -- op: = < <= > >= / LIKE '<pattern>
 
 relation は常にちょうど 2 個。以下はいずれも `42601`（fail-closed）:
 
-- `CROSS`／`NATURAL` JOIN（`JOIN ... USING (...)` は Issue #1826 で受理対象になった。
-  `docs/design/join-using.md` 参照。`LEFT`／`RIGHT`／`FULL [OUTER]` は
+- `CROSS` JOIN（`JOIN ... USING (...)` は Issue #1826、`NATURAL JOIN` は Issue #1827 で受理対象に
+  なった。`docs/design/join-using.md` 参照。`LEFT`／`RIGHT`／`FULL [OUTER]` は
   Issue #926 で受理対象になった。`docs/design/outer-join.md` 参照）
 - 非等価の `ON`、左右が同じ relation を指す `ON`
 - `ORDER BY`・`<=>`・`HYBRID`・`USING PLAN`・`USING MODE`・`HINT ORDER` との併用
@@ -58,7 +58,7 @@ OUTER CROSS NATURAL ON USING WHERE LIMIT OFFSET AS`）は大小文字を無視�
 JOIN の判定はトークン列の先読み（`sql::allowlist::looks_like_join`）で行う。括弧深さ 0 の
 最初の `FROM` の直後が `<ident> [[AS] <alias>] (JOIN|INNER JOIN|LEFT|RIGHT|FULL|CROSS|
 NATURAL)` の並びのときだけ真になり、`validate_sql_tokens_impl` の集計・`DISTINCT`・
-集合演算の判定より前に呼んで `parse_join_statement` へ分岐する。`CROSS`・`NATURAL`・
+集合演算の判定より前に呼んで `parse_join_statement` へ分岐する。`CROSS`・`NATURAL`（Issue #1827 で受理対象）・
 単独の `OUTER JOIN`（対象外事項）も検出対象に含め、`parse_join_statement` 側で `42601`
 に分類させる（構文段の判定順序を `looks_like_join` 側の複雑な除外リストに分散させない）。
 `LEFT`／`RIGHT`／`FULL [OUTER]` の受理は Issue #926（`docs/design/outer-join.md`）参照。
@@ -189,8 +189,8 @@ JOIN の「整数クラスを跨いで結合できる」という要件（`id`�
 
 ## 対象外（Issue は起票しない。申し送りのみ）
 
-- `CROSS`／`NATURAL` JOIN（`JOIN ... USING (...)` は Issue #1826 で受理対象になった。
-  `docs/design/join-using.md` 参照。`LEFT`/`RIGHT`/`FULL [OUTER]` は
+- `CROSS` JOIN（`JOIN ... USING (...)` は Issue #1826、`NATURAL JOIN` は Issue #1827 で受理対象に
+  なった。`docs/design/join-using.md` 参照。`LEFT`/`RIGHT`/`FULL [OUTER]` は
   Issue #926 で受理対象になった。`docs/design/outer-join.md` 参照）
 - ウィンドウ・`DISTINCT` と JOIN の組み合わせ
 - WHERE の `BETWEEN`・サブクエリ

@@ -33,7 +33,8 @@ use crate::sql::relation::{BindingScope, ColumnRef, ColumnSlot, TableRef};
 use crate::sql::udf_call::{BinOp, UdfRegistry};
 
 use super::using::{
-    bind_using_step, relation_columns, slot_type, JoinScope, MergedColumn, VisibleCol,
+    bind_using_step, natural_using_names, relation_columns, slot_type, JoinScope, MergedColumn,
+    VisibleCol,
 };
 use super::values::{cmp_class, key_class, CmpClass, JoinKeyClass};
 
@@ -796,7 +797,7 @@ pub(super) fn build_plan<'a>(
                     });
                 }
             }
-            JoinCondition::Using(names) => {
+            JoinCondition::Using(_) | JoinCondition::Natural => {
                 let left_base = BindingScope::new(
                     b.relations
                         .iter()
@@ -807,6 +808,21 @@ pub(super) fn build_plan<'a>(
                 )?;
                 let left_scope =
                     JoinScope::new(left_base, merged.clone(), visible.clone(), has_using);
+                // NATURAL は両入力の共通列名を導出して USING と同じ束縛へ流す（Issue #1827）。
+                let derived;
+                let names: &[String] = match &step.condition {
+                    JoinCondition::Using(names) => names,
+                    _ => {
+                        let new_schema =
+                            *b.schemas
+                                .get(new_rel)
+                                .ok_or_else(|| SqlSurfaceError::Internal {
+                                    detail: "JOIN relation index out of range".to_string(),
+                                })?;
+                        derived = natural_using_names(&left_scope, new_rel, new_schema)?;
+                        &derived
+                    }
+                };
                 let bound = bind_using_step(&left_scope, &step_base, step.kind, names, new_rel)?;
                 keys.reserve(bound.keys.len());
                 for key in &bound.keys {
@@ -821,7 +837,8 @@ pub(super) fn build_plan<'a>(
                 }
                 merged = bound.merged;
                 visible = bound.visible;
-                has_using = true;
+                // 共通列 0 個の NATURAL は統合を伴わないので USING 扱いにしない（従来経路を保つ）。
+                has_using = has_using || !names.is_empty();
             }
         }
         steps.push(StepPlan {
