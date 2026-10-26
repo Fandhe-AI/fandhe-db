@@ -45,7 +45,8 @@ pub(super) fn where_has_subquery(preds: &[WherePredicate]) -> bool {
     preds.iter().any(|p| match p {
         WherePredicate::InSubquery { .. }
         | WherePredicate::Exists { .. }
-        | WherePredicate::ScalarSubqueryCompare { .. } => true,
+        | WherePredicate::ScalarSubqueryCompare { .. }
+        | WherePredicate::QuantifiedSubqueryCompare { .. } => true,
         WherePredicate::Not(inner) => where_has_subquery(std::slice::from_ref(inner.as_ref())),
         WherePredicate::Or(branches) => branches.iter().any(|b| where_has_subquery(b)),
         _ => false,

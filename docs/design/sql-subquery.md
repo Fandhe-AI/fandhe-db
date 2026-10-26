@@ -278,6 +278,47 @@ RLS は既存の実行器がそのまま適用するため、新しい可視性�
 列があれば内側を優先する。疑似列 `id` は全テーブルにあるため相関と判定しない。修飾参照は
 内側の構文解析が `42601` にする。エラー文言は静的文字列のみ。
 
+## Issue #1855 追記: `ANY`／`SOME`／`ALL` (SELECT ...)（SQL-61 (3)・RLS-10）
+
+`<列> <比較演算子> ANY|SOME|ALL (SELECT ...)` を非相関のサブクエリに限って受理する。`SOME` は構文段で
+`ANY` に正規化する。第 2 の評価器は作らず、内側の値集合を既存の `IN`／スカラー比較と同じ経路で定数化し、
+既存の述語（`IN` 集合・境界値とのリテラル比較）へ書き換える。
+
+- **構文**: `WherePredicate::QuantifiedSubqueryCompare { column, op, quantifier, inner_tokens, depth }`
+  （BREAKING CHANGE。非網羅 `match` を破壊する）。サブクエリ文脈にあり CHECK 本体でないときだけ受理し、
+  それ以外（文脈外・式の左辺）は従来どおり `0A000`。否定は構文段で演算子と量化子の両方を反転して葉へ
+  押し下げる（`NOT (x = ANY S)` は `x <> ALL S`）。
+- **解決**（`sql::subquery::resolve_quantified_compare`）: `= ANY` は `IN`、`<> ALL` は `NOT IN` へ委譲する
+  （予算・NULL 規則・値族検証・ENUM の語彙外ラベルは `IN` と同一）。それ以外は内側の非 NULL 値の最小・最大から
+  既存の `scalar_literal_predicate` で `col <op> <リテラル>` を作る（生成する述語は高々 2 つ）。
+
+  | 形 | 内側 0 行／NULL のみ | NULL を含む | それ以外 |
+  | -- | -------------------- | ----------- | -------- |
+  | `> >= ANY` | 常に偽 | NULL を無視 | `col op min` |
+  | `< <= ANY` | 常に偽 | NULL を無視 | `col op max` |
+  | `<> ANY` | 常に偽 | NULL を無視 | `min == max` なら `col <> v`、異なれば `col <> min OR col <> max` |
+  | `> >= ALL` | 0 行は常に真・NULL のみは常に偽 | 常に偽 | `col op max` |
+  | `< <= ALL` | 同上 | 常に偽 | `col op min` |
+  | `= ALL` | 同上 | 常に偽 | `min == max` なら `col = v`、異なれば常に偽 |
+
+  外側値が NULL の行は生成した比較が UNKNOWN になり除外される（`ALL` は内側 0 行のとき外側 NULL でも真）。
+  境界値の比較は `cmp_quantified_cells`（型が合わないセルは `Equal` へ落とさず `Err`）で行い、浮動小数を含む
+  数値は `f64`、それ以外の数値は厳密な 10 進数で比べる。
+- **上限・形**: 内側の形（単一列・`LIMIT` 必須・集計形は `42601`）・行数上限・実行回数予算・入れ子の深さは
+  `IN (SELECT ...)` と同じ。値族の不一致と、BOOLEAN／ENUM の範囲比較（内側が空でも）は `22000`。TEXT の範囲比較で
+  列の照合がバイト列順でなければ `0A000`（比較の葉が照合を運ばないため。fail-closed）。
+- **拡張クエリプロトコル**: `core.rs` の `contains_subquery_syntax` が「比較演算子 → `ANY`／`SOME`／`ALL` →
+  `(` → `SELECT`」を検出し、`$n` との併用を Parse 段で `42601` にする（内側の `$n` が外側のダミーフラグの
+  添字をずらすのを防ぐ）。
+- **述語形 DML の内容照合**: `recovery/content_hash.rs` のタグ 18（外側の列 → 演算子判別子 → 量化子判別子
+  〔`Any=0`・`All=1`〕→ 内側トークン）。ANY と ALL・スカラー比較・`IN` は互いに別ハッシュ。
+- **対象外（fail-closed のまま）**: 式の左辺・相関サブクエリ・内側の集計形・サブクエリ文脈外（CHECK・ビュー
+  定義本体の単純形・カーソル・COPY・EXPLAIN）・投影位置／HAVING／CASE 条件での量化サブクエリ・
+  JOIN 文などサブクエリの解決を経由しない文形（未解決のまま束縛へ届けば `42601`）。
+- **OWASP**: 内側は外側と同じ `PolicyContext`・同じスナップショットで評価し、境界値・空かどうか・NULL の有無は
+  可視行だけから決まる（RLS-10。2 テナントの結合テストで固定）。内側は生トークン列のまま再検証し、境界値は
+  AST のリテラルとして埋め込む（文字列連結をしない）。エラー文言は固定の英語で他テナントの値を含めない。
+
 ## 実装ファイル
 
 | パス | 内容 |
@@ -290,6 +331,7 @@ RLS は既存の実行器がそのまま適用するため、新しい可視性�
 | `crates/engine/tests/sql29_subquery.rs`（新設） | 結合テスト（受理・RLS 境界・深さ上限・文脈拒否・`NOT IN`／`NOT EXISTS`） |
 | `crates/engine/tests/sql29_projection_subquery.rs`（Issue #1352） | 投影位置スカラーサブクエリの結合テスト（列位置・NULL・複数行・拒否形・RLS） |
 | `crates/engine/tests/sql29_subquery_scalar.rs`（Issue #1191） | スカラー比較・相関 `42601`・`IN` 対象型拡大・RLS の結合テスト |
+| `crates/engine/tests/sql61_any_all_subquery.rs`（Issue #1855） | `ANY`／`SOME`／`ALL` の独立オラクル照合・拒否形・上限・RLS・拡張クエリ・述語形 DML の結合テスト |
 
 ## OWASP Top 10 観点
 

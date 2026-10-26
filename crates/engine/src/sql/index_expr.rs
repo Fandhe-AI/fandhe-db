@@ -402,7 +402,8 @@ fn check_one_predicate(pred: &WherePredicate) -> Result<(), SqlSurfaceError> {
         // 構文段（`subquery_ctx = None`）では生成されないが、fail-closed の防御として拒否する。
         WherePredicate::InSubquery { .. }
         | WherePredicate::Exists { .. }
-        | WherePredicate::ScalarSubqueryCompare { .. } => {
+        | WherePredicate::ScalarSubqueryCompare { .. }
+        | WherePredicate::QuantifiedSubqueryCompare { .. } => {
             Err(SqlSurfaceError::FeatureNotSupported {
                 detail: site.subquery().to_string(),
             })

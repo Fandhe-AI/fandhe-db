@@ -676,6 +676,8 @@ Issue #871（述語つき UPDATE/DELETE の実行結線）は自動運転モー�
   文から導出できるので入れない。
 - **タグ**: `InSubquery`=13（外側の列 → 内側トークン）・`Exists`=14（内側トークン）・
   `ScalarSubqueryCompare`=15（外側の列 → 演算子判別子 `Eq=0..Ge=5`〔明示 match〕→ 内側トークン）。
+  Issue #1855 で `QuantifiedSubqueryCompare`=18（外側の列 → 演算子判別子 → 量化子判別子
+  `Any=0`・`All=1`〔明示 match〕→ 内側トークン）を追加した（既存タグのバイト列は不変）。
   タグ 1〜12 と `OpTag` は不変で、サブクエリを含まない文のハッシュはビット同一。`NOT` は既存のタグ 12 の
   再帰で別ハッシュになる。`IdCompare`（解決後の内部の葉）と未束縛 `$n` は `Internal` で fail-closed。
 - **計算位置の契約**: ハッシュは `Validated*` が持つ**解決前**の述語から計算する。内側を解決して

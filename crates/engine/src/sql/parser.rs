@@ -2042,6 +2042,7 @@ fn declarative_leaf_to_filter(
         | WherePredicate::InSubquery { .. }
         | WherePredicate::Exists { .. }
         | WherePredicate::ScalarSubqueryCompare { .. }
+        | WherePredicate::QuantifiedSubqueryCompare { .. }
         | WherePredicate::IdCompare { .. } => Err(SqlSurfaceError::Internal {
             detail: "declarative predicate binding reached a non-declarative WherePredicate"
                 .to_string(),
@@ -2765,7 +2766,8 @@ fn bind_where_predicates_recursive(
             // 内側 SELECT の解決は #1751 まで未結線のため、この腕が fail-closed に止める。
             WherePredicate::InSubquery { .. }
             | WherePredicate::Exists { .. }
-            | WherePredicate::ScalarSubqueryCompare { .. } => {
+            | WherePredicate::ScalarSubqueryCompare { .. }
+            | WherePredicate::QuantifiedSubqueryCompare { .. } => {
                 return Err(SqlSurfaceError::unsupported(
                     "subquery is not supported for this statement shape",
                 ));
@@ -2779,6 +2781,7 @@ fn bind_where_predicates_recursive(
                     WherePredicate::InSubquery { .. }
                         | WherePredicate::Exists { .. }
                         | WherePredicate::ScalarSubqueryCompare { .. }
+                        | WherePredicate::QuantifiedSubqueryCompare { .. }
                 ) =>
             {
                 return Err(SqlSurfaceError::unsupported(
@@ -9879,7 +9882,8 @@ pub(crate) fn collect_where_predicate_idents(
             // 自分の FROM テーブルのスキーマのみで束縛される。
             // `sql::subquery` モジュールドキュメント参照）。
             WherePredicate::Exists { .. } => {}
-            WherePredicate::ScalarSubqueryCompare { column, .. } => {
+            WherePredicate::ScalarSubqueryCompare { column, .. }
+            | WherePredicate::QuantifiedSubqueryCompare { column, .. } => {
                 out.insert(column.clone());
             }
             // 解決段が生成する内部専用の葉。疑似列 `id` は列参照（ウィンドウ別名
