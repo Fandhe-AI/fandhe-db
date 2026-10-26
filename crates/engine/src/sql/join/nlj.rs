@@ -33,7 +33,8 @@ fn relation_out_of_range() -> SqlSurfaceError {
     }
 }
 
-/// NLJ 1 段（INNER／LEFT／RIGHT。キー無し FULL は `0A000`）。`acc`（relation 0..=k の結合結果）に relation `new_rel` を加える。
+/// NLJ 1 段（INNER／LEFT／RIGHT。キー無し FULL は `0A000`）。
+/// `acc`（relation 0..=k の結合結果）に relation `new_rel` を加える。
 /// 引数は `exec::join_step` と同じ（呼び出し元は `join_step` のみ）。
 // `join_step` と同じ 8 引数（最終段の停止閾値 Issue #1797 を含む）。
 #[allow(clippy::too_many_arguments)]

@@ -37,8 +37,6 @@ pub(super) struct Tuples {
     data: Vec<Option<u32>>,
 }
 
-impl Tuples {}
-
 impl Tuples {
     pub(super) fn len(&self) -> usize {
         self.data.len().checked_div(self.n).unwrap_or(0)
