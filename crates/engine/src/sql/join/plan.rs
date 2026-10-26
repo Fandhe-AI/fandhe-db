@@ -848,6 +848,17 @@ pub(super) fn build_plan<'a>(
                 // 残余述語は一致条件として段のスコープで束縛する（Issue #1830）。
                 on_res = bind_on_residuals(&mut b, step_scope, &split, udfs)?;
             }
+            JoinCondition::Cross => {
+                // CROSS JOIN（Issue #1831）: 条件なしの直積。右 relation の全列を可視列へ足すだけで、
+                // キー・ON 残余は空のまま（実行段は空キー段として全組み合わせを列挙する）。
+                let new_schema =
+                    *b.schemas
+                        .get(new_rel)
+                        .ok_or_else(|| SqlSurfaceError::Internal {
+                            detail: "JOIN relation index out of range".to_string(),
+                        })?;
+                visible.extend(relation_columns(new_rel, new_schema));
+            }
             JoinCondition::Using(_) | JoinCondition::Natural => {
                 let left_base = BindingScope::new(
                     b.relations

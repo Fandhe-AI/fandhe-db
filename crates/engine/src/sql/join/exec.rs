@@ -191,6 +191,24 @@ fn join_step(
     // ON 残余（Issue #1830）の評価用。タプルの組み立て領域（長さ n）は確保前に計上する。
     let has_on_residual =
         !(step.on_acc.is_empty() && step.on_new.is_empty() && step.on_mixed.is_empty());
+    // Issue #1831（SQL-60）: 結合キーも ON 残余も無い段（CROSS JOIN・共通列 0 個の NATURAL）の
+    // 件数は左 × 右で確定する。ハッシュ表・ペア列を確保する前に出力上限・暗黙の結果行数上限を
+    // 判定する（`checked_mul` のオーバーフローも `54000`）。逐次判定は後段の安全網として残す。
+    // 判定に使うのは可視行（RLS・WHERE 適用後）の件数だけで、`LIMIT`／`OFFSET` の値には依存しない。
+    if step.keys.is_empty() && !has_on_residual {
+        match acc.len().checked_mul(new_rows.len()) {
+            Some(product) if product <= limits.max_output_rows => {
+                if matches!(stop_after_pairs, Some(t) if product > t) {
+                    return Err(crate::sql::scan::row_limit_exceeded());
+                }
+            }
+            _ => {
+                return Err(SqlSurfaceError::payload_too_large(
+                    "JOIN result exceeds the row limit",
+                ));
+            }
+        }
+    }
     let mut probe: Vec<Option<u32>> = Vec::new();
     if has_on_residual {
         budget.charge(n.saturating_mul(SLOT_BYTES))?;
@@ -395,5 +413,81 @@ mod pair_budget_tests {
             .expect_err("fourth pair must exceed the shared byte budget");
         assert_eq!(err.wire_code(), "54000");
         assert_eq!(pairs.len(), 3, "rejected pair must not be pushed");
+    }
+}
+
+#[cfg(test)]
+mod cross_precheck_tests {
+    use super::*;
+
+    fn rows(n: usize) -> Vec<ResultRow> {
+        (0..n)
+            .map(|i| ResultRow {
+                id: i as u64,
+                score: 0.0,
+                cells: Vec::new(),
+            })
+            .collect()
+    }
+
+    fn cross_step() -> StepPlan {
+        StepPlan {
+            preserve_acc: false,
+            preserve_new: false,
+            keys: Vec::new(),
+            on_acc: Vec::new(),
+            on_new: Vec::new(),
+            on_mixed: Vec::new(),
+        }
+    }
+
+    fn limits(max_output_rows: usize) -> JoinLimits {
+        JoinLimits {
+            max_output_rows,
+            ..JoinLimits::default()
+        }
+    }
+
+    fn run(
+        max_output_rows: usize,
+        stop: Option<usize>,
+    ) -> (Result<Tuples, SqlSurfaceError>, usize) {
+        let sides = vec![rows(3), rows(2)];
+        let acc = Tuples::single_relation_for_test(3);
+        let mut budget = JoinBudget::new(usize::MAX / 2);
+        let r = join_step(
+            &sides,
+            &cross_step(),
+            1,
+            &sides[1],
+            &acc,
+            &mut budget,
+            &limits(max_output_rows),
+            stop,
+        );
+        (r, budget.used)
+    }
+
+    /// 直積の件数が上限を超える場合は、確保前（予算計上 0）に `54000` で拒否される。
+    #[test]
+    fn cross_product_over_limit_is_rejected_before_allocation() {
+        let (r, used) = run(5, None);
+        assert_eq!(r.err().expect("6 > 5").wire_code(), "54000");
+        assert_eq!(used, 0, "must be rejected before any charge");
+    }
+
+    /// 境界値: 上限ちょうどなら成功して 6 タプルになる。
+    #[test]
+    fn cross_product_at_limit_succeeds() {
+        let (r, _) = run(6, None);
+        assert_eq!(r.expect("6 <= 6").len(), 6);
+    }
+
+    /// 暗黙の結果行数上限（最終段の停止閾値）超過も確保前に拒否される。
+    #[test]
+    fn cross_product_over_stop_threshold_is_rejected_before_allocation() {
+        let (r, used) = run(100, Some(5));
+        assert_eq!(r.err().expect("6 > 5").wire_code(), "54000");
+        assert_eq!(used, 0);
     }
 }

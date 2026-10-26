@@ -3064,11 +3064,23 @@ pub(crate) enum JoinKind {
 /// `Natural`（Issue #1827）は `NATURAL [INNER|LEFT|RIGHT|FULL [OUTER]] JOIN` で、列名列は
 /// 構文段では持たない。束縛段 `sql::join` が両入力のスキーマから共通列名を導出し、`Using` と
 /// 同じ経路で束縛する（共通列が 0 個なら条件なしの直積）。
+/// `Cross`（Issue #1831・SQL-60 ポインタ）は `CROSS JOIN` で、条件を持たない直積。結合種別は
+/// 常に [`JoinKind::Inner`]。束縛段では結合キー・ON 残余ともに空の段になる。
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) enum JoinCondition {
     On(Vec<JoinWherePredicate>),
     Using(Vec<String>),
     Natural,
+    Cross,
+}
+
+/// [`parse_join_kind`] が返す結合形（条件の置き方の違い）。`Plain` は `ON`／`USING` を要求し、
+/// `Natural` と `Cross` は条件を持たない（Issue #1827・#1831）。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum JoinForm {
+    Plain,
+    Natural,
+    Cross,
 }
 
 /// left-deep 連鎖 JOIN の 1 段（Issue #1190）。`kind` は「これまでの結合結果」
@@ -18169,8 +18181,7 @@ pub(super) fn probe_from_table_ref(tokens: &[Token]) -> Option<(TableRef, usize)
 /// §2.2・#926）。`validate_sql_tokens_impl` の集計・`DISTINCT`・集合演算の判定
 /// より前に呼ぶ。括弧深さ 0 の最初の `FROM` の直後が `<ident> [[AS] <alias>]
 /// (JOIN|INNER JOIN|LEFT|RIGHT|FULL|CROSS|NATURAL)` の並びのときのみ真になる
-/// （`CROSS`〔対象外〕も検出して `parse_join_statement` 側で
-/// `42601` に分類させる。`NATURAL` は Issue #1827 で受理対象になった——構文段の判定順序〔`42601` が `42P01` に先行する〕を
+/// （`CROSS` は Issue #1831 で受理対象。`NATURAL` は Issue #1827 で受理対象になった——構文段の判定順序〔`42601` が `42P01` に先行する〕を
 /// 保つため。`LEFT`／`RIGHT`／`FULL [OUTER]` は Issue #926 で受理対象になった）。
 pub(crate) fn looks_like_join(tokens: &[Token]) -> bool {
     if !matches!(tokens.first(), Some(Token::Keyword(Keyword::Select))) {
@@ -19111,22 +19122,32 @@ fn parse_join_where_leaf(p: &mut Parser<'_>) -> Result<JoinWherePredicate, SqlSu
 }
 
 /// 結合種別の先頭語（`[NATURAL] INNER`／`JOIN`／`LEFT`／`RIGHT`／`FULL [OUTER]`）を読み、
-/// 対応する [`JoinKind`] と NATURAL 指定の有無を返す。結合語で始まらなければ `Ok(None)`
-/// （連鎖の終端）。`CROSS`／単独の `OUTER`／`NATURAL` の後に結合種別が続かない形は
-/// 対象外として `42601`（fail-closed）。
-fn parse_join_kind(p: &mut Parser<'_>) -> Result<Option<(JoinKind, bool)>, SqlSurfaceError> {
+/// 対応する [`JoinKind`] と結合形（[`JoinForm`]）を返す。`CROSS JOIN`（Issue #1831）は
+/// `(Inner, Cross)`。結合語で始まらなければ `Ok(None)`（連鎖の終端）。`CROSS` の後が `JOIN`
+/// でない形・単独の `OUTER`・`NATURAL` の後に結合種別が続かない形は `42601`（fail-closed）。
+fn parse_join_kind(p: &mut Parser<'_>) -> Result<Option<(JoinKind, JoinForm)>, SqlSurfaceError> {
+    if p.peek_ident_matches("CROSS") {
+        p.advance();
+        p.expect_ident_matching("JOIN")?;
+        return Ok(Some((JoinKind::Inner, JoinForm::Cross)));
+    }
     let natural = p.peek_ident_matches("NATURAL");
     if natural {
         p.advance();
     }
+    let form = if natural {
+        JoinForm::Natural
+    } else {
+        JoinForm::Plain
+    };
     if p.peek_ident_matches("INNER") {
         p.advance();
         p.expect_ident_matching("JOIN")?;
-        return Ok(Some((JoinKind::Inner, natural)));
+        return Ok(Some((JoinKind::Inner, form)));
     }
     if p.peek_ident_matches("JOIN") {
         p.advance();
-        return Ok(Some((JoinKind::Inner, natural)));
+        return Ok(Some((JoinKind::Inner, form)));
     }
     for (word, kind) in [
         ("LEFT", JoinKind::Left),
@@ -19139,12 +19160,12 @@ fn parse_join_kind(p: &mut Parser<'_>) -> Result<Option<(JoinKind, bool)>, SqlSu
                 p.advance();
             }
             p.expect_ident_matching("JOIN")?;
-            return Ok(Some((kind, natural)));
+            return Ok(Some((kind, form)));
         }
     }
-    if natural || p.peek_ident_matches("CROSS") || p.peek_ident_matches("OUTER") {
+    if natural || p.peek_ident_matches("OUTER") {
         return Err(SqlSurfaceError::unsupported(
-            "only [NATURAL] INNER/LEFT/RIGHT/FULL [OUTER] JOIN (or bare JOIN) is supported",
+            "only CROSS JOIN or [NATURAL] INNER/LEFT/RIGHT/FULL [OUTER] JOIN (or bare JOIN) is supported",
         ));
     }
     Ok(None)
@@ -19286,11 +19307,11 @@ fn parse_join_statement(
     let mut steps: Vec<JoinStep> = Vec::new();
 
     loop {
-        let (kind, natural) = match parse_join_kind(&mut p)? {
+        let (kind, form) = match parse_join_kind(&mut p)? {
             Some(k) => k,
             None if steps.is_empty() => {
                 return Err(SqlSurfaceError::unsupported(
-                    "only [NATURAL] INNER/LEFT/RIGHT/FULL [OUTER] JOIN (or bare JOIN) is supported",
+                    "only CROSS JOIN or [NATURAL] INNER/LEFT/RIGHT/FULL [OUTER] JOIN (or bare JOIN) is supported",
                 ));
             }
             None => break,
@@ -19313,7 +19334,17 @@ fn parse_join_statement(
         relations.push(rel);
         // `USING` は直後が `(` のときだけ結合条件として扱う（`USING PLAN(...)` 等の
         // 他の句と取り違えず、それ以外は従来どおり `ON` を要求して `42601`）。
-        let condition = if natural {
+        let condition = if form == JoinForm::Cross {
+            // CROSS JOIN は結合条件を持たない（`ON`／`USING (...)` の後置は構文エラー）。
+            if p.peek_ident_matches("ON")
+                || (p.peek_ident_matches("USING") && p.peek_punct_at(1, '('))
+            {
+                return Err(SqlSurfaceError::unsupported(
+                    "CROSS JOIN cannot have an ON or USING clause",
+                ));
+            }
+            JoinCondition::Cross
+        } else if form == JoinForm::Natural {
             // NATURAL は結合条件を持たない（`ON`／`USING (...)` の後置は構文エラー）。
             if p.peek_ident_matches("ON")
                 || (p.peek_ident_matches("USING") && p.peek_punct_at(1, '('))
@@ -34250,7 +34281,59 @@ mod tests {
             "SELECT * FROM a NATURAL CROSS JOIN b LIMIT 1",
             "SELECT * FROM a NATURAL OUTER JOIN b LIMIT 1",
             "SELECT * FROM a NATURAL b LIMIT 1",
-            "SELECT * FROM a CROSS JOIN b LIMIT 1",
+        ] {
+            let err = validate_sql(sql, &lookup).expect_err("must be rejected");
+            assert_eq!(err.wire_code(), "42601", "sql={sql:?} err={err:?}");
+        }
+    }
+
+    /// Issue #1831・SQL-60: `CROSS JOIN` は `JoinCondition::Cross`（kind は常に Inner）で保持し、
+    /// `ON`／`USING` の後置・`CROSS OUTER/INNER/LEFT`・`NATURAL CROSS` は `42601` に拒否する。
+    #[test]
+    fn cross_join_is_parsed_and_misuse_is_rejected() {
+        let lookup = catalog_with(&["a", "b", "c"]);
+        for (sql, conds) in [
+            ("SELECT * FROM a CROSS JOIN b LIMIT 1", vec![true]),
+            ("SELECT * FROM a AS x CROSS JOIN b y LIMIT 1", vec![true]),
+            (
+                "SELECT * FROM a CROSS JOIN b CROSS JOIN c LIMIT 1",
+                vec![true, true],
+            ),
+            (
+                "SELECT * FROM a CROSS JOIN b JOIN c ON b.id = c.id LIMIT 1",
+                vec![true, false],
+            ),
+            (
+                "SELECT * FROM a NATURAL JOIN b CROSS JOIN c LIMIT 1",
+                vec![false, true],
+            ),
+        ] {
+            match validate_sql(sql, &lookup).expect("CROSS JOIN should be accepted") {
+                Statement::Join(v) => {
+                    assert_eq!(v.steps.len(), conds.len(), "sql={sql:?}");
+                    for (step, is_cross) in v.steps.iter().zip(&conds) {
+                        assert_eq!(
+                            step.condition == JoinCondition::Cross,
+                            *is_cross,
+                            "sql={sql:?}"
+                        );
+                        if *is_cross {
+                            assert_eq!(step.kind, JoinKind::Inner, "sql={sql:?}");
+                        }
+                    }
+                }
+                other => panic!("expected Join, got {other:?}"),
+            }
+        }
+        for sql in [
+            "SELECT * FROM a CROSS JOIN b ON a.id = b.id LIMIT 1",
+            "SELECT * FROM a CROSS JOIN b USING (x) LIMIT 1",
+            "SELECT * FROM a CROSS OUTER JOIN b LIMIT 1",
+            "SELECT * FROM a CROSS INNER JOIN b LIMIT 1",
+            "SELECT * FROM a CROSS LEFT JOIN b LIMIT 1",
+            "SELECT * FROM a CROSS b LIMIT 1",
+            "SELECT * FROM a CROSS JOIN LIMIT 1",
+            "SELECT * FROM a NATURAL CROSS JOIN b LIMIT 1",
         ] {
             let err = validate_sql(sql, &lookup).expect_err("must be rejected");
             assert_eq!(err.wire_code(), "42601", "sql={sql:?} err={err:?}");

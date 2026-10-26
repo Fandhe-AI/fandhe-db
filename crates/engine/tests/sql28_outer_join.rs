@@ -3,7 +3,7 @@
 //!
 //! `tests/sql28_inner_join.rs` と同じ流儀（実 `Storage` ＋ `CpuScalarProvider`、
 //! `unique_db_path`／`CleanupGuard`、`EngineCore` を production 経路として使う）。
-//! `CROSS`・単独の `OUTER JOIN`・3 テーブル連鎖等の対象外事項の
+//! 単独の `OUTER JOIN`・3 テーブル連鎖等の対象外事項の
 //! 拒否確認は `sql28_inner_join.rs` 側に既存のものを残す（INNER・OUTER で共通の
 //! 構文検証のため二重化しない）。
 

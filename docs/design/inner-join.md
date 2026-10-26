@@ -37,7 +37,7 @@ conj        := colref <op> <literal>        -- op: = < <= > >= / LIKE '<pattern>
 
 relation は常にちょうど 2 個。以下はいずれも `42601`（fail-closed）:
 
-- `CROSS` JOIN（`JOIN ... USING (...)` は Issue #1826、`NATURAL JOIN` は Issue #1827 で受理対象に
+- （`CROSS JOIN` は Issue #1831、`JOIN ... USING (...)` は Issue #1826、`NATURAL JOIN` は Issue #1827 で受理対象に
   なった。`docs/design/join-using.md` 参照。`LEFT`／`RIGHT`／`FULL [OUTER]` は
   Issue #926 で受理対象になった。`docs/design/outer-join.md` 参照）
 - 非等価の `ON`、左右が同じ relation を指す `ON`
@@ -189,7 +189,7 @@ JOIN の「整数クラスを跨いで結合できる」という要件（`id`�
 
 ## 対象外（Issue は起票しない。申し送りのみ）
 
-- `CROSS` JOIN（`JOIN ... USING (...)` は Issue #1826、`NATURAL JOIN` は Issue #1827 で受理対象に
+- （`CROSS JOIN` は Issue #1831、`JOIN ... USING (...)` は Issue #1826、`NATURAL JOIN` は Issue #1827 で受理対象に
   なった。`docs/design/join-using.md` 参照。`LEFT`/`RIGHT`/`FULL [OUTER]` は
   Issue #926 で受理対象になった。`docs/design/outer-join.md` 参照）
 - ウィンドウ・`DISTINCT` と JOIN の組み合わせ
@@ -219,3 +219,18 @@ JOIN の「整数クラスを跨いで結合できる」という要件（`id`�
   外部結合の ON 残余は WHERE の簡約規則へ流さない。
 - Issue #1830 で残余付き ON の `0A000` 拒否を解除した（一致条件として結合段で評価する。意味論は
   [outer-join.md](outer-join.md) の「Issue #1830 追記」）。キー無し ON の `42601` は維持する。
+
+## Issue #1831 追記（CROSS JOIN。SQL-60 ポインタ）
+
+- 文法: `rel CROSS JOIN rel`（別名可）。`ON`／`USING (...)` の後置・`NATURAL CROSS`・
+  `CROSS OUTER/INNER/LEFT JOIN`・`CROSS` の後に `JOIN` が無い形は `42601`。
+- 表現: `JoinCondition::Cross`（kind は常に `Inner`）。束縛段は右 relation の全列を可視列へ足すだけの
+  空キー段になり、NATURAL の共通列 0 個と同じ実行経路（1 バケットのハッシュ表による直積列挙）を通る。
+  `SELECT *` の列順は左の全列 → 右の全列。
+- 上限: 空キーかつ ON 残余なしの段は、ハッシュ表・ペア列の確保前に `左 × 右`（`checked_mul`）を
+  出力行数上限と照合して `54000`（オーバーフローも同じ）。最終段では暗黙の結果行数上限（#1797）も事前判定する。
+  判定に使うのは可視行（RLS・WHERE 適用後）の件数だけで、`LIMIT`／`OFFSET` の値や他テナントの行数には依存しない。
+  従来の逐次判定は後段の安全網として残す。
+- 側を跨ぐ WHERE（`a.x = b.y` 等）は結合後の残余として評価するため、上限判定は直積の件数に対して行われる
+  （fail-closed。WHERE の等価条件を結合キーへ昇格する最適化は対象外）。
+- 対象外: カンマ結合 `FROM a, b`、DML の `FROM`／`USING` での CROSS、`CROSS JOIN LATERAL`・派生テーブル。

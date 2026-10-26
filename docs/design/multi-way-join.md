@@ -49,7 +49,7 @@ having      := <項目名> op ['-'] <数値>
 ### `42601` のまま残す形
 
 ベクトル順位付けとの併用（`ORDER BY ... <=>`・`HYBRID`・`USING PLAN`・`USING MODE`・
-`HINT ORDER`）、`CROSS`／`NATURAL` JOIN、`JOIN ... USING (...)`、FROM でのビュー参照、
+`HINT ORDER`）、`JOIN ... USING (...)`、FROM でのビュー参照、
 JOIN の WHERE 内のサブクエリ・`EXISTS`、`$n` パラメータ、`NOT`・`NOT IN`・`IS [NOT] NULL`・
 `BETWEEN`・`<>`／`!=`・式、`COUNT(DISTINCT ...)`・集計引数の式・VECTOR 列を引数とする集計・
 ウィンドウ関数・`DISTINCT`・`t.*`、JOIN を含む `EXPLAIN`／`DECLARE CURSOR`／`CREATE VIEW`
@@ -168,8 +168,10 @@ PostgreSQL と同じ意味論に従ってテスト内で手計算した値に固
 
 ## 対象外（申し送りのみ。Issue は起票しない）
 
-- `CROSS`／`NATURAL` JOIN・`USING (...)`・`NOT`／`IS NULL`／`BETWEEN`／`<>`・式・
+- `USING (...)`・`NOT`／`IS NULL`／`BETWEEN`／`<>`・式・
   `COUNT(DISTINCT ...)`・ウィンドウ・`DISTINCT` と JOIN の組み合わせ
 - 整数と浮動小数の列同士の比較（比較クラス不一致として `42804`）
 - JOIN を含む VIEW・CTE・サブクエリ・`EXPLAIN`・カーソル・`COPY`・`$n`
 - JOIN 経路の性能計測（#1204）
+
+`CROSS JOIN` は Issue #1831 で受理対象になった（[inner-join.md](inner-join.md) の「Issue #1831 追記」参照）。
