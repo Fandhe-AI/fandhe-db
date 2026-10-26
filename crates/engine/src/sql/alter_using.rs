@@ -409,6 +409,7 @@ pub(crate) fn redact_row_conversion_error(e: SqlSurfaceError) -> SqlSurfaceError
         | E::InvalidViewReplacement { .. }
         | E::DuplicateColumn { .. }
         | E::InvalidColumnReference
+        | E::CteColumnListTooLong { .. }
         | E::OrderByPositionNotInSelectList { .. }
         | E::AggregateOrderByNotInArguments
         | E::DependentObjectsStillExist { .. }

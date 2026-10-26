@@ -482,8 +482,6 @@ fn unsupported_positions_fail_closed_without_side_effects() {
     for sql in [
         // 集合演算の枝
         "SELECT c FROM v UNION SELECT lang FROM docs",
-        // CTE
-        "WITH x AS (SELECT c FROM v) SELECT * FROM x LIMIT 10",
         // ウィンドウ関数
         "SELECT c, ROW_NUMBER() OVER (ORDER BY d) FROM v LIMIT 10",
         // 疑似列 `id` へ写る別名を述語で参照する
@@ -495,6 +493,12 @@ fn unsupported_positions_fail_closed_without_side_effects() {
             "unexpected code {code} for {sql}"
         );
     }
+    // 列別名付きビューの CTE 内参照は、SQL-62 (2)・Issue #1857 の対応表の伝播により受理される。
+    let via_cte = q(
+        &core,
+        "WITH x AS (SELECT c FROM v) SELECT c FROM x LIMIT 10",
+    );
+    assert_eq!(names(&via_cte), ["c"]);
     // 副作用なし: 通常の参照は引き続き動く。
     assert_eq!(q(&core, "SELECT c FROM v LIMIT 10").rows.len(), 5);
 }
