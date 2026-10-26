@@ -4,7 +4,7 @@
 - 対象ビヘイビア（ポインタ表記のみ。spec 本文は転記しない）: SQL-57・SQL-13・SQL-14・RLS-7・RLS-8・WIRE-13・TABLE-13
 - 前提: [array-agg.md](array-agg.md)・[string-agg.md](string-agg.md)（SQL-57 の集計関数追加の型。対象外経路の扱いを踏襲する）
 - 検証コード: `crates/engine/src/sql/variance.rs`・`numeric.rs`（`U256`・`select_div_scale_wide`・`div_round_wide`）・
-  `allowlist.rs`・`parser.rs`・`aggregate.rs`・`const_select.rs`、`crates/engine/tests/sql57_variance.rs`
+  `allowlist.rs`・`parser.rs`・`aggregate.rs`・`const_select.rs`、`crates/engine/tests/sql57_variance.rs`・`sql57_stddev.rs`（#1804）
 
 ## 背景・目的
 
@@ -73,6 +73,18 @@ GROUP BY の有無を問わず使えるようにする。後続の `stddev` 系�
 
 通常のビュー越しの分散は元表と同じ結果になる。
 
+## stddev 系（Issue #1804）
+
+- `stddev`（`stddev_samp` と同義）・`stddev_pop`・`stddev_samp` は分散と同じ累積状態を共有し、確定時だけ平方根をかぶせる
+  （`VarianceOutput::Stddev`。構文・型の受理行列・結果型・対象外経路は `is_variance_family` で分散と共通）
+- numeric は PostgreSQL 17 の手順どおり、丸め済みの分散を同じ scale で平方根にして half-up 丸めする
+  （`numeric::sqrt_round_decimal`。`U256::isqrt` は二分探索）。`N·Σx²/den` の平方根を直接取る改良は PG とずれるため行わない。
+  全値が等しい場合は scale 0 の `0`
+- double は分散の `f64::sqrt`。非有限は防御として `22003`
+- 範囲超過は分散段階の判定（38 桁・結果 scale 38 超）をそのまま継承する。stddev 固有の `22003` 経路はない
+- 既定の結果列名は関数名。HAVING 内の直接呼び出し（#2687）も通る
+- 期待値は PG 手順を Python の整数演算で独立に再現して導出した固定値（`sql57_stddev.rs`）
+
 ## 資源・安全性
 
 - 状態は O(1)（行数に比例して増えない）。`Accumulator` の大きさは増やさない（正確演算は `Box`。単体テストで上限を固定）
@@ -87,11 +99,11 @@ GROUP BY の有無を問わず使えるようにする。後続の `stddev` 系�
 
 ## 契約変更（BREAKING）
 
-- `AggregateFunc` に `Variance`・`VarPop`・`VarSamp` を追加（`non_exhaustive` ではない公開 enum）
-- 3 名が予約語になり、同名の `CREATE FUNCTION` は拒否される
+- `AggregateFunc` に `Variance`・`VarPop`・`VarSamp`（#1804 で `Stddev`・`StddevPop`・`StddevSamp`）を追加（`non_exhaustive` ではない公開 enum）
+- 6 名が予約語になり、同名の `CREATE FUNCTION` は拒否される
 
 ## 対象外（追跡）
 
-- `stddev` / `stddev_pop` / `stddev_samp`（#1804）、`FILTER`（#1806）
+- `FILTER`（#1806）
 - `DISTINCT` 付き分散、FROM なし・JOIN・ウィンドウ（SQL-64）・NoSQL 表層・ビュー本体の分散
 - 式入力の numeric 化、任意精度の numeric
