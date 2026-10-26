@@ -206,6 +206,36 @@ fn abs_of_int4_minimum_is_out_of_range() {
     )
     .expect("insert");
     assert_eq!(code(&core, &ctx, "SELECT abs(min(n)) FROM t"), "22003");
+    // 後続の算術に渡しても範囲外のまま通らない（codex 指摘）。
+    assert_eq!(code(&core, &ctx, "SELECT abs(min(n)) - 1 FROM t"), "22003");
+}
+
+/// codex 指摘: NUMERIC に統一した CASE／COALESCE の整数分岐が値としても NUMERIC になる。
+#[test]
+fn numeric_branch_integer_arm_is_converted_to_numeric() {
+    let (core, ctx, _g) = setup();
+    for sql in [
+        "SELECT coalesce(sum(b), 0)::text FROM t WHERE 1 = 0",
+        "SELECT (CASE WHEN 1 = 1 THEN 0 ELSE sum(b) END)::text FROM t",
+        "SELECT (CASE WHEN 1 = 1 THEN max(n) ELSE sum(b) END)::text FROM t",
+    ] {
+        let r = text_cells(&core, &ctx, sql);
+        assert!(matches!(r[0][0], Cell::Text(_)), "{sql}");
+    }
+}
+
+/// codex 指摘: real に統一する分岐の整数値は単精度へ丸められる。
+#[test]
+fn real_branch_integer_arm_is_rounded_to_float4() {
+    let (core, ctx, _g) = setup();
+    for sql in [
+        "SELECT (CASE WHEN 1 = 1 THEN 16777217 ELSE CAST(0 AS real) END) \
+         - CAST(16777216 AS real) FROM t",
+        "SELECT coalesce(16777217, CAST(0 AS real)) - CAST(16777216 AS real) FROM t",
+    ] {
+        let r = text_cells(&core, &ctx, sql);
+        assert_eq!(r[0][0], Cell::Float(0.0), "{sql}");
+    }
 }
 
 fn text_cells(core: &EngineCore, ctx: &PolicyContext, sql: &str) -> Vec<Vec<Cell>> {

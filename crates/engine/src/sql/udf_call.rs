@@ -3923,22 +3923,35 @@ fn bind_case(
         let final_ty = unified.ok_or_else(|| SqlSurfaceError::FeatureNotSupported {
             detail: "CASE expression with only NULL results has no determinable type".to_string(),
         })?;
+        let mut branches: Vec<(&Expr, &BoundExpr, Option<ExprType>)> = whens
+            .iter()
+            .zip(bound_whens.iter())
+            .zip(branch_tys.iter())
+            .map(|(((_, r), (_, br)), t)| (r, br, *t))
+            .collect();
+        if let Some(e) = else_result {
+            branches.push((e, &else_bound, else_ty));
+        }
         if final_ty == ExprType::Numeric && env.numeric_arith {
-            let mut branches: Vec<(&Expr, &BoundExpr, Option<ExprType>)> = whens
-                .iter()
-                .zip(bound_whens.iter())
-                .zip(branch_tys.iter())
-                .map(|(((_, r), (_, br)), t)| (r, br, *t))
-                .collect();
-            if let Some(e) = else_result {
-                branches.push((e, &else_bound, else_ty));
-            }
             validate_numeric_branches(
                 &branches,
                 env.schema,
                 "CASE branches must have the same type",
             )?;
         }
+        // 統一後の結果型へ各分岐の値を実際に変換する（NUMERIC・real。評価値の型と結果型を一致させる）。
+        let coercion = branch_coercion(env, final_ty, &branches);
+        let schema = env.schema;
+        let bound_whens: Vec<(BoundExpr, BoundExpr)> = bound_whens
+            .into_iter()
+            .zip(whens.iter())
+            .zip(branch_tys.iter())
+            .map(|(((c, r), (_, re)), t)| (c, coerce_branch(coercion, re, r, *t, schema)))
+            .collect();
+        let else_bound = match else_result {
+            Some(e) => coerce_branch(coercion, e, else_bound, else_ty, schema),
+            None => else_bound,
+        };
         Ok((
             BoundExpr::Case {
                 whens: bound_whens,
@@ -3978,19 +3991,27 @@ fn bind_coalesce(
         let final_ty = unified.ok_or_else(|| SqlSurfaceError::FeatureNotSupported {
             detail: "COALESCE with only NULL arguments has no determinable type".to_string(),
         })?;
+        let branches: Vec<(&Expr, &BoundExpr, Option<ExprType>)> = args
+            .iter()
+            .zip(bound_args.iter())
+            .zip(arg_tys.iter())
+            .map(|((a, b), t)| (a, b, *t))
+            .collect();
         if final_ty == ExprType::Numeric && env.numeric_arith {
-            let branches: Vec<(&Expr, &BoundExpr, Option<ExprType>)> = args
-                .iter()
-                .zip(bound_args.iter())
-                .zip(arg_tys.iter())
-                .map(|((a, b), t)| (a, b, *t))
-                .collect();
             validate_numeric_branches(
                 &branches,
                 env.schema,
                 "COALESCE arguments must have the same type",
             )?;
         }
+        let coercion = branch_coercion(env, final_ty, &branches);
+        let schema = env.schema;
+        let bound_args: Vec<BoundExpr> = bound_args
+            .into_iter()
+            .zip(args.iter())
+            .zip(arg_tys.iter())
+            .map(|((b, a), t)| coerce_branch(coercion, a, b, *t, schema))
+            .collect();
         Ok((BoundExpr::Coalesce(bound_args), final_ty))
     })
 }
@@ -5772,6 +5793,17 @@ fn scalar_numeric_kind(
             f: BuiltinFn::TypedArith(_, k),
             ..
         } => Some(*k),
+        // 分岐の値変換・整数 `abs` の範囲検査が挿入する変換ノードは変換先の種別を持つ。
+        BoundExpr::Builtin {
+            f: BuiltinFn::Cast(c),
+            ..
+        } => match c.to {
+            crate::sql::cast_value::CastDst::Int2 => Some(NumericKind::Int2),
+            crate::sql::cast_value::CastDst::Int4 => Some(NumericKind::Int4),
+            crate::sql::cast_value::CastDst::Int8 => Some(NumericKind::Int8),
+            crate::sql::cast_value::CastDst::Float4 => Some(NumericKind::Float4),
+            _ => None,
+        },
         // `json_array_length` は int4（Issue #2180）。整数除算・添字の型解決に反映する。
         BoundExpr::JsonTextFn(f) if f.result_is_int4() => Some(NumericKind::Int4),
         // 配列関数の長さ・位置は int4（TABLE-35・Issue #1604）。
@@ -5850,6 +5882,112 @@ fn validate_numeric_branches(
         }
     }
     Ok(())
+}
+
+/// 投影モードの `abs(<整数型>)` を、引数の整数種別への checked な変換で包む（Issue #1812）。
+/// `Abs` の評価は f64 の絶対値だけなので、int2／int4 の最小値の `abs` が範囲外のまま通らないよう、
+/// 結果を引数と同じ整数種別へ `CAST` 相当で戻して `22003` を発生させる（int8 は 2^53 以内の
+/// 不変条件で運ばれるため対象外）。`abs` 以外・非投影モード・整数以外の引数は素通し。
+fn wrap_integer_abs_range_check(
+    builtin: BuiltinFn,
+    args: &[Expr],
+    node: BoundExpr,
+    env: &BindEnv<'_>,
+) -> BoundExpr {
+    use crate::sql::cast_value::{CastDst, CastFn, CastSrc};
+    if builtin != BuiltinFn::Abs || !env.typed_arith {
+        return node;
+    }
+    let (Some(arg), BoundExpr::Builtin { args: bound, .. }) = (args.first(), &node) else {
+        return node;
+    };
+    let Some(b) = bound.first() else {
+        return node;
+    };
+    let to = match numeric_kind(arg, b, env) {
+        Some(NumericKind::Int2) => CastDst::Int2,
+        Some(NumericKind::Int4) => CastDst::Int4,
+        _ => return node,
+    };
+    BoundExpr::Builtin {
+        f: BuiltinFn::Cast(CastFn {
+            from: CastSrc::Int8,
+            to,
+        }),
+        args: vec![node],
+    }
+}
+
+/// `CASE`／`COALESCE` の統一済み結果型へ分岐の値を揃える変換の種類。
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum BranchCoercion {
+    None,
+    /// 結果型が NUMERIC。`Scalar` で運ばれる整数分岐を `Decimal` に変える。
+    Numeric,
+    /// 結果が `real`。整数分岐を単精度へ丸める。
+    Float4,
+}
+
+/// 統一後の分岐に必要な値変換を決める。`exprs`／`bounds`／`tys` は分岐ごとに同順。
+fn branch_coercion(
+    env: &BindEnv<'_>,
+    final_ty: ExprType,
+    branches: &[(&Expr, &BoundExpr, Option<ExprType>)],
+) -> BranchCoercion {
+    if final_ty == ExprType::Numeric && env.numeric_arith {
+        return BranchCoercion::Numeric;
+    }
+    if final_ty == ExprType::Scalar && (env.typed_arith || env.numeric_arith) {
+        let mut acc = ProjKind::Null;
+        for (e, b, _) in branches {
+            acc = common_proj_kind(acc, projection_kind(e, b, env.schema));
+        }
+        if acc == ProjKind::Num(NumericKind::Float4) {
+            return BranchCoercion::Float4;
+        }
+    }
+    BranchCoercion::None
+}
+
+/// 分岐 1 つの値を [`BranchCoercion`] に従って変換する。変換対象は整数種別の `Scalar` 分岐だけ
+/// （NUMERIC・単精度・NULL 分岐はそのまま）。
+fn coerce_branch(
+    coercion: BranchCoercion,
+    expr: &Expr,
+    bound: BoundExpr,
+    ty: Option<ExprType>,
+    schema: Option<&TableSchema>,
+) -> BoundExpr {
+    use crate::sql::cast_value::{CastDst, CastFn, CastSrc};
+    if coercion == BranchCoercion::None || ty != Some(ExprType::Scalar) {
+        return bound;
+    }
+    let is_int = matches!(expr, Expr::Number(raw) if classify_projection_integer_literal(raw).is_some())
+        || matches!(
+            projection_kind(expr, &bound, schema),
+            ProjKind::Num(NumericKind::Int2 | NumericKind::Int4 | NumericKind::Int8)
+        );
+    if !is_int {
+        return bound;
+    }
+    if coercion == BranchCoercion::Numeric {
+        if let Expr::Number(raw) = expr {
+            if let Ok(d) = crate::numeric::parse_literal_exact(raw) {
+                return BoundExpr::Numeric(d);
+            }
+        }
+    }
+    let to = match coercion {
+        BranchCoercion::Numeric => CastDst::Numeric(None),
+        _ => CastDst::Float4,
+    };
+    BoundExpr::Builtin {
+        f: BuiltinFn::Cast(CastFn {
+            from: CastSrc::Int8,
+            to,
+        }),
+        args: vec![bound],
+    }
 }
 
 /// 分岐型の単一化（[`unify_branch_type`]）に、集計式項目の `NUMERIC` と整数の混在
@@ -6820,13 +6958,11 @@ fn bind_call(
             }
             bound_args.push(b);
         }
-        return Ok((
-            BoundExpr::Builtin {
-                f: builtin,
-                args: bound_args,
-            },
-            ret,
-        ));
+        let node = BoundExpr::Builtin {
+            f: builtin,
+            args: bound_args,
+        };
+        return Ok((wrap_integer_abs_range_check(builtin, args, node, env), ret));
     }
 
     // 解決順（組み込み → 宣言的 UDF → WASM UDF）。組み込みは上で既に処理済みなので
