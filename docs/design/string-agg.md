@@ -70,7 +70,7 @@ Issue 本文は「集計内 `ORDER BY` の既存経路へ接続する」とし�
 
 ## 対象外（追跡）
 
-- FROM のない `string_agg`、JOIN の集計、ウィンドウの `string_agg`（SQL-64）、`string_agg(bytea, bytea)`、
-  `FILTER (WHERE ...)`
+- FROM のない `string_agg`、JOIN の集計、ウィンドウの `string_agg`（SQL-64）、`string_agg(bytea, bytea)`
+  （`FILTER (WHERE ...)` は Issue #1806 で対応済み。[aggregate-filter-clause.md](aggregate-filter-clause.md)）
 - 集計の入れ子の `42803`・引数中のウィンドウ関数の `42P20` への是正（現状は `42601`）
 - 上限の起動時設定（SQL-46 の範囲）

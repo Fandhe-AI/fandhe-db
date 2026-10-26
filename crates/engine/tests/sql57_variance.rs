@@ -643,7 +643,6 @@ fn unsupported_forms_are_rejected_explicitly() {
         "SELECT var_pop() FROM t",
         "SELECT var_pop(k, k) FROM t",
         "SELECT var_pop(k) OVER () FROM t",
-        "SELECT var_pop(k) FILTER (WHERE k > 1) FROM t",
     ] {
         let c = code_of(&core, sql);
         assert!(

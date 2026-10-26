@@ -67,7 +67,7 @@ GROUP BY の有無を問わず使えるようにする。後続の `stddev` 系�
 | FROM なし | `0A000` |
 | JOIN | `0A000` |
 | ウィンドウ `OVER` | 既存の拒否（`42601`/`0A000`） |
-| `DISTINCT`・内側 `ORDER BY`・`FILTER` | 既存の構文層の拒否 |
+| `DISTINCT`・内側 `ORDER BY`（`FILTER` は Issue #1806 で対応済み） | 既存の構文層の拒否 |
 | NoSQL（`BoundAggregateItem::bind`） | `42601` |
 | ビュー本体・評価後射影形ビューの外側 | 拒否 |
 

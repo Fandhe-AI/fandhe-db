@@ -203,6 +203,92 @@ fn is_where_predicate_boundary_token(
     }
 }
 
+/// `FILTER (WHERE ...)` の括弧区間（`open` は `FILTER` 直後の `(` の位置）を、構文解析の前に
+/// 先読み検査する（SQL-57・Issue #1806）。汎用の述語パーサは `count(*)`・`OVER (...)` を
+/// `42601` で落とすため、PostgreSQL と同じ SQLSTATE をここで分類する:
+/// ウィンドウ関数（`name(...) OVER`）は `42P20`、集計関数呼び出しは `42803`（判定は OVER を優先）、
+/// `$n` は `42601`（Prepared の等値序数フラグが FILTER 内の葉でずれる fail-open を防ぐ）。
+/// 部分クエリ（`( SELECT ...)`）の内側は走査しない（内側の集計は正当）。深さカウンタの
+/// 線形走査で再帰せず、呼び出し元は [`Parser::parse_aggregate_filter_clause`]。
+fn precheck_aggregate_filter_tokens(tokens: &[Token], open: usize) -> Result<(), SqlSurfaceError> {
+    // 区間内の `(` ごとの対応 `)` 位置（対応が無ければ `tokens.len()` 扱いで区間末尾まで）。
+    let mut close: Vec<Option<usize>> = vec![None; tokens.len()];
+    let mut stack: Vec<usize> = Vec::new();
+    let mut end = tokens.len();
+    for (i, tok) in tokens.iter().enumerate().skip(open) {
+        match tok {
+            Token::Punct('(') => stack.push(i),
+            Token::Punct(')') => {
+                if let Some(o) = stack.pop() {
+                    if let Some(slot) = close.get_mut(o) {
+                        *slot = Some(i);
+                    }
+                    if o == open {
+                        end = i;
+                        break;
+                    }
+                }
+            }
+            _ => {}
+        }
+    }
+    if tokens
+        .get(open.saturating_add(1)..end)
+        .is_some_and(|r| r.iter().any(|t| matches!(t, Token::Param(_))))
+    {
+        return Err(SqlSurfaceError::unsupported(
+            "parameters are not supported inside FILTER",
+        ));
+    }
+    let mut i = open.saturating_add(1);
+    while i < end {
+        match tokens.get(i) {
+            Some(Token::Punct('('))
+                if matches!(
+                    tokens.get(i.saturating_add(1)),
+                    Some(Token::Keyword(Keyword::Select))
+                ) =>
+            {
+                // 部分クエリは内側を走査せず対応する `)` の次へ進む。
+                match close.get(i).copied().flatten() {
+                    Some(c) => {
+                        i = c.saturating_add(1);
+                        continue;
+                    }
+                    None => break,
+                }
+            }
+            Some(Token::Ident(name))
+                if matches!(tokens.get(i.saturating_add(1)), Some(Token::Punct('('))) =>
+            {
+                let o = i.saturating_add(1);
+                let has_over = close
+                    .get(o)
+                    .copied()
+                    .flatten()
+                    .and_then(|c| tokens.get(c.saturating_add(1)))
+                    .is_some_and(
+                        |t| matches!(t, Token::Ident(n) if n.eq_ignore_ascii_case("OVER")),
+                    );
+                let is_agg = is_aggregate_function_name(name);
+                if has_over && (is_agg || WindowFunc::from_name(name).is_some()) {
+                    return Err(SqlSurfaceError::WindowingError {
+                        detail: "window functions are not allowed in FILTER",
+                    });
+                }
+                if is_agg {
+                    return Err(SqlSurfaceError::GroupingError {
+                        detail: "aggregate functions are not allowed in FILTER",
+                    });
+                }
+            }
+            _ => {}
+        }
+        i = i.saturating_add(1);
+    }
+    Ok(())
+}
+
 /// `WHERE`（・`CHECK` 本体）述語ツリーが持てる葉（`Or` を含まない末端述語）の
 /// 総数上限（TASK-208・SQL-24、Issue #912）。`declarative_filter::
 /// MAX_METADATA_FILTERS` と同じ値を採用する（下流の索引・束縛段が同じ上限を
@@ -3242,6 +3328,10 @@ pub struct AggregateItem {
     /// 集計の内側の `ORDER BY`（SQL-57。`string_agg` のみ非空になりうる。キー数の上限は
     /// [`MAX_SCALAR_ORDER_KEYS`]）。文レベルの `ORDER BY`（[`AggregateOrderBy`]）とは別物。
     pub(crate) order_by: Vec<AggregateOrderKey>,
+    /// `FILTER (WHERE <条件>)`（SQL-57・Issue #1806）。空なら FILTER なし。非空なら AND 結合の
+    /// 述語列で、真になる行だけをこの集計へ入れる（偽・NULL の行は入れない）。関数ごとの分岐を
+    /// 持たず全集計関数に共通で効く（束縛は `sql::parser::BoundAggregateFilter`）。
+    pub(crate) filter: Vec<WherePredicate>,
 }
 
 /// 集計の内側の `ORDER BY` 1 キー（SQL-57・Issue #1800。`string_agg(x, ',' ORDER BY y DESC)`）。
@@ -3439,6 +3529,9 @@ pub(crate) fn collect_aggregate_item_idents(
     for k in &agg.order_by {
         super::parser::collect_expr_idents(&k.expr, out);
     }
+    // SQL-57・Issue #1806: `FILTER (WHERE ...)` の条件が参照する識別子も含める
+    // （漏れると非公開列を条件経由で推測できる filter oracle になる）。
+    super::parser::collect_where_predicate_idents(&agg.filter, out);
 }
 
 impl GroupByClause {
@@ -6233,6 +6326,7 @@ impl<'a> Parser<'a> {
             }
         }
         self.expect_punct(')')?;
+        let filter = self.parse_aggregate_filter_clause()?;
         Ok(AggregateItem {
             func,
             arg,
@@ -6240,7 +6334,51 @@ impl<'a> Parser<'a> {
             distinct,
             extra_args,
             order_by,
+            filter,
         })
+    }
+
+    /// 集計呼び出しの `)` 直後に続く `FILTER (WHERE <条件>)`（SQL-57・Issue #1806）を読む。
+    /// `FILTER` は文脈語（`Token::Ident`）で、直後が `(` のときだけ句として消費する
+    /// （別名なしの列参照等を壊さない）。条件の文法は `WHERE` と同一で、`)` を境界として扱う。
+    /// 条件中の集計関数は `42803`、ウィンドウ関数は `42P20`、`$n` は `42601`（Prepared の
+    /// 等値序数フラグを FILTER 内の葉でずらさないため）。部分クエリは許可し、束縛前の解決は
+    /// トップレベル経路が担う（それ以外は束縛段が `42601` で fail-closed）。
+    /// 呼び出し元は [`Self::parse_aggregate_call_after_name`] のみ。
+    fn parse_aggregate_filter_clause(&mut self) -> Result<Vec<WherePredicate>, SqlSurfaceError> {
+        if !(self.peek_ident_matches("FILTER")
+            && matches!(self.tokens.get(self.pos + 1), Some(Token::Punct('('))))
+        {
+            return Ok(Vec::new());
+        }
+        self.advance();
+        let open = self.pos;
+        self.advance();
+        if !matches!(self.peek(), Some(Token::Keyword(Keyword::Where))) {
+            return Err(SqlSurfaceError::unsupported(
+                "FILTER requires a WHERE condition",
+            ));
+        }
+        precheck_aggregate_filter_tokens(&self.tokens, open)?;
+        self.advance();
+        let saved_calls = self.agg_calls.take();
+        let saved_minus = self.allow_unary_minus;
+        let saved_null = self.allow_null_literal;
+        self.allow_unary_minus = false;
+        self.allow_null_literal = false;
+        let mut leaf_count = 0usize;
+        let parsed = self.parse_where_or(true, false, 0, &mut leaf_count);
+        self.allow_null_literal = saved_null;
+        self.allow_unary_minus = saved_minus;
+        self.agg_calls = saved_calls;
+        let predicates = parsed?;
+        self.expect_punct(')')?;
+        if self.peek_ident_matches("OVER") {
+            return Err(SqlSurfaceError::feature_not_supported(
+                "FILTER is not supported for window functions",
+            ));
+        }
+        Ok(predicates)
     }
 
     /// `bool_and` 系の引数で左辺を読んだ直後に比較演算子が続く場合の残り（演算子と右辺）を読み、
@@ -20593,6 +20731,17 @@ fn validate_select_statement(
     // 正規化後のトークン列を見る（`sql::qualified_column` 参照）。
     let normalized = super::qualified_column::normalize_single_table_qualifiers(tokens)?;
     let tokens: &[Token] = &normalized;
+    // SQL-57・Issue #1806: `FILTER (WHERE ...)` 内のウィンドウ関数・集計は、文全体の
+    // `) OVER (` 走査（下の `contains_window_over`）でウィンドウ形へ誤振り分けされて
+    // 汎用の `42601` になる前に、PostgreSQL と同じ SQLSTATE（`42P20`・`42803`）で拒否する。
+    for (i, w) in tokens.windows(3).enumerate() {
+        if matches!(&w[0], Token::Ident(n) if n.eq_ignore_ascii_case("FILTER"))
+            && matches!(w[1], Token::Punct('('))
+            && matches!(w[2], Token::Keyword(Keyword::Where))
+        {
+            precheck_aggregate_filter_tokens(tokens, i.saturating_add(1))?;
+        }
+    }
     // TASK-166（SQL-13）: `SELECT` の直後（2 番目・3 番目のトークン）が
     // 集計関数名 `'('` なら集計 SELECT 形状（[`parse_aggregate_shape`]）へ、それ
     // 以外は既存の検索 SELECT 形状（[`parse_select_shape`]）へ分岐する。バック
@@ -29194,6 +29343,112 @@ mod tests {
             "54000"
         );
         assert!(is_aggregate_function_name("Array_Agg"));
+    }
+
+    /// SQL-57・Issue #1806: `FILTER (WHERE ...)` の構文。AND 結合・OR・部分クエリを受理し、
+    /// 集計式項目の中の集計・`DISTINCT`・内側 `ORDER BY` との併用でも AST に載る。
+    #[test]
+    fn aggregate_filter_parses_conditions_into_the_ast() {
+        let lookup = catalog_with(&["documents"]);
+        let agg = expect_aggregate(
+            "SELECT count(*) FILTER (WHERE a = 'x' AND n > 1), \
+             sum(n) FILTER (WHERE a = 'y' OR a = 'z') AS s, \
+             count(DISTINCT a) FILTER (WHERE n IS NULL), count(*), \
+             string_agg(a, ',' ORDER BY a) FILTER (WHERE flag) \
+             FROM documents",
+            &lookup,
+        );
+        assert_eq!(expect_agg_item(&agg.items()[0]).filter.len(), 2);
+        assert!(matches!(
+            expect_agg_item(&agg.items()[1]).filter.as_slice(),
+            [WherePredicate::Or(_)]
+        ));
+        assert_eq!(expect_agg_item(&agg.items()[2]).filter.len(), 1);
+        assert!(expect_agg_item(&agg.items()[3]).filter.is_empty());
+        assert_eq!(expect_agg_item(&agg.items()[4]).filter.len(), 1);
+        // 集計式項目の中の集計にも FILTER が付く。
+        let agg = expect_aggregate(
+            "SELECT sum(n) FILTER (WHERE a = 'x') + 1 FROM documents",
+            &lookup,
+        );
+        match &agg.items()[0] {
+            AggregateSelectItem::Expr { aggregates, .. } => {
+                assert_eq!(aggregates.len(), 1);
+                assert_eq!(aggregates[0].filter.len(), 1);
+            }
+            other => panic!("expected an expression item, got {other:?}"),
+        }
+        // FILTER 内の部分クエリは構文段では受理する（解決は実行段）。
+        let tokens = super::super::relation_name::tokenize_resolved(
+            "SELECT count(*) FILTER (WHERE a IN (SELECT a FROM documents LIMIT 5)) FROM documents",
+            false,
+        )
+        .expect("tokenize");
+        let Statement::Aggregate(agg) =
+            validate_sql_tokens_with_subquery_ctx(&tokens, &lookup, 0).expect("subquery in FILTER")
+        else {
+            panic!("expected Statement::Aggregate");
+        };
+        assert!(matches!(
+            expect_agg_item(&agg.items()[0]).filter.as_slice(),
+            [WherePredicate::InSubquery { .. }]
+        ));
+    }
+
+    /// SQL-57・Issue #1806: FILTER の誤形は fail-closed。条件中の集計は `42803`、ウィンドウは
+    /// `42P20`（OVER を集計より優先）、`$n` と `WHERE` の欠落は `42601`。部分クエリ内の集計は合法。
+    #[test]
+    fn aggregate_filter_rejects_malformed_and_forbidden_shapes() {
+        let lookup = catalog_with(&["documents"]);
+        let code = |sql: &str| validate_sql(sql, &lookup).expect_err(sql).wire_code();
+        assert_eq!(
+            code("SELECT count(*) FILTER (WHERE count(*) > 1) FROM documents"),
+            "42803"
+        );
+        assert_eq!(
+            code("SELECT count(*) FILTER (WHERE n > (1 + max(n))) FROM documents"),
+            "42803"
+        );
+        assert_eq!(
+            code("SELECT count(*) FILTER (WHERE sum(n) OVER () > 1) FROM documents"),
+            "42P20"
+        );
+        assert_eq!(
+            code("SELECT count(*) FILTER (WHERE row_number() OVER () > 1) FROM documents"),
+            "42P20"
+        );
+        assert_eq!(
+            code("SELECT count(*) FILTER (a = 'x') FROM documents"),
+            "42601"
+        );
+        assert_eq!(
+            code("SELECT count(*) FILTER (WHERE) FROM documents"),
+            "42601"
+        );
+        assert_eq!(
+            code("SELECT count(*) FILTER (WHERE a = 'x' FROM documents"),
+            "42601"
+        );
+        assert_eq!(
+            code("SELECT count(*) FILTER (WHERE a = 'x') OVER () FROM documents"),
+            "42601"
+        );
+        // 部分クエリの内側の集計は FILTER 内の集計禁止の対象外。
+        let tokens = super::super::relation_name::tokenize_resolved(
+            "SELECT count(*) FILTER (WHERE n = (SELECT max(n) FROM documents)) FROM documents",
+            false,
+        )
+        .expect("tokenize");
+        validate_sql_tokens_with_subquery_ctx(&tokens, &lookup, 0)
+            .expect("an aggregate inside a subquery is allowed");
+        // 部分クエリを許さない文脈（カーソル・ビュー本体等）では構文段で `42601`。
+        assert_eq!(
+            code("SELECT count(*) FILTER (WHERE a IN (SELECT a FROM documents LIMIT 5)) FROM documents"),
+            "42601"
+        );
+        // `filter` を列別名として使える（FILTER の直後が `(` でなければ句ではない）。
+        let agg = expect_aggregate("SELECT count(*) AS filter FROM documents", &lookup);
+        assert!(expect_agg_item(&agg.items()[0]).filter.is_empty());
     }
 
     /// Issue #1541（SQL-42 (5) のポインタ）: 集計呼び出しの直後の算術演算子で集計式項目になり、

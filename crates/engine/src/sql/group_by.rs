@@ -550,6 +550,19 @@ fn accumulate_row(
         // クエリ全体の累計バイト数を予算管理する（before/after 比較で、
         // 増加方向は加算・縮小方向〔より短い極値への更新〕は減算し、
         // 実際の保持量を正確に反映する）。
+        // SQL-57・Issue #1806: `FILTER (WHERE ...)` が偽・NULL の行はこの項目に入れない
+        // （評価は `sql::aggregate::item_filter_matches` の 1 箇所）。
+        if let Some(filter) = &item.filter {
+            if !crate::sql::aggregate::item_filter_matches(
+                filter,
+                id,
+                vector,
+                scanned,
+                expr_scratch,
+            )? {
+                continue;
+            }
+        }
         let before = accumulator.text_len();
         let (distinct_entries_before, distinct_bytes_before) = accumulator.distinct_footprint();
         accumulator.observe(&item.input, id, vector, scanned, expr_scratch)?;
@@ -2866,6 +2879,7 @@ mod tests {
                 input: AggregateInput::AllVisible,
                 name: "result".to_string(),
                 distinct: false,
+                filter: None,
             }],
             metadata_filters: Vec::new(),
             expr_filters: Vec::new(),
@@ -3007,12 +3021,14 @@ mod tests {
                     input: AggregateInput::TextColumn(1),
                     name: "result_min".to_string(),
                     distinct: false,
+                    filter: None,
                 },
                 BoundAggregateItem {
                     func: AggregateFunc::Max,
                     input: AggregateInput::TextColumn(1),
                     name: "result_max".to_string(),
                     distinct: false,
+                    filter: None,
                 },
             ],
             metadata_filters: Vec::new(),
@@ -3506,6 +3522,7 @@ mod tests {
                 input: AggregateInput::UuidColumn(2),
                 name: "result".to_string(),
                 distinct: false,
+                filter: None,
             }],
             metadata_filters: Vec::new(),
             expr_filters: Vec::new(),

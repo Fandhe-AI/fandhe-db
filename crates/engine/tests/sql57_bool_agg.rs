@@ -340,7 +340,7 @@ fn unsupported_forms_are_rejected() {
     // 2 引数・未知列。
     assert_eq!(code_of(&core, "SELECT bool_and(f, f) FROM t"), "42883");
     assert_eq!(code_of(&core, "SELECT bool_and(nope) FROM t"), "42703");
-    // `*`・DISTINCT・集計内 ORDER BY・FILTER・ウィンドウ・空引数は構文エラー。
+    // `*`・DISTINCT・集計内 ORDER BY・ウィンドウ・空引数は構文エラー。
     assert_eq!(code_of(&core, "SELECT bool_and(*) FROM t"), "42601");
     assert_eq!(
         code_of(&core, "SELECT bool_and(DISTINCT f) FROM t"),
@@ -350,9 +350,12 @@ fn unsupported_forms_are_rejected() {
         code_of(&core, "SELECT bool_and(f ORDER BY k) FROM t"),
         "42601"
     );
+    // FILTER は Issue #1806 で受理される（全集計関数共通）。
     assert_eq!(
-        code_of(&core, "SELECT bool_and(f) FILTER (WHERE k > 1) FROM t"),
-        "42601"
+        run(&core, "SELECT bool_and(f) FILTER (WHERE k > 1) FROM t")
+            .rows
+            .len(),
+        1
     );
     assert_eq!(code_of(&core, "SELECT bool_and(f) OVER () FROM t"), "42601");
     assert_eq!(code_of(&core, "SELECT bool_and() FROM t"), "42601");

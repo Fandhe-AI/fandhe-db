@@ -1293,6 +1293,7 @@ mod tests {
             distinct: false,
             extra_args: Vec::new(),
             order_by: Vec::new(),
+            filter: Vec::new(),
         })
     }
 

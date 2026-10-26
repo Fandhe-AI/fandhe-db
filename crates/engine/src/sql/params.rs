@@ -233,9 +233,29 @@ fn where_region(tokens: &[Token]) -> Option<(usize, usize)> {
     // `WHERE` は、条件が `EXCLUDED.<列>`・修飾列を取り得て、束縛側（`sql::upsert_where`）が
     // 等値リテラルの通し番号を持たないため、パターン 4 の対象にしない（序数のずれによる
     // 黙った誤解釈を作らず、`$n` は `42601` で fail-closed に拒否される）。
-    let start = tokens
-        .iter()
-        .position(|t| matches!(t, Token::Keyword(crate::sql::lexer::Keyword::Where)))?;
+    // 集計の `FILTER (WHERE ...)`（SQL-57・Issue #1806）の `WHERE` は文の `WHERE` ではない。
+    // 領域開始に選ぶと等値リテラルの序数フラグがずれる（ENUM 語彙検証の省略可否を実リテラルへ
+    // 誤適用する fail-open）ため、直前が `FILTER (` の `WHERE` は読み飛ばす。
+    // FILTER 括弧内（部分クエリ内の `WHERE` を含む）は深さを数えて丸ごと読み飛ばす。
+    let mut filter_depth: usize = 0;
+    let start = tokens.iter().enumerate().position(|(i, t)| {
+        if filter_depth > 0 {
+            match t {
+                Token::Punct('(') => filter_depth = filter_depth.saturating_add(1),
+                Token::Punct(')') => filter_depth = filter_depth.saturating_sub(1),
+                _ => {}
+            }
+            return false;
+        }
+        if matches!(t, Token::Punct('('))
+            && i >= 1
+            && matches!(tokens.get(i - 1), Some(Token::Ident(n)) if n.eq_ignore_ascii_case("FILTER"))
+        {
+            filter_depth = 1;
+            return false;
+        }
+        matches!(t, Token::Keyword(crate::sql::lexer::Keyword::Where))
+    })?;
     // `DO UPDATE SET` を含むだけの文では、その手前（`INSERT ... SELECT ... WHERE`）の
     // `WHERE` は従来どおりパターン 4 の対象とする。除外するのは `DO UPDATE SET` 領域より
     // 後ろにある `WHERE`（`DO UPDATE ... WHERE`）だけ。
@@ -3230,6 +3250,32 @@ mod tests {
         assert_eq!(
             flags("SELECT a FROM t WHERE a = $1 UNION SELECT a FROM t WHERE a = 'x'"),
             vec![true, false]
+        );
+    }
+
+    /// 集計の `FILTER (WHERE ...)` の `WHERE` は文の `WHERE` 領域の開始に選ばない（SQL-57・
+    /// Issue #1806）。FILTER 内の `$n` は `42601`。
+    #[test]
+    fn where_region_skips_aggregate_filter_where() {
+        let flags = |sql: &str| {
+            let tokens = tokenize_with_params(sql).expect("tokenize_with_params should succeed");
+            where_equality_literal_is_param(&tokens)
+        };
+        assert_eq!(
+            flags("SELECT count(*) FILTER (WHERE a = 'x') FROM t WHERE b = $1"),
+            vec![true]
+        );
+        assert!(flags("SELECT count(*) FILTER (WHERE a = 'x') FROM t").is_empty());
+        let err = positions("SELECT count(*) FILTER (WHERE a = $1) FROM t").unwrap_err();
+        assert_eq!(err.wire_code(), "42601");
+
+        // FILTER 内の部分クエリが持つ `WHERE` も文の `WHERE` 領域に選ばない。
+        let sub = "SELECT count(*) FILTER (WHERE a IN (SELECT x FROM u WHERE y = 'z')) FROM t WHERE b = $1";
+        assert_eq!(flags(sub), vec![true]);
+        assert!(positions(sub).is_ok());
+        assert_eq!(
+            flags("SELECT count(*) FILTER (WHERE a IN (SELECT x FROM u WHERE y = 'z')) FROM t WHERE b = 'q' AND c = $1"),
+            vec![false, true]
         );
     }
 
