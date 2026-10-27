@@ -23,13 +23,14 @@
 //! - `plan`: 束縛（列解決・型検証・外部結合の簡約・WHERE のプッシュダウン／残余の
 //!   分離・側スキャン投影の確定・集計／並べ替えの束縛）。Describe も同じ計画を使う。
 //! - `exec`: N 方向ハッシュ結合（段ごとのカーディナリティ上限・決定的順序）。
-//! - `nlj`: 等価キーの無い ON 残余のある段のネステッドループ結合（INNER のみ。比較回数上限・
-//!   Issue #1837。SQL からの到達は #1839。設計は `docs/design/nested-loop-join.md`）。
+//! - `nlj`: 等価キーの無い ON 残余のある段のネステッドループ結合（INNER／LEFT／RIGHT。比較回数
+//!   上限。Issue #1837・#1838。SQL からは #1839 で到達し、段ごとにハッシュ結合と自動で選ぶ。
+//!   設計は `docs/design/nested-loop-join.md`）。
 //! - `residual`: WHERE 残余の行単位評価（ON 残余の一致条件評価 `eval_all` も共有。Issue #1830）と
 //!   スカラー `ORDER BY`。
 //! - `aggregate`: 集計形（既存の `Accumulator` を再利用）。
 //! - `values`: 型クラス・キー正準化・比較・`Cell` → `ScalarRef` アダプタ。
-//! - `on_split`: ON の AND 連鎖を結合キー／残余述語（左のみ・右のみ・混在）へ分類する
+//! - `on_split`: ON の論理木（最上位 AND の conjunct 単位）を結合キー／残余述語（左のみ・右のみ・混在）へ分類する
 //!   （Issue #1829・SQL-60 ポインタ）。
 //! - `using`: `JOIN ... USING (...)` の束縛（等価 ON への脱糖）と結合列の統合規則・
 //!   統合列を考慮した列解決（Issue #1826・SQL-60 (1)）。
@@ -531,15 +532,17 @@ mod tests {
             relations,
             steps: vec![JoinStep {
                 kind,
-                condition: JoinCondition::On(
+                condition: JoinCondition::On(JoinWhereExpr::And(
                     on.into_iter()
-                        .map(|(lhs, rhs)| JoinWherePredicate::ColumnCompare {
-                            lhs,
-                            op: crate::sql::udf_call::BinOp::Eq,
-                            rhs,
+                        .map(|(lhs, rhs)| {
+                            JoinWhereExpr::Leaf(JoinWherePredicate::ColumnCompare {
+                                lhs,
+                                op: crate::sql::udf_call::BinOp::Eq,
+                                rhs,
+                            })
                         })
                         .collect(),
-                ),
+                )),
             }],
             projection,
             column_aliases: Vec::new(),
@@ -690,8 +693,10 @@ mod tests {
             rhs: ColumnRef::qualified("r", "id"),
         };
         if let Some(step) = validated.steps.first_mut() {
-            step.condition =
-                JoinCondition::On(vec![eq("l", "r", crate::sql::udf_call::BinOp::Eq), mixed]);
+            step.condition = JoinCondition::On(JoinWhereExpr::And(vec![
+                JoinWhereExpr::Leaf(eq("l", "r", crate::sql::udf_call::BinOp::Eq)),
+                JoinWhereExpr::Leaf(mixed),
+            ]));
         }
         let read_txn = storage.db().begin_read().expect("begin_read");
         let mut schemas = HashMap::new();
@@ -1177,19 +1182,23 @@ mod tests {
             steps: vec![
                 JoinStep {
                     kind,
-                    condition: JoinCondition::On(vec![JoinWherePredicate::ColumnCompare {
-                        lhs: ColumnRef::qualified("l", "tag"),
-                        op: crate::sql::udf_call::BinOp::Eq,
-                        rhs: ColumnRef::qualified("r", "tag"),
-                    }]),
+                    condition: JoinCondition::On(JoinWhereExpr::Leaf(
+                        JoinWherePredicate::ColumnCompare {
+                            lhs: ColumnRef::qualified("l", "tag"),
+                            op: crate::sql::udf_call::BinOp::Eq,
+                            rhs: ColumnRef::qualified("r", "tag"),
+                        },
+                    )),
                 },
                 JoinStep {
                     kind: JoinKind::Inner,
-                    condition: JoinCondition::On(vec![JoinWherePredicate::ColumnCompare {
-                        lhs: ColumnRef::qualified("r", "tag"),
-                        op: crate::sql::udf_call::BinOp::Eq,
-                        rhs: ColumnRef::qualified("s", "tag"),
-                    }]),
+                    condition: JoinCondition::On(JoinWhereExpr::Leaf(
+                        JoinWherePredicate::ColumnCompare {
+                            lhs: ColumnRef::qualified("r", "tag"),
+                            op: crate::sql::udf_call::BinOp::Eq,
+                            rhs: ColumnRef::qualified("s", "tag"),
+                        },
+                    )),
                 },
             ],
             projection: JoinProjection::Columns(vec![ColumnRef::qualified("l", "tag")]),
@@ -1380,5 +1389,86 @@ mod tests {
         let result = execute_with_limits(&read_txn, &ctx, &schemas, &validated, &udfs, &limits)
             .expect("4 groups fit a limit of 4");
         assert_eq!(result.rows.len(), 4);
+    }
+
+    /// `a.id <op> b.id` の葉。
+    fn id_cmp(a: &str, op: crate::sql::udf_call::BinOp, b: &str) -> JoinWhereExpr {
+        JoinWhereExpr::Leaf(JoinWherePredicate::ColumnCompare {
+            lhs: ColumnRef::qualified(a, "id"),
+            op,
+            rhs: ColumnRef::qualified(b, "id"),
+        })
+    }
+
+    /// Issue #1839: ON の `OR`／非等価（キー無し）段は NLJ で実行され、比較回数の上限は
+    /// 文全体で共有する（超過は部分結果を返さず `54000`）。実 SQL からの到達経路と同じ
+    /// 束縛結果（`JoinCondition::On` の論理木）を直接組み立てて確かめる。
+    #[test]
+    fn keyless_on_comparison_budget_is_enforced_per_statement() {
+        use crate::sql::udf_call::BinOp;
+        let path = unique_db_path("join-keyless-on-comparison-budget");
+        let storage = Storage::open(&path).expect("open storage");
+        let _guard = CleanupGuard(path);
+        for t in ["l", "r", "s"] {
+            storage.create_table(&schema(t)).expect("create table");
+        }
+        let ctx = PolicyContext::new("tenant-a").expect("valid tenant");
+        for i in 0..3u64 {
+            for t in ["l", "r", "s"] {
+                insert_row(&storage, t, &ctx, i, "k");
+            }
+        }
+        let read_txn = storage.db().begin_read().expect("begin_read");
+        let mut schemas = HashMap::new();
+        for t in ["l", "r", "s"] {
+            schemas.insert(t.to_string(), schema(t));
+        }
+        let udfs = UdfRegistry::default();
+        let run = |v: &ValidatedJoin, max: usize| {
+            let limits = JoinLimits {
+                max_comparisons: max,
+                ..JoinLimits::default()
+            };
+            execute_with_limits(&read_txn, &ctx, &schemas, v, &udfs, &limits)
+        };
+
+        // (a) 単段の非等価 ON: 3 x 3 = 9 比較。上限 8 は 54000、上限 9 は成功（l.id < r.id は 3 組）。
+        let mut single = three_way(JoinKind::Inner);
+        single.relations.truncate(2);
+        single.steps.truncate(1);
+        single.steps[0].condition = JoinCondition::On(id_cmp("l", BinOp::Lt, "r"));
+        assert_eq!(
+            run(&single, 8)
+                .expect_err("9 comparisons exceed 8")
+                .wire_code(),
+            "54000"
+        );
+        assert_eq!(run(&single, 9).expect("fits 9").rows.len(), 3);
+
+        // (b) OR を含む ON も同じ予算で数える。
+        single.steps[0].condition = JoinCondition::On(JoinWhereExpr::Or(vec![
+            id_cmp("l", BinOp::Lt, "r"),
+            id_cmp("l", BinOp::Gt, "r"),
+        ]));
+        assert_eq!(
+            run(&single, 8)
+                .expect_err("OR on 9 pairs exceeds 8")
+                .wire_code(),
+            "54000"
+        );
+        assert_eq!(run(&single, 9).expect("fits 9").rows.len(), 6);
+
+        // (c) 3 表で NLJ 段が 2 つ: 段 0 は 9 比較・段 1 は 3 x 3 = 9 比較。各段は 12 以内でも合計 18 が
+        // 12 を超えるため、文全体で共有する予算により 54000。
+        let mut chain = three_way(JoinKind::Inner);
+        chain.steps[0].condition = JoinCondition::On(id_cmp("l", BinOp::Lt, "r"));
+        chain.steps[1].condition = JoinCondition::On(id_cmp("r", BinOp::Lt, "s"));
+        assert_eq!(
+            run(&chain, 12)
+                .expect_err("sum of both steps exceeds 12")
+                .wire_code(),
+            "54000"
+        );
+        assert!(run(&chain, 100).is_ok());
     }
 }

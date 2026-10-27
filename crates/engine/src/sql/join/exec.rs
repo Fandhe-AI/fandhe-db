@@ -204,7 +204,7 @@ fn join_step(
     let has_on_residual =
         !(step.on_acc.is_empty() && step.on_new.is_empty() && step.on_mixed.is_empty());
     // Issue #1837: キー無し・ON 残余ありの段はネステッドループ結合へ振り分ける（D1。ハッシュ表を
-    // 作る前）。SQL からの到達（束縛段の `42601` 解除）は #1839。キー無し・残余無しは下の直積経路。
+    // 作る前）。SQL からの到達（束縛段の `42601` 解除）は #1839 で実装済み。キー無し・残余無しは下の直積経路。
     if step.keys.is_empty() && has_on_residual {
         return super::nlj::nlj_step(
             sides,

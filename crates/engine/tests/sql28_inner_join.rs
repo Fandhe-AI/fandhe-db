@@ -496,30 +496,35 @@ fn accepts_three_table_join_chain() {
     assert_eq!(result.columns.len(), 10);
 }
 
+/// Issue #1839 で `42601` の暫定拒否から NLJ での実行へ置き換えた（仕様どおりの結果検証への
+/// 置き換えで、検査の弱体化ではない）。documents.author_id = 1,1,2,999・authors.id = 1,2 のため、
+/// `author_id > id` を満たす組は (2,1)・(999,1)・(999,2) の 3 件。
 #[test]
-fn rejects_non_equality_on_condition() {
+fn non_equality_on_condition_runs_as_nested_loop() {
     let (storage, path) = seeded_basic();
     let _guard = CleanupGuard(path);
     let core = new_core(storage);
-    assert_rejected(
+    let result = run(
         &core,
         "tenant-a",
         "SELECT * FROM documents JOIN authors ON documents.author_id > authors.id LIMIT 10",
-        "42601",
     );
+    assert_eq!(result.rows.len(), 3);
 }
 
+/// Issue #1839: 片側だけを参照する ON もキー無し段として NLJ で実行する（置き換えの趣旨は上と同じ）。
+/// d1.author_id は NULL でないため ON は常に真になり、4 x 4 = 16 組が返る。
 #[test]
-fn rejects_on_condition_referencing_only_one_side() {
+fn on_condition_referencing_only_one_side_runs_as_nested_loop() {
     let (storage, path) = seeded_basic();
     let _guard = CleanupGuard(path);
     let core = new_core(storage);
-    assert_rejected(
+    let result = run(
         &core,
         "tenant-a",
-        "SELECT * FROM documents d1 JOIN documents d2 ON d1.author_id = d1.author_id LIMIT 10",
-        "42601",
+        "SELECT * FROM documents d1 JOIN documents d2 ON d1.author_id = d1.author_id LIMIT 100",
     );
+    assert_eq!(result.rows.len(), 16);
 }
 
 #[test]

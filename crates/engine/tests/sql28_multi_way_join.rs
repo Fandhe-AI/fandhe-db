@@ -380,12 +380,14 @@ fn on_clause_scoping_rejects_forward_reference_and_both_earlier_sides() {
         "SELECT * FROM dept JOIN emp ON emp.dept_id = proj.id JOIN proj ON proj.emp_id = emp.id LIMIT 10",
         "42P01",
     );
-    // 両側とも既出 relation → 42601。
-    assert_rejected(
+    // 両側とも既出 relation のみを参照する ON は、Issue #1839 以降はキー無しの左のみ残余として
+    // NLJ で実行される（暫定の 42601 を仕様どおりの結果検証へ置き換えた。検査の弱体化ではない）。
+    // PostgreSQL と同じく受理し、`emp.id = dept.id` を満たす組が無いため結果は空。
+    assert!(q(
         &core,
-        "SELECT * FROM dept JOIN emp ON emp.dept_id = dept.id JOIN proj ON emp.id = dept.id LIMIT 10",
-        "42601",
-    );
+        "SELECT dept.id FROM dept JOIN emp ON emp.dept_id = dept.id JOIN proj ON emp.id = dept.id LIMIT 10",
+    )
+    .is_empty());
     // 結合キーの型不一致は段ごとに 42804。
     assert_rejected(
         &core,
