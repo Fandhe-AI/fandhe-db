@@ -9,6 +9,11 @@
 
 ### Added
 
+- `WITH RECURSIVE` の構文を受理し再帰構造を検証する（Issue #1869・SQL-35。段階 A）。アンカー項と再帰項を
+  `UNION [ALL]` で結んだ形の自己参照の位置・回数を検証し、不正な再帰は `42P19`、未対応の形と構造検証を通過した
+  文の実行（反復評価は #1870）は `0A000` で拒否する。従来 `42601` だった挙動変更。詳細は [recursive-cte.md](docs/design/recursive-cte.md)。
+  BREAKING CHANGE: 公開 enum `ErrorClass` と `SqlSurfaceError` に variant（`InvalidRecursion`）を追加したため、
+  網羅的な `match` は更新が要る。
 - CTE の `MATERIALIZED`／`NOT MATERIALIZED` を受理する（Issue #1858・SQL-62 (3)）。評価方式の指定として読み捨て、結果は変わらない。
   従来 `42601` で拒否していた構文が受理される挙動変更。詳細は [cte.md](docs/design/cte.md)。
 - CTE の列名リスト `WITH x(a, b) AS (...)` を受理する（Issue #1857・SQL-62 (2)）。出力列へ先頭から順に名前を付け、短いリストは残りを元の名前のまま受理する。

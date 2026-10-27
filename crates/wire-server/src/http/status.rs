@@ -100,6 +100,9 @@ pub const fn http_status(class: ErrorClass) -> u16 {
         | ErrorClass::InvalidParameterValue
         // Issue #1546: `$n` の型を決められない（`42P18`）も入力起因の拒否として 400。
         | ErrorClass::IndeterminateDatatype
+        // Issue #1869・SQL-35 (2)・ERR-6: 不正な再帰（`42P19`）。入力起因の拒否として 400。
+        // NoSQL 表層には再帰 CTE を書く op が無く到達しない（`ErrorClass` の網羅性のため定める）。
+        | ErrorClass::InvalidRecursion
         // Issue #1759: COPY 文の `$n`（`42P02`）も入力起因の拒否として 400。
         | ErrorClass::UndefinedParameter
         // Issue #2190: 照合の不一致（`42P21`）・照合を決められない（`42P22`）も入力起因で 400。
@@ -221,7 +224,7 @@ mod tests {
 
     /// 期待表を明示的に列挙し、`ErrorClass::ALL` との突き合わせで非 vacuous に検証する。
     /// `match` にアームを足したが期待表の更新を忘れた、という乖離を (a)(b) が検出する。
-    const EXPECTED: [(ErrorClass, u16); 85] = [
+    const EXPECTED: [(ErrorClass, u16); 86] = [
         (ErrorClass::InvalidInput, 400),
         (ErrorClass::StringDataRightTruncation, 400),
         (ErrorClass::AuthInvalid, 401),
@@ -280,6 +283,7 @@ mod tests {
         (ErrorClass::AmbiguousColumn, 400),
         (ErrorClass::InvalidParameterValue, 400),
         (ErrorClass::IndeterminateDatatype, 400),
+        (ErrorClass::InvalidRecursion, 400),
         (ErrorClass::UndefinedParameter, 400),
         (ErrorClass::CollationMismatch, 400),
         (ErrorClass::InvalidEscapeSequence, 400),

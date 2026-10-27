@@ -985,6 +985,10 @@ pub enum SqlSurfaceError {
     /// 許可リスト外）とは意味論的に異なるため、`wire-server` 側の分類縮退
     /// （Issue #896 レビュー指摘）を避けるために独立させた。
     FeatureNotSupported { detail: String },
+    /// `WITH RECURSIVE` の再帰構造の違反（`42P19`。SQL-35 (2)・ERR-6 のポインタ、Issue #1869）。
+    /// `sql::recursive_cte` が自己参照の位置・回数を検証して返す。`name` は利用者が書いた
+    /// CTE 名、`reason` は固定文言（行・値・他テナント情報を含めない）。
+    InvalidRecursion { name: String, reason: &'static str },
     /// `CREATE TABLE`（SQL-23・TASK-85、Issue #899）が指定したテーブル名が既に
     /// カタログに存在する。既存スキーマは変更しない（TABLE-4）。`CREATE VIEW`
     /// （TABLE-18・SQL-23・TASK-205、Issue #909）が既存のテーブル名・ビュー名と
@@ -1230,6 +1234,10 @@ impl SqlSurfaceError {
             Self::FeatureNotSupported { detail } => {
                 Self::FeatureNotSupported { detail: f(&detail) }
             }
+            Self::InvalidRecursion { name, reason } => Self::InvalidRecursion {
+                name: f(&name),
+                reason,
+            },
             Self::DuplicateTable { name } => Self::DuplicateTable { name: f(&name) },
             Self::DuplicateSchema { name } => Self::DuplicateSchema { name: f(&name) },
             Self::InvalidSchemaName { name } => Self::InvalidSchemaName { name: f(&name) },
@@ -1409,6 +1417,14 @@ impl SqlSurfaceError {
     pub(crate) fn feature_not_supported(detail: impl Into<String>) -> Self {
         SqlSurfaceError::FeatureNotSupported {
             detail: truncate_for_error(&detail.into()),
+        }
+    }
+
+    /// `pub(crate)`: `WITH RECURSIVE` の再帰構造違反（`42P19`。SQL-35 (2)、Issue #1869）。
+    pub(crate) fn invalid_recursion(name: impl Into<String>, reason: &'static str) -> Self {
+        SqlSurfaceError::InvalidRecursion {
+            name: truncate_for_error(&name.into()),
+            reason,
         }
     }
 
@@ -1676,6 +1692,7 @@ impl ClassifiedError for SqlSurfaceError {
                 ErrorClass::FeatureNotSupported
             }
             SqlSurfaceError::FeatureNotSupported { .. } => ErrorClass::FeatureNotSupported,
+            SqlSurfaceError::InvalidRecursion { .. } => ErrorClass::InvalidRecursion,
             SqlSurfaceError::DuplicateTable { .. } => ErrorClass::DuplicateTable,
             SqlSurfaceError::DuplicateSchema { .. } => ErrorClass::DuplicateSchema,
             SqlSurfaceError::InvalidSchemaName { .. } | SqlSurfaceError::NoSchemaSelected => {
@@ -1874,6 +1891,9 @@ impl std::fmt::Display for SqlSurfaceError {
             }
             SqlSurfaceError::FeatureNotSupported { detail } => {
                 write!(f, "feature not supported: {detail}")
+            }
+            SqlSurfaceError::InvalidRecursion { name, reason } => {
+                write!(f, "invalid recursion in query \"{name}\": {reason}")
             }
             // 名前はクライアント自身が指定した識別子であり秘匿情報ではない
             // （既存の `UndefinedTable`／`WrongObjectType` と同じ扱い）。
@@ -14921,9 +14941,14 @@ impl<'a> Parser<'a> {
     /// 名前重複は [`super::cte::check_no_duplicate_name`] が判定する。
     fn parse_with_clause(&mut self) -> Result<Vec<super::cte::CteDef>, SqlSurfaceError> {
         self.expect_ident_matching("WITH")?;
+        // 防御（fail-closed）: `WITH RECURSIVE` は `validate_sql_tokens_impl` の WITH 分岐が
+        // 先頭で `sql::recursive_cte` へ分岐するため、本関数には構造的に到達しない
+        // （呼び出し元は同分岐と、ビュー本文の依存収集 `collect_cte_definition_relations`
+        // のみ。後者の入力は同分岐の検証を通った本文）。非再帰経路へ流すと自己参照が同名の
+        // 実テーブルへ黙って解決されるため、万一到達しても拒否する（SQL-35、Issue #1869）。
         if self.peek_ident_matches("RECURSIVE") {
-            return Err(SqlSurfaceError::unsupported(
-                "WITH RECURSIVE is not supported",
+            return Err(SqlSurfaceError::feature_not_supported(
+                "WITH RECURSIVE is not supported here",
             ));
         }
         let mut ctes: Vec<super::cte::CteDef> = Vec::new();
@@ -14978,6 +15003,66 @@ impl<'a> Parser<'a> {
             break;
         }
         Ok(ctes)
+    }
+
+    /// `WITH RECURSIVE <name> [(<列名>, ...)] AS [[NOT] MATERIALIZED] (<body>)[, ...]*` の
+    /// 見出し部を切り出し、各定義の `(名前, 列名リスト, 本文トークン列)` と主クエリの
+    /// トークン列を返す（SQL-35、Issue #1869）。`sql::recursive_cte::validate_recursive_with`
+    /// だけが呼ぶ。再帰構造の検証・評価は呼び出し元の担当で、本関数は構文の切り出し
+    /// （`parse_with_clause` と同じ列名リスト・`[NOT] MATERIALIZED`・括弧対応・本文内 `;` の
+    /// 規則。第 2 のパーサーを持たない）と、本文直後の `SEARCH`／`CYCLE` 句の拒否（`0A000`。
+    /// #2213・#2214 が実装）だけを行う。
+    pub(crate) fn parse_recursive_with_header(
+        &mut self,
+    ) -> Result<RecursiveWithHeader, SqlSurfaceError> {
+        self.expect_ident_matching("WITH")?;
+        self.expect_ident_matching("RECURSIVE")?;
+        let mut defs: Vec<(String, Vec<String>, Vec<Token>)> = Vec::new();
+        loop {
+            let name = self.expect_ident()?;
+            let column_aliases = self.parse_optional_view_column_aliases()?;
+            self.expect_ident_matching("AS")?;
+            if self.peek_ident_matches("NOT") {
+                self.advance();
+                self.expect_ident_matching("MATERIALIZED")?;
+            } else if self.peek_ident_matches("MATERIALIZED") {
+                self.advance();
+            }
+            if !matches!(self.peek(), Some(Token::Punct('('))) {
+                return Err(SqlSurfaceError::unsupported(
+                    "expected '(' to start CTE body",
+                ));
+            }
+            let (inner, after) = split_parenthesized(self.remaining())?;
+            if inner.iter().any(|t| matches!(t, Token::Punct(';'))) {
+                return Err(SqlSurfaceError::unsupported(
+                    "CTE body must not contain a statement separator",
+                ));
+            }
+            if defs.iter().any(|(n, _, _)| n.eq_ignore_ascii_case(&name)) {
+                return Err(SqlSurfaceError::unsupported(format!(
+                    "duplicate CTE name: {name}"
+                )));
+            }
+            let body = inner.to_vec();
+            self.pos = self.tokens.len().saturating_sub(after.len());
+            defs.push((name, column_aliases, body));
+            super::cte::check_definition_count(
+                defs.len(),
+                self.nesting_limits.max_cte_definitions(),
+            )?;
+            if self.peek_ident_matches("SEARCH") || self.peek_ident_matches("CYCLE") {
+                return Err(SqlSurfaceError::feature_not_supported(
+                    "SEARCH and CYCLE clauses of WITH RECURSIVE are not supported yet",
+                ));
+            }
+            if matches!(self.peek(), Some(Token::Punct(','))) {
+                self.advance();
+                continue;
+            }
+            break;
+        }
+        Ok((defs, self.remaining().to_vec()))
     }
 }
 
@@ -21485,6 +21570,17 @@ fn validate_sql_tokens_impl(
         // 先頭トークンで振り分けるため、本アームには到達しない
         // （out-of-scope。Issue #928 対象外事項）。
         _ if is_with_statement => {
+            // SQL-35・Issue #1869: `WITH RECURSIVE` は非再帰経路（`cte::resolve_relation`）へ
+            // 一切流さず、ここで早期に返す（流すと自己参照が同名の実テーブルへ黙って解決される。
+            // fail-closed）。構文・再帰構造の検証（`42601`／`42P19`）を通過した後は、反復評価が
+            // 未実装（#1870）のため一律 `0A000` で終える。
+            if matches!(tokens.get(1), Some(Token::Ident(w)) if w.eq_ignore_ascii_case("RECURSIVE"))
+            {
+                let _clause = super::recursive_cte::validate_recursive_with(tokens, limits)?;
+                return Err(SqlSurfaceError::feature_not_supported(
+                    "WITH RECURSIVE evaluation is not supported yet",
+                ));
+            }
             let mut p = Parser::new(tokens).with_nesting_limits(limits);
             let ctes = p.parse_with_clause()?;
             // Issue #1535: 主クエリも通常 SELECT と同じ修飾列正規化を通す（CTE 定義本体は対象外）。
@@ -23305,7 +23401,9 @@ impl ValidatedCopy {
 /// 深さで数えれば安全に対応を取れる）。`tokens` の先頭は必ず `(` であること
 /// （呼び出し元が確認済み）。添字直接アクセス（`coding-rust.md`）を避け
 /// `enumerate`＋`get` で処理する。
-fn split_parenthesized(tokens: &[Token]) -> Result<(&[Token], &[Token]), SqlSurfaceError> {
+pub(crate) fn split_parenthesized(
+    tokens: &[Token],
+) -> Result<(&[Token], &[Token]), SqlSurfaceError> {
     let mut depth: i32 = 0;
     for (i, t) in tokens.iter().enumerate() {
         match t {
@@ -23328,6 +23426,21 @@ fn split_parenthesized(tokens: &[Token]) -> Result<(&[Token], &[Token]), SqlSurf
     Err(SqlSurfaceError::unsupported(
         "unterminated parenthesized expression",
     ))
+}
+
+/// `WITH RECURSIVE` の見出し部の切り出し結果（各定義の `(名前, 列名リスト, 本文トークン列)` と
+/// 主クエリのトークン列）。
+pub(crate) type RecursiveWithHeader = (Vec<(String, Vec<String>, Vec<Token>)>, Vec<Token>);
+
+/// `WITH RECURSIVE` の見出し部（各定義の名前・列名リスト・本文トークン列と主クエリ）を
+/// 切り出す。`sql::recursive_cte::validate_recursive_with` の唯一の入口（`Parser` は本
+/// モジュール内に閉じるため、薄い公開ラッパーとして置く。SQL-35、Issue #1869）。
+pub(crate) fn split_recursive_with_clause(
+    tokens: &[Token],
+    limits: crate::nesting_limits::NestingLimits,
+) -> Result<RecursiveWithHeader, SqlSurfaceError> {
+    let mut p = Parser::new(tokens).with_nesting_limits(limits);
+    p.parse_recursive_with_header()
 }
 
 impl Parser<'_> {
@@ -34928,7 +35041,8 @@ mod tests {
             &lookup,
         )
         .expect_err("WITH RECURSIVE must be rejected");
-        assert_eq!(err.wire_code(), "42601");
+        // SQL-35・Issue #1869: 構造検証は通るが評価は未実装のため `0A000`（`42601` ではない）。
+        assert_eq!(err.wire_code(), "0A000");
     }
 
     /// SQL-62 (2)・Issue #1857: CTE 列名リストの受理・`42P10`・各種拒否。

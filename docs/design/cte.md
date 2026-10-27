@@ -38,8 +38,10 @@ WITH <name> [(<列名>, ...)] AS (SELECT <* | 列名リスト> FROM <table | vie
   指すため列検査の対象外。順位付き（`ORDER BY <ベクトル>`／`USING PLAN`）は明示的な
   メッセージで `42601` に拒否し、`WITH` 句を剥がして後段へ流すことは絶対にしない
   （同名の実テーブルを黙って読む危険があるため）。
-- `WITH RECURSIVE`・CTE 名の重複・データ変更 CTE（`WITH x AS (DELETE
+- CTE 名の重複・データ変更 CTE（`WITH x AS (DELETE
   ...)` 等。body が `SELECT` 以外は受理しない）はいずれも `42601`。
+  `WITH RECURSIVE` は本経路に流さず `sql::recursive_cte` へ分岐する
+  （構造検証の `42P19`・評価未実装の `0A000`。[recursive-cte.md](recursive-cte.md)）。
 - 定義数上限（`MAX_CTE_DEFINITIONS = 16`）・連鎖の深さ上限
   （`MAX_CTE_NESTING_DEPTH = 4`）はハード上限（＝既定値）で、起動フラグ
   `--max-cte-definitions`・`--max-cte-nesting-depth` により下げられる
@@ -115,7 +117,7 @@ CTE は実体化しない（インライン展開のみ）。主クエリ（`Par
   主クエリの述語の前へ挿入される（`build_scan_from_resolved`）ため、束縛時に
   `$n` の対応先が組み立て後の述語列とトークン列上の位置とでずれる恐れがある。
   この対応ずれを解消してから別 Issue で扱う。
-- `WITH RECURSIVE`（SQL-29 で対象外）。
+- `WITH RECURSIVE` の評価（構文・構造検証は受理済み。[recursive-cte.md](recursive-cte.md)）。
 - NoSQL（HTTP）表層での CTE（SQL-28〜30 は非対応のまま）。
 
 ## Issue #1857 追記: 列名リスト（SQL-62 (2) ポインタ）

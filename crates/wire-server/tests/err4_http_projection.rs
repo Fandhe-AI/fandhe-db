@@ -308,7 +308,7 @@ fn query_as_alice(addr: SocketAddr, body: &[u8]) -> HttpResponse {
 /// `status.rs::EXPECTED`（`#[cfg(test)]` 内で外部から参照不可）と同値の
 /// 期待表。両者の乖離は [`err4_projection_table_is_closed_over_all_error_classes`]
 /// が `http_status` 経由で検出する。
-const EXPECTED_STATUS: [(&str, u16); 82] = [
+const EXPECTED_STATUS: [(&str, u16); 83] = [
     ("22000", 400),
     ("22001", 400),
     ("22012", 400),
@@ -389,6 +389,8 @@ const EXPECTED_STATUS: [(&str, u16); 82] = [
     // `IndeterminateDatatype`（`42P18`。Issue #1546）: 拡張クエリの Parse で `$n` の型を
     // 決められない。SQL 表層専用の分類で 400。
     ("42P18", 400),
+    // `InvalidRecursion`（`42P19`。Issue #1869・SQL-35 (2)）: SQL 表層専用の分類で 400。
+    ("42P19", 400),
     // `UndefinedParameter`（`42P02`。Issue #1759）: 拡張クエリの Parse で COPY 文に置いた `$n`。400。
     ("42P02", 400),
     // `CollationMismatch`（`42P21`）・`IndeterminateCollation`（`42P22`。Issue #2190）:
@@ -529,7 +531,7 @@ fn assert_projected_as(resp: &HttpResponse, expected_class: ErrorClass) {
 
 // --- R7: 射影表が ErrorClass::ALL 全体を閉じて覆うことの機械検証 -----------
 
-const _: () = assert!(ErrorClass::ALL.len() == 85);
+const _: () = assert!(ErrorClass::ALL.len() == 86);
 
 /// `wire_code` を共有する分類と、逆引き（`from_wire_code`）が返す分類の組
 /// （ERR-6。`23502`: TABLE-16・TASK-204・Issue #904、`23505`: Issue #1180）。

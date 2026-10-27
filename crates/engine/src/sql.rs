@@ -185,6 +185,7 @@ mod identity_column_tests;
 pub(crate) mod insert_select;
 pub(crate) mod interval_arith;
 pub(crate) mod matview;
+pub(crate) mod recursive_cte;
 #[cfg(test)]
 mod serial_expansion_tests;
 pub(crate) mod set_expr;

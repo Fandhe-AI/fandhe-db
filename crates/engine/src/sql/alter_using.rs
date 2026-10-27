@@ -429,6 +429,7 @@ pub(crate) fn redact_row_conversion_error(e: SqlSurfaceError) -> SqlSurfaceError
         | E::PartialCompletion { .. }
         | E::PartitionedDmlCancelled { .. }
         | E::PartitionedJobBusy { .. }
+        | E::InvalidRecursion { .. }
         | E::InvalidForeignKey { .. }
         | E::UndefinedFunction { .. }
         | E::DuplicateFunction { .. } => E::Internal {

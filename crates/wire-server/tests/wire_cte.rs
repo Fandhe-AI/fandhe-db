@@ -110,7 +110,17 @@ fn wire_cte_rejected_forms_report_expected_sqlstate_and_keep_connection_usable()
     let cases: &[(&str, &str)] = &[
         (
             "WITH RECURSIVE r AS (SELECT id FROM docs) SELECT id FROM r LIMIT 10",
-            "42601",
+            "0A000",
+        ),
+        // SQL-35・Issue #1869: 不正な再帰（アンカー項に自己参照）は `42P19`。
+        (
+            "WITH RECURSIVE r(n) AS (SELECT n FROM r UNION ALL SELECT id FROM docs) SELECT n FROM r",
+            "42P19",
+        ),
+        // 構造検証を通過した再帰形は評価未実装の `0A000`（反復評価は #1870）。
+        (
+            "WITH RECURSIVE r(n) AS (SELECT 1 UNION ALL SELECT n + 1 FROM r WHERE n < 3) SELECT n FROM r",
+            "0A000",
         ),
         (
             "WITH x AS (SELECT id FROM ghost) SELECT id FROM x LIMIT 10",

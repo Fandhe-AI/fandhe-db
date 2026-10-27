@@ -13,7 +13,7 @@
 //!
 //! 検証する契約（本計画の受入基準 1〜4）:
 //! 1. 非再帰 CTE を受理する
-//! 2. `WITH RECURSIVE` を拒否する
+//! 2. `WITH RECURSIVE` は非再帰経路へ流さない（段階 A では評価未対応の `0A000`。SQL-35 のポインタ）
 //! 3. CTE の定義数・連鎖の深さに上限を設け、超過は `54000`
 //! 4. CTE 経由でも RLS が暗黙に適用される
 
@@ -240,7 +240,7 @@ fn rejects_with_recursive() {
         "alice",
         "WITH RECURSIVE r AS (SELECT id FROM docs) SELECT id FROM r LIMIT 10",
     );
-    assert_eq!(err.wire_code(), "42601");
+    assert_eq!(err.wire_code(), "0A000");
 }
 
 // --- 受入基準 3: 定義数・連鎖の深さの上限 --------------------------------------
