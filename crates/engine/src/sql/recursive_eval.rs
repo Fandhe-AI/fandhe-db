@@ -28,7 +28,7 @@
 
 use std::collections::HashMap;
 
-use crate::catalog::{ColumnType, TableSchema};
+use crate::catalog::{ColumnType, RowIdentity, TableSchema};
 use crate::policy::PolicyContext;
 
 use super::allowlist::{
@@ -362,6 +362,23 @@ fn with_prepared<T>(
         })
         .collect();
     let (work_schema, work_types) = synth_schema(&cte.name, &synth_input);
+    // 作業表は行 id を持たない: 疑似列 `id` を持たない行識別方式（`Allocated`）にして、式・述語・
+    // JOIN 条件・ORDER BY を含む全ての `id` 参照を束縛段の未知列として拒否する（実列 `id` は
+    // 合成列として解決される）。直接投影の検査（`ScanTerm::new`）は二重の防御として残す。
+    let work_schema = work_schema.with_row_identity(RowIdentity::Allocated);
+    // 非バイト列順の照合（ICU）の列を持つ表を参照する再帰は、アンカー列の照合を作業表へ運べない
+    // ため、再帰項の比較・結合が既定のバイト列順で黙って評価される fail-open を避けて拒否する
+    // （`check_buffered_view_collations` と同じ固定 `0A000`。TABLE-28）。
+    if schemas.values().any(|schema| {
+        schema
+            .columns
+            .iter()
+            .any(|c| c.collation.is_some_and(|coll| !coll.is_byte_order()))
+    }) {
+        return Err(SqlSurfaceError::feature_not_supported(
+            "this collation is not supported in this expression",
+        ));
+    }
 
     let mut all: HashMap<String, TableSchema> = schemas.clone();
     all.insert(cte.name.clone(), work_schema.clone());

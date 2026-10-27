@@ -483,23 +483,76 @@ fn pseudo_id_anchor_column() {
     );
 }
 
-/// 作業表の疑似列 `id`・`SELECT *` は黙って NULL にせず拒否する（fail-closed）。
+/// 作業表は疑似列 `id` を持たないため、`SELECT *`・`t.*` は実列だけへ展開される（`id` を含まない）。
+/// 疑似列 `id` の直接投影は黙って 0／NULL にせず拒否する（fail-closed）。
 #[test]
-fn recursive_reference_rejects_pseudo_id_and_star() {
+fn recursive_reference_star_expands_to_real_columns_only() {
+    let (core, _g) = open_core_with(seed_tree);
+    // 実列だけへ展開され、終端する（`n` は変化しないため `WHERE` で 1 回だけ通す）。
+    let star = "WITH RECURSIVE t(n) AS (SELECT 1 UNION ALL SELECT * FROM t WHERE n < 1) \
+                SELECT n FROM t";
+    assert_eq!(rows(&core, "alice", star), col(&["1"]));
+    let sql =
+        "WITH RECURSIVE t(n) AS (SELECT 1 UNION ALL SELECT id FROM t WHERE n < 3) SELECT n FROM t";
+    let c = code(&core, "alice", sql);
+    assert!(["0A000", "42601", "42703"].contains(&c.as_str()), "{c}");
+}
+
+/// 作業表は疑似列 `id` を持たない: 述語・式項目・JOIN 条件・外側の参照のどれでも `id` を
+/// 黙って 0 として評価せず束縛段で拒否する（Issue #1870 レビュー指摘）。
+#[test]
+fn recursive_reference_rejects_pseudo_id_in_expressions() {
     let (core, _g) = open_core_with(seed_tree);
     for sql in [
-        "WITH RECURSIVE t(n) AS (SELECT 1 UNION ALL SELECT * FROM t WHERE n < 3) SELECT n FROM t",
-        "WITH RECURSIVE t(n) AS (SELECT 1 UNION ALL SELECT id FROM t WHERE n < 3) SELECT n FROM t",
+        "WITH RECURSIVE t(n) AS (SELECT 1 UNION ALL SELECT n + 1 FROM t WHERE n < 3 AND id = 0) \
+           SELECT n FROM t",
+        "WITH RECURSIVE t(n) AS (SELECT 1 UNION ALL SELECT n + 1 FROM t WHERE id > 0) SELECT n FROM t",
+        "WITH RECURSIVE t(n) AS (SELECT 1 UNION ALL SELECT id + 1 FROM t WHERE n < 3) SELECT n FROM t",
         "WITH RECURSIVE t(n) AS (SELECT 1 UNION ALL \
-           SELECT t.* FROM tree c JOIN t ON c.parent_id = t.n) SELECT n FROM t",
+           SELECT c.node_id FROM tree c JOIN t ON c.parent_id = t.n WHERE t.id = 0) SELECT n FROM t",
+        "WITH RECURSIVE t(n) AS (SELECT 1 UNION ALL \
+           SELECT c.node_id FROM tree c JOIN t ON t.id = c.parent_id) SELECT n FROM t",
+        "WITH RECURSIVE t(n) AS (SELECT 1 UNION ALL SELECT n + 1 FROM t WHERE n < 3) \
+           SELECT n FROM t WHERE id = 0",
+        "WITH RECURSIVE t(n) AS (SELECT 1 UNION ALL SELECT n + 1 FROM t WHERE n < 3) \
+           SELECT n FROM t ORDER BY id",
     ] {
         let c = code(&core, "alice", sql);
-        assert!(
-            ["0A000", "42601", "42703"].contains(&c.as_str()),
-            "{sql}: {c}"
-        );
-        assert_ne!(c, "00000");
+        assert!(["0A000", "42601", "42703", "22000"].contains(&c.as_str()), "{sql}: {c}");
     }
+    // 実列 `id` を持つ作業表では従来どおり参照できる（疑似列ではなく実列として束縛）。
+    let ok = "WITH RECURSIVE t(id) AS (SELECT 1 UNION ALL SELECT id + 1 FROM t WHERE id < 3) \
+              SELECT id FROM t ORDER BY id";
+    assert_eq!(rows(&core, "alice", ok), col(&["1", "2", "3"]));
+}
+
+/// ICU 照合の列を持つ表を参照する再帰は、照合を作業表へ運べないため固定の `0A000` で拒否する
+/// （バイト列順での黙った比較にしない。TABLE-28）。
+#[test]
+fn icu_collated_table_is_rejected() {
+    let (core, _g) = open_core_with(|storage| {
+        let schema = TableSchema::new(
+            "words",
+            vec![
+                ColumnDef::new("w", ColumnType::Text, false)
+                    .with_collation(engine::collation::Collation::UndIcu),
+                ColumnDef::new("n", ColumnType::BigInt, false),
+            ],
+        );
+        storage
+            .create_table(&schema)
+            .expect("create collated table");
+    });
+    let sql = "WITH RECURSIVE t(w, n) AS (\
+                 SELECT w, n FROM words WHERE n = 1 \
+                 UNION ALL SELECT w, n + 1 FROM t WHERE w < 'm' AND n < 3) \
+               SELECT n FROM t";
+    let err = run(&core, "alice", sql).expect_err("collated recursion must be rejected");
+    assert_eq!(code(&core, "alice", sql), "0A000");
+    assert!(
+        format!("{err:?}").contains("this collation is not supported in this expression"),
+        "{err:?}"
+    );
 }
 
 /// 評価できない形は `0A000`（`UNION`・複数定義・SEARCH／CYCLE）。段階 A の `42P19` が先に決まる。
