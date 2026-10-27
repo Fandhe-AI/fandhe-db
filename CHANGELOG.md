@@ -9,6 +9,11 @@
 
 ### Added
 
+- CTE を JOIN の入力（リレーション）として受け付ける（Issue #1861・SQL-62）。セッションの最上位 SELECT で `WITH` の主クエリが JOIN の形のとき、
+  FROM の CTE を評価済みの行の側入力にし、複数回参照しても共有する CTE の本文は文内で 1 回だけ評価する（指定なしは参照数 2 以上で共有）。
+  従来 `42601` で拒否していた形が受理される挙動変更で、ICU 照合の列を読む CTE・重複列名・型なし列は `0A000`、
+  本文の可視行が `--max-result-rows` を超えると `54000`。観測用に `EngineCore::materialized_cte_eval_stats`（`VectorCore` 外の固有 API）を追加。
+  公開 enum は変えない（非 BREAKING）。詳細は [cte.md](docs/design/cte.md) の「Issue #1861 追記」節。
 - `WITH RECURSIVE` の構文を受理し再帰構造を検証する（Issue #1869・SQL-35。段階 A）。アンカー項と再帰項を
   `UNION [ALL]` で結んだ形の自己参照の位置・回数を検証し、不正な再帰は `42P19`、未対応の形と構造検証を通過した
   文の実行（反復評価は #1870）は `0A000` で拒否する。従来 `42601` だった挙動変更。詳細は [recursive-cte.md](docs/design/recursive-cte.md)。

@@ -335,6 +335,38 @@ fn plan_rows(
     })
 }
 
+/// 行形の層（射影・`WHERE`）を、評価済みの本文の結果列に対して計画する（Issue #1861。
+/// `JOIN` が CTE を入力にするときの側スキャンと、CTE→CTE の導出が使う）。束縛・公開範囲・
+/// 同名列の規則は評価後射影形ビューの外側（[`plan_outer`]）と同じ [`plan_rows`] を共有する。
+pub(crate) fn plan_rows_layer(
+    body_columns: &[ColumnMeta],
+    view_name: &str,
+    rows: &BufferedRows,
+    udfs: &UdfRegistry,
+) -> Result<OuterPlan, SqlSurfaceError> {
+    plan_rows(body_columns, view_name, rows, udfs)
+}
+
+/// [`plan_rows_layer`] の計画を評価済みの行へ適用する。集計形の計画は受け付けない（`Internal`）。
+pub(crate) fn apply_rows_layer(
+    result: QueryResult,
+    plan: &OuterPlan,
+) -> Result<QueryResult, SqlSurfaceError> {
+    match &plan.kind {
+        OuterKind::Rows(rows) => apply_rows(result, rows, &plan.columns),
+        OuterKind::Aggregate(_) => Err(internal_error()),
+    }
+}
+
+/// 評価済みの CTE の結果列を列名リスト（`WITH c(a, b)`）で先頭から改名する（Issue #1861）。
+/// 規則は評価後射影形ビューの列別名（[`rename_body_columns`]）と同じ。
+pub(crate) fn rename_cte_columns(
+    columns: &[ColumnMeta],
+    aliases: &[String],
+) -> Result<Vec<ColumnMeta>, SqlSurfaceError> {
+    rename_body_columns(columns, aliases)
+}
+
 /// 外側 `ORDER BY` が参照する識別子と、並べ替えキーの有無（集合演算外の `Rows` 外側のみ。
 /// 集計外側は `ORDER BY` を持たない）。並べ替えは `plan_order` が `cmp_class` で型を検査する
 /// ため、具体化可否の判定（`allowlist::materialized_cte_statement`）が同じ関数の対応範囲に
