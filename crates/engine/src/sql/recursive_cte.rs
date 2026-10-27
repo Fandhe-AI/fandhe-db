@@ -128,6 +128,12 @@ fn relation_refs(tokens: &[Token], name: &str) -> Vec<RelRef> {
                 }
             }
             Token::Ident(w) => {
+                // 直前が `AS` なら、この識別子は中身（`GROUP`／`FETCH`／`WINDOW`／`JOIN` 等の語を含む）を
+                // 問わず無条件に別名であり、句の終端・結合・関係名としては扱わない（SQL の文法位置で決める）。
+                // `AS` の無い引用符付き予約語の別名（`FROM t "group"`）は lexer が区別しないため区別できない。
+                if is_alias_position(tokens, i) {
+                    continue;
+                }
                 if let Some(f) = stack.last_mut() {
                     if f.expect_rel {
                         if (w.eq_ignore_ascii_case("LATERAL") || w.eq_ignore_ascii_case("ONLY"))
@@ -174,6 +180,21 @@ fn relation_refs(tokens: &[Token], name: &str) -> Vec<RelRef> {
         }
     }
     out
+}
+
+/// `tokens[i]` が `AS` の直後の別名位置か。直前に連続する `AS` の個数が奇数なら別名
+/// （`AS "AS"` の 2 個目の `AS` は別名であり、その直後の語は別名位置ではない）。
+fn is_alias_position(tokens: &[Token], i: usize) -> bool {
+    let mut n = 0usize;
+    let mut k = i;
+    while let Some(p) = k.checked_sub(1) {
+        if !is_word(tokens.get(p), "AS") {
+            break;
+        }
+        n = n.saturating_add(1);
+        k = p;
+    }
+    n % 2 == 1
 }
 
 /// 式・別名を導入する語。直後の `JOIN` は結合演算子ではなく列名・別名として読む
@@ -243,7 +264,11 @@ fn ends_operand(prev: Option<&Token>) -> bool {
 /// 完結し（[`ends_operand`]）、直後に関係名（識別子・`(`）が続く位置だけ。`AS "join"` の別名や
 /// `= "join"`・`ON join` の列参照は演算子とみなさない（`relation_refs` の構造判定用）。
 fn is_join_operator_position(tokens: &[Token], i: usize) -> bool {
-    ends_operand(i.checked_sub(1).and_then(|p| tokens.get(p)))
+    // 直前が `AS` の別名なら、その語が `ON` 等の語でも別名として項は完結している。
+    let prev_is_alias = i
+        .checked_sub(1)
+        .is_some_and(|p| is_alias_position(tokens, p));
+    (prev_is_alias || ends_operand(i.checked_sub(1).and_then(|p| tokens.get(p))))
         && matches!(
             tokens.get(i.saturating_add(1)),
             Some(Token::Ident(_) | Token::Punct('('))
@@ -453,10 +478,10 @@ pub(crate) fn validate_recursive_with(
             None
         };
         if let Some(gate) = skipped_gate {
-            // 入れ子の WITH は、既存の通常 WITH 経路が定数 SELECT の主クエリ等の妥当な形を `42601` で
-            // 拒否するため（挙動を `0A000` から変えてしまう）、構文検証せず機能ゲートへ保留する。
+            // 入れ子の WITH は通常 WITH 経路（ビュー本文の形制約あり）を使わず、構文専用の
+            // [`validate_nested_with_syntax`] で検証する。
             let checked = if is_word(first, "WITH") {
-                Ok(())
+                validate_nested_with_syntax(body, 1, limits)
             } else {
                 validate_data_modifying_cte_syntax(body, limits).map(|_| ())
             };
@@ -519,6 +544,52 @@ pub(crate) fn validate_recursive_with(
     Ok(RecursiveWithClause { defs, main_tokens })
 }
 
+/// 入れ子の `WITH`（本文が `WITH` で始まる定義）の構文だけを検証する（実行対応とは分離。
+/// 呼び出し元が妥当な形を機能ゲート `0A000` へ保留する）。通常 `WITH` 経路（`parse_with_clause`＋
+/// 解決・合成）は CTE 本文にビュー本文の形制約を課すため使わず、`WITH RECURSIVE` と同じ
+/// ヘッダー解析（`RECURSIVE` を補って流用）で定義を切り出し、各本文をカタログ非依存の構文検証器へ
+/// 通す。深さは `limits` のサブクエリ深さ上限で打ち切る（超過は `54000`）。
+fn validate_nested_with_syntax(
+    tokens: &[Token],
+    depth: usize,
+    limits: NestingLimits,
+) -> Result<(), SqlSurfaceError> {
+    if depth > limits.max_subquery_depth() {
+        return Err(SqlSurfaceError::payload_too_large(format!(
+            "subquery nesting exceeds limit {}",
+            limits.max_subquery_depth()
+        )));
+    }
+    if is_word(tokens.get(1), "RECURSIVE") {
+        // 入れ子の `WITH RECURSIVE` は再帰項の構造まで同じ検証器で確定させる。
+        return validate_recursive_with(tokens, limits).map(|_| ());
+    }
+    let mut with_recursive: Vec<Token> = Vec::with_capacity(tokens.len().saturating_add(1));
+    with_recursive.extend(tokens.first().cloned());
+    with_recursive.push(Token::Ident("RECURSIVE".to_string()));
+    with_recursive.extend(tokens.iter().skip(1).cloned());
+    let (defs, main, _search_cycle) = split_recursive_with_clause(&with_recursive, limits)?;
+    if !matches!(main.first(), Some(Token::Keyword(Keyword::Select))) {
+        return Err(SqlSurfaceError::unsupported(
+            "WITH must be followed by a SELECT statement",
+        ));
+    }
+    for (_, _, body) in &defs {
+        let first = body.first();
+        if is_word(first, "WITH") {
+            validate_nested_with_syntax(body, depth.saturating_add(1), limits)?;
+        } else if matches!(first, Some(Token::Ident(w))
+            if ["INSERT", "UPDATE", "DELETE"].iter().any(|k| w.eq_ignore_ascii_case(k)))
+        {
+            validate_data_modifying_cte_syntax(body, limits)?;
+        } else {
+            structural(body, limits)?;
+        }
+    }
+    structural(&main, limits)?;
+    Ok(())
+}
+
 /// 自己参照を持つ本文を、アンカー項と再帰項へ分割して検証する。
 fn validate_recursive_body(
     name: &str,
@@ -537,7 +608,9 @@ fn validate_recursive_body(
         ));
     };
     let union_all = is_word(body.get(u.saturating_add(1)), "ALL");
-    let right_start = u.saturating_add(if union_all { 2 } else { 1 });
+    // `UNION DISTINCT` は `UNION` と同義の明示形。量指定語（`ALL`／`DISTINCT`）は右項に含めない。
+    let has_quantifier = union_all || is_word(body.get(u.saturating_add(1)), "DISTINCT");
+    let right_start = u.saturating_add(if has_quantifier { 2 } else { 1 });
     let anchor = body.get(..u).unwrap_or(&[]);
     let recursive = body.get(right_start..).unwrap_or(&[]);
     if anchor.is_empty() || recursive.is_empty() {
@@ -862,6 +935,86 @@ mod tests {
         ] {
             assert_eq!(code(sql), NOT_YET, "{sql}");
         }
+    }
+
+    #[test]
+    fn alias_position_never_triggers_keyword_handling() {
+        // relation_refs が特別扱いする全語（句の終端語・ONLY/LATERAL・JOIN 系・ON/USING 等）を
+        // `AS <語>` の別名位置へ置いても、後続の JOIN の自己参照まで 2 件として数える。
+        let words = [
+            "GROUP",
+            "HAVING",
+            "UNION",
+            "INTERSECT",
+            "EXCEPT",
+            "OFFSET",
+            "FETCH",
+            "WINDOW",
+            "WHERE",
+            "ORDER",
+            "LIMIT",
+            "ONLY",
+            "LATERAL",
+            "JOIN",
+            "INNER",
+            "LEFT",
+            "RIGHT",
+            "FULL",
+            "CROSS",
+            "NATURAL",
+            "ON",
+            "USING",
+            "AS",
+            "FROM",
+            "SELECT",
+            "AND",
+            "OR",
+        ];
+        for kw in words {
+            let sql = format!("SELECT a.n FROM t AS \"{kw}\" JOIN t b ON b.n = 1");
+            let Ok(tokens) = crate::sql::lexer::tokenize(&sql) else {
+                continue;
+            };
+            assert_eq!(relation_refs(&tokens, "t").len(), 2, "{sql}");
+        }
+    }
+
+    #[test]
+    fn union_distinct_recursive_query_is_accepted() {
+        assert_eq!(
+            code("WITH RECURSIVE t(n) AS (SELECT 1 UNION DISTINCT SELECT n + 1 FROM t WHERE n < 3) SELECT n FROM t"),
+            NOT_YET
+        );
+        assert_eq!(
+            code("WITH RECURSIVE t(n) AS (SELECT 1 UNION DISTINCT SELECT n FROM docs WHERE n IN (SELECT n FROM t)) SELECT n FROM t"),
+            "42P19"
+        );
+    }
+
+    #[test]
+    fn nested_with_syntax_precedes_gate() {
+        let bad_rec = "t(n) AS (SELECT n FROM t)";
+        for sql in [
+            "WITH RECURSIVE t AS (WITH) SELECT 1".to_string(),
+            "WITH RECURSIVE a AS (WITH x AS (SELECT FROM docs) SELECT 1) SELECT 1".to_string(),
+            format!("WITH RECURSIVE a AS (WITH x AS (SELECT FROM docs) SELECT 1), {bad_rec} SELECT 1"),
+            "WITH RECURSIVE a AS (WITH x AS (WITH y AS (SELECT FROM docs) SELECT 1) SELECT 1) SELECT 1".to_string(),
+            "WITH RECURSIVE a AS (WITH x AS (SELECT id FROM docs) SELECT FROM x) SELECT 1".to_string(),
+        ] {
+            assert_eq!(code(&sql), "42601", "{sql}");
+        }
+        for sql in [
+            "WITH RECURSIVE a AS (WITH u AS (SELECT 1) SELECT 1) SELECT 1",
+            "WITH RECURSIVE a AS (WITH x AS (SELECT id FROM docs) SELECT id FROM x) SELECT 1",
+            "WITH RECURSIVE a AS (WITH x AS (DELETE FROM docs WHERE id = 1) SELECT 1) SELECT 1",
+        ] {
+            assert_eq!(code(sql), NOT_YET, "{sql}");
+        }
+        // 妥当な入れ子 WITH と不正な再帰の併記は 42P19 が先。
+        assert_eq!(
+            code("WITH RECURSIVE a AS (WITH u AS (SELECT 1) SELECT 1), t(n) AS (SELECT n FROM t) SELECT 1"),
+            "42P19"
+        );
     }
 
     #[test]
