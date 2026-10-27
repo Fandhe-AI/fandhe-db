@@ -97,6 +97,7 @@ cargo run -p fandhe-db-wire-server -- --users <ユーザーストアのパス> -
   [--max-cte-definitions <1-16>] [--max-cte-nesting-depth <1-4>] \
   [--max-join-relations <2-8>] [--max-join-input-rows <1-100000>] [--max-join-output-rows <1-100000>] \
   [--max-correlated-reevaluations <1-100000>] \
+  [--max-recursive-cte-iterations <1-1000>] [--max-recursive-cte-rows <1-100000>] \
   [--max-result-rows <1-100000>] \
   [--write-lock-wait-ms <100-60000>] \
   [--read-timeout-secs <1-600>] [--max-connections <1-256>] [--max-prepared-statements <1-1024>] \
@@ -421,6 +422,13 @@ CTE 連鎖の深さの上限を、プロセス全体に対して起動時に**�
 変わりません）。超過時の SQLSTATE は `54000` です。範囲外・非数値・値欠落・2 回目以降の重複指定は fail-closed で
 起動エラーです。上限を引き上げることはできません（詳細: [docs/design/sql-subquery.md](docs/design/sql-subquery.md)
 の「Issue #1847 追記」節）。
+
+`--max-recursive-cte-iterations <N>`（既定 1,000・範囲 `1`〜`1,000`）と `--max-recursive-cte-rows <N>`（既定 100,000・
+範囲 `1`〜`100,000`）（Issue #1871・SQL-35・SQL-46）は、`WITH RECURSIVE` の反復回数（再帰項の実行回数）と累積行数
+（アンカー行を含む）の上限を、プロセス全体に対して起動時に**下げる方向だけ**設定します（未指定は現行のハード上限と
+同じ値で、挙動は変わりません）。累積行数は `--max-result-rows` との小さい方が実効上限です。超過時の SQLSTATE は
+`54000` です。範囲外・非数値・値欠落・2 回目以降の重複指定は fail-closed で起動エラーです（詳細:
+[docs/design/recursive-cte.md](docs/design/recursive-cte.md)）。
 
 `--max-result-rows <N>`（既定 10,000・範囲 `1`〜`100,000`）（Issue #1555・SQL-34／SQL-46）は、明示 `LIMIT` の
 範囲上限（従来のコンパイル時定数 10,000）を、プロセス全体に対して起動時に**上げ下げ両方向**へ設定します
