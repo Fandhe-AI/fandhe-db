@@ -15067,6 +15067,7 @@ impl<'a> Parser<'a> {
                 // 句の存在だけを記録し、次の定義の区切り（`, 名前 AS|(`）か主クエリの
                 // `SELECT` の手前までトークンを読み飛ばす。
                 has_search_cycle = true;
+                let clause_start = self.pos;
                 loop {
                     match self.peek() {
                         None | Some(Token::Keyword(Keyword::Select)) => break,
@@ -15087,6 +15088,10 @@ impl<'a> Parser<'a> {
                         }
                     }
                 }
+                // 構文（42601）は機能ゲート（0A000）より先に確定させる。
+                validate_search_cycle_clause(
+                    self.tokens.get(clause_start..self.pos).unwrap_or(&[]),
+                )?;
             }
             if matches!(self.peek(), Some(Token::Punct(','))) {
                 self.advance();
@@ -15095,6 +15100,92 @@ impl<'a> Parser<'a> {
             break;
         }
         Ok((defs, self.remaining().to_vec(), has_search_cycle))
+    }
+}
+
+/// `WITH RECURSIVE` 本文がデータ変更文のとき、`WITH` 通常経路と同じ DML 許可パーサーで構文を
+/// 検証する（`sql::recursive_cte` から呼ばれる。カタログは参照しない）。`Ok(true)` は構文が
+/// 妥当なデータ変更文、`Ok(false)` は先頭がデータ変更文ではない。未対応形は `0A000`、構文不正は
+/// `42601` を返し、呼び出し元が順序契約（構文 → 再帰構造 → 機能ゲート）に従って扱う。
+pub(crate) fn validate_data_modifying_cte_syntax(
+    inner: &[Token],
+    limits: crate::nesting_limits::NestingLimits,
+) -> Result<bool, SqlSurfaceError> {
+    Ok(parse_data_modifying_cte_body(inner, None, limits)?.is_some())
+}
+
+/// `WITH RECURSIVE` 定義の直後の `SEARCH`／`CYCLE` 句（SQL-35。実行は未対応で `0A000`）の構文だけを
+/// 検証する。`parse_recursive_with_header` が機能ゲートより先に呼び、不正な形は `42601`
+/// （構文 → 再帰構造 → 機能ゲートの順序契約）。文法: `SEARCH {BREADTH|DEPTH} FIRST BY 列[, 列]* SET 列`
+/// の後に `CYCLE 列[, 列]* SET 列 [TO 定数 DEFAULT 定数] [USING 列]` を任意で続けられる
+/// （`CYCLE` 単独も可）。固定文言で入力断片を含めない。
+fn validate_search_cycle_clause(clause: &[Token]) -> Result<(), SqlSurfaceError> {
+    let bad = || SqlSurfaceError::unsupported("invalid SEARCH or CYCLE clause");
+    let mut i = 0usize;
+    let word = |i: usize, w: &str| matches!(clause.get(i), Some(Token::Ident(n)) if n.eq_ignore_ascii_case(w));
+    let ident = |i: usize| matches!(clause.get(i), Some(Token::Ident(_)));
+    // 列名のカンマ区切りリスト（1 個以上）を読み、次の位置を返す。
+    let list = |mut i: usize| -> Option<usize> {
+        if !ident(i) {
+            return None;
+        }
+        i = i.saturating_add(1);
+        while matches!(clause.get(i), Some(Token::Punct(','))) {
+            if !ident(i.saturating_add(1)) {
+                return None;
+            }
+            i = i.saturating_add(2);
+        }
+        Some(i)
+    };
+    // 定数 1 個（任意の符号付き数値・文字列・識別子語）を読み、次の位置を返す。
+    let constant = |mut i: usize| -> Option<usize> {
+        if matches!(clause.get(i), Some(Token::Punct('-' | '+'))) {
+            i = i.saturating_add(1);
+        }
+        matches!(
+            clause.get(i),
+            Some(Token::Number(_) | Token::StringLiteral(_) | Token::Ident(_))
+        )
+        .then(|| i.saturating_add(1))
+    };
+    if word(i, "SEARCH") {
+        if !(word(i + 1, "BREADTH") || word(i + 1, "DEPTH")) || !word(i + 2, "FIRST") {
+            return Err(bad());
+        }
+        if !matches!(clause.get(i + 3), Some(Token::Keyword(Keyword::By))) {
+            return Err(bad());
+        }
+        i = list(i + 4).ok_or_else(bad)?;
+        if !word(i, "SET") || !ident(i + 1) {
+            return Err(bad());
+        }
+        i += 2;
+    }
+    if word(i, "CYCLE") {
+        i = list(i + 1).ok_or_else(bad)?;
+        if !word(i, "SET") || !ident(i + 1) {
+            return Err(bad());
+        }
+        i += 2;
+        if word(i, "TO") {
+            i = constant(i + 1).ok_or_else(bad)?;
+            if !word(i, "DEFAULT") {
+                return Err(bad());
+            }
+            i = constant(i + 1).ok_or_else(bad)?;
+        }
+        if word(i, "USING") {
+            if !ident(i + 1) {
+                return Err(bad());
+            }
+            i += 2;
+        }
+    }
+    if i == clause.len() {
+        Ok(())
+    } else {
+        Err(bad())
     }
 }
 

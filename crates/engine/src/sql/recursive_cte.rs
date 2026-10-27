@@ -18,8 +18,9 @@
 
 use super::allowlist::{
     is_set_operator_ident, set_operator_is_followed_by_branch, split_parenthesized,
-    split_recursive_with_clause, validate_sql_tokens_with_subquery_ctx_limits, JoinKind,
-    SqlSurfaceError, Statement, StructuralOnlyLookup,
+    split_recursive_with_clause, validate_data_modifying_cte_syntax,
+    validate_sql_tokens_with_subquery_ctx_limits, JoinKind, SqlSurfaceError, Statement,
+    StructuralOnlyLookup,
 };
 use super::lexer::{Keyword, Token};
 use crate::nesting_limits::NestingLimits;
@@ -440,23 +441,37 @@ pub(crate) fn validate_recursive_with(
     let mut defs = Vec::with_capacity(raw_defs.len());
     for (idx, (name, column_aliases, body)) in raw_defs.iter().enumerate() {
         let first = body.first();
-        if matches!(first, Some(Token::Ident(w))
+        // データ変更本文・入れ子の WITH は評価できない（機能ゲート 0A000）が、ゲートは構文（42601）・
+        // 再帰構造（42P19）の確定後に返す順序契約のため、本文の構文を検証してから保留する。
+        let skipped_gate: Option<&'static str> = if matches!(first, Some(Token::Ident(w))
             if ["INSERT", "UPDATE", "DELETE"].iter().any(|k| w.eq_ignore_ascii_case(k)))
         {
-            // 本文は SELECT でなく構文検証できないため、この定義の検証だけ省く。
-            deferred.get_or_insert_with(|| {
-                SqlSurfaceError::feature_not_supported(
-                    "data-modifying statements in WITH RECURSIVE are not supported",
-                )
-            });
-            continue;
-        }
-        if is_word(first, "WITH") {
-            deferred.get_or_insert_with(|| {
-                SqlSurfaceError::feature_not_supported(
-                    "nested WITH inside WITH RECURSIVE is not supported",
-                )
-            });
+            Some("data-modifying statements in WITH RECURSIVE are not supported")
+        } else if is_word(first, "WITH") {
+            Some("nested WITH inside WITH RECURSIVE is not supported")
+        } else {
+            None
+        };
+        if let Some(gate) = skipped_gate {
+            // 入れ子の WITH は、既存の通常 WITH 経路が定数 SELECT の主クエリ等の妥当な形を `42601` で
+            // 拒否するため（挙動を `0A000` から変えてしまう）、構文検証せず機能ゲートへ保留する。
+            let checked = if is_word(first, "WITH") {
+                Ok(())
+            } else {
+                validate_data_modifying_cte_syntax(body, limits).map(|_| ())
+            };
+            match checked {
+                Ok(()) => {
+                    deferred.get_or_insert_with(|| SqlSurfaceError::feature_not_supported(gate));
+                }
+                Err(e) if e.wire_code() == "42P19" => {
+                    structural_err.get_or_insert(e);
+                }
+                Err(e) if e.wire_code() == "0A000" => {
+                    deferred.get_or_insert(e);
+                }
+                Err(e) => return Err(e),
+            }
             continue;
         }
         for (_, (later, _, _)) in raw_defs.iter().enumerate().skip(idx.saturating_add(1)) {
@@ -804,6 +819,48 @@ mod tests {
         for tail in ["1", "'a'", "$1", "a[1]", "TRUE", "NULL", "(1)", "d.n"] {
             let sql = format!("SELECT d.n FROM docs d JOIN u ON d.n = {tail} JOIN t ON t.n = 1");
             assert_eq!(count(&sql), 1, "{sql}");
+        }
+    }
+
+    #[test]
+    fn data_modifying_body_syntax_precedes_gate_and_structure() {
+        let bad_rec = "t(n) AS (SELECT n FROM t)";
+        for sql in [
+            "WITH RECURSIVE d AS (DELETE) SELECT 1".to_string(),
+            "WITH RECURSIVE d AS (INSERT INTO) SELECT 1".to_string(),
+            format!("WITH RECURSIVE {bad_rec}, d AS (DELETE) SELECT 1"),
+            format!("WITH RECURSIVE d AS (DELETE), {bad_rec} SELECT 1"),
+            format!("WITH RECURSIVE d AS (UPDATE docs SET), {bad_rec} SELECT 1"),
+        ] {
+            assert_eq!(code(&sql), "42601", "{sql}");
+        }
+        // 妥当なデータ変更本文は従来どおり機能ゲート 0A000。不正な再帰との併記は 42P19 が先。
+        assert_eq!(
+            code("WITH RECURSIVE d AS (DELETE FROM docs WHERE id = 1) SELECT 1"),
+            NOT_YET
+        );
+        assert_eq!(
+            code("WITH RECURSIVE d AS (DELETE FROM docs WHERE id = 1), t(n) AS (SELECT n FROM t) SELECT 1"),
+            "42P19"
+        );
+    }
+
+    #[test]
+    fn search_cycle_clause_syntax_precedes_gate() {
+        for sql in [
+            "WITH RECURSIVE t(n) AS (SELECT 1 UNION ALL SELECT n + 1 FROM t) SEARCH garbage SELECT n FROM t".to_string(),
+            "WITH RECURSIVE t(n) AS (SELECT 1 UNION ALL SELECT n + 1 FROM t) SEARCH DEPTH FIRST BY n SELECT n FROM t".to_string(),
+            "WITH RECURSIVE t(n) AS (SELECT 1 UNION ALL SELECT n + 1 FROM t) CYCLE n SELECT n FROM t".to_string(),
+            "WITH RECURSIVE t(n) AS (SELECT 1 UNION ALL SELECT n + 1 FROM t) CYCLE n SET c TO 1 USING p SELECT n FROM t".to_string(),
+        ] {
+            assert_eq!(code(&sql), "42601", "{sql}");
+        }
+        for sql in [
+            "WITH RECURSIVE t(n) AS (SELECT 1 UNION ALL SELECT n + 1 FROM t) SEARCH BREADTH FIRST BY n SET o SELECT n FROM t",
+            "WITH RECURSIVE t(n) AS (SELECT 1 UNION ALL SELECT n + 1 FROM t) CYCLE n SET c TO 1 DEFAULT 0 USING p SELECT n FROM t",
+            "WITH RECURSIVE t(n) AS (SELECT 1 UNION ALL SELECT n + 1 FROM t) SEARCH DEPTH FIRST BY n SET o CYCLE n SET c USING p SELECT n FROM t",
+        ] {
+            assert_eq!(code(sql), NOT_YET, "{sql}");
         }
     }
 
