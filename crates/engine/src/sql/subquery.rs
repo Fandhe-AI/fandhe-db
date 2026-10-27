@@ -24,6 +24,10 @@
 //!   受理する（Issue #1853・SQL-29・SQL-34。上限の扱いは下記）。
 //! - スカラー: 上記に加え、単一集計項目の集計形（[`Statement::Aggregate`]。
 //!   `GROUP BY` の有無を問わず `LIMIT` 不要）。
+//! - `<col> <op> ANY|SOME|ALL (SELECT ...)`（Issue #1855・SQL-61 (3)）: 内側の形は `IN` と
+//!   同じ。`= ANY`／`<> ALL` は `IN`／`NOT IN` へ委譲し、それ以外は内側の値集合の境界値
+//!   （最小・最大）との比較へ書き換える（空集合・NULL を含む集合・外側値 NULL の三値論理は
+//!   [`resolve_quantified_compare`] 参照）。
 //!
 //! ランキング付き検索 SELECT・集合演算・JOIN・
 //! 内側自身の投影位置スカラーサブクエリは `42601`（`docs/design/sql-subquery.md` 参照）。
@@ -246,6 +250,32 @@ pub(crate) fn resolve_where_predicates(
                     in_value_budget,
                 )?);
             }
+            // `<col> <op> ANY|SOME|ALL (SELECT ...)`（Issue #1855・SQL-61 (3)）。否定は構文段が
+            // 演算子と量化子の反転として葉へ押し下げ済みのため、`Not` に包まれては届かない。
+            WherePredicate::QuantifiedSubqueryCompare {
+                column,
+                op,
+                quantifier,
+                inner_tokens,
+                depth,
+            } => {
+                out.extend(resolve_quantified_compare(
+                    &column,
+                    op,
+                    quantifier,
+                    &inner_tokens,
+                    depth,
+                    outer_scopes,
+                    read_txn,
+                    ctx,
+                    lookup,
+                    udfs,
+                    group_limits,
+                    nesting_limits,
+                    budget,
+                    in_value_budget,
+                )?);
+            }
             WherePredicate::Not(inner) => match *inner {
                 // `NOT IN (SELECT ...)`（Issue #1191）。NULL 規則は
                 // [`resolve_in_subquery`] が担う。
@@ -294,6 +324,14 @@ pub(crate) fn resolve_where_predicates(
                     if exists {
                         out.push(WherePredicate::Or(Vec::new()));
                     }
+                }
+                // 構文段の不変条件（量化比較の否定は反転済み）が破れた場合の fail-closed
+                // （述語を黙って通さない）。
+                WherePredicate::QuantifiedSubqueryCompare { .. } => {
+                    return Err(SqlSurfaceError::Internal {
+                        detail: "negated quantified subquery comparison reached resolution"
+                            .to_string(),
+                    });
                 }
                 other => out.push(WherePredicate::Not(Box::new(other))),
             },
@@ -998,6 +1036,39 @@ fn static_validate_subquery_predicates(
                 let (_, target_family) = scalar_target_column(column, chain)?;
                 check_scalar_family_compatible(column, inner_meta, target_family)?;
             }
+            WherePredicate::QuantifiedSubqueryCompare {
+                column,
+                op,
+                quantifier,
+                inner_tokens,
+                depth,
+            } => {
+                // [`resolve_quantified_compare`] と同じ順序（内側 → 投影列数 → 対象列 → 値族）。
+                let meta = static_validate_inner_query(
+                    inner_tokens,
+                    *depth,
+                    InnerScanIntent::Values,
+                    chain,
+                    read_txn,
+                    lookup,
+                    udfs,
+                    nesting_limits,
+                )?;
+                let [inner_meta] = meta.as_slice() else {
+                    return Err(SqlSurfaceError::unsupported(
+                        "subquery used with ANY/ALL must select exactly one column",
+                    ));
+                };
+                if quantified_delegates_to_in(*op, *quantifier).is_some() {
+                    let (_, family) = validate_in_target_column(column, owner_schema(chain)?)?;
+                    if !in_family_compatible(inner_meta, family) {
+                        return Err(in_family_mismatch(column));
+                    }
+                } else {
+                    let (_, target_family) = quantified_target_column(column, *op, chain)?;
+                    check_scalar_family_compatible(column, inner_meta, target_family)?;
+                }
+            }
             _ => {}
         }
     }
@@ -1188,7 +1259,8 @@ pub(crate) fn predicate_contains_subquery(pred: &WherePredicate) -> bool {
     match pred {
         WherePredicate::InSubquery { .. }
         | WherePredicate::Exists { .. }
-        | WherePredicate::ScalarSubqueryCompare { .. } => true,
+        | WherePredicate::ScalarSubqueryCompare { .. }
+        | WherePredicate::QuantifiedSubqueryCompare { .. } => true,
         WherePredicate::Not(inner) => predicate_contains_subquery(inner),
         WherePredicate::Or(branches) => branches.iter().flatten().any(predicate_contains_subquery),
         _ => false,
@@ -2105,6 +2177,320 @@ fn resolve_scalar_compare(
     scalar_literal_predicate(column, op, cell, target_ty, target_family)
 }
 
+/// `= ANY` は `IN`、`<> ALL` は `NOT IN` と同じ意味のため、`resolve_in_subquery` の
+/// `negated` 引数へ写す（Issue #1855・SQL-61 (3)）。委譲しない組合せは `None`。
+fn quantified_delegates_to_in(
+    op: ScalarSubqueryOp,
+    quantifier: crate::sql::udf_call::Quantifier,
+) -> Option<bool> {
+    use crate::sql::udf_call::Quantifier;
+    match (op, quantifier) {
+        (ScalarSubqueryOp::Eq, Quantifier::Any) => Some(false),
+        (ScalarSubqueryOp::Ne, Quantifier::All) => Some(true),
+        _ => None,
+    }
+}
+
+/// 量化比較の対象列を [`scalar_target_column`] で検証し、範囲比較（`< <= > >=`）の対象が
+/// BOOLEAN／ENUM なら `22000`、TEXT 系で列の照合がバイト列順でなければ `0A000`（比較の葉が
+/// 照合を運ばないため境界値の選び方と評価順序がずれる。fail-closed）で拒否する。内側の
+/// 行数・値に依存せず必ず実行する（Issue #1855・SQL-61 (3)）。
+fn quantified_target_column<'a>(
+    column: &str,
+    op: ScalarSubqueryOp,
+    outer_scopes: &[&'a TableSchema],
+) -> Result<(Option<&'a ColumnType>, SubqueryValueFamily), SqlSurfaceError> {
+    let (ty, family) = scalar_target_column(column, outer_scopes)?;
+    let is_range = matches!(
+        op,
+        ScalarSubqueryOp::Lt | ScalarSubqueryOp::Le | ScalarSubqueryOp::Gt | ScalarSubqueryOp::Ge
+    );
+    if is_range {
+        match (family, ty) {
+            (SubqueryValueFamily::Boolean, _) => {
+                return Err(SqlSurfaceError::invalid_input(
+                    "range comparison is not supported for BOOLEAN columns",
+                ));
+            }
+            (SubqueryValueFamily::Text, Some(ColumnType::Enum(_))) => {
+                return Err(SqlSurfaceError::invalid_input(
+                    "range comparison is not supported for ENUM columns",
+                ));
+            }
+            (SubqueryValueFamily::Text, _) => {
+                let collation = owner_schema(outer_scopes)?
+                    .columns
+                    .iter()
+                    .find(|c| c.name == column)
+                    .and_then(|c| c.collation);
+                crate::sql::udf_call::require_wired_collation(collation)?;
+            }
+            _ => {}
+        }
+    }
+    Ok((ty, family))
+}
+
+/// 数値セルか（整数・浮動小数・numeric）。
+fn is_numeric_cell(cell: &Cell) -> bool {
+    matches!(
+        cell,
+        Cell::Integer(_) | Cell::SignedInteger(_) | Cell::Float(_) | Cell::Numeric(_)
+    )
+}
+
+/// 数値セルを `f64` へ写す（`-0.0` は `+0.0` へ正規化。非有限は `22000`）。
+fn numeric_cell_f64(cell: &Cell) -> Result<f64, SqlSurfaceError> {
+    let f = match cell {
+        Cell::Integer(n) => *n as f64,
+        Cell::SignedInteger(n) => *n as f64,
+        Cell::Float(f) => *f,
+        Cell::Numeric(d) => d.to_string().parse().map_err(|_| unexpected_cell_type())?,
+        _ => return Err(unexpected_cell_type()),
+    };
+    if !f.is_finite() {
+        return Err(SqlSurfaceError::invalid_input(
+            "subquery returned a non-finite number",
+        ));
+    }
+    Ok(if f == 0.0 { 0.0 } else { f })
+}
+
+/// 数値セルを厳密な 10 進数へ写す（浮動小数を含まない組合せ専用）。
+fn numeric_cell_decimal(cell: &Cell) -> Result<crate::numeric::Decimal, SqlSurfaceError> {
+    match cell {
+        Cell::Integer(n) => crate::numeric::Decimal::from_parts(i128::from(*n), 0),
+        Cell::SignedInteger(n) => crate::numeric::Decimal::from_parts(i128::from(*n), 0),
+        Cell::Numeric(d) => return Ok(*d),
+        _ => return Err(unexpected_cell_type()),
+    }
+    .map_err(|_| unexpected_cell_type())
+}
+
+/// 量化比較の境界値選びに使う、同じ値族の 2 セルの全順序。`group_by::cmp_cell_values` は
+/// 型が合わないときに `Equal` へ落ちるため再利用せず、想定外の組合せは `Err`（fail-closed）に
+/// する。TEXT はバイト列順（照合がバイト列順でない列の範囲比較は
+/// [`quantified_target_column`] が先に拒否する。等価判定は deterministic な照合でもバイト列の
+/// 等値と一致する）。浮動小数を含む数値は `f64`、それ以外の数値は厳密な 10 進数で比べる。
+fn cmp_quantified_cells(a: &Cell, b: &Cell) -> Result<std::cmp::Ordering, SqlSurfaceError> {
+    match (a, b) {
+        (Cell::Text(x), Cell::Text(y)) => Ok(x.as_bytes().cmp(y.as_bytes())),
+        (Cell::Bool(x), Cell::Bool(y)) => Ok(x.cmp(y)),
+        (Cell::Date(x), Cell::Date(y)) => Ok(x.cmp(y)),
+        (Cell::Timestamp(x), Cell::Timestamp(y))
+        | (Cell::Time(x), Cell::Time(y))
+        | (Cell::TimestampTz(x), Cell::TimestampTz(y)) => Ok(x.cmp(y)),
+        (Cell::Uuid(x), Cell::Uuid(y)) => Ok(x.cmp(y)),
+        (Cell::Bytes(x), Cell::Bytes(y)) => Ok(x.cmp(y)),
+        _ if is_numeric_cell(a) && is_numeric_cell(b) => {
+            if matches!(a, Cell::Float(_)) || matches!(b, Cell::Float(_)) {
+                Ok(numeric_cell_f64(a)?.total_cmp(&numeric_cell_f64(b)?))
+            } else {
+                Ok(crate::numeric::cmp_exact(
+                    &numeric_cell_decimal(a)?,
+                    &numeric_cell_decimal(b)?,
+                ))
+            }
+        }
+        _ => Err(unexpected_cell_type()),
+    }
+}
+
+/// `<column> <op> ANY|SOME|ALL (SELECT ...)`（Issue #1855・SQL-61 (3)・RLS-10）を解決し、
+/// 連言の述語列を返す（空は常に真）。`= ANY`／`<> ALL` は [`resolve_in_subquery`] へ委譲する
+/// （予算・NULL 規則・値族検証・ENUM の語彙外ラベル処理は `IN` と同一）。それ以外は内側の
+/// 非 NULL 値の最小 `min`・最大 `max` だけから、既存の [`scalar_literal_predicate`] で
+/// `col <op> <リテラル>` を作る（第 2 の評価器を作らない。生成する述語は高々 2 つ）。
+///
+/// 三値論理（`S` は内側の全行。否定は構文段で押し下げ済みのため「真か、真以外か」だけを
+/// 区別する）:
+/// - `ANY`: 非 NULL 値が無ければ常に偽（空集合・NULL のみ）。NULL は無視する。
+///   `> >=` は `min`、`< <=` は `max`、`<>` は `min == max` なら `col <> min`、異なれば
+///   `col <> min OR col <> max`。
+/// - `ALL`: 内側が 0 行なら常に真（外側値が NULL でも真）。NULL を含めば真にならない
+///   （偽か UNKNOWN）ため常に偽。`> >=` は `max`、`< <=` は `min`、`=` は `min == max` なら
+///   `col = min`、異なれば `col = min AND col = max`（型変換で両方と等しくなりうるため）。
+///
+/// 外側値が NULL の行は生成した比較が UNKNOWN になり除外される。判定材料は
+/// 可視行（外側と同じ `PolicyContext`・同じスナップショット）だけで、他テナントの行は影響しない。
+#[allow(clippy::too_many_arguments)]
+fn resolve_quantified_compare(
+    column: &str,
+    op: ScalarSubqueryOp,
+    quantifier: crate::sql::udf_call::Quantifier,
+    inner_tokens: &[Token],
+    depth: usize,
+    outer_scopes: &[&TableSchema],
+    read_txn: &impl crate::storage::read_source::ReadSource,
+    ctx: &PolicyContext,
+    lookup: &impl TableLookup,
+    udfs: &UdfRegistry,
+    group_limits: crate::group_by_limits::GroupByLimits,
+    nesting_limits: crate::nesting_limits::NestingLimits,
+    budget: &mut usize,
+    in_value_budget: &mut usize,
+) -> Result<Vec<WherePredicate>, SqlSurfaceError> {
+    use crate::sql::udf_call::Quantifier;
+    use std::cmp::Ordering;
+
+    if let Some(negated) = quantified_delegates_to_in(op, quantifier) {
+        return resolve_in_subquery(
+            column,
+            inner_tokens,
+            depth,
+            negated,
+            outer_scopes,
+            read_txn,
+            ctx,
+            lookup,
+            udfs,
+            group_limits,
+            nesting_limits,
+            budget,
+            in_value_budget,
+        );
+    }
+    let mut meta_sink: Option<Vec<ColumnMeta>> = None;
+    let result = match execute_inner_query_with_meta(
+        inner_tokens,
+        depth,
+        InnerScanIntent::Values,
+        outer_scopes,
+        read_txn,
+        ctx,
+        lookup,
+        udfs,
+        group_limits,
+        nesting_limits,
+        budget,
+        in_value_budget,
+        &mut meta_sink,
+    ) {
+        Ok(r) => r,
+        Err(e) => {
+            // 遅延対象エラーのときだけ、同じ述語の静的エラー（対象列・値族）を先に返す
+            // （Issue #1432。[`resolve_scalar_compare`] と同じ fail-closed の規則）。
+            if is_deferrable_runtime_error(&e) {
+                let (_, target_family) = quantified_target_column(column, op, outer_scopes)?;
+                if let Some([inner_meta]) = meta_sink.as_deref() {
+                    check_scalar_family_compatible(column, inner_meta, target_family)?;
+                }
+            }
+            return Err(e);
+        }
+    };
+    if result.columns.len() != 1 {
+        return Err(SqlSurfaceError::unsupported(
+            "subquery used with ANY/ALL must select exactly one column",
+        ));
+    }
+    // 内側の行数に依存せず、対象列・値族を必ず検証する。
+    let (target_ty, target_family) = quantified_target_column(column, op, outer_scopes)?;
+    let inner_meta = result
+        .columns
+        .first()
+        .ok_or_else(|| SqlSurfaceError::Internal {
+            detail: "subquery result missing projected column metadata".to_string(),
+        })?;
+    check_scalar_family_compatible(column, inner_meta, target_family)?;
+
+    let inner_empty = result.rows.is_empty();
+    let mut has_null = false;
+    let mut extremes: Option<(&Cell, &Cell)> = None;
+    for row in &result.rows {
+        let cell = row.cells.first().ok_or_else(|| SqlSurfaceError::Internal {
+            detail: "subquery row missing projected cell".to_string(),
+        })?;
+        if matches!(cell, Cell::Null) {
+            has_null = true;
+            continue;
+        }
+        // 非有限の浮動小数は比較が定義できないため `IN` と同じく `22000`。
+        if let Cell::Float(f) = cell {
+            if !f.is_finite() {
+                return Err(SqlSurfaceError::invalid_input(
+                    "subquery returned a non-finite number",
+                ));
+            }
+        }
+        extremes = Some(match extremes {
+            None => (cell, cell),
+            Some((min, max)) => (
+                if cmp_quantified_cells(cell, min)? == Ordering::Less {
+                    cell
+                } else {
+                    min
+                },
+                if cmp_quantified_cells(cell, max)? == Ordering::Greater {
+                    cell
+                } else {
+                    max
+                },
+            ),
+        });
+    }
+    let falsum = || vec![WherePredicate::Or(Vec::new())];
+    let literal = |op: ScalarSubqueryOp, cell: &Cell| {
+        scalar_literal_predicate(column, op, cell, target_ty, target_family)
+    };
+    match quantifier {
+        Quantifier::Any => {
+            let Some((min, max)) = extremes else {
+                return Ok(falsum());
+            };
+            match op {
+                ScalarSubqueryOp::Gt | ScalarSubqueryOp::Ge => Ok(vec![literal(op, min)?]),
+                ScalarSubqueryOp::Lt | ScalarSubqueryOp::Le => Ok(vec![literal(op, max)?]),
+                ScalarSubqueryOp::Ne => {
+                    if cmp_quantified_cells(min, max)? == Ordering::Equal {
+                        Ok(vec![literal(ScalarSubqueryOp::Ne, min)?])
+                    } else {
+                        Ok(vec![WherePredicate::Or(vec![
+                            vec![literal(ScalarSubqueryOp::Ne, min)?],
+                            vec![literal(ScalarSubqueryOp::Ne, max)?],
+                        ])])
+                    }
+                }
+                // `= ANY` は冒頭で `IN` へ委譲済み。
+                ScalarSubqueryOp::Eq => Err(SqlSurfaceError::Internal {
+                    detail: "= ANY must be delegated to IN".to_string(),
+                }),
+            }
+        }
+        Quantifier::All => {
+            // 内側 0 行は常に真（外側値が NULL でも真）。
+            if inner_empty {
+                return Ok(Vec::new());
+            }
+            // NULL を含む、または非 NULL 値が無ければ真にならない。
+            let Some((min, max)) = extremes.filter(|_| !has_null) else {
+                return Ok(falsum());
+            };
+            match op {
+                ScalarSubqueryOp::Gt | ScalarSubqueryOp::Ge => Ok(vec![literal(op, max)?]),
+                ScalarSubqueryOp::Lt | ScalarSubqueryOp::Le => Ok(vec![literal(op, min)?]),
+                ScalarSubqueryOp::Eq => {
+                    if cmp_quantified_cells(min, max)? == Ordering::Equal {
+                        Ok(vec![literal(ScalarSubqueryOp::Eq, min)?])
+                    } else {
+                        // 異なる境界値でも、外側列の比較型（整数列×浮動小数、DOUBLE 列×BIGINT の
+                        // f64 変換等）では両方と等しくなりうる。個別比較の連言と一致させるため、
+                        // 恒偽にせず `col = min AND col = max` を返す（変換は単調なので中間値も同値）。
+                        Ok(vec![
+                            literal(ScalarSubqueryOp::Eq, min)?,
+                            literal(ScalarSubqueryOp::Eq, max)?,
+                        ])
+                    }
+                }
+                // `<> ALL` は冒頭で `NOT IN` へ委譲済み。
+                ScalarSubqueryOp::Ne => Err(SqlSurfaceError::Internal {
+                    detail: "<> ALL must be delegated to NOT IN".to_string(),
+                }),
+            }
+        }
+    }
+}
+
 /// スカラーサブクエリの 1 セルを、同じ列型で `col <op> <リテラル>` と書いたときに
 /// パーサーが生成する AST と同一の述語へ変換する（第 2 の評価器を作らない）。
 /// パーサーでは生じない分岐（`<>`・ENUM の語彙外値）は明示的に扱う。
@@ -2671,5 +3057,41 @@ mod tests {
                 assert_eq!(vec![resolved], parsed.where_predicates.clone(), "sql={sql}");
             }
         }
+    }
+    /// Issue #1855・SQL-61 (3): 量化比較の境界値選びに使う比較器は、同じ値族の順序を正しく
+    /// 与え、型の食い違うセルは `Equal` に落とさず `Err` にする（fail-closed）。
+    #[test]
+    fn cmp_quantified_cells_orders_and_rejects_mismatches() {
+        use std::cmp::Ordering::{Equal, Greater, Less};
+        let dec =
+            |u: i128, sc: u8| Cell::Numeric(crate::numeric::Decimal::from_parts(u, sc).unwrap());
+        let t = |s: &str| Cell::Text(s.to_string());
+        assert_eq!(cmp_quantified_cells(&t("a"), &t("b")).unwrap(), Less);
+        assert_eq!(
+            cmp_quantified_cells(&Cell::Bool(true), &Cell::Bool(false)).unwrap(),
+            Greater
+        );
+        // scale 違いの numeric は値で比べる（`1.5` と `1.50` は等価）。
+        assert_eq!(
+            cmp_quantified_cells(&dec(15, 1), &dec(150, 2)).unwrap(),
+            Equal
+        );
+        // 整数と numeric は厳密に比べる。
+        assert_eq!(
+            cmp_quantified_cells(&Cell::SignedInteger(2), &dec(25, 1)).unwrap(),
+            Less
+        );
+        assert_eq!(
+            cmp_quantified_cells(&Cell::Integer(u64::MAX), &Cell::SignedInteger(-1)).unwrap(),
+            Greater
+        );
+        // `-0.0` と `+0.0` は等価。
+        assert_eq!(
+            cmp_quantified_cells(&Cell::Float(-0.0), &Cell::Float(0.0)).unwrap(),
+            Equal
+        );
+        // 型の食い違い・非有限は `Err`。
+        assert!(cmp_quantified_cells(&t("a"), &Cell::SignedInteger(1)).is_err());
+        assert!(cmp_quantified_cells(&Cell::Float(f64::NAN), &Cell::Float(1.0)).is_err());
     }
 }

@@ -159,6 +159,21 @@ fn negate_one(
             inner_tokens,
             depth,
         }]),
+        // 量化比較のサブクエリ形（Issue #1855・SQL-61 (3)）も同じ規則で、演算子と量化子の
+        // 両方を反転する（De Morgan は三値論理でも厳密）。
+        WherePredicate::QuantifiedSubqueryCompare {
+            column,
+            op,
+            quantifier,
+            inner_tokens,
+            depth,
+        } => Ok(vec![WherePredicate::QuantifiedSubqueryCompare {
+            column,
+            op: op.negated(),
+            quantifier: quantifier.flipped(),
+            inner_tokens,
+            depth,
+        }]),
         // 量化比較の否定は量化子の反転と演算子の否定（`NOT (x = ANY a)` = `x <> ALL a`）。量化子の
         // De Morgan は Kleene の三値論理でも厳密に成り立つ（空配列・NULL 要素・左辺 NULL を含む。
         // TABLE-35・Issue #1603）。
@@ -467,6 +482,41 @@ mod tests {
         ] {
             assert_eq!(negate_conjunction(vec![p(a)], &mut b).unwrap(), vec![p(n)]);
             assert_eq!(negate_conjunction(vec![p(n)], &mut b).unwrap(), vec![p(a)]);
+        }
+    }
+
+    /// Issue #1855・SQL-61 (3): サブクエリ形の量化比較の否定は演算子と量化子の両方を反転し、
+    /// 二重否定で元に戻る。
+    #[test]
+    fn quantified_subquery_negation_flips_operator_and_quantifier() {
+        use crate::sql::allowlist::ScalarSubqueryOp as O;
+        use crate::sql::udf_call::Quantifier as Q;
+        let mut b = 100;
+        let p = |op, quantifier| WherePredicate::QuantifiedSubqueryCompare {
+            column: "c".into(),
+            op,
+            quantifier,
+            inner_tokens: vec![],
+            depth: 1,
+        };
+        for (op, nop) in [
+            (O::Eq, O::Ne),
+            (O::Lt, O::Ge),
+            (O::Le, O::Gt),
+            (O::Gt, O::Le),
+            (O::Ge, O::Lt),
+            (O::Ne, O::Eq),
+        ] {
+            for (q, nq) in [(Q::Any, Q::All), (Q::All, Q::Any)] {
+                assert_eq!(
+                    negate_conjunction(vec![p(op, q)], &mut b).unwrap(),
+                    vec![p(nop, nq)]
+                );
+                assert_eq!(
+                    negate_conjunction(vec![p(nop, nq)], &mut b).unwrap(),
+                    vec![p(op, q)]
+                );
+            }
         }
     }
 
