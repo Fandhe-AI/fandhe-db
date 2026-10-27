@@ -356,8 +356,42 @@ fn quantified_eq_all_follows_outer_comparison_type() {
             &format!("SELECT id FROM {ITEMS} WHERE {w} LIMIT 100"),
         )
     };
-    assert_eq!(q(&conj), vec![1]);
+    assert_eq!(q(conj), vec![1]);
     assert_eq!(q(&w), vec![1]);
+}
+
+/// `= ALL` の境界値が 2^53 超でも厳密性ガード（22003）に落ちず、個別比較の連言と一致する
+/// （Issue #1855 レビュー指摘。DOUBLE 外側列 × BIGINT 内側の負値・単一値・混在集合）。
+#[test]
+fn quantified_eq_all_beyond_2_pow_53_matches_conjunction() {
+    let (core, path) = new_core();
+    let _guard = CleanupGuard(path);
+    let ctx = ctx_for("tenant-a");
+    ins(&core, &ctx, ITEMS, 1, &[("ratio", "9007199254740992.0")]);
+    ins(&core, &ctx, ITEMS, 2, &[("ratio", "-9007199254740992.0")]);
+    ins(&core, &ctx, ITEMS, 3, &[("ratio", "1.0")]);
+    ins(&core, &ctx, REFS, 1, &[("qty", "-9007199254740992")]);
+    ins(&core, &ctx, REFS, 2, &[("qty", "-9007199254740993")]);
+    let q = |w: &str| {
+        ids(
+            &core,
+            &ctx,
+            &format!("SELECT id FROM {ITEMS} WHERE {w} LIMIT 100"),
+        )
+    };
+    let conj = "ratio = -9007199254740992 AND ratio = -9007199254740993";
+    assert_eq!(q(conj), vec![2]);
+    assert_eq!(
+        q(&format!("ratio = ALL (SELECT qty FROM {REFS} LIMIT 10)")),
+        vec![2]
+    );
+    // 単一値（min == max）でも 2^53 超でエラーにならない。
+    assert_eq!(
+        q(&format!(
+            "ratio = ALL (SELECT qty FROM {REFS} WHERE id = 2 LIMIT 10)"
+        )),
+        q("ratio = -9007199254740993")
+    );
 }
 
 /// SQL-61 (4)(5): 未対応の形・静的エラー・上限は fail-closed の既存コードで拒否する。

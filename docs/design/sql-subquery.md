@@ -299,7 +299,7 @@ RLS は既存の実行器がそのまま適用するため、新しい可視性�
   | `<> ANY` | 常に偽 | NULL を無視 | `min == max` なら `col <> v`、異なれば `col <> min OR col <> max` |
   | `> >= ALL` | 0 行は常に真・NULL のみは常に偽 | 常に偽 | `col op max` |
   | `< <= ALL` | 同上 | 常に偽 | `col op min` |
-  | `= ALL` | 同上 | 常に偽 | `min == max` なら `col = v`、異なれば常に偽 |
+  | `= ALL` | 同上 | 常に偽 | `min == max` なら `col = v`、異なれば `col = min AND col = max`（外側列の比較型への変換で両方と等しくなりうる。例: DOUBLE の 9007199254740992 は BIGINT の 9007199254740992 と 9007199254740993 の両方と等しい） |
 
   外側値が NULL の行は生成した比較が UNKNOWN になり除外される（`ALL` は内側 0 行のとき外側 NULL でも真）。
   境界値の比較は `cmp_quantified_cells`（型が合わないセルは `Equal` へ落とさず `Err`）で行い、浮動小数を含む
