@@ -285,16 +285,28 @@ pub(crate) fn execute(
         schemas,
         validated,
         udfs,
-        &JoinLimits {
+        &JoinLimits::from_settings(group_limits, join_limits, result_limits),
+    )
+}
+
+impl JoinLimits {
+    /// 起動時設定（`EngineCore` 保持）から実行上限を組み立てる。[`execute`] と、再帰 CTE の
+    /// 反復評価器（`sql::recursive_eval`）が共有する唯一の写像。
+    pub(crate) fn from_settings(
+        group_limits: crate::group_by_limits::GroupByLimits,
+        join_limits: crate::join_limits::JoinSizeLimits,
+        result_limits: crate::result_limits::ResultLimits,
+    ) -> Self {
+        Self {
             max_groups: group_limits.max_groups(),
             max_group_by_columns: group_limits.max_group_by_columns(),
             max_input_rows: join_limits.max_input_rows(),
             max_output_rows: join_limits.max_output_rows(),
             max_relations: join_limits.max_relations(),
             max_result_rows: result_limits.max_result_rows(),
-            ..JoinLimits::default()
-        },
-    )
+            ..Self::default()
+        }
+    }
 }
 
 /// [`execute`] の本体。`limits` はテスト専用に上限を差し替えられるようにした
@@ -307,6 +319,145 @@ pub(crate) fn execute_with_limits(
     udfs: &UdfRegistry,
     limits: &JoinLimits,
 ) -> Result<QueryResult, SqlSurfaceError> {
+    let prepared = prepare_join(schemas, validated, udfs, limits)?;
+    let mut budget = JoinBudget::new(limits.budget_cap);
+
+    // §2.4: 各 relation の評価は既存の広域取得経路（`execute_scan_with_budget`）を
+    // 通す——RLS 暗黙適用・fail-closed のエラー写像を第 2 の実行器なしに継承する。
+    // 呼び出したセッションの `ctx`（`PolicyContext`）で全 relation を独立に評価する
+    // ため、他テナント行は中間結果・結合キー・カーディナリティ判定のいずれにも
+    // 現れない（RLS-10 相当）。
+    let mut sides: Vec<Vec<ResultRow>> = Vec::with_capacity(prepared.side_count());
+    for side in 0..prepared.side_count() {
+        sides.push(prepared.scan_side(read_txn, ctx, side, limits, &mut budget)?);
+    }
+    run_join_with_sides(&prepared, &sides, limits, budget)
+}
+
+/// 束縛済みで、まだ行を読んでいない JOIN（[`prepare_join`] の結果）。`execute_with_limits` は
+/// これに各 relation の行を供給して [`run_join_with_sides`] で実行する。再帰 CTE の反復評価器
+/// （`sql::recursive_eval`。SQL-35・Issue #1870）は、作業表側だけを毎反復で差し替えながら
+/// 基底表側の行を 1 度だけ読んで使い回すために、この 2 段階の入口を直接使う。
+pub(crate) struct PreparedJoin<'a> {
+    plan: JoinPlan<'a>,
+    bound: Vec<crate::sql::parser::BoundScan>,
+    limit: Option<usize>,
+    offset: usize,
+}
+
+impl PreparedJoin<'_> {
+    /// relation（側）の数。`FROM` 句の並び順と一致する。
+    pub(crate) fn side_count(&self) -> usize {
+        self.plan.scans.len()
+    }
+
+    /// 結果列メタデータ（Describe と Execute が共有する）。
+    pub(crate) fn column_metas(&self) -> Vec<ColumnMeta> {
+        self.plan.column_metas()
+    }
+
+    /// 結果が集計形か（再帰 CTE の再帰項としては受理しない判定に使う）。
+    pub(crate) fn is_aggregate(&self) -> bool {
+        matches!(self.plan.shape, Shape::Aggregate(_))
+    }
+
+    /// 並べ替え・明示 `LIMIT`／`OFFSET` を持つか（再帰 CTE の再帰項としては受理しない判定に使う）。
+    pub(crate) fn has_ordering_or_limit(&self) -> bool {
+        self.limit.is_some()
+            || self.offset != 0
+            || matches!(&self.plan.shape, Shape::Plain { order, .. } if !order.is_empty())
+    }
+
+    /// 側 `side` の束縛済み走査と、その走査が対象にするスキーマ。
+    pub(crate) fn side_scan(
+        &self,
+        side: usize,
+    ) -> Option<(&TableSchema, &crate::sql::parser::BoundScan)> {
+        Some((*self.plan.schemas.get(side)?, self.bound.get(side)?))
+    }
+
+    /// 側 `side` を既存の広域取得経路で走査して行を返す（RLS 暗黙適用は呼び出し元の `ctx`）。
+    /// 入力行数上限・累計バイト予算の計上を含む。
+    fn scan_side(
+        &self,
+        read_txn: &impl crate::storage::read_source::ReadSource,
+        ctx: &PolicyContext,
+        side: usize,
+        limits: &JoinLimits,
+        budget: &mut JoinBudget,
+    ) -> Result<Vec<ResultRow>, SqlSurfaceError> {
+        let (schema, bound_scan) =
+            self.side_scan(side)
+                .ok_or_else(|| SqlSurfaceError::Internal {
+                    detail: "JOIN side index out of range".to_string(),
+                })?;
+        let result = crate::sql::scan::execute_scan_with_budget(
+            read_txn,
+            ctx,
+            schema,
+            bound_scan,
+            budget.remaining(),
+        )?;
+        if result.rows.len() > limits.max_input_rows {
+            return Err(SqlSurfaceError::payload_too_large(
+                "JOIN input exceeds the visible row limit",
+            ));
+        }
+        budget.charge(result_bytes(result.columns.len(), &result.rows))?;
+        Ok(result.rows)
+    }
+}
+
+impl PreparedJoin<'_> {
+    /// 側 `side` を、他の側と予算を共有せずに 1 度だけ走査する（再帰 CTE の基底表側。入力行数上限と
+    /// 側ごとのバイト予算は従来どおり課す）。
+    pub(crate) fn scan_side_once(
+        &self,
+        read_txn: &impl crate::storage::read_source::ReadSource,
+        ctx: &PolicyContext,
+        side: usize,
+        limits: &JoinLimits,
+    ) -> Result<Vec<ResultRow>, SqlSurfaceError> {
+        let mut budget = JoinBudget::new(limits.budget_cap);
+        self.scan_side(read_txn, ctx, side, limits, &mut budget)
+    }
+
+    /// 呼び出し元が供給した全側の行 `sides` に対して結合以降を実行する。文（反復 1 回）ごとに新しい
+    /// 累計バイト予算を作り、全側の行を計上してから実行する。
+    pub(crate) fn run_with_sides(
+        &self,
+        sides: &[Vec<ResultRow>],
+        limits: &JoinLimits,
+    ) -> Result<QueryResult, SqlSurfaceError> {
+        if sides.len() != self.side_count() {
+            return Err(SqlSurfaceError::Internal {
+                detail: "JOIN side count mismatch".to_string(),
+            });
+        }
+        let mut budget = JoinBudget::new(limits.budget_cap);
+        for (side, rows) in sides.iter().enumerate() {
+            // 呼び出し元が供給した側の行にも、走査経路（`scan_side`）と同じ入力行数上限を課す。
+            if rows.len() > limits.max_input_rows {
+                return Err(SqlSurfaceError::payload_too_large(
+                    "JOIN input exceeds the visible row limit",
+                ));
+            }
+            let columns = self.bound.get(side).map_or(0, |b| b.projection.len());
+            budget.charge(result_bytes(columns, rows))?;
+        }
+        run_join_with_sides(self, sides, limits, budget)
+    }
+}
+
+/// 束縛（列解決・型検証）と、データ非依存の上限検査までを行う。行は読まない。
+/// 判定順序は従来どおり、束縛エラー → `LIMIT`／`OFFSET` の範囲（`22000`）→ リレーション数・
+/// `GROUP BY` 列数の上限（`54000`）。
+pub(crate) fn prepare_join<'a>(
+    schemas: &'a HashMap<String, TableSchema>,
+    validated: &ValidatedJoin,
+    udfs: &UdfRegistry,
+    limits: &JoinLimits,
+) -> Result<PreparedJoin<'a>, SqlSurfaceError> {
     let plan = build_plan(schemas, validated, udfs)?;
     // §2.4/§2.5: 全 relation の束縛（列参照・WHERE 述語の型検証）を完了させてから
     // `LIMIT`／`OFFSET` の範囲検証（`22000`）を行う（束縛エラー優先。Describe と
@@ -331,31 +482,24 @@ pub(crate) fn execute_with_limits(
             )));
         }
     }
+    Ok(PreparedJoin {
+        plan,
+        bound,
+        limit,
+        offset,
+    })
+}
 
-    let mut budget = JoinBudget::new(limits.budget_cap);
-
-    // §2.4: 各 relation の評価は既存の広域取得経路（`execute_scan_with_budget`）を
-    // 通す——RLS 暗黙適用・fail-closed のエラー写像を第 2 の実行器なしに継承する。
-    // 呼び出したセッションの `ctx`（`PolicyContext`）で全 relation を独立に評価する
-    // ため、他テナント行は中間結果・結合キー・カーディナリティ判定のいずれにも
-    // 現れない（RLS-10 相当）。
-    let mut sides: Vec<Vec<ResultRow>> = Vec::with_capacity(plan.scans.len());
-    for (schema, bound_scan) in plan.schemas.iter().zip(bound.iter()) {
-        let result = crate::sql::scan::execute_scan_with_budget(
-            read_txn,
-            ctx,
-            schema,
-            bound_scan,
-            budget.remaining(),
-        )?;
-        if result.rows.len() > limits.max_input_rows {
-            return Err(SqlSurfaceError::payload_too_large(
-                "JOIN input exceeds the visible row limit",
-            ));
-        }
-        budget.charge(result_bytes(result.columns.len(), &result.rows))?;
-        sides.push(result.rows);
-    }
+/// 各側の行 `sides`（[`PreparedJoin::scan_side`] の結果、または呼び出し元が供給した行）に対して
+/// 結合以降を実行する。`budget` は側の行を計上済みのものを渡す。
+fn run_join_with_sides(
+    prepared: &PreparedJoin<'_>,
+    sides: &[Vec<ResultRow>],
+    limits: &JoinLimits,
+    mut budget: JoinBudget,
+) -> Result<QueryResult, SqlSurfaceError> {
+    let plan = &prepared.plan;
+    let (limit, offset) = (prepared.limit, prepared.offset);
 
     // Issue #1797・SQL-34: 非集計形・`LIMIT` 省略・残余述語なしのときに限り、最終段の一致ペアが
     // `offset + cap` を超えた時点で結合を中断できる（残余述語・集計で件数が減りうる形は
@@ -364,14 +508,14 @@ pub(crate) fn execute_with_limits(
         (Shape::Plain { .. }, None, true) => offset.checked_add(limits.max_result_rows),
         _ => None,
     };
-    let (tuples, order) = exec::run_joins(&sides, &plan.steps, &mut budget, limits, final_stop)?;
-    let order = residual::filter_tuples(order, &tuples, &plan.residual, &sides, &mut budget)?;
+    let (tuples, order) = exec::run_joins(sides, &plan.steps, &mut budget, limits, final_stop)?;
+    let order = residual::filter_tuples(order, &tuples, &plan.residual, sides, &mut budget)?;
 
     match &plan.shape {
         Shape::Aggregate(agg) => {
             let result = aggregate::run_aggregate(
                 agg,
-                &sides,
+                sides,
                 &tuples,
                 &order,
                 (limit, offset),
@@ -393,7 +537,7 @@ pub(crate) fn execute_with_limits(
             if limit.is_none() && order.len().saturating_sub(offset) > limits.max_result_rows {
                 return Err(crate::sql::scan::row_limit_exceeded());
             }
-            let order = residual::sort_by_keys(order, &tuples, keys, &sides, &mut budget)?;
+            let order = residual::sort_by_keys(order, &tuples, keys, sides, &mut budget)?;
             // Issue #1796・SQL-34: `LIMIT` 省略・`LIMIT ALL`（`None`）は OFFSET 以降の全件を対象にし、
             // 行を組み立てる前に件数が結果行数上限を超えるかを判定する（超過は `54000`）。
             let start = offset.min(order.len());
@@ -437,7 +581,7 @@ pub(crate) fn execute_with_limits(
                     // FULL JOIN USING の統合列は代替ソースから `COALESCE` 相当で値を採る
                     // （借用のまま選ぶため、複製前の見積もり計上の順序は変わらない）。
                     let cell = residual::cell_with_fallbacks(
-                        &sides,
+                        sides,
                         tuple,
                         out_col.rel,
                         out_col.pos,
@@ -459,7 +603,7 @@ pub(crate) fn execute_with_limits(
                 // クエリ出力では `row.id` を使っていないため観測上の影響は無い）。
                 let mut id = None;
                 for rel in 0..tuple.len() {
-                    if let Some(row) = residual::row_at(&sides, tuple, rel)? {
+                    if let Some(row) = residual::row_at(sides, tuple, rel)? {
                         id = Some(row.id);
                         break;
                     }

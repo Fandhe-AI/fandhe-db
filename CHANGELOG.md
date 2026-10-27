@@ -9,6 +9,13 @@
 
 ### Added
 
+- `WITH RECURSIVE` の反復評価器を追加する（Issue #1870・SQL-35。段階 B）。アンカー項の結果を最初の作業表とし、
+  「前回の反復で増えた行だけ」を作業表として再帰項（単一関係、または基底表との JOIN）を再実行し、作業表が空に
+  なったら終了する。出力順は生成順。階層走査と数列が評価できる。暫定の固定上限（反復 1,000 回・累積 100,000 行。
+  超過は部分結果を返さず `54000`）を置く（設定化は #1871）。挙動変更: 構造検証を通過した `UNION ALL` の再帰形は
+  従来 `0A000` だったが評価される。自己参照の無い `WITH RECURSIVE` は通常 CTE として実行される。`UNION`（重複除去）・
+  複数定義・セッション最上位以外の文は `0A000` のまま。詳細は [recursive-cte.md](docs/design/recursive-cte.md)。
+  BREAKING CHANGE: 公開 enum `Statement` に variant（`RecursiveCte`）を追加したため、網羅的な `match` は更新が要る。
 - `WITH RECURSIVE` の構文を受理し再帰構造を検証する（Issue #1869・SQL-35。段階 A）。アンカー項と再帰項を
   `UNION [ALL]` で結んだ形の自己参照の位置・回数を検証し、不正な再帰は `42P19`、未対応の形と構造検証を通過した
   文の実行（反復評価は #1870）は `0A000` で拒否する。従来 `42601` だった挙動変更。詳細は [recursive-cte.md](docs/design/recursive-cte.md)。

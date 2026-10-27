@@ -2835,6 +2835,29 @@ pub enum Statement {
     /// **本 variant の追加は破壊的変更（BREAKING CHANGE）**: 既存の網羅的 `match` はアームの
     /// 追加が必要（`ConstSelect` 追加時と同じ運用）。
     MaterializedView(ValidatedMaterializedViewRead),
+    /// `WITH RECURSIVE <name> [(列名, ...)] AS (<アンカー項> UNION ALL <再帰項>)` の CTE 全体の
+    /// 結果集合（SQL-35・Issue #1870）。`sql::recursive_eval` が作業表方式で反復評価する。
+    /// 単独の文としては生成されず、主クエリの外側（WHERE・ORDER BY・集計・LIMIT）を重ねた
+    /// [`Statement::BufferedView`]（`origin: MaterializedCte`）の本文としてのみ現れる。
+    ///
+    /// **本 variant の追加は破壊的変更（BREAKING CHANGE）**: 既存の網羅的 `match` はアームの
+    /// 追加が必要（`MaterializedView` 追加時と同じ運用）。
+    RecursiveCte(ValidatedRecursiveCte),
+}
+
+/// 検証済みの再帰 CTE（[`Statement::RecursiveCte`]。SQL-35・Issue #1870）。フィールドは
+/// `pub(crate)`（クレート外からの直読み・直書き不可）。テナント情報・`PolicyContext` は一切
+/// 保持しない（可視性は実行時の参照セッションの `PolicyContext` だけで決まる。RLS-10 (b)）。
+#[derive(Debug, Clone, PartialEq)]
+pub struct ValidatedRecursiveCte {
+    /// CTE 名（再帰項の自己参照名。同名の実表・ビューは再帰項では隠される）。
+    pub(crate) name: String,
+    /// 列名リスト（空なら改名なし）。
+    pub(crate) column_aliases: Vec<String>,
+    /// アンカー項（実カタログで検証済み。自己参照を含まない）。
+    pub(crate) anchor: Box<Statement>,
+    /// 再帰項（CTE 名だけを作業表として解決する検証で得た `Scan` か `Join`）。
+    pub(crate) recursive: Box<Statement>,
 }
 
 /// matview の葉の読み取り（[`Statement::MaterializedView`]）。定義の列は参照時に束縛した値で、
@@ -16774,6 +16797,11 @@ pub(crate) fn require_row_query_statement(
         | Statement::BufferedView(_)
         | Statement::ConstSelect(_)
         | Statement::MaterializedView(_) => Ok(()),
+        // SQL-35・Issue #1870: 再帰 CTE はセッション最上位の SELECT 入口（`CteEvaluation::
+        // AllowMaterialize`）でだけ組み立てるため、ここへは到達しない（防御的に拒否する）。
+        Statement::RecursiveCte(_) => Err(SqlSurfaceError::feature_not_supported(format!(
+            "{what} with WITH RECURSIVE is not supported"
+        ))),
         Statement::Explain(_)
         | Statement::SetSearchMode { .. }
         | Statement::SetTimeZone { .. }
@@ -21855,6 +21883,82 @@ pub(crate) fn validate_session_sql_tokens(
     )
 }
 
+/// `WITH` の主クエリ（`WITH` 句の後ろのトークン列）を解析し、主クエリの形と FROM のテーブル名を返す。
+/// 通常 CTE（Issue #928・#1191）と再帰 CTE（SQL-35・Issue #1870）の `WITH` 分岐が共有する唯一の実装。
+fn parse_with_main(
+    remaining: &[Token],
+    limits: crate::nesting_limits::NestingLimits,
+) -> Result<(MainShape, String), SqlSurfaceError> {
+    // Issue #1535: 主クエリも通常 SELECT と同じ修飾列正規化を通す（CTE 定義本体は対象外）。
+    let main_normalized = super::qualified_column::normalize_single_table_qualifiers(remaining)?;
+    let main_tokens: &[Token] = &main_normalized;
+
+    if !matches!(main_tokens.first(), Some(Token::Keyword(Keyword::Select))) {
+        return Err(SqlSurfaceError::unsupported(
+            "WITH must be followed by a SELECT statement",
+        ));
+    }
+    let main_contains_group_by = main_tokens.windows(2).any(|w| {
+        matches!(&w[0], Token::Ident(name) if name.eq_ignore_ascii_case("GROUP"))
+            && matches!(w[1], Token::Keyword(Keyword::By))
+    });
+    // SQL-30・TASK-214（Issue #930）: トップレベル SELECT の判定
+    // （`contains_window_over`）と同じ理由で、`WITH` の主クエリでも
+    // `COUNT(*) OVER (...)` のようなウィンドウ項目を集計 SELECT と
+    // 誤判定しない（`OVER` の有無を見ずに関数名 + `'('` だけで判定すると、
+    // 集計関数名を使うウィンドウ項目を主クエリとして受理できなくなる）。
+    let main_contains_window_over = main_tokens.windows(3).any(|w| {
+        matches!(w[0], Token::Punct(')'))
+            && matches!(&w[1], Token::Ident(name) if name.eq_ignore_ascii_case("OVER"))
+            && matches!(w[2], Token::Punct('('))
+    });
+    let main_is_aggregate_select = !main_contains_window_over
+        && ((matches!(main_tokens.get(1), Some(Token::Ident(name)) if is_aggregate_function_name(name))
+            && matches!(main_tokens.get(2), Some(Token::Punct('('))))
+            || main_contains_group_by);
+    // Issue #1191（SQL-29 (b)）: 集計主クエリ（`GROUP BY`／`HAVING`／
+    // `ORDER BY`／`SELECT DISTINCT` を含む）も受理する。主クエリは
+    // 常に `subquery_ctx: None` で解析し（Issue #927 のサブクエリとの併用は
+    // 対象外。`docs/design/cte.md` 対象外節）、CTE の解決後は
+    // [`build_aggregate_from_resolved`] で通常の集計 SELECT と同じ
+    // [`ValidatedAggregate`] へ畳み込む（第 2 の実行器を作らない）。
+    let main = if is_distinct_modifier(main_tokens, 1) {
+        MainShape::Aggregate(parse_distinct_shape(main_tokens)?)
+    } else if main_is_aggregate_select {
+        MainShape::Aggregate(parse_aggregate_shape(
+            main_tokens,
+            None,
+            false,
+            false,
+            limits,
+        )?)
+    } else {
+        match parse_select_shape(main_tokens, None, false, limits)? {
+            ParsedSelect::Scan(shape) => MainShape::Scan(shape),
+            ParsedSelect::Search(_) => {
+                return Err(SqlSurfaceError::unsupported(
+                    "WITH does not support a ranked main query (ORDER BY / USING PLAN)",
+                ));
+            }
+        }
+    };
+    // SQL-56 (3)・Issue #1793: `WITH TIES` は CTE を伴う文では未対応（fail-closed）。
+    let main_has_ties = match &main {
+        MainShape::Scan(shape) => shape.with_ties,
+        MainShape::Aggregate(shape) => shape.group_by.as_ref().is_some_and(|g| g.with_ties),
+    };
+    if main_has_ties {
+        return Err(SqlSurfaceError::feature_not_supported(
+            "WITH TIES is not supported in a statement with CTEs",
+        ));
+    }
+    let main_table_name = match &main {
+        MainShape::Scan(shape) => shape.table_name.clone(),
+        MainShape::Aggregate(shape) => shape.table_name.clone(),
+    };
+    Ok((main, main_table_name))
+}
+
 /// `WITH` の主クエリの形（Issue #1191 の集計主クエリを含む。Issue #1860 で具体化経路の
 /// 判定のためモジュール直下へ移した）。
 #[derive(Clone)]
@@ -22129,6 +22233,146 @@ enum CteEvaluation {
     AllowMaterialize,
 }
 
+/// トークン列に部分クエリ（`(SELECT`／`(WITH`／`(VALUES`）が含まれるか（再帰項の機能ゲート用）。
+fn contains_subquery_paren(tokens: &[Token]) -> bool {
+    tokens.windows(2).any(|w| {
+        matches!(w[0], Token::Punct('('))
+            && (matches!(w[1], Token::Keyword(Keyword::Select))
+                || matches!(&w[1], Token::Ident(n)
+                    if n.eq_ignore_ascii_case("WITH") || n.eq_ignore_ascii_case("VALUES")))
+    })
+}
+
+/// `WITH RECURSIVE` 文の検証（SQL-35・Issue #1870）。判定順序は段階 A（#1869）の
+/// 構文（`42601`）→ 再帰構造（`42P19`）→ 機能ゲート（`0A000`）を保ち、実行対象にする形の機能ゲートは
+/// すべて段階 A の検証の後に置く。
+///
+/// - 自己参照を持たない定義だけなら、`RECURSIVE` を除いた通常の `WITH` として再入する（意味は等しい）。
+/// - 実行対象は「定義 1 件・`UNION ALL`・セッション最上位の SELECT」だけ。アンカー項は実カタログで、
+///   再帰項は CTE 名だけを作業表として解決する [`RecursiveTermLookup`] で検証する（同名の実表は隠れる）。
+/// - 主クエリは通常 CTE と同じ [`parse_with_main`] で解析し、CTE 全体の結果集合
+///   （[`Statement::RecursiveCte`]）の上へ評価後射影形ビューと同じ外側として重ねる。
+fn recursive_cte_statement(
+    tokens: &[Token],
+    lookup: &impl TableLookup,
+    subquery_ctx: Option<usize>,
+    limits: crate::nesting_limits::NestingLimits,
+    cte_evaluation: CteEvaluation,
+) -> Result<Statement, SqlSurfaceError> {
+    use super::recursive_cte::{RecursiveCteBody, RecursiveTermLookup};
+
+    let clause = super::recursive_cte::validate_recursive_with(tokens, limits)?;
+    if clause
+        .defs
+        .iter()
+        .all(|d| matches!(d.body, RecursiveCteBody::NonRecursive { .. }))
+    {
+        // 自己参照が 1 つも無い `WITH RECURSIVE` は通常 CTE と同じ意味。`RECURSIVE` を取り除いた
+        // トークン列（文字列へ戻さない）を通常の `WITH` 分岐へ再入させる。
+        let mut plain: Vec<Token> = Vec::with_capacity(tokens.len());
+        plain.extend(tokens.first().cloned());
+        plain.extend(tokens.iter().skip(2).cloned());
+        return validate_sql_tokens_impl(&plain, lookup, subquery_ctx, limits, cte_evaluation);
+    }
+    let [def] = clause.defs.as_slice() else {
+        return Err(SqlSurfaceError::feature_not_supported(
+            "WITH RECURSIVE with several definitions is not supported yet",
+        ));
+    };
+    let RecursiveCteBody::Recursive {
+        anchor,
+        recursive,
+        union_all,
+    } = &def.body
+    else {
+        return Err(SqlSurfaceError::feature_not_supported(
+            "WITH RECURSIVE with several definitions is not supported yet",
+        ));
+    };
+    if !*union_all {
+        return Err(SqlSurfaceError::feature_not_supported(
+            "WITH RECURSIVE with UNION (duplicate elimination) is not supported yet",
+        ));
+    }
+    if cte_evaluation != CteEvaluation::AllowMaterialize {
+        return Err(SqlSurfaceError::feature_not_supported(
+            "WITH RECURSIVE is supported only in a top-level SELECT statement",
+        ));
+    }
+
+    // アンカー項: 実カタログで検証する。自己参照を含まない（段階 A で確認済み）。
+    let anchor_stmt = validate_sql_tokens_with_subquery_ctx_limits(anchor, lookup, 0, limits)?;
+    match &anchor_stmt {
+        Statement::Select(v) if v.using_plan().is_some() => {
+            return Err(SqlSurfaceError::feature_not_supported(
+                "USING PLAN in the anchor term of WITH RECURSIVE is not supported",
+            ));
+        }
+        Statement::Select(_)
+        | Statement::Scan(_)
+        | Statement::Aggregate(_)
+        | Statement::Join(_)
+        | Statement::SetOperation(_)
+        | Statement::ConstSelect(_)
+        | Statement::BufferedView(_) => {}
+        _ => {
+            return Err(SqlSurfaceError::feature_not_supported(
+                "unsupported form of the anchor term in WITH RECURSIVE",
+            ));
+        }
+    }
+
+    // 再帰項: CTE 名だけを作業表として解決する。部分クエリ・導出表は未対応。
+    if contains_subquery_paren(recursive) {
+        return Err(SqlSurfaceError::feature_not_supported(
+            "subqueries in the recursive term of WITH RECURSIVE are not supported yet",
+        ));
+    }
+    let shadow = RecursiveTermLookup::new(lookup, &def.name);
+    let recursive_stmt =
+        validate_sql_tokens_with_subquery_ctx_limits(recursive, &shadow, 0, limits)?;
+    if !matches!(&recursive_stmt, Statement::Scan(_) | Statement::Join(_)) {
+        return Err(SqlSurfaceError::feature_not_supported(
+            "unsupported form of the recursive term in WITH RECURSIVE",
+        ));
+    }
+
+    // 主クエリ: CTE 全体の結果集合だけを読む形に限る。
+    let (main, main_table_name) = parse_with_main(&clause.main_tokens, limits)?;
+    if !main_table_name.eq_ignore_ascii_case(&def.name) {
+        return Err(SqlSurfaceError::feature_not_supported(
+            "the main query of WITH RECURSIVE must read the recursive query",
+        ));
+    }
+    let body = Box::new(Statement::RecursiveCte(ValidatedRecursiveCte {
+        name: def.name.clone(),
+        column_aliases: def.column_aliases.clone(),
+        anchor: Box::new(anchor_stmt),
+        recursive: Box::new(recursive_stmt),
+    }));
+    let view_name = def.name.clone();
+    let stmt = match main {
+        MainShape::Scan(shape) => buffered_scan_statement(view_name, body, shape)?,
+        MainShape::Aggregate(shape) => aggregate_statement_from_resolved(
+            shape.table_name,
+            super::view::Resolved::Buffered { view_name, body },
+            shape.items,
+            shape.where_predicates,
+            shape.group_by,
+        )?,
+    };
+    match stmt {
+        Statement::BufferedView(mut v) => {
+            // 本文は呼び出し段の `--max-result-rows` で実行する（具体化 CTE と同じ。SQL-34・SQL-62）。
+            v.origin = BufferedOrigin::MaterializedCte;
+            Ok(Statement::BufferedView(v))
+        }
+        _ => Err(SqlSurfaceError::Internal {
+            detail: "recursive CTE outer query was not a buffered view".to_string(),
+        }),
+    }
+}
+
 /// [`validate_sql_tokens`]／[`validate_sql_tokens_with_subquery_ctx`] が共有する
 /// 本体。`subquery_ctx` が `None` の呼び出し（cursor・view・copy・params・
 /// aggregate 等の既存の内部呼び出しがすべてここへ委譲する）は本 Issue 追加前と
@@ -22200,87 +22444,24 @@ fn validate_sql_tokens_impl(
         // 先頭トークンで振り分けるため、本アームには到達しない
         // （out-of-scope。Issue #928 対象外事項）。
         _ if is_with_statement => {
-            // SQL-35・Issue #1869: `WITH RECURSIVE` は非再帰経路（`cte::resolve_relation`）へ
+            // SQL-35・Issue #1869・#1870: `WITH RECURSIVE` は非再帰経路（`cte::resolve_relation`）へ
             // 一切流さず、ここで早期に返す（流すと自己参照が同名の実テーブルへ黙って解決される。
-            // fail-closed）。構文・再帰構造の検証（`42601`／`42P19`）を通過した後は、反復評価が
-            // 未実装（#1870）のため一律 `0A000` で終える。
+            // fail-closed）。構文・再帰構造の検証（`42601`／`42P19`）の後に、反復評価の形へ組み立てる。
             if matches!(tokens.get(1), Some(Token::Ident(w)) if w.eq_ignore_ascii_case("RECURSIVE"))
             {
-                let _clause = super::recursive_cte::validate_recursive_with(tokens, limits)?;
-                return Err(SqlSurfaceError::feature_not_supported(
-                    "WITH RECURSIVE evaluation is not supported yet",
-                ));
+                return recursive_cte_statement(
+                    tokens,
+                    lookup,
+                    subquery_ctx,
+                    limits,
+                    cte_evaluation,
+                );
             }
             let mut p = Parser::new(tokens).with_nesting_limits(limits);
             let ctes = p.parse_with_clause()?;
-            // Issue #1535: 主クエリも通常 SELECT と同じ修飾列正規化を通す（CTE 定義本体は対象外）。
-            let main_normalized =
-                super::qualified_column::normalize_single_table_qualifiers(p.remaining())?;
-            let main_tokens: &[Token] = &main_normalized;
-
-            if !matches!(main_tokens.first(), Some(Token::Keyword(Keyword::Select))) {
-                return Err(SqlSurfaceError::unsupported(
-                    "WITH must be followed by a SELECT statement",
-                ));
-            }
-            let main_contains_group_by = main_tokens.windows(2).any(|w| {
-                matches!(&w[0], Token::Ident(name) if name.eq_ignore_ascii_case("GROUP"))
-                    && matches!(w[1], Token::Keyword(Keyword::By))
-            });
-            // SQL-30・TASK-214（Issue #930）: トップレベル SELECT の判定
-            // （`contains_window_over`）と同じ理由で、`WITH` の主クエリでも
-            // `COUNT(*) OVER (...)` のようなウィンドウ項目を集計 SELECT と
-            // 誤判定しない（`OVER` の有無を見ずに関数名 + `'('` だけで判定すると、
-            // 集計関数名を使うウィンドウ項目を主クエリとして受理できなくなる）。
-            let main_contains_window_over = main_tokens.windows(3).any(|w| {
-                matches!(w[0], Token::Punct(')'))
-                    && matches!(&w[1], Token::Ident(name) if name.eq_ignore_ascii_case("OVER"))
-                    && matches!(w[2], Token::Punct('('))
-            });
-            let main_is_aggregate_select = !main_contains_window_over
-                && ((matches!(main_tokens.get(1), Some(Token::Ident(name)) if is_aggregate_function_name(name))
-                    && matches!(main_tokens.get(2), Some(Token::Punct('('))))
-                    || main_contains_group_by);
-            // Issue #1191（SQL-29 (b)）: 集計主クエリ（`GROUP BY`／`HAVING`／
-            // `ORDER BY`／`SELECT DISTINCT` を含む）も受理する。主クエリは
-            // 常に `subquery_ctx: None` で解析し（Issue #927 のサブクエリとの併用は
-            // 対象外。`docs/design/cte.md` 対象外節）、CTE の解決後は
-            // [`build_aggregate_from_resolved`] で通常の集計 SELECT と同じ
-            // [`ValidatedAggregate`] へ畳み込む（第 2 の実行器を作らない）。
-            let main = if is_distinct_modifier(main_tokens, 1) {
-                MainShape::Aggregate(parse_distinct_shape(main_tokens)?)
-            } else if main_is_aggregate_select {
-                MainShape::Aggregate(parse_aggregate_shape(
-                    main_tokens,
-                    None,
-                    false,
-                    false,
-                    limits,
-                )?)
-            } else {
-                match parse_select_shape(main_tokens, None, false, limits)? {
-                    ParsedSelect::Scan(shape) => MainShape::Scan(shape),
-                    ParsedSelect::Search(_) => {
-                        return Err(SqlSurfaceError::unsupported(
-                            "WITH does not support a ranked main query (ORDER BY / USING PLAN)",
-                        ));
-                    }
-                }
-            };
-            // SQL-56 (3)・Issue #1793: `WITH TIES` は CTE を伴う文では未対応（fail-closed）。
-            let main_has_ties = match &main {
-                MainShape::Scan(shape) => shape.with_ties,
-                MainShape::Aggregate(shape) => shape.group_by.as_ref().is_some_and(|g| g.with_ties),
-            };
-            if main_has_ties {
-                return Err(SqlSurfaceError::feature_not_supported(
-                    "WITH TIES is not supported in a statement with CTEs",
-                ));
-            }
-            let main_table_name = match &main {
-                MainShape::Scan(shape) => shape.table_name.clone(),
-                MainShape::Aggregate(shape) => shape.table_name.clone(),
-            };
+            // 主クエリの形（Issue #1535 の修飾列正規化・Issue #1191 の集計主クエリ・SQL-56 の
+            // `WITH TIES` 拒否を含む）。再帰 CTE の主クエリ（Issue #1870）と共有する。
+            let (main, main_table_name) = parse_with_main(p.remaining(), limits)?;
 
             // 参照されない CTE も含め、すべての定義本文を検証する（決定性・
             // fail-closed のため。構造検証・存在確認を省略しない）。
@@ -22564,7 +22745,9 @@ fn validate_sql_tokens_impl(
                 // 完結させる設計）。網羅性のためのみここに列挙する防御的経路。
                 | Statement::Join(_)
                 // TABLE-42・Issue #1664: matview の葉は `BufferedView` の本文としてのみ現れる。
-                | Statement::MaterializedView(_) => {
+                | Statement::MaterializedView(_)
+                // SQL-35・Issue #1870: 再帰 CTE は `WITH` 分岐だけが組み立てる。
+                | Statement::RecursiveCte(_) => {
                     return Err(SqlSurfaceError::Internal {
                         detail: "validate_select_statement returned a non-SELECT statement"
                             .to_string(),
@@ -22894,6 +23077,10 @@ pub fn validate_statement(
         // TABLE-42・Issue #1664: matview の葉は単独の文としては現れない（防御的経路）。
         Statement::MaterializedView(_) => Err(SqlSurfaceError::unsupported(
             "materialized view read is not a search query statement (use a session-aware entry point)",
+        )),
+        // SQL-35・Issue #1870: 再帰 CTE は単独の文としては現れない（防御的経路）。
+        Statement::RecursiveCte(_) => Err(SqlSurfaceError::unsupported(
+            "recursive CTE is not a search query statement (use a session-aware entry point)",
         )),
     }
 }
@@ -35721,14 +35908,23 @@ mod tests {
     }
 
     #[test]
-    fn rejects_with_recursive() {
+    fn with_recursive_is_gated_unless_self_reference_free() {
         let lookup = catalog_with(&["documents"]);
-        let err = validate_sql(
+        // SQL-35・Issue #1870: 自己参照が 1 つも無い `WITH RECURSIVE` は通常 CTE と同じ受理。
+        let plain = validate_sql(
             "WITH RECURSIVE x AS (SELECT id FROM documents) SELECT * FROM x LIMIT 10",
             &lookup,
         )
-        .expect_err("WITH RECURSIVE must be rejected");
-        // SQL-35・Issue #1869: 構造検証は通るが評価は未実装のため `0A000`（`42601` ではない）。
+        .expect("self-reference-free WITH RECURSIVE is a plain CTE");
+        assert!(matches!(plain, Statement::Scan(_)));
+        // 再帰を含む文は、セッション最上位の SELECT 入口以外（この `validate_sql` を含む）では
+        // 評価できない形として `0A000`（`42601` ではない）。
+        let err = validate_sql(
+            "WITH RECURSIVE x(n) AS (SELECT 1 UNION ALL SELECT n + 1 FROM x WHERE n < 3) \
+             SELECT n FROM x LIMIT 10",
+            &lookup,
+        )
+        .expect_err("recursive form outside the session entry must be rejected");
         assert_eq!(err.wire_code(), "0A000");
     }
 

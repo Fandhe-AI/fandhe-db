@@ -188,7 +188,7 @@ fn columns_compatible(a: &ColumnMeta, b: &ColumnMeta) -> bool {
 /// 型整合済みの 2 枝の結果列メタを合成する。名前・由来（`Scalar`／`Computed`）は左に
 /// 揃え、整数型どうしは広い方の型へ拡大する（RowDescription の型と実行結果の型を
 /// そろえる。セルは `Cell::SignedInteger` で型をまたいで共通。Issue #1560）。
-fn merge_columns(left: &[ColumnMeta], right: &[ColumnMeta]) -> Vec<ColumnMeta> {
+pub(crate) fn merge_columns(left: &[ColumnMeta], right: &[ColumnMeta]) -> Vec<ColumnMeta> {
     fn int_ty(m: &ColumnMeta) -> Option<&ColumnType> {
         match m {
             ColumnMeta::Scalar { ty, .. } | ColumnMeta::Computed { ty: Some(ty), .. } => {
@@ -251,7 +251,7 @@ fn merge_columns(left: &[ColumnMeta], right: &[ColumnMeta]) -> Vec<ColumnMeta> {
 /// 単一化する（PR #1105 レビュー指摘対応: 従来はこの判定ロジックを `eval_tree`
 /// と `describe_tree` の 2 箇所に重複実装しており、判定基準が乖離しうる構造
 /// だった）。
-fn check_branch_type_compatibility(
+pub(crate) fn check_branch_type_compatibility(
     op: SetOperator,
     l_columns: &[ColumnMeta],
     r_columns: &[ColumnMeta],
@@ -304,7 +304,7 @@ fn columns_have_interval(columns: &[ColumnMeta]) -> bool {
     })
 }
 
-fn columns_have_vector(columns: &[ColumnMeta]) -> bool {
+pub(crate) fn columns_have_vector(columns: &[ColumnMeta]) -> bool {
     columns.iter().any(|c| {
         matches!(
             c,

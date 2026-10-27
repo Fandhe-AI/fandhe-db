@@ -896,81 +896,89 @@ fn build_projected_cells(
                 } else {
                     &[]
                 };
-                match program.eval(id, embedding_for_eval, scanned, proj_expr_scratch)? {
-                    ExprValue::Scalar(v) => {
-                        cells.push(crate::sql::exec::scalar_cell_for(v, result_ty.as_ref())?)
-                    }
-                    ExprValue::Vector(v) => {
-                        // codex-review P1 指摘対応: `Computed` 列のベクトル
-                        // 結果も `VECTOR` 列直接投影と同じ累計予算
-                        // （`MAX_SCAN_RESULT_BYTES`）へ計上する。所有化
-                        // （`into_owned_vector`）自体は `try_reserve_exact`
-                        // 経由で単発の確保失敗には強いが、累計を見ないと
-                        // 行数分の蓄積で予算を回避できてしまうため。
-                        let owned = udf_call::into_owned_vector(v)?;
-                        cells.push(Cell::Vector(try_accumulate_vector_budget(
-                            owned,
-                            byte_budget,
-                            max_result_bytes,
-                        )?));
-                    }
-                    ExprValue::Bool(b) => cells.push(Cell::Bool(b)),
-                    // Issue #919・SQL-26（AC2）: 投影の式結果は `Cell::Text`/
-                    // `Cell::Null` へそのまま写像する（wire 層は既存の
-                    // `Computed` → text OID 25 の経路をそのまま使うため
-                    // wire 側の変更は不要）。
-                    ExprValue::Text(t) => {
-                        cells.push(Cell::Text(try_alloc_text_for_budget(
-                            &t,
-                            byte_budget,
-                            max_result_bytes,
-                        )?));
-                    }
-                    // 対象ビヘイビア: SQL-26（Issue #920）。`DATE`／`TIMESTAMP`
-                    // を返す式（`date_trunc` 等）を `Cell::Date`／
-                    // `Cell::Timestamp` へ写像する。
-                    ExprValue::Date(d) => cells.push(Cell::Date(d)),
-                    ExprValue::Timestamp(t) => cells.push(Cell::Timestamp(t)),
-                    ExprValue::Time(t) => cells.push(Cell::Time(t)),
-                    ExprValue::TimestampTz(t) => cells.push(Cell::TimestampTz(t)),
-                    ExprValue::Interval(v) => cells.push(Cell::Interval(v)),
-                    // Issue #919・SQL-26（AC2）と Issue #921・SQL-26 の共有
-                    // 契約: NULL は `Cell::Null` へ写像する。
-                    ExprValue::Null => cells.push(Cell::Null),
-                    // jsonb パス演算子 `->`／`#>` の結果（Issue #1596・TABLE-25）。
-                    // TEXT 結果と同じ累計バイト予算に計上する（行数分の蓄積で予算を
-                    // 回避させない）。
-                    // `json`（原文保存）式の結果（Issue #2180）も同じ累計バイト予算に計上する。
-                    ExprValue::Json(j) | ExprValue::JsonText(j) => {
-                        cells.push(Cell::Json(try_alloc_text_for_budget(
-                            &j,
-                            byte_budget,
-                            max_result_bytes,
-                        )?));
-                    }
-                    // `CAST(.. AS numeric)` の結果（Issue #1591）。固定長の値で確保は伴わない。
-                    ExprValue::Numeric(d) => cells.push(Cell::Numeric(d)),
-                    ExprValue::Uuid(u) => cells.push(Cell::Uuid(u)),
-                    // `CAST` の結果の BYTEA・配列（Issue #1592）は、列直接投影と同じ累計バイト予算に
-                    // 計上する（行数分の蓄積で予算を回避させない）。
-                    ExprValue::Bytes(b) => {
-                        *byte_budget =
-                            try_accumulate_budget(*byte_budget, b.len(), max_result_bytes)?;
-                        cells.push(Cell::Bytes(b.into_owned()));
-                    }
-                    ExprValue::Array(a) => {
-                        *byte_budget = try_accumulate_budget(
-                            *byte_budget,
-                            a.approx_heap_bytes(),
-                            max_result_bytes,
-                        )?;
-                        cells.push(Cell::Array(a));
-                    }
-                }
+                let value = program.eval(id, embedding_for_eval, scanned, proj_expr_scratch)?;
+                cells.push(computed_value_to_cell(
+                    value,
+                    result_ty.as_ref(),
+                    byte_budget,
+                    max_result_bytes,
+                )?);
             }
         }
     }
     Ok(cells)
+}
+
+/// 式 `Computed` 列の評価値を結果セルへ変換する（`build_projected_cells` の式項目と、
+/// 再帰 CTE の反復評価器 `sql::recursive_eval` が共有する唯一の写像。第 2 の写像を作らない）。
+/// ベクトル・テキスト・バイト列・配列は呼び出し元の累計バイト予算 `byte_budget` へ計上する。
+pub(crate) fn computed_value_to_cell(
+    value: ExprValue<'_>,
+    result_ty: Option<&ColumnType>,
+    byte_budget: &mut usize,
+    max_result_bytes: usize,
+) -> Result<Cell, SqlSurfaceError> {
+    Ok(match value {
+        ExprValue::Scalar(v) => crate::sql::exec::scalar_cell_for(v, result_ty)?,
+        ExprValue::Vector(v) => {
+            // codex-review P1 指摘対応: `Computed` 列のベクトル
+            // 結果も `VECTOR` 列直接投影と同じ累計予算
+            // （`MAX_SCAN_RESULT_BYTES`）へ計上する。所有化
+            // （`into_owned_vector`）自体は `try_reserve_exact`
+            // 経由で単発の確保失敗には強いが、累計を見ないと
+            // 行数分の蓄積で予算を回避できてしまうため。
+            let owned = udf_call::into_owned_vector(v)?;
+            Cell::Vector(try_accumulate_vector_budget(
+                owned,
+                byte_budget,
+                max_result_bytes,
+            )?)
+        }
+        ExprValue::Bool(b) => Cell::Bool(b),
+        // Issue #919・SQL-26（AC2）: 投影の式結果は `Cell::Text`/
+        // `Cell::Null` へそのまま写像する（wire 層は既存の
+        // `Computed` → text OID 25 の経路をそのまま使うため
+        // wire 側の変更は不要）。
+        ExprValue::Text(t) => Cell::Text(try_alloc_text_for_budget(
+            &t,
+            byte_budget,
+            max_result_bytes,
+        )?),
+        // 対象ビヘイビア: SQL-26（Issue #920）。`DATE`／`TIMESTAMP`
+        // を返す式（`date_trunc` 等）を `Cell::Date`／
+        // `Cell::Timestamp` へ写像する。
+        ExprValue::Date(d) => Cell::Date(d),
+        ExprValue::Timestamp(t) => Cell::Timestamp(t),
+        ExprValue::Time(t) => Cell::Time(t),
+        ExprValue::TimestampTz(t) => Cell::TimestampTz(t),
+        ExprValue::Interval(v) => Cell::Interval(v),
+        // Issue #919・SQL-26（AC2）と Issue #921・SQL-26 の共有
+        // 契約: NULL は `Cell::Null` へ写像する。
+        ExprValue::Null => Cell::Null,
+        // jsonb パス演算子 `->`／`#>` の結果（Issue #1596・TABLE-25）。
+        // TEXT 結果と同じ累計バイト予算に計上する（行数分の蓄積で予算を
+        // 回避させない）。
+        // `json`（原文保存）式の結果（Issue #2180）も同じ累計バイト予算に計上する。
+        ExprValue::Json(j) | ExprValue::JsonText(j) => Cell::Json(try_alloc_text_for_budget(
+            &j,
+            byte_budget,
+            max_result_bytes,
+        )?),
+        // `CAST(.. AS numeric)` の結果（Issue #1591）。固定長の値で確保は伴わない。
+        ExprValue::Numeric(d) => Cell::Numeric(d),
+        ExprValue::Uuid(u) => Cell::Uuid(u),
+        // `CAST` の結果の BYTEA・配列（Issue #1592）は、列直接投影と同じ累計バイト予算に
+        // 計上する（行数分の蓄積で予算を回避させない）。
+        ExprValue::Bytes(b) => {
+            *byte_budget = try_accumulate_budget(*byte_budget, b.len(), max_result_bytes)?;
+            Cell::Bytes(b.into_owned())
+        }
+        ExprValue::Array(a) => {
+            *byte_budget =
+                try_accumulate_budget(*byte_budget, a.approx_heap_bytes(), max_result_bytes)?;
+            Cell::Array(a)
+        }
+    })
 }
 
 /// 経路 (B)（上位 N 件 2 パス）の 1 パス目が `BinaryHeap` へ保持する候補

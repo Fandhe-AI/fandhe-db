@@ -13,7 +13,7 @@
 //!
 //! 検証する契約（本計画の受入基準 1〜4）:
 //! 1. 非再帰 CTE を受理する
-//! 2. `WITH RECURSIVE` は非再帰経路へ流さない（段階 A では評価未対応の `0A000`。SQL-35 のポインタ）
+//! 2. `WITH RECURSIVE` は非再帰経路へ流さない（自己参照が無い場合だけ通常 CTE と同じ結果。SQL-35 のポインタ）
 //! 3. CTE の定義数・連鎖の深さに上限を設け、超過は `54000`
 //! 4. CTE 経由でも RLS が暗黙に適用される
 
@@ -230,15 +230,30 @@ fn accepts_unreferenced_cte() {
     assert!(result_ids(&result).contains(&1));
 }
 
-// --- 受入基準 2: `WITH RECURSIVE` を拒否する -----------------------------------
+// --- 受入基準 2: `WITH RECURSIVE` は非再帰経路へ流さない --------------------
 
 #[test]
-fn rejects_with_recursive() {
+fn with_recursive_without_self_reference_runs_as_plain_cte() {
     let (core, _guard) = open_seeded();
-    let err = query_err(
+    // 自己参照が 1 つも無い `WITH RECURSIVE` は通常 CTE と同じ意味（SQL-35・Issue #1870）。
+    let recursive = query(
         &core,
         "alice",
         "WITH RECURSIVE r AS (SELECT id FROM docs) SELECT id FROM r LIMIT 10",
+    )
+    .expect("self-reference-free WITH RECURSIVE is a plain CTE");
+    let plain = query(
+        &core,
+        "alice",
+        "WITH r AS (SELECT id FROM docs) SELECT id FROM r LIMIT 10",
+    )
+    .expect("plain CTE");
+    assert_eq!(recursive, plain);
+    // 評価対象外の再帰形（`UNION`）は `0A000` のまま。
+    let err = query_err(
+        &core,
+        "alice",
+        "WITH RECURSIVE r(n) AS (SELECT 1 UNION SELECT n + 1 FROM r WHERE n < 3) SELECT n FROM r",
     );
     assert_eq!(err.wire_code(), "0A000");
 }
