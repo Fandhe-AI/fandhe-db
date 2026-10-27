@@ -32,7 +32,7 @@
 | 内側がランキング付き検索 SELECT・集合演算・JOIN | **非対応**（`42601`）。集計形（単一集計項目。`GROUP BY` の有無を問わず `LIMIT` 不要）はスカラー比較の内側に限り対応（Issue #1191）。`IN`／`EXISTS` の内側の集計形は非対応 |
 | 内側の `LIMIT` 省略・`LIMIT ALL` | 対応（Issue #1853・SQL-29・SQL-34）。上限は結果行数上限 `--max-result-rows` だけを参照し、`IN`／`NOT IN` は上限超過で `54000`（黙って切り詰めない）。`EXISTS` は 1 件、スカラー用途は 2 件（`21000` 判定用）へ差し替えて有界にする。明示 `LIMIT` の範囲検証も設定値に追随する |
 | 内側の `OFFSET` | 未検証（構文上は Scan 形状を再利用するため通るが、意味論は未確認。将来の Issue 課題） |
-| 相関サブクエリ | 相関 `EXISTS` は実行（Issue #1842・SQL-61。等価の相関はハッシュ半結合、それ以外は外側の行ごとの再評価）。相関 `NOT EXISTS` も同じプローブの反結合で実行（Issue #1843）。`IN`／`NOT IN`／スカラー／`ANY`／`ALL` の相関・述語形 `UPDATE`／`DELETE`・集計の `FILTER` は引き続き束縛段で解決した上で `42601`（`correlated subqueries are not supported`）。名前解決の誤りは PostgreSQL と同じコード（曖昧 `42702`・未知列 `42703`・未定義の修飾子 `42P01`）。詳細は「相関参照の束縛（Issue #1841）」「Issue #1842 追記」「Issue #1843 追記」節 |
+| 相関サブクエリ | 相関 `EXISTS` は実行（Issue #1842・SQL-61。等価の相関はハッシュ半結合、それ以外は外側の行ごとの再評価）。相関 `NOT EXISTS` も同じプローブの反結合で実行（Issue #1843）。相関 `IN`／`NOT IN` も実行（Issue #1844。肯定形は半結合、`NOT IN` は NULL を考慮した反結合）。スカラー／`ANY`／`ALL` の相関・述語形 `UPDATE`／`DELETE`・集計の `FILTER` は引き続き束縛段で解決した上で `42601`（`correlated subqueries are not supported`）。名前解決の誤りは PostgreSQL と同じコード（曖昧 `42702`・未知列 `42703`・未定義の修飾子 `42P01`）。詳細は「相関参照の束縛（Issue #1841）」「Issue #1842 追記」「Issue #1843 追記」「Issue #1844 追記」節 |
 | `NOT IN`・`NOT EXISTS` | 対応（Issue #1191。`NOT IN` は NULL 規則込み。後述） |
 | `IN` 対象列が疑似列 `id` | 対応（Issue #1352）。スキーマに実カラム `id` が無い場合のみ整数族として扱う（実カラム優先。スカラー比較と同じ規則）。内側は `id` 投影または `INTEGER`／`BIGINT` 列（負値・NULL は一致しない）。`TEXT` 等の他の値族の投影は `22000` |
 | `IN` 対象値の型 | `TEXT`／`ENUM`／`BOOLEAN`／`DATE`／`TIMESTAMP`／`NUMERIC`／`UUID`／`BYTEA`／`INTEGER`／`BIGINT`（Issue #1191 で拡大）に加え `REAL`／`DOUBLE PRECISION`（Issue #1352。浮動小数族どうし。`REAL` は `f64` へ無損失拡大して比較し、`-0.0` は `+0.0` と等しい。非有限値は `22000`）。内側の投影列は同じ値族であること。`VECTOR`／配列／JSON は `22000`。整数・浮動小数列の distinct 値数は 1 サイトあたり `IN` 256・`NOT IN` 128 まで（超過は `54000`） |
@@ -402,7 +402,8 @@ Issue #1841 以降は下記の束縛段で解決する。エラー文言は静�
 | 形 | 扱い |
 | ---- | ---- |
 | `NOT EXISTS` の相関（#1843） | 反結合として実行（「Issue #1843 追記」節）。述語形 DML・`FILTER` では `42601` |
-| `IN`／`NOT IN`／スカラー／`ANY`／`ALL` の相関（#1844）・外側参照を含む入れ子サブクエリ述語 | `42601` |
+| `IN`／`NOT IN` の相関（#1844） | 実行（「Issue #1844 追記」節）。明示 `LIMIT`／`OFFSET`・式投影は `42601`、結合キーに表せない型の組は `0A000` |
+| スカラー／`ANY`／`ALL` の相関・外側参照を含む入れ子サブクエリ述語 | `42601` |
 | 直近の外側より外への参照（1 段飛ばし） | `42601` |
 | 投影・`ORDER BY` の外側参照（真偽に影響しないが、本 Issue では束縛しない） | `42601` |
 | 述語形 `UPDATE`／`DELETE` の `WHERE`・集計の `FILTER (WHERE ...)` | `CorrelatedCtx::disabled()` で従来どおり `42601`（台帳・content hash への影響を扱わない） |
@@ -438,6 +439,7 @@ Issue #1841 以降は下記の束縛段で解決する。エラー文言は静�
 | `crates/engine/tests/sql29_subquery_scalar.rs`（Issue #1191） | スカラー比較・相関 `42601`・`IN` 対象型拡大・RLS の結合テスト |
 | `crates/engine/src/sql/correlation.rs`・`crates/engine/tests/sql61_correlated_binding.rs`（Issue #1841） | 相関参照の束縛（IR・予約内部名）と名前解決エラーの結合テスト |
 | `crates/engine/src/sql/correlated_exists.rs`・`crates/engine/src/sql/join/semi.rs`・`crates/engine/tests/sql61_correlated_exists.rs`（Issue #1842） | 相関 `EXISTS` の述語分解・実行文脈・プローブ（半結合・再評価）と、PostgreSQL の意味論から導いた固定値・上限・RLS の結合／単体テスト |
+| `crates/engine/src/sql/correlated_exists.rs`・`crates/engine/src/sql/join/semi.rs`・`crates/engine/tests/sql61_correlated_in.rs`（Issue #1844） | 相関 `IN`／`NOT IN` の対象ペア・`NOT IN` プローブ（真理値表）と、三値論理の固定値・上限・RLS・fail-closed の結合／単体テスト |
 | `crates/engine/tests/sql61_any_all_subquery.rs`（Issue #1855） | `ANY`／`SOME`／`ALL` の独立オラクル照合・拒否形・上限・RLS・拡張クエリ・述語形 DML の結合テスト |
 
 ## OWASP Top 10 観点
@@ -468,7 +470,7 @@ Issue #1841 以降は下記の束縛段で解決する。エラー文言は静�
   （PR #1103 Cursor Bugbot 指摘対応。理由は「上限（DoS 対策）」節参照。
   サブクエリとウィンドウ関数の組合せが正しく動く経路は設計上未検証のため、
   作り込むのではなく fail-closed に倒した）。
-- 相関サブクエリのうち `EXISTS`／`NOT EXISTS` 以外（`IN`／`NOT IN`〔#1844〕・スカラー／`ANY`／`ALL`・述語形 DML・集計の `FILTER` は `42601` で拒否。実行はしない）。再評価回数上限の CLI フラグ（wire-server）
+- 相関サブクエリのうち `EXISTS`／`NOT EXISTS`／`IN`／`NOT IN` 以外（スカラー／`ANY`／`ALL`・述語形 DML・集計の `FILTER` は `42601` で拒否。実行はしない）。再評価回数上限の CLI フラグ（wire-server）
 - 拡張クエリプロトコル経由のサブクエリ・Describe 対応
 - ランキング付き検索 SELECT（外側）でのサブクエリ対応
 - サブクエリ述語に対するスカラー二次索引の最適化（現状は `PlainScan` 相当のまま。
@@ -509,7 +511,7 @@ Issue #1841 以降は下記の束縛段で解決する。エラー文言は静�
 
 ### fail-closed のまま残す形
 
-相関 `IN`／`NOT IN`／スカラー／`ANY`／`ALL`（#1844）、述語形 `UPDATE`／`DELETE`・集計の `FILTER` の相関
+相関スカラー／`ANY`／`ALL`、述語形 `UPDATE`／`DELETE`・集計の `FILTER` の相関
 （肯定・否定とも `42601`）、直近の外側より外への参照、内側 `LIMIT 0`（`22000`。既存挙動）。
 
 ### 却下した案
@@ -518,3 +520,73 @@ Issue #1841 以降は下記の束縛段で解決する。エラー文言は静�
   宣言型フィルタ経路へ流れ `Internal` になり、構文側の変更が増える。
 - variant を `{ probe, negated }` に変える: BREAKING CHANGE で全 match 腕の改修が要る。
 - 外側を `ValidatedJoin` へ変換して表結合のハッシュ結合に反結合を足す: #1842 で却下済み。
+
+## Issue #1844 追記: 相関 `IN`／`NOT IN` の半結合と NULL を考慮した反結合（SQL-61・RLS-10 ポインタ）
+
+親 #1840。#1842・#1843 と同じ準備（内側 `WHERE` の連言の分解・残余の束縛）・実体化・予算を使い、
+内部専用の葉 `WherePredicate::CorrelatedExists` → `BoundExpr::CorrelatedExists` →
+`ExprStep::CorrelatedExists` に載せる（variant を増やさない非 BREAKING。名前と実態のずれは
+ドキュメンテーションコメントで明記）。経路の分岐は `resolve_in_predicate` だけで、内側が外側を参照する
+広域取得なら相関経路、それ以外は従来の `resolve_in_subquery`（非相関の挙動は不変）。
+
+### 意味論
+
+外側 1 行について、x = 対象値、S = 「相関条件を満たす内側可視行の投影値 y の多重集合」とする
+（WHERE では UNKNOWN は偽として除外）。
+
+| 条件 | `x IN (S)` | `x NOT IN (S)` |
+| ---- | ---------- | -------------- |
+| S が空（外側の相関キーが NULL でバケットが引けない場合を含む） | 偽 | 真（x が NULL でも真） |
+| x が NULL で S 非空 | 偽（UNKNOWN） | 偽（UNKNOWN） |
+| x が S の非 NULL 要素と等しい | 真 | 偽 |
+| x が S に無く S に NULL を含む | 偽（UNKNOWN） | 偽（UNKNOWN） |
+| x が S に無く S に NULL なし・非空 | 偽 | 真 |
+
+- 肯定形は `EXISTS (... AND y = x)` と同値になる（UNKNOWN が偽に潰れるため）。対象ペア `(y, x)` を
+  等価キーへ足すだけで実装する。この潰し込みが安全なのは、構文段の否定の押し下げ
+  （`sql::where_negation`）により `NOT IN` は `Not(InSubquery)` として専用経路へ届き、肯定形の葉が
+  `NOT` の下に置かれないため。
+- `NOT IN` は #1843 の反結合に `(y, x)` キーを足しても**正しくならない**（`NOT EXISTS (相関 AND y = x)` は
+  NULL を考慮せず、x が NULL の行や S に NULL を含む行を誤って真にする）。専用のプローブ種別
+  `ProbeKind::NotIn` で実装する。残余なしは相関キーごとのバケット（NULL の有無と対象値の集合）、残余ありは
+  既存の行ごとの再評価（残余が真の行を S の要素とみなし、x が NULL・y が NULL・y = x のいずれかで偽）。
+- `CorrelatedProbe::eval` は `ProbeKind` を網羅的に `match` し、述語の取りこぼしによる fail-open を作らない。
+
+### 受理する内側の形と静的検査（行数に依存しない）
+
+| 検査 | 結果 |
+| ---- | ---- |
+| 投影列数が 1 でない | `42601`（非相関と同文言） |
+| 対象列が未定義／`IN` で扱えない型 | `42703`／`22000`（非相関と同一） |
+| 値族の不一致 | `22000`（非相関と同一） |
+| 式投影（`y + 1` 等。裸の列・別名付きの列参照・疑似列 `id` のみ受理） | `42601` |
+| 明示 `LIMIT n`／`OFFSET k`（`LIMIT` 省略・`LIMIT ALL` は受理。`LIMIT 0` は従来どおり `22000`） | `42601`（`correlated` を含む静的文言） |
+| 対象ペアが JOIN キーの型クラスで表せない（`REAL`／`DOUBLE`／`NUMERIC`／`TIME`／`TIMESTAMPTZ`、TEXT×ENUM 等）・非バイト列順の照合 | `0A000` |
+| 照合の衝突 | `42P21`／`42P22` |
+| `ANY`／`ALL`（`= ANY`・`<> ALL` を含む）・述語形 DML・集計の `FILTER`・`levels_up >= 2` | 従来どおり `42601` |
+
+`LIMIT n` を外側の行ごとの先頭 n 件として扱う実装は、`ORDER BY` なしでは PostgreSQL でも結果が不定で、
+`ORDER BY` 付きは行ごとの top-k が要るため範囲外とし fail-closed にする。
+
+### 上限・テナント境界
+
+- 再評価回数・比較回数（`MAX_JOIN_COMPARISONS` を共有）・内側入力行数・バイト予算・実行回数予算は
+  `EXISTS` と共有し、超過は `54000` で文全体を拒否する。確保は計上後に `try_reserve`。`IN` の distinct 値予算は
+  消費しない（ハッシュ照合のため）。
+- 内側は外側と同じ `PolicyContext`・`read_txn` で実体化する（RLS 暗黙適用）。他テナントの NULL 行が
+  自テナントの `NOT IN` を偽にしないこと、エラーが他テナントの行数に依存しないことを結合テストで固定する。
+- 失敗時の静的検証（Issue #1432 の経路）は `static_validate_correlated_in` が準備と内側だけの連言の
+  静的検証・束縛までを共有する。
+
+### 却下した案
+
+- `NOT IN` を 3 つの反結合（`NOT EXISTS(相関 ∧ y=x)` ∧ `NOT EXISTS(相関 ∧ y IS NULL)` ∧
+  `(x IS NOT NULL ∨ NOT EXISTS(相関))`）へ分解: 正しいが内側の実体化と予算を 3 倍消費する。
+- `NOT EXISTS (… ∧ (y = x OR y IS NULL OR x IS NULL))` への述語レベルの書き換え: x が内側 `WHERE` に無く
+  相関 IR への注入が要り、等価キーが使えず常に行ごとの再評価になる。
+- #1843 の否定プローブへ対象ペアをキーとして足す: 真理値表の「x が NULL」「S に NULL」を誤る。
+
+### 対象外（後続候補）
+
+相関 `IN`／`NOT IN` の明示 `LIMIT`／`OFFSET`、結合キーに表せない型の組（残余での等価比較へ回す拡張）、
+式投影、相関 `ANY`／`ALL`・スカラー、再評価回数上限の CLI フラグ化（wire-server）。

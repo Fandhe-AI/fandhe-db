@@ -2472,8 +2472,9 @@ pub enum WherePredicate {
     IdCompare { op: BinOp, value: i128 },
     /// 相関 `EXISTS (SELECT ...)` を外側の行ごとに判定する内部専用の葉（Issue #1842・SQL-61
     /// ポインタ・RLS-10）。構文解析は生成せず、`sql::subquery` が相関 `EXISTS` を解決する際に
-    /// だけ生成する（`IdCompare` と同じ流儀）。`NOT EXISTS`（Issue #1843）も同じ葉で、否定はプローブの
-    /// 反結合モード（判定の反転）が持つ（variant の形は変えない）。内側は 1 回だけ実体化済みのプローブ
+    /// だけ生成する（`IdCompare` と同じ流儀）。`NOT EXISTS`（Issue #1843）・
+    /// 相関 `IN`／`NOT IN`（Issue #1844）も同じ葉で、否定はプローブの反結合モード
+    /// （判定の反転）が持つ（variant の形は変えない）。内側は 1 回だけ実体化済みのプローブ
     /// （`sql::join::semi`）で、束縛時に `BoundExpr::CorrelatedExists` へ写り外側の行ごとに真偽を返す
     /// （UNKNOWN にならない）。内側の行データは `Debug` に出ない。
     ///
