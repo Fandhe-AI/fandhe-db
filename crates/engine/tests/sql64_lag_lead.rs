@@ -285,6 +285,38 @@ fn bare_column_defaults_use_declared_types() {
                     },
                     false,
                 ),
+                ColumnDef::new(
+                    "n4",
+                    ColumnType::Numeric {
+                        precision: 38,
+                        scale: 0,
+                    },
+                    false,
+                ),
+                ColumnDef::new(
+                    "n5",
+                    ColumnType::Numeric {
+                        precision: 38,
+                        scale: 38,
+                    },
+                    false,
+                ),
+                ColumnDef::new(
+                    "n6",
+                    ColumnType::Numeric {
+                        precision: 20,
+                        scale: 10,
+                    },
+                    false,
+                ),
+                ColumnDef::new(
+                    "n7",
+                    ColumnType::Numeric {
+                        precision: 30,
+                        scale: 5,
+                    },
+                    false,
+                ),
                 ColumnDef::new("u1", ColumnType::Uuid, false),
                 ColumnDef::new("b1", ColumnType::Bytea, false),
                 ColumnDef::new("i1", ColumnType::Integer, false),
@@ -298,6 +330,11 @@ fn bare_column_defaults_use_declared_types() {
         // typmod（精度・スケール）違いの NUMERIC 同士も統一できる（`42804` にしない）。
         ("lag(n1, 1, n3)", "0A000"),
         ("lag(n3, 1, n1)", "0A000"),
+        // 統一型が精度上限（38）を超える組は不正な型を作らず fail-closed（42804）。
+        ("lag(n4, 1, n5)", "42804"),
+        ("lag(n5, 1, n4)", "42804"),
+        // 上限内（整数部 25＋小数部 10＝35）は受理。
+        ("lag(n6, 1, n7)", "0A000"),
         ("lag(u1, 1, u1)", "0A000"),
         ("lag(n1, 1, u1)", "42804"),
         ("lag(i1, 1, n1)", "42804"),

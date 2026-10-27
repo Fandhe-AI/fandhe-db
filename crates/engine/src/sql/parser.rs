@@ -9848,10 +9848,13 @@ fn unify_lag_lead_types(a: &ColumnType, b: &ColumnType) -> Option<ColumnType> {
         ) => {
             let scale = (*sa).max(*sb);
             let int_digits = pa.saturating_sub(*sa).max(pb.saturating_sub(*sb));
-            Some(ColumnType::Numeric {
-                precision: int_digits.saturating_add(scale),
-                scale,
-            })
+            // 上限（`MAX_PRECISION`）超過は catalog・行 codec が拒否する型になるため、
+            // 無損失に統一できないものとして `None`（呼び出し側が fail-closed で `42804`）。
+            let precision = int_digits.checked_add(scale)?;
+            if precision > crate::numeric::MAX_PRECISION {
+                return None;
+            }
+            Some(ColumnType::Numeric { precision, scale })
         }
         _ => match (int_rank(a), int_rank(b)) {
             (Some(x), Some(y)) => Some(if x >= y { a.clone() } else { b.clone() }),
