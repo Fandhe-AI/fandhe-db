@@ -261,6 +261,9 @@ fn is_write(parsed: &ParsedSql) -> bool {
         parsed,
         ParsedSql::Insert(_)
             | ParsedSql::InsertSelect(_)
+            // SQL-63・Issue #1876: 振り分け対象外（`is_routable` が false で一時表が絡めば `0A000`）だが、
+            // 書き込み文としての分類は他の DML と揃える。
+            | ParsedSql::DataModifyingCte(_)
             | ParsedSql::Truncate(_)
             | ParsedSql::Delete(_)
             | ParsedSql::Update(_)

@@ -3054,12 +3054,11 @@ pub(crate) struct BufferedRows {
     pub(crate) offset: u32,
 }
 
-impl ValidatedBufferedView {
-    /// 外側クエリが、本文の結果列の順序・比較に依存するか（TABLE-28・Issue #2190）。
-    /// 外側は本文の評価済みセルを列型だけで比較するため、本文のテキスト列についた照合は
-    /// 運ばれない。素通し（`WHERE`・`ORDER BY`・ウィンドウ・集計がない）以外は依存するとみなす。
-    pub(crate) fn outer_depends_on_order(&self) -> bool {
-        match &self.outer {
+impl BufferedOuter {
+    /// 外側が本文の結果列の順序・比較に依存するか（[`ValidatedBufferedView::outer_depends_on_order`]
+    /// の本体。データ変更 CTE の主クエリ〔SQL-63・Issue #1876〕も同じ判定を共有する）。
+    pub(crate) fn depends_on_order(&self) -> bool {
+        match self {
             BufferedOuter::Rows(rows) => {
                 !rows.where_predicates.is_empty()
                     || !rows.order_by.is_empty()
@@ -3068,6 +3067,15 @@ impl ValidatedBufferedView {
             }
             BufferedOuter::Aggregate(_) => true,
         }
+    }
+}
+
+impl ValidatedBufferedView {
+    /// 外側クエリが、本文の結果列の順序・比較に依存するか（TABLE-28・Issue #2190）。
+    /// 外側は本文の評価済みセルを列型だけで比較するため、本文のテキスト列についた照合は
+    /// 運ばれない。素通し（`WHERE`・`ORDER BY`・ウィンドウ・集計がない）以外は依存するとみなす。
+    pub(crate) fn outer_depends_on_order(&self) -> bool {
+        self.outer.depends_on_order()
     }
 
     /// 参照されたビュー名。
@@ -21956,6 +21964,19 @@ fn buffered_scan_statement(
     body: Box<Statement>,
     shape: ParsedScanShape,
 ) -> Result<Statement, SqlSurfaceError> {
+    let outer = buffered_scan_outer(shape)?;
+    Ok(Statement::BufferedView(ValidatedBufferedView {
+        view_name,
+        body,
+        outer,
+        column_aliases: Vec::new(),
+        origin: BufferedOrigin::View,
+    }))
+}
+
+/// [`buffered_scan_statement`] の外側部分（行形）の組み立てと検証。データ変更 CTE の主クエリ
+/// （SQL-63・Issue #1876）も本文が `Statement` でない同じ外側を使うため、検証規則をここに共有する。
+fn buffered_scan_outer(shape: ParsedScanShape) -> Result<BufferedOuter, SqlSurfaceError> {
     if shape.with_ties {
         return Err(SqlSurfaceError::feature_not_supported(
             "WITH TIES is not supported over a view with an aggregate/LIMIT body",
@@ -21976,23 +21997,17 @@ fn buffered_scan_statement(
     // `LIMIT` の範囲は構文段では検査しない（設定値を持たないため）。
     // `EngineCore::check_buffered_outer_limit` が設定値で検査する（Issue #1555）。
     super::parser::validate_search_offset(shape.offset)?;
-    Ok(Statement::BufferedView(ValidatedBufferedView {
-        view_name,
-        body,
-        outer: BufferedOuter::Rows(Box::new(BufferedRows {
-            projection: shape.projection,
-            where_predicates: shape.where_predicates,
-            order_by: shape.order_by,
-            order_keys: shape.order_keys,
-            window_items: shape.window_items,
-            limit: shape.limit.unwrap_or(u32::MAX),
-            limit_explicit: shape.limit.is_some(),
-            limit_implicit: shape.limit.is_none(),
-            offset: shape.offset,
-        })),
-        column_aliases: Vec::new(),
-        origin: BufferedOrigin::View,
-    }))
+    Ok(BufferedOuter::Rows(Box::new(BufferedRows {
+        projection: shape.projection,
+        where_predicates: shape.where_predicates,
+        order_by: shape.order_by,
+        order_keys: shape.order_keys,
+        window_items: shape.window_items,
+        limit: shape.limit.unwrap_or(u32::MAX),
+        limit_explicit: shape.limit.is_some(),
+        limit_implicit: shape.limit.is_none(),
+        offset: shape.offset,
+    })))
 }
 
 /// 集計・`SELECT DISTINCT` の FROM の解決結果から [`Statement`] を組み立てる
@@ -22011,6 +22026,34 @@ fn aggregate_statement_from_resolved(
     group_by: Option<GroupByClause>,
 ) -> Result<Statement, SqlSurfaceError> {
     if let super::view::Resolved::Buffered { view_name, body } = resolved {
+        let outer = buffered_aggregate_outer(view_name.clone(), items, where_predicates, group_by)?;
+        return Ok(Statement::BufferedView(ValidatedBufferedView {
+            view_name,
+            body,
+            outer,
+            column_aliases: Vec::new(),
+            origin: BufferedOrigin::View,
+        }));
+    }
+    Ok(Statement::Aggregate(build_aggregate_from_resolved(
+        table_name,
+        resolved,
+        items,
+        where_predicates,
+        group_by,
+    )?))
+}
+
+/// [`aggregate_statement_from_resolved`] の評価後射影形（外側集計）部分の検証と組み立て。
+/// データ変更 CTE の主クエリ（SQL-63・Issue #1876）も同じ外側を使うため検証規則を共有する。
+/// `view_name` は束縛時に合成スキーマの表名になる（本文の結果列に対して束縛する）。
+fn buffered_aggregate_outer(
+    view_name: String,
+    items: Vec<AggregateSelectItem>,
+    where_predicates: Vec<WherePredicate>,
+    group_by: Option<GroupByClause>,
+) -> Result<BufferedOuter, SqlSurfaceError> {
+    {
         if group_by.as_ref().is_some_and(|g| g.with_ties) {
             return Err(SqlSurfaceError::feature_not_supported(
                 "WITH TIES is not supported over a view with an aggregate/LIMIT body",
@@ -22062,26 +22105,13 @@ fn aggregate_statement_from_resolved(
         where_predicates
             .iter()
             .try_for_each(check_buffered_outer_pred)?;
-        return Ok(Statement::BufferedView(ValidatedBufferedView {
-            view_name: view_name.clone(),
-            body,
-            outer: BufferedOuter::Aggregate(Box::new(ValidatedAggregate {
-                table_name: view_name,
-                items,
-                where_predicates,
-                group_by,
-            })),
-            column_aliases: Vec::new(),
-            origin: BufferedOrigin::View,
-        }));
+        Ok(BufferedOuter::Aggregate(Box::new(ValidatedAggregate {
+            table_name: view_name,
+            items,
+            where_predicates,
+            group_by,
+        })))
     }
-    Ok(Statement::Aggregate(build_aggregate_from_resolved(
-        table_name,
-        resolved,
-        items,
-        where_predicates,
-        group_by,
-    )?))
 }
 
 pub(crate) fn validate_sql_tokens(
@@ -22704,6 +22734,436 @@ fn validate_cte_definitions(
     Ok(dm_exposed)
 }
 
+/// データ変更 CTE を含む `WITH` を、読み取りの入口（固定 `0A000`）として扱うか、最上位の実行入口
+/// として実行計画まで組み立てるか（SQL-63・Issue #1876）。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum DmWith {
+    /// 従来どおり検証を通過しても固定 `0A000` で止める（cursor・COPY・ビュー・CTAS・サブクエリ内側）。
+    RejectAsUnsupported,
+    /// セッションの最上位の文として実行計画（[`ValidatedDataModifyingCte`]）を返す。
+    Execute,
+}
+
+/// `WITH` 文の検証結果。
+enum WithOutcome {
+    Read(Statement),
+    DataModifying(ValidatedDataModifyingCte),
+}
+
+/// 文末の `[;]`・`USING OPERATION_ID '<id>' | NULL` を主クエリから切り離す（SQL-63・Issue #1876）。
+/// 戻り値は（句と末尾 `;` を除いた主クエリ, 検証済みの `operation_id`）。句の無い文・明示 `NULL` は
+/// `None`。値の検証は [`OperationId::parse`]。`USING OPERATION_ID` の形が崩れている場合は何もせず
+/// 元のトークンを返し、主クエリの解析が余剰トークンとして `42601` にする（fail-closed）。
+fn split_trailing_operation_id(
+    tokens: &[Token],
+) -> Result<(&[Token], Option<OperationId>), SqlSurfaceError> {
+    let head = match tokens.split_last() {
+        Some((Token::Punct(';'), head)) => head,
+        _ => tokens,
+    };
+    if let [rest @ .., Token::Ident(u), Token::Ident(o), last] = head {
+        if u.eq_ignore_ascii_case("USING") && o.eq_ignore_ascii_case("OPERATION_ID") {
+            let operation_id = match last {
+                Token::Ident(n) if n.eq_ignore_ascii_case("NULL") => None,
+                Token::StringLiteral(raw) => Some(OperationId::parse(raw)?),
+                _ => return Ok((tokens, None)),
+            };
+            return Ok((rest, operation_id));
+        }
+    }
+    Ok((tokens, None))
+}
+
+/// データ変更 CTE を含む最上位の `WITH` 文（SQL-63・Issue #1876）。検証（構文・名前・列・
+/// 実行形のゲート）を通過した文だけが持つ実行計画で、`EngineCore` の書き込み経路が 1 つの書き込み
+/// トランザクションで副文を定義順に実行し、参照される副文の `RETURNING` 行を具体化して主クエリの
+/// 外側処理（評価後射影形ビューと同じ [`BufferedOuter`]）を適用する。
+///
+/// 不変条件（RLS-10 (b)）: テナント・`PolicyContext` を保持しない。実行は常に参照した
+/// セッション自身の `PolicyContext` で行う。フィールドは `pub(crate)`（クレート外からの直読み・
+/// 直書き不可）。
+#[derive(Debug, Clone, PartialEq)]
+pub struct ValidatedDataModifyingCte {
+    /// 副文（データ変更 CTE）の本文。定義順。
+    pub(crate) dm_ctes: Vec<super::cte::DataModifyingCteBody>,
+    /// 主クエリが読む副文の `dm_ctes` 内の添字。
+    pub(crate) referenced: usize,
+    /// 主クエリが FROM に書いた CTE 名（外側の表名）。
+    pub(crate) view_name: String,
+    /// 参照される CTE の列名リスト（`WITH d(x, y) AS (...)`）。空なら改名なし。
+    pub(crate) column_aliases: Vec<String>,
+    /// 主クエリの外側処理。
+    pub(crate) outer: BufferedOuter,
+    /// 文末の `USING OPERATION_ID`（文全体で 1 つ。副文には持たせない）。
+    pub(crate) operation_id: Option<OperationId>,
+    /// 送られた文から導いた台帳照合ハッシュ（結果行の値は材料にしない）。
+    pub(crate) statement_hash: crate::recovery::content_hash::ContentHash,
+}
+
+impl ValidatedDataModifyingCte {
+    /// 台帳・世代の単位になる表（定義順で最初のデータ変更 CTE の対象表。決定的）。
+    pub(crate) fn ledger_table(&self) -> &str {
+        self.dm_ctes.first().map_or("", |d| d.target_table.as_str())
+    }
+
+    /// 主クエリが読む副文。
+    pub(crate) fn referenced_body(&self) -> Option<&super::cte::DataModifyingCteBody> {
+        self.dm_ctes.get(self.referenced)
+    }
+}
+
+/// データ変更 CTE を含む最上位 `WITH` 文の実行計画を組み立てる（SQL-63・Issue #1876）。
+/// 構文・名前・列の検証は呼び出し元（[`validate_with_statement`]）が済ませている前提で、ここでは
+/// 本 Issue で実行する形かどうかのゲートを書き込みトランザクションを開く前に判定する
+/// （未対応の形はすべて固定 `0A000`。入力断片を含めない）。
+///
+/// 実行する形: データ変更 CTE がちょうど 1 つで、主クエリの FROM がその CTE（`RETURNING` あり）。
+/// 複数のデータ変更 CTE・実表やビューを読む主クエリは、文開始時点のスナップショットの可視性
+/// （#1877）が決まるまで実行しない。
+fn build_data_modifying_with(
+    tokens: &[Token],
+    ctes: &[super::cte::CteDef],
+    main_dm_idx: usize,
+    main: MainShape,
+    operation_id: Option<OperationId>,
+    ledger_mode: LedgerMode,
+) -> Result<ValidatedDataModifyingCte, SqlSurfaceError> {
+    let mut dm_ctes: Vec<super::cte::DataModifyingCteBody> = Vec::new();
+    let mut referenced: Option<usize> = None;
+    for (idx, def) in ctes.iter().enumerate() {
+        if let super::cte::CteBody::DataModifying(body) = &def.body {
+            if idx == main_dm_idx {
+                referenced = Some(dm_ctes.len());
+            }
+            dm_ctes.push((**body).clone());
+        }
+    }
+    let (Some(referenced), 1) = (referenced, dm_ctes.len()) else {
+        return Err(SqlSurfaceError::feature_not_supported(
+            "this data-modifying CTE form is not supported yet",
+        ));
+    };
+    let def = ctes
+        .get(main_dm_idx)
+        .ok_or_else(super::cte::data_modifying_cte_unsupported)?;
+    let outer = match main {
+        MainShape::Scan(shape) => buffered_scan_outer(shape)?,
+        MainShape::Aggregate(shape) => buffered_aggregate_outer(
+            def.name.clone(),
+            shape.items,
+            shape.where_predicates,
+            shape.group_by,
+        )?,
+    };
+    // 文末句の省略は台帳あり構成（`--require-operation-id`）で `23502`。構文・名前・列の検証より後、
+    // 書き込みトランザクションを開く前に判定する（RECOVER-1）。
+    ledger_mode.require(operation_id.as_ref())?;
+    let statement_hash = crate::recovery::content_hash::for_data_modifying_cte(
+        crate::recovery::content_hash::strip_operation_id_clause(tokens),
+    )
+    .map_err(|_| SqlSurfaceError::Internal {
+        detail: "internal error".to_string(),
+    })?;
+    Ok(ValidatedDataModifyingCte {
+        dm_ctes,
+        referenced,
+        view_name: def.name.clone(),
+        column_aliases: def.column_aliases.clone(),
+        outer,
+        operation_id,
+        statement_hash,
+    })
+}
+
+/// `WITH` 文（非再帰・`WITH RECURSIVE` の早期分岐を含む）の検証本体。`validate_sql_tokens_impl` の
+/// `WITH` 分岐と、最上位の実行入口 [`validate_session_with_tokens`] が共有する唯一の実装
+/// （第 2 の検出器・パーサーを作らない）。`dm_mode` が [`DmWith::RejectAsUnsupported`] なら
+/// データ変更 CTE を含む文は検証を通過しても従来どおり固定 `0A000` で止める。
+fn validate_with_statement(
+    tokens: &[Token],
+    lookup: &impl TableLookup,
+    limits: crate::nesting_limits::NestingLimits,
+    cte_evaluation: CteEvaluation,
+    dm_mode: DmWith,
+    ledger_mode: LedgerMode,
+) -> Result<WithOutcome, SqlSurfaceError> {
+    // SQL-35・Issue #1869: `WITH RECURSIVE` は非再帰経路（`cte::resolve_relation`）へ
+    // 一切流さず、ここで早期に返す（流すと自己参照が同名の実テーブルへ黙って解決される。
+    // fail-closed）。構文・再帰構造の検証（`42601`／`42P19`）を通過した後は、反復評価が
+    // 未実装（#1870）のため一律 `0A000` で終える。
+    if matches!(tokens.get(1), Some(Token::Ident(w)) if w.eq_ignore_ascii_case("RECURSIVE")) {
+        let _clause = super::recursive_cte::validate_recursive_with(tokens, limits)?;
+        return Err(SqlSurfaceError::feature_not_supported(
+            "WITH RECURSIVE evaluation is not supported yet",
+        ));
+    }
+    let mut p = Parser::new(tokens).with_nesting_limits(limits);
+    let ctes = p.parse_with_clause()?;
+    let has_dm = ctes.iter().any(|d| d.is_data_modifying());
+    // SQL-63・Issue #1876: 最上位の実行入口だけが、文末の `USING OPERATION_ID` を主クエリから
+    // 切り離して受理する（読み取り入口・DM CTE なしの `WITH` は従来どおり余剰トークンで `42601`）。
+    let execute_dm = has_dm && dm_mode == DmWith::Execute;
+    let (main_src, operation_id) = if execute_dm {
+        split_trailing_operation_id(p.remaining())?
+    } else {
+        (p.remaining(), None)
+    };
+    // Issue #1861（SQL-62）: セッションの最上位 SELECT の入口に限り、JOIN の主クエリで CTE を入力として
+    // 参照できる。InlineOnly（ビュー本文・cursor・COPY・CTAS・サブクエリ内側）と、データ変更 CTE の
+    // 実行入口は従来どおり下の単一表の主クエリ解析へ流す（JOIN は `42601` のまま。fail-closed）。
+    if cte_evaluation == CteEvaluation::AllowMaterialize && !execute_dm && looks_like_join(main_src)
+    {
+        return Ok(WithOutcome::Read(validate_with_join_main(
+            main_src, &ctes, lookup, limits,
+        )?));
+    }
+    // Issue #1535: 主クエリも通常 SELECT と同じ修飾列正規化を通す（CTE 定義本体は対象外）。
+    let main_normalized = super::qualified_column::normalize_single_table_qualifiers(main_src)?;
+    let main_tokens: &[Token] = &main_normalized;
+
+    if !matches!(main_tokens.first(), Some(Token::Keyword(Keyword::Select))) {
+        return Err(SqlSurfaceError::unsupported(
+            "WITH must be followed by a SELECT statement",
+        ));
+    }
+    let main_contains_group_by = main_tokens.windows(2).any(|w| {
+        matches!(&w[0], Token::Ident(name) if name.eq_ignore_ascii_case("GROUP"))
+            && matches!(w[1], Token::Keyword(Keyword::By))
+    });
+    // SQL-30・TASK-214（Issue #930）: トップレベル SELECT の判定
+    // （`contains_window_over`）と同じ理由で、`WITH` の主クエリでも
+    // `COUNT(*) OVER (...)` のようなウィンドウ項目を集計 SELECT と
+    // 誤判定しない（`OVER` の有無を見ずに関数名 + `'('` だけで判定すると、
+    // 集計関数名を使うウィンドウ項目を主クエリとして受理できなくなる）。
+    let main_contains_window_over = main_tokens.windows(3).any(|w| {
+        matches!(w[0], Token::Punct(')'))
+            && matches!(&w[1], Token::Ident(name) if name.eq_ignore_ascii_case("OVER"))
+            && matches!(w[2], Token::Punct('('))
+    });
+    let main_is_aggregate_select = !main_contains_window_over
+        && ((matches!(main_tokens.get(1), Some(Token::Ident(name)) if is_aggregate_function_name(name))
+            && matches!(main_tokens.get(2), Some(Token::Punct('('))))
+            || main_contains_group_by);
+    // Issue #1191（SQL-29 (b)）: 集計主クエリ（`GROUP BY`／`HAVING`／
+    // `ORDER BY`／`SELECT DISTINCT` を含む）も受理する。主クエリは
+    // 常に `subquery_ctx: None` で解析し（Issue #927 のサブクエリとの併用は
+    // 対象外。`docs/design/cte.md` 対象外節）、CTE の解決後は
+    // [`build_aggregate_from_resolved`] で通常の集計 SELECT と同じ
+    // [`ValidatedAggregate`] へ畳み込む（第 2 の実行器を作らない）。
+    let main = if is_distinct_modifier(main_tokens, 1) {
+        MainShape::Aggregate(parse_distinct_shape(main_tokens)?)
+    } else if main_is_aggregate_select {
+        MainShape::Aggregate(parse_aggregate_shape(
+            main_tokens,
+            None,
+            false,
+            false,
+            limits,
+        )?)
+    } else {
+        match parse_select_shape(main_tokens, None, false, limits)? {
+            ParsedSelect::Scan(shape) => MainShape::Scan(shape),
+            ParsedSelect::Search(_) => {
+                return Err(SqlSurfaceError::unsupported(
+                    "WITH does not support a ranked main query (ORDER BY / USING PLAN)",
+                ));
+            }
+        }
+    };
+    // SQL-56 (3)・Issue #1793: `WITH TIES` は CTE を伴う文では未対応（fail-closed）。
+    let main_has_ties = match &main {
+        MainShape::Scan(shape) => shape.with_ties,
+        MainShape::Aggregate(shape) => shape.group_by.as_ref().is_some_and(|g| g.with_ties),
+    };
+    if main_has_ties {
+        return Err(SqlSurfaceError::feature_not_supported(
+            "WITH TIES is not supported in a statement with CTEs",
+        ));
+    }
+    let main_table_name = match &main {
+        MainShape::Scan(shape) => shape.table_name.clone(),
+        MainShape::Aggregate(shape) => shape.table_name.clone(),
+    };
+
+    // 参照されない CTE も含め、すべての定義本文を検証する（決定性・
+    // fail-closed のため。構造検証・存在確認を省略しない）。
+    // 上限カウンタ（`ResolveBudget`）は「1 回のトップレベル呼び出し
+    // （1 つの CTE 定義の事前検証、または主クエリの解決）」ごとに
+    // 新規生成する（`cte::MAX_CTE_REFERENCES` のドキュメント参照。
+    // Issue #928 レビュー指摘）。文全体で 1 つのカウンタを使い回すと、
+    // このループが各定義のチェーンを再帰的に辿るたびに参照回数が
+    // 名前ごとではなく呼び出し回数分累積し、定義数・連鎖の深さの
+    // どちらも上限内の有効なクエリを誤って `54000` で拒否する。
+    // 連鎖の深さは `MAX_CTE_NESTING_DEPTH` で呼び出しごとに独立して
+    // 上限が掛かるため、リセットしても DoS 対策としての上限は失われない。
+    //
+    // `resolve_relation` は `def.body.table_name`（FROM）の名前解決
+    // 連鎖だけを検証し、`def` 自身の射影・`WHERE`（`compose` が本来
+    // 適用する `check_columns_within_view`）は「他の CTE・主クエリから
+    // 参照され `compose` を通る」場合にしか検証されない。参照されない
+    // leaf CTE はどこからも `compose` されないため、FROM 解決結果
+    // （`resolved` の公開列集合）に対して `def` 自身の射影・`WHERE` を
+    // ここで明示的に検証しないと、先行 CTE が非公開列を隠していても
+    // 参照されない後続 CTE がそれを射影・条件に使う文を通してしまう
+    // （Issue #928 レビュー指摘: Codex P1・Cursor Bugbot Low、同一欠陥）。
+    //
+    // `resolved` の公開列集合が `None`（`Resolved::Table` か、連鎖の
+    // どの段も列を絞り込んでいない `Resolved::View { view_columns: None,
+    // .. }`）の場合、実テーブル直下の列存在検査は通常
+    // `sql::parser::bind` に委ねている（`sql::view::resolve_from` の
+    // 同種コメント参照）。これは**参照される** CTE・VIEW には妥当
+    // （最終的に `ValidatedScan` へ畳み込まれ bind を通る）だが、
+    // どこからも参照されない leaf CTE は bind に到達しないため、
+    // ここで実テーブルのスキーマへ問い合わせて代わりに検証する
+    // （PR #1100 追加レビュー指摘: Codex P1・Cursor Bugbot Low）。
+    // `TableLookup::table_columns` の既定実装は `Ok(None)`（検査省略・
+    // 後方互換）を返すため、これに対応しない `TableLookup` 実装
+    // （テスト用モック等）は無変更のまま今まで通り動作する。
+    let dm_exposed = validate_cte_definitions(&ctes, lookup, limits)?;
+    // 主クエリがデータ変更 CTE を参照する場合は、`RETURNING` の公開列だけを持つ仮のビュー解決結果で
+    // 既存の列スコープ検査を通す（結果は捨てる）。`RETURNING` なしの参照は 0A000。
+    let main_dm = ctes
+        .iter()
+        .enumerate()
+        .find(|(_, d)| d.is_data_modifying() && d.name.eq_ignore_ascii_case(&main_table_name));
+    let main_dm_idx = main_dm.map(|(i, _)| i);
+    let resolved = if let Some((dm_idx, dm_def)) = main_dm {
+        let exposed = dm_exposed
+            .get(dm_idx)
+            .cloned()
+            .flatten()
+            .ok_or_else(super::cte::data_modifying_cte_unsupported)?;
+        let base_table = match &dm_def.body {
+            super::cte::CteBody::DataModifying(b) => b.target_table.clone(),
+            super::cte::CteBody::Select(_) => {
+                return Err(super::cte::data_modifying_cte_unsupported());
+            }
+        };
+        let base_allocated = lookup.table_is_allocated(&base_table)?;
+        super::view::Resolved::View {
+            base_table,
+            view_predicates: Vec::new(),
+            view_columns: Some(exposed),
+            column_map: None,
+            check_predicates: Vec::new(),
+            base_allocated,
+        }
+    } else {
+        let mut budget = super::cte::ResolveBudget::new();
+        super::cte::resolve_relation(
+            lookup,
+            &ctes,
+            ctes.len(),
+            &main_table_name,
+            0,
+            limits.max_cte_nesting_depth(),
+            &mut budget,
+        )?
+    };
+    // Issue #1860（SQL-62 (1)(3)）: 明示 `MATERIALIZED` の CTE を主クエリが直接参照するときだけ
+    // 具体化経路を試す。エラー契約を揃えるため、まず従来のインライン解決・畳み込み
+    // （下の `inline`）で列スコープ等の検証を通し、その失敗はそのまま返す。外側が評価後射影形
+    // として受理できない形（式投影・UDF 述語等）は具体化せずインラインの結果を使う。
+    // データ変更 CTE を含む文は具体化せず、下の固定 0A000 に流す。
+    let materialized_idx = if cte_evaluation == CteEvaluation::AllowMaterialize
+        && !ctes.iter().any(|d| d.is_data_modifying())
+    {
+        ctes.iter().rposition(|def| {
+            def.name.eq_ignore_ascii_case(&main_table_name)
+                && def.materialization == super::cte::CteMaterialization::Materialized
+        })
+    } else {
+        None
+    };
+    let main_for_materialize = materialized_idx.map(|_| main.clone());
+    let main_for_dm = execute_dm.then(|| main.clone());
+    let inline: Result<Statement, SqlSurfaceError> = (|| match main {
+        MainShape::Scan(shape) => Ok(Statement::Scan(build_scan_from_resolved(
+            shape.table_name,
+            resolved,
+            shape.projection,
+            shape.where_predicates,
+            shape.limit,
+            shape.order_by,
+            shape.offset,
+            shape.window_items,
+            shape.order_keys,
+            shape.scalar_subquery_items,
+        )?)),
+        MainShape::Aggregate(shape) => Ok(Statement::Aggregate(build_aggregate_from_resolved(
+            shape.table_name,
+            resolved,
+            shape.items,
+            shape.where_predicates,
+            shape.group_by,
+        )?)),
+    })();
+    // SQL-63: データ変更 CTE を含む文は、構文・名前・列の検証をすべて通過しても実行しない
+    // （読み取りプランへ化けさせない。書き込み結線は #1876）。固定文言で入力断片を含めない。
+    if has_dm {
+        inline?;
+        // 読み取り入口（cursor・COPY・ビュー・CTAS・サブクエリ内側等）は従来どおり固定 0A000。
+        let (Some(main_shape), Some(dm_idx)) = (main_for_dm, main_dm_idx) else {
+            return Err(super::cte::data_modifying_cte_unsupported());
+        };
+        return build_data_modifying_with(
+            tokens,
+            &ctes,
+            dm_idx,
+            main_shape,
+            operation_id,
+            ledger_mode,
+        )
+        .map(WithOutcome::DataModifying);
+    }
+    if let (Some(idx), Some(shape)) = (materialized_idx, main_for_materialize) {
+        let inline = inline?;
+        return Ok(WithOutcome::Read(
+            materialized_cte_statement(&ctes, idx, shape, lookup, limits).unwrap_or(inline),
+        ));
+    }
+    inline.map(WithOutcome::Read)
+}
+
+/// セッションの最上位の文の入口（Issue #1876・SQL-63）。先頭が `WITH`（`RECURSIVE` でない）で CTE 定義に
+/// データ変更 CTE を含む場合だけ、実行計画 [`ValidatedDataModifyingCte`] を返す。それ以外は
+/// [`validate_session_sql_tokens`] と同じ結果（[`SessionWith::Statement`]）。`EngineCore` の
+/// パース入口（`parse_tokens_in`）だけが呼ぶ。検出は [`validate_with_statement`] 内の
+/// `parse_with_clause` の結果で行う。
+pub(crate) fn validate_session_with_tokens(
+    tokens: &[Token],
+    lookup: &impl TableLookup,
+    depth: usize,
+    limits: crate::nesting_limits::NestingLimits,
+    ledger_mode: LedgerMode,
+) -> Result<SessionWith, SqlSurfaceError> {
+    let is_non_recursive_with = matches!(tokens.first(), Some(Token::Ident(w)) if w.eq_ignore_ascii_case("WITH"))
+        && !matches!(tokens.get(1), Some(Token::Ident(w)) if w.eq_ignore_ascii_case("RECURSIVE"));
+    if !is_non_recursive_with {
+        return validate_session_sql_tokens(tokens, lookup, depth, limits)
+            .map(SessionWith::Statement);
+    }
+    match validate_with_statement(
+        tokens,
+        lookup,
+        limits,
+        CteEvaluation::AllowMaterialize,
+        DmWith::Execute,
+        ledger_mode,
+    )? {
+        WithOutcome::Read(stmt) => Ok(SessionWith::Statement(stmt)),
+        WithOutcome::DataModifying(v) => Ok(SessionWith::DataModifying(Box::new(v))),
+    }
+}
+
+/// [`validate_session_with_tokens`] の結果。パース入口が直ちに `ParsedSql` へ詰め替える短命の戻り値で、
+/// 保持しないため variant の大きさの差は許容する（`Statement` を Box 化すると全呼び出しが影響を受ける）。
+#[allow(clippy::large_enum_variant)]
+pub(crate) enum SessionWith {
+    Statement(Statement),
+    DataModifying(Box<ValidatedDataModifyingCte>),
+}
+
 /// `WITH` 句の CTE をインライン展開のみで評価するか、`MATERIALIZED` 指定の具体化経路を
 /// 許すか（Issue #1860）。
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -22782,221 +23242,18 @@ fn validate_sql_tokens_impl(
         // `is_explain_statement`／`validate_select_statement` 側の先読みが
         // 先頭トークンで振り分けるため、本アームには到達しない
         // （out-of-scope。Issue #928 対象外事項）。
-        _ if is_with_statement => {
-            // SQL-35・Issue #1869: `WITH RECURSIVE` は非再帰経路（`cte::resolve_relation`）へ
-            // 一切流さず、ここで早期に返す（流すと自己参照が同名の実テーブルへ黙って解決される。
-            // fail-closed）。構文・再帰構造の検証（`42601`／`42P19`）を通過した後は、反復評価が
-            // 未実装（#1870）のため一律 `0A000` で終える。
-            if matches!(tokens.get(1), Some(Token::Ident(w)) if w.eq_ignore_ascii_case("RECURSIVE"))
-            {
-                let _clause = super::recursive_cte::validate_recursive_with(tokens, limits)?;
-                return Err(SqlSurfaceError::feature_not_supported(
-                    "WITH RECURSIVE evaluation is not supported yet",
-                ));
-            }
-            let mut p = Parser::new(tokens).with_nesting_limits(limits);
-            let ctes = p.parse_with_clause()?;
-            // Issue #1861（SQL-62）: セッションの最上位 SELECT の入口に限り、JOIN の主クエリで CTE を
-            // 入力として参照できる。InlineOnly（ビュー本文・cursor・COPY・CTAS・サブクエリ内側）は
-            // 従来どおり下の単一表の主クエリ解析へ流し、JOIN は `42601` のままにする（fail-closed）。
-            if cte_evaluation == CteEvaluation::AllowMaterialize && looks_like_join(p.remaining()) {
-                return validate_with_join_main(p.remaining(), &ctes, lookup, limits);
-            }
-            // Issue #1535: 主クエリも通常 SELECT と同じ修飾列正規化を通す（CTE 定義本体は対象外）。
-            let main_normalized =
-                super::qualified_column::normalize_single_table_qualifiers(p.remaining())?;
-            let main_tokens: &[Token] = &main_normalized;
-
-            if !matches!(main_tokens.first(), Some(Token::Keyword(Keyword::Select))) {
-                return Err(SqlSurfaceError::unsupported(
-                    "WITH must be followed by a SELECT statement",
-                ));
-            }
-            let main_contains_group_by = main_tokens.windows(2).any(|w| {
-                matches!(&w[0], Token::Ident(name) if name.eq_ignore_ascii_case("GROUP"))
-                    && matches!(w[1], Token::Keyword(Keyword::By))
-            });
-            // SQL-30・TASK-214（Issue #930）: トップレベル SELECT の判定
-            // （`contains_window_over`）と同じ理由で、`WITH` の主クエリでも
-            // `COUNT(*) OVER (...)` のようなウィンドウ項目を集計 SELECT と
-            // 誤判定しない（`OVER` の有無を見ずに関数名 + `'('` だけで判定すると、
-            // 集計関数名を使うウィンドウ項目を主クエリとして受理できなくなる）。
-            let main_contains_window_over = main_tokens.windows(3).any(|w| {
-                matches!(w[0], Token::Punct(')'))
-                    && matches!(&w[1], Token::Ident(name) if name.eq_ignore_ascii_case("OVER"))
-                    && matches!(w[2], Token::Punct('('))
-            });
-            let main_is_aggregate_select = !main_contains_window_over
-                && ((matches!(main_tokens.get(1), Some(Token::Ident(name)) if is_aggregate_function_name(name))
-                    && matches!(main_tokens.get(2), Some(Token::Punct('('))))
-                    || main_contains_group_by);
-            // Issue #1191（SQL-29 (b)）: 集計主クエリ（`GROUP BY`／`HAVING`／
-            // `ORDER BY`／`SELECT DISTINCT` を含む）も受理する。主クエリは
-            // 常に `subquery_ctx: None` で解析し（Issue #927 のサブクエリとの併用は
-            // 対象外。`docs/design/cte.md` 対象外節）、CTE の解決後は
-            // [`build_aggregate_from_resolved`] で通常の集計 SELECT と同じ
-            // [`ValidatedAggregate`] へ畳み込む（第 2 の実行器を作らない）。
-            let main = if is_distinct_modifier(main_tokens, 1) {
-                MainShape::Aggregate(parse_distinct_shape(main_tokens)?)
-            } else if main_is_aggregate_select {
-                MainShape::Aggregate(parse_aggregate_shape(
-                    main_tokens,
-                    None,
-                    false,
-                    false,
-                    limits,
-                )?)
-            } else {
-                match parse_select_shape(main_tokens, None, false, limits)? {
-                    ParsedSelect::Scan(shape) => MainShape::Scan(shape),
-                    ParsedSelect::Search(_) => {
-                        return Err(SqlSurfaceError::unsupported(
-                            "WITH does not support a ranked main query (ORDER BY / USING PLAN)",
-                        ));
-                    }
-                }
-            };
-            // SQL-56 (3)・Issue #1793: `WITH TIES` は CTE を伴う文では未対応（fail-closed）。
-            let main_has_ties = match &main {
-                MainShape::Scan(shape) => shape.with_ties,
-                MainShape::Aggregate(shape) => shape.group_by.as_ref().is_some_and(|g| g.with_ties),
-            };
-            if main_has_ties {
-                return Err(SqlSurfaceError::feature_not_supported(
-                    "WITH TIES is not supported in a statement with CTEs",
-                ));
-            }
-            let main_table_name = match &main {
-                MainShape::Scan(shape) => shape.table_name.clone(),
-                MainShape::Aggregate(shape) => shape.table_name.clone(),
-            };
-
-            // 参照されない CTE も含め、すべての定義本文を検証する（決定性・
-            // fail-closed のため。構造検証・存在確認を省略しない）。
-            // 上限カウンタ（`ResolveBudget`）は「1 回のトップレベル呼び出し
-            // （1 つの CTE 定義の事前検証、または主クエリの解決）」ごとに
-            // 新規生成する（`cte::MAX_CTE_REFERENCES` のドキュメント参照。
-            // Issue #928 レビュー指摘）。文全体で 1 つのカウンタを使い回すと、
-            // このループが各定義のチェーンを再帰的に辿るたびに参照回数が
-            // 名前ごとではなく呼び出し回数分累積し、定義数・連鎖の深さの
-            // どちらも上限内の有効なクエリを誤って `54000` で拒否する。
-            // 連鎖の深さは `MAX_CTE_NESTING_DEPTH` で呼び出しごとに独立して
-            // 上限が掛かるため、リセットしても DoS 対策としての上限は失われない。
-            //
-            // `resolve_relation` は `def.body.table_name`（FROM）の名前解決
-            // 連鎖だけを検証し、`def` 自身の射影・`WHERE`（`compose` が本来
-            // 適用する `check_columns_within_view`）は「他の CTE・主クエリから
-            // 参照され `compose` を通る」場合にしか検証されない。参照されない
-            // leaf CTE はどこからも `compose` されないため、FROM 解決結果
-            // （`resolved` の公開列集合）に対して `def` 自身の射影・`WHERE` を
-            // ここで明示的に検証しないと、先行 CTE が非公開列を隠していても
-            // 参照されない後続 CTE がそれを射影・条件に使う文を通してしまう
-            // （Issue #928 レビュー指摘: Codex P1・Cursor Bugbot Low、同一欠陥）。
-            //
-            // `resolved` の公開列集合が `None`（`Resolved::Table` か、連鎖の
-            // どの段も列を絞り込んでいない `Resolved::View { view_columns: None,
-            // .. }`）の場合、実テーブル直下の列存在検査は通常
-            // `sql::parser::bind` に委ねている（`sql::view::resolve_from` の
-            // 同種コメント参照）。これは**参照される** CTE・VIEW には妥当
-            // （最終的に `ValidatedScan` へ畳み込まれ bind を通る）だが、
-            // どこからも参照されない leaf CTE は bind に到達しないため、
-            // ここで実テーブルのスキーマへ問い合わせて代わりに検証する
-            // （PR #1100 追加レビュー指摘: Codex P1・Cursor Bugbot Low）。
-            // `TableLookup::table_columns` の既定実装は `Ok(None)`（検査省略・
-            // 後方互換）を返すため、これに対応しない `TableLookup` 実装
-            // （テスト用モック等）は無変更のまま今まで通り動作する。
-            let dm_exposed = validate_cte_definitions(&ctes, lookup, limits)?;
-            // 主クエリがデータ変更 CTE を参照する場合は、`RETURNING` の公開列だけを持つ仮のビュー解決結果で
-            // 既存の列スコープ検査を通す（結果は捨てる）。`RETURNING` なしの参照は 0A000。
-            let main_dm = ctes.iter().enumerate().find(|(_, d)| {
-                d.is_data_modifying() && d.name.eq_ignore_ascii_case(&main_table_name)
-            });
-            let resolved = if let Some((dm_idx, dm_def)) = main_dm {
-                let exposed = dm_exposed
-                    .get(dm_idx)
-                    .cloned()
-                    .flatten()
-                    .ok_or_else(super::cte::data_modifying_cte_unsupported)?;
-                let base_table = match &dm_def.body {
-                    super::cte::CteBody::DataModifying(b) => b.target_table.clone(),
-                    super::cte::CteBody::Select(_) => {
-                        return Err(super::cte::data_modifying_cte_unsupported());
-                    }
-                };
-                let base_allocated = lookup.table_is_allocated(&base_table)?;
-                super::view::Resolved::View {
-                    base_table,
-                    view_predicates: Vec::new(),
-                    view_columns: Some(exposed),
-                    column_map: None,
-                    check_predicates: Vec::new(),
-                    base_allocated,
-                }
-            } else {
-                let mut budget = super::cte::ResolveBudget::new();
-                super::cte::resolve_relation(
-                    lookup,
-                    &ctes,
-                    ctes.len(),
-                    &main_table_name,
-                    0,
-                    limits.max_cte_nesting_depth(),
-                    &mut budget,
-                )?
-            };
-            // Issue #1860（SQL-62 (1)(3)）: 明示 `MATERIALIZED` の CTE を主クエリが直接参照するときだけ
-            // 具体化経路を試す。エラー契約を揃えるため、まず従来のインライン解決・畳み込み
-            // （下の `inline`）で列スコープ等の検証を通し、その失敗はそのまま返す。外側が評価後射影形
-            // として受理できない形（式投影・UDF 述語等）は具体化せずインラインの結果を使う。
-            // データ変更 CTE を含む文は具体化せず、下の固定 0A000 に流す。
-            let materialized_idx = if cte_evaluation == CteEvaluation::AllowMaterialize
-                && !ctes.iter().any(|d| d.is_data_modifying())
-            {
-                ctes.iter().rposition(|def| {
-                    def.name.eq_ignore_ascii_case(&main_table_name)
-                        && def.materialization == super::cte::CteMaterialization::Materialized
-                })
-            } else {
-                None
-            };
-            let main_for_materialize = materialized_idx.map(|_| main.clone());
-            let inline: Result<Statement, SqlSurfaceError> = (|| match main {
-                MainShape::Scan(shape) => Ok(Statement::Scan(build_scan_from_resolved(
-                    shape.table_name,
-                    resolved,
-                    shape.projection,
-                    shape.where_predicates,
-                    shape.limit,
-                    shape.order_by,
-                    shape.offset,
-                    shape.window_items,
-                    shape.order_keys,
-                    shape.scalar_subquery_items,
-                )?)),
-                MainShape::Aggregate(shape) => {
-                    Ok(Statement::Aggregate(build_aggregate_from_resolved(
-                        shape.table_name,
-                        resolved,
-                        shape.items,
-                        shape.where_predicates,
-                        shape.group_by,
-                    )?))
-                }
-            })();
-            // SQL-63: データ変更 CTE を含む文は、構文・名前・列の検証をすべて通過しても実行しない
-            // （読み取りプランへ化けさせない。書き込み結線は #1876）。固定文言で入力断片を含めない。
-            if ctes.iter().any(|d| d.is_data_modifying()) {
-                inline?;
-                return Err(super::cte::data_modifying_cte_unsupported());
-            }
-            if let (Some(idx), Some(shape)) = (materialized_idx, main_for_materialize) {
-                let inline = inline?;
-                return Ok(
-                    materialized_cte_statement(&ctes, idx, shape, lookup, limits).unwrap_or(inline),
-                );
-            }
-            inline
-        }
+        _ if is_with_statement => match validate_with_statement(
+            tokens,
+            lookup,
+            limits,
+            cte_evaluation,
+            DmWith::RejectAsUnsupported,
+            LedgerMode::default(),
+        )? {
+            WithOutcome::Read(stmt) => Ok(stmt),
+            // 読み取り入口はデータ変更 CTE を決して実行しない（防御的に固定 0A000）。
+            WithOutcome::DataModifying(_) => Err(super::cte::data_modifying_cte_unsupported()),
+        },
         // TABLE-27・Issue #1715: `SET [SESSION] search_path` は TimeZone 系の振り分けより先に判定する
         // （`SET SESSION` の 2 語目が TimeZone 系の頭として扱われるため）。他の `SET` の挙動は不変。
         _ if is_set_statement && is_set_search_path_head(tokens) => {
