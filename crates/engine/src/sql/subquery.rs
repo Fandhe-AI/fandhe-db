@@ -42,17 +42,18 @@
 //! （PostgreSQL の名前解決順と同じく、内側スキーマに無く外側のいずれかのスコープに有る列名を
 //! 相関参照とみなす。どこにも無い名前は従来どおり内側の束縛が `42703`〔未定義列。Issue #2332〕で
 //! 拒否する）。外側スコープは `outer_scopes`（末尾が直近の外側）としてネストの深さ分を引き回す。
-//! 肯定形の相関 `EXISTS`（Issue #1842・SQL-61）は、内側 `WHERE` の連言を等価キー・残余・内側だけの
+//! 相関 `EXISTS`／`NOT EXISTS`（Issue #1842・#1843・SQL-61）は、内側 `WHERE` の連言を等価キー・残余・内側だけの
 //! 条件へ分解して（`sql::correlated_exists`）内側を 1 回だけ実体化し、外側の行ごとに判定する内部専用の葉
 //! （[`WherePredicate::CorrelatedExists`]。ハッシュ半結合、残余があれば行ごとの再評価。
-//! `sql::join::semi`）へ書き換える。それ以外の相関（`NOT EXISTS`・`IN`／スカラー・述語形 DML・集計の
-//! `FILTER`）は従来どおり `42601` で拒否する（fail-closed）。
+//! `sql::join::semi`）へ書き換える。`NOT EXISTS` は同じプローブの判定を反転した反結合として扱う。
+//! それ以外の相関（`IN`／スカラー・述語形 DML・集計の `FILTER`）は従来どおり `42601` で拒否する（fail-closed）。
 //!
 //! NULL 規則（三値論理。RLS 境界内＝可視行のみから決まる）:
 //! - `NOT IN`: 内側 0 行なら常に真（外側値が NULL でも真）。内側の結果に NULL を
 //!   1 つでも含めば真にならない。それ以外は distinct 値ごとの否定を連言で並べ、
 //!   外側値が NULL の行は UNKNOWN として除外される。
-//! - `NOT EXISTS`: 可視行が 1 件でもあれば常に偽、無ければ常に真。
+//! - `NOT EXISTS`: 可視行が 1 件でもあれば常に偽、無ければ常に真。相関 `NOT EXISTS` は外側の行ごとに
+//!   `EXISTS` の単純な否定（外側キーが NULL の行は真）で、内側 `OFFSET k` は「一致が `k` 件以下」。
 //! - スカラー: 0 行または NULL は UNKNOWN（否定は構文段で演算子反転済みのため
 //!   常に偽）。2 行以上は「先頭行を採用」せずエラー（`21000`。Issue #1404）。
 //!
@@ -328,28 +329,30 @@ pub(crate) fn resolve_where_predicates(
                     inner_tokens,
                     depth,
                 } => {
-                    // 相関の `NOT EXISTS` は反結合の範囲（#1843）で、従来どおり `42601`。
-                    let exists = matches!(
-                        resolve_exists_subquery(
-                            &inner_tokens,
-                            depth,
-                            false,
-                            outer_scopes,
-                            read_txn,
-                            ctx,
-                            lookup,
-                            udfs,
-                            group_limits,
-                            nesting_limits,
-                            result_limits,
-                            budget,
-                            in_value_budget,
-                            corr,
-                        )?,
-                        ExistsOutcome::Constant(true)
-                    );
-                    if exists {
-                        out.push(WherePredicate::Or(Vec::new()));
+                    // 相関の `NOT EXISTS`（Issue #1843）は反結合プローブ（negated）として返る。
+                    // 3 値すべてを明示的に扱う（`Probe` を取りこぼして述語を落とすと全行通過の
+                    // fail-open になるため、`matches!` 等の網羅しない判定にしない）。
+                    match resolve_exists_subquery(
+                        &inner_tokens,
+                        depth,
+                        false,
+                        outer_scopes,
+                        read_txn,
+                        ctx,
+                        lookup,
+                        udfs,
+                        group_limits,
+                        nesting_limits,
+                        result_limits,
+                        budget,
+                        in_value_budget,
+                        corr,
+                    )? {
+                        ExistsOutcome::Constant(true) => out.push(WherePredicate::Or(Vec::new())),
+                        ExistsOutcome::Constant(false) => {}
+                        ExistsOutcome::Probe(probe) => {
+                            out.push(WherePredicate::CorrelatedExists(probe))
+                        }
                     }
                 }
                 // 構文段の不変条件（量化比較の否定は反転済み）が破れた場合の fail-closed
@@ -513,10 +516,10 @@ fn aggregate_referenced_columns(validated: &ValidatedAggregate) -> HashSet<Strin
 /// 内側クエリの事前検査結果。`correlation` は外側スコープへの束縛結果（相関の IR。
 /// SQL-61・Issue #1841）。この経路では相関があれば事前検査が
 /// [`correlation::reject_if_correlated`] で拒否するため、返る時点では相関なしである
-/// （肯定形の相関 `EXISTS` は [`try_resolve_correlated_exists`] が先に処理する。Issue #1842）。
+/// （相関 `EXISTS`／`NOT EXISTS` は [`try_resolve_correlated_exists`] が先に処理する。Issue #1842・#1843）。
 struct InnerPrecheck {
     schema: TableSchema,
-    #[allow(dead_code)] // #1843 以降の反結合への書き換えが読む。
+    #[allow(dead_code)] // #1844 以降の相関 `IN`／スカラーへの書き換えが読む。
     correlation: correlation::Correlation,
 }
 
@@ -1064,7 +1067,6 @@ fn static_validate_subquery_predicates(
                 } => static_validate_exists(
                     inner_tokens,
                     *depth,
-                    false,
                     chain,
                     read_txn,
                     lookup,
@@ -1116,7 +1118,6 @@ fn static_validate_subquery_predicates(
                 static_validate_exists(
                     inner_tokens,
                     *depth,
-                    true,
                     chain,
                     read_txn,
                     lookup,
@@ -2813,12 +2814,13 @@ enum ExistsOutcome {
 /// `EXISTS (SELECT ...)` を解決する。非相関なら内側は [`InnerScanIntent::ExistenceOnly`] で評価し
 /// （投影不要・実質 `LIMIT` 1。PR #1103 追加 codex-review P1 指摘対応の詳細は
 /// [`execute_inner_scan_statement`] 参照）、可視行の有無を [`ExistsOutcome::Constant`] で返す。
-/// `NOT EXISTS` は呼び出し側が結果を反転する。
+/// 非相関の `NOT EXISTS` は呼び出し側が結果を反転する（相関は反結合プローブが反転を持つ）。
 ///
-/// 相関（Issue #1842・SQL-61）: `positive`（肯定形の `EXISTS`）かつ `corr` が有効なとき、内側が外側の
-/// 列を参照していれば [`resolve_correlated_exists`] で内側を 1 回だけ実体化したプローブを返す。
-/// `NOT EXISTS`（#1843）・相関 `IN`／スカラー（#1844）・`corr` 無効の文脈（述語形 DML・集計の
-/// `FILTER`）は従来どおり内側の事前検査が `42601` で拒否する。
+/// 相関（Issue #1842・#1843・SQL-61）: `corr` が有効なとき、内側が外側の列を参照していれば
+/// [`resolve_correlated_exists`] で内側を 1 回だけ実体化したプローブを返す。`positive` が偽
+/// （`NOT EXISTS`）ならプローブは反結合（判定を反転）として組み立てる。相関 `IN`／スカラー
+/// （#1844）・`corr` 無効の文脈（述語形 DML・集計の `FILTER`）は従来どおり内側の事前検査が
+/// `42601` で拒否する。
 #[allow(clippy::too_many_arguments)]
 fn resolve_exists_subquery(
     inner_tokens: &[Token],
@@ -2836,10 +2838,11 @@ fn resolve_exists_subquery(
     in_value_budget: &mut usize,
     corr: &CorrelatedCtx,
 ) -> Result<ExistsOutcome, SqlSurfaceError> {
-    if positive && corr.is_enabled() {
+    if corr.is_enabled() {
         if let Some(probe) = try_resolve_correlated_exists(
             inner_tokens,
             depth,
+            !positive,
             outer_scopes,
             read_txn,
             ctx,
@@ -2918,6 +2921,7 @@ fn classify_correlated_scan(
 fn try_resolve_correlated_exists(
     inner_tokens: &[Token],
     depth: usize,
+    negated: bool,
     outer_scopes: &[&TableSchema],
     read_txn: &impl crate::storage::read_source::ReadSource,
     ctx: &PolicyContext,
@@ -2945,6 +2949,7 @@ fn try_resolve_correlated_exists(
         validated,
         inner_schema,
         correlation,
+        negated,
         outer_scopes,
         read_txn,
         ctx,
@@ -3107,6 +3112,7 @@ fn resolve_correlated_exists(
     validated: ValidatedScan,
     inner_schema: TableSchema,
     correlation: correlation::Correlation,
+    negated: bool,
     outer_scopes: &[&TableSchema],
     read_txn: &impl crate::storage::read_source::ReadSource,
     ctx: &PolicyContext,
@@ -3238,6 +3244,7 @@ fn resolve_correlated_exists(
             keys,
             residual,
             min_matches,
+            negated,
             budget: corr.budget(),
             byte_cap: corr.byte_cap(),
         },
@@ -3246,14 +3253,13 @@ fn resolve_correlated_exists(
     Ok(CorrelatedProbeRef::new(probe))
 }
 
-/// 失敗時の静的検証（Issue #1432 の経路）での `EXISTS`。肯定形で内側が外側を参照するときは、
+/// 失敗時の静的検証（Issue #1432 の経路）での `EXISTS`／`NOT EXISTS`。内側が外側を参照するときは、
 /// 実行せずに [`prepare_correlated_exists`]（相関の分解・残余の束縛）と内側だけの連言の静的検証・
 /// 束縛までを行う（実行経路と同じ検査を共有する）。それ以外は従来の静的検証（相関は `42601`）。
 #[allow(clippy::too_many_arguments)]
 fn static_validate_exists(
     inner_tokens: &[Token],
     depth: usize,
-    positive: bool,
     outer_scopes: &[&TableSchema],
     read_txn: &impl crate::storage::read_source::ReadSource,
     lookup: &impl TableLookup,
@@ -3261,46 +3267,44 @@ fn static_validate_exists(
     nesting_limits: crate::nesting_limits::NestingLimits,
     result_limits: crate::result_limits::ResultLimits,
 ) -> Result<(), SqlSurfaceError> {
-    if positive {
-        if let Some((validated, inner_schema, correlation)) = classify_correlated_scan(
-            inner_tokens,
-            depth,
+    if let Some((validated, inner_schema, correlation)) = classify_correlated_scan(
+        inner_tokens,
+        depth,
+        outer_scopes,
+        read_txn,
+        lookup,
+        nesting_limits,
+    )? {
+        let mut prepared = prepare_correlated_exists(
+            validated,
+            &inner_schema,
+            &correlation,
             outer_scopes,
+            udfs,
+            result_limits,
+        )?;
+        let mut chain: Vec<&TableSchema> = outer_scopes.to_vec();
+        chain.push(&inner_schema);
+        static_validate_subquery_predicates(
+            &prepared.analysis.inner_only,
+            &chain,
             read_txn,
             lookup,
+            udfs,
             nesting_limits,
-        )? {
-            let mut prepared = prepare_correlated_exists(
-                validated,
-                &inner_schema,
-                &correlation,
-                outer_scopes,
-                udfs,
-                result_limits,
-            )?;
-            let mut chain: Vec<&TableSchema> = outer_scopes.to_vec();
-            chain.push(&inner_schema);
-            static_validate_subquery_predicates(
-                &prepared.analysis.inner_only,
-                &chain,
-                read_txn,
-                lookup,
-                udfs,
-                nesting_limits,
-                result_limits,
-            )?;
-            prepared.validated.where_predicates =
-                static_validation_predicates(&prepared.analysis.inner_only);
-            shape_for_materialization(&mut prepared.validated, &prepared.projected);
-            super::parser::bind_scan_with_dummy_flags(
-                &prepared.validated,
-                &inner_schema,
-                udfs,
-                &[],
-                &result_limits,
-            )?;
-            return Ok(());
-        }
+            result_limits,
+        )?;
+        prepared.validated.where_predicates =
+            static_validation_predicates(&prepared.analysis.inner_only);
+        shape_for_materialization(&mut prepared.validated, &prepared.projected);
+        super::parser::bind_scan_with_dummy_flags(
+            &prepared.validated,
+            &inner_schema,
+            udfs,
+            &[],
+            &result_limits,
+        )?;
+        return Ok(());
     }
     static_validate_inner_query(
         inner_tokens,

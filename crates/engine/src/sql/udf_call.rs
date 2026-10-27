@@ -854,6 +854,7 @@ pub enum BoundExpr {
     /// 相関 `EXISTS` の外側の行ごとの判定（Issue #1842・SQL-61 ポインタ）。`sql::subquery` が生成する
     /// `WherePredicate::CorrelatedExists` の束縛結果としてのみ作られる。内側は 1 回だけ実体化済みの
     /// プローブ（`sql::join::semi`）で、外側の行スカラーと `id` から常に `Bool` を返す。
+    /// `NOT EXISTS`（Issue #1843）の否定はプローブ内で適用済み。
     CorrelatedExists(crate::sql::join::semi::CorrelatedProbeRef),
     /// テーブルの `VECTOR` 列参照（1 テーブルにつき高々 1 本、TABLE-1。
     /// `catalog::encode_schema` が内部で呼ぶ `validate_schema` により

@@ -101,19 +101,31 @@ fn sql61_qualified_outer_refs_reach_binding_and_fail_closed_as_correlated() {
     let (core, ctx, _g) = setup();
     for sql in [
         // 肯定形の相関 `EXISTS` は SQL-61（Issue #1842）で実行できる
-        // （`tests/sql61_correlated_exists.rs`）。ここでは反結合以降の範囲（#1843・#1844）を固定する。
-        "SELECT id FROM docs x WHERE NOT EXISTS (SELECT id FROM refs WHERE lang = x.lang LIMIT 1) LIMIT 10",
+        // （`tests/sql61_correlated_exists.rs`）。反結合（#1843）も同様。ここでは #1844 の範囲を固定する。
         "SELECT id FROM docs x WHERE lang IN (SELECT lang FROM refs WHERE x.id = 1 LIMIT 10) LIMIT 10",
         "SELECT id FROM docs x WHERE lang NOT IN (SELECT lang FROM refs WHERE x.id = 1 LIMIT 10) LIMIT 10",
         "SELECT id FROM docs x WHERE lang = (SELECT lang FROM refs WHERE x.id = id LIMIT 1) LIMIT 10",
         "SELECT id FROM docs x WHERE lang = (SELECT COUNT(x.id) FROM refs) LIMIT 10",
         "SELECT id FROM docs x WHERE lang IN (SELECT lang FROM refs WHERE id IN (SELECT id FROM refs WHERE lang = x.lang LIMIT 10) LIMIT 10) LIMIT 10",
-        "SELECT id FROM docs WHERE NOT EXISTS (SELECT id FROM refs WHERE docs.lang = lang LIMIT 1) LIMIT 10",
+        "SELECT id FROM docs WHERE lang IN (SELECT lang FROM refs WHERE docs.lang = lang LIMIT 10) LIMIT 10",
     ] {
         let (code, msg) = err(&core, &ctx, sql);
         assert_eq!(code, "42601", "{sql}: {msg}");
         assert!(msg.contains("correlated"), "{sql}: {msg}");
         assert!(!msg.contains('\u{2}'), "{sql}: {msg:?}");
+    }
+}
+
+#[test]
+fn sql61_qualified_outer_refs_in_not_exists_are_executed_as_anti_join() {
+    // 否定形の相関 `EXISTS`（Issue #1843）は束縛段を通って反結合として実行される。
+    // docs は {1: en, 2: ja}、refs は {1: en} なので ja の docs 2 だけが残る。
+    let (core, ctx, _g) = setup();
+    for sql in [
+        "SELECT id FROM docs x WHERE NOT EXISTS (SELECT id FROM refs WHERE lang = x.lang LIMIT 1) LIMIT 10",
+        "SELECT id FROM docs WHERE NOT EXISTS (SELECT id FROM refs WHERE docs.lang = lang LIMIT 1) LIMIT 10",
+    ] {
+        assert_eq!(ids(&core, &ctx, sql), vec![2], "{sql}");
     }
 }
 
@@ -137,10 +149,21 @@ fn sql61_outer_ref_in_order_by_expr_is_correlated() {
 #[test]
 fn sql61_unqualified_outer_only_column_is_correlated() {
     let (core, ctx, _g) = setup();
+    // 非修飾の外側専用列も相関として束縛される。`outer_only` は全行 NULL で `=` は真にならない
+    // ため、反結合（Issue #1843）は全外側行を返す。
+    assert_eq!(
+        ids(
+            &core,
+            &ctx,
+            "SELECT id FROM docs WHERE NOT EXISTS (SELECT id FROM refs WHERE lang = outer_only LIMIT 1) LIMIT 10"
+        ),
+        vec![1, 2]
+    );
+    // 未対応の相関 `IN`（#1844）は引き続き 42601。
     let (code, msg) = err(
         &core,
         &ctx,
-        "SELECT id FROM docs WHERE NOT EXISTS (SELECT id FROM refs WHERE lang = outer_only LIMIT 1) LIMIT 10",
+        "SELECT id FROM docs WHERE lang IN (SELECT lang FROM refs WHERE lang = outer_only LIMIT 10) LIMIT 10",
     );
     assert_eq!(code, "42601");
     assert!(msg.contains("correlated"), "{msg}");
@@ -216,7 +239,7 @@ fn sql61_errors_do_not_depend_on_other_tenant_rows() {
     seed(&core, &b, "refs", 8, "de");
     seed(&core, &b, "refs", 9, "it");
     for sql in [
-        "SELECT id FROM docs x WHERE NOT EXISTS (SELECT id FROM refs WHERE lang = x.lang LIMIT 1) LIMIT 10",
+        "SELECT id FROM docs x WHERE lang IN (SELECT lang FROM refs WHERE lang = x.lang LIMIT 10) LIMIT 10",
         "SELECT id FROM docs x WHERE EXISTS (SELECT id FROM refs WHERE lang = x.zz LIMIT 1) LIMIT 10",
         "SELECT id FROM docs x WHERE EXISTS (SELECT id FROM refs WHERE zzz.lang = lang LIMIT 1) LIMIT 10",
     ] {

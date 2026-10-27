@@ -450,7 +450,6 @@ fn correlated_subqueries_are_rejected_with_42601() {
         format!("SELECT id FROM {ITEMS} WHERE qty = (SELECT qty FROM {REFS} WHERE label = outer_only LIMIT 1) LIMIT 100"),
         format!("SELECT id FROM {ITEMS} WHERE qty IN (SELECT qty FROM {REFS} WHERE label = outer_only LIMIT 10) LIMIT 100"),
         format!("SELECT id FROM {ITEMS} WHERE qty NOT IN (SELECT qty FROM {REFS} WHERE label = outer_only LIMIT 10) LIMIT 100"),
-        format!("SELECT id FROM {ITEMS} WHERE NOT EXISTS (SELECT id FROM {REFS} WHERE label = outer_only LIMIT 1) LIMIT 100"),
         // 内側の投影が外側だけにある列を参照する。
         format!("SELECT id FROM {ITEMS} WHERE name IN (SELECT outer_only FROM {REFS} LIMIT 10) LIMIT 100"),
         // 内側の集計引数・GROUP BY が外側だけにある列を参照する。
@@ -472,6 +471,15 @@ fn correlated_subqueries_are_rejected_with_42601() {
             &format!("SELECT id FROM {ITEMS} WHERE EXISTS (SELECT id FROM {REFS} WHERE label = outer_only LIMIT 1) LIMIT 100")
         ),
         vec![1]
+    );
+    // 否定形（Issue #1843）は同じ一致で偽になるため空。
+    assert_eq!(
+        ids(
+            &core,
+            &ctx,
+            &format!("SELECT id FROM {ITEMS} WHERE NOT EXISTS (SELECT id FROM {REFS} WHERE label = outer_only LIMIT 1) LIMIT 100")
+        ),
+        Vec::<u64>::new()
     );
     // どのスコープにも無い名前は従来どおり 22000（unknown column）。
     let (code, _) = err_code(

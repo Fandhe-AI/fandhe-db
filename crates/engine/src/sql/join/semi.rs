@@ -20,6 +20,10 @@
 //! NULL 規則: 外側キーに NULL があれば偽（`EXISTS` は UNKNOWN にならない）。内側キーに NULL を
 //! 含む行はバケットへ入れない（`=` は NULL で真にならない）。
 //!
+//! 反結合（`NOT EXISTS`、Issue #1843）: 同じプローブの判定を [`CorrelatedProbe::eval`] の出口で
+//! 反転するだけで、構築・予算・件数の扱いは `EXISTS` と共通。`EXISTS` は UNKNOWN にならないため
+//! 単純な否定になり、外側キーが NULL の行は真（返る）、`OFFSET k` は「一致が `k` 件以下」になる。
+//!
 //! 情報漏えい対策: 内側行はすべて呼び出したセッションの可視行だけ。[`CorrelatedProbeRef`] の
 //! `Debug` は行データを一切出さない。エラー文言は静的文字列のみ。バケットの反復順は結果に
 //! 影響しない（バケット内は走査順の `Vec`、ハッシュ表は引くだけで走査しない）。
@@ -152,6 +156,8 @@ pub struct CorrelatedProbe {
     residual: Option<Residual>,
     /// 一致が必要な最小件数（内側 `OFFSET k` の意味の保存。`k + 1`）。
     min_matches: usize,
+    /// 反結合（`NOT EXISTS`、Issue #1843）。`eval` の出口で判定を反転する。
+    negated: bool,
     budget: Arc<CorrelatedBudget>,
     /// 外側スキーマで評価に必要な論理列インデックス（キーと残余が参照する列。重複なし・昇順）。
     outer_columns: Vec<usize>,
@@ -171,6 +177,8 @@ pub(crate) struct ProbeSpec {
     pub(crate) keys: Vec<OuterKey>,
     pub(crate) residual: Option<Residual>,
     pub(crate) min_matches: usize,
+    /// 反結合（`NOT EXISTS`）か。`EXISTS` は UNKNOWN にならないため単純な否定になる。
+    pub(crate) negated: bool,
     pub(crate) budget: Arc<CorrelatedBudget>,
     /// 内側行の保持に使える推定バイト量の上限（確保前に計上して超過なら `54000`）。
     pub(crate) byte_cap: usize,
@@ -197,6 +205,7 @@ impl CorrelatedProbe {
             keys,
             residual,
             min_matches,
+            negated,
             budget,
             byte_cap,
         } = spec;
@@ -295,6 +304,7 @@ impl CorrelatedProbe {
             },
             residual,
             min_matches,
+            negated,
             budget,
             outer_columns,
         })
@@ -307,7 +317,18 @@ impl CorrelatedProbe {
 
     /// 外側の 1 行に対して判定する。`row_scalars` は外側スキーマの論理列インデックスで引く
     /// 行スカラー値のビュー、`id` は外側の行 `id`。結果は常に真偽（UNKNOWN にならない）。
+    /// 反結合（`NOT EXISTS`）は `EXISTS` の判定をこの唯一の出口で反転する（外側キーが NULL の
+    /// 早期偽も反転され、その外側行は返る。否定の取りこぼしによる fail-open を作らない）。
     pub(crate) fn eval(
+        &self,
+        row_scalars: &[Option<ScalarRef<'_>>],
+        id: u64,
+    ) -> Result<bool, SqlSurfaceError> {
+        self.eval_exists(row_scalars, id).map(|e| e != self.negated)
+    }
+
+    /// 否定を適用する前の `EXISTS` 判定（[`Self::eval`] 専用）。
+    fn eval_exists(
         &self,
         row_scalars: &[Option<ScalarRef<'_>>],
         id: u64,
@@ -486,11 +507,16 @@ mod tests {
     }
 
     fn probe(min_matches: usize, keys: Vec<Cell>) -> CorrelatedProbe {
+        probe_with(min_matches, false, keys)
+    }
+
+    fn probe_with(min_matches: usize, negated: bool, keys: Vec<Cell>) -> CorrelatedProbe {
         CorrelatedProbe::build(
             ProbeSpec {
                 keys: int_key(),
                 residual: None,
                 min_matches,
+                negated,
                 budget: budget(),
                 byte_cap: usize::MAX,
             },
@@ -510,6 +536,37 @@ mod tests {
         assert!(!p.eval(&[Some(ScalarRef::BigInt(8))], 1).unwrap());
         // 外側キーが NULL の行は偽（UNKNOWN にならない）。
         assert!(!p.eval(&[None], 1).unwrap());
+    }
+
+    #[test]
+    fn anti_join_inverts_every_exit_including_null_outer_key() {
+        let p = probe_with(
+            1,
+            true,
+            vec![Cell::SignedInteger(7), Cell::Integer(9), Cell::Null],
+        );
+        // 一致あり → 偽、一致なし → 真。内側の NULL キー行は不一致。
+        assert!(!p.eval(&[Some(ScalarRef::Integer(7))], 1).unwrap());
+        assert!(p.eval(&[Some(ScalarRef::BigInt(8))], 1).unwrap());
+        // 外側キーが NULL の行は EXISTS が偽のため NOT EXISTS は真。
+        assert!(p.eval(&[None], 1).unwrap());
+        // 範囲外の外側列は否定しても fail-closed のまま。
+        assert_eq!(p.eval(&[], 1).unwrap_err().wire_code(), "XX000");
+    }
+
+    #[test]
+    fn anti_join_inverts_offset_threshold() {
+        let p = probe_with(
+            2,
+            true,
+            vec![
+                Cell::SignedInteger(1),
+                Cell::SignedInteger(1),
+                Cell::SignedInteger(2),
+            ],
+        );
+        assert!(!p.eval(&[Some(ScalarRef::BigInt(1))], 1).unwrap());
+        assert!(p.eval(&[Some(ScalarRef::BigInt(2))], 1).unwrap());
     }
 
     #[test]
@@ -548,6 +605,7 @@ mod tests {
                 keys: int_key(),
                 residual: None,
                 min_matches: 1,
+                negated: false,
                 budget: budget(),
                 byte_cap: 8,
             },
