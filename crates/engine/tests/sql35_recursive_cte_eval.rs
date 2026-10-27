@@ -363,7 +363,7 @@ fn empty_anchor_and_empty_first_iteration() {
     );
 }
 
-/// 反復回数の上限（暫定の固定値 1000。再帰項の実行回数で数え、0 行になる最後の実行も含む）。
+/// 反復回数の上限（既定値 1000＝ハード上限。再帰項の実行回数で数え、0 行になる最後の実行も含む）。
 /// `--max-result-rows` を上限回数より大きくして、行数の上限が先に効かないようにする。
 #[test]
 fn iteration_limit_boundary() {
@@ -379,6 +379,78 @@ fn iteration_limit_boundary() {
     let over = "WITH RECURSIVE t(n) AS (SELECT 1 UNION ALL SELECT n + 1 FROM t WHERE n < 1001) \
                 SELECT count(*) FROM t";
     assert_eq!(code(&core, "alice", over), "54000");
+}
+
+/// 起動時設定を注入した `EngineCore`（`--max-result-rows` も明示）を作る。
+fn core_with_recursive_limits(
+    tag: &str,
+    cfg: engine::recursive_cte_limits::RecursiveCteLimits,
+    max_result_rows: usize,
+) -> (EngineCore, CleanupGuard) {
+    let path = unique_db_path(tag);
+    let guard = CleanupGuard(path.clone());
+    let storage = Storage::open(&path).expect("open storage");
+    let core = EngineCore::from_storage(storage, Box::new(CpuScalarProvider))
+        .with_result_limits(engine::result_limits::ResultLimits::new(max_result_rows))
+        .with_recursive_cte_limits(cfg);
+    (core, guard)
+}
+
+fn seq_count(upper: u32) -> String {
+    format!(
+        "WITH RECURSIVE t(n) AS (SELECT 1 UNION ALL SELECT n + 1 FROM t WHERE n < {upper}) \
+         SELECT count(*) FROM t"
+    )
+}
+
+/// 反復回数の設定値の境界（SQL-35 (3)・SQL-46 (4)）。上限ちょうどは受理、1 超過で `54000`。
+/// 行数の上限が先に効かないよう、行数側は大きくしておく。
+#[test]
+fn configured_iteration_limit_boundary() {
+    let (core, _g) = core_with_recursive_limits(
+        "sql35-recursive-cfg-iter",
+        engine::recursive_cte_limits::RecursiveCteLimits::new(10, 100_000),
+        5_000,
+    );
+    assert_eq!(rows(&core, "alice", &seq_count(10)), col(&["10"]));
+    assert_eq!(code(&core, "alice", &seq_count(11)), "54000");
+}
+
+/// 累積行数の設定値の境界（SQL-35 (3)・SQL-46 (4)）。50 行ちょうどは受理、51 行で `54000`。
+/// `--max-result-rows` を設定値より大きくして、設定値が先に効くようにする。
+#[test]
+fn configured_row_limit_boundary() {
+    let (core, _g) = core_with_recursive_limits(
+        "sql35-recursive-cfg-rows",
+        engine::recursive_cte_limits::RecursiveCteLimits::new(1_000, 50),
+        5_000,
+    );
+    assert_eq!(rows(&core, "alice", &seq_count(50)), col(&["50"]));
+    assert_eq!(code(&core, "alice", &seq_count(51)), "54000");
+}
+
+/// 下げた構成でも、終了条件の無い再帰は `54000` で止まる（SQL-35 (3)）。
+#[test]
+fn unbounded_recursion_stops_with_lowered_limits() {
+    let (core, _g) = core_with_recursive_limits(
+        "sql35-recursive-cfg-unbounded",
+        engine::recursive_cte_limits::RecursiveCteLimits::new(5, 20),
+        5_000,
+    );
+    let sql = "WITH RECURSIVE t(n) AS (SELECT 1 UNION ALL SELECT n + 1 FROM t) SELECT n FROM t";
+    assert_eq!(code(&core, "alice", sql), "54000");
+}
+
+/// 設定値（行数 100,000）が `--max-result-rows` より大きくても、小さい方が効く（SQL-46 (6)）。
+#[test]
+fn configured_row_limit_composes_with_result_cap() {
+    let (core, _g) = core_with_recursive_limits(
+        "sql35-recursive-cfg-compose",
+        engine::recursive_cte_limits::RecursiveCteLimits::new(1_000, 100_000),
+        5,
+    );
+    assert_eq!(rows(&core, "alice", &seq_count(5)), col(&["5"]));
+    assert_eq!(code(&core, "alice", &seq_count(6)), "54000");
 }
 
 /// 終了条件の無い再帰は部分結果を返さず `54000` で止まる。

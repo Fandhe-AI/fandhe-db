@@ -23,8 +23,9 @@
 //!
 //! 上限: 反復回数・累積行数・累積バイト数を確保前に判定し、超過は結果を打ち切らず文全体を
 //! `54000` で拒否する（部分結果を返さない）。反復ごとに `interrupt::check()` へ協調する
-//! （`57014`）。暫定の固定上限は [`RecursiveLimits`] の既定値で、起動時設定への差し替えは
-//! #1871 の担当。
+//! （`57014`）。反復回数・累積行数の上限は起動時設定
+//! （`EngineCore::with_recursive_cte_limits`。Issue #1871・SQL-35 (3)・SQL-46）で、
+//! [`RecursiveLimits::from_settings`] が呼び出し段の `--max-result-rows` と合成する。
 
 use std::collections::HashMap;
 
@@ -43,14 +44,6 @@ use super::view_buffered::{
     normalize_cell, rename_body_columns, synth_schema, where_matches_for_row, with_scanned,
 };
 
-/// 暫定の反復回数上限（再帰項の実行回数。最後の「0 行になる実行」を含む）。#1871 が起動時設定へ
-/// 差し替える前提の固定値で、`crates/engine/src/recursive_cte_limits.rs`（`correlated_limits.rs`
-/// 流儀）へ移す。
-pub(crate) const DEFAULT_MAX_RECURSIVE_ITERATIONS: usize = 1_000;
-
-/// 暫定の累積行数上限（アンカー行を含む全反復の合計）。#1871 が起動時設定へ差し替える前提。
-pub(crate) const DEFAULT_MAX_RECURSIVE_ROWS: usize = 100_000;
-
 /// 再帰評価の実行上限。
 #[derive(Debug, Clone, Copy)]
 pub(crate) struct RecursiveLimits {
@@ -63,12 +56,16 @@ pub(crate) struct RecursiveLimits {
 }
 
 impl RecursiveLimits {
-    /// 呼び出し段の `--max-result-rows`（SQL-34）を累積行数の上限へ畳み込んだ上限を返す。
-    /// 具体化 CTE と同じく、CTE 全体の行数が呼び出し段の上限を超えたら `54000` にする。
-    pub(crate) fn with_result_cap(max_result_rows: usize) -> Self {
+    /// 起動時設定（[`crate::recursive_cte_limits::RecursiveCteLimits`]）と呼び出し段の
+    /// `--max-result-rows`（SQL-34）から上限を組み立てる。累積行数は両者の小さい方で、
+    /// 具体化 CTE と同じく CTE 全体の行数が呼び出し段の上限を超えたら `54000` にする。
+    pub(crate) fn from_settings(
+        cfg: crate::recursive_cte_limits::RecursiveCteLimits,
+        max_result_rows: usize,
+    ) -> Self {
         Self {
-            max_iterations: DEFAULT_MAX_RECURSIVE_ITERATIONS,
-            max_rows: DEFAULT_MAX_RECURSIVE_ROWS.min(max_result_rows),
+            max_iterations: cfg.max_iterations(),
+            max_rows: cfg.max_rows().min(max_result_rows),
             max_bytes: crate::arena::MAX_ARENA_TOTAL_BYTES,
         }
     }

@@ -1283,6 +1283,10 @@ pub struct EngineCore {
     /// 相関サブクエリの再評価回数上限（Issue #1847）。[`Self::with_correlated_limits`] のみ
     /// （起動時 1 回）。`sql::correlated_exists::CorrelatedCtx` の予算へ渡る。
     correlated_limits: crate::correlated_limits::CorrelatedLimits,
+    /// 再帰 CTE の反復回数・累積行数の上限（Issue #1871・SQL-35 (3)）。
+    /// [`Self::with_recursive_cte_limits`] のみが起動時に 1 回だけ差し替え、
+    /// `sql::recursive_eval` の実行段だけに効く。
+    recursive_cte_limits: crate::recursive_cte_limits::RecursiveCteLimits,
     /// 明示 `LIMIT` の範囲上限（Issue #1555）。差し替えは [`Self::with_result_limits`]
     /// のみ（起動時 1 回）。文の `LIMIT`・`FETCH n`・集合演算／JOIN 文の `LIMIT` の
     /// 範囲判定にだけ効き、`OFFSET`・枝行数・サブクエリ内側行数の上限とは連動しない。
@@ -2775,6 +2779,7 @@ impl EngineCore {
             nesting_limits: crate::nesting_limits::NestingLimits::default(),
             join_limits: crate::join_limits::JoinSizeLimits::default(),
             correlated_limits: crate::correlated_limits::CorrelatedLimits::default(),
+            recursive_cte_limits: crate::recursive_cte_limits::RecursiveCteLimits::default(),
             result_limits: crate::result_limits::ResultLimits::default(),
             materialization_contexts: None,
             partitioned_dml_limits: crate::sql::parser::PartitionedDmlLimits::default(),
@@ -3178,6 +3183,22 @@ impl EngineCore {
     /// 現在の相関サブクエリ上限（Issue #1847）。
     pub fn correlated_limits(&self) -> crate::correlated_limits::CorrelatedLimits {
         self.correlated_limits
+    }
+
+    /// 再帰 CTE の反復回数・累積行数の上限
+    /// （[`crate::recursive_cte_limits::RecursiveCteLimits`]）を差し替える。wire-server の
+    /// 起動時 CLI フラグからだけ呼ぶ。呼ばなければハード上限と同値の既定値（Issue #1871）。
+    pub fn with_recursive_cte_limits(
+        mut self,
+        limits: crate::recursive_cte_limits::RecursiveCteLimits,
+    ) -> Self {
+        self.recursive_cte_limits = limits;
+        self
+    }
+
+    /// 現在の再帰 CTE 上限設定。
+    pub fn recursive_cte_limits(&self) -> crate::recursive_cte_limits::RecursiveCteLimits {
+        self.recursive_cte_limits
     }
 
     /// 束縛済み計画の `LIMIT` を設定値の範囲で再検査する（Issue #1555 の多層防御）。
@@ -9514,7 +9535,8 @@ impl EngineCore {
                     &schemas,
                     session.udfs(),
                     &join_limits,
-                    crate::sql::recursive_eval::RecursiveLimits::with_result_cap(
+                    crate::sql::recursive_eval::RecursiveLimits::from_settings(
+                        self.recursive_cte_limits,
                         limits.max_result_rows(),
                     ),
                 )?;

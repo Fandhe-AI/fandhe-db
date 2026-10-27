@@ -194,6 +194,14 @@
 //! `wire_server::correlated_limits_opt::resolve` に一本化し、
 //! `EngineCore::with_correlated_limits` へ 1 回だけ注入する（`docs/design/sql-subquery.md`）。
 //!
+//! `--max-recursive-cte-iterations <1-1000>`・`--max-recursive-cte-rows <1-100000>`
+//! （Issue #1871。SQL-35 (3)・SQL-46）: 再帰 CTE の反復回数（再帰項の実行回数）と累積行数
+//! （アンカー行を含む）の上限を、プロセス全体に対して起動時に**下げる方向だけ**設定できる
+//! opt-in 注入点（未指定は現行のハード上限と同値＝挙動不変）。超過は `54000`。範囲外・非数値・
+//! 値欠落・重複指定はいずれも fail-closed で起動エラー。値の解決は
+//! `wire_server::recursive_cte_limits_opt::resolve` に一本化し、
+//! `EngineCore::with_recursive_cte_limits` へ 1 回だけ注入する（`docs/design/recursive-cte.md`）。
+//!
 //! `--max-result-rows`（Issue #1555・#2211。SQL-34・SQL-46）: 明示 `LIMIT` の範囲上限と `LIMIT` 省略時の結果行数上限
 //! （`1`〜`100000`・既定 10000）を、プロセス全体に対して起動時に**上げ下げ両方向**へ設定できる
 //! opt-in 注入点（未指定は従来の 10000 と同値＝挙動不変）。走査・kNN の `LIMIT k`・`FETCH n`・
@@ -470,6 +478,8 @@ fn run_server(args: &[String]) -> ExitCode {
     let mut max_join_input_rows_raw: Option<String> = None;
     let mut max_join_output_rows_raw: Option<String> = None;
     let mut max_correlated_reevaluations_raw: Option<String> = None;
+    let mut max_recursive_cte_iterations_raw: Option<String> = None;
+    let mut max_recursive_cte_rows_raw: Option<String> = None;
     let mut max_result_rows_raw: Option<String> = None;
     let mut write_lock_wait_raw: Option<String> = None;
     let mut read_timeout_secs_raw: Option<String> = None;
@@ -1280,6 +1290,46 @@ fn run_server(args: &[String]) -> ExitCode {
                 max_correlated_reevaluations_raw = Some(v.clone());
                 i += 2;
             }
+            wire_server::recursive_cte_limits_opt::MAX_RECURSIVE_CTE_ITERATIONS_FLAG => {
+                let Some(v) = args.get(i + 1) else {
+                    engine::log_stderr!(
+                        "wire-server: {} requires a non-negative integer argument",
+                        wire_server::recursive_cte_limits_opt::MAX_RECURSIVE_CTE_ITERATIONS_FLAG
+                    );
+                    return ExitCode::FAILURE;
+                };
+                // Issue #1871: 他の起動時構成フラグと同じく 2 回目以降の指定を
+                // fail-closed に拒否する（last-wins にしない）。
+                if max_recursive_cte_iterations_raw.is_some() {
+                    engine::log_stderr!(
+                        "wire-server: {} specified more than once",
+                        wire_server::recursive_cte_limits_opt::MAX_RECURSIVE_CTE_ITERATIONS_FLAG
+                    );
+                    return ExitCode::FAILURE;
+                }
+                max_recursive_cte_iterations_raw = Some(v.clone());
+                i += 2;
+            }
+            wire_server::recursive_cte_limits_opt::MAX_RECURSIVE_CTE_ROWS_FLAG => {
+                let Some(v) = args.get(i + 1) else {
+                    engine::log_stderr!(
+                        "wire-server: {} requires a non-negative integer argument",
+                        wire_server::recursive_cte_limits_opt::MAX_RECURSIVE_CTE_ROWS_FLAG
+                    );
+                    return ExitCode::FAILURE;
+                };
+                // Issue #1871: 他の起動時構成フラグと同じく 2 回目以降の指定を
+                // fail-closed に拒否する（last-wins にしない）。
+                if max_recursive_cte_rows_raw.is_some() {
+                    engine::log_stderr!(
+                        "wire-server: {} specified more than once",
+                        wire_server::recursive_cte_limits_opt::MAX_RECURSIVE_CTE_ROWS_FLAG
+                    );
+                    return ExitCode::FAILURE;
+                }
+                max_recursive_cte_rows_raw = Some(v.clone());
+                i += 2;
+            }
             wire_server::result_limits_opt::MAX_RESULT_ROWS_FLAG => {
                 let Some(v) = args.get(i + 1) else {
                     engine::log_stderr!(
@@ -1900,6 +1950,21 @@ fn run_server(args: &[String]) -> ExitCode {
         }
     };
 
+    // Issue #1871: 再帰 CTE の反復回数・累積行数上限を bind・ユーザーストア読込より前に
+    // 解決する（fail-closed）。未指定は `RecursiveCteLimits::default()`＝ハード上限＝現行挙動。
+    let recursive_cte_limits = match wire_server::recursive_cte_limits_opt::resolve(
+        wire_server::recursive_cte_limits_opt::RecursiveCteLimitsRawFlags {
+            max_iterations: max_recursive_cte_iterations_raw.as_deref(),
+            max_rows: max_recursive_cte_rows_raw.as_deref(),
+        },
+    ) {
+        Ok(limits) => limits,
+        Err(e) => {
+            engine::log_stderr!("wire-server: invalid recursive CTE limit configuration: {e}");
+            return ExitCode::FAILURE;
+        }
+    };
+
     // Issue #1555: 明示 `LIMIT` の範囲上限を bind・ユーザーストア読込より前に解決する
     // （fail-closed）。未指定は `ResultLimits::default()`＝従来の 10,000＝現行挙動。
     let result_limits =
@@ -2378,6 +2443,8 @@ fn run_server(args: &[String]) -> ExitCode {
     core = core.with_join_limits(join_limits);
     // Issue #1847: 未指定でも常に呼ぶ（既定はハード上限と同値で、未注入と挙動が同一）。
     core = core.with_correlated_limits(correlated_limits);
+    // Issue #1871: 未指定でも常に呼ぶ（既定はハード上限と同値で、未注入と挙動が同一）。
+    core = core.with_recursive_cte_limits(recursive_cte_limits);
     // Issue #1555: 未指定でも常に呼ぶ（既定は従来の 10,000 と同値で、未注入と挙動が同一）。
     core = core.with_result_limits(result_limits);
     // Issue #1664（TABLE-42）: MATERIALIZED VIEW の初回実体化の対象文脈は、認証構成（ユーザー
