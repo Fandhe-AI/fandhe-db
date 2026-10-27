@@ -191,16 +191,30 @@ fn depth0_words(tokens: &[Token], words: &[&str]) -> Vec<usize> {
     out
 }
 
-/// 全体が 1 組の外側括弧で囲まれていれば 1 段だけ剥がす。
-fn strip_outer_parens(tokens: &[Token]) -> &[Token] {
-    if matches!(tokens.first(), Some(Token::Punct('('))) {
-        if let Ok((inner, after)) = split_parenthesized(tokens) {
-            if after.is_empty() {
-                return inner;
-            }
+/// 再帰項の外側を囲む括弧を繰り返し剥がす。戻り値は（内側, 括弧を剥がしたか, 括弧の後ろに
+/// 深さ 0 の `ORDER BY`／`LIMIT`／`OFFSET`／`FETCH` が続いていたか）。後ろの句は項の区切りとして
+/// 扱い、項本体を部分クエリと誤判定させない（SQL-35 の判定順序: 構文 → 構造 → 機能ゲート）。
+fn peel_term(mut tokens: &[Token]) -> (&[Token], bool, bool) {
+    let mut wrapped = false;
+    let mut trailing = false;
+    while matches!(tokens.first(), Some(Token::Punct('('))) {
+        let Ok((inner, after)) = split_parenthesized(tokens) else {
+            break;
+        };
+        let tail_clause = matches!(
+            after.first(),
+            Some(Token::Keyword(Keyword::Order | Keyword::Limit))
+        ) || is_word(after.first(), "OFFSET")
+            || is_word(after.first(), "FETCH");
+        if after.is_empty() || tail_clause {
+            trailing |= tail_clause;
+            wrapped = true;
+            tokens = inner;
+        } else {
+            break;
         }
     }
-    tokens
+    (tokens, wrapped, trailing)
 }
 
 fn structural(tokens: &[Token], limits: NestingLimits) -> Result<Statement, SqlSurfaceError> {
@@ -273,6 +287,8 @@ fn validate_recursive_body(
 
     let unions = depth0_words(body, &["UNION"]);
     let Some(&u) = unions.last() else {
+        // 構文不正は構造エラーより優先して `42601` にする。
+        structural(body, limits)?;
         return Err(bad(
             "recursive query must be UNION [ALL] of non-recursive and recursive terms",
         ));
@@ -287,14 +303,16 @@ fn validate_recursive_body(
         ));
     }
 
+    // 判定順序は構文 → 再帰構造 → 機能ゲート。構造判定の前に各項の構文を検証する。
+    structural(anchor, limits)?;
+    let (term, wrapped, trailing) = peel_term(recursive);
+    let stmt = structural(term, limits)?;
+
     if !relation_refs(anchor, name).is_empty() {
         return Err(bad(
             "recursive reference must not appear in the non-recursive term",
         ));
     }
-    // 再帰項全体を囲む外側の括弧は部分クエリではなく項の区切りなので、先に 1 段剥がす。
-    let term = strip_outer_parens(recursive);
-    let wrapped = term.len() != recursive.len();
     let rec_refs = relation_refs(term, name);
     if rec_refs.iter().any(|r| r.in_subquery) {
         return Err(bad("recursive reference must not appear within a subquery"));
@@ -309,16 +327,21 @@ fn validate_recursive_body(
             "recursive reference must not appear within INTERSECT or EXCEPT",
         ));
     }
-    // 括弧の無い再帰項の末尾の ORDER BY／LIMIT／OFFSET／FETCH は本文全体に掛かる句で、
-    // PostgreSQL も未実装（0A000）。括弧で囲んだ再帰項の内側は項自身の句として下で `42P19`。
-    if !wrapped && !depth0_words(term, &["ORDER", "LIMIT", "OFFSET", "FETCH"]).is_empty() {
+    let clauses = !depth0_words(term, &["ORDER", "LIMIT", "OFFSET", "FETCH"]).is_empty();
+    // 括弧で囲んだ再帰項の内側の句は項自身の句（`OFFSET 0` も句の存在で判定）で `42P19`。
+    if wrapped && clauses {
+        return Err(bad(
+            "LIMIT, OFFSET and ORDER BY are not allowed in a recursive term",
+        ));
+    }
+    // 括弧の無い再帰項の末尾、または括弧の後ろに続く ORDER BY／LIMIT／OFFSET／FETCH は
+    // 本文全体に掛かる句で、PostgreSQL も未実装（0A000）。
+    if trailing || clauses {
         return Err(SqlSurfaceError::feature_not_supported(
             "ORDER BY, LIMIT, OFFSET and FETCH on WITH RECURSIVE queries are not supported",
         ));
     }
 
-    structural(anchor, limits)?;
-    let stmt = structural(term, limits)?;
     check_recursive_term(name, &stmt)?;
 
     Ok(RecursiveCteBody::Recursive {
@@ -433,6 +456,8 @@ mod tests {
             "WITH RECURSIVE t(n) AS (SELECT 1 UNION ALL SELECT d.n FROM docs d FULL JOIN t ON d.n = t.n) SELECT n FROM t",
             "WITH RECURSIVE t(n) AS (SELECT 1 UNION ALL SELECT count(*) FROM t) SELECT n FROM t",
             "WITH RECURSIVE t(n) AS (SELECT 1 UNION ALL (SELECT n FROM t LIMIT 1)) SELECT n FROM t",
+            "WITH RECURSIVE t(n) AS (SELECT 1 UNION ALL (SELECT n FROM t OFFSET 0)) SELECT n FROM t",
+            "WITH RECURSIVE t(n) AS (SELECT 1 UNION ALL (SELECT d.n FROM docs d JOIN t ON d.n = t.n OFFSET 0)) SELECT n FROM t",
             "WITH RECURSIVE t(n) AS (SELECT n FROM t) SELECT n FROM t",
         ] {
             assert_eq!(code(sql), "42P19", "{sql}");
@@ -448,6 +473,10 @@ mod tests {
             "WITH RECURSIVE a AS (SELECT id FROM b), b AS (SELECT id FROM docs) SELECT id FROM a",
             "WITH RECURSIVE t(n) AS (SELECT 1 UNION ALL SELECT n + 1 FROM t LIMIT 5) SELECT n FROM t",
             "WITH RECURSIVE t AS (WITH u AS (SELECT 1) SELECT 1) SELECT 1",
+            "WITH RECURSIVE t(n) AS (SELECT 1 UNION ALL ((SELECT n + 1 FROM t WHERE n < 3))) SELECT n FROM t",
+            "WITH RECURSIVE t(n) AS (SELECT 1 UNION ALL (SELECT n + 1 FROM t WHERE n < 3) LIMIT 5) SELECT n FROM t",
+            "WITH RECURSIVE t(n) AS (SELECT 1 UNION ALL ((SELECT n + 1 FROM t)) ORDER BY n) SELECT n FROM t",
+            "WITH RECURSIVE t(n) AS (SELECT 1 UNION ALL (SELECT n + 1 FROM t) OFFSET 1) SELECT n FROM t",
         ] {
             assert_eq!(code(sql), NOT_YET, "{sql}");
         }
@@ -458,6 +487,9 @@ mod tests {
         for sql in [
             "WITH RECURSIVE t(n) (SELECT 1) SELECT n FROM t",
             "WITH RECURSIVE t(n) AS (SELECT 1; ) SELECT n FROM t",
+            "WITH RECURSIVE t AS (SELECT FROM t) SELECT 1",
+            "WITH RECURSIVE t(n) AS (SELECT FROM t UNION ALL SELECT n FROM t) SELECT 1",
+            "WITH RECURSIVE t(n) AS (SELECT 1 UNION ALL SELECT FROM t) SELECT 1",
             "WITH RECURSIVE t AS (SELECT 1), t AS (SELECT 2) SELECT 1",
             "WITH RECURSIVE t() AS (SELECT 1) SELECT 1",
             "WITH RECURSIVE t AS (SELECT 1) DELETE FROM docs",
