@@ -48,8 +48,11 @@
 //! `sql::join::semi`）へ書き換える。`NOT EXISTS` は同じプローブの判定を反転した反結合として扱う。
 //! 相関 `IN`／`NOT IN`（Issue #1844）も同じ分解・実体化を使い、肯定形は対象ペア `(y, x)` を等価キーへ
 //! 足した半結合、`NOT IN` は NULL を考慮した反結合（`ProbeKind::NotIn`）へ書き換える
-//! （[`resolve_in_predicate`]）。それ以外の相関（スカラー・`ANY`／`ALL`・述語形 DML・集計の `FILTER`）は
-//! 従来どおり `42601` で拒否する（fail-closed）。
+//! （[`resolve_in_predicate`]）。集計形の相関スカラー（Issue #1846。単一集計項目で外側参照が内側 `WHERE` の
+//! 等価の相関条件だけの形）は、内側を相関キーの `GROUP BY` 集計へ書き換えて 1 回だけ実行し、外側の行ごとに
+//! キーで引く（左外部結合＋集計と同値。WHERE 位置・投影位置の両方。[`resolve_correlated_scalar_aggregate`]）。
+//! 非集計形のスカラー・`ANY`／`ALL`・述語形 DML・集計の `FILTER` の相関は従来どおり `42601` で拒否する
+//! （fail-closed）。
 //!
 //! NULL 規則（三値論理。RLS 境界内＝可視行のみから決まる）:
 //! - `NOT IN`: 内側 0 行なら常に真（外側値が NULL でも真）。内側の結果に NULL を
@@ -1153,6 +1156,21 @@ fn static_validate_subquery_predicates(
                 depth,
                 ..
             } => {
+                // 集計形の相関スカラー（Issue #1846）は実行経路と同じ準備・静的検証・対象列と値族の
+                // 検査まで行う（実行はしない）。
+                if static_validate_correlated_scalar(
+                    column,
+                    inner_tokens,
+                    *depth,
+                    chain,
+                    read_txn,
+                    lookup,
+                    udfs,
+                    nesting_limits,
+                    result_limits,
+                )? {
+                    continue;
+                }
                 // [`resolve_scalar_compare`] と同じ順序（内側 → 投影列数 → 対象列 → 値族）。
                 let meta = static_validate_inner_query(
                     inner_tokens,
@@ -1924,6 +1942,9 @@ pub(crate) struct ResolvedScalarItem {
     /// ときだけ返す（PostgreSQL の遅延評価と同じ。外側 0 行では内側は評価されない）。
     /// 静的エラー（`42xxx`・`22000`・`54000` 等）はここへ入れず解決時点で即返す。
     deferred_error: Option<SqlSurfaceError>,
+    /// 集計形の相関スカラー（Issue #1846）の値表。`Some` のとき `cell` は使わず、外側の行ごとに
+    /// 隠しキー列から相関キーを作って引く（[`merge_scalar_projection_items`]）。
+    correlated: Option<CorrelatedScalarValues>,
 }
 
 /// 投影位置のスカラーサブクエリ（Issue #1352・SQL-29 (a)・RLS-10 (b)・TASK-213）を
@@ -1949,6 +1970,68 @@ pub(crate) fn resolve_scalar_projection_items(
 ) -> Result<Vec<ResolvedScalarItem>, SqlSurfaceError> {
     let mut out = Vec::with_capacity(items.len());
     for item in items {
+        // 集計形の相関スカラー（Issue #1846）。内側を 1 回だけ `GROUP BY` 集計で実行し、外側の行ごとの
+        // 引き当ては [`merge_scalar_projection_items`] が隠しキー列で行う。`corr` が無効な文脈は
+        // 従来どおり内側の事前検査が `42601` で拒否する。
+        if corr.is_enabled() {
+            if let Some((validated, inner_schema, correlation)) = classify_correlated_aggregate(
+                &item.inner_tokens,
+                item.depth,
+                outer_scopes,
+                read_txn,
+                lookup,
+                nesting_limits,
+            )? {
+                let mut agg_meta: Option<ColumnMeta> = None;
+                match resolve_correlated_scalar_aggregate(
+                    validated,
+                    inner_schema,
+                    correlation,
+                    outer_scopes,
+                    read_txn,
+                    ctx,
+                    lookup,
+                    udfs,
+                    group_limits,
+                    nesting_limits,
+                    result_limits,
+                    budget,
+                    in_value_budget,
+                    corr,
+                    &mut agg_meta,
+                ) {
+                    Ok(table) => out.push(ResolvedScalarItem {
+                        position: item.position,
+                        meta: alias_scalar_meta(&table.meta, item.alias.as_ref()),
+                        cell: Cell::Null,
+                        multi_row: false,
+                        deferred_error: None,
+                        correlated: Some(CorrelatedScalarValues {
+                            values: std::sync::Arc::new(table.values),
+                            empty: table.empty,
+                            keys: table.keys,
+                            key_names: table.key_names,
+                        }),
+                    }),
+                    // 束縛後の実行時データ例外は外側の行数判明まで遅延する（非相関と同じ契約）。
+                    Err(e) if is_deferrable_runtime_error(&e) => {
+                        let Some(inner_meta) = agg_meta else {
+                            return Err(e);
+                        };
+                        out.push(ResolvedScalarItem {
+                            position: item.position,
+                            meta: alias_scalar_meta(&inner_meta, item.alias.as_ref()),
+                            cell: Cell::Null,
+                            multi_row: false,
+                            deferred_error: Some(e),
+                            correlated: None,
+                        });
+                    }
+                    Err(e) => return Err(e),
+                }
+                continue;
+            }
+        }
         let mut meta_sink: Option<Vec<ColumnMeta>> = None;
         let result = match execute_inner_query_with_meta(
             &item.inner_tokens,
@@ -1987,6 +2070,7 @@ pub(crate) fn resolve_scalar_projection_items(
                     cell: Cell::Null,
                     multi_row: false,
                     deferred_error: Some(e),
+                    correlated: None,
                 });
                 continue;
             }
@@ -2022,6 +2106,7 @@ pub(crate) fn resolve_scalar_projection_items(
             cell,
             multi_row,
             deferred_error: None,
+            correlated: None,
         });
     }
     Ok(out)
@@ -2055,9 +2140,12 @@ fn alias_scalar_meta(inner_meta: &ColumnMeta, alias: Option<&String>) -> ColumnM
 ///   （[`crate::arena::MAX_ARENA_TOTAL_BYTES`]。`sql::scan` の結果バイト上限と同値）を
 ///   超えれば `54000`。
 /// - 位置が現在の列数を超える場合は `Internal`（fail-closed。添字アクセスは使わない）。
+/// - `hidden` は外側の結果の末尾に並ぶ隠しキー列の名前（[`hidden_key_columns`]。無ければ空）。
+///   集計形の相関スカラー（Issue #1846）が行ごとに値を引き当てるために使い、合流前に取り除く。
 pub(crate) fn merge_scalar_projection_items(
     mut result: super::exec::QueryResult,
     items: Vec<ResolvedScalarItem>,
+    hidden: &[String],
 ) -> Result<super::exec::QueryResult, SqlSurfaceError> {
     // 投影セルが無ければ合流しない。外側結果は `sql::scan` が同じ上限で検査済みのため再検査しない。
     if items.is_empty() {
@@ -2071,34 +2159,80 @@ pub(crate) fn merge_scalar_projection_items(
     if !result.rows.is_empty() && items.iter().any(|i| i.multi_row) {
         return Err(SqlSurfaceError::cardinality_violation());
     }
+    // 隠しキー列（相関項目が引き当てに使う。末尾に並ぶ）の開始位置。
+    let hidden_base = result
+        .columns
+        .len()
+        .checked_sub(hidden.len())
+        .ok_or_else(|| SqlSurfaceError::Internal {
+            detail: "scalar subquery hidden key columns are missing".to_string(),
+        })?;
     // 外側結果の使用量を引き継ぎ、追加分との合計を確保前に検査する。
     let mut total_bytes: usize = super::cursor::estimate_result_bytes(&result);
+    // 項目ごとの行別セル（相関項目のみ。行順）。隠し列を取り除く前に引き当てる。
+    let mut per_row: Vec<Option<Vec<Cell>>> = Vec::with_capacity(items.len());
     for item in &items {
-        let per_cell = std::mem::size_of::<Cell>()
-            .checked_add(super::cursor::estimate_cell_bytes(&item.cell))
-            .ok_or_else(merge_too_large)?;
-        let added = per_cell
-            .checked_mul(result.rows.len())
-            .ok_or_else(merge_too_large)?;
-        total_bytes = total_bytes.checked_add(added).ok_or_else(merge_too_large)?;
-        if total_bytes > crate::arena::MAX_ARENA_TOTAL_BYTES {
-            return Err(merge_too_large());
+        let Some(c) = &item.correlated else {
+            let per_cell = std::mem::size_of::<Cell>()
+                .checked_add(super::cursor::estimate_cell_bytes(&item.cell))
+                .ok_or_else(merge_too_large)?;
+            let added = per_cell
+                .checked_mul(result.rows.len())
+                .ok_or_else(merge_too_large)?;
+            total_bytes = total_bytes.checked_add(added).ok_or_else(merge_too_large)?;
+            if total_bytes > crate::arena::MAX_ARENA_TOTAL_BYTES {
+                return Err(merge_too_large());
+            }
+            per_row.push(None);
+            continue;
+        };
+        let mut cells: Vec<Cell> = Vec::new();
+        cells
+            .try_reserve(result.rows.len())
+            .map_err(|_| merge_too_large())?;
+        for row in &result.rows {
+            let value = c.value_for(row.id, &row.cells, hidden_base, hidden)?;
+            let per_cell = std::mem::size_of::<Cell>()
+                .checked_add(super::cursor::estimate_cell_bytes(value))
+                .ok_or_else(merge_too_large)?;
+            total_bytes = total_bytes
+                .checked_add(per_cell)
+                .ok_or_else(merge_too_large)?;
+            if total_bytes > crate::arena::MAX_ARENA_TOTAL_BYTES {
+                return Err(merge_too_large());
+            }
+            cells.push(value.clone());
+        }
+        per_row.push(Some(cells));
+    }
+    // 隠しキー列を取り除いてから、元の位置どおりに合流する。
+    if !hidden.is_empty() {
+        result.columns.truncate(hidden_base);
+        for row in &mut result.rows {
+            row.cells.truncate(hidden_base);
         }
     }
-    for item in items {
+    for (item, cells) in items.into_iter().zip(per_row) {
         if item.position > result.columns.len() {
             return Err(SqlSurfaceError::Internal {
                 detail: "scalar subquery position out of range".to_string(),
             });
         }
         result.columns.insert(item.position, item.meta);
+        let mut per_row_cells = cells.map(Vec::into_iter);
         for row in &mut result.rows {
             if item.position > row.cells.len() {
                 return Err(SqlSurfaceError::Internal {
                     detail: "scalar subquery position out of range".to_string(),
                 });
             }
-            row.cells.insert(item.position, item.cell.clone());
+            let cell = match per_row_cells.as_mut() {
+                Some(it) => it.next().ok_or_else(|| SqlSurfaceError::Internal {
+                    detail: "correlated scalar subquery row value is missing".to_string(),
+                })?,
+                None => item.cell.clone(),
+            };
+            row.cells.insert(item.position, cell);
         }
     }
     Ok(result)
@@ -2259,6 +2393,30 @@ fn resolve_scalar_compare(
     in_value_budget: &mut usize,
     corr: &CorrelatedCtx,
 ) -> Result<WherePredicate, SqlSurfaceError> {
+    // 集計形の相関スカラー（Issue #1846）は内側を `GROUP BY` 集計で 1 回だけ実行する相関プローブへ
+    // 解決する。`corr` が無効な文脈（述語形 DML・集計の `FILTER`）・非集計形の相関は従来どおり
+    // 内側の事前検査が `42601` で拒否する。
+    if corr.is_enabled() {
+        if let Some(pred) = try_resolve_correlated_scalar_compare(
+            column,
+            op,
+            inner_tokens,
+            depth,
+            outer_scopes,
+            read_txn,
+            ctx,
+            lookup,
+            udfs,
+            group_limits,
+            nesting_limits,
+            result_limits,
+            budget,
+            in_value_budget,
+            corr,
+        )? {
+            return Ok(pred);
+        }
+    }
     let mut meta_sink: Option<Vec<ColumnMeta>> = None;
     let result = match execute_inner_query_with_meta(
         inner_tokens,
@@ -3625,6 +3783,720 @@ fn static_validate_exists(
     )
     .map(|_| ())
 }
+// ===== 集計形の相関スカラーサブクエリ（Issue #1846・SQL-61・親 #1845。RLS-10 ポインタ） =====
+//
+// `col <op> (SELECT agg(...) FROM b WHERE b.k = a.k [AND <内側だけの条件>])`（WHERE 位置）と
+// `SELECT ..., (SELECT agg(...) FROM b WHERE b.k = a.k)`（投影位置）を、内側を相関キーの
+// `GROUP BY` 集計へ書き換えて 1 回だけ既存の集計器で実行し、外側の行ごとにキーで引く
+// （左外部結合＋集計と同値）。該当する内側行が無い外側の行は空集合に対する集計値
+// （`count` は 0、それ以外は NULL）になる。受理形は「GROUP BY の無い単一集計項目で、外側参照が
+// 内側 `WHERE` の等価の相関条件だけ」で、キーごとに必ず 1 行になるため `21000` は発生しない。
+// それ以外の相関（非等価・OR 混在・内側の GROUP BY／HAVING／LIMIT・集計引数内の外側参照・
+// 非集計形）は従来どおり静的文字列の `42601`／`0A000` で拒否する（fail-closed）。
+//
+// 上限（DoS）: 内側の可視行は集計器が走査するだけで保持せず、保持量はグループ数
+// （`GroupByLimits::max_groups`。ハード上限 `MAX_GROUPS` = 10,000）と結果バイト上限で有界。
+// このため内側の結果行数上限（`--max-result-rows`）の検査は適用しない（グループ数超過は集計器が
+// `54000`）。実行回数は入れ子を含む文全体の予算を 1 消費する。
+
+/// 受理形の外の相関スカラー集計の拒否（静的文字列のみ。他テナントの情報・予約内部名を含めない）。
+fn correlated_scalar_unsupported() -> SqlSurfaceError {
+    SqlSurfaceError::unsupported(
+        "correlated scalar subqueries are supported only as a single aggregate whose \
+         correlation is equality conditions in WHERE",
+    )
+}
+
+/// 内側が単一集計の集計形で外側の列を参照する形か判定し、そうなら検証済みの内側・内側スキーマ・
+/// 相関 IR を返す。集計形でない・相関が無い内側は `None`（呼び出し側の従来経路が同じ検査・拒否を行う。
+/// 非集計形の相関スカラーは従来どおり `42601`）。実行経路・静的検証経路が共有する。
+fn classify_correlated_aggregate(
+    inner_tokens: &[Token],
+    depth: usize,
+    outer_scopes: &[&TableSchema],
+    read_txn: &impl crate::storage::read_source::ReadSource,
+    lookup: &impl TableLookup,
+    nesting_limits: crate::nesting_limits::NestingLimits,
+) -> Result<Option<(ValidatedAggregate, TableSchema, correlation::Correlation)>, SqlSurfaceError> {
+    let Statement::Aggregate(validated) =
+        super::allowlist::validate_sql_tokens_with_subquery_ctx_limits(
+            inner_tokens,
+            lookup,
+            depth,
+            nesting_limits,
+        )?
+    else {
+        return Ok(None);
+    };
+    let inner_schema = inner_table_schema(read_txn, &validated.table_name)?;
+    let referenced = aggregate_referenced_columns(&validated);
+    let correlation = correlation::bind_correlation(&referenced, &inner_schema, outer_scopes)?;
+    if !correlation.is_correlated() {
+        return Ok(None);
+    }
+    Ok(Some((validated, inner_schema, correlation)))
+}
+
+/// 集計形の相関スカラーの、実行を伴わない準備の結果（[`prepare_correlated_scalar_aggregate`]）。
+struct PreparedScalarAggregate {
+    /// 元の集計（`WHERE` は内側だけの連言。サブクエリは未解決）。空集合の値・列メタデータの束縛用。
+    plain: ValidatedAggregate,
+    /// 相関キーの `GROUP BY` 集計へ書き換えた形（`WHERE` は `plain` と同じ。先頭がキー列、末尾が元の集計）。
+    grouped: ValidatedAggregate,
+    /// 等価の相関条件（`GROUP BY` のキーと同じ順）。
+    keys: Vec<correlated_exists::KeyPair>,
+}
+
+/// 集計形の相関スカラーの準備（実行も走査もしない静的な処理）。受理形の検査・`WHERE` の分解・
+/// キー型の検査・`GROUP BY` 形への書き換えを行い、実行経路（[`resolve_correlated_scalar_aggregate`]）と
+/// 失敗時の静的検証（[`static_validate_correlated_scalar`]）が共有する。
+fn prepare_correlated_scalar_aggregate(
+    validated: ValidatedAggregate,
+    inner_schema: &TableSchema,
+    correlation: &correlation::Correlation,
+    outer_scopes: &[&TableSchema],
+) -> Result<PreparedScalarAggregate, SqlSurfaceError> {
+    use super::allowlist::{AggregateSelectItem, GroupByClause, MAX_GROUP_BY_COLUMNS};
+    let outer_schema = owner_schema(outer_scopes)?;
+    if validated.items.len() != 1 {
+        return Err(SqlSurfaceError::unsupported(
+            "subquery used as a value must select exactly one column",
+        ));
+    }
+    // 受理形: GROUP BY・HAVING・（集計 ORDER BY・LIMIT・OFFSET を含む）句なしの単一の集計項目。
+    // 式項目（`count(*)+1`）・`SELECT DISTINCT` の脱糖形（`GroupKey`）は空グループの値の意味論が
+    // 変わるため拒否する。
+    let item = match (validated.items.as_slice(), &validated.group_by) {
+        ([AggregateSelectItem::Aggregate(item)], None) => item.clone(),
+        _ => return Err(correlated_scalar_unsupported()),
+    };
+    // 外側参照は内側 `WHERE` の中だけ（集計引数・FILTER・extra_args・集計内 ORDER BY の外側参照は拒否）。
+    let mut non_where = validated.clone();
+    non_where.where_predicates = Vec::new();
+    let non_where_correlation = correlation::bind_correlation(
+        &aggregate_referenced_columns(&non_where),
+        inner_schema,
+        outer_scopes,
+    )?;
+    if non_where_correlation.is_correlated() {
+        return Err(correlated_scalar_unsupported());
+    }
+
+    let analysis = correlated_exists::analyze(
+        validated.where_predicates.clone(),
+        inner_schema,
+        outer_schema,
+        correlation,
+    )?;
+    // 等価の相関条件だけで書ける形（キー 1 本以上・残余なし）に限る。残余あり・キーなしは行ごとの
+    // 再評価が要るため範囲外（`42601`）。
+    if analysis.keys.is_empty() || !analysis.residual.is_empty() {
+        return Err(correlated_scalar_unsupported());
+    }
+    if analysis.keys.len() > MAX_GROUP_BY_COLUMNS {
+        return Err(SqlSurfaceError::payload_too_large(
+            "correlated scalar subquery has too many correlation keys",
+        ));
+    }
+    let mut seen: HashSet<&str> = HashSet::new();
+    for key in &analysis.keys {
+        // `GROUP BY` で束ねられない（並べ替え不能な）キー型は `0A000`。
+        if key.class == super::join::values::JoinKeyClass::Bytea {
+            return Err(SqlSurfaceError::feature_not_supported(
+                "this column type is not supported in a correlated scalar subquery condition",
+            ));
+        }
+        // 同じ内側列への等価の重複は `GROUP BY` のキー重複になるため拒否する（fail-closed）。
+        if !seen.insert(key.inner_column.as_str()) {
+            return Err(correlated_scalar_unsupported());
+        }
+    }
+
+    let mut plain = validated;
+    plain.where_predicates = analysis.inner_only;
+    let mut items: Vec<AggregateSelectItem> = analysis
+        .keys
+        .iter()
+        .enumerate()
+        .map(|(i, k)| AggregateSelectItem::GroupKey {
+            column: k.inner_column.clone(),
+            // 利用者の別名・列名と衝突しない予約名（制御文字接頭辞）。
+            alias: Some(format!("\u{3}corrkey{i}")),
+        })
+        .collect();
+    items.push(AggregateSelectItem::Aggregate(item));
+    let grouped = ValidatedAggregate {
+        table_name: plain.table_name.clone(),
+        items,
+        where_predicates: plain.where_predicates.clone(),
+        group_by: Some(GroupByClause {
+            columns: analysis
+                .keys
+                .iter()
+                .map(|k| k.inner_column.clone())
+                .collect(),
+            key_exprs: Vec::new(),
+            grouping_sets: None,
+            having: Vec::new(),
+            having_exprs: Vec::new(),
+            having_aggregates: Vec::new(),
+            order_by: Vec::new(),
+            limit: None,
+            with_ties: false,
+            offset: 0,
+        }),
+    };
+    Ok(PreparedScalarAggregate {
+        plain,
+        grouped,
+        keys: analysis.keys,
+    })
+}
+
+/// 束縛済みの集計形の相関スカラー（[`bind_scalar_aggregate`]）。
+struct BoundScalarAggregate {
+    grouped: super::parser::BoundAggregate,
+    /// 集計項目 1 列の列メタデータ（外側の行数・値に依存しない）。
+    meta: ColumnMeta,
+    /// 空集合に対する集計値（`count` は 0、それ以外は NULL。既存の集計評価器の空入力時の値）。
+    empty: Cell,
+}
+
+/// `where_preds`（解決済み、または静的検証用に整えた述語）で元の集計とキー付き集計を束縛する。
+/// 空集合の値は第 2 の評価器を作らず、集計アキュムレータの空入力時の `finish` をそのまま使う。
+fn bind_scalar_aggregate(
+    prepared: &PreparedScalarAggregate,
+    where_preds: Vec<WherePredicate>,
+    inner_schema: &TableSchema,
+    udfs: &UdfRegistry,
+) -> Result<BoundScalarAggregate, SqlSurfaceError> {
+    let mut plain = prepared.plain.clone();
+    plain.where_predicates = where_preds.clone();
+    let bound_plain = super::parser::bind_aggregate(&plain, inner_schema, udfs)?;
+    let metas = super::describe::aggregate_columns(&bound_plain, inner_schema)?;
+    let [meta] = metas.as_slice() else {
+        return Err(SqlSurfaceError::Internal {
+            detail: "correlated scalar aggregate has an unexpected column count".to_string(),
+        });
+    };
+    let item = bound_plain
+        .items
+        .first()
+        .ok_or_else(|| SqlSurfaceError::Internal {
+            detail: "correlated scalar aggregate is missing its aggregate item".to_string(),
+        })?;
+    let empty = super::aggregate::Accumulator::for_item(item)?.finish()?;
+    let mut grouped = prepared.grouped.clone();
+    grouped.where_predicates = where_preds;
+    let grouped = super::parser::bind_aggregate(&grouped, inner_schema, udfs)?;
+    Ok(BoundScalarAggregate {
+        grouped,
+        meta: meta.clone(),
+        empty,
+    })
+}
+
+/// 内側の `GROUP BY` 集計の結果（相関キー → 集計値）。外側の行ごとにキーで引く。
+/// 可視行由来の値を持つため `Debug` は導出しない。
+struct ScalarAggTable {
+    /// 相関キーの正準バイト列 → 集計値（キーが NULL のグループは含めない）。
+    values: std::collections::HashMap<Vec<u8>, Cell>,
+    /// 空集合に対する集計値。
+    empty: Cell,
+    meta: ColumnMeta,
+    /// 外側の取り出し元と型クラス（`values` のキーと同じ順）。
+    keys: Vec<super::join::semi::OuterKey>,
+    /// 外側の列名（疑似列 `id` は `None`。`keys` と同じ順）。
+    key_names: Vec<Option<String>>,
+}
+
+/// 集計形の相関スカラーを内側 1 回の `GROUP BY` 集計で実行して [`ScalarAggTable`] にする。
+/// 内側だけの連言（入れ子のサブクエリを含む）は先に解決し、外側と同じ `ctx`・`read_txn`
+/// （RLS 暗黙適用・同一スナップショット）の既存集計器で実行する。実行回数予算を 1 消費する。
+/// 束縛に成功した時点で列メタデータを `meta_sink` へ書き出す（投影位置の実行時データ例外を
+/// 外側の行数判明まで遅延するため。[`resolve_scalar_projection_items`] と同じ契約）。
+#[allow(clippy::too_many_arguments)]
+fn resolve_correlated_scalar_aggregate(
+    validated: ValidatedAggregate,
+    inner_schema: TableSchema,
+    correlation: correlation::Correlation,
+    outer_scopes: &[&TableSchema],
+    read_txn: &impl crate::storage::read_source::ReadSource,
+    ctx: &PolicyContext,
+    lookup: &impl TableLookup,
+    udfs: &UdfRegistry,
+    group_limits: crate::group_by_limits::GroupByLimits,
+    nesting_limits: crate::nesting_limits::NestingLimits,
+    result_limits: crate::result_limits::ResultLimits,
+    budget: &mut usize,
+    in_value_budget: &mut usize,
+    corr: &CorrelatedCtx,
+    meta_sink: &mut Option<ColumnMeta>,
+) -> Result<ScalarAggTable, SqlSurfaceError> {
+    use super::join::semi::{key_bytes_overhead, too_large, OuterKey, OuterSource};
+    let outer_schema = owner_schema(outer_scopes)?;
+    let prepared =
+        prepare_correlated_scalar_aggregate(validated, &inner_schema, &correlation, outer_scopes)?;
+    let mut chain: Vec<&TableSchema> = outer_scopes.to_vec();
+    chain.push(&inner_schema);
+    let original_preds = prepared.plain.where_predicates.clone();
+    let resolved = match resolve_where_predicates(
+        original_preds.clone(),
+        &chain,
+        read_txn,
+        ctx,
+        lookup,
+        udfs,
+        group_limits,
+        nesting_limits,
+        result_limits,
+        budget,
+        in_value_budget,
+        corr,
+    ) {
+        Ok(p) => p,
+        Err(e) => {
+            // 入れ子 WHERE の実行時データ例外は、投影位置の外側が行数判明まで遅延できるよう、
+            // 実行せずに静的検証・束縛してメタデータを確定する（Issue #1432 と同じ契約）。
+            if is_deferrable_runtime_error(&e) {
+                static_validate_subquery_predicates(
+                    &original_preds,
+                    &chain,
+                    read_txn,
+                    lookup,
+                    udfs,
+                    nesting_limits,
+                    result_limits,
+                )?;
+            }
+            let bound = bind_scalar_aggregate(
+                &prepared,
+                static_validation_predicates(&original_preds),
+                &inner_schema,
+                udfs,
+            )?;
+            *meta_sink = Some(bound.meta);
+            return Err(e);
+        }
+    };
+    *budget = budget.checked_sub(1).ok_or_else(|| {
+        SqlSurfaceError::payload_too_large(format!(
+            "subquery execution count exceeds limit {}",
+            nesting_limits.max_subquery_executions()
+        ))
+    })?;
+    let bound = bind_scalar_aggregate(&prepared, resolved, &inner_schema, udfs)?;
+    *meta_sink = Some(bound.meta.clone());
+    let result = super::aggregate::execute_aggregate_with_group_limits(
+        read_txn,
+        ctx,
+        &inner_schema,
+        &bound.grouped,
+        super::aggregate::MAX_AGGREGATE_RESULT_BYTES,
+        None,
+        None,
+        None,
+        group_limits,
+    )?;
+
+    let keys: Vec<OuterKey> = prepared
+        .keys
+        .iter()
+        .map(|k| OuterKey {
+            source: k.outer.source,
+            class: k.class.clone(),
+        })
+        .collect();
+    let mut key_names: Vec<Option<String>> = Vec::with_capacity(keys.len());
+    for k in &keys {
+        key_names.push(match k.source {
+            OuterSource::Column(i) => Some(
+                outer_schema
+                    .columns
+                    .get(i)
+                    .ok_or_else(|| SqlSurfaceError::Internal {
+                        detail: "correlated scalar key column is outside the outer schema"
+                            .to_string(),
+                    })?
+                    .name
+                    .clone(),
+            ),
+            OuterSource::Id => None,
+        });
+    }
+
+    // 結果行: 先頭がキー列（`keys` と同じ順）、末尾が集計値。確保前に予算へ計上する。
+    let mut values: std::collections::HashMap<Vec<u8>, Cell> = std::collections::HashMap::new();
+    let mut used = 0usize;
+    'rows: for row in result.rows {
+        if row.cells.len() != keys.len().saturating_add(1) {
+            return Err(SqlSurfaceError::Internal {
+                detail: "correlated scalar aggregate row has an unexpected width".to_string(),
+            });
+        }
+        let mut key = Vec::new();
+        for (cell, k) in row.cells.iter().zip(&keys) {
+            if matches!(cell, Cell::Null) {
+                // キーが NULL のグループは `=` で真にならず、どの外側の行にも一致しない。
+                continue 'rows;
+            }
+            super::join::values::encode_key_component(cell, &k.class, &mut key)?;
+        }
+        let value =
+            row.cells
+                .into_iter()
+                .nth(keys.len())
+                .ok_or_else(|| SqlSurfaceError::Internal {
+                    detail: "correlated scalar aggregate row is missing its value".to_string(),
+                })?;
+        used = used
+            .saturating_add(key_bytes_overhead(&key))
+            .saturating_add(std::mem::size_of::<Cell>())
+            .saturating_add(super::cursor::estimate_cell_bytes(&value));
+        if used > corr.byte_cap() {
+            return Err(too_large());
+        }
+        values.try_reserve(1).map_err(|_| too_large())?;
+        if values.insert(key, value).is_some() {
+            // `GROUP BY` はキーごとに 1 行。破れたら黙って上書きせず fail-closed。
+            return Err(SqlSurfaceError::Internal {
+                detail: "correlated scalar aggregate returned a duplicate group".to_string(),
+            });
+        }
+    }
+    Ok(ScalarAggTable {
+        values,
+        empty: bound.empty,
+        meta: bound.meta,
+        keys,
+        key_names,
+    })
+}
+
+/// 比較述語の表を組み立てる（同じ値のグループは 1 つの述語を共有する）。
+struct ScalarPredicateBuilder<'a> {
+    op: ScalarSubqueryOp,
+    column: &'a str,
+    target_ty: Option<&'a ColumnType>,
+    family: SubqueryValueFamily,
+    outer_schema: &'a TableSchema,
+    udfs: &'a UdfRegistry,
+    byte_cap: usize,
+    used: usize,
+    predicates: Vec<super::where_tree::BoundOrGroup>,
+    index_by_value: std::collections::HashMap<String, u32>,
+}
+
+impl ScalarPredicateBuilder<'_> {
+    /// `cell` に対する比較述語の添字を返す（無ければ束縛して追加する）。NULL は常に偽
+    /// （UNKNOWN は WHERE で偽に潰れる。否定は構文段で演算子反転済み）。非 NULL は
+    /// 非相関のスカラー比較と同じ [`scalar_literal_predicate`] を外側スキーマへ束縛する。
+    fn index_for(&mut self, cell: &Cell) -> Result<u32, SqlSurfaceError> {
+        use super::join::semi::too_large;
+        let dedup = format!("{cell:?}");
+        if let Some(i) = self.index_by_value.get(&dedup) {
+            return Ok(*i);
+        }
+        self.used = self
+            .used
+            .saturating_add(std::mem::size_of::<super::where_tree::BoundOrGroup>())
+            .saturating_add(512)
+            .saturating_add(super::cursor::estimate_cell_bytes(cell).saturating_mul(2))
+            .saturating_add(dedup.len());
+        if self.used > self.byte_cap {
+            return Err(too_large());
+        }
+        let group = if matches!(cell, Cell::Null) {
+            super::where_tree::BoundOrGroup::new(Vec::new())
+        } else {
+            let pred =
+                scalar_literal_predicate(self.column, self.op, cell, self.target_ty, self.family)?;
+            let mut node_budget = super::udf_call::MAX_EXPR_NODES;
+            let (metadata, expr, _rls, or_filters) = super::parser::bind_where_predicates(
+                std::slice::from_ref(&pred),
+                self.outer_schema,
+                self.udfs,
+                &mut node_budget,
+                &[],
+            )?;
+            super::where_tree::BoundOrGroup::new(vec![super::where_tree::BoundConjunction::new(
+                metadata, expr, or_filters,
+            )])
+        };
+        let index = u32::try_from(self.predicates.len()).map_err(|_| too_large())?;
+        self.predicates.try_reserve(1).map_err(|_| too_large())?;
+        self.predicates.push(group);
+        self.index_by_value.insert(dedup, index);
+        Ok(index)
+    }
+}
+
+/// WHERE 位置 `col <op> (SELECT agg ...)` の内側が集計形の相関なら、内側を 1 回だけ実行した
+/// 相関プローブ（[`WherePredicate::CorrelatedExists`] の葉。判定方式は
+/// `ProbeKind::ScalarCompare`）へ解決する。相関でなければ `None`（従来の
+/// [`resolve_scalar_compare`] の経路）。
+#[allow(clippy::too_many_arguments)]
+fn try_resolve_correlated_scalar_compare(
+    column: &str,
+    op: ScalarSubqueryOp,
+    inner_tokens: &[Token],
+    depth: usize,
+    outer_scopes: &[&TableSchema],
+    read_txn: &impl crate::storage::read_source::ReadSource,
+    ctx: &PolicyContext,
+    lookup: &impl TableLookup,
+    udfs: &UdfRegistry,
+    group_limits: crate::group_by_limits::GroupByLimits,
+    nesting_limits: crate::nesting_limits::NestingLimits,
+    result_limits: crate::result_limits::ResultLimits,
+    budget: &mut usize,
+    in_value_budget: &mut usize,
+    corr: &CorrelatedCtx,
+) -> Result<Option<WherePredicate>, SqlSurfaceError> {
+    use super::join::semi::{CorrelatedProbe, CorrelatedProbeRef, ScalarTable};
+    let Some((validated, inner_schema, correlation)) = classify_correlated_aggregate(
+        inner_tokens,
+        depth,
+        outer_scopes,
+        read_txn,
+        lookup,
+        nesting_limits,
+    )?
+    else {
+        return Ok(None);
+    };
+    let mut meta_sink: Option<ColumnMeta> = None;
+    let table = match resolve_correlated_scalar_aggregate(
+        validated,
+        inner_schema,
+        correlation,
+        outer_scopes,
+        read_txn,
+        ctx,
+        lookup,
+        udfs,
+        group_limits,
+        nesting_limits,
+        result_limits,
+        budget,
+        in_value_budget,
+        corr,
+        &mut meta_sink,
+    ) {
+        Ok(t) => t,
+        Err(e) => {
+            // 遅延対象エラーのときだけ、同じ述語の静的エラー（対象列・値族）を優先する
+            // （[`resolve_scalar_compare`] と同じ契約。Issue #1432）。
+            if is_deferrable_runtime_error(&e) {
+                let (_, target_family) = scalar_target_column(column, outer_scopes)?;
+                if let Some(meta) = &meta_sink {
+                    check_scalar_family_compatible(column, meta, target_family)?;
+                }
+            }
+            return Err(e);
+        }
+    };
+    let (target_ty, family) = scalar_target_column(column, outer_scopes)?;
+    check_scalar_family_compatible(column, &table.meta, family)?;
+
+    let outer_schema = owner_schema(outer_scopes)?;
+    let ScalarAggTable {
+        values,
+        empty,
+        keys,
+        ..
+    } = table;
+    let mut builder = ScalarPredicateBuilder {
+        op,
+        column,
+        target_ty,
+        family,
+        outer_schema,
+        udfs,
+        byte_cap: corr.byte_cap(),
+        used: 0,
+        predicates: Vec::new(),
+        index_by_value: std::collections::HashMap::new(),
+    };
+    let empty_set = builder.index_for(&empty)?;
+    let mut by_key: std::collections::HashMap<Vec<u8>, u32> = std::collections::HashMap::new();
+    by_key
+        .try_reserve(values.len())
+        .map_err(|_| super::join::semi::too_large())?;
+    for (key, cell) in values {
+        let index = builder.index_for(&cell)?;
+        by_key.insert(key, index);
+    }
+    let target_column = outer_schema.columns.iter().position(|c| c.name == column);
+    let probe = CorrelatedProbe::scalar_compare(
+        keys,
+        ScalarTable {
+            by_key,
+            predicates: builder.predicates,
+            empty_set,
+        },
+        target_column,
+        corr.budget(),
+    );
+    Ok(Some(WherePredicate::CorrelatedExists(
+        CorrelatedProbeRef::new(probe),
+    )))
+}
+
+/// 失敗時の静的検証（Issue #1432 の経路）での WHERE 位置の集計形の相関スカラー。内側が集計形で
+/// 外側を参照するときは、実行せずに [`prepare_correlated_scalar_aggregate`] と内側だけの連言の
+/// 静的検証・束縛、対象列・値族の検査までを行い `true` を返す（実行回数予算は消費しない）。
+/// 相関でなければ `false`（従来の静的検証へ）。
+#[allow(clippy::too_many_arguments)]
+fn static_validate_correlated_scalar(
+    column: &str,
+    inner_tokens: &[Token],
+    depth: usize,
+    outer_scopes: &[&TableSchema],
+    read_txn: &impl crate::storage::read_source::ReadSource,
+    lookup: &impl TableLookup,
+    udfs: &UdfRegistry,
+    nesting_limits: crate::nesting_limits::NestingLimits,
+    result_limits: crate::result_limits::ResultLimits,
+) -> Result<bool, SqlSurfaceError> {
+    let Some((validated, inner_schema, correlation)) = classify_correlated_aggregate(
+        inner_tokens,
+        depth,
+        outer_scopes,
+        read_txn,
+        lookup,
+        nesting_limits,
+    )?
+    else {
+        return Ok(false);
+    };
+    let prepared =
+        prepare_correlated_scalar_aggregate(validated, &inner_schema, &correlation, outer_scopes)?;
+    let mut chain: Vec<&TableSchema> = outer_scopes.to_vec();
+    chain.push(&inner_schema);
+    static_validate_subquery_predicates(
+        &prepared.plain.where_predicates,
+        &chain,
+        read_txn,
+        lookup,
+        udfs,
+        nesting_limits,
+        result_limits,
+    )?;
+    let bound = bind_scalar_aggregate(
+        &prepared,
+        static_validation_predicates(&prepared.plain.where_predicates),
+        &inner_schema,
+        udfs,
+    )?;
+    let (_, target_family) = scalar_target_column(column, outer_scopes)?;
+    check_scalar_family_compatible(column, &bound.meta, target_family)?;
+    Ok(true)
+}
+
+/// 投影位置の集計形の相関スカラー 1 項目の値表（Issue #1846）。外側の行ごとに、隠しキー列
+/// （疑似列 `id` は行の `id`）から相関キーを作って引く。可視行由来の値を持つため `Debug` は
+/// 行データを出さない。
+#[derive(Clone)]
+pub(crate) struct CorrelatedScalarValues {
+    values: std::sync::Arc<std::collections::HashMap<Vec<u8>, Cell>>,
+    empty: Cell,
+    keys: Vec<super::join::semi::OuterKey>,
+    /// キーごとの外側の列名（疑似列 `id` は `None`）。隠しキー列の位置引きに使う。
+    key_names: Vec<Option<String>>,
+}
+
+impl std::fmt::Debug for CorrelatedScalarValues {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str("CorrelatedScalarValues(..)")
+    }
+}
+
+/// 隠しキー列の出力名（利用者の識別子・出力別名と衝突しない制御文字接頭辞。利用者へは返さない）。
+fn hidden_key_alias(column: &str) -> String {
+    format!("\u{3}corrkey.{column}")
+}
+
+/// 解決済みの相関項目が要求する外側キー列の名前（重複なし・初出順。疑似列 `id` は含めない）。
+pub(crate) fn hidden_key_columns(items: &[ResolvedScalarItem]) -> Vec<String> {
+    let mut out: Vec<String> = Vec::new();
+    for item in items {
+        if let Some(c) = &item.correlated {
+            for name in c.key_names.iter().flatten() {
+                if !out.contains(name) {
+                    out.push(name.clone());
+                }
+            }
+        }
+    }
+    out
+}
+
+/// 外側の走査へ、相関項目が要求する隠しキー列を投影の末尾へ足す（元の投影位置・`ORDER BY` の
+/// 序数は変わらない）。`*` との併用は疑似列 `id` 以外のキーを持てないため `42601`（fail-closed）。
+/// 隠し列は [`merge_scalar_projection_items`] が値の引き当てに使った後に取り除く。
+pub(crate) fn append_hidden_key_columns(
+    validated: &mut ValidatedScan,
+    hidden: &[String],
+) -> Result<(), SqlSurfaceError> {
+    if hidden.is_empty() {
+        return Ok(());
+    }
+    let mut items: Vec<SelectItem> =
+        match std::mem::replace(&mut validated.projection, Projection::Columns(Vec::new())) {
+            Projection::All => return Err(correlated_scalar_unsupported()),
+            Projection::Columns(names) => names.into_iter().map(SelectItem::Column).collect(),
+            Projection::Items(items) => items,
+        };
+    for name in hidden {
+        items.push(SelectItem::Expr {
+            expr: Expr::Ident(name.clone()),
+            alias: Some(hidden_key_alias(name)),
+        });
+    }
+    validated.projection = Projection::Items(items);
+    Ok(())
+}
+
+impl CorrelatedScalarValues {
+    /// 外側の 1 行の値（該当グループが無い・キーが NULL なら空集合の値）。`cells` は隠しキー列を
+    /// 含む外側の行セル、`hidden_base` は隠し列の開始位置、`hidden` は [`hidden_key_columns`] の結果。
+    fn value_for(
+        &self,
+        row_id: u64,
+        cells: &[Cell],
+        hidden_base: usize,
+        hidden: &[String],
+    ) -> Result<&Cell, SqlSurfaceError> {
+        let mut key = Vec::new();
+        for (k, name) in self.keys.iter().zip(&self.key_names) {
+            let cell = match name {
+                None => Cell::Integer(row_id),
+                Some(name) => {
+                    let pos = hidden
+                        .iter()
+                        .position(|h| h == name)
+                        .and_then(|p| hidden_base.checked_add(p))
+                        .ok_or_else(|| SqlSurfaceError::Internal {
+                            detail: "correlated scalar hidden key column is missing".to_string(),
+                        })?;
+                    cells
+                        .get(pos)
+                        .cloned()
+                        .ok_or_else(|| SqlSurfaceError::Internal {
+                            detail: "correlated scalar hidden key cell is missing".to_string(),
+                        })?
+                }
+            };
+            if matches!(cell, Cell::Null) {
+                return Ok(&self.empty);
+            }
+            super::join::values::encode_key_component(&cell, &k.class, &mut key)?;
+        }
+        Ok(self.values.get(&key).unwrap_or(&self.empty))
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

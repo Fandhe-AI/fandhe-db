@@ -9048,9 +9048,29 @@ impl EngineCore {
                     &mut subquery_in_value_budget,
                     &correlated,
                 )?;
-                let result = self.run_scan_plan(read_txn, ctx, &schema, &bound)?;
-                let result =
-                    crate::sql::subquery::merge_scalar_projection_items(result, resolved_items)?;
+                // Issue #1846・SQL-61: 集計形の相関スカラーは外側の行ごとに相関キーで引き当てるため、
+                // 外側の投影の末尾へ隠しキー列を足した写しで走査する（元の投影位置は変えない。
+                // 隠し列は合流時に取り除く）。相関項目が無ければ従来どおり元の束縛で走査する。
+                let hidden = crate::sql::subquery::hidden_key_columns(&resolved_items);
+                let result = if hidden.is_empty() {
+                    self.run_scan_plan(read_txn, ctx, &schema, &bound)?
+                } else {
+                    let mut with_keys = validated.clone();
+                    crate::sql::subquery::append_hidden_key_columns(&mut with_keys, &hidden)?;
+                    let bound_with_keys = crate::sql::parser::bind_scan_with_dummy_flags(
+                        &with_keys,
+                        &schema,
+                        session.udfs(),
+                        &[],
+                        &limits,
+                    )?;
+                    self.run_scan_plan(read_txn, ctx, &schema, &bound_with_keys)?
+                };
+                let result = crate::sql::subquery::merge_scalar_projection_items(
+                    result,
+                    resolved_items,
+                    &hidden,
+                )?;
                 Ok(crate::sql::SqlOutcome::Query(result))
             }
             // 集合演算・JOIN は複数枝／両辺を単一スナップショット上で評価する必要が
