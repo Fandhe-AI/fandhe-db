@@ -66,6 +66,11 @@
 //! - スカラー: 0 行または NULL は UNKNOWN（否定は構文段で演算子反転済みのため
 //!   常に偽）。2 行以上は「先頭行を採用」せずエラー（`21000`。Issue #1404）。
 //!
+//! 式の内側の相関スカラー（Issue #1848）: 算術・比較・`COALESCE`・`CASE` の内側に埋め込まれた相関
+//! スカラーサブクエリは [`resolve_embedded_scalar_subqueries`] が WHERE 側の解決の後・外側の束縛の前に
+//! 内側を 1 回だけ実行し、値プローブを式木の葉（`BoundExpr::CorrelatedScalar`）へ解決する。
+//! 相関の無い内側は `42601`。詳細は `docs/design/sql-subquery.md` の「Issue #1848 追記」節。
+//!
 //! DoS 対策（security.md「不安全な設計｜無制限リソース確保」対応）:
 //! - ネスト深さは構文解析段（[`super::allowlist::MAX_SUBQUERY_DEPTH`]・
 //!   `Parser::require_subquery_depth`）が担う。
@@ -2169,6 +2174,149 @@ pub(crate) fn resolve_scalar_projection_items(
             deferred_error: None,
             correlated: None,
         });
+    }
+    Ok(out)
+}
+
+/// 式の内側に埋め込まれた相関スカラーサブクエリ（Issue #1848・SQL-61 ポインタ。RLS-10 ポインタ）を
+/// すべて実行し、式木の葉（[`crate::sql::correlated_scalar::CorrelatedScalarRef`]）へ解決する。
+/// `core.rs` の `Statement::Scan` アームが WHERE 側の解決（[`resolve_where_predicates`]）の後・外側の
+/// 束縛の前に、同じ `budget`／`in_value_budget`・`read_txn`・`ctx`・相関予算で呼ぶ。
+///
+/// - 集計形（Issue #1846 と同じ受理形・拒否文言）: 内側を `GROUP BY` 集計で 1 回だけ実行し、相関キー →
+///   集計値の表を値プローブへ詰める（空集合の値は `count` が 0、それ以外は NULL）。
+/// - 非集計形（Issue #1847 と同じ受理形・拒否文言）: 内側を 1 回だけ実体化し、外側の行ごとに 0 件は
+///   NULL・2 件以上は `21000` を葉の評価時点で返す。
+/// - 相関の無い内側は `42601`（SQL-29 の契約。式の内側への埋め込みは相関だけを対象とする）。
+/// - 束縛後の実行時データ例外（`22xxx`・入れ子の `21000`）は外側の行を評価するまで遅延する。
+///
+/// 内側は WHERE 側と同じ経路（RLS 暗黙適用・同一スナップショット）だけを通り、新しい可視性判定や
+/// 評価器は作らない。静的エラー（未知列・投影列数・未対応の型・受理形外）は外側の行数に依存せず返る。
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn resolve_embedded_scalar_subqueries(
+    items: &[super::allowlist::EmbeddedScalarSubquery],
+    outer_scopes: &[&TableSchema],
+    read_txn: &impl crate::storage::read_source::ReadSource,
+    ctx: &PolicyContext,
+    lookup: &impl TableLookup,
+    udfs: &UdfRegistry,
+    group_limits: crate::group_by_limits::GroupByLimits,
+    nesting_limits: crate::nesting_limits::NestingLimits,
+    result_limits: crate::result_limits::ResultLimits,
+    budget: &mut usize,
+    in_value_budget: &mut usize,
+    corr: &CorrelatedCtx,
+) -> Result<Vec<super::correlated_scalar::CorrelatedScalarRef>, SqlSurfaceError> {
+    use super::correlated_scalar::{column_type_of_meta, expr_type_for, CorrelatedScalarRef};
+    use super::join::semi::{CorrelatedProbe, CorrelatedProbeRef};
+    // 値として運べない型は内側の実行前ではなく結果列メタデータの確定後に静的に拒否する。
+    let checked_type = |meta: &ColumnMeta| -> Result<ColumnType, SqlSurfaceError> {
+        let ty = column_type_of_meta(meta)?;
+        expr_type_for(&ty)?;
+        Ok(ty)
+    };
+    if !corr.is_enabled() {
+        return Err(SqlSurfaceError::unsupported(
+            "scalar subquery inside an expression is not allowed in this context",
+        ));
+    }
+    let mut out = Vec::with_capacity(items.len());
+    for item in items {
+        if let Some((validated, inner_schema, correlation)) = classify_correlated_aggregate(
+            &item.inner_tokens,
+            item.depth,
+            outer_scopes,
+            read_txn,
+            lookup,
+            nesting_limits,
+        )? {
+            let mut agg_meta: Option<ColumnMeta> = None;
+            match resolve_correlated_scalar_aggregate(
+                validated,
+                inner_schema,
+                correlation,
+                outer_scopes,
+                read_txn,
+                ctx,
+                lookup,
+                udfs,
+                group_limits,
+                nesting_limits,
+                result_limits,
+                budget,
+                in_value_budget,
+                corr,
+                &mut agg_meta,
+            ) {
+                Ok(table) => {
+                    let ty = checked_type(&table.meta)?;
+                    let probe = CorrelatedProbe::scalar_agg_value(
+                        table.keys,
+                        table.values,
+                        table.empty,
+                        corr.budget(),
+                    );
+                    out.push(CorrelatedScalarRef::from_probe(
+                        CorrelatedProbeRef::new(probe),
+                        ty,
+                    ));
+                }
+                // 束縛後の実行時データ例外は外側の行を評価するまで遅延する（投影位置と同じ契約）。
+                Err(e) if is_deferrable_runtime_error(&e) => {
+                    let Some(meta) = agg_meta else {
+                        return Err(e);
+                    };
+                    out.push(CorrelatedScalarRef::deferred(e, checked_type(&meta)?));
+                }
+                Err(e) => return Err(e),
+            }
+            continue;
+        }
+        if let Some((validated, inner_schema, correlation)) = classify_correlated_scan(
+            &item.inner_tokens,
+            item.depth,
+            outer_scopes,
+            read_txn,
+            lookup,
+            nesting_limits,
+        )? {
+            let mut rows_meta: Option<ColumnMeta> = None;
+            match resolve_correlated_scalar_rows(
+                validated,
+                inner_schema,
+                correlation,
+                &ScalarPosition::Projection,
+                outer_scopes,
+                read_txn,
+                ctx,
+                lookup,
+                udfs,
+                group_limits,
+                nesting_limits,
+                result_limits,
+                budget,
+                in_value_budget,
+                corr,
+                &mut rows_meta,
+            ) {
+                Ok(resolved) => {
+                    let ty = checked_type(&resolved.meta)?;
+                    out.push(CorrelatedScalarRef::from_probe(resolved.probe, ty));
+                }
+                Err(e) if is_deferrable_runtime_error(&e) => {
+                    let Some(meta) = rows_meta else {
+                        return Err(e);
+                    };
+                    out.push(CorrelatedScalarRef::deferred(e, checked_type(&meta)?));
+                }
+                Err(e) => return Err(e),
+            }
+            continue;
+        }
+        // 相関の無い内側（非相関のスカラーサブクエリ）は式の内側へ埋め込めない（SQL-29 の契約）。
+        return Err(SqlSurfaceError::unsupported(
+            "scalar subqueries inside expressions are only supported when correlated",
+        ));
     }
     Ok(out)
 }
