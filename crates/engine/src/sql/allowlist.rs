@@ -21764,33 +21764,50 @@ fn materialized_cte_statement(
                 &v.outer,
                 BufferedOuter::Rows(rows) if matches!(rows.projection, Projection::All)
             ) && !v.outer_depends_on_order();
-            let hits_unevaluable = match &body_projection {
-                Projection::All => !hazards.unevaluable_columns.is_empty(),
-                Projection::Columns(names) => names
+            // 本文の射影が `names` のいずれかの列を運ぶか（名前解決と同じ大文字小文字無視の比較）。
+            let body_hits = |names: &[String]| match &body_projection {
+                Projection::All => !names.is_empty(),
+                Projection::Columns(cols) => cols
                     .iter()
-                    .any(|n| hazards.unevaluable_columns.iter().any(|u| u == n)),
-                Projection::Items(items) => projection_item_idents(items).is_none_or(|names| {
-                    names
-                        .iter()
-                        .any(|n| hazards.unevaluable_columns.iter().any(|u| u == n))
+                    .any(|c| names.iter().any(|u| u.eq_ignore_ascii_case(c))),
+                Projection::Items(items) => projection_item_idents(items).is_none_or(|cols| {
+                    cols.iter()
+                        .any(|c| names.iter().any(|u| u.eq_ignore_ascii_case(c)))
                 }),
             };
+            let hits_unevaluable = body_hits(&hazards.unevaluable_columns);
             // 外側が述語・並べ替え・ウィンドウ・集計で参照しない限り、VECTOR／ARRAY セルは
             // 射影でそのまま運ばれる（未参照列は評価対象にならない）。名前で突き合わせられるのは
             // 列別名なしの `*`／列名投影の本文だけで、それ以外は従来どおり素通し外側のみ許す。
             let name_checkable = def.column_aliases.is_empty()
                 && matches!(&body_projection, Projection::All | Projection::Columns(_));
-            let outer_refs_unevaluable = if name_checkable {
-                let idents = super::view_buffered::outer_non_projection_idents(&v.outer);
-                hazards
-                    .unevaluable_columns
+            let refs_any = |hazard_cols: &[String], idents: &std::collections::HashSet<String>| {
+                hazard_cols
                     .iter()
                     .any(|u| idents.iter().any(|i| i.eq_ignore_ascii_case(u)))
+            };
+            let outer_refs_unevaluable = if name_checkable {
+                let idents = super::view_buffered::outer_non_projection_idents(&v.outer);
+                refs_any(&hazards.unevaluable_columns, &idents)
             } else {
                 !outer_passthrough_all
             };
             if hits_unevaluable && outer_refs_unevaluable {
                 return None;
+            }
+            // 外側 `ORDER BY` は `view_buffered::plan_order` が `cmp_class` で並べ替え可能な型だけを
+            // 受理する（対応外は実行段で `22000`）。同関数の対応外の型を持つ列を並べ替えキーが
+            // 参照しうるならインライン展開へ戻す（評価方式で結果が変わらない契約）。
+            if body_hits(&hazards.unorderable_columns) {
+                let order_idents = super::view_buffered::outer_order_idents(&v.outer);
+                let outer_orders_unorderable = if name_checkable {
+                    refs_any(&hazards.unorderable_columns, &order_idents)
+                } else {
+                    !order_idents.is_empty()
+                };
+                if outer_orders_unorderable {
+                    return None;
+                }
             }
             let projects_id = match &body_projection {
                 Projection::All => true,

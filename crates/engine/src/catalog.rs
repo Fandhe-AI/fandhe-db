@@ -16353,6 +16353,11 @@ impl TableLookup for Storage {
 pub struct TableMaterializationHazards {
     /// `VECTOR`／`ARRAY` 型の実カラム名。評価後射影形の外側は述語・並べ替えで参照できない。
     pub unevaluable_columns: Vec<String>,
+    /// 評価後射影形の外側 `ORDER BY` が並べ替えられない型の実カラム名。外側が実際に使う
+    /// `sql::join::values::cmp_class` が `None` を返す型（`VECTOR`／`ARRAY` を含む。`INTERVAL`・
+    /// `TIME`・`TIMESTAMPTZ`・`JSONB`・`CHAR` 等）を、型の列挙ではなく同関数から導く
+    /// （型が増えても判定が自動で追随する）。
+    pub unorderable_columns: Vec<String>,
     /// 疑似列 `id` を持つ表（従来方式・移行済み）が実カラム `id` も宣言しているか。`SELECT *` が
     /// 疑似列 `id` と実カラム `id` の 2 列を返し、具体化後は外側の列名解決が `42702` になる。
     /// 採番方式の表は `id` が予約されず `SELECT *` も 1 列のため衝突しない（false）。
@@ -16366,6 +16371,12 @@ pub(crate) fn schema_materialization_hazards(schema: &TableSchema) -> TableMater
             .columns
             .iter()
             .filter(|c| matches!(c.ty, ColumnType::Vector(_) | ColumnType::Array(_)))
+            .map(|c| c.name.clone())
+            .collect(),
+        unorderable_columns: schema
+            .columns
+            .iter()
+            .filter(|c| crate::sql::join::values::cmp_class(Some(&c.ty)).is_none())
             .map(|c| c.name.clone())
             .collect(),
         declares_real_id: schema.has_pseudo_id() && schema.columns.iter().any(|c| c.name == "id"),

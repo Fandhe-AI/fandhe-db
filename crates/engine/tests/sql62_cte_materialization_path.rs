@@ -510,3 +510,93 @@ fn pseudo_id_above_i64_max_falls_back_to_inline() {
     // インライン側で成功する形が 1 つ以上あること（全形が両側エラーの空振りを防ぐ）。
     assert!(plain_ok > 0);
 }
+
+/// SQL で表を作り、行を投入して core を返す（型付き列の具体化可否テスト用）。
+fn open_sql_table(label: &str, ddl: &str, inserts: &[&str]) -> (EngineCore, CleanupGuard) {
+    let path = unique_db_path(label);
+    let guard = CleanupGuard(path.clone());
+    let storage = Storage::open(&path).expect("open storage");
+    let core = new_core(storage);
+    let mut session = SessionState::default();
+    session.allow_ddl();
+    core.execute_sql_in_session(&ctx("alice"), &mut session, ddl)
+        .expect("create table");
+    for (i, ins) in inserts.iter().enumerate() {
+        core.execute_sql_in_session(
+            &ctx("alice"),
+            &mut SessionState::default(),
+            &format!("{ins} USING OPERATION_ID 'ty-{label}-{i}'"),
+        )
+        .expect("insert");
+    }
+    (core, guard)
+}
+
+/// 具体化指定の有無で結果（成功時は内容、失敗時は `wire_code`）が一致すること。
+fn assert_same_outcome(core: &EngineCore, template: &str) {
+    let plain = query(core, "alice", &template.replace("{h}", ""));
+    let mat = query(core, "alice", &template.replace("{h}", "MATERIALIZED "));
+    match (plain, mat) {
+        (Ok(p), Ok(m)) => assert_eq!(render(&m), render(&p), "template={template}"),
+        (Err(p), Err(m)) => assert_eq!(m.wire_code(), p.wire_code(), "template={template}"),
+        (p, m) => panic!("outcome differs template={template} plain={p:?} mat={m:?}"),
+    }
+}
+
+/// `cmp_class` が対応しない型（INTERVAL・TIME・TIMESTAMPTZ・JSONB・CHAR）の列を外側 `ORDER BY` が
+/// 参照しても、具体化指定の有無で結果が変わらない（実行段 `22000` にならずインラインへ戻る）。
+#[test]
+fn unorderable_types_in_outer_order_by_match_inline() {
+    for (col, ty, a, b) in [
+        ("iv", "INTERVAL", "'1 day'", "'2 days'"),
+        ("tm", "TIME", "'01:00:00'", "'02:00:00'"),
+        (
+            "tz",
+            "TIMESTAMPTZ",
+            "'2024-01-01 00:00:00+00'",
+            "'2024-01-02 00:00:00+00'",
+        ),
+        ("jb", "JSONB", "'{\"a\":1}'", "'{\"a\":2}'"),
+        ("ch", "CHAR(3)", "'abc'", "'abd'"),
+    ] {
+        let (core, _g) = open_sql_table(
+            &format!("sql62-ty-{col}"),
+            &format!("CREATE TABLE ty (id BIGINT PRIMARY KEY, {col} {ty})"),
+            &[
+                &format!("INSERT INTO ty (id, {col}) VALUES (1, {b})"),
+                &format!("INSERT INTO ty (id, {col}) VALUES (2, {a})"),
+            ],
+        );
+        for t in [
+            format!("WITH x AS {{h}}(SELECT * FROM ty) SELECT id FROM x ORDER BY {col}"),
+            format!(
+                "WITH x AS {{h}}(SELECT id, {col} FROM ty) SELECT id FROM x ORDER BY {col} LIMIT 2"
+            ),
+            format!("WITH x(i, c) AS {{h}}(SELECT id, {col} FROM ty) SELECT i FROM x ORDER BY c"),
+            "WITH x AS {h}(SELECT * FROM ty) SELECT id FROM x ORDER BY id".to_string(),
+        ] {
+            assert_same_outcome(&core, &t);
+        }
+    }
+}
+
+/// 大文字小文字だけが異なる列（`"Tags"` が ARRAY・`tags` が TEXT）を含む表でも、危険列の照合は
+/// 名前解決の規則に沿った保守側（大文字小文字無視）で行われ、具体化指定の有無で結果が変わらない。
+/// 現行のカタログ名前解決は完全一致のため、照合の差で挙動が割れる入力は構成できず、これは
+/// 回帰防止（保守側へ倒す判定がエラー契約を変えないこと）の確認である。
+#[test]
+fn hazard_column_names_differing_only_by_case_match_inline() {
+    let (core, _g) = open_sql_table(
+        "sql62-case",
+        "CREATE TABLE cs (id BIGINT PRIMARY KEY, \"Tags\" TEXT[], tags TEXT, s TEXT)",
+        &["INSERT INTO cs (id, \"Tags\", tags, s) VALUES (1, ARRAY['a'], 't', 'x')"],
+    );
+    for t in [
+        "WITH x AS {h}(SELECT tags, s FROM cs) SELECT s FROM x ORDER BY tags",
+        "WITH x AS {h}(SELECT \"Tags\", s FROM cs) SELECT s FROM x ORDER BY s",
+        "WITH x AS {h}(SELECT \"Tags\", s FROM cs) SELECT s FROM x WHERE s = 'x'",
+        "WITH x AS {h}(SELECT * FROM cs) SELECT s FROM x ORDER BY tags",
+    ] {
+        assert_same_outcome(&core, t);
+    }
+}
