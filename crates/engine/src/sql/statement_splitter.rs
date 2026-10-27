@@ -329,14 +329,34 @@ pub fn classify_statement(stmt: &str) -> StatementEffect {
         Token::Ident(name) if name.eq_ignore_ascii_case("DECLARE") => StatementEffect::ReadOnly,
         Token::Ident(name) if name.eq_ignore_ascii_case("FETCH") => StatementEffect::ReadOnly,
         Token::Ident(name) if name.eq_ignore_ascii_case("CLOSE") => StatementEffect::ReadOnly,
-        // TASK-213・SQL-29 (b)（Issue #928）: `WITH`（非再帰 CTE）は
-        // `sql::allowlist::validate_sql_tokens` の `WITH` 分岐が主クエリを
-        // 広域取得（`Statement::Scan`）のみに限定し、データ変更 CTE
-        // （`WITH x AS (DELETE ...)` 等）は本文が `SELECT` 以外のため構造検証
-        // 段で `42601` になり `Statement` 自体が生成されない。したがって
-        // `WITH` を `ReadOnly` に分類しても、複数文メッセージの書き込み配置
-        // 制約（本関数の呼び出し元）をすり抜けて副作用が生じることはない。
-        Token::Ident(name) if name.eq_ignore_ascii_case("WITH") => StatementEffect::ReadOnly,
+        // TASK-213・SQL-29 (b)（Issue #928）: `WITH`（非再帰 CTE）は読み取り系。ただし
+        // データ変更 CTE（SQL-63・Issue #1875。`(` の直後に `INSERT`／`UPDATE`／`DELETE` が現れる
+        // 本文）は書き込みを持ちうる形のため `Write` に倒す（fail-closed）。現時点では
+        // `sql::allowlist::validate_sql_tokens` が固定 `0A000` で止めるが、実行結線（#1876）後も
+        // 複数文メッセージの書き込み配置制約をすり抜けないよう、分類は先に書き込み側へ置く。
+        Token::Ident(name) if name.eq_ignore_ascii_case("WITH") => {
+            // CTE 本文の `(` は直前が `AS` か `MATERIALIZED`（`AS [NOT] MATERIALIZED (`）の
+            // ものに限る。列名リスト `x(delete)` や式の括弧は本文ではない。
+            let has_dml_body = tokens.windows(3).any(|w| {
+                matches!(
+                    w.first(),
+                    Some(Token::Ident(a))
+                        if a.eq_ignore_ascii_case("AS") || a.eq_ignore_ascii_case("MATERIALIZED")
+                ) && matches!(w.get(1), Some(Token::Punct('(')))
+                    && matches!(
+                        w.get(2),
+                        Some(Token::Ident(n))
+                            if n.eq_ignore_ascii_case("INSERT")
+                                || n.eq_ignore_ascii_case("UPDATE")
+                                || n.eq_ignore_ascii_case("DELETE")
+                    )
+            });
+            if has_dml_body {
+                StatementEffect::Write
+            } else {
+                StatementEffect::ReadOnly
+            }
+        }
         Token::Ident(name) if name.eq_ignore_ascii_case("SET") => StatementEffect::SessionLocal,
         Token::Ident(name) if name.eq_ignore_ascii_case("BEGIN") => {
             StatementEffect::TransactionControl(crate::sql::transaction::TxnControl::Begin)
@@ -886,6 +906,22 @@ mod tests {
             classify_statement("WITH x AS (SELECT id FROM t) SELECT * FROM x LIMIT 1"),
             StatementEffect::ReadOnly
         );
+        // 列名リストの `delete` は本文ではない（読み取り分類のまま）。
+        assert_eq!(
+            classify_statement(
+                "WITH x(delete) AS (SELECT id FROM documents) SELECT * FROM x LIMIT 1"
+            ),
+            StatementEffect::ReadOnly
+        );
+        // SQL-63・Issue #1875: データ変更 CTE は書き込み系（`[NOT] MATERIALIZED` を挟む形を含む）。
+        for sql in [
+            "WITH d AS (DELETE FROM t RETURNING *) SELECT * FROM d LIMIT 1",
+            "WITH d AS MATERIALIZED (UPDATE t SET a = 'x' RETURNING id) SELECT * FROM d LIMIT 1",
+            "WITH d AS NOT MATERIALIZED (INSERT INTO t (a) VALUES ('x')) SELECT * FROM t LIMIT 1",
+            "WITH s AS (SELECT id FROM t), d AS (delete from t) SELECT * FROM s LIMIT 1",
+        ] {
+            assert_eq!(classify_statement(sql), StatementEffect::Write, "sql={sql}");
+        }
         assert!(check_write_placement(&["CREATE INDEX i ON t (body)", "SELECT 1"], false).is_err());
         assert!(check_write_placement(&["SELECT 1", "DROP INDEX i"], false).is_ok());
         assert_eq!(
