@@ -7,10 +7,10 @@
 //! スコープ（実装既定値。`docs/design/sql-subquery.md` 参照）:
 //! - 対応: WHERE の `<col> [NOT] IN (SELECT ...)`・`[NOT] EXISTS (SELECT ...)`
 //!   （`NOT` 系は Issue #1191）。内側は `SELECT ... FROM <table> [WHERE ...]
-//!   LIMIT <n>`（広域取得）のみ。スカラー比較サブクエリ・相関サブクエリの
+//!   [LIMIT <n>]`（広域取得）のみ。スカラー比較サブクエリ・相関サブクエリの
 //!   `42601`・`IN` 対象型の拡大は `tests/sql29_subquery_scalar.rs`。
 //! - 対象外（このファイルでは拒否の確認のみ）: 投影位置のサブクエリ・内側が
-//!   ランキング付き検索 SELECT・内側 `LIMIT` 省略・拡張クエリプロトコル
+//!   ランキング付き検索 SELECT・拡張クエリプロトコル
 //!   （Parse/Bind）経由の `$n` 併用。
 
 use engine::catalog::{ColumnDef, ColumnType, EnumTypeDef, TableSchema};
@@ -1171,24 +1171,24 @@ fn unparameterized_subquery_over_extended_query_protocol_is_accepted() {
     assert_eq!(prepared.param_count(), 0);
 }
 
+// Issue #1853・SQL-29・SQL-34: 内側の `LIMIT` 省略は受理し、独立オラクルと一致する。
 #[test]
-fn inner_subquery_without_limit_is_rejected() {
+fn inner_subquery_without_limit_is_accepted() {
     let (core, path) = new_core();
     let _guard = CleanupGuard(path);
     let ctx = ctx_for("tenant-a");
     seed_docs(&core, &ctx);
+    insert_allowed_lang(&core, &ctx, 1, "ja");
+    insert_allowed_lang(&core, &ctx, 2, "fr");
 
-    let err = expect_error_code(
+    let ids = select_ids(
         &core,
         &ctx,
         &format!(
             "SELECT id FROM {DOCS} WHERE lang IN (SELECT lang FROM {ALLOWED_LANGS}) LIMIT 100"
         ),
     );
-    assert!(matches!(
-        err,
-        engine::sql::allowlist::SqlSurfaceError::UnsupportedSyntax { .. }
-    ));
+    assert_eq!(ids, vec![1, 3]);
 }
 
 // Cursor Bugbot 指摘の回帰テスト: ウィンドウ関数（SQL-30・TASK-214、

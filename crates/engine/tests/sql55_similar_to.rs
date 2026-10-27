@@ -391,7 +391,8 @@ fn unsupported_forms_fail_closed() {
     assert_eq!(err_code(&core, "s SIMILAR TO"), "42601");
 }
 
-/// JOIN・HAVING・サブクエリ・CASE の条件・ビュー本体・式索引は対象外で `42601`。
+/// JOIN・HAVING・CASE の条件・ビュー本体・式索引は対象外で `42601`。
+/// （サブクエリ内側の素の Scan は Issue #1853 で `LIMIT` 省略を受理したため通常の WHERE と同じ。）
 #[test]
 fn other_contexts_fail_closed() {
     let (core, _g) = setup("sql55s-other");
@@ -399,7 +400,6 @@ fn other_contexts_fail_closed() {
     for q in [
         "SELECT a.id FROM t a JOIN t b ON a.id = b.id WHERE a.s SIMILAR TO 'src%' LIMIT 10",
         "SELECT k FROM t GROUP BY k HAVING k SIMILAR TO 'a' LIMIT 10",
-        "SELECT id FROM t WHERE id IN (SELECT id FROM t WHERE s SIMILAR TO 'src%') LIMIT 10",
         "SELECT CASE WHEN s SIMILAR TO 'a' THEN 1 ELSE 0 END FROM t LIMIT 10",
     ] {
         assert_eq!(exec(&core, "tenant-a", q).expect_err(q), "42601", "{q}");

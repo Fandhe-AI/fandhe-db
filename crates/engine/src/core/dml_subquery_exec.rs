@@ -86,6 +86,7 @@ impl EngineCore {
             session.udfs(),
             self.group_by_limits,
             self.nesting_limits,
+            self.result_limits,
             &mut budget,
             &mut in_budget,
         )

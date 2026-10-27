@@ -22,15 +22,15 @@
 
 | 項目 | 対応状況 |
 | ---- | -------- |
-| `<col> IN (SELECT <単一列> FROM <table> [WHERE ...] LIMIT <n>)` | 対応 |
-| `EXISTS (SELECT ... FROM <table> [WHERE ...] LIMIT <n>)` | 対応 |
+| `<col> IN (SELECT <単一列> FROM <table> [WHERE ...] [LIMIT <n>])` | 対応 |
+| `EXISTS (SELECT ... FROM <table> [WHERE ...] [LIMIT <n>])` | 対応 |
 | ネスト（`MAX_SUBQUERY_DEPTH` = 4 まで） | 対応 |
 | 外側が広域取得 SELECT（`Statement::Scan`）・集計 SELECT（`Statement::Aggregate`） | 対応 |
 | 外側がランキング付き検索 SELECT（`ORDER BY <=>`・`HYBRID`・`USING PLAN`） | **非対応**（構文は受理するが束縛時に `42601`） |
 | WHERE 値位置のスカラー比較サブクエリ（`<col> <op> (SELECT ...)`。`<op>` は `= <> < <= > >=`） | 対応（Issue #1191）。逆向き（`(SELECT ...) <op> <col>`）・式への埋め込みは **非対応**（`42601`） |
-| 投影位置のスカラーサブクエリ（`SELECT <列>, (SELECT <単一列> FROM <table> [WHERE ...] LIMIT <n>) [AS <alias>] FROM ...`） | 対応（Issue #1352）。外側は広域取得 SELECT（スカラー `ORDER BY`・`OFFSET` 可）のみ。項目全体がサブクエリである形に限り、式の内側（関数引数・演算・`CASE`）への埋め込みは `42601`。非相関のみ。内側が集計形（単一集計項目）でも可。内側が 0 行なら NULL、2 行以上は外側の結果が 1 行以上のときだけ `21000`（Issue #1404）。内側 WHERE に入れ子のスカラーサブクエリの 2 行以上も同様に外側の行数判明まで遅延（Issue #1432）。外側がランキング付き検索 SELECT・集計・`DISTINCT`・JOIN・ウィンドウ項目との併用・`EXPLAIN`・カーソル・`COPY`・`CREATE VIEW` 本体・CTE・集合演算の枝・拡張クエリプロトコルの `$n` 併用は `42601`。内側の投影位置サブクエリは `42601` |
+| 投影位置のスカラーサブクエリ（`SELECT <列>, (SELECT <単一列> FROM <table> [WHERE ...] [LIMIT <n>]) [AS <alias>] FROM ...`） | 対応（Issue #1352）。外側は広域取得 SELECT（スカラー `ORDER BY`・`OFFSET` 可）のみ。項目全体がサブクエリである形に限り、式の内側（関数引数・演算・`CASE`）への埋め込みは `42601`。非相関のみ。内側が集計形（単一集計項目）でも可。内側が 0 行なら NULL、2 行以上は外側の結果が 1 行以上のときだけ `21000`（Issue #1404）。内側 WHERE に入れ子のスカラーサブクエリの 2 行以上も同様に外側の行数判明まで遅延（Issue #1432）。外側がランキング付き検索 SELECT・集計・`DISTINCT`・JOIN・ウィンドウ項目との併用・`EXPLAIN`・カーソル・`COPY`・`CREATE VIEW` 本体・CTE・集合演算の枝・拡張クエリプロトコルの `$n` 併用は `42601`。内側の投影位置サブクエリは `42601` |
 | 内側がランキング付き検索 SELECT・集合演算・JOIN | **非対応**（`42601`）。集計形（単一集計項目。`GROUP BY` の有無を問わず `LIMIT` 不要）はスカラー比較の内側に限り対応（Issue #1191）。`IN`／`EXISTS` の内側の集計形は非対応 |
-| 内側の `LIMIT` 省略 | **非対応**（`42601`。内側は常に明示 `LIMIT` が必要） |
+| 内側の `LIMIT` 省略・`LIMIT ALL` | 対応（Issue #1853・SQL-29・SQL-34）。上限は結果行数上限 `--max-result-rows` だけを参照し、`IN`／`NOT IN` は上限超過で `54000`（黙って切り詰めない）。`EXISTS` は 1 件、スカラー用途は 2 件（`21000` 判定用）へ差し替えて有界にする。明示 `LIMIT` の範囲検証も設定値に追随する |
 | 内側の `OFFSET` | 未検証（構文上は Scan 形状を再利用するため通るが、意味論は未確認。将来の Issue 課題） |
 | 相関サブクエリ | **非対応**。束縛前の静的走査で `42601`（Issue #1191。内側スキーマに無く外側スコープのいずれかに有る非修飾列名の参照を検出する。どこにも無い名前は従来どおり `22000`） |
 | `NOT IN`・`NOT EXISTS` | 対応（Issue #1191。`NOT IN` は NULL 規則込み。後述） |
@@ -107,8 +107,8 @@ RLS は既存の実行器がそのまま適用するため、新しい可視性�
 - 1 文あたりの内側クエリ実行回数: `sql::subquery::MAX_SUBQUERY_EXECUTIONS`
   = 16（実装既定値。解決の再帰呼び出し階層全体で共有する `&mut usize`
   カウンタで検査。ネスト深さと組み合わせて評価コストを有界にする）。
-- 内側の可視結果行数: `core::MAX_SEARCH_K`（10,000）超過は `54000`
-  （内側 `LIMIT` の範囲検証とは独立の追加防御）。
+- 内側の可視結果行数: 結果行数上限 `--max-result-rows`（既定 10,000）超過は `54000`
+  （Issue #1853。`LIMIT` 省略形は scan 側が上限 + 1 件で止めて拒否し、本ガードは明示 `LIMIT`・集計形の追加防御）。
 - `IN (SELECT ...)` の distinct 値数: `sql::subquery::MAX_SUBQUERY_IN_VALUES`
   （10,000。`core::MAX_SEARCH_K` と同値の独立定数、Issue #1517。Issue #1165 で旧 256 葉上限〔PR #1103
   codex-review 指摘対応で導入〕から集合照合方式へ見直して引き上げ。文全体で共有する

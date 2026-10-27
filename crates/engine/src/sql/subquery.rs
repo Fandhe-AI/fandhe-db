@@ -20,11 +20,12 @@
 //!
 //! 対応する内側の形:
 //! - `IN`／`NOT IN`／`EXISTS`／`NOT EXISTS`: `SELECT <単一列> FROM <table> [WHERE ...]
-//!   LIMIT <n>`（広域取得＝[`Statement::Scan`]）のみ。
+//!   [LIMIT <n>]`（広域取得＝[`Statement::Scan`]）のみ。`LIMIT` の省略・`LIMIT ALL` も
+//!   受理する（Issue #1853・SQL-29・SQL-34。上限の扱いは下記）。
 //! - スカラー: 上記に加え、単一集計項目の集計形（[`Statement::Aggregate`]。
 //!   `GROUP BY` の有無を問わず `LIMIT` 不要）。
 //!
-//! ランキング付き検索 SELECT・集合演算・JOIN・内側の `LIMIT` 省略（Scan 形）・
+//! ランキング付き検索 SELECT・集合演算・JOIN・
 //! 内側自身の投影位置スカラーサブクエリは `42601`（`docs/design/sql-subquery.md` 参照）。
 //!
 //! 投影位置のスカラーサブクエリ（Issue #1352。外側は広域取得 SELECT のみ）は
@@ -55,7 +56,9 @@
 //!   共有する `&mut usize` として引き回す）。入れ子 WHERE が遅延対象エラーで打ち切られた
 //!   ときの静的検証（[`static_validate_subquery_predicates`]）は内側を実行せず、スキーマ取得と
 //!   束縛のみ（文の長さとネスト深さで有界）のため、この予算を消費しない（Issue #1432）。
-//! - 内側の可視行数は [`crate::core::MAX_SEARCH_K`] を超えたら `54000`。
+//! - 内側の可視行数は結果行数上限（`--max-result-rows`。`ResultLimits::max_result_rows()`）を
+//!   超えたら `54000`。`LIMIT` 省略形の `IN`／`NOT IN` は上限 + 1 件で取得を止めて拒否し、
+//!   `EXISTS` は 1 件、スカラー用途は 2 件（`21000` 判定用）へ差し替えて有界にする。
 //! - `IN`／`NOT IN` は内側の distinct 値を [`crate::declarative_filter::MAX_IN_LIST_ITEMS`]
 //!   件以下のチャンクへ分け、チャンクごとの `WherePredicate::InList`（既存評価器の
 //!   集合照合）を `Or`（`NOT IN` は `Not(InList)` の連言）に束ねる。取り込める
@@ -99,10 +102,12 @@ pub(crate) const MAX_SUBQUERY_EXECUTIONS: usize = 16;
 /// 分割し、各チャンクを既存の `InList`（束縛時にソート・重複除去済みの
 /// `FilterOp::InText`、評価は二分探索）へ束縛するため、1 行あたりの評価コストは
 /// 「分岐数 × O(log 256)」で有界。内側 1 回の可視行数は既に
-/// [`crate::core::MAX_SEARCH_K`] で頭打ちのため、単一の `IN` サブクエリは
+/// 結果行数上限（既定 10,000）で頭打ちのため、既定構成では単一の `IN` サブクエリは
 /// この上限に到達しない（複数の `IN` の distinct 合計のみが上限に効く）。
+/// `--max-result-rows` を引き上げた構成では、単一の `IN` でも distinct 値数がこの上限を
+/// 超えれば `54000`（評価コスト予算。Issue #1853）。
 ///
-/// 現行の既定値では `MAX_SEARCH_K` と同値（10,000）だが、参照ではなく独立した
+/// 現行の既定値では結果行数上限の既定と同値（10,000）だが、参照ではなく独立した
 /// リテラル定数とする。検索 k 上限を設定可能にしても本予算が連動しないようにする
 /// ため（Issue #1517・SQL-34・SQL-46）。
 pub(crate) const MAX_SUBQUERY_IN_VALUES: usize = 10_000;
@@ -142,6 +147,7 @@ pub(crate) fn resolve_where_predicates(
     udfs: &UdfRegistry,
     group_limits: crate::group_by_limits::GroupByLimits,
     nesting_limits: crate::nesting_limits::NestingLimits,
+    result_limits: crate::result_limits::ResultLimits,
     budget: &mut usize,
     in_value_budget: &mut usize,
 ) -> Result<Vec<WherePredicate>, SqlSurfaceError> {
@@ -160,6 +166,7 @@ pub(crate) fn resolve_where_predicates(
                         udfs,
                         group_limits,
                         nesting_limits,
+                        result_limits,
                         budget,
                         in_value_budget,
                     )?);
@@ -183,6 +190,7 @@ pub(crate) fn resolve_where_predicates(
                     udfs,
                     group_limits,
                     nesting_limits,
+                    result_limits,
                     budget,
                     in_value_budget,
                 )?);
@@ -201,6 +209,7 @@ pub(crate) fn resolve_where_predicates(
                     udfs,
                     group_limits,
                     nesting_limits,
+                    result_limits,
                     budget,
                     in_value_budget,
                 )?;
@@ -232,6 +241,7 @@ pub(crate) fn resolve_where_predicates(
                     udfs,
                     group_limits,
                     nesting_limits,
+                    result_limits,
                     budget,
                     in_value_budget,
                 )?);
@@ -256,6 +266,7 @@ pub(crate) fn resolve_where_predicates(
                         udfs,
                         group_limits,
                         nesting_limits,
+                        result_limits,
                         budget,
                         in_value_budget,
                     )?);
@@ -276,6 +287,7 @@ pub(crate) fn resolve_where_predicates(
                         udfs,
                         group_limits,
                         nesting_limits,
+                        result_limits,
                         budget,
                         in_value_budget,
                     )?;
@@ -436,6 +448,7 @@ fn execute_inner_query(
     udfs: &UdfRegistry,
     group_limits: crate::group_by_limits::GroupByLimits,
     nesting_limits: crate::nesting_limits::NestingLimits,
+    result_limits: crate::result_limits::ResultLimits,
     budget: &mut usize,
     in_value_budget: &mut usize,
 ) -> Result<super::exec::QueryResult, SqlSurfaceError> {
@@ -451,6 +464,7 @@ fn execute_inner_query(
         udfs,
         group_limits,
         nesting_limits,
+        result_limits,
         budget,
         in_value_budget,
         &mut meta_sink,
@@ -473,6 +487,7 @@ fn execute_inner_query_with_meta(
     udfs: &UdfRegistry,
     group_limits: crate::group_by_limits::GroupByLimits,
     nesting_limits: crate::nesting_limits::NestingLimits,
+    result_limits: crate::result_limits::ResultLimits,
     budget: &mut usize,
     in_value_budget: &mut usize,
     meta_sink: &mut Option<Vec<ColumnMeta>>,
@@ -501,6 +516,7 @@ fn execute_inner_query_with_meta(
             udfs,
             group_limits,
             nesting_limits,
+            result_limits,
             budget,
             in_value_budget,
             meta_sink,
@@ -517,6 +533,7 @@ fn execute_inner_query_with_meta(
             udfs,
             group_limits,
             nesting_limits,
+            result_limits,
             budget,
             in_value_budget,
             meta_sink,
@@ -524,14 +541,23 @@ fn execute_inner_query_with_meta(
         _ => return Err(unsupported_inner_statement()),
     };
 
-    // `bind_scan` の LIMIT 範囲検証とは独立に、内側の可視結果行数を
-    // `MAX_SEARCH_K` で頭打ちにする防御的な上限（security.md「不安全な設計」
-    // 対応。内側 LIMIT の値自体は利用者が指定できるため、既存の範囲検証の
-    // 上限がこの値より緩い場合の保険）。
-    if result.rows.len() > crate::core::MAX_SEARCH_K {
+    // 内側の可視結果行数を結果行数上限（`--max-result-rows`）で頭打ちにする多層防御
+    // （security.md「不安全な設計」対応）。`LIMIT` 省略形は scan 側の
+    // `row_limit_exceeded()` が先に `54000` を返すため、本ガードは明示 `LIMIT` と
+    // 集計形のための保険として残す。
+    // スカラー用途は基数判定用に最大 2 件取得するため、cap が 1 でも 2 件目までは
+    // 許容する（2 件以上は呼び出し側が `21000` を返す）。
+    let max_rows = if matches!(
+        intent,
+        InnerScanIntent::Scalar | InnerScanIntent::ScalarValue
+    ) {
+        result_limits.max_result_rows().max(2)
+    } else {
+        result_limits.max_result_rows()
+    };
+    if result.rows.len() > max_rows {
         return Err(SqlSurfaceError::payload_too_large(format!(
-            "subquery result row count exceeds limit {}",
-            crate::core::MAX_SEARCH_K
+            "subquery result row count exceeds limit {max_rows}"
         )));
     }
 
@@ -542,7 +568,7 @@ fn execute_inner_query_with_meta(
 /// [`execute_inner_query_with_meta`] と [`static_validate_inner_query`] で共有する。
 fn unsupported_inner_statement() -> SqlSurfaceError {
     SqlSurfaceError::unsupported(
-        "subquery must be a plain SELECT ... FROM ... [WHERE ...] LIMIT n \
+        "subquery must be a plain SELECT ... FROM ... [WHERE ...] [LIMIT n] \
          (no HYBRID / USING PLAN / set operation / JOIN; GROUP BY only as a scalar \
          aggregate)",
     )
@@ -558,11 +584,9 @@ fn inner_scan_prechecks(
     outer_scopes: &[&TableSchema],
     read_txn: &impl crate::storage::read_source::ReadSource,
 ) -> Result<TableSchema, SqlSurfaceError> {
-    // Issue #1796・SQL-34: 内側の `LIMIT` 省略・`LIMIT ALL` は従来どおり `42601`
-    // （サブクエリ内側の暗黙上限は #1852／#1853 の範囲。受理範囲を黙って広げない）。
-    if validated.limit_implicit {
-        return Err(unsupported_inner_statement());
-    }
+    // Issue #1853・SQL-29・SQL-34: 内側の `LIMIT` 省略・`LIMIT ALL` は受理する。
+    // 取得上限は用途ごとに呼び出し側（実行経路・静的検証経路）が束縛前に確定する
+    // （`Values` は結果行数上限 + 1、`ExistenceOnly` は 1、スカラー用途は 2）。
     // Cursor Bugbot 指摘対応: ウィンドウ関数（SQL-30・TASK-214、Issue #930）を
     // 含む内側は一律拒否する。`window_items` が非空だと `sql::scan::execute_scan` は
     // `sql::window::execute_window_scan` へ分岐し、`LIMIT` による早期終了なしに
@@ -648,6 +672,7 @@ fn execute_inner_scan_statement(
     udfs: &UdfRegistry,
     group_limits: crate::group_by_limits::GroupByLimits,
     nesting_limits: crate::nesting_limits::NestingLimits,
+    result_limits: crate::result_limits::ResultLimits,
     budget: &mut usize,
     in_value_budget: &mut usize,
     meta_sink: &mut Option<Vec<ColumnMeta>>,
@@ -670,6 +695,7 @@ fn execute_inner_scan_statement(
         udfs,
         group_limits,
         nesting_limits,
+        result_limits,
         budget,
         in_value_budget,
     ) {
@@ -690,10 +716,17 @@ fn execute_inner_scan_statement(
                         lookup,
                         udfs,
                         nesting_limits,
+                        result_limits,
                     )?;
                 }
                 validated.where_predicates = static_validation_predicates(&original_preds);
-                let bound = super::parser::bind_scan(&validated, &inner_schema, udfs)?;
+                let bound = super::parser::bind_scan_with_dummy_flags(
+                    &validated,
+                    &inner_schema,
+                    udfs,
+                    &[],
+                    &result_limits,
+                )?;
                 *meta_sink = super::describe::scan_columns(&bound, &inner_schema).ok();
             }
             return Err(e);
@@ -705,7 +738,10 @@ fn execute_inner_scan_statement(
         // は、これから使う値を 1 へ差し替えても迂回されないよう、差し替え前の
         // 元の値に対して明示的に検証しておく（fail-closed）。`OFFSET` は可視性
         // 判定に意味を持つため変更しない。
-        super::parser::validate_search_limit(validated.limit)?;
+        // `LIMIT` 省略形は検証対象の明示値が無く、下の差し替えで有界値（1）になる。
+        if !validated.limit_implicit {
+            super::parser::validate_search_limit_with(validated.limit, &result_limits)?;
+        }
         // ユーザー指定の投影も、実行用に空へ差し替える前に必ず束縛検証する
         // （検証前に入力を差し替えると、存在しない列を指定した内側クエリが列検証を
         // すり抜け、可視行の有無だけで成否が決まってしまう）。束縛結果自体は使わない。
@@ -717,18 +753,56 @@ fn execute_inner_scan_statement(
             &mut probe_node_budget,
         )?;
         validated.projection = Projection::Columns(Vec::new());
+        // 有界値（1）への差し替えと同時に暗黙上限扱いを解く（fail-open 防止）。
         validated.limit = 1;
+        validated.limit_implicit = false;
     }
 
-    if intent == InnerScanIntent::ScalarValue {
-        // 元の `LIMIT` 自体の範囲検証は差し替えで迂回されないよう先に行う（fail-closed）。
-        super::parser::validate_search_limit(validated.limit)?;
-        validated.limit = validated.limit.min(2);
-    }
+    let bind_limits = apply_scalar_inner_limit(&mut validated, intent, &result_limits)?;
 
-    let bound = super::parser::bind_scan(&validated, &inner_schema, udfs)?;
+    let bound = super::parser::bind_scan_with_dummy_flags(
+        &validated,
+        &inner_schema,
+        udfs,
+        &[],
+        &bind_limits,
+    )?;
     *meta_sink = super::describe::scan_columns(&bound, &inner_schema).ok();
     super::scan::execute_scan(read_txn, ctx, &inner_schema, &bound)
+}
+
+/// スカラー用途（`Scalar`／`ScalarValue`）の内側 Scan の取得上限を確定する（Issue #1853・
+/// SQL-29・SQL-34）。`LIMIT` 省略・`LIMIT ALL` は 2 件（基数違反 `21000` の判定に足りる
+/// 最小）へ差し替え、暗黙上限扱いを同時に解く。明示 `LIMIT` は結果行数上限で範囲検証し、
+/// `ScalarValue` のみ 2 へ頭打ちにする（`Scalar` は従来どおり値を保つ）。
+/// 検証は差し替えより先に行い、差し替えで迂回されないようにする（fail-closed）。
+/// 実行経路と静的検証経路の両方から呼び、2 系統の挙動を分岐させない。
+/// 戻り値は bind に渡す上限。省略形の 2 件は基数判定用の内部プローブであり利用者の
+/// 明示 `LIMIT` ではないため、cap が 1 でも bind の範囲検証で `22000` にならないよう
+/// `max(cap, 2)` の上限を返す（`Scalar`／`ScalarValue` 以外と明示 `LIMIT` は cap のまま）。
+fn apply_scalar_inner_limit(
+    validated: &mut ValidatedScan,
+    intent: InnerScanIntent,
+    result_limits: &crate::result_limits::ResultLimits,
+) -> Result<crate::result_limits::ResultLimits, SqlSurfaceError> {
+    if !matches!(
+        intent,
+        InnerScanIntent::Scalar | InnerScanIntent::ScalarValue
+    ) {
+        return Ok(*result_limits);
+    }
+    if validated.limit_implicit {
+        validated.limit = 2;
+        validated.limit_implicit = false;
+        return Ok(crate::result_limits::ResultLimits::new(
+            result_limits.max_result_rows().max(2),
+        ));
+    }
+    super::parser::validate_search_limit_with(validated.limit, result_limits)?;
+    if intent == InnerScanIntent::ScalarValue {
+        validated.limit = validated.limit.min(2);
+    }
+    Ok(*result_limits)
 }
 
 /// [`execute_inner_query`] の集計（`Statement::Aggregate`。スカラー用途のみ）側の
@@ -744,6 +818,7 @@ fn execute_inner_aggregate_statement(
     udfs: &UdfRegistry,
     group_limits: crate::group_by_limits::GroupByLimits,
     nesting_limits: crate::nesting_limits::NestingLimits,
+    result_limits: crate::result_limits::ResultLimits,
     budget: &mut usize,
     in_value_budget: &mut usize,
     meta_sink: &mut Option<Vec<ColumnMeta>>,
@@ -762,6 +837,7 @@ fn execute_inner_aggregate_statement(
         udfs,
         group_limits,
         nesting_limits,
+        result_limits,
         budget,
         in_value_budget,
     ) {
@@ -776,6 +852,7 @@ fn execute_inner_aggregate_statement(
                     lookup,
                     udfs,
                     nesting_limits,
+                    result_limits,
                 )?;
             }
             validated.where_predicates = static_validation_predicates(&original_preds);
@@ -818,7 +895,7 @@ fn is_deferrable_runtime_error(e: &SqlSurfaceError) -> bool {
 /// なし」とみなして後続の静的エラーを見落とす経路を作らない＝fail-closed）。
 /// コストはカタログからのスキーマ取得と束縛のみで、文の長さと
 /// [`super::allowlist::MAX_SUBQUERY_DEPTH`] で有界（可視行の読み取りは行わない）。
-/// 行数・値に依存する検査（`21000`・`MAX_SEARCH_K` 超過・`IN` 値予算）は対象外。
+/// 行数・値に依存する検査（`21000`・結果行数上限超過・`IN` 値予算）は対象外。
 fn static_validate_subquery_predicates(
     preds: &[WherePredicate],
     chain: &[&TableSchema],
@@ -826,6 +903,7 @@ fn static_validate_subquery_predicates(
     lookup: &impl TableLookup,
     udfs: &UdfRegistry,
     nesting_limits: crate::nesting_limits::NestingLimits,
+    result_limits: crate::result_limits::ResultLimits,
 ) -> Result<(), SqlSurfaceError> {
     for pred in preds {
         match pred {
@@ -838,6 +916,7 @@ fn static_validate_subquery_predicates(
                         lookup,
                         udfs,
                         nesting_limits,
+                        result_limits,
                     )?;
                 }
             }
@@ -848,6 +927,7 @@ fn static_validate_subquery_predicates(
                 lookup,
                 udfs,
                 nesting_limits,
+                result_limits,
             )?,
             WherePredicate::InSubquery {
                 column,
@@ -864,6 +944,7 @@ fn static_validate_subquery_predicates(
                     lookup,
                     udfs,
                     nesting_limits,
+                    result_limits,
                 )?;
                 let [inner_meta] = meta.as_slice() else {
                     return Err(SqlSurfaceError::unsupported(
@@ -888,6 +969,7 @@ fn static_validate_subquery_predicates(
                     lookup,
                     udfs,
                     nesting_limits,
+                    result_limits,
                 )?;
             }
             WherePredicate::ScalarSubqueryCompare {
@@ -906,6 +988,7 @@ fn static_validate_subquery_predicates(
                     lookup,
                     udfs,
                     nesting_limits,
+                    result_limits,
                 )?;
                 let [inner_meta] = meta.as_slice() else {
                     return Err(SqlSurfaceError::unsupported(
@@ -935,6 +1018,7 @@ fn static_validate_inner_query(
     lookup: &impl TableLookup,
     udfs: &UdfRegistry,
     nesting_limits: crate::nesting_limits::NestingLimits,
+    result_limits: crate::result_limits::ResultLimits,
 ) -> Result<Vec<ColumnMeta>, SqlSurfaceError> {
     let stmt = super::allowlist::validate_sql_tokens_with_subquery_ctx_limits(
         inner_tokens,
@@ -954,13 +1038,17 @@ fn static_validate_inner_query(
                 lookup,
                 udfs,
                 nesting_limits,
+                result_limits,
             )?;
             validated.where_predicates = static_validation_predicates(&validated.where_predicates);
+            let mut scalar_bind_limits = result_limits;
             match intent {
                 InnerScanIntent::ExistenceOnly => {
                     // 実行経路（`execute_inner_scan_statement`）と同じく、差し替え前の
                     // `LIMIT`・投影を検証してから可視性判定用の形へ差し替える。
-                    super::parser::validate_search_limit(validated.limit)?;
+                    if !validated.limit_implicit {
+                        super::parser::validate_search_limit_with(validated.limit, &result_limits)?;
+                    }
                     let mut probe_node_budget = crate::sql::udf_call::MAX_EXPR_NODES;
                     super::parser::bind_projection(
                         &validated.projection,
@@ -970,14 +1058,21 @@ fn static_validate_inner_query(
                     )?;
                     validated.projection = Projection::Columns(Vec::new());
                     validated.limit = 1;
+                    validated.limit_implicit = false;
                 }
-                InnerScanIntent::ScalarValue => {
-                    super::parser::validate_search_limit(validated.limit)?;
-                    validated.limit = validated.limit.min(2);
+                InnerScanIntent::ScalarValue | InnerScanIntent::Scalar => {
+                    scalar_bind_limits =
+                        apply_scalar_inner_limit(&mut validated, intent, &result_limits)?;
                 }
-                InnerScanIntent::Values | InnerScanIntent::Scalar => {}
+                InnerScanIntent::Values => {}
             }
-            let bound = super::parser::bind_scan(&validated, &inner_schema, udfs)?;
+            let bound = super::parser::bind_scan_with_dummy_flags(
+                &validated,
+                &inner_schema,
+                udfs,
+                &[],
+                &scalar_bind_limits,
+            )?;
             super::describe::scan_columns(&bound, &inner_schema)
         }
         (
@@ -994,6 +1089,7 @@ fn static_validate_inner_query(
                 lookup,
                 udfs,
                 nesting_limits,
+                result_limits,
             )?;
             validated.where_predicates = static_validation_predicates(&validated.where_predicates);
             let bound = super::parser::bind_aggregate(&validated, &inner_schema, udfs)?;
@@ -1042,6 +1138,7 @@ pub(crate) fn resolve_aggregate_item_filters(
     udfs: &UdfRegistry,
     group_limits: crate::group_by_limits::GroupByLimits,
     nesting_limits: crate::nesting_limits::NestingLimits,
+    result_limits: crate::result_limits::ResultLimits,
     budget: &mut usize,
     in_value_budget: &mut usize,
 ) -> Result<(), SqlSurfaceError> {
@@ -1060,6 +1157,7 @@ pub(crate) fn resolve_aggregate_item_filters(
                 udfs,
                 group_limits,
                 nesting_limits,
+                result_limits,
                 budget,
                 in_value_budget,
             )?;
@@ -1253,6 +1351,7 @@ fn resolve_in_subquery(
     udfs: &UdfRegistry,
     group_limits: crate::group_by_limits::GroupByLimits,
     nesting_limits: crate::nesting_limits::NestingLimits,
+    result_limits: crate::result_limits::ResultLimits,
     budget: &mut usize,
     in_value_budget: &mut usize,
 ) -> Result<Vec<WherePredicate>, SqlSurfaceError> {
@@ -1268,6 +1367,7 @@ fn resolve_in_subquery(
         udfs,
         group_limits,
         nesting_limits,
+        result_limits,
         budget,
         in_value_budget,
         &mut meta_sink,
@@ -1625,6 +1725,7 @@ pub(crate) fn resolve_scalar_projection_items(
     udfs: &UdfRegistry,
     group_limits: crate::group_by_limits::GroupByLimits,
     nesting_limits: crate::nesting_limits::NestingLimits,
+    result_limits: crate::result_limits::ResultLimits,
     budget: &mut usize,
     in_value_budget: &mut usize,
 ) -> Result<Vec<ResolvedScalarItem>, SqlSurfaceError> {
@@ -1642,6 +1743,7 @@ pub(crate) fn resolve_scalar_projection_items(
             udfs,
             group_limits,
             nesting_limits,
+            result_limits,
             budget,
             in_value_budget,
             &mut meta_sink,
@@ -1933,6 +2035,7 @@ fn resolve_scalar_compare(
     udfs: &UdfRegistry,
     group_limits: crate::group_by_limits::GroupByLimits,
     nesting_limits: crate::nesting_limits::NestingLimits,
+    result_limits: crate::result_limits::ResultLimits,
     budget: &mut usize,
     in_value_budget: &mut usize,
 ) -> Result<WherePredicate, SqlSurfaceError> {
@@ -1948,6 +2051,7 @@ fn resolve_scalar_compare(
         udfs,
         group_limits,
         nesting_limits,
+        result_limits,
         budget,
         in_value_budget,
         &mut meta_sink,
@@ -2193,6 +2297,7 @@ fn resolve_exists_subquery(
     udfs: &UdfRegistry,
     group_limits: crate::group_by_limits::GroupByLimits,
     nesting_limits: crate::nesting_limits::NestingLimits,
+    result_limits: crate::result_limits::ResultLimits,
     budget: &mut usize,
     in_value_budget: &mut usize,
 ) -> Result<bool, SqlSurfaceError> {
@@ -2207,6 +2312,7 @@ fn resolve_exists_subquery(
         udfs,
         group_limits,
         nesting_limits,
+        result_limits,
         budget,
         in_value_budget,
     )?;
@@ -2347,6 +2453,7 @@ mod tests {
             &udfs,
             crate::group_by_limits::GroupByLimits::default(),
             crate::nesting_limits::NestingLimits::default(),
+            crate::result_limits::ResultLimits::default(),
             &mut budget,
             &mut in_value_budget,
         )
@@ -2402,6 +2509,7 @@ mod tests {
             &udfs,
             crate::group_by_limits::GroupByLimits::default(),
             crate::nesting_limits::NestingLimits::default(),
+            crate::result_limits::ResultLimits::default(),
             &mut budget,
             &mut in_value_budget,
         )
