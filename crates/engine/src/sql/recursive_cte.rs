@@ -179,6 +179,12 @@ fn is_operator_position(tokens: &[Token], i: usize, w: &str) -> bool {
         return set_operator_is_followed_by_branch(tokens, i);
     }
     if w.eq_ignore_ascii_case("OFFSET") || w.eq_ignore_ascii_case("FETCH") {
+        // `AS offset` / `AS fetch` は別名であり句ではない。
+        if i.checked_sub(1)
+            .is_some_and(|p| is_word(tokens.get(p), "AS"))
+        {
+            return false;
+        }
         let prev_ends_expr = i
             .checked_sub(1)
             .and_then(|p| tokens.get(p))
@@ -192,7 +198,8 @@ fn is_operator_position(tokens: &[Token], i: usize, w: &str) -> bool {
                         | Token::Param(_)
                         | Token::Number(_)
                         | Token::StringLiteral(_)
-                        | Token::Punct(')')
+                        | Token::QuotedCollationName(_)
+                        | Token::Punct(')' | ']')
                 )
             });
         let next_is_operand = !matches!(
@@ -299,26 +306,37 @@ pub(crate) fn validate_recursive_with(
     }
     structural(&main_tokens, limits)?;
 
+    // 機能ゲート（0A000）は検出結果を保持し、全定義の構文・再帰構造の検証が終わってから返す。
+    let mut deferred: Option<SqlSurfaceError> = None;
     let mut defs = Vec::with_capacity(raw_defs.len());
     for (idx, (name, column_aliases, body)) in raw_defs.iter().enumerate() {
         let first = body.first();
         if matches!(first, Some(Token::Ident(w))
             if ["INSERT", "UPDATE", "DELETE"].iter().any(|k| w.eq_ignore_ascii_case(k)))
         {
-            return Err(SqlSurfaceError::feature_not_supported(
-                "data-modifying statements in WITH RECURSIVE are not supported",
-            ));
+            // 本文は SELECT でなく構文検証できないため、この定義の検証だけ省く。
+            deferred.get_or_insert_with(|| {
+                SqlSurfaceError::feature_not_supported(
+                    "data-modifying statements in WITH RECURSIVE are not supported",
+                )
+            });
+            continue;
         }
         if is_word(first, "WITH") {
-            return Err(SqlSurfaceError::feature_not_supported(
-                "nested WITH inside WITH RECURSIVE is not supported",
-            ));
+            deferred.get_or_insert_with(|| {
+                SqlSurfaceError::feature_not_supported(
+                    "nested WITH inside WITH RECURSIVE is not supported",
+                )
+            });
+            continue;
         }
         for (_, (later, _, _)) in raw_defs.iter().enumerate().skip(idx.saturating_add(1)) {
             if !relation_refs(body, later).is_empty() {
-                return Err(SqlSurfaceError::feature_not_supported(
-                    "forward references between WITH RECURSIVE queries are not supported",
-                ));
+                deferred.get_or_insert_with(|| {
+                    SqlSurfaceError::feature_not_supported(
+                        "forward references between WITH RECURSIVE queries are not supported",
+                    )
+                });
             }
         }
         let refs = relation_refs(body, name);
@@ -328,13 +346,16 @@ pub(crate) fn validate_recursive_with(
                 tokens: body.clone(),
             }
         } else {
-            validate_recursive_body(name, body, limits)?
+            validate_recursive_body(name, body, limits, &mut deferred)?
         };
         defs.push(RecursiveCteDef {
             name: name.clone(),
             column_aliases: column_aliases.clone(),
             body: kind,
         });
+    }
+    if let Some(e) = deferred {
+        return Err(e);
     }
     Ok(RecursiveWithClause { defs, main_tokens })
 }
@@ -344,6 +365,7 @@ fn validate_recursive_body(
     name: &str,
     body: &[Token],
     limits: NestingLimits,
+    deferred: &mut Option<SqlSurfaceError>,
 ) -> Result<RecursiveCteBody, SqlSurfaceError> {
     let bad = |reason: &'static str| SqlSurfaceError::invalid_recursion(name, reason);
 
@@ -368,7 +390,18 @@ fn validate_recursive_body(
     // 判定順序は構文 → 再帰構造 → 機能ゲート。構造判定の前に各項の構文を検証する。
     structural(anchor, limits)?;
     let (term, wrapped, trailing, inner_clause) = peel_term(recursive, limits)?;
-    let stmt = structural(term, limits)?;
+    // 末尾句（本文全体に掛かる句。0A000 は後回し）は、句だけを `SELECT 1` に連結して構文を検証し、
+    // 構造検査は句を除いた項で行う（集計項などに句が付いても 42P19 を優先して返すため）。
+    let core_len = depth0_words(term, &["ORDER", "LIMIT", "OFFSET", "FETCH"])
+        .first()
+        .copied()
+        .unwrap_or(term.len());
+    if let Some(tail) = term.get(core_len..).filter(|t| !t.is_empty()) {
+        let mut probe = vec![Token::Keyword(Keyword::Select), Token::Number("1".into())];
+        probe.extend_from_slice(tail);
+        structural(&probe, limits)?;
+    }
+    let stmt = structural(term.get(..core_len).unwrap_or(term), limits)?;
 
     if !relation_refs(anchor, name).is_empty() {
         return Err(bad(
@@ -399,9 +432,12 @@ fn validate_recursive_body(
     // 括弧の無い再帰項の末尾、または括弧の後ろに続く ORDER BY／LIMIT／OFFSET／FETCH は
     // 本文全体に掛かる句で、PostgreSQL も未実装（0A000）。
     if trailing || clauses {
-        return Err(SqlSurfaceError::feature_not_supported(
-            "ORDER BY, LIMIT, OFFSET and FETCH on WITH RECURSIVE queries are not supported",
-        ));
+        // 再帰項の集計・ウィンドウ違反（42P19）を優先するため、返却は検証完了後に回す。
+        deferred.get_or_insert_with(|| {
+            SqlSurfaceError::feature_not_supported(
+                "ORDER BY, LIMIT, OFFSET and FETCH on WITH RECURSIVE queries are not supported",
+            )
+        });
     }
 
     check_recursive_term(name, &stmt)?;
@@ -543,6 +579,24 @@ mod tests {
         ] {
             assert_eq!(code(sql), NOT_YET, "{sql}");
         }
+    }
+
+    #[test]
+    fn structure_and_syntax_errors_take_precedence_over_feature_gate() {
+        for (sql, want) in [
+            ("WITH RECURSIVE t(n) AS (SELECT 1 UNION ALL SELECT count(*) FROM t LIMIT 5) SELECT n FROM t", "42P19"),
+            ("WITH RECURSIVE a AS (SELECT FROM b), b AS (SELECT 1) SELECT 1", "42601"),
+            ("WITH RECURSIVE d AS (DELETE FROM docs), t AS (SELECT n FROM t) SELECT 1", "42P19"),
+            ("WITH RECURSIVE u AS (WITH v AS (SELECT 1) SELECT 1), t AS (SELECT FROM t) SELECT 1", "42601"),
+        ] {
+            assert_eq!(code(sql), want, "{sql}");
+        }
+    }
+
+    #[test]
+    fn offset_after_subscript_is_a_trailing_clause() {
+        let sql = "WITH RECURSIVE t(n) AS (SELECT 1 UNION ALL SELECT n + 1 FROM t WHERE n < d[1] OFFSET 1) SELECT n FROM t";
+        assert_eq!(code(sql), NOT_YET, "{sql}");
     }
 
     #[test]
