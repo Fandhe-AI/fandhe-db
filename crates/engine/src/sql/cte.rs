@@ -14,6 +14,16 @@
 //! 情報を一切保持しない。畳み込み後の文は、参照した**セッション自身**の
 //! `PolicyContext` を使う既存の実行経路でしか評価されない。
 //!
+//! 具体化経路（SQL-62 (1)(3)(5)(6)・Issue #1860）: 明示 `MATERIALIZED` の CTE を主クエリの
+//! FROM が直接参照するとき、`sql::allowlist` の `WITH` 分岐は本文を 1 文（`Statement::Scan`）
+//! として組み、既存の評価後射影形ビュー経路（`Statement::BufferedView`）へ載せる。本文は
+//! 参照したセッション自身の `PolicyContext`・外側と同一の `read_txn`（同一スナップショット）
+//! で評価され（RLS-10 (b)）、評価済みの結果行は文のスタック上にだけ存在して文の終了で破棄
+//! される（他の文・他セッションと共有しない）。保持行数は本文が暗黙 `LIMIT` を持つため
+//! `--max-result-rows` で頭打ちとなり、超過は `54000`（SQL-34。黙って切り詰めない）。
+//! 発火はセッションの最上位 SELECT の入口だけで、ビュー本文・cursor・COPY・CTAS 等は
+//! 従来どおりインライン展開（結果は同じ）。
+//!
 //! データ変更 CTE（SQL-63、Issue #1875）: CTE 本文に単一表の `INSERT`／`UPDATE`／
 //! `DELETE`（`RETURNING` 任意）を書く形は [`CteBody::DataModifying`] として構文受理し、
 //! 本文は既存の DML 許可パーサーで解析する（第 2 の DML パーサーを作らない）。本 Issue の
@@ -69,6 +79,9 @@ pub(crate) struct CteDef {
     /// 列名リスト `WITH <name>(a, b)`（SQL-62 (2)・Issue #1857）。空ならリストなし。
     pub(crate) column_aliases: Vec<String>,
     pub(crate) body: CteBody,
+    /// `[NOT] MATERIALIZED` の指定（SQL-62 (3)・Issue #1860）。`CteDef` はテナント情報を
+    /// 持たない不変条件（RLS-10 (b)）を保つため、ここにも評価方式のヒントだけを置く。
+    pub(crate) materialization: CteMaterialization,
 }
 
 impl CteDef {
@@ -128,6 +141,20 @@ impl DataModifyingCteBody {
 /// データ変更 CTE を読み取りへ展開しようとしたときの固定エラー（`0A000`）。入力断片を含めない。
 pub(crate) fn data_modifying_cte_unsupported() -> SqlSurfaceError {
     SqlSurfaceError::feature_not_supported("data-modifying CTE is not supported yet")
+}
+
+/// CTE の評価方式ヒント（`WITH <name> AS [NOT] MATERIALIZED (...)`。SQL-62 (3)・Issue #1860）。
+/// 結果は評価方式で変わらない。`Materialized` のみ、セッションの最上位 SELECT の入口で
+/// 主クエリが直接参照したとき具体化経路（`Statement::BufferedView`）で評価される
+/// （本文末尾「具体化経路」節）。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum CteMaterialization {
+    /// 指定なし（インライン展開。複数回参照時の既定の具体化は Issue #1861）。
+    Default,
+    /// `MATERIALIZED`（具体化経路の対象）。
+    Materialized,
+    /// `NOT MATERIALIZED`（インライン展開）。
+    NotMaterialized,
 }
 
 /// CTE 名の解決回数を数え、上限超過を `54000` として検出するための可変カウンタ。

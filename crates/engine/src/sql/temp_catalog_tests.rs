@@ -177,6 +177,32 @@ fn table_44_wrapper_passes_through_unmatched_names_and_empty_catalog() {
 }
 
 #[test]
+fn table_44_wrapper_propagates_materialization_hazards() {
+    // 一時表は自身のスキーマから、それ以外は内側 lookup へ委譲する（Issue #1860）。
+    let mut cat = SessionTempCatalog::default();
+    cat.register(
+        TableSchema::new(
+            "tv",
+            vec![
+                ColumnDef::new("id", ColumnType::Text, true),
+                ColumnDef::new("e", ColumnType::Vector(3), true),
+            ],
+        ),
+        TempOnCommit::PreserveRows,
+        4,
+    )
+    .expect("tv");
+    let hit = Cell::new(false);
+    let w = SessionRelationLookup::new(&Inner, &cat, &hit);
+    let h = w.table_materialization_hazards("tv").expect("hazards");
+    assert!(h.declares_real_id);
+    assert_eq!(h.unevaluable_columns, vec!["e".to_string()]);
+    // 一時表でない名前は内側（既定実装＝何も無し）へ委譲される。
+    let h = w.table_materialization_hazards("t").expect("hazards");
+    assert_eq!(h, crate::catalog::TableMaterializationHazards::default());
+}
+
+#[test]
 fn table_44_token_scan_is_case_insensitive_and_empty_safe() {
     let toks = crate::sql::lexer::tokenize_marked("DROP TABLE Tmp1").expect("lex");
     let mut cat = SessionTempCatalog::default();

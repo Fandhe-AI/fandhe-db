@@ -9,6 +9,8 @@
 
 ### Added
 
+- CTE の具体化経路を追加する（Issue #1860・SQL-62）。明示 `MATERIALIZED` の CTE を主クエリが直接参照すると、本文全体を評価した結果行集合を外側が読む。
+  挙動変更: 本文の可視行数が `--max-result-rows` を超えると、外側の `LIMIT` に関わらず `54000` で拒否される。公開 API の破壊的変更なし。詳細は [cte.md](docs/design/cte.md)。
 - 非集計形の相関スカラーサブクエリ（`(SELECT y FROM b WHERE b.k = a.k)`。`y` は単一の裸の列）を、WHERE 位置と投影位置で
   外側の行ごとの再評価により実行する（Issue #1847・SQL-61）。一致 0 件は NULL（WHERE では偽）、1 件はその値、
   2 件以上は `21000`。内側を 1 回だけ実体化し、テナント境界は外側と同じ `PolicyContext` に従う。

@@ -186,6 +186,10 @@ impl TableLookup for NewViewLookup<'_> {
         TableLookup::table_is_allocated(self.inner, name)
     }
 
+    fn table_has_non_byte_collation(&self, name: &str) -> Result<bool, SqlSurfaceError> {
+        TableLookup::table_has_non_byte_collation(self.inner, name)
+    }
+
     fn materialized_view_columns(
         &self,
         name: &str,
