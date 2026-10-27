@@ -26,10 +26,11 @@
 //!
 //! データ変更 CTE（SQL-63、Issue #1875）: CTE 本文に単一表の `INSERT`／`UPDATE`／
 //! `DELETE`（`RETURNING` 任意）を書く形は [`CteBody::DataModifying`] として構文受理し、
-//! 本文は既存の DML 許可パーサーで解析する（第 2 の DML パーサーを作らない）。本 Issue の
-//! 範囲は構文・名前・`RETURNING` の公開列の確定までで、**書き込みは一切発生させない**
-//! （検証を通過した文も `sql::allowlist::validate_sql_tokens` の `WITH` 分岐が固定 `0A000` で
-//! 止める。実行結線は #1876）。データ変更 CTE の名前は [`resolve_relation`] で
+//! 本文は既存の DML 許可パーサーで解析する（第 2 の DML パーサーを作らない）。#1875 の範囲は
+//! 構文・名前・`RETURNING` の公開列の確定までで、読み取りの入口（`sql::allowlist::validate_sql_tokens`
+//! の `WITH` 分岐。cursor・COPY・ビュー・CTAS 等）は検証を通過しても固定 `0A000` で止め、書き込みを
+//! 発生させない。最上位の文だけが `sql::allowlist::validate_session_with_tokens` で実行計画を得て
+//! 書き込み経路（`core/dm_cte_exec.rs`）で実行される（SQL-63・Issue #1876）。データ変更 CTE の名前は [`resolve_relation`] で
 //! 決して表・ビューへ展開しない（同名の実表を RLS の暗黙適用を迂回して読む経路を作らない）。
 //!
 //! 名前解決の順序（PostgreSQL と同じ意味論）: CTE 名はカタログのテーブル・

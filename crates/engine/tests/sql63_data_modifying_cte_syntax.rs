@@ -1,11 +1,13 @@
 //! データ変更 CTE の構文受理・列解決の結合テスト（SQL-63、Issue #1875）。ポインタ:
 //! `docs/spec/04-behavior/sql-surface.md` SQL-63・`docs/spec/04-behavior/rls.md` RLS-10 (b)。
 //!
-//! 本 Issue の範囲は「CTE 本文の `INSERT`／`UPDATE`／`DELETE` を構文受理し、`RETURNING` の
-//! 公開列を確定する」まで。書き込みの実行は #1876 の担当のため、検証を通過した文も固定
-//! `0A000` で止まり、**表の行は一切変わらない**ことを production 経路
-//! （`EngineCore::execute_sql_in_session`）で固定する。エラー応答はテナント間で同一であること
-//! （他テナントの行の有無で応答が変わらない）も確認する。流儀は `sql29_cte.rs` と同じ。
+//! #1875 の範囲は「CTE 本文の `INSERT`／`UPDATE`／`DELETE` を構文受理し、`RETURNING` の
+//! 公開列を確定する」まで。書き込みの実行（最上位の文で副文 1 つを主クエリが読む形）は #1876
+//! （`sql63_data_modifying_cte_exec.rs`）が担う。本ファイルは、実行しない形（RETURNING なしの参照・
+//! 主クエリが実表を読む形・複数の副文）が検証を通過しても固定 `0A000` で止まり、**表の行は
+//! 一切変わらない**ことを production 経路（`EngineCore::execute_sql_in_session`）で固定する。
+//! エラー応答はテナント間で同一であること（他テナントの行の有無で応答が変わらない）も確認する。
+//! 流儀は `sql29_cte.rs` と同じ。
 
 use engine::catalog::{ColumnDef, ColumnType, TableSchema};
 use engine::core::EngineCore;
@@ -96,18 +98,20 @@ fn lang_of_all(core: &EngineCore, tenant: &str) -> Vec<String> {
 }
 
 #[test]
-fn valid_data_modifying_ctes_stop_with_0a000_and_change_nothing() {
+fn unsupported_data_modifying_cte_shapes_stop_with_0a000_and_change_nothing() {
     let (core, _guard) = open_seeded();
     let before_alice = (count(&core, "alice"), lang_of_all(&core, "alice"));
     let before_bob = (count(&core, "bob"), lang_of_all(&core, "bob"));
     for sql in [
-        "WITH d AS (DELETE FROM docs WHERE lang = 'ja' RETURNING *) SELECT * FROM d LIMIT 10",
-        "WITH d AS (UPDATE docs SET lang = 'xx' WHERE lang = 'ja' RETURNING id, lang) \
-         SELECT lang FROM d LIMIT 10",
-        "WITH d AS (INSERT INTO docs (lang, body) VALUES ('zz', 'b') RETURNING id) \
-         SELECT * FROM d LIMIT 10",
-        "WITH d(x) AS (DELETE FROM docs WHERE lang = 'ja' RETURNING id) SELECT x FROM d LIMIT 10",
+        // 主クエリが実表を読む（文開始時点の可視性は #1877）
         "WITH d AS (DELETE FROM docs WHERE lang = 'ja') SELECT * FROM docs LIMIT 10",
+        "WITH d AS (DELETE FROM docs WHERE lang = 'ja' RETURNING id) SELECT * FROM docs LIMIT 10",
+        // RETURNING なしの副文を参照
+        "WITH d AS (DELETE FROM docs WHERE lang = 'ja') SELECT * FROM d LIMIT 10",
+        // 複数のデータ変更 CTE（#1877）
+        "WITH a AS (DELETE FROM docs WHERE lang = 'ja' RETURNING id), \
+         b AS (UPDATE docs SET lang = 'xx' WHERE lang = 'en' RETURNING id) \
+         SELECT id FROM a LIMIT 10",
     ] {
         for tenant in ["alice", "bob"] {
             let err = run(&core, tenant, sql).expect_err("must stop before execution");
@@ -129,15 +133,20 @@ fn valid_data_modifying_ctes_stop_with_0a000_and_change_nothing() {
 fn same_name_as_real_table_is_never_read() {
     let (core, _guard) = open_seeded();
     let before = count(&core, "alice");
-    // CTE 名が実表と同名でも、実表の読み取りに化けない。
-    let err = run(
+    // CTE 名が実表と同名でも、実表の走査には化けず副文の RETURNING 行だけを返す
+    // （実表を読めば公開行を含む複数行になる）。
+    let outcome = run(
         &core,
         "alice",
         "WITH docs AS (DELETE FROM docs WHERE lang = 'ja' RETURNING *) SELECT * FROM docs LIMIT 10",
     )
-    .expect_err("must not read the real table");
-    assert_eq!(err.wire_code(), "0A000");
-    assert_eq!(count(&core, "alice"), before);
+    .expect("executes the data-modifying CTE");
+    let SqlOutcome::Query(result) = outcome else {
+        panic!("expected Query outcome");
+    };
+    assert_eq!(result.rows.len(), 1, "only the deleted row is returned");
+    // 実表が読まれていれば残るはずの行数ではなく、削除した 1 行分だけ減っている。
+    assert_eq!(count(&core, "alice"), before - 1);
 }
 
 #[test]

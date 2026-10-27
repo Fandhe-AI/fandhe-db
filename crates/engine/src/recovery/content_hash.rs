@@ -198,6 +198,10 @@ enum OpTag {
     UpdateFrom = 27,
     /// `DELETE ... USING`（Issue #1757。[`OpTag::UpdateFrom`] と同じ規則で、UPDATE とは別ドメイン）。
     DeleteUsing = 28,
+    /// データ変更 CTE を含む `WITH` 文（Issue #1876・SQL-63 (5)・RECOVER-1・RECOVER-11）。文全体
+    /// （全副文と主クエリ）を 1 つの台帳エントリで扱うため、送られた文のトークン列だけを材料にし、
+    /// 単独の DML や [`OpTag::InsertSelect`] とは別ドメインに分離する。
+    DataModifyingCte = 29,
 }
 
 /// 長さプレフィクス付きフィールド連結でハッシュ入力を組み立てるビルダー
@@ -1434,6 +1438,20 @@ pub(crate) fn for_delete_using(
     statement_tokens: &[crate::sql::lexer::Token],
 ) -> Result<ContentHash, StorageError> {
     token_statement_hash(OpTag::DeleteUsing, statement_tokens)
+}
+
+/// データ変更 CTE を含む `WITH` 文の台帳照合ハッシュ（Issue #1876。ポインタ: SQL-63 (5)・
+/// RECOVER-1・RECOVER-11）。
+///
+/// 材料は [`strip_operation_id_clause`] で `USING OPERATION_ID` 句と末尾 `;` を除いた文のトークン列
+/// **だけ**（relation 名の書き換え後）。副文の `RETURNING` 行や主クエリの結果の値は材料にしないため、
+/// 再送時にデータが変わっていても同一文なら同一ハッシュになる（`23505`）。識別子の大小・数値表記は
+/// 畳まない（差があれば `22023` 側へ倒す）。未束縛の [`Token::Param`] が残っていれば `Err`
+/// （fail-closed）。呼び出し元は `sql::allowlist` のデータ変更 CTE 検証入口。
+pub(crate) fn for_data_modifying_cte(
+    statement_tokens: &[crate::sql::lexer::Token],
+) -> Result<ContentHash, StorageError> {
+    token_statement_hash(OpTag::DataModifyingCte, statement_tokens)
 }
 
 /// 文のトークン列を長さプレフィクス付きで直列化したハッシュ（結合形 DML 用の共通本体）。
@@ -7326,6 +7344,60 @@ mod tests {
     fn sel_hash(sql: &str) -> ContentHash {
         let toks = crate::sql::lexer::tokenize(sql).expect("tokenize");
         for_insert_select(strip_operation_id_clause(&toks)).expect("hash")
+    }
+
+    // ---- Issue #1876: データ変更 CTE の content_hash（SQL-63 (5)・RECOVER-1・RECOVER-11）----
+
+    fn dm_cte_hash(sql: &str) -> ContentHash {
+        let toks = crate::sql::lexer::tokenize(sql).expect("tokenize");
+        for_data_modifying_cte(strip_operation_id_clause(&toks)).expect("hash")
+    }
+
+    const DM_CTE: &str = "WITH d AS (DELETE FROM t WHERE id = 1 RETURNING id) SELECT id FROM d";
+
+    #[test]
+    fn data_modifying_cte_hash_ignores_operation_id_and_whitespace() {
+        let base = dm_cte_hash(DM_CTE);
+        assert_eq!(
+            base,
+            dm_cte_hash(
+                "WITH  d AS (DELETE FROM t /* c */ WHERE id = 1 RETURNING id)\nSELECT id FROM d"
+            )
+        );
+        assert_eq!(
+            base,
+            dm_cte_hash(&format!("{DM_CTE} USING OPERATION_ID 'a'"))
+        );
+        assert_eq!(
+            base,
+            dm_cte_hash(&format!("{DM_CTE} using operation_id 'b';"))
+        );
+        assert_eq!(
+            base,
+            dm_cte_hash(&format!("{DM_CTE} USING OPERATION_ID NULL"))
+        );
+    }
+
+    #[test]
+    fn data_modifying_cte_hash_is_sensitive_to_statement_and_domain() {
+        let base = dm_cte_hash(DM_CTE);
+        for other in [
+            "WITH d AS (DELETE FROM t WHERE id = 2 RETURNING id) SELECT id FROM d",
+            "WITH d AS (DELETE FROM t WHERE id = 1 RETURNING id) SELECT id FROM d LIMIT 1",
+            "WITH e AS (DELETE FROM t WHERE id = 1 RETURNING id) SELECT id FROM e",
+        ] {
+            assert_ne!(base, dm_cte_hash(other), "{other}");
+        }
+        // 同じトークン列でも `INSERT ... SELECT` のドメインとは別（タグが違う）。
+        let toks = crate::sql::lexer::tokenize(DM_CTE).expect("tokenize");
+        assert_ne!(base, for_insert_select(&toks).expect("hash"));
+    }
+
+    #[test]
+    fn data_modifying_cte_hash_rejects_unbound_param() {
+        let mut toks = crate::sql::lexer::tokenize(DM_CTE).expect("tokenize");
+        toks.push(crate::sql::lexer::Token::Param(1));
+        assert!(for_data_modifying_cte(&toks).is_err());
     }
 
     const SEL: &str = "INSERT INTO t (a) SELECT a FROM s WHERE b = 'x' LIMIT 3";

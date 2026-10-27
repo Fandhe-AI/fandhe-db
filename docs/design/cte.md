@@ -39,8 +39,10 @@ WITH <name> [(<列名>, ...)] AS (SELECT <* | 列名リスト> FROM <table | vie
   メッセージで `42601` に拒否し、`WITH` 句を剥がして後段へ流すことは絶対にしない
   （同名の実テーブルを黙って読む危険があるため）。
 - CTE 名の重複は `42601`。データ変更 CTE（`WITH x AS (DELETE
-  ...)` 等）は本文の構文・名前・`RETURNING` の公開列までを受理し、実行は未対応のため
-  固定 `0A000` で止める（SQL-63・Issue #1875。[data-modifying-cte.md](data-modifying-cte.md)）。
+  ...)` 等）は本文の構文・名前・`RETURNING` の公開列までを受理する。最上位の文として副文 1 つを
+  主クエリが読む形は書き込み経路で実行し（SQL-63・Issue #1876）、それ以外の形・読み取りの入口
+  （cursor・COPY・ビュー・CTAS 等）は固定 `0A000` で止める
+  （[data-modifying-cte.md](data-modifying-cte.md)）。
   `WITH RECURSIVE` は本経路に流さず `sql::recursive_cte` へ分岐する
   （構造検証の `42P19`・評価未実装の `0A000`。[recursive-cte.md](recursive-cte.md)）。
 - 定義数上限（`MAX_CTE_DEFINITIONS = 16`）・連鎖の深さ上限

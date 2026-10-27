@@ -75,6 +75,9 @@ mod matview_exec;
 // INSERT ... SELECT の実行本体（SQL-51・Issue #1733）。
 mod insert_select_exec;
 
+// データ変更 CTE（`WITH d AS (DELETE ... RETURNING ...) SELECT ...`）の実行本体（SQL-63・Issue #1876）。
+mod dm_cte_exec;
+
 // 書き込み・実体化の入力 SELECT の行数上限（SQL-34・Issue #2212）。
 mod write_input_cap;
 
@@ -1604,6 +1607,16 @@ pub enum ParsedSql {
     /// **BREAKING CHANGE**（Issue #1732）: 本 variant の追加により `ParsedSql` を網羅的に
     /// マッチするクレート外コードは追随が必要。
     InsertSelect(crate::sql::allowlist::ValidatedInsertSelect),
+    /// データ変更 CTE を含む最上位の `WITH` 文（`WITH d AS (DELETE ... RETURNING ...) SELECT ... FROM d`。
+    /// SQL-63・Issue #1876）。構文・名前・`RETURNING` 公開列・実行形のゲート（実行する形は副文 1 つを
+    /// 主クエリが読む形）までを通過した実行計画で、実行腕は全副文と文末の `USING OPERATION_ID` 台帳記録を
+    /// 1 つの書き込みトランザクションで行い、副文の `RETURNING` 行へ主クエリの外側処理を適用する
+    /// （`core/dm_cte_exec.rs`）。読み取り専用の [`ParsedSql::Statement`] へ載せないのは、書き込みを伴う
+    /// 文を wire 側が非書き込みと誤判定しないため。
+    ///
+    /// **BREAKING CHANGE**（Issue #1876）: 本 variant の追加により `ParsedSql` を網羅的に
+    /// マッチするクレート外コードは追随が必要（`#[non_exhaustive]`）。
+    DataModifyingCte(Box<crate::sql::allowlist::ValidatedDataModifyingCte>),
     /// 自動更新可能なビューへの `INSERT`（TABLE-43・Issue #1671）。送られた文の形のまま保持し、
     /// 基表への書き換えは Execute／Describe 時に現在のカタログで行う（Parse と Execute の間の
     /// `CREATE OR REPLACE VIEW`／`DROP VIEW` を取り込む）。自動更新不可のビューは Parse で `55000`。
@@ -1894,6 +1907,8 @@ fn statement_clock_scope(
         ParsedSql::Statement(_)
         | ParsedSql::Insert(_)
         | ParsedSql::InsertSelect(_)
+        // SQL-63・Issue #1876: 副文と主クエリは同じ文の開始時刻を共有する。
+        | ParsedSql::DataModifyingCte(_)
         | ParsedSql::ViewInsert(_)
         | ParsedSql::ViewDelete(_)
         | ParsedSql::ViewUpdate(_)
@@ -1955,6 +1970,11 @@ fn insert_sequence_scope(
             return insert_sequence_scope(storage, session, routed.inner())
         }
         ParsedSql::Insert(_) | ParsedSql::InsertSelect(_) | ParsedSql::ViewInsert(_) => true,
+        // SQL-63・Issue #1876: 副文に `INSERT` を含むときだけ採番・既定時刻の文脈を張る。
+        ParsedSql::DataModifyingCte(v) => v
+            .dm_ctes
+            .iter()
+            .any(|d| d.command == crate::sql::returning::DmlCommand::Insert),
         ParsedSql::Statement(_)
         | ParsedSql::Truncate(_)
         | ParsedSql::Delete(_)
@@ -2013,6 +2033,11 @@ fn insert_default_clock_scope(
             return insert_default_clock_scope(routed.inner(), txn_start_micros)
         }
         ParsedSql::Insert(_) | ParsedSql::InsertSelect(_) | ParsedSql::ViewInsert(_) => true,
+        // SQL-63・Issue #1876: 副文に `INSERT` を含むときだけ採番・既定時刻の文脈を張る。
+        ParsedSql::DataModifyingCte(v) => v
+            .dm_ctes
+            .iter()
+            .any(|d| d.command == crate::sql::returning::DmlCommand::Insert),
         ParsedSql::Statement(_)
         | ParsedSql::Truncate(_)
         | ParsedSql::Delete(_)
@@ -2177,6 +2202,8 @@ fn parsed_operation_id(parsed: &ParsedSql) -> Option<&str> {
     match parsed {
         ParsedSql::Insert(stmt) => stmt.operation_id.as_ref().map(|id| id.as_str()),
         ParsedSql::InsertSelect(stmt) => stmt.operation_id().map(|id| id.as_str()),
+        // SQL-63・Issue #1876: 文末の 1 つだけ（副文は持たない）。
+        ParsedSql::DataModifyingCte(stmt) => stmt.operation_id.as_ref().map(|id| id.as_str()),
         ParsedSql::ViewInsert(stmt) => stmt.operation_id().map(|id| id.as_str()),
         ParsedSql::ViewDelete(stmt) => stmt.operation_id().map(|id| id.as_str()),
         ParsedSql::ViewUpdate(stmt) => stmt.operation_id().map(|id| id.as_str()),
@@ -5433,13 +5460,20 @@ impl EngineCore {
             return Ok(ParsedSql::AlterTable(stmt));
         }
 
-        let stmt = crate::sql::allowlist::validate_session_sql_tokens(
+        // SQL-63・Issue #1876: 最上位の `WITH` にデータ変更 CTE を含む文だけが実行計画を持つ
+        // （検出は `parse_with_clause` の結果。それ以外は従来どおり読み取りの `Statement`）。
+        match crate::sql::allowlist::validate_session_with_tokens(
             &tokens,
             &storage_lookup,
             0,
             self.nesting_limits,
-        )?;
-        Ok(ParsedSql::Statement(stmt))
+            ledger_mode,
+        )? {
+            crate::sql::allowlist::SessionWith::Statement(stmt) => Ok(ParsedSql::Statement(stmt)),
+            crate::sql::allowlist::SessionWith::DataModifying(v) => {
+                Ok(ParsedSql::DataModifyingCte(v))
+            }
+        }
     }
 
     /// `INSERT ... SELECT` の挿入先の確認と内側 SELECT の検証（SQL-51・Issue #1732）。
@@ -6408,7 +6442,12 @@ impl EngineCore {
         }
         // SQL-53（Issue #1751）: サブクエリつき述語形 DML は文単位の暗黙トランザクションで実行する
         // （内側の評価と書き込みを同じ write txn に乗せる）。`ON COMMIT` の適用は commit 側が担う。
-        if Self::is_subquery_predicate_dml(parsed) {
+        // SQL-63・Issue #1876: データ変更 CTE も同じ暗黙トランザクションで実行する（全副文・台帳記録・
+        // 主クエリが 1 つの write txn に乗り、commit 時に遅延 FK の検査を通る。副文ごとの autocommit
+        // では原子的にならない）。
+        if Self::is_subquery_predicate_dml(parsed)
+            || matches!(parsed, ParsedSql::DataModifyingCte(_))
+        {
             return self.execute_subquery_dml_autocommit(ctx, session, parsed);
         }
         let outcome = self.execute_parsed_statement(ctx, session, parsed)?;
@@ -6482,6 +6521,14 @@ impl EngineCore {
                 session,
                 stmt,
             ),
+            // SQL-63・Issue #1876: 入口（`execute_parsed_in_session_inner`）が暗黙トランザクションへ
+            // 振り分けるため、ここへ到達するのは構造上の誤りだけ（副文ごとの autocommit で原子性を
+            // 失わないよう、実行せず fail-closed）。
+            ParsedSql::DataModifyingCte(_) => {
+                Err(crate::sql::allowlist::SqlSurfaceError::Internal {
+                    detail: "internal error".to_string(),
+                })
+            }
             ParsedSql::ViewInsert(stmt) => self
                 .execute_view_insert(
                     || crate::tenant::WriteTarget::Autocommit(&self.storage),
@@ -7389,6 +7436,19 @@ impl EngineCore {
             ParsedSql::DeleteUsing(stmt) => self.execute_delete_using_stub(stmt),
             // SQL-51・Issue #1732・#1733: autocommit と同じ実行本体へ共有 write txn を渡す
             // （読み取り源にも書き込み先にもなる）。台帳・世代の単位は挿入先の表。
+            // SQL-63・Issue #1876: 全副文・台帳記録・主クエリを共有 write txn で実行する。書いた全表へ
+            // `mark_written` する（漏れると遅延 FK の COMMIT 時検査が取りこぼす。P0）。
+            ParsedSql::DataModifyingCte(stmt) => {
+                let write_txn = txn.write_txn().ok_or_else(|| SqlSurfaceError::Internal {
+                    detail: "internal error".to_string(),
+                })?;
+                let (outcome, written) =
+                    self.execute_data_modifying_cte(write_txn, ctx, session, stmt)?;
+                for table in &written {
+                    txn.mark_written(ctx.tenant_id(), table);
+                }
+                Ok(outcome)
+            }
             ParsedSql::InsertSelect(stmt) => {
                 let write_txn = txn.write_txn().ok_or_else(|| SqlSurfaceError::Internal {
                     detail: "internal error".to_string(),
@@ -8080,6 +8140,11 @@ impl EngineCore {
                     None => Ok(None),
                 }
             }
+            // SQL-63・Issue #1876: 書き込みは行わず、参照される副文の `RETURNING` 列に主クエリの外側処理を
+            // 適用した列メタを返す（Execute と同じ `plan_outer_parts` を通るため列名・型・束縛エラーが一致）。
+            ParsedSql::DataModifyingCte(stmt) => self
+                .describe_data_modifying_cte(session, stmt, limits)
+                .map(Some),
             // SQL-51・Issue #1732: 束縛（列数・型）を通した上で、`RETURNING` の列メタだけを返す。
             ParsedSql::InsertSelect(stmt) => {
                 let bound = self.bind_insert_select(session, stmt, limits)?;
@@ -13004,7 +13069,7 @@ impl EngineCore {
                     target,
                     ctx,
                     &bound,
-                    self.ledger_mode,
+                    self.dml_ledger_mode(),
                     None,
                 )
             }
@@ -13029,7 +13094,7 @@ impl EngineCore {
                     target,
                     ctx,
                     &bounds,
-                    self.ledger_mode,
+                    self.dml_ledger_mode(),
                     Some(&schema),
                 )
             }
@@ -13043,7 +13108,7 @@ impl EngineCore {
                     self.embedder.as_deref(),
                     &self.incremental_config,
                     &bound,
-                    self.ledger_mode,
+                    self.dml_ledger_mode(),
                     self.scan_limits.max_scanned_rows(),
                 )
             }
@@ -13054,7 +13119,13 @@ impl EngineCore {
             // にも揃える）。
             crate::sql::parser::BoundInsertForm::Upsert(bound) => {
                 self.validate_upsert_batch_limits(&bound.rows)?;
-                crate::sql::exec::execute_upsert_in(target, ctx, &bound, self.ledger_mode, &schema)
+                crate::sql::exec::execute_upsert_in(
+                    target,
+                    ctx,
+                    &bound,
+                    self.dml_ledger_mode(),
+                    &schema,
+                )
             }
         }
     }
@@ -13102,7 +13173,7 @@ impl EngineCore {
                     target,
                     ctx,
                     std::slice::from_ref(&bound),
-                    self.ledger_mode,
+                    self.dml_ledger_mode(),
                     &returning,
                     &schema,
                 )
@@ -13113,7 +13184,7 @@ impl EngineCore {
                     target,
                     ctx,
                     &bounds,
-                    self.ledger_mode,
+                    self.dml_ledger_mode(),
                     &returning,
                     &schema,
                 )
@@ -13137,7 +13208,7 @@ impl EngineCore {
                     target,
                     ctx,
                     &bound,
-                    self.ledger_mode,
+                    self.dml_ledger_mode(),
                     &returning,
                     &schema,
                 )
@@ -13238,7 +13309,7 @@ impl EngineCore {
         stmt: &crate::sql::allowlist::ValidatedDelete,
     ) -> Result<crate::sql::exec::DeleteOutcome, crate::sql::allowlist::SqlSurfaceError> {
         let bound = crate::sql::parser::bind_delete(stmt)?;
-        crate::sql::exec::execute_delete_in(target, ctx, &bound, self.ledger_mode)
+        crate::sql::exec::execute_delete_in(target, ctx, &bound, self.dml_ledger_mode())
     }
 
     /// [`Self::execute_sql_in_session`] の `DELETE`（述語形。SQL-19・TASK-192、
@@ -13332,7 +13403,7 @@ impl EngineCore {
             target,
             ctx,
             &bound,
-            self.ledger_mode,
+            self.dml_ledger_mode(),
             schema,
             &content_hash_value,
             self.dml_limits.max_affected_rows,
@@ -13744,7 +13815,7 @@ impl EngineCore {
             target,
             ctx,
             &bound,
-            self.ledger_mode,
+            self.dml_ledger_mode(),
             &schema,
             &content_hash_value,
             self.dml_limits.max_affected_rows,
@@ -13785,7 +13856,7 @@ impl EngineCore {
             target,
             ctx,
             &bound,
-            self.ledger_mode,
+            self.dml_ledger_mode(),
             &returning,
             &schema,
         )
@@ -13867,7 +13938,7 @@ impl EngineCore {
             target,
             ctx,
             &bound,
-            self.ledger_mode,
+            self.dml_ledger_mode(),
             Some(&schema),
         )
     }
@@ -13924,7 +13995,7 @@ impl EngineCore {
                 target,
                 ctx,
                 &bound,
-                self.ledger_mode,
+                self.dml_ledger_mode(),
                 Some(&schema),
             );
         };
@@ -14041,7 +14112,7 @@ impl EngineCore {
                     target,
                     ctx,
                     &bound,
-                    self.ledger_mode,
+                    self.dml_ledger_mode(),
                     &returning,
                     &schema,
                 )
@@ -14059,7 +14130,7 @@ impl EngineCore {
                     target,
                     ctx,
                     &bound,
-                    self.ledger_mode,
+                    self.dml_ledger_mode(),
                     &schema,
                     &content_hash_value,
                     &legacy_hashes,
@@ -14115,7 +14186,7 @@ impl EngineCore {
             target,
             ctx,
             &predicate,
-            self.ledger_mode,
+            self.dml_ledger_mode(),
             schema,
             &content_hash_value,
             legacy_hashes,
