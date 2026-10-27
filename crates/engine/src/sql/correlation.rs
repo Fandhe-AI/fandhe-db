@@ -14,7 +14,8 @@
 //! - 外側表で修飾した参照の列が存在しなければ `42703`。
 //! - どのスコープにも無い非修飾名はここでは拒否しない（内側の束縛が従来どおり `42703` にする。
 //!   `ORDER BY` の出力別名など列ではない識別子がここへ来るため）。
-//! - 相関 `EXISTS`（Issue #1842）・`NOT EXISTS`（Issue #1843）・`IN`／`NOT IN`（Issue #1844）は `sql::subquery` が本 IR を使って
+//! - 相関 `EXISTS`（Issue #1842）・`NOT EXISTS`（Issue #1843）・
+//!   `IN`／`NOT IN`（Issue #1844）は `sql::subquery` が本 IR を使って
 //!   半結合・反結合・行ごとの再評価へ書き換えて実行する（`sql::correlated_exists`）。それ以外
 //!   （スカラー・`ANY`／`ALL`・述語形 DML・集計の `FILTER`）は、束縛に成功した相関を [`reject_if_correlated`] が
 //!   `42601` で拒否する。
