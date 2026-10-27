@@ -285,7 +285,9 @@ pub(crate) fn cell_scalar<'a>(
     };
     Ok(match (ty, cell) {
         (_, Cell::Null) => None,
-        (ColumnType::Text | ColumnType::Varchar(_), Cell::Text(s)) => Some(ScalarRef::Text(s)),
+        (ColumnType::Text | ColumnType::Varchar(_) | ColumnType::Bpchar(_), Cell::Text(s)) => {
+            Some(ScalarRef::Text(s))
+        }
         (ColumnType::Enum(_), Cell::Text(s)) => Some(ScalarRef::Enum(s)),
         (ColumnType::SmallInt, Cell::SignedInteger(v)) => Some(ScalarRef::Integer(i32::from(
             i16::try_from(*v).map_err(|_| bug("SMALLINT value out of range"))?,

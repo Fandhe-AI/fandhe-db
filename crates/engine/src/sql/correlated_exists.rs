@@ -323,6 +323,7 @@ fn inner_cell_supported(ty: &ColumnType) -> bool {
         ty,
         ColumnType::Text
             | ColumnType::Varchar(_)
+            | ColumnType::Bpchar(_)
             | ColumnType::Enum(_)
             | ColumnType::SmallInt
             | ColumnType::Integer

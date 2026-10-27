@@ -375,6 +375,9 @@ impl CorrelatedProbe {
         let mut matched = 0usize;
         for &idx in indices {
             self.budget.charge_comparison()?;
+            // キーなし相関では外側 1 行の評価が内側全行に及ぶため、既存 JOIN と同じく
+            // 比較ごとに協調的中断（57014）を確認する。
+            crate::interrupt::check()?;
             let row = rows
                 .get(idx as usize)
                 .ok_or_else(|| SqlSurfaceError::Internal {
