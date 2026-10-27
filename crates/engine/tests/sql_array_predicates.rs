@@ -370,7 +370,7 @@ fn unsupported_forms_fail_closed() {
     assert_eq!(
         code(
             &core,
-            "SELECT id FROM t WHERE id = ANY(SELECT id FROM t) LIMIT 5"
+            "SELECT id FROM t WHERE id + 0 = ANY(SELECT id FROM t LIMIT 5) LIMIT 5"
         ),
         "0A000"
     );

@@ -401,6 +401,16 @@ fn detects_subquery_leaves_recursively() {
     };
     assert!(!where_has_subquery(std::slice::from_ref(&plain)));
     assert!(where_has_subquery(&[in_sub(INNER)]));
+    // Issue #1855: 量化比較のサブクエリ形も検出する。
+    assert!(where_has_subquery(&[
+        WherePredicate::QuantifiedSubqueryCompare {
+            column: "lang".to_string(),
+            op: ScalarSubqueryOp::Gt,
+            quantifier: crate::sql::udf_call::Quantifier::All,
+            inner_tokens: inner(INNER),
+            depth: 1,
+        }
+    ]));
     assert!(where_has_subquery(&[WherePredicate::Not(Box::new(
         in_sub(INNER)
     ))]));

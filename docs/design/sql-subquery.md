@@ -22,15 +22,15 @@
 
 | 項目 | 対応状況 |
 | ---- | -------- |
-| `<col> IN (SELECT <単一列> FROM <table> [WHERE ...] LIMIT <n>)` | 対応 |
-| `EXISTS (SELECT ... FROM <table> [WHERE ...] LIMIT <n>)` | 対応 |
+| `<col> IN (SELECT <単一列> FROM <table> [WHERE ...] [LIMIT <n>])` | 対応 |
+| `EXISTS (SELECT ... FROM <table> [WHERE ...] [LIMIT <n>])` | 対応 |
 | ネスト（`MAX_SUBQUERY_DEPTH` = 4 まで） | 対応 |
 | 外側が広域取得 SELECT（`Statement::Scan`）・集計 SELECT（`Statement::Aggregate`） | 対応 |
 | 外側がランキング付き検索 SELECT（`ORDER BY <=>`・`HYBRID`・`USING PLAN`） | **非対応**（構文は受理するが束縛時に `42601`） |
 | WHERE 値位置のスカラー比較サブクエリ（`<col> <op> (SELECT ...)`。`<op>` は `= <> < <= > >=`） | 対応（Issue #1191）。逆向き（`(SELECT ...) <op> <col>`）・式への埋め込みは **非対応**（`42601`） |
-| 投影位置のスカラーサブクエリ（`SELECT <列>, (SELECT <単一列> FROM <table> [WHERE ...] LIMIT <n>) [AS <alias>] FROM ...`） | 対応（Issue #1352）。外側は広域取得 SELECT（スカラー `ORDER BY`・`OFFSET` 可）のみ。項目全体がサブクエリである形に限り、式の内側（関数引数・演算・`CASE`）への埋め込みは `42601`。非相関のみ。内側が集計形（単一集計項目）でも可。内側が 0 行なら NULL、2 行以上は外側の結果が 1 行以上のときだけ `21000`（Issue #1404）。内側 WHERE に入れ子のスカラーサブクエリの 2 行以上も同様に外側の行数判明まで遅延（Issue #1432）。外側がランキング付き検索 SELECT・集計・`DISTINCT`・JOIN・ウィンドウ項目との併用・`EXPLAIN`・カーソル・`COPY`・`CREATE VIEW` 本体・CTE・集合演算の枝・拡張クエリプロトコルの `$n` 併用は `42601`。内側の投影位置サブクエリは `42601` |
+| 投影位置のスカラーサブクエリ（`SELECT <列>, (SELECT <単一列> FROM <table> [WHERE ...] [LIMIT <n>]) [AS <alias>] FROM ...`） | 対応（Issue #1352）。外側は広域取得 SELECT（スカラー `ORDER BY`・`OFFSET` 可）のみ。項目全体がサブクエリである形に限り、式の内側（関数引数・演算・`CASE`）への埋め込みは `42601`。非相関のみ。内側が集計形（単一集計項目）でも可。内側が 0 行なら NULL、2 行以上は外側の結果が 1 行以上のときだけ `21000`（Issue #1404）。内側 WHERE に入れ子のスカラーサブクエリの 2 行以上も同様に外側の行数判明まで遅延（Issue #1432）。外側がランキング付き検索 SELECT・集計・`DISTINCT`・JOIN・ウィンドウ項目との併用・`EXPLAIN`・カーソル・`COPY`・`CREATE VIEW` 本体・CTE・集合演算の枝・拡張クエリプロトコルの `$n` 併用は `42601`。内側の投影位置サブクエリは `42601` |
 | 内側がランキング付き検索 SELECT・集合演算・JOIN | **非対応**（`42601`）。集計形（単一集計項目。`GROUP BY` の有無を問わず `LIMIT` 不要）はスカラー比較の内側に限り対応（Issue #1191）。`IN`／`EXISTS` の内側の集計形は非対応 |
-| 内側の `LIMIT` 省略 | **非対応**（`42601`。内側は常に明示 `LIMIT` が必要） |
+| 内側の `LIMIT` 省略・`LIMIT ALL` | 対応（Issue #1853・SQL-29・SQL-34）。上限は結果行数上限 `--max-result-rows` だけを参照し、`IN`／`NOT IN` は上限超過で `54000`（黙って切り詰めない）。`EXISTS` は 1 件、スカラー用途は 2 件（`21000` 判定用）へ差し替えて有界にする。明示 `LIMIT` の範囲検証も設定値に追随する |
 | 内側の `OFFSET` | 未検証（構文上は Scan 形状を再利用するため通るが、意味論は未確認。将来の Issue 課題） |
 | 相関サブクエリ | **実行は非対応**。外側列への参照は束縛段（`sql::correlation`。Issue #1841・SQL-61）で解決した上で `42601`（`correlated subqueries are not supported`）。名前解決の誤りは PostgreSQL と同じコード（曖昧 `42702`・未知列 `42703`・未定義の修飾子 `42P01`）。詳細は「相関参照の束縛（Issue #1841）」節 |
 | `NOT IN`・`NOT EXISTS` | 対応（Issue #1191。`NOT IN` は NULL 規則込み。後述） |
@@ -107,8 +107,8 @@ RLS は既存の実行器がそのまま適用するため、新しい可視性�
 - 1 文あたりの内側クエリ実行回数: `sql::subquery::MAX_SUBQUERY_EXECUTIONS`
   = 16（実装既定値。解決の再帰呼び出し階層全体で共有する `&mut usize`
   カウンタで検査。ネスト深さと組み合わせて評価コストを有界にする）。
-- 内側の可視結果行数: `core::MAX_SEARCH_K`（10,000）超過は `54000`
-  （内側 `LIMIT` の範囲検証とは独立の追加防御）。
+- 内側の可視結果行数: 結果行数上限 `--max-result-rows`（既定 10,000）超過は `54000`
+  （Issue #1853。`LIMIT` 省略形は scan 側が上限 + 1 件で止めて拒否し、本ガードは明示 `LIMIT`・集計形の追加防御）。
 - `IN (SELECT ...)` の distinct 値数: `sql::subquery::MAX_SUBQUERY_IN_VALUES`
   （10,000。`core::MAX_SEARCH_K` と同値の独立定数、Issue #1517。Issue #1165 で旧 256 葉上限〔PR #1103
   codex-review 指摘対応で導入〕から集合照合方式へ見直して引き上げ。文全体で共有する
@@ -302,6 +302,47 @@ Issue #1841 以降は下記の束縛段で解決する。エラー文言は静�
 - **対象外**: 相関の実行、述語形 `UPDATE`／`DELETE` の部分クエリ内の外側表の修飾（現状どおり
   `42P01`）、外側が JOIN／カンマ区切り FROM の文の部分クエリ。
 
+## Issue #1855 追記: `ANY`／`SOME`／`ALL` (SELECT ...)（SQL-61 (3)・RLS-10）
+
+`<列> <比較演算子> ANY|SOME|ALL (SELECT ...)` を非相関のサブクエリに限って受理する。`SOME` は構文段で
+`ANY` に正規化する。第 2 の評価器は作らず、内側の値集合を既存の `IN`／スカラー比較と同じ経路で定数化し、
+既存の述語（`IN` 集合・境界値とのリテラル比較）へ書き換える。
+
+- **構文**: `WherePredicate::QuantifiedSubqueryCompare { column, op, quantifier, inner_tokens, depth }`
+  （BREAKING CHANGE。非網羅 `match` を破壊する）。サブクエリ文脈にあり CHECK 本体でないときだけ受理し、
+  それ以外（文脈外・式の左辺）は従来どおり `0A000`。否定は構文段で演算子と量化子の両方を反転して葉へ
+  押し下げる（`NOT (x = ANY S)` は `x <> ALL S`）。
+- **解決**（`sql::subquery::resolve_quantified_compare`）: `= ANY` は `IN`、`<> ALL` は `NOT IN` へ委譲する
+  （予算・NULL 規則・値族検証・ENUM の語彙外ラベルは `IN` と同一）。それ以外は内側の非 NULL 値の最小・最大から
+  既存の `scalar_literal_predicate` で `col <op> <リテラル>` を作る（生成する述語は高々 2 つ）。
+
+  | 形 | 内側 0 行／NULL のみ | NULL を含む | それ以外 |
+  | -- | -------------------- | ----------- | -------- |
+  | `> >= ANY` | 常に偽 | NULL を無視 | `col op min` |
+  | `< <= ANY` | 常に偽 | NULL を無視 | `col op max` |
+  | `<> ANY` | 常に偽 | NULL を無視 | `min == max` なら `col <> v`、異なれば `col <> min OR col <> max` |
+  | `> >= ALL` | 0 行は常に真・NULL のみは常に偽 | 常に偽 | `col op max` |
+  | `< <= ALL` | 同上 | 常に偽 | `col op min` |
+  | `= ALL` | 同上 | 常に偽 | `min == max` なら `col = v`、異なれば `col = min AND col = max`（外側列の比較型への変換で両方と等しくなりうる。例: DOUBLE の 9007199254740992 は BIGINT の 9007199254740992 と 9007199254740993 の両方と等しい） |
+
+  外側値が NULL の行は生成した比較が UNKNOWN になり除外される（`ALL` は内側 0 行のとき外側 NULL でも真）。
+  境界値の比較は `cmp_quantified_cells`（型が合わないセルは `Equal` へ落とさず `Err`）で行い、浮動小数を含む
+  数値は `f64`、それ以外の数値は厳密な 10 進数で比べる。
+- **上限・形**: 内側の形（単一列・`LIMIT` 必須・集計形は `42601`）・行数上限・実行回数予算・入れ子の深さは
+  `IN (SELECT ...)` と同じ。値族の不一致と、BOOLEAN／ENUM の範囲比較（内側が空でも）は `22000`。TEXT の範囲比較で
+  列の照合がバイト列順でなければ `0A000`（比較の葉が照合を運ばないため。fail-closed）。
+- **拡張クエリプロトコル**: `core.rs` の `contains_subquery_syntax` が「比較演算子 → `ANY`／`SOME`／`ALL` →
+  `(` → `SELECT`」を検出し、`$n` との併用を Parse 段で `42601` にする（内側の `$n` が外側のダミーフラグの
+  添字をずらすのを防ぐ）。
+- **述語形 DML の内容照合**: `recovery/content_hash.rs` のタグ 18（外側の列 → 演算子判別子 → 量化子判別子
+  〔`Any=0`・`All=1`〕→ 内側トークン）。ANY と ALL・スカラー比較・`IN` は互いに別ハッシュ。
+- **対象外（fail-closed のまま）**: 式の左辺・相関サブクエリ・内側の集計形・サブクエリ文脈外（CHECK・ビュー
+  定義本体の単純形・カーソル・COPY・EXPLAIN）・投影位置／HAVING／CASE 条件での量化サブクエリ・
+  JOIN 文などサブクエリの解決を経由しない文形（未解決のまま束縛へ届けば `42601`）。
+- **OWASP**: 内側は外側と同じ `PolicyContext`・同じスナップショットで評価し、境界値・空かどうか・NULL の有無は
+  可視行だけから決まる（RLS-10。2 テナントの結合テストで固定）。内側は生トークン列のまま再検証し、境界値は
+  AST のリテラルとして埋め込む（文字列連結をしない）。エラー文言は固定の英語で他テナントの値を含めない。
+
 ## 実装ファイル
 
 | パス | 内容 |
@@ -315,6 +356,7 @@ Issue #1841 以降は下記の束縛段で解決する。エラー文言は静�
 | `crates/engine/tests/sql29_projection_subquery.rs`（Issue #1352） | 投影位置スカラーサブクエリの結合テスト（列位置・NULL・複数行・拒否形・RLS） |
 | `crates/engine/tests/sql29_subquery_scalar.rs`（Issue #1191） | スカラー比較・相関 `42601`・`IN` 対象型拡大・RLS の結合テスト |
 | `crates/engine/src/sql/correlation.rs`・`crates/engine/tests/sql61_correlated_binding.rs`（Issue #1841） | 相関参照の束縛（IR・予約内部名）と名前解決エラーの結合テスト |
+| `crates/engine/tests/sql61_any_all_subquery.rs`（Issue #1855） | `ANY`／`SOME`／`ALL` の独立オラクル照合・拒否形・上限・RLS・拡張クエリ・述語形 DML の結合テスト |
 
 ## OWASP Top 10 観点
 

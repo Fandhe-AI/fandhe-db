@@ -199,7 +199,8 @@ fn reject_forbidden_elements(predicates: &[WherePredicate]) -> Result<(), SqlSur
                 }
                 WherePredicate::InSubquery { .. }
                 | WherePredicate::Exists { .. }
-                | WherePredicate::ScalarSubqueryCompare { .. } => {
+                | WherePredicate::ScalarSubqueryCompare { .. }
+                | WherePredicate::QuantifiedSubqueryCompare { .. } => {
                     return Err(SqlSurfaceError::unsupported(
                         "subquery is not allowed in ON CONFLICT DO UPDATE WHERE",
                     ));

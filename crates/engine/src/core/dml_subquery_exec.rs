@@ -45,7 +45,8 @@ pub(super) fn where_has_subquery(preds: &[WherePredicate]) -> bool {
     preds.iter().any(|p| match p {
         WherePredicate::InSubquery { .. }
         | WherePredicate::Exists { .. }
-        | WherePredicate::ScalarSubqueryCompare { .. } => true,
+        | WherePredicate::ScalarSubqueryCompare { .. }
+        | WherePredicate::QuantifiedSubqueryCompare { .. } => true,
         WherePredicate::Not(inner) => where_has_subquery(std::slice::from_ref(inner.as_ref())),
         WherePredicate::Or(branches) => branches.iter().any(|b| where_has_subquery(b)),
         _ => false,
@@ -86,6 +87,7 @@ impl EngineCore {
             session.udfs(),
             self.group_by_limits,
             self.nesting_limits,
+            self.result_limits,
             &mut budget,
             &mut in_budget,
         )

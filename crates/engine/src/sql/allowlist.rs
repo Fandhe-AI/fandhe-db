@@ -2423,6 +2423,24 @@ pub enum WherePredicate {
         inner_tokens: Vec<Token>,
         depth: usize,
     },
+    /// `<列> <比較演算子> ANY|SOME|ALL (SELECT ...)`（量化比較のサブクエリ形。
+    /// Issue #1855・SQL-61 (3)・RLS-10）。内側の生トークン列のみを保持し、構文段では
+    /// 評価しない（意味論・解決契約は [`WherePredicate::InSubquery`] と同じ。
+    /// `sql::subquery` が束縛前に内側の値集合の境界値で `col <op> <リテラル>` と同じ
+    /// AST へ書き換える）。`SOME` は構文段で `ANY` に正規化する。受理するのは列が左辺で、
+    /// サブクエリ文脈にある形のみ（式の左辺・文脈外・CHECK 本体は従来どおり `0A000`）。
+    /// 否定は構文段で演算子反転と量化子反転（`NOT (x = ANY S)` → `x <> ALL S`）として
+    /// 葉へ押し下げる。
+    ///
+    /// **BREAKING CHANGE**: 本 variant の追加は非網羅的 `match` を破壊する
+    /// （既存の破壊的変更運用を踏襲）。
+    QuantifiedSubqueryCompare {
+        column: String,
+        op: ScalarSubqueryOp,
+        quantifier: Quantifier,
+        inner_tokens: Vec<Token>,
+        depth: usize,
+    },
     /// 疑似列 `id`（`u64` 全域）と整数 `value` の厳密比較（Issue #1352）。構文解析は
     /// 生成せず、`sql::subquery` が `IN`／スカラー比較のサブクエリを解決する際にだけ
     /// 生成する内部専用の葉。式評価器は行 `id` を `f64` へ写すため `2^53` 超で
@@ -8028,6 +8046,20 @@ impl<'a> Parser<'a> {
                             inner_tokens,
                             depth,
                         }],
+                        // 量化比較の否定は演算子反転＋量化子反転で表す（Issue #1855）。
+                        WherePredicate::QuantifiedSubqueryCompare {
+                            column,
+                            op,
+                            quantifier,
+                            inner_tokens,
+                            depth,
+                        } => vec![WherePredicate::QuantifiedSubqueryCompare {
+                            column,
+                            op: op.negated(),
+                            quantifier: quantifier.flipped(),
+                            inner_tokens,
+                            depth,
+                        }],
                         other => vec![WherePredicate::Not(Box::new(other))],
                     }
                 } else {
@@ -8827,6 +8859,49 @@ impl<'a> Parser<'a> {
         }
         if let Some((op, op_len)) = self.scalar_subquery_op_at(self.pos + 1) {
             let open_idx = self.pos + 1 + op_len;
+            // `<col> <op> ANY|SOME|ALL (SELECT ...)`（Issue #1855・SQL-61 (3)）。サブクエリ
+            // 文脈にあり CHECK 本体でないときだけ受理する。それ以外は本腕に入らず、従来の
+            // 式フォールバック（`parse_quantified_rest`）が `0A000` で拒否する。
+            let quantifier = match self.tokens.get(open_idx) {
+                Some(Token::Ident(w)) if w.eq_ignore_ascii_case("ANY") => Some(Quantifier::Any),
+                Some(Token::Ident(w)) if w.eq_ignore_ascii_case("SOME") => Some(Quantifier::Any),
+                Some(Token::Ident(w)) if w.eq_ignore_ascii_case("ALL") => Some(Quantifier::All),
+                _ => None,
+            };
+            if let Some(quantifier) = quantifier {
+                if self.subquery_ctx.is_some()
+                    && !self.in_check_body
+                    && matches!(self.tokens.get(open_idx + 1), Some(Token::Punct('(')))
+                    && matches!(
+                        self.tokens.get(open_idx + 2),
+                        Some(Token::Keyword(Keyword::Select))
+                    )
+                {
+                    let depth = self.require_subquery_depth()?;
+                    let close_idx =
+                        self.find_matching_close_paren(open_idx + 1)
+                            .ok_or_else(|| {
+                                SqlSurfaceError::unsupported(
+                                    "unmatched parenthesis in ANY/ALL subquery",
+                                )
+                            })?;
+                    let inner_tokens = self
+                        .tokens
+                        .get((open_idx + 2)..close_idx)
+                        .ok_or_else(|| {
+                            SqlSurfaceError::unsupported("malformed ANY/ALL subquery boundary")
+                        })?
+                        .to_vec();
+                    self.pos = close_idx + 1;
+                    return Ok(Some(WherePredicate::QuantifiedSubqueryCompare {
+                        column: name,
+                        op,
+                        quantifier,
+                        inner_tokens,
+                        depth,
+                    }));
+                }
+            }
             if matches!(self.tokens.get(open_idx), Some(Token::Punct('(')))
                 && matches!(
                     self.tokens.get(open_idx + 1),
@@ -14965,6 +15040,7 @@ pub(crate) fn parse_view_body(tokens: &[Token]) -> Result<ParsedViewBody, SqlSur
             WherePredicate::InSubquery { .. }
             | WherePredicate::Exists { .. }
             | WherePredicate::ScalarSubqueryCompare { .. }
+            | WherePredicate::QuantifiedSubqueryCompare { .. }
             | WherePredicate::IdCompare { .. } => {
                 return Err(SqlSurfaceError::unsupported(
                     "view body WHERE predicate form is not supported",
@@ -15058,6 +15134,7 @@ fn check_buffered_outer_pred(pred: &WherePredicate) -> Result<(), SqlSurfaceErro
         | WherePredicate::Exists { .. }
         | WherePredicate::IdCompare { .. }
         | WherePredicate::Prefix { .. }
+        | WherePredicate::QuantifiedSubqueryCompare { .. }
         | WherePredicate::ScalarSubqueryCompare { .. } => Err(SqlSurfaceError::unsupported(
             "a view with an aggregate/LIMIT body does not support UDF predicates or subqueries in WHERE",
         )),
@@ -15496,6 +15573,12 @@ fn check_body_pred(
             depth,
             ..
         } => check_body_subquery(inner_tokens, *depth, true, lookup, out),
+        // 量化比較の内側は `IN` と同じ Values 形（Issue #1855）。
+        WherePredicate::QuantifiedSubqueryCompare {
+            inner_tokens,
+            depth,
+            ..
+        } => check_body_subquery(inner_tokens, *depth, false, lookup, out),
         WherePredicate::Equality { .. }
         | WherePredicate::Prefix { .. }
         | WherePredicate::BoolEquality { .. }
@@ -15630,6 +15713,7 @@ pub(crate) fn rename_column_in_view_body(
             | WherePredicate::InSubquery { .. }
             | WherePredicate::Exists { .. }
             | WherePredicate::ScalarSubqueryCompare { .. }
+            | WherePredicate::QuantifiedSubqueryCompare { .. }
             | WherePredicate::IdCompare { .. } => {
                 return Err(SqlSurfaceError::unsupported(
                     "view body WHERE predicate form is not supported",
@@ -15756,6 +15840,7 @@ fn render_where_predicate(pred: &WherePredicate) -> String {
         WherePredicate::InSubquery { .. }
         | WherePredicate::Exists { .. }
         | WherePredicate::ScalarSubqueryCompare { .. }
+        | WherePredicate::QuantifiedSubqueryCompare { .. }
         | WherePredicate::IdCompare { .. } => String::new(),
     }
 }

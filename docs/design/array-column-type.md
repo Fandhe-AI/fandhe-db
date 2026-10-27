@@ -371,7 +371,7 @@ TABLE-35 の配列関数 8 種（`array_length`・`cardinality`・`array_append`
   式述語の経路のため二次索引では被覆されず全走査で、RLS の述語と AND で評価される。`ANY`／`ALL` 内の `$n`
   は型を導けず `42P18`。内容ハッシュは新タグ 19（量化比較）と `JsonAccessOp` の種別 14（`&&`）。
 - **対象外**: 配列の `||`（`array_cat` 等と同じ意味のため #1604 で扱う想定。#1602 の対象外記述とは
-  担当が食い違っている）、`ANY／ALL (SELECT ...)`（`0A000`）、`IN (ARRAY[...])`（拒否のまま）、
+  担当が食い違っている）、式左辺の `ANY／ALL (SELECT ...)` とサブクエリ文脈外（`0A000`。列が左辺の形は Issue #1855 で受理）、`IN (ARRAY[...])`（拒否のまま）、
   HAVING・CASE の条件・定数 SELECT での量化比較、CHECK・UDF 本体での使用（`0A000`）、date と timestamp 要素の
   混在比較（`0A000`）、numeric／json／ENUM 要素、多次元（#1605）、包含の索引利用。
 

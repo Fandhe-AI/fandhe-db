@@ -122,6 +122,7 @@ fn render_predicate(predicate: &WherePredicate) -> String {
         WherePredicate::InSubquery { .. }
         | WherePredicate::Exists { .. }
         | WherePredicate::ScalarSubqueryCompare { .. }
+        | WherePredicate::QuantifiedSubqueryCompare { .. }
         | WherePredicate::IdCompare { .. } => String::new(),
     }
 }
@@ -588,6 +589,7 @@ fn reject_forbidden_elements(predicates: &[WherePredicate]) -> Result<(), SqlSur
             WherePredicate::InSubquery { .. }
             | WherePredicate::Exists { .. }
             | WherePredicate::ScalarSubqueryCompare { .. }
+            | WherePredicate::QuantifiedSubqueryCompare { .. }
             | WherePredicate::IdCompare { .. } => {
                 return Err(SqlSurfaceError::unsupported(
                     "CHECK constraint predicate must not contain a subquery",
@@ -1061,7 +1063,8 @@ pub(crate) fn map_predicate_columns(
         },
         WherePredicate::InSubquery { .. }
         | WherePredicate::Exists { .. }
-        | WherePredicate::ScalarSubqueryCompare { .. } => return Err(on_subquery()),
+        | WherePredicate::ScalarSubqueryCompare { .. }
+        | WherePredicate::QuantifiedSubqueryCompare { .. } => return Err(on_subquery()),
     })
 }
 

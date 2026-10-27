@@ -117,6 +117,23 @@ fn sql61_qualified_outer_refs_reach_binding_and_fail_closed_as_correlated() {
 }
 
 #[test]
+fn sql61_outer_ref_in_order_by_expr_is_correlated() {
+    // Cursor Bugbot 指摘: 式 ORDER BY 内の外側参照も
+    // 相関として検出され、内側表上の 42703 ではなく 42601 になる。
+    // 集約 HAVING・集約 ORDER BY は内側が GROUP BY 集約を受理しない（グループキー項目で
+    // 項目数が 2 以上になる）ため SQL 経由では到達不能で、収集は多層防御として置く。
+    let (core, ctx, _g) = setup();
+    for sql in [
+        "SELECT id FROM docs x WHERE EXISTS (SELECT id FROM refs ORDER BY lower(x.lang) LIMIT 1) LIMIT 10",
+        "SELECT id FROM docs x WHERE lang IN (SELECT lang FROM refs ORDER BY lower(x.lang) LIMIT 10) LIMIT 10",
+    ] {
+        let (code, msg) = err(&core, &ctx, sql);
+        assert_eq!(code, "42601", "{sql}: {msg}");
+        assert!(msg.contains("correlated"), "{sql}: {msg}");
+    }
+}
+
+#[test]
 fn sql61_unqualified_outer_only_column_is_correlated() {
     let (core, ctx, _g) = setup();
     let (code, msg) = err(

@@ -1399,7 +1399,7 @@ struct HnswEngineState {
 ///   で打ち切る）。`Not(Or)` は構文段が押し下げるため拒否する。
 /// - それ以外（`PredicateCall`〔RLS 述語 `visible()`。`Or` の内側を含む〕・
 ///   `BoolColumn`・`Not(Not)`・許可形以外を包む `Not`・`InSubquery`／`Exists`／
-///   `ScalarSubqueryCompare`〔NoSQL にサブクエリ構文が無い〕）はすべて `42601` で
+///   `ScalarSubqueryCompare`／`QuantifiedSubqueryCompare`〔NoSQL にサブクエリ構文が無い〕）はすべて `42601` で
 ///   拒否する。網羅的 `match` にし、将来 variant 追加時に無言で穴が開かないようにする。
 fn reject_unsupported_predicate_dml_forms(
     predicates: &[crate::sql::allowlist::WherePredicate],
@@ -1461,6 +1461,7 @@ fn reject_unsupported_predicate_dml_conjunction(
                 | WherePredicate::InSubquery { .. }
                 | WherePredicate::Exists { .. }
                 | WherePredicate::ScalarSubqueryCompare { .. }
+                | WherePredicate::QuantifiedSubqueryCompare { .. }
                 | WherePredicate::IdCompare { .. } => return Err(unsupported()),
             },
             // 列 × 数値リテラルの比較の形に限る（`Call` 等は持ち込ませない）。
@@ -1490,6 +1491,7 @@ fn reject_unsupported_predicate_dml_conjunction(
             | WherePredicate::InSubquery { .. }
             | WherePredicate::Exists { .. }
             | WherePredicate::ScalarSubqueryCompare { .. }
+            | WherePredicate::QuantifiedSubqueryCompare { .. }
             | WherePredicate::IdCompare { .. } => return Err(unsupported()),
         }
     }
@@ -5586,7 +5588,24 @@ impl EngineCore {
                     tokens.get(i - 1),
                     Some(Token::Keyword(Keyword::Select) | Token::Punct(','))
                 );
-            if is_exists || is_in || is_scalar || is_projection_scalar {
+            // 量化比較のサブクエリ形 `<col> <op> ANY|SOME|ALL (SELECT ...)`（Issue #1855・
+            // SQL-61 (3)）: 内側の `$n` が外側の `where_equality_dummy_flags` の添字を
+            // ずらしうるため、`$n` との併用は Parse 段で拒否する（P0）。誤検出しても
+            // 拒否側に倒れるだけ。
+            let is_quantified = matches!(
+                tokens.get(i),
+                Some(Token::Ident(w))
+                    if w.eq_ignore_ascii_case("ANY")
+                        || w.eq_ignore_ascii_case("SOME")
+                        || w.eq_ignore_ascii_case("ALL")
+            ) && matches!(tokens.get(i + 1), Some(Token::Punct('(')))
+                && matches!(tokens.get(i + 2), Some(Token::Keyword(Keyword::Select)))
+                && i > 0
+                && matches!(
+                    tokens.get(i - 1),
+                    Some(Token::Punct('=' | '<' | '>') | Token::Le | Token::Ge)
+                );
+            if is_exists || is_in || is_scalar || is_projection_scalar || is_quantified {
                 return true;
             }
         }
@@ -8936,6 +8955,7 @@ impl EngineCore {
                     session.udfs(),
                     self.group_by_limits,
                     self.nesting_limits,
+                    limits,
                     &mut subquery_budget,
                     &mut subquery_in_value_budget,
                 )?;
@@ -8954,6 +8974,7 @@ impl EngineCore {
                     session.udfs(),
                     self.group_by_limits,
                     self.nesting_limits,
+                    limits,
                     &mut subquery_budget,
                     &mut subquery_in_value_budget,
                 )?;
@@ -8984,6 +9005,7 @@ impl EngineCore {
                     session.udfs(),
                     self.group_by_limits,
                     self.nesting_limits,
+                    limits,
                     &mut subquery_budget,
                     &mut subquery_in_value_budget,
                 )?;
@@ -9009,6 +9031,7 @@ impl EngineCore {
                     session.udfs(),
                     self.group_by_limits,
                     self.nesting_limits,
+                    limits,
                     &mut subquery_budget,
                     &mut subquery_in_value_budget,
                 )?;

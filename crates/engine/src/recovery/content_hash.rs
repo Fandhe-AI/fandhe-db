@@ -2240,7 +2240,8 @@ fn push_dml_where_predicates(
 /// 正規化）。タグ 1〜7 の直列化形式は本 Issue 以前と一切変えない（`AND` だけの
 /// 既存述語列の content hash は不変。回帰テストで固定する）。
 ///
-/// サブクエリ葉（タグ 13 `InSubquery`・14 `Exists`・15 `ScalarSubqueryCompare`。Issue #1752）
+/// サブクエリ葉（タグ 13 `InSubquery`・14 `Exists`・15 `ScalarSubqueryCompare`・
+/// 18 `QuantifiedSubqueryCompare`〔Issue #1855〕。Issue #1752）
 /// は**解決前**の述語を渡す契約で、内側を解決して `InList`／`IdCompare` へ書き換えた述語列は
 /// 決して渡さない（渡すと内側の結果が材料になり、再送が `22023` に化ける）。
 fn push_dml_where_predicate(
@@ -2418,6 +2419,36 @@ fn push_dml_where_predicate(
                 ScalarSubqueryOp::Le => 3,
                 ScalarSubqueryOp::Gt => 4,
                 ScalarSubqueryOp::Ge => 5,
+            });
+            push_dml_subquery_tokens(b, inner_tokens)?;
+        }
+        // Issue #1855・SQL-61 (3): 量化比較のサブクエリ形（`<col> <op> ANY|ALL (SELECT ...)`）。
+        // 直列化順は「外側列 → 演算子の判別子 → 量化子の判別子 → 内側トークン」。材料は
+        // 構文形だけで内側の評価結果は含めない（タグ 15 のスカラー比較・ANY と ALL は
+        // それぞれ別ハッシュ）。`SOME` は構文段で `Any` に正規化済み。
+        WherePredicate::QuantifiedSubqueryCompare {
+            column,
+            op,
+            quantifier,
+            inner_tokens,
+            ..
+        } => {
+            use crate::sql::allowlist::ScalarSubqueryOp;
+            use crate::sql::udf_call::Quantifier;
+            b.push_u8(18);
+            b.push_bytes(column.as_bytes())
+                .map_err(|_| dml_hash_field_too_large())?;
+            b.push_u8(match op {
+                ScalarSubqueryOp::Eq => 0,
+                ScalarSubqueryOp::Ne => 1,
+                ScalarSubqueryOp::Lt => 2,
+                ScalarSubqueryOp::Le => 3,
+                ScalarSubqueryOp::Gt => 4,
+                ScalarSubqueryOp::Ge => 5,
+            });
+            b.push_u8(match quantifier {
+                Quantifier::Any => 0,
+                Quantifier::All => 1,
             });
             push_dml_subquery_tokens(b, inner_tokens)?;
         }
@@ -7497,9 +7528,50 @@ mod tests {
         }
     }
 
+    fn quantified_sq(
+        column: &str,
+        op: crate::sql::allowlist::ScalarSubqueryOp,
+        quantifier: crate::sql::udf_call::Quantifier,
+        inner: &str,
+    ) -> crate::sql::allowlist::WherePredicate {
+        crate::sql::allowlist::WherePredicate::QuantifiedSubqueryCompare {
+            column: column.to_string(),
+            op,
+            quantifier,
+            inner_tokens: sq_toks(inner),
+            depth: 1,
+        }
+    }
+
     fn del_hash(preds: &[crate::sql::allowlist::WherePredicate]) -> ContentHash {
         for_delete_where("t", preds, &crate::sql::udf_call::UdfRegistry::default())
             .expect("subquery predicate must be hashable")
+    }
+
+    /// Issue #1855・SQL-61 (3): 量化比較は ANY と ALL・演算子・スカラー比較・IN と
+    /// 互いに別ハッシュになる（同一 operation_id の取り違えを `22023` で検出するため）。
+    #[test]
+    fn quantified_subquery_where_hash_is_independent() {
+        use crate::sql::allowlist::ScalarSubqueryOp as Op;
+        use crate::sql::udf_call::Quantifier as Q;
+        let inner = "SELECT id FROM s LIMIT 3";
+        let any = del_hash(&[quantified_sq("n", Op::Gt, Q::Any, inner)]);
+        let all = del_hash(&[quantified_sq("n", Op::Gt, Q::All, inner)]);
+        assert_eq!(any, del_hash(&[quantified_sq("n", Op::Gt, Q::Any, inner)]));
+        assert_ne!(any, all);
+        assert_ne!(any, del_hash(&[quantified_sq("n", Op::Ge, Q::Any, inner)]));
+        assert_ne!(any, del_hash(&[quantified_sq("m", Op::Gt, Q::Any, inner)]));
+        assert_ne!(
+            any,
+            del_hash(&[quantified_sq(
+                "n",
+                Op::Gt,
+                Q::Any,
+                "SELECT id FROM s LIMIT 4"
+            )])
+        );
+        assert_ne!(any, del_hash(&[scalar_sq("n", Op::Gt, inner)]));
+        assert_ne!(any, del_hash(&[in_sq("n", inner)]));
     }
 
     /// 同じ述語は決定的に同じハッシュになる。
