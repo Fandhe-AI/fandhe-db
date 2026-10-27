@@ -9823,6 +9823,51 @@ fn bare_schema_column<'a>(
     }
 }
 
+/// 式が疑似列 `id` の裸の参照か（スキーマ列 `id` があればそちらが優先）。値・オフセット・
+/// 既定値の型決定（[`lag_lead_declared_type`]）と `uses_pseudo_id` 判定が共有する唯一の判定。
+/// テーブル修飾・別名は字句段で修飾子検査済みの `Expr::Ident("id")` へ正規化されている。
+fn is_pseudo_id_ref(expr: &Expr, schema: &TableSchema) -> bool {
+    matches!(expr, Expr::Ident(name) if name == "id")
+        && schema.has_pseudo_id()
+        && !schema.columns.iter().any(|c| c.name == "id")
+}
+
+/// `LAG`／`LEAD` の 1 引数（値・オフセット・既定値）の宣言型を決める唯一の写像。
+/// スキーマ列は列の宣言型、疑似列 `id` は `BIGINT`、それ以外の式は式束縛の結果列型。
+/// 式層が `id` を倍精度として束縛しても、公告型・統一型はこの写像に従う（オフセット側の
+/// 整数判定も同じ写像）。束縛できない式は `None`（呼び出し側の本束縛がエラーを返す）。
+fn lag_lead_declared_type(
+    expr: &Expr,
+    schema: &TableSchema,
+    udfs: &crate::sql::udf_call::UdfRegistry,
+    node_budget: &usize,
+) -> Option<ColumnType> {
+    if let Some((_, c)) = bare_schema_column(expr, schema) {
+        return Some(c.ty.clone());
+    }
+    if is_pseudo_id_ref(expr, schema) {
+        return Some(ColumnType::BigInt);
+    }
+    let mut scratch = *node_budget;
+    crate::sql::udf_call::bind_projection_expr(expr, schema, udfs, &mut scratch)
+        .ok()
+        .and_then(|(_, _, col)| col)
+}
+
+/// 値・既定値の宣言型から最終の結果列型を決める。両方が宣言できれば [`unify_lag_lead_types`]
+/// （例: `lag(id, 1, 0)` は `BIGINT`）、統一できない組（整数と倍精度の混在等）や片側不明は
+/// `COALESCE` 束縛の結果列型 `fallback` を使う。
+fn lag_lead_result_type(
+    value: Option<&ColumnType>,
+    default: Option<&ColumnType>,
+    fallback: Option<ColumnType>,
+) -> Option<ColumnType> {
+    match (value, default) {
+        (Some(v), Some(d)) => unify_lag_lead_types(v, d).or(fallback),
+        _ => fallback,
+    }
+}
+
 /// `LAG`／`LEAD` の値と既定値の宣言型を統一する（`COALESCE` と同じく文字列系同士・整数系同士は
 /// 統一し、それ以外は同一型のみ許す）。統一できなければ `None`（呼び出し側が `42804`）。
 fn unify_lag_lead_types(a: &ColumnType, b: &ColumnType) -> Option<ColumnType> {
@@ -9891,6 +9936,12 @@ fn bind_window_offset_args(
             && schema.has_pseudo_id()
             && !schema.columns.iter().any(|c| c.name == "id")
     };
+    // 値・既定値の宣言型（疑似列 `id` は BIGINT。公告型を式層の倍精度にしない）。
+    let value_decl = lag_lead_declared_type(&args.value, schema, udfs, node_budget);
+    let default_decl = args
+        .default
+        .as_ref()
+        .and_then(|d| lag_lead_declared_type(d, schema, udfs, node_budget));
     let unsupported =
         || SqlSurfaceError::feature_not_supported("this value type is not supported in LAG/LEAD");
     let offset = match &args.offset {
@@ -9898,13 +9949,8 @@ fn bind_window_offset_args(
         Some(Expr::Null) => Some(BoundExpr::Null),
         // 裸の列は列の宣言型で判定する（式層は BOOLEAN 等の裸の列を束縛できず `22000` になるため）。
         // 疑似列 `id` は bigint として扱う（スキーマ列 `id` があればそちらが優先）。
-        Some(Expr::Ident(name))
-            if name == "id"
-                && schema.has_pseudo_id()
-                && !schema.columns.iter().any(|c| c.name == "id") =>
-        {
-            let (bound, _ty, _col) =
-                bind_projection_expr(&Expr::Ident(name.clone()), schema, udfs, node_budget)?;
+        Some(e @ Expr::Ident(_)) if is_pseudo_id_ref(e, schema) => {
+            let (bound, _ty, _col) = bind_projection_expr(e, schema, udfs, node_budget)?;
             Some(bound)
         }
         Some(Expr::Ident(name)) if schema.columns.iter().any(|c| &c.name == name) => {
@@ -9980,7 +10026,12 @@ fn bind_window_offset_args(
                 }
             }
             match bind_value_with_default(&args.value, d, schema, udfs, node_budget) {
-                Ok((v, d, ty, col)) => (v, Some(d), ty, col),
+                Ok((v, d, ty, col)) => (
+                    v,
+                    Some(d),
+                    ty,
+                    lag_lead_result_type(value_decl.as_ref(), default_decl.as_ref(), col),
+                ),
                 // 式層が拒否する型（BOOLEAN・NUMERIC・UUID・ENUM 等）の裸の列は宣言型で
                 // 型統一・不一致判定する（`COALESCE` 式束縛へ落とさない）。
                 Err(SqlSurfaceError::InvalidInput { .. })
@@ -10002,7 +10053,7 @@ fn bind_window_offset_args(
                         None => {
                             let (b, ty, col) =
                                 bind_projection_expr(&args.value, schema, udfs, node_budget)?;
-                            let col = col.ok_or_else(unsupported)?;
+                            let col = value_decl.clone().or(col).ok_or_else(unsupported)?;
                             if lag_lead_value_type_unsupported(&col)
                                 || matches!(
                                     ty,
@@ -10021,7 +10072,7 @@ fn bind_window_offset_args(
                         Some((index, c)) => (None, Some(index), c.ty.clone()),
                         None => {
                             let (b, _ty, col) = bind_projection_expr(d, schema, udfs, node_budget)?;
-                            let col = col.ok_or_else(mismatch)?;
+                            let col = default_decl.clone().or(col).ok_or_else(mismatch)?;
                             if lag_lead_value_type_unsupported(&col) {
                                 return Err(unsupported());
                             }
@@ -10044,7 +10095,7 @@ fn bind_window_offset_args(
         }
         None => {
             let (v, ty, col) = bind_projection_expr(&args.value, schema, udfs, node_budget)?;
-            (v, null_default, ty, col)
+            (v, null_default, ty, value_decl.clone().or(col))
         }
     };
     let type_ok = col
@@ -14448,5 +14499,142 @@ mod tests {
         ))];
         let agg = Expr::Ident(crate::sql::allowlist::aggregate_placeholder(0));
         assert_eq!(substitute_group_key_exprs(&agg, &keys), agg);
+    }
+}
+
+/// `LAG`／`LEAD` の値・既定値の公告型（`result_type`）が宣言型と一致することの表駆動検査
+/// （SQL-64 (1)・Issue #1880。疑似列 `id` が式層の倍精度で公告されない回帰を含む）。
+#[cfg(test)]
+mod lag_lead_declared_type_tests {
+    use super::*;
+    use crate::sql::allowlist::WindowOffsetArgs;
+    use crate::sql::udf_call::{Expr, UdfRegistry};
+
+    fn col(name: &str, ty: ColumnType) -> ColumnDef {
+        ColumnDef::new(name, ty, false)
+    }
+    fn numeric(precision: u8, scale: u8) -> ColumnType {
+        ColumnType::Numeric { precision, scale }
+    }
+    fn ident(n: &str) -> Expr {
+        Expr::Ident(n.to_string())
+    }
+    fn num(n: &str) -> Expr {
+        Expr::Number(n.to_string())
+    }
+
+    fn pseudo_schema() -> TableSchema {
+        TableSchema::new(
+            "t",
+            vec![
+                col("score", ColumnType::Integer),
+                col("big", ColumnType::BigInt),
+                col("name", ColumnType::Text),
+                col("n", numeric(10, 2)),
+                col("u", ColumnType::Uuid),
+                col("flag", ColumnType::Boolean),
+            ],
+        )
+    }
+
+    /// 実列 `id`（TEXT）を持つ表。疑似列 `id` は存在せず、宣言型は実列の型になる。
+    fn real_id_schema() -> TableSchema {
+        TableSchema::new(
+            "t",
+            vec![
+                col("id", ColumnType::Text),
+                col("score", ColumnType::Integer),
+            ],
+        )
+    }
+
+    fn result_type(
+        schema: &TableSchema,
+        value: Expr,
+        default: Option<Expr>,
+    ) -> Result<Option<ColumnType>, SqlSurfaceError> {
+        let mut budget = 10_000usize;
+        bind_window_offset_args(
+            &WindowOffsetArgs {
+                value,
+                offset: None,
+                default,
+            },
+            schema,
+            &UdfRegistry::default(),
+            &mut budget,
+        )
+        .map(|a| a.result_type)
+    }
+
+    #[test]
+    fn advertised_type_matches_declared_type() {
+        let s = pseudo_schema();
+        let cases: Vec<(Expr, Option<Expr>, Option<ColumnType>)> = vec![
+            (ident("id"), None, Some(ColumnType::BigInt)),
+            (ident("id"), Some(Expr::Null), Some(ColumnType::BigInt)),
+            (ident("id"), Some(num("0")), Some(ColumnType::BigInt)),
+            (ident("id"), Some(ident("id")), Some(ColumnType::BigInt)),
+            (ident("id"), Some(ident("score")), Some(ColumnType::BigInt)),
+            (ident("score"), Some(ident("id")), Some(ColumnType::BigInt)),
+            (num("1"), Some(ident("id")), Some(ColumnType::BigInt)),
+            (ident("score"), None, Some(ColumnType::Integer)),
+            (ident("score"), Some(num("0")), Some(ColumnType::Integer)),
+            (ident("score"), Some(ident("big")), Some(ColumnType::BigInt)),
+            (
+                ident("name"),
+                Some(Expr::String("x".into())),
+                Some(ColumnType::Text),
+            ),
+            (ident("n"), None, Some(numeric(10, 2))),
+            (ident("n"), Some(ident("n")), Some(numeric(10, 2))),
+            (ident("u"), Some(ident("u")), Some(ColumnType::Uuid)),
+            (
+                ident("flag"),
+                Some(ident("flag")),
+                Some(ColumnType::Boolean),
+            ),
+        ];
+        for (value, default, want) in cases {
+            let got = result_type(&s, value.clone(), default.clone())
+                .unwrap_or_else(|e| panic!("{value:?}/{default:?}: {e:?}"));
+            assert_eq!(got, want, "value={value:?} default={default:?}");
+        }
+    }
+
+    #[test]
+    fn real_id_column_keeps_its_declared_type() {
+        let s = real_id_schema();
+        assert_eq!(
+            result_type(&s, ident("id"), None).expect("bind"),
+            Some(ColumnType::Text)
+        );
+        assert_eq!(
+            result_type(&s, ident("id"), Some(Expr::String("x".into()))).expect("bind"),
+            Some(ColumnType::Text)
+        );
+        // 実列 `id` があれば疑似列扱い（BIGINT）にならず、整数既定値とは不一致。
+        assert!(matches!(
+            result_type(&s, ident("id"), Some(num("0"))),
+            Err(SqlSurfaceError::DatatypeMismatch { .. })
+        ));
+    }
+
+    #[test]
+    fn mismatches_stay_fail_closed() {
+        let s = pseudo_schema();
+        for (value, default) in [
+            (ident("id"), ident("name")),
+            (ident("name"), ident("id")),
+            (ident("n"), ident("id")),
+        ] {
+            assert!(
+                matches!(
+                    result_type(&s, value.clone(), Some(default.clone())),
+                    Err(SqlSurfaceError::DatatypeMismatch { .. })
+                ),
+                "value={value:?} default={default:?}"
+            );
+        }
     }
 }
