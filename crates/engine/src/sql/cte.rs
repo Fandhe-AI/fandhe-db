@@ -433,5 +433,16 @@ pub(crate) fn validate_data_modifying_cte(
             *slot = alias.clone();
         }
     }
+    // 公開名（改名後の全体）の重複は外側から列を一意に引けないため `42702`。
+    // 比較は識別子の大文字小文字を区別しない。
+    for (i, name) in exposed.iter().enumerate() {
+        if exposed
+            .iter()
+            .skip(i.saturating_add(1))
+            .any(|other| other.eq_ignore_ascii_case(name))
+        {
+            return Err(SqlSurfaceError::ambiguous_column(name.clone()));
+        }
+    }
     Ok(Some(exposed))
 }

@@ -14990,6 +14990,11 @@ impl<'a> Parser<'a> {
     }
 }
 
+/// データ変更 CTE 本文での `PARTITIONED` 句（分割実行）の固定拒否エラー（Issue #1875）。
+fn partitioned_in_cte_error() -> SqlSurfaceError {
+    SqlSurfaceError::unsupported("PARTITIONED cannot be used in a data-modifying CTE")
+}
+
 /// CTE 本文がデータ変更文（先頭が `INSERT`／`UPDATE`／`DELETE`）なら、既存の DML 許可パーサーで
 /// 解析して [`super::cte::CteBody::DataModifying`] を返す（SQL-63・Issue #1875）。そうでなければ
 /// `None`（呼び出し元が SELECT 本文として扱う）。`sql::allowlist::Parser::parse_with_clause` から
@@ -15019,16 +15024,8 @@ fn parse_data_modifying_cte_body(
         return Ok(None);
     };
 
-    let mut depth: i32 = 0;
     for (i, tok) in inner.iter().enumerate() {
         match tok {
-            Token::Punct('(') => depth = depth.saturating_add(1),
-            Token::Punct(')') => depth = depth.saturating_sub(1),
-            Token::Ident(w) if depth == 0 && w.eq_ignore_ascii_case("PARTITIONED") => {
-                return Err(SqlSurfaceError::unsupported(
-                    "PARTITIONED cannot be used in a data-modifying CTE",
-                ));
-            }
             Token::Ident(w)
                 if w.eq_ignore_ascii_case("USING")
                     && matches!(
@@ -15062,7 +15059,7 @@ fn parse_data_modifying_cte_body(
                     "UPDATE ... FROM is not supported in a data-modifying CTE yet",
                 ));
             }
-            let v = parse_update_form_shape_tokens_with_limits(inner, mode, limits)?;
+            let v = parse_update_form_shape_inner(inner, mode, limits, true)?;
             let table = match &v {
                 ValidatedUpdateForm::Single(u) => u.table_name.clone(),
                 ValidatedUpdateForm::Predicate(u) => u.table_name.clone(),
@@ -15075,7 +15072,7 @@ fn parse_data_modifying_cte_body(
                     "DELETE ... USING is not supported in a data-modifying CTE yet",
                 ));
             }
-            let v = parse_delete_statement_shape_tokens_with_limits(inner, mode, limits)?;
+            let v = parse_delete_statement_shape_inner(inner, mode, limits, true)?;
             let table = match &v {
                 DeleteStatement::SingleRow(d) => d.table_name.clone(),
                 DeleteStatement::Predicate(d) => d.table_name.clone(),
@@ -22515,7 +22512,21 @@ pub(crate) fn parse_delete_statement_shape_tokens_with_limits(
     mode: LedgerMode,
     limits: crate::nesting_limits::NestingLimits,
 ) -> Result<DeleteStatement, SqlSurfaceError> {
+    parse_delete_statement_shape_inner(tokens, mode, limits, false)
+}
+
+/// [`parse_delete_statement_shape_tokens_with_limits`] の本体。`forbid_partitioned` はデータ変更 CTE
+/// 本文用で、構文解析で `PARTITIONED` 句が現れたら `operation_id` 必須化より先に拒否する（Issue #1875）。
+fn parse_delete_statement_shape_inner(
+    tokens: &[lexer::Token],
+    mode: LedgerMode,
+    limits: crate::nesting_limits::NestingLimits,
+    forbid_partitioned: bool,
+) -> Result<DeleteStatement, SqlSurfaceError> {
     let shape = parse_delete_statement_shape(tokens, Some(limits))?;
+    if forbid_partitioned && shape.partitioned.is_some() {
+        return Err(partitioned_in_cte_error());
+    }
 
     // 分割実行はジョブ識別に operation_id を使うため、構成に関わらず必須（Issue #1704）。
     if shape.partitioned.is_some() {
@@ -24217,11 +24228,25 @@ pub(crate) fn parse_update_form_shape_tokens_with_limits(
     mode: LedgerMode,
     limits: crate::nesting_limits::NestingLimits,
 ) -> Result<ValidatedUpdateForm, SqlSurfaceError> {
+    parse_update_form_shape_inner(tokens, mode, limits, false)
+}
+
+/// [`parse_update_form_shape_tokens_with_limits`] の本体（`forbid_partitioned` の意味は
+/// [`parse_delete_statement_shape_inner`] と同じ）。
+fn parse_update_form_shape_inner(
+    tokens: &[lexer::Token],
+    mode: LedgerMode,
+    limits: crate::nesting_limits::NestingLimits,
+    forbid_partitioned: bool,
+) -> Result<ValidatedUpdateForm, SqlSurfaceError> {
     let mut p = Parser::new(tokens)
         .with_nesting_limits(limits)
         .with_dml_where_subquery_ctx(0);
     let shape = p.parse_update()?;
     p.expect_end_of_statement()?;
+    if forbid_partitioned && shape.partitioned.is_some() {
+        return Err(partitioned_in_cte_error());
+    }
 
     // 分割実行はジョブ識別に operation_id を使うため、構成に関わらず必須（Issue #1704）。
     if shape.partitioned.is_some() {
@@ -35306,6 +35331,19 @@ mod tests {
     }
 
     #[test]
+    fn data_modifying_cte_allows_partitioned_column_name() {
+        let main = "SELECT * FROM d LIMIT 10";
+        // 列名 `partitioned` は句ではない（構文解析後の句だけを拒否する）。解析段で
+        // `PARTITIONED` 起因の拒否にならないこと（未知列 42703 は可）。
+        let r = dm_cte_exposed(&format!(
+            "WITH d AS (UPDATE documents SET partitioned = 'x' WHERE partitioned = 'y' RETURNING partitioned) {main}"
+        ));
+        if let Err(e) = r {
+            assert_eq!(e.wire_code(), "42703", "err={e:?}");
+        }
+    }
+
+    #[test]
     fn data_modifying_cte_column_errors() {
         let main = "SELECT * FROM d LIMIT 10";
         let too_long = dm_cte_exposed(&format!(
@@ -35323,6 +35361,12 @@ mod tests {
         ))
         .expect_err("missing target");
         assert_eq!(ghost.wire_code(), "42P01");
+        // 短い別名リストと後続の元列名の衝突（別名同士の重複は構文段で 42701）は 42702。
+        let dup = dm_cte_exposed(&format!(
+            "WITH d(lang) AS (DELETE FROM documents WHERE lang = 'ja' RETURNING id, lang) {main}"
+        ))
+        .expect_err("duplicate exposed name");
+        assert_eq!(dup.wire_code(), "42702");
         let cte_target = dm_cte_exposed(&format!(
             "WITH s AS (SELECT id FROM documents), d AS (DELETE FROM s WHERE lang = 'ja') {main}"
         ))

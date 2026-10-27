@@ -335,10 +335,16 @@ pub fn classify_statement(stmt: &str) -> StatementEffect {
         // `sql::allowlist::validate_sql_tokens` が固定 `0A000` で止めるが、実行結線（#1876）後も
         // 複数文メッセージの書き込み配置制約をすり抜けないよう、分類は先に書き込み側へ置く。
         Token::Ident(name) if name.eq_ignore_ascii_case("WITH") => {
-            let has_dml_body = tokens.windows(2).any(|w| {
-                matches!(w.first(), Some(Token::Punct('(')))
+            // CTE 本文の `(` は直前が `AS` か `MATERIALIZED`（`AS [NOT] MATERIALIZED (`）の
+            // ものに限る。列名リスト `x(delete)` や式の括弧は本文ではない。
+            let has_dml_body = tokens.windows(3).any(|w| {
+                matches!(
+                    w.first(),
+                    Some(Token::Ident(a))
+                        if a.eq_ignore_ascii_case("AS") || a.eq_ignore_ascii_case("MATERIALIZED")
+                ) && matches!(w.get(1), Some(Token::Punct('(')))
                     && matches!(
-                        w.get(1),
+                        w.get(2),
                         Some(Token::Ident(n))
                             if n.eq_ignore_ascii_case("INSERT")
                                 || n.eq_ignore_ascii_case("UPDATE")
@@ -898,6 +904,13 @@ mod tests {
         // 主クエリが広域取得のみで、書き込みを持たない）。
         assert_eq!(
             classify_statement("WITH x AS (SELECT id FROM t) SELECT * FROM x LIMIT 1"),
+            StatementEffect::ReadOnly
+        );
+        // 列名リストの `delete` は本文ではない（読み取り分類のまま）。
+        assert_eq!(
+            classify_statement(
+                "WITH x(delete) AS (SELECT id FROM documents) SELECT * FROM x LIMIT 1"
+            ),
             StatementEffect::ReadOnly
         );
         // SQL-63・Issue #1875: データ変更 CTE は書き込み系（`[NOT] MATERIALIZED` を挟む形を含む）。
