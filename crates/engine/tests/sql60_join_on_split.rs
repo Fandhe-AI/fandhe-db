@@ -1,7 +1,8 @@
 //! `JOIN ... ON` の結合キー／残余述語への分解の結合テスト（Issue #1829。ポインタ: SQL-60）。
 //!
 //! 分類器そのものの単体テストは `sql::join::on_split`。ここでは production 経路
-//! （`EngineCore`）で、(a) 等価キーのみの ON が従来どおり動くこと、(b) キー無しは `42601`、
+//! （`EngineCore`）で、(a) 等価キーのみの ON が従来どおり動くこと、(b) キー無しは NLJ で実行（Issue #1839）、
+//!
 //! (c) 残余述語（左のみ・右のみ・混在）付きは評価が #1830 の責務のため全結合種別で `0A000`
 //! の fail-closed、(d) 未知列は分類より前に `42703`、(e) 拒否がテナントに依存しないこと
 //! を確認する。
@@ -276,24 +277,27 @@ fn on_residual_type_mismatch_is_rejected() {
     );
 }
 
+/// Issue #1839 で `42601` の暫定拒否から、ネステッドループ結合（NLJ）での実行へ置き換えた
+/// （仕様どおりの結果検証への置き換えで、検査の弱体化ではない）。期待行は PostgreSQL の
+/// 意味論による手計算（l: (1,x,1),(2,y,5)、r: (1,x,2),(2,w,1),(3,z,9)）。
 #[test]
-fn on_without_equi_key_is_rejected() {
+fn on_without_equi_key_runs_as_nested_loop() {
     let (core, path) = seeded();
     let _guard = CleanupGuard(path);
-    assert_rejected(
-        &core,
-        "SELECT l.k FROM l JOIN r ON l.n > r.n LIMIT 10",
-        "42601",
+    let run = |sql: &str| run_sorted(&core, "tenant-a", sql);
+    assert_eq!(
+        run("SELECT l.k, r.k FROM l JOIN r ON l.n > r.n LIMIT 10"),
+        expect(&[&["2", "1"], &["2", "2"]])
     );
-    assert_rejected(
-        &core,
-        "SELECT l.k FROM l JOIN r ON l.k = l.n LIMIT 10",
-        "42601",
+    // 左のみの ON（acc 側残余）。右の全行と直積になる。
+    assert_eq!(
+        run("SELECT l.k, r.k FROM l JOIN r ON l.k = l.n LIMIT 10"),
+        expect(&[&["1", "1"], &["1", "2"], &["1", "3"]])
     );
-    assert_rejected(
-        &core,
-        "SELECT l.k FROM l JOIN r ON r.tag = 'x' LIMIT 10",
-        "42601",
+    // 右のみの ON（new 側残余）。
+    assert_eq!(
+        run("SELECT l.k, r.k FROM l JOIN r ON r.tag = 'x' LIMIT 10"),
+        expect(&[&["1", "1"], &["2", "1"]])
     );
 }
 
@@ -366,19 +370,26 @@ fn keyless_full_join_analysis_errors_take_precedence() {
     );
 }
 
-/// WHERE の strict 述語で FULL が片側以下に簡約された段は、NLJ の SQL 到達（#1839）まで
-/// 従来どおり `42601`（暫定）。LEFT／RIGHT のキー無し ON も同様。
+/// WHERE の strict 述語で FULL が片側以下に簡約された段と、LEFT／RIGHT のキー無し ON は、
+/// Issue #1839 以降 NLJ で実行される（暫定の `42601` を仕様どおりの結果検証へ置き換えた。
+/// 検査の弱体化ではない）。
 #[test]
-fn keyless_reduced_full_and_other_kinds_stay_42601_until_1839() {
+fn keyless_reduced_full_and_other_kinds_run_as_nested_loop() {
     let (core, path) = seeded();
     let _guard = CleanupGuard(path);
-    for sql in [
-        "SELECT l.k FROM l FULL JOIN r ON l.n > r.n WHERE l.k = 1 AND r.k = 1 LIMIT 10",
-        "SELECT l.k FROM l LEFT JOIN r ON l.n > r.n LIMIT 10",
-        "SELECT l.k FROM l RIGHT JOIN r ON l.n > r.n LIMIT 10",
-    ] {
-        assert_rejected(&core, sql, "42601");
-    }
+    let run = |sql: &str| run_sorted(&core, "tenant-a", sql);
+    assert_eq!(
+        run("SELECT l.k, r.k FROM l FULL JOIN r ON l.n > r.n WHERE l.tag = 'y' AND r.tag = 'x' LIMIT 10"),
+        expect(&[&["2", "1"]])
+    );
+    assert_eq!(
+        run("SELECT l.k, r.k FROM l LEFT JOIN r ON l.n > r.n LIMIT 10"),
+        expect(&[&["1", "NULL"], &["2", "1"], &["2", "2"]])
+    );
+    assert_eq!(
+        run("SELECT l.k, r.k FROM l RIGHT JOIN r ON l.n > r.n LIMIT 10"),
+        expect(&[&["2", "1"], &["2", "2"], &["NULL", "3"]])
+    );
 }
 
 /// キー有り＋残余の FULL は従来どおり受け付けられる。

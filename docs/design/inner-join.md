@@ -218,7 +218,7 @@ JOIN の「整数クラスを跨いで結合できる」という要件（`id`�
   がある ON は `0A000`（fail-closed）。残余の評価は Issue #1830 で行い、そこで拒否を解除する。
   外部結合の ON 残余は WHERE の簡約規則へ流さない。
 - Issue #1830 で残余付き ON の `0A000` 拒否を解除した（一致条件として結合段で評価する。意味論は
-  [outer-join.md](outer-join.md) の「Issue #1830 追記」）。キー無し ON の `42601` は維持する（#1835 系の #1837〜#1839 でネステッドループ結合により解除予定。設計は [nested-loop-join.md](nested-loop-join.md)）。
+  [outer-join.md](outer-join.md) の「Issue #1830 追記」）。キー無し ON の `42601` は、#1839 でネステッドループ結合により解除した（設計は [nested-loop-join.md](nested-loop-join.md)）。
 
 ## Issue #1831 追記（CROSS JOIN。SQL-60 ポインタ）
 
