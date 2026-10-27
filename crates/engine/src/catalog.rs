@@ -16353,8 +16353,9 @@ impl TableLookup for Storage {
 pub struct TableMaterializationHazards {
     /// `VECTOR`／`ARRAY` 型の実カラム名。評価後射影形の外側は述語・並べ替えで参照できない。
     pub unevaluable_columns: Vec<String>,
-    /// 実カラム `id` を宣言しているか。`SELECT *` が疑似列 `id` と実カラム `id` の
-    /// 2 列を返し、具体化後は外側の列名解決が `42702` になる。
+    /// 疑似列 `id` を持つ表（従来方式・移行済み）が実カラム `id` も宣言しているか。`SELECT *` が
+    /// 疑似列 `id` と実カラム `id` の 2 列を返し、具体化後は外側の列名解決が `42702` になる。
+    /// 採番方式の表は `id` が予約されず `SELECT *` も 1 列のため衝突しない（false）。
     pub declares_real_id: bool,
 }
 
@@ -16367,7 +16368,7 @@ pub(crate) fn schema_materialization_hazards(schema: &TableSchema) -> TableMater
             .filter(|c| matches!(c.ty, ColumnType::Vector(_) | ColumnType::Array(_)))
             .map(|c| c.name.clone())
             .collect(),
-        declares_real_id: schema.columns.iter().any(|c| c.name == "id"),
+        declares_real_id: schema.has_pseudo_id() && schema.columns.iter().any(|c| c.name == "id"),
     }
 }
 

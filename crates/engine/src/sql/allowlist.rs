@@ -21614,6 +21614,12 @@ fn materialized_cte_statement(
     // 書き換えた後の投影で判定する（未解決の `def.body.projection` は別名のままで、基底表の
     // `unevaluable_columns` と一致しない。Issue #1860 レビュー指摘）。
     let body_projection = body.projection.clone();
+    // `SELECT *` が先行 CTE／ビューの重複公開列を継承する本文は、解決後の投影で初めて重複が
+    // 現れる（`SELECT *` 自体は `def.body.projection` 上では重複を持たない）。具体化後の
+    // 外側の列名解決が `42702` になるため、インライン展開へ戻す（Issue #1860 レビュー指摘）。
+    if projection_has_duplicate_names(&body_projection) {
+        return None;
+    }
     let body = Box::new(Statement::Scan(body));
     let view_name = def.name.clone();
     let stmt = match main {
@@ -21657,7 +21663,21 @@ fn materialized_cte_statement(
                         .any(|n| hazards.unevaluable_columns.iter().any(|u| u == n))
                 }),
             };
-            if hits_unevaluable && !outer_passthrough_all {
+            // 外側が述語・並べ替え・ウィンドウ・集計で参照しない限り、VECTOR／ARRAY セルは
+            // 射影でそのまま運ばれる（未参照列は評価対象にならない）。名前で突き合わせられるのは
+            // 列別名なしの `*`／列名投影の本文だけで、それ以外は従来どおり素通し外側のみ許す。
+            let name_checkable = def.column_aliases.is_empty()
+                && matches!(&body_projection, Projection::All | Projection::Columns(_));
+            let outer_refs_unevaluable = if name_checkable {
+                let idents = super::view_buffered::outer_non_projection_idents(&v.outer);
+                hazards
+                    .unevaluable_columns
+                    .iter()
+                    .any(|u| idents.iter().any(|i| i.eq_ignore_ascii_case(u)))
+            } else {
+                !outer_passthrough_all
+            };
+            if hits_unevaluable && outer_refs_unevaluable {
                 return None;
             }
             let projects_id = match &body_projection {
@@ -21712,6 +21732,28 @@ fn materialized_body_has_duplicate_names(def: &super::cte::CteDef) -> bool {
                 })
                 .collect(),
         }
+    };
+    let mut seen = std::collections::HashSet::new();
+    names.iter().any(|n| !seen.insert(n.to_ascii_lowercase()))
+}
+
+/// 解決後の本文投影が同名（大文字小文字無視）の公開列を 2 列以上返すか。名前を静的に決められない
+/// 式項目は数えない。
+fn projection_has_duplicate_names(projection: &Projection) -> bool {
+    let names: Vec<String> = match projection {
+        Projection::All => return false,
+        Projection::Columns(c) => c.clone(),
+        Projection::Items(items) => items
+            .iter()
+            .filter_map(|i| match i {
+                SelectItem::Column(n) => Some(n.clone()),
+                SelectItem::Expr { expr, alias } => match (alias, expr) {
+                    (Some(a), _) => Some(a.clone()),
+                    (None, Expr::Ident(n)) => Some(n.clone()),
+                    _ => None,
+                },
+            })
+            .collect(),
     };
     let mut seen = std::collections::HashSet::new();
     names.iter().any(|n| !seen.insert(n.to_ascii_lowercase()))

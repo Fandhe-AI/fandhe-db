@@ -424,3 +424,30 @@ fn aliased_cte_still_materializes_and_is_capped() {
     let plain = "WITH x(l, b) AS (SELECT lang, body FROM docs) SELECT l FROM x LIMIT 2";
     assert_eq!(query(&core, "alice", plain).expect("plain").rows.len(), 2);
 }
+
+/// 先行 CTE の重複公開列を `SELECT *` で継承する本文は、解決後の投影で重複が現れ、具体化すると
+/// `42702` になるためインライン展開へ戻る（Issue #1860 レビュー指摘）。
+#[test]
+fn inherited_duplicate_columns_fall_back_to_inline() {
+    let (core, _g) = open_with(None);
+    let template = "WITH a AS (SELECT lang, lang FROM docs), b AS {h}(SELECT * FROM a) \
+                    SELECT lang FROM b LIMIT 2";
+    let plain = query(&core, "alice", &template.replace("{h}", ""));
+    let mat = query(&core, "alice", &template.replace("{h}", "MATERIALIZED "));
+    match (plain, mat) {
+        (Ok(p), Ok(m)) => assert_eq!(render(&m), render(&p)),
+        (Err(p), Err(m)) => assert_eq!(m.wire_code(), p.wire_code()),
+        (p, m) => panic!("plain={p:?} mat={m:?}"),
+    }
+}
+
+/// VECTOR 列を含む本文でも、外側が VECTOR 列を述語等で参照しない素の列射影なら具体化され、
+/// `--max-result-rows` の上限が適用される（Issue #1860 レビュー指摘）。
+#[test]
+fn vector_body_with_plain_outer_still_materializes_and_is_capped() {
+    let (core, _g) = open_with(Some(ResultLimits::new(5)));
+    let mat = "WITH x AS MATERIALIZED (SELECT * FROM docs) SELECT lang FROM x LIMIT 2";
+    assert_eq!(code(&core, "alice", mat), "54000");
+    let plain = "WITH x AS (SELECT * FROM docs) SELECT lang FROM x LIMIT 2";
+    assert_eq!(query(&core, "alice", plain).expect("plain").rows.len(), 2);
+}

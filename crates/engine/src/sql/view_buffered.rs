@@ -335,6 +335,52 @@ fn plan_rows(
     })
 }
 
+/// 外側が射影以外（`WHERE`・`ORDER BY`・ウィンドウ・集計・`GROUP BY`・`HAVING`）で参照する識別子
+/// （`plan_rows`／`plan_aggregate` が本文の結果列の評価に使う集合と同じ。具体化可否の判定用。
+/// Issue #1860）。射影で運ぶだけの列は含まない。
+pub(crate) fn outer_non_projection_idents(outer: &BufferedOuter) -> HashSet<String> {
+    let mut idents = HashSet::new();
+    match outer {
+        BufferedOuter::Rows(rows) => {
+            for item in &rows.window_items {
+                idents.extend(item.partition_by.iter().cloned());
+                idents.extend(item.order_by.iter().map(|ob| ob.column.clone()));
+                if let Some(AggregateArg::Expr(e)) = &item.arg {
+                    super::parser::collect_expr_idents(e, &mut idents);
+                }
+            }
+            super::parser::collect_where_predicate_idents(&rows.where_predicates, &mut idents);
+            for key in &rows.order_by {
+                idents.insert(key.column.clone());
+            }
+            for key in &rows.order_keys {
+                match key {
+                    ScanOrderKey::Column { key: k, .. } => {
+                        idents.insert(k.column.clone());
+                    }
+                    ScanOrderKey::Expr { expr, .. } => {
+                        super::parser::collect_expr_idents(expr, &mut idents)
+                    }
+                    ScanOrderKey::Ordinal { .. } => {}
+                }
+            }
+        }
+        BufferedOuter::Aggregate(agg) => {
+            super::parser::collect_where_predicate_idents(&agg.where_predicates, &mut idents);
+            for item in &agg.items {
+                item.collect_referenced_idents(&mut idents);
+            }
+            if let Some(gb) = &agg.group_by {
+                for c in &gb.columns {
+                    idents.insert(c.clone());
+                }
+                gb.collect_having_aggregate_idents(&mut idents);
+            }
+        }
+    }
+    idents
+}
+
 fn plan_aggregate(
     body_columns: &[ColumnMeta],
     agg: &ValidatedAggregate,
