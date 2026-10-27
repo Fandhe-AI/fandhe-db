@@ -8084,6 +8084,18 @@ impl EngineCore {
         skip_vector_literal_validation: bool,
         limits: &crate::result_limits::ResultLimits,
     ) -> Result<Vec<crate::sql::exec::ColumnMeta>, crate::sql::allowlist::SqlSurfaceError> {
+        // 定数アンカーの `current_schema()` 系は、通常の定数 SELECT が張る検索パスのスコープ外で実行
+        // されるため未対応（Execute の実行本体の前提）。Describe と Execute が同じ `0A000` になるよう
+        // 共有経路で拒否する。
+        if let crate::sql::allowlist::Statement::ConstSelect(c) = &*validated.anchor {
+            if crate::sql::const_select::uses_schema_fn(c) {
+                return Err(
+                    crate::sql::allowlist::SqlSurfaceError::feature_not_supported(
+                        "current_schema() in the anchor term of WITH RECURSIVE is not supported",
+                    ),
+                );
+            }
+        }
         let anchor_parsed = ParsedSql::Statement((*validated.anchor).clone());
         let anchor_columns = self
             .describe_parsed_in_session_impl(
@@ -9369,11 +9381,6 @@ impl EngineCore {
                     // `FROM` なし定数式はセッション UDF レジストリを要する専用の実行本体を持つ
                     // （`execute_read_statement_with_limits` の対象外）。
                     crate::sql::allowlist::Statement::ConstSelect(c) => {
-                        if crate::sql::const_select::uses_schema_fn(c) {
-                            return Err(crate::sql::allowlist::SqlSurfaceError::feature_not_supported(
-                                "current_schema() in the anchor term of WITH RECURSIVE is not supported",
-                            ));
-                        }
                         crate::sql::const_select::run(c, session.udfs())?
                     }
                     other => match self.execute_read_statement_with_limits(

@@ -795,3 +795,56 @@ fn row_id_above_i64_max_survives_the_working_table() {
                   SELECT c.id FROM tree c JOIN t ON c.parent_id = t.i) SELECT i FROM t";
     assert_eq!(code(&core, "alice", join), "22003");
 }
+
+/// 「作業表が空なら終了」の契約（アンカーが空・再帰項が初回で空・Scan 版／JOIN 版）。アンカーが空なら
+/// JOIN の基底表側は読まない（入力行数上限を超える可視行数でも本来空の文が `54000` にならない）。
+#[test]
+fn empty_working_table_ends_without_reading_the_base_side() {
+    // 基底表（9 行）の可視行数が JOIN の入力行数上限（3）を超える設定。
+    let path = unique_db_path("sql35-recursive-empty");
+    let _g = CleanupGuard(path.clone());
+    let storage = Storage::open(&path).expect("open storage");
+    storage.create_table(&tree_schema()).expect("create table");
+    storage.create_table(&edges_schema()).expect("create table");
+    seed_tree(&storage);
+    let core = EngineCore::from_storage(storage, Box::new(CpuScalarProvider))
+        .with_join_limits(engine::join_limits::JoinSizeLimits::new(8, 3, 100_000));
+    let join = |anchor: &str| {
+        format!(
+            "WITH RECURSIVE t(n) AS (SELECT node_id FROM tree WHERE node_id = {anchor} \
+               UNION ALL SELECT c.node_id FROM tree c JOIN t ON c.parent_id = t.n) \
+             SELECT n FROM t"
+        )
+    };
+    // アンカーが空（JOIN 版）: 空の結果（`54000` にならない）。
+    assert_eq!(
+        rows(&core, "alice", &join("999")),
+        Vec::<Vec<String>>::new()
+    );
+    // アンカーが空でなければ、基底表側の読み込みは入力行数上限の対象のまま（`54000`）。
+    assert_eq!(code(&core, "alice", &join("1")), "54000");
+
+    // 既定の上限の core で、残りの形を検査する。
+    let (core, _g2) = open_core_with(seed_tree);
+    // アンカーが空（Scan 版）。
+    let scan_empty = "WITH RECURSIVE t(n) AS (SELECT node_id FROM tree WHERE node_id = 999 \
+                        UNION ALL SELECT n FROM t WHERE n < 0) SELECT n FROM t";
+    assert_eq!(rows(&core, "alice", scan_empty), Vec::<Vec<String>>::new());
+    // 再帰項が初回で空（Scan 版）: アンカーの行だけ。
+    let scan_first = "WITH RECURSIVE t(n) AS (SELECT node_id FROM tree WHERE node_id = 4 \
+                        UNION ALL SELECT n FROM t WHERE n < 0) SELECT n FROM t";
+    assert_eq!(rows(&core, "alice", scan_first), col(&["4"]));
+    // 再帰項が初回で空（JOIN 版、葉ノードには子がない）。
+    assert_eq!(rows(&core, "alice", &join("4")), col(&["4"]));
+}
+
+/// 定数アンカーの `current_schema()` 系は、Describe と Execute のどちらも同じ `0A000`（Execute だけが
+/// 拒否して Describe は列を公告する食い違いを作らない）。
+#[test]
+fn const_anchor_schema_function_is_rejected_in_describe_and_execute() {
+    let (core, _g) = open_core();
+    let sql = "WITH RECURSIVE t(s) AS (SELECT current_schema() UNION ALL \
+                 SELECT s FROM t WHERE 1 = 0) SELECT s FROM t";
+    assert_eq!(code(&core, "alice", sql), "0A000");
+    assert_eq!(describe_code(&core, sql).as_deref(), Some("0A000"));
+}

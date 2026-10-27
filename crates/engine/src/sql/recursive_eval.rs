@@ -637,10 +637,15 @@ pub(crate) fn execute(
 
         // JOIN の基底表側は反復によらず同じ行を返す（同一 `read_txn`）ため、ループの前に 1 度だけ読む。
         // 読んだ行は共有予算へ計上する（JOIN 自身の上限〔`join_limits`〕を超えない範囲で保持される）。
+        // アンカーが 0 行なら作業表は最初から空で再帰項は 1 度も評価されないため、基底表側は読まない
+        // （可視行数が入力行数上限を超える表でも、本来空で終わる文が `54000` にならない）。
         let mut sides: Vec<Vec<ResultRow>> = Vec::new();
-        if let Step::Join {
-            prepared, cte_side, ..
-        } = &p.step
+        if let (
+            true,
+            Step::Join {
+                prepared, cte_side, ..
+            },
+        ) = (start < end, &p.step)
         {
             for side in 0..prepared.side_count() {
                 if side == *cte_side {
