@@ -9703,10 +9703,219 @@ pub(crate) struct BoundWindowItem {
     pub(crate) position: usize,
     pub(crate) func: crate::sql::allowlist::WindowFunc,
     pub(crate) input: Option<AggregateInput>,
+    /// `LAG`／`LEAD` の束縛済み引数（それ以外の関数は `None`。SQL-64 (1)・Issue #1880）。
+    pub(crate) offset_args: Option<BoundWindowOffsetArgs>,
     pub(crate) partition_by: Vec<WindowKeyRef>,
     /// 宣言順のウィンドウ `ORDER BY` キー列（SQL-30・SQL-56）。
     pub(crate) order_by: Vec<BoundWindowOrderKey>,
     pub(crate) name: String,
+}
+
+/// `LAG`／`LEAD` の束縛済み引数（SQL-64 (1)・Issue #1880）。評価（Issue #1881）は
+/// `sql::window` が担い、本構造体は型検査済みの式と結果型（Describe の型 OID 公告元）を運ぶ。
+#[derive(Debug, Clone, PartialEq)]
+pub(crate) struct BoundWindowOffsetArgs {
+    pub(crate) value: BoundWindowValue,
+    /// オフセット式（行ごとに評価する。整数型または裸の `NULL`。省略時は `None`＝既定の 1）。
+    pub(crate) offset: Option<crate::sql::udf_call::BoundExpr>,
+    /// 既定値式（値の型へ統一済み。省略時は `None`＝NULL）。
+    pub(crate) default: Option<crate::sql::udf_call::BoundExpr>,
+    /// 統一後の結果列型（`window_result_type` が公告に使う）。
+    pub(crate) result_type: Option<ColumnType>,
+    /// 引数が疑似列 `id` を参照するか（セル評価経路 `CellWindowEvaluator` が拒否に使う）。
+    pub(crate) uses_pseudo_id: bool,
+}
+
+impl BoundWindowOffsetArgs {
+    /// 疑似列 `id` を参照するか。
+    pub(crate) fn references_pseudo_id(&self) -> bool {
+        self.uses_pseudo_id
+    }
+
+    /// 引数が参照するスカラー列を `mask` へ反映する（`sql::window::decode_tier_for_window` が
+    /// 呼ぶ。取りこぼすとマスク外の列を NULL と誤判定するため全引数を走査する）。参照が
+    /// 1 つでもあれば `true`。
+    pub(crate) fn mark_referenced_columns(&self, mask: &mut [bool]) -> bool {
+        let mut any = false;
+        match &self.value {
+            BoundWindowValue::Column { index, .. } => {
+                if let Some(slot) = mask.get_mut(*index) {
+                    *slot = true;
+                }
+                any = true;
+            }
+            BoundWindowValue::Expr { bound, .. } => {
+                any |= crate::sql::udf_call::mark_referenced_scalar_columns(bound, mask);
+            }
+        }
+        for e in self.offset.iter().chain(self.default.iter()) {
+            any |= crate::sql::udf_call::mark_referenced_scalar_columns(e, mask);
+        }
+        any
+    }
+
+    /// 引数が埋め込みベクトルを参照するか。
+    pub(crate) fn references_embedding(&self) -> bool {
+        let value = match &self.value {
+            BoundWindowValue::Column { .. } => false,
+            BoundWindowValue::Expr { bound, .. } => {
+                crate::sql::udf_call::references_embedding(bound)
+            }
+        };
+        value
+            || self
+                .offset
+                .iter()
+                .chain(self.default.iter())
+                .any(crate::sql::udf_call::references_embedding)
+    }
+}
+
+/// `LAG`／`LEAD` の値引数。裸の列は列の型を正確に保持し（NUMERIC・UUID 等も公告できる）、
+/// それ以外は式として束縛する。
+#[derive(Debug, Clone, PartialEq)]
+pub(crate) enum BoundWindowValue {
+    Column {
+        index: usize,
+        ty: ColumnType,
+    },
+    Expr {
+        bound: crate::sql::udf_call::BoundExpr,
+        ty: crate::sql::udf_call::ExprType,
+    },
+}
+
+/// `LAG`／`LEAD` の値として運べない型（`VECTOR`・配列・`BYTEA`・`json`・`jsonb`。fail-closed）。
+fn lag_lead_value_type_unsupported(ty: &ColumnType) -> bool {
+    matches!(
+        ty,
+        ColumnType::Vector(_)
+            | ColumnType::Array(_)
+            | ColumnType::Bytea
+            | ColumnType::Json
+            | ColumnType::Jsonb
+    )
+}
+
+/// `LAG`／`LEAD` の引数（値・オフセット・既定値）を束縛し型を検査する（SQL-64 (1)・
+/// Issue #1880。[`bind_window_item`] から呼ばれる）。オフセットは整数型か裸の `NULL`
+/// （それ以外は `42804`）、値と既定値の型統一は `COALESCE` と同じ規則
+/// （[`crate::sql::udf_call::bind_value_with_default`]）で行い、不一致は `42804`。
+fn bind_window_offset_args(
+    args: &crate::sql::allowlist::WindowOffsetArgs,
+    schema: &TableSchema,
+    udfs: &crate::sql::udf_call::UdfRegistry,
+    node_budget: &mut usize,
+) -> Result<BoundWindowOffsetArgs, SqlSurfaceError> {
+    use crate::sql::udf_call::{
+        bind_projection_expr, bind_value_with_default, BoundExpr, ExprType,
+    };
+    let uses_pseudo_id = {
+        let mut idents = std::collections::HashSet::new();
+        collect_expr_idents(&args.value, &mut idents);
+        for e in args.offset.iter().chain(args.default.iter()) {
+            collect_expr_idents(e, &mut idents);
+        }
+        idents.contains("id")
+            && schema.has_pseudo_id()
+            && !schema.columns.iter().any(|c| c.name == "id")
+    };
+    let unsupported =
+        || SqlSurfaceError::feature_not_supported("this value type is not supported in LAG/LEAD");
+    let offset = match &args.offset {
+        None => None,
+        Some(Expr::Null) => Some(BoundExpr::Null),
+        // 裸の列は列の宣言型で判定する（式層は BOOLEAN 等の裸の列を束縛できず `22000` になるため）。
+        Some(Expr::Ident(name)) if schema.columns.iter().any(|c| &c.name == name) => {
+            let column = schema.columns.iter().find(|c| &c.name == name);
+            match column.map(|c| &c.ty) {
+                Some(ColumnType::SmallInt | ColumnType::Integer | ColumnType::BigInt) => {
+                    let (bound, _ty, _col) = bind_projection_expr(
+                        &Expr::Ident(name.clone()),
+                        schema,
+                        udfs,
+                        node_budget,
+                    )?;
+                    Some(bound)
+                }
+                _ => {
+                    return Err(SqlSurfaceError::datatype_mismatch(
+                        "LAG/LEAD offset must be of integer type",
+                    ))
+                }
+            }
+        }
+        Some(e) => {
+            let (bound, _ty, col) = bind_projection_expr(e, schema, udfs, node_budget)?;
+            match col {
+                Some(ColumnType::SmallInt | ColumnType::Integer | ColumnType::BigInt) => {
+                    Some(bound)
+                }
+                _ => {
+                    return Err(SqlSurfaceError::datatype_mismatch(
+                        "LAG/LEAD offset must be of integer type",
+                    ))
+                }
+            }
+        }
+    };
+    let default_expr = match &args.default {
+        None | Some(Expr::Null) => None,
+        Some(e) => Some(e),
+    };
+    let null_default = matches!(&args.default, Some(Expr::Null)).then_some(BoundExpr::Null);
+
+    let bare_column = match &args.value {
+        Expr::Ident(name) => schema
+            .columns
+            .iter()
+            .enumerate()
+            .find(|(_, c)| &c.name == name),
+        _ => None,
+    };
+    if let (Some((index, column)), None) = (bare_column, default_expr) {
+        if lag_lead_value_type_unsupported(&column.ty) {
+            return Err(unsupported());
+        }
+        return Ok(BoundWindowOffsetArgs {
+            value: BoundWindowValue::Column {
+                index,
+                ty: column.ty.clone(),
+            },
+            offset,
+            default: null_default,
+            result_type: Some(column.ty.clone()),
+            uses_pseudo_id,
+        });
+    }
+    let (value, default, ty, col) = match default_expr {
+        Some(d) => {
+            let (v, d, ty, col) =
+                bind_value_with_default(&args.value, d, schema, udfs, node_budget)?;
+            (v, Some(d), ty, col)
+        }
+        None => {
+            let (v, ty, col) = bind_projection_expr(&args.value, schema, udfs, node_budget)?;
+            (v, null_default, ty, col)
+        }
+    };
+    let type_ok = col
+        .as_ref()
+        .is_some_and(|c| !lag_lead_value_type_unsupported(c))
+        && !matches!(
+            ty,
+            ExprType::Vector | ExprType::Array | ExprType::Json | ExprType::JsonText
+        );
+    if !type_ok {
+        return Err(unsupported());
+    }
+    Ok(BoundWindowOffsetArgs {
+        value: BoundWindowValue::Expr { bound: value, ty },
+        offset,
+        default,
+        result_type: col,
+        uses_pseudo_id,
+    })
 }
 
 /// ウィンドウ `ORDER BY` の束縛済み 1 キー（キー参照・降順指定・NULL 位置。SQL-30・SQL-56）。
@@ -9801,6 +10010,13 @@ fn bind_window_item(
                             .to_string(),
                     });
                 }
+                // `LAG`／`LEAD` の引数は `offset_args` 経路で運び、`arg` は常に `None`。
+                WindowFunc::Lag | WindowFunc::Lead => {
+                    return Err(SqlSurfaceError::Internal {
+                        detail: "offset window function unexpectedly carries an aggregate argument"
+                            .to_string(),
+                    });
+                }
             };
             let resolved = resolve_aggregate_input(agg_func, arg, schema, udfs, node_budget)?;
             // 照合付きの MIN/MAX（ICU。Issue #2190）はウィンドウ累積器が照合を運ばないため拒否する。
@@ -9817,6 +10033,13 @@ fn bind_window_item(
             }
             Some(resolved)
         }
+    };
+
+    let offset_args = match &item.offset_args {
+        Some(args) if item.func.is_value_offset() => {
+            Some(bind_window_offset_args(args, schema, udfs, node_budget)?)
+        }
+        _ => None,
     };
 
     let mut partition_by = Vec::with_capacity(item.partition_by.len());
@@ -9839,14 +10062,25 @@ fn bind_window_item(
         .clone()
         .unwrap_or_else(|| item.func.default_alias().to_string());
 
-    Ok(BoundWindowItem {
+    let bound = BoundWindowItem {
         position: item.position,
         func: item.func,
         input,
+        offset_args,
         partition_by,
         order_by,
         name,
-    })
+    };
+    // 構文受理・束縛・型検査までが Issue #1880 の範囲で、評価は Issue #1881 が接続する。
+    // 型検査を終えた後ろの単一のゲートで `0A000` を返し、評価経路（走査・Describe・ビューの
+    // 評価後射影）へ未実装の関数を流さない（fail-closed。走査より前に効くため行数・
+    // テナントの存在に依存しない）。Issue #1881 はこのゲートを外して評価を接続する。
+    if bound.func.is_value_offset() {
+        return Err(SqlSurfaceError::feature_not_supported(
+            "lag/lead window functions are not executable yet",
+        ));
+    }
+    Ok(bound)
 }
 
 /// `where_predicates`（未束縛。`sql::allowlist::WherePredicate`）が参照する列名を

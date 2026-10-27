@@ -3504,6 +3504,47 @@ fn bind_projection_expr_inner(
     Ok((bound, ty, col))
 }
 
+/// `LAG`／`LEAD` の値式と既定値式を束縛し、型を統一する（SQL-64 (1)・Issue #1880。
+/// `sql::parser::bind_window_item` から呼ばれる）。型統一の規則は `COALESCE` と同じ
+/// （第 2 の型検査を作らない）ため、両式を `COALESCE(<値>, <既定値>)` として束縛し、
+/// 統一・変換済みの 2 引数と結果列型を取り出す。この束縛結果は型検査のためだけに使い、
+/// 評価では `COALESCE` として実行しない（値が NULL のときに既定値へ落ちてしまうため）。
+/// 型が食い違えば `42804`（固定文言）。戻り値は (変換済みの値, 変換済みの既定値,
+/// 統一後の式型, 統一後の結果列型)。
+pub(crate) fn bind_value_with_default(
+    value: &Expr,
+    default: &Expr,
+    schema: &TableSchema,
+    registry: &UdfRegistry,
+    node_budget: &mut usize,
+) -> Result<(BoundExpr, BoundExpr, ExprType, Option<ColumnType>), SqlSurfaceError> {
+    let pair = Expr::Coalesce(vec![value.clone(), default.clone()]);
+    let (bound, ty, col) =
+        bind_projection_expr(&pair, schema, registry, node_budget).map_err(|e| match e {
+            SqlSurfaceError::DatatypeMismatch { .. } => SqlSurfaceError::DatatypeMismatch {
+                detail: "LAG/LEAD default value must have the same type as the value".to_string(),
+            },
+            SqlSurfaceError::FeatureNotSupported { .. } => SqlSurfaceError::FeatureNotSupported {
+                detail: "this value type is not supported with a LAG/LEAD default".to_string(),
+            },
+            other => other,
+        })?;
+    match bound {
+        BoundExpr::Coalesce(args) => {
+            let mut it = args.into_iter();
+            match (it.next(), it.next(), it.next()) {
+                (Some(v), Some(d), None) => Ok((v, d, ty, col)),
+                _ => Err(SqlSurfaceError::Internal {
+                    detail: "LAG/LEAD value and default pair lost its shape".to_string(),
+                }),
+            }
+        }
+        _ => Err(SqlSurfaceError::Internal {
+            detail: "LAG/LEAD value and default pair did not bind as COALESCE".to_string(),
+        }),
+    }
+}
+
 /// 配列列への `UPDATE ... SET` 右辺を束縛する（TABLE-35・Issue #1602。`sql::set_expr` から呼ばれる）。
 ///
 /// 通常の投影束縛と同じだが、右辺が裸の列名のときは CAST の被演算子と同じ規則（配列列を
