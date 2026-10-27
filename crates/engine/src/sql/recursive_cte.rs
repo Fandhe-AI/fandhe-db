@@ -17,8 +17,9 @@
 //! 検証済み `Statement` は持たない（段階 B が実カタログで再検証する）。
 
 use super::allowlist::{
-    split_parenthesized, split_recursive_with_clause, validate_sql_tokens_with_subquery_ctx_limits,
-    JoinKind, SqlSurfaceError, Statement, StructuralOnlyLookup,
+    is_set_operator_ident, set_operator_is_followed_by_branch, split_parenthesized,
+    split_recursive_with_clause, validate_sql_tokens_with_subquery_ctx_limits, JoinKind,
+    SqlSurfaceError, Statement, StructuralOnlyLookup,
 };
 use super::lexer::{Keyword, Token};
 use crate::nesting_limits::NestingLimits;
@@ -169,6 +170,43 @@ fn relation_refs(tokens: &[Token], name: &str) -> Vec<RelRef> {
     out
 }
 
+/// `tokens[i]`（識別子 `w`）が列名・表名ではなく演算子・句として使われているかを文脈で判定する。
+/// `UNION`／`INTERSECT`／`EXCEPT` は既存の集合演算ヘルパーと同じく直後に `SELECT` 枝が続く
+/// 場合のみ、`OFFSET`／`FETCH` は直前が式の末尾（識別子・数値・文字列・`)`）で直後が
+/// `FROM`・`,`・比較演算子などでない場合のみ句とみなす（`SELECT offset FROM t` 等の誤分類防止）。
+fn is_operator_position(tokens: &[Token], i: usize, w: &str) -> bool {
+    if is_set_operator_ident(w) {
+        return set_operator_is_followed_by_branch(tokens, i);
+    }
+    if w.eq_ignore_ascii_case("OFFSET") || w.eq_ignore_ascii_case("FETCH") {
+        let prev_ends_expr = i
+            .checked_sub(1)
+            .and_then(|p| tokens.get(p))
+            .is_some_and(|t| {
+                matches!(
+                    t,
+                    Token::Ident(_)
+                        | Token::QualifiedIdent { .. }
+                        | Token::QuotedNull(_)
+                        | Token::QuotedBoolWord(_)
+                        | Token::Param(_)
+                        | Token::Number(_)
+                        | Token::StringLiteral(_)
+                        | Token::Punct(')')
+                )
+            });
+        let next_is_operand = !matches!(
+            tokens.get(i.saturating_add(1)),
+            Some(Token::Keyword(_) | Token::Punct(',' | '=' | '>' | '<' | '*' | '/' | '%' | ')'))
+        ) || matches!(
+            tokens.get(i.saturating_add(1)),
+            Some(Token::Keyword(Keyword::Limit | Keyword::Order))
+        );
+        return prev_ends_expr && next_is_operand;
+    }
+    true
+}
+
 /// 括弧の深さ 0 にある識別子トークンのうち、`words` のいずれかに一致する位置を返す。
 fn depth0_words(tokens: &[Token], words: &[&str]) -> Vec<usize> {
     let mut depth: usize = 0;
@@ -177,7 +215,11 @@ fn depth0_words(tokens: &[Token], words: &[&str]) -> Vec<usize> {
         match t {
             Token::Punct('(') => depth = depth.saturating_add(1),
             Token::Punct(')') => depth = depth.saturating_sub(1),
-            Token::Ident(w) if depth == 0 && words.iter().any(|k| w.eq_ignore_ascii_case(k)) => {
+            Token::Ident(w)
+                if depth == 0
+                    && words.iter().any(|k| w.eq_ignore_ascii_case(k))
+                    && is_operator_position(tokens, i, w) =>
+            {
                 out.push(i);
             }
             Token::Keyword(Keyword::Order | Keyword::Limit)
@@ -518,6 +560,20 @@ mod tests {
             "WITH RECURSIVE t AS (SELECT 1) DELETE FROM docs",
         ] {
             assert_eq!(code(sql), "42601", "{sql}");
+        }
+    }
+
+    #[test]
+    fn operator_words_as_names_do_not_misclassify() {
+        for name in ["union", "offset", "fetch", "intersect", "except"] {
+            let sql = format!(
+                "WITH RECURSIVE t(n) AS (SELECT 1 UNION ALL SELECT {name} + 1 FROM t WHERE {name} < 3) SELECT n FROM t"
+            );
+            assert_eq!(code(&sql), NOT_YET, "{sql}");
+            let sql = format!(
+                "WITH RECURSIVE t(n) AS (SELECT {name} FROM docs UNION ALL SELECT n + 1 FROM t WHERE n < 2) SELECT n FROM t"
+            );
+            assert_eq!(code(&sql), NOT_YET, "{sql}");
         }
     }
 
