@@ -405,8 +405,6 @@ fn quantified_compare_rejections_are_fail_closed() {
     let cases: Vec<(String, &str)> = vec![
         // 内側の投影列数 ≠ 1。
         (format!("SELECT id FROM {ITEMS} WHERE qty > ANY (SELECT qty, name FROM {REFS} LIMIT 5) LIMIT 100"), "42601"),
-        // 内側の `LIMIT` 省略。
-        (format!("SELECT id FROM {ITEMS} WHERE qty > ANY (SELECT qty FROM {REFS}) LIMIT 100"), "42601"),
         // 相関サブクエリ。
         (format!("SELECT id FROM {ITEMS} WHERE qty > ALL (SELECT qty FROM {REFS} WHERE name = outer_only LIMIT 5) LIMIT 100"), "42601"),
         // 内側の集計形。

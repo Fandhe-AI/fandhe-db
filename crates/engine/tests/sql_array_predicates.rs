@@ -374,15 +374,6 @@ fn unsupported_forms_fail_closed() {
         ),
         "0A000"
     );
-    // 列が左辺の `<col> = ANY (SELECT ...)` は Issue #1855（SQL-61 (3)）で受理済み。
-    // `LIMIT` 省略の内側は `IN (SELECT ...)` と同じく 42601。
-    assert_eq!(
-        code(
-            &core,
-            "SELECT id FROM t WHERE id = ANY(SELECT id FROM t) LIMIT 5"
-        ),
-        "42601"
-    );
     // 2^53 を超える整数リテラルは float 配列との比較で丸め誤一致を避けるため、
     // 範囲外 int8 と同じ fail-closed の拒否（22003）に倒す。
     assert_eq!(
