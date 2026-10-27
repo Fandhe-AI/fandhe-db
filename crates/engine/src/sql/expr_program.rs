@@ -66,6 +66,9 @@ pub(crate) enum ExprStep {
     /// `NOT EXISTS`（Issue #1843）の否定はプローブ内で適用済み。相関 `IN`／`NOT IN`（Issue #1844）も
     /// 同じ葉に載る（名前は `EXISTS` のままだが、判定方式はプローブの `ProbeKind` が持つ）。
     CorrelatedExists(crate::sql::join::semi::CorrelatedProbeRef),
+    /// 式の内側の相関スカラーサブクエリの値（Issue #1848）。外側の行ごとにプローブを引いた値
+    /// （該当なしは NULL、2 件以上は `21000`）を push する。
+    CorrelatedScalar(crate::sql::correlated_scalar::CorrelatedScalarRef),
     /// テーブルの `VECTOR` 列（行の `embedding`）への参照を push する。
     /// `embedding` が空スライス（`VECTOR` 列が NULL。`dim == 0`）の行では
     /// [`StackValue::Null`] を push し、それ以外では [`StackValue::VectorRef`]
@@ -562,6 +565,7 @@ fn try_fold_scalar(expr: &BoundExpr) -> Option<FoldedConst> {
         | BoundExpr::IdRef
         | BoundExpr::IdCompare { .. }
         | BoundExpr::CorrelatedExists(_)
+        | BoundExpr::CorrelatedScalar(_)
         | BoundExpr::VectorRef
         | BoundExpr::WasmCall { .. }
         | BoundExpr::Null
@@ -637,6 +641,11 @@ fn compile_node(
         }
         BoundExpr::CorrelatedExists(probe) => {
             steps.push(ExprStep::CorrelatedExists(probe.clone()));
+            *current_depth += 1;
+            *max_stack = (*max_stack).max(*current_depth);
+        }
+        BoundExpr::CorrelatedScalar(leaf) => {
+            steps.push(ExprStep::CorrelatedScalar(leaf.clone()));
             *current_depth += 1;
             *max_stack = (*max_stack).max(*current_depth);
         }
@@ -958,6 +967,10 @@ impl ExprProgram {
                 }
                 ExprStep::CorrelatedExists(probe) => {
                     scratch.push(StackValue::Bool(probe.probe().eval(row_scalars, id)?));
+                    pc += 1;
+                }
+                ExprStep::CorrelatedScalar(leaf) => {
+                    scratch.push(expr_value_to_stack(leaf.eval(row_scalars, id)?));
                     pc += 1;
                 }
                 ExprStep::PushVector => {

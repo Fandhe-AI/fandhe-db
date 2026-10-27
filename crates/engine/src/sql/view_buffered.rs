@@ -594,6 +594,7 @@ fn bind_scan_plan(
         scalar_subquery_items: Vec::new(),
         order_keys: rows.order_keys.clone(),
         physical_order_keys: Vec::new(),
+        embedded_scalar_subqueries: Vec::new(),
         with_ties: false,
     };
     let bound = super::parser::bind_scan(&scan, &schema, udfs)?;

@@ -1018,6 +1018,7 @@ pub(super) fn build_plan<'a>(
             order_keys: Vec::new(),
             scalar_subquery_items: Vec::new(),
             physical_order_keys: Vec::new(),
+            embedded_scalar_subqueries: Vec::new(),
             with_ties: false,
         });
     }
