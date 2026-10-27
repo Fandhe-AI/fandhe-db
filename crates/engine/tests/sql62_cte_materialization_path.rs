@@ -293,3 +293,52 @@ fn unreferenced_materialized_cte_is_validated_but_not_executed() {
     let bad = "WITH x AS MATERIALIZED (SELECT * FROM missing_table) SELECT * FROM docs LIMIT 2";
     assert_eq!(code(&core, "alice", bad), "42P01");
 }
+
+/// `ORDER BY` の序数キーは評価後射影形の外側が解決できない（`42601`）ため、具体化を選ばず
+/// インライン展開へ戻り、インライン版と同じ結果で成功する（Issue #1860 レビュー指摘）。
+#[test]
+fn ordinal_order_by_falls_back_to_inline() {
+    let (core, _g) = open_with(None);
+    let template = "WITH x AS {h}(SELECT lang FROM docs) SELECT lang FROM x ORDER BY 1 LIMIT 2";
+    let plain = query(&core, "alice", &template.replace("{h}", "")).expect("plain");
+    let mat = query(&core, "alice", &template.replace("{h}", "MATERIALIZED ")).expect("mat");
+    assert_eq!(plain.rows.len(), 2);
+    assert_eq!(render(&mat), render(&plain));
+}
+
+/// 非バイト列順の照合の列を持つ表では、具体化結果が照合を運べず実行段が `0A000` で拒否してしまう
+/// ため、順序・比較に依存する外側はインライン展開へ戻って従来どおり成功する（Issue #1860
+/// レビュー指摘）。
+#[test]
+fn collated_table_falls_back_to_inline() {
+    let path = unique_db_path("sql62-cte-mat-collation");
+    let _g = CleanupGuard(path.clone());
+    let storage = Storage::open(&path).expect("open storage");
+    let core = new_core(storage);
+    let mut session = SessionState::default();
+    session.allow_ddl();
+    core.execute_sql_in_session(
+        &ctx("alice"),
+        &mut session,
+        "CREATE TABLE ct (id BIGINT PRIMARY KEY, s TEXT COLLATE \"und-x-icu\")",
+    )
+    .expect("create table");
+    for i in 1..=3 {
+        core.execute_sql_in_session(
+            &ctx("alice"),
+            &mut SessionState::default(),
+            &format!("INSERT INTO ct (id, s) VALUES ({i}, 'v{i}') USING OPERATION_ID 'ins-{i}'"),
+        )
+        .expect("insert");
+    }
+    for template in [
+        "WITH x AS {h}(SELECT * FROM ct) SELECT * FROM x WHERE id > 1 LIMIT 2",
+        "WITH x AS {h}(SELECT * FROM ct) SELECT * FROM x ORDER BY s LIMIT 2",
+    ] {
+        let plain = query(&core, "alice", &template.replace("{h}", "")).expect("plain");
+        let mat = query(&core, "alice", &template.replace("{h}", "MATERIALIZED "))
+            .expect("fallback must succeed");
+        assert!(!plain.rows.is_empty());
+        assert_eq!(render(&mat), render(&plain), "template={template}");
+    }
+}

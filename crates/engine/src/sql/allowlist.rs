@@ -2146,6 +2146,15 @@ pub trait TableLookup {
         Ok(false)
     }
 
+    /// `name` が非バイト列順の照合（ICU）の列を持つ実テーブルか（Issue #1860。具体化 CTE が
+    /// 照合を運べないため、順序・比較に依存する外側ではインライン展開へ戻す判定に使う）。
+    /// 既定実装は `false`（判定できない lookup は具体化経路へ進み、実行段の
+    /// `check_buffered_view_collations` が `0A000` で拒否する fail-closed のまま）。
+    fn table_has_non_byte_collation(&self, name: &str) -> Result<bool, SqlSurfaceError> {
+        let _ = name;
+        Ok(false)
+    }
+
     /// 評価後射影形ビューの本文を参照時に再検証する入れ子の深さ（Issue #1411。
     /// 既定は 0）。評価後射影形ビューの連鎖（`sql::view::resolve_from` が本文を再検証する
     /// たびに +1 するラッパーが上書きする）を `MAX_VIEW_NESTING_DEPTH` で打ち切り、
@@ -3002,6 +3011,21 @@ pub(crate) struct BufferedRows {
 }
 
 impl ValidatedBufferedView {
+    /// 外側クエリが、本文の結果列の順序・比較に依存するか（TABLE-28・Issue #2190）。
+    /// 外側は本文の評価済みセルを列型だけで比較するため、本文のテキスト列についた照合は
+    /// 運ばれない。素通し（`WHERE`・`ORDER BY`・ウィンドウ・集計がない）以外は依存するとみなす。
+    pub(crate) fn outer_depends_on_order(&self) -> bool {
+        match &self.outer {
+            BufferedOuter::Rows(rows) => {
+                !rows.where_predicates.is_empty()
+                    || !rows.order_by.is_empty()
+                    || !rows.order_keys.is_empty()
+                    || !rows.window_items.is_empty()
+            }
+            BufferedOuter::Aggregate(_) => true,
+        }
+    }
+
     /// 参照されたビュー名。
     pub fn view_name(&self) -> &str {
         &self.view_name
@@ -21521,6 +21545,17 @@ fn materialized_cte_statement(
     limits: crate::nesting_limits::NestingLimits,
 ) -> Option<Statement> {
     let def = ctes.get(idx)?;
+    // 序数 `ORDER BY`（`ORDER BY 1`）は評価後射影形の外側が解決できず後段で `42601` になる
+    // ため、具体化を選ぶ前にインライン展開へ戻す（結果は等しい。Issue #1860 レビュー指摘）。
+    if let MainShape::Scan(shape) = &main {
+        if shape
+            .order_keys
+            .iter()
+            .any(|k| matches!(k, ScanOrderKey::Ordinal { .. }))
+        {
+            return None;
+        }
+    }
     let mut budget = super::cte::ResolveBudget::new();
     let inner = super::cte::resolve_relation(
         lookup,
@@ -21545,6 +21580,7 @@ fn materialized_cte_statement(
         Vec::new(),
     )
     .ok()?;
+    let body_table = body.table_name().to_string();
     let body = Box::new(Statement::Scan(body));
     let view_name = def.name.clone();
     let stmt = match main {
@@ -21560,6 +21596,14 @@ fn materialized_cte_statement(
     };
     match stmt {
         Statement::BufferedView(mut v) => {
+            // 具体化結果は照合を運ばない。照合付き列を持つ表を本文が読み、かつ外側が順序・比較に
+            // 依存するなら、実行段で `0A000` になる前にインライン展開（照合を保つ）へ戻す。
+            // 判定できない場合（照会失敗）も具体化せずインラインへ戻す（結果は等しい）。
+            if v.outer_depends_on_order()
+                && lookup.table_has_non_byte_collation(&body_table).ok()?
+            {
+                return None;
+            }
             v.column_aliases = def.column_aliases.clone();
             v.origin = BufferedOrigin::MaterializedCte;
             Some(Statement::BufferedView(v))

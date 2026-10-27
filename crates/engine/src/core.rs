@@ -2101,22 +2101,6 @@ fn buffered_body_tables(stmt: &crate::sql::allowlist::Statement, out: &mut Vec<S
     }
 }
 
-/// 評価後射影形ビューの外側クエリが、本文の結果列の順序・比較に依存するか（TABLE-28・
-/// Issue #2190）。外側は本文の評価済みセルを列型だけで比較するため、本文のテキスト列に
-/// ついた照合は運ばれない。素通し（`WHERE`・`ORDER BY`・ウィンドウ・集計がない）以外は
-/// 順序・比較に依存するとみなす。
-fn buffered_outer_depends_on_order(view: &crate::sql::allowlist::ValidatedBufferedView) -> bool {
-    match &view.outer {
-        crate::sql::allowlist::BufferedOuter::Rows(rows) => {
-            !rows.where_predicates.is_empty()
-                || !rows.order_by.is_empty()
-                || !rows.order_keys.is_empty()
-                || !rows.window_items.is_empty()
-        }
-        crate::sql::allowlist::BufferedOuter::Aggregate(_) => true,
-    }
-}
-
 /// 評価後射影形ビューの本文が非バイト列順の照合（ICU）の列を持つテーブルを参照し、かつ外側が
 /// 順序・比較に依存するときは `0A000` で拒否する（照合が運ばれずバイト列順で黙って
 /// 比較される意味論の fail-open を作らない。TABLE-28・Issue #2190）。
@@ -2124,7 +2108,7 @@ fn check_buffered_view_collations(
     read_txn: &impl crate::storage::read_source::ReadSource,
     view: &crate::sql::allowlist::ValidatedBufferedView,
 ) -> Result<(), crate::sql::allowlist::SqlSurfaceError> {
-    if !buffered_outer_depends_on_order(view) {
+    if !view.outer_depends_on_order() {
         return Ok(());
     }
     let mut names = Vec::new();

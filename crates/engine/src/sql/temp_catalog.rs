@@ -305,6 +305,13 @@ impl<L: TableLookup + ?Sized> TableLookup for SessionRelationLookup<'_, L> {
         Ok(allocated)
     }
 
+    fn table_has_non_byte_collation(&self, name: &str) -> Result<bool, SqlSurfaceError> {
+        if let Some(entry) = self.temp_entry(name) {
+            return Ok(crate::catalog::schema_has_non_byte_collation(&entry.schema));
+        }
+        self.inner.table_has_non_byte_collation(name)
+    }
+
     fn buffered_depth(&self) -> usize {
         self.inner.buffered_depth()
     }

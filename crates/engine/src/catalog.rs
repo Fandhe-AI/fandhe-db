@@ -5131,6 +5131,15 @@ impl TableLookup for TxnViewLookup<'_, '_> {
             .txn_schema(name)?
             .is_some_and(|schema| schema.is_allocated()))
     }
+
+    fn table_has_non_byte_collation(
+        &self,
+        name: &str,
+    ) -> std::result::Result<bool, SqlSurfaceError> {
+        Ok(self
+            .txn_schema(name)?
+            .is_some_and(|schema| schema_has_non_byte_collation(&schema)))
+    }
 }
 
 impl TxnViewLookup<'_, '_> {
@@ -5206,6 +5215,17 @@ impl TableLookup for ViewWriteSnapshot<'_> {
     fn table_is_allocated(&self, name: &str) -> std::result::Result<bool, SqlSurfaceError> {
         match self.table_schema(name) {
             Ok(schema) => Ok(schema.is_allocated()),
+            Err(CatalogError::TableNotFound(_)) => Ok(false),
+            Err(other) => Err(table_lookup_error(other)),
+        }
+    }
+
+    fn table_has_non_byte_collation(
+        &self,
+        name: &str,
+    ) -> std::result::Result<bool, SqlSurfaceError> {
+        match self.table_schema(name) {
+            Ok(schema) => Ok(schema_has_non_byte_collation(&schema)),
             Err(CatalogError::TableNotFound(_)) => Ok(false),
             Err(other) => Err(table_lookup_error(other)),
         }
@@ -16256,6 +16276,17 @@ impl TableLookup for Storage {
         }
     }
 
+    fn table_has_non_byte_collation(
+        &self,
+        name: &str,
+    ) -> std::result::Result<bool, SqlSurfaceError> {
+        match self.get_table_schema(name) {
+            Ok(schema) => Ok(schema_has_non_byte_collation(&schema)),
+            Err(CatalogError::TableNotFound(_)) => Ok(false),
+            Err(other) => Err(table_lookup_error(other)),
+        }
+    }
+
     /// `SELECT *` の実際の列並び（疑似列 `id` が先頭、続けて宣言済みの実カラム。実カラム `id` を
     /// 宣言していれば `id` が 2 回現れる）。`sql::parser::bind_projection` の `Projection::All` と一致させる。
     fn table_star_columns(
@@ -16282,6 +16313,14 @@ impl TableLookup for Storage {
             Err(other) => Err(table_lookup_error(other)),
         }
     }
+}
+
+/// 表スキーマが非バイト列順の照合の列を持つか（[`TableLookup::table_has_non_byte_collation`] の共有本体）。
+pub(crate) fn schema_has_non_byte_collation(schema: &TableSchema) -> bool {
+    schema
+        .columns
+        .iter()
+        .any(|c| c.collation.is_some_and(|coll| !coll.is_byte_order()))
 }
 
 /// [`TableLookup::table_columns`] の列名組み立て（実カラム名 ＋ 実カラム `id` が
