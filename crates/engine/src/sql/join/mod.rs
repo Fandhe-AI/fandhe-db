@@ -287,11 +287,23 @@ pub(crate) fn relation_is_cte(validated: &ValidatedJoin, i: usize) -> bool {
 /// （docs/design/inner-join.md）を両者で揃える。
 fn bind_side_scans(
     plan: &JoinPlan<'_>,
+    cte_ids: &CteIdColumns,
+    validated: &ValidatedJoin,
     udfs: &UdfRegistry,
     scan_limit: usize,
 ) -> Result<Vec<crate::sql::parser::BoundScan>, SqlSurfaceError> {
     let mut out = Vec::with_capacity(plan.scans.len());
-    for (scan, schema) in plan.scans.iter().zip(plan.schemas.iter()) {
+    for (i, (scan, schema)) in plan.scans.iter().zip(plan.schemas.iter()).enumerate() {
+        // CTE が公開した行 `id` の列は、リテラルを `u64` を損失なく扱える型（疑似列 `id` と同じ numeric）で
+        // 束縛する（`BIGINT` だと `i64` 解析になり、`i64::MAX` 超の有効な行 id のリテラルが `22003`）。
+        // 実際の側述語の評価は `view_buffered::plan_rows_layer` が同じ型で行う（`CteIdColumns` が唯一の情報源）。
+        let id_typed = validated
+            .relations
+            .get(i)
+            .and_then(|r| cte_ids.get(r.table()))
+            .filter(|cols| !cols.is_empty())
+            .map(|cols| plan::cte_id_binding_schema(schema, cols));
+        let schema = id_typed.as_ref().unwrap_or(*schema);
         // 側スキャンの `LIMIT` は直後に `scan_limit` へ差し替える内部値のため既定の範囲検証のまま
         // （文の `LIMIT` は `validate_limit_offset` が設定値で判定する）。
         let mut bound = crate::sql::parser::bind_scan_with_dummy_flags(
@@ -441,7 +453,13 @@ fn execute_with_inputs(
     // §2.4/§2.5: 全 relation の束縛（列参照・WHERE 述語の型検証）を完了させてから
     // `LIMIT`／`OFFSET` の範囲検証（`22000`）を行う（束縛エラー優先。Describe と
     // 同じ判断順序）。
-    let bound = bind_side_scans(&plan, udfs, limits.max_input_rows.saturating_add(1))?;
+    let bound = bind_side_scans(
+        &plan,
+        cte_ids,
+        validated,
+        udfs,
+        limits.max_input_rows.saturating_add(1),
+    )?;
     let (limit, offset) = validate_limit_offset(validated, limits.max_result_rows)?;
     // Issue #1551: 起動時設定のリレーション数上限（データ非依存。走査より前に判定する）。
     if validated.relations.len() > limits.max_relations {
@@ -722,7 +740,7 @@ pub(crate) fn describe_columns(
     // 走査せずに束縛だけ行い、WHERE リテラルの型検証を Execute と同じ判定
     // 基準で確定させる（Describe は本体を実行しない契約）。束縛完了を
     // `LIMIT`／`OFFSET` 検証より前に行う（束縛エラー優先。Execute と同じ順序）。
-    bind_side_scans(&plan, udfs, 1)?;
+    bind_side_scans(&plan, cte_ids, validated, udfs, 1)?;
     validate_limit_offset(validated, result_limits.max_result_rows())?;
     Ok(plan.column_metas())
 }

@@ -688,3 +688,92 @@ fn row_id_column_of_a_cte_orders_groups_and_rejects_aggregates() {
         "0A000"
     );
 }
+
+/// 行 `id` を公開した CTE の列を、`i64::MAX` を超える値で比較リテラル・`IN` リスト・`BETWEEN`・結合キー・
+/// `ORDER BY`・導出層の述語に使うテーブル駆動テスト（PR #2729 の codex 指摘。型の扱いの退行を全経路で固定する）。
+/// どの形も `22003` にならず、期待の行 id（`u64`）だけを返し、Describe の公告は Execute と一致する。
+#[test]
+fn huge_row_id_is_usable_in_every_predicate_and_key_form() {
+    let (core, _g, huge) = open_with_huge_ids();
+    let h = huge.to_string();
+    let cte = "WITH c AS (SELECT id FROM docs) SELECT c.id FROM c JOIN docs d ON c.id = d.id";
+    let cases: Vec<(String, Vec<u64>)> = vec![
+        (format!("{cte} WHERE c.id = '{h}' LIMIT 5"), vec![huge]),
+        (format!("{cte} WHERE c.id > '5' LIMIT 5"), vec![huge]),
+        (format!("{cte} WHERE c.id >= '{h}' LIMIT 5"), vec![huge]),
+        (format!("{cte} WHERE c.id < '{h}' LIMIT 5"), vec![1]),
+        (format!("{cte} WHERE c.id IN ('{h}') LIMIT 5"), vec![huge]),
+        (
+            format!("{cte} WHERE c.id IN ('1', '{h}') LIMIT 5"),
+            vec![1, huge],
+        ),
+        (
+            format!("{cte} WHERE c.id = '{h}' OR d.lang = 'zz' LIMIT 5"),
+            vec![huge],
+        ),
+        (
+            format!("{cte} WHERE c.id = '1' OR d.lang = 'zz' LIMIT 5"),
+            vec![1],
+        ),
+        (
+            format!("{cte} WHERE c.id IN ('{h}', '7') OR d.lang = 'zz' LIMIT 5"),
+            vec![huge],
+        ),
+        (format!("{cte} AND c.id = '{h}' LIMIT 5"), vec![huge]),
+        (
+            format!("{cte} AND (c.id = '{h}' OR d.id = '1') LIMIT 5"),
+            vec![1, huge],
+        ),
+        (format!("{cte} ORDER BY c.id DESC LIMIT 5"), vec![huge, 1]),
+        (
+            format!(
+                "WITH c(i) AS (SELECT id FROM docs) SELECT c.i FROM c JOIN docs d ON c.i = d.id \
+                 WHERE c.i = '{h}' LIMIT 5"
+            ),
+            vec![huge],
+        ),
+        (
+            format!(
+                "WITH a AS MATERIALIZED (SELECT id, lang FROM docs), \
+                 b AS (SELECT id FROM a WHERE id = '{h}') \
+                 SELECT y.id FROM a x JOIN b y ON x.id = y.id LIMIT 5"
+            ),
+            vec![huge],
+        ),
+        (
+            format!(
+                "WITH a AS MATERIALIZED (SELECT id, lang FROM docs), \
+                 b AS (SELECT id FROM a WHERE id > '5') \
+                 SELECT y.id FROM a x JOIN b y ON x.id = y.id WHERE y.id = '{h}' LIMIT 5"
+            ),
+            vec![huge],
+        ),
+    ];
+    // JOIN の `WHERE` は `BETWEEN` を受け付けない（構文段で `42601`。`i64` に丸めて黙って通さない）。
+    assert_eq!(
+        code(
+            &core,
+            "alice",
+            &format!("{cte} WHERE c.id BETWEEN '5' AND '{h}' LIMIT 5")
+        ),
+        "42601"
+    );
+    for (sql, want) in &cases {
+        let r = match query(&core, "alice", sql) {
+            Ok(r) => r,
+            Err(e) => panic!("{sql}: {e:?}"),
+        };
+        let mut got = ids(&r);
+        got.sort_unstable();
+        let mut want = want.clone();
+        want.sort_unstable();
+        assert_eq!(got, want, "{sql}");
+        let session = SessionState::default();
+        let parsed = core.parse_sql(sql).expect("parse");
+        let described = core
+            .describe_parsed_in_session(&session, &parsed)
+            .expect("describe")
+            .expect("has columns");
+        assert_eq!(described, r.columns, "describe must match execute: {sql}");
+    }
+}

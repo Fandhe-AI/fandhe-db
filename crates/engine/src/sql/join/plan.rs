@@ -52,6 +52,20 @@ use super::where_promote::promotable_where_key;
 /// 綴り（`TableRef::table`）。`cte_schema` が作り、`core.rs` が Execute・Describe の双方で同じものを渡す。
 pub(crate) type CteIdColumns = HashMap<String, Vec<usize>>;
 
+/// CTE の行 `id` を運ぶ列（`id_columns`）を、リテラル束縛用に疑似列 `id` と同じ numeric 型
+/// （[`crate::sql::exec::ALIASED_ID_TYPE`]）へ差し替えたスキーマの写し。`CteIdColumns` を唯一の情報源として、
+/// 側述語の事前束縛（`bind_side_scans`）と単一リレーションの残余述語（`build_residual`）が共有する。
+/// 実行時のセルは変えない（`u64` のまま。残余の評価は `eval_single` が numeric へ写す）。
+pub(super) fn cte_id_binding_schema(schema: &TableSchema, id_columns: &[usize]) -> TableSchema {
+    let mut out = schema.clone();
+    for &i in id_columns {
+        if let Some(col) = out.columns.get_mut(i) {
+            col.ty = crate::sql::exec::ALIASED_ID_TYPE.clone();
+        }
+    }
+    out
+}
+
 /// 解決済みの列参照（どの relation の、側スキャン結果の何番目のセルか）。
 #[derive(Debug, Clone)]
 pub(super) struct Col {
@@ -631,12 +645,21 @@ fn build_residual(
             })?;
         let preds = to_where_predicates(expr, &binder.scope, &binder.schemas)?;
         let wrapped = vec![WherePredicate::Or(vec![preds])];
-        let schema = *binder
+        let base_schema = *binder
             .schemas
             .get(rel)
             .ok_or_else(|| SqlSurfaceError::Internal {
                 detail: "JOIN relation index out of range".to_string(),
             })?;
+        // CTE の行 `id` の列は numeric で束縛する（`BIGINT` の `i64` 解析で有効な行 id のリテラルを
+        // `22003` にしない）。
+        let id_typed = binder
+            .relations
+            .get(rel)
+            .and_then(|r| binder.cte_ids.get(r.table()))
+            .filter(|cols| !cols.is_empty())
+            .map(|cols| cte_id_binding_schema(base_schema, cols));
+        let schema = id_typed.as_ref().unwrap_or(base_schema);
         let mut node_budget = crate::sql::udf_call::MAX_EXPR_NODES;
         let (metadata, expr_filters, _rls, mut or_filters) =
             crate::sql::parser::bind_where_predicates(
@@ -664,7 +687,14 @@ fn build_residual(
         let mut cols: Vec<(usize, usize, ColumnType)> = Vec::new();
         for r in refs {
             let c = binder.col(r)?;
-            if let (Some(idx), Some(ty)) = (c.schema_idx, c.ty) {
+            // CTE の行 `id` の列は型なし（符号なし整数のセル）として束縛済みだが、残余の評価では
+            // numeric の列として渡す（`eval_single` が `u64` のセルを numeric へ写す）。
+            let ty = if c.cte_id {
+                Some(crate::sql::exec::ALIASED_ID_TYPE.clone())
+            } else {
+                c.ty
+            };
+            if let (Some(idx), Some(ty)) = (c.schema_idx, ty) {
                 if !cols.iter().any(|(i, _, _)| *i == idx) {
                     cols.push((idx, c.pos, ty));
                 }
