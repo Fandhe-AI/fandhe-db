@@ -9,6 +9,13 @@
 
 ### Added
 
+- 相関スカラーサブクエリを式の内側で使えるようにする（Issue #1848・SQL-61）。算術・比較・`COALESCE`・`CASE`・関数引数・`CAST` の
+  被演算子として、投影の式項目・WHERE の式述語・スカラー `ORDER BY` の式キーに置ける（`(SELECT max(v) ...) + 1`・
+  `COALESCE((SELECT ...), 0)`・`v > (SELECT ...) * 2`）。該当なしは NULL が式の中で伝播し（集計形の `count` は 0）、結果列の型は
+  内側の結果列の型どおり。非相関の埋め込みは従来どおり `42601`、NUMERIC の結果の算術は `0A000`。
+  挙動変更: `GROUP BY` のキー内のサブクエリを `42601` から `0A000` へ変えた（非相関にも効く）。
+  BREAKING CHANGE: 公開 enum `sql::udf_call::BoundExpr` に variant `CorrelatedScalar` を追加したため、網羅的な `match` は更新が要る。
+  詳細は [sql-subquery.md](docs/design/sql-subquery.md) の「Issue #1848 追記」節。
 - `WITH RECURSIVE` の構文を受理し再帰構造を検証する（Issue #1869・SQL-35。段階 A）。アンカー項と再帰項を
   `UNION [ALL]` で結んだ形の自己参照の位置・回数を検証し、不正な再帰は `42P19`、未対応の形と構造検証を通過した
   文の実行（反復評価は #1870）は `0A000` で拒否する。従来 `42601` だった挙動変更。詳細は [recursive-cte.md](docs/design/recursive-cte.md)。
@@ -24,6 +31,10 @@
   wire-server に `--max-correlated-reevaluations <1-100000>`（再評価回数の上限を下げる opt-in。超過は `54000`）を追加し、
   `engine::correlated_limits`・`EngineCore::with_correlated_limits` を公開する。詳細は
   [sql-subquery.md](docs/design/sql-subquery.md) の「Issue #1847 追記」節。
+- データ変更 CTE を書き込み経路で実行する（Issue #1876・SQL-63）。最上位の文で `WITH d AS (DELETE|UPDATE|INSERT ... RETURNING ...) SELECT ... FROM d`
+  を 1 つの書き込みトランザクションで実行し、`RETURNING` 行を主クエリが読む。文末の `USING OPERATION_ID` は文全体を台帳 1 エントリで記録する。
+  従来固定 `0A000` だった形が実行されるようになる挙動変更（複数のデータ変更 CTE・実表を読む主クエリ・一時表対象は引き続き `0A000`）。
+  公開 enum `ParsedSql` に variant（`DataModifyingCte`）を追加（`#[non_exhaustive]`）。詳細は [data-modifying-cte.md](docs/design/data-modifying-cte.md)。
 - CTE 本文のデータ変更文（`WITH x AS (DELETE ... RETURNING ...)` 等）の構文を受理し、本文の解析と `RETURNING` の公開列の確定までを行う（Issue #1875・SQL-63）。
   実行は未対応のため、検証を通過した文も `0A000` で拒否する（従来は `42601`）。書き込みは発生しない。詳細は [data-modifying-cte.md](docs/design/data-modifying-cte.md)。
 - CTE の `MATERIALIZED`／`NOT MATERIALIZED` を受理する（Issue #1858・SQL-62 (3)）。評価方式の指定として読み捨て、結果は変わらない。

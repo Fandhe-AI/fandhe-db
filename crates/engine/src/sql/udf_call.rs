@@ -856,6 +856,10 @@ pub enum BoundExpr {
     /// プローブ（`sql::join::semi`）で、外側の行スカラーと `id` から常に `Bool` を返す。
     /// `NOT EXISTS`（Issue #1843）の否定はプローブ内で適用済み。
     CorrelatedExists(crate::sql::join::semi::CorrelatedProbeRef),
+    /// 式の内側へ埋め込む相関スカラーサブクエリの値（Issue #1848・SQL-61 ポインタ）。`sql::subquery` が
+    /// 内側を 1 回だけ実行して作る値プローブを葉として運び、外側の行スカラーと `id` から値
+    /// （該当なしは NULL、2 件以上は `21000`）を返す。束縛段が予約内部名の識別子からのみ作る。
+    CorrelatedScalar(crate::sql::correlated_scalar::CorrelatedScalarRef),
     /// テーブルの `VECTOR` 列参照（1 テーブルにつき高々 1 本、TABLE-1。
     /// `catalog::encode_schema` が内部で呼ぶ `validate_schema` により
     /// `CREATE TABLE`・`ALTER TABLE ADD COLUMN` の双方で fail-closed に強制される
@@ -1389,6 +1393,7 @@ impl PartialEq for BoundExpr {
                 BoundExpr::IdCompare { op: ob, value: vb },
             ) => oa == ob && va == vb,
             (BoundExpr::CorrelatedExists(a), BoundExpr::CorrelatedExists(b)) => a == b,
+            (BoundExpr::CorrelatedScalar(a), BoundExpr::CorrelatedScalar(b)) => a == b,
             (BoundExpr::VectorRef, BoundExpr::VectorRef) => true,
             (BoundExpr::Null, BoundExpr::Null) => true,
             (BoundExpr::Builtin { f: fa, args: aa }, BoundExpr::Builtin { f: fb, args: ab }) => {
@@ -2745,6 +2750,7 @@ fn count_bound_nodes(expr: &BoundExpr) -> usize {
         | BoundExpr::IdRef
         | BoundExpr::IdCompare { .. }
         | BoundExpr::CorrelatedExists(_)
+        | BoundExpr::CorrelatedScalar(_)
         | BoundExpr::VectorRef
         | BoundExpr::JsonbColumnRef { .. }
         | BoundExpr::JsonColumnRef { .. }
@@ -2851,6 +2857,7 @@ fn max_bound_case_nesting(expr: &BoundExpr) -> usize {
         | BoundExpr::IdRef
         | BoundExpr::IdCompare { .. }
         | BoundExpr::CorrelatedExists(_)
+        | BoundExpr::CorrelatedScalar(_)
         | BoundExpr::VectorRef
         | BoundExpr::JsonbColumnRef { .. }
         | BoundExpr::JsonColumnRef { .. }
@@ -2954,6 +2961,7 @@ pub(crate) fn references_embedding(expr: &BoundExpr) -> bool {
         | BoundExpr::IdRef
         | BoundExpr::IdCompare { .. }
         | BoundExpr::CorrelatedExists(_)
+        | BoundExpr::CorrelatedScalar(_)
         | BoundExpr::JsonbColumnRef { .. }
         | BoundExpr::JsonColumnRef { .. }
         | BoundExpr::Numeric(_)
@@ -3072,6 +3080,12 @@ pub(crate) fn visit_referenced_scalar_columns(expr: &BoundExpr, visit: &mut dyn 
                 visit(*index);
             }
         }
+        // 式の内側の相関スカラー（Issue #1848）も同じ理由で外側のキー・残余の列を含める。
+        BoundExpr::CorrelatedScalar(leaf) => {
+            for index in leaf.outer_columns() {
+                visit(*index);
+            }
+        }
         BoundExpr::Number(_)
         | BoundExpr::Text(_)
         | BoundExpr::Date(_)
@@ -3176,6 +3190,14 @@ pub(crate) fn mark_referenced_scalar_columns(expr: &BoundExpr, mask: &mut [bool]
         }
         BoundExpr::CorrelatedExists(probe) => {
             for index in probe.probe().outer_columns() {
+                if let Some(slot) = mask.get_mut(*index) {
+                    *slot = true;
+                }
+            }
+            true
+        }
+        BoundExpr::CorrelatedScalar(leaf) => {
+            for index in leaf.outer_columns() {
                 if let Some(slot) = mask.get_mut(*index) {
                     *slot = true;
                 }
@@ -3335,6 +3357,46 @@ thread_local! {
     /// CHECK 述語の束縛中（[`CheckBindingGuard`] が生きている間）だけ `true`。構文段が型を知らず
     /// 拒否できない jsonb の `-`（[`bind_json_delete`]）を CHECK 本体で `0A000` にするために使う。
     static CHECK_BINDING: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+}
+
+thread_local! {
+    /// 式の内側のスカラーサブクエリ（Issue #1848）の解決済みの葉（内部名の添字順）。広域取得の束縛
+    /// （`sql::parser::bind_scan_with_dummy_flags`）が [`EmbeddedScalarGuard`] で束縛区間だけ設定し、
+    /// `bind_expr_any` の内部名の解決が参照する。束縛 API の署名（`bind_expr` ほか多数）を変えずに
+    /// 表を運ぶための経路で、区間外では常に空（解決済みの葉が無い文脈は束縛が `0A000` で拒否する）。
+    static EMBEDDED_SCALARS: std::cell::RefCell<Vec<crate::sql::correlated_scalar::CorrelatedScalarRef>> =
+        const { std::cell::RefCell::new(Vec::new()) };
+}
+
+/// 式の内側のスカラーサブクエリの葉の表を束縛区間だけ設定する RAII ガード（drop で直前の表へ戻す）。
+pub(crate) struct EmbeddedScalarGuard(Vec<crate::sql::correlated_scalar::CorrelatedScalarRef>);
+
+impl EmbeddedScalarGuard {
+    pub(crate) fn enter(leaves: Vec<crate::sql::correlated_scalar::CorrelatedScalarRef>) -> Self {
+        Self(EMBEDDED_SCALARS.with(|c| c.replace(leaves)))
+    }
+}
+
+impl Drop for EmbeddedScalarGuard {
+    fn drop(&mut self) {
+        let prev = std::mem::take(&mut self.0);
+        EMBEDDED_SCALARS.with(|c| {
+            c.replace(prev);
+        });
+    }
+}
+
+/// 内部名 `name` の埋め込みスカラーサブクエリを葉へ束縛する（[`bind_expr_any`] の `Expr::Ident` 腕）。
+fn bind_embedded_scalar_leaf(name: &str) -> Result<(BoundExpr, ExprType), SqlSurfaceError> {
+    let leaf = crate::sql::allowlist::scalar_subquery_placeholder_index(name)
+        .and_then(|j| EMBEDDED_SCALARS.with(|c| c.borrow().get(j).cloned()));
+    let Some(leaf) = leaf else {
+        return Err(SqlSurfaceError::feature_not_supported(
+            "scalar subquery inside an expression is not allowed in this context",
+        ));
+    };
+    let ty = leaf.expr_type()?;
+    Ok((BoundExpr::CorrelatedScalar(leaf), ty))
 }
 
 /// CHECK 述語の束縛区間を示す RAII ガード（`sql::parser::bind_check_predicates` が張る）。
@@ -4463,6 +4525,13 @@ pub(super) fn bind_expr_any(
             Ok((BoundExpr::Text(s.clone()), ExprType::Text))
         }
         Expr::Ident(name) => {
+            // 式の内側のスカラーサブクエリの内部名（Issue #1848）は列・UDF 仮引数より先に解決する
+            // （利用者の識別子は字句段で制御文字を生成できないため衝突しない）。解決済みの葉が無い文脈
+            // （`sql::subquery` を経ない束縛）は静的な文言の `0A000` で拒否する（内部名・未知の列名の
+            // エラーへ流さない）。
+            if crate::sql::allowlist::is_scalar_subquery_placeholder_name(name) {
+                return bind_embedded_scalar_leaf(name);
+            }
             // `env.params`（UDF 本体束縛時のみ非空）のキーは `define_function` で
             // 正規化済み（小文字）。本体の参照側も同じ正規形へそろえて引く
             // （`validate_closed_expr` の参照検証と一貫させる。外側コンテキストでは
@@ -5903,6 +5972,15 @@ fn scalar_numeric_kind(
             f: BuiltinFn::TypedArith(_, k),
             ..
         } => Some(*k),
+        // 式の内側の相関スカラー（Issue #1848）は内側の結果列の型どおり（`count` は bigint、
+        // `max(int4)` は int4、`real` は real）。倍精度・その他は `None`（f64 意味論）。
+        BoundExpr::CorrelatedScalar(leaf) => match leaf.column_type() {
+            ColumnType::SmallInt => Some(NumericKind::Int2),
+            ColumnType::Integer => Some(NumericKind::Int4),
+            ColumnType::BigInt => Some(NumericKind::Int8),
+            ColumnType::Real => Some(NumericKind::Float4),
+            _ => None,
+        },
         // 分岐の値変換・整数 `abs` の範囲検査が挿入する変換ノードは変換先の種別を持つ。
         BoundExpr::Builtin {
             f: BuiltinFn::Cast(c),
@@ -8601,6 +8679,8 @@ pub(crate) fn eval_with_scalars<'a>(
         BoundExpr::CorrelatedExists(probe) => {
             probe.probe().eval(row_scalars, id).map(ExprValue::Bool)
         }
+        // 式の内側の相関スカラー（Issue #1848）。値は所有（プローブ内のセルからの複製）で返す。
+        BoundExpr::CorrelatedScalar(leaf) => leaf.eval(row_scalars, id),
         BoundExpr::VectorRef => {
             // Issue #352: 行の embedding をそのまま借用する。テーブル `VECTOR` 列の
             // 素通し参照（`WHERE vec_norm(embedding) > x` 等の読み取り経路）では

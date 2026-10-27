@@ -1678,6 +1678,10 @@ pub(crate) fn default_expr_alias(expr: &Expr) -> String {
 /// `CAST` の被演算子が既定列名として持つ名前（PostgreSQL の `FigureColname` の強い名前に相当）。
 fn cast_operand_name(expr: &Expr) -> Option<String> {
     match expr {
+        // 式の内側のスカラーサブクエリの内部名（Issue #1848）は列名ではない（結果列名へ漏らさない）。
+        Expr::Ident(name) if crate::sql::allowlist::is_scalar_subquery_placeholder_name(name) => {
+            None
+        }
         Expr::Ident(name) => Some(name.clone()),
         Expr::Call { .. }
         | Expr::Coalesce(_)
@@ -1747,7 +1751,7 @@ pub fn bind_projection(
                     crate::sql::allowlist::SelectItem::Expr {
                         expr: Expr::Ident(name),
                         alias: Some(alias),
-                    } => {
+                    } if !crate::sql::allowlist::is_scalar_subquery_placeholder_name(name) => {
                         cols.push(resolve_projected_column(name, alias, schema)?);
                     }
                     crate::sql::allowlist::SelectItem::Expr { expr, alias } => {
@@ -10306,7 +10310,11 @@ pub(crate) fn collect_expr_idents(expr: &Expr, out: &mut std::collections::HashS
         // Issue #919・SQL-26: 文字列リテラルは列識別子を参照しない。
         Expr::Number(_) | Expr::String(_) => {}
         Expr::Ident(name) => {
-            out.insert(name.clone());
+            // 式の内側のスカラーサブクエリの内部名（Issue #1848）は列を参照しない（外側の相関列は
+            // 解決済みの葉が自身のデコード対象として運ぶ）。
+            if !crate::sql::allowlist::is_scalar_subquery_placeholder_name(name) {
+                out.insert(name.clone());
+            }
         }
         Expr::Call { args, .. } => {
             for arg in args {
@@ -10423,6 +10431,21 @@ pub(crate) fn bind_scan_with_dummy_flags(
             "scalar subquery in the SELECT list is not allowed in this context",
         ));
     }
+    // Issue #1848: 式の内側のスカラーサブクエリも同じ理由で、`core.rs` が解決して葉を埋めてから束縛へ
+    // 渡す。未解決のまま届いた場合（Describe 等）は黙って列・述語を落とさず拒否する（fail-closed）。
+    let mut embedded_leaves = Vec::with_capacity(stmt.embedded_scalar_subqueries.len());
+    for e in &stmt.embedded_scalar_subqueries {
+        match &e.resolved {
+            Some(leaf) => embedded_leaves.push(leaf.clone()),
+            None => {
+                return Err(SqlSurfaceError::unsupported(
+                    "scalar subquery inside an expression is not allowed in this context",
+                ))
+            }
+        }
+    }
+    // 束縛区間だけ葉の表を公開する（区間外では空。`sql::udf_call::bind_embedded_scalar_leaf` が参照）。
+    let _embedded_guard = crate::sql::udf_call::EmbeddedScalarGuard::enter(embedded_leaves);
     let mut node_budget = crate::sql::udf_call::MAX_EXPR_NODES;
 
     let projection = bind_projection(stmt.projection(), schema, udfs, &mut node_budget)?;

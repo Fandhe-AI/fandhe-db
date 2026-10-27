@@ -636,6 +636,15 @@ pub(super) fn source_cast_kind(
                 },
                 // 配列関数の長さ・位置は int4（TABLE-35・Issue #1604）。
                 BoundExpr::ArrayFn(f) if f.result_is_int4() => SourceKind::Known(CastKind::Int4),
+                // 式の内側の相関スカラー（Issue #1848）は内側の結果列の型どおりの種別。
+                BoundExpr::CorrelatedScalar(leaf) => match leaf.column_type() {
+                    ColumnType::SmallInt => SourceKind::Known(CastKind::Int2),
+                    ColumnType::Integer => SourceKind::Known(CastKind::Int4),
+                    ColumnType::BigInt => SourceKind::Known(CastKind::Int8),
+                    ColumnType::Real => SourceKind::Known(CastKind::Float4),
+                    ColumnType::Double => SourceKind::Known(CastKind::Float8),
+                    _ => SourceKind::UnknownNumeric,
+                },
                 BoundExpr::Builtin {
                     f: BuiltinFn::TypedArith(_, kind),
                     ..

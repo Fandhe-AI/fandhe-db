@@ -200,17 +200,37 @@ pub(crate) fn plan_outer(
     view: &ValidatedBufferedView,
     udfs: &UdfRegistry,
 ) -> Result<OuterPlan, SqlSurfaceError> {
+    plan_outer_parts(
+        body_columns,
+        &view.view_name,
+        &view.column_aliases,
+        &view.outer,
+        udfs,
+    )
+}
+
+/// [`plan_outer`] の本体。外側の形（`view_name`・`column_aliases`・`outer`）だけを受け取る。
+/// データ変更 CTE（SQL-63・Issue #1876）の主クエリは、本文が `Statement` ではなく副文の
+/// `RETURNING` 行であるため、ダミーの本文を作らずここへ直接渡す（Describe と Execute が
+/// 同じ入口を通る契約は変わらない）。
+pub(crate) fn plan_outer_parts(
+    body_columns: &[ColumnMeta],
+    view_name: &str,
+    column_aliases: &[String],
+    outer: &BufferedOuter,
+    udfs: &UdfRegistry,
+) -> Result<OuterPlan, SqlSurfaceError> {
     // 列別名付きビュー（TABLE-41 (1)・Issue #1659）の層は、外側の束縛より前に本文の結果列を
     // 先頭から改名する。Describe と Execute はどちらもこの入口を通るため列名が一致する。
     let renamed;
-    let body_columns = if view.column_aliases.is_empty() {
+    let body_columns = if column_aliases.is_empty() {
         body_columns
     } else {
-        renamed = rename_body_columns(body_columns, &view.column_aliases)?;
+        renamed = rename_body_columns(body_columns, column_aliases)?;
         renamed.as_slice()
     };
-    match &view.outer {
-        BufferedOuter::Rows(rows) => plan_rows(body_columns, &view.view_name, rows, udfs),
+    match outer {
+        BufferedOuter::Rows(rows) => plan_rows(body_columns, view_name, rows, udfs),
         BufferedOuter::Aggregate(agg) => plan_aggregate(body_columns, agg, udfs),
     }
 }
@@ -562,6 +582,7 @@ fn bind_scan_plan(
         scalar_subquery_items: Vec::new(),
         order_keys: rows.order_keys.clone(),
         physical_order_keys: Vec::new(),
+        embedded_scalar_subqueries: Vec::new(),
         with_ties: false,
     };
     let bound = super::parser::bind_scan(&scan, &schema, udfs)?;

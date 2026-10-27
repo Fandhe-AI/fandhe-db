@@ -217,3 +217,160 @@ fn wire_cte_read_applies_reader_session_rls() {
     assert_eq!(tag, "SELECT 1");
     read_ready_for_query(&mut bob_stream);
 }
+// ---- データ変更 CTE の実行（SQL-63・Issue #1876）----
+
+fn insert_doc(stream: &mut std::net::TcpStream, id: u32, lang: &str) {
+    send_simple_query(
+        stream,
+        &format!(
+            "INSERT INTO docs (id, embedding, lang) VALUES ({id}, '[0.1,0.2,0.3]', '{lang}') \
+             USING OPERATION_ID 'op-seed-{id}'"
+        ),
+    );
+    let _tag = read_command_complete(stream);
+    read_ready_for_query(stream);
+}
+
+fn count_docs(stream: &mut std::net::TcpStream) -> String {
+    send_simple_query(stream, "SELECT COUNT(*) FROM docs");
+    let _columns = read_row_description(stream);
+    let row = read_data_row(stream);
+    let _tag = read_command_complete(stream);
+    read_ready_for_query(stream);
+    row.into_iter().next().flatten().expect("count cell")
+}
+
+/// Sync まで読み進め、受け取ったメッセージ種別を順に返す。
+fn read_until_ready(stream: &mut std::net::TcpStream) -> Vec<u8> {
+    let mut types = Vec::new();
+    loop {
+        let (t, _body) = read_message(stream);
+        types.push(t);
+        if t == b'Z' {
+            return types;
+        }
+    }
+}
+
+/// 簡易クエリ: 書き込みと SELECT が 1 文で成立し、`RowDescription`・`DataRow`・`SELECT n` が返る。
+#[test]
+fn wire_data_modifying_cte_simple_query_writes_and_returns_rows() {
+    let (core, _guard) = new_core_with_docs_table();
+    let users_path = write_user_store_file(&[("alice", "tenant-a", "correct-horse")]);
+    let store = UserStore::load_from_file(&users_path).expect("valid user store");
+    let addr = spawn_server_with_engine_and_store(store, core);
+    let mut stream = authenticate_to_ready_for_query(addr, "alice", "correct-horse");
+    insert_doc(&mut stream, 1, "ja");
+    insert_doc(&mut stream, 2, "en");
+
+    let sql = "WITH d AS (DELETE FROM docs WHERE lang = 'ja' RETURNING id, lang) \
+               SELECT id FROM d LIMIT 10 USING OPERATION_ID 'op-dm-1'";
+    send_simple_query(&mut stream, sql);
+    let columns = read_row_description(&mut stream);
+    assert_eq!(columns, vec!["id".to_string()]);
+    assert_eq!(read_data_row(&mut stream), vec![Some("1".to_string())]);
+    assert_eq!(read_command_complete(&mut stream), "SELECT 1");
+    read_ready_for_query(&mut stream);
+    assert_eq!(count_docs(&mut stream), "1");
+
+    // 同一文の再送は 23505 で、再実行されない。
+    send_simple_query(&mut stream, sql);
+    expect_error_response_with_sqlstate(&mut stream, "23505");
+    read_ready_for_query(&mut stream);
+    assert_eq!(count_docs(&mut stream), "1");
+}
+
+/// 複数文メッセージ（暗黙トランザクション）: 先行文の書き込みを後続文が読み、未対応の形は
+/// 固定 `0A000` で何も変えない。
+#[test]
+fn wire_data_modifying_cte_multi_statement_message_is_one_implicit_transaction() {
+    let (core, _guard) = new_core_with_docs_table();
+    let users_path = write_user_store_file(&[("alice", "tenant-a", "correct-horse")]);
+    let store = UserStore::load_from_file(&users_path).expect("valid user store");
+    let addr = spawn_server_with_engine_and_store(store, core);
+    let mut stream = authenticate_to_ready_for_query(addr, "alice", "correct-horse");
+    insert_doc(&mut stream, 1, "ja");
+
+    send_simple_query(
+        &mut stream,
+        "WITH d AS (DELETE FROM docs WHERE lang = 'ja' RETURNING id) SELECT id FROM d LIMIT 10; \
+         SELECT COUNT(*) FROM docs",
+    );
+    let _columns = read_row_description(&mut stream);
+    assert_eq!(read_data_row(&mut stream), vec![Some("1".to_string())]);
+    assert_eq!(read_command_complete(&mut stream), "SELECT 1");
+    let _columns = read_row_description(&mut stream);
+    assert_eq!(read_data_row(&mut stream), vec![Some("0".to_string())]);
+    assert_eq!(read_command_complete(&mut stream), "SELECT 1");
+    read_ready_for_query(&mut stream);
+
+    insert_doc(&mut stream, 2, "ja");
+    send_simple_query(
+        &mut stream,
+        "WITH d AS (DELETE FROM docs WHERE lang = 'ja' RETURNING id) SELECT id FROM docs LIMIT 10",
+    );
+    expect_error_response_with_sqlstate(&mut stream, "0A000");
+    read_ready_for_query(&mut stream);
+    assert_eq!(count_docs(&mut stream), "1");
+}
+
+/// 明示トランザクション内の実行は ROLLBACK で全副作用が消える。
+#[test]
+fn wire_data_modifying_cte_in_explicit_transaction_rolls_back() {
+    let (core, _guard) = new_core_with_docs_table();
+    let users_path = write_user_store_file(&[("alice", "tenant-a", "correct-horse")]);
+    let store = UserStore::load_from_file(&users_path).expect("valid user store");
+    let addr = spawn_server_with_engine_and_store(store, core);
+    let mut stream = authenticate_to_ready_for_query(addr, "alice", "correct-horse");
+    insert_doc(&mut stream, 1, "ja");
+
+    send_simple_query(&mut stream, "BEGIN");
+    let _tag = read_command_complete(&mut stream);
+    read_ready_for_query(&mut stream);
+    send_simple_query(
+        &mut stream,
+        "WITH d AS (DELETE FROM docs WHERE lang = 'ja' RETURNING id) SELECT id FROM d LIMIT 10",
+    );
+    let _columns = read_row_description(&mut stream);
+    assert_eq!(read_data_row(&mut stream), vec![Some("1".to_string())]);
+    assert_eq!(read_command_complete(&mut stream), "SELECT 1");
+    read_ready_for_query(&mut stream);
+    send_simple_query(&mut stream, "ROLLBACK");
+    let _tag = read_command_complete(&mut stream);
+    read_ready_for_query(&mut stream);
+    assert_eq!(count_docs(&mut stream), "1");
+}
+
+/// 拡張クエリ: Describe（portal）は書き込みを起こさず、Execute で初めて書き込む。
+#[test]
+fn wire_data_modifying_cte_extended_query_describe_does_not_write() {
+    let (core, _guard) = new_core_with_docs_table();
+    let users_path = write_user_store_file(&[("alice", "tenant-a", "correct-horse")]);
+    let store = UserStore::load_from_file(&users_path).expect("valid user store");
+    let addr = spawn_server_with_engine_and_store(store, core);
+    let mut stream = authenticate_to_ready_for_query(addr, "alice", "correct-horse");
+    insert_doc(&mut stream, 1, "ja");
+
+    send_length_prefixed_message(
+        &mut stream,
+        b'P',
+        &parse_body(
+            "s1",
+            "WITH d AS (DELETE FROM docs WHERE lang = 'ja' RETURNING id) \
+             SELECT id FROM d LIMIT 10",
+            0,
+        ),
+    );
+    send_length_prefixed_message(&mut stream, b'B', &bind_body("p1", "s1"));
+    send_length_prefixed_message(&mut stream, b'D', b"Pp1\0");
+    send_length_prefixed_message(&mut stream, b'S', &[]);
+    assert_eq!(read_until_ready(&mut stream), vec![b'1', b'2', b'T', b'Z']);
+    assert_eq!(count_docs(&mut stream), "1", "Describe must not write");
+
+    // portal は Sync（暗黙トランザクションの終端）で破棄されるため、準備済みの文から Bind し直す。
+    send_length_prefixed_message(&mut stream, b'B', &bind_body("p2", "s1"));
+    send_length_prefixed_message(&mut stream, b'E', &execute_body("p2", 0));
+    send_length_prefixed_message(&mut stream, b'S', &[]);
+    assert_eq!(read_until_ready(&mut stream), vec![b'2', b'D', b'C', b'Z']);
+    assert_eq!(count_docs(&mut stream), "0");
+}
