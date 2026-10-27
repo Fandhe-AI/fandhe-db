@@ -3253,7 +3253,7 @@ fn resolve_correlated_exists(
     Ok(CorrelatedProbeRef::new(probe))
 }
 
-/// 失敗時の静的検証（Issue #1432 の経路）での `EXISTS`。肯定形で内側が外側を参照するときは、
+/// 失敗時の静的検証（Issue #1432 の経路）での `EXISTS`／`NOT EXISTS`。内側が外側を参照するときは、
 /// 実行せずに [`prepare_correlated_exists`]（相関の分解・残余の束縛）と内側だけの連言の静的検証・
 /// 束縛までを行う（実行経路と同じ検査を共有する）。それ以外は従来の静的検証（相関は `42601`）。
 #[allow(clippy::too_many_arguments)]
@@ -3267,46 +3267,44 @@ fn static_validate_exists(
     nesting_limits: crate::nesting_limits::NestingLimits,
     result_limits: crate::result_limits::ResultLimits,
 ) -> Result<(), SqlSurfaceError> {
-    {
-        if let Some((validated, inner_schema, correlation)) = classify_correlated_scan(
-            inner_tokens,
-            depth,
+    if let Some((validated, inner_schema, correlation)) = classify_correlated_scan(
+        inner_tokens,
+        depth,
+        outer_scopes,
+        read_txn,
+        lookup,
+        nesting_limits,
+    )? {
+        let mut prepared = prepare_correlated_exists(
+            validated,
+            &inner_schema,
+            &correlation,
             outer_scopes,
+            udfs,
+            result_limits,
+        )?;
+        let mut chain: Vec<&TableSchema> = outer_scopes.to_vec();
+        chain.push(&inner_schema);
+        static_validate_subquery_predicates(
+            &prepared.analysis.inner_only,
+            &chain,
             read_txn,
             lookup,
+            udfs,
             nesting_limits,
-        )? {
-            let mut prepared = prepare_correlated_exists(
-                validated,
-                &inner_schema,
-                &correlation,
-                outer_scopes,
-                udfs,
-                result_limits,
-            )?;
-            let mut chain: Vec<&TableSchema> = outer_scopes.to_vec();
-            chain.push(&inner_schema);
-            static_validate_subquery_predicates(
-                &prepared.analysis.inner_only,
-                &chain,
-                read_txn,
-                lookup,
-                udfs,
-                nesting_limits,
-                result_limits,
-            )?;
-            prepared.validated.where_predicates =
-                static_validation_predicates(&prepared.analysis.inner_only);
-            shape_for_materialization(&mut prepared.validated, &prepared.projected);
-            super::parser::bind_scan_with_dummy_flags(
-                &prepared.validated,
-                &inner_schema,
-                udfs,
-                &[],
-                &result_limits,
-            )?;
-            return Ok(());
-        }
+            result_limits,
+        )?;
+        prepared.validated.where_predicates =
+            static_validation_predicates(&prepared.analysis.inner_only);
+        shape_for_materialization(&mut prepared.validated, &prepared.projected);
+        super::parser::bind_scan_with_dummy_flags(
+            &prepared.validated,
+            &inner_schema,
+            udfs,
+            &[],
+            &result_limits,
+        )?;
+        return Ok(());
     }
     static_validate_inner_query(
         inner_tokens,
