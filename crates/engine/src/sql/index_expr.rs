@@ -409,9 +409,9 @@ fn check_one_predicate(pred: &WherePredicate) -> Result<(), SqlSurfaceError> {
             })
         }
         // パーサが生成しない内部専用の葉。到達しないが、防御的に拒否する。
-        WherePredicate::IdCompare { .. } => Err(SqlSurfaceError::unsupported(
-            "unsupported predicate in an index predicate",
-        )),
+        WherePredicate::IdCompare { .. } | WherePredicate::CorrelatedExists(_) => Err(
+            SqlSurfaceError::unsupported("unsupported predicate in an index predicate"),
+        ),
     }
 }
 

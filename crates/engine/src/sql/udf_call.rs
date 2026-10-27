@@ -851,6 +851,10 @@ pub enum BoundExpr {
         op: BinOp,
         value: i128,
     },
+    /// 相関 `EXISTS` の外側の行ごとの判定（Issue #1842・SQL-61 ポインタ）。`sql::subquery` が生成する
+    /// `WherePredicate::CorrelatedExists` の束縛結果としてのみ作られる。内側は 1 回だけ実体化済みの
+    /// プローブ（`sql::join::semi`）で、外側の行スカラーと `id` から常に `Bool` を返す。
+    CorrelatedExists(crate::sql::join::semi::CorrelatedProbeRef),
     /// テーブルの `VECTOR` 列参照（1 テーブルにつき高々 1 本、TABLE-1。
     /// `catalog::encode_schema` が内部で呼ぶ `validate_schema` により
     /// `CREATE TABLE`・`ALTER TABLE ADD COLUMN` の双方で fail-closed に強制される
@@ -1383,6 +1387,7 @@ impl PartialEq for BoundExpr {
                 BoundExpr::IdCompare { op: oa, value: va },
                 BoundExpr::IdCompare { op: ob, value: vb },
             ) => oa == ob && va == vb,
+            (BoundExpr::CorrelatedExists(a), BoundExpr::CorrelatedExists(b)) => a == b,
             (BoundExpr::VectorRef, BoundExpr::VectorRef) => true,
             (BoundExpr::Null, BoundExpr::Null) => true,
             (BoundExpr::Builtin { f: fa, args: aa }, BoundExpr::Builtin { f: fb, args: ab }) => {
@@ -2738,6 +2743,7 @@ fn count_bound_nodes(expr: &BoundExpr) -> usize {
         | BoundExpr::ColumnRef { .. }
         | BoundExpr::IdRef
         | BoundExpr::IdCompare { .. }
+        | BoundExpr::CorrelatedExists(_)
         | BoundExpr::VectorRef
         | BoundExpr::JsonbColumnRef { .. }
         | BoundExpr::JsonColumnRef { .. }
@@ -2843,6 +2849,7 @@ fn max_bound_case_nesting(expr: &BoundExpr) -> usize {
         | BoundExpr::ColumnRef { .. }
         | BoundExpr::IdRef
         | BoundExpr::IdCompare { .. }
+        | BoundExpr::CorrelatedExists(_)
         | BoundExpr::VectorRef
         | BoundExpr::JsonbColumnRef { .. }
         | BoundExpr::JsonColumnRef { .. }
@@ -2945,6 +2952,7 @@ pub(crate) fn references_embedding(expr: &BoundExpr) -> bool {
         | BoundExpr::ColumnRef { .. }
         | BoundExpr::IdRef
         | BoundExpr::IdCompare { .. }
+        | BoundExpr::CorrelatedExists(_)
         | BoundExpr::JsonbColumnRef { .. }
         | BoundExpr::JsonColumnRef { .. }
         | BoundExpr::Numeric(_)
@@ -3056,6 +3064,13 @@ pub(crate) fn visit_referenced_scalar_columns(expr: &BoundExpr, visit: &mut dyn 
                 visit_referenced_scalar_columns(e, visit);
             }
         }
+        // 相関 `EXISTS`（Issue #1842）: 外側のキー・残余が参照する外側列をデコード対象へ含める
+        // （欠けるとマスク外参照＝全行 NULL 扱いで偽になる）。
+        BoundExpr::CorrelatedExists(probe) => {
+            for index in probe.probe().outer_columns() {
+                visit(*index);
+            }
+        }
         BoundExpr::Number(_)
         | BoundExpr::Text(_)
         | BoundExpr::Date(_)
@@ -3155,6 +3170,14 @@ pub(crate) fn mark_referenced_scalar_columns(expr: &BoundExpr, mask: &mut [bool]
         | BoundExpr::ColumnRef { index } => {
             if let Some(slot) = mask.get_mut(*index) {
                 *slot = true;
+            }
+            true
+        }
+        BoundExpr::CorrelatedExists(probe) => {
+            for index in probe.probe().outer_columns() {
+                if let Some(slot) = mask.get_mut(*index) {
+                    *slot = true;
+                }
             }
             true
         }
@@ -8532,6 +8555,10 @@ pub(crate) fn eval_with_scalars<'a>(
         BoundExpr::JsonFn { f, args } => eval_json_fn(*f, args, id, embedding, row_scalars),
         BoundExpr::IdRef => id_as_finite_scalar(id).map(ExprValue::Scalar),
         BoundExpr::IdCompare { op, value } => Ok(ExprValue::Bool(id_compare(*op, id, *value))),
+        // 相関 `EXISTS`（Issue #1842）。常に真偽（UNKNOWN にならない）。
+        BoundExpr::CorrelatedExists(probe) => {
+            probe.probe().eval(row_scalars, id).map(ExprValue::Bool)
+        }
         BoundExpr::VectorRef => {
             // Issue #352: 行の embedding をそのまま借用する。テーブル `VECTOR` 列の
             // 素通し参照（`WHERE vec_norm(embedding) > x` 等の読み取り経路）では

@@ -14,8 +14,10 @@
 //! - 外側表で修飾した参照の列が存在しなければ `42703`。
 //! - どのスコープにも無い非修飾名はここでは拒否しない（内側の束縛が従来どおり `42703` にする。
 //!   `ORDER BY` の出力別名など列ではない識別子がここへ来るため）。
-//! - 相関の実行は未対応のため、束縛に成功した相関は [`reject_if_correlated`] が `42601` で拒否する。
-//!   #1842 以降は、この呼び出し箇所を半結合・反結合の書き換えへ置き換える。
+//! - 肯定形の相関 `EXISTS`（Issue #1842）は `sql::subquery` が本 IR を使って半結合・行ごとの再評価へ
+//!   書き換えて実行する（`sql::correlated_exists`）。それ以外（`NOT EXISTS`〔#1843〕・`IN`／スカラー
+//!   〔#1844〕・述語形 DML・集計の `FILTER`）は、束縛に成功した相関を [`reject_if_correlated`] が
+//!   `42601` で拒否する。
 //!
 //! エラー文言は静的文字列と利用者自身が書いた列名だけを含め、予約接頭辞（制御文字）・
 //! 他テナントの情報は含めない。束縛はスキーマだけを参照し、行データは読まない
@@ -77,7 +79,6 @@ impl Correlation {
     }
 
     /// 外側列への参照一覧（`levels_up`・列名の昇順）。
-    #[allow(dead_code)] // #1842 以降の半結合書き換えが読む IR の入口。
     pub(crate) fn outer_refs(&self) -> &[OuterColumnRef] {
         &self.outer_refs
     }
@@ -185,9 +186,9 @@ pub(crate) fn bind_correlation(
     bind_correlation_levels(referenced, inner, &levels)
 }
 
-/// 相関の実行は未対応のため、相関があれば `42601` で拒否する（fail-closed）。
-/// `sql::subquery` の事前検査が束縛の直後に呼ぶ。#1842 以降はこの呼び出し箇所を
-/// 半結合・反結合への書き換えに置き換える。エラー文言は静的文字列のみ。
+/// 相関の実行に対応しない形では、相関があれば `42601` で拒否する（fail-closed）。
+/// `sql::subquery` の事前検査が束縛の直後に呼ぶ。肯定形の相関 `EXISTS` は #1842 で別経路
+/// （`sql::correlated_exists`）が実行するため、ここへは届かない。エラー文言は静的文字列のみ。
 pub(crate) fn reject_if_correlated(correlation: &Correlation) -> Result<(), SqlSurfaceError> {
     if correlation.is_correlated() {
         return Err(SqlSurfaceError::unsupported(

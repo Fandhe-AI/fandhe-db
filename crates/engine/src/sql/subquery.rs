@@ -38,11 +38,15 @@
 //! 合流する。内側が 2 行以上なら外側の結果が 1 行以上のときだけ `21000`。
 //! 内側 WHERE に入れ子のスカラーサブクエリの `21000` も同様に外側の行数判明まで遅延する（Issue #1432）。
 //!
-//! 相関サブクエリ（内側が外側の列を非修飾名で参照する形）は束縛前の静的走査で
-//! `42601` にする（PostgreSQL の名前解決順と同じく、内側スキーマに無く外側の
-//! いずれかのスコープに有る列名を相関参照とみなす。どこにも無い名前は従来どおり
-//! 内側の束縛が `42703`〔未定義列。Issue #2332〕で拒否する）。外側スコープは
-//! `outer_scopes`（末尾が直近の外側）としてネストの深さ分を引き回す。
+//! 相関サブクエリ（内側が外側の列を参照する形）は束縛前の静的走査で外側スコープへ束縛する
+//! （PostgreSQL の名前解決順と同じく、内側スキーマに無く外側のいずれかのスコープに有る列名を
+//! 相関参照とみなす。どこにも無い名前は従来どおり内側の束縛が `42703`〔未定義列。Issue #2332〕で
+//! 拒否する）。外側スコープは `outer_scopes`（末尾が直近の外側）としてネストの深さ分を引き回す。
+//! 肯定形の相関 `EXISTS`（Issue #1842・SQL-61）は、内側 `WHERE` の連言を等価キー・残余・内側だけの
+//! 条件へ分解して（`sql::correlated_exists`）内側を 1 回だけ実体化し、外側の行ごとに判定する内部専用の葉
+//! （[`WherePredicate::CorrelatedExists`]。ハッシュ半結合、残余があれば行ごとの再評価。
+//! `sql::join::semi`）へ書き換える。それ以外の相関（`NOT EXISTS`・`IN`／スカラー・述語形 DML・集計の
+//! `FILTER`）は従来どおり `42601` で拒否する（fail-closed）。
 //!
 //! NULL 規則（三値論理。RLS 境界内＝可視行のみから決まる）:
 //! - `NOT IN`: 内側 0 行なら常に真（外側値が NULL でも真）。内側の結果に NULL を
@@ -85,6 +89,7 @@ use super::allowlist::{
     CompareOp, Projection, ScalarSubqueryItem, ScalarSubqueryOp, SelectItem, SqlSurfaceError,
     Statement, TableLookup, ValidatedAggregate, ValidatedScan, WherePredicate,
 };
+use super::correlated_exists::{self, CorrelatedCtx};
 use super::correlation;
 use super::exec::{Cell, ColumnMeta};
 use super::lexer::Token;
@@ -155,6 +160,7 @@ pub(crate) fn resolve_where_predicates(
     result_limits: crate::result_limits::ResultLimits,
     budget: &mut usize,
     in_value_budget: &mut usize,
+    corr: &CorrelatedCtx,
 ) -> Result<Vec<WherePredicate>, SqlSurfaceError> {
     let mut out = Vec::with_capacity(predicates.len());
     for predicate in predicates {
@@ -174,6 +180,7 @@ pub(crate) fn resolve_where_predicates(
                         result_limits,
                         budget,
                         in_value_budget,
+                        corr,
                     )?);
                 }
                 out.push(WherePredicate::Or(resolved_branches));
@@ -198,15 +205,17 @@ pub(crate) fn resolve_where_predicates(
                     result_limits,
                     budget,
                     in_value_budget,
+                    corr,
                 )?);
             }
             WherePredicate::Exists {
                 inner_tokens,
                 depth,
             } => {
-                let exists = resolve_exists_subquery(
+                match resolve_exists_subquery(
                     &inner_tokens,
                     depth,
+                    true,
                     outer_scopes,
                     read_txn,
                     ctx,
@@ -217,16 +226,23 @@ pub(crate) fn resolve_where_predicates(
                     result_limits,
                     budget,
                     in_value_budget,
-                )?;
-                if !exists {
-                    // 常に偽: 分岐 0 個の `Or` は `where_tree::BoundOrGroup::matches`
-                    // が必ず `false` を返す（`sql::where_tree` モジュール
-                    // ドキュメント参照）。`EXISTS` が偽の行を除外しつつ、
-                    // `has_where_filters()` は真のままに保つ（フィルタなし専用
-                    // キャッシュへ誤って乗せない）。
-                    out.push(WherePredicate::Or(Vec::new()));
+                    corr,
+                )? {
+                    ExistsOutcome::Constant(false) => {
+                        // 常に偽: 分岐 0 個の `Or` は `where_tree::BoundOrGroup::matches`
+                        // が必ず `false` を返す（`sql::where_tree` モジュール
+                        // ドキュメント参照）。`EXISTS` が偽の行を除外しつつ、
+                        // `has_where_filters()` は真のままに保つ（フィルタなし専用
+                        // キャッシュへ誤って乗せない）。
+                        out.push(WherePredicate::Or(Vec::new()));
+                    }
+                    // 真の場合は述語自体を追加しない（制約を課さない＝常に真）。
+                    ExistsOutcome::Constant(true) => {}
+                    // 相関 `EXISTS`（Issue #1842）: 外側の行ごとに判定する内部専用の葉。
+                    ExistsOutcome::Probe(probe) => {
+                        out.push(WherePredicate::CorrelatedExists(probe))
+                    }
                 }
-                // 真の場合は述語自体を追加しない（制約を課さない＝常に真）。
             }
             WherePredicate::ScalarSubqueryCompare {
                 column,
@@ -249,6 +265,7 @@ pub(crate) fn resolve_where_predicates(
                     result_limits,
                     budget,
                     in_value_budget,
+                    corr,
                 )?);
             }
             // `<col> <op> ANY|SOME|ALL (SELECT ...)`（Issue #1855・SQL-61 (3)）。否定は構文段が
@@ -276,6 +293,7 @@ pub(crate) fn resolve_where_predicates(
                     result_limits,
                     budget,
                     in_value_budget,
+                    corr,
                 )?);
             }
             WherePredicate::Not(inner) => match *inner {
@@ -301,6 +319,7 @@ pub(crate) fn resolve_where_predicates(
                         result_limits,
                         budget,
                         in_value_budget,
+                        corr,
                     )?);
                 }
                 // `NOT EXISTS (SELECT ...)`（Issue #1191）: 可視行があれば常に偽、
@@ -309,20 +328,26 @@ pub(crate) fn resolve_where_predicates(
                     inner_tokens,
                     depth,
                 } => {
-                    let exists = resolve_exists_subquery(
-                        &inner_tokens,
-                        depth,
-                        outer_scopes,
-                        read_txn,
-                        ctx,
-                        lookup,
-                        udfs,
-                        group_limits,
-                        nesting_limits,
-                        result_limits,
-                        budget,
-                        in_value_budget,
-                    )?;
+                    // 相関の `NOT EXISTS` は反結合の範囲（#1843）で、従来どおり `42601`。
+                    let exists = matches!(
+                        resolve_exists_subquery(
+                            &inner_tokens,
+                            depth,
+                            false,
+                            outer_scopes,
+                            read_txn,
+                            ctx,
+                            lookup,
+                            udfs,
+                            group_limits,
+                            nesting_limits,
+                            result_limits,
+                            budget,
+                            in_value_budget,
+                            corr,
+                        )?,
+                        ExistsOutcome::Constant(true)
+                    );
                     if exists {
                         out.push(WherePredicate::Or(Vec::new()));
                     }
@@ -486,12 +511,12 @@ fn aggregate_referenced_columns(validated: &ValidatedAggregate) -> HashSet<Strin
 }
 
 /// 内側クエリの事前検査結果。`correlation` は外側スコープへの束縛結果（相関の IR。
-/// SQL-61・Issue #1841）。相関の実行が未対応の間は、相関があれば事前検査が
-/// [`correlation::reject_if_correlated`] で拒否するため、返る時点では相関なしである。
-/// #1842 以降は拒否を半結合・反結合の書き換えへ置き換え、この IR を使う。
+/// SQL-61・Issue #1841）。この経路では相関があれば事前検査が
+/// [`correlation::reject_if_correlated`] で拒否するため、返る時点では相関なしである
+/// （肯定形の相関 `EXISTS` は [`try_resolve_correlated_exists`] が先に処理する。Issue #1842）。
 struct InnerPrecheck {
     schema: TableSchema,
-    #[allow(dead_code)] // #1842 以降の半結合・反結合への書き換えが読む。
+    #[allow(dead_code)] // #1843 以降の反結合への書き換えが読む。
     correlation: correlation::Correlation,
 }
 
@@ -546,6 +571,7 @@ fn execute_inner_query(
     result_limits: crate::result_limits::ResultLimits,
     budget: &mut usize,
     in_value_budget: &mut usize,
+    corr: &CorrelatedCtx,
 ) -> Result<super::exec::QueryResult, SqlSurfaceError> {
     let mut meta_sink = None;
     execute_inner_query_with_meta(
@@ -562,6 +588,7 @@ fn execute_inner_query(
         result_limits,
         budget,
         in_value_budget,
+        corr,
         &mut meta_sink,
     )
 }
@@ -585,6 +612,7 @@ fn execute_inner_query_with_meta(
     result_limits: crate::result_limits::ResultLimits,
     budget: &mut usize,
     in_value_budget: &mut usize,
+    corr: &CorrelatedCtx,
     meta_sink: &mut Option<Vec<ColumnMeta>>,
 ) -> Result<super::exec::QueryResult, SqlSurfaceError> {
     *budget = budget.checked_sub(1).ok_or_else(|| {
@@ -614,6 +642,7 @@ fn execute_inner_query_with_meta(
             result_limits,
             budget,
             in_value_budget,
+            corr,
             meta_sink,
         )?,
         (
@@ -631,6 +660,7 @@ fn execute_inner_query_with_meta(
             result_limits,
             budget,
             in_value_budget,
+            corr,
             meta_sink,
         )?,
         _ => return Err(unsupported_inner_statement()),
@@ -776,6 +806,7 @@ fn execute_inner_scan_statement(
     result_limits: crate::result_limits::ResultLimits,
     budget: &mut usize,
     in_value_budget: &mut usize,
+    corr: &CorrelatedCtx,
     meta_sink: &mut Option<Vec<ColumnMeta>>,
 ) -> Result<super::exec::QueryResult, SqlSurfaceError> {
     let inner_schema = inner_scan_prechecks(&validated, intent, outer_scopes, read_txn)?.schema;
@@ -799,6 +830,7 @@ fn execute_inner_scan_statement(
         result_limits,
         budget,
         in_value_budget,
+        corr,
     ) {
         Ok(p) => p,
         Err(e) => {
@@ -922,6 +954,7 @@ fn execute_inner_aggregate_statement(
     result_limits: crate::result_limits::ResultLimits,
     budget: &mut usize,
     in_value_budget: &mut usize,
+    corr: &CorrelatedCtx,
     meta_sink: &mut Option<Vec<ColumnMeta>>,
 ) -> Result<super::exec::QueryResult, SqlSurfaceError> {
     let inner_schema = inner_aggregate_prechecks(&validated, outer_scopes, read_txn)?.schema;
@@ -941,6 +974,7 @@ fn execute_inner_aggregate_statement(
         result_limits,
         budget,
         in_value_budget,
+        corr,
     ) {
         Ok(p) => p,
         Err(e) => {
@@ -1021,15 +1055,33 @@ fn static_validate_subquery_predicates(
                     )?;
                 }
             }
-            WherePredicate::Not(inner) => static_validate_subquery_predicates(
-                std::slice::from_ref(inner.as_ref()),
-                chain,
-                read_txn,
-                lookup,
-                udfs,
-                nesting_limits,
-                result_limits,
-            )?,
+            // 相関の `NOT EXISTS` は反結合の範囲（#1843）で従来どおり拒否するため、否定形の `EXISTS` は
+            // 相関を実行する肯定形と区別して検証する（Issue #1842）。
+            WherePredicate::Not(inner) => match inner.as_ref() {
+                WherePredicate::Exists {
+                    inner_tokens,
+                    depth,
+                } => static_validate_exists(
+                    inner_tokens,
+                    *depth,
+                    false,
+                    chain,
+                    read_txn,
+                    lookup,
+                    udfs,
+                    nesting_limits,
+                    result_limits,
+                )?,
+                other => static_validate_subquery_predicates(
+                    std::slice::from_ref(other),
+                    chain,
+                    read_txn,
+                    lookup,
+                    udfs,
+                    nesting_limits,
+                    result_limits,
+                )?,
+            },
             WherePredicate::InSubquery {
                 column,
                 inner_tokens,
@@ -1061,10 +1113,10 @@ fn static_validate_subquery_predicates(
                 inner_tokens,
                 depth,
             } => {
-                static_validate_inner_query(
+                static_validate_exists(
                     inner_tokens,
                     *depth,
-                    InnerScanIntent::ExistenceOnly,
+                    true,
                     chain,
                     read_txn,
                     lookup,
@@ -1280,6 +1332,8 @@ pub(crate) fn resolve_aggregate_item_filters(
     in_value_budget: &mut usize,
 ) -> Result<(), SqlSurfaceError> {
     use crate::sql::allowlist::AggregateSelectItem;
+    // 集計の `FILTER (WHERE ...)` では相関 `EXISTS` を実行しない（従来どおり `42601`。Issue #1842）。
+    let corr = CorrelatedCtx::disabled();
     let mut resolve =
         |agg: &mut crate::sql::allowlist::AggregateItem| -> Result<(), SqlSurfaceError> {
             if !agg.filter.iter().any(predicate_contains_subquery) {
@@ -1297,6 +1351,7 @@ pub(crate) fn resolve_aggregate_item_filters(
                 result_limits,
                 budget,
                 in_value_budget,
+                &corr,
             )?;
             Ok(())
         };
@@ -1492,6 +1547,7 @@ fn resolve_in_subquery(
     result_limits: crate::result_limits::ResultLimits,
     budget: &mut usize,
     in_value_budget: &mut usize,
+    corr: &CorrelatedCtx,
 ) -> Result<Vec<WherePredicate>, SqlSurfaceError> {
     let mut meta_sink: Option<Vec<ColumnMeta>> = None;
     let result = match execute_inner_query_with_meta(
@@ -1508,6 +1564,7 @@ fn resolve_in_subquery(
         result_limits,
         budget,
         in_value_budget,
+        corr,
         &mut meta_sink,
     ) {
         Ok(r) => r,
@@ -1866,6 +1923,7 @@ pub(crate) fn resolve_scalar_projection_items(
     result_limits: crate::result_limits::ResultLimits,
     budget: &mut usize,
     in_value_budget: &mut usize,
+    corr: &CorrelatedCtx,
 ) -> Result<Vec<ResolvedScalarItem>, SqlSurfaceError> {
     let mut out = Vec::with_capacity(items.len());
     for item in items {
@@ -1884,6 +1942,7 @@ pub(crate) fn resolve_scalar_projection_items(
             result_limits,
             budget,
             in_value_budget,
+            corr,
             &mut meta_sink,
         ) {
             Ok(r) => r,
@@ -2176,6 +2235,7 @@ fn resolve_scalar_compare(
     result_limits: crate::result_limits::ResultLimits,
     budget: &mut usize,
     in_value_budget: &mut usize,
+    corr: &CorrelatedCtx,
 ) -> Result<WherePredicate, SqlSurfaceError> {
     let mut meta_sink: Option<Vec<ColumnMeta>> = None;
     let result = match execute_inner_query_with_meta(
@@ -2192,6 +2252,7 @@ fn resolve_scalar_compare(
         result_limits,
         budget,
         in_value_budget,
+        corr,
         &mut meta_sink,
     ) {
         Ok(r) => r,
@@ -2396,6 +2457,7 @@ fn resolve_quantified_compare(
     result_limits: crate::result_limits::ResultLimits,
     budget: &mut usize,
     in_value_budget: &mut usize,
+    corr: &CorrelatedCtx,
 ) -> Result<Vec<WherePredicate>, SqlSurfaceError> {
     use crate::sql::udf_call::Quantifier;
     use std::cmp::Ordering;
@@ -2416,6 +2478,7 @@ fn resolve_quantified_compare(
             result_limits,
             budget,
             in_value_budget,
+            corr,
         );
     }
     let mut meta_sink: Option<Vec<ColumnMeta>> = None;
@@ -2433,6 +2496,7 @@ fn resolve_quantified_compare(
         result_limits,
         budget,
         in_value_budget,
+        corr,
         &mut meta_sink,
     ) {
         Ok(r) => r,
@@ -2737,14 +2801,29 @@ fn build_in_set_predicate(column: &str, values: Vec<String>) -> WherePredicate {
     WherePredicate::Or(branches)
 }
 
-/// `EXISTS (SELECT ...)` を解決し、可視行が 1 件以上存在するかどうかを返す。
-/// 内側は [`InnerScanIntent::ExistenceOnly`] で評価する（投影不要・実質 `LIMIT` 1。
-/// PR #1103 追加 codex-review P1 指摘対応の詳細は [`execute_inner_scan_statement`]
-/// 参照）。`NOT EXISTS` は呼び出し側が結果を反転する。
+/// [`resolve_exists_subquery`] の解決結果。
+#[derive(Debug)]
+enum ExistsOutcome {
+    /// 外側の行に依存しない結果（可視行の有無）。
+    Constant(bool),
+    /// 相関 `EXISTS`（Issue #1842）: 外側の行ごとに判定するプローブ。
+    Probe(super::join::semi::CorrelatedProbeRef),
+}
+
+/// `EXISTS (SELECT ...)` を解決する。非相関なら内側は [`InnerScanIntent::ExistenceOnly`] で評価し
+/// （投影不要・実質 `LIMIT` 1。PR #1103 追加 codex-review P1 指摘対応の詳細は
+/// [`execute_inner_scan_statement`] 参照）、可視行の有無を [`ExistsOutcome::Constant`] で返す。
+/// `NOT EXISTS` は呼び出し側が結果を反転する。
+///
+/// 相関（Issue #1842・SQL-61）: `positive`（肯定形の `EXISTS`）かつ `corr` が有効なとき、内側が外側の
+/// 列を参照していれば [`resolve_correlated_exists`] で内側を 1 回だけ実体化したプローブを返す。
+/// `NOT EXISTS`（#1843）・相関 `IN`／スカラー（#1844）・`corr` 無効の文脈（述語形 DML・集計の
+/// `FILTER`）は従来どおり内側の事前検査が `42601` で拒否する。
 #[allow(clippy::too_many_arguments)]
 fn resolve_exists_subquery(
     inner_tokens: &[Token],
     depth: usize,
+    positive: bool,
     outer_scopes: &[&TableSchema],
     read_txn: &impl crate::storage::read_source::ReadSource,
     ctx: &PolicyContext,
@@ -2755,7 +2834,27 @@ fn resolve_exists_subquery(
     result_limits: crate::result_limits::ResultLimits,
     budget: &mut usize,
     in_value_budget: &mut usize,
-) -> Result<bool, SqlSurfaceError> {
+    corr: &CorrelatedCtx,
+) -> Result<ExistsOutcome, SqlSurfaceError> {
+    if positive && corr.is_enabled() {
+        if let Some(probe) = try_resolve_correlated_exists(
+            inner_tokens,
+            depth,
+            outer_scopes,
+            read_txn,
+            ctx,
+            lookup,
+            udfs,
+            group_limits,
+            nesting_limits,
+            result_limits,
+            budget,
+            in_value_budget,
+            corr,
+        )? {
+            return Ok(ExistsOutcome::Probe(probe));
+        }
+    }
     let result = execute_inner_query(
         inner_tokens,
         depth,
@@ -2770,8 +2869,451 @@ fn resolve_exists_subquery(
         result_limits,
         budget,
         in_value_budget,
+        corr,
     )?;
-    Ok(!result.rows.is_empty())
+    Ok(ExistsOutcome::Constant(!result.rows.is_empty()))
+}
+
+/// 内側が広域取得で外側の列を参照する形か判定し、そうなら検証済みの内側・内側スキーマ・相関 IR を返す。
+/// 相関が無い・広域取得でない・ウィンドウ関数を含む内側は `None`（呼び出し側の従来経路が同じ検査・
+/// 拒否を行う）。実行経路（[`try_resolve_correlated_exists`]）と失敗時の静的検証
+/// （[`static_validate_exists`]）が共有する（2 系統の検査を分岐させない）。
+fn classify_correlated_scan(
+    inner_tokens: &[Token],
+    depth: usize,
+    outer_scopes: &[&TableSchema],
+    read_txn: &impl crate::storage::read_source::ReadSource,
+    lookup: &impl TableLookup,
+    nesting_limits: crate::nesting_limits::NestingLimits,
+) -> Result<Option<(ValidatedScan, TableSchema, correlation::Correlation)>, SqlSurfaceError> {
+    let Statement::Scan(validated) =
+        super::allowlist::validate_sql_tokens_with_subquery_ctx_limits(
+            inner_tokens,
+            lookup,
+            depth,
+            nesting_limits,
+        )?
+    else {
+        return Ok(None);
+    };
+    if !validated.window_items.is_empty() {
+        return Ok(None);
+    }
+    let inner_schema = inner_table_schema(read_txn, &validated.table_name)?;
+    let referenced = scan_referenced_columns(&validated);
+    let correlation = correlation::bind_correlation(&referenced, &inner_schema, outer_scopes)?;
+    if !correlation.is_correlated() {
+        return Ok(None);
+    }
+    if !validated.scalar_subquery_items.is_empty() {
+        return Err(SqlSurfaceError::unsupported(
+            "a subquery cannot contain a scalar subquery in its SELECT list",
+        ));
+    }
+    Ok(Some((validated, inner_schema, correlation)))
+}
+
+/// 内側が外側の列を参照するときだけ、相関 `EXISTS` のプローブを作って返す（それ以外は `None`）。
+#[allow(clippy::too_many_arguments)]
+fn try_resolve_correlated_exists(
+    inner_tokens: &[Token],
+    depth: usize,
+    outer_scopes: &[&TableSchema],
+    read_txn: &impl crate::storage::read_source::ReadSource,
+    ctx: &PolicyContext,
+    lookup: &impl TableLookup,
+    udfs: &UdfRegistry,
+    group_limits: crate::group_by_limits::GroupByLimits,
+    nesting_limits: crate::nesting_limits::NestingLimits,
+    result_limits: crate::result_limits::ResultLimits,
+    budget: &mut usize,
+    in_value_budget: &mut usize,
+    corr: &CorrelatedCtx,
+) -> Result<Option<super::join::semi::CorrelatedProbeRef>, SqlSurfaceError> {
+    let Some((validated, inner_schema, correlation)) = classify_correlated_scan(
+        inner_tokens,
+        depth,
+        outer_scopes,
+        read_txn,
+        lookup,
+        nesting_limits,
+    )?
+    else {
+        return Ok(None);
+    };
+    resolve_correlated_exists(
+        validated,
+        inner_schema,
+        correlation,
+        outer_scopes,
+        read_txn,
+        ctx,
+        lookup,
+        udfs,
+        group_limits,
+        nesting_limits,
+        result_limits,
+        budget,
+        in_value_budget,
+        corr,
+    )
+    .map(Some)
+}
+
+/// 相関 `EXISTS` の、実行を伴わない準備の結果（[`prepare_correlated_exists`]）。
+struct PreparedCorrelated {
+    /// `WHERE` を取り除いた内側（実体化・静的検証用の土台）。
+    validated: ValidatedScan,
+    analysis: correlated_exists::Analysis,
+    /// 実体化する内側列（等価キー → 残余の順。重複なし。疑似列 `id` は含めない）。
+    projected: Vec<String>,
+    residual: Option<super::join::semi::Residual>,
+    /// 内側 `OFFSET`（検証済み）。
+    offset: usize,
+}
+
+/// 相関 `EXISTS` の準備（Issue #1842）。実行も走査もしない静的な処理だけを行い、実行経路
+/// （[`resolve_correlated_exists`]）と失敗時の静的検証（[`static_validate_correlated_exists`]）が共有する。
+///
+/// 手順: (1) 外側参照が `WHERE` の中だけであることを確認、(2) `LIMIT`／`OFFSET`／投影／`ORDER BY` を
+/// 従来の `EXISTS` と同じく差し替え前に検証、(3) `WHERE` の連言を分解
+/// （[`correlated_exists::analyze`]）、(4) 残余を合成スキーマへ束縛する。
+fn prepare_correlated_exists(
+    validated: ValidatedScan,
+    inner_schema: &TableSchema,
+    correlation: &correlation::Correlation,
+    outer_scopes: &[&TableSchema],
+    udfs: &UdfRegistry,
+    result_limits: crate::result_limits::ResultLimits,
+) -> Result<PreparedCorrelated, SqlSurfaceError> {
+    let outer_schema = owner_schema(outer_scopes)?;
+    // (1) 外側参照は `WHERE` の中だけを対象にする。投影・`ORDER BY` の外側参照は真偽に影響しないが、
+    // 束縛できる形に直す対象外とし、従来どおり `42601` で拒否する（`WHERE` を除いた参照名が
+    // 外側へ束縛されるかで判定する。`WHERE` と同じ列名を投影が参照する場合も拒否できる）。
+    let mut non_where = validated.clone();
+    non_where.where_predicates = Vec::new();
+    let non_where_correlation = correlation::bind_correlation(
+        &scan_referenced_columns(&non_where),
+        inner_schema,
+        outer_scopes,
+    )?;
+    if non_where_correlation.is_correlated() {
+        return Err(SqlSurfaceError::unsupported(
+            "correlated subqueries are not supported",
+        ));
+    }
+
+    // (2) 差し替え前の検証（従来の `EXISTS` と同じ契約。差し替えで迂回しない）。
+    if !validated.limit_implicit {
+        super::parser::validate_search_limit_with(validated.limit, &result_limits)?;
+    }
+    let offset = super::parser::validate_search_offset(validated.offset)?;
+    let mut probe_node_budget = crate::sql::udf_call::MAX_EXPR_NODES;
+    super::parser::bind_projection(
+        &validated.projection,
+        inner_schema,
+        udfs,
+        &mut probe_node_budget,
+    )?;
+    let mut shape_probe = validated.clone();
+    shape_probe.where_predicates = Vec::new();
+    shape_probe.projection = Projection::Columns(Vec::new());
+    shape_probe.limit = 1;
+    shape_probe.limit_implicit = false;
+    super::parser::bind_scan_with_dummy_flags(
+        &shape_probe,
+        inner_schema,
+        udfs,
+        &[],
+        &result_limits,
+    )?;
+
+    // (3) 述語の分解。
+    let mut validated = validated;
+    let analysis = correlated_exists::analyze(
+        std::mem::take(&mut validated.where_predicates),
+        inner_schema,
+        outer_schema,
+        correlation,
+    )?;
+
+    // 実体化する内側列。疑似列 `id` は行 `id` で賄う。
+    let mut projected: Vec<String> = Vec::new();
+    for key in &analysis.keys {
+        if !key.inner_is_pseudo_id && !projected.contains(&key.inner_column) {
+            projected.push(key.inner_column.clone());
+        }
+    }
+    let mut residual_idents = HashSet::new();
+    super::parser::collect_where_predicate_idents(&analysis.residual, &mut residual_idents);
+    let mut residual_idents: Vec<String> = residual_idents.into_iter().collect();
+    residual_idents.sort();
+    for ident in residual_idents {
+        if inner_schema.columns.iter().any(|c| c.name == ident) && !projected.contains(&ident) {
+            projected.push(ident);
+        }
+    }
+
+    // (4) 残余の束縛（静的に確定する誤りは実体化より前に返す）。
+    let residual = if analysis.residual.is_empty() {
+        None
+    } else {
+        Some(correlated_exists::bind_residual(
+            &analysis.residual,
+            inner_schema,
+            outer_schema,
+            correlation,
+            udfs,
+            &|name: &str| {
+                projected
+                    .iter()
+                    .position(|p| p == name)
+                    .unwrap_or(usize::MAX)
+            },
+        )?)
+    };
+    Ok(PreparedCorrelated {
+        validated,
+        analysis,
+        projected,
+        residual,
+        offset,
+    })
+}
+
+/// 内側を実体化用の形（等価キー・残余が使う列だけを投影し、真偽に影響しない `ORDER BY`・`OFFSET`・
+/// 上限を外した形）へ整える。実体化と静的検証が同じ形で束縛する。
+fn shape_for_materialization(validated: &mut ValidatedScan, projected: &[String]) {
+    validated.projection = Projection::Columns(projected.to_vec());
+    validated.order_by.clear();
+    validated.order_keys.clear();
+    validated.physical_order_keys.clear();
+    validated.window_items.clear();
+    validated.scalar_subquery_items.clear();
+    validated.offset = 0;
+    validated.with_ties = false;
+    validated.limit = 1;
+    validated.limit_implicit = false;
+}
+
+/// 相関 `EXISTS` を実行用のプローブへ解決する（Issue #1842・SQL-61 ポインタ・RLS-10 ポインタ）。
+///
+/// [`prepare_correlated_exists`] の後、内側だけの連言（入れ子のサブクエリを含む）を解決して
+/// 外側と同じ `ctx`・`read_txn`（RLS 暗黙適用・同一スナップショット）で 1 回だけ実体化し、
+/// 等価キーのハッシュ表と残余を持つプローブを組み立てる。`OFFSET k` は「一致が `k + 1` 件以上」で
+/// 保存する。内側の入力行数・バイト量・実行回数予算の超過は `54000`。
+#[allow(clippy::too_many_arguments)]
+fn resolve_correlated_exists(
+    validated: ValidatedScan,
+    inner_schema: TableSchema,
+    correlation: correlation::Correlation,
+    outer_scopes: &[&TableSchema],
+    read_txn: &impl crate::storage::read_source::ReadSource,
+    ctx: &PolicyContext,
+    lookup: &impl TableLookup,
+    udfs: &UdfRegistry,
+    group_limits: crate::group_by_limits::GroupByLimits,
+    nesting_limits: crate::nesting_limits::NestingLimits,
+    result_limits: crate::result_limits::ResultLimits,
+    budget: &mut usize,
+    in_value_budget: &mut usize,
+    corr: &CorrelatedCtx,
+) -> Result<super::join::semi::CorrelatedProbeRef, SqlSurfaceError> {
+    use super::join::semi::{CorrelatedProbe, CorrelatedProbeRef, InnerInput, OuterKey, ProbeSpec};
+
+    let PreparedCorrelated {
+        mut validated,
+        analysis,
+        projected,
+        residual,
+        offset,
+    } = prepare_correlated_exists(
+        validated,
+        &inner_schema,
+        &correlation,
+        outer_scopes,
+        udfs,
+        result_limits,
+    )?;
+
+    // 内側だけの連言を解決し、1 回だけ実体化する。
+    let mut chain: Vec<&TableSchema> = outer_scopes.to_vec();
+    chain.push(&inner_schema);
+    validated.where_predicates = resolve_where_predicates(
+        analysis.inner_only,
+        &chain,
+        read_txn,
+        ctx,
+        lookup,
+        udfs,
+        group_limits,
+        nesting_limits,
+        result_limits,
+        budget,
+        in_value_budget,
+        corr,
+    )?;
+    *budget = budget.checked_sub(1).ok_or_else(|| {
+        SqlSurfaceError::payload_too_large(format!(
+            "subquery execution count exceeds limit {}",
+            nesting_limits.max_subquery_executions()
+        ))
+    })?;
+    shape_for_materialization(&mut validated, &projected);
+    let mut bound = super::parser::bind_scan_with_dummy_flags(
+        &validated,
+        &inner_schema,
+        udfs,
+        &[],
+        &result_limits,
+    )?;
+    // 取得上限は内側の入力行数の上限 + 1 件（超過の検出用）。文の `LIMIT` ではなく JOIN の入力と同じ
+    // 設定値で頭打ちにし、超過は黙って切り詰めず `54000` にする。
+    bound.limit = corr.max_input_rows().saturating_add(1);
+    let result = super::scan::execute_scan_with_budget(
+        read_txn,
+        ctx,
+        &inner_schema,
+        &bound,
+        corr.byte_cap(),
+    )?;
+    if result.rows.len() > corr.max_input_rows() {
+        return Err(SqlSurfaceError::payload_too_large(
+            "correlated subquery input exceeds the visible row limit",
+        ));
+    }
+
+    // プローブの組み立て。
+    let keys: Vec<OuterKey> = analysis
+        .keys
+        .iter()
+        .map(|k| OuterKey {
+            source: k.outer.source,
+            class: k.class.clone(),
+        })
+        .collect();
+    let key_positions: Vec<Option<usize>> = analysis
+        .keys
+        .iter()
+        .map(|k| {
+            if k.inner_is_pseudo_id {
+                None
+            } else {
+                projected.iter().position(|p| p == &k.inner_column)
+            }
+        })
+        .collect();
+    let keep_cells = residual.is_some();
+    let min_matches = offset.saturating_add(1);
+    let inputs = result.rows.into_iter().map(|row| {
+        let mut key_cells = Vec::with_capacity(key_positions.len());
+        for (pos, key) in key_positions.iter().zip(&analysis.keys) {
+            let cell = match pos {
+                Some(i) => row
+                    .cells
+                    .get(*i)
+                    .cloned()
+                    .ok_or_else(|| SqlSurfaceError::Internal {
+                        detail: "correlated subquery key column is missing from the row"
+                            .to_string(),
+                    })?,
+                None if key.inner_is_pseudo_id => Cell::Integer(row.id),
+                None => {
+                    return Err(SqlSurfaceError::Internal {
+                        detail: "correlated subquery key column was not projected".to_string(),
+                    })
+                }
+            };
+            key_cells.push(cell);
+        }
+        let cells: Vec<Cell> = if keep_cells { row.cells } else { Vec::new() };
+        Ok(InnerInput {
+            id: row.id,
+            key_cells,
+            cells,
+        })
+    });
+    let probe = CorrelatedProbe::build(
+        ProbeSpec {
+            keys,
+            residual,
+            min_matches,
+            budget: corr.budget(),
+            byte_cap: corr.byte_cap(),
+        },
+        inputs,
+    )?;
+    Ok(CorrelatedProbeRef::new(probe))
+}
+
+/// 失敗時の静的検証（Issue #1432 の経路）での `EXISTS`。肯定形で内側が外側を参照するときは、
+/// 実行せずに [`prepare_correlated_exists`]（相関の分解・残余の束縛）と内側だけの連言の静的検証・
+/// 束縛までを行う（実行経路と同じ検査を共有する）。それ以外は従来の静的検証（相関は `42601`）。
+#[allow(clippy::too_many_arguments)]
+fn static_validate_exists(
+    inner_tokens: &[Token],
+    depth: usize,
+    positive: bool,
+    outer_scopes: &[&TableSchema],
+    read_txn: &impl crate::storage::read_source::ReadSource,
+    lookup: &impl TableLookup,
+    udfs: &UdfRegistry,
+    nesting_limits: crate::nesting_limits::NestingLimits,
+    result_limits: crate::result_limits::ResultLimits,
+) -> Result<(), SqlSurfaceError> {
+    if positive {
+        if let Some((validated, inner_schema, correlation)) = classify_correlated_scan(
+            inner_tokens,
+            depth,
+            outer_scopes,
+            read_txn,
+            lookup,
+            nesting_limits,
+        )? {
+            let mut prepared = prepare_correlated_exists(
+                validated,
+                &inner_schema,
+                &correlation,
+                outer_scopes,
+                udfs,
+                result_limits,
+            )?;
+            let mut chain: Vec<&TableSchema> = outer_scopes.to_vec();
+            chain.push(&inner_schema);
+            static_validate_subquery_predicates(
+                &prepared.analysis.inner_only,
+                &chain,
+                read_txn,
+                lookup,
+                udfs,
+                nesting_limits,
+                result_limits,
+            )?;
+            prepared.validated.where_predicates =
+                static_validation_predicates(&prepared.analysis.inner_only);
+            shape_for_materialization(&mut prepared.validated, &prepared.projected);
+            super::parser::bind_scan_with_dummy_flags(
+                &prepared.validated,
+                &inner_schema,
+                udfs,
+                &[],
+                &result_limits,
+            )?;
+            return Ok(());
+        }
+    }
+    static_validate_inner_query(
+        inner_tokens,
+        depth,
+        InnerScanIntent::ExistenceOnly,
+        outer_scopes,
+        read_txn,
+        lookup,
+        udfs,
+        nesting_limits,
+        result_limits,
+    )
+    .map(|_| ())
 }
 #[cfg(test)]
 mod tests {
@@ -2911,6 +3453,7 @@ mod tests {
             crate::result_limits::ResultLimits::default(),
             &mut budget,
             &mut in_value_budget,
+            &CorrelatedCtx::disabled(),
         )
         .expect("existence-only scan should succeed");
 
@@ -2967,6 +3510,7 @@ mod tests {
             crate::result_limits::ResultLimits::default(),
             &mut budget,
             &mut in_value_budget,
+            &CorrelatedCtx::disabled(),
         )
         .expect("values scan should succeed");
 

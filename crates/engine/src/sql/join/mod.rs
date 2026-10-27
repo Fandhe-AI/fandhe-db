@@ -61,6 +61,9 @@ mod where_promote;
 // 評価済みセルの比較・述語評価に同じ部品を再利用する（第 2 の比較器を作らない）。
 pub(crate) mod values;
 
+// 相関 `EXISTS` の半結合プローブ（Issue #1842）。`sql::correlated_exists` が組み立てる。
+pub(crate) mod semi;
+
 use std::collections::HashMap;
 
 use crate::catalog::TableSchema;

@@ -450,7 +450,6 @@ fn correlated_subqueries_are_rejected_with_42601() {
         format!("SELECT id FROM {ITEMS} WHERE qty = (SELECT qty FROM {REFS} WHERE label = outer_only LIMIT 1) LIMIT 100"),
         format!("SELECT id FROM {ITEMS} WHERE qty IN (SELECT qty FROM {REFS} WHERE label = outer_only LIMIT 10) LIMIT 100"),
         format!("SELECT id FROM {ITEMS} WHERE qty NOT IN (SELECT qty FROM {REFS} WHERE label = outer_only LIMIT 10) LIMIT 100"),
-        format!("SELECT id FROM {ITEMS} WHERE EXISTS (SELECT id FROM {REFS} WHERE label = outer_only LIMIT 1) LIMIT 100"),
         format!("SELECT id FROM {ITEMS} WHERE NOT EXISTS (SELECT id FROM {REFS} WHERE label = outer_only LIMIT 1) LIMIT 100"),
         // 内側の投影が外側だけにある列を参照する。
         format!("SELECT id FROM {ITEMS} WHERE name IN (SELECT outer_only FROM {REFS} LIMIT 10) LIMIT 100"),
@@ -464,6 +463,16 @@ fn correlated_subqueries_are_rejected_with_42601() {
         assert_eq!(code, "42601", "sql={sql} err={e:?}");
         assert!(e.to_string().contains(corr), "sql={sql} err={e:?}");
     }
+    // 肯定形の相関 `EXISTS` は SQL-61（Issue #1842）で実行できる（`outer_only` は外側だけの列）。
+    // 外側 1 行の `outer_only = 'a'` が内側の `label = 'a'` と一致するため真。
+    assert_eq!(
+        ids(
+            &core,
+            &ctx,
+            &format!("SELECT id FROM {ITEMS} WHERE EXISTS (SELECT id FROM {REFS} WHERE label = outer_only LIMIT 1) LIMIT 100")
+        ),
+        vec![1]
+    );
     // どのスコープにも無い名前は従来どおり 22000（unknown column）。
     let (code, _) = err_code(
         &core,
