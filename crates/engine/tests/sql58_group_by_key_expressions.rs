@@ -472,7 +472,7 @@ fn unsupported_forms_are_rejected_fail_closed() {
         ("GROUP BY 1", "42601"),
         ("GROUP BY upper(nope)", "42703"),
         ("GROUP BY n / 2, n / 2", "42601"),
-        ("GROUP BY n + (SELECT 1)", "42601"),
+        ("GROUP BY n + (SELECT 1)", "0A000"),
         ("GROUP BY n + $1", "42601"),
         ("GROUP BY n / 2 n", "42601"),
         ("GROUP BY CAST(n AS numeric)", "0A000"),

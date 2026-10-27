@@ -9097,6 +9097,34 @@ impl EngineCore {
                     &mut subquery_in_value_budget,
                     &correlated,
                 )?;
+                // Issue #1848・SQL-61: 式の内側に埋め込まれた相関スカラーサブクエリも WHERE 側と同じ
+                // 予算・同じ `read_txn`・同じ `ctx`（RLS 暗黙適用）で内側を 1 回だけ実行し、解決済みの
+                // 値の葉を埋めてから外側を束縛する（WHERE 側の解決が束縛前に走る既存の順序と同じ）。
+                if !validated.embedded_scalar_subqueries.is_empty() {
+                    let embedded = std::mem::take(&mut validated.embedded_scalar_subqueries);
+                    let leaves = crate::sql::subquery::resolve_embedded_scalar_subqueries(
+                        &embedded,
+                        &[&schema],
+                        read_txn,
+                        ctx,
+                        &self.storage,
+                        session.udfs(),
+                        self.group_by_limits,
+                        self.nesting_limits,
+                        limits,
+                        &mut subquery_budget,
+                        &mut subquery_in_value_budget,
+                        &correlated,
+                    )?;
+                    validated.embedded_scalar_subqueries = embedded
+                        .into_iter()
+                        .zip(leaves)
+                        .map(|(mut e, leaf)| {
+                            e.resolved = Some(leaf);
+                            e
+                        })
+                        .collect();
+                }
                 // Issue #1352: 投影位置のスカラーサブクエリは WHERE 側と同じ予算・同じ
                 // `read_txn`・同じ `ctx`（RLS 暗黙適用）で解決し、束縛へは項目を空にして
                 // 渡す。解決結果は外側の走査結果へ SELECT リスト上の位置で合流する。

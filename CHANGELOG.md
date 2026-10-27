@@ -16,6 +16,13 @@
   従来 `0A000` だったが評価される。自己参照の無い `WITH RECURSIVE` は通常 CTE として実行される。`UNION`（重複除去）・
   複数定義・セッション最上位以外の文は `0A000` のまま。詳細は [recursive-cte.md](docs/design/recursive-cte.md)。
   BREAKING CHANGE: 公開 enum `Statement` に variant（`RecursiveCte`）を追加したため、網羅的な `match` は更新が要る。
+- 相関スカラーサブクエリを式の内側で使えるようにする（Issue #1848・SQL-61）。算術・比較・`COALESCE`・`CASE`・関数引数・`CAST` の
+  被演算子として、投影の式項目・WHERE の式述語・スカラー `ORDER BY` の式キーに置ける（`(SELECT max(v) ...) + 1`・
+  `COALESCE((SELECT ...), 0)`・`v > (SELECT ...) * 2`）。該当なしは NULL が式の中で伝播し（集計形の `count` は 0）、結果列の型は
+  内側の結果列の型どおり。非相関の埋め込みは従来どおり `42601`、NUMERIC の結果の算術は `0A000`。
+  挙動変更: `GROUP BY` のキー内のサブクエリを `42601` から `0A000` へ変えた（非相関にも効く）。
+  BREAKING CHANGE: 公開 enum `sql::udf_call::BoundExpr` に variant `CorrelatedScalar` を追加したため、網羅的な `match` は更新が要る。
+  詳細は [sql-subquery.md](docs/design/sql-subquery.md) の「Issue #1848 追記」節。
 - `WITH RECURSIVE` の構文を受理し再帰構造を検証する（Issue #1869・SQL-35。段階 A）。アンカー項と再帰項を
   `UNION [ALL]` で結んだ形の自己参照の位置・回数を検証し、不正な再帰は `42P19`、未対応の形と構造検証を通過した
   文の実行（反復評価は #1870）は `0A000` で拒否する。従来 `42601` だった挙動変更。詳細は [recursive-cte.md](docs/design/recursive-cte.md)。

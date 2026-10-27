@@ -262,7 +262,7 @@ fn group_key_range_end(tokens: &[Token], start: usize) -> usize {
 /// （Issue #1817・SQL-58。[`precheck_aggregate_filter_tokens`] と同じ方針）。汎用の式パーサは
 /// 集計呼び出し・`OVER (...)` を `42601` で落とすため、PostgreSQL と同じ SQLSTATE をここで
 /// 分類する: ウィンドウ関数（`name(...) OVER`）は `42P20`、集計関数呼び出しは `42803`
-/// （判定は OVER を優先）、`$n` と部分クエリは `42601`（Prepared の序数フラグがずれる fail-open
+/// （判定は OVER を優先）、`$n` は `42601`、部分クエリは `0A000`（Issue #1848）（Prepared の序数フラグがずれる fail-open
 /// と、キー式内での不可視行の参照を防ぐ）。
 fn precheck_group_key_tokens(
     tokens: &[Token],
@@ -299,7 +299,9 @@ fn precheck_group_key_tokens(
                     Some(Token::Keyword(Keyword::Select))
                 ) =>
             {
-                return Err(SqlSurfaceError::unsupported(
+                // Issue #1848: 相関スカラーを含むスカラーサブクエリは `GROUP BY` のキーに使えない形
+                // として `0A000`（構文は正しいが未対応）にそろえる。
+                return Err(SqlSurfaceError::feature_not_supported(
                     "subqueries are not supported in GROUP BY expressions",
                 ));
             }
@@ -3790,6 +3792,44 @@ pub(crate) struct ScalarSubqueryItem {
     pub(crate) alias: Option<String>,
 }
 
+/// 広域取得 SELECT の式の内側に埋め込まれたスカラーサブクエリ 1 件（Issue #1848・SQL-61 ポインタ。
+/// `(SELECT ...) + 1`・`COALESCE((SELECT ...), 0)`・`a.v > (SELECT ...) * 2` など）。
+///
+/// 式木側には内部名（[`scalar_subquery_placeholder`]）の `Expr::Ident` を置き、内側の生トークン列
+/// だけをここへ保持する（公開 AST の [`Expr`] を拡張しない。集計の [`aggregate_placeholder`] と同じ
+/// 方式）。`resolved` は `core.rs` の `Statement::Scan` アームが `sql::subquery` で内側を 1 回だけ
+/// 実行して埋める（解決前に束縛へ届いた場合は `sql::parser::bind_scan` が拒否する。fail-closed）。
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct EmbeddedScalarSubquery {
+    pub(crate) inner_tokens: Vec<Token>,
+    /// このサブクエリ自身の入れ子深さ（[`Parser::require_subquery_depth`] の戻り値）。
+    pub(crate) depth: usize,
+    /// 解決済みの値の葉（実行前は `None`）。
+    pub(crate) resolved: Option<crate::sql::correlated_scalar::CorrelatedScalarRef>,
+}
+
+/// 式の内側のスカラーサブクエリの内部名の接頭辞（Issue #1848）。先頭の制御文字は字句解析器が
+/// 受理する識別子では生成できないため、利用者の列名・別名と衝突・すり替えが起きない。
+/// [`AGG_PLACEHOLDER_PREFIX`]・[`GROUP_KEY_EXPR_PLACEHOLDER_PREFIX`] とも別の接頭辞にする。
+const SCALAR_SUBQUERY_PLACEHOLDER_PREFIX: &str = "\u{1}ssq";
+
+/// `j` 番目（[`ValidatedScan::embedded_scalar_subqueries`] の添字）の埋め込みスカラーサブクエリの内部名。
+pub(crate) fn scalar_subquery_placeholder(j: usize) -> String {
+    format!("{SCALAR_SUBQUERY_PLACEHOLDER_PREFIX}{j}")
+}
+
+/// 内部名から埋め込みスカラーサブクエリの添字を取り出す。内部名でなければ `None`。
+pub(crate) fn scalar_subquery_placeholder_index(name: &str) -> Option<usize> {
+    name.strip_prefix(SCALAR_SUBQUERY_PLACEHOLDER_PREFIX)?
+        .parse()
+        .ok()
+}
+
+/// 名前が埋め込みスカラーサブクエリの内部名の接頭辞を持つか（添字が不正でも真。漏えい防止の判定用）。
+pub(crate) fn is_scalar_subquery_placeholder_name(name: &str) -> bool {
+    name.starts_with(SCALAR_SUBQUERY_PLACEHOLDER_PREFIX)
+}
+
 /// 集計 `SELECT` リストの 1 項目（TASK-167・SQL-14 で `AggregateItem` 単独から拡張）。
 /// `GroupKey` は `GROUP BY` 句がある場合にのみ現れ、`GROUP BY` 列と同名の裸の
 /// 識別子（任意で `AS <alias>`）だけを構造上受理する（`allowlist::Parser::parse_select_item`
@@ -4152,6 +4192,10 @@ pub struct ValidatedScan {
     /// [`Self::projection`] はこれらを含まず、`core.rs` が解決して結果列へ合流する
     /// （合流前に束縛へ渡すと `sql::parser::bind_scan` が拒否する）。
     pub(crate) scalar_subquery_items: Vec<ScalarSubqueryItem>,
+    /// 式の内側に埋め込まれたスカラーサブクエリ（Issue #1848）。式木の内部名の識別子
+    /// （[`scalar_subquery_placeholder`]）の添字がこの配列の添字。空なら従来どおり。`core.rs` が解決して
+    /// `resolved` を埋めてから束縛へ渡す（未解決のまま届いた場合は `sql::parser::bind_scan` が拒否する）。
+    pub(crate) embedded_scalar_subqueries: Vec<EmbeddedScalarSubquery>,
     /// 列別名付きビュー（TABLE-41・Issue #1659）の公開名から基底の物理名へ書き換え済みの
     /// `ORDER BY` キーの位置（`order_keys` が空でなければ `order_keys`、空なら `order_by` の添字）。
     /// 束縛段の出力別名解決（`sql::parser::resolve_scan_order_aliases`）はこの位置のキーを
@@ -4165,6 +4209,13 @@ pub struct ValidatedScan {
 }
 
 impl ValidatedScan {
+    /// 値としてのスカラーサブクエリ（投影位置の項目全体形・式の内側への埋め込み形）を 1 件でも
+    /// 持つか。ウィンドウ・EXPLAIN・ビュー本文などの併用拒否の判定が共有する（取りこぼしで
+    /// 黙って列を落とさないため、両形を必ず同時に見る）。
+    pub(crate) fn has_value_subqueries(&self) -> bool {
+        !self.scalar_subquery_items.is_empty() || !self.embedded_scalar_subqueries.is_empty()
+    }
+
     /// FROM に指定され、カタログ存在確認を通過したテーブル名。
     pub fn table_name(&self) -> &str {
         &self.table_name
@@ -5630,6 +5681,15 @@ struct Parser<'a> {
     /// `None` のままなので、これらの位置のサブクエリは従来どおり `42601`。
     /// [`Self::parse_dml_where`] が設定・復元する。
     dml_where_subquery_ctx: Option<usize>,
+    /// 式の内側のスカラーサブクエリ（`( SELECT ...)`。Issue #1848）を受理してよい文脈か。広域取得
+    /// （[`parse_select_shape`]）の投影の式項目・`WHERE` の式述語・スカラー `ORDER BY` の式キーを
+    /// 解析している間だけ、かつ最外側（`subquery_ctx == Some(0)`）でだけ立つ。それ以外
+    /// （CHECK・UDF 本体・`INSERT`・`UPDATE SET`・DML の `WHERE`・`GROUP BY`・`HAVING`・集計の引数・
+    /// 索引式・入れ子の内側・`subquery_ctx == None` の各文脈）は従来どおり `42601`。
+    embedded_scalar_ok: bool,
+    /// 収集した埋め込みスカラーサブクエリ（`(開き括弧のトークン位置, 本体)`）。位置で重複を除く
+    /// （述語の先読みが同じ区間を 2 度解析しても内部名の添字がずれない）。
+    embedded_scalars: Vec<(usize, EmbeddedScalarSubquery)>,
     /// サブクエリ深さ・CTE 定義数の実効上限（Issue #1552）。`Parser::new` の既定は
     /// ハード上限と同値で、セッション SQL のパース入口だけが
     /// [`Self::with_nesting_limits`] で起動時設定値へ差し替える。
@@ -5781,6 +5841,8 @@ impl<'a> Parser<'a> {
             expr_node_budget: MAX_EXPR_NODES,
             subquery_ctx: None,
             dml_where_subquery_ctx: None,
+            embedded_scalar_ok: false,
+            embedded_scalars: Vec::new(),
             nesting_limits: crate::nesting_limits::NestingLimits::default(),
             case_nesting: 0,
             allow_null_literal: false,
@@ -5849,6 +5911,88 @@ impl<'a> Parser<'a> {
     fn with_nesting_limits(mut self, limits: crate::nesting_limits::NestingLimits) -> Self {
         self.nesting_limits = limits;
         self
+    }
+
+    /// `f` を式の内側のスカラーサブクエリ（[`Self::embedded_scalar_ok`]）の受理文脈として実行する
+    /// （Issue #1848）。最外側（`subquery_ctx == Some(0)`）以外では何も変えない。エラー時も元の値へ戻す。
+    fn with_embedded_scalars<T>(
+        &mut self,
+        f: impl FnOnce(&mut Self) -> Result<T, SqlSurfaceError>,
+    ) -> Result<T, SqlSurfaceError> {
+        let prev = self.embedded_scalar_ok;
+        self.embedded_scalar_ok = prev || self.subquery_ctx == Some(0);
+        let r = f(self);
+        self.embedded_scalar_ok = prev;
+        r
+    }
+
+    /// 現在位置が `'(' SELECT` か（消費しない）。
+    fn at_paren_select(&self) -> bool {
+        matches!(self.peek(), Some(Token::Punct('(')))
+            && matches!(
+                self.tokens.get(self.pos.saturating_add(1)),
+                Some(Token::Keyword(Keyword::Select))
+            )
+    }
+
+    /// `'(' SELECT ... ')'` の直後の位置（消費しない。対応する `)` が無ければ `None`）。
+    fn after_paren_select(&self) -> Option<usize> {
+        self.find_matching_close_paren(self.pos)
+            .and_then(|c| c.checked_add(1))
+    }
+
+    /// 埋め込みスカラーサブクエリ 1 件を読み、内部名の識別子へ置き換える（Issue #1848）。現在位置は
+    /// `'(' SELECT`。深さは [`Self::require_subquery_depth`]（超過は `54000`）、件数は
+    /// [`super::subquery::MAX_SUBQUERY_EXECUTIONS`] で頭打ち（超過は `54000`）。内側は切り出した
+    /// トークン列を保持するだけで、検証は実行時に同じ許可リストパーサーが行う。
+    fn parse_embedded_scalar_subquery(&mut self) -> Result<Expr, SqlSurfaceError> {
+        let depth = self.require_subquery_depth()?;
+        let open_idx = self.pos;
+        let close_idx = self.find_matching_close_paren(open_idx).ok_or_else(|| {
+            SqlSurfaceError::unsupported("unmatched parenthesis in scalar subquery")
+        })?;
+        let existing = self
+            .embedded_scalars
+            .iter()
+            .position(|(at, _)| *at == open_idx);
+        let index = match existing {
+            Some(i) => i,
+            None => {
+                if self.embedded_scalars.len() >= super::subquery::MAX_SUBQUERY_EXECUTIONS {
+                    return Err(SqlSurfaceError::payload_too_large(format!(
+                        "subquery execution count exceeds limit {}",
+                        super::subquery::MAX_SUBQUERY_EXECUTIONS
+                    )));
+                }
+                let inner_tokens = self
+                    .tokens
+                    .get(open_idx.saturating_add(1)..close_idx)
+                    .ok_or_else(|| {
+                        SqlSurfaceError::unsupported("malformed scalar subquery boundary")
+                    })?
+                    .to_vec();
+                self.embedded_scalars.push((
+                    open_idx,
+                    EmbeddedScalarSubquery {
+                        inner_tokens,
+                        depth,
+                        resolved: None,
+                    },
+                ));
+                self.embedded_scalars.len().saturating_sub(1)
+            }
+        };
+        self.pos = close_idx.saturating_add(1);
+        self.consume_expr_node()?;
+        Ok(Expr::Ident(scalar_subquery_placeholder(index)))
+    }
+
+    /// 収集済みの埋め込みスカラーサブクエリを取り出す（内部名の添字順）。
+    fn take_embedded_scalars(&mut self) -> Vec<EmbeddedScalarSubquery> {
+        std::mem::take(&mut self.embedded_scalars)
+            .into_iter()
+            .map(|(_, e)| e)
+            .collect()
     }
 
     /// `IN (SELECT ...)`／`EXISTS (SELECT ...)` を検出した位置で呼ぶ。現在の
@@ -6274,6 +6418,13 @@ impl<'a> Parser<'a> {
         // `(n)` ≡ `n`: 別名なしの括弧付き裸識別子は列項目へ戻す（`Projection::Columns` を保つ）。
         // 別名付きは Issue #1540（SQL-42）の契約どおり `Expr::Ident` ＋ `alias` で返す。
         if let Expr::Ident(name) = &expr {
+            // 括弧で囲んだだけのスカラーサブクエリ項目（`((SELECT ...))`。Issue #1848）は、列項目にも別名付きの
+            // 列参照にも写せない（内部名が列名として漏れる）ため、項目全体形（括弧なし）へ誘導して拒否する。
+            if is_scalar_subquery_placeholder_name(name) {
+                return Err(SqlSurfaceError::unsupported(
+                    "a parenthesized scalar subquery cannot be used as a SELECT list item",
+                ));
+            }
             if !has_alias {
                 return Ok(SelectItem::Column(name.clone()));
             }
@@ -6329,7 +6480,14 @@ impl<'a> Parser<'a> {
         let mut scalar_items: Vec<ScalarSubqueryItem> = Vec::new();
         let mut position: usize = 0;
         loop {
-            if self.peek_is_scalar_subquery_start() {
+            // Issue #1848: `( SELECT ... )` の直後が項目の終端（`,`・`FROM`・`AS`・別名）なら従来の
+            // 項目全体形、演算子などが続くなら式の内側への埋め込み（通常の式項目として読み直す）。
+            let whole_item_form = self.peek_is_scalar_subquery_start()
+                && !(self.subquery_ctx == Some(0)
+                    && self
+                        .after_paren_select()
+                        .is_some_and(|at| !self.is_select_item_end_at(at)));
+            if whole_item_form {
                 // Issue #1352: 項目数は構文段でも実行回数上限で頭打ちにする。
                 if scalar_items.len() >= super::subquery::MAX_SUBQUERY_EXECUTIONS {
                     return Err(SqlSurfaceError::payload_too_large(format!(
@@ -6346,7 +6504,8 @@ impl<'a> Parser<'a> {
                 item.position = position;
                 window_items.push(item);
             } else {
-                plain_items.push(self.parse_select_item()?);
+                let item = self.with_embedded_scalars(|p| p.parse_select_item())?;
+                plain_items.push(item);
             }
             position = position
                 .checked_add(1)
@@ -6374,6 +6533,15 @@ impl<'a> Parser<'a> {
             Projection::Items(plain_items)
         };
         Ok((projection, window_items, scalar_items))
+    }
+
+    /// 位置 `at` のトークンが SELECT リスト項目の終端か（`,`・`FROM`・`AS`・文末・`;`・
+    /// 別名の識別子。Issue #1848）。項目全体がスカラーサブクエリの形と、式の内側への埋め込みを区別する。
+    fn is_select_item_end_at(&self, at: usize) -> bool {
+        matches!(
+            self.tokens.get(at),
+            None | Some(Token::Punct(',' | ';') | Token::Keyword(Keyword::From) | Token::Ident(_))
+        )
     }
 
     /// 現在位置が投影位置のスカラーサブクエリ（`'(' SELECT`）の開始かを、消費せず
@@ -9015,6 +9183,22 @@ impl<'a> Parser<'a> {
                 // 深さを検査し、内側の生トークン列だけを保持する。逆向き
                 // （`(SELECT ...) <op> <col>`）・式の内側への埋め込みは本腕に
                 // 一致せず、従来どおり式フォールバックで `42601` になる。
+                //
+                // Issue #1848: 式の内側のスカラーサブクエリを受理する文脈では、閉じ括弧の直後が
+                // 述語の終端でない形（`a.v > (SELECT ...) * 2` など）を式述語へ回す。
+                if self.embedded_scalar_ok {
+                    let after = self
+                        .find_matching_close_paren(open_idx)
+                        .and_then(|c| c.checked_add(1));
+                    let next = after.and_then(|a| self.tokens.get(a));
+                    let ends =
+                        is_where_predicate_boundary_token(next, extra_close_paren, set_operators)
+                            || matches!(next, Some(Token::Ident(w))
+                        if w.eq_ignore_ascii_case("OFFSET") || w.eq_ignore_ascii_case("FETCH"));
+                    if !ends {
+                        return Ok(None);
+                    }
+                }
                 let depth = self.require_subquery_depth()?;
                 let close_idx = self.find_matching_close_paren(open_idx).ok_or_else(|| {
                     SqlSurfaceError::unsupported("unmatched parenthesis in scalar subquery")
@@ -9844,6 +10028,12 @@ impl<'a> Parser<'a> {
                 self.advance();
                 self.consume_expr_node()?;
                 Ok(Expr::String(s))
+            }
+            // 式の内側のスカラーサブクエリ（Issue #1848・SQL-61 ポインタ）。受理文脈
+            // （[`Self::embedded_scalar_ok`]）でだけ内部名の識別子へ置き換える。それ以外の文脈は
+            // 下の一般の括弧式へ進み、`SELECT` で従来どおり `42601` になる。
+            Some(Token::Punct('(')) if self.embedded_scalar_ok && self.at_paren_select() => {
+                self.parse_embedded_scalar_subquery()
             }
             Some(Token::Punct('(')) => {
                 self.advance();
@@ -11001,6 +11191,8 @@ impl<'a> Parser<'a> {
     /// 先読みだけで判定する（`CASE` は次が `WHEN` のときのみ。列名 `case` の後方互換）。
     fn order_key_starts_expression(&self) -> bool {
         match self.peek() {
+            // Issue #1848: 式の内側のスカラーサブクエリを受理する文脈では `( SELECT ...)` 始まりも式キー。
+            Some(Token::Punct('(')) if self.embedded_scalar_ok && self.at_paren_select() => true,
             // Issue #1593: `ORDER BY '2026-10-10'::date`／`1::int`（CAST 形と同じく式キー）。
             Some(Token::StringLiteral(_) | Token::Number(_))
                 if matches!(self.tokens.get(self.pos + 1), Some(Token::TypeCast)) =>
@@ -15857,7 +16049,7 @@ fn check_body_scan(
         }),
         _ => false,
     };
-    if !v.window_items.is_empty() || !v.scalar_subquery_items.is_empty() || computed_items {
+    if !v.window_items.is_empty() || v.has_value_subqueries() || computed_items {
         return Err(body_form_unsupported());
     }
     push_relation(out, &v.table_name);
@@ -18582,6 +18774,8 @@ struct ParsedScanShape {
     order_keys: Vec<ScanOrderKey>,
     /// 投影位置のスカラーサブクエリ（Issue #1352）。
     scalar_subquery_items: Vec<ScalarSubqueryItem>,
+    /// 式の内側に埋め込まれたスカラーサブクエリ（Issue #1848）。
+    embedded_scalar_subqueries: Vec<EmbeddedScalarSubquery>,
     /// `FETCH FIRST n ROWS WITH TIES`（SQL-56 (3)・Issue #1793）。スカラー `ORDER BY` 付き
     /// 広域取得だけが真になりうる（`sql::fetch_clause` が書き換えた正規形を受理する）。
     with_ties: bool,
@@ -20117,6 +20311,7 @@ fn parse_set_branch(
             order_keys: Vec::new(),
             scalar_subquery_items: Vec::new(),
             physical_order_keys: Vec::new(),
+            embedded_scalar_subqueries: Vec::new(),
             with_ties: false,
         },
         super::view::Resolved::View {
@@ -20158,6 +20353,7 @@ fn parse_set_branch(
                 order_keys: Vec::new(),
                 scalar_subquery_items: Vec::new(),
                 physical_order_keys: Vec::new(),
+                embedded_scalar_subqueries: Vec::new(),
                 with_ties: false,
             }
         }
@@ -20616,7 +20812,7 @@ fn parse_select_shape(
 
     let where_predicates = if matches!(p.peek(), Some(Token::Keyword(Keyword::Where))) {
         p.advance();
-        p.parse_where()?
+        p.with_embedded_scalars(|p| p.parse_where())?
     } else {
         Vec::new()
     };
@@ -20638,7 +20834,7 @@ fn parse_select_shape(
                 "window functions cannot be combined with USING PLAN",
             ));
         }
-        if !scalar_subquery_items.is_empty() {
+        if !scalar_subquery_items.is_empty() || !p.embedded_scalars.is_empty() {
             return Err(SqlSurfaceError::unsupported(
                 "scalar subqueries in the SELECT list cannot be combined with USING PLAN",
             ));
@@ -20688,6 +20884,7 @@ fn parse_select_shape(
         let offset = p.parse_optional_offset()?.unwrap_or(0);
 
         p.expect_end_of_statement()?;
+        check_embedded_scalar_shape(&p, &window_items, scalar_subquery_items.len())?;
 
         return Ok(ParsedSelect::Scan(ParsedScanShape {
             table_name,
@@ -20699,6 +20896,7 @@ fn parse_select_shape(
             window_items,
             order_keys: Vec::new(),
             scalar_subquery_items,
+            embedded_scalar_subqueries: p.take_embedded_scalars(),
             with_ties: false,
         }));
     }
@@ -20733,14 +20931,14 @@ fn parse_select_shape(
             "window functions cannot be combined with vector ORDER BY",
         ));
     }
-    if is_vector_ranking && !scalar_subquery_items.is_empty() {
+    if is_vector_ranking && (!scalar_subquery_items.is_empty() || !p.embedded_scalars.is_empty()) {
         return Err(SqlSurfaceError::unsupported(
             "scalar subqueries in the SELECT list cannot be combined with vector ORDER BY",
         ));
     }
 
     if !is_vector_ranking {
-        let scan_keys = p.parse_scalar_order_by()?;
+        let scan_keys = p.with_embedded_scalars(|p| p.parse_scalar_order_by())?;
         let (order_by, order_keys) = split_scan_order_keys(scan_keys);
         // Issue #1188: 式キーの `ORDER BY` とウィンドウ関数の併用は非対応（Issue #1189 で
         // 併用可能になったのは列名キーのみ。`sql::window` の出力順計算は列キーだけを扱う）。
@@ -20772,7 +20970,8 @@ fn parse_select_shape(
         if with_ties
             && (subquery_ctx.is_some_and(|d| d > 0)
                 || !window_items.is_empty()
-                || !scalar_subquery_items.is_empty())
+                || !scalar_subquery_items.is_empty()
+                || !p.embedded_scalars.is_empty())
         {
             return Err(SqlSurfaceError::feature_not_supported(
                 "WITH TIES is not supported in a subquery or with window functions or scalar subqueries",
@@ -20792,6 +20991,7 @@ fn parse_select_shape(
         // しない。上のベクトル順位付け経路と同じ「取得モード・評価順の余地を
         // 持たない」契約——§受入基準 3）。
         p.expect_end_of_statement()?;
+        check_embedded_scalar_shape(&p, &window_items, scalar_subquery_items.len())?;
 
         return Ok(ParsedSelect::Scan(ParsedScanShape {
             table_name,
@@ -20804,10 +21004,16 @@ fn parse_select_shape(
             window_items,
             order_keys,
             scalar_subquery_items,
+            embedded_scalar_subqueries: p.take_embedded_scalars(),
             with_ties,
         }));
     }
 
+    if !p.embedded_scalars.is_empty() {
+        return Err(SqlSurfaceError::unsupported(
+            "scalar subqueries inside expressions cannot be combined with vector ORDER BY",
+        ));
+    }
     let order_by = p.parse_order_by()?;
 
     p.expect_keyword(Keyword::Limit)?;
@@ -20831,6 +21037,33 @@ fn parse_select_shape(
         evaluation_order,
         using_plan: None,
     }))
+}
+
+/// 式の内側のスカラーサブクエリ（Issue #1848）の併用制限を検査する。ウィンドウ項目とは併用できず
+/// （ウィンドウ実行は結果列を独自に組み立てる）、項目全体形との合計は実行回数上限
+/// （[`super::subquery::MAX_SUBQUERY_EXECUTIONS`]）で頭打ちにする。
+fn check_embedded_scalar_shape(
+    p: &Parser<'_>,
+    window_items: &[WindowSelectItem],
+    whole_item_count: usize,
+) -> Result<(), SqlSurfaceError> {
+    if p.embedded_scalars.is_empty() {
+        return Ok(());
+    }
+    if !window_items.is_empty() {
+        return Err(SqlSurfaceError::unsupported(
+            "scalar subqueries inside expressions cannot be combined with window functions",
+        ));
+    }
+    if whole_item_count.saturating_add(p.embedded_scalars.len())
+        > super::subquery::MAX_SUBQUERY_EXECUTIONS
+    {
+        return Err(SqlSurfaceError::payload_too_large(format!(
+            "subquery execution count exceeds limit {}",
+            super::subquery::MAX_SUBQUERY_EXECUTIONS
+        )));
+    }
+    Ok(())
 }
 
 /// SQL/JSON 問い合わせ関数の名前（大小無視）から種別を引く（Issue #2187）。
@@ -21518,6 +21751,7 @@ fn build_scan_from_resolved(
             order_keys,
             scalar_subquery_items,
             physical_order_keys: Vec::new(),
+            embedded_scalar_subqueries: Vec::new(),
             with_ties: false,
         }),
         super::view::Resolved::View {
@@ -21587,6 +21821,7 @@ fn build_scan_from_resolved(
                 order_keys,
                 scalar_subquery_items,
                 physical_order_keys,
+                embedded_scalar_subqueries: Vec::new(),
                 with_ties: false,
             })
         }
@@ -21677,7 +21912,10 @@ fn buffered_scan_statement(
             "WITH TIES is not supported over a view with an aggregate/LIMIT body",
         ));
     }
-    if !shape.scalar_subquery_items.is_empty() || matches!(shape.projection, Projection::Items(_)) {
+    if !shape.scalar_subquery_items.is_empty()
+        || !shape.embedded_scalar_subqueries.is_empty()
+        || matches!(shape.projection, Projection::Items(_))
+    {
         return Err(SqlSurfaceError::unsupported(
             "a view with an aggregate/LIMIT body supports only column projections, declarative WHERE, ORDER BY, window functions and aggregates",
         ));
@@ -22700,7 +22938,7 @@ fn validate_sql_tokens_impl(
                 // も返しうるが、`sql::explain` 側に対応する記述がなくレビュー
                 // 未了のため、ここで明示的に `42601` へ倒す。
                 Statement::Scan(v)
-                    if !v.window_items.is_empty() || !v.scalar_subquery_items.is_empty() =>
+                    if !v.window_items.is_empty() || v.has_value_subqueries() =>
                 {
                     return Err(SqlSurfaceError::unsupported(
                         "EXPLAIN is not supported for window function queries",
@@ -22995,6 +23233,16 @@ fn validate_select_statement(
             if let super::view::Resolved::Buffered { view_name, body } = resolved {
                 return buffered_scan_statement(view_name, body, shape);
             }
+            // Issue #1848: 式の内側のスカラーサブクエリは実テーブル直接の参照だけが対象。ビュー・CTE 越しは
+            // 外側の述語・列名の書き換え（公開名 → 物理名）と相関列の対応を保証できないため `0A000`。
+            if !shape.embedded_scalar_subqueries.is_empty()
+                && !matches!(resolved, super::view::Resolved::Table)
+            {
+                return Err(SqlSurfaceError::feature_not_supported(
+                    "scalar subqueries inside expressions are not supported over a view",
+                ));
+            }
+            let embedded_scalar_subqueries = shape.embedded_scalar_subqueries;
             let mut scan = build_scan_from_resolved(
                 shape.table_name,
                 resolved,
@@ -23008,6 +23256,7 @@ fn validate_select_statement(
                 shape.scalar_subquery_items,
             )?;
             scan.with_ties = shape.with_ties;
+            scan.embedded_scalar_subqueries = embedded_scalar_subqueries;
             Ok(Statement::Scan(scan))
         }
     }
@@ -24686,6 +24935,7 @@ fn validate_copy_table_to_tokens(
         order_keys: Vec::new(),
         scalar_subquery_items: Vec::new(),
         physical_order_keys: Vec::new(),
+        embedded_scalar_subqueries: Vec::new(),
         with_ties: false,
     };
     Ok(CopyStatement::To(ValidatedCopyTo {
@@ -32069,7 +32319,7 @@ mod tests {
         assert_eq!(check("row_number() OVER ()"), "42P20");
         assert_eq!(check("sum(n) OVER ()"), "42P20");
         assert_eq!(check("n + $1"), "42601");
-        assert_eq!(check("n + (SELECT 1)"), "42601");
+        assert_eq!(check("n + (SELECT 1)"), "0A000");
         let ok = lexer::tokenize("upper(lang) || 'x'").expect("tokenize");
         assert!(precheck_group_key_tokens(&ok, 0, ok.len()).is_ok());
     }
@@ -32209,7 +32459,7 @@ mod tests {
             ("ROLLUP(count(*))".to_string(), "42803"),
             ("ROLLUP($1)".to_string(), "42601"),
             ("ROLLUP(1)".to_string(), "42601"),
-            ("ROLLUP((SELECT 1))".to_string(), "42601"),
+            ("ROLLUP((SELECT 1))".to_string(), "0A000"),
             ("(a, b)".to_string(), "42601"),
             ("a, a".to_string(), "42601"),
             ("DISTINCT a".to_string(), "42601"),
@@ -36418,6 +36668,139 @@ mod tests {
             "WITH x AS (SELECT id FROM documents) SELECT * FROM x WHERE id = 'lit' LIMIT 10",
             &lookup,
         );
+    }
+
+    // --- Issue #1848・SQL-61: 式の内側のスカラーサブクエリ --------------------------------
+
+    /// 最外側の文脈（`subquery_ctx == Some(0)`）で広域取得を検証する。
+    fn scan_with_ctx0(
+        sql: &str,
+        lookup: &impl TableLookup,
+    ) -> Result<ValidatedScan, SqlSurfaceError> {
+        let tokens = lexer::tokenize(sql).expect("tokenize");
+        match validate_sql_tokens_with_subquery_ctx(&tokens, lookup, 0)? {
+            Statement::Scan(scan) => Ok(scan),
+            other => panic!("expected Statement::Scan, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn embedded_scalar_subqueries_become_placeholders_in_projection_where_and_order_by() {
+        let lookup = catalog_with(&["documents"]);
+        let scan = scan_with_ctx0(
+            "SELECT id, (SELECT max(v) FROM b WHERE b.k = documents.k) + 1 FROM documents \
+             WHERE n > (SELECT count(*) FROM b WHERE b.k = documents.k) * 2 \
+             ORDER BY COALESCE((SELECT max(v) FROM b WHERE b.k = documents.k), 0) LIMIT 5",
+            &lookup,
+        )
+        .expect("embedded forms are accepted at the outermost context");
+        // 内側は 3 件（出現順）。式木側は内部名の識別子で、利用者の識別子とは衝突しない。
+        assert_eq!(scan.embedded_scalar_subqueries.len(), 3);
+        assert!(scan.scalar_subquery_items.is_empty());
+        assert!(scan
+            .embedded_scalar_subqueries
+            .iter()
+            .all(|e| e.resolved.is_none()));
+        let Projection::Items(items) = scan.projection() else {
+            panic!("expected expression items");
+        };
+        let SelectItem::Expr {
+            expr: Expr::Binary { lhs, .. },
+            ..
+        } = &items[1]
+        else {
+            panic!("expected a binary expression item, got {:?}", items[1]);
+        };
+        assert_eq!(**lhs, Expr::Ident(scalar_subquery_placeholder(0)));
+        assert_eq!(
+            scalar_subquery_placeholder_index(&scalar_subquery_placeholder(7)),
+            Some(7)
+        );
+        assert_eq!(scalar_subquery_placeholder_index("v"), None);
+        assert!(is_scalar_subquery_placeholder_name(
+            &scalar_subquery_placeholder(0)
+        ));
+        assert!(!is_scalar_subquery_placeholder_name("ssq0"));
+        // 予約内部名は他の内部名と衝突しない。
+        assert_ne!(scalar_subquery_placeholder(0), aggregate_placeholder(0));
+        assert_ne!(
+            scalar_subquery_placeholder(0),
+            group_key_expr_placeholder(0)
+        );
+        assert_eq!(
+            aggregate_placeholder_index(&scalar_subquery_placeholder(0)),
+            None
+        );
+    }
+
+    #[test]
+    fn existing_whole_item_and_column_compare_forms_keep_their_ast() {
+        let lookup = catalog_with(&["documents"]);
+        // 項目全体形（`( SELECT ...) [AS alias]`）は従来どおり `scalar_subquery_items`。
+        let scan = scan_with_ctx0(
+            "SELECT id, (SELECT max(v) FROM b WHERE b.k = documents.k) AS m FROM documents LIMIT 5",
+            &lookup,
+        )
+        .expect("whole-item form");
+        assert_eq!(scan.scalar_subquery_items.len(), 1);
+        assert!(scan.embedded_scalar_subqueries.is_empty());
+        // `col <op> (SELECT ...)` が述語の終端なら従来どおり `ScalarSubqueryCompare`。
+        let scan = scan_with_ctx0(
+            "SELECT id FROM documents WHERE n > (SELECT max(v) FROM b WHERE b.k = documents.k) \
+             AND id > 1 LIMIT 5",
+            &lookup,
+        )
+        .expect("column compare form");
+        assert!(scan.embedded_scalar_subqueries.is_empty());
+        assert!(matches!(
+            scan.where_predicates().first(),
+            Some(WherePredicate::ScalarSubqueryCompare { .. })
+        ));
+    }
+
+    #[test]
+    fn embedded_scalar_subqueries_are_rejected_outside_the_outermost_scan_context() {
+        let lookup = catalog_with(&["documents"]);
+        let item =
+            "SELECT id, (SELECT max(v) FROM b WHERE b.k = documents.k) + 1 FROM documents LIMIT 5";
+        let cond = "SELECT id FROM documents WHERE n > (SELECT max(v) FROM b) * 2 LIMIT 5";
+        // サブクエリを許可しない文脈（`subquery_ctx == None`）は従来どおり 42601。
+        for sql in [item, cond] {
+            let e = validate_sql(sql, &lookup).expect_err(sql);
+            assert_eq!(e.wire_code(), "42601", "{sql}");
+        }
+        // 入れ子の内側（`subquery_ctx > 0`）でも受理しない。
+        let tokens = lexer::tokenize(item).expect("tokenize");
+        let e = validate_sql_tokens_with_subquery_ctx(&tokens, &lookup, 1).expect_err(item);
+        assert_eq!(e.wire_code(), "42601");
+        // ウィンドウ関数・ランキング付き検索 SELECT との併用は 42601。
+        for sql in [
+            "SELECT id, row_number() OVER (), (SELECT max(v) FROM b) + 1 FROM documents LIMIT 5",
+            "SELECT id FROM documents WHERE n > (SELECT max(v) FROM b) * 2 \
+             ORDER BY embedding <=> '[0.1,0.2]' LIMIT 5",
+        ] {
+            let e = scan_with_ctx0(sql, &lookup).expect_err(sql);
+            assert_eq!(e.wire_code(), "42601", "{sql}");
+        }
+    }
+
+    #[test]
+    fn embedded_scalar_subqueries_respect_the_execution_count_limit() {
+        let lookup = catalog_with(&["documents"]);
+        let one = "(SELECT max(v) FROM b WHERE b.k = documents.k)";
+        let terms = vec![one; super::super::subquery::MAX_SUBQUERY_EXECUTIONS + 1].join(" + ");
+        let sql = format!("SELECT id, {terms} FROM documents LIMIT 5");
+        let e = scan_with_ctx0(&sql, &lookup).expect_err("over the count limit");
+        assert_eq!(e.wire_code(), "54000");
+        let terms = vec![one; super::super::subquery::MAX_SUBQUERY_EXECUTIONS].join(" + ");
+        let sql = format!("SELECT id, {terms} FROM documents LIMIT 5");
+        scan_with_ctx0(&sql, &lookup).expect("at the count limit");
+    }
+
+    #[test]
+    fn reserved_placeholder_names_cannot_be_written_by_users() {
+        // 先頭が制御文字の識別子は、引用形でも字句段が拒否する（内部名のすり替えができない）。
+        assert!(lexer::tokenize("SELECT \"\u{1}ssq0\" FROM documents LIMIT 1").is_err());
     }
 }
 
