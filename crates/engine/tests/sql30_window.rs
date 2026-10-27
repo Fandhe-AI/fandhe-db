@@ -1182,7 +1182,7 @@ fn rejects_unknown_window_function_name() {
     expect_rejected(
         &core,
         &ctx,
-        "SELECT id, LAG(score) OVER (ORDER BY score) FROM docs LIMIT 10",
+        "SELECT id, no_such_window_fn(score) OVER (ORDER BY score) FROM docs LIMIT 10",
         "42601",
     );
 }
