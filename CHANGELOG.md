@@ -9,6 +9,8 @@
 
 ### Added
 
+- CTE 本文のデータ変更文（`WITH x AS (DELETE ... RETURNING ...)` 等）の構文を受理し、本文の解析と `RETURNING` の公開列の確定までを行う（Issue #1875・SQL-63）。
+  実行は未対応のため、検証を通過した文も `0A000` で拒否する（従来は `42601`）。書き込みは発生しない。詳細は [data-modifying-cte.md](docs/design/data-modifying-cte.md)。
 - CTE の `MATERIALIZED`／`NOT MATERIALIZED` を受理する（Issue #1858・SQL-62 (3)）。評価方式の指定として読み捨て、結果は変わらない。
   従来 `42601` で拒否していた構文が受理される挙動変更。詳細は [cte.md](docs/design/cte.md)。
 - CTE の列名リスト `WITH x(a, b) AS (...)` を受理する（Issue #1857・SQL-62 (2)）。出力列へ先頭から順に名前を付け、短いリストは残りを元の名前のまま受理する。
