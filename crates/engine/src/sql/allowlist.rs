@@ -21592,7 +21592,10 @@ fn materialized_cte_statement(
     )
     .ok()?;
     let body_table = body.table_name().to_string();
-    let body_projection = def.body.projection.clone();
+    // 列別名つき CTE／ビュー越しの本文は、`build_scan_from_resolved` が公開名を基底表の物理列名へ
+    // 書き換えた後の投影で判定する（未解決の `def.body.projection` は別名のままで、基底表の
+    // `unevaluable_columns` と一致しない。Issue #1860 レビュー指摘）。
+    let body_projection = body.projection.clone();
     let body = Box::new(Statement::Scan(body));
     let view_name = def.name.clone();
     let stmt = match main {

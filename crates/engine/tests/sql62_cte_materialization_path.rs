@@ -387,3 +387,17 @@ fn real_id_column_star_body_falls_back_to_inline() {
     assert!(!plain.rows.is_empty());
     assert_eq!(render(&mat), render(&plain));
 }
+
+/// 先行 CTE が VECTOR 列を改名（列別名）して本文が改名後の名前で読む形も、具体化後は参照不能列に
+/// なるため、基底表の物理列へ対応づけて判定しインライン展開へ戻る（Issue #1860 レビュー指摘）。
+#[test]
+fn renamed_vector_column_through_cte_falls_back_to_inline() {
+    let (core, _g) = open_with(None);
+    let template =
+        "WITH a(e, l) AS (SELECT embedding, lang FROM docs), b AS {h}(SELECT e, l FROM a) \
+                    SELECT e FROM b WHERE l = 'ja' LIMIT 2";
+    let plain = query(&core, "alice", &template.replace("{h}", "")).expect("plain");
+    let mat = query(&core, "alice", &template.replace("{h}", "MATERIALIZED "))
+        .expect("fallback must succeed");
+    assert_eq!(render(&mat), render(&plain));
+}
