@@ -139,8 +139,64 @@ impl RowBudget {
         self.scratch = 0;
     }
 
-    /// 1 行（`cells`）を保持する前に計上する。超過は `54000`。
+    /// 行 1 件の構造体ぶん（`ResultRow` 本体＋セル配列）のバイト数。
+    fn row_overhead(ncols: usize) -> usize {
+        ncols
+            .saturating_mul(std::mem::size_of::<Cell>())
+            .saturating_add(std::mem::size_of::<ResultRow>())
+    }
+
+    /// 全確保経路の合計に対する残りバイトの見積もり（式セルの生成上限に渡す）。
+    fn headroom(&self) -> usize {
+        self.remaining()
+    }
+
+    /// `bytes` を確保する **前** に計上する（唯一の計上点）。超過は `54000`（計上は変えない）。
+    fn reserve(&mut self, bytes: usize, charge: Charge) -> Result<(), SqlSurfaceError> {
+        let total = self
+            .total()
+            .checked_add(bytes)
+            .filter(|n| *n <= self.limits.max_bytes)
+            .ok_or_else(|| {
+                SqlSurfaceError::payload_too_large(
+                    "recursive query exceeds the shared result byte budget",
+                )
+            })?;
+        let _ = total;
+        match charge {
+            Charge::Retained => self.retained = self.retained.saturating_add(bytes),
+            Charge::Fixed => self.fixed = self.fixed.saturating_add(bytes),
+            Charge::Scratch => self.scratch = self.scratch.saturating_add(bytes),
+        }
+        Ok(())
+    }
+
+    /// 行を 1 件作る前に、行数上限（結果へ残る行のみ）と構造体ぶんのバイトを計上する。
+    fn reserve_row(&mut self, ncols: usize, charge: Charge) -> Result<(), SqlSurfaceError> {
+        if charge == Charge::Retained {
+            let rows = self
+                .rows
+                .checked_add(1)
+                .filter(|n| *n <= self.limits.max_rows)
+                .ok_or_else(|| {
+                    SqlSurfaceError::payload_too_large("recursive query exceeds the row limit")
+                })?;
+            self.reserve(Self::row_overhead(ncols), charge)?;
+            self.rows = rows;
+            Ok(())
+        } else {
+            self.reserve(Self::row_overhead(ncols), charge)
+        }
+    }
+
+    /// すでに実体化済みの行（アンカーの結果・基底表の走査結果・JOIN の出力。いずれも上流が残予算を
+    /// 上限として生成済みで、所有権ごと移して複製しない）を保持する計上。超過は `54000`。
     fn admit(&mut self, cells: &[Cell], charge: Charge) -> Result<(), SqlSurfaceError> {
+        let payload = cells
+            .iter()
+            .fold(0usize, |acc, c| acc.saturating_add(cell_payload_bytes(c)));
+        let bytes = Self::row_overhead(cells.len()).saturating_add(payload);
+        // 行数・バイトの両方を検査してから、まとめて計上する（片方だけ計上された状態を残さない）。
         let rows = if charge == Charge::Retained {
             self.rows
                 .checked_add(1)
@@ -151,28 +207,8 @@ impl RowBudget {
         } else {
             self.rows
         };
-        let payload = cells
-            .iter()
-            .fold(0usize, |acc, c| acc.saturating_add(cell_payload_bytes(c)));
-        let row_bytes = cells
-            .len()
-            .saturating_mul(std::mem::size_of::<Cell>())
-            .saturating_add(std::mem::size_of::<ResultRow>())
-            .saturating_add(payload);
-        self.total()
-            .checked_add(row_bytes)
-            .filter(|n| *n <= self.limits.max_bytes)
-            .ok_or_else(|| {
-                SqlSurfaceError::payload_too_large(
-                    "recursive query exceeds the shared result byte budget",
-                )
-            })?;
+        self.reserve(bytes, charge)?;
         self.rows = rows;
-        match charge {
-            Charge::Retained => self.retained = self.retained.saturating_add(row_bytes),
-            Charge::Fixed => self.fixed = self.fixed.saturating_add(row_bytes),
-            Charge::Scratch => self.scratch = self.scratch.saturating_add(row_bytes),
-        }
         Ok(())
     }
 }
@@ -243,6 +279,70 @@ impl ScanTerm {
             .collect()
     }
 
+    /// 作業表・結果に入る 1 行を作る唯一の処理。確保の順序を固定する: (1) 行の構造体ぶんと各セルの
+    /// ペイロードを、借用セルから見積もって共有予算へ **確保前に** 計上する（超過は `54000`）、
+    /// (2) 計上が通った後でのみ `clone`／`into_owned` する、(3) 式セルは共有予算の残りを上限として
+    /// `computed_value_to_cell` へ渡し、生成したバイトを同じ予算へ計上する。Scan 版・JOIN の作業表側の
+    /// どちらもここを通る。
+    fn build_row(
+        &self,
+        types: &[Option<ColumnType>],
+        row: &ResultRow,
+        scanned: &[Option<crate::row_codec::ScalarRef<'_>>],
+        budget: &mut RowBudget,
+        charge: Charge,
+        proj_scratch: &mut Vec<StackValue>,
+    ) -> Result<Vec<Cell>, SqlSurfaceError> {
+        budget.reserve_row(self.bound.projection.len(), charge)?;
+        let mut cells: Vec<Cell> = Vec::new();
+        cells
+            .try_reserve_exact(self.bound.projection.len())
+            .map_err(|_| {
+                SqlSurfaceError::payload_too_large("recursive query exceeds the row limit")
+            })?;
+        for (i, col) in self.bound.projection.iter().enumerate() {
+            match col {
+                ProjectedColumn::Column { index, .. } => {
+                    let cell = row
+                        .cells
+                        .get(*index)
+                        .ok_or_else(|| internal("projected column index out of range"))?;
+                    // (1) 借用セルから見積もって計上（複製の前）。
+                    budget.reserve(cell_payload_bytes(cell), charge)?;
+                    // (2) 計上後にだけ複製する。`id` 型の列は元のセル（`u64`）のまま運ぶ。
+                    let is_id = self.id_cols.get(*index).copied().unwrap_or(false);
+                    cells.push(match types.get(*index) {
+                        Some(Some(_)) if is_id => cell.clone(),
+                        Some(Some(ty)) => normalize_cell(cell, ty)?.into_owned(),
+                        _ => cell.clone(),
+                    });
+                }
+                ProjectedColumn::Computed { result_ty, .. } => {
+                    let program = self
+                        .programs
+                        .get(i)
+                        .and_then(|p| p.as_ref())
+                        .ok_or_else(|| internal("computed projection program missing"))?;
+                    let value = program.eval(0, &[], scanned, proj_scratch)?;
+                    // (3) 共有予算の残りを上限にセルを生成し（確保前に超過を検査）、実バイトを計上する。
+                    let mut cell_bytes = 0usize;
+                    let cell = crate::sql::scan::computed_value_to_cell(
+                        value,
+                        result_ty.as_ref(),
+                        &mut cell_bytes,
+                        budget.headroom(),
+                    )?;
+                    budget.reserve(cell_payload_bytes(&cell), charge)?;
+                    cells.push(cell);
+                }
+                ProjectedColumn::Id | ProjectedColumn::AliasedId { .. } => {
+                    return Err(internal("pseudo column in the recursive reference"));
+                }
+            }
+        }
+        Ok(cells)
+    }
+
     /// 作業表の行 `rows` に `WHERE` と射影を適用した行を返す。1 行ごとに、結果へ加える前に
     /// `budget` で行数・バイト数を判定する（超過は `54000`。部分結果は返さない）。
     fn eval_over_rows(
@@ -255,61 +355,35 @@ impl ScanTerm {
         let referenced = vec![true; types.len()];
         let mut where_scratch: Vec<StackValue> = Vec::new();
         let mut proj_scratch: Vec<StackValue> = Vec::new();
-        let mut cell_bytes = 0usize;
         let mut out: Vec<ResultRow> = Vec::new();
         for (n, row) in rows.iter().enumerate() {
             if n % 1024 == 0 {
                 crate::interrupt::check()?;
             }
-            let cells =
-                with_scanned(types, &referenced, row, |scanned| {
-                    if !where_matches_for_row(
-                        &self.bound.metadata_filters,
-                        &self.bound.or_filters,
-                        &self.bound.expr_filter_programs,
-                        scanned,
-                        0,
-                        &mut where_scratch,
-                    )? {
-                        return Ok(None);
-                    }
-                    let mut cells: Vec<Cell> = Vec::with_capacity(self.bound.projection.len());
-                    for (i, col) in self.bound.projection.iter().enumerate() {
-                        match col {
-                            ProjectedColumn::Column { index, .. } => {
-                                let cell = row.cells.get(*index).ok_or_else(|| {
-                                    internal("projected column index out of range")
-                                })?;
-                                let is_id = self.id_cols.get(*index).copied().unwrap_or(false);
-                                cells.push(match types.get(*index) {
-                                    // 直接の結果行の `id` 型の列は元のセル（`u64`）のまま運ぶ。
-                                    Some(Some(_)) if is_id => cell.clone(),
-                                    Some(Some(ty)) => normalize_cell(cell, ty)?.into_owned(),
-                                    _ => cell.clone(),
-                                });
-                            }
-                            ProjectedColumn::Computed { result_ty, .. } => {
-                                let program =
-                                    self.programs.get(i).and_then(|p| p.as_ref()).ok_or_else(
-                                        || internal("computed projection program missing"),
-                                    )?;
-                                let value = program.eval(0, &[], scanned, &mut proj_scratch)?;
-                                cells.push(crate::sql::scan::computed_value_to_cell(
-                                    value,
-                                    result_ty.as_ref(),
-                                    &mut cell_bytes,
-                                    budget.limits.max_bytes,
-                                )?);
-                            }
-                            ProjectedColumn::Id | ProjectedColumn::AliasedId { .. } => {
-                                return Err(internal("pseudo column in the recursive reference"));
-                            }
-                        }
-                    }
-                    Ok(Some(cells))
-                })?;
+            let cells = with_scanned(types, &referenced, row, |scanned| {
+                if !where_matches_for_row(
+                    &self.bound.metadata_filters,
+                    &self.bound.or_filters,
+                    &self.bound.expr_filter_programs,
+                    scanned,
+                    0,
+                    &mut where_scratch,
+                )? {
+                    return Ok(None);
+                }
+                Ok(Some(self.build_row(
+                    types,
+                    row,
+                    scanned,
+                    budget,
+                    charge,
+                    &mut proj_scratch,
+                )?))
+            })?;
             if let Some(cells) = cells {
-                budget.admit(&cells, charge)?;
+                out.try_reserve(1).map_err(|_| {
+                    SqlSurfaceError::payload_too_large("recursive query exceeds the row limit")
+                })?;
                 out.push(ResultRow {
                     id: 0,
                     score: 0.0,
@@ -881,5 +955,112 @@ mod tests {
         // 十分なバイト予算では、バイト予算が原因では拒否されない（行数・反復の上限が先に効く）。
         let err = run(usize::MAX / 2).expect_err("row or iteration limit");
         assert!(!format!("{err:?}").contains("byte budget"), "{err:?}");
+    }
+
+    /// 確保の順序（見積もり → 計上 → 複製）: 残予算に入らない行は、計上の段階で `54000` になり、
+    /// 計上済みの量は変わらない（複製・生成に進まない）。
+    #[test]
+    fn reserve_refuses_before_any_allocation_and_keeps_the_accounting() {
+        let cells = text_cells(10_000);
+        let need = RowBudget::row_overhead(1) + cell_payload_bytes(&cells[0]);
+        let mut b = RowBudget::new(limits(need - 1));
+        // 行の構造体は入るが、ペイロード（借用セルからの見積もり）が入らない。
+        b.reserve_row(1, Charge::Retained).unwrap();
+        let before = b.retained;
+        let err = b
+            .reserve(cell_payload_bytes(&cells[0]), Charge::Retained)
+            .unwrap_err();
+        assert_eq!(err.wire_code(), "54000");
+        assert_eq!(b.retained, before);
+        // 式セルの生成上限は残予算（全体上限ではない）。残予算を超えるテキストは確保前に拒否される。
+        let mut produced = 0usize;
+        let value = crate::sql::udf_call::ExprValue::Text(std::borrow::Cow::Borrowed(
+            "y".repeat(10_000).leak(),
+        ));
+        let err = crate::sql::scan::computed_value_to_cell(
+            value,
+            Some(&ColumnType::Text),
+            &mut produced,
+            b.headroom(),
+        )
+        .unwrap_err();
+        assert_eq!(err.wire_code(), "54000");
+        assert_eq!(produced, 0);
+    }
+
+    /// 保持量が上限近くのとき、大きな TEXT の直接射影・式射影（連結）は `54000` になる
+    /// （Scan 版の作業表の射影。確保前の見積もり・残予算での生成上限は上の単体テストが固定する）。
+    #[test]
+    fn large_text_projection_near_the_limit_is_refused() {
+        use crate::core::{EngineCore, ParsedSql};
+        use crate::kernel::CpuScalarProvider;
+        use crate::policy::PolicyContext;
+        use crate::sql::allowlist::Statement;
+        use crate::sql::exec::QueryResult;
+        use crate::storage::{Storage, Visibility};
+        use crate::test_util::temp_db::{unique_db_path, CleanupGuard};
+
+        let path = unique_db_path("recursive-eval-text-budget");
+        let _cleanup = CleanupGuard(path.clone());
+        let storage = Storage::open(&path).expect("open storage");
+        let core = EngineCore::from_storage(storage, Box::new(CpuScalarProvider));
+        let ctx = PolicyContext::with_visibilities("t1", [Visibility::Public]).expect("ctx");
+        let big = "z".repeat(200_000);
+        let anchor_cells = vec![Cell::Text(big)];
+        let anchor_bytes = {
+            let mut b = RowBudget::new(limits(usize::MAX));
+            b.admit(&anchor_cells, Charge::Retained).unwrap();
+            b.retained
+        };
+        let read_txn = {
+            use redb::ReadableDatabase;
+            core.storage_for_test().db().begin_read().unwrap()
+        };
+        let udfs = UdfRegistry::default();
+        let join_limits = JoinLimits::default();
+        let schemas: HashMap<String, TableSchema> = HashMap::new();
+        for body in [
+            "SELECT t FROM r WHERE 1 = 1",
+            "SELECT CONCAT(t, t) FROM r WHERE 1 = 1",
+        ] {
+            let sql = format!(
+                "WITH RECURSIVE r(t) AS (SELECT CAST('a' AS TEXT) UNION ALL {body}) SELECT t FROM r"
+            );
+            let parsed = core.parse_sql(&sql).expect("parse");
+            let ParsedSql::Statement(Statement::BufferedView(view)) = &parsed else {
+                panic!("expected a buffered view");
+            };
+            let Statement::RecursiveCte(cte) = &*view.body else {
+                panic!("expected a recursive cte");
+            };
+            let anchor = QueryResult {
+                columns: vec![ColumnMeta::Scalar {
+                    name: "t".to_string(),
+                    ty: ColumnType::Text,
+                }],
+                rows: vec![ResultRow {
+                    id: 0,
+                    score: 0.0,
+                    cells: anchor_cells.clone(),
+                }],
+            };
+            // 保持量（アンカー 1 行）に、もう 1 行ぶん（直接射影は同じ大きさ、連結は 2 倍）は入らない。
+            let err = execute(
+                &read_txn,
+                &ctx,
+                cte,
+                anchor,
+                &schemas,
+                &udfs,
+                &join_limits,
+                RecursiveLimits {
+                    max_iterations: 5,
+                    max_rows: 1_000,
+                    max_bytes: anchor_bytes + 150_000,
+                },
+            )
+            .expect_err("must be refused");
+            assert_eq!(err.wire_code(), "54000", "{body}: {err:?}");
+        }
     }
 }
