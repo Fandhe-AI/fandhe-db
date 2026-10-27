@@ -100,8 +100,9 @@ fn setup() -> (EngineCore, PolicyContext, CleanupGuard) {
 fn sql61_qualified_outer_refs_reach_binding_and_fail_closed_as_correlated() {
     let (core, ctx, _g) = setup();
     for sql in [
-        // 肯定形の相関 `EXISTS` は SQL-61（Issue #1842）で実行できる
-        // （`tests/sql61_correlated_exists.rs`）。反結合（#1843）も同様。ここでは #1844 の範囲を固定する。
+        // 相関 `EXISTS`（Issue #1842）・反結合（#1843）・`LIMIT` なしの相関 `IN`／`NOT IN`（#1844）は
+        // 実行できる（`tests/sql61_correlated_exists.rs`・`tests/sql61_correlated_in.rs`）。ここでは
+        // 明示 `LIMIT` 付きの相関 `IN`（集合の帰属が変わるため fail-closed）と相関スカラーを固定する。
         "SELECT id FROM docs x WHERE lang IN (SELECT lang FROM refs WHERE x.id = 1 LIMIT 10) LIMIT 10",
         "SELECT id FROM docs x WHERE lang NOT IN (SELECT lang FROM refs WHERE x.id = 1 LIMIT 10) LIMIT 10",
         "SELECT id FROM docs x WHERE lang = (SELECT lang FROM refs WHERE x.id = id LIMIT 1) LIMIT 10",
@@ -159,7 +160,7 @@ fn sql61_unqualified_outer_only_column_is_correlated() {
         ),
         vec![1, 2]
     );
-    // 未対応の相関 `IN`（#1844）は引き続き 42601。
+    // 明示 `LIMIT` 付きの相関 `IN` は集合の帰属を変えるため引き続き 42601（fail-closed）。
     let (code, msg) = err(
         &core,
         &ctx,
@@ -167,6 +168,47 @@ fn sql61_unqualified_outer_only_column_is_correlated() {
     );
     assert_eq!(code, "42601");
     assert!(msg.contains("correlated"), "{msg}");
+    // `LIMIT` を外せば実行できる（Issue #1844）。`outer_only` は全行 NULL で相関条件は真にならず、
+    // 内側の集合 S は常に空: `IN` は偽、`NOT IN` は S が空のため真。
+    assert_eq!(
+        ids(
+            &core,
+            &ctx,
+            "SELECT id FROM docs WHERE lang IN (SELECT lang FROM refs WHERE lang = outer_only) LIMIT 10"
+        ),
+        Vec::<u64>::new()
+    );
+    assert_eq!(
+        ids(
+            &core,
+            &ctx,
+            "SELECT id FROM docs WHERE lang NOT IN (SELECT lang FROM refs WHERE lang = outer_only) LIMIT 10"
+        ),
+        vec![1, 2]
+    );
+}
+
+#[test]
+fn sql61_correlated_in_without_limit_is_executed() {
+    // docs は {1: en, 2: ja}、refs は {1: en}。相関 `IN` は半結合、`NOT IN` は反結合
+    // （refs.lang に NULL は無いので `NOT IN` は一致なしの行が返る）。
+    let (core, ctx, _g) = setup();
+    assert_eq!(
+        ids(
+            &core,
+            &ctx,
+            "SELECT id FROM docs x WHERE lang IN (SELECT lang FROM refs WHERE lang = x.lang) LIMIT 10"
+        ),
+        vec![1]
+    );
+    assert_eq!(
+        ids(
+            &core,
+            &ctx,
+            "SELECT id FROM docs x WHERE lang NOT IN (SELECT lang FROM refs WHERE lang = x.lang) LIMIT 10"
+        ),
+        vec![2]
+    );
 }
 
 #[test]
