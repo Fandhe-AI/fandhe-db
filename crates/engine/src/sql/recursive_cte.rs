@@ -191,12 +191,19 @@ fn depth0_words(tokens: &[Token], words: &[&str]) -> Vec<usize> {
     out
 }
 
-/// 再帰項の外側を囲む括弧を繰り返し剥がす。戻り値は（内側, 括弧を剥がしたか, 括弧の後ろに
-/// 深さ 0 の `ORDER BY`／`LIMIT`／`OFFSET`／`FETCH` が続いていたか）。後ろの句は項の区切りとして
-/// 扱い、項本体を部分クエリと誤判定させない（SQL-35 の判定順序: 構文 → 構造 → 機能ゲート）。
-fn peel_term(mut tokens: &[Token]) -> (&[Token], bool, bool) {
+/// 再帰項の外側を囲む括弧を繰り返し剥がす。戻り値は（内側, 括弧を剥がしたか, 本文全体に掛かる
+/// 後続句の有無, 括弧内に属する後続句の有無）。括弧の後ろに続く `ORDER BY`／`LIMIT`／`OFFSET`／
+/// `FETCH` は捨てず、括弧内側と連結して構文を検証する（`42601`）。最外の後続句は本文全体の句
+/// （機能ゲート `0A000`）、さらに外側の括弧に包まれた後続句は再帰項自身の句（`42P19`）として
+/// 区別する（SQL-35 の判定順序: 構文 → 構造 → 機能ゲート）。
+fn peel_term(
+    mut tokens: &[Token],
+    limits: NestingLimits,
+) -> Result<(&[Token], bool, bool, bool), SqlSurfaceError> {
     let mut wrapped = false;
     let mut trailing = false;
+    let mut inner_clause = false;
+    let mut tails: Vec<&[Token]> = Vec::new();
     while matches!(tokens.first(), Some(Token::Punct('('))) {
         let Ok((inner, after)) = split_parenthesized(tokens) else {
             break;
@@ -207,14 +214,27 @@ fn peel_term(mut tokens: &[Token]) -> (&[Token], bool, bool) {
         ) || is_word(after.first(), "OFFSET")
             || is_word(after.first(), "FETCH");
         if after.is_empty() || tail_clause {
-            trailing |= tail_clause;
+            if tail_clause {
+                tails.push(after);
+                if wrapped {
+                    inner_clause = true;
+                } else {
+                    trailing = true;
+                }
+            }
             wrapped = true;
             tokens = inner;
         } else {
             break;
         }
     }
-    (tokens, wrapped, trailing)
+    // 後続句は最内の項と連結して構文だけを検証する（値の欠落などは `42601`）。
+    for tail in tails {
+        let mut joined = tokens.to_vec();
+        joined.extend_from_slice(tail);
+        structural(&joined, limits)?;
+    }
+    Ok((tokens, wrapped, trailing, inner_clause))
 }
 
 fn structural(tokens: &[Token], limits: NestingLimits) -> Result<Statement, SqlSurfaceError> {
@@ -305,7 +325,7 @@ fn validate_recursive_body(
 
     // 判定順序は構文 → 再帰構造 → 機能ゲート。構造判定の前に各項の構文を検証する。
     structural(anchor, limits)?;
-    let (term, wrapped, trailing) = peel_term(recursive);
+    let (term, wrapped, trailing, inner_clause) = peel_term(recursive, limits)?;
     let stmt = structural(term, limits)?;
 
     if !relation_refs(anchor, name).is_empty() {
@@ -329,7 +349,7 @@ fn validate_recursive_body(
     }
     let clauses = !depth0_words(term, &["ORDER", "LIMIT", "OFFSET", "FETCH"]).is_empty();
     // 括弧で囲んだ再帰項の内側の句は項自身の句（`OFFSET 0` も句の存在で判定）で `42P19`。
-    if wrapped && clauses {
+    if inner_clause || (wrapped && clauses) {
         return Err(bad(
             "LIMIT, OFFSET and ORDER BY are not allowed in a recursive term",
         ));
@@ -457,6 +477,7 @@ mod tests {
             "WITH RECURSIVE t(n) AS (SELECT 1 UNION ALL SELECT count(*) FROM t) SELECT n FROM t",
             "WITH RECURSIVE t(n) AS (SELECT 1 UNION ALL (SELECT n FROM t LIMIT 1)) SELECT n FROM t",
             "WITH RECURSIVE t(n) AS (SELECT 1 UNION ALL (SELECT n FROM t OFFSET 0)) SELECT n FROM t",
+            "WITH RECURSIVE t(n) AS (SELECT 1 UNION ALL ((SELECT n FROM t) LIMIT 1)) SELECT n FROM t",
             "WITH RECURSIVE t(n) AS (SELECT 1 UNION ALL (SELECT d.n FROM docs d JOIN t ON d.n = t.n OFFSET 0)) SELECT n FROM t",
             "WITH RECURSIVE t(n) AS (SELECT n FROM t) SELECT n FROM t",
         ] {
@@ -491,6 +512,8 @@ mod tests {
             "WITH RECURSIVE t(n) AS (SELECT FROM t UNION ALL SELECT n FROM t) SELECT 1",
             "WITH RECURSIVE t(n) AS (SELECT 1 UNION ALL SELECT FROM t) SELECT 1",
             "WITH RECURSIVE t AS (SELECT 1), t AS (SELECT 2) SELECT 1",
+            "WITH RECURSIVE t(n) AS (SELECT 1 UNION ALL (SELECT n FROM t) LIMIT) SELECT n FROM t",
+            "WITH RECURSIVE t(n) AS (SELECT 1 UNION ALL (SELECT n FROM t) ORDER BY) SELECT n FROM t",
             "WITH RECURSIVE t() AS (SELECT 1) SELECT 1",
             "WITH RECURSIVE t AS (SELECT 1) DELETE FROM docs",
         ] {
