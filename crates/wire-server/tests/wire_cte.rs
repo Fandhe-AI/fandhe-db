@@ -108,8 +108,9 @@ fn wire_cte_rejected_forms_report_expected_sqlstate_and_keep_connection_usable()
     let mut stream = authenticate_to_ready_for_query(addr, "alice", "correct-horse");
 
     let cases: &[(&str, &str)] = &[
+        // `UNION`（重複除去）の再帰は #1872 まで機能ゲートの `0A000`。
         (
-            "WITH RECURSIVE r AS (SELECT id FROM docs) SELECT id FROM r LIMIT 10",
+            "WITH RECURSIVE r(n) AS (SELECT 1 UNION SELECT n + 1 FROM r WHERE n < 3) SELECT n FROM r",
             "0A000",
         ),
         // SQL-35・Issue #1869: 不正な再帰（アンカー項に自己参照）は `42P19`。
@@ -117,10 +118,10 @@ fn wire_cte_rejected_forms_report_expected_sqlstate_and_keep_connection_usable()
             "WITH RECURSIVE r(n) AS (SELECT n FROM r UNION ALL SELECT id FROM docs) SELECT n FROM r",
             "42P19",
         ),
-        // 構造検証を通過した再帰形は評価未実装の `0A000`（反復評価は #1870）。
+        // 反復上限（暫定 1000 回）を超える再帰は部分結果を返さず `54000`（SQL-35・Issue #1870）。
         (
-            "WITH RECURSIVE r(n) AS (SELECT 1 UNION ALL SELECT n + 1 FROM r WHERE n < 3) SELECT n FROM r",
-            "0A000",
+            "WITH RECURSIVE r(n) AS (SELECT 1 UNION ALL SELECT n + 1 FROM r) SELECT n FROM r",
+            "54000",
         ),
         (
             "WITH x AS (SELECT id FROM ghost) SELECT id FROM x LIMIT 10",
@@ -216,6 +217,89 @@ fn wire_cte_read_applies_reader_session_rls() {
     let tag = read_command_complete(&mut bob_stream);
     assert_eq!(tag, "SELECT 1");
     read_ready_for_query(&mut bob_stream);
+}
+
+const RECURSIVE_SEQUENCE: &str =
+    "WITH RECURSIVE r(n) AS (SELECT 1 UNION ALL SELECT n + 1 FROM r WHERE n < 3) SELECT n FROM r";
+
+/// SQL-35・Issue #1870: 再帰 CTE（数列）の簡易クエリ。反復評価の結果が行として返る。
+#[test]
+fn wire_recursive_cte_simple_query_returns_sequence() {
+    let (core, _guard) = new_core_with_docs_table();
+    let users_path = write_user_store_file(&[("alice", "tenant-a", "correct-horse")]);
+    let store = UserStore::load_from_file(&users_path).expect("valid user store");
+    let addr = spawn_server_with_engine_and_store(store, core);
+    let mut stream = authenticate_to_ready_for_query(addr, "alice", "correct-horse");
+
+    send_simple_query(&mut stream, RECURSIVE_SEQUENCE);
+    let columns = read_row_description(&mut stream);
+    assert_eq!(columns, vec!["n".to_string()]);
+    for expected in ["1", "2", "3"] {
+        let row = read_data_row(&mut stream);
+        assert_eq!(row, vec![Some(expected.to_string())]);
+    }
+    let tag = read_command_complete(&mut stream);
+    assert_eq!(tag, "SELECT 3");
+    read_ready_for_query(&mut stream);
+}
+
+/// SQL-35・Issue #1870: 拡張クエリ（Parse／Bind／Describe／Execute）でも再帰 CTE が評価され、
+/// Describe の列は Execute の `RowDescription` と一致する。
+#[test]
+fn wire_recursive_cte_extended_query_describes_and_executes() {
+    let (core, _guard) = new_core_with_docs_table();
+    let users_path = write_user_store_file(&[("alice", "tenant-a", "correct-horse")]);
+    let store = UserStore::load_from_file(&users_path).expect("valid user store");
+    let addr = spawn_server_with_engine_and_store(store, core);
+    let mut stream = authenticate_to_ready_for_query(addr, "alice", "correct-horse");
+
+    send_length_prefixed_message(&mut stream, b'P', &parse_body("s1", RECURSIVE_SEQUENCE, 0));
+    let (kind, body) = read_message(&mut stream);
+    assert_eq!(
+        kind,
+        b'1',
+        "ParseComplete: {}",
+        String::from_utf8_lossy(&body)
+    );
+    send_length_prefixed_message(&mut stream, b'B', &bind_body("p1", "s1"));
+    let (kind, _) = read_message(&mut stream);
+    assert_eq!(kind, b'2', "BindComplete");
+    let mut describe = vec![b'P'];
+    describe.extend_from_slice(b"p1\0");
+    send_length_prefixed_message(&mut stream, b'D', &describe);
+    let (kind, described) = read_message(&mut stream);
+    assert_eq!(kind, b'T', "RowDescription from Describe");
+    send_length_prefixed_message(&mut stream, b'E', &execute_body("p1", 0));
+    let mut data_rows = 0;
+    loop {
+        let (kind, body) = read_message(&mut stream);
+        match kind {
+            b'D' => data_rows += 1,
+            b'C' => {
+                assert_eq!(body, b"SELECT 3\0");
+                break;
+            }
+            other => panic!("unexpected message {other}"),
+        }
+    }
+    assert_eq!(data_rows, 3);
+    send_length_prefixed_message(&mut stream, b'S', b"");
+    let (kind, _) = read_message(&mut stream);
+    assert_eq!(kind, b'Z');
+
+    // 簡易クエリの RowDescription と、Describe が返した RowDescription は一致する。
+    send_simple_query(&mut stream, RECURSIVE_SEQUENCE);
+    let mut simple_description = Vec::new();
+    let (kind, body) = read_message(&mut stream);
+    assert_eq!(kind, b'T');
+    simple_description.extend_from_slice(&body);
+    assert_eq!(simple_description, described);
+    loop {
+        let (kind, _) = read_message(&mut stream);
+        if kind == b'Z' {
+            break;
+        }
+    }
 }
 // ---- データ変更 CTE の実行（SQL-63・Issue #1876）----
 

@@ -269,6 +269,31 @@ pub(super) fn op_holds(op: BinOp, ord: Ordering) -> bool {
     }
 }
 
+/// [`cell_scalar`] が値へ写せる列型か（作業表など、実行時にセルを述語・式へ渡す経路が、
+/// 未対応型を計画時に固定 `0A000` で拒否するための唯一の判定。`cell_scalar` の腕と同じ集合で、
+/// 単体テストが両者の一致を固定する）。`VECTOR`・`ARRAY` は述語・式へ渡さない列として別扱い。
+pub(crate) fn cell_scalar_supports(ty: &ColumnType) -> bool {
+    matches!(
+        ty,
+        ColumnType::Text
+            | ColumnType::Varchar(_)
+            | ColumnType::Bpchar(_)
+            | ColumnType::Enum(_)
+            | ColumnType::SmallInt
+            | ColumnType::Integer
+            | ColumnType::BigInt
+            | ColumnType::Real
+            | ColumnType::Double
+            | ColumnType::Boolean
+            | ColumnType::Date
+            | ColumnType::Timestamp
+            | ColumnType::Numeric { .. }
+            | ColumnType::Uuid
+            | ColumnType::Bytea
+            | ColumnType::Json
+    )
+}
+
 /// 述語束縛・集計の観測器が期待する借用形（[`ScalarRef`]）へ [`Cell`] を写像する
 /// アダプタ。`ty` は列の宣言型（`Cell::SignedInteger` が `INTEGER` か `BIGINT` か、
 /// `Cell::Float` が `REAL` か `DOUBLE` か、`Cell::Text` が `TEXT` か `ENUM` かは
@@ -415,6 +440,43 @@ mod tests {
             .expect_err("mismatch");
         assert_eq!(err.wire_code(), "XX000");
         assert!(key_cell_from_scalar(&ScalarRef::Double(1.0), &JoinKeyClass::Integer).is_err());
+    }
+
+    /// `cell_scalar_supports` が false の型は、どの型付きセルでも `cell_scalar` が拒否する。
+    #[test]
+    fn cell_scalar_supports_matches_adapter() {
+        let unsupported = [
+            ColumnType::Time,
+            ColumnType::TimestampTz,
+            ColumnType::Interval,
+            ColumnType::Jsonb,
+        ];
+        let cells = [
+            Cell::SignedInteger(1),
+            Cell::Text("x".to_string()),
+            Cell::Bool(true),
+            Cell::Float(1.0),
+        ];
+        for ty in &unsupported {
+            assert!(!cell_scalar_supports(ty));
+            for cell in &cells {
+                assert!(cell_scalar(cell, ty).is_err(), "{ty:?}");
+            }
+        }
+        for ty in [
+            ColumnType::Text,
+            ColumnType::SmallInt,
+            ColumnType::Integer,
+            ColumnType::BigInt,
+            ColumnType::Boolean,
+            ColumnType::Date,
+            ColumnType::Timestamp,
+            ColumnType::Uuid,
+            ColumnType::Bytea,
+            ColumnType::Json,
+        ] {
+            assert!(cell_scalar_supports(&ty));
+        }
     }
 
     #[test]

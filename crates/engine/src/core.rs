@@ -2148,8 +2148,22 @@ fn buffered_body_tables(stmt: &crate::sql::allowlist::Statement, out: &mut Vec<S
         Statement::Join(v) => out.extend(crate::sql::join::collect_join_tables(v)),
         Statement::SetOperation(v) => crate::sql::set_op::collect_branch_tables(&v.tree, out),
         Statement::BufferedView(v) => buffered_body_tables(&v.body, out),
+        Statement::RecursiveCte(v) => recursive_cte_tables(v, out),
         _ => {}
     }
+}
+
+/// 再帰 CTE（SQL-35・Issue #1870）が実際に読む基底表の名前を集める。再帰項が読む CTE 名自身は
+/// 含めない（同名の実表をストレージから引いてしまうと、CTE が実表に隠れる規則に反する）。
+fn recursive_cte_tables(v: &crate::sql::allowlist::ValidatedRecursiveCte, out: &mut Vec<String>) {
+    buffered_body_tables(&v.anchor, out);
+    let mut recursive = Vec::new();
+    buffered_body_tables(&v.recursive, &mut recursive);
+    out.extend(
+        recursive
+            .into_iter()
+            .filter(|t| !t.eq_ignore_ascii_case(&v.name)),
+    );
 }
 
 /// 評価後射影形ビューの本文が非バイト列順の照合（ICU）の列を持つテーブルを参照し、かつ外側が
@@ -4206,6 +4220,13 @@ impl EngineCore {
             crate::sql::allowlist::Statement::MaterializedView(_) => {
                 Err(crate::sql::allowlist::SqlSurfaceError::Internal {
                     detail: "unexpected materialized view statement".to_string(),
+                })
+            }
+            // SQL-35・Issue #1870: 再帰 CTE は `BufferedView` の本文としてのみ現れ、単独の文としては
+            // 生成されない（防御的に fail-closed）。
+            crate::sql::allowlist::Statement::RecursiveCte(_) => {
+                Err(crate::sql::allowlist::SqlSurfaceError::Internal {
+                    detail: "unexpected recursive CTE statement".to_string(),
                 })
             }
             stmt @ (crate::sql::allowlist::Statement::Join(_)
@@ -7753,6 +7774,7 @@ impl EngineCore {
             | Statement::ShowSearchPath
             | Statement::CreateFunction { .. }
             | Statement::MaterializedView(_)
+            | Statement::RecursiveCte(_)
             | Statement::ConstSelect(_) => Err(crate::sql::allowlist::SqlSurfaceError::Internal {
                 detail: "unexpected statement in transactional read path".to_string(),
             }),
@@ -8093,6 +8115,59 @@ impl EngineCore {
             }
         }
         Ok(())
+    }
+
+    /// 再帰 CTE（SQL-35・Issue #1870）の静的検証と結果列の導出（行は読まない）。アンカー項の結果列を
+    /// 導出し、再帰項の束縛・列整合・型・照合の検査を [`crate::sql::recursive_eval::describe`] で行う。
+    /// Describe の結果列導出と、Execute のアンカー実行前の事前検証が共有する唯一の実装で、
+    /// 静的に決まるエラー（`42804`・`0A000` 等）がデータ依存の実行エラー（アンカー本文の除算エラー等）より
+    /// 先に決まり、両経路で同じエラーになる。
+    fn describe_recursive_cte(
+        &self,
+        session: &crate::sql::mode::SessionState,
+        validated: &crate::sql::allowlist::ValidatedRecursiveCte,
+        skip_vector_literal_validation: bool,
+        limits: &crate::result_limits::ResultLimits,
+    ) -> Result<Vec<crate::sql::exec::ColumnMeta>, crate::sql::allowlist::SqlSurfaceError> {
+        // 定数アンカーの `current_schema()` 系は、通常の定数 SELECT が張る検索パスのスコープ外で実行
+        // されるため未対応（Execute の実行本体の前提）。Describe と Execute が同じ `0A000` になるよう
+        // 共有経路で拒否する。
+        if let crate::sql::allowlist::Statement::ConstSelect(c) = &*validated.anchor {
+            if crate::sql::const_select::uses_schema_fn(c) {
+                return Err(
+                    crate::sql::allowlist::SqlSurfaceError::feature_not_supported(
+                        "current_schema() in the anchor term of WITH RECURSIVE is not supported",
+                    ),
+                );
+            }
+        }
+        let anchor_parsed = ParsedSql::Statement((*validated.anchor).clone());
+        let anchor_columns = self
+            .describe_parsed_in_session_impl(
+                session,
+                &anchor_parsed,
+                skip_vector_literal_validation,
+                &[],
+                limits,
+            )?
+            .ok_or_else(|| crate::sql::allowlist::SqlSurfaceError::Internal {
+                detail: "internal error".to_string(),
+            })?;
+        let mut table_names = Vec::new();
+        recursive_cte_tables(validated, &mut table_names);
+        let (_read_txn, schemas) = self.read_txn_with_schemas(&table_names)?;
+        let join_limits = crate::sql::join::JoinLimits::from_settings(
+            self.group_by_limits,
+            self.join_limits,
+            *limits,
+        );
+        crate::sql::recursive_eval::describe(
+            validated,
+            &anchor_columns,
+            &schemas,
+            session.udfs(),
+            &join_limits,
+        )
     }
 
     /// [`Self::describe_parsed_in_session`]／[`Self::describe_prepared_in_session`]
@@ -8488,6 +8563,18 @@ impl EngineCore {
             // Describe では判定しない（本体を実行しない契約）。
             ParsedSql::Statement(Statement::MaterializedView(v)) => {
                 Ok(Some(crate::sql::matview::describe_columns(v)))
+            }
+            // SQL-35・Issue #1870: 再帰 CTE。アンカー項の結果列を（本文は実行せずに）導出し、
+            // 再帰項の束縛・列整合の検査だけを行う（Execute と同じ `recursive_eval` の計画を通る
+            // ため、束縛エラーが両経路で一致する）。
+            ParsedSql::Statement(Statement::RecursiveCte(validated)) => {
+                let columns = self.describe_recursive_cte(
+                    session,
+                    validated,
+                    skip_vector_literal_validation,
+                    limits,
+                )?;
+                Ok(Some(columns))
             }
             // Issue #1192（TABLE-18）: 評価後射影形ビュー。本文の結果列を
             // （本文は実行せずに）導出し、外側の射影だけを適用する。
@@ -9029,6 +9116,12 @@ impl EngineCore {
                     detail: "unexpected materialized view statement".to_string(),
                 })
             }
+            // SQL-35・Issue #1870: 再帰 CTE も `BufferedView` の本文としてのみ現れる（防御的に fail-closed）。
+            crate::sql::allowlist::Statement::RecursiveCte(_) => {
+                Err(crate::sql::allowlist::SqlSurfaceError::Internal {
+                    detail: "unexpected recursive CTE statement".to_string(),
+                })
+            }
         }
     }
 
@@ -9374,6 +9467,58 @@ impl EngineCore {
                         detail: "internal error".to_string(),
                     }),
                 }
+            }
+            // SQL-35・Issue #1870: 再帰 CTE。アンカー項を実行して最初の作業表とし、再帰項を
+            // 作業表が空になるまで反復する（`sql::recursive_eval`）。基底表の読み取りは参照者自身の
+            // `ctx`・同一の `read_txn`（単一スナップショット）で既存の走査経路を通る（RLS 暗黙適用）。
+            // 外側の WHERE・ORDER BY・射影・集計・LIMIT は呼び出し元の `BufferedView` 腕が適用する。
+            crate::sql::allowlist::Statement::RecursiveCte(validated) => {
+                // 静的に決まるエラー（アンカーの束縛・再帰項の束縛・列数・型・照合・未対応型）は、アンカーを
+                // 実行する前に Describe と同じ経路で検査する（データ依存の実行エラーに覆われない。
+                // Describe／Execute で同じエラー）。
+                self.describe_recursive_cte(&*session, &validated, false, &limits)?;
+                let anchor = match &*validated.anchor {
+                    // `FROM` なし定数式はセッション UDF レジストリを要する専用の実行本体を持つ
+                    // （`execute_read_statement_with_limits` の対象外）。
+                    crate::sql::allowlist::Statement::ConstSelect(c) => {
+                        crate::sql::const_select::run(c, session.udfs())?
+                    }
+                    other => match self.execute_read_statement_with_limits(
+                        ctx,
+                        session,
+                        other.clone(),
+                        read_txn,
+                        limits,
+                    )? {
+                        crate::sql::SqlOutcome::Query(result) => result,
+                        _ => {
+                            return Err(crate::sql::allowlist::SqlSurfaceError::Internal {
+                                detail: "internal error".to_string(),
+                            })
+                        }
+                    },
+                };
+                let mut table_names = Vec::new();
+                recursive_cte_tables(&validated, &mut table_names);
+                let schemas = table_schemas_in(read_txn, &table_names)?;
+                let join_limits = crate::sql::join::JoinLimits::from_settings(
+                    self.group_by_limits,
+                    self.join_limits,
+                    limits,
+                );
+                let result = crate::sql::recursive_eval::execute(
+                    read_txn,
+                    ctx,
+                    &validated,
+                    anchor,
+                    &schemas,
+                    session.udfs(),
+                    &join_limits,
+                    crate::sql::recursive_eval::RecursiveLimits::with_result_cap(
+                        limits.max_result_rows(),
+                    ),
+                )?;
+                Ok(crate::sql::SqlOutcome::Query(result))
             }
             // TABLE-42・Issue #1664: matview の葉。読み手の `ctx`（RLS 暗黙適用と同じ文脈）に
             // 完全一致する文脈の実体だけを、同一の `read_txn`（単一スナップショット）から読む。

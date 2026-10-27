@@ -237,7 +237,7 @@ pub(crate) fn plan_outer_parts(
 
 /// 本文の結果列を先頭から `aliases` で改名した列メタデータを返す（型・値は変えない）。
 /// 別名が結果列より多ければ `42601`（作成時の突合と参照時の列数変化の双方を塞ぐ。fail-closed）。
-fn rename_body_columns(
+pub(crate) fn rename_body_columns(
     body_columns: &[ColumnMeta],
     aliases: &[String],
 ) -> Result<Vec<ColumnMeta>, SqlSurfaceError> {
@@ -594,7 +594,7 @@ fn evaluable_type(meta: &ColumnMeta) -> Option<&ColumnType> {
 /// 型を作る。合成スキーマに載らない列（`id` メタ・型なし列・`VECTOR`／`ARRAY`）は到達できない
 /// プレースホルダ名にして、参照を束縛段の `22000` で拒否する（ビューが公開していない物理
 /// キーでの絞り込みや、型の取り違えを作らない）。
-fn synth_schema(
+pub(crate) fn synth_schema(
     view_name: &str,
     body_columns: &[ColumnMeta],
 ) -> (TableSchema, Vec<Option<ColumnType>>) {
@@ -773,7 +773,10 @@ fn plan_order(
 /// 述語アダプタ（`cell_scalar`）は `BIGINT` に符号付き整数、`NUMERIC` に十進数しか
 /// 受け付けない。変換できない値は `22003`（黙って NULL にしない）。それ以外のセルは
 /// そのまま通す（不整合は `cell_scalar` が `Internal` で拒否する）。
-fn normalize_cell<'a>(cell: &'a Cell, ty: &ColumnType) -> Result<Cow<'a, Cell>, SqlSurfaceError> {
+pub(crate) fn normalize_cell<'a>(
+    cell: &'a Cell,
+    ty: &ColumnType,
+) -> Result<Cow<'a, Cell>, SqlSurfaceError> {
     let Cell::Integer(u) = cell else {
         return Ok(Cow::Borrowed(cell));
     };
@@ -795,7 +798,7 @@ fn normalize_cell<'a>(cell: &'a Cell, ty: &ColumnType) -> Result<Cow<'a, Cell>, 
 /// （`i64::MAX` 超の `COUNT` 等が未参照列にあっても、その列を使わない外側を `22003` で
 /// 失敗させない）。疑似列 `id` は合成スキーマの実列（本文が公開する `id` 結果列）としてだけ
 /// 参照でき、本文の行 id は述語・式に渡さない。
-fn with_scanned<T>(
+pub(crate) fn with_scanned<T>(
     types: &[Option<ColumnType>],
     referenced: &[bool],
     row: &ResultRow,

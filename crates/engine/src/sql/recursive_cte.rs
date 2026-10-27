@@ -1,14 +1,16 @@
-//! `WITH RECURSIVE` の構文受理と再帰構造の検証（段階 A。SQL-35、Issue #1869）。
+//! `WITH RECURSIVE` の構文受理と再帰構造の検証（段階 A。SQL-35、Issue #1869）と、再帰項の検証用 lookup（段階 B）。
 //!
 //! 責務境界: `sql::allowlist::validate_sql_tokens_impl` の `WITH` 分岐が、先頭の
 //! `RECURSIVE` を検出した時点で本モジュールの [`validate_recursive_with`] へ分岐する
 //! （非再帰経路の `sql::cte::resolve_relation` へは一切流さない。流すと自己参照が同名の
-//! 実テーブルへ黙って解決されるため）。本モジュールは次の 2 つだけを担う。
+//! 実テーブルへ黙って解決されるため）。本モジュールは次の 3 つを担う。
 //!
 //! 1. 構文の受理: アンカー項（非再帰項）と再帰項を `UNION [ALL]` で結んだ形の切り出し
 //! 2. 再帰構造の検証: 自己参照の位置・回数（SQL-35 (2)・ERR-6 の `42P19`）
+//! 3. 再帰項の検証用 [`RecursiveTermLookup`]（Issue #1870）: CTE 名だけを作業表として解決する
 //!
-//! 反復評価は #1870 の担当で、本モジュールを通過した文も呼び出し元が一律 `0A000` で終える。
+//! 検証を通過した文の組み立て（アンカー項・再帰項の実カタログ検証と主クエリの重ね合わせ）は
+//! `sql::allowlist::recursive_cte_statement`、反復評価は `sql::recursive_eval` が担う。
 //! 判定順序は ①構文（`42601`）→ ②再帰構造（`42P19`）→ ③機能ゲート（`0A000`）。構造検証は
 //! カタログを照会しない [`StructuralOnlyLookup`] で行うため、同名の実テーブルや他テナントの
 //! 表の有無で wire_code が変わらない（存在オラクルを作らない。RLS-10 (b)）。
@@ -20,14 +22,13 @@ use super::allowlist::{
     is_set_operator_ident, set_operator_is_followed_by_branch, split_parenthesized,
     split_recursive_with_clause, validate_data_modifying_cte_syntax,
     validate_sql_tokens_with_subquery_ctx_limits, JoinKind, SqlSurfaceError, Statement,
-    StructuralOnlyLookup,
+    StructuralOnlyLookup, TableLookup,
 };
 use super::lexer::{Keyword, Token};
 use crate::nesting_limits::NestingLimits;
 
 /// 検証済みの `WITH RECURSIVE` 句（トークン列のみ保持。#1870 の反復評価器が消費する）。
 #[derive(Debug, Clone, PartialEq)]
-#[allow(dead_code)] // #1870（反復評価器）が消費する
 pub(crate) struct RecursiveWithClause {
     pub(crate) defs: Vec<RecursiveCteDef>,
     pub(crate) main_tokens: Vec<Token>,
@@ -35,7 +36,6 @@ pub(crate) struct RecursiveWithClause {
 
 /// 1 件の CTE 定義（`name [(列名...)] AS (本文)`）。
 #[derive(Debug, Clone, PartialEq)]
-#[allow(dead_code)] // #1870（反復評価器）が消費する
 pub(crate) struct RecursiveCteDef {
     pub(crate) name: String,
     pub(crate) column_aliases: Vec<String>,
@@ -44,7 +44,6 @@ pub(crate) struct RecursiveCteDef {
 
 /// CTE 本文の種別。
 #[derive(Debug, Clone, PartialEq)]
-#[allow(dead_code)] // #1870（反復評価器）が消費する
 pub(crate) enum RecursiveCteBody {
     /// 自己参照を持たない本文。
     NonRecursive { tokens: Vec<Token> },
@@ -780,6 +779,97 @@ fn check_recursive_term(name: &str, stmt: &Statement) -> Result<(), SqlSurfaceEr
     }
 }
 
+/// 再帰項の検証専用の `TableLookup`（SQL-35・Issue #1870）。CTE 名だけを「実在する表（ビューではない）」
+/// として解決し、それ以外は実カタログ `inner` へ委譲する。同名の実表・ビューは CTE 名に隠される
+/// （PostgreSQL と同じシャドーイング）ため、CTE 名について実表の列集合・照合・ビュー定義を
+/// 一切返さない（列の存在検査は、作業表の合成スキーマに対する束縛〔`sql::recursive_eval`〕が担う）。
+/// 呼び出し元は `sql::allowlist` の `WITH RECURSIVE` 分岐だけ。
+pub(crate) struct RecursiveTermLookup<'a> {
+    inner: &'a dyn TableLookup,
+    cte_name: &'a str,
+}
+
+impl<'a> RecursiveTermLookup<'a> {
+    pub(crate) fn new(inner: &'a dyn TableLookup, cte_name: &'a str) -> Self {
+        Self { inner, cte_name }
+    }
+
+    fn is_cte(&self, name: &str) -> bool {
+        self.cte_name.eq_ignore_ascii_case(name)
+    }
+}
+
+impl TableLookup for RecursiveTermLookup<'_> {
+    fn table_exists(&self, name: &str) -> Result<bool, SqlSurfaceError> {
+        if self.is_cte(name) {
+            return Ok(true);
+        }
+        self.inner.table_exists(name)
+    }
+
+    fn view_definition(
+        &self,
+        name: &str,
+    ) -> Result<Option<crate::catalog::ViewDef>, SqlSurfaceError> {
+        if self.is_cte(name) {
+            return Ok(None);
+        }
+        self.inner.view_definition(name)
+    }
+
+    fn table_columns(&self, name: &str) -> Result<Option<Vec<String>>, SqlSurfaceError> {
+        if self.is_cte(name) {
+            return Ok(None);
+        }
+        self.inner.table_columns(name)
+    }
+
+    fn table_star_columns(&self, name: &str) -> Result<Option<Vec<String>>, SqlSurfaceError> {
+        if self.is_cte(name) {
+            return Ok(None);
+        }
+        self.inner.table_star_columns(name)
+    }
+
+    fn table_is_allocated(&self, name: &str) -> Result<bool, SqlSurfaceError> {
+        if self.is_cte(name) {
+            return Ok(false);
+        }
+        self.inner.table_is_allocated(name)
+    }
+
+    fn table_has_non_byte_collation(&self, name: &str) -> Result<bool, SqlSurfaceError> {
+        if self.is_cte(name) {
+            return Ok(false);
+        }
+        self.inner.table_has_non_byte_collation(name)
+    }
+
+    fn table_materialization_hazards(
+        &self,
+        name: &str,
+    ) -> Result<crate::catalog::TableMaterializationHazards, SqlSurfaceError> {
+        if self.is_cte(name) {
+            return Ok(crate::catalog::TableMaterializationHazards::default());
+        }
+        self.inner.table_materialization_hazards(name)
+    }
+
+    fn buffered_depth(&self) -> usize {
+        self.inner.buffered_depth()
+    }
+
+    fn materialized_view_columns(
+        &self,
+        name: &str,
+    ) -> Result<Option<Vec<crate::catalog::ColumnDef>>, SqlSurfaceError> {
+        if self.is_cte(name) {
+            return Ok(None);
+        }
+        self.inner.materialized_view_columns(name)
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -795,7 +885,12 @@ mod tests {
     const NOT_YET: &str = "0A000";
 
     #[test]
-    fn accepted_forms_end_with_evaluation_not_supported() {
+    fn accepted_forms_are_gated_outside_the_session_entry() {
+        // 自己参照が 1 つも無い形は通常 CTE として受理される（SQL-35・Issue #1870）。
+        assert_eq!(
+            code("WITH RECURSIVE x AS (SELECT id FROM docs) SELECT id FROM x"),
+            "ok"
+        );
         for sql in [
             "WITH RECURSIVE t(n) AS (SELECT 1 UNION ALL SELECT n + 1 FROM t WHERE n < 10) SELECT n FROM t",
             "WITH RECURSIVE t(n) AS (SELECT 1 UNION SELECT n + 1 FROM t WHERE n < 10) SELECT n FROM t",
@@ -803,7 +898,6 @@ mod tests {
             "WITH RECURSIVE t(n) AS MATERIALIZED (SELECT 1 UNION ALL SELECT n + 1 FROM t WHERE n < 3) SELECT n FROM t",
             "WITH RECURSIVE t(n) AS (SELECT 1 UNION ALL (SELECT n + 1 FROM t WHERE n < 3)) SELECT n FROM t",
             "WITH RECURSIVE a AS (SELECT id FROM docs), t(n) AS (SELECT 1 UNION ALL SELECT n + 1 FROM t WHERE n < 3) SELECT n FROM t",
-            "WITH RECURSIVE x AS (SELECT id FROM docs) SELECT id FROM x",
         ] {
             assert_eq!(code(sql), NOT_YET, "{sql}");
         }
