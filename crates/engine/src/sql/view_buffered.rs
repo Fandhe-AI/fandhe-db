@@ -355,6 +355,81 @@ fn plan_rows(
     })
 }
 
+/// 行形の層（射影・`WHERE`）を、評価済みの本文の結果列に対して計画する（Issue #1861。
+/// `JOIN` が CTE を入力にするときの側スキャンと、CTE→CTE の導出が使う）。束縛・公開範囲・
+/// 同名列の規則は評価後射影形ビューの外側（[`plan_outer`]）と同じ [`plan_rows`] を共有する。
+///
+/// 行 `id` の結果列（`ColumnMeta::Id`）は、述語・射影の評価では `BIGINT`（符号付き）ではなく
+/// 疑似列 `id` と同じ numeric（`AliasedId` 相当）として束縛する。`BIGINT` だと `normalize_cell` が
+/// `u64` を `i64` へ変換して `i64::MAX` 超の有効な行 id を `22003` にするため。セル（`Cell::Integer(u64)`）
+/// は変えず、この関数の戻りの結果列では `id` は `AliasedId { name: "id" }` で公告される。
+pub(crate) fn plan_rows_layer(
+    body_columns: &[ColumnMeta],
+    view_name: &str,
+    rows: &BufferedRows,
+    udfs: &UdfRegistry,
+) -> Result<OuterPlan, SqlSurfaceError> {
+    let unsigned_ids: Vec<ColumnMeta> = body_columns
+        .iter()
+        .map(|m| match m {
+            ColumnMeta::Id => super::exec::aliased_id_column_meta("id"),
+            other => other.clone(),
+        })
+        .collect();
+    plan_rows(&unsigned_ids, view_name, rows, udfs)
+}
+
+impl OuterPlan {
+    /// 行形の層 [`apply_rows_layer`] が `parent` から作る出力行の推定バイト量（上界）。
+    ///
+    /// 出力は射影した列のセルの複製なので、同じ列を複数回選ぶ射影（`SELECT body, body, body`）は
+    /// 親より大きくなりうる。出現回数ぶんの複製を数え、絞り込み・`LIMIT` は無視する（上界）。
+    /// 層を適用して新しい行を作る経路（CTE→CTE の導出・JOIN の側スキャン）は、適用の **前** に
+    /// この値を共有予算へ計上する（`join::JoinBudget::charge_layer_output`。見積もりの唯一の実装）。
+    /// 集計形の計画は層として受け付けないため `None`。
+    pub(crate) fn rows_output_bytes(&self, parent: &QueryResult) -> Option<usize> {
+        let OuterKind::Rows(plan) = &self.kind else {
+            return None;
+        };
+        let per_row = plan
+            .out
+            .len()
+            .saturating_mul(std::mem::size_of::<Cell>())
+            .saturating_add(std::mem::size_of::<ResultRow>());
+        let mut total = per_row.saturating_mul(parent.rows.len());
+        for row in &parent.rows {
+            for col in &plan.out {
+                if let OutCol::Plain(i) = col {
+                    if let Some(cell) = row.cells.get(*i) {
+                        total = total.saturating_add(super::join::cell_payload_bytes(cell));
+                    }
+                }
+            }
+        }
+        Some(total)
+    }
+}
+
+/// [`plan_rows_layer`] の計画を評価済みの行へ適用する。集計形の計画は受け付けない（`Internal`）。
+pub(crate) fn apply_rows_layer(
+    result: QueryResult,
+    plan: &OuterPlan,
+) -> Result<QueryResult, SqlSurfaceError> {
+    match &plan.kind {
+        OuterKind::Rows(rows) => apply_rows(result, rows, &plan.columns),
+        OuterKind::Aggregate(_) => Err(internal_error()),
+    }
+}
+
+/// 評価済みの CTE の結果列を列名リスト（`WITH c(a, b)`）で先頭から改名する（Issue #1861）。
+/// 規則は評価後射影形ビューの列別名（[`rename_body_columns`]）と同じ。
+pub(crate) fn rename_cte_columns(
+    columns: &[ColumnMeta],
+    aliases: &[String],
+) -> Result<Vec<ColumnMeta>, SqlSurfaceError> {
+    rename_body_columns(columns, aliases)
+}
+
 /// 外側 `ORDER BY` が参照する識別子と、並べ替えキーの有無（集合演算外の `Rows` 外側のみ。
 /// 集計外側は `ORDER BY` を持たない）。並べ替えは `plan_order` が `cmp_class` で型を検査する
 /// ため、具体化可否の判定（`allowlist::materialized_cte_statement`）が同じ関数の対応範囲に

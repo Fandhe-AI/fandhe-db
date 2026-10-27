@@ -789,11 +789,21 @@ fn row_id_above_i64_max_survives_the_working_table() {
     let pred = "WITH RECURSIVE t(i) AS (SELECT id FROM tree WHERE name = 'root' UNION ALL \
                   SELECT i FROM t WHERE i > 9223372036854775807 AND i < 0) SELECT i FROM t";
     assert_eq!(rows(&core, "alice", pred), col(&["18446744073709551610"]));
-    // JOIN の再帰項の結合キーは BIGINT として読むため、`i64::MAX` 超の行 id は値を壊さず `22003`
-    // （範囲外）で拒否する。範囲内の行 id は結合キーに使える（`pseudo_id_anchor_column`）。
-    let join = "WITH RECURSIVE t(i) AS (SELECT id FROM tree WHERE name = 'root' UNION ALL \
-                  SELECT c.id FROM tree c JOIN t ON c.parent_id = t.i) SELECT i FROM t";
-    assert_eq!(code(&core, "alice", join), "22003");
+    // JOIN の再帰項でも、作業表の `id` 型の列は行 `id` として結合キーに使える（`CteIdColumns`。
+    // セルは `u64` のまま運ばれ、`i64::MAX` 超の行 id も損失なく結合できて 22003 にならない）。
+    let join =
+        "WITH RECURSIVE t(i, n) AS (SELECT id, CAST(0 AS BIGINT) FROM tree WHERE name = 'root' \
+                  UNION ALL SELECT c.id, c.node_id FROM tree c JOIN t ON c.id = t.i AND c.node_id > t.n) \
+                SELECT count(*) FROM t";
+    assert_eq!(rows(&core, "alice", join), col(&["2"]));
+    // 作業表側の `id` 型の列をそのまま射影しても、公告（numeric）と値（`u64`）が保たれる（`42804` にならない）。
+    let proj = "WITH RECURSIVE t(i, n) AS (SELECT id, CAST(0 AS BIGINT) FROM tree WHERE name = 'root' \
+                  UNION ALL SELECT t.i, c.node_id FROM tree c JOIN t ON c.id = t.i AND c.node_id > t.n) \
+                SELECT i FROM t";
+    assert_eq!(
+        rows(&core, "alice", proj),
+        col(&["18446744073709551610", "18446744073709551610"])
+    );
 }
 
 /// 「作業表が空なら終了」の契約（アンカーが空・再帰項が初回で空・Scan 版／JOIN 版）。アンカーが空なら

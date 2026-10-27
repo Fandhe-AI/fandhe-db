@@ -115,7 +115,7 @@ RECURSIVE の下では後方の CTE 名も可視になり、非再帰経路の�
   `42804`（PostgreSQL と同じ。例: `SELECT 1` のアンカーに `BIGINT` を返す再帰項は `CAST(1 AS BIGINT)` と書く）。
   疑似列 `id` のアンカー・再帰項の列は作業表では `id` 型（numeric(20,0)。`u64` 全域を損失なく運ぶ。単一の写像 `work_column`）で、
   公開結果列の公告（numeric）と値（`u64`）は元のまま。`id` 型の列への算術・`id` 型かどうかが両項で食い違う列は拒否する。
-  JOIN の再帰項の結合キーは BIGINT として読むため `i64::MAX` 超の行 id は `22003`（値は壊さない）。述語・式へ渡せない型
+  JOIN の再帰項でも `id` 型の列は CTE の行 `id`（`CteIdColumns`。#2729 と同じ写像）として結合へ渡し、セルは `u64` のまま運ぶ。述語・式へ渡せない型
   （`TIME`・`TIMESTAMPTZ`・`INTERVAL`・`JSONB` 等）は計画時（Describe も同じ）に固定 `0A000`
 - 主クエリ: CTE 以外の表の読み取り・JOIN、式射影、序数 `ORDER BY`（評価後射影形ビューの外側と同じ制約）
 

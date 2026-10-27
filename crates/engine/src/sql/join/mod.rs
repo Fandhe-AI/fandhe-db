@@ -42,6 +42,9 @@
 //! （`using::natural_using_names`）。
 //! `CROSS JOIN`（Issue #1831）は空キー段（条件なしの直積）で、件数 `左 × 右` を確保前に
 //! 出力上限と照合する（`exec::join_step`）。
+//! CTE 入力（Issue #1861・SQL-62）: `WITH` の主クエリの JOIN では、CTE のリレーションは `core.rs` が
+//! 評価した行（`execute_with_cte_inputs` の `inputs`）に側スキャンを適用して側入力にする（記憶域を
+//! 読まない）。合成スキーマは [`cte_schema`]、`docs/design/cte.md` の「Issue #1861 追記」節参照。
 //! スコープ外: `USING (...) AS <alias>`・FULL JOIN USING の統合列の
 //! WHERE／GROUP BY／集計／後続段の結合キーでの参照（`0A000`）・ベクトル順位付け
 //! （`ORDER BY ... <=>` 等）との併用・FROM でのビュー参照・`RelationSnapshotCache`
@@ -72,6 +75,7 @@ use crate::sql::allowlist::{SqlSurfaceError, ValidatedJoin};
 use crate::sql::exec::{Cell, ColumnMeta, QueryResult, ResultRow};
 use crate::sql::udf_call::UdfRegistry;
 
+pub(crate) use plan::CteIdColumns;
 use plan::{build_plan, JoinPlan, Shape};
 
 pub(crate) use crate::join_limits::{
@@ -114,6 +118,16 @@ impl JoinLimits {
             max_result_rows: self.max_result_rows,
         }
     }
+
+    /// 起動時設定（`EngineCore` 保持）から実行上限を組み立てる。[`execute`] と、再帰 CTE の
+    /// 反復評価器（`sql::recursive_eval`）が共有する写像（[`startup_limits`]）。
+    pub(crate) fn from_settings(
+        group_limits: crate::group_by_limits::GroupByLimits,
+        join_limits: crate::join_limits::JoinSizeLimits,
+        result_limits: crate::result_limits::ResultLimits,
+    ) -> Self {
+        startup_limits(group_limits, join_limits, result_limits)
+    }
 }
 
 impl Default for JoinLimits {
@@ -133,7 +147,7 @@ impl Default for JoinLimits {
 
 /// 文全体（全 relation の走査・ハッシュ表・タプル・出力行の生成）で共有する累計
 /// バイト予算（`sql::set_op::SetOpBudget` と同じ設計。モジュールドキュメント参照）。
-pub(super) struct JoinBudget {
+pub(crate) struct JoinBudget {
     used: usize,
     cap: usize,
     /// NLJ の比較回数の文全体の累計（Issue #1837・D5）。バイト予算とは別軸。
@@ -171,11 +185,51 @@ impl JoinBudget {
         cap.saturating_sub(self.comparisons_used)
     }
 
-    fn remaining(&self) -> usize {
+    /// 起動時設定の既定上限で文全体の予算を作る。CTE を入力に持つ JOIN では、`core.rs` が CTE 本文の
+    /// 評価・共有キャッシュ・参照ごとの複製を **確保の前に** この 1 つの予算へ計上し、続く JOIN の
+    /// 走査・結合・出力生成も同じ予算で続ける（Issue #1861。独立した予算を複数持たない）。
+    pub(crate) fn for_statement() -> Self {
+        Self::new(JoinLimits::default().budget_cap)
+    }
+
+    /// 上限を指定して作る（テスト専用。実行経路は [`Self::for_statement`] を使う）。
+    #[cfg(test)]
+    pub(crate) fn with_cap(cap: usize) -> Self {
+        Self::new(cap)
+    }
+
+    /// 残りのバイト予算。行を生成する走査へ上限としてそのまま渡す（生成中に打ち切らせる）。
+    pub(crate) fn remaining(&self) -> usize {
         self.cap.saturating_sub(self.used)
     }
 
-    pub(super) fn charge(&mut self, bytes: usize) -> Result<(), SqlSurfaceError> {
+    /// 評価済みの行集合 `result`（保持・複製する分）のバイト量を計上する。複製・保持の **前に**
+    /// 借用のまま呼び、超過なら `54000`（複製・確保そのものを行わない。PR #1110 と同じ設計判断）。
+    pub(crate) fn charge_result(
+        &mut self,
+        result: &crate::sql::exec::QueryResult,
+    ) -> Result<(), SqlSurfaceError> {
+        self.charge(result_bytes(result.columns.len(), &result.rows))
+    }
+
+    /// 行形の層（射影・絞り込み）を `parent` に適用して作る出力行の分を、適用の **前** に計上する。
+    /// 同じ列の複数回選択で出力が親より大きくなりうるため、親の分の再計上ではなく射影の出現回数から
+    /// 見積もる（[`crate::sql::view_buffered::OuterPlan::rows_output_bytes`]）。見積もれない計画は
+    /// `Internal`（fail-closed）。
+    pub(crate) fn charge_layer_output(
+        &mut self,
+        parent: &crate::sql::exec::QueryResult,
+        plan: &crate::sql::view_buffered::OuterPlan,
+    ) -> Result<(), SqlSurfaceError> {
+        let bytes = plan
+            .rows_output_bytes(parent)
+            .ok_or_else(|| SqlSurfaceError::Internal {
+                detail: "layer output size is not estimable".to_string(),
+            })?;
+        self.charge(bytes)
+    }
+
+    pub(crate) fn charge(&mut self, bytes: usize) -> Result<(), SqlSurfaceError> {
         self.used = self.used.saturating_add(bytes);
         if self.used > self.cap {
             return Err(SqlSurfaceError::payload_too_large(
@@ -228,9 +282,17 @@ pub(crate) fn cell_payload_bytes(cell: &Cell) -> usize {
 /// [`crate::sql::allowlist::ValidatedJoin`] が参照するテーブル名（重複除去済み。
 /// 自己結合では 1 個になる）。`core.rs::EngineCore` が単一の `read_txn` 上で
 /// 全 relation のスキーマを解決するために使う（`read_txn_with_schemas`）。
+///
+/// CTE を出所とするリレーション（`cte_inputs` の `relation_slot` が `Some`。Issue #1861）は
+/// **含めない**: CTE 名はカタログの表名ではなく、同名の実表を黙って読む経路を作らないため
+/// （この結果を使わずに CTE 入力つきの JOIN を実行すると、スキーマ欠落で `Internal`＝fail-closed）。
+/// CTE 本文が読む表の解決は `core.rs` が slot ごとに行う。
 pub(crate) fn collect_join_tables(validated: &ValidatedJoin) -> Vec<String> {
     let mut out = Vec::with_capacity(validated.relations.len());
-    for r in &validated.relations {
+    for (i, r) in validated.relations.iter().enumerate() {
+        if relation_is_cte(validated, i) {
+            continue;
+        }
         if !out.iter().any(|t| t == r.table()) {
             out.push(r.table().to_string());
         }
@@ -238,16 +300,37 @@ pub(crate) fn collect_join_tables(validated: &ValidatedJoin) -> Vec<String> {
     out
 }
 
+/// リレーション `i` が CTE 入力か（Issue #1861）。
+pub(crate) fn relation_is_cte(validated: &ValidatedJoin, i: usize) -> bool {
+    validated
+        .cte_inputs
+        .as_ref()
+        .and_then(|c| c.relation_slot.get(i))
+        .is_some_and(Option::is_some)
+}
+
 /// 側スキャンの束縛（WHERE リテラルの型検証）を行う。Execute・Describe が共有し、
 /// 束縛エラーを `LIMIT`／`OFFSET` の範囲検証（`22000`）より先に返す順序契約
 /// （docs/design/inner-join.md）を両者で揃える。
 fn bind_side_scans(
     plan: &JoinPlan<'_>,
+    cte_ids: &CteIdColumns,
+    validated: &ValidatedJoin,
     udfs: &UdfRegistry,
     scan_limit: usize,
 ) -> Result<Vec<crate::sql::parser::BoundScan>, SqlSurfaceError> {
     let mut out = Vec::with_capacity(plan.scans.len());
-    for (scan, schema) in plan.scans.iter().zip(plan.schemas.iter()) {
+    for (i, (scan, schema)) in plan.scans.iter().zip(plan.schemas.iter()).enumerate() {
+        // CTE が公開した行 `id` の列は、リテラルを `u64` を損失なく扱える型（疑似列 `id` と同じ numeric）で
+        // 束縛する（`BIGINT` だと `i64` 解析になり、`i64::MAX` 超の有効な行 id のリテラルが `22003`）。
+        // 実際の側述語の評価は `view_buffered::plan_rows_layer` が同じ型で行う（`CteIdColumns` が唯一の情報源）。
+        let id_typed = validated
+            .relations
+            .get(i)
+            .and_then(|r| cte_ids.get(r.table()))
+            .filter(|cols| !cols.is_empty())
+            .map(|cols| plan::cte_id_binding_schema(schema, cols));
+        let schema = id_typed.as_ref().unwrap_or(*schema);
         // 側スキャンの `LIMIT` は直後に `scan_limit` へ差し替える内部値のため既定の範囲検証のまま
         // （文の `LIMIT` は `validate_limit_offset` が設定値で判定する）。
         let mut bound = crate::sql::parser::bind_scan_with_dummy_flags(
@@ -302,28 +385,57 @@ pub(crate) fn execute(
         schemas,
         validated,
         udfs,
-        &JoinLimits::from_settings(group_limits, join_limits, result_limits),
+        &startup_limits(group_limits, join_limits, result_limits),
     )
 }
 
-impl JoinLimits {
-    /// 起動時設定（`EngineCore` 保持）から実行上限を組み立てる。[`execute`] と、再帰 CTE の
-    /// 反復評価器（`sql::recursive_eval`）が共有する唯一の写像。
-    pub(crate) fn from_settings(
-        group_limits: crate::group_by_limits::GroupByLimits,
-        join_limits: crate::join_limits::JoinSizeLimits,
-        result_limits: crate::result_limits::ResultLimits,
-    ) -> Self {
-        Self {
-            max_groups: group_limits.max_groups(),
-            max_group_by_columns: group_limits.max_group_by_columns(),
-            max_input_rows: join_limits.max_input_rows(),
-            max_output_rows: join_limits.max_output_rows(),
-            max_relations: join_limits.max_relations(),
-            max_result_rows: result_limits.max_result_rows(),
-            ..Self::default()
-        }
+/// 起動時設定から実行段の上限を組み立てる（[`execute`]・[`execute_with_cte_inputs`] が共有する）。
+fn startup_limits(
+    group_limits: crate::group_by_limits::GroupByLimits,
+    join_limits: crate::join_limits::JoinSizeLimits,
+    result_limits: crate::result_limits::ResultLimits,
+) -> JoinLimits {
+    JoinLimits {
+        max_groups: group_limits.max_groups(),
+        max_group_by_columns: group_limits.max_group_by_columns(),
+        max_input_rows: join_limits.max_input_rows(),
+        max_output_rows: join_limits.max_output_rows(),
+        max_relations: join_limits.max_relations(),
+        max_result_rows: result_limits.max_result_rows(),
+        ..JoinLimits::default()
     }
+}
+
+/// CTE を入力に持つ JOIN の実行（Issue #1861・SQL-62）。`inputs` はリレーションと同じ並びで、
+/// CTE のリレーションには `core.rs` が評価済みの CTE の行（列名リスト適用後）を渡す。`schemas` は
+/// 実表に加えて CTE の結果列から合成したスキーマ（CTE 名で引く）を含む。CTE 本文は呼び出し側が
+/// 参照者自身の `PolicyContext`・同一の `read_txn` で評価済みで、本関数は評価済みの行に側スキャンの
+/// 射影・述語を適用するだけで記憶域を読まない。
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn execute_with_cte_inputs(
+    read_txn: &impl crate::storage::read_source::ReadSource,
+    ctx: &PolicyContext,
+    schemas: &HashMap<String, TableSchema>,
+    validated: &ValidatedJoin,
+    udfs: &UdfRegistry,
+    group_limits: crate::group_by_limits::GroupByLimits,
+    join_limits: crate::join_limits::JoinSizeLimits,
+    result_limits: crate::result_limits::ResultLimits,
+    cte_ids: &CteIdColumns,
+    inputs: Vec<Option<QueryResult>>,
+    budget: JoinBudget,
+) -> Result<QueryResult, SqlSurfaceError> {
+    execute_with_inputs(
+        read_txn,
+        ctx,
+        schemas,
+        validated,
+        udfs,
+        &startup_limits(group_limits, join_limits, result_limits),
+        cte_ids,
+        inputs,
+        budget,
+    )
 }
 
 /// [`execute`] の本体。`limits` はテスト専用に上限を差し替えられるようにした
@@ -336,18 +448,82 @@ pub(crate) fn execute_with_limits(
     udfs: &UdfRegistry,
     limits: &JoinLimits,
 ) -> Result<QueryResult, SqlSurfaceError> {
-    let prepared = prepare_join(schemas, validated, udfs, limits)?;
-    let mut budget = JoinBudget::new(limits.budget_cap);
+    execute_with_inputs(
+        read_txn,
+        ctx,
+        schemas,
+        validated,
+        udfs,
+        limits,
+        &CteIdColumns::new(),
+        Vec::new(),
+        JoinBudget::new(limits.budget_cap),
+    )
+}
+
+/// [`execute_with_limits`] の本体。`inputs[i]` が `Some` のリレーションは記憶域を走査せず、
+/// 評価済みの CTE の行へ側スキャン（プッシュダウン済みの述語・側投影）を適用して側入力にする
+/// （Issue #1861）。`None`・範囲外は従来どおり `execute_scan_with_budget` で走査する。
+#[allow(clippy::too_many_arguments)]
+fn execute_with_inputs(
+    read_txn: &impl crate::storage::read_source::ReadSource,
+    ctx: &PolicyContext,
+    schemas: &HashMap<String, TableSchema>,
+    validated: &ValidatedJoin,
+    udfs: &UdfRegistry,
+    limits: &JoinLimits,
+    cte_ids: &CteIdColumns,
+    mut inputs: Vec<Option<QueryResult>>,
+    mut budget: JoinBudget,
+) -> Result<QueryResult, SqlSurfaceError> {
+    let prepared = prepare_join(schemas, cte_ids, validated, udfs, limits)?;
+    let plan = &prepared.plan;
+    let bound = &prepared.bound;
 
     // §2.4: 各 relation の評価は既存の広域取得経路（`execute_scan_with_budget`）を
     // 通す——RLS 暗黙適用・fail-closed のエラー写像を第 2 の実行器なしに継承する。
     // 呼び出したセッションの `ctx`（`PolicyContext`）で全 relation を独立に評価する
     // ため、他テナント行は中間結果・結合キー・カーディナリティ判定のいずれにも
     // 現れない（RLS-10 相当）。
-    let mut sides: Vec<Vec<ResultRow>> = Vec::with_capacity(prepared.side_count());
-    for side in 0..prepared.side_count() {
-        sides.push(prepared.scan_side(read_txn, ctx, side, limits, &mut budget)?);
+    let mut sides: Vec<Vec<ResultRow>> = Vec::with_capacity(plan.scans.len());
+    for (i, (schema, bound_scan)) in plan.schemas.iter().zip(bound.iter()).enumerate() {
+        // CTE 入力の側スキャンは、出力行の見積もり（射影の重複込みの上界）を適用の **前** に
+        // 計上する（`apply_cte_side_scan`）ため、適用後の再計上は不要。
+        let mut charged_before_apply = false;
+        let result = match inputs.get_mut(i).and_then(Option::take) {
+            // CTE の評価済みの行（Issue #1861）。側スキャンは `view_buffered` の外側計画と同じ
+            // 束縛・評価の規則で適用する（第 2 の評価器を作らない）。入力は所有権ごと渡して消費し、
+            // 複製を作らない（保持分は評価時に `budget` へ計上済み）。
+            Some(body) => {
+                charged_before_apply = true;
+                apply_cte_side_scan(
+                    body,
+                    &mut budget,
+                    plan.scans.get(i).ok_or_else(|| SqlSurfaceError::Internal {
+                        detail: "JOIN side scan missing".to_string(),
+                    })?,
+                    udfs,
+                )?
+            }
+            None => crate::sql::scan::execute_scan_with_budget(
+                read_txn,
+                ctx,
+                schema,
+                bound_scan,
+                budget.remaining(),
+            )?,
+        };
+        if result.rows.len() > limits.max_input_rows {
+            return Err(SqlSurfaceError::payload_too_large(
+                "JOIN input exceeds the visible row limit",
+            ));
+        }
+        if !charged_before_apply {
+            budget.charge_result(&result)?;
+        }
+        sides.push(result.rows);
     }
+
     run_join_with_sides(&prepared, &sides, limits, budget)
 }
 
@@ -468,18 +644,25 @@ impl PreparedJoin<'_> {
 
 /// 束縛（列解決・型検証）と、データ非依存の上限検査までを行う。行は読まない。
 /// 判定順序は従来どおり、束縛エラー → `LIMIT`／`OFFSET` の範囲（`22000`）→ リレーション数・
-/// `GROUP BY` 列数の上限（`54000`）。
+/// `GROUP BY` 列数の上限（`54000`）。`cte_ids` は CTE リレーションの行 `id` を運ぶ列（#2729）。
 pub(crate) fn prepare_join<'a>(
     schemas: &'a HashMap<String, TableSchema>,
+    cte_ids: &CteIdColumns,
     validated: &ValidatedJoin,
     udfs: &UdfRegistry,
     limits: &JoinLimits,
 ) -> Result<PreparedJoin<'a>, SqlSurfaceError> {
-    let plan = build_plan(schemas, validated, udfs)?;
+    let plan = build_plan(schemas, cte_ids, validated, udfs)?;
     // §2.4/§2.5: 全 relation の束縛（列参照・WHERE 述語の型検証）を完了させてから
     // `LIMIT`／`OFFSET` の範囲検証（`22000`）を行う（束縛エラー優先。Describe と
     // 同じ判断順序）。
-    let bound = bind_side_scans(&plan, udfs, limits.max_input_rows.saturating_add(1))?;
+    let bound = bind_side_scans(
+        &plan,
+        cte_ids,
+        validated,
+        udfs,
+        limits.max_input_rows.saturating_add(1),
+    )?;
     let (limit, offset) = validate_limit_offset(validated, limits.max_result_rows)?;
     // Issue #1551: 起動時設定のリレーション数上限（データ非依存。走査より前に判定する）。
     if validated.relations.len() > limits.max_relations {
@@ -499,6 +682,7 @@ pub(crate) fn prepare_join<'a>(
             )));
         }
     }
+
     Ok(PreparedJoin {
         plan,
         bound,
@@ -643,21 +827,98 @@ fn run_join_with_sides(
     }
 }
 
+/// CTE の結果列（列名リスト適用後）から JOIN 用のスキーマを合成する（Issue #1861）。Execute と
+/// Describe が同じ関数で作る（列メタの食い違いを作らない）。行識別方式は採番方式
+/// （`RowIdentity::Allocated`）で、暗黙の疑似列 `id` を持たない: `*` は CTE の公開列だけを展開し、
+/// `c.id` は CTE 本文が公開した `id` 列にだけ解決される（本文が公開しない行 id を述語や
+/// 結合キーで読めない）。同名の列が 2 つ以上ある結果・型を持たない列は、どれを指すか決められず
+/// 型も比較できないため固定文言の `0A000` で拒否する（入力の断片を含めない。fail-closed）。
+/// 行 `id` を運ぶ結果列（`Id`・`AliasedId`）は、結合キー・比較を整数クラスで行うため NULL 可能な `BIGINT`
+/// 列として載せるが、セルは `Cell::Integer(u64)` のままで（`i64` へ変換しない）、その列の添字を第 2 戻り値で
+/// 返す。JOIN の束縛器はこの添字の列を `BIGINT` ではなく `id` 型（`ColumnMeta::Id`／`AliasedId`）で公告し、
+/// 側述語は `view_buffered::plan_rows_layer` が符号なしのまま評価する（`i64::MAX` 超の行 id を壊さない）。
+pub(crate) fn cte_schema(
+    name: &str,
+    columns: &[ColumnMeta],
+) -> Result<(TableSchema, Vec<usize>), SqlSurfaceError> {
+    let mut defs: Vec<crate::catalog::ColumnDef> = Vec::with_capacity(columns.len());
+    let mut id_columns: Vec<usize> = Vec::new();
+    for (pos, meta) in columns.iter().enumerate() {
+        if matches!(meta, ColumnMeta::Id | ColumnMeta::AliasedId { .. }) {
+            id_columns.push(pos);
+        }
+        let (col_name, ty) = match meta {
+            ColumnMeta::Id => ("id", crate::catalog::ColumnType::BigInt),
+            // 別名付きの疑似列 `id`（`WITH c(i) AS (SELECT id ...)`）。セルは `Cell::Integer(u64)` の
+            // ままなので、JOIN の比較クラスが整数になる `BIGINT` で載せる（`NUMERIC` にすると
+            // 整数セルとクラスが食い違う）。
+            ColumnMeta::AliasedId { name } => (name.as_str(), crate::catalog::ColumnType::BigInt),
+            ColumnMeta::Scalar { name, ty } => (name.as_str(), ty.clone()),
+            ColumnMeta::Computed { name, ty: Some(ty) } => (name.as_str(), ty.clone()),
+            ColumnMeta::Computed { ty: None, .. } => {
+                return Err(SqlSurfaceError::feature_not_supported(
+                    "a CTE column without a static type cannot be a JOIN input",
+                ));
+            }
+        };
+        if defs.iter().any(|d| d.name.eq_ignore_ascii_case(col_name)) {
+            return Err(SqlSurfaceError::feature_not_supported(
+                "a CTE with duplicate column names cannot be a JOIN input",
+            ));
+        }
+        defs.push(crate::catalog::ColumnDef::new(col_name, ty, true));
+    }
+    Ok((
+        TableSchema::new(name.to_string(), defs)
+            .with_row_identity(crate::catalog::RowIdentity::Allocated),
+        id_columns,
+    ))
+}
+
+/// 評価済みの CTE の行 `body` に、側スキャン `scan`（射影＋プッシュダウン済み述語）を適用する
+/// （Issue #1861）。評価済みの行は文のローカルな所有値で、他の文・他セッションとは共有しない。
+/// 述語・射影の束縛は `view_buffered::plan_rows_layer`（評価後射影形ビューの外側と同じ規則）で、
+/// 本文が公開しない列は `22000` で拒否される。出力行の保持量は `budget` へ適用前に計上する。
+fn apply_cte_side_scan(
+    body: QueryResult,
+    budget: &mut JoinBudget,
+    scan: &crate::sql::allowlist::ValidatedScan,
+    udfs: &UdfRegistry,
+) -> Result<QueryResult, SqlSurfaceError> {
+    let layer = crate::sql::allowlist::BufferedRows {
+        projection: scan.projection.clone(),
+        where_predicates: scan.where_predicates.clone(),
+        order_by: Vec::new(),
+        order_keys: Vec::new(),
+        window_items: Vec::new(),
+        limit: u32::MAX,
+        limit_explicit: false,
+        limit_implicit: false,
+        offset: 0,
+    };
+    let plan =
+        crate::sql::view_buffered::plan_rows_layer(&body.columns, scan.table_name(), &layer, udfs)?;
+    // 出力行（射影の複製を含む）の分を、適用の前に共有予算へ計上する（唯一の見積もり）。
+    budget.charge_layer_output(&body, &plan)?;
+    crate::sql::view_buffered::apply_rows_layer(body, &plan)
+}
+
 /// Describe（拡張クエリプロトコル）向けに、走査を一切行わず結果列メタデータだけを
 /// 導出する（`sql::set_op::describe_columns` と同じ方針）。JOIN は `$n` パラメータを
 /// 受理しない（`sql::params::validate_param_positions` が構文段で拒否する）ため、
 /// ダミー等価フラグは常に空でよい。
 pub(crate) fn describe_columns(
     schemas: &HashMap<String, TableSchema>,
+    cte_ids: &CteIdColumns,
     validated: &ValidatedJoin,
     udfs: &UdfRegistry,
     result_limits: &crate::result_limits::ResultLimits,
 ) -> Result<Vec<ColumnMeta>, SqlSurfaceError> {
-    let plan = build_plan(schemas, validated, udfs)?;
+    let plan = build_plan(schemas, cte_ids, validated, udfs)?;
     // 走査せずに束縛だけ行い、WHERE リテラルの型検証を Execute と同じ判定
     // 基準で確定させる（Describe は本体を実行しない契約）。束縛完了を
     // `LIMIT`／`OFFSET` 検証より前に行う（束縛エラー優先。Execute と同じ順序）。
-    bind_side_scans(&plan, udfs, 1)?;
+    bind_side_scans(&plan, cte_ids, validated, udfs, 1)?;
     validate_limit_offset(validated, result_limits.max_result_rows())?;
     Ok(plan.column_metas())
 }
@@ -715,6 +976,7 @@ mod tests {
             aggregate: None,
             limit: Some(limit),
             offset: 0,
+            cte_inputs: None,
         }
     }
     use crate::sql::udf_call::UdfRegistry;
@@ -1372,6 +1634,7 @@ mod tests {
             aggregate: None,
             limit: Some(10),
             offset: 0,
+            cte_inputs: None,
         }
     }
 

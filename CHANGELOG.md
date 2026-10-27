@@ -16,6 +16,11 @@
   従来 `0A000` だったが評価される。自己参照の無い `WITH RECURSIVE` は通常 CTE として実行される。`UNION`（重複除去）・
   複数定義・セッション最上位以外の文は `0A000` のまま。再帰項の整数型がアンカー型と異なる形は `42804`、作業表で評価できない型（`TIME`・`TIMESTAMPTZ`・`INTERVAL` 等）は `0A000`。詳細は [recursive-cte.md](docs/design/recursive-cte.md)。
   BREAKING CHANGE: 公開 enum `Statement` に variant（`RecursiveCte`）を追加したため、網羅的な `match` は更新が要る。
+- CTE を JOIN の入力（リレーション）として受け付ける（Issue #1861・SQL-62）。セッションの最上位 SELECT で `WITH` の主クエリが JOIN の形のとき、
+  FROM の CTE を評価済みの行の側入力にし、複数回参照しても共有する CTE の本文は文内で 1 回だけ評価する（指定なしは参照数 2 以上で共有）。
+  従来 `42601` で拒否していた形が受理される挙動変更で、ICU 照合の列を読む CTE・重複列名・型なし列・導出できない層で先行 CTE を読む本文・CTE が公開した行 `id` への集計は `0A000`、
+  本文の可視行が `--max-result-rows` を超えると `54000`。観測用に `EngineCore::materialized_cte_eval_stats`（`VectorCore` 外の固有 API）を追加。
+  公開 enum は変えない（非 BREAKING）。詳細は [cte.md](docs/design/cte.md) の「Issue #1861 追記」節。
 - 相関スカラーサブクエリを式の内側で使えるようにする（Issue #1848・SQL-61）。算術・比較・`COALESCE`・`CASE`・関数引数・`CAST` の
   被演算子として、投影の式項目・WHERE の式述語・スカラー `ORDER BY` の式キーに置ける（`(SELECT max(v) ...) + 1`・
   `COALESCE((SELECT ...), 0)`・`v > (SELECT ...) * 2`）。該当なしは NULL が式の中で伝播し（集計形の `count` は 0）、結果列の型は

@@ -184,17 +184,10 @@ struct ScanTerm {
     /// 作業表の列ごとの `id` 型フラグ（[`work_column`]）。`id` 型の列は公告を `AliasedId`、値を
     /// `Cell::Integer(u64)` のまま運ぶ。
     id_cols: Vec<bool>,
-    /// `true` なら `id` 型の列も numeric セルへ正規化して返す（JOIN の作業表側の行。結合は numeric
-    /// 型の列としてセルを読む）。`false` なら元のセルのまま返す（直接の結果行）。
-    numeric_ids: bool,
 }
 
 impl ScanTerm {
-    fn new(
-        bound: BoundScan,
-        id_cols: Vec<bool>,
-        numeric_ids: bool,
-    ) -> Result<Self, SqlSurfaceError> {
+    fn new(bound: BoundScan, id_cols: Vec<bool>) -> Result<Self, SqlSurfaceError> {
         // 疑似列 `id` は作業表に存在しない（行 id を持たない）。`SELECT *` や `<cte>.id`（実列 `id` が
         // 無い場合）は黙って NULL／0 にせず拒否する（fail-closed）。
         if bound
@@ -218,7 +211,6 @@ impl ScanTerm {
             bound,
             programs,
             id_cols,
-            numeric_ids,
         })
     }
 
@@ -291,7 +283,7 @@ impl ScanTerm {
                                 let is_id = self.id_cols.get(*index).copied().unwrap_or(false);
                                 cells.push(match types.get(*index) {
                                     // 直接の結果行の `id` 型の列は元のセル（`u64`）のまま運ぶ。
-                                    Some(Some(_)) if is_id && !self.numeric_ids => cell.clone(),
+                                    Some(Some(_)) if is_id => cell.clone(),
                                     Some(Some(ty)) => normalize_cell(cell, ty)?.into_owned(),
                                     _ => cell.clone(),
                                 });
@@ -347,8 +339,6 @@ struct Prepared<'a> {
     columns: Vec<ColumnMeta>,
     /// 作業表の列型（`synth_schema` の `types`）。
     work_types: Vec<Option<ColumnType>>,
-    /// JOIN の作業表側の列型。`id` 型の列は結合キーに使えるよう BIGINT（`i64::MAX` 超は `22003`）。
-    join_types: Vec<Option<ColumnType>>,
     step: Step<'a>,
 }
 
@@ -496,9 +486,9 @@ fn with_prepared<T>(
     // JOIN 条件・ORDER BY を含む全ての `id` 参照を束縛段の未知列として拒否する（実列 `id` は
     // 合成列として解決される）。直接投影の検査（`ScanTerm::new`）は二重の防御として残す。
     let work_schema = work_schema.with_row_identity(RowIdentity::Allocated);
-    // JOIN の作業表側だけは、`id` 型（numeric）の列を結合キーに使えるよう BIGINT の実列として束縛する
-    // （結合キーは numeric を受け付けない）。`i64::MAX` を超える行 id は変換時に `22003` で拒否される
-    // （値を壊さない）。直接の結果行（Scan 版）は numeric のまま `u64` 全域を運ぶ。
+    // JOIN 側のスキーマ（`cte_schema` と同じ写像）: `id` 型の列は結合キーのクラスが整数になる BIGINT で
+    // 載せ、`CteIdColumns` でその列の添字を渡す（セルは `Cell::Integer(u64)` のまま。束縛器は公告を
+    // `id` 型にし、リテラルを numeric で束縛する。`i64::MAX` 超の行 id も損失なく結合できる）。
     let join_input: Vec<ColumnMeta> = synth_input
         .iter()
         .map(|m| match m {
@@ -509,7 +499,7 @@ fn with_prepared<T>(
             other => other.clone(),
         })
         .collect();
-    let (join_schema, join_types) = synth_schema(&cte.name, &join_input);
+    let (join_schema, _) = synth_schema(&cte.name, &join_input);
     let join_schema = join_schema.with_row_identity(RowIdentity::Allocated);
     // 非バイト列順の照合（ICU）の列を持つ表を参照する再帰は、アンカー列の照合を作業表へ運べない
     // ため、再帰項の比較・結合が既定のバイト列順で黙って評価される fail-open を避けて拒否する
@@ -537,11 +527,12 @@ fn with_prepared<T>(
             }
             check_scan_shape(scan)?;
             let bound = super::parser::bind_scan(scan, &work_schema, udfs)?;
-            let term = ScanTerm::new(bound, id_cols.clone(), false)?;
+            let term = ScanTerm::new(bound, id_cols.clone())?;
             (term.column_metas(&work_schema)?, Step::Scan(term))
         }
         Statement::Join(join) => {
             let mut cte_side: Option<usize> = None;
+            let mut cte_ids = crate::sql::join::CteIdColumns::new();
             for (i, rel) in join.relations.iter().enumerate() {
                 if rel.table().eq_ignore_ascii_case(&cte.name) {
                     if cte_side.is_some() {
@@ -552,12 +543,23 @@ fn with_prepared<T>(
                     cte_side = Some(i);
                     // 関係名の書き方（大文字小文字）に依らず合成スキーマへ解決させる（同名の実表を隠す）。
                     all.insert(rel.table().to_string(), join_schema.clone());
+                    // `id` 型の列は CTE の行 `id` として結合へ渡す（セルは `Cell::Integer(u64)` のまま、
+                    // 疑似列 `id` と同じ符号なし整数のキー。`i64::MAX` 超の行 id も損失なく結合できる）。
+                    let id_idx: Vec<usize> = id_cols
+                        .iter()
+                        .enumerate()
+                        .filter(|(_, is_id)| **is_id)
+                        .map(|(i, _)| i)
+                        .collect();
+                    if !id_idx.is_empty() {
+                        cte_ids.insert(rel.table().to_string(), id_idx);
+                    }
                 }
             }
             let cte_side = cte_side.ok_or_else(|| {
                 unsupported_term("the recursive term must read the recursive reference")
             })?;
-            let prepared = prepare_join(&all, join, udfs, join_limits)?;
+            let prepared = prepare_join(&all, &cte_ids, join, udfs, join_limits)?;
             if prepared.is_aggregate() || prepared.has_ordering_or_limit() {
                 return Err(unsupported_term(
                     "aggregation, ORDER BY and LIMIT in a recursive term are not supported",
@@ -566,7 +568,7 @@ fn with_prepared<T>(
             let (_, side_bound) = prepared
                 .side_scan(cte_side)
                 .ok_or_else(|| internal("recursive reference side out of range"))?;
-            let side_term = ScanTerm::new(side_bound.clone(), id_cols.clone(), true)?;
+            let side_term = ScanTerm::new(side_bound.clone(), id_cols.clone())?;
             (
                 prepared.column_metas(),
                 Step::Join {
@@ -589,7 +591,6 @@ fn with_prepared<T>(
     f(&Prepared {
         columns,
         work_types,
-        join_types,
         step,
     })
 }
@@ -686,7 +687,7 @@ pub(crate) fn execute(
                     // 作業表側の行は、側スキャンと同じ束縛（述語・射影）を作業表へ適用して作る
                     // （反復内だけ保持する一時行として同じ共有予算へ計上する）。
                     let side_rows = side_term.eval_over_rows(
-                        &p.join_types,
+                        &p.work_types,
                         working,
                         &mut budget,
                         Charge::Scratch,
