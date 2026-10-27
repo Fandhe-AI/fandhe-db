@@ -548,3 +548,143 @@ fn temp_table_cte_join_runs_on_the_temp_core_and_mixed_is_rejected() {
     let err = run(mixed).expect_err("mixed");
     assert_eq!(err.wire_code(), "0A000", "{err:?}");
 }
+
+/// `i64::MAX` を超える行 id を持つ行だけの表を開く（alice の public 2 行）。
+fn open_with_huge_ids() -> (EngineCore, CleanupGuard, u64) {
+    let path = unique_db_path("sql62-cte-join-huge-id");
+    let guard = CleanupGuard(path.clone());
+    let storage = Storage::open(&path).expect("open storage");
+    storage.create_table(&schema()).expect("create table");
+    let huge = i64::MAX as u64 + 7;
+    insert_row(
+        &storage,
+        &ctx("alice"),
+        1,
+        "ja",
+        "small",
+        Visibility::Public,
+    );
+    insert_row(
+        &storage,
+        &ctx("alice"),
+        huge,
+        "ja",
+        "huge",
+        Visibility::Public,
+    );
+    (new_core(storage), guard, huge)
+}
+
+fn ids(r: &QueryResult) -> Vec<u64> {
+    let mut out: Vec<u64> = r
+        .rows
+        .iter()
+        .map(|row| match row.cells.first() {
+            Some(engine::sql::exec::Cell::Integer(v)) => *v,
+            other => panic!("expected an unsigned id cell, got {other:?}"),
+        })
+        .collect();
+    out.sort_unstable();
+    out
+}
+
+/// codex・Cursor 指摘（PR #2729）: CTE の側述語・導出層（`WHERE c.id > 0`）でも `i64::MAX` を超える
+/// 行 id は `22003` にならず `u64` のまま運ばれ、結果列は実 `BIGINT`（int8）ではなく `id` 型で公告される。
+#[test]
+fn huge_row_id_survives_side_predicates_and_is_announced_as_id() {
+    let (core, _g, huge) = open_with_huge_ids();
+    let want = vec![1, huge];
+
+    let direct = "WITH c AS (SELECT id FROM docs) \
+                  SELECT c.id FROM c JOIN docs d ON c.id = d.id WHERE c.id > '0' LIMIT 5";
+    let r = ok(&core, "alice", direct);
+    assert_eq!(ids(&r), want);
+    assert_eq!(r.columns, vec![engine::sql::exec::ColumnMeta::Id]);
+
+    // 列名リスト（別名）でも別名付きの `id` 型で公告し、値は `u64` のまま。
+    let aliased = "WITH c(i) AS (SELECT id FROM docs) \
+                   SELECT c.i FROM c JOIN docs d ON c.i = d.id WHERE c.i > '0' LIMIT 5";
+    let r = ok(&core, "alice", aliased);
+    assert_eq!(ids(&r), want);
+    assert_eq!(
+        r.columns,
+        vec![engine::sql::exec::ColumnMeta::AliasedId {
+            name: "i".to_string()
+        }]
+    );
+
+    // CTE→CTE の導出層（子の `WHERE id > 0`）も符号なしのまま評価する。
+    let derived = "WITH a AS MATERIALIZED (SELECT id, lang FROM docs), \
+                   b AS (SELECT id FROM a WHERE id > '0') \
+                   SELECT y.id FROM a x JOIN b y ON x.id = y.id LIMIT 5";
+    let r = ok(&core, "alice", derived);
+    assert_eq!(ids(&r), want);
+    assert_eq!(r.columns, vec![engine::sql::exec::ColumnMeta::Id]);
+
+    // 述語が行を絞る場合も `u64` の大小比較が正しい（`i64` に丸めない）。
+    let tight = "WITH c AS (SELECT id FROM docs) \
+                 SELECT c.id FROM c JOIN docs d ON c.id = d.id WHERE c.id > '5' LIMIT 5";
+    assert_eq!(ids(&ok(&core, "alice", tight)), vec![huge]);
+
+    // Describe は Execute と同じ公告になる。
+    let session = SessionState::default();
+    let parsed = core.parse_sql(direct).expect("parse");
+    let described = core
+        .describe_parsed_in_session(&session, &parsed)
+        .expect("describe")
+        .expect("has columns");
+    assert_eq!(described, vec![engine::sql::exec::ColumnMeta::Id]);
+}
+
+/// codex 指摘（PR #2729）: 親が `MATERIALIZED` の CTE を読む子が、導出できない述語（`ILIKE`）を持つとき、
+/// 親をインライン展開して基底表を再評価してはならない（文内 1 回評価・親の可視行上限の迂回）。
+/// 評価を始める前に固定の `0A000` で拒否する。
+#[test]
+fn materialized_parent_is_never_inlined_when_the_child_layer_is_not_derivable() {
+    let (core, _g) = open_with(None);
+    let before = evals(&core);
+    let sql = "WITH a AS MATERIALIZED (SELECT id, lang FROM docs), \
+               b AS (SELECT id FROM a WHERE lang ILIKE 'ja%') \
+               SELECT x.id FROM a x JOIN b y ON x.id = y.id LIMIT 100";
+    assert_eq!(code(&core, "alice", sql), "0A000");
+    assert_eq!(evals(&core), before, "rejected before any body evaluation");
+}
+
+/// 行 `id` を公開した CTE の列は、並べ替え・グルーピング・結合・述語では `u64` のまま扱えるが、集計の入力
+/// 写像は符号付きのセルを前提とするため、集計は内部エラーにせず固定の `0A000` で拒否する。
+#[test]
+fn row_id_column_of_a_cte_orders_groups_and_rejects_aggregates() {
+    let (core, _g, huge) = open_with_huge_ids();
+    let r = ok(
+        &core,
+        "alice",
+        "WITH c AS (SELECT id FROM docs) SELECT c.id FROM c JOIN docs d ON c.id = d.id \
+         ORDER BY c.id DESC LIMIT 5",
+    );
+    let got: Vec<u64> = r
+        .rows
+        .iter()
+        .map(|row| match row.cells.first() {
+            Some(engine::sql::exec::Cell::Integer(v)) => *v,
+            other => panic!("expected an unsigned id cell, got {other:?}"),
+        })
+        .collect();
+    assert_eq!(got, vec![huge, 1]);
+
+    let r = ok(
+        &core,
+        "alice",
+        "WITH c AS (SELECT id FROM docs) SELECT c.id, count(*) FROM c JOIN docs d ON c.id = d.id \
+         GROUP BY c.id",
+    );
+    assert_eq!(r.rows.len(), 2);
+
+    assert_eq!(
+        code(
+            &core,
+            "alice",
+            "WITH c AS (SELECT id FROM docs) SELECT max(c.id) FROM c JOIN docs d ON c.id = d.id",
+        ),
+        "0A000"
+    );
+}

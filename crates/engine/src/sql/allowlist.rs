@@ -22477,8 +22477,9 @@ fn validate_with_join_main(
 
 /// CTE `idx` が別の CTE（それより前に定義されたもの）を読む本文のとき、その親の添字と、評価済みの
 /// 親の行へ重ねる層（射影・`WHERE`）を返す。層が評価後射影形の外側として受理できない形
-/// （UDF 述語・サブクエリ等）なら `None`（呼び出し側は本文を 1 つの広域取得へインライン合成する。
-/// 結果は等しい）。
+/// （UDF 述語・サブクエリ等）なら `None`。本文が CTE でなく実表・ビューを読む場合の `None` は広域取得へ
+/// 合成してよいが、先行 CTE を読む本文の `None` は呼び出し側（`build_join_cte_inputs`）が `0A000` で拒否する
+/// （親のインライン再評価で共有・上限の契約を迂回させない）。
 fn derived_cte_layer(ctes: &[super::cte::CteDef], idx: usize) -> Option<(usize, BufferedRows)> {
     let body = ctes.get(idx)?.select_body()?;
     let parent = ctes
@@ -22571,6 +22572,19 @@ fn build_join_cte_inputs(
                 let select_body = def
                     .select_body()
                     .ok_or_else(super::cte::data_modifying_cte_unsupported)?;
+                // 本文が先行する CTE を読むのに層として導出できない形（`derived_cte_layer` が `None`）は、
+                // 親をインライン合成すると親の本文が slot とは別に基底表から再評価され、`MATERIALIZED`
+                // の文内 1 回評価・親の可視行上限の契約を迂回する。共有しうる親は必ず slot を経由させるため、
+                // 導出できないときはインラインへ退避せず固定文言の `0A000` で拒否する（fail-closed）。
+                if ctes.get(..idx).is_some_and(|earlier| {
+                    earlier
+                        .iter()
+                        .any(|d| d.name.eq_ignore_ascii_case(&select_body.table_name))
+                }) {
+                    return Err(SqlSurfaceError::feature_not_supported(
+                        "a CTE reading another CTE through an unsupported predicate cannot be a JOIN input",
+                    ));
+                }
                 let mut budget = super::cte::ResolveBudget::new();
                 let inner = super::cte::resolve_relation(
                     lookup,

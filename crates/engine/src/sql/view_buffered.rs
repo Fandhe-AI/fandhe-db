@@ -338,13 +338,25 @@ fn plan_rows(
 /// 行形の層（射影・`WHERE`）を、評価済みの本文の結果列に対して計画する（Issue #1861。
 /// `JOIN` が CTE を入力にするときの側スキャンと、CTE→CTE の導出が使う）。束縛・公開範囲・
 /// 同名列の規則は評価後射影形ビューの外側（[`plan_outer`]）と同じ [`plan_rows`] を共有する。
+///
+/// 行 `id` の結果列（`ColumnMeta::Id`）は、述語・射影の評価では `BIGINT`（符号付き）ではなく
+/// 疑似列 `id` と同じ numeric（`AliasedId` 相当）として束縛する。`BIGINT` だと `normalize_cell` が
+/// `u64` を `i64` へ変換して `i64::MAX` 超の有効な行 id を `22003` にするため。セル（`Cell::Integer(u64)`）
+/// は変えず、この関数の戻りの結果列では `id` は `AliasedId { name: "id" }` で公告される。
 pub(crate) fn plan_rows_layer(
     body_columns: &[ColumnMeta],
     view_name: &str,
     rows: &BufferedRows,
     udfs: &UdfRegistry,
 ) -> Result<OuterPlan, SqlSurfaceError> {
-    plan_rows(body_columns, view_name, rows, udfs)
+    let unsigned_ids: Vec<ColumnMeta> = body_columns
+        .iter()
+        .map(|m| match m {
+            ColumnMeta::Id => super::exec::aliased_id_column_meta("id"),
+            other => other.clone(),
+        })
+        .collect();
+    plan_rows(&unsigned_ids, view_name, rows, udfs)
 }
 
 /// [`plan_rows_layer`] の計画を評価済みの行へ適用する。集計形の計画は受け付けない（`Internal`）。

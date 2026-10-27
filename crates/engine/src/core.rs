@@ -84,6 +84,8 @@ mod dml_from_exec;
 // 述語形 UPDATE／DELETE の WHERE 内サブクエリの実行（SQL-53・Issue #1751）。
 mod dml_subquery_exec;
 // 述語形 UPDATE ... FROM／DELETE ... USING の結合実行（SQL-53・Issue #1755）。
+#[cfg(test)]
+mod cte_join_budget_tests;
 mod dml_join_exec;
 #[cfg(test)]
 mod dml_join_exec_tests;
@@ -1367,6 +1369,10 @@ pub struct EngineCore {
     /// 具体化経路が CTE 本文を記憶域に対して実行した累計回数（SQL-62・Issue #1861）。
     /// 観測専用で、結果・エラーには影響しない（[`MaterializedCteEvalStats`]）。
     materialized_cte_evals: std::sync::atomic::AtomicU64,
+    /// CTE を入力に持つ JOIN の文全体バイト予算の上限を差し替えるテスト専用の入口（既定 `None`＝本番の
+    /// 上限）。1 GiB の実データを作らずに予算の事前計上を固定するためで、本番ビルドには含めない。
+    #[cfg(test)]
+    cte_join_budget_cap_for_test: Option<usize>,
 }
 /// [`EngineCore::hnsw_state`] が保持する状態束（Issue #408）。`provider` は
 /// [`crate::hnsw::provider::HnswSearchProvider`]（`Copy`）のコピーであり、
@@ -2743,6 +2749,8 @@ impl EngineCore {
             hnsw_scope: crate::search_engine::HnswScope::default(),
             explain_index_name_scans: std::sync::atomic::AtomicU64::new(0),
             materialized_cte_evals: std::sync::atomic::AtomicU64::new(0),
+            #[cfg(test)]
+            cte_join_budget_cap_for_test: None,
         }
     }
 
@@ -2835,6 +2843,15 @@ impl EngineCore {
                 .explain_index_name_scans
                 .load(std::sync::atomic::Ordering::Relaxed),
         }
+    }
+
+    /// CTE を入力に持つ JOIN の文全体バイト予算を作る（Issue #1861）。テストビルドでは上限を差し替えられる。
+    fn cte_join_budget(&self) -> crate::sql::join::JoinBudget {
+        #[cfg(test)]
+        if let Some(cap) = self.cte_join_budget_cap_for_test {
+            return crate::sql::join::JoinBudget::with_cap(cap);
+        }
+        crate::sql::join::JoinBudget::for_statement()
     }
 
     /// 具体化経路が CTE 本文を記憶域に対して実行した累計回数（SQL-62・Issue #1861）。
@@ -8374,6 +8391,7 @@ impl EngineCore {
             ParsedSql::Statement(Statement::Join(validated)) => {
                 let table_names = crate::sql::join::collect_join_tables(validated);
                 let (_read_txn, mut schemas) = self.read_txn_with_schemas(&table_names)?;
+                let mut cte_ids = crate::sql::join::CteIdColumns::new();
                 // SQL-62・Issue #1861: CTE 入力は本文を実行せず、結果列だけを導出して Execute と同じ
                 // 関数で合成スキーマにする（Describe は本体を実行しない契約）。
                 if let Some(cte) = validated.cte_inputs.as_deref() {
@@ -8386,14 +8404,15 @@ impl EngineCore {
                             skip_vector_literal_validation,
                             limits,
                         )?;
-                        schemas.insert(
-                            rel.table().to_string(),
-                            crate::sql::join::cte_schema(rel.table(), &cols)?,
-                        );
+                        let (schema, id_columns) =
+                            crate::sql::join::cte_schema(rel.table(), &cols)?;
+                        schemas.insert(rel.table().to_string(), schema);
+                        cte_ids.insert(rel.table().to_string(), id_columns);
                     }
                 }
                 let columns = crate::sql::join::describe_columns(
                     &schemas,
+                    &cte_ids,
                     validated,
                     session.udfs(),
                     limits,
@@ -9198,7 +9217,10 @@ impl EngineCore {
                     // SQL-62・Issue #1861: CTE を入力に持つ JOIN。slot（CTE 本文）を参照者自身の
                     // `ctx`・同一の `read_txn` で評価し、評価済みの行を側入力として渡す。
                     Some(cte) => {
-                        let inputs = self.evaluate_join_cte_inputs(
+                        // CTE 本文の評価・共有キャッシュ・参照ごとの複製と、続く JOIN の走査・結合・
+                        // 出力生成は、1 つの文全体のバイト予算を共有する（確保の前に計上する）。
+                        let mut budget = self.cte_join_budget();
+                        let (inputs, cte_ids) = self.evaluate_join_cte_inputs(
                             ctx,
                             session,
                             read_txn,
@@ -9206,6 +9228,7 @@ impl EngineCore {
                             cte,
                             limits,
                             &mut schemas,
+                            &mut budget,
                         )?;
                         crate::sql::join::execute_with_cte_inputs(
                             read_txn,
@@ -9216,7 +9239,9 @@ impl EngineCore {
                             self.group_by_limits,
                             self.join_limits,
                             limits,
-                            &inputs,
+                            &cte_ids,
+                            inputs,
+                            budget,
                         )?
                     }
                 };
@@ -9306,8 +9331,8 @@ impl EngineCore {
     }
 
     /// JOIN の CTE 入力（SQL-62・Issue #1861）を評価し、リレーションごとの評価済みの行
-    /// （CTE でないリレーションは `None`）を返す。あわせて CTE の結果列から合成したスキーマを
-    /// `schemas` へ CTE 名（リレーションの綴りのまま）で加える。
+    /// （CTE でないリレーションは `None`）と、CTE の行 `id` を運ぶ列の表を返す。あわせて CTE の結果列から
+    /// 合成したスキーマを `schemas` へ CTE 名（リレーションの綴りのまま）で加える。
     ///
     /// slot は定義順（依存順）に、参照者自身の `ctx`・呼び出し元と同一の `read_txn`（単一
     /// スナップショット。RLS-10 (b)）で評価する。共有する slot（`MATERIALIZED`、または指定なしで
@@ -9315,6 +9340,9 @@ impl EngineCore {
     /// slot は参照のたびに評価する。保持した行は本関数の戻りで破棄され、他の文・他セッションとは
     /// 共有しない（SQL-62 (6)）。`Scan` 起点の本文は暗黙 `LIMIT` つきの広域取得で、可視行が
     /// `--max-result-rows` を超えたら黙って切り詰めず `54000`（SQL-62 (5)・SQL-34）。
+    ///
+    /// 評価結果・キャッシュ・複製の保持バイトはすべて呼び出し元の `budget`（後続の JOIN と共有する
+    /// 文全体の 1 つの予算）へ、確保・複製の前に計上する。超過は `54000`（部分結果は返さない）。
     #[allow(clippy::too_many_arguments)]
     fn evaluate_join_cte_inputs<R: crate::storage::read_source::ReadSource>(
         &self,
@@ -9325,29 +9353,37 @@ impl EngineCore {
         cte: &crate::sql::allowlist::JoinCteInputs,
         limits: crate::result_limits::ResultLimits,
         schemas: &mut std::collections::HashMap<String, crate::catalog::TableSchema>,
-    ) -> Result<Vec<Option<crate::sql::exec::QueryResult>>, crate::sql::allowlist::SqlSurfaceError>
-    {
+        budget: &mut crate::sql::join::JoinBudget,
+    ) -> Result<
+        (
+            Vec<Option<crate::sql::exec::QueryResult>>,
+            crate::sql::join::CteIdColumns,
+        ),
+        crate::sql::allowlist::SqlSurfaceError,
+    > {
         let mut cache: Vec<Option<crate::sql::exec::QueryResult>> = vec![None; cte.slots.len()];
         let mut inputs = Vec::with_capacity(validated.relations.len());
+        let mut cte_ids = crate::sql::join::CteIdColumns::new();
         for (rel, slot) in validated.relations.iter().zip(cte.relation_slot.iter()) {
             let Some(k) = slot else {
                 inputs.push(None);
                 continue;
             };
-            let result =
-                self.evaluate_cte_slot(ctx, session, read_txn, cte, *k, limits, &mut cache)?;
-            schemas.insert(
-                rel.table().to_string(),
-                crate::sql::join::cte_schema(rel.table(), &result.columns)?,
-            );
+            let result = self
+                .evaluate_cte_slot(ctx, session, read_txn, cte, *k, limits, &mut cache, budget)?;
+            let (schema, id_columns) = crate::sql::join::cte_schema(rel.table(), &result.columns)?;
+            schemas.insert(rel.table().to_string(), schema);
+            cte_ids.insert(rel.table().to_string(), id_columns);
             inputs.push(Some(result));
         }
-        Ok(inputs)
+        Ok((inputs, cte_ids))
     }
 
     /// CTE slot `k` の評価済みの行（列名リスト適用後）を返す（[`Self::evaluate_join_cte_inputs`]
     /// の再帰本体）。`Derived` は親 slot の評価済みの行へ層を重ねて導出し、記憶域を読まない
-    /// （数えない）。
+    /// （数えない）。生成・保持・複製のたびに `budget` へ計上する（`Scan` は走査へ残予算を上限として
+    /// 渡し、生成中に打ち切らせる。キャッシュ格納・ヒット時の複製・層の適用は借用のまま見積もって
+    /// から行う）。
     #[allow(clippy::too_many_arguments)]
     fn evaluate_cte_slot<R: crate::storage::read_source::ReadSource>(
         &self,
@@ -9358,37 +9394,45 @@ impl EngineCore {
         k: usize,
         limits: crate::result_limits::ResultLimits,
         cache: &mut Vec<Option<crate::sql::exec::QueryResult>>,
+        budget: &mut crate::sql::join::JoinBudget,
     ) -> Result<crate::sql::exec::QueryResult, crate::sql::allowlist::SqlSurfaceError> {
-        use crate::sql::allowlist::{CteSlotSource, SqlSurfaceError, Statement};
+        use crate::sql::allowlist::{CteSlotSource, SqlSurfaceError};
         let slot = cte.slots.get(k).ok_or_else(|| SqlSurfaceError::Internal {
             detail: "CTE slot out of range".to_string(),
         })?;
         if slot.shared {
             if let Some(hit) = cache.get(k).and_then(Option::as_ref) {
+                budget.charge_result(hit)?;
                 return Ok(hit.clone());
             }
         }
         let raw = match &slot.source {
             CteSlotSource::Scan(scan) => {
                 self.count_materialized_cte_eval();
-                match self.execute_read_statement_with_limits(
-                    ctx,
-                    session,
-                    Statement::Scan((**scan).clone()),
+                let schema = table_schema_in(read_txn, scan.table_name())?;
+                let bound = crate::sql::parser::bind_scan_with_dummy_flags(
+                    scan,
+                    &schema,
+                    session.udfs(),
+                    &[],
+                    &limits,
+                )?;
+                let result = crate::sql::scan::execute_scan_with_budget(
                     read_txn,
-                    limits,
-                )? {
-                    crate::sql::SqlOutcome::Query(result) => result,
-                    _ => {
-                        return Err(SqlSurfaceError::Internal {
-                            detail: "internal error".to_string(),
-                        })
-                    }
-                }
+                    ctx,
+                    &schema,
+                    &bound,
+                    budget.remaining(),
+                )?;
+                budget.charge_result(&result)?;
+                result
             }
             CteSlotSource::Derived { from, layer } => {
-                let parent =
-                    self.evaluate_cte_slot(ctx, session, read_txn, cte, *from, limits, cache)?;
+                let parent = self
+                    .evaluate_cte_slot(ctx, session, read_txn, cte, *from, limits, cache, budget)?;
+                // 層は親の行を消費して新しい行集合を作る（射影・絞り込みなので親以下の大きさ）。
+                // 適用中の保持量の上界として、適用の前に親の分をもう一度計上する。
+                budget.charge_result(&parent)?;
                 let plan = crate::sql::view_buffered::plan_rows_layer(
                     &parent.columns,
                     &slot.name,
@@ -9410,6 +9454,8 @@ impl EngineCore {
             }
         };
         if slot.shared {
+            // キャッシュに残す複製の分を、複製の前に計上する（返す値とは別に 1 部保持される）。
+            budget.charge_result(&result)?;
             if let Some(entry) = cache.get_mut(k) {
                 *entry = Some(result.clone());
             }
