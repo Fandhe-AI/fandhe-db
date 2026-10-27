@@ -35277,6 +35277,31 @@ mod tests {
         }
     }
 
+    /// 採番方式（疑似列 `id` なし・実列 `id` 未宣言）の表を模すフェイク（Issue #1875 レビュー指摘）。
+    struct AllocatedCatalog;
+
+    impl TableLookup for AllocatedCatalog {
+        fn table_exists(&self, name: &str) -> Result<bool, SqlSurfaceError> {
+            Ok(name == "t")
+        }
+        fn table_columns(&self, name: &str) -> Result<Option<Vec<String>>, SqlSurfaceError> {
+            Ok((name == "t").then(|| vec!["body".to_string()]))
+        }
+    }
+
+    /// 実列 `id` を持たない採番方式の表への `RETURNING id` は存在しない列として `42703` になる。
+    #[test]
+    fn data_modifying_cte_returning_id_on_allocated_table_is_42703() {
+        let sql = "WITH d AS (DELETE FROM t RETURNING id) SELECT * FROM d LIMIT 1";
+        let tokens = lexer::tokenize(sql).expect("tokenize");
+        let mut p = Parser::new(&tokens);
+        let ctes = p.parse_with_clause().expect("with clause");
+        let err =
+            crate::sql::cte::validate_data_modifying_cte(&AllocatedCatalog, &ctes, 0, &ctes[0])
+                .expect_err("id is not a column of an allocated table");
+        assert_eq!(err.wire_code(), "42703");
+    }
+
     /// データ変更 CTE の本文を構造解析し、検証関数が返す公開列を取り出す（解析・列解決のみ。実行なし）。
     fn dm_cte_exposed(sql: &str) -> Result<Vec<Option<Vec<String>>>, SqlSurfaceError> {
         let tokens = lexer::tokenize(sql)?;

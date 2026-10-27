@@ -412,7 +412,7 @@ pub(crate) fn validate_data_modifying_cte(
                 .table_columns(target)?
                 .ok_or_else(data_modifying_cte_unsupported)?;
             for col in cols {
-                if col != "id" && !known.iter().any(|k| k == col) {
+                if !known.iter().any(|k| k == col) {
                     return Err(SqlSurfaceError::undefined_column(col.clone()));
                 }
             }
