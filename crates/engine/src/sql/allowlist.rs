@@ -22909,10 +22909,10 @@ fn validate_with_statement(
         (p.remaining(), None)
     };
     // Issue #1861（SQL-62）: セッションの最上位 SELECT の入口に限り、JOIN の主クエリで CTE を入力として
-    // 参照できる。InlineOnly（ビュー本文・cursor・COPY・CTAS・サブクエリ内側）と、データ変更 CTE の
-    // 実行入口は従来どおり下の単一表の主クエリ解析へ流す（JOIN は `42601` のまま。fail-closed）。
-    if cte_evaluation == CteEvaluation::AllowMaterialize && !execute_dm && looks_like_join(main_src)
-    {
+    // 参照できる。InlineOnly（ビュー本文・cursor・COPY・CTAS・サブクエリ内側）は従来どおり下の単一表の
+    // 主クエリ解析へ流す（JOIN は `42601` のまま。fail-closed）。データ変更 CTE を含む JOIN 主クエリは、
+    // 検証後に固定 `0A000` で止める（`validate_with_join_main`。書き込みを発生させない）。
+    if cte_evaluation == CteEvaluation::AllowMaterialize && looks_like_join(main_src) {
         return Ok(WithOutcome::Read(validate_with_join_main(
             main_src, &ctes, lookup, limits,
         )?));
