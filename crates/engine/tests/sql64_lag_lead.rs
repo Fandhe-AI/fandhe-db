@@ -277,6 +277,14 @@ fn bare_column_defaults_use_declared_types() {
                     },
                     false,
                 ),
+                ColumnDef::new(
+                    "n3",
+                    ColumnType::Numeric {
+                        precision: 12,
+                        scale: 4,
+                    },
+                    false,
+                ),
                 ColumnDef::new("u1", ColumnType::Uuid, false),
                 ColumnDef::new("b1", ColumnType::Bytea, false),
                 ColumnDef::new("i1", ColumnType::Integer, false),
@@ -287,6 +295,9 @@ fn bare_column_defaults_use_declared_types() {
     let ctx = ctx_for("tenant-a");
     let cases = [
         ("lag(n1, 1, n2)", "0A000"),
+        // typmod（精度・スケール）違いの NUMERIC 同士も統一できる（`42804` にしない）。
+        ("lag(n1, 1, n3)", "0A000"),
+        ("lag(n3, 1, n1)", "0A000"),
         ("lag(u1, 1, u1)", "0A000"),
         ("lag(n1, 1, u1)", "42804"),
         ("lag(i1, 1, n1)", "42804"),

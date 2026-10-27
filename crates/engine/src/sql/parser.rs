@@ -9834,6 +9834,25 @@ fn unify_lag_lead_types(a: &ColumnType, b: &ColumnType) -> Option<ColumnType> {
         (ColumnType::Text | ColumnType::Varchar(_), ColumnType::Text | ColumnType::Varchar(_)) => {
             Some(ColumnType::Text)
         }
+        // NUMERIC は精度・スケールだけが異なっても統一できる（`COALESCE` は typmod を消して
+        // `ExprType::Numeric` で扱う）。整数部桁数・小数部桁数の大きい側を取り、全値を収める。
+        (
+            ColumnType::Numeric {
+                precision: pa,
+                scale: sa,
+            },
+            ColumnType::Numeric {
+                precision: pb,
+                scale: sb,
+            },
+        ) => {
+            let scale = (*sa).max(*sb);
+            let int_digits = pa.saturating_sub(*sa).max(pb.saturating_sub(*sb));
+            Some(ColumnType::Numeric {
+                precision: int_digits.saturating_add(scale),
+                scale,
+            })
+        }
         _ => match (int_rank(a), int_rank(b)) {
             (Some(x), Some(y)) => Some(if x >= y { a.clone() } else { b.clone() }),
             _ if a == b => Some(a.clone()),
