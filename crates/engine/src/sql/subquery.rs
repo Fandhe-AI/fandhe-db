@@ -2205,7 +2205,7 @@ fn cmp_quantified_cells(a: &Cell, b: &Cell) -> Result<std::cmp::Ordering, SqlSur
 ///   `col <> min OR col <> max`。
 /// - `ALL`: 内側が 0 行なら常に真（外側値が NULL でも真）。NULL を含めば真にならない
 ///   （偽か UNKNOWN）ため常に偽。`> >=` は `max`、`< <=` は `min`、`=` は `min == max` なら
-///   `col = min`、異なれば常に偽。
+///   `col = min`、異なれば `col = min AND col = max`（型変換で両方と等しくなりうるため）。
 ///
 /// 外側値が NULL の行は生成した比較が UNKNOWN になり除外される。判定材料は
 /// 可視行（外側と同じ `PolicyContext`・同じスナップショット）だけで、他テナントの行は影響しない。
@@ -2369,7 +2369,13 @@ fn resolve_quantified_compare(
                     if cmp_quantified_cells(min, max)? == Ordering::Equal {
                         Ok(vec![literal(ScalarSubqueryOp::Eq, min)?])
                     } else {
-                        Ok(falsum())
+                        // 異なる境界値でも、外側列の比較型（整数列×浮動小数、DOUBLE 列×BIGINT の
+                        // f64 変換等）では両方と等しくなりうる。個別比較の連言と一致させるため、
+                        // 恒偽にせず `col = min AND col = max` を返す（変換は単調なので中間値も同値）。
+                        Ok(vec![
+                            literal(ScalarSubqueryOp::Eq, min)?,
+                            literal(ScalarSubqueryOp::Eq, max)?,
+                        ])
                     }
                 }
                 // `<> ALL` は冒頭で `NOT IN` へ委譲済み。
