@@ -97,3 +97,82 @@ fn scan_result_is_bounded_by_the_remaining_shared_budget() {
     .expect_err("one copy does not fit");
     assert_eq!(err.wire_code(), "54000");
 }
+
+/// 層（射影）の出力行の見積もりは、同じ列の複数回選択ぶんの複製を数える（PR #2729 の codex 指摘。
+/// 親 1 部だけを追加計上すると、`SELECT body, body, body` が 3 部を確保してから拒否される）。
+/// 見積もりは `JoinBudget::charge_layer_output` が唯一の入口で、適用の前に呼ばれる。
+#[test]
+fn layer_output_estimate_counts_repeated_projection_columns() {
+    use crate::sql::allowlist::{BufferedRows, Projection};
+    use crate::sql::exec::{Cell, ColumnMeta, ResultRow};
+    use crate::sql::join::JoinBudget;
+    use crate::sql::udf_call::UdfRegistry;
+
+    let parent = QueryResult {
+        columns: vec![ColumnMeta::Scalar {
+            name: "body".to_string(),
+            ty: ColumnType::Text,
+        }],
+        rows: (0..ROWS)
+            .map(|id| ResultRow {
+                id,
+                score: 0.0,
+                cells: vec![Cell::Text("x".repeat(BODY_LEN))],
+            })
+            .collect(),
+    };
+    let layer_with = |cols: &[&str]| BufferedRows {
+        projection: Projection::Columns(cols.iter().map(|c| c.to_string()).collect()),
+        where_predicates: Vec::new(),
+        order_by: Vec::new(),
+        order_keys: Vec::new(),
+        window_items: Vec::new(),
+        limit: u32::MAX,
+        limit_explicit: false,
+        limit_implicit: false,
+        offset: 0,
+    };
+    let udfs = UdfRegistry::default();
+    let plan = |cols: &[&str]| {
+        crate::sql::view_buffered::plan_rows_layer(&parent.columns, "a", &layer_with(cols), &udfs)
+            .expect("plan")
+    };
+    let one = plan(&["body"])
+        .rows_output_bytes(&parent)
+        .expect("estimable");
+    let three = plan(&["body", "body", "body"])
+        .rows_output_bytes(&parent)
+        .expect("estimable");
+    let payload = (BODY_LEN as u64 * ROWS) as usize;
+    assert!(one >= payload, "one copy of the payload is counted");
+    assert!(three >= 3 * payload, "three copies are counted: {three}");
+
+    // 3 部は収まらず 1 部は収まる上限では、3 回選択の層だけが適用前に `54000` で拒否される。
+    let cap = 2 * payload;
+    let mut budget = JoinBudget::with_cap(cap);
+    budget
+        .charge_layer_output(&parent, &plan(&["body"]))
+        .expect("one copy fits");
+    let mut budget = JoinBudget::with_cap(cap);
+    let err = budget
+        .charge_layer_output(&parent, &plan(&["body", "body", "body"]))
+        .expect_err("three copies exceed the budget");
+    assert_eq!(err.wire_code(), "54000");
+}
+
+/// 同じ列を複数回選ぶ導出層を SQL から通す（列名リストで改名）。予算が十分なら結果が正しく、
+/// 3 部ぶんの保持量を見込む小さい予算では `54000` になる。
+#[test]
+fn repeated_projection_in_a_derived_layer_is_charged_and_correct() {
+    let (mut core, _g) = open();
+    let sql = "WITH a AS MATERIALIZED (SELECT id, body FROM docs), \
+               b(x, y, z) AS (SELECT body, body, body FROM a) \
+               SELECT p.x, q.z FROM b p JOIN b q ON p.x = q.x WHERE p.x = 'none' LIMIT 5";
+    core.cte_join_budget_cap_for_test = Some(64 * 1024 * 1024);
+    assert!(run(&core, sql).expect("fits").rows.is_empty());
+    core.cte_join_budget_cap_for_test = Some(30_000);
+    assert_eq!(
+        run(&core, sql).expect_err("over budget").wire_code(),
+        "54000"
+    );
+}

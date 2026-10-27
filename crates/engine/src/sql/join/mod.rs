@@ -185,6 +185,23 @@ impl JoinBudget {
         self.charge(result_bytes(result.columns.len(), &result.rows))
     }
 
+    /// 行形の層（射影・絞り込み）を `parent` に適用して作る出力行の分を、適用の **前** に計上する。
+    /// 同じ列の複数回選択で出力が親より大きくなりうるため、親の分の再計上ではなく射影の出現回数から
+    /// 見積もる（[`crate::sql::view_buffered::OuterPlan::rows_output_bytes`]）。見積もれない計画は
+    /// `Internal`（fail-closed）。
+    pub(crate) fn charge_layer_output(
+        &mut self,
+        parent: &crate::sql::exec::QueryResult,
+        plan: &crate::sql::view_buffered::OuterPlan,
+    ) -> Result<(), SqlSurfaceError> {
+        let bytes = plan
+            .rows_output_bytes(parent)
+            .ok_or_else(|| SqlSurfaceError::Internal {
+                detail: "layer output size is not estimable".to_string(),
+            })?;
+        self.charge(bytes)
+    }
+
     pub(crate) fn charge(&mut self, bytes: usize) -> Result<(), SqlSurfaceError> {
         self.used = self.used.saturating_add(bytes);
         if self.used > self.cap {
@@ -452,18 +469,18 @@ fn execute_with_inputs(
     // 現れない（RLS-10 相当）。
     let mut sides: Vec<Vec<ResultRow>> = Vec::with_capacity(plan.scans.len());
     for (i, (schema, bound_scan)) in plan.schemas.iter().zip(bound.iter()).enumerate() {
-        // CTE 入力の側スキャンは、結果が入力以下の大きさ（射影・絞り込み）で、適用中は入力と結果の両方を
-        // 保持するため、適用の **前** に入力の分を計上済みにする（結果の計上は不要）。
+        // CTE 入力の側スキャンは、出力行の見積もり（射影の重複込みの上界）を適用の **前** に
+        // 計上する（`apply_cte_side_scan`）ため、適用後の再計上は不要。
         let mut charged_before_apply = false;
         let result = match inputs.get_mut(i).and_then(Option::take) {
             // CTE の評価済みの行（Issue #1861）。側スキャンは `view_buffered` の外側計画と同じ
             // 束縛・評価の規則で適用する（第 2 の評価器を作らない）。入力は所有権ごと渡して消費し、
             // 複製を作らない（保持分は評価時に `budget` へ計上済み）。
             Some(body) => {
-                budget.charge_result(&body)?;
                 charged_before_apply = true;
                 apply_cte_side_scan(
                     body,
+                    &mut budget,
                     plan.scans.get(i).ok_or_else(|| SqlSurfaceError::Internal {
                         detail: "JOIN side scan missing".to_string(),
                     })?,
@@ -665,9 +682,10 @@ pub(crate) fn cte_schema(
 /// 評価済みの CTE の行 `body` に、側スキャン `scan`（射影＋プッシュダウン済み述語）を適用する
 /// （Issue #1861）。評価済みの行は文のローカルな所有値で、他の文・他セッションとは共有しない。
 /// 述語・射影の束縛は `view_buffered::plan_rows_layer`（評価後射影形ビューの外側と同じ規則）で、
-/// 本文が公開しない列は `22000` で拒否される。
+/// 本文が公開しない列は `22000` で拒否される。出力行の保持量は `budget` へ適用前に計上する。
 fn apply_cte_side_scan(
     body: QueryResult,
+    budget: &mut JoinBudget,
     scan: &crate::sql::allowlist::ValidatedScan,
     udfs: &UdfRegistry,
 ) -> Result<QueryResult, SqlSurfaceError> {
@@ -684,6 +702,8 @@ fn apply_cte_side_scan(
     };
     let plan =
         crate::sql::view_buffered::plan_rows_layer(&body.columns, scan.table_name(), &layer, udfs)?;
+    // 出力行（射影の複製を含む）の分を、適用の前に共有予算へ計上する（唯一の見積もり）。
+    budget.charge_layer_output(&body, &plan)?;
     crate::sql::view_buffered::apply_rows_layer(body, &plan)
 }
 

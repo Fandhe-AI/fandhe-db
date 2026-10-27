@@ -379,6 +379,37 @@ pub(crate) fn plan_rows_layer(
     plan_rows(&unsigned_ids, view_name, rows, udfs)
 }
 
+impl OuterPlan {
+    /// 行形の層 [`apply_rows_layer`] が `parent` から作る出力行の推定バイト量（上界）。
+    ///
+    /// 出力は射影した列のセルの複製なので、同じ列を複数回選ぶ射影（`SELECT body, body, body`）は
+    /// 親より大きくなりうる。出現回数ぶんの複製を数え、絞り込み・`LIMIT` は無視する（上界）。
+    /// 層を適用して新しい行を作る経路（CTE→CTE の導出・JOIN の側スキャン）は、適用の **前** に
+    /// この値を共有予算へ計上する（`join::JoinBudget::charge_layer_output`。見積もりの唯一の実装）。
+    /// 集計形の計画は層として受け付けないため `None`。
+    pub(crate) fn rows_output_bytes(&self, parent: &QueryResult) -> Option<usize> {
+        let OuterKind::Rows(plan) = &self.kind else {
+            return None;
+        };
+        let per_row = plan
+            .out
+            .len()
+            .saturating_mul(std::mem::size_of::<Cell>())
+            .saturating_add(std::mem::size_of::<ResultRow>());
+        let mut total = per_row.saturating_mul(parent.rows.len());
+        for row in &parent.rows {
+            for col in &plan.out {
+                if let OutCol::Plain(i) = col {
+                    if let Some(cell) = row.cells.get(*i) {
+                        total = total.saturating_add(super::join::cell_payload_bytes(cell));
+                    }
+                }
+            }
+        }
+        Some(total)
+    }
+}
+
 /// [`plan_rows_layer`] の計画を評価済みの行へ適用する。集計形の計画は受け付けない（`Internal`）。
 pub(crate) fn apply_rows_layer(
     result: QueryResult,

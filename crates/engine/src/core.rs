@@ -9495,15 +9495,15 @@ impl EngineCore {
             CteSlotSource::Derived { from, layer } => {
                 let parent = self
                     .evaluate_cte_slot(ctx, session, read_txn, cte, *from, limits, cache, budget)?;
-                // 層は親の行を消費して新しい行集合を作る（射影・絞り込みなので親以下の大きさ）。
-                // 適用中の保持量の上界として、適用の前に親の分をもう一度計上する。
-                budget.charge_result(&parent)?;
                 let plan = crate::sql::view_buffered::plan_rows_layer(
                     &parent.columns,
                     &slot.name,
                     layer,
                     session.udfs(),
                 )?;
+                // 層は親の行から射影のセルを複製して新しい行集合を作る。同じ列の複数回選択で親より
+                // 大きくなりうるため、出力の見積もり（上界）を適用の **前** に計上する。
+                budget.charge_layer_output(&parent, &plan)?;
                 crate::sql::view_buffered::apply_rows_layer(parent, &plan)?
             }
         };
