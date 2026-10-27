@@ -9640,6 +9640,11 @@ impl EngineCore {
             CteSlotSource::Derived { from, layer } => {
                 let parent = self
                     .evaluate_cte_slot(ctx, session, read_txn, cte, *from, limits, cache, budget)?;
+                // tail CTE（Issue #1862）の明示 `LIMIT` は設定値の範囲で検査する（構文段は
+                // 設定値を持たない。Scan 側の `bind_scan_with_dummy_flags` と同じ契約）。
+                if layer.limit_explicit {
+                    crate::sql::parser::validate_search_limit_with(layer.limit, &limits)?;
+                }
                 let plan = crate::sql::view_buffered::plan_rows_layer(
                     &parent.columns,
                     &slot.name,
