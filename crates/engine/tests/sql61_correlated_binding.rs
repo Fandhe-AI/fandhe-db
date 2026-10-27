@@ -100,14 +100,15 @@ fn setup() -> (EngineCore, PolicyContext, CleanupGuard) {
 fn sql61_qualified_outer_refs_reach_binding_and_fail_closed_as_correlated() {
     let (core, ctx, _g) = setup();
     for sql in [
-        "SELECT id FROM docs x WHERE EXISTS (SELECT id FROM refs WHERE refs.lang = x.lang LIMIT 1) LIMIT 10",
+        // 肯定形の相関 `EXISTS` は SQL-61（Issue #1842）で実行できる
+        // （`tests/sql61_correlated_exists.rs`）。ここでは反結合以降の範囲（#1843・#1844）を固定する。
         "SELECT id FROM docs x WHERE NOT EXISTS (SELECT id FROM refs WHERE lang = x.lang LIMIT 1) LIMIT 10",
         "SELECT id FROM docs x WHERE lang IN (SELECT lang FROM refs WHERE x.id = 1 LIMIT 10) LIMIT 10",
         "SELECT id FROM docs x WHERE lang NOT IN (SELECT lang FROM refs WHERE x.id = 1 LIMIT 10) LIMIT 10",
         "SELECT id FROM docs x WHERE lang = (SELECT lang FROM refs WHERE x.id = id LIMIT 1) LIMIT 10",
         "SELECT id FROM docs x WHERE lang = (SELECT COUNT(x.id) FROM refs) LIMIT 10",
         "SELECT id FROM docs x WHERE lang IN (SELECT lang FROM refs WHERE id IN (SELECT id FROM refs WHERE lang = x.lang LIMIT 10) LIMIT 10) LIMIT 10",
-        "SELECT id FROM docs WHERE EXISTS (SELECT id FROM refs WHERE docs.lang = lang LIMIT 1) LIMIT 10",
+        "SELECT id FROM docs WHERE NOT EXISTS (SELECT id FROM refs WHERE docs.lang = lang LIMIT 1) LIMIT 10",
     ] {
         let (code, msg) = err(&core, &ctx, sql);
         assert_eq!(code, "42601", "{sql}: {msg}");
@@ -139,7 +140,7 @@ fn sql61_unqualified_outer_only_column_is_correlated() {
     let (code, msg) = err(
         &core,
         &ctx,
-        "SELECT id FROM docs WHERE EXISTS (SELECT id FROM refs WHERE lang = outer_only LIMIT 1) LIMIT 10",
+        "SELECT id FROM docs WHERE NOT EXISTS (SELECT id FROM refs WHERE lang = outer_only LIMIT 1) LIMIT 10",
     );
     assert_eq!(code, "42601");
     assert!(msg.contains("correlated"), "{msg}");
@@ -215,7 +216,7 @@ fn sql61_errors_do_not_depend_on_other_tenant_rows() {
     seed(&core, &b, "refs", 8, "de");
     seed(&core, &b, "refs", 9, "it");
     for sql in [
-        "SELECT id FROM docs x WHERE EXISTS (SELECT id FROM refs WHERE lang = x.lang LIMIT 1) LIMIT 10",
+        "SELECT id FROM docs x WHERE NOT EXISTS (SELECT id FROM refs WHERE lang = x.lang LIMIT 1) LIMIT 10",
         "SELECT id FROM docs x WHERE EXISTS (SELECT id FROM refs WHERE lang = x.zz LIMIT 1) LIMIT 10",
         "SELECT id FROM docs x WHERE EXISTS (SELECT id FROM refs WHERE zzz.lang = lang LIMIT 1) LIMIT 10",
     ] {

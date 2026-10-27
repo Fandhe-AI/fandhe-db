@@ -2043,7 +2043,8 @@ fn declarative_leaf_to_filter(
         | WherePredicate::Exists { .. }
         | WherePredicate::ScalarSubqueryCompare { .. }
         | WherePredicate::QuantifiedSubqueryCompare { .. }
-        | WherePredicate::IdCompare { .. } => Err(SqlSurfaceError::Internal {
+        | WherePredicate::IdCompare { .. }
+        | WherePredicate::CorrelatedExists(_) => Err(SqlSurfaceError::Internal {
             detail: "declarative predicate binding reached a non-declarative WherePredicate"
                 .to_string(),
         }),
@@ -2716,6 +2717,17 @@ fn bind_where_predicates_recursive(
                     op: *op,
                     value: *value,
                 });
+            }
+            // Issue #1842・SQL-61: 相関 `EXISTS` の外側の行ごとの判定（`sql::subquery` が解決段で
+            // 生成する内部専用の葉）。式述語と同じ `expr_filters` へ載せ、外側の行スカラーと `id` から
+            // 常に真偽を返す。索引化できない式述語のため走査経路は全走査へ縮退する。
+            WherePredicate::CorrelatedExists(probe) => {
+                *node_budget = node_budget.checked_sub(1).ok_or_else(|| {
+                    SqlSurfaceError::payload_too_large("WHERE expression is too large")
+                })?;
+                expr_filters.push(crate::sql::udf_call::BoundExpr::CorrelatedExists(
+                    probe.clone(),
+                ));
             }
             WherePredicate::Or(branches) => {
                 // 配列の `<>`／`NOT a = b` は `where_negation` が `a < b OR a > b` へ脱糖するが、
@@ -9891,6 +9903,8 @@ pub(crate) fn collect_where_predicate_idents(
             WherePredicate::IdCompare { .. } => {
                 out.insert("id".to_string());
             }
+            // 外側の列は構築時にインデックスへ解決済みで、識別子としては現れない。
+            WherePredicate::CorrelatedExists(_) => {}
             WherePredicate::Expression(expr) => collect_expr_idents(expr, out),
             // `NOT` は内側を再帰する（`sql::view::check_predicate_columns_within`
             // と同じ理由: 否定越しの列参照見落としを防ぐ）。

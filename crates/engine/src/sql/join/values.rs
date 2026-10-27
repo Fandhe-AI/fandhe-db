@@ -21,7 +21,7 @@ use crate::sql::udf_call::BinOp;
 /// `id`・`INTEGER`・`BIGINT`）は相互に結合できる（外部キー設計 `a.id = b.fk` 形を
 /// 成立させるため）。それ以外は完全一致（`Enum` は型名まで一致）が必要。
 #[derive(Debug, Clone, PartialEq, Eq)]
-pub(super) enum JoinKeyClass {
+pub(crate) enum JoinKeyClass {
     Integer,
     Text,
     Bool,
@@ -35,7 +35,7 @@ pub(super) enum JoinKeyClass {
 /// 結合キーとして許可する列型を判定する（Issue #925 §2.3）。`None` は疑似列
 /// `id`（整数クラス）。`VECTOR`・`REAL`／`DOUBLE`／`NUMERIC`／`JSON`／`JSONB`／
 /// `ARRAY` は許可しない（`42601`）。
-pub(super) fn key_class(ty: Option<&ColumnType>) -> Result<JoinKeyClass, SqlSurfaceError> {
+pub(crate) fn key_class(ty: Option<&ColumnType>) -> Result<JoinKeyClass, SqlSurfaceError> {
     match ty {
         None => Ok(JoinKeyClass::Integer),
         Some(ColumnType::SmallInt | ColumnType::Integer | ColumnType::BigInt) => {
@@ -65,7 +65,7 @@ fn push_len_prefixed(out: &mut Vec<u8>, bytes: &[u8]) -> Result<(), SqlSurfaceEr
 /// 結合キー 1 成分（セル＋型クラス）を正準バイト列へ追記する（Issue #925
 /// §2.4）。型クラスは束縛段の型検証を通過済みのため、`class` と `cell` の組み合わせは
 /// 常に整合する（不整合は内部バグとして防御的に拒否する。fail-closed）。
-pub(super) fn encode_key_component(
+pub(crate) fn encode_key_component(
     cell: &Cell,
     class: &JoinKeyClass,
     out: &mut Vec<u8>,
@@ -113,7 +113,7 @@ pub(super) fn encode_key_component(
 /// 最小アダプタで、結合キーとして許可する型クラス（[`key_class`]）だけを扱い、キーの正準化を
 /// 2 系統にしない（両経路のバイト列一致は単体テストで固定する）。`class` と値が整合しない
 /// 組は内部バグとして `Internal`（fail-closed）。
-pub(super) fn key_cell_from_scalar(
+pub(crate) fn key_cell_from_scalar(
     scalar: &ScalarRef<'_>,
     class: &JoinKeyClass,
 ) -> Result<Cell, SqlSurfaceError> {
@@ -285,7 +285,9 @@ pub(crate) fn cell_scalar<'a>(
     };
     Ok(match (ty, cell) {
         (_, Cell::Null) => None,
-        (ColumnType::Text | ColumnType::Varchar(_), Cell::Text(s)) => Some(ScalarRef::Text(s)),
+        (ColumnType::Text | ColumnType::Varchar(_) | ColumnType::Bpchar(_), Cell::Text(s)) => {
+            Some(ScalarRef::Text(s))
+        }
         (ColumnType::Enum(_), Cell::Text(s)) => Some(ScalarRef::Enum(s)),
         (ColumnType::SmallInt, Cell::SignedInteger(v)) => Some(ScalarRef::Integer(i32::from(
             i16::try_from(*v).map_err(|_| bug("SMALLINT value out of range"))?,

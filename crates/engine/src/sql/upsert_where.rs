@@ -211,7 +211,7 @@ fn reject_forbidden_elements(predicates: &[WherePredicate]) -> Result<(), SqlSur
                         walk(branch)?;
                     }
                 }
-                WherePredicate::IdCompare { .. } => {
+                WherePredicate::IdCompare { .. } | WherePredicate::CorrelatedExists(_) => {
                     return Err(SqlSurfaceError::unsupported(
                         "unsupported predicate in ON CONFLICT DO UPDATE WHERE",
                     ));
