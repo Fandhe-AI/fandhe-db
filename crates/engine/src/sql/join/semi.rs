@@ -190,6 +190,14 @@ enum ProbeRows {
         by_key: HashMap<Vec<u8>, Vec<u32>>,
         predicates: Vec<BoundOrGroup>,
     },
+    /// 集計形の相関スカラーの値表（Issue #1848。式の内側へ埋め込む形）。相関キーの正準バイト列 →
+    /// 集計値。`empty` は該当する内側のグループが無い外側の行（キーが NULL を含む行を含む）の値
+    /// （空集合に対する集計値。`count` は 0、それ以外は NULL）。可視行由来の値を持つため `Debug` は
+    /// 導出しない。
+    AggValues {
+        by_key: HashMap<Vec<u8>, Cell>,
+        empty: Cell,
+    },
 }
 
 /// 集計形の相関スカラー比較（Issue #1846）の述語表。`sql::subquery` が内側の `GROUP BY` 集計の
@@ -217,6 +225,9 @@ pub(crate) enum ProbeKind {
     /// 非集計形の相関スカラー（Issue #1847）。`offset`／`limit` は内側 `OFFSET`／`LIMIT`
     /// （`limit` が `None` は上限なし）で、一致行の先頭 `offset` 件を飛ばし最大 `limit` 件を採る。
     ScalarRows { offset: usize, limit: Option<usize> },
+    /// 集計形の相関スカラーの値（Issue #1848。式の内側へ埋め込む形）。真偽ではなく値を返すため
+    /// [`CorrelatedProbe::eval`] は使えず、[`CorrelatedProbe::scalar_value`] で引く。
+    ScalarAggValue,
 }
 
 /// 残余述語の評価器。内側スキーマに外側参照ごとの列を足した合成スキーマで束縛した結果を
@@ -312,8 +323,12 @@ impl CorrelatedProbe {
             budget,
             byte_cap,
         } = spec;
-        if matches!(kind, ProbeKind::ScalarRows { .. }) {
-            // 非集計形の相関スカラーは [`Self::scalar_rows`] で組み立てる。破れたら fail-closed。
+        if matches!(
+            kind,
+            ProbeKind::ScalarRows { .. } | ProbeKind::ScalarAggValue
+        ) {
+            // 非集計形・集計値の相関スカラーは [`Self::scalar_rows`]／[`Self::scalar_agg_value`] で
+            // 組み立てる。破れたら fail-closed。
             return Err(SqlSurfaceError::Internal {
                 detail: "correlated scalar rows probe was built through the generic path"
                     .to_string(),
@@ -333,9 +348,10 @@ impl CorrelatedProbe {
         let mut buckets: HashMap<Vec<u8>, NotInBucket> = HashMap::new();
         let not_in_class = match &kind {
             ProbeKind::NotIn { target } => Some(target.class.clone()),
-            ProbeKind::Exists { .. } | ProbeKind::ScalarCompare | ProbeKind::ScalarRows { .. } => {
-                None
-            }
+            ProbeKind::Exists { .. }
+            | ProbeKind::ScalarCompare
+            | ProbeKind::ScalarRows { .. }
+            | ProbeKind::ScalarAggValue => None,
         };
         let keep_rows = residual.is_some();
         'rows: for input in inputs {
@@ -438,7 +454,8 @@ impl CorrelatedProbe {
                 ProbeKind::NotIn { target } => Some(target),
                 ProbeKind::Exists { .. }
                 | ProbeKind::ScalarCompare
-                | ProbeKind::ScalarRows { .. } => None,
+                | ProbeKind::ScalarRows { .. }
+                | ProbeKind::ScalarAggValue => None,
             })
             .filter_map(|k| match k.source {
                 OuterSource::Column(i) => Some(i),
@@ -618,6 +635,38 @@ impl CorrelatedProbe {
         }
     }
 
+    /// 集計形の相関スカラーの値プローブを組み立てる（Issue #1848。式の内側へ埋め込む形）。
+    /// `values` は内側の `GROUP BY` 集計の結果（相関キーの正準バイト列 → 集計値。確保済みで、
+    /// 予算の計上は呼び出し側が確保前に済ませている）、`empty` は一致するグループが無い外側の行の値。
+    pub(crate) fn scalar_agg_value(
+        keys: Vec<OuterKey>,
+        values: HashMap<Vec<u8>, Cell>,
+        empty: Cell,
+        budget: Arc<CorrelatedBudget>,
+    ) -> Self {
+        let mut outer_columns: Vec<usize> = keys
+            .iter()
+            .filter_map(|k| match k.source {
+                OuterSource::Column(i) => Some(i),
+                OuterSource::Id => None,
+            })
+            .collect();
+        outer_columns.sort();
+        outer_columns.dedup();
+        Self {
+            keys,
+            rows: ProbeRows::AggValues {
+                by_key: values,
+                empty,
+            },
+            residual: None,
+            min_matches: 1,
+            kind: ProbeKind::ScalarAggValue,
+            budget,
+            outer_columns,
+        }
+    }
+
     /// 外側スキーマで評価に必要な論理列インデックス（デコード対象へ含める用）。
     pub(crate) fn outer_columns(&self) -> &[usize] {
         &self.outer_columns
@@ -639,6 +688,8 @@ impl CorrelatedProbe {
             ProbeKind::NotIn { target } => self.eval_not_in(target, row_scalars, id),
             ProbeKind::ScalarCompare => self.eval_scalar_compare(row_scalars, id),
             ProbeKind::ScalarRows { .. } => self.eval_scalar_rows(row_scalars, id),
+            // 値を返すプローブは真偽の入口では使えない（構築側の不変条件違反。fail-closed）。
+            ProbeKind::ScalarAggValue => Err(unexpected_scalar_layout()),
         }
     }
 
@@ -676,6 +727,17 @@ impl CorrelatedProbe {
         row_scalars: &[Option<ScalarRef<'_>>],
         id: u64,
     ) -> Result<Option<&Cell>, SqlSurfaceError> {
+        // 集計形（Issue #1848）: 相関キーで値表を引く。キーが NULL・グループ無しは空集合の値。
+        // ハッシュ引きのため再評価予算は計上しない（#1846 の比較形と同じ定義）。
+        if matches!(self.kind, ProbeKind::ScalarAggValue) {
+            let ProbeRows::AggValues { by_key, empty } = &self.rows else {
+                return Err(unexpected_scalar_layout());
+            };
+            return Ok(Some(match self.outer_key(row_scalars, id)? {
+                Some(key) => by_key.get(&key).unwrap_or(empty),
+                None => empty,
+            }));
+        }
         match self.pick_scalar(row_scalars, id)? {
             None => Ok(None),
             Some(row) => match &row.scalar {
@@ -850,11 +912,12 @@ impl CorrelatedProbe {
                 Ok(!decided_false)
             }
             // `NotIn` の構築は `NotIn`／`Rows` のどちらかだけ。破れたら fail-closed。
-            ProbeRows::Counts(_) | ProbeRows::Scalar(_) | ProbeRows::ScalarRows { .. } => {
-                Err(SqlSurfaceError::Internal {
-                    detail: "correlated NOT IN probe has an unexpected row layout".to_string(),
-                })
-            }
+            ProbeRows::Counts(_)
+            | ProbeRows::Scalar(_)
+            | ProbeRows::ScalarRows { .. }
+            | ProbeRows::AggValues { .. } => Err(SqlSurfaceError::Internal {
+                detail: "correlated NOT IN probe has an unexpected row layout".to_string(),
+            }),
         }
     }
 
@@ -912,11 +975,12 @@ impl CorrelatedProbe {
                 self.count_matches(rows, indices, residual, row_scalars, id)
             }
             // `Exists` 種別では構築されない形。破れたら fail-closed。
-            ProbeRows::NotIn(_) | ProbeRows::Scalar(_) | ProbeRows::ScalarRows { .. } => {
-                Err(SqlSurfaceError::Internal {
-                    detail: "correlated EXISTS probe has an unexpected row layout".to_string(),
-                })
-            }
+            ProbeRows::NotIn(_)
+            | ProbeRows::Scalar(_)
+            | ProbeRows::ScalarRows { .. }
+            | ProbeRows::AggValues { .. } => Err(SqlSurfaceError::Internal {
+                detail: "correlated EXISTS probe has an unexpected row layout".to_string(),
+            }),
         }
     }
 
@@ -1560,6 +1624,162 @@ mod tests {
                     offset: 0,
                     limit: None,
                 },
+                budget: budget(),
+                byte_cap: usize::MAX,
+            },
+            std::iter::empty(),
+        )
+        .err()
+        .expect("generic build is rejected");
+        assert_eq!(e.wire_code(), "XX000");
+        assert_eq!(p.outer_columns(), &[0]);
+        let r = CorrelatedProbeRef::new(p);
+        assert_eq!(format!("{r:?}"), "CorrelatedProbeRef(..)");
+    }
+
+    /// 式の内側の相関スカラーの葉（Issue #1848）は、再帰評価とコンパイル済み評価で同じ値・同じ NULL・
+    /// 同じエラーを返し、デコード対象へ外側キー列を含める。
+    #[test]
+    fn correlated_scalar_leaf_agrees_between_recursive_and_compiled_evaluators() {
+        use crate::catalog::ColumnType;
+        use crate::sql::correlated_scalar::CorrelatedScalarRef;
+        use crate::sql::expr_program::ExprProgram;
+        use crate::sql::udf_call::{
+            eval_with_scalars, mark_referenced_scalar_columns, visit_referenced_scalar_columns,
+            BinOp, BoundExpr, ExprValue,
+        };
+        let leaf = CorrelatedScalarRef::from_probe(
+            CorrelatedProbeRef::new(agg_value_probe(Cell::Null)),
+            ColumnType::BigInt,
+        );
+        // leaf + 1（NULL は式の中で伝播する）。
+        let expr = BoundExpr::Binary {
+            op: BinOp::Add,
+            lhs: Box::new(BoundExpr::CorrelatedScalar(leaf.clone())),
+            rhs: Box::new(BoundExpr::Number(1.0)),
+        };
+        let program = ExprProgram::compile(&expr);
+        let mut scratch = Vec::new();
+        let rows: Vec<Vec<Option<ScalarRef<'_>>>> = vec![
+            vec![Some(ScalarRef::BigInt(1))],
+            vec![Some(ScalarRef::BigInt(2))],
+            vec![Some(ScalarRef::BigInt(9))],
+            vec![None],
+        ];
+        let mut got = Vec::new();
+        for row in &rows {
+            let recursive = eval_with_scalars(&expr, 1, &[], row).expect("recursive");
+            let compiled = program.eval(1, &[], row, &mut scratch).expect("compiled");
+            assert_eq!(recursive, compiled);
+            got.push(recursive);
+        }
+        // キー 1 → 50、キー 2 → 20、グループ無し・NULL キーは空集合の値（NULL）。
+        assert_eq!(
+            got,
+            vec![
+                ExprValue::Scalar(51.0),
+                ExprValue::Scalar(21.0),
+                ExprValue::Null,
+                ExprValue::Null
+            ]
+        );
+        // 範囲外の外側列は両評価器とも XX000（NULL と取り違えない）。
+        assert_eq!(
+            eval_with_scalars(&expr, 1, &[], &[])
+                .unwrap_err()
+                .wire_code(),
+            "XX000"
+        );
+        assert_eq!(
+            program
+                .eval(1, &[], &[], &mut scratch)
+                .unwrap_err()
+                .wire_code(),
+            "XX000"
+        );
+        // 外側キー列がデコード対象に含まれる。
+        let leaf_expr = BoundExpr::CorrelatedScalar(leaf);
+        let mut mask = [false; 2];
+        assert!(mark_referenced_scalar_columns(&leaf_expr, &mut mask));
+        assert_eq!(mask, [true, false]);
+        let mut visited = Vec::new();
+        visit_referenced_scalar_columns(&leaf_expr, &mut |i| visited.push(i));
+        assert_eq!(visited, vec![0]);
+        // 遅延エラーの葉は外側の行を評価した時点でそのエラーを返す（外側が 0 行なら評価されない）。
+        let deferred = BoundExpr::CorrelatedScalar(CorrelatedScalarRef::deferred(
+            SqlSurfaceError::cardinality_violation(),
+            ColumnType::Integer,
+        ));
+        assert_eq!(
+            eval_with_scalars(&deferred, 1, &[], &[])
+                .unwrap_err()
+                .wire_code(),
+            "21000"
+        );
+        assert_eq!(
+            ExprProgram::compile(&deferred)
+                .eval(1, &[], &[], &mut scratch)
+                .unwrap_err()
+                .wire_code(),
+            "21000"
+        );
+    }
+
+    /// 値表（相関キー → 集計値）を持つ集計値プローブ（Issue #1848）。キー 1 → 50、キー 2 → 20。
+    /// 空集合の値は `count` 相当の 0。
+    fn agg_value_probe(empty: Cell) -> CorrelatedProbe {
+        let mut by_key = HashMap::new();
+        for (k, v) in [(1i64, 50i64), (2, 20)] {
+            let mut key = Vec::new();
+            encode_key_component(&Cell::SignedInteger(k), &JoinKeyClass::Integer, &mut key)
+                .expect("encode");
+            by_key.insert(key, Cell::SignedInteger(v));
+        }
+        CorrelatedProbe::scalar_agg_value(int_key(), by_key, empty, budget())
+    }
+
+    #[test]
+    fn scalar_agg_value_returns_group_value_or_the_empty_set_value() {
+        let p = agg_value_probe(Cell::Integer(0));
+        // 一致するグループは集計値。型の異なる外側（INTEGER／BIGINT）でも同じキーで引ける。
+        assert_eq!(
+            p.scalar_value(&[Some(ScalarRef::BigInt(1))], 1).unwrap(),
+            Some(&Cell::SignedInteger(50))
+        );
+        assert_eq!(
+            p.scalar_value(&[Some(ScalarRef::Integer(2))], 1).unwrap(),
+            Some(&Cell::SignedInteger(20))
+        );
+        // グループ無し・外側キー NULL は空集合の値（`count` は 0。NULL にしない）。
+        assert_eq!(
+            p.scalar_value(&[Some(ScalarRef::BigInt(9))], 1).unwrap(),
+            Some(&Cell::Integer(0))
+        );
+        assert_eq!(p.scalar_value(&[None], 1).unwrap(), Some(&Cell::Integer(0)));
+        // `count` 以外の集計は空集合で NULL。
+        let p = agg_value_probe(Cell::Null);
+        assert_eq!(p.scalar_value(&[None], 1).unwrap(), Some(&Cell::Null));
+    }
+
+    #[test]
+    fn scalar_agg_value_fail_closed_layout_and_opaque_debug() {
+        let p = agg_value_probe(Cell::Null);
+        // 範囲外の外側列は NULL と取り違えず XX000。
+        assert_eq!(p.scalar_value(&[], 1).unwrap_err().wire_code(), "XX000");
+        // 真偽の入口（`eval`）は値プローブには使えない（取りこぼしで偽にしない）。
+        assert_eq!(
+            p.eval(&[Some(ScalarRef::BigInt(1))], 1)
+                .unwrap_err()
+                .wire_code(),
+            "XX000"
+        );
+        // 汎用の構築経路は `ScalarAggValue` を拒否する。
+        let e = CorrelatedProbe::build(
+            ProbeSpec {
+                keys: int_key(),
+                residual: None,
+                min_matches: 1,
+                kind: ProbeKind::ScalarAggValue,
                 budget: budget(),
                 byte_cap: usize::MAX,
             },

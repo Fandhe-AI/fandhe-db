@@ -260,6 +260,7 @@ fn build_source_index(
         order_keys: Vec::new(),
         scalar_subquery_items: Vec::new(),
         physical_order_keys: Vec::new(),
+        embedded_scalar_subqueries: Vec::new(),
         with_ties: false,
     };
     // 側スキャンの `LIMIT` は内部値（入力行数上限 + 1）に差し替える（JOIN の側スキャンと同じ）。
