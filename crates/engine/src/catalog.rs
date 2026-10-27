@@ -5131,6 +5131,25 @@ impl TableLookup for TxnViewLookup<'_, '_> {
             .txn_schema(name)?
             .is_some_and(|schema| schema.is_allocated()))
     }
+
+    fn table_has_non_byte_collation(
+        &self,
+        name: &str,
+    ) -> std::result::Result<bool, SqlSurfaceError> {
+        Ok(self
+            .txn_schema(name)?
+            .is_some_and(|schema| schema_has_non_byte_collation(&schema)))
+    }
+
+    fn table_materialization_hazards(
+        &self,
+        name: &str,
+    ) -> std::result::Result<TableMaterializationHazards, SqlSurfaceError> {
+        Ok(self
+            .txn_schema(name)?
+            .map(|schema| schema_materialization_hazards(&schema))
+            .unwrap_or_default())
+    }
 }
 
 impl TxnViewLookup<'_, '_> {
@@ -5207,6 +5226,28 @@ impl TableLookup for ViewWriteSnapshot<'_> {
         match self.table_schema(name) {
             Ok(schema) => Ok(schema.is_allocated()),
             Err(CatalogError::TableNotFound(_)) => Ok(false),
+            Err(other) => Err(table_lookup_error(other)),
+        }
+    }
+
+    fn table_has_non_byte_collation(
+        &self,
+        name: &str,
+    ) -> std::result::Result<bool, SqlSurfaceError> {
+        match self.table_schema(name) {
+            Ok(schema) => Ok(schema_has_non_byte_collation(&schema)),
+            Err(CatalogError::TableNotFound(_)) => Ok(false),
+            Err(other) => Err(table_lookup_error(other)),
+        }
+    }
+
+    fn table_materialization_hazards(
+        &self,
+        name: &str,
+    ) -> std::result::Result<TableMaterializationHazards, SqlSurfaceError> {
+        match self.table_schema(name) {
+            Ok(schema) => Ok(schema_materialization_hazards(&schema)),
+            Err(CatalogError::TableNotFound(_)) => Ok(TableMaterializationHazards::default()),
             Err(other) => Err(table_lookup_error(other)),
         }
     }
@@ -16256,6 +16297,28 @@ impl TableLookup for Storage {
         }
     }
 
+    fn table_has_non_byte_collation(
+        &self,
+        name: &str,
+    ) -> std::result::Result<bool, SqlSurfaceError> {
+        match self.get_table_schema(name) {
+            Ok(schema) => Ok(schema_has_non_byte_collation(&schema)),
+            Err(CatalogError::TableNotFound(_)) => Ok(false),
+            Err(other) => Err(table_lookup_error(other)),
+        }
+    }
+
+    fn table_materialization_hazards(
+        &self,
+        name: &str,
+    ) -> std::result::Result<TableMaterializationHazards, SqlSurfaceError> {
+        match self.get_table_schema(name) {
+            Ok(schema) => Ok(schema_materialization_hazards(&schema)),
+            Err(CatalogError::TableNotFound(_)) => Ok(TableMaterializationHazards::default()),
+            Err(other) => Err(table_lookup_error(other)),
+        }
+    }
+
     /// `SELECT *` の実際の列並び（疑似列 `id` が先頭、続けて宣言済みの実カラム。実カラム `id` を
     /// 宣言していれば `id` が 2 回現れる）。`sql::parser::bind_projection` の `Projection::All` と一致させる。
     fn table_star_columns(
@@ -16282,6 +16345,50 @@ impl TableLookup for Storage {
             Err(other) => Err(table_lookup_error(other)),
         }
     }
+}
+
+/// 具体化 CTE の本文が読む表の、具体化結果では再現できない列の性質
+/// （[`TableLookup::table_materialization_hazards`]。Issue #1860）。
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct TableMaterializationHazards {
+    /// `VECTOR`／`ARRAY` 型の実カラム名。評価後射影形の外側は述語・並べ替えで参照できない。
+    pub unevaluable_columns: Vec<String>,
+    /// 評価後射影形の外側 `ORDER BY` が並べ替えられない型の実カラム名。外側が実際に使う
+    /// `sql::join::values::cmp_class` が `None` を返す型（`VECTOR`／`ARRAY` を含む。`INTERVAL`・
+    /// `TIME`・`TIMESTAMPTZ`・`JSONB`・`CHAR` 等）を、型の列挙ではなく同関数から導く
+    /// （型が増えても判定が自動で追随する）。
+    pub unorderable_columns: Vec<String>,
+    /// 疑似列 `id` を持つ表（従来方式・移行済み）が実カラム `id` も宣言しているか。`SELECT *` が
+    /// 疑似列 `id` と実カラム `id` の 2 列を返し、具体化後は外側の列名解決が `42702` になる。
+    /// 採番方式の表は `id` が予約されず `SELECT *` も 1 列のため衝突しない（false）。
+    pub declares_real_id: bool,
+}
+
+/// 表スキーマから [`TableMaterializationHazards`] を導く共有本体。
+pub(crate) fn schema_materialization_hazards(schema: &TableSchema) -> TableMaterializationHazards {
+    TableMaterializationHazards {
+        unevaluable_columns: schema
+            .columns
+            .iter()
+            .filter(|c| matches!(c.ty, ColumnType::Vector(_) | ColumnType::Array(_)))
+            .map(|c| c.name.clone())
+            .collect(),
+        unorderable_columns: schema
+            .columns
+            .iter()
+            .filter(|c| crate::sql::join::values::cmp_class(Some(&c.ty)).is_none())
+            .map(|c| c.name.clone())
+            .collect(),
+        declares_real_id: schema.has_pseudo_id() && schema.columns.iter().any(|c| c.name == "id"),
+    }
+}
+
+/// 表スキーマが非バイト列順の照合の列を持つか（[`TableLookup::table_has_non_byte_collation`] の共有本体）。
+pub(crate) fn schema_has_non_byte_collation(schema: &TableSchema) -> bool {
+    schema
+        .columns
+        .iter()
+        .any(|c| c.collation.is_some_and(|coll| !coll.is_byte_order()))
 }
 
 /// [`TableLookup::table_columns`] の列名組み立て（実カラム名 ＋ 実カラム `id` が

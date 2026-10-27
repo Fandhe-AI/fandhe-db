@@ -2106,22 +2106,6 @@ fn buffered_body_tables(stmt: &crate::sql::allowlist::Statement, out: &mut Vec<S
     }
 }
 
-/// 評価後射影形ビューの外側クエリが、本文の結果列の順序・比較に依存するか（TABLE-28・
-/// Issue #2190）。外側は本文の評価済みセルを列型だけで比較するため、本文のテキスト列に
-/// ついた照合は運ばれない。素通し（`WHERE`・`ORDER BY`・ウィンドウ・集計がない）以外は
-/// 順序・比較に依存するとみなす。
-fn buffered_outer_depends_on_order(view: &crate::sql::allowlist::ValidatedBufferedView) -> bool {
-    match &view.outer {
-        crate::sql::allowlist::BufferedOuter::Rows(rows) => {
-            !rows.where_predicates.is_empty()
-                || !rows.order_by.is_empty()
-                || !rows.order_keys.is_empty()
-                || !rows.window_items.is_empty()
-        }
-        crate::sql::allowlist::BufferedOuter::Aggregate(_) => true,
-    }
-}
-
 /// 評価後射影形ビューの本文が非バイト列順の照合（ICU）の列を持つテーブルを参照し、かつ外側が
 /// 順序・比較に依存するときは `0A000` で拒否する（照合が運ばれずバイト列順で黙って
 /// 比較される意味論の fail-open を作らない。TABLE-28・Issue #2190）。
@@ -2129,7 +2113,7 @@ fn check_buffered_view_collations(
     read_txn: &impl crate::storage::read_source::ReadSource,
     view: &crate::sql::allowlist::ValidatedBufferedView,
 ) -> Result<(), crate::sql::allowlist::SqlSurfaceError> {
-    if !buffered_outer_depends_on_order(view) {
+    if !view.outer_depends_on_order() {
         return Ok(());
     }
     let mut names = Vec::new();
@@ -3881,7 +3865,7 @@ impl EngineCore {
         let resolver = self.schema_resolver(ctx);
         let resolved_tokens =
             crate::sql::relation_name::tokenize_resolved_with(sql, false, Some(&resolver))?;
-        match crate::sql::allowlist::validate_sql_tokens_with_subquery_ctx_limits(
+        match crate::sql::allowlist::validate_session_sql_tokens(
             &resolved_tokens,
             &self.storage,
             0,
@@ -5428,7 +5412,7 @@ impl EngineCore {
             return Ok(ParsedSql::AlterTable(stmt));
         }
 
-        let stmt = crate::sql::allowlist::validate_sql_tokens_with_subquery_ctx_limits(
+        let stmt = crate::sql::allowlist::validate_session_sql_tokens(
             &tokens,
             &storage_lookup,
             0,
@@ -8389,8 +8373,14 @@ impl EngineCore {
                     skip_vector_literal_validation,
                     &[],
                     // 本文の `LIMIT` は外側の設定値と連動させず独立した既定値で検証する
-                    // （result-limits-cli.md の「内側 LIMIT は連動しない」）。
-                    &crate::result_limits::ResultLimits::default(),
+                    // （result-limits-cli.md の「内側 LIMIT は連動しない」）。具体化 CTE
+                    // （Issue #1860）は実行側と同じく呼び出し段の `limits` を渡す。
+                    &match validated.origin {
+                        crate::sql::allowlist::BufferedOrigin::MaterializedCte => *limits,
+                        crate::sql::allowlist::BufferedOrigin::View => {
+                            crate::result_limits::ResultLimits::default()
+                        }
+                    },
                 )?;
                 match body_columns {
                     Some(cols) => {
@@ -9142,12 +9132,21 @@ impl EngineCore {
                 Self::check_buffered_outer_limit(&validated, &limits)?;
                 check_buffered_view_collations(read_txn, &validated)?;
                 let body = (*validated.body).clone();
+                // 具体化 CTE（Issue #1860・SQL-62 (5)）の本文は呼び出し段の上限で実行する
+                // （可視行が `--max-result-rows` を超えたら黙って切り詰めず `54000`）。ビュー本文は
+                // 従来どおり既定値（内側 LIMIT は外側の設定値と連動させない）。
+                let body_limits = match validated.origin {
+                    crate::sql::allowlist::BufferedOrigin::MaterializedCte => limits,
+                    crate::sql::allowlist::BufferedOrigin::View => {
+                        crate::result_limits::ResultLimits::default()
+                    }
+                };
                 match self.execute_read_statement_with_limits(
                     ctx,
                     session,
                     body,
                     read_txn,
-                    crate::result_limits::ResultLimits::default(),
+                    body_limits,
                 )? {
                     crate::sql::SqlOutcome::Query(result) => {
                         // Issue #1360: 外側の WHERE・ORDER BY・射影・LIMIT/OFFSET は

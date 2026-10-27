@@ -2166,6 +2166,26 @@ pub trait TableLookup {
         Ok(false)
     }
 
+    /// `name` が非バイト列順の照合（ICU）の列を持つ実テーブルか（Issue #1860。具体化 CTE が
+    /// 照合を運べないため、順序・比較に依存する外側ではインライン展開へ戻す判定に使う）。
+    /// 既定実装は `false`（判定できない lookup は具体化経路へ進み、実行段の
+    /// `check_buffered_view_collations` が `0A000` で拒否する fail-closed のまま）。
+    fn table_has_non_byte_collation(&self, name: &str) -> Result<bool, SqlSurfaceError> {
+        let _ = name;
+        Ok(false)
+    }
+
+    /// 具体化 CTE の本文が読む表について、具体化結果では再現できない列の性質を返す
+    /// （Issue #1860。`VECTOR`／`ARRAY` 列・実カラム `id` の併存）。既定実装は何も無し
+    /// （判定できない lookup は具体化経路へ進む）。
+    fn table_materialization_hazards(
+        &self,
+        name: &str,
+    ) -> Result<crate::catalog::TableMaterializationHazards, SqlSurfaceError> {
+        let _ = name;
+        Ok(crate::catalog::TableMaterializationHazards::default())
+    }
+
     /// 評価後射影形ビューの本文を参照時に再検証する入れ子の深さ（Issue #1411。
     /// 既定は 0）。評価後射影形ビューの連鎖（`sql::view::resolve_from` が本文を再検証する
     /// たびに +1 するラッパーが上書きする）を `MAX_VIEW_NESTING_DEPTH` で打ち切り、
@@ -2974,6 +2994,19 @@ pub struct ValidatedBufferedView {
     /// 素通しの層だけで、`sql::view_buffered::plan_outer` が外側の束縛より前に改名する
     /// （Describe と Execute が同じ入口を通るため列名が一致する）。
     pub(crate) column_aliases: Vec<String>,
+    /// この文の出所（Issue #1860）。`MaterializedCte` のとき本文は呼び出し段の
+    /// `ResultLimits` で実行する（SQL-62 (5)）。ビュー由来は本文を既定値で実行する
+    /// （`docs/design/result-limits-cli.md` の「内側 LIMIT は連動しない」）。
+    pub(crate) origin: BufferedOrigin,
+}
+
+/// [`ValidatedBufferedView`] の出所（Issue #1860）。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum BufferedOrigin {
+    /// 評価後射影形ビューの参照（Issue #1192 以降）。
+    View,
+    /// `MATERIALIZED` 指定 CTE の具体化経路（SQL-62・Issue #1860）。
+    MaterializedCte,
 }
 
 /// 評価後射影形ビューへの外側クエリの形（Issue #1411）。どちらも本文の評価済みセルに
@@ -3020,6 +3053,21 @@ pub(crate) struct BufferedRows {
 }
 
 impl ValidatedBufferedView {
+    /// 外側クエリが、本文の結果列の順序・比較に依存するか（TABLE-28・Issue #2190）。
+    /// 外側は本文の評価済みセルを列型だけで比較するため、本文のテキスト列についた照合は
+    /// 運ばれない。素通し（`WHERE`・`ORDER BY`・ウィンドウ・集計がない）以外は依存するとみなす。
+    pub(crate) fn outer_depends_on_order(&self) -> bool {
+        match &self.outer {
+            BufferedOuter::Rows(rows) => {
+                !rows.where_predicates.is_empty()
+                    || !rows.order_by.is_empty()
+                    || !rows.order_keys.is_empty()
+                    || !rows.window_items.is_empty()
+            }
+            BufferedOuter::Aggregate(_) => true,
+        }
+    }
+
     /// 参照されたビュー名。
     pub fn view_name(&self) -> &str {
         &self.view_name
@@ -14960,15 +15008,19 @@ impl<'a> Parser<'a> {
             // 空リスト `42601`）を共有する（SQL-62 (2)・Issue #1857）。
             let column_aliases = self.parse_optional_view_column_aliases()?;
             self.expect_ident_matching("AS")?;
-            // `[NOT] MATERIALIZED` は評価方式の指定として構文だけ受理し読み捨てる（SQL-62 (3)・
-            // Issue #1858）。現行の CTE は常にインライン展開されるため結果に影響しない。
+            // `[NOT] MATERIALIZED` は評価方式のヒント（SQL-62 (3)・Issue #1858・#1860）。結果には
+            // 影響せず、`MATERIALIZED` のみセッション最上位 SELECT の入口で具体化経路の対象になる。
             // `NOT` の後に `MATERIALIZED` が無い形は 42601（fail-closed）。
-            if self.peek_ident_matches("NOT") {
+            let materialization = if self.peek_ident_matches("NOT") {
                 self.advance();
                 self.expect_ident_matching("MATERIALIZED")?;
+                super::cte::CteMaterialization::NotMaterialized
             } else if self.peek_ident_matches("MATERIALIZED") {
                 self.advance();
-            }
+                super::cte::CteMaterialization::Materialized
+            } else {
+                super::cte::CteMaterialization::Default
+            };
             if !matches!(self.peek(), Some(Token::Punct('('))) {
                 return Err(SqlSurfaceError::unsupported(
                     "expected '(' to start CTE body",
@@ -14994,6 +15046,7 @@ impl<'a> Parser<'a> {
                 name,
                 column_aliases,
                 body,
+                materialization,
             });
             super::cte::check_definition_count(
                 ctes.len(),
@@ -15704,6 +15757,7 @@ pub(crate) fn buffered_layer_statement(
             offset: 0,
         })),
         column_aliases: Vec::new(),
+        origin: BufferedOrigin::View,
     }))
 }
 
@@ -15731,6 +15785,7 @@ pub(crate) fn buffered_alias_layer(
             offset: 0,
         })),
         column_aliases,
+        origin: BufferedOrigin::View,
     })
 }
 
@@ -18481,6 +18536,7 @@ struct ParsedShape {
 
 /// 構文木（[`ValidatedScan`] の元）。カタログ存在確認前の中間結果（Issue #454。
 /// SQL-30・TASK-214、Issue #930 で `window_items` を追加）。
+#[derive(Clone)]
 struct ParsedScanShape {
     table_name: String,
     projection: Projection,
@@ -20827,6 +20883,7 @@ fn split_scan_order_keys(keys: Vec<ScanOrderKey>) -> (Vec<ScalarOrderKey>, Vec<S
 
 /// 構文木（[`ValidatedAggregate`] の元）。カタログ存在確認前の中間結果
 /// （TASK-166・SQL-13。TASK-167・SQL-14 で `group_by` を追加）。
+#[derive(Clone)]
 struct ParsedAggregateShape {
     table_name: String,
     items: Vec<AggregateSelectItem>,
@@ -21577,6 +21634,52 @@ fn build_aggregate_from_resolved(
     }
 }
 
+/// 評価後射影形の本文 `body` の上へ、行形の外側（`SELECT <*|列> FROM <view_name> [WHERE ...]
+/// [ORDER BY <列|式>] LIMIT n [OFFSET m]`。ウィンドウ項目を含みうる）を重ねた
+/// [`Statement::BufferedView`] を組み立てる。`parse_select_shape` の `Scan` 腕（ビュー参照）と
+/// `WITH` 腕の具体化経路（Issue #1860）が共有する唯一の実装。WHERE は宣言的な葉と NOT／OR・
+/// 式述語のみ、式項目・投影位置のスカラーサブクエリは `42601`、`WITH TIES` は `0A000`。
+fn buffered_scan_statement(
+    view_name: String,
+    body: Box<Statement>,
+    shape: ParsedScanShape,
+) -> Result<Statement, SqlSurfaceError> {
+    if shape.with_ties {
+        return Err(SqlSurfaceError::feature_not_supported(
+            "WITH TIES is not supported over a view with an aggregate/LIMIT body",
+        ));
+    }
+    if !shape.scalar_subquery_items.is_empty() || matches!(shape.projection, Projection::Items(_)) {
+        return Err(SqlSurfaceError::unsupported(
+            "a view with an aggregate/LIMIT body supports only column projections, declarative WHERE, ORDER BY, window functions and aggregates",
+        ));
+    }
+    shape
+        .where_predicates
+        .iter()
+        .try_for_each(check_buffered_outer_pred)?;
+    // `LIMIT` の範囲は構文段では検査しない（設定値を持たないため）。
+    // `EngineCore::check_buffered_outer_limit` が設定値で検査する（Issue #1555）。
+    super::parser::validate_search_offset(shape.offset)?;
+    Ok(Statement::BufferedView(ValidatedBufferedView {
+        view_name,
+        body,
+        outer: BufferedOuter::Rows(Box::new(BufferedRows {
+            projection: shape.projection,
+            where_predicates: shape.where_predicates,
+            order_by: shape.order_by,
+            order_keys: shape.order_keys,
+            window_items: shape.window_items,
+            limit: shape.limit.unwrap_or(u32::MAX),
+            limit_explicit: shape.limit.is_some(),
+            limit_implicit: shape.limit.is_none(),
+            offset: shape.offset,
+        })),
+        column_aliases: Vec::new(),
+        origin: BufferedOrigin::View,
+    }))
+}
+
 /// 集計・`SELECT DISTINCT` の FROM の解決結果から [`Statement`] を組み立てる
 /// （[`build_aggregate_from_resolved`] の入口。Issue #1411）。評価後射影形ビュー
 /// （[`super::view::Resolved::Buffered`]）への集計は、本文を実行した評価済みセルに
@@ -21654,6 +21757,7 @@ fn aggregate_statement_from_resolved(
                 group_by,
             })),
             column_aliases: Vec::new(),
+            origin: BufferedOrigin::View,
         }));
     }
     Ok(Statement::Aggregate(build_aggregate_from_resolved(
@@ -21674,6 +21778,7 @@ pub(crate) fn validate_sql_tokens(
         lookup,
         None,
         crate::nesting_limits::NestingLimits::default(),
+        CteEvaluation::InlineOnly,
     )
 }
 
@@ -21686,7 +21791,7 @@ pub(crate) fn validate_sql_tokens_with_limits(
     lookup: &impl TableLookup,
     limits: crate::nesting_limits::NestingLimits,
 ) -> Result<Statement, SqlSurfaceError> {
-    validate_sql_tokens_impl(tokens, lookup, None, limits)
+    validate_sql_tokens_impl(tokens, lookup, None, limits, CteEvaluation::InlineOnly)
 }
 
 /// [`validate_sql_tokens`] のサブクエリ許可版（Issue #927・TASK-213）。
@@ -21721,7 +21826,307 @@ pub(crate) fn validate_sql_tokens_with_subquery_ctx_limits(
     depth: usize,
     limits: crate::nesting_limits::NestingLimits,
 ) -> Result<Statement, SqlSurfaceError> {
-    validate_sql_tokens_impl(tokens, lookup, Some(depth), limits)
+    validate_sql_tokens_impl(
+        tokens,
+        lookup,
+        Some(depth),
+        limits,
+        CteEvaluation::InlineOnly,
+    )
+}
+
+/// セッションの最上位 SELECT の入口専用の検証（Issue #1860・SQL-62）。
+/// [`validate_sql_tokens_with_subquery_ctx_limits`] と同じ検証に加え、明示 `MATERIALIZED`
+/// の CTE を主クエリが直接参照するとき具体化経路（[`Statement::BufferedView`]）を返しうる。
+/// `EngineCore` のセッション SQL パース入口だけが呼ぶ（ビュー本文・cursor・COPY・CTAS・
+/// サブクエリ内側の再検証は従来のインライン展開のまま。結果は同じ）。
+pub(crate) fn validate_session_sql_tokens(
+    tokens: &[Token],
+    lookup: &impl TableLookup,
+    depth: usize,
+    limits: crate::nesting_limits::NestingLimits,
+) -> Result<Statement, SqlSurfaceError> {
+    validate_sql_tokens_impl(
+        tokens,
+        lookup,
+        Some(depth),
+        limits,
+        CteEvaluation::AllowMaterialize,
+    )
+}
+
+/// `WITH` の主クエリの形（Issue #1191 の集計主クエリを含む。Issue #1860 で具体化経路の
+/// 判定のためモジュール直下へ移した）。
+#[derive(Clone)]
+enum MainShape {
+    Scan(ParsedScanShape),
+    Aggregate(ParsedAggregateShape),
+}
+
+/// 具体化経路（Issue #1860・SQL-62 (1)(3)(5)(6)）の文を組み立てる。`ctes[idx]`（明示
+/// `MATERIALIZED`）の本文を、先行 CTE をインライン合成した 1 つの `Statement::Scan` にし
+/// （`LIMIT` なし＝暗黙上限つき。保持行数は `--max-result-rows` で頭打ち）、その上へ主クエリ
+/// の外側を既存の評価後射影形の外側処理（`buffered_scan_statement`・
+/// `aggregate_statement_from_resolved`）で重ねる。外側が評価後射影形として受理できない形など、
+/// どこかで失敗した場合は `None`（呼び出し側はインライン展開の結果を使う。結果は等しい）。
+/// 本文の可視性は実行時に参照者自身の `PolicyContext`・外側と同一の `read_txn` で決まる
+/// （`CteDef` はテナント情報を持たない。RLS-10 (b)）。
+fn materialized_cte_statement(
+    ctes: &[super::cte::CteDef],
+    idx: usize,
+    main: MainShape,
+    lookup: &impl TableLookup,
+    limits: crate::nesting_limits::NestingLimits,
+) -> Option<Statement> {
+    let def = ctes.get(idx)?;
+    // 序数 `ORDER BY`（`ORDER BY 1`）は評価後射影形の外側が解決できず後段で `42601` になる
+    // ため、具体化を選ぶ前にインライン展開へ戻す（結果は等しい。Issue #1860 レビュー指摘）。
+    if let MainShape::Scan(shape) = &main {
+        if shape
+            .order_keys
+            .iter()
+            .any(|k| matches!(k, ScanOrderKey::Ordinal { .. }))
+        {
+            return None;
+        }
+    }
+    // 本文が同名の公開列を 2 列以上返す形（`SELECT lang, lang`）は、具体化結果の列解決が
+    // `42702` になる（インラインは基底列へ畳み込める）。結果は等しいのでインラインへ戻す。
+    if materialized_body_has_duplicate_names(def) {
+        return None;
+    }
+    let select_body = def.select_body()?;
+    let mut budget = super::cte::ResolveBudget::new();
+    let inner = super::cte::resolve_relation(
+        lookup,
+        ctes,
+        idx,
+        &select_body.table_name,
+        0,
+        limits.max_cte_nesting_depth(),
+        &mut budget,
+    )
+    .ok()?;
+    let body = build_scan_from_resolved(
+        select_body.table_name.clone(),
+        inner,
+        select_body.projection.clone(),
+        select_body.where_predicates.clone(),
+        None,
+        Vec::new(),
+        0,
+        Vec::new(),
+        Vec::new(),
+        Vec::new(),
+    )
+    .ok()?;
+    let body_table = body.table_name().to_string();
+    // 列別名つき CTE／ビュー越しの本文は、`build_scan_from_resolved` が公開名を基底表の物理列名へ
+    // 書き換えた後の投影で判定する（未解決の `def.body.projection` は別名のままで、基底表の
+    // `unevaluable_columns` と一致しない。Issue #1860 レビュー指摘）。
+    let body_projection = body.projection.clone();
+    // `SELECT *` が先行 CTE／ビューの重複公開列を継承する本文は、解決後の投影で初めて重複が
+    // 現れる（`SELECT *` 自体は `def.body.projection` 上では重複を持たない）。具体化後の
+    // 外側の列名解決が `42702` になるため、インライン展開へ戻す（Issue #1860 レビュー指摘）。
+    if projection_has_duplicate_names(&body_projection) {
+        return None;
+    }
+    let body = Box::new(Statement::Scan(body));
+    let view_name = def.name.clone();
+    let stmt = match main {
+        MainShape::Scan(shape) => buffered_scan_statement(view_name, body, shape).ok()?,
+        MainShape::Aggregate(shape) => aggregate_statement_from_resolved(
+            shape.table_name,
+            super::view::Resolved::Buffered { view_name, body },
+            shape.items,
+            shape.where_predicates,
+            shape.group_by,
+        )
+        .ok()?,
+    };
+    match stmt {
+        Statement::BufferedView(mut v) => {
+            // 具体化結果は照合を運ばない。照合付き列を持つ表を本文が読み、かつ外側が順序・比較に
+            // 依存するなら、実行段で `0A000` になる前にインライン展開（照合を保つ）へ戻す。
+            // 判定できない場合（照会失敗）も具体化せずインラインへ戻す（結果は等しい）。
+            if v.outer_depends_on_order()
+                && lookup.table_has_non_byte_collation(&body_table).ok()?
+            {
+                return None;
+            }
+            // 本文が VECTOR／ARRAY 列を結果に含み、外側が述語・並べ替え・集計・列名指定で
+            // 参照しうる場合、具体化後は参照不能列（未知列拒否）になる。また `SELECT *` が
+            // 疑似列 `id` と実カラム `id` の 2 列を返す本文は、外側の列名解決が `42702` になる
+            // （インラインは実カラム優先で解決できる）。いずれもインライン展開へ戻す。
+            let hazards = lookup.table_materialization_hazards(&body_table).ok()?;
+            let outer_passthrough_all = matches!(
+                &v.outer,
+                BufferedOuter::Rows(rows) if matches!(rows.projection, Projection::All)
+            ) && !v.outer_depends_on_order();
+            // 本文の射影が `names` のいずれかの列を運ぶか（名前解決と同じ大文字小文字無視の比較）。
+            let body_hits = |names: &[String]| match &body_projection {
+                Projection::All => !names.is_empty(),
+                Projection::Columns(cols) => cols
+                    .iter()
+                    .any(|c| names.iter().any(|u| u.eq_ignore_ascii_case(c))),
+                Projection::Items(items) => projection_item_idents(items).is_none_or(|cols| {
+                    cols.iter()
+                        .any(|c| names.iter().any(|u| u.eq_ignore_ascii_case(c)))
+                }),
+            };
+            let hits_unevaluable = body_hits(&hazards.unevaluable_columns);
+            // 外側が述語・並べ替え・ウィンドウ・集計で参照しない限り、VECTOR／ARRAY セルは
+            // 射影でそのまま運ばれる（未参照列は評価対象にならない）。名前で突き合わせられるのは
+            // 列別名なしの `*`／列名投影の本文だけで、それ以外は従来どおり素通し外側のみ許す。
+            let name_checkable = def.column_aliases.is_empty()
+                && matches!(&body_projection, Projection::All | Projection::Columns(_));
+            let refs_any = |hazard_cols: &[String], idents: &std::collections::HashSet<String>| {
+                hazard_cols
+                    .iter()
+                    .any(|u| idents.iter().any(|i| i.eq_ignore_ascii_case(u)))
+            };
+            let outer_refs_unevaluable = if name_checkable {
+                let idents = super::view_buffered::outer_non_projection_idents(&v.outer);
+                refs_any(&hazards.unevaluable_columns, &idents)
+            } else {
+                !outer_passthrough_all
+            };
+            if hits_unevaluable && outer_refs_unevaluable {
+                return None;
+            }
+            // 外側 `ORDER BY` は `view_buffered::plan_order` が `cmp_class` で並べ替え可能な型だけを
+            // 受理する（対応外は実行段で `22000`）。同関数の対応外の型を持つ列を並べ替えキーが
+            // 参照しうるならインライン展開へ戻す（評価方式で結果が変わらない契約）。
+            if body_hits(&hazards.unorderable_columns) {
+                let order_idents = super::view_buffered::outer_order_idents(&v.outer);
+                let outer_orders_unorderable = if name_checkable {
+                    refs_any(&hazards.unorderable_columns, &order_idents)
+                } else {
+                    !order_idents.is_empty()
+                };
+                if outer_orders_unorderable {
+                    return None;
+                }
+            }
+            let projects_id = match &body_projection {
+                Projection::All => true,
+                Projection::Columns(_) => false,
+                Projection::Items(items) => projection_item_idents(items)
+                    .is_none_or(|names| names.iter().any(|n| n.eq_ignore_ascii_case("id"))),
+            };
+            if projects_id && hazards.declares_real_id {
+                return None;
+            }
+            // 具体化結果の疑似列 `id` は `BIGINT` として運ばれ、外側が値を評価（述語・集計・式・
+            // 並べ替え）すると `i64::MAX` 超の行 id で `22003` になる（インラインは `u64` のまま
+            // 評価できる。例: `MAX(id)`）。素通し射影（`*`・列名のみ）以外で `id` を読みうる外側は、
+            // 列別名で名前を追えない場合も含め安全側でインライン展開へ戻す（Issue #1860 レビュー指摘）。
+            let exposes_id = match &body_projection {
+                Projection::All => true,
+                Projection::Columns(names) => names.iter().any(|n| n.eq_ignore_ascii_case("id")),
+                Projection::Items(_) => projects_id,
+            };
+            if exposes_id && outer_may_evaluate_pseudo_id(&v.outer, !def.column_aliases.is_empty())
+            {
+                return None;
+            }
+            v.column_aliases = def.column_aliases.clone();
+            v.origin = BufferedOrigin::MaterializedCte;
+            Some(Statement::BufferedView(v))
+        }
+        _ => None,
+    }
+}
+
+/// 評価後射影形の外側が、本文の公開列（疑似列 `id` を含みうる）を素通し以外で評価するか。
+/// 述語・並べ替え・ウィンドウ・集計が `id` を名前で参照する場合、または式投影・列別名つき CTE
+/// のように名前で追えない場合は真（安全側）。素通し（`*`・列名のみの射影）は値を評価しない
+/// ため偽（`BufferedView` のセルは `u64` のまま運ばれる）。
+fn outer_may_evaluate_pseudo_id(outer: &BufferedOuter, aliased: bool) -> bool {
+    let idents = super::view_buffered::outer_non_projection_idents(outer);
+    if aliased && !idents.is_empty() {
+        return true;
+    }
+    if idents.iter().any(|i| i.eq_ignore_ascii_case("id")) {
+        return true;
+    }
+    match outer {
+        BufferedOuter::Rows(rows) => matches!(rows.projection, Projection::Items(_)),
+        BufferedOuter::Aggregate(_) => false,
+    }
+}
+
+/// `Items` 投影が実際に参照する列名（式中の識別子を含む）。`*` を含む場合は列を特定できないため
+/// `None`（呼び出し側は全列を参照するものとして安全側に倒す。Issue #1860）。
+fn projection_item_idents(items: &[SelectItem]) -> Option<Vec<String>> {
+    let mut names = Vec::new();
+    for item in items {
+        match item {
+            SelectItem::Column(n) if n == "*" => return None,
+            SelectItem::Column(n) => names.push(n.clone()),
+            SelectItem::Expr { expr, .. } => names.extend(expr_bare_idents(expr)),
+        }
+    }
+    Some(names)
+}
+
+/// 具体化対象 CTE の本文が、公開列名の重複（列名リスト適用後を含む）を持つか。名前を静的に
+/// 決められない式項目は数えない（重複判定は偽陰性側が具体化経路のまま＝既存挙動）。
+fn materialized_body_has_duplicate_names(def: &super::cte::CteDef) -> bool {
+    let names: Vec<String> = if !def.column_aliases.is_empty() {
+        def.column_aliases.clone()
+    } else {
+        let Some(select_body) = def.select_body() else {
+            return false;
+        };
+        match &select_body.projection {
+            Projection::All => return false,
+            Projection::Columns(c) => c.clone(),
+            Projection::Items(items) => items
+                .iter()
+                .filter_map(|i| match i {
+                    SelectItem::Column(n) => Some(n.clone()),
+                    SelectItem::Expr { expr, alias } => match (alias, expr) {
+                        (Some(a), _) => Some(a.clone()),
+                        (None, Expr::Ident(n)) => Some(n.clone()),
+                        _ => None,
+                    },
+                })
+                .collect(),
+        }
+    };
+    let mut seen = std::collections::HashSet::new();
+    names.iter().any(|n| !seen.insert(n.to_ascii_lowercase()))
+}
+
+/// 解決後の本文投影が同名（大文字小文字無視）の公開列を 2 列以上返すか。名前を静的に決められない
+/// 式項目は数えない。
+fn projection_has_duplicate_names(projection: &Projection) -> bool {
+    let names: Vec<String> = match projection {
+        Projection::All => return false,
+        Projection::Columns(c) => c.clone(),
+        Projection::Items(items) => items
+            .iter()
+            .filter_map(|i| match i {
+                SelectItem::Column(n) => Some(n.clone()),
+                SelectItem::Expr { expr, alias } => match (alias, expr) {
+                    (Some(a), _) => Some(a.clone()),
+                    (None, Expr::Ident(n)) => Some(n.clone()),
+                    _ => None,
+                },
+            })
+            .collect(),
+    };
+    let mut seen = std::collections::HashSet::new();
+    names.iter().any(|n| !seen.insert(n.to_ascii_lowercase()))
+}
+
+/// `WITH` 句の CTE をインライン展開のみで評価するか、`MATERIALIZED` 指定の具体化経路を
+/// 許すか（Issue #1860）。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum CteEvaluation {
+    InlineOnly,
+    AllowMaterialize,
 }
 
 /// [`validate_sql_tokens`]／[`validate_sql_tokens_with_subquery_ctx`] が共有する
@@ -21734,6 +22139,7 @@ fn validate_sql_tokens_impl(
     lookup: &impl TableLookup,
     subquery_ctx: Option<usize>,
     limits: crate::nesting_limits::NestingLimits,
+    cte_evaluation: CteEvaluation,
 ) -> Result<Statement, SqlSurfaceError> {
     // `SET`・`CREATE` は字句解析段階のキーワードではなく `Ident` のため
     // （TASK-161・SQL-12 修正と同方針）、statement 先頭という文脈でのみ大文字小文字を
@@ -21841,10 +22247,6 @@ fn validate_sql_tokens_impl(
             // 対象外。`docs/design/cte.md` 対象外節）、CTE の解決後は
             // [`build_aggregate_from_resolved`] で通常の集計 SELECT と同じ
             // [`ValidatedAggregate`] へ畳み込む（第 2 の実行器を作らない）。
-            enum MainShape {
-                Scan(ParsedScanShape),
-                Aggregate(ParsedAggregateShape),
-            }
             let main = if is_distinct_modifier(main_tokens, 1) {
                 MainShape::Aggregate(parse_distinct_shape(main_tokens)?)
             } else if main_is_aggregate_select {
@@ -22007,7 +22409,23 @@ fn validate_sql_tokens_impl(
                     &mut budget,
                 )?
             };
-            let built = match main {
+            // Issue #1860（SQL-62 (1)(3)）: 明示 `MATERIALIZED` の CTE を主クエリが直接参照するときだけ
+            // 具体化経路を試す。エラー契約を揃えるため、まず従来のインライン解決・畳み込み
+            // （下の `inline`）で列スコープ等の検証を通し、その失敗はそのまま返す。外側が評価後射影形
+            // として受理できない形（式投影・UDF 述語等）は具体化せずインラインの結果を使う。
+            // データ変更 CTE を含む文は具体化せず、下の固定 0A000 に流す。
+            let materialized_idx = if cte_evaluation == CteEvaluation::AllowMaterialize
+                && !ctes.iter().any(|d| d.is_data_modifying())
+            {
+                ctes.iter().rposition(|def| {
+                    def.name.eq_ignore_ascii_case(&main_table_name)
+                        && def.materialization == super::cte::CteMaterialization::Materialized
+                })
+            } else {
+                None
+            };
+            let main_for_materialize = materialized_idx.map(|_| main.clone());
+            let inline: Result<Statement, SqlSurfaceError> = (|| match main {
                 MainShape::Scan(shape) => Ok(Statement::Scan(build_scan_from_resolved(
                     shape.table_name,
                     resolved,
@@ -22029,13 +22447,20 @@ fn validate_sql_tokens_impl(
                         shape.group_by,
                     )?))
                 }
-            };
+            })();
             // SQL-63: データ変更 CTE を含む文は、構文・名前・列の検証をすべて通過しても実行しない
             // （読み取りプランへ化けさせない。書き込み結線は #1876）。固定文言で入力断片を含めない。
             if ctes.iter().any(|d| d.is_data_modifying()) {
+                inline?;
                 return Err(super::cte::data_modifying_cte_unsupported());
             }
-            built
+            if let (Some(idx), Some(shape)) = (materialized_idx, main_for_materialize) {
+                let inline = inline?;
+                return Ok(
+                    materialized_cte_statement(&ctes, idx, shape, lookup, limits).unwrap_or(inline),
+                );
+            }
+            inline
         }
         // TABLE-27・Issue #1715: `SET [SESSION] search_path` は TimeZone 系の振り分けより先に判定する
         // （`SET SESSION` の 2 語目が TimeZone 系の頭として扱われるため）。他の `SET` の挙動は不変。
@@ -22385,41 +22810,7 @@ fn validate_select_statement(
             // 宣言的な葉と NOT／OR・式述語のみ。式項目・投影位置のスカラーサブクエリは
             // `42601`。
             if let super::view::Resolved::Buffered { view_name, body } = resolved {
-                if shape.with_ties {
-                    return Err(SqlSurfaceError::feature_not_supported(
-                        "WITH TIES is not supported over a view with an aggregate/LIMIT body",
-                    ));
-                }
-                if !shape.scalar_subquery_items.is_empty()
-                    || matches!(shape.projection, Projection::Items(_))
-                {
-                    return Err(SqlSurfaceError::unsupported(
-                        "a view with an aggregate/LIMIT body supports only column projections, declarative WHERE, ORDER BY, window functions and aggregates",
-                    ));
-                }
-                shape
-                    .where_predicates
-                    .iter()
-                    .try_for_each(check_buffered_outer_pred)?;
-                // `LIMIT` の範囲は構文段では検査しない（設定値を持たないため）。
-                // `EngineCore::check_buffered_outer_limit` が設定値で検査する（Issue #1555）。
-                super::parser::validate_search_offset(shape.offset)?;
-                return Ok(Statement::BufferedView(ValidatedBufferedView {
-                    view_name,
-                    body,
-                    outer: BufferedOuter::Rows(Box::new(BufferedRows {
-                        projection: shape.projection,
-                        where_predicates: shape.where_predicates,
-                        order_by: shape.order_by,
-                        order_keys: shape.order_keys,
-                        window_items: shape.window_items,
-                        limit: shape.limit.unwrap_or(u32::MAX),
-                        limit_explicit: shape.limit.is_some(),
-                        limit_implicit: shape.limit.is_none(),
-                        offset: shape.offset,
-                    })),
-                    column_aliases: Vec::new(),
-                }));
+                return buffered_scan_statement(view_name, body, shape);
             }
             let mut scan = build_scan_from_resolved(
                 shape.table_name,

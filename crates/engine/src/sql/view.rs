@@ -517,6 +517,10 @@ impl TableLookup for BufferedBodyLookup<'_> {
         self.inner.table_is_allocated(name)
     }
 
+    fn table_has_non_byte_collation(&self, name: &str) -> Result<bool, SqlSurfaceError> {
+        self.inner.table_has_non_byte_collation(name)
+    }
+
     fn buffered_depth(&self) -> usize {
         self.depth
     }
