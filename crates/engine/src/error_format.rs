@@ -94,7 +94,7 @@ macro_rules! define_error_classes {
 pub(crate) const SHARED_WIRE_CODES: &[&str] = &["23502", "23505", "22023"];
 
 define_error_classes! {
-    count = 85;
+    count = 86;
 
     /// 構文上受理された SQL の値・引数が不正（`22000`）。
     /// [`crate::sql::allowlist::SqlSurfaceError::InvalidInput`] の写像。
@@ -410,6 +410,12 @@ define_error_classes! {
     /// （存在オラクルを作らない）。[`crate::sql::allowlist::SqlSurfaceError::IndeterminateDatatype`]
     /// の写像。
     IndeterminateDatatype => ("42P18", "INDETERMINATE_DATATYPE"),
+    /// 不正な再帰（`42P19`。`WITH RECURSIVE` の再帰構造の検証。SQL-35 (2)・ERR-6 のポインタ、
+    /// Issue #1869）。自己参照がアンカー項にある・再帰項に複数ある・部分クエリや外部結合の
+    /// NULL 側にある等の構造違反を返す。構文だけで判定し、表・列の存在には依存しない
+    /// （存在オラクルを作らない）。HTTP 射影は 400。
+    /// [`crate::sql::allowlist::SqlSurfaceError::InvalidRecursion`] の写像。
+    InvalidRecursion => ("42P19", "INVALID_RECURSION"),
     /// 拡張クエリプロトコルの Parse で `COPY` 文に `$n` を置いた（`42P02`。Issue #1759・
     /// WIRE-21 (1)・ERR-6 のポインタ）。`COPY` はバインドパラメータを持てないため、`$n` を
     /// 含む形は Parse で fail-closed に拒否する。文言は番号だけを含め、値・表の存在情報を載せない。

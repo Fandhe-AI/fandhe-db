@@ -36,7 +36,9 @@
 //! ビューを隠す。i 番目の CTE の本文から見えるのは 0..i-1 番目の CTE だけで、
 //! 見つからなければ [`super::view::resolve_from`]（ビュー→テーブル）へ進む。
 //! このため自己参照や循環は構造的に作れない（自己参照に見える名前は同名の
-//! 実リレーションへ解決される）。
+//! 実リレーションへ解決される）。これは非再帰 CTE に限った話で、`WITH RECURSIVE` は
+//! 本モジュールへ到達せず `sql::recursive_cte` へ分岐する（SQL-35、Issue #1869。
+//! シャドーイングで自己参照が実テーブルへ解決されるのを防ぐ）。
 
 use super::allowlist::{
     DeleteStatement, ParsedViewBody, Projection, SqlSurfaceError, TableLookup, ValidatedInsert,

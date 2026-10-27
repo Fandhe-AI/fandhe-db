@@ -9,6 +9,12 @@
 
 ### Added
 
+- `WITH RECURSIVE` の構文を受理し再帰構造を検証する（Issue #1869・SQL-35。段階 A）。アンカー項と再帰項を
+  `UNION [ALL]` で結んだ形の自己参照の位置・回数を検証し、不正な再帰は `42P19`、未対応の形と構造検証を通過した
+  文の実行（反復評価は #1870）は `0A000` で拒否する。従来 `42601` だった挙動変更。詳細は [recursive-cte.md](docs/design/recursive-cte.md)。
+  BREAKING CHANGE: 公開 enum `ErrorClass` と `SqlSurfaceError` に variant（`InvalidRecursion`）を追加したため、
+  網羅的な `match` は更新が要る。
+  サブクエリ内部も構文検証してから構造判定へ進み（構文 `42601` → `42P19` → `0A000`）、引用符付きの `"join"` 列・別名を結合演算子と取り違えない。
 - CTE の具体化経路を追加する（Issue #1860・SQL-62）。明示 `MATERIALIZED` の CTE を主クエリが直接参照すると、本文全体を評価した結果行集合を外側が読む。
   挙動変更: 本文の可視行数が `--max-result-rows` を超えると、外側の `LIMIT` に関わらず `54000` で拒否される。公開 API の破壊的変更なし。詳細は [cte.md](docs/design/cte.md)。
 - 非集計形の相関スカラーサブクエリ（`(SELECT y FROM b WHERE b.k = a.k)`。`y` は単一の裸の列）を、WHERE 位置と投影位置で

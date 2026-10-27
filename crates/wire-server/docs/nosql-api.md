@@ -1171,6 +1171,7 @@ Date: <IMF-fixdate>
 | `42P16` | `INVALID_TABLE_DEFINITION` | 400 | Bad Request | `create_table.constraints` に `primary_key` を 2 個以上指定した場合（名前付きを含む。TABLE-22 (d)、Issue #1412・#1437。`ALTER TABLE ... ADD PRIMARY KEY` の重複宣言は SQL 表層専用。後述） |
 | `42P17` | `INVALID_OBJECT_DEFINITION` | 400 | Bad Request | 式索引の式が IMMUTABLE 相当でない（SQL 表層専用。NoSQL の `op` 語彙からは到達しない）。Issue #1647 |
 | `42P18` | `INDETERMINATE_DATATYPE` | 400 | Bad Request | 拡張クエリプロトコル（SQL 表層）の Parse で `$n` の型を決められない。NoSQL の `op` 語彙からは到達しない。Issue #1546 |
+| `42P19` | `INVALID_RECURSION` | 400 | Bad Request | `WITH RECURSIVE` の再帰構造の違反（SQL 表層専用。NoSQL の `op` 語彙からは到達しない）。SQL-35、Issue #1869 |
 | `42P20` | `WINDOWING_ERROR` | 400 | Bad Request | 式索引の式にウィンドウ関数がある（SQL 表層専用。NoSQL の `op` 語彙からは到達しない）。Issue #1647 |
 | `42P21` | `COLLATION_MISMATCH` | 400 | Bad Request | 式の明示的な `COLLATE` 同士の食い違い（SQL 表層専用。NoSQL の `op` 語彙からは到達しない）。Issue #2190 |
 | `42P22` | `INDETERMINATE_COLLATION` | 400 | Bad Request | 暗黙の照合の衝突を照合が必要な演算が消費した（SQL 表層専用。NoSQL の `op` 語彙からは到達しない）。Issue #2190 |
