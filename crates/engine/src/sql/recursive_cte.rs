@@ -129,7 +129,9 @@ fn relation_refs(tokens: &[Token], name: &str) -> Vec<RelRef> {
             Token::Ident(w) => {
                 if let Some(f) = stack.last_mut() {
                     if f.expect_rel {
-                        if w.eq_ignore_ascii_case("LATERAL") || w.eq_ignore_ascii_case("ONLY") {
+                        if (w.eq_ignore_ascii_case("LATERAL") || w.eq_ignore_ascii_case("ONLY"))
+                            && starts_relation(next)
+                        {
                             continue;
                         }
                         if w.eq_ignore_ascii_case(name)
@@ -173,28 +175,78 @@ fn relation_refs(tokens: &[Token], name: &str) -> Vec<RelRef> {
     out
 }
 
-/// 式・別名を導入する語。直後の `JOIN` は結合演算子ではなく列名・別名として読む。
+/// 式・別名を導入する語。直後の `JOIN` は結合演算子ではなく列名・別名として読む
+/// （`NULL`／`TRUE`／`FALSE` は式を完結させる語なので含めない）。
 const JOIN_NOT_AFTER: &[&str] = &[
-    "AS", "ON", "AND", "OR", "NOT", "IN", "IS", "LIKE", "ILIKE", "BETWEEN", "USING", "DISTINCT",
-    "NULL", "TRUE", "FALSE", "CASE", "WHEN", "THEN", "ELSE", "BY",
+    "AS", "ON", "AND", "OR", "NOT", "IN", "IS", "LIKE", "ILIKE", "BETWEEN", "USING", "CASE",
+    "WHEN", "THEN", "ELSE", "BY",
 ];
 
-/// `tokens[i]`（識別子 `JOIN`）が結合演算子の位置にあるかを判定する。lexer は引用符付き識別子も
-/// 未引用語も同じ `Token::Ident` にするため、文脈で区別する。結合の `JOIN` は、直前が
-/// 表参照・別名・結合種別語（識別子）または `)` で終わり、直後に関係名（識別子・`(`）が続く。
-/// `AS "join"` の別名、`= "join"` や `ON join` の列参照は演算子とみなさない
-/// （自己参照の誤検出・取りこぼしを防ぐ。`relation_refs` の構造判定用）。
-fn is_join_operator_position(tokens: &[Token], i: usize) -> bool {
-    let prev_ok = match i.checked_sub(1).and_then(|p| tokens.get(p)) {
-        Some(Token::Ident(p)) => !JOIN_NOT_AFTER.iter().any(|k| p.eq_ignore_ascii_case(k)),
-        Some(Token::Punct(')')) => true,
+/// 関係の直後に続いて FROM 項目を閉じる／次の句を始める語。`ONLY`／`LATERAL` の直後にこれらが
+/// 来た場合、その `ONLY`／`LATERAL` は修飾語でなく関係名（引用符付き `"only"` 等）として読む。
+const NOT_RELATION_START: &[&str] = &[
+    "AS",
+    "ON",
+    "USING",
+    "JOIN",
+    "INNER",
+    "LEFT",
+    "RIGHT",
+    "FULL",
+    "CROSS",
+    "NATURAL",
+    "GROUP",
+    "HAVING",
+    "UNION",
+    "INTERSECT",
+    "EXCEPT",
+    "OFFSET",
+    "FETCH",
+    "WINDOW",
+    "WHERE",
+];
+
+/// `ONLY`／`LATERAL` の直後のトークン `next` が関係の開始（識別子・`(`）かを判定する。lexer は
+/// 引用符付き識別子と未引用語を区別しないため、修飾語として読めるのは関係が続く場合に限り、
+/// 続かない `FROM "only"` は関係名として数える（`WITH RECURSIVE "only"` の自己参照を取りこぼさない）。
+fn starts_relation(next: Option<&Token>) -> bool {
+    match next {
+        Some(Token::Ident(n)) => !NOT_RELATION_START.iter().any(|k| n.eq_ignore_ascii_case(k)),
+        Some(Token::Punct('(')) => true,
         _ => false,
-    };
-    let next_ok = matches!(
-        tokens.get(i.saturating_add(1)),
-        Some(Token::Ident(_) | Token::Punct('('))
-    );
-    prev_ok && next_ok
+    }
+}
+
+/// 直前のトークンが式・関係参照を完結させているか（`JOIN` を演算子と読める文法状態）。
+/// 識別子（式を導入する語を除く）・数値・文字列・パラメータ・`)`・`]` のあとは項が完結しており、
+/// 演算子・`AS`・`ON` などのあとは項を待つ位置なので `JOIN` は列名・別名になる。
+fn ends_operand(prev: Option<&Token>) -> bool {
+    match prev {
+        Some(Token::Ident(p)) => !JOIN_NOT_AFTER.iter().any(|k| p.eq_ignore_ascii_case(k)),
+        Some(
+            Token::QualifiedIdent { .. }
+            | Token::QuotedNull(_)
+            | Token::QuotedBoolWord(_)
+            | Token::Param(_)
+            | Token::Number(_)
+            | Token::StringLiteral(_)
+            | Token::QuotedCollationName(_)
+            | Token::Punct(')' | ']'),
+        ) => true,
+        _ => false,
+    }
+}
+
+/// `tokens[i]`（識別子 `JOIN`）が結合演算子の位置にあるかを判定する。lexer は引用符付き識別子も
+/// 未引用語も同じ `Token::Ident` にするため、文法状態で区別する。結合の `JOIN` は、直前で項が
+/// 完結し（[`ends_operand`]）、直後に関係名（識別子・`(`）が続く位置だけ。`AS "join"` の別名や
+/// `= "join"`・`ON join` の列参照は演算子とみなさない（`relation_refs` の構造判定用）。
+fn is_join_operator_position(tokens: &[Token], i: usize) -> bool {
+    ends_operand(i.checked_sub(1).and_then(|p| tokens.get(p)))
+        && matches!(
+            tokens.get(i.saturating_add(1)),
+            Some(Token::Ident(_) | Token::Punct('('))
+        )
 }
 
 /// `tokens[i]`（識別子 `w`）が列名・表名ではなく演算子・句として使われているかを文脈で判定する。
@@ -719,6 +771,40 @@ mod tests {
             count("SELECT d.n FROM docs d INNER JOIN t ON t.n = d.n LEFT JOIN u ON u.n = 1"),
             1
         );
+    }
+
+    #[test]
+    fn cte_named_only_or_lateral_is_a_relation_name() {
+        for sql in [
+            "WITH RECURSIVE \"only\" AS (SELECT n FROM \"only\") SELECT n FROM \"only\"",
+            "WITH RECURSIVE \"lateral\" AS (SELECT n FROM \"lateral\") SELECT n FROM \"lateral\"",
+        ] {
+            assert_eq!(code(sql), "42P19", "{sql}");
+        }
+        // 修飾語としての ONLY／LATERAL は従来どおり読み飛ばす。
+        let count = |sql: &str, name: &str| {
+            let tokens = crate::sql::lexer::tokenize(sql).expect("tokenize");
+            relation_refs(&tokens, name).len()
+        };
+        assert_eq!(count("SELECT n FROM ONLY t", "t"), 1);
+        assert_eq!(count("SELECT n FROM docs, LATERAL t", "t"), 1);
+        assert_eq!(count("SELECT n FROM \"only\"", "only"), 1);
+        assert_eq!(
+            count("SELECT n FROM \"only\" JOIN docs ON 1 = 1", "only"),
+            1
+        );
+    }
+
+    #[test]
+    fn join_after_literal_param_or_subscript_is_an_operator() {
+        let count = |sql: &str| {
+            let tokens = crate::sql::lexer::tokenize_with_params(sql).expect("tokenize");
+            relation_refs(&tokens, "t").len()
+        };
+        for tail in ["1", "'a'", "$1", "a[1]", "TRUE", "NULL", "(1)", "d.n"] {
+            let sql = format!("SELECT d.n FROM docs d JOIN u ON d.n = {tail} JOIN t ON t.n = 1");
+            assert_eq!(count(&sql), 1, "{sql}");
+        }
     }
 
     #[test]
