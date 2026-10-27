@@ -3015,9 +3015,9 @@ fn prepare_correlated_exists(
         udfs,
         &mut probe_node_budget,
     )?;
+    // 投影は元のまま残す（`ORDER BY` の出力別名・序数の解決が投影を参照するため）。
     let mut shape_probe = validated.clone();
     shape_probe.where_predicates = Vec::new();
-    shape_probe.projection = Projection::Columns(Vec::new());
     shape_probe.limit = 1;
     shape_probe.limit_implicit = false;
     super::parser::bind_scan_with_dummy_flags(

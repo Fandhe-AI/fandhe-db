@@ -31,7 +31,7 @@ use crate::sql::join::semi::{
     CorrelatedBudget, OuterSource, Residual, MAX_CORRELATED_REEVALUATIONS,
 };
 use crate::sql::join::values::{key_class, JoinKeyClass};
-use crate::sql::udf_call::{BinOp, Expr, UdfRegistry};
+use crate::sql::udf_call::{BinOp, CollDerivation, Expr, UdfRegistry};
 use crate::sql::where_tree::{BoundConjunction, BoundOrGroup};
 
 /// 相関 `EXISTS` の実行文脈。`core.rs` の `Statement::Scan`／`Statement::Aggregate` 実行アームが
@@ -245,6 +245,26 @@ fn as_equality_key(
         return Ok(None);
     };
     if inner_class != outer_class {
+        return Ok(None);
+    }
+    // 照合の導出と衝突検証（通常の比較束縛と同じ契約。キー抽出で `42P21`／`42P22` を迂回しない）。
+    // 実効照合が非バイト列順ならバイト列キーでは表せないため残余へ回す。
+    let inner_col = inner.columns.iter().find(|c| c.name == *inner_ident);
+    let outer_col = match outer_ref.source {
+        OuterSource::Column(idx) => outer.columns.get(idx),
+        OuterSource::Id => None,
+    };
+    let derive = |c: Option<&ColumnDef>| match c {
+        Some(c) if c.ty.is_text_like() || matches!(c.ty, ColumnType::Bpchar(_)) => {
+            match c.collation {
+                Some(coll) => CollDerivation::Implicit(coll),
+                None => CollDerivation::Default,
+            }
+        }
+        _ => CollDerivation::NotCollatable,
+    };
+    let eff = derive(inner_col).merge(derive(outer_col))?.consume()?;
+    if !eff.is_byte_order() {
         return Ok(None);
     }
     Ok(Some(KeyPair {
@@ -506,6 +526,33 @@ mod tests {
         .expect("analyze");
         assert!(a.keys.is_empty());
         assert_eq!(a.residual.len(), 2);
+    }
+
+    #[test]
+    fn conflicting_column_collations_in_a_key_are_rejected_with_42p22() {
+        use crate::collation::Collation;
+        let mut inner = schema("b", &[("t", ColumnType::Text)]);
+        let mut outer = schema("a", &[("n", ColumnType::Text)]);
+        inner.columns[0].collation = Some(Collation::JaIcu);
+        outer.columns[0].collation = Some(Collation::UndIcu);
+        let idents = vec!["t".into(), ph("n")];
+        let corr = corr_for(&inner, &outer, &idents);
+        let e = analyze(vec![eq("t", &ph("n"))], &inner, &outer, &corr).expect_err("conflict");
+        assert_eq!(e.wire_code(), "42P22");
+    }
+
+    #[test]
+    fn non_byte_order_collation_key_falls_back_to_residual() {
+        use crate::collation::Collation;
+        let mut inner = schema("b", &[("t", ColumnType::Text)]);
+        let mut outer = schema("a", &[("n", ColumnType::Text)]);
+        inner.columns[0].collation = Some(Collation::JaIcu);
+        outer.columns[0].collation = Some(Collation::JaIcu);
+        let idents = vec!["t".into(), ph("n")];
+        let corr = corr_for(&inner, &outer, &idents);
+        let a = analyze(vec![eq("t", &ph("n"))], &inner, &outer, &corr).expect("analyze");
+        assert!(a.keys.is_empty());
+        assert_eq!(a.residual.len(), 1);
     }
 
     #[test]

@@ -72,7 +72,7 @@ impl CorrelatedBudget {
         what: &'static str,
     ) -> Result<(), SqlSurfaceError> {
         counter
-            .fetch_update(Ordering::Relaxed, Ordering::Relaxed, |used| {
+            .try_update(Ordering::Relaxed, Ordering::Relaxed, |used| {
                 used.checked_add(n).filter(|t| *t <= cap)
             })
             .map(|_| ())
