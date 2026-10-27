@@ -9707,10 +9707,415 @@ pub(crate) struct BoundWindowItem {
     pub(crate) position: usize,
     pub(crate) func: crate::sql::allowlist::WindowFunc,
     pub(crate) input: Option<AggregateInput>,
+    /// `LAG`／`LEAD` の束縛済み引数（それ以外の関数は `None`。SQL-64 (1)・Issue #1880）。
+    pub(crate) offset_args: Option<BoundWindowOffsetArgs>,
     pub(crate) partition_by: Vec<WindowKeyRef>,
     /// 宣言順のウィンドウ `ORDER BY` キー列（SQL-30・SQL-56）。
     pub(crate) order_by: Vec<BoundWindowOrderKey>,
     pub(crate) name: String,
+}
+
+/// `LAG`／`LEAD` の束縛済み引数（SQL-64 (1)・Issue #1880）。評価（Issue #1881）は
+/// `sql::window` が担い、本構造体は型検査済みの式と結果型（Describe の型 OID 公告元）を運ぶ。
+#[derive(Debug, Clone, PartialEq)]
+pub(crate) struct BoundWindowOffsetArgs {
+    pub(crate) value: BoundWindowValue,
+    /// オフセット式（行ごとに評価する。整数型または裸の `NULL`。省略時は `None`＝既定の 1）。
+    pub(crate) offset: Option<crate::sql::udf_call::BoundExpr>,
+    /// 既定値式（値の型へ統一済み。省略時は `None`＝NULL）。
+    pub(crate) default: Option<crate::sql::udf_call::BoundExpr>,
+    /// 既定値が式層で束縛できない型（BOOLEAN・NUMERIC・UUID・ENUM 等）の裸の列のとき、その列の
+    /// 位置（宣言型で型統一済み。この場合 `default` は `None`）。評価は Issue #1881 が接続する。
+    pub(crate) default_column: Option<usize>,
+    /// 統一後の結果列型（`window_result_type` が公告に使う）。
+    pub(crate) result_type: Option<ColumnType>,
+    /// 引数が疑似列 `id` を参照するか（セル評価経路 `CellWindowEvaluator` が拒否に使う）。
+    pub(crate) uses_pseudo_id: bool,
+}
+
+impl BoundWindowOffsetArgs {
+    /// 疑似列 `id` を参照するか。
+    pub(crate) fn references_pseudo_id(&self) -> bool {
+        self.uses_pseudo_id
+    }
+
+    /// 引数が参照するスカラー列を `mask` へ反映する（`sql::window::decode_tier_for_window` が
+    /// 呼ぶ。取りこぼすとマスク外の列を NULL と誤判定するため全引数を走査する）。参照が
+    /// 1 つでもあれば `true`。
+    pub(crate) fn mark_referenced_columns(&self, mask: &mut [bool]) -> bool {
+        let mut any = false;
+        match &self.value {
+            BoundWindowValue::Column { index, .. } => {
+                if let Some(slot) = mask.get_mut(*index) {
+                    *slot = true;
+                }
+                any = true;
+            }
+            BoundWindowValue::Expr { bound, .. } => {
+                any |= crate::sql::udf_call::mark_referenced_scalar_columns(bound, mask);
+            }
+        }
+        for e in self.offset.iter().chain(self.default.iter()) {
+            any |= crate::sql::udf_call::mark_referenced_scalar_columns(e, mask);
+        }
+        if let Some(slot) = self.default_column.and_then(|i| mask.get_mut(i)) {
+            *slot = true;
+            any = true;
+        }
+        any
+    }
+
+    /// 引数が埋め込みベクトルを参照するか。
+    pub(crate) fn references_embedding(&self) -> bool {
+        let value = match &self.value {
+            BoundWindowValue::Column { .. } => false,
+            BoundWindowValue::Expr { bound, .. } => {
+                crate::sql::udf_call::references_embedding(bound)
+            }
+        };
+        value
+            || self
+                .offset
+                .iter()
+                .chain(self.default.iter())
+                .any(crate::sql::udf_call::references_embedding)
+    }
+}
+
+/// `LAG`／`LEAD` の値引数。裸の列は列の型を正確に保持し（NUMERIC・UUID 等も公告できる）、
+/// それ以外は式として束縛する。
+#[derive(Debug, Clone, PartialEq)]
+pub(crate) enum BoundWindowValue {
+    Column {
+        index: usize,
+        ty: ColumnType,
+    },
+    Expr {
+        bound: crate::sql::udf_call::BoundExpr,
+        ty: crate::sql::udf_call::ExprType,
+    },
+}
+
+/// `LAG`／`LEAD` の値として運べない型（`VECTOR`・配列・`BYTEA`・`json`・`jsonb`。fail-closed）。
+fn lag_lead_value_type_unsupported(ty: &ColumnType) -> bool {
+    matches!(
+        ty,
+        ColumnType::Vector(_)
+            | ColumnType::Array(_)
+            | ColumnType::Bytea
+            | ColumnType::Json
+            | ColumnType::Jsonb
+    )
+}
+
+/// 式が裸のスキーマ列参照ならその位置と列定義を返す（`LAG`／`LEAD` の宣言型判定用）。
+fn bare_schema_column<'a>(
+    expr: &Expr,
+    schema: &'a TableSchema,
+) -> Option<(usize, &'a crate::catalog::ColumnDef)> {
+    match expr {
+        Expr::Ident(name) => schema
+            .columns
+            .iter()
+            .enumerate()
+            .find(|(_, c)| &c.name == name),
+        _ => None,
+    }
+}
+
+/// 式が疑似列 `id` の裸の参照か（スキーマ列 `id` があればそちらが優先）。値・オフセット・
+/// 既定値の型決定（[`lag_lead_declared_type`]）と `uses_pseudo_id` 判定が共有する唯一の判定。
+/// テーブル修飾・別名は字句段で修飾子検査済みの `Expr::Ident("id")` へ正規化されている。
+fn is_pseudo_id_ref(expr: &Expr, schema: &TableSchema) -> bool {
+    matches!(expr, Expr::Ident(name) if name == "id")
+        && schema.has_pseudo_id()
+        && !schema.columns.iter().any(|c| c.name == "id")
+}
+
+/// `LAG`／`LEAD` の 1 引数（値・オフセット・既定値）の宣言型を決める唯一の写像。
+/// スキーマ列は列の宣言型、疑似列 `id` は `BIGINT`、それ以外の式は式束縛の結果列型。
+/// 式層が `id` を倍精度として束縛しても、公告型・統一型はこの写像に従う（オフセット側の
+/// 整数判定も同じ写像）。束縛できない式は `None`（呼び出し側の本束縛がエラーを返す）。
+fn lag_lead_declared_type(
+    expr: &Expr,
+    schema: &TableSchema,
+    udfs: &crate::sql::udf_call::UdfRegistry,
+    node_budget: &usize,
+) -> Option<ColumnType> {
+    if let Some((_, c)) = bare_schema_column(expr, schema) {
+        return Some(c.ty.clone());
+    }
+    if is_pseudo_id_ref(expr, schema) {
+        return Some(ColumnType::BigInt);
+    }
+    let mut scratch = *node_budget;
+    crate::sql::udf_call::bind_projection_expr(expr, schema, udfs, &mut scratch)
+        .ok()
+        .and_then(|(_, _, col)| col)
+}
+
+/// 値・既定値の宣言型から最終の結果列型を決める。両方が宣言できれば [`unify_lag_lead_types`]
+/// （例: `lag(id, 1, 0)` は `BIGINT`）、統一できない組（整数と倍精度の混在等）や片側不明は
+/// `COALESCE` 束縛の結果列型 `fallback` を使う。
+fn lag_lead_result_type(
+    value: Option<&ColumnType>,
+    default: Option<&ColumnType>,
+    fallback: Option<ColumnType>,
+) -> Option<ColumnType> {
+    match (value, default) {
+        (Some(v), Some(d)) => unify_lag_lead_types(v, d).or(fallback),
+        _ => fallback,
+    }
+}
+
+/// `LAG`／`LEAD` の値と既定値の宣言型を統一する（`COALESCE` と同じく文字列系同士・整数系同士は
+/// 統一し、それ以外は同一型のみ許す）。統一できなければ `None`（呼び出し側が `42804`）。
+fn unify_lag_lead_types(a: &ColumnType, b: &ColumnType) -> Option<ColumnType> {
+    fn int_rank(t: &ColumnType) -> Option<u8> {
+        match t {
+            ColumnType::SmallInt => Some(1),
+            ColumnType::Integer => Some(2),
+            ColumnType::BigInt => Some(3),
+            _ => None,
+        }
+    }
+    match (a, b) {
+        (ColumnType::Text | ColumnType::Varchar(_), ColumnType::Text | ColumnType::Varchar(_)) => {
+            Some(ColumnType::Text)
+        }
+        // NUMERIC は精度・スケールだけが異なっても統一できる（`COALESCE` は typmod を消して
+        // `ExprType::Numeric` で扱う）。整数部桁数・小数部桁数の大きい側を取り、全値を収める。
+        (
+            ColumnType::Numeric {
+                precision: pa,
+                scale: sa,
+            },
+            ColumnType::Numeric {
+                precision: pb,
+                scale: sb,
+            },
+        ) => {
+            let scale = (*sa).max(*sb);
+            let int_digits = pa.saturating_sub(*sa).max(pb.saturating_sub(*sb));
+            // 上限（`MAX_PRECISION`）超過は catalog・行 codec が拒否する型になるため、
+            // 無損失に統一できないものとして `None`（呼び出し側が fail-closed で `42804`）。
+            let precision = int_digits.checked_add(scale)?;
+            if precision > crate::numeric::MAX_PRECISION {
+                return None;
+            }
+            Some(ColumnType::Numeric { precision, scale })
+        }
+        _ => match (int_rank(a), int_rank(b)) {
+            (Some(x), Some(y)) => Some(if x >= y { a.clone() } else { b.clone() }),
+            _ if a == b => Some(a.clone()),
+            _ => None,
+        },
+    }
+}
+
+/// `LAG`／`LEAD` の引数（値・オフセット・既定値）を束縛し型を検査する（SQL-64 (1)・
+/// Issue #1880。[`bind_window_item`] から呼ばれる）。オフセットは整数型か裸の `NULL`
+/// （それ以外は `42804`）、値と既定値の型統一は `COALESCE` と同じ規則
+/// （[`crate::sql::udf_call::bind_value_with_default`]）で行い、不一致は `42804`。
+fn bind_window_offset_args(
+    args: &crate::sql::allowlist::WindowOffsetArgs,
+    schema: &TableSchema,
+    udfs: &crate::sql::udf_call::UdfRegistry,
+    node_budget: &mut usize,
+) -> Result<BoundWindowOffsetArgs, SqlSurfaceError> {
+    use crate::sql::udf_call::{
+        bind_projection_expr, bind_value_with_default, BoundExpr, ExprType,
+    };
+    let uses_pseudo_id = {
+        let mut idents = std::collections::HashSet::new();
+        collect_expr_idents(&args.value, &mut idents);
+        for e in args.offset.iter().chain(args.default.iter()) {
+            collect_expr_idents(e, &mut idents);
+        }
+        idents.contains("id")
+            && schema.has_pseudo_id()
+            && !schema.columns.iter().any(|c| c.name == "id")
+    };
+    // 値・既定値の宣言型（疑似列 `id` は BIGINT。公告型を式層の倍精度にしない）。
+    let value_decl = lag_lead_declared_type(&args.value, schema, udfs, node_budget);
+    let default_decl = args
+        .default
+        .as_ref()
+        .and_then(|d| lag_lead_declared_type(d, schema, udfs, node_budget));
+    let unsupported =
+        || SqlSurfaceError::feature_not_supported("this value type is not supported in LAG/LEAD");
+    let offset = match &args.offset {
+        None => None,
+        Some(Expr::Null) => Some(BoundExpr::Null),
+        // 裸の列は列の宣言型で判定する（式層は BOOLEAN 等の裸の列を束縛できず `22000` になるため）。
+        // 疑似列 `id` は bigint として扱う（スキーマ列 `id` があればそちらが優先）。
+        Some(e @ Expr::Ident(_)) if is_pseudo_id_ref(e, schema) => {
+            let (bound, _ty, _col) = bind_projection_expr(e, schema, udfs, node_budget)?;
+            Some(bound)
+        }
+        Some(Expr::Ident(name)) if schema.columns.iter().any(|c| &c.name == name) => {
+            let column = schema.columns.iter().find(|c| &c.name == name);
+            match column.map(|c| &c.ty) {
+                Some(ColumnType::SmallInt | ColumnType::Integer | ColumnType::BigInt) => {
+                    let (bound, _ty, _col) = bind_projection_expr(
+                        &Expr::Ident(name.clone()),
+                        schema,
+                        udfs,
+                        node_budget,
+                    )?;
+                    Some(bound)
+                }
+                _ => {
+                    return Err(SqlSurfaceError::datatype_mismatch(
+                        "LAG/LEAD offset must be of integer type",
+                    ))
+                }
+            }
+        }
+        Some(e) => {
+            let (bound, _ty, col) = bind_projection_expr(e, schema, udfs, node_budget)?;
+            match col {
+                Some(ColumnType::SmallInt | ColumnType::Integer | ColumnType::BigInt) => {
+                    Some(bound)
+                }
+                _ => {
+                    return Err(SqlSurfaceError::datatype_mismatch(
+                        "LAG/LEAD offset must be of integer type",
+                    ))
+                }
+            }
+        }
+    };
+    let default_expr = match &args.default {
+        None | Some(Expr::Null) => None,
+        Some(e) => Some(e),
+    };
+    let null_default = matches!(&args.default, Some(Expr::Null)).then_some(BoundExpr::Null);
+
+    let bare_column = match &args.value {
+        Expr::Ident(name) => schema
+            .columns
+            .iter()
+            .enumerate()
+            .find(|(_, c)| &c.name == name),
+        _ => None,
+    };
+    if let (Some((index, column)), None) = (bare_column, default_expr) {
+        if lag_lead_value_type_unsupported(&column.ty) {
+            return Err(unsupported());
+        }
+        return Ok(BoundWindowOffsetArgs {
+            value: BoundWindowValue::Column {
+                index,
+                ty: column.ty.clone(),
+            },
+            offset,
+            default: null_default,
+            default_column: None,
+            result_type: Some(column.ty.clone()),
+            uses_pseudo_id,
+        });
+    }
+    let (value, default, ty, col) = match default_expr {
+        Some(d) => {
+            let default_bare = bare_schema_column(d, schema);
+            // 値・既定値が運べない型の裸の列なら、式束縛へ入る前に `0A000`（fail-closed）。
+            for (_, c) in bare_column.iter().chain(default_bare.iter()) {
+                if lag_lead_value_type_unsupported(&c.ty) {
+                    return Err(unsupported());
+                }
+            }
+            match bind_value_with_default(&args.value, d, schema, udfs, node_budget) {
+                Ok((v, d, ty, col)) => (
+                    v,
+                    Some(d),
+                    ty,
+                    lag_lead_result_type(value_decl.as_ref(), default_decl.as_ref(), col),
+                ),
+                // 式層が拒否する型（BOOLEAN・NUMERIC・UUID・ENUM 等）の裸の列は宣言型で
+                // 型統一・不一致判定する（`COALESCE` 式束縛へ落とさない）。
+                Err(SqlSurfaceError::InvalidInput { .. })
+                    if bare_column.is_some() || default_bare.is_some() =>
+                {
+                    let mismatch = || {
+                        SqlSurfaceError::datatype_mismatch(
+                            "LAG/LEAD default value must have the same type as the value",
+                        )
+                    };
+                    let (value_bound, value_ty) = match bare_column {
+                        Some((index, c)) => (
+                            BoundWindowValue::Column {
+                                index,
+                                ty: c.ty.clone(),
+                            },
+                            c.ty.clone(),
+                        ),
+                        None => {
+                            let (b, ty, col) =
+                                bind_projection_expr(&args.value, schema, udfs, node_budget)?;
+                            let col = value_decl.clone().or(col).ok_or_else(unsupported)?;
+                            if lag_lead_value_type_unsupported(&col)
+                                || matches!(
+                                    ty,
+                                    ExprType::Vector
+                                        | ExprType::Array
+                                        | ExprType::Json
+                                        | ExprType::JsonText
+                                )
+                            {
+                                return Err(unsupported());
+                            }
+                            (BoundWindowValue::Expr { bound: b, ty }, col)
+                        }
+                    };
+                    let (default_bound, default_column, default_ty) = match default_bare {
+                        Some((index, c)) => (None, Some(index), c.ty.clone()),
+                        None => {
+                            let (b, _ty, col) = bind_projection_expr(d, schema, udfs, node_budget)?;
+                            let col = default_decl.clone().or(col).ok_or_else(mismatch)?;
+                            if lag_lead_value_type_unsupported(&col) {
+                                return Err(unsupported());
+                            }
+                            (Some(b), None, col)
+                        }
+                    };
+                    let unified =
+                        unify_lag_lead_types(&value_ty, &default_ty).ok_or_else(mismatch)?;
+                    return Ok(BoundWindowOffsetArgs {
+                        value: value_bound,
+                        offset,
+                        default: default_bound,
+                        default_column,
+                        result_type: Some(unified),
+                        uses_pseudo_id,
+                    });
+                }
+                Err(e) => return Err(e),
+            }
+        }
+        None => {
+            let (v, ty, col) = bind_projection_expr(&args.value, schema, udfs, node_budget)?;
+            (v, null_default, ty, value_decl.clone().or(col))
+        }
+    };
+    let type_ok = col
+        .as_ref()
+        .is_some_and(|c| !lag_lead_value_type_unsupported(c))
+        && !matches!(
+            ty,
+            ExprType::Vector | ExprType::Array | ExprType::Json | ExprType::JsonText
+        );
+    if !type_ok {
+        return Err(unsupported());
+    }
+    Ok(BoundWindowOffsetArgs {
+        value: BoundWindowValue::Expr { bound: value, ty },
+        offset,
+        default,
+        default_column: None,
+        result_type: col,
+        uses_pseudo_id,
+    })
 }
 
 /// ウィンドウ `ORDER BY` の束縛済み 1 キー（キー参照・降順指定・NULL 位置。SQL-30・SQL-56）。
@@ -9805,6 +10210,13 @@ fn bind_window_item(
                             .to_string(),
                     });
                 }
+                // `LAG`／`LEAD` の引数は `offset_args` 経路で運び、`arg` は常に `None`。
+                WindowFunc::Lag | WindowFunc::Lead => {
+                    return Err(SqlSurfaceError::Internal {
+                        detail: "offset window function unexpectedly carries an aggregate argument"
+                            .to_string(),
+                    });
+                }
             };
             let resolved = resolve_aggregate_input(agg_func, arg, schema, udfs, node_budget)?;
             // 照合付きの MIN/MAX（ICU。Issue #2190）はウィンドウ累積器が照合を運ばないため拒否する。
@@ -9821,6 +10233,13 @@ fn bind_window_item(
             }
             Some(resolved)
         }
+    };
+
+    let offset_args = match &item.offset_args {
+        Some(args) if item.func.is_value_offset() => {
+            Some(bind_window_offset_args(args, schema, udfs, node_budget)?)
+        }
+        _ => None,
     };
 
     let mut partition_by = Vec::with_capacity(item.partition_by.len());
@@ -9843,14 +10262,25 @@ fn bind_window_item(
         .clone()
         .unwrap_or_else(|| item.func.default_alias().to_string());
 
-    Ok(BoundWindowItem {
+    let bound = BoundWindowItem {
         position: item.position,
         func: item.func,
         input,
+        offset_args,
         partition_by,
         order_by,
         name,
-    })
+    };
+    // 構文受理・束縛・型検査までが Issue #1880 の範囲で、評価は Issue #1881 が接続する。
+    // 型検査を終えた後ろの単一のゲートで `0A000` を返し、評価経路（走査・Describe・ビューの
+    // 評価後射影）へ未実装の関数を流さない（fail-closed。走査より前に効くため行数・
+    // テナントの存在に依存しない）。Issue #1881 はこのゲートを外して評価を接続する。
+    if bound.func.is_value_offset() {
+        return Err(SqlSurfaceError::feature_not_supported(
+            "lag/lead window functions are not executable yet",
+        ));
+    }
+    Ok(bound)
 }
 
 /// `where_predicates`（未束縛。`sql::allowlist::WherePredicate`）が参照する列名を
@@ -14069,5 +14499,142 @@ mod tests {
         ))];
         let agg = Expr::Ident(crate::sql::allowlist::aggregate_placeholder(0));
         assert_eq!(substitute_group_key_exprs(&agg, &keys), agg);
+    }
+}
+
+/// `LAG`／`LEAD` の値・既定値の公告型（`result_type`）が宣言型と一致することの表駆動検査
+/// （SQL-64 (1)・Issue #1880。疑似列 `id` が式層の倍精度で公告されない回帰を含む）。
+#[cfg(test)]
+mod lag_lead_declared_type_tests {
+    use super::*;
+    use crate::sql::allowlist::WindowOffsetArgs;
+    use crate::sql::udf_call::{Expr, UdfRegistry};
+
+    fn col(name: &str, ty: ColumnType) -> ColumnDef {
+        ColumnDef::new(name, ty, false)
+    }
+    fn numeric(precision: u8, scale: u8) -> ColumnType {
+        ColumnType::Numeric { precision, scale }
+    }
+    fn ident(n: &str) -> Expr {
+        Expr::Ident(n.to_string())
+    }
+    fn num(n: &str) -> Expr {
+        Expr::Number(n.to_string())
+    }
+
+    fn pseudo_schema() -> TableSchema {
+        TableSchema::new(
+            "t",
+            vec![
+                col("score", ColumnType::Integer),
+                col("big", ColumnType::BigInt),
+                col("name", ColumnType::Text),
+                col("n", numeric(10, 2)),
+                col("u", ColumnType::Uuid),
+                col("flag", ColumnType::Boolean),
+            ],
+        )
+    }
+
+    /// 実列 `id`（TEXT）を持つ表。疑似列 `id` は存在せず、宣言型は実列の型になる。
+    fn real_id_schema() -> TableSchema {
+        TableSchema::new(
+            "t",
+            vec![
+                col("id", ColumnType::Text),
+                col("score", ColumnType::Integer),
+            ],
+        )
+    }
+
+    fn result_type(
+        schema: &TableSchema,
+        value: Expr,
+        default: Option<Expr>,
+    ) -> Result<Option<ColumnType>, SqlSurfaceError> {
+        let mut budget = 10_000usize;
+        bind_window_offset_args(
+            &WindowOffsetArgs {
+                value,
+                offset: None,
+                default,
+            },
+            schema,
+            &UdfRegistry::default(),
+            &mut budget,
+        )
+        .map(|a| a.result_type)
+    }
+
+    #[test]
+    fn advertised_type_matches_declared_type() {
+        let s = pseudo_schema();
+        let cases: Vec<(Expr, Option<Expr>, Option<ColumnType>)> = vec![
+            (ident("id"), None, Some(ColumnType::BigInt)),
+            (ident("id"), Some(Expr::Null), Some(ColumnType::BigInt)),
+            (ident("id"), Some(num("0")), Some(ColumnType::BigInt)),
+            (ident("id"), Some(ident("id")), Some(ColumnType::BigInt)),
+            (ident("id"), Some(ident("score")), Some(ColumnType::BigInt)),
+            (ident("score"), Some(ident("id")), Some(ColumnType::BigInt)),
+            (num("1"), Some(ident("id")), Some(ColumnType::BigInt)),
+            (ident("score"), None, Some(ColumnType::Integer)),
+            (ident("score"), Some(num("0")), Some(ColumnType::Integer)),
+            (ident("score"), Some(ident("big")), Some(ColumnType::BigInt)),
+            (
+                ident("name"),
+                Some(Expr::String("x".into())),
+                Some(ColumnType::Text),
+            ),
+            (ident("n"), None, Some(numeric(10, 2))),
+            (ident("n"), Some(ident("n")), Some(numeric(10, 2))),
+            (ident("u"), Some(ident("u")), Some(ColumnType::Uuid)),
+            (
+                ident("flag"),
+                Some(ident("flag")),
+                Some(ColumnType::Boolean),
+            ),
+        ];
+        for (value, default, want) in cases {
+            let got = result_type(&s, value.clone(), default.clone())
+                .unwrap_or_else(|e| panic!("{value:?}/{default:?}: {e:?}"));
+            assert_eq!(got, want, "value={value:?} default={default:?}");
+        }
+    }
+
+    #[test]
+    fn real_id_column_keeps_its_declared_type() {
+        let s = real_id_schema();
+        assert_eq!(
+            result_type(&s, ident("id"), None).expect("bind"),
+            Some(ColumnType::Text)
+        );
+        assert_eq!(
+            result_type(&s, ident("id"), Some(Expr::String("x".into()))).expect("bind"),
+            Some(ColumnType::Text)
+        );
+        // 実列 `id` があれば疑似列扱い（BIGINT）にならず、整数既定値とは不一致。
+        assert!(matches!(
+            result_type(&s, ident("id"), Some(num("0"))),
+            Err(SqlSurfaceError::DatatypeMismatch { .. })
+        ));
+    }
+
+    #[test]
+    fn mismatches_stay_fail_closed() {
+        let s = pseudo_schema();
+        for (value, default) in [
+            (ident("id"), ident("name")),
+            (ident("name"), ident("id")),
+            (ident("n"), ident("id")),
+        ] {
+            assert!(
+                matches!(
+                    result_type(&s, value.clone(), Some(default.clone())),
+                    Err(SqlSurfaceError::DatatypeMismatch { .. })
+                ),
+                "value={value:?} default={default:?}"
+            );
+        }
     }
 }
