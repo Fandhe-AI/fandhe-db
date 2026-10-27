@@ -124,6 +124,16 @@ impl RowBudget {
             .saturating_add(self.scratch)
     }
 
+    /// 全確保経路の合計に対する残りバイト（走査の確保上限）。
+    fn remaining(&self) -> usize {
+        self.limits.max_bytes.saturating_sub(self.total())
+    }
+
+    /// JOIN へ渡す上限（JOIN は側の行を自分の予算へ計上し直すため、保持済みの結果だけを差し引く）。
+    fn remaining_for_join(&self) -> usize {
+        self.limits.max_bytes.saturating_sub(self.retained)
+    }
+
     /// 一時行の計上を解放する（反復の終わり）。
     fn clear_scratch(&mut self) {
         self.scratch = 0;
@@ -171,10 +181,20 @@ impl RowBudget {
 struct ScanTerm {
     bound: BoundScan,
     programs: Vec<Option<ExprProgram>>,
+    /// 作業表の列ごとの `id` 型フラグ（[`work_column`]）。`id` 型の列は公告を `AliasedId`、値を
+    /// `Cell::Integer(u64)` のまま運ぶ。
+    id_cols: Vec<bool>,
+    /// `true` なら `id` 型の列も numeric セルへ正規化して返す（JOIN の作業表側の行。結合は numeric
+    /// 型の列としてセルを読む）。`false` なら元のセルのまま返す（直接の結果行）。
+    numeric_ids: bool,
 }
 
 impl ScanTerm {
-    fn new(bound: BoundScan) -> Result<Self, SqlSurfaceError> {
+    fn new(
+        bound: BoundScan,
+        id_cols: Vec<bool>,
+        numeric_ids: bool,
+    ) -> Result<Self, SqlSurfaceError> {
         // 疑似列 `id` は作業表に存在しない（行 id を持たない）。`SELECT *` や `<cte>.id`（実列 `id` が
         // 無い場合）は黙って NULL／0 にせず拒否する（fail-closed）。
         if bound
@@ -194,7 +214,12 @@ impl ScanTerm {
                 _ => None,
             })
             .collect();
-        Ok(Self { bound, programs })
+        Ok(Self {
+            bound,
+            programs,
+            id_cols,
+            numeric_ids,
+        })
     }
 
     /// 射影の結果列メタデータ（再帰項の列整合の検査に使う）。
@@ -208,6 +233,9 @@ impl ScanTerm {
                         .columns
                         .get(*index)
                         .ok_or_else(|| internal("projected column index out of range"))?;
+                    if self.id_cols.get(*index).copied().unwrap_or(false) {
+                        return Ok(crate::sql::exec::aliased_id_column_meta(name));
+                    }
                     Ok(ColumnMeta::Scalar {
                         name: name.clone(),
                         ty: def.ty.clone(),
@@ -260,7 +288,10 @@ impl ScanTerm {
                                 let cell = row.cells.get(*index).ok_or_else(|| {
                                     internal("projected column index out of range")
                                 })?;
+                                let is_id = self.id_cols.get(*index).copied().unwrap_or(false);
                                 cells.push(match types.get(*index) {
+                                    // 直接の結果行の `id` 型の列は元のセル（`u64`）のまま運ぶ。
+                                    Some(Some(_)) if is_id && !self.numeric_ids => cell.clone(),
                                     Some(Some(ty)) => normalize_cell(cell, ty)?.into_owned(),
                                     _ => cell.clone(),
                                 });
@@ -316,6 +347,8 @@ struct Prepared<'a> {
     columns: Vec<ColumnMeta>,
     /// 作業表の列型（`synth_schema` の `types`）。
     work_types: Vec<Option<ColumnType>>,
+    /// JOIN の作業表側の列型。`id` 型の列は結合キーに使えるよう BIGINT（`i64::MAX` 超は `22003`）。
+    join_types: Vec<Option<ColumnType>>,
     step: Step<'a>,
 }
 
@@ -340,21 +373,21 @@ fn check_scan_shape(scan: &ValidatedScan) -> Result<(), SqlSurfaceError> {
 }
 
 /// 「アンカー列 → 作業表列」の唯一の写像。疑似列 `id`（行 id）を結果列にしたアンカー項の列は、
-/// 作業表では BIGINT の実列として扱う（`id` の値は `u64` のまま運ばれ、結合キー・述語に使える。
-/// 作業表自身は行 id を持たない）。作業表スキーマ・列型（`work_types`）・型整合検査
-/// （[`compose_columns`]）・再帰項の束縛のすべてがこの写像の結果を使う。
+/// 作業表では `id` 型（[`ColumnMeta::AliasedId`]。numeric(20,0) で `u64` 全域を損失なく運ぶ。評価後射影形
+/// ビューの外側の `id` 列と同じ写像）として扱う。BIGINT の実列にすると `u64` を `i64` へ変換して
+/// `i64::MAX` 超の行 id を壊す。作業表自身は行 id を持たない。作業表スキーマ・列型（`work_types`）・
+/// 型整合検査（[`compose_columns`]）・再帰項の束縛のすべてがこの写像の結果を使い、公開結果列の公告
+/// （`Id`／`AliasedId` は numeric）と値表現（`Cell::Integer(u64)`）は元のメタのまま保つ。
 fn work_column(m: &ColumnMeta) -> ColumnMeta {
     match m {
-        ColumnMeta::Id => ColumnMeta::Scalar {
-            name: "id".to_string(),
-            ty: ColumnType::BigInt,
-        },
-        ColumnMeta::AliasedId { name } => ColumnMeta::Scalar {
-            name: name.clone(),
-            ty: ColumnType::BigInt,
-        },
+        ColumnMeta::Id => crate::sql::exec::aliased_id_column_meta("id"),
         other => other.clone(),
     }
+}
+
+/// 作業表の列が `id` 型（セルが `Cell::Integer(u64)`）か。
+fn is_id_column(m: &ColumnMeta) -> bool {
+    matches!(m, ColumnMeta::Id | ColumnMeta::AliasedId { .. })
 }
 
 /// 結果列の静的な整数型（`SMALLINT`／`INTEGER`／`BIGINT`）。
@@ -393,6 +426,7 @@ fn check_work_types(columns: &[ColumnMeta]) -> Result<(), SqlSurfaceError> {
 /// 列を正とし、再帰項は互換でなければ `42804`。
 fn compose_columns(
     cte: &ValidatedRecursiveCte,
+    public_anchor: &[ColumnMeta],
     anchor_columns: &[ColumnMeta],
     rec_columns: &[ColumnMeta],
 ) -> Result<Vec<ColumnMeta>, SqlSurfaceError> {
@@ -403,6 +437,15 @@ fn compose_columns(
         super::set_op::columns_have_vector(anchor_columns),
         super::set_op::columns_have_vector(rec_columns),
     )?;
+    // `id` 型の列は値表現（`Cell::Integer(u64)`）が他の numeric と違うため、アンカーと再帰項で
+    // `id` 型かどうかが一致しない列（`id` 列への算術・JOIN 越しの射影など）は `42804` で拒否する。
+    for (i, (a, r)) in anchor_columns.iter().zip(rec_columns.iter()).enumerate() {
+        if is_id_column(a) != is_id_column(r) {
+            return Err(SqlSurfaceError::datatype_mismatch(format!(
+                "recursive query column {i} must be the row id in both terms or in neither"
+            )));
+        }
+    }
     // 作業表と再帰項の束縛はアンカー型を正とするため、整数型の拡大（アンカーより広い型を再帰項が
     // 返す形）は受け入れずに `42804` で拒否する（PostgreSQL も再帰項の型がアンカー型と一致しない
     // と `42804`。作業表へ拡大後の型を運ぶと、次の反復で範囲外の値が狭い型の列へ渡る）。
@@ -415,7 +458,8 @@ fn compose_columns(
             }
         }
     }
-    let merged = super::set_op::merge_columns(anchor_columns, rec_columns);
+    // 公開結果列の公告はアンカーの元のメタ（`Id`／`AliasedId` は numeric）を保つ。
+    let merged = super::set_op::merge_columns(public_anchor, rec_columns);
     if cte.column_aliases.is_empty() {
         Ok(merged)
     } else {
@@ -446,11 +490,27 @@ fn with_prepared<T>(
         &named
     };
     let synth_input: Vec<ColumnMeta> = exposed.to_vec();
+    let id_cols: Vec<bool> = exposed.iter().map(is_id_column).collect();
     let (work_schema, work_types) = synth_schema(&cte.name, &synth_input);
     // 作業表は行 id を持たない: 疑似列 `id` を持たない行識別方式（`Allocated`）にして、式・述語・
     // JOIN 条件・ORDER BY を含む全ての `id` 参照を束縛段の未知列として拒否する（実列 `id` は
     // 合成列として解決される）。直接投影の検査（`ScanTerm::new`）は二重の防御として残す。
     let work_schema = work_schema.with_row_identity(RowIdentity::Allocated);
+    // JOIN の作業表側だけは、`id` 型（numeric）の列を結合キーに使えるよう BIGINT の実列として束縛する
+    // （結合キーは numeric を受け付けない）。`i64::MAX` を超える行 id は変換時に `22003` で拒否される
+    // （値を壊さない）。直接の結果行（Scan 版）は numeric のまま `u64` 全域を運ぶ。
+    let join_input: Vec<ColumnMeta> = synth_input
+        .iter()
+        .map(|m| match m {
+            ColumnMeta::AliasedId { name } => ColumnMeta::Scalar {
+                name: name.clone(),
+                ty: ColumnType::BigInt,
+            },
+            other => other.clone(),
+        })
+        .collect();
+    let (join_schema, join_types) = synth_schema(&cte.name, &join_input);
+    let join_schema = join_schema.with_row_identity(RowIdentity::Allocated);
     // 非バイト列順の照合（ICU）の列を持つ表を参照する再帰は、アンカー列の照合を作業表へ運べない
     // ため、再帰項の比較・結合が既定のバイト列順で黙って評価される fail-open を避けて拒否する
     // （`check_buffered_view_collations` と同じ固定 `0A000`。TABLE-28）。
@@ -466,7 +526,7 @@ fn with_prepared<T>(
     }
 
     let mut all: HashMap<String, TableSchema> = schemas.clone();
-    all.insert(cte.name.clone(), work_schema.clone());
+    all.insert(cte.name.clone(), join_schema.clone());
 
     let (rec_columns, step): (Vec<ColumnMeta>, Step<'_>) = match &*cte.recursive {
         Statement::Scan(scan) => {
@@ -477,7 +537,7 @@ fn with_prepared<T>(
             }
             check_scan_shape(scan)?;
             let bound = super::parser::bind_scan(scan, &work_schema, udfs)?;
-            let term = ScanTerm::new(bound)?;
+            let term = ScanTerm::new(bound, id_cols.clone(), false)?;
             (term.column_metas(&work_schema)?, Step::Scan(term))
         }
         Statement::Join(join) => {
@@ -491,7 +551,7 @@ fn with_prepared<T>(
                     }
                     cte_side = Some(i);
                     // 関係名の書き方（大文字小文字）に依らず合成スキーマへ解決させる（同名の実表を隠す）。
-                    all.insert(rel.table().to_string(), work_schema.clone());
+                    all.insert(rel.table().to_string(), join_schema.clone());
                 }
             }
             let cte_side = cte_side.ok_or_else(|| {
@@ -506,7 +566,7 @@ fn with_prepared<T>(
             let (_, side_bound) = prepared
                 .side_scan(cte_side)
                 .ok_or_else(|| internal("recursive reference side out of range"))?;
-            let side_term = ScanTerm::new(side_bound.clone())?;
+            let side_term = ScanTerm::new(side_bound.clone(), id_cols.clone(), true)?;
             (
                 prepared.column_metas(),
                 Step::Join {
@@ -524,11 +584,12 @@ fn with_prepared<T>(
     };
     // 再帰項の疑似列 `id` も同じ写像で BIGINT の実列として扱う（アンカー側と対称にする）。
     let rec_work: Vec<ColumnMeta> = rec_columns.iter().map(work_column).collect();
-    let columns = compose_columns(cte, &work_anchor, &rec_work)?;
+    let columns = compose_columns(cte, anchor_columns, &work_anchor, &rec_work)?;
     check_work_types(&rec_work)?;
     f(&Prepared {
         columns,
         work_types,
+        join_types,
         step,
     })
 }
@@ -585,7 +646,9 @@ pub(crate) fn execute(
                 if side == *cte_side {
                     sides.push(Vec::new());
                 } else {
-                    let rows = prepared.scan_side_once(read_txn, ctx, side, join_limits)?;
+                    // 走査の確保上限は、保持済みの全確保を差し引いた残予算（確保前に拒否される）。
+                    let scan_limits = join_limits.with_budget_cap(budget.remaining());
+                    let rows = prepared.scan_side_once(read_txn, ctx, side, &scan_limits)?;
                     for row in &rows {
                         budget.admit(&row.cells, Charge::Fixed)?;
                     }
@@ -618,7 +681,7 @@ pub(crate) fn execute(
                     // 作業表側の行は、側スキャンと同じ束縛（述語・射影）を作業表へ適用して作る
                     // （反復内だけ保持する一時行として同じ共有予算へ計上する）。
                     let side_rows = side_term.eval_over_rows(
-                        &p.work_types,
+                        &p.join_types,
                         working,
                         &mut budget,
                         Charge::Scratch,
@@ -627,7 +690,9 @@ pub(crate) fn execute(
                         .get_mut(*cte_side)
                         .ok_or_else(|| internal("recursive reference side out of range"))?;
                     *slot = side_rows;
-                    let joined = prepared.run_with_sides(&sides, join_limits)?;
+                    // JOIN の中間結果・出力の確保上限は、保持済みの結果を差し引いた残予算。
+                    let step_limits = join_limits.with_budget_cap(budget.remaining_for_join());
+                    let joined = prepared.run_with_sides(&sides, &step_limits)?;
                     if let Some(slot) = sides.get_mut(*cte_side) {
                         slot.clear();
                     }
@@ -690,16 +755,125 @@ mod tests {
         assert_eq!(b.rows, 2);
     }
 
+    /// 疑似列 `id` は作業表では `u64` 全域を運べる `id` 型（numeric）へ写る（BIGINT へは写さない）。
     #[test]
-    fn work_column_maps_pseudo_id_to_bigint() {
+    fn work_column_maps_pseudo_id_to_the_lossless_id_type() {
         for m in [ColumnMeta::Id, ColumnMeta::AliasedId { name: "k".into() }] {
+            let w = work_column(&m);
+            assert!(matches!(w, ColumnMeta::AliasedId { .. }), "{w:?}");
+            let (schema, types) = synth_schema("t", std::slice::from_ref(&w));
             assert!(matches!(
-                work_column(&m),
-                ColumnMeta::Scalar {
-                    ty: ColumnType::BigInt,
-                    ..
-                }
+                types.first(),
+                Some(Some(ColumnType::Numeric { .. }))
             ));
+            assert_eq!(schema.columns.len(), 1);
         }
+    }
+
+    /// JOIN の再帰項で、保持済みの結果を差し引いた残予算が走査・JOIN の確保処理へ上限として渡る
+    /// （確保前の拒否）。残予算が足りないときの拒否は走査・JOIN 側の確保前判定（`JOIN exceeds`／
+    /// 走査の予算）から返り、確保後の事後計上（`recursive query exceeds`）には到達しない。
+    #[test]
+    fn join_and_base_scan_receive_the_remaining_budget() {
+        use crate::catalog::{ColumnDef, TableSchema};
+        use crate::core::{EngineCore, ParsedSql};
+        use crate::kernel::CpuScalarProvider;
+        use crate::policy::PolicyContext;
+        use crate::recovery::required_op_id::OperationId;
+        use crate::row_codec::Value;
+        use crate::sql::allowlist::Statement;
+        use crate::sql::exec::QueryResult;
+        use crate::storage::{Storage, Visibility};
+        use crate::test_util::temp_db::{unique_db_path, CleanupGuard};
+        use redb::ReadableDatabase;
+
+        let path = unique_db_path("recursive-eval-budget");
+        let _cleanup = CleanupGuard(path.clone());
+        let storage = Storage::open(&path).expect("open storage");
+        let schema = TableSchema::new(
+            "edges",
+            vec![
+                ColumnDef::new("src", ColumnType::BigInt, false),
+                ColumnDef::new("dst", ColumnType::BigInt, false),
+            ],
+        );
+        storage.create_table(&schema).expect("create table");
+        let ctx = PolicyContext::with_visibilities("t1", [Visibility::Public]).expect("ctx");
+        for i in 0..50u64 {
+            crate::tenant::insert_typed_row(
+                &storage,
+                "edges",
+                &ctx,
+                i + 1,
+                Visibility::Public,
+                &[Value::BigInt(1), Value::BigInt(1)],
+                &OperationId::parse(&format!("edge-{i}")).expect("op id"),
+            )
+            .expect("insert edge");
+        }
+        let core = EngineCore::from_storage(storage, Box::new(CpuScalarProvider));
+        let sql = "WITH RECURSIVE r(n) AS (SELECT CAST(1 AS BIGINT) UNION ALL \
+                   SELECT e.dst FROM edges e JOIN r ON e.src = r.n) SELECT n FROM r";
+        let parsed = core.parse_sql(sql).expect("parse");
+        let ParsedSql::Statement(Statement::BufferedView(view)) = &parsed else {
+            panic!("expected a buffered view");
+        };
+        let Statement::RecursiveCte(cte) = &*view.body else {
+            panic!("expected a recursive cte");
+        };
+        let schemas: HashMap<String, TableSchema> =
+            HashMap::from([("edges".to_string(), schema.clone())]);
+        let anchor = || QueryResult {
+            columns: vec![ColumnMeta::Scalar {
+                name: "n".to_string(),
+                ty: ColumnType::BigInt,
+            }],
+            rows: vec![ResultRow {
+                id: 0,
+                score: 0.0,
+                cells: vec![Cell::SignedInteger(1)],
+            }],
+        };
+        let row_bytes = |cells: &[Cell]| {
+            let mut b = RowBudget::new(limits(usize::MAX));
+            b.admit(cells, Charge::Retained).unwrap();
+            b.retained
+        };
+        let anchor_bytes = row_bytes(&[Cell::SignedInteger(1)]);
+        let edge_bytes = row_bytes(&[Cell::SignedInteger(1), Cell::SignedInteger(1)]);
+        let read_txn = core.storage_for_test().db().begin_read().unwrap();
+        let udfs = UdfRegistry::default();
+        let join_limits = JoinLimits::default();
+        let run = |max_bytes: usize| {
+            execute(
+                &read_txn,
+                &ctx,
+                cte,
+                anchor(),
+                &schemas,
+                &udfs,
+                &join_limits,
+                RecursiveLimits {
+                    max_iterations: 5,
+                    max_rows: 1_000_000,
+                    max_bytes,
+                },
+            )
+        };
+        // 基底表（50 行）が残予算に入らない: 走査の確保前判定で拒否される。
+        let err = run(anchor_bytes + edge_bytes * 10).expect_err("scan must be refused");
+        assert_eq!(err.wire_code(), "54000");
+        assert!(
+            !format!("{err:?}").contains("recursive query exceeds"),
+            "{err:?}"
+        );
+        // 側の行（基底表・作業表側）は入るが JOIN の中間結果・出力は入らない: JOIN の確保前判定で拒否される
+        // （残予算が渡らないと JOIN は満額で確保し、事後の計上でしか拒否されない）。
+        let err = run(anchor_bytes * 2 + edge_bytes * 50 + 8).expect_err("join must be refused");
+        assert_eq!(err.wire_code(), "54000");
+        assert!(format!("{err:?}").contains("JOIN exceeds"), "{err:?}");
+        // 十分なバイト予算では、バイト予算が原因では拒否されない（行数・反復の上限が先に効く）。
+        let err = run(usize::MAX / 2).expect_err("row or iteration limit");
+        assert!(!format!("{err:?}").contains("byte budget"), "{err:?}");
     }
 }

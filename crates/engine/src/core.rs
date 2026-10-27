@@ -8072,6 +8072,47 @@ impl EngineCore {
         Ok(())
     }
 
+    /// 再帰 CTE（SQL-35・Issue #1870）の静的検証と結果列の導出（行は読まない）。アンカー項の結果列を
+    /// 導出し、再帰項の束縛・列整合・型・照合の検査を [`crate::sql::recursive_eval::describe`] で行う。
+    /// Describe の結果列導出と、Execute のアンカー実行前の事前検証が共有する唯一の実装で、
+    /// 静的に決まるエラー（`42804`・`0A000` 等）がデータ依存の実行エラー（アンカー本文の除算エラー等）より
+    /// 先に決まり、両経路で同じエラーになる。
+    fn describe_recursive_cte(
+        &self,
+        session: &crate::sql::mode::SessionState,
+        validated: &crate::sql::allowlist::ValidatedRecursiveCte,
+        skip_vector_literal_validation: bool,
+        limits: &crate::result_limits::ResultLimits,
+    ) -> Result<Vec<crate::sql::exec::ColumnMeta>, crate::sql::allowlist::SqlSurfaceError> {
+        let anchor_parsed = ParsedSql::Statement((*validated.anchor).clone());
+        let anchor_columns = self
+            .describe_parsed_in_session_impl(
+                session,
+                &anchor_parsed,
+                skip_vector_literal_validation,
+                &[],
+                limits,
+            )?
+            .ok_or_else(|| crate::sql::allowlist::SqlSurfaceError::Internal {
+                detail: "internal error".to_string(),
+            })?;
+        let mut table_names = Vec::new();
+        recursive_cte_tables(validated, &mut table_names);
+        let (_read_txn, schemas) = self.read_txn_with_schemas(&table_names)?;
+        let join_limits = crate::sql::join::JoinLimits::from_settings(
+            self.group_by_limits,
+            self.join_limits,
+            *limits,
+        );
+        crate::sql::recursive_eval::describe(
+            validated,
+            &anchor_columns,
+            &schemas,
+            session.udfs(),
+            &join_limits,
+        )
+    }
+
     /// [`Self::describe_parsed_in_session`]／[`Self::describe_prepared_in_session`]
     /// が共有する実装本体。`skip_vector_literal_validation` が `true` のときのみ
     /// `ORDER BY` のベクトルリテラルの実パース（`parse_vector_literal` による
@@ -8450,32 +8491,11 @@ impl EngineCore {
             // 再帰項の束縛・列整合の検査だけを行う（Execute と同じ `recursive_eval` の計画を通る
             // ため、束縛エラーが両経路で一致する）。
             ParsedSql::Statement(Statement::RecursiveCte(validated)) => {
-                let anchor_parsed = ParsedSql::Statement((*validated.anchor).clone());
-                let anchor_columns = self
-                    .describe_parsed_in_session_impl(
-                        session,
-                        &anchor_parsed,
-                        skip_vector_literal_validation,
-                        &[],
-                        limits,
-                    )?
-                    .ok_or_else(|| crate::sql::allowlist::SqlSurfaceError::Internal {
-                        detail: "internal error".to_string(),
-                    })?;
-                let mut table_names = Vec::new();
-                recursive_cte_tables(validated, &mut table_names);
-                let (_read_txn, schemas) = self.read_txn_with_schemas(&table_names)?;
-                let join_limits = crate::sql::join::JoinLimits::from_settings(
-                    self.group_by_limits,
-                    self.join_limits,
-                    *limits,
-                );
-                let columns = crate::sql::recursive_eval::describe(
+                let columns = self.describe_recursive_cte(
+                    session,
                     validated,
-                    &anchor_columns,
-                    &schemas,
-                    session.udfs(),
-                    &join_limits,
+                    skip_vector_literal_validation,
+                    limits,
                 )?;
                 Ok(Some(columns))
             }
@@ -9341,6 +9361,10 @@ impl EngineCore {
             // `ctx`・同一の `read_txn`（単一スナップショット）で既存の走査経路を通る（RLS 暗黙適用）。
             // 外側の WHERE・ORDER BY・射影・集計・LIMIT は呼び出し元の `BufferedView` 腕が適用する。
             crate::sql::allowlist::Statement::RecursiveCte(validated) => {
+                // 静的に決まるエラー（アンカーの束縛・再帰項の束縛・列数・型・照合・未対応型）は、アンカーを
+                // 実行する前に Describe と同じ経路で検査する（データ依存の実行エラーに覆われない。
+                // Describe／Execute で同じエラー）。
+                self.describe_recursive_cte(&*session, &validated, false, &limits)?;
                 let anchor = match &*validated.anchor {
                     // `FROM` なし定数式はセッション UDF レジストリを要する専用の実行本体を持つ
                     // （`execute_read_statement_with_limits` の対象外）。

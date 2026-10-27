@@ -99,6 +99,23 @@ pub(crate) struct JoinLimits {
     pub(crate) max_result_rows: usize,
 }
 
+impl JoinLimits {
+    /// 累計バイト予算の上限だけを `budget_cap` に差し替えた上限を返す（再帰 CTE が、保持済みの
+    /// 結果・作業表を差し引いた残予算を走査・JOIN の確保処理へ上限として渡す。確保前に拒否される）。
+    pub(crate) fn with_budget_cap(&self, budget_cap: usize) -> Self {
+        Self {
+            max_input_rows: self.max_input_rows,
+            max_output_rows: self.max_output_rows,
+            max_comparisons: self.max_comparisons,
+            budget_cap,
+            max_groups: self.max_groups,
+            max_group_by_columns: self.max_group_by_columns,
+            max_relations: self.max_relations,
+            max_result_rows: self.max_result_rows,
+        }
+    }
+}
+
 impl Default for JoinLimits {
     fn default() -> Self {
         Self {

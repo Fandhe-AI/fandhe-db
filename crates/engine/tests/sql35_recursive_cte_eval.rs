@@ -726,10 +726,17 @@ fn work_table_type_mapping_is_consistent() {
                SELECT i FROM t WHERE i < 0) SELECT i FROM t",
             "",
         ),
+        // `id` 型（numeric）の列への算術は、作業表上では評価できず束縛段で拒否される。
         (
             "WITH RECURSIVE t(i) AS (SELECT id FROM tree WHERE name = 'root' UNION ALL \
                SELECT i + 1 FROM t WHERE i < 0) SELECT i FROM t",
-            "",
+            "22000",
+        ),
+        // 静的な不正（列数不一致）は、アンカーのデータ依存の実行エラー（0 除算）に覆われない。
+        (
+            "WITH RECURSIVE t(n) AS (SELECT 1 / 0 UNION ALL SELECT n + 1, 2 FROM t WHERE n < 3) \
+               SELECT n FROM t",
+            "42804",
         ),
         (
             "WITH RECURSIVE t(i) AS (SELECT id FROM tree WHERE name = 'root' UNION ALL \
@@ -754,4 +761,37 @@ fn work_table_type_mapping_is_consistent() {
            SELECT i FROM t WHERE i < 0) SELECT count(*) FROM t",
     );
     assert_eq!(ids, col(&["1"]));
+}
+
+/// 行 id が `i64::MAX` を超えても、再帰を経た結果列の公告（numeric）と値（`u64`）が一致して保たれる
+/// （作業表で BIGINT へ写して値を壊さない。Issue #1870 レビュー指摘）。
+#[test]
+fn row_id_above_i64_max_survives_the_working_table() {
+    let big: u64 = u64::MAX - 5;
+    let (core, _g) = open_core_with(|s| {
+        put_node(s, "alice", big, 1, None, "root", Visibility::Public);
+    });
+    let sql = "WITH RECURSIVE t(i) AS (SELECT id FROM tree WHERE name = 'root' UNION ALL \
+                 SELECT i FROM t WHERE i < 0) SELECT i FROM t";
+    let result = run(&core, "alice", sql).expect("execute");
+    assert_eq!(grid(&result), col(&["18446744073709551610"]));
+    // 公告は BIGINT ではなく `id` 型（numeric）。
+    assert!(
+        matches!(
+            result.columns.first(),
+            Some(engine::sql::exec::ColumnMeta::Id)
+                | Some(engine::sql::exec::ColumnMeta::AliasedId { .. })
+        ),
+        "{:?}",
+        result.columns
+    );
+    // 作業表上の述語も `u64` 全域で評価できる（`i64::MAX` 超の比較が `22003` にならない）。
+    let pred = "WITH RECURSIVE t(i) AS (SELECT id FROM tree WHERE name = 'root' UNION ALL \
+                  SELECT i FROM t WHERE i > 9223372036854775807 AND i < 0) SELECT i FROM t";
+    assert_eq!(rows(&core, "alice", pred), col(&["18446744073709551610"]));
+    // JOIN の再帰項の結合キーは BIGINT として読むため、`i64::MAX` 超の行 id は値を壊さず `22003`
+    // （範囲外）で拒否する。範囲内の行 id は結合キーに使える（`pseudo_id_anchor_column`）。
+    let join = "WITH RECURSIVE t(i) AS (SELECT id FROM tree WHERE name = 'root' UNION ALL \
+                  SELECT c.id FROM tree c JOIN t ON c.parent_id = t.i) SELECT i FROM t";
+    assert_eq!(code(&core, "alice", join), "22003");
 }
