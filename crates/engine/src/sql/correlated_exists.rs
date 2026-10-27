@@ -1,7 +1,7 @@
 //! 相関 `EXISTS` の述語分解と残余述語の束縛（SQL-61 ポインタ、Issue #1842、親 #1840。
 //! RLS-10 ポインタ）。
 //!
-//! 責務境界: `sql::subquery` が肯定形の `EXISTS (SELECT ...)` の内側で外側の列への参照
+//! 責務境界: `sql::subquery` が `EXISTS`／`NOT EXISTS (SELECT ...)`（Issue #1843）の内側で外側の列への参照
 //! （[`crate::sql::correlation::Correlation`]）を検出したとき、内側 `WHERE` の連言を本モジュールの
 //! [`analyze`] が次の 3 つへ分類する。内側の実体化・走査・プローブ組み立て（実行を伴う部分）は
 //! `sql::subquery` と `sql::join::semi` が担い、本モジュールはスキーマだけを見る（行データは読まない。

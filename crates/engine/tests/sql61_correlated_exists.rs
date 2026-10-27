@@ -522,17 +522,15 @@ fn sql61_other_tenants_rows_are_not_observable_through_the_correlation() {
     let sql2 = "SELECT id FROM a WHERE EXISTS (SELECT 1 FROM b WHERE b.aid = a.k AND b.v > a.v - 1000) LIMIT 100";
     assert_eq!(ids(&core, &ctx, sql2), vec![1, 2]);
     // 未対応の形のエラーは他テナントの行数に依存しない。
-    let not_exists =
-        "SELECT id FROM a WHERE NOT EXISTS (SELECT 1 FROM b WHERE b.aid = a.k) LIMIT 100";
-    assert_eq!(err(&core, &ctx, not_exists), err(&core, &t2, not_exists));
+    let unsupported = "SELECT id FROM a WHERE t IN (SELECT t FROM b WHERE b.aid = a.k) LIMIT 100";
+    assert_eq!(err(&core, &ctx, unsupported), err(&core, &t2, unsupported));
 }
 
 #[test]
 fn sql61_unsupported_correlated_forms_stay_fail_closed() {
     let (core, ctx, _g) = setup();
     for sql in [
-        // 反結合 (#1843)・相関 IN／NOT IN／スカラー (#1844)。
-        "SELECT id FROM a WHERE NOT EXISTS (SELECT 1 FROM b WHERE b.aid = a.k) LIMIT 100",
+        // 相関 IN／NOT IN／スカラー (#1844)。
         "SELECT id FROM a WHERE t IN (SELECT t FROM b WHERE b.aid = a.k) LIMIT 100",
         "SELECT id FROM a WHERE t NOT IN (SELECT t FROM b WHERE b.aid = a.k) LIMIT 100",
         "SELECT id FROM a WHERE t = (SELECT t FROM b WHERE b.aid = a.k LIMIT 1) LIMIT 100",
@@ -543,6 +541,9 @@ fn sql61_unsupported_correlated_forms_stay_fail_closed() {
         "SELECT id FROM a WHERE EXISTS (SELECT 1 FROM b WHERE b.aid = a.k ORDER BY a.k LIMIT 1) LIMIT 100",
         // 集計の FILTER は相関を実行しない。
         "SELECT COUNT(*) FILTER (WHERE EXISTS (SELECT 1 FROM b WHERE b.aid = a.k)) FROM a",
+        "SELECT COUNT(*) FILTER (WHERE NOT EXISTS (SELECT 1 FROM b WHERE b.aid = a.k)) FROM a",
+        // 直近より外側の参照（否定形でも同じ）。
+        "SELECT id FROM a WHERE NOT EXISTS (SELECT 1 FROM b WHERE NOT EXISTS (SELECT 1 FROM c WHERE c.aid = a.k)) LIMIT 100",
     ] {
         let (code, msg) = err(&core, &ctx, sql);
         assert_eq!(code, "42601", "{sql}: {msg}");
@@ -553,6 +554,8 @@ fn sql61_unsupported_correlated_forms_stay_fail_closed() {
     for sql in [
         "DELETE FROM a WHERE EXISTS (SELECT 1 FROM b WHERE b.aid = k) USING OPERATION_ID 'x1'",
         "UPDATE a SET t = 'q' WHERE EXISTS (SELECT 1 FROM b WHERE b.aid = k) USING OPERATION_ID 'x2'",
+        "DELETE FROM a WHERE NOT EXISTS (SELECT 1 FROM b WHERE b.aid = k) USING OPERATION_ID 'x3'",
+        "UPDATE a SET t = 'q' WHERE NOT EXISTS (SELECT 1 FROM b WHERE b.aid = k) USING OPERATION_ID 'x4'",
     ] {
         let e = core
             .execute_sql_in_session(&ctx, &mut SessionState::default(), sql)
@@ -647,9 +650,185 @@ fn sql61_deferred_error_path_validates_correlated_exists_statically() {
     let bad = "SELECT id FROM a WHERE k IN (SELECT aid FROM b WHERE v = (SELECT v FROM d LIMIT 2) \
                AND EXISTS (SELECT 1 FROM c WHERE c.aid = b.aid AND c.zz = 1)) LIMIT 100";
     assert_eq!(err(&core, &ctx, bad).0, "42703");
-    // 否定形の相関は従来どおり 42601。
+    // 否定形の相関（Issue #1843）も肯定形と同じ静的検証を共有する。
     let negated =
         "SELECT id FROM a WHERE k IN (SELECT aid FROM b WHERE v = (SELECT v FROM d LIMIT 2) \
                    AND NOT EXISTS (SELECT 1 FROM c WHERE c.aid = b.aid)) LIMIT 100";
-    assert_eq!(err(&core, &ctx, negated).0, "42601");
+    assert_eq!(err(&core, &ctx, negated).0, "21000");
+    let negated_bad =
+        "SELECT id FROM a WHERE k IN (SELECT aid FROM b WHERE v = (SELECT v FROM d LIMIT 2) \
+                   AND NOT EXISTS (SELECT 1 FROM c WHERE c.aid = b.aid AND c.zz = 1)) LIMIT 100";
+    assert_eq!(err(&core, &ctx, negated_bad).0, "42703");
+}
+
+/// `SELECT id FROM a WHERE <pred> LIMIT 100` の `id` 集合。
+fn a_where(core: &EngineCore, ctx: &PolicyContext, pred: &str) -> Vec<u64> {
+    ids(
+        core,
+        ctx,
+        &format!("SELECT id FROM a WHERE {pred} LIMIT 100"),
+    )
+}
+
+#[test]
+fn sql61_not_exists_anti_join_matches_postgres_null_semantics() {
+    let (core, ctx, _g) = setup();
+    // 外側キー k が NULL の a4 は EXISTS が偽（`=` は UNKNOWN）なので NOT EXISTS は真。
+    // a3 (k=3) は b.aid に 3 が無い。b4 の NULL aid はどの外側とも一致しない。
+    assert_eq!(
+        a_where(
+            &core,
+            &ctx,
+            "NOT EXISTS (SELECT 1 FROM b WHERE b.aid = a.k)"
+        ),
+        vec![3, 4]
+    );
+    // 疑似列 id をキーにする: b.aid の集合は {1, 2}。
+    assert_eq!(
+        a_where(
+            &core,
+            &ctx,
+            "NOT EXISTS (SELECT 1 FROM b WHERE b.aid = a.id)"
+        ),
+        vec![3, 4]
+    );
+    // 内側だけの条件: flag = false は b2 (aid 1) のみ。
+    assert_eq!(
+        a_where(
+            &core,
+            &ctx,
+            "NOT EXISTS (SELECT 1 FROM b WHERE b.aid = a.k AND b.flag = false)"
+        ),
+        vec![2, 3, 4]
+    );
+}
+
+#[test]
+fn sql61_not_exists_reevaluation_and_offset_inversion() {
+    let (core, ctx, _g) = setup();
+    // 残余のみ: 肯定形 [1, 2, 4] の補集合。
+    assert_eq!(
+        a_where(
+            &core,
+            &ctx,
+            "NOT EXISTS (SELECT 1 FROM b WHERE b.v > a.v + 25)"
+        ),
+        vec![3]
+    );
+    // キー ＋ 残余: 肯定形 [1] の補集合。
+    assert_eq!(
+        a_where(
+            &core,
+            &ctx,
+            "NOT EXISTS (SELECT 1 FROM b WHERE b.aid = a.k AND b.v > a.v)"
+        ),
+        vec![2, 3, 4]
+    );
+    // OR 混在: a4 は (NULL OR 偽) が UNKNOWN で一致に数えない。肯定形 [1, 2] の補集合。
+    assert_eq!(
+        a_where(
+            &core,
+            &ctx,
+            "NOT EXISTS (SELECT 1 FROM b WHERE (b.aid = a.k OR b.t = 'none'))"
+        ),
+        vec![3, 4]
+    );
+    // キーにできない型 (DOUBLE): 肯定形 [1, 2] の補集合（d が NULL の a3・a4 は一致なし）。
+    assert_eq!(
+        a_where(&core, &ctx, "NOT EXISTS (SELECT 1 FROM b WHERE b.d = a.d)"),
+        vec![3, 4]
+    );
+    // OFFSET 1: 一致が 1 件以下で真。aid=1 は 2 件、aid=2 は 1 件。
+    assert_eq!(
+        a_where(
+            &core,
+            &ctx,
+            "NOT EXISTS (SELECT 1 FROM b WHERE b.aid = a.k LIMIT 5 OFFSET 1)"
+        ),
+        vec![2, 3, 4]
+    );
+    // キー無しの再評価: b.v > a.v の件数は a1: 2、a2: 1、a3: 1、a4: 2。
+    assert_eq!(
+        a_where(
+            &core,
+            &ctx,
+            "NOT EXISTS (SELECT 1 FROM b WHERE b.v > a.v LIMIT 5 OFFSET 1)"
+        ),
+        vec![2, 3]
+    );
+}
+
+#[test]
+fn sql61_not_exists_composes_with_or_demorgan_aggregate_order_limit() {
+    let (core, ctx, _g) = setup();
+    assert_eq!(
+        a_where(
+            &core,
+            &ctx,
+            "a.t = 'y' OR NOT EXISTS (SELECT 1 FROM b WHERE b.aid = a.k)"
+        ),
+        vec![2, 3, 4]
+    );
+    // De Morgan: NOT EXISTS OR t <> 'x'。a1 のみ偽。
+    assert_eq!(
+        a_where(
+            &core,
+            &ctx,
+            "NOT (EXISTS (SELECT 1 FROM b WHERE b.aid = a.k) AND t = 'x')"
+        ),
+        vec![2, 3, 4]
+    );
+    let r = core
+        .execute_sql(
+            &ctx,
+            "SELECT COUNT(*) FROM a WHERE NOT EXISTS (SELECT 1 FROM b WHERE b.aid = a.k)",
+        )
+        .expect("count");
+    assert_eq!(r.rows[0].cells[0], Cell::Integer(2));
+    assert_eq!(
+        ids_in_order(
+            &core,
+            &ctx,
+            "SELECT id FROM a WHERE NOT EXISTS (SELECT 1 FROM b WHERE b.aid = a.k) \
+             ORDER BY v DESC LIMIT 1"
+        ),
+        vec![3]
+    );
+    // 入れ子: a1 の b1・b2 は c が有る、a2 の b3 (aid 2) には c が無い。
+    assert_eq!(
+        a_where(
+            &core,
+            &ctx,
+            "EXISTS (SELECT 1 FROM b WHERE b.aid = a.k \
+             AND NOT EXISTS (SELECT 1 FROM c WHERE c.aid = b.aid))"
+        ),
+        vec![2]
+    );
+    // 内側 0 行: 外側キーが NULL の行も含めて全行が真。
+    assert_eq!(
+        a_where(
+            &core,
+            &ctx,
+            "NOT EXISTS (SELECT 1 FROM b WHERE b.aid = a.k AND b.t = 'none')"
+        ),
+        vec![1, 2, 3, 4]
+    );
+}
+
+#[test]
+fn sql61_not_exists_does_not_observe_other_tenants_rows() {
+    // RLS-10: t2 にだけ b.aid = 3 がある。t1 の a3 は除外されない（他テナントの行は反結合の
+    // 除外条件に混ざらない）。
+    let (core, ctx, _g) = setup();
+    let t2 = ctx_for("t2");
+    ins(&core, &t2, "a", 100, &[("k", "100")]);
+    ins(&core, &t2, "b", 100, &[("aid", "3")]);
+    ins(&core, &t2, "b", 101, &[("aid", "100")]);
+    let sql = "SELECT id FROM a WHERE NOT EXISTS (SELECT 1 FROM b WHERE b.aid = a.k) LIMIT 100";
+    assert_eq!(ids(&core, &ctx, sql), vec![3, 4]);
+    // t2 は自テナントの行だけで判定する（a100 は b101 と一致して除外される）。
+    assert_eq!(ids(&core, &t2, sql), Vec::<u64>::new());
+    let sql2 = "SELECT id FROM a WHERE NOT EXISTS \
+                (SELECT 1 FROM b WHERE b.aid = a.k AND b.v > a.v - 1000) LIMIT 100";
+    assert_eq!(ids(&core, &ctx, sql2), vec![3, 4]);
 }
