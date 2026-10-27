@@ -1263,6 +1263,9 @@ pub struct EngineCore {
     /// JOIN のリレーション数・入出力行数の上限（Issue #1551）。差し替えは
     /// [`Self::with_join_limits`] のみ（起動時 1 回）。JOIN の実行段（`sql::join`）にだけ効く。
     join_limits: crate::join_limits::JoinSizeLimits,
+    /// 相関サブクエリの再評価回数上限（Issue #1847）。[`Self::with_correlated_limits`] のみ
+    /// （起動時 1 回）。`sql::correlated_exists::CorrelatedCtx` の予算へ渡る。
+    correlated_limits: crate::correlated_limits::CorrelatedLimits,
     /// 明示 `LIMIT` の範囲上限（Issue #1555）。差し替えは [`Self::with_result_limits`]
     /// のみ（起動時 1 回）。文の `LIMIT`・`FETCH n`・集合演算／JOIN 文の `LIMIT` の
     /// 範囲判定にだけ効き、`OFFSET`・枝行数・サブクエリ内側行数の上限とは連動しない。
@@ -2725,6 +2728,7 @@ impl EngineCore {
             regex_limits: crate::regex_limits::RegexLimits::default(),
             nesting_limits: crate::nesting_limits::NestingLimits::default(),
             join_limits: crate::join_limits::JoinSizeLimits::default(),
+            correlated_limits: crate::correlated_limits::CorrelatedLimits::default(),
             result_limits: crate::result_limits::ResultLimits::default(),
             materialization_contexts: None,
             partitioned_dml_limits: crate::sql::parser::PartitionedDmlLimits::default(),
@@ -3087,6 +3091,23 @@ impl EngineCore {
     /// 現在の JOIN 上限（Issue #1551）。
     pub fn join_limits(&self) -> crate::join_limits::JoinSizeLimits {
         self.join_limits
+    }
+
+    /// 相関サブクエリの再評価回数上限（[`crate::correlated_limits::CorrelatedLimits`]）を
+    /// 差し替えたビルダーを返す（Issue #1847）。`wire-server` の起動時 CLI フラグ
+    /// （`--max-correlated-reevaluations`）からのみ呼ぶ。未呼び出しならハード上限と同値の既定
+    /// （現行挙動）。
+    pub fn with_correlated_limits(
+        mut self,
+        limits: crate::correlated_limits::CorrelatedLimits,
+    ) -> Self {
+        self.correlated_limits = limits;
+        self
+    }
+
+    /// 現在の相関サブクエリ上限（Issue #1847）。
+    pub fn correlated_limits(&self) -> crate::correlated_limits::CorrelatedLimits {
+        self.correlated_limits
     }
 
     /// 束縛済み計画の `LIMIT` を設定値の範囲で再検査する（Issue #1555 の多層防御）。
@@ -8950,8 +8971,10 @@ impl EngineCore {
                 let mut subquery_in_value_budget = crate::sql::subquery::MAX_SUBQUERY_IN_VALUES;
                 // Issue #1842・SQL-61: 肯定形の相関 `EXISTS` を半結合・行ごとの再評価で実行する。
                 // 再評価・比較の予算は 1 文ごとに作り、入れ子を含む文全体で共有する。
-                let correlated =
-                    crate::sql::correlated_exists::CorrelatedCtx::enabled(self.join_limits);
+                let correlated = crate::sql::correlated_exists::CorrelatedCtx::enabled(
+                    self.join_limits,
+                    self.correlated_limits,
+                );
                 validated.where_predicates = crate::sql::subquery::resolve_where_predicates(
                     validated.where_predicates,
                     &[&schema],
@@ -9005,8 +9028,10 @@ impl EngineCore {
                 let mut subquery_in_value_budget = crate::sql::subquery::MAX_SUBQUERY_IN_VALUES;
                 // Issue #1842・SQL-61: 肯定形の相関 `EXISTS` を半結合・行ごとの再評価で実行する。
                 // 再評価・比較の予算は 1 文ごとに作り、入れ子を含む文全体で共有する。
-                let correlated =
-                    crate::sql::correlated_exists::CorrelatedCtx::enabled(self.join_limits);
+                let correlated = crate::sql::correlated_exists::CorrelatedCtx::enabled(
+                    self.join_limits,
+                    self.correlated_limits,
+                );
                 validated.where_predicates = crate::sql::subquery::resolve_where_predicates(
                     validated.where_predicates,
                     &[&schema],
@@ -9048,9 +9073,29 @@ impl EngineCore {
                     &mut subquery_in_value_budget,
                     &correlated,
                 )?;
-                let result = self.run_scan_plan(read_txn, ctx, &schema, &bound)?;
-                let result =
-                    crate::sql::subquery::merge_scalar_projection_items(result, resolved_items)?;
+                // Issue #1846・SQL-61: 集計形の相関スカラーは外側の行ごとに相関キーで引き当てるため、
+                // 外側の投影の末尾へ隠しキー列を足した写しで走査する（元の投影位置は変えない。
+                // 隠し列は合流時に取り除く）。相関項目が無ければ従来どおり元の束縛で走査する。
+                let hidden = crate::sql::subquery::hidden_key_columns(&resolved_items);
+                let result = if hidden.is_empty() {
+                    self.run_scan_plan(read_txn, ctx, &schema, &bound)?
+                } else {
+                    let mut with_keys = validated.clone();
+                    crate::sql::subquery::append_hidden_key_columns(&mut with_keys, &hidden)?;
+                    let bound_with_keys = crate::sql::parser::bind_scan_with_dummy_flags(
+                        &with_keys,
+                        &schema,
+                        session.udfs(),
+                        &[],
+                        &limits,
+                    )?;
+                    self.run_scan_plan(read_txn, ctx, &schema, &bound_with_keys)?
+                };
+                let result = crate::sql::subquery::merge_scalar_projection_items(
+                    result,
+                    resolved_items,
+                    &hidden,
+                )?;
                 Ok(crate::sql::SqlOutcome::Query(result))
             }
             // 集合演算・JOIN は複数枝／両辺を単一スナップショット上で評価する必要が

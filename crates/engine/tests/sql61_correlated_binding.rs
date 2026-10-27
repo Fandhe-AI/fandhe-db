@@ -105,7 +105,6 @@ fn sql61_qualified_outer_refs_reach_binding_and_fail_closed_as_correlated() {
         // 明示 `LIMIT` 付きの相関 `IN`（集合の帰属が変わるため fail-closed）と相関スカラーを固定する。
         "SELECT id FROM docs x WHERE lang IN (SELECT lang FROM refs WHERE x.id = 1 LIMIT 10) LIMIT 10",
         "SELECT id FROM docs x WHERE lang NOT IN (SELECT lang FROM refs WHERE x.id = 1 LIMIT 10) LIMIT 10",
-        "SELECT id FROM docs x WHERE lang = (SELECT lang FROM refs WHERE x.id = id LIMIT 1) LIMIT 10",
         "SELECT id FROM docs x WHERE lang = (SELECT COUNT(x.id) FROM refs) LIMIT 10",
         "SELECT id FROM docs x WHERE lang IN (SELECT lang FROM refs WHERE id IN (SELECT id FROM refs WHERE lang = x.lang LIMIT 10) LIMIT 10) LIMIT 10",
         "SELECT id FROM docs WHERE lang IN (SELECT lang FROM refs WHERE docs.lang = lang LIMIT 10) LIMIT 10",
@@ -115,6 +114,21 @@ fn sql61_qualified_outer_refs_reach_binding_and_fail_closed_as_correlated() {
         assert!(msg.contains("correlated"), "{sql}: {msg}");
         assert!(!msg.contains('\u{2}'), "{sql}: {msg:?}");
     }
+}
+
+#[test]
+fn sql61_qualified_outer_refs_in_non_aggregate_scalar_are_executed() {
+    // 非集計形の相関スカラー（Issue #1847）は束縛段を通って行ごとの再評価で実行される。
+    // docs は {1: en, 2: ja}、refs は {1: en}。docs 1 は内側 1 件（en）で一致、docs 2 は 0 件で NULL（偽）。
+    let (core, ctx, _g) = setup();
+    assert_eq!(
+        ids(
+            &core,
+            &ctx,
+            "SELECT id FROM docs x WHERE lang = (SELECT lang FROM refs WHERE x.id = id LIMIT 1) LIMIT 10"
+        ),
+        vec![1]
+    );
 }
 
 #[test]

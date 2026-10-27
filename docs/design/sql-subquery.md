@@ -28,11 +28,11 @@
 | 外側が広域取得 SELECT（`Statement::Scan`）・集計 SELECT（`Statement::Aggregate`） | 対応 |
 | 外側がランキング付き検索 SELECT（`ORDER BY <=>`・`HYBRID`・`USING PLAN`） | **非対応**（構文は受理するが束縛時に `42601`） |
 | WHERE 値位置のスカラー比較サブクエリ（`<col> <op> (SELECT ...)`。`<op>` は `= <> < <= > >=`） | 対応（Issue #1191）。逆向き（`(SELECT ...) <op> <col>`）・式への埋め込みは **非対応**（`42601`） |
-| 投影位置のスカラーサブクエリ（`SELECT <列>, (SELECT <単一列> FROM <table> [WHERE ...] [LIMIT <n>]) [AS <alias>] FROM ...`） | 対応（Issue #1352）。外側は広域取得 SELECT（スカラー `ORDER BY`・`OFFSET` 可）のみ。項目全体がサブクエリである形に限り、式の内側（関数引数・演算・`CASE`）への埋め込みは `42601`。非相関のみ。内側が集計形（単一集計項目）でも可。内側が 0 行なら NULL、2 行以上は外側の結果が 1 行以上のときだけ `21000`（Issue #1404）。内側 WHERE に入れ子のスカラーサブクエリの 2 行以上も同様に外側の行数判明まで遅延（Issue #1432）。外側がランキング付き検索 SELECT・集計・`DISTINCT`・JOIN・ウィンドウ項目との併用・`EXPLAIN`・カーソル・`COPY`・`CREATE VIEW` 本体・CTE・集合演算の枝・拡張クエリプロトコルの `$n` 併用は `42601`。内側の投影位置サブクエリは `42601` |
+| 投影位置のスカラーサブクエリ（`SELECT <列>, (SELECT <単一列> FROM <table> [WHERE ...] [LIMIT <n>]) [AS <alias>] FROM ...`） | 対応（Issue #1352）。外側は広域取得 SELECT（スカラー `ORDER BY`・`OFFSET` 可）のみ。項目全体がサブクエリである形に限り、式の内側（関数引数・演算・`CASE`）への埋め込みは `42601`。非相関、または集計形の相関（Issue #1846。「Issue #1846 追記」節）。内側が集計形（単一集計項目）でも可。内側が 0 行なら NULL、2 行以上は外側の結果が 1 行以上のときだけ `21000`（Issue #1404）。内側 WHERE に入れ子のスカラーサブクエリの 2 行以上も同様に外側の行数判明まで遅延（Issue #1432）。外側がランキング付き検索 SELECT・集計・`DISTINCT`・JOIN・ウィンドウ項目との併用・`EXPLAIN`・カーソル・`COPY`・`CREATE VIEW` 本体・CTE・集合演算の枝・拡張クエリプロトコルの `$n` 併用は `42601`。内側の投影位置サブクエリは `42601` |
 | 内側がランキング付き検索 SELECT・集合演算・JOIN | **非対応**（`42601`）。集計形（単一集計項目。`GROUP BY` の有無を問わず `LIMIT` 不要）はスカラー比較の内側に限り対応（Issue #1191）。`IN`／`EXISTS` の内側の集計形は非対応 |
 | 内側の `LIMIT` 省略・`LIMIT ALL` | 対応（Issue #1853・SQL-29・SQL-34）。上限は結果行数上限 `--max-result-rows` だけを参照し、`IN`／`NOT IN` は上限超過で `54000`（黙って切り詰めない）。`EXISTS` は 1 件、スカラー用途は 2 件（`21000` 判定用）へ差し替えて有界にする。明示 `LIMIT` の範囲検証も設定値に追随する |
 | 内側の `OFFSET` | 未検証（構文上は Scan 形状を再利用するため通るが、意味論は未確認。将来の Issue 課題） |
-| 相関サブクエリ | 相関 `EXISTS` は実行（Issue #1842・SQL-61。等価の相関はハッシュ半結合、それ以外は外側の行ごとの再評価）。相関 `NOT EXISTS` も同じプローブの反結合で実行（Issue #1843）。相関 `IN`／`NOT IN` も実行（Issue #1844。肯定形は半結合、`NOT IN` は NULL を考慮した反結合）。スカラー／`ANY`／`ALL` の相関・述語形 `UPDATE`／`DELETE`・集計の `FILTER` は引き続き束縛段で解決した上で `42601`（`correlated subqueries are not supported`）。名前解決の誤りは PostgreSQL と同じコード（曖昧 `42702`・未知列 `42703`・未定義の修飾子 `42P01`）。詳細は「相関参照の束縛（Issue #1841）」「Issue #1842 追記」「Issue #1843 追記」「Issue #1844 追記」節 |
+| 相関サブクエリ | 相関 `EXISTS` は実行（Issue #1842・SQL-61。等価の相関はハッシュ半結合、それ以外は外側の行ごとの再評価）。相関 `NOT EXISTS` も同じプローブの反結合で実行（Issue #1843）。相関 `IN`／`NOT IN` も実行（Issue #1844。肯定形は半結合、`NOT IN` は NULL を考慮した反結合）。集計形の相関スカラー（単一集計項目で等価の相関条件のみ）も実行（Issue #1846。内側を相関キーの `GROUP BY` 集計へ書き換えて 1 回だけ実行）。非集計形の相関スカラー（単一の裸の列。外側の行ごとの再評価）も実行（Issue #1847）。相関 `ANY`／`ALL`・述語形 `UPDATE`／`DELETE`・集計の `FILTER` は引き続き束縛段で解決した上で `42601`（`correlated subqueries are not supported`）。名前解決の誤りは PostgreSQL と同じコード（曖昧 `42702`・未知列 `42703`・未定義の修飾子 `42P01`）。詳細は「相関参照の束縛（Issue #1841）」「Issue #1842 追記」「Issue #1843 追記」「Issue #1844 追記」「Issue #1846 追記」「Issue #1847 追記」節 |
 | `NOT IN`・`NOT EXISTS` | 対応（Issue #1191。`NOT IN` は NULL 規則込み。後述） |
 | `IN` 対象列が疑似列 `id` | 対応（Issue #1352）。スキーマに実カラム `id` が無い場合のみ整数族として扱う（実カラム優先。スカラー比較と同じ規則）。内側は `id` 投影または `INTEGER`／`BIGINT` 列（負値・NULL は一致しない）。`TEXT` 等の他の値族の投影は `22000` |
 | `IN` 対象値の型 | `TEXT`／`ENUM`／`BOOLEAN`／`DATE`／`TIMESTAMP`／`NUMERIC`／`UUID`／`BYTEA`／`INTEGER`／`BIGINT`（Issue #1191 で拡大）に加え `REAL`／`DOUBLE PRECISION`（Issue #1352。浮動小数族どうし。`REAL` は `f64` へ無損失拡大して比較し、`-0.0` は `+0.0` と等しい。非有限値は `22000`）。内側の投影列は同じ値族であること。`VECTOR`／配列／JSON は `22000`。整数・浮動小数列の distinct 値数は 1 サイトあたり `IN` 256・`NOT IN` 128 まで（超過は `54000`） |
@@ -394,8 +394,9 @@ Issue #1841 以降は下記の束縛段で解決する。エラー文言は静�
 - 内側の入力行数は JOIN の起動時設定 `max_input_rows`（`--max-join-input-rows`）で、`上限 + 1` 件で取得を止めて検出する。
   バイト量は走査・プローブ保持ともに累計予算（`MAX_ARENA_TOTAL_BYTES`）へ確保前に計上する。実行回数予算
   （`MAX_SUBQUERY_EXECUTIONS`）は実体化 1 回で 1 消費する。`--max-result-rows` は使わない。
-- 再評価・比較のカウンタは 1 文の実行ごとに作り、入れ子を含む文全体で共有する。**CLI フラグ化は対象外**
-  （`MAX_JOIN_COMPARISONS` の前例に倣う）。フォローアップで検討する。
+- 再評価・比較のカウンタは 1 文の実行ごとに作り、入れ子を含む文全体で共有する。再評価回数の CLI フラグ化は
+  Issue #1847 で行った（`--max-correlated-reevaluations`。「Issue #1847 追記」節）。比較回数
+  （`MAX_JOIN_COMPARISONS`）は引き続き CLI 化の対象外。
 
 ### fail-closed のまま残す形
 
@@ -440,6 +441,9 @@ Issue #1841 以降は下記の束縛段で解決する。エラー文言は静�
 | `crates/engine/src/sql/correlation.rs`・`crates/engine/tests/sql61_correlated_binding.rs`（Issue #1841） | 相関参照の束縛（IR・予約内部名）と名前解決エラーの結合テスト |
 | `crates/engine/src/sql/correlated_exists.rs`・`crates/engine/src/sql/join/semi.rs`・`crates/engine/tests/sql61_correlated_exists.rs`（Issue #1842） | 相関 `EXISTS` の述語分解・実行文脈・プローブ（半結合・再評価）と、PostgreSQL の意味論から導いた固定値・上限・RLS の結合／単体テスト |
 | `crates/engine/src/sql/correlated_exists.rs`・`crates/engine/src/sql/join/semi.rs`・`crates/engine/tests/sql61_correlated_in.rs`（Issue #1844） | 相関 `IN`／`NOT IN` の対象ペア・`NOT IN` プローブ（真理値表）と、三値論理の固定値・上限・RLS・fail-closed の結合／単体テスト |
+| `crates/engine/src/sql/subquery.rs`・`crates/engine/src/sql/join/semi.rs`・`crates/engine/src/core.rs`・`crates/engine/tests/sql61_correlated_scalar_agg.rs`（Issue #1846） | 集計形の相関スカラー（`GROUP BY` 集計への書き換え・`ProbeKind::ScalarCompare`・投影位置の隠しキー列）と、PostgreSQL の意味論から導いた固定値・上限・RLS・fail-closed の結合／単体テスト |
+| `crates/engine/src/sql/subquery.rs`・`crates/engine/src/sql/join/semi.rs`・`crates/engine/src/correlated_limits.rs`・`crates/engine/src/core.rs`・`crates/engine/tests/sql61_correlated_scalar_nonagg.rs`（Issue #1847） | 非集計形の相関スカラー（`ProbeKind::ScalarRows`・基数判定・投影位置の隠し列）、再評価回数上限の型と検証、PostgreSQL の意味論から導いた固定値・上限・RLS・fail-closed の結合／単体テスト |
+| `crates/wire-server/src/correlated_limits_opt.rs`・`crates/wire-server/tests/wire_correlated_limits_cli.rs`（Issue #1847） | `--max-correlated-reevaluations` の厳密パース・範囲外／重複／値欠落の起動拒否 |
 | `crates/engine/tests/sql61_any_all_subquery.rs`（Issue #1855） | `ANY`／`SOME`／`ALL` の独立オラクル照合・拒否形・上限・RLS・拡張クエリ・述語形 DML の結合テスト |
 
 ## OWASP Top 10 観点
@@ -470,7 +474,7 @@ Issue #1841 以降は下記の束縛段で解決する。エラー文言は静�
   （PR #1103 Cursor Bugbot 指摘対応。理由は「上限（DoS 対策）」節参照。
   サブクエリとウィンドウ関数の組合せが正しく動く経路は設計上未検証のため、
   作り込むのではなく fail-closed に倒した）。
-- 相関サブクエリのうち `EXISTS`／`NOT EXISTS`／`IN`／`NOT IN` 以外（スカラー／`ANY`／`ALL`・述語形 DML・集計の `FILTER` は `42601` で拒否。実行はしない）。再評価回数上限の CLI フラグ（wire-server）
+- 相関サブクエリのうち `EXISTS`／`NOT EXISTS`／`IN`／`NOT IN`・スカラー以外（`ANY`／`ALL`・述語形 DML・集計の `FILTER` は `42601` で拒否。実行はしない）
 - 拡張クエリプロトコル経由のサブクエリ・Describe 対応
 - ランキング付き検索 SELECT（外側）でのサブクエリ対応
 - サブクエリ述語に対するスカラー二次索引の最適化（現状は `PlainScan` 相当のまま。
@@ -590,3 +594,153 @@ Issue #1841 以降は下記の束縛段で解決する。エラー文言は静�
 
 相関 `IN`／`NOT IN` の明示 `LIMIT`／`OFFSET`、結合キーに表せない型の組（残余での等価比較へ回す拡張）、
 式投影、相関 `ANY`／`ALL`・スカラー、再評価回数上限の CLI フラグ化（wire-server）。
+
+## Issue #1846 追記: 集計形の相関スカラーを左外部結合＋集計と同値に実行（SQL-61・RLS-10 ポインタ）
+
+親 #1845。`(SELECT agg(...) FROM b WHERE b.k = a.k)` のように、単一の集計項目で外側参照が内側 `WHERE` の
+等価の相関条件だけの形を、WHERE 位置（`col <op> (SELECT agg ...)`）と投影位置
+（`SELECT ..., (SELECT agg ...)`）の両方で実行する。非集計形・行ごとの再評価・複数行の `21000`
+（#1847）と、式の一部としての利用（#1848）は対象外（#1847 は後続の節で実装済み）。
+
+### 方式
+
+- 内側を相関キー列（内側 `WHERE` の等価条件の内側列。`correlated_exists::analyze` が分解）の
+  `GROUP BY` 集計へ書き換え（先頭がキー列、末尾が元の集計項目）、外側と同じ `PolicyContext`・`read_txn`
+  の既存集計器（`execute_aggregate_with_group_limits`）で **1 回だけ**実行する（RLS 暗黙適用。第 2 の
+  評価器・新しい可視性判定は作らない）。結果をキーの正準バイト列（`join::values::encode_key_component`）
+  → 集計値の表にする。キーが NULL のグループは外側のどの行にも一致しない（`=` は NULL で真にならない）。
+- 空集合に対する集計値は、元の集計の束縛結果から既存アキュムレータの空入力時の `finish` で求める
+  （`count`／`count(DISTINCT)` は 0、それ以外は NULL）。外側キーが NULL の行・内側に該当グループが無い行は
+  この値になる。キーごとに必ず 1 行のため `21000` は発生しない。
+- **WHERE 位置**: 内部専用の葉 `WherePredicate::CorrelatedExists` に判定方式
+  `ProbeKind::ScalarCompare` を足して載せる（variant を増やさない。#1844 と同じ非 BREAKING）。グループ値の
+  distinct ごとに、非相関のスカラー比較と同じ `scalar_literal_predicate` を外側スキーマへ束縛した述語を
+  保持し、外側の行の相関キーで引いた述語を既存の述語評価器（`where_tree`）で評価する。NULL の集計値は
+  常に偽（UNKNOWN を偽に潰す。否定は構文段で演算子反転済み）。値族の検査は束縛済みメタデータで実行前に行う。
+- **投影位置**: 外側の走査の投影末尾へ隠しキー列（制御文字接頭辞の予約別名。利用者の識別子・出力別名と衝突
+  しない）を足した写しで走査し、合流時に行ごとにキーを作って引き、隠し列を取り除く。元の投影位置・
+  `ORDER BY`・`LIMIT`・`OFFSET` は変わらない。疑似列 `id` のキーは行の `id` を使うため隠し列は不要。
+  内側の実行時データ例外（`22xxx`）は既存と同じく外側が 1 行以上のときだけ返す（列メタデータは束縛済み集計から
+  確定し外側の行数に依らない）。PostgreSQL と異なり、どの外側の行からも参照されないグループの例外でも外側が
+  1 行以上あればエラーになる（誤った結果ではなくエラー側に倒れる差分）。
+
+### 受理形と fail-closed
+
+| 形 | 結果 |
+| ---- | ---- |
+| GROUP BY の無い単一の集計項目＋等価の相関条件（1 本以上）＋内側だけの条件 | 実行 |
+| 集計引数・`FILTER`・集計内 `ORDER BY` の外側参照、内側の `GROUP BY`／`HAVING`／`LIMIT`／`OFFSET`、`count(*)+1` 等の式項目、`SELECT DISTINCT` | `42601`（`correlated` を含む静的文言） |
+| 非等価・`OR` 混在・キーにできない型の等価（残余）、キーなし、同じ内側列への等価の重複、`levels_up >= 2` | `42601` |
+| 非集計形の相関スカラー | #1847 で実行（「Issue #1847 追記」節） |
+| BYTEA キー | `0A000`（`GROUP BY` で束ねられない） |
+| 述語形 `UPDATE`／`DELETE` の `WHERE`・集計の `FILTER` | 従来どおり拒否 |
+| 外側が JOIN・カンマ区切り FROM | 従来どおり拒否 |
+| 値族の不一致・未知の対象列 | `22000`・`42703`（非相関と同一） |
+
+投影位置で `*` との併用は構文段が受理しない。隠しキー列の追加経路でも `Projection::All` は `42601` で
+拒否する（防御的）。エラー文言は静的文字列と利用者自身が書いた列名だけで、予約名を含めない。
+
+### 上限・テナント境界
+
+- 内側の可視行は集計器が走査するだけで保持しない。保持量はグループ数（`GroupByLimits::max_groups`。
+  ハード上限 10,000）と結果バイト上限で有界で、超過は `54000`（部分結果を返さない）。このため内側の
+  結果行数上限（`--max-result-rows`）の検査は適用せず、EXISTS の入力行上限（100,000）より小さい点に注意する。
+- 実行回数予算（`MAX_SUBQUERY_EXECUTIONS` 等）を 1 消費し、述語・値表の保持バイトは確保前に
+  `CorrelatedCtx::byte_cap` へ計上する。ハッシュ引きは再評価・比較の予算を消費しない。
+- 内側は外側と同じ `ctx`・`read_txn`。グループ表と空集合の値は可視行だけから決まる。他テナントの行が
+  グループ値・`count` に混ざらず、エラーが他テナントの行数に依存しないことを結合テストで固定する。
+- 失敗時の静的検証（Issue #1432 の経路）は `static_validate_correlated_scalar` が準備・内側だけの連言の
+  静的検証・束縛・対象列と値族の検査までを共有する（実行回数予算は消費しない）。
+
+### 却下した案
+
+- 外側スキーマ＋集計値の合成列へ `col <op> synth` を束縛: 列どうしの比較は式評価経路に乗り、TEXT／ENUM の
+  語彙外・NUMERIC の厳密比較など `scalar_literal_predicate` の値族ごとの規則とずれる。
+- 比較を `eval` 内で自前実装: 第 2 の評価器になる。
+- 行ごとの再評価で相関条件ごとに内側を再実行: 内側の実行回数が外側の行数に比例して予算を食う。
+
+### 対象外（後続候補）
+
+式の一部としての利用（#1848）、残余（非等価・`OR` 混在）を伴う集計形、内側の `GROUP BY`／`HAVING`／`LIMIT`／`OFFSET`、`AggregateSelectItem::Expr`、BYTEA キー。
+
+## Issue #1847 追記: 非集計形の相関スカラーを行ごとの再評価で実行（SQL-61・RLS-10 ポインタ）
+
+親 #1845。`(SELECT y FROM b WHERE <相関条件>)`（`y` は単一の裸の列）を、WHERE 位置
+（`col <op> (SELECT y ...)`）と投影位置（`SELECT ..., (SELECT y ...)`）の両方で実行する。
+式の一部としての利用（算術・`COALESCE`・`ORDER BY`／`GROUP BY` キー）は #1848 の対象外。
+
+### 「行ごとの再評価」の意味
+
+内側を外側の行ごとに**実行し直す方式は採らない**（外側の値を内側 AST へ埋めて再実行する案は
+Issue #1842 節の「却下した案」で却下済みで、`MAX_SUBQUERY_EXECUTIONS` の制約もあり成り立たない）。
+Issue #1842／#1844 と同じ方式で、内側を外側と同じ `PolicyContext`・同じ `read_txn`（RLS 暗黙適用）で
+**1 回だけ**実体化し、外側の各行では等価キーのバケット（キーが無ければ全内側行）を走査して残余を既存の
+述語評価器（`where_tree`）で評価する。実装は `prepare_correlated_exists` → `materialize_correlated`
+（実体化の共有部）→ `resolve_correlated_scalar_rows` と `ProbeKind::ScalarRows`（`sql::join::semi`）で、
+`CorrelatedShape::Scalar` を足して第 2 の述語評価器を作らない。
+
+### 基数の判定
+
+外側 1 行について、一致行（バケット内で残余が真の行。並びは実体化順）の先頭 `OFFSET k` 件を飛ばし、
+最大 `LIMIT n` 件を採った件数で決める。
+
+| 採った件数 | 結果 |
+| ---- | ---- |
+| 0 件（外側キーが NULL・バケット無しを含む） | NULL（WHERE 位置では偽） |
+| 1 件 | その行の投影値 |
+| 2 件以上 | `21000` |
+
+- 2 件目の一致が見つかった時点で走査を打ち切る。`21000` は外側の行を評価したときにだけ発生するため、
+  外側が 0 行なら発生せず（#1404／#1432 の遅延規約と整合）、投影位置では外側の `ORDER BY`／`LIMIT`／
+  `OFFSET` の適用後に出力される行についてだけ発生する。他テナントの行は内側に現れないため基数に影響しない。
+- WHERE 位置: #1846 の `ScalarPredicateBuilder` を再利用し、内側行の値の distinct ごとに
+  `scalar_literal_predicate` を外側スキーマへ束縛した述語を持つ（NULL は常に偽）。値族の検査は実行前に行う。
+- 投影位置: #1846 の隠しキー列を一般化し、キー列に加えて残余が参照する外側列を外側の走査の末尾へ足す。
+  合流時に外側セルを `cell_scalar` で行スカラーへ写してプローブの基数判定を呼ぶ。
+
+### 受理形と fail-closed
+
+| 形 | 結果 |
+| ---- | ---- |
+| 内側が `Scan`・単一の裸の列（疑似列 `id`・別名付き列参照を含む）・外側参照は内側 `WHERE` の中だけ | 実行（等価キーのみ・残余あり・キーなしのすべて） |
+| 内側 `LIMIT`／`OFFSET`（`ORDER BY` なし） | 実行（先頭 k 件を飛ばし最大 n 件を採る意味。`LIMIT` は差し替え前に範囲検証） |
+| 内側 `ORDER BY` のみ | 実行（一致行の個数に影響しないため。束縛は検証する） |
+| 内側 `ORDER BY` と `LIMIT`／`OFFSET` の併用（外側の行ごとの top-n） | `42601`（`correlated` を含む静的文言） |
+| 式投影・`*`・複数列・`SELECT DISTINCT`・内側投影のスカラーサブクエリ | `42601` |
+| 投影・`ORDER BY` の外側参照・`levels_up >= 2` | `42601` |
+| 残余が参照する内側列の型が `cell_scalar` 非対応・投影位置で残余／キーが参照する外側列の型が非対応 | `0A000` |
+| 集計形で残余・キーなしのもの | `42601` のまま（#1846 の受理形を変えない） |
+| 述語形 `UPDATE`／`DELETE`・集計の `FILTER`・外側が JOIN／カンマ区切り FROM | 従来どおり拒否 |
+| 値族の不一致・未知の対象列 | `22000`・`42703`（非相関と同一） |
+
+PostgreSQL との差分: `ORDER BY` を伴わない `LIMIT`／`OFFSET` の選択行は PostgreSQL では不定だが、本実装は
+実体化順で決定的に選ぶ（テストは一意に決まるデータだけで値を固定する）。
+
+### 上限（DoS）と CLI フラグ
+
+- 再評価の計上は #1842 の定義（残余を評価する外側の行 1 行＝再評価 1 回）に揃える。残余あり、またはキーなしの
+  形は外側 1 行ごとに計上し、等価キーのみで残余が無い形はハッシュ引きで O(1) のため計上しない。走査した内側行
+  ごとに比較 1 回を計上する（`MAX_JOIN_COMPARISONS` 共有）。内側の入力行数・バイト・実行回数予算は #1842 のまま。
+  確保は予算への計上の後に `try_reserve` で行い、WHERE 位置の述語表も `byte_cap` へ計上する。超過は `54000`。
+- 再評価回数の上限は既定 100,000（ハード上限）で、wire-server の `--max-correlated-reevaluations <1-100000>`
+  で**下げる方向だけ**設定できる（未指定は挙動不変。範囲外・非数値・値欠落・2 回目以降の指定は起動エラー。
+  環境変数は設けない）。型・検証・ハード上限は `engine::correlated_limits`（`join_limits` と責務を分けた別モジュール）
+  が単一情報源で、`EngineCore::with_correlated_limits` → `CorrelatedCtx::enabled` → `CorrelatedBudget` へ渡る。
+
+### テナント境界・情報漏えい
+
+- 内側の実体化は外側と同じ `PolicyContext`・`read_txn` だけを通る。基数（`21000`）・値・上限判定は可視行だけから
+  決まり、他テナントの行による `21000` の誘発・値の混入・エラー有無の差が無いことを 2 テナントの結合テストで固定する。
+- 外側の値を内側の SQL 文字列・トークン列へ連結しない。比較は束縛済みの述語と束縛済みの残余だけで評価する。
+- 新しいプローブ・値表の `Debug` は行データを出さない。エラー文言は静的文字列と利用者が書いた列名だけで、予約内部名を含めない。
+
+### 却下した案
+
+- 外側の行ごとに内側を再実行: 実行回数予算（`MAX_SUBQUERY_EXECUTIONS`）の制約と #1842 の却下判断のとおり不可。
+- 「複数行」の遅延エラーを第 2 の機構（`multi_row` の相関版）で持つ: 判定が外側の行の評価と分離し、遅延規約を
+  二重に管理することになるため、プローブの基数判定を外側の行の評価時に 1 か所で行う。
+
+### 対象外（後続候補）
+
+式の一部としての利用（#1848）、内側 `ORDER BY` と `LIMIT`／`OFFSET` の併用（外側の行ごとの top-n）、内側の式投影、
+集計形で残余・キーなしのもの、比較回数上限の CLI フラグ化。
