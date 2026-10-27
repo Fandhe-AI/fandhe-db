@@ -90,6 +90,8 @@ impl EngineCore {
             self.result_limits,
             &mut budget,
             &mut in_budget,
+            // 述語形 `UPDATE`／`DELETE` の `WHERE` では相関を実行しない（従来どおり `42601`）。
+            &crate::sql::correlated_exists::CorrelatedCtx::disabled(),
         )
     }
 

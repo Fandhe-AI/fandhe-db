@@ -1462,7 +1462,8 @@ fn reject_unsupported_predicate_dml_conjunction(
                 | WherePredicate::Exists { .. }
                 | WherePredicate::ScalarSubqueryCompare { .. }
                 | WherePredicate::QuantifiedSubqueryCompare { .. }
-                | WherePredicate::IdCompare { .. } => return Err(unsupported()),
+                | WherePredicate::IdCompare { .. }
+                | WherePredicate::CorrelatedExists(_) => return Err(unsupported()),
             },
             // 列 × 数値リテラルの比較の形に限る（`Call` 等は持ち込ませない）。
             WherePredicate::Expression(expr) => match expr {
@@ -1492,7 +1493,8 @@ fn reject_unsupported_predicate_dml_conjunction(
             | WherePredicate::Exists { .. }
             | WherePredicate::ScalarSubqueryCompare { .. }
             | WherePredicate::QuantifiedSubqueryCompare { .. }
-            | WherePredicate::IdCompare { .. } => return Err(unsupported()),
+            | WherePredicate::IdCompare { .. }
+            | WherePredicate::CorrelatedExists(_) => return Err(unsupported()),
         }
     }
     Ok(())
@@ -8946,6 +8948,10 @@ impl EngineCore {
                 // 解決する（`sql::subquery` モジュールドキュメント参照）。
                 let mut subquery_budget = self.nesting_limits.max_subquery_executions();
                 let mut subquery_in_value_budget = crate::sql::subquery::MAX_SUBQUERY_IN_VALUES;
+                // Issue #1842・SQL-61: 肯定形の相関 `EXISTS` を半結合・行ごとの再評価で実行する。
+                // 再評価・比較の予算は 1 文ごとに作り、入れ子を含む文全体で共有する。
+                let correlated =
+                    crate::sql::correlated_exists::CorrelatedCtx::enabled(self.join_limits);
                 validated.where_predicates = crate::sql::subquery::resolve_where_predicates(
                     validated.where_predicates,
                     &[&schema],
@@ -8958,6 +8964,7 @@ impl EngineCore {
                     limits,
                     &mut subquery_budget,
                     &mut subquery_in_value_budget,
+                    &correlated,
                 )?;
                 // SQL-57・Issue #1806: 集計項目の `FILTER (WHERE ...)` 中の部分クエリも
                 // 同じ文脈・同じ予算で解決する。
@@ -8996,6 +9003,10 @@ impl EngineCore {
                 // `Statement::Aggregate` と同じ理由・同じ経路でサブクエリを解決する。
                 let mut subquery_budget = self.nesting_limits.max_subquery_executions();
                 let mut subquery_in_value_budget = crate::sql::subquery::MAX_SUBQUERY_IN_VALUES;
+                // Issue #1842・SQL-61: 肯定形の相関 `EXISTS` を半結合・行ごとの再評価で実行する。
+                // 再評価・比較の予算は 1 文ごとに作り、入れ子を含む文全体で共有する。
+                let correlated =
+                    crate::sql::correlated_exists::CorrelatedCtx::enabled(self.join_limits);
                 validated.where_predicates = crate::sql::subquery::resolve_where_predicates(
                     validated.where_predicates,
                     &[&schema],
@@ -9008,6 +9019,7 @@ impl EngineCore {
                     limits,
                     &mut subquery_budget,
                     &mut subquery_in_value_budget,
+                    &correlated,
                 )?;
                 // Issue #1352: 投影位置のスカラーサブクエリは WHERE 側と同じ予算・同じ
                 // `read_txn`・同じ `ctx`（RLS 暗黙適用）で解決し、束縛へは項目を空にして
@@ -9034,6 +9046,7 @@ impl EngineCore {
                     limits,
                     &mut subquery_budget,
                     &mut subquery_in_value_budget,
+                    &correlated,
                 )?;
                 let result = self.run_scan_plan(read_txn, ctx, &schema, &bound)?;
                 let result =

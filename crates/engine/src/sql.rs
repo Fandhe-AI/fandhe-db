@@ -165,6 +165,7 @@ pub(crate) mod const_expr;
 pub mod const_select;
 pub mod copy;
 pub mod copy_options;
+pub(crate) mod correlated_exists;
 pub(crate) mod correlation;
 pub(crate) mod ctas;
 pub(crate) mod cte;

@@ -2450,6 +2450,15 @@ pub enum WherePredicate {
     /// **BREAKING CHANGE**: 本 variant の追加は非網羅的 `match` を破壊する
     /// （既存の破壊的変更運用を踏襲）。
     IdCompare { op: BinOp, value: i128 },
+    /// 相関 `EXISTS (SELECT ...)` を外側の行ごとに判定する内部専用の葉（Issue #1842・SQL-61
+    /// ポインタ・RLS-10）。構文解析は生成せず、`sql::subquery` が肯定形の相関 `EXISTS` を解決する際に
+    /// だけ生成する（`IdCompare` と同じ流儀）。内側は 1 回だけ実体化済みのプローブ
+    /// （`sql::join::semi`）で、束縛時に `BoundExpr::CorrelatedExists` へ写り外側の行ごとに真偽を返す
+    /// （UNKNOWN にならない）。内側の行データは `Debug` に出ない。
+    ///
+    /// **BREAKING CHANGE**: 本 variant の追加は非網羅的 `match` を破壊する
+    /// （既存の破壊的変更運用を踏襲）。
+    CorrelatedExists(crate::sql::join::semi::CorrelatedProbeRef),
 }
 
 /// [`WherePredicate::ScalarSubqueryCompare`] の比較演算子（Issue #1191）。
@@ -15047,7 +15056,8 @@ pub(crate) fn parse_view_body(tokens: &[Token]) -> Result<ParsedViewBody, SqlSur
             | WherePredicate::Exists { .. }
             | WherePredicate::ScalarSubqueryCompare { .. }
             | WherePredicate::QuantifiedSubqueryCompare { .. }
-            | WherePredicate::IdCompare { .. } => {
+            | WherePredicate::IdCompare { .. }
+            | WherePredicate::CorrelatedExists(_) => {
                 return Err(SqlSurfaceError::unsupported(
                     "view body WHERE predicate form is not supported",
                 ));
@@ -15138,7 +15148,7 @@ fn check_buffered_outer_pred(pred: &WherePredicate) -> Result<(), SqlSurfaceErro
         WherePredicate::PredicateCall { .. }
         | WherePredicate::InSubquery { .. }
         | WherePredicate::Exists { .. }
-        | WherePredicate::IdCompare { .. }
+        | WherePredicate::IdCompare { .. } | WherePredicate::CorrelatedExists(_)
         | WherePredicate::Prefix { .. }
         | WherePredicate::QuantifiedSubqueryCompare { .. }
         | WherePredicate::ScalarSubqueryCompare { .. } => Err(SqlSurfaceError::unsupported(
@@ -15593,6 +15603,7 @@ fn check_body_pred(
         | WherePredicate::InList { .. }
         | WherePredicate::Between { .. }
         | WherePredicate::IdCompare { .. }
+        | WherePredicate::CorrelatedExists(_)
         | WherePredicate::IsNull { .. } => Ok(()),
     }
 }
@@ -15720,7 +15731,8 @@ pub(crate) fn rename_column_in_view_body(
             | WherePredicate::Exists { .. }
             | WherePredicate::ScalarSubqueryCompare { .. }
             | WherePredicate::QuantifiedSubqueryCompare { .. }
-            | WherePredicate::IdCompare { .. } => {
+            | WherePredicate::IdCompare { .. }
+            | WherePredicate::CorrelatedExists(_) => {
                 return Err(SqlSurfaceError::unsupported(
                     "view body WHERE predicate form is not supported",
                 ));
@@ -15847,7 +15859,8 @@ fn render_where_predicate(pred: &WherePredicate) -> String {
         | WherePredicate::Exists { .. }
         | WherePredicate::ScalarSubqueryCompare { .. }
         | WherePredicate::QuantifiedSubqueryCompare { .. }
-        | WherePredicate::IdCompare { .. } => String::new(),
+        | WherePredicate::IdCompare { .. }
+        | WherePredicate::CorrelatedExists(_) => String::new(),
     }
 }
 
