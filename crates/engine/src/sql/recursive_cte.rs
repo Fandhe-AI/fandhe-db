@@ -297,7 +297,7 @@ pub(crate) fn validate_recursive_with(
     tokens: &[Token],
     limits: NestingLimits,
 ) -> Result<RecursiveWithClause, SqlSurfaceError> {
-    let (raw_defs, main_tokens) = split_recursive_with_clause(tokens, limits)?;
+    let (raw_defs, main_tokens, has_search_cycle) = split_recursive_with_clause(tokens, limits)?;
 
     if !matches!(main_tokens.first(), Some(Token::Keyword(Keyword::Select))) {
         return Err(SqlSurfaceError::unsupported(
@@ -308,6 +308,13 @@ pub(crate) fn validate_recursive_with(
 
     // 機能ゲート（0A000）は検出結果を保持し、全定義の構文・再帰構造の検証が終わってから返す。
     let mut deferred: Option<SqlSurfaceError> = None;
+    if has_search_cycle {
+        deferred = Some(SqlSurfaceError::feature_not_supported(
+            "SEARCH and CYCLE clauses of WITH RECURSIVE are not supported yet",
+        ));
+    }
+    // 再帰構造エラー（42P19）は保留し、後続定義の構文検証（42601）を優先させる。
+    let mut structural_err: Option<SqlSurfaceError> = None;
     let mut defs = Vec::with_capacity(raw_defs.len());
     for (idx, (name, column_aliases, body)) in raw_defs.iter().enumerate() {
         let first = body.first();
@@ -346,13 +353,23 @@ pub(crate) fn validate_recursive_with(
                 tokens: body.clone(),
             }
         } else {
-            validate_recursive_body(name, body, limits, &mut deferred)?
+            match validate_recursive_body(name, body, limits, &mut deferred) {
+                Ok(k) => k,
+                Err(e) if e.wire_code() == "42P19" => {
+                    structural_err.get_or_insert(e);
+                    continue;
+                }
+                Err(e) => return Err(e),
+            }
         };
         defs.push(RecursiveCteDef {
             name: name.clone(),
             column_aliases: column_aliases.clone(),
             body: kind,
         });
+    }
+    if let Some(e) = structural_err {
+        return Err(e);
     }
     if let Some(e) = deferred {
         return Err(e);
@@ -390,14 +407,20 @@ fn validate_recursive_body(
     // 判定順序は構文 → 再帰構造 → 機能ゲート。構造判定の前に各項の構文を検証する。
     structural(anchor, limits)?;
     let (term, wrapped, trailing, inner_clause) = peel_term(recursive, limits)?;
-    // 末尾句（本文全体に掛かる句。0A000 は後回し）は、句だけを `SELECT 1` に連結して構文を検証し、
+    // 末尾句（本文全体に掛かる句。0A000 は後回し）は、FROM を持つ有効な select に連結して
+    // 構文だけを検証する（`ORDER BY`／`FETCH` を受理しない定数 select へ連結しない）。
     // 構造検査は句を除いた項で行う（集計項などに句が付いても 42P19 を優先して返すため）。
     let core_len = depth0_words(term, &["ORDER", "LIMIT", "OFFSET", "FETCH"])
         .first()
         .copied()
         .unwrap_or(term.len());
     if let Some(tail) = term.get(core_len..).filter(|t| !t.is_empty()) {
-        let mut probe = vec![Token::Keyword(Keyword::Select), Token::Number("1".into())];
+        let mut probe = vec![
+            Token::Keyword(Keyword::Select),
+            Token::Ident("n".into()),
+            Token::Keyword(Keyword::From),
+            Token::Ident("docs".into()),
+        ];
         probe.extend_from_slice(tail);
         structural(&probe, limits)?;
     }
@@ -576,6 +599,9 @@ mod tests {
             "WITH RECURSIVE t(n) AS (SELECT 1 UNION ALL (SELECT n + 1 FROM t WHERE n < 3) LIMIT 5) SELECT n FROM t",
             "WITH RECURSIVE t(n) AS (SELECT 1 UNION ALL ((SELECT n + 1 FROM t)) ORDER BY n) SELECT n FROM t",
             "WITH RECURSIVE t(n) AS (SELECT 1 UNION ALL (SELECT n + 1 FROM t) OFFSET 1) SELECT n FROM t",
+            "WITH RECURSIVE t(n) AS (SELECT 1 UNION ALL SELECT n + 1 FROM t ORDER BY n) SELECT n FROM t",
+            "WITH RECURSIVE t(n) AS (SELECT 1 UNION ALL SELECT n + 1 FROM t WHERE n < 3 ORDER BY n LIMIT 2) SELECT n FROM t",
+            "WITH RECURSIVE t(n) AS (SELECT 1 UNION ALL SELECT n + 1 FROM t FETCH FIRST 1 ROWS ONLY) SELECT n FROM t",
         ] {
             assert_eq!(code(sql), NOT_YET, "{sql}");
         }
@@ -588,6 +614,11 @@ mod tests {
             ("WITH RECURSIVE a AS (SELECT FROM b), b AS (SELECT 1) SELECT 1", "42601"),
             ("WITH RECURSIVE d AS (DELETE FROM docs), t AS (SELECT n FROM t) SELECT 1", "42P19"),
             ("WITH RECURSIVE u AS (WITH v AS (SELECT 1) SELECT 1), t AS (SELECT FROM t) SELECT 1", "42601"),
+            ("WITH RECURSIVE t(n) AS (SELECT n FROM t), u AS (SELECT FROM docs) SELECT n FROM t", "42601"),
+            ("WITH RECURSIVE t(n) AS (SELECT n FROM t) CYCLE n SET c USING p SELECT n FROM t", "42P19"),
+            ("WITH RECURSIVE t(n) AS (SELECT n FROM t) SEARCH DEPTH FIRST BY n SET o SELECT n FROM t", "42P19"),
+            ("WITH RECURSIVE t(n) AS (SELECT FROM t) CYCLE n SET c USING p SELECT n FROM t", "42601"),
+            ("WITH RECURSIVE t(n) AS (SELECT 1 UNION ALL SELECT n + 1 FROM t) SEARCH DEPTH FIRST BY n, m SET o, u AS (SELECT FROM docs) SELECT n FROM t", "42601"),
         ] {
             assert_eq!(code(sql), want, "{sql}");
         }

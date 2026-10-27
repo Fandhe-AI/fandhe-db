@@ -15011,7 +15011,8 @@ impl<'a> Parser<'a> {
     /// トークン列を返す（SQL-35、Issue #1869）。`sql::recursive_cte::validate_recursive_with`
     /// だけが呼ぶ。再帰構造の検証・評価は呼び出し元の担当で、本関数は構文の切り出し
     /// （`parse_with_clause` と同じ列名リスト・`[NOT] MATERIALIZED`・括弧対応・本文内 `;` の
-    /// 規則。第 2 のパーサーを持たない）と、本文直後の `SEARCH`／`CYCLE` 句の拒否（`0A000`。
+    /// 規則。第 2 のパーサーを持たない）と、本文直後の `SEARCH`／`CYCLE` 句の読み飛ばしと
+    /// 存在の記録（`0A000` の機能ゲートは呼び出し元が構文・構造の検証後に返す。
     /// #2213・#2214 が実装）だけを行う。
     pub(crate) fn parse_recursive_with_header(
         &mut self,
@@ -15019,6 +15020,7 @@ impl<'a> Parser<'a> {
         self.expect_ident_matching("WITH")?;
         self.expect_ident_matching("RECURSIVE")?;
         let mut defs: Vec<(String, Vec<String>, Vec<Token>)> = Vec::new();
+        let mut has_search_cycle = false;
         loop {
             let name = self.expect_ident()?;
             let column_aliases = self.parse_optional_view_column_aliases()?;
@@ -15053,9 +15055,30 @@ impl<'a> Parser<'a> {
                 self.nesting_limits.max_cte_definitions(),
             )?;
             if self.peek_ident_matches("SEARCH") || self.peek_ident_matches("CYCLE") {
-                return Err(SqlSurfaceError::feature_not_supported(
-                    "SEARCH and CYCLE clauses of WITH RECURSIVE are not supported yet",
-                ));
+                // 機能ゲート（0A000）は呼び出し元が構文・再帰構造の検証後に返す。ここでは
+                // 句の存在だけを記録し、次の定義の区切り（`, 名前 AS|(`）か主クエリの
+                // `SELECT` の手前までトークンを読み飛ばす。
+                has_search_cycle = true;
+                loop {
+                    match self.peek() {
+                        None | Some(Token::Keyword(Keyword::Select)) => break,
+                        Some(Token::Punct(',')) => {
+                            let after_name = self.tokens.get(self.pos.saturating_add(2));
+                            let is_def = matches!(
+                                self.tokens.get(self.pos.saturating_add(1)),
+                                Some(Token::Ident(_))
+                            ) && (matches!(after_name, Some(Token::Punct('(')))
+                                || matches!(after_name, Some(Token::Ident(a)) if a.eq_ignore_ascii_case("AS")));
+                            if is_def {
+                                break;
+                            }
+                            self.advance();
+                        }
+                        Some(_) => {
+                            self.advance();
+                        }
+                    }
+                }
             }
             if matches!(self.peek(), Some(Token::Punct(','))) {
                 self.advance();
@@ -15063,7 +15086,7 @@ impl<'a> Parser<'a> {
             }
             break;
         }
-        Ok((defs, self.remaining().to_vec()))
+        Ok((defs, self.remaining().to_vec(), has_search_cycle))
     }
 }
 
@@ -23431,7 +23454,7 @@ pub(crate) fn split_parenthesized(
 
 /// `WITH RECURSIVE` の見出し部の切り出し結果（各定義の `(名前, 列名リスト, 本文トークン列)` と
 /// 主クエリのトークン列）。
-pub(crate) type RecursiveWithHeader = (Vec<(String, Vec<String>, Vec<Token>)>, Vec<Token>);
+pub(crate) type RecursiveWithHeader = (Vec<(String, Vec<String>, Vec<Token>)>, Vec<Token>, bool);
 
 /// `WITH RECURSIVE` の見出し部（各定義の名前・列名リスト・本文トークン列と主クエリ）を
 /// 切り出す。`sql::recursive_cte::validate_recursive_with` の唯一の入口（`Parser` は本
