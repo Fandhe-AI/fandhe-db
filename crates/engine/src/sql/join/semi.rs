@@ -32,6 +32,13 @@
 //! S が空なら真（x が NULL でも真）／x が NULL なら偽／x が S にあれば偽／S に NULL があれば偽／
 //! それ以外は真。
 //!
+//! 集計形の相関スカラー比較（Issue #1846。親 #1845）: `col <op> (SELECT agg ... WHERE b.k = a.k)` は、
+//! `sql::subquery` が内側を相関キーの `GROUP BY` 集計へ書き換えて 1 回だけ実行し、グループ値ごとに
+//! 既存の述語評価器で外側の列を比較する述語（[`ScalarTable`]）を束縛して渡す。本モジュールは
+//! 外側の行の相関キーでグループの述語を 1 つ引いて評価するだけ（[`ProbeKind::ScalarCompare`]）。
+//! 該当する内側行が無い外側の行（キーが NULL の行を含む）は空集合に対する集計値の述語で評価する
+//! （`count` は 0、それ以外は NULL＝常に偽）。内側のキーが NULL のグループはどの外側の行にも一致しない。
+//!
 //! 情報漏えい対策: 内側行はすべて呼び出したセッションの可視行だけ。[`CorrelatedProbeRef`] の
 //! `Debug` は行データを一切出さない。エラー文言は静的文字列のみ。バケットの反復順は結果に
 //! 影響しない（バケット内は走査順の `Vec`、ハッシュ表は引くだけで走査しない）。
@@ -153,6 +160,20 @@ enum ProbeRows {
     },
     /// `NOT IN` で残余が無い形（相関キーごとの [`NotInBucket`]）。
     NotIn(HashMap<Vec<u8>, NotInBucket>),
+    /// 集計形の相関スカラー比較（Issue #1846。グループごとに束縛済みの比較述語）。
+    Scalar(ScalarTable),
+}
+
+/// 集計形の相関スカラー比較（Issue #1846）の述語表。`sql::subquery` が内側の `GROUP BY` 集計の
+/// 結果（グループ値）から組み立てる。可視行由来の値を束縛済みの述語として保持するため `Debug` は
+/// 導出しない（エラー・ログ経由の漏えい防止）。
+pub(crate) struct ScalarTable {
+    /// 相関キーの正準バイト列 → `predicates` の添字（キーが NULL のグループは入れない）。
+    pub(crate) by_key: HashMap<Vec<u8>, u32>,
+    /// 外側の列を比較する束縛済みの述語（グループ値の distinct ごと。NULL は常に偽）。
+    pub(crate) predicates: Vec<BoundOrGroup>,
+    /// 該当する内側のグループが無い外側の行に使う述語（空集合に対する集計値との比較）の添字。
+    pub(crate) empty_set: u32,
 }
 
 /// プローブの判定方式（Issue #1844）。`eval` は網羅的に `match` し、取りこぼしで述語が
@@ -163,6 +184,8 @@ pub(crate) enum ProbeKind {
     Exists { negated: bool },
     /// `NOT IN`（NULL を考慮した反結合）。`target` は外側の対象値 x の取り出し元と型クラス。
     NotIn { target: OuterKey },
+    /// 集計形の相関スカラー比較（Issue #1846）。述語表は [`ProbeRows::Scalar`] が持つ。
+    ScalarCompare,
 }
 
 /// 残余述語の評価器。内側スキーマに外側参照ごとの列を足した合成スキーマで束縛した結果を
@@ -217,13 +240,13 @@ pub(crate) struct ProbeSpec {
     pub(crate) byte_cap: usize,
 }
 
-fn key_bytes_overhead(key: &[u8]) -> usize {
+pub(crate) fn key_bytes_overhead(key: &[u8]) -> usize {
     key.len()
         .saturating_add(std::mem::size_of::<Vec<u8>>())
         .saturating_add(std::mem::size_of::<usize>())
 }
 
-fn too_large() -> SqlSurfaceError {
+pub(crate) fn too_large() -> SqlSurfaceError {
     SqlSurfaceError::payload_too_large("correlated subquery input exceeds the byte budget")
 }
 
@@ -256,7 +279,7 @@ impl CorrelatedProbe {
         let mut buckets: HashMap<Vec<u8>, NotInBucket> = HashMap::new();
         let not_in_class = match &kind {
             ProbeKind::NotIn { target } => Some(target.class.clone()),
-            ProbeKind::Exists { .. } => None,
+            ProbeKind::Exists { .. } | ProbeKind::ScalarCompare => None,
         };
         let keep_rows = residual.is_some();
         'rows: for input in inputs {
@@ -356,7 +379,7 @@ impl CorrelatedProbe {
             .iter()
             .chain(match &kind {
                 ProbeKind::NotIn { target } => Some(target),
-                ProbeKind::Exists { .. } => None,
+                ProbeKind::Exists { .. } | ProbeKind::ScalarCompare => None,
             })
             .filter_map(|k| match k.source {
                 OuterSource::Column(i) => Some(i),
@@ -388,6 +411,36 @@ impl CorrelatedProbe {
         })
     }
 
+    /// 集計形の相関スカラー比較（Issue #1846）のプローブを組み立てる。`table` の述語は外側
+    /// スキーマへ束縛済みで、`target_column` はその述語が参照する外側の比較対象列（疑似列 `id`
+    /// は `None`）。デコード対象へ含める外側列はキーの列と対象列の和集合。
+    pub(crate) fn scalar_compare(
+        keys: Vec<OuterKey>,
+        table: ScalarTable,
+        target_column: Option<usize>,
+        budget: Arc<CorrelatedBudget>,
+    ) -> Self {
+        let mut outer_columns: Vec<usize> = keys
+            .iter()
+            .filter_map(|k| match k.source {
+                OuterSource::Column(i) => Some(i),
+                OuterSource::Id => None,
+            })
+            .chain(target_column)
+            .collect();
+        outer_columns.sort();
+        outer_columns.dedup();
+        Self {
+            keys,
+            rows: ProbeRows::Scalar(table),
+            residual: None,
+            min_matches: 1,
+            kind: ProbeKind::ScalarCompare,
+            budget,
+            outer_columns,
+        }
+    }
+
     /// 外側スキーマで評価に必要な論理列インデックス（デコード対象へ含める用）。
     pub(crate) fn outer_columns(&self) -> &[usize] {
         &self.outer_columns
@@ -407,7 +460,36 @@ impl CorrelatedProbe {
                 self.eval_exists(row_scalars, id).map(|e| e != *negated)
             }
             ProbeKind::NotIn { target } => self.eval_not_in(target, row_scalars, id),
+            ProbeKind::ScalarCompare => self.eval_scalar_compare(row_scalars, id),
         }
+    }
+
+    /// 集計形の相関スカラー比較の 1 行判定（Issue #1846）。外側の相関キーでグループの述語を引き、
+    /// 該当が無い（キーが NULL・内側に一致するグループが無い）行は空集合の述語で評価する。述語は
+    /// 外側スキーマに束縛済みのため、外側の行スカラーをそのまま渡して既存の評価器を呼ぶ。
+    fn eval_scalar_compare(
+        &self,
+        row_scalars: &[Option<ScalarRef<'_>>],
+        id: u64,
+    ) -> Result<bool, SqlSurfaceError> {
+        let ProbeRows::Scalar(table) = &self.rows else {
+            // `ScalarCompare` の構築は `Scalar` だけ。破れたら fail-closed。
+            return Err(SqlSurfaceError::Internal {
+                detail: "correlated scalar probe has an unexpected row layout".to_string(),
+            });
+        };
+        let index = match self.outer_key(row_scalars, id)? {
+            Some(key) => table.by_key.get(&key).copied().unwrap_or(table.empty_set),
+            None => table.empty_set,
+        };
+        let group = usize::try_from(index)
+            .ok()
+            .and_then(|i| table.predicates.get(i))
+            .ok_or_else(|| SqlSurfaceError::Internal {
+                detail: "correlated scalar predicate index out of range".to_string(),
+            })?;
+        let mut scratch: Vec<StackValue> = Vec::new();
+        group.matches(row_scalars, id, &[], 0, &mut scratch)
     }
 
     /// `NOT IN` の 1 行判定（真理値表は本モジュール冒頭）。外側の相関キーが NULL の行は S が空
@@ -469,7 +551,7 @@ impl CorrelatedProbe {
                 Ok(!decided_false)
             }
             // `NotIn` の構築は `NotIn`／`Rows` のどちらかだけ。破れたら fail-closed。
-            ProbeRows::Counts(_) => Err(SqlSurfaceError::Internal {
+            ProbeRows::Counts(_) | ProbeRows::Scalar(_) => Err(SqlSurfaceError::Internal {
                 detail: "correlated NOT IN probe has an unexpected row layout".to_string(),
             }),
         }
@@ -529,7 +611,7 @@ impl CorrelatedProbe {
                 self.count_matches(rows, indices, residual, row_scalars, id)
             }
             // `Exists` 種別では構築されない形。破れたら fail-closed。
-            ProbeRows::NotIn(_) => Err(SqlSurfaceError::Internal {
+            ProbeRows::NotIn(_) | ProbeRows::Scalar(_) => Err(SqlSurfaceError::Internal {
                 detail: "correlated EXISTS probe has an unexpected row layout".to_string(),
             }),
         }
@@ -974,5 +1056,80 @@ mod tests {
         let mut visited = Vec::new();
         visit_referenced_scalar_columns(&expr, &mut |i| visited.push(i));
         assert_eq!(visited, vec![0]);
+    }
+    /// 常に真の述語（空の連言）と常に偽の述語（分岐 0 個）。
+    fn always_true() -> BoundOrGroup {
+        BoundOrGroup::new(vec![crate::sql::where_tree::BoundConjunction::new(
+            Vec::new(),
+            Vec::new(),
+            Vec::new(),
+        )])
+    }
+
+    fn always_false() -> BoundOrGroup {
+        BoundOrGroup::new(Vec::new())
+    }
+
+    /// キー 7 → 真、キー 8 → 偽、それ以外・キー NULL → 空集合の述語（`empty_true` で切り替え）。
+    fn scalar_probe(empty_true: bool) -> CorrelatedProbe {
+        let mut by_key = HashMap::new();
+        for (k, idx) in [(7_i128, 0_u32), (8_i128, 1_u32)] {
+            by_key.insert(k.to_be_bytes().to_vec(), idx);
+        }
+        let table = ScalarTable {
+            by_key,
+            predicates: vec![
+                always_true(),
+                always_false(),
+                if empty_true {
+                    always_true()
+                } else {
+                    always_false()
+                },
+            ],
+            empty_set: 2,
+        };
+        CorrelatedProbe::scalar_compare(int_key(), table, Some(1), budget())
+    }
+
+    #[test]
+    fn scalar_compare_uses_group_predicate_then_empty_set_predicate() {
+        let p = scalar_probe(true);
+        assert!(p.eval(&[Some(ScalarRef::BigInt(7)), None], 1).unwrap());
+        assert!(!p.eval(&[Some(ScalarRef::BigInt(8)), None], 1).unwrap());
+        // 内側に一致するグループが無い外側の行は空集合の述語（ここでは真）。
+        assert!(p.eval(&[Some(ScalarRef::BigInt(99)), None], 1).unwrap());
+        // 外側キーが NULL の行も空集合の述語（`count` の 0 との比較は真になりうる）。
+        assert!(p.eval(&[None, None], 1).unwrap());
+        let p = scalar_probe(false);
+        assert!(!p.eval(&[None, None], 1).unwrap());
+        assert!(!p.eval(&[Some(ScalarRef::BigInt(99)), None], 1).unwrap());
+    }
+
+    #[test]
+    fn scalar_compare_fails_closed_on_missing_outer_column_and_bad_index() {
+        let p = scalar_probe(true);
+        assert_eq!(p.eval(&[], 1).unwrap_err().wire_code(), "XX000");
+        let table = ScalarTable {
+            by_key: HashMap::new(),
+            predicates: Vec::new(),
+            empty_set: 0,
+        };
+        let broken = CorrelatedProbe::scalar_compare(int_key(), table, None, budget());
+        assert_eq!(
+            broken
+                .eval(&[Some(ScalarRef::BigInt(1))], 1)
+                .unwrap_err()
+                .wire_code(),
+            "XX000"
+        );
+    }
+
+    #[test]
+    fn scalar_compare_outer_columns_include_key_and_target_and_debug_is_opaque() {
+        let p = scalar_probe(true);
+        assert_eq!(p.outer_columns(), &[0, 1]);
+        let r = CorrelatedProbeRef::new(p);
+        assert_eq!(format!("{r:?}"), "CorrelatedProbeRef(..)");
     }
 }
