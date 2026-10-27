@@ -401,3 +401,26 @@ fn renamed_vector_column_through_cte_falls_back_to_inline() {
         .expect("fallback must succeed");
     assert_eq!(render(&mat), render(&plain));
 }
+
+/// 本文が同名列を重複投影する形は、具体化すると `42702` になるためインライン展開へ戻り、
+/// `MATERIALIZED` の有無で結果が変わらない（Issue #1860 レビュー指摘）。
+#[test]
+fn duplicate_projection_falls_back_to_inline() {
+    let (core, _g) = open_with(None);
+    let template = "WITH x AS {h}(SELECT lang, lang FROM docs) SELECT lang FROM x LIMIT 2";
+    let plain = query(&core, "alice", &template.replace("{h}", "")).expect("plain");
+    let mat = query(&core, "alice", &template.replace("{h}", "MATERIALIZED "))
+        .expect("fallback must succeed");
+    assert_eq!(render(&mat), render(&plain));
+}
+
+/// 列別名つき CTE の本文が Items 投影になっても、投影しない VECTOR 列のせいで具体化が
+/// インラインへ落ちず、`--max-result-rows` の上限が適用される（Issue #1860 レビュー指摘）。
+#[test]
+fn aliased_cte_still_materializes_and_is_capped() {
+    let (core, _g) = open_with(Some(ResultLimits::new(5)));
+    let mat = "WITH x(l, b) AS MATERIALIZED (SELECT lang, body FROM docs) SELECT l FROM x LIMIT 2";
+    assert_eq!(code(&core, "alice", mat), "54000");
+    let plain = "WITH x(l, b) AS (SELECT lang, body FROM docs) SELECT l FROM x LIMIT 2";
+    assert_eq!(query(&core, "alice", plain).expect("plain").rows.len(), 2);
+}

@@ -21580,6 +21580,11 @@ fn materialized_cte_statement(
             return None;
         }
     }
+    // 本文が同名の公開列を 2 列以上返す形（`SELECT lang, lang`）は、具体化結果の列解決が
+    // `42702` になる（インラインは基底列へ畳み込める）。結果は等しいのでインラインへ戻す。
+    if materialized_body_has_duplicate_names(def) {
+        return None;
+    }
     let mut budget = super::cte::ResolveBudget::new();
     let inner = super::cte::resolve_relation(
         lookup,
@@ -21642,17 +21647,26 @@ fn materialized_cte_statement(
                 BufferedOuter::Rows(rows) if matches!(rows.projection, Projection::All)
             ) && !v.outer_depends_on_order();
             let hits_unevaluable = match &body_projection {
-                Projection::All | Projection::Items(_) => !hazards.unevaluable_columns.is_empty(),
+                Projection::All => !hazards.unevaluable_columns.is_empty(),
                 Projection::Columns(names) => names
                     .iter()
                     .any(|n| hazards.unevaluable_columns.iter().any(|u| u == n)),
+                Projection::Items(items) => projection_item_idents(items).is_none_or(|names| {
+                    names
+                        .iter()
+                        .any(|n| hazards.unevaluable_columns.iter().any(|u| u == n))
+                }),
             };
             if hits_unevaluable && !outer_passthrough_all {
                 return None;
             }
-            if matches!(body_projection, Projection::All | Projection::Items(_))
-                && hazards.declares_real_id
-            {
+            let projects_id = match &body_projection {
+                Projection::All => true,
+                Projection::Columns(_) => false,
+                Projection::Items(items) => projection_item_idents(items)
+                    .is_none_or(|names| names.iter().any(|n| n.eq_ignore_ascii_case("id"))),
+            };
+            if projects_id && hazards.declares_real_id {
                 return None;
             }
             v.column_aliases = def.column_aliases.clone();
@@ -21661,6 +21675,46 @@ fn materialized_cte_statement(
         }
         _ => None,
     }
+}
+
+/// `Items` 投影が実際に参照する列名（式中の識別子を含む）。`*` を含む場合は列を特定できないため
+/// `None`（呼び出し側は全列を参照するものとして安全側に倒す。Issue #1860）。
+fn projection_item_idents(items: &[SelectItem]) -> Option<Vec<String>> {
+    let mut names = Vec::new();
+    for item in items {
+        match item {
+            SelectItem::Column(n) if n == "*" => return None,
+            SelectItem::Column(n) => names.push(n.clone()),
+            SelectItem::Expr { expr, .. } => names.extend(expr_bare_idents(expr)),
+        }
+    }
+    Some(names)
+}
+
+/// 具体化対象 CTE の本文が、公開列名の重複（列名リスト適用後を含む）を持つか。名前を静的に
+/// 決められない式項目は数えない（重複判定は偽陰性側が具体化経路のまま＝既存挙動）。
+fn materialized_body_has_duplicate_names(def: &super::cte::CteDef) -> bool {
+    let names: Vec<String> = if !def.column_aliases.is_empty() {
+        def.column_aliases.clone()
+    } else {
+        match &def.body.projection {
+            Projection::All => return false,
+            Projection::Columns(c) => c.clone(),
+            Projection::Items(items) => items
+                .iter()
+                .filter_map(|i| match i {
+                    SelectItem::Column(n) => Some(n.clone()),
+                    SelectItem::Expr { expr, alias } => match (alias, expr) {
+                        (Some(a), _) => Some(a.clone()),
+                        (None, Expr::Ident(n)) => Some(n.clone()),
+                        _ => None,
+                    },
+                })
+                .collect(),
+        }
+    };
+    let mut seen = std::collections::HashSet::new();
+    names.iter().any(|n| !seen.insert(n.to_ascii_lowercase()))
 }
 
 /// `WITH` 句の CTE をインライン展開のみで評価するか、`MATERIALIZED` 指定の具体化経路を
