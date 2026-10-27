@@ -272,6 +272,7 @@ pub(crate) fn resolve_where_predicates(
                     udfs,
                     group_limits,
                     nesting_limits,
+                    result_limits,
                     budget,
                     in_value_budget,
                 )?);
@@ -1053,6 +1054,7 @@ fn static_validate_subquery_predicates(
                     lookup,
                     udfs,
                     nesting_limits,
+                    result_limits,
                 )?;
                 let [inner_meta] = meta.as_slice() else {
                     return Err(SqlSurfaceError::unsupported(
@@ -2327,6 +2329,7 @@ fn resolve_quantified_compare(
     udfs: &UdfRegistry,
     group_limits: crate::group_by_limits::GroupByLimits,
     nesting_limits: crate::nesting_limits::NestingLimits,
+    result_limits: crate::result_limits::ResultLimits,
     budget: &mut usize,
     in_value_budget: &mut usize,
 ) -> Result<Vec<WherePredicate>, SqlSurfaceError> {
@@ -2346,6 +2349,7 @@ fn resolve_quantified_compare(
             udfs,
             group_limits,
             nesting_limits,
+            result_limits,
             budget,
             in_value_budget,
         );
@@ -2362,6 +2366,7 @@ fn resolve_quantified_compare(
         udfs,
         group_limits,
         nesting_limits,
+        result_limits,
         budget,
         in_value_budget,
         &mut meta_sink,
