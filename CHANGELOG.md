@@ -9,6 +9,8 @@
 
 ### Added
 
+- CTE の具体化経路を追加する（Issue #1860・SQL-62）。明示 `MATERIALIZED` の CTE を主クエリが直接参照すると、本文全体を評価した結果行集合を外側が読む。
+  挙動変更: 本文の可視行数が `--max-result-rows` を超えると、外側の `LIMIT` に関わらず `54000` で拒否される。公開 API の破壊的変更なし。詳細は [cte.md](docs/design/cte.md)。
 - CTE の `MATERIALIZED`／`NOT MATERIALIZED` を受理する（Issue #1858・SQL-62 (3)）。評価方式の指定として読み捨て、結果は変わらない。
   従来 `42601` で拒否していた構文が受理される挙動変更。詳細は [cte.md](docs/design/cte.md)。
 - CTE の列名リスト `WITH x(a, b) AS (...)` を受理する（Issue #1857・SQL-62 (2)）。出力列へ先頭から順に名前を付け、短いリストは残りを元の名前のまま受理する。

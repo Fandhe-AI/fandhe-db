@@ -1002,6 +1002,7 @@ mod tests {
                 offset,
             })),
             column_aliases: Vec::new(),
+            origin: crate::sql::allowlist::BufferedOrigin::View,
         }
     }
 
@@ -1279,6 +1280,7 @@ mod tests {
                 group_by: None,
             })),
             column_aliases: Vec::new(),
+            origin: crate::sql::allowlist::BufferedOrigin::View,
         }
     }
 
@@ -1395,6 +1397,7 @@ mod tests {
                 offset: 0,
             })),
             column_aliases: Vec::new(),
+            origin: crate::sql::allowlist::BufferedOrigin::View,
         };
         let out = run(result(), &mk(vec![expr_key("a", true)])).unwrap();
         let ids: Vec<u64> = out.rows.iter().map(|r| r.id).collect();

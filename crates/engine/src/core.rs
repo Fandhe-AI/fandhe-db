@@ -3858,7 +3858,7 @@ impl EngineCore {
         let resolver = self.schema_resolver(ctx);
         let resolved_tokens =
             crate::sql::relation_name::tokenize_resolved_with(sql, false, Some(&resolver))?;
-        match crate::sql::allowlist::validate_sql_tokens_with_subquery_ctx_limits(
+        match crate::sql::allowlist::validate_session_sql_tokens(
             &resolved_tokens,
             &self.storage,
             0,
@@ -5405,7 +5405,7 @@ impl EngineCore {
             return Ok(ParsedSql::AlterTable(stmt));
         }
 
-        let stmt = crate::sql::allowlist::validate_sql_tokens_with_subquery_ctx_limits(
+        let stmt = crate::sql::allowlist::validate_session_sql_tokens(
             &tokens,
             &storage_lookup,
             0,
@@ -8366,8 +8366,14 @@ impl EngineCore {
                     skip_vector_literal_validation,
                     &[],
                     // 本文の `LIMIT` は外側の設定値と連動させず独立した既定値で検証する
-                    // （result-limits-cli.md の「内側 LIMIT は連動しない」）。
-                    &crate::result_limits::ResultLimits::default(),
+                    // （result-limits-cli.md の「内側 LIMIT は連動しない」）。具体化 CTE
+                    // （Issue #1860）は実行側と同じく呼び出し段の `limits` を渡す。
+                    &match validated.origin {
+                        crate::sql::allowlist::BufferedOrigin::MaterializedCte => *limits,
+                        crate::sql::allowlist::BufferedOrigin::View => {
+                            crate::result_limits::ResultLimits::default()
+                        }
+                    },
                 )?;
                 match body_columns {
                     Some(cols) => {
@@ -9084,12 +9090,21 @@ impl EngineCore {
                 Self::check_buffered_outer_limit(&validated, &limits)?;
                 check_buffered_view_collations(read_txn, &validated)?;
                 let body = (*validated.body).clone();
+                // 具体化 CTE（Issue #1860・SQL-62 (5)）の本文は呼び出し段の上限で実行する
+                // （可視行が `--max-result-rows` を超えたら黙って切り詰めず `54000`）。ビュー本文は
+                // 従来どおり既定値（内側 LIMIT は外側の設定値と連動させない）。
+                let body_limits = match validated.origin {
+                    crate::sql::allowlist::BufferedOrigin::MaterializedCte => limits,
+                    crate::sql::allowlist::BufferedOrigin::View => {
+                        crate::result_limits::ResultLimits::default()
+                    }
+                };
                 match self.execute_read_statement_with_limits(
                     ctx,
                     session,
                     body,
                     read_txn,
-                    crate::result_limits::ResultLimits::default(),
+                    body_limits,
                 )? {
                     crate::sql::SqlOutcome::Query(result) => {
                         // Issue #1360: 外側の WHERE・ORDER BY・射影・LIMIT/OFFSET は
