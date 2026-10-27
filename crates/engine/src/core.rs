@@ -1629,9 +1629,10 @@ pub enum ParsedSql {
     /// マッチするクレート外コードは追随が必要。
     InsertSelect(crate::sql::allowlist::ValidatedInsertSelect),
     /// データ変更 CTE を含む最上位の `WITH` 文（`WITH d AS (DELETE ... RETURNING ...) SELECT ... FROM d`。
-    /// SQL-63・Issue #1876）。構文・名前・`RETURNING` 公開列・実行形のゲート（実行する形は副文 1 つを
-    /// 主クエリが読む形）までを通過した実行計画で、実行腕は全副文と文末の `USING OPERATION_ID` 台帳記録を
-    /// 1 つの書き込みトランザクションで行い、副文の `RETURNING` 行へ主クエリの外側処理を適用する
+    /// SQL-63・Issue #1876・#1877）。構文・名前・`RETURNING` 公開列・実行形のゲート（実行する形は副文 1 つ
+    /// 以上と、副文を読む主クエリまたは実表等を読む主クエリ）までを通過した実行計画で、実行腕は全副文と
+    /// 文末の `USING OPERATION_ID` 台帳記録を 1 つの書き込みトランザクションで行う。全副文と主クエリは文の
+    /// 開始時点の状態を読み、副文を読む主クエリには副文の `RETURNING` 行へ外側処理を適用する
     /// （`core/dm_cte_exec.rs`）。読み取り専用の [`ParsedSql::Statement`] へ載せないのは、書き込みを伴う
     /// 文を wire 側が非書き込みと誤判定しないため。
     ///
@@ -13656,6 +13657,20 @@ impl EngineCore {
         session: &crate::sql::mode::SessionState,
         stmt: &crate::sql::allowlist::ValidatedPredicateDelete,
     ) -> Result<crate::sql::exec::DeleteOutcome, crate::sql::allowlist::SqlSurfaceError> {
+        self.execute_predicate_delete_form_pre(target, ctx, session, stmt, None)
+    }
+
+    /// 内側の実装。`pre` が `Some` のとき、`WHERE` のサブクエリは呼び出し元（データ変更 CTE の
+    /// 段 A。Issue #1877）が書き込み前に解決済みで、その結果（サブクエリが無ければ `None`）をそのまま使う。
+    /// 台帳ハッシュは解決前の文から出す契約（SQL-53 (5)）は変わらない。
+    fn execute_predicate_delete_form_pre(
+        &self,
+        target: crate::tenant::WriteTarget<'_>,
+        ctx: &PolicyContext,
+        session: &crate::sql::mode::SessionState,
+        stmt: &crate::sql::allowlist::ValidatedPredicateDelete,
+        pre: Option<Option<crate::sql::allowlist::ValidatedPredicateDelete>>,
+    ) -> Result<crate::sql::exec::DeleteOutcome, crate::sql::allowlist::SqlSurfaceError> {
         let schema = self
             .storage
             .get_table_schema(stmt.table_name())
@@ -13668,8 +13683,12 @@ impl EngineCore {
                 },
             })?;
         // SQL-53（Issue #1751）: WHERE 内のサブクエリは束縛の前に書き込み txn のスナップショットで解決する。
-        let resolved =
-            self.resolve_predicate_delete_subqueries(&target, ctx, session, stmt, &schema)?;
+        let resolved = match pre {
+            Some(resolved) => resolved,
+            None => {
+                self.resolve_predicate_delete_subqueries(&target, ctx, session, stmt, &schema)?
+            }
+        };
         self.run_predicate_delete_resolved(
             target,
             ctx,
@@ -14117,6 +14136,20 @@ impl EngineCore {
         session: &crate::sql::mode::SessionState,
         stmt: &crate::sql::allowlist::ValidatedPredicateDelete,
     ) -> Result<crate::sql::exec::ReturningOutcome, crate::sql::allowlist::SqlSurfaceError> {
+        self.execute_predicate_delete_returning_form_pre(target, ctx, session, stmt, None)
+    }
+
+    /// 内側の実装。`pre` が `Some` のとき、`WHERE` のサブクエリは呼び出し元（データ変更 CTE の
+    /// 段 A。Issue #1877）が書き込み前に解決済みで、その結果（サブクエリが無ければ `None`）をそのまま使う。
+    /// 台帳ハッシュは解決前の文から出す契約（SQL-53 (5)）は変わらない。
+    fn execute_predicate_delete_returning_form_pre(
+        &self,
+        target: crate::tenant::WriteTarget<'_>,
+        ctx: &PolicyContext,
+        session: &crate::sql::mode::SessionState,
+        stmt: &crate::sql::allowlist::ValidatedPredicateDelete,
+        pre: Option<Option<crate::sql::allowlist::ValidatedPredicateDelete>>,
+    ) -> Result<crate::sql::exec::ReturningOutcome, crate::sql::allowlist::SqlSurfaceError> {
         let schema = self.load_table_schema_for_dml(stmt.table_name())?;
         let returning =
             crate::sql::parser::bind_returning(stmt.returning(), &schema)?.ok_or_else(|| {
@@ -14125,8 +14158,12 @@ impl EngineCore {
                         .to_string(),
                 }
             })?;
-        let resolved =
-            self.resolve_predicate_delete_subqueries(&target, ctx, session, stmt, &schema)?;
+        let resolved = match pre {
+            Some(resolved) => resolved,
+            None => {
+                self.resolve_predicate_delete_subqueries(&target, ctx, session, stmt, &schema)?
+            }
+        };
         let (bound, content_hash_value) = Self::prepare_predicate_delete(
             resolved.as_ref().unwrap_or(stmt),
             stmt,
@@ -14285,6 +14322,20 @@ impl EngineCore {
         session: &crate::sql::mode::SessionState,
         stmt: &crate::sql::allowlist::ValidatedUpdateForm,
     ) -> Result<crate::sql::exec::UpdateOutcome, crate::sql::allowlist::SqlSurfaceError> {
+        self.execute_predicate_update_form_pre(target, ctx, session, stmt, None)
+    }
+
+    /// 内側の実装。`pre` が `Some` のとき、`WHERE` のサブクエリは呼び出し元（データ変更 CTE の
+    /// 段 A。Issue #1877）が書き込み前に解決済みで、その結果（サブクエリが無ければ `None`）をそのまま使う。
+    /// 台帳ハッシュは解決前の文から出す契約（SQL-53 (5)）は変わらない。
+    fn execute_predicate_update_form_pre(
+        &self,
+        target: crate::tenant::WriteTarget<'_>,
+        ctx: &PolicyContext,
+        session: &crate::sql::mode::SessionState,
+        stmt: &crate::sql::allowlist::ValidatedUpdateForm,
+        pre: Option<Option<crate::sql::allowlist::ValidatedPredicateUpdate>>,
+    ) -> Result<crate::sql::exec::UpdateOutcome, crate::sql::allowlist::SqlSurfaceError> {
         use crate::sql::allowlist::ValidatedUpdateForm;
 
         let table_name = match stmt {
@@ -14322,8 +14373,12 @@ impl EngineCore {
             );
         };
         // SQL-53（Issue #1751）: WHERE 内のサブクエリは束縛の前に書き込み txn のスナップショットで解決する。
-        let resolved =
-            self.resolve_predicate_update_subqueries(&target, ctx, session, stmt, &schema)?;
+        let resolved = match pre {
+            Some(resolved) => resolved,
+            None => {
+                self.resolve_predicate_update_subqueries(&target, ctx, session, stmt, &schema)?
+            }
+        };
         self.run_predicate_update_resolved(
             target,
             ctx,
@@ -14408,6 +14463,20 @@ impl EngineCore {
         session: &crate::sql::mode::SessionState,
         stmt: &crate::sql::allowlist::ValidatedUpdateForm,
     ) -> Result<crate::sql::exec::ReturningOutcome, crate::sql::allowlist::SqlSurfaceError> {
+        self.execute_update_returning_form_pre(target, ctx, session, stmt, None)
+    }
+
+    /// 内側の実装。`pre` が `Some` のとき、`WHERE` のサブクエリは呼び出し元（データ変更 CTE の
+    /// 段 A。Issue #1877）が書き込み前に解決済みで、その結果（サブクエリが無ければ `None`）をそのまま使う。
+    /// 台帳ハッシュは解決前の文から出す契約（SQL-53 (5)）は変わらない。
+    fn execute_update_returning_form_pre(
+        &self,
+        target: crate::tenant::WriteTarget<'_>,
+        ctx: &PolicyContext,
+        session: &crate::sql::mode::SessionState,
+        stmt: &crate::sql::allowlist::ValidatedUpdateForm,
+        pre: Option<Option<crate::sql::allowlist::ValidatedPredicateUpdate>>,
+    ) -> Result<crate::sql::exec::ReturningOutcome, crate::sql::allowlist::SqlSurfaceError> {
         use crate::sql::allowlist::ValidatedUpdateForm;
 
         let (table_name, projection) = match stmt {
@@ -14440,8 +14509,12 @@ impl EngineCore {
                 )
             }
             ValidatedUpdateForm::Predicate(validated) => {
-                let resolved =
-                    self.resolve_predicate_update_subqueries(&target, ctx, session, stmt, &schema)?;
+                let resolved = match pre {
+                    Some(resolved) => resolved,
+                    None => self.resolve_predicate_update_subqueries(
+                        &target, ctx, session, stmt, &schema,
+                    )?,
+                };
                 let (bound, content_hash_value, legacy_hashes) = Self::prepare_predicate_update(
                     resolved.as_ref().unwrap_or(validated),
                     validated,

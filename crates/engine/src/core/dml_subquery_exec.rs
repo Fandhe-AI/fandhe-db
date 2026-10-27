@@ -115,7 +115,7 @@ impl EngineCore {
             ));
         };
         let ledger_write = self
-            .ledger_mode
+            .dml_ledger_mode()
             .resolve(op_id)
             .map_err(|_| SqlSurfaceError::MissingOperationId)?;
         crate::recovery::ledger::precheck_in_write_txn(
