@@ -9,6 +9,12 @@
 
 ### Added
 
+- 再帰 CTE の反復回数・累積行数の上限を起動時設定にする（Issue #1871・SQL-35・SQL-46。段階 B）。
+  wire-server に `--max-recursive-cte-iterations <1-1000>`・`--max-recursive-cte-rows <1-100000>` を追加し、
+  `EngineCore::with_recursive_cte_limits` へ注入する。ハード上限は既定値（反復 1,000 回・累積 100,000 行）と
+  同じで、下げる方向だけ設定できる。超過は `54000`。範囲外・非数値・値欠落・重複指定は起動エラー。
+  累積行数は `--max-result-rows` との小さい方が実効上限。公開 API は追加のみ（`engine::recursive_cte_limits`）。
+
 - `WITH RECURSIVE` の反復評価器を追加する（Issue #1870・SQL-35。段階 B）。アンカー項の結果を最初の作業表とし、
   「前回の反復で増えた行だけ」を作業表として再帰項（単一関係、または基底表との JOIN）を再実行し、作業表が空に
   なったら終了する。出力順は生成順。階層走査と数列が評価できる。暫定の固定上限（反復 1,000 回・累積 100,000 行。

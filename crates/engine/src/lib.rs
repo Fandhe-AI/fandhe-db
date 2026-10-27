@@ -267,6 +267,7 @@ pub mod policy;
 pub mod precision;
 pub mod query_planner;
 pub mod recovery;
+pub mod recursive_cte_limits;
 pub mod regex_limits;
 pub mod regex_match;
 pub mod rerank;
