@@ -2016,6 +2016,7 @@ mod budget_regression_tests {
                 },
                 offset: None,
                 default: None,
+                default_column: None,
                 result_type: Some(ColumnType::Uuid),
                 uses_pseudo_id: false,
             });

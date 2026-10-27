@@ -94,6 +94,10 @@ fn accepted_forms_reach_the_not_executable_gate() {
         "SELECT id, lag(score, 1, NULL) OVER (ORDER BY id) FROM docs LIMIT 10",
         "SELECT id, lag(lang, 1, 'none') OVER (ORDER BY id) FROM docs LIMIT 10",
         "SELECT id, Lead(score) OVER (ORDER BY id) AS nxt FROM docs LIMIT 10",
+        // 擬似列 `id` はオフセットに使える（bigint 扱い）。
+        "SELECT id, lag(score, id) OVER (ORDER BY id) FROM docs LIMIT 10",
+        // BOOLEAN の裸の列は既定値でも宣言型で統一され、ゲートへ到達する。
+        "SELECT id, lag(flag, 1, flag) OVER (ORDER BY id) FROM docs LIMIT 10",
     ];
     for sql in accepted {
         assert_eq!(code(&core, &ctx, sql), "0A000", "sql={sql}");
@@ -109,6 +113,8 @@ fn offset_and_default_type_mismatch_is_42804() {
         "SELECT id, lag(score, flag) OVER (ORDER BY id) FROM docs LIMIT 10",
         "SELECT id, lag(score, 1, 'x') OVER (ORDER BY id) FROM docs LIMIT 10",
         "SELECT id, lag(lang, 1, 0) OVER (ORDER BY id) FROM docs LIMIT 10",
+        "SELECT id, lag(score, 1, flag) OVER (ORDER BY id) FROM docs LIMIT 10",
+        "SELECT id, lag(flag, 1, score) OVER (ORDER BY id) FROM docs LIMIT 10",
     ];
     for sql in cases {
         assert_eq!(code(&core, &ctx, sql), "42804", "sql={sql}");
@@ -241,5 +247,55 @@ fn view_column_scope_covers_all_arguments() {
         "SELECT id, lag(lang, 1, 'x' || score) OVER (ORDER BY id) FROM v LIMIT 10",
     ] {
         assert_eq!(run(sql), "42703", "sql={sql}");
+    }
+}
+
+/// 式層が束縛できない型の裸の列（NUMERIC・UUID）も既定値で宣言型判定され、
+/// 同型ならゲート（`0A000`）、異型なら `42804`、運べない型（BYTEA）は `0A000` になる。
+#[test]
+fn bare_column_defaults_use_declared_types() {
+    let path = unique_db_path("lag-declared");
+    let _guard = CleanupGuard(path.clone());
+    let storage = Storage::open(&path).expect("open storage");
+    storage
+        .create_table(&TableSchema::new(
+            "typed",
+            vec![
+                ColumnDef::new(
+                    "n1",
+                    ColumnType::Numeric {
+                        precision: 10,
+                        scale: 2,
+                    },
+                    false,
+                ),
+                ColumnDef::new(
+                    "n2",
+                    ColumnType::Numeric {
+                        precision: 10,
+                        scale: 2,
+                    },
+                    false,
+                ),
+                ColumnDef::new("u1", ColumnType::Uuid, false),
+                ColumnDef::new("b1", ColumnType::Bytea, false),
+                ColumnDef::new("i1", ColumnType::Integer, false),
+            ],
+        ))
+        .expect("create table");
+    let core = EngineCore::from_storage(storage, Box::new(CpuScalarProvider));
+    let ctx = ctx_for("tenant-a");
+    let cases = [
+        ("lag(n1, 1, n2)", "0A000"),
+        ("lag(u1, 1, u1)", "0A000"),
+        ("lag(n1, 1, u1)", "42804"),
+        ("lag(i1, 1, n1)", "42804"),
+        ("lag(b1, 1, b1)", "0A000"),
+        ("lag(i1, 1, b1)", "0A000"),
+        ("lag(b1, 1, i1)", "0A000"),
+    ];
+    for (call, want) in cases {
+        let sql = format!("SELECT id, {call} OVER (ORDER BY id) FROM typed LIMIT 10");
+        assert_eq!(code(&core, &ctx, &sql), want, "sql={sql}");
     }
 }

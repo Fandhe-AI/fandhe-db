@@ -9720,6 +9720,9 @@ pub(crate) struct BoundWindowOffsetArgs {
     pub(crate) offset: Option<crate::sql::udf_call::BoundExpr>,
     /// 既定値式（値の型へ統一済み。省略時は `None`＝NULL）。
     pub(crate) default: Option<crate::sql::udf_call::BoundExpr>,
+    /// 既定値が式層で束縛できない型（BOOLEAN・NUMERIC・UUID・ENUM 等）の裸の列のとき、その列の
+    /// 位置（宣言型で型統一済み。この場合 `default` は `None`）。評価は Issue #1881 が接続する。
+    pub(crate) default_column: Option<usize>,
     /// 統一後の結果列型（`window_result_type` が公告に使う）。
     pub(crate) result_type: Option<ColumnType>,
     /// 引数が疑似列 `id` を参照するか（セル評価経路 `CellWindowEvaluator` が拒否に使う）。
@@ -9750,6 +9753,10 @@ impl BoundWindowOffsetArgs {
         }
         for e in self.offset.iter().chain(self.default.iter()) {
             any |= crate::sql::udf_call::mark_referenced_scalar_columns(e, mask);
+        }
+        if let Some(slot) = self.default_column.and_then(|i| mask.get_mut(i)) {
+            *slot = true;
+            any = true;
         }
         any
     }
@@ -9797,6 +9804,44 @@ fn lag_lead_value_type_unsupported(ty: &ColumnType) -> bool {
     )
 }
 
+/// 式が裸のスキーマ列参照ならその位置と列定義を返す（`LAG`／`LEAD` の宣言型判定用）。
+fn bare_schema_column<'a>(
+    expr: &Expr,
+    schema: &'a TableSchema,
+) -> Option<(usize, &'a crate::catalog::ColumnDef)> {
+    match expr {
+        Expr::Ident(name) => schema
+            .columns
+            .iter()
+            .enumerate()
+            .find(|(_, c)| &c.name == name),
+        _ => None,
+    }
+}
+
+/// `LAG`／`LEAD` の値と既定値の宣言型を統一する（`COALESCE` と同じく文字列系同士・整数系同士は
+/// 統一し、それ以外は同一型のみ許す）。統一できなければ `None`（呼び出し側が `42804`）。
+fn unify_lag_lead_types(a: &ColumnType, b: &ColumnType) -> Option<ColumnType> {
+    fn int_rank(t: &ColumnType) -> Option<u8> {
+        match t {
+            ColumnType::SmallInt => Some(1),
+            ColumnType::Integer => Some(2),
+            ColumnType::BigInt => Some(3),
+            _ => None,
+        }
+    }
+    match (a, b) {
+        (ColumnType::Text | ColumnType::Varchar(_), ColumnType::Text | ColumnType::Varchar(_)) => {
+            Some(ColumnType::Text)
+        }
+        _ => match (int_rank(a), int_rank(b)) {
+            (Some(x), Some(y)) => Some(if x >= y { a.clone() } else { b.clone() }),
+            _ if a == b => Some(a.clone()),
+            _ => None,
+        },
+    }
+}
+
 /// `LAG`／`LEAD` の引数（値・オフセット・既定値）を束縛し型を検査する（SQL-64 (1)・
 /// Issue #1880。[`bind_window_item`] から呼ばれる）。オフセットは整数型か裸の `NULL`
 /// （それ以外は `42804`）、値と既定値の型統一は `COALESCE` と同じ規則
@@ -9826,6 +9871,16 @@ fn bind_window_offset_args(
         None => None,
         Some(Expr::Null) => Some(BoundExpr::Null),
         // 裸の列は列の宣言型で判定する（式層は BOOLEAN 等の裸の列を束縛できず `22000` になるため）。
+        // 疑似列 `id` は bigint として扱う（スキーマ列 `id` があればそちらが優先）。
+        Some(Expr::Ident(name))
+            if name == "id"
+                && schema.has_pseudo_id()
+                && !schema.columns.iter().any(|c| c.name == "id") =>
+        {
+            let (bound, _ty, _col) =
+                bind_projection_expr(&Expr::Ident(name.clone()), schema, udfs, node_budget)?;
+            Some(bound)
+        }
         Some(Expr::Ident(name)) if schema.columns.iter().any(|c| &c.name == name) => {
             let column = schema.columns.iter().find(|c| &c.name == name);
             match column.map(|c| &c.ty) {
@@ -9884,15 +9939,82 @@ fn bind_window_offset_args(
             },
             offset,
             default: null_default,
+            default_column: None,
             result_type: Some(column.ty.clone()),
             uses_pseudo_id,
         });
     }
     let (value, default, ty, col) = match default_expr {
         Some(d) => {
-            let (v, d, ty, col) =
-                bind_value_with_default(&args.value, d, schema, udfs, node_budget)?;
-            (v, Some(d), ty, col)
+            let default_bare = bare_schema_column(d, schema);
+            // 値・既定値が運べない型の裸の列なら、式束縛へ入る前に `0A000`（fail-closed）。
+            for (_, c) in bare_column.iter().chain(default_bare.iter()) {
+                if lag_lead_value_type_unsupported(&c.ty) {
+                    return Err(unsupported());
+                }
+            }
+            match bind_value_with_default(&args.value, d, schema, udfs, node_budget) {
+                Ok((v, d, ty, col)) => (v, Some(d), ty, col),
+                // 式層が拒否する型（BOOLEAN・NUMERIC・UUID・ENUM 等）の裸の列は宣言型で
+                // 型統一・不一致判定する（`COALESCE` 式束縛へ落とさない）。
+                Err(SqlSurfaceError::InvalidInput { .. })
+                    if bare_column.is_some() || default_bare.is_some() =>
+                {
+                    let mismatch = || {
+                        SqlSurfaceError::datatype_mismatch(
+                            "LAG/LEAD default value must have the same type as the value",
+                        )
+                    };
+                    let (value_bound, value_ty) = match bare_column {
+                        Some((index, c)) => (
+                            BoundWindowValue::Column {
+                                index,
+                                ty: c.ty.clone(),
+                            },
+                            c.ty.clone(),
+                        ),
+                        None => {
+                            let (b, ty, col) =
+                                bind_projection_expr(&args.value, schema, udfs, node_budget)?;
+                            let col = col.ok_or_else(unsupported)?;
+                            if lag_lead_value_type_unsupported(&col)
+                                || matches!(
+                                    ty,
+                                    ExprType::Vector
+                                        | ExprType::Array
+                                        | ExprType::Json
+                                        | ExprType::JsonText
+                                )
+                            {
+                                return Err(unsupported());
+                            }
+                            (BoundWindowValue::Expr { bound: b, ty }, col)
+                        }
+                    };
+                    let (default_bound, default_column, default_ty) = match default_bare {
+                        Some((index, c)) => (None, Some(index), c.ty.clone()),
+                        None => {
+                            let (b, _ty, col) = bind_projection_expr(d, schema, udfs, node_budget)?;
+                            let col = col.ok_or_else(mismatch)?;
+                            if lag_lead_value_type_unsupported(&col) {
+                                return Err(unsupported());
+                            }
+                            (Some(b), None, col)
+                        }
+                    };
+                    let unified =
+                        unify_lag_lead_types(&value_ty, &default_ty).ok_or_else(mismatch)?;
+                    return Ok(BoundWindowOffsetArgs {
+                        value: value_bound,
+                        offset,
+                        default: default_bound,
+                        default_column,
+                        result_type: Some(unified),
+                        uses_pseudo_id,
+                    });
+                }
+                Err(e) => return Err(e),
+            }
         }
         None => {
             let (v, ty, col) = bind_projection_expr(&args.value, schema, udfs, node_budget)?;
@@ -9913,6 +10035,7 @@ fn bind_window_offset_args(
         value: BoundWindowValue::Expr { bound: value, ty },
         offset,
         default,
+        default_column: None,
         result_type: col,
         uses_pseudo_id,
     })
