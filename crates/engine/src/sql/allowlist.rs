@@ -2155,6 +2155,17 @@ pub trait TableLookup {
         Ok(false)
     }
 
+    /// 具体化 CTE の本文が読む表について、具体化結果では再現できない列の性質を返す
+    /// （Issue #1860。`VECTOR`／`ARRAY` 列・実カラム `id` の併存）。既定実装は何も無し
+    /// （判定できない lookup は具体化経路へ進む）。
+    fn table_materialization_hazards(
+        &self,
+        name: &str,
+    ) -> Result<crate::catalog::TableMaterializationHazards, SqlSurfaceError> {
+        let _ = name;
+        Ok(crate::catalog::TableMaterializationHazards::default())
+    }
+
     /// 評価後射影形ビューの本文を参照時に再検証する入れ子の深さ（Issue #1411。
     /// 既定は 0）。評価後射影形ビューの連鎖（`sql::view::resolve_from` が本文を再検証する
     /// たびに +1 するラッパーが上書きする）を `MAX_VIEW_NESTING_DEPTH` で打ち切り、
@@ -21581,6 +21592,7 @@ fn materialized_cte_statement(
     )
     .ok()?;
     let body_table = body.table_name().to_string();
+    let body_projection = def.body.projection.clone();
     let body = Box::new(Statement::Scan(body));
     let view_name = def.name.clone();
     let stmt = match main {
@@ -21601,6 +21613,29 @@ fn materialized_cte_statement(
             // 判定できない場合（照会失敗）も具体化せずインラインへ戻す（結果は等しい）。
             if v.outer_depends_on_order()
                 && lookup.table_has_non_byte_collation(&body_table).ok()?
+            {
+                return None;
+            }
+            // 本文が VECTOR／ARRAY 列を結果に含み、外側が述語・並べ替え・集計・列名指定で
+            // 参照しうる場合、具体化後は参照不能列（未知列拒否）になる。また `SELECT *` が
+            // 疑似列 `id` と実カラム `id` の 2 列を返す本文は、外側の列名解決が `42702` になる
+            // （インラインは実カラム優先で解決できる）。いずれもインライン展開へ戻す。
+            let hazards = lookup.table_materialization_hazards(&body_table).ok()?;
+            let outer_passthrough_all = matches!(
+                &v.outer,
+                BufferedOuter::Rows(rows) if matches!(rows.projection, Projection::All)
+            ) && !v.outer_depends_on_order();
+            let hits_unevaluable = match &body_projection {
+                Projection::All | Projection::Items(_) => !hazards.unevaluable_columns.is_empty(),
+                Projection::Columns(names) => names
+                    .iter()
+                    .any(|n| hazards.unevaluable_columns.iter().any(|u| u == n)),
+            };
+            if hits_unevaluable && !outer_passthrough_all {
+                return None;
+            }
+            if matches!(body_projection, Projection::All | Projection::Items(_))
+                && hazards.declares_real_id
             {
                 return None;
             }

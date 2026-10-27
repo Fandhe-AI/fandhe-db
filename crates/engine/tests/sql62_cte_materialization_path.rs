@@ -342,3 +342,48 @@ fn collated_table_falls_back_to_inline() {
         assert_eq!(render(&mat), render(&plain), "template={template}");
     }
 }
+
+/// 本文が VECTOR 列を結果に含み外側が述語で参照する形は、具体化後に参照不能列（未知列拒否）
+/// になるため、インライン展開へ戻って従来どおり成功する（Issue #1860 レビュー指摘）。
+#[test]
+fn vector_column_predicate_falls_back_to_inline() {
+    let (core, _g) = open_with(None);
+    let template =
+        "WITH x AS {h}(SELECT * FROM docs) SELECT embedding FROM x WHERE lang = 'ja' LIMIT 2";
+    let plain = query(&core, "alice", &template.replace("{h}", "")).expect("plain");
+    let mat = query(&core, "alice", &template.replace("{h}", "MATERIALIZED "))
+        .expect("fallback must succeed");
+    assert_eq!(render(&mat), render(&plain));
+}
+
+/// 実カラム `id` を宣言する表の `SELECT *` 本文は、具体化すると外側の `id` 解決が `42702` に
+/// なるため、実カラム優先で解決するインライン展開へ戻る（Issue #1860 レビュー指摘）。
+#[test]
+fn real_id_column_star_body_falls_back_to_inline() {
+    let path = unique_db_path("sql62-cte-mat-real-id");
+    let _g = CleanupGuard(path.clone());
+    let storage = Storage::open(&path).expect("open storage");
+    let core = new_core(storage);
+    let mut session = SessionState::default();
+    session.allow_ddl();
+    core.execute_sql_in_session(
+        &ctx("alice"),
+        &mut session,
+        "CREATE TABLE rt (id BIGINT PRIMARY KEY, s TEXT)",
+    )
+    .expect("create table");
+    for i in 1..=3 {
+        core.execute_sql_in_session(
+            &ctx("alice"),
+            &mut SessionState::default(),
+            &format!("INSERT INTO rt (id, s) VALUES ({i}, 'v{i}') USING OPERATION_ID 'rid-{i}'"),
+        )
+        .expect("insert");
+    }
+    let template = "WITH x AS {h}(SELECT * FROM rt) SELECT id FROM x LIMIT 2";
+    let plain = query(&core, "alice", &template.replace("{h}", "")).expect("plain");
+    let mat = query(&core, "alice", &template.replace("{h}", "MATERIALIZED "))
+        .expect("fallback must succeed");
+    assert!(!plain.rows.is_empty());
+    assert_eq!(render(&mat), render(&plain));
+}
