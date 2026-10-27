@@ -301,6 +301,93 @@ fn wire_recursive_cte_extended_query_describes_and_executes() {
         }
     }
 }
+// ---- SEARCH DEPTH／BREADTH FIRST 句（SQL-35・Issue #2213）----
+
+const RECURSIVE_SEARCH_DEPTH: &str = "WITH RECURSIVE r(n) AS (SELECT 1 UNION ALL \
+     SELECT n + 1 FROM r WHERE n < 3) SEARCH DEPTH FIRST BY n SET o \
+     SELECT n, o FROM r ORDER BY o";
+const RECURSIVE_SEARCH_BREADTH: &str = "WITH RECURSIVE r(n) AS (SELECT 1 UNION ALL \
+     SELECT n + 1 FROM r WHERE n < 3) SEARCH BREADTH FIRST BY n SET o \
+     SELECT n, o FROM r ORDER BY o";
+
+/// 順序列の型 OID は深さ優先が `record[]`（2287）・幅優先が `record`（2249）で、値は PostgreSQL の
+/// `array_out`／`record_out` 形式のテキスト。
+#[test]
+fn wire_recursive_search_advertises_record_oids_and_text_values() {
+    let (core, _guard) = new_core_with_docs_table();
+    let users_path = write_user_store_file(&[("alice", "tenant-a", "correct-horse")]);
+    let store = UserStore::load_from_file(&users_path).expect("valid user store");
+    let addr = spawn_server_with_engine_and_store(store, core);
+    let mut stream = authenticate_to_ready_for_query(addr, "alice", "correct-horse");
+
+    for (sql, oid, expected) in [
+        (
+            RECURSIVE_SEARCH_DEPTH,
+            2287,
+            ["{(1)}", "{(1),(2)}", "{(1),(2),(3)}"],
+        ),
+        (RECURSIVE_SEARCH_BREADTH, 2249, ["(0,1)", "(1,2)", "(2,3)"]),
+    ] {
+        send_simple_query(&mut stream, sql);
+        let columns = read_row_description_with_types(&mut stream);
+        assert_eq!(columns.len(), 2, "{sql}");
+        assert_eq!(columns[1], ("o".to_string(), oid, -1), "{sql}");
+        for (i, want) in expected.iter().enumerate() {
+            let row = read_data_row(&mut stream);
+            assert_eq!(row[0], Some((i + 1).to_string()), "{sql}");
+            assert_eq!(row[1].as_deref(), Some(*want), "{sql}");
+        }
+        assert_eq!(read_command_complete(&mut stream), "SELECT 3");
+        read_ready_for_query(&mut stream);
+    }
+}
+
+/// 順序列のバイナリ形式（`record_send`）は未対応: 結果列へ binary を要求すると `0A000` で当該文だけ
+/// 拒否され、接続は維持される。
+#[test]
+fn wire_recursive_search_binary_result_format_is_0a000() {
+    let (core, _guard) = new_core_with_docs_table();
+    let users_path = write_user_store_file(&[("alice", "tenant-a", "correct-horse")]);
+    let store = UserStore::load_from_file(&users_path).expect("valid user store");
+    let addr = spawn_server_with_engine_and_store(store, core);
+    let mut stream = authenticate_to_ready_for_query(addr, "alice", "correct-horse");
+
+    send_length_prefixed_message(
+        &mut stream,
+        b'P',
+        &parse_body("s1", RECURSIVE_SEARCH_DEPTH, 0),
+    );
+    let (kind, _) = read_message(&mut stream);
+    assert_eq!(kind, b'1', "ParseComplete");
+    // 全結果列を binary（format code 1）で要求する Bind。
+    let mut bind = Vec::new();
+    bind.extend_from_slice(b"p1\0s1\0");
+    bind.extend_from_slice(&0i16.to_be_bytes()); // param format codes
+    bind.extend_from_slice(&0i16.to_be_bytes()); // params
+    bind.extend_from_slice(&1i16.to_be_bytes()); // result format code count
+    bind.extend_from_slice(&1i16.to_be_bytes()); // binary
+    send_length_prefixed_message(&mut stream, b'B', &bind);
+    let (kind, body) = read_message(&mut stream);
+    assert_eq!(kind, b'E', "ErrorResponse");
+    assert!(
+        String::from_utf8_lossy(&body).contains("0A000"),
+        "{}",
+        String::from_utf8_lossy(&body)
+    );
+    send_length_prefixed_message(&mut stream, b'S', b"");
+    let (kind, _) = read_message(&mut stream);
+    assert_eq!(kind, b'Z');
+
+    // 回復後、同じ接続でテキスト形式は通る。
+    send_simple_query(&mut stream, RECURSIVE_SEARCH_DEPTH);
+    let _ = read_row_description(&mut stream);
+    for _ in 0..3 {
+        let _ = read_data_row(&mut stream);
+    }
+    assert_eq!(read_command_complete(&mut stream), "SELECT 3");
+    read_ready_for_query(&mut stream);
+}
+
 // ---- データ変更 CTE の実行（SQL-63・Issue #1876）----
 
 fn insert_doc(stream: &mut std::net::TcpStream, id: u32, lang: &str) {

@@ -597,6 +597,12 @@ wire_type_enum! {
         /// `ColumnMeta::Scalar{ty: Array(<jsonb>)}`（`_jsonb`。TABLE-35・WIRE-13・Issue #1606）。
         /// 次元数は OID に影響しない（PostgreSQL と同じ）。テキスト表現のみ対応。
         JsonbArray,
+        /// `ColumnMeta::Record{array: false}`（`record`。再帰 CTE の `SEARCH BREADTH FIRST` 順序列。
+        /// SQL-35・Issue #2213）。テキスト表現のみ対応（`record_out` 形式）。
+        Record,
+        /// `ColumnMeta::Record{array: true}`（`_record`。再帰 CTE の `SEARCH DEPTH FIRST` 順序列。
+        /// SQL-35・Issue #2213）。テキスト表現のみ対応（`array_out` 形式）。
+        RecordArray,
     }
 }
 
@@ -638,6 +644,8 @@ impl WireType {
             WireType::ByteaArray => 1001,
             WireType::JsonArray => 199,
             WireType::JsonbArray => 3807,
+            WireType::Record => 2249,
+            WireType::RecordArray => 2287,
         }
     }
 
@@ -663,7 +671,9 @@ impl WireType {
             | WireType::NumericArray
             | WireType::ByteaArray
             | WireType::JsonArray
-            | WireType::JsonbArray => -1,
+            | WireType::JsonbArray
+            | WireType::Record
+            | WireType::RecordArray => -1,
             WireType::Int2 => 2,
             WireType::Int4 | WireType::Float4 | WireType::Date => 4,
             WireType::Int8
@@ -712,6 +722,8 @@ impl WireType {
             WireType::ByteaArray => "_bytea",
             WireType::JsonArray => "_json",
             WireType::JsonbArray => "_jsonb",
+            WireType::Record => "record",
+            WireType::RecordArray => "_record",
         }
     }
 
@@ -764,7 +776,9 @@ impl WireType {
             | WireType::NumericArray
             | WireType::ByteaArray
             | WireType::JsonArray
-            | WireType::JsonbArray => None,
+            | WireType::JsonbArray
+            | WireType::Record
+            | WireType::RecordArray => None,
         }
     }
 
@@ -818,7 +832,10 @@ impl WireType {
             | WireType::NumericArray
             | WireType::ByteaArray
             | WireType::JsonArray
-            | WireType::JsonbArray => false,
+            | WireType::JsonbArray
+            // レコード・レコード配列のバイナリ形式（`record_send`）は対象外（SQL-35・Issue #2213）。
+            | WireType::Record
+            | WireType::RecordArray => false,
         }
     }
 }
@@ -839,6 +856,8 @@ pub(crate) fn column_binary_support(meta: &ColumnMeta) -> bool {
         ColumnMeta::Computed { ty: None, .. } => false,
         // 別名付き `id` は numeric 公告（`Id` と同じくバイナリ対応）。
         ColumnMeta::AliasedId { .. } => column_wire_type(meta).supports_binary(),
+        // SEARCH 順序列（record／record[]）はバイナリ非対応（fail-closed で `0A000`。SQL-35）。
+        ColumnMeta::Record { .. } => false,
     }
 }
 
@@ -889,9 +908,10 @@ pub(crate) fn column_type_modifier(meta: &ColumnMeta) -> Result<i32, EncodeError
         ColumnMeta::Scalar { ty, .. } | ColumnMeta::Computed { ty: Some(ty), .. } => {
             scalar_type_modifier(ty)
         }
-        ColumnMeta::Id | ColumnMeta::AliasedId { .. } | ColumnMeta::Computed { ty: None, .. } => {
-            Ok(-1)
-        }
+        ColumnMeta::Id
+        | ColumnMeta::AliasedId { .. }
+        | ColumnMeta::Computed { ty: None, .. }
+        | ColumnMeta::Record { .. } => Ok(-1),
     }
 }
 
@@ -945,6 +965,14 @@ pub(crate) fn column_wire_type(meta: &ColumnMeta) -> WireType {
             Some(t) => scalar_wire_type(t),
             None => WireType::Text,
         },
+        // 再帰 CTE の SEARCH 順序列（幅優先は `record`、深さ優先は `record[]`。SQL-35・Issue #2213）。
+        ColumnMeta::Record { array, .. } => {
+            if *array {
+                WireType::RecordArray
+            } else {
+                WireType::Record
+            }
+        }
     }
 }
 
@@ -1026,7 +1054,9 @@ pub(crate) fn column_name(meta: &ColumnMeta) -> &str {
     match meta {
         ColumnMeta::Id => "id",
         ColumnMeta::Scalar { name, .. } => name.as_str(),
-        ColumnMeta::Computed { name, .. } | ColumnMeta::AliasedId { name } => name.as_str(),
+        ColumnMeta::Computed { name, .. }
+        | ColumnMeta::AliasedId { name }
+        | ColumnMeta::Record { name, .. } => name.as_str(),
     }
 }
 
@@ -1120,17 +1150,61 @@ pub(crate) fn cell_to_text_for_column_in_tz(
     cell: &Cell,
     tz: &engine::datetime::SessionTimeZone,
 ) -> Result<Option<String>, EncodeError> {
+    if let ColumnMeta::Record { fields, array, .. } = meta {
+        return match (cell, *array) {
+            (Cell::Null, _) => Ok(None),
+            (Cell::Record(cells), false) => Ok(Some(record_cell_text(fields, cells, tz)?)),
+            (Cell::RecordArray(items), true) => {
+                let mut elements = Vec::new();
+                elements.try_reserve(items.len()).map_err(|_| EncodeError)?;
+                for rec in items {
+                    elements.push(record_cell_text(fields, rec, tz)?);
+                }
+                Ok(Some(engine::sql::record_text::record_array_out(&elements)))
+            }
+            _ => Err(EncodeError),
+        };
+    }
     if let Cell::Float(f) = cell {
         if column_wire_type(meta) == WireType::Float4 {
-            let narrowed = *f as f32;
-            let exact = (narrowed.is_nan() && f.is_nan()) || f64::from(narrowed) == *f;
-            if !exact {
-                return Err(EncodeError);
-            }
-            return Ok(Some(engine::scalar_float::format_real(narrowed)));
+            return Ok(Some(format_float4(*f)?));
         }
     }
     cell_to_text(cell, tz)
+}
+
+/// `float4` 公告列の `Cell::Float` を整形する。f32 へ無損失に縮められない値は `EncodeError`。
+fn format_float4(f: f64) -> Result<String, EncodeError> {
+    let narrowed = f as f32;
+    let exact = (narrowed.is_nan() && f.is_nan()) || f64::from(narrowed) == f;
+    if !exact {
+        return Err(EncodeError);
+    }
+    Ok(engine::scalar_float::format_real(narrowed))
+}
+
+/// `SEARCH` 順序列のレコード 1 件（`fields` はフィールドの宣言型。`None` は行 id 型）を
+/// `record_out` 形式へ整形する（SQL-35・Issue #2213）。フィールド数の食い違い・想定外のセルは
+/// `EncodeError`（fail-closed）。
+fn record_cell_text(
+    fields: &[Option<engine::catalog::ColumnType>],
+    cells: &[Cell],
+    tz: &engine::datetime::SessionTimeZone,
+) -> Result<String, EncodeError> {
+    if fields.len() != cells.len() {
+        return Err(EncodeError);
+    }
+    let mut texts: Vec<Option<String>> = Vec::new();
+    texts.try_reserve(cells.len()).map_err(|_| EncodeError)?;
+    for (ty, cell) in fields.iter().zip(cells.iter()) {
+        let text = match (cell, ty) {
+            (Cell::Float(f), Some(engine::catalog::ColumnType::Real)) => Some(format_float4(*f)?),
+            (Cell::Record(_) | Cell::RecordArray(_), _) => return Err(EncodeError),
+            _ => cell_to_text(cell, tz)?,
+        };
+        texts.push(text);
+    }
+    Ok(engine::sql::record_text::record_out(&texts))
 }
 
 /// `Cell` の text フォーマット表現。`Null` は `None`（`DataRow` の -1 長へ写像）。
@@ -1199,6 +1273,9 @@ fn cell_to_text(
         // `8-4-4-4-12`）をそのまま送る（TABLE-13〔検討中〕・TASK-197、
         // Issue #887・U4）。
         Cell::Uuid(u) => Ok(Some(u.to_string())),
+        // SEARCH 順序列は列メタ（フィールド型）が要るため [`cell_to_text_for_column_in_tz`] だけが
+        // 整形する。メタ無しで到達したら fail-closed（SQL-35・Issue #2213）。
+        Cell::Record(_) | Cell::RecordArray(_) => Err(EncodeError),
     }
 }
 
@@ -2752,7 +2829,7 @@ mod tests {
     /// 保証はマクロが担う）。
     #[test]
     fn wire_type_all_is_exhaustive() {
-        assert_eq!(WireType::ALL.len(), 32);
+        assert_eq!(WireType::ALL.len(), 34);
     }
 
     /// Parse の宣言 OID 写像（Issue #2436・WIRE-24 ポインタ）: 全 variant が OID から
@@ -2761,8 +2838,9 @@ mod tests {
     fn wire_type_round_trips_through_oid_and_declared_type() {
         for t in WireType::ALL {
             assert_eq!(WireType::from_oid(t.oid()), Some(t));
-            // 配列型は宣言型を持たず（None）、Parse では `0A000`（WIRE-24・Issue #1606）。
-            let is_array = t.pg_type_name().starts_with('_');
+            // 配列型・`record` は宣言型を持たず（None）、Parse では `0A000`（WIRE-24・Issue #1606。
+            // `record` は再帰 CTE の SEARCH 順序列専用の公告型。SQL-35・Issue #2213）。
+            let is_array = t.pg_type_name().starts_with('_') || t == WireType::Record;
             assert_eq!(t.declared_param_type().is_none(), is_array, "{t:?}");
         }
         assert_eq!(WireType::from_oid(0), None);
@@ -2775,7 +2853,7 @@ mod tests {
     /// そのものを外部オラクルで検証する（WIRE-13・TASK-200・Issue #895）。
     #[test]
     fn wire_type_table_matches_postgres_builtin_catalog() {
-        let expected: [(WireType, i32, i16, &str); 32] = [
+        let expected: [(WireType, i32, i16, &str); 34] = [
             (WireType::Numeric, 1700, -1, "numeric"),
             (WireType::Text, 25, -1, "text"),
             (WireType::Varchar, 1043, -1, "varchar"),
@@ -2808,6 +2886,8 @@ mod tests {
             (WireType::ByteaArray, 1001, -1, "_bytea"),
             (WireType::JsonArray, 199, -1, "_json"),
             (WireType::JsonbArray, 3807, -1, "_jsonb"),
+            (WireType::Record, 2249, -1, "record"),
+            (WireType::RecordArray, 2287, -1, "_record"),
         ];
         for (wire_type, oid, typlen, name) in expected {
             assert_eq!(wire_type.oid(), oid, "oid mismatch for {name}");

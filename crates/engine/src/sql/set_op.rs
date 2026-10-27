@@ -114,6 +114,8 @@ fn cell_payload_bytes(cell: &Cell) -> usize {
         Cell::Numeric(d) => d.to_string().len(),
         Cell::Vector(v) => v.len().saturating_mul(std::mem::size_of::<f32>()),
         Cell::Array(arr) => arr.approx_heap_bytes(),
+        // SEARCH 順序列（SQL-35・Issue #2213）。集合演算へは到達しないが、予算計上は過小にしない。
+        Cell::Record(_) | Cell::RecordArray(_) => crate::sql::join::cell_payload_bytes(cell),
         Cell::Null
         | Cell::Integer(_)
         | Cell::Float(_)
@@ -168,7 +170,9 @@ fn columns_compatible(a: &ColumnMeta, b: &ColumnMeta) -> bool {
             ColumnMeta::Scalar { ty, .. } => Some(ty),
             ColumnMeta::Computed { ty: Some(ty), .. } => Some(ty),
             ColumnMeta::AliasedId { .. } => Some(&crate::sql::exec::ALIASED_ID_TYPE),
-            ColumnMeta::Id | ColumnMeta::Computed { ty: None, .. } => None,
+            ColumnMeta::Id | ColumnMeta::Computed { ty: None, .. } | ColumnMeta::Record { .. } => {
+                None
+            }
         }
     }
     match (a, b) {
@@ -453,6 +457,12 @@ fn row_key(row: &ResultRow) -> Result<Vec<u8>, SqlSurfaceError> {
                     detail: "VECTOR column reached set operation row key encoding".to_string(),
                 });
             }
+            // SEARCH 順序列（SQL-35・Issue #2213）は集合演算へ到達させない（fail-closed）。
+            Cell::Record(_) | Cell::RecordArray(_) => {
+                return Err(SqlSurfaceError::Internal {
+                    detail: "record column reached set operation row key encoding".to_string(),
+                });
+            }
         }
     }
     Ok(out)
@@ -522,6 +532,11 @@ fn row_key_len(row: &ResultRow) -> Result<usize, SqlSurfaceError> {
             Cell::Vector(_) => {
                 return Err(SqlSurfaceError::Internal {
                     detail: "VECTOR column reached set operation row key encoding".to_string(),
+                });
+            }
+            Cell::Record(_) | Cell::RecordArray(_) => {
+                return Err(SqlSurfaceError::Internal {
+                    detail: "record column reached set operation row key encoding".to_string(),
                 });
             }
         };

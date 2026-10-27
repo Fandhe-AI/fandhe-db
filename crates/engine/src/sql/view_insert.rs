@@ -289,7 +289,8 @@ pub(crate) fn apply_public_names(columns: &mut [ColumnMeta], public_names: Optio
         match meta {
             ColumnMeta::Scalar { name, .. }
             | ColumnMeta::Computed { name, .. }
-            | ColumnMeta::AliasedId { name } => *name = public.clone(),
+            | ColumnMeta::AliasedId { name }
+            | ColumnMeta::Record { name, .. } => *name = public.clone(),
             ColumnMeta::Id => {}
         }
     }

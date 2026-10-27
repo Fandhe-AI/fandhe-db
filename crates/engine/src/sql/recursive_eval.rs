@@ -16,6 +16,11 @@
 //!    再帰項を再実行し、作業表が空になったら終了する。出力順は生成順（アンカー行 → 反復 1 →
 //!    反復 2 …）で固定する（`sort_unstable*` は使わない）。
 //!
+//! 4. `SEARCH DEPTH／BREADTH FIRST` 句（#2213）: 反復中に、各行の親（再帰行を生んだ作業表の行）の順序列から
+//!    自分の順序列（深さ優先は経路の `record[]`、幅優先は `(深さ, BY 列...)` の `record`）を作り、結果列の
+//!    末尾へ足す（[`SearchPlan`]）。順序列は作業表のスキーマには含めない。経路は深さに比例して増えるため、
+//!    複製の前に共有バイト予算へ計上する。
+//!
 //! RLS-10 (b) の不変条件: 基底表の読み取りは、参照セッション自身の `PolicyContext` と同一の
 //! `read_txn` で既存の走査経路（RLS 暗黙適用）を通る。作業表は前回反復の可視行から作った値
 //! だけで構成されるため、停止時点・反復回数・`54000` の有無は可視行だけで決まり、他テナントの
@@ -33,7 +38,7 @@ use crate::catalog::{ColumnType, RowIdentity, TableSchema};
 use crate::policy::PolicyContext;
 
 use super::allowlist::{
-    SetOperator, SqlSurfaceError, Statement, ValidatedRecursiveCte, ValidatedScan,
+    SearchClause, SetOperator, SqlSurfaceError, Statement, ValidatedRecursiveCte, ValidatedScan,
 };
 use super::exec::{computed_column_meta, Cell, ColumnMeta, QueryResult, ResultRow};
 use super::expr_program::{ExprProgram, StackValue};
@@ -41,7 +46,8 @@ use super::join::{cell_payload_bytes, prepare_join, JoinLimits, PreparedJoin};
 use super::parser::{BoundScan, ProjectedColumn};
 use super::udf_call::UdfRegistry;
 use super::view_buffered::{
-    normalize_cell, rename_body_columns, synth_schema, where_matches_for_row, with_scanned,
+    column_name, normalize_cell, rename_body_columns, synth_schema, where_matches_for_row,
+    with_scanned,
 };
 
 /// 再帰評価の実行上限。
@@ -341,13 +347,16 @@ impl ScanTerm {
     }
 
     /// 作業表の行 `rows` に `WHERE` と射影を適用した行を返す。1 行ごとに、結果へ加える前に
-    /// `budget` で行数・バイト数を判定する（超過は `54000`。部分結果は返さない）。
+    /// `budget` で行数・バイト数を判定する（超過は `54000`。部分結果は返さない）。`parents` が
+    /// `Some` のときは、出力行ごとに入力行（`rows` 内の位置）を追記する（`SEARCH` 句が親行を引く
+    /// ために使う。SQL-35・Issue #2213）。
     fn eval_over_rows(
         &self,
         types: &[Option<ColumnType>],
         rows: &[ResultRow],
         budget: &mut RowBudget,
         charge: Charge,
+        mut parents: Option<&mut Vec<usize>>,
     ) -> Result<Vec<ResultRow>, SqlSurfaceError> {
         let referenced = vec![true; types.len()];
         let mut where_scratch: Vec<StackValue> = Vec::new();
@@ -381,6 +390,12 @@ impl ScanTerm {
                 out.try_reserve(1).map_err(|_| {
                     SqlSurfaceError::payload_too_large("recursive query exceeds the row limit")
                 })?;
+                if let Some(parents) = parents.as_deref_mut() {
+                    parents.try_reserve(1).map_err(|_| {
+                        SqlSurfaceError::payload_too_large("recursive query exceeds the row limit")
+                    })?;
+                    parents.push(n);
+                }
                 out.push(ResultRow {
                     id: 0,
                     score: 0.0,
@@ -406,11 +421,218 @@ enum Step<'a> {
 
 /// 計画の結果（Describe と Execute が共有する）。
 struct Prepared<'a> {
-    /// CTE の公開列（`column_aliases` 適用後・型合成後）。
+    /// CTE の公開列（`column_aliases` 適用後・型合成後。`SEARCH` 句があれば末尾に順序列）。
     columns: Vec<ColumnMeta>,
+    /// `SEARCH` 句の計画（順序列の生成に使う）。
+    search: Option<SearchPlan>,
     /// 作業表の列型（`synth_schema` の `types`）。
     work_types: Vec<Option<ColumnType>>,
     step: Step<'a>,
+}
+
+/// `SEARCH` 句の計画（SQL-35・Issue #2213）。BY 列は CTE の公開列の添字で持ち、順序列は
+/// PostgreSQL の書き換えと同じ意味で生成する: 深さ優先は「根から当該行までの BY 列の行値の配列」
+/// （アンカー行は `ARRAY[ROW(by...)]`、再帰行は親の経路の末尾へ自分の `ROW(by...)` を足す）、
+/// 幅優先は `ROW(深さ, by...)`（アンカー行は深さ 0、再帰行は親の深さ + 1）。
+struct SearchPlan {
+    breadth_first: bool,
+    by_idx: Vec<usize>,
+}
+
+/// `SEARCH` 句の BY 列・SET 名を CTE の公開列に対して解決し、計画と順序列の列メタを返す。
+/// エラーの SQLSTATE は PostgreSQL（`parse_cte.c`）に合わせる: BY 列が列名リストに無い・SET 名が列と
+/// 衝突は `42601`、BY 列の重複は `42701`。並べ替えできない型（`VECTOR`・`ARRAY`・`JSON`・型なし等）の
+/// BY 列は、PostgreSQL が並べ替え時まで遅延するところを計画時に固定文言の `0A000` で拒否する
+/// （fail-closed。Describe と Execute が同じ検査を通る）。
+fn plan_search(
+    clause: &SearchClause,
+    columns: &[ColumnMeta],
+) -> Result<(SearchPlan, ColumnMeta), SqlSurfaceError> {
+    let mut by_idx: Vec<usize> = Vec::new();
+    by_idx
+        .try_reserve(clause.by.len())
+        .map_err(|_| SqlSurfaceError::payload_too_large("too many columns in the SEARCH clause"))?;
+    for name in &clause.by {
+        let mut found: Option<usize> = None;
+        for (i, meta) in columns.iter().enumerate() {
+            if column_name(meta).eq_ignore_ascii_case(name) {
+                if found.is_some() {
+                    return Err(SqlSurfaceError::ambiguous_column(name.clone()));
+                }
+                found = Some(i);
+            }
+        }
+        let i = found.ok_or_else(|| {
+            SqlSurfaceError::unsupported(format!(
+                "search column \"{name}\" not in WITH query column list"
+            ))
+        })?;
+        if by_idx.contains(&i) {
+            return Err(SqlSurfaceError::duplicate_column(name.clone()));
+        }
+        by_idx.push(i);
+    }
+    if columns
+        .iter()
+        .any(|m| column_name(m).eq_ignore_ascii_case(&clause.set))
+    {
+        return Err(SqlSurfaceError::unsupported(format!(
+            "search sequence column name \"{}\" already used in WITH query column list",
+            clause.set
+        )));
+    }
+    let mut fields: Vec<Option<ColumnType>> = Vec::new();
+    fields
+        .try_reserve(by_idx.len().saturating_add(1))
+        .map_err(|_| SqlSurfaceError::payload_too_large("too many columns in the SEARCH clause"))?;
+    if clause.breadth_first {
+        fields.push(Some(ColumnType::BigInt));
+    }
+    for &i in &by_idx {
+        let unsupported =
+            || unsupported_term("this column type cannot be used as a SEARCH BY column");
+        let meta = columns
+            .get(i)
+            .ok_or_else(|| internal("search column out of range"))?;
+        let field = match meta {
+            // 行 id 型の列（セルは `Cell::Integer(u64)`）。
+            ColumnMeta::Id | ColumnMeta::AliasedId { .. } => None,
+            ColumnMeta::Scalar { ty, .. } | ColumnMeta::Computed { ty: Some(ty), .. } => {
+                if super::join::values::cmp_class(Some(ty)).is_none() {
+                    return Err(unsupported());
+                }
+                Some(ty.clone())
+            }
+            ColumnMeta::Computed { ty: None, .. } | ColumnMeta::Record { .. } => {
+                return Err(unsupported());
+            }
+        };
+        fields.push(field);
+    }
+    Ok((
+        SearchPlan {
+            breadth_first: clause.breadth_first,
+            by_idx,
+        },
+        ColumnMeta::Record {
+            name: clause.set.clone(),
+            fields,
+            array: !clause.breadth_first,
+        },
+    ))
+}
+
+/// レコードのフィールド列が占めるバイト数の見積もり（確保前の予算計上用。借用セルから算出する）。
+fn fields_bytes(cells: &[&Cell]) -> usize {
+    cells.iter().fold(0usize, |acc, c| {
+        acc.saturating_add(std::mem::size_of::<Cell>())
+            .saturating_add(cell_payload_bytes(c))
+    })
+}
+
+impl SearchPlan {
+    /// 行の BY 列のセル（借用）を取り出す。添字が行の範囲外なら `Internal`（fail-closed）。
+    fn by_cells<'r>(&self, row: &'r ResultRow) -> Result<Vec<&'r Cell>, SqlSurfaceError> {
+        self.by_idx
+            .iter()
+            .map(|&i| {
+                row.cells
+                    .get(i)
+                    .ok_or_else(|| internal("search column index out of range"))
+            })
+            .collect()
+    }
+
+    /// BY 列のセルを複製してフィールド列を作る（呼び出し元が確保前に予算へ計上済み）。
+    fn clone_fields(by: &[&Cell], lead: Option<Cell>) -> Result<Vec<Cell>, SqlSurfaceError> {
+        let mut out: Vec<Cell> = Vec::new();
+        out.try_reserve_exact(by.len().saturating_add(usize::from(lead.is_some())))
+            .map_err(|_| {
+                SqlSurfaceError::payload_too_large(
+                    "recursive query exceeds the shared result byte budget",
+                )
+            })?;
+        out.extend(lead);
+        out.extend(by.iter().map(|c| (*c).clone()));
+        Ok(out)
+    }
+
+    /// アンカー行の順序列。確保前に共有予算へ計上する（超過は `54000`）。
+    fn initial(&self, row: &ResultRow, budget: &mut RowBudget) -> Result<Cell, SqlSurfaceError> {
+        let by = self.by_cells(row)?;
+        if self.breadth_first {
+            let bytes = std::mem::size_of::<Cell>()
+                .saturating_add(std::mem::size_of::<Cell>())
+                .saturating_add(fields_bytes(&by));
+            budget.reserve(bytes, Charge::Retained)?;
+            Ok(Cell::Record(Self::clone_fields(
+                &by,
+                Some(Cell::SignedInteger(0)),
+            )?))
+        } else {
+            let bytes = std::mem::size_of::<Cell>()
+                .saturating_add(std::mem::size_of::<Vec<Cell>>())
+                .saturating_add(fields_bytes(&by));
+            budget.reserve(bytes, Charge::Retained)?;
+            let mut path: Vec<Vec<Cell>> = Vec::new();
+            path.try_reserve_exact(1).map_err(|_| {
+                SqlSurfaceError::payload_too_large(
+                    "recursive query exceeds the shared result byte budget",
+                )
+            })?;
+            path.push(Self::clone_fields(&by, None)?);
+            Ok(Cell::RecordArray(path))
+        }
+    }
+
+    /// 再帰行（親の順序列 `parent`・新しい行 `row`）の順序列。深さ優先は経路が深さに比例して増える
+    /// ため、複製する **前** に親の経路ぶんを含めて共有予算へ計上する（超過は `54000`）。
+    fn child(
+        &self,
+        parent: &Cell,
+        row: &ResultRow,
+        budget: &mut RowBudget,
+    ) -> Result<Cell, SqlSurfaceError> {
+        let by = self.by_cells(row)?;
+        match (self.breadth_first, parent) {
+            (true, Cell::Record(parent_fields)) => {
+                let depth = match parent_fields.first() {
+                    Some(Cell::SignedInteger(d)) => d
+                        .checked_add(1)
+                        .ok_or_else(|| internal("recursive search depth overflow"))?,
+                    _ => return Err(internal("recursive search sequence has no depth")),
+                };
+                let bytes = std::mem::size_of::<Cell>()
+                    .saturating_add(std::mem::size_of::<Cell>())
+                    .saturating_add(fields_bytes(&by));
+                budget.reserve(bytes, Charge::Retained)?;
+                Ok(Cell::Record(Self::clone_fields(
+                    &by,
+                    Some(Cell::SignedInteger(depth)),
+                )?))
+            }
+            (false, Cell::RecordArray(parent_path)) => {
+                let bytes = std::mem::size_of::<Cell>()
+                    .saturating_add(cell_payload_bytes(parent))
+                    .saturating_add(std::mem::size_of::<Vec<Cell>>())
+                    .saturating_add(fields_bytes(&by));
+                budget.reserve(bytes, Charge::Retained)?;
+                let mut path: Vec<Vec<Cell>> = Vec::new();
+                path.try_reserve_exact(parent_path.len().saturating_add(1))
+                    .map_err(|_| {
+                        SqlSurfaceError::payload_too_large(
+                            "recursive query exceeds the shared result byte budget",
+                        )
+                    })?;
+                path.extend(parent_path.iter().cloned());
+                path.push(Self::clone_fields(&by, None)?);
+                Ok(Cell::RecordArray(path))
+            }
+            _ => Err(internal(
+                "recursive search sequence has an unexpected shape",
+            )),
+        }
+    }
 }
 
 /// 再帰項の `ValidatedScan` が作業表上で評価できる形かを検査する。
@@ -657,10 +879,21 @@ fn with_prepared<T>(
     };
     // 再帰項の疑似列 `id` も同じ写像で BIGINT の実列として扱う（アンカー側と対称にする）。
     let rec_work: Vec<ColumnMeta> = rec_columns.iter().map(work_column).collect();
-    let columns = compose_columns(cte, anchor_columns, &work_anchor, &rec_work)?;
+    let mut columns = compose_columns(cte, anchor_columns, &work_anchor, &rec_work)?;
     check_work_types(&rec_work)?;
+    // 順序列は公開列（列名リスト適用後）の末尾へ足す。作業表のスキーマ・再帰項の束縛・列整合には
+    // 含めない（再帰項からは見えない）。
+    let search = match &cte.search {
+        Some(clause) => {
+            let (plan, meta) = plan_search(clause, &columns)?;
+            columns.push(meta);
+            Some(plan)
+        }
+        None => None,
+    };
     f(&Prepared {
         columns,
+        search,
         work_types,
         step,
     })
@@ -706,6 +939,17 @@ pub(crate) fn execute(
         let mut result: Vec<ResultRow> = anchor_rows;
         let mut start = 0usize;
         let mut end = result.len();
+        // `SEARCH` 句の順序列（`result` と同じ添字で並ぶ。最後に各行のセル末尾へ移す）。
+        let search = p.search.as_ref();
+        let mut seqs: Vec<Cell> = Vec::new();
+        if let Some(sp) = search {
+            seqs.try_reserve(result.len()).map_err(|_| {
+                SqlSurfaceError::payload_too_large("recursive query exceeds the row limit")
+            })?;
+            for row in &result {
+                seqs.push(sp.initial(row, &mut budget)?);
+            }
+        }
 
         // JOIN の基底表側は反復によらず同じ行を返す（同一 `read_txn`）ため、ループの前に 1 度だけ読む。
         // 読んだ行は共有予算へ計上する（JOIN 自身の上限〔`join_limits`〕を超えない範囲で保持される）。
@@ -746,10 +990,15 @@ pub(crate) fn execute(
             let working = result
                 .get(start..end)
                 .ok_or_else(|| internal("working table range out of bounds"))?;
+            let mut parents: Vec<usize> = Vec::new();
             let new_rows = match &p.step {
-                Step::Scan(term) => {
-                    term.eval_over_rows(&p.work_types, working, &mut budget, Charge::Retained)?
-                }
+                Step::Scan(term) => term.eval_over_rows(
+                    &p.work_types,
+                    working,
+                    &mut budget,
+                    Charge::Retained,
+                    search.map(|_| &mut parents),
+                )?,
                 Step::Join {
                     prepared,
                     cte_side,
@@ -757,11 +1006,13 @@ pub(crate) fn execute(
                 } => {
                     // 作業表側の行は、側スキャンと同じ束縛（述語・射影）を作業表へ適用して作る
                     // （反復内だけ保持する一時行として同じ共有予算へ計上する）。
+                    let mut side_parents: Vec<usize> = Vec::new();
                     let side_rows = side_term.eval_over_rows(
                         &p.work_types,
                         working,
                         &mut budget,
                         Charge::Scratch,
+                        search.map(|_| &mut side_parents),
                     )?;
                     let slot = sides
                         .get_mut(*cte_side)
@@ -769,9 +1020,21 @@ pub(crate) fn execute(
                     *slot = side_rows;
                     // JOIN の中間結果・出力の確保上限は、保持済みの結果を差し引いた残予算。
                     let step_limits = join_limits.with_budget_cap(budget.remaining_for_join());
-                    let joined = prepared.run_with_sides(&sides, &step_limits)?;
+                    let (joined, side_idx) = prepared.run_with_sides_provenance(
+                        &sides,
+                        &step_limits,
+                        search.map(|_| *cte_side),
+                    )?;
                     if let Some(slot) = sides.get_mut(*cte_side) {
                         slot.clear();
+                    }
+                    // JOIN 出力行 → 作業表側の行 → 作業表の行、の 2 段で親を引く。
+                    if search.is_some() {
+                        parents = side_idx
+                            .iter()
+                            .map(|&k| side_parents.get(k).copied())
+                            .collect::<Option<Vec<usize>>>()
+                            .ok_or_else(|| internal("recursive parent mapping out of range"))?;
                     }
                     budget.clear_scratch();
                     for row in &joined.rows {
@@ -783,9 +1046,38 @@ pub(crate) fn execute(
             result.try_reserve(new_rows.len()).map_err(|_| {
                 SqlSurfaceError::payload_too_large("recursive query exceeds the row limit")
             })?;
+            if let Some(sp) = search {
+                if parents.len() != new_rows.len() {
+                    return Err(internal("recursive parent mapping length mismatch"));
+                }
+                seqs.try_reserve(new_rows.len()).map_err(|_| {
+                    SqlSurfaceError::payload_too_large("recursive query exceeds the row limit")
+                })?;
+                for (row, parent) in new_rows.iter().zip(parents.iter()) {
+                    // `parent` は作業表（`start..end`）内の位置。順序列は `result` と同じ添字。
+                    let parent_seq = start
+                        .checked_add(*parent)
+                        .and_then(|i| seqs.get(i))
+                        .ok_or_else(|| internal("recursive parent sequence out of range"))?;
+                    let seq = sp.child(parent_seq, row, &mut budget)?;
+                    seqs.push(seq);
+                }
+            }
             start = end;
             result.extend(new_rows);
             end = result.len();
+        }
+        if search.is_some() {
+            if seqs.len() != result.len() {
+                return Err(internal("recursive sequence column length mismatch"));
+            }
+            for (row, seq) in result.iter_mut().zip(seqs) {
+                // 倍々の再確保で行のセル配列が 2 倍に膨らまないよう、1 個ぶんだけ確保する。
+                row.cells.try_reserve_exact(1).map_err(|_| {
+                    SqlSurfaceError::payload_too_large("recursive query exceeds the row limit")
+                })?;
+                row.cells.push(seq);
+            }
         }
         Ok(QueryResult {
             columns: p.columns.clone(),
@@ -1059,5 +1351,99 @@ mod tests {
             .expect_err("must be refused");
             assert_eq!(err.wire_code(), "54000", "{body}: {err:?}");
         }
+    }
+    fn search_row(n: i64) -> ResultRow {
+        ResultRow {
+            id: 0,
+            score: 0.0,
+            cells: vec![Cell::SignedInteger(n)],
+        }
+    }
+
+    fn search_columns() -> Vec<ColumnMeta> {
+        vec![ColumnMeta::Scalar {
+            name: "n".to_string(),
+            ty: ColumnType::BigInt,
+        }]
+    }
+
+    /// `SEARCH` の計画（SQL-35・Issue #2213）: 名前解決のエラー（PostgreSQL 17 の SQLSTATE）。
+    #[test]
+    fn plan_search_name_errors() {
+        let clause = |by: &[&str], set: &str| SearchClause {
+            breadth_first: false,
+            by: by.iter().map(|s| (*s).to_string()).collect(),
+            set: set.to_string(),
+        };
+        let cols = search_columns();
+        assert_eq!(
+            plan_search(&clause(&["x"], "o"), &cols)
+                .err()
+                .unwrap()
+                .wire_code(),
+            "42601"
+        );
+        assert_eq!(
+            plan_search(&clause(&["n", "N"], "o"), &cols)
+                .err()
+                .unwrap()
+                .wire_code(),
+            "42701"
+        );
+        assert_eq!(
+            plan_search(&clause(&["n"], "N"), &cols)
+                .err()
+                .unwrap()
+                .wire_code(),
+            "42601"
+        );
+        let (plan, meta) = plan_search(&clause(&["n"], "o"), &cols).unwrap();
+        assert_eq!(plan.by_idx, vec![0]);
+        assert!(matches!(meta, ColumnMeta::Record { array: true, .. }));
+    }
+
+    /// 深さ優先の経路は深さに比例して増えるため、複製の前に共有予算へ計上し、超過は `54000`。
+    #[test]
+    fn depth_first_path_growth_is_charged_before_cloning() {
+        let plan = SearchPlan {
+            breadth_first: false,
+            by_idx: vec![0],
+        };
+        let mut budget = RowBudget::new(limits(usize::MAX));
+        let mut seq = plan.initial(&search_row(1), &mut budget).unwrap();
+        for n in 2..=5 {
+            seq = plan.child(&seq, &search_row(n), &mut budget).unwrap();
+        }
+        match &seq {
+            Cell::RecordArray(path) => assert_eq!(path.len(), 5),
+            other => panic!("unexpected {other:?}"),
+        }
+        // 親の経路ぶんを含めて計上するため、予算がぎりぎり足りない状態では拒否され、計上は変わらない。
+        let mut tight = RowBudget::new(limits(budget.retained / 4));
+        let err = plan
+            .child(&seq, &search_row(6), &mut tight)
+            .expect_err("must be refused");
+        assert_eq!(err.wire_code(), "54000");
+        assert_eq!(tight.retained, 0);
+    }
+
+    /// 幅優先の深さは親の深さ + 1（アンカーは 0）。
+    #[test]
+    fn breadth_first_depth_increments() {
+        let plan = SearchPlan {
+            breadth_first: true,
+            by_idx: vec![0],
+        };
+        let mut budget = RowBudget::new(limits(usize::MAX));
+        let a = plan.initial(&search_row(7), &mut budget).unwrap();
+        assert_eq!(
+            a,
+            Cell::Record(vec![Cell::SignedInteger(0), Cell::SignedInteger(7)])
+        );
+        let b = plan.child(&a, &search_row(8), &mut budget).unwrap();
+        assert_eq!(
+            b,
+            Cell::Record(vec![Cell::SignedInteger(1), Cell::SignedInteger(8)])
+        );
     }
 }
