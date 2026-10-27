@@ -9717,6 +9717,7 @@ pub(crate) struct BoundWindowItem {
 
 /// `LAG`／`LEAD` の束縛済み引数（SQL-64 (1)・Issue #1880）。評価（Issue #1881）は
 /// `sql::window` が担い、本構造体は型検査済みの式と結果型（Describe の型 OID 公告元）を運ぶ。
+/// 評価済みで、`bind_window_item` のゲートは撤去されている。
 #[derive(Debug, Clone, PartialEq)]
 pub(crate) struct BoundWindowOffsetArgs {
     pub(crate) value: BoundWindowValue,
@@ -9725,8 +9726,9 @@ pub(crate) struct BoundWindowOffsetArgs {
     /// 既定値式（値の型へ統一済み。省略時は `None`＝NULL）。
     pub(crate) default: Option<crate::sql::udf_call::BoundExpr>,
     /// 既定値が式層で束縛できない型（BOOLEAN・NUMERIC・UUID・ENUM 等）の裸の列のとき、その列の
-    /// 位置（宣言型で型統一済み。この場合 `default` は `None`）。評価は Issue #1881 が接続する。
-    pub(crate) default_column: Option<usize>,
+    /// 位置と宣言型（型統一済み。この場合 `default` は `None`）。`sql::window` が宣言型で
+    /// セル化する（統一後の型では行の格納表現と食い違いうるため、宣言型を併せて運ぶ）。
+    pub(crate) default_column: Option<(usize, ColumnType)>,
     /// 統一後の結果列型（`window_result_type` が公告に使う）。
     pub(crate) result_type: Option<ColumnType>,
     /// 引数が疑似列 `id` を参照するか（セル評価経路 `CellWindowEvaluator` が拒否に使う）。
@@ -9758,7 +9760,11 @@ impl BoundWindowOffsetArgs {
         for e in self.offset.iter().chain(self.default.iter()) {
             any |= crate::sql::udf_call::mark_referenced_scalar_columns(e, mask);
         }
-        if let Some(slot) = self.default_column.and_then(|i| mask.get_mut(i)) {
+        if let Some(slot) = self
+            .default_column
+            .as_ref()
+            .and_then(|(i, _)| mask.get_mut(*i))
+        {
             *slot = true;
             any = true;
         }
@@ -10069,7 +10075,7 @@ fn bind_window_offset_args(
                         }
                     };
                     let (default_bound, default_column, default_ty) = match default_bare {
-                        Some((index, c)) => (None, Some(index), c.ty.clone()),
+                        Some((index, c)) => (None, Some((index, c.ty.clone())), c.ty.clone()),
                         None => {
                             let (b, _ty, col) = bind_projection_expr(d, schema, udfs, node_budget)?;
                             let col = default_decl.clone().or(col).ok_or_else(mismatch)?;
@@ -10271,15 +10277,8 @@ fn bind_window_item(
         order_by,
         name,
     };
-    // 構文受理・束縛・型検査までが Issue #1880 の範囲で、評価は Issue #1881 が接続する。
-    // 型検査を終えた後ろの単一のゲートで `0A000` を返し、評価経路（走査・Describe・ビューの
-    // 評価後射影）へ未実装の関数を流さない（fail-closed。走査より前に効くため行数・
-    // テナントの存在に依存しない）。Issue #1881 はこのゲートを外して評価を接続する。
-    if bound.func.is_value_offset() {
-        return Err(SqlSurfaceError::feature_not_supported(
-            "lag/lead window functions are not executable yet",
-        ));
-    }
+    // `LAG`／`LEAD` は構文受理・束縛・型検査（Issue #1880）の後、評価（`sql::window`。
+    // Issue #1881）へそのまま流す。運べない値型は束縛段で `0A000` に拒否済み。
     Ok(bound)
 }
 

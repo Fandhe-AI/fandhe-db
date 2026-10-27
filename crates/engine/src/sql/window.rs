@@ -43,9 +43,14 @@
 //! 集め、[`compute_output_order`] が base scan と同一の比較器で出力順（順列）を
 //! 決め、投影段がその順列で base scan の出力行とウィンドウ値を対応付ける。
 //!
-//! `LAG`／`LEAD` は構文受理・束縛・型検査まで実装済み（SQL-64 (1)・Issue #1880）。評価は
-//! Issue #1881 が接続するまで、束縛段（`sql::parser::bind_window_item`）のゲートが `0A000`
-//! で拒否する。本モジュールの `LAG`／`LEAD` の分岐は、ゲートが外れた後の評価接続点である。
+//! `LAG`／`LEAD`（SQL-64 (1)・Issue #1881）は、materialize 段が行ごとに「参照先になったとき
+//! 返す値」「現在行で評価したオフセット」「現在行で評価した既定値」（[`OffsetRowValues`]）を
+//! 集め、評価段（[`evaluate_offset_partition`]）がパーティション内の並び（`ORDER BY`→`id`→
+//! `seq`）の上でオフセット先の行を引く。peer・フレームには依存しない。PostgreSQL の
+//! 評価規則（オフセットは全行で評価・値は参照先の行で評価・既定値はパーティション外のときだけ
+//! 現在行で評価）に合わせるため、値と既定値の評価エラー（`22xxx`）は保持して使用時に返す。
+//! 母集合は他のウィンドウ関数と同じ（RLS・`WHERE` を通った行のみ）で、不可視行は参照先に
+//! ならない。
 //!
 //! 対象外（`42601`／`54000` で fail-closed に拒否。allowlist・parser 側で既に拒否
 //! 済みの形も含む）: フレーム句（`ROWS`/`RANGE`/`GROUPS`）・
@@ -66,8 +71,10 @@ use crate::sql::order_value::{
     NullPlacement, OrderValue, ScalarKeyRef,
 };
 use crate::sql::parser::{
-    AggregateInput, BoundScan, BoundWindowItem, ProjectedColumn, WindowKeyKind, WindowKeyRef,
+    AggregateInput, BoundScan, BoundWindowItem, BoundWindowOffsetArgs, BoundWindowValue,
+    ProjectedColumn, WindowKeyKind, WindowKeyRef,
 };
+use crate::sql::scan::{computed_value_to_cell, push_scalar_column_cell};
 use crate::sql::udf_call::{self, ExprValue};
 use crate::storage::{self, StorageError};
 use redb::ReadableTable;
@@ -227,6 +234,195 @@ enum WindowInputValue {
     PresenceOnly(bool),
 }
 
+/// `LAG`／`LEAD` 項目 1 つについての 1 行分の入力（Issue #1881）。この行が他の行から参照
+/// されたときに返す値、この行で評価したオフセット、この行で評価した既定値を持つ。
+#[derive(Debug)]
+struct OffsetRowValues {
+    /// この行が参照先になったときの値。評価エラー（`22xxx`）は使用時まで保持する。
+    value: Result<Cell, SqlSurfaceError>,
+    /// 現在行で評価したオフセット（`None` は NULL。範囲外は評価時点で `22003`）。
+    offset: Option<i32>,
+    /// 現在行で評価した既定値（`None` は既定値なし＝NULL。評価エラーは使用時まで保持）。
+    default: Option<Result<Cell, SqlSurfaceError>>,
+}
+
+/// `LAG`／`LEAD` 項目の式を項目ごとに 1 回だけコンパイルした結果。
+struct OffsetPrograms {
+    value: Option<ExprProgram>,
+    offset: Option<ExprProgram>,
+    default: Option<ExprProgram>,
+}
+
+/// `LAG`／`LEAD` の行ごとの入力を抽出する評価器（コンパイル済みプログラムと式スタックを持つ）。
+/// [`materialize_rows`]（ストレージ走査）と [`CellWindowEvaluator`] が共有する。
+struct OffsetEvaluator {
+    programs: Vec<Option<OffsetPrograms>>,
+    scratch: Vec<StackValue>,
+}
+
+impl OffsetEvaluator {
+    fn new(items: &[BoundWindowItem]) -> Self {
+        let programs = items
+            .iter()
+            .map(|item| {
+                item.offset_args.as_ref().map(|args| OffsetPrograms {
+                    value: match &args.value {
+                        BoundWindowValue::Expr { bound, .. } => Some(ExprProgram::compile(bound)),
+                        BoundWindowValue::Column { .. } => None,
+                    },
+                    offset: args.offset.as_ref().map(ExprProgram::compile),
+                    default: args.default.as_ref().map(ExprProgram::compile),
+                })
+            })
+            .collect();
+        Self {
+            programs,
+            scratch: Vec::new(),
+        }
+    }
+
+    /// 項目 `item_index` の 1 行分の入力を評価する。保持するセルは状態予算へ計上する。
+    #[allow(clippy::too_many_arguments)]
+    fn extract(
+        &mut self,
+        item_index: usize,
+        args: &BoundWindowOffsetArgs,
+        id: u64,
+        embedding: &[f32],
+        scanned: &[Option<row_codec::ScalarRef<'_>>],
+        state_bytes: &mut usize,
+        state_cap: usize,
+    ) -> Result<OffsetRowValues, SqlSurfaceError> {
+        let programs = self
+            .programs
+            .get(item_index)
+            .and_then(|p| p.as_ref())
+            .ok_or_else(|| window_bug("offset window programs missing for an item"))?;
+        let scratch = &mut self.scratch;
+        *state_bytes = try_accumulate_state_budget(
+            *state_bytes,
+            std::mem::size_of::<Option<OffsetRowValues>>(),
+            state_cap,
+        )?;
+        let result_ty = args.result_type.as_ref();
+
+        // オフセットは全行で評価する（PostgreSQL と同じ。エラーは即時）。
+        let offset = match (&args.offset, &programs.offset) {
+            (None, _) => Some(1),
+            (Some(_), Some(program)) => {
+                offset_from_expr_value(program.eval(id, embedding, scanned, scratch)?)?
+            }
+            (Some(_), None) => return Err(window_bug("offset program missing at evaluation")),
+        };
+
+        // 値はこの行が参照先になったときに返すもの。データ例外（22xxx）だけ遅延する。
+        let value =
+            match &args.value {
+                BoundWindowValue::Column { index, ty } => {
+                    Ok(scalar_cell(ty, *index, scanned, state_bytes, state_cap)?)
+                }
+                BoundWindowValue::Expr { .. } => {
+                    let program = programs
+                        .value
+                        .as_ref()
+                        .ok_or_else(|| window_bug("value program missing at evaluation"))?;
+                    defer_data_exception(program.eval(id, embedding, scanned, scratch).and_then(
+                        |v| computed_value_to_cell(v, result_ty, state_bytes, state_cap),
+                    ))?
+                }
+            };
+
+        // 既定値は現在行で評価し、パーティション外を指したときだけ使う。
+        let default = if let Some((index, ty)) = &args.default_column {
+            Some(Ok(scalar_cell(
+                ty,
+                *index,
+                scanned,
+                state_bytes,
+                state_cap,
+            )?))
+        } else if let (Some(_), Some(program)) = (&args.default, &programs.default) {
+            Some(defer_data_exception(
+                program
+                    .eval(id, embedding, scanned, scratch)
+                    .and_then(|v| computed_value_to_cell(v, result_ty, state_bytes, state_cap)),
+            )?)
+        } else {
+            None
+        };
+        Ok(OffsetRowValues {
+            value,
+            offset,
+            default,
+        })
+    }
+}
+
+/// スカラー列 1 つをセル化する（[`push_scalar_column_cell`] の薄い包み。テキスト長は
+/// 状態予算へ計上する）。
+fn scalar_cell(
+    ty: &ColumnType,
+    index: usize,
+    scanned: &[Option<row_codec::ScalarRef<'_>>],
+    state_bytes: &mut usize,
+    state_cap: usize,
+) -> Result<Cell, SqlSurfaceError> {
+    let mut cells: Vec<Cell> = Vec::with_capacity(1);
+    push_scalar_column_cell(&mut cells, ty, index, scanned, state_bytes, state_cap)?;
+    cells
+        .pop()
+        .ok_or_else(|| window_bug("scalar column cell was not produced"))
+}
+
+/// データ例外（`22xxx`）は `Err` のまま保持して返し、それ以外（予算超過・中断・内部エラー）は
+/// 即時に伝播する。値・既定値は参照されない行では評価されなかったものとして扱うため。
+fn defer_data_exception(
+    r: Result<Cell, SqlSurfaceError>,
+) -> Result<Result<Cell, SqlSurfaceError>, SqlSurfaceError> {
+    match r {
+        Ok(c) => Ok(Ok(c)),
+        Err(e) if e.wire_code().starts_with("22") => Ok(Err(e)),
+        Err(e) => Err(e),
+    }
+}
+
+/// オフセット式の評価値を `i32`（`None` は NULL）へ変換する。範囲外は `22003`。
+/// 束縛段が整数型に限定済みのため、非整数・他の variant は不変条件違反（`XX000`）。
+fn offset_from_expr_value(value: ExprValue<'_>) -> Result<Option<i32>, SqlSurfaceError> {
+    match value {
+        ExprValue::Null => Ok(None),
+        ExprValue::Scalar(f) => {
+            if !(f.is_finite() && f.fract() == 0.0) {
+                return Err(window_bug("LAG/LEAD offset is not an integer value"));
+            }
+            if f < f64::from(i32::MIN) || f > f64::from(i32::MAX) {
+                return Err(SqlSurfaceError::numeric_out_of_range(
+                    "integer out of range",
+                ));
+            }
+            Ok(Some(f as i32))
+        }
+        _ => Err(window_bug(
+            "LAG/LEAD offset evaluated to a non-integer value",
+        )),
+    }
+}
+
+/// パーティション内の位置 `pos`（0 始まり・長さ `len`）から見たオフセット先の位置。
+/// `LAG` は `pos - offset`、`LEAD`（`forward`）は `pos + offset`。範囲外は `None`。
+/// 計算は `i64` で行い、`i32::MIN` でもあふれない。
+fn offset_target_index(pos: usize, len: usize, offset: i32, forward: bool) -> Option<usize> {
+    let p = i64::try_from(pos).ok()?;
+    let delta = i64::from(offset);
+    let target = if forward {
+        p.checked_add(delta)?
+    } else {
+        p.checked_sub(delta)?
+    };
+    let target = usize::try_from(target).ok()?;
+    (target < len).then_some(target)
+}
+
 /// 可視かつ WHERE を満たす 1 行の materialize 結果（SQL-30・TASK-214）。
 /// `partition_keys`／`order_keys`／`agg_values` は `bound.windows()` と同じ順序の
 /// `Vec`（外側添字がウィンドウ項目の添字）。
@@ -237,6 +433,8 @@ struct MaterializedRow {
     partition_keys: Vec<Vec<Option<WindowKeyValue>>>,
     order_keys: Vec<Vec<Option<WindowKeyValue>>>,
     agg_values: Vec<WindowInputValue>,
+    /// `LAG`／`LEAD` 項目の入力（外側添字がウィンドウ項目。それ以外の項目は `None`。Issue #1881）。
+    offset_values: Vec<Option<OffsetRowValues>>,
     /// 文全体のスカラー `ORDER BY` キー値（`bound.order_by` と同順。`ORDER BY`
     /// なしなら空。Issue #1189）。出力順の計算（[`compute_output_order`]）専用で、
     /// 出力には現れない。
@@ -432,6 +630,7 @@ fn materialize_rows(
 
     let mut embedding_scratch: Vec<f32> = Vec::new();
     let mut expr_scratch: Vec<StackValue> = Vec::new();
+    let mut offset_eval = OffsetEvaluator::new(bound.windows());
     let mut materialized: Vec<MaterializedRow> = Vec::new();
     let mut tenants: Vec<String> = Vec::new();
     let mut seq: usize = 0;
@@ -558,14 +757,21 @@ fn materialize_rows(
                 state_cap,
             )?;
 
+            let value_embedding: &[f32] = match tier {
+                DecodeTier::Embedding => embedding_scratch.as_slice(),
+                DecodeTier::Fast | DecodeTier::DimAndScalar => &[],
+            };
             let WindowRowValues {
                 partition_keys,
                 order_keys,
                 agg_values,
+                offset_values,
             } = collect_window_row_values(
                 bound.windows(),
+                &mut offset_eval,
                 id,
                 dim,
+                value_embedding,
                 &scanned,
                 &mut partition_counts,
                 &mut state_bytes,
@@ -624,6 +830,7 @@ fn materialize_rows(
                 partition_keys,
                 order_keys,
                 agg_values,
+                offset_values,
                 stmt_order_keys,
                 tenant_idx,
             });
@@ -647,6 +854,7 @@ struct WindowRowValues {
     partition_keys: Vec<Vec<Option<WindowKeyValue>>>,
     order_keys: Vec<Vec<Option<WindowKeyValue>>>,
     agg_values: Vec<WindowInputValue>,
+    offset_values: Vec<Option<OffsetRowValues>>,
 }
 
 /// `scanned`（1 行分のスカラー列）から `items`（`bound.windows()`）ごとのキー・引数の値を
@@ -654,10 +862,13 @@ struct WindowRowValues {
 /// 上限（いずれも超過は `54000`）へ計上する。ストレージ走査（[`materialize_rows`]）と
 /// 評価済みセル（[`CellWindowEvaluator`]。Issue #1411）が共有する唯一の実装で、第 2 の
 /// ウィンドウ値抽出を作らない。
+#[allow(clippy::too_many_arguments)]
 fn collect_window_row_values(
     items: &[BoundWindowItem],
+    offset_eval: &mut OffsetEvaluator,
     id: u64,
     dim: u32,
+    embedding: &[f32],
     scanned: &[Option<row_codec::ScalarRef<'_>>],
     partition_counts: &mut [HashMap<Vec<u8>, usize>],
     state_bytes: &mut usize,
@@ -666,6 +877,7 @@ fn collect_window_row_values(
     let mut partition_keys = Vec::with_capacity(items.len());
     let mut order_keys = Vec::with_capacity(items.len());
     let mut agg_values = Vec::with_capacity(items.len());
+    let mut offset_values = Vec::with_capacity(items.len());
     for (item_index, item) in items.iter().enumerate() {
         let mut pkeys = Vec::with_capacity(item.partition_by.len());
         for key in &item.partition_by {
@@ -714,14 +926,29 @@ fn collect_window_row_values(
             }
         };
 
+        let offset_value = match &item.offset_args {
+            Some(args) => Some(offset_eval.extract(
+                item_index,
+                args,
+                id,
+                embedding,
+                scanned,
+                state_bytes,
+                state_cap,
+            )?),
+            None => None,
+        };
+
         partition_keys.push(pkeys);
         order_keys.push(okeys);
         agg_values.push(agg_value);
+        offset_values.push(offset_value);
     }
     Ok(WindowRowValues {
         partition_keys,
         order_keys,
         agg_values,
+        offset_values,
     })
 }
 
@@ -738,6 +965,7 @@ pub(crate) struct CellWindowEvaluator<'a> {
     rows: Vec<MaterializedRow>,
     state_bytes: usize,
     partition_counts: Vec<HashMap<Vec<u8>, usize>>,
+    offset_eval: OffsetEvaluator,
 }
 
 impl<'a> CellWindowEvaluator<'a> {
@@ -765,6 +993,7 @@ impl<'a> CellWindowEvaluator<'a> {
             rows: Vec::new(),
             state_bytes: 0,
             partition_counts: vec![HashMap::new(); items.len()],
+            offset_eval: OffsetEvaluator::new(items),
         })
     }
 
@@ -782,10 +1011,13 @@ impl<'a> CellWindowEvaluator<'a> {
             partition_keys,
             order_keys,
             agg_values,
+            offset_values,
         } = collect_window_row_values(
             self.items,
+            &mut self.offset_eval,
             0,
             0,
+            &[],
             scanned,
             &mut self.partition_counts,
             &mut self.state_bytes,
@@ -798,6 +1030,7 @@ impl<'a> CellWindowEvaluator<'a> {
             partition_keys,
             order_keys,
             agg_values,
+            offset_values,
             stmt_order_keys: Vec::new(),
             tenant_idx: 0,
         });
@@ -1389,6 +1622,69 @@ fn evaluate_window_item(
         .collect()
 }
 
+/// `LAG`／`LEAD` の 1 パーティション分（`indices` は並べ替え済み）を評価する（Issue #1881）。
+/// オフセットが NULL なら NULL、オフセット先がパーティション内ならその行の値（値が NULL なら
+/// NULL。既定値へは落とさない）、範囲外なら現在行で評価した既定値（なければ NULL）。値・既定値の
+/// 評価エラーは使用時に初めて返す（PostgreSQL と同じく、参照されない行のエラーを出さない）。
+fn evaluate_offset_partition(
+    item: &BoundWindowItem,
+    item_index: usize,
+    materialized: &[MaterializedRow],
+    indices: &[usize],
+    out: &mut [Option<Cell>],
+    state_bytes: &mut usize,
+    state_cap: usize,
+) -> Result<(), SqlSurfaceError> {
+    let forward = matches!(item.func, WindowFunc::Lead);
+    let values_of = |row_idx: usize| -> Result<&OffsetRowValues, SqlSurfaceError> {
+        materialized
+            .get(row_idx)
+            .and_then(|r| r.offset_values.get(item_index))
+            .and_then(|v| v.as_ref())
+            .ok_or_else(|| window_bug("offset window values missing for a row"))
+    };
+    for (pos, &row_idx) in indices.iter().enumerate() {
+        let current = values_of(row_idx)?;
+        let picked: Option<&Cell> = match current.offset {
+            None => None,
+            Some(o) => match offset_target_index(pos, indices.len(), o, forward) {
+                Some(target) => {
+                    let target_row = *indices
+                        .get(target)
+                        .ok_or_else(|| window_bug("offset target index out of range"))?;
+                    Some(
+                        values_of(target_row)?
+                            .value
+                            .as_ref()
+                            .map_err(Clone::clone)?,
+                    )
+                }
+                None => match &current.default {
+                    None => None,
+                    Some(d) => Some(d.as_ref().map_err(Clone::clone)?),
+                },
+            },
+        };
+        let cell = match picked {
+            None => Cell::Null,
+            Some(c) => {
+                // 複製の前に状態予算へ計上する（確保前の検証）。
+                *state_bytes = try_accumulate_state_budget(
+                    *state_bytes,
+                    window_cell_state_bytes(c),
+                    state_cap,
+                )?;
+                c.clone()
+            }
+        };
+        let slot = out.get_mut(row_idx).ok_or_else(|| {
+            window_bug("evaluate_offset_partition row index out of range for the result slice")
+        })?;
+        *slot = Some(cell);
+    }
+    Ok(())
+}
+
 /// 1 パーティション分のウィンドウ値を計算する（安定ソート → peer 分割 →
 /// 順位/集計評価。§モジュールドキュメント「評価の意味」参照）。
 fn evaluate_partition(
@@ -1419,6 +1715,19 @@ fn evaluate_partition(
         }
         ra.id.cmp(&rb.id).then(ra.seq.cmp(&rb.seq))
     });
+
+    // `LAG`／`LEAD` は peer・フレームに依存しないため、peer 分割へ入れず専用の評価へ委譲する。
+    if item.func.is_value_offset() {
+        return evaluate_offset_partition(
+            item,
+            item_index,
+            materialized,
+            &indices,
+            out,
+            state_bytes,
+            state_cap,
+        );
+    }
 
     let mut scratch: Vec<StackValue> = Vec::new();
     let has_order_by = !item.order_by.is_empty();
@@ -1472,9 +1781,9 @@ fn evaluate_partition(
         // （`RowNumber`/`Rank`/`DenseRank`）は行ごとに値が変わるため対象外。
         let aggregate_cell: Option<Cell> = match item.func {
             WindowFunc::RowNumber | WindowFunc::Rank | WindowFunc::DenseRank => None,
-            // `LAG`／`LEAD` の評価は Issue #1881。束縛段のゲートが走査前に拒否するため到達しない。
+            // `LAG`／`LEAD` は上で専用の評価へ委譲済みのため到達しない（不変条件違反は fail-closed）。
             WindowFunc::Lag | WindowFunc::Lead => {
-                return Err(window_bug("lag/lead evaluation is not wired yet"));
+                return Err(window_bug("offset window function reached the peer loop"));
             }
             WindowFunc::Count
             | WindowFunc::Sum
@@ -1496,7 +1805,7 @@ fn evaluate_partition(
                 WindowFunc::Rank => Cell::Integer((rank + 1) as u64),
                 WindowFunc::DenseRank => Cell::Integer((dense_rank + 1) as u64),
                 WindowFunc::Lag | WindowFunc::Lead => {
-                    return Err(window_bug("lag/lead evaluation is not wired yet"));
+                    return Err(window_bug("offset window function reached the peer loop"));
                 }
                 WindowFunc::Count
                 | WindowFunc::Sum
@@ -2211,6 +2520,92 @@ mod budget_regression_tests {
             materialize_only_bytes.saturating_add(1_000_000),
         )
         .expect("cap with headroom for the evaluation stage should succeed");
+    }
+
+    /// `offset_target_index`: 正・0・負のオフセットと範囲外・`i32` の両端でもあふれない。
+    #[test]
+    fn offset_target_index_handles_boundaries_without_overflow() {
+        // LAG（forward = false）は pos - offset、LEAD（forward = true）は pos + offset。
+        assert_eq!(offset_target_index(2, 5, 1, false), Some(1));
+        assert_eq!(offset_target_index(2, 5, 1, true), Some(3));
+        assert_eq!(offset_target_index(2, 5, 0, false), Some(2));
+        assert_eq!(offset_target_index(2, 5, -1, false), Some(3));
+        assert_eq!(offset_target_index(2, 5, -1, true), Some(1));
+        assert_eq!(offset_target_index(0, 5, 1, false), None);
+        assert_eq!(offset_target_index(4, 5, 1, true), None);
+        assert_eq!(offset_target_index(4, 5, 0, true), Some(4));
+        assert_eq!(offset_target_index(0, 0, 0, true), None);
+        for forward in [false, true] {
+            assert_eq!(offset_target_index(3, 5, i32::MAX, forward), None);
+            assert_eq!(offset_target_index(3, 5, i32::MIN, forward), None);
+        }
+    }
+
+    /// `offset_from_expr_value`: NULL・整数・`int4` 範囲外（`22003`）・非整数（`XX000`）。
+    #[test]
+    fn offset_from_expr_value_validates_range_and_shape() {
+        assert_eq!(offset_from_expr_value(ExprValue::Null).unwrap(), None);
+        assert_eq!(
+            offset_from_expr_value(ExprValue::Scalar(2.0)).unwrap(),
+            Some(2)
+        );
+        assert_eq!(
+            offset_from_expr_value(ExprValue::Scalar(-2_147_483_648.0)).unwrap(),
+            Some(i32::MIN)
+        );
+        assert_eq!(
+            offset_from_expr_value(ExprValue::Scalar(2_147_483_647.0)).unwrap(),
+            Some(i32::MAX)
+        );
+        for v in [2_147_483_648.0, -2_147_483_649.0] {
+            let err = offset_from_expr_value(ExprValue::Scalar(v)).expect_err("out of range");
+            assert_eq!(err.wire_code(), "22003");
+        }
+        for v in [1.5, f64::NAN, f64::INFINITY] {
+            let err = offset_from_expr_value(ExprValue::Scalar(v)).expect_err("not an integer");
+            assert_eq!(err.wire_code(), "XX000");
+        }
+        let err = offset_from_expr_value(ExprValue::Bool(true)).expect_err("wrong variant");
+        assert_eq!(err.wire_code(), "XX000");
+    }
+
+    /// `LAG` が保持する値（TEXT）も状態予算へ計上され、cap を下回ると `54000` になる。
+    #[test]
+    fn lag_value_retention_is_charged_against_state_budget() {
+        use crate::sql::parser::{BoundWindowOffsetArgs, BoundWindowValue};
+        let path = unique_db_path("window-state-budget-lag");
+        let _guard = CleanupGuard(path.clone());
+        let storage = Storage::open(&path).expect("open storage");
+        let schema = schema_with_text();
+        storage.create_table(&schema).expect("create table");
+        let body = "y".repeat(4_000);
+        write_text_row(&storage, &schema, "tenant-a", 1, &body);
+
+        let ctx = PolicyContext::new("tenant-a").expect("valid tenant");
+        let read_txn = storage.db().begin_read().expect("begin_read");
+        let mut bound = bound_min_body_over();
+        bound.windows[0].func = WindowFunc::Lag;
+        bound.windows[0].input = None;
+        bound.windows[0].offset_args = Some(BoundWindowOffsetArgs {
+            value: BoundWindowValue::Column {
+                index: 0,
+                ty: ColumnType::Text,
+            },
+            offset: None,
+            default: None,
+            default_column: None,
+            result_type: Some(ColumnType::Text),
+            uses_pseudo_id: false,
+        });
+
+        let needed = materialize_rows(&read_txn, &ctx, &schema, &bound, usize::MAX)
+            .expect("materialize should succeed with an unbounded cap")
+            .state_bytes;
+        assert!(needed >= body.len(), "the retained text must be counted");
+        let err = materialize_rows(&read_txn, &ctx, &schema, &bound, needed - 1)
+            .err()
+            .expect("cap below the retained size must reject");
+        assert_eq!(err.wire_code(), "54000");
     }
 
     /// PR #1233 指摘の回帰: `ORDER BY` なしでは順列を確保せず状態予算にも計上しない

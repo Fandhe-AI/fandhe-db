@@ -164,8 +164,40 @@
   `json`・`jsonb` の値は `0A000`。結果型は統一後の値の型で、`window_result_type` が公告する。
 - **ゲート**: 型検査を終えた `bind_window_item` の末尾の 1 か所で `0A000` を返す。走査・
   Describe・ビューの評価後射影はすべて `bind_window_item` を通るため、行数・テナントの
-  存在に依存せず未実装の評価へ到達しない。Issue #1881 はこのゲートを外して評価を接続する。
+  存在に依存せず未実装の評価へ到達しない。Issue #1881 でこのゲートを外し、評価を接続した。
 - **ビューの列スコープ**: `check_window_columns_within_view` が値・オフセット・既定値の式の
   識別子をすべて検査する。欠くとゲートの `0A000` と `42703` の差から非公開列の存在が漏れる。
 - **名前表の副作用**: `lag`／`lead` が窓関数名になるため、`FILTER` 内の `lag(x) OVER ()` は
   `42601` から `42P20` になる（PostgreSQL と同じ分類）。
+
+## Issue #1881 追記: LAG／LEAD の評価（SQL-64 (1) ポインタ）
+
+親 #1879 の第 2 段。`bind_window_item` のゲート（`0A000`）を外し、評価本体を `sql::window` に
+実装した。意味論は PostgreSQL 17 の `lag`／`lead` に合わせる。
+
+| 引数 | 評価する行 | 規則 |
+| ---- | ---------- | ---- |
+| オフセット | 現在行 | 全行で評価する（省略時 1）。NULL なら既定値の有無によらず結果は NULL。負は逆方向、0 は現在行 |
+| 値 | 参照先の行 | 参照先がパーティション内ならその行の値。値が NULL なら結果も NULL（既定値へ落とさない） |
+| 既定値 | 現在行 | 参照先がパーティション外のときだけ使う（省略時 NULL） |
+
+- **入力の保持**: materialize 段が行ごとに「参照先になったときの値」「現在行のオフセット」
+  「現在行の既定値」（`OffsetRowValues`）を集める。抽出は `collect_window_row_values`（走査と
+  `CellWindowEvaluator` の共有実装）に統合し、第 2 の抽出器を作らない。式は項目ごとに 1 回だけ
+  コンパイルする。保持するセルは `MAX_WINDOW_STATE_BYTES` の状態予算に確保前に計上する。
+- **遅延エラー**: 値・既定値式のデータ例外（`22xxx`）は保持し、使用時に初めて返す
+  （参照されない行のエラーを出さない。PostgreSQL と同じ）。予算超過・中断・内部エラーは即時。
+- **オフセットの範囲**: bigint・smallint も受理するため、`int4` の範囲外は `22003`。
+  参照先の位置は `i64` で計算し、`i32::MIN` でもあふれない。
+- **評価位置**: `evaluate_partition` が安定ソートの直後に専用の `evaluate_offset_partition`
+  へ委譲する（peer・フレームに依存しない）。同点は既存どおり `id`→`seq`。
+- **母集合・RLS**: 他のウィンドウ関数と同じ materialize 段（可視性・TABLE-12 整合・`WHERE`・
+  可視性の再適用）を通った行だけで構成される（RLS-10 ポインタ）。不可視行は参照先にならない。
+- **ビュー経路の修正**: 評価後射影形ビュー（集計／`LIMIT` 本文）の外側が参照する識別子の
+  収集が `LAG`／`LEAD` の引数を見ておらず、引数にしか現れない列が NULL になっていた。
+  `WindowSelectItem::collect_referenced_idents` へ一本化し、`plan_rows`・
+  `outer_non_projection_idents` から使う。
+- **共通化**: 裸の列のセル化は `scan::push_scalar_column_cell`（`build_projected_cells` から
+  抽出。挙動不変）を共有する。既定値の裸の列は宣言型を併せて運ぶ（`default_column`）。
+- **対象外**: フレーム句・名前付きウィンドウ・`FILTER`・`EXPLAIN`（兄弟 Issue）。引数内の
+  `$n`（`42601`）。NUMERIC の typmod が異なる値と既定値の公告 typmod の差（#1880 の判断を維持）。
