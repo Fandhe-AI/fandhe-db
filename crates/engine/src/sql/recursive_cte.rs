@@ -445,6 +445,18 @@ pub(crate) fn validate_recursive_with(
     tokens: &[Token],
     limits: NestingLimits,
 ) -> Result<RecursiveWithClause, SqlSurfaceError> {
+    validate_with_clause(tokens, limits, true)
+}
+
+/// [`validate_recursive_with`] の本体。`recursive` が偽のときは入れ子の通常 `WITH`（呼び出し元が
+/// `RECURSIVE` を補ってある）で、自己参照・前方参照の解析を行わず各本文の構文だけを検証する。
+/// 構文（`42601`）→ 再帰構造（`42P19`）→ 機能ゲート（`0A000`）の集約順序は両者で共通。
+fn validate_with_clause(
+    tokens: &[Token],
+    limits: NestingLimits,
+    recursive: bool,
+) -> Result<RecursiveWithClause, SqlSurfaceError> {
+    let _depth = WithDepthGuard::enter(limits)?;
     let (raw_defs, main_tokens, has_search_cycle) = split_recursive_with_clause(tokens, limits)?;
 
     if !matches!(main_tokens.first(), Some(Token::Keyword(Keyword::Select))) {
@@ -481,7 +493,7 @@ pub(crate) fn validate_recursive_with(
             // 入れ子の WITH は通常 WITH 経路（ビュー本文の形制約あり）を使わず、構文専用の
             // [`validate_nested_with_syntax`] で検証する。
             let checked = if is_word(first, "WITH") {
-                validate_nested_with_syntax(body, 1, limits)
+                validate_nested_with_syntax(body, limits)
             } else {
                 validate_data_modifying_cte_syntax(body, limits).map(|_| ())
             };
@@ -499,7 +511,12 @@ pub(crate) fn validate_recursive_with(
             }
             continue;
         }
-        for (_, (later, _, _)) in raw_defs.iter().enumerate().skip(idx.saturating_add(1)) {
+        for (_, (later, _, _)) in raw_defs
+            .iter()
+            .enumerate()
+            .skip(idx.saturating_add(1))
+            .filter(|_| recursive)
+        {
             if !relation_refs(body, later).is_empty() {
                 deferred.get_or_insert_with(|| {
                     SqlSurfaceError::feature_not_supported(
@@ -508,7 +525,11 @@ pub(crate) fn validate_recursive_with(
                 });
             }
         }
-        let refs = relation_refs(body, name);
+        let refs = if recursive {
+            relation_refs(body, name)
+        } else {
+            Vec::new()
+        };
         let checked = if refs.is_empty() {
             structural(body, limits).map(|_| RecursiveCteBody::NonRecursive {
                 tokens: body.clone(),
@@ -546,48 +567,55 @@ pub(crate) fn validate_recursive_with(
 
 /// 入れ子の `WITH`（本文が `WITH` で始まる定義）の構文だけを検証する（実行対応とは分離。
 /// 呼び出し元が妥当な形を機能ゲート `0A000` へ保留する）。通常 `WITH` 経路（`parse_with_clause`＋
-/// 解決・合成）は CTE 本文にビュー本文の形制約を課すため使わず、`WITH RECURSIVE` と同じ
-/// ヘッダー解析（`RECURSIVE` を補って流用）で定義を切り出し、各本文をカタログ非依存の構文検証器へ
-/// 通す。深さは `limits` のサブクエリ深さ上限で打ち切る（超過は `54000`）。
+/// 解決・合成）は CTE 本文にビュー本文の形制約を課すため使わず、`RECURSIVE` を補って
+/// [`validate_with_clause`]（`WITH RECURSIVE` と同じ集約ロジック。自己参照の解析だけ無効）へ通す。
 fn validate_nested_with_syntax(
     tokens: &[Token],
-    depth: usize,
     limits: NestingLimits,
 ) -> Result<(), SqlSurfaceError> {
-    if depth > limits.max_subquery_depth() {
-        return Err(SqlSurfaceError::payload_too_large(format!(
-            "subquery nesting exceeds limit {}",
-            limits.max_subquery_depth()
-        )));
-    }
     if is_word(tokens.get(1), "RECURSIVE") {
-        // 入れ子の `WITH RECURSIVE` は再帰項の構造まで同じ検証器で確定させる。
-        return validate_recursive_with(tokens, limits).map(|_| ());
+        return validate_with_clause(tokens, limits, true).map(|_| ());
     }
     let mut with_recursive: Vec<Token> = Vec::with_capacity(tokens.len().saturating_add(1));
     with_recursive.extend(tokens.first().cloned());
     with_recursive.push(Token::Ident("RECURSIVE".to_string()));
     with_recursive.extend(tokens.iter().skip(1).cloned());
-    let (defs, main, _search_cycle) = split_recursive_with_clause(&with_recursive, limits)?;
-    if !matches!(main.first(), Some(Token::Keyword(Keyword::Select))) {
-        return Err(SqlSurfaceError::unsupported(
-            "WITH must be followed by a SELECT statement",
-        ));
-    }
-    for (_, _, body) in &defs {
-        let first = body.first();
-        if is_word(first, "WITH") {
-            validate_nested_with_syntax(body, depth.saturating_add(1), limits)?;
-        } else if matches!(first, Some(Token::Ident(w))
-            if ["INSERT", "UPDATE", "DELETE"].iter().any(|k| w.eq_ignore_ascii_case(k)))
-        {
-            validate_data_modifying_cte_syntax(body, limits)?;
-        } else {
-            structural(body, limits)?;
+    validate_with_clause(&with_recursive, limits, false).map(|_| ())
+}
+
+thread_local! {
+    /// 実行中スレッドで入れ子になっている `WITH` 検証（[`validate_with_clause`]）の段数。
+    static WITH_DEPTH: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+}
+
+/// [`WITH_DEPTH`] を 1 段進め、スコープ終了（エラー・panic の巻き戻しを含む）で戻す RAII ガード。
+/// 通常 `WITH` ⇄ `WITH RECURSIVE` の切り替え、再帰項を括弧で包んだ `(WITH ...)` など、検証器の
+/// どの再入経路を通っても深さが単調に加算・検査される（段数の数え直しによる DoS を防ぐ）。
+struct WithDepthGuard;
+
+impl WithDepthGuard {
+    /// 段数を加算し、`limits` のサブクエリ深さ上限を超えたら `54000` を返す。
+    fn enter(limits: NestingLimits) -> Result<Self, SqlSurfaceError> {
+        let depth = WITH_DEPTH.with(|d| {
+            let next = d.get().saturating_add(1);
+            d.set(next);
+            next
+        });
+        let guard = Self;
+        if depth > limits.max_subquery_depth() {
+            return Err(SqlSurfaceError::payload_too_large(format!(
+                "subquery nesting exceeds limit {}",
+                limits.max_subquery_depth()
+            )));
         }
+        Ok(guard)
     }
-    structural(&main, limits)?;
-    Ok(())
+}
+
+impl Drop for WithDepthGuard {
+    fn drop(&mut self) {
+        WITH_DEPTH.with(|d| d.set(d.get().saturating_sub(1)));
+    }
 }
 
 /// 自己参照を持つ本文を、アンカー項と再帰項へ分割して検証する。
@@ -1014,6 +1042,59 @@ mod tests {
         assert_eq!(
             code("WITH RECURSIVE a AS (WITH u AS (SELECT 1) SELECT 1), t(n) AS (SELECT n FROM t) SELECT 1"),
             "42P19"
+        );
+    }
+
+    #[test]
+    fn alternating_with_nesting_stops_at_depth_limit() {
+        let limit = NestingLimits::default().max_subquery_depth();
+        // 通常 WITH と WITH RECURSIVE を交互に上限を超えて重ねても、段数が数え直されず 54000 で止まる。
+        // 最外は検証器へ入る WITH RECURSIVE とし、内側を 2 通りの位相で交互に重ねる。
+        for inner_recursive_on_even in [true, false] {
+            let n = limit.saturating_add(4);
+            let mut sql = String::from("SELECT 1");
+            for k in (0..n).rev() {
+                let rec = k == 0 || ((k % 2 == 0) == inner_recursive_on_even);
+                let kw = if rec { "WITH RECURSIVE" } else { "WITH" };
+                sql = format!("{kw} a AS ({sql}) SELECT 1");
+            }
+            assert_eq!(code(&sql), "54000", "phase={inner_recursive_on_even}");
+        }
+        // 上限以内なら深さ起因では拒否されない（段数はスコープ終了で戻る）。
+        let mut sql = String::from("SELECT 1");
+        for _ in 0..limit.saturating_sub(1) {
+            sql = format!("WITH a AS ({sql}) SELECT 1");
+        }
+        assert_ne!(code(&sql), "54000");
+    }
+
+    #[test]
+    fn nested_with_orders_syntax_before_structure_before_gate() {
+        let bad_rec = "t(n) AS (SELECT n FROM t)";
+        let del = "d AS (DELETE FROM docs WHERE id = 1)";
+        for sql in [
+            // 前の定義が 0A000 相当・後ろの定義が構文不正。
+            format!("WITH RECURSIVE a AS (WITH {del}, x AS (SELECT FROM docs) SELECT 1) SELECT 1"),
+            // 前の定義が 42P19 相当・後ろの定義が構文不正。
+            format!("WITH RECURSIVE a AS (WITH RECURSIVE {bad_rec}, x AS (SELECT FROM docs) SELECT 1) SELECT 1"),
+            // 前の定義が 0A000・内側の主クエリが構文不正。
+            format!("WITH RECURSIVE a AS (WITH {del} SELECT FROM docs) SELECT 1"),
+            format!("WITH RECURSIVE a AS (WITH RECURSIVE {bad_rec} SELECT FROM docs) SELECT 1"),
+        ] {
+            assert_eq!(code(&sql), "42601", "{sql}");
+        }
+        // 構文が正しければ従来どおり（42P19 が 0A000 より先、妥当なら 0A000）。
+        assert_eq!(
+            code(&format!(
+                "WITH RECURSIVE a AS (WITH RECURSIVE {bad_rec}, {del} SELECT 1) SELECT 1"
+            )),
+            "42P19"
+        );
+        assert_eq!(
+            code(&format!(
+                "WITH RECURSIVE a AS (WITH {del}, x AS (SELECT id FROM docs) SELECT 1) SELECT 1"
+            )),
+            NOT_YET
         );
     }
 
