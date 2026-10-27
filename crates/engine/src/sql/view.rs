@@ -954,6 +954,17 @@ pub(crate) fn check_window_columns_within_view(
                 return Err(SqlSurfaceError::undefined_column(name));
             }
         }
+        // `LAG`／`LEAD` の値・オフセット・既定値（SQL-64 (1)・Issue #1880）。式中の識別子を
+        // すべて検査する。欠くと、束縛段のゲート（`0A000`）と未定義列（`42703`）の違いから
+        // ビューの非公開列の存在が漏れる（A01）。
+        if let Some(args) = &item.offset_args {
+            for e in std::iter::once(&args.value)
+                .chain(args.offset.iter())
+                .chain(args.default.iter())
+            {
+                expr_columns_within(columns, e)?;
+            }
+        }
     }
     Ok(())
 }

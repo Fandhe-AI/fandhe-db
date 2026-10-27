@@ -343,6 +343,39 @@ fn precheck_group_key_tokens(
 /// 部分クエリ（`( SELECT ...)`）の内側は走査しない（内側の集計は正当）。深さカウンタの
 /// 線形走査で再帰せず、呼び出し元は [`Parser::parse_aggregate_filter_clause`]。
 fn precheck_aggregate_filter_tokens(tokens: &[Token], open: usize) -> Result<(), SqlSurfaceError> {
+    precheck_call_arg_tokens(tokens, open, &FILTER_ARG_SITE)
+}
+
+/// 括弧区間の先読み検査（[`precheck_call_arg_tokens`]）が返すエラー文言の組。場所ごとに
+/// 固定の英語文言を持たせ、利用者の入力値を埋め込まない。
+struct PrecheckSite {
+    param: &'static str,
+    window: &'static str,
+    aggregate: &'static str,
+}
+
+/// `FILTER (WHERE ...)` 内の先読み検査の文言。
+const FILTER_ARG_SITE: PrecheckSite = PrecheckSite {
+    param: "parameters are not supported inside FILTER",
+    window: "window functions are not allowed in FILTER",
+    aggregate: "aggregate functions are not allowed in FILTER",
+};
+
+/// `LAG`／`LEAD` の引数内の先読み検査の文言（SQL-64 (1)・Issue #1880）。`$n` は
+/// Prepared の Describe で行うダミー値置換と型検査が食い違う恐れがあるため fail-closed に拒否する。
+const LAG_LEAD_ARG_SITE: PrecheckSite = PrecheckSite {
+    param: "parameters are not supported inside LAG/LEAD arguments",
+    window: "window function calls cannot be nested",
+    aggregate: "aggregate function calls cannot be used inside LAG/LEAD arguments",
+};
+
+/// [`precheck_aggregate_filter_tokens`] と `LAG`／`LEAD` 引数の共通本体。`open` は区間を
+/// 開く `(` の位置で、`site` が場所ごとの文言を与える。
+fn precheck_call_arg_tokens(
+    tokens: &[Token],
+    open: usize,
+    site: &PrecheckSite,
+) -> Result<(), SqlSurfaceError> {
     // 区間内の `(` ごとの対応 `)` 位置（対応が無ければ `tokens.len()` 扱いで区間末尾まで）。
     let mut close: Vec<Option<usize>> = vec![None; tokens.len()];
     let mut stack: Vec<usize> = Vec::new();
@@ -368,9 +401,7 @@ fn precheck_aggregate_filter_tokens(tokens: &[Token], open: usize) -> Result<(),
         .get(open.saturating_add(1)..end)
         .is_some_and(|r| r.iter().any(|t| matches!(t, Token::Param(_))))
     {
-        return Err(SqlSurfaceError::unsupported(
-            "parameters are not supported inside FILTER",
-        ));
+        return Err(SqlSurfaceError::unsupported(site.param));
     }
     let mut i = open.saturating_add(1);
     while i < end {
@@ -405,12 +436,12 @@ fn precheck_aggregate_filter_tokens(tokens: &[Token], open: usize) -> Result<(),
                 let is_agg = is_aggregate_function_name(name);
                 if has_over && (is_agg || WindowFunc::from_name(name).is_some()) {
                     return Err(SqlSurfaceError::WindowingError {
-                        detail: "window functions are not allowed in FILTER",
+                        detail: site.window,
                     });
                 }
                 if is_agg {
                     return Err(SqlSurfaceError::GroupingError {
-                        detail: "aggregate functions are not allowed in FILTER",
+                        detail: site.aggregate,
                     });
                 }
             }
@@ -3683,6 +3714,9 @@ pub(crate) enum WindowFunc {
     Avg,
     Min,
     Max,
+    /// オフセット参照関数（`LAG`／`LEAD`。SQL-64 (1)・Issue #1880）。
+    Lag,
+    Lead,
 }
 
 impl WindowFunc {
@@ -3699,6 +3733,8 @@ impl WindowFunc {
             "AVG" => Some(WindowFunc::Avg),
             "MIN" => Some(WindowFunc::Min),
             "MAX" => Some(WindowFunc::Max),
+            "LAG" => Some(WindowFunc::Lag),
+            "LEAD" => Some(WindowFunc::Lead),
             _ => None,
         }
     }
@@ -3712,9 +3748,18 @@ impl WindowFunc {
         )
     }
 
+    /// オフセット参照関数（`LAG`／`LEAD`。式引数を 1〜3 個取る。SQL-64 (1)・Issue #1880）。
+    /// [`Parser::parse_window_item`]・`sql::parser::bind_window_item` が集計関数の
+    /// 引数経路（[`AggregateArg`]）と分けるために使う。
+    pub(crate) fn is_value_offset(self) -> bool {
+        matches!(self, WindowFunc::Lag | WindowFunc::Lead)
+    }
+
     /// `alias` 省略時の既定列名（[`AggregateFunc::default_alias`] と同じ命名規則）。
     pub(crate) fn default_alias(self) -> &'static str {
         match self {
+            WindowFunc::Lag => "lag",
+            WindowFunc::Lead => "lead",
             WindowFunc::RowNumber => "row_number",
             WindowFunc::Rank => "rank",
             WindowFunc::DenseRank => "dense_rank",
@@ -3741,11 +3786,24 @@ pub(crate) struct WindowSelectItem {
     /// 複合式は対象外——TASK-214 のスコープ縮小、`docs/design/window-functions.md`
     /// 参照）。
     pub(crate) arg: Option<AggregateArg>,
+    /// `LAG`／`LEAD` の引数（値・オフセット・既定値。それ以外の関数は `None`。
+    /// SQL-64 (1)・Issue #1880）。
+    pub(crate) offset_args: Option<WindowOffsetArgs>,
     /// `PARTITION BY` の列名一覧（順序保持。最大 [`MAX_WINDOW_KEYS`]）。
     pub(crate) partition_by: Vec<String>,
     /// `ORDER BY` の (列名, 降順か, NULL 位置) 一覧（順序保持。最大 [`MAX_WINDOW_KEYS`]）。
     pub(crate) order_by: Vec<WindowOrderItem>,
     pub(crate) alias: Option<String>,
+}
+
+/// `LAG`／`LEAD` の引数 1〜3 個（`<値式> [, <オフセット式> [, <既定値式>]]`。SQL-64 (1)・
+/// Issue #1880）。オフセットは定数に限らず行ごとに評価する式として保持する。束縛は
+/// `sql::parser::bind_window_item`、評価は `sql::window`（Issue #1881）が担う。
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct WindowOffsetArgs {
+    pub(crate) value: Expr,
+    pub(crate) offset: Option<Expr>,
+    pub(crate) default: Option<Expr>,
 }
 
 /// ウィンドウ項目 `OVER (ORDER BY ...)` の 1 キー分（SQL-56・Issue #1791）。従来の
@@ -6612,7 +6670,11 @@ impl<'a> Parser<'a> {
             SqlSurfaceError::unsupported(format!("unsupported window function: {name}"))
         })?;
         self.expect_punct('(')?;
+        let mut offset_args = None;
         let arg = if func.is_ranking() {
+            None
+        } else if func.is_value_offset() {
+            offset_args = Some(self.parse_window_offset_args(&name)?);
             None
         } else {
             // `DISTINCT` は本 Issue のスコープ外（`COUNT(DISTINCT ...) OVER (...)`
@@ -6711,9 +6773,73 @@ impl<'a> Parser<'a> {
             position: 0,
             func,
             arg,
+            offset_args,
             partition_by,
             order_by,
             alias,
+        })
+    }
+
+    /// `LAG`／`LEAD` の `(` を読み終えた位置から引数 1〜3 個（`)` の手前まで）を読む
+    /// （SQL-64 (1)・Issue #1880。[`Self::parse_window_item`] からのみ呼ばれる）。個数が
+    /// 誤りの形（0 個・4 個以上）は該当シグネチャの関数が無い扱い（`42883`。`string_agg` と
+    /// 同じ）、`DISTINCT`・`*` は `42601`。引数区間は式パーサが `42601` に潰す分類
+    /// （入れ子のウィンドウ関数 `42P20`・集計 `42803`・`$n`）を先読みで PostgreSQL と同じ
+    /// SQLSTATE へ振り分けてから解析する。引数の解析中は集計呼び出しの収集を止め、単項
+    /// マイナスを受理する。第 2・第 3 引数だけ裸の `NULL` をリテラルとして受理する。
+    fn parse_window_offset_args(
+        &mut self,
+        name: &str,
+    ) -> Result<WindowOffsetArgs, SqlSurfaceError> {
+        if is_distinct_modifier(&self.tokens, self.pos) {
+            return Err(SqlSurfaceError::unsupported(
+                "DISTINCT is not supported inside LAG/LEAD",
+            ));
+        }
+        if matches!(self.peek(), Some(Token::Punct('*'))) {
+            return Err(SqlSurfaceError::unsupported(
+                "'*' is only allowed inside COUNT(*)",
+            ));
+        }
+        if matches!(self.peek(), Some(Token::Punct(')'))) {
+            return Err(SqlSurfaceError::undefined_function(format!(
+                "function {} requires one to three arguments",
+                name.to_ascii_lowercase()
+            )));
+        }
+        precheck_call_arg_tokens(&self.tokens, self.pos.saturating_sub(1), &LAG_LEAD_ARG_SITE)?;
+        let mut exprs: Vec<Expr> = Vec::with_capacity(3);
+        loop {
+            let saved_calls = self.agg_calls.take();
+            let saved_minus = self.allow_unary_minus;
+            let saved_null = self.allow_null_literal;
+            self.allow_unary_minus = true;
+            self.allow_null_literal = !exprs.is_empty();
+            let parsed = self.parse_value_expr(0);
+            self.allow_null_literal = saved_null;
+            self.allow_unary_minus = saved_minus;
+            self.agg_calls = saved_calls;
+            exprs.push(parsed?);
+            if matches!(self.peek(), Some(Token::Punct(','))) {
+                if exprs.len() >= 3 {
+                    return Err(SqlSurfaceError::undefined_function(format!(
+                        "function {} requires one to three arguments",
+                        name.to_ascii_lowercase()
+                    )));
+                }
+                self.advance();
+                continue;
+            }
+            break;
+        }
+        let mut it = exprs.into_iter();
+        let value = it.next().ok_or_else(|| {
+            SqlSurfaceError::unsupported("LAG/LEAD requires at least one argument")
+        })?;
+        Ok(WindowOffsetArgs {
+            value,
+            offset: it.next(),
+            default: it.next(),
         })
     }
 

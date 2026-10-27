@@ -43,6 +43,10 @@
 //! 集め、[`compute_output_order`] が base scan と同一の比較器で出力順（順列）を
 //! 決め、投影段がその順列で base scan の出力行とウィンドウ値を対応付ける。
 //!
+//! `LAG`／`LEAD` は構文受理・束縛・型検査まで実装済み（SQL-64 (1)・Issue #1880）。評価は
+//! Issue #1881 が接続するまで、束縛段（`sql::parser::bind_window_item`）のゲートが `0A000`
+//! で拒否する。本モジュールの `LAG`／`LEAD` の分岐は、ゲートが外れた後の評価接続点である。
+//!
 //! 対象外（`42601`／`54000` で fail-closed に拒否。allowlist・parser 側で既に拒否
 //! 済みの形も含む）: フレーム句（`ROWS`/`RANGE`/`GROUPS`）・
 //! 名前付きウィンドウ・`FILTER (...)`・関数内 `DISTINCT`・複合式の引数・
@@ -745,7 +749,11 @@ impl<'a> CellWindowEvaluator<'a> {
                 .iter()
                 .chain(item.order_by.iter().map(|o| &o.key))
                 .any(|k| matches!(k, WindowKeyRef::Id))
-                || matches!(item.input, Some(AggregateInput::IdU64));
+                || matches!(item.input, Some(AggregateInput::IdU64))
+                || item
+                    .offset_args
+                    .as_ref()
+                    .is_some_and(|a| a.references_pseudo_id());
             if uses_pseudo_id {
                 return Err(window_bug(
                     "window item references the pseudo column id over evaluated cells",
@@ -888,6 +896,17 @@ fn decode_tier_for_window(schema: &TableSchema, bound: &BoundScan) -> (DecodeTie
     }
 
     for item in bound.windows() {
+        // `LAG`／`LEAD` の値・オフセット・既定値が参照する列も反映する（Issue #1880。
+        // 取りこぼすとマスク外の列を NULL と誤判定する fail-closed 違反になるため、評価を
+        // 接続する Issue #1881 より前に先回りで入れておく）。
+        if let Some(args) = &item.offset_args {
+            if args.mark_referenced_columns(&mut scalar_mask) {
+                has_scalar_reference = true;
+            }
+            if args.references_embedding() {
+                needs_embedding = true;
+            }
+        }
         for key in item
             .partition_by
             .iter()
@@ -1453,6 +1472,10 @@ fn evaluate_partition(
         // （`RowNumber`/`Rank`/`DenseRank`）は行ごとに値が変わるため対象外。
         let aggregate_cell: Option<Cell> = match item.func {
             WindowFunc::RowNumber | WindowFunc::Rank | WindowFunc::DenseRank => None,
+            // `LAG`／`LEAD` の評価は Issue #1881。束縛段のゲートが走査前に拒否するため到達しない。
+            WindowFunc::Lag | WindowFunc::Lead => {
+                return Err(window_bug("lag/lead evaluation is not wired yet"));
+            }
             WindowFunc::Count
             | WindowFunc::Sum
             | WindowFunc::Avg
@@ -1472,6 +1495,9 @@ fn evaluate_partition(
                 WindowFunc::RowNumber => Cell::Integer(row_number as u64),
                 WindowFunc::Rank => Cell::Integer((rank + 1) as u64),
                 WindowFunc::DenseRank => Cell::Integer((dense_rank + 1) as u64),
+                WindowFunc::Lag | WindowFunc::Lead => {
+                    return Err(window_bug("lag/lead evaluation is not wired yet"));
+                }
                 WindowFunc::Count
                 | WindowFunc::Sum
                 | WindowFunc::Avg
@@ -1546,6 +1572,10 @@ pub(crate) fn window_result_type(item: &BoundWindowItem) -> Option<ColumnType> {
         WindowFunc::Avg => AggregateFunc::Avg,
         WindowFunc::Min => AggregateFunc::Min,
         WindowFunc::Max => AggregateFunc::Max,
+        // `LAG`／`LEAD` の結果型は値（既定値があれば統一後）の型（SQL-64 (1)・Issue #1880）。
+        WindowFunc::Lag | WindowFunc::Lead => {
+            return item.offset_args.as_ref()?.result_type.clone();
+        }
     };
     aggregate::aggregate_result_type(func, item.input.as_ref()?)
 }
@@ -1562,6 +1592,9 @@ fn window_func_to_aggregate_func(
         WindowFunc::Max => Ok(AggregateFunc::Max),
         WindowFunc::RowNumber | WindowFunc::Rank | WindowFunc::DenseRank => Err(window_bug(
             "ranking window function unexpectedly requires an accumulator",
+        )),
+        WindowFunc::Lag | WindowFunc::Lead => Err(window_bug(
+            "offset window function unexpectedly requires an accumulator",
         )),
     }
 }
@@ -1963,9 +1996,33 @@ mod budget_regression_tests {
             position: 0,
             func,
             input,
+            offset_args: None,
             partition_by: Vec::new(),
             order_by: Vec::new(),
             name: "w".to_string(),
+        }
+    }
+
+    /// `LAG`／`LEAD` の結果型は値（既定値があれば統一後）の型（SQL-64 (1)・Issue #1880）。
+    #[test]
+    fn window_result_type_for_lag_lead_follows_value_type() {
+        use crate::sql::parser::{BoundWindowOffsetArgs, BoundWindowValue};
+        for func in [WindowFunc::Lag, WindowFunc::Lead] {
+            let mut it = item(func, None);
+            it.offset_args = Some(BoundWindowOffsetArgs {
+                value: BoundWindowValue::Column {
+                    index: 0,
+                    ty: ColumnType::Uuid,
+                },
+                offset: None,
+                default: None,
+                default_column: None,
+                result_type: Some(ColumnType::Uuid),
+                uses_pseudo_id: false,
+            });
+            assert_eq!(window_result_type(&it), Some(ColumnType::Uuid));
+            // 引数が無い（束縛前の）項目は型を公告しない（fail-closed）。
+            assert_eq!(window_result_type(&item(func, None)), None);
         }
     }
 
@@ -2064,6 +2121,7 @@ mod budget_regression_tests {
                 position: 1,
                 func: WindowFunc::Min,
                 input: Some(AggregateInput::TextColumn(0)),
+                offset_args: None,
                 partition_by: Vec::new(),
                 order_by: Vec::new(),
                 name: "min_body".to_string(),
