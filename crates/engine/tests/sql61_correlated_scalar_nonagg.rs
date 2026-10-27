@@ -579,6 +579,64 @@ fn where_static_errors_win_regardless_of_data() {
     assert_eq!(code, "42601");
 }
 
+#[test]
+fn where_pseudo_id_value_and_deferred_nested_errors() {
+    let (core, ctx, _g) = setup();
+    // 値が内側の疑似列 `id`（a1→1、a2→3）。外側 `id` との等価は a1 だけ真。
+    assert_eq!(
+        ids(
+            &core,
+            &ctx,
+            "SELECT id FROM a WHERE id = (SELECT b.id FROM b WHERE b.aid = a.k AND b.flag = true) \
+             LIMIT 100"
+        ),
+        vec![1]
+    );
+    // 内側 WHERE の入れ子スカラーサブクエリが 2 行以上（非相関・4 行）で 21000 になる形。
+    let nested = "b.v = (SELECT x.v FROM b x)";
+    // 投影位置: 外側が 0 行なら内側は評価されずエラーにならず、列メタデータは確定する。
+    let empty = query(
+        &core,
+        &ctx,
+        &format!(
+            "SELECT id, (SELECT b.v FROM b WHERE b.aid = a.k AND {nested}) FROM a \
+             WHERE v > 1000 LIMIT 100"
+        ),
+    );
+    assert!(empty.rows.is_empty());
+    assert_eq!(empty.columns.len(), 2);
+    // 外側が 1 行以上なら遅延していた 21000 を返す。
+    let (code, msg) = err(
+        &core,
+        &ctx,
+        &format!("SELECT id, (SELECT b.v FROM b WHERE b.aid = a.k AND {nested}) FROM a LIMIT 100"),
+    );
+    assert_eq!(code, "21000", "{msg}");
+    assert_no_reserved_names("deferred", &msg);
+    // WHERE 位置は実行時に解決するため 21000 をそのまま返す。
+    let (code, _) = err(
+        &core,
+        &ctx,
+        &format!(
+            "SELECT id FROM a WHERE v = (SELECT b.v FROM b WHERE b.aid = a.k AND {nested}) \
+             LIMIT 100"
+        ),
+    );
+    assert_eq!(code, "21000");
+    // 静的エラー（入れ子の値族の不一致 22000）は遅延対象の 21000 より優先する（両位置）。
+    let mismatch = "t = (SELECT x.v FROM b x)";
+    for sql in [
+        format!("SELECT id, (SELECT b.v FROM b WHERE b.aid = a.k AND {mismatch}) FROM a LIMIT 100"),
+        format!(
+            "SELECT id FROM a WHERE v = (SELECT b.v FROM b WHERE b.aid = a.k AND {mismatch}) \
+             LIMIT 100"
+        ),
+    ] {
+        let (code, msg) = err(&core, &ctx, &sql);
+        assert_eq!(code, "22000", "sql={sql:?} msg={msg}");
+    }
+}
+
 // --- テナント境界（RLS-10） ----------------------------------------------------------------------
 
 #[test]
