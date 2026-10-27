@@ -337,7 +337,7 @@ fn union_all_keeps_duplicates() {
         put_edge(s, "alice", 4, 3, 4);
     });
     let sql = "WITH RECURSIVE r(n) AS (\
-                 SELECT 1 UNION ALL SELECT e.dst FROM edges e JOIN r ON e.src = r.n) \
+                 SELECT CAST(1 AS BIGINT) UNION ALL SELECT e.dst FROM edges e JOIN r ON e.src = r.n) \
                SELECT n FROM r ORDER BY n";
     assert_eq!(rows(&core, "alice", sql), col(&["1", "2", "3", "4", "4"]));
 }
@@ -400,7 +400,7 @@ fn row_limit_stops_exploding_recursion() {
         put_edge(s, "alice", 2, 1, 1);
     });
     let sql = "WITH RECURSIVE r(n) AS (\
-                 SELECT 1 UNION ALL SELECT e.dst FROM edges e JOIN r ON e.src = r.n) \
+                 SELECT CAST(1 AS BIGINT) UNION ALL SELECT e.dst FROM edges e JOIN r ON e.src = r.n) \
                SELECT count(*) FROM r";
     assert_eq!(code(&core, "alice", sql), "54000");
 }
@@ -605,7 +605,7 @@ fn recursive_reference_shadows_real_table() {
         put_edge(s, "alice", 2, 2, 3);
     });
     let join_form = "WITH RECURSIVE tree(n) AS (\
-                       SELECT 1 UNION ALL SELECT e.dst FROM edges e JOIN tree ON e.src = tree.n) \
+                       SELECT CAST(1 AS BIGINT) UNION ALL SELECT e.dst FROM edges e JOIN tree ON e.src = tree.n) \
                      SELECT n FROM tree ORDER BY n";
     assert_eq!(rows(&core, "alice", join_form), col(&["1", "2", "3"]));
 }
@@ -669,4 +669,89 @@ fn describe_matches_execute() {
         .describe_parsed_in_session(&session, &parsed)
         .expect_err("describe must fail");
     assert_eq!(err.wire_code(), "42804");
+}
+
+/// Describe の SQLSTATE（`None` は Describe が成功する）。
+fn describe_code(core: &EngineCore, sql: &str) -> Option<String> {
+    let session = SessionState::default();
+    let parsed = core.parse_sql(sql).expect("parse");
+    core.describe_parsed_in_session(&session, &parsed)
+        .err()
+        .map(|e| e.wire_code().to_string())
+}
+
+/// 作業表の型の写像（Issue #1870 レビュー指摘）: 整数型の拡大は `42804`、作業表で評価できない型は
+/// 計画時に固定 `0A000`、疑似列 `id` を結果列にしたアンカー項は BIGINT の実列として再帰できる。
+/// Execute と Describe が同じ SQLSTATE を返す。
+#[test]
+fn work_table_type_mapping_is_consistent() {
+    let (core, _g) = open_core_with(seed_tree);
+    let cases: &[(&str, &str)] = &[
+        // 整数の拡大（SMALLINT アンカー＋INTEGER の再帰項）は事前に 42804。
+        (
+            "WITH RECURSIVE t(n) AS (SELECT CAST(32767 AS SMALLINT) UNION ALL \
+               SELECT CAST(n AS INTEGER) + 1 FROM t WHERE n < 32768) SELECT n FROM t",
+            "42804",
+        ),
+        (
+            "WITH RECURSIVE t(n) AS (SELECT CAST(1 AS INTEGER) UNION ALL \
+               SELECT CAST(n AS BIGINT) + 1 FROM t WHERE n < 3) SELECT n FROM t",
+            "42804",
+        ),
+        // 型が一致していれば受理（SMALLINT のまま再帰）。
+        (
+            "WITH RECURSIVE t(n) AS (SELECT CAST(1 AS SMALLINT) UNION ALL \
+               SELECT CAST(n + 1 AS SMALLINT) FROM t WHERE n < 3) SELECT n FROM t",
+            "",
+        ),
+        // 作業表から述語・式へ渡せない型は 0A000（実行時 Internal にしない）。
+        (
+            "WITH RECURSIVE t(n, tm) AS (SELECT 1, CAST('12:00:00' AS TIME) UNION ALL \
+               SELECT n + 1, tm FROM t WHERE n < 2) SELECT n FROM t",
+            "0A000",
+        ),
+        (
+            "WITH RECURSIVE t(n, tm) AS (SELECT 1, CAST('2024-01-01 00:00:00+00' AS TIMESTAMPTZ) \
+               UNION ALL SELECT n + 1, tm FROM t WHERE n < 2) SELECT n FROM t",
+            "0A000",
+        ),
+        (
+            "WITH RECURSIVE t(n, iv) AS (SELECT 1, CAST('1 day' AS INTERVAL) UNION ALL \
+               SELECT n + 1, iv FROM t WHERE n < 2) SELECT n FROM t",
+            "0A000",
+        ),
+        // 疑似列 `id` のアンカー（BIGINT の実列）。再帰項が実列を返しても、`id` を返しても受理。
+        (
+            "WITH RECURSIVE t(i) AS (SELECT id FROM tree WHERE name = 'root' UNION ALL \
+               SELECT i FROM t WHERE i < 0) SELECT i FROM t",
+            "",
+        ),
+        (
+            "WITH RECURSIVE t(i) AS (SELECT id FROM tree WHERE name = 'root' UNION ALL \
+               SELECT i + 1 FROM t WHERE i < 0) SELECT i FROM t",
+            "",
+        ),
+        (
+            "WITH RECURSIVE t(i) AS (SELECT id FROM tree WHERE name = 'root' UNION ALL \
+               SELECT c.id FROM tree c JOIN t ON c.parent_id = t.i) SELECT i FROM t",
+            "",
+        ),
+    ];
+    for (sql, expected) in cases {
+        let got = match run(&core, "alice", sql) {
+            Ok(_) => String::new(),
+            Err(e) => e.wire_code().to_string(),
+        };
+        assert_eq!(&got, expected, "execute: {sql}");
+        let described = describe_code(&core, sql).unwrap_or_default();
+        assert_eq!(&described, expected, "describe: {sql}");
+    }
+    // 疑似列 `id` のアンカーの値は作業表を経て保たれる。
+    let ids = rows(
+        &core,
+        "alice",
+        "WITH RECURSIVE t(i) AS (SELECT id FROM tree WHERE name = 'root' UNION ALL \
+           SELECT i FROM t WHERE i < 0) SELECT count(*) FROM t",
+    );
+    assert_eq!(ids, col(&["1"]));
 }

@@ -14,7 +14,7 @@
   なったら終了する。出力順は生成順。階層走査と数列が評価できる。暫定の固定上限（反復 1,000 回・累積 100,000 行。
   超過は部分結果を返さず `54000`）を置く（設定化は #1871）。挙動変更: 構造検証を通過した `UNION ALL` の再帰形は
   従来 `0A000` だったが評価される。自己参照の無い `WITH RECURSIVE` は通常 CTE として実行される。`UNION`（重複除去）・
-  複数定義・セッション最上位以外の文は `0A000` のまま。詳細は [recursive-cte.md](docs/design/recursive-cte.md)。
+  複数定義・セッション最上位以外の文は `0A000` のまま。再帰項の整数型がアンカー型と異なる形は `42804`、作業表で評価できない型（`TIME`・`TIMESTAMPTZ`・`INTERVAL` 等）は `0A000`。詳細は [recursive-cte.md](docs/design/recursive-cte.md)。
   BREAKING CHANGE: 公開 enum `Statement` に variant（`RecursiveCte`）を追加したため、網羅的な `match` は更新が要る。
 - 相関スカラーサブクエリを式の内側で使えるようにする（Issue #1848・SQL-61）。算術・比較・`COALESCE`・`CASE`・関数引数・`CAST` の
   被演算子として、投影の式項目・WHERE の式述語・スカラー `ORDER BY` の式キーに置ける（`(SELECT max(v) ...) + 1`・
