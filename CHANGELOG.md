@@ -11,6 +11,11 @@
 
 - CTE 本文の `ORDER BY`・`LIMIT`・`OFFSET` を受け付ける（Issue #1862・SQL-62）。本文に `LIMIT` を持つ CTE はインライン展開では `LIMIT` が落ちるため、常に具体化して評価し（単一表の主クエリは評価後射影形、JOIN は入力 slot）、外側の `WHERE` は本文の `LIMIT` の後に適用される。`LIMIT` なしの本文は暗黙上限で、可視行が `--max-result-rows` を超えると `54000`。
   挙動変更: 従来 `42601` で拒否していた形が受理される。他の CTE が読む連鎖・ビュー本文や cursor などインライン専用の文脈での参照は固定 `0A000`。公開 enum は変えない（非 BREAKING）。詳細は [cte.md](docs/design/cte.md) の「Issue #1862 追記」節。
+- 再帰 CTE の反復回数・累積行数の上限を起動時設定にする（Issue #1871・SQL-35・SQL-46。段階 B）。
+  wire-server に `--max-recursive-cte-iterations <1-1000>`・`--max-recursive-cte-rows <1-100000>` を追加し、
+  `EngineCore::with_recursive_cte_limits` へ注入する。ハード上限は既定値（反復 1,000 回・累積 100,000 行）と
+  同じで、下げる方向だけ設定できる。超過は `54000`。範囲外・非数値・値欠落・重複指定は起動エラー。
+  累積行数は `--max-result-rows` との小さい方が実効上限。公開 API は追加のみ（`engine::recursive_cte_limits`）。
 - `WITH RECURSIVE` の反復評価器を追加する（Issue #1870・SQL-35。段階 B）。アンカー項の結果を最初の作業表とし、
   「前回の反復で増えた行だけ」を作業表として再帰項（単一関係、または基底表との JOIN）を再実行し、作業表が空に
   なったら終了する。出力順は生成順。階層走査と数列が評価できる。暫定の固定上限（反復 1,000 回・累積 100,000 行。
