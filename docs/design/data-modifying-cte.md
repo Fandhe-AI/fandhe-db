@@ -48,3 +48,56 @@ CTE 本文に単一表の `INSERT ... VALUES`・`UPDATE`・`DELETE`（各 `RETUR
   SELECT 本文 CTE からの参照、主クエリが DML の形は未対応
 - 副文の `INSERT` の行数上限（`max_insert_rows`）は検証段では適用されない。実行結線時に必ず適用する
 - `WITH RECURSIVE` 内のデータ変更 CTE の扱いは再帰 CTE の実装後に確認する
+
+## Issue #1876（書き込み経路での実行）
+
+ポインタ: SQL-63 (1)〜(6)・RECOVER-1・RECOVER-11・RLS-9・RLS-10 (b)。親 #1874、後続 #1877（文内の可視性・
+同一行の多重変更・失敗時動作）・#1878（RLS・権限の境界テスト）。
+
+### 経路
+
+| 入口 | 役割 |
+| ---- | ---- |
+| `sql::allowlist::validate_session_with_tokens` | 最上位の文だけが呼ぶ。`parse_with_clause` の結果でデータ変更 CTE を検出し、実行計画 `ValidatedDataModifyingCte` を返す（第 2 の検出器を作らない）。読み取り入口（`validate_sql_tokens`・cursor・COPY・CREATE VIEW・CTAS・EXPLAIN・サブクエリ内側）は従来どおり検証後に固定 `0A000` |
+| `ParsedSql::DataModifyingCte` | `ParsedSql::Statement`（読み取り専用）に載せない。wire 側が非書き込みと誤判定して commit 後の失敗を包み損ねないため |
+| `core/dm_cte_exec.rs` | 事前照合 → 副文を定義順に実行 → 台帳記録 → 主クエリの外側処理。副文は単独 DML と同じ `execute_*_returning_form` を通す |
+| `view_buffered::plan_outer_parts` | 評価後射影形ビューと同じ外側処理（Describe と Execute が同じ入口） |
+
+### 実行する形（ゲート）
+
+検証段（書き込みトランザクションを開く前）で判定し、それ以外は固定 `0A000`（表は変わらない）。
+
+| 形 | 扱い |
+| ---- | ---- |
+| データ変更 CTE が 1 つで、主クエリの FROM がその CTE（`RETURNING` あり） | 実行 |
+| データ変更 CTE が 2 つ以上 | `0A000`（可視性と多重変更の順序は #1877） |
+| 主クエリの FROM が実表・ビュー・SELECT 本文 CTE | `0A000`（主クエリの読み取りスナップショットは #1877） |
+| `RETURNING` なしの副文を参照 | `0A000` |
+| 一時表が対象 | `0A000`（`temp_route` が振り分け対象外として拒否。一時コアへ流さない） |
+
+### トランザクション
+
+- autocommit は `execute_subquery_dml_autocommit` と同じ文単位の暗黙トランザクションで実行する。副文ごとの
+  autocommit では原子的にならず、`WriteTarget::InTxn` を直接使うと遅延 `FOREIGN KEY` 検査が抜けるため、
+  `commit_implicit` を通す。明示・暗黙トランザクションは共有 write txn 上で実行し、書いた全表へ `mark_written` する
+- 失敗（副文の制約違反・主クエリのエラー・行数上限超過）は txn の abort で全体が破棄される
+
+### 台帳（文単位 1 エントリ）
+
+- 文末の `USING OPERATION_ID '<id>'` を主クエリから切り離して受理する（副文内の指定は従来どおり `42601`）。
+  `--require-operation-id` 構成での省略・`NULL` は検証段で `23502`
+- 文ハッシュは `OpTag::DataModifyingCte`（= 29）で、送られた文のトークン列だけが材料（結果行の値は含めない）。
+  再送は最初の副文を実行する前の事前照合で `23505`、別内容は `22023`
+- 副文は `operation_id` を持たないため、副文の実行中だけ台帳モードを「省略可」へ切り替える
+  （`SubstatementLedgerScope`。`Ledgered` のままだと副文が `23502` になる）。副文は台帳に触れない
+- 台帳・世代の単位は「定義順で最初のデータ変更 CTE の対象表」に決定的に固定する。同じ `operation_id` を同表へ
+  直接 DML で再送した場合は別ドメインのハッシュで `22023` になる
+
+### 対象外（後続）
+
+- 文開始時点スナップショットの可視性、同一行を複数の副文が変更する場合の順序、複数のデータ変更 CTE、
+  主クエリが実表・ビュー・SELECT 本文 CTE を読む形（#1877）
+- RLS・権限の境界テスト（#1878）。DML 単位の権限検査（SQL-40 相当）は現状実装がなく、本 Issue では副文が
+  単独 DML と同じ経路を通ることだけを保証する
+- 主クエリが DML の形、`INSERT ... SELECT`／`UPDATE ... FROM`／`DELETE ... USING` 本文、ビュー・一時表が対象の本文、
+  `WITH RECURSIVE` 内のデータ変更、拡張クエリの `$n`、NoSQL 表層（従来どおり拒否）
