@@ -347,20 +347,25 @@ pub(crate) fn validate_recursive_with(
             }
         }
         let refs = relation_refs(body, name);
-        let kind = if refs.is_empty() {
-            structural(body, limits)?;
-            RecursiveCteBody::NonRecursive {
+        let checked = if refs.is_empty() {
+            structural(body, limits).map(|_| RecursiveCteBody::NonRecursive {
                 tokens: body.clone(),
-            }
+            })
         } else {
-            match validate_recursive_body(name, body, limits, &mut deferred) {
-                Ok(k) => k,
-                Err(e) if e.wire_code() == "42P19" => {
-                    structural_err.get_or_insert(e);
-                    continue;
-                }
-                Err(e) => return Err(e),
+            validate_recursive_body(name, body, limits, &mut deferred)
+        };
+        // 構文エラー（42601 等）は即返し、42P19 と 0A000 は保留して優先順位（構文 → 42P19 → 機能ゲート）を保つ。
+        let kind = match checked {
+            Ok(k) => k,
+            Err(e) if e.wire_code() == "42P19" => {
+                structural_err.get_or_insert(e);
+                continue;
             }
+            Err(e) if e.wire_code() == "0A000" => {
+                deferred.get_or_insert(e);
+                continue;
+            }
+            Err(e) => return Err(e),
         };
         defs.push(RecursiveCteDef {
             name: name.clone(),
@@ -619,6 +624,8 @@ mod tests {
             ("WITH RECURSIVE t(n) AS (SELECT n FROM t) SEARCH DEPTH FIRST BY n SET o SELECT n FROM t", "42P19"),
             ("WITH RECURSIVE t(n) AS (SELECT FROM t) CYCLE n SET c USING p SELECT n FROM t", "42601"),
             ("WITH RECURSIVE t(n) AS (SELECT 1 UNION ALL SELECT n + 1 FROM t) SEARCH DEPTH FIRST BY n, m SET o, u AS (SELECT FROM docs) SELECT n FROM t", "42601"),
+            ("WITH RECURSIVE t(n) AS (SELECT n FROM t), u(m) AS (SELECT 1 UNION ALL SELECT m FROM u LIMIT 3) SELECT n FROM t", "42P19"),
+            ("WITH RECURSIVE t(n) AS (SELECT n FROM t), u AS (DELETE FROM docs), w AS (WITH v AS (SELECT 1) SELECT 1) SELECT n FROM t", "42P19"),
         ] {
             assert_eq!(code(sql), want, "{sql}");
         }
