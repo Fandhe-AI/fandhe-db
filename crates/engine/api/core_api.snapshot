@@ -11,6 +11,7 @@ pub mod catalog;
 pub mod chunking;
 pub mod collation;
 pub mod core;
+pub mod correlated_limits;
 pub mod crypto;
 pub mod datetime;
 pub mod declarative_filter;

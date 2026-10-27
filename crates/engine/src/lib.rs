@@ -237,6 +237,7 @@ pub mod collation;
 pub(crate) mod column_rewrite;
 pub(crate) mod constraint;
 pub mod core;
+pub mod correlated_limits;
 pub mod crypto;
 pub mod datetime;
 pub mod declarative_filter;

@@ -33,9 +33,7 @@ use std::sync::Arc;
 use crate::catalog::{ColumnDef, ColumnType, TableSchema};
 use crate::sql::allowlist::{SqlSurfaceError, WherePredicate};
 use crate::sql::correlation::{self, Correlation};
-use crate::sql::join::semi::{
-    CorrelatedBudget, OuterSource, Residual, MAX_CORRELATED_REEVALUATIONS,
-};
+use crate::sql::join::semi::{CorrelatedBudget, OuterSource, Residual};
 use crate::sql::join::values::{key_class, JoinKeyClass};
 use crate::sql::udf_call::{BinOp, CollDerivation, Expr, UdfRegistry};
 use crate::sql::where_tree::{BoundConjunction, BoundOrGroup};
@@ -56,20 +54,32 @@ pub(crate) struct CorrelatedCtx {
 impl CorrelatedCtx {
     /// 相関を拒否する文脈（従来の挙動）。
     pub(crate) fn disabled() -> Self {
-        Self::build(false, crate::join_limits::MAX_JOIN_INPUT_ROWS)
+        Self::build(
+            false,
+            crate::join_limits::MAX_JOIN_INPUT_ROWS,
+            crate::correlated_limits::MAX_CORRELATED_REEVALUATIONS,
+        )
     }
 
-    /// 相関 `EXISTS` を実行する文脈。内側の入力行数の上限は JOIN と同じ起動時設定
-    /// （[`crate::join_limits::JoinSizeLimits`]）に従う。
-    pub(crate) fn enabled(join_limits: crate::join_limits::JoinSizeLimits) -> Self {
-        Self::build(true, join_limits.max_input_rows())
+    /// 相関サブクエリを実行する文脈。内側の入力行数の上限は JOIN と同じ起動時設定
+    /// （[`crate::join_limits::JoinSizeLimits`]）、再評価回数の上限は起動時設定
+    /// （[`crate::correlated_limits::CorrelatedLimits`]。Issue #1847）に従う。
+    pub(crate) fn enabled(
+        join_limits: crate::join_limits::JoinSizeLimits,
+        correlated_limits: crate::correlated_limits::CorrelatedLimits,
+    ) -> Self {
+        Self::build(
+            true,
+            join_limits.max_input_rows(),
+            correlated_limits.max_reevaluations(),
+        )
     }
 
-    fn build(enabled: bool, max_input_rows: usize) -> Self {
+    fn build(enabled: bool, max_input_rows: usize, max_reevaluations: usize) -> Self {
         Self {
             enabled,
             budget: Arc::new(CorrelatedBudget::new(
-                MAX_CORRELATED_REEVALUATIONS,
+                max_reevaluations,
                 crate::join_limits::MAX_JOIN_COMPARISONS,
             )),
             max_input_rows,
