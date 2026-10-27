@@ -22,8 +22,8 @@
 //!   なら、その段の結合キーへ昇格して残余から外す（Issue #1834・`where_promote`）。
 //!   空キー段（CROSS／カンマ）はハッシュ結合になり、出力行数上限は一致件数で判定される。
 //!
-//! ON は `on_split` が結合キー／残余述語へ分類し、キー無しは `42601` で拒否する
-//! （Issue #1829）。残余述語（左のみ・右のみ・混在）は一致条件の一部として
+//! ON は `on_split` が結合キー／残余述語へ分類する（Issue #1829）。キー無しの段は NLJ で
+//! 実行し（Issue #1839）、両側保存が残るキー無し FULL だけ `0A000` で拒否する。残余述語（左のみ・右のみ・混在）は一致条件の一部として
 //! [`StepPlan`] の `on_*` へ束縛し、`exec::join_step` が評価する（Issue #1830）。
 //! ON 残余は WHERE の strict マスク簡約へは流さない（外部結合の保存側を消さないため）。
 
@@ -486,7 +486,7 @@ fn has_compare(expr: &JoinWhereExpr) -> bool {
 }
 
 /// 最上位の `AND` を平坦化して conjunct を集める。
-fn flatten_conjuncts<'e>(expr: &'e JoinWhereExpr, out: &mut Vec<&'e JoinWhereExpr>) {
+pub(super) fn flatten_conjuncts<'e>(expr: &'e JoinWhereExpr, out: &mut Vec<&'e JoinWhereExpr>) {
     match expr {
         JoinWhereExpr::And(ch) => {
             for c in ch {
@@ -577,7 +577,7 @@ fn to_where_predicates(
     }
 }
 
-fn collect_leaf_colrefs<'e>(expr: &'e JoinWhereExpr, out: &mut Vec<&'e ColumnRef>) {
+pub(super) fn collect_leaf_colrefs<'e>(expr: &'e JoinWhereExpr, out: &mut Vec<&'e ColumnRef>) {
     match expr {
         JoinWhereExpr::Leaf(p) => out.extend(leaf_colrefs(p)),
         JoinWhereExpr::And(ch) | JoinWhereExpr::Or(ch) => {
@@ -717,10 +717,10 @@ fn bind_on_residuals<'a>(
 ) -> Result<OnResiduals, SqlSurfaceError> {
     let saved = std::mem::replace(&mut b.scope, step_scope);
     let r = (|| {
-        let mut bind = |leaves: &[&JoinWherePredicate]| -> Result<Vec<ResNode>, SqlSurfaceError> {
-            leaves
+        let mut bind = |conjs: &[&JoinWhereExpr]| -> Result<Vec<ResNode>, SqlSurfaceError> {
+            conjs
                 .iter()
-                .map(|leaf| build_residual(&JoinWhereExpr::Leaf((*leaf).clone()), b, udfs))
+                .map(|conj| build_residual(conj, b, udfs))
                 .collect()
         };
         Ok(OnResiduals {
@@ -832,11 +832,9 @@ pub(super) fn build_plan<'a>(
                     // Issue #1838（D11）: キー無し FULL はここでは拒否せず、束縛をすべて終えた後
                     // （WHERE の外部結合簡約の後）で `0A000` か従来の `42601` を決める。
                     keyless_full_on.push(k);
-                } else if split.keys.is_empty() {
-                    return Err(SqlSurfaceError::unsupported(
-                        "JOIN ON condition must reference both sides of the join",
-                    ));
                 }
+                // Issue #1839: キー無しの非 FULL 段は拒否せず NLJ へ流す。ON には葉が 1 個以上あるため
+                // キー無しは常に ON 残余ありで、`exec::join_step` が NLJ を選ぶ（D1）。
                 keys.reserve(split.keys.len());
                 for (acc, new) in &split.keys {
                     let acc_class = key_class(acc.column_type())?;
@@ -1026,8 +1024,8 @@ pub(super) fn build_plan<'a>(
 
     // Issue #1838（D11）: キー無し ON の FULL の判定。列解決・型エラー（解析段）がすべて済んだ後に、
     // WHERE の strict 述語による外部結合の簡約結果で決める（PostgreSQL も簡約を結合方式の選択より
-    // 先に行う）。両側の保存が残る段は `0A000`。片側以下に簡約された段は NLJ 経路の SQL 到達（#1839）
-    // まで従来の `42601`。判定は束縛結果だけで決まり、行データ（テナントの可視行）に依存しない。
+    // 先に行う）。両側の保存が残るキー無し段だけ `0A000`。片側以下に簡約された段や WHERE の等価昇格で
+    // キーを得た段は、NLJ／ハッシュ経路へそのまま流す（Issue #1839）。判定は束縛結果だけで決まり、行データ（テナントの可視行）に依存しない。
     for &k in &keyless_full_on {
         if let Some(s) = steps.get(k) {
             if s.keys.is_empty() && s.preserve_acc && s.preserve_new {
@@ -1035,9 +1033,6 @@ pub(super) fn build_plan<'a>(
                     "FULL JOIN is only supported with merge-joinable or hash-joinable join conditions",
                 ));
             }
-            return Err(SqlSurfaceError::unsupported(
-                "JOIN ON condition must reference both sides of the join",
-            ));
         }
     }
 
