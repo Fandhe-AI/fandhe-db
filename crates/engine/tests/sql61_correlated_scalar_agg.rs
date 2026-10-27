@@ -738,8 +738,8 @@ fn unsupported_shapes_are_rejected_fail_closed() {
         // 非等価の相関・キーなし（行ごとの再評価は範囲外）。
         "SELECT id, (SELECT max(b.v) FROM b WHERE b.v < a.v) FROM a LIMIT 100",
         "SELECT id, (SELECT max(b.v) FROM b WHERE b.aid = a.k OR b.v = a.v) FROM a LIMIT 100",
-        // 非集計形（#1847 まで）。
-        "SELECT id, (SELECT b.v FROM b WHERE b.aid = a.k LIMIT 1) FROM a LIMIT 100",
+        // 非集計形で投影が式（Issue #1847 の受理形は単一の裸の列だけ）。
+        "SELECT id, (SELECT b.v + 1 FROM b WHERE b.aid = a.k LIMIT 1) FROM a LIMIT 100",
         // 同じ内側列への等価の重複。
         "SELECT id, (SELECT count(*) FROM b WHERE b.aid = a.k AND b.aid = a.v) FROM a LIMIT 100",
     ];
@@ -758,7 +758,7 @@ fn unsupported_shapes_are_rejected_fail_closed() {
     for sql in [
         "SELECT id FROM a WHERE v < (SELECT max(b.v) FROM b WHERE b.v < a.v) LIMIT 100",
         "SELECT id FROM a WHERE v < (SELECT max(b.v + a.v) FROM b WHERE b.aid = a.k) LIMIT 100",
-        "SELECT id FROM a WHERE v < (SELECT b.v FROM b WHERE b.aid = a.k LIMIT 1) LIMIT 100",
+        "SELECT id FROM a WHERE v < (SELECT b.v + 1 FROM b WHERE b.aid = a.k LIMIT 1) LIMIT 100",
     ] {
         let (code, msg) = err(&core, &ctx, sql);
         assert_eq!(code, "42601", "sql={sql:?} msg={msg}");

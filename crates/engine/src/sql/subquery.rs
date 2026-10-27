@@ -2006,7 +2006,7 @@ pub(crate) fn resolve_scalar_projection_items(
                         cell: Cell::Null,
                         multi_row: false,
                         deferred_error: None,
-                        correlated: Some(CorrelatedScalarValues {
+                        correlated: Some(CorrelatedScalarValues::Agg {
                             values: std::sync::Arc::new(table.values),
                             empty: table.empty,
                             keys: table.keys,
@@ -2016,6 +2016,67 @@ pub(crate) fn resolve_scalar_projection_items(
                     // 束縛後の実行時データ例外は外側の行数判明まで遅延する（非相関と同じ契約）。
                     Err(e) if is_deferrable_runtime_error(&e) => {
                         let Some(inner_meta) = agg_meta else {
+                            return Err(e);
+                        };
+                        out.push(ResolvedScalarItem {
+                            position: item.position,
+                            meta: alias_scalar_meta(&inner_meta, item.alias.as_ref()),
+                            cell: Cell::Null,
+                            multi_row: false,
+                            deferred_error: Some(e),
+                            correlated: None,
+                        });
+                    }
+                    Err(e) => return Err(e),
+                }
+                continue;
+            }
+        }
+        // 非集計形の相関スカラー（Issue #1847）。内側を 1 回だけ実体化し、外側の行ごとの引き当て・
+        // 基数判定（`21000`）は [`merge_scalar_projection_items`] が隠し列で行う。
+        if corr.is_enabled() {
+            if let Some((validated, inner_schema, correlation)) = classify_correlated_scan(
+                &item.inner_tokens,
+                item.depth,
+                outer_scopes,
+                read_txn,
+                lookup,
+                nesting_limits,
+            )? {
+                let mut rows_meta: Option<ColumnMeta> = None;
+                match resolve_correlated_scalar_rows(
+                    validated,
+                    inner_schema,
+                    correlation,
+                    &ScalarPosition::Projection,
+                    outer_scopes,
+                    read_txn,
+                    ctx,
+                    lookup,
+                    udfs,
+                    group_limits,
+                    nesting_limits,
+                    result_limits,
+                    budget,
+                    in_value_budget,
+                    corr,
+                    &mut rows_meta,
+                ) {
+                    Ok(resolved) => out.push(ResolvedScalarItem {
+                        position: item.position,
+                        meta: alias_scalar_meta(&resolved.meta, item.alias.as_ref()),
+                        cell: Cell::Null,
+                        multi_row: false,
+                        deferred_error: None,
+                        correlated: Some(CorrelatedScalarValues::Rows {
+                            probe: resolved.probe_ref(),
+                            outer: std::sync::Arc::new(resolved.outer),
+                            width: resolved.width,
+                        }),
+                    }),
+                    // 束縛後の実行時データ例外は外側の行数判明まで遅延する（非相関と同じ契約）。
+                    Err(e) if is_deferrable_runtime_error(&e) => {
+                        let Some(inner_meta) = rows_meta else {
                             return Err(e);
                         };
                         out.push(ResolvedScalarItem {
@@ -2193,7 +2254,7 @@ pub(crate) fn merge_scalar_projection_items(
         for row in &result.rows {
             let value = c.value_for(row.id, &row.cells, hidden_base, hidden)?;
             let per_cell = std::mem::size_of::<Cell>()
-                .checked_add(super::cursor::estimate_cell_bytes(value))
+                .checked_add(super::cursor::estimate_cell_bytes(&value))
                 .ok_or_else(merge_too_large)?;
             total_bytes = total_bytes
                 .checked_add(per_cell)
@@ -2201,7 +2262,7 @@ pub(crate) fn merge_scalar_projection_items(
             if total_bytes > crate::arena::MAX_ARENA_TOTAL_BYTES {
                 return Err(merge_too_large());
             }
-            cells.push(value.clone());
+            cells.push(value);
         }
         per_row.push(Some(cells));
     }
@@ -3152,6 +3213,8 @@ enum CorrelatedShape<'a> {
         target_column: &'a str,
         negated: bool,
     },
+    /// 非集計形の相関スカラー（Issue #1847。WHERE 位置の比較・投影位置の両方）。
+    Scalar,
 }
 
 /// 相関 `EXISTS` の、実行を伴わない準備の結果（[`prepare_correlated_exists`]）。
@@ -3166,6 +3229,14 @@ struct PreparedCorrelated {
     offset: usize,
     /// 相関 `NOT IN` の対象ペア `(y, x)`（等価キーには入れない。`ProbeKind::NotIn` が持つ）。
     not_in_target: Option<correlated_exists::KeyPair>,
+    /// 非集計形の相関スカラー（Issue #1847）の投影列 y（疑似列 `id` を含む）。それ以外は `None`。
+    scalar_column: Option<String>,
+    /// y が疑似列 `id` か（セルは行 `id` から作る）。
+    scalar_pseudo_id: bool,
+    /// y の列メタデータ（外側の行数・値に依存しない。非集計形の相関スカラーだけ `Some`）。
+    scalar_meta: Option<ColumnMeta>,
+    /// 内側の明示 `LIMIT n`（省略・`LIMIT ALL` は `None`）。
+    scalar_limit: Option<usize>,
 }
 
 /// 相関 `EXISTS` の準備（Issue #1842）。実行も走査もしない静的な処理だけを行い、実行経路
@@ -3217,18 +3288,43 @@ fn prepare_correlated_exists(
     shape_probe.where_predicates = Vec::new();
     shape_probe.limit = 1;
     shape_probe.limit_implicit = false;
-    super::parser::bind_scan_with_dummy_flags(
+    let shape_bound = super::parser::bind_scan_with_dummy_flags(
         &shape_probe,
         inner_schema,
         udfs,
         &[],
         &result_limits,
     )?;
+    // 非集計形の相関スカラー（Issue #1847）の値の列メタデータ（外側の行数・値に依存しない）。
+    let shape_meta = match super::describe::scan_columns(&shape_bound, inner_schema) {
+        Ok(metas) => match metas.as_slice() {
+            [m] => Some(m.clone()),
+            _ => None,
+        },
+        Err(_) => None,
+    };
 
     // (2b) 相関 `IN`／`NOT IN` の静的検査（非相関 `IN` と同じ順序・同じコード・文言。内側の行数・値に
     // 依存しない）。対象ペア `(y, x)` を結合キーの形へ写せない組は `0A000`。
     let in_pair = match shape {
         CorrelatedShape::Exists { .. } => None,
+        CorrelatedShape::Scalar => {
+            if projected_cols.len() != 1 {
+                return Err(SqlSurfaceError::unsupported(
+                    "subquery used as a value must select exactly one column",
+                ));
+            }
+            // 外側の行ごとの先頭 n 件（`ORDER BY` と `LIMIT`／`OFFSET` の併用）は実現できない。
+            // `ORDER BY` だけなら一致行の個数に影響しないため受理する（fail-closed で拒否する範囲を狭めない）。
+            if (!validated.order_by.is_empty() || !validated.order_keys.is_empty())
+                && (!validated.limit_implicit || offset > 0)
+            {
+                return Err(SqlSurfaceError::unsupported(
+                    "correlated scalar subqueries with ORDER BY and LIMIT or OFFSET are not supported",
+                ));
+            }
+            None
+        }
         CorrelatedShape::In { target_column, .. } => {
             if projected_cols.len() != 1 {
                 return Err(SqlSurfaceError::unsupported(
@@ -3286,11 +3382,39 @@ fn prepare_correlated_exists(
         }
     }
 
+    // 非集計形の相関スカラー（Issue #1847）の投影列 y。単一の裸の列だけを受理する。
+    let (scalar_column, scalar_pseudo_id) = match shape {
+        CorrelatedShape::Scalar => {
+            let y = single_projected_column(&validated.projection).map_err(|_| {
+                SqlSurfaceError::unsupported(
+                    "a correlated scalar subquery must select a plain column \
+                     (expressions are not supported)",
+                )
+            })?;
+            let pseudo = correlated_exists::inner_column_type(inner_schema, &y)?.is_none();
+            (Some(y), pseudo)
+        }
+        CorrelatedShape::Exists { .. } | CorrelatedShape::In { .. } => (None, false),
+    };
+    let scalar_limit = if validated.limit_implicit {
+        None
+    } else {
+        Some(
+            usize::try_from(validated.limit)
+                .map_err(|_| SqlSurfaceError::invalid_input("LIMIT value is out of range"))?,
+        )
+    };
+
     // 実体化する内側列。疑似列 `id` は行 `id` で賄う。
     let mut projected: Vec<String> = Vec::new();
     for key in &analysis.keys {
         if !key.inner_is_pseudo_id && !projected.contains(&key.inner_column) {
             projected.push(key.inner_column.clone());
+        }
+    }
+    if let Some(y) = &scalar_column {
+        if !scalar_pseudo_id && !projected.contains(y) {
+            projected.push(y.clone());
         }
     }
     if let Some(pair) = &not_in_target {
@@ -3333,6 +3457,14 @@ fn prepare_correlated_exists(
         residual,
         offset,
         not_in_target,
+        scalar_column,
+        scalar_pseudo_id,
+        scalar_meta: if matches!(shape, CorrelatedShape::Scalar) {
+            shape_meta
+        } else {
+            None
+        },
+        scalar_limit,
     })
 }
 
@@ -3376,6 +3508,76 @@ fn shape_for_materialization(validated: &mut ValidatedScan, projected: &[String]
     validated.limit_implicit = false;
 }
 
+/// 準備済みの相関サブクエリの内側を 1 回だけ実体化する（Issue #1842。非集計形の相関スカラー
+///〔Issue #1847〕と共有）。内側だけの連言（入れ子のサブクエリを含む）を解決し、外側と同じ `ctx`・
+/// `read_txn`（RLS 暗黙適用・同一スナップショット）で走査する。内側の入力行数・バイト量・実行回数予算の
+/// 超過は `54000`。`prepared.analysis.inner_only` は解決のため取り出す（呼び出し側が失敗時の静的検証に
+/// 要るなら事前に複製する）。
+#[allow(clippy::too_many_arguments)]
+fn materialize_correlated(
+    prepared: &mut PreparedCorrelated,
+    inner_schema: &TableSchema,
+    outer_scopes: &[&TableSchema],
+    read_txn: &impl crate::storage::read_source::ReadSource,
+    ctx: &PolicyContext,
+    lookup: &impl TableLookup,
+    udfs: &UdfRegistry,
+    group_limits: crate::group_by_limits::GroupByLimits,
+    nesting_limits: crate::nesting_limits::NestingLimits,
+    result_limits: crate::result_limits::ResultLimits,
+    budget: &mut usize,
+    in_value_budget: &mut usize,
+    corr: &CorrelatedCtx,
+) -> Result<super::exec::QueryResult, SqlSurfaceError> {
+    // 内側だけの連言を解決し、1 回だけ実体化する。
+    let mut chain: Vec<&TableSchema> = outer_scopes.to_vec();
+    chain.push(inner_schema);
+    prepared.validated.where_predicates = resolve_where_predicates(
+        std::mem::take(&mut prepared.analysis.inner_only),
+        &chain,
+        read_txn,
+        ctx,
+        lookup,
+        udfs,
+        group_limits,
+        nesting_limits,
+        result_limits,
+        budget,
+        in_value_budget,
+        corr,
+    )?;
+    *budget = budget.checked_sub(1).ok_or_else(|| {
+        SqlSurfaceError::payload_too_large(format!(
+            "subquery execution count exceeds limit {}",
+            nesting_limits.max_subquery_executions()
+        ))
+    })?;
+    shape_for_materialization(&mut prepared.validated, &prepared.projected);
+    let mut bound = super::parser::bind_scan_with_dummy_flags(
+        &prepared.validated,
+        inner_schema,
+        udfs,
+        &[],
+        &result_limits,
+    )?;
+    // 取得上限は内側の入力行数の上限 + 1 件（超過の検出用）。文の `LIMIT` ではなく JOIN の入力と同じ
+    // 設定値で頭打ちにし、超過は黙って切り詰めず `54000` にする。
+    bound.limit = corr.max_input_rows().saturating_add(1);
+    let result = super::scan::execute_scan_with_budget(
+        read_txn,
+        ctx,
+        inner_schema,
+        &bound,
+        corr.byte_cap(),
+    )?;
+    if result.rows.len() > corr.max_input_rows() {
+        return Err(SqlSurfaceError::payload_too_large(
+            "correlated subquery input exceeds the visible row limit",
+        ));
+    }
+    Ok(result)
+}
+
 /// 相関 `EXISTS` を実行用のプローブへ解決する（Issue #1842・SQL-61 ポインタ・RLS-10 ポインタ）。
 ///
 /// [`prepare_correlated_exists`] の後、内側だけの連言（入れ子のサブクエリを含む）を解決して
@@ -3404,14 +3606,7 @@ fn resolve_correlated_exists(
         CorrelatedProbe, CorrelatedProbeRef, InnerInput, OuterKey, ProbeKind, ProbeSpec,
     };
 
-    let PreparedCorrelated {
-        mut validated,
-        analysis,
-        projected,
-        residual,
-        offset,
-        not_in_target,
-    } = prepare_correlated_exists(
+    let mut prepared = prepare_correlated_exists(
         validated,
         &inner_schema,
         &correlation,
@@ -3420,13 +3615,10 @@ fn resolve_correlated_exists(
         udfs,
         result_limits,
     )?;
-
-    // 内側だけの連言を解決し、1 回だけ実体化する。
-    let mut chain: Vec<&TableSchema> = outer_scopes.to_vec();
-    chain.push(&inner_schema);
-    validated.where_predicates = resolve_where_predicates(
-        analysis.inner_only,
-        &chain,
+    let result = materialize_correlated(
+        &mut prepared,
+        &inner_schema,
+        outer_scopes,
         read_txn,
         ctx,
         lookup,
@@ -3438,35 +3630,14 @@ fn resolve_correlated_exists(
         in_value_budget,
         corr,
     )?;
-    *budget = budget.checked_sub(1).ok_or_else(|| {
-        SqlSurfaceError::payload_too_large(format!(
-            "subquery execution count exceeds limit {}",
-            nesting_limits.max_subquery_executions()
-        ))
-    })?;
-    shape_for_materialization(&mut validated, &projected);
-    let mut bound = super::parser::bind_scan_with_dummy_flags(
-        &validated,
-        &inner_schema,
-        udfs,
-        &[],
-        &result_limits,
-    )?;
-    // 取得上限は内側の入力行数の上限 + 1 件（超過の検出用）。文の `LIMIT` ではなく JOIN の入力と同じ
-    // 設定値で頭打ちにし、超過は黙って切り詰めず `54000` にする。
-    bound.limit = corr.max_input_rows().saturating_add(1);
-    let result = super::scan::execute_scan_with_budget(
-        read_txn,
-        ctx,
-        &inner_schema,
-        &bound,
-        corr.byte_cap(),
-    )?;
-    if result.rows.len() > corr.max_input_rows() {
-        return Err(SqlSurfaceError::payload_too_large(
-            "correlated subquery input exceeds the visible row limit",
-        ));
-    }
+    let PreparedCorrelated {
+        analysis,
+        projected,
+        residual,
+        offset,
+        not_in_target,
+        ..
+    } = prepared;
 
     // プローブの組み立て。
     let keys: Vec<OuterKey> = analysis
@@ -3501,6 +3672,12 @@ fn resolve_correlated_exists(
         (CorrelatedShape::In { negated: true, .. }, None) => {
             return Err(SqlSurfaceError::Internal {
                 detail: "correlated NOT IN is missing its target pair".to_string(),
+            })
+        }
+        // 非集計形の相関スカラーは `resolve_correlated_scalar_rows` が組み立てる。破れたら fail-closed。
+        (CorrelatedShape::Scalar, _) => {
+            return Err(SqlSurfaceError::Internal {
+                detail: "correlated scalar was routed to the EXISTS builder".to_string(),
             })
         }
     };
@@ -3563,6 +3740,7 @@ fn resolve_correlated_exists(
                 key_cells,
                 cells,
                 value_cell,
+                scalar: None,
             })
         });
     let probe = CorrelatedProbe::build(
@@ -3802,8 +3980,8 @@ fn static_validate_exists(
 /// 受理形の外の相関スカラー集計の拒否（静的文字列のみ。他テナントの情報・予約内部名を含めない）。
 fn correlated_scalar_unsupported() -> SqlSurfaceError {
     SqlSurfaceError::unsupported(
-        "correlated scalar subqueries are supported only as a single aggregate whose \
-         correlation is equality conditions in WHERE",
+        "this form of correlated scalar subquery is not supported (a single plain column, or a \
+         single aggregate whose correlation is equality conditions in WHERE)",
     )
 }
 
@@ -4231,6 +4409,348 @@ impl ScalarPredicateBuilder<'_> {
     }
 }
 
+// ===== 非集計形の相関スカラーサブクエリ（Issue #1847・SQL-61・親 #1845。RLS-10 ポインタ） =====
+//
+// `col <op> (SELECT y FROM b WHERE <相関条件>)`（WHERE 位置）と `SELECT ..., (SELECT y FROM b WHERE
+// <相関条件>)`（投影位置）を、外側の行ごとの再評価で実行する。内側を外側の行ごとに実行し直す方式
+// （外側の値を内側 AST へ埋めて再実行する案）は #1842 の設計記録で却下済みのため、`EXISTS` と同じ
+// 方式を採る: 内側は外側と同じ `PolicyContext`・同じ `read_txn`（RLS 暗黙適用）で 1 回だけ実体化し、
+// 外側の各行では等価キーのバケット（キーが無ければ全内側行）を走査して残余を既存の述語評価器で
+// 評価する（`sql::join::semi` の `ProbeKind::ScalarRows`。第 2 の述語評価器は作らない）。
+// 一致行 0 件は NULL（WHERE 位置では偽）、1 件はその行の値、2 件以上は `21000`。判定は可視行だけで
+// 決まり、外側の行を評価したときにだけ発生する（外側が 0 行ならエラーにならない）。
+//
+// 受理形: 内側は `Statement::Scan` で投影が単一の裸の列、外側参照は内側 `WHERE` の中だけ。内側の
+// `LIMIT`／`OFFSET` は一致行の先頭 k 件を飛ばし最大 n 件を採る意味で保存する（`ORDER BY` と併用する
+// 外側の行ごとの top-n は実現できず `42601`）。それ以外は静的文字列の `42601`／`0A000` で拒否する。
+
+/// 非集計形の相関スカラーの位置（WHERE 位置の比較か、投影位置か）。
+enum ScalarPosition<'a> {
+    Where {
+        column: &'a str,
+        op: ScalarSubqueryOp,
+    },
+    Projection,
+}
+
+/// 非集計形の相関スカラーの解決結果。
+struct ScalarRowsResolved {
+    probe: super::join::semi::CorrelatedProbeRef,
+    /// 値（投影列 y）の列メタデータ。
+    meta: ColumnMeta,
+    /// 投影位置で隠し列として外側の走査へ足す外側列（`(論理列インデックス, 列名, 列型)`）。
+    /// WHERE 位置では空。
+    outer: Vec<(usize, String, ColumnType)>,
+    /// 外側スキーマの列数。
+    width: usize,
+}
+
+impl ScalarRowsResolved {
+    fn probe_ref(&self) -> super::join::semi::CorrelatedProbeRef {
+        self.probe.clone()
+    }
+}
+
+/// `cell_scalar`（外側セル → 行スカラー）が扱える列型か。投影位置で外側のセルを行スカラーへ写す
+/// ため、扱えない型（TIME／TIMESTAMPTZ／INTERVAL／JSONB／ARRAY／VECTOR）は静的に `0A000` にする。
+fn outer_cell_scalar_supported(ty: &ColumnType) -> bool {
+    matches!(
+        ty,
+        ColumnType::Text
+            | ColumnType::Varchar(_)
+            | ColumnType::Bpchar(_)
+            | ColumnType::Enum(_)
+            | ColumnType::SmallInt
+            | ColumnType::Integer
+            | ColumnType::BigInt
+            | ColumnType::Real
+            | ColumnType::Double
+            | ColumnType::Boolean
+            | ColumnType::Date
+            | ColumnType::Timestamp
+            | ColumnType::Numeric { .. }
+            | ColumnType::Uuid
+            | ColumnType::Bytea
+            | ColumnType::Json
+    )
+}
+
+/// 内側の 1 行から結合キー成分のセルを作る（疑似列 `id` は行 `id`）。
+fn inner_key_cells(
+    row: &super::exec::ResultRow,
+    key_positions: &[Option<usize>],
+    keys: &[correlated_exists::KeyPair],
+) -> Result<Vec<Cell>, SqlSurfaceError> {
+    let mut key_cells = Vec::with_capacity(key_positions.len());
+    for (pos, key) in key_positions.iter().zip(keys) {
+        let cell = match pos {
+            Some(i) => row
+                .cells
+                .get(*i)
+                .cloned()
+                .ok_or_else(|| SqlSurfaceError::Internal {
+                    detail: "correlated subquery key column is missing from the row".to_string(),
+                })?,
+            None if key.inner_is_pseudo_id => Cell::Integer(row.id),
+            None => {
+                return Err(SqlSurfaceError::Internal {
+                    detail: "correlated subquery key column was not projected".to_string(),
+                })
+            }
+        };
+        key_cells.push(cell);
+    }
+    Ok(key_cells)
+}
+
+/// 非集計形の相関スカラーを実行用のプローブへ解決する（Issue #1847）。
+///
+/// [`prepare_correlated_exists`]（静的検査・分解・残余の束縛）の後、WHERE 位置は対象列と値族を内側の
+/// 実行より前に検査し、投影位置は外側の列型を検査する（静的エラーは外側の行数・内側の値に依存せず
+/// 返る）。内側は [`materialize_correlated`] で 1 回だけ実体化する。入れ子 WHERE の実行時データ例外は
+/// 外側の行数判明まで遅延できるよう、実行せずに静的検証してから `Err` を返す（`meta_sink` へ値の
+/// 列メタデータを書き出す。[`resolve_scalar_projection_items`] と同じ契約）。
+#[allow(clippy::too_many_arguments)]
+fn resolve_correlated_scalar_rows(
+    validated: ValidatedScan,
+    inner_schema: TableSchema,
+    correlation: correlation::Correlation,
+    position: &ScalarPosition<'_>,
+    outer_scopes: &[&TableSchema],
+    read_txn: &impl crate::storage::read_source::ReadSource,
+    ctx: &PolicyContext,
+    lookup: &impl TableLookup,
+    udfs: &UdfRegistry,
+    group_limits: crate::group_by_limits::GroupByLimits,
+    nesting_limits: crate::nesting_limits::NestingLimits,
+    result_limits: crate::result_limits::ResultLimits,
+    budget: &mut usize,
+    in_value_budget: &mut usize,
+    corr: &CorrelatedCtx,
+    meta_sink: &mut Option<ColumnMeta>,
+) -> Result<ScalarRowsResolved, SqlSurfaceError> {
+    use super::join::semi::{
+        CorrelatedProbe, CorrelatedProbeRef, InnerInput, OuterKey, OuterSource, ScalarOut,
+        ScalarRowsSpec,
+    };
+    let outer_schema = owner_schema(outer_scopes)?;
+    let mut prepared = prepare_correlated_exists(
+        validated,
+        &inner_schema,
+        &correlation,
+        &CorrelatedShape::Scalar,
+        outer_scopes,
+        udfs,
+        result_limits,
+    )?;
+    let meta = prepared
+        .scalar_meta
+        .clone()
+        .ok_or_else(|| SqlSurfaceError::Internal {
+            detail: "correlated scalar subquery is missing its column metadata".to_string(),
+        })?;
+    *meta_sink = Some(meta.clone());
+
+    // 静的検査（内側の実行より前）。
+    let mut builder: Option<ScalarPredicateBuilder<'_>> = None;
+    let mut outer_cols: Vec<usize> = Vec::new();
+    let mut extra_outer_columns: Vec<usize> = Vec::new();
+    match position {
+        ScalarPosition::Where { column, op } => {
+            let (target_ty, family) = scalar_target_column(column, outer_scopes)?;
+            check_scalar_family_compatible(column, &meta, family)?;
+            if let Some(i) = outer_schema.columns.iter().position(|c| c.name == *column) {
+                extra_outer_columns.push(i);
+            }
+            builder = Some(ScalarPredicateBuilder {
+                op: *op,
+                column,
+                target_ty,
+                family,
+                outer_schema,
+                udfs,
+                byte_cap: corr.byte_cap(),
+                used: 0,
+                predicates: Vec::new(),
+                index_by_value: std::collections::HashMap::new(),
+            });
+        }
+        ScalarPosition::Projection => {
+            // 外側のセルを行スカラーへ写す列（キー・残余の外側参照）の型を静的に検査する。
+            let sources = prepared.analysis.keys.iter().map(|k| k.outer.source).chain(
+                prepared
+                    .residual
+                    .iter()
+                    .flat_map(|r| r.outer_cols.iter().map(|(_, src, _)| *src)),
+            );
+            for source in sources {
+                if let OuterSource::Column(i) = source {
+                    if !outer_cols.contains(&i) {
+                        outer_cols.push(i);
+                    }
+                }
+            }
+            for i in &outer_cols {
+                let def =
+                    outer_schema
+                        .columns
+                        .get(*i)
+                        .ok_or_else(|| SqlSurfaceError::Internal {
+                            detail: "correlated scalar outer column is outside the outer schema"
+                                .to_string(),
+                        })?;
+                if !outer_cell_scalar_supported(&def.ty) {
+                    return Err(SqlSurfaceError::feature_not_supported(
+                        "this column type is not supported in a correlated scalar subquery \
+                         condition",
+                    ));
+                }
+            }
+        }
+    }
+
+    let original_inner_only = prepared.analysis.inner_only.clone();
+    let result = match materialize_correlated(
+        &mut prepared,
+        &inner_schema,
+        outer_scopes,
+        read_txn,
+        ctx,
+        lookup,
+        udfs,
+        group_limits,
+        nesting_limits,
+        result_limits,
+        budget,
+        in_value_budget,
+        corr,
+    ) {
+        Ok(r) => r,
+        Err(e) => {
+            // 入れ子 WHERE の実行時データ例外は、外側の行数判明まで遅延できるよう、実行せずに
+            // 静的検証して静的エラー（未知列・値族の不一致等）を優先する（Issue #1432 と同じ契約）。
+            if is_deferrable_runtime_error(&e) {
+                let mut chain: Vec<&TableSchema> = outer_scopes.to_vec();
+                chain.push(&inner_schema);
+                static_validate_subquery_predicates(
+                    &original_inner_only,
+                    &chain,
+                    read_txn,
+                    lookup,
+                    udfs,
+                    nesting_limits,
+                    result_limits,
+                )?;
+            }
+            return Err(e);
+        }
+    };
+
+    let PreparedCorrelated {
+        analysis,
+        projected,
+        residual,
+        offset,
+        scalar_pseudo_id,
+        scalar_column,
+        scalar_limit,
+        ..
+    } = prepared;
+    let keys: Vec<OuterKey> = analysis
+        .keys
+        .iter()
+        .map(|k| OuterKey {
+            source: k.outer.source,
+            class: k.class.clone(),
+        })
+        .collect();
+    let key_positions: Vec<Option<usize>> = analysis
+        .keys
+        .iter()
+        .map(|k| {
+            if k.inner_is_pseudo_id {
+                None
+            } else {
+                projected.iter().position(|p| p == &k.inner_column)
+            }
+        })
+        .collect();
+    let scalar_pos: Option<usize> = match (&scalar_column, scalar_pseudo_id) {
+        (Some(y), false) => projected.iter().position(|p| p == y),
+        _ => None,
+    };
+    let keep_cells = residual.is_some();
+    let mut inputs: Vec<InnerInput> = Vec::new();
+    inputs
+        .try_reserve(result.rows.len())
+        .map_err(|_| super::join::semi::too_large())?;
+    for row in result.rows {
+        let key_cells = inner_key_cells(&row, &key_positions, &analysis.keys)?;
+        let id = row.id;
+        let y = match scalar_pos {
+            Some(i) => row
+                .cells
+                .get(i)
+                .cloned()
+                .ok_or_else(|| SqlSurfaceError::Internal {
+                    detail: "correlated scalar value column is missing from the row".to_string(),
+                })?,
+            None if scalar_pseudo_id => Cell::Integer(id),
+            None => {
+                return Err(SqlSurfaceError::Internal {
+                    detail: "correlated scalar value column was not projected".to_string(),
+                })
+            }
+        };
+        let scalar = match builder.as_mut() {
+            Some(b) => ScalarOut::Pred(b.index_for(&y)?),
+            None => ScalarOut::Value(y),
+        };
+        let cells: Vec<Cell> = if keep_cells { row.cells } else { Vec::new() };
+        inputs.push(InnerInput {
+            id,
+            key_cells,
+            cells,
+            value_cell: None,
+            scalar: Some(scalar),
+        });
+    }
+    let predicates = builder.map(|b| b.predicates).unwrap_or_default();
+    let probe = CorrelatedProbe::scalar_rows(
+        ScalarRowsSpec {
+            keys,
+            residual,
+            offset,
+            limit: scalar_limit,
+            predicates,
+            extra_outer_columns,
+            budget: corr.budget(),
+            byte_cap: corr.byte_cap(),
+        },
+        inputs.into_iter().map(Ok),
+    )?;
+    // 投影位置: プローブがデコードを要する外側列を隠し列として返す（疑似列 `id` は行 `id` で賄う）。
+    let mut outer: Vec<(usize, String, ColumnType)> = Vec::new();
+    if matches!(position, ScalarPosition::Projection) {
+        for i in probe.outer_columns() {
+            let def = outer_schema
+                .columns
+                .get(*i)
+                .ok_or_else(|| SqlSurfaceError::Internal {
+                    detail: "correlated scalar outer column is outside the outer schema"
+                        .to_string(),
+                })?;
+            outer.push((*i, def.name.clone(), def.ty.clone()));
+        }
+    }
+    Ok(ScalarRowsResolved {
+        probe: CorrelatedProbeRef::new(probe),
+        meta,
+        outer,
+        width: outer_schema.columns.len(),
+    })
+}
+
 /// WHERE 位置 `col <op> (SELECT agg ...)` の内側が集計形の相関なら、内側を 1 回だけ実行した
 /// 相関プローブ（[`WherePredicate::CorrelatedExists`] の葉。判定方式は
 /// `ProbeKind::ScalarCompare`）へ解決する。相関でなければ `None`（従来の
@@ -4263,7 +4783,38 @@ fn try_resolve_correlated_scalar_compare(
         nesting_limits,
     )?
     else {
-        return Ok(None);
+        // 非集計形（Issue #1847）。相関が無ければ `None`（従来の非相関経路）。
+        let Some((validated, inner_schema, correlation)) = classify_correlated_scan(
+            inner_tokens,
+            depth,
+            outer_scopes,
+            read_txn,
+            lookup,
+            nesting_limits,
+        )?
+        else {
+            return Ok(None);
+        };
+        let mut meta_sink: Option<ColumnMeta> = None;
+        let resolved = resolve_correlated_scalar_rows(
+            validated,
+            inner_schema,
+            correlation,
+            &ScalarPosition::Where { column, op },
+            outer_scopes,
+            read_txn,
+            ctx,
+            lookup,
+            udfs,
+            group_limits,
+            nesting_limits,
+            result_limits,
+            budget,
+            in_value_budget,
+            corr,
+            &mut meta_sink,
+        )?;
+        return Ok(Some(WherePredicate::CorrelatedExists(resolved.probe)));
     };
     let mut meta_sink: Option<ColumnMeta> = None;
     let table = match resolve_correlated_scalar_aggregate(
@@ -4368,7 +4919,58 @@ fn static_validate_correlated_scalar(
         nesting_limits,
     )?
     else {
-        return Ok(false);
+        // 非集計形（Issue #1847）: 実行経路と同じ準備と、内側だけの連言の静的検証・束縛、
+        // 対象列と値族の検査までを行う（実行はしない）。相関でなければ `false`。
+        let Some((validated, inner_schema, correlation)) = classify_correlated_scan(
+            inner_tokens,
+            depth,
+            outer_scopes,
+            read_txn,
+            lookup,
+            nesting_limits,
+        )?
+        else {
+            return Ok(false);
+        };
+        let mut prepared = prepare_correlated_exists(
+            validated,
+            &inner_schema,
+            &correlation,
+            &CorrelatedShape::Scalar,
+            outer_scopes,
+            udfs,
+            result_limits,
+        )?;
+        let mut chain: Vec<&TableSchema> = outer_scopes.to_vec();
+        chain.push(&inner_schema);
+        static_validate_subquery_predicates(
+            &prepared.analysis.inner_only,
+            &chain,
+            read_txn,
+            lookup,
+            udfs,
+            nesting_limits,
+            result_limits,
+        )?;
+        prepared.validated.where_predicates =
+            static_validation_predicates(&prepared.analysis.inner_only);
+        shape_for_materialization(&mut prepared.validated, &prepared.projected);
+        super::parser::bind_scan_with_dummy_flags(
+            &prepared.validated,
+            &inner_schema,
+            udfs,
+            &[],
+            &result_limits,
+        )?;
+        let meta = prepared
+            .scalar_meta
+            .as_ref()
+            .ok_or_else(|| SqlSurfaceError::Internal {
+                detail: "correlated scalar subquery is missing its column metadata".to_string(),
+            })?;
+        let (_, target_family) = scalar_target_column(column, outer_scopes)?;
+        check_scalar_family_compatible(column, meta, target_family)?;
+        return Ok(true);
     };
     let prepared =
         prepare_correlated_scalar_aggregate(validated, &inner_schema, &correlation, outer_scopes)?;
@@ -4394,16 +4996,27 @@ fn static_validate_correlated_scalar(
     Ok(true)
 }
 
-/// 投影位置の集計形の相関スカラー 1 項目の値表（Issue #1846）。外側の行ごとに、隠しキー列
-/// （疑似列 `id` は行の `id`）から相関キーを作って引く。可視行由来の値を持つため `Debug` は
-/// 行データを出さない。
+/// 投影位置の相関スカラー 1 項目の値表。外側の行ごとに、隠し列（疑似列 `id` は行の `id`）から
+/// 値を引き当てる。可視行由来の値を持つため `Debug` は行データを出さない。
 #[derive(Clone)]
-pub(crate) struct CorrelatedScalarValues {
-    values: std::sync::Arc<std::collections::HashMap<Vec<u8>, Cell>>,
-    empty: Cell,
-    keys: Vec<super::join::semi::OuterKey>,
-    /// キーごとの外側の列名（疑似列 `id` は `None`）。隠しキー列の位置引きに使う。
-    key_names: Vec<Option<String>>,
+pub(crate) enum CorrelatedScalarValues {
+    /// 集計形（Issue #1846）。隠しキー列から相関キーを作ってグループの値を引く。
+    Agg {
+        values: std::sync::Arc<std::collections::HashMap<Vec<u8>, Cell>>,
+        empty: Cell,
+        keys: Vec<super::join::semi::OuterKey>,
+        /// キーごとの外側の列名（疑似列 `id` は `None`）。隠しキー列の位置引きに使う。
+        key_names: Vec<Option<String>>,
+    },
+    /// 非集計形（Issue #1847）。隠し列の外側セルを行スカラーへ写し、プローブの基数判定
+    /// （0 件は NULL・1 件はその値・2 件以上は `21000`）を呼ぶ。
+    Rows {
+        probe: super::join::semi::CorrelatedProbeRef,
+        /// `(外側スキーマ上の論理列インデックス, 列名, 列型)`。プローブがデコードを要する外側列。
+        outer: std::sync::Arc<Vec<(usize, String, ColumnType)>>,
+        /// 外側スキーマの列数（行スカラービューの長さ）。
+        width: usize,
+    },
 }
 
 impl std::fmt::Debug for CorrelatedScalarValues {
@@ -4417,23 +5030,30 @@ fn hidden_key_alias(column: &str) -> String {
     format!("\u{3}corrkey.{column}")
 }
 
-/// 解決済みの相関項目が要求する外側キー列の名前（重複なし・初出順。疑似列 `id` は含めない）。
+/// 解決済みの相関項目が要求する外側列の名前（重複なし・初出順。疑似列 `id` は含めない）。
 pub(crate) fn hidden_key_columns(items: &[ResolvedScalarItem]) -> Vec<String> {
     let mut out: Vec<String> = Vec::new();
     for item in items {
-        if let Some(c) = &item.correlated {
-            for name in c.key_names.iter().flatten() {
-                if !out.contains(name) {
-                    out.push(name.clone());
-                }
+        let names: Vec<&String> = match &item.correlated {
+            Some(CorrelatedScalarValues::Agg { key_names, .. }) => {
+                key_names.iter().flatten().collect()
+            }
+            Some(CorrelatedScalarValues::Rows { outer, .. }) => {
+                outer.iter().map(|(_, name, _)| name).collect()
+            }
+            None => Vec::new(),
+        };
+        for name in names {
+            if !out.contains(name) {
+                out.push(name.clone());
             }
         }
     }
     out
 }
 
-/// 外側の走査へ、相関項目が要求する隠しキー列を投影の末尾へ足す（元の投影位置・`ORDER BY` の
-/// 序数は変わらない）。`*` との併用は疑似列 `id` 以外のキーを持てないため `42601`（fail-closed）。
+/// 外側の走査へ、相関項目が要求する隠し列を投影の末尾へ足す（元の投影位置・`ORDER BY` の
+/// 序数は変わらない）。`*` との併用は疑似列 `id` 以外の列を持てないため `42601`（fail-closed）。
 /// 隠し列は [`merge_scalar_projection_items`] が値の引き当てに使った後に取り除く。
 pub(crate) fn append_hidden_key_columns(
     validated: &mut ValidatedScan,
@@ -4459,41 +5079,74 @@ pub(crate) fn append_hidden_key_columns(
 }
 
 impl CorrelatedScalarValues {
-    /// 外側の 1 行の値（該当グループが無い・キーが NULL なら空集合の値）。`cells` は隠しキー列を
-    /// 含む外側の行セル、`hidden_base` は隠し列の開始位置、`hidden` は [`hidden_key_columns`] の結果。
+    /// 外側の 1 行の値（該当が無い・キーが NULL なら空集合の値＝集計形、NULL＝非集計形）。`cells` は
+    /// 隠し列を含む外側の行セル、`hidden_base` は隠し列の開始位置、`hidden` は
+    /// [`hidden_key_columns`] の結果。非集計形で一致行が 2 件以上なら `21000`。
     fn value_for(
         &self,
         row_id: u64,
         cells: &[Cell],
         hidden_base: usize,
         hidden: &[String],
-    ) -> Result<&Cell, SqlSurfaceError> {
-        let mut key = Vec::new();
-        for (k, name) in self.keys.iter().zip(&self.key_names) {
-            let cell = match name {
-                None => Cell::Integer(row_id),
-                Some(name) => {
-                    let pos = hidden
-                        .iter()
-                        .position(|h| h == name)
-                        .and_then(|p| hidden_base.checked_add(p))
-                        .ok_or_else(|| SqlSurfaceError::Internal {
-                            detail: "correlated scalar hidden key column is missing".to_string(),
-                        })?;
-                    cells
-                        .get(pos)
-                        .cloned()
-                        .ok_or_else(|| SqlSurfaceError::Internal {
-                            detail: "correlated scalar hidden key cell is missing".to_string(),
-                        })?
+    ) -> Result<Cell, SqlSurfaceError> {
+        let hidden_cell = |name: &str| -> Result<&Cell, SqlSurfaceError> {
+            let pos = hidden
+                .iter()
+                .position(|h| h == name)
+                .and_then(|p| hidden_base.checked_add(p))
+                .ok_or_else(|| SqlSurfaceError::Internal {
+                    detail: "correlated scalar hidden key column is missing".to_string(),
+                })?;
+            cells.get(pos).ok_or_else(|| SqlSurfaceError::Internal {
+                detail: "correlated scalar hidden key cell is missing".to_string(),
+            })
+        };
+        match self {
+            Self::Agg {
+                values,
+                empty,
+                keys,
+                key_names,
+            } => {
+                let mut key = Vec::new();
+                for (k, name) in keys.iter().zip(key_names) {
+                    let cell = match name {
+                        None => Cell::Integer(row_id),
+                        Some(name) => hidden_cell(name)?.clone(),
+                    };
+                    if matches!(cell, Cell::Null) {
+                        return Ok(empty.clone());
+                    }
+                    super::join::values::encode_key_component(&cell, &k.class, &mut key)?;
                 }
-            };
-            if matches!(cell, Cell::Null) {
-                return Ok(&self.empty);
+                Ok(values.get(&key).unwrap_or(empty).clone())
             }
-            super::join::values::encode_key_component(&cell, &k.class, &mut key)?;
+            Self::Rows {
+                probe,
+                outer,
+                width,
+            } => {
+                let mut scalars: Vec<Option<crate::row_codec::ScalarRef<'_>>> = Vec::new();
+                scalars.try_reserve(*width).map_err(|_| merge_too_large())?;
+                scalars.resize(*width, None);
+                for (index, name, ty) in outer.iter() {
+                    let cell = hidden_cell(name)?;
+                    let slot =
+                        scalars
+                            .get_mut(*index)
+                            .ok_or_else(|| SqlSurfaceError::Internal {
+                                detail: "correlated scalar outer column is outside the row view"
+                                    .to_string(),
+                            })?;
+                    *slot = super::join::values::cell_scalar(cell, ty)?;
+                }
+                Ok(probe
+                    .probe()
+                    .scalar_value(&scalars, row_id)?
+                    .cloned()
+                    .unwrap_or(Cell::Null))
+            }
         }
-        Ok(self.values.get(&key).unwrap_or(&self.empty))
     }
 }
 
