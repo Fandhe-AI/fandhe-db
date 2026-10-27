@@ -451,3 +451,62 @@ fn vector_body_with_plain_outer_still_materializes_and_is_capped() {
     let plain = "WITH x AS (SELECT * FROM docs) SELECT lang FROM x LIMIT 2";
     assert_eq!(query(&core, "alice", plain).expect("plain").rows.len(), 2);
 }
+
+/// 疑似列 `id` が `i64::MAX` を超える行でも、具体化指定の有無で結果とエラー契約が変わらない。
+/// 評価後射影形の外側は `id` を `BIGINT` として扱い `22003` になるため、本文が疑似列 `id` を
+/// 公開し外側が `*` 素通し以外で読む形はインライン展開へ戻る（Issue #1860 レビュー指摘）。
+#[test]
+fn pseudo_id_above_i64_max_falls_back_to_inline() {
+    let path = unique_db_path("sql62-cte-mat-big-id");
+    let _g = CleanupGuard(path.clone());
+    let storage = Storage::open(&path).expect("open storage");
+    storage.create_table(&schema()).expect("create table");
+    insert_row(
+        &storage,
+        &ctx("alice"),
+        u64::MAX,
+        "ja",
+        "big id",
+        Visibility::Public,
+    );
+    insert_row(
+        &storage,
+        &ctx("alice"),
+        1,
+        "en",
+        "small id",
+        Visibility::Public,
+    );
+    let core = new_core(storage);
+    let templates = [
+        "WITH x AS {h}(SELECT id FROM docs) SELECT id FROM x WHERE id > 0 LIMIT 2",
+        "WITH x AS {h}(SELECT * FROM docs) SELECT lang FROM x WHERE id > 0 LIMIT 2",
+        "WITH x AS {h}(SELECT id, lang FROM docs) SELECT id FROM x ORDER BY id LIMIT 2",
+        "WITH x AS {h}(SELECT id FROM docs) SELECT id FROM x LIMIT 2",
+        "WITH x AS {h}(SELECT id FROM docs) SELECT COUNT(*) FROM x WHERE id > 0",
+        "WITH x AS {h}(SELECT * FROM docs) SELECT * FROM x WHERE id > 0 LIMIT 2",
+        "WITH x AS {h}(SELECT id FROM docs) SELECT id FROM x WHERE id = 18446744073709551615",
+        "WITH x AS {h}(SELECT id FROM docs) SELECT id FROM x WHERE id IN (18446744073709551615)",
+        "WITH x AS {h}(SELECT id FROM docs) SELECT MAX(id) FROM x",
+        "WITH x AS {h}(SELECT id FROM docs) SELECT id FROM x ORDER BY id DESC LIMIT 1",
+        "WITH x AS {h}(SELECT id FROM docs) SELECT id FROM x WHERE id < 100",
+        "WITH x AS {h}(SELECT id FROM docs) SELECT id + 0 FROM x",
+        "WITH x(k) AS {h}(SELECT id FROM docs) SELECT MAX(k) FROM x",
+        "WITH x AS {h}(SELECT * FROM docs) SELECT MAX(id) FROM x",
+    ];
+    let mut plain_ok = 0;
+    for template in templates {
+        let plain = query(&core, "alice", &template.replace("{h}", ""));
+        let mat = query(&core, "alice", &template.replace("{h}", "MATERIALIZED "));
+        match (plain, mat) {
+            (Ok(p), Ok(m)) => {
+                plain_ok += 1;
+                assert_eq!(render(&m), render(&p), "template={template}");
+            }
+            (Err(p), Err(m)) => assert_eq!(m.wire_code(), p.wire_code(), "template={template}"),
+            (p, m) => panic!("outcome differs template={template} plain={p:?} mat={m:?}"),
+        }
+    }
+    // インライン側で成功する形が 1 つ以上あること（全形が両側エラーの空振りを防ぐ）。
+    assert!(plain_ok > 0);
+}

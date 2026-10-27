@@ -1,7 +1,7 @@
 //! 相関 `EXISTS` の述語分解と残余述語の束縛（SQL-61 ポインタ、Issue #1842、親 #1840。
 //! RLS-10 ポインタ）。
 //!
-//! 責務境界: `sql::subquery` が肯定形の `EXISTS (SELECT ...)` の内側で外側の列への参照
+//! 責務境界: `sql::subquery` が `EXISTS`／`NOT EXISTS (SELECT ...)`（Issue #1843）の内側で外側の列への参照
 //! （[`crate::sql::correlation::Correlation`]）を検出したとき、内側 `WHERE` の連言を本モジュールの
 //! [`analyze`] が次の 3 つへ分類する。内側の実体化・走査・プローブ組み立て（実行を伴う部分）は
 //! `sql::subquery` と `sql::join::semi` が担い、本モジュールはスキーマだけを見る（行データは読まない。
@@ -13,7 +13,13 @@
 //!   内側スキーマに外側参照ごとの列を足した合成スキーマで既存の `bind_where_predicates` へ束縛し、
 //!   述語評価器を再利用する（第 2 の評価器を作らない）。
 //!
-//! fail-closed の範囲: 外側参照を含むサブクエリ述語（`IN`／スカラー等の相関は #1844 の範囲）、
+//! 相関 `IN`／`NOT IN`（Issue #1844）: 対象ペア `(y, x)` は [`in_target_key`] が等価キーの形へ写し、
+//! 内側 `WHERE` の連言は同じ [`analyze`] で分類する。
+//!
+//! 集計形の相関スカラー（Issue #1846）: 内側 `WHERE` の連言は同じ [`analyze`] で分類し、残余が無く等価キーが
+//! 1 本以上の形だけを `GROUP BY` 集計へ書き換える（`sql::subquery` が担う。残余ありは範囲外で拒否）。
+//!
+//! fail-closed の範囲: 外側参照を含む入れ子のサブクエリ述語（`IN`／スカラー等の相関）、
 //! 直近の外側より外への参照、`WHERE` 以外（投影・`ORDER BY`）の外側参照、述語評価に使えない
 //! 列型は、静的文字列のエラー（`42601`／`0A000`）で拒否する。エラー文言に予約接頭辞・行データを
 //! 含めない。
@@ -27,9 +33,7 @@ use std::sync::Arc;
 use crate::catalog::{ColumnDef, ColumnType, TableSchema};
 use crate::sql::allowlist::{SqlSurfaceError, WherePredicate};
 use crate::sql::correlation::{self, Correlation};
-use crate::sql::join::semi::{
-    CorrelatedBudget, OuterSource, Residual, MAX_CORRELATED_REEVALUATIONS,
-};
+use crate::sql::join::semi::{CorrelatedBudget, OuterSource, Residual};
 use crate::sql::join::values::{key_class, JoinKeyClass};
 use crate::sql::udf_call::{BinOp, CollDerivation, Expr, UdfRegistry};
 use crate::sql::where_tree::{BoundConjunction, BoundOrGroup};
@@ -50,20 +54,32 @@ pub(crate) struct CorrelatedCtx {
 impl CorrelatedCtx {
     /// 相関を拒否する文脈（従来の挙動）。
     pub(crate) fn disabled() -> Self {
-        Self::build(false, crate::join_limits::MAX_JOIN_INPUT_ROWS)
+        Self::build(
+            false,
+            crate::join_limits::MAX_JOIN_INPUT_ROWS,
+            crate::correlated_limits::MAX_CORRELATED_REEVALUATIONS,
+        )
     }
 
-    /// 相関 `EXISTS` を実行する文脈。内側の入力行数の上限は JOIN と同じ起動時設定
-    /// （[`crate::join_limits::JoinSizeLimits`]）に従う。
-    pub(crate) fn enabled(join_limits: crate::join_limits::JoinSizeLimits) -> Self {
-        Self::build(true, join_limits.max_input_rows())
+    /// 相関サブクエリを実行する文脈。内側の入力行数の上限は JOIN と同じ起動時設定
+    /// （[`crate::join_limits::JoinSizeLimits`]）、再評価回数の上限は起動時設定
+    /// （[`crate::correlated_limits::CorrelatedLimits`]。Issue #1847）に従う。
+    pub(crate) fn enabled(
+        join_limits: crate::join_limits::JoinSizeLimits,
+        correlated_limits: crate::correlated_limits::CorrelatedLimits,
+    ) -> Self {
+        Self::build(
+            true,
+            join_limits.max_input_rows(),
+            correlated_limits.max_reevaluations(),
+        )
     }
 
-    fn build(enabled: bool, max_input_rows: usize) -> Self {
+    fn build(enabled: bool, max_input_rows: usize, max_reevaluations: usize) -> Self {
         Self {
             enabled,
             budget: Arc::new(CorrelatedBudget::new(
-                MAX_CORRELATED_REEVALUATIONS,
+                max_reevaluations,
                 crate::join_limits::MAX_JOIN_COMPARISONS,
             )),
             max_input_rows,
@@ -149,7 +165,7 @@ fn inner_has(inner: &TableSchema, name: &str) -> bool {
 }
 
 /// 内側の列型（実在の列）。疑似列 `id` は `None`、存在しない名前は `Err`。
-fn inner_column_type(
+pub(crate) fn inner_column_type(
     inner: &TableSchema,
     name: &str,
 ) -> Result<Option<ColumnType>, SqlSurfaceError> {
@@ -250,10 +266,30 @@ fn as_equality_key(
     // 照合の導出と衝突検証（通常の比較束縛と同じ契約。キー抽出で `42P21`／`42P22` を迂回しない）。
     // 実効照合が非バイト列順ならバイト列キーでは表せないため残余へ回す。
     let inner_col = inner.columns.iter().find(|c| c.name == *inner_ident);
-    let outer_col = match outer_ref.source {
+    let outer_col = outer_column_def(&outer_ref, outer);
+    if !effective_collation_is_byte_order(inner_col, outer_col)? {
+        return Ok(None);
+    }
+    Ok(Some(KeyPair {
+        inner_column: inner_ident.clone(),
+        inner_is_pseudo_id: inner_ty.is_none(),
+        outer: outer_ref,
+        class: inner_class,
+    }))
+}
+
+fn outer_column_def<'a>(outer_ref: &OuterRef, outer: &'a TableSchema) -> Option<&'a ColumnDef> {
+    match outer_ref.source {
         OuterSource::Column(idx) => outer.columns.get(idx),
         OuterSource::Id => None,
-    };
+    }
+}
+
+/// 2 つの列の照合を導出・衝突検証し（衝突は `42P21`／`42P22`）、実効照合がバイト列順か返す。
+fn effective_collation_is_byte_order(
+    a: Option<&ColumnDef>,
+    b: Option<&ColumnDef>,
+) -> Result<bool, SqlSurfaceError> {
     let derive = |c: Option<&ColumnDef>| match c {
         Some(c) if c.ty.is_text_like() || matches!(c.ty, ColumnType::Bpchar(_)) => {
             match c.collation {
@@ -263,16 +299,61 @@ fn as_equality_key(
         }
         _ => CollDerivation::NotCollatable,
     };
-    let eff = derive(inner_col).merge(derive(outer_col))?.consume()?;
-    if !eff.is_byte_order() {
-        return Ok(None);
+    Ok(derive(a).merge(derive(b))?.consume()?.is_byte_order())
+}
+
+/// 相関 `IN`／`NOT IN`（Issue #1844）の対象ペア `(内側の投影列 y, 外側の対象列 x)` を等価キーの
+/// 形（[`KeyPair`]）に写す。対象 x は内側 `WHERE` に現れず相関 IR に無いため、ここで外側スキーマから
+/// 直接組み立てる。値族の検証は呼び出し側（`sql::subquery`）が先に済ませている前提で、本関数は
+/// 結合キーとして表せるか（型クラスの一致・バイト列順の照合）だけを見る。表せない組は `0A000`
+/// （`IN` の比較を残余へ回せない本 Issue の範囲では fail-closed）。
+pub(crate) fn in_target_key(
+    inner: &TableSchema,
+    outer: &TableSchema,
+    inner_column: &str,
+    target_column: &str,
+) -> Result<KeyPair, SqlSurfaceError> {
+    let inner_ty = inner_column_type(inner, inner_column)?;
+    let (source, ty, key_ty) = match outer.columns.iter().position(|c| c.name == target_column) {
+        Some(idx) => {
+            let col = outer.columns.get(idx).ok_or_else(not_supported)?;
+            (
+                OuterSource::Column(idx),
+                col.ty.clone(),
+                Some(col.ty.clone()),
+            )
+        }
+        None if target_column == "id" && outer.has_pseudo_id() => {
+            (OuterSource::Id, ColumnType::BigInt, None)
+        }
+        None => return Err(SqlSurfaceError::undefined_column(target_column)),
+    };
+    let unkeyable = || {
+        SqlSurfaceError::feature_not_supported(
+            "this column type combination is not supported in a correlated IN subquery",
+        )
+    };
+    let inner_class = key_class(inner_ty.as_ref()).map_err(|_| unkeyable())?;
+    let outer_class = key_class(key_ty.as_ref()).map_err(|_| unkeyable())?;
+    if inner_class != outer_class {
+        return Err(unkeyable());
     }
-    Ok(Some(KeyPair {
-        inner_column: inner_ident.clone(),
+    let outer_ref = OuterRef {
+        ident: "in_target".to_string(),
+        source,
+        ty,
+        key_ty,
+    };
+    let inner_col = inner.columns.iter().find(|c| c.name == inner_column);
+    if !effective_collation_is_byte_order(inner_col, outer_column_def(&outer_ref, outer))? {
+        return Err(unkeyable());
+    }
+    Ok(KeyPair {
+        inner_column: inner_column.to_string(),
         inner_is_pseudo_id: inner_ty.is_none(),
         outer: outer_ref,
         class: inner_class,
-    }))
+    })
 }
 
 /// 内側 `WHERE` の連言を分類する。`corr` は内側全体の相関束縛結果（直近の外側への参照の確認に使う）。
@@ -305,7 +386,7 @@ pub(crate) fn analyze(
             analysis.inner_only.push(pred);
             continue;
         }
-        // 外側参照を持つサブクエリ述語（相関 `IN`／スカラー等）は本 Issue の範囲外（#1844）。
+        // 内側 `WHERE` 内の入れ子のサブクエリ述語が外側を参照する形（相関 `IN`／スカラー等）は範囲外。
         if crate::sql::subquery::predicate_contains_subquery(&pred) {
             return Err(not_supported());
         }
@@ -799,6 +880,102 @@ mod tests {
         let tiny = CorrelatedCtx::with_limits(BIG, BIG, BIG, 1);
         let e = eval_where(&core, &t1, SEMI, &tiny).expect_err("byte budget");
         assert_eq!(e.wire_code(), "54000");
+    }
+
+    #[test]
+    fn not_in_with_a_residual_is_bounded_by_the_reevaluation_and_comparison_caps() {
+        let (core, _g) = fixture();
+        let t1 = tenant("t1");
+        // キー付き残余: 外側 3 行がいずれもバケットに当たり再評価 3 回。S は各 1 件で x は S に無いため全行が真。
+        let keyed = "v NOT IN (SELECT v FROM b WHERE b.aid = a.k AND b.v < a.v)";
+        let ok = CorrelatedCtx::with_limits(3, BIG, BIG, usize::MAX);
+        assert_eq!(eval_where(&core, &t1, keyed, &ok).unwrap(), vec![1, 2, 3]);
+        let over = CorrelatedCtx::with_limits(2, BIG, BIG, usize::MAX);
+        let e = eval_where(&core, &t1, keyed, &over).expect_err("over cap");
+        assert_eq!(e.wire_code(), "54000");
+        // キー無し残余: 外側 3 行 × 内側 3 行 = 9 回の比較（S は常に空で真）。
+        let keyless = "v NOT IN (SELECT v FROM b WHERE b.v > a.v + 1000)";
+        let ok = CorrelatedCtx::with_limits(BIG, 9, BIG, usize::MAX);
+        assert_eq!(eval_where(&core, &t1, keyless, &ok).unwrap(), vec![1, 2, 3]);
+        let over = CorrelatedCtx::with_limits(BIG, 8, BIG, usize::MAX);
+        let e = eval_where(&core, &t1, keyless, &over).expect_err("over cap");
+        assert_eq!(e.wire_code(), "54000");
+    }
+
+    #[test]
+    fn correlated_in_input_rows_and_bytes_are_bounded_using_visible_rows_only() {
+        let (core, _g) = fixture();
+        let t1 = tenant("t1");
+        let semi = "v IN (SELECT v FROM b WHERE b.aid = a.k)";
+        let not_in = "v NOT IN (SELECT v FROM b WHERE b.aid = a.k)";
+        // t1 の可視 b は 3 行。他テナントの 5 行は数えない。
+        let cap3 = CorrelatedCtx::with_limits(BIG, BIG, 3, usize::MAX);
+        assert_eq!(
+            eval_where(&core, &t1, not_in, &cap3).unwrap(),
+            vec![1, 2, 3]
+        );
+        assert_eq!(
+            eval_where(&core, &t1, semi, &cap3).unwrap(),
+            Vec::<u64>::new()
+        );
+        let cap2 = CorrelatedCtx::with_limits(BIG, BIG, 2, usize::MAX);
+        for pred in [semi, not_in] {
+            let e = eval_where(&core, &t1, pred, &cap2).expect_err("over cap");
+            assert_eq!(e.wire_code(), "54000");
+        }
+        let tiny = CorrelatedCtx::with_limits(BIG, BIG, BIG, 1);
+        let e = eval_where(&core, &t1, not_in, &tiny).expect_err("byte budget");
+        assert_eq!(e.wire_code(), "54000");
+    }
+
+    #[test]
+    fn in_target_key_requires_a_byte_order_key_class_match() {
+        use crate::collation::Collation;
+        let mut inner = schema(
+            "b",
+            &[
+                ("i", ColumnType::Integer),
+                ("d", ColumnType::Double),
+                ("t", ColumnType::Text),
+            ],
+        );
+        let mut outer = schema(
+            "a",
+            &[
+                ("n", ColumnType::BigInt),
+                ("e", ColumnType::Double),
+                ("t", ColumnType::Text),
+            ],
+        );
+        // 整数クラスどうし・疑似列 id どうしは受理する。
+        let pair = in_target_key(&inner, &outer, "i", "n").expect("integer pair");
+        assert!(!pair.inner_is_pseudo_id);
+        assert!(
+            in_target_key(&inner, &outer, "id", "id")
+                .expect("id pair")
+                .inner_is_pseudo_id
+        );
+        // 型クラスが合わない組・結合キーにできない型は 0A000。
+        for (i, o) in [("i", "t"), ("d", "e"), ("t", "n")] {
+            let e = in_target_key(&inner, &outer, i, o).expect_err("unkeyable");
+            assert_eq!(e.wire_code(), "0A000", "{i}/{o}");
+        }
+        // 照合の衝突は 42P22、非バイト列順の照合は 0A000。
+        inner.columns[2].collation = Some(Collation::JaIcu);
+        outer.columns[2].collation = Some(Collation::UndIcu);
+        assert_eq!(
+            in_target_key(&inner, &outer, "t", "t")
+                .expect_err("conflict")
+                .wire_code(),
+            "42P22"
+        );
+        outer.columns[2].collation = Some(Collation::JaIcu);
+        assert_eq!(
+            in_target_key(&inner, &outer, "t", "t")
+                .expect_err("non byte order")
+                .wire_code(),
+            "0A000"
+        );
     }
 
     #[test]

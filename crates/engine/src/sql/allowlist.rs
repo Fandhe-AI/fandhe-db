@@ -2471,8 +2471,10 @@ pub enum WherePredicate {
     /// （既存の破壊的変更運用を踏襲）。
     IdCompare { op: BinOp, value: i128 },
     /// 相関 `EXISTS (SELECT ...)` を外側の行ごとに判定する内部専用の葉（Issue #1842・SQL-61
-    /// ポインタ・RLS-10）。構文解析は生成せず、`sql::subquery` が肯定形の相関 `EXISTS` を解決する際に
-    /// だけ生成する（`IdCompare` と同じ流儀）。内側は 1 回だけ実体化済みのプローブ
+    /// ポインタ・RLS-10）。構文解析は生成せず、`sql::subquery` が相関 `EXISTS` を解決する際に
+    /// だけ生成する（`IdCompare` と同じ流儀）。`NOT EXISTS`（Issue #1843）・
+    /// 相関 `IN`／`NOT IN`（Issue #1844）も同じ葉で、否定はプローブの反結合モード
+    /// （判定の反転）が持つ（variant の形は変えない）。内側は 1 回だけ実体化済みのプローブ
     /// （`sql::join::semi`）で、束縛時に `BoundExpr::CorrelatedExists` へ写り外側の行ごとに真偽を返す
     /// （UNKNOWN にならない）。内側の行データは `Debug` に出ない。
     ///
@@ -15005,7 +15007,15 @@ impl<'a> Parser<'a> {
                     "CTE body must not contain a statement separator",
                 ));
             }
-            let body = parse_view_body(inner)?;
+            // SQL-63・Issue #1875: 先頭が INSERT／UPDATE／DELETE ならデータ変更 CTE の本文として
+            // 既存の DML 許可パーサーで解析する（実行は未対応で、呼び出し元が固定 0A000 で止める）。
+            let body = if let Some(dml) =
+                parse_data_modifying_cte_body(inner, self.max_insert_rows, self.nesting_limits)?
+            {
+                dml
+            } else {
+                super::cte::CteBody::Select(parse_view_body(inner)?)
+            };
             super::cte::check_no_duplicate_name(&ctes, &name)?;
             ctes.push(super::cte::CteDef {
                 name,
@@ -15031,6 +15041,105 @@ impl<'a> Parser<'a> {
         }
         Ok(ctes)
     }
+}
+
+/// データ変更 CTE 本文での `PARTITIONED` 句（分割実行）の固定拒否エラー（Issue #1875）。
+fn partitioned_in_cte_error() -> SqlSurfaceError {
+    SqlSurfaceError::unsupported("PARTITIONED cannot be used in a data-modifying CTE")
+}
+
+/// CTE 本文がデータ変更文（先頭が `INSERT`／`UPDATE`／`DELETE`）なら、既存の DML 許可パーサーで
+/// 解析して [`super::cte::CteBody::DataModifying`] を返す（SQL-63・Issue #1875）。そうでなければ
+/// `None`（呼び出し元が SELECT 本文として扱う）。`sql::allowlist::Parser::parse_with_clause` から
+/// 呼ばれ、第 2 の DML パーサーは持たない。
+///
+/// 副文は文単位の保護句を持てない: `USING OPERATION_ID`（台帳の記録単位が曖昧になる）と
+/// `PARTITIONED`（分割実行）は `42601`。`operation_id` の必須化判定は文単位のため
+/// [`LedgerMode::Optional`] で解析し、副文ごとには呼ばない。未対応の形（`INSERT ... SELECT`・
+/// `UPDATE ... FROM`・`DELETE ... USING`）は `0A000`。いずれも固定文言で入力断片を含めない。
+fn parse_data_modifying_cte_body(
+    inner: &[Token],
+    max_insert_rows: Option<std::num::NonZeroUsize>,
+    limits: crate::nesting_limits::NestingLimits,
+) -> Result<Option<super::cte::CteBody>, SqlSurfaceError> {
+    use super::cte::{CteBody, DataModifyingCteBody, DmlStatement};
+    use super::returning::DmlCommand;
+    let Some(Token::Ident(head)) = inner.first() else {
+        return Ok(None);
+    };
+    let command = if head.eq_ignore_ascii_case("INSERT") {
+        DmlCommand::Insert
+    } else if head.eq_ignore_ascii_case("UPDATE") {
+        DmlCommand::Update
+    } else if head.eq_ignore_ascii_case("DELETE") {
+        DmlCommand::Delete
+    } else {
+        return Ok(None);
+    };
+
+    for (i, tok) in inner.iter().enumerate() {
+        match tok {
+            Token::Ident(w)
+                if w.eq_ignore_ascii_case("USING")
+                    && matches!(
+                        inner.get(i.saturating_add(1)),
+                        Some(Token::Ident(n)) if n.eq_ignore_ascii_case("OPERATION_ID")
+                    ) =>
+            {
+                return Err(SqlSurfaceError::unsupported(
+                    "USING OPERATION_ID cannot be used in a data-modifying CTE",
+                ));
+            }
+            _ => {}
+        }
+    }
+
+    let mode = LedgerMode::Optional;
+    let (target_table, statement) = match command {
+        DmlCommand::Insert => {
+            match parse_insert_any_shape_tokens_with_limit(inner, mode, max_insert_rows)? {
+                ParsedInsertTokens::Values(v) => (v.table_name.clone(), DmlStatement::Insert(v)),
+                ParsedInsertTokens::Select(_) => {
+                    return Err(SqlSurfaceError::feature_not_supported(
+                        "INSERT ... SELECT is not supported in a data-modifying CTE yet",
+                    ));
+                }
+            }
+        }
+        DmlCommand::Update => {
+            if looks_like_update_from(inner) {
+                return Err(SqlSurfaceError::feature_not_supported(
+                    "UPDATE ... FROM is not supported in a data-modifying CTE yet",
+                ));
+            }
+            let v = parse_update_form_shape_inner(inner, mode, limits, true)?;
+            let table = match &v {
+                ValidatedUpdateForm::Single(u) => u.table_name.clone(),
+                ValidatedUpdateForm::Predicate(u) => u.table_name.clone(),
+            };
+            (table, DmlStatement::Update(v))
+        }
+        DmlCommand::Delete => {
+            if looks_like_delete_using(inner) {
+                return Err(SqlSurfaceError::feature_not_supported(
+                    "DELETE ... USING is not supported in a data-modifying CTE yet",
+                ));
+            }
+            let v = parse_delete_statement_shape_inner(inner, mode, limits, true)?;
+            let table = match &v {
+                DeleteStatement::SingleRow(d) => d.table_name.clone(),
+                DeleteStatement::Predicate(d) => d.table_name.clone(),
+            };
+            (table, DmlStatement::Delete(v))
+        }
+    };
+    Ok(Some(CteBody::DataModifying(Box::new(
+        DataModifyingCteBody {
+            command,
+            target_table,
+            statement,
+        },
+    ))))
 }
 
 /// `CREATE VIEW ... AS` 本文の許可形状（TABLE-18・SQL-23・TASK-205、
@@ -15298,11 +15407,13 @@ fn collect_cte_definition_relations(
     let ctes = p.parse_with_clause()?;
     for (i, def) in ctes.iter().enumerate() {
         let visible = ctes.get(..i).unwrap_or(&[]);
-        if !visible
-            .iter()
-            .any(|c| c.name.eq_ignore_ascii_case(&def.body.table_name))
-        {
-            push_relation(out, &def.body.table_name);
+        // データ変更 CTE（SQL-63）は対象表を依存として加える（CTE 名との衝突は検証段が拒否済み）。
+        let table = match &def.body {
+            super::cte::CteBody::Select(b) => b.table_name.as_str(),
+            super::cte::CteBody::DataModifying(b) => b.target_table.as_str(),
+        };
+        if !visible.iter().any(|c| c.name.eq_ignore_ascii_case(table)) {
+            push_relation(out, table);
         }
     }
     Ok(())
@@ -21585,22 +21696,23 @@ fn materialized_cte_statement(
     if materialized_body_has_duplicate_names(def) {
         return None;
     }
+    let select_body = def.select_body()?;
     let mut budget = super::cte::ResolveBudget::new();
     let inner = super::cte::resolve_relation(
         lookup,
         ctes,
         idx,
-        &def.body.table_name,
+        &select_body.table_name,
         0,
         limits.max_cte_nesting_depth(),
         &mut budget,
     )
     .ok()?;
     let body = build_scan_from_resolved(
-        def.body.table_name.clone(),
+        select_body.table_name.clone(),
         inner,
-        def.body.projection.clone(),
-        def.body.where_predicates.clone(),
+        select_body.projection.clone(),
+        select_body.where_predicates.clone(),
         None,
         Vec::new(),
         0,
@@ -21689,11 +21801,42 @@ fn materialized_cte_statement(
             if projects_id && hazards.declares_real_id {
                 return None;
             }
+            // 具体化結果の疑似列 `id` は `BIGINT` として運ばれ、外側が値を評価（述語・集計・式・
+            // 並べ替え）すると `i64::MAX` 超の行 id で `22003` になる（インラインは `u64` のまま
+            // 評価できる。例: `MAX(id)`）。素通し射影（`*`・列名のみ）以外で `id` を読みうる外側は、
+            // 列別名で名前を追えない場合も含め安全側でインライン展開へ戻す（Issue #1860 レビュー指摘）。
+            let exposes_id = match &body_projection {
+                Projection::All => true,
+                Projection::Columns(names) => names.iter().any(|n| n.eq_ignore_ascii_case("id")),
+                Projection::Items(_) => projects_id,
+            };
+            if exposes_id && outer_may_evaluate_pseudo_id(&v.outer, !def.column_aliases.is_empty())
+            {
+                return None;
+            }
             v.column_aliases = def.column_aliases.clone();
             v.origin = BufferedOrigin::MaterializedCte;
             Some(Statement::BufferedView(v))
         }
         _ => None,
+    }
+}
+
+/// 評価後射影形の外側が、本文の公開列（疑似列 `id` を含みうる）を素通し以外で評価するか。
+/// 述語・並べ替え・ウィンドウ・集計が `id` を名前で参照する場合、または式投影・列別名つき CTE
+/// のように名前で追えない場合は真（安全側）。素通し（`*`・列名のみの射影）は値を評価しない
+/// ため偽（`BufferedView` のセルは `u64` のまま運ばれる）。
+fn outer_may_evaluate_pseudo_id(outer: &BufferedOuter, aliased: bool) -> bool {
+    let idents = super::view_buffered::outer_non_projection_idents(outer);
+    if aliased && !idents.is_empty() {
+        return true;
+    }
+    if idents.iter().any(|i| i.eq_ignore_ascii_case("id")) {
+        return true;
+    }
+    match outer {
+        BufferedOuter::Rows(rows) => matches!(rows.projection, Projection::Items(_)),
+        BufferedOuter::Aggregate(_) => false,
     }
 }
 
@@ -21717,7 +21860,10 @@ fn materialized_body_has_duplicate_names(def: &super::cte::CteDef) -> bool {
     let names: Vec<String> = if !def.column_aliases.is_empty() {
         def.column_aliases.clone()
     } else {
-        match &def.body.projection {
+        let Some(select_body) = def.select_body() else {
+            return false;
+        };
+        match &select_body.projection {
             Projection::All => return false,
             Projection::Columns(c) => c.clone(),
             Projection::Items(items) => items
@@ -21943,19 +22089,29 @@ fn validate_sql_tokens_impl(
             // `TableLookup::table_columns` の既定実装は `Ok(None)`（検査省略・
             // 後方互換）を返すため、これに対応しない `TableLookup` 実装
             // （テスト用モック等）は無変更のまま今まで通り動作する。
+            // SQL-63・Issue #1875: データ変更 CTE は定義順にここで検証し、`RETURNING` の公開列を
+            // 集める（`dm_exposed[i]`。`RETURNING` なしは `None`）。成功しても最後に固定 0A000 で止める。
+            let mut dm_exposed: Vec<Option<Vec<String>>> = Vec::new();
             for (idx, def) in ctes.iter().enumerate() {
+                let Some(select_body) = def.select_body() else {
+                    dm_exposed.push(super::cte::validate_data_modifying_cte(
+                        lookup, &ctes, idx, def,
+                    )?);
+                    continue;
+                };
+                dm_exposed.push(None);
                 let mut budget = super::cte::ResolveBudget::new();
                 let resolved = super::cte::resolve_relation(
                     lookup,
                     &ctes,
                     idx,
-                    &def.body.table_name,
+                    &select_body.table_name,
                     0,
                     limits.max_cte_nesting_depth(),
                     &mut budget,
                 )?;
                 let (base_table, view_columns): (&str, Option<Vec<String>>) = match &resolved {
-                    super::view::Resolved::Table => (def.body.table_name.as_str(), None),
+                    super::view::Resolved::Table => (select_body.table_name.as_str(), None),
                     super::view::Resolved::View {
                         base_table,
                         view_columns,
@@ -21978,8 +22134,8 @@ fn validate_sql_tokens_impl(
                 // `build_scan_from_resolved` 呼び出し側が別途行う）。
                 super::view::check_columns_within_view(
                     exposed.as_deref(),
-                    &def.body.projection,
-                    &def.body.where_predicates,
+                    &select_body.projection,
+                    &select_body.where_predicates,
                     &[],
                 )?;
                 // 列名リスト（SQL-62 (2)・Issue #1857）の長さ・重複も、参照の有無に関係なく
@@ -21988,21 +22144,52 @@ fn validate_sql_tokens_impl(
                     super::cte::compose(lookup, resolved, def)?;
                 }
             }
-            let mut budget = super::cte::ResolveBudget::new();
-            let resolved = super::cte::resolve_relation(
-                lookup,
-                &ctes,
-                ctes.len(),
-                &main_table_name,
-                0,
-                limits.max_cte_nesting_depth(),
-                &mut budget,
-            )?;
+            // 主クエリがデータ変更 CTE を参照する場合は、`RETURNING` の公開列だけを持つ仮のビュー解決結果で
+            // 既存の列スコープ検査を通す（結果は捨てる）。`RETURNING` なしの参照は 0A000。
+            let main_dm = ctes.iter().enumerate().find(|(_, d)| {
+                d.is_data_modifying() && d.name.eq_ignore_ascii_case(&main_table_name)
+            });
+            let resolved = if let Some((dm_idx, dm_def)) = main_dm {
+                let exposed = dm_exposed
+                    .get(dm_idx)
+                    .cloned()
+                    .flatten()
+                    .ok_or_else(super::cte::data_modifying_cte_unsupported)?;
+                let base_table = match &dm_def.body {
+                    super::cte::CteBody::DataModifying(b) => b.target_table.clone(),
+                    super::cte::CteBody::Select(_) => {
+                        return Err(super::cte::data_modifying_cte_unsupported());
+                    }
+                };
+                let base_allocated = lookup.table_is_allocated(&base_table)?;
+                super::view::Resolved::View {
+                    base_table,
+                    view_predicates: Vec::new(),
+                    view_columns: Some(exposed),
+                    column_map: None,
+                    check_predicates: Vec::new(),
+                    base_allocated,
+                }
+            } else {
+                let mut budget = super::cte::ResolveBudget::new();
+                super::cte::resolve_relation(
+                    lookup,
+                    &ctes,
+                    ctes.len(),
+                    &main_table_name,
+                    0,
+                    limits.max_cte_nesting_depth(),
+                    &mut budget,
+                )?
+            };
             // Issue #1860（SQL-62 (1)(3)）: 明示 `MATERIALIZED` の CTE を主クエリが直接参照するときだけ
             // 具体化経路を試す。エラー契約を揃えるため、まず従来のインライン解決・畳み込み
             // （下の `inline`）で列スコープ等の検証を通し、その失敗はそのまま返す。外側が評価後射影形
             // として受理できない形（式投影・UDF 述語等）は具体化せずインラインの結果を使う。
-            let materialized_idx = if cte_evaluation == CteEvaluation::AllowMaterialize {
+            // データ変更 CTE を含む文は具体化せず、下の固定 0A000 に流す。
+            let materialized_idx = if cte_evaluation == CteEvaluation::AllowMaterialize
+                && !ctes.iter().any(|d| d.is_data_modifying())
+            {
                 ctes.iter().rposition(|def| {
                     def.name.eq_ignore_ascii_case(&main_table_name)
                         && def.materialization == super::cte::CteMaterialization::Materialized
@@ -22034,6 +22221,12 @@ fn validate_sql_tokens_impl(
                     )?))
                 }
             })();
+            // SQL-63: データ変更 CTE を含む文は、構文・名前・列の検証をすべて通過しても実行しない
+            // （読み取りプランへ化けさせない。書き込み結線は #1876）。固定文言で入力断片を含めない。
+            if ctes.iter().any(|d| d.is_data_modifying()) {
+                inline?;
+                return Err(super::cte::data_modifying_cte_unsupported());
+            }
             if let (Some(idx), Some(shape)) = (materialized_idx, main_for_materialize) {
                 let inline = inline?;
                 return Ok(
@@ -22693,7 +22886,21 @@ pub(crate) fn parse_delete_statement_shape_tokens_with_limits(
     mode: LedgerMode,
     limits: crate::nesting_limits::NestingLimits,
 ) -> Result<DeleteStatement, SqlSurfaceError> {
+    parse_delete_statement_shape_inner(tokens, mode, limits, false)
+}
+
+/// [`parse_delete_statement_shape_tokens_with_limits`] の本体。`forbid_partitioned` はデータ変更 CTE
+/// 本文用で、構文解析で `PARTITIONED` 句が現れたら `operation_id` 必須化より先に拒否する（Issue #1875）。
+fn parse_delete_statement_shape_inner(
+    tokens: &[lexer::Token],
+    mode: LedgerMode,
+    limits: crate::nesting_limits::NestingLimits,
+    forbid_partitioned: bool,
+) -> Result<DeleteStatement, SqlSurfaceError> {
     let shape = parse_delete_statement_shape(tokens, Some(limits))?;
+    if forbid_partitioned && shape.partitioned.is_some() {
+        return Err(partitioned_in_cte_error());
+    }
 
     // 分割実行はジョブ識別に operation_id を使うため、構成に関わらず必須（Issue #1704）。
     if shape.partitioned.is_some() {
@@ -24395,11 +24602,25 @@ pub(crate) fn parse_update_form_shape_tokens_with_limits(
     mode: LedgerMode,
     limits: crate::nesting_limits::NestingLimits,
 ) -> Result<ValidatedUpdateForm, SqlSurfaceError> {
+    parse_update_form_shape_inner(tokens, mode, limits, false)
+}
+
+/// [`parse_update_form_shape_tokens_with_limits`] の本体（`forbid_partitioned` の意味は
+/// [`parse_delete_statement_shape_inner`] と同じ）。
+fn parse_update_form_shape_inner(
+    tokens: &[lexer::Token],
+    mode: LedgerMode,
+    limits: crate::nesting_limits::NestingLimits,
+    forbid_partitioned: bool,
+) -> Result<ValidatedUpdateForm, SqlSurfaceError> {
     let mut p = Parser::new(tokens)
         .with_nesting_limits(limits)
         .with_dml_where_subquery_ctx(0);
     let shape = p.parse_update()?;
     p.expect_end_of_statement()?;
+    if forbid_partitioned && shape.partitioned.is_some() {
+        return Err(partitioned_in_cte_error());
+    }
 
     // 分割実行はジョブ識別に operation_id を使うため、構成に関わらず必須（Issue #1704）。
     if shape.partitioned.is_some() {
@@ -35401,13 +35622,237 @@ mod tests {
     #[test]
     fn rejects_data_modifying_cte() {
         let lookup = catalog_with(&["documents"]);
-        for sql in [
+        // SQL-63・Issue #1875: RETURNING なしのデータ変更 CTE の参照は 0A000（旧: 42601）。
+        let err = validate_sql(
             "WITH x AS (DELETE FROM documents) SELECT * FROM x LIMIT 10",
+            &lookup,
+        )
+        .expect_err("data-modifying CTE must be rejected");
+        assert_eq!(err.wire_code(), "0A000");
+        // 主クエリが DML の形は従来どおり 42601。
+        let err = validate_sql(
             "WITH x AS (SELECT id FROM documents) INSERT INTO documents (id) VALUES ('1')",
-        ] {
-            let err = validate_sql(sql, &lookup).expect_err("data-modifying CTE must be rejected");
-            assert_eq!(err.wire_code(), "42601", "sql={sql}");
+            &lookup,
+        )
+        .expect_err("DML main query must be rejected");
+        assert_eq!(err.wire_code(), "42601");
+    }
+
+    /// 列情報を返す単体テスト用フェイク（SQL-63・Issue #1875 のデータ変更 CTE の列解決用）。
+    struct ColCatalog;
+
+    impl TableLookup for ColCatalog {
+        fn table_exists(&self, name: &str) -> Result<bool, SqlSurfaceError> {
+            Ok(name == "documents")
         }
+        fn table_columns(&self, name: &str) -> Result<Option<Vec<String>>, SqlSurfaceError> {
+            Ok((name == "documents")
+                .then(|| vec!["id".to_string(), "lang".to_string(), "body".to_string()]))
+        }
+    }
+
+    /// 採番方式（疑似列 `id` なし・実列 `id` 未宣言）の表を模すフェイク（Issue #1875 レビュー指摘）。
+    struct AllocatedCatalog;
+
+    impl TableLookup for AllocatedCatalog {
+        fn table_exists(&self, name: &str) -> Result<bool, SqlSurfaceError> {
+            Ok(name == "t")
+        }
+        fn table_columns(&self, name: &str) -> Result<Option<Vec<String>>, SqlSurfaceError> {
+            Ok((name == "t").then(|| vec!["body".to_string()]))
+        }
+    }
+
+    /// 実列 `id` を持たない採番方式の表への `RETURNING id` は存在しない列として `42703` になる。
+    #[test]
+    fn data_modifying_cte_returning_id_on_allocated_table_is_42703() {
+        let sql = "WITH d AS (DELETE FROM t RETURNING id) SELECT * FROM d LIMIT 1";
+        let tokens = lexer::tokenize(sql).expect("tokenize");
+        let mut p = Parser::new(&tokens);
+        let ctes = p.parse_with_clause().expect("with clause");
+        let err =
+            crate::sql::cte::validate_data_modifying_cte(&AllocatedCatalog, &ctes, 0, &ctes[0])
+                .expect_err("id is not a column of an allocated table");
+        assert_eq!(err.wire_code(), "42703");
+    }
+
+    /// データ変更 CTE の本文を構造解析し、検証関数が返す公開列を取り出す（解析・列解決のみ。実行なし）。
+    fn dm_cte_exposed(sql: &str) -> Result<Vec<Option<Vec<String>>>, SqlSurfaceError> {
+        let tokens = lexer::tokenize(sql)?;
+        let mut p = Parser::new(&tokens);
+        let ctes = p.parse_with_clause()?;
+        let mut out = Vec::new();
+        for (idx, def) in ctes.iter().enumerate() {
+            if def.is_data_modifying() {
+                out.push(crate::sql::cte::validate_data_modifying_cte(
+                    &ColCatalog,
+                    &ctes,
+                    idx,
+                    def,
+                )?);
+            }
+        }
+        Ok(out)
+    }
+
+    fn cols(v: &[&str]) -> Option<Vec<String>> {
+        Some(v.iter().map(|s| s.to_string()).collect())
+    }
+
+    #[test]
+    fn data_modifying_cte_resolves_returning_columns() {
+        let main = "SELECT * FROM d LIMIT 10";
+        let star = dm_cte_exposed(&format!(
+            "WITH d AS (DELETE FROM documents WHERE lang = 'ja' RETURNING *) {main}"
+        ))
+        .expect("DELETE RETURNING * must parse");
+        assert_eq!(star, vec![cols(&["id", "lang", "body"])]);
+        let upd = dm_cte_exposed(&format!(
+            "WITH d AS (UPDATE documents SET lang = 'en' WHERE lang = 'ja' RETURNING id, lang) {main}"
+        ))
+        .expect("UPDATE RETURNING cols must parse");
+        assert_eq!(upd, vec![cols(&["id", "lang"])]);
+        let ins = dm_cte_exposed(&format!(
+            "WITH d AS (INSERT INTO documents (lang) VALUES ('en') RETURNING id) {main}"
+        ))
+        .expect("INSERT RETURNING must parse");
+        assert_eq!(ins, vec![cols(&["id"])]);
+        let renamed = dm_cte_exposed(&format!(
+            "WITH d(x, y) AS (DELETE FROM documents WHERE lang = 'ja' RETURNING id, lang) {main}"
+        ))
+        .expect("column list must apply");
+        assert_eq!(renamed, vec![cols(&["x", "y"])]);
+        let none = dm_cte_exposed(&format!(
+            "WITH d AS MATERIALIZED (DELETE FROM documents WHERE lang = 'ja') {main}"
+        ))
+        .expect("no RETURNING must parse");
+        assert_eq!(none, vec![None]);
+    }
+
+    #[test]
+    fn data_modifying_cte_allows_partitioned_column_name() {
+        let main = "SELECT * FROM d LIMIT 10";
+        // 列名 `partitioned` は句ではない（構文解析後の句だけを拒否する）。解析段で
+        // `PARTITIONED` 起因の拒否にならないこと（未知列 42703 は可）。
+        let r = dm_cte_exposed(&format!(
+            "WITH d AS (UPDATE documents SET partitioned = 'x' WHERE partitioned = 'y' RETURNING partitioned) {main}"
+        ));
+        if let Err(e) = r {
+            assert_eq!(e.wire_code(), "42703", "err={e:?}");
+        }
+    }
+
+    #[test]
+    fn data_modifying_cte_column_errors() {
+        let main = "SELECT * FROM d LIMIT 10";
+        let too_long = dm_cte_exposed(&format!(
+            "WITH d(a, b, c) AS (DELETE FROM documents WHERE lang = 'ja' RETURNING id, lang) {main}"
+        ))
+        .expect_err("column list longer than RETURNING");
+        assert_eq!(too_long.wire_code(), "42P10");
+        let missing = dm_cte_exposed(&format!(
+            "WITH d AS (DELETE FROM documents WHERE lang = 'ja' RETURNING nope) {main}"
+        ))
+        .expect_err("unknown RETURNING column");
+        assert_eq!(missing.wire_code(), "42703");
+        let ghost = dm_cte_exposed(&format!(
+            "WITH d AS (DELETE FROM ghost WHERE lang = 'ja' RETURNING *) {main}"
+        ))
+        .expect_err("missing target");
+        assert_eq!(ghost.wire_code(), "42P01");
+        // 短い別名リストと後続の元列名の衝突（別名同士の重複は構文段で 42701）は 42702。
+        let dup = dm_cte_exposed(&format!(
+            "WITH d(lang) AS (DELETE FROM documents WHERE lang = 'ja' RETURNING id, lang) {main}"
+        ))
+        .expect_err("duplicate exposed name");
+        assert_eq!(dup.wire_code(), "42702");
+        let cte_target = dm_cte_exposed(&format!(
+            "WITH s AS (SELECT id FROM documents), d AS (DELETE FROM s WHERE lang = 'ja') {main}"
+        ))
+        .expect_err("CTE target");
+        assert_eq!(cte_target.wire_code(), "0A000");
+    }
+
+    #[test]
+    fn data_modifying_cte_body_syntax_errors_and_unsupported_forms() {
+        let main = "SELECT * FROM d LIMIT 10";
+        for (body, code) in [
+            (
+                "DELETE FROM documents WHERE lang = 'ja' USING OPERATION_ID 'op1'",
+                "42601",
+            ),
+            (
+                "UPDATE documents SET lang = 'en' WHERE lang = 'ja' PARTITIONED",
+                "42601",
+            ),
+            ("DELETE documents", "42601"),
+            ("DELETE FROM documents WHERE lang = 'ja';", "42601"),
+            (
+                "INSERT INTO documents (lang) SELECT lang FROM documents",
+                "0A000",
+            ),
+            (
+                "UPDATE documents SET lang = o.lang FROM other o WHERE documents.id = o.id",
+                "0A000",
+            ),
+            (
+                "DELETE FROM documents USING other WHERE documents.id = other.id",
+                "0A000",
+            ),
+        ] {
+            let err = dm_cte_exposed(&format!("WITH d AS ({body}) {main}"))
+                .expect_err("must be rejected");
+            assert_eq!(err.wire_code(), code, "body={body}");
+        }
+    }
+
+    #[test]
+    fn data_modifying_cte_always_ends_with_0a000_and_never_expands() {
+        let lookup = ColCatalog;
+        // 正しい形（受理・列解決を通過）でも固定 0A000。読み取りプランには化けない。
+        for sql in [
+            "WITH d AS (DELETE FROM documents WHERE lang = 'ja' RETURNING *) SELECT * FROM d LIMIT 10",
+            "WITH d AS (UPDATE documents SET lang = 'en' WHERE lang = 'ja' RETURNING id, lang) SELECT lang FROM d LIMIT 10",
+            "WITH d(x, y) AS (DELETE FROM documents WHERE lang = 'ja' RETURNING id, lang) SELECT x FROM d LIMIT 10",
+            "WITH d AS (DELETE FROM documents WHERE lang = 'ja') SELECT * FROM documents LIMIT 1",
+            "WITH d AS (DELETE FROM documents WHERE lang = 'ja' RETURNING id) SELECT * FROM documents LIMIT 1",
+            // 同名の実表をデータ変更 CTE 名にしても、実表の読み取りに化けない。
+            "WITH documents AS (DELETE FROM documents WHERE lang = 'ja' RETURNING *) SELECT * FROM documents LIMIT 1",
+        ] {
+            let err = validate_sql(sql, &lookup).expect_err("must not become a read plan");
+            assert_eq!(err.wire_code(), "0A000", "sql={sql}");
+        }
+        // 主クエリが RETURNING に無い列を参照する場合は既存 CTE の列スコープ違反と同じコード。
+        let err = validate_sql(
+            "WITH d AS (DELETE FROM documents WHERE lang = 'ja' RETURNING id) SELECT * FROM d WHERE body = 'y' LIMIT 10",
+            &lookup,
+        )
+        .expect_err("out-of-scope column");
+        assert_eq!(err.wire_code(), "42703");
+        // 後続の SELECT 本文 CTE がデータ変更 CTE を参照する形は 0A000。
+        let err = validate_sql(
+            "WITH d AS (DELETE FROM documents WHERE lang = 'ja' RETURNING id), s AS (SELECT id FROM d) SELECT * FROM s LIMIT 10",
+            &lookup,
+        )
+        .expect_err("SELECT CTE over data-modifying CTE");
+        assert_eq!(err.wire_code(), "0A000");
+    }
+
+    #[test]
+    fn data_modifying_cte_counts_toward_definition_limit() {
+        let lookup = ColCatalog;
+        let mut sql = String::from("WITH ");
+        for i in 0..17 {
+            if i > 0 {
+                sql.push_str(", ");
+            }
+            sql.push_str(&format!(
+                "d{i} AS (DELETE FROM documents WHERE lang = 'ja')"
+            ));
+        }
+        sql.push_str(" SELECT * FROM documents LIMIT 1");
+        let err = validate_sql(&sql, &lookup).expect_err("too many CTEs");
+        assert_eq!(err.wire_code(), "54000");
     }
 
     #[test]

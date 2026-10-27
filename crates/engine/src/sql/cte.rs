@@ -24,13 +24,25 @@
 //! 発火はセッションの最上位 SELECT の入口だけで、ビュー本文・cursor・COPY・CTAS 等は
 //! 従来どおりインライン展開（結果は同じ）。
 //!
+//! データ変更 CTE（SQL-63、Issue #1875）: CTE 本文に単一表の `INSERT`／`UPDATE`／
+//! `DELETE`（`RETURNING` 任意）を書く形は [`CteBody::DataModifying`] として構文受理し、
+//! 本文は既存の DML 許可パーサーで解析する（第 2 の DML パーサーを作らない）。本 Issue の
+//! 範囲は構文・名前・`RETURNING` の公開列の確定までで、**書き込みは一切発生させない**
+//! （検証を通過した文も `sql::allowlist::validate_sql_tokens` の `WITH` 分岐が固定 `0A000` で
+//! 止める。実行結線は #1876）。データ変更 CTE の名前は [`resolve_relation`] で
+//! 決して表・ビューへ展開しない（同名の実表を RLS の暗黙適用を迂回して読む経路を作らない）。
+//!
 //! 名前解決の順序（PostgreSQL と同じ意味論）: CTE 名はカタログのテーブル・
 //! ビューを隠す。i 番目の CTE の本文から見えるのは 0..i-1 番目の CTE だけで、
 //! 見つからなければ [`super::view::resolve_from`]（ビュー→テーブル）へ進む。
 //! このため自己参照や循環は構造的に作れない（自己参照に見える名前は同名の
 //! 実リレーションへ解決される）。
 
-use super::allowlist::{ParsedViewBody, Projection, SqlSurfaceError, TableLookup};
+use super::allowlist::{
+    DeleteStatement, ParsedViewBody, Projection, SqlSurfaceError, TableLookup, ValidatedInsert,
+    ValidatedUpdateForm,
+};
+use super::returning::DmlCommand;
 use super::view::{
     apply_column_aliases, check_columns_within_view, physical_of, resolve_from, Resolved,
 };
@@ -61,15 +73,74 @@ pub(crate) const MAX_CTE_REFERENCES: usize = 32;
 
 /// `WITH <name> [(<列名>, ...)] AS (<body>)` 1 件分の定義（`sql::allowlist::parse_with_clause`
 /// が構築する）。
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq)]
 pub(crate) struct CteDef {
     pub(crate) name: String,
     /// 列名リスト `WITH <name>(a, b)`（SQL-62 (2)・Issue #1857）。空ならリストなし。
     pub(crate) column_aliases: Vec<String>,
-    pub(crate) body: ParsedViewBody,
+    pub(crate) body: CteBody,
     /// `[NOT] MATERIALIZED` の指定（SQL-62 (3)・Issue #1860）。`CteDef` はテナント情報を
     /// 持たない不変条件（RLS-10 (b)）を保つため、ここにも評価方式のヒントだけを置く。
     pub(crate) materialization: CteMaterialization,
+}
+
+impl CteDef {
+    /// SELECT 本文なら検証済みの本文を返す。データ変更 CTE では `None`。
+    pub(crate) fn select_body(&self) -> Option<&ParsedViewBody> {
+        match &self.body {
+            CteBody::Select(body) => Some(body),
+            CteBody::DataModifying(_) => None,
+        }
+    }
+
+    /// データ変更 CTE（本文が `INSERT`／`UPDATE`／`DELETE`）か。
+    pub(crate) fn is_data_modifying(&self) -> bool {
+        matches!(self.body, CteBody::DataModifying(_))
+    }
+}
+
+/// CTE 本文の種別（SQL-63・Issue #1875）。
+#[derive(Debug, Clone, PartialEq)]
+pub(crate) enum CteBody {
+    /// 従来の SELECT 本文（`CREATE VIEW` 本文と同一の許可形状）。
+    Select(ParsedViewBody),
+    /// データ変更 CTE。
+    DataModifying(Box<DataModifyingCteBody>),
+}
+
+/// 構造検証済みの DML 本文（既存の DML 検証済み型をそのまま保持する）。
+#[derive(Debug, Clone, PartialEq)]
+pub(crate) enum DmlStatement {
+    Insert(ValidatedInsert),
+    Update(ValidatedUpdateForm),
+    Delete(DeleteStatement),
+}
+
+/// データ変更 CTE の本文。実行器（#1876）が既存の DML 実行入口へそのまま渡せるよう、
+/// 検証済み型を保持する。テナント・`PolicyContext` は保持しない（RLS-10 (b)）。
+#[derive(Debug, Clone, PartialEq)]
+pub(crate) struct DataModifyingCteBody {
+    pub(crate) command: DmlCommand,
+    pub(crate) target_table: String,
+    pub(crate) statement: DmlStatement,
+}
+
+impl DataModifyingCteBody {
+    /// `RETURNING` 句（無ければ `None`）。
+    pub(crate) fn returning(&self) -> Option<&Projection> {
+        match &self.statement {
+            DmlStatement::Insert(v) => v.returning.as_ref(),
+            DmlStatement::Update(ValidatedUpdateForm::Single(v)) => v.returning.as_ref(),
+            DmlStatement::Update(ValidatedUpdateForm::Predicate(v)) => v.returning.as_ref(),
+            DmlStatement::Delete(DeleteStatement::SingleRow(v)) => v.returning.as_ref(),
+            DmlStatement::Delete(DeleteStatement::Predicate(v)) => v.returning.as_ref(),
+        }
+    }
+}
+
+/// データ変更 CTE を読み取りへ展開しようとしたときの固定エラー（`0A000`）。入力断片を含めない。
+pub(crate) fn data_modifying_cte_unsupported() -> SqlSurfaceError {
+    SqlSurfaceError::feature_not_supported("data-modifying CTE is not supported yet")
 }
 
 /// CTE の評価方式ヒント（`WITH <name> AS [NOT] MATERIALIZED (...)`。SQL-62 (3)・Issue #1860）。
@@ -153,12 +224,16 @@ pub(crate) fn resolve_relation(
         .rev()
         .find(|(_, def)| def.name.eq_ignore_ascii_case(name))
     {
+        // 多層防御（SQL-63）: データ変更 CTE は表・ビューへ展開しない（固定 0A000）。
+        let Some(select) = def.select_body() else {
+            return Err(data_modifying_cte_unsupported());
+        };
         budget.consume_reference()?;
         let inner = resolve_relation(
             lookup,
             ctes,
             idx,
-            &def.body.table_name,
+            &select.table_name,
             depth.checked_add(1).ok_or_else(|| {
                 SqlSurfaceError::payload_too_large(format!(
                     "CTE nesting depth exceeds limit {max_depth}"
@@ -189,9 +264,12 @@ pub(crate) fn compose(
     inner: Resolved,
     def: &CteDef,
 ) -> Result<Resolved, SqlSurfaceError> {
+    let Some(body) = def.select_body() else {
+        return Err(data_modifying_cte_unsupported());
+    };
     let (base_table, mut acc_predicates, exposed, column_map, base_allocated) = match inner {
         Resolved::Table => {
-            let base_table = def.body.table_name.clone();
+            let base_table = body.table_name.clone();
             let allocated = lookup.table_is_allocated(&base_table)?;
             (base_table, Vec::new(), None, None, allocated)
         }
@@ -225,8 +303,8 @@ pub(crate) fn compose(
     // 呼び出し側で別途検証する）。
     check_columns_within_view(
         exposed.as_deref(),
-        &def.body.projection,
-        &def.body.where_predicates,
+        &body.projection,
+        &body.where_predicates,
         &[],
     )?;
 
@@ -234,9 +312,9 @@ pub(crate) fn compose(
     let layer_predicates = match &column_map {
         Some(map) => rewrite_where(
             &ColumnMap::new(map, !base_allocated),
-            def.body.where_predicates.clone(),
+            body.where_predicates.clone(),
         )?,
-        None => def.body.where_predicates.clone(),
+        None => body.where_predicates.clone(),
     };
 
     let (next_exposed, next_map) = if !def.column_aliases.is_empty() {
@@ -245,7 +323,7 @@ pub(crate) fn compose(
         let map = apply_column_aliases(
             lookup,
             &base_table,
-            &def.body.projection,
+            &body.projection,
             exposed.as_deref(),
             column_map.as_deref(),
             &def.column_aliases,
@@ -259,7 +337,7 @@ pub(crate) fn compose(
             Some(map.iter().map(|(p, _)| p.clone()).collect()),
             Some(map),
         )
-    } else if let Projection::Columns(cols) = &def.body.projection {
+    } else if let Projection::Columns(cols) = &body.projection {
         // 内側の別名対応を通して物理名を引き継ぐ（内側に無い列は検査済みのため到達しない）。
         let map = column_map.as_ref().map(|m| {
             cols.iter()
@@ -312,4 +390,86 @@ pub(crate) fn check_no_duplicate_name(ctes: &[CteDef], name: &str) -> Result<(),
         )));
     }
     Ok(())
+}
+/// データ変更 CTE 1 件の検証（SQL-63・Issue #1875）。`sql::allowlist::validate_sql_tokens` の
+/// `WITH` 分岐が、定義の並び順（`idx` 番目）に呼ぶ。対象表の実在・CTE 名との衝突を確認し、
+/// `RETURNING` が外側へ公開する列（列名リストの改名後）を返す。`RETURNING` なしは `None`。
+///
+/// 判定順序（決定的）: 対象が先行 CTE 名 `0A000` → 対象がビュー `0A000` → 対象なし `42P01` →
+/// `RETURNING` の列が無い `42703` → 列名リストが長すぎる `42P10`。列情報を返せない lookup は
+/// 検査を省略せず `0A000`（fail-closed）。エラーに他テナントの情報は含めない。
+pub(crate) fn validate_data_modifying_cte(
+    lookup: &impl TableLookup,
+    ctes: &[CteDef],
+    idx: usize,
+    def: &CteDef,
+) -> Result<Option<Vec<String>>, SqlSurfaceError> {
+    let CteBody::DataModifying(body) = &def.body else {
+        return Err(SqlSurfaceError::Internal {
+            detail: "internal error".to_string(),
+        });
+    };
+    let target = body.target_table.as_str();
+
+    // CTE への書き込みは不可。同名の実表へ黙って解決しない。
+    let visible = ctes.get(..idx).unwrap_or(&[]);
+    if visible.iter().any(|c| c.name.eq_ignore_ascii_case(target)) {
+        return Err(SqlSurfaceError::feature_not_supported(
+            "a data-modifying CTE cannot target a CTE",
+        ));
+    }
+    if !lookup.table_exists(target)? {
+        if lookup.view_definition(target)?.is_some() {
+            return Err(SqlSurfaceError::feature_not_supported(
+                "a data-modifying CTE cannot target a view yet",
+            ));
+        }
+        return Err(SqlSurfaceError::undefined_table(target));
+    }
+
+    let Some(returning) = body.returning() else {
+        return Ok(None);
+    };
+    let mut exposed: Vec<String> = match returning {
+        Projection::All => lookup
+            .table_star_columns(target)?
+            .ok_or_else(data_modifying_cte_unsupported)?,
+        Projection::Columns(cols) => {
+            let known = lookup
+                .table_columns(target)?
+                .ok_or_else(data_modifying_cte_unsupported)?;
+            for col in cols {
+                if !known.iter().any(|k| k == col) {
+                    return Err(SqlSurfaceError::undefined_column(col.clone()));
+                }
+            }
+            cols.clone()
+        }
+        // 関数呼び出し項目は RETURNING の構造検証で拒否済み（防御的に fail-closed）。
+        Projection::Items(_) => return Err(data_modifying_cte_unsupported()),
+    };
+    if !def.column_aliases.is_empty() {
+        if def.column_aliases.len() > exposed.len() {
+            return Err(SqlSurfaceError::CteColumnListTooLong {
+                name: def.name.clone(),
+                available: exposed.len(),
+                specified: def.column_aliases.len(),
+            });
+        }
+        for (slot, alias) in exposed.iter_mut().zip(def.column_aliases.iter()) {
+            *slot = alias.clone();
+        }
+    }
+    // 公開名（改名後の全体）の重複は外側から列を一意に引けないため `42702`。
+    // 比較は識別子の大文字小文字を区別しない。
+    for (i, name) in exposed.iter().enumerate() {
+        if exposed
+            .iter()
+            .skip(i.saturating_add(1))
+            .any(|other| other.eq_ignore_ascii_case(name))
+        {
+            return Err(SqlSurfaceError::ambiguous_column(name.clone()));
+        }
+    }
+    Ok(Some(exposed))
 }

@@ -63,6 +63,8 @@ pub(crate) enum ExprStep {
     /// （`BoundExpr::IdCompare`。`f64` を経由しないため `2^53` 超でも `22003` にならない）。
     IdCompare { op: BinOp, value: i128 },
     /// 相関 `EXISTS` の外側の行ごとの判定（Issue #1842）。常に `Bool` を push する。
+    /// `NOT EXISTS`（Issue #1843）の否定はプローブ内で適用済み。相関 `IN`／`NOT IN`（Issue #1844）も
+    /// 同じ葉に載る（名前は `EXISTS` のままだが、判定方式はプローブの `ProbeKind` が持つ）。
     CorrelatedExists(crate::sql::join::semi::CorrelatedProbeRef),
     /// テーブルの `VECTOR` 列（行の `embedding`）への参照を push する。
     /// `embedding` が空スライス（`VECTOR` 列が NULL。`dim == 0`）の行では

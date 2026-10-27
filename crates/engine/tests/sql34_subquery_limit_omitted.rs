@@ -275,7 +275,9 @@ fn unsupported_inner_forms_stay_rejected() {
         "SELECT id FROM t WHERE k IN (SELECT ROW_NUMBER() OVER (ORDER BY w) FROM u)",
         "SELECT id FROM t WHERE k IN (SELECT k FROM u UNION SELECT k FROM u)",
         "SELECT id FROM t WHERE k IN (SELECT u.k FROM u JOIN t ON u.k = t.k)",
-        "SELECT id FROM t WHERE k IN (SELECT k FROM u WHERE w = v)",
+        // 相関 `IN`（LIMIT なし）は Issue #1844、単一の裸の列の相関スカラーは Issue #1847 で
+        // 実行できる。式投影の相関スカラーは引き続き拒否する。
+        "SELECT id FROM t WHERE k = (SELECT k + 1 FROM u WHERE w = v)",
     ] {
         assert_eq!(code(&core, sql), "42601", "{sql}");
     }

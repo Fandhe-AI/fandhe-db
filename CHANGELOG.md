@@ -11,6 +11,15 @@
 
 - CTE の具体化経路を追加する（Issue #1860・SQL-62）。明示 `MATERIALIZED` の CTE を主クエリが直接参照すると、本文全体を評価した結果行集合を外側が読む。
   挙動変更: 本文の可視行数が `--max-result-rows` を超えると、外側の `LIMIT` に関わらず `54000` で拒否される。公開 API の破壊的変更なし。詳細は [cte.md](docs/design/cte.md)。
+- 非集計形の相関スカラーサブクエリ（`(SELECT y FROM b WHERE b.k = a.k)`。`y` は単一の裸の列）を、WHERE 位置と投影位置で
+  外側の行ごとの再評価により実行する（Issue #1847・SQL-61）。一致 0 件は NULL（WHERE では偽）、1 件はその値、
+  2 件以上は `21000`。内側を 1 回だけ実体化し、テナント境界は外側と同じ `PolicyContext` に従う。
+  従来 `42601` で拒否していた形が実行可能になる挙動変更。公開 enum は変えない（非 BREAKING）。
+  wire-server に `--max-correlated-reevaluations <1-100000>`（再評価回数の上限を下げる opt-in。超過は `54000`）を追加し、
+  `engine::correlated_limits`・`EngineCore::with_correlated_limits` を公開する。詳細は
+  [sql-subquery.md](docs/design/sql-subquery.md) の「Issue #1847 追記」節。
+- CTE 本文のデータ変更文（`WITH x AS (DELETE ... RETURNING ...)` 等）の構文を受理し、本文の解析と `RETURNING` の公開列の確定までを行う（Issue #1875・SQL-63）。
+  実行は未対応のため、検証を通過した文も `0A000` で拒否する（従来は `42601`）。書き込みは発生しない。詳細は [data-modifying-cte.md](docs/design/data-modifying-cte.md)。
 - CTE の `MATERIALIZED`／`NOT MATERIALIZED` を受理する（Issue #1858・SQL-62 (3)）。評価方式の指定として読み捨て、結果は変わらない。
   従来 `42601` で拒否していた構文が受理される挙動変更。詳細は [cte.md](docs/design/cte.md)。
 - CTE の列名リスト `WITH x(a, b) AS (...)` を受理する（Issue #1857・SQL-62 (2)）。出力列へ先頭から順に名前を付け、短いリストは残りを元の名前のまま受理する。
