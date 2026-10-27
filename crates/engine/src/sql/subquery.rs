@@ -46,12 +46,18 @@
 //! 条件へ分解して（`sql::correlated_exists`）内側を 1 回だけ実体化し、外側の行ごとに判定する内部専用の葉
 //! （[`WherePredicate::CorrelatedExists`]。ハッシュ半結合、残余があれば行ごとの再評価。
 //! `sql::join::semi`）へ書き換える。`NOT EXISTS` は同じプローブの判定を反転した反結合として扱う。
-//! それ以外の相関（`IN`／スカラー・述語形 DML・集計の `FILTER`）は従来どおり `42601` で拒否する（fail-closed）。
+//! 相関 `IN`／`NOT IN`（Issue #1844）も同じ分解・実体化を使い、肯定形は対象ペア `(y, x)` を等価キーへ
+//! 足した半結合、`NOT IN` は NULL を考慮した反結合（`ProbeKind::NotIn`）へ書き換える
+//! （[`resolve_in_predicate`]）。それ以外の相関（スカラー・`ANY`／`ALL`・述語形 DML・集計の `FILTER`）は
+//! 従来どおり `42601` で拒否する（fail-closed）。
 //!
 //! NULL 規則（三値論理。RLS 境界内＝可視行のみから決まる）:
 //! - `NOT IN`: 内側 0 行なら常に真（外側値が NULL でも真）。内側の結果に NULL を
 //!   1 つでも含めば真にならない。それ以外は distinct 値ごとの否定を連言で並べ、
 //!   外側値が NULL の行は UNKNOWN として除外される。
+//! - 相関 `NOT IN`: 外側の行ごとに、相関条件を満たす内側可視行の投影値の集合 S について、S が空なら
+//!   真（外側値が NULL でも真）、外側値が NULL・S に外側値がある・S に NULL がある場合は偽、それ以外は真。
+//!   相関 `IN` は WHERE 文脈で UNKNOWN が偽に潰れるため `EXISTS (... AND y = x)` と同値。
 //! - `NOT EXISTS`: 可視行が 1 件でもあれば常に偽、無ければ常に真。相関 `NOT EXISTS` は外側の行ごとに
 //!   `EXISTS` の単純な否定（外側キーが NULL の行は真）で、内側 `OFFSET k` は「一致が `k` 件以下」。
 //! - スカラー: 0 行または NULL は UNKNOWN（否定は構文段で演算子反転済みのため
@@ -191,7 +197,7 @@ pub(crate) fn resolve_where_predicates(
                 inner_tokens,
                 depth,
             } => {
-                out.extend(resolve_in_subquery(
+                out.extend(resolve_in_predicate(
                     &column,
                     &inner_tokens,
                     depth,
@@ -305,7 +311,7 @@ pub(crate) fn resolve_where_predicates(
                     inner_tokens,
                     depth,
                 } => {
-                    out.extend(resolve_in_subquery(
+                    out.extend(resolve_in_predicate(
                         &column,
                         &inner_tokens,
                         depth,
@@ -519,7 +525,7 @@ fn aggregate_referenced_columns(validated: &ValidatedAggregate) -> HashSet<Strin
 /// （相関 `EXISTS`／`NOT EXISTS` は [`try_resolve_correlated_exists`] が先に処理する。Issue #1842・#1843）。
 struct InnerPrecheck {
     schema: TableSchema,
-    #[allow(dead_code)] // #1844 以降の相関 `IN`／スカラーへの書き換えが読む。
+    #[allow(dead_code)] // スカラー等の相関への書き換えが読む。
     correlation: correlation::Correlation,
 }
 
@@ -1089,6 +1095,21 @@ fn static_validate_subquery_predicates(
                 inner_tokens,
                 depth,
             } => {
+                // 相関 `IN`（Issue #1844）は実行経路と同じ準備（静的検査・分解・残余の束縛）と
+                // 内側だけの連言の静的検証・束縛まで行う（実行はしない）。
+                if static_validate_correlated_in(
+                    column,
+                    inner_tokens,
+                    *depth,
+                    chain,
+                    read_txn,
+                    lookup,
+                    udfs,
+                    nesting_limits,
+                    result_limits,
+                )? {
+                    continue;
+                }
                 // [`resolve_in_subquery`] と同じ順序（内側 → 投影列数 → 対象列 → 値族）で検証する。
                 let meta = static_validate_inner_query(
                     inner_tokens,
@@ -2818,9 +2839,8 @@ enum ExistsOutcome {
 ///
 /// 相関（Issue #1842・#1843・SQL-61）: `corr` が有効なとき、内側が外側の列を参照していれば
 /// [`resolve_correlated_exists`] で内側を 1 回だけ実体化したプローブを返す。`positive` が偽
-/// （`NOT EXISTS`）ならプローブは反結合（判定を反転）として組み立てる。相関 `IN`／スカラー
-/// （#1844）・`corr` 無効の文脈（述語形 DML・集計の `FILTER`）は従来どおり内側の事前検査が
-/// `42601` で拒否する。
+/// （`NOT EXISTS`）ならプローブは反結合（判定を反転）として組み立てる。相関スカラー・`corr` 無効の
+/// 文脈（述語形 DML・集計の `FILTER`）は従来どおり内側の事前検査が `42601` で拒否する。
 #[allow(clippy::too_many_arguments)]
 fn resolve_exists_subquery(
     inner_tokens: &[Token],
@@ -2949,7 +2969,7 @@ fn try_resolve_correlated_exists(
         validated,
         inner_schema,
         correlation,
-        negated,
+        &CorrelatedShape::Exists { negated },
         outer_scopes,
         read_txn,
         ctx,
@@ -2965,6 +2985,17 @@ fn try_resolve_correlated_exists(
     .map(Some)
 }
 
+/// 相関サブクエリ述語の形（[`prepare_correlated_exists`]・[`resolve_correlated_exists`] の分岐）。
+enum CorrelatedShape<'a> {
+    /// `EXISTS`／`NOT EXISTS`（`negated` なら反結合。Issue #1842・#1843）。
+    Exists { negated: bool },
+    /// `target_column [NOT] IN (SELECT y ...)`（Issue #1844）。
+    In {
+        target_column: &'a str,
+        negated: bool,
+    },
+}
+
 /// 相関 `EXISTS` の、実行を伴わない準備の結果（[`prepare_correlated_exists`]）。
 struct PreparedCorrelated {
     /// `WHERE` を取り除いた内側（実体化・静的検証用の土台）。
@@ -2975,6 +3006,8 @@ struct PreparedCorrelated {
     residual: Option<super::join::semi::Residual>,
     /// 内側 `OFFSET`（検証済み）。
     offset: usize,
+    /// 相関 `NOT IN` の対象ペア `(y, x)`（等価キーには入れない。`ProbeKind::NotIn` が持つ）。
+    not_in_target: Option<correlated_exists::KeyPair>,
 }
 
 /// 相関 `EXISTS` の準備（Issue #1842）。実行も走査もしない静的な処理だけを行い、実行経路
@@ -2987,6 +3020,7 @@ fn prepare_correlated_exists(
     validated: ValidatedScan,
     inner_schema: &TableSchema,
     correlation: &correlation::Correlation,
+    shape: &CorrelatedShape<'_>,
     outer_scopes: &[&TableSchema],
     udfs: &UdfRegistry,
     result_limits: crate::result_limits::ResultLimits,
@@ -3014,7 +3048,7 @@ fn prepare_correlated_exists(
     }
     let offset = super::parser::validate_search_offset(validated.offset)?;
     let mut probe_node_budget = crate::sql::udf_call::MAX_EXPR_NODES;
-    super::parser::bind_projection(
+    let projected_cols = super::parser::bind_projection(
         &validated.projection,
         inner_schema,
         udfs,
@@ -3033,20 +3067,77 @@ fn prepare_correlated_exists(
         &result_limits,
     )?;
 
+    // (2b) 相関 `IN`／`NOT IN` の静的検査（非相関 `IN` と同じ順序・同じコード・文言。内側の行数・値に
+    // 依存しない）。対象ペア `(y, x)` を結合キーの形へ写せない組は `0A000`。
+    let in_pair = match shape {
+        CorrelatedShape::Exists { .. } => None,
+        CorrelatedShape::In { target_column, .. } => {
+            if projected_cols.len() != 1 {
+                return Err(SqlSurfaceError::unsupported(
+                    "subquery used with IN must select exactly one column",
+                ));
+            }
+            let (_, family) = validate_in_target_column(target_column, outer_schema)?;
+            let y = single_projected_column(&validated.projection)?;
+            let inner_ty = correlated_exists::inner_column_type(inner_schema, &y)?;
+            let compatible = match &inner_ty {
+                None => family == SubqueryValueFamily::Integer,
+                Some(ty) => {
+                    family_of_type(ty) == Some(family)
+                        || (matches!(
+                            family,
+                            SubqueryValueFamily::Integer | SubqueryValueFamily::Float
+                        ) && matches!(ty, ColumnType::Numeric { .. }))
+                }
+            };
+            if !compatible {
+                return Err(in_family_mismatch(target_column));
+            }
+            // 集合の帰属を変える `LIMIT n`／`OFFSET k` は外側の行ごとの先頭 n 件になり実現できない
+            // （`EXISTS` のように最小一致件数へ変換できない）。fail-closed で拒否する。
+            if !validated.limit_implicit || offset > 0 {
+                return Err(SqlSurfaceError::unsupported(
+                    "correlated IN subqueries with LIMIT or OFFSET are not supported",
+                ));
+            }
+            Some(correlated_exists::in_target_key(
+                inner_schema,
+                outer_schema,
+                &y,
+                target_column,
+            )?)
+        }
+    };
+
     // (3) 述語の分解。
     let mut validated = validated;
-    let analysis = correlated_exists::analyze(
+    let mut analysis = correlated_exists::analyze(
         std::mem::take(&mut validated.where_predicates),
         inner_schema,
         outer_schema,
         correlation,
     )?;
+    // 肯定形の相関 `IN` は `EXISTS (... AND y = x)` と同値（UNKNOWN は WHERE で偽）。対象ペアを等価キーへ
+    // 足す。`NOT IN` は NULL を考慮するため等価キーに入れず、専用のプローブ種別が持つ。
+    let mut not_in_target = None;
+    if let (Some(pair), CorrelatedShape::In { negated, .. }) = (in_pair, shape) {
+        if *negated {
+            not_in_target = Some(pair);
+        } else {
+            analysis.keys.push(pair);
+        }
+    }
 
     // 実体化する内側列。疑似列 `id` は行 `id` で賄う。
     let mut projected: Vec<String> = Vec::new();
     for key in &analysis.keys {
         if !key.inner_is_pseudo_id && !projected.contains(&key.inner_column) {
             projected.push(key.inner_column.clone());
+        }
+    }
+    if let Some(pair) = &not_in_target {
+        if !pair.inner_is_pseudo_id && !projected.contains(&pair.inner_column) {
+            projected.push(pair.inner_column.clone());
         }
     }
     let mut residual_idents = HashSet::new();
@@ -3083,6 +3174,32 @@ fn prepare_correlated_exists(
         projected,
         residual,
         offset,
+        not_in_target,
+    })
+}
+
+/// 相関 `IN` の内側投影が「単一の裸の内側列（実列または疑似列 `id`）」であることを確認して列名を返す。
+/// 別名付きの列参照（Issue #1540）も受理する。式投影は実体化できず `42601`（静的文字列のみ）。
+fn single_projected_column(projection: &Projection) -> Result<String, SqlSurfaceError> {
+    let name = match projection {
+        Projection::Columns(cols) => match cols.as_slice() {
+            [c] => Some(c.clone()),
+            _ => None,
+        },
+        Projection::Items(items) => match items.as_slice() {
+            [SelectItem::Column(c)] => Some(c.clone()),
+            [SelectItem::Expr {
+                expr: Expr::Ident(c),
+                alias: Some(_),
+            }] => Some(c.clone()),
+            _ => None,
+        },
+        Projection::All => None,
+    };
+    name.ok_or_else(|| {
+        SqlSurfaceError::unsupported(
+            "a correlated IN subquery must select a plain column (expressions are not supported)",
+        )
     })
 }
 
@@ -3112,7 +3229,7 @@ fn resolve_correlated_exists(
     validated: ValidatedScan,
     inner_schema: TableSchema,
     correlation: correlation::Correlation,
-    negated: bool,
+    shape: &CorrelatedShape<'_>,
     outer_scopes: &[&TableSchema],
     read_txn: &impl crate::storage::read_source::ReadSource,
     ctx: &PolicyContext,
@@ -3125,7 +3242,9 @@ fn resolve_correlated_exists(
     in_value_budget: &mut usize,
     corr: &CorrelatedCtx,
 ) -> Result<super::join::semi::CorrelatedProbeRef, SqlSurfaceError> {
-    use super::join::semi::{CorrelatedProbe, CorrelatedProbeRef, InnerInput, OuterKey, ProbeSpec};
+    use super::join::semi::{
+        CorrelatedProbe, CorrelatedProbeRef, InnerInput, OuterKey, ProbeKind, ProbeSpec,
+    };
 
     let PreparedCorrelated {
         mut validated,
@@ -3133,10 +3252,12 @@ fn resolve_correlated_exists(
         projected,
         residual,
         offset,
+        not_in_target,
     } = prepare_correlated_exists(
         validated,
         &inner_schema,
         &correlation,
+        shape,
         outer_scopes,
         udfs,
         result_limits,
@@ -3209,48 +3330,232 @@ fn resolve_correlated_exists(
             }
         })
         .collect();
+    // 判定方式。全形を明示的に扱う（取りこぼしで述語が落ちる fail-open を作らない）。
+    let kind = match (shape, &not_in_target) {
+        (CorrelatedShape::Exists { negated }, _) => ProbeKind::Exists { negated: *negated },
+        (CorrelatedShape::In { negated: false, .. }, _) => ProbeKind::Exists { negated: false },
+        (CorrelatedShape::In { negated: true, .. }, Some(pair)) => ProbeKind::NotIn {
+            target: OuterKey {
+                source: pair.outer.source,
+                class: pair.class.clone(),
+            },
+        },
+        (CorrelatedShape::In { negated: true, .. }, None) => {
+            return Err(SqlSurfaceError::Internal {
+                detail: "correlated NOT IN is missing its target pair".to_string(),
+            })
+        }
+    };
+    // `NOT IN` の対象値 y の取り出し位置（疑似列 `id` は行 `id` から作る）。
+    let value_pos: Option<Option<usize>> = not_in_target.as_ref().map(|pair| {
+        if pair.inner_is_pseudo_id {
+            None
+        } else {
+            projected.iter().position(|p| p == &pair.inner_column)
+        }
+    });
+    let value_is_id = not_in_target
+        .as_ref()
+        .is_some_and(|pair| pair.inner_is_pseudo_id);
     let keep_cells = residual.is_some();
     let min_matches = offset.saturating_add(1);
-    let inputs = result.rows.into_iter().map(|row| {
-        let mut key_cells = Vec::with_capacity(key_positions.len());
-        for (pos, key) in key_positions.iter().zip(&analysis.keys) {
-            let cell = match pos {
-                Some(i) => row
-                    .cells
-                    .get(*i)
-                    .cloned()
-                    .ok_or_else(|| SqlSurfaceError::Internal {
-                        detail: "correlated subquery key column is missing from the row"
-                            .to_string(),
-                    })?,
-                None if key.inner_is_pseudo_id => Cell::Integer(row.id),
-                None => {
-                    return Err(SqlSurfaceError::Internal {
-                        detail: "correlated subquery key column was not projected".to_string(),
-                    })
-                }
-            };
-            key_cells.push(cell);
-        }
-        let cells: Vec<Cell> = if keep_cells { row.cells } else { Vec::new() };
-        Ok(InnerInput {
-            id: row.id,
-            key_cells,
-            cells,
-        })
-    });
+    let inputs =
+        result.rows.into_iter().map(|row| {
+            let mut key_cells = Vec::with_capacity(key_positions.len());
+            for (pos, key) in key_positions.iter().zip(&analysis.keys) {
+                let cell = match pos {
+                    Some(i) => {
+                        row.cells
+                            .get(*i)
+                            .cloned()
+                            .ok_or_else(|| SqlSurfaceError::Internal {
+                                detail: "correlated subquery key column is missing from the row"
+                                    .to_string(),
+                            })?
+                    }
+                    None if key.inner_is_pseudo_id => Cell::Integer(row.id),
+                    None => {
+                        return Err(SqlSurfaceError::Internal {
+                            detail: "correlated subquery key column was not projected".to_string(),
+                        })
+                    }
+                };
+                key_cells.push(cell);
+            }
+            let value_cell =
+                match value_pos {
+                    None => None,
+                    Some(Some(i)) => Some(row.cells.get(i).cloned().ok_or_else(|| {
+                        SqlSurfaceError::Internal {
+                            detail: "correlated subquery value column is missing from the row"
+                                .to_string(),
+                        }
+                    })?),
+                    Some(None) if value_is_id => Some(Cell::Integer(row.id)),
+                    Some(None) => {
+                        return Err(SqlSurfaceError::Internal {
+                            detail: "correlated subquery value column was not projected"
+                                .to_string(),
+                        })
+                    }
+                };
+            let cells: Vec<Cell> = if keep_cells { row.cells } else { Vec::new() };
+            Ok(InnerInput {
+                id: row.id,
+                key_cells,
+                cells,
+                value_cell,
+            })
+        });
     let probe = CorrelatedProbe::build(
         ProbeSpec {
             keys,
             residual,
             min_matches,
-            negated,
+            kind,
             budget: corr.budget(),
             byte_cap: corr.byte_cap(),
         },
         inputs,
     )?;
     Ok(CorrelatedProbeRef::new(probe))
+}
+
+/// `target_column [NOT] IN (SELECT ...)` を解決する。内側が外側の列を参照する広域取得で `corr` が
+/// 有効なら、内側を 1 回だけ実体化した相関プローブ（肯定形は半結合、`NOT IN` は NULL を考慮した
+/// 反結合）へ書き換える（Issue #1844・SQL-61 ポインタ・RLS-10 ポインタ）。それ以外（非相関・`corr`
+/// 無効の文脈）は従来の [`resolve_in_subquery`] に委ねる（非相関の挙動は不変。相関は事前検査が
+/// `42601` で拒否する）。
+#[allow(clippy::too_many_arguments)]
+fn resolve_in_predicate(
+    column: &str,
+    inner_tokens: &[Token],
+    depth: usize,
+    negated: bool,
+    outer_scopes: &[&TableSchema],
+    read_txn: &impl crate::storage::read_source::ReadSource,
+    ctx: &PolicyContext,
+    lookup: &impl TableLookup,
+    udfs: &UdfRegistry,
+    group_limits: crate::group_by_limits::GroupByLimits,
+    nesting_limits: crate::nesting_limits::NestingLimits,
+    result_limits: crate::result_limits::ResultLimits,
+    budget: &mut usize,
+    in_value_budget: &mut usize,
+    corr: &CorrelatedCtx,
+) -> Result<Vec<WherePredicate>, SqlSurfaceError> {
+    if corr.is_enabled() {
+        if let Some((validated, inner_schema, correlation)) = classify_correlated_scan(
+            inner_tokens,
+            depth,
+            outer_scopes,
+            read_txn,
+            lookup,
+            nesting_limits,
+        )? {
+            let probe = resolve_correlated_exists(
+                validated,
+                inner_schema,
+                correlation,
+                &CorrelatedShape::In {
+                    target_column: column,
+                    negated,
+                },
+                outer_scopes,
+                read_txn,
+                ctx,
+                lookup,
+                udfs,
+                group_limits,
+                nesting_limits,
+                result_limits,
+                budget,
+                in_value_budget,
+                corr,
+            )?;
+            // 内部専用の葉。`NOT` の下には置かない（`NOT IN` は専用プローブが NULL を含めて判定する）。
+            return Ok(vec![WherePredicate::CorrelatedExists(probe)]);
+        }
+    }
+    resolve_in_subquery(
+        column,
+        inner_tokens,
+        depth,
+        negated,
+        outer_scopes,
+        read_txn,
+        ctx,
+        lookup,
+        udfs,
+        group_limits,
+        nesting_limits,
+        result_limits,
+        budget,
+        in_value_budget,
+        corr,
+    )
+}
+
+/// 失敗時の静的検証（Issue #1432 の経路）での相関 `IN`／`NOT IN`。内側が外側を参照するときは、
+/// 実行せずに [`prepare_correlated_exists`] と内側だけの連言の静的検証・束縛までを行い `true` を返す
+/// （否定形は準備の結果が同じなので肯定形として検証する）。相関でなければ `false`（従来の静的検証へ）。
+#[allow(clippy::too_many_arguments)]
+fn static_validate_correlated_in(
+    column: &str,
+    inner_tokens: &[Token],
+    depth: usize,
+    outer_scopes: &[&TableSchema],
+    read_txn: &impl crate::storage::read_source::ReadSource,
+    lookup: &impl TableLookup,
+    udfs: &UdfRegistry,
+    nesting_limits: crate::nesting_limits::NestingLimits,
+    result_limits: crate::result_limits::ResultLimits,
+) -> Result<bool, SqlSurfaceError> {
+    let Some((validated, inner_schema, correlation)) = classify_correlated_scan(
+        inner_tokens,
+        depth,
+        outer_scopes,
+        read_txn,
+        lookup,
+        nesting_limits,
+    )?
+    else {
+        return Ok(false);
+    };
+    let mut prepared = prepare_correlated_exists(
+        validated,
+        &inner_schema,
+        &correlation,
+        &CorrelatedShape::In {
+            target_column: column,
+            negated: false,
+        },
+        outer_scopes,
+        udfs,
+        result_limits,
+    )?;
+    let mut chain: Vec<&TableSchema> = outer_scopes.to_vec();
+    chain.push(&inner_schema);
+    static_validate_subquery_predicates(
+        &prepared.analysis.inner_only,
+        &chain,
+        read_txn,
+        lookup,
+        udfs,
+        nesting_limits,
+        result_limits,
+    )?;
+    prepared.validated.where_predicates =
+        static_validation_predicates(&prepared.analysis.inner_only);
+    shape_for_materialization(&mut prepared.validated, &prepared.projected);
+    super::parser::bind_scan_with_dummy_flags(
+        &prepared.validated,
+        &inner_schema,
+        udfs,
+        &[],
+        &result_limits,
+    )?;
+    Ok(true)
 }
 
 /// 失敗時の静的検証（Issue #1432 の経路）での `EXISTS`／`NOT EXISTS`。内側が外側を参照するときは、
@@ -3279,6 +3584,7 @@ fn static_validate_exists(
             validated,
             &inner_schema,
             &correlation,
+            &CorrelatedShape::Exists { negated: false },
             outer_scopes,
             udfs,
             result_limits,

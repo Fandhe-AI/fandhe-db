@@ -522,7 +522,8 @@ fn sql61_other_tenants_rows_are_not_observable_through_the_correlation() {
     let sql2 = "SELECT id FROM a WHERE EXISTS (SELECT 1 FROM b WHERE b.aid = a.k AND b.v > a.v - 1000) LIMIT 100";
     assert_eq!(ids(&core, &ctx, sql2), vec![1, 2]);
     // 未対応の形のエラーは他テナントの行数に依存しない。
-    let unsupported = "SELECT id FROM a WHERE t IN (SELECT t FROM b WHERE b.aid = a.k) LIMIT 100";
+    let unsupported =
+        "SELECT id FROM a WHERE t = (SELECT t FROM b WHERE b.aid = a.k LIMIT 1) LIMIT 100";
     assert_eq!(err(&core, &ctx, unsupported), err(&core, &t2, unsupported));
 }
 
@@ -530,9 +531,10 @@ fn sql61_other_tenants_rows_are_not_observable_through_the_correlation() {
 fn sql61_unsupported_correlated_forms_stay_fail_closed() {
     let (core, ctx, _g) = setup();
     for sql in [
-        // 相関 IN／NOT IN／スカラー (#1844)。
-        "SELECT id FROM a WHERE t IN (SELECT t FROM b WHERE b.aid = a.k) LIMIT 100",
-        "SELECT id FROM a WHERE t NOT IN (SELECT t FROM b WHERE b.aid = a.k) LIMIT 100",
+        // 相関 IN／NOT IN は Issue #1844 で実行できる（`tests/sql61_correlated_in.rs`）。明示
+        // `LIMIT`／`OFFSET` 付きは集合の帰属を変えるため fail-closed のまま。相関スカラーは対象外。
+        "SELECT id FROM a WHERE t IN (SELECT t FROM b WHERE b.aid = a.k LIMIT 5) LIMIT 100",
+        "SELECT id FROM a WHERE t NOT IN (SELECT t FROM b WHERE b.aid = a.k LIMIT 5) LIMIT 100",
         "SELECT id FROM a WHERE t = (SELECT t FROM b WHERE b.aid = a.k LIMIT 1) LIMIT 100",
         // 直近より外側の参照。
         "SELECT id FROM a WHERE EXISTS (SELECT 1 FROM b WHERE EXISTS (SELECT 1 FROM c WHERE c.aid = a.k)) LIMIT 100",

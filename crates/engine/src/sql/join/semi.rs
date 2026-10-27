@@ -24,11 +24,19 @@
 //! 反転するだけで、構築・予算・件数の扱いは `EXISTS` と共通。`EXISTS` は UNKNOWN にならないため
 //! 単純な否定になり、外側キーが NULL の行は真（返る）、`OFFSET k` は「一致が `k` 件以下」になる。
 //!
+//! 相関 `IN`／`NOT IN`（Issue #1844）: 肯定形 `x IN (SELECT y ...)` は、WHERE 文脈で UNKNOWN が偽に
+//! 潰れるため `EXISTS (... AND y = x)` と同値で、対象ペア `(y, x)` を等価キーへ足した
+//! [`ProbeKind::Exists`] で実行する。`NOT IN` は NULL を考慮した [`ProbeKind::NotIn`] で実行する
+//! （`NOT EXISTS (... AND y = x)` の流用は NULL を誤るため不可）。外側 1 行について、S を
+//! 「相関条件を満たす内側可視行の投影値 y の多重集合」とすると、値は次のとおり:
+//! S が空なら真（x が NULL でも真）／x が NULL なら偽／x が S にあれば偽／S に NULL があれば偽／
+//! それ以外は真。
+//!
 //! 情報漏えい対策: 内側行はすべて呼び出したセッションの可視行だけ。[`CorrelatedProbeRef`] の
 //! `Debug` は行データを一切出さない。エラー文言は静的文字列のみ。バケットの反復順は結果に
 //! 影響しない（バケット内は走査順の `Vec`、ハッシュ表は引くだけで走査しない）。
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::Arc;
 
@@ -123,6 +131,17 @@ pub(crate) struct OuterKey {
 struct InnerRow {
     id: u64,
     cells: Vec<Cell>,
+    /// `NOT IN` の対象値（内側投影列 y）の正準バイト列。`None` は NULL。`NotIn` 以外では未使用。
+    value: Option<Vec<u8>>,
+}
+
+/// `NOT IN`（残余なし）のバケット。同じ相関キーを持つ内側行（= S）の投影値の集合。
+/// 可視行の内容を持つため `Debug` は導出しない。
+struct NotInBucket {
+    /// S に NULL の投影値を含むか。
+    has_null: bool,
+    /// S の非 NULL 投影値（正準バイト列）。
+    values: HashSet<Vec<u8>>,
 }
 
 /// 内側行の保持形。残余が無い（半結合）ときは件数だけ、あるときは行そのものを持つ（`Debug` 非導出）。
@@ -132,6 +151,18 @@ enum ProbeRows {
         rows: Vec<InnerRow>,
         by_key: HashMap<Vec<u8>, Vec<u32>>,
     },
+    /// `NOT IN` で残余が無い形（相関キーごとの [`NotInBucket`]）。
+    NotIn(HashMap<Vec<u8>, NotInBucket>),
+}
+
+/// プローブの判定方式（Issue #1844）。`eval` は網羅的に `match` し、取りこぼしで述語が
+/// 落ちる fail-open を作らない。
+#[derive(Debug, Clone)]
+pub(crate) enum ProbeKind {
+    /// `EXISTS`（`negated` なら `NOT EXISTS`）。肯定形の相関 `IN` もこれ（対象ペアは等価キー）。
+    Exists { negated: bool },
+    /// `NOT IN`（NULL を考慮した反結合）。`target` は外側の対象値 x の取り出し元と型クラス。
+    NotIn { target: OuterKey },
 }
 
 /// 残余述語の評価器。内側スキーマに外側参照ごとの列を足した合成スキーマで束縛した結果を
@@ -156,8 +187,8 @@ pub struct CorrelatedProbe {
     residual: Option<Residual>,
     /// 一致が必要な最小件数（内側 `OFFSET k` の意味の保存。`k + 1`）。
     min_matches: usize,
-    /// 反結合（`NOT EXISTS`、Issue #1843）。`eval` の出口で判定を反転する。
-    negated: bool,
+    /// 判定方式。`Exists { negated }` は `eval` の出口で判定を反転する（Issue #1843）。
+    kind: ProbeKind,
     budget: Arc<CorrelatedBudget>,
     /// 外側スキーマで評価に必要な論理列インデックス（キーと残余が参照する列。重複なし・昇順）。
     outer_columns: Vec<usize>,
@@ -170,6 +201,8 @@ pub(crate) struct InnerInput {
     pub(crate) key_cells: Vec<Cell>,
     /// 残余の評価に必要な内側列のセル（`Residual::inner_cols` と同じ順）。
     pub(crate) cells: Vec<Cell>,
+    /// `NOT IN` の対象値（内側投影列 y）のセル。`ProbeKind::NotIn` のときだけ `Some`。
+    pub(crate) value_cell: Option<Cell>,
 }
 
 /// プローブの構築パラメータ。
@@ -177,8 +210,8 @@ pub(crate) struct ProbeSpec {
     pub(crate) keys: Vec<OuterKey>,
     pub(crate) residual: Option<Residual>,
     pub(crate) min_matches: usize,
-    /// 反結合（`NOT EXISTS`）か。`EXISTS` は UNKNOWN にならないため単純な否定になる。
-    pub(crate) negated: bool,
+    /// 判定方式（`EXISTS`／`NOT EXISTS`／`NOT IN`）。
+    pub(crate) kind: ProbeKind,
     pub(crate) budget: Arc<CorrelatedBudget>,
     /// 内側行の保持に使える推定バイト量の上限（確保前に計上して超過なら `54000`）。
     pub(crate) byte_cap: usize,
@@ -205,7 +238,7 @@ impl CorrelatedProbe {
             keys,
             residual,
             min_matches,
-            negated,
+            kind,
             budget,
             byte_cap,
         } = spec;
@@ -220,6 +253,11 @@ impl CorrelatedProbe {
         let mut counts: HashMap<Vec<u8>, usize> = HashMap::new();
         let mut rows: Vec<InnerRow> = Vec::new();
         let mut by_key: HashMap<Vec<u8>, Vec<u32>> = HashMap::new();
+        let mut buckets: HashMap<Vec<u8>, NotInBucket> = HashMap::new();
+        let not_in_class = match &kind {
+            ProbeKind::NotIn { target } => Some(target.class.clone()),
+            ProbeKind::Exists { .. } => None,
+        };
         let keep_rows = residual.is_some();
         'rows: for input in inputs {
             let input = input?;
@@ -235,7 +273,39 @@ impl CorrelatedProbe {
                 }
                 encode_key_component(cell, &k.class, &mut key)?;
             }
-            if keep_rows {
+            // `NOT IN` の対象値 y（NULL は `None`）。相関キーが NULL の行は上で除外済み。
+            let value: Option<Vec<u8>> = match (&not_in_class, &input.value_cell) {
+                (Some(class), Some(cell)) if !matches!(cell, Cell::Null) => {
+                    let mut v = Vec::new();
+                    encode_key_component(cell, class, &mut v)?;
+                    Some(v)
+                }
+                (Some(_), Some(_)) => None,
+                (Some(_), None) => {
+                    return Err(SqlSurfaceError::Internal {
+                        detail: "correlated NOT IN input is missing the target value".to_string(),
+                    })
+                }
+                (None, _) => None,
+            };
+            if not_in_class.is_some() && !keep_rows {
+                match buckets.get_mut(&key) {
+                    Some(b) => Self::add_not_in_value(b, value, &mut charge)?,
+                    None => {
+                        charge(
+                            key_bytes_overhead(&key)
+                                .saturating_add(std::mem::size_of::<NotInBucket>()),
+                        )?;
+                        buckets.try_reserve(1).map_err(|_| too_large())?;
+                        let mut b = NotInBucket {
+                            has_null: false,
+                            values: HashSet::new(),
+                        };
+                        Self::add_not_in_value(&mut b, value, &mut charge)?;
+                        buckets.insert(key, b);
+                    }
+                }
+            } else if keep_rows {
                 let idx = u32::try_from(rows.len()).map_err(|_| too_large())?;
                 let cell_bytes = input
                     .cells
@@ -251,12 +321,14 @@ impl CorrelatedProbe {
                                 .saturating_mul(std::mem::size_of::<Cell>()),
                         )
                         .saturating_add(cell_bytes)
+                        .saturating_add(value.as_ref().map_or(0, |v| key_bytes_overhead(v)))
                         .saturating_add(std::mem::size_of::<u32>()),
                 )?;
                 rows.try_reserve(1).map_err(|_| too_large())?;
                 rows.push(InnerRow {
                     id: input.id,
                     cells: input.cells,
+                    value,
                 });
                 match by_key.get_mut(&key) {
                     Some(v) => {
@@ -282,6 +354,10 @@ impl CorrelatedProbe {
         }
         let mut outer_columns: Vec<usize> = keys
             .iter()
+            .chain(match &kind {
+                ProbeKind::NotIn { target } => Some(target),
+                ProbeKind::Exists { .. } => None,
+            })
             .filter_map(|k| match k.source {
                 OuterSource::Column(i) => Some(i),
                 OuterSource::Id => None,
@@ -299,12 +375,14 @@ impl CorrelatedProbe {
             keys,
             rows: if keep_rows {
                 ProbeRows::Rows { rows, by_key }
+            } else if not_in_class.is_some() {
+                ProbeRows::NotIn(buckets)
             } else {
                 ProbeRows::Counts(counts)
             },
             residual,
             min_matches,
-            negated,
+            kind,
             budget,
             outer_columns,
         })
@@ -324,15 +402,85 @@ impl CorrelatedProbe {
         row_scalars: &[Option<ScalarRef<'_>>],
         id: u64,
     ) -> Result<bool, SqlSurfaceError> {
-        self.eval_exists(row_scalars, id).map(|e| e != self.negated)
+        match &self.kind {
+            ProbeKind::Exists { negated } => {
+                self.eval_exists(row_scalars, id).map(|e| e != *negated)
+            }
+            ProbeKind::NotIn { target } => self.eval_not_in(target, row_scalars, id),
+        }
     }
 
-    /// 否定を適用する前の `EXISTS` 判定（[`Self::eval`] 専用）。
-    fn eval_exists(
+    /// `NOT IN` の 1 行判定（真理値表は本モジュール冒頭）。外側の相関キーが NULL の行は S が空
+    /// （どの内側行にも一致しない）ため、対象値 x が NULL でも真になる。
+    fn eval_not_in(
         &self,
+        target: &OuterKey,
         row_scalars: &[Option<ScalarRef<'_>>],
         id: u64,
     ) -> Result<bool, SqlSurfaceError> {
+        // x は先に取り出す（範囲外の外側列は NULL と取り違えず fail-closed にする）。
+        let x: Option<Vec<u8>> = match target.source {
+            OuterSource::Id => {
+                let mut v = Vec::new();
+                encode_key_component(&Cell::Integer(id), &target.class, &mut v)?;
+                Some(v)
+            }
+            OuterSource::Column(i) => match outer_scalar(row_scalars, i)? {
+                None => None,
+                Some(scalar) => {
+                    let cell = key_cell_from_scalar(&scalar, &target.class)?;
+                    let mut v = Vec::new();
+                    encode_key_component(&cell, &target.class, &mut v)?;
+                    Some(v)
+                }
+            },
+        };
+        let Some(key) = self.outer_key(row_scalars, id)? else {
+            // 外側の相関キーが NULL: 内側のどの行にも一致せず S は空 → NOT IN は真。
+            return Ok(true);
+        };
+        match &self.rows {
+            ProbeRows::NotIn(map) => {
+                let Some(bucket) = map.get(&key) else {
+                    return Ok(true);
+                };
+                // バケットが在る = S は非空。
+                let Some(x) = x else { return Ok(false) };
+                Ok(!bucket.has_null && !bucket.values.contains(&x))
+            }
+            ProbeRows::Rows { rows, by_key } => {
+                let Some(indices) = by_key.get(&key) else {
+                    return Ok(true);
+                };
+                let residual = self.residual_required()?;
+                self.budget.charge_reevaluation()?;
+                // S の要素（残余が真の行）が 1 つでも x と一致・NULL、または x が NULL なら偽。
+                let decided_false = self.scan_matches(
+                    rows,
+                    indices,
+                    residual,
+                    row_scalars,
+                    id,
+                    &mut |row| match (&x, &row.value) {
+                        (Some(x), Some(y)) => x == y,
+                        _ => true,
+                    },
+                )?;
+                Ok(!decided_false)
+            }
+            // `NotIn` の構築は `NotIn`／`Rows` のどちらかだけ。破れたら fail-closed。
+            ProbeRows::Counts(_) => Err(SqlSurfaceError::Internal {
+                detail: "correlated NOT IN probe has an unexpected row layout".to_string(),
+            }),
+        }
+    }
+
+    /// 外側の相関キーの正準バイト列。いずれかの成分が NULL なら `None`。
+    fn outer_key(
+        &self,
+        row_scalars: &[Option<ScalarRef<'_>>],
+        id: u64,
+    ) -> Result<Option<Vec<u8>>, SqlSurfaceError> {
         let mut key = Vec::new();
         for k in &self.keys {
             let scalar = match k.source {
@@ -343,28 +491,47 @@ impl CorrelatedProbe {
                 OuterSource::Column(i) => outer_scalar(row_scalars, i)?,
             };
             let Some(scalar) = scalar else {
-                // 外側キーが NULL: `=` は真にならないため偽（EXISTS は UNKNOWN にならない）。
-                return Ok(false);
+                return Ok(None);
             };
             let cell = key_cell_from_scalar(&scalar, &k.class)?;
             encode_key_component(&cell, &k.class, &mut key)?;
         }
+        Ok(Some(key))
+    }
+
+    /// 残余を持たない `Rows` は構築されない不変条件。破れたら fail-closed。
+    fn residual_required(&self) -> Result<&Residual, SqlSurfaceError> {
+        self.residual
+            .as_ref()
+            .ok_or_else(|| SqlSurfaceError::Internal {
+                detail: "correlated probe has rows without a residual".to_string(),
+            })
+    }
+
+    /// 否定を適用する前の `EXISTS` 判定（[`Self::eval`] 専用）。
+    fn eval_exists(
+        &self,
+        row_scalars: &[Option<ScalarRef<'_>>],
+        id: u64,
+    ) -> Result<bool, SqlSurfaceError> {
+        // 外側キーが NULL: `=` は真にならないため偽（EXISTS は UNKNOWN にならない）。
+        let Some(key) = self.outer_key(row_scalars, id)? else {
+            return Ok(false);
+        };
         match &self.rows {
             ProbeRows::Counts(map) => Ok(map.get(&key).is_some_and(|n| *n >= self.min_matches)),
             ProbeRows::Rows { rows, by_key } => {
                 let Some(indices) = by_key.get(&key) else {
                     return Ok(false);
                 };
-                // 残余を持たない `Rows` は構築されない不変条件。破れたら fail-closed。
-                let residual = self
-                    .residual
-                    .as_ref()
-                    .ok_or_else(|| SqlSurfaceError::Internal {
-                        detail: "correlated probe has rows without a residual".to_string(),
-                    })?;
+                let residual = self.residual_required()?;
                 self.budget.charge_reevaluation()?;
                 self.count_matches(rows, indices, residual, row_scalars, id)
             }
+            // `Exists` 種別では構築されない形。破れたら fail-closed。
+            ProbeRows::NotIn(_) => Err(SqlSurfaceError::Internal {
+                detail: "correlated EXISTS probe has an unexpected row layout".to_string(),
+            }),
         }
     }
 
@@ -375,6 +542,26 @@ impl CorrelatedProbe {
         residual: &Residual,
         row_scalars: &[Option<ScalarRef<'_>>],
         outer_id: u64,
+    ) -> Result<bool, SqlSurfaceError> {
+        let mut matched = 0usize;
+        let min = self.min_matches;
+        self.scan_matches(rows, indices, residual, row_scalars, outer_id, &mut |_| {
+            matched = matched.saturating_add(1);
+            matched >= min
+        })
+    }
+
+    /// バケット内の各内側行について残余を評価し、真の行ごとに `on_match` を呼ぶ。`on_match` が
+    /// `true` を返した時点で打ち切り `true` を返す（最後まで打ち切られなければ `false`）。
+    /// 行ごとに比較予算を計上し協調的中断を確認する（キーなし相関は内側全行に及ぶため）。
+    fn scan_matches(
+        &self,
+        rows: &[InnerRow],
+        indices: &[u32],
+        residual: &Residual,
+        row_scalars: &[Option<ScalarRef<'_>>],
+        outer_id: u64,
+        on_match: &mut dyn FnMut(&InnerRow) -> bool,
     ) -> Result<bool, SqlSurfaceError> {
         let mut scanned: Vec<Option<ScalarRef<'_>>> = vec![None; residual.width];
         for (slot, source, _ty) in &residual.outer_cols {
@@ -393,11 +580,8 @@ impl CorrelatedProbe {
             }
         }
         let mut scratch: Vec<StackValue> = Vec::new();
-        let mut matched = 0usize;
         for &idx in indices {
             self.budget.charge_comparison()?;
-            // キーなし相関では外側 1 行の評価が内側全行に及ぶため、既存 JOIN と同じく
-            // 比較ごとに協調的中断（57014）を確認する。
             crate::interrupt::check()?;
             let row = rows
                 .get(idx as usize)
@@ -424,14 +608,31 @@ impl CorrelatedProbe {
             if residual
                 .group
                 .matches(&scanned, row.id, &[], 0, &mut scratch)?
+                && on_match(row)
             {
-                matched = matched.saturating_add(1);
-                if matched >= self.min_matches {
-                    return Ok(true);
-                }
+                return Ok(true);
             }
         }
         Ok(false)
+    }
+
+    /// `NotInBucket` へ投影値 1 つを加える。新しい値だけを予算へ計上してから確保する。
+    fn add_not_in_value(
+        bucket: &mut NotInBucket,
+        value: Option<Vec<u8>>,
+        charge: &mut impl FnMut(usize) -> Result<(), SqlSurfaceError>,
+    ) -> Result<(), SqlSurfaceError> {
+        match value {
+            None => bucket.has_null = true,
+            Some(v) => {
+                if !bucket.values.contains(&v) {
+                    charge(key_bytes_overhead(&v))?;
+                    bucket.values.try_reserve(1).map_err(|_| too_large())?;
+                    bucket.values.insert(v);
+                }
+            }
+        }
+        Ok(())
     }
 }
 
@@ -503,6 +704,7 @@ mod tests {
             id: 0,
             key_cells: vec![key],
             cells: Vec::new(),
+            value_cell: None,
         }
     }
 
@@ -516,7 +718,7 @@ mod tests {
                 keys: int_key(),
                 residual: None,
                 min_matches,
-                negated,
+                kind: ProbeKind::Exists { negated },
                 budget: budget(),
                 byte_cap: usize::MAX,
             },
@@ -569,6 +771,111 @@ mod tests {
         assert!(p.eval(&[Some(ScalarRef::BigInt(2))], 1).unwrap());
     }
 
+    fn not_in_probe(
+        rows: Vec<(Cell, Cell)>,
+        byte_cap: usize,
+    ) -> Result<CorrelatedProbe, SqlSurfaceError> {
+        // 相関キー（外側列 0）と対象値（外側列 1）はともに整数クラス。
+        CorrelatedProbe::build(
+            ProbeSpec {
+                keys: int_key(),
+                residual: None,
+                min_matches: 1,
+                kind: ProbeKind::NotIn {
+                    target: OuterKey {
+                        source: OuterSource::Column(1),
+                        class: JoinKeyClass::Integer,
+                    },
+                },
+                budget: budget(),
+                byte_cap,
+            },
+            rows.into_iter().map(|(k, v)| {
+                Ok(InnerInput {
+                    id: 0,
+                    key_cells: vec![k],
+                    cells: Vec::new(),
+                    value_cell: Some(v),
+                })
+            }),
+        )
+    }
+
+    fn outer(key: Option<i64>, x: Option<i64>) -> Vec<Option<ScalarRef<'static>>> {
+        vec![key.map(ScalarRef::BigInt), x.map(ScalarRef::BigInt)]
+    }
+
+    #[test]
+    fn not_in_follows_the_three_valued_truth_table() {
+        use Cell::{Null, SignedInteger as I};
+        // 相関キー 1 の S = {1, 2}、キー 2 の S = {NULL, 5}、キー 3 の S = {7}。キー NULL の行は誰の S にも属さない。
+        let p = not_in_probe(
+            vec![
+                (I(1), I(1)),
+                (I(1), I(2)),
+                (I(2), Null),
+                (I(2), I(5)),
+                (I(3), I(7)),
+                (Null, I(9)),
+            ],
+            usize::MAX,
+        )
+        .expect("build");
+        // 1. S が空（バケット無し・外側キー NULL）は x が NULL でも真。
+        assert!(p.eval(&outer(Some(4), None), 1).unwrap());
+        assert!(p.eval(&outer(Some(4), Some(1)), 1).unwrap());
+        assert!(p.eval(&outer(None, None), 1).unwrap());
+        assert!(p.eval(&outer(None, Some(9)), 1).unwrap());
+        // 2. x が NULL で S 非空は偽（UNKNOWN）。
+        assert!(!p.eval(&outer(Some(3), None), 1).unwrap());
+        // 3. x ∈ S は偽。
+        assert!(!p.eval(&outer(Some(1), Some(2)), 1).unwrap());
+        assert!(!p.eval(&outer(Some(2), Some(5)), 1).unwrap());
+        // 4. x ∉ S かつ S に NULL は偽（UNKNOWN）。
+        assert!(!p.eval(&outer(Some(2), Some(6)), 1).unwrap());
+        // 5. x ∉ S かつ NULL なしで S 非空は真。
+        assert!(p.eval(&outer(Some(1), Some(3)), 1).unwrap());
+        assert!(p.eval(&outer(Some(3), Some(8)), 1).unwrap());
+    }
+
+    #[test]
+    fn not_in_fails_closed_on_missing_wiring_and_charges_the_byte_budget() {
+        use Cell::SignedInteger as I;
+        let p = not_in_probe(vec![(I(1), I(1))], usize::MAX).expect("build");
+        // 対象列（外側列 1）が行ビューに無い場合は NULL と取り違えず XX000。
+        let e = p.eval(&[Some(ScalarRef::BigInt(1))], 1).unwrap_err();
+        assert_eq!(e.wire_code(), "XX000");
+        // 対象列がデコード対象に含まれる。
+        assert_eq!(p.outer_columns(), &[0, 1]);
+        let e = not_in_probe((0..10).map(|i| (I(i), I(i))).collect(), 8)
+            .err()
+            .expect("over budget");
+        assert_eq!(e.wire_code(), "54000");
+    }
+
+    #[test]
+    fn not_in_requires_the_target_value_cell() {
+        let e = CorrelatedProbe::build(
+            ProbeSpec {
+                keys: int_key(),
+                residual: None,
+                min_matches: 1,
+                kind: ProbeKind::NotIn {
+                    target: OuterKey {
+                        source: OuterSource::Column(1),
+                        class: JoinKeyClass::Integer,
+                    },
+                },
+                budget: budget(),
+                byte_cap: usize::MAX,
+            },
+            std::iter::once(Ok(input(Cell::SignedInteger(1)))),
+        )
+        .err()
+        .expect("missing value");
+        assert_eq!(e.wire_code(), "XX000");
+    }
+
     #[test]
     fn semi_join_has_no_distinct_value_cap() {
         let keys: Vec<Cell> = (0..2_000_i64).map(Cell::SignedInteger).collect();
@@ -605,7 +912,7 @@ mod tests {
                 keys: int_key(),
                 residual: None,
                 min_matches: 1,
-                negated: false,
+                kind: ProbeKind::Exists { negated: false },
                 budget: budget(),
                 byte_cap: 8,
             },
