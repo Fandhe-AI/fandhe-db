@@ -48,18 +48,39 @@ use super::using::{
 use super::values::{cmp_class, key_class, CmpClass, JoinKeyClass};
 use super::where_promote::promotable_where_key;
 
+/// CTE リレーションが公開した行 `id` を運ぶ列（`TableSchema::columns` の添字）の表。キーはリレーションの
+/// 綴り（`TableRef::table`）。`cte_schema` が作り、`core.rs` が Execute・Describe の双方で同じものを渡す。
+pub(crate) type CteIdColumns = HashMap<String, Vec<usize>>;
+
+/// CTE の行 `id` を運ぶ列（`id_columns`）を、リテラル束縛用に疑似列 `id` と同じ numeric 型
+/// （[`crate::sql::exec::ALIASED_ID_TYPE`]）へ差し替えたスキーマの写し。`CteIdColumns` を唯一の情報源として、
+/// 側述語の事前束縛（`bind_side_scans`）と単一リレーションの残余述語（`build_residual`）が共有する。
+/// 実行時のセルは変えない（`u64` のまま。残余の評価は `eval_single` が numeric へ写す）。
+pub(super) fn cte_id_binding_schema(schema: &TableSchema, id_columns: &[usize]) -> TableSchema {
+    let mut out = schema.clone();
+    for &i in id_columns {
+        if let Some(col) = out.columns.get_mut(i) {
+            col.ty = crate::sql::exec::ALIASED_ID_TYPE.clone();
+        }
+    }
+    out
+}
+
 /// 解決済みの列参照（どの relation の、側スキャン結果の何番目のセルか）。
 #[derive(Debug, Clone)]
 pub(super) struct Col {
     pub(super) rel: usize,
     /// 側スキャン結果の行 `cells` 内の位置。
     pub(super) pos: usize,
-    /// 列型（疑似列 `id` は `None`）。
+    /// 列型（疑似列 `id`・CTE が公開した行 `id` は `None`）。
     pub(super) ty: Option<ColumnType>,
     /// スキーマ列名（疑似列は `"id"`）。
     pub(super) name: String,
     /// `TableSchema::columns` の添字（疑似列は `None`）。
     pub(super) schema_idx: Option<usize>,
+    /// CTE 本文が公開した行 `id`（`ColumnMeta::Id`／`AliasedId`）を運ぶ列か（Issue #1861）。セルは
+    /// `Cell::Integer(u64)` のままで、公告は実 `BIGINT` ではなく `id` 型（`meta` が写す）。
+    pub(super) cte_id: bool,
 }
 
 /// 結合キー 1 成分（これまでの結合結果側の列と、新しく加わる relation 側の列）。
@@ -288,6 +309,8 @@ struct Binder<'a, 'b> {
     relations: &'b [TableRef],
     scope: JoinScope<'a>,
     sides: Vec<SideProjection>,
+    /// CTE リレーション（`relations` と同じ綴りのキー）ごとの、行 `id` を運ぶ列の `columns` 添字。
+    cte_ids: &'b CteIdColumns,
 }
 
 impl<'a, 'b> Binder<'a, 'b> {
@@ -342,19 +365,39 @@ impl<'a, 'b> Binder<'a, 'b> {
             },
             SideProjection::Columns(_) => side.ensure(&name, schema)?,
         };
+        // CTE が公開した行 `id` の列は、疑似列 `id` と同じ扱い（型なし＝符号なし整数のセル）にする。
+        // 実 `BIGINT` として束縛すると、集計・比較の写像が `Cell::SignedInteger` を前提にして
+        // `Cell::Integer(u64)` を扱えず、`i64::MAX` 超の行 id が壊れる／内部エラーになる（Issue #1861）。
+        let cte_id = match (slot, self.relations.get(rel)) {
+            (ColumnSlot::Column(i), Some(r)) => self
+                .cte_ids
+                .get(r.table())
+                .is_some_and(|cols| cols.contains(&i)),
+            _ => false,
+        };
         Ok(Col {
             rel,
             pos,
-            ty: ty.cloned(),
+            ty: if cte_id { None } else { ty.cloned() },
             name,
             schema_idx: match slot {
                 ColumnSlot::Id => None,
                 ColumnSlot::Column(i) => Some(i),
             },
+            cte_id,
         })
     }
 
     fn meta(col: &Col) -> ColumnMeta {
+        // CTE が公開した行 `id` は `BIGINT` ではなく `id` 型で公告する（単一表の具体化 CTE 経路と同じ。
+        // `i64::MAX` 超の行 id は `int8` では符号化できない）。
+        if col.cte_id {
+            return if col.name == "id" {
+                ColumnMeta::Id
+            } else {
+                crate::sql::exec::aliased_id_column_meta(&col.name)
+            };
+        }
         match (&col.ty, col.schema_idx) {
             (Some(ty), Some(_)) => ColumnMeta::Scalar {
                 name: col.name.clone(),
@@ -602,12 +645,21 @@ fn build_residual(
             })?;
         let preds = to_where_predicates(expr, &binder.scope, &binder.schemas)?;
         let wrapped = vec![WherePredicate::Or(vec![preds])];
-        let schema = *binder
+        let base_schema = *binder
             .schemas
             .get(rel)
             .ok_or_else(|| SqlSurfaceError::Internal {
                 detail: "JOIN relation index out of range".to_string(),
             })?;
+        // CTE の行 `id` の列は numeric で束縛する（`BIGINT` の `i64` 解析で有効な行 id のリテラルを
+        // `22003` にしない）。
+        let id_typed = binder
+            .relations
+            .get(rel)
+            .and_then(|r| binder.cte_ids.get(r.table()))
+            .filter(|cols| !cols.is_empty())
+            .map(|cols| cte_id_binding_schema(base_schema, cols));
+        let schema = id_typed.as_ref().unwrap_or(base_schema);
         let mut node_budget = crate::sql::udf_call::MAX_EXPR_NODES;
         let (metadata, expr_filters, _rls, mut or_filters) =
             crate::sql::parser::bind_where_predicates(
@@ -635,7 +687,14 @@ fn build_residual(
         let mut cols: Vec<(usize, usize, ColumnType)> = Vec::new();
         for r in refs {
             let c = binder.col(r)?;
-            if let (Some(idx), Some(ty)) = (c.schema_idx, c.ty) {
+            // CTE の行 `id` の列は型なし（符号なし整数のセル）として束縛済みだが、残余の評価では
+            // numeric の列として渡す（`eval_single` が `u64` のセルを numeric へ写す）。
+            let ty = if c.cte_id {
+                Some(crate::sql::exec::ALIASED_ID_TYPE.clone())
+            } else {
+                c.ty
+            };
+            if let (Some(idx), Some(ty)) = (c.schema_idx, ty) {
                 if !cols.iter().any(|(i, _, _)| *i == idx) {
                     cols.push((idx, c.pos, ty));
                 }
@@ -737,6 +796,7 @@ fn bind_on_residuals<'a>(
 /// WHERE 分離・投影展開・並べ替え／集計の型検証をすべて行走査より前に確定させる。
 pub(super) fn build_plan<'a>(
     schemas: &'a HashMap<String, TableSchema>,
+    cte_ids: &CteIdColumns,
     validated: &ValidatedJoin,
     udfs: &UdfRegistry,
 ) -> Result<JoinPlan<'a>, SqlSurfaceError> {
@@ -783,6 +843,7 @@ pub(super) fn build_plan<'a>(
         relations,
         scope,
         sides,
+        cte_ids,
     };
 
     // 結合段（ON）。段 k のスコープは relation 0..=k+1 だけで構築する——未出現の
@@ -1347,6 +1408,14 @@ fn build_aggregate_shape(
                     ),
                     Some(colref) => {
                         let c = b.col(colref)?;
+                        // CTE が公開した行 `id`（符号なし整数のセル）への集計は、集計の入力写像が
+                        // 符号付き `BIGINT` のセルを前提とするため未対応。内部エラーや `i64` への
+                        // 変換で値を壊さず、固定文言の `0A000` で拒否する（fail-closed）。
+                        if c.cte_id {
+                            return Err(SqlSurfaceError::feature_not_supported(
+                                "an aggregate over a CTE row id column is not supported in JOIN",
+                            ));
+                        }
                         let schema =
                             *b.schemas
                                 .get(c.rel)

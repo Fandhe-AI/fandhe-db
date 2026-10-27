@@ -3337,6 +3337,55 @@ pub struct ValidatedJoin {
     pub(crate) aggregate: Option<Box<JoinAggregate>>,
     pub(crate) limit: Option<u32>,
     pub(crate) offset: u32,
+    /// FROM の一部が CTE のとき、その具体化・共有の指示（SQL-62・Issue #1861）。`None` は従来の
+    /// JOIN（全リレーションが実表）で、既存の全経路の挙動は変わらない。`Some` のとき、
+    /// `relations` のうち [`JoinCteInputs::relation_slot`] が `Some` のものは CTE を指し、
+    /// カタログの同名の表・ビューを読んではならない（読む経路は fail-closed で `Internal`）。
+    pub(crate) cte_inputs: Option<Box<JoinCteInputs>>,
+}
+
+/// JOIN の FROM が参照する CTE の評価計画（SQL-62 (1)(3)(5)(6)・Issue #1861）。
+/// `sql::allowlist` の `WITH` 分岐だけが組み立て、`core.rs` の実行・Describe が slot を評価して
+/// `sql::join` へ評価済みの行を渡す。テナント・`PolicyContext` は保持しない（RLS-10 (b)。
+/// 評価は常に参照したセッション自身の文脈で行う）。
+#[derive(Debug, Clone, PartialEq)]
+pub(crate) struct JoinCteInputs {
+    /// 到達できる CTE の評価単位（定義順＝依存順。`Derived` の `from` は常に自身より前）。
+    pub(crate) slots: Vec<CteSlot>,
+    /// `ValidatedJoin::relations` と同じ並びで、そのリレーションが参照する slot の添字
+    /// （`None` は実表）。
+    pub(crate) relation_slot: Vec<Option<usize>>,
+}
+
+// 手書きの `Eq`: `slots` が持つ述語は f64 を含みうるため `derive(Eq)` できないが、構築経路が
+// NaN を受理しない（`JoinHavingPredicate` と同じ論法）ため反射律は保たれる。`ValidatedJoin` の
+// `Eq` を外すと公開 API を壊すので維持する。
+impl Eq for JoinCteInputs {}
+
+/// CTE 1 つ分の評価単位（Issue #1861）。
+#[derive(Debug, Clone, PartialEq)]
+pub(crate) struct CteSlot {
+    /// CTE 名（定義時の綴り）。
+    pub(crate) name: String,
+    /// 列名リスト（`WITH c(a, b) AS ...`）。評価後の結果列を先頭から改名する。
+    pub(crate) column_aliases: Vec<String>,
+    /// 評価結果を文内で共有するか。真なら本文は文内で 1 回だけ評価する（`MATERIALIZED`、
+    /// または指定なしで 2 回以上参照されるとき）。偽なら参照のたびに評価する。
+    pub(crate) shared: bool,
+    pub(crate) source: CteSlotSource,
+}
+
+/// [`CteSlot`] の評価方法。
+#[derive(Debug, Clone, PartialEq)]
+pub(crate) enum CteSlotSource {
+    /// 実表（またはビュー）を読む本文を 1 つの広域取得にしたもの（暗黙の `LIMIT`＝結果行数上限つき）。
+    Scan(Box<ValidatedScan>),
+    /// 別の CTE（`from` 番目の slot）を読む本文。親の評価済みの行へ層を重ねて導出する
+    /// （記憶域を読まない）。
+    Derived {
+        from: usize,
+        layer: Box<BufferedRows>,
+    },
 }
 
 /// `UPDATE ... FROM` の SET 右辺 1 個（SQL-53 (b)、Issue #1754）。列参照 1 個（修飾あり・なし）は
@@ -15979,6 +16028,9 @@ pub(crate) fn check_buffered_body_shape(
         Statement::Scan(v) if v.limit_implicit => Err(body_form_unsupported()),
         Statement::Scan(v) => check_body_scan(v, lookup, top_policy, out),
         Statement::Aggregate(v) => check_body_aggregate(v, lookup, top_policy, out),
+        // Issue #1861（SQL-62）: CTE を入力に持つ JOIN はセッションの最上位 SELECT だけが生成する
+        // （InlineOnly の本文検証は生成しない）。多層防御として本文では拒否する（fail-closed）。
+        Statement::Join(v) if v.cte_inputs.is_some() => Err(body_form_unsupported()),
         // Issue #1796・SQL-34: 非集計 JOIN の `LIMIT` 省略・`LIMIT ALL` も本文では `42601`。
         Statement::Join(v) if v.aggregate.is_none() && v.limit.is_none() => {
             Err(body_form_unsupported())
@@ -20128,6 +20180,15 @@ fn parse_join_statement(
     tokens: &[Token],
     lookup: &impl TableLookup,
 ) -> Result<ValidatedJoin, SqlSurfaceError> {
+    let validated = parse_join_syntax(tokens)?;
+    check_join_relations_are_tables(&validated, lookup)?;
+    Ok(validated)
+}
+
+/// [`parse_join_statement`] の構文部（カタログを引かない）。`WITH` 主クエリの JOIN
+/// （Issue #1861）も同じ構文解析を共有し、FROM の各リレーションを CTE 名として先に照合してから
+/// 残りをカタログで解決する（第 2 の JOIN パーサーを作らない）。
+fn parse_join_syntax(tokens: &[Token]) -> Result<ValidatedJoin, SqlSurfaceError> {
     let mut p = Parser::new(tokens);
     p.expect_keyword(Keyword::Select)?;
     let (projection, select_items, column_aliases) = parse_join_select_list(&mut p)?;
@@ -20278,18 +20339,6 @@ fn parse_join_statement(
     let offset = p.parse_optional_offset()?.unwrap_or(0);
     p.expect_end_of_statement()?;
 
-    for r in &relations {
-        match crate::sql::view::resolve_from(lookup, r.table())? {
-            crate::sql::view::Resolved::Table => {}
-            crate::sql::view::Resolved::View { .. }
-            | crate::sql::view::Resolved::Buffered { .. } => {
-                return Err(SqlSurfaceError::unsupported(
-                    "JOIN does not support view references",
-                ));
-            }
-        }
-    }
-
     Ok(ValidatedJoin {
         relations,
         steps,
@@ -20300,7 +20349,35 @@ fn parse_join_statement(
         aggregate,
         limit,
         offset,
+        cte_inputs: None,
     })
+}
+
+/// JOIN の 1 リレーションが実表であることを確かめる（存在確認は `42P01`、ビューは `42601`）。
+/// トップレベルの JOIN と、`WITH` 主クエリで CTE 名に一致しなかったリレーション（Issue #1861）が
+/// 共有する。
+fn check_join_relation_is_table(
+    relation: &TableRef,
+    lookup: &impl TableLookup,
+) -> Result<(), SqlSurfaceError> {
+    match crate::sql::view::resolve_from(lookup, relation.table())? {
+        crate::sql::view::Resolved::Table => Ok(()),
+        crate::sql::view::Resolved::View { .. } | crate::sql::view::Resolved::Buffered { .. } => {
+            Err(SqlSurfaceError::unsupported(
+                "JOIN does not support view references",
+            ))
+        }
+    }
+}
+
+fn check_join_relations_are_tables(
+    validated: &ValidatedJoin,
+    lookup: &impl TableLookup,
+) -> Result<(), SqlSurfaceError> {
+    validated
+        .relations
+        .iter()
+        .try_for_each(|r| check_join_relation_is_table(r, lookup))
 }
 /// 集合演算文かどうかをバックトラックせず先読みだけで判定する（Issue #929・
 /// SQL-29 (c)）。`validate_sql_tokens` の `is_aggregate_select`／
@@ -22515,6 +22592,274 @@ fn projection_has_duplicate_names(projection: &Projection) -> bool {
     names.iter().any(|n| !seen.insert(n.to_ascii_lowercase()))
 }
 
+/// `WITH` 句＋JOIN 主クエリ（Issue #1861・SQL-62 (1)(3)(5)(6)）の検証。FROM の各リレーションを
+/// **カタログより先に**大文字小文字を区別せず CTE 名と照合し（CTE は同名の表・ビューを隠す）、
+/// 一致したものは [`JoinCteInputs`] の slot として評価計画に載せ、一致しないものは従来どおり
+/// 実表であることを確かめる（ビューは拒否）。データ変更 CTE を含む文は、検証をすべて通した後に
+/// 固定の `0A000`（SQL-63 の既存契約。書き込みを発生させない）で止める。主クエリが CTE を 1 つも
+/// 参照しない場合は通常の JOIN として返す（結果は同じ）。
+fn validate_with_join_main(
+    main_tokens: &[Token],
+    ctes: &[super::cte::CteDef],
+    lookup: &impl TableLookup,
+    limits: crate::nesting_limits::NestingLimits,
+) -> Result<Statement, SqlSurfaceError> {
+    let mut join = parse_join_syntax(main_tokens)?;
+    validate_cte_definitions(ctes, lookup, limits)?;
+    let rel_cte: Vec<Option<usize>> = join
+        .relations
+        .iter()
+        .map(|r| {
+            ctes.iter()
+                .position(|d| d.name.eq_ignore_ascii_case(r.table()))
+        })
+        .collect();
+    for (rel, cte) in join.relations.iter().zip(rel_cte.iter()) {
+        if cte.is_none() {
+            check_join_relation_is_table(rel, lookup)?;
+        }
+    }
+    if ctes.iter().any(|d| d.is_data_modifying()) {
+        return Err(super::cte::data_modifying_cte_unsupported());
+    }
+    if rel_cte.iter().all(Option::is_none) {
+        return Ok(Statement::Join(join));
+    }
+    join.cte_inputs = Some(Box::new(build_join_cte_inputs(
+        ctes, &rel_cte, lookup, limits,
+    )?));
+    Ok(Statement::Join(join))
+}
+
+/// CTE `idx` が別の CTE（それより前に定義されたもの）を読む本文のとき、その親の添字と、評価済みの
+/// 親の行へ重ねる層（射影・`WHERE`）を返す。層が評価後射影形の外側として受理できない形
+/// （UDF 述語・サブクエリ等）なら `None`。本文が CTE でなく実表・ビューを読む場合の `None` は広域取得へ
+/// 合成してよいが、先行 CTE を読む本文の `None` は呼び出し側（`build_join_cte_inputs`）が `0A000` で拒否する
+/// （親のインライン再評価で共有・上限の契約を迂回させない）。
+fn derived_cte_layer(ctes: &[super::cte::CteDef], idx: usize) -> Option<(usize, BufferedRows)> {
+    let body = ctes.get(idx)?.select_body()?;
+    let parent = ctes
+        .get(..idx)?
+        .iter()
+        .rposition(|d| d.name.eq_ignore_ascii_case(&body.table_name))?;
+    ctes.get(parent)?.select_body()?;
+    body.where_predicates
+        .iter()
+        .try_for_each(check_buffered_outer_pred)
+        .ok()?;
+    Some((
+        parent,
+        BufferedRows {
+            projection: body.projection.clone(),
+            where_predicates: body.where_predicates.clone(),
+            order_by: Vec::new(),
+            order_keys: Vec::new(),
+            window_items: Vec::new(),
+            limit: u32::MAX,
+            limit_explicit: false,
+            limit_implicit: false,
+            offset: 0,
+        },
+    ))
+}
+
+/// JOIN の主クエリから到達できる CTE の評価計画を組み立てる（Issue #1861）。参照数は、主クエリの
+/// FROM からの直接参照と、到達できる CTE 本文の FROM からの参照（`Derived`）の合計。参照されない
+/// CTE は slot にしない（事前検証だけ済んでいる）。評価方式は SQL-62 (3): `MATERIALIZED` は共有、
+/// 指定なしは参照数 2 以上で共有、`NOT MATERIALIZED` は共有しない（結果は方式で変わらない）。
+fn build_join_cte_inputs(
+    ctes: &[super::cte::CteDef],
+    rel_cte: &[Option<usize>],
+    lookup: &impl TableLookup,
+    limits: crate::nesting_limits::NestingLimits,
+) -> Result<JoinCteInputs, SqlSurfaceError> {
+    let count = ctes.len();
+    let mut refs = vec![0usize; count];
+    let mut reached = vec![false; count];
+    let mut derived: Vec<Option<(usize, BufferedRows)>> = vec![None; count];
+    let mut stack: Vec<usize> = Vec::new();
+    for &c in rel_cte.iter().flatten() {
+        if let Some(r) = refs.get_mut(c) {
+            *r = r.saturating_add(1);
+        }
+        stack.push(c);
+    }
+    while let Some(i) = stack.pop() {
+        match reached.get_mut(i) {
+            Some(flag) if !*flag => *flag = true,
+            _ => continue,
+        }
+        if let Some((parent, layer)) = derived_cte_layer(ctes, i) {
+            if let Some(r) = refs.get_mut(parent) {
+                *r = r.saturating_add(1);
+            }
+            if let Some(slot) = derived.get_mut(i) {
+                *slot = Some((parent, layer));
+            }
+            stack.push(parent);
+        }
+    }
+
+    let mut slot_of: Vec<Option<usize>> = vec![None; count];
+    let mut slots: Vec<CteSlot> = Vec::new();
+    for (idx, def) in ctes.iter().enumerate() {
+        if !reached.get(idx).copied().unwrap_or(false) {
+            continue;
+        }
+        let ref_count = refs.get(idx).copied().unwrap_or(0);
+        let shared = match def.materialization {
+            super::cte::CteMaterialization::Materialized => true,
+            super::cte::CteMaterialization::NotMaterialized => false,
+            super::cte::CteMaterialization::Default => ref_count >= 2,
+        };
+        let source = match derived.get_mut(idx).and_then(Option::take) {
+            Some((parent, layer)) => {
+                let from = slot_of.get(parent).copied().flatten().ok_or_else(|| {
+                    SqlSurfaceError::Internal {
+                        detail: "CTE parent slot missing".to_string(),
+                    }
+                })?;
+                CteSlotSource::Derived {
+                    from,
+                    layer: Box::new(layer),
+                }
+            }
+            None => {
+                let select_body = def
+                    .select_body()
+                    .ok_or_else(super::cte::data_modifying_cte_unsupported)?;
+                // 本文が先行する CTE を読むのに層として導出できない形（`derived_cte_layer` が `None`）は、
+                // 親をインライン合成すると親の本文が slot とは別に基底表から再評価され、`MATERIALIZED`
+                // の文内 1 回評価・親の可視行上限の契約を迂回する。共有しうる親は必ず slot を経由させるため、
+                // 導出できないときはインラインへ退避せず固定文言の `0A000` で拒否する（fail-closed）。
+                if ctes.get(..idx).is_some_and(|earlier| {
+                    earlier
+                        .iter()
+                        .any(|d| d.name.eq_ignore_ascii_case(&select_body.table_name))
+                }) {
+                    return Err(SqlSurfaceError::feature_not_supported(
+                        "a CTE reading another CTE through an unsupported predicate cannot be a JOIN input",
+                    ));
+                }
+                let mut budget = super::cte::ResolveBudget::new();
+                let inner = super::cte::resolve_relation(
+                    lookup,
+                    ctes,
+                    idx,
+                    &select_body.table_name,
+                    0,
+                    limits.max_cte_nesting_depth(),
+                    &mut budget,
+                )?;
+                let scan = build_scan_from_resolved(
+                    select_body.table_name.clone(),
+                    inner,
+                    select_body.projection.clone(),
+                    select_body.where_predicates.clone(),
+                    None,
+                    Vec::new(),
+                    0,
+                    Vec::new(),
+                    Vec::new(),
+                    Vec::new(),
+                )?;
+                // 評価済みの行は列型だけで結合・比較され、照合（ICU 等）は運ばれない。非バイト列順の
+                // 照合を持つ表を読む CTE は、インラインへ退避できない JOIN の入力では fail-closed に
+                // 拒否する（照合が黙って落ちる意味論の fail-open を作らない。TABLE-28）。
+                if lookup.table_has_non_byte_collation(scan.table_name())? {
+                    return Err(SqlSurfaceError::feature_not_supported(
+                        "a CTE reading a collated column cannot be a JOIN input",
+                    ));
+                }
+                CteSlotSource::Scan(Box::new(scan))
+            }
+        };
+        if let Some(s) = slot_of.get_mut(idx) {
+            *s = Some(slots.len());
+        }
+        slots.push(CteSlot {
+            name: def.name.clone(),
+            column_aliases: def.column_aliases.clone(),
+            shared,
+            source,
+        });
+    }
+    let relation_slot = rel_cte
+        .iter()
+        .map(|c| c.and_then(|i| slot_of.get(i).copied().flatten()))
+        .collect();
+    Ok(JoinCteInputs {
+        slots,
+        relation_slot,
+    })
+}
+
+/// `WITH` 句の全 CTE 定義の事前検証（参照されない定義も含む。決定性・fail-closed のため）。
+/// 戻り値はデータ変更 CTE ごとの `RETURNING` 公開列（SELECT 本文・`RETURNING` なしは `None`）。
+/// 主クエリの形（単一表・JOIN）によらず共有する（Issue #1861 で `WITH` 分岐から切り出した）。
+fn validate_cte_definitions(
+    ctes: &[super::cte::CteDef],
+    lookup: &impl TableLookup,
+    limits: crate::nesting_limits::NestingLimits,
+) -> Result<Vec<Option<Vec<String>>>, SqlSurfaceError> {
+    // SQL-63・Issue #1875: データ変更 CTE は定義順にここで検証し、`RETURNING` の公開列を
+    // 集める（`dm_exposed[i]`。`RETURNING` なしは `None`）。成功しても最後に固定 0A000 で止める。
+    let mut dm_exposed: Vec<Option<Vec<String>>> = Vec::new();
+    for (idx, def) in ctes.iter().enumerate() {
+        let Some(select_body) = def.select_body() else {
+            dm_exposed.push(super::cte::validate_data_modifying_cte(
+                lookup, ctes, idx, def,
+            )?);
+            continue;
+        };
+        dm_exposed.push(None);
+        let mut budget = super::cte::ResolveBudget::new();
+        let resolved = super::cte::resolve_relation(
+            lookup,
+            ctes,
+            idx,
+            &select_body.table_name,
+            0,
+            limits.max_cte_nesting_depth(),
+            &mut budget,
+        )?;
+        let (base_table, view_columns): (&str, Option<Vec<String>>) = match &resolved {
+            super::view::Resolved::Table => (select_body.table_name.as_str(), None),
+            super::view::Resolved::View {
+                base_table,
+                view_columns,
+                ..
+            } => (base_table.as_str(), view_columns.clone()),
+            // Issue #1192: 評価後射影形ビューは CTE の本文として参照できない。
+            super::view::Resolved::Buffered { .. } => {
+                return Err(SqlSurfaceError::unsupported(
+                    "a view with an aggregate/LIMIT body cannot be used in a CTE",
+                ));
+            }
+        };
+        let exposed = match view_columns {
+            Some(cols) => Some(cols),
+            None => lookup.table_columns(base_table)?,
+        };
+        // `ParsedViewBody`（CTE 本文）は構文上 `ORDER BY` を持たない
+        // （`sql::allowlist::parse_view_body` のドキュメント参照）ため、
+        // 空スライスを渡す（主クエリ自身の ORDER BY 検査は
+        // `build_scan_from_resolved` 呼び出し側が別途行う）。
+        super::view::check_columns_within_view(
+            exposed.as_deref(),
+            &select_body.projection,
+            &select_body.where_predicates,
+            &[],
+        )?;
+        // 列名リスト（SQL-62 (2)・Issue #1857）の長さ・重複も、参照の有無に関係なく
+        // ここで検査する（参照されない CTE の長すぎるリストを通さない）。結果は捨てる。
+        if !def.column_aliases.is_empty() {
+            super::cte::compose(lookup, resolved, def)?;
+        }
+    }
+    Ok(dm_exposed)
+}
+
 /// データ変更 CTE を含む `WITH` を、読み取りの入口（固定 `0A000`）として扱うか、最上位の実行入口
 /// として実行計画まで組み立てるか（SQL-63・Issue #1876）。
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -22689,6 +23034,15 @@ fn validate_with_statement(
     } else {
         (p.remaining(), None)
     };
+    // Issue #1861（SQL-62）: セッションの最上位 SELECT の入口に限り、JOIN の主クエリで CTE を入力として
+    // 参照できる。InlineOnly（ビュー本文・cursor・COPY・CTAS・サブクエリ内側）は従来どおり下の単一表の
+    // 主クエリ解析へ流す（JOIN は `42601` のまま。fail-closed）。データ変更 CTE を含む JOIN 主クエリは、
+    // 検証後に固定 `0A000` で止める（`validate_with_join_main`。書き込みを発生させない）。
+    if cte_evaluation == CteEvaluation::AllowMaterialize && looks_like_join(main_src) {
+        return Ok(WithOutcome::Read(validate_with_join_main(
+            main_src, &ctes, lookup, limits,
+        )?));
+    }
     // Issue #1535: 主クエリも通常 SELECT と同じ修飾列正規化を通す（CTE 定義本体は対象外）。
     let main_normalized = super::qualified_column::normalize_single_table_qualifiers(main_src)?;
     let main_tokens: &[Token] = &main_normalized;
@@ -22791,61 +23145,7 @@ fn validate_with_statement(
     // `TableLookup::table_columns` の既定実装は `Ok(None)`（検査省略・
     // 後方互換）を返すため、これに対応しない `TableLookup` 実装
     // （テスト用モック等）は無変更のまま今まで通り動作する。
-    // SQL-63・Issue #1875: データ変更 CTE は定義順にここで検証し、`RETURNING` の公開列を
-    // 集める（`dm_exposed[i]`。`RETURNING` なしは `None`）。成功しても最後に固定 0A000 で止める。
-    let mut dm_exposed: Vec<Option<Vec<String>>> = Vec::new();
-    for (idx, def) in ctes.iter().enumerate() {
-        let Some(select_body) = def.select_body() else {
-            dm_exposed.push(super::cte::validate_data_modifying_cte(
-                lookup, &ctes, idx, def,
-            )?);
-            continue;
-        };
-        dm_exposed.push(None);
-        let mut budget = super::cte::ResolveBudget::new();
-        let resolved = super::cte::resolve_relation(
-            lookup,
-            &ctes,
-            idx,
-            &select_body.table_name,
-            0,
-            limits.max_cte_nesting_depth(),
-            &mut budget,
-        )?;
-        let (base_table, view_columns): (&str, Option<Vec<String>>) = match &resolved {
-            super::view::Resolved::Table => (select_body.table_name.as_str(), None),
-            super::view::Resolved::View {
-                base_table,
-                view_columns,
-                ..
-            } => (base_table.as_str(), view_columns.clone()),
-            // Issue #1192: 評価後射影形ビューは CTE の本文として参照できない。
-            super::view::Resolved::Buffered { .. } => {
-                return Err(SqlSurfaceError::unsupported(
-                    "a view with an aggregate/LIMIT body cannot be used in a CTE",
-                ));
-            }
-        };
-        let exposed = match view_columns {
-            Some(cols) => Some(cols),
-            None => lookup.table_columns(base_table)?,
-        };
-        // `ParsedViewBody`（CTE 本文）は構文上 `ORDER BY` を持たない
-        // （`sql::allowlist::parse_view_body` のドキュメント参照）ため、
-        // 空スライスを渡す（主クエリ自身の ORDER BY 検査は
-        // `build_scan_from_resolved` 呼び出し側が別途行う）。
-        super::view::check_columns_within_view(
-            exposed.as_deref(),
-            &select_body.projection,
-            &select_body.where_predicates,
-            &[],
-        )?;
-        // 列名リスト（SQL-62 (2)・Issue #1857）の長さ・重複も、参照の有無に関係なく
-        // ここで検査する（参照されない CTE の長すぎるリストを通さない）。結果は捨てる。
-        if !def.column_aliases.is_empty() {
-            super::cte::compose(lookup, resolved, def)?;
-        }
-    }
+    let dm_exposed = validate_cte_definitions(&ctes, lookup, limits)?;
     // 主クエリがデータ変更 CTE を参照する場合は、`RETURNING` の公開列だけを持つ仮のビュー解決結果で
     // 既存の列スコープ検査を通す（結果は捨てる）。`RETURNING` なしの参照は 0A000。
     let main_dm = ctes

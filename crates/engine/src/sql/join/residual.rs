@@ -100,8 +100,20 @@ fn eval_single(
             .ok_or_else(|| SqlSurfaceError::Internal {
                 detail: "JOIN residual column position out of range".to_string(),
             })?;
+        // CTE が公開した行 `id`（`Cell::Integer(u64)`）は numeric の列として評価する（`i64` を経由せず、
+        // `i64::MAX` 超でも損失しない）。
+        let scalar = match (cell, ty) {
+            (crate::sql::exec::Cell::Integer(u), crate::catalog::ColumnType::Numeric { .. }) => {
+                Some(crate::row_codec::ScalarRef::Numeric(
+                    crate::numeric::Decimal::from_parts(i128::from(*u), 0).map_err(|_| {
+                        SqlSurfaceError::numeric_out_of_range("integer value out of range")
+                    })?,
+                ))
+            }
+            _ => cell_scalar(cell, ty)?,
+        };
         if let Some(slot) = scanned.get_mut(*schema_idx) {
-            *slot = cell_scalar(cell, ty)?;
+            *slot = scalar;
         }
     }
     f.group.matches(&scanned, row.id, &[], 0, scratch)
