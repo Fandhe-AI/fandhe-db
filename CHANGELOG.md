@@ -14,6 +14,7 @@
   文の実行（反復評価は #1870）は `0A000` で拒否する。従来 `42601` だった挙動変更。詳細は [recursive-cte.md](docs/design/recursive-cte.md)。
   BREAKING CHANGE: 公開 enum `ErrorClass` と `SqlSurfaceError` に variant（`InvalidRecursion`）を追加したため、
   網羅的な `match` は更新が要る。
+  サブクエリ内部も構文検証してから構造判定へ進み（構文 `42601` → `42P19` → `0A000`）、引用符付きの `"join"` 列・別名を結合演算子と取り違えない。
 - 非集計形の相関スカラーサブクエリ（`(SELECT y FROM b WHERE b.k = a.k)`。`y` は単一の裸の列）を、WHERE 位置と投影位置で
   外側の行ごとの再評価により実行する（Issue #1847・SQL-61）。一致 0 件は NULL（WHERE では偽）、1 件はその値、
   2 件以上は `21000`。内側を 1 回だけ実体化し、テナント境界は外側と同じ `PolicyContext` に従う。

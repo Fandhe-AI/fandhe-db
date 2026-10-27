@@ -140,7 +140,10 @@ fn relation_refs(tokens: &[Token], name: &str) -> Vec<RelRef> {
                             });
                         }
                         f.expect_rel = false;
-                    } else if w.eq_ignore_ascii_case("JOIN") {
+                    } else if w.eq_ignore_ascii_case("JOIN")
+                        && f.in_from
+                        && is_join_operator_position(tokens, i)
+                    {
                         f.in_from = true;
                         f.expect_rel = true;
                     } else if [
@@ -168,6 +171,30 @@ fn relation_refs(tokens: &[Token], name: &str) -> Vec<RelRef> {
         }
     }
     out
+}
+
+/// 式・別名を導入する語。直後の `JOIN` は結合演算子ではなく列名・別名として読む。
+const JOIN_NOT_AFTER: &[&str] = &[
+    "AS", "ON", "AND", "OR", "NOT", "IN", "IS", "LIKE", "ILIKE", "BETWEEN", "USING", "DISTINCT",
+    "NULL", "TRUE", "FALSE", "CASE", "WHEN", "THEN", "ELSE", "BY",
+];
+
+/// `tokens[i]`（識別子 `JOIN`）が結合演算子の位置にあるかを判定する。lexer は引用符付き識別子も
+/// 未引用語も同じ `Token::Ident` にするため、文脈で区別する。結合の `JOIN` は、直前が
+/// 表参照・別名・結合種別語（識別子）または `)` で終わり、直後に関係名（識別子・`(`）が続く。
+/// `AS "join"` の別名、`= "join"` や `ON join` の列参照は演算子とみなさない
+/// （自己参照の誤検出・取りこぼしを防ぐ。`relation_refs` の構造判定用）。
+fn is_join_operator_position(tokens: &[Token], i: usize) -> bool {
+    let prev_ok = match i.checked_sub(1).and_then(|p| tokens.get(p)) {
+        Some(Token::Ident(p)) => !JOIN_NOT_AFTER.iter().any(|k| p.eq_ignore_ascii_case(k)),
+        Some(Token::Punct(')')) => true,
+        _ => false,
+    };
+    let next_ok = matches!(
+        tokens.get(i.saturating_add(1)),
+        Some(Token::Ident(_) | Token::Punct('('))
+    );
+    prev_ok && next_ok
 }
 
 /// `tokens[i]`（識別子 `w`）が列名・表名ではなく演算子・句として使われているかを文脈で判定する。
@@ -286,8 +313,51 @@ fn peel_term(
     Ok((tokens, wrapped, trailing, inner_clause))
 }
 
+/// カタログ非依存の構文検証。構造判定（`42P19`）へ進む前に各項で必ず通す。既存パーサーは
+/// `IN`／`EXISTS`／スカラー比較などのサブクエリ内部をトークン列のまま保存して検証を後段へ委ねるため、
+/// 保存された内部も [`validate_nested_subqueries`] で再帰的に構文検証する
+/// （構文 `42601` → 構造 `42P19` → 機能ゲート `0A000` の順序契約）。
 fn structural(tokens: &[Token], limits: NestingLimits) -> Result<Statement, SqlSurfaceError> {
-    validate_sql_tokens_with_subquery_ctx_limits(tokens, &StructuralOnlyLookup, 0, limits)
+    let stmt =
+        validate_sql_tokens_with_subquery_ctx_limits(tokens, &StructuralOnlyLookup, 0, limits)?;
+    validate_nested_subqueries(tokens, 0, limits)?;
+    Ok(stmt)
+}
+
+/// `tokens`（深さ `depth` の文）の中にある `( SELECT ...)` の括弧群を、それぞれ深さ `depth + 1` の
+/// 文としてカタログ非依存で構文検証し、その内側へ再帰する。深さ上限は `limits` を引き継ぎ、
+/// 超過は `54000`。括弧が閉じない場合は呼び出し元の検証が先に `42601` で拒否済みのため打ち切る。
+fn validate_nested_subqueries(
+    tokens: &[Token],
+    depth: usize,
+    limits: NestingLimits,
+) -> Result<(), SqlSurfaceError> {
+    let mut i = 0usize;
+    while let Some(t) = tokens.get(i) {
+        let is_subquery_open = matches!(t, Token::Punct('('))
+            && matches!(
+                tokens.get(i.saturating_add(1)),
+                Some(Token::Keyword(Keyword::Select))
+            );
+        if !is_subquery_open {
+            i = i.saturating_add(1);
+            continue;
+        }
+        let Some(rest) = tokens.get(i..) else { break };
+        let Ok((inner, after)) = split_parenthesized(rest) else {
+            break;
+        };
+        let inner_depth = depth.saturating_add(1);
+        validate_sql_tokens_with_subquery_ctx_limits(
+            inner,
+            &StructuralOnlyLookup,
+            inner_depth,
+            limits,
+        )?;
+        validate_nested_subqueries(inner, inner_depth, limits)?;
+        i = tokens.len().saturating_sub(after.len());
+    }
+    Ok(())
 }
 
 /// `WITH RECURSIVE` 文の構文を受理し再帰構造を検証する（SQL-35、Issue #1869）。
@@ -589,6 +659,66 @@ mod tests {
         ] {
             assert_eq!(code(sql), "42P19", "{sql}");
         }
+    }
+
+    #[test]
+    fn subquery_inner_syntax_is_checked_before_recursion_structure() {
+        for sql in [
+            "WITH RECURSIVE t(n) AS (SELECT 1 UNION ALL SELECT n FROM docs WHERE n IN (SELECT FROM t)) SELECT n FROM t",
+            "WITH RECURSIVE t(n) AS (SELECT 1 UNION ALL SELECT n FROM docs WHERE n IN (SELECT n FROM docs WHERE n IN (SELECT FROM docs))) SELECT n FROM t",
+            "WITH RECURSIVE t(n) AS (SELECT 1 UNION ALL SELECT n FROM t) SELECT n FROM docs WHERE n IN (SELECT FROM docs)",
+            "WITH RECURSIVE t(n) AS (SELECT n FROM docs WHERE n IN (SELECT FROM docs) UNION ALL SELECT n FROM t) SELECT n FROM t",
+        ] {
+            assert_eq!(code(sql), "42601", "{sql}");
+        }
+        // 構文が正しいサブクエリ内の自己参照は従来どおり 42P19。
+        assert_eq!(
+            code("WITH RECURSIVE t(n) AS (SELECT 1 UNION ALL SELECT n FROM docs WHERE n IN (SELECT n FROM t)) SELECT n FROM t"),
+            "42P19"
+        );
+    }
+
+    #[test]
+    fn subquery_nesting_limit_is_inherited() {
+        let mut sql = String::from("SELECT n FROM docs");
+        for _ in 0..40 {
+            sql = format!("SELECT n FROM docs WHERE n IN ({sql})");
+        }
+        let sql = format!(
+            "WITH RECURSIVE t(n) AS (SELECT 1 UNION ALL SELECT n FROM t) SELECT n FROM docs WHERE n IN ({sql})"
+        );
+        assert_eq!(code(&sql), "54000");
+    }
+
+    #[test]
+    fn join_named_column_is_not_a_join_operator() {
+        // 引用符付きの列 "join" が後続の識別子 `t` を関係位置へ押し上げて自己参照を捏造しない。
+        assert_eq!(
+            code("WITH RECURSIVE t(n) AS (SELECT \"join\", t FROM docs UNION ALL SELECT n, 1 FROM t) SELECT n FROM t"),
+            NOT_YET
+        );
+    }
+
+    #[test]
+    fn join_named_alias_does_not_hide_real_join() {
+        let count = |sql: &str| {
+            let tokens = crate::sql::lexer::tokenize(sql).expect("tokenize");
+            relation_refs(&tokens, "t").len()
+        };
+        // 式中の "join" が後続の本物の JOIN を関係位置として消費して t を取りこぼさない。
+        assert_eq!(
+            count("SELECT d.n FROM docs d JOIN u ON d.n = \"join\" JOIN t ON t.n = d.n"),
+            1
+        );
+        assert_eq!(
+            count("SELECT d.n FROM docs AS \"join\" JOIN t ON t.n = 1"),
+            1
+        );
+        // 通常の結合は従来どおり数える。
+        assert_eq!(
+            count("SELECT d.n FROM docs d INNER JOIN t ON t.n = d.n LEFT JOIN u ON u.n = 1"),
+            1
+        );
     }
 
     #[test]
