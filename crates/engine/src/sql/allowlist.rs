@@ -14900,7 +14900,7 @@ impl<'a> Parser<'a> {
         Ok((names, if_exists, behavior))
     }
 
-    /// `WITH <name> [(<列名>, ...)] AS (<body>)[, ...]*`（非再帰 CTE。SQL-29 (b)・
+    /// `WITH <name> [(<列名>, ...)] AS [[NOT] MATERIALIZED] (<body>)[, ...]*`（非再帰 CTE。SQL-29 (b)・
     /// RLS-10 (b)、TASK-213、Issue #928）を切り出し、各定義を
     /// [`super::cte::CteDef`] へ積む。`<body>` は [`parse_view_body`]（`CREATE
     /// VIEW` 本文と同一の許可パーサー）で検証する——本関数は第 2 の SELECT
@@ -14908,9 +14908,11 @@ impl<'a> Parser<'a> {
     /// 分岐）が、返した `Vec<CteDef>` と本関数消費後の残りトークン列
     /// （主クエリ）を [`super::cte::resolve_relation`] へ渡す。
     ///
+    /// `AS` の直後には `[NOT] MATERIALIZED` を置ける（構文のみ受理して読み捨てる。
+    /// Issue #1858）。`NOT` の後に `MATERIALIZED` が無い形は `42601`。
+    ///
     /// 受理しない形（いずれも `42601`。SQL-29 (b) の対象外規定）:
-    /// `WITH RECURSIVE`・`MATERIALIZED`／
-    /// `NOT MATERIALIZED` 指定・本文内の `;`（`split_parenthesized` で切り出した
+    /// `WITH RECURSIVE`・本文内の `;`（`split_parenthesized` で切り出した
     /// 括弧内トークン列に対して明示的に検査する。`parse_view_body` の
     /// `expect_end_of_statement` は末尾の単一 `;` を許容してしまうため、
     /// ここで先に弾かないと `WITH x AS (SELECT * FROM t;) ...` のような入力を
@@ -14931,10 +14933,14 @@ impl<'a> Parser<'a> {
             // 空リスト `42601`）を共有する（SQL-62 (2)・Issue #1857）。
             let column_aliases = self.parse_optional_view_column_aliases()?;
             self.expect_ident_matching("AS")?;
-            if self.peek_ident_matches("MATERIALIZED") || self.peek_ident_matches("NOT") {
-                return Err(SqlSurfaceError::unsupported(
-                    "CTE MATERIALIZED hint is not supported",
-                ));
+            // `[NOT] MATERIALIZED` は評価方式の指定として構文だけ受理し読み捨てる（SQL-62 (3)・
+            // Issue #1858）。現行の CTE は常にインライン展開されるため結果に影響しない。
+            // `NOT` の後に `MATERIALIZED` が無い形は 42601（fail-closed）。
+            if self.peek_ident_matches("NOT") {
+                self.advance();
+                self.expect_ident_matching("MATERIALIZED")?;
+            } else if self.peek_ident_matches("MATERIALIZED") {
+                self.advance();
             }
             if !matches!(self.peek(), Some(Token::Punct('('))) {
                 return Err(SqlSurfaceError::unsupported(
@@ -34970,13 +34976,40 @@ mod tests {
     }
 
     #[test]
-    fn rejects_cte_materialized_hint() {
+    fn accepts_cte_materialized_hint() {
         let lookup = catalog_with(&["documents"]);
+        let plain = validate_sql(
+            "WITH x AS (SELECT id FROM documents) SELECT * FROM x LIMIT 10",
+            &lookup,
+        )
+        .expect("plain CTE");
         for sql in [
             "WITH x AS MATERIALIZED (SELECT id FROM documents) SELECT * FROM x LIMIT 10",
             "WITH x AS NOT MATERIALIZED (SELECT id FROM documents) SELECT * FROM x LIMIT 10",
         ] {
-            let err = validate_sql(sql, &lookup).expect_err("MATERIALIZED hint must be rejected");
+            let stmt = validate_sql(sql, &lookup).expect(sql);
+            assert_eq!(format!("{stmt:?}"), format!("{plain:?}"), "sql={sql}");
+        }
+        for sql in [
+            "WITH x (a) AS MATERIALIZED (SELECT id FROM documents) SELECT a FROM x LIMIT 10",
+            "WITH x AS MATERIALIZED (SELECT id FROM documents), y AS (SELECT id FROM documents) SELECT * FROM x LIMIT 10",
+        ] {
+            validate_sql(sql, &lookup).expect(sql);
+        }
+    }
+
+    #[test]
+    fn rejects_malformed_cte_materialized_hint() {
+        let lookup = catalog_with(&["documents"]);
+        for sql in [
+            "WITH x AS NOT (SELECT id FROM documents) SELECT * FROM x LIMIT 10",
+            "WITH x AS NOT NOT MATERIALIZED (SELECT id FROM documents) SELECT * FROM x LIMIT 10",
+            "WITH x AS MATERIALIZED MATERIALIZED (SELECT id FROM documents) SELECT * FROM x LIMIT 10",
+            "WITH x AS MATERIALIZED SELECT id FROM documents",
+            "WITH x MATERIALIZED AS (SELECT id FROM documents) SELECT * FROM x LIMIT 10",
+            "WITH x AS (SELECT id FROM documents) MATERIALIZED SELECT * FROM x LIMIT 10",
+        ] {
+            let err = validate_sql(sql, &lookup).expect_err(sql);
             assert_eq!(err.wire_code(), "42601", "sql={sql}");
         }
     }

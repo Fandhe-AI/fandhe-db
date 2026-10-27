@@ -9,6 +9,8 @@
 
 ### Added
 
+- CTE の `MATERIALIZED`／`NOT MATERIALIZED` を受理する（Issue #1858・SQL-62 (3)）。評価方式の指定として読み捨て、結果は変わらない。
+  従来 `42601` で拒否していた構文が受理される挙動変更。詳細は [cte.md](docs/design/cte.md)。
 - CTE の列名リスト `WITH x(a, b) AS (...)` を受理する（Issue #1857・SQL-62 (2)）。出力列へ先頭から順に名前を付け、短いリストは残りを元の名前のまま受理する。
   出力列より長いリストだけ `42P10`（参照されない CTE も同様）。別名付きビューの CTE 内参照も受理する。詳細は [cte.md](docs/design/cte.md)。
   BREAKING CHANGE: 公開 enum `SqlSurfaceError` に variant（`CteColumnListTooLong`）を追加したため、網羅的な `match` は更新が要る。

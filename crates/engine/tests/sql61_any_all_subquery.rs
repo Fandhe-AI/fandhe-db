@@ -422,6 +422,13 @@ fn quantified_compare_rejections_are_fail_closed() {
     for (sql, code) in cases {
         assert_eq!(err_code(&core, &ctx, &sql), code, "sql={sql}");
     }
+    // 内側の `LIMIT` 省略は Issue #1853 以降は受理される（結果行数上限だけで有界）。
+    assert!(core
+        .execute_sql(
+            &ctx,
+            &format!("SELECT id FROM {ITEMS} WHERE qty > ANY (SELECT qty FROM {REFS}) LIMIT 100")
+        )
+        .is_ok());
     // 同じ形でも `= ANY`／`<> ALL`（IN へ委譲）は BOOLEAN で受理される。
     assert!(core
         .execute_sql(

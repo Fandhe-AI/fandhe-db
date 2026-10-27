@@ -38,8 +38,7 @@ WITH <name> [(<列名>, ...)] AS (SELECT <* | 列名リスト> FROM <table | vie
   指すため列検査の対象外。順位付き（`ORDER BY <ベクトル>`／`USING PLAN`）は明示的な
   メッセージで `42601` に拒否し、`WITH` 句を剥がして後段へ流すことは絶対にしない
   （同名の実テーブルを黙って読む危険があるため）。
-- `WITH RECURSIVE`・`AS MATERIALIZED`／
-  `AS NOT MATERIALIZED`・CTE 名の重複・データ変更 CTE（`WITH x AS (DELETE
+- `WITH RECURSIVE`・CTE 名の重複・データ変更 CTE（`WITH x AS (DELETE
   ...)` 等。body が `SELECT` 以外は受理しない）はいずれも `42601`。
 - 定義数上限（`MAX_CTE_DEFINITIONS = 16`）・連鎖の深さ上限
   （`MAX_CTE_NESTING_DEPTH = 4`）はハード上限（＝既定値）で、起動フラグ
@@ -116,7 +115,7 @@ CTE は実体化しない（インライン展開のみ）。主クエリ（`Par
   主クエリの述語の前へ挿入される（`build_scan_from_resolved`）ため、束縛時に
   `$n` の対応先が組み立て後の述語列とトークン列上の位置とでずれる恐れがある。
   この対応ずれを解消してから別 Issue で扱う。
-- `WITH RECURSIVE`（SQL-29 で対象外）、`MATERIALIZED` 指定。
+- `WITH RECURSIVE`（SQL-29 で対象外）。
 - NoSQL（HTTP）表層での CTE（SQL-28〜30 は非対応のまま）。
 
 ## Issue #1857 追記: 列名リスト（SQL-62 (2) ポインタ）
@@ -141,3 +140,13 @@ CTE は実体化しない（インライン展開のみ）。主クエリ（`Par
   ビューの列別名と同じく `0A000`（fail-closed）。投影だけなら受理される。
 - 元の名前での参照は本実装では既存の列スコープ検査の結果（`42703` 相当）に従う。
 - RLS-10 (b) の不変条件は不変。`CteDef` は列名の写像だけを追加で持ち、テナント情報を持たない。
+
+## Issue #1858 追記: `MATERIALIZED`／`NOT MATERIALIZED`（SQL-62 (3) ポインタ）
+
+- `WITH x AS [[NOT] MATERIALIZED] (<body>)` を構文として受理し、`parse_with_clause` が読み捨てる。
+  `CteDef` は変更せず、実行経路にも渡さない。現行の CTE は常にインライン展開されるため、
+  指定の有無で結果は変わらない（ビュー本文内の CTE にも同じく適用される）。
+- `NOT` の後に `MATERIALIZED` が無い形・重複指定・括弧なし・`AS` より前や本文の後ろへの指定は `42601`。
+- 既知の差分: 引用識別子 `"MATERIALIZED"` も識別子トークンとして受理される（PostgreSQL は構文エラー）。
+  既存の文脈キーワードと同じ扱いで、受理側に緩いだけで安全性に影響しない。
+- 実際に一度だけ評価する実体化は対象外（別項目）。
