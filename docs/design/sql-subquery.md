@@ -815,3 +815,29 @@ PostgreSQL との差分: `ORDER BY` を伴わない `LIMIT`／`OFFSET` の選択
 
 非相関スカラーの式への埋め込み（SQL-29 の契約の改訂を伴う）、項目全体形の葉への統合（`ORDER BY` の別名・序数が解決できるようになる）、
 `HAVING`・外側が集計・`GROUP BY` キーでの相関スカラー、NUMERIC の結果の算術・`COALESCE`、`(SELECT ...) IS [NOT] NULL`。
+
+## Issue #1851 追記: 相関・派生テーブルの RLS 境界マトリクス（RLS-10 (b)・SQL-61・SQL-62 ポインタ）
+
+`crates/engine/tests/rls10_relational_paths.rs`（Issue #931）の関係演算マトリクスを、相関サブクエリと FROM 句の派生テーブルへ広げた。
+production コードは変えない（テストのみ）。
+
+### 追加した検査軸
+
+- 形（T0・T1・T2・T5）: 相関 EXISTS（半結合）・NOT EXISTS（反結合）・非等価残余つき EXISTS（行ごとの再評価）・IN・NOT IN、
+  相関スカラーの集計形・非集計形・式埋め込み、派生表の単体（インライン展開）・集計（具体化）・ORDER BY + LIMIT の順位・JOIN の slot・入れ子。
+  T0 の非空条件を緩めないため、Public 行だけで非空になる形に限った。
+- 手計算の期待値（T4b）: モード別（Public のみ／自テナント Private 込み）の NOT EXISTS・集計値・非集計スカラー・NOT IN・順位を、
+  baseline と flooded の双方で固定する。陽性対照として flood の保持者自身が実行すると flood 行が結果に届くことも確かめる。
+- エラー（T3）: 相関・派生表の未対応形（相関 IN の明示 LIMIT・ANY/ALL・JOIN 外側の相関スカラー・式投影・未知の外側表・
+  派生表を使う文の外側 IN・LATERAL・未知の列・列名リスト超過・隠れた実表名での修飾）が、閲覧者 3 テナント × 2 モード × flood の有無で
+  `(wire_code, client_message)` 完全一致し、文言に他テナント名・行トークン・内部の予約名が含まれないこと。
+- データ依存上限のカナリア: 非集計スカラーの `21000`・相関の再評価回数上限・派生表の具体化行数上限。他テナントの Private 行では発火せず、
+  自テナントで超えると実際に失敗する（陽性対照）。
+- 負の対照（T6）: 文言検査ヘルパが捏造した文言を検出できること。
+
+### 対象外
+
+- wire-server・NoSQL 表層での同等検証: engine の `wire_code` と `client_message` を写像するだけのため engine 側の不変性で代替する。
+- 述語形 DML の WHERE での相関: 現状は拒否のため本マトリクスの対象外。
+- 集計形スカラーのグループ数上限・実行回数予算の適用経路: 後者は `tests/nesting_limits.rs`（#2743）で固定済み。
+- 再帰 CTE: `tests/rls10_recursive_cte_paths.rs`（#1873）で固定済み。
