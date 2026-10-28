@@ -139,7 +139,8 @@ fn column_names(columns: &[ColumnMeta]) -> Vec<String> {
             ColumnMeta::Id => "id".to_string(),
             ColumnMeta::AliasedId { name }
             | ColumnMeta::Scalar { name, .. }
-            | ColumnMeta::Computed { name, .. } => name.clone(),
+            | ColumnMeta::Computed { name, .. }
+            | ColumnMeta::Record { name, .. } => name.clone(),
         })
         .collect()
 }

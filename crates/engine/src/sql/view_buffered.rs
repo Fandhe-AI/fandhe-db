@@ -61,12 +61,13 @@ use super::udf_call::{ExprValue, UdfRegistry};
 use super::window::{window_result_type, CellWindowEvaluator};
 
 /// 列メタデータの名前（疑似列 `id` は `"id"`）。
-fn column_name(meta: &ColumnMeta) -> &str {
+pub(crate) fn column_name(meta: &ColumnMeta) -> &str {
     match meta {
         ColumnMeta::Id => "id",
         ColumnMeta::Scalar { name, .. }
         | ColumnMeta::Computed { name, .. }
-        | ColumnMeta::AliasedId { name } => name,
+        | ColumnMeta::AliasedId { name }
+        | ColumnMeta::Record { name, .. } => name,
     }
 }
 
@@ -114,10 +115,17 @@ fn internal_error() -> SqlSurfaceError {
     }
 }
 
+/// 外側 `ORDER BY` キーの比較クラス。スカラー列は型クラス 1 つ、再帰 CTE の `SEARCH` 順序列
+/// （`record`／`record[]`。SQL-35・Issue #2213）はフィールドごとの型クラス列で比較する。
+enum OrderClass {
+    Scalar(CmpClass),
+    Record { fields: Vec<CmpClass>, array: bool },
+}
+
 /// 外側 `ORDER BY`（列キーのみ）の 1 キー（本文の結果列の位置・比較クラス・降順指定）。
 struct OrderKeyPlan {
     index: usize,
-    class: CmpClass,
+    class: OrderClass,
     descending: bool,
     nulls: NullPlacement,
 }
@@ -261,6 +269,11 @@ pub(crate) fn rename_body_columns(
             (Some(alias), ColumnMeta::Computed { ty, .. }) => ColumnMeta::Computed {
                 name: alias.clone(),
                 ty: ty.clone(),
+            },
+            (Some(alias), ColumnMeta::Record { fields, array, .. }) => ColumnMeta::Record {
+                name: alias.clone(),
+                fields: fields.clone(),
+                array: *array,
             },
         })
         .collect();
@@ -582,7 +595,8 @@ fn evaluable_type(meta: &ColumnMeta) -> Option<&ColumnType> {
         ColumnMeta::AliasedId { .. } => &crate::sql::exec::ALIASED_ID_TYPE,
         ColumnMeta::Scalar { ty, .. } => ty,
         ColumnMeta::Computed { ty: Some(ty), .. } => ty,
-        ColumnMeta::Computed { ty: None, .. } => return None,
+        // 述語・式へは渡さない列（SEARCH 順序列は `ORDER BY` と射影だけで使う。SQL-35・Issue #2213）。
+        ColumnMeta::Computed { ty: None, .. } | ColumnMeta::Record { .. } => return None,
     };
     match ty {
         ColumnType::Vector(_) | ColumnType::Array(_) => None,
@@ -651,7 +665,19 @@ fn bind_scan_plan(
         where_predicates: rows.where_predicates.clone(),
         limit: 1,
         limit_implicit: false,
-        order_by: rows.order_by.clone(),
+        // 再帰 CTE の `SEARCH` 順序列（`record`／`record[]`）は合成スキーマ上で到達不能名のため、束縛へ
+        // 渡すと未知列になる。比較は [`plan_order`] がレコード専用に行うので、ここからは除く
+        // （SQL-35・Issue #2213）。
+        order_by: rows
+            .order_by
+            .iter()
+            .filter(|k| {
+                !body_columns.iter().any(|m| {
+                    matches!(m, ColumnMeta::Record { .. }) && column_name(m) == k.column.as_str()
+                })
+            })
+            .cloned()
+            .collect(),
         offset: 0,
         window_items: rows.window_items.clone(),
         scalar_subquery_items: Vec::new(),
@@ -749,18 +775,39 @@ fn plan_order(
                 key.column
             ))
         };
+        if let ColumnMeta::Record { fields, array, .. } =
+            body_columns.get(index).ok_or_else(internal_error)?
+        {
+            // `id` 型のフィールド（`None`）は整数クラス。他は `cmp_class` が決める（並べ替え不能型は
+            // 計画時に拒否済みだが、ここでも fail-closed で検査する）。
+            let classes = fields
+                .iter()
+                .map(|f| cmp_class(f.as_ref()))
+                .collect::<Option<Vec<CmpClass>>>()
+                .ok_or_else(unsupported)?;
+            out.push(OrderKeyPlan {
+                index,
+                class: OrderClass::Record {
+                    fields: classes,
+                    array: *array,
+                },
+                descending: key.descending,
+                nulls: NullPlacement::pg_default(key.descending),
+            });
+            continue;
+        }
         let class = match body_columns.get(index).ok_or_else(internal_error)? {
             ColumnMeta::Id => cmp_class(None),
             ColumnMeta::AliasedId { .. } => cmp_class(Some(&crate::sql::exec::ALIASED_ID_TYPE)),
             ColumnMeta::Scalar { ty, .. } | ColumnMeta::Computed { ty: Some(ty), .. } => {
                 cmp_class(Some(ty))
             }
-            ColumnMeta::Computed { ty: None, .. } => None,
+            ColumnMeta::Computed { ty: None, .. } | ColumnMeta::Record { .. } => None,
         }
         .ok_or_else(unsupported)?;
         out.push(OrderKeyPlan {
             index,
-            class,
+            class: OrderClass::Scalar(class),
             descending: key.descending,
             nulls: NullPlacement::pg_default(key.descending),
         });
@@ -1010,13 +1057,24 @@ fn sort_rows(
     rows: Vec<ResultRow>,
     order: &[OrderKeyPlan],
 ) -> Result<Vec<ResultRow>, SqlSurfaceError> {
+    /// 行ごとに先に取り出した 1 キー分の比較値。レコード列はセルの借用のまま持ち、比較時に
+    /// フィールドごとに取り出す（経路長に比例する複製を作らない）。
+    enum SortKey<'a> {
+        Scalar(Option<CmpVal<'a>>),
+        Record(&'a Cell),
+    }
+    // 比較器からはエラーを返せないため、最初のエラーを保持して `Equal` を返し、整列後に返す。
+    let failure: std::cell::RefCell<Option<SqlSurfaceError>> = std::cell::RefCell::new(None);
     let idx = {
-        let mut keys: Vec<Vec<Option<CmpVal<'_>>>> = Vec::with_capacity(rows.len());
+        let mut keys: Vec<Vec<SortKey<'_>>> = Vec::with_capacity(rows.len());
         for row in &rows {
             let mut k = Vec::with_capacity(order.len());
             for o in order {
                 let cell = row.cells.get(o.index).ok_or_else(internal_error)?;
-                k.push(order_val(cell, &o.class)?);
+                k.push(match &o.class {
+                    OrderClass::Scalar(class) => SortKey::Scalar(order_val(cell, class)?),
+                    OrderClass::Record { .. } => SortKey::Record(cell),
+                });
             }
             keys.push(k);
         }
@@ -1026,7 +1084,27 @@ fn sort_rows(
                 return Ordering::Equal;
             };
             for (o, (va, vb)) in order.iter().zip(ka.iter().zip(kb.iter())) {
-                let ord = compare_order(va.as_ref(), vb.as_ref(), o.descending, o.nulls);
+                let ord = match (&o.class, va, vb) {
+                    (OrderClass::Scalar(_), SortKey::Scalar(x), SortKey::Scalar(y)) => {
+                        compare_order(x.as_ref(), y.as_ref(), o.descending, o.nulls)
+                    }
+                    (
+                        OrderClass::Record { fields, array },
+                        SortKey::Record(x),
+                        SortKey::Record(y),
+                    ) => match compare_record_cells(x, y, fields, *array) {
+                        Ok(ord) if o.descending => ord.reverse(),
+                        Ok(ord) => ord,
+                        Err(e) => {
+                            failure.borrow_mut().get_or_insert(e);
+                            Ordering::Equal
+                        }
+                    },
+                    _ => {
+                        failure.borrow_mut().get_or_insert_with(internal_error);
+                        Ordering::Equal
+                    }
+                };
                 if ord != Ordering::Equal {
                     return ord;
                 }
@@ -1035,7 +1113,54 @@ fn sort_rows(
         });
         idx
     };
+    if let Some(e) = failure.into_inner() {
+        return Err(e);
+    }
     reorder(rows, &idx)
+}
+
+/// `SEARCH` 順序列（`record`／`record[]`）のセル同士を PostgreSQL の btree 比較（`record_cmp`／
+/// `array_cmp`）に合わせて昇順で比較する（SQL-35・Issue #2213）。レコードは先頭フィールドから順に
+/// 比較し NULL は非 NULL より後（NULL 同士は等しい）、配列は要素ごとに比較して共通部分が等しければ
+/// 短い方が先。`DESC` は呼び出し元が全体を反転する。セルの形・フィールド数が計画と食い違えば
+/// `Internal`（fail-closed）。
+fn compare_record_cells(
+    a: &Cell,
+    b: &Cell,
+    classes: &[CmpClass],
+    array: bool,
+) -> Result<Ordering, SqlSurfaceError> {
+    fn fields_cmp(
+        a: &[Cell],
+        b: &[Cell],
+        classes: &[CmpClass],
+    ) -> Result<Ordering, SqlSurfaceError> {
+        if a.len() != classes.len() || b.len() != classes.len() {
+            return Err(internal_error());
+        }
+        for ((x, y), class) in a.iter().zip(b.iter()).zip(classes.iter()) {
+            let vx = order_val(x, class)?;
+            let vy = order_val(y, class)?;
+            let ord = compare_order(vx.as_ref(), vy.as_ref(), false, NullPlacement::Last);
+            if ord != Ordering::Equal {
+                return Ok(ord);
+            }
+        }
+        Ok(Ordering::Equal)
+    }
+    match (a, b, array) {
+        (Cell::Record(x), Cell::Record(y), false) => fields_cmp(x, y, classes),
+        (Cell::RecordArray(x), Cell::RecordArray(y), true) => {
+            for (rx, ry) in x.iter().zip(y.iter()) {
+                let ord = fields_cmp(rx, ry, classes)?;
+                if ord != Ordering::Equal {
+                    return Ok(ord);
+                }
+            }
+            Ok(x.len().cmp(&y.len()))
+        }
+        _ => Err(internal_error()),
+    }
 }
 
 /// 行を式キーを含む外側 `ORDER BY`（`ScanPlan::bound.order_by`）で安定ソートする
@@ -1576,5 +1701,54 @@ mod tests {
             .err()
             .unwrap();
         assert_eq!(err.wire_code(), "42703");
+    }
+    /// `SEARCH` 順序列（SQL-35・Issue #2213）の比較: レコードは先頭フィールドから順に比べ NULL は
+    /// 非 NULL より後、配列は要素ごとに比べて共通部分が等しければ短い方が先。
+    #[test]
+    fn record_cells_compare_like_pg_record_and_array_cmp() {
+        let int = vec![CmpClass::Integer];
+        let rec = |v: Option<i64>| {
+            Cell::Record(vec![match v {
+                Some(n) => Cell::SignedInteger(n),
+                None => Cell::Null,
+            }])
+        };
+        assert_eq!(
+            compare_record_cells(&rec(Some(1)), &rec(Some(2)), &int, false).unwrap(),
+            Ordering::Less
+        );
+        assert_eq!(
+            compare_record_cells(&rec(Some(9)), &rec(None), &int, false).unwrap(),
+            Ordering::Less
+        );
+        assert_eq!(
+            compare_record_cells(&rec(None), &rec(None), &int, false).unwrap(),
+            Ordering::Equal
+        );
+        let two = vec![CmpClass::Integer, CmpClass::Text];
+        let r2 = |n: i64, t: &str| Cell::Record(vec![Cell::SignedInteger(n), Cell::Text(t.into())]);
+        assert_eq!(
+            compare_record_cells(&r2(1, "b"), &r2(1, "a"), &two, false).unwrap(),
+            Ordering::Greater
+        );
+        let arr = |items: &[i64]| {
+            Cell::RecordArray(
+                items
+                    .iter()
+                    .map(|n| vec![Cell::SignedInteger(*n)])
+                    .collect(),
+            )
+        };
+        assert_eq!(
+            compare_record_cells(&arr(&[1, 2]), &arr(&[1, 2, 0]), &int, true).unwrap(),
+            Ordering::Less
+        );
+        assert_eq!(
+            compare_record_cells(&arr(&[1, 3]), &arr(&[1, 2, 9]), &int, true).unwrap(),
+            Ordering::Greater
+        );
+        // 形が計画と食い違えば fail-closed。
+        assert!(compare_record_cells(&rec(Some(1)), &arr(&[1]), &int, false).is_err());
+        assert!(compare_record_cells(&r2(1, "a"), &r2(1, "a"), &int, false).is_err());
     }
 }

@@ -186,6 +186,7 @@ mod identity_column_tests;
 pub(crate) mod insert_select;
 pub(crate) mod interval_arith;
 pub(crate) mod matview;
+pub mod record_text;
 pub(crate) mod recursive_cte;
 pub(crate) mod recursive_eval;
 #[cfg(test)]

@@ -23,7 +23,14 @@
   `EngineCore::with_recursive_cte_limits` へ注入する。ハード上限は既定値（反復 1,000 回・累積 100,000 行）と
   同じで、下げる方向だけ設定できる。超過は `54000`。範囲外・非数値・値欠落・重複指定は起動エラー。
   累積行数は `--max-result-rows` との小さい方が実効上限。公開 API は追加のみ（`engine::recursive_cte_limits`）。
-
+- `WITH RECURSIVE` の `SEARCH DEPTH FIRST／BREADTH FIRST BY 列[, ...] SET 順序列` 句を評価する（Issue #2213・SQL-35。段階 C）。
+  深さ優先は根から当該行までの BY 列の行値の配列（`record[]`）、幅優先は `(深さ, BY 列の値...)`（`record`）を順序列として結果列の末尾へ足し、
+  主クエリの `ORDER BY 順序列 [DESC]` で PostgreSQL 17 と同じ順序になる。wire は OID 2249／2287 のテキスト形式（バイナリ結果形式の要求は `0A000`）、
+  HTTP の SQL 応答は入れ子の JSON 配列。BY 列が列名に無い・SET 名の衝突・非再帰定義への指定は `42601`、BY 列の重複は `42701`、
+  アンカー項が集合演算・`CYCLE` 句の併用は `0A000`。深さ優先の経路は確保前に共有バイト予算へ計上し、超過は部分結果なしの `54000`。
+  挙動変更: `SEARCH` 句つきの再帰 CTE は従来 `0A000` だったが評価される。詳細は [recursive-cte.md](docs/design/recursive-cte.md)。
+  BREAKING CHANGE: 公開 enum `sql::exec::Cell` に variant（`Record`／`RecordArray`）、`sql::exec::ColumnMeta` に variant（`Record`）を追加したため、
+  網羅的な `match` は更新が要る。
 - `WITH RECURSIVE` の反復評価器を追加する（Issue #1870・SQL-35。段階 B）。アンカー項の結果を最初の作業表とし、
   「前回の反復で増えた行だけ」を作業表として再帰項（単一関係、または基底表との JOIN）を再実行し、作業表が空に
   なったら終了する。出力順は生成順。階層走査と数列が評価できる。暫定の固定上限（反復 1,000 回・累積 100,000 行。

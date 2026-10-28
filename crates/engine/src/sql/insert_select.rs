@@ -496,9 +496,11 @@ fn source_ty(meta: &ColumnMeta) -> Result<SourceTy<'_>, SqlSurfaceError> {
         ColumnMeta::Computed { ty: Some(ty), .. } => Ok(SourceTy::Ty(ty)),
         // 静的な型を持たない式は代入可否を判定できないため拒否する（fail-closed。
         // `set_op::columns_compatible` と同じ方針）。
-        ColumnMeta::Computed { ty: None, .. } => Err(SqlSurfaceError::datatype_mismatch(
-            "INSERT ... SELECT source column has no static type",
-        )),
+        ColumnMeta::Computed { ty: None, .. } | ColumnMeta::Record { .. } => {
+            Err(SqlSurfaceError::datatype_mismatch(
+                "INSERT ... SELECT source column has no static type",
+            ))
+        }
     }
 }
 
