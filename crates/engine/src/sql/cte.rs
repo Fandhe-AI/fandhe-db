@@ -29,6 +29,13 @@
 //! 具体化の入口（単一表の `BufferedView`・JOIN の slot）以外から名前解決された場合は
 //! [`resolve_relation`] が固定 `0A000` で拒否する（連鎖・インライン専用の文脈を含む）。
 //!
+//! 集計・窓 CTE（SQL-62 (1)・Issue #1863）: 本文が集計・`GROUP BY`／`HAVING`・`SELECT DISTINCT`
+//! （[`CteBody::Aggregate`]）またはウィンドウ関数（[`CteBodyTail::window_items`]）を持つ CTE は、
+//! 外側の `WHERE` を基底表へ合成すると意味が変わるため tail CTE と同じく常に具体化経路で評価し、
+//! インラインへ戻さない（[`CteDef::requires_materialization`]。入口以外からの名前解決は
+//! [`resolve_relation`] が固定 `0A000`）。集計値・窓の値は参照者自身の `PolicyContext` で見える行
+//! だけから計算される（RLS-10 (b)）。
+//!
 //! データ変更 CTE（SQL-63、Issue #1875）: CTE 本文に単一表の `INSERT`／`UPDATE`／
 //! `DELETE`（`RETURNING` 任意）を書く形は [`CteBody::DataModifying`] として構文受理し、
 //! 本文は既存の DML 許可パーサーで解析する（第 2 の DML パーサーを作らない）。#1875 の範囲は
@@ -47,8 +54,9 @@
 //! シャドーイングで自己参照が実テーブルへ解決されるのを防ぐ）。
 
 use super::allowlist::{
-    DeleteStatement, ParsedViewBody, Projection, ScalarOrderKey, ScanOrderKey, SqlSurfaceError,
-    TableLookup, ValidatedInsert, ValidatedUpdateForm,
+    AggregateSelectItem, DeleteStatement, GroupByClause, ParsedViewBody, Projection,
+    ScalarOrderKey, ScanOrderKey, SqlSurfaceError, TableLookup, ValidatedInsert,
+    ValidatedUpdateForm, WherePredicate, WindowSelectItem,
 };
 use super::returning::DmlCommand;
 use super::view::{
@@ -110,19 +118,46 @@ pub(crate) struct CteBodyTail {
     pub(crate) limit: Option<u32>,
     /// `OFFSET m`（範囲検証済み。既定 0）。
     pub(crate) offset: u32,
+    /// 本文のウィンドウ項目（SQL-62・Issue #1863。無ければ空）。窓つき本文は `ORDER BY`／`LIMIT`
+    /// の語が無くても `tail` を持ち、本文の広域取得へそのまま載る。
+    pub(crate) window_items: Vec<WindowSelectItem>,
+}
+
+/// 集計・`GROUP BY`／`HAVING`・`SELECT DISTINCT`（脱糖後の集計形）の CTE 本文（SQL-62・Issue #1863）。
+/// `sql::allowlist::Parser::parse_with_clause` が既存の集計許可パーサーで解析して詰める。
+/// 集計の `ORDER BY`／`LIMIT`／`OFFSET` は [`GroupByClause`] が保持する。テナント情報は持たない
+/// （RLS-10 (b)）。
+#[derive(Debug, Clone, PartialEq)]
+pub(crate) struct CteAggregateBody {
+    /// FROM のリレーション名（表・ビュー・先行 CTE）。
+    pub(crate) table_name: String,
+    pub(crate) items: Vec<AggregateSelectItem>,
+    pub(crate) where_predicates: Vec<WherePredicate>,
+    pub(crate) group_by: Option<GroupByClause>,
 }
 
 impl CteDef {
-    /// 本文が `ORDER BY`・`LIMIT`・`OFFSET` を持つ（インライン展開できない）か。
-    pub(crate) fn has_tail(&self) -> bool {
-        self.tail.is_some()
+    /// インライン展開できず、常に具体化経路で評価する CTE か（tail・窓・集計の本文。SQL-62・
+    /// Issue #1862・#1863）。
+    pub(crate) fn requires_materialization(&self) -> bool {
+        self.tail.is_some() || matches!(self.body, CteBody::Aggregate(_))
     }
 
-    /// SELECT 本文なら検証済みの本文を返す。データ変更 CTE では `None`。
+    /// 本文の FROM のリレーション名（SELECT・集計・データ変更 CTE の対象表のいずれも）。
+    pub(crate) fn relation_name(&self) -> &str {
+        match &self.body {
+            CteBody::Select(b) => b.table_name.as_str(),
+            CteBody::Aggregate(b) => b.table_name.as_str(),
+            CteBody::DataModifying(b) => b.target_table.as_str(),
+        }
+    }
+
+    /// SELECT 本文なら検証済みの本文を返す。集計本文・データ変更 CTE では `None`
+    /// （呼び出し側は集計本文を [`CteBody::Aggregate`] として別に扱うこと）。
     pub(crate) fn select_body(&self) -> Option<&ParsedViewBody> {
         match &self.body {
             CteBody::Select(body) => Some(body),
-            CteBody::DataModifying(_) => None,
+            CteBody::Aggregate(_) | CteBody::DataModifying(_) => None,
         }
     }
 
@@ -137,6 +172,8 @@ impl CteDef {
 pub(crate) enum CteBody {
     /// 従来の SELECT 本文（`CREATE VIEW` 本文と同一の許可形状）。
     Select(ParsedViewBody),
+    /// 集計・`GROUP BY`／`HAVING`・`SELECT DISTINCT` の本文（SQL-62・Issue #1863）。
+    Aggregate(Box<CteAggregateBody>),
     /// データ変更 CTE。
     DataModifying(Box<DataModifyingCteBody>),
 }
@@ -257,19 +294,28 @@ pub(crate) fn resolve_relation(
         .rev()
         .find(|(_, def)| def.name.eq_ignore_ascii_case(name))
     {
+        // SQL-62・Issue #1862・#1863: 本文が ORDER BY／LIMIT／OFFSET・集計・窓を持つ CTE はインライン
+        // 展開すると `LIMIT` が落ちる・外側の `WHERE` が集計の前に掛かる等で誤結果になる。具体化経路
+        // （`sql::allowlist` が組む `BufferedView`・JOIN の slot）以外から名前解決された場合は、ここで
+        // 1 箇所だけ固定文言の `0A000` で拒否する（連鎖・InlineOnly 文脈・具体化の本文構築を含む）。
+        if def.requires_materialization() {
+            let aggregate_or_window = matches!(def.body, CteBody::Aggregate(_))
+                || def
+                    .tail
+                    .as_ref()
+                    .is_some_and(|t| !t.window_items.is_empty());
+            return Err(SqlSurfaceError::feature_not_supported(
+                if aggregate_or_window {
+                    "a CTE with an aggregate or window function in its body cannot be referenced here"
+                } else {
+                    "a CTE with ORDER BY/LIMIT/OFFSET in its body cannot be referenced here"
+                },
+            ));
+        }
         // 多層防御（SQL-63）: データ変更 CTE は表・ビューへ展開しない（固定 0A000）。
         let Some(select) = def.select_body() else {
             return Err(data_modifying_cte_unsupported());
         };
-        // SQL-62・Issue #1862: 本文が ORDER BY／LIMIT／OFFSET を持つ CTE はインライン展開すると
-        // `LIMIT` が黙って落ちて誤結果になる。具体化経路（`sql::allowlist` が組む
-        // `BufferedView`・JOIN の slot）以外から名前解決された場合は、ここで 1 箇所だけ
-        // 固定文言の `0A000` で拒否する（連鎖・InlineOnly 文脈・具体化の本文構築を含む）。
-        if def.has_tail() {
-            return Err(SqlSurfaceError::feature_not_supported(
-                "a CTE with ORDER BY/LIMIT/OFFSET in its body cannot be referenced here",
-            ));
-        }
         budget.consume_reference()?;
         let inner = resolve_relation(
             lookup,
@@ -306,6 +352,12 @@ pub(crate) fn compose(
     inner: Resolved,
     def: &CteDef,
 ) -> Result<Resolved, SqlSurfaceError> {
+    // 集計本文は `resolve_relation` が止めるため到達しない（多層防御として固定 `0A000`）。
+    if matches!(def.body, CteBody::Aggregate(_)) {
+        return Err(SqlSurfaceError::feature_not_supported(
+            "a CTE with an aggregate or window function in its body cannot be referenced here",
+        ));
+    }
     let Some(body) = def.select_body() else {
         return Err(data_modifying_cte_unsupported());
     };

@@ -9,6 +9,8 @@
 
 ### Added
 
+- CTE 本文の集計・`GROUP BY`・`SELECT DISTINCT`・ウィンドウ関数を受け付ける（Issue #1863・SQL-62）。インライン展開では外側の `WHERE` が集計・窓の前に掛かって誤結果になるため、常に具体化して評価し、集計値・窓の値は参照者の可視行だけから計算される。`LIMIT` なしの本文は暗黙上限で、可視行（グループ）が `--max-result-rows` を超えると `54000`。
+  挙動変更: 従来 `42601` で拒否していた形が受理される。他の CTE が読む連鎖・集計 CTE の JOIN 入力・ビュー本文や cursor などインライン専用の文脈での参照は固定 `0A000`。公開 enum は変えない（非 BREAKING）。詳細は [cte.md](docs/design/cte.md) の「Issue #1863 追記」節。
 - CTE 本文の `ORDER BY`・`LIMIT`・`OFFSET` を受け付ける（Issue #1862・SQL-62）。本文に `LIMIT` を持つ CTE はインライン展開では `LIMIT` が落ちるため、常に具体化して評価し（単一表の主クエリは評価後射影形、JOIN は入力 slot）、外側の `WHERE` は本文の `LIMIT` の後に適用される。`LIMIT` なしの本文は暗黙上限で、可視行が `--max-result-rows` を超えると `54000`。
   挙動変更: 従来 `42601` で拒否していた形が受理される。他の CTE が読む連鎖・ビュー本文や cursor などインライン専用の文脈での参照は固定 `0A000`。公開 enum は変えない（非 BREAKING）。詳細は [cte.md](docs/design/cte.md) の「Issue #1862 追記」節。
 - データ変更 CTE の 1 文内の可視性と失敗時の動作を PostgreSQL に揃える（Issue #1877・SQL-63）。副文を 2 つ以上・
