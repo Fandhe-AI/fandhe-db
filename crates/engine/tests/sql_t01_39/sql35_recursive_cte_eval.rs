@@ -626,18 +626,13 @@ fn icu_collated_table_is_rejected() {
     );
 }
 
-/// 評価できない形は `0A000`（`UNION`・複数定義・SEARCH／CYCLE）。段階 A の `42P19` が先に決まる。
+/// 評価できない形は `0A000`（複数定義）。段階 A の `42P19` が先に決まる。
 #[test]
 fn feature_gates_remain() {
     let (core, _g) = open_core();
-    for sql in [
-        "WITH RECURSIVE a AS (SELECT 1), t(n) AS (SELECT 1 UNION ALL SELECT n + 1 FROM t WHERE n < 3) \
-         SELECT n FROM t",
-        "WITH RECURSIVE t(n) AS (SELECT 1 UNION ALL SELECT n + 1 FROM t WHERE n < 3) \
-         CYCLE n SET c USING p SELECT n FROM t",
-    ] {
-        assert_eq!(code(&core, "alice", sql), "0A000", "{sql}");
-    }
+    let sql = "WITH RECURSIVE a AS (SELECT 1), t(n) AS (SELECT 1 UNION ALL SELECT n + 1 FROM t WHERE n < 3) \
+               SELECT n FROM t";
+    assert_eq!(code(&core, "alice", sql), "0A000", "{sql}");
     assert_eq!(
         code(
             &core,

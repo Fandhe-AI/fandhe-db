@@ -27,6 +27,13 @@
 //!    末尾へ足す（[`SearchPlan`]）。順序列は作業表のスキーマには含めない。経路は深さに比例して増えるため、
 //!    複製の前に共有バイト予算へ計上する。
 //!
+//! 5. `CYCLE ... SET ... USING` 句（#2214）: PostgreSQL 17 の書き換え（`rewriteSearchAndCycle`）と同じ意味で、
+//!    行ごとに経路（循環判定列の行値の `record[]`。深さ優先の `SEARCH` と同じ生成器 [`SearchPlan`] を共有）を持ち、
+//!    新しい行の行値が親の経路に含まれる（レコード等値。NULL 同士は一致、片側のみ NULL は不一致）なら印を `TO` 値に
+//!    する。印が `TO` 値の行は結果へ残すが次の作業表へは渡さない（そこで再帰が止まる）。印列・経路列は
+//!    順序列（あれば）の後ろへ足し、作業表のスキーマには含めない（[`CyclePlan`]）。経路は複製の前に共有
+//!    バイト予算へ計上する。
+//!
 //! RLS-10 (b) の不変条件: 基底表の読み取りは、参照セッション自身の `PolicyContext` と同一の
 //! `read_txn` で既存の走査経路（RLS 暗黙適用）を通る。作業表は前回反復の可視行から作った値
 //! だけで構成されるため、停止時点・反復回数・`54000` の有無は可視行だけで決まり、他テナントの
@@ -44,7 +51,8 @@ use crate::catalog::{ColumnType, RowIdentity, TableSchema};
 use crate::policy::PolicyContext;
 
 use super::allowlist::{
-    SearchClause, SetOperator, SqlSurfaceError, Statement, ValidatedRecursiveCte, ValidatedScan,
+    CycleClause, CycleConst, SearchClause, SetOperator, SqlSurfaceError, Statement,
+    ValidatedRecursiveCte, ValidatedScan,
 };
 use super::exec::{computed_column_meta, Cell, ColumnMeta, QueryResult, ResultRow};
 use super::expr_program::{ExprProgram, StackValue};
@@ -438,6 +446,7 @@ impl ScanTerm {
     /// `budget` で行数・バイト数を判定する（超過は `54000`。部分結果は返さない）。`parents` が
     /// `Some` のときは、出力行ごとに入力行（`rows` 内の位置）を追記する（`SEARCH` 句が親行を引く
     /// ために使う。SQL-35・Issue #2213）。
+    #[allow(clippy::too_many_arguments)]
     fn eval_over_rows(
         &self,
         types: &[Option<ColumnType>],
@@ -446,7 +455,13 @@ impl ScanTerm {
         charge: Charge,
         mut parents: Option<&mut Vec<usize>>,
         mut dedup: Option<&mut DedupSet>,
+        skip: Option<&[bool]>,
     ) -> Result<Vec<ResultRow>, SqlSurfaceError> {
+        // `skip` は `rows` と同じ並びの「次の作業表へ渡さない行」（`CYCLE` の循環行。#2214）。長さの
+        // 食い違いは黙って全行を通す・捨てるのではなく `Internal`（fail-closed）にする。
+        if skip.is_some_and(|s| s.len() != rows.len()) {
+            return Err(internal("working table skip mask length mismatch"));
+        }
         let referenced = vec![true; types.len()];
         let mut where_scratch: Vec<StackValue> = Vec::new();
         let mut proj_scratch: Vec<StackValue> = Vec::new();
@@ -454,6 +469,9 @@ impl ScanTerm {
         for (n, row) in rows.iter().enumerate() {
             if n % 1024 == 0 {
                 crate::interrupt::check()?;
+            }
+            if skip.is_some_and(|s| s.get(n).copied().unwrap_or(true)) {
+                continue;
             }
             let cells = with_scanned(types, &referenced, row, |scanned| {
                 if !where_matches_for_row(
@@ -520,10 +538,13 @@ enum Step<'a> {
 
 /// 計画の結果（Describe と Execute が共有する）。
 struct Prepared<'a> {
-    /// CTE の公開列（`column_aliases` 適用後・型合成後。`SEARCH` 句があれば末尾に順序列）。
+    /// CTE の公開列（`column_aliases` 適用後・型合成後。`SEARCH` 句があれば末尾に順序列、`CYCLE` 句が
+    /// あればさらに印列・経路列）。
     columns: Vec<ColumnMeta>,
     /// `SEARCH` 句の計画（順序列の生成に使う）。
     search: Option<SearchPlan>,
+    /// `CYCLE` 句の計画（印・経路の生成と循環判定に使う）。
+    cycle: Option<CyclePlan>,
     /// 作業表の列型（`synth_schema` の `types`）。
     work_types: Vec<Option<ColumnType>>,
     step: Step<'a>,
@@ -619,6 +640,313 @@ fn plan_search(
             array: !clause.breadth_first,
         },
     ))
+}
+
+/// `CYCLE` 句の計画（SQL-35・Issue #2214）。循環判定列は CTE の公開列の添字で持ち、経路は深さ優先の
+/// `SEARCH` と同じ生成器（[`SearchPlan`]。アンカー行は `ARRAY[ROW(cols)]`、再帰行は親の経路の末尾へ
+/// 自分の `ROW(cols)` を足す）を共有する。印は `TO` 値と `DEFAULT` 値の 2 値で、循環検出は評価ごとに
+/// [`CyclePlan::is_cycle`] が親の経路に対して行う。
+struct CyclePlan {
+    /// 経路の生成器（`breadth_first` は常に偽）。
+    path: SearchPlan,
+    /// 循環判定列の比較クラス（`path.by_idx` と同じ並び）。
+    classes: Vec<super::join::values::CmpClass>,
+    /// 循環行の印（`TO` 値。省略時は `true`）。
+    mark_to: Cell,
+    /// 循環でない行の印（`DEFAULT` 値。省略時は `false`）。
+    mark_default: Cell,
+    /// `TO` と `DEFAULT` が同じ値か。真のとき、循環でない行の印も `TO` 値と等しく、どの行も次の作業表へ
+    /// 渡らない（PostgreSQL の書き換えが足す `WHERE 印 <> TO` と同じ結果）。
+    default_is_to: bool,
+}
+
+/// `TO`／`DEFAULT` 定数の値の種別（共通型の解決用）。
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum CycleConstKind {
+    Bool,
+    Int,
+    Text,
+}
+
+fn cycle_const_kind(c: &CycleConst) -> Result<CycleConstKind, SqlSurfaceError> {
+    match c {
+        CycleConst::Bool(_) => Ok(CycleConstKind::Bool),
+        CycleConst::Integer(_) => Ok(CycleConstKind::Int),
+        CycleConst::Text(_) => Ok(CycleConstKind::Text),
+        // 小数・NULL・型名付きリテラルは、黙って別の型へ変換せず固定文言で拒否する（fail-closed）。
+        CycleConst::Decimal(_) | CycleConst::Null | CycleConst::Typed => Err(unsupported_term(
+            "this form of constant in the CYCLE clause is not supported",
+        )),
+    }
+}
+
+/// 定数を整数として読む（整数リテラルは範囲外なら `0A000`、文字列は整数として解釈できなければ `22P02`）。
+fn cycle_const_i64(c: &CycleConst) -> Result<i64, SqlSurfaceError> {
+    match c {
+        CycleConst::Integer(s) => s.parse::<i64>().map_err(|_| {
+            unsupported_term("an integer constant in the CYCLE clause is out of range")
+        }),
+        CycleConst::Text(s) => s.trim().parse::<i64>().map_err(|_| {
+            SqlSurfaceError::invalid_text_representation("invalid input syntax for type integer")
+        }),
+        _ => Err(internal("unexpected CYCLE constant form")),
+    }
+}
+
+/// 定数を真偽値として読む（文字列は PostgreSQL の boolean 入力規則で解釈し、できなければ `22P02`）。
+fn cycle_const_bool(c: &CycleConst) -> Result<bool, SqlSurfaceError> {
+    match c {
+        CycleConst::Bool(b) => Ok(*b),
+        CycleConst::Text(s) => super::params::parse_pg_bool(s).ok_or_else(|| {
+            SqlSurfaceError::invalid_text_representation("invalid input syntax for type boolean")
+        }),
+        _ => Err(internal("unexpected CYCLE constant form")),
+    }
+}
+
+/// 印の `TO`／`DEFAULT` を共通型へ解決する（PostgreSQL の `select_common_type` と同じ決め方）。
+/// 省略時は boolean の `true`／`false`。両方が文字列なら text、整数どうし（または整数と文字列）なら
+/// 整数リテラル自身の型（`i32` に収まれば integer、収まらなければ bigint）で、文字列定数はその型へ範囲検証付きで
+/// 変換する（範囲外は `22003`）。真偽値と文字列なら boolean。真偽値と整数は `42804`。
+/// 返す印のセルは `Cell::Bool`／`Cell::SignedInteger`／`Cell::Text`。
+fn resolve_cycle_marks(
+    values: &Option<(CycleConst, CycleConst)>,
+) -> Result<(Cell, Cell, ColumnType), SqlSurfaceError> {
+    use CycleConstKind::{Bool, Int, Text};
+    let Some((to, default)) = values else {
+        return Ok((Cell::Bool(true), Cell::Bool(false), ColumnType::Boolean));
+    };
+    let (kt, kd) = (cycle_const_kind(to)?, cycle_const_kind(default)?);
+    match (kt, kd) {
+        (Bool, Bool) | (Bool, Text) | (Text, Bool) => Ok((
+            Cell::Bool(cycle_const_bool(to)?),
+            Cell::Bool(cycle_const_bool(default)?),
+            ColumnType::Boolean,
+        )),
+        (Text, Text) => match (to, default) {
+            (CycleConst::Text(a), CycleConst::Text(b)) => Ok((
+                Cell::Text(a.clone()),
+                Cell::Text(b.clone()),
+                ColumnType::Text,
+            )),
+            _ => Err(internal("unexpected CYCLE constant form")),
+        },
+        (Int, Int) | (Int, Text) | (Text, Int) => {
+            // 共通型は整数リテラル自身の型（`i32` に収まれば integer、収まらなければ bigint）から決める。
+            // 文字列定数はその型へ範囲検証付きで変換する（`'2147483648'` を integer へは入れられず `22003`）。
+            let fits = |v: i64| i32::try_from(v).is_ok();
+            let lit = |c: &CycleConst| match c {
+                CycleConst::Integer(_) => cycle_const_i64(c).map(Some),
+                _ => Ok(None),
+            };
+            let (la, lb) = (lit(to)?, lit(default)?);
+            let ty = if la.into_iter().chain(lb).all(fits) {
+                ColumnType::Integer
+            } else {
+                ColumnType::BigInt
+            };
+            let conv = |c: &CycleConst, l: Option<i64>| -> Result<i64, SqlSurfaceError> {
+                if let Some(v) = l {
+                    return Ok(v);
+                }
+                let CycleConst::Text(s) = c else {
+                    return Err(internal("unexpected CYCLE constant form"));
+                };
+                let t = s.trim();
+                let digits = t.strip_prefix(['+', '-']).unwrap_or(t);
+                if digits.is_empty() || !digits.bytes().all(|b| b.is_ascii_digit()) {
+                    return Err(SqlSurfaceError::invalid_text_representation(
+                        "invalid input syntax for type integer",
+                    ));
+                }
+                let out_of_range = || {
+                    SqlSurfaceError::numeric_out_of_range(
+                        "integer out of range in the CYCLE clause",
+                    )
+                };
+                let v = t.parse::<i64>().map_err(|_| out_of_range())?;
+                if ty == ColumnType::Integer && !fits(v) {
+                    return Err(out_of_range());
+                }
+                Ok(v)
+            };
+            let (a, b) = (conv(to, la)?, conv(default, lb)?);
+            Ok((Cell::SignedInteger(a), Cell::SignedInteger(b), ty))
+        }
+        (Bool, Int) | (Int, Bool) => Err(SqlSurfaceError::datatype_mismatch(
+            "CYCLE types boolean and integer cannot be matched",
+        )),
+    }
+}
+
+/// `CYCLE` 句の循環判定列・印列名・経路列名を CTE の公開列（`SEARCH` の順序列を除く。`base`）に対して
+/// 解決し、計画と印列・経路列の列メタを返す。エラーの SQLSTATE は PostgreSQL（`parse_cte.c`）に合わせる:
+/// 循環列が列名リストに無い・印／経路の列名が列や `SEARCH` の SET 名と衝突・印と経路が同名は `42601`、
+/// 循環列の重複は `42701`。比較できない型（`VECTOR`・`ARRAY`・`JSON`・型なし等）の循環列は、
+/// PostgreSQL が実行時まで遅延するところを計画時に固定文言の `0A000` で拒否する（fail-closed。
+/// Describe と Execute が同じ検査を通る）。
+fn plan_cycle(
+    clause: &CycleClause,
+    base: &[ColumnMeta],
+    search_set: Option<&str>,
+) -> Result<(CyclePlan, ColumnMeta, ColumnMeta), SqlSurfaceError> {
+    let too_many = || SqlSurfaceError::payload_too_large("too many columns in the CYCLE clause");
+    let mut by_idx: Vec<usize> = Vec::new();
+    by_idx
+        .try_reserve(clause.columns.len())
+        .map_err(|_| too_many())?;
+    for name in &clause.columns {
+        let mut found: Option<usize> = None;
+        for (i, meta) in base.iter().enumerate() {
+            if column_name(meta).eq_ignore_ascii_case(name) {
+                if found.is_some() {
+                    return Err(SqlSurfaceError::ambiguous_column(name.clone()));
+                }
+                found = Some(i);
+            }
+        }
+        let i = found.ok_or_else(|| {
+            SqlSurfaceError::unsupported(format!(
+                "cycle column \"{name}\" not in WITH query column list"
+            ))
+        })?;
+        if by_idx.contains(&i) {
+            return Err(SqlSurfaceError::duplicate_column(name.clone()));
+        }
+        by_idx.push(i);
+    }
+    let clashes = |n: &str| {
+        base.iter().any(|m| column_name(m).eq_ignore_ascii_case(n))
+            || search_set.is_some_and(|s| s.eq_ignore_ascii_case(n))
+    };
+    if clashes(&clause.mark) {
+        return Err(SqlSurfaceError::unsupported(format!(
+            "cycle mark column name \"{}\" already used in WITH query column list",
+            clause.mark
+        )));
+    }
+    if clashes(&clause.path) {
+        return Err(SqlSurfaceError::unsupported(format!(
+            "cycle path column name \"{}\" already used in WITH query column list",
+            clause.path
+        )));
+    }
+    if clause.mark.eq_ignore_ascii_case(&clause.path) {
+        return Err(SqlSurfaceError::unsupported(
+            "cycle mark column name and cycle path column name are the same",
+        ));
+    }
+    let mut fields: Vec<Option<ColumnType>> = Vec::new();
+    fields.try_reserve(by_idx.len()).map_err(|_| too_many())?;
+    let mut classes: Vec<super::join::values::CmpClass> = Vec::new();
+    classes.try_reserve(by_idx.len()).map_err(|_| too_many())?;
+    for &i in &by_idx {
+        let unsupported = || unsupported_term("this column type cannot be used as a CYCLE column");
+        let meta = base
+            .get(i)
+            .ok_or_else(|| internal("cycle column out of range"))?;
+        match meta {
+            // 行 id 型の列（セルは `Cell::Integer(u64)`。整数クラスで比べる）。
+            ColumnMeta::Id | ColumnMeta::AliasedId { .. } => {
+                fields.push(None);
+                classes.push(super::join::values::CmpClass::Integer);
+            }
+            ColumnMeta::Scalar { ty, .. } | ColumnMeta::Computed { ty: Some(ty), .. } => {
+                let class = super::join::values::cmp_class(Some(ty)).ok_or_else(unsupported)?;
+                fields.push(Some(ty.clone()));
+                classes.push(class);
+            }
+            ColumnMeta::Computed { ty: None, .. } | ColumnMeta::Record { .. } => {
+                return Err(unsupported());
+            }
+        }
+    }
+    let (mark_to, mark_default, mark_ty) = resolve_cycle_marks(&clause.mark_values)?;
+    let default_is_to = mark_to == mark_default;
+    Ok((
+        CyclePlan {
+            path: SearchPlan {
+                breadth_first: false,
+                by_idx,
+            },
+            classes,
+            mark_to,
+            mark_default,
+            default_is_to,
+        },
+        ColumnMeta::Computed {
+            name: clause.mark.clone(),
+            ty: Some(mark_ty),
+        },
+        ColumnMeta::Record {
+            name: clause.path.clone(),
+            fields,
+            array: true,
+        },
+    ))
+}
+
+impl CyclePlan {
+    /// 印のセル（循環なら `TO` 値、そうでなければ `DEFAULT` 値）。
+    fn mark_cell(&self, hit: bool) -> Cell {
+        if hit {
+            self.mark_to.clone()
+        } else {
+            self.mark_default.clone()
+        }
+    }
+
+    /// 印のセル 1 個ぶんのバイト数の見積もり（確保前の予算計上用）。
+    fn mark_bytes(&self, hit: bool) -> usize {
+        let cell = if hit {
+            &self.mark_to
+        } else {
+            &self.mark_default
+        };
+        std::mem::size_of::<Cell>().saturating_add(cell_payload_bytes(cell))
+    }
+
+    /// 新しい行 `row` の循環判定列の行値が、親の経路 `parent_path`（親自身の行値を含む `record[]`）の
+    /// いずれかの要素と等しいか。等値はレコード等値（PostgreSQL の `record_eq`）で、NULL 同士は一致、
+    /// 片側のみ NULL は不一致（`ROW(1, NULL)` どうしは循環になる）。コストは O(深さ × 列数)。
+    /// セルの形が計画と食い違えば `Internal`（fail-closed）。
+    fn is_cycle(&self, parent_path: &Cell, row: &ResultRow) -> Result<bool, SqlSurfaceError> {
+        use super::join::values::{cmp_val, compare_order};
+        use super::order_value::NullPlacement;
+        let Cell::RecordArray(elements) = parent_path else {
+            return Err(internal("recursive cycle path has an unexpected shape"));
+        };
+        let new = self.path.by_cells(row)?;
+        if new.len() != self.classes.len() {
+            return Err(internal("cycle column count mismatch"));
+        }
+        for element in elements {
+            if element.len() != self.classes.len() {
+                return Err(internal("cycle path element has an unexpected width"));
+            }
+            let mut equal = true;
+            for ((old, now), class) in element.iter().zip(new.iter()).zip(self.classes.iter()) {
+                // レコード等値（`record_eq` 相当）: NULL 同士は一致、片側のみ NULL は不一致。
+                let (a, b) = (cmp_val(old, class)?, cmp_val(now, class)?);
+                let same = match (&a, &b) {
+                    (None, None) => true,
+                    (Some(x), Some(y)) => {
+                        compare_order(Some(x), Some(y), false, NullPlacement::Last)
+                            == std::cmp::Ordering::Equal
+                    }
+                    _ => false,
+                };
+                if !same {
+                    equal = false;
+                    break;
+                }
+            }
+            if equal {
+                return Ok(true);
+            }
+        }
+        Ok(false)
+    }
 }
 
 /// レコードのフィールド列が占めるバイト数の見積もり（確保前の予算計上用。借用セルから算出する）。
@@ -1015,6 +1343,7 @@ fn with_prepared<T>(
     }
     // 順序列は公開列（列名リスト適用後）の末尾へ足す。作業表のスキーマ・再帰項の束縛・列整合には
     // 含めない（再帰項からは見えない）。
+    let base_len = columns.len();
     let search = match &cte.search {
         Some(clause) => {
             let (plan, meta) = plan_search(clause, &columns)?;
@@ -1023,9 +1352,24 @@ fn with_prepared<T>(
         }
         None => None,
     };
+    // 印列・経路列は順序列の後ろ。循環列は元の列（順序列を除く）から引く。
+    let cycle = match &cte.cycle {
+        Some(clause) => {
+            let base = columns
+                .get(..base_len)
+                .ok_or_else(|| internal("cycle base columns out of range"))?;
+            let search_set = cte.search.as_ref().map(|c| c.set.as_str());
+            let (plan, mark, path) = plan_cycle(clause, base, search_set)?;
+            columns.push(mark);
+            columns.push(path);
+            Some(plan)
+        }
+        None => None,
+    };
     f(&Prepared {
         columns,
         search,
+        cycle,
         work_types,
         step,
     })
@@ -1112,6 +1456,25 @@ pub(crate) fn execute(
             }
         }
 
+        // `CYCLE` 句の経路と循環フラグ（`result` と同じ添字で並ぶ。アンカー行は循環ではない）。
+        let cycle = p.cycle.as_ref();
+        let track = search.is_some() || cycle.is_some();
+        let mut paths: Vec<Cell> = Vec::new();
+        let mut hits: Vec<bool> = Vec::new();
+        if let Some(cp) = cycle {
+            paths.try_reserve(result.len()).map_err(|_| {
+                SqlSurfaceError::payload_too_large("recursive query exceeds the row limit")
+            })?;
+            hits.try_reserve(result.len()).map_err(|_| {
+                SqlSurfaceError::payload_too_large("recursive query exceeds the row limit")
+            })?;
+            for row in &result {
+                budget.reserve(cp.mark_bytes(false), Charge::Retained)?;
+                paths.push(cp.path.initial(row, &mut budget)?);
+                hits.push(false);
+            }
+        }
+
         // JOIN の基底表側は反復によらず同じ行を返す（同一 `read_txn`）ため、ループの前に 1 度だけ読む。
         // 読んだ行は共有予算へ計上する（JOIN 自身の上限〔`join_limits`〕を超えない範囲で保持される）。
         // アンカーが 0 行なら作業表は最初から空で再帰項は 1 度も評価されないため、基底表側は読まない
@@ -1152,6 +1515,19 @@ pub(crate) fn execute(
                 .get(start..end)
                 .ok_or_else(|| internal("working table range out of bounds"))?;
             let mut parents: Vec<usize> = Vec::new();
+            // 次の作業表へ渡さない行（印が `TO` 値の行）。`TO` と `DEFAULT` が同じ値の指定では、
+            // 循環でなくても印が `TO` 値と等しいため、PostgreSQL の書き換え（`WHERE 印 <> TO`）と同じく
+            // どの行も再帰しない。
+            let skip: Option<Vec<bool>> = match cycle {
+                Some(cp) => Some(
+                    hits.get(start..end)
+                        .ok_or_else(|| internal("working table range out of bounds"))?
+                        .iter()
+                        .map(|h| *h || cp.default_is_to)
+                        .collect(),
+                ),
+                None => None,
+            };
             let new_rows = match &p.step {
                 Step::Scan(term) => {
                     // 重複除去版は候補行を `Scratch` で作り、未出の行だけを結果へ移す。
@@ -1165,8 +1541,9 @@ pub(crate) fn execute(
                         working,
                         &mut budget,
                         charge,
-                        search.map(|_| &mut parents),
+                        track.then_some(&mut parents),
                         dedup.as_mut(),
+                        skip.as_deref(),
                     )?;
                     budget.clear_scratch();
                     rows
@@ -1184,8 +1561,9 @@ pub(crate) fn execute(
                         working,
                         &mut budget,
                         Charge::Scratch,
-                        search.map(|_| &mut side_parents),
+                        track.then_some(&mut side_parents),
                         None,
+                        skip.as_deref(),
                     )?;
                     let slot = sides
                         .get_mut(*cte_side)
@@ -1203,13 +1581,13 @@ pub(crate) fn execute(
                     let (joined, side_idx) = prepared.run_with_sides_provenance(
                         &sides,
                         &step_limits,
-                        search.map(|_| *cte_side),
+                        track.then_some(*cte_side),
                     )?;
                     if let Some(slot) = sides.get_mut(*cte_side) {
                         slot.clear();
                     }
                     // JOIN 出力行 → 作業表側の行 → 作業表の行、の 2 段で親を引く。
-                    if search.is_some() {
+                    if track {
                         parents = side_idx
                             .iter()
                             .map(|&k| side_parents.get(k).copied())
@@ -1252,10 +1630,30 @@ pub(crate) fn execute(
             result.try_reserve(new_rows.len()).map_err(|_| {
                 SqlSurfaceError::payload_too_large("recursive query exceeds the row limit")
             })?;
-            if let Some(sp) = search {
-                if parents.len() != new_rows.len() {
-                    return Err(internal("recursive parent mapping length mismatch"));
+            if track && parents.len() != new_rows.len() {
+                return Err(internal("recursive parent mapping length mismatch"));
+            }
+            if let Some(cp) = cycle {
+                paths.try_reserve(new_rows.len()).map_err(|_| {
+                    SqlSurfaceError::payload_too_large("recursive query exceeds the row limit")
+                })?;
+                hits.try_reserve(new_rows.len()).map_err(|_| {
+                    SqlSurfaceError::payload_too_large("recursive query exceeds the row limit")
+                })?;
+                for (row, parent) in new_rows.iter().zip(parents.iter()) {
+                    // `parent` は作業表（`start..end`）内の位置。経路・循環フラグは `result` と同じ添字。
+                    let parent_path = start
+                        .checked_add(*parent)
+                        .and_then(|i| paths.get(i))
+                        .ok_or_else(|| internal("recursive parent path out of range"))?;
+                    let hit = cp.is_cycle(parent_path, row)?;
+                    budget.reserve(cp.mark_bytes(hit), Charge::Retained)?;
+                    let path = cp.path.child(parent_path, row, &mut budget)?;
+                    paths.push(path);
+                    hits.push(hit);
                 }
+            }
+            if let Some(sp) = search {
                 seqs.try_reserve(new_rows.len()).map_err(|_| {
                     SqlSurfaceError::payload_too_large("recursive query exceeds the row limit")
                 })?;
@@ -1273,16 +1671,42 @@ pub(crate) fn execute(
             result.extend(new_rows);
             end = result.len();
         }
-        if search.is_some() {
-            if seqs.len() != result.len() {
+        if track {
+            if search.is_some() && seqs.len() != result.len() {
                 return Err(internal("recursive sequence column length mismatch"));
             }
-            for (row, seq) in result.iter_mut().zip(seqs) {
-                // 倍々の再確保で行のセル配列が 2 倍に膨らまないよう、1 個ぶんだけ確保する。
-                row.cells.try_reserve_exact(1).map_err(|_| {
+            if cycle.is_some() && (paths.len() != result.len() || hits.len() != result.len()) {
+                return Err(internal("recursive cycle column length mismatch"));
+            }
+            // 結果列の末尾へ、順序列 → 印 → 経路の順に足す（公開列の並びと一致させる）。
+            let extra =
+                usize::from(search.is_some()).saturating_add(if cycle.is_some() { 2 } else { 0 });
+            let mut seq_it = seqs.into_iter();
+            let mut path_it = paths.into_iter();
+            let mut hit_it = hits.into_iter();
+            for row in result.iter_mut() {
+                // 倍々の再確保で行のセル配列が膨らまないよう、足す個数ぶんだけ確保する。
+                row.cells.try_reserve_exact(extra).map_err(|_| {
                     SqlSurfaceError::payload_too_large("recursive query exceeds the row limit")
                 })?;
-                row.cells.push(seq);
+                if search.is_some() {
+                    row.cells.push(
+                        seq_it
+                            .next()
+                            .ok_or_else(|| internal("recursive sequence column length mismatch"))?,
+                    );
+                }
+                if let Some(cp) = cycle {
+                    let hit = hit_it
+                        .next()
+                        .ok_or_else(|| internal("recursive cycle column length mismatch"))?;
+                    row.cells.push(cp.mark_cell(hit));
+                    row.cells.push(
+                        path_it
+                            .next()
+                            .ok_or_else(|| internal("recursive cycle column length mismatch"))?,
+                    );
+                }
             }
         }
         Ok(QueryResult {
@@ -1701,5 +2125,192 @@ mod tests {
             b,
             Cell::Record(vec![Cell::SignedInteger(1), Cell::SignedInteger(8)])
         );
+    }
+
+    fn cycle_clause(
+        columns: &[&str],
+        mark: &str,
+        path: &str,
+        values: Option<(CycleConst, CycleConst)>,
+    ) -> CycleClause {
+        CycleClause {
+            columns: columns.iter().map(|s| (*s).to_string()).collect(),
+            mark: mark.to_string(),
+            mark_values: values,
+            path: path.to_string(),
+        }
+    }
+
+    /// `CYCLE` の計画（SQL-35・Issue #2214）: 名前解決・型解決のエラー（PostgreSQL 17 の SQLSTATE）。
+    #[test]
+    fn plan_cycle_name_and_type_errors() {
+        let cols = search_columns();
+        let code = |c: &CycleClause, search_set: Option<&str>| {
+            plan_cycle(c, &cols, search_set).err().unwrap().wire_code()
+        };
+        assert_eq!(code(&cycle_clause(&["x"], "c", "p", None), None), "42601");
+        assert_eq!(
+            code(&cycle_clause(&["n", "N"], "c", "p", None), None),
+            "42701"
+        );
+        assert_eq!(code(&cycle_clause(&["n"], "N", "p", None), None), "42601");
+        assert_eq!(code(&cycle_clause(&["n"], "c", "n", None), None), "42601");
+        assert_eq!(code(&cycle_clause(&["n"], "c", "C", None), None), "42601");
+        assert_eq!(
+            code(&cycle_clause(&["n"], "o", "p", None), Some("o")),
+            "42601"
+        );
+        let mixed = |to, default| code(&cycle_clause(&["n"], "c", "p", Some((to, default))), None);
+        assert_eq!(
+            mixed(CycleConst::Bool(true), CycleConst::Integer("1".into())),
+            "42804"
+        );
+        assert_eq!(
+            mixed(
+                CycleConst::Integer("1".into()),
+                CycleConst::Text("x".into())
+            ),
+            "22P02"
+        );
+        assert_eq!(mixed(CycleConst::Null, CycleConst::Bool(false)), "0A000");
+        assert_eq!(
+            mixed(
+                CycleConst::Decimal("1.5".into()),
+                CycleConst::Integer("0".into())
+            ),
+            "0A000"
+        );
+        // 比較できない型（JSON）の循環列は計画時に `0A000`。
+        let json = vec![ColumnMeta::Scalar {
+            name: "j".to_string(),
+            ty: ColumnType::Json,
+        }];
+        assert_eq!(
+            plan_cycle(&cycle_clause(&["j"], "c", "p", None), &json, None)
+                .err()
+                .unwrap()
+                .wire_code(),
+            "0A000"
+        );
+        let (plan, mark, path) =
+            plan_cycle(&cycle_clause(&["n"], "c", "p", None), &cols, None).unwrap();
+        assert_eq!(plan.path.by_idx, vec![0]);
+        assert!(!plan.default_is_to);
+        assert_eq!(plan.mark_to, Cell::Bool(true));
+        assert!(matches!(
+            mark,
+            ColumnMeta::Computed {
+                ty: Some(ColumnType::Boolean),
+                ..
+            }
+        ));
+        assert!(matches!(path, ColumnMeta::Record { array: true, .. }));
+    }
+
+    /// `TO`／`DEFAULT` の共通型: 整数は `i32` に収まらなければ bigint、文字列は整数リテラルの型へ範囲検証付きで変換。
+    #[test]
+    fn resolve_cycle_marks_common_type() {
+        let int = |s: &str| CycleConst::Integer(s.to_string());
+        let (_, _, ty) = resolve_cycle_marks(&Some((int("1"), int("0")))).unwrap();
+        assert_eq!(ty, ColumnType::Integer);
+        let (to, _, ty) = resolve_cycle_marks(&Some((int("2147483648"), int("0")))).unwrap();
+        assert_eq!(
+            (to, ty),
+            (Cell::SignedInteger(2_147_483_648), ColumnType::BigInt)
+        );
+        let (to, default, ty) =
+            resolve_cycle_marks(&Some((CycleConst::Text(" 7 ".into()), int("5")))).unwrap();
+        assert_eq!(
+            (to, default, ty),
+            (
+                Cell::SignedInteger(7),
+                Cell::SignedInteger(5),
+                ColumnType::Integer
+            )
+        );
+        // 文字列定数は整数リテラルの型（integer）へ範囲検証付きで変換する（範囲外は `22003`）。
+        assert_eq!(
+            resolve_cycle_marks(&Some((int("1"), CycleConst::Text("2147483648".into()))))
+                .unwrap_err()
+                .wire_code(),
+            "22003"
+        );
+        // 整数リテラルが bigint なら文字列も bigint として受理する。
+        let (_, d, ty) = resolve_cycle_marks(&Some((
+            int("2147483648"),
+            CycleConst::Text("2147483649".into()),
+        )))
+        .unwrap();
+        assert_eq!(
+            (d, ty),
+            (Cell::SignedInteger(2_147_483_649), ColumnType::BigInt)
+        );
+        // `i64` を超える整数リテラルは未対応（`0A000`）。
+        assert_eq!(
+            resolve_cycle_marks(&Some((int("9223372036854775808"), int("0"))))
+                .unwrap_err()
+                .wire_code(),
+            "0A000"
+        );
+    }
+
+    /// 循環判定はレコード等値: 親の経路のどれかと全フィールドが等しければ循環（NULL 同士は一致、片側のみ NULL は不一致）。
+    #[test]
+    fn is_cycle_uses_equality_semantics() {
+        let (plan, _, _) = plan_cycle(
+            &cycle_clause(&["n"], "c", "p", None),
+            &search_columns(),
+            None,
+        )
+        .unwrap();
+        let mut budget = RowBudget::new(limits(usize::MAX));
+        let mut path = plan.path.initial(&search_row(1), &mut budget).unwrap();
+        path = plan.path.child(&path, &search_row(2), &mut budget).unwrap();
+        assert!(plan.is_cycle(&path, &search_row(1)).unwrap());
+        assert!(plan.is_cycle(&path, &search_row(2)).unwrap());
+        assert!(!plan.is_cycle(&path, &search_row(3)).unwrap());
+        let null_row = ResultRow {
+            id: 0,
+            score: 0.0,
+            cells: vec![Cell::Null],
+        };
+        let null_path = Cell::RecordArray(vec![vec![Cell::Null]]);
+        assert!(plan.is_cycle(&null_path, &null_row).unwrap());
+        let value_path = Cell::RecordArray(vec![vec![Cell::SignedInteger(1)]]);
+        assert!(!plan.is_cycle(&value_path, &null_row).unwrap());
+        assert!(!plan.is_cycle(&null_path, &search_row(1)).unwrap());
+        // 経路の形が想定外なら `Internal`（fail-closed）。
+        assert!(plan.is_cycle(&Cell::Null, &search_row(1)).is_err());
+    }
+
+    /// 経路の伸長は複製の前に共有予算へ計上され、狭い予算では `54000`。
+    #[test]
+    fn cycle_path_growth_is_charged_before_cloning() {
+        let (plan, _, _) = plan_cycle(
+            &cycle_clause(&["n"], "c", "p", None),
+            &search_columns(),
+            None,
+        )
+        .unwrap();
+        let mut wide = RowBudget::new(limits(usize::MAX));
+        let mut path = plan.path.initial(&search_row(1), &mut wide).unwrap();
+        for n in 2..=5 {
+            path = plan.path.child(&path, &search_row(n), &mut wide).unwrap();
+        }
+        let mut tight = RowBudget::new(limits(wide.retained / 4));
+        let first = plan.path.initial(&search_row(1), &mut tight);
+        let err = match first {
+            Err(e) => e,
+            Ok(p) => plan
+                .path
+                .child(&p, &search_row(2), &mut tight)
+                .and_then(|p2| {
+                    plan.path
+                        .child(&p2, &search_row(3), &mut tight)
+                        .and_then(|p3| plan.path.child(&p3, &search_row(4), &mut tight))
+                })
+                .unwrap_err(),
+        };
+        assert_eq!(err.wire_code(), "54000");
     }
 }
