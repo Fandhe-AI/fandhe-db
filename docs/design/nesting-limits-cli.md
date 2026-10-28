@@ -26,7 +26,7 @@
 | D1 | ハード上限は現行定数のまま（既定値と同値）。設定できるのは下げる方向だけで、範囲は深さ `1..=4`・実行回数 `1..=16`・CTE 定義数 `1..=16`・CTE 連鎖深さ `1..=4`。フラグ未指定の挙動は不変。引き上げは対象外 |
 | D2 | 値の運搬は `group_by_limits` と同型。`engine::nesting_limits::NestingLimits`（`Copy`・フィールド非公開・ハード上限で飽和）を `EngineCore::with_nesting_limits` で起動時に 1 回注入する。グローバル状態は使わない（並列テストの干渉を避ける）。範囲検証は engine の `validate_*` に一本化し、wire-server は CLI 文字列を厳密パースして渡すだけ |
 | D3 | `GROUP BY` 上限（実行段だけで判定）とは異なり、**構文解析段でも設定値で判定する**。CTE はパース時に `ValidatedScan` へ展開され、サブクエリ深さも `Parser::require_subquery_depth` が判定するため、実行段に判定できる場所がない。そのため拡張プロトコルでも Parse の段で `54000` になる |
-| D4 | ハード定数のまま残す構造ガード: スカラーサブクエリ項目数の構文段上限、`qualified_column` のスコープ深さガード、`MAX_CTE_REFERENCES`（`MAX_CTE_NESTING_DEPTH + 1` から導いた値）。設定値による判定はこれらとは別に追加し、設定値は常にハード上限以下 |
+| D4 | ハード定数のまま残す構造ガード: スカラーサブクエリ項目数の構文段上限、`qualified_column` のスコープ深さガード、`MAX_CTE_REFERENCES`（`MAX_CTE_NESTING_DEPTH + 1` から導いた値）、式の中のスカラーサブクエリ件数の構文段上限（`parse_embedded_scalar_subquery`・`check_embedded_scalar_shape`）、派生テーブル有無の fail-closed 検出（`derived_table::contains_derived_table`）。これらは構文段の構造ガードで、設定値は実行段の共有予算で効く。設定値による判定はこれらとは別に追加し、設定値は常にハード上限以下 |
 | D5 | 設定値が効く経路: セッション SQL（simple／extended の Parse・`execute_sql`・`DECLARE CURSOR ... FOR <query>` の内側）のパース、およびサブクエリ解決（実行回数予算・内側の再検証）。評価後射影形ビューの本文実行を通る 2 段目以降のサブクエリにも効く |
 | D6 | **格納済みビュー本文の再パースはハード上限のまま**（`CREATE VIEW` の構造検証・参照時の再検証）。上限を下げて再起動しても既存ビューの定義検証は壊れない（schema-limits の「カタログ decode には適用しない」と同じ考え方）。したがってビュー本文の中の CTE 定義数・CTE 連鎖深さには設定値が効かない。ハード上限は効くので資源上限は維持される |
 | D7 | フラグ名は `--max-subquery-depth <1-4>`・`--max-subquery-executions <1-16>`・`--max-cte-definitions <1-16>`・`--max-cte-nesting-depth <1-4>`。2 回目以降の指定は fail-closed（last-wins にしない） |
@@ -38,6 +38,7 @@
 | ---- | -------- |
 | サブクエリ深さ | `Parser::require_subquery_depth`（構文解析段）。内側の再検証でも `validate_sql_tokens_with_subquery_ctx_limits` が同じ設定値で判定 |
 | 実行回数 | `EngineCore` が予算を設定値で初期化し、`sql::subquery` の `execute_inner_query_with_meta` が消費（WHERE の `IN`／`EXISTS`／スカラー比較と投影位置のスカラーサブクエリ） |
+| 実行回数（相関・派生経路。Issue #1850） | 相関 `EXISTS`／`IN`・集計形／非集計形の相関スカラー・式の中の相関スカラーは同じ予算を共有して消費する。派生テーブルの入れ子深さは `derived_table` の `gate`／`build_statement` が `NestingLimits` で判定する（本文内のサブクエリは現状 fail-closed で拒否され、設定値を迂回しない）。テスト: `crates/engine/tests/nesting_limits.rs` |
 | CTE 定義数 | `Parser::parse_with_clause` → `cte::check_definition_count` |
 | CTE 連鎖深さ | `cte::resolve_relation`（`WITH` 分岐が設定値を渡す） |
 
