@@ -145,12 +145,31 @@ fn check_finite(iv: Interval) -> Result<Interval, SqlSurfaceError> {
 /// `TIMESTAMP + INTERVAL`（PG の `timestamp_pl_interval`）。減算は呼び出し側が
 /// [`negate_interval`] した値を渡す。
 pub(crate) fn timestamp_add_interval(ts: i64, iv: &Interval) -> Result<i64, SqlSurfaceError> {
+    let out = timestamp_shift_wide(ts, iv)?;
+    let out = i64::try_from(out).map_err(|_| timestamp_out_of_range())?;
+    if validate_timestamp_micros(out) {
+        Ok(out)
+    } else {
+        Err(timestamp_out_of_range())
+    }
+}
+
+/// PostgreSQL の timestamp が表現できる範囲（4714 BC-11-24 以上〜294277-01-01 未満）内か。
+fn within_pg_timestamp_range(v: i128) -> bool {
+    let day = i128::from(MICROS_PER_DAY);
+    v >= pg_min_days() * day && v < (pg_max_days() + 1) * day
+}
+
+/// `TIMESTAMP + INTERVAL` を最終結果の 0001〜9999 年検査なしで返す（`sql::window` の `RANGE`
+/// フレームのオフセット境界専用。Issue #1890）。PostgreSQL の timestamp 範囲は 9999 年より広く、
+/// 境界値が 9999 年を超えても比較はできるため、PG の範囲外だけを `22008` にする。減算は呼び出し側が
+/// [`negate_interval`] した値を渡す。
+pub(crate) fn timestamp_shift_wide(ts: i64, iv: &Interval) -> Result<i128, SqlSurfaceError> {
     let shifted = shift_local(i128::from(ts), iv)?;
     let out = shifted
         .checked_add(i128::from(iv.micros))
         .ok_or_else(timestamp_out_of_range)?;
-    let out = i64::try_from(out).map_err(|_| timestamp_out_of_range())?;
-    if validate_timestamp_micros(out) {
+    if within_pg_timestamp_range(out) {
         Ok(out)
     } else {
         Err(timestamp_out_of_range())
@@ -166,6 +185,22 @@ pub(crate) fn timestamptz_add_interval(
     iv: &Interval,
     tz: &SessionTimeZone,
 ) -> Result<i64, SqlSurfaceError> {
+    let out = timestamptz_shift_wide(utc, iv, tz)?;
+    let out = i64::try_from(out).map_err(|_| timestamp_out_of_range())?;
+    if validate_timestamptz_micros(out) {
+        Ok(out)
+    } else {
+        Err(timestamp_out_of_range())
+    }
+}
+
+/// [`timestamptz_add_interval`] の最終結果の範囲検査（0001〜9999 年）なし版（`RANGE` フレーム専用。
+/// Issue #1890。[`timestamp_shift_wide`] と同じ理由）。PG の timestamp 範囲外だけを `22008` にする。
+pub(crate) fn timestamptz_shift_wide(
+    utc: i64,
+    iv: &Interval,
+    tz: &SessionTimeZone,
+) -> Result<i128, SqlSurfaceError> {
     // PG の `timestamptz_pl_interval` と同じく、月と日はそれぞれ別の「壁時計 -> UTC」往復で
     // 加算する（月の結果が DST の gap に入ると UTC への変換で正規化され、日の加算は
     // 正規化後の時点の offset から始まる）。
@@ -194,9 +229,8 @@ pub(crate) fn timestamptz_add_interval(
     }
     let out = cur
         .checked_add(i128::from(iv.micros))
-        .and_then(|v| i64::try_from(v).ok())
         .ok_or_else(timestamp_out_of_range)?;
-    if validate_timestamptz_micros(out) {
+    if within_pg_timestamp_range(out) {
         Ok(out)
     } else {
         Err(timestamp_out_of_range())

@@ -59,8 +59,14 @@
 //! オフセットの NULL／負を検査する。位置範囲の計算（[`rows_frame_bounds`]）はモード非依存の
 //! 形で、first_value 等（#1883）や RANGE／GROUPS（#1890／#1891）が再利用する。
 //!
+//! `RANGE` フレーム（SQL-64 (2)・Issue #1890）は、同じく [`resolve_frames`] が型付きのオフセット
+//! （[`RangeOffset`]。束縛段が `ORDER BY` キー型との照合と強制変換を済ませている）を解決し、
+//! 集計だけが [`evaluate_range_frame_partition`] で評価する。境界位置は [`range_frame_bounds`] が
+//! peer グループと、非 NULL 区間上の二分探索（PostgreSQL の `in_range` 判定の移植）で求める。
+//! 負・NaN のオフセット（`22013`）は PostgreSQL と同じく非 NULL キーの行で境界を求める時点まで遅延する。
+//!
 //! 対象外（`42601`／`54000`／`0A000` で fail-closed に拒否。allowlist・parser 側で既に拒否
-//! 済みの形も含む）: フレーム句の `RANGE`/`GROUPS`（`ROWS` は対応済み）・
+//! 済みの形も含む）: フレーム句の `GROUPS`（`ROWS`・`RANGE` は対応済み）・
 //! 名前付きウィンドウ・`FILTER (...)`・関数内 `DISTINCT`・複合式の引数・
 //! ベクトル順位付け（`ORDER BY embedding <=> ...`）／`USING PLAN` との併用・
 //! ウィンドウ別名による文全体の `ORDER BY`・`GROUP BY`／集計 SELECT との併用。
@@ -79,7 +85,8 @@ use crate::sql::order_value::{
 };
 use crate::sql::parser::{
     AggregateInput, BoundFrameBound, BoundFrameOffset, BoundScan, BoundWindowItem,
-    BoundWindowOffsetArgs, BoundWindowValue, ProjectedColumn, WindowKeyKind, WindowKeyRef,
+    BoundWindowOffsetArgs, BoundWindowValue, ProjectedColumn, RangeOffsetKind, WindowKeyKind,
+    WindowKeyRef,
 };
 use crate::sql::scan::{computed_value_to_cell, push_scalar_column_cell};
 use crate::sql::udf_call::{self, ExprValue};
@@ -553,56 +560,229 @@ fn check_frame_bound(
     })
 }
 
+/// 解決済みの `RANGE` オフセット 1 つ（Issue #1890。種別は `ORDER BY` キー型で決まり、束縛段が
+/// 型照合と強制変換を済ませている）。
+#[derive(Debug, Clone, Copy)]
+enum RangeOffset {
+    /// 整数キー（`id` を含む）の整数オフセット。
+    Int(i64),
+    /// `REAL`／`DOUBLE PRECISION` キーの浮動小数点オフセット。
+    Float(f64),
+    /// `NUMERIC` キーの正確な小数オフセット。
+    Numeric(crate::numeric::Decimal),
+    /// 日付・日時キーの `INTERVAL` オフセット。
+    Interval(crate::datetime::Interval),
+}
+
+/// 解決済みの `RANGE` フレーム境界（オフセットは評価済み・NULL 検査済み。負・NaN の検査は
+/// 遅延する。[`range_frame_bounds`] 参照）。
+#[derive(Debug, Clone, Copy)]
+enum ResolvedRangeBound {
+    UnboundedPreceding,
+    Preceding(RangeOffset),
+    CurrentRow,
+    Following(RangeOffset),
+    UnboundedFollowing,
+}
+
+/// 解決済みの `RANGE` フレーム（[`resolve_frames`] が作る）。
+#[derive(Debug, Clone, Copy)]
+struct ResolvedRangeFrame {
+    start: ResolvedRangeBound,
+    end: ResolvedRangeBound,
+    exclusion: WindowFrameExclusion,
+}
+
+impl ResolvedRangeFrame {
+    fn offsets(&self) -> impl Iterator<Item = &RangeOffset> {
+        [&self.start, &self.end]
+            .into_iter()
+            .filter_map(|b| match b {
+                ResolvedRangeBound::Preceding(o) | ResolvedRangeBound::Following(o) => Some(o),
+                _ => None,
+            })
+    }
+}
+
+/// 項目ごとの解決済みフレーム（`ROWS`／`RANGE`）。
+#[derive(Debug, Clone, Copy)]
+enum ResolvedFrame {
+    Rows(ResolvedRowsFrame),
+    Range(ResolvedRangeFrame),
+}
+
+/// 評価済み（未検査）の `RANGE` 境界。オフセットの `None` は NULL。
+#[derive(Debug, Clone, Copy)]
+enum EvaluatedRangeBound {
+    UnboundedPreceding,
+    Preceding(Option<RangeOffset>),
+    CurrentRow,
+    Following(Option<RangeOffset>),
+    UnboundedFollowing,
+}
+
+/// 評価済みの 1 項目分のフレーム（検査前）。
+enum EvaluatedFrame {
+    Rows(EvaluatedBound, EvaluatedBound, WindowFrameExclusion),
+    Range(
+        EvaluatedRangeBound,
+        EvaluatedRangeBound,
+        WindowFrameExclusion,
+    ),
+}
+
+/// `NUMERIC` を `f64` へ（浮動小数点キーの `RANGE` オフセットが `NUMERIC` 値のとき）。
+fn decimal_to_f64(d: &crate::numeric::Decimal) -> f64 {
+    d.unscaled() as f64 / 10f64.powi(i32::from(d.scale()))
+}
+
+/// `RANGE` オフセットの評価値を種別 `kind` の [`RangeOffset`]（`None` は NULL）へ変換する。
+/// 束縛段が型を照合済みのため、想定外の組は不変条件違反（`XX000`）。
+fn range_offset_from_expr_value(
+    kind: RangeOffsetKind,
+    value: ExprValue<'_>,
+) -> Result<Option<RangeOffset>, SqlSurfaceError> {
+    match (kind, value) {
+        (_, ExprValue::Null) => Ok(None),
+        (RangeOffsetKind::Int, v) => Ok(frame_offset_from_expr_value(v)?.map(RangeOffset::Int)),
+        (RangeOffsetKind::Float, ExprValue::Scalar(f)) => Ok(Some(RangeOffset::Float(f))),
+        (RangeOffsetKind::Float, ExprValue::Numeric(d)) => {
+            Ok(Some(RangeOffset::Float(decimal_to_f64(&d))))
+        }
+        (RangeOffsetKind::Numeric, ExprValue::Numeric(d)) => Ok(Some(RangeOffset::Numeric(d))),
+        (RangeOffsetKind::Interval, ExprValue::Interval(iv)) => Ok(Some(RangeOffset::Interval(iv))),
+        _ => Err(window_bug(
+            "RANGE frame offset evaluated to an unexpected value type",
+        )),
+    }
+}
+
+fn evaluate_range_bound(
+    bound: &BoundFrameBound,
+    kind: Option<RangeOffsetKind>,
+    scratch: &mut Vec<StackValue>,
+) -> Result<EvaluatedRangeBound, SqlSurfaceError> {
+    let mut offset = |o: &BoundFrameOffset| -> Result<Option<RangeOffset>, SqlSurfaceError> {
+        match o {
+            BoundFrameOffset::Null => Ok(None),
+            BoundFrameOffset::Expr(e) => {
+                let kind =
+                    kind.ok_or_else(|| window_bug("RANGE frame offset without an offset kind"))?;
+                range_offset_from_expr_value(
+                    kind,
+                    ExprProgram::compile(e).eval(0, &[], &[], scratch)?,
+                )
+            }
+        }
+    };
+    Ok(match bound {
+        BoundFrameBound::UnboundedPreceding => EvaluatedRangeBound::UnboundedPreceding,
+        BoundFrameBound::Preceding(o) => EvaluatedRangeBound::Preceding(offset(o)?),
+        BoundFrameBound::CurrentRow => EvaluatedRangeBound::CurrentRow,
+        BoundFrameBound::Following(o) => EvaluatedRangeBound::Following(offset(o)?),
+        BoundFrameBound::UnboundedFollowing => EvaluatedRangeBound::UnboundedFollowing,
+    })
+}
+
+/// `RANGE` オフセットの NULL（`22004`）を検査して [`ResolvedRangeBound`] にする。負・NaN
+/// （`22013`）は PostgreSQL の in_range 関数内の検査に合わせ、ここでは行わない。
+fn check_range_bound(
+    bound: EvaluatedRangeBound,
+    is_start: bool,
+) -> Result<ResolvedRangeBound, SqlSurfaceError> {
+    let present = |v: Option<RangeOffset>| -> Result<RangeOffset, SqlSurfaceError> {
+        v.ok_or(SqlSurfaceError::NullValueNotAllowed {
+            detail: if is_start {
+                "frame starting offset must not be null"
+            } else {
+                "frame ending offset must not be null"
+            },
+        })
+    };
+    Ok(match bound {
+        EvaluatedRangeBound::UnboundedPreceding => ResolvedRangeBound::UnboundedPreceding,
+        EvaluatedRangeBound::Preceding(v) => ResolvedRangeBound::Preceding(present(v)?),
+        EvaluatedRangeBound::CurrentRow => ResolvedRangeBound::CurrentRow,
+        EvaluatedRangeBound::Following(v) => ResolvedRangeBound::Following(present(v)?),
+        EvaluatedRangeBound::UnboundedFollowing => ResolvedRangeBound::UnboundedFollowing,
+    })
+}
+
 /// 項目ごとのフレームを実行開始時に解決する（`execute_window_scan_with_caps` と
 /// [`CellWindowEvaluator::new`] が行を引く前に 1 回呼ぶ。PostgreSQL がプラン時・WindowAgg 開始時に
 /// オフセットを評価するのと同じ位置で、0 行・`WHERE` 不一致でもエラーを返す）。
-/// 評価エラー（`22012`・`22003` 等）は関数種別を問わず返す。NULL／負の検査は集計と
+/// 評価エラー（`22012`・`22003` 等）は関数種別を問わず返す。NULL／`ROWS` の負の検査は集計と
 /// `LAG`／`LEAD` だけが行う（順位関数は PostgreSQL 16 以降フレームを最適化で置き換えるため
-/// 検査しない）。戻り値を保持するのは集計だけで、`LAG`／`LEAD`・順位関数は `None`
-/// （フレームを無視する）。
+/// 検査しない）。`RANGE` の負・NaN は検査を遅延する（集計と、オフセット付きの `LAG`／`LEAD` が
+/// 境界計算時に行う）。戻り値を保持するのは集計（と `RANGE` オフセット付きの `LAG`／`LEAD`）で、
+/// 順位関数・`ROWS` の `LAG`／`LEAD` は `None`（フレームを無視する）。
 fn resolve_frames(
     items: &[BoundWindowItem],
-) -> Result<Vec<Option<ResolvedRowsFrame>>, SqlSurfaceError> {
+) -> Result<Vec<Option<ResolvedFrame>>, SqlSurfaceError> {
     let mut scratch: Vec<StackValue> = Vec::new();
-    let mut evaluated: Vec<Option<(EvaluatedBound, EvaluatedBound, WindowFrameExclusion)>> =
-        Vec::with_capacity(items.len());
+    let mut evaluated: Vec<Option<EvaluatedFrame>> = Vec::with_capacity(items.len());
     for item in items {
         evaluated.push(match &item.frame {
             None => None,
-            Some(frame) => {
-                if frame.mode != WindowFrameMode::Rows {
-                    return Err(window_bug("non-ROWS window frame reached evaluation"));
-                }
-                Some((
+            Some(frame) => match frame.mode {
+                WindowFrameMode::Rows => Some(EvaluatedFrame::Rows(
                     evaluate_frame_bound(&frame.start, &mut scratch)?,
                     evaluate_frame_bound(&frame.end, &mut scratch)?,
                     frame.exclusion,
-                ))
-            }
+                )),
+                WindowFrameMode::Range => Some(EvaluatedFrame::Range(
+                    evaluate_range_bound(&frame.start, frame.range_offset, &mut scratch)?,
+                    evaluate_range_bound(&frame.end, frame.range_offset, &mut scratch)?,
+                    frame.exclusion,
+                )),
+                WindowFrameMode::Groups => {
+                    return Err(window_bug("GROUPS window frame reached evaluation"));
+                }
+            },
         });
     }
     let mut out = Vec::with_capacity(items.len());
     for (item, ev) in items.iter().zip(evaluated) {
-        let Some((start, end, exclusion)) = ev else {
+        let Some(ev) = ev else {
             out.push(None);
             continue;
         };
-        match item.func {
-            WindowFunc::RowNumber | WindowFunc::Rank | WindowFunc::DenseRank => out.push(None),
-            WindowFunc::Lag | WindowFunc::Lead => {
-                check_frame_bound(start, true)?;
-                check_frame_bound(end, false)?;
-                out.push(None);
+        if matches!(
+            item.func,
+            WindowFunc::RowNumber | WindowFunc::Rank | WindowFunc::DenseRank
+        ) {
+            out.push(None);
+            continue;
+        }
+        let is_offset_fn = matches!(item.func, WindowFunc::Lag | WindowFunc::Lead);
+        match ev {
+            EvaluatedFrame::Rows(start, end, exclusion) => {
+                let start = check_frame_bound(start, true)?;
+                let end = check_frame_bound(end, false)?;
+                out.push(if is_offset_fn {
+                    None
+                } else {
+                    Some(ResolvedFrame::Rows(ResolvedRowsFrame {
+                        start,
+                        end,
+                        exclusion,
+                    }))
+                });
             }
-            WindowFunc::Count
-            | WindowFunc::Sum
-            | WindowFunc::Avg
-            | WindowFunc::Min
-            | WindowFunc::Max => out.push(Some(ResolvedRowsFrame {
-                start: check_frame_bound(start, true)?,
-                end: check_frame_bound(end, false)?,
-                exclusion,
-            })),
+            EvaluatedFrame::Range(start, end, exclusion) => {
+                let frame = ResolvedRangeFrame {
+                    start: check_range_bound(start, true)?,
+                    end: check_range_bound(end, false)?,
+                    exclusion,
+                };
+                // `LAG`／`LEAD` はフレームを使わないが、オフセットの負・NaN の検査（遅延）のために
+                // オフセット付きのときだけ保持する。
+                out.push(if is_offset_fn && frame.offsets().next().is_none() {
+                    None
+                } else {
+                    Some(ResolvedFrame::Range(frame))
+                });
+            }
         }
     }
     Ok(out)
@@ -1182,8 +1362,8 @@ pub(crate) struct CellWindowEvaluator<'a> {
     state_bytes: usize,
     partition_counts: Vec<HashMap<Vec<u8>, usize>>,
     offset_eval: OffsetEvaluator,
-    /// 実行開始時に解決した `ROWS` フレーム（項目ごと。[`resolve_frames`]）。
-    frames: Vec<Option<ResolvedRowsFrame>>,
+    /// 実行開始時に解決した `ROWS`／`RANGE` フレーム（項目ごと。[`resolve_frames`]）。
+    frames: Vec<Option<ResolvedFrame>>,
 }
 
 impl<'a> CellWindowEvaluator<'a> {
@@ -1827,7 +2007,7 @@ fn evaluate_window_item(
     item: &BoundWindowItem,
     item_index: usize,
     materialized: &[MaterializedRow],
-    frame: Option<&ResolvedRowsFrame>,
+    frame: Option<&ResolvedFrame>,
     state_bytes: &mut usize,
     state_cap: usize,
 ) -> Result<Vec<Cell>, SqlSurfaceError> {
@@ -1939,7 +2119,7 @@ fn evaluate_offset_partition(
 /// `evaluate_window_item` から呼ばれる。
 fn evaluate_partition(
     part: &SortedPartition<'_>,
-    frame: Option<&ResolvedRowsFrame>,
+    frame: Option<&ResolvedFrame>,
     out: &mut [Option<Cell>],
     state_bytes: &mut usize,
     state_cap: usize,
@@ -1949,12 +2129,23 @@ fn evaluate_partition(
 
     // `LAG`／`LEAD` は peer・フレームに依存しないため、peer 分割へ入れず専用の評価へ委譲する。
     if item.func.is_value_offset() {
+        // `RANGE` のオフセットの負・NaN は、非 NULL キーの行を持つパーティションで初めて
+        // エラーになる（PostgreSQL の in_range 関数内の検査。NULL キーだけ・0 行では出ない）。
+        if let Some(ResolvedFrame::Range(range)) = frame {
+            check_range_offsets_for_partition(part, range)?;
+        }
         return evaluate_offset_partition(part, out, state_bytes, state_cap);
     }
-    // 解決済みの `ROWS` フレームを持つのは集計だけ。フレームなし（既定の peer 意味論）の経路は
+    // 解決済みのフレームを持つのは集計だけ。フレームなし（既定の peer 意味論）の経路は
     // 以下の peer ループのまま変えない。
-    if let Some(frame) = frame {
-        return evaluate_rows_frame_partition(part, frame, out, state_bytes, state_cap);
+    match frame {
+        Some(ResolvedFrame::Rows(frame)) => {
+            return evaluate_rows_frame_partition(part, frame, out, state_bytes, state_cap);
+        }
+        Some(ResolvedFrame::Range(frame)) => {
+            return evaluate_range_frame_partition(part, frame, out, state_bytes, state_cap);
+        }
+        None => {}
     }
 
     let mut scratch: Vec<StackValue> = Vec::new();
@@ -2129,6 +2320,427 @@ fn evaluate_rows_frame_partition(
         }
     }
     Ok(())
+}
+
+/// 集計の `RANGE` フレーム評価（SQL-64 (2)・Issue #1890。[`evaluate_partition`] から呼ばれる）。
+/// 行ごとに [`range_frame_bounds`] のフレームから `EXCLUDE` 対象（現在行・peer グループ）を除いた行を
+/// 前方順に観測する。`ROWS` の評価（[`evaluate_rows_frame_partition`]）と同じ形で、始点が
+/// `UNBOUNDED PRECEDING` かつ `EXCLUDE` なしで終点が単調非減少のときは 1 つの累積器へ新規行だけを足す
+/// O(n) の経路を取る（PostgreSQL の前方加算の順序とも一致する）。母集合は materialize 段を通った
+/// 行のみで、不可視行・他テナントの Private 行は境界計算にも現れない。
+fn evaluate_range_frame_partition(
+    part: &SortedPartition<'_>,
+    frame: &ResolvedRangeFrame,
+    out: &mut [Option<Cell>],
+    state_bytes: &mut usize,
+    state_cap: usize,
+) -> Result<(), SqlSurfaceError> {
+    let item = part.item;
+    let item_index = part.item_index;
+    let input = item
+        .input
+        .as_ref()
+        .ok_or_else(|| window_bug("framed window function is missing its aggregate input"))?;
+    let agg_func = window_func_to_aggregate_func(item.func)?;
+    let mut scratch: Vec<StackValue> = Vec::new();
+    let non_null = if frame.offsets().next().is_some() {
+        non_null_region(part)?
+    } else {
+        (0, 0)
+    };
+
+    let observe_at = |acc: &mut Accumulator,
+                      pos: usize,
+                      scratch: &mut Vec<StackValue>|
+     -> Result<(), SqlSurfaceError> {
+        let row = part.row(pos)?;
+        let agg_value = row
+            .agg_values
+            .get(item_index)
+            .ok_or_else(|| window_bug("aggregate window values missing for a row"))?;
+        observe_window_row(acc, input, row.id, agg_value, scratch)
+    };
+
+    let cumulative = matches!(frame.start, ResolvedRangeBound::UnboundedPreceding)
+        && frame.exclusion == WindowFrameExclusion::NoOthers;
+    let mut running = Accumulator::new(agg_func, input)?;
+    let mut observed = 0usize;
+
+    for group in part.peer_groups() {
+        let (g_start, g_end) = group?;
+        for pos in g_start..g_end {
+            crate::interrupt::check()?;
+            let (start, end) = range_frame_bounds(part, non_null, pos, (g_start, g_end), frame)?;
+            let cell = if cumulative && end >= observed {
+                while observed < end {
+                    observe_at(&mut running, observed, &mut scratch)?;
+                    observed += 1;
+                }
+                running.clone().finish()?
+            } else {
+                let mut acc = Accumulator::new(agg_func, input)?;
+                for q in start..end {
+                    let excluded = match frame.exclusion {
+                        WindowFrameExclusion::NoOthers => false,
+                        WindowFrameExclusion::CurrentRow => q == pos,
+                        WindowFrameExclusion::Group => (g_start..g_end).contains(&q),
+                        WindowFrameExclusion::Ties => q != pos && (g_start..g_end).contains(&q),
+                    };
+                    if !excluded {
+                        crate::interrupt::check()?;
+                        observe_at(&mut acc, q, &mut scratch)?;
+                    }
+                }
+                acc.finish()?
+            };
+            // 行ごとの複製も他の評価段の確保と同じ状態予算へ計上する（確保前の検証）。
+            *state_bytes = try_accumulate_state_budget(
+                *state_bytes,
+                window_cell_state_bytes(&cell),
+                state_cap,
+            )?;
+            let row_idx = part.row_index(pos)?;
+            let slot = out.get_mut(row_idx).ok_or_else(|| {
+                window_bug(
+                    "evaluate_range_frame_partition row index out of range for the result slice",
+                )
+            })?;
+            *slot = Some(cell);
+        }
+    }
+    Ok(())
+}
+
+/// 位置 `pos` の `ORDER BY` 第 1 キー（`None` は NULL）。キーが無いのは不変条件違反（`XX000`）。
+fn first_order_key<'a>(
+    part: &SortedPartition<'a>,
+    pos: usize,
+) -> Result<Option<&'a WindowKeyValue>, SqlSurfaceError> {
+    let row = part.row(pos)?;
+    row.order_keys
+        .get(part.item_index)
+        .and_then(|keys| keys.first())
+        .map(|k| k.as_ref())
+        .ok_or_else(|| window_bug("RANGE frame ORDER BY key missing for a row"))
+}
+
+/// `[lo, hi)` で述語が「偽…偽・真…真」と単調に変わるとき、最初に真になる位置（無ければ `hi`）。
+fn first_true(
+    lo: usize,
+    hi: usize,
+    mut pred: impl FnMut(usize) -> Result<bool, SqlSurfaceError>,
+) -> Result<usize, SqlSurfaceError> {
+    let (mut lo, mut hi) = (lo, hi);
+    while lo < hi {
+        let mid = lo + (hi - lo) / 2;
+        if pred(mid)? {
+            hi = mid;
+        } else {
+            lo = mid + 1;
+        }
+    }
+    Ok(lo)
+}
+
+/// パーティション内で `ORDER BY` 第 1 キーが非 NULL の区間 `[start, end)`。NULL は並びの先頭
+/// （`NULLS FIRST`）か末尾（`NULLS LAST`）に連続するため、二分探索で求める。
+fn non_null_region(part: &SortedPartition<'_>) -> Result<(usize, usize), SqlSurfaceError> {
+    let len = part.len();
+    let nulls_first = part
+        .item
+        .order_by
+        .first()
+        .is_some_and(|o| o.nulls == NullPlacement::First);
+    if nulls_first {
+        let start = first_true(0, len, |p| Ok(first_order_key(part, p)?.is_some()))?;
+        Ok((start, len))
+    } else {
+        let end = first_true(0, len, |p| Ok(first_order_key(part, p)?.is_none()))?;
+        Ok((0, end))
+    }
+}
+
+/// `RANGE` オフセットが負（`NaN` を含む）か。`TIME` キーは PostgreSQL の `in_range_time_interval`
+/// に合わせ `INTERVAL` の時間成分だけで判定し（月・日は無視）、他は正規化キー（月 = 30 日）で判定する。
+fn range_offset_is_negative(off: &RangeOffset, key: &WindowKeyValue) -> bool {
+    match off {
+        RangeOffset::Int(n) => *n < 0,
+        RangeOffset::Float(f) => f.is_nan() || *f < 0.0,
+        RangeOffset::Numeric(d) => d.unscaled() < 0,
+        RangeOffset::Interval(iv) => match key {
+            WindowKeyValue::Time(_) => iv.micros < 0,
+            _ => crate::datetime::interval_cmp_key(iv) < 0,
+        },
+    }
+}
+
+fn invalid_range_offset() -> SqlSurfaceError {
+    SqlSurfaceError::InvalidPrecedingOrFollowingSize {
+        detail: "invalid preceding or following size in window function",
+    }
+}
+
+/// `LAG`／`LEAD` が `RANGE` のオフセット付きフレームを持つとき、非 NULL キーの行があるパーティション
+/// でだけ負・NaN のオフセットを `22013` にする（PostgreSQL と同じ遅延検査）。NULL は連続して
+/// 先頭か末尾に並ぶため、両端の行を見れば非 NULL 行の有無が分かる。
+fn check_range_offsets_for_partition(
+    part: &SortedPartition<'_>,
+    frame: &ResolvedRangeFrame,
+) -> Result<(), SqlSurfaceError> {
+    let len = part.len();
+    if len == 0 {
+        return Ok(());
+    }
+    let key = match first_order_key(part, 0)? {
+        Some(k) => Some(k),
+        None => first_order_key(part, len - 1)?,
+    };
+    if let Some(key) = key {
+        if frame.offsets().any(|o| range_offset_is_negative(o, key)) {
+            return Err(invalid_range_offset());
+        }
+    }
+    Ok(())
+}
+
+/// 境界の比較対象（`基準値 ± オフセット`）。現在行ごと・境界ごとに 1 回だけ計算する
+/// （[`range_limit`]）。
+enum RangeLimit {
+    /// 整数キー（`i128` で正確に比較する。PostgreSQL の桁あふれ時の分岐と結果が一致する）。
+    Int(i128),
+    /// 浮動小数点キー。`base` は NaN の分岐用、`skip` は基準値・オフセットがともに無限大で
+    /// 加減算が NaN になる組（PostgreSQL は常に範囲内とする）。
+    Float {
+        base: f64,
+        sum: f64,
+        skip: bool,
+    },
+    Numeric(crate::numeric::Decimal),
+    /// 日付・日時・時刻キーのマイクロ秒（`DATE` は日付を日時へ昇格した値）。
+    Micros(i128),
+}
+
+fn key_as_i128(v: &WindowKeyValue) -> Option<i128> {
+    match v {
+        WindowKeyValue::Id(x) => Some(i128::from(*x)),
+        WindowKeyValue::Integer(x) => Some(i128::from(*x)),
+        WindowKeyValue::BigInt(x) => Some(i128::from(*x)),
+        _ => None,
+    }
+}
+
+fn key_as_f64(v: &WindowKeyValue) -> Option<f64> {
+    match v {
+        WindowKeyValue::Real(x) => Some(f64::from(*x)),
+        WindowKeyValue::Double(x) => Some(*x),
+        _ => None,
+    }
+}
+
+fn key_as_micros(v: &WindowKeyValue) -> Option<i128> {
+    match v {
+        WindowKeyValue::Date(d) => {
+            Some(i128::from(*d) * i128::from(crate::datetime::MICROS_PER_DAY))
+        }
+        WindowKeyValue::Timestamp(t) | WindowKeyValue::TimestampTz(t) | WindowKeyValue::Time(t) => {
+            Some(i128::from(*t))
+        }
+        _ => None,
+    }
+}
+
+/// `base ± offset`（`sub` なら減算）を比較対象として計算する。PostgreSQL 17 の
+/// `in_range_*`（整数・float・numeric・date/timestamp/timestamptz/time ± interval）の移植。
+/// 日時は月 → 日 → マイクロ秒の順に加算し、最終値の 0001〜9999 年検査は行わない（PG の timestamp
+/// 範囲外だけ `22008`）。`TIMESTAMPTZ` の月・日はセッション TZ の壁時計で加算する。
+/// `TIME` は `INTERVAL` の時間成分だけを日またぎの折り返しなしで加減算する。
+fn range_limit(
+    base: &WindowKeyValue,
+    off: &RangeOffset,
+    sub: bool,
+) -> Result<RangeLimit, SqlSurfaceError> {
+    use crate::sql::interval_arith;
+    match off {
+        RangeOffset::Int(n) => {
+            let b = key_as_i128(base)
+                .ok_or_else(|| window_bug("RANGE integer offset on a non-integer key"))?;
+            let n = i128::from(*n);
+            Ok(RangeLimit::Int(if sub { b - n } else { b + n }))
+        }
+        RangeOffset::Float(o) => {
+            let b = key_as_f64(base)
+                .ok_or_else(|| window_bug("RANGE float offset on a non-float key"))?;
+            let skip = o.is_infinite() && b.is_infinite() && (if sub { b > 0.0 } else { b < 0.0 });
+            let sum = if sub { b - o } else { b + o };
+            Ok(RangeLimit::Float { base: b, sum, skip })
+        }
+        RangeOffset::Numeric(o) => {
+            let WindowKeyValue::Numeric(b) = base else {
+                return Err(window_bug("RANGE numeric offset on a non-numeric key"));
+            };
+            let op = if sub {
+                crate::numeric::DecimalOp::Sub
+            } else {
+                crate::numeric::DecimalOp::Add
+            };
+            crate::numeric::decimal_arith(op, b, o)
+                .map(RangeLimit::Numeric)
+                .map_err(|_| SqlSurfaceError::numeric_out_of_range("value out of range"))
+        }
+        RangeOffset::Interval(iv) => {
+            let iv = if sub {
+                interval_arith::negate_interval(iv)?
+            } else {
+                *iv
+            };
+            match base {
+                WindowKeyValue::Date(_) | WindowKeyValue::Timestamp(_) => {
+                    let micros = key_as_micros(base)
+                        .and_then(|m| i64::try_from(m).ok())
+                        .ok_or_else(|| window_bug("RANGE date key out of range"))?;
+                    interval_arith::timestamp_shift_wide(micros, &iv).map(RangeLimit::Micros)
+                }
+                WindowKeyValue::TimestampTz(t) => {
+                    crate::datetime::with_current_session_time_zone(|tz| {
+                        interval_arith::timestamptz_shift_wide(*t, &iv, tz)
+                    })
+                    .map(RangeLimit::Micros)
+                }
+                WindowKeyValue::Time(t) => {
+                    // `negate_interval` 済みの時間成分を足す（日またぎで折り返さない）。
+                    Ok(RangeLimit::Micros(i128::from(*t) + i128::from(iv.micros)))
+                }
+                _ => Err(window_bug("RANGE interval offset on a non-datetime key")),
+            }
+        }
+    }
+}
+
+/// `val` が比較対象 `limit` に対して範囲内か（`less` なら `val <= limit`、でなければ `val >= limit`）。
+/// 浮動小数点は PostgreSQL の規則（NaN は最大値として NaN 同士は等しい）に従う。
+fn in_range_limit(
+    val: &WindowKeyValue,
+    limit: &RangeLimit,
+    less: bool,
+) -> Result<bool, SqlSurfaceError> {
+    use std::cmp::Ordering;
+    let ord_ok = |o: Ordering| {
+        if less {
+            o != Ordering::Greater
+        } else {
+            o != Ordering::Less
+        }
+    };
+    match limit {
+        RangeLimit::Int(l) => {
+            let v = key_as_i128(val).ok_or_else(|| window_bug("RANGE integer key expected"))?;
+            Ok(ord_ok(v.cmp(l)))
+        }
+        RangeLimit::Float { base, sum, skip } => {
+            let v = key_as_f64(val).ok_or_else(|| window_bug("RANGE float key expected"))?;
+            Ok(if v.is_nan() {
+                if base.is_nan() {
+                    true
+                } else {
+                    !less
+                }
+            } else if base.is_nan() {
+                less
+            } else if *skip {
+                true
+            } else if less {
+                v <= *sum
+            } else {
+                v >= *sum
+            })
+        }
+        RangeLimit::Numeric(l) => {
+            let WindowKeyValue::Numeric(v) = val else {
+                return Err(window_bug("RANGE numeric key expected"));
+            };
+            Ok(ord_ok(crate::numeric::cmp_exact(v, l)))
+        }
+        RangeLimit::Micros(l) => {
+            let v = key_as_micros(val).ok_or_else(|| window_bug("RANGE datetime key expected"))?;
+            Ok(ord_ok(v.cmp(l)))
+        }
+    }
+}
+
+/// 値オフセット付き境界 1 つの位置を、非 NULL 区間 `non_null` 上の二分探索で求める。
+/// 始点は「境界以上（`DESC` は以下）の最初の行」、終点は「境界以下（`DESC` は以上）を満たす
+/// 最後の行の次」。`DESC` は PostgreSQL と同じく加減と大小の向きをともに反転する。
+fn offset_bound_position(
+    part: &SortedPartition<'_>,
+    non_null: (usize, usize),
+    cur: &WindowKeyValue,
+    off: &RangeOffset,
+    preceding: bool,
+    is_start: bool,
+) -> Result<usize, SqlSurfaceError> {
+    let desc = part.item.order_by.first().is_some_and(|o| o.descending);
+    let sub = preceding != desc;
+    let limit = range_limit(cur, off, sub)?;
+    let less = if is_start { desc } else { !desc };
+    let in_range_at = |p: usize| -> Result<bool, SqlSurfaceError> {
+        let key = first_order_key(part, p)?
+            .ok_or_else(|| window_bug("NULL key inside the non-NULL region"))?;
+        in_range_limit(key, &limit, less)
+    };
+    let (lo, hi) = non_null;
+    if is_start {
+        first_true(lo, hi, in_range_at)
+    } else {
+        first_true(lo, hi, |p| Ok(!in_range_at(p)?))
+    }
+}
+
+/// 位置 `pos`（peer グループ `peers` = `[g_start, g_end)`）の `RANGE` フレームを半開区間
+/// `[start, end)` で返す（`start >= end` は空フレーム。Issue #1890）。`UNBOUNDED`／`CURRENT ROW`
+/// （peer グループ単位）は位置だけで決まり、`ORDER BY` なし・複数キーでも使える。値オフセットは
+/// 現在行のキーが NULL なら NULL の peer グループ、非 NULL なら非 NULL 区間上の二分探索で決まる
+/// （NULL 行はオフセット境界を満たさない）。負・NaN のオフセットは、非 NULL キーの現在行で
+/// 境界を求める時点で初めて `22013`（PostgreSQL の in_range 内の検査と同じ時点）。
+fn range_frame_bounds(
+    part: &SortedPartition<'_>,
+    non_null: (usize, usize),
+    pos: usize,
+    peers: (usize, usize),
+    frame: &ResolvedRangeFrame,
+) -> Result<(usize, usize), SqlSurfaceError> {
+    let (g_start, g_end) = peers;
+    let len = part.len();
+    let cur = if frame.offsets().next().is_some() {
+        first_order_key(part, pos)?
+    } else {
+        None
+    };
+    if let Some(cur) = cur {
+        if frame.offsets().any(|o| range_offset_is_negative(o, cur)) {
+            return Err(invalid_range_offset());
+        }
+    }
+    let position = |b: &ResolvedRangeBound, is_start: bool| -> Result<usize, SqlSurfaceError> {
+        match b {
+            ResolvedRangeBound::UnboundedPreceding => Ok(0),
+            ResolvedRangeBound::UnboundedFollowing => Ok(len),
+            ResolvedRangeBound::CurrentRow => Ok(if is_start { g_start } else { g_end }),
+            ResolvedRangeBound::Preceding(off) | ResolvedRangeBound::Following(off) => match cur {
+                None => Ok(if is_start { g_start } else { g_end }),
+                Some(cur) => offset_bound_position(
+                    part,
+                    non_null,
+                    cur,
+                    off,
+                    matches!(b, ResolvedRangeBound::Preceding(_)),
+                    is_start,
+                ),
+            },
+        }
+    };
+    let start = position(&frame.start, true)?;
+    let end = position(&frame.end, false)?;
+    Ok((start.min(len), end.min(len)))
 }
 
 /// `ORDER BY` キーだけの比較（タイブレークなし）。`Equal` が peer（同順位）の定義で、
@@ -3353,5 +3965,179 @@ mod partition_layout_tests {
         let part = SortedPartition::new(&it, 0, &rows, vec![]);
         assert_eq!(part.len(), 0);
         assert!(groups(&part).is_empty());
+    }
+}
+/// `RANGE` フレームの境界計算（Issue #1890。`range_limit`／`in_range_limit`）の単体テスト。
+/// 期待値は PostgreSQL 17 の `in_range_*` の挙動。結合テスト（`sql64_window_range_frame.rs`）は
+/// 列に格納できない NaN・無限大と、セッション TZ をまたぐ暦計算をここで補う。
+#[cfg(test)]
+mod range_frame_tests {
+    use super::*;
+    use crate::datetime::{Interval, SessionTimeZone, SessionTimeZoneScope};
+
+    fn limit(base: &WindowKeyValue, off: RangeOffset, sub: bool) -> RangeLimit {
+        range_limit(base, &off, sub).expect("limit")
+    }
+
+    fn within(val: &WindowKeyValue, l: &RangeLimit, less: bool) -> bool {
+        in_range_limit(val, l, less).expect("in_range")
+    }
+
+    fn dbl(v: f64) -> WindowKeyValue {
+        WindowKeyValue::Double(v)
+    }
+
+    #[test]
+    fn float_nan_sorts_last_and_equals_itself() {
+        let nan = dbl(f64::NAN);
+        let one = dbl(1.0);
+        // 基準値が NaN: NaN は範囲内（等しい）、非 NaN は「小さい側」だけ範囲内。
+        let l = limit(&nan, RangeOffset::Float(1.0), true);
+        assert!(within(&nan, &l, true) && within(&nan, &l, false));
+        assert!(within(&one, &l, true));
+        assert!(!within(&one, &l, false));
+        // 基準値が非 NaN: NaN は「大きい側」だけ範囲内。
+        let l = limit(&one, RangeOffset::Float(1.0), false);
+        assert!(!within(&nan, &l, true));
+        assert!(within(&nan, &l, false));
+    }
+
+    #[test]
+    fn float_infinite_base_and_offset_cover_everything() {
+        let inf = dbl(f64::INFINITY);
+        let ninf = dbl(f64::NEG_INFINITY);
+        let two = dbl(2.0);
+        // +inf - inf と -inf + inf は NaN になる組で、PostgreSQL は常に範囲内とする。
+        let l = limit(&inf, RangeOffset::Float(f64::INFINITY), true);
+        assert!(within(&two, &l, false) && within(&ninf, &l, false));
+        let l = limit(&ninf, RangeOffset::Float(f64::INFINITY), false);
+        assert!(within(&two, &l, true) && within(&inf, &l, true));
+        // -inf - inf = -inf（通常計算）。終点（`val <= base - off`）は -inf だけが範囲内。
+        let l = limit(&ninf, RangeOffset::Float(f64::INFINITY), true);
+        assert!(within(&ninf, &l, true));
+        assert!(!within(&two, &l, true));
+        assert!(within(&two, &l, false));
+        // 有限基準値 - inf は -inf へ飽和する。
+        let l = limit(&two, RangeOffset::Float(f64::INFINITY), true);
+        assert!(within(&ninf, &l, true) && !within(&two, &l, true));
+        assert!(within(&two, &l, false));
+    }
+
+    #[test]
+    fn negative_and_nan_offsets_are_detected_per_key_type() {
+        let t = WindowKeyValue::Time(0);
+        let ts = WindowKeyValue::Timestamp(0);
+        let iv = |months, days, micros| {
+            RangeOffset::Interval(Interval {
+                months,
+                days,
+                micros,
+            })
+        };
+        // TIME キーは時間成分だけを見る（月・日は無視）。
+        assert!(!range_offset_is_negative(&iv(-1, -1, 0), &t));
+        assert!(range_offset_is_negative(&iv(0, 0, -1), &t));
+        // 他の日時キーは正規化値（月 = 30 日）で判定する。
+        assert!(range_offset_is_negative(&iv(1, -31, 0), &ts));
+        assert!(!range_offset_is_negative(&iv(1, -29, 0), &ts));
+        assert!(range_offset_is_negative(
+            &RangeOffset::Float(f64::NAN),
+            &dbl(0.0)
+        ));
+        assert!(range_offset_is_negative(
+            &RangeOffset::Float(-0.5),
+            &dbl(0.0)
+        ));
+        assert!(!range_offset_is_negative(
+            &RangeOffset::Float(0.0),
+            &dbl(0.0)
+        ));
+        assert!(range_offset_is_negative(
+            &RangeOffset::Int(-1),
+            &WindowKeyValue::Integer(0)
+        ));
+    }
+
+    #[test]
+    fn integer_limits_do_not_overflow() {
+        let max = WindowKeyValue::BigInt(i64::MAX);
+        let l = limit(&max, RangeOffset::Int(i64::MAX), false);
+        assert!(within(&max, &l, true));
+        let min = WindowKeyValue::BigInt(i64::MIN);
+        let l = limit(&min, RangeOffset::Int(i64::MAX), true);
+        assert!(within(&min, &l, false));
+        assert!(!within(&min, &l, true));
+    }
+
+    #[test]
+    fn timestamptz_offsets_add_calendar_days_in_the_session_zone() {
+        let ny = SessionTimeZone::parse_setting("America/New_York").expect("zone");
+        let utc = SessionTimeZone::utc();
+        let parse = |s: &str| crate::datetime::parse_timestamptz(s, &utc).expect("timestamptz");
+        // 2024-03-10 は America/New_York の DST 開始日（その日の 2:00 に 1 時間進む）。
+        let d = parse("2024-03-10 12:00:00-04:00");
+        let key = WindowKeyValue::TimestampTz(d);
+        let day = RangeOffset::Interval(Interval {
+            months: 0,
+            days: 1,
+            micros: 0,
+        });
+        let hours24 = RangeOffset::Interval(Interval {
+            months: 0,
+            days: 0,
+            micros: 24 * 3_600_000_000,
+        });
+        let _scope = SessionTimeZoneScope::enter(ny);
+        // `1 day` は壁時計で前日の同時刻（EST の 12:00 = 17:00 UTC）。`24 hours` は 24 時間前。
+        let RangeLimit::Micros(m) = limit(&key, day, true) else {
+            panic!("expected micros limit");
+        };
+        assert_eq!(m, i128::from(parse("2024-03-09 12:00:00-05:00")));
+        let RangeLimit::Micros(m) = limit(&key, hours24, true) else {
+            panic!("expected micros limit");
+        };
+        assert_eq!(m, i128::from(d - 24 * 3_600_000_000));
+    }
+
+    #[test]
+    fn time_offsets_do_not_wrap_and_ignore_months_and_days() {
+        let t = WindowKeyValue::Time(23 * 3_600_000_000);
+        let hours = |h: i64| {
+            RangeOffset::Interval(Interval {
+                months: 1,
+                days: 1,
+                micros: h * 3_600_000_000,
+            })
+        };
+        let RangeLimit::Micros(m) = limit(&t, hours(2), false) else {
+            panic!("expected micros limit");
+        };
+        assert_eq!(m, i128::from(25 * 3_600_000_000_i64));
+        let RangeLimit::Micros(m) = limit(&t, hours(30), true) else {
+            panic!("expected micros limit");
+        };
+        assert_eq!(m, i128::from(-7 * 3_600_000_000_i64));
+    }
+
+    #[test]
+    fn numeric_limits_are_exact() {
+        let d = |u: i128, s: u8| crate::numeric::Decimal::from_parts(u, s).expect("decimal");
+        let base = WindowKeyValue::Numeric(d(25, 1));
+        let l = limit(&base, RangeOffset::Numeric(d(15, 1)), false);
+        assert!(within(&WindowKeyValue::Numeric(d(40, 1)), &l, true));
+        assert!(!within(&WindowKeyValue::Numeric(d(401, 2)), &l, true));
+        let l = limit(&base, RangeOffset::Numeric(d(1, 0)), true);
+        assert!(within(&WindowKeyValue::Numeric(d(15, 1)), &l, false));
+        assert!(!within(&WindowKeyValue::Numeric(d(149, 2)), &l, false));
+    }
+
+    #[test]
+    fn first_true_finds_the_partition_point() {
+        for len in 0..6usize {
+            for at in 0..=len {
+                let got = first_true(0, len, |p| Ok(p >= at)).expect("search");
+                assert_eq!(got, at, "len={len} at={at}");
+            }
+        }
     }
 }

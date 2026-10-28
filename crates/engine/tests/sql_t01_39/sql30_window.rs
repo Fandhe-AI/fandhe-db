@@ -1103,8 +1103,8 @@ fn scalar_order_by_with_window_rejects_unsupported_combinations() {
 
 #[test]
 fn frame_clause_is_accepted_syntactically_but_gated() {
-    // フレーム句の構文は受理し（SQL-64 (2)・Issue #1887）、`RANGE`／`GROUPS` は #1890／#1891 まで
-    // 評価前のゲート `0A000` で止まる（`ROWS` は #1889 で評価される）。
+    // フレーム句の構文は受理し（SQL-64 (2)・Issue #1887）、`GROUPS` は #1891 まで
+    // 評価前のゲート `0A000` で止まる（`ROWS` は #1889、`RANGE` は #1890 で評価される）。
     let path = unique_db_path("window-reject-frame");
     let _guard = CleanupGuard(path.clone());
     let storage = open_storage(&path);
@@ -1115,9 +1115,13 @@ fn frame_clause_is_accepted_syntactically_but_gated() {
     expect_rejected(
         &core,
         &ctx,
-        "SELECT id, ROW_NUMBER() OVER (ORDER BY score RANGE UNBOUNDED PRECEDING) FROM docs LIMIT 10",
+        "SELECT id, ROW_NUMBER() OVER (ORDER BY score GROUPS UNBOUNDED PRECEDING) FROM docs LIMIT 10",
         "0A000",
     );
+    expect_query(core.execute_sql(
+        &ctx,
+        "SELECT id, ROW_NUMBER() OVER (ORDER BY score RANGE UNBOUNDED PRECEDING) FROM docs LIMIT 10",
+    ));
     expect_query(core.execute_sql(
         &ctx,
         "SELECT id, ROW_NUMBER() OVER (ORDER BY score ROWS UNBOUNDED PRECEDING) FROM docs LIMIT 10",
