@@ -193,6 +193,27 @@ fn derived_table_syntax_is_accepted_and_stops_at_fixed_gate() {
     assert!(!m.contains("docs"), "{m}");
 }
 
+/// `union` 等は通常の識別子であり、後続に枝が無ければ集合演算とみなさず派生表の抽出を続ける。
+#[test]
+fn set_operator_words_as_identifiers_do_not_abort_extraction() {
+    let (core, _g) = open_seeded();
+    for sql in [
+        "SELECT lang AS union FROM (SELECT lang FROM docs) t",
+        "SELECT lang AS except FROM (SELECT lang FROM docs) t",
+        "SELECT * FROM (SELECT lang FROM docs) union",
+    ] {
+        assert_eq!(code(&core, "alice", sql), UNSUPPORTED, "{sql}");
+    }
+    assert_eq!(
+        code(
+            &core,
+            "alice",
+            "SELECT lang AS union FROM (SELECT lang FROM docs) t(a, b, c)"
+        ),
+        "42P10"
+    );
+}
+
 #[test]
 fn derived_table_column_list_too_long_is_42p10() {
     let (core, _g) = open_seeded();

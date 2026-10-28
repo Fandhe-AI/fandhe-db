@@ -22,8 +22,8 @@
 use crate::nesting_limits::NestingLimits;
 use crate::sql::allowlist::{
     derived_output_names, is_set_operator_ident, parse_cte_select_body, parse_derived_alias_head,
-    parse_with_clause_and_main, split_parenthesized, validate_cte_definition_at,
-    validate_cte_definitions, SqlSurfaceError, TableLookup,
+    parse_with_clause_and_main, set_operator_is_followed_by_branch, split_parenthesized,
+    validate_cte_definition_at, validate_cte_definitions, SqlSurfaceError, TableLookup,
 };
 use crate::sql::cte::{CteDef, CteMaterialization};
 use crate::sql::lexer::{Keyword, Token};
@@ -130,7 +130,10 @@ fn extract(tokens: &[Token], max_tables: usize) -> Result<Option<Extracted>, Sql
     let mut i: usize = 0;
     while let Some(tok) = tokens.get(i) {
         if depth == 0 {
-            if matches!(tok, Token::Ident(n) if is_set_operator_ident(n)) {
+            // 後続に枝（`SELECT` 等）が続く場合のみ集合演算子とみなす（`union` 等は通常の識別子）。
+            if matches!(tok, Token::Ident(n) if is_set_operator_ident(n))
+                && set_operator_is_followed_by_branch(tokens, i)
+            {
                 return Ok(None);
             }
             if matches!(tok, Token::Keyword(Keyword::From)) {
