@@ -104,7 +104,7 @@
 use std::collections::{HashMap, HashSet};
 
 use crate::sql::allowlist::SqlSurfaceError;
-use crate::sql::lexer::{self, Token};
+use crate::sql::lexer::{self, Keyword, Token};
 
 /// 1 文で許容するパラメータ番号の上限（実装既定値）。wire 層（Parse の宣言型
 /// 件数・Bind の値件数）もこの定数を単一情報源として参照する。
@@ -1355,6 +1355,17 @@ pub fn validate_param_positions(tokens: &[Token]) -> Result<u16, SqlSurfaceError
     {
         return Err(SqlSurfaceError::unsupported(
             "parameter placeholders are not supported in WITH statements",
+        ));
+    }
+
+    // SQL-62・Issue #1866: FROM の派生表を含む文も `$n` を一律拒否する（fail-closed）。内側の述語が
+    // 外側の述語の前へ合成され、パターン 4 のトークン位置と束縛先がずれうるため（`WITH` と同じ理由）。
+    if matches!(tokens.first(), Some(Token::Keyword(Keyword::Select)))
+        && tokens.iter().any(|t| matches!(t, Token::Param(_)))
+        && crate::sql::derived_table::contains_derived_table(tokens)
+    {
+        return Err(SqlSurfaceError::unsupported(
+            "parameter placeholders are not supported in statements with derived tables",
         ));
     }
 
@@ -3251,6 +3262,22 @@ mod tests {
             flags("SELECT a FROM t WHERE a = $1 UNION SELECT a FROM t WHERE a = 'x'"),
             vec![true, false]
         );
+    }
+
+    /// SQL-62・Issue #1866: FROM の派生表を含む文の `$n` は一律 `42601`（内側の述語の合成で位置と
+    /// 束縛先がずれうるため）。派生表を含まない文は従来どおり受理される。
+    #[test]
+    fn params_are_rejected_in_statements_with_derived_tables() {
+        for sql in [
+            "SELECT a FROM (SELECT a FROM t WHERE a = $1) x",
+            "SELECT a FROM (SELECT a FROM t) x WHERE a = $1",
+        ] {
+            let tokens = tokenize_with_params(sql).expect("tokenize_with_params should succeed");
+            let e = validate_param_positions(&tokens).expect_err("must be rejected");
+            assert_eq!(e.wire_code(), "42601", "{sql}");
+        }
+        let tokens = tokenize_with_params("SELECT a FROM t WHERE a = $1").expect("tokenize");
+        assert_eq!(validate_param_positions(&tokens).expect("accepted"), 1);
     }
 
     /// 集計の `FILTER (WHERE ...)` の `WHERE` は文の `WHERE` 領域の開始に選ばない（SQL-57・

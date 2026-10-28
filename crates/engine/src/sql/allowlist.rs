@@ -22673,6 +22673,55 @@ fn parse_with_main(
     Ok((main, main_table_name))
 }
 
+/// 単一表の主クエリを、検証済みの CTE 列 `ctes`（データ変更 CTE を含まない）の上で評価する文へ組む
+/// （SQL-62・Issue #1866。派生表の合成 CTE から呼ばれる）。`validate_with_statement` の単一表主クエリ
+/// 経路（強制具体化 → `resolve_relation` → インライン畳み込み）と同じ部品だけを使い、派生表専用の
+/// 実行器を持たない。参照した側セッションの `PolicyContext` で評価され、テナント情報は持ち込まない。
+pub(super) fn single_relation_main_over_ctes(
+    ctes: &[super::cte::CteDef],
+    main_src: &[Token],
+    lookup: &impl TableLookup,
+    limits: crate::nesting_limits::NestingLimits,
+) -> Result<Statement, SqlSurfaceError> {
+    let (main, main_table_name) = parse_with_main(main_src, limits)?;
+    if let Some(idx) = ctes.iter().rposition(|d| {
+        d.name.eq_ignore_ascii_case(&main_table_name) && d.requires_materialization()
+    }) {
+        return forced_cte_statement(ctes, idx, main, lookup, limits);
+    }
+    let mut budget = super::cte::ResolveBudget::new();
+    let resolved = super::cte::resolve_relation(
+        lookup,
+        ctes,
+        ctes.len(),
+        &main_table_name,
+        0,
+        limits.max_cte_nesting_depth(),
+        &mut budget,
+    )?;
+    match main {
+        MainShape::Scan(shape) => Ok(Statement::Scan(build_scan_from_resolved(
+            shape.table_name,
+            resolved,
+            shape.projection,
+            shape.where_predicates,
+            shape.limit,
+            shape.order_by,
+            shape.offset,
+            shape.window_items,
+            shape.order_keys,
+            shape.scalar_subquery_items,
+        )?)),
+        MainShape::Aggregate(shape) => Ok(Statement::Aggregate(build_aggregate_from_resolved(
+            shape.table_name,
+            resolved,
+            shape.items,
+            shape.where_predicates,
+            shape.group_by,
+        )?)),
+    }
+}
+
 /// `WITH` の主クエリの形（Issue #1191 の集計主クエリを含む。Issue #1860 で具体化経路の
 /// 判定のためモジュール直下へ移した）。
 #[derive(Clone)]
@@ -23961,7 +24010,9 @@ fn validate_with_statement(
     // SQL-62・Issue #1865: 主クエリの FROM の派生表（セッション最上位の入口だけ。`EngineCore` の
     // WITH 入口は `validate_sql_tokens_impl` を経由せずここへ来る）。
     if cte_evaluation == CteEvaluation::AllowMaterialize {
-        super::derived_table::gate_with(tokens, lookup, limits)?;
+        if let Some(stmt) = super::derived_table::gate_with(tokens, lookup, limits)? {
+            return Ok(WithOutcome::Read(stmt));
+        }
     }
     let mut p = Parser::new(tokens).with_nesting_limits(limits);
     let ctes = p.parse_with_clause()?;
@@ -24390,7 +24441,9 @@ fn validate_sql_tokens_impl(
     // 他の入口は従来どおり下流の既存パーサーが `42601` にする。検出器の多くが括弧深さを追わないため、
     // 内側の `GROUP BY`／`OVER` による誤振り分けを避けるよう、他の判定より前に置く。
     if cte_evaluation == CteEvaluation::AllowMaterialize {
-        super::derived_table::gate(tokens, lookup, limits)?;
+        if let Some(stmt) = super::derived_table::gate(tokens, lookup, limits)? {
+            return Ok(stmt);
+        }
     }
     if looks_like_join(tokens) {
         let validated = parse_join_statement(tokens, lookup)?;
