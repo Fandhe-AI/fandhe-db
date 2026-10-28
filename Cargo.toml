@@ -28,10 +28,11 @@ publish = true
 # - 依存のビルドスクリプト・proc-macro（`build-override` 側の既定は debuginfo なし）にも
 #   適用され行番号付きになる（`build-override` より `package."*"` が優先されるため
 #   打ち消せない）。増分は依存本体の削減に比べて小さい
-# - 下記 `[profile.test]` は `dev` を継承し、package 指定も継承される。`test` 側は
-#   `debug = "line-tables-only"` で値が同じため `[profile.test.package."*"]` は不要で、
-#   `opt-level = 2` 等の他の設定もそのまま依存に効く。`release`・`bench`（`release`
-#   継承）は既定どおり debuginfo なしで影響しない
+# - 下記 `[profile.test]` は `dev` を継承し、package 指定も継承される。`test` 側の
+#   `debug = false` はメンバーにだけ効き、依存はこの指定により行番号付きのまま
+#   （依存側の設定は変わらないため、`debug` の変更で依存は再ビルドされない）。
+#   `[profile.test.package."*"]` は置かず、`opt-level = 2` 等の他の設定もそのまま依存に
+#   効く。`release`・`bench`（`release` 継承）は既定どおり debuginfo なしで影響しない
 [profile.dev.package."*"]
 debug = "line-tables-only"
 
@@ -46,13 +47,18 @@ debug = "line-tables-only"
 # - `opt-level = 2`: ホットループの最適化。`debug-assertions`／`overflow-checks` は
 #   既定（dev 継承）でも有効だが、`.claude/rules/coding-rust.md` の checked 演算・
 #   fail-closed 方針をテストで確実に検証するため明示的に true へ固定する
-# - `debug = "line-tables-only"`: バックトレースの行番号は保ちつつ、リンク時間と
-#   成果物サイズ（CI の target cache 容量）を抑える
+# - `debug = false`: メンバー（`engine`・`wire-server`）のテストビルドで debuginfo を
+#   生成しない。テストバイナリが数百本あり、`line-tables-only` から `false` にすると
+#   ローカル計測で workspace のビルド CPU 時間が約 25% 減ったため無効化した。panic メッセージの
+#   `file:line`（`panic::Location` 由来）は debuginfo に依存せず残る。失うのは
+#   テストバイナリでのメンバー側の `RUST_BACKTRACE=1` 時の行番号と、デバッガでの
+#   ソースレベルの追跡で、必要な場合は手元で
+#   `CARGO_PROFILE_TEST_DEBUG=line-tables-only cargo test ...` として一時的に戻す
 # - `incremental = false`: CI は毎回クリーン（cache 復元後の差分のみ）で incremental
 #   の恩恵が薄く、`target/debug/incremental` が cache サイズを押し上げるため無効化
 [profile.test]
 opt-level = 2
-debug = "line-tables-only"
+debug = false
 debug-assertions = true
 overflow-checks = true
 incremental = false
