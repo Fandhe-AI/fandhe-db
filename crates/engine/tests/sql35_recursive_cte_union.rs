@@ -251,6 +251,25 @@ fn join_candidates_before_dedup_do_not_hit_result_row_limit() {
     assert_eq!(col(&core, "alice", &walk("UNION")), strs(&["1", "2"]));
 }
 
+/// アンカー候補にも最終結果の行数上限を適用しない: 同じ値を 4 行返すアンカーでも、重複除去後
+/// （1 行）が `--max-result-rows=3` 以内なら成功する。
+#[test]
+fn anchor_candidates_before_dedup_do_not_hit_result_row_limit() {
+    let (core, _g) = open_core_with(
+        "sql35-union-anchor-candidates",
+        Some(RecursiveCteLimits::new(1000, 100)),
+        |s| {
+            for i in 0..4u64 {
+                put_parent(s, i + 1, Some(7));
+            }
+        },
+    );
+    let core = core.with_result_limits(engine::result_limits::ResultLimits::new(3));
+    let sql = "WITH RECURSIVE t(n) AS (SELECT parent_id FROM tree UNION \
+               SELECT n FROM t WHERE n < 0) SELECT n FROM t";
+    assert_eq!(col(&core, "alice", sql), strs(&["7"]));
+}
+
 /// 重複が多くても、重複除去後の行数が上限を超えれば部分結果を返さず `54000`。
 #[test]
 fn distinct_rows_over_limit_fail_closed() {

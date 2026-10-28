@@ -1069,21 +1069,31 @@ pub(crate) fn execute(
             Some(DedupSet::new())
         };
         // 重複除去版はアンカーの中の重複も除く（捨てる行は行数に数えない。入力順で最初の行を残す）。
+        // 保持中の候補ぶんを先に一時行として共有予算へ計上してからキーを確保し、キー確保が候補と
+        // 合算で上限を超えないようにする（JOIN 出力と同じ手順）。未出の行だけを結果へ移す。
         let mut anchor_rows = anchor_rows;
         if let Some(d) = dedup.as_mut() {
+            for row in &anchor_rows {
+                budget.reserve(RowBudget::row_bytes(&row.cells), Charge::Scratch)?;
+            }
             let mut kept: Vec<ResultRow> = Vec::new();
             kept.try_reserve(anchor_rows.len()).map_err(|_| {
                 SqlSurfaceError::payload_too_large("recursive query exceeds the row limit")
             })?;
             for row in anchor_rows {
                 if d.insert(&row, &mut budget)? {
+                    budget.promote(&row.cells)?;
                     kept.push(row);
+                } else {
+                    budget.discard_scratch(&row.cells);
                 }
             }
+            budget.clear_scratch();
             anchor_rows = kept;
-        }
-        for row in &anchor_rows {
-            budget.admit(&row.cells, Charge::Retained)?;
+        } else {
+            for row in &anchor_rows {
+                budget.admit(&row.cells, Charge::Retained)?;
+            }
         }
         // 結果は 1 本の行列で持ち、作業表（前回の反復で増えた行）はその末尾区間 `start..end` として
         // 参照する（`result.clone()` や各反復の深い複製を作らない）。
