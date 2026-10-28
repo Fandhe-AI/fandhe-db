@@ -28,8 +28,8 @@
 //! （Public のみ／Public＋Private）が書き込み対象の軸になる、台帳キーはテナントごと、他テナントの
 //! SCHEMA 修飾名は存在しない SCHEMA と同じ応答。
 //!
-//! 読み取りの注意: 他テナントの Public 行は読み取りで可視（RLS-7）なため、主クエリが `docs` を
-//! 読む形は応答の完全一致ではなく「他テナントの Private トークンが出ない」で検査する。副文の
+//! 読み取りの注意: 主クエリが `docs` を読む形は、baseline／flooded それぞれの返却 body 集合を
+//! seed と可視性モードから算出した期待集合と照合し、他テナントの Private トークン非混入も検査する。副文の
 //! `WHERE` サブクエリが読む `tags` は、他テナントの追加行を Private にして応答の完全一致を保つ。
 //!
 //! 対象外: SQL-40（オブジェクト単位の権限を副文ごとに検査すること。engine に実装が無い。実装時に
@@ -353,6 +353,47 @@ fn private_token_leaks(dump: &str, viewer: &str) -> usize {
                 .sum::<usize>()
         })
         .sum()
+}
+
+/// 応答の全テキストに現れる `docs` 行トークン（テナント名, id）の集合。
+fn docs_tokens(dump: &str) -> std::collections::BTreeSet<(&'static str, u64)> {
+    let mut set = std::collections::BTreeSet::new();
+    for t in TENANTS {
+        for id in 1..=12u64 {
+            if dump.contains(&format!("tok-{t}-docs-{id}\"")) {
+                set.insert((t, id));
+            }
+        }
+    }
+    set
+}
+
+/// 主クエリが `docs` を読む形の期待集合（seed と可視性モードから算出する真実値）。
+/// 自テナントは Public＋Private 込みなら全 4 行・Public のみなら奇数 id のみ。他テナントは
+/// flooded のときだけ存在し、可視なのは Public 行（共通 seed の奇数 id と追加 9〜12）のみ（RLS-7）。
+/// 主クエリは副文の変更を見ない（文開始時点の状態を読む）ため、副文の削除は差し引かない。
+fn expected_docs(
+    viewer: &str,
+    allow_private: bool,
+    flood: bool,
+) -> std::collections::BTreeSet<(&'static str, u64)> {
+    let mut set = std::collections::BTreeSet::new();
+    for t in TENANTS {
+        let ids: Vec<u64> = if t == viewer {
+            (1..=4).collect()
+        } else if flood {
+            vec![1, 2, 3, 4, 9, 10, 11, 12]
+        } else {
+            Vec::new()
+        };
+        for id in ids {
+            let public = id % 2 == 1 || id >= 9;
+            if public || (t == viewer && allow_private) {
+                set.insert((t, id));
+            }
+        }
+    }
+    set
 }
 
 /// 応答（成功の行・エラーメッセージ）に閲覧側以外のテナント名が現れる件数。
@@ -862,11 +903,16 @@ fn t1_independent_oracle_and_no_foreign_tokens() {
                     ));
                 }
             } else {
-                assert!(
-                    matches!(cell.obs, Obs::Ok { .. }),
-                    "{which}: {}: {:?}",
-                    label(r),
-                    cell.obs
+                let Obs::Ok { debug, .. } = &cell.obs else {
+                    panic!("{which}: {}: {:?}", label(r), cell.obs);
+                };
+                // 返却内容を seed と可視性モードから算出した期待集合と照合する（空返却や
+                // Public のみモードでの自テナント Private 行の返却を検出する）。
+                assert_eq!(
+                    docs_tokens(debug),
+                    expected_docs(r.viewer, r.allow_private, which == "flooded"),
+                    "{which}: {}",
+                    label(r)
                 );
             }
             if matches!(cell.obs, Obs::Err { .. }) {
