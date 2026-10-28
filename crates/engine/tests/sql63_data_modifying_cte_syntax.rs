@@ -103,15 +103,17 @@ fn unsupported_data_modifying_cte_shapes_stop_with_0a000_and_change_nothing() {
     let before_alice = (count(&core, "alice"), lang_of_all(&core, "alice"));
     let before_bob = (count(&core, "bob"), lang_of_all(&core, "bob"));
     for sql in [
-        // 主クエリが実表を読む（文開始時点の可視性は #1877）
-        "WITH d AS (DELETE FROM docs WHERE lang = 'ja') SELECT * FROM docs LIMIT 10",
-        "WITH d AS (DELETE FROM docs WHERE lang = 'ja' RETURNING id) SELECT * FROM docs LIMIT 10",
         // RETURNING なしの副文を参照
         "WITH d AS (DELETE FROM docs WHERE lang = 'ja') SELECT * FROM d LIMIT 10",
-        // 複数のデータ変更 CTE（#1877）
-        "WITH a AS (DELETE FROM docs WHERE lang = 'ja' RETURNING id), \
+        // JOIN の主クエリでデータ変更 CTE を含む形は未対応
+        "WITH d AS (DELETE FROM docs WHERE lang = 'ja' RETURNING id) \
+         SELECT d.id FROM d JOIN docs ON d.id = docs.id LIMIT 10",
+        // ON CONFLICT 付き INSERT 副文が他の副文と同じ表を対象にする形は、文開始時点の可視性を
+        // 保証できないため未対応（#1877）
+        "WITH a AS (INSERT INTO docs (id, embedding, lang, body) \
+         VALUES (1, '[1,2]', 'zz', 'b') ON CONFLICT (id) DO NOTHING RETURNING id), \
          b AS (UPDATE docs SET lang = 'xx' WHERE lang = 'en' RETURNING id) \
-         SELECT id FROM a LIMIT 10",
+         SELECT id FROM b LIMIT 10",
     ] {
         for tenant in ["alice", "bob"] {
             let err = run(&core, tenant, sql).expect_err("must stop before execution");

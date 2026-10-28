@@ -7,7 +7,8 @@
 //! 文末の `USING OPERATION_ID` が文単位で台帳に記録されること、未対応の形は書き込みトランザクションを
 //! 開く前に固定 `0A000` で拒否され表が一切変わらないことを production 経路
 //! （`EngineCore::execute_sql_in_session`／`execute_sql_in_txn`）で固定する。文開始時点の可視性・
-//! 同一行の多重変更・複数のデータ変更 CTE は #1877、RLS・権限の境界テストは #1878 の担当。
+//! 同一行の多重変更・複数のデータ変更 CTE は `sql63_data_modifying_cte_semantics.rs`（#1877）、
+//! RLS・権限の境界テストは #1878 の担当。
 
 use engine::catalog::{ColumnDef, ColumnType, TableSchema};
 use engine::core::EngineCore;
@@ -193,15 +194,15 @@ fn unsupported_shapes_stop_with_0a000_and_change_nothing() {
     let (core, _g) = open_seeded();
     let before = (state(&core, "alice"), state(&core, "bob"));
     for sql in [
-        // 複数のデータ変更 CTE（#1877）
-        "WITH a AS (DELETE FROM docs WHERE lang = 'ja' RETURNING id), \
-         b AS (DELETE FROM docs WHERE lang = 'en' RETURNING id) SELECT id FROM a LIMIT 10",
-        // 主クエリが実表を読む（#1877）
-        "WITH d AS (DELETE FROM docs WHERE lang = 'ja' RETURNING id) SELECT id FROM docs LIMIT 10",
         // RETURNING なしの副文を参照
         "WITH d AS (DELETE FROM docs WHERE lang = 'ja') SELECT * FROM d LIMIT 10",
-        // 主クエリが副文を読まない（副文だけ書く形）
-        "WITH d AS (DELETE FROM docs WHERE lang = 'ja') SELECT id FROM docs LIMIT 10",
+        // JOIN の主クエリでデータ変更 CTE を含む形
+        "WITH d AS (DELETE FROM docs WHERE lang = 'ja' RETURNING id) \
+         SELECT d.id FROM d JOIN docs ON d.id = docs.id LIMIT 10",
+        // ON CONFLICT 付き INSERT 副文が他の副文と同じ表を対象にする形（#1877）
+        "WITH a AS (INSERT INTO docs (id, embedding, lang, body) \
+         VALUES (1, '[1,2]', 'zz', 'b') ON CONFLICT (id) DO NOTHING RETURNING id), \
+         b AS (DELETE FROM docs WHERE lang = 'en' RETURNING id) SELECT id FROM b LIMIT 10",
     ] {
         for tenant in ["alice", "bob"] {
             assert_eq!(
