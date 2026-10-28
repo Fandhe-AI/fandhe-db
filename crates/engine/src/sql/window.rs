@@ -268,7 +268,7 @@ impl OffsetEvaluator {
                 item.offset_args.as_ref().map(|args| OffsetPrograms {
                     value: match &args.value {
                         BoundWindowValue::Expr { bound, .. } => Some(ExprProgram::compile(bound)),
-                        BoundWindowValue::Column { .. } => None,
+                        BoundWindowValue::Column { .. } | BoundWindowValue::PseudoId => None,
                     },
                     offset: args.offset.as_ref().map(ExprProgram::compile),
                     default: args.default.as_ref().map(ExprProgram::compile),
@@ -321,6 +321,7 @@ impl OffsetEvaluator {
                 BoundWindowValue::Column { index, ty } => {
                     Ok(scalar_cell(ty, *index, scanned, state_bytes, state_cap)?)
                 }
+                BoundWindowValue::PseudoId => defer_data_exception(pseudo_id_cell(id))?,
                 BoundWindowValue::Expr { .. } => {
                     let program = programs
                         .value
@@ -341,6 +342,8 @@ impl OffsetEvaluator {
                 state_bytes,
                 state_cap,
             )?))
+        } else if args.default_pseudo_id {
+            Some(defer_data_exception(pseudo_id_cell(id))?)
         } else if let (Some(_), Some(program)) = (&args.default, &programs.default) {
             Some(defer_data_exception(
                 program
@@ -356,6 +359,14 @@ impl OffsetEvaluator {
             default,
         })
     }
+}
+
+/// 裸の疑似列 `id` を BIGINT セルへ直接変換する（f64 を経由しない）。`i64` に収まらない
+/// `id` は `22003`（データ例外。参照された行でだけ表面化する）。
+fn pseudo_id_cell(id: u64) -> Result<Cell, SqlSurfaceError> {
+    i64::try_from(id)
+        .map(Cell::SignedInteger)
+        .map_err(|_| SqlSurfaceError::numeric_out_of_range("bigint out of range"))
 }
 
 /// スカラー列 1 つをセル化する（[`push_scalar_column_cell`] の薄い包み。テキスト長は
@@ -2326,6 +2337,7 @@ mod budget_regression_tests {
                 offset: None,
                 default: None,
                 default_column: None,
+                default_pseudo_id: false,
                 result_type: Some(ColumnType::Uuid),
                 uses_pseudo_id: false,
             });
@@ -2594,6 +2606,7 @@ mod budget_regression_tests {
             offset: None,
             default: None,
             default_column: None,
+            default_pseudo_id: false,
             result_type: Some(ColumnType::Text),
             uses_pseudo_id: false,
         });

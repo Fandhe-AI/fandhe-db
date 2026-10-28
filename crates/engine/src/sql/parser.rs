@@ -9729,6 +9729,9 @@ pub(crate) struct BoundWindowOffsetArgs {
     /// 位置と宣言型（型統一済み。この場合 `default` は `None`）。`sql::window` が宣言型で
     /// セル化する（統一後の型では行の格納表現と食い違いうるため、宣言型を併せて運ぶ）。
     pub(crate) default_column: Option<(usize, ColumnType)>,
+    /// 既定値が裸の疑似列 `id` のとき `true`（この場合 `default` は `None`）。`sql::window` が
+    /// 行 `id` を f64 経由にせず整数セルへ直接変換する（2^53 超の `id` を正確に保つ）。
+    pub(crate) default_pseudo_id: bool,
     /// 統一後の結果列型（`window_result_type` が公告に使う）。
     pub(crate) result_type: Option<ColumnType>,
     /// 引数が疑似列 `id` を参照するか（セル評価経路 `CellWindowEvaluator` が拒否に使う）。
@@ -9753,6 +9756,7 @@ impl BoundWindowOffsetArgs {
                 }
                 any = true;
             }
+            BoundWindowValue::PseudoId => {}
             BoundWindowValue::Expr { bound, .. } => {
                 any |= crate::sql::udf_call::mark_referenced_scalar_columns(bound, mask);
             }
@@ -9774,7 +9778,7 @@ impl BoundWindowOffsetArgs {
     /// 引数が埋め込みベクトルを参照するか。
     pub(crate) fn references_embedding(&self) -> bool {
         let value = match &self.value {
-            BoundWindowValue::Column { .. } => false,
+            BoundWindowValue::Column { .. } | BoundWindowValue::PseudoId => false,
             BoundWindowValue::Expr { bound, .. } => {
                 crate::sql::udf_call::references_embedding(bound)
             }
@@ -9800,6 +9804,8 @@ pub(crate) enum BoundWindowValue {
         bound: crate::sql::udf_call::BoundExpr,
         ty: crate::sql::udf_call::ExprType,
     },
+    /// 裸の疑似列 `id`（BIGINT）。f64 を経由する式層ではなく行 `id` から整数セルを直接作る。
+    PseudoId,
 }
 
 /// `LAG`／`LEAD` の値として運べない型（`VECTOR`・配列・`BYTEA`・`json`・`jsonb`。fail-closed）。
@@ -9998,6 +10004,17 @@ fn bind_window_offset_args(
     };
     let null_default = matches!(&args.default, Some(Expr::Null)).then_some(BoundExpr::Null);
 
+    if default_expr.is_none() && is_pseudo_id_ref(&args.value, schema) {
+        return Ok(BoundWindowOffsetArgs {
+            value: BoundWindowValue::PseudoId,
+            offset,
+            default: null_default,
+            default_column: None,
+            default_pseudo_id: false,
+            result_type: Some(ColumnType::BigInt),
+            uses_pseudo_id,
+        });
+    }
     let bare_column = match &args.value {
         Expr::Ident(name) => schema
             .columns
@@ -10018,6 +10035,7 @@ fn bind_window_offset_args(
             offset,
             default: null_default,
             default_column: None,
+            default_pseudo_id: false,
             result_type: Some(column.ty.clone()),
             uses_pseudo_id,
         });
@@ -10033,10 +10051,23 @@ fn bind_window_offset_args(
             }
             // BIGINT の裸の列は f64 ベースの式層を通すと 2^53 超が範囲エラーになるため、
             // 式束縛へ落とさず宣言型・列位置でセル化する経路（下の `InvalidInput` 腕）へ回す。
-            let exact_int = bare_column
-                .iter()
-                .chain(default_bare.iter())
-                .any(|(_, c)| matches!(c.ty, ColumnType::BigInt));
+            // 整数同士のときに限る（倍精度への昇格が要る組は従来の型統一へ回す）。
+            let value_pseudo = is_pseudo_id_ref(&args.value, schema);
+            let default_pseudo = is_pseudo_id_ref(d, schema);
+            let is_int = |t: &Option<ColumnType>| {
+                matches!(
+                    t,
+                    Some(ColumnType::SmallInt | ColumnType::Integer | ColumnType::BigInt)
+                )
+            };
+            let exact_int = (value_pseudo
+                || default_pseudo
+                || bare_column
+                    .iter()
+                    .chain(default_bare.iter())
+                    .any(|(_, c)| matches!(c.ty, ColumnType::BigInt)))
+                && is_int(&value_decl)
+                && is_int(&default_decl);
             let bound = if exact_int {
                 Err(SqlSurfaceError::InvalidInput {
                     detail: "LAG/LEAD BIGINT column is bound by declared type".to_string(),
@@ -10054,7 +10085,10 @@ fn bind_window_offset_args(
                 // 式層が拒否する型（BOOLEAN・NUMERIC・UUID・ENUM 等）の裸の列は宣言型で
                 // 型統一・不一致判定する（`COALESCE` 式束縛へ落とさない）。
                 Err(SqlSurfaceError::InvalidInput { .. })
-                    if bare_column.is_some() || default_bare.is_some() =>
+                    if bare_column.is_some()
+                        || default_bare.is_some()
+                        || value_pseudo
+                        || default_pseudo =>
                 {
                     let mismatch = || {
                         SqlSurfaceError::datatype_mismatch(
@@ -10069,6 +10103,7 @@ fn bind_window_offset_args(
                             },
                             c.ty.clone(),
                         ),
+                        None if value_pseudo => (BoundWindowValue::PseudoId, ColumnType::BigInt),
                         None => {
                             let (b, ty, col) =
                                 bind_projection_expr(&args.value, schema, udfs, node_budget)?;
@@ -10089,6 +10124,7 @@ fn bind_window_offset_args(
                     };
                     let (default_bound, default_column, default_ty) = match default_bare {
                         Some((index, c)) => (None, Some((index, c.ty.clone())), c.ty.clone()),
+                        None if default_pseudo => (None, None, ColumnType::BigInt),
                         None => {
                             let (b, _ty, col) = bind_projection_expr(d, schema, udfs, node_budget)?;
                             let col = default_decl.clone().or(col).ok_or_else(mismatch)?;
@@ -10105,6 +10141,7 @@ fn bind_window_offset_args(
                         offset,
                         default: default_bound,
                         default_column,
+                        default_pseudo_id: default_pseudo,
                         result_type: Some(unified),
                         uses_pseudo_id,
                     });
@@ -10132,6 +10169,7 @@ fn bind_window_offset_args(
         offset,
         default,
         default_column: None,
+        default_pseudo_id: false,
         result_type: col,
         uses_pseudo_id,
     })

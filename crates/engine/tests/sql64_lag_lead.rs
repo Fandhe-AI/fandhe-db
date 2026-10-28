@@ -894,3 +894,89 @@ fn bigint_column_with_default_stays_exact() {
         sis(&[Some(BIG + 1), Some(BIG + 1)])
     );
 }
+
+/// BIGINT の裸の列と倍精度の既定値の混在は従来の型統一（倍精度）で受理する（両方向）。
+/// 整数同士のときだけ正確保持経路を使う（Issue #1881 のレビュー指摘の回帰）。
+#[test]
+fn bigint_column_mixed_with_double_default_unifies_to_double() {
+    let path = unique_db_path("lag-eval-bigint-double");
+    let _g = CleanupGuard(path.clone());
+    let storage = Storage::open(&path).expect("open storage");
+    let ctx = ctx_for("tenant-a");
+    storage
+        .create_table(&TableSchema::new(
+            "big",
+            vec![ColumnDef::new("b", ColumnType::BigInt, true)],
+        ))
+        .expect("create table");
+    for id in 1..=2u64 {
+        let op_id = engine::recovery::required_op_id::OperationId::parse(&format!("mix-op-{id}"))
+            .expect("valid operation_id");
+        engine::tenant::insert_typed_row(
+            &storage,
+            "big",
+            &ctx,
+            id,
+            Visibility::Public,
+            &[Value::BigInt(i64::try_from(id).expect("small") * 10)],
+            &op_id,
+        )
+        .expect("insert row");
+    }
+    let core = EngineCore::from_storage(storage, Box::new(CpuScalarProvider));
+    let q = |c: &str| col1(&core, &ctx, &format!("SELECT id, {c} FROM big LIMIT 10"));
+    assert_eq!(
+        q("lag(b, 1, 0.5) OVER (ORDER BY id)"),
+        vec![Cell::Float(0.5), Cell::Float(10.0)]
+    );
+    assert_eq!(
+        q("lag(0.5, 1, b) OVER (ORDER BY id)"),
+        vec![Cell::Float(10.0), Cell::Float(0.5)]
+    );
+}
+
+/// 裸の疑似列 `id` は値・既定値のどちらでも f64 を経由せず、2^53 超の `id` が正確に保たれる
+/// （Issue #1881 のレビュー指摘の回帰）。
+#[test]
+fn pseudo_id_beyond_2_pow_53_stays_exact() {
+    const BIG_ID: u64 = 9_007_199_254_740_993;
+    let path = unique_db_path("lag-eval-pseudo-id");
+    let _g = CleanupGuard(path.clone());
+    let storage = Storage::open(&path).expect("open storage");
+    let ctx = ctx_for("tenant-a");
+    storage
+        .create_table(&TableSchema::new(
+            "big",
+            vec![ColumnDef::new("b", ColumnType::BigInt, true)],
+        ))
+        .expect("create table");
+    for id in [BIG_ID, BIG_ID + 2] {
+        let op_id = engine::recovery::required_op_id::OperationId::parse(&format!("pid-op-{id}"))
+            .expect("valid operation_id");
+        engine::tenant::insert_typed_row(
+            &storage,
+            "big",
+            &ctx,
+            id,
+            Visibility::Public,
+            &[Value::BigInt(1)],
+            &op_id,
+        )
+        .expect("insert row");
+    }
+    let core = EngineCore::from_storage(storage, Box::new(CpuScalarProvider));
+    let q = |c: &str| col1(&core, &ctx, &format!("SELECT id, {c} FROM big LIMIT 10"));
+    let b = i64::try_from(BIG_ID).expect("fits");
+    assert_eq!(
+        q("lag(id, 0) OVER (ORDER BY id)"),
+        sis(&[Some(b), Some(b + 2)])
+    );
+    assert_eq!(
+        q("lag(id, 1, id) OVER (ORDER BY id)"),
+        sis(&[Some(b), Some(b)])
+    );
+    assert_eq!(
+        q("lead(b, 1, id) OVER (ORDER BY id)"),
+        sis(&[Some(1), Some(b + 2)])
+    );
+}
