@@ -23,8 +23,8 @@ WITH <name> [(<列名>, ...)] AS (SELECT <* | 列名リスト> FROM <table | vie
 <主クエリ: SELECT <* | 列名リスト> FROM <name> [WHERE ...] LIMIT n>
 ```
 
-- CTE 本文は `parse_view_body` の受理範囲（`LIMIT`・`ORDER BY`・`USING PLAN`・
-  集計・式項目・UDF 呼び出し述語はいずれも `42601`）に加え、本文内の `;`
+- CTE 本文は `parse_view_body` の受理範囲（`USING PLAN`・式項目・UDF 呼び出し述語は `42601`。
+  `LIMIT`・`ORDER BY` は #1862、集計・窓は #1863 の追記節で受理）に加え、本文内の `;`
   （`Token::Punct(';')`）も明示的に拒否する。`parse_view_body` が使う
   `expect_end_of_statement` は末尾の単一 `;` を許容してしまうため、CTE の
   括弧内トークン列に対しては呼び出し前に別途検査する。
@@ -178,7 +178,7 @@ CTE は原則として実体化しない（インライン展開。明示 `MATER
   上限を超えたら黙って切り詰めず `54000`。判定は RLS 適用後の可視行だけで行い、他テナント行の
   存在は漏れない。Describe と Execute は同じ上限を使う。
 - 対象外: 同一 CTE の複数回参照時の 1 回評価・JOIN 入力・指定なし CTE の既定の具体化は #1861、
-  本文の `LIMIT`／`ORDER BY` は #1862 で対応済み（下の「Issue #1862 追記」節）、本文の集計・窓は #1863。`EXPLAIN` での表示は対象外。
+  本文の `LIMIT`／`ORDER BY` は #1862 で対応済み（下の「Issue #1862 追記」節）、本文の集計・窓は #1863 で対応済み（下の「Issue #1863 追記」節）。`EXPLAIN` での表示は対象外。
 
 ## Issue #1861 追記: CTE を JOIN の入力にする（SQL-62 (1)(3)(5)(6) ポインタ）
 
@@ -233,7 +233,7 @@ CTE は原則として実体化しない（インライン展開。明示 `MATER
 - 観測: 本文の評価回数は結果から観測できないため、`EngineCore::materialized_cte_eval_stats`
   （`VectorCore` trait 外の固有 API。テナント ID・行数を含まない）で「記憶域に対する本文の実行回数」を
   公開する。`Derived` の導出は数えない。
-- 対象外: 集計・`GROUP BY`・窓（#1863。本文の `LIMIT`／`ORDER BY` は #1862 で対応済み）、派生表（FROM の部分クエリ）、
+- 対象外: 派生表（FROM の部分クエリ）、
   主クエリのサブクエリからの CTE 参照、集合演算の主クエリ、`EXPLAIN` での具体化の表示、NoSQL 表層、
   JOIN 入力の非共有 CTE への述語プッシュダウン。
 
@@ -269,3 +269,34 @@ tail CTE と呼ぶ（`CteDef.tail`）。関連: SQL-34（暗黙上限・`54000`�
   変更 CTE を含む文での参照は固定 `0A000`。本文のベクトル順位付け・集計・窓・式投影・サブクエリは `42601`、
   `WITH TIES` は `0A000`。
 - 対象外: tail CTE の連鎖、インライン専用の文脈での参照、`EXPLAIN` での表示、NoSQL 表層。
+
+## Issue #1863 追記（SQL-62 ポインタ）
+
+CTE 本文の集計・`GROUP BY`・`SELECT DISTINCT`・ウィンドウ関数を受理する。関連: SQL-34（暗黙上限・
+`54000`）・RLS-10 (b)。
+
+- 受理範囲と解析: `parse_view_body` が失敗した本文を、まず集計形か判定する（先頭項目が集計関数・
+  `GROUP BY`・トップレベルの `HAVING`・`DISTINCT` 修飾子。述語は通常 SELECT の入口と共有）。集計形は
+  `parse_aggregate_shape`／`parse_distinct_shape` で解析して `CteBody::Aggregate` にする。ウィンドウ項目
+  （`) OVER (`）を持つ本文は #1862 の `parse_select_shape` 再解析に載せ、窓項目を `CteBodyTail.window_items`
+  に詰める（`ORDER BY`／`LIMIT` の語が無い窓本文も `tail` を持つ）。`WHERE` は単純形のみ
+  （`check_view_body_predicates`）。
+- インラインへ戻さない: 集計・窓は外側の `WHERE` を基底表へ合成すると意味が変わるため、tail CTE と同じく
+  常に具体化経路で評価し、インライン解決は `cte::resolve_relation` が固定 `0A000` で拒否する
+  （`CteDef::requires_materialization`）。単一表の主クエリは `forced_cte_statement` が
+  `Statement::BufferedView`（`MaterializedCte`）を組む（本文は集計なら `Statement::Aggregate`、窓なら窓項目つきの
+  `Statement::Scan`）。
+- 上限・RLS: 本文は参照者自身の `PolicyContext`・同一の `read_txn` で評価し、集計値・窓の値は可視行だけから
+  計算される（RLS-10 (b)）。`LIMIT` なしの本文は暗黙上限で、可視行（集計ならグループ数）が
+  `--max-result-rows` を超えたら `54000`。集計引数・`GROUP BY` キー・窓の `PARTITION BY`／`ORDER BY` は
+  FROM の公開列に限定する（`22000`／`42703`。参照されない CTE にも適用）。
+- 列名リスト: 集計・窓の本文は `compose` を通さず、出力列数から静的に検査する（リストが長ければ `42P10`、
+  改名後の重複は `42702`）。参照の有無によらない。
+- JOIN の入力: 窓本文は slot（`CteSlotSource::Scan`）に載せられる。集計本文は集計の実行器が JoinBudget の
+  バイト予算（確保前の計上）を受け取れないため固定 `0A000`。先行 CTE を読む窓本文（導出層）も `0A000`。
+- 拒否: 集計・窓 CTE を別の CTE が読む連鎖・インライン専用の文脈・データ変更 CTE を含む文での参照・
+  `WITH TIES` は `0A000`。式項目・`GROUPING SETS`／`ROLLUP`／`CUBE`・式の `GROUP BY` キー・`HAVING` 内の
+  集計呼び出し（`WITH` の主クエリ・ビュー本体と同じ制限。集計値の絞り込みは外側の `WHERE` で行う）・窓と
+  `GROUP BY` の併用・ベクトル順位付けは `42601`。
+- 対象外: 集計 CTE の JOIN 入力、連鎖、インライン専用の文脈、式項目／`GROUPING SETS`、窓の導出層、
+  `EXPLAIN` での表示、NoSQL 表層。

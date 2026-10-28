@@ -15443,8 +15443,13 @@ impl<'a> Parser<'a> {
             } else {
                 match parse_view_body(inner) {
                     Ok(body) => super::cte::CteBody::Select(body),
-                    // SQL-62・Issue #1862: 本文が `ORDER BY`／`LIMIT`／`OFFSET` を持つ形は
-                    // 既存の SELECT 許可パーサーで再解析する（元の失敗が tail 以外の理由なら
+                    // SQL-62・Issue #1863: 集計・`GROUP BY`／`HAVING`・`SELECT DISTINCT` の本文は
+                    // 既存の集計許可パーサーで解析する（判定は通常 SELECT の入口と同じ述語）。
+                    Err(_) if is_cte_aggregate_body(inner) => super::cte::CteBody::Aggregate(
+                        Box::new(parse_cte_aggregate_body(inner, self.nesting_limits)?),
+                    ),
+                    // SQL-62・Issue #1862・#1863: 本文が `ORDER BY`／`LIMIT`／`OFFSET`・ウィンドウ関数を
+                    // 持つ形は既存の SELECT 許可パーサーで再解析する（元の失敗がそれ以外の理由なら
                     // 元のエラーをそのまま返す）。
                     Err(err) => {
                         let (body, parsed_tail) =
@@ -15826,19 +15831,97 @@ fn has_top_level_tail_keyword(tokens: &[Token]) -> bool {
     false
 }
 
-/// CTE 本文が `ORDER BY`・`LIMIT`・`OFFSET` を持つ形（tail CTE。SQL-62・Issue #1862）を、
-/// 既存の SELECT 許可パーサー [`parse_select_shape`] で解析する。呼び出し元は
-/// [`Parser::parse_with_clause`] で、`orig` は [`parse_view_body`] の失敗。tail の語が無い本文は
+/// トークン列に `GROUP BY` の並びがあるか（通常 SELECT の振り分けと CTE 本文の判定が共有する）。
+fn tokens_contain_group_by(tokens: &[Token]) -> bool {
+    tokens.windows(2).any(|w| {
+        matches!(&w[0], Token::Ident(name) if name.eq_ignore_ascii_case("GROUP"))
+            && matches!(w[1], Token::Keyword(Keyword::By))
+    })
+}
+
+/// トークン列にウィンドウ項目の目印 `) OVER (` の並びがあるか（同上）。
+fn tokens_contain_window_over(tokens: &[Token]) -> bool {
+    tokens.windows(3).any(|w| {
+        matches!(w[0], Token::Punct(')'))
+            && matches!(&w[1], Token::Ident(name) if name.eq_ignore_ascii_case("OVER"))
+            && matches!(w[2], Token::Punct('('))
+    })
+}
+
+/// CTE 本文が集計形（集計・`GROUP BY`／`HAVING`・`SELECT DISTINCT`。SQL-62・Issue #1863）か。
+/// 判定は [`validate_select_statement`] と同じ述語（先頭項目が集計関数名 `(`・`GROUP BY`・
+/// トップレベルの `HAVING`・`DISTINCT` 修飾子）で、ウィンドウ項目を含む本文は窓として扱う
+/// （窓と `GROUP BY` の併用は [`parse_cte_body_with_tail`] が `42601`）。
+fn is_cte_aggregate_body(inner: &[Token]) -> bool {
+    if !matches!(inner.first(), Some(Token::Keyword(Keyword::Select))) {
+        return false;
+    }
+    if is_distinct_modifier(inner, 1) {
+        return true;
+    }
+    if tokens_contain_window_over(inner) {
+        return false;
+    }
+    (matches!(inner.get(1), Some(Token::Ident(name)) if is_aggregate_function_name(name))
+        && matches!(inner.get(2), Some(Token::Punct('('))))
+        || tokens_contain_group_by(inner)
+        || has_top_level_having_clause(inner)
+}
+
+/// CTE 本文の集計形を既存の集計許可パーサーで解析する（SQL-62・Issue #1863）。式項目・
+/// `GROUPING SETS`／`ROLLUP`／`CUBE`・式の `GROUP BY` キー・サブクエリは `WITH` の主クエリと同じく
+/// `42601`、`WITH TIES` は `0A000`、`WHERE` は単純形のみ（fail-closed）。
+fn parse_cte_aggregate_body(
+    inner: &[Token],
+    limits: crate::nesting_limits::NestingLimits,
+) -> Result<super::cte::CteAggregateBody, SqlSurfaceError> {
+    // `FILTER (WHERE ...)` の事前検査（SQLSTATE を通常 SELECT と揃える。SQL-57）。
+    for (i, w) in inner.windows(3).enumerate() {
+        if matches!(&w[0], Token::Ident(n) if n.eq_ignore_ascii_case("FILTER"))
+            && matches!(w[1], Token::Punct('('))
+            && matches!(w[2], Token::Keyword(Keyword::Where))
+        {
+            precheck_aggregate_filter_tokens(inner, i.saturating_add(1))?;
+        }
+    }
+    let shape = if is_distinct_modifier(inner, 1) {
+        parse_distinct_shape(inner)?
+    } else {
+        parse_aggregate_shape(inner, None, false, false, limits)?
+    };
+    if shape.group_by.as_ref().is_some_and(|g| g.with_ties) {
+        return Err(SqlSurfaceError::feature_not_supported(
+            "WITH TIES is not supported in a CTE body",
+        ));
+    }
+    check_view_body_predicates(&shape.where_predicates)?;
+    Ok(super::cte::CteAggregateBody {
+        table_name: shape.table_name,
+        items: shape.items,
+        where_predicates: shape.where_predicates,
+        group_by: shape.group_by,
+    })
+}
+
+/// CTE 本文が `ORDER BY`・`LIMIT`・`OFFSET`・ウィンドウ関数を持つ形（tail／窓 CTE。SQL-62・
+/// Issue #1862・#1863）を、既存の SELECT 許可パーサー [`parse_select_shape`] で解析する。呼び出し元は
+/// [`Parser::parse_with_clause`] で、`orig` は [`parse_view_body`] の失敗。これらの語が無い本文は
 /// `orig` を返して従来の `42601` を保つ。受理する形は `parse_view_body` と同じ頭部（`*`／列名投影・
-/// 単一 relation・単純 `WHERE`）に tail を足したものだけで、ベクトル順位付け・集計・窓・式投影・
-/// サブクエリは `42601`、`WITH TIES` は `0A000`（fail-closed）。
+/// 単一 relation・単純 `WHERE`）に tail・窓項目を足したものだけで、ベクトル順位付け・窓と `GROUP BY`
+/// の併用・式投影・サブクエリは `42601`、`WITH TIES` は `0A000`（fail-closed）。
 fn parse_cte_body_with_tail(
     inner: &[Token],
     limits: crate::nesting_limits::NestingLimits,
     orig: SqlSurfaceError,
 ) -> Result<(ParsedViewBody, super::cte::CteBodyTail), SqlSurfaceError> {
-    if !has_top_level_tail_keyword(inner) {
+    let has_window = tokens_contain_window_over(inner);
+    if !has_top_level_tail_keyword(inner) && !has_window {
         return Err(orig);
+    }
+    if has_window && (tokens_contain_group_by(inner) || has_top_level_having_clause(inner)) {
+        return Err(SqlSurfaceError::unsupported(
+            "window functions cannot be combined with GROUP BY",
+        ));
     }
     let shape = match parse_select_shape(inner, None, true, limits)? {
         ParsedSelect::Scan(shape) => shape,
@@ -15854,7 +15937,6 @@ fn parse_cte_body_with_tail(
         ));
     }
     if matches!(shape.projection, Projection::Items(_))
-        || !shape.window_items.is_empty()
         || !shape.scalar_subquery_items.is_empty()
         || !shape.embedded_scalar_subqueries.is_empty()
     {
@@ -15875,6 +15957,7 @@ fn parse_cte_body_with_tail(
             order_keys: shape.order_keys,
             limit: shape.limit,
             offset: shape.offset,
+            window_items: shape.window_items,
         },
     ))
 }
@@ -16140,10 +16223,7 @@ fn collect_cte_definition_relations(
     for (i, def) in ctes.iter().enumerate() {
         let visible = ctes.get(..i).unwrap_or(&[]);
         // データ変更 CTE（SQL-63）は対象表を依存として加える（CTE 名との衝突は検証段が拒否済み）。
-        let table = match &def.body {
-            super::cte::CteBody::Select(b) => b.table_name.as_str(),
-            super::cte::CteBody::DataModifying(b) => b.target_table.as_str(),
-        };
+        let table = def.relation_name();
         if !visible.iter().any(|c| c.name.eq_ignore_ascii_case(table)) {
             push_relation(out, table);
         }
@@ -22573,31 +22653,26 @@ enum MainShape {
     Aggregate(ParsedAggregateShape),
 }
 
-/// tail CTE（本文が `ORDER BY`・`LIMIT`・`OFFSET` を持つ CTE。SQL-62・Issue #1862）を主クエリが
-/// 直接参照する単一表の文を、具体化経路（`Statement::BufferedView`・`MaterializedCte`）で組む。
-/// 本文の `LIMIT` はインライン展開では表現できないため、[`materialized_cte_statement`] と違い
-/// **インライン展開へ戻さない**（戻すと `LIMIT` が黙って落ちて誤結果になる）。外側が評価後射影形として
+/// 具体化を強制する CTE（本文が `ORDER BY`・`LIMIT`・`OFFSET`・集計・窓を持つ CTE。SQL-62・
+/// Issue #1862・#1863）を主クエリが直接参照する単一表の文を、具体化経路
+/// （`Statement::BufferedView`・`MaterializedCte`）で組む。本文の `LIMIT`・集計はインライン展開では
+/// 表現できないため、[`materialized_cte_statement`] と違い**インライン展開へ戻さない**（戻すと
+/// `LIMIT` が黙って落ち、外側の `WHERE` が集計の前に掛かって誤結果になる）。外側が評価後射影形として
 /// 受理できない形などの失敗は、そのままエラー（`42601`／`0A000` ほか）として返す（fail-closed）。
-/// 本文は参照者自身の `PolicyContext`・外側と同一の `read_txn` で評価され、`LIMIT` は RLS 適用後の
-/// 可視行に掛かる（RLS-10 (b)）。`LIMIT` なしの本文は暗黙上限（`--max-result-rows`）つきで、超過は
-/// `54000`（SQL-34）。
-fn tail_cte_statement(
+/// 本文は参照者自身の `PolicyContext`・外側と同一の `read_txn` で評価され、`LIMIT`・集計・窓は RLS
+/// 適用後の可視行に掛かる（RLS-10 (b)）。`LIMIT` なしの本文は暗黙上限（`--max-result-rows`）つきで、
+/// 超過は `54000`（SQL-34）。
+fn forced_cte_statement(
     ctes: &[super::cte::CteDef],
     idx: usize,
     main: MainShape,
     lookup: &impl TableLookup,
     limits: crate::nesting_limits::NestingLimits,
 ) -> Result<Statement, SqlSurfaceError> {
-    let (Some(def), Some(select_body)) =
-        (ctes.get(idx), ctes.get(idx).and_then(|d| d.select_body()))
-    else {
+    let Some(def) = ctes.get(idx) else {
         return Err(super::cte::data_modifying_cte_unsupported());
     };
-    let tail = def.tail.as_ref().ok_or_else(|| SqlSurfaceError::Internal {
-        detail: "CTE tail missing".to_string(),
-    })?;
-    let body = tail_cte_body_scan(ctes, idx, select_body, tail, lookup, limits)?;
-    let body = Box::new(Statement::Scan(body));
+    let body = Box::new(forced_cte_body(ctes, idx, lookup, limits)?);
     let view_name = def.name.clone();
     let stmt = match main {
         MainShape::Scan(mut shape) => {
@@ -22642,9 +22717,59 @@ fn tail_cte_statement(
     }
 }
 
+/// 具体化を強制する CTE（[`forced_cte_statement`] の対象）の本文を、先行 CTE・ビューをインライン
+/// 合成した 1 文にする。tail・窓は広域取得（[`Statement::Scan`]。窓項目・`ORDER BY`・`LIMIT`・
+/// `OFFSET` を載せる）、集計は [`Statement::Aggregate`]。FROM が別の具体化強制 CTE になる連鎖は
+/// [`super::cte::resolve_relation`] が `0A000` で拒否する。
+fn forced_cte_body(
+    ctes: &[super::cte::CteDef],
+    idx: usize,
+    lookup: &impl TableLookup,
+    limits: crate::nesting_limits::NestingLimits,
+) -> Result<Statement, SqlSurfaceError> {
+    let Some(def) = ctes.get(idx) else {
+        return Err(super::cte::data_modifying_cte_unsupported());
+    };
+    match &def.body {
+        super::cte::CteBody::Aggregate(agg) => {
+            let mut budget = super::cte::ResolveBudget::new();
+            let inner = super::cte::resolve_relation(
+                lookup,
+                ctes,
+                idx,
+                &agg.table_name,
+                0,
+                limits.max_cte_nesting_depth(),
+                &mut budget,
+            )?;
+            Ok(Statement::Aggregate(build_aggregate_from_resolved(
+                agg.table_name.clone(),
+                inner,
+                agg.items.clone(),
+                agg.where_predicates.clone(),
+                agg.group_by.clone(),
+            )?))
+        }
+        super::cte::CteBody::Select(select_body) => {
+            let tail = def.tail.as_ref().ok_or_else(|| SqlSurfaceError::Internal {
+                detail: "CTE tail missing".to_string(),
+            })?;
+            Ok(Statement::Scan(tail_cte_body_scan(
+                ctes,
+                idx,
+                select_body,
+                tail,
+                lookup,
+                limits,
+            )?))
+        }
+        super::cte::CteBody::DataModifying(_) => Err(super::cte::data_modifying_cte_unsupported()),
+    }
+}
+
 /// tail CTE の本文を、先行 CTE・ビューをインライン合成した 1 つの [`ValidatedScan`] にする
 /// （`ORDER BY`・`LIMIT`・`OFFSET` は本文のものを載せる）。単一表の主クエリ
-/// （[`tail_cte_statement`]）と JOIN の slot（[`build_join_cte_inputs`]）が共有する。
+/// （[`forced_cte_body`]）と JOIN の slot（[`build_join_cte_inputs`]）が共有する。
 /// 内側の FROM が別の tail CTE になる連鎖は [`super::cte::resolve_relation`] が `0A000` で拒否する。
 fn tail_cte_body_scan(
     ctes: &[super::cte::CteDef],
@@ -22672,7 +22797,7 @@ fn tail_cte_body_scan(
         tail.limit,
         tail.order_by.clone(),
         tail.offset,
-        Vec::new(),
+        tail.window_items.clone(),
         tail.order_keys.clone(),
         Vec::new(),
     )
@@ -22982,15 +23107,25 @@ fn validate_with_join_main(
 /// （親のインライン再評価で共有・上限の契約を迂回させない）。
 fn derived_cte_layer(ctes: &[super::cte::CteDef], idx: usize) -> Option<(usize, BufferedRows)> {
     let body = ctes.get(idx)?.select_body()?;
+    // 窓つき本文（SQL-62・Issue #1863）は評価後射影形の層（`BufferedRows`）に窓項目を載せる経路を
+    // 持たないため導出しない（呼び出し側が先行 CTE を読む本文を固定 `0A000` で拒否する）。
+    if ctes
+        .get(idx)?
+        .tail
+        .as_ref()
+        .is_some_and(|t| !t.window_items.is_empty())
+    {
+        return None;
+    }
     let parent = ctes
         .get(..idx)?
         .iter()
         .rposition(|d| d.name.eq_ignore_ascii_case(&body.table_name))?;
     let parent_def = ctes.get(parent)?;
     parent_def.select_body()?;
-    // 親が tail CTE の連鎖は対象外（Issue #1862。`validate_cte_definitions` が先に `0A000` にする
+    // 親が tail・窓 CTE の連鎖は対象外（Issue #1862・#1863。`validate_cte_definitions` が先に `0A000` にする
     // が、層の導出でも多層防御として導出しない＝呼び出し側が `0A000` にする）。
-    if parent_def.has_tail() {
+    if parent_def.requires_materialization() {
         return None;
     }
     body.where_predicates
@@ -23132,6 +23267,13 @@ fn build_join_cte_inputs(
                 }
             }
             None => {
+                // 集計本文の slot は、集計の実行器が JoinBudget のバイト予算（確保前の計上）を受け取れない
+                // ため未対応（SQL-62・Issue #1863。fail-closed。後続 Issue の対象）。
+                if matches!(def.body, super::cte::CteBody::Aggregate(_)) {
+                    return Err(SqlSurfaceError::feature_not_supported(
+                        "a CTE with an aggregate body cannot be a JOIN input yet",
+                    ));
+                }
                 let select_body = def
                     .select_body()
                     .ok_or_else(super::cte::data_modifying_cte_unsupported)?;
@@ -23208,6 +23350,104 @@ fn build_join_cte_inputs(
     })
 }
 
+/// 集計本文の CTE 1 件の事前検証（SQL-62・Issue #1863）。FROM を解決して公開列集合を得て、集計引数・
+/// `GROUP BY` キー・`WHERE` の列を [`super::view::check_aggregate_columns_within_view`] で検査し（範囲外は
+/// `22000`）、列名リストの長さ・重複を出力列から静的に検査する。`HAVING`・集計 `ORDER BY` は出力名を
+/// 指すため列検査の対象外（主クエリの集計と同じ）。
+fn validate_aggregate_cte_definition(
+    ctes: &[super::cte::CteDef],
+    idx: usize,
+    def: &super::cte::CteDef,
+    agg: &super::cte::CteAggregateBody,
+    lookup: &impl TableLookup,
+    limits: crate::nesting_limits::NestingLimits,
+) -> Result<(), SqlSurfaceError> {
+    let mut budget = super::cte::ResolveBudget::new();
+    let resolved = super::cte::resolve_relation(
+        lookup,
+        ctes,
+        idx,
+        &agg.table_name,
+        0,
+        limits.max_cte_nesting_depth(),
+        &mut budget,
+    )?;
+    let exposed = match &resolved {
+        super::view::Resolved::Table => lookup.table_columns(&agg.table_name)?,
+        super::view::Resolved::View {
+            base_table,
+            view_columns,
+            ..
+        } => match view_columns {
+            Some(cols) => Some(cols.clone()),
+            None => lookup.table_columns(base_table)?,
+        },
+        // Issue #1192: 評価後射影形ビューは CTE の本文として参照できない。
+        super::view::Resolved::Buffered { .. } => {
+            return Err(SqlSurfaceError::unsupported(
+                "a view with an aggregate/LIMIT body cannot be used in a CTE",
+            ));
+        }
+    };
+    super::view::check_aggregate_columns_within_view(
+        exposed.as_deref(),
+        &agg.items,
+        agg.group_by.as_ref(),
+        &agg.where_predicates,
+    )?;
+    let names: Vec<Option<String>> = agg
+        .items
+        .iter()
+        .map(|item| match item {
+            AggregateSelectItem::Aggregate(a) => a.alias.clone(),
+            AggregateSelectItem::GroupKey { column, alias } => {
+                Some(alias.clone().unwrap_or_else(|| column.clone()))
+            }
+            AggregateSelectItem::Expr { alias, .. } => alias.clone(),
+        })
+        .collect();
+    check_cte_column_list_static(def, &names)
+}
+
+/// 集計・窓の CTE の列名リスト（SQL-62 (2)）を、出力列の（静的に決まる範囲の）名前から検査する。
+/// `names` は出力列の並び（名前を静的に決められない列は `None`）。リストが出力列数より長ければ
+/// `42P10`、改名後の名前が重複すれば `42702`（[`super::view::apply_column_aliases`] と同じ規則。
+/// 名前を決められない列は重複判定に数えない）。リストなしなら何もしない。
+fn check_cte_column_list_static(
+    def: &super::cte::CteDef,
+    names: &[Option<String>],
+) -> Result<(), SqlSurfaceError> {
+    if def.column_aliases.is_empty() {
+        return Ok(());
+    }
+    if def.column_aliases.len() > names.len() {
+        return Err(SqlSurfaceError::CteColumnListTooLong {
+            name: def.name.clone(),
+            available: names.len(),
+            specified: def.column_aliases.len(),
+        });
+    }
+    let renamed: Vec<Option<&str>> = names
+        .iter()
+        .enumerate()
+        .map(|(i, n)| match def.column_aliases.get(i) {
+            Some(a) => Some(a.as_str()),
+            None => n.as_deref(),
+        })
+        .collect();
+    for (i, name) in renamed.iter().enumerate() {
+        let Some(name) = name else { continue };
+        if renamed
+            .iter()
+            .skip(i.saturating_add(1))
+            .any(|o| o.is_some_and(|o| o.eq_ignore_ascii_case(name)))
+        {
+            return Err(SqlSurfaceError::ambiguous_column((*name).to_string()));
+        }
+    }
+    Ok(())
+}
+
 /// `WITH` 句の全 CTE 定義の事前検証（参照されない定義も含む。決定性・fail-closed のため）。
 /// 戻り値はデータ変更 CTE ごとの `RETURNING` 公開列（SELECT 本文・`RETURNING` なしは `None`）。
 /// 主クエリの形（単一表・JOIN）によらず共有する（Issue #1861 で `WITH` 分岐から切り出した）。
@@ -23220,6 +23460,13 @@ fn validate_cte_definitions(
     // 集める（`dm_exposed[i]`。`RETURNING` なしは `None`）。成功しても最後に固定 0A000 で止める。
     let mut dm_exposed: Vec<Option<Vec<String>>> = Vec::new();
     for (idx, def) in ctes.iter().enumerate() {
+        // SQL-62・Issue #1863: 集計本文は FROM の公開列集合に対して集計引数・`GROUP BY` キー・`WHERE`
+        // を検査する（非公開列を集計経由の oracle にさせない。参照されない CTE にも適用する）。
+        if let super::cte::CteBody::Aggregate(agg) = &def.body {
+            dm_exposed.push(None);
+            validate_aggregate_cte_definition(ctes, idx, def, agg, lookup, limits)?;
+            continue;
+        }
         let Some(select_body) = def.select_body() else {
             dm_exposed.push(super::cte::validate_data_modifying_cte(
                 lookup, ctes, idx, def,
@@ -23270,6 +23517,23 @@ fn validate_cte_definitions(
             tail_order_by,
         )?;
         super::view::check_order_exprs_within_view(exposed.as_deref(), tail_order_keys)?;
+        // 窓つき本文（SQL-62・Issue #1863）: 窓項目の列（`PARTITION BY`・`ORDER BY`・引数）も同じ
+        // 公開列集合に収める。列名リストは窓列を数えられない `compose` ではなく静的な出力列で検査する。
+        if let Some(window_items) = def
+            .tail
+            .as_ref()
+            .map(|t| t.window_items.as_slice())
+            .filter(|w| !w.is_empty())
+        {
+            super::view::check_window_columns_within_view(exposed.as_deref(), window_items)?;
+            let mut names: Vec<Option<String>> = match &select_body.projection {
+                Projection::Columns(cols) => cols.iter().cloned().map(Some).collect(),
+                _ => Vec::new(),
+            };
+            names.extend(window_items.iter().map(|w| w.alias.clone()));
+            check_cte_column_list_static(def, &names)?;
+            continue;
+        }
         // 列名リスト（SQL-62 (2)・Issue #1857）の長さ・重複も、参照の有無に関係なく
         // ここで検査する（参照されない CTE の長すぎるリストを通さない）。結果は捨てる。
         if !def.column_aliases.is_empty() {
@@ -23551,14 +23815,13 @@ fn validate_with_statement(
     // SQL-62・Issue #1862: 主クエリが tail CTE（本文に `ORDER BY`／`LIMIT`／`OFFSET`）を直接
     // 参照する最上位 SELECT は、`[NOT] MATERIALIZED` の指定によらず具体化経路で評価する。
     // インライン展開では本文の `LIMIT` が落ちるため、フォールバックを持たない
-    // （`tail_cte_statement`）。それ以外の入口（InlineOnly・データ変更 CTE を含む文）は
+    // （`forced_cte_statement`）。それ以外の入口（InlineOnly・データ変更 CTE を含む文）は
     // 下の `resolve_relation` が tail CTE を固定 `0A000` で拒否する。
     if cte_evaluation == CteEvaluation::AllowMaterialize && !has_dm {
-        if let Some(idx) = ctes
-            .iter()
-            .rposition(|d| d.name.eq_ignore_ascii_case(&main_table_name) && d.has_tail())
-        {
-            return tail_cte_statement(&ctes, idx, main, lookup, limits).map(WithOutcome::Read);
+        if let Some(idx) = ctes.iter().rposition(|d| {
+            d.name.eq_ignore_ascii_case(&main_table_name) && d.requires_materialization()
+        }) {
+            return forced_cte_statement(&ctes, idx, main, lookup, limits).map(WithOutcome::Read);
         }
     }
     // 主クエリがデータ変更 CTE を参照する場合は、`RETURNING` の公開列だけを持つ仮のビュー解決結果で
@@ -23576,7 +23839,7 @@ fn validate_with_statement(
             .ok_or_else(super::cte::data_modifying_cte_unsupported)?;
         let base_table = match &dm_def.body {
             super::cte::CteBody::DataModifying(b) => b.target_table.clone(),
-            super::cte::CteBody::Select(_) => {
+            super::cte::CteBody::Select(_) | super::cte::CteBody::Aggregate(_) => {
                 return Err(super::cte::data_modifying_cte_unsupported());
             }
         };
@@ -24192,10 +24455,7 @@ fn validate_select_statement(
     // どちらも他の文脈で通常の識別子・既存の `ORDER BY` の一部として現れうるが、
     // 「`Ident("GROUP")` の直後に `Keyword::By`」という並びは既存の許可形状には
     // 存在しないため、フォールス・ポジティブなく集計形状の目印として使える。
-    let contains_group_by = tokens.windows(2).any(|w| {
-        matches!(&w[0], Token::Ident(name) if name.eq_ignore_ascii_case("GROUP"))
-            && matches!(w[1], Token::Keyword(Keyword::By))
-    });
+    let contains_group_by = tokens_contain_group_by(tokens);
     // SQL-30・TASK-214（Issue #930）: `SELECT COUNT(*) OVER (...) ...` のような
     // ウィンドウ項目は、先頭の集計関数名 `'('` という同じ字面を持つため
     // 集計 SELECT と誤判定される（`COUNT` の直後の `'('` を見るだけでは `OVER`
@@ -24203,11 +24463,7 @@ fn validate_select_statement(
     // `OVER`、その直後に `'('`」という並びがあるかを走査して判定する。この
     // 並びは既存の許可形状（式・集計・WHERE のいずれも）には現れないため、
     // フォールス・ポジティブなくウィンドウ項目の目印として使える。
-    let contains_window_over = tokens.windows(3).any(|w| {
-        matches!(w[0], Token::Punct(')'))
-            && matches!(&w[1], Token::Ident(name) if name.eq_ignore_ascii_case("OVER"))
-            && matches!(w[2], Token::Punct('('))
-    });
+    let contains_window_over = tokens_contain_window_over(tokens);
     // Issue #1819・SQL-58 (4): 括弧の深さ 0 の句としての `HAVING`（`GROUP BY` なし）も集計形の目印。
     let contains_having_clause = has_top_level_having_clause(tokens);
     // Issue #1811・SQL-42 ポインタ: トップレベル文に限り、SELECT リストのどこかに集計呼び出しを
@@ -37375,12 +37631,10 @@ mod tests {
     }
 
     #[test]
-    fn rejects_cte_body_with_vector_ranking_aggregate_or_semicolon() {
+    fn rejects_cte_body_with_vector_ranking_or_semicolon() {
         let lookup = catalog_with(&["documents"]);
         for sql in [
             "WITH x AS (SELECT id FROM documents ORDER BY embedding <=> '[0.1]' LIMIT 5) SELECT * FROM x LIMIT 10",
-            "WITH x AS (SELECT COUNT(*) FROM documents) SELECT * FROM x LIMIT 10",
-            "WITH x AS (SELECT COUNT(*) FROM documents LIMIT 1) SELECT * FROM x LIMIT 10",
             "WITH x AS (SELECT id FROM documents;) SELECT * FROM x LIMIT 10",
             "WITH x AS (SELECT id FROM documents x LIMIT 5) SELECT * FROM x LIMIT 10",
         ] {
@@ -37406,6 +37660,39 @@ mod tests {
             &lookup,
         )
         .expect("unreferenced tail CTE is accepted");
+    }
+
+    /// SQL-62・Issue #1863: 集計・窓の本文は、インライン専用の入口で参照されると固定 `0A000`
+    /// （従来は本文の集計が `42601`）。参照されない集計・窓 CTE は受理する（事前検証のみ）。
+    #[test]
+    fn aggregate_and_window_cte_are_rejected_inline_but_unreferenced_ones_are_accepted() {
+        let lookup = catalog_with(&["documents"]);
+        for body in [
+            "SELECT COUNT(*) FROM documents",
+            "SELECT lang, COUNT(*) FROM documents GROUP BY lang ORDER BY lang LIMIT 1",
+            "SELECT DISTINCT lang FROM documents",
+            "SELECT id, row_number() OVER (ORDER BY id) AS rn FROM documents",
+        ] {
+            let referenced = format!("WITH x AS ({body}) SELECT * FROM x LIMIT 10");
+            let err = validate_sql(&referenced, &lookup).expect_err(body);
+            assert_eq!(err.wire_code(), "0A000", "body={body}");
+            let unreferenced = format!("WITH x AS ({body}) SELECT id FROM documents LIMIT 10");
+            validate_sql(&unreferenced, &lookup).expect(body);
+        }
+    }
+
+    /// SQL-62・Issue #1863: 窓と `GROUP BY` の併用・ROLLUP・ベクトル順位付けの本文は `42601`。
+    #[test]
+    fn cte_body_unsupported_aggregate_window_forms_are_42601() {
+        let lookup = catalog_with(&["documents"]);
+        for body in [
+            "SELECT lang, row_number() OVER (ORDER BY id) FROM documents GROUP BY lang",
+            "SELECT lang, COUNT(*) FROM documents GROUP BY ROLLUP (lang)",
+        ] {
+            let sql = format!("WITH x AS ({body}) SELECT * FROM x LIMIT 10");
+            let err = validate_sql(&sql, &lookup).expect_err(body);
+            assert_eq!(err.wire_code(), "42601", "body={body}");
+        }
     }
 
     fn session_stmt(sql: &str, lookup: &impl TableLookup) -> Result<Statement, SqlSurfaceError> {
@@ -37440,6 +37727,56 @@ mod tests {
             assert_eq!(body.offset(), 2);
             assert_eq!(body.order_by().len(), 1);
         }
+    }
+
+    /// SQL-62・Issue #1863: セッション最上位の SELECT では集計本文の CTE が具体化経路になり、本文は
+    /// `Statement::Aggregate`、窓本文は `window_items` が非空の `Statement::Scan` になる。
+    #[test]
+    fn session_aggregate_and_window_cte_become_materialized_views() {
+        let lookup = catalog_with(&["documents"]);
+        for modifier in ["", "NOT MATERIALIZED "] {
+            let agg = format!(
+                "WITH x AS {modifier}(SELECT lang, COUNT(*) AS n FROM documents GROUP BY lang) \
+                 SELECT lang FROM x WHERE n > 1 LIMIT 5"
+            );
+            let Statement::BufferedView(v) = session_stmt(&agg, &lookup).expect("accepted") else {
+                panic!("expected BufferedView for {modifier:?}");
+            };
+            assert_eq!(v.origin, BufferedOrigin::MaterializedCte);
+            assert!(matches!(&*v.body, Statement::Aggregate(_)));
+            let win = format!(
+                "WITH x AS {modifier}(SELECT id, row_number() OVER (ORDER BY id) AS rn \
+                 FROM documents) SELECT id FROM x WHERE rn = 1 LIMIT 5"
+            );
+            let Statement::BufferedView(v) = session_stmt(&win, &lookup).expect("accepted") else {
+                panic!("expected BufferedView for {modifier:?}");
+            };
+            let Statement::Scan(body) = &*v.body else {
+                panic!("window body must be a Scan");
+            };
+            assert_eq!(body.window_items.len(), 1);
+        }
+    }
+
+    /// SQL-62・Issue #1863: 集計・窓 CTE の列名リストが出力列より長ければ、参照の有無によらず
+    /// `42P10`。集計 CTE を別の CTE が読む連鎖は `0A000`。
+    #[test]
+    fn aggregate_cte_column_list_and_chain() {
+        let lookup = catalog_with(&["documents"]);
+        let too_long = "WITH x(a, b, c) AS (SELECT lang, COUNT(*) FROM documents GROUP BY lang) \
+                        SELECT id FROM documents LIMIT 5";
+        assert_eq!(
+            session_stmt(too_long, &lookup)
+                .expect_err("too long")
+                .wire_code(),
+            "42P10"
+        );
+        let chain = "WITH a AS (SELECT COUNT(*) AS n FROM documents), b AS (SELECT n FROM a) \
+                     SELECT * FROM b LIMIT 5";
+        assert_eq!(
+            session_stmt(chain, &lookup).expect_err("chain").wire_code(),
+            "0A000"
+        );
     }
 
     /// tail CTE を別の CTE が読む連鎖と、本文の `WITH TIES` は `0A000`。

@@ -317,17 +317,16 @@ fn unsupported_shapes_fail_closed_with_0a000() {
     }
 }
 
-/// 本文の集計・ベクトル順位付けは従来どおり `42601`（#1863 の範囲）。
+/// ベクトル順位付けの本文は `42601` のまま。集計の本文は #1863 で受理され、`LIMIT` つきでも値が正しい。
 #[test]
-fn ranked_and_aggregate_bodies_stay_42601() {
+fn ranked_body_stays_42601_and_aggregate_body_is_accepted() {
     let (core, _g) = open_with(None);
-    for sql in [
-        "WITH c AS (SELECT id FROM docs ORDER BY embedding <=> '[0.1,0.2]' LIMIT 3) \
-         SELECT id FROM c LIMIT 10",
-        "WITH c AS (SELECT COUNT(*) FROM docs LIMIT 1) SELECT * FROM c LIMIT 10",
-    ] {
-        assert_eq!(code(&core, "alice", sql), "42601", "{sql}");
-    }
+    let ranked = "WITH c AS (SELECT id FROM docs ORDER BY embedding <=> '[0.1,0.2]' LIMIT 3) \
+                  SELECT id FROM c LIMIT 10";
+    assert_eq!(code(&core, "alice", ranked), "42601");
+    let agg = "WITH c AS (SELECT lang, COUNT(*) AS n FROM docs GROUP BY lang \
+               ORDER BY n DESC LIMIT 1) SELECT n FROM c LIMIT 10";
+    assert_eq!(ints(&ok(&core, "alice", agg), 0), vec![5]);
 }
 
 /// 本文の `ORDER BY` はビューが公開しない列を参照できない（並べ替えの oracle にしない）。
