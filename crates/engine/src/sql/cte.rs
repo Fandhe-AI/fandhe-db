@@ -24,6 +24,11 @@
 //! 発火はセッションの最上位 SELECT の入口だけで、ビュー本文・cursor・COPY・CTAS 等は
 //! 従来どおりインライン展開（結果は同じ）。
 //!
+//! tail CTE（SQL-62・Issue #1862）: 本文が `ORDER BY`／`LIMIT`／`OFFSET` を持つ CTE（[`CteDef::tail`]）は
+//! インライン展開が `LIMIT` を表現できないため、常に具体化経路で評価しインラインへ戻さない。
+//! 具体化の入口（単一表の `BufferedView`・JOIN の slot）以外から名前解決された場合は
+//! [`resolve_relation`] が固定 `0A000` で拒否する（連鎖・インライン専用の文脈を含む）。
+//!
 //! データ変更 CTE（SQL-63、Issue #1875）: CTE 本文に単一表の `INSERT`／`UPDATE`／
 //! `DELETE`（`RETURNING` 任意）を書く形は [`CteBody::DataModifying`] として構文受理し、
 //! 本文は既存の DML 許可パーサーで解析する（第 2 の DML パーサーを作らない）。#1875 の範囲は
@@ -42,8 +47,8 @@
 //! シャドーイングで自己参照が実テーブルへ解決されるのを防ぐ）。
 
 use super::allowlist::{
-    DeleteStatement, ParsedViewBody, Projection, SqlSurfaceError, TableLookup, ValidatedInsert,
-    ValidatedUpdateForm,
+    DeleteStatement, ParsedViewBody, Projection, ScalarOrderKey, ScanOrderKey, SqlSurfaceError,
+    TableLookup, ValidatedInsert, ValidatedUpdateForm,
 };
 use super::returning::DmlCommand;
 use super::view::{
@@ -85,9 +90,34 @@ pub(crate) struct CteDef {
     /// `[NOT] MATERIALIZED` の指定（SQL-62 (3)・Issue #1860）。`CteDef` はテナント情報を
     /// 持たない不変条件（RLS-10 (b)）を保つため、ここにも評価方式のヒントだけを置く。
     pub(crate) materialization: CteMaterialization,
+    /// 本文の `ORDER BY`・`LIMIT`・`OFFSET`（SQL-62・Issue #1862）。`None` は従来形（これらを
+    /// 持たない本文。インライン展開できる）。`Some` の CTE（以下 tail CTE）はインライン展開が
+    /// 本文の `LIMIT` を表現できないため、常に具体化経路で評価する（[`resolve_relation`] が
+    /// インライン解決を `0A000` で拒否する）。
+    pub(crate) tail: Option<CteBodyTail>,
+}
+
+/// CTE 本文の `ORDER BY`・`LIMIT`・`OFFSET`（SQL-62・Issue #1862）。`sql::allowlist::Parser::
+/// parse_with_clause` が既存の SELECT 許可パーサーで解析して詰める。テナント情報は持たない
+/// （RLS-10 (b)。評価は参照者自身の `PolicyContext` で既存のスキャン経路が行う）。
+#[derive(Debug, Clone, PartialEq)]
+pub(crate) struct CteBodyTail {
+    /// スカラー列 `ORDER BY`（式キーを含むときは空で、正本は `order_keys`）。
+    pub(crate) order_by: Vec<ScalarOrderKey>,
+    /// 式キーを含む `ORDER BY` の全キー（含まなければ空）。
+    pub(crate) order_keys: Vec<ScanOrderKey>,
+    /// `LIMIT n`。`None` は省略または `LIMIT ALL`（暗黙の結果行数上限の対象。SQL-34）。
+    pub(crate) limit: Option<u32>,
+    /// `OFFSET m`（範囲検証済み。既定 0）。
+    pub(crate) offset: u32,
 }
 
 impl CteDef {
+    /// 本文が `ORDER BY`・`LIMIT`・`OFFSET` を持つ（インライン展開できない）か。
+    pub(crate) fn has_tail(&self) -> bool {
+        self.tail.is_some()
+    }
+
     /// SELECT 本文なら検証済みの本文を返す。データ変更 CTE では `None`。
     pub(crate) fn select_body(&self) -> Option<&ParsedViewBody> {
         match &self.body {
@@ -231,6 +261,15 @@ pub(crate) fn resolve_relation(
         let Some(select) = def.select_body() else {
             return Err(data_modifying_cte_unsupported());
         };
+        // SQL-62・Issue #1862: 本文が ORDER BY／LIMIT／OFFSET を持つ CTE はインライン展開すると
+        // `LIMIT` が黙って落ちて誤結果になる。具体化経路（`sql::allowlist` が組む
+        // `BufferedView`・JOIN の slot）以外から名前解決された場合は、ここで 1 箇所だけ
+        // 固定文言の `0A000` で拒否する（連鎖・InlineOnly 文脈・具体化の本文構築を含む）。
+        if def.has_tail() {
+            return Err(SqlSurfaceError::feature_not_supported(
+                "a CTE with ORDER BY/LIMIT/OFFSET in its body cannot be referenced here",
+            ));
+        }
         budget.consume_reference()?;
         let inner = resolve_relation(
             lookup,
@@ -299,11 +338,10 @@ pub(crate) fn compose(
         }
     };
 
-    // `ParsedViewBody`（CTE 本文）は構文上 `ORDER BY` を持たない
-    // （`sql::allowlist::parse_view_body` のドキュメント参照）ため、
-    // Issue #915・SQL-25 のスカラー ORDER BY 検査は空スライスで無効化する
-    // （主クエリ自身の ORDER BY は `sql::allowlist::build_scan_from_resolved`
-    // 呼び出し側で別途検証する）。
+    // `compose` に到達する CTE は tail を持たない（`resolve_relation` が tail CTE を
+    // `0A000` で止める。Issue #1862）ため、Issue #915・SQL-25 のスカラー ORDER BY 検査は
+    // 空スライスで無効化する（主クエリ自身の ORDER BY は
+    // `sql::allowlist::build_scan_from_resolved` 呼び出し側で別途検証する）。
     check_columns_within_view(
         exposed.as_deref(),
         &body.projection,

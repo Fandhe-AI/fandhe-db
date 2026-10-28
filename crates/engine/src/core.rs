@@ -9665,8 +9665,37 @@ impl EngineCore {
                 result
             }
             CteSlotSource::Derived { from, layer } => {
-                let parent = self
-                    .evaluate_cte_slot(ctx, session, read_txn, cte, *from, limits, cache, budget)?;
+                // tail CTE の `LIMIT` 省略（`limit_implicit`）は `OFFSET` 適用後の件数で上限を判定し、
+                // 明示 `LIMIT`（`limit_explicit`）は `ORDER BY`／`LIMIT` 適用後の件数（設定値の範囲で
+                // 検査済みの `LIMIT` 以下）で判定する。親を上限つきで評価すると層の適用前の件数で
+                // `54000` になるため（単一表経路は inline 化で成功する形との不整合）、親が共有されない
+                // （他の読み手へ上限なしの行を渡さない）ときだけ親の暗黙上限を hard cap まで緩める。
+                // 緩めた分の行数は JoinBudget が引き続き抑え、層の適用後に呼び出し段の上限を検査する
+                // （無制限の具体化は許さない。fail-closed）。
+                let parent_limits = if (layer.limit_implicit || layer.limit_explicit)
+                    && !cte.slots.get(*from).is_some_and(|p| p.shared)
+                {
+                    crate::result_limits::ResultLimits::new(
+                        crate::result_limits::MAX_RESULT_ROWS_HARD_CAP,
+                    )
+                } else {
+                    limits
+                };
+                let parent = self.evaluate_cte_slot(
+                    ctx,
+                    session,
+                    read_txn,
+                    cte,
+                    *from,
+                    parent_limits,
+                    cache,
+                    budget,
+                )?;
+                // tail CTE（Issue #1862）の明示 `LIMIT` は設定値の範囲で検査する（構文段は
+                // 設定値を持たない。Scan 側の `bind_scan_with_dummy_flags` と同じ契約）。
+                if layer.limit_explicit {
+                    crate::sql::parser::validate_search_limit_with(layer.limit, &limits)?;
+                }
                 let plan = crate::sql::view_buffered::plan_rows_layer(
                     &parent.columns,
                     &slot.name,
@@ -9676,7 +9705,12 @@ impl EngineCore {
                 // 層は親の行から射影のセルを複製して新しい行集合を作る。同じ列の複数回選択で親より
                 // 大きくなりうるため、出力の見積もり（上界）を適用の **前** に計上する。
                 budget.charge_layer_output(&parent, &plan)?;
-                crate::sql::view_buffered::apply_rows_layer(parent, &plan)?
+                let layered = crate::sql::view_buffered::apply_rows_layer(parent, &plan)?;
+                if layer.limit_implicit {
+                    Self::enforce_result_cap(layered, limits.max_result_rows())?
+                } else {
+                    layered
+                }
             }
         };
         let result = if slot.column_aliases.is_empty() {
@@ -9734,6 +9768,11 @@ impl EngineCore {
                     skip_vector_literal_validation,
                     limits,
                 )?;
+                // Execute（`evaluate_cte_slot`）と同じ明示 `LIMIT` の範囲検査を Describe でも行い、
+                // Describe 成功・Execute だけ上限違反になる乖離を作らない（Issue #1862）。
+                if layer.limit_explicit {
+                    crate::sql::parser::validate_search_limit_with(layer.limit, limits)?;
+                }
                 crate::sql::view_buffered::plan_rows_layer(
                     &parent,
                     &slot.name,

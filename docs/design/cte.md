@@ -178,7 +178,7 @@ CTE は原則として実体化しない（インライン展開。明示 `MATER
   上限を超えたら黙って切り詰めず `54000`。判定は RLS 適用後の可視行だけで行い、他テナント行の
   存在は漏れない。Describe と Execute は同じ上限を使う。
 - 対象外: 同一 CTE の複数回参照時の 1 回評価・JOIN 入力・指定なし CTE の既定の具体化は #1861、
-  本文の `LIMIT`／`ORDER BY` は #1862、本文の集計・窓は #1863。`EXPLAIN` での表示は対象外。
+  本文の `LIMIT`／`ORDER BY` は #1862 で対応済み（下の「Issue #1862 追記」節）、本文の集計・窓は #1863。`EXPLAIN` での表示は対象外。
 
 ## Issue #1861 追記: CTE を JOIN の入力にする（SQL-62 (1)(3)(5)(6) ポインタ）
 
@@ -233,6 +233,39 @@ CTE は原則として実体化しない（インライン展開。明示 `MATER
 - 観測: 本文の評価回数は結果から観測できないため、`EngineCore::materialized_cte_eval_stats`
   （`VectorCore` trait 外の固有 API。テナント ID・行数を含まない）で「記憶域に対する本文の実行回数」を
   公開する。`Derived` の導出は数えない。
-- 対象外: 本文の `LIMIT`／`ORDER BY`（#1862）、集計・`GROUP BY`・窓（#1863）、派生表（FROM の部分クエリ）、
+- 対象外: 集計・`GROUP BY`・窓（#1863。本文の `LIMIT`／`ORDER BY` は #1862 で対応済み）、派生表（FROM の部分クエリ）、
   主クエリのサブクエリからの CTE 参照、集合演算の主クエリ、`EXPLAIN` での具体化の表示、NoSQL 表層、
   JOIN 入力の非共有 CTE への述語プッシュダウン。
+
+## Issue #1862 追記（SQL-62 ポインタ）
+
+CTE 本文の `ORDER BY`（スカラー列・式・序数キー）・`LIMIT`・`OFFSET`（`FETCH FIRST n ROWS ONLY` は
+`sql::fetch_clause` が `LIMIT` へ正規化）を受理する。本文に `ORDER BY`／`LIMIT`／`OFFSET` を持つ CTE を
+tail CTE と呼ぶ（`CteDef.tail`）。関連: SQL-34（暗黙上限・`54000`）・RLS-10 (b)。
+
+- 受理範囲: 本文の頭部は従来と同じ（`*`／列名投影・単一 relation・単純 `WHERE`）に tail を足したもの。解析は
+  `parse_view_body` が失敗し、深さ 0 に tail の語があるときだけ `parse_select_shape` で再解析し、`WHERE` の
+  判定表は `check_view_body_predicates` を `parse_view_body` と共有する。
+- インラインへ戻さない: インライン展開は本文の `LIMIT` を表現できず、畳み込むと黙って落ちて誤結果になる。
+  tail CTE は常に具体化経路で評価し、`cte::resolve_relation` が tail CTE のインライン解決を固定 `0A000`
+  で拒否する（1 箇所のゲート）。
+  - 単一表の主クエリ: セッション最上位 SELECT が直接参照すると、`[NOT] MATERIALIZED` によらず
+    `Statement::BufferedView`（`MaterializedCte`）で評価する（`tail_cte_statement`）。`NOT MATERIALIZED` でも
+    具体化するのは PostgreSQL との差分（結果は等しい）。外側が評価後射影形として受理できない形は、
+    インラインへ戻らずそのままのエラーを返す。
+  - JOIN の主クエリ: slot（`CteSlotSource::Scan`）の本文に tail を載せる。tail CTE が先行する非 tail CTE を
+    読む形（`Derived`）は導出層に `ORDER BY`・`LIMIT`・`OFFSET` を載せる。
+- 上限・RLS: 本文は参照者自身の `PolicyContext`・同一の `read_txn` で評価し、`LIMIT` は RLS 適用後の可視行に
+  掛かる（RLS-10 (b)）。`LIMIT` なし（`ORDER BY` のみ・`OFFSET` のみ）の本文は暗黙上限で評価し、可視行が
+  `--max-result-rows` を超えたら `54000`。本文 `ORDER BY` のキーは FROM の公開列に限定する（非公開列を
+  並べ替えの oracle にしない。参照されない CTE にも適用）。
+- JOIN の導出層（`Derived`）の制限: 本文が `SELECT *` で序数 `ORDER BY`（`ORDER BY 1`）を使う形は、親の
+  結果列が評価前に確定しないため固定 `0A000`（列名を明示した本文、または単一表の主クエリでは序数も使える）。
+  `LIMIT` なしの導出層は単一表経路と同じく `OFFSET` 適用後の件数で上限を判定する（親が他の読み手と共有されない
+  ときだけ、親の暗黙上限を `OFFSET` 適用前は hard cap まで緩め、JoinBudget で抑える）。
+- 外側に `ORDER BY` がなければ外側の順序は保証しない（PostgreSQL と同じ）。外側の `WHERE` は本文の `LIMIT`
+  の後に適用される。
+- 拒否: tail CTE を別の CTE が読む連鎖・インライン専用の文脈（ビュー本文・cursor・CTAS 等）での参照・データ
+  変更 CTE を含む文での参照は固定 `0A000`。本文のベクトル順位付け・集計・窓・式投影・サブクエリは `42601`、
+  `WITH TIES` は `0A000`。
+- 対象外: tail CTE の連鎖、インライン専用の文脈での参照、`EXPLAIN` での表示、NoSQL 表層。
