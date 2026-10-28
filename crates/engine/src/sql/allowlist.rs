@@ -19455,8 +19455,12 @@ impl<'a> Parser<'a> {
     /// 別名として誤って消費しない）。
     fn parse_join_relation(&mut self) -> Result<TableRef, SqlSurfaceError> {
         let table = self.expect_ident()?;
-        crate::catalog::validate_relation_key(&table)
-            .map_err(|e| SqlSurfaceError::unsupported(format!("invalid table name: {e}")))?;
+        // 派生表の合成名（SQL-62・Issue #1867）だけはカタログ検証の対象外にする。字句解析器は `?` を
+        // 含む識別子を作らず引用形も受理しないため、利用者がこの名前を書く経路はない。
+        if !super::derived_table::is_derived_placeholder(&table) {
+            crate::catalog::validate_relation_key(&table)
+                .map_err(|e| SqlSurfaceError::unsupported(format!("invalid table name: {e}")))?;
+        }
         let alias = self.parse_relation_alias(is_join_reserved_word, "JOIN")?;
         Ok(match alias {
             Some(a) => TableRef::with_alias(table, a),
@@ -23144,7 +23148,7 @@ fn projection_has_duplicate_names(projection: &Projection) -> bool {
 /// 実表であることを確かめる（ビューは拒否）。データ変更 CTE を含む文は、検証をすべて通した後に
 /// 固定の `0A000`（SQL-63 の既存契約。書き込みを発生させない）で止める。主クエリが CTE を 1 つも
 /// 参照しない場合は通常の JOIN として返す（結果は同じ）。
-fn validate_with_join_main(
+pub(super) fn validate_with_join_main(
     main_tokens: &[Token],
     ctes: &[super::cte::CteDef],
     lookup: &impl TableLookup,

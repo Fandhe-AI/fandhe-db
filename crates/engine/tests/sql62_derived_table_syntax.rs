@@ -2,8 +2,8 @@
 //! （SQL-62・Issue #1865、親 Issue #1864）。ポインタ: `docs/spec/04-behavior/sql-surface.md` SQL-62・
 //! `docs/spec/04-behavior/error-format.md`（`42P10`・ERR-6）・RLS-10 (b)。
 //!
-//! 実行は #1866（FROM 直後の単一の派生表。`sql62_derived_table_exec.rs`）で接続済み。JOIN 入力・複数件・
-//! 深さ上限は #1867 の担当のため固定の `0A000` で止まる。
+//! 実行は #1866（FROM 直後の単一の派生表。`sql62_derived_table_exec.rs`）・#1867（JOIN 入力・複数件・
+//! 入れ子と深さ上限。`sql62_derived_table_join.rs`）で接続済み。
 //! 本テストは「構文を受理して解決まで進む」「解決で拒否される形は専用の SQLSTATE」
 //! 「非セッションの入口は従来どおり `42601`」「テナントで結果が変わらない」を固定する。
 //! `sql62_cte_column_list.rs` と同じ流儀（実 `Storage` ＋ `EngineCore::execute_sql_in_session`）。
@@ -270,10 +270,6 @@ fn derived_table_syntax_and_resolution_errors() {
             "SELECT * FROM (SELECT lang FROM docs) t, (SELECT body FROM docs) t",
             "42601",
         ),
-        (
-            "SELECT * FROM (SELECT * FROM (SELECT lang FROM docs) x) t",
-            "42601",
-        ),
         ("SELECT * FROM (SELECT lang FROM docs;) t", "42601"),
         (
             "SELECT * FROM LATERAL (SELECT lang FROM docs) t",
@@ -292,7 +288,7 @@ fn derived_table_in_join_positions() {
         "SELECT * FROM docs d, (SELECT lang FROM docs) t",
         "SELECT * FROM (SELECT lang FROM docs) a JOIN (SELECT body FROM docs) b ON a.lang = b.body",
     ] {
-        assert_eq!(code(&core, "alice", sql), UNSUPPORTED, "{sql}");
+        assert!(query(&core, "alice", sql).is_ok(), "{sql}");
     }
     assert_eq!(
         code(
@@ -364,7 +360,7 @@ fn derived_table_errors_do_not_depend_on_tenant() {
     for sql in [
         "SELECT * FROM (SELECT lang FROM docs) t(a, b)",
         "SELECT * FROM (SELECT lang FROM nope) t",
-        "SELECT * FROM (SELECT lang FROM docs) a, (SELECT lang FROM docs) b",
+        "SELECT * FROM (SELECT lang FROM docs) a, (SELECT lang FROM nope) b",
     ] {
         let a = (code(&core, "alice", sql), msg(&core, "alice", sql));
         for tenant in ["bob", "carol"] {
