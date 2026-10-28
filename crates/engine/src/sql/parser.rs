@@ -10060,13 +10060,21 @@ fn bind_window_offset_args(
                     Some(ColumnType::SmallInt | ColumnType::Integer | ColumnType::BigInt)
                 )
             };
+            // 型なしの裸の `NULL` 値は相手（既定値）の宣言型に揃えて判定する。値と既定値の
+            // 扱いを対称にし、`lag(NULL, 1, b)` でも BIGINT の既定値を f64 経由にしない。
+            let value_null = matches!(&args.value, Expr::Null);
+            let value_eff_decl = if value_null {
+                &default_decl
+            } else {
+                &value_decl
+            };
             let exact_int = (value_pseudo
                 || default_pseudo
                 || bare_column
                     .iter()
                     .chain(default_bare.iter())
                     .any(|(_, c)| matches!(c.ty, ColumnType::BigInt)))
-                && is_int(&value_decl)
+                && is_int(value_eff_decl)
                 && is_int(&default_decl);
             let bound = if exact_int {
                 Err(SqlSurfaceError::InvalidInput {
@@ -10088,12 +10096,25 @@ fn bind_window_offset_args(
                     if bare_column.is_some()
                         || default_bare.is_some()
                         || value_pseudo
-                        || default_pseudo =>
+                        || default_pseudo
+                        || value_null =>
                 {
                     let mismatch = || {
                         SqlSurfaceError::datatype_mismatch(
                             "LAG/LEAD default value must have the same type as the value",
                         )
+                    };
+                    let (default_bound, default_column, default_ty) = match default_bare {
+                        Some((index, c)) => (None, Some((index, c.ty.clone())), c.ty.clone()),
+                        None if default_pseudo => (None, None, ColumnType::BigInt),
+                        None => {
+                            let (b, _ty, col) = bind_projection_expr(d, schema, udfs, node_budget)?;
+                            let col = default_decl.clone().or(col).ok_or_else(mismatch)?;
+                            if lag_lead_value_type_unsupported(&col) {
+                                return Err(unsupported());
+                            }
+                            (Some(b), None, col)
+                        }
                     };
                     let (value_bound, value_ty) = match bare_column {
                         Some((index, c)) => (
@@ -10102,6 +10123,14 @@ fn bind_window_offset_args(
                                 ty: c.ty.clone(),
                             },
                             c.ty.clone(),
+                        ),
+                        // 型なしの `NULL` は既定値の型に揃える（評価結果は常に NULL セル）。
+                        None if value_null => (
+                            BoundWindowValue::Expr {
+                                bound: BoundExpr::Null,
+                                ty: ExprType::Scalar,
+                            },
+                            default_ty.clone(),
                         ),
                         None if value_pseudo => (BoundWindowValue::PseudoId, ColumnType::BigInt),
                         None => {
@@ -10120,18 +10149,6 @@ fn bind_window_offset_args(
                                 return Err(unsupported());
                             }
                             (BoundWindowValue::Expr { bound: b, ty }, col)
-                        }
-                    };
-                    let (default_bound, default_column, default_ty) = match default_bare {
-                        Some((index, c)) => (None, Some((index, c.ty.clone())), c.ty.clone()),
-                        None if default_pseudo => (None, None, ColumnType::BigInt),
-                        None => {
-                            let (b, _ty, col) = bind_projection_expr(d, schema, udfs, node_budget)?;
-                            let col = default_decl.clone().or(col).ok_or_else(mismatch)?;
-                            if lag_lead_value_type_unsupported(&col) {
-                                return Err(unsupported());
-                            }
-                            (Some(b), None, col)
                         }
                     };
                     let unified =
@@ -14615,6 +14632,37 @@ mod lag_lead_declared_type_tests {
             &mut budget,
         )
         .map(|a| a.result_type)
+    }
+
+    /// 型なしの裸の `NULL` 値（直接構築 AST。字句段は第 1 引数の `NULL` を列参照とするため
+    /// SQL テキストからは到達しない）は、既定値の整数型に揃えて BIGINT 列・疑似列 `id` を
+    /// 宣言型のまま運ぶ（式層＝f64 へ落とさない。Issue #1881 のレビュー指摘の回帰）。
+    #[test]
+    fn untyped_null_value_aligns_with_integer_default() {
+        let s = pseudo_schema();
+        let bound = |default: Expr| {
+            let mut budget = 10_000usize;
+            bind_window_offset_args(
+                &WindowOffsetArgs {
+                    value: Expr::Null,
+                    offset: None,
+                    default: Some(default),
+                },
+                &s,
+                &UdfRegistry::default(),
+                &mut budget,
+            )
+            .expect("bind")
+        };
+        let by_col = bound(ident("big"));
+        assert_eq!(by_col.result_type, Some(ColumnType::BigInt));
+        assert_eq!(by_col.default_column, Some((1, ColumnType::BigInt)));
+        assert!(by_col.default.is_none());
+        let by_id = bound(ident("id"));
+        assert_eq!(by_id.result_type, Some(ColumnType::BigInt));
+        assert!(by_id.default_pseudo_id);
+        let by_int = bound(ident("score"));
+        assert_eq!(by_int.result_type, Some(ColumnType::Integer));
     }
 
     #[test]

@@ -1123,3 +1123,88 @@ fn pseudo_id_beyond_2_pow_53_stays_exact() {
         sis(&[Some(1), Some(b + 2)])
     );
 }
+
+/// 型なし `NULL` と整数の既定値・値の組は、相手の整数型に揃えて正確に保持する
+/// （2^53 超の BIGINT 列・疑似列 `id` が f64 を経由しない。Issue #1881 のレビュー指摘の回帰）。
+#[test]
+fn untyped_null_with_exact_integer_stays_exact() {
+    const BIG: i64 = 9_007_199_254_740_993;
+    let path = unique_db_path("lag-eval-null-exact");
+    let _g = CleanupGuard(path.clone());
+    let storage = Storage::open(&path).expect("open storage");
+    let ctx = ctx_for("tenant-a");
+    storage
+        .create_table(&TableSchema::new(
+            "big",
+            vec![
+                ColumnDef::new("b", ColumnType::BigInt, true),
+                ColumnDef::new("s", ColumnType::Integer, true),
+            ],
+        ))
+        .expect("create table");
+    let big_id = u64::try_from(BIG).expect("positive");
+    for (n, id) in [big_id, big_id + 2].into_iter().enumerate() {
+        let op_id = engine::recovery::required_op_id::OperationId::parse(&format!("nul-op-{id}"))
+            .expect("valid operation_id");
+        engine::tenant::insert_typed_row(
+            &storage,
+            "big",
+            &ctx,
+            id,
+            Visibility::Public,
+            &[
+                Value::BigInt(BIG + i64::try_from(n).expect("small")),
+                Value::Integer(7),
+            ],
+            &op_id,
+        )
+        .expect("insert row");
+    }
+    let core = EngineCore::from_storage(storage, Box::new(CpuScalarProvider));
+    let q = |c: &str| col1(&core, &ctx, &format!("SELECT id, {c} FROM big LIMIT 10"));
+    // 値が NULL・既定値が BIGINT 列。
+    assert_eq!(
+        q("lag(CAST(NULL AS bigint), 1, b) OVER (ORDER BY id)"),
+        sis(&[Some(BIG), None])
+    );
+    assert_eq!(
+        q("lead(CAST(NULL AS bigint), 1, b) OVER (ORDER BY id)"),
+        sis(&[None, Some(BIG + 1)])
+    );
+    // 値が NULL・既定値が疑似列 `id`。
+    assert_eq!(
+        q("lag(CAST(NULL AS bigint), 1, id) OVER (ORDER BY id)"),
+        sis(&[Some(BIG), None])
+    );
+    assert_eq!(
+        q("lead(CAST(NULL AS bigint), 1, id) OVER (ORDER BY id)"),
+        sis(&[None, Some(BIG + 2)])
+    );
+    // `NULLIF` が生む NULL も同様（裸の `NULL` 値は字句段が列参照として扱う契約のため式で与える）。
+    assert_eq!(
+        q("lag(NULLIF(1, 1), 1, b) OVER (ORDER BY id)"),
+        sis(&[Some(BIG), None])
+    );
+    assert_eq!(
+        q("lead(NULLIF(1, 1), 1, id) OVER (ORDER BY id)"),
+        sis(&[None, Some(BIG + 2)])
+    );
+    // 逆（値が列・既定値が NULL）。
+    assert_eq!(
+        q("lag(b, 1, NULL) OVER (ORDER BY id)"),
+        sis(&[None, Some(BIG)])
+    );
+    assert_eq!(
+        q("lead(id, 1, NULL) OVER (ORDER BY id)"),
+        sis(&[Some(BIG + 2), None])
+    );
+    // 型の異なる整数（INTEGER 値・BIGINT 既定値と、その逆）。
+    assert_eq!(
+        q("lag(s, 1, b) OVER (ORDER BY id)"),
+        sis(&[Some(BIG), Some(7)])
+    );
+    assert_eq!(
+        q("lag(b, 1, s) OVER (ORDER BY id)"),
+        sis(&[Some(7), Some(BIG)])
+    );
+}
