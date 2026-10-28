@@ -372,3 +372,25 @@ fn derived_tail_cte_star_ordinal_order_by_is_unsupported() {
                SELECT x.id FROM b x JOIN docs d ON x.id = d.id LIMIT 10";
     assert_eq!(code(&core, "alice", star), "0A000");
 }
+
+/// 導出層（先行 CTE を読む tail CTE）の明示 `LIMIT` は `ORDER BY`／`LIMIT` 適用後の件数で判定し、
+/// 非共有の親が暗黙の行数上限を超えていても成功する（PR #2733 レビュー指摘。単一表経路との整合）。
+/// `LIMIT` なしの本文は従来どおり `54000`。alice の可視行は 6 行・上限 5。
+#[test]
+fn derived_tail_cte_explicit_limit_is_not_capped_by_the_parent() {
+    let (core, _g) = open_with(Some(ResultLimits::new(5)));
+    let limited = "WITH a AS (SELECT id FROM docs), \
+               b AS (SELECT id FROM a ORDER BY id DESC LIMIT 2) \
+               SELECT x.id FROM b x JOIN docs d ON x.id = d.id ORDER BY x.id LIMIT 5";
+    assert_eq!(ints(&ok(&core, "alice", limited), 0), vec![5, 7]);
+    // 明示 `LIMIT` が設定値の上限を超える本文は引き続き拒否される（無制限の具体化は許さない）。
+    let over = "WITH a AS (SELECT id FROM docs), \
+               b AS (SELECT id FROM a ORDER BY id LIMIT 6) \
+               SELECT x.id FROM b x JOIN docs d ON x.id = d.id ORDER BY x.id LIMIT 5";
+    assert_eq!(code(&core, "alice", over), "22000");
+    // `LIMIT` なしは従来どおり。
+    let unlimited = "WITH a AS (SELECT id FROM docs), \
+               b AS (SELECT id FROM a ORDER BY id) \
+               SELECT x.id FROM b x JOIN docs d ON x.id = d.id ORDER BY x.id LIMIT 5";
+    assert_eq!(code(&core, "alice", unlimited), "54000");
+}

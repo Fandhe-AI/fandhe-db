@@ -9665,18 +9665,22 @@ impl EngineCore {
                 result
             }
             CteSlotSource::Derived { from, layer } => {
-                // tail CTE の `LIMIT` 省略（`limit_implicit`）は `OFFSET` 適用後の件数で上限を判定する。
-                // 親を上限つきで評価すると `OFFSET` 前の件数で `54000` になるため、親が共有されない
+                // tail CTE の `LIMIT` 省略（`limit_implicit`）は `OFFSET` 適用後の件数で上限を判定し、
+                // 明示 `LIMIT`（`limit_explicit`）は `ORDER BY`／`LIMIT` 適用後の件数（設定値の範囲で
+                // 検査済みの `LIMIT` 以下）で判定する。親を上限つきで評価すると層の適用前の件数で
+                // `54000` になるため（単一表経路は inline 化で成功する形との不整合）、親が共有されない
                 // （他の読み手へ上限なしの行を渡さない）ときだけ親の暗黙上限を hard cap まで緩める。
-                // 緩めた分の行数は JoinBudget が引き続き抑え、層の適用後に呼び出し段の上限を検査する。
-                let parent_limits =
-                    if layer.limit_implicit && !cte.slots.get(*from).is_some_and(|p| p.shared) {
-                        crate::result_limits::ResultLimits::new(
-                            crate::result_limits::MAX_RESULT_ROWS_HARD_CAP,
-                        )
-                    } else {
-                        limits
-                    };
+                // 緩めた分の行数は JoinBudget が引き続き抑え、層の適用後に呼び出し段の上限を検査する
+                // （無制限の具体化は許さない。fail-closed）。
+                let parent_limits = if (layer.limit_implicit || layer.limit_explicit)
+                    && !cte.slots.get(*from).is_some_and(|p| p.shared)
+                {
+                    crate::result_limits::ResultLimits::new(
+                        crate::result_limits::MAX_RESULT_ROWS_HARD_CAP,
+                    )
+                } else {
+                    limits
+                };
                 let parent = self.evaluate_cte_slot(
                     ctx,
                     session,
