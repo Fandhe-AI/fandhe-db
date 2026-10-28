@@ -65,8 +65,13 @@
 //! peer グループと、非 NULL 区間上の二分探索（PostgreSQL の `in_range` 判定の移植）で求める。
 //! 負・NaN のオフセット（`22013`）は PostgreSQL と同じく非 NULL キーの行で境界を求める時点まで遅延する。
 //!
+//! `GROUPS` フレーム（SQL-64 (2)・Issue #1891）は `ROWS` と同じく [`resolve_frames`] がオフセットを
+//! 解決・検査（検査時点も `ROWS` と同じ）し、集計だけが [`evaluate_groups_frame_partition`] で評価する。
+//! オフセットは peer グループ数で、境界は [`groups_frame_bounds`] が前進のみの 2 本のカーソル
+//! （[`GroupCursor`]）で求める。グループ境界の配列は確保しないため状態予算は変わらない。
+//!
 //! 対象外（`42601`／`54000`／`0A000` で fail-closed に拒否。allowlist・parser 側で既に拒否
-//! 済みの形も含む）: フレーム句の `GROUPS`（`ROWS`・`RANGE` は対応済み）・
+//! 済みの形も含む）:
 //! 名前付きウィンドウ・`FILTER (...)`・関数内 `DISTINCT`・複合式の引数・
 //! ベクトル順位付け（`ORDER BY embedding <=> ...`）／`USING PLAN` との併用・
 //! ウィンドウ別名による文全体の `ORDER BY`・`GROUP BY`／集計 SELECT との併用。
@@ -468,7 +473,9 @@ enum ResolvedBound {
     UnboundedFollowing,
 }
 
-/// 解決済みの `ROWS` フレーム（集計だけが保持する。[`resolve_frames`] が作る）。
+/// 解決済みの `ROWS`／`GROUPS` フレーム（集計だけが保持する。[`resolve_frames`] が作る）。
+/// オフセットの検査（NULL＝`22004`・負＝`22013`）は両モード共通のため同じ形を共用し、
+/// 単位だけが違う（`ROWS` は行数、`GROUPS` は peer グループ数。Issue #1891）。
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 struct ResolvedRowsFrame {
     start: ResolvedBound,
@@ -604,10 +611,11 @@ impl ResolvedRangeFrame {
     }
 }
 
-/// 項目ごとの解決済みフレーム（`ROWS`／`RANGE`）。
+/// 項目ごとの解決済みフレーム（`ROWS`／`RANGE`／`GROUPS`）。
 #[derive(Debug, Clone, Copy)]
 enum ResolvedFrame {
     Rows(ResolvedRowsFrame),
+    Groups(ResolvedRowsFrame),
     Range(ResolvedRangeFrame),
 }
 
@@ -624,6 +632,7 @@ enum EvaluatedRangeBound {
 /// 評価済みの 1 項目分のフレーム（検査前）。
 enum EvaluatedFrame {
     Rows(EvaluatedBound, EvaluatedBound, WindowFrameExclusion),
+    Groups(EvaluatedBound, EvaluatedBound, WindowFrameExclusion),
     Range(
         EvaluatedRangeBound,
         EvaluatedRangeBound,
@@ -711,11 +720,11 @@ fn check_range_bound(
 /// 項目ごとのフレームを実行開始時に解決する（`execute_window_scan_with_caps` と
 /// [`CellWindowEvaluator::new`] が行を引く前に 1 回呼ぶ。PostgreSQL がプラン時・WindowAgg 開始時に
 /// オフセットを評価するのと同じ位置で、0 行・`WHERE` 不一致でもエラーを返す）。
-/// 評価エラー（`22012`・`22003` 等）は関数種別を問わず返す。NULL／`ROWS` の負の検査は集計と
+/// 評価エラー（`22012`・`22003` 等）は関数種別を問わず返す。NULL／`ROWS`・`GROUPS` の負の検査は集計と
 /// `LAG`／`LEAD` だけが行う（順位関数は PostgreSQL 16 以降フレームを最適化で置き換えるため
 /// 検査しない）。`RANGE` の負・NaN は検査を遅延する（集計と、オフセット付きの `LAG`／`LEAD` が
 /// 境界計算時に行う）。戻り値を保持するのは集計（と `RANGE` オフセット付きの `LAG`／`LEAD`）で、
-/// 順位関数・`ROWS` の `LAG`／`LEAD` は `None`（フレームを無視する）。
+/// 順位関数・`ROWS`／`GROUPS` の `LAG`／`LEAD` は `None`（フレームを無視する）。
 fn resolve_frames(
     items: &[BoundWindowItem],
 ) -> Result<Vec<Option<ResolvedFrame>>, SqlSurfaceError> {
@@ -735,9 +744,11 @@ fn resolve_frames(
                     evaluate_range_bound(&frame.end, frame.range_offset, &mut scratch)?,
                     frame.exclusion,
                 )),
-                WindowFrameMode::Groups => {
-                    return Err(window_bug("GROUPS window frame reached evaluation"));
-                }
+                WindowFrameMode::Groups => Some(EvaluatedFrame::Groups(
+                    evaluate_frame_bound(&frame.start, &mut scratch)?,
+                    evaluate_frame_bound(&frame.end, &mut scratch)?,
+                    frame.exclusion,
+                )),
             },
         });
     }
@@ -763,6 +774,19 @@ fn resolve_frames(
                     None
                 } else {
                     Some(ResolvedFrame::Rows(ResolvedRowsFrame {
+                        start,
+                        end,
+                        exclusion,
+                    }))
+                });
+            }
+            EvaluatedFrame::Groups(start, end, exclusion) => {
+                let start = check_frame_bound(start, true)?;
+                let end = check_frame_bound(end, false)?;
+                out.push(if is_offset_fn {
+                    None
+                } else {
+                    Some(ResolvedFrame::Groups(ResolvedRowsFrame {
                         start,
                         end,
                         exclusion,
@@ -2142,6 +2166,9 @@ fn evaluate_partition(
         Some(ResolvedFrame::Rows(frame)) => {
             return evaluate_rows_frame_partition(part, frame, out, state_bytes, state_cap);
         }
+        Some(ResolvedFrame::Groups(frame)) => {
+            return evaluate_groups_frame_partition(part, frame, out, state_bytes, state_cap);
+        }
         Some(ResolvedFrame::Range(frame)) => {
             return evaluate_range_frame_partition(part, frame, out, state_bytes, state_cap);
         }
@@ -2322,6 +2349,181 @@ fn evaluate_rows_frame_partition(
     Ok(())
 }
 
+/// peer グループ上の前進のみのカーソル（`GROUPS` の境界計算用。Issue #1891）。
+/// `idx` 番目のグループの `[start, end)` を指し、`start == len` は最終グループの後ろ。
+/// 現在行のグループ番号は単調非減少なので、目標グループも単調となりカーソルは後退しない。
+#[derive(Debug, Clone, Copy)]
+struct GroupCursor {
+    idx: usize,
+    start: usize,
+    end: usize,
+}
+
+impl GroupCursor {
+    /// 先頭グループを指すカーソル（0 行なら `len` の位置）。
+    fn new(part: &SortedPartition<'_>) -> Result<Self, SqlSurfaceError> {
+        let end = if part.len() == 0 {
+            0
+        } else {
+            part.peer_group_end(0)?
+        };
+        Ok(Self {
+            idx: 0,
+            start: 0,
+            end,
+        })
+    }
+
+    /// グループ番号 `target` まで進める（最終グループを越える目標は `start == len` で止まる）。
+    fn advance_to(
+        &mut self,
+        part: &SortedPartition<'_>,
+        target: usize,
+    ) -> Result<(), SqlSurfaceError> {
+        let len = part.len();
+        while self.idx < target && self.start < len {
+            self.start = self.end;
+            self.idx += 1;
+            self.end = if self.start < len {
+                part.peer_group_end(self.start)?
+            } else {
+                len
+            };
+        }
+        Ok(())
+    }
+}
+
+/// 現在行のグループ番号 `c`（範囲 `current`）の `GROUPS` フレームを半開区間 `[start, end)` で返す
+/// （`start >= end` は空フレーム）。`head`／`tail` は始点用・終点用のカーソルで、`c` を
+/// 昇順に渡す限り後退しない。オフセットの加減算はすべて飽和演算で、最後に `len` へクランプする。
+fn groups_frame_bounds(
+    part: &SortedPartition<'_>,
+    c: usize,
+    current: (usize, usize),
+    frame: &ResolvedRowsFrame,
+    head: &mut GroupCursor,
+    tail: &mut GroupCursor,
+) -> Result<(usize, usize), SqlSurfaceError> {
+    let len = part.len();
+    let start = match frame.start {
+        ResolvedBound::UnboundedPreceding => 0,
+        ResolvedBound::Preceding(n) => {
+            head.advance_to(part, c.saturating_sub(n))?;
+            head.start
+        }
+        ResolvedBound::CurrentRow => current.0,
+        ResolvedBound::Following(n) => {
+            head.advance_to(part, c.saturating_add(n))?;
+            head.start
+        }
+        ResolvedBound::UnboundedFollowing => len,
+    };
+    let end = match frame.end {
+        ResolvedBound::UnboundedPreceding => 0,
+        ResolvedBound::Preceding(n) => {
+            if n > c {
+                0
+            } else {
+                tail.advance_to(part, c - n)?;
+                tail.end
+            }
+        }
+        ResolvedBound::CurrentRow => current.1,
+        ResolvedBound::Following(n) => {
+            tail.advance_to(part, c.saturating_add(n))?;
+            tail.end
+        }
+        ResolvedBound::UnboundedFollowing => len,
+    };
+    Ok((start.min(len), end.min(len)))
+}
+
+/// 集計の `GROUPS` フレーム評価（SQL-64 (2)・Issue #1891。[`evaluate_partition`] から呼ばれる）。
+/// 骨格は [`evaluate_rows_frame_partition`] と同じで、境界だけを [`groups_frame_bounds`] で求める。
+/// 始点が `UNBOUNDED PRECEDING` かつ `EXCLUDE` なしなら終点は単調非減少なので累積器の O(n) 経路を取る。
+/// 母集合は materialize 段を通った行のみで、不可視行・他テナントの Private 行は
+/// グループ数にもフレームにも現れない。
+fn evaluate_groups_frame_partition(
+    part: &SortedPartition<'_>,
+    frame: &ResolvedRowsFrame,
+    out: &mut [Option<Cell>],
+    state_bytes: &mut usize,
+    state_cap: usize,
+) -> Result<(), SqlSurfaceError> {
+    let item = part.item;
+    let item_index = part.item_index;
+    let input = item
+        .input
+        .as_ref()
+        .ok_or_else(|| window_bug("framed window function is missing its aggregate input"))?;
+    let agg_func = window_func_to_aggregate_func(item.func)?;
+    let mut scratch: Vec<StackValue> = Vec::new();
+
+    let observe_at = |acc: &mut Accumulator,
+                      pos: usize,
+                      scratch: &mut Vec<StackValue>|
+     -> Result<(), SqlSurfaceError> {
+        let row = part.row(pos)?;
+        let agg_value = row
+            .agg_values
+            .get(item_index)
+            .ok_or_else(|| window_bug("aggregate window values missing for a row"))?;
+        observe_window_row(acc, input, row.id, agg_value, scratch)
+    };
+
+    let cumulative = frame.start == ResolvedBound::UnboundedPreceding
+        && frame.exclusion == WindowFrameExclusion::NoOthers;
+    let mut running = Accumulator::new(agg_func, input)?;
+    let mut observed = 0usize;
+    let mut head = GroupCursor::new(part)?;
+    let mut tail = GroupCursor::new(part)?;
+
+    for (c, group) in part.peer_groups().enumerate() {
+        let (g_start, g_end) = group?;
+        let (start, end) =
+            groups_frame_bounds(part, c, (g_start, g_end), frame, &mut head, &mut tail)?;
+        for pos in g_start..g_end {
+            crate::interrupt::check()?;
+            let cell = if cumulative && end >= observed {
+                while observed < end {
+                    observe_at(&mut running, observed, &mut scratch)?;
+                    observed += 1;
+                }
+                running.clone().finish()?
+            } else {
+                let mut acc = Accumulator::new(agg_func, input)?;
+                for q in start..end {
+                    let excluded = match frame.exclusion {
+                        WindowFrameExclusion::NoOthers => false,
+                        WindowFrameExclusion::CurrentRow => q == pos,
+                        WindowFrameExclusion::Group => (g_start..g_end).contains(&q),
+                        WindowFrameExclusion::Ties => q != pos && (g_start..g_end).contains(&q),
+                    };
+                    if !excluded {
+                        crate::interrupt::check()?;
+                        observe_at(&mut acc, q, &mut scratch)?;
+                    }
+                }
+                acc.finish()?
+            };
+            // 行ごとの複製も他の評価段の確保と同じ状態予算へ計上する（確保前の検証）。
+            *state_bytes = try_accumulate_state_budget(
+                *state_bytes,
+                window_cell_state_bytes(&cell),
+                state_cap,
+            )?;
+            let row_idx = part.row_index(pos)?;
+            let slot = out.get_mut(row_idx).ok_or_else(|| {
+                window_bug(
+                    "evaluate_groups_frame_partition row index out of range for the result slice",
+                )
+            })?;
+            *slot = Some(cell);
+        }
+    }
+    Ok(())
+}
 /// 集計の `RANGE` フレーム評価（SQL-64 (2)・Issue #1890。[`evaluate_partition`] から呼ばれる）。
 /// 行ごとに [`range_frame_bounds`] のフレームから `EXCLUDE` 対象（現在行・peer グループ）を除いた行を
 /// 前方順に観測する。`ROWS` の評価（[`evaluate_rows_frame_partition`]）と同じ形で、始点が
@@ -3965,6 +4167,94 @@ mod partition_layout_tests {
         let part = SortedPartition::new(&it, 0, &rows, vec![]);
         assert_eq!(part.len(), 0);
         assert!(groups(&part).is_empty());
+    }
+
+    /// `groups_frame_bounds` を全グループ昇順に呼んだ結果（Issue #1891）。
+    fn group_frames(part: &SortedPartition<'_>, frame: ResolvedRowsFrame) -> Vec<(usize, usize)> {
+        let mut head = GroupCursor::new(part).unwrap();
+        let mut tail = GroupCursor::new(part).unwrap();
+        part.peer_groups()
+            .enumerate()
+            .map(|(c, g)| {
+                groups_frame_bounds(part, c, g.unwrap(), &frame, &mut head, &mut tail).unwrap()
+            })
+            .collect()
+    }
+
+    fn gframe(start: ResolvedBound, end: ResolvedBound) -> ResolvedRowsFrame {
+        ResolvedRowsFrame {
+            start,
+            end,
+            exclusion: WindowFrameExclusion::NoOthers,
+        }
+    }
+
+    #[test]
+    fn groups_frame_bounds_follow_peer_group_numbers() {
+        use ResolvedBound::*;
+        // キー [1, 2, 2, NULL(最後)] → グループ (0,1) (1,3) (3,4)。
+        let it = item(&[ASC]);
+        let rows = vec![
+            row(0, 0, &[Some(1)]),
+            row(1, 1, &[Some(2)]),
+            row(2, 2, &[Some(2)]),
+            row(3, 3, &[None]),
+        ];
+        let part = SortedPartition::new(&it, 0, &rows, vec![0, 1, 2, 3]);
+        assert_eq!(
+            group_frames(&part, gframe(Preceding(1), Following(1))),
+            vec![(0, 3), (0, 4), (1, 4)]
+        );
+        // 先頭を越える PRECEDING の終点は空（0）。始点は 0 にクランプ。
+        assert_eq!(
+            group_frames(&part, gframe(Preceding(2), Preceding(2))),
+            vec![(0, 0), (0, 0), (0, 1)]
+        );
+        assert_eq!(
+            group_frames(&part, gframe(CurrentRow, CurrentRow)),
+            vec![(0, 1), (1, 3), (3, 4)]
+        );
+        // 末尾を越える FOLLOWING は len へ。
+        assert_eq!(
+            group_frames(&part, gframe(Following(1), Following(5))),
+            vec![(1, 4), (3, 4), (4, 4)]
+        );
+        // 巨大オフセットは飽和し、パニックしない。
+        assert_eq!(
+            group_frames(&part, gframe(Preceding(usize::MAX), Following(usize::MAX))),
+            vec![(0, 4), (0, 4), (0, 4)]
+        );
+        assert_eq!(
+            group_frames(&part, gframe(UnboundedPreceding, UnboundedFollowing)),
+            vec![(0, 4); 3]
+        );
+    }
+
+    #[test]
+    fn groups_frame_bounds_handle_degenerate_partitions() {
+        use ResolvedBound::*;
+        let it = item(&[ASC]);
+        let empty: Vec<MaterializedRow> = vec![];
+        let part = SortedPartition::new(&it, 0, &empty, vec![]);
+        assert!(group_frames(&part, gframe(Preceding(1), Following(1))).is_empty());
+        // 1 グループ（全行が peer）。
+        let rows = vec![row(0, 0, &[Some(7)]), row(1, 1, &[Some(7)])];
+        let part = SortedPartition::new(&it, 0, &rows, vec![0, 1]);
+        assert_eq!(
+            group_frames(&part, gframe(Preceding(3), Following(3))),
+            vec![(0, 2)]
+        );
+        // 第 2 キーの違いでグループが分かれる。
+        let it2 = item(&[ASC, ASC]);
+        let rows = vec![
+            row(0, 0, &[Some(1), Some(1)]),
+            row(1, 1, &[Some(1), Some(2)]),
+        ];
+        let part = SortedPartition::new(&it2, 0, &rows, vec![0, 1]);
+        assert_eq!(
+            group_frames(&part, gframe(CurrentRow, CurrentRow)),
+            vec![(0, 1), (1, 2)]
+        );
     }
 }
 /// `RANGE` フレームの境界計算（Issue #1890。`range_limit`／`in_range_limit`）の単体テスト。

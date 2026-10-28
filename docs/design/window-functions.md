@@ -36,7 +36,7 @@
 | 文全体のスカラー `ORDER BY [ASC\|DESC][, ...]`（`LIMIT`／`OFFSET` 付き。Issue #1189） | 受理（ウィンドウ値は全母集合で評価し、並べ替え・`LIMIT`／`OFFSET` は出力行にのみ効く） |
 | 文全体のベクトル `ORDER BY`（検索 SELECT）・`USING PLAN`・`GROUP BY`／集計 SELECT・`SELECT DISTINCT` との併用 | `42601`（構造的に相互排他） |
 | 文全体の `ORDER BY` でのウィンドウ別名参照（実在する同名列がある場合はその列として解釈） | `42601` |
-| フレーム句（`ROWS`/`RANGE`/`GROUPS`。Issue #1887・#1889・#1890） | 構文は受理する（形の誤りは `42601`）。`ROWS` は #1889、`RANGE` は #1890 で評価し、`GROUPS` は評価前のゲートで `0A000`（詳細は末尾「Issue #1887 追記」「Issue #1889 追記」「Issue #1890 追記」） |
+| フレーム句（`ROWS`/`RANGE`/`GROUPS`。Issue #1887・#1889・#1890・#1891） | 構文は受理する（形の誤りは `42601`）。`ROWS` は #1889、`RANGE` は #1890、`GROUPS` は #1891 で評価する（詳細は末尾「Issue #1887 追記」「Issue #1889 追記」「Issue #1890 追記」「Issue #1891 追記」） |
 | 名前付きウィンドウ（`WINDOW`/`OVER w`）・`FILTER (...)`・関数内 `DISTINCT`・複合式の引数・式の中へのウィンドウ呼び出し（`ROW_NUMBER() OVER () + 1` 等）・`*` とウィンドウ項目の混在 | `42601` |
 | `WHERE` でのウィンドウ別名参照（実在する同名列がある場合はその列として解釈） | `42601` |
 | `CREATE VIEW` 本文への `OVER` 混入 | `42601`（`parse_view_body` が構造上受理しない） |
@@ -127,7 +127,7 @@
 - ウィンドウ関数の結果による文全体の `ORDER BY`（`ORDER BY rn`）。base scan への委譲方式では評価できない
 - `EXPLAIN` とウィンドウ関数の併用（`ORDER BY` の有無を問わず `42601`）
 - `GROUP BY`／集計 SELECT とウィンドウの併用
-- `GROUPS` フレームの評価（構文は Issue #1887 で受理済み。`ROWS` は #1889、`RANGE` は #1890 で評価）・名前付きウィンドウ・`FILTER (...)`・
+- 名前付きウィンドウ・`FILTER (...)`・
   関数内 `DISTINCT`・複合式の引数
 - 式の中へのウィンドウ呼び出しの埋め込み
 - 検索 SELECT（ベクトル `ORDER BY`・`HYBRID`・`USING PLAN`）へのウィンドウ追加
@@ -226,7 +226,7 @@
   | `0A000` | 上記をすべて通った項目（評価前ゲート） | 束縛（`bind_window_item` 末尾） |
 
 - **ゲート**: フレーム句付きの項目は行数・テナントの有無に依存せず `0A000` で止まる。既定
-  フレームと同値の明示フレームも対象で、実行しない。解除は #1889〜#1891 がモード単位で行う。
+  フレームと同値の明示フレームも対象で、実行しない。解除は #1889〜#1891 がモード単位で行い、#1891 で全モードのゲートを解除した（現在 `0A000` は残らない）。
 - **オフセットの変数検査**: 識別子が 1 つでもあれば列を解決せず一律 `42P10` とする。実在列・
   未知列・ビューの非公開列で応答が変わらず、存在情報が漏れない（A01）。
   既知の差異: PostgreSQL は未知列を `42703` とする。
@@ -259,7 +259,7 @@
 
 `bind_window_item` のゲートを「`ROWS` 以外のフレーム」だけに縮め、`ROWS` を PostgreSQL 17 と同じ
 結果で評価する。`RANGE`／`GROUPS`（`RANGE UNBOUNDED PRECEDING` のようにオフセットのない形も含む）は
-Issue #1890／#1891 まで `0A000` のまま。
+Issue #1890／#1891 で順次評価に対応した。
 
 - **束縛**: `bind_window_frame` は `ROWS` のとき束縛済みフレーム（`BoundWindowFrame`。オフセットは
   `bind_projection_expr` の束縛済み式、裸の `NULL` は `Null` 境界）を返し、`BoundWindowItem.frame` に載せる。
@@ -294,13 +294,13 @@ Issue #1890／#1891 まで `0A000` のまま。
   `2147483648` と `9007199254740992` は受理）。`'1'` リテラルは `42804`、オフセット内の `$n` は `42601`、
   未知列は `42P10`（#1887 から継続）。評価後射影形ビュー経路では本文のエラーがオフセットのエラーより
   先に出る可能性がある。
-- **対象外**: `GROUPS`（#1891）・first_value／last_value／nth_value（#1882／#1883）、
+- **対象外**: first_value／last_value／nth_value（#1882／#1883）、
   逆遷移・セグメント木による移動集計の高速化。
 
 ## Issue #1890 追記: RANGE フレームの評価（SQL-64 (2) ポインタ）
 
 `bind_window_item` のゲートを `GROUPS` だけに縮め、`RANGE`（値オフセット付き・なしの両方）を
-PostgreSQL 17（17.11 で実測）と同じ結果・同じ SQLSTATE で評価する。`GROUPS` は #1891 まで `0A000`。
+PostgreSQL 17（17.11 で実測）と同じ結果・同じ SQLSTATE で評価する（`GROUPS` は #1891 で対応済み）。
 ORDER BY なし・複数キーの `RANGE UNBOUNDED PRECEDING` 等も評価される（全行が 1 つの peer グループ）。
 
 - **オフセット型の照合**（束縛段 `bind_range_offset`。`ORDER BY` の唯一のキー型 × オフセット型。
@@ -347,5 +347,39 @@ ORDER BY なし・複数キーの `RANGE UNBOUNDED PRECEDING` 等も評価され
   (4) `'inf'`／`'NaN'` の float8 への変換は未対応（`0A000`。列にも NaN・無限大は格納できない）ため、
   無限大・NaN の規則は単体テストで固定する。(5) 整数キーに対する型なし文字列リテラルは `SMALLINT` でも
   int4 へ変換する。
-- **対象外**: `GROUPS`（#1891）・first_value／last_value／nth_value（#1882／#1883）・interval 列を
+- **対象外**: first_value／last_value／nth_value（#1882／#1883）・interval 列を
   `ORDER BY` キーにする `RANGE`・timetz・移動集計の高速化。
+
+## Issue #1891 追記: GROUPS フレームの評価（SQL-64 (2) ポインタ）
+
+`bind_window_item` に残っていた評価前ゲート（`GROUPS` の `0A000`）を外し、`GROUPS` を PostgreSQL 17 と
+同じ結果・同じ SQLSTATE で評価する。これで ROWS／RANGE／GROUPS のすべてが評価され、フレーム句の
+ゲートは残らない。
+
+- **方式**: オフセットは peer グループ数。`resolve_frames` が `ROWS` と同じ形（`ResolvedRowsFrame`）で
+  解決・検査し、集計だけが `evaluate_groups_frame_partition` で評価する。骨格（`EXCLUDE`・累積経路・
+  前方加算順・`interrupt::check()`・結果セルの状態予算計上）は `ROWS`／`RANGE` と同じ。
+- **境界規則**（現在行のグループ番号を `c`、範囲を `[g_start, g_end)`、`len` をパーティション長とする）
+
+  | 境界 | 始点（包含） | 終点（排他） |
+  | ---- | ------------ | ------------ |
+  | `UNBOUNDED PRECEDING` | 0 | 0（構文段で拒否済み。空へ倒す） |
+  | `n PRECEDING` | グループ `c - n` の先頭（`n > c` は 0） | `n > c` は 0（空）、それ以外はグループ `c - n` の末尾 |
+  | `CURRENT ROW` | `g_start` | `g_end` |
+  | `n FOLLOWING` | グループ `c + n` の先頭（無ければ `len`） | グループ `c + n` の末尾（無ければ `len`） |
+  | `UNBOUNDED FOLLOWING` | `len`（構文段で拒否済み） | `len` |
+
+- **カーソル方式**（`groups_frame_bounds`・`GroupCursor`）: 始点用・終点用に前進のみのカーソルを 1 つずつ持つ。
+  目標グループは `c` に対して単調非減少なので後退せず、パーティション全体で O(n) の比較で済む。
+  グループ境界の配列は確保しないため状態予算は変わらない（`SortedPartition` の方針どおり）。
+  オフセットは `usize` へ飽和変換し、加減算はすべて飽和演算、最後に `len` へクランプする。
+- **peer**: `ORDER BY` の全キーで比較する（複数キーも可。`RANGE` のオフセット形と異なる）。NULL は NULL 同士だけが
+  peer。`ORDER BY` の無い `GROUPS` は #1887 から `42P20`。
+- **オフセットの検査時点**（PG 17 で実測）: `ROWS` と同じ。実行開始時に集計と `LAG`／`LEAD` が NULL（`22004`）・
+  負（`22013`）を検査する（0 行・`WHERE` 不一致でも出る）。順位関数はフレームもオフセットも無視する。
+- **RLS**: 母集合は materialize 段を通った行のみ。他テナントの Private 行はグループ数にも境界にも現れない
+  （結合テストで固定）。
+- **既知の差異**: (1) `'1'` 文字列や `1.5` のオフセットを PostgreSQL は受理するが、本実装は `42804`
+  （#1887 から継続）。(2) 整数リテラル `2^53` 超は `22003`（#1889 から継続）。(3) 識別子を含むオフセットは
+  一律 `42P10`（存在情報の秘匿）。
+- **対象外**: first_value／last_value／nth_value（#1882／#1883）・逆遷移やセグメント木による移動集計の高速化。

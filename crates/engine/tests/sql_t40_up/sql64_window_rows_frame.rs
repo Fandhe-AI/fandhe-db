@@ -3,7 +3,7 @@
 //! 足場は `sql64_lag_lead.rs` と同じ（`unique_db_path`＋`CleanupGuard`、公開 API の
 //! `EngineCore::execute_sql` のみ）。期待値は PostgreSQL 17（17.11）で同じ SQL を流して確認した値で、
 //! 順位関数・`LAG`／`LEAD` がフレームを無視すること、オフセット（NULL＝`22004`・負＝`22013`）の
-//! 検査が関数ごとに異なることも含む。`RANGE`／`GROUPS` は #1890／#1891 の担当で本テストの対象外。
+//! 検査が関数ごとに異なることも含む。`RANGE`／`GROUPS` は #1890／#1891 の担当で本テストの対象外（値は兄弟ファイル）。
 
 use engine::catalog::{ColumnDef, ColumnType, TableSchema};
 use engine::core::EngineCore;
