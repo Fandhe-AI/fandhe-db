@@ -62,6 +62,27 @@ cargo test -p fandhe-db-engine --test sql_named
 - 共通ヘルパー（`src/test_util/`）は束ね先の `main.rs` で 1 回だけ取り込み、各モジュールは `use crate::temp_db;` のように参照する
 - 次のいずれかに当たるテストは別プロセスであることを前提にするため束ねず、`tests/` 直下に単独バイナリのまま置く: ①`feature` ゲート付き・`test-sync-points` 利用 ②プロセス全体で共有する状態（`OnceLock`・`static` 等）・環境変数・カレントディレクトリ・子プロセス・異常終了に依存 ③時間・スレッド数・メモリなどを計測 ④`bench` 共通 harness・fixture モジュール（`recall_engine`・`nl_qa` 等）を取り込む ⑤ `Makefile`・`scripts/`・CI から `--test <name>` で名指しされる（`--ignored` の層 B ゲート等）。判断に迷うものは束ねない側に倒す
 
+### wire-server の結合テストの束ね方と個別実行
+
+`crates/wire-server/tests/` も engine と同じ方式で、サブディレクトリ単位で少数のテストバイナリへ束ねています（`tests/<束ね先>/main.rs` が `mod <ファイル名>;` を並べる。束ね先は `http_nosql`・`wire_proto`・`wire_sql`・`wire_cli`・`tls_auth`）。
+
+```bash
+# 束ね先の 1 ファイルだけ実行する（モジュール名＝元のファイル名で絞る）
+cargo test -p fandhe-db-wire-server --test wire_sql wire_cte::
+# 束ね先の全体を実行する
+cargo test -p fandhe-db-wire-server --test wire_cli
+# 複数ファイルはフィルターごとに分けて実行する（名前フィルターは 1 つしか書けない）
+cargo test -p fandhe-db-wire-server --test wire_sql wire_scan::
+cargo test -p fandhe-db-wire-server --test wire_sql wire_aggregate::
+# 単独のまま残したテストは従来どおり --test <ファイル名>
+cargo test -p fandhe-db-wire-server --test wire_framing
+```
+
+- 新しい結合テストは、これまでどおり `tests/<name>.rs` を置けば単独バイナリとして動く。束ねたい場合は適当な束ね先へ `git mv` して `main.rs` に `mod <name>;` を足す
+- 共通ヘルパー（`tests/common/`・`tests/http_common/`・`engine/src/test_util/`）は束ね先の `main.rs` で 1 回だけ `#[path]` 宣言し、各モジュールは `use crate::common;` のように参照する
+- 束ねると同じプロセス内でテストが並行実行されるため、サーバーの起動・接続先は OS 割り当てポート（`127.0.0.1:0`）とテストごとに一意な一時ディレクトリ（pid・時刻・連番）で独立させている。固定ポート・固定パスを使うテストは束ねない
+- 次のいずれかに当たるテストは束ねず、`tests/` 直下に単独バイナリのまま置く: ①`feature` ゲート付き・fault-injection（`fault_inject`・`failpoint` 等）②環境変数・`current_exe` による自己再起動（テスト名を子プロセスへ渡すもの）・`/proc`・`lsof`・異常終了（abort）に依存 ③時間・遅延の計測や経過時間のアサーション（`Instant`・`elapsed`・バックオフ・タイムアウト境界）④`bench` 共通 harness を取り込む ⑤ `Makefile`・`scripts/`・CI（`make tmp-leak-check` を含む）から `--test <name>` で名指しされる（`--ignored` の層 B・3 クライアント E2E 等）。判断に迷うものは束ねない側に倒す
+
 ### タスクランナー（Makefile）
 
 `Makefile` は薄い入口で、複数行・条件分岐を伴う処理の実体は `scripts/` 配下の bash スクリプトにあります（Make を使わない場合の直接コマンド一覧は `scripts/help.sh`、`make help` でターゲット一覧を表示）。編集方針は [`.claude/rules/makefile.md`](.claude/rules/makefile.md)（make skill: `.claude/skills/make`）を参照してください。
