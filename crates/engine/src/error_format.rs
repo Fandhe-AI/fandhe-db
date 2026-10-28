@@ -94,7 +94,7 @@ macro_rules! define_error_classes {
 pub(crate) const SHARED_WIRE_CODES: &[&str] = &["23502", "23505", "22023"];
 
 define_error_classes! {
-    count = 86;
+    count = 87;
 
     /// 構文上受理された SQL の値・引数が不正（`22000`）。
     /// [`crate::sql::allowlist::SqlSurfaceError::InvalidInput`] の写像。
@@ -441,6 +441,9 @@ define_error_classes! {
     /// 式索引の式にウィンドウ関数がある（`42P20`。Issue #1647・INDEX-10 のポインタ）。固定文言のみ。
     /// [`crate::sql::allowlist::SqlSurfaceError::WindowingError`] の写像。
     WindowingError => ("42P20", "WINDOWING_ERROR"),
+    /// ウィンドウのフレーム句の `ROWS`／`GROUPS` オフセットが負（`22013`。SQL-64 (2)・Issue #1889 のポインタ）。
+    /// 固定文言のみ。[`crate::sql::allowlist::SqlSurfaceError::InvalidPrecedingOrFollowingSize`] の写像。
+    InvalidPrecedingOrFollowingSize => ("22013", "INVALID_PRECEDING_OR_FOLLOWING_SIZE"),
     /// `GROUP BY` の `ROLLUP`／`CUBE`／`GROUPING SETS` の展開後セット数が上限を超えた、または
     /// 入れ子が深すぎる（`54001`。Issue #1821・SQL-59 のポインタ）。文の形だけで決まり、行・
     /// テナントに依存しない。固定文言のみ。
