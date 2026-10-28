@@ -970,7 +970,7 @@ fn apply_rows(
     let windows = plan.scan.bound.windows();
     let body_len = plan.scan.types.len();
     if !windows.is_empty() {
-        let mut evaluator = CellWindowEvaluator::new(windows)?;
+        let mut evaluator = CellWindowEvaluator::new(windows, &plan.scan.types)?;
         for row in &rows {
             with_scanned(&plan.scan.types, &plan.scan.referenced, row, |scanned| {
                 evaluator.push_row(scanned)

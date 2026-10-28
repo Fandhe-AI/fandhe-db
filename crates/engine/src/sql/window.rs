@@ -982,7 +982,10 @@ pub(crate) struct CellWindowEvaluator<'a> {
 
 impl<'a> CellWindowEvaluator<'a> {
     /// `items` は合成スキーマ（本文の結果列と同じ並び）に束縛済みのウィンドウ項目。
-    pub(crate) fn new(items: &'a [BoundWindowItem]) -> Result<Self, SqlSurfaceError> {
+    pub(crate) fn new(
+        items: &'a [BoundWindowItem],
+        column_types: &[Option<ColumnType>],
+    ) -> Result<Self, SqlSurfaceError> {
         for item in items {
             // バッファ済みビュー経路のセル→スカラー変換（`cell_scalar`）が写せない型（TIME／
             // TIMESTAMPTZ／INTERVAL 等）の列を値・既定値に取る LAG／LEAD は、内部エラーでなく
@@ -994,10 +997,21 @@ impl<'a> CellWindowEvaluator<'a> {
                     _ => None,
                 };
                 let default_ty = args.default_column.as_ref().map(|(_, ty)| ty);
-                if value_ty
-                    .into_iter()
-                    .chain(default_ty)
-                    .any(|ty| !crate::sql::join::values::cell_scalar_supports(ty))
+                // 式形の引数（value／offset／default）が読む本文列も同じ型検査にかける
+                // （参照列は `mark_referenced_columns` と同じ走査で集める）。
+                let mut mask = vec![false; column_types.len()];
+                args.mark_referenced_columns(&mut mask);
+                let expr_unsupported = mask.iter().zip(column_types.iter()).any(|(used, ty)| {
+                    *used
+                        && ty
+                            .as_ref()
+                            .is_some_and(|t| !crate::sql::join::values::cell_scalar_supports(t))
+                });
+                if expr_unsupported
+                    || value_ty
+                        .into_iter()
+                        .chain(default_ty)
+                        .any(|ty| !crate::sql::join::values::cell_scalar_supports(ty))
                 {
                     return Err(SqlSurfaceError::FeatureNotSupported {
                         detail: "LAG/LEAD over TIME, TIMESTAMPTZ or INTERVAL columns of a buffered view is not supported"
