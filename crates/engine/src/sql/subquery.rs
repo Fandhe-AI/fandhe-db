@@ -1509,7 +1509,7 @@ fn inner_value_family(meta: &ColumnMeta) -> Option<SubqueryValueFamily> {
         ColumnMeta::Id | ColumnMeta::AliasedId { .. } => Some(SubqueryValueFamily::Integer),
         ColumnMeta::Scalar { ty, .. } => family_of_type(ty),
         ColumnMeta::Computed { ty: Some(ty), .. } => family_of_type(ty),
-        ColumnMeta::Computed { ty: None, .. } => None,
+        ColumnMeta::Computed { ty: None, .. } | ColumnMeta::Record { .. } => None,
     }
 }
 
@@ -2338,6 +2338,11 @@ fn alias_scalar_meta(inner_meta: &ColumnMeta, alias: Option<&String>) -> ColumnM
         (ColumnMeta::Id | ColumnMeta::AliasedId { .. }, Some(alias)) => {
             crate::sql::exec::aliased_id_column_meta(alias)
         }
+        (ColumnMeta::Record { fields, array, .. }, Some(alias)) => ColumnMeta::Record {
+            name: alias.clone(),
+            fields: fields.clone(),
+            array: *array,
+        },
     }
 }
 

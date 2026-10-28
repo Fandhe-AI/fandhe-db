@@ -40,6 +40,9 @@ pub(crate) fn output_columns_from_metas(metas: Vec<ColumnMeta>) -> Vec<ViewColum
             },
             ColumnMeta::Scalar { name, ty } => ViewColumn { name, ty: Some(ty) },
             ColumnMeta::Computed { name, ty } => ViewColumn { name, ty },
+            // SEARCH 順序列（record／record[]）は列型にできない。型なしとして渡し、
+            // `derive_ctas_column_defs` の「型なしは 0A000」で拒否させる（fail-closed）。
+            ColumnMeta::Record { name, .. } => ViewColumn { name, ty: None },
         })
         .collect()
 }

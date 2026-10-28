@@ -1234,7 +1234,9 @@ pub(crate) fn having_matches(cell: &Cell, op: BinOp, literal: f64) -> bool {
         | Cell::Array(_)
         | Cell::Bytes(_)
         | Cell::Json(_)
-        | Cell::Uuid(_) => false,
+        | Cell::Uuid(_)
+        | Cell::Record(_)
+        | Cell::RecordArray(_) => false,
     }
 }
 
@@ -3199,7 +3201,12 @@ pub(crate) fn cell_to_scalar_ref(
         Cell::Time(t) => Some(row_codec::ScalarRef::Time(*t)),
         Cell::TimestampTz(t) => Some(row_codec::ScalarRef::TimestampTz(*t)),
         Cell::Interval(v) => Some(row_codec::ScalarRef::Interval(*v)),
-        Cell::Vector(_) | Cell::Array(_) | Cell::Bytes(_) | Cell::Json(_) => {
+        Cell::Vector(_)
+        | Cell::Array(_)
+        | Cell::Bytes(_)
+        | Cell::Json(_)
+        | Cell::Record(_)
+        | Cell::RecordArray(_) => {
             return Err(accumulator_bug(
                 "group row cell type is not usable in an expression",
             ))

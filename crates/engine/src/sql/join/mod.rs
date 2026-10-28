@@ -257,6 +257,14 @@ fn result_bytes(column_count: usize, rows: &[ResultRow]) -> usize {
     total
 }
 
+/// レコードのフィールド列が占めるバイト（各 `Cell` の構造体＋ペイロードの飽和加算）。
+fn record_payload_bytes(fields: &[Cell]) -> usize {
+    fields.iter().fold(0usize, |acc, c| {
+        acc.saturating_add(std::mem::size_of::<Cell>())
+            .saturating_add(cell_payload_bytes(c))
+    })
+}
+
 pub(crate) fn cell_payload_bytes(cell: &Cell) -> usize {
     match cell {
         Cell::Text(s) => s.len(),
@@ -265,6 +273,13 @@ pub(crate) fn cell_payload_bytes(cell: &Cell) -> usize {
         Cell::Numeric(d) => d.to_string().len(),
         Cell::Vector(v) => v.len().saturating_mul(std::mem::size_of::<f32>()),
         Cell::Array(arr) => arr.approx_heap_bytes(),
+        // SEARCH 順序列（SQL-35・Issue #2213）。フィールドのペイロードに、構造体ぶん
+        // （`Cell` 1 個・`Vec` 1 個）を飽和加算で上乗せする。
+        Cell::Record(fields) => record_payload_bytes(fields),
+        Cell::RecordArray(items) => items.iter().fold(0usize, |acc, rec| {
+            acc.saturating_add(std::mem::size_of::<Vec<Cell>>())
+                .saturating_add(record_payload_bytes(rec))
+        }),
         Cell::Null
         | Cell::Integer(_)
         | Cell::Float(_)
@@ -524,7 +539,7 @@ fn execute_with_inputs(
         sides.push(result.rows);
     }
 
-    run_join_with_sides(&prepared, &sides, limits, budget)
+    run_join_with_sides(&prepared, &sides, limits, budget, None).map(|(result, _)| result)
 }
 
 /// 束縛済みで、まだ行を読んでいない JOIN（[`prepare_join`] の結果）。`execute_with_limits` は
@@ -616,12 +631,16 @@ impl PreparedJoin<'_> {
     }
 
     /// 呼び出し元が供給した全側の行 `sides` に対して結合以降を実行する。文（反復 1 回）ごとに新しい
-    /// 累計バイト予算を作り、全側の行を計上してから実行する。
-    pub(crate) fn run_with_sides(
+    /// 累計バイト予算を作り、全側の行を計上してから実行する。加えて、出力行ごとに側 `provenance_side`
+    /// の入力行の添字（`sides[provenance_side]` 内の位置）を返す（再帰 CTE の `SEARCH` が、再帰行を
+    /// 生んだ作業表の行＝親行を引くために使う。SQL-35・Issue #2213）。非集計形のみ対応し、集計形・
+    /// 外部結合の NULL 補完側では `Internal`（fail-closed）。`provenance_side` が `None` なら添字列は空。
+    pub(crate) fn run_with_sides_provenance(
         &self,
         sides: &[Vec<ResultRow>],
         limits: &JoinLimits,
-    ) -> Result<QueryResult, SqlSurfaceError> {
+        provenance_side: Option<usize>,
+    ) -> Result<(QueryResult, Vec<usize>), SqlSurfaceError> {
         if sides.len() != self.side_count() {
             return Err(SqlSurfaceError::Internal {
                 detail: "JOIN side count mismatch".to_string(),
@@ -638,7 +657,7 @@ impl PreparedJoin<'_> {
             let columns = self.bound.get(side).map_or(0, |b| b.projection.len());
             budget.charge(result_bytes(columns, rows))?;
         }
-        run_join_with_sides(self, sides, limits, budget)
+        run_join_with_sides(self, sides, limits, budget, provenance_side)
     }
 }
 
@@ -698,7 +717,8 @@ fn run_join_with_sides(
     sides: &[Vec<ResultRow>],
     limits: &JoinLimits,
     mut budget: JoinBudget,
-) -> Result<QueryResult, SqlSurfaceError> {
+    provenance_side: Option<usize>,
+) -> Result<(QueryResult, Vec<usize>), SqlSurfaceError> {
     let plan = &prepared.plan;
     let (limit, offset) = (prepared.limit, prepared.offset);
 
@@ -728,7 +748,12 @@ fn run_join_with_sides(
             if limit.is_none() && result.rows.len() > limits.max_result_rows {
                 return Err(crate::sql::scan::row_limit_exceeded());
             }
-            Ok(result)
+            if provenance_side.is_some() {
+                return Err(SqlSurfaceError::Internal {
+                    detail: "JOIN provenance is not available for aggregate output".to_string(),
+                });
+            }
+            Ok((result, Vec::new()))
         }
         Shape::Plain {
             output,
@@ -761,6 +786,12 @@ fn run_join_with_sides(
                 .saturating_add(std::mem::size_of::<ResultRow>());
 
             let mut rows = Vec::with_capacity(sliced.len());
+            let mut provenance: Vec<usize> = Vec::new();
+            if provenance_side.is_some() {
+                provenance
+                    .try_reserve(sliced.len())
+                    .map_err(|_| SqlSurfaceError::payload_too_large("JOIN output is too large"))?;
+            }
             for &ti in sliced {
                 let tuple = tuples
                     .get(ti as usize)
@@ -812,6 +843,16 @@ fn run_join_with_sides(
                 let id = id.ok_or_else(|| SqlSurfaceError::Internal {
                     detail: "JOIN output row has no relation row".to_string(),
                 })?;
+                if let Some(side) = provenance_side {
+                    // 側の行がタプルに無い（NULL 補完）ことは、作業表側が外部結合の NULL 側に
+                    // なれない（構造検証で `42P19`）ため起きない。起きたら fail-closed。
+                    let idx = tuple.get(side).copied().flatten().ok_or_else(|| {
+                        SqlSurfaceError::Internal {
+                            detail: "JOIN provenance side row is missing".to_string(),
+                        }
+                    })?;
+                    provenance.push(idx as usize);
+                }
                 rows.push(ResultRow {
                     id,
                     score: 0.0,
@@ -819,10 +860,13 @@ fn run_join_with_sides(
                 });
             }
 
-            Ok(QueryResult {
-                columns: output.iter().map(|c| c.meta.clone()).collect(),
-                rows,
-            })
+            Ok((
+                QueryResult {
+                    columns: output.iter().map(|c| c.meta.clone()).collect(),
+                    rows,
+                },
+                provenance,
+            ))
         }
     }
 }
@@ -855,7 +899,7 @@ pub(crate) fn cte_schema(
             ColumnMeta::AliasedId { name } => (name.as_str(), crate::catalog::ColumnType::BigInt),
             ColumnMeta::Scalar { name, ty } => (name.as_str(), ty.clone()),
             ColumnMeta::Computed { name, ty: Some(ty) } => (name.as_str(), ty.clone()),
-            ColumnMeta::Computed { ty: None, .. } => {
+            ColumnMeta::Computed { ty: None, .. } | ColumnMeta::Record { .. } => {
                 return Err(SqlSurfaceError::feature_not_supported(
                     "a CTE column without a static type cannot be a JOIN input",
                 ));

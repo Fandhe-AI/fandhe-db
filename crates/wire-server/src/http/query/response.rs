@@ -232,7 +232,39 @@ fn write_cell(out: &mut String, cell: &Cell) -> Result<(), ResponseEncodeError> 
             out.push('"');
             Ok(())
         }
+        // 再帰 CTE の SEARCH 順序列（SQL-35・Issue #2213）。フィールドの JSON 値を入れ子の配列で
+        // 書く（`record` は `[f1,f2,...]`、`record[]` は `[[f1,...],...]`）。フィールドは
+        // スカラーのセルだけで、深さは高々 2 で有界。
+        Cell::Record(fields) => write_record_fields(out, fields),
+        Cell::RecordArray(items) => {
+            out.push('[');
+            for (i, fields) in items.iter().enumerate() {
+                if i > 0 {
+                    out.push(',');
+                }
+                write_record_fields(out, fields)?;
+            }
+            out.push(']');
+            Ok(())
+        }
     }
+}
+
+/// レコード 1 件のフィールドを JSON 配列として書く（[`write_cell`] の `Record` 系）。フィールドが
+/// さらにレコードなら不変条件違反として fail-closed（`Err`）。
+fn write_record_fields(out: &mut String, fields: &[Cell]) -> Result<(), ResponseEncodeError> {
+    out.push('[');
+    for (i, field) in fields.iter().enumerate() {
+        if i > 0 {
+            out.push(',');
+        }
+        if matches!(field, Cell::Record(_) | Cell::RecordArray(_)) {
+            return Err(ResponseEncodeError);
+        }
+        write_cell(out, field)?;
+    }
+    out.push(']');
+    Ok(())
 }
 
 /// 配列セルの JSON 表現（Issue #888・#1193）。NULL 要素は `null`。整数は JSON number
@@ -403,6 +435,8 @@ fn nosql_type_name(meta: &ColumnMeta) -> &'static str {
         // 公告するようになっても、NOSQL-11 の契約に従い `"text"` 固定を維持する
         // （wire 側との意図的な非対称。モジュール doc 参照）。
         ColumnMeta::Computed { .. } | ColumnMeta::AliasedId { .. } => "text",
+        // 再帰 CTE の SEARCH 順序列（SQL-35・Issue #2213）。SQL wire の `record`／`_record` と同名。
+        ColumnMeta::Record { .. } => crate::result_encoder::column_wire_type(meta).pg_type_name(),
         ColumnMeta::Scalar { ty, .. } => match ty {
             ColumnType::Text => "text",
             ColumnType::Varchar(_) => "varchar",
@@ -602,6 +636,45 @@ mod tests {
                 ty: Some(ColumnType::Double),
             },
         ]
+    }
+
+    /// 再帰 CTE の SEARCH 順序列（SQL-35・Issue #2213）: 型名は `record`／`_record`、値は入れ子の
+    /// JSON 配列。レコードの中にレコードがあれば fail-closed。
+    #[test]
+    fn search_sequence_columns_encode_as_nested_arrays() {
+        let result = QueryResult {
+            columns: vec![
+                ColumnMeta::Record {
+                    name: "d".to_string(),
+                    fields: vec![Some(ColumnType::BigInt)],
+                    array: true,
+                },
+                ColumnMeta::Record {
+                    name: "b".to_string(),
+                    fields: vec![Some(ColumnType::BigInt), Some(ColumnType::BigInt)],
+                    array: false,
+                },
+            ],
+            rows: vec![row(vec![
+                Cell::RecordArray(vec![
+                    vec![Cell::SignedInteger(1)],
+                    vec![Cell::SignedInteger(2)],
+                ]),
+                Cell::Record(vec![Cell::SignedInteger(0), Cell::SignedInteger(1)]),
+            ])],
+        };
+        let body = encode(&result).expect("encode");
+        assert!(body.contains("\"type\":\"_record\""), "{body}");
+        assert!(body.contains("\"type\":\"record\""), "{body}");
+        assert!(body.contains("[[[1],[2]],[0,1]]"), "{body}");
+        let nested = QueryResult {
+            columns: result.columns.clone(),
+            rows: vec![row(vec![
+                Cell::Record(vec![Cell::Record(vec![])]),
+                Cell::Null,
+            ])],
+        };
+        assert!(encode(&nested).is_err());
     }
 
     #[test]

@@ -89,6 +89,8 @@ pub(crate) fn context_kind(ty: &PreparedParamType) -> Option<CastKind> {
             ColumnMeta::Id | ColumnMeta::AliasedId { .. } => CastKind::Numeric,
             ColumnMeta::Scalar { ty, .. } => announced_kind(ty),
             ColumnMeta::Computed { ty, .. } => ty.as_ref().map_or(CastKind::Text, announced_kind),
+            // SEARCH 順序列（record／record[]）は文脈型にならない。型なしと同じ text 扱い（SQL-35）。
+            ColumnMeta::Record { .. } => CastKind::Text,
         }),
     }
 }

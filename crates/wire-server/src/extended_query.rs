@@ -574,7 +574,9 @@ fn binary_param_kind(ty: &PreparedParamType, declared_oid: i32, effective_oid: i
                 1700 => BinaryParam::Numeric,
                 other => int_kind(other),
             },
-            ColumnMeta::Computed { .. } | ColumnMeta::AliasedId { .. } => BinaryParam::Unsupported,
+            ColumnMeta::Computed { .. }
+            | ColumnMeta::AliasedId { .. }
+            | ColumnMeta::Record { .. } => BinaryParam::Unsupported,
             ColumnMeta::Scalar { ty, .. } => match ty {
                 ColumnType::Text | ColumnType::Varchar(_) => text_like(),
                 ColumnType::SmallInt | ColumnType::Integer | ColumnType::BigInt => {
@@ -802,7 +804,8 @@ fn retained_columns_bytes(columns: &[ColumnMeta]) -> usize {
             ColumnMeta::Id => 0,
             ColumnMeta::AliasedId { name }
             | ColumnMeta::Scalar { name, .. }
-            | ColumnMeta::Computed { name, .. } => name.len(),
+            | ColumnMeta::Computed { name, .. }
+            | ColumnMeta::Record { name, .. } => name.len(),
         };
         total = total.saturating_add(name_len);
     }

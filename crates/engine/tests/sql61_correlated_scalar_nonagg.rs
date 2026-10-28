@@ -128,7 +128,8 @@ fn col_name(meta: &ColumnMeta) -> String {
         ColumnMeta::Id => "id".to_string(),
         ColumnMeta::Scalar { name, .. }
         | ColumnMeta::Computed { name, .. }
-        | ColumnMeta::AliasedId { name } => name.clone(),
+        | ColumnMeta::AliasedId { name }
+        | ColumnMeta::Record { name, .. } => name.clone(),
     }
 }
 
