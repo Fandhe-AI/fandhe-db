@@ -29,7 +29,7 @@
 //!
 //! 5. `CYCLE ... SET ... USING` 句（#2214）: PostgreSQL 17 の書き換え（`rewriteSearchAndCycle`）と同じ意味で、
 //!    行ごとに経路（循環判定列の行値の `record[]`。深さ優先の `SEARCH` と同じ生成器 [`SearchPlan`] を共有）を持ち、
-//!    新しい行の行値が親の経路に含まれる（`=` の意味。フィールドに NULL があれば一致しない）なら印を `TO` 値に
+//!    新しい行の行値が親の経路に含まれる（レコード等値。NULL 同士は一致、片側のみ NULL は不一致）なら印を `TO` 値に
 //!    する。印が `TO` 値の行は結果へ残すが次の作業表へは渡さない（そこで再帰が止まる）。印列・経路列は
 //!    順序列（あれば）の後ろへ足し、作業表のスキーマには含めない（[`CyclePlan`]）。経路は複製の前に共有
 //!    バイト予算へ計上する。
@@ -706,7 +706,8 @@ fn cycle_const_bool(c: &CycleConst) -> Result<bool, SqlSurfaceError> {
 
 /// 印の `TO`／`DEFAULT` を共通型へ解決する（PostgreSQL の `select_common_type` と同じ決め方）。
 /// 省略時は boolean の `true`／`false`。両方が文字列なら text、整数どうし（または整数と文字列）なら
-/// integer（`i32` に収まらなければ bigint）、真偽値と文字列なら boolean。真偽値と整数は `42804`。
+/// 整数リテラル自身の型（`i32` に収まれば integer、収まらなければ bigint）で、文字列定数はその型へ範囲検証付きで
+/// 変換する（範囲外は `22003`）。真偽値と文字列なら boolean。真偽値と整数は `42804`。
 /// 返す印のセルは `Cell::Bool`／`Cell::SignedInteger`／`Cell::Text`。
 fn resolve_cycle_marks(
     values: &Option<(CycleConst, CycleConst)>,
@@ -731,13 +732,45 @@ fn resolve_cycle_marks(
             _ => Err(internal("unexpected CYCLE constant form")),
         },
         (Int, Int) | (Int, Text) | (Text, Int) => {
-            let (a, b) = (cycle_const_i64(to)?, cycle_const_i64(default)?);
+            // 共通型は整数リテラル自身の型（`i32` に収まれば integer、収まらなければ bigint）から決める。
+            // 文字列定数はその型へ範囲検証付きで変換する（`'2147483648'` を integer へは入れられず `22003`）。
             let fits = |v: i64| i32::try_from(v).is_ok();
-            let ty = if fits(a) && fits(b) {
+            let lit = |c: &CycleConst| match c {
+                CycleConst::Integer(_) => cycle_const_i64(c).map(Some),
+                _ => Ok(None),
+            };
+            let (la, lb) = (lit(to)?, lit(default)?);
+            let ty = if la.into_iter().chain(lb).all(fits) {
                 ColumnType::Integer
             } else {
                 ColumnType::BigInt
             };
+            let conv = |c: &CycleConst, l: Option<i64>| -> Result<i64, SqlSurfaceError> {
+                if let Some(v) = l {
+                    return Ok(v);
+                }
+                let CycleConst::Text(s) = c else {
+                    return Err(internal("unexpected CYCLE constant form"));
+                };
+                let t = s.trim();
+                let digits = t.strip_prefix(['+', '-']).unwrap_or(t);
+                if digits.is_empty() || !digits.bytes().all(|b| b.is_ascii_digit()) {
+                    return Err(SqlSurfaceError::invalid_text_representation(
+                        "invalid input syntax for type integer",
+                    ));
+                }
+                let out_of_range = || {
+                    SqlSurfaceError::numeric_out_of_range(
+                        "integer out of range in the CYCLE clause",
+                    )
+                };
+                let v = t.parse::<i64>().map_err(|_| out_of_range())?;
+                if ty == ColumnType::Integer && !fits(v) {
+                    return Err(out_of_range());
+                }
+                Ok(v)
+            };
+            let (a, b) = (conv(to, la)?, conv(default, lb)?);
             Ok((Cell::SignedInteger(a), Cell::SignedInteger(b), ty))
         }
         (Bool, Int) | (Int, Bool) => Err(SqlSurfaceError::datatype_mismatch(
@@ -874,8 +907,8 @@ impl CyclePlan {
     }
 
     /// 新しい行 `row` の循環判定列の行値が、親の経路 `parent_path`（親自身の行値を含む `record[]`）の
-    /// いずれかの要素と等しいか。等値は SQL の `=` の意味で、フィールドに NULL が 1 つでもあれば一致
-    /// しない（`ROW(1, NULL) = ROW(1, NULL)` は NULL で循環扱いにならない）。コストは O(深さ × 列数)。
+    /// いずれかの要素と等しいか。等値はレコード等値（PostgreSQL の `record_eq`）で、NULL 同士は一致、
+    /// 片側のみ NULL は不一致（`ROW(1, NULL)` どうしは循環になる）。コストは O(深さ × 列数)。
     /// セルの形が計画と食い違えば `Internal`（fail-closed）。
     fn is_cycle(&self, parent_path: &Cell, row: &ResultRow) -> Result<bool, SqlSurfaceError> {
         use super::join::values::{cmp_val, compare_order};
@@ -884,12 +917,8 @@ impl CyclePlan {
             return Err(internal("recursive cycle path has an unexpected shape"));
         };
         let new = self.path.by_cells(row)?;
-        if new.len() != self.classes.len() || new.iter().any(|c| matches!(c, Cell::Null)) {
-            return if new.len() != self.classes.len() {
-                Err(internal("cycle column count mismatch"))
-            } else {
-                Ok(false)
-            };
+        if new.len() != self.classes.len() {
+            return Err(internal("cycle column count mismatch"));
         }
         for element in elements {
             if element.len() != self.classes.len() {
@@ -897,13 +926,17 @@ impl CyclePlan {
             }
             let mut equal = true;
             for ((old, now), class) in element.iter().zip(new.iter()).zip(self.classes.iter()) {
-                let (Some(a), Some(b)) = (cmp_val(old, class)?, cmp_val(now, class)?) else {
-                    equal = false;
-                    break;
+                // レコード等値（`record_eq` 相当）: NULL 同士は一致、片側のみ NULL は不一致。
+                let (a, b) = (cmp_val(old, class)?, cmp_val(now, class)?);
+                let same = match (&a, &b) {
+                    (None, None) => true,
+                    (Some(x), Some(y)) => {
+                        compare_order(Some(x), Some(y), false, NullPlacement::Last)
+                            == std::cmp::Ordering::Equal
+                    }
+                    _ => false,
                 };
-                if compare_order(Some(&a), Some(&b), false, NullPlacement::Last)
-                    != std::cmp::Ordering::Equal
-                {
+                if !same {
                     equal = false;
                     break;
                 }
@@ -2174,7 +2207,7 @@ mod tests {
         assert!(matches!(path, ColumnMeta::Record { array: true, .. }));
     }
 
-    /// `TO`／`DEFAULT` の共通型: 整数は `i32` に収まらなければ bigint、文字列と整数は整数。
+    /// `TO`／`DEFAULT` の共通型: 整数は `i32` に収まらなければ bigint、文字列は整数リテラルの型へ範囲検証付きで変換。
     #[test]
     fn resolve_cycle_marks_common_type() {
         let int = |s: &str| CycleConst::Integer(s.to_string());
@@ -2195,6 +2228,23 @@ mod tests {
                 ColumnType::Integer
             )
         );
+        // 文字列定数は整数リテラルの型（integer）へ範囲検証付きで変換する（範囲外は `22003`）。
+        assert_eq!(
+            resolve_cycle_marks(&Some((int("1"), CycleConst::Text("2147483648".into()))))
+                .unwrap_err()
+                .wire_code(),
+            "22003"
+        );
+        // 整数リテラルが bigint なら文字列も bigint として受理する。
+        let (_, d, ty) = resolve_cycle_marks(&Some((
+            int("2147483648"),
+            CycleConst::Text("2147483649".into()),
+        )))
+        .unwrap();
+        assert_eq!(
+            (d, ty),
+            (Cell::SignedInteger(2_147_483_649), ColumnType::BigInt)
+        );
         // `i64` を超える整数リテラルは未対応（`0A000`）。
         assert_eq!(
             resolve_cycle_marks(&Some((int("9223372036854775808"), int("0"))))
@@ -2204,7 +2254,7 @@ mod tests {
         );
     }
 
-    /// 循環判定は `=` の意味: 親の経路のどれかと全フィールドが非 NULL で等しければ循環、NULL を含めば一致しない。
+    /// 循環判定はレコード等値: 親の経路のどれかと全フィールドが等しければ循環（NULL 同士は一致、片側のみ NULL は不一致）。
     #[test]
     fn is_cycle_uses_equality_semantics() {
         let (plan, _, _) = plan_cycle(
@@ -2225,7 +2275,10 @@ mod tests {
             cells: vec![Cell::Null],
         };
         let null_path = Cell::RecordArray(vec![vec![Cell::Null]]);
-        assert!(!plan.is_cycle(&null_path, &null_row).unwrap());
+        assert!(plan.is_cycle(&null_path, &null_row).unwrap());
+        let value_path = Cell::RecordArray(vec![vec![Cell::SignedInteger(1)]]);
+        assert!(!plan.is_cycle(&value_path, &null_row).unwrap());
+        assert!(!plan.is_cycle(&null_path, &search_row(1)).unwrap());
         // 経路の形が想定外なら `Internal`（fail-closed）。
         assert!(plan.is_cycle(&Cell::Null, &search_row(1)).is_err());
     }

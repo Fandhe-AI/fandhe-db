@@ -342,6 +342,7 @@ fn mark_value_errors() {
         ("TO true DEFAULT 1", "42804"),
         ("TO 1 DEFAULT true", "42804"),
         ("TO 1 DEFAULT 'x'", "22P02"),
+        ("TO 1 DEFAULT '2147483648'", "22003"),
         ("TO true DEFAULT 'maybe'", "22P02"),
         ("TO 1.5 DEFAULT 0", "0A000"),
         ("TO NULL DEFAULT 0", "0A000"),
@@ -384,16 +385,20 @@ fn search_and_cycle_together() {
     assert_eq!(result.columns.len(), 4);
 }
 
-/// 循環判定列に NULL があると `=` が真にならず、循環として検出されない（本実装は反復上限で拒否する）。
+/// 循環判定列の NULL はレコード等値で NULL 同士が一致し、循環として検出される。
 #[test]
-fn null_fields_never_match() {
+fn null_fields_match_each_other() {
     let (core, _g) = open_core_with(seed_cycle);
     let sql =
         "WITH RECURSIVE t(n, x) AS (SELECT CAST(1 AS BIGINT), CAST(NULL AS BIGINT) UNION ALL \
                SELECT e.dst, t.x FROM edges e JOIN t ON e.src = t.n) \
                CYCLE n, x SET c USING p SELECT n FROM t";
-    assert_eq!(code(&core, "alice", sql), "54000");
-    // 比較対象を n だけにすれば停止する。
+    assert_eq!(rows(&core, "alice", sql).len(), 5);
+    // NULL のみの循環行も 54000 にならず、循環行を含む 2 行で停止する。
+    let nulls = "WITH RECURSIVE t(n) AS (SELECT CAST(NULL AS BIGINT) UNION ALL SELECT n FROM t) \
+                 CYCLE n SET c USING p SELECT * FROM t";
+    assert_eq!(rows(&core, "alice", nulls).len(), 2);
+    // 比較対象を n だけにしても停止する。
     let ok = "WITH RECURSIVE t(n, x) AS (SELECT CAST(1 AS BIGINT), CAST(NULL AS BIGINT) UNION ALL \
               SELECT e.dst, t.x FROM edges e JOIN t ON e.src = t.n) \
               CYCLE n SET c USING p SELECT n FROM t";
