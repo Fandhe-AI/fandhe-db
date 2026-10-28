@@ -852,3 +852,45 @@ fn lag_argument_column_survives_buffered_view() {
     let got: Vec<Cell> = rows.into_iter().map(|(_, c)| c).collect();
     assert_eq!(got, sis(&[None, Some(10), Some(20)]));
 }
+
+/// 裸の BIGINT 列は既定値付きでも宣言型のまま運ぶ（f64 を経由せず 2^53 超が正確に保たれる。
+/// Issue #1881 のレビュー指摘の回帰）。
+#[test]
+fn bigint_column_with_default_stays_exact() {
+    const BIG: i64 = 9_007_199_254_740_993;
+    let path = unique_db_path("lag-eval-bigint-default");
+    let _g = CleanupGuard(path.clone());
+    let storage = Storage::open(&path).expect("open storage");
+    let ctx = ctx_for("tenant-a");
+    storage
+        .create_table(&TableSchema::new(
+            "big",
+            vec![ColumnDef::new("b", ColumnType::BigInt, true)],
+        ))
+        .expect("create table");
+    for id in 1..=2u64 {
+        let op_id = engine::recovery::required_op_id::OperationId::parse(&format!("big-op-{id}"))
+            .expect("valid operation_id");
+        engine::tenant::insert_typed_row(
+            &storage,
+            "big",
+            &ctx,
+            id,
+            Visibility::Public,
+            &[Value::BigInt(BIG + i64::try_from(id).expect("small"))],
+            &op_id,
+        )
+        .expect("insert row");
+    }
+    let core = EngineCore::from_storage(storage, Box::new(CpuScalarProvider));
+    let q = |c: &str| col1(&core, &ctx, &format!("SELECT id, {c} FROM big LIMIT 10"));
+    let exact = sis(&[Some(BIG + 1), Some(BIG + 2)]);
+    assert_eq!(q("lag(b, 0) OVER (ORDER BY id)"), exact);
+    assert_eq!(q("lag(b, 0, 0) OVER (ORDER BY id)"), exact);
+    assert_eq!(q("lead(b, 0, 0) OVER (ORDER BY id)"), exact);
+    assert_eq!(q("lead(b, 0, b) OVER (ORDER BY id)"), exact);
+    assert_eq!(
+        q("lag(b, 1, b) OVER (ORDER BY id)"),
+        sis(&[Some(BIG + 1), Some(BIG + 1)])
+    );
+}

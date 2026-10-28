@@ -10031,7 +10031,20 @@ fn bind_window_offset_args(
                     return Err(unsupported());
                 }
             }
-            match bind_value_with_default(&args.value, d, schema, udfs, node_budget) {
+            // BIGINT の裸の列は f64 ベースの式層を通すと 2^53 超が範囲エラーになるため、
+            // 式束縛へ落とさず宣言型・列位置でセル化する経路（下の `InvalidInput` 腕）へ回す。
+            let exact_int = bare_column
+                .iter()
+                .chain(default_bare.iter())
+                .any(|(_, c)| matches!(c.ty, ColumnType::BigInt));
+            let bound = if exact_int {
+                Err(SqlSurfaceError::InvalidInput {
+                    detail: "LAG/LEAD BIGINT column is bound by declared type".to_string(),
+                })
+            } else {
+                bind_value_with_default(&args.value, d, schema, udfs, node_budget)
+            };
+            match bound {
                 Ok((v, d, ty, col)) => (
                     v,
                     Some(d),
