@@ -81,9 +81,9 @@ GroupEnd` の挙動（タイ組の境界カット・完全化）がキャッシ�
 | `cargo test -p engine --test query_planning_recall` | ok（10 passed） |
 | `cargo test -p engine --test precision_eval` | ok（11 passed） |
 | `cargo test -p engine --test incremental_recall` | ok |
-| `cargo test -p engine --test sparse_cache` | ok（5 passed。#357 既存受け入れ基準） |
-| `cargo test -p engine --test sql_surface` | ok（12 passed） |
-| `cargo test -p engine --test hybrid` | ok（9 passed） |
+| `cargo test -p engine --test core_misc sparse_cache::` | ok（5 passed。#357 既存受け入れ基準） |
+| `cargo test -p engine --test sql_named sql_surface::` | ok（12 passed） |
+| `cargo test -p engine --test core_misc hybrid::` | ok（9 passed） |
 | `make sort-determinism-check` | ok |
 
 ## 実行結果（新規 SQL 表層専用検証）
