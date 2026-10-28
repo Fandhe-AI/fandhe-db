@@ -853,6 +853,45 @@ fn lag_argument_column_survives_buffered_view() {
     assert_eq!(got, sis(&[None, Some(10), Some(20)]));
 }
 
+/// バッファ済みビュー越しの TIME／TIMESTAMPTZ 列の LAG／LEAD は内部エラー（XX000）でなく
+/// 固定 `0A000` で拒否する（PR レビュー指摘の回帰）。
+#[test]
+fn buffered_view_time_columns_are_rejected_with_0a000() {
+    let path = unique_db_path("lag-view-time");
+    let _guard = CleanupGuard(path.clone());
+    let storage = Storage::open(&path).expect("open storage");
+    storage
+        .create_table(&TableSchema::new(
+            "events",
+            vec![
+                ColumnDef::new("at_time", ColumnType::Time, false),
+                ColumnDef::new("at_tz", ColumnType::TimestampTz, false),
+            ],
+        ))
+        .expect("create table");
+    let core = EngineCore::from_storage(storage, Box::new(CpuScalarProvider));
+    let ctx = ctx_for("tenant-a");
+    let mut session = SessionState::default();
+    session.allow_ddl();
+    core.execute_sql_in_session(
+        &ctx,
+        &mut session,
+        "CREATE VIEW ev AS SELECT id, at_time, at_tz FROM events ORDER BY id LIMIT 3",
+    )
+    .expect("create view");
+    for col in ["at_time", "at_tz"] {
+        let mut s = SessionState::default();
+        let err = core
+            .execute_sql_in_session(
+                &ctx,
+                &mut s,
+                &format!("SELECT id, lag({col}) OVER (ORDER BY id) FROM ev LIMIT 100"),
+            )
+            .expect_err("TIME/TIMESTAMPTZ over a buffered view is rejected");
+        assert_eq!(err.wire_code(), "0A000", "{col}: {err:?}");
+    }
+}
+
 /// 裸の BIGINT 列は既定値付きでも宣言型のまま運ぶ（f64 を経由せず 2^53 超が正確に保たれる。
 /// Issue #1881 のレビュー指摘の回帰）。
 #[test]

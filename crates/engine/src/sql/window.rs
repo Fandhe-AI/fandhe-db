@@ -299,11 +299,6 @@ impl OffsetEvaluator {
             .and_then(|p| p.as_ref())
             .ok_or_else(|| window_bug("offset window programs missing for an item"))?;
         let scratch = &mut self.scratch;
-        *state_bytes = try_accumulate_state_budget(
-            *state_bytes,
-            std::mem::size_of::<Option<OffsetRowValues>>(),
-            state_cap,
-        )?;
         let result_ty = args.result_type.as_ref();
 
         // オフセットは全行で評価する（PostgreSQL と同じ。エラーは即時）。
@@ -888,6 +883,12 @@ fn collect_window_row_values(
     let mut partition_keys = Vec::with_capacity(items.len());
     let mut order_keys = Vec::with_capacity(items.len());
     let mut agg_values = Vec::with_capacity(items.len());
+    // offset 関数を持たない項目も `None` の固定領域を行ごとに持つため、確保前に全項目分を
+    // 状態予算へ計上する（`OffsetEvaluator::extract` 側では計上しない＝二重計上しない）。
+    let offset_slots_bytes = std::mem::size_of::<Option<OffsetRowValues>>()
+        .checked_mul(items.len())
+        .ok_or_else(|| window_bug("offset slot size overflow"))?;
+    *state_bytes = try_accumulate_state_budget(*state_bytes, offset_slots_bytes, state_cap)?;
     let mut offset_values = Vec::with_capacity(items.len());
     for (item_index, item) in items.iter().enumerate() {
         let mut pkeys = Vec::with_capacity(item.partition_by.len());
@@ -983,6 +984,26 @@ impl<'a> CellWindowEvaluator<'a> {
     /// `items` は合成スキーマ（本文の結果列と同じ並び）に束縛済みのウィンドウ項目。
     pub(crate) fn new(items: &'a [BoundWindowItem]) -> Result<Self, SqlSurfaceError> {
         for item in items {
+            // バッファ済みビュー経路のセル→スカラー変換（`cell_scalar`）は TIME／TIMESTAMPTZ を
+            // 写せないため、これらの列を値・既定値に取る LAG／LEAD は内部エラーでなく
+            // 固定 `0A000` で拒否する（fail-closed）。
+            if let Some(args) = &item.offset_args {
+                let value_ty = match &args.value {
+                    BoundWindowValue::Column { ty, .. } => Some(ty),
+                    _ => None,
+                };
+                let default_ty = args.default_column.as_ref().map(|(_, ty)| ty);
+                if value_ty
+                    .into_iter()
+                    .chain(default_ty)
+                    .any(|ty| matches!(ty, ColumnType::Time | ColumnType::TimestampTz))
+                {
+                    return Err(SqlSurfaceError::FeatureNotSupported {
+                        detail: "LAG/LEAD over TIME or TIMESTAMPTZ columns of a buffered view is not supported"
+                            .to_string(),
+                    });
+                }
+            }
             let uses_pseudo_id = item
                 .partition_by
                 .iter()
