@@ -9712,14 +9712,13 @@ pub(crate) struct BoundWindowItem {
     pub(crate) partition_by: Vec<WindowKeyRef>,
     /// 宣言順のウィンドウ `ORDER BY` キー列（SQL-30・SQL-56）。
     pub(crate) order_by: Vec<BoundWindowOrderKey>,
-    /// 束縛済みのフレーム句（`ROWS`・`RANGE`。SQL-64 (2)・Issue #1889／#1890）。`GROUPS` は
-    /// #1891 までゲート（`0A000`）で止まるため常に `None`。
+    /// 束縛済みのフレーム句（`ROWS`・`RANGE`・`GROUPS`。SQL-64 (2)・Issue #1889／#1890／#1891）。
     pub(crate) frame: Option<BoundWindowFrame>,
     pub(crate) name: String,
 }
 
 /// 束縛済みのウィンドウフレーム（SQL-64 (2)・Issue #1889／#1890）。`sql::window` が実行開始時に
-/// オフセットを評価して解決する。`mode` は評価側が `GROUPS` を fail-closed に弾くために持つ。
+/// オフセットを評価して解決する。`mode` は評価側が ROWS／RANGE／GROUPS を振り分けるために持つ。
 #[derive(Debug, Clone, PartialEq)]
 pub(crate) struct BoundWindowFrame {
     pub(crate) mode: crate::sql::allowlist::WindowFrameMode,
@@ -10395,26 +10394,14 @@ fn bind_window_item(
         frame,
         name,
     };
-    // `GROUPS` フレーム句は構文・束縛段の検査（`bind_window_frame`）を通っても評価しない。
-    // 評価は #1891 がこのゲートを外す（#1889 で ROWS、#1890 で RANGE は外した）。
-    // 既定フレームと同値の明示フレームも対象で、行数・テナントの有無に依存しない（fail-closed）。
-    if item
-        .frame
-        .as_ref()
-        .is_some_and(|f| f.mode == crate::sql::allowlist::WindowFrameMode::Groups)
-    {
-        return Err(SqlSurfaceError::feature_not_supported(
-            "window frame clauses are not supported yet",
-        ));
-    }
     // `LAG`／`LEAD` は構文受理・束縛・型検査（Issue #1880）の後、評価（`sql::window`。
     // Issue #1881）へそのまま流す。運べない値型は束縛段で `0A000` に拒否済み。
     Ok(bound)
 }
 
-/// ウィンドウのフレーム句を検証し、`ROWS`・`RANGE` のときは束縛済みフレームを返す（SQL-64 (2)・
-/// Issue #1887／#1889／#1890。[`bind_window_item`] からキー解決の後に呼ばれる。`GROUPS` は
-/// 検証のみで `None`——#1891 が束縛済みフレームを追加する）。PostgreSQL の
+/// ウィンドウのフレーム句を検証し、束縛済みフレームを返す（SQL-64 (2)・
+/// Issue #1887／#1889／#1890。[`bind_window_item`] からキー解決の後に呼ばれる。`GROUPS` も
+/// Issue #1891 で束縛済みフレームを返す）。PostgreSQL の
 /// 解析段に合わせ、次の順で拒否する: `RANGE` オフセットの `ORDER BY` キー数（`42P20`）→
 /// `ORDER BY` の無い `GROUPS`（`42P20`）→ オフセット式の変数（`42P10`。列は解決せず一律に拒否し、
 /// ビューの非公開列か未知列かの存在情報を漏らさない）→ `ROWS`／`GROUPS` オフセットの型（`42804`）／
@@ -10486,10 +10473,6 @@ fn bind_window_frame(
     };
     let start = bind_bound(&frame.start, node_budget)?;
     let end = bind_bound(&frame.end, node_budget)?;
-    if frame.mode == WindowFrameMode::Groups {
-        // `GROUPS` は #1891 が束縛済みフレームを持つ（ゲートで止まる）。
-        return Ok(None);
-    }
     Ok(Some(BoundWindowFrame {
         mode: frame.mode,
         start,
