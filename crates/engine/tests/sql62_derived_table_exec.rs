@@ -4,6 +4,7 @@
 //! 派生表は名前を利用者が書けない合成 CTE 1 件として既存の単一表 `WITH` 主クエリ経路で実行される。
 //! 本テストは (A) 外側の述語・投影・並びが派生列に対して動く、(B) 他テナントの行が混入しない、
 //! (C) CTE 版と結果が一致する、(D) 実行対象外の形は固定エラーで止まる、を固定する。
+//! JOIN 入力・入れ子・深さ上限（Issue #1867）は `sql62_derived_table_join.rs`。
 
 use engine::catalog::{ColumnDef, ColumnType, TableSchema};
 use engine::core::EngineCore;
@@ -350,15 +351,6 @@ fn materialization_cap_counts_only_visible_rows() {
 fn unsupported_shapes_stay_fail_closed() {
     let (core, _g) = open_seeded();
     for (sql, expected) in [
-        (
-            "SELECT * FROM (SELECT lang FROM docs) a JOIN docs d ON a.lang = d.lang",
-            "0A000",
-        ),
-        ("SELECT * FROM (SELECT lang FROM docs) a, docs d", "0A000"),
-        (
-            "SELECT * FROM (SELECT lang FROM docs) a, (SELECT lang FROM docs) b",
-            "0A000",
-        ),
         ("SELECT * FROM LATERAL (SELECT lang FROM docs) t", "0A000"),
         ("EXPLAIN SELECT * FROM (SELECT lang FROM docs) t", "42601"),
         (
@@ -395,7 +387,7 @@ fn errors_hide_internal_names_and_do_not_depend_on_tenant() {
     for sql in [
         "SELECT nope FROM (SELECT lang FROM docs) t",
         "SELECT * FROM (SELECT lang FROM docs) t(a, b, c)",
-        "SELECT * FROM (SELECT lang FROM docs) a, docs d",
+        "SELECT * FROM (SELECT lang FROM docs) a, docs d WHERE nope = 1",
         "SELECT x FROM (SELECT lang FROM docs ORDER BY lang) t",
         "SELECT * FROM (SELECT lang FROM docs) t ORDER BY lang <=> '[1,0]'",
     ] {
