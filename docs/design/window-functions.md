@@ -201,3 +201,20 @@
   抽出。挙動不変）を共有する。既定値の裸の列は宣言型を併せて運ぶ（`default_column`）。
 - **対象外**: フレーム句・名前付きウィンドウ・`FILTER`・`EXPLAIN`（兄弟 Issue）。引数内の
   `$n`（`42601`）。NUMERIC の typmod が異なる値と既定値の公告 typmod の差（#1880 の判断を維持）。
+
+## Issue #1888 追記: パーティション・比較器の整理（SQL-64 ポインタ）
+
+親 #1886（フレーム句）の前提整備。挙動は変えないリファクタで、既存テストの期待値は不変。
+
+- **比較器を 1 本に**: `cmp_order_keys`（ORDER BY キーのみ）と `cmp_partition_rows`
+  （キー → `id` → `seq`）に分けた。peer は `cmp_order_keys == Equal` と定義し、旧
+  `peer_group_equal`／`window_key_value_eq` を廃止した（NULL 同士のみ peer という意味は同じ）。
+- **`SortedPartition`**: 並べ替え済みパーティション。`row(pos)`／`row_index(pos)`／`len()` で
+  位置から行を引き、`peer_groups()`／`peer_group_end(start)`／`are_peers(p, q)` で peer 範囲を
+  得る。範囲外は panic せず `XX000` で fail-closed。
+- **状態予算は不変**: peer の境界は確保せず都度走査で求める。`indices` は
+  `evaluate_window_item` が計上済みの Vec をそのまま持つため、`54000` の境目は動かない。
+  境界索引が必要になった場合（#1890／#1891）は、確保の前に `try_accumulate_state_budget`
+  へ計上すること。
+- **#1889〜#1891 の前提**: ROWS は位置アクセス、RANGE／GROUPS は peer 範囲と
+  `cmp_order_keys` を土台にする。フレーム固有の処理は本 Issue では入れていない。
