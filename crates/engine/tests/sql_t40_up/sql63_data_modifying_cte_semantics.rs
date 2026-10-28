@@ -6,7 +6,8 @@
 //! 同じ行を複数の副文が変更する場合は `WITH` の定義順に実行して後の副文が先の副文の書いた行に触れず、
 //! どこかでエラーになれば文全体が取り消されて副作用が残らないことを、production 経路
 //! （`EngineCore::execute_sql_in_session`／`execute_sql_in_txn`）で固定する。
-//! RLS・権限の境界テストの網羅は #1878 の担当（本ファイルは 2 テナントでの同一応答までを確かめる）。
+//! RLS・権限の境界テストの網羅は `rls10_data_modifying_cte_paths.rs`（#1878）が担当する
+//! （本ファイルは 2 テナントでの同一応答までを確かめる）。
 
 use engine::catalog::{ColumnDef, ColumnType, TableSchema};
 use engine::core::EngineCore;

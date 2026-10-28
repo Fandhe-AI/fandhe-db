@@ -8,7 +8,7 @@
 //! 開く前に固定 `0A000` で拒否され表が一切変わらないことを production 経路
 //! （`EngineCore::execute_sql_in_session`／`execute_sql_in_txn`）で固定する。文開始時点の可視性・
 //! 同一行の多重変更・複数のデータ変更 CTE は `sql63_data_modifying_cte_semantics.rs`（#1877）、
-//! RLS・権限の境界テストは #1878 の担当。
+//! RLS・権限の境界テストは `rls10_data_modifying_cte_paths.rs`（#1878）が担当する。
 
 use engine::catalog::{ColumnDef, ColumnType, TableSchema};
 use engine::core::EngineCore;

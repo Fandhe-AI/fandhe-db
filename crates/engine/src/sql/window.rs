@@ -1661,15 +1661,8 @@ fn evaluate_window_item(
     )?;
     let mut result: Vec<Option<Cell>> = vec![None; materialized.len()];
     for indices in partitions.into_values() {
-        evaluate_partition(
-            item,
-            item_index,
-            materialized,
-            indices,
-            &mut result,
-            state_bytes,
-            state_cap,
-        )?;
+        let part = SortedPartition::new(item, item_index, materialized, indices);
+        evaluate_partition(&part, &mut result, state_bytes, state_cap)?;
     }
     result
         .into_iter()
@@ -1689,14 +1682,15 @@ fn evaluate_window_item(
 /// NULL。既定値へは落とさない）、範囲外なら現在行で評価した既定値（なければ NULL）。値・既定値の
 /// 評価エラーは使用時に初めて返す（PostgreSQL と同じく、参照されない行のエラーを出さない）。
 fn evaluate_offset_partition(
-    item: &BoundWindowItem,
-    item_index: usize,
-    materialized: &[MaterializedRow],
-    indices: &[usize],
+    part: &SortedPartition<'_>,
     out: &mut [Option<Cell>],
     state_bytes: &mut usize,
     state_cap: usize,
 ) -> Result<(), SqlSurfaceError> {
+    let item = part.item;
+    let item_index = part.item_index;
+    let materialized = part.materialized;
+    let indices = part.row_indices();
     let forward = matches!(item.func, WindowFunc::Lead);
     let values_of = |row_idx: usize| -> Result<&OffsetRowValues, SqlSurfaceError> {
         materialized
@@ -1711,9 +1705,7 @@ fn evaluate_offset_partition(
             None => None,
             Some(o) => match offset_target_index(pos, indices.len(), o, forward) {
                 Some(target) => {
-                    let target_row = *indices
-                        .get(target)
-                        .ok_or_else(|| window_bug("offset target index out of range"))?;
+                    let target_row = part.row_index(target)?;
                     Some(
                         values_of(target_row)?
                             .value
@@ -1747,52 +1739,24 @@ fn evaluate_offset_partition(
     Ok(())
 }
 
-/// 1 パーティション分のウィンドウ値を計算する（安定ソート → peer 分割 →
-/// 順位/集計評価。§モジュールドキュメント「評価の意味」参照）。
+/// 1 パーティション分のウィンドウ値を計算する（並べ替え済み [`SortedPartition`] を
+/// peer グループ単位で走査し、順位/集計を評価する。§モジュールドキュメント「評価の意味」参照）。
+/// `evaluate_window_item` から呼ばれる。
 fn evaluate_partition(
-    item: &BoundWindowItem,
-    item_index: usize,
-    materialized: &[MaterializedRow],
-    mut indices: Vec<usize>,
+    part: &SortedPartition<'_>,
     out: &mut [Option<Cell>],
     state_bytes: &mut usize,
     state_cap: usize,
 ) -> Result<(), SqlSurfaceError> {
-    // 安定ソート。比較順は ORDER BY キー → `id` 昇順 → `seq` 昇順（走査順の
-    // タイブレーク。`sort_by`〔安定〕のみを使い `sort_unstable*` は使わない
-    // ——`scripts/check_sort_determinism.sh` が CI で検知する）。
-    indices.sort_by(|&a, &b| {
-        let ra = &materialized[a];
-        let rb = &materialized[b];
-        for (key_idx, ordering) in item.order_by.iter().enumerate() {
-            let ord = cmp_window_key(
-                &ra.order_keys[item_index][key_idx],
-                &rb.order_keys[item_index][key_idx],
-                ordering.descending,
-                ordering.nulls,
-            );
-            if ord != std::cmp::Ordering::Equal {
-                return ord;
-            }
-        }
-        ra.id.cmp(&rb.id).then(ra.seq.cmp(&rb.seq))
-    });
+    let item = part.item;
+    let item_index = part.item_index;
 
     // `LAG`／`LEAD` は peer・フレームに依存しないため、peer 分割へ入れず専用の評価へ委譲する。
     if item.func.is_value_offset() {
-        return evaluate_offset_partition(
-            item,
-            item_index,
-            materialized,
-            &indices,
-            out,
-            state_bytes,
-            state_cap,
-        );
+        return evaluate_offset_partition(part, out, state_bytes, state_cap);
     }
 
     let mut scratch: Vec<StackValue> = Vec::new();
-    let has_order_by = !item.order_by.is_empty();
 
     let mut acc: Option<Accumulator> = match &item.input {
         None => None,
@@ -1802,36 +1766,19 @@ fn evaluate_partition(
         )?),
     };
 
-    let mut rank = 0usize;
-    let mut dense_rank = 0usize;
-    let mut idx = 0usize;
-    while idx < indices.len() {
-        let mut peer_end = idx + 1;
-        if has_order_by {
-            while peer_end < indices.len()
-                && peer_group_equal(
-                    item,
-                    item_index,
-                    materialized,
-                    indices[idx],
-                    indices[peer_end],
-                )
-            {
-                peer_end += 1;
-            }
-        } else {
-            peer_end = indices.len();
-        }
+    for (dense_rank, group) in part.peer_groups().enumerate() {
+        let (idx, peer_end) = group?;
+        // 順位関数の `rank` は peer グループ先頭の 0 始まり位置（= 先行行数）。
+        let rank = idx;
 
         if let (Some(acc_mut), Some(input)) = (acc.as_mut(), &item.input) {
-            for &row_idx in &indices[idx..peer_end] {
-                observe_window_row(
-                    acc_mut,
-                    input,
-                    materialized[row_idx].id,
-                    &materialized[row_idx].agg_values[item_index],
-                    &mut scratch,
-                )?;
+            for pos in idx..peer_end {
+                let row = part.row(pos)?;
+                let agg_value = row
+                    .agg_values
+                    .get(item_index)
+                    .ok_or_else(|| window_bug("aggregate window values missing for a row"))?;
+                observe_window_row(acc_mut, input, row.id, agg_value, &mut scratch)?;
             }
         }
 
@@ -1860,7 +1807,8 @@ fn evaluate_partition(
         };
 
         let row_number_base = idx;
-        for (offset, &row_idx) in indices[idx..peer_end].iter().enumerate() {
+        for (offset, pos) in (idx..peer_end).enumerate() {
+            let row_idx = part.row_index(pos)?;
             let row_number = row_number_base + offset + 1;
             let cell = match item.func {
                 WindowFunc::RowNumber => Cell::Integer(row_number as u64),
@@ -1891,38 +1839,170 @@ fn evaluate_partition(
             })?;
             *slot = Some(cell);
         }
-
-        rank = peer_end;
-        dense_rank += 1;
-        idx = peer_end;
     }
 
     Ok(())
 }
 
-fn peer_group_equal(
+/// `ORDER BY` キーだけの比較（タイブレークなし）。`Equal` が peer（同順位）の定義で、
+/// 並べ替え（[`cmp_partition_rows`]）と peer 判定（[`SortedPartition::are_peers`]）が
+/// 共有する唯一の比較器。RANGE フレームのオフセット比較（Issue #1890）の土台でもある。
+/// キーを取り出せないのは不変条件違反だが、`sort_by` のクロージャはエラーを返せないため
+/// `Equal` へ倒す（`compute_output_order` と同じ流儀）。
+fn cmp_order_keys(
     item: &BoundWindowItem,
     item_index: usize,
-    materialized: &[MaterializedRow],
-    a: usize,
-    b: usize,
-) -> bool {
-    for key_idx in 0..item.order_by.len() {
-        if !window_key_value_eq(
-            &materialized[a].order_keys[item_index][key_idx],
-            &materialized[b].order_keys[item_index][key_idx],
-        ) {
-            return false;
+    a: &MaterializedRow,
+    b: &MaterializedRow,
+) -> std::cmp::Ordering {
+    use std::cmp::Ordering;
+    for (key_idx, ordering) in item.order_by.iter().enumerate() {
+        let ka = a.order_keys.get(item_index).and_then(|k| k.get(key_idx));
+        let kb = b.order_keys.get(item_index).and_then(|k| k.get(key_idx));
+        let (Some(ka), Some(kb)) = (ka, kb) else {
+            return Ordering::Equal;
+        };
+        let ord = cmp_window_key(ka, kb, ordering.descending, ordering.nulls);
+        if ord != Ordering::Equal {
+            return ord;
         }
     }
-    true
+    Ordering::Equal
 }
 
-fn window_key_value_eq(a: &Option<WindowKeyValue>, b: &Option<WindowKeyValue>) -> bool {
-    match (a, b) {
-        (None, None) => true,
-        (Some(x), Some(y)) => cmp_window_key_value(x, y) == std::cmp::Ordering::Equal,
-        _ => false,
+/// パーティション内の並べ替え順。比較順は ORDER BY キー → `id` 昇順 → `seq` 昇順
+/// （走査順のタイブレーク）。`sort_by`〔安定〕のみを使い `sort_unstable*` は使わない
+/// ——`scripts/check_sort_determinism.sh` が CI で検知する。
+fn cmp_partition_rows(
+    item: &BoundWindowItem,
+    item_index: usize,
+    a: &MaterializedRow,
+    b: &MaterializedRow,
+) -> std::cmp::Ordering {
+    cmp_order_keys(item, item_index, a, b)
+        .then(a.id.cmp(&b.id))
+        .then(a.seq.cmp(&b.seq))
+}
+
+/// 並べ替え済みの 1 パーティション（Issue #1888。SQL-64 ポインタ）。
+///
+/// `evaluate_window_item` がパーティション分割後に作り、`evaluate_partition`／
+/// `evaluate_offset_partition` が「位置 → 行」の引き当てと peer 範囲の取得に使う。
+/// フレーム評価（ROWS／RANGE／GROUPS。Issue #1889〜#1891）は位置アクセス
+/// （`row`／`row_index`／`len`）と peer 範囲（`peer_groups`／`peer_group_end`／`are_peers`）を
+/// 土台にする。状態予算を変えないため、peer の境界は確保せず都度走査で求める
+/// （`indices` は `evaluate_window_item` が計上済みの Vec をそのまま保持する）。
+struct SortedPartition<'a> {
+    item: &'a BoundWindowItem,
+    item_index: usize,
+    materialized: &'a [MaterializedRow],
+    /// 並べ替え済み（位置 → `materialized` の添字）。
+    indices: Vec<usize>,
+}
+
+impl<'a> SortedPartition<'a> {
+    /// `indices` を [`cmp_partition_rows`] で安定ソートして保持する。
+    fn new(
+        item: &'a BoundWindowItem,
+        item_index: usize,
+        materialized: &'a [MaterializedRow],
+        mut indices: Vec<usize>,
+    ) -> Self {
+        indices.sort_by(|&a, &b| match (materialized.get(a), materialized.get(b)) {
+            (Some(ra), Some(rb)) => cmp_partition_rows(item, item_index, ra, rb),
+            _ => std::cmp::Ordering::Equal,
+        });
+        Self {
+            item,
+            item_index,
+            materialized,
+            indices,
+        }
+    }
+
+    fn len(&self) -> usize {
+        self.indices.len()
+    }
+
+    fn row_indices(&self) -> &[usize] {
+        &self.indices
+    }
+
+    /// 位置 `pos` の行の `materialized` 添字（範囲外は不変条件違反として `XX000`）。
+    fn row_index(&self, pos: usize) -> Result<usize, SqlSurfaceError> {
+        self.indices
+            .get(pos)
+            .copied()
+            .ok_or_else(|| window_bug("partition position out of range"))
+    }
+
+    /// 位置 `pos` の行（範囲外は不変条件違反として `XX000`）。
+    fn row(&self, pos: usize) -> Result<&'a MaterializedRow, SqlSurfaceError> {
+        let idx = self.row_index(pos)?;
+        self.materialized
+            .get(idx)
+            .ok_or_else(|| window_bug("partition row index out of range"))
+    }
+
+    fn has_order_by(&self) -> bool {
+        !self.item.order_by.is_empty()
+    }
+
+    /// 位置 `p` と `q` が peer か。ORDER BY なしならパーティション全体が 1 グループ。
+    fn are_peers(&self, p: usize, q: usize) -> Result<bool, SqlSurfaceError> {
+        if !self.has_order_by() {
+            return Ok(true);
+        }
+        let (rp, rq) = (self.row(p)?, self.row(q)?);
+        Ok(cmp_order_keys(self.item, self.item_index, rp, rq) == std::cmp::Ordering::Equal)
+    }
+
+    /// `start` から始まる peer グループの終わり（排他的）。
+    fn peer_group_end(&self, start: usize) -> Result<usize, SqlSurfaceError> {
+        if !self.has_order_by() {
+            return Ok(self.len());
+        }
+        let mut end = start.saturating_add(1);
+        while end < self.len() && self.are_peers(start, end)? {
+            end += 1;
+        }
+        Ok(end)
+    }
+
+    /// peer グループの `(start, end)`（end は排他的）を位置順に返す。
+    fn peer_groups(&self) -> PeerGroups<'_, 'a> {
+        PeerGroups {
+            part: self,
+            next: 0,
+        }
+    }
+}
+
+/// [`SortedPartition::peer_groups`] のイテレータ。
+struct PeerGroups<'p, 'a> {
+    part: &'p SortedPartition<'a>,
+    next: usize,
+}
+
+impl Iterator for PeerGroups<'_, '_> {
+    type Item = Result<(usize, usize), SqlSurfaceError>;
+
+    fn next(&mut self) -> Option<Self::Item> {
+        if self.next >= self.part.len() {
+            return None;
+        }
+        let start = self.next;
+        match self.part.peer_group_end(start) {
+            Ok(end) => {
+                self.next = end;
+                Some(Ok((start, end)))
+            }
+            Err(e) => {
+                // エラー後は打ち切る。
+                self.next = self.part.len();
+                Some(Err(e))
+            }
+        }
     }
 }
 
@@ -2746,5 +2826,157 @@ mod budget_regression_tests {
             window_func_to_aggregate_func(WindowFunc::Min).unwrap(),
             AggregateFunc::Min
         );
+    }
+}
+
+#[cfg(test)]
+mod partition_layout_tests {
+    //! [`SortedPartition`]・[`cmp_order_keys`] の単体テスト（Issue #1888。SQL-64 ポインタ）。
+    //! `MaterializedRow` を直接組み立て、peer 範囲・位置アクセス・タイブレークを固定する
+    //! （フレーム評価 Issue #1889〜#1891 の土台。既存の挙動は不変）。
+
+    use super::*;
+    use crate::sql::parser::{BoundWindowOrderKey, WindowKeyKind, WindowKeyRef};
+
+    fn item(keys: &[(bool, NullPlacement)]) -> BoundWindowItem {
+        BoundWindowItem {
+            position: 0,
+            func: WindowFunc::Rank,
+            input: None,
+            offset_args: None,
+            partition_by: vec![],
+            order_by: keys
+                .iter()
+                .enumerate()
+                .map(|(i, &(descending, nulls))| BoundWindowOrderKey {
+                    key: WindowKeyRef::Column {
+                        index: i,
+                        kind: WindowKeyKind::Integer,
+                    },
+                    descending,
+                    nulls,
+                })
+                .collect(),
+            name: "w".to_string(),
+        }
+    }
+
+    fn row(seq: usize, id: u64, keys: &[Option<i32>]) -> MaterializedRow {
+        MaterializedRow {
+            seq,
+            id,
+            partition_keys: vec![vec![]],
+            order_keys: vec![keys
+                .iter()
+                .map(|k| k.map(WindowKeyValue::Integer))
+                .collect()],
+            agg_values: vec![],
+            offset_values: vec![],
+            stmt_order_keys: vec![],
+            tenant_idx: 0,
+        }
+    }
+
+    fn groups(part: &SortedPartition<'_>) -> Vec<(usize, usize)> {
+        part.peer_groups().map(|g| g.unwrap()).collect()
+    }
+
+    const ASC: (bool, NullPlacement) = (false, NullPlacement::Last);
+
+    #[test]
+    fn no_order_by_is_a_single_peer_group() {
+        let it = item(&[]);
+        let rows: Vec<_> = (0..3).map(|i| row(i, i as u64, &[])).collect();
+        let part = SortedPartition::new(&it, 0, &rows, vec![0, 1, 2]);
+        assert_eq!(groups(&part), vec![(0, 3)]);
+    }
+
+    #[test]
+    fn equal_keys_form_consecutive_peer_groups() {
+        let it = item(&[ASC]);
+        let ks = [1, 1, 2, 3, 3, 3];
+        let rows: Vec<_> = ks
+            .iter()
+            .enumerate()
+            .map(|(i, &k)| row(i, i as u64, &[Some(k)]))
+            .collect();
+        let part = SortedPartition::new(&it, 0, &rows, (0..6).collect());
+        assert_eq!(groups(&part), vec![(0, 2), (2, 3), (3, 6)]);
+        assert!(part.are_peers(0, 1).unwrap());
+        assert!(!part.are_peers(1, 2).unwrap());
+    }
+
+    #[test]
+    fn nulls_are_peers_of_each_other_only() {
+        for nulls in [NullPlacement::First, NullPlacement::Last] {
+            for descending in [false, true] {
+                let it = item(&[(descending, nulls)]);
+                let rows = vec![
+                    row(0, 0, &[None]),
+                    row(1, 1, &[Some(1)]),
+                    row(2, 2, &[None]),
+                ];
+                let part = SortedPartition::new(&it, 0, &rows, vec![0, 1, 2]);
+                let g = groups(&part);
+                assert_eq!(g.len(), 2, "nulls={nulls:?} desc={descending}");
+                let sizes: Vec<_> = g.iter().map(|(s, e)| e - s).collect();
+                let expect = match nulls {
+                    NullPlacement::First => vec![2, 1],
+                    NullPlacement::Last => vec![1, 2],
+                };
+                assert_eq!(sizes, expect);
+            }
+        }
+    }
+
+    #[test]
+    fn second_key_difference_splits_peers() {
+        let it = item(&[ASC, ASC]);
+        let rows = vec![
+            row(0, 0, &[Some(1), Some(1)]),
+            row(1, 1, &[Some(1), Some(1)]),
+            row(2, 2, &[Some(1), Some(2)]),
+        ];
+        let part = SortedPartition::new(&it, 0, &rows, vec![0, 1, 2]);
+        assert_eq!(groups(&part), vec![(0, 2), (2, 3)]);
+    }
+
+    #[test]
+    fn sort_tie_breaks_by_id_then_seq() {
+        let it = item(&[ASC]);
+        let rows = vec![
+            row(0, 9, &[Some(1)]),
+            row(1, 3, &[Some(1)]),
+            row(2, 3, &[Some(1)]),
+            row(3, 0, &[Some(0)]),
+        ];
+        let part = SortedPartition::new(&it, 0, &rows, vec![0, 1, 2, 3]);
+        assert_eq!(part.row_indices(), &[3, 1, 2, 0]);
+        // id が全て 0（CellWindowEvaluator の形）なら seq 順。
+        let rows = vec![
+            row(2, 0, &[Some(1)]),
+            row(0, 0, &[Some(1)]),
+            row(1, 0, &[Some(1)]),
+        ];
+        let part = SortedPartition::new(&it, 0, &rows, vec![0, 1, 2]);
+        assert_eq!(part.row_indices(), &[1, 2, 0]);
+    }
+
+    #[test]
+    fn out_of_range_position_is_internal_error() {
+        let it = item(&[ASC]);
+        let rows = vec![row(0, 0, &[Some(1)])];
+        let part = SortedPartition::new(&it, 0, &rows, vec![0]);
+        assert_eq!(part.row_index(1).expect_err("範囲外").wire_code(), "XX000");
+        assert_eq!(part.row(1).err().expect("範囲外").wire_code(), "XX000");
+    }
+
+    #[test]
+    fn empty_partition_has_no_peer_groups() {
+        let it = item(&[ASC]);
+        let rows: Vec<MaterializedRow> = vec![];
+        let part = SortedPartition::new(&it, 0, &rows, vec![]);
+        assert_eq!(part.len(), 0);
+        assert!(groups(&part).is_empty());
     }
 }
