@@ -2977,6 +2977,9 @@ pub struct ValidatedRecursiveCte {
     /// 定義直後の `SEARCH ... SET` 句（SQL-35・Issue #2213）。`sql::recursive_eval` が順序列を
     /// 生成して結果列の末尾へ足す。
     pub(crate) search: Option<SearchClause>,
+    /// 定義直後の `CYCLE ... SET ... USING` 句（SQL-35・Issue #2214）。`sql::recursive_eval` が循環を
+    /// 検出して印列・経路列を結果列の末尾へ足す。
+    pub(crate) cycle: Option<CycleClause>,
 }
 
 /// matview の葉の読み取り（[`Statement::MaterializedView`]）。定義の列は参照時に束縛した値で、
@@ -15766,8 +15769,8 @@ impl<'a> Parser<'a> {
     /// だけが呼ぶ。再帰構造の検証・評価は呼び出し元の担当で、本関数は構文の切り出し
     /// （`parse_with_clause` と同じ列名リスト・`[NOT] MATERIALIZED`・括弧対応・本文内 `;` の
     /// 規則。第 2 のパーサーを持たない）と、本文直後の `SEARCH`／`CYCLE` 句の構文検証を行う。
-    /// `SEARCH` は [`SearchClause`] として保持し（評価は `sql::recursive_eval`。#2213）、`CYCLE` は
-    /// 存在だけを記録する（`0A000` の機能ゲートは呼び出し元が構文・構造の検証後に返す。#2214 が実装）。
+    /// `SEARCH` は [`SearchClause`]（評価は `sql::recursive_eval`。#2213）、`CYCLE` は
+    /// [`CycleClause`]（同。#2214）として保持する。
     pub(crate) fn parse_recursive_with_header(
         &mut self,
     ) -> Result<RecursiveWithHeader, SqlSurfaceError> {
@@ -15807,7 +15810,7 @@ impl<'a> Parser<'a> {
                 column_aliases,
                 body,
                 search: None,
-                has_cycle: false,
+                cycle: None,
             });
             super::cte::check_definition_count(
                 defs.len(),
@@ -15815,8 +15818,7 @@ impl<'a> Parser<'a> {
             )?;
             if self.peek_ident_matches("SEARCH") || self.peek_ident_matches("CYCLE") {
                 // 次の定義の区切り（`, 名前 AS|(`）か主クエリの `SELECT` の手前までトークンを
-                // 読み飛ばして句の範囲を決める。`SEARCH` は構造体として保持し、`CYCLE` は存在だけを
-                // 記録する（機能ゲート 0A000 は呼び出し元が構文・再帰構造の検証後に返す）。
+                // 読み飛ばして句の範囲を決める。`SEARCH`・`CYCLE` とも構造体として保持する。
                 let clause_start = self.pos;
                 loop {
                     match self.peek() {
@@ -15839,12 +15841,12 @@ impl<'a> Parser<'a> {
                     }
                 }
                 // 構文（42601）は機能ゲート（0A000）より先に確定させる。
-                let (search, has_cycle) = validate_search_cycle_clause(
+                let (search, cycle) = validate_search_cycle_clause(
                     self.tokens.get(clause_start..self.pos).unwrap_or(&[]),
                 )?;
                 if let Some(def) = defs.last_mut() {
                     def.search = search;
-                    def.has_cycle = has_cycle;
+                    def.cycle = cycle;
                 }
             }
             if matches!(self.peek(), Some(Token::Punct(','))) {
@@ -15871,16 +15873,17 @@ pub(crate) fn validate_data_modifying_cte_syntax(
     Ok(parse_data_modifying_cte_body(inner, None, limits)?.is_some())
 }
 
-/// `WITH RECURSIVE` 定義の直後の `SEARCH`／`CYCLE` 句（SQL-35）の構文を検証し、`SEARCH` 句は
-/// [`SearchClause`] として返す（`CYCLE` 句は構文検証のみで存在フラグを返す。実行は #2214 の担当で
-/// `0A000`）。`parse_recursive_with_header` が機能ゲートより先に呼び、不正な形は `42601`
+/// `WITH RECURSIVE` 定義の直後の `SEARCH`／`CYCLE` 句（SQL-35）の構文を検証し、それぞれ
+/// [`SearchClause`]・[`CycleClause`] として返す（評価は `sql::recursive_eval`。#2213・#2214）。
+/// `parse_recursive_with_header` が機能ゲートより先に呼び、不正な形は `42601`
 /// （構文 → 再帰構造 → 機能ゲートの順序契約）。文法: `SEARCH {BREADTH|DEPTH} FIRST BY 列[, 列]* SET 列`
-/// の後に `CYCLE 列[, 列]* SET 列 [TO 定数 DEFAULT 定数] [USING 列]` を任意で続けられる
-/// （`CYCLE` 単独も可）。固定文言で入力断片を含めない。BY 列は CTE の列数上限
-/// （`MAX_COLUMN_COUNT`）を超えると `54000`（無制限の確保をしない）。
+/// の後に `CYCLE 列[, 列]* SET 列 [TO 定数 DEFAULT 定数] USING 列` を任意で続けられる
+/// （`CYCLE` 単独も可。`USING` は必須）。定数は PostgreSQL の `AexprConst` に合わせ、符号なしの数値・
+/// 文字列・引用符なしの `TRUE`／`FALSE`／`NULL`・型名付き文字列に限る。固定文言で入力断片を含めない。
+/// BY 列・CYCLE 列は CTE の列数上限（`MAX_COLUMN_COUNT`）を超えると `54000`（無制限の確保をしない）。
 fn validate_search_cycle_clause(
     clause: &[Token],
-) -> Result<(Option<SearchClause>, bool), SqlSurfaceError> {
+) -> Result<(Option<SearchClause>, Option<CycleClause>), SqlSurfaceError> {
     let bad = || SqlSurfaceError::unsupported("invalid SEARCH or CYCLE clause");
     let mut i = 0usize;
     let word = |i: usize, w: &str| matches!(clause.get(i), Some(Token::Ident(n)) if n.eq_ignore_ascii_case(w));
@@ -15899,16 +15902,48 @@ fn validate_search_cycle_clause(
         }
         Some(i)
     };
-    // 定数 1 個（任意の符号付き数値・文字列・識別子語）を読み、次の位置を返す。
-    let constant = |mut i: usize| -> Option<usize> {
-        if matches!(clause.get(i), Some(Token::Punct('-' | '+'))) {
-            i = i.saturating_add(1);
+    let names = |from: usize, to: usize| -> Vec<String> {
+        clause
+            .get(from..to)
+            .unwrap_or(&[])
+            .iter()
+            .filter_map(|t| match t {
+                Token::Ident(n) => Some(n.clone()),
+                _ => None,
+            })
+            .collect()
+    };
+    // 定数 1 個（`AexprConst` 相当）を読み、値と次の位置を返す。符号付き数値・任意の識別子・
+    // 引用識別子は `None`（`42601`）。
+    let constant = |i: usize| -> Option<(CycleConst, usize)> {
+        let next = i.saturating_add(1);
+        match clause.get(i) {
+            Some(Token::Number(n)) => {
+                let integral = !n.is_empty() && n.bytes().all(|b| b.is_ascii_digit());
+                Some((
+                    if integral {
+                        CycleConst::Integer(n.clone())
+                    } else {
+                        CycleConst::Decimal(n.clone())
+                    },
+                    next,
+                ))
+            }
+            Some(Token::StringLiteral(s)) => Some((CycleConst::Text(s.clone()), next)),
+            Some(Token::Ident(w)) if w.eq_ignore_ascii_case("TRUE") => {
+                Some((CycleConst::Bool(true), next))
+            }
+            Some(Token::Ident(w)) if w.eq_ignore_ascii_case("FALSE") => {
+                Some((CycleConst::Bool(false), next))
+            }
+            Some(Token::Ident(w)) if w.eq_ignore_ascii_case("NULL") => {
+                Some((CycleConst::Null, next))
+            }
+            Some(Token::Ident(_)) if matches!(clause.get(next), Some(Token::StringLiteral(_))) => {
+                Some((CycleConst::Typed, next.saturating_add(1)))
+            }
+            _ => None,
         }
-        matches!(
-            clause.get(i),
-            Some(Token::Number(_) | Token::StringLiteral(_) | Token::Ident(_))
-        )
-        .then(|| i.saturating_add(1))
     };
     let mut search: Option<SearchClause> = None;
     if word(i, "SEARCH") {
@@ -15921,15 +15956,7 @@ fn validate_search_cycle_clause(
         let breadth_first = word(i + 1, "BREADTH");
         let by_start = i + 4;
         i = list(by_start).ok_or_else(bad)?;
-        let by: Vec<String> = clause
-            .get(by_start..i)
-            .unwrap_or(&[])
-            .iter()
-            .filter_map(|t| match t {
-                Token::Ident(n) => Some(n.clone()),
-                _ => None,
-            })
-            .collect();
+        let by = names(by_start, i);
         if by.len() > MAX_COLUMN_COUNT {
             return Err(SqlSurfaceError::payload_too_large(
                 "too many columns in the SEARCH clause",
@@ -15948,30 +15975,44 @@ fn validate_search_cycle_clause(
         });
         i += 2;
     }
-    let mut has_cycle = false;
+    let mut cycle: Option<CycleClause> = None;
     if word(i, "CYCLE") {
-        has_cycle = true;
-        i = list(i + 1).ok_or_else(bad)?;
-        if !word(i, "SET") || !ident(i + 1) {
-            return Err(bad());
+        let cols_start = i + 1;
+        i = list(cols_start).ok_or_else(bad)?;
+        let columns = names(cols_start, i);
+        if columns.len() > MAX_COLUMN_COUNT {
+            return Err(SqlSurfaceError::payload_too_large(
+                "too many columns in the CYCLE clause",
+            ));
         }
+        let Some(Token::Ident(mark)) = clause.get(i + 1).filter(|_| word(i, "SET")) else {
+            return Err(bad());
+        };
         i += 2;
+        let mut mark_values = None;
         if word(i, "TO") {
-            i = constant(i + 1).ok_or_else(bad)?;
+            let (to, next) = constant(i + 1).ok_or_else(bad)?;
+            i = next;
             if !word(i, "DEFAULT") {
                 return Err(bad());
             }
-            i = constant(i + 1).ok_or_else(bad)?;
+            let (default, next) = constant(i + 1).ok_or_else(bad)?;
+            i = next;
+            mark_values = Some((to, default));
         }
-        if word(i, "USING") {
-            if !ident(i + 1) {
-                return Err(bad());
-            }
-            i += 2;
-        }
+        let Some(Token::Ident(path)) = clause.get(i + 1).filter(|_| word(i, "USING")) else {
+            return Err(bad());
+        };
+        i += 2;
+        cycle = Some(CycleClause {
+            columns,
+            mark: mark.clone(),
+            mark_values,
+            path: path.clone(),
+        });
     }
     if i == clause.len() {
-        Ok((search, has_cycle))
+        Ok((search, cycle))
     } else {
         Err(bad())
     }
@@ -24580,9 +24621,9 @@ fn recursive_cte_statement(
     // `UNION`（重複除去。SQL-35・Issue #1872）は演算子を検証済みの文へ運び、重複除去は
     // `sql::recursive_eval` が行う。`SEARCH` 句つきの `UNION` は順序列を含めた重複判定が必要になる
     // ため、黙って順序列なしで比較しないよう固定の `0A000` で拒否する（fail-closed）。
-    if !*union_all && def.search.is_some() {
+    if !*union_all && (def.search.is_some() || def.cycle.is_some()) {
         return Err(SqlSurfaceError::feature_not_supported(
-            "a SEARCH clause with UNION in WITH RECURSIVE is not supported yet",
+            "a SEARCH or CYCLE clause with UNION in WITH RECURSIVE is not supported yet",
         ));
     }
     if cte_evaluation != CteEvaluation::AllowMaterialize {
@@ -24599,11 +24640,11 @@ fn recursive_cte_statement(
                 "USING PLAN in the anchor term of WITH RECURSIVE is not supported",
             ));
         }
-        Statement::SetOperation(_) if def.search.is_some() => {
+        Statement::SetOperation(_) if def.search.is_some() || def.cycle.is_some() => {
             // PostgreSQL と同じく、SEARCH／CYCLE 句つきの定義は UNION の左辺が単一の SELECT で
             // なければならない（`0A000`）。
             return Err(SqlSurfaceError::feature_not_supported(
-                "with a SEARCH clause, the left side of the UNION must be a SELECT",
+                "with a SEARCH or CYCLE clause, the left side of the UNION must be a SELECT",
             ));
         }
         Statement::Select(_)
@@ -24649,6 +24690,7 @@ fn recursive_cte_statement(
         recursive: Box::new(recursive_stmt),
         union_all: *union_all,
         search: def.search.clone(),
+        cycle: def.cycle.clone(),
     }));
     let view_name = def.name.clone();
     let stmt = match main {
@@ -26426,6 +26468,40 @@ pub(crate) struct SearchClause {
     pub(crate) set: String,
 }
 
+/// `CYCLE ... SET ... TO ... DEFAULT ...` の定数 1 個（PostgreSQL の `AexprConst` に合わせた
+/// 字句解析済みの形。SQL 文字列へ再連結せず、型の解決は評価計画段〔`sql::recursive_eval`〕が行う）。
+/// 符号付き数値・任意の識別子・引用識別子は構文段で `42601` にする。
+#[derive(Debug, Clone, PartialEq)]
+pub(crate) enum CycleConst {
+    /// 引用符なしの `TRUE`／`FALSE`。
+    Bool(bool),
+    /// 整数リテラル（小数点・指数を含まない数字列）。
+    Integer(String),
+    /// 小数リテラル（評価は未対応で、計画段が固定 `0A000` にする）。
+    Decimal(String),
+    /// 文字列リテラル。
+    Text(String),
+    /// 引用符なしの `NULL`（評価は未対応で、計画段が固定 `0A000` にする）。
+    Null,
+    /// 型名付きリテラル（`型名 '文字列'`。評価は未対応で、計画段が固定 `0A000` にする）。
+    Typed,
+}
+
+/// `WITH RECURSIVE` 定義直後の `CYCLE 列[, 列]* SET 印列 [TO 値 DEFAULT 既定値] USING 経路列` 句
+/// （SQL-35・Issue #2214）の構文検証結果。`sql::recursive_cte` が構造検証を行い、`sql::recursive_eval` が
+/// 列名・型の解決と循環検出を行う。テナント情報は持たない（RLS-10 (b)）。
+#[derive(Debug, Clone, PartialEq)]
+pub(crate) struct CycleClause {
+    /// 循環判定に使う列の名前（書かれた順。1 個以上）。
+    pub(crate) columns: Vec<String>,
+    /// 印列の名前（`SET` の直後）。
+    pub(crate) mark: String,
+    /// `TO` の値と `DEFAULT` の値（両方書かれたときだけ `Some`。省略時の印は boolean の `true`／`false`）。
+    pub(crate) mark_values: Option<(CycleConst, CycleConst)>,
+    /// 経路列の名前（`USING` の直後）。
+    pub(crate) path: String,
+}
+
 /// `WITH RECURSIVE` の定義 1 件の切り出し結果（本文トークンと、直後の `SEARCH`／`CYCLE` 句の
 /// 構文検証結果）。
 #[derive(Debug, Clone)]
@@ -26435,8 +26511,8 @@ pub(crate) struct RawRecursiveDef {
     pub(crate) body: Vec<Token>,
     /// 直後の `SEARCH` 句（無ければ `None`）。
     pub(crate) search: Option<SearchClause>,
-    /// 直後に `CYCLE` 句があるか（構文検証のみ。実行は #2214 の担当で `0A000`）。
-    pub(crate) has_cycle: bool,
+    /// 直後の `CYCLE` 句（無ければ `None`。SQL-35・Issue #2214）。
+    pub(crate) cycle: Option<CycleClause>,
 }
 
 /// `WITH RECURSIVE` の見出し部の切り出し結果（各定義と主クエリのトークン列）。

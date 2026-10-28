@@ -72,9 +72,15 @@ fn recursive_forms_have_stable_codes() {
             "WITH RECURSIVE t(n) AS (SELECT 1 UNION ALL SELECT n FROM docs WHERE n IN (SELECT n FROM t)) SELECT n FROM t",
             "42P19",
         ),
+        // CYCLE 句は評価される（#2214）。`n` は繰り返さない無限系列なので循環せず、反復上限で拒否される。
         (
             "WITH RECURSIVE t(n) AS (SELECT 1 UNION ALL SELECT n + 1 FROM t) CYCLE n SET c USING p SELECT n FROM t",
-            "0A000",
+            "54000",
+        ),
+        // USING は必須（#2214）。
+        (
+            "WITH RECURSIVE t(n) AS (SELECT 1 UNION ALL SELECT n + 1 FROM t) CYCLE n SET c SELECT n FROM t",
+            "42601",
         ),
         ("WITH RECURSIVE t(n) (SELECT 1) SELECT n FROM t", "42601"),
     ];
