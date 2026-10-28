@@ -1141,6 +1141,11 @@ fn correlated_and_derived_truth_values_do_not_depend_on_other_tenants() {
         "positive control: flood rows (score=10) must remove id=10 from NOT IN"
     );
     let top = b(top3);
+    assert_eq!(
+        top.len(),
+        3,
+        "positive control: derived top-3 must return exactly 3 rows: {top:?}"
+    );
     assert!(
         top.iter()
             .all(|r| r[0].contains(&format!("_{TENANT_B}_100"))),
