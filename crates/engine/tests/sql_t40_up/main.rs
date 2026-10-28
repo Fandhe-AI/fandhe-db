@@ -1,0 +1,99 @@
+//! 統合テストの束ね先バイナリ `sql_t40_up`（`crates/engine/tests/sql_t40_up/` 配下を 1 つのテストターゲットにする）。
+//!
+//! 個別実行は `cargo test -p fandhe-db-engine --test sql_t40_up <ファイル名>::` のように
+//! モジュール名（元のファイル名）で絞る。共通ヘルパー（`src/test_util/`）は本ファイルで
+//! 1 回だけ取り込み、各モジュールからは `use crate::<名前>;` で参照する。
+
+#[path = "../../src/test_util/legacy_table.rs"]
+mod legacy_table;
+
+#[path = "../../src/test_util/temp_db.rs"]
+mod temp_db;
+
+mod sql1797_early_stop;
+mod sql1798_interrupt;
+mod sql41_bool_literal_where;
+mod sql42_aggregate_arith_projection;
+mod sql42_aggregate_expr_tree_projection;
+mod sql42_aggregate_expr_types;
+mod sql42_projection_alias;
+mod sql42_projection_infix_expr;
+mod sql42_projection_result_types;
+mod sql43_from_less_select;
+mod sql44_from_alias;
+mod sql44_qualified_star;
+mod sql45_insert_const_expr;
+mod sql45_update_set_expr;
+mod sql45_update_set_expr_resend;
+mod sql49_upsert_add_concurrency;
+mod sql50_insert_default_values;
+mod sql50_update_delete_params;
+mod sql50_update_row_value;
+mod sql50_update_set_default;
+mod sql51_insert_select_bind;
+mod sql51_insert_select_exec;
+mod sql51_insert_select_limit_omitted;
+mod sql51_insert_select_migrated_id;
+mod sql51_insert_select_omitted_assign;
+mod sql51_insert_select_on_conflict;
+mod sql51_insert_select_on_conflict_describe;
+mod sql52_ctas_exec;
+mod sql53_dml_from_using_bind;
+mod sql53_dml_where_subquery;
+mod sql54_ilike;
+mod sql54_is_distinct_from;
+mod sql54_is_distinct_from_params;
+mod sql54_like_escape;
+mod sql54_like_expr_lhs;
+mod sql55_regex_operators;
+mod sql55_regex_operators_params;
+mod sql55_similar_to;
+mod sql56_fetch_first;
+mod sql56_order_by_nulls;
+mod sql56_order_by_ordinal;
+mod sql57_aggregate_expr_args;
+mod sql57_aggregate_filter;
+mod sql57_array_agg;
+mod sql57_bool_agg;
+mod sql57_stddev;
+mod sql57_string_agg;
+mod sql57_variance;
+mod sql58_group_by_key_expressions;
+mod sql58_group_key_expr_matching;
+mod sql58_having_aggregate_calls;
+mod sql58_having_without_group_by;
+mod sql58_order_by_aggregate_calls;
+mod sql59_grouping_function;
+mod sql59_grouping_sets_combos;
+mod sql59_grouping_sets_exec;
+mod sql59_grouping_sets_parse;
+mod sql60_comma_join;
+mod sql60_cross_join;
+mod sql60_join_on_split;
+mod sql60_join_using;
+mod sql60_natural_join;
+mod sql60_nlj_join;
+mod sql60_where_key_promotion;
+mod sql61_any_all_subquery;
+mod sql61_correlated_binding;
+mod sql61_correlated_char_interrupt;
+mod sql61_correlated_exists;
+mod sql61_correlated_in;
+mod sql61_correlated_scalar_agg;
+mod sql61_correlated_scalar_expr;
+mod sql61_correlated_scalar_nonagg;
+mod sql62_cte_body_aggregate_window;
+mod sql62_cte_body_limit_order;
+mod sql62_cte_column_list;
+mod sql62_cte_join_input;
+mod sql62_cte_materialization_path;
+mod sql62_cte_materialized;
+mod sql62_derived_table_exec;
+mod sql62_derived_table_join;
+mod sql62_derived_table_syntax;
+mod sql63_data_modifying_cte_exec;
+mod sql63_data_modifying_cte_semantics;
+mod sql63_data_modifying_cte_syntax;
+mod sql64_lag_lead;
+mod sql78_predicate_dml_noneq_between_params;
+mod sql78_where_noneq_between_params;
