@@ -369,6 +369,61 @@ const LAG_LEAD_ARG_SITE: PrecheckSite = PrecheckSite {
     aggregate: "aggregate function calls cannot be used inside LAG/LEAD arguments",
 };
 
+/// フレーム境界の組み合わせ検査（PostgreSQL が文法アクションで返す `42P20`。SQL-64 (2)・
+/// Issue #1887）。判定順も PostgreSQL に合わせる。オフセットの大小は比較しない。
+/// `single` は単一境界形（終了を `CURRENT ROW` に正規化したもの）。
+fn validate_window_frame_bounds(
+    start: &WindowFrameBound,
+    end: &WindowFrameBound,
+    single: bool,
+) -> Result<(), SqlSurfaceError> {
+    let err = |detail: &'static str| Err(SqlSurfaceError::WindowingError { detail });
+    if matches!(start, WindowFrameBound::UnboundedFollowing) {
+        return err("frame start cannot be UNBOUNDED FOLLOWING");
+    }
+    if single {
+        if matches!(start, WindowFrameBound::Following(_)) {
+            return err("frame starting from following row cannot end with current row");
+        }
+        return Ok(());
+    }
+    if matches!(end, WindowFrameBound::UnboundedPreceding) {
+        return err("frame end cannot be UNBOUNDED PRECEDING");
+    }
+    if matches!(start, WindowFrameBound::CurrentRow)
+        && matches!(end, WindowFrameBound::Preceding(_))
+    {
+        return err("frame starting from current row cannot have preceding rows");
+    }
+    if matches!(start, WindowFrameBound::Following(_))
+        && matches!(
+            end,
+            WindowFrameBound::Preceding(_) | WindowFrameBound::CurrentRow
+        )
+    {
+        return err("frame starting from following row cannot have preceding rows");
+    }
+    Ok(())
+}
+
+/// ウィンドウのフレーム句のオフセット内の先読み検査の文言（SQL-64 (2)・Issue #1887）。
+/// モードごとに集計の文言が変わる（PostgreSQL と同じ）。`$n` は `LAG`／`LEAD` と同じ理由で拒否する。
+const FRAME_ROWS_SITE: PrecheckSite = PrecheckSite {
+    param: "parameters are not supported inside window frame offsets",
+    window: "window functions are not allowed in window definitions",
+    aggregate: "aggregate functions are not allowed in window ROWS",
+};
+const FRAME_RANGE_SITE: PrecheckSite = PrecheckSite {
+    param: "parameters are not supported inside window frame offsets",
+    window: "window functions are not allowed in window definitions",
+    aggregate: "aggregate functions are not allowed in window RANGE",
+};
+const FRAME_GROUPS_SITE: PrecheckSite = PrecheckSite {
+    param: "parameters are not supported inside window frame offsets",
+    window: "window functions are not allowed in window definitions",
+    aggregate: "aggregate functions are not allowed in window GROUPS",
+};
+
 /// [`precheck_aggregate_filter_tokens`] と `LAG`／`LEAD` 引数の共通本体。`open` は区間を
 /// 開く `(` の位置で、`site` が場所ごとの文言を与える。
 fn precheck_call_arg_tokens(
@@ -1089,6 +1144,10 @@ pub enum SqlSurfaceError {
     /// 一致しない（`42P10`。SQL-49・ERR-6、Issue #1707。`id` と他列の混在・未知列を含む）。
     /// 束縛段（`sql::parser::resolve_conflict_target`）が返す。固定文言で列名・値を含めない。
     InvalidColumnReference,
+    /// ウィンドウのフレーム句のオフセット式に変数（識別子）がある（`42P10`。SQL-64 (2)・
+    /// Issue #1887）。列を解決せず一律に返すため、ビューの非公開列か未知列かで応答が変わらない
+    /// （存在情報を漏らさない）。`mode` は `ROWS`／`RANGE`／`GROUPS` の固定語で、利用者の入力は含めない。
+    WindowFrameOffsetHasVariables { mode: &'static str },
     /// `WITH <name>(a, b, ...)` の列名リストが CTE 本文の出力列数より長い（`42P10`。SQL-62 (2)・
     /// Issue #1857）。含めるのは利用者が書いた CTE 名と件数だけで、列名・値・テナント情報は含めない。
     CteColumnListTooLong {
@@ -1752,6 +1811,7 @@ impl ClassifiedError for SqlSurfaceError {
             SqlSurfaceError::PartitionedJobBusy { .. } => ErrorClass::LockNotAvailable,
             SqlSurfaceError::DuplicateColumn { .. } => ErrorClass::DuplicateColumn,
             SqlSurfaceError::InvalidColumnReference
+            | SqlSurfaceError::WindowFrameOffsetHasVariables { .. }
             | SqlSurfaceError::CteColumnListTooLong { .. }
             | SqlSurfaceError::DerivedTableColumnListTooLong { .. }
             | SqlSurfaceError::OrderByPositionNotInSelectList { .. }
@@ -2013,6 +2073,9 @@ impl std::fmt::Display for SqlSurfaceError {
                 f,
                 "there is no unique or exclusion constraint matching the ON CONFLICT specification"
             ),
+            SqlSurfaceError::WindowFrameOffsetHasVariables { mode } => {
+                write!(f, "argument of {mode} must not contain variables")
+            }
             SqlSurfaceError::CteColumnListTooLong {
                 name,
                 available,
@@ -3891,7 +3954,70 @@ pub(crate) struct WindowSelectItem {
     pub(crate) partition_by: Vec<String>,
     /// `ORDER BY` の (列名, 降順か, NULL 位置) 一覧（順序保持。最大 [`MAX_WINDOW_KEYS`]）。
     pub(crate) order_by: Vec<WindowOrderItem>,
+    /// フレーム句（`ROWS`／`RANGE`／`GROUPS`。SQL-64 (2)・Issue #1887）。構文と束縛段の検証までを
+    /// 担い、評価は #1889〜#1891 が `sql::parser::bind_window_item` のゲートを外して行う。
+    pub(crate) frame: Option<WindowFrame>,
     pub(crate) alias: Option<String>,
+}
+
+/// フレーム句のモード（SQL-64 (2)・Issue #1887）。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum WindowFrameMode {
+    Rows,
+    Range,
+    Groups,
+}
+
+impl WindowFrameMode {
+    /// エラー文言用の固定語。
+    pub(crate) fn as_str(self) -> &'static str {
+        match self {
+            WindowFrameMode::Rows => "ROWS",
+            WindowFrameMode::Range => "RANGE",
+            WindowFrameMode::Groups => "GROUPS",
+        }
+    }
+}
+
+/// フレームの境界 1 つ。`Preceding`／`Following` のオフセットは未束縛の式で保持する。
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) enum WindowFrameBound {
+    UnboundedPreceding,
+    Preceding(Expr),
+    CurrentRow,
+    Following(Expr),
+    UnboundedFollowing,
+}
+
+impl WindowFrameBound {
+    /// オフセット式を持つ境界ならその式。
+    pub(crate) fn offset(&self) -> Option<&Expr> {
+        match self {
+            WindowFrameBound::Preceding(e) | WindowFrameBound::Following(e) => Some(e),
+            _ => None,
+        }
+    }
+}
+
+/// `EXCLUDE` 句（既定は `NoOthers`）。適用は評価 Issue（#1889〜#1891）が担う。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum WindowFrameExclusion {
+    NoOthers,
+    CurrentRow,
+    Group,
+    Ties,
+}
+
+/// フレーム句 1 つ。単一境界形（`ROWS 1 PRECEDING`）の `end` は `CurrentRow` に正規化する
+/// （PostgreSQL と同じ）。
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct WindowFrame {
+    pub(crate) mode: WindowFrameMode,
+    pub(crate) start: WindowFrameBound,
+    pub(crate) end: WindowFrameBound,
+    /// 適用は #1889〜#1891 が読む（それまで本番コードでは未読）。
+    #[cfg_attr(not(test), allow(dead_code))]
+    pub(crate) exclusion: WindowFrameExclusion,
 }
 
 impl WindowSelectItem {
@@ -6779,8 +6905,11 @@ impl<'a> Parser<'a> {
     /// で先読み確定済みの前提で呼ぶ。`position` は呼び出し元が後から設定する
     /// （ここでは常に `0`）。
     ///
+    /// フレーム句（`ROWS`/`RANGE`/`GROUPS`）は構文のみ受理する（SQL-64 (2)・Issue #1887。
+    /// [`Self::parse_window_frame`]。評価は束縛段のゲートが止める）。
+    ///
     /// スコープ縮小（`docs/design/window-functions.md` 参照。§計画 2「対象外」）:
-    /// フレーム句（`ROWS`/`RANGE`/`GROUPS`）・名前付き
+    /// 名前付き
     /// ウィンドウ（`WINDOW w AS (...)`/`OVER w`）・`FILTER (...)`・関数内
     /// `DISTINCT`・複合式の引数はいずれも許可リスト外として `42601` に落ちる
     /// （該当する構文を消費する分岐を意図的に持たない）。
@@ -6836,6 +6965,7 @@ impl<'a> Parser<'a> {
         self.expect_punct(')')?;
         self.expect_ident_matching("OVER")?;
         self.expect_punct('(')?;
+        let over_open = self.pos.saturating_sub(1);
         let mut partition_by = Vec::new();
         if self.peek_contextual_keyword("PARTITION") {
             self.advance();
@@ -6882,6 +7012,7 @@ impl<'a> Parser<'a> {
                 break;
             }
         }
+        let frame = self.parse_window_frame(over_open)?;
         self.expect_punct(')')?;
         let alias = if self.peek_ident_matches("AS") {
             self.advance();
@@ -6896,8 +7027,126 @@ impl<'a> Parser<'a> {
             offset_args,
             partition_by,
             order_by,
+            frame,
             alias,
         })
+    }
+
+    /// `OVER (...)` 内のフレーム句 `<mode> (<bound> | BETWEEN <bound> AND <bound>) [EXCLUDE ...]`
+    /// を読む（SQL-64 (2)・Issue #1887。[`Self::parse_window_item`] からのみ呼ばれる。`over_open` は
+    /// `OVER` の `(` の位置）。フレーム句が無ければ `None`。形の誤りは `42601`、PostgreSQL が文法段で
+    /// 返す境界の組み合わせの誤りは `42P20`。オフセット式の先読み検査（集計・入れ子のウィンドウ・
+    /// `$n`）もここで行う。評価は行わず、束縛段（`sql::parser::bind_window_item`）のゲートが止める。
+    fn parse_window_frame(
+        &mut self,
+        over_open: usize,
+    ) -> Result<Option<WindowFrame>, SqlSurfaceError> {
+        let mode = if self.peek_ident_matches("ROWS") {
+            WindowFrameMode::Rows
+        } else if self.peek_ident_matches("RANGE") {
+            WindowFrameMode::Range
+        } else if self.peek_ident_matches("GROUPS") {
+            WindowFrameMode::Groups
+        } else {
+            return Ok(None);
+        };
+        self.advance();
+        let site = match mode {
+            WindowFrameMode::Rows => &FRAME_ROWS_SITE,
+            WindowFrameMode::Range => &FRAME_RANGE_SITE,
+            WindowFrameMode::Groups => &FRAME_GROUPS_SITE,
+        };
+        precheck_call_arg_tokens(&self.tokens, over_open, site)?;
+        let (start, end, single) = if self.peek_ident_matches("BETWEEN") {
+            self.advance();
+            let start = self.parse_window_frame_bound()?;
+            self.expect_keyword(Keyword::And)?;
+            let end = self.parse_window_frame_bound()?;
+            (start, end, false)
+        } else {
+            (
+                self.parse_window_frame_bound()?,
+                WindowFrameBound::CurrentRow,
+                true,
+            )
+        };
+        validate_window_frame_bounds(&start, &end, single)?;
+        let exclusion = if self.peek_ident_matches("EXCLUDE") {
+            self.advance();
+            if self.peek_ident_matches("CURRENT") {
+                self.advance();
+                self.expect_ident_matching("ROW")?;
+                WindowFrameExclusion::CurrentRow
+            } else if self.peek_ident_matches("GROUP") {
+                self.advance();
+                WindowFrameExclusion::Group
+            } else if self.peek_ident_matches("TIES") {
+                self.advance();
+                WindowFrameExclusion::Ties
+            } else if self.peek_ident_matches("NO") {
+                self.advance();
+                self.expect_ident_matching("OTHERS")?;
+                WindowFrameExclusion::NoOthers
+            } else {
+                return Err(SqlSurfaceError::unsupported(
+                    "EXCLUDE must be followed by CURRENT ROW, GROUP, TIES or NO OTHERS",
+                ));
+            }
+        } else {
+            WindowFrameExclusion::NoOthers
+        };
+        Ok(Some(WindowFrame {
+            mode,
+            start,
+            end,
+            exclusion,
+        }))
+    }
+
+    /// フレームの境界 1 つを読む（[`Self::parse_window_frame`] からのみ呼ばれる）。オフセット式は
+    /// `LAG`／`LEAD` の引数と同じく集計収集を止め、単項マイナスと裸の `NULL` を受理する
+    /// （負値・NULL の検査は評価 Issue の担当）。
+    fn parse_window_frame_bound(&mut self) -> Result<WindowFrameBound, SqlSurfaceError> {
+        if self.peek_ident_matches("UNBOUNDED") {
+            self.advance();
+            return if self.peek_ident_matches("PRECEDING") {
+                self.advance();
+                Ok(WindowFrameBound::UnboundedPreceding)
+            } else if self.peek_ident_matches("FOLLOWING") {
+                self.advance();
+                Ok(WindowFrameBound::UnboundedFollowing)
+            } else {
+                Err(SqlSurfaceError::unsupported(
+                    "UNBOUNDED must be followed by PRECEDING or FOLLOWING",
+                ))
+            };
+        }
+        if self.peek_ident_matches("CURRENT") {
+            self.advance();
+            self.expect_ident_matching("ROW")?;
+            return Ok(WindowFrameBound::CurrentRow);
+        }
+        let saved_calls = self.agg_calls.take();
+        let saved_minus = self.allow_unary_minus;
+        let saved_null = self.allow_null_literal;
+        self.allow_unary_minus = true;
+        self.allow_null_literal = true;
+        let parsed = self.parse_value_expr(0);
+        self.allow_null_literal = saved_null;
+        self.allow_unary_minus = saved_minus;
+        self.agg_calls = saved_calls;
+        let offset = parsed?;
+        if self.peek_ident_matches("PRECEDING") {
+            self.advance();
+            Ok(WindowFrameBound::Preceding(offset))
+        } else if self.peek_ident_matches("FOLLOWING") {
+            self.advance();
+            Ok(WindowFrameBound::Following(offset))
+        } else {
+            Err(SqlSurfaceError::unsupported(
+                "frame offset must be followed by PRECEDING or FOLLOWING",
+            ))
+        }
     }
 
     /// `LAG`／`LEAD` の `(` を読み終えた位置から引数 1〜3 個（`)` の手前まで）を読む
@@ -38681,6 +38930,42 @@ mod tests {
     fn reserved_placeholder_names_cannot_be_written_by_users() {
         // 先頭が制御文字の識別子は、引用形でも字句段が拒否する（内部名のすり替えができない）。
         assert!(lexer::tokenize("SELECT \"\u{1}ssq0\" FROM documents LIMIT 1").is_err());
+    }
+
+    /// SQL-64 (2)・Issue #1887: フレーム句の構文が AST に載る（ゲートと独立に構文受理を確認）。
+    /// 単一境界形の終了は `CURRENT ROW` に正規化され、`EXCLUDE` の既定は `NO OTHERS`。
+    #[test]
+    fn window_frame_syntax_is_parsed_into_ast() {
+        let lookup = catalog_with(&["documents"]);
+        let frame_of = |over: &str| -> WindowFrame {
+            let sql = format!("SELECT id, sum(score) OVER ({over}) FROM documents LIMIT 5");
+            let Statement::Scan(body) = session_stmt(&sql, &lookup).expect(&sql) else {
+                panic!("expected Scan for {sql}");
+            };
+            body.window_items[0].frame.clone().expect("frame")
+        };
+        let f = frame_of("ORDER BY score ROWS 1 PRECEDING");
+        assert_eq!(f.mode, WindowFrameMode::Rows);
+        assert!(matches!(f.start, WindowFrameBound::Preceding(_)));
+        assert_eq!(f.end, WindowFrameBound::CurrentRow);
+        assert_eq!(f.exclusion, WindowFrameExclusion::NoOthers);
+        let f = frame_of(
+            "PARTITION BY lang ORDER BY score NULLS FIRST \
+             groups between current row and unbounded following exclude ties",
+        );
+        assert_eq!(f.mode, WindowFrameMode::Groups);
+        assert_eq!(f.start, WindowFrameBound::CurrentRow);
+        assert_eq!(f.end, WindowFrameBound::UnboundedFollowing);
+        assert_eq!(f.exclusion, WindowFrameExclusion::Ties);
+        let f = frame_of(
+            "ORDER BY score RANGE BETWEEN UNBOUNDED PRECEDING AND 2 FOLLOWING EXCLUDE CURRENT ROW",
+        );
+        assert_eq!(f.mode, WindowFrameMode::Range);
+        assert_eq!(f.start, WindowFrameBound::UnboundedPreceding);
+        assert!(matches!(f.end, WindowFrameBound::Following(_)));
+        assert_eq!(f.exclusion, WindowFrameExclusion::CurrentRow);
+        let f = frame_of("ORDER BY score ROWS UNBOUNDED PRECEDING EXCLUDE GROUP");
+        assert_eq!(f.exclusion, WindowFrameExclusion::Group);
     }
 }
 
