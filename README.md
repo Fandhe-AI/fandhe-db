@@ -45,7 +45,7 @@ make setup   # サブモジュール → rustup → lefthook（git hooks）を�
 
 `docs/spec`（`fandhe-db-spec`）は private リポジトリのため、アクセス権のない環境では submodule 取得が失敗します（`make setup` は警告のみで継続します）。実装コードのビルド・テストは `docs/spec` 抜きでも成立するよう維持します。
 
-ビルド成果物（`target/`）は数十 GB に膨らみやすいため、ルート `Cargo.toml` の `[profile.dev.package."*"]` で依存クレート（workspace 外）のデバッグ情報を行番号のみにしています（`cargo build` 等の `dev` では `engine`・`wire-server` は full debuginfo のままで、`cargo test` が使う `[profile.test]` は従来どおり全体を行番号のみにしています。panic 位置・バックトレースの行番号は残り、デバッガで依存の変数・型を見られなくなるだけです）。溜まった古い成果物は `cargo install cargo-sweep` のうえ `cargo sweep --time 14`（14 日以上使われていない成果物を削除）や `cargo sweep --installed`（rustup に現存しないツールチェーンでビルドした成果物を削除）で消せます。
+ビルド成果物（`target/`）は数十 GB に膨らみやすいため、ルート `Cargo.toml` の `[profile.dev.package."*"]` で依存クレート（workspace 外）のデバッグ情報を行番号のみにしています（`cargo build` 等の `dev` では `engine`・`wire-server` は full debuginfo のままで、`cargo test` が使う `[profile.test]` は依存を行番号のみ・`engine`・`wire-server` をデバッグ情報なしにしてテストビルドを短縮しています。panic 位置の行番号は残り、デバッガで依存の変数・型を見られなくなるのと、テスト時の `engine`・`wire-server` のバックトレースに行番号が出なくなるだけです。必要なら `CARGO_PROFILE_TEST_DEBUG=line-tables-only` で一時的に戻せます）。溜まった古い成果物は `cargo install cargo-sweep` のうえ `cargo sweep --time 14`（14 日以上使われていない成果物を削除）や `cargo sweep --installed`（rustup に現存しないツールチェーンでビルドした成果物を削除）で消せます。
 
 ### タスクランナー（Makefile）
 
