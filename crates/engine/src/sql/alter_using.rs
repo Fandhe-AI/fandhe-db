@@ -361,6 +361,7 @@ pub(crate) fn redact_row_conversion_error(e: SqlSurfaceError) -> SqlSurfaceError
         | E::InvalidObjectDefinition { .. }
         | E::GroupingError { .. }
         | E::WindowingError { .. }
+        | E::InvalidPrecedingOrFollowingSize { .. }
         | E::StatementTooComplex { .. }
         | E::TooManyColumns { .. }
         | E::TooManyArguments { .. }

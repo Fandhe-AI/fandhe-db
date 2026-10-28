@@ -965,6 +965,9 @@ pub enum SqlSurfaceError {
     GroupingError { detail: &'static str },
     /// 式索引の式にウィンドウ関数がある（`42P20`。Issue #1647・INDEX-10）。固定文言のみ。
     WindowingError { detail: &'static str },
+    /// ウィンドウのフレーム句の `ROWS`／`GROUPS` オフセットが負（`22013`。SQL-64 (2)・Issue #1889）。
+    /// 固定文言のみで、利用者の値は含めない（NULL は `NullValueNotAllowed`＝`22004`）。
+    InvalidPrecedingOrFollowingSize { detail: &'static str },
     /// `GROUP BY` のグルーピングセットの展開後セット数・入れ子の深さが上限を超えた
     /// （`54001`。Issue #1821・SQL-59）。固定文言のみ。
     StatementTooComplex { detail: &'static str },
@@ -1756,6 +1759,9 @@ impl ClassifiedError for SqlSurfaceError {
             SqlSurfaceError::InvalidObjectDefinition { .. } => ErrorClass::InvalidObjectDefinition,
             SqlSurfaceError::GroupingError { .. } => ErrorClass::GroupingError,
             SqlSurfaceError::WindowingError { .. } => ErrorClass::WindowingError,
+            SqlSurfaceError::InvalidPrecedingOrFollowingSize { .. } => {
+                ErrorClass::InvalidPrecedingOrFollowingSize
+            }
             SqlSurfaceError::StatementTooComplex { .. } => ErrorClass::StatementTooComplex,
             SqlSurfaceError::TooManyColumns { .. } => ErrorClass::TooManyColumns,
             SqlSurfaceError::TooManyArguments { .. } => ErrorClass::TooManyArguments,
@@ -1912,6 +1918,7 @@ impl std::fmt::Display for SqlSurfaceError {
             SqlSurfaceError::InvalidObjectDefinition { detail }
             | SqlSurfaceError::GroupingError { detail }
             | SqlSurfaceError::WindowingError { detail }
+            | SqlSurfaceError::InvalidPrecedingOrFollowingSize { detail }
             | SqlSurfaceError::StatementTooComplex { detail }
             | SqlSurfaceError::TooManyColumns { detail }
             | SqlSurfaceError::TooManyArguments { detail } => f.write_str(detail),
@@ -4015,8 +4022,7 @@ pub(crate) struct WindowFrame {
     pub(crate) mode: WindowFrameMode,
     pub(crate) start: WindowFrameBound,
     pub(crate) end: WindowFrameBound,
-    /// 適用は #1889〜#1891 が読む（それまで本番コードでは未読）。
-    #[cfg_attr(not(test), allow(dead_code))]
+    /// 適用は #1889（ROWS）が読み、#1890／#1891 がモード単位で追従する。
     pub(crate) exclusion: WindowFrameExclusion,
 }
 

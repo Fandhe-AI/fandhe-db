@@ -36,7 +36,7 @@
 | 文全体のスカラー `ORDER BY [ASC\|DESC][, ...]`（`LIMIT`／`OFFSET` 付き。Issue #1189） | 受理（ウィンドウ値は全母集合で評価し、並べ替え・`LIMIT`／`OFFSET` は出力行にのみ効く） |
 | 文全体のベクトル `ORDER BY`（検索 SELECT）・`USING PLAN`・`GROUP BY`／集計 SELECT・`SELECT DISTINCT` との併用 | `42601`（構造的に相互排他） |
 | 文全体の `ORDER BY` でのウィンドウ別名参照（実在する同名列がある場合はその列として解釈） | `42601` |
-| フレーム句（`ROWS`/`RANGE`/`GROUPS`。Issue #1887） | 構文は受理し、評価前のゲートで `0A000`（形の誤りは `42601`。詳細は末尾「Issue #1887 追記」） |
+| フレーム句（`ROWS`/`RANGE`/`GROUPS`。Issue #1887・#1889） | 構文は受理する（形の誤りは `42601`）。`ROWS` は #1889 で評価し、`RANGE`／`GROUPS` は評価前のゲートで `0A000`（詳細は末尾「Issue #1887 追記」「Issue #1889 追記」） |
 | 名前付きウィンドウ（`WINDOW`/`OVER w`）・`FILTER (...)`・関数内 `DISTINCT`・複合式の引数・式の中へのウィンドウ呼び出し（`ROW_NUMBER() OVER () + 1` 等）・`*` とウィンドウ項目の混在 | `42601` |
 | `WHERE` でのウィンドウ別名参照（実在する同名列がある場合はその列として解釈） | `42601` |
 | `CREATE VIEW` 本文への `OVER` 混入 | `42601`（`parse_view_body` が構造上受理しない） |
@@ -127,7 +127,7 @@
 - ウィンドウ関数の結果による文全体の `ORDER BY`（`ORDER BY rn`）。base scan への委譲方式では評価できない
 - `EXPLAIN` とウィンドウ関数の併用（`ORDER BY` の有無を問わず `42601`）
 - `GROUP BY`／集計 SELECT とウィンドウの併用
-- フレーム指定の評価（構文は Issue #1887 で受理済み）・名前付きウィンドウ・`FILTER (...)`・
+- `RANGE`／`GROUPS` フレームの評価（構文は Issue #1887 で受理済み。`ROWS` は #1889 で評価）・名前付きウィンドウ・`FILTER (...)`・
   関数内 `DISTINCT`・複合式の引数
 - 式の中へのウィンドウ呼び出しの埋め込み
 - 検索 SELECT（ベクトル `ORDER BY`・`HYBRID`・`USING PLAN`）へのウィンドウ追加
@@ -254,3 +254,45 @@
   へ計上すること。
 - **#1889〜#1891 の前提**: ROWS は位置アクセス、RANGE／GROUPS は peer 範囲と
   `cmp_order_keys` を土台にする。フレーム固有の処理は本 Issue では入れていない。
+
+## Issue #1889 追記: ROWS フレームの評価（SQL-64 (2) ポインタ）
+
+`bind_window_item` のゲートを「`ROWS` 以外のフレーム」だけに縮め、`ROWS` を PostgreSQL 17 と同じ
+結果で評価する。`RANGE`／`GROUPS`（`RANGE UNBOUNDED PRECEDING` のようにオフセットのない形も含む）は
+Issue #1890／#1891 まで `0A000` のまま。
+
+- **束縛**: `bind_window_frame` は `ROWS` のとき束縛済みフレーム（`BoundWindowFrame`。オフセットは
+  `bind_projection_expr` の束縛済み式、裸の `NULL` は `Null` 境界）を返し、`BoundWindowItem.frame` に載せる。
+  検証の順序（`42P20`→`42P10`→`42804`）は #1887 から変えない。Describe は束縛までで、オフセットは評価しない。
+- **解決の位置**: `resolve_frames` が実行開始時（行を引く前。ストレージ走査は `materialize_rows` の前、
+  評価後射影形ビューは `CellWindowEvaluator::new`）にオフセット式を評価する。PostgreSQL がプラン時・
+  WindowAgg 開始時に評価するのと同じ位置で、0 行・`WHERE` 不一致でも検査が走る。
+- **関数別の扱い**（PostgreSQL 17.11 で実測）
+
+  | 関数 | フレーム・`EXCLUDE` | 評価エラー（`22012`・`22003` 等） | NULL `22004`／負 `22013` |
+  | ---- | ------------------- | ---------------------------------- | ------------------------ |
+  | `row_number`／`rank`／`dense_rank` | 無視 | 返る | 検査しない（PG16 以降は最適化でフレームが置換される） |
+  | `lag`／`lead` | 無視（`EXCLUDE` も） | 返る | 検査する（空テーブルでも） |
+  | `count`／`sum`／`avg`／`min`／`max` | 適用 | 返る | 検査する（開始→終了の順） |
+
+- **オフセットの型**: int8 全域（`i64` へ飽和変換。`LAG` の int4 契約とは別の `frame_offset_from_expr_value`）。
+  文言は PostgreSQL と同じ固定語（`frame starting offset must not be null` 等）で、値は含めない。
+  `SqlSurfaceError::InvalidPrecedingOrFollowingSize`（`22013`）を追加した（網羅 enum のため破壊的変更）。
+- **範囲計算**: `rows_frame_bounds(pos, len, frame)` は位置の半開区間を返すモード非依存の純関数で、
+  すべて飽和演算。first_value 等（#1883）と #1890／#1891 が再利用する。
+- **集計の評価**: `evaluate_rows_frame_partition` が行ごとにフレームから `EXCLUDE`（`CURRENT ROW`／
+  `GROUP`／`TIES`。peer 範囲で判定）を除いた行を**前方順**に観測する。PostgreSQL は逆遷移のない集計
+  （float・`MIN`／`MAX` 等）で同じく再集計するため、浮動小数点の加算順まで一致する。整数・`NUMERIC` は
+  逆遷移でも正確なので同値。始点が `UNBOUNDED PRECEDING` で `EXCLUDE` なしの形は終点が単調非減少なので、
+  累積器へ新規行だけを足す O(n) の経路を取る。それ以外は O(n×幅)（最大 1M 行）。観測ループで
+  `interrupt::check()` を呼び、切断で打ち切れる。独自の作業量上限は PostgreSQL にない拒否になるため置かない。
+- **状態予算**: 新しい確保は行ごとの結果セルの複製だけで、確保前に `MAX_WINDOW_STATE_BYTES` へ計上する。
+  peer 境界の索引は確保しない（#1888 の方針）。
+- **RLS**: フレームは materialize 段（可視性判定→整合確認→`WHERE`→再判定）を通った行の並びの上でしか
+  位置を数えない。不可視行はフレームに入らない（結合テストで固定）。
+- **既知の差異**: 整数リテラルは式層の規則で `2^53` 超が `22003`（例: `9223372036854775807 PRECEDING`。
+  `2147483648` と `9007199254740992` は受理）。`'1'` リテラルは `42804`、オフセット内の `$n` は `42601`、
+  未知列は `42P10`（#1887 から継続）。評価後射影形ビュー経路では本文のエラーがオフセットのエラーより
+  先に出る可能性がある。
+- **対象外**: `RANGE`（#1890）・`GROUPS`（#1891）・first_value／last_value／nth_value（#1882／#1883）、
+  逆遷移・セグメント木による移動集計の高速化。

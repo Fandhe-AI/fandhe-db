@@ -9712,7 +9712,37 @@ pub(crate) struct BoundWindowItem {
     pub(crate) partition_by: Vec<WindowKeyRef>,
     /// 宣言順のウィンドウ `ORDER BY` キー列（SQL-30・SQL-56）。
     pub(crate) order_by: Vec<BoundWindowOrderKey>,
+    /// 束縛済みのフレーム句（`ROWS` のみ。SQL-64 (2)・Issue #1889）。`RANGE`／`GROUPS` は
+    /// #1890／#1891 までゲート（`0A000`）で止まるため常に `None`。
+    pub(crate) frame: Option<BoundWindowFrame>,
     pub(crate) name: String,
+}
+
+/// 束縛済みのウィンドウフレーム（SQL-64 (2)・Issue #1889）。`sql::window` が実行開始時に
+/// オフセットを評価して解決する。`mode` は評価側が `ROWS` 以外を fail-closed に弾くために持つ。
+#[derive(Debug, Clone, PartialEq)]
+pub(crate) struct BoundWindowFrame {
+    pub(crate) mode: crate::sql::allowlist::WindowFrameMode,
+    pub(crate) start: BoundFrameBound,
+    pub(crate) end: BoundFrameBound,
+    pub(crate) exclusion: crate::sql::allowlist::WindowFrameExclusion,
+}
+
+/// フレーム境界（オフセットは束縛済みの定数式）。
+#[derive(Debug, Clone, PartialEq)]
+pub(crate) enum BoundFrameBound {
+    UnboundedPreceding,
+    Preceding(BoundFrameOffset),
+    CurrentRow,
+    Following(BoundFrameOffset),
+    UnboundedFollowing,
+}
+
+/// フレームオフセット。裸の `NULL` は式層で束縛せず `Null` として運び、実行時に `22004` とする。
+#[derive(Debug, Clone, PartialEq)]
+pub(crate) enum BoundFrameOffset {
+    Null,
+    Expr(crate::sql::udf_call::BoundExpr),
 }
 
 /// `LAG`／`LEAD` の束縛済み引数（SQL-64 (1)・Issue #1880）。評価（Issue #1881）は
@@ -10331,7 +10361,7 @@ fn bind_window_item(
         });
     }
 
-    bind_window_frame(item, udfs, schema, node_budget)?;
+    let frame = bind_window_frame(item, udfs, schema, node_budget)?;
 
     let name = item
         .alias
@@ -10345,12 +10375,17 @@ fn bind_window_item(
         offset_args,
         partition_by,
         order_by,
+        frame,
         name,
     };
-    // フレーム句付きの項目は構文・束縛段の検査（`bind_window_frame`）を通っても評価しない。
-    // 評価は #1889（ROWS）／#1890（RANGE）／#1891（GROUPS）がモード単位でこのゲートを外す。
+    // `ROWS` 以外のフレーム句は構文・束縛段の検査（`bind_window_frame`）を通っても評価しない。
+    // 評価は #1890（RANGE）／#1891（GROUPS）がモード単位でこのゲートを外す（#1889 で ROWS は外した）。
     // 既定フレームと同値の明示フレームも対象で、行数・テナントの有無に依存しない（fail-closed）。
-    if item.frame.is_some() {
+    if item
+        .frame
+        .as_ref()
+        .is_some_and(|f| f.mode != crate::sql::allowlist::WindowFrameMode::Rows)
+    {
         return Err(SqlSurfaceError::feature_not_supported(
             "window frame clauses are not supported yet",
         ));
@@ -10360,8 +10395,9 @@ fn bind_window_item(
     Ok(bound)
 }
 
-/// ウィンドウのフレーム句を検証する（SQL-64 (2)・Issue #1887。[`bind_window_item`] からキー解決の
-/// 後に呼ばれる。検証のみで束縛済みフレームは作らない——評価 Issue が追加する）。PostgreSQL の
+/// ウィンドウのフレーム句を検証し、`ROWS` のときは束縛済みフレームを返す（SQL-64 (2)・
+/// Issue #1887／#1889。[`bind_window_item`] からキー解決の後に呼ばれる。`RANGE`／`GROUPS` は
+/// 検証のみで `None`——#1890／#1891 が束縛済みフレームを追加する）。PostgreSQL の
 /// 解析段に合わせ、次の順で拒否する: `RANGE` オフセットの `ORDER BY` キー数（`42P20`）→
 /// `ORDER BY` の無い `GROUPS`（`42P20`）→ オフセット式の変数（`42P10`。列は解決せず一律に拒否し、
 /// ビューの非公開列か未知列かの存在情報を漏らさない）→ `ROWS`／`GROUPS` オフセットの型（`42804`）。
@@ -10370,11 +10406,11 @@ fn bind_window_frame(
     udfs: &crate::sql::udf_call::UdfRegistry,
     schema: &TableSchema,
     node_budget: &mut usize,
-) -> Result<(), SqlSurfaceError> {
-    use crate::sql::allowlist::WindowFrameMode;
+) -> Result<Option<BoundWindowFrame>, SqlSurfaceError> {
+    use crate::sql::allowlist::{WindowFrameBound, WindowFrameMode};
     use crate::sql::udf_call::bind_projection_expr;
     let Some(frame) = &item.frame else {
-        return Ok(());
+        return Ok(None);
     };
     let offsets: Vec<&Expr> = [&frame.start, &frame.end]
         .into_iter()
@@ -10400,12 +10436,18 @@ fn bind_window_frame(
         }
     }
     // `RANGE` のオフセット型と `ORDER BY` キー型の照合は #1890 が担う（ゲートで止まる）。
-    if frame.mode != WindowFrameMode::Range {
-        for e in &offsets {
+    if frame.mode == WindowFrameMode::Range {
+        return Ok(None);
+    }
+    // 境界ごとに束縛する（検査順は開始 → 終了。オフセットの型検査は従来どおり）。
+    let bind_bound = |b: &WindowFrameBound,
+                      node_budget: &mut usize|
+     -> Result<BoundFrameBound, SqlSurfaceError> {
+        let mut offset = |e: &Expr| -> Result<BoundFrameOffset, SqlSurfaceError> {
             if matches!(e, Expr::Null) {
-                continue;
+                return Ok(BoundFrameOffset::Null);
             }
-            let (_bound, _ty, col) = bind_projection_expr(e, schema, udfs, node_budget)?;
+            let (bound, _ty, col) = bind_projection_expr(e, schema, udfs, node_budget)?;
             if !matches!(
                 col,
                 Some(ColumnType::SmallInt | ColumnType::Integer | ColumnType::BigInt)
@@ -10414,9 +10456,28 @@ fn bind_window_frame(
                     "window frame offset must be of integer type",
                 ));
             }
-        }
+            Ok(BoundFrameOffset::Expr(bound))
+        };
+        Ok(match b {
+            WindowFrameBound::UnboundedPreceding => BoundFrameBound::UnboundedPreceding,
+            WindowFrameBound::Preceding(e) => BoundFrameBound::Preceding(offset(e)?),
+            WindowFrameBound::CurrentRow => BoundFrameBound::CurrentRow,
+            WindowFrameBound::Following(e) => BoundFrameBound::Following(offset(e)?),
+            WindowFrameBound::UnboundedFollowing => BoundFrameBound::UnboundedFollowing,
+        })
+    };
+    let start = bind_bound(&frame.start, node_budget)?;
+    let end = bind_bound(&frame.end, node_budget)?;
+    if frame.mode == WindowFrameMode::Groups {
+        // `GROUPS` は #1891 が束縛済みフレームを持つ（ゲートで止まる）。
+        return Ok(None);
     }
-    Ok(())
+    Ok(Some(BoundWindowFrame {
+        mode: frame.mode,
+        start,
+        end,
+        exclusion: frame.exclusion,
+    }))
 }
 
 /// `where_predicates`（未束縛。`sql::allowlist::WherePredicate`）が参照する列名を

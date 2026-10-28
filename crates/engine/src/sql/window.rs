@@ -52,8 +52,15 @@
 //! 母集合は他のウィンドウ関数と同じ（RLS・`WHERE` を通った行のみ）で、不可視行は参照先に
 //! ならない。
 //!
-//! 対象外（`42601`／`54000` で fail-closed に拒否。allowlist・parser 側で既に拒否
-//! 済みの形も含む）: フレーム句（`ROWS`/`RANGE`/`GROUPS`）・
+//! `ROWS` フレーム（SQL-64 (2)・Issue #1889）は、実行開始時（行を引く前）に
+//! [`resolve_frames`] がオフセット式を評価して解決済みフレーム（[`ResolvedRowsFrame`]）にし、
+//! 集計だけが [`evaluate_rows_frame_partition`] で行ごとのフレーム（`EXCLUDE` 込み）を評価する。
+//! 順位関数と `LAG`／`LEAD` はフレームを無視する（PostgreSQL と同じ）が、`LAG`／`LEAD` は
+//! オフセットの NULL／負を検査する。位置範囲の計算（[`rows_frame_bounds`]）はモード非依存の
+//! 形で、first_value 等（#1883）や RANGE／GROUPS（#1890／#1891）が再利用する。
+//!
+//! 対象外（`42601`／`54000`／`0A000` で fail-closed に拒否。allowlist・parser 側で既に拒否
+//! 済みの形も含む）: フレーム句の `RANGE`/`GROUPS`（`ROWS` は対応済み）・
 //! 名前付きウィンドウ・`FILTER (...)`・関数内 `DISTINCT`・複合式の引数・
 //! ベクトル順位付け（`ORDER BY embedding <=> ...`）／`USING PLAN` との併用・
 //! ウィンドウ別名による文全体の `ORDER BY`・`GROUP BY`／集計 SELECT との併用。
@@ -63,7 +70,7 @@ use crate::declarative_filter;
 use crate::policy::PolicyContext;
 use crate::row_codec;
 use crate::sql::aggregate::{self, Accumulator, DecodeTier, RowVector};
-use crate::sql::allowlist::{SqlSurfaceError, WindowFunc};
+use crate::sql::allowlist::{SqlSurfaceError, WindowFrameExclusion, WindowFrameMode, WindowFunc};
 use crate::sql::exec::{Cell, ColumnMeta, QueryResult, ResultRow};
 use crate::sql::expr_program::{ExprProgram, StackValue};
 use crate::sql::order_value::{
@@ -71,8 +78,8 @@ use crate::sql::order_value::{
     NullPlacement, OrderValue, ScalarKeyRef,
 };
 use crate::sql::parser::{
-    AggregateInput, BoundScan, BoundWindowItem, BoundWindowOffsetArgs, BoundWindowValue,
-    ProjectedColumn, WindowKeyKind, WindowKeyRef,
+    AggregateInput, BoundFrameBound, BoundFrameOffset, BoundScan, BoundWindowItem,
+    BoundWindowOffsetArgs, BoundWindowValue, ProjectedColumn, WindowKeyKind, WindowKeyRef,
 };
 use crate::sql::scan::{computed_value_to_cell, push_scalar_column_cell};
 use crate::sql::udf_call::{self, ExprValue};
@@ -444,6 +451,185 @@ fn offset_target_index(pos: usize, len: usize, offset: i32, forward: bool) -> Op
     (target < len).then_some(target)
 }
 
+/// 解決済みのフレーム境界（オフセットは評価・検査済みの非負位置数。i64 超は飽和）。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum ResolvedBound {
+    UnboundedPreceding,
+    Preceding(usize),
+    CurrentRow,
+    Following(usize),
+    UnboundedFollowing,
+}
+
+/// 解決済みの `ROWS` フレーム（集計だけが保持する。[`resolve_frames`] が作る）。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct ResolvedRowsFrame {
+    start: ResolvedBound,
+    end: ResolvedBound,
+    exclusion: WindowFrameExclusion,
+}
+
+/// 評価済み（未検査）のオフセット。`None` は NULL。
+#[derive(Debug, Clone, Copy)]
+enum EvaluatedBound {
+    UnboundedPreceding,
+    Preceding(Option<i64>),
+    CurrentRow,
+    Following(Option<i64>),
+    UnboundedFollowing,
+}
+
+/// フレームオフセットの評価値を `i64`（`None` は NULL）へ変換する。`offset_from_expr_value`
+/// （`LAG` の int4 契約）とは別で、フレームオフセットは int8 全域を受理する（PostgreSQL と同じ）。
+/// 束縛段が整数型に限定済みのため、非整数・他の variant は不変条件違反（`XX000`）。
+fn frame_offset_from_expr_value(value: ExprValue<'_>) -> Result<Option<i64>, SqlSurfaceError> {
+    match value {
+        ExprValue::Null => Ok(None),
+        ExprValue::Scalar(f) => {
+            if !(f.is_finite() && f.fract() == 0.0) {
+                return Err(window_bug("window frame offset is not an integer value"));
+            }
+            // `as` は飽和変換（2^63 以上は `i64::MAX`）。それを超えるオフセットは事実上 unbounded。
+            Ok(Some(f as i64))
+        }
+        _ => Err(window_bug(
+            "window frame offset evaluated to a non-integer value",
+        )),
+    }
+}
+
+fn evaluate_frame_bound(
+    bound: &BoundFrameBound,
+    scratch: &mut Vec<StackValue>,
+) -> Result<EvaluatedBound, SqlSurfaceError> {
+    // 識別子は束縛段（42P10）で拒否済みの定数式のため、行なしで評価できる。
+    let mut offset = |o: &BoundFrameOffset| -> Result<Option<i64>, SqlSurfaceError> {
+        match o {
+            BoundFrameOffset::Null => Ok(None),
+            BoundFrameOffset::Expr(e) => {
+                frame_offset_from_expr_value(ExprProgram::compile(e).eval(0, &[], &[], scratch)?)
+            }
+        }
+    };
+    Ok(match bound {
+        BoundFrameBound::UnboundedPreceding => EvaluatedBound::UnboundedPreceding,
+        BoundFrameBound::Preceding(o) => EvaluatedBound::Preceding(offset(o)?),
+        BoundFrameBound::CurrentRow => EvaluatedBound::CurrentRow,
+        BoundFrameBound::Following(o) => EvaluatedBound::Following(offset(o)?),
+        BoundFrameBound::UnboundedFollowing => EvaluatedBound::UnboundedFollowing,
+    })
+}
+
+/// オフセットの NULL（`22004`）・負（`22013`）を検査して [`ResolvedBound`] にする。
+fn check_frame_bound(
+    bound: EvaluatedBound,
+    is_start: bool,
+) -> Result<ResolvedBound, SqlSurfaceError> {
+    let checked = |v: Option<i64>| -> Result<usize, SqlSurfaceError> {
+        let n = v.ok_or(SqlSurfaceError::NullValueNotAllowed {
+            detail: if is_start {
+                "frame starting offset must not be null"
+            } else {
+                "frame ending offset must not be null"
+            },
+        })?;
+        if n < 0 {
+            return Err(SqlSurfaceError::InvalidPrecedingOrFollowingSize {
+                detail: if is_start {
+                    "frame starting offset must not be negative"
+                } else {
+                    "frame ending offset must not be negative"
+                },
+            });
+        }
+        Ok(usize::try_from(n).unwrap_or(usize::MAX))
+    };
+    Ok(match bound {
+        EvaluatedBound::UnboundedPreceding => ResolvedBound::UnboundedPreceding,
+        EvaluatedBound::Preceding(v) => ResolvedBound::Preceding(checked(v)?),
+        EvaluatedBound::CurrentRow => ResolvedBound::CurrentRow,
+        EvaluatedBound::Following(v) => ResolvedBound::Following(checked(v)?),
+        EvaluatedBound::UnboundedFollowing => ResolvedBound::UnboundedFollowing,
+    })
+}
+
+/// 項目ごとのフレームを実行開始時に解決する（`execute_window_scan_with_caps` と
+/// [`CellWindowEvaluator::new`] が行を引く前に 1 回呼ぶ。PostgreSQL がプラン時・WindowAgg 開始時に
+/// オフセットを評価するのと同じ位置で、0 行・`WHERE` 不一致でもエラーを返す）。
+/// 評価エラー（`22012`・`22003` 等）は関数種別を問わず返す。NULL／負の検査は集計と
+/// `LAG`／`LEAD` だけが行う（順位関数は PostgreSQL 16 以降フレームを最適化で置き換えるため
+/// 検査しない）。戻り値を保持するのは集計だけで、`LAG`／`LEAD`・順位関数は `None`
+/// （フレームを無視する）。
+fn resolve_frames(
+    items: &[BoundWindowItem],
+) -> Result<Vec<Option<ResolvedRowsFrame>>, SqlSurfaceError> {
+    let mut scratch: Vec<StackValue> = Vec::new();
+    let mut evaluated: Vec<Option<(EvaluatedBound, EvaluatedBound, WindowFrameExclusion)>> =
+        Vec::with_capacity(items.len());
+    for item in items {
+        evaluated.push(match &item.frame {
+            None => None,
+            Some(frame) => {
+                if frame.mode != WindowFrameMode::Rows {
+                    return Err(window_bug("non-ROWS window frame reached evaluation"));
+                }
+                Some((
+                    evaluate_frame_bound(&frame.start, &mut scratch)?,
+                    evaluate_frame_bound(&frame.end, &mut scratch)?,
+                    frame.exclusion,
+                ))
+            }
+        });
+    }
+    let mut out = Vec::with_capacity(items.len());
+    for (item, ev) in items.iter().zip(evaluated) {
+        let Some((start, end, exclusion)) = ev else {
+            out.push(None);
+            continue;
+        };
+        match item.func {
+            WindowFunc::RowNumber | WindowFunc::Rank | WindowFunc::DenseRank => out.push(None),
+            WindowFunc::Lag | WindowFunc::Lead => {
+                check_frame_bound(start, true)?;
+                check_frame_bound(end, false)?;
+                out.push(None);
+            }
+            WindowFunc::Count
+            | WindowFunc::Sum
+            | WindowFunc::Avg
+            | WindowFunc::Min
+            | WindowFunc::Max => out.push(Some(ResolvedRowsFrame {
+                start: check_frame_bound(start, true)?,
+                end: check_frame_bound(end, false)?,
+                exclusion,
+            })),
+        }
+    }
+    Ok(out)
+}
+
+/// 位置 `pos`（0 始まり・パーティション長 `len`）の `ROWS` フレームを半開区間
+/// `[start, end)` で返す（`start >= end` は空フレーム）。位置数のみに依存するモード非依存の計算で、
+/// すべて飽和演算。`UNBOUNDED FOLLOWING` を始点、`UNBOUNDED PRECEDING` を終点にする形は
+/// 構文層が拒否済みだが、空フレームへ倒す。
+fn rows_frame_bounds(pos: usize, len: usize, frame: &ResolvedRowsFrame) -> (usize, usize) {
+    let start = match frame.start {
+        ResolvedBound::UnboundedPreceding => 0,
+        ResolvedBound::Preceding(n) => pos.saturating_sub(n),
+        ResolvedBound::CurrentRow => pos,
+        ResolvedBound::Following(n) => pos.saturating_add(n),
+        ResolvedBound::UnboundedFollowing => len,
+    };
+    let end = match frame.end {
+        ResolvedBound::UnboundedPreceding => 0,
+        ResolvedBound::Preceding(n) => pos.saturating_add(1).saturating_sub(n),
+        ResolvedBound::CurrentRow => pos.saturating_add(1),
+        ResolvedBound::Following(n) => pos.saturating_add(n).saturating_add(1),
+        ResolvedBound::UnboundedFollowing => len,
+    };
+    (start.min(len), end.min(len))
+}
+
 /// 可視かつ WHERE を満たす 1 行の materialize 結果（SQL-30・TASK-214）。
 /// `partition_keys`／`order_keys`／`agg_values` は `bound.windows()` と同じ順序の
 /// `Vec`（外側添字がウィンドウ項目の添字）。
@@ -517,6 +703,8 @@ fn execute_window_scan_with_caps(
     max_result_bytes: usize,
     state_cap: usize,
 ) -> Result<QueryResult, SqlSurfaceError> {
+    // フレームのオフセットは行を引く前に評価する（PostgreSQL の評価位置。0 行でも検査する）。
+    let frames = resolve_frames(bound.windows())?;
     let MaterializeOutput {
         rows: materialized,
         tenants,
@@ -535,6 +723,7 @@ fn execute_window_scan_with_caps(
             item,
             item_index,
             &materialized,
+            frames.get(item_index).and_then(|f| f.as_ref()),
             &mut state_bytes,
             state_cap,
         )?);
@@ -993,6 +1182,8 @@ pub(crate) struct CellWindowEvaluator<'a> {
     state_bytes: usize,
     partition_counts: Vec<HashMap<Vec<u8>, usize>>,
     offset_eval: OffsetEvaluator,
+    /// 実行開始時に解決した `ROWS` フレーム（項目ごと。[`resolve_frames`]）。
+    frames: Vec<Option<ResolvedRowsFrame>>,
 }
 
 impl<'a> CellWindowEvaluator<'a> {
@@ -1050,12 +1241,14 @@ impl<'a> CellWindowEvaluator<'a> {
                 ));
             }
         }
+        let frames = resolve_frames(items)?;
         Ok(Self {
             items,
             rows: Vec::new(),
             state_bytes: 0,
             partition_counts: vec![HashMap::new(); items.len()],
             offset_eval: OffsetEvaluator::new(items),
+            frames,
         })
     }
 
@@ -1107,6 +1300,7 @@ impl<'a> CellWindowEvaluator<'a> {
                 item,
                 item_index,
                 &self.rows,
+                self.frames.get(item_index).and_then(|f| f.as_ref()),
                 &mut self.state_bytes,
                 MAX_WINDOW_STATE_BYTES,
             )?);
@@ -1633,6 +1827,7 @@ fn evaluate_window_item(
     item: &BoundWindowItem,
     item_index: usize,
     materialized: &[MaterializedRow],
+    frame: Option<&ResolvedRowsFrame>,
     state_bytes: &mut usize,
     state_cap: usize,
 ) -> Result<Vec<Cell>, SqlSurfaceError> {
@@ -1662,7 +1857,7 @@ fn evaluate_window_item(
     let mut result: Vec<Option<Cell>> = vec![None; materialized.len()];
     for indices in partitions.into_values() {
         let part = SortedPartition::new(item, item_index, materialized, indices);
-        evaluate_partition(&part, &mut result, state_bytes, state_cap)?;
+        evaluate_partition(&part, frame, &mut result, state_bytes, state_cap)?;
     }
     result
         .into_iter()
@@ -1744,6 +1939,7 @@ fn evaluate_offset_partition(
 /// `evaluate_window_item` から呼ばれる。
 fn evaluate_partition(
     part: &SortedPartition<'_>,
+    frame: Option<&ResolvedRowsFrame>,
     out: &mut [Option<Cell>],
     state_bytes: &mut usize,
     state_cap: usize,
@@ -1754,6 +1950,11 @@ fn evaluate_partition(
     // `LAG`／`LEAD` は peer・フレームに依存しないため、peer 分割へ入れず専用の評価へ委譲する。
     if item.func.is_value_offset() {
         return evaluate_offset_partition(part, out, state_bytes, state_cap);
+    }
+    // 解決済みの `ROWS` フレームを持つのは集計だけ。フレームなし（既定の peer 意味論）の経路は
+    // 以下の peer ループのまま変えない。
+    if let Some(frame) = frame {
+        return evaluate_rows_frame_partition(part, frame, out, state_bytes, state_cap);
     }
 
     let mut scratch: Vec<StackValue> = Vec::new();
@@ -1841,6 +2042,92 @@ fn evaluate_partition(
         }
     }
 
+    Ok(())
+}
+
+/// 集計の `ROWS` フレーム評価（SQL-64 (2)・Issue #1889。[`evaluate_partition`] から呼ばれる）。
+/// 行ごとに [`rows_frame_bounds`] のフレームから `EXCLUDE` 対象を除いた行を前方順に観測する
+/// （PostgreSQL は逆遷移を持たない集計〔float・MIN/MAX 等〕で同じく再集計するため、前方加算の
+/// 順序まで一致する。整数・NUMERIC は逆遷移でも正確で同値）。始点が `UNBOUNDED PRECEDING` で
+/// `EXCLUDE` なしなら終点は単調非減少なので、1 つの累積器へ新規行だけを足す O(n) の経路を取る。
+/// 空フレームは累積器の空集合契約（`COUNT`＝0、他は NULL）で返る。母集合は materialize 段を通った
+/// 行のみで、不可視行はフレームに現れない。
+fn evaluate_rows_frame_partition(
+    part: &SortedPartition<'_>,
+    frame: &ResolvedRowsFrame,
+    out: &mut [Option<Cell>],
+    state_bytes: &mut usize,
+    state_cap: usize,
+) -> Result<(), SqlSurfaceError> {
+    let item = part.item;
+    let item_index = part.item_index;
+    let input = item
+        .input
+        .as_ref()
+        .ok_or_else(|| window_bug("framed window function is missing its aggregate input"))?;
+    let agg_func = window_func_to_aggregate_func(item.func)?;
+    let len = part.len();
+    let mut scratch: Vec<StackValue> = Vec::new();
+
+    let observe_at = |acc: &mut Accumulator,
+                      pos: usize,
+                      scratch: &mut Vec<StackValue>|
+     -> Result<(), SqlSurfaceError> {
+        let row = part.row(pos)?;
+        let agg_value = row
+            .agg_values
+            .get(item_index)
+            .ok_or_else(|| window_bug("aggregate window values missing for a row"))?;
+        observe_window_row(acc, input, row.id, agg_value, scratch)
+    };
+
+    let cumulative = frame.start == ResolvedBound::UnboundedPreceding
+        && frame.exclusion == WindowFrameExclusion::NoOthers;
+    let mut running = Accumulator::new(agg_func, input)?;
+    let mut observed = 0usize;
+
+    for group in part.peer_groups() {
+        let (g_start, g_end) = group?;
+        for pos in g_start..g_end {
+            crate::interrupt::check()?;
+            let (start, end) = rows_frame_bounds(pos, len, frame);
+            let cell = if cumulative {
+                while observed < end {
+                    observe_at(&mut running, observed, &mut scratch)?;
+                    observed += 1;
+                }
+                running.clone().finish()?
+            } else {
+                let mut acc = Accumulator::new(agg_func, input)?;
+                for q in start..end {
+                    let excluded = match frame.exclusion {
+                        WindowFrameExclusion::NoOthers => false,
+                        WindowFrameExclusion::CurrentRow => q == pos,
+                        WindowFrameExclusion::Group => (g_start..g_end).contains(&q),
+                        WindowFrameExclusion::Ties => q != pos && (g_start..g_end).contains(&q),
+                    };
+                    if !excluded {
+                        crate::interrupt::check()?;
+                        observe_at(&mut acc, q, &mut scratch)?;
+                    }
+                }
+                acc.finish()?
+            };
+            // 行ごとの複製も他の評価段の確保と同じ状態予算へ計上する（確保前の検証）。
+            *state_bytes = try_accumulate_state_budget(
+                *state_bytes,
+                window_cell_state_bytes(&cell),
+                state_cap,
+            )?;
+            let row_idx = part.row_index(pos)?;
+            let slot = out.get_mut(row_idx).ok_or_else(|| {
+                window_bug(
+                    "evaluate_rows_frame_partition row index out of range for the result slice",
+                )
+            })?;
+            *slot = Some(cell);
+        }
+    }
     Ok(())
 }
 
@@ -2444,6 +2731,7 @@ mod budget_regression_tests {
 
     fn item(func: WindowFunc, input: Option<AggregateInput>) -> BoundWindowItem {
         BoundWindowItem {
+            frame: None,
             position: 0,
             func,
             input,
@@ -2570,6 +2858,7 @@ mod budget_regression_tests {
             order_by: Vec::new(),
             offset: 0,
             windows: vec![BoundWindowItem {
+                frame: None,
                 position: 1,
                 func: WindowFunc::Min,
                 input: Some(AggregateInput::TextColumn(0)),
@@ -2712,6 +3001,91 @@ mod budget_regression_tests {
         assert_eq!(err.wire_code(), "XX000");
     }
 
+    /// `frame_offset_from_expr_value`: NULL・int8 全域（飽和）・`-0.0`・非整数（`XX000`）。
+    #[test]
+    fn frame_offset_from_expr_value_accepts_int8_range() {
+        assert_eq!(frame_offset_from_expr_value(ExprValue::Null).unwrap(), None);
+        assert_eq!(
+            frame_offset_from_expr_value(ExprValue::Scalar(3.0)).unwrap(),
+            Some(3)
+        );
+        assert_eq!(
+            frame_offset_from_expr_value(ExprValue::Scalar(-1.0)).unwrap(),
+            Some(-1)
+        );
+        // `i32` を超える値も受理する（`LAG` の int4 契約とは別）。
+        assert_eq!(
+            frame_offset_from_expr_value(ExprValue::Scalar(2_147_483_648.0)).unwrap(),
+            Some(2_147_483_648)
+        );
+        assert_eq!(
+            frame_offset_from_expr_value(ExprValue::Scalar(9.3e18)).unwrap(),
+            Some(i64::MAX)
+        );
+        // `-0.0` は負として扱わない（検査側が `n < 0` で判定するため 0 になる）。
+        assert_eq!(
+            frame_offset_from_expr_value(ExprValue::Scalar(-0.0)).unwrap(),
+            Some(0)
+        );
+        for v in [1.5, f64::NAN, f64::INFINITY] {
+            let err = frame_offset_from_expr_value(ExprValue::Scalar(v)).expect_err("not integer");
+            assert_eq!(err.wire_code(), "XX000");
+        }
+        let err = frame_offset_from_expr_value(ExprValue::Bool(true)).expect_err("wrong variant");
+        assert_eq!(err.wire_code(), "XX000");
+    }
+
+    /// `check_frame_bound`: NULL は `22004`、負は `22013`、巨大値は飽和して受理される。
+    #[test]
+    fn check_frame_bound_classifies_null_and_negative() {
+        let err = check_frame_bound(EvaluatedBound::Preceding(None), true).expect_err("null");
+        assert_eq!(err.wire_code(), "22004");
+        let err = check_frame_bound(EvaluatedBound::Following(Some(-1)), false).expect_err("neg");
+        assert_eq!(err.wire_code(), "22013");
+        assert_eq!(
+            check_frame_bound(EvaluatedBound::Following(Some(i64::MAX)), false).unwrap(),
+            ResolvedBound::Following(usize::try_from(i64::MAX).unwrap_or(usize::MAX))
+        );
+        assert_eq!(
+            check_frame_bound(EvaluatedBound::CurrentRow, true).unwrap(),
+            ResolvedBound::CurrentRow
+        );
+    }
+
+    /// `rows_frame_bounds`: 先頭・末尾・空パーティション・飽和・始点が終点を超える空フレーム。
+    #[test]
+    fn rows_frame_bounds_clamps_and_detects_empty_frames() {
+        use ResolvedBound::*;
+        let f = |start, end| ResolvedRowsFrame {
+            start,
+            end,
+            exclusion: WindowFrameExclusion::NoOthers,
+        };
+        let sliding = f(Preceding(1), Following(1));
+        assert_eq!(rows_frame_bounds(0, 5, &sliding), (0, 2));
+        assert_eq!(rows_frame_bounds(2, 5, &sliding), (1, 4));
+        assert_eq!(rows_frame_bounds(4, 5, &sliding), (3, 5));
+        assert_eq!(rows_frame_bounds(0, 1, &sliding), (0, 1));
+        // 空パーティション（呼ばれないが安全に畳む）。
+        assert_eq!(rows_frame_bounds(0, 0, &sliding), (0, 0));
+        // 巨大オフセットは飽和してパーティション全体。
+        let huge = f(Preceding(usize::MAX), Following(usize::MAX));
+        assert_eq!(rows_frame_bounds(3, 10, &huge), (0, 10));
+        // 始点が終点以降なら空（`start >= end`）。
+        let (s, e) = rows_frame_bounds(2, 5, &f(Preceding(2), Preceding(3)));
+        assert!(s >= e);
+        let (s, e) = rows_frame_bounds(4, 5, &f(Following(1), UnboundedFollowing));
+        assert!(s >= e);
+        assert_eq!(
+            rows_frame_bounds(2, 5, &f(UnboundedPreceding, CurrentRow)),
+            (0, 3)
+        );
+        assert_eq!(
+            rows_frame_bounds(2, 5, &f(CurrentRow, UnboundedFollowing)),
+            (2, 5)
+        );
+    }
+
     /// `LAG` が保持する値（TEXT）も状態予算へ計上され、cap を下回ると `54000` になる。
     #[test]
     fn lag_value_retention_is_charged_against_state_budget() {
@@ -2840,6 +3214,7 @@ mod partition_layout_tests {
 
     fn item(keys: &[(bool, NullPlacement)]) -> BoundWindowItem {
         BoundWindowItem {
+            frame: None,
             position: 0,
             func: WindowFunc::Rank,
             input: None,

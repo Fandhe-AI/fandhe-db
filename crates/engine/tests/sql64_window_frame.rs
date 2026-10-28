@@ -1,9 +1,10 @@
 //! ウィンドウのフレーム句（`ROWS`／`RANGE`／`GROUPS`）の構文受理（SQL-64 (2)・Issue #1887）の
 //! 結合テスト。
 //!
-//! 評価は兄弟 Issue（#1889〜#1891）の担当で、本 Issue では正しいフレームが構文・束縛段を通って
-//! 評価前のゲート `0A000` に届くこと、不正なフレームが PostgreSQL 17 と同じ SQLSTATE
-//! （`42601`／`42P20`／`42P10`／`42803`／`42804`）で拒否されることを検証する。足場は
+//! 評価は兄弟 Issue の担当で、本 Issue（#1887）では正しいフレームが構文・束縛段を通ること、
+//! 不正なフレームが PostgreSQL 17 と同じ SQLSTATE（`42601`／`42P20`／`42P10`／`42803`／`42804`）で
+//! 拒否されることを検証する。`ROWS` は #1889 で評価まで通り（値は `sql_t40_up/sql64_window_rows_frame.rs`）、
+//! `RANGE`／`GROUPS` は #1890／#1891 まで評価前のゲート `0A000` に届く。足場は
 //! `tests/sql64_lag_lead.rs` と同じ（`unique_db_path`＋`CleanupGuard`、公開 API のみ）。
 
 use engine::catalog::{ColumnDef, ColumnType, TableSchema};
@@ -77,7 +78,7 @@ fn check(core: &EngineCore, ctx: &PolicyContext, cases: &[(&str, &str)]) {
 }
 
 #[test]
-fn accepted_frames_reach_the_gate() {
+fn accepted_frames_reach_evaluation_or_the_gate() {
     for rows in [0u64, 3] {
         let (core, ctx, _g) = setup(&format!("frame-gate-{rows}"), rows);
         let cases = [
@@ -104,7 +105,18 @@ fn accepted_frames_reach_the_gate() {
         ];
         for c in cases {
             let sql = format!("SELECT id, sum(score) OVER ({c}) FROM docs LIMIT 10");
-            assert_eq!(outcome(&core, &ctx, &sql), "0A000", "{sql}");
+            // `ROWS` は評価まで通る（NULL／負のオフセットは行数に依らず 22004／22013）。
+            // `RANGE`／`GROUPS` は #1890／#1891 までゲート。
+            let want = if c.contains("RANGE") || c.contains("GROUPS") {
+                "0A000"
+            } else if c.contains("NULL PRECEDING") {
+                "22004"
+            } else if c.contains("-1 PRECEDING") {
+                "22013"
+            } else {
+                "OK"
+            };
+            assert_eq!(outcome(&core, &ctx, &sql), want, "{sql}");
         }
         for f in [
             "row_number()",
@@ -115,6 +127,10 @@ fn accepted_frames_reach_the_gate() {
         ] {
             let sql =
                 format!("SELECT id, {f} OVER (ORDER BY score ROWS 1 PRECEDING) FROM docs LIMIT 10");
+            assert_eq!(outcome(&core, &ctx, &sql), "OK", "{sql}");
+            let sql = format!(
+                "SELECT id, {f} OVER (ORDER BY score RANGE BETWEEN 1 PRECEDING AND 1 FOLLOWING) FROM docs LIMIT 10"
+            );
             assert_eq!(outcome(&core, &ctx, &sql), "0A000", "{sql}");
         }
     }
@@ -124,8 +140,10 @@ fn accepted_frames_reach_the_gate() {
 fn other_tenant_sees_same_gate() {
     let (core, _ctx, _g) = setup("frame-gate-tenant", 3);
     let other = ctx_for("tenant-b");
-    let sql = "SELECT id, sum(score) OVER (ORDER BY score ROWS 1 PRECEDING) FROM docs LIMIT 10";
+    let sql = "SELECT id, sum(score) OVER (ORDER BY score RANGE BETWEEN 1 PRECEDING AND 1 FOLLOWING) FROM docs LIMIT 10";
     assert_eq!(outcome(&core, &other, sql), "0A000");
+    let rows = "SELECT id, sum(score) OVER (ORDER BY score ROWS 1 PRECEDING) FROM docs LIMIT 10";
+    assert_eq!(outcome(&core, &other, rows), "OK");
 }
 
 #[test]
@@ -231,10 +249,14 @@ fn existing_prechecks_are_unaffected() {
 }
 
 #[test]
-fn cte_and_derived_bodies_reach_the_gate() {
+fn cte_and_derived_bodies_reach_evaluation_or_the_gate() {
     let (core, ctx, _g) = setup("frame-cte", 2);
     let cte = "WITH c AS (SELECT id, sum(score) OVER (ORDER BY score ROWS 1 PRECEDING) AS s FROM docs) SELECT * FROM c";
-    assert_eq!(outcome(&core, &ctx, cte), "0A000");
+    assert_eq!(outcome(&core, &ctx, cte), "OK");
     let derived = "SELECT * FROM (SELECT id, sum(score) OVER (ORDER BY score ROWS 1 PRECEDING) AS s FROM docs) t";
+    assert_eq!(outcome(&core, &ctx, derived), "OK");
+    let cte = "WITH c AS (SELECT id, sum(score) OVER (ORDER BY score RANGE BETWEEN 1 PRECEDING AND 1 FOLLOWING) AS s FROM docs) SELECT * FROM c";
+    assert_eq!(outcome(&core, &ctx, cte), "0A000");
+    let derived = "SELECT * FROM (SELECT id, sum(score) OVER (ORDER BY score RANGE BETWEEN 1 PRECEDING AND 1 FOLLOWING) AS s FROM docs) t";
     assert_eq!(outcome(&core, &ctx, derived), "0A000");
 }
