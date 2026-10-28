@@ -984,9 +984,10 @@ impl<'a> CellWindowEvaluator<'a> {
     /// `items` は合成スキーマ（本文の結果列と同じ並び）に束縛済みのウィンドウ項目。
     pub(crate) fn new(items: &'a [BoundWindowItem]) -> Result<Self, SqlSurfaceError> {
         for item in items {
-            // バッファ済みビュー経路のセル→スカラー変換（`cell_scalar`）は TIME／TIMESTAMPTZ を
-            // 写せないため、これらの列を値・既定値に取る LAG／LEAD は内部エラーでなく
-            // 固定 `0A000` で拒否する（fail-closed）。
+            // バッファ済みビュー経路のセル→スカラー変換（`cell_scalar`）が写せない型（TIME／
+            // TIMESTAMPTZ／INTERVAL 等）の列を値・既定値に取る LAG／LEAD は、内部エラーでなく
+            // 固定 `0A000` で拒否する（fail-closed。データ有無に依らない）。判定は `cell_scalar` と
+            // 同じ集合を持つ `cell_scalar_supports` に一本化し、乖離を防ぐ。
             if let Some(args) = &item.offset_args {
                 let value_ty = match &args.value {
                     BoundWindowValue::Column { ty, .. } => Some(ty),
@@ -996,10 +997,10 @@ impl<'a> CellWindowEvaluator<'a> {
                 if value_ty
                     .into_iter()
                     .chain(default_ty)
-                    .any(|ty| matches!(ty, ColumnType::Time | ColumnType::TimestampTz))
+                    .any(|ty| !crate::sql::join::values::cell_scalar_supports(ty))
                 {
                     return Err(SqlSurfaceError::FeatureNotSupported {
-                        detail: "LAG/LEAD over TIME or TIMESTAMPTZ columns of a buffered view is not supported"
+                        detail: "LAG/LEAD over TIME, TIMESTAMPTZ or INTERVAL columns of a buffered view is not supported"
                             .to_string(),
                     });
                 }

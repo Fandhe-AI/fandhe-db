@@ -892,6 +892,67 @@ fn buffered_view_time_columns_are_rejected_with_0a000() {
     }
 }
 
+/// バッファ済みビュー越しの INTERVAL 列の LAG／LEAD は、行の有無・値の NULL 有無に依らず
+/// 同じ固定 `0A000` で拒否する（PR レビュー指摘の回帰。データ依存の XX000 を出さない）。
+#[test]
+fn buffered_view_interval_column_is_rejected_with_0a000_regardless_of_data() {
+    for (label, with_rows) in [("lag-view-iv-empty", false), ("lag-view-iv-rows", true)] {
+        let path = unique_db_path(label);
+        let _guard = CleanupGuard(path.clone());
+        let storage = Storage::open(&path).expect("open storage");
+        storage
+            .create_table(&TableSchema::new(
+                "spans",
+                vec![ColumnDef::new("span", ColumnType::Interval, true)],
+            ))
+            .expect("create table");
+        let ctx = ctx_for("tenant-a");
+        if with_rows {
+            for (id, v) in [(1u64, Some(1i64)), (2, None), (3, Some(3))] {
+                let op_id =
+                    engine::recovery::required_op_id::OperationId::parse(&format!("iv-op-{id}"))
+                        .expect("valid operation_id");
+                let value = match v {
+                    Some(m) => Value::Interval(engine::datetime::Interval {
+                        months: 0,
+                        days: 0,
+                        micros: m * 1_000_000,
+                    }),
+                    None => Value::Null,
+                };
+                engine::tenant::insert_typed_row(
+                    &storage,
+                    "spans",
+                    &ctx,
+                    id,
+                    Visibility::Public,
+                    &[value],
+                    &op_id,
+                )
+                .expect("insert row");
+            }
+        }
+        let core = EngineCore::from_storage(storage, Box::new(CpuScalarProvider));
+        let mut session = SessionState::default();
+        session.allow_ddl();
+        core.execute_sql_in_session(
+            &ctx,
+            &mut session,
+            "CREATE VIEW sv AS SELECT id, span FROM spans ORDER BY id LIMIT 3",
+        )
+        .expect("create view");
+        let mut s = SessionState::default();
+        let err = core
+            .execute_sql_in_session(
+                &ctx,
+                &mut s,
+                "SELECT id, lag(span) OVER (ORDER BY id) FROM sv LIMIT 10",
+            )
+            .expect_err("INTERVAL over a buffered view is rejected");
+        assert_eq!(err.wire_code(), "0A000", "{label}: {err:?}");
+    }
+}
+
 /// 裸の BIGINT 列は既定値付きでも宣言型のまま運ぶ（f64 を経由せず 2^53 超が正確に保たれる。
 /// Issue #1881 のレビュー指摘の回帰）。
 #[test]
