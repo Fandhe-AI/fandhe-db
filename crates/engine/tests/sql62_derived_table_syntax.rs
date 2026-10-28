@@ -2,8 +2,9 @@
 //! （SQL-62・Issue #1865、親 Issue #1864）。ポインタ: `docs/spec/04-behavior/sql-surface.md` SQL-62・
 //! `docs/spec/04-behavior/error-format.md`（`42P10`・ERR-6）・RLS-10 (b)。
 //!
-//! 実行は後続 Issue（#1866・#1867）の担当のため、検証を通過した文は固定の `0A000` で止まる。
-//! 本テストは「構文を受理して解決まで進む（`0A000`）」「解決で拒否される形は専用の SQLSTATE」
+//! 実行は #1866（FROM 直後の単一の派生表。`sql62_derived_table_exec.rs`）で接続済み。JOIN 入力・複数件・
+//! 深さ上限は #1867 の担当のため固定の `0A000` で止まる。
+//! 本テストは「構文を受理して解決まで進む」「解決で拒否される形は専用の SQLSTATE」
 //! 「非セッションの入口は従来どおり `42601`」「テナントで結果が変わらない」を固定する。
 //! `sql62_cte_column_list.rs` と同じ流儀（実 `Storage` ＋ `EngineCore::execute_sql_in_session`）。
 
@@ -168,7 +169,7 @@ fn msg(core: &EngineCore, tenant: &str, sql: &str) -> String {
 }
 
 #[test]
-fn derived_table_syntax_is_accepted_and_stops_at_fixed_gate() {
+fn derived_table_syntax_is_accepted_and_executes() {
     let (core, _g) = open_seeded();
     for sql in [
         "SELECT * FROM (SELECT lang FROM docs) t",
@@ -180,17 +181,27 @@ fn derived_table_syntax_is_accepted_and_stops_at_fixed_gate() {
         "SELECT * FROM (SELECT lang, count(*) FROM docs GROUP BY lang) d",
         "SELECT * FROM (SELECT lang FROM docs ORDER BY lang LIMIT 2) d",
         "SELECT * FROM (SELECT lang, row_number() OVER (ORDER BY lang) FROM docs) d",
-        "SELECT * FROM (SELECT lang FROM docs) t WHERE a = 1",
     ] {
-        assert_eq!(code(&core, "alice", sql), UNSUPPORTED, "{sql}");
+        assert!(query(&core, "alice", sql).is_ok(), "{sql}");
     }
-    // 実表は読まれず、文言は固定（別名・断片を含めない）。
-    let m = msg(
+    // 存在しない列（元の名前は列名リストで隠れる）は `42703`。
+    assert_eq!(
+        code(
+            &core,
+            "alice",
+            "SELECT * FROM (SELECT lang FROM docs) t WHERE a = 1"
+        ),
+        "42703"
+    );
+    // 別名が実表名と同じでも実表は読まれず、本文の結果（1 列）だけを返す。
+    let r = query(
         &core,
         "alice",
-        "SELECT * FROM (SELECT lang FROM docs) AS docs",
-    );
-    assert!(!m.contains("docs"), "{m}");
+        "SELECT * FROM (SELECT lang FROM docs WHERE lang = 'en') AS docs",
+    )
+    .expect("select");
+    assert_eq!(r.rows.len(), 1);
+    assert_eq!(r.columns.len(), 1);
 }
 
 /// `union` 等は通常の識別子であり、後続に枝が無ければ集合演算とみなさず派生表の抽出を続ける。
@@ -200,10 +211,16 @@ fn set_operator_words_as_identifiers_do_not_abort_extraction() {
     for sql in [
         "SELECT lang AS union FROM (SELECT lang FROM docs) t",
         "SELECT lang AS except FROM (SELECT lang FROM docs) t",
-        "SELECT * FROM (SELECT lang FROM docs) union",
     ] {
-        assert_eq!(code(&core, "alice", sql), UNSUPPORTED, "{sql}");
+        assert!(query(&core, "alice", sql).is_ok(), "{sql}");
     }
+    // 別名の位置の `union` は外側の構文検証が拒否する（実測。PostgreSQL も構文エラー）。
+    assert!(query(
+        &core,
+        "alice",
+        "SELECT * FROM (SELECT lang FROM docs) union"
+    )
+    .is_err());
     assert_eq!(
         code(
             &core,
@@ -290,14 +307,13 @@ fn derived_table_in_join_positions() {
 #[test]
 fn derived_table_with_cte_and_data_modifying_cte() {
     let (core, _g) = open_seeded();
-    assert_eq!(
-        code(
-            &core,
-            "alice",
-            "WITH c AS (SELECT lang FROM docs) SELECT * FROM (SELECT * FROM c) d"
-        ),
-        UNSUPPORTED
-    );
+    let r = query(
+        &core,
+        "alice",
+        "WITH c AS (SELECT lang FROM docs) SELECT * FROM (SELECT * FROM c) d",
+    )
+    .expect("with + derived");
+    assert_eq!(r.rows.len(), 6);
     assert_eq!(
         code(
             &core,
@@ -346,9 +362,9 @@ fn non_derived_forms_are_unchanged() {
 fn derived_table_errors_do_not_depend_on_tenant() {
     let (core, _g) = open_seeded();
     for sql in [
-        "SELECT * FROM (SELECT lang FROM docs) t",
         "SELECT * FROM (SELECT lang FROM docs) t(a, b)",
         "SELECT * FROM (SELECT lang FROM nope) t",
+        "SELECT * FROM (SELECT lang FROM docs) a, (SELECT lang FROM docs) b",
     ] {
         let a = (code(&core, "alice", sql), msg(&core, "alice", sql));
         for tenant in ["bob", "carol"] {

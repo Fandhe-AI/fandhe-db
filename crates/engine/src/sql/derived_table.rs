@@ -13,17 +13,21 @@
 //! 外側の文の構文検証は本 Issue では行わず、#1866 が置換後のトークン列で行う。本文の解析・検証は
 //! CTE 本文と同じ部品（`parse_cte_select_body`・`validate_cte_definition_at`）を共有する。
 //!
-//! 検証をすべて通過した文は [`execution_unsupported`] の固定文言 `0A000` で止める（単一ゲート）。
-//! 派生表の別名を実表名として走査へ流す経路は存在しない。
+//! 検証を通過した「FROM 直後の単一の派生表」（#1866）は、合成 CTE 1 件として既存の単一表 `WITH`
+//! 主クエリ経路でインライン展開または具体化して実行する（第 3 の実行器を作らない）。JOIN／カンマ区切り・
+//! 複数件は [`execution_unsupported`] の固定文言 `0A000` で止める（#1867 の担当）。外側へは
+//! 別名だけを残し、派生表の別名を実表名として走査へ流す経路は存在しない（合成名は `?` を含む）。
 //!
 //! RLS-10 (b) の不変条件: 本モジュールの型はテナント・`PolicyContext` を持たない。解決時の
 //! `42P01`／`42P10` 等はカタログの構造だけで決まり、行やテナントに依存しない。
 
 use crate::nesting_limits::NestingLimits;
+use crate::sql::allowlist::Statement;
 use crate::sql::allowlist::{
-    derived_output_names, is_set_operator_ident, parse_cte_select_body, parse_derived_alias_head,
-    parse_with_clause_and_main, set_operator_is_followed_by_branch, split_parenthesized,
-    validate_cte_definition_at, validate_cte_definitions, SqlSurfaceError, TableLookup,
+    derived_output_names, is_set_operator_ident, looks_like_join, parse_cte_select_body,
+    parse_derived_alias_head, parse_with_clause_and_main, set_operator_is_followed_by_branch,
+    single_relation_main_over_ctes, split_parenthesized, validate_cte_definition_at,
+    validate_cte_definitions, SqlSurfaceError, TableLookup,
 };
 use crate::sql::cte::{CteDef, CteMaterialization};
 use crate::sql::lexer::{Keyword, Token};
@@ -80,8 +84,8 @@ struct RawDerived {
 /// 抽出結果（派生表の並びと、派生表をプレースホルダへ置き換えた外側のトークン列）。
 type Extracted = (Vec<RawDerived>, Vec<Token>);
 
-/// 派生表を含む文の実行が未対応であることを示す固定エラー（`0A000`）。入力の断片・別名を含めない。
-/// #1866 はこの関数の呼び出しを実行経路への接続へ置き換える。
+/// 実行対象外の派生表（JOIN／カンマ区切りの入力・複数件。#1867 の担当）を示す固定エラー（`0A000`）。
+/// 入力の断片・別名を含めない。
 pub(crate) fn execution_unsupported() -> SqlSurfaceError {
     SqlSurfaceError::feature_not_supported("derived tables in FROM are not supported yet")
 }
@@ -191,6 +195,11 @@ fn extract(tokens: &[Token], max_tables: usize) -> Result<Option<Extracted>, Sql
                             "{PLACEHOLDER_PREFIX}{}",
                             found.len().saturating_add(1)
                         )));
+                        // 別名は暗黙別名の形で外側へ残す（`t.col` の修飾参照を外側の既存の
+                        // 修飾列正規化が解決できるようにする。列名リストは合成 CTE が適用する）。
+                        if let Some(a) = &alias {
+                            outer.push(Token::Ident(a.clone()));
+                        }
                         found.push(RawDerived {
                             body: inner.to_vec(),
                             alias,
@@ -277,23 +286,58 @@ fn resolve(
     })
 }
 
-/// セッション最上位の入口で、FROM に派生表を持つ `SELECT` 文を検出して検証し、固定 `0A000` で止める。
-/// 派生表を含まない文は `Ok(())`（呼び出し元は従来の検証へ進む）。派生表を含む文は必ず `Err`
-/// （構文 `42601` → 解決 `42P01`／`42703`／`42P10`／`42702` 等 → 実行未対応の `0A000` の順）。
+/// 派生表を含むか（`$n` 束縛の fail-closed ガード用。`sql::params` から呼ばれる。第 2 の検出器を
+/// 作らず [`extract`] を共有する。抽出が拒否した形も「含む」とみなす）。
+pub(crate) fn contains_derived_table(tokens: &[Token]) -> bool {
+    !matches!(
+        extract(tokens, crate::sql::relation::MAX_TABLE_REFS),
+        Ok(None)
+    )
+}
+
+/// 解決済みの派生表を実行形へ組む（#1866）。実行するのは「派生表 1 件・`FROM` 直後・外側が JOIN／
+/// カンマ区切りでない」文だけで、それ以外（#1867 の担当）は従来どおり固定 `0A000`。派生表は名前を
+/// 利用者が書けない合成 CTE 1 件として、既存の単一表 `WITH` 主クエリ経路
+/// （`allowlist::single_relation_main_over_ctes`。インライン展開／具体化と RLS を CTE と共有）へ流す。
+/// 合成 CTE は利用者の CTE の後ろへ付けるため、本文からは先行する CTE だけが見える。
+fn build_statement(
+    clause: DerivedFromClause,
+    ctes: &[CteDef],
+    lookup: &impl TableLookup,
+    limits: NestingLimits,
+) -> Result<Statement, SqlSurfaceError> {
+    let DerivedFromClause {
+        mut tables,
+        outer_tokens,
+    } = clause;
+    let (Some(table), true) = (tables.pop(), tables.is_empty()) else {
+        return Err(execution_unsupported());
+    };
+    if table.position != DerivedPosition::From || looks_like_join(&outer_tokens) {
+        return Err(execution_unsupported());
+    }
+    let mut scope: Vec<CteDef> = ctes.to_vec();
+    scope.push(table.def);
+    single_relation_main_over_ctes(&scope, &outer_tokens, lookup, limits)
+}
+
+/// セッション最上位の入口で、FROM に派生表を持つ `SELECT` 文を検出して検証し、実行形へ組む。
+/// 派生表を含まない文は `Ok(None)`（呼び出し元は従来の検証へ進む）。派生表を含む文は
+/// 構文 `42601` → 解決 `42P01`／`42703`／`42P10`／`42702` 等 → 実行対象外の `0A000` の順に判定する。
 /// 先頭が `SELECT` でない文は対象外（`WITH` は [`gate_with`]）。
 pub(crate) fn gate(
     tokens: &[Token],
     lookup: &impl TableLookup,
     limits: NestingLimits,
-) -> Result<(), SqlSurfaceError> {
+) -> Result<Option<Statement>, SqlSurfaceError> {
     if !matches!(tokens.first(), Some(Token::Keyword(Keyword::Select))) {
-        return Ok(());
+        return Ok(None);
     }
     let Some((raw, outer)) = extract(tokens, crate::sql::relation::MAX_TABLE_REFS)? else {
-        return Ok(());
+        return Ok(None);
     };
-    resolve(raw, outer, &[], lookup, limits)?;
-    Err(execution_unsupported())
+    let clause = resolve(raw, outer, &[], lookup, limits)?;
+    build_statement(clause, &[], lookup, limits).map(Some)
 }
 
 /// [`gate`] の非再帰 `WITH` 版。呼び出し元は `allowlist::validate_with_statement`（セッション最上位の
@@ -305,17 +349,17 @@ pub(crate) fn gate_with(
     tokens: &[Token],
     lookup: &impl TableLookup,
     limits: NestingLimits,
-) -> Result<(), SqlSurfaceError> {
+) -> Result<Option<Statement>, SqlSurfaceError> {
     let (ctes, main_tokens) = parse_with_clause_and_main(tokens, limits)?;
     let Some((raw, outer)) = extract(&main_tokens, crate::sql::relation::MAX_TABLE_REFS)? else {
-        return Ok(());
+        return Ok(None);
     };
     if ctes.iter().any(|d| d.is_data_modifying()) {
         return Err(crate::sql::cte::data_modifying_cte_unsupported());
     }
     validate_cte_definitions(&ctes, lookup, limits)?;
-    resolve(raw, outer, &ctes, lookup, limits)?;
-    Err(execution_unsupported())
+    let clause = resolve(raw, outer, &ctes, lookup, limits)?;
+    build_statement(clause, &ctes, lookup, limits).map(Some)
 }
 
 #[cfg(test)]
@@ -348,9 +392,12 @@ mod tests {
         assert!(outer
             .iter()
             .any(|t| matches!(t, Token::Ident(n) if n.starts_with(PLACEHOLDER_PREFIX))));
-        assert!(!outer
+        // 別名は暗黙別名の形でプレースホルダの直後に残る。
+        let pos = outer
             .iter()
-            .any(|t| matches!(t, Token::Ident(n) if n == "x")));
+            .position(|t| matches!(t, Token::Ident(n) if n.starts_with(PLACEHOLDER_PREFIX)))
+            .expect("placeholder");
+        assert!(matches!(outer.get(pos + 1), Some(Token::Ident(n)) if n == "x"));
     }
 
     #[test]
