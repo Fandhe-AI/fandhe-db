@@ -16,6 +16,12 @@
 //!    再帰項を再実行し、作業表が空になったら終了する。出力順は生成順（アンカー行 → 反復 1 →
 //!    反復 2 …）で固定する（`sort_unstable*` は使わない）。
 //!
+//! 重複除去版 `UNION`（#1872）: `cte.union_all` が偽のとき、アンカー行・各反復の再帰項の出力から
+//! 「既に結果に残った行」「同じ反復で先に出た行」と同値の行を捨てる（循環グラフで作業表が空になり
+//! 止まる。PostgreSQL 17 の RecursiveUnion と同じ意味）。同値判定は集合演算 `UNION` と同じ行キー
+//! （`sql::set_op::row_key`）を再利用し、第 2 の比較器は作らない（[`DedupSet`]）。捨てた行は
+//! 行数上限に数えない。キーは確保前に共有バイト予算へ計上する。
+//!
 //! 4. `SEARCH DEPTH／BREADTH FIRST` 句（#2213）: 反復中に、各行の親（再帰行を生んだ作業表の行）の順序列から
 //!    自分の順序列（深さ優先は経路の `record[]`、幅優先は `(深さ, BY 列...)` の `record`）を作り、結果列の
 //!    末尾へ足す（[`SearchPlan`]）。順序列は作業表のスキーマには含めない。経路は深さに比例して増えるため、
@@ -32,7 +38,7 @@
 //! （`EngineCore::with_recursive_cte_limits`。Issue #1871・SQL-35 (3)・SQL-46）で、
 //! [`RecursiveLimits::from_settings`] が呼び出し段の `--max-result-rows` と合成する。
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 
 use crate::catalog::{ColumnType, RowIdentity, TableSchema};
 use crate::policy::PolicyContext;
@@ -174,6 +180,36 @@ impl RowBudget {
         Ok(())
     }
 
+    /// 行 1 件ぶん（構造体＋ペイロード）のバイト数。
+    fn row_bytes(cells: &[Cell]) -> usize {
+        let payload = cells
+            .iter()
+            .fold(0usize, |acc, c| acc.saturating_add(cell_payload_bytes(c)));
+        Self::row_overhead(cells.len()).saturating_add(payload)
+    }
+
+    /// 一時行（`Scratch` で計上済み）を結果へ残る行（`Retained`）へ移す。行数上限を判定してから
+    /// 計上を付け替える（合計バイトは変わらず、二重計上を作らない）。超過は `54000`。
+    fn promote(&mut self, cells: &[Cell]) -> Result<(), SqlSurfaceError> {
+        let rows = self
+            .rows
+            .checked_add(1)
+            .filter(|n| *n <= self.limits.max_rows)
+            .ok_or_else(|| {
+                SqlSurfaceError::payload_too_large("recursive query exceeds the row limit")
+            })?;
+        let bytes = Self::row_bytes(cells);
+        self.scratch = self.scratch.saturating_sub(bytes);
+        self.retained = self.retained.saturating_add(bytes);
+        self.rows = rows;
+        Ok(())
+    }
+
+    /// 重複として捨てる一時行の計上を解放する（結果にも次の作業表にも入らない）。
+    fn discard_scratch(&mut self, cells: &[Cell]) {
+        self.scratch = self.scratch.saturating_sub(Self::row_bytes(cells));
+    }
+
     /// 行を 1 件作る前に、行数上限（結果へ残る行のみ）と構造体ぶんのバイトを計上する。
     fn reserve_row(&mut self, ncols: usize, charge: Charge) -> Result<(), SqlSurfaceError> {
         if charge == Charge::Retained {
@@ -213,6 +249,39 @@ impl RowBudget {
         self.reserve(bytes, charge)?;
         self.rows = rows;
         Ok(())
+    }
+}
+
+/// 重複除去版 `UNION` の既出行集合。キーは集合演算 `UNION` と同じ `set_op::row_key`（NULL 同士は
+/// 等しい・`-0.0`＝`+0.0`・numeric は scale 無視）。キーは評価中ずっと残るため、確保の前に
+/// 共有バイト予算へ（`Charge::Fixed`＝行数に数えない）計上する。重複と分かったキーの計上は残す
+/// （上限が厳しくなる側）。
+struct DedupSet {
+    seen: HashSet<Vec<u8>>,
+}
+
+/// 1 キーあたりの集合の管理領域の見積もり（`sql::distinct` の定数と同じ値）。
+const DEDUP_ENTRY_OVERHEAD_BYTES: usize = 32;
+
+impl DedupSet {
+    fn new() -> Self {
+        Self {
+            seen: HashSet::new(),
+        }
+    }
+
+    /// 行が未出なら記録して `true`、既出なら `false`（呼び出し側が捨てる）。
+    fn insert(&mut self, row: &ResultRow, budget: &mut RowBudget) -> Result<bool, SqlSurfaceError> {
+        let len = super::set_op::row_key_len(row)?;
+        budget.reserve(
+            len.saturating_add(DEDUP_ENTRY_OVERHEAD_BYTES),
+            Charge::Fixed,
+        )?;
+        let key = super::set_op::row_key(row)?;
+        self.seen.try_reserve(1).map_err(|_| {
+            SqlSurfaceError::payload_too_large("recursive query exceeds the row limit")
+        })?;
+        Ok(self.seen.insert(key))
     }
 }
 
@@ -357,6 +426,7 @@ impl ScanTerm {
         budget: &mut RowBudget,
         charge: Charge,
         mut parents: Option<&mut Vec<usize>>,
+        mut dedup: Option<&mut DedupSet>,
     ) -> Result<Vec<ResultRow>, SqlSurfaceError> {
         let referenced = vec![true; types.len()];
         let mut where_scratch: Vec<StackValue> = Vec::new();
@@ -387,6 +457,20 @@ impl ScanTerm {
                 )?))
             })?;
             if let Some(cells) = cells {
+                let row = ResultRow {
+                    id: 0,
+                    score: 0.0,
+                    cells,
+                };
+                // 重複除去版: 候補行（`Scratch` で計上済み）が既出なら計上を解放して捨て、未出なら
+                // 結果へ残る行へ移す（重複は行数上限に数えない）。
+                if let Some(d) = dedup.as_deref_mut() {
+                    if !d.insert(&row, budget)? {
+                        budget.discard_scratch(&row.cells);
+                        continue;
+                    }
+                    budget.promote(&row.cells)?;
+                }
                 out.try_reserve(1).map_err(|_| {
                     SqlSurfaceError::payload_too_large("recursive query exceeds the row limit")
                 })?;
@@ -396,11 +480,7 @@ impl ScanTerm {
                     })?;
                     parents.push(n);
                 }
-                out.push(ResultRow {
-                    id: 0,
-                    score: 0.0,
-                    cells,
-                });
+                out.push(row);
             }
         }
         Ok(out)
@@ -683,6 +763,29 @@ fn static_integer_type(m: &ColumnMeta) -> Option<&ColumnType> {
     }
 }
 
+/// 重複除去版 `UNION` の列に、PostgreSQL が等値・ハッシュを持たない型（`JSON` と `JSON` の配列）が
+/// 無いことを計画時に検査する（固定 `0A000`。PostgreSQL では recursive UNION を実装できない型）。
+/// 行キーはこれらを文字列として比べてしまうため、黙って同値判定せず拒否する（fail-closed）。
+fn check_union_equality_types(columns: &[ColumnMeta]) -> Result<(), SqlSurfaceError> {
+    for m in columns {
+        let ty = match m {
+            ColumnMeta::Scalar { ty, .. } | ColumnMeta::Computed { ty: Some(ty), .. } => ty,
+            _ => continue,
+        };
+        let no_equality = match ty {
+            ColumnType::Json => true,
+            ColumnType::Array(a) => matches!(a.elem(), crate::catalog::ArrayElemType::Json),
+            _ => false,
+        };
+        if no_equality {
+            return Err(unsupported_term(
+                "could not implement recursive UNION for this column type",
+            ));
+        }
+    }
+    Ok(())
+}
+
 /// 作業表へ載せる列の型が、実行時にセルを述語・式へ渡す変換（`join::values::cell_scalar`）で
 /// 扱える型だけであることを検査する。未対応型（`TIME`・`TIMESTAMPTZ`・`INTERVAL`・`JSONB` 等）は
 /// 実行時の `Internal` ではなく、計画時（describe／execute 共通）に固定 `0A000` で拒否する。
@@ -713,8 +816,14 @@ fn compose_columns(
     anchor_columns: &[ColumnMeta],
     rec_columns: &[ColumnMeta],
 ) -> Result<Vec<ColumnMeta>, SqlSurfaceError> {
+    // 重複除去版（`UNION`）は集合演算 `UNION` と同じ検査（`VECTOR` 列は `22000` 等）を通す。
+    let op = if cte.union_all {
+        SetOperator::UnionAll
+    } else {
+        SetOperator::Union
+    };
     super::set_op::check_branch_type_compatibility(
-        SetOperator::UnionAll,
+        op,
         anchor_columns,
         rec_columns,
         super::set_op::columns_have_vector(anchor_columns),
@@ -881,6 +990,10 @@ fn with_prepared<T>(
     let rec_work: Vec<ColumnMeta> = rec_columns.iter().map(work_column).collect();
     let mut columns = compose_columns(cte, anchor_columns, &work_anchor, &rec_work)?;
     check_work_types(&rec_work)?;
+    if !cte.union_all {
+        check_union_equality_types(&work_anchor)?;
+        check_union_equality_types(&rec_work)?;
+    }
     // 順序列は公開列（列名リスト適用後）の末尾へ足す。作業表のスキーマ・再帰項の束縛・列整合には
     // 含めない（再帰項からは見えない）。
     let search = match &cte.search {
@@ -931,6 +1044,25 @@ pub(crate) fn execute(
     } = anchor;
     with_prepared(cte, &anchor_columns, schemas, udfs, join_limits, |p| {
         let mut budget = RowBudget::new(limits);
+        let mut dedup: Option<DedupSet> = if cte.union_all {
+            None
+        } else {
+            Some(DedupSet::new())
+        };
+        // 重複除去版はアンカーの中の重複も除く（捨てる行は行数に数えない。入力順で最初の行を残す）。
+        let mut anchor_rows = anchor_rows;
+        if let Some(d) = dedup.as_mut() {
+            let mut kept: Vec<ResultRow> = Vec::new();
+            kept.try_reserve(anchor_rows.len()).map_err(|_| {
+                SqlSurfaceError::payload_too_large("recursive query exceeds the row limit")
+            })?;
+            for row in anchor_rows {
+                if d.insert(&row, &mut budget)? {
+                    kept.push(row);
+                }
+            }
+            anchor_rows = kept;
+        }
         for row in &anchor_rows {
             budget.admit(&row.cells, Charge::Retained)?;
         }
@@ -992,13 +1124,24 @@ pub(crate) fn execute(
                 .ok_or_else(|| internal("working table range out of bounds"))?;
             let mut parents: Vec<usize> = Vec::new();
             let new_rows = match &p.step {
-                Step::Scan(term) => term.eval_over_rows(
-                    &p.work_types,
-                    working,
-                    &mut budget,
-                    Charge::Retained,
-                    search.map(|_| &mut parents),
-                )?,
+                Step::Scan(term) => {
+                    // 重複除去版は候補行を `Scratch` で作り、未出の行だけを結果へ移す。
+                    let charge = if dedup.is_some() {
+                        Charge::Scratch
+                    } else {
+                        Charge::Retained
+                    };
+                    let rows = term.eval_over_rows(
+                        &p.work_types,
+                        working,
+                        &mut budget,
+                        charge,
+                        search.map(|_| &mut parents),
+                        dedup.as_mut(),
+                    )?;
+                    budget.clear_scratch();
+                    rows
+                }
                 Step::Join {
                     prepared,
                     cte_side,
@@ -1013,6 +1156,7 @@ pub(crate) fn execute(
                         &mut budget,
                         Charge::Scratch,
                         search.map(|_| &mut side_parents),
+                        None,
                     )?;
                     let slot = sides
                         .get_mut(*cte_side)
@@ -1037,10 +1181,26 @@ pub(crate) fn execute(
                             .ok_or_else(|| internal("recursive parent mapping out of range"))?;
                     }
                     budget.clear_scratch();
-                    for row in &joined.rows {
+                    let mut joined_rows = joined.rows;
+                    if let Some(d) = dedup.as_mut() {
+                        // `SEARCH` との併用は計画段で拒否済みのため `parents` は空。
+                        let mut kept: Vec<ResultRow> = Vec::new();
+                        kept.try_reserve(joined_rows.len()).map_err(|_| {
+                            SqlSurfaceError::payload_too_large(
+                                "recursive query exceeds the row limit",
+                            )
+                        })?;
+                        for row in joined_rows {
+                            if d.insert(&row, &mut budget)? {
+                                kept.push(row);
+                            }
+                        }
+                        joined_rows = kept;
+                    }
+                    for row in &joined_rows {
                         budget.admit(&row.cells, Charge::Retained)?;
                     }
-                    joined.rows
+                    joined_rows
                 }
             };
             result.try_reserve(new_rows.len()).map_err(|_| {
@@ -1122,6 +1282,51 @@ mod tests {
         b.admit(&text_cells(100), Charge::Retained).unwrap();
         // 基底表側・一時行は行数上限に数えない。
         assert_eq!(b.rows, 2);
+    }
+
+    /// `promote` は一時行の計上を結果へ付け替え、合計バイトは変えず、行数上限を超える付け替えは拒否する。
+    #[test]
+    fn promote_moves_scratch_to_retained_without_double_charging() {
+        let mut b = RowBudget::new(RecursiveLimits {
+            max_iterations: 10,
+            max_rows: 1,
+            max_bytes: usize::MAX,
+        });
+        let cells = text_cells(10);
+        b.admit(&cells, Charge::Scratch).unwrap();
+        let before = b.total();
+        b.promote(&cells).unwrap();
+        assert_eq!((b.total(), b.scratch, b.rows), (before, 0, 1));
+        b.admit(&cells, Charge::Scratch).unwrap();
+        assert_eq!(b.promote(&cells).unwrap_err().wire_code(), "54000");
+        // 捨てる一時行は計上を解放する。
+        b.discard_scratch(&cells);
+        assert_eq!(b.scratch, 0);
+    }
+
+    /// 重複除去の集合: 同値の行は 2 度目に `false`、キーの計上は確保前に判定され、予算超過は `54000`。
+    #[test]
+    fn dedup_set_detects_duplicates_and_charges_keys_first() {
+        let row = |n: i64| ResultRow {
+            id: 0,
+            score: 0.0,
+            cells: vec![Cell::SignedInteger(n)],
+        };
+        let mut b = RowBudget::new(limits(usize::MAX));
+        let mut d = DedupSet::new();
+        assert!(d.insert(&row(1), &mut b).unwrap());
+        assert!(!d.insert(&row(1), &mut b).unwrap());
+        assert!(d.insert(&row(2), &mut b).unwrap());
+        // キーは行数に数えない。
+        assert_eq!(b.rows, 0);
+        assert!(b.fixed > 0);
+        let mut tight = RowBudget::new(limits(1));
+        let mut d2 = DedupSet::new();
+        assert_eq!(
+            d2.insert(&row(1), &mut tight).unwrap_err().wire_code(),
+            "54000"
+        );
+        assert!(d2.seen.is_empty());
     }
 
     /// 疑似列 `id` は作業表では `u64` 全域を運べる `id` 型（numeric）へ写る（BIGINT へは写さない）。

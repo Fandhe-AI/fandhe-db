@@ -55,9 +55,10 @@ fn outcome(core: &EngineCore, tenant: &str, sql: &str) -> (String, String) {
 fn recursive_forms_have_stable_codes() {
     let (core, _guard) = open_core();
     let cases: &[(&str, &str)] = &[
-        // `UNION`（重複除去）は #1872 まで機能ゲート。
+        // `UNION`（重複除去）は #1872 で評価できる形になった。`SEARCH` との併用だけが機能ゲート。
         (
-            "WITH RECURSIVE t(n) AS (SELECT 1 UNION SELECT n + 1 FROM t WHERE n < 10) SELECT n FROM t",
+            "WITH RECURSIVE t(n) AS (SELECT 1 UNION SELECT n + 1 FROM t WHERE n < 10) \
+             SEARCH DEPTH FIRST BY n SET o SELECT n FROM t",
             "0A000",
         ),
         (
