@@ -15768,6 +15768,7 @@ fn validate_search_cycle_clause(
         Err(bad())
     }
 }
+
 /// データ変更 CTE 本文での `PARTITIONED` 句（分割実行）の固定拒否エラー（Issue #1875）。
 fn partitioned_in_cte_error() -> SqlSurfaceError {
     SqlSurfaceError::unsupported("PARTITIONED cannot be used in a data-modifying CTE")

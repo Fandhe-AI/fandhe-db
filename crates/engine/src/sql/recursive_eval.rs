@@ -915,6 +915,7 @@ impl CyclePlan {
         Ok(false)
     }
 }
+
 /// レコードのフィールド列が占めるバイト数の見積もり（確保前の予算計上用。借用セルから算出する）。
 fn fields_bytes(cells: &[&Cell]) -> usize {
     cells.iter().fold(0usize, |acc, c| {
