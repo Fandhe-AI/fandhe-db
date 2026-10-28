@@ -36,7 +36,8 @@
 | 文全体のスカラー `ORDER BY [ASC\|DESC][, ...]`（`LIMIT`／`OFFSET` 付き。Issue #1189） | 受理（ウィンドウ値は全母集合で評価し、並べ替え・`LIMIT`／`OFFSET` は出力行にのみ効く） |
 | 文全体のベクトル `ORDER BY`（検索 SELECT）・`USING PLAN`・`GROUP BY`／集計 SELECT・`SELECT DISTINCT` との併用 | `42601`（構造的に相互排他） |
 | 文全体の `ORDER BY` でのウィンドウ別名参照（実在する同名列がある場合はその列として解釈） | `42601` |
-| フレーム句（`ROWS`/`RANGE`/`GROUPS`）・名前付きウィンドウ（`WINDOW`/`OVER w`）・`FILTER (...)`・関数内 `DISTINCT`・複合式の引数・式の中へのウィンドウ呼び出し（`ROW_NUMBER() OVER () + 1` 等）・`*` とウィンドウ項目の混在 | `42601` |
+| フレーム句（`ROWS`/`RANGE`/`GROUPS`。Issue #1887） | 構文は受理し、評価前のゲートで `0A000`（形の誤りは `42601`。詳細は末尾「Issue #1887 追記」） |
+| 名前付きウィンドウ（`WINDOW`/`OVER w`）・`FILTER (...)`・関数内 `DISTINCT`・複合式の引数・式の中へのウィンドウ呼び出し（`ROW_NUMBER() OVER () + 1` 等）・`*` とウィンドウ項目の混在 | `42601` |
 | `WHERE` でのウィンドウ別名参照（実在する同名列がある場合はその列として解釈） | `42601` |
 | `CREATE VIEW` 本文への `OVER` 混入 | `42601`（`parse_view_body` が構造上受理しない） |
 
@@ -126,7 +127,7 @@
 - ウィンドウ関数の結果による文全体の `ORDER BY`（`ORDER BY rn`）。base scan への委譲方式では評価できない
 - `EXPLAIN` とウィンドウ関数の併用（`ORDER BY` の有無を問わず `42601`）
 - `GROUP BY`／集計 SELECT とウィンドウの併用
-- フレーム指定・名前付きウィンドウ・`FILTER (...)`・
+- フレーム指定の評価（構文は Issue #1887 で受理済み）・名前付きウィンドウ・`FILTER (...)`・
   関数内 `DISTINCT`・複合式の引数
 - 式の中へのウィンドウ呼び出しの埋め込み
 - 検索 SELECT（ベクトル `ORDER BY`・`HYBRID`・`USING PLAN`）へのウィンドウ追加
@@ -201,3 +202,38 @@
   抽出。挙動不変）を共有する。既定値の裸の列は宣言型を併せて運ぶ（`default_column`）。
 - **対象外**: フレーム句・名前付きウィンドウ・`FILTER`・`EXPLAIN`（兄弟 Issue）。引数内の
   `$n`（`42601`）。NUMERIC の typmod が異なる値と既定値の公告 typmod の差（#1880 の判断を維持）。
+
+## Issue #1887 追記（フレーム句の構文受理・SQL-64 (2) ポインタ）
+
+`OVER (...)` 内のフレーム句の構文を解析して AST（`WindowSelectItem.frame`）に載せる。評価は
+兄弟 Issue（#1889 ROWS・#1890 RANGE・#1891 GROUPS）の担当で、本 Issue はゲートまでを担う。
+
+- **受理する文法**（PostgreSQL 17 の frame_clause）: `<mode> (<bound> | BETWEEN <bound> AND <bound>)
+  [EXCLUDE (CURRENT ROW | GROUP | TIES | NO OTHERS)]`。`<mode>` は `ROWS`／`RANGE`／`GROUPS`、
+  `<bound>` は `UNBOUNDED PRECEDING`・`<offset> PRECEDING`・`CURRENT ROW`・`<offset> FOLLOWING`・
+  `UNBOUNDED FOLLOWING`。位置は `PARTITION BY`／`ORDER BY` の後、`)` の直前。単一境界形の終了は
+  `CURRENT ROW` に正規化する。
+- **分類と配置段**:
+
+  | SQLSTATE | 内容 | 段 |
+  | -------- | ---- | -- |
+  | `42601` | 形の誤り（境界の欠落・`UNBOUNDED`／`CURRENT` 単独・未知の語・`EXCLUDE` の不完全・余剰トークン・オフセット内の `$n`） | 構文（`parse_window_item`） |
+  | `42P20` | 境界の組み合わせ（`frame start cannot be UNBOUNDED FOLLOWING` 等 6 種）・オフセット内の入れ子ウィンドウ関数 | 構文 |
+  | `42803` | オフセット内の集計関数 | 構文（先読み） |
+  | `42P20` | `RANGE` オフセットで `ORDER BY` が 1 キーでない・`ORDER BY` の無い `GROUPS` | 束縛（`bind_window_frame`） |
+  | `42P10` | オフセット式に識別子がある | 束縛 |
+  | `42804` | `ROWS`／`GROUPS` のオフセットが整数型でない | 束縛 |
+  | `0A000` | 上記をすべて通った項目（評価前ゲート） | 束縛（`bind_window_item` 末尾） |
+
+- **ゲート**: フレーム句付きの項目は行数・テナントの有無に依存せず `0A000` で止まる。既定
+  フレームと同値の明示フレームも対象で、実行しない。解除は #1889〜#1891 がモード単位で行う。
+- **オフセットの変数検査**: 識別子が 1 つでもあれば列を解決せず一律 `42P10` とする。実在列・
+  未知列・ビューの非公開列で応答が変わらず、存在情報が漏れない（A01）。
+  既知の差異: PostgreSQL は未知列を `42703` とする。
+- **対象外**（評価 Issue へ引き継ぐ）: 負のオフセット `22013`・NULL のオフセット `22004`
+  （PostgreSQL は実行開始時の検査）、`RANGE` オフセット型と `ORDER BY` キー型の照合、順位関数・
+  `LAG`／`LEAD` にフレームが付いた場合の扱い（PostgreSQL はフレームを無視して評価する）。
+  `ROWS`／`GROUPS` のオフセットが文字列リテラル `'1'` の場合、PostgreSQL は受理するが
+  本実装は `42804`（`LAG` と同じ規則）。オフセット内の `$n` は `42601`。
+- **公開 API**: `SqlSurfaceError` に `WindowFrameOffsetHasVariables { mode }`（`42P10`）を追加した
+  （網羅 enum のため破壊的変更）。

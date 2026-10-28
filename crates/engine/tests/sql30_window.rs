@@ -1103,7 +1103,8 @@ fn scalar_order_by_with_window_rejects_unsupported_combinations() {
 }
 
 #[test]
-fn rejects_frame_clause() {
+fn frame_clause_is_accepted_syntactically_but_gated() {
+    // フレーム句の構文は受理し（SQL-64 (2)・Issue #1887）、評価前のゲート `0A000` で止まる。
     let path = unique_db_path("window-reject-frame");
     let _guard = CleanupGuard(path.clone());
     let storage = open_storage(&path);
@@ -1115,7 +1116,7 @@ fn rejects_frame_clause() {
         &core,
         &ctx,
         "SELECT id, ROW_NUMBER() OVER (ORDER BY score ROWS UNBOUNDED PRECEDING) FROM docs LIMIT 10",
-        "42601",
+        "0A000",
     );
 }
 

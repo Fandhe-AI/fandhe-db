@@ -10331,6 +10331,8 @@ fn bind_window_item(
         });
     }
 
+    bind_window_frame(item, udfs, schema, node_budget)?;
+
     let name = item
         .alias
         .clone()
@@ -10345,9 +10347,76 @@ fn bind_window_item(
         order_by,
         name,
     };
+    // フレーム句付きの項目は構文・束縛段の検査（`bind_window_frame`）を通っても評価しない。
+    // 評価は #1889（ROWS）／#1890（RANGE）／#1891（GROUPS）がモード単位でこのゲートを外す。
+    // 既定フレームと同値の明示フレームも対象で、行数・テナントの有無に依存しない（fail-closed）。
+    if item.frame.is_some() {
+        return Err(SqlSurfaceError::feature_not_supported(
+            "window frame clauses are not supported yet",
+        ));
+    }
     // `LAG`／`LEAD` は構文受理・束縛・型検査（Issue #1880）の後、評価（`sql::window`。
     // Issue #1881）へそのまま流す。運べない値型は束縛段で `0A000` に拒否済み。
     Ok(bound)
+}
+
+/// ウィンドウのフレーム句を検証する（SQL-64 (2)・Issue #1887。[`bind_window_item`] からキー解決の
+/// 後に呼ばれる。検証のみで束縛済みフレームは作らない——評価 Issue が追加する）。PostgreSQL の
+/// 解析段に合わせ、次の順で拒否する: `RANGE` オフセットの `ORDER BY` キー数（`42P20`）→
+/// `ORDER BY` の無い `GROUPS`（`42P20`）→ オフセット式の変数（`42P10`。列は解決せず一律に拒否し、
+/// ビューの非公開列か未知列かの存在情報を漏らさない）→ `ROWS`／`GROUPS` オフセットの型（`42804`）。
+fn bind_window_frame(
+    item: &crate::sql::allowlist::WindowSelectItem,
+    udfs: &crate::sql::udf_call::UdfRegistry,
+    schema: &TableSchema,
+    node_budget: &mut usize,
+) -> Result<(), SqlSurfaceError> {
+    use crate::sql::allowlist::WindowFrameMode;
+    use crate::sql::udf_call::bind_projection_expr;
+    let Some(frame) = &item.frame else {
+        return Ok(());
+    };
+    let offsets: Vec<&Expr> = [&frame.start, &frame.end]
+        .into_iter()
+        .filter_map(|b| b.offset())
+        .collect();
+    if frame.mode == WindowFrameMode::Range && !offsets.is_empty() && item.order_by.len() != 1 {
+        return Err(SqlSurfaceError::WindowingError {
+            detail: "RANGE with offset PRECEDING/FOLLOWING requires exactly one ORDER BY column",
+        });
+    }
+    if frame.mode == WindowFrameMode::Groups && item.order_by.is_empty() {
+        return Err(SqlSurfaceError::WindowingError {
+            detail: "GROUPS mode requires an ORDER BY clause",
+        });
+    }
+    for e in &offsets {
+        let mut idents = std::collections::HashSet::new();
+        collect_expr_idents(e, &mut idents);
+        if !idents.is_empty() {
+            return Err(SqlSurfaceError::WindowFrameOffsetHasVariables {
+                mode: frame.mode.as_str(),
+            });
+        }
+    }
+    // `RANGE` のオフセット型と `ORDER BY` キー型の照合は #1890 が担う（ゲートで止まる）。
+    if frame.mode != WindowFrameMode::Range {
+        for e in &offsets {
+            if matches!(e, Expr::Null) {
+                continue;
+            }
+            let (_bound, _ty, col) = bind_projection_expr(e, schema, udfs, node_budget)?;
+            if !matches!(
+                col,
+                Some(ColumnType::SmallInt | ColumnType::Integer | ColumnType::BigInt)
+            ) {
+                return Err(SqlSurfaceError::datatype_mismatch(
+                    "window frame offset must be of integer type",
+                ));
+            }
+        }
+    }
+    Ok(())
 }
 
 /// `where_predicates`（未束縛。`sql::allowlist::WherePredicate`）が参照する列名を
