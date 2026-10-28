@@ -257,6 +257,32 @@ fn column_list_applies_to_aggregate_and_window_bodies() {
     }
 }
 
+/// 別名なしの集計・窓項目の既定名（`count`・`row_number`）も列名リストの重複検査（`42702`）に
+/// 含める（参照されない CTE にも適用）。窓項目は位置どおりに数えて列数を判定する。
+#[test]
+fn column_list_checks_default_names_and_star_width() {
+    let (core, _g) = open_with(None);
+    for sql in [
+        "WITH c(count) AS (SELECT lang, count(*) FROM docs GROUP BY lang) SELECT id FROM docs LIMIT 1",
+        "WITH c(row_number) AS (SELECT id, row_number() OVER (ORDER BY id) FROM docs) \
+         SELECT id FROM docs LIMIT 1",
+        // 窓項目が先頭でも位置どおりに改名される（`lang` は 2 列目の通常列と衝突）。
+        "WITH c(lang) AS (SELECT row_number() OVER (ORDER BY id), lang FROM docs) \
+         SELECT id FROM docs LIMIT 1",
+    ] {
+        assert_eq!(code(&core, "alice", sql), "42702", "{sql}");
+    }
+    // 列数ちょうどのリストは受理し、1 つ多いリストは 42P10。
+    let body = "SELECT lang, row_number() OVER (ORDER BY id) AS rn FROM docs";
+    ok(
+        &core,
+        "alice",
+        &format!("WITH c(x0, x1) AS ({body}) SELECT id FROM docs LIMIT 1"),
+    );
+    let too_long = format!("WITH c(x0, x1, x2) AS ({body}) SELECT id FROM docs LIMIT 1");
+    assert_eq!(code(&core, "alice", &too_long), "42P10");
+}
+
 /// `[NOT] MATERIALIZED` の指定によらず結果は同じで、本文の評価は 1 回。
 #[test]
 fn materialization_modifier_does_not_change_result() {

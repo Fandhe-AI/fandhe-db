@@ -23399,7 +23399,12 @@ fn validate_aggregate_cte_definition(
         .items
         .iter()
         .map(|item| match item {
-            AggregateSelectItem::Aggregate(a) => a.alias.clone(),
+            // 別名なしの集計は既定の出力名（`count` 等）で 42702 の重複検査に含める。
+            AggregateSelectItem::Aggregate(a) => Some(
+                a.alias
+                    .clone()
+                    .unwrap_or_else(|| a.func.default_alias().to_string()),
+            ),
             AggregateSelectItem::GroupKey { column, alias } => {
                 Some(alias.clone().unwrap_or_else(|| column.clone()))
             }
@@ -23526,11 +23531,43 @@ fn validate_cte_definitions(
             .filter(|w| !w.is_empty())
         {
             super::view::check_window_columns_within_view(exposed.as_deref(), window_items)?;
-            let mut names: Vec<Option<String>> = match &select_body.projection {
+            // 通常項目の出力名。`SELECT *` は公開列（無ければ表の `*` 展開）の数だけ列を持つ
+            // （現行の構文は `*` と窓項目の併用を受理しないが、列数の数え落としで検査を弱めない
+            // ための多層防御。列名リストがあるときのみ展開する）。
+            let plain: Vec<Option<String>> = match &select_body.projection {
                 Projection::Columns(cols) => cols.iter().cloned().map(Some).collect(),
-                _ => Vec::new(),
+                Projection::Items(items) => items
+                    .iter()
+                    .map(|it| match it {
+                        SelectItem::Column(c) => Some(c.clone()),
+                        SelectItem::Expr { alias, .. } => alias.clone(),
+                    })
+                    .collect(),
+                Projection::All if !def.column_aliases.is_empty() => match exposed.as_deref() {
+                    Some(cols) => cols.iter().cloned().map(Some).collect(),
+                    None => super::view::star_columns_of_table(lookup, base_table)?
+                        .into_iter()
+                        .map(Some)
+                        .collect(),
+                },
+                Projection::All => Vec::new(),
             };
-            names.extend(window_items.iter().map(|w| w.alias.clone()));
+            // 窓項目は `position`（SELECT リスト内の位置）の枠へ置き、残りの枠を通常項目で埋める。
+            // 別名なしの窓項目は既定の出力名（`row_number` 等）で重複検査に含める。
+            let total = plain.len().saturating_add(window_items.len());
+            let mut plain_iter = plain.into_iter();
+            let names: Vec<Option<String>> = (0..total)
+                .map(
+                    |slot| match window_items.iter().find(|w| w.position == slot) {
+                        Some(w) => Some(
+                            w.alias
+                                .clone()
+                                .unwrap_or_else(|| w.func.default_alias().to_string()),
+                        ),
+                        None => plain_iter.next().flatten(),
+                    },
+                )
+                .collect();
             check_cte_column_list_static(def, &names)?;
             continue;
         }
