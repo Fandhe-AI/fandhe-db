@@ -233,7 +233,7 @@ CTE は原則として実体化しない（インライン展開。明示 `MATER
 - 観測: 本文の評価回数は結果から観測できないため、`EngineCore::materialized_cte_eval_stats`
   （`VectorCore` trait 外の固有 API。テナント ID・行数を含まない）で「記憶域に対する本文の実行回数」を
   公開する。`Derived` の導出は数えない。
-- 対象外: 派生表（FROM の部分クエリ）、
+- 対象外: 派生表（FROM の部分クエリ。構文受理と解決は #1865、実行は #1866・JOIN 入力は #1867）、
   主クエリのサブクエリからの CTE 参照、集合演算の主クエリ、`EXPLAIN` での具体化の表示、NoSQL 表層、
   JOIN 入力の非共有 CTE への述語プッシュダウン。
 
@@ -300,3 +300,28 @@ CTE 本文の集計・`GROUP BY`・`SELECT DISTINCT`・ウィンドウ関数を�
   `GROUP BY` の併用・ベクトル順位付けは `42601`。
 - 対象外: 集計 CTE の JOIN 入力、連鎖、インライン専用の文脈、式項目／`GROUPING SETS`、窓の導出層、
   `EXPLAIN` での表示、NoSQL 表層。
+
+## Issue #1865 追記: 派生表の構文受理（SQL-62 ポインタ。親 #1864）
+
+`SELECT ... FROM (SELECT ...) [[AS] 別名 [(列名, ...)]]` の構文を受理し、別名と列名リストを静的に解決する
+（`sql::derived_table`）。実行（外側の WHERE・投影・ORDER BY からの参照と RLS 適用）は #1866、JOIN 入力・
+入れ子・深さ上限・EXPLAIN は #1867 の担当で、本 Issue では検証を通過した文を単一のゲートで固定文言の
+`0A000` で止める（`derived_table::execution_unsupported`。#1866 はこの呼び出しを置き換える）。
+
+- 方式: 前置き抽出。深さ 0 の FROM 句から派生表を検出して本文を切り出し、外側のトークン列では内部名
+  （`?derived<n>`。`validate_identifier` を通らず利用者が書けない）のプレースホルダ 1 トークンへ置き換える。
+  深さを追わない既存の検出器（`GROUP BY`／`OVER` の走査）が内側を見て誤振り分けしないよう、他の判定より前に行う。
+- 発火する入口: セッション最上位の `SELECT`（`validate_sql_tokens_impl`）と非再帰 `WITH`（`validate_with_statement`）の
+  `AllowMaterialize` のみ。ビュー本文・cursor・COPY・CTAS・サブクエリ内側・`EXPLAIN`・`WITH RECURSIVE`・
+  深さ 0 に集合演算子を持つ文は従来どおり `42601`。
+- 位置: `FROM`・`JOIN`・FROM 句内のカンマの直後。`LATERAL` は固定 `0A000`。
+- 本文の解析・検証は CTE と共有する部品（`parse_cte_select_body`・`validate_cte_definition_at`）。
+  `WITH` の主クエリの派生表からは先行する CTE が見える。派生表どうしは互いに見えず、1 件ずつ独立に検証する。
+  データ変更 CTE を含む文は解決の前に固定 `0A000`（書き込みを発生させない）。
+- 列名リスト: 件数上限（`54000`）・重複（`42701`）・空（`42601`）は CTE と共通。別名なしの列名リストは `42601`。
+  出力列より長いと `42P10`（`table "<別名>" has N columns available but M columns specified`。
+  `SqlSurfaceError::DerivedTableColumnListTooLong`）、短いと残りは元の名前。改名後の重複は `42702`。
+- 判定順序: 字句 → 抽出（`42601`・LATERAL の `0A000`）→ 本文の構文（`42601`）→ 解決（`42P01`／`42703`／`22000`／
+  `42P10`／`42702`）→ ゲートの `0A000`。外側の文の構文検証は #1866。
+- 入れ子の派生表は本文パーサーが `42601`（#1867 で受理と `54000` を扱う）。同一 FROM 句の別名重複は `42601`。
+- RLS-10 (b): 型はテナント・`PolicyContext` を持たず、エラーは行・テナントに依存しない。

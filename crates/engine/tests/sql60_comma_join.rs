@@ -227,11 +227,16 @@ fn comma_join_syntax_and_table_ref_limits() {
         "SELECT * FROM a, b, LIMIT 1",
         "SELECT * FROM a, b ON a.k = b.k LIMIT 10",
         "SELECT * FROM a, b USING (k) LIMIT 10",
-        "SELECT * FROM a, (SELECT k FROM b) s LIMIT 10",
         "SELECT * FROM a, unnest(ARRAY[1]) LIMIT 10",
     ] {
         assert_rejected(&core, sql, "42601");
     }
+    // 派生表（SQL-62）は構文を受理し、実行は未対応の固定ゲート（0A000）で止まる。
+    assert_rejected(
+        &core,
+        "SELECT * FROM a, (SELECT k FROM b) s LIMIT 10",
+        "0A000",
+    );
     // カンマの後の CROSS 以外の明示 JOIN は fail-closed（0A000）。
     for sql in [
         "SELECT * FROM a, b JOIN c ON b.k = c.k LIMIT 10",
