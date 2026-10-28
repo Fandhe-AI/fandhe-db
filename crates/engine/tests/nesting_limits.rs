@@ -250,3 +250,176 @@ fn stored_view_bodies_are_revalidated_with_hard_limits() {
     ok(&core, "SELECT id FROM v LIMIT 10");
     too_large(&core, &cte_defs(2));
 }
+// ---- 相関サブクエリ・派生テーブル経路（Issue #1850。ポインタ: SQL-46・SQL-61・SQL-62）----
+
+const TAGS: &str = "tags";
+
+/// `docs` に加えて相関の内側表 `tags(doc_id)` を作成・投入した core。
+///
+/// `tags` は doc 1 に 2 行、doc 2 に 1 行を持つ（相関 EXISTS／IN／スカラーの内側表）。
+fn seeded_core_with_tags(path: &std::path::Path, limits: Option<NestingLimits>) -> EngineCore {
+    {
+        let storage = Storage::open(path).expect("open storage");
+        seed(&storage);
+        storage
+            .create_table(&TableSchema::new(
+                TAGS,
+                vec![
+                    ColumnDef::new("embedding", ColumnType::Vector(2), false),
+                    ColumnDef::new("doc_id", ColumnType::BigInt, true),
+                ],
+            ))
+            .expect("create tags");
+        for (id, doc) in [(1u64, 1i64), (2, 1), (3, 2)] {
+            engine::tenant::insert_typed_row(
+                &storage,
+                TAGS,
+                &ctx("alice"),
+                id,
+                Visibility::Public,
+                &[Value::Vector(vec![0.0, 0.0]), Value::BigInt(doc)],
+                &OperationId::parse(&format!("seed-tag-{id}")).expect("op id"),
+            )
+            .expect("insert tag");
+        }
+    }
+    open_core(path, limits)
+}
+
+/// 述語 `pred` を `n` 個 AND 連結した文。
+fn and_preds(n: usize, pred: &str) -> String {
+    let preds: Vec<&str> = (0..n).map(|_| pred).collect();
+    format!(
+        "SELECT id FROM {DOCS} WHERE {} LIMIT 100",
+        preds.join(" AND ")
+    )
+}
+
+/// 実行回数 `limit` の core で、`pred` が「`limit` 個は成功・+1 個は 54000」になることを確かめる。
+fn assert_exec_budget(name: &str, pred: &str, limit: usize) {
+    let path = unique_db_path(name);
+    let _g = CleanupGuard(path.clone());
+    let core = seeded_core_with_tags(&path, Some(NestingLimits::new(4, limit, 16, 4)));
+    let n = limit;
+    ok(&core, &and_preds(n, pred));
+    let msg = too_large(&core, &and_preds(n + 1, pred));
+    assert!(msg.contains(&format!("limit {limit}")), "{msg}");
+}
+
+#[test]
+fn execution_budget_applies_to_correlated_exists_and_in() {
+    let t = format!("FROM {TAGS} WHERE {TAGS}.doc_id = {DOCS}.id");
+    assert_exec_budget("nl-corr-exists", &format!("EXISTS (SELECT 1 {t})"), 1);
+    assert_exec_budget(
+        "nl-corr-not-exists",
+        &format!("NOT EXISTS (SELECT 1 {t})"),
+        2,
+    );
+    assert_exec_budget(
+        "nl-corr-in",
+        &format!("id IN (SELECT {TAGS}.doc_id {t})"),
+        1,
+    );
+    assert_exec_budget(
+        "nl-corr-not-in",
+        &format!("id NOT IN (SELECT {TAGS}.doc_id {t})"),
+        2,
+    );
+}
+
+#[test]
+fn execution_budget_applies_to_correlated_scalars() {
+    let path = unique_db_path("nl-corr-scalar");
+    let _g = CleanupGuard(path.clone());
+    let core = seeded_core_with_tags(&path, Some(NestingLimits::new(4, 1, 16, 4)));
+    let agg = format!("(SELECT count(*) FROM {TAGS} WHERE {TAGS}.doc_id = {DOCS}.id)");
+    let plain =
+        format!("(SELECT {TAGS}.doc_id FROM {TAGS} WHERE {TAGS}.doc_id = {DOCS}.id LIMIT 1)");
+
+    // 投影位置: 集計形・非集計形・式の中。1 件は成功し、2 件目で 54000。
+    ok(&core, &format!("SELECT id, {agg} FROM {DOCS} LIMIT 100"));
+    ok(&core, &format!("SELECT id, {plain} FROM {DOCS} LIMIT 100"));
+    ok(
+        &core,
+        &format!("SELECT id, 1 + {agg} FROM {DOCS} LIMIT 100"),
+    );
+    let msg = too_large(
+        &core,
+        &format!("SELECT id, 1 + {agg}, 2 + {agg} FROM {DOCS} LIMIT 100"),
+    );
+    assert!(msg.contains("limit 1"), "{msg}");
+    too_large(
+        &core,
+        &format!("SELECT id, {plain}, {plain} FROM {DOCS} LIMIT 100"),
+    );
+
+    // WHERE 位置。
+    ok(
+        &core,
+        &format!("SELECT id FROM {DOCS} WHERE id <= {agg} LIMIT 100"),
+    );
+    too_large(
+        &core,
+        &format!("SELECT id FROM {DOCS} WHERE id <= {agg} AND id >= {agg} LIMIT 100"),
+    );
+}
+
+#[test]
+fn subquery_depth_applies_to_correlated_exists() {
+    let path = unique_db_path("nl-corr-depth");
+    let _g = CleanupGuard(path.clone());
+    let core = seeded_core_with_tags(&path, Some(NestingLimits::new(1, 16, 16, 4)));
+    let one = format!(
+        "SELECT id FROM {DOCS} WHERE EXISTS (SELECT 1 FROM {TAGS} WHERE {TAGS}.doc_id = {DOCS}.id) \
+         LIMIT 100"
+    );
+    ok(&core, &one);
+    let two = format!(
+        "SELECT id FROM {DOCS} WHERE EXISTS (SELECT 1 FROM {TAGS} WHERE {TAGS}.doc_id = {DOCS}.id \
+         AND {TAGS}.id IN (SELECT id FROM {TAGS} LIMIT 100)) LIMIT 100"
+    );
+    let msg = too_large(&core, &two);
+    assert!(msg.contains("limit 1"), "{msg}");
+}
+
+/// 深さ `n` の派生テーブル入れ子（最内側が実表。SQL-62）。
+fn nested_derived(n: usize) -> String {
+    let mut inner = DOCS.to_string();
+    for k in (0..n).rev() {
+        inner = format!("(SELECT lang FROM {inner}) a{k}");
+    }
+    format!("SELECT * FROM {inner}")
+}
+
+#[test]
+fn derived_table_nesting_honors_lowered_depth_and_bodies_reject_subqueries() {
+    let path = unique_db_path("nl-derived");
+    let _g = CleanupGuard(path.clone());
+    let core = seeded_core_with_tags(&path, Some(NestingLimits::new(2, 2, 16, 4)));
+    // 深さ: 設定値ちょうどは成功し、+1 は 54000（メッセージに設定値）。
+    ok(&core, &nested_derived(2));
+    assert!(too_large(&core, &nested_derived(3)).contains("limit 2"));
+    // 派生テーブル本文内のサブクエリは現状受理されず、設定値を迂回する経路にもならない
+    // （fail-closed。受理されるようになった場合は設定値の適用を本テストへ追加すること）。
+    let sql = format!(
+        "SELECT t.id FROM (SELECT id, lang FROM {DOCS} WHERE lang IN \
+         (SELECT lang FROM {DOCS} LIMIT 100)) t LIMIT 100"
+    );
+    let e = run(&core, &sql).expect_err("subquery in derived body must be rejected");
+    assert!(matches!(e.wire_code(), "42601" | "0A000"), "{e}");
+}
+
+#[test]
+fn default_limits_leave_correlated_and_derived_paths_unchanged() {
+    let path = unique_db_path("nl-default-paths");
+    let _g = CleanupGuard(path.clone());
+    let core = seeded_core_with_tags(&path, None);
+    ok(
+        &core,
+        &and_preds(
+            16,
+            &format!("EXISTS (SELECT 1 FROM {TAGS} WHERE {TAGS}.doc_id = {DOCS}.id)"),
+        ),
+    );
+    ok(&core, &nested_derived(4));
+}

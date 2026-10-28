@@ -179,6 +179,7 @@ pub(crate) mod ddl_column_type;
 /// 組み立てて `bind_declarative_predicates` へ渡す（`allowlist`／`parser` の
 /// SQL テキスト経由束縛と同一の実行意味論を共有する。第 2 の評価器を作らない）。
 pub mod declarative_predicate;
+pub(crate) mod derived_table;
 pub(crate) mod describe;
 pub mod dml_from;
 #[cfg(test)]

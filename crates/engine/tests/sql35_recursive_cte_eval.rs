@@ -632,7 +632,6 @@ fn icu_collated_table_is_rejected() {
 fn feature_gates_remain() {
     let (core, _g) = open_core();
     for sql in [
-        "WITH RECURSIVE t(n) AS (SELECT 1 UNION SELECT n + 1 FROM t WHERE n < 3) SELECT n FROM t",
         "WITH RECURSIVE a AS (SELECT 1), t(n) AS (SELECT 1 UNION ALL SELECT n + 1 FROM t WHERE n < 3) \
          SELECT n FROM t",
         "WITH RECURSIVE t(n) AS (SELECT 1 UNION ALL SELECT n + 1 FROM t WHERE n < 3) \
@@ -682,7 +681,7 @@ fn recursive_reference_shadows_real_table() {
     assert_eq!(rows(&core, "alice", join_form), col(&["1", "2", "3"]));
 }
 
-/// RLS の基本ケース（網羅は #1873）: 他テナントの Private 行を経由する枝は辿られない。
+/// RLS の基本ケース（網羅は `rls10_recursive_cte_paths.rs`）: 他テナントの Private 行を経由する枝は辿られない。
 #[test]
 fn rls_hides_foreign_private_branch() {
     let (core, _g) = open_core_with(|s| {

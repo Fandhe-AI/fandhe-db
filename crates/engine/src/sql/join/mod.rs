@@ -119,6 +119,22 @@ impl JoinLimits {
         }
     }
 
+    /// 結果行数上限（`max_result_rows`）だけを差し替えた上限を返す。再帰 CTE の重複除去版が、
+    /// 重複除去の前の候補行に最終結果の行数上限を適用しないために使う（候補生成の作業量は
+    /// `max_output_rows`・`budget_cap` が引き続き制限する。結果行数は重複除去後に判定する）。
+    pub(crate) fn with_max_result_rows(&self, max_result_rows: usize) -> Self {
+        Self {
+            max_input_rows: self.max_input_rows,
+            max_output_rows: self.max_output_rows,
+            max_comparisons: self.max_comparisons,
+            budget_cap: self.budget_cap,
+            max_groups: self.max_groups,
+            max_group_by_columns: self.max_group_by_columns,
+            max_relations: self.max_relations,
+            max_result_rows,
+        }
+    }
+
     /// 起動時設定（`EngineCore` 保持）から実行上限を組み立てる。[`execute`] と、再帰 CTE の
     /// 反復評価器（`sql::recursive_eval`）が共有する写像（[`startup_limits`]）。
     pub(crate) fn from_settings(

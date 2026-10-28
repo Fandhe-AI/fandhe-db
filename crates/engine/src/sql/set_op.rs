@@ -357,7 +357,7 @@ fn numeric_key_text(d: &crate::numeric::Decimal) -> String {
 /// キー）。セルごとに「型タグ＋長さ接頭辞（`u32` BE）＋ペイロード」を連結する
 /// （SQL-29 (c) §2.3）。`VECTOR` 列は §2.2 の型検証で重複除去を伴う演算からは
 /// 排除済みのため、到達した場合は防御的に拒否する（fail-closed）。
-fn row_key(row: &ResultRow) -> Result<Vec<u8>, SqlSurfaceError> {
+pub(crate) fn row_key(row: &ResultRow) -> Result<Vec<u8>, SqlSurfaceError> {
     let mut out = Vec::new();
     for cell in &row.cells {
         match cell {
@@ -487,7 +487,7 @@ fn len_prefixed_total_len(payload_len: usize) -> Result<usize, SqlSurfaceError> 
 /// 呼ぶこと。`row_key` と同じ型タグ・長さ接頭辞規約に従う必要があるため、
 /// 両者は変更時に必ず同時に保守する（`tests::row_key_len_matches_row_key_
 /// output_length` が全 variant を横断して不一致を検出する）。
-fn row_key_len(row: &ResultRow) -> Result<usize, SqlSurfaceError> {
+pub(crate) fn row_key_len(row: &ResultRow) -> Result<usize, SqlSurfaceError> {
     let mut total: usize = 0;
     for cell in &row.cells {
         let cell_len = match cell {

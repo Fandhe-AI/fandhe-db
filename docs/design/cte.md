@@ -23,8 +23,8 @@ WITH <name> [(<列名>, ...)] AS (SELECT <* | 列名リスト> FROM <table | vie
 <主クエリ: SELECT <* | 列名リスト> FROM <name> [WHERE ...] LIMIT n>
 ```
 
-- CTE 本文は `parse_view_body` の受理範囲（`LIMIT`・`ORDER BY`・`USING PLAN`・
-  集計・式項目・UDF 呼び出し述語はいずれも `42601`）に加え、本文内の `;`
+- CTE 本文は `parse_view_body` の受理範囲（`USING PLAN`・式項目・UDF 呼び出し述語は `42601`。
+  `LIMIT`・`ORDER BY` は #1862、集計・窓は #1863 の追記節で受理）に加え、本文内の `;`
   （`Token::Punct(';')`）も明示的に拒否する。`parse_view_body` が使う
   `expect_end_of_statement` は末尾の単一 `;` を許容してしまうため、CTE の
   括弧内トークン列に対しては呼び出し前に別途検査する。
@@ -178,7 +178,7 @@ CTE は原則として実体化しない（インライン展開。明示 `MATER
   上限を超えたら黙って切り詰めず `54000`。判定は RLS 適用後の可視行だけで行い、他テナント行の
   存在は漏れない。Describe と Execute は同じ上限を使う。
 - 対象外: 同一 CTE の複数回参照時の 1 回評価・JOIN 入力・指定なし CTE の既定の具体化は #1861、
-  本文の `LIMIT`／`ORDER BY` は #1862、本文の集計・窓は #1863。`EXPLAIN` での表示は対象外。
+  本文の `LIMIT`／`ORDER BY` は #1862 で対応済み（下の「Issue #1862 追記」節）、本文の集計・窓は #1863 で対応済み（下の「Issue #1863 追記」節）。`EXPLAIN` での表示は対象外。
 
 ## Issue #1861 追記: CTE を JOIN の入力にする（SQL-62 (1)(3)(5)(6) ポインタ）
 
@@ -233,6 +233,144 @@ CTE は原則として実体化しない（インライン展開。明示 `MATER
 - 観測: 本文の評価回数は結果から観測できないため、`EngineCore::materialized_cte_eval_stats`
   （`VectorCore` trait 外の固有 API。テナント ID・行数を含まない）で「記憶域に対する本文の実行回数」を
   公開する。`Derived` の導出は数えない。
-- 対象外: 本文の `LIMIT`／`ORDER BY`（#1862）、集計・`GROUP BY`・窓（#1863）、派生表（FROM の部分クエリ）、
+- 対象外: 派生表の個別仕様（FROM の部分クエリ。構文受理と解決は #1865、実行は #1866、JOIN 入力は #1867。各追記節参照）、
   主クエリのサブクエリからの CTE 参照、集合演算の主クエリ、`EXPLAIN` での具体化の表示、NoSQL 表層、
   JOIN 入力の非共有 CTE への述語プッシュダウン。
+
+## Issue #1862 追記（SQL-62 ポインタ）
+
+CTE 本文の `ORDER BY`（スカラー列・式・序数キー）・`LIMIT`・`OFFSET`（`FETCH FIRST n ROWS ONLY` は
+`sql::fetch_clause` が `LIMIT` へ正規化）を受理する。本文に `ORDER BY`／`LIMIT`／`OFFSET` を持つ CTE を
+tail CTE と呼ぶ（`CteDef.tail`）。関連: SQL-34（暗黙上限・`54000`）・RLS-10 (b)。
+
+- 受理範囲: 本文の頭部は従来と同じ（`*`／列名投影・単一 relation・単純 `WHERE`）に tail を足したもの。解析は
+  `parse_view_body` が失敗し、深さ 0 に tail の語があるときだけ `parse_select_shape` で再解析し、`WHERE` の
+  判定表は `check_view_body_predicates` を `parse_view_body` と共有する。
+- インラインへ戻さない: インライン展開は本文の `LIMIT` を表現できず、畳み込むと黙って落ちて誤結果になる。
+  tail CTE は常に具体化経路で評価し、`cte::resolve_relation` が tail CTE のインライン解決を固定 `0A000`
+  で拒否する（1 箇所のゲート）。
+  - 単一表の主クエリ: セッション最上位 SELECT が直接参照すると、`[NOT] MATERIALIZED` によらず
+    `Statement::BufferedView`（`MaterializedCte`）で評価する（`tail_cte_statement`）。`NOT MATERIALIZED` でも
+    具体化するのは PostgreSQL との差分（結果は等しい）。外側が評価後射影形として受理できない形は、
+    インラインへ戻らずそのままのエラーを返す。
+  - JOIN の主クエリ: slot（`CteSlotSource::Scan`）の本文に tail を載せる。tail CTE が先行する非 tail CTE を
+    読む形（`Derived`）は導出層に `ORDER BY`・`LIMIT`・`OFFSET` を載せる。
+- 上限・RLS: 本文は参照者自身の `PolicyContext`・同一の `read_txn` で評価し、`LIMIT` は RLS 適用後の可視行に
+  掛かる（RLS-10 (b)）。`LIMIT` なし（`ORDER BY` のみ・`OFFSET` のみ）の本文は暗黙上限で評価し、可視行が
+  `--max-result-rows` を超えたら `54000`。本文 `ORDER BY` のキーは FROM の公開列に限定する（非公開列を
+  並べ替えの oracle にしない。参照されない CTE にも適用）。
+- JOIN の導出層（`Derived`）の制限: 本文が `SELECT *` で序数 `ORDER BY`（`ORDER BY 1`）を使う形は、親の
+  結果列が評価前に確定しないため固定 `0A000`（列名を明示した本文、または単一表の主クエリでは序数も使える）。
+  `LIMIT` なしの導出層は単一表経路と同じく `OFFSET` 適用後の件数で上限を判定する（親が他の読み手と共有されない
+  ときだけ、親の暗黙上限を `OFFSET` 適用前は hard cap まで緩め、JoinBudget で抑える）。
+- 外側に `ORDER BY` がなければ外側の順序は保証しない（PostgreSQL と同じ）。外側の `WHERE` は本文の `LIMIT`
+  の後に適用される。
+- 拒否: tail CTE を別の CTE が読む連鎖・インライン専用の文脈（ビュー本文・cursor・CTAS 等）での参照・データ
+  変更 CTE を含む文での参照は固定 `0A000`。本文のベクトル順位付け・集計・窓・式投影・サブクエリは `42601`、
+  `WITH TIES` は `0A000`。
+- 対象外: tail CTE の連鎖、インライン専用の文脈での参照、`EXPLAIN` での表示、NoSQL 表層。
+
+## Issue #1863 追記（SQL-62 ポインタ）
+
+CTE 本文の集計・`GROUP BY`・`SELECT DISTINCT`・ウィンドウ関数を受理する。関連: SQL-34（暗黙上限・
+`54000`）・RLS-10 (b)。
+
+- 受理範囲と解析: `parse_view_body` が失敗した本文を、まず集計形か判定する（先頭項目が集計関数・
+  `GROUP BY`・トップレベルの `HAVING`・`DISTINCT` 修飾子。述語は通常 SELECT の入口と共有）。集計形は
+  `parse_aggregate_shape`／`parse_distinct_shape` で解析して `CteBody::Aggregate` にする。ウィンドウ項目
+  （`) OVER (`）を持つ本文は #1862 の `parse_select_shape` 再解析に載せ、窓項目を `CteBodyTail.window_items`
+  に詰める（`ORDER BY`／`LIMIT` の語が無い窓本文も `tail` を持つ）。`WHERE` は単純形のみ
+  （`check_view_body_predicates`）。
+- インラインへ戻さない: 集計・窓は外側の `WHERE` を基底表へ合成すると意味が変わるため、tail CTE と同じく
+  常に具体化経路で評価し、インライン解決は `cte::resolve_relation` が固定 `0A000` で拒否する
+  （`CteDef::requires_materialization`）。単一表の主クエリは `forced_cte_statement` が
+  `Statement::BufferedView`（`MaterializedCte`）を組む（本文は集計なら `Statement::Aggregate`、窓なら窓項目つきの
+  `Statement::Scan`）。
+- 上限・RLS: 本文は参照者自身の `PolicyContext`・同一の `read_txn` で評価し、集計値・窓の値は可視行だけから
+  計算される（RLS-10 (b)）。`LIMIT` なしの本文は暗黙上限で、可視行（集計ならグループ数）が
+  `--max-result-rows` を超えたら `54000`。集計引数・`GROUP BY` キー・窓の `PARTITION BY`／`ORDER BY` は
+  FROM の公開列に限定する（`22000`／`42703`。参照されない CTE にも適用）。
+- 列名リスト: 集計・窓の本文は `compose` を通さず、出力列数から静的に検査する（リストが長ければ `42P10`、
+  改名後の重複は `42702`）。参照の有無によらない。
+- JOIN の入力: 窓本文は slot（`CteSlotSource::Scan`）に載せられる。集計本文は集計の実行器が JoinBudget の
+  バイト予算（確保前の計上）を受け取れないため固定 `0A000`。先行 CTE を読む窓本文（導出層）も `0A000`。
+- 拒否: 集計・窓 CTE を別の CTE が読む連鎖・インライン専用の文脈・データ変更 CTE を含む文での参照・
+  `WITH TIES` は `0A000`。式項目・`GROUPING SETS`／`ROLLUP`／`CUBE`・式の `GROUP BY` キー・`HAVING` 内の
+  集計呼び出し（`WITH` の主クエリ・ビュー本体と同じ制限。集計値の絞り込みは外側の `WHERE` で行う）・窓と
+  `GROUP BY` の併用・ベクトル順位付けは `42601`。
+- 対象外: 集計 CTE の JOIN 入力、連鎖、インライン専用の文脈、式項目／`GROUPING SETS`、窓の導出層、
+  `EXPLAIN` での表示、NoSQL 表層。
+
+## Issue #1865 追記: 派生表の構文受理（SQL-62 ポインタ。親 #1864）
+
+`SELECT ... FROM (SELECT ...) [[AS] 別名 [(列名, ...)]]` の構文を受理し、別名と列名リストを静的に解決する
+（`sql::derived_table`）。実行（外側の WHERE・投影・ORDER BY からの参照と RLS 適用）は #1866、JOIN 入力・
+入れ子・深さ上限・EXPLAIN は #1867 の担当で、本 Issue では検証を通過した文を単一のゲートで固定文言の
+`0A000` で止める（`derived_table::execution_unsupported`。#1866 はこの呼び出しを置き換える）。
+
+- 方式: 前置き抽出。深さ 0 の FROM 句から派生表を検出して本文を切り出し、外側のトークン列では内部名
+  （`?derived<n>`。`validate_identifier` を通らず利用者が書けない）のプレースホルダ 1 トークンへ置き換える。
+  深さを追わない既存の検出器（`GROUP BY`／`OVER` の走査）が内側を見て誤振り分けしないよう、他の判定より前に行う。
+- 発火する入口: セッション最上位の `SELECT`（`validate_sql_tokens_impl`）と非再帰 `WITH`（`validate_with_statement`）の
+  `AllowMaterialize` のみ。ビュー本文・cursor・COPY・CTAS・サブクエリ内側・`EXPLAIN`・`WITH RECURSIVE`・
+  深さ 0 に集合演算子を持つ文は従来どおり `42601`。
+- 位置: `FROM`・`JOIN`・FROM 句内のカンマの直後。`LATERAL` は固定 `0A000`。
+- 本文の解析・検証は CTE と共有する部品（`parse_cte_select_body`・`validate_cte_definition_at`）。
+  `WITH` の主クエリの派生表からは先行する CTE が見える。派生表どうしは互いに見えず、1 件ずつ独立に検証する。
+  データ変更 CTE を含む文は解決の前に固定 `0A000`（書き込みを発生させない）。
+- 列名リスト: 件数上限（`54000`）・重複（`42701`）・空（`42601`）は CTE と共通。別名なしの列名リストは `42601`。
+  出力列より長いと `42P10`（`table "<別名>" has N columns available but M columns specified`。
+  `SqlSurfaceError::DerivedTableColumnListTooLong`）、短いと残りは元の名前。改名後の重複は `42702`。
+- 判定順序: 字句 → 抽出（`42601`・LATERAL の `0A000`）→ 本文の構文（`42601`）→ 解決（`42P01`／`42703`／`22000`／
+  `42P10`／`42702`）→ ゲートの `0A000`。外側の文の構文検証は #1866。
+- 入れ子の派生表は本 Issue 時点では本文パーサーが `42601`（#1867 で受理と `54000` を扱った。下記追記節）。同一 FROM 句の別名重複は `42601`。
+- RLS-10 (b): 型はテナント・`PolicyContext` を持たず、エラーは行・テナントに依存しない。
+
+## Issue #1866 追記: 派生表の実行（SQL-62 ポインタ。親 #1864）
+
+先行 Issue #1865 の固定 `0A000` のゲートを実行経路へ接続した。`SELECT ... FROM (SELECT ...) [[AS] 別名 [(列名, ...)]]` の
+うち **FROM 直後の派生表 1 件で、外側が JOIN／カンマ区切りでない文**を実行する。それ以外（JOIN／カンマ位置・
+2 件以上）は従来どおり固定 `0A000`（#1867 の担当）。入れ子・深さ上限・`EXPLAIN`・`LATERAL` も本 Issue の対象外。
+
+- 方式: 派生表を「名前を利用者が書けない合成 CTE 1 件（`?derived1`）」として扱い、単一表 `WITH` 主クエリと
+  同じ部品（`allowlist::single_relation_main_over_ctes`）へ流す。本文が単純形ならインライン展開、
+  `ORDER BY`／`LIMIT`／`OFFSET`・集計・窓を含むなら具体化（`BufferedView`・`MaterializedCte`。
+  `LIMIT` なしは `--max-result-rows` 超過で `54000`）。第 3 の実行器は作らない。
+- 外側のトークン列には、プレースホルダの直後に別名を暗黙別名の形で残す（`t.col` の修飾参照を既存の
+  修飾列正規化が解決する）。列名リストは合成 CTE の `column_aliases` が適用する。別名なしの派生表は
+  非修飾参照のみ可（修飾参照は `42P01`）。別名が実表・CTE 名と同じでも実表は読まれない。
+- スコープ: `WITH` では利用者の CTE の後ろへ合成 CTE を付けるため、本文から先行する CTE が見え、
+  利用者の CTE からは派生表が見えない。データ変更 CTE との併用は解決の前に固定 `0A000`（変更なし）。
+- `$n`: 内側の述語が外側の前へ合成され `validate_param_positions` の位置判定とずれうるため、派生表を含む文の
+  `$n` は `42601` で一律拒否（`derived_table::contains_derived_table`。`WITH`・JOIN と同じ fail-closed）。
+- RLS-10 (b): 内側のスキャンは参照したセッション自身の `PolicyContext`・同一 `read_txn` で評価され、
+  具体化・集計・上限判定は RLS 適用後の可視行だけに掛かる。型・合成 CTE はテナント情報を持たない。
+- 既知の差分: 一部のエラー文言は WITH 前提（`WITH does not support ...`）のまま派生表の文にも出る
+  （SQLSTATE は正しい）。外側の `WHERE x IN (SELECT ...)` は CTE の主クエリと同じく `42601`。
+
+## Issue #1867 追記: 派生表と JOIN の組み合わせ・深さ上限（SQL-62 ポインタ。親 #1864）
+
+派生表を JOIN／カンマ区切りの入力にでき、本文に派生表を入れ子にできる。第 3 の実行器は作らず、#1866 と同じく
+派生表は名前を利用者が書けない合成 CTE（`?derived<番号>`）として扱う。
+
+- 振り分け（`derived_table::build_statement`）: 派生表 1 件・`FROM` 直後・外側が JOIN でない文は従来の単一表
+  経路。それ以外（派生表と実表・派生表どうしの JOIN、カンマ区切り、2 件以上）は `WITH`＋JOIN 主クエリ経路
+  （Issue #1861 の `allowlist::validate_with_join_main`）へ、利用者の CTE ＋合成 CTE をスコープとして流す。
+  slot の評価・RLS・`JoinBudget`・`--max-result-rows` はこの経路の契約をそのまま引き継ぐ。
+- JOIN パーサー（`parse_join_relation`）は合成名（`derived_table::is_derived_placeholder`）だけをカタログ検証の
+  対象外にする。字句解析器は `?` を含む識別子を作らず引用形も受理しないため、利用者が書く経路はない（テストで固定）。
+- 別名なしの派生表は、複数リレーションの FROM では固定 `0A000`（公開名が内部名になるため）。単一 FROM では
+  従来どおり受理する。PG 17 は JOIN 入力でも受理するため既知の差分。
+- 入れ子: 本文の FROM の派生表を再帰的に切り出し、内側の合成 CTE を外側より前に積む。プレースホルダの番号は
+  文全体で一意。本文側では別名を残さないため、本文内で内側の別名による修飾参照（`x.col`）は `42601`
+  （CTE 本文は修飾列の正規化を持たない。既知の制限）。
+- 深さ上限: 最上位の派生表を深さ 1 とし、運用者設定のサブクエリ深さ上限（`NestingLimits::max_subquery_depth`。
+  既定・ハード上限は `MAX_SUBQUERY_DEPTH` = 4）を超えたら `54000`。判定は本文の解析より前で、内側の構文エラー
+  （`42601`）に先行する。派生表の総数は `relation::MAX_TABLE_REFS`、利用者 CTE を含む定義数は
+  `max_cte_definitions` で打ち切り、いずれも `54000`。深さ 4 の入れ子は既定の CTE 連鎖深さ上限でも成功する。
+- 引き継ぐ制限（固定文言の `0A000`。文言は CTE 前提のまま）: 集計本文の派生表を JOIN 入力にすること、
+  非バイト列順の照合を持つ表を読む本文、層を導出できない述語を持つ先行 CTE 読み。入れ子の内側が
+  `ORDER BY`／`LIMIT`／集計・窓を持つ場合も、外側の合成 CTE からの参照は `0A000`。
+- `EXPLAIN`: 先頭が `SELECT` でないため派生表のゲートに入らず、CTE と同じく `42601`（JOIN・入れ子とも対象外）。
+- RLS-10 (b): 派生表は参照したセッションの `PolicyContext`・同一 `read_txn` の slot だけで評価され、別名が実表名と
+  同じでも実表は読まれない。エラーは行・テナントに依存せず、内部名（`?derived`）は文言・結果列名に出ない。
