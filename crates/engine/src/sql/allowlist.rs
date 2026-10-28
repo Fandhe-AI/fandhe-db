@@ -22937,7 +22937,9 @@ fn derived_cte_layer(ctes: &[super::cte::CteDef], idx: usize) -> Option<(usize, 
     let (order_by, order_keys, limit, limit_explicit, offset) = match &ctes.get(idx)?.tail {
         Some(t) => (
             t.order_by.clone(),
-            t.order_keys.clone(),
+            // 序数キー（`ORDER BY 1`）は導出層の `plan_rows` が解決できず `42601` になるため、
+            // 本文の投影位置から列キーへ解決して渡す（解決できない形は `None`＝呼び出し側が `0A000`）。
+            resolve_ordinal_order_keys(&t.order_keys, &body.projection)?,
             t.limit.unwrap_or(u32::MAX),
             t.limit.is_some(),
             t.offset,
@@ -22958,6 +22960,42 @@ fn derived_cte_layer(ctes: &[super::cte::CteDef], idx: usize) -> Option<(usize, 
             offset,
         },
     ))
+}
+
+/// 導出層へ渡す `ORDER BY` キーの序数（`ORDER BY 1`）を、CTE 本文の投影位置の列名キーへ解決する
+/// （Issue #1862・単一表の具体化経路と同じ「本文の出力列で並べる」意味）。`*` や式項目など位置から
+/// 列名を確定できない投影、範囲外の位置は `None`（呼び出し側が固定 `0A000` で拒否する。fail-closed）。
+fn resolve_ordinal_order_keys(
+    keys: &[ScanOrderKey],
+    projection: &Projection,
+) -> Option<Vec<ScanOrderKey>> {
+    keys.iter()
+        .map(|k| match k {
+            ScanOrderKey::Ordinal {
+                position,
+                descending,
+                nulls,
+            } => {
+                let i = usize::try_from(position.checked_sub(1)?).ok()?;
+                let column = match projection {
+                    Projection::Columns(cols) => cols.get(i)?.clone(),
+                    Projection::Items(items) => match items.get(i)? {
+                        SelectItem::Column(c) => c.clone(),
+                        SelectItem::Expr { .. } => return None,
+                    },
+                    Projection::All => return None,
+                };
+                Some(ScanOrderKey::Column {
+                    key: ScalarOrderKey {
+                        column,
+                        descending: *descending,
+                    },
+                    nulls: *nulls,
+                })
+            }
+            other => Some(other.clone()),
+        })
+        .collect()
 }
 
 /// JOIN の主クエリから到達できる CTE の評価計画を組み立てる（Issue #1861）。参照数は、主クエリの

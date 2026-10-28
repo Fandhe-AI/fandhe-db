@@ -9734,6 +9734,11 @@ impl EngineCore {
                     skip_vector_literal_validation,
                     limits,
                 )?;
+                // Execute（`evaluate_cte_slot`）と同じ明示 `LIMIT` の範囲検査を Describe でも行い、
+                // Describe 成功・Execute だけ上限違反になる乖離を作らない（Issue #1862）。
+                if layer.limit_explicit {
+                    crate::sql::parser::validate_search_limit_with(layer.limit, limits)?;
+                }
                 crate::sql::view_buffered::plan_rows_layer(
                     &parent,
                     &slot.name,

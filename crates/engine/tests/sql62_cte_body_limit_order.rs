@@ -234,6 +234,38 @@ fn tail_cte_derived_from_a_plain_cte_in_a_join() {
     assert_eq!(ints(&r, 0), vec![5, 7]);
 }
 
+/// 導出層（先行 CTE を読む tail CTE）の序数 `ORDER BY` は本文の投影位置の列へ解決される
+/// （PR #2733 レビュー指摘。`plan_rows` が序数を `42601` で拒否していた）。
+#[test]
+fn derived_tail_cte_resolves_ordinal_order_by_in_a_join() {
+    let (core, _g) = open_with(None);
+    let sql = "WITH a AS (SELECT id FROM docs), \
+               b AS (SELECT id FROM a ORDER BY 1 DESC LIMIT 2) \
+               SELECT x.id FROM b x JOIN docs d ON x.id = d.id ORDER BY x.id LIMIT 10";
+    assert_eq!(ints(&ok(&core, "alice", sql), 0), vec![5, 7]);
+    // 範囲外の序数は黙って並べず拒否する（fail-closed。単一表経路と同じ `42601`）。
+    let out_of_range = "WITH a AS (SELECT id FROM docs), \
+               b AS (SELECT id FROM a ORDER BY 3 LIMIT 2) \
+               SELECT x.id FROM b x JOIN docs d ON x.id = d.id LIMIT 10";
+    assert!(query(&core, "alice", out_of_range).is_err());
+}
+
+/// 導出層の明示 `LIMIT` の上限検査は Describe でも Execute と同じ結果になる（乖離させない）。
+#[test]
+fn derived_tail_cte_limit_is_validated_in_describe() {
+    let (core, _g) = open_with(Some(ResultLimits::new(5)));
+    let sql = "WITH a AS (SELECT id FROM docs), \
+               b AS (SELECT id FROM a LIMIT 6) \
+               SELECT x.id FROM b x JOIN b y ON x.id = y.id LIMIT 10";
+    let executed = code(&core, "carol", sql);
+    let session = SessionState::default();
+    let parsed = core.parse_sql(sql).expect("parse");
+    let described = core
+        .describe_parsed_in_session(&session, &parsed)
+        .expect_err("describe must reject the over-limit LIMIT");
+    assert_eq!(described.wire_code().to_string(), executed);
+}
+
 /// 列名リストつきの tail CTE と、Describe の列が Execute の結果列と一致すること。
 #[test]
 fn column_list_and_describe() {
