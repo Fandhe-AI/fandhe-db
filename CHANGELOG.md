@@ -33,6 +33,10 @@
   `EngineCore::with_recursive_cte_limits` へ注入する。ハード上限は既定値（反復 1,000 回・累積 100,000 行）と
   同じで、下げる方向だけ設定できる。超過は `54000`。範囲外・非数値・値欠落・重複指定は起動エラー。
   累積行数は `--max-result-rows` との小さい方が実効上限。公開 API は追加のみ（`engine::recursive_cte_limits`）。
+- `WITH RECURSIVE` の `CYCLE 列[, ...] SET 印列 [TO 値 DEFAULT 既定値] USING 経路列` 句を評価する（Issue #2214・SQL-35）。
+  行ごとに経路（循環列の行値の `record[]`）を持ち、新しい行の行値が親の経路に含まれれば印を `TO` 値（省略時は `true`）にして出力し、その行からは再帰しない。
+  `UNION ALL` でも循環グラフで止まる。印列・経路列は順序列（あれば）の後ろに付く。反復回数・累積行数・共有バイト予算の上限は従来どおりで、超過は部分結果なしの `54000`。
+  挙動変更: 従来 `0A000` だった `CYCLE` 句が評価される。`USING` のない形・符号付きの `TO`／`DEFAULT` 定数は `42601`。公開 API の変更はない（非 BREAKING）。詳細は [recursive-cte.md](docs/design/recursive-cte.md) の「Issue #2214 追記」節。
 - `WITH RECURSIVE` の `SEARCH DEPTH FIRST／BREADTH FIRST BY 列[, ...] SET 順序列` 句を評価する（Issue #2213・SQL-35。段階 C）。
   深さ優先は根から当該行までの BY 列の行値の配列（`record[]`）、幅優先は `(深さ, BY 列の値...)`（`record`）を順序列として結果列の末尾へ足し、
   主クエリの `ORDER BY 順序列 [DESC]` で PostgreSQL 17 と同じ順序になる。wire は OID 2249／2287 のテキスト形式（バイナリ結果形式の要求は `0A000`）、

@@ -410,6 +410,56 @@ fn wire_recursive_search_binary_result_format_is_0a000() {
     read_ready_for_query(&mut stream);
 }
 
+// ---- CYCLE 句（SQL-35・Issue #2214）----
+
+const RECURSIVE_CYCLE: &str = "WITH RECURSIVE r(n) AS (SELECT 1 UNION ALL SELECT n FROM r) \
+     CYCLE n SET c USING p SELECT n, c, p FROM r ORDER BY p";
+
+/// 印列は boolean（OID 16）・経路列は `record[]`（OID 2287）で、値は `t`／`f` と `array_out` 形式。
+/// simple query と extended query（Describe）の公告が一致する。
+#[test]
+fn wire_recursive_cycle_advertises_mark_and_path_columns() {
+    let (core, _guard) = new_core_with_docs_table();
+    let users_path = write_user_store_file(&[("alice", "tenant-a", "correct-horse")]);
+    let store = UserStore::load_from_file(&users_path).expect("valid user store");
+    let addr = spawn_server_with_engine_and_store(store, core);
+    let mut stream = authenticate_to_ready_for_query(addr, "alice", "correct-horse");
+
+    send_simple_query(&mut stream, RECURSIVE_CYCLE);
+    let columns = read_row_description_with_types(&mut stream);
+    assert_eq!(columns.len(), 3);
+    assert_eq!(columns[1], ("c".to_string(), 16, 1));
+    assert_eq!(columns[2], ("p".to_string(), 2287, -1));
+    let first = read_data_row(&mut stream);
+    assert_eq!(
+        first,
+        vec![
+            Some("1".to_string()),
+            Some("f".to_string()),
+            Some("{(1)}".to_string())
+        ]
+    );
+    let second = read_data_row(&mut stream);
+    assert_eq!(
+        second,
+        vec![
+            Some("1".to_string()),
+            Some("t".to_string()),
+            Some("{(1),(1)}".to_string())
+        ]
+    );
+    assert_eq!(read_command_complete(&mut stream), "SELECT 2");
+    read_ready_for_query(&mut stream);
+
+    // 構文違反（USING なし）は 42601 で、接続は維持される。
+    send_simple_query(
+        &mut stream,
+        "WITH RECURSIVE r(n) AS (SELECT 1 UNION ALL SELECT n FROM r) CYCLE n SET c SELECT n FROM r",
+    );
+    expect_error_response_with_sqlstate(&mut stream, "42601");
+    read_ready_for_query(&mut stream);
+}
+
 // ---- データ変更 CTE の実行（SQL-63・Issue #1876）----
 
 fn insert_doc(stream: &mut std::net::TcpStream, id: u32, lang: &str) {

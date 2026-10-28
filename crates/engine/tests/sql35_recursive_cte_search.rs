@@ -483,13 +483,6 @@ fn clause_errors_and_gates() {
                 .to_string(),
             "0A000",
         ),
-        // CYCLE 句は #2214 まで 0A000（SEARCH との併用も同じ）。
-        (
-            "WITH RECURSIVE t(n) AS (SELECT 1 UNION ALL SELECT n + 1 FROM t WHERE n < 3) \
-             SEARCH DEPTH FIRST BY n SET o CYCLE n SET c USING p SELECT n FROM t"
-                .to_string(),
-            "0A000",
-        ),
         // 並べ替えできない型（ベクトル等）の BY 列は計画時に 0A000。
         (
             "WITH RECURSIVE t(n, j) AS (SELECT 1, CAST('{}' AS JSON) UNION ALL \
