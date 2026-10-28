@@ -939,6 +939,7 @@ impl From<LedgerRecordError> for TenantWriteError {
 /// （本関数はキー生成に関与しない）。他テナントの行キーへ触れる経路を持たないため、
 /// 他テナント行の有無で分岐する処理は本関数にも存在しない（RLS-9・fail-closed）。
 fn insert_unique_row(
+    table: &str,
     row_table: &mut redb::Table<'_, (&'static str, u64), &'static [u8]>,
     key: (&str, u64),
     encoded: &[u8],
@@ -950,6 +951,8 @@ fn insert_unique_row(
     {
         return Err(TenantWriteError::IdConflict);
     }
+    // データ変更 CTE の文内変更集合（Issue #1877）へ記録する。スコープ外では何もしない。
+    statement_writes::record(table, key.1);
     Ok(())
 }
 
@@ -1056,7 +1059,7 @@ pub(crate) fn insert_row_unchecked(
             .map_err(map_row_table_error)?;
         // 物理キーはサーバー側導出テナントで名前空間化する（TABLE-12・RLS-9）。
         let key = row_key(ctx.tenant_id(), RowId::from_legacy_id(id));
-        insert_unique_row(&mut row_table, key, encoded.as_slice())?;
+        insert_unique_row(table, &mut row_table, key, encoded.as_slice())?;
         // `CHECK` 制約（Issue #906）と `PRIMARY KEY`（Issue #903）・UNIQUE 制約（Issue #905）の
         // テナント内一意性制約（いずれも TABLE-16・TASK-204）は、
         // 台帳照合（上記 `ledger::record_in_txn`）と行の書き込み（`insert_unique_row`）が
@@ -1245,7 +1248,7 @@ pub(crate) fn insert_rows_unchecked(
                     "batch encode arena range out of bounds".to_string(),
                 ))
             })?;
-            insert_unique_row(&mut row_table, key, encoded)?;
+            insert_unique_row(table, &mut row_table, key, encoded)?;
         }
         drop(row_table);
         // `PRIMARY KEY`（Issue #903）・UNIQUE 制約（Issue #905。TABLE-16・TASK-204）のテナント内一意性制約検査
@@ -2003,7 +2006,7 @@ fn insert_typed_row_impl(
             .map_err(map_row_table_error)?;
         let key = row_key(ctx.tenant_id(), row_id);
         let encoded = encode_row(&row)?;
-        insert_unique_row(&mut row_table, key, encoded.as_slice())?;
+        insert_unique_row(table, &mut row_table, key, encoded.as_slice())?;
         drop(row_table);
         // `PRIMARY KEY`（Issue #903）・UNIQUE 制約（Issue #905。TABLE-16・TASK-204）のテナント内一意性制約検査
         // （[`insert_row_unchecked`] と同じ判定順序。`constraint.rs` モジュール
@@ -2349,7 +2352,7 @@ pub(crate) fn insert_typed_rows_unchecked(
                 })?;
                 let key = row_key(ctx.tenant_id(), row_id);
                 let encoded = encode_row(&row)?;
-                insert_unique_row(&mut row_table, key, encoded.as_slice())?;
+                insert_unique_row(table, &mut row_table, key, encoded.as_slice())?;
             }
             drop(row_table);
             row_ids
@@ -3388,7 +3391,7 @@ fn upsert_typed_rows_impl(
                         metadata: &metadata,
                     };
                     let encoded = encode_row(&row)?;
-                    insert_unique_row(&mut row_table, key, encoded.as_slice())?;
+                    insert_unique_row(table, &mut row_table, key, encoded.as_slice())?;
                     // `RETURNING`（Issue #1182）: 挿入した値を投影する。
                     if let Some(project) = project.as_mut() {
                         let values =
@@ -3604,6 +3607,7 @@ pub(crate) fn update_row_unchecked(
             row_table
                 .insert(key, encoded.as_slice())
                 .map_err(CatalogError::from)?;
+            statement_writes::record(table, id);
         }
         // `PRIMARY KEY`（Issue #903）・UNIQUE 制約（Issue #905。TABLE-16・TASK-204）のテナント内一意性制約検査
         // （[`insert_row_unchecked`] と同じ判定順序。`constraint.rs` モジュール
@@ -4606,6 +4610,9 @@ pub(crate) fn update_row_columns_capturing_unchecked(
             // の行はこのキーでは物理的に取得できない）ため、他テナント行の混入は
             // 構造的に起こらない。
             let visible_row: Option<Row> = match row_table.get(&key).map_err(CatalogError::from)? {
+                // データ変更 CTE（Issue #1877）で先の副文が書いた行は、文の開始時点には無かった／
+                // 別の状態だった行として扱い、後の副文の対象にしない（`statement_writes`）。
+                Some(_) if statement_writes::is_prior(table, id) => None,
                 Some(guard) => {
                     let raw = guard.value();
                     match crate::storage::decode_row_tenant_and_visibility(raw) {
@@ -4692,6 +4699,7 @@ pub(crate) fn update_row_columns_capturing_unchecked(
                     row_table
                         .insert(key, encoded.as_slice())
                         .map_err(CatalogError::from)?;
+                    statement_writes::record(table, id);
                     // `RETURNING`（Issue #1182）: 書いた値（更新後）そのものを捕捉する。
                     if project.is_some() {
                         captured_row = Some(CapturedRow {
@@ -5059,6 +5067,8 @@ fn delete_row_impl(
             // `update_row` と同じく `(tenant_id, id)` キー（TABLE-12）＋ `is_owner` の二重防御。
             let key = row_key(ctx.tenant_id(), RowId::from_legacy_id(id));
             let owns_existing = match row_table.get(&key).map_err(CatalogError::from)? {
+                // データ変更 CTE（Issue #1877）で先の副文が書いた行は後の副文の対象にしない。
+                Some(_) if statement_writes::is_prior(table, id) => false,
                 Some(guard) => {
                     let (existing_tenant, existing_visibility) =
                         decode_row_tenant_and_visibility(guard.value())?;
@@ -5130,6 +5140,7 @@ fn delete_row_impl(
             };
             if owns_existing {
                 row_table.remove(&key).map_err(CatalogError::from)?;
+                statement_writes::record(table, id);
             } else if not_found_ledger == DeleteNotFoundLedger::Discard {
                 // 台帳への tentative 追記はこの早期 `return` により `write_txn` が
                 // commit されず破棄されるため、副作用として残らない
@@ -5398,6 +5409,7 @@ pub(crate) struct DmlCandidate<'a> {
 /// `predicate` が `Err(e)` を返した場合はその時点で呼び出し元へ伝播する
 /// （呼び出し元が `write_txn` を破棄することで副作用ゼロを保つ）。
 fn enumerate_dml_candidates<E>(
+    table: &str,
     row_table: &redb::Table<'_, (&'static str, u64), &'static [u8]>,
     ctx: &PolicyContext,
     needs_embedding: bool,
@@ -5406,6 +5418,7 @@ fn enumerate_dml_candidates<E>(
     predicate: &mut impl FnMut(&DmlCandidate<'_>) -> Result<bool, E>,
 ) -> Result<Vec<u64>, PredicateDmlError<E>> {
     let with_payload = enumerate_dml_candidates_with(
+        table,
         row_table,
         ctx,
         needs_embedding,
@@ -5422,6 +5435,7 @@ fn enumerate_dml_candidates<E>(
 /// 拡張で、走査範囲・総走査上限・所有かつ可視の選定・`limit` の早期終了は上記と完全に同一
 /// （`T = ()` の薄いラッパーが既存の呼び出し元のビット同一性を保つ）。
 fn enumerate_dml_candidates_with<E, T>(
+    table: &str,
     row_table: &redb::Table<'_, (&'static str, u64), &'static [u8]>,
     ctx: &PolicyContext,
     needs_embedding: bool,
@@ -5486,6 +5500,11 @@ fn enumerate_dml_candidates_with<E, T>(
         // （応答から可視性の分布を推測させない）、不可視行の本体は読まない
         // （破損が `XX000` として観測される経路を作らない）。
         if !ctx.is_owner(row_tenant) || !ctx.is_visible(row_tenant, visibility) {
+            continue;
+        }
+        // データ変更 CTE（Issue #1877）で先の副文が書いた行は、述語を評価せず候補から外す
+        // （走査行数には上で数え済み。スコープ外では常に偽）。
+        if statement_writes::is_prior(table, id) {
             continue;
         }
 
@@ -5651,6 +5670,7 @@ fn delete_rows_where_impl<E>(
                 .open_table(user_rows_table_def(&row_table_name))
                 .map_err(|e| dml_write_err(map_row_table_error(e)))?;
             let candidate_ids = enumerate_dml_candidates(
+                table,
                 &row_table,
                 ctx,
                 needs_embedding,
@@ -5853,6 +5873,7 @@ fn update_rows_where_impl<E>(
                 .open_table(user_rows_table_def(&row_table_name))
                 .map_err(|e| dml_write_err(map_row_table_error(e)))?;
             let candidate_ids = enumerate_dml_candidates(
+                table,
                 &row_table,
                 ctx,
                 needs_embedding,
@@ -5956,6 +5977,7 @@ pub(crate) fn update_rows_joined_unchecked<E>(
                 .open_table(user_rows_table_def(&row_table_name))
                 .map_err(|e| dml_write_err(map_row_table_error(e)))?;
             let candidates = enumerate_dml_candidates_with(
+                table,
                 &row_table,
                 ctx,
                 needs_embedding,
@@ -6049,6 +6071,7 @@ fn apply_predicate_delete_in_txn<E>(
             let removed_guard = row_table
                 .remove(&key)
                 .map_err(|e| dml_write_err(CatalogError::from(e)))?;
+            statement_writes::record(table, *id);
             if needs_fk_removed_pre_image || project.is_some() {
                 if let Some(guard) = removed_guard {
                     let row = crate::storage::decode_row(RowId::from_legacy_id(*id), guard.value())
@@ -6232,6 +6255,7 @@ fn apply_predicate_update_in_txn<E>(
             row_table
                 .insert(key, encoded.as_slice())
                 .map_err(|e| dml_write_err(CatalogError::from(e)))?;
+            statement_writes::record(table, *id);
             // `RETURNING`（Issue #1182）: 書いた値（更新後）を行ごとに投影する。
             if let Some(project) = project.as_mut() {
                 let values = captured_values_from_parts(schema, embedding_value, &metadata)
@@ -6984,6 +7008,7 @@ pub(crate) fn last_operation(
 }
 
 pub(crate) mod partitioned_dml;
+pub(crate) mod statement_writes;
 
 #[cfg(test)]
 mod tests {
