@@ -389,9 +389,10 @@ fn wire_data_modifying_cte_multi_statement_message_is_one_implicit_transaction()
     read_ready_for_query(&mut stream);
 
     insert_doc(&mut stream, 2, "ja");
+    // 副文を読まない形（RETURNING なしの副文を参照）は未対応。表は変わらない。
     send_simple_query(
         &mut stream,
-        "WITH d AS (DELETE FROM docs WHERE lang = 'ja' RETURNING id) SELECT id FROM docs LIMIT 10",
+        "WITH d AS (DELETE FROM docs WHERE lang = 'ja') SELECT id FROM d LIMIT 10",
     );
     expect_error_response_with_sqlstate(&mut stream, "0A000");
     read_ready_for_query(&mut stream);
@@ -453,6 +454,76 @@ fn wire_data_modifying_cte_extended_query_describe_does_not_write() {
 
     // portal は Sync（暗黙トランザクションの終端）で破棄されるため、準備済みの文から Bind し直す。
     send_length_prefixed_message(&mut stream, b'B', &bind_body("p2", "s1"));
+    send_length_prefixed_message(&mut stream, b'E', &execute_body("p2", 0));
+    send_length_prefixed_message(&mut stream, b'S', &[]);
+    assert_eq!(read_until_ready(&mut stream), vec![b'2', b'D', b'C', b'Z']);
+    assert_eq!(count_docs(&mut stream), "0");
+}
+
+/// 副文が複数ある文と、主クエリが実表を読む文を簡易クエリで実行できる（Issue #1877）。全副文と主クエリは
+/// 文の開始時点の状態を読み、書き込みは同じ文で成立する。
+#[test]
+fn wire_data_modifying_cte_several_substatements_and_table_main_query() {
+    let (core, _guard) = new_core_with_docs_table();
+    let users_path = write_user_store_file(&[("alice", "tenant-a", "correct-horse")]);
+    let store = UserStore::load_from_file(&users_path).expect("valid user store");
+    let addr = spawn_server_with_engine_and_store(store, core);
+    let mut stream = authenticate_to_ready_for_query(addr, "alice", "correct-horse");
+    insert_doc(&mut stream, 1, "ja");
+    insert_doc(&mut stream, 2, "en");
+
+    // 2 つの副文。b は a の削除を見ず、en の行だけを更新する。
+    send_simple_query(
+        &mut stream,
+        "WITH a AS (DELETE FROM docs WHERE lang = 'ja' RETURNING id), \
+         b AS (UPDATE docs SET lang = 'ja' WHERE lang = 'en' RETURNING id) \
+         SELECT id FROM b LIMIT 10",
+    );
+    let _columns = read_row_description(&mut stream);
+    assert_eq!(read_data_row(&mut stream), vec![Some("2".to_string())]);
+    assert_eq!(read_command_complete(&mut stream), "SELECT 1");
+    read_ready_for_query(&mut stream);
+    assert_eq!(count_docs(&mut stream), "1");
+
+    // 主クエリが実表を読む形は、削除前の状態を返す。
+    send_simple_query(
+        &mut stream,
+        "WITH d AS (DELETE FROM docs WHERE lang = 'ja' RETURNING id) SELECT id FROM docs LIMIT 10",
+    );
+    let _columns = read_row_description(&mut stream);
+    assert_eq!(read_data_row(&mut stream), vec![Some("2".to_string())]);
+    assert_eq!(read_command_complete(&mut stream), "SELECT 1");
+    read_ready_for_query(&mut stream);
+    assert_eq!(count_docs(&mut stream), "0");
+}
+
+/// 拡張クエリ: 主クエリが実表を読む形の Describe は書き込みを起こさない（Issue #1877）。
+#[test]
+fn wire_data_modifying_cte_table_main_query_describe_does_not_write() {
+    let (core, _guard) = new_core_with_docs_table();
+    let users_path = write_user_store_file(&[("alice", "tenant-a", "correct-horse")]);
+    let store = UserStore::load_from_file(&users_path).expect("valid user store");
+    let addr = spawn_server_with_engine_and_store(store, core);
+    let mut stream = authenticate_to_ready_for_query(addr, "alice", "correct-horse");
+    insert_doc(&mut stream, 1, "ja");
+
+    send_length_prefixed_message(
+        &mut stream,
+        b'P',
+        &parse_body(
+            "s2",
+            "WITH a AS (DELETE FROM docs WHERE lang = 'ja'), \
+             b AS (DELETE FROM docs WHERE id = 99) SELECT id FROM docs LIMIT 10",
+            0,
+        ),
+    );
+    send_length_prefixed_message(&mut stream, b'B', &bind_body("p1", "s2"));
+    send_length_prefixed_message(&mut stream, b'D', b"Pp1\0");
+    send_length_prefixed_message(&mut stream, b'S', &[]);
+    assert_eq!(read_until_ready(&mut stream), vec![b'1', b'2', b'T', b'Z']);
+    assert_eq!(count_docs(&mut stream), "1", "Describe must not write");
+
+    send_length_prefixed_message(&mut stream, b'B', &bind_body("p2", "s2"));
     send_length_prefixed_message(&mut stream, b'E', &execute_body("p2", 0));
     send_length_prefixed_message(&mut stream, b'S', &[]);
     assert_eq!(read_until_ready(&mut stream), vec![b'2', b'D', b'C', b'Z']);

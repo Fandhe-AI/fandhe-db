@@ -11,6 +11,15 @@
 
 - CTE 本文の `ORDER BY`・`LIMIT`・`OFFSET` を受け付ける（Issue #1862・SQL-62）。本文に `LIMIT` を持つ CTE はインライン展開では `LIMIT` が落ちるため、常に具体化して評価し（単一表の主クエリは評価後射影形、JOIN は入力 slot）、外側の `WHERE` は本文の `LIMIT` の後に適用される。`LIMIT` なしの本文は暗黙上限で、可視行が `--max-result-rows` を超えると `54000`。
   挙動変更: 従来 `42601` で拒否していた形が受理される。他の CTE が読む連鎖・ビュー本文や cursor などインライン専用の文脈での参照は固定 `0A000`。公開 enum は変えない（非 BREAKING）。詳細は [cte.md](docs/design/cte.md) の「Issue #1862 追記」節。
+- データ変更 CTE の 1 文内の可視性と失敗時の動作を PostgreSQL に揃える（Issue #1877・SQL-63）。副文を 2 つ以上・
+  主クエリから参照されない副文・`RETURNING` のない副文で実行でき、主クエリが実表・ビュー・SELECT 本文 CTE を読む形も実行できる。
+  全副文と主クエリは文の開始時点の状態を読み、互いの変更は `RETURNING` を通したときだけ見える。同じ行を複数の副文が
+  変更する場合は `WITH` の順に実行し、後の副文は先の副文が書いた行に触れない。副文または主クエリのどこかでエラーなら
+  文全体が取り消され、行数上限は副文ごとに判定する。挙動変更: 従来 `0A000` だった複数副文・主クエリが実表を読む形・
+  副文を読まない形が実行される。`ON CONFLICT` 付き INSERT 副文が他の副文と同じ表を対象にする形、副文が 2 つ以上で対象表が
+  `FOREIGN KEY` の参照アクションの参照先になる形、JOIN の主クエリは引き続き `0A000`。あわせて、`--require-operation-id` で
+  `WHERE` にサブクエリを持つ副文が `23502` になる不具合を直した。公開 API の変更はない（非 BREAKING）。
+  詳細は [data-modifying-cte.md](docs/design/data-modifying-cte.md) の「Issue #1877」節。
 - 再帰 CTE の反復回数・累積行数の上限を起動時設定にする（Issue #1871・SQL-35・SQL-46。段階 B）。
   wire-server に `--max-recursive-cte-iterations <1-1000>`・`--max-recursive-cte-rows <1-100000>` を追加し、
   `EngineCore::with_recursive_cte_limits` へ注入する。ハード上限は既定値（反復 1,000 回・累積 100,000 行）と

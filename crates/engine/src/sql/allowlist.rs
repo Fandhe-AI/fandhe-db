@@ -23247,10 +23247,30 @@ fn split_trailing_operation_id(
     Ok((tokens, None))
 }
 
-/// データ変更 CTE を含む最上位の `WITH` 文（SQL-63・Issue #1876）。検証（構文・名前・列・
+/// データ変更 CTE を含む最上位の `WITH` 文の主クエリ（SQL-63・Issue #1876・#1877）。
+#[derive(Debug, Clone, PartialEq)]
+pub(crate) enum DmMain {
+    /// 主クエリが副文（`RETURNING` あり）の 1 つを FROM に読む形（Issue #1876）。副文の `RETURNING` 行を
+    /// 具体化し、評価後射影形ビューと同じ外側処理（[`BufferedOuter`]）を適用する。
+    Referenced {
+        /// 主クエリが読む副文の `dm_ctes` 内の添字。
+        referenced: usize,
+        /// 主クエリが FROM に書いた CTE 名（外側の表名）。
+        view_name: String,
+        /// 参照される CTE の列名リスト（`WITH d(x, y) AS (...)`）。空なら改名なし。
+        column_aliases: Vec<String>,
+        /// 主クエリの外側処理。
+        outer: BufferedOuter,
+    },
+    /// 主クエリが副文を読まず、実表・ビュー・SELECT 本文の CTE を読む形（Issue #1877）。検証済みの
+    /// 読み取り文を、**副文を 1 つも実行する前**の文開始時点の状態で評価する（副文の変更は見えない）。
+    Read(Box<Statement>),
+}
+
+/// データ変更 CTE を含む最上位の `WITH` 文（SQL-63・Issue #1876・#1877）。検証（構文・名前・列・
 /// 実行形のゲート）を通過した文だけが持つ実行計画で、`EngineCore` の書き込み経路が 1 つの書き込み
-/// トランザクションで副文を定義順に実行し、参照される副文の `RETURNING` 行を具体化して主クエリの
-/// 外側処理（評価後射影形ビューと同じ [`BufferedOuter`]）を適用する。
+/// トランザクションで全副文を定義順に実行し、主クエリを返す。主クエリは副文の `RETURNING` 行
+/// （[`DmMain::Referenced`]）か、文開始時点の状態での読み取り（[`DmMain::Read`]）のいずれか。
 ///
 /// 不変条件（RLS-10 (b)）: テナント・`PolicyContext` を保持しない。実行は常に参照した
 /// セッション自身の `PolicyContext` で行う。フィールドは `pub(crate)`（クレート外からの直読み・
@@ -23259,14 +23279,8 @@ fn split_trailing_operation_id(
 pub struct ValidatedDataModifyingCte {
     /// 副文（データ変更 CTE）の本文。定義順。
     pub(crate) dm_ctes: Vec<super::cte::DataModifyingCteBody>,
-    /// 主クエリが読む副文の `dm_ctes` 内の添字。
-    pub(crate) referenced: usize,
-    /// 主クエリが FROM に書いた CTE 名（外側の表名）。
-    pub(crate) view_name: String,
-    /// 参照される CTE の列名リスト（`WITH d(x, y) AS (...)`）。空なら改名なし。
-    pub(crate) column_aliases: Vec<String>,
-    /// 主クエリの外側処理。
-    pub(crate) outer: BufferedOuter,
+    /// 主クエリ。
+    pub(crate) main: DmMain,
     /// 文末の `USING OPERATION_ID`（文全体で 1 つ。副文には持たせない）。
     pub(crate) operation_id: Option<OperationId>,
     /// 送られた文から導いた台帳照合ハッシュ（結果行の値は材料にしない）。
@@ -23279,25 +23293,31 @@ impl ValidatedDataModifyingCte {
         self.dm_ctes.first().map_or("", |d| d.target_table.as_str())
     }
 
-    /// 主クエリが読む副文。
+    /// 主クエリが読む副文（[`DmMain::Referenced`] のときだけ）。
     pub(crate) fn referenced_body(&self) -> Option<&super::cte::DataModifyingCteBody> {
-        self.dm_ctes.get(self.referenced)
+        match &self.main {
+            DmMain::Referenced { referenced, .. } => self.dm_ctes.get(*referenced),
+            DmMain::Read(_) => None,
+        }
     }
 }
 
-/// データ変更 CTE を含む最上位 `WITH` 文の実行計画を組み立てる（SQL-63・Issue #1876）。
+/// データ変更 CTE を含む最上位 `WITH` 文の実行計画を組み立てる（SQL-63・Issue #1876・#1877）。
 /// 構文・名前・列の検証は呼び出し元（[`validate_with_statement`]）が済ませている前提で、ここでは
-/// 本 Issue で実行する形かどうかのゲートを書き込みトランザクションを開く前に判定する
+/// 実行する形かどうかのゲートを書き込みトランザクションを開く前に判定する
 /// （未対応の形はすべて固定 `0A000`。入力断片を含めない）。
 ///
-/// 実行する形: データ変更 CTE がちょうど 1 つで、主クエリの FROM がその CTE（`RETURNING` あり）。
-/// 複数のデータ変更 CTE・実表やビューを読む主クエリは、文開始時点のスナップショットの可視性
-/// （#1877）が決まるまで実行しない。
+/// 実行する形: 副文 1 件以上（参照されない副文・`RETURNING` なしの副文を含む）。主クエリは副文（`RETURNING`
+/// あり）を FROM に読む形（`main_dm_idx` が `Some`）か、副文を読まない単一リレーションの読み取り
+/// （`None`。`inline` を [`DmMain::Read`] として運ぶ）。可視性（全副文と主クエリが文開始時点の状態を読む）
+/// を保証できない形として、`ON CONFLICT` 付き INSERT 副文が他の副文と同じ表を対象にする文は拒否する
+/// （衝突判定が先の副文の変更を見てしまうため）。
 fn build_data_modifying_with(
     tokens: &[Token],
     ctes: &[super::cte::CteDef],
-    main_dm_idx: usize,
+    main_dm_idx: Option<usize>,
     main: MainShape,
+    inline: Statement,
     operation_id: Option<OperationId>,
     ledger_mode: LedgerMode,
 ) -> Result<ValidatedDataModifyingCte, SqlSurfaceError> {
@@ -23305,28 +23325,55 @@ fn build_data_modifying_with(
     let mut referenced: Option<usize> = None;
     for (idx, def) in ctes.iter().enumerate() {
         if let super::cte::CteBody::DataModifying(body) = &def.body {
-            if idx == main_dm_idx {
+            if Some(idx) == main_dm_idx {
                 referenced = Some(dm_ctes.len());
             }
             dm_ctes.push((**body).clone());
         }
     }
-    let (Some(referenced), 1) = (referenced, dm_ctes.len()) else {
+    if dm_ctes.is_empty() || (main_dm_idx.is_some() && referenced.is_none()) {
         return Err(SqlSurfaceError::feature_not_supported(
             "this data-modifying CTE form is not supported yet",
         ));
-    };
-    let def = ctes
-        .get(main_dm_idx)
-        .ok_or_else(super::cte::data_modifying_cte_unsupported)?;
-    let outer = match main {
-        MainShape::Scan(shape) => buffered_scan_outer(shape)?,
-        MainShape::Aggregate(shape) => buffered_aggregate_outer(
-            def.name.clone(),
-            shape.items,
-            shape.where_predicates,
-            shape.group_by,
-        )?,
+    }
+    // `ON CONFLICT` 付き INSERT 副文が、他の副文と同じ表を対象にする形は実行しない。
+    for (i, body) in dm_ctes.iter().enumerate() {
+        let has_conflict = matches!(
+            &body.statement,
+            super::cte::DmlStatement::Insert(v) if v.on_conflict.is_some()
+        );
+        if has_conflict
+            && dm_ctes.iter().enumerate().any(|(j, other)| {
+                j != i && other.target_table.eq_ignore_ascii_case(&body.target_table)
+            })
+        {
+            return Err(SqlSurfaceError::feature_not_supported(
+                "ON CONFLICT in a data-modifying CTE that shares its table with another is not supported yet",
+            ));
+        }
+    }
+    let main = match (referenced, main_dm_idx) {
+        (Some(referenced), Some(main_dm_idx)) => {
+            let def = ctes
+                .get(main_dm_idx)
+                .ok_or_else(super::cte::data_modifying_cte_unsupported)?;
+            let outer = match main {
+                MainShape::Scan(shape) => buffered_scan_outer(shape)?,
+                MainShape::Aggregate(shape) => buffered_aggregate_outer(
+                    def.name.clone(),
+                    shape.items,
+                    shape.where_predicates,
+                    shape.group_by,
+                )?,
+            };
+            DmMain::Referenced {
+                referenced,
+                view_name: def.name.clone(),
+                column_aliases: def.column_aliases.clone(),
+                outer,
+            }
+        }
+        _ => DmMain::Read(Box::new(inline)),
     };
     // 文末句の省略は台帳あり構成（`--require-operation-id`）で `23502`。構文・名前・列の検証より後、
     // 書き込みトランザクションを開く前に判定する（RECOVER-1）。
@@ -23339,10 +23386,7 @@ fn build_data_modifying_with(
     })?;
     Ok(ValidatedDataModifyingCte {
         dm_ctes,
-        referenced,
-        view_name: def.name.clone(),
-        column_aliases: def.column_aliases.clone(),
-        outer,
+        main,
         operation_id,
         statement_hash,
     })
@@ -23523,19 +23567,20 @@ fn validate_with_statement(
             shape.group_by,
         )?)),
     })();
-    // SQL-63: データ変更 CTE を含む文は、構文・名前・列の検証をすべて通過しても実行しない
-    // （読み取りプランへ化けさせない。書き込み結線は #1876）。固定文言で入力断片を含めない。
+    // SQL-63: データ変更 CTE を含む文は、構文・名前・列の検証をすべて通過してから実行形のゲートへ進む
+    // （読み取りプランへ化けさせない）。固定文言で入力断片を含めない。
     if has_dm {
-        inline?;
+        let inline = inline?;
         // 読み取り入口（cursor・COPY・ビュー・CTAS・サブクエリ内側等）は従来どおり固定 0A000。
-        let (Some(main_shape), Some(dm_idx)) = (main_for_dm, main_dm_idx) else {
+        let Some(main_shape) = main_for_dm else {
             return Err(super::cte::data_modifying_cte_unsupported());
         };
         return build_data_modifying_with(
             tokens,
             &ctes,
-            dm_idx,
+            main_dm_idx,
             main_shape,
+            inline,
             operation_id,
             ledger_mode,
         )
