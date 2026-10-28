@@ -47,6 +47,21 @@ make setup   # サブモジュール → rustup → lefthook（git hooks）を�
 
 ビルド成果物（`target/`）は数十 GB に膨らみやすいため、ルート `Cargo.toml` の `[profile.dev.package."*"]` で依存クレート（workspace 外）のデバッグ情報を行番号のみにしています（`cargo build` 等の `dev` では `engine`・`wire-server` は full debuginfo のままで、`cargo test` が使う `[profile.test]` は依存を行番号のみ・`engine`・`wire-server` をデバッグ情報なしにしてテストビルドを短縮しています。panic 位置の行番号は残り、デバッガで依存の変数・型を見られなくなるのと、テスト時の `engine`・`wire-server` のバックトレースに行番号が出なくなるだけです。必要なら `CARGO_PROFILE_TEST_DEBUG=line-tables-only` で一時的に戻せます）。溜まった古い成果物は `cargo install cargo-sweep` のうえ `cargo sweep --time 14`（14 日以上使われていない成果物を削除）や `cargo sweep --installed`（rustup に現存しないツールチェーンでビルドした成果物を削除）で消せます。
 
+### engine の結合テストの束ね方と個別実行
+
+`crates/engine/tests/` の結合テストは、ファイルごとにテストバイナリを作るとリンク・共通モジュールの重複コンパイルでテストビルドが長くなるため、サブディレクトリ単位で少数のテストバイナリへ束ねています（`tests/<束ね先>/main.rs` が `mod <ファイル名>;` を並べる。束ね先は `sql_named`・`sql_t01_39`・`sql_t40_up`・`table_rls`・`core_misc`）。
+
+```bash
+# 束ね先の 1 ファイルだけ実行する（モジュール名＝元のファイル名で絞る）
+cargo test -p fandhe-db-engine --test table_rls table24_sequence_nextval::
+# 束ね先の全体を実行する
+cargo test -p fandhe-db-engine --test sql_named
+```
+
+- 新しい結合テストは、これまでどおり `tests/<name>.rs` を置けば単独バイナリとして動く。束ねたい場合は適当な束ね先へ `git mv` して `main.rs` に `mod <name>;` を足す
+- 共通ヘルパー（`src/test_util/`）は束ね先の `main.rs` で 1 回だけ取り込み、各モジュールは `use crate::temp_db;` のように参照する
+- 次のいずれかに当たるテストは別プロセスであることを前提にするため束ねず、`tests/` 直下に単独バイナリのまま置く: ①`feature` ゲート付き・`test-sync-points` 利用 ②プロセス全体で共有する状態（`OnceLock`・`static` 等）・環境変数・カレントディレクトリ・子プロセス・異常終了に依存 ③時間・スレッド数・メモリなどを計測 ④`bench` 共通 harness・fixture モジュール（`recall_engine`・`nl_qa` 等）を取り込む ⑤ `Makefile`・`scripts/`・CI から `--test <name>` で名指しされる（`--ignored` の層 B ゲート等）。判断に迷うものは束ねない側に倒す
+
 ### タスクランナー（Makefile）
 
 `Makefile` は薄い入口で、複数行・条件分岐を伴う処理の実体は `scripts/` 配下の bash スクリプトにあります（Make を使わない場合の直接コマンド一覧は `scripts/help.sh`、`make help` でターゲット一覧を表示）。編集方針は [`.claude/rules/makefile.md`](.claude/rules/makefile.md)（make skill: `.claude/skills/make`）を参照してください。
