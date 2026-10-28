@@ -493,8 +493,8 @@ Top-k 内の順位入れ替え・スコアの微小なビット差はこの指�
 （集計指標の非退行）にとどめる。12 run すべて `test result: ok`（`0 failed`）。
 
 層 A（`cargo test --release -p engine --test hybrid_recall --test
-rerank_recall --test query_planning_recall --test core_misc sparse_determinism::`
-〔束ねたバイナリへの指定は先頭の個別指定にも絞り込みが及ぶため、実際は分けて実行する〕。状態 C）
+rerank_recall --test query_planning_recall` と
+`cargo test --release -p engine --test core_misc sparse_determinism::`。状態 C）
 は全件 green（23 テスト・0 failed）。
 
 ## 7. 判定

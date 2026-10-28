@@ -341,8 +341,8 @@ terminates_and_is_deterministic` として F16 常駐でも
 （候補生成の f16→f32 昇格 dot で探索順序が変わり得ても）停止性・ビット
 同一の決定性契約が不変であることを固定した。
 
-いずれも `cargo test -p engine --test core_misc hnsw_cache:: hnsw_hybrid_refetch::`
-で green。production コード（`crates/engine/src/`）は無変更・テスト専任。
+いずれも `cargo test -p engine --test core_misc hnsw_cache::` と
+`cargo test -p engine --test hnsw_hybrid_refetch`（単独ターゲット）で green。production コード（`crates/engine/src/`）は無変更・テスト専任。
 
 ### `recall.yml` の 3 系列化
 
@@ -504,8 +504,8 @@ R4（テナント境界）・hybrid 密側再取得ループ・Rust API 検索�
 として I8 常駐でも停止性・ビット同一の決定性契約が不変であることを固定
 した。
 
-いずれも `cargo test -p engine --test core_misc hnsw_cache:: hnsw_hybrid_refetch::`
-で green。production コード（`crates/engine/src/`）は無変更・テスト専任。
+いずれも `cargo test -p engine --test core_misc hnsw_cache::` と
+`cargo test -p engine --test hnsw_hybrid_refetch`（単独ターゲット）で green。production コード（`crates/engine/src/`）は無変更・テスト専任。
 
 ### `recall.yml` の 4 系列化
 
@@ -599,8 +599,8 @@ repair 逐次段削減の前後で一致することを実測で確認したも�
 
 ### 可視外非混入・既存 ANN テストの無変更 green 確認
 
-`cargo test --release -p engine --test core_misc incremental_index_hnsw::
-hnsw_cache:: hnsw_hybrid_refetch:: hnsw::` と `cargo test --release -p engine --test
+`cargo test --release -p engine --test core_misc hnsw`（`incremental_index_hnsw`・`hnsw_cache`・`hnsw` 等の
+前方一致）と `cargo test --release -p engine --test hnsw_hybrid_refetch --test
 hnsw_parallel_profile_accept --test hnsw_search`（層 A。`hnsw_search` の `#[ignore]` 3 本
 除く）・`cargo test --release -p engine --lib hnsw::`・`make
 hnsw-search-recall`（層 B・`#[ignore]`）をいずれも実行し、全て green
