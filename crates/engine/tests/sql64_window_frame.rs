@@ -4,7 +4,8 @@
 //! 評価は兄弟 Issue の担当で、本 Issue（#1887）では正しいフレームが構文・束縛段を通ること、
 //! 不正なフレームが PostgreSQL 17 と同じ SQLSTATE（`42601`／`42P20`／`42P10`／`42803`／`42804`）で
 //! 拒否されることを検証する。`ROWS` は #1889 で評価まで通り（値は `sql_t40_up/sql64_window_rows_frame.rs`）、
-//! `RANGE`／`GROUPS` は #1890／#1891 まで評価前のゲート `0A000` に届く。足場は
+//! `RANGE` は #1890 で評価まで通り（値は `sql_t40_up/sql64_window_range_frame.rs`）、`GROUPS` は
+//! #1891 まで評価前のゲート `0A000` に届く。足場は
 //! `tests/sql64_lag_lead.rs` と同じ（`unique_db_path`＋`CleanupGuard`、公開 API のみ）。
 
 use engine::catalog::{ColumnDef, ColumnType, TableSchema};
@@ -93,6 +94,7 @@ fn accepted_frames_reach_evaluation_or_the_gate() {
             "ORDER BY score RANGE BETWEEN UNBOUNDED PRECEDING AND CURRENT ROW",
             "ORDER BY score RANGE BETWEEN 1 PRECEDING AND 1 FOLLOWING",
             "RANGE UNBOUNDED PRECEDING",
+            "ORDER BY score RANGE BETWEEN 1 PRECEDING AND NULL FOLLOWING",
             "ORDER BY score GROUPS BETWEEN 1 PRECEDING AND CURRENT ROW",
             "ORDER BY score ROWS UNBOUNDED PRECEDING EXCLUDE CURRENT ROW",
             "ORDER BY score ROWS UNBOUNDED PRECEDING EXCLUDE GROUP",
@@ -105,11 +107,11 @@ fn accepted_frames_reach_evaluation_or_the_gate() {
         ];
         for c in cases {
             let sql = format!("SELECT id, sum(score) OVER ({c}) FROM docs LIMIT 10");
-            // `ROWS` は評価まで通る（NULL／負のオフセットは行数に依らず 22004／22013）。
-            // `RANGE`／`GROUPS` は #1890／#1891 までゲート。
-            let want = if c.contains("RANGE") || c.contains("GROUPS") {
+            // `ROWS`・`RANGE` は評価まで通る（NULL のオフセットは行数に依らず 22004。`ROWS` の負は
+            // 22013）。`GROUPS` は #1891 までゲート。
+            let want = if c.contains("GROUPS") {
                 "0A000"
-            } else if c.contains("NULL PRECEDING") {
+            } else if c.contains("NULL PRECEDING") || c.contains("NULL FOLLOWING") {
                 "22004"
             } else if c.contains("-1 PRECEDING") {
                 "22013"
@@ -131,6 +133,10 @@ fn accepted_frames_reach_evaluation_or_the_gate() {
             let sql = format!(
                 "SELECT id, {f} OVER (ORDER BY score RANGE BETWEEN 1 PRECEDING AND 1 FOLLOWING) FROM docs LIMIT 10"
             );
+            assert_eq!(outcome(&core, &ctx, &sql), "OK", "{sql}");
+            let sql = format!(
+                "SELECT id, {f} OVER (ORDER BY score GROUPS BETWEEN 1 PRECEDING AND 1 FOLLOWING) FROM docs LIMIT 10"
+            );
             assert_eq!(outcome(&core, &ctx, &sql), "0A000", "{sql}");
         }
     }
@@ -140,8 +146,10 @@ fn accepted_frames_reach_evaluation_or_the_gate() {
 fn other_tenant_sees_same_gate() {
     let (core, _ctx, _g) = setup("frame-gate-tenant", 3);
     let other = ctx_for("tenant-b");
-    let sql = "SELECT id, sum(score) OVER (ORDER BY score RANGE BETWEEN 1 PRECEDING AND 1 FOLLOWING) FROM docs LIMIT 10";
+    let sql = "SELECT id, sum(score) OVER (ORDER BY score GROUPS BETWEEN 1 PRECEDING AND 1 FOLLOWING) FROM docs LIMIT 10";
     assert_eq!(outcome(&core, &other, sql), "0A000");
+    let range = "SELECT id, sum(score) OVER (ORDER BY score RANGE BETWEEN 1 PRECEDING AND 1 FOLLOWING) FROM docs LIMIT 10";
+    assert_eq!(outcome(&core, &other, range), "OK");
     let rows = "SELECT id, sum(score) OVER (ORDER BY score ROWS 1 PRECEDING) FROM docs LIMIT 10";
     assert_eq!(outcome(&core, &other, rows), "OK");
 }
@@ -221,7 +229,16 @@ fn analysis_stage_checks() {
         &[
             ("RANGE 1 PRECEDING", "42P20"),
             ("ORDER BY score, lang RANGE 1 PRECEDING", "42P20"),
-            ("RANGE UNBOUNDED PRECEDING", "0A000"),
+            ("RANGE UNBOUNDED PRECEDING", "OK"),
+            // `RANGE` のオフセット型はキー型と照合する（PostgreSQL 17 の in_range 照合。不一致は 0A000）。
+            ("ORDER BY score RANGE 1.5 PRECEDING", "0A000"),
+            ("ORDER BY score RANGE INTERVAL '1 day' PRECEDING", "0A000"),
+            ("ORDER BY score RANGE 1::float8 PRECEDING", "0A000"),
+            ("ORDER BY lang RANGE 1 PRECEDING", "0A000"),
+            ("ORDER BY lang RANGE NULL PRECEDING", "0A000"),
+            ("ORDER BY score RANGE '1' PRECEDING", "OK"),
+            ("ORDER BY score RANGE 'abc' PRECEDING", "22P02"),
+            ("ORDER BY score RANGE 1::bigint PRECEDING", "OK"),
             ("GROUPS CURRENT ROW", "42P20"),
             ("ORDER BY score GROUPS CURRENT ROW", "0A000"),
             ("ORDER BY score ROWS score PRECEDING", "42P10"),
@@ -256,7 +273,11 @@ fn cte_and_derived_bodies_reach_evaluation_or_the_gate() {
     let derived = "SELECT * FROM (SELECT id, sum(score) OVER (ORDER BY score ROWS 1 PRECEDING) AS s FROM docs) t";
     assert_eq!(outcome(&core, &ctx, derived), "OK");
     let cte = "WITH c AS (SELECT id, sum(score) OVER (ORDER BY score RANGE BETWEEN 1 PRECEDING AND 1 FOLLOWING) AS s FROM docs) SELECT * FROM c";
-    assert_eq!(outcome(&core, &ctx, cte), "0A000");
+    assert_eq!(outcome(&core, &ctx, cte), "OK");
     let derived = "SELECT * FROM (SELECT id, sum(score) OVER (ORDER BY score RANGE BETWEEN 1 PRECEDING AND 1 FOLLOWING) AS s FROM docs) t";
+    assert_eq!(outcome(&core, &ctx, derived), "OK");
+    let cte = "WITH c AS (SELECT id, sum(score) OVER (ORDER BY score GROUPS BETWEEN 1 PRECEDING AND 1 FOLLOWING) AS s FROM docs) SELECT * FROM c";
+    assert_eq!(outcome(&core, &ctx, cte), "0A000");
+    let derived = "SELECT * FROM (SELECT id, sum(score) OVER (ORDER BY score GROUPS BETWEEN 1 PRECEDING AND 1 FOLLOWING) AS s FROM docs) t";
     assert_eq!(outcome(&core, &ctx, derived), "0A000");
 }

@@ -36,7 +36,7 @@
 | 文全体のスカラー `ORDER BY [ASC\|DESC][, ...]`（`LIMIT`／`OFFSET` 付き。Issue #1189） | 受理（ウィンドウ値は全母集合で評価し、並べ替え・`LIMIT`／`OFFSET` は出力行にのみ効く） |
 | 文全体のベクトル `ORDER BY`（検索 SELECT）・`USING PLAN`・`GROUP BY`／集計 SELECT・`SELECT DISTINCT` との併用 | `42601`（構造的に相互排他） |
 | 文全体の `ORDER BY` でのウィンドウ別名参照（実在する同名列がある場合はその列として解釈） | `42601` |
-| フレーム句（`ROWS`/`RANGE`/`GROUPS`。Issue #1887・#1889） | 構文は受理する（形の誤りは `42601`）。`ROWS` は #1889 で評価し、`RANGE`／`GROUPS` は評価前のゲートで `0A000`（詳細は末尾「Issue #1887 追記」「Issue #1889 追記」） |
+| フレーム句（`ROWS`/`RANGE`/`GROUPS`。Issue #1887・#1889・#1890） | 構文は受理する（形の誤りは `42601`）。`ROWS` は #1889、`RANGE` は #1890 で評価し、`GROUPS` は評価前のゲートで `0A000`（詳細は末尾「Issue #1887 追記」「Issue #1889 追記」「Issue #1890 追記」） |
 | 名前付きウィンドウ（`WINDOW`/`OVER w`）・`FILTER (...)`・関数内 `DISTINCT`・複合式の引数・式の中へのウィンドウ呼び出し（`ROW_NUMBER() OVER () + 1` 等）・`*` とウィンドウ項目の混在 | `42601` |
 | `WHERE` でのウィンドウ別名参照（実在する同名列がある場合はその列として解釈） | `42601` |
 | `CREATE VIEW` 本文への `OVER` 混入 | `42601`（`parse_view_body` が構造上受理しない） |
@@ -127,7 +127,7 @@
 - ウィンドウ関数の結果による文全体の `ORDER BY`（`ORDER BY rn`）。base scan への委譲方式では評価できない
 - `EXPLAIN` とウィンドウ関数の併用（`ORDER BY` の有無を問わず `42601`）
 - `GROUP BY`／集計 SELECT とウィンドウの併用
-- `RANGE`／`GROUPS` フレームの評価（構文は Issue #1887 で受理済み。`ROWS` は #1889 で評価）・名前付きウィンドウ・`FILTER (...)`・
+- `GROUPS` フレームの評価（構文は Issue #1887 で受理済み。`ROWS` は #1889、`RANGE` は #1890 で評価）・名前付きウィンドウ・`FILTER (...)`・
   関数内 `DISTINCT`・複合式の引数
 - 式の中へのウィンドウ呼び出しの埋め込み
 - 検索 SELECT（ベクトル `ORDER BY`・`HYBRID`・`USING PLAN`）へのウィンドウ追加
@@ -294,5 +294,58 @@ Issue #1890／#1891 まで `0A000` のまま。
   `2147483648` と `9007199254740992` は受理）。`'1'` リテラルは `42804`、オフセット内の `$n` は `42601`、
   未知列は `42P10`（#1887 から継続）。評価後射影形ビュー経路では本文のエラーがオフセットのエラーより
   先に出る可能性がある。
-- **対象外**: `RANGE`（#1890）・`GROUPS`（#1891）・first_value／last_value／nth_value（#1882／#1883）、
+- **対象外**: `GROUPS`（#1891）・first_value／last_value／nth_value（#1882／#1883）、
   逆遷移・セグメント木による移動集計の高速化。
+
+## Issue #1890 追記: RANGE フレームの評価（SQL-64 (2) ポインタ）
+
+`bind_window_item` のゲートを `GROUPS` だけに縮め、`RANGE`（値オフセット付き・なしの両方）を
+PostgreSQL 17（17.11 で実測）と同じ結果・同じ SQLSTATE で評価する。`GROUPS` は #1891 まで `0A000`。
+ORDER BY なし・複数キーの `RANGE UNBOUNDED PRECEDING` 等も評価される（全行が 1 つの peer グループ）。
+
+- **オフセット型の照合**（束縛段 `bind_range_offset`。`ORDER BY` の唯一のキー型 × オフセット型。
+  PostgreSQL は不一致を一律 `0A000` にする。`42804` にはならない）
+
+  | キー型 | 受理するオフセット | 型なし文字列リテラル `'..'` の変換先 |
+  | ------ | ------------------ | ------------------------------------ |
+  | `SMALLINT`／`INTEGER`／`BIGINT`／`id` | 整数（小数・float・interval は `0A000`） | 整数（`'abc'` は `22P02`） |
+  | `REAL`／`DOUBLE PRECISION` | 整数・小数・float・numeric（`f64`。interval は `0A000`） | float8 |
+  | `NUMERIC` | 整数・小数リテラル・numeric（`Decimal` で正確に加減算。float は `0A000`） | numeric |
+  | `DATE`／`TIMESTAMP`／`TIMESTAMPTZ`／`TIME` | `INTERVAL`（整数等は `0A000`） | interval（`'abc'` は `22007`） |
+  | `TEXT`／`BOOLEAN`／`UUID` | オフセット付きは常に `0A000`（`NULL` オフセットも） | — |
+
+  小数リテラルは式層では double だが、PostgreSQL は numeric のため、未束縛の `Expr::Number` の形で補正する
+  （`1.5` は numeric キーに正確な値で渡り、整数キーには `0A000`）。`NULL` オフセットは照合を通り実行開始時に `22004`。
+- **peer と `CURRENT ROW`**: `CURRENT ROW` 境界・`EXCLUDE GROUP`／`TIES` は peer グループ単位
+  （`SortedPartition::peer_groups`）。NULL キーは NULL 同士だけが peer。
+- **境界の計算**（`range_frame_bounds`）: `UNBOUNDED`／`CURRENT ROW` は位置だけで決まる。値オフセットは、
+  現在行のキーが NULL なら NULL の peer グループ、非 NULL なら非 NULL 区間（NULL は先頭か末尾に連続するため
+  二分探索で求める）の上で、PostgreSQL の `in_range` 判定を述語にした二分探索で求める。`DESC` は加減と
+  大小の向きをともに反転する。NULL 行はオフセット境界を満たさず、`UNBOUNDED` 境界には含まれる
+  （`UNBOUNDED PRECEDING AND 1 FOLLOWING` の NULL 行は先頭から自身の peer 末尾まで）。追加の確保は
+  しないため状態予算は変わらない。比較対象（`基準値 ± オフセット`）は現在行・境界ごとに 1 回だけ計算する。
+- **型別の `in_range`**: 整数は `i128` で正確に比較（PG の桁あふれ分岐と同じ結果）。float は NaN を最大値
+  （NaN 同士は等しい）とし、基準値・オフセットがともに無限大で加減算が NaN になる組は常に範囲内とする。
+  numeric は `Decimal` の正確な加減算（あふれは `22003`）。`DATE` は日時へ昇格して比較する。
+  `TIMESTAMP` は月→日→マイクロ秒の順に加算し、最終値の 0001〜9999 年検査はしない（PG の範囲外だけ
+  `22008`。`9999-12-31` の `1 day FOLLOWING` はエラーにならない）。`interval_arith` に範囲検査なしの
+  `timestamp_shift_wide`／`timestamptz_shift_wide` を追加した（既存の加減算の挙動は不変）。
+  `TIMESTAMPTZ` は月・日をセッション TZ の壁時計で加算する（DST をまたぐ `1 day` は 24 時間と異なる）。
+  `TIME` は `INTERVAL` の時間成分だけを日またぎの折り返しなしで加減算する（月・日は無視）。
+- **オフセットの検査時点**（PG 17.11 で実測）: `NULL`（`22004`）は実行開始時に、集計と `LAG`／`LEAD` が検査する
+  （0 行でも出る）。負・NaN（`22013`）は PG の in_range 関数内の検査に合わせ、**非 NULL キーの現在行で境界を
+  求める時点**まで遅延する。0 行・全行 NULL キーのパーティションのみでは出ない。`LAG`／`LEAD` もフレームは
+  無視するが、非 NULL キーの行があるパーティションでは同じ `22013` になる。順位関数は検査しない。
+  負の判定は整数・numeric・float（NaN 含む）はその値、interval は正規化値（月 = 30 日）、`TIME` キーは時間成分のみ。
+- **集計の評価**: `evaluate_range_frame_partition`。`EXCLUDE`・累積経路（始点が `UNBOUNDED PRECEDING` で
+  `EXCLUDE` なし。終点が単調でなければ再集計へ倒す）・前方加算順・`interrupt::check()`・結果セルの状態予算計上は
+  `ROWS` と同じ。明示の `UNBOUNDED PRECEDING AND CURRENT ROW` と既定フレームは全関数で同値（テストで固定）。
+- **RLS**: 母集合は materialize 段を通った行のみ。他テナントの Private 行は境界計算にも現れない（結合テストで固定）。
+- **既知の差異**: (1) 識別子を含むオフセットは型照合より先に一律 `42P10`（PG は照合が先。存在情報の秘匿）。
+  (2) 式層の整数リテラル `2^53` 超は `22003`（#1889 から継続）。(3) 整数・小数リテラル以外の式
+  （算術等）で作った小数は double 扱いのため、numeric キーには `0A000`（fail-closed）。
+  (4) `'inf'`／`'NaN'` の float8 への変換は未対応（`0A000`。列にも NaN・無限大は格納できない）ため、
+  無限大・NaN の規則は単体テストで固定する。(5) 整数キーに対する型なし文字列リテラルは `SMALLINT` でも
+  int4 へ変換する。
+- **対象外**: `GROUPS`（#1891）・first_value／last_value／nth_value（#1882／#1883）・interval 列を
+  `ORDER BY` キーにする `RANGE`・timetz・移動集計の高速化。

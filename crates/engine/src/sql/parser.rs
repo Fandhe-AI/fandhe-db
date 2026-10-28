@@ -9712,20 +9712,37 @@ pub(crate) struct BoundWindowItem {
     pub(crate) partition_by: Vec<WindowKeyRef>,
     /// 宣言順のウィンドウ `ORDER BY` キー列（SQL-30・SQL-56）。
     pub(crate) order_by: Vec<BoundWindowOrderKey>,
-    /// 束縛済みのフレーム句（`ROWS` のみ。SQL-64 (2)・Issue #1889）。`RANGE`／`GROUPS` は
-    /// #1890／#1891 までゲート（`0A000`）で止まるため常に `None`。
+    /// 束縛済みのフレーム句（`ROWS`・`RANGE`。SQL-64 (2)・Issue #1889／#1890）。`GROUPS` は
+    /// #1891 までゲート（`0A000`）で止まるため常に `None`。
     pub(crate) frame: Option<BoundWindowFrame>,
     pub(crate) name: String,
 }
 
-/// 束縛済みのウィンドウフレーム（SQL-64 (2)・Issue #1889）。`sql::window` が実行開始時に
-/// オフセットを評価して解決する。`mode` は評価側が `ROWS` 以外を fail-closed に弾くために持つ。
+/// 束縛済みのウィンドウフレーム（SQL-64 (2)・Issue #1889／#1890）。`sql::window` が実行開始時に
+/// オフセットを評価して解決する。`mode` は評価側が `GROUPS` を fail-closed に弾くために持つ。
 #[derive(Debug, Clone, PartialEq)]
 pub(crate) struct BoundWindowFrame {
     pub(crate) mode: crate::sql::allowlist::WindowFrameMode,
     pub(crate) start: BoundFrameBound,
     pub(crate) end: BoundFrameBound,
     pub(crate) exclusion: crate::sql::allowlist::WindowFrameExclusion,
+    /// 値オフセット付き `RANGE` のオフセットの評価種別（`ORDER BY` キー型で決まる。それ以外は `None`）。
+    pub(crate) range_offset: Option<RangeOffsetKind>,
+}
+
+/// 値オフセット付き `RANGE` のオフセット値の種別（Issue #1890。`ORDER BY` キー型から一意に決まる）。
+/// 束縛段（`bind_range_offset`）が型照合と強制変換を済ませ、`sql::window` が評価値をこの種別で
+/// 解決済みオフセットへ変換する。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum RangeOffsetKind {
+    /// 整数キー（`id` を含む）の整数オフセット。
+    Int,
+    /// `REAL`／`DOUBLE PRECISION` キーの浮動小数点オフセット。
+    Float,
+    /// `NUMERIC` キーの正確な小数オフセット。
+    Numeric,
+    /// 日付・日時キーの `INTERVAL` オフセット。
+    Interval,
 }
 
 /// フレーム境界（オフセットは束縛済みの定数式）。
@@ -10378,13 +10395,13 @@ fn bind_window_item(
         frame,
         name,
     };
-    // `ROWS` 以外のフレーム句は構文・束縛段の検査（`bind_window_frame`）を通っても評価しない。
-    // 評価は #1890（RANGE）／#1891（GROUPS）がモード単位でこのゲートを外す（#1889 で ROWS は外した）。
+    // `GROUPS` フレーム句は構文・束縛段の検査（`bind_window_frame`）を通っても評価しない。
+    // 評価は #1891 がこのゲートを外す（#1889 で ROWS、#1890 で RANGE は外した）。
     // 既定フレームと同値の明示フレームも対象で、行数・テナントの有無に依存しない（fail-closed）。
     if item
         .frame
         .as_ref()
-        .is_some_and(|f| f.mode != crate::sql::allowlist::WindowFrameMode::Rows)
+        .is_some_and(|f| f.mode == crate::sql::allowlist::WindowFrameMode::Groups)
     {
         return Err(SqlSurfaceError::feature_not_supported(
             "window frame clauses are not supported yet",
@@ -10395,12 +10412,14 @@ fn bind_window_item(
     Ok(bound)
 }
 
-/// ウィンドウのフレーム句を検証し、`ROWS` のときは束縛済みフレームを返す（SQL-64 (2)・
-/// Issue #1887／#1889。[`bind_window_item`] からキー解決の後に呼ばれる。`RANGE`／`GROUPS` は
-/// 検証のみで `None`——#1890／#1891 が束縛済みフレームを追加する）。PostgreSQL の
+/// ウィンドウのフレーム句を検証し、`ROWS`・`RANGE` のときは束縛済みフレームを返す（SQL-64 (2)・
+/// Issue #1887／#1889／#1890。[`bind_window_item`] からキー解決の後に呼ばれる。`GROUPS` は
+/// 検証のみで `None`——#1891 が束縛済みフレームを追加する）。PostgreSQL の
 /// 解析段に合わせ、次の順で拒否する: `RANGE` オフセットの `ORDER BY` キー数（`42P20`）→
 /// `ORDER BY` の無い `GROUPS`（`42P20`）→ オフセット式の変数（`42P10`。列は解決せず一律に拒否し、
-/// ビューの非公開列か未知列かの存在情報を漏らさない）→ `ROWS`／`GROUPS` オフセットの型（`42804`）。
+/// ビューの非公開列か未知列かの存在情報を漏らさない）→ `ROWS`／`GROUPS` オフセットの型（`42804`）／
+/// `RANGE` オフセットの型照合（キー型 × オフセット型。不一致は `0A000`）。PostgreSQL は型照合を
+/// 変数検査より先に行うが、存在情報の秘匿のため識別子の拒否を先にする（既知の差異）。
 fn bind_window_frame(
     item: &crate::sql::allowlist::WindowSelectItem,
     udfs: &crate::sql::udf_call::UdfRegistry,
@@ -10435,9 +10454,8 @@ fn bind_window_frame(
             });
         }
     }
-    // `RANGE` のオフセット型と `ORDER BY` キー型の照合は #1890 が担う（ゲートで止まる）。
     if frame.mode == WindowFrameMode::Range {
-        return Ok(None);
+        return bind_range_frame(item, frame, udfs, schema, node_budget).map(Some);
     }
     // 境界ごとに束縛する（検査順は開始 → 終了。オフセットの型検査は従来どおり）。
     let bind_bound = |b: &WindowFrameBound,
@@ -10477,7 +10495,148 @@ fn bind_window_frame(
         start,
         end,
         exclusion: frame.exclusion,
+        range_offset: None,
     }))
+}
+
+/// `RANGE` フレームを束縛する（SQL-64 (2)・Issue #1890。[`bind_window_frame`] からのみ呼ばれる）。
+/// オフセットが無ければ（`UNBOUNDED`／`CURRENT ROW` だけ。`ORDER BY` なし・複数キーも可）型照合は不要。
+/// オフセットがあれば `ORDER BY` の唯一のキー型でオフセット型を決め（[`bind_range_offset`]）、
+/// 不一致は `0A000` で拒否する。
+fn bind_range_frame(
+    item: &crate::sql::allowlist::WindowSelectItem,
+    frame: &crate::sql::allowlist::WindowFrame,
+    udfs: &crate::sql::udf_call::UdfRegistry,
+    schema: &TableSchema,
+    node_budget: &mut usize,
+) -> Result<BoundWindowFrame, SqlSurfaceError> {
+    use crate::sql::allowlist::WindowFrameBound;
+    let has_offset = frame.start.offset().is_some() || frame.end.offset().is_some();
+    let mut range_offset = None;
+    let key = match (has_offset, item.order_by.first()) {
+        (true, Some(ob)) => Some(resolve_window_key(&ob.column, schema)?),
+        _ => None,
+    };
+    let mut bind_bound = |b: &WindowFrameBound| -> Result<BoundFrameBound, SqlSurfaceError> {
+        let mut offset = |e: &Expr| -> Result<BoundFrameOffset, SqlSurfaceError> {
+            let key = key.ok_or_else(|| SqlSurfaceError::Internal {
+                detail: "RANGE frame offset without an ORDER BY key".to_string(),
+            })?;
+            let (o, kind) = bind_range_offset(e, key, schema, udfs, node_budget)?;
+            range_offset = Some(kind);
+            Ok(o)
+        };
+        Ok(match b {
+            WindowFrameBound::UnboundedPreceding => BoundFrameBound::UnboundedPreceding,
+            WindowFrameBound::Preceding(e) => BoundFrameBound::Preceding(offset(e)?),
+            WindowFrameBound::CurrentRow => BoundFrameBound::CurrentRow,
+            WindowFrameBound::Following(e) => BoundFrameBound::Following(offset(e)?),
+            WindowFrameBound::UnboundedFollowing => BoundFrameBound::UnboundedFollowing,
+        })
+    };
+    let start = bind_bound(&frame.start)?;
+    let end = bind_bound(&frame.end)?;
+    Ok(BoundWindowFrame {
+        mode: frame.mode,
+        start,
+        end,
+        exclusion: frame.exclusion,
+        range_offset,
+    })
+}
+
+/// `RANGE` オフセット 1 つを `ORDER BY` キー型 `key` と照合して束縛する（Issue #1890。
+/// [`bind_range_frame`] からのみ呼ばれる）。PostgreSQL 17 の in_range 照合に合わせ、受理は
+/// 整数キー←整数、浮動小数点キー←整数・小数・浮動小数点、`NUMERIC` キー←整数・小数（浮動小数点は不可）、
+/// 日付・日時キー←`INTERVAL`。型なし文字列リテラルはキー型の目標型へ `CAST` で強制変換する。
+/// `TEXT`／`BOOLEAN`／`UUID` キーと型の不一致は固定文言の `0A000`（値・型名を含めない）。
+/// 裸の `NULL` は照合を通り、実行開始時に `22004`（`sql::window::resolve_frames`）。
+fn bind_range_offset(
+    e: &Expr,
+    key: WindowKeyRef,
+    schema: &TableSchema,
+    udfs: &crate::sql::udf_call::UdfRegistry,
+    node_budget: &mut usize,
+) -> Result<(BoundFrameOffset, RangeOffsetKind), SqlSurfaceError> {
+    use crate::sql::cast::CastType;
+    // 最上位が NUMERIC の式（`CAST(.. AS numeric)`）も束縛できる版を使う（オフセットは評価結果の
+    // 値だけを使い、投影はしない）。
+    use crate::sql::udf_call::{
+        bind_aggregate_projection_expr_top as bind_projection_expr, ExprType,
+    };
+    let mismatch = || {
+        SqlSurfaceError::feature_not_supported(
+            "RANGE with offset PRECEDING/FOLLOWING is not supported for this column type and offset type",
+        )
+    };
+    let (kind, string_cast) = match key {
+        WindowKeyRef::Id => (RangeOffsetKind::Int, CastType::Int8),
+        WindowKeyRef::Column { kind, .. } => match kind {
+            WindowKeyKind::Integer => (RangeOffsetKind::Int, CastType::Int4),
+            WindowKeyKind::BigInt => (RangeOffsetKind::Int, CastType::Int8),
+            WindowKeyKind::Real | WindowKeyKind::Double => {
+                (RangeOffsetKind::Float, CastType::Float8)
+            }
+            WindowKeyKind::Numeric => (RangeOffsetKind::Numeric, CastType::Numeric(None)),
+            WindowKeyKind::Date
+            | WindowKeyKind::Timestamp
+            | WindowKeyKind::TimestampTz
+            | WindowKeyKind::Time => (RangeOffsetKind::Interval, CastType::Interval),
+            WindowKeyKind::Text | WindowKeyKind::Boolean | WindowKeyKind::Uuid => {
+                return Err(mismatch());
+            }
+        },
+    };
+    if matches!(e, Expr::Null) {
+        return Ok((BoundFrameOffset::Null, kind));
+    }
+    // 型なし文字列リテラルは目標型へ強制変換する（解析エラーは CAST 経路の既存コード）。
+    if matches!(e, Expr::String(_)) {
+        let wrapped = Expr::Cast {
+            expr: Box::new(e.clone()),
+            ty: string_cast,
+        };
+        let (bound, _, _) = bind_projection_expr(&wrapped, schema, udfs, node_budget)?;
+        return Ok((BoundFrameOffset::Expr(bound), kind));
+    }
+    let (bound, ty, col) = bind_projection_expr(e, schema, udfs, node_budget)?;
+    // 小数リテラル（整数形でない数値リテラル）は PostgreSQL では numeric。式層は double として
+    // 運ぶため、未束縛の形で補正する。
+    let is_decimal_literal = matches!(e, Expr::Number(raw) if !is_integer_literal_text(raw));
+    let is_int = matches!(
+        col,
+        Some(ColumnType::SmallInt | ColumnType::Integer | ColumnType::BigInt)
+    );
+    let is_float = !is_decimal_literal
+        && (matches!(col, Some(ColumnType::Real | ColumnType::Double))
+            || (ty == ExprType::Scalar && !is_int && col.is_none()));
+    let is_numeric = is_decimal_literal || ty == ExprType::Numeric;
+    let is_interval = ty == ExprType::Interval;
+    let ok = match kind {
+        RangeOffsetKind::Int => is_int,
+        RangeOffsetKind::Float => is_int || is_float || is_numeric,
+        RangeOffsetKind::Numeric => is_int || is_numeric,
+        RangeOffsetKind::Interval => is_interval,
+    };
+    if !ok {
+        return Err(mismatch());
+    }
+    // NUMERIC キーは整数・小数リテラルを正確な NUMERIC へ変換して運ぶ（f64 を経由しない）。
+    if kind == RangeOffsetKind::Numeric && ty != ExprType::Numeric {
+        let wrapped = Expr::Cast {
+            expr: Box::new(e.clone()),
+            ty: CastType::Numeric(None),
+        };
+        let (bound, _, _) = bind_projection_expr(&wrapped, schema, udfs, node_budget)?;
+        return Ok((BoundFrameOffset::Expr(bound), kind));
+    }
+    Ok((BoundFrameOffset::Expr(bound), kind))
+}
+
+/// 数値リテラルの生テキストが整数形（符号と数字のみ）か。
+fn is_integer_literal_text(raw: &str) -> bool {
+    let digits = raw.strip_prefix(['-', '+']).unwrap_or(raw);
+    !digits.is_empty() && digits.bytes().all(|b| b.is_ascii_digit())
 }
 
 /// `where_predicates`（未束縛。`sql::allowlist::WherePredicate`）が参照する列名を
