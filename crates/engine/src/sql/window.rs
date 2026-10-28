@@ -311,22 +311,24 @@ impl OffsetEvaluator {
         };
 
         // 値はこの行が参照先になったときに返すもの。データ例外（22xxx）だけ遅延する。
-        let value =
-            match &args.value {
-                BoundWindowValue::Column { index, ty } => {
-                    Ok(scalar_cell(ty, *index, scanned, state_bytes, state_cap)?)
-                }
-                BoundWindowValue::PseudoId => defer_data_exception(pseudo_id_cell(id))?,
-                BoundWindowValue::Expr { .. } => {
-                    let program = programs
-                        .value
-                        .as_ref()
-                        .ok_or_else(|| window_bug("value program missing at evaluation"))?;
-                    defer_data_exception(program.eval(id, embedding, scanned, scratch).and_then(
-                        |v| computed_value_to_cell(v, result_ty, state_bytes, state_cap),
-                    ))?
-                }
-            };
+        let value = match &args.value {
+            BoundWindowValue::Column { index, ty } => {
+                Ok(scalar_cell(ty, *index, scanned, state_bytes, state_cap)?)
+            }
+            BoundWindowValue::PseudoId => {
+                defer_data_exception(pseudo_id_cell(id), state_bytes, state_cap)?
+            }
+            BoundWindowValue::Expr { .. } => {
+                let program = programs
+                    .value
+                    .as_ref()
+                    .ok_or_else(|| window_bug("value program missing at evaluation"))?;
+                let evaluated = program
+                    .eval(id, embedding, scanned, scratch)
+                    .and_then(|v| computed_value_to_cell(v, result_ty, state_bytes, state_cap));
+                defer_data_exception(evaluated, state_bytes, state_cap)?
+            }
+        };
 
         // 既定値は現在行で評価し、パーティション外を指したときだけ使う。
         let default = if let Some((index, ty)) = &args.default_column {
@@ -338,13 +340,16 @@ impl OffsetEvaluator {
                 state_cap,
             )?))
         } else if args.default_pseudo_id {
-            Some(defer_data_exception(pseudo_id_cell(id))?)
-        } else if let (Some(_), Some(program)) = (&args.default, &programs.default) {
             Some(defer_data_exception(
-                program
-                    .eval(id, embedding, scanned, scratch)
-                    .and_then(|v| computed_value_to_cell(v, result_ty, state_bytes, state_cap)),
+                pseudo_id_cell(id),
+                state_bytes,
+                state_cap,
             )?)
+        } else if let (Some(_), Some(program)) = (&args.default, &programs.default) {
+            let evaluated = program
+                .eval(id, embedding, scanned, scratch)
+                .and_then(|v| computed_value_to_cell(v, result_ty, state_bytes, state_cap));
+            Some(defer_data_exception(evaluated, state_bytes, state_cap)?)
         } else {
             None
         };
@@ -382,12 +387,22 @@ fn scalar_cell(
 
 /// データ例外（`22xxx`）は `Err` のまま保持して返し、それ以外（予算超過・中断・内部エラー）は
 /// 即時に伝播する。値・既定値は参照されない行では評価されなかったものとして扱うため。
+///
+/// 保持するエラーの所有文字列（`detail` 等。入力の一部を含みうる）は行ごとに残るため、
+/// 表示文字列長（所有文字列の長さ以上）を状態予算へ計上し、超過は `54000`（fail-closed）。
+/// 値側・既定値側のエラー保持はすべて本関数を通り、計上経路はここ 1 か所に集約する。
 fn defer_data_exception(
     r: Result<Cell, SqlSurfaceError>,
+    state_bytes: &mut usize,
+    state_cap: usize,
 ) -> Result<Result<Cell, SqlSurfaceError>, SqlSurfaceError> {
     match r {
         Ok(c) => Ok(Ok(c)),
-        Err(e) if e.wire_code().starts_with("22") => Ok(Err(e)),
+        Err(e) if e.wire_code().starts_with("22") => {
+            *state_bytes =
+                try_accumulate_state_budget(*state_bytes, e.to_string().len(), state_cap)?;
+            Ok(Err(e))
+        }
         Err(e) => Err(e),
     }
 }
@@ -2655,6 +2670,58 @@ mod budget_regression_tests {
             .err()
             .expect("cap below the retained size must reject");
         assert_eq!(err.wire_code(), "54000");
+    }
+
+    /// 値・既定値の評価で保持する `22xxx` エラーの所有文字列も状態予算へ計上される
+    /// （不正な文字列の CAST エラーが全行で残る形。cap を下回ると `54000`）。
+    #[test]
+    fn lag_deferred_error_strings_are_charged_against_state_budget() {
+        let path = unique_db_path("window-state-budget-lag-err");
+        let _guard = CleanupGuard(path.clone());
+        let storage = Storage::open(&path).expect("open storage");
+        let schema = schema_with_text();
+        storage.create_table(&schema).expect("create table");
+        let body = "z".repeat(60);
+        for id in 1..=3u64 {
+            write_text_row(&storage, &schema, "tenant-a", id, &body);
+        }
+        let ctx = PolicyContext::new("tenant-a").expect("valid tenant");
+        let read_txn = storage.db().begin_read().expect("begin_read");
+        let udfs = crate::sql::udf_call::UdfRegistry::default();
+
+        for sql in [
+            // 値側のエラーが全行で保持される（既定値は NULL）。
+            "SELECT id, lag(CAST(body AS integer), NULL) OVER (ORDER BY id) FROM docs LIMIT 10",
+            // 既定値側のエラーが全行で保持される。
+            "SELECT id, lag(7, 1, CAST(body AS integer)) OVER (ORDER BY id) FROM docs LIMIT 10",
+        ] {
+            let crate::sql::allowlist::Statement::Scan(validated) =
+                crate::sql::allowlist::validate_sql(sql, &storage).expect("validate")
+            else {
+                panic!("expected scan statement");
+            };
+            let bound = crate::sql::parser::bind_scan(&validated, &schema, &udfs).expect("bind");
+            let needed = materialize_rows(&read_txn, &ctx, &schema, &bound, usize::MAX)
+                .expect("materialize should succeed with an unbounded cap")
+                .state_bytes;
+            // 3 行 x 保持エラー文字列（入力 60 文字を含む）が計上されていること。
+            let baseline = {
+                let mut b = bound.clone();
+                b.windows[0].offset_args = None;
+                b.windows[0].func = WindowFunc::RowNumber;
+                materialize_rows(&read_txn, &ctx, &schema, &b, usize::MAX)
+                    .expect("baseline")
+                    .state_bytes
+            };
+            assert!(
+                needed >= baseline + 3 * 60,
+                "{sql}: error strings uncounted"
+            );
+            let err = materialize_rows(&read_txn, &ctx, &schema, &bound, needed - 1)
+                .err()
+                .expect("cap below the retained size must reject");
+            assert_eq!(err.wire_code(), "54000", "{sql}");
+        }
     }
 
     /// PR #1233 指摘の回帰: `ORDER BY` なしでは順列を確保せず状態予算にも計上しない
