@@ -345,3 +345,30 @@ fn inline_only_context_rejects_tail_cte() {
         .expect_err("tail CTE in a view body");
     assert_eq!(err.wire_code(), "0A000");
 }
+
+/// 導出層（先行 CTE を読む tail CTE）の `LIMIT` 省略は、単一表経路と同じく `OFFSET` 適用後の件数で
+/// 結果行数上限を判定する（PR #2733 レビュー指摘）。alice の可視行は 6 行・上限 5。
+#[test]
+fn derived_tail_cte_without_limit_is_capped_after_offset() {
+    let (core, _g) = open_with(Some(ResultLimits::new(5)));
+    let offset2 = "WITH a AS (SELECT id FROM docs), \
+               b AS (SELECT id FROM a ORDER BY id OFFSET 2) \
+               SELECT x.id FROM b x JOIN docs d ON x.id = d.id ORDER BY x.id LIMIT 5";
+    assert_eq!(ints(&ok(&core, "alice", offset2), 0), vec![3, 4, 5, 7]);
+    // `OFFSET` 後も上限（5）を超える本文は `54000`。
+    let offset0 = "WITH a AS (SELECT id FROM docs), \
+               b AS (SELECT id FROM a ORDER BY id OFFSET 0) \
+               SELECT x.id FROM b x JOIN docs d ON x.id = d.id ORDER BY x.id LIMIT 5";
+    assert_eq!(code(&core, "alice", offset0), "54000");
+}
+
+/// 導出層の `SELECT *` 本文の序数 `ORDER BY` は固定 `0A000`（親の列で `*` を展開しない制限。
+/// 列名を明示した本文は序数でも並べられる）。
+#[test]
+fn derived_tail_cte_star_ordinal_order_by_is_unsupported() {
+    let (core, _g) = open_with(None);
+    let star = "WITH a AS (SELECT id FROM docs), \
+               b AS (SELECT * FROM a ORDER BY 1 DESC LIMIT 2) \
+               SELECT x.id FROM b x JOIN docs d ON x.id = d.id LIMIT 10";
+    assert_eq!(code(&core, "alice", star), "0A000");
+}

@@ -259,6 +259,10 @@ tail CTE と呼ぶ（`CteDef.tail`）。関連: SQL-34（暗黙上限・`54000`�
   掛かる（RLS-10 (b)）。`LIMIT` なし（`ORDER BY` のみ・`OFFSET` のみ）の本文は暗黙上限で評価し、可視行が
   `--max-result-rows` を超えたら `54000`。本文 `ORDER BY` のキーは FROM の公開列に限定する（非公開列を
   並べ替えの oracle にしない。参照されない CTE にも適用）。
+- JOIN の導出層（`Derived`）の制限: 本文が `SELECT *` で序数 `ORDER BY`（`ORDER BY 1`）を使う形は、親の
+  結果列が評価前に確定しないため固定 `0A000`（列名を明示した本文、または単一表の主クエリでは序数も使える）。
+  `LIMIT` なしの導出層は単一表経路と同じく `OFFSET` 適用後の件数で上限を判定する（親が他の読み手と共有されない
+  ときだけ、親の暗黙上限を `OFFSET` 適用前は hard cap まで緩め、JoinBudget で抑える）。
 - 外側に `ORDER BY` がなければ外側の順序は保証しない（PostgreSQL と同じ）。外側の `WHERE` は本文の `LIMIT`
   の後に適用される。
 - 拒否: tail CTE を別の CTE が読む連鎖・インライン専用の文脈（ビュー本文・cursor・CTAS 等）での参照・データ

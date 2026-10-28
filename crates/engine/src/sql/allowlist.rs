@@ -22956,7 +22956,13 @@ fn derived_cte_layer(ctes: &[super::cte::CteDef], idx: usize) -> Option<(usize, 
             window_items: Vec::new(),
             limit,
             limit_explicit,
-            limit_implicit: false,
+            // tail CTE の `LIMIT` 省略は、単一表経路と同じく `OFFSET` 適用後の件数で結果行数上限を
+            // 判定する印（評価側 `EngineCore::evaluate_cte_slot` が層の適用後に検査する）。
+            limit_implicit: ctes
+                .get(idx)?
+                .tail
+                .as_ref()
+                .is_some_and(|t| t.limit.is_none()),
             offset,
         },
     ))
