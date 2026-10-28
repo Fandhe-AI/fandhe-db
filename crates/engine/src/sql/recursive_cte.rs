@@ -21,8 +21,8 @@
 use super::allowlist::{
     is_set_operator_ident, set_operator_is_followed_by_branch, split_parenthesized,
     split_recursive_with_clause, validate_data_modifying_cte_syntax,
-    validate_sql_tokens_with_subquery_ctx_limits, JoinKind, RecursiveWithHeader, SearchClause,
-    SqlSurfaceError, Statement, StructuralOnlyLookup, TableLookup,
+    validate_sql_tokens_with_subquery_ctx_limits, CycleClause, JoinKind, RecursiveWithHeader,
+    SearchClause, SqlSurfaceError, Statement, StructuralOnlyLookup, TableLookup,
 };
 use super::lexer::{Keyword, Token};
 use crate::nesting_limits::NestingLimits;
@@ -43,6 +43,8 @@ pub(crate) struct RecursiveCteDef {
     /// 定義直後の `SEARCH` 句（SQL-35・Issue #2213）。自己参照を持つ定義にだけ付く
     /// （持たない定義への指定は `42601`）。評価は `sql::recursive_eval` が行う。
     pub(crate) search: Option<SearchClause>,
+    /// 定義直後の `CYCLE` 句（SQL-35・Issue #2214）。`SEARCH` と同じく自己参照を持つ定義にだけ付く。
+    pub(crate) cycle: Option<CycleClause>,
 }
 
 /// CTE 本文の種別。
@@ -473,13 +475,7 @@ fn validate_with_clause(
 
     // 機能ゲート（0A000）は検出結果を保持し、全定義の構文・再帰構造の検証が終わってから返す。
     let mut deferred: Option<SqlSurfaceError> = None;
-    // `CYCLE` 句の実行は未対応（#2214）。`SEARCH` 句は評価できる（#2213）ためゲートに含めない。
-    if raw_defs.iter().any(|d| d.has_cycle) {
-        deferred = Some(SqlSurfaceError::feature_not_supported(
-            "the CYCLE clause of WITH RECURSIVE is not supported yet",
-        ));
-    }
-    // 自己参照を持たない定義への `SEARCH` 句（`42601`）。判定順は再帰構造（`42P19`）の後。
+    // 自己参照を持たない定義への `SEARCH`／`CYCLE` 句（`42601`）。判定順は再帰構造（`42P19`）の後。
     let mut search_err: Option<SqlSurfaceError> = None;
     // 再帰構造エラー（42P19）は保留し、後続定義の構文検証（42601）を優先させる。
     let mut structural_err: Option<SqlSurfaceError> = None;
@@ -559,7 +555,9 @@ fn validate_with_clause(
             }
             Err(e) => return Err(e),
         };
-        if raw.search.is_some() && matches!(kind, RecursiveCteBody::NonRecursive { .. }) {
+        if (raw.search.is_some() || raw.cycle.is_some())
+            && matches!(kind, RecursiveCteBody::NonRecursive { .. })
+        {
             search_err
                 .get_or_insert_with(|| SqlSurfaceError::unsupported("WITH query is not recursive"));
         }
@@ -568,6 +566,7 @@ fn validate_with_clause(
             column_aliases: column_aliases.clone(),
             body: kind,
             search: raw.search.clone(),
+            cycle: raw.cycle.clone(),
         });
     }
     if let Some(e) = structural_err {
@@ -1065,12 +1064,17 @@ mod tests {
             "WITH RECURSIVE t(n) AS (SELECT 1 UNION ALL SELECT n + 1 FROM t) SEARCH DEPTH FIRST BY n SELECT n FROM t".to_string(),
             "WITH RECURSIVE t(n) AS (SELECT 1 UNION ALL SELECT n + 1 FROM t) CYCLE n SELECT n FROM t".to_string(),
             "WITH RECURSIVE t(n) AS (SELECT 1 UNION ALL SELECT n + 1 FROM t) CYCLE n SET c TO 1 USING p SELECT n FROM t".to_string(),
+            // `USING` は必須・符号付き定数と任意の識別子は定数にならない（#2214）。
+            "WITH RECURSIVE t(n) AS (SELECT 1 UNION ALL SELECT n + 1 FROM t) CYCLE n SET c SELECT n FROM t".to_string(),
+            "WITH RECURSIVE t(n) AS (SELECT 1 UNION ALL SELECT n + 1 FROM t) CYCLE n SET c TO -1 DEFAULT 0 USING p SELECT n FROM t".to_string(),
+            "WITH RECURSIVE t(n) AS (SELECT 1 UNION ALL SELECT n + 1 FROM t) CYCLE n SET c TO foo DEFAULT 0 USING p SELECT n FROM t".to_string(),
         ] {
             assert_eq!(code(&sql), "42601", "{sql}");
         }
         for sql in [
             "WITH RECURSIVE t(n) AS (SELECT 1 UNION ALL SELECT n + 1 FROM t) SEARCH BREADTH FIRST BY n SET o SELECT n FROM t",
             "WITH RECURSIVE t(n) AS (SELECT 1 UNION ALL SELECT n + 1 FROM t) CYCLE n SET c TO 1 DEFAULT 0 USING p SELECT n FROM t",
+            "WITH RECURSIVE t(n) AS (SELECT 1 UNION ALL SELECT n + 1 FROM t) CYCLE n SET c TO 'Y' DEFAULT 'N' USING p SELECT n FROM t",
             "WITH RECURSIVE t(n) AS (SELECT 1 UNION ALL SELECT n + 1 FROM t) SEARCH DEPTH FIRST BY n SET o CYCLE n SET c USING p SELECT n FROM t",
         ] {
             assert_eq!(code(sql), NOT_YET, "{sql}");
@@ -1217,6 +1221,7 @@ mod tests {
         for (sql, want) in [
             ("WITH RECURSIVE t(n) AS (SELECT 1) SEARCH DEPTH FIRST BY n SET o SELECT n FROM t", "42601"),
             ("WITH RECURSIVE t(n) AS (SELECT n FROM t) SEARCH DEPTH FIRST BY n SET o SELECT n FROM t", "42P19"),
+            ("WITH RECURSIVE t(n) AS (SELECT 1) CYCLE n SET c USING p SELECT n FROM t", "42601"),
             ("WITH RECURSIVE t(n) AS (SELECT 1), u AS (DELETE FROM docs) SEARCH DEPTH FIRST BY n SET o SELECT n FROM t", NOT_YET),
         ] {
             assert_eq!(code(sql), want, "{sql}");
