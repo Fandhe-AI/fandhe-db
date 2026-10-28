@@ -95,6 +95,7 @@ mod sql63_data_modifying_cte_exec;
 mod sql63_data_modifying_cte_semantics;
 mod sql63_data_modifying_cte_syntax;
 mod sql64_lag_lead;
+mod sql64_named_window;
 mod sql64_window_groups_frame;
 mod sql64_window_range_frame;
 mod sql64_window_rows_frame;

@@ -421,6 +421,7 @@ pub(crate) fn redact_row_conversion_error(e: SqlSurfaceError) -> SqlSurfaceError
         | E::UndefinedObject { .. }
         | E::UndefinedType { .. }
         | E::UndefinedCollation { .. }
+        | E::UndefinedWindow { .. }
         | E::UndefinedColumn { .. }
         | E::CheckViolation { .. }
         | E::WithCheckOptionViolation
