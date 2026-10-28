@@ -1248,7 +1248,7 @@ fn error_responses_are_identical_with_and_without_other_tenant_private_rows() {
     }
 }
 
-/// データ依存カナリア（AC3 (b)）:他テナントの不可視行だけで閾値を超えさせても
+/// データ依存カナリア（AC3 (b)）: 他テナントの不可視行だけで閾値を超えさせても
 /// 閲覧テナントの応答（成功・結果）が不変であること。判定機構自体が空虚でない
 /// ことは陽性対照（閲覧テナント自身の行で同じ閾値を実際に超えさせる）で裏付ける。
 mod data_dependent_canaries {
