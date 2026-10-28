@@ -97,6 +97,27 @@ fn wire_cte_simple_query_returns_only_exposed_columns() {
     read_ready_for_query(&mut stream);
 }
 
+/// 重複除去版 `UNION` の再帰が接続の上で評価され、重複を除いた行が返る（SQL-35・Issue #1872）。
+#[test]
+fn wire_recursive_union_returns_deduplicated_rows() {
+    let (core, _guard) = new_core_with_docs_table();
+    let users_path = write_user_store_file(&[("alice", "tenant-a", "correct-horse")]);
+    let store = UserStore::load_from_file(&users_path).expect("valid user store");
+    let addr = spawn_server_with_engine_and_store(store, core);
+    let mut stream = authenticate_to_ready_for_query(addr, "alice", "correct-horse");
+
+    send_simple_query(
+        &mut stream,
+        "WITH RECURSIVE r(n) AS (SELECT 1 UNION SELECT 4 - n FROM r) SELECT n FROM r",
+    );
+    let columns = read_row_description(&mut stream);
+    assert_eq!(columns, vec!["n".to_string()]);
+    assert_eq!(read_data_row(&mut stream), vec![Some("1".to_string())]);
+    assert_eq!(read_data_row(&mut stream), vec![Some("3".to_string())]);
+    assert_eq!(read_command_complete(&mut stream), "SELECT 2");
+    read_ready_for_query(&mut stream);
+}
+
 /// 拒否形ごとの SQLSTATE が `ErrorResponse` に現れ、接続は使用可能なまま維持
 /// される。
 #[test]
@@ -108,9 +129,10 @@ fn wire_cte_rejected_forms_report_expected_sqlstate_and_keep_connection_usable()
     let mut stream = authenticate_to_ready_for_query(addr, "alice", "correct-horse");
 
     let cases: &[(&str, &str)] = &[
-        // `UNION`（重複除去）の再帰は #1872 まで機能ゲートの `0A000`。
+        // `UNION` と `SEARCH` の併用は機能ゲートの `0A000`（`UNION` 単独は #1872 で評価できる）。
         (
-            "WITH RECURSIVE r(n) AS (SELECT 1 UNION SELECT n + 1 FROM r WHERE n < 3) SELECT n FROM r",
+            "WITH RECURSIVE r(n) AS (SELECT 1 UNION SELECT n + 1 FROM r WHERE n < 3) \
+             SEARCH DEPTH FIRST BY n SET o SELECT n FROM r",
             "0A000",
         ),
         // SQL-35・Issue #1869: 不正な再帰（アンカー項に自己参照）は `42P19`。

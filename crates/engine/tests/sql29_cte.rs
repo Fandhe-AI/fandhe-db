@@ -249,13 +249,14 @@ fn with_recursive_without_self_reference_runs_as_plain_cte() {
     )
     .expect("plain CTE");
     assert_eq!(recursive, plain);
-    // 評価対象外の再帰形（`UNION`）は `0A000` のまま。
-    let err = query_err(
+    // 重複除去版（`UNION`）の再帰も評価される（SQL-35・Issue #1872）。
+    let result = query(
         &core,
         "alice",
         "WITH RECURSIVE r(n) AS (SELECT 1 UNION SELECT n + 1 FROM r WHERE n < 3) SELECT n FROM r",
-    );
-    assert_eq!(err.wire_code(), "0A000");
+    )
+    .expect("recursive UNION is evaluated");
+    assert_eq!(result.rows.len(), 3);
 }
 
 // --- 受入基準 3: 定義数・連鎖の深さの上限 --------------------------------------

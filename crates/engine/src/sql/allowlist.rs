@@ -2868,7 +2868,7 @@ pub enum Statement {
     /// **本 variant の追加は破壊的変更（BREAKING CHANGE）**: 既存の網羅的 `match` はアームの
     /// 追加が必要（`ConstSelect` 追加時と同じ運用）。
     MaterializedView(ValidatedMaterializedViewRead),
-    /// `WITH RECURSIVE <name> [(列名, ...)] AS (<アンカー項> UNION ALL <再帰項>)` の CTE 全体の
+    /// `WITH RECURSIVE <name> [(列名, ...)] AS (<アンカー項> UNION [ALL] <再帰項>)` の CTE 全体の
     /// 結果集合（SQL-35・Issue #1870）。`sql::recursive_eval` が作業表方式で反復評価する。
     /// 単独の文としては生成されず、主クエリの外側（WHERE・ORDER BY・集計・LIMIT）を重ねた
     /// [`Statement::BufferedView`]（`origin: MaterializedCte`）の本文としてのみ現れる。
@@ -2891,6 +2891,9 @@ pub struct ValidatedRecursiveCte {
     pub(crate) anchor: Box<Statement>,
     /// 再帰項（CTE 名だけを作業表として解決する検証で得た `Scan` か `Join`）。
     pub(crate) recursive: Box<Statement>,
+    /// アンカー項と再帰項の結合が `UNION ALL`（`true`）か `UNION`／`UNION DISTINCT`（`false`。
+    /// 重複除去。SQL-35・Issue #1872）か。
+    pub(crate) union_all: bool,
     /// 定義直後の `SEARCH ... SET` 句（SQL-35・Issue #2213）。`sql::recursive_eval` が順序列を
     /// 生成して結果列の末尾へ足す。
     pub(crate) search: Option<SearchClause>,
@@ -24078,9 +24081,12 @@ fn recursive_cte_statement(
             "WITH RECURSIVE with several definitions is not supported yet",
         ));
     };
-    if !*union_all {
+    // `UNION`（重複除去。SQL-35・Issue #1872）は演算子を検証済みの文へ運び、重複除去は
+    // `sql::recursive_eval` が行う。`SEARCH` 句つきの `UNION` は順序列を含めた重複判定が必要になる
+    // ため、黙って順序列なしで比較しないよう固定の `0A000` で拒否する（fail-closed）。
+    if !*union_all && def.search.is_some() {
         return Err(SqlSurfaceError::feature_not_supported(
-            "WITH RECURSIVE with UNION (duplicate elimination) is not supported yet",
+            "a SEARCH clause with UNION in WITH RECURSIVE is not supported yet",
         ));
     }
     if cte_evaluation != CteEvaluation::AllowMaterialize {
@@ -24145,6 +24151,7 @@ fn recursive_cte_statement(
         column_aliases: def.column_aliases.clone(),
         anchor: Box::new(anchor_stmt),
         recursive: Box::new(recursive_stmt),
+        union_all: *union_all,
         search: def.search.clone(),
     }));
     let view_name = def.name.clone();

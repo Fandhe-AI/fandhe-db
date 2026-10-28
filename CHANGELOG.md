@@ -9,6 +9,8 @@
 
 ### Added
 
+- 再帰 CTE の `UNION`（重複除去）版を評価できるようにした（Issue #1872・SQL-35）。既出行を捨てるため循環グラフでも止まり、捨てた重複は累積行数の上限に数えない。`JSON` 列の `UNION` と `SEARCH` 句との併用は固定 `0A000`。
+  挙動変更: 従来 `0A000` だった `UNION` の再帰が評価される。公開 API の変更はない（非 BREAKING）。詳細は [recursive-cte.md](docs/design/recursive-cte.md) の「Issue #1872 追記」節。
 - CTE 本文の集計・`GROUP BY`・`SELECT DISTINCT`・ウィンドウ関数を受け付ける（Issue #1863・SQL-62）。インライン展開では外側の `WHERE` が集計・窓の前に掛かって誤結果になるため、常に具体化して評価し、集計値・窓の値は参照者の可視行だけから計算される。`LIMIT` なしの本文は暗黙上限で、可視行（グループ）が `--max-result-rows` を超えると `54000`。
   挙動変更: 従来 `42601` で拒否していた形が受理される。他の CTE が読む連鎖・集計 CTE の JOIN 入力・ビュー本文や cursor などインライン専用の文脈での参照は固定 `0A000`。公開 enum は変えない（非 BREAKING）。詳細は [cte.md](docs/design/cte.md) の「Issue #1863 追記」節。
 - CTE 本文の `ORDER BY`・`LIMIT`・`OFFSET` を受け付ける（Issue #1862・SQL-62）。本文に `LIMIT` を持つ CTE はインライン展開では `LIMIT` が落ちるため、常に具体化して評価し（単一表の主クエリは評価後射影形、JOIN は入力 slot）、外側の `WHERE` は本文の `LIMIT` の後に適用される。`LIMIT` なしの本文は暗黙上限で、可視行が `--max-result-rows` を超えると `54000`。

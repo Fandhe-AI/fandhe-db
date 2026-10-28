@@ -9503,6 +9503,16 @@ impl EngineCore {
                 // 実行する前に Describe と同じ経路で検査する（データ依存の実行エラーに覆われない。
                 // Describe／Execute で同じエラー）。
                 self.describe_recursive_cte(&*session, &validated, false, &limits)?;
+                // 重複除去版（`UNION`）はアンカー候補へ結果行数上限を適用しない（捨てる重複は行数に
+                // 数えない契約。上限は重複除去後に `recursive_eval::execute` が判定する）。候補生成は
+                // ハード上限と各走査の入力上限で抑えられる。
+                let anchor_limits = if validated.union_all {
+                    limits
+                } else {
+                    crate::result_limits::ResultLimits::new(
+                        crate::result_limits::MAX_RESULT_ROWS_HARD_CAP,
+                    )
+                };
                 let anchor = match &*validated.anchor {
                     // `FROM` なし定数式はセッション UDF レジストリを要する専用の実行本体を持つ
                     // （`execute_read_statement_with_limits` の対象外）。
@@ -9514,7 +9524,7 @@ impl EngineCore {
                         session,
                         other.clone(),
                         read_txn,
-                        limits,
+                        anchor_limits,
                     )? {
                         crate::sql::SqlOutcome::Query(result) => result,
                         _ => {
