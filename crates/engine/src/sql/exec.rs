@@ -246,6 +246,14 @@ pub enum Cell {
     /// `UUID` 列の投影結果（TABLE-13〔検討中〕・TASK-197、Issue #887）。
     /// 正規テキスト表現は [`crate::uuid::Uuid`] の `Display` を参照。
     Uuid(crate::uuid::Uuid),
+    /// 再帰 CTE の `SEARCH ... SET` 順序列（幅優先）の値（SQL-35・Issue #2213）。PostgreSQL の
+    /// `record` 相当で、フィールドは `(深さ, BY 列の値...)`。`sql::recursive_eval` だけが構築し、
+    /// 表への保存・行 codec・JOIN キー・集合演算などの経路へは到達させない（到達したら fail-closed）。
+    /// フィールドに `Record`／`RecordArray` を入れ子にしない。
+    Record(Vec<Cell>),
+    /// 再帰 CTE の `SEARCH DEPTH FIRST` 順序列の値（SQL-35・Issue #2213）。PostgreSQL の
+    /// `record[]` 相当で、要素は「根から当該行までの BY 列の行値」。`Record` と同じ到達制約。
+    RecordArray(Vec<Vec<Cell>>),
 }
 
 /// 投影結果の列メタデータ。`Id` は疑似列（`ColumnType` を持たない）。
@@ -276,6 +284,15 @@ pub enum ColumnMeta {
     Computed {
         name: String,
         ty: Option<ColumnType>,
+    },
+    /// 再帰 CTE の `SEARCH ... SET` 順序列の結果列（SQL-35・Issue #2213）。`array` が偽なら
+    /// `record`（幅優先。`fields` は `[BIGINT, BY 列の型...]`）、真なら `record[]`（深さ優先。
+    /// `fields` は BY 列の型）。`None` のフィールドは行 id 型の列（セルは `Cell::Integer(u64)`）。
+    /// `ColumnType`（カタログ型）へは足さず、表へ保存される経路を作らない。
+    Record {
+        name: String,
+        fields: Vec<Option<ColumnType>>,
+        array: bool,
     },
 }
 

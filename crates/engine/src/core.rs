@@ -8052,6 +8052,9 @@ impl EngineCore {
                 },
                 ColumnMeta::Scalar { name, ty } => ViewColumn { name, ty: Some(ty) },
                 ColumnMeta::Computed { name, ty } => ViewColumn { name, ty },
+                // 再帰 CTE の SEARCH 順序列（record／record[]）は表・ビューの列型にできない。型なしとして
+                // 渡し、下流の「型なし列は 0A000」検査で拒否させる（fail-closed。SQL-35・Issue #2213）。
+                ColumnMeta::Record { name, .. } => ViewColumn { name, ty: None },
             })
             .collect();
         if let Some(names) = expected_names {
@@ -8116,7 +8119,8 @@ impl EngineCore {
                         ColumnMeta::Id => "id".to_string(),
                         ColumnMeta::AliasedId { name }
                         | ColumnMeta::Scalar { name, .. }
-                        | ColumnMeta::Computed { name, .. } => name,
+                        | ColumnMeta::Computed { name, .. }
+                        | ColumnMeta::Record { name, .. } => name,
                     })
                     .collect()
             }

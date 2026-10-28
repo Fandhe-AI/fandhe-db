@@ -305,6 +305,15 @@ pub(crate) fn estimate_cell_bytes(cell: &Cell) -> usize {
         // （厳密なメモリ使用量ではなく DoS 対策の上限判定用途のため）。
         Cell::Numeric(_) => 32,
         Cell::Uuid(_) => 16,
+        // SEARCH 順序列（SQL-35・Issue #2213）。経路長に比例して増えるため要素ごとに積み上げる。
+        Cell::Record(fields) => fields
+            .iter()
+            .fold(8usize, |acc, c| acc.saturating_add(estimate_cell_bytes(c))),
+        Cell::RecordArray(items) => items.iter().fold(8usize, |acc, rec| {
+            rec.iter().fold(acc.saturating_add(8), |a, c| {
+                a.saturating_add(estimate_cell_bytes(c))
+            })
+        }),
     }
 }
 

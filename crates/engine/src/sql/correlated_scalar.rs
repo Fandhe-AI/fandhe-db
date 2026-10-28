@@ -152,9 +152,11 @@ pub(crate) fn column_type_of_meta(meta: &ColumnMeta) -> Result<ColumnType, SqlSu
         ColumnMeta::Id | ColumnMeta::AliasedId { .. } => Ok(ColumnType::BigInt),
         ColumnMeta::Scalar { ty, .. } => Ok(ty.clone()),
         ColumnMeta::Computed { ty: Some(ty), .. } => Ok(ty.clone()),
-        ColumnMeta::Computed { ty: None, .. } => Err(SqlSurfaceError::feature_not_supported(
-            "this column type is not supported in a scalar subquery inside an expression",
-        )),
+        ColumnMeta::Computed { ty: None, .. } | ColumnMeta::Record { .. } => {
+            Err(SqlSurfaceError::feature_not_supported(
+                "this column type is not supported in a scalar subquery inside an expression",
+            ))
+        }
     }
 }
 

@@ -2891,6 +2891,9 @@ pub struct ValidatedRecursiveCte {
     pub(crate) anchor: Box<Statement>,
     /// 再帰項（CTE 名だけを作業表として解決する検証で得た `Scan` か `Join`）。
     pub(crate) recursive: Box<Statement>,
+    /// 定義直後の `SEARCH ... SET` 句（SQL-35・Issue #2213）。`sql::recursive_eval` が順序列を
+    /// 生成して結果列の末尾へ足す。
+    pub(crate) search: Option<SearchClause>,
 }
 
 /// matview の葉の読み取り（[`Statement::MaterializedView`]）。定義の列は参照時に束縛した値で、
@@ -15492,16 +15495,15 @@ impl<'a> Parser<'a> {
     /// トークン列を返す（SQL-35、Issue #1869）。`sql::recursive_cte::validate_recursive_with`
     /// だけが呼ぶ。再帰構造の検証・評価は呼び出し元の担当で、本関数は構文の切り出し
     /// （`parse_with_clause` と同じ列名リスト・`[NOT] MATERIALIZED`・括弧対応・本文内 `;` の
-    /// 規則。第 2 のパーサーを持たない）と、本文直後の `SEARCH`／`CYCLE` 句の読み飛ばしと
-    /// 存在の記録（`0A000` の機能ゲートは呼び出し元が構文・構造の検証後に返す。
-    /// #2213・#2214 が実装）だけを行う。
+    /// 規則。第 2 のパーサーを持たない）と、本文直後の `SEARCH`／`CYCLE` 句の構文検証を行う。
+    /// `SEARCH` は [`SearchClause`] として保持し（評価は `sql::recursive_eval`。#2213）、`CYCLE` は
+    /// 存在だけを記録する（`0A000` の機能ゲートは呼び出し元が構文・構造の検証後に返す。#2214 が実装）。
     pub(crate) fn parse_recursive_with_header(
         &mut self,
     ) -> Result<RecursiveWithHeader, SqlSurfaceError> {
         self.expect_ident_matching("WITH")?;
         self.expect_ident_matching("RECURSIVE")?;
-        let mut defs: Vec<(String, Vec<String>, Vec<Token>)> = Vec::new();
-        let mut has_search_cycle = false;
+        let mut defs: Vec<RawRecursiveDef> = Vec::new();
         loop {
             let name = self.expect_ident()?;
             let column_aliases = self.parse_optional_view_column_aliases()?;
@@ -15523,23 +15525,28 @@ impl<'a> Parser<'a> {
                     "CTE body must not contain a statement separator",
                 ));
             }
-            if defs.iter().any(|(n, _, _)| n.eq_ignore_ascii_case(&name)) {
+            if defs.iter().any(|d| d.name.eq_ignore_ascii_case(&name)) {
                 return Err(SqlSurfaceError::unsupported(format!(
                     "duplicate CTE name: {name}"
                 )));
             }
             let body = inner.to_vec();
             self.pos = self.tokens.len().saturating_sub(after.len());
-            defs.push((name, column_aliases, body));
+            defs.push(RawRecursiveDef {
+                name,
+                column_aliases,
+                body,
+                search: None,
+                has_cycle: false,
+            });
             super::cte::check_definition_count(
                 defs.len(),
                 self.nesting_limits.max_cte_definitions(),
             )?;
             if self.peek_ident_matches("SEARCH") || self.peek_ident_matches("CYCLE") {
-                // 機能ゲート（0A000）は呼び出し元が構文・再帰構造の検証後に返す。ここでは
-                // 句の存在だけを記録し、次の定義の区切り（`, 名前 AS|(`）か主クエリの
-                // `SELECT` の手前までトークンを読み飛ばす。
-                has_search_cycle = true;
+                // 次の定義の区切り（`, 名前 AS|(`）か主クエリの `SELECT` の手前までトークンを
+                // 読み飛ばして句の範囲を決める。`SEARCH` は構造体として保持し、`CYCLE` は存在だけを
+                // 記録する（機能ゲート 0A000 は呼び出し元が構文・再帰構造の検証後に返す）。
                 let clause_start = self.pos;
                 loop {
                     match self.peek() {
@@ -15562,9 +15569,13 @@ impl<'a> Parser<'a> {
                     }
                 }
                 // 構文（42601）は機能ゲート（0A000）より先に確定させる。
-                validate_search_cycle_clause(
+                let (search, has_cycle) = validate_search_cycle_clause(
                     self.tokens.get(clause_start..self.pos).unwrap_or(&[]),
                 )?;
+                if let Some(def) = defs.last_mut() {
+                    def.search = search;
+                    def.has_cycle = has_cycle;
+                }
             }
             if matches!(self.peek(), Some(Token::Punct(','))) {
                 self.advance();
@@ -15572,7 +15583,10 @@ impl<'a> Parser<'a> {
             }
             break;
         }
-        Ok((defs, self.remaining().to_vec(), has_search_cycle))
+        Ok(RecursiveWithHeader {
+            defs,
+            main_tokens: self.remaining().to_vec(),
+        })
     }
 }
 
@@ -15587,12 +15601,16 @@ pub(crate) fn validate_data_modifying_cte_syntax(
     Ok(parse_data_modifying_cte_body(inner, None, limits)?.is_some())
 }
 
-/// `WITH RECURSIVE` 定義の直後の `SEARCH`／`CYCLE` 句（SQL-35。実行は未対応で `0A000`）の構文だけを
-/// 検証する。`parse_recursive_with_header` が機能ゲートより先に呼び、不正な形は `42601`
+/// `WITH RECURSIVE` 定義の直後の `SEARCH`／`CYCLE` 句（SQL-35）の構文を検証し、`SEARCH` 句は
+/// [`SearchClause`] として返す（`CYCLE` 句は構文検証のみで存在フラグを返す。実行は #2214 の担当で
+/// `0A000`）。`parse_recursive_with_header` が機能ゲートより先に呼び、不正な形は `42601`
 /// （構文 → 再帰構造 → 機能ゲートの順序契約）。文法: `SEARCH {BREADTH|DEPTH} FIRST BY 列[, 列]* SET 列`
 /// の後に `CYCLE 列[, 列]* SET 列 [TO 定数 DEFAULT 定数] [USING 列]` を任意で続けられる
-/// （`CYCLE` 単独も可）。固定文言で入力断片を含めない。
-fn validate_search_cycle_clause(clause: &[Token]) -> Result<(), SqlSurfaceError> {
+/// （`CYCLE` 単独も可）。固定文言で入力断片を含めない。BY 列は CTE の列数上限
+/// （`MAX_COLUMN_COUNT`）を超えると `54000`（無制限の確保をしない）。
+fn validate_search_cycle_clause(
+    clause: &[Token],
+) -> Result<(Option<SearchClause>, bool), SqlSurfaceError> {
     let bad = || SqlSurfaceError::unsupported("invalid SEARCH or CYCLE clause");
     let mut i = 0usize;
     let word = |i: usize, w: &str| matches!(clause.get(i), Some(Token::Ident(n)) if n.eq_ignore_ascii_case(w));
@@ -15622,6 +15640,7 @@ fn validate_search_cycle_clause(clause: &[Token]) -> Result<(), SqlSurfaceError>
         )
         .then(|| i.saturating_add(1))
     };
+    let mut search: Option<SearchClause> = None;
     if word(i, "SEARCH") {
         if !(word(i + 1, "BREADTH") || word(i + 1, "DEPTH")) || !word(i + 2, "FIRST") {
             return Err(bad());
@@ -15629,13 +15648,39 @@ fn validate_search_cycle_clause(clause: &[Token]) -> Result<(), SqlSurfaceError>
         if !matches!(clause.get(i + 3), Some(Token::Keyword(Keyword::By))) {
             return Err(bad());
         }
-        i = list(i + 4).ok_or_else(bad)?;
-        if !word(i, "SET") || !ident(i + 1) {
+        let breadth_first = word(i + 1, "BREADTH");
+        let by_start = i + 4;
+        i = list(by_start).ok_or_else(bad)?;
+        let by: Vec<String> = clause
+            .get(by_start..i)
+            .unwrap_or(&[])
+            .iter()
+            .filter_map(|t| match t {
+                Token::Ident(n) => Some(n.clone()),
+                _ => None,
+            })
+            .collect();
+        if by.len() > MAX_COLUMN_COUNT {
+            return Err(SqlSurfaceError::payload_too_large(
+                "too many columns in the SEARCH clause",
+            ));
+        }
+        if !word(i, "SET") {
             return Err(bad());
         }
+        let Some(Token::Ident(set)) = clause.get(i + 1) else {
+            return Err(bad());
+        };
+        search = Some(SearchClause {
+            breadth_first,
+            by,
+            set: set.clone(),
+        });
         i += 2;
     }
+    let mut has_cycle = false;
     if word(i, "CYCLE") {
+        has_cycle = true;
         i = list(i + 1).ok_or_else(bad)?;
         if !word(i, "SET") || !ident(i + 1) {
             return Err(bad());
@@ -15656,7 +15701,7 @@ fn validate_search_cycle_clause(clause: &[Token]) -> Result<(), SqlSurfaceError>
         }
     }
     if i == clause.len() {
-        Ok(())
+        Ok((search, has_cycle))
     } else {
         Err(bad())
     }
@@ -23491,6 +23536,13 @@ fn recursive_cte_statement(
                 "USING PLAN in the anchor term of WITH RECURSIVE is not supported",
             ));
         }
+        Statement::SetOperation(_) if def.search.is_some() => {
+            // PostgreSQL と同じく、SEARCH／CYCLE 句つきの定義は UNION の左辺が単一の SELECT で
+            // なければならない（`0A000`）。
+            return Err(SqlSurfaceError::feature_not_supported(
+                "with a SEARCH clause, the left side of the UNION must be a SELECT",
+            ));
+        }
         Statement::Select(_)
         | Statement::Scan(_)
         | Statement::Aggregate(_)
@@ -23532,6 +23584,7 @@ fn recursive_cte_statement(
         column_aliases: def.column_aliases.clone(),
         anchor: Box::new(anchor_stmt),
         recursive: Box::new(recursive_stmt),
+        search: def.search.clone(),
     }));
     let view_name = def.name.clone();
     let stmt = match main {
@@ -25294,9 +25347,39 @@ pub(crate) fn split_parenthesized(
     ))
 }
 
-/// `WITH RECURSIVE` の見出し部の切り出し結果（各定義の `(名前, 列名リスト, 本文トークン列)` と
-/// 主クエリのトークン列）。
-pub(crate) type RecursiveWithHeader = (Vec<(String, Vec<String>, Vec<Token>)>, Vec<Token>, bool);
+/// `WITH RECURSIVE` 定義直後の `SEARCH {DEPTH|BREADTH} FIRST BY 列[, ...] SET 順序列` 句
+/// （SQL-35・Issue #2213）。字句解析済みトークンから構築し、SQL 文字列へは再連結しない。
+/// 名前の解決（BY 列が CTE の列に在るか・SET 名が衝突しないか）は列が確定する評価計画段
+/// （`sql::recursive_eval`）が行う。
+#[derive(Debug, Clone, PartialEq)]
+pub(crate) struct SearchClause {
+    /// `BREADTH FIRST` なら真、`DEPTH FIRST` なら偽。
+    pub(crate) breadth_first: bool,
+    /// BY 列の名前（書かれた順。1 個以上）。
+    pub(crate) by: Vec<String>,
+    /// 順序列の名前（`SET` の直後）。
+    pub(crate) set: String,
+}
+
+/// `WITH RECURSIVE` の定義 1 件の切り出し結果（本文トークンと、直後の `SEARCH`／`CYCLE` 句の
+/// 構文検証結果）。
+#[derive(Debug, Clone)]
+pub(crate) struct RawRecursiveDef {
+    pub(crate) name: String,
+    pub(crate) column_aliases: Vec<String>,
+    pub(crate) body: Vec<Token>,
+    /// 直後の `SEARCH` 句（無ければ `None`）。
+    pub(crate) search: Option<SearchClause>,
+    /// 直後に `CYCLE` 句があるか（構文検証のみ。実行は #2214 の担当で `0A000`）。
+    pub(crate) has_cycle: bool,
+}
+
+/// `WITH RECURSIVE` の見出し部の切り出し結果（各定義と主クエリのトークン列）。
+#[derive(Debug, Clone)]
+pub(crate) struct RecursiveWithHeader {
+    pub(crate) defs: Vec<RawRecursiveDef>,
+    pub(crate) main_tokens: Vec<Token>,
+}
 
 /// `WITH RECURSIVE` の見出し部（各定義の名前・列名リスト・本文トークン列と主クエリ）を
 /// 切り出す。`sql::recursive_cte::validate_recursive_with` の唯一の入口（`Parser` は本

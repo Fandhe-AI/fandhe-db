@@ -425,6 +425,11 @@ impl<'a, 'b> Binder<'a, 'b> {
                 name: a.clone(),
                 ty,
             },
+            ColumnMeta::Record { fields, array, .. } => ColumnMeta::Record {
+                name: a.clone(),
+                fields,
+                array,
+            },
         }
     }
 }

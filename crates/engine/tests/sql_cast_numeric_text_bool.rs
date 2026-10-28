@@ -108,7 +108,7 @@ fn meta_type(meta: &ColumnMeta) -> Option<ColumnType> {
     match meta {
         ColumnMeta::Computed { ty, .. } => ty.clone(),
         ColumnMeta::Scalar { ty, .. } => Some(ty.clone()),
-        ColumnMeta::Id | ColumnMeta::AliasedId { .. } => None,
+        ColumnMeta::Id | ColumnMeta::AliasedId { .. } | ColumnMeta::Record { .. } => None,
     }
 }
 
