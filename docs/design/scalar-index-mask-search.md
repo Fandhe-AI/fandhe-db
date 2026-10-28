@@ -219,9 +219,11 @@ gather 済み `CpuScalarProvider::search` 対照一致（同点誘発コーパ�
 
 ```bash
 cargo test -p engine --lib kernel:: parallel_search:: arena::
-cargo test -p engine --test scalar_index_mask_search --test scalar_index_prune \
-  --test scalar_index_cache --test hnsw_cache --test hnsw_hybrid_refetch \
-  --test sql_explain --test sql_precision_mode
+cargo test -p engine --test core_misc scalar_index_
+cargo test -p engine --test core_misc hnsw_cache::
+cargo test -p engine --test hnsw_hybrid_refetch
+cargo test -p engine --test sql_named sql_explain::
+cargo test -p engine --test sql_named sql_precision_mode::
 scripts/check_core_api.sh --update && bash scripts/check_core_api.sh
 ```
 

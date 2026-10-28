@@ -28,25 +28,21 @@ WIRE_TESTS=(
   tmp_fixture_cleanup
   wire_temp_table
 )
-# 一時表（Issue #1685・TABLE-44）の engine 結合テスト。
-ENGINE_TESTS=(
-  table44_temp_table_ddl
-  table44_temp_table_dml
-  table44_temp_table_isolation
-)
+# 一時表（Issue #1685・TABLE-44）の engine 結合テスト。engine の結合テストは少数の
+# テストバイナリへ束ねてあり（`crates/engine/tests/<束ね先>/main.rs`）、対象は
+# 束ね先バイナリ `table_rls` の `table44_temp_table_` 接頭辞のモジュールに限る。
+ENGINE_TEST_BIN=table_rls
+ENGINE_TEST_FILTER="table44_temp_table_"
 # lib のユニットテストは名前フィルタで絞る（wire-server の auth unit test・engine の temp_db）。
 WIRE_LIB_FILTER="auth::"
 ENGINE_LIB_FILTER="test_util"
 
-# 上記一覧を `--test <name>` の引数列へ展開する。
+# wire-server の一覧を `--test <name>` の引数列へ展開する。
 WIRE_TEST_ARGS=()
 for name in "${WIRE_TESTS[@]}"; do
   WIRE_TEST_ARGS+=(--test "${name}")
 done
-ENGINE_TEST_ARGS=()
-for name in "${ENGINE_TESTS[@]}"; do
-  ENGINE_TEST_ARGS+=(--test "${name}")
-done
+ENGINE_TEST_ARGS=(--test "${ENGINE_TEST_BIN}")
 
 # ビルドの一時ファイル（rustc / linker）を計測に混ぜないため、先に通常の TMPDIR でビルドする。
 # 既定モードでは計測で実行するテストバイナリ（上記一覧と lib のユニットテスト）だけを
@@ -68,7 +64,7 @@ else
   TMPDIR="${LEAK_DIR}" cargo test -p fandhe-db-wire-server "${WIRE_TEST_ARGS[@]}"
   TMPDIR="${LEAK_DIR}" cargo test -p fandhe-db-wire-server --lib "${WIRE_LIB_FILTER}"
   TMPDIR="${LEAK_DIR}" cargo test -p fandhe-db-engine --lib "${ENGINE_LIB_FILTER}"
-  TMPDIR="${LEAK_DIR}" cargo test -p fandhe-db-engine "${ENGINE_TEST_ARGS[@]}"
+  TMPDIR="${LEAK_DIR}" cargo test -p fandhe-db-engine "${ENGINE_TEST_ARGS[@]}" "${ENGINE_TEST_FILTER}"
 fi
 
 # 外部ツール由来で除外が必要なエントリが出た場合のみ、理由コメント付きでここへ列挙する。
