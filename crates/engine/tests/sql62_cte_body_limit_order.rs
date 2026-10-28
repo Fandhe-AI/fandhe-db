@@ -156,6 +156,22 @@ fn outer_where_applies_after_body_limit() {
     assert_eq!(ints(&ok(&core, "alice", &sql), 0), vec![1, 2]);
 }
 
+/// 外側の序数 `ORDER BY`（`ORDER BY 1`・ASC/DESC）は外側の投影位置の列として解決される。
+/// 範囲外・0・負の序数は fail-closed で拒否する（`0A000`・`42601` のいずれか固定コード）。
+#[test]
+fn outer_ordinal_order_by_resolves_and_rejects_out_of_range() {
+    let (core, _g) = open_with(None);
+    let asc = format!("WITH c AS ({BODY}) SELECT id FROM c ORDER BY 1 LIMIT 10");
+    assert_eq!(ints(&ok(&core, "alice", &asc), 0), vec![1, 2, 3]);
+    let desc = format!("WITH c AS ({BODY}) SELECT id FROM c ORDER BY 1 DESC LIMIT 10");
+    assert_eq!(ints(&ok(&core, "alice", &desc), 0), vec![3, 2, 1]);
+    for pos in ["2", "0", "-1"] {
+        let sql = format!("WITH c AS ({BODY}) SELECT id FROM c ORDER BY {pos} LIMIT 10");
+        let c = code(&core, "alice", &sql);
+        assert!(c == "0A000" || c == "42601", "{sql}: {c}");
+    }
+}
+
 /// 集計の主クエリも本文の `LIMIT` の件数を数える。
 #[test]
 fn aggregate_main_query_counts_limited_rows() {

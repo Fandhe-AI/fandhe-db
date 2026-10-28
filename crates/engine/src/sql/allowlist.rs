@@ -22600,7 +22600,28 @@ fn tail_cte_statement(
     let body = Box::new(Statement::Scan(body));
     let view_name = def.name.clone();
     let stmt = match main {
-        MainShape::Scan(shape) => buffered_scan_statement(view_name, body, shape)?,
+        MainShape::Scan(mut shape) => {
+            // 外側の序数 `ORDER BY`（`ORDER BY 1`）は評価後射影形の外側が解決できず `42601` になるため、
+            // 外側の投影位置から列キーへ解決して渡す。解決できない形（`*`・式項目・範囲外・0 以下・
+            // ウィンドウ項目つき）は固定の `0A000` で拒否する（fail-closed。詳細は載せない）。
+            if shape
+                .order_keys
+                .iter()
+                .any(|k| matches!(k, ScanOrderKey::Ordinal { .. }))
+            {
+                let resolved = if shape.window_items.is_empty() {
+                    resolve_ordinal_order_keys(&shape.order_keys, &shape.projection)
+                } else {
+                    None
+                };
+                shape.order_keys = resolved.ok_or_else(|| {
+                    SqlSurfaceError::feature_not_supported(
+                        "ORDER BY position over a CTE with a LIMIT/ORDER BY body requires a plain column in the select list",
+                    )
+                })?;
+            }
+            buffered_scan_statement(view_name, body, shape)?
+        }
         MainShape::Aggregate(shape) => aggregate_statement_from_resolved(
             shape.table_name,
             super::view::Resolved::Buffered { view_name, body },
