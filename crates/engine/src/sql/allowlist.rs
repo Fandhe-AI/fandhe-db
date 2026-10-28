@@ -3891,6 +3891,28 @@ pub(crate) struct WindowSelectItem {
     pub(crate) alias: Option<String>,
 }
 
+impl WindowSelectItem {
+    /// この項目が参照する表の列名（`PARTITION BY`・`ORDER BY`・集計引数・`LAG`／`LEAD` の
+    /// 値／オフセット／既定値の式の識別子）を `out` へ集める。評価後射影形ビューの外側が
+    /// 参照列マスクと曖昧性検査を導くための単一実装（Issue #1881。`LAG`／`LEAD` の引数にしか
+    /// 現れない列を取りこぼすと本文の結果列が評価されず NULL になる fail-open を防ぐ）。
+    pub(crate) fn collect_referenced_idents(&self, out: &mut std::collections::HashSet<String>) {
+        out.extend(self.partition_by.iter().cloned());
+        out.extend(self.order_by.iter().map(|ob| ob.column.clone()));
+        if let Some(AggregateArg::Expr(e)) = &self.arg {
+            super::parser::collect_expr_idents(e, out);
+        }
+        if let Some(args) = &self.offset_args {
+            for e in std::iter::once(&args.value)
+                .chain(args.offset.iter())
+                .chain(args.default.iter())
+            {
+                super::parser::collect_expr_idents(e, out);
+            }
+        }
+    }
+}
+
 /// `LAG`／`LEAD` の引数 1〜3 個（`<値式> [, <オフセット式> [, <既定値式>]]`。SQL-64 (1)・
 /// Issue #1880）。オフセットは定数に限らず行ごとに評価する式として保持する。束縛は
 /// `sql::parser::bind_window_item`、評価は `sql::window`（Issue #1881）が担う。

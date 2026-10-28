@@ -9717,6 +9717,7 @@ pub(crate) struct BoundWindowItem {
 
 /// `LAG`／`LEAD` の束縛済み引数（SQL-64 (1)・Issue #1880）。評価（Issue #1881）は
 /// `sql::window` が担い、本構造体は型検査済みの式と結果型（Describe の型 OID 公告元）を運ぶ。
+/// 評価済みで、`bind_window_item` のゲートは撤去されている。
 #[derive(Debug, Clone, PartialEq)]
 pub(crate) struct BoundWindowOffsetArgs {
     pub(crate) value: BoundWindowValue,
@@ -9725,8 +9726,12 @@ pub(crate) struct BoundWindowOffsetArgs {
     /// 既定値式（値の型へ統一済み。省略時は `None`＝NULL）。
     pub(crate) default: Option<crate::sql::udf_call::BoundExpr>,
     /// 既定値が式層で束縛できない型（BOOLEAN・NUMERIC・UUID・ENUM 等）の裸の列のとき、その列の
-    /// 位置（宣言型で型統一済み。この場合 `default` は `None`）。評価は Issue #1881 が接続する。
-    pub(crate) default_column: Option<usize>,
+    /// 位置と宣言型（型統一済み。この場合 `default` は `None`）。`sql::window` が宣言型で
+    /// セル化する（統一後の型では行の格納表現と食い違いうるため、宣言型を併せて運ぶ）。
+    pub(crate) default_column: Option<(usize, ColumnType)>,
+    /// 既定値が裸の疑似列 `id` のとき `true`（この場合 `default` は `None`）。`sql::window` が
+    /// 行 `id` を f64 経由にせず整数セルへ直接変換する（2^53 超の `id` を正確に保つ）。
+    pub(crate) default_pseudo_id: bool,
     /// 統一後の結果列型（`window_result_type` が公告に使う）。
     pub(crate) result_type: Option<ColumnType>,
     /// 引数が疑似列 `id` を参照するか（セル評価経路 `CellWindowEvaluator` が拒否に使う）。
@@ -9751,6 +9756,7 @@ impl BoundWindowOffsetArgs {
                 }
                 any = true;
             }
+            BoundWindowValue::PseudoId => {}
             BoundWindowValue::Expr { bound, .. } => {
                 any |= crate::sql::udf_call::mark_referenced_scalar_columns(bound, mask);
             }
@@ -9758,7 +9764,11 @@ impl BoundWindowOffsetArgs {
         for e in self.offset.iter().chain(self.default.iter()) {
             any |= crate::sql::udf_call::mark_referenced_scalar_columns(e, mask);
         }
-        if let Some(slot) = self.default_column.and_then(|i| mask.get_mut(i)) {
+        if let Some(slot) = self
+            .default_column
+            .as_ref()
+            .and_then(|(i, _)| mask.get_mut(*i))
+        {
             *slot = true;
             any = true;
         }
@@ -9768,7 +9778,7 @@ impl BoundWindowOffsetArgs {
     /// 引数が埋め込みベクトルを参照するか。
     pub(crate) fn references_embedding(&self) -> bool {
         let value = match &self.value {
-            BoundWindowValue::Column { .. } => false,
+            BoundWindowValue::Column { .. } | BoundWindowValue::PseudoId => false,
             BoundWindowValue::Expr { bound, .. } => {
                 crate::sql::udf_call::references_embedding(bound)
             }
@@ -9794,6 +9804,8 @@ pub(crate) enum BoundWindowValue {
         bound: crate::sql::udf_call::BoundExpr,
         ty: crate::sql::udf_call::ExprType,
     },
+    /// 裸の疑似列 `id`（BIGINT）。f64 を経由する式層ではなく行 `id` から整数セルを直接作る。
+    PseudoId,
 }
 
 /// `LAG`／`LEAD` の値として運べない型（`VECTOR`・配列・`BYTEA`・`json`・`jsonb`。fail-closed）。
@@ -9992,6 +10004,17 @@ fn bind_window_offset_args(
     };
     let null_default = matches!(&args.default, Some(Expr::Null)).then_some(BoundExpr::Null);
 
+    if default_expr.is_none() && is_pseudo_id_ref(&args.value, schema) {
+        return Ok(BoundWindowOffsetArgs {
+            value: BoundWindowValue::PseudoId,
+            offset,
+            default: null_default,
+            default_column: None,
+            default_pseudo_id: false,
+            result_type: Some(ColumnType::BigInt),
+            uses_pseudo_id,
+        });
+    }
     let bare_column = match &args.value {
         Expr::Ident(name) => schema
             .columns
@@ -10012,6 +10035,7 @@ fn bind_window_offset_args(
             offset,
             default: null_default,
             default_column: None,
+            default_pseudo_id: false,
             result_type: Some(column.ty.clone()),
             uses_pseudo_id,
         });
@@ -10025,7 +10049,41 @@ fn bind_window_offset_args(
                     return Err(unsupported());
                 }
             }
-            match bind_value_with_default(&args.value, d, schema, udfs, node_budget) {
+            // BIGINT の裸の列は f64 ベースの式層を通すと 2^53 超が範囲エラーになるため、
+            // 式束縛へ落とさず宣言型・列位置でセル化する経路（下の `InvalidInput` 腕）へ回す。
+            // 整数同士のときに限る（倍精度への昇格が要る組は従来の型統一へ回す）。
+            let value_pseudo = is_pseudo_id_ref(&args.value, schema);
+            let default_pseudo = is_pseudo_id_ref(d, schema);
+            let is_int = |t: &Option<ColumnType>| {
+                matches!(
+                    t,
+                    Some(ColumnType::SmallInt | ColumnType::Integer | ColumnType::BigInt)
+                )
+            };
+            // 型なしの裸の `NULL` 値は相手（既定値）の宣言型に揃えて判定する。値と既定値の
+            // 扱いを対称にし、`lag(NULL, 1, b)` でも BIGINT の既定値を f64 経由にしない。
+            let value_null = matches!(&args.value, Expr::Null);
+            let value_eff_decl = if value_null {
+                &default_decl
+            } else {
+                &value_decl
+            };
+            let exact_int = (value_pseudo
+                || default_pseudo
+                || bare_column
+                    .iter()
+                    .chain(default_bare.iter())
+                    .any(|(_, c)| matches!(c.ty, ColumnType::BigInt)))
+                && is_int(value_eff_decl)
+                && is_int(&default_decl);
+            let bound = if exact_int {
+                Err(SqlSurfaceError::InvalidInput {
+                    detail: "LAG/LEAD BIGINT column is bound by declared type".to_string(),
+                })
+            } else {
+                bind_value_with_default(&args.value, d, schema, udfs, node_budget)
+            };
+            match bound {
                 Ok((v, d, ty, col)) => (
                     v,
                     Some(d),
@@ -10035,12 +10093,28 @@ fn bind_window_offset_args(
                 // 式層が拒否する型（BOOLEAN・NUMERIC・UUID・ENUM 等）の裸の列は宣言型で
                 // 型統一・不一致判定する（`COALESCE` 式束縛へ落とさない）。
                 Err(SqlSurfaceError::InvalidInput { .. })
-                    if bare_column.is_some() || default_bare.is_some() =>
+                    if bare_column.is_some()
+                        || default_bare.is_some()
+                        || value_pseudo
+                        || default_pseudo
+                        || value_null =>
                 {
                     let mismatch = || {
                         SqlSurfaceError::datatype_mismatch(
                             "LAG/LEAD default value must have the same type as the value",
                         )
+                    };
+                    let (default_bound, default_column, default_ty) = match default_bare {
+                        Some((index, c)) => (None, Some((index, c.ty.clone())), c.ty.clone()),
+                        None if default_pseudo => (None, None, ColumnType::BigInt),
+                        None => {
+                            let (b, _ty, col) = bind_projection_expr(d, schema, udfs, node_budget)?;
+                            let col = default_decl.clone().or(col).ok_or_else(mismatch)?;
+                            if lag_lead_value_type_unsupported(&col) {
+                                return Err(unsupported());
+                            }
+                            (Some(b), None, col)
+                        }
                     };
                     let (value_bound, value_ty) = match bare_column {
                         Some((index, c)) => (
@@ -10050,6 +10124,15 @@ fn bind_window_offset_args(
                             },
                             c.ty.clone(),
                         ),
+                        // 型なしの `NULL` は既定値の型に揃える（評価結果は常に NULL セル）。
+                        None if value_null => (
+                            BoundWindowValue::Expr {
+                                bound: BoundExpr::Null,
+                                ty: ExprType::Scalar,
+                            },
+                            default_ty.clone(),
+                        ),
+                        None if value_pseudo => (BoundWindowValue::PseudoId, ColumnType::BigInt),
                         None => {
                             let (b, ty, col) =
                                 bind_projection_expr(&args.value, schema, udfs, node_budget)?;
@@ -10068,17 +10151,6 @@ fn bind_window_offset_args(
                             (BoundWindowValue::Expr { bound: b, ty }, col)
                         }
                     };
-                    let (default_bound, default_column, default_ty) = match default_bare {
-                        Some((index, c)) => (None, Some(index), c.ty.clone()),
-                        None => {
-                            let (b, _ty, col) = bind_projection_expr(d, schema, udfs, node_budget)?;
-                            let col = default_decl.clone().or(col).ok_or_else(mismatch)?;
-                            if lag_lead_value_type_unsupported(&col) {
-                                return Err(unsupported());
-                            }
-                            (Some(b), None, col)
-                        }
-                    };
                     let unified =
                         unify_lag_lead_types(&value_ty, &default_ty).ok_or_else(mismatch)?;
                     return Ok(BoundWindowOffsetArgs {
@@ -10086,6 +10158,7 @@ fn bind_window_offset_args(
                         offset,
                         default: default_bound,
                         default_column,
+                        default_pseudo_id: default_pseudo,
                         result_type: Some(unified),
                         uses_pseudo_id,
                     });
@@ -10113,6 +10186,7 @@ fn bind_window_offset_args(
         offset,
         default,
         default_column: None,
+        default_pseudo_id: false,
         result_type: col,
         uses_pseudo_id,
     })
@@ -10271,15 +10345,8 @@ fn bind_window_item(
         order_by,
         name,
     };
-    // 構文受理・束縛・型検査までが Issue #1880 の範囲で、評価は Issue #1881 が接続する。
-    // 型検査を終えた後ろの単一のゲートで `0A000` を返し、評価経路（走査・Describe・ビューの
-    // 評価後射影）へ未実装の関数を流さない（fail-closed。走査より前に効くため行数・
-    // テナントの存在に依存しない）。Issue #1881 はこのゲートを外して評価を接続する。
-    if bound.func.is_value_offset() {
-        return Err(SqlSurfaceError::feature_not_supported(
-            "lag/lead window functions are not executable yet",
-        ));
-    }
+    // `LAG`／`LEAD` は構文受理・束縛・型検査（Issue #1880）の後、評価（`sql::window`。
+    // Issue #1881）へそのまま流す。運べない値型は束縛段で `0A000` に拒否済み。
     Ok(bound)
 }
 
@@ -14565,6 +14632,37 @@ mod lag_lead_declared_type_tests {
             &mut budget,
         )
         .map(|a| a.result_type)
+    }
+
+    /// 型なしの裸の `NULL` 値（直接構築 AST。字句段は第 1 引数の `NULL` を列参照とするため
+    /// SQL テキストからは到達しない）は、既定値の整数型に揃えて BIGINT 列・疑似列 `id` を
+    /// 宣言型のまま運ぶ（式層＝f64 へ落とさない。Issue #1881 のレビュー指摘の回帰）。
+    #[test]
+    fn untyped_null_value_aligns_with_integer_default() {
+        let s = pseudo_schema();
+        let bound = |default: Expr| {
+            let mut budget = 10_000usize;
+            bind_window_offset_args(
+                &WindowOffsetArgs {
+                    value: Expr::Null,
+                    offset: None,
+                    default: Some(default),
+                },
+                &s,
+                &UdfRegistry::default(),
+                &mut budget,
+            )
+            .expect("bind")
+        };
+        let by_col = bound(ident("big"));
+        assert_eq!(by_col.result_type, Some(ColumnType::BigInt));
+        assert_eq!(by_col.default_column, Some((1, ColumnType::BigInt)));
+        assert!(by_col.default.is_none());
+        let by_id = bound(ident("id"));
+        assert_eq!(by_id.result_type, Some(ColumnType::BigInt));
+        assert!(by_id.default_pseudo_id);
+        let by_int = bound(ident("score"));
+        assert_eq!(by_int.result_type, Some(ColumnType::Integer));
     }
 
     #[test]

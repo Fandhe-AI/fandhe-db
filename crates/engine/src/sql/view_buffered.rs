@@ -46,8 +46,8 @@ use crate::catalog::{ColumnDef, ColumnType, TableSchema};
 use crate::row_codec::ScalarRef;
 
 use super::allowlist::{
-    AggregateArg, BufferedOuter, BufferedRows, Projection, ScalarOrderKey, ScanOrderKey,
-    SqlSurfaceError, ValidatedAggregate, ValidatedBufferedView, ValidatedScan,
+    BufferedOuter, BufferedRows, Projection, ScalarOrderKey, ScanOrderKey, SqlSurfaceError,
+    ValidatedAggregate, ValidatedBufferedView, ValidatedScan,
 };
 use super::exec::{Cell, ColumnMeta, QueryResult, ResultRow};
 use super::expr_program::StackValue;
@@ -319,11 +319,7 @@ fn plan_rows(
     super::view::check_window_columns_within_view(Some(&names), &rows.window_items)?;
     let mut idents = HashSet::new();
     for item in &rows.window_items {
-        idents.extend(item.partition_by.iter().cloned());
-        idents.extend(item.order_by.iter().map(|ob| ob.column.clone()));
-        if let Some(AggregateArg::Expr(e)) = &item.arg {
-            super::parser::collect_expr_idents(e, &mut idents);
-        }
+        item.collect_referenced_idents(&mut idents);
     }
     super::parser::collect_where_predicate_idents(&rows.where_predicates, &mut idents);
     for key in &rows.order_by {
@@ -476,11 +472,7 @@ pub(crate) fn outer_non_projection_idents(outer: &BufferedOuter) -> HashSet<Stri
     match outer {
         BufferedOuter::Rows(rows) => {
             for item in &rows.window_items {
-                idents.extend(item.partition_by.iter().cloned());
-                idents.extend(item.order_by.iter().map(|ob| ob.column.clone()));
-                if let Some(AggregateArg::Expr(e)) = &item.arg {
-                    super::parser::collect_expr_idents(e, &mut idents);
-                }
+                item.collect_referenced_idents(&mut idents);
             }
             super::parser::collect_where_predicate_idents(&rows.where_predicates, &mut idents);
             for key in &rows.order_by {
@@ -978,7 +970,7 @@ fn apply_rows(
     let windows = plan.scan.bound.windows();
     let body_len = plan.scan.types.len();
     if !windows.is_empty() {
-        let mut evaluator = CellWindowEvaluator::new(windows)?;
+        let mut evaluator = CellWindowEvaluator::new(windows, &plan.scan.types)?;
         for row in &rows {
             with_scanned(&plan.scan.types, &plan.scan.referenced, row, |scanned| {
                 evaluator.push_row(scanned)
@@ -1239,7 +1231,7 @@ fn reorder(rows: Vec<ResultRow>, idx: &[usize]) -> Result<Vec<ResultRow>, SqlSur
 mod tests {
     use super::*;
     use crate::sql::allowlist::{
-        AggregateFunc, AggregateItem, AggregateSelectItem, Statement, WherePredicate,
+        AggregateArg, AggregateFunc, AggregateItem, AggregateSelectItem, Statement, WherePredicate,
     };
     use crate::sql::udf_call::{BinOp, Expr};
 

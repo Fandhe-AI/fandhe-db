@@ -666,214 +666,14 @@ fn build_projected_cells(
                             )?));
                         }
                     }
-                    ColumnType::Text | ColumnType::Varchar(_) | ColumnType::Bpchar(_) => {
-                        match scanned.get(*index) {
-                            Some(Some(row_codec::ScalarRef::Text(t))) => cells.push(Cell::Text(
-                                try_alloc_text_for_budget(t, byte_budget, max_result_bytes)?,
-                            )),
-                            Some(None) | None => cells.push(Cell::Null),
-                            Some(Some(_)) => {
-                                return Err(SqlSurfaceError::Internal {
-                                    detail: "scalar payload type mismatch".to_string(),
-                                })
-                            }
-                        }
-                    }
-                    // F8（Issue #882 計画）: REAL/DOUBLE は `Cell::Float`
-                    // （REAL は f64 への無損失拡大）へ投影する。
-                    ColumnType::Real => match scanned.get(*index) {
-                        Some(Some(row_codec::ScalarRef::Real(v))) => {
-                            cells.push(Cell::Float(f64::from(*v)))
-                        }
-                        Some(None) | None => cells.push(Cell::Null),
-                        Some(Some(_)) => {
-                            return Err(SqlSurfaceError::Internal {
-                                detail: "scalar payload type mismatch".to_string(),
-                            })
-                        }
-                    },
-                    ColumnType::Double => match scanned.get(*index) {
-                        Some(Some(row_codec::ScalarRef::Double(v))) => cells.push(Cell::Float(*v)),
-                        Some(None) | None => cells.push(Cell::Null),
-                        Some(Some(_)) => {
-                            return Err(SqlSurfaceError::Internal {
-                                detail: "scalar payload type mismatch".to_string(),
-                            })
-                        }
-                    },
-                    ColumnType::SmallInt | ColumnType::Integer => match scanned.get(*index) {
-                        Some(Some(row_codec::ScalarRef::Integer(v))) => {
-                            cells.push(Cell::SignedInteger(i64::from(*v)))
-                        }
-                        Some(Some(_)) => {
-                            return Err(SqlSurfaceError::Internal {
-                                detail: "scanned scalar type mismatch for INTEGER column"
-                                    .to_string(),
-                            })
-                        }
-                        Some(None) | None => cells.push(Cell::Null),
-                    },
-                    ColumnType::BigInt => match scanned.get(*index) {
-                        Some(Some(row_codec::ScalarRef::BigInt(v))) => {
-                            cells.push(Cell::SignedInteger(*v))
-                        }
-                        Some(Some(_)) => {
-                            return Err(SqlSurfaceError::Internal {
-                                detail: "scanned scalar type mismatch for BIGINT column"
-                                    .to_string(),
-                            })
-                        }
-                        Some(None) | None => cells.push(Cell::Null),
-                    },
-                    ColumnType::Boolean => match scanned.get(*index) {
-                        Some(Some(row_codec::ScalarRef::Bool(b))) => cells.push(Cell::Bool(*b)),
-                        Some(None) | None => cells.push(Cell::Null),
-                        Some(Some(_)) => {
-                            return Err(SqlSurfaceError::Internal {
-                                detail: "scalar payload type mismatch".to_string(),
-                            })
-                        }
-                    },
-                    ColumnType::Date => match scanned.get(*index) {
-                        Some(Some(v)) => match v.as_date() {
-                            Some(d) => cells.push(Cell::Date(d)),
-                            None => {
-                                return Err(scan_bug(
-                                    "DATE column scan yielded a non-Date scalar value",
-                                ))
-                            }
-                        },
-                        Some(None) | None => cells.push(Cell::Null),
-                    },
-                    ColumnType::Timestamp => {
-                        match scanned.get(*index) {
-                            Some(Some(v)) => match v.as_timestamp() {
-                                Some(t) => cells.push(Cell::Timestamp(t)),
-                                None => return Err(scan_bug(
-                                    "TIMESTAMP column scan yielded a non-Timestamp scalar value",
-                                )),
-                            },
-                            Some(None) | None => cells.push(Cell::Null),
-                        }
-                    }
-                    ColumnType::Time => match scanned.get(*index) {
-                        Some(Some(row_codec::ScalarRef::Time(t))) => cells.push(Cell::Time(*t)),
-                        Some(Some(_)) => {
-                            return Err(scan_bug(
-                                "TIME column scan yielded a non-Time scalar value",
-                            ))
-                        }
-                        Some(None) | None => cells.push(Cell::Null),
-                    },
-                    ColumnType::TimestampTz => {
-                        match scanned.get(*index) {
-                            Some(Some(row_codec::ScalarRef::TimestampTz(t))) => {
-                                cells.push(Cell::TimestampTz(*t))
-                            }
-                            Some(Some(_)) => return Err(scan_bug(
-                                "TIMESTAMPTZ column scan yielded a non-TimestampTz scalar value",
-                            )),
-                            Some(None) | None => cells.push(Cell::Null),
-                        }
-                    }
-                    ColumnType::Interval => match scanned.get(*index) {
-                        Some(Some(row_codec::ScalarRef::Interval(v))) => {
-                            cells.push(Cell::Interval(*v))
-                        }
-                        Some(Some(_)) => {
-                            return Err(scan_bug(
-                                "INTERVAL column scan yielded a non-Interval scalar value",
-                            ))
-                        }
-                        Some(None) | None => cells.push(Cell::Null),
-                    },
-                    ColumnType::Array(_) => match scanned.get(*index) {
-                        Some(Some(row_codec::ScalarRef::Array(array_ref))) => {
-                            let value = try_alloc_array_for_budget(
-                                *array_ref,
-                                byte_budget,
-                                max_result_bytes,
-                            )?;
-                            cells.push(Cell::Array(value));
-                        }
-                        Some(Some(_)) => {
-                            return Err(scan_bug(
-                                "ARRAY column scan yielded a non-Array scalar value",
-                            ))
-                        }
-                        Some(None) | None => cells.push(Cell::Null),
-                    },
-                    ColumnType::Bytea => match scanned.get(*index) {
-                        Some(Some(row_codec::ScalarRef::Bytes(b))) => {
-                            cells.push(Cell::Bytes(try_alloc_bytes_for_budget(
-                                b,
-                                byte_budget,
-                                max_result_bytes,
-                            )?));
-                        }
-                        Some(Some(_)) => {
-                            return Err(scan_bug(
-                                "BYTEA column scan yielded a non-Bytea scalar value",
-                            ))
-                        }
-                        Some(None) | None => cells.push(Cell::Null),
-                    },
-                    ColumnType::Json | ColumnType::Jsonb => match scanned.get(*index) {
-                        Some(Some(row_codec::ScalarRef::Json(t))) => {
-                            cells.push(Cell::Json(try_alloc_text_for_budget(
-                                t,
-                                byte_budget,
-                                max_result_bytes,
-                            )?));
-                        }
-                        Some(Some(_)) => {
-                            return Err(scan_bug(
-                                "JSON column scan yielded a non-Json scalar value",
-                            ))
-                        }
-                        Some(None) | None => cells.push(Cell::Null),
-                    },
-                    // ENUM 列は既存の `Cell::Text` へ写像する（Issue #890 D7。
-                    // `sql::exec` の投影と同じ扱い）。
-                    ColumnType::Enum(_) => match scanned.get(*index) {
-                        Some(Some(v)) => match v.as_dictionary_text() {
-                            Some(t) => {
-                                cells.push(Cell::Text(try_alloc_text_for_budget(
-                                    t,
-                                    byte_budget,
-                                    max_result_bytes,
-                                )?));
-                            }
-                            None => {
-                                return Err(scan_bug(
-                                    "ENUM column scan yielded a non-Enum scalar value",
-                                ))
-                            }
-                        },
-                        Some(None) | None => cells.push(Cell::Null),
-                    },
-                    ColumnType::Numeric { .. } => match scanned.get(*index) {
-                        Some(Some(v)) => match v.as_numeric() {
-                            Some(d) => cells.push(Cell::Numeric(d)),
-                            None => {
-                                return Err(scan_bug(
-                                    "NUMERIC column scan yielded a non-Numeric scalar value",
-                                ))
-                            }
-                        },
-                        Some(None) | None => cells.push(Cell::Null),
-                    },
-                    ColumnType::Uuid => match scanned.get(*index) {
-                        Some(Some(v)) => match v.as_uuid() {
-                            Some(u) => cells.push(Cell::Uuid(u)),
-                            None => {
-                                return Err(scan_bug(
-                                    "UUID column scan yielded a non-Uuid scalar value",
-                                ))
-                            }
-                        },
-                        Some(None) | None => cells.push(Cell::Null),
-                    },
+                    _ => push_scalar_column_cell(
+                        &mut cells,
+                        &column.ty,
+                        *index,
+                        scanned,
+                        byte_budget,
+                        max_result_bytes,
+                    )?,
                 }
             }
             ProjectedColumn::Computed { result_ty, .. } => {
@@ -907,6 +707,202 @@ fn build_projected_cells(
         }
     }
     Ok(cells)
+}
+
+/// VECTOR 以外のスカラー列 1 つ（`scanned[index]`）を結果セルへ写像して `cells` へ積む。
+/// `build_projected_cells` の列直接投影と、`sql::window` の LAG/LEAD（値・既定値の裸の列。
+/// Issue #1881）が共有する唯一の写像（第 2 の写像を作らない）。VECTOR は呼び出し元が扱う。
+pub(crate) fn push_scalar_column_cell(
+    cells: &mut Vec<Cell>,
+    ty: &ColumnType,
+    index: usize,
+    scanned: &[Option<row_codec::ScalarRef<'_>>],
+    byte_budget: &mut usize,
+    max_result_bytes: usize,
+) -> Result<(), SqlSurfaceError> {
+    let index = &index;
+    match ty {
+        ColumnType::Vector(_) => return Err(scan_bug("VECTOR column is not a scalar projection")),
+        ColumnType::Text | ColumnType::Varchar(_) | ColumnType::Bpchar(_) => {
+            match scanned.get(*index) {
+                Some(Some(row_codec::ScalarRef::Text(t))) => cells.push(Cell::Text(
+                    try_alloc_text_for_budget(t, byte_budget, max_result_bytes)?,
+                )),
+                Some(None) | None => cells.push(Cell::Null),
+                Some(Some(_)) => {
+                    return Err(SqlSurfaceError::Internal {
+                        detail: "scalar payload type mismatch".to_string(),
+                    })
+                }
+            }
+        }
+        // F8（Issue #882 計画）: REAL/DOUBLE は `Cell::Float`
+        // （REAL は f64 への無損失拡大）へ投影する。
+        ColumnType::Real => match scanned.get(*index) {
+            Some(Some(row_codec::ScalarRef::Real(v))) => cells.push(Cell::Float(f64::from(*v))),
+            Some(None) | None => cells.push(Cell::Null),
+            Some(Some(_)) => {
+                return Err(SqlSurfaceError::Internal {
+                    detail: "scalar payload type mismatch".to_string(),
+                })
+            }
+        },
+        ColumnType::Double => match scanned.get(*index) {
+            Some(Some(row_codec::ScalarRef::Double(v))) => cells.push(Cell::Float(*v)),
+            Some(None) | None => cells.push(Cell::Null),
+            Some(Some(_)) => {
+                return Err(SqlSurfaceError::Internal {
+                    detail: "scalar payload type mismatch".to_string(),
+                })
+            }
+        },
+        ColumnType::SmallInt | ColumnType::Integer => match scanned.get(*index) {
+            Some(Some(row_codec::ScalarRef::Integer(v))) => {
+                cells.push(Cell::SignedInteger(i64::from(*v)))
+            }
+            Some(Some(_)) => {
+                return Err(SqlSurfaceError::Internal {
+                    detail: "scanned scalar type mismatch for INTEGER column".to_string(),
+                })
+            }
+            Some(None) | None => cells.push(Cell::Null),
+        },
+        ColumnType::BigInt => match scanned.get(*index) {
+            Some(Some(row_codec::ScalarRef::BigInt(v))) => cells.push(Cell::SignedInteger(*v)),
+            Some(Some(_)) => {
+                return Err(SqlSurfaceError::Internal {
+                    detail: "scanned scalar type mismatch for BIGINT column".to_string(),
+                })
+            }
+            Some(None) | None => cells.push(Cell::Null),
+        },
+        ColumnType::Boolean => match scanned.get(*index) {
+            Some(Some(row_codec::ScalarRef::Bool(b))) => cells.push(Cell::Bool(*b)),
+            Some(None) | None => cells.push(Cell::Null),
+            Some(Some(_)) => {
+                return Err(SqlSurfaceError::Internal {
+                    detail: "scalar payload type mismatch".to_string(),
+                })
+            }
+        },
+        ColumnType::Date => match scanned.get(*index) {
+            Some(Some(v)) => match v.as_date() {
+                Some(d) => cells.push(Cell::Date(d)),
+                None => return Err(scan_bug("DATE column scan yielded a non-Date scalar value")),
+            },
+            Some(None) | None => cells.push(Cell::Null),
+        },
+        ColumnType::Timestamp => match scanned.get(*index) {
+            Some(Some(v)) => match v.as_timestamp() {
+                Some(t) => cells.push(Cell::Timestamp(t)),
+                None => {
+                    return Err(scan_bug(
+                        "TIMESTAMP column scan yielded a non-Timestamp scalar value",
+                    ))
+                }
+            },
+            Some(None) | None => cells.push(Cell::Null),
+        },
+        ColumnType::Time => match scanned.get(*index) {
+            Some(Some(row_codec::ScalarRef::Time(t))) => cells.push(Cell::Time(*t)),
+            Some(Some(_)) => {
+                return Err(scan_bug("TIME column scan yielded a non-Time scalar value"))
+            }
+            Some(None) | None => cells.push(Cell::Null),
+        },
+        ColumnType::TimestampTz => match scanned.get(*index) {
+            Some(Some(row_codec::ScalarRef::TimestampTz(t))) => cells.push(Cell::TimestampTz(*t)),
+            Some(Some(_)) => {
+                return Err(scan_bug(
+                    "TIMESTAMPTZ column scan yielded a non-TimestampTz scalar value",
+                ))
+            }
+            Some(None) | None => cells.push(Cell::Null),
+        },
+        ColumnType::Interval => match scanned.get(*index) {
+            Some(Some(row_codec::ScalarRef::Interval(v))) => cells.push(Cell::Interval(*v)),
+            Some(Some(_)) => {
+                return Err(scan_bug(
+                    "INTERVAL column scan yielded a non-Interval scalar value",
+                ))
+            }
+            Some(None) | None => cells.push(Cell::Null),
+        },
+        ColumnType::Array(_) => match scanned.get(*index) {
+            Some(Some(row_codec::ScalarRef::Array(array_ref))) => {
+                let value = try_alloc_array_for_budget(*array_ref, byte_budget, max_result_bytes)?;
+                cells.push(Cell::Array(value));
+            }
+            Some(Some(_)) => {
+                return Err(scan_bug(
+                    "ARRAY column scan yielded a non-Array scalar value",
+                ))
+            }
+            Some(None) | None => cells.push(Cell::Null),
+        },
+        ColumnType::Bytea => match scanned.get(*index) {
+            Some(Some(row_codec::ScalarRef::Bytes(b))) => {
+                cells.push(Cell::Bytes(try_alloc_bytes_for_budget(
+                    b,
+                    byte_budget,
+                    max_result_bytes,
+                )?));
+            }
+            Some(Some(_)) => {
+                return Err(scan_bug(
+                    "BYTEA column scan yielded a non-Bytea scalar value",
+                ))
+            }
+            Some(None) | None => cells.push(Cell::Null),
+        },
+        ColumnType::Json | ColumnType::Jsonb => match scanned.get(*index) {
+            Some(Some(row_codec::ScalarRef::Json(t))) => {
+                cells.push(Cell::Json(try_alloc_text_for_budget(
+                    t,
+                    byte_budget,
+                    max_result_bytes,
+                )?));
+            }
+            Some(Some(_)) => {
+                return Err(scan_bug("JSON column scan yielded a non-Json scalar value"))
+            }
+            Some(None) | None => cells.push(Cell::Null),
+        },
+        // ENUM 列は既存の `Cell::Text` へ写像する（Issue #890 D7。
+        // `sql::exec` の投影と同じ扱い）。
+        ColumnType::Enum(_) => match scanned.get(*index) {
+            Some(Some(v)) => match v.as_dictionary_text() {
+                Some(t) => {
+                    cells.push(Cell::Text(try_alloc_text_for_budget(
+                        t,
+                        byte_budget,
+                        max_result_bytes,
+                    )?));
+                }
+                None => return Err(scan_bug("ENUM column scan yielded a non-Enum scalar value")),
+            },
+            Some(None) | None => cells.push(Cell::Null),
+        },
+        ColumnType::Numeric { .. } => match scanned.get(*index) {
+            Some(Some(v)) => match v.as_numeric() {
+                Some(d) => cells.push(Cell::Numeric(d)),
+                None => {
+                    return Err(scan_bug(
+                        "NUMERIC column scan yielded a non-Numeric scalar value",
+                    ))
+                }
+            },
+            Some(None) | None => cells.push(Cell::Null),
+        },
+        ColumnType::Uuid => match scanned.get(*index) {
+            Some(Some(v)) => match v.as_uuid() {
+                Some(u) => cells.push(Cell::Uuid(u)),
+                None => return Err(scan_bug("UUID column scan yielded a non-Uuid scalar value")),
+            },
+            Some(None) | None => cells.push(Cell::Null),
+        },
+    }
+    Ok(())
 }
 
 /// 式 `Computed` 列の評価値を結果セルへ変換する（`build_projected_cells` の式項目と、
