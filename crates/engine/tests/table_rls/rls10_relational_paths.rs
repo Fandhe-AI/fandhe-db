@@ -21,6 +21,12 @@
 //! 7. キャッシュ（`relation_snapshot`／`generation_key`／`visible_cache`）の温め
 //!    順序に依存しないこと（T5）
 //!
+//! Issue #1851（親 #1849。ポインタ: RLS-10 (b)・SQL-61・SQL-62）で、相関サブクエリ
+//! （EXISTS・NOT EXISTS・IN・NOT IN・スカラーの集計形／非集計形／式埋め込み）と
+//! FROM 句の派生テーブル（単体・集計・順位・JOIN・入れ子）の軸を T0〜T3・T5 へ追加し、
+//! モード別の手計算期待値と陽性対照（T4b）・エラー文言の秘匿検査・データ依存上限
+//! カナリア（21000・再評価回数・派生表の具体化行数）を加えた。
+//!
 //! 判定ヘルパ自体の健全性は T6（負の対照）で固定する。
 
 use std::collections::HashSet;
@@ -573,6 +579,86 @@ fn shapes() -> Vec<Shape> {
             sql: "SELECT id, title FROM ja_docs LIMIT 50",
             check: Check::DocumentsId,
         },
+        // Issue #1851（SQL-61・SQL-62・RLS-10 (b) ポインタ）: 相関サブクエリと
+        // FROM 句の派生テーブル。いずれも Public 行だけで非空になる形に限る
+        // （T0 を緩めない）。Private 行・モード別の真偽は T4b で手計算の期待値と照合する。
+        // 相関 EXISTS（半結合）。
+        Shape {
+            axis: "correlated_exists",
+            sql: "SELECT id, title FROM documents WHERE EXISTS (SELECT 1 FROM authors WHERE authors.id = documents.author_id) LIMIT 50",
+            check: Check::DocumentsId,
+        },
+        // 相関 NOT EXISTS（反結合）。`score < 10` を満たすのは flood 行だけで、
+        // 内側へ他テナント行が届くと author 1 が消えて T2 が検出する。
+        Shape {
+            axis: "correlated_not_exists",
+            sql: "SELECT id, name FROM authors WHERE NOT EXISTS (SELECT 1 FROM documents WHERE documents.author_id = authors.id AND documents.score < 10) LIMIT 50",
+            check: Check::Token,
+        },
+        // 非等価の残余を持つ相関 EXISTS（外側行ごとの再評価経路）。
+        Shape {
+            axis: "correlated_exists_reeval",
+            sql: "SELECT id, name FROM authors WHERE EXISTS (SELECT 1 FROM documents WHERE documents.author_id = authors.id AND documents.score > authors.id) LIMIT 50",
+            check: Check::Token,
+        },
+        Shape {
+            axis: "correlated_in",
+            sql: "SELECT id, title FROM documents WHERE lang IN (SELECT lang FROM langs WHERE langs.id = documents.author_id) LIMIT 50",
+            check: Check::DocumentsId,
+        },
+        // 相関 NOT IN。`score = 10` は flood 行だけが満たす。
+        Shape {
+            axis: "correlated_not_in",
+            sql: "SELECT id, lang FROM other_docs WHERE lang NOT IN (SELECT lang FROM documents WHERE documents.score = other_docs.id) LIMIT 50",
+            check: Check::StatisticOnly,
+        },
+        // 相関スカラー（集計形。左外部結合＋集計の経路）。count・min が flood で変わる。
+        Shape {
+            axis: "correlated_scalar_agg",
+            sql: "SELECT id, name, (SELECT count(*) FROM documents WHERE documents.author_id = authors.id) FROM authors LIMIT 50",
+            check: Check::Token,
+        },
+        // 相関スカラー（非集計形）。内側を Private 行 id=11 に絞った決定的な形。
+        Shape {
+            axis: "correlated_scalar_nonagg",
+            sql: "SELECT id, name, (SELECT title FROM documents WHERE documents.author_id = authors.id AND documents.id = 11) FROM authors LIMIT 50",
+            check: Check::Token,
+        },
+        // 相関スカラー（式埋め込み）。
+        Shape {
+            axis: "correlated_scalar_expr",
+            sql: "SELECT id, name, COALESCE((SELECT min(score) FROM documents WHERE documents.author_id = authors.id), -1) FROM authors LIMIT 50",
+            check: Check::Token,
+        },
+        // 派生表（インライン展開）。
+        Shape {
+            axis: "derived",
+            sql: "SELECT title, lang FROM (SELECT id, title, lang FROM documents WHERE lang = 'ja') t LIMIT 50",
+            check: Check::Token,
+        },
+        // 派生表（集計。具体化）。
+        Shape {
+            axis: "derived_aggregate",
+            sql: "SELECT lang, n FROM (SELECT lang, count(*) AS n FROM documents GROUP BY lang) t ORDER BY lang",
+            check: Check::StatisticOnly,
+        },
+        // 派生表（ORDER BY + LIMIT の順位。flood 行が順位を押し出す）。
+        Shape {
+            axis: "derived_order_limit",
+            sql: "SELECT title FROM (SELECT title, score FROM documents ORDER BY score, title LIMIT 3) t",
+            check: Check::Token,
+        },
+        // 派生表 × JOIN（JOIN の slot）。
+        Shape {
+            axis: "derived_join",
+            sql: "SELECT d.title, authors.name FROM (SELECT title, author_id FROM documents) d JOIN authors ON d.author_id = authors.id LIMIT 50",
+            check: Check::Token,
+        },
+        Shape {
+            axis: "derived_nested",
+            sql: "SELECT title FROM (SELECT title FROM (SELECT title, lang FROM documents) a1) a0 LIMIT 50",
+            check: Check::Token,
+        },
         Shape {
             axis: "statistic",
             sql: "SELECT COUNT(*) FROM documents",
@@ -674,6 +760,19 @@ fn shape_matrix_is_accepted_and_covers_each_axis() {
         "window_count",
         "view",
         "statistic",
+        "correlated_exists",
+        "correlated_not_exists",
+        "correlated_exists_reeval",
+        "correlated_in",
+        "correlated_not_in",
+        "correlated_scalar_agg",
+        "correlated_scalar_nonagg",
+        "correlated_scalar_expr",
+        "derived",
+        "derived_aggregate",
+        "derived_order_limit",
+        "derived_join",
+        "derived_nested",
     ] {
         assert!(axes.contains(required), "missing shape axis: {required}");
     }
@@ -716,6 +815,21 @@ fn text_cells(row: &engine::sql::exec::ResultRow) -> Vec<&str> {
             _ => None,
         })
         .collect()
+}
+
+/// エラー文言に他テナントの情報（行の一意トークン・テナント名・flood 用の固有文字列）や
+/// 内部の予約名（名前置 `\u{2}`・合成 CTE 名 `?derived`）が含まれないことを検査する
+/// （Issue #1851。T3・データ依存カナリアの陽性対照が共用する。SQLSTATE 風 `wire_code`
+/// に付随する `client_message` を wire-server がそのまま写像するため、engine 側で固定する）。
+fn assert_error_message_clean(msg: &str) {
+    let mut banned: Vec<&str> = vec!["uniquetoken_", "zz-only-", "\u{2}", "?derived"];
+    banned.extend(TENANTS.iter().copied());
+    for word in banned {
+        assert!(
+            !msg.contains(word),
+            "error message must not expose {word:?}: {msg:?}"
+        );
+    }
 }
 
 /// 結果に禁止トークン・不許可 `id` が混入していないかを検査する（独立オラクル
@@ -888,6 +1002,156 @@ fn outer_join_padding_and_exists_truth_do_not_depend_on_other_tenants() {
     );
 }
 
+// ---------- T4b: 相関・派生表の手計算期待値（Issue #1851） ----------
+
+/// 結果を「行ごとのセル Debug 表現の列」へ写し、並び順に依らず比較できるよう整列する。
+fn rendered_rows(result: &QueryResult) -> Vec<Vec<String>> {
+    let mut rows: Vec<Vec<String>> = result
+        .rows
+        .iter()
+        .map(|r| r.cells.iter().map(|c| format!("{c:?}")).collect())
+        .collect();
+    rows.sort();
+    rows
+}
+
+fn text(s: &str) -> String {
+    format!("Text({s:?})")
+}
+
+/// 相関サブクエリ・派生表の真偽・集計値・順位が、自テナントと Public の行だけで決まり、
+/// 他テナントの Private 行（flood）に依存しないことを手計算の期待値で固定する。
+/// 陽性対照として flooder 自身が同じ SQL を実行すると flood 行の影響が実際に結果へ出る
+/// （flood 行が相関の内側・派生表の本文へ届く位置にあることの裏付け）。
+#[test]
+fn correlated_and_derived_truth_values_do_not_depend_on_other_tenants() {
+    let path_baseline = unique_db_path("rls10-t4b-baseline");
+    let _guard_baseline = CleanupGuard(path_baseline.clone());
+    let storage_baseline = Storage::open(&path_baseline).expect("open storage");
+    seed_fixture(&storage_baseline, TENANT_A, false);
+    let core_baseline = new_core(storage_baseline);
+
+    let path_flooded = unique_db_path("rls10-t4b-flooded");
+    let _guard_flooded = CleanupGuard(path_flooded.clone());
+    let storage_flooded = Storage::open(&path_flooded).expect("open storage");
+    seed_fixture(&storage_flooded, TENANT_A, true);
+    let core_flooded = new_core(storage_flooded);
+
+    let author = |t: &str, id: u64| text(&unique_token(AUTHORS, t, id));
+    let doc = |t: &str, id: u64| text(&unique_token(DOCUMENTS, t, id));
+
+    let not_exists = "SELECT name FROM authors WHERE NOT EXISTS (SELECT 1 FROM documents WHERE documents.author_id = authors.id AND documents.score < 10) LIMIT 50";
+    let scalar_agg = "SELECT name, (SELECT count(*) FROM documents WHERE documents.author_id = authors.id), (SELECT min(score) FROM documents WHERE documents.author_id = authors.id) FROM authors LIMIT 50";
+    let scalar_nonagg = "SELECT name, (SELECT title FROM documents WHERE documents.author_id = authors.id AND documents.id = 11) FROM authors LIMIT 50";
+    let not_in = "SELECT id FROM other_docs WHERE lang NOT IN (SELECT lang FROM documents WHERE documents.score = other_docs.id) LIMIT 50";
+    let top3 =
+        "SELECT title FROM (SELECT title, score FROM documents ORDER BY score, title LIMIT 3) t";
+
+    for (label, core) in [("baseline", &core_baseline), ("flooded", &core_flooded)] {
+        for allow_private in [false, true] {
+            let ctx = format!("{label} allow_private={allow_private}");
+
+            // NOT EXISTS: 各テナントの author 1 は残る（flood 行の score<10 に消されない）。
+            let mut want: Vec<Vec<String>> = vec![
+                vec![author(TENANT_A, 1)],
+                vec![author(TENANT_B, 1)],
+                vec![author(TENANT_C, 1)],
+            ];
+            if allow_private {
+                want.push(vec![author(TENANT_A, 2)]);
+            }
+            want.sort();
+            let got = rendered_rows(&run(core, TENANT_A, allow_private, not_exists));
+            assert_eq!(got, want, "NOT EXISTS: {ctx}");
+
+            // 集計形スカラー: Public の author 1 は count=6・min=50、自テナントの
+            // Private author 2 は count=1・min=200（他テナントの行は数えない）。
+            let mut want: Vec<Vec<String>> = TENANTS
+                .iter()
+                .map(|t| {
+                    vec![
+                        author(t, 1),
+                        "Integer(6)".to_string(),
+                        "SignedInteger(50)".to_string(),
+                    ]
+                })
+                .collect();
+            if allow_private {
+                want.push(vec![
+                    author(TENANT_A, 2),
+                    "Integer(1)".to_string(),
+                    "SignedInteger(200)".to_string(),
+                ]);
+            }
+            want.sort();
+            let got = rendered_rows(&run(core, TENANT_A, allow_private, scalar_agg));
+            assert_eq!(got, want, "correlated scalar aggregate: {ctx}");
+
+            // 非集計形スカラー: Private の id=11 は allow_private=true のとき自テナントの
+            // ものだけが見える。他テナントの id=11 が混ざれば 21000 かトークン漏れになる。
+            let mut want: Vec<Vec<String>> = TENANTS
+                .iter()
+                .map(|t| vec![author(t, 1), "Null".to_string()])
+                .collect();
+            if allow_private {
+                want.push(vec![author(TENANT_A, 2), doc(TENANT_A, 11)]);
+            }
+            want.sort();
+            let got = rendered_rows(&run(core, TENANT_A, allow_private, scalar_nonagg));
+            assert_eq!(got, want, "correlated scalar non-aggregate: {ctx}");
+
+            // 相関 NOT IN: other_docs の Public id=10（3 テナント分）が残り、
+            // allow_private なら自テナントの Private id=11 も残る。
+            let mut want: Vec<Vec<String>> = vec![vec!["Integer(10)".to_string()]; 3];
+            if allow_private {
+                want.push(vec!["Integer(11)".to_string()]);
+            }
+            want.sort();
+            let got = rendered_rows(&run(core, TENANT_A, allow_private, not_in));
+            assert_eq!(got, want, "correlated NOT IN: {ctx}");
+
+            // 派生表の ORDER BY + LIMIT: 上位 3 件は各テナントの Public id=12（score=50）。
+            let mut want: Vec<Vec<String>> = TENANTS.iter().map(|t| vec![doc(t, 12)]).collect();
+            want.sort();
+            let got = rendered_rows(&run(core, TENANT_A, allow_private, top3));
+            assert_eq!(got, want, "derived ORDER BY/LIMIT: {ctx}");
+        }
+    }
+
+    // 陽性対照: flooder（tenant-b）自身には flood 行（author_id=1・score=0..19）が届く。
+    let b = |sql: &str| rendered_rows(&run(&core_flooded, TENANT_B, true, sql));
+    assert_eq!(
+        b(not_exists),
+        vec![vec![author(TENANT_B, 2)]],
+        "positive control: flood rows must remove author 1 from NOT EXISTS for the flooder"
+    );
+    let agg = b(scalar_agg);
+    assert!(
+        agg.contains(&vec![
+            author(TENANT_A, 1),
+            "Integer(26)".to_string(),
+            "SignedInteger(0)".to_string()
+        ]),
+        "positive control: flood rows must reach the correlated aggregate: {agg:?}"
+    );
+    assert_eq!(
+        b(not_in),
+        vec![vec!["Integer(11)".to_string()]],
+        "positive control: flood rows (score=10) must remove id=10 from NOT IN"
+    );
+    let top = b(top3);
+    assert_eq!(
+        top.len(),
+        3,
+        "positive control: derived top-3 must return exactly 3 rows: {top:?}"
+    );
+    assert!(
+        top.iter()
+            .all(|r| r[0].contains(&format!("_{TENANT_B}_100"))),
+        "positive control: flood rows must take the derived top-3: {top:?}"
+    );
+}
+
 // ---------- T3: エラー応答の不変性（AC3） ----------
 
 #[test]
@@ -940,6 +1204,50 @@ fn error_responses_are_identical_with_and_without_other_tenant_private_rows() {
                 err_flooded.client_message(),
                 "client_message changed under flood: sql={sql:?} allow_private={allow_private}"
             );
+        }
+    }
+
+    // Issue #1851（SQL-61・SQL-62）: 相関・派生表の未対応形は fail-closed（42601・
+    // 0A000・名前解決系）で拒否され、閲覧テナント・可視性モード・flood の有無に
+    // よらず `(wire_code, client_message)` が完全一致し、文言に他テナントの情報や
+    // 内部の予約名が含まれない。期待コードは実測で確定した値。
+    let correlated_derived_errors: [(&str, &str); 10] = [
+        ("SELECT id, title FROM documents WHERE lang IN (SELECT lang FROM langs WHERE langs.id = documents.author_id LIMIT 5) LIMIT 50", "42601"),
+        ("SELECT id, title FROM documents WHERE author_id = ANY (SELECT id FROM authors WHERE authors.id = documents.author_id) LIMIT 50", "42601"),
+        ("SELECT id, title FROM documents WHERE author_id <> ALL (SELECT id FROM authors WHERE authors.id = documents.author_id) LIMIT 50", "42601"),
+        ("SELECT documents.id, (SELECT count(*) FROM authors WHERE authors.id = documents.author_id) FROM documents JOIN langs ON documents.lang = langs.lang LIMIT 5", "42601"),
+        ("SELECT id, (SELECT title || 'x' FROM documents WHERE documents.author_id = authors.id) FROM authors LIMIT 5", "0A000"),
+        ("SELECT id, title FROM documents WHERE EXISTS (SELECT 1 FROM authors WHERE authors.id = nosuch.author_id) LIMIT 5", "42P01"),
+        ("SELECT title FROM (SELECT title FROM documents) t WHERE lang IN (SELECT lang FROM langs) LIMIT 5", "42601"),
+        ("SELECT t.title FROM (SELECT title FROM documents) t, LATERAL (SELECT 1) x LIMIT 5", "0A000"),
+        ("SELECT nosuch FROM (SELECT title FROM documents) t LIMIT 5", "42703"),
+        ("SELECT documents.title FROM (SELECT title FROM documents) t LIMIT 5", "42P01"),
+    ];
+    for (sql, want_code) in correlated_derived_errors.iter().copied().chain([(
+        "SELECT title FROM (SELECT title FROM documents) t(a, b, c) LIMIT 5",
+        "42P10",
+    )]) {
+        let mut reference: Option<(String, String)> = None;
+        for core in [&core_baseline, &core_flooded] {
+            for &viewer in TENANTS.iter() {
+                for allow_private in [false, true] {
+                    let mut session = SessionState::default();
+                    let err = core
+                        .execute_sql_in_session(&ctx_for(viewer, allow_private), &mut session, sql)
+                        .expect_err("shape must be rejected");
+                    assert_eq!(err.wire_code(), want_code, "sql={sql:?} err={err:?}");
+                    let msg = err.client_message().to_string();
+                    assert_error_message_clean(&msg);
+                    let observed = (err.wire_code().to_string(), msg);
+                    match &reference {
+                        None => reference = Some(observed),
+                        Some(r) => assert_eq!(
+                            r, &observed,
+                            "error response varied by viewer/mode/flood: sql={sql:?} viewer={viewer} allow_private={allow_private}"
+                        ),
+                    }
+                }
+            }
         }
     }
 }
@@ -1219,6 +1527,144 @@ mod data_dependent_canaries {
             "positive control"
         );
     }
+
+    // ---- Issue #1851: 相関サブクエリ・派生表のデータ依存上限（SQL-61・SQL-62） ----
+
+    /// canary 2 表へ行を投入して `EngineCore` を組む。`docs` は (tenant, id, 可視性,
+    /// lang, score)、`langs` は (tenant, id, 可視性, lang)。`configure` で上限設定を渡す。
+    fn open_canary(
+        name: &str,
+        docs: &[(&str, u64, Visibility, &str, i64)],
+        langs: &[(&str, u64, Visibility, &str)],
+        configure: impl FnOnce(EngineCore) -> EngineCore,
+    ) -> (EngineCore, CleanupGuard) {
+        let path = unique_db_path(name);
+        let guard = CleanupGuard(path.clone());
+        let storage = Storage::open(&path).expect("open storage");
+        storage
+            .create_table(&canary_docs_schema())
+            .expect("create canary_docs");
+        storage
+            .create_table(&canary_langs_schema())
+            .expect("create canary_langs");
+        for &(t, id, vis, lang, score) in docs {
+            insert_canary_doc(&storage, t, id, vis, lang, score);
+        }
+        for &(t, id, vis, lang) in langs {
+            insert_canary_lang(&storage, t, id, vis, lang);
+        }
+        (configure(new_core(storage)), guard)
+    }
+
+    fn expect_error(core: &EngineCore, sql: &str) -> (String, String) {
+        let mut session = SessionState::default();
+        let err = core
+            .execute_sql_in_session(&ctx_for(TENANT_A, true), &mut session, sql)
+            .expect_err("own-tenant overflow must be rejected (positive control)");
+        (
+            err.wire_code().to_string(),
+            err.client_message().to_string(),
+        )
+    }
+
+    /// 非集計形の相関スカラー（`21000`）は内側の可視行数だけで決まる。他テナントの Private
+    /// 行が同じキーを持っても閲覧テナントの結果は変わらず、自テナントで 2 件一致させると
+    /// 実際に `21000` になる（文言に他テナントの情報は含まれない）。
+    #[test]
+    fn correlated_scalar_cardinality_error_is_invariant_to_other_tenant_flood() {
+        let sql = format!(
+            "SELECT id, (SELECT lang FROM {CANARY_DOCS} WHERE {CANARY_DOCS}.score = {CANARY_LANGS}.id) FROM {CANARY_LANGS}"
+        );
+        let base_docs = [(TENANT_A, 1, Visibility::Public, "ja", 1)];
+        let langs = [(TENANT_A, 1, Visibility::Public, "ja")];
+        let (core_baseline, _g1) =
+            open_canary("rls10-canary-21000-base", &base_docs, &langs, |c| c);
+        let mut flood_docs = base_docs.to_vec();
+        flood_docs.push((TENANT_B, 500, Visibility::Private, "zz", 1));
+        flood_docs.push((TENANT_C, 501, Visibility::Private, "zz", 1));
+        let (core_flooded, _g2) =
+            open_canary("rls10-canary-21000-flood", &flood_docs, &langs, |c| c);
+        assert_eq!(
+            run(&core_baseline, TENANT_A, true, &sql),
+            run(&core_flooded, TENANT_A, true, &sql),
+            "non-aggregate correlated scalar must be invariant to other tenants' rows"
+        );
+        let mut own_docs = base_docs.to_vec();
+        own_docs.push((TENANT_A, 502, Visibility::Private, "zz", 1));
+        let (core_positive, _g3) = open_canary("rls10-canary-21000-pos", &own_docs, &langs, |c| c);
+        let (code, msg) = expect_error(&core_positive, &sql);
+        assert_eq!(code, "21000", "positive control msg={msg}");
+        assert_error_message_clean(&msg);
+    }
+
+    /// 相関の再評価回数上限（`54000`）は外側の**可視行**数で数える。他テナントの外側行が
+    /// 上限を超えるほど増えても閲覧テナントは成功し、自テナントの外側行が上限を超えると
+    /// 実際に `54000` になる（ちょうど上限なら成功）。
+    #[test]
+    fn correlated_reevaluation_limit_is_invariant_to_other_tenant_flood() {
+        use engine::correlated_limits::CorrelatedLimits;
+        let sql = format!(
+            "SELECT id, (SELECT {CANARY_LANGS}.id FROM {CANARY_LANGS} WHERE {CANARY_LANGS}.id < {CANARY_DOCS}.score) + 1 FROM {CANARY_DOCS}"
+        );
+        let limited = |c: EngineCore| c.with_correlated_limits(CorrelatedLimits::new(2));
+        let langs = [(TENANT_A, 1, Visibility::Public, "ja")];
+        let base_docs = [
+            (TENANT_A, 1, Visibility::Public, "ja", 5),
+            (TENANT_A, 2, Visibility::Public, "ja", 6),
+        ];
+        let (core_baseline, _g1) =
+            open_canary("rls10-canary-reeval-base", &base_docs, &langs, limited);
+        let mut flood_docs = base_docs.to_vec();
+        for i in 0..6u64 {
+            flood_docs.push((TENANT_B, 600 + i, Visibility::Private, "ja", 5));
+        }
+        let (core_flooded, _g2) =
+            open_canary("rls10-canary-reeval-flood", &flood_docs, &langs, limited);
+        assert_eq!(
+            run(&core_baseline, TENANT_A, true, &sql),
+            run(&core_flooded, TENANT_A, true, &sql),
+            "re-evaluation budget must not count other tenants' outer rows"
+        );
+        let mut own_docs = base_docs.to_vec();
+        own_docs.push((TENANT_A, 3, Visibility::Private, "ja", 7));
+        let (core_positive, _g3) =
+            open_canary("rls10-canary-reeval-pos", &own_docs, &langs, limited);
+        let (code, msg) = expect_error(&core_positive, &sql);
+        assert_eq!(code, "54000", "positive control msg={msg}");
+        assert_error_message_clean(&msg);
+    }
+
+    /// 派生表の具体化行数上限（`54000`）は閲覧テナントの可視行だけを数える。他テナントの
+    /// Private 行で本文が上限を超えても成功し、自テナントの可視行が上限を超えると失敗する。
+    #[test]
+    fn derived_materialization_cap_is_invariant_to_other_tenant_flood() {
+        use engine::result_limits::ResultLimits;
+        let sql = format!("SELECT * FROM (SELECT lang FROM {CANARY_DOCS} ORDER BY lang) t");
+        let limited = |c: EngineCore| c.with_result_limits(ResultLimits::new(2));
+        let base_docs = [
+            (TENANT_A, 1, Visibility::Public, "a1", 1),
+            (TENANT_A, 2, Visibility::Public, "a2", 2),
+        ];
+        let (core_baseline, _g1) =
+            open_canary("rls10-canary-derived-base", &base_docs, &[], limited);
+        let mut flood_docs = base_docs.to_vec();
+        for i in 0..6u64 {
+            flood_docs.push((TENANT_B, 700 + i, Visibility::Private, "b", 1));
+        }
+        let (core_flooded, _g2) =
+            open_canary("rls10-canary-derived-flood", &flood_docs, &[], limited);
+        assert_eq!(
+            run(&core_baseline, TENANT_A, true, &sql),
+            run(&core_flooded, TENANT_A, true, &sql),
+            "derived-table materialization cap must not count other tenants' rows"
+        );
+        let mut own_docs = base_docs.to_vec();
+        own_docs.push((TENANT_A, 3, Visibility::Private, "a3", 3));
+        let (core_positive, _g3) = open_canary("rls10-canary-derived-pos", &own_docs, &[], limited);
+        let (code, msg) = expect_error(&core_positive, &sql);
+        assert_eq!(code, "54000", "positive control msg={msg}");
+        assert_error_message_clean(&msg);
+    }
 }
 
 // ---------- T5: キャッシュ温め順序に非依存 ----------
@@ -1230,6 +1676,8 @@ fn cache_warming_order_does_not_change_results() {
     // キー分離契約は `relation_snapshot`／`generation_key` が
     // per-(table, PolicyContext) で持つ設計により本質的に同型）。
     let representative_sql = [
+        "SELECT id, name, (SELECT count(*) FROM documents WHERE documents.author_id = authors.id) FROM authors LIMIT 50",
+        "SELECT d.title, authors.name FROM (SELECT title, author_id FROM documents) d JOIN authors ON d.author_id = authors.id LIMIT 50",
         "SELECT documents.title, authors.name FROM documents JOIN authors ON documents.author_id = authors.id LIMIT 50",
         "SELECT id FROM documents WHERE lang IN (SELECT lang FROM langs LIMIT 1000) LIMIT 50",
         "SELECT id, ROW_NUMBER() OVER (PARTITION BY lang ORDER BY score DESC) FROM documents LIMIT 50",
@@ -1388,6 +1836,25 @@ fn checker_negative_control_detects_fabricated_violation() {
         );
     }))
     .is_err();
+    // Issue #1851: エラー文言の秘匿検査ヘルパも、他テナントの名前・行トークン・内部の
+    // 予約名を含む捏造文言を見逃さない。
+    for fabricated in [
+        format!("boom {}", unique_token(DOCUMENTS, TENANT_B, 11)),
+        format!("row of {TENANT_B} rejected"),
+        "unknown \u{2}derived".to_string(),
+        "relation ?derived0 missing".to_string(),
+        format!("zz-only-{TENANT_B}"),
+    ] {
+        let caught_msg = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            assert_error_message_clean(&fabricated);
+        }))
+        .is_err();
+        assert!(
+            caught_msg,
+            "assert_error_message_clean failed to catch {fabricated:?}"
+        );
+    }
+
     assert!(
         caught_collision,
         "the DocumentsId leak-detection assertion failed to catch a same-id cross-tenant \
