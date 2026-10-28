@@ -234,6 +234,23 @@ fn duplicates_do_not_count_toward_row_limit() {
     assert_eq!(code(&core, "alice", &walk("UNION")), "54000");
 }
 
+/// JOIN の候補行（重複除去前）には最終結果の行数上限を適用しない: 同じ行を 4 件返す JOIN でも、
+/// 重複除去後（2 行）が `--max-result-rows=3` 以内なら成功する。
+#[test]
+fn join_candidates_before_dedup_do_not_hit_result_row_limit() {
+    let (core, _g) = open_core_with(
+        "sql35-union-join-candidates",
+        Some(RecursiveCteLimits::new(1000, 100)),
+        |storage| {
+            for i in 0..4u64 {
+                put_edge(storage, "alice", i + 1, 1, 2, Visibility::Public);
+            }
+        },
+    );
+    let core = core.with_result_limits(engine::result_limits::ResultLimits::new(3));
+    assert_eq!(col(&core, "alice", &walk("UNION")), strs(&["1", "2"]));
+}
+
 /// 重複が多くても、重複除去後の行数が上限を超えれば部分結果を返さず `54000`。
 #[test]
 fn distinct_rows_over_limit_fail_closed() {

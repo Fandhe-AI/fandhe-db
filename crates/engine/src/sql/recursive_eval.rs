@@ -102,6 +102,8 @@ struct RowBudget {
     retained: usize,
     fixed: usize,
     scratch: usize,
+    /// 重複除去キー集合の保持量（`fixed` の内数ではなく別計上。JOIN へ渡す残予算から差し引く）。
+    dedup_keys: usize,
     limits: RecursiveLimits,
 }
 
@@ -123,6 +125,7 @@ impl RowBudget {
             retained: 0,
             fixed: 0,
             scratch: 0,
+            dedup_keys: 0,
             limits,
         }
     }
@@ -131,6 +134,7 @@ impl RowBudget {
         self.retained
             .saturating_add(self.fixed)
             .saturating_add(self.scratch)
+            .saturating_add(self.dedup_keys)
     }
 
     /// 全確保経路の合計に対する残りバイト（走査の確保上限）。
@@ -138,9 +142,27 @@ impl RowBudget {
         self.limits.max_bytes.saturating_sub(self.total())
     }
 
-    /// JOIN へ渡す上限（JOIN は側の行を自分の予算へ計上し直すため、保持済みの結果だけを差し引く）。
+    /// JOIN へ渡す上限（JOIN は側の行を自分の予算へ計上し直すため、保持済みの結果と、評価中ずっと
+    /// 残る重複除去キーだけを差し引く）。
     fn remaining_for_join(&self) -> usize {
-        self.limits.max_bytes.saturating_sub(self.retained)
+        self.limits
+            .max_bytes
+            .saturating_sub(self.retained)
+            .saturating_sub(self.dedup_keys)
+    }
+
+    /// 重複除去キーの保持量を確保前に計上する（超過は `54000`）。
+    fn reserve_dedup_key(&mut self, bytes: usize) -> Result<(), SqlSurfaceError> {
+        self.total()
+            .checked_add(bytes)
+            .filter(|n| *n <= self.limits.max_bytes)
+            .ok_or_else(|| {
+                SqlSurfaceError::payload_too_large(
+                    "recursive query exceeds the shared result byte budget",
+                )
+            })?;
+        self.dedup_keys = self.dedup_keys.saturating_add(bytes);
+        Ok(())
     }
 
     /// 一時行の計上を解放する（反復の終わり）。
@@ -254,7 +276,7 @@ impl RowBudget {
 
 /// 重複除去版 `UNION` の既出行集合。キーは集合演算 `UNION` と同じ `set_op::row_key`（NULL 同士は
 /// 等しい・`-0.0`＝`+0.0`・numeric は scale 無視）。キーは評価中ずっと残るため、確保の前に
-/// 共有バイト予算へ（`Charge::Fixed`＝行数に数えない）計上する。重複と分かったキーの計上は残す
+/// 共有バイト予算へ（`RowBudget::reserve_dedup_key`＝行数に数えない）計上する。重複と分かったキーの計上は残す
 /// （上限が厳しくなる側）。
 struct DedupSet {
     seen: HashSet<Vec<u8>>,
@@ -273,10 +295,7 @@ impl DedupSet {
     /// 行が未出なら記録して `true`、既出なら `false`（呼び出し側が捨てる）。
     fn insert(&mut self, row: &ResultRow, budget: &mut RowBudget) -> Result<bool, SqlSurfaceError> {
         let len = super::set_op::row_key_len(row)?;
-        budget.reserve(
-            len.saturating_add(DEDUP_ENTRY_OVERHEAD_BYTES),
-            Charge::Fixed,
-        )?;
+        budget.reserve_dedup_key(len.saturating_add(DEDUP_ENTRY_OVERHEAD_BYTES))?;
         let key = super::set_op::row_key(row)?;
         self.seen.try_reserve(1).map_err(|_| {
             SqlSurfaceError::payload_too_large("recursive query exceeds the row limit")
@@ -1164,6 +1183,13 @@ pub(crate) fn execute(
                     *slot = side_rows;
                     // JOIN の中間結果・出力の確保上限は、保持済みの結果を差し引いた残予算。
                     let step_limits = join_limits.with_budget_cap(budget.remaining_for_join());
+                    // 重複除去版は候補行へ最終結果の行数上限を適用しない（捨てる重複は累積行数に
+                    // 数えない契約。結果行数は重複除去後の `admit` で判定する）。
+                    let step_limits = if dedup.is_some() {
+                        step_limits.with_max_result_rows(usize::MAX)
+                    } else {
+                        step_limits
+                    };
                     let (joined, side_idx) = prepared.run_with_sides_provenance(
                         &sides,
                         &step_limits,
@@ -1181,9 +1207,14 @@ pub(crate) fn execute(
                             .ok_or_else(|| internal("recursive parent mapping out of range"))?;
                     }
                     budget.clear_scratch();
-                    let mut joined_rows = joined.rows;
+                    let joined_rows = joined.rows;
                     if let Some(d) = dedup.as_mut() {
                         // `SEARCH` との併用は計画段で拒否済みのため `parents` は空。
+                        // JOIN 出力は保持したままキーを追加するため、出力ぶんを先に一時行として
+                        // 共有予算へ計上し、キー確保が出力と合算で上限を超えないようにする。
+                        for row in &joined_rows {
+                            budget.reserve(RowBudget::row_bytes(&row.cells), Charge::Scratch)?;
+                        }
                         let mut kept: Vec<ResultRow> = Vec::new();
                         kept.try_reserve(joined_rows.len()).map_err(|_| {
                             SqlSurfaceError::payload_too_large(
@@ -1192,15 +1223,20 @@ pub(crate) fn execute(
                         })?;
                         for row in joined_rows {
                             if d.insert(&row, &mut budget)? {
+                                budget.promote(&row.cells)?;
                                 kept.push(row);
+                            } else {
+                                budget.discard_scratch(&row.cells);
                             }
                         }
-                        joined_rows = kept;
+                        budget.clear_scratch();
+                        kept
+                    } else {
+                        for row in &joined_rows {
+                            budget.admit(&row.cells, Charge::Retained)?;
+                        }
+                        joined_rows
                     }
-                    for row in &joined_rows {
-                        budget.admit(&row.cells, Charge::Retained)?;
-                    }
-                    joined_rows
                 }
             };
             result.try_reserve(new_rows.len()).map_err(|_| {
@@ -1319,7 +1355,12 @@ mod tests {
         assert!(d.insert(&row(2), &mut b).unwrap());
         // キーは行数に数えない。
         assert_eq!(b.rows, 0);
-        assert!(b.fixed > 0);
+        assert!(b.dedup_keys > 0);
+        // JOIN へ渡す残予算はキー保持量を差し引く。
+        assert_eq!(
+            b.remaining_for_join(),
+            b.limits.max_bytes - b.retained - b.dedup_keys
+        );
         let mut tight = RowBudget::new(limits(1));
         let mut d2 = DedupSet::new();
         assert_eq!(
