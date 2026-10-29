@@ -9,6 +9,7 @@
 
 ### Added
 
+- `ln`／`log`／`exp`／`sign` を追加する（Issue #1907・SQL-65）。`log(x)` は底 10、`log(b, x)` は底 b の対数。`ln`・`log` の 0 と負は `2201E`、`log(1, x)` は `22012`、`exp` のあふれ・アンダーフローは `22003`。NUMERIC 型の引数は従来どおり `42804`。詳細は [numeric-scalar-functions.md](docs/design/numeric-scalar-functions.md) の「Issue #1907 追記」節。
 - 数値関数 `trunc(x)`／`trunc(x, n)` を追加した（Issue #1908・SQL-65）。0 方向への切り捨てで、2 引数形は小数点以下 `n` 桁（負の `n` は整数部の桁）で打ち切る。10 進数字列で処理するため桁上げ・二進誤差はない。`n` が非整数は `22000`、`i32` の範囲外は `22003`。
   挙動変更: `trunc` が組み込み関数の予約名になり、同名の `CREATE FUNCTION` は `42723`。公開 enum `BuiltinFn` に variant `Trunc1`／`Trunc2` を追加した（BREAKING）。
 - 文字列関数 `lpad`／`rpad`／`split_part` を追加した（Issue #1904・SQL-65）。いずれも strict で、長さ・位置は文字単位。`lpad`／`rpad` は第 3 引数の省略時に半角空白で埋め、`split_part` は負の位置を末尾から数え、位置 0 は `22023`。結果長が上限（4 MiB）を超えると `54000`。
@@ -196,6 +197,8 @@
 
 - `sql::udf_call::BoundExpr`（Issue #1909・SQL-65）: variant `MinMax { op, args }` と公開型 `MinMaxOp` を追加した。
   網羅 `match` する外部コードは腕を足す。
+- `ln`／`log` の定義域外を `2201E` で拒否する（Issue #1907・SQL-65）。公開型の変更として `SqlSurfaceError::InvalidArgumentForLogarithm`・
+  `ErrorClass::InvalidArgumentForLogarithm`・`ArenaError::InvalidArgumentForLogarithm` を追加した（HTTP 射影は 400）。
 - `sql::udf_call::BuiltinFn`（Issue #1904・SQL-65）: variant を追加した（`Lpad2`／`Lpad3`／`Rpad2`／`Rpad3`／`SplitPart`）。
   網羅 `match` する外部コードは腕を足す。
 - `substring`／`substr` の負の長さを `22011`（substring_error）で拒否する（Issue #1903・SQL-65）。従来は `22000`。公開型の変更として

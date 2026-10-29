@@ -517,6 +517,9 @@ fn map_arena_error(table: &str, e: ArenaError) -> SqlSurfaceError {
         // Issue #1163: 0 除算は `22012`、算術あふれは `22003` を往復で保つ。
         ArenaError::DivisionByZero(detail) => SqlSurfaceError::division_by_zero(detail),
         ArenaError::SubstringError(detail) => SqlSurfaceError::substring_error(detail),
+        ArenaError::InvalidArgumentForLogarithm(detail) => {
+            SqlSurfaceError::invalid_argument_for_logarithm(detail)
+        }
         ArenaError::NumericOutOfRange(detail) => SqlSurfaceError::numeric_out_of_range(detail),
         ArenaError::Storage(_)
         | ArenaError::Catalog(_)
@@ -542,6 +545,9 @@ fn expr_eval_error_to_arena(e: SqlSurfaceError) -> ArenaError {
         SqlSurfaceError::InvalidInput { detail } => ArenaError::InvalidInput(detail),
         SqlSurfaceError::DivisionByZero { detail } => ArenaError::DivisionByZero(detail),
         SqlSurfaceError::SubstringError { detail } => ArenaError::SubstringError(detail),
+        SqlSurfaceError::InvalidArgumentForLogarithm { detail } => {
+            ArenaError::InvalidArgumentForLogarithm(detail)
+        }
         SqlSurfaceError::NumericOutOfRange { detail } => ArenaError::NumericOutOfRange(detail),
         other => ArenaError::Storage(StorageError::Codec(other.to_string())),
     }
