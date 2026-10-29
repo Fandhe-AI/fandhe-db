@@ -1393,7 +1393,10 @@ fn collect_window_row_values(
             Some(filter) => {
                 let vector = RowVector {
                     dim,
-                    values: if embedding.is_empty() {
+                    // `dim > 0` なのに embedding が空なら未デコード（導出漏れ）として `None`＝
+                    // `XX000` fail-closed。`dim == 0`（NULL／未設定ベクトル）は空スライスのまま
+                    // `Some` とし、式評価側の 3VL（UNKNOWN）で FILTER から除外させる。
+                    values: if dim > 0 && embedding.is_empty() {
                         None
                     } else {
                         Some(embedding)
