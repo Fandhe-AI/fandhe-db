@@ -30,6 +30,8 @@ pub struct DropFunctionOutcome {}
 
 /// `CREATE FUNCTION` をカタログへ永続化してセッションへ登録する（DDL 権限のあるセッション用）。
 ///
+/// `max_functions` は起動時設定の件数上限（Issue #1922。ハード上限で飽和される）。
+///
 /// 判定順は [`prepare_function_definition`]（予約名・識別子・引数・閉じた本体。セッションの重複
 /// `42723` を含む）→ [`Storage::create_function`]（同名の定義があれば `42723`・件数上限 `54000`）→
 /// セッションへの登録。
@@ -41,6 +43,7 @@ pub(crate) fn execute_create_function_persistent(
     params: &[String],
     body: &crate::sql::udf_call::Expr,
     body_source: &str,
+    max_functions: usize,
 ) -> Result<(), SqlSurfaceError> {
     let prepared = prepare_function_definition(session.udfs(), name, params, body)?;
     let def = FunctionDef {
@@ -61,7 +64,7 @@ pub(crate) fn execute_create_function_persistent(
         attrs: FunctionAttributes::default(),
     };
     storage
-        .create_function(tenant_id, &def)
+        .create_function_with_limit(tenant_id, &def, max_functions)
         .map_err(map_function_error)?;
     let key = prepared.key.clone();
     commit_function_definition(session.udfs_mut(), prepared);

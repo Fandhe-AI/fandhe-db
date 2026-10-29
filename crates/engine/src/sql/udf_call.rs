@@ -2586,6 +2586,20 @@ pub fn define_function_with_types(
     param_types: &[Option<crate::sql::cast::CastType>],
     body: &Expr,
 ) -> Result<(), SqlSurfaceError> {
+    define_function_with_types_capped(registry, name, params, param_types, body, MAX_SESSION_UDFS)
+}
+
+/// [`define_function_with_types`] の件数上限指定版（SQL-66 (5)・Issue #1922）。`max_functions` は
+/// 起動時設定（`crate::function_limits::FunctionLimits`）で、ハード上限 [`MAX_SESSION_UDFS`] で
+/// 飽和させる（設定で上げられない）。判定順は既存のまま（重複 `42723` が上限 `54000` より先）。
+pub(crate) fn define_function_with_types_capped(
+    registry: &mut UdfRegistry,
+    name: &str,
+    params: &[String],
+    param_types: &[Option<crate::sql::cast::CastType>],
+    body: &Expr,
+    max_functions: usize,
+) -> Result<(), SqlSurfaceError> {
     if param_types.len() != params.len() {
         return Err(SqlSurfaceError::unsupported(
             "function parameter type list does not match the parameter list",
@@ -2599,7 +2613,13 @@ pub fn define_function_with_types(
             )));
         }
     }
-    let mut prepared = prepare_function_definition(registry, name, params, body)?;
+    let mut prepared = prepare_function_definition_inner(
+        registry,
+        name,
+        params,
+        body,
+        Some(max_functions.min(MAX_SESSION_UDFS)),
+    )?;
     prepared.param_types = param_types.to_vec();
     commit_function_definition(registry, prepared);
     Ok(())
@@ -2626,7 +2646,7 @@ pub(crate) fn prepare_function_definition(
     params: &[String],
     body: &Expr,
 ) -> Result<PreparedUdf, SqlSurfaceError> {
-    prepare_function_definition_inner(registry, name, params, body, true)
+    prepare_function_definition_inner(registry, name, params, body, Some(MAX_SESSION_UDFS))
 }
 
 /// レジストリ容量の上限だけを無視して登録可否を検査する（UDF カタログロードが「容量による一時的な
@@ -2637,7 +2657,7 @@ pub(crate) fn prepare_function_definition_ignoring_capacity(
     params: &[String],
     body: &Expr,
 ) -> Result<PreparedUdf, SqlSurfaceError> {
-    prepare_function_definition_inner(registry, name, params, body, false)
+    prepare_function_definition_inner(registry, name, params, body, None)
 }
 
 fn prepare_function_definition_inner(
@@ -2645,7 +2665,7 @@ fn prepare_function_definition_inner(
     name: &str,
     params: &[String],
     body: &Expr,
-    check_capacity: bool,
+    capacity: Option<usize>,
 ) -> Result<PreparedUdf, SqlSurfaceError> {
     // 関数名は relation キー（裸の名前、または SCHEMA 配下の内部キー `#<id>.<name>`。
     // 名前解決器が `CREATE FUNCTION s.f(` を解決した出力。TABLE-27・Issue #1717）を受理する。
@@ -2662,7 +2682,7 @@ fn prepare_function_definition_inner(
             "function {name} is already defined in this session"
         )));
     }
-    if check_capacity && registry.len() >= MAX_SESSION_UDFS {
+    if capacity.is_some_and(|cap| registry.len() >= cap) {
         return Err(SqlSurfaceError::payload_too_large(
             "too many functions defined in this session",
         ));

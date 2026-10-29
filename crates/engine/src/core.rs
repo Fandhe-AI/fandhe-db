@@ -1264,6 +1264,8 @@ pub struct EngineCore {
     /// 一時表のセッションあたりの件数・総バイト数の上限（TABLE-44・Issue #1683）。差し替えは
     /// [`Self::with_temp_table_limits`] のみ（起動時 1 回）。`CREATE TEMP TABLE` の実行段にだけ効く。
     temp_table_limits: crate::temp_table_limits::TempTableLimits,
+    /// UDF 件数上限の起動時設定（SQL-66 (5)・Issue #1922）。注入点は [`Self::with_function_limits`] のみ。
+    function_limits: crate::function_limits::FunctionLimits,
     /// jsonpath 評価のステップ数・再帰深さの上限（Issue #2184・TABLE-25 ポインタ）。
     /// 差し替えは [`Self::with_jsonpath_limits`] のみ（起動時 1 回）。SQL 表層の `jsonb_path_*`
     /// （Issue #2185）は、文実行入口が張る `JsonPathLimitsScope` 経由で束縛時にこの値を焼き込む。
@@ -2786,6 +2788,7 @@ impl EngineCore {
             scan_limits: crate::scan_limits::ScanLimits::default(),
             group_by_limits: crate::group_by_limits::GroupByLimits::default(),
             temp_table_limits: crate::temp_table_limits::TempTableLimits::default(),
+            function_limits: crate::function_limits::FunctionLimits::default(),
             jsonpath_limits: crate::jsonpath_limits::JsonPathLimits::default(),
             regex_limits: crate::regex_limits::RegexLimits::default(),
             nesting_limits: crate::nesting_limits::NestingLimits::default(),
@@ -3123,6 +3126,19 @@ impl EngineCore {
     /// 現在の一時表上限（TABLE-44・Issue #1683）。
     pub fn temp_table_limits(&self) -> crate::temp_table_limits::TempTableLimits {
         self.temp_table_limits
+    }
+
+    /// UDF 件数上限（[`crate::function_limits::FunctionLimits`]）を差し替えたビルダーを返す
+    /// （SQL-66 (5)・Issue #1922）。`wire-server` の起動時 CLI フラグ `--max-functions` からのみ
+    /// 呼ぶ。未呼び出しならハード上限と同値の既定（現行挙動）。
+    pub fn with_function_limits(mut self, limits: crate::function_limits::FunctionLimits) -> Self {
+        self.function_limits = limits;
+        self
+    }
+
+    /// 現在の UDF 件数上限（SQL-66 (5)・Issue #1922）。
+    pub fn function_limits(&self) -> crate::function_limits::FunctionLimits {
+        self.function_limits
     }
 
     /// jsonpath 評価のステップ数・再帰深さ上限（[`crate::jsonpath_limits::JsonPathLimits`]）を
@@ -8947,7 +8963,8 @@ impl EngineCore {
             //
             // Issue #1920（SQL-66）: DDL 実行権限のあるセッションでは、検証 → UDF カタログへの書き込み
             // （単一 write txn・1 回の commit）→ レジストリへの登録の順で永続化する。権限の無いセッションは
-            // 従来どおりセッション内だけに登録し、カタログには触れない（42501 ゲートは #1922）。
+            // 従来どおりセッション内だけに登録し、カタログには触れない（権限なしの CREATE は永続化されない。
+            // セッション内経路の撤去は型付き引数・RETURNS の永続化が前提のため未実施。docs/design/udf-catalog.md）。
             //
             // Issue #1915（SQL-66 (1)）: 型注釈つきの定義は、カタログへの型の永続化とロード側の
             // 復元（`udf_load` は型注釈つきの行を読み飛ばす）が揃うまで、永続化経路では `0A000` で
@@ -8975,14 +8992,16 @@ impl EngineCore {
                         &params,
                         &body,
                         &body_source,
+                        self.function_limits.max_functions(),
                     )?;
                 } else {
-                    crate::sql::udf_call::define_function_with_types(
+                    crate::sql::udf_call::define_function_with_types_capped(
                         session.udfs_mut(),
                         &name,
                         &params,
                         &param_types,
                         &body,
+                        self.function_limits.max_functions(),
                     )?;
                 }
                 Ok(crate::sql::SqlOutcome::CreateFunction { name })

@@ -19,6 +19,7 @@ pub mod dictionary;
 pub mod dispatch;
 pub mod embedding;
 pub mod error_format;
+pub mod function_limits;
 pub mod gpu_batch;
 pub mod group_by_limits;
 pub mod hnsw;
