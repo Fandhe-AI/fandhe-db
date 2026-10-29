@@ -2092,6 +2092,7 @@ mod tests {
         let cases: Vec<Expr> = vec![
             call("lower", vec![Expr::Ident("label".to_string())]),
             call("upper", vec![Expr::Ident("label".to_string())]),
+            call("md5", vec![Expr::Ident("label".to_string())]),
             call("length", vec![Expr::Ident("label".to_string())]),
             call(
                 "substr",
