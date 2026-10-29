@@ -596,6 +596,7 @@ fn try_fold_scalar(expr: &BoundExpr) -> Option<FoldedConst> {
         | BoundExpr::IsDistinctFrom { .. }
         | BoundExpr::RegexMatch { .. }
         | BoundExpr::Like { .. }
+        | BoundExpr::MinMax { .. }
         | BoundExpr::NullIf { .. } => None,
     }
 }
@@ -749,7 +750,10 @@ fn compile_node(
         // 正規表現マッチ（SQL-55。Issue #1787）はコンパイル済みマッチャを持つため同様に木評価へ委ねる。
         | BoundExpr::RegexMatch { .. }
         // 式左辺の `LIKE`（SQL-54。Issue #1782）も同様に木評価へ委ねる。
-        | BoundExpr::Like { .. } => {
+        | BoundExpr::Like { .. }
+        // `GREATEST`／`LEAST`（SQL-65。Issue #1909）は可変長引数を畳み込む専用評価
+        // （`udf_call::fold_min_max`）を 1 箇所に保つため木評価へ委ねる。
+        | BoundExpr::MinMax { .. } => {
             steps.push(ExprStep::JsonSubtree(Box::new(expr.clone())));
             *current_depth += 1;
             *max_stack = (*max_stack).max(*current_depth);
