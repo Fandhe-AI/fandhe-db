@@ -289,7 +289,12 @@ pub(crate) fn log_base(b: f64, x: f64) -> Result<f64, SqlSurfaceError> {
         return Err(SqlSurfaceError::division_by_zero("log"));
     }
     if x.is_infinite() {
-        return Ok(f64::INFINITY);
+        // x = +∞ のとき ln(x)/ln(b) の符号は底で決まる（b>1 は +∞、0<b<1 は -∞）。
+        return Ok(if b > 1.0 {
+            f64::INFINITY
+        } else {
+            f64::NEG_INFINITY
+        });
     }
     let r = if b == 10.0 {
         x.log10()
@@ -565,6 +570,12 @@ mod tests {
     fn log_base_one_is_division_by_zero() {
         assert_eq!(log_base(1.0, 10.0).unwrap_err().wire_code(), "22012");
         assert_eq!(log_base(1.0, 1.0).unwrap_err().wire_code(), "22012");
+    }
+
+    #[test]
+    fn log_base_infinite_x_sign_follows_base() {
+        assert_eq!(log_base(2.0, f64::INFINITY).unwrap(), f64::INFINITY);
+        assert_eq!(log_base(0.5, f64::INFINITY).unwrap(), f64::NEG_INFINITY);
     }
 
     #[test]
