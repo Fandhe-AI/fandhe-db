@@ -37,7 +37,7 @@
 | 文全体のベクトル `ORDER BY`（検索 SELECT）・`USING PLAN`・`GROUP BY`／集計 SELECT・`SELECT DISTINCT` との併用 | `42601`（構造的に相互排他） |
 | 文全体の `ORDER BY` でのウィンドウ別名参照（実在する同名列がある場合はその列として解釈） | `42601` |
 | フレーム句（`ROWS`/`RANGE`/`GROUPS`。Issue #1887・#1889・#1890・#1891） | 構文は受理する（形の誤りは `42601`）。`ROWS` は #1889、`RANGE` は #1890、`GROUPS` は #1891 で評価する（詳細は末尾「Issue #1887 追記」「Issue #1889 追記」「Issue #1890 追記」「Issue #1891 追記」） |
-| 名前付きウィンドウ（`WINDOW`/`OVER w`）・関数内 `DISTINCT`・複合式の引数・式の中へのウィンドウ呼び出し（`ROW_NUMBER() OVER () + 1` 等）・`*` とウィンドウ項目の混在 | `42601` |
+| 名前付きウィンドウ（`WINDOW`/`OVER w`）・関数内 `DISTINCT`・式の中へのウィンドウ呼び出し（`ROW_NUMBER() OVER () + 1` 等）・`*` とウィンドウ項目の混在 | `42601` |
 | `WHERE` でのウィンドウ別名参照（実在する同名列がある場合はその列として解釈） | `42601` |
 | `CREATE VIEW` 本文への `OVER` 混入 | `42601`（`parse_view_body` が構造上受理しない） |
 
@@ -111,10 +111,8 @@
 
 ## 実装上の簡略化（既知の制約・対象外）
 
-- `SUM`/`AVG`/`MIN`/`MAX` の集計引数は裸の列名・`*`（`COUNT` のみ）に限定し、
-  複合式（UDF・演算）は受理しない（構文段で `42601`）。この制約により、束縛結果
-  （`AggregateInput`）に `ScalarExpr` が現れないことが保証され、`Accumulator`
-  の観測をスカラー式評価（`ExprProgram`）を経由せず直接行える。
+- `SUM`/`AVG`/`MIN`/`MAX`/`COUNT` の集計引数は列名・`*`（`COUNT` のみ）・式を受理する
+  （式は Issue #1895。末尾「Issue #1895 追記」参照）。
 - ウィンドウ集計の集計本体は `sql::aggregate::Accumulator` を再利用しており、
   型ごとの桁あふれ検査・NULL 契約は集計 SELECT と同一。
 - 性能: materialize 段は `LIMIT` を適用できないため、`WHERE` に一致する全行を
@@ -128,7 +126,7 @@
 - `EXPLAIN` とウィンドウ関数の併用（`ORDER BY` の有無を問わず `42601`）
 - `GROUP BY`／集計 SELECT とウィンドウの併用
 - 名前付きウィンドウ・
-  関数内 `DISTINCT`・複合式の引数
+  関数内 `DISTINCT`
 - 式の中へのウィンドウ呼び出しの埋め込み
 - 検索 SELECT（ベクトル `ORDER BY`・`HYBRID`・`USING PLAN`）へのウィンドウ追加
 - NoSQL（HTTP JSON）表層（`BoundScan::new` は常に `windows` を空にするため
@@ -475,3 +473,21 @@ ORDER BY なし・複数キーの `RANGE UNBOUNDED PRECEDING` 等も評価され
 - **対象外**: FILTER 内の部分クエリ（束縛段で `42601`。PostgreSQL は受理する差異）、名前付きウィンドウ
   （#1892）との組み合わせ、`GROUP BY`／集計 SELECT とウィンドウの併用、`OVER` 無しで非集計関数に
   FILTER を付けた場合の SQLSTATE の差異。PostgreSQL 実機での照合は未実施（期待値は意味論から導出）。
+
+## Issue #1895 追記: ウィンドウ集計の式引数（SQL-64 ポインタ）
+
+- **受理範囲**: `count`／`sum`／`avg`／`min`／`max` の `... OVER (...)` の引数に、集計 SELECT と同じ
+  値式（演算・組み込み関数・UDF・疑似列 `id`・embedding 参照）を受理する。構文段は
+  `parse_value_expr` で式を読み、束縛段は `resolve_aggregate_input`（`bind_expr` 経路）を共有するため、
+  型検査（`42883`・Interval／Numeric 式の `0A000`）と結果型（式は倍精度）は集計 SELECT と同じ。
+- **先読み検査**: 引数中の入れ子ウィンドウは `42P20`、集計呼び出しは `42803`、`$n` は `42601`
+  （LAG／LEAD と同じく Prepared の Describe との不整合を避ける fail-closed）。
+- **評価時点**: FILTER を引数評価より先に判定し、除外行の引数は評価しない
+  （`sum(10 / k) FILTER (WHERE k <> 0)` が除外行で `22012` にならない）。評価エラーは行ごとに保持し、
+  その行がフレームに入って観測されたときに初めて返す（どのフレームにも入らない行のエラーは出ない）。
+- **デコード対象**: 式が参照する列・embedding を `decode_tier_for_window` が参照集合へ反映する。
+  ビュー越しは、式中の非公開列を `42703` に統一する（存在情報を漏らさない）。評価後射影形
+  （バッファ済み）ビューでは、embedding 参照・写せない型の列・疑似 `id` を含む式を拒否する。
+- **対象外**: `$n`・部分クエリ・Numeric（CAST）／Interval 式・`COUNT(DISTINCT 式)` のウィンドウ版、
+  整数式の `sum` の結果型が倍精度になる差異（PostgreSQL は bigint／numeric。集計 SELECT と共通の既存契約）。
+  PostgreSQL 実機での照合は未実施（期待値は意味論から導出）。

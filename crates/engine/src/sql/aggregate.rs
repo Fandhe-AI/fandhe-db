@@ -1248,7 +1248,13 @@ impl Accumulator {
 
     /// 評価済みの行値をアキュムレータの入口（`observe_*`）へ振り分ける
     /// （Issue #1808。評価は [`eval_aggregate_input`]）。NULL は集計対象外。
-    fn observe_value(&mut self, value: AggregateRowValue<'_>) -> Result<(), SqlSurfaceError> {
+    ///
+    /// ウィンドウ評価段（`sql::window`）も、行ごとに先に評価した式入力（Issue #1895）を
+    /// この入口へ渡す。
+    pub(crate) fn observe_value(
+        &mut self,
+        value: AggregateRowValue<'_>,
+    ) -> Result<(), SqlSurfaceError> {
         match value {
             AggregateRowValue::Null => Ok(()),
             AggregateRowValue::Present => self.observe_present(),
