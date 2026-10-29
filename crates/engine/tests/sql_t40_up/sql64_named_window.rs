@@ -493,3 +493,28 @@ fn cte_named_like_a_verb_keeps_the_window_clause_valid() {
         "WITH update AS (SELECT id, s FROM t) SELECT id, rank() OVER (ORDER BY s, id) FROM update LIMIT 100",
     );
 }
+
+/// 再帰 CTE の `SEARCH`／`CYCLE` 句（主クエリの動詞判定がこれらを動詞と誤認しない）。再帰 CTE を
+/// 主クエリの窓関数が読む形は現状の実行側が未対応のため、名前付きとインラインの結果（SQLSTATE）が
+/// 一致することで、展開器が余計に拒否しないことを確かめる（受理の直接確認は unit テスト）。
+#[test]
+fn recursive_cte_search_and_cycle_clauses_with_named_window() {
+    let (core, ctx, _g) = setup("nw-reccte", true);
+    let cte = "WITH RECURSIVE r(n) AS (SELECT 1 UNION ALL SELECT n + 1 FROM r WHERE n < 4)";
+    for clause in [
+        "SEARCH DEPTH FIRST BY n SET ord",
+        "CYCLE n SET is_cycle USING path",
+        "SEARCH DEPTH FIRST BY n SET ord CYCLE n SET is_cycle USING path",
+    ] {
+        let named = format!(
+            "{cte} {clause} SELECT n AS id, rank() OVER w FROM r WINDOW w AS (ORDER BY n) LIMIT 100"
+        );
+        let inline =
+            format!("{cte} {clause} SELECT n AS id, rank() OVER (ORDER BY n) FROM r LIMIT 100");
+        assert_eq!(
+            outcome(&core, &ctx, &named),
+            outcome(&core, &ctx, &inline),
+            "{clause}"
+        );
+    }
+}

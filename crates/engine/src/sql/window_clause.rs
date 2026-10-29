@@ -306,6 +306,28 @@ fn statement_verb_position(branch: &[Token]) -> Option<usize> {
             return None;
         }
         p = matching_close(branch, p)? + 1;
+        // 再帰 CTE の `SEARCH ... SET ...`／`CYCLE ... SET ... USING ...` は、次の定義の区切り
+        // （`, 名前 AS|(`）か主クエリの `SELECT` の手前までを句として読み飛ばす
+        // （`allowlist` の再帰 CTE 解析と同じ終端規則。句の中身の検証はそちらの責務）。
+        if is_ident(branch.get(p), "SEARCH") || is_ident(branch.get(p), "CYCLE") {
+            loop {
+                match branch.get(p) {
+                    None => return None,
+                    Some(Token::Keyword(Keyword::Select)) => break,
+                    Some(Token::Punct(',')) => {
+                        let after_name = branch.get(p + 2);
+                        if matches!(branch.get(p + 1), Some(Token::Ident(_)))
+                            && (matches!(after_name, Some(Token::Punct('(')))
+                                || is_ident(after_name, "AS"))
+                        {
+                            break;
+                        }
+                        p += 1;
+                    }
+                    Some(_) => p += 1,
+                }
+            }
+        }
         if matches!(branch.get(p), Some(Token::Punct(','))) {
             p += 1;
             continue;
@@ -996,6 +1018,35 @@ mod tests {
         }
         assert_eq!(
             code("EXPLAIN DELETE FROM t RETURNING id WINDOW w AS (ORDER BY id)"),
+            "42601"
+        );
+    }
+
+    #[test]
+    fn recursive_cte_search_and_cycle_clauses_keep_the_window_clause_valid() {
+        let cte = "WITH RECURSIVE r(n) AS (SELECT 1 UNION ALL SELECT n + 1 FROM r WHERE n < 3)";
+        for clause in [
+            "SEARCH DEPTH FIRST BY n SET ord",
+            "CYCLE n SET is_cycle USING path",
+            "SEARCH BREADTH FIRST BY n SET ord CYCLE n SET is_cycle TO 1 DEFAULT 0 USING path",
+        ] {
+            assert!(
+                run(&format!(
+                    "{cte} {clause} SELECT n, RANK() OVER w FROM r WINDOW w AS (ORDER BY n)"
+                ))
+                .is_ok(),
+                "{clause}"
+            );
+        }
+        // 後続の CTE 定義が続く形と、主文が SELECT でない形(fail-closed)。
+        assert!(run(&format!(
+            "{cte} SEARCH DEPTH FIRST BY n SET ord, c AS (SELECT 1) SELECT RANK() OVER w FROM c WINDOW w AS (ORDER BY n)"
+        ))
+        .is_ok());
+        assert_eq!(
+            code(&format!(
+                "{cte} CYCLE n SET m USING p DELETE FROM t RETURNING id WINDOW w AS (ORDER BY id)"
+            )),
             "42601"
         );
     }
