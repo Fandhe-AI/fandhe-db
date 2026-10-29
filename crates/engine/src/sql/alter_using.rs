@@ -329,6 +329,9 @@ pub(crate) fn redact_row_conversion_error(e: SqlSurfaceError) -> SqlSurfaceError
         E::DivisionByZero { .. } => E::DivisionByZero {
             detail: "division by zero during column type conversion".to_string(),
         },
+        E::SubstringError { .. } => E::SubstringError {
+            detail: "substring error during column type conversion".to_string(),
+        },
         E::PayloadTooLarge { .. } => E::PayloadTooLarge {
             detail: "value too large during column type conversion".to_string(),
         },
@@ -472,6 +475,9 @@ mod tests {
                 detail: secret.to_string(),
             },
             SqlSurfaceError::DivisionByZero {
+                detail: secret.to_string(),
+            },
+            SqlSurfaceError::SubstringError {
                 detail: secret.to_string(),
             },
             SqlSurfaceError::payload_too_large(secret),
