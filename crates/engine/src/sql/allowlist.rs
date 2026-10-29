@@ -32,6 +32,8 @@ use crate::sql::udf_call::{
 use crate::sql::using_operation_id::OperationId;
 use crate::sql::where_negation::negate_conjunction;
 
+mod grouped_window;
+
 /// エラーメッセージへ含める入力断片の長さ上限。untrusted 入力をそのまま無加工で
 /// 長大にエラーへ埋め込まない（security.md「情報漏えい」対応）。値は
 /// [`crate::error_format`] の単一真実源を参照し、wire 応答直前の最終切り詰め
@@ -3232,6 +3234,10 @@ pub(crate) enum BufferedOrigin {
     View,
     /// `MATERIALIZED` 指定 CTE の具体化経路（SQL-62・Issue #1860）。
     MaterializedCte,
+    /// 集計 SELECT の結果行に窓関数をかける経路（SQL-64・Issue #1898）。本文は集計文で、
+    /// `MaterializedCte` と同じく呼び出し段の `ResultLimits` で実行する（グループ数が上限を
+    /// 超えたら黙って切り詰めず `54000`）。出力列名の復元は `sql::view_buffered::plan_outer`。
+    GroupedWindow,
 }
 
 /// 評価後射影形ビューへの外側クエリの形（Issue #1411）。どちらも本文の評価済みセルに
@@ -3942,7 +3948,8 @@ pub(crate) struct AggregateOrderKey {
 /// ウィンドウ関数（SQL-30・TASK-214、Issue #930）の種別。順位関数
 /// （`RowNumber`/`Rank`/`DenseRank`）は引数を取らず、集計関数
 /// （`Count`/`Sum`/`Avg`/`Min`/`Max`）は [`AggregateFunc`] と同じ名前を共有するが、
-/// `OVER (...)` 句を伴う点・`GROUP BY` と併用できない点が異なるため独立の enum に
+/// `OVER (...)` 句を伴う点・走査経路では `GROUP BY` と併用できない点（トップレベルの集計
+/// SELECT との併用は `grouped_window` が別経路で扱う）が異なるため独立の enum に
 /// する（`allowlist::validate_sql_tokens` の振り分け・`sql::parser::bind_window_item`
 /// が本 enum の variant で分岐する）。
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -25389,6 +25396,19 @@ fn validate_select_statement(
     // から除外しただけでは `contains_group_by` 単独の形（`SELECT ... OVER (...)
     // ... GROUP BY ...`）が `parse_select_shape`（広域取得）へ素通りしてしまうため、
     // ここで明示的に `42601` へ倒す。
+    if contains_window_over {
+        // SQL-64・Issue #1898: トップレベルの集計 SELECT の結果行への窓（評価後射影形の
+        // `BufferedView`）。対象外の形は `Ok(None)` で、従来のエラーへ進む。
+        if let Some(stmt) = grouped_window::try_build(
+            tokens,
+            lookup,
+            subquery_ctx,
+            limits,
+            contains_group_by || contains_having_clause,
+        )? {
+            return Ok(stmt);
+        }
+    }
     if contains_window_over && (contains_group_by || contains_having_clause) {
         return Err(SqlSurfaceError::unsupported(
             "window functions cannot be combined with GROUP BY",
@@ -34839,8 +34859,8 @@ mod tests {
         }
     }
     /// Issue #1819: `GROUP BY` なしの `HAVING` を受理するのはトップレベルの集計 `SELECT` だけ。
-    /// 後続の `ORDER BY`／`LIMIT`／`OFFSET`・`OR`・CTE 主クエリ・集合演算の枝・ウィンドウ併用は
-    /// 従来どおり `42601`。`GROUP BY` も `HAVING` も無い裸の列は `42601` のまま。
+    /// 後続の `ORDER BY`／`LIMIT`／`OFFSET`・`OR`・CTE 主クエリ・集合演算の枝は従来どおり `42601`
+    /// （ウィンドウ併用は Issue #1898 で受理。`grouped_window_dispatch_tests` 参照）。`GROUP BY` も `HAVING` も無い裸の列は `42601` のまま。
     #[test]
     fn having_without_group_by_rejects_unsupported_contexts() {
         let lookup = catalog_with(&["documents"]);
@@ -34849,13 +34869,53 @@ mod tests {
             "SELECT COUNT(*) FROM documents HAVING COUNT(*) > 1 LIMIT 1",
             "SELECT COUNT(*) FROM documents HAVING COUNT(*) > 1 OFFSET 1",
             "SELECT COUNT(*) FROM documents HAVING COUNT(*) > 1 OR COUNT(*) < 0",
-            "SELECT COUNT(*) OVER () FROM documents HAVING COUNT(*) > 1",
             "SELECT COUNT(*) FROM documents HAVING COUNT(*) > $1",
             "WITH x AS (SELECT lang FROM documents) SELECT COUNT(*) FROM x HAVING COUNT(*) > 1",
             "SELECT COUNT(*) FROM documents HAVING COUNT(*) > 1 UNION ALL SELECT COUNT(*) FROM documents",
         ] {
             let err = validate_sql(sql, &lookup).expect_err("must be rejected");
             assert_eq!(err.wire_code(), "42601", "sql={sql:?}");
+        }
+    }
+
+    /// Issue #1898・SQL-64: トップレベルの集計 SELECT と窓項目の併用は評価後射影形
+    /// （`BufferedOrigin::GroupedWindow`）へ振り分け、対象外の形は従来のエラーのまま。
+    #[test]
+    fn grouped_window_dispatch_tests() {
+        let lookup = catalog_with(&["documents"]);
+        for sql in [
+            "SELECT lang, COUNT(*), rank() OVER (ORDER BY lang) FROM documents GROUP BY lang",
+            "SELECT COUNT(*), COUNT(*) OVER () FROM documents",
+            "SELECT lang, rank() OVER (ORDER BY lang) FROM documents GROUP BY lang LIMIT 1",
+        ] {
+            match validate_sql(sql, &lookup).expect(sql) {
+                Statement::BufferedView(v) => {
+                    assert_eq!(v.origin, BufferedOrigin::GroupedWindow, "{sql}");
+                    assert!(matches!(*v.body, Statement::Aggregate(_)), "{sql}");
+                }
+                other => panic!("expected BufferedView for {sql}, got {other:?}"),
+            }
+        }
+        for (sql, code) in [
+            (
+                "SELECT lang, COUNT(*) FROM documents GROUP BY lang HAVING rank() OVER () > 0",
+                "42601",
+            ),
+            (
+                "SELECT DISTINCT lang, rank() OVER (ORDER BY lang) FROM documents GROUP BY lang",
+                "42601",
+            ),
+            (
+                "SELECT lang, rank() OVER (ORDER BY COUNT(*)) FROM documents GROUP BY lang",
+                "0A000",
+            ),
+            (
+                "SELECT lang, rank() OVER (ORDER BY lang) FROM documents GROUP BY lang WHERE 1 = 1",
+                "42601",
+            ),
+        ] {
+            let err = validate_sql(sql, &lookup).expect_err(sql);
+            assert_eq!(err.wire_code(), code, "{sql}");
         }
     }
 
