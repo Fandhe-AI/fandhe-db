@@ -6,7 +6,7 @@
   RECOVER-11・TASK-311）。`docs/spec/04-behavior/sql-surface.md`・`docs/spec/05-tasks.md`
 - 前提: Issue #2215 配下（#2216 ドル引用の字句化・#2217 `LANGUAGE` 句と属性・
   #2218 `LANGUAGE sql` 本体の実行・#2220 集合返却関数の `FROM` 利用）、UDF の永続化
-  （PR #2775・`docs/design/udf-catalog.md`。本体は原文テキストで保存）
+  （PR #2775 で追加予定の UDF カタログ設計。本体は原文テキストで保存）
 - 関連 ADR: [explicit-transaction.md](explicit-transaction.md)・
   [sql-cursor.md](sql-cursor.md)・[statement-interrupt.md](statement-interrupt.md)・
   [recursive-cte.md](recursive-cte.md)・[nesting-limits-cli.md](nesting-limits-cli.md)・
