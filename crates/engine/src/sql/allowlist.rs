@@ -1275,6 +1275,9 @@ pub enum SqlSurfaceError {
     /// ERR-6: `42704`）。`name` はクライアントが指定した綴りのみ（カタログを参照せず
     /// 他テナント・既存オブジェクトの情報は含めない）。
     UndefinedCollation { name: String },
+    /// `OVER <名前>`／`OVER (<名前> ...)` が `WINDOW` 句に無い名前（前方参照を含む）を参照した
+    /// （SQL-64 (3)・Issue #1892。ERR-6: `42704`）。`name` はクライアントが書いた綴りのみ。
+    UndefinedWindow { name: String },
     /// 索引 DDL が参照した列が対象テーブルに存在しない、または FROM ありの SELECT／DML が
     /// 参照した列がスキーマに存在しない（TASK-206・INDEX-7、Issue #908、Issue #2332。
     /// DDL 側は [`crate::catalog::CatalogError::ColumnNotFound`] の写像。ERR-6: `42703`）。
@@ -1381,6 +1384,7 @@ impl SqlSurfaceError {
             Self::WrongObjectType { name } => Self::WrongObjectType { name: f(&name) },
             Self::UndefinedObject { name } => Self::UndefinedObject { name: f(&name) },
             Self::UndefinedType { name } => Self::UndefinedType { name: f(&name) },
+            Self::UndefinedWindow { name } => Self::UndefinedWindow { name: f(&name) },
             Self::UndefinedColumn { name } => Self::UndefinedColumn { name: f(&name) },
             Self::AmbiguousColumn { name } => Self::AmbiguousColumn { name: f(&name) },
             Self::InvalidForeignKey { detail } => Self::InvalidForeignKey { detail: f(&detail) },
@@ -1864,6 +1868,7 @@ impl ClassifiedError for SqlSurfaceError {
             SqlSurfaceError::UndefinedObject { .. } => ErrorClass::UndefinedObject,
             SqlSurfaceError::UndefinedType { .. } => ErrorClass::UndefinedObject,
             SqlSurfaceError::UndefinedCollation { .. } => ErrorClass::UndefinedObject,
+            SqlSurfaceError::UndefinedWindow { .. } => ErrorClass::UndefinedObject,
             SqlSurfaceError::UndefinedColumn { .. }
             | SqlSurfaceError::ColumnReferenceWithoutFrom => ErrorClass::UndefinedColumn,
             SqlSurfaceError::CheckViolation { .. } => ErrorClass::CheckViolation,
@@ -2189,6 +2194,9 @@ impl std::fmt::Display for SqlSurfaceError {
             }
             SqlSurfaceError::UndefinedCollation { name } => {
                 write!(f, "collation does not exist: {name}")
+            }
+            SqlSurfaceError::UndefinedWindow { name } => {
+                write!(f, "window does not exist: {name}")
             }
             SqlSurfaceError::UndefinedColumn { name } => {
                 write!(f, "column does not exist: {name}")
@@ -7020,12 +7028,14 @@ impl<'a> Parser<'a> {
     /// フレーム句（`ROWS`/`RANGE`/`GROUPS`）は構文のみ受理する（SQL-64 (2)・Issue #1887。
     /// [`Self::parse_window_frame`]。評価は束縛段のゲートが止める）。
     ///
+    /// 名前付きウィンドウ（`WINDOW w AS (...)`／`OVER w`／`OVER (w ...)`。Issue #1892）は
+    /// 本関数の前段（`sql::window_clause::expand_named_windows`）がトークン列を等価な
+    /// インライン `OVER (...)` へ展開済みで、本関数は名前を見ない。
+    ///
     /// `FILTER (WHERE ...)` は集計のみ受理し（Issue #1894）、非集計のウィンドウ関数は `0A000`。
     ///
     /// スコープ縮小（`docs/design/window-functions.md` 参照。§計画 2「対象外」）:
-    /// 名前付き
-    /// ウィンドウ（`WINDOW w AS (...)`/`OVER w`）・関数内
-    /// `DISTINCT` はいずれも許可リスト外として `42601` に落ちる
+    /// 関数内 `DISTINCT` は許可リスト外として `42601` に落ちる
     /// （該当する構文を消費する分岐を意図的に持たない）。
     fn parse_window_item(&mut self) -> Result<WindowSelectItem, SqlSurfaceError> {
         let name = self.expect_ident()?;
@@ -7099,6 +7109,34 @@ impl<'a> Parser<'a> {
         }
         self.expect_ident_matching("OVER")?;
         self.expect_punct('(')?;
+        let (partition_by, order_by, frame) = self.parse_window_spec()?;
+        let alias = if self.peek_ident_matches("AS") {
+            self.advance();
+            Some(self.expect_ident()?)
+        } else {
+            None
+        };
+        Ok(WindowSelectItem {
+            position: 0,
+            func,
+            arg,
+            offset_args,
+            partition_by,
+            order_by,
+            frame,
+            filter,
+            alias,
+        })
+    }
+
+    /// `OVER (` を消費済みの位置から窓指定 `[PARTITION BY ...] [ORDER BY ...] [<フレーム>] )` を
+    /// 閉じ括弧まで読む（Issue #1892 で [`Self::parse_window_item`] から抽出。挙動は不変）。
+    /// `sql::window_clause` が組み立てた `WINDOW` 定義の検証（[`validate_window_spec_tokens`]）からも
+    /// 使い、インラインの `OVER (...)` と同じ制約・同じ SQLSTATE を保つ。
+    #[allow(clippy::type_complexity)]
+    fn parse_window_spec(
+        &mut self,
+    ) -> Result<(Vec<String>, Vec<WindowOrderItem>, Option<WindowFrame>), SqlSurfaceError> {
         let over_open = self.pos.saturating_sub(1);
         let mut partition_by = Vec::new();
         if self.peek_contextual_keyword("PARTITION") {
@@ -7148,23 +7186,7 @@ impl<'a> Parser<'a> {
         }
         let frame = self.parse_window_frame(over_open)?;
         self.expect_punct(')')?;
-        let alias = if self.peek_ident_matches("AS") {
-            self.advance();
-            Some(self.expect_ident()?)
-        } else {
-            None
-        };
-        Ok(WindowSelectItem {
-            position: 0,
-            func,
-            arg,
-            offset_args,
-            partition_by,
-            order_by,
-            frame,
-            filter,
-            alias,
-        })
+        Ok((partition_by, order_by, frame))
     }
 
     /// `OVER (...)` 内のフレーム句 `<mode> (<bound> | BETWEEN <bound> AND <bound>) [EXCLUDE ...]`
@@ -24675,6 +24697,10 @@ pub(crate) fn validate_session_with_tokens(
     limits: crate::nesting_limits::NestingLimits,
     ledger_mode: LedgerMode,
 ) -> Result<SessionWith, SqlSurfaceError> {
+    // Issue #1892: セッション最上位の WITH は `validate_sql_tokens_impl` を通らず
+    // `validate_with_statement` を直接呼ぶため、ここでも名前付きウィンドウを展開する。
+    let expanded = super::window_clause::expand_named_windows(tokens)?;
+    let tokens: &[Token] = &expanded;
     let is_non_recursive_with = matches!(tokens.first(), Some(Token::Ident(w)) if w.eq_ignore_ascii_case("WITH"))
         && !matches!(tokens.get(1), Some(Token::Ident(w)) if w.eq_ignore_ascii_case("RECURSIVE"));
     if !is_non_recursive_with {
@@ -24700,6 +24726,27 @@ pub(crate) fn validate_session_with_tokens(
 pub(crate) enum SessionWith {
     Statement(Statement),
     DataModifying(Box<ValidatedDataModifyingCte>),
+}
+
+/// 組み立て済みの窓指定トークン列 `( <窓指定> )` を、インライン `OVER (...)` と同じ許可リスト
+/// （[`Parser::parse_window_spec`]）で検証する（Issue #1892。`sql::window_clause` が `WINDOW` 句の
+/// 各定義を、参照されない定義も含めて検証するために呼ぶ）。形の誤りは `42601`、フレーム境界の
+/// 誤りは `42P20` 等で、インラインと一致する。
+pub(crate) fn validate_window_spec_tokens(tokens: &[Token]) -> Result<(), SqlSurfaceError> {
+    let mut p = Parser::new(tokens);
+    p.expect_punct('(')?;
+    let (_partition, order_by, frame) = p.parse_window_spec()?;
+    if p.peek().is_some() {
+        return Err(SqlSurfaceError::unsupported(
+            "unexpected token after window specification",
+        ));
+    }
+    // 参照されない定義でもフレームの意味検査（束縛段と同じ関数）を通す。型照合はスキーマが要るため
+    // 参照された窓の束縛段だけが行う。
+    if let Some(frame) = &frame {
+        crate::sql::parser::check_window_frame_shape(frame, order_by.len())?;
+    }
+    Ok(())
 }
 
 /// `WITH` 句の CTE をインライン展開のみで評価するか、`MATERIALIZED` 指定の具体化経路を
@@ -24883,6 +24930,11 @@ fn validate_sql_tokens_impl(
     limits: crate::nesting_limits::NestingLimits,
     cte_evaluation: CteEvaluation,
 ) -> Result<Statement, SqlSurfaceError> {
+    // Issue #1892・SQL-64 (3): 名前付きウィンドウは、分類器（`) OVER (` を目印にする検出器が多数ある）
+    // より前に等価なインライン `OVER (...)` へ展開する。以降の判定・束縛・実行は展開済みの
+    // トークン列だけを見る（第 2 の実行経路を持たない）。再入時は展開済みのため高速経路を通る。
+    let expanded = super::window_clause::expand_named_windows(tokens)?;
+    let tokens: &[Token] = &expanded;
     // `SET`・`CREATE` は字句解析段階のキーワードではなく `Ident` のため
     // （TASK-161・SQL-12 修正と同方針）、statement 先頭という文脈でのみ大文字小文字を
     // 区別せず判定する。

@@ -10550,6 +10550,42 @@ fn bind_window_item(
     Ok(bound)
 }
 
+/// フレーム句のスキーマ非依存の意味検査（`RANGE` オフセットの `ORDER BY` キー数・`ORDER BY` の無い
+/// `GROUPS`・オフセット式の変数。いずれも `42P20`／`42P10`）。[`bind_window_frame`] の先頭と、
+/// `WINDOW` 句の定義（参照されない定義を含む。`sql::window_clause`）の検証
+/// （`sql::allowlist::validate_window_spec_tokens`）の両方が呼び、検査を 1 箇所に保つ。
+/// オフセットの型照合はキー型（スキーマ）が要るため束縛段だけが行う。
+pub(crate) fn check_window_frame_shape(
+    frame: &crate::sql::allowlist::WindowFrame,
+    order_by_len: usize,
+) -> Result<(), SqlSurfaceError> {
+    use crate::sql::allowlist::WindowFrameMode;
+    let offsets: Vec<&Expr> = [&frame.start, &frame.end]
+        .into_iter()
+        .filter_map(|b| b.offset())
+        .collect();
+    if frame.mode == WindowFrameMode::Range && !offsets.is_empty() && order_by_len != 1 {
+        return Err(SqlSurfaceError::WindowingError {
+            detail: "RANGE with offset PRECEDING/FOLLOWING requires exactly one ORDER BY column",
+        });
+    }
+    if frame.mode == WindowFrameMode::Groups && order_by_len == 0 {
+        return Err(SqlSurfaceError::WindowingError {
+            detail: "GROUPS mode requires an ORDER BY clause",
+        });
+    }
+    for e in &offsets {
+        let mut idents = std::collections::HashSet::new();
+        collect_expr_idents(e, &mut idents);
+        if !idents.is_empty() {
+            return Err(SqlSurfaceError::WindowFrameOffsetHasVariables {
+                mode: frame.mode.as_str(),
+            });
+        }
+    }
+    Ok(())
+}
+
 /// ウィンドウのフレーム句を検証し、束縛済みフレームを返す（SQL-64 (2)・
 /// Issue #1887／#1889／#1890。[`bind_window_item`] からキー解決の後に呼ばれる。`GROUPS` も
 /// Issue #1891 で束縛済みフレームを返す）。PostgreSQL の
@@ -10569,29 +10605,7 @@ fn bind_window_frame(
     let Some(frame) = &item.frame else {
         return Ok(None);
     };
-    let offsets: Vec<&Expr> = [&frame.start, &frame.end]
-        .into_iter()
-        .filter_map(|b| b.offset())
-        .collect();
-    if frame.mode == WindowFrameMode::Range && !offsets.is_empty() && item.order_by.len() != 1 {
-        return Err(SqlSurfaceError::WindowingError {
-            detail: "RANGE with offset PRECEDING/FOLLOWING requires exactly one ORDER BY column",
-        });
-    }
-    if frame.mode == WindowFrameMode::Groups && item.order_by.is_empty() {
-        return Err(SqlSurfaceError::WindowingError {
-            detail: "GROUPS mode requires an ORDER BY clause",
-        });
-    }
-    for e in &offsets {
-        let mut idents = std::collections::HashSet::new();
-        collect_expr_idents(e, &mut idents);
-        if !idents.is_empty() {
-            return Err(SqlSurfaceError::WindowFrameOffsetHasVariables {
-                mode: frame.mode.as_str(),
-            });
-        }
-    }
+    check_window_frame_shape(frame, item.order_by.len())?;
     if frame.mode == WindowFrameMode::Range {
         return bind_range_frame(item, frame, udfs, schema, node_budget).map(Some);
     }

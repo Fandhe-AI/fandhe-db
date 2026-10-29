@@ -1126,20 +1126,25 @@ fn frame_clause_is_accepted_and_evaluated() {
     ));
 }
 
+/// 名前付きウィンドウは Issue #1892（SQL-64 (3)）で受理に変わった。未定義の名前だけが `42704` で拒否される。
 #[test]
-fn rejects_named_window() {
-    let path = unique_db_path("window-reject-named");
+fn named_window_accepted_and_undefined_rejected() {
+    let path = unique_db_path("window-named");
     let _guard = CleanupGuard(path.clone());
     let storage = open_storage(&path);
     let ctx = ctx_for("tenant-a");
     seed_basic(&storage, &ctx);
     let core = new_core(storage);
 
+    expect_query(core.execute_sql(
+        &ctx,
+        "SELECT id, ROW_NUMBER() OVER w FROM docs WINDOW w AS (ORDER BY score) LIMIT 10",
+    ));
     expect_rejected(
         &core,
         &ctx,
-        "SELECT id, ROW_NUMBER() OVER w FROM docs WINDOW w AS (ORDER BY score) LIMIT 10",
-        "42601",
+        "SELECT id, ROW_NUMBER() OVER w FROM docs LIMIT 10",
+        "42704",
     );
 }
 
