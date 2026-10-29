@@ -2733,13 +2733,23 @@ fn bind_udf_return(
     if matches!(cast::strip_collate(body), Expr::String(_) | Expr::Null) {
         return cast::bind_cast(cast::strip_collate(body), ret, env, node_budget);
     }
-    let (bound, ty) = bind_expr_in(body, env, node_budget)?;
     let mismatch = || {
         SqlSurfaceError::invalid_function_definition(format!(
             "return type mismatch in function declared to return {}",
             ret.pg_label()
         ))
     };
+    // 数値リテラルは `bind_expr_in` が Scalar で束縛する一方 `source_cast_kind` は Numeric と
+    // 判定し `cast_bound_from` で対応が取れないため、引数（`bind_typed_udf_arg`）と同じく
+    // リテラルの種別で代入規則を見て `bind_cast` で変換する。
+    if let Expr::Number(raw) = cast::strip_collate(body) {
+        let from = cast::number_literal_kind(raw);
+        if !cast::is_assignment_rule(cast::cast_rule(from, ret.kind())) {
+            return Err(mismatch());
+        }
+        return cast::bind_cast(cast::strip_collate(body), ret, env, node_budget);
+    }
+    let (bound, ty) = bind_expr_in(body, env, node_budget)?;
     let source = match udf_body_source_kind(body, &bound, ty, env) {
         SourceKind::Known(k) => {
             if !cast::is_assignment_rule(cast::cast_rule(k, ret.kind())) {

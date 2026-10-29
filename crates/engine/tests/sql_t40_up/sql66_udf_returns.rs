@@ -138,6 +138,39 @@ fn identity_and_widening_bodies_are_accepted() {
 }
 
 #[test]
+fn numeric_literal_bodies_are_assignable_to_numeric_returns() {
+    let (core, _g) = new_core("sql66r-numlit");
+    let mut s = SessionState::default();
+    for (i, ret) in ["integer", "double precision", "numeric", "bigint"]
+        .iter()
+        .enumerate()
+    {
+        define(
+            &core,
+            &mut s,
+            &format!("CREATE FUNCTION d{i}() RETURNS {ret} AS 1.5"),
+        );
+        define(
+            &core,
+            &mut s,
+            &format!("CREATE FUNCTION e{i}() RETURNS {ret} AS 2"),
+        );
+    }
+    assert_eq!(
+        first_cell(&core, &mut s, "SELECT e0() FROM docs LIMIT 1"),
+        Cell::SignedInteger(2)
+    );
+    assert_eq!(
+        code(
+            &core,
+            &mut s,
+            "CREATE FUNCTION bad() RETURNS boolean AS 1.5"
+        ),
+        "42P13"
+    );
+}
+
+#[test]
 fn body_type_mismatch_is_42p13() {
     let (core, _g) = new_core("sql66r-mismatch");
     let mut s = SessionState::default();
