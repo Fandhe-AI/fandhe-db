@@ -11225,6 +11225,70 @@ impl<'a> Parser<'a> {
         }
     }
 
+    /// `SUBSTRING(...)` の引数列（`(` 消費済み）を解析して `Expr::Call` を返す（Issue #1903・SQL-65）。
+    ///
+    /// `parse_call_expr` の `substring` 分岐から呼ばれる。`FOR`／`SIMILAR` は lexer の
+    /// キーワードではなく識別子のまま文脈的に照合する（既存の同名識別子を壊さないため）。
+    /// 正規表現形 `SIMILAR ... ESCAPE` は SQL-55 の管轄で、黙って別の意味にせず `0A000` で
+    /// fail-closed に拒否する。構文誤りは `42601`、個数の誤りは束縛段が `42883` で拒否する。
+    fn parse_substring_expr(
+        &mut self,
+        name: String,
+        depth: usize,
+    ) -> Result<Expr, SqlSurfaceError> {
+        let null_ctx = self.const_expr_null_args;
+        let source = self.parse_value_expr_with_null_context(depth + 1, null_ctx)?;
+        let mut args = vec![source];
+        match self.peek() {
+            Some(Token::Keyword(Keyword::From)) => {
+                self.advance();
+                args.push(self.parse_value_expr_with_null_context(depth + 1, null_ctx)?);
+                if self.peek_ident_matches("for") {
+                    self.advance();
+                    args.push(self.parse_value_expr_with_null_context(depth + 1, null_ctx)?);
+                }
+            }
+            Some(Token::Ident(kw)) if kw.eq_ignore_ascii_case("for") => {
+                self.advance();
+                let len = self.parse_value_expr_with_null_context(depth + 1, null_ctx)?;
+                if matches!(self.peek(), Some(Token::Keyword(Keyword::From))) {
+                    self.advance();
+                    let start = self.parse_value_expr_with_null_context(depth + 1, null_ctx)?;
+                    args.push(start);
+                } else {
+                    // `FOR n` 単独は開始位置 1 と同じ意味（PostgreSQL 互換）。
+                    args.push(Expr::Number("1".to_string()));
+                }
+                args.push(len);
+            }
+            Some(Token::Ident(kw)) if kw.eq_ignore_ascii_case("similar") => {
+                return Err(SqlSurfaceError::FeatureNotSupported {
+                    detail: "regular expression form of substring is not supported".to_string(),
+                });
+            }
+            Some(Token::Punct(',')) => {
+                while matches!(self.peek(), Some(Token::Punct(','))) {
+                    self.advance();
+                    if args.len() >= MAX_CALL_ARGS {
+                        return Err(SqlSurfaceError::payload_too_large(
+                            "too many call arguments",
+                        ));
+                    }
+                    args.push(self.parse_value_expr_with_null_context(depth + 1, null_ctx)?);
+                }
+            }
+            Some(Token::Punct(')')) => {}
+            other => {
+                return Err(SqlSurfaceError::unsupported(format!(
+                    "expected FROM, FOR or ',' in SUBSTRING, near {other:?}"
+                )))
+            }
+        }
+        self.expect_punct(')')?;
+        self.consume_expr_node()?;
+        Ok(Expr::Call { name, args })
+    }
+
     /// 関数呼び出し式 `<name> '(' [expr {',' expr}] ')'` を解析する。呼び出し元は
     /// 直前に `name` を消費済みで、次のトークンが `'('` である前提（`peek` 済み）。
     ///
@@ -11312,6 +11376,13 @@ impl<'a> Parser<'a> {
                 name,
                 args: vec![haystack, needle],
             });
+        }
+        // Issue #1903・SQL-65: `SUBSTRING(s FROM n [FOR m])`／`SUBSTRING(s FOR m [FROM n])` と
+        // カンマ形 `SUBSTRING(s, n[, m])` を受理する。AST 上は `substring` 名のまま
+        // `Expr::Call { args: [s, start(, len)] }` へ脱糖し、束縛・評価は `substr` と共有する
+        // （既定の列名が `substring` になり、CHECK・ビューの描画も汎用のカンマ形で往復する）。
+        if name.eq_ignore_ascii_case("substring") {
+            return self.parse_substring_expr(name, depth);
         }
         // Issue #1188・SQL-26: `EXTRACT(field FROM src)` は `date_part('field', src)` の
         // SQL 標準構文糖。`(` の直後が「識別子または文字列リテラル」かつその次が
