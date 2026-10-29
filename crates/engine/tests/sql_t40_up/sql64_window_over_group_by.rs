@@ -1,6 +1,8 @@
 //! 集計 SELECT の結果行に窓関数をかける結合テスト（SQL-64・Issue #1898。関連: SQL-13・SQL-14・
 //! SQL-58・RLS-10 (b)）。
 //!
+//! Issue #1899: 窓の引数・`PARTITION BY`・`ORDER BY` に集計式を書く形も扱う（本文へ巻き上げる）。
+//!
 //! 評価順は「WHERE → GROUP BY → HAVING → 窓 → ORDER BY → LIMIT/OFFSET」で、窓の母集合は集計後の
 //! 結果行（1 グループ = 1 行）。期待値は PostgreSQL 17 の意味論から手で導いた固定値で、PostgreSQL
 //! 実機での照合は未実施。`unique_db_path`＋`CleanupGuard`、`EngineCore::execute_sql_in_session` の
@@ -109,6 +111,7 @@ fn cell_str(c: &Cell) -> String {
         Cell::Integer(n) => n.to_string(),
         Cell::SignedInteger(n) => n.to_string(),
         Cell::Text(s) => s.clone(),
+        Cell::Numeric(d) => d.to_string(),
         other => format!("{other:?}"),
     }
 }
@@ -310,25 +313,186 @@ fn group_count_over_cap_is_rejected() {
     );
 }
 
+/// 窓の `ORDER BY`・`PARTITION BY`・引数に集計式を書ける（Issue #1899）。
+#[test]
+fn aggregate_inside_window() {
+    let (core, _g) = build("sql64-gw-agg-in-window", None);
+    // グループ a: sum 15 / count 4 / max 9、b: 9 / 3 / 5、c: 1 / 1 / 1。
+    let q = "SELECT g, sum(k), rank() OVER (ORDER BY sum(k) DESC) FROM t GROUP BY g ORDER BY g";
+    assert_eq!(rows(&core, A, q), strs(&["a,15,1", "b,9,2", "c,1,3"]));
+    assert_eq!(names(&core, A, q), strs(&["g", "sum", "rank"]));
+    let q = "SELECT g, rank() OVER (ORDER BY count(*)) FROM t GROUP BY g ORDER BY g";
+    assert_eq!(rows(&core, A, q), strs(&["a,3", "b,2", "c,1"]));
+    assert_eq!(names(&core, A, q), strs(&["g", "rank"]));
+    // FILTER 付き集計と修飾子（max は a=9・b=5・c=NULL）。
+    let f = "max(k) FILTER (WHERE k > 4)";
+    let q = format!("SELECT g, rank() OVER (ORDER BY {f}) FROM t GROUP BY g ORDER BY g");
+    assert_eq!(rows(&core, A, &q), strs(&["a,2", "b,1", "c,3"]));
+    let q = format!("SELECT g, rank() OVER (ORDER BY {f} DESC) FROM t GROUP BY g ORDER BY g");
+    assert_eq!(rows(&core, A, &q), strs(&["a,2", "b,3", "c,1"]));
+    let q =
+        format!("SELECT g, rank() OVER (ORDER BY {f} NULLS FIRST) FROM t GROUP BY g ORDER BY g");
+    assert_eq!(rows(&core, A, &q), strs(&["a,3", "b,2", "c,1"]));
+    // 式キー: sum(k) + 1 は sum(k) と同順位。
+    let q = "SELECT g, rank() OVER (ORDER BY sum(k) + 1), rank() OVER (ORDER BY sum(k)) \
+             FROM t GROUP BY g ORDER BY g";
+    assert_eq!(rows(&core, A, q), strs(&["a,3,3", "b,2,2", "c,1,1"]));
+    // PARTITION BY の集計式（min は a=1・b=4・c=1 なので a と c が同じ区画）。
+    let q = "SELECT g, row_number() OVER (PARTITION BY min(k) ORDER BY g) \
+             FROM t GROUP BY g ORDER BY g";
+    assert_eq!(rows(&core, A, q), strs(&["a,1", "b,1", "c,2"]));
+    // 引数の集計式。
+    let q = "SELECT g, sum(sum(k)) OVER () FROM t GROUP BY g ORDER BY g";
+    assert_eq!(rows(&core, A, q), strs(&["a,25", "b,25", "c,25"]));
+    let q = "SELECT g, sum(sum(k)) OVER (ORDER BY g) FROM t GROUP BY g ORDER BY g";
+    assert_eq!(rows(&core, A, q), strs(&["a,15", "b,24", "c,25"]));
+    let q = "SELECT g, lag(sum(k)) OVER (ORDER BY g) FROM t GROUP BY g ORDER BY g";
+    assert_eq!(rows(&core, A, q), strs(&["a,NULL", "b,15", "c,9"]));
+    // 同じ集計式を非窓項目・ORDER BY・引数に書いても一致する（隠し列は漏れない）。
+    let q = "SELECT sum(k), rank() OVER (ORDER BY sum(k)), sum(sum(k)) OVER () \
+             FROM t GROUP BY g ORDER BY 1";
+    assert_eq!(rows(&core, A, q), strs(&["1,1,25", "9,2,25", "15,3,25"]));
+    assert_eq!(names(&core, A, q), strs(&["sum", "rank", "sum"]));
+    // HAVING・LIMIT との併用（LIMIT は窓の後）。
+    let q = "SELECT g, rank() OVER (ORDER BY sum(k) DESC) FROM t GROUP BY g \
+             HAVING count(*) > 1 ORDER BY g";
+    assert_eq!(rows(&core, A, q), strs(&["a,1", "b,2"]));
+    let q = "SELECT g, rank() OVER (ORDER BY sum(k) DESC) FROM t GROUP BY g \
+             ORDER BY g LIMIT 1 OFFSET 1";
+    assert_eq!(rows(&core, A, q), strs(&["b,2"]));
+}
+
+/// GROUP BY なしでも窓の中だけにある集計は 1 グループ 1 行の集計 SELECT になる（Issue #1899）。
+#[test]
+fn aggregate_inside_window_implicit_single_group() {
+    let (core, _g) = build("sql64-gw-agg-single", None);
+    assert_eq!(
+        rows(&core, A, "SELECT rank() OVER (ORDER BY sum(k)) FROM t"),
+        strs(&["1"])
+    );
+    assert_eq!(
+        rows(&core, A, "SELECT sum(k), sum(sum(k)) OVER () FROM t"),
+        strs(&["25,25"])
+    );
+    // 列参照を持たない非窓項目は暗黙の単一グループに混ざっても受理される。
+    assert_eq!(
+        rows(&core, A, "SELECT 1, rank() OVER (ORDER BY sum(k)) FROM t"),
+        strs(&["1,1"])
+    );
+}
+
+/// 巻き上げた集計もテナント境界の内側で計算される（tenant-b の 1000 を含まない）。
+#[test]
+fn aggregate_inside_window_respects_tenant_boundary() {
+    let (core, _g) = build("sql64-gw-agg-rls", None);
+    let q = "SELECT g, sum(sum(k)) OVER (), rank() OVER (ORDER BY sum(k) DESC) \
+             FROM t GROUP BY g ORDER BY g";
+    assert_eq!(rows(&core, A, q), strs(&["a,25,1", "b,25,2", "c,25,3"]));
+    // tenant-b は自分の非公開行を足す: a=1015・b=9・c=1・z=7。
+    assert_eq!(
+        rows(&core, "tenant-b", q),
+        strs(&["a,1032,1", "b,1032,2", "c,1032,4", "z,1032,3"])
+    );
+}
+
+/// LIMIT 付き暗黙グループの先行検査は演算子キーワード・型名を列参照とみなさない（42703 にならない）。
+#[test]
+fn limit_precheck_ignores_keywords_and_type_names() {
+    let (core, _g) = build("sql64-gw-kw", None);
+    for expr in [
+        "1 OR 2",
+        "NULL IS NULL",
+        "1::int",
+        "'a' LIKE 'a'",
+        "1 IN (1)",
+    ] {
+        let sql = format!("SELECT {expr}, rank() OVER (ORDER BY sum(k)) FROM t LIMIT 1");
+        let code = core
+            .execute_sql(&ctx("tenant-a"), &sql)
+            .err()
+            .map(|e| e.wire_code());
+        assert_ne!(code, Some("42703"), "keyword misread as column: {sql}");
+    }
+}
+
+/// 疑似列 `id` を持たない採番方式の表では、LIMIT 付き暗黙グループの先行検査でも `id` は
+/// 未定義列（42703）。実列扱いの例外で 42803 に倒さない。
+#[test]
+fn limit_precheck_treats_id_as_undefined_on_allocated_table() {
+    let path = unique_db_path("sql64-gw-noid");
+    let _g = CleanupGuard(path.clone());
+    let storage = Storage::open(&path).expect("open storage");
+    let core = EngineCore::from_storage(storage, Box::new(CpuScalarProvider));
+    let mut s = SessionState::default();
+    s.allow_ddl();
+    core.execute_sql_in_session(
+        &ctx("tenant-a"),
+        &mut s,
+        "CREATE TABLE na (code TEXT PRIMARY KEY, k INTEGER)",
+    )
+    .expect("create");
+    let code = core
+        .execute_sql_in_session(
+            &ctx("tenant-a"),
+            &mut s,
+            "SELECT id, rank() OVER (ORDER BY sum(k)) FROM na LIMIT 1",
+        )
+        .err()
+        .map(|e| e.wire_code());
+    assert_eq!(code, Some("42703"));
+}
+
 /// 未対応の形は fail-closed（コード固定）。
 #[test]
 fn unsupported_shapes_fail_closed() {
     let (core, _g) = build("sql64-gw-reject", None);
-    let cases: [(&str, &str); 17] = [
+    let cases: [(&str, &str); 25] = [
         // グループ化されていない列を窓が参照する。
         (
             "SELECT g, count(*), rank() OVER (ORDER BY k) FROM t GROUP BY g",
             "42803",
         ),
-        // 窓の ORDER BY・引数の集計（Issue #1899 で扱う）。
+        // 巻き上げた集計式が入れ子集計・窓呼び出し・非グループ化列を含む（Issue #1899）。
         (
-            "SELECT g, count(*), rank() OVER (ORDER BY sum(k)) FROM t GROUP BY g",
-            "0A000",
+            "SELECT g, rank() OVER (ORDER BY sum(sum(k))) FROM t GROUP BY g",
+            "42803",
         ),
-        ("SELECT g, sum(sum(k)) OVER () FROM t GROUP BY g", "0A000"),
         (
-            "SELECT g, count(*), rank() OVER (PARTITION BY count(*)) FROM t GROUP BY g",
-            "0A000",
+            "SELECT g, rank() OVER (ORDER BY sum(rank() OVER ())) FROM t GROUP BY g",
+            "42803",
+        ),
+        (
+            "SELECT g, rank() OVER (ORDER BY sum(k) + k) FROM t GROUP BY g",
+            "42803",
+        ),
+        // 暗黙の単一グループで非グループ化列を射影する。
+        ("SELECT k, rank() OVER (ORDER BY sum(k)) FROM t", "42803"),
+        ("SELECT k, lag(count(*)) OVER () FROM t", "42803"),
+        ("SELECT k, lag(count(*)) OVER () FROM t LIMIT 1", "42803"),
+        // 未定義列は束縛段の 42703（先行ゲートの 42803 に潰されない）。
+        (
+            "SELECT nosuch, rank() OVER (ORDER BY sum(k)) FROM t",
+            "42703",
+        ),
+        // LIMIT 付きでも未定義列は 42703（型名・CASE キーワードは列扱いしない）。
+        (
+            "SELECT nosuch, rank() OVER (ORDER BY sum(k)) FROM t LIMIT 1",
+            "42703",
+        ),
+        (
+            "SELECT CASE WHEN nosuch > 1 THEN 1 ELSE 2 END, rank() OVER (ORDER BY sum(k)) \
+             FROM t LIMIT 1",
+            "42703",
+        ),
+        // 列名 desc を末尾に持つ式は ASC/DESC 修飾子として剥がされず、未定義列として束縛される。
+        (
+            "SELECT g, rank() OVER (ORDER BY sum(k) + desc) FROM t GROUP BY g",
+            "42703",
+        ),
+        // 窓の FILTER 内・フレームオフセット内の集計。
+        (
+            "SELECT g, count(*) FILTER (WHERE sum(k) > 1) OVER () FROM t GROUP BY g",
+            "42803",
         ),
         // 窓が GROUP BY・HAVING・WHERE・ORDER BY 式にある。
         (
@@ -405,6 +569,8 @@ fn describe_matches_execute() {
         "SELECT g, count(*), rank() OVER (ORDER BY g) AS r FROM t GROUP BY g ORDER BY g",
         "SELECT rank() OVER (ORDER BY g), g, sum(k) FROM t GROUP BY g",
         "SELECT count(*), count(*) OVER () FROM t",
+        "SELECT g, sum(k), rank() OVER (ORDER BY sum(k) DESC) FROM t GROUP BY g",
+        "SELECT rank() OVER (ORDER BY sum(k)) FROM t",
     ] {
         let session = SessionState::default();
         let parsed = core.parse_sql(sql).expect("parse");
