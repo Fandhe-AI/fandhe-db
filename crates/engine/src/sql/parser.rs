@@ -9748,6 +9748,9 @@ pub(crate) struct BoundWindowItem {
     /// 集計の `FILTER (WHERE ...)`（SQL-64・Issue #1894）。偽・NULL の行はこの項目の累積器の入力
     /// からだけ除く。集計 SELECT と同じ [`BoundAggregateFilter`] を共有する。
     pub(crate) filter: Option<Box<BoundAggregateFilter>>,
+    /// 集計引数が式（`ScalarExpr`／`TypedExpr`）で疑似列 `id` を参照するか（Issue #1895）。
+    /// 評価済みセル上（バッファ済みビュー）では `id` を持てないため `sql::window` が拒否に使う。
+    pub(crate) input_uses_pseudo_id: bool,
     pub(crate) name: String,
 }
 
@@ -10461,8 +10464,33 @@ fn bind_window_item(
                     detail: "INTERVAL columns are not supported in window aggregates".to_string(),
                 });
             }
+            // Issue #1895: ウィンドウが受理する入力は列・`*`・式（`ScalarExpr`／`TypedExpr`）。
+            // `string_agg`／`array_agg`／比較式／`GROUPING` はウィンドウ集計では生成されない
+            // ため、到達したら束縛層の不整合として fail-closed に拒否する。
+            if matches!(
+                resolved,
+                AggregateInput::StringAgg(_)
+                    | AggregateInput::ArrayAgg(_)
+                    | AggregateInput::BoolExpr { .. }
+                    | AggregateInput::GroupingKeys(_)
+            ) {
+                return Err(SqlSurfaceError::Internal {
+                    detail: "window aggregate resolved to an unsupported input kind".to_string(),
+                });
+            }
             Some(resolved)
         }
+    };
+    // 疑似列 `id` を式の中で参照するか（裸の `id` 引数は `IdU64` 専用経路なので対象外）。
+    let input_uses_pseudo_id = match &item.arg {
+        Some(crate::sql::allowlist::AggregateArg::Expr(e)) if !matches!(e, Expr::Ident(_)) => {
+            let mut idents = std::collections::HashSet::new();
+            collect_expr_idents(e, &mut idents);
+            idents.contains("id")
+                && schema.has_pseudo_id()
+                && !schema.columns.iter().any(|c| c.name == "id")
+        }
+        _ => false,
     };
 
     let offset_args = match &item.offset_args {
@@ -10514,6 +10542,7 @@ fn bind_window_item(
         order_by,
         frame,
         filter,
+        input_uses_pseudo_id,
         name,
     };
     // `LAG`／`LEAD` は構文受理・束縛・型検査（Issue #1880）の後、評価（`sql::window`。

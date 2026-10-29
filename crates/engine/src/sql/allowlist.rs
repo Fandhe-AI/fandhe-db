@@ -361,6 +361,13 @@ const FILTER_ARG_SITE: PrecheckSite = PrecheckSite {
     aggregate: "aggregate functions are not allowed in FILTER",
 };
 
+/// ウィンドウ集計（`sum(<式>) OVER (...)` 等）の引数内の先読み検査の文言（SQL-64・Issue #1895）。
+const WINDOW_AGG_ARG_SITE: PrecheckSite = PrecheckSite {
+    param: "parameters are not supported inside window aggregate function arguments",
+    window: "window function calls cannot be nested",
+    aggregate: "aggregate function calls cannot be used inside window aggregate function arguments",
+};
+
 /// 引数個数の誤り文言の句（固定語彙。`function <name> requires <句>`）。
 fn arity_phrase(min: usize, max: usize) -> &'static str {
     match (min, max) {
@@ -4032,9 +4039,9 @@ impl WindowFunc {
 pub(crate) struct WindowSelectItem {
     pub(crate) position: usize,
     pub(crate) func: WindowFunc,
-    /// 順位関数は常に `None`。集計関数は [`AggregateArg`]（`*`・裸の列名のみ。
-    /// 複合式は対象外——TASK-214 のスコープ縮小、`docs/design/window-functions.md`
-    /// 参照）。
+    /// 順位関数は常に `None`。集計関数は [`AggregateArg`]（`*`・列名・式。式は Issue #1895 で
+    /// 受理し、束縛は `sql::parser::bind_window_item` が集計 SELECT と同じ
+    /// `resolve_aggregate_input` で行う。`docs/design/window-functions.md` 参照）。
     pub(crate) arg: Option<AggregateArg>,
     /// `LAG`／`LEAD`／`first_value`／`last_value`／`nth_value` の引数（値・オフセット・既定値。
     /// それ以外の関数は `None`。`first_value`／`last_value` は値のみ、`nth_value` は値と `n`
@@ -7018,7 +7025,7 @@ impl<'a> Parser<'a> {
     /// スコープ縮小（`docs/design/window-functions.md` 参照。§計画 2「対象外」）:
     /// 名前付き
     /// ウィンドウ（`WINDOW w AS (...)`/`OVER w`）・関数内
-    /// `DISTINCT`・複合式の引数はいずれも許可リスト外として `42601` に落ちる
+    /// `DISTINCT` はいずれも許可リスト外として `42601` に落ちる
     /// （該当する構文を消費する分岐を意図的に持たない）。
     fn parse_window_item(&mut self) -> Result<WindowSelectItem, SqlSurfaceError> {
         let name = self.expect_ident()?;
@@ -7049,24 +7056,29 @@ impl<'a> Parser<'a> {
                 self.advance();
                 Some(AggregateArg::Star)
             } else {
-                match self.peek() {
-                    // 引数は裸の列名のみを受理する（複合式・UDF 呼び出しは
-                    // §計画 2「対象外」）。
-                    Some(Token::Ident(_)) => {
-                        let column = self.expect_ident()?;
-                        Some(AggregateArg::Expr(Expr::Ident(column)))
-                    }
-                    Some(Token::Punct(')')) => {
-                        return Err(SqlSurfaceError::unsupported(
-                            "window aggregate function requires exactly one argument",
-                        ));
-                    }
-                    other => {
-                        return Err(SqlSurfaceError::unsupported(format!(
-                            "window aggregate function argument must be a bare column reference, got {other:?}"
-                        )));
-                    }
+                if matches!(self.peek(), Some(Token::Punct(')'))) {
+                    return Err(SqlSurfaceError::unsupported(
+                        "window aggregate function requires exactly one argument",
+                    ));
                 }
+                // Issue #1895: 引数は式を受理する（集計 SELECT と同じ `parse_value_expr`。
+                // 束縛は `bind_window_item` が `resolve_aggregate_input` で行う）。
+                // 先読み検査で入れ子ウィンドウ（42P20）・集計（42803）・`$n`（42601）を弾く。
+                precheck_call_arg_tokens(
+                    &self.tokens,
+                    self.pos.saturating_sub(1),
+                    &WINDOW_AGG_ARG_SITE,
+                )?;
+                let saved_calls = self.agg_calls.take();
+                let saved_minus = self.allow_unary_minus;
+                let saved_null = self.allow_null_literal;
+                self.allow_unary_minus = true;
+                self.allow_null_literal = false;
+                let parsed = self.parse_value_expr(0);
+                self.allow_null_literal = saved_null;
+                self.allow_unary_minus = saved_minus;
+                self.agg_calls = saved_calls;
+                Some(AggregateArg::Expr(parsed?))
             }
         };
         self.expect_punct(')')?;

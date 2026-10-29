@@ -949,10 +949,10 @@ pub(crate) fn check_window_columns_within_view(
                 return Err(SqlSurfaceError::undefined_column(col));
             }
         }
-        if let Some(AggregateArg::Expr(Expr::Ident(name))) = &item.arg {
-            if !columns.iter().any(|vc| vc == name) {
-                return Err(SqlSurfaceError::undefined_column(name));
-            }
+        // 集計引数は式全体を検査する（Issue #1895。式中の非公開列を `42703` に統一し、束縛段との
+        // エラー差からビューの非公開列の存在が漏れる A01 を防ぐ）。
+        if let Some(AggregateArg::Expr(e)) = &item.arg {
+            expr_columns_within(columns, e)?;
         }
         // `LAG`／`LEAD` の値・オフセット・既定値（SQL-64 (1)・Issue #1880）。式中の識別子を
         // すべて検査する。欠くと、束縛段のゲート（`0A000`）と未定義列（`42703`）の違いから

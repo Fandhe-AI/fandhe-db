@@ -31,13 +31,12 @@
 //! 集計の数値計算（`SUM`/`AVG`/`MIN`/`MAX` の NULL 契約・桁あふれ検査・NUMERIC の
 //! scale 保持）は [`crate::sql::aggregate::Accumulator`] を再利用し、集計 SELECT
 //! （`sql::aggregate`）と同一の規約を共有する（第 2 の集計実装を作らない）。
-//! ウィンドウ項目の集計引数は構文段（`sql::allowlist::Parser::parse_window_item`）で
-//! 裸の列参照・`*` のみに制限しているため（複合式は対象外）、束縛結果
-//! （[`AggregateInput`]）に `ScalarExpr` は現れない——本モジュールはこの前提のもとで
-//! のみ `Accumulator::observe` を呼ぶ。`observe` は借用形（`scanned: &[Option<
-//! row_codec::ScalarRef>]`・`vector: &RowVector`）を要求するため、materialize 段で
-//! owned 化した値を、観測のたびにその場で最小限の借用形へ組み立て直す
-//! （[`observe_window_row`]）。
+//! ウィンドウ項目の集計引数は裸の列参照・`*`・式（Issue #1895）を受理する。列参照は
+//! `Accumulator::observe` が要求する借用形（`scanned: &[Option<row_codec::ScalarRef>]`・
+//! `vector: &RowVector`）へ、materialize 段で owned 化した値を観測のたびにその場で最小限の
+//! 借用形へ組み立て直して渡す（[`observe_window_row`]）。式（`ScalarExpr`／`TypedExpr`）は
+//! materialize 段で FILTER 通過後の行についてだけ評価して owned 化し
+//! （[`eval_window_expr_input`]）、観測では `Accumulator::observe_value` へ評価済みの値を渡す。
 //!
 //! 文全体のスカラー `ORDER BY`（Issue #1189）は、materialize 段で並べ替えキーを
 //! 集め、[`compute_output_order`] が base scan と同一の比較器で出力順（順列）を
@@ -79,7 +78,7 @@
 //!
 //! 対象外（`42601`／`54000`／`0A000` で fail-closed に拒否。allowlist・parser 側で既に拒否
 //! 済みの形も含む）:
-//! 名前付きウィンドウ・関数内 `DISTINCT`・複合式の引数・
+//! 名前付きウィンドウ・関数内 `DISTINCT`・
 //! ベクトル順位付け（`ORDER BY embedding <=> ...`）／`USING PLAN` との併用・
 //! ウィンドウ別名による文全体の `ORDER BY`・`GROUP BY`／集計 SELECT との併用。
 //!
@@ -92,6 +91,7 @@ use crate::declarative_filter;
 use crate::policy::PolicyContext;
 use crate::row_codec;
 use crate::sql::aggregate::{self, Accumulator, DecodeTier, RowVector};
+use crate::sql::aggregate_input;
 use crate::sql::allowlist::{SqlSurfaceError, WindowFrameExclusion, WindowFrameMode, WindowFunc};
 use crate::sql::exec::{Cell, ColumnMeta, QueryResult, ResultRow};
 use crate::sql::expr_program::{ExprProgram, StackValue};
@@ -237,9 +237,39 @@ enum WindowKeyValue {
     Uuid(crate::uuid::Uuid),
 }
 
-/// ウィンドウ集計項目の引数値（実行時表現。SQL-30・TASK-214）。構文段が引数を
-/// 裸の列参照・`*` のみに制限しているため、束縛結果は必ずこの網羅で尽くされる
-/// （複合式は現れない）。
+/// 式引数（`ScalarExpr`／`TypedExpr`）の 1 行分の評価結果を owned 化した値（Issue #1895）。
+/// `AggregateRowValue` のうち式が生成しうる腕だけを持つ（借用を行の寿命から切り離すため）。
+#[derive(Debug, Clone)]
+enum EvaluatedAggValue {
+    Null,
+    Float(f64),
+    Text(String),
+    Bool(bool),
+    Date(i32),
+    Timestamp(i64),
+    Time(i64),
+    TimestampTz(i64),
+}
+
+impl EvaluatedAggValue {
+    /// 累積器の入口（`Accumulator::observe_value`）が受ける借用形へ戻す。
+    fn as_row_value(&self) -> aggregate_input::AggregateRowValue<'_> {
+        use aggregate_input::AggregateRowValue as V;
+        match self {
+            EvaluatedAggValue::Null => V::Null,
+            EvaluatedAggValue::Float(v) => V::Float(*v),
+            EvaluatedAggValue::Text(s) => V::Text(std::borrow::Cow::Borrowed(s.as_str())),
+            EvaluatedAggValue::Bool(b) => V::Bool(*b),
+            EvaluatedAggValue::Date(v) => V::Date(*v),
+            EvaluatedAggValue::Timestamp(v) => V::Timestamp(*v),
+            EvaluatedAggValue::Time(v) => V::Time(*v),
+            EvaluatedAggValue::TimestampTz(v) => V::TimestampTz(*v),
+        }
+    }
+}
+
+/// ウィンドウ集計項目の引数値（実行時表現。SQL-30・TASK-214）。引数は裸の列参照・`*`・式
+/// （Issue #1895。式は行ごとに評価済みの [`WindowInputValue::Evaluated`]）。
 #[derive(Debug, Clone)]
 enum WindowInputValue {
     /// 順位関数（`ROW_NUMBER`/`RANK`/`DENSE_RANK`）。引数を持たない。
@@ -262,6 +292,10 @@ enum WindowInputValue {
     /// （いずれも `COUNT` 限定。`Accumulator::observe` はこれらの型で値の中身を
     /// 見ず非 NULL の有無だけを見るため、実際の値は保持しない）。
     PresenceOnly(bool),
+    /// 式引数の評価結果（Issue #1895）。評価エラー（`22012`・`22003` 等）は、その行がフレームに
+    /// 入って観測されるときまで保持する（PostgreSQL と同じく、どのフレームにも入らない行の
+    /// エラーは表面化しない。`LAG`／`LEAD` の [`OffsetRowValues::value`] と同方針）。
+    Evaluated(Result<EvaluatedAggValue, SqlSurfaceError>),
 }
 
 /// `LAG`／`LEAD` 項目 1 つについての 1 行分の入力（Issue #1881）。この行が他の行から参照
@@ -1326,6 +1360,7 @@ fn collect_window_row_values(
     *state_bytes = try_accumulate_state_budget(*state_bytes, filter_slots_bytes, state_cap)?;
     let mut filter_pass = Vec::with_capacity(items.len());
     let mut filter_scratch: Vec<StackValue> = Vec::new();
+    let mut expr_scratch: Vec<StackValue> = Vec::new();
     for (item_index, item) in items.iter().enumerate() {
         let mut pkeys = Vec::with_capacity(item.partition_by.len());
         for key in &item.partition_by {
@@ -1361,32 +1396,8 @@ fn collect_window_row_values(
             okeys.push(value);
         }
 
-        let agg_value = match &item.input {
-            None => WindowInputValue::None,
-            Some(input) => {
-                let value = extract_window_input(input, dim, scanned)?;
-                *state_bytes = try_accumulate_state_budget(
-                    *state_bytes,
-                    window_input_value_bytes(&value),
-                    state_cap,
-                )?;
-                value
-            }
-        };
-
-        let offset_value = match &item.offset_args {
-            Some(args) => Some(offset_eval.extract(
-                item_index,
-                args,
-                id,
-                embedding,
-                scanned,
-                state_bytes,
-                state_cap,
-            )?),
-            None => None,
-        };
-
+        // FILTER は集計引数の評価より先に判定する（除外行の引数を評価しない。PostgreSQL と同じく
+        // `sum(10 / k) FILTER (WHERE k <> 0)` が除外行で `22012` を返さない。Issue #1895）。
         // 可視性判定・文の WHERE を通過した行にだけ到達する（FILTER は母集合を広げない）。
         let passes = match &item.filter {
             None => true,
@@ -1410,6 +1421,51 @@ fn collect_window_row_values(
                     &mut filter_scratch,
                 )?
             }
+        };
+
+        let agg_value = match &item.input {
+            None => WindowInputValue::None,
+            Some(input) => {
+                let value = if matches!(
+                    input,
+                    AggregateInput::ScalarExpr { .. } | AggregateInput::TypedExpr { .. }
+                ) {
+                    if passes {
+                        // 式引数は FILTER を通過した行でだけ評価する（Issue #1895）。
+                        eval_window_expr_input(
+                            input,
+                            id,
+                            dim,
+                            embedding,
+                            scanned,
+                            &mut expr_scratch,
+                        )?
+                    } else {
+                        WindowInputValue::None
+                    }
+                } else {
+                    extract_window_input(input, dim, scanned)?
+                };
+                *state_bytes = try_accumulate_state_budget(
+                    *state_bytes,
+                    window_input_value_bytes(&value),
+                    state_cap,
+                )?;
+                value
+            }
+        };
+
+        let offset_value = match &item.offset_args {
+            Some(args) => Some(offset_eval.extract(
+                item_index,
+                args,
+                id,
+                embedding,
+                scanned,
+                state_bytes,
+                state_cap,
+            )?),
+            None => None,
         };
 
         partition_keys.push(pkeys);
@@ -1502,11 +1558,34 @@ impl<'a> CellWindowEvaluator<'a> {
                     });
                 }
             }
+            // 式形の集計引数（Issue #1895）も、評価済みセル上では embedding を持てず、写せない型の
+            // 列は読めないため、固定 `0A000` で拒否する（fail-closed）。
+            if let Some(
+                AggregateInput::ScalarExpr { source, .. }
+                | AggregateInput::TypedExpr { source, .. },
+            ) = &item.input
+            {
+                let mut mask = vec![false; column_types.len()];
+                udf_call::mark_referenced_scalar_columns(source, &mut mask);
+                let unsupported = mask.iter().zip(column_types.iter()).any(|(used, ty)| {
+                    *used
+                        && ty
+                            .as_ref()
+                            .is_some_and(|t| !crate::sql::join::values::cell_scalar_supports(t))
+                });
+                if udf_call::references_embedding(source) || unsupported {
+                    return Err(SqlSurfaceError::FeatureNotSupported {
+                        detail: "window aggregate expressions over a buffered view support only scalar columns of plain types"
+                            .to_string(),
+                    });
+                }
+            }
             let uses_pseudo_id = item
                 .partition_by
                 .iter()
                 .chain(item.order_by.iter().map(|o| &o.key))
                 .any(|k| matches!(k, WindowKeyRef::Id))
+                || item.input_uses_pseudo_id
                 || matches!(item.input, Some(AggregateInput::IdU64))
                 || item
                     .offset_args
@@ -1733,17 +1812,24 @@ fn decode_tier_for_window(schema: &TableSchema, bound: &BoundScan) -> (DecodeTie
                     *slot = true;
                 }
             }
-            // 構文段が複合式の引数を受理しないため到達しない
-            // （`Parser::parse_window_item` 参照）。
-            Some(AggregateInput::ScalarExpr { .. }) => {
+            // 式引数（Issue #1895）は集計 SELECT（`sql::aggregate`）と同じ契約で、参照する列・
+            // embedding をデコード対象へ反映する（取りこぼすと縮小デコードした行で列が NULL と
+            // 取り違えられ、黙って誤集計になる）。
+            Some(
+                AggregateInput::ScalarExpr { source, .. }
+                | AggregateInput::TypedExpr { source, .. },
+            ) => {
                 has_scalar_reference = true;
+                if udf_call::references_embedding(source) {
+                    needs_embedding = true;
+                }
+                udf_call::mark_referenced_scalar_columns(source, &mut scalar_mask);
             }
             // `string_agg` はウィンドウ関数ではない（`WindowFunc::from_name` が拒否済み）。
             Some(
                 AggregateInput::StringAgg(_)
                 | AggregateInput::ArrayAgg(_)
                 | AggregateInput::BoolExpr { .. }
-                | AggregateInput::TypedExpr { .. }
                 | AggregateInput::GroupingKeys(_),
             ) => {
                 has_scalar_reference = true;
@@ -1847,9 +1933,56 @@ fn extract_window_key(
     })
 }
 
+/// 式引数（`ScalarExpr`／`TypedExpr`）を 1 行分評価して owned 化する（Issue #1895）。
+/// 評価は集計 SELECT と同じ [`aggregate_input::eval_aggregate_input`] を共有する（第 2 の式評価を
+/// 作らない）。`22xxx` 系の評価エラーは [`WindowInputValue::Evaluated`] に保持して観測時に返し、
+/// 実装バグ（`XX000`）は fail-closed のため即座に返す。`dim > 0` なのに embedding が空なら
+/// 未デコード（導出漏れ）として `None` にし、式評価側が `XX000` で拒否する。
+fn eval_window_expr_input(
+    input: &AggregateInput,
+    id: u64,
+    dim: u32,
+    embedding: &[f32],
+    scanned: &[Option<row_codec::ScalarRef<'_>>],
+    scratch: &mut Vec<StackValue>,
+) -> Result<WindowInputValue, SqlSurfaceError> {
+    use aggregate_input::AggregateRowValue as V;
+    let vector = RowVector {
+        dim,
+        values: if dim > 0 && embedding.is_empty() {
+            None
+        } else {
+            Some(embedding)
+        },
+    };
+    let evaluated =
+        match aggregate_input::eval_aggregate_input(input, id, &vector, scanned, scratch) {
+            Ok(v) => v,
+            Err(e @ SqlSurfaceError::Internal { .. }) => return Err(e),
+            Err(e) => return Ok(WindowInputValue::Evaluated(Err(e))),
+        };
+    let owned = match evaluated {
+        V::Null => EvaluatedAggValue::Null,
+        V::Float(v) => EvaluatedAggValue::Float(v),
+        V::Text(s) => EvaluatedAggValue::Text(aggregate::try_clone_str(s.as_ref())?),
+        V::Bool(b) => EvaluatedAggValue::Bool(b),
+        V::Date(v) => EvaluatedAggValue::Date(v),
+        V::Timestamp(v) => EvaluatedAggValue::Timestamp(v),
+        V::Time(v) => EvaluatedAggValue::Time(v),
+        V::TimestampTz(v) => EvaluatedAggValue::TimestampTz(v),
+        _ => {
+            return Err(window_bug(
+                "window expression input evaluated to an unexpected value kind",
+            ))
+        }
+    };
+    Ok(WindowInputValue::Evaluated(Ok(owned)))
+}
+
 /// [`AggregateInput`] の値を `scanned`／`dim` から取り出す（SQL-30・TASK-214）。
-/// 構文段が複合式を受理しないため `ScalarExpr` は到達しない
-/// （到達した場合は実装バグとして fail-closed に拒否する）。
+/// 式引数（`ScalarExpr`／`TypedExpr`）は評価に id・embedding・FILTER 結果が要るため
+/// [`collect_window_row_values`] が [`eval_window_expr_input`] へ回す（ここへ到達したら
+/// 実装バグとして fail-closed に拒否する）。
 fn extract_window_input(
     input: &AggregateInput,
     dim: u32,
@@ -1944,8 +2077,8 @@ fn extract_window_input(
         | AggregateInput::UuidColumn(index) => {
             WindowInputValue::PresenceOnly(scanned.get(*index).copied().flatten().is_some())
         }
-        // 構文段（`Parser::parse_window_item`）が裸の列参照・`*` のみを受理する
-        // ため到達しない。
+        // 式引数は呼び出し元が [`eval_window_expr_input`] へ回す。`string_agg` 等は
+        // ウィンドウ関数ではないため到達しない。
         AggregateInput::ScalarExpr { .. }
         | AggregateInput::StringAgg(_)
         | AggregateInput::ArrayAgg(_)
@@ -1953,7 +2086,7 @@ fn extract_window_input(
         | AggregateInput::TypedExpr { .. }
         | AggregateInput::GroupingKeys(_) => {
             return Err(window_bug(
-                "window aggregate input unexpectedly carries a compound expression",
+                "window aggregate input reached the column extractor with an unsupported kind",
             ))
         }
     })
@@ -1974,6 +2107,9 @@ fn window_input_value_bytes(value: &WindowInputValue) -> usize {
     let base = std::mem::size_of::<WindowInputValue>();
     match value {
         WindowInputValue::Text(Some(s)) => base + s.len(),
+        WindowInputValue::Evaluated(Ok(EvaluatedAggValue::Text(s))) => base + s.len(),
+        // 保持する評価エラーの詳細文字列（固定の短い英語）の概算。
+        WindowInputValue::Evaluated(Err(_)) => base + 256,
         _ => base,
     }
 }
@@ -3690,6 +3826,14 @@ fn observe_window_row(
             );
             acc.observe(input, id, &no_vector, &scanned, scratch)
         }
+        (
+            AggregateInput::ScalarExpr { .. } | AggregateInput::TypedExpr { .. },
+            WindowInputValue::Evaluated(v),
+        ) => match v {
+            // 保持していた評価エラーは、行がフレームに入って観測されたここで初めて返す。
+            Err(e) => Err(e.clone()),
+            Ok(v) => acc.observe_value(v.as_row_value()),
+        },
         _ => Err(window_bug(
             "window aggregate input/value combination mismatch",
         )),
@@ -3981,6 +4125,7 @@ mod budget_regression_tests {
         BoundWindowItem {
             frame: None,
             filter: None,
+            input_uses_pseudo_id: false,
             position: 0,
             func,
             input,
@@ -4147,6 +4292,7 @@ mod budget_regression_tests {
             windows: vec![BoundWindowItem {
                 frame: None,
                 filter: None,
+                input_uses_pseudo_id: false,
                 position: 1,
                 func: WindowFunc::Min,
                 input: Some(AggregateInput::TextColumn(0)),
@@ -4504,6 +4650,7 @@ mod partition_layout_tests {
         BoundWindowItem {
             frame: None,
             filter: None,
+            input_uses_pseudo_id: false,
             position: 0,
             func: WindowFunc::Rank,
             input: None,
