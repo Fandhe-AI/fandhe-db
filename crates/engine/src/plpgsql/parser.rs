@@ -18,8 +18,8 @@ use super::ast::{
     ParseOptions, ReturnShape, SqlExpr, Stmt, VarDecl, VarId, VarKind, VarRef,
 };
 use super::embedded::{
-    classify_query, classify_with, has_write_cte, is_ident_position, reject_forbidden_clauses,
-    split_into, RawInto,
+    classify_query, classify_with, has_write_cte, is_ident_position_with, reject_forbidden_clauses,
+    relation_slots, split_into, RawInto,
 };
 use super::lexer::{scan, TokKind};
 use super::{oos_err, syn_err, too_big_err};
@@ -471,6 +471,8 @@ impl<'a> Parser<'a> {
 
     fn resolve_refs(&self, tokens: &[Token]) -> Result<Vec<(usize, VarRef)>, SqlSurfaceError> {
         let mut refs: Vec<(usize, VarRef)> = Vec::new();
+        // 関係リスト位置は文ごとに 1 回だけ求め、識別子ごとの再走査（二乗コスト）を避ける。
+        let slots = relation_slots(tokens);
         for (i, t) in tokens.iter().enumerate() {
             match t {
                 Token::Param(n) => {
@@ -480,12 +482,14 @@ impl<'a> Parser<'a> {
                     }
                     refs.push((i, VarRef::Var(VarId(u32::from(*n) - 1))));
                 }
-                Token::Ident(name) if !is_ident_position(tokens, i) => {
+                Token::Ident(name) if !is_ident_position_with(tokens, i, &slots) => {
                     if let Some(id) = self.lookup_var(&name.to_ascii_lowercase()) {
                         refs.push((i, VarRef::Var(id)));
                     }
                 }
-                Token::QualifiedIdent { qualifier, name } if !is_ident_position(tokens, i) => {
+                Token::QualifiedIdent { qualifier, name }
+                    if !is_ident_position_with(tokens, i, &slots) =>
+                {
                     if let Some(r) = self.lookup_qualified(qualifier, name) {
                         refs.push((i, r));
                     }
@@ -692,8 +696,9 @@ impl<'a> Parser<'a> {
         })?;
         let ty = self.parse_decl_type(ts, te)?;
         self.pos = te;
-        if self.eat_kw("COLLATE") {
-            self.take_name()?;
+        if self.is_kw(0, "COLLATE") {
+            // 照合順序は AST で保持しないため、黙って捨てず範囲外として拒否する。
+            return Err(oos_err("COLLATE in PL/pgSQL declarations is not supported"));
         }
         let mut not_null = false;
         if self.is_kw(0, "NOT") && self.is_kw(1, "NULL") {
@@ -1065,7 +1070,7 @@ impl<'a> Parser<'a> {
     ) -> Result<Stmt, SqlSurfaceError> {
         // 括弧で始まる問い合わせ（`FOR r IN (SELECT ...) LOOP`）も受理する。
         let first_is_query = match self.kind(0) {
-            Some(TokKind::Word(w)) => ["SELECT", "WITH", "VALUES"]
+            Some(TokKind::Word(w)) => ["SELECT", "WITH", "VALUES", "INSERT", "UPDATE", "DELETE"]
                 .iter()
                 .any(|x| w.eq_ignore_ascii_case(x)),
             Some(TokKind::Punct('(')) => true,

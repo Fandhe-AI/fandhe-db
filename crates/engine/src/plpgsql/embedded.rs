@@ -235,7 +235,12 @@ fn from_relation_slots(tokens: &[Token]) -> Vec<bool> {
     }
     let mut out = vec![false; tokens.len()];
     let mut stack = vec![St::Idle];
+    // `DELETE ... USING t` だけが括弧なしの `USING` 関係リストを持つ。DELETE を見た後に限定する。
+    let mut seen_delete = false;
     for (k, t) in tokens.iter().enumerate() {
+        if ident_is(t, "DELETE") {
+            seen_delete = true;
+        }
         match t {
             Token::Punct('(') => {
                 stack.push(St::Idle);
@@ -259,7 +264,7 @@ fn from_relation_slots(tokens: &[Token]) -> Vec<bool> {
             continue;
         }
         let next_is_paren = matches!(tokens.get(k.saturating_add(1)), Some(Token::Punct('(')));
-        if ident_is(t, "USING") && !next_is_paren {
+        if ident_is(t, "USING") && !next_is_paren && seen_delete {
             *st = St::Rel;
             continue;
         }
@@ -275,7 +280,8 @@ fn from_relation_slots(tokens: &[Token]) -> Vec<bool> {
                 }
             }
             St::On => {
-                if matches!(t, Token::Punct(',')) || is_join_word(t) {
+                let is_call = matches!(tokens.get(k.saturating_add(1)), Some(Token::Punct('(')));
+                if matches!(t, Token::Punct(',')) || (is_join_word(t) && !is_call) {
                     *st = St::Rel;
                 }
             }
@@ -538,6 +544,16 @@ pub(super) fn has_write_cte(tokens: &[Token]) -> bool {
 /// `ON CONFLICT` の対象・`UPDATE ... SET`／`DO UPDATE SET` の代入先）にあるか。そうなら変数参照として
 /// 置換しない。#2226 の呼び出し時の置換と共有する単一の分類関数。
 pub(crate) fn is_ident_position(tokens: &[Token], i: usize) -> bool {
+    is_ident_position_with(tokens, i, &from_relation_slots(tokens))
+}
+
+/// 関係リスト位置 `slots`（[`relation_slots`] の結果）を呼び出し側が事前計算して渡す版。
+pub(super) fn relation_slots(tokens: &[Token]) -> Vec<bool> {
+    from_relation_slots(tokens)
+}
+
+/// [`is_ident_position`] の本体。`slots` は同じ `tokens` に対する [`relation_slots`] の結果。
+pub(super) fn is_ident_position_with(tokens: &[Token], i: usize, slots: &[bool]) -> bool {
     if matches!(tokens.get(i.saturating_add(1)), Some(Token::Punct('('))) {
         return true;
     }
@@ -566,7 +582,7 @@ pub(crate) fn is_ident_position(tokens: &[Token], i: usize) -> bool {
         _ => {}
     }
     // `FROM t, u`・JOIN 対象・別名など、関係リスト内の語。
-    if from_relation_slots(tokens).get(i).copied().unwrap_or(false) {
+    if slots.get(i).copied().unwrap_or(false) {
         return true;
     }
     // CTE の宣言名（`WITH c AS (`・`c AS MATERIALIZED (`）と列名リスト（`c (a, b) AS (`）。

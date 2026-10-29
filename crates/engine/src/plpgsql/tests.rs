@@ -71,7 +71,7 @@ fn accepts_blocks_and_declarations() {
         "BEGIN NULL; END",
         "BEGIN NULL; END;",
         "<<outer>> DECLARE x int := 1; y CONSTANT text DEFAULT 'a'; z numeric(10,2) NOT NULL = 0; \
-         r RECORD; t users.id%TYPE; w users%ROWTYPE; c varchar(5) COLLATE \"C\"; BEGIN x := x + 1; END outer;",
+         r RECORD; t users.id%TYPE; w users%ROWTYPE; c varchar(5); BEGIN x := x + 1; END outer;",
         "DECLARE x int; BEGIN DECLARE x int; BEGIN x := 2; END; x := 1; END",
         "<<l>> DECLARE x int; BEGIN <<inner>> BEGIN l.x := 1; END inner; END",
         "DECLARE xs int[]; ts timestamptz; BEGIN NULL; END",
@@ -838,6 +838,24 @@ fn from_list_tables_and_aliases_are_not_variables() {
         panic!("perform");
     };
     assert!(p.var_refs.is_empty());
+}
+
+#[test]
+fn for_query_accepts_returning_dml_and_rejects_collate() {
+    ok("BEGIN FOR r IN UPDATE t SET x = 1 RETURNING x LOOP NULL; END LOOP; END");
+    ok("BEGIN FOR r IN DELETE FROM t RETURNING x LOOP NULL; END LOOP; END");
+    assert_eq!(
+        code("DECLARE s text COLLATE \"C\"; BEGIN NULL; END"),
+        "0A000"
+    );
+}
+
+#[test]
+fn relation_slots_do_not_swallow_value_positions() {
+    // ON 式内の left(...) 関数呼び出しは JOIN 語ではなく、後続の値位置の語は関係位置にならない。
+    let s = "SELECT 1 FROM a JOIN b ON a.x = left(b.y, 2) AND a.z = v";
+    let t = tokenize(s).expect("tokenize");
+    assert!(!is_ident_position(&t, t.len() - 1));
 }
 
 #[test]
