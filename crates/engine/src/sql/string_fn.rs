@@ -242,9 +242,29 @@ pub(crate) fn position(haystack: &str, needle: &str) -> f64 {
     }
 }
 
+/// `md5(text)`（Issue #1905・SQL-65）。UTF-8 バイト列の MD5 を 32 文字の小文字
+/// 16 進で返す。`sql::udf_call::apply_builtin` が非 NULL 入力に対して呼ぶ。
+/// 出力長は常に 32 で、入力長に応じた増幅はない。
+pub(crate) fn md5(s: &str) -> String {
+    use std::fmt::Write as _;
+    let mut out = String::with_capacity(32);
+    for b in crate::crypto::md5::digest(s.as_bytes()) {
+        let _ = write!(out, "{b:02x}");
+    }
+    out
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn md5_is_lower_hex_of_utf8_bytes() {
+        assert_eq!(md5("abc"), "900150983cd24fb0d6963f7d28e17f72");
+        assert_eq!(md5(""), "d41d8cd98f00b204e9800998ecf8427e");
+        assert_eq!(md5("日本語テキスト"), "291a033f45232d75458716bcc03d90a0");
+        assert_eq!(md5("x").len(), 32);
+    }
 
     #[test]
     fn lower_upper_roundtrip_ascii() {

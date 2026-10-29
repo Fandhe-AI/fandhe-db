@@ -9,6 +9,8 @@
 
 ### Added
 
+- 文字列関数 `md5(text)` を追加した（Issue #1905・SQL-65）。UTF-8 バイト列の MD5 を 32 文字の小文字 16 進で返す strict 関数（NULL は NULL）で、依存追加なしの自作実装。`md5(bytea)` は bytea が関数引数に使えない既存規則どおり `0A000`（PostgreSQL との既知の差）。
+  挙動変更: `md5` が組み込み関数の予約名になり、同名の `CREATE FUNCTION` は `42723`。公開 enum `BuiltinFn` に variant `Md5` を追加した（BREAKING）。
 - `substring(s FROM n [FOR m])`／`substring(s FOR m [FROM n])` とカンマ形 `substring(s, n[, m])` を受理する（Issue #1903・SQL-65）。意味は `substr` と同じ文字単位の窓計算で、`substring` は組み込み関数名として予約される。正規表現形（第 2 引数が文字列・`SIMILAR ... ESCAPE`）は SQL-55 の管轄のため `0A000`。`position(needle IN haystack)` は Issue #919 の実装を SQL-65 の回帰テストで固定した。公開 API の変更はない（非 BREAKING）。
 - 派生表を JOIN／カンマ区切りの入力にでき、本文に派生表を入れ子にできるようにした（Issue #1867・SQL-62）。派生表と実表・派生表どうしの JOIN は合成 CTE を `WITH`＋JOIN 経路の slot として評価し、内側は参照者の可視行だけを読む。入れ子の深さはサブクエリ深さ上限（既定 4）を超えると `54000`。
   挙動変更: 従来 `0A000`／`42601` だった JOIN 入力・複数件・入れ子の派生表が実行される。別名なしの派生表の JOIN 入力・集計本文の JOIN 入力は `0A000`、`EXPLAIN` は `42601` のまま。公開 API の変更はない（非 BREAKING）。詳細は [cte.md](docs/design/cte.md) の「Issue #1867 追記」節。
