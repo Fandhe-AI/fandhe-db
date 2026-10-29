@@ -232,7 +232,8 @@ fn combined_with_other_clauses_and_cte() {
 }
 
 /// マテリアライズドビュー・CTAS・カーソル・EXPLAIN は、名前付きとインラインで結果（成否・SQLSTATE）が
-/// 一致する（展開を通らない入口は従来どおりの拒否にとどまる＝fail-closed）。
+/// 一致する（`outcome` は `execute_sql` 入口のため EXPLAIN は両形とも `42601`。セッション入口での
+/// EXPLAIN 行の一致は `sql64_window_explain` が検査する。展開を通らない入口は fail-closed）。
 #[test]
 fn other_entry_points_agree_with_inline() {
     let (core, ctx, _g) = setup("nw-entries", true);

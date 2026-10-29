@@ -1104,7 +1104,7 @@ fn scalar_order_by_with_window_rejects_unsupported_combinations() {
         "SELECT id, ROW_NUMBER() OVER () FROM docs ORDER BY score, score, score, score, score, score, score, score, score LIMIT 10",
         "54000",
     );
-    // EXPLAIN とウィンドウの併用は ORDER BY 付きでも 42601 のまま。
+    // `execute_sql` 入口の EXPLAIN は ORDER BY 付きでも 42601 のまま（既存契約）。
     expect_rejected(
         &core,
         &ctx,
@@ -1263,12 +1263,9 @@ fn rejects_using_plan_combined_with_window() {
 }
 
 #[test]
-fn rejects_explain_combined_with_window() {
-    // Issue #922（EXPLAIN の対象文拡大）取り込み時の再配線: `EXPLAIN` は
-    // ウィンドウ関数に未対応のまま維持する（`sql::explain` 側に対応する記述が
-    // ないため）。`validate_select_statement` が EXPLAIN・非 EXPLAIN 双方から
-    // 共有されるようになったことで、`Statement::Scan` の `window_items` が
-    // 非空なら EXPLAIN 側で明示的に拒否することを固定する。
+fn execute_sql_entry_rejects_explain_with_window() {
+    // `execute_sql`（セッション非対応の入口）は EXPLAIN を種類によらず 42601 で拒否する既存契約。
+    // セッション入口での窓付き EXPLAIN の受理（Issue #1896）は `sql64_window_explain` が検査する。
     let path = unique_db_path("window-reject-explain");
     let _guard = CleanupGuard(path.clone());
     let storage = open_storage(&path);

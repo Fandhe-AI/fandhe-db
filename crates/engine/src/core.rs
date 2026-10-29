@@ -11194,7 +11194,26 @@ impl EngineCore {
                     ExplainIndexNames::default(),
                 )
             };
-        crate::sql::explain::build_relational_explain_result(scalar_plan, None, access_path, &names)
+        // Issue #1896・SQL-64 (6): 窓付きの文は `classify_pk_point`／`classify_gin_scan` が
+        // 索引経路を返さず、実行側も `sql::window::execute_window_scan`（全行走査）へ回るため、
+        // 上の分岐は自然に `plain_scan`／`full_scan` となり実経路と矛盾しない。窓の評価段は
+        // 静的な情報（関数名・キー数）だけを追記する。NoSQL 表層の `BoundScan` は常に窓なし。
+        let windows: Vec<crate::sql::explain::ExplainWindowStage> = bound
+            .windows()
+            .iter()
+            .map(|w| crate::sql::explain::ExplainWindowStage {
+                func: w.func.default_alias(),
+                partition_keys: w.partition_by.len(),
+                order_keys: w.order_by.len(),
+            })
+            .collect();
+        crate::sql::explain::build_relational_explain_result_with_windows(
+            scalar_plan,
+            None,
+            access_path,
+            &names,
+            &windows,
+        )
     }
 
     /// 束縛済み `USING PLAN` 検索計画の EXPLAIN（TASK-186・NOSQL-10。

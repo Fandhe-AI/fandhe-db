@@ -99,6 +99,7 @@ mod sql64_named_window;
 mod sql64_ntile;
 mod sql64_percent_rank_cume_dist;
 mod sql64_value_functions;
+mod sql64_window_explain;
 mod sql64_window_expr_arg;
 mod sql64_window_filter;
 mod sql64_window_groups_frame;
