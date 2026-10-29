@@ -27,7 +27,7 @@ use crate::sql::relation::{ColumnRef, TableRef};
 use crate::sql::udf_call::{
     ArrayCmpOp, ArraySubscript, BinOp, Expr, JsonAccessOp, Quantifier, SqlJsonBehavior,
     SqlJsonQueryExpr, SqlJsonQueryKind, ValueFunctionKind, MAX_CALL_ARGS, MAX_CASE_BRANCHES,
-    MAX_CASE_NESTING, MAX_EXPR_DEPTH, MAX_EXPR_NODES, MAX_UDF_PARAMS,
+    MAX_CASE_NESTING, MAX_EXPR_DEPTH, MAX_EXPR_NODES, MAX_FUNCTION_CALL_ARGS, MAX_UDF_PARAMS,
 };
 use crate::sql::using_operation_id::OperationId;
 use crate::sql::where_negation::negate_conjunction;
@@ -998,7 +998,8 @@ pub enum SqlSurfaceError {
     /// `CUBE` の要素数が上限を超えた（`54011`。Issue #1821・SQL-59）。固定文言のみ。
     /// `CatalogError::TooManyColumns`（`54000`。変更しない）とは別物。
     TooManyColumns { detail: &'static str },
-    /// `GROUPING()` の引数が上限（31 個）を超えた（`54023`。Issue #1823・SQL-59）。固定文言のみ。
+    /// `GROUPING()` の引数が上限（31 個）、または関数呼び出しの引数が 100 個を超えた
+    /// （`54023`。Issue #1823・SQL-59、Issue #1910・SQL-65）。固定文言のみ。
     TooManyArguments { detail: &'static str },
     /// 明示的な `COLLATE` 同士の食い違い（`42P21`。Issue #2190・TABLE-28）。固定文言のみ。
     CollationMismatch,
@@ -11365,10 +11366,10 @@ impl<'a> Parser<'a> {
                 args.push(self.parse_value_expr_with_null_context(depth + 1, true)?);
                 while matches!(self.peek(), Some(Token::Punct(','))) {
                     self.advance();
-                    if args.len() >= MAX_CALL_ARGS {
-                        return Err(SqlSurfaceError::payload_too_large(
-                            "too many call arguments",
-                        ));
+                    if args.len() >= MAX_FUNCTION_CALL_ARGS {
+                        return Err(SqlSurfaceError::TooManyArguments {
+                            detail: crate::sql::udf_call::TOO_MANY_FUNCTION_ARGS_DETAIL,
+                        });
                     }
                     args.push(self.parse_value_expr_with_null_context(depth + 1, true)?);
                 }
@@ -11420,10 +11421,10 @@ impl<'a> Parser<'a> {
             );
             while matches!(self.peek(), Some(Token::Punct(','))) {
                 self.advance();
-                if args.len() >= MAX_CALL_ARGS {
-                    return Err(SqlSurfaceError::payload_too_large(
-                        "too many call arguments",
-                    ));
+                if args.len() >= MAX_FUNCTION_CALL_ARGS {
+                    return Err(SqlSurfaceError::TooManyArguments {
+                        detail: crate::sql::udf_call::TOO_MANY_FUNCTION_ARGS_DETAIL,
+                    });
                 }
                 args.push(
                     self.parse_value_expr_with_null_context(depth + 1, allow_null_for_this_call)?,

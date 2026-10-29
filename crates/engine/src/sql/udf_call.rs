@@ -35,8 +35,17 @@ use crate::wasm_udf::WasmUdfBackend;
 
 /// UDF 定義が持てるパラメータ数の上限（`54000` で拒否）。
 pub const MAX_UDF_PARAMS: usize = 32;
-/// 関数呼び出し（組み込み・UDF 問わず）1 回あたりの引数数上限（`54000`）。
+/// `COALESCE` と SQL/JSON の `PASSING` が持てる要素数の上限（`54000`）。
+/// 関数呼び出しの引数上限は [`MAX_FUNCTION_CALL_ARGS`]（Issue #1910）であり、
+/// この定数とは別物（値・意味ともに変えない）。
 pub const MAX_CALL_ARGS: usize = 32;
+/// 関数呼び出し（組み込み・UDF 問わず）1 回あたりの引数数上限（100 個。超過は `54023`）。
+/// SQL-65 (3)・Issue #1910。構文段（`allowlist`）と束縛段（`bind_call`・
+/// `validate_closed_expr`）の双方で、関数名の解決より先に判定する。
+pub const MAX_FUNCTION_CALL_ARGS: usize = 100;
+/// [`MAX_FUNCTION_CALL_ARGS`] 超過時の固定文言（利用者の入力は埋め込まない）。
+pub(crate) const TOO_MANY_FUNCTION_ARGS_DETAIL: &str =
+    "cannot pass more than 100 arguments to a function";
 /// 式の構文解析時の再帰深さ上限（スタック消費の上限。`54000`）。
 pub const MAX_EXPR_DEPTH: usize = 32;
 /// UDF インライン展開後の式ノード数上限（多段呼び出しによる指数的膨張への歯止め）。
@@ -2179,12 +2188,57 @@ pub(crate) fn is_foldable_builtin(f: BuiltinFn) -> bool {
 }
 
 /// 組み込み関数の arity（[`builtin_signature`] が返す引数個数）の上限。
+/// 固定引数の実行時バッファの大きさであり、利用者に見える引数上限ではない
+/// （それは [`builtin_call_arity`] の表と [`MAX_FUNCTION_CALL_ARGS`] が決める。
+/// 可変長の `concat` は `Concat2` の左畳み込みに展開されるのでこのバッファを使わない）。
 /// `sql::expr_program::ExprStep::Builtin` の実行時、この上限個数の固定配列
 /// （ヒープ確保なし）へ引数を積んでから [`apply_builtin`] を呼ぶために使う
 /// （PR #373 codex-review 指摘対応・追加 `Vec` 確保の排除）。新しい組み込み関数を
 /// 追加してこの上限を超える arity になる場合はここも合わせて引き上げる
 /// （`builtin_arities_fit_max_arity` で全 [`BuiltinFn`] 網羅的に検証する）。
 pub(crate) const MAX_BUILTIN_ARITY: usize = 3;
+
+/// 組み込み関数 1 つの引数個数の範囲（`min..=max`）。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) struct BuiltinArity {
+    pub min: usize,
+    pub max: usize,
+}
+
+/// 組み込み関数ごとの引数個数表（SQL-65 (3)・Issue #1910）。大小は無視する。
+/// `bind_call`・`validate_closed_expr` が個数照合の唯一の判定元として引く。
+/// jsonb・json・配列・jsonpath 関数とスキーマ関数は各モジュールが個数を検査するため
+/// 表に載せず `None` を返す（後段へ回す。黙って通すのではなく各モジュールが fail-closed）。
+pub(crate) fn builtin_call_arity(name: &str) -> Option<BuiltinArity> {
+    let fixed = |min, max| Some(BuiltinArity { min, max });
+    match name.to_ascii_lowercase().as_str() {
+        "concat" => fixed(1, MAX_FUNCTION_CALL_ARGS),
+        "substr" => fixed(2, 3),
+        "round" => fixed(1, 2),
+        "date_part" => fixed(2, 2),
+        "date_trunc" => fixed(2, 3),
+        "timezone" => fixed(1, 2),
+        "now" | "transaction_timestamp" | "statement_timestamp" => fixed(0, 0),
+        _ => {
+            let f = builtin_from_name(name)?;
+            let n = builtin_signature(f).0.len();
+            fixed(n, n)
+        }
+    }
+}
+
+/// 表を引いて引数個数を照合する。表にない名前は `Ok(())`（後段が判定する）、
+/// 範囲外は `42883`。
+fn check_builtin_arity(name: &str, n: usize) -> Result<(), SqlSurfaceError> {
+    if let Some(a) = builtin_call_arity(name) {
+        if n < a.min || n > a.max {
+            return Err(SqlSurfaceError::undefined_function(format!(
+                "function {name} has wrong number of arguments: got {n}"
+            )));
+        }
+    }
+    Ok(())
+}
 
 /// `WHERE`・`ORDER BY` の既存許可名（`allowlist::is_allowed_where_predicate_name`
 /// 等）・組み込み関数名・集計関数名（`allowlist::is_aggregate_function_name`。
@@ -2483,11 +2537,12 @@ fn validate_closed_expr(
             }
         }
         Expr::Call { name, args } => {
-            if args.len() > MAX_CALL_ARGS {
-                return Err(SqlSurfaceError::payload_too_large(
-                    "too many call arguments",
-                ));
+            if args.len() > MAX_FUNCTION_CALL_ARGS {
+                return Err(SqlSurfaceError::TooManyArguments {
+                    detail: TOO_MANY_FUNCTION_ARGS_DETAIL,
+                });
             }
+            check_builtin_arity(name, args.len())?;
             // 呼び出し先の存在だけでなく、引数個数（組み込みは `builtin_signature`、
             // 登録済み UDF は `UdfDefinition::params.len()`）も定義時に照合する。
             // ここを素通りすると `CREATE FUNCTION f() AS vec_norm()` のような
@@ -6983,11 +7038,12 @@ fn bind_call(
     env: &mut BindEnv<'_>,
     node_budget: &mut usize,
 ) -> Result<(BoundExpr, ExprType), SqlSurfaceError> {
-    if args.len() > MAX_CALL_ARGS {
-        return Err(SqlSurfaceError::payload_too_large(
-            "too many call arguments",
-        ));
+    if args.len() > MAX_FUNCTION_CALL_ARGS {
+        return Err(SqlSurfaceError::TooManyArguments {
+            detail: TOO_MANY_FUNCTION_ARGS_DETAIL,
+        });
     }
+    check_builtin_arity(name, args.len())?;
     let lower_name = name.to_ascii_lowercase();
     // `nextval`／`currval` は INSERT の VALUES 要素・列 DEFAULT の単独形でだけ使える
     // （TABLE-24・Issue #1690）。SELECT 投影・WHERE・UPDATE SET・ビュー本文などの式位置は
@@ -7232,7 +7288,7 @@ fn bind_call(
     )))
 }
 
-/// `CONCAT(a, b, c, ...)`（可変長・1〜[`MAX_CALL_ARGS`] 引数）を束縛する
+/// `CONCAT(a, b, c, ...)`（可変長・1〜[`MAX_FUNCTION_CALL_ARGS`] 引数）を束縛する
 /// （Issue #919・SQL-26）。引数はすべて `TEXT` 型に限定する（数値等の暗黙
 /// 文字列化は PostgreSQL の表現と一致しない恐れがあるため対象外とし `22000` で
 /// 拒否する。既知の制約として `docs/design/implementation-status.md` に記す）。
@@ -10605,6 +10661,41 @@ mod tests {
         // move のみで再確保されていないことをポインタの同一性で確認する。
         assert_eq!(owned.as_ptr(), ptr_before);
         assert_eq!(owned, vec![1.0, 2.0, 3.0]);
+    }
+
+    /// Issue #1910・SQL-65 (3): arity 表の名前はすべて組み込み関数名として予約され、
+    /// 固定引数の関数は `builtin_signature` の個数と一致する。
+    #[test]
+    fn builtin_call_arity_table_is_consistent() {
+        for name in [
+            "concat",
+            "substr",
+            "round",
+            "date_part",
+            "date_trunc",
+            "timezone",
+            "now",
+            "transaction_timestamp",
+            "statement_timestamp",
+            "clock_timestamp",
+            "lower",
+            "vec_norm",
+            "justify_days",
+        ] {
+            assert!(is_builtin_function_name(name), "{name}");
+            let a = builtin_call_arity(name).unwrap_or_else(|| panic!("{name} not in table"));
+            assert!(a.min <= a.max && a.max <= MAX_FUNCTION_CALL_ARGS, "{name}");
+        }
+        assert_eq!(
+            builtin_call_arity("CONCAT"),
+            Some(BuiltinArity {
+                min: 1,
+                max: MAX_FUNCTION_CALL_ARGS
+            })
+        );
+        let lower = builtin_call_arity("lower").expect("lower");
+        assert_eq!((lower.min, lower.max), (1, 1));
+        assert!(builtin_call_arity("mystery_fn").is_none());
     }
 
     /// PR #373 codex-review 指摘 2 対応の回帰テスト: `sql::expr_program::ExprStep::Builtin`
