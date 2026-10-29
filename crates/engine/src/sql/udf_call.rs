@@ -828,6 +828,14 @@ impl JsonAccessOp {
     }
 }
 
+/// `GREATEST`／`LEAST` の向き（[`BoundExpr::MinMax`]。対象ビヘイビア: SQL-65 ポインタ。
+/// Issue #1909）。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum MinMaxOp {
+    Greatest,
+    Least,
+}
+
 /// 束縛済み（列参照・関数呼び出しの解決、UDF 本体のインライン展開が完了した）式。
 /// レジストリを参照せずに単独で評価できる（`eval` の入力）。
 ///
@@ -906,6 +914,13 @@ pub enum BoundExpr {
     },
     /// `COALESCE`（対象ビヘイビア: SQL-26）。
     Coalesce(Vec<BoundExpr>),
+    /// `GREATEST`／`LEAST`（対象ビヘイビア: SQL-65 ポインタ。Issue #1909）。引数は
+    /// [`bind_min_max`] が統一した型へそろえてあり、NULL は評価時に無視する
+    /// （全引数 NULL なら NULL）。
+    MinMax {
+        op: MinMaxOp,
+        args: Vec<BoundExpr>,
+    },
     /// `NULLIF`（対象ビヘイビア: SQL-26）。両辺は常に `Scalar` 型（[`bind_nullif`]
     /// が検査済み）。
     NullIf {
@@ -1431,6 +1446,9 @@ impl PartialEq for BoundExpr {
                 },
             ) => wa == wb && ea == eb,
             (BoundExpr::Coalesce(a), BoundExpr::Coalesce(b)) => a == b,
+            (BoundExpr::MinMax { op: oa, args: a }, BoundExpr::MinMax { op: ob, args: b }) => {
+                oa == ob && a == b
+            }
             (BoundExpr::NullIf { lhs: la, rhs: ra }, BoundExpr::NullIf { lhs: lb, rhs: rb }) => {
                 la == lb && ra == rb
             }
@@ -2036,6 +2054,10 @@ fn is_variadic_or_overloaded_builtin_name(name: &str) -> bool {
             | "timezone"
             | "lpad"
             | "rpad"
+            // `greatest`／`least`（SQL-65・Issue #1909）は引数型を統一する可変長関数で、
+            // `BuiltinFn` では表せないため専用ノード（`BoundExpr::MinMax`）へ束縛する。
+            | "greatest"
+            | "least"
     )
 }
 
@@ -2289,6 +2311,7 @@ pub(crate) fn builtin_call_arity(name: &str) -> Option<BuiltinArity> {
     let fixed = |min, max| Some(BuiltinArity { min, max });
     match name.to_ascii_lowercase().as_str() {
         "concat" => fixed(1, MAX_FUNCTION_CALL_ARGS),
+        "greatest" | "least" => fixed(1, MAX_FUNCTION_CALL_ARGS),
         "substr" => fixed(2, 3),
         "lpad" | "rpad" => fixed(2, 3),
         "round" => fixed(1, 2),
@@ -2693,6 +2716,9 @@ fn validate_closed_expr(
                         args.len()
                     )));
                 }
+            } else if name.eq_ignore_ascii_case("greatest") || name.eq_ignore_ascii_case("least") {
+                // `greatest`／`least`（SQL-65・Issue #1909）。個数は上の `check_builtin_arity` が
+                // 照合済みで、型の統一検査は呼び出し時（`bind_min_max`）が行う。
             } else if name.eq_ignore_ascii_case("round")
                 || name.eq_ignore_ascii_case("trunc")
                 || name.eq_ignore_ascii_case("log")
@@ -2955,6 +2981,7 @@ fn count_bound_nodes(expr: &BoundExpr) -> usize {
                 + count_bound_nodes(else_result)
         }
         BoundExpr::Coalesce(args) => 1 + args.iter().map(count_bound_nodes).sum::<usize>(),
+        BoundExpr::MinMax { args, .. } => 1 + args.iter().map(count_bound_nodes).sum::<usize>(),
         BoundExpr::Like { lhs, .. } | BoundExpr::RegexMatch { lhs, .. } => {
             1 + count_bound_nodes(lhs)
         }
@@ -3063,6 +3090,9 @@ fn max_bound_case_nesting(expr: &BoundExpr) -> usize {
             1 + branches_max.max(max_bound_case_nesting(else_result))
         }
         BoundExpr::Coalesce(args) => 1 + args.iter().map(max_bound_case_nesting).max().unwrap_or(0),
+        BoundExpr::MinMax { args, .. } => {
+            1 + args.iter().map(max_bound_case_nesting).max().unwrap_or(0)
+        }
         BoundExpr::Like { lhs, .. } | BoundExpr::RegexMatch { lhs, .. } => {
             max_bound_case_nesting(lhs)
         }
@@ -3157,6 +3187,7 @@ pub(crate) fn references_embedding(expr: &BoundExpr) -> bool {
                 || references_embedding(else_result)
         }
         BoundExpr::Coalesce(args) => args.iter().any(references_embedding),
+        BoundExpr::MinMax { args, .. } => args.iter().any(references_embedding),
         BoundExpr::Like { lhs, .. } | BoundExpr::RegexMatch { lhs, .. } => {
             references_embedding(lhs)
         }
@@ -3281,7 +3312,7 @@ pub(crate) fn visit_referenced_scalar_columns(expr: &BoundExpr, visit: &mut dyn 
             }
             visit_referenced_scalar_columns(else_result, visit);
         }
-        BoundExpr::Coalesce(args) => {
+        BoundExpr::Coalesce(args) | BoundExpr::MinMax { args, .. } => {
             for a in args {
                 visit_referenced_scalar_columns(a, visit);
             }
@@ -3474,7 +3505,7 @@ pub(crate) fn mark_referenced_scalar_columns(expr: &BoundExpr, mask: &mut [bool]
             }
             any
         }
-        BoundExpr::Coalesce(args) => {
+        BoundExpr::Coalesce(args) | BoundExpr::MinMax { args, .. } => {
             let mut any = false;
             for a in args {
                 if mark_referenced_scalar_columns(a, mask) {
@@ -4281,6 +4312,77 @@ fn bind_coalesce(
             .map(|((b, a), t)| coerce_branch(coercion, a, b, *t, schema))
             .collect();
         Ok((BoundExpr::Coalesce(bound_args), final_ty))
+    })
+}
+
+/// `GREATEST(<arg>, ...)`／`LEAST(<arg>, ...)` を束縛する（対象ビヘイビア: SQL-65 ポインタ。
+/// Issue #1909）。引数型の統一は `COALESCE` と同じ規則（[`unify_branch_type_numeric`]）で、
+/// 統一できなければ `42804`。統一後の型が比較器を持たない場合は fail-closed で拒否する
+/// （`Vector` は比較演算子が無いため `42883`、その他の未対応型は `0A000`）。引数個数の
+/// 上限は `bind_call` 入口（[`MAX_FUNCTION_CALL_ARGS`]・`54023`）が検査済み。
+fn bind_min_max(
+    op: MinMaxOp,
+    args: &[Expr],
+    env: &mut BindEnv<'_>,
+    node_budget: &mut usize,
+) -> Result<(BoundExpr, ExprType), SqlSurfaceError> {
+    bind_with_case_nesting(env, |env| {
+        let mut bound_args = Vec::with_capacity(args.len());
+        let mut unified: Option<ExprType> = None;
+        let mut arg_tys: Vec<Option<ExprType>> = Vec::with_capacity(args.len());
+        for a in args {
+            let (b, t) = bind_null_aware(a, env, node_budget)?;
+            unify_branch_type_numeric(
+                env,
+                &mut unified,
+                t,
+                "GREATEST/LEAST arguments must have the same type",
+            )?;
+            arg_tys.push(t);
+            bound_args.push(b);
+        }
+        let final_ty = unified.ok_or_else(|| SqlSurfaceError::FeatureNotSupported {
+            detail: "GREATEST/LEAST with only NULL arguments has no determinable type".to_string(),
+        })?;
+        match final_ty {
+            ExprType::Scalar
+            | ExprType::Text
+            | ExprType::Date
+            | ExprType::Timestamp
+            | ExprType::Time
+            | ExprType::TimestampTz => {}
+            ExprType::Vector => {
+                return Err(SqlSurfaceError::undefined_function(
+                    "GREATEST/LEAST does not support vector arguments",
+                ));
+            }
+            _ => {
+                return Err(SqlSurfaceError::FeatureNotSupported {
+                    detail: "GREATEST/LEAST does not support this argument type".to_string(),
+                });
+            }
+        }
+        let branches: Vec<(&Expr, &BoundExpr, Option<ExprType>)> = args
+            .iter()
+            .zip(bound_args.iter())
+            .zip(arg_tys.iter())
+            .map(|((a, b), t)| (a, b, *t))
+            .collect();
+        let coercion = branch_coercion(env, final_ty, &branches);
+        let schema = env.schema;
+        let bound_args: Vec<BoundExpr> = bound_args
+            .into_iter()
+            .zip(args.iter())
+            .zip(arg_tys.iter())
+            .map(|((b, a), t)| coerce_branch(coercion, a, b, *t, schema))
+            .collect();
+        Ok((
+            BoundExpr::MinMax {
+                op,
+                args: bound_args,
+            },
+            final_ty,
+        ))
     })
 }
 
@@ -6042,6 +6144,18 @@ pub(crate) fn projection_kind(
             }
             return acc;
         }
+        (
+            Expr::Call { args, .. },
+            BoundExpr::MinMax {
+                args: bound_args, ..
+            },
+        ) if args.len() == bound_args.len() => {
+            let mut acc = ProjKind::Null;
+            for (a, b) in args.iter().zip(bound_args.iter()) {
+                acc = common_proj_kind(acc, projection_kind(a, b, schema));
+            }
+            return acc;
+        }
         (Expr::Coalesce(args), BoundExpr::Coalesce(bound_args))
             if args.len() == bound_args.len() =>
         {
@@ -7160,6 +7274,14 @@ fn bind_call(
     }
     if lower_name == "concat" {
         return bind_concat(args, env, node_budget);
+    }
+    if lower_name == "greatest" || lower_name == "least" {
+        let op = if lower_name == "greatest" {
+            MinMaxOp::Greatest
+        } else {
+            MinMaxOp::Least
+        };
+        return bind_min_max(op, args, env, node_budget);
     }
     if let Some(kind) = json_fn_from_name(&lower_name) {
         return bind_json_fn(name, kind, args, env, node_budget);
@@ -9051,6 +9173,14 @@ pub(crate) fn eval_with_scalars<'a>(
             }
             Ok(ExprValue::Null)
         }
+        BoundExpr::MinMax { op, args } => {
+            // PostgreSQL と同じく短絡せず全引数を評価する（評価エラーは伝播する）。
+            let mut values = Vec::with_capacity(args.len());
+            for a in args {
+                values.push(eval_with_scalars(a, id, embedding, row_scalars)?);
+            }
+            fold_min_max(*op, values)
+        }
         BoundExpr::NullIf { lhs, rhs } => {
             let l = eval_with_scalars(lhs, id, embedding, row_scalars)?;
             let r = eval_with_scalars(rhs, id, embedding, row_scalars)?;
@@ -9119,6 +9249,52 @@ pub(crate) fn eval_is_distinct_from<'a>(
         },
     };
     Ok(ExprValue::Bool(distinct != negated))
+}
+
+/// `GREATEST`／`LEAST` の畳み込み評価（対象ビヘイビア: SQL-65 ポインタ。Issue #1909）。
+/// `eval_with_scalars` の `BoundExpr::MinMax` 腕から呼ばれる（バイトコード経路は部分木ごと
+/// 木評価へ委ねるため実装は 1 箇所）。NULL は無視し、全引数 NULL なら NULL を返す。
+/// 比較は既存の比較演算（[`eval_binary`]）に任せ、同値のときは先に現れた値を残す。
+/// 比較結果が真偽値で返らないのは束縛段の不変条件が崩れた場合だけで、`Internal` で拒否する。
+fn fold_min_max<'a>(
+    op: MinMaxOp,
+    values: Vec<ExprValue<'a>>,
+) -> Result<ExprValue<'a>, SqlSurfaceError> {
+    let cmp = match op {
+        MinMaxOp::Greatest => BinOp::Gt,
+        MinMaxOp::Least => BinOp::Lt,
+    };
+    let mut acc: Option<ExprValue<'a>> = None;
+    for cand in values {
+        if matches!(cand, ExprValue::Null) {
+            continue;
+        }
+        acc = Some(match acc {
+            None => cand,
+            // 浮動小数（REAL／DOUBLE は `Scalar`）は集約 MIN/MAX と同じ `total_cmp` の全順序で
+            // 比較する。`>`／`<` は NaN を含むと常に偽で結果が引数順に依存するため使わない。
+            Some(ExprValue::Scalar(cur)) if matches!(cand, ExprValue::Scalar(_)) => {
+                let ExprValue::Scalar(c) = cand else {
+                    unreachable!("guarded by matches!")
+                };
+                let better = match op {
+                    MinMaxOp::Greatest => c.total_cmp(&cur).is_gt(),
+                    MinMaxOp::Least => c.total_cmp(&cur).is_lt(),
+                };
+                ExprValue::Scalar(if better { c } else { cur })
+            }
+            Some(cur) => match eval_binary(cmp, cand.clone(), cur.clone())? {
+                ExprValue::Bool(true) => cand,
+                ExprValue::Bool(false) => cur,
+                _ => {
+                    return Err(SqlSurfaceError::Internal {
+                        detail: "GREATEST/LEAST comparison did not evaluate to boolean".to_string(),
+                    })
+                }
+            },
+        });
+    }
+    Ok(acc.unwrap_or(ExprValue::Null))
 }
 
 /// `NULLIF(lhs, rhs)` を値ベースで評価する（`CASE WHEN lhs = rhs THEN NULL ELSE
@@ -10966,6 +11142,8 @@ mod tests {
             "lower",
             "vec_norm",
             "justify_days",
+            "greatest",
+            "least",
         ] {
             assert!(is_builtin_function_name(name), "{name}");
             let a = builtin_call_arity(name).unwrap_or_else(|| panic!("{name} not in table"));
@@ -10985,6 +11163,53 @@ mod tests {
         let sp = builtin_call_arity("split_part").expect("split_part");
         assert_eq!((sp.min, sp.max), (3, 3));
         assert!(builtin_call_arity("mystery_fn").is_none());
+    }
+
+    /// Issue #1909・SQL-65: `GREATEST`／`LEAST` の畳み込みは NULL を無視し、全 NULL なら NULL、
+    /// 同値では先に現れた値を残す。
+    #[test]
+    fn fold_min_max_ignores_nulls_and_keeps_first_on_ties() {
+        use ExprValue::{Null, Scalar, Text};
+        let v = |xs: Vec<ExprValue<'static>>| xs;
+        assert_eq!(
+            fold_min_max(
+                MinMaxOp::Greatest,
+                v(vec![Null, Scalar(1.0), Null, Scalar(3.0)])
+            )
+            .unwrap(),
+            Scalar(3.0)
+        );
+        assert_eq!(
+            fold_min_max(MinMaxOp::Least, v(vec![Scalar(2.0), Null, Scalar(-1.0)])).unwrap(),
+            Scalar(-1.0)
+        );
+        assert_eq!(
+            fold_min_max(MinMaxOp::Greatest, v(vec![Null, Null])).unwrap(),
+            Null
+        );
+        assert_eq!(
+            fold_min_max(
+                MinMaxOp::Least,
+                v(vec![Text("b".into()), Text("B".into()), Text("a".into())])
+            )
+            .unwrap(),
+            Text("B".into())
+        );
+        // NaN は最大として扱い、引数順に依存しない（集約 MIN/MAX の total_cmp 順序と一致）。
+        let nan = f64::NAN;
+        for xs in [
+            vec![Scalar(nan), Scalar(1.0), Scalar(2.0)],
+            vec![Scalar(1.0), Scalar(nan), Scalar(2.0)],
+            vec![Scalar(1.0), Scalar(2.0), Scalar(nan)],
+        ] {
+            match fold_min_max(MinMaxOp::Greatest, xs.clone()).unwrap() {
+                Scalar(x) => assert!(x.is_nan()),
+                other => panic!("unexpected {other:?}"),
+            }
+            assert_eq!(fold_min_max(MinMaxOp::Least, xs).unwrap(), Scalar(1.0));
+        }
+        // 型が混在した場合（束縛段の不変条件が崩れた場合）は Internal で拒否する。
+        assert!(fold_min_max(MinMaxOp::Greatest, v(vec![Scalar(1.0), Text("a".into())])).is_err());
     }
 
     /// PR #373 codex-review 指摘 2 対応の回帰テスト: `sql::expr_program::ExprStep::Builtin`
