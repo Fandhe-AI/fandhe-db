@@ -374,6 +374,11 @@ fn aggregate_inside_window_implicit_single_group() {
         rows(&core, A, "SELECT sum(k), sum(sum(k)) OVER () FROM t"),
         strs(&["25,25"])
     );
+    // 列参照を持たない非窓項目は暗黙の単一グループに混ざっても受理される。
+    assert_eq!(
+        rows(&core, A, "SELECT 1, rank() OVER (ORDER BY sum(k)) FROM t"),
+        strs(&["1,1"])
+    );
 }
 
 /// 巻き上げた集計もテナント境界の内側で計算される（tenant-b の 1000 を含まない）。
@@ -394,7 +399,7 @@ fn aggregate_inside_window_respects_tenant_boundary() {
 #[test]
 fn unsupported_shapes_fail_closed() {
     let (core, _g) = build("sql64-gw-reject", None);
-    let cases: [(&str, &str); 19] = [
+    let cases: [(&str, &str); 22] = [
         // グループ化されていない列を窓が参照する。
         (
             "SELECT g, count(*), rank() OVER (ORDER BY k) FROM t GROUP BY g",
@@ -415,6 +420,13 @@ fn unsupported_shapes_fail_closed() {
         ),
         // 暗黙の単一グループで非グループ化列を射影する。
         ("SELECT k, rank() OVER (ORDER BY sum(k)) FROM t", "42803"),
+        ("SELECT k, lag(count(*)) OVER () FROM t", "42803"),
+        ("SELECT k, lag(count(*)) OVER () FROM t LIMIT 1", "42803"),
+        // 未定義列は束縛段の 42703（先行ゲートの 42803 に潰されない）。
+        (
+            "SELECT nosuch, rank() OVER (ORDER BY sum(k)) FROM t",
+            "42703",
+        ),
         // 窓の FILTER 内・フレームオフセット内の集計。
         (
             "SELECT g, count(*) FILTER (WHERE sum(k) > 1) OVER () FROM t GROUP BY g",

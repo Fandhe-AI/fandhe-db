@@ -379,6 +379,33 @@ fn push_sep(out: &mut Vec<Token>, n: &mut usize) {
     *n = n.saturating_add(1);
 }
 
+/// FROM 以降に `LIMIT`／`OFFSET`／`FETCH` があるか。
+fn tail_has_row_limit(tail: &[Token]) -> bool {
+    tail.iter().any(|t| match t {
+        Token::Keyword(Keyword::Limit) => true,
+        Token::Ident(n) => n.eq_ignore_ascii_case("OFFSET") || n.eq_ignore_ascii_case("FETCH"),
+        _ => false,
+    })
+}
+
+/// 項目が列参照（関数名・別名・型名・`NULL`／`TRUE`／`FALSE` 以外の識別子）を持つか。
+fn item_has_column_ref(item: &[Token]) -> bool {
+    item.iter().enumerate().any(|(i, t)| {
+        let Token::Ident(n) = t else { return false };
+        let next_is_call = matches!(item.get(i.saturating_add(1)), Some(Token::Punct('(')));
+        let prev = i.checked_sub(1).and_then(|j| item.get(j));
+        let after_as = matches!(prev, Some(Token::Ident(p)) if p.eq_ignore_ascii_case("AS"));
+        let after_cast = matches!(prev, Some(Token::Punct(':')));
+        !(next_is_call
+            || after_as
+            || after_cast
+            || n.eq_ignore_ascii_case("AS")
+            || n.eq_ignore_ascii_case("NULL")
+            || n.eq_ignore_ascii_case("TRUE")
+            || n.eq_ignore_ascii_case("FALSE"))
+    })
+}
+
 /// 集計 SELECT と窓項目の併用を [`Statement::BufferedView`]（`origin = GroupedWindow`）へ振り分ける。
 ///
 /// `Ok(None)` は「この経路の対象外」（呼び出し元が従来の振り分け・エラーへ進む）。対象と確定した後の
@@ -419,7 +446,6 @@ pub(super) fn try_build(
     // 窓項目の有無と、非窓項目の集計呼び出しでこの経路の対象かを先に確定する（解析前）。
     let mut any_window = false;
     let mut plain_has_aggregate = false;
-    let mut any_plain = false;
     let mut window_has_aggregate = false;
     for &(s, e) in &ranges {
         let Some(item) = tokens.get(s..e) else {
@@ -431,7 +457,6 @@ pub(super) fn try_build(
                 window_has_aggregate = true;
             }
         } else {
-            any_plain = true;
             if item_has_aggregate_call(item) {
                 plain_has_aggregate = true;
             }
@@ -440,10 +465,19 @@ pub(super) fn try_build(
     if !any_window || !(has_group_by_or_having || plain_has_aggregate || window_has_aggregate) {
         return Ok(None);
     }
-    // 窓の内側の集計だけが根拠で、GROUP BY／HAVING も非窓の集計も無いのに非窓項目がある文
-    // （`SELECT id, lag(count(*)) OVER ()` 等）は、暗黙の単一グループに非集計項目が混ざるので
-    // PostgreSQL と同じ `42803`。本文の形検査（`LIMIT` 付きで `42601` に倒れる）へ渡さず先に返す。
-    if !has_group_by_or_having && !plain_has_aggregate && any_plain {
+    // 窓内集計だけが根拠で GROUP BY／HAVING も非窓の集計も無い文は暗黙の単一グループになる。
+    // 非窓項目が列参照を持たない（定数のみ）なら受理し、未定義列は束縛段の `42703`、未グループ化列は
+    // 束縛側の `42803` に任せる。ただし `LIMIT`／`OFFSET` 付きでは本文の形検査が先に `42601` へ倒れて
+    // しまうため、その場合に限り列参照を持つ非窓項目を先に `42803` で拒否する。
+    if !has_group_by_or_having
+        && !plain_has_aggregate
+        && tail_has_row_limit(tail)
+        && ranges.iter().any(|&(s, e)| {
+            tokens
+                .get(s..e)
+                .is_some_and(|item| !tokens_contain_window_over(item) && item_has_column_ref(item))
+        })
+    {
         return Err(SqlSurfaceError::GroupingError {
             detail: "column must appear in the GROUP BY clause or be used in an aggregate function",
         });
