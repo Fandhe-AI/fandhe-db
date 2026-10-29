@@ -1036,6 +1036,10 @@ pub enum SqlSurfaceError {
     /// `substring`／`substr` の負の長さ（`22011`、SQL-65・ERR-2、Issue #1903）。PostgreSQL と同じ
     /// 固定文言で、行の値・テナント情報を含めない。
     SubstringError { detail: String },
+    /// `ln`／`log` の定義域外（引数が 0 または負。`2201E`、SQL-65・ERR-2、Issue #1907）。
+    /// detail は PostgreSQL と同じ固定文言（zero／negative の 2 種）に限り、行の値・
+    /// テナント情報を含めない。
+    InvalidArgumentForLogarithm { detail: String },
     /// `DATE`／`TIMESTAMP` リテラルが文法上は解析できたが、値が受理範囲外、
     /// または暦上不正（月 13・2 月 30 日・非閏年の 2/29・時 24・分 60・秒 60・
     /// 年 0000・年 10000 以上等。TABLE-13・TASK-197、Issue #884・D-1）。
@@ -1650,6 +1654,14 @@ impl SqlSurfaceError {
         }
     }
 
+    /// `pub(crate)`: `ln`／`log` の定義域外（0・負）を報告する（Issue #1907・SQL-65）。
+    /// 呼び出し元（`sql::numeric_fn`）は固定文言のみを渡す。
+    pub(crate) fn invalid_argument_for_logarithm(detail: impl Into<String>) -> Self {
+        SqlSurfaceError::InvalidArgumentForLogarithm {
+            detail: truncate_for_error(&detail.into()),
+        }
+    }
+
     /// `pub(crate)`: `sql::parser::bind_datetime_literal`（TABLE-13・TASK-197、
     /// Issue #884）が `DATE`／`TIMESTAMP` リテラルの範囲外・暦上不正を報告する
     /// ために使う。
@@ -1794,6 +1806,9 @@ impl ClassifiedError for SqlSurfaceError {
             SqlSurfaceError::NumericOutOfRange { .. } => ErrorClass::NumericOutOfRange,
             SqlSurfaceError::DivisionByZero { .. } => ErrorClass::DivisionByZero,
             SqlSurfaceError::SubstringError { .. } => ErrorClass::SubstringError,
+            SqlSurfaceError::InvalidArgumentForLogarithm { .. } => {
+                ErrorClass::InvalidArgumentForLogarithm
+            }
             SqlSurfaceError::OperationIdContentMismatch => ErrorClass::OperationIdContentMismatch,
             SqlSurfaceError::InvalidParameterValue { .. } => ErrorClass::InvalidParameterValue,
             SqlSurfaceError::IndeterminateDatatype { .. } => ErrorClass::IndeterminateDatatype,
@@ -1967,6 +1982,8 @@ impl std::fmt::Display for SqlSurfaceError {
             }
             // 接頭辞なしで固定文言をそのまま出す（PostgreSQL と同じ文言。値は埋め込まない）。
             SqlSurfaceError::InvalidParameterValue { detail } => f.write_str(detail),
+            // PostgreSQL と同じ固定文言（コンストラクタが固定文言のみ受ける）。
+            SqlSurfaceError::InvalidArgumentForLogarithm { detail } => f.write_str(detail),
             SqlSurfaceError::NullValueNotAllowed { detail } => f.write_str(detail),
             SqlSurfaceError::InvalidObjectDefinition { detail }
             | SqlSurfaceError::GroupingError { detail }
