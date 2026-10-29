@@ -1336,6 +1336,8 @@ Issue #1405（fix(engine)!: CREATE TYPE の型名の重複を 42710 で返す。
 
 **Issue #1908（feat(engine)!: trunc を追加する。SQL-65 ポインタ。詳細は [numeric-scalar-functions.md](numeric-scalar-functions.md) の「Issue #1908 追記」節）**: `trunc(x)`／`trunc(x, n)`（負の `n` 対応）を `round` と同じ arity オーバーロード（`BuiltinFn::Trunc1`／`Trunc2`）で追加。10 進数字列で打ち切るため桁上げ・二進誤差なし。`n` の検査は `round` と同じ（`22000`／`22003`）。`trunc` は予約名。結合テストは `tests/sql_t40_up/sql65_trunc.rs`。依存・CI 変更なし。
 
+- Issue #1721（docs(design): TRIGGER の実行モデルを設計記録として追加。親 #1720・TABLE-45 ポインタ。詳細は [trigger-execution-model.md](trigger-execution-model.md)）: 発火の時点と順序・NEW／OLD・BEFORE の戻り値・`WHEN`・未結線経路ガード・RLS・再帰上限・台帳整合を決定として記録し、#1722〜#1728 への引き継ぎを列挙。設計記録のみでコードの変更なし。
+
 **Issue #1919（feat(engine): UDF カタログのスキーマと保存形式を定義する。親 #1918・SQL-66 ポインタ。詳細は [udf-catalog.md](udf-catalog.md)）**: `catalog::function` に `functions`／`function_id_counter` 表（遅延作成）、版付き定義 blob v1、crate 内部の create／get／list／drop を追加した。キーは `(scope=tenant_id, 関数名, 引数シグネチャ)` でテナント境界を構造化し、多重定義を表現する。未結線（書き込み #1920・ロード #1921）で、公開 API の変更・依存追加・`unsafe` はない。
 
 **Issue #2223（docs(design): PL/pgSQL サブセットの範囲と実行モデルを設計する。SQL-68 ポインタ。詳細は [plpgsql-subset.md](plpgsql-subset.md)）**: `LANGUAGE plpgsql` のサブセットを設計記録として確定した。受理する構文と `0A000` の拒否方針、変数を型付きトークンで置換する値の受け渡し、呼び出し元と同一 Tx・同一 RLS の書き込み経路の事前決定、`EXECUTE`、資源上限と CLI、台帳を外側の文の単位で 1 エントリにする整合、トリガ関数と `DO` の接続点を定める。ドキュメントのみで、コード・依存・CI の変更なし。実装は #2224〜#2229。
