@@ -174,6 +174,25 @@ fn unsupported_forms_are_fail_closed() {
     define(&core, &mut s, "CREATE FUNCTION f(x integer) AS x");
 }
 
+/// 引数モードは名前の前後どちらに書いても同じ `0A000`（名前の後ろを型名として解釈して `42704` に
+/// ならない）。拒否した定義はレジストリを変更しない。
+#[test]
+fn argument_mode_after_name_is_0a000_like_before_name() {
+    let (core, _g) = new_core("sql66-mode-after-name");
+    let mut s = SessionState::default();
+    for sql in [
+        "CREATE FUNCTION f(a OUT integer) AS a",
+        "CREATE FUNCTION f(a IN integer) AS a",
+        "CREATE FUNCTION f(a inout integer) AS a",
+        "CREATE FUNCTION f(a VARIADIC integer) AS a",
+        "CREATE FUNCTION f(a OUT) AS a",
+        "CREATE FUNCTION f(OUT a integer) AS a",
+    ] {
+        assert_eq!(code(&core, &mut s, sql), "0A000", "{sql}");
+    }
+    define(&core, &mut s, "CREATE FUNCTION f(a integer) AS a");
+}
+
 #[test]
 fn varchar_modifier_is_normalized_and_does_not_truncate() {
     let (core, _g) = new_core("sql66-varchar");

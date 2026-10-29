@@ -22935,6 +22935,16 @@ impl Parser<'_> {
                 "function argument modes are not supported",
             ));
         }
+        // 名前の後ろに書かれたモード（`a OUT int`）。PostgreSQL では構文エラーだが、IN／OUT／INOUT／
+        // VARIADIC は型名になり得ないため、名前の前に書いた場合と同じ `0A000` に揃える（型名として
+        // 解釈して `42704` になる位置依存の食い違いを避ける。どちらも拒否で fail-closed）。
+        if matches!(self.peek(), Some(Token::Ident(w))
+            if ["IN", "OUT", "INOUT", "VARIADIC"].iter().any(|m| w.eq_ignore_ascii_case(m)))
+        {
+            return Err(SqlSurfaceError::feature_not_supported(
+                "function argument modes are not supported",
+            ));
+        }
         // `%TYPE`（修飾名 `docs.n%TYPE` を含む）は型名解決より先に検出し、カタログも型表も
         // 参照せず `0A000` で拒否する（未知の型名として `42704` になるのを避ける）。
         // 型名は括弧内の `,` を含みうるため、括弧の深さ 0 の `,`・`)` までを走査する。
