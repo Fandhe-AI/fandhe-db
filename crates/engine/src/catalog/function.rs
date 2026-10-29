@@ -3,10 +3,10 @@
 //! `docs/design/udf-catalog.md`）。
 //!
 //! 役割: 現状セッション単位の `sql::udf_call::UdfRegistry` にしか無い関数定義を redb へ永続化する
-//! ための土台（テーブル定義・定義 blob の版付き符号化・crate 内部の保存／読み出し API）だけを担う。
-//! `CREATE FUNCTION`／`DROP FUNCTION` からの書き込み（#1920）、セッション開始時のロード（#1921）、
-//! 上限と権限の設定（#1922）は後続 Issue がここの API を呼んで結線する（それまで呼び出し元は
-//! テストのみのため mod 宣言側で `dead_code` を許可している）。
+//! ための土台（テーブル定義・定義 blob の版付き符号化・crate 内部の保存／読み出し API）を担う。
+//! `CREATE FUNCTION`／`DROP FUNCTION` からの書き込み（#1920）は `sql::udf_ddl` が呼んで結線済み。
+//! セッション開始時のロード（#1921）、上限と権限の設定（#1922）は後続 Issue が結線する（読み出し API の
+//! 一部は当面テストからのみ呼ばれるため、該当項目に個別に `dead_code` を許可している）。
 //!
 //! 既存データの不変: [`FUNCTIONS_TABLE`]／[`FUNCTION_ID_COUNTER_TABLE`] は最初の書き込みまで作らない
 //! （遅延作成。読み取りは `TableDoesNotExist` を 0 件と扱う）ため、UDF を使わない DB や本変更より
@@ -51,6 +51,13 @@ pub(crate) const MAX_FUNCTION_BODY_BYTES: usize = MAX_VIEW_BODY_BYTES;
 
 /// スコープあたりの関数定義数の既定上限（SQL-66 (5) の既定値）。
 pub(crate) const MAX_FUNCTIONS: usize = 64;
+
+/// 同名の定義が既にあるときの `Invalid` の固定文言。`sql::udf_ddl` が 42723 へ写す判定に使う
+/// （文言の比較を 1 箇所に集約する。前例: `ROW_IDENTITY_UNSUPPORTED_MESSAGE`）。
+pub(crate) const FUNCTION_ALREADY_EXISTS_MESSAGE: &str = "function already exists";
+
+/// 名前指定の削除が複数の多重定義に当たった場合の `Invalid` の固定文言（防御的。42725 へ写す）。
+pub(crate) const FUNCTION_AMBIGUOUS_MESSAGE: &str = "function name is not unique";
 
 /// 型タグ・param 文字列の最大バイト数（確保前の上限検査用）。
 const MAX_TYPE_FIELD_BYTES: usize = 128;
@@ -234,7 +241,7 @@ impl FunctionType {
     }
 
     /// 型の同一性トークン（typmod・次元・最大長を落とした形）。検証済みの値にのみ呼ぶ。
-    fn identity_token(&self) -> String {
+    pub(crate) fn identity_token(&self) -> String {
         if self.tag == "array" {
             let elem = self.param.split(',').next().unwrap_or("");
             format!("array:{elem}")
@@ -683,6 +690,58 @@ fn remove_function_in_txn(
     Ok(removed)
 }
 
+/// SCHEMA 接頭辞（`#<id>.`）配下に `scope` の関数が 1 件でもあるか（`DROP SCHEMA ... RESTRICT` の
+/// 空判定用。表が無ければ `false`）。
+pub(crate) fn functions_in_schema_exist_in_txn<R: ReadSource>(
+    src: &R,
+    scope: &str,
+    prefix: &str,
+) -> Result<bool> {
+    let table = match src.open_table(FUNCTIONS_TABLE) {
+        Ok(t) => t,
+        Err(redb::TableError::TableDoesNotExist(_)) => return Ok(false),
+        Err(e) => return Err(e.into()),
+    };
+    // 範囲の先頭 1 件だけを見る（scope が変わる・接頭辞が外れた時点で配下に無い）。
+    let first = table.range((scope, prefix, "")..)?.next().transpose()?;
+    Ok(first.is_some_and(|(k, _)| {
+        let (s, key, _) = k.value();
+        s == scope && key.starts_with(prefix)
+    }))
+}
+
+/// SCHEMA 接頭辞配下の `scope` の関数をすべて削除する（`DROP SCHEMA ... CASCADE` 用。削除は単一の
+/// [`remove_function_in_txn`] を経由する）。件数は [`MAX_FUNCTIONS`] で打ち切り、超えたら `CorruptSchema`。
+pub(crate) fn remove_functions_with_prefix_in_txn(
+    write_txn: &redb::WriteTransaction,
+    scope: &str,
+    prefix: &str,
+) -> Result<()> {
+    let mut targets: Vec<(String, String)> = Vec::new();
+    {
+        let table = match write_txn.open_table(FUNCTIONS_TABLE) {
+            Ok(t) => t,
+            Err(redb::TableError::TableDoesNotExist(_)) => return Ok(()),
+            Err(e) => return Err(e.into()),
+        };
+        for entry in table.range((scope, prefix, "")..)? {
+            let (k, _) = entry?;
+            let (s, key, sig) = k.value();
+            if s != scope || !key.starts_with(prefix) {
+                break;
+            }
+            if targets.len() >= MAX_FUNCTIONS {
+                return Err(corrupt());
+            }
+            targets.push((key.to_string(), sig.to_string()));
+        }
+    }
+    for (key, sig) in targets {
+        remove_function_in_txn(write_txn, scope, &key, &sig)?;
+    }
+    Ok(())
+}
+
 impl Storage {
     /// `scope` に関数定義を作り、払い出した内部 ID を返す。判定順は形状検証 → 同一
     /// `(関数名, 引数シグネチャ)` の既存（`Invalid`。SQLSTATE への写像は #1920 が決める）→ 件数
@@ -709,8 +768,19 @@ impl Storage {
         let write_txn = self
             .begin_write_txn()
             .map_err(super::convert_storage_error)?;
-        if get_function_in_txn(&*write_txn, scope, &stored.function_key, &signature)?.is_some() {
-            return Err(CatalogError::Invalid("function already exists".to_string()));
+        // SCHEMA 配下形のキーは、挿入と同じ write txn で当該テナントの SCHEMA の現存を確認する
+        // （名前解決後の `DROP SCHEMA` との競合で孤児定義を作らない。Issue #1920）。
+        super::namespace::ensure_tenant_key_schema_alive_in_txn(
+            &*write_txn,
+            scope,
+            &stored.function_key,
+        )?;
+        // 同じ名前の定義が 1 件でもあれば、シグネチャが違っても既存扱いにする（`UdfRegistry` は
+        // 名前単位で多重定義を持てず、書けても読めない永続状態を作らないため。設計記録 §書き込み経路）。
+        if !list_in_txn(&*write_txn, scope, Some(&stored.function_key))?.is_empty() {
+            return Err(CatalogError::Invalid(
+                FUNCTION_ALREADY_EXISTS_MESSAGE.to_string(),
+            ));
         }
         if count_functions_capped(&*write_txn, scope, max_functions)? >= max_functions {
             return Err(CatalogError::ViewLimitExceeded(
@@ -726,6 +796,7 @@ impl Storage {
 
     /// `(scope, 関数名, 引数シグネチャ)` の定義を 1 件引く（読み取り専用）。他スコープの定義は
     /// 構造上引けず、不在と同じ `None` になる。
+    #[allow(dead_code)] // #1921（セッション開始時のロード）が結線するまではテストからのみ呼ばれる。
     pub(crate) fn get_function(
         &self,
         scope: &str,
@@ -739,6 +810,7 @@ impl Storage {
     }
 
     /// `scope` の全定義を `(関数名, シグネチャ)` の昇順で返す（読み取り専用。#1921 のロード用）。
+    #[allow(dead_code)] // #1921（セッション開始時のロード）が結線するまではテストからのみ呼ばれる。
     pub(crate) fn list_functions(&self, scope: &str) -> Result<Vec<FunctionDef>> {
         validate_scope(scope)?;
         let rt = self.db().begin_read()?;
@@ -746,6 +818,7 @@ impl Storage {
     }
 
     /// `scope` の同名の多重定義を返す（読み取り専用）。
+    #[cfg(test)]
     pub(crate) fn list_overloads(
         &self,
         scope: &str,
@@ -758,6 +831,7 @@ impl Storage {
     }
 
     /// 定義を削除する。存在して削除した場合に `true`。ID カウンタは巻き戻さない。
+    #[cfg(test)]
     pub(crate) fn drop_function(
         &self,
         scope: &str,
@@ -775,6 +849,66 @@ impl Storage {
         crate::recovery::commit_boundary::commit(write_txn)
             .map_err(super::convert_storage_error)?;
         Ok(true)
+    }
+
+    /// 同名の定義がちょうど 1 件で `matcher` が真のとき、同一 write txn で削除して `true`。
+    /// 0 件・2 件以上・不一致は `false`（型付き `DROP FUNCTION` 用。列挙・照合・削除を原子的にする）。
+    pub(crate) fn drop_function_matching(
+        &self,
+        scope: &str,
+        function_key: &str,
+        matcher: impl Fn(&FunctionDef) -> Result<bool>,
+    ) -> Result<bool> {
+        validate_scope(scope)?;
+        let key = normalize_key(function_key)?;
+        let write_txn = self
+            .begin_write_txn()
+            .map_err(super::convert_storage_error)?;
+        let found = list_in_txn(&*write_txn, scope, Some(&key))?;
+        let [def] = found.as_slice() else {
+            return Ok(false);
+        };
+        if !matcher(def)? {
+            return Ok(false);
+        }
+        let sig = arg_signature(&def.params)?;
+        if !remove_function_in_txn(&write_txn, scope, &key, &sig)? {
+            return Ok(false);
+        }
+        crate::recovery::commit_boundary::commit(write_txn)
+            .map_err(super::convert_storage_error)?;
+        Ok(true)
+    }
+
+    /// 名前（引数の型の並びを省略した形）で定義を削除し、削除した定義のシグネチャを返す。0 件は
+    /// `Ok(None)`、2 件以上は `Invalid(FUNCTION_AMBIGUOUS_MESSAGE)`（作成時に同名の多重定義を拒否して
+    /// いるため通常は起きない防御）。列挙と削除は同一 write txn・1 回の commit で行う。
+    pub(crate) fn drop_function_by_name(
+        &self,
+        scope: &str,
+        function_key: &str,
+    ) -> Result<Option<String>> {
+        validate_scope(scope)?;
+        let key = normalize_key(function_key)?;
+        let write_txn = self
+            .begin_write_txn()
+            .map_err(super::convert_storage_error)?;
+        let found = list_in_txn(&*write_txn, scope, Some(&key))?;
+        let sig = match found.as_slice() {
+            [] => return Ok(None),
+            [one] => arg_signature(&one.params)?,
+            _ => {
+                return Err(CatalogError::Invalid(
+                    FUNCTION_AMBIGUOUS_MESSAGE.to_string(),
+                ));
+            }
+        };
+        if !remove_function_in_txn(&write_txn, scope, &key, &sig)? {
+            return Ok(None);
+        }
+        crate::recovery::commit_boundary::commit(write_txn)
+            .map_err(super::convert_storage_error)?;
+        Ok(Some(sig))
     }
 }
 
@@ -1210,37 +1344,147 @@ mod tests {
         assert!(s.drop_function("t", "f_edge", &key).expect("drop"));
     }
 
-    /// SQL-66 (2): 多重定義の共存と重複の拒否（typmod 違いは同一シグネチャ）。
+    /// 保存層の検査を迂回して定義を直接書く（多重定義の状態を作るテスト専用）。
+    fn insert_raw(s: &Storage, scope: &str, d: &FunctionDef) {
+        let w = s.begin_write_txn().expect("w");
+        let mut stored = d.clone();
+        stored.id = allocate_function_id_in_txn(&w).expect("id");
+        let sig = arg_signature(&stored.params).expect("sig");
+        insert_function_in_txn(&w, scope, &stored, &sig).expect("insert");
+        crate::recovery::commit_boundary::commit(w).expect("commit");
+    }
+
+    /// SQL-66 (2)・#1920: 同じ名前の定義があればシグネチャが違っても既存扱いで拒否する
+    /// （名前単位の多重定義は `UdfRegistry` が持てないため）。typmod 違いも同様。
     #[test]
-    fn overloads_coexist_and_duplicates_are_rejected() {
+    fn same_name_is_rejected_regardless_of_signature() {
         let (s, _g) = tmp_storage("fn-overload");
         s.create_function("t", &def("f", vec![param(None, ty(&ColumnType::Integer))]))
             .expect("int");
-        s.create_function("t", &def("f", vec![param(None, ty(&ColumnType::Text))]))
-            .expect("text");
+        for p in [
+            param(None, ty(&ColumnType::Text)),
+            param(None, ty(&ColumnType::Integer)),
+        ] {
+            let err = s
+                .create_function("t", &def("F", vec![p]))
+                .expect_err("same name");
+            assert!(
+                matches!(&err, CatalogError::Invalid(m) if m == FUNCTION_ALREADY_EXISTS_MESSAGE)
+            );
+        }
         s.create_function("t", &def("g", vec![])).expect("g");
-        let o = s.list_overloads("t", "f").expect("overloads");
-        assert_eq!(o.len(), 2);
-        assert!(o.iter().all(|d| d.function_key == "f"));
-        assert_eq!(s.list_functions("t").expect("all").len(), 3);
-        assert!(matches!(
-            s.create_function("t", &def("F", vec![param(None, ty(&ColumnType::Integer))])),
-            Err(CatalogError::Invalid(_))
-        ));
-        s.create_function(
-            "t",
-            &def("v", vec![param(None, ty(&ColumnType::Varchar(Some(10))))]),
-        )
-        .expect("v10");
-        assert!(s
-            .create_function(
-                "t",
-                &def("v", vec![param(None, ty(&ColumnType::Varchar(Some(20))))])
-            )
-            .is_err());
+        assert_eq!(s.list_overloads("t", "f").expect("ov").len(), 1);
+        assert_eq!(s.list_functions("t").expect("all").len(), 2);
         assert!(s.drop_function("t", "f", "integer").expect("drop"));
         assert!(!s.drop_function("t", "f", "integer").expect("again"));
-        assert_eq!(s.list_overloads("t", "f").expect("left").len(), 1);
+        s.create_function("t", &def("f", vec![param(None, ty(&ColumnType::Text))]))
+            .expect("name is free after drop");
+    }
+
+    /// #1920: 型付き削除は照合と削除が同一 txn。不一致・0 件・多重定義は削除しない。
+    #[test]
+    fn drop_matching_only_when_single_and_matcher_true() {
+        let (s, _g) = tmp_storage("fn-dropmatch");
+        assert!(!s
+            .drop_function_matching("t", "f", |_| Ok(true))
+            .expect("zero"));
+        s.create_function("t", &def("f", vec![param(None, ty(&ColumnType::Integer))]))
+            .expect("f");
+        assert!(!s
+            .drop_function_matching("t", "f", |_| Ok(false))
+            .expect("no match"));
+        assert_eq!(s.list_overloads("t", "f").expect("ov").len(), 1);
+        assert!(s
+            .drop_function_matching("t", "f", |_| Ok(true))
+            .expect("drop"));
+        assert!(s.list_overloads("t", "f").expect("ov").is_empty());
+    }
+
+    /// #1920: 名前での削除。0 件は `None`・1 件は削除・2 件（直接作った防御的な状態）は拒否。
+    #[test]
+    fn drop_by_name_handles_zero_one_and_many() {
+        let (s, _g) = tmp_storage("fn-dropname");
+        assert_eq!(s.drop_function_by_name("t", "nope").expect("zero"), None);
+        s.create_function("t", &def("f", vec![param(None, ty(&ColumnType::Integer))]))
+            .expect("f");
+        assert_eq!(
+            s.drop_function_by_name("t", "F").expect("one"),
+            Some("integer".to_string())
+        );
+        assert!(s.list_functions("t").expect("list").is_empty());
+        insert_raw(
+            &s,
+            "t",
+            &def("g", vec![param(None, ty(&ColumnType::Integer))]),
+        );
+        insert_raw(&s, "t", &def("g", vec![param(None, ty(&ColumnType::Text))]));
+        let err = s.drop_function_by_name("t", "g").expect_err("many");
+        assert!(matches!(&err, CatalogError::Invalid(m) if m == FUNCTION_AMBIGUOUS_MESSAGE));
+        assert_eq!(s.list_overloads("t", "g").expect("ov").len(), 2);
+        assert_eq!(
+            s.drop_function_by_name("u", "g").expect("other tenant"),
+            None
+        );
+    }
+
+    /// #1920: 削除は再オープン後も保たれ、ID は再利用されない。
+    #[test]
+    fn create_and_drop_persist_across_reopen() {
+        let (path, _g) = tmp_path("fn-reopen-drop");
+        let first;
+        {
+            let s = Storage::open(&path).expect("open");
+            first = s.create_function("t", &def("f", vec![])).expect("f");
+            s.create_function("t", &def("g", vec![])).expect("g");
+            assert!(s.drop_function("t", "f", "").expect("drop"));
+        }
+        let s = Storage::open(&path).expect("reopen");
+        assert!(s.get_function("t", "f", "").expect("get").is_none());
+        assert!(s.get_function("t", "g", "").expect("get").is_some());
+        let again = s.create_function("t", &def("f", vec![])).expect("again");
+        assert!(again > first);
+    }
+
+    /// #1920: SCHEMA 接頭辞の存在判定と一括削除は自テナント・自接頭辞に限る。
+    #[test]
+    fn schema_prefix_helpers_are_scoped() {
+        let (s, _g) = tmp_storage("fn-prefix");
+        // 関数は生存する SCHEMA 配下にしか作れない（Issue #1920）ため実 SCHEMA を作る。
+        s.create_schema("t", "a", false).expect("a");
+        s.create_schema("t", "b", false).expect("b");
+        s.create_schema("u", "a", false).expect("u a");
+        let id = |t: &str, n: &str| s.schema_id(t, n).expect("id").expect("exists");
+        let (ta, tb, ua) = (id("t", "a"), id("t", "b"), id("u", "a"));
+        let key = |i: u64| format!("#{i}.f");
+        let prefix = |i: u64| format!("#{i}.");
+        s.create_function("t", &def(&key(ta), vec![]))
+            .expect("in schema");
+        s.create_function("t", &def(&key(tb), vec![]))
+            .expect("other schema");
+        s.create_function("t", &def("plain", vec![]))
+            .expect("public");
+        s.create_function("u", &def(&key(ua), vec![]))
+            .expect("other tenant");
+        {
+            let rt = s.db().begin_read().expect("read");
+            assert!(functions_in_schema_exist_in_txn(&rt, "t", &prefix(ta)).expect("exist"));
+            assert!(!functions_in_schema_exist_in_txn(&rt, "t", "#999.").expect("none"));
+            assert!(!functions_in_schema_exist_in_txn(&rt, "v", &prefix(ta)).expect("tenant"));
+        }
+        let w = s.begin_write_txn().expect("w");
+        remove_functions_with_prefix_in_txn(&w, "t", &prefix(ta)).expect("remove");
+        crate::recovery::commit_boundary::commit(w).expect("commit");
+        let mut keys: Vec<String> = s
+            .list_functions("t")
+            .expect("list")
+            .into_iter()
+            .map(|d| d.function_key)
+            .collect();
+        keys.sort();
+        let mut want = vec![key(tb), "plain".to_string()];
+        want.sort();
+        assert_eq!(keys, want);
+        assert_eq!(s.list_functions("u").expect("u").len(), 1);
     }
 
     /// RLS-12（P0）: 他テナントの定義は不可視で、同名の独立作成も互いに干渉しない。
@@ -1360,5 +1604,35 @@ mod tests {
         };
         assert!(bad.to_column_type().is_err());
         assert!(arg_signature(&[param(None, Some(bad))]).is_err());
+    }
+
+    /// 削除済み SCHEMA・他テナントの SCHEMA の ID 配下には関数を作れず、生存する自テナントの
+    /// SCHEMA 配下には作れる（名前解決後の `DROP SCHEMA` との競合・準備済み CREATE の再実行。Issue #1920）。
+    #[test]
+    fn create_function_requires_live_tenant_schema() {
+        use crate::catalog::namespace::RelationKey;
+        let (s, _g) = tmp_storage("fn-schema-alive");
+        s.create_schema("alice", "a", false).expect("schema");
+        let id = s.schema_id("alice", "a").expect("id").expect("exists");
+        let key = RelationKey::InSchema {
+            schema_id: id,
+            name: "f".to_string(),
+        }
+        .encode();
+        // 他テナントからは拒否（存在情報を区別しない）。
+        assert!(matches!(
+            s.create_function("bob", &def(&key, vec![])),
+            Err(CatalogError::TableNotFound(_))
+        ));
+        s.create_function("alice", &def(&key, vec![]))
+            .expect("live schema accepts");
+        s.drop_function_by_name("alice", &key).expect("drop fn");
+        s.drop_schema("alice", "a", false).expect("drop schema");
+        // DROP SCHEMA 後の CREATE（競合・準備済み文の再実行）は拒否され、何も残らない。
+        assert!(matches!(
+            s.create_function("alice", &def(&key, vec![])),
+            Err(CatalogError::TableNotFound(_))
+        ));
+        assert!(s.list_functions("alice").expect("list").is_empty());
     }
 }

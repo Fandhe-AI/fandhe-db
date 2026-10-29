@@ -1122,7 +1122,7 @@ fn udfs_in_schema_are_registered_under_the_schema() {
         code(&core, &mut s, "SELECT nope.dbl(n) AS d FROM t LIMIT 1"),
         "42601"
     );
-    ok(&core, &mut s, "DROP SCHEMA s");
+    ok(&core, &mut s, "DROP SCHEMA s CASCADE");
     assert_eq!(
         code(&core, &mut s, "SELECT s.dbl(n) AS d FROM t LIMIT 1"),
         "42601"

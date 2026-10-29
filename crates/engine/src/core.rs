@@ -1849,6 +1849,10 @@ pub enum ParsedSql {
     CreateSequence(crate::sql::allowlist::ValidatedCreateSequence),
     /// `DROP SEQUENCE`（TABLE-24、Issue #1688）。
     DropSequence(crate::sql::allowlist::ValidatedDropSequence),
+    /// `DROP FUNCTION <name> [(<型>, ...)]`（SQL-66・TASK-309、Issue #1920）。
+    ///
+    /// **BREAKING CHANGE**（Issue #1920）: `ParsedSql` への variant 追加。
+    DropFunction(crate::sql::allowlist::ValidatedDropFunction),
     /// `CREATE SCHEMA [IF NOT EXISTS] <name>`（TABLE-27、Issue #1713）。
     ///
     /// **BREAKING CHANGE**（Issue #1713）: `ParsedSql` への variant 追加。
@@ -1971,6 +1975,7 @@ fn statement_clock_scope(
         | ParsedSql::DropType(_)
         | ParsedSql::CreateSequence(_)
         | ParsedSql::DropSequence(_)
+        | ParsedSql::DropFunction(_)
         | ParsedSql::CreateSchema(_)
         | ParsedSql::DropSchema(_)
         | ParsedSql::AlterSchema(_)
@@ -2036,6 +2041,7 @@ fn insert_sequence_scope(
         | ParsedSql::DropType(_)
         | ParsedSql::CreateSequence(_)
         | ParsedSql::DropSequence(_)
+        | ParsedSql::DropFunction(_)
         | ParsedSql::CreateSchema(_)
         | ParsedSql::DropSchema(_)
         | ParsedSql::AlterSchema(_)
@@ -2099,6 +2105,7 @@ fn insert_default_clock_scope(
         | ParsedSql::DropType(_)
         | ParsedSql::CreateSequence(_)
         | ParsedSql::DropSequence(_)
+        | ParsedSql::DropFunction(_)
         | ParsedSql::CreateSchema(_)
         | ParsedSql::DropSchema(_)
         | ParsedSql::AlterSchema(_)
@@ -4071,6 +4078,7 @@ impl EngineCore {
                     | crate::sql::SqlOutcome::DropType(_)
                     | crate::sql::SqlOutcome::CreateSequence(_)
                     | crate::sql::SqlOutcome::DropSequence(_)
+                    | crate::sql::SqlOutcome::DropFunction(_)
                     | crate::sql::SqlOutcome::CreateSchema(_)
                     | crate::sql::SqlOutcome::DropSchema(_)
                     | crate::sql::SqlOutcome::AlterSchema(_)
@@ -4126,6 +4134,7 @@ impl EngineCore {
                     | crate::sql::SqlOutcome::DropType(_)
                     | crate::sql::SqlOutcome::CreateSequence(_)
                     | crate::sql::SqlOutcome::DropSequence(_)
+                    | crate::sql::SqlOutcome::DropFunction(_)
                     | crate::sql::SqlOutcome::CreateSchema(_)
                     | crate::sql::SqlOutcome::DropSchema(_)
                     | crate::sql::SqlOutcome::AlterSchema(_)
@@ -4178,6 +4187,7 @@ impl EngineCore {
                     | crate::sql::SqlOutcome::DropType(_)
                     | crate::sql::SqlOutcome::CreateSequence(_)
                     | crate::sql::SqlOutcome::DropSequence(_)
+                    | crate::sql::SqlOutcome::DropFunction(_)
                     | crate::sql::SqlOutcome::CreateSchema(_)
                     | crate::sql::SqlOutcome::DropSchema(_)
                     | crate::sql::SqlOutcome::AlterSchema(_)
@@ -4237,6 +4247,7 @@ impl EngineCore {
                     | crate::sql::SqlOutcome::DropType(_)
                     | crate::sql::SqlOutcome::CreateSequence(_)
                     | crate::sql::SqlOutcome::DropSequence(_)
+                    | crate::sql::SqlOutcome::DropFunction(_)
                     | crate::sql::SqlOutcome::CreateSchema(_)
                     | crate::sql::SqlOutcome::DropSchema(_)
                     | crate::sql::SqlOutcome::AlterSchema(_)
@@ -4309,6 +4320,7 @@ impl EngineCore {
                     | crate::sql::SqlOutcome::DropType(_)
                     | crate::sql::SqlOutcome::CreateSequence(_)
                     | crate::sql::SqlOutcome::DropSequence(_)
+                    | crate::sql::SqlOutcome::DropFunction(_)
                     | crate::sql::SqlOutcome::CreateSchema(_)
                     | crate::sql::SqlOutcome::DropSchema(_)
                     | crate::sql::SqlOutcome::AlterSchema(_)
@@ -5400,6 +5412,11 @@ impl EngineCore {
         if crate::sql::allowlist::is_alter_schema_statement(&tokens) {
             let stmt = crate::sql::allowlist::validate_alter_schema_tokens(&tokens)?;
             return Ok(ParsedSql::AlterSchema(stmt));
+        }
+        // Issue #1920: `DROP FUNCTION` も汎用 `DROP` より前に分岐する（カタログ照会なし）。
+        if crate::sql::allowlist::is_drop_function_statement(&tokens) {
+            let stmt = crate::sql::allowlist::validate_drop_function_tokens(&tokens)?;
+            return Ok(ParsedSql::DropFunction(stmt));
         }
         if crate::sql::allowlist::is_drop_sequence_statement(&tokens) {
             let stmt = crate::sql::allowlist::validate_drop_sequence_tokens(&tokens)?;
@@ -6985,6 +7002,17 @@ impl EngineCore {
                 let outcome = crate::sql::ddl::execute_drop_sequence(&self.storage, stmt)?;
                 Ok(crate::sql::SqlOutcome::DropSequence(outcome))
             }
+            // SQL-66（Issue #1920）: 権限ゲートは置かない（権限の無いセッションはセッション内の定義だけを
+            // 消せる。CREATE FUNCTION と対称。42501 化は #1922）。カタログは DDL 権限ありのときだけ触る。
+            ParsedSql::DropFunction(stmt) => {
+                let outcome = crate::sql::udf_ddl::execute_drop_function(
+                    &self.storage,
+                    ctx.tenant_id(),
+                    session,
+                    stmt,
+                )?;
+                Ok(crate::sql::SqlOutcome::DropFunction(outcome))
+            }
             // TABLE-27（Issue #1713）: DDL 実行権限ゲート → 実行本体。SCHEMA はテナント単位のカタログ
             // のため `ctx.tenant_id()` を渡す（SEQUENCE との違い）。権限の無い主体には対象の有無を
             // 問わず常に `42501`。
@@ -7467,9 +7495,35 @@ impl EngineCore {
                 | Statement::SetTimeZone { .. }
                 | Statement::ShowTimeZone
                 | Statement::SetSearchPath { .. }
-                | Statement::ShowSearchPath
-                | Statement::CreateFunction { .. }),
+                | Statement::ShowSearchPath),
             ) => self.execute_validated_in_session(ctx, session, stmt.clone()),
+            // SQL-66（Issue #1920）: DDL 権限のあるセッションの `CREATE FUNCTION` は UDF カタログへ書く
+            // 永続 DDL のため、ROLLBACK で取り消せない書き込みを明示トランザクションの中で行わない
+            // （他の DDL と同じ `0A000`）。権限の無いセッションはセッション内だけの登録で、ROLLBACK で
+            // `session_at_begin` へ戻るため従来どおり通す。
+            ParsedSql::Statement(stmt @ Statement::CreateFunction { .. }) => {
+                if session.ddl_allowed() {
+                    Err(SqlSurfaceError::feature_not_supported(
+                        "CREATE FUNCTION is not supported inside a transaction block",
+                    ))
+                } else {
+                    self.execute_validated_in_session(ctx, session, stmt.clone())
+                }
+            }
+            ParsedSql::DropFunction(_) if session.ddl_allowed() => {
+                Err(SqlSurfaceError::feature_not_supported(
+                    "DROP FUNCTION is not supported inside a transaction block",
+                ))
+            }
+            ParsedSql::DropFunction(stmt) => {
+                let outcome = crate::sql::udf_ddl::execute_drop_function(
+                    &self.storage,
+                    ctx.tenant_id(),
+                    session,
+                    stmt,
+                )?;
+                Ok(crate::sql::SqlOutcome::DropFunction(outcome))
+            }
             // 検索・集計・広域取得・`EXPLAIN`・JOIN・評価後射影形ビュー・集合演算はすべて
             // 同じ読み取り経路へ入る（Issue #1179・#1192・#1353）。dirty テーブルの有無・
             // `USING PLAN`／`EXPLAIN` の読み取り源の切り替えは `read_only_in_active_txn`
@@ -8448,6 +8502,7 @@ impl EngineCore {
             // Issue #1688: SEQUENCE DDL も結果列を持たない。
             ParsedSql::CreateSequence(_) => Ok(None),
             ParsedSql::DropSequence(_) => Ok(None),
+            ParsedSql::DropFunction(_) => Ok(None),
             ParsedSql::CreateSchema(_) => Ok(None),
             ParsedSql::DropSchema(_) => Ok(None),
             ParsedSql::AlterSchema(_) => Ok(None),
@@ -8851,8 +8906,34 @@ impl EngineCore {
             // `sql::udf_call::define_function` に委譲する（検証→登録の順を守り、
             // 失敗時は `session.udfs()` を一切変更しない。`SET search_mode` と同じ
             // 「部分更新＝黙った既定化を防ぐ」方針）。
-            crate::sql::allowlist::Statement::CreateFunction { name, params, body } => {
-                crate::sql::udf_call::define_function(session.udfs_mut(), &name, &params, &body)?;
+            //
+            // Issue #1920（SQL-66）: DDL 実行権限のあるセッションでは、検証 → UDF カタログへの書き込み
+            // （単一 write txn・1 回の commit）→ レジストリへの登録の順で永続化する。権限の無いセッションは
+            // 従来どおりセッション内だけに登録し、カタログには触れない（42501 ゲートは #1922）。
+            crate::sql::allowlist::Statement::CreateFunction {
+                name,
+                params,
+                body,
+                body_source,
+            } => {
+                if session.ddl_allowed() {
+                    crate::sql::udf_ddl::execute_create_function_persistent(
+                        &self.storage,
+                        ctx.tenant_id(),
+                        session,
+                        &name,
+                        &params,
+                        &body,
+                        &body_source,
+                    )?;
+                } else {
+                    crate::sql::udf_call::define_function(
+                        session.udfs_mut(),
+                        &name,
+                        &params,
+                        &body,
+                    )?;
+                }
                 Ok(crate::sql::SqlOutcome::CreateFunction { name })
             }
             crate::sql::allowlist::Statement::Select(validated) => {
