@@ -328,10 +328,6 @@ fn having_without_group_by_classifies_ungrouped_columns() {
             "42601",
         ),
         (
-            "SELECT count(*) OVER () FROM docs HAVING count(*) > 1",
-            "42601",
-        ),
-        (
             "SELECT count(*) FROM docs HAVING count(*) > 1 OR count(*) < 0",
             "42601",
         ),

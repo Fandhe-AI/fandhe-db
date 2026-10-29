@@ -198,19 +198,47 @@ fn window_filter_on_non_aggregate_is_rejected_over_wire() {
     read_ready_for_query(&mut stream);
 }
 
-/// `GROUP BY` とウィンドウ項目の併用は `42601` の `ErrorResponse` になる。
+/// Issue #1898（SQL-64）: `GROUP BY` とウィンドウ項目の併用は集計後の結果行に窓をかけて返る。
+/// RowDescription は書いたとおりの列（隠しキーを含まない 3 列）、DataRow は `lang` 昇順。
 #[test]
-fn window_combined_with_group_by_is_rejected_over_wire() {
+fn window_over_grouped_rows_returns_group_level_rows_over_wire() {
     let (core, _guard) = new_core_window_docs();
     let (mut stream, _users_path) = spawn_with_alice(core);
 
     send_simple_query(
         &mut stream,
-        "SELECT lang, COUNT(*) OVER () FROM docs GROUP BY lang",
+        "SELECT lang, COUNT(*), rank() OVER (ORDER BY lang) AS r FROM docs \
+         GROUP BY lang ORDER BY lang",
     );
-    expect_error_response_with_sqlstate(&mut stream, "42601");
+    let columns = read_row_description(&mut stream);
+    assert_eq!(columns, vec!["lang", "count", "r"]);
+
+    let mut rows: Vec<Vec<Option<String>>> = Vec::new();
+    for _ in 0..2 {
+        rows.push(read_data_row(&mut stream));
+    }
+    // en は 1 行、ja は 2 行。窓の順位はグループ（結果行）に対して付く。
+    let text =
+        |v: &[&str]| -> Vec<Option<String>> { v.iter().map(|s| Some((*s).to_string())).collect() };
+    assert_eq!(rows, vec![text(&["en", "1", "1"]), text(&["ja", "2", "2"])]);
+    assert_eq!(read_command_complete(&mut stream), "SELECT 2");
     read_ready_for_query(&mut stream);
 }
+
+/// 窓の `ORDER BY` が集計式を参照する形は未対応（Issue #1899）で `0A000` の `ErrorResponse`。
+#[test]
+fn window_over_grouped_rows_with_aggregate_in_window_is_rejected_over_wire() {
+    let (core, _guard) = new_core_window_docs();
+    let (mut stream, _users_path) = spawn_with_alice(core);
+
+    send_simple_query(
+        &mut stream,
+        "SELECT lang, rank() OVER (ORDER BY sum(score)) FROM docs GROUP BY lang",
+    );
+    expect_error_response_with_sqlstate(&mut stream, "0A000");
+    read_ready_for_query(&mut stream);
+}
+
 /// Issue #1189: 文全体のスカラー `ORDER BY` とウィンドウ関数の併用が wire 越しに
 /// 行順（`score` 降順）とウィンドウ値の対応を保って返る。
 #[test]

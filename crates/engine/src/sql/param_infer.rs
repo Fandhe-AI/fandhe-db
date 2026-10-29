@@ -161,7 +161,7 @@ fn is_comparison(op: BinOp) -> bool {
 fn builtin_arg_is_text(name: &str, index: usize) -> bool {
     match name.to_ascii_lowercase().as_str() {
         "lower" | "upper" | "length" | "trim" => index == 0,
-        "substr" => index == 0,
+        "substr" | "substring" => index == 0,
         // Issue #1904・SQL-65: lpad／rpad は s と fill が text、split_part は s と delim が text。
         "lpad" | "rpad" => index == 0 || index == 2,
         "split_part" => index <= 1,
@@ -177,8 +177,8 @@ fn builtin_arg_is_text(name: &str, index: usize) -> bool {
 /// 組み込み関数の戻り値の型（`$n` の相手として使うときの近似）。
 fn builtin_return_type(name: &str) -> Ty {
     match name.to_ascii_lowercase().as_str() {
-        "lower" | "upper" | "trim" | "replace" | "concat" | "substr" | "lpad" | "rpad"
-        | "split_part" => Ty::Known(PreparedParamType::Text),
+        "lower" | "upper" | "trim" | "replace" | "concat" | "substr" | "substring" | "lpad"
+        | "rpad" | "split_part" => Ty::Known(PreparedParamType::Text),
         "length" | "position" => Ty::Known(scalar("?column?", ColumnType::Integer)),
         // 配列関数（Issue #1604）。配列を返すものは `$n` の型付け対象外（Double と誤推論しない）。
         "array_length" | "cardinality" | "array_position" => {
@@ -232,6 +232,7 @@ fn operator_kind(other: &Expr) -> Option<ParamContextKind> {
                     | "lpad"
                     | "rpad"
                     | "split_part"
+                    | "substring"
                     | "length"
                     | "position"
             ),

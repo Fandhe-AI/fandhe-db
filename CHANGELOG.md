@@ -11,6 +11,7 @@
 
 - 文字列関数 `lpad`／`rpad`／`split_part` を追加した（Issue #1904・SQL-65）。いずれも strict で、長さ・位置は文字単位。`lpad`／`rpad` は第 3 引数の省略時に半角空白で埋め、`split_part` は負の位置を末尾から数え、位置 0 は `22023`。結果長が上限（4 MiB）を超えると `54000`。
   挙動変更: 3 名は組み込みの予約名になり、同名の `CREATE FUNCTION` は `42723` で拒否される。
+- `substring(s FROM n [FOR m])`／`substring(s FOR m [FROM n])` とカンマ形 `substring(s, n[, m])` を受理する（Issue #1903・SQL-65）。意味は `substr` と同じ文字単位の窓計算で、`substring` は組み込み関数名として予約される。正規表現形（第 2 引数が文字列・`SIMILAR ... ESCAPE`）は SQL-55 の管轄のため `0A000`。`position(needle IN haystack)` は Issue #919 の実装を SQL-65 の回帰テストで固定した。公開 API の変更はない（非 BREAKING）。
 - 派生表を JOIN／カンマ区切りの入力にでき、本文に派生表を入れ子にできるようにした（Issue #1867・SQL-62）。派生表と実表・派生表どうしの JOIN は合成 CTE を `WITH`＋JOIN 経路の slot として評価し、内側は参照者の可視行だけを読む。入れ子の深さはサブクエリ深さ上限（既定 4）を超えると `54000`。
   挙動変更: 従来 `0A000`／`42601` だった JOIN 入力・複数件・入れ子の派生表が実行される。別名なしの派生表の JOIN 入力・集計本文の JOIN 入力は `0A000`、`EXPLAIN` は `42601` のまま。公開 API の変更はない（非 BREAKING）。詳細は [cte.md](docs/design/cte.md) の「Issue #1867 追記」節。
 - FROM 直後の派生表 `(SELECT ...) [[AS] 別名 [(列名, ...)]]` を実行できるようにした（Issue #1866・SQL-62）。合成 CTE として既存の単一表 `WITH` 経路でインライン展開または具体化して評価し、外側の `WHERE`・投影・`ORDER BY` が派生列を参照でき、内側は参照者の可視行だけを読む。
@@ -186,6 +187,8 @@
 
 - `sql::udf_call::BuiltinFn`（Issue #1904・SQL-65）: variant を追加した（`Lpad2`／`Lpad3`／`Rpad2`／`Rpad3`／`SplitPart`）。
   網羅 `match` する外部コードは腕を足す。
+- `substring`／`substr` の負の長さを `22011`（substring_error）で拒否する（Issue #1903・SQL-65）。従来は `22000`。公開型の変更として
+  `SqlSurfaceError::SubstringError`・`ErrorClass::SubstringError`・`ArenaError::SubstringError` を追加した（HTTP 射影は 400）。
 - jsonpath の `like_regex` 配線（Issue #2677）に伴う公開型の変更。`PathNode::LikeRegex` に `matcher: LikeRegexMatcher` を追加、
   `JsonPathParseError` に `Regex(RegexError)`・`TooManyRegex`、`JsonPathEvalError` に `RegexInputTooLong` を追加し、
   `RegexNotSupported` は `x` フラグ専用になった。従来 `like_regex` を一律 `0A000` で拒否していた挙動が変わる。

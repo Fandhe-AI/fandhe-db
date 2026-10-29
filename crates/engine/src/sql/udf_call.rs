@@ -2003,7 +2003,15 @@ fn is_variadic_or_overloaded_builtin_name(name: &str) -> bool {
         // `date_part`／`date_trunc`（対象ビヘイビア: SQL-26。Issue #920）は
         // field／unit の解決結果を `BuiltinFn` のペイロードとして持つため、
         // 名前だけでは variant が一意に定まらない（`round` と同じ理由。§2-4）。
-        "substr" | "concat" | "round" | "date_part" | "date_trunc" | "timezone" | "lpad" | "rpad"
+        "substr"
+            | "substring"
+            | "concat"
+            | "round"
+            | "date_part"
+            | "date_trunc"
+            | "timezone"
+            | "lpad"
+            | "rpad"
     )
 }
 
@@ -2609,6 +2617,7 @@ fn validate_closed_expr(
                     ));
                 }
             } else if name.eq_ignore_ascii_case("substr")
+                || name.eq_ignore_ascii_case("substring")
                 || name.eq_ignore_ascii_case("lpad")
                 || name.eq_ignore_ascii_case("rpad")
             {
@@ -7117,7 +7126,7 @@ fn bind_call(
             detail: "set-returning functions are not supported".to_string(),
         });
     }
-    if lower_name == "substr" {
+    if lower_name == "substr" || lower_name == "substring" {
         return bind_substr(name, args, env, node_budget);
     }
     if lower_name == "lpad" || lower_name == "rpad" {
@@ -7896,6 +7905,13 @@ fn bind_substr(
     let mut bound_args = Vec::with_capacity(args.len());
     for (a, expected) in args.iter().zip(param_types.iter()) {
         let (b, ty) = bind_expr_in(a, env, node_budget)?;
+        // Issue #1903・SQL-65: `substring(s, 'pattern')` のように第 2 引数が文字列の形は
+        // 正規表現形（SQL-55 管轄）。型不一致（`42804`）へ落とさず `0A000` で拒否する。
+        if name.eq_ignore_ascii_case("substring") && bound_args.len() == 1 && ty == ExprType::Text {
+            return Err(SqlSurfaceError::FeatureNotSupported {
+                detail: "regular expression form of substring is not supported".to_string(),
+            });
+        }
         if ty != *expected {
             return Err(SqlSurfaceError::datatype_mismatch(format!(
                 "function {name} argument type mismatch"
@@ -7950,11 +7966,12 @@ fn bind_strict_text_fn(
     node_budget: &mut usize,
 ) -> Result<(BoundExpr, ExprType), SqlSurfaceError> {
     let mut bound_args = Vec::with_capacity(args.len());
-    let mut any_null = false;
     for (a, expected) in args.iter().zip(param_types.iter()) {
         let (b, ty) = bind_null_aware(a, env, node_budget)?;
         match ty {
-            None => any_null = true,
+            // NULL リテラルは束縛時に呼び出し全体を NULL へ畳まず、評価時の strict な NULL 伝播に
+            // 委ねる（兄弟引数の評価時エラー、例えば 1/0 を握りつぶさないため）。
+            None => {}
             Some(t) if t != *expected => {
                 return Err(SqlSurfaceError::datatype_mismatch(format!(
                     "function {name} argument type mismatch"
@@ -7963,9 +7980,6 @@ fn bind_strict_text_fn(
             Some(_) => {}
         }
         bound_args.push(b);
-    }
-    if any_null {
-        return Ok((BoundExpr::Null, ret));
     }
     Ok((
         BoundExpr::Builtin {
