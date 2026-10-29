@@ -131,8 +131,8 @@ jsonpath 系（#2182 配下の #2183〜#2187）は、JSON 値が式評価器の�
 - 未対応のまま（fail-closed）: `UPDATE ... SET jsonb列 = <jsonb 関数>`・`INSERT ... VALUES` の
   jsonb 関数・CHECK 本体（`0A000`）、GROUP BY・DISTINCT の jsonb 結果、`$n` の jsonb 型推論、
   JOIN 経路、`VARIADIC ARRAY[...]` 形式の呼び出し。
-- 既知の差分: 引数の個数は `MAX_CALL_ARGS`（32。超過は `54000`）なので `jsonb_build_object` は
-  16 組まで（PostgreSQL は 100 個）。数値は内部が f64 のため `to_jsonb(1.0)` は `1`（末尾の 0 が
+- 既知の差分: 関数呼び出しの引数は `MAX_FUNCTION_CALL_ARGS`（100。超過は `54023`。Issue #1910・
+  SQL-65）で、`jsonb_build_object` は 50 組まで（PostgreSQL と同じ）。数値は内部が f64 のため `to_jsonb(1.0)` は `1`（末尾の 0 が
   残らない）。指数表記なしで 64 バイトを超える極端な値は指数表記で出力する。`to_jsonb(vector)` は
   `0A000`（PostgreSQL＋pgvector は文字列化する）。
 
