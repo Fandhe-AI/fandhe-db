@@ -1100,7 +1100,11 @@ fn advance_to(chars: &mut std::iter::Peekable<std::str::CharIndices<'_>>, byte_o
 /// `'...'` 文字列リテラルを読む。`''` を単一の `'` へのエスケープとして扱う。
 /// 閉じ引用符が見つからない場合は `Err`。リテラルの内容自体の意味論的妥当性は
 /// 検証しない（本レイヤは文字列として正しく閉じているかのみを構造的に見る）。
-fn lex_string_literal(input: &str, start: usize) -> Result<(String, usize), LexError> {
+///
+/// `pub(crate)`: `plpgsql::lexer`（Issue #2224）が PL/pgSQL 本体の走査で文字列の区切りを
+/// SQL 字句解析器と一致させるために再利用する（`''` のみがエスケープで、バックスラッシュは
+/// エスケープではない。独自実装すると埋め込み SQL との境界が食い違う）。
+pub(crate) fn lex_string_literal(input: &str, start: usize) -> Result<(String, usize), LexError> {
     let bytes = input.as_bytes();
     // start は呼び出し元で確認済みの `'` の位置。
     let mut idx = start + 1;

@@ -94,6 +94,10 @@ mod dml_join_exec;
 mod dml_join_exec_tests;
 #[cfg(test)]
 mod dml_subquery_exec_tests;
+// PL/pgSQL 本体の埋め込み SQL の定義時構文検証（Issue #2224・SQL-68。`plpgsql::embedded` の検証口）。
+mod plpgsql_validate;
+#[cfg(test)]
+mod plpgsql_validate_tests;
 
 /// 検索 `k` の上限（直接 Rust API 用）。明示 `LIMIT` の既定値と同値だが、SQL／NoSQL の
 /// `LIMIT` 範囲は起動時設定（`result_limits::ResultLimits`。Issue #1555）が決め、本定数は

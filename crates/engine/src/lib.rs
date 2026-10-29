@@ -263,6 +263,13 @@ pub(crate) mod key_index;
 pub mod nesting_limits;
 pub mod numeric;
 pub mod parallel_search;
+// PL/pgSQL の構文解析器（Issue #2224・SQL-68）。結線（`LANGUAGE plpgsql` の受理・実行器）は
+// #2217／#2225 が行うため、呼び出し元は当面テストだけ（`catalog::function` と同じ扱い）。
+#[allow(dead_code)]
+pub(crate) mod plpgsql;
+// PL/pgSQL のハード上限（Issue #2224）。`PlpgsqlLimits` と CLI は #2225 が追加する。
+#[allow(dead_code)]
+pub(crate) mod plpgsql_limits;
 pub mod policy;
 pub mod precision;
 pub mod query_planner;

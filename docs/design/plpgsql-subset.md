@@ -275,3 +275,43 @@ Issue #2227 で受理する。
 | #2229 | 越境マトリクス（RLS-10 ポインタ）・上限超過の fail-closed・再送で副作用が重複しないこと・crash-test |
 | #2227 | `RAISE`・`EXCEPTION` 節（SAVEPOINT #1941 の後） |
 | #1721／#1720 | 発火規則・発火位置が D5 の不変条件を満たすこと・トリガ経由の台帳 |
+
+## Issue #2224 追記: 構文解析器の実装方針
+
+ポインタ: SQL-68。実装は `crates/engine/src/plpgsql/`（`lexer`・`ast`・`parser`・`embedded`）と
+`crates/engine/src/plpgsql_limits.rs`（ハード上限）、`core/plpgsql_validate.rs`（定義時検証）。
+
+- 方針: PL/pgSQL 独自の式パーサーは持たない。制御構造だけを再帰下降で解析し、式・埋め込み SQL は
+  括弧の深さ 0 の終端（`;`・`THEN`・`LOOP`・`..`・`BY`・`INTO`・`USING`・`WHEN` 等）で原文の範囲を
+  切り出して `sql::lexer::tokenize_with_params` に通す。本体をそのまま SQL 字句解析器へ通せない
+  （`:=`・`1..10`・`<<l>>`・`%TYPE`）ため、span 付きのスキャナを別に置く。文字列・引用識別子・
+  コメントの区切りは SQL 字句解析器の関数を共有する
+- 結線しない単体モジュール（`pub(crate)`）。`LANGUAGE plpgsql` の受理（#2217）と実行（#2225）が
+  結線するまで呼び出し元はテストだけ。公開 enum（`Statement`・`ErrorClass`・`SqlSurfaceError`）は
+  変えないため非 BREAKING。**D10 の「#2224（`Statement`）」は撤回する**（`Do` variant は #2228 で入れる）
+- 定義時のダミー検証（D3）: 変数・`$n` をダミートークン（整数・浮動小数は `0`、真偽値は `false`、
+  それ以外は `'0'`）へ置換し、`EmbeddedSqlChecker` 経由で core の許可リスト解析（`parse_tokens`）へ
+  委譲する。定義時に伝播する wire_code は `42601`／`0A000`／`54000`／`54001` だけで、未知の表・列・
+  型エラー（`42P01` 等）は呼び出し時の検証へ回す（late binding）。許可リストは比較・論理演算を
+  `WHERE` の中でしか受理しないため、条件式（`IF`・`WHILE`・検索形 `CASE`・`EXIT/CONTINUE WHEN`）は
+  `SELECT 1 WHERE <cond>`、値の式は `SELECT <expr>` の形で検証する
+- 変数参照の分類: 識別子の位置（関数名・`FROM`／`JOIN`／`INTO`／`UPDATE`／`AS` の直後・
+  `INSERT` の列リスト・`UPDATE ... SET` の代入先）の `Ident` は変数として置換しない。この分類関数
+  （`plpgsql::embedded::is_ident_position`）は #2226 の呼び出し時の値置換と共有する
+- 範囲外の追加確定: `FOR ... IN EXECUTE`・`RETURN QUERY EXECUTE`・カーソル `FOR` は `0A000`。
+  本体内の `USING OPERATION_ID`・深さ 0 の `PARTITIONED` は `0A000`（D8）。`RAISE`・`ASSERT` は
+  `0A000` のまま（#2227 で受理）
+- 本体内のドル引用（例: `EXECUTE $q$...$q$`）は、#2216 のマージまでは SQL 字句解析器が `$` を拒否するため
+  `42601`。スキャナはドル引用 1 個を 1 トークンとして読み飛ばす（中の `;` で文を分けない）
+- 変数名・ラベルが PL/pgSQL の予約語（`BEGIN`・`END`・`IF`・`LOOP` 等）と同じ場合は `42601`
+  （PostgreSQL より厳しい。fail-closed）。識別子の比較は ASCII の大小を無視し、引用付きと引用無しの
+  同名を区別しない（既知の差）
+- `FOR rec IN <query> LOOP` の単独かつ未宣言の対象は、ループ範囲に暗黙のレコード変数として宣言する
+  （PostgreSQL と同じ）。整数 `FOR` の変数は暗黙の整数型で、ループ範囲のスコープを持つ
+- `$n` の番号が引数の個数を超える場合は `42P02`。`RETURN` の値の有無の検査は `ReturnShape` で行う
+  （`void`／集合返却で値付き `RETURN` は `42804`、集合返却以外の `RETURN NEXT`／`QUERY` は `42601`。
+  SQLSTATE は PostgreSQL 17 の挙動の記憶に基づくため、#2225 で実測照合する）
+- 上限: `plpgsql_limits.rs` のハード定数（本体長は格納上限と同値・入れ子 32・トークン数・1 文あたり
+  変数数は `sql::params::MAX_PARAMS`）。`ParseOptions::with_limits` はハード上限へ飽和し、`PlpgsqlLimits`・
+  CLI は #2225 で入れる。入れ子の深さ超過は `54001`、それ以外は `54000`
+- エラー文言は固定の英語で、本体の断片・変数名を含めない
