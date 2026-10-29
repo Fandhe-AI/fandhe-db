@@ -11505,6 +11505,11 @@ impl<'a> Parser<'a> {
             || name.eq_ignore_ascii_case("justify_hours")
             || name.eq_ignore_ascii_case("justify_days")
             || name.eq_ignore_ascii_case("justify_interval")
+            // `lpad`／`rpad`／`split_part`（Issue #1904・SQL-65）も新設の strict 関数として
+            // 裸の `NULL` を受理し、束縛段で NULL 伝播させる。
+            || name.eq_ignore_ascii_case("lpad")
+            || name.eq_ignore_ascii_case("rpad")
+            || name.eq_ignore_ascii_case("split_part")
             || self.const_expr_null_args
             || is_json_fn_call
             || is_array_fn_call
