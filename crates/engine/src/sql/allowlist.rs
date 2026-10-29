@@ -757,7 +757,9 @@ pub const MAX_AGGREGATE_ITEMS: usize = 32;
 
 /// ウィンドウ項目（SQL-30・TASK-214）の `PARTITION BY`・`ORDER BY` 句が持てる
 /// 列数の上限。SQL-25 (d) の列数上限と同じ実装既定値を流用する（無制限 `Vec`
-/// 確保を避ける方針。security.md「不安全な設計」対応）。
+/// 確保を避ける方針。security.md「不安全な設計」対応）。起動時設定
+/// （[`crate::window_limits::WindowLimits`]・Issue #1900）で下げられるが、引き上げは不可で
+/// 本定数が設定のハード上限を兼ねる。
 pub(crate) const MAX_WINDOW_KEYS: usize = 8;
 
 /// `count` 件の集計項目が [`MAX_AGGREGATE_ITEMS`] を超えないことを検証する
@@ -6100,6 +6102,9 @@ struct Parser<'a> {
     /// ハード上限と同値で、セッション SQL のパース入口だけが
     /// [`Self::with_nesting_limits`] で起動時設定値へ差し替える。
     nesting_limits: crate::nesting_limits::NestingLimits,
+    /// 窓の `PARTITION BY`／`ORDER BY` キー数の実効上限（Issue #1900）。`Parser::new` の既定は
+    /// [`MAX_WINDOW_KEYS`]。[`Self::with_nesting_limits`] が運搬値から設定する。
+    max_window_keys: usize,
     /// `CASE`／`COALESCE`／`NULLIF`（対象ビヘイビア: SQL-26。Issue #921）の現在の
     /// 入れ子段数。[`enter_case_nesting`]／[`Self::exit_case_nesting`] が
     /// 対で管理する（構文段の計測。束縛段の独立検査は `udf_call::BindEnv::
@@ -6250,6 +6255,7 @@ impl<'a> Parser<'a> {
             embedded_scalar_ok: false,
             embedded_scalars: Vec::new(),
             nesting_limits: crate::nesting_limits::NestingLimits::default(),
+            max_window_keys: MAX_WINDOW_KEYS,
             case_nesting: 0,
             allow_null_literal: false,
             const_expr_null_args: false,
@@ -6316,6 +6322,7 @@ impl<'a> Parser<'a> {
     /// （[`crate::nesting_limits::NestingLimits`]）を持つ入口だけが呼ぶ。
     fn with_nesting_limits(mut self, limits: crate::nesting_limits::NestingLimits) -> Self {
         self.nesting_limits = limits;
+        self.max_window_keys = limits.max_window_keys();
         self
     }
 
@@ -7153,7 +7160,7 @@ impl<'a> Parser<'a> {
             partition_by.push(self.expect_ident()?);
             while matches!(self.peek(), Some(Token::Punct(','))) {
                 self.advance();
-                if partition_by.len() >= MAX_WINDOW_KEYS {
+                if partition_by.len() >= self.max_window_keys {
                     return Err(SqlSurfaceError::payload_too_large(
                         "too many PARTITION BY columns",
                     ));
@@ -7166,7 +7173,7 @@ impl<'a> Parser<'a> {
             self.advance();
             self.expect_keyword(Keyword::By)?;
             loop {
-                if order_by.len() >= MAX_WINDOW_KEYS {
+                if order_by.len() >= self.max_window_keys {
                     return Err(SqlSurfaceError::payload_too_large("too many ORDER BY keys"));
                 }
                 let column = self.expect_ident()?;

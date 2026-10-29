@@ -295,6 +295,7 @@ pub mod tiering;
 pub mod txn;
 pub mod uuid;
 pub mod wasm_udf;
+pub mod window_limits;
 
 /// テスト専用の共通ヘルパ群（Issue #173）。`#[cfg(test)]` 限定・非公開のため
 /// `pub mod` を含まず `scripts/check_core_api.sh` の到達性スナップショットに影響しない。
