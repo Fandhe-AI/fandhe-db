@@ -263,6 +263,57 @@ fn starts_trailing_clause(tokens: &[Token], i: usize) -> bool {
     super::fetch_clause::follows_operand(Some(prev))
 }
 
+/// 枝の文の動詞（`SELECT`・`DELETE` 等）の位置。先頭が `WITH` なら CTE リスト
+/// （`name [(列, ...)] AS [NOT] [MATERIALIZED] ( 本体 ) [, ...]`）を読み飛ばした直後を返す。
+/// CTE 名・列名が `update` 等でも動詞と誤認しない。形が想定外なら `None`（呼び出し側は
+/// WINDOW 句を拒否する＝fail-closed）。
+fn statement_verb_position(branch: &[Token]) -> Option<usize> {
+    // 文頭の接頭（集合演算子で分けた後続の枝の `ALL`／`DISTINCT`、`EXPLAIN`・`CREATE ... AS`・
+    // `PREPARE ... AS` 等）を飛ばし、深さ 0 で最初に現れる文の開始語を動詞とする。
+    let start = depth0_positions(branch).into_iter().find(|&i| {
+        matches!(branch.get(i), Some(Token::Keyword(Keyword::Select)))
+            || ["WITH", "DELETE", "UPDATE", "INSERT"]
+                .iter()
+                .any(|w| is_ident(branch.get(i), w))
+    })?;
+    if !is_ident(branch.get(start), "WITH") {
+        return Some(start);
+    }
+    let mut p = start;
+    p += 1;
+    if is_ident(branch.get(p), "RECURSIVE") {
+        p += 1;
+    }
+    loop {
+        if !matches!(branch.get(p), Some(Token::Ident(_))) {
+            return None;
+        }
+        p += 1;
+        if matches!(branch.get(p), Some(Token::Punct('('))) {
+            p = matching_close(branch, p)? + 1;
+        }
+        if !is_ident(branch.get(p), "AS") {
+            return None;
+        }
+        p += 1;
+        if is_ident(branch.get(p), "NOT") {
+            p += 1;
+        }
+        if is_ident(branch.get(p), "MATERIALIZED") {
+            p += 1;
+        }
+        if !matches!(branch.get(p), Some(Token::Punct('('))) {
+            return None;
+        }
+        p = matching_close(branch, p)? + 1;
+        if matches!(branch.get(p), Some(Token::Punct(','))) {
+            p += 1;
+            continue;
+        }
+        return Some(p);
+    }
+}
+
 /// 括弧の外（深さ 0）にあるトークンの位置（括弧そのものを含む）。
 fn depth0_positions(tokens: &[Token]) -> Vec<usize> {
     let mut d = 0usize;
@@ -327,12 +378,7 @@ fn process_branch(branch: &[Token], budget: &mut usize) -> Result<Vec<Token>, Sq
             && is_ident(branch.get(i + 2), "AS")
     });
     if has_window_clause {
-        let verb = d0.iter().copied().find(|&i| {
-            matches!(branch.get(i), Some(Token::Keyword(Keyword::Select)))
-                || ["DELETE", "UPDATE", "INSERT"]
-                    .iter()
-                    .any(|w| is_ident(branch.get(i), w))
-        });
+        let verb = statement_verb_position(branch);
         if !matches!(
             verb.and_then(|v| branch.get(v)),
             Some(Token::Keyword(Keyword::Select))
@@ -928,5 +974,29 @@ mod tests {
             "WITH c AS (SELECT id FROM t) SELECT RANK() OVER w FROM c WINDOW w AS (ORDER BY id)"
         )
         .is_ok());
+    }
+
+    #[test]
+    fn statement_prefixes_before_select_are_accepted() {
+        for prefix in [
+            "EXPLAIN ",
+            "EXPLAIN ANALYZE ",
+            "CREATE VIEW v AS ",
+            "CREATE MATERIALIZED VIEW mv AS ",
+            "CREATE TABLE c AS ",
+            "PREPARE p AS ",
+        ] {
+            assert!(
+                run(&format!(
+                    "{prefix}SELECT id, RANK() OVER w FROM t WINDOW w AS (ORDER BY id)"
+                ))
+                .is_ok(),
+                "{prefix}"
+            );
+        }
+        assert_eq!(
+            code("EXPLAIN DELETE FROM t RETURNING id WINDOW w AS (ORDER BY id)"),
+            "42601"
+        );
     }
 }

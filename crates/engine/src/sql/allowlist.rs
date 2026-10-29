@@ -24735,11 +24735,16 @@ pub(crate) enum SessionWith {
 pub(crate) fn validate_window_spec_tokens(tokens: &[Token]) -> Result<(), SqlSurfaceError> {
     let mut p = Parser::new(tokens);
     p.expect_punct('(')?;
-    p.parse_window_spec()?;
+    let (_partition, order_by, frame) = p.parse_window_spec()?;
     if p.peek().is_some() {
         return Err(SqlSurfaceError::unsupported(
             "unexpected token after window specification",
         ));
+    }
+    // 参照されない定義でもフレームの意味検査（束縛段と同じ関数）を通す。型照合はスキーマが要るため
+    // 参照された窓の束縛段だけが行う。
+    if let Some(frame) = &frame {
+        crate::sql::parser::check_window_frame_shape(frame, order_by.len())?;
     }
     Ok(())
 }

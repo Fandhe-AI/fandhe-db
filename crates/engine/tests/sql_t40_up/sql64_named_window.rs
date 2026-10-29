@@ -453,3 +453,43 @@ fn window_clause_on_data_modifying_statements_is_rejected_without_effect() {
         ROWS.len()
     );
 }
+
+/// 参照されない定義でもフレームの意味検査（ORDER BY の無い GROUPS・RANGE オフセットのキー数・
+/// オフセット内の変数）が通り、`42P20`／`42P10` になる。
+#[test]
+fn unused_definition_frame_semantics_are_rejected() {
+    let (core, ctx, _g) = setup("nw-unused", true);
+    for (sql, code) in [
+        ("SELECT id FROM t WINDOW w AS (GROUPS CURRENT ROW) LIMIT 10", "42P20"),
+        (
+            "SELECT id FROM t WINDOW w AS (RANGE BETWEEN 1 PRECEDING AND CURRENT ROW) LIMIT 10",
+            "42P20",
+        ),
+        (
+            "SELECT id FROM t WINDOW w AS (ORDER BY s ROWS BETWEEN s PRECEDING AND CURRENT ROW) LIMIT 10",
+            "42P10",
+        ),
+    ] {
+        assert_eq!(outcome(&core, &ctx, sql), code, "{sql}");
+    }
+    assert_eq!(
+        outcome(
+            &core,
+            &ctx,
+            "SELECT id FROM t WINDOW w AS (ORDER BY s GROUPS CURRENT ROW) LIMIT 10"
+        ),
+        "OK"
+    );
+}
+
+/// 動詞と同名の CTE を持つ SELECT 主クエリの WINDOW 句は受理され、結果がインラインと一致する。
+#[test]
+fn cte_named_like_a_verb_keeps_the_window_clause_valid() {
+    let (core, ctx, _g) = setup("nw-verbcte", true);
+    assert_same(
+        &core,
+        &ctx,
+        "WITH update AS (SELECT id, s FROM t) SELECT id, rank() OVER w FROM update WINDOW w AS (ORDER BY s, id) LIMIT 100",
+        "WITH update AS (SELECT id, s FROM t) SELECT id, rank() OVER (ORDER BY s, id) FROM update LIMIT 100",
+    );
+}
