@@ -1336,6 +1336,10 @@ pub enum SqlSurfaceError {
     /// 組み込み／予約名と同名の UDF 登録・同一セッション内の再定義
     /// （ERR-6: `42723`。SQL-26、Issue #1186）。`detail` には関数名以外を含めない。
     DuplicateFunction { detail: String },
+    /// `CREATE FUNCTION ... RETURNS <型>` の本体の型が RETURNS の型へ代入変換できない
+    /// （`42P13`。SQL-66 (1)・Issue #1916）。`detail` は静的な型名だけで作り、本体の原文・
+    /// テナント・値を含めない。
+    InvalidFunctionDefinition { detail: String },
     /// 複数テーブル参照スコープ（`sql::relation::BindingScope`、SQL-28・RLS-10・
     /// Issue #924）で、非修飾列参照が 2 つ以上の参照テーブルに一致した
     /// （候補が曖昧で一意に解決できない）。ERR-6: `42702`。文言には列名のみを
@@ -1404,6 +1408,9 @@ impl SqlSurfaceError {
             Self::DatatypeMismatch { detail } => Self::DatatypeMismatch { detail: f(&detail) },
             Self::UndefinedFunction { detail } => Self::UndefinedFunction { detail: f(&detail) },
             Self::DuplicateFunction { detail } => Self::DuplicateFunction { detail: f(&detail) },
+            Self::InvalidFunctionDefinition { detail } => {
+                Self::InvalidFunctionDefinition { detail: f(&detail) }
+            }
             other => other,
         }
     }
@@ -1768,6 +1775,14 @@ impl SqlSurfaceError {
         }
     }
 
+    /// `pub(crate)`: `CREATE FUNCTION ... RETURNS` の本体型検査（`sql::udf_call`、
+    /// SQL-66 (1)・Issue #1916）が RETURNS 型への代入不能を報告する。
+    pub(crate) fn invalid_function_definition(detail: impl Into<String>) -> Self {
+        SqlSurfaceError::InvalidFunctionDefinition {
+            detail: truncate_for_error(&detail.into()),
+        }
+    }
+
     /// `pub(crate)`: `sql::relation::BindingScope::resolve`（SQL-28・RLS-10、
     /// Issue #924）が非修飾列参照の曖昧な解決を報告するために使う。列名は
     /// untrusted な字句解析結果のため他 variant と同じ切り詰め規約を経由する。
@@ -1910,6 +1925,9 @@ impl ClassifiedError for SqlSurfaceError {
             SqlSurfaceError::DatatypeMismatch { .. } => ErrorClass::DatatypeMismatch,
             SqlSurfaceError::UndefinedFunction { .. } => ErrorClass::UndefinedFunction,
             SqlSurfaceError::DuplicateFunction { .. } => ErrorClass::DuplicateFunction,
+            SqlSurfaceError::InvalidFunctionDefinition { .. } => {
+                ErrorClass::InvalidFunctionDefinition
+            }
             SqlSurfaceError::AmbiguousColumn { .. } => ErrorClass::AmbiguousColumn,
             SqlSurfaceError::JsonPathEval(e) => e.error_class(),
             SqlSurfaceError::JsonPathParse(e) => e.error_class(),
@@ -2274,6 +2292,9 @@ impl std::fmt::Display for SqlSurfaceError {
             }
             SqlSurfaceError::DuplicateFunction { detail } => {
                 write!(f, "duplicate function: {detail}")
+            }
+            SqlSurfaceError::InvalidFunctionDefinition { detail } => {
+                write!(f, "invalid function definition: {detail}")
             }
             SqlSurfaceError::AmbiguousColumn { name } => {
                 write!(f, "column reference {name:?} is ambiguous")
@@ -2963,6 +2984,9 @@ pub enum Statement {
     /// `param_types` フィールドを追加した（`<名前> <型>` の型注釈。`params` と同じ長さで、
     /// 型なしの従来形は全要素 `None`。型付きと型なしの混在は構文段で拒否済み）。
     ///
+    /// **Issue #1916 で追加した破壊的変更（BREAKING CHANGE）**: `return_type` を追加した
+    /// （`RETURNS <型>` の型。型修飾子は `param_types` と同じく正規化済み。句が無ければ `None`）。
+    ///
     /// **#1920 で追加した破壊的変更（BREAKING CHANGE）**: `body_source` を追加した。`AS` 以降の
     /// トークン列を [`lexer::render_tokens`] で描画した本体の原文（名前解決後のトークンのため SCHEMA
     /// 配下の名前は `#<id>.f` 形のまま。UDF カタログへ永続化する値で、ロード時は同じ字句解析と許可リストで
@@ -2971,6 +2995,7 @@ pub enum Statement {
         name: String,
         params: Vec<String>,
         param_types: Vec<Option<CastType>>,
+        return_type: Option<CastType>,
         body: Expr,
         body_source: String,
     },
@@ -22821,7 +22846,8 @@ fn parse_set_search_mode(tokens: &[Token]) -> Result<String, SqlSurfaceError> {
     Ok(value)
 }
 
-/// `CREATE FUNCTION <name>(<param>[, <param>...]) AS <expr> [;]`（TASK-79・SQL-9）の
+/// `CREATE FUNCTION <name>(<param>[, <param>...]) [RETURNS <型>] AS <expr> [;]`（TASK-79・SQL-9。
+/// RETURNS は SQL-66 (1)・Issue #1916）の
 /// 許可形状。`CREATE`／`FUNCTION`／`AS` は `SET`・`USING` と同方針で予約語化せず、
 /// statement 先頭・所定位置でのみ文脈的に照合する（既存の列名・テーブル名として
 /// これらの語を使う SQL を破壊しない）。パラメータ数は構造検証段階でも
@@ -22861,6 +22887,20 @@ fn parse_create_function(tokens: &[Token]) -> Result<ParsedCreateFunction, SqlSu
             "function parameters must be either all typed or all untyped",
         ));
     }
+    // `RETURNS <型>`（SQL-66 (1)・Issue #1916）。RETURNS 付きは本体の型を静的に決める必要が
+    // あるため、引数がすべて型なしの関数（引数 1 個以上）には付けられない（fail-closed）。
+    let return_type = if p.peek_ident_matches("RETURNS") {
+        p.advance();
+        let ty = p.parse_create_function_return_type()?;
+        if !param_types.is_empty() && param_types.iter().all(Option::is_none) {
+            return Err(SqlSurfaceError::feature_not_supported(
+                "RETURNS requires typed function parameters",
+            ));
+        }
+        Some(ty)
+    } else {
+        None
+    };
     p.expect_ident_matching("AS")?;
     let body_start = p.pos;
     let body = p.parse_value_expr(0)?;
@@ -22879,7 +22919,14 @@ fn parse_create_function(tokens: &[Token]) -> Result<ParsedCreateFunction, SqlSu
             "function body too large",
         ));
     }
-    Ok((name, params, param_types, body, body_source))
+    Ok(ParsedCreateFunction {
+        name,
+        params,
+        param_types,
+        return_type,
+        body,
+        body_source,
+    })
 }
 
 /// カタログに保存された UDF の本体（`render_tokens` の出力を `tokenize_rendered` で再字句解析した
@@ -22893,8 +22940,16 @@ pub(crate) fn parse_stored_function_body(tokens: &[Token]) -> Result<Expr, SqlSu
     Ok(body)
 }
 
-/// [`parse_create_function`] の戻り値（名前・パラメータ名・パラメータ型注釈・本体式）。
-type ParsedCreateFunction = (String, Vec<String>, Vec<Option<CastType>>, Expr, String);
+/// [`parse_create_function`] の戻り値（名前・パラメータ名・パラメータ型注釈・RETURNS 型・本体式・
+/// 本体の原文）。
+struct ParsedCreateFunction {
+    name: String,
+    params: Vec<String>,
+    param_types: Vec<Option<CastType>>,
+    return_type: Option<CastType>,
+    body: Expr,
+    body_source: String,
+}
 
 /// 関数シグネチャに載せる型の正規化（SQL-66 (1)・Issue #1915）。PostgreSQL は関数の引数型の
 /// 型修飾子を捨てるため `varchar(n)`・`numeric(p,s)` は修飾子なしに揃える。`char(n)` は
@@ -22915,6 +22970,24 @@ fn normalize_udf_param_type(ty: CastType) -> Result<CastType, SqlSurfaceError> {
 }
 
 impl Parser<'_> {
+    /// `RETURNS` の直後の戻り値型を読む（[`parse_create_function`] から呼ばれる。SQL-66 (1)・
+    /// Issue #1916）。`SETOF`・`TABLE (...)`・`void`／`trigger`／`record` 等の擬似型は型名解決より
+    /// 先に識別子で検出して `0A000` にする（未知の型名として `42704` になるのを避ける）。型名は
+    /// 引数と同じ規則（`cast::parse_cast_type`・修飾子の正規化）で、カタログは参照しない。
+    fn parse_create_function_return_type(&mut self) -> Result<CastType, SqlSurfaceError> {
+        if let Some(Token::Ident(w)) = self.peek() {
+            if ["SETOF", "TABLE", "VOID", "TRIGGER", "RECORD"]
+                .iter()
+                .any(|k| w.eq_ignore_ascii_case(k))
+            {
+                return Err(SqlSurfaceError::feature_not_supported(
+                    "RETURNS SETOF, TABLE and pseudo-types are not supported",
+                ));
+            }
+        }
+        normalize_udf_param_type(self.parse_cast_target_type()?)
+    }
+
     /// `CREATE FUNCTION` の引数 1 個（`<名前>` または `<名前> <型>`）を読む
     /// （[`parse_create_function`] から呼ばれる。SQL-66 (1)・TASK-309・Issue #1915）。
     /// 引数モード・`DEFAULT`・`=`・`%TYPE` は未対応のため `0A000`。型名は CAST と DDL が
@@ -25382,13 +25455,14 @@ fn validate_sql_tokens_impl(
             Ok(Statement::SetSearchMode { value })
         }
         _ if is_create_function_statement => {
-            let (name, params, param_types, body, body_source) = parse_create_function(tokens)?;
+            let parsed = parse_create_function(tokens)?;
             Ok(Statement::CreateFunction {
-                name,
-                params,
-                param_types,
-                body,
-                body_source,
+                name: parsed.name,
+                params: parsed.params,
+                param_types: parsed.param_types,
+                return_type: parsed.return_type,
+                body: parsed.body,
+                body_source: parsed.body_source,
             })
         }
         // Issue #922（SQL-27）: `EXPLAIN` の対象を通常検索・集計・広域取得へ
@@ -27898,8 +27972,8 @@ mod tests {
         for body_sql in cases {
             let create = format!("CREATE FUNCTION g(x, y) AS {body_sql}");
             let tokens = crate::sql::lexer::tokenize_rendered(&create).expect("lex create");
-            let (_, _, _, expr, body_source) =
-                parse_create_function(&tokens).expect("create parse");
+            let parsed = parse_create_function(&tokens).expect("create parse");
+            let (expr, body_source) = (parsed.body, parsed.body_source);
             let again = crate::sql::lexer::tokenize_rendered(&body_source).expect("re-lex");
             let reparsed = parse_stored_function_body(&again).expect("reparse");
             assert_eq!(reparsed, expr, "{body_sql} -> {body_source}");
@@ -35552,6 +35626,46 @@ mod tests {
 
     /// SQL-66（Issue #1920）: 保存する本体の原文は、字句解析して再パースすると元の式に戻る
     /// （ロード側が同じ許可リストで再パースできることの確認）。末尾の `;` は含めない。
+    /// SQL-66 (1)・Issue #1916: `RETURNS <型>` は型を正規化して `return_type` に載せ、
+    /// 型なし引数との併用・擬似型・未知の型は拒否する。
+    #[test]
+    fn create_function_returns_clause_is_parsed() {
+        use crate::sql::cast::CastType;
+        let lookup = catalog_with(&["documents"]);
+        let Statement::CreateFunction { return_type, .. } = validate_sql(
+            "CREATE FUNCTION f(x integer) RETURNS varchar(5) AS x",
+            &lookup,
+        )
+        .expect("valid") else {
+            panic!("expected CreateFunction");
+        };
+        assert_eq!(return_type, Some(CastType::Varchar(None)));
+        let Statement::CreateFunction { return_type, .. } =
+            validate_sql("CREATE FUNCTION f(x integer) AS x", &lookup).expect("valid")
+        else {
+            panic!("expected CreateFunction");
+        };
+        assert_eq!(return_type, None);
+        for sql in [
+            "CREATE FUNCTION f(x) RETURNS integer AS x",
+            "CREATE FUNCTION f(x integer) RETURNS SETOF integer AS x",
+            "CREATE FUNCTION f(x integer) RETURNS void AS x",
+            "CREATE FUNCTION f(x integer) RETURNS char(3) AS x",
+        ] {
+            assert_eq!(
+                validate_sql(sql, &lookup).expect_err("reject").wire_code(),
+                "0A000",
+                "{sql}"
+            );
+        }
+        assert_eq!(
+            validate_sql("CREATE FUNCTION f(x integer) RETURNS nope AS x", &lookup)
+                .expect_err("reject")
+                .wire_code(),
+            "42704"
+        );
+    }
+
     #[test]
     fn create_function_body_source_round_trips() {
         let lookup = catalog_with(&["documents"]);

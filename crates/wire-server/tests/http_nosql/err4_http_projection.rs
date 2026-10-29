@@ -305,7 +305,7 @@ fn query_as_alice(addr: SocketAddr, body: &[u8]) -> HttpResponse {
 /// `status.rs::EXPECTED`（`#[cfg(test)]` 内で外部から参照不可）と同値の
 /// 期待表。両者の乖離は [`err4_projection_table_is_closed_over_all_error_classes`]
 /// が `http_status` 経由で検出する。
-const EXPECTED_STATUS: [(&str, u16); 88] = [
+const EXPECTED_STATUS: [(&str, u16); 89] = [
     ("22000", 400),
     ("22001", 400),
     ("22012", 400),
@@ -385,6 +385,7 @@ const EXPECTED_STATUS: [(&str, u16); 88] = [
     // （Issue #1186）。いずれも 400。
     ("42883", 400),
     ("42723", 400),
+    ("42P13", 400),
     // `IndeterminateDatatype`（`42P18`。Issue #1546）: 拡張クエリの Parse で `$n` の型を
     // 決められない。SQL 表層専用の分類で 400。
     ("42P18", 400),
@@ -536,7 +537,7 @@ fn assert_projected_as(resp: &HttpResponse, expected_class: ErrorClass) {
 
 // --- R7: 射影表が ErrorClass::ALL 全体を閉じて覆うことの機械検証 -----------
 
-const _: () = assert!(ErrorClass::ALL.len() == 91);
+const _: () = assert!(ErrorClass::ALL.len() == 92);
 
 /// `wire_code` を共有する分類と、逆引き（`from_wire_code`）が返す分類の組
 /// （ERR-6。`23502`: TABLE-16・TASK-204・Issue #904、`23505`: Issue #1180）。
@@ -1014,6 +1015,9 @@ fn err4_f_unreachable_classes_project_via_production_encoder() {
         // （`UndefinedFunction`〔`42883`〕は `aggregate` op から到達可能。固定は
         // `err4_f_sum_on_date_column_projects_42883_to_400` が担う）
         ErrorClass::DuplicateFunction,
+        // `InvalidFunctionDefinition`（`42P13`。SQL-66、Issue #1916）: `CREATE FUNCTION ...
+        // RETURNS` の型検査。NoSQL 表層に `CREATE FUNCTION` が無いため到達不能。
+        ErrorClass::InvalidFunctionDefinition,
         // （`AmbiguousColumn`〔`42702`〕は Issue #1270 で `aggregate.sort` から到達
         // 可能になったためこの一覧から外した。固定は
         // `err4_f_ambiguous_sort_reachable_via_nosql_aggregate` が担う）

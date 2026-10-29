@@ -2419,6 +2419,12 @@ pub struct UdfDefinition {
     ///
     /// **Issue #1915 で追加した破壊的変更（BREAKING CHANGE）**: pub フィールド追加。
     pub param_types: Vec<Option<crate::sql::cast::CastType>>,
+    /// `RETURNS <型>` で宣言された戻り値型（SQL-66 (1)・TASK-309・Issue #1916）。`None` は句なし
+    /// （従来形。本体の結果をそのまま返す）。`Some` のときは定義時に本体の型が代入変換できることを
+    /// 検査済みで、呼び出し時は本体の結果をこの型へ変換して返す。型修飾子は構文段で正規化済み。
+    ///
+    /// **Issue #1916 で追加した破壊的変更（BREAKING CHANGE）**: pub フィールド追加。
+    pub return_type: Option<crate::sql::cast::CastType>,
     pub body: Expr,
 }
 
@@ -2586,6 +2592,23 @@ pub fn define_function_with_types(
     param_types: &[Option<crate::sql::cast::CastType>],
     body: &Expr,
 ) -> Result<(), SqlSurfaceError> {
+    define_function_with_signature(registry, name, params, param_types, None, body)
+}
+
+/// [`define_function_with_types`] の `RETURNS` つき版（SQL-66 (1)・TASK-309・Issue #1916）。
+/// `return_type` が `Some` のとき、定義の時点で本体の式の型を RETURNS の型へ代入変換できるかを
+/// 検査し、できなければ `42P13`、静的に決められない組み合わせは `0A000`（fail-closed）で拒否する。
+/// RETURNS は本体の型を静的に決める必要があるため、引数が 1 個以上あって型なしの関数には付けられない
+/// （`0A000`。構文段でも拒否済みの二重防御）。検査はレジストリを変更せず、失敗時は何も登録しない。
+/// `core.rs::EngineCore::execute_sql_in_session` の `CreateFunction` 分岐が呼ぶ。
+pub fn define_function_with_signature(
+    registry: &mut UdfRegistry,
+    name: &str,
+    params: &[String],
+    param_types: &[Option<crate::sql::cast::CastType>],
+    return_type: Option<&crate::sql::cast::CastType>,
+    body: &Expr,
+) -> Result<(), SqlSurfaceError> {
     if param_types.len() != params.len() {
         return Err(SqlSurfaceError::unsupported(
             "function parameter type list does not match the parameter list",
@@ -2601,8 +2624,171 @@ pub fn define_function_with_types(
     }
     let mut prepared = prepare_function_definition(registry, name, params, body)?;
     prepared.param_types = param_types.to_vec();
+    if let Some(ret) = return_type {
+        if ret.expr_type().is_none() {
+            return Err(SqlSurfaceError::feature_not_supported(format!(
+                "function return type {} is not supported",
+                ret.pg_label()
+            )));
+        }
+        if !params.is_empty() && param_types.iter().any(Option::is_none) {
+            return Err(SqlSurfaceError::feature_not_supported(
+                "RETURNS requires typed function parameters",
+            ));
+        }
+        check_function_return_type(registry, &prepared, ret)?;
+        prepared.return_type = Some(ret.clone());
+    }
     commit_function_definition(registry, prepared);
     Ok(())
+}
+
+/// 定義の時点で、本体の式の型が RETURNS の型へ代入変換できることを検査する
+/// （[`define_function_with_signature`] から呼ばれる。SQL-66 (1)・Issue #1916）。
+/// 引数は宣言型の仮束縛（値は持たない。束縛だけに使い評価しない）で本体を束縛し、
+/// 呼び出し時と同じ [`bind_udf_return`] を通すため、定義が通れば呼び出し時に型で失敗しない。
+/// 本体の束縛エラー（未知の関数・型不一致など）はそのまま返す。
+fn check_function_return_type(
+    registry: &UdfRegistry,
+    prepared: &PreparedUdf,
+    ret: &crate::sql::cast::CastType,
+) -> Result<(), SqlSurfaceError> {
+    let mut params = std::collections::HashMap::new();
+    let mut param_decl = std::collections::HashMap::new();
+    for (pname, declared) in prepared.params.iter().zip(prepared.param_types.iter()) {
+        if let Some(declared) = declared {
+            let Some(ety) = declared.expr_type() else {
+                return Err(SqlSurfaceError::feature_not_supported(format!(
+                    "function parameter of type {} is not supported",
+                    declared.pg_label()
+                )));
+            };
+            params.insert(pname.clone(), (BoundExpr::Null, ety));
+            param_decl.insert(pname.clone(), declared.clone());
+        }
+    }
+    let mut env = BindEnv {
+        schema: None,
+        params,
+        param_decl,
+        registry,
+        case_nesting: 0,
+        typed_arith: false,
+        clock: time_fn::current_clock(),
+        collation_leaf: false,
+        numeric_arith: false,
+    };
+    let mut node_budget = MAX_EXPR_NODES;
+    bind_udf_return(&prepared.body, ret, &mut env, &mut node_budget).map(|_| ())
+}
+
+/// 静的な型 `ty` を規則表の変換元の種別へ写す（配列は要素型つき）。
+fn source_kind_of_cast_type(ty: &crate::sql::cast::CastType) -> crate::sql::cast::SourceKind {
+    use crate::sql::cast::{CastType, SourceKind};
+    match ty {
+        CastType::Array(elem) => SourceKind::Array(Some(elem.as_ref().clone())),
+        other => SourceKind::Known(other.kind()),
+    }
+}
+
+/// UDF 本体 `body`（束縛結果 `bound`・型 `ty`）の変換元の静的な種別を導く。引数参照は宣言型、
+/// RETURNS 付き UDF の呼び出しはその RETURNS 型、それ以外は `cast::source_cast_kind` の既存の導出。
+fn udf_body_source_kind(
+    body: &Expr,
+    bound: &BoundExpr,
+    ty: ExprType,
+    env: &BindEnv<'_>,
+) -> crate::sql::cast::SourceKind {
+    match crate::sql::cast::strip_collate(body) {
+        Expr::Ident(pn) => {
+            if let Some(declared) = env.param_decl.get(pn.to_ascii_lowercase().as_str()) {
+                return source_kind_of_cast_type(declared);
+            }
+        }
+        Expr::Call { name, .. } => {
+            if let Some(ret) = env.registry.get(name).and_then(|d| d.return_type.as_ref()) {
+                return source_kind_of_cast_type(ret);
+            }
+        }
+        _ => {}
+    }
+    crate::sql::cast::source_cast_kind(body, bound, ty, None)
+}
+
+/// RETURNS 付き UDF の本体を束縛し、戻り値型 `ret` へ代入変換して返す（定義時の型検査
+/// [`check_function_return_type`] と呼び出し時の展開 [`bind_call`] が共有する唯一の経路）。
+///
+/// - 文字列リテラル・NULL の本体は型なしリテラルとして `ret` の入力関数で解釈する
+///   （引数の [`bind_typed_udf_arg`] と同じ。形式不正は `22P02` 等）。
+/// - それ以外は本体を束縛して変換元の種別を導き、代入の規則（恒等・暗黙・代入・文字列型への
+///   I/O 代入）を満たさなければ `42P13`。種別を決められない数値は数値型へ Float8 として代入し、
+///   文字列型・要素型不明の配列は `0A000`（描画の種別を決められないため fail-closed）。
+fn bind_udf_return(
+    body: &Expr,
+    ret: &crate::sql::cast::CastType,
+    env: &mut BindEnv<'_>,
+    node_budget: &mut usize,
+) -> Result<(BoundExpr, ExprType), SqlSurfaceError> {
+    use crate::sql::cast::{self, CastKind, SourceKind};
+    if matches!(cast::strip_collate(body), Expr::String(_) | Expr::Null) {
+        return cast::bind_cast(cast::strip_collate(body), ret, env, node_budget);
+    }
+    let (bound, ty) = bind_expr_in(body, env, node_budget)?;
+    let mismatch = || {
+        SqlSurfaceError::invalid_function_definition(format!(
+            "return type mismatch in function declared to return {}",
+            ret.pg_label()
+        ))
+    };
+    let source = match udf_body_source_kind(body, &bound, ty, env) {
+        SourceKind::Known(k) => {
+            if !cast::is_assignment_rule(cast::cast_rule(k, ret.kind())) {
+                return Err(mismatch());
+            }
+            SourceKind::Known(k)
+        }
+        SourceKind::Array(Some(elem)) => {
+            if !cast::cast_type_assignable(&cast::CastType::Array(Box::new(elem.clone())), ret) {
+                return Err(mismatch());
+            }
+            SourceKind::Array(Some(elem))
+        }
+        SourceKind::Array(None) => {
+            return Err(SqlSurfaceError::feature_not_supported(
+                "function body of an array type with an unknown element type is not supported",
+            ))
+        }
+        SourceKind::UnknownNumeric => match ret.kind() {
+            CastKind::Int2
+            | CastKind::Int4
+            | CastKind::Int8
+            | CastKind::Float4
+            | CastKind::Float8
+            | CastKind::Numeric => SourceKind::Known(CastKind::Float8),
+            CastKind::Text | CastKind::Varchar | CastKind::Bpchar => {
+                return Err(SqlSurfaceError::feature_not_supported(format!(
+                    "function body of a numeric type cannot be converted to {} yet",
+                    ret.pg_label()
+                )))
+            }
+            _ => return Err(mismatch()),
+        },
+        SourceKind::Outside => return Err(mismatch()),
+    };
+    cast::cast_bound_from(source, body, bound, ty, ret, node_budget)
+}
+
+/// 投影位置の呼び出し `f(...)` が RETURNS 付き UDF なら、その戻り値型を結果列型として返す
+/// （RowDescription の型の元。[`expr_result_column_type`] が先に参照する。Issue #1916）。
+fn udf_return_column_type(expr: &Expr, registry: &UdfRegistry) -> Option<ColumnType> {
+    let Expr::Call { name, .. } = expr else {
+        return None;
+    };
+    registry
+        .get(name)?
+        .return_type
+        .as_ref()?
+        .result_column_type()
 }
 
 /// [`prepare_function_definition`] が返す検証済みの定義（レジストリへ入れる直前の値。
@@ -2615,6 +2801,8 @@ pub(crate) struct PreparedUdf {
     pub(crate) params: Vec<String>,
     /// 型注釈（`params` と同じ長さ。`prepare_*` は全要素 `None` で返し、型注釈つき定義だけが上書きする）。
     pub(crate) param_types: Vec<Option<crate::sql::cast::CastType>>,
+    /// `RETURNS` の型（`prepare_*` は `None` で返し、[`define_function_with_signature`] だけが設定する）。
+    pub(crate) return_type: Option<crate::sql::cast::CastType>,
     pub(crate) body: Expr,
 }
 
@@ -2704,6 +2892,7 @@ fn prepare_function_definition_inner(
     Ok(PreparedUdf {
         key: lower,
         param_types: vec![None; normalized_params.len()],
+        return_type: None,
         params: normalized_params,
         body: body.clone(),
     })
@@ -2717,6 +2906,7 @@ pub(crate) fn commit_function_definition(registry: &mut UdfRegistry, prepared: P
         UdfDefinition {
             params: prepared.params,
             param_types: prepared.param_types,
+            return_type: prepared.return_type,
             body: prepared.body,
         },
     );
@@ -2789,7 +2979,18 @@ fn bind_typed_udf_arg(
                     return cast::cast_bound_from(known, arg, bound, ty, declared, node_budget);
                 }
             }
-            match cast::source_cast_kind(arg, &bound, ty, env.schema()) {
+            // RETURNS 付き UDF の呼び出しは、結果の型が戻り値型で静的に決まる（Issue #1916）。
+            let nested_ret = match cast::strip_collate(arg) {
+                Expr::Call { name: callee, .. } => {
+                    env.registry.get(callee).and_then(|d| d.return_type.clone())
+                }
+                _ => None,
+            };
+            let source = match &nested_ret {
+                Some(rt) => source_kind_of_cast_type(rt),
+                None => cast::source_cast_kind(arg, &bound, ty, env.schema()),
+            };
+            match source.clone() {
                 SourceKind::Known(k) => {
                     if !implicit_ok(cast::cast_rule(k, declared.kind())) {
                         return Err(mismatch(k.label()));
@@ -2804,7 +3005,7 @@ fn bind_typed_udf_arg(
                 // 種別を決められない数値・要素型不明の配列・vector は `cast_bound` が判定する。
                 SourceKind::Array(None) | SourceKind::UnknownNumeric | SourceKind::Outside => {}
             }
-            cast::cast_bound(arg, bound, ty, declared, env, node_budget)
+            cast::cast_bound_from(source, arg, bound, ty, declared, node_budget)
         }
     }
 }
@@ -4012,7 +4213,7 @@ fn bind_projection_expr_inner(
         numeric_arith,
     };
     let (bound, ty) = bind_expr_any(expr, &mut env, node_budget)?;
-    let col = expr_result_column_type(expr, &bound, ty, Some(schema));
+    let col = expr_result_column_type(expr, &bound, ty, Some(schema), registry);
     Ok((bound, ty, col))
 }
 
@@ -4079,7 +4280,7 @@ pub(crate) fn bind_array_assignment_source(
         numeric_arith: false,
     };
     let (bound, ty) = crate::sql::cast::bind_operand(expr, &mut env, node_budget)?;
-    let col = expr_result_column_type(expr, &bound, ty, Some(schema));
+    let col = expr_result_column_type(expr, &bound, ty, Some(schema), registry);
     Ok((bound, ty, col))
 }
 
@@ -4145,7 +4346,12 @@ pub(crate) fn expr_result_column_type(
     bound: &BoundExpr,
     ty: ExprType,
     schema: Option<&TableSchema>,
+    registry: &UdfRegistry,
 ) -> Option<ColumnType> {
+    // RETURNS 付き UDF の呼び出しは宣言された戻り値型（Issue #1916）。
+    if let Some(col) = udf_return_column_type(expr, registry) {
+        return Some(col);
+    }
     // `CAST`／`<type> '<literal>'` の結果列の型は変換先の型で決める（SQL-47・Issue #1590）。
     // 値を変えない変換は被演算子の束縛結果をそのまま返す（Issue #1591）ため、型付き算術など
     // 内側の束縛結果より先に判定する。これを欠くと `CAST(NULL AS integer)` が double precision、
@@ -4263,7 +4469,7 @@ pub(crate) fn bind_const_projection_expr(
         numeric_arith: false,
     };
     let (bound, ty) = bind_expr_any(expr, &mut env, node_budget)?;
-    let col = expr_result_column_type(expr, &bound, ty, None);
+    let col = expr_result_column_type(expr, &bound, ty, None, registry);
     Ok((bound, ty, col))
 }
 
@@ -4339,7 +4545,7 @@ pub(crate) fn bind_const_expr(
         numeric_arith: false,
     };
     let (bound, ty) = bind_expr_in(expr, &mut env, node_budget)?;
-    let col = expr_result_column_type(expr, &bound, ty, None);
+    let col = expr_result_column_type(expr, &bound, ty, None, registry);
     Ok((bound, ty, col))
 }
 
@@ -4367,7 +4573,7 @@ pub(crate) fn bind_const_expr_array_top(
     if ty != ExprType::Array {
         reject_json_operand(ty)?;
     }
-    let col = expr_result_column_type(expr, &bound, ty, None);
+    let col = expr_result_column_type(expr, &bound, ty, None, registry);
     Ok((bound, ty, col))
 }
 
@@ -7793,7 +7999,11 @@ fn bind_call(
             collation_leaf: false,
             numeric_arith: false,
         };
-        return bind_expr_in(&def.body, &mut inner_env, node_budget);
+        // RETURNS 付きは本体の結果を戻り値型へ変換して返す（定義時に型検査済み。Issue #1916）。
+        return match &def.return_type {
+            Some(ret) => bind_udf_return(&def.body, ret, &mut inner_env, node_budget),
+            None => bind_expr_in(&def.body, &mut inner_env, node_budget),
+        };
     }
 
     if let Some(backend) = env.registry.get_wasm(name).cloned() {
