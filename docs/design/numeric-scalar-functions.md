@@ -100,6 +100,37 @@ codex-review P1 是正）。`x * 10^n` を `f64` で計算すると、10 進小�
 日時スカラー関数群を実装する後続作業（下記「スコープ外・後続課題」参照）で
 spec と対にして判断する。
 
+## Issue #1907 追記（ln／log／exp／sign。SQL-65）
+
+- `ln(x)` は自然対数、`log(x)` は**底 10** の常用対数、`log(b, x)` は底 b の対数、`exp(x)` は e の x 乗、`sign(x)` は -1／0／1。戻り値は `Scalar`（double precision）。NULL は伝播する。
+- `log` は `round` と同じ arity オーバーロードで、`bind_call` が 1 引数を `Log1`、2 引数を `Log2` に解決する（`builtin_from_name` には載せず、予約名判定と個数表には載せる）。
+- エラー写像: `ln`・`log` の 0 と負（`-Infinity` 含む）は `2201E`（`ErrorClass::InvalidArgumentForLogarithm`、HTTP 400）、`log(1, x)` の底 1 は `22012`、`exp` の有限入力からのあふれ・アンダーフローは `22003`。文言は PostgreSQL と同じ固定文言で、値は埋め込まない。`log(b, x)` は底を先に検査する。
+- 非有限入力は PostgreSQL の float8 版に合わせ、NaN は伝播し、`ln(+Infinity)` は `+Infinity`、`exp(-Infinity)` は 0、`sign(NaN)` と `sign(-0.0)` は 0。
+- `log(b, x)` は結果が整数 k に極めて近く `b^k == x` が厳密に成り立つとき k に丸める（`log(10, 1000)` が 3 になる）。
+- 制約: NUMERIC 型の引数は従来の数値関数と同じく `42804`。PostgreSQL の numeric 版が返す表示桁（例: `3.0000000000000000`）や、`exp` の極小入力で 0 を返す挙動は再現しない（f64 の最短表現・`22003`）。
+- 既存の `power`・`sqrt` の `22000` は変更しない（PostgreSQL の `2201F` への揃えは別課題）。
+
+## Issue #1908 追記（trunc。SQL-65）
+
+`trunc(x)`／`trunc(x, n)` を組み込みに追加した（ポインタ: `docs/spec/04-behavior/` SQL-65）。
+`round` と同じ arity オーバーロードで、1 引数形は `BuiltinFn::Trunc1`、2 引数形は
+`BuiltinFn::Trunc2` へ `bind_call` が解決する。引数・戻り値とも Scalar（f64）で、
+NUMERIC 型の引数は他の数値関数と同じく `42804`。`trunc` は予約名になり、同名の
+`CREATE FUNCTION` は `42723`。
+
+- `trunc(x)`: 0 方向へ整数へ切り捨てる（`f64::trunc`）。`trunc(-0.5)` は `-0.0`
+  （PostgreSQL の float8 版と同じ）。
+- `trunc(x, n)`: `x` の最短往復表現（10 進数字列）を `n` 桁で打ち切る。桁上げは起きず、
+  `x * 10^n` の二進誤差も入らない（`trunc(2.675, 2)` = 2.67、`trunc(99.99, 1)` = 99.9）。
+  負の `n` は整数部の下位 `|n|` 桁を 0 にし（`trunc(1234.5678, -2)` = 1200）、`|n|` が整数部の
+  桁数以上なら符号付きの 0 を返す。`n` が小数部の桁数以上なら `x` をそのまま返す。
+- `n` の検査は `round` と同じ: 非整数は `22000`、`i32` の範囲外は `22003`。
+
+PostgreSQL との既知の差: PG の 2 引数形は `trunc(numeric, integer)` のみで型違いは `42883`
+だが、本エンジンは `round` と同じく Scalar を受け取る。PG の numeric 版は表示桁（スケール）を
+保つが、本エンジンは f64 の最短表現で返す。PG numeric に `-0` は無いが本エンジンは float8 版と
+同じく `-0` を返す。裸の `NULL` リテラルは関数引数に使えない既存規則のまま。
+
 ## スコープ外・後続課題（当時の記録。実装済みの部分は `docs/design/datetime-scalar-functions.md` を参照）
 
 `date_part('field', src)`・`date_trunc('unit', src)`・`DATE`/`TIMESTAMP`
@@ -129,3 +160,16 @@ datetime-scalar-functions.md`）で実装済み。`EXTRACT(field FROM src)` 構�
 判断（PR #1107 codex-review P1 是正で本 PR からは除外。上記「決定性（本 PR の
 対象範囲）」参照）も、日時スカラー関数群の実装時に spec の決定性要件と対にして
 判断すること。
+
+## `greatest`／`least`（Issue #1909・SQL-65 ポインタ）
+
+`greatest(v1, ..., vn)`／`least(v1, ..., vn)` は引数型を統一する可変長関数のため、固定 arity の
+`BuiltinFn` ではなく専用ノード `BoundExpr::MinMax` に束縛する（構文は `Expr::Call` のまま）。
+
+- **NULL**: 評価時に NULL 引数を無視し、全引数が NULL の行は NULL。リテラル `NULL` だけで型が決まらない呼び出しは
+  `CASE`／`COALESCE` と同じく `0A000`。
+- **型**: `COALESCE` と同じ統一規則。統一できなければ `42804`。比較できるのは数値・TEXT（既定照合のバイト順）・
+  DATE・TIMESTAMP・TIME・TIMESTAMPTZ。vector は `42883`、それ以外の型は `0A000`。
+- **評価**: 短絡せず全引数を評価し（評価エラーは伝播）、既存の比較（`eval_binary`）で畳み込む。同値は先に現れた値を残す。
+- **個数**: 1〜100 個（`builtin_call_arity`）。超過は `54023`、0 個は `42883`。
+- **位置**: SQL-26 の式位置（投影・`WHERE`・`ORDER BY`・CHECK・UDF 本体・INSERT VALUES の定数式）で使える。

@@ -204,6 +204,7 @@ pub(crate) fn is_search_path_exempt(parsed: &ParsedSql) -> bool {
             | ParsedSql::CreateTempTable(_)
             | ParsedSql::CreateSchema(_)
             | ParsedSql::DropSchema(_)
+            | ParsedSql::DropFunction(_)
             | ParsedSql::Cursor(CursorStatement::Fetch { .. } | CursorStatement::Close { .. })
             | ParsedSql::Statement(
                 Statement::SetSearchMode { .. }

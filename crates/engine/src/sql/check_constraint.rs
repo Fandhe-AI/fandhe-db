@@ -2116,6 +2116,44 @@ mod tests {
                     Expr::String("suffix".to_string()),
                 ],
             ),
+            call(
+                "lpad",
+                vec![
+                    Expr::Ident("label".to_string()),
+                    Expr::Number("5".to_string()),
+                ],
+            ),
+            call(
+                "lpad",
+                vec![
+                    Expr::Ident("label".to_string()),
+                    Expr::Number("5".to_string()),
+                    Expr::String("x".to_string()),
+                ],
+            ),
+            call(
+                "rpad",
+                vec![
+                    Expr::Ident("label".to_string()),
+                    Expr::Number("5".to_string()),
+                ],
+            ),
+            call(
+                "rpad",
+                vec![
+                    Expr::Ident("label".to_string()),
+                    Expr::Number("5".to_string()),
+                    Expr::String("x".to_string()),
+                ],
+            ),
+            call(
+                "split_part",
+                vec![
+                    Expr::Ident("label".to_string()),
+                    Expr::String(",".to_string()),
+                    Expr::Number("2".to_string()),
+                ],
+            ),
             call("trim", vec![Expr::Ident("label".to_string())]),
             call(
                 "replace",

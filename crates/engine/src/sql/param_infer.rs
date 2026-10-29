@@ -162,6 +162,9 @@ fn builtin_arg_is_text(name: &str, index: usize) -> bool {
     match name.to_ascii_lowercase().as_str() {
         "lower" | "upper" | "length" | "trim" | "md5" => index == 0,
         "substr" | "substring" | "left" | "right" | "reverse" | "initcap" => index == 0,
+        // Issue #1904・SQL-65: lpad／rpad は s と fill が text、split_part は s と delim が text。
+        "lpad" | "rpad" => index == 0 || index == 2,
+        "split_part" => index <= 1,
         "replace" | "position" | "concat" => true,
         // jsonb_extract_path(_text) のパス要素（2 番目以降）は text（Issue #1599）。
         "jsonb_extract_path" | "jsonb_extract_path_text" => index >= 1,
@@ -175,7 +178,9 @@ fn builtin_arg_is_text(name: &str, index: usize) -> bool {
 fn builtin_return_type(name: &str) -> Ty {
     match name.to_ascii_lowercase().as_str() {
         "lower" | "upper" | "trim" | "replace" | "concat" | "substr" | "substring" | "left"
-        | "right" | "reverse" | "initcap" | "md5" => Ty::Known(PreparedParamType::Text),
+        | "right" | "reverse" | "initcap" | "lpad" | "rpad" | "split_part" | "md5" => {
+            Ty::Known(PreparedParamType::Text)
+        }
         "length" | "position" => Ty::Known(scalar("?column?", ColumnType::Integer)),
         // 配列関数（Issue #1604）。配列を返すものは `$n` の型付け対象外（Double と誤推論しない）。
         "array_length" | "cardinality" | "array_position" => {
@@ -207,6 +212,11 @@ fn builtin_return_type(name: &str) -> Ty {
     }
 }
 
+/// `greatest`／`least`（SQL-65・Issue #1909）か。`$n` の型を兄弟引数から推論する対象。
+fn is_min_max_name(name: &str) -> bool {
+    name.eq_ignore_ascii_case("greatest") || name.eq_ignore_ascii_case("least")
+}
+
 /// 演算子の相手 `other` の型が信頼できるときだけ変換可否判定の対象にする
 /// （Issue #2437）。列参照・数値リテラル・それらの算術・型を明示した組み込み関数に限り、
 /// 文字列リテラル（PG では unknown 型）や戻り型を近似で置く関数は対象外
@@ -227,6 +237,9 @@ fn operator_kind(other: &Expr) -> Option<ParamContextKind> {
                     | "replace"
                     | "concat"
                     | "substr"
+                    | "lpad"
+                    | "rpad"
+                    | "split_part"
                     | "substring"
                     | "length"
                     | "position"
@@ -270,6 +283,8 @@ impl Inferrer<'_> {
                 }
                 Ty::Unresolved
             }
+            // `greatest`／`least`（SQL-65・Issue #1909）は引数型を統一する兄弟扱い（`COALESCE` と同じ）。
+            Expr::Call { name, args } if is_min_max_name(name) => self.sibling_type(args.iter()),
             Expr::Call { name, .. } => builtin_return_type(name),
             Expr::Binary { op, lhs, rhs } => {
                 if is_comparison(*op) {
@@ -436,6 +451,10 @@ impl Inferrer<'_> {
                         self.walk(rhs)?;
                     }
                 }
+            }
+            Expr::Call { name, args } if is_min_max_name(name) => {
+                let refs: Vec<&Expr> = args.iter().collect();
+                self.walk_siblings(&refs)?;
             }
             Expr::Call { name, args } => {
                 for (i, arg) in args.iter().enumerate() {

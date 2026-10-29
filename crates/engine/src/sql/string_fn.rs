@@ -27,6 +27,11 @@
 //! - `left`/`right` の `n` は `substr` と同じく `f64` Scalar で受け、`i64` 範囲内の
 //!   整数を受理する（PostgreSQL の int4 範囲外・非整数は関数解決エラー `42883`
 //!   だが、本実装では非整数は `22000`）。
+//! - `lpad`/`rpad`/`split_part` の長さ・位置引数は `substr` と同じく `f64` で受けて
+//!   整数性を検査する。非整数は `22000`（PostgreSQL は関数解決の `42883`）で、
+//!   int4 範囲外でも i64 範囲内なら受理する。
+//! - `lpad`/`rpad` の結果長は [`MAX_RESULT_LEN`]（4 MiB）で `54000` に拒否する
+//!   （PostgreSQL は約 1 GB で `54000`）。
 //! - TEXT 同士の比較はバイト順（UTF-8 のコードポイント順）で、PostgreSQL の
 //!   `"C"` 照合順に相当する。
 //!
@@ -302,6 +307,106 @@ pub(crate) fn initcap(s: &str) -> Result<String, SqlSurfaceError> {
     check_result_len(out)
 }
 
+/// `lpad`／`rpad` の共通実装（Issue #1904・SQL-65 ポインタ）。`s` を先頭 `len` 文字へ
+/// 切り詰めてから、`fill` を先頭から循環させて不足分を左（`left`）または右へ埋める。
+/// `len` は untrusted のため、確保前に結果バイト長を checked 演算で見積もり
+/// [`MAX_RESULT_LEN`] 超過を `54000` で拒否する。
+fn pad(s: &str, len: f64, fill: &str, left: bool) -> Result<String, SqlSurfaceError> {
+    let len_i = arg_as_i64(len, if left { "lpad length" } else { "rpad length" })?;
+    if len_i <= 0 {
+        return Ok(String::new());
+    }
+    // usize へ収まらない長さは必ず上限超過として扱う。
+    let target = usize::try_from(len_i).map_err(|_| replace_overflow())?;
+    // 先頭 `target` 文字への切り詰め（左側の文字を残す）。
+    let (kept, kept_chars) = match s.char_indices().nth(target) {
+        Some((end, _)) => (s.get(..end).unwrap_or(s), target),
+        None => (s, s.chars().count()),
+    };
+    if fill.is_empty() || kept_chars >= target {
+        return check_result_len(kept.to_string());
+    }
+    let pad_chars = target - kept_chars;
+    let fill_chars = fill.chars().count();
+    let full = pad_chars / fill_chars;
+    let rem = pad_chars % fill_chars;
+    let rem_bytes = match fill.char_indices().nth(rem) {
+        Some((end, _)) => end,
+        None => fill.len(),
+    };
+    let pad_bytes = full
+        .checked_mul(fill.len())
+        .and_then(|b| b.checked_add(rem_bytes))
+        .ok_or_else(replace_overflow)?;
+    let total = kept
+        .len()
+        .checked_add(pad_bytes)
+        .ok_or_else(replace_overflow)?;
+    if total > MAX_RESULT_LEN {
+        return Err(replace_overflow());
+    }
+    let mut out = String::new();
+    out.try_reserve_exact(total).map_err(|_| {
+        SqlSurfaceError::payload_too_large("string function result exceeds available memory")
+    })?;
+    if !left {
+        out.push_str(kept);
+    }
+    out.extend(fill.chars().cycle().take(pad_chars));
+    if left {
+        out.push_str(kept);
+    }
+    check_result_len(out)
+}
+
+/// `LPAD(s, len[, fill])`: 左側を `fill`（省略時は半角空白）で埋める。
+/// `sql::udf_call::apply_builtin` から非 NULL 引数でのみ呼ばれる（Issue #1904・SQL-65）。
+pub(crate) fn lpad(s: &str, len: f64, fill: &str) -> Result<String, SqlSurfaceError> {
+    pad(s, len, fill, true)
+}
+
+/// `RPAD(s, len[, fill])`: 右側を `fill`（省略時は半角空白）で埋める。
+/// 呼び出し元は [`lpad`] と同じ（Issue #1904・SQL-65）。
+pub(crate) fn rpad(s: &str, len: f64, fill: &str) -> Result<String, SqlSurfaceError> {
+    pad(s, len, fill, false)
+}
+
+/// `SPLIT_PART(s, delim, n)`: `delim` で左から右へ非重複に分割した `n` 番目（負なら
+/// 末尾から）のフィールド。範囲外は空文字、位置 0 は `22023`（PostgreSQL と同じ固定文言）。
+/// NULL 判定は呼び出し元（`apply_builtin`）で位置検査より先に済んでいる（Issue #1904）。
+pub(crate) fn split_part(s: &str, delim: &str, n: f64) -> Result<String, SqlSurfaceError> {
+    let n_i = arg_as_i64(n, "split_part position")?;
+    if n_i == 0 {
+        return Err(SqlSurfaceError::InvalidParameterValue {
+            detail: "field position must not be zero",
+        });
+    }
+    if s.is_empty() {
+        return Ok(String::new());
+    }
+    if delim.is_empty() {
+        // 区切りが空なら全体が 1 フィールド（Rust の `split("")` は使わない）。
+        return Ok(if n_i == 1 || n_i == -1 {
+            s.to_string()
+        } else {
+            String::new()
+        });
+    }
+    let idx = if n_i > 0 {
+        usize::try_from(n_i - 1).ok()
+    } else {
+        // 総フィールド数を数えてから（`Vec` を作らず）左から数えた添字へ直す。
+        let count = s.split(delim).count();
+        usize::try_from(n_i.unsigned_abs())
+            .ok()
+            .and_then(|k| count.checked_sub(k))
+    };
+    Ok(idx
+        .and_then(|i| s.split(delim).nth(i))
+        .unwrap_or("")
+        .to_string())
+}
+
 /// `md5(text)`（Issue #1905・SQL-65）。UTF-8 バイト列の MD5 を 32 文字の小文字
 /// 16 進で返す。`sql::udf_call::apply_builtin` が非 NULL 入力に対して呼ぶ。
 /// 出力長は常に 32 で、入力長に応じた増幅はない。
@@ -554,5 +659,61 @@ mod tests {
         assert_eq!(position("hello", "z"), 0.0);
         assert_eq!(position("hello", ""), 1.0);
         assert_eq!(position("あいうえお", "うえ"), 3.0);
+    }
+
+    #[test]
+    fn lpad_rpad_match_postgres() {
+        assert_eq!(lpad("hi", 5.0, "xy").unwrap(), "xyxhi");
+        assert_eq!(rpad("hi", 5.0, "xy").unwrap(), "hixyx");
+        assert_eq!(lpad("hi", 5.0, " ").unwrap(), "   hi");
+        assert_eq!(lpad("hello", 3.0, " ").unwrap(), "hel");
+        assert_eq!(rpad("hello", 3.0, " ").unwrap(), "hel");
+        assert_eq!(lpad("hi", 0.0, "x").unwrap(), "");
+        assert_eq!(lpad("hi", -1.0, "x").unwrap(), "");
+        assert_eq!(lpad("hi", 5.0, "").unwrap(), "hi");
+        assert_eq!(lpad("hello", 3.0, "").unwrap(), "hel");
+        assert_eq!(lpad("日本", 4.0, "あ").unwrap(), "ああ日本");
+        assert_eq!(rpad("a", 4.0, "あい").unwrap(), "aあいあ");
+    }
+
+    #[test]
+    fn lpad_rejects_bad_and_huge_lengths_before_allocating() {
+        for bad in [1.5, f64::NAN, f64::INFINITY, 9223372036854775808.0] {
+            assert!(lpad("x", bad, "a").is_err());
+        }
+        let e = lpad("x", 4.0e9, "a").unwrap_err();
+        assert_eq!(e.wire_code(), "54000");
+        let e = rpad("", (MAX_RESULT_LEN + 1) as f64, "a").unwrap_err();
+        assert_eq!(e.wire_code(), "54000");
+        assert_eq!(
+            rpad("", MAX_RESULT_LEN as f64, "a").unwrap().len(),
+            MAX_RESULT_LEN
+        );
+    }
+
+    #[test]
+    fn split_part_matches_postgres() {
+        assert_eq!(split_part("abc~@~def~@~ghi", "~@~", 2.0).unwrap(), "def");
+        assert_eq!(split_part("a,b,c", ",", -1.0).unwrap(), "c");
+        assert_eq!(split_part("a,b,c", ",", -3.0).unwrap(), "a");
+        assert_eq!(split_part("a,b,c", ",", -4.0).unwrap(), "");
+        assert_eq!(split_part("a,b,c", ",", 4.0).unwrap(), "");
+        assert_eq!(split_part("abc", "", 1.0).unwrap(), "abc");
+        assert_eq!(split_part("abc", "", -1.0).unwrap(), "abc");
+        assert_eq!(split_part("abc", "", 2.0).unwrap(), "");
+        assert_eq!(split_part("", ",", 1.0).unwrap(), "");
+        assert_eq!(split_part("aaa", "aa", 1.0).unwrap(), "");
+        assert_eq!(split_part("aaa", "aa", -1.0).unwrap(), "a");
+        assert_eq!(split_part("a,b", ",", -9223372036854775808.0).unwrap(), "");
+    }
+
+    #[test]
+    fn split_part_zero_position_is_22023_even_for_empty_input() {
+        for s in ["a,b", ""] {
+            let e = split_part(s, ",", 0.0).unwrap_err();
+            assert_eq!(e.wire_code(), "22023");
+            assert!(e.to_string().contains("field position must not be zero"));
+        }
+        assert!(split_part("a", ",", 1.5).is_err());
     }
 }

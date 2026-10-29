@@ -9,8 +9,13 @@
 //! 再利用する。本文は「窓項目を除いた集計 SELECT（＋窓が参照するグループ化キーの隠し項目）」
 //! で既存の集計経路が実行し、外側（`sql::view_buffered`）が評価済みセルに窓を適用する。
 //! 本文の結果列は外側の束縛専用に改名する（利用者の非窓項目は利用者が書けない内部名、隠し
-//! キーは実キー列名）ため、窓が名前解決できるのはグループ化キー列だけになり、出力別名との
+//! キーは実キー列名）ため、窓が名前解決できるのはグループ化キー列と巻き上げ列だけになり、出力別名との
 //! 衝突は起きない。利用者に見せる列名は `view_buffered::plan_outer` が改名前へ戻す。
+//!
+//! Issue #1899: 窓の引数・`PARTITION BY`・`ORDER BY` の中にある集計式（`rank() OVER (ORDER BY
+//! sum(x))`・`sum(sum(x)) OVER ()` 等）は、集計呼び出しを含むセグメント全体を隠し項目として本文
+//! （集計経路）へ巻き上げ（hoist）、窓側は利用者が書けない内部名の列参照へ置き換える。窓が
+//! 名前解決できるのはグループ化キー列と巻き上げた集計列になる。
 //!
 //! 呼び出し元: [`super::validate_select_statement`] だけ。受理できない形は `Ok(None)` を返し、
 //! 呼び出し元が従来のエラー（`42601`）へ倒す（fail-closed）。
@@ -26,6 +31,8 @@ use super::*;
 const ITEM_PREFIX: &str = "\u{1}gwitem";
 /// 本文に補う隠しの `count(*)`（集計項目を 1 つ以上要求する本文の制約を満たすためだけの列）。
 const FILL_NAME: &str = "\u{1}gwfill";
+/// 窓の中から巻き上げた集計式を本文の隠し項目として受ける内部名の接頭辞（同上）。
+const AGG_PREFIX: &str = "\u{1}gwagg";
 /// 隠しキー項目の本文側の別名の接頭辞（出力名の衝突回避。外側へは実キー列名で渡す）。
 const KEY_ALIAS_PREFIX: &str = "\u{1}gwkey";
 
@@ -81,8 +88,8 @@ fn item_has_aggregate_call(item: &[Token]) -> bool {
     })
 }
 
-/// 窓項目の引数・`PARTITION BY`・`ORDER BY` に集計呼び出しがあるか（Issue #1899 の領域。本 Issue
-/// では PostgreSQL が受理する形を誤った SQLSTATE で拒否しないよう `0A000` にする）。先頭の関数名、
+/// 窓項目の引数・`PARTITION BY`・`ORDER BY` に集計呼び出しがあるか（Issue #1899。振り分け条件の
+/// 判定専用で、巻き上げ本体は [`hoist_window_item`]）。先頭の関数名、
 /// `FILTER (...)` の括弧内、フレーム句以降は対象外（それぞれ既存の検査が担う）。
 fn window_item_has_inner_aggregate(item: &[Token]) -> bool {
     let mut depth = 0usize;
@@ -132,10 +139,236 @@ fn window_item_has_inner_aggregate(item: &[Token]) -> bool {
     false
 }
 
+/// 直前のトークンが式の終端か（`ROWS`／`RANGE`／`GROUPS` をフレーム開始と見なす条件）。演算子・
+/// `,`・`BY` の直後の同名識別子（`sum(k) + rows` 等）は式の途中の識別子なのでフレームではない。
+fn ends_expression(prev: Option<&Token>) -> bool {
+    match prev {
+        Some(Token::Ident(n)) => ![
+            "AND", "OR", "NOT", "IS", "LIKE", "ILIKE", "IN", "BETWEEN", "DISTINCT",
+        ]
+        .iter()
+        .any(|k| n.eq_ignore_ascii_case(k)),
+        Some(
+            Token::Number(_)
+            | Token::StringLiteral(_)
+            | Token::QuotedBoolWord(_)
+            | Token::Punct(')' | ']'),
+        ) => true,
+        _ => false,
+    }
+}
+
+/// `open` の `(` に対応する `)` の添字。閉じない場合は `None`。
+fn find_close(tokens: &[Token], open: usize) -> Option<usize> {
+    let mut depth = 0usize;
+    for (i, t) in tokens.iter().enumerate().skip(open) {
+        match t {
+            Token::Punct('(') => depth = depth.saturating_add(1),
+            Token::Punct(')') => {
+                depth = depth.checked_sub(1)?;
+                if depth == 0 {
+                    return Some(i);
+                }
+            }
+            _ => {}
+        }
+    }
+    None
+}
+
+/// 巻き上げ段で構造を読み取れない窓項目の拒否（fail-closed。固定文言）。
+fn hoist_unsupported() -> SqlSurfaceError {
+    SqlSurfaceError::feature_not_supported(
+        "unsupported aggregate placement inside a window function over a grouped query",
+    )
+}
+
+/// `item[s..e]` を深さ 0 の `,` で分け、集計呼び出しを含むセグメントの `(開始, 終了)` だけ返す。
+/// 集計を含まない区間は分割せず空を返す（構造の検証は従来どおり窓の構文解析が担う）。
+fn aggregate_segments(
+    item: &[Token],
+    s: usize,
+    e: usize,
+) -> Result<Vec<(usize, usize)>, SqlSurfaceError> {
+    let Some(range) = item.get(s..e) else {
+        return Err(hoist_unsupported());
+    };
+    if !item_has_aggregate_call(range) {
+        return Ok(Vec::new());
+    }
+    let segs = split_items(item, s, e).ok_or_else(hoist_unsupported)?;
+    Ok(segs
+        .into_iter()
+        .filter(|&(a, b)| item.get(a..b).is_some_and(item_has_aggregate_call))
+        .collect())
+}
+
+/// 窓項目の引数・`PARTITION BY`・`ORDER BY` にある集計式を含むセグメント全体を `hoisted` へ
+/// 登録（同一トークン列は重複排除）し、内部名の識別子 1 トークンへ置き換えたトークン列を返す
+/// （Issue #1899。呼び出し元は [`try_build`] だけ）。セグメント単位で置換するのは、窓キーが識別子
+/// しか受理しないため（`ORDER BY sum(k) + 1` 等）。`FILTER (...)` の内側・フレーム句以降・先頭の
+/// `DISTINCT` 付き引数は触らず、既存の検査／構文解析に委ねる。構造が想定外なら `0A000`。
+fn hoist_window_item(
+    item: &[Token],
+    hoisted: &mut Vec<Vec<Token>>,
+) -> Result<Vec<Token>, SqlSurfaceError> {
+    if !matches!(item.get(1), Some(Token::Punct('('))) {
+        return Err(hoist_unsupported());
+    }
+    let close = find_close(item, 1).ok_or_else(hoist_unsupported)?;
+    let mut spans: Vec<(usize, usize)> = Vec::new();
+    if close > 2 && !is_distinct_modifier(item, 2) {
+        spans.extend(aggregate_segments(item, 2, close)?);
+    }
+    let mut c = close;
+    if matches!(item.get(c.saturating_add(1)), Some(Token::Ident(n)) if n.eq_ignore_ascii_case("FILTER"))
+        && matches!(item.get(c.saturating_add(2)), Some(Token::Punct('(')))
+    {
+        c = find_close(item, c.saturating_add(2)).ok_or_else(hoist_unsupported)?;
+    }
+    if !matches!(item.get(c.saturating_add(1)), Some(Token::Ident(n)) if n.eq_ignore_ascii_case("OVER"))
+    {
+        return Err(hoist_unsupported());
+    }
+    let over_open = c.saturating_add(2);
+    if !matches!(item.get(over_open), Some(Token::Punct('('))) {
+        return Err(hoist_unsupported());
+    }
+    let over_close = find_close(item, over_open).ok_or_else(hoist_unsupported)?;
+    let spec_start = over_open.saturating_add(1);
+
+    // OVER の括弧直下で PARTITION BY／ORDER BY の範囲とフレーム句の開始を求める。
+    let mut part_start: Option<usize> = None;
+    let mut order_kw: Option<usize> = None;
+    let mut frame_start = over_close;
+    let mut depth = 0usize;
+    for i in spec_start..over_close {
+        let t = item.get(i).ok_or_else(hoist_unsupported)?;
+        let next_is_by = matches!(
+            item.get(i.saturating_add(1)),
+            Some(Token::Keyword(Keyword::By))
+        );
+        match t {
+            Token::Punct('(') => depth = depth.saturating_add(1),
+            Token::Punct(')') => depth = depth.checked_sub(1).ok_or_else(hoist_unsupported)?,
+            Token::Keyword(Keyword::Order) if depth == 0 && order_kw.is_none() && next_is_by => {
+                order_kw = Some(i);
+            }
+            Token::Ident(n)
+                if depth == 0
+                    && i == spec_start
+                    && next_is_by
+                    && n.eq_ignore_ascii_case("PARTITION") =>
+            {
+                part_start = Some(i.saturating_add(2));
+            }
+            Token::Ident(n)
+                if depth == 0
+                    && i > spec_start
+                    && (n.eq_ignore_ascii_case("ROWS")
+                        || n.eq_ignore_ascii_case("RANGE")
+                        || n.eq_ignore_ascii_case("GROUPS"))
+                    && ends_expression(item.get(i.saturating_sub(1))) =>
+            {
+                frame_start = i;
+                break;
+            }
+            _ => {}
+        }
+    }
+    if let Some(ps) = part_start {
+        let pe = order_kw.unwrap_or(frame_start);
+        spans.extend(aggregate_segments(item, ps, pe)?);
+    }
+    if let Some(ok) = order_kw {
+        let os = ok.saturating_add(2);
+        for (a, b) in aggregate_segments(item, os, frame_start)? {
+            // 末尾の `ASC|DESC`・`NULLS FIRST|LAST` は式の外に残す。
+            let mut e = b;
+            if let (Some(Token::Ident(x)), Some(Token::Ident(y))) =
+                (item.get(e.saturating_sub(2)), item.get(e.saturating_sub(1)))
+            {
+                if e.saturating_sub(2) > a
+                    && x.eq_ignore_ascii_case("NULLS")
+                    && (y.eq_ignore_ascii_case("FIRST") || y.eq_ignore_ascii_case("LAST"))
+                {
+                    e = e.saturating_sub(2);
+                }
+            }
+            if let Some(Token::Ident(x)) = item.get(e.saturating_sub(1)) {
+                // 直前がオペランドで終わる場合のみ修飾子（`sum(k) + desc` の `desc` は列名）。
+                if e.saturating_sub(1) > a
+                    && (x.eq_ignore_ascii_case("ASC") || x.eq_ignore_ascii_case("DESC"))
+                    && ends_expression(item.get(e.saturating_sub(2)))
+                {
+                    e = e.saturating_sub(1);
+                }
+            }
+            if item.get(a..e).is_some_and(item_has_aggregate_call) {
+                spans.push((a, e));
+            }
+        }
+    }
+
+    spans.sort_unstable();
+    let mut out: Vec<Token> = Vec::with_capacity(item.len());
+    let mut prev = 0usize;
+    for (a, b) in spans {
+        let seg = item.get(a..b).ok_or_else(hoist_unsupported)?;
+        if a < prev || seg.is_empty() {
+            return Err(hoist_unsupported());
+        }
+        // 集計呼び出しの引数の中の集計呼び出し（入れ子集計）は PostgreSQL と同じ `42803`。
+        for (i, w) in seg.windows(2).enumerate() {
+            if matches!(&w[0], Token::Ident(n) if is_aggregate_function_name(n))
+                && matches!(w[1], Token::Punct('('))
+            {
+                let open = i.saturating_add(1);
+                let inner_close = find_close(seg, open).ok_or_else(hoist_unsupported)?;
+                if seg
+                    .get(open.saturating_add(1)..inner_close)
+                    .is_some_and(item_has_aggregate_call)
+                {
+                    return Err(SqlSurfaceError::GroupingError {
+                        detail: "aggregate function calls cannot be nested",
+                    });
+                }
+            }
+        }
+        if tokens_contain_window_over(seg) {
+            return Err(SqlSurfaceError::GroupingError {
+                detail: "aggregate function calls cannot contain window function calls",
+            });
+        }
+        let idx = match hoisted.iter().position(|h| h.as_slice() == seg) {
+            Some(i) => i,
+            None => {
+                hoisted.push(seg.to_vec());
+                hoisted.len().saturating_sub(1)
+            }
+        };
+        out.extend(
+            item.get(prev..a)
+                .ok_or_else(hoist_unsupported)?
+                .iter()
+                .cloned(),
+        );
+        out.push(ident(&format!("{AGG_PREFIX}{idx}")));
+        prev = b;
+    }
+    out.extend(
+        item.get(prev..)
+            .ok_or_else(hoist_unsupported)?
+            .iter()
+            .cloned(),
+    );
+    Ok(out)
+}
+
 /// 分類済みの SELECT リスト項目。
 enum ListItem<'a> {
-    /// 窓項目（元トークンと解析結果。`position` は SELECT リスト全体での位置）。
-    Window(&'a [Token], Box<WindowSelectItem>),
+    /// 窓項目（巻き上げ後のトークンと解析結果。`position` は SELECT リスト全体での位置）。
+    Window(Vec<Token>, Box<WindowSelectItem>),
     /// 非窓項目（本文へそのまま渡す）。
     Plain(&'a [Token]),
 }
@@ -148,11 +381,61 @@ fn push_sep(out: &mut Vec<Token>, n: &mut usize) {
     *n = n.saturating_add(1);
 }
 
+/// FROM 以降に `LIMIT`／`OFFSET`／`FETCH` があるか。
+fn tail_has_row_limit(tail: &[Token]) -> bool {
+    tail.iter().any(|t| match t {
+        Token::Keyword(Keyword::Limit) => true,
+        Token::Ident(n) => n.eq_ignore_ascii_case("OFFSET") || n.eq_ignore_ascii_case("FETCH"),
+        _ => false,
+    })
+}
+
+/// 項目内の列参照候補（関数名・別名・型名・演算子／`CASE` 系キーワード・`NULL`／`TRUE`／`FALSE` 以外の識別子）。
+fn column_ref_candidates(item: &[Token]) -> Vec<&str> {
+    item.iter()
+        .enumerate()
+        .filter_map(|(i, t)| {
+            let Token::Ident(n) = t else { return None };
+            let next_is_call = matches!(item.get(i.saturating_add(1)), Some(Token::Punct('(')));
+            let prev = i.checked_sub(1).and_then(|j| item.get(j));
+            let after_as = matches!(prev, Some(Token::Ident(p)) if p.eq_ignore_ascii_case("AS"));
+            let after_cast = matches!(prev, Some(Token::TypeCast));
+            let reserved = [
+                "AS",
+                "CASE",
+                "WHEN",
+                "THEN",
+                "ELSE",
+                "END",
+                "NULL",
+                "TRUE",
+                "FALSE",
+                "OR",
+                "AND",
+                "NOT",
+                "IS",
+                "LIKE",
+                "ILIKE",
+                "IN",
+                "BETWEEN",
+                "ESCAPE",
+                "DISTINCT",
+                "PRECISION",
+                "VARYING",
+            ]
+            .iter()
+            .any(|k| n.eq_ignore_ascii_case(k));
+            (!(next_is_call || after_as || after_cast || reserved)).then_some(n.as_str())
+        })
+        .collect()
+}
+
 /// 集計 SELECT と窓項目の併用を [`Statement::BufferedView`]（`origin = GroupedWindow`）へ振り分ける。
 ///
 /// `Ok(None)` は「この経路の対象外」（呼び出し元が従来の振り分け・エラーへ進む）。対象と確定した後の
 /// 構文・束縛上の誤りは `Err` で返す。`has_group_by_or_having` は呼び出し元が求めた
-/// `GROUP BY`／`HAVING` の有無で、これと非窓項目の集計呼び出しのどちらかが無ければ対象外とする。
+/// `GROUP BY`／`HAVING` の有無で、これ・非窓項目の集計呼び出し・窓の内側の集計呼び出しの
+/// いずれも無ければ対象外とする。
 pub(super) fn try_build(
     tokens: &[Token],
     lookup: &impl TableLookup,
@@ -187,18 +470,60 @@ pub(super) fn try_build(
     // 窓項目の有無と、非窓項目の集計呼び出しでこの経路の対象かを先に確定する（解析前）。
     let mut any_window = false;
     let mut plain_has_aggregate = false;
+    let mut window_has_aggregate = false;
     for &(s, e) in &ranges {
         let Some(item) = tokens.get(s..e) else {
             return Ok(None);
         };
         if tokens_contain_window_over(item) {
             any_window = true;
-        } else if item_has_aggregate_call(item) {
-            plain_has_aggregate = true;
+            if window_item_has_inner_aggregate(item) {
+                window_has_aggregate = true;
+            }
+        } else {
+            if item_has_aggregate_call(item) {
+                plain_has_aggregate = true;
+            }
         }
     }
-    if !any_window || !(has_group_by_or_having || plain_has_aggregate) {
+    if !any_window || !(has_group_by_or_having || plain_has_aggregate || window_has_aggregate) {
         return Ok(None);
+    }
+    // 窓内集計だけが根拠で GROUP BY／HAVING も非窓の集計も無い文は暗黙の単一グループになる。
+    // 非窓項目が列参照を持たない（定数のみ）なら受理し、未定義列は束縛段の `42703`、未グループ化列は
+    // 束縛側の `42803` に任せる。ただし `LIMIT`／`OFFSET` 付きでは本文の形検査が先に `42601` へ倒れて
+    // しまうため、その場合に限り列参照を持つ非窓項目を先に `42803` で拒否する。
+    // 未定義名は `42803` に倒さず `42703` にする（テーブルの列集合が分かるときのみ判別できる）。
+    if !has_group_by_or_having && !plain_has_aggregate && tail_has_row_limit(tail) {
+        let known_cols = match tail.get(1) {
+            Some(Token::Ident(t)) => lookup.table_columns(t)?,
+            _ => None,
+        };
+        let mut grouping = false;
+        for &(s, e) in &ranges {
+            let Some(item) = tokens.get(s..e) else {
+                continue;
+            };
+            if tokens_contain_window_over(item) {
+                continue;
+            }
+            for n in column_ref_candidates(item) {
+                match &known_cols {
+                    Some(ks) if !ks.iter().any(|c| c.eq_ignore_ascii_case(n)) => {
+                        return Err(SqlSurfaceError::UndefinedColumn {
+                            name: n.to_string(),
+                        });
+                    }
+                    _ => grouping = true,
+                }
+            }
+        }
+        if grouping {
+            return Err(SqlSurfaceError::GroupingError {
+                detail:
+                    "column must appear in the GROUP BY clause or be used in an aggregate function",
+            });
+        }
     }
     // Describe 経路は本文が `$n` を含まない前提でダミーフラグを渡すため、不一致を避けて拒否する。
     if tokens.iter().any(|t| matches!(t, Token::Param(_))) {
@@ -209,6 +534,7 @@ pub(super) fn try_build(
 
     // 項目の分類と窓項目の解析。
     let mut list: Vec<ListItem<'_>> = Vec::with_capacity(ranges.len());
+    let mut hoisted: Vec<Vec<Token>> = Vec::new();
     for (pos, &(s, e)) in ranges.iter().enumerate() {
         let Some(item) = tokens.get(s..e) else {
             return Ok(None);
@@ -217,21 +543,17 @@ pub(super) fn try_build(
             list.push(ListItem::Plain(item));
             continue;
         }
-        let mut p = Parser::new(item).with_nesting_limits(limits);
-        if !p.peek_is_window_item_start() {
+        if !Parser::new(item).peek_is_window_item_start() {
             return Ok(None);
         }
-        if window_item_has_inner_aggregate(item) {
-            return Err(SqlSurfaceError::feature_not_supported(
-                "aggregate functions inside window functions over a grouped query are not supported",
-            ));
-        }
+        let rewritten = hoist_window_item(item, &mut hoisted)?;
+        let mut p = Parser::new(&rewritten).with_nesting_limits(limits);
         let mut w = p.parse_window_item()?;
         if p.peek().is_some() {
             return Ok(None);
         }
         w.position = pos;
-        list.push(ListItem::Window(item, Box::new(w)));
+        list.push(ListItem::Window(rewritten, Box::new(w)));
     }
 
     // 窓が参照するグループ化キー列（重複排除・名前順）。
@@ -241,11 +563,15 @@ pub(super) fn try_build(
             w.collect_referenced_idents(&mut referenced);
         }
     }
-    let mut keys: Vec<String> = referenced.into_iter().collect();
+    // 巻き上げた集計列は本文の隠し項目として別に積むため、キー列候補から除く。
+    let mut keys: Vec<String> = referenced
+        .into_iter()
+        .filter(|k| !k.starts_with(AGG_PREFIX))
+        .collect();
     keys.sort();
 
     // 本文: 非窓項目（元の順序）＋必要なら隠し count(*) ＋隠しキー項目。
-    let need_fill = !plain_has_aggregate;
+    let need_fill = !plain_has_aggregate && hoisted.is_empty();
     let mut body: Vec<Token> = vec![Token::Keyword(Keyword::Select)];
     let mut aliases: Vec<String> = Vec::new();
     let mut body_items = 0usize;
@@ -269,6 +595,13 @@ pub(super) fn try_build(
             ident(FILL_NAME),
         ]);
         aliases.push(FILL_NAME.to_string());
+    }
+    for (j, seg) in hoisted.iter().enumerate() {
+        push_sep(&mut body, &mut body_items);
+        body.extend(seg.iter().cloned());
+        body.push(ident("AS"));
+        body.push(ident(&format!("{AGG_PREFIX}{j}")));
+        aliases.push(format!("{AGG_PREFIX}{j}"));
     }
     for (j, k) in keys.iter().enumerate() {
         push_sep(&mut body, &mut body_items);
@@ -363,7 +696,7 @@ pub(super) fn try_build(
                 outer_tokens.push(ident(&format!("{ITEM_PREFIX}{plain_idx}")));
                 plain_idx = plain_idx.saturating_add(1);
             }
-            ListItem::Window(item, _) => outer_tokens.extend(item.iter().cloned()),
+            ListItem::Window(toks, _) => outer_tokens.extend(toks.iter().cloned()),
         }
     }
     outer_tokens.push(Token::Keyword(Keyword::From));

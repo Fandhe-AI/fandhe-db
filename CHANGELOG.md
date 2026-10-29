@@ -11,6 +11,11 @@
 
 - 文字列関数 `left`／`right`／`reverse`／`initcap` を追加した（Issue #1902・SQL-65）。文字単位は Unicode スカラー値で、4 関数とも strict（NULL 引数で NULL）。`left`／`right` の長さは負で「除く文字数」を表し、`initcap` は英数字の連続を 1 語として扱う（ロケール非依存。PostgreSQL との既知の差は `string_fn.rs` のモジュール doc に記載）。
   挙動変更: 4 名は組み込みの予約名になり、同名の `CREATE FUNCTION` は `42723` になる。
+- `ln`／`log`／`exp`／`sign` を追加する（Issue #1907・SQL-65）。`log(x)` は底 10、`log(b, x)` は底 b の対数。`ln`・`log` の 0 と負は `2201E`、`log(1, x)` は `22012`、`exp` のあふれ・アンダーフローは `22003`。NUMERIC 型の引数は従来どおり `42804`。詳細は [numeric-scalar-functions.md](docs/design/numeric-scalar-functions.md) の「Issue #1907 追記」節。
+- 数値関数 `trunc(x)`／`trunc(x, n)` を追加した（Issue #1908・SQL-65）。0 方向への切り捨てで、2 引数形は小数点以下 `n` 桁（負の `n` は整数部の桁）で打ち切る。10 進数字列で処理するため桁上げ・二進誤差はない。`n` が非整数は `22000`、`i32` の範囲外は `22003`。
+  挙動変更: `trunc` が組み込み関数の予約名になり、同名の `CREATE FUNCTION` は `42723`。公開 enum `BuiltinFn` に variant `Trunc1`／`Trunc2` を追加した（BREAKING）。
+- 文字列関数 `lpad`／`rpad`／`split_part` を追加した（Issue #1904・SQL-65）。いずれも strict で、長さ・位置は文字単位。`lpad`／`rpad` は第 3 引数の省略時に半角空白で埋め、`split_part` は負の位置を末尾から数え、位置 0 は `22023`。結果長が上限（4 MiB）を超えると `54000`。
+  挙動変更: 3 名は組み込みの予約名になり、同名の `CREATE FUNCTION` は `42723` で拒否される。
 - 文字列関数 `md5(text)` を追加した（Issue #1905・SQL-65）。UTF-8 バイト列の MD5 を 32 文字の小文字 16 進で返す strict 関数（NULL は NULL）で、依存追加なしの自作実装。`md5(bytea)` は bytea が関数引数に使えない既存規則どおり `0A000`（PostgreSQL との既知の差）。
   挙動変更: `md5` が組み込み関数の予約名になり、同名の `CREATE FUNCTION` は `42723`。公開 enum `BuiltinFn` に variant `Md5` を追加した（BREAKING）。
 - `substring(s FROM n [FOR m])`／`substring(s FOR m [FROM n])` とカンマ形 `substring(s, n[, m])` を受理する（Issue #1903・SQL-65）。意味は `substr` と同じ文字単位の窓計算で、`substring` は組み込み関数名として予約される。正規表現形（第 2 引数が文字列・`SIMILAR ... ESCAPE`）は SQL-55 の管轄のため `0A000`。`position(needle IN haystack)` は Issue #919 の実装を SQL-65 の回帰テストで固定した。公開 API の変更はない（非 BREAKING）。
@@ -177,6 +182,11 @@
   wire-server に値なしスイッチ `--require-where-for-dml` を追加した。明示した述語・NoSQL 表層・`TRUNCATE` は対象外。
   詳細は [require-where-for-dml-cli.md](docs/design/require-where-for-dml-cli.md)。
 
+- `greatest(v1, ..., vn)`／`least(v1, ..., vn)` を追加した（Issue #1909・SQL-65）。NULL 引数は無視し、全引数が NULL の行は NULL。
+  引数の型は `CASE`／`COALESCE` と同じ規則で統一し（統一できなければ `42804`）、引数は 100 個まで（超過は `54023`）。
+  数値・TEXT（バイト順）・DATE・TIMESTAMP・TIME・TIMESTAMPTZ を比較でき、それ以外の型は `0A000`（vector は `42883`）。
+  挙動変更: 2 名が組み込みの予約名になり、同名の `CREATE FUNCTION` は `42723`。
+
 ### Changed
 
 - 拡張クエリの Execute の `max_rows` 分割で、完了タグの件数を累計からその回の件数に変え、`max_rows` ちょうどで
@@ -188,6 +198,12 @@
 ### Breaking Changes
 
 - `sql::udf_call::BuiltinFn`（Issue #1902・SQL-65）: variant `Left`／`Right`／`Reverse`／`Initcap` を追加した。網羅 `match` する外部コードは腕を足す。
+- `sql::udf_call::BoundExpr`（Issue #1909・SQL-65）: variant `MinMax { op, args }` と公開型 `MinMaxOp` を追加した。
+  網羅 `match` する外部コードは腕を足す。
+- `ln`／`log` の定義域外を `2201E` で拒否する（Issue #1907・SQL-65）。公開型の変更として `SqlSurfaceError::InvalidArgumentForLogarithm`・
+  `ErrorClass::InvalidArgumentForLogarithm`・`ArenaError::InvalidArgumentForLogarithm` を追加した（HTTP 射影は 400）。
+- `sql::udf_call::BuiltinFn`（Issue #1904・SQL-65）: variant を追加した（`Lpad2`／`Lpad3`／`Rpad2`／`Rpad3`／`SplitPart`）。
+  網羅 `match` する外部コードは腕を足す。
 - `substring`／`substr` の負の長さを `22011`（substring_error）で拒否する（Issue #1903・SQL-65）。従来は `22000`。公開型の変更として
   `SqlSurfaceError::SubstringError`・`ErrorClass::SubstringError`・`ArenaError::SubstringError` を追加した（HTTP 射影は 400）。
 - jsonpath の `like_regex` 配線（Issue #2677）に伴う公開型の変更。`PathNode::LikeRegex` に `matcher: LikeRegexMatcher` を追加、

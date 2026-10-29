@@ -332,6 +332,9 @@ pub(crate) fn redact_row_conversion_error(e: SqlSurfaceError) -> SqlSurfaceError
         E::SubstringError { .. } => E::SubstringError {
             detail: "substring error during column type conversion".to_string(),
         },
+        E::InvalidArgumentForLogarithm { .. } => E::InvalidArgumentForLogarithm {
+            detail: "invalid argument for logarithm during column type conversion".to_string(),
+        },
         E::PayloadTooLarge { .. } => E::PayloadTooLarge {
             detail: "value too large during column type conversion".to_string(),
         },
@@ -478,6 +481,9 @@ mod tests {
                 detail: secret.to_string(),
             },
             SqlSurfaceError::SubstringError {
+                detail: secret.to_string(),
+            },
+            SqlSurfaceError::InvalidArgumentForLogarithm {
                 detail: secret.to_string(),
             },
             SqlSurfaceError::payload_too_large(secret),

@@ -828,6 +828,14 @@ impl JsonAccessOp {
     }
 }
 
+/// `GREATEST`／`LEAST` の向き（[`BoundExpr::MinMax`]。対象ビヘイビア: SQL-65 ポインタ。
+/// Issue #1909）。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum MinMaxOp {
+    Greatest,
+    Least,
+}
+
 /// 束縛済み（列参照・関数呼び出しの解決、UDF 本体のインライン展開が完了した）式。
 /// レジストリを参照せずに単独で評価できる（`eval` の入力）。
 ///
@@ -906,6 +914,13 @@ pub enum BoundExpr {
     },
     /// `COALESCE`（対象ビヘイビア: SQL-26）。
     Coalesce(Vec<BoundExpr>),
+    /// `GREATEST`／`LEAST`（対象ビヘイビア: SQL-65 ポインタ。Issue #1909）。引数は
+    /// [`bind_min_max`] が統一した型へそろえてあり、NULL は評価時に無視する
+    /// （全引数 NULL なら NULL）。
+    MinMax {
+        op: MinMaxOp,
+        args: Vec<BoundExpr>,
+    },
     /// `NULLIF`（対象ビヘイビア: SQL-26）。両辺は常に `Scalar` 型（[`bind_nullif`]
     /// が検査済み）。
     NullIf {
@@ -1431,6 +1446,9 @@ impl PartialEq for BoundExpr {
                 },
             ) => wa == wb && ea == eb,
             (BoundExpr::Coalesce(a), BoundExpr::Coalesce(b)) => a == b,
+            (BoundExpr::MinMax { op: oa, args: a }, BoundExpr::MinMax { op: ob, args: b }) => {
+                oa == ob && a == b
+            }
             (BoundExpr::NullIf { lhs: la, rhs: ra }, BoundExpr::NullIf { lhs: lb, rhs: rb }) => {
                 la == lb && ra == rb
             }
@@ -1660,6 +1678,16 @@ pub enum BuiltinFn {
     Substr2,
     /// `substr(s: Text, start: Scalar, len: Scalar) -> Text`。
     Substr3,
+    /// `lpad(s: Text, len: Scalar) -> Text`（`fill` 省略形・半角空白で埋める。Issue #1904・SQL-65）。
+    Lpad2,
+    /// `lpad(s: Text, len: Scalar, fill: Text) -> Text`。
+    Lpad3,
+    /// `rpad(s: Text, len: Scalar) -> Text`（Issue #1904・SQL-65）。
+    Rpad2,
+    /// `rpad(s: Text, len: Scalar, fill: Text) -> Text`。
+    Rpad3,
+    /// `split_part(s: Text, delim: Text, n: Scalar) -> Text`（Issue #1904・SQL-65）。
+    SplitPart,
     /// `concat(a: Text, b: Text) -> Text`。可変長 `CONCAT` は束縛段
     /// （[`bind_call`]）でこの 2 引数版の左畳み込みへ展開する。
     Concat2,
@@ -1686,6 +1714,11 @@ pub enum BuiltinFn {
     Round1,
     /// `round(x: Scalar, n: Scalar) -> Scalar`（2 引数形。小数点以下 `n` 桁）。
     Round2,
+    /// `trunc(x: Scalar) -> Scalar`（1 引数形。`trunc` は `round` と同じく arity で
+    /// `Trunc1`／`Trunc2` へオーバーロード解決される。Issue #1908・SQL-65）。
+    Trunc1,
+    /// `trunc(x: Scalar, n: Scalar) -> Scalar`（2 引数形。小数点以下 `n` 桁での切り捨て）。
+    Trunc2,
     /// `floor(x: Scalar) -> Scalar`。
     Floor,
     /// `ceil(x: Scalar) -> Scalar`（`ceiling` はこの variant の別名として解決
@@ -1697,6 +1730,17 @@ pub enum BuiltinFn {
     Power,
     /// `sqrt(x: Scalar) -> Scalar`。
     Sqrt,
+    /// `ln(x: Scalar) -> Scalar`（自然対数。0・負は `2201E`。Issue #1907・SQL-65）。
+    Ln,
+    /// `log(x: Scalar) -> Scalar`（1 引数形。**底 10** の常用対数であり、自然対数ではない。
+    /// `log` は arity で `Log1`／`Log2` へオーバーロード解決される。[`bind_call`] 参照）。
+    Log1,
+    /// `log(b: Scalar, x: Scalar) -> Scalar`（2 引数形。底 `b` の対数）。
+    Log2,
+    /// `exp(x: Scalar) -> Scalar`（あふれ・アンダーフローは `22003`）。
+    Exp,
+    /// `sign(x: Scalar) -> Scalar`（-1／0／1）。
+    Sign,
     /// `date_part(field: Text, src: Timestamp) -> Scalar`／`EXTRACT(field FROM
     /// src)`（対象ビヘイビア: SQL-26。Issue #920）。`field` は束縛時に解決済み
     /// （`bind_call` 参照。実行時の引数は `src` 1 個のみ）。
@@ -1974,12 +2018,18 @@ fn builtin_from_name(name: &str) -> Option<BuiltinFn> {
         "right" => Some(BuiltinFn::Right),
         "reverse" => Some(BuiltinFn::Reverse),
         "initcap" => Some(BuiltinFn::Initcap),
+        // Issue #1904・SQL-65: 引数 3 個固定。`lpad`／`rpad` は 2／3 引数の
+        // オーバーロードのためここには含めない（`bind_pad` が個数で解決する）。
+        "split_part" => Some(BuiltinFn::SplitPart),
         "abs" => Some(BuiltinFn::Abs),
         "floor" => Some(BuiltinFn::Floor),
         "ceil" | "ceiling" => Some(BuiltinFn::Ceil),
         "mod" => Some(BuiltinFn::Mod),
         "power" => Some(BuiltinFn::Power),
         "sqrt" => Some(BuiltinFn::Sqrt),
+        "ln" => Some(BuiltinFn::Ln),
+        "exp" => Some(BuiltinFn::Exp),
+        "sign" => Some(BuiltinFn::Sign),
         "clock_timestamp" => Some(BuiltinFn::ClockTimestamp),
         // Issue #1582・TABLE-34: INTERVAL の正規化関数（引数 1 個固定。予約名になる）。
         "justify_hours" => Some(BuiltinFn::JustifyHours),
@@ -2005,7 +2055,21 @@ fn is_variadic_or_overloaded_builtin_name(name: &str) -> bool {
         // `date_part`／`date_trunc`（対象ビヘイビア: SQL-26。Issue #920）は
         // field／unit の解決結果を `BuiltinFn` のペイロードとして持つため、
         // 名前だけでは variant が一意に定まらない（`round` と同じ理由。§2-4）。
-        "substr" | "substring" | "concat" | "round" | "date_part" | "date_trunc" | "timezone"
+        "substr"
+            | "substring"
+            | "concat"
+            | "round"
+            | "log"
+            | "trunc"
+            | "date_part"
+            | "date_trunc"
+            | "timezone"
+            | "lpad"
+            | "rpad"
+            // `greatest`／`least`（SQL-65・Issue #1909）は引数型を統一する可変長関数で、
+            // `BuiltinFn` では表せないため専用ノード（`BoundExpr::MinMax`）へ束縛する。
+            | "greatest"
+            | "least"
     )
 }
 
@@ -2027,6 +2091,17 @@ pub(crate) fn builtin_signature(f: BuiltinFn) -> (&'static [ExprType], ExprType)
             &[ExprType::Text, ExprType::Scalar, ExprType::Scalar],
             ExprType::Text,
         ),
+        BuiltinFn::Lpad2 | BuiltinFn::Rpad2 => {
+            (&[ExprType::Text, ExprType::Scalar], ExprType::Text)
+        }
+        BuiltinFn::Lpad3 | BuiltinFn::Rpad3 => (
+            &[ExprType::Text, ExprType::Scalar, ExprType::Text],
+            ExprType::Text,
+        ),
+        BuiltinFn::SplitPart => (
+            &[ExprType::Text, ExprType::Text, ExprType::Scalar],
+            ExprType::Text,
+        ),
         BuiltinFn::Concat2 => (&[ExprType::Text, ExprType::Text], ExprType::Text),
         BuiltinFn::Trim => (&[ExprType::Text], ExprType::Text),
         BuiltinFn::Replace => (
@@ -2039,11 +2114,17 @@ pub(crate) fn builtin_signature(f: BuiltinFn) -> (&'static [ExprType], ExprType)
         BuiltinFn::Abs => (&[ExprType::Scalar], ExprType::Scalar),
         BuiltinFn::Round1 => (&[ExprType::Scalar], ExprType::Scalar),
         BuiltinFn::Round2 => (&[ExprType::Scalar, ExprType::Scalar], ExprType::Scalar),
+        BuiltinFn::Trunc1 => (&[ExprType::Scalar], ExprType::Scalar),
+        BuiltinFn::Trunc2 => (&[ExprType::Scalar, ExprType::Scalar], ExprType::Scalar),
         BuiltinFn::Floor => (&[ExprType::Scalar], ExprType::Scalar),
         BuiltinFn::Ceil => (&[ExprType::Scalar], ExprType::Scalar),
         BuiltinFn::Mod => (&[ExprType::Scalar, ExprType::Scalar], ExprType::Scalar),
         BuiltinFn::Power => (&[ExprType::Scalar, ExprType::Scalar], ExprType::Scalar),
         BuiltinFn::Sqrt => (&[ExprType::Scalar], ExprType::Scalar),
+        BuiltinFn::Ln | BuiltinFn::Log1 | BuiltinFn::Exp | BuiltinFn::Sign => {
+            (&[ExprType::Scalar], ExprType::Scalar)
+        }
+        BuiltinFn::Log2 => (&[ExprType::Scalar, ExprType::Scalar], ExprType::Scalar),
         // `date_part`／`date_trunc` の実行時引数は `src`（`Timestamp`。`DATE`
         // 入力は束縛時に `DateToTimestamp` で昇格済み）1 個のみ。field／unit は
         // `BuiltinFn` のペイロードとして束縛時に解決済みのため実行時引数には
@@ -2145,11 +2226,18 @@ pub(crate) fn is_foldable_builtin(f: BuiltinFn) -> bool {
         BuiltinFn::Abs
         | BuiltinFn::Round1
         | BuiltinFn::Round2
+        | BuiltinFn::Trunc1
+        | BuiltinFn::Trunc2
         | BuiltinFn::Floor
         | BuiltinFn::Ceil
         | BuiltinFn::Mod
         | BuiltinFn::Power
-        | BuiltinFn::Sqrt => true,
+        | BuiltinFn::Sqrt
+        | BuiltinFn::Ln
+        | BuiltinFn::Log1
+        | BuiltinFn::Log2
+        | BuiltinFn::Exp
+        | BuiltinFn::Sign => true,
         // Issue #919・SQL-26: 文字列組み込みは `try_fold_scalar`
         // （`FoldedConst::Scalar`/`Bool` のみを表現できる型）の畳み込み対象に
         // 含めない。正しさには影響しない（§3-8 は対象外事項）。
@@ -2159,6 +2247,11 @@ pub(crate) fn is_foldable_builtin(f: BuiltinFn) -> bool {
         | BuiltinFn::Length
         | BuiltinFn::Substr2
         | BuiltinFn::Substr3
+        | BuiltinFn::Lpad2
+        | BuiltinFn::Lpad3
+        | BuiltinFn::Rpad2
+        | BuiltinFn::Rpad3
+        | BuiltinFn::SplitPart
         | BuiltinFn::Concat2
         | BuiltinFn::Trim
         | BuiltinFn::Replace
@@ -2236,8 +2329,12 @@ pub(crate) fn builtin_call_arity(name: &str) -> Option<BuiltinArity> {
     let fixed = |min, max| Some(BuiltinArity { min, max });
     match name.to_ascii_lowercase().as_str() {
         "concat" => fixed(1, MAX_FUNCTION_CALL_ARGS),
+        "greatest" | "least" => fixed(1, MAX_FUNCTION_CALL_ARGS),
         "substr" => fixed(2, 3),
+        "lpad" | "rpad" => fixed(2, 3),
         "round" => fixed(1, 2),
+        "log" => fixed(1, 2),
+        "trunc" => fixed(1, 2),
         "date_part" => fixed(2, 2),
         "date_trunc" => fixed(2, 3),
         "timezone" => fixed(1, 2),
@@ -2320,8 +2417,9 @@ pub struct UdfDefinition {
 }
 
 /// セッション単位の UDF レジストリ（`sql::mode::SessionState` が保持する）。
-/// 追記専用（再定義・`DROP` は許可しない。RLS-8 と同じ「認証済みテナントの接続単位」
-/// の外へ漏れない構造にするため、他セッション・永続化とは無関係に保つ）。
+/// 再定義は許可しない（同名は `42723`）。削除は `DROP FUNCTION`（#1920）だけが [`Self::remove`] で行う。
+/// 永続化（#1920）後も、レジストリは RLS-8 と同じ「認証済みテナントの接続単位」の外へ漏れない構造を
+/// 保つ（カタログは自テナントの scope でしか引けず、セッションへのロードは #1921 が担う）。
 ///
 /// `PartialEq` は手動実装する（`wasm` マップの値 `Arc<dyn WasmUdfBackend>` が
 /// `dyn` 型のため構造的な `derive` を導出できない。宣言的 UDF 定義は構造等価、
@@ -2334,11 +2432,25 @@ pub struct UdfRegistry {
     /// [`define_wasm_function`]・[`define_function`] の双方が
     /// [`is_name_taken`] を通して行う）。
     wasm: std::collections::BTreeMap<String, Arc<dyn WasmUdfBackend>>,
+    /// SQL-66（Issue #1921）: UDF カタログからロードした宣言的 UDF の名前（小文字化済みのキー）。
+    /// セッション内で作った定義と区別するための出所（provenance）で、`DROP FUNCTION` の権限判定と
+    /// refresh 時の入れ替え（カタログ由来だけを消して入れ直す）に使う。
+    catalog_names: std::collections::BTreeSet<String>,
+    /// カタログ由来の登録を束縛したテナント（scope）。refresh で ctx のテナントが異なれば
+    /// 何もロードせずカタログ由来を全部消す（他テナントの定義を見せない。P0）。
+    catalog_scope: Option<Box<str>>,
+    /// ロード時に読んだ UDF カタログの世代（`Storage` のテナント単位の世代）。
+    catalog_generation: u64,
 }
 
 impl PartialEq for UdfRegistry {
     fn eq(&self, other: &Self) -> bool {
-        if self.defs != other.defs || self.wasm.len() != other.wasm.len() {
+        if self.defs != other.defs
+            || self.wasm.len() != other.wasm.len()
+            || self.catalog_names != other.catalog_names
+            || self.catalog_scope != other.catalog_scope
+            || self.catalog_generation != other.catalog_generation
+        {
             return false;
         }
         self.wasm.iter().all(|(name, backend)| {
@@ -2369,10 +2481,65 @@ impl UdfRegistry {
         self.defs.is_empty() && self.wasm.is_empty()
     }
 
+    /// 宣言的 UDF・WASM UDF を名前（大文字小文字を区別しない）で削除し、削除したら `true`
+    /// （`DROP FUNCTION` から呼ばれる。同じ名前空間を共有するため両方の表から外す）。
+    pub(crate) fn remove(&mut self, name: &str) -> bool {
+        let lower = name.to_ascii_lowercase();
+        self.catalog_names.remove(&lower);
+        let a = self.defs.remove(&lower).is_some();
+        let b = self.wasm.remove(&lower).is_some();
+        a || b
+    }
+
+    /// `name` の登録が UDF カタログ由来か（`sql::udf_ddl` が権限の無いセッションの `DROP FUNCTION` を
+    /// `42501` にするかの判定に使う）。
+    pub(crate) fn is_catalog_origin(&self, name: &str) -> bool {
+        self.catalog_names.contains(&name.to_ascii_lowercase())
+    }
+
+    /// カタログ由来として登録されている件数（`sql::udf_load` が「非カタログ登録が枠を占めているか」の
+    /// 判定に使う）。
+    pub(crate) fn catalog_entry_count(&self) -> usize {
+        self.catalog_names.len()
+    }
+
+    /// 既に登録済みの `name` をカタログ由来として印付けする（`sql::udf_load`・
+    /// `sql::udf_ddl::execute_create_function_persistent` から。未登録の名前は無視する）。
+    pub(crate) fn mark_catalog_origin(&mut self, name: &str) {
+        let lower = name.to_ascii_lowercase();
+        if self.defs.contains_key(&lower) {
+            self.catalog_names.insert(lower);
+        }
+    }
+
+    /// カタログ由来の登録を全部消す（リロード・refresh 失敗時・テナント不一致時）。
+    /// セッション内由来・WASM UDF は残す。束縛した scope と世代は呼び出し側が管理する。
+    pub(crate) fn remove_catalog_entries(&mut self) {
+        for name in std::mem::take(&mut self.catalog_names) {
+            self.defs.remove(&name);
+        }
+    }
+
+    /// カタログ由来の登録を束縛した scope（未ロードなら `None`）。
+    pub(crate) fn catalog_scope(&self) -> Option<&str> {
+        self.catalog_scope.as_deref()
+    }
+
+    /// ロード時に読んだ UDF カタログの世代。
+    pub(crate) fn catalog_generation(&self) -> u64 {
+        self.catalog_generation
+    }
+
+    /// カタログ由来の登録を束縛する scope と世代を記録する。
+    pub(crate) fn set_catalog_binding(&mut self, scope: Option<&str>, generation: u64) {
+        self.catalog_scope = scope.map(Into::into);
+        self.catalog_generation = generation;
+    }
+
     /// 名前空間（組み込み・宣言的 UDF・WASM UDF を横断した名前）が既に使われて
     /// いるかを判定する（[`define_function`]・[`define_wasm_function`] が共有する
     /// 衝突検査）。
-    fn is_name_taken(&self, lower: &str) -> bool {
+    pub(crate) fn is_name_taken(&self, lower: &str) -> bool {
         self.defs.contains_key(lower) || self.wasm.contains_key(lower)
     }
 }
@@ -2395,6 +2562,51 @@ pub fn define_function(
     params: &[String],
     body: &Expr,
 ) -> Result<(), SqlSurfaceError> {
+    let prepared = prepare_function_definition(registry, name, params, body)?;
+    commit_function_definition(registry, prepared);
+    Ok(())
+}
+
+/// [`prepare_function_definition`] が返す検証済みの定義（レジストリへ入れる直前の値。
+/// `CREATE FUNCTION` の永続化経路（`sql::udf_ddl`）がカタログへ書く値の元にもなる）。
+#[derive(Debug, Clone)]
+pub(crate) struct PreparedUdf {
+    /// 小文字化済みの関数キー（裸の名前または `#<id>.<name>`）。
+    pub(crate) key: String,
+    /// 小文字化済みの引数名。
+    pub(crate) params: Vec<String>,
+    pub(crate) body: Expr,
+}
+
+/// [`define_function`] の検証部（レジストリは変更しない）。永続化経路が「検証 → カタログ書き込み →
+/// 登録」の順を守れるよう、検証と登録（[`commit_function_definition`]）を分けている。
+pub(crate) fn prepare_function_definition(
+    registry: &UdfRegistry,
+    name: &str,
+    params: &[String],
+    body: &Expr,
+) -> Result<PreparedUdf, SqlSurfaceError> {
+    prepare_function_definition_inner(registry, name, params, body, true)
+}
+
+/// レジストリ容量の上限だけを無視して登録可否を検査する（UDF カタログロードが「容量による一時的な
+/// ブロック」と「恒久的にロード不能（呼び出し先の消失・予約名など）」を区別するために使う）。
+pub(crate) fn prepare_function_definition_ignoring_capacity(
+    registry: &UdfRegistry,
+    name: &str,
+    params: &[String],
+    body: &Expr,
+) -> Result<PreparedUdf, SqlSurfaceError> {
+    prepare_function_definition_inner(registry, name, params, body, false)
+}
+
+fn prepare_function_definition_inner(
+    registry: &UdfRegistry,
+    name: &str,
+    params: &[String],
+    body: &Expr,
+    check_capacity: bool,
+) -> Result<PreparedUdf, SqlSurfaceError> {
     // 関数名は relation キー（裸の名前、または SCHEMA 配下の内部キー `#<id>.<name>`。
     // 名前解決器が `CREATE FUNCTION s.f(` を解決した出力。TABLE-27・Issue #1717）を受理する。
     catalog::validate_relation_key(name)
@@ -2410,7 +2622,7 @@ pub fn define_function(
             "function {name} is already defined in this session"
         )));
     }
-    if registry.len() >= MAX_SESSION_UDFS {
+    if check_capacity && registry.len() >= MAX_SESSION_UDFS {
         return Err(SqlSurfaceError::payload_too_large(
             "too many functions defined in this session",
         ));
@@ -2449,14 +2661,23 @@ pub fn define_function(
     let mut node_budget = MAX_EXPR_NODES;
     validate_closed_expr(body, &normalized_params, registry, &mut node_budget)?;
 
+    Ok(PreparedUdf {
+        key: lower,
+        params: normalized_params,
+        body: body.clone(),
+    })
+}
+
+/// 検証済みの定義をレジストリへ登録する（BTreeMap への挿入だけで失敗しない）。永続化経路では
+/// カタログの commit 成功後にだけ呼ぶ（カタログで失敗したらセッションは変わらない）。
+pub(crate) fn commit_function_definition(registry: &mut UdfRegistry, prepared: PreparedUdf) {
     registry.defs.insert(
-        lower,
+        prepared.key,
         UdfDefinition {
-            params: normalized_params,
-            body: body.clone(),
+            params: prepared.params,
+            body: prepared.body,
         },
     );
-    Ok(())
 }
 
 /// テスト専用: `define_function` のパラメータ名正規化（小文字化）を経由せず、
@@ -2601,7 +2822,10 @@ fn validate_closed_expr(
                         "function concat expects at least 1 argument, got 0",
                     ));
                 }
-            } else if name.eq_ignore_ascii_case("substr") || name.eq_ignore_ascii_case("substring")
+            } else if name.eq_ignore_ascii_case("substr")
+                || name.eq_ignore_ascii_case("substring")
+                || name.eq_ignore_ascii_case("lpad")
+                || name.eq_ignore_ascii_case("rpad")
             {
                 if !matches!(args.len(), 2 | 3) {
                     return Err(SqlSurfaceError::undefined_function(format!(
@@ -2634,8 +2858,14 @@ fn validate_closed_expr(
                         args.len()
                     )));
                 }
-            } else if name.eq_ignore_ascii_case("round") {
-                // `round` は arity オーバーロード（1／2 引数）。他の組み込みと
+            } else if name.eq_ignore_ascii_case("greatest") || name.eq_ignore_ascii_case("least") {
+                // `greatest`／`least`（SQL-65・Issue #1909）。個数は上の `check_builtin_arity` が
+                // 照合済みで、型の統一検査は呼び出し時（`bind_min_max`）が行う。
+            } else if name.eq_ignore_ascii_case("round")
+                || name.eq_ignore_ascii_case("trunc")
+                || name.eq_ignore_ascii_case("log")
+            {
+                // `round`／`trunc`／`log`（Issue #1907・#1908）は arity オーバーロード（1／2 引数）。他の組み込みと
                 // 異なり単一の `BuiltinFn` に定まらないため、ここでは引数個数の
                 // 妥当性のみ検査する（実際の variant 解決は呼び出し時の
                 // `bind_call` が行う）。
@@ -2893,6 +3123,7 @@ fn count_bound_nodes(expr: &BoundExpr) -> usize {
                 + count_bound_nodes(else_result)
         }
         BoundExpr::Coalesce(args) => 1 + args.iter().map(count_bound_nodes).sum::<usize>(),
+        BoundExpr::MinMax { args, .. } => 1 + args.iter().map(count_bound_nodes).sum::<usize>(),
         BoundExpr::Like { lhs, .. } | BoundExpr::RegexMatch { lhs, .. } => {
             1 + count_bound_nodes(lhs)
         }
@@ -3001,6 +3232,9 @@ fn max_bound_case_nesting(expr: &BoundExpr) -> usize {
             1 + branches_max.max(max_bound_case_nesting(else_result))
         }
         BoundExpr::Coalesce(args) => 1 + args.iter().map(max_bound_case_nesting).max().unwrap_or(0),
+        BoundExpr::MinMax { args, .. } => {
+            1 + args.iter().map(max_bound_case_nesting).max().unwrap_or(0)
+        }
         BoundExpr::Like { lhs, .. } | BoundExpr::RegexMatch { lhs, .. } => {
             max_bound_case_nesting(lhs)
         }
@@ -3095,6 +3329,7 @@ pub(crate) fn references_embedding(expr: &BoundExpr) -> bool {
                 || references_embedding(else_result)
         }
         BoundExpr::Coalesce(args) => args.iter().any(references_embedding),
+        BoundExpr::MinMax { args, .. } => args.iter().any(references_embedding),
         BoundExpr::Like { lhs, .. } | BoundExpr::RegexMatch { lhs, .. } => {
             references_embedding(lhs)
         }
@@ -3219,7 +3454,7 @@ pub(crate) fn visit_referenced_scalar_columns(expr: &BoundExpr, visit: &mut dyn 
             }
             visit_referenced_scalar_columns(else_result, visit);
         }
-        BoundExpr::Coalesce(args) => {
+        BoundExpr::Coalesce(args) | BoundExpr::MinMax { args, .. } => {
             for a in args {
                 visit_referenced_scalar_columns(a, visit);
             }
@@ -3412,7 +3647,7 @@ pub(crate) fn mark_referenced_scalar_columns(expr: &BoundExpr, mask: &mut [bool]
             }
             any
         }
-        BoundExpr::Coalesce(args) => {
+        BoundExpr::Coalesce(args) | BoundExpr::MinMax { args, .. } => {
             let mut any = false;
             for a in args {
                 if mark_referenced_scalar_columns(a, mask) {
@@ -4219,6 +4454,77 @@ fn bind_coalesce(
             .map(|((b, a), t)| coerce_branch(coercion, a, b, *t, schema))
             .collect();
         Ok((BoundExpr::Coalesce(bound_args), final_ty))
+    })
+}
+
+/// `GREATEST(<arg>, ...)`／`LEAST(<arg>, ...)` を束縛する（対象ビヘイビア: SQL-65 ポインタ。
+/// Issue #1909）。引数型の統一は `COALESCE` と同じ規則（[`unify_branch_type_numeric`]）で、
+/// 統一できなければ `42804`。統一後の型が比較器を持たない場合は fail-closed で拒否する
+/// （`Vector` は比較演算子が無いため `42883`、その他の未対応型は `0A000`）。引数個数の
+/// 上限は `bind_call` 入口（[`MAX_FUNCTION_CALL_ARGS`]・`54023`）が検査済み。
+fn bind_min_max(
+    op: MinMaxOp,
+    args: &[Expr],
+    env: &mut BindEnv<'_>,
+    node_budget: &mut usize,
+) -> Result<(BoundExpr, ExprType), SqlSurfaceError> {
+    bind_with_case_nesting(env, |env| {
+        let mut bound_args = Vec::with_capacity(args.len());
+        let mut unified: Option<ExprType> = None;
+        let mut arg_tys: Vec<Option<ExprType>> = Vec::with_capacity(args.len());
+        for a in args {
+            let (b, t) = bind_null_aware(a, env, node_budget)?;
+            unify_branch_type_numeric(
+                env,
+                &mut unified,
+                t,
+                "GREATEST/LEAST arguments must have the same type",
+            )?;
+            arg_tys.push(t);
+            bound_args.push(b);
+        }
+        let final_ty = unified.ok_or_else(|| SqlSurfaceError::FeatureNotSupported {
+            detail: "GREATEST/LEAST with only NULL arguments has no determinable type".to_string(),
+        })?;
+        match final_ty {
+            ExprType::Scalar
+            | ExprType::Text
+            | ExprType::Date
+            | ExprType::Timestamp
+            | ExprType::Time
+            | ExprType::TimestampTz => {}
+            ExprType::Vector => {
+                return Err(SqlSurfaceError::undefined_function(
+                    "GREATEST/LEAST does not support vector arguments",
+                ));
+            }
+            _ => {
+                return Err(SqlSurfaceError::FeatureNotSupported {
+                    detail: "GREATEST/LEAST does not support this argument type".to_string(),
+                });
+            }
+        }
+        let branches: Vec<(&Expr, &BoundExpr, Option<ExprType>)> = args
+            .iter()
+            .zip(bound_args.iter())
+            .zip(arg_tys.iter())
+            .map(|((a, b), t)| (a, b, *t))
+            .collect();
+        let coercion = branch_coercion(env, final_ty, &branches);
+        let schema = env.schema;
+        let bound_args: Vec<BoundExpr> = bound_args
+            .into_iter()
+            .zip(args.iter())
+            .zip(arg_tys.iter())
+            .map(|((b, a), t)| coerce_branch(coercion, a, b, *t, schema))
+            .collect();
+        Ok((
+            BoundExpr::MinMax {
+                op,
+                args: bound_args,
+            },
+            final_ty,
+        ))
     })
 }
 
@@ -5980,6 +6286,18 @@ pub(crate) fn projection_kind(
             }
             return acc;
         }
+        (
+            Expr::Call { args, .. },
+            BoundExpr::MinMax {
+                args: bound_args, ..
+            },
+        ) if args.len() == bound_args.len() => {
+            let mut acc = ProjKind::Null;
+            for (a, b) in args.iter().zip(bound_args.iter()) {
+                acc = common_proj_kind(acc, projection_kind(a, b, schema));
+            }
+            return acc;
+        }
         (Expr::Coalesce(args), BoundExpr::Coalesce(bound_args))
             if args.len() == bound_args.len() =>
         {
@@ -7099,6 +7417,14 @@ fn bind_call(
     if lower_name == "concat" {
         return bind_concat(args, env, node_budget);
     }
+    if lower_name == "greatest" || lower_name == "least" {
+        let op = if lower_name == "greatest" {
+            MinMaxOp::Greatest
+        } else {
+            MinMaxOp::Least
+        };
+        return bind_min_max(op, args, env, node_budget);
+    }
     if let Some(kind) = json_fn_from_name(&lower_name) {
         return bind_json_fn(name, kind, args, env, node_budget);
     }
@@ -7111,17 +7437,15 @@ fn bind_call(
     if lower_name == "substr" || lower_name == "substring" {
         return bind_substr(name, args, env, node_budget);
     }
-    if name.eq_ignore_ascii_case("round") {
-        // `round` は arity オーバーロード（SQL-26）: 1 引数形は
-        // `BuiltinFn::Round1`、2 引数形（小数点以下 `n` 桁）は `BuiltinFn::Round2`
-        // へ解決する。他の組み込みのように `builtin_from_name` 1 個には
-        // 定まらないため、ここで名前を先に見て arity から variant を選ぶ。
+    if name.eq_ignore_ascii_case("log") {
+        // `log` は arity オーバーロード（Issue #1907・SQL-65）: 1 引数形は底 10 の
+        // `BuiltinFn::Log1`、2 引数形（底, 真数）は `BuiltinFn::Log2` へ解決する。
         let builtin = match args.len() {
-            1 => BuiltinFn::Round1,
-            2 => BuiltinFn::Round2,
+            1 => BuiltinFn::Log1,
+            2 => BuiltinFn::Log2,
             n => {
                 return Err(SqlSurfaceError::undefined_function(format!(
-                    "function round expects 1 or 2 argument(s), got {n}"
+                    "function log expects 1 or 2 argument(s), got {n}"
                 )));
             }
         };
@@ -7131,8 +7455,47 @@ fn bind_call(
             let (b, ty) = bind_expr_in(a, env, node_budget)?;
             if ty != *expected {
                 return Err(SqlSurfaceError::datatype_mismatch(
-                    "function round argument type mismatch",
+                    "function log argument type mismatch",
                 ));
+            }
+            bound_args.push(b);
+        }
+        return Ok((
+            BoundExpr::Builtin {
+                f: builtin,
+                args: bound_args,
+            },
+            ret,
+        ));
+    }
+    if lower_name == "lpad" || lower_name == "rpad" {
+        return bind_pad(name, &lower_name, args, env, node_budget);
+    }
+    if lower_name == "round" || lower_name == "trunc" {
+        // `round`（SQL-26）／`trunc`（Issue #1908・SQL-65）は arity オーバーロード:
+        // 1 引数形は `Round1`／`Trunc1`、2 引数形（小数点以下 `n` 桁）は
+        // `Round2`／`Trunc2` へ解決する。他の組み込みのように `builtin_from_name` 1 個には
+        // 定まらないため、ここで名前を先に見て arity から variant を選ぶ。
+        let is_round = lower_name == "round";
+        let builtin = match (args.len(), is_round) {
+            (1, true) => BuiltinFn::Round1,
+            (2, true) => BuiltinFn::Round2,
+            (1, false) => BuiltinFn::Trunc1,
+            (2, false) => BuiltinFn::Trunc2,
+            (n, _) => {
+                return Err(SqlSurfaceError::undefined_function(format!(
+                    "function {lower_name} expects 1 or 2 argument(s), got {n}"
+                )));
+            }
+        };
+        let (param_types, ret) = builtin_signature(builtin);
+        let mut bound_args = Vec::with_capacity(args.len());
+        for (a, expected) in args.iter().zip(param_types.iter()) {
+            let (b, ty) = bind_expr_in(a, env, node_budget)?;
+            if ty != *expected {
+                return Err(SqlSurfaceError::datatype_mismatch(format!(
+                    "function {lower_name} argument type mismatch"
+                )));
             }
             bound_args.push(b);
         }
@@ -7192,6 +7555,9 @@ fn bind_call(
                 param_types.len(),
                 args.len()
             )));
+        }
+        if matches!(builtin, BuiltinFn::SplitPart) {
+            return bind_strict_text_fn(name, builtin, args, param_types, ret, env, node_budget);
         }
         // `justify_*`（Issue #1582）は strict 関数: 裸の `NULL` 引数は型検査で
         // 弾かず、結果型 `Interval` の `NULL` として伝播させる（`date_part` 等と同方針）。
@@ -7892,6 +8258,68 @@ fn bind_substr(
             return Err(SqlSurfaceError::datatype_mismatch(format!(
                 "function {name} argument type mismatch"
             )));
+        }
+        bound_args.push(b);
+    }
+    Ok((
+        BoundExpr::Builtin {
+            f: builtin,
+            args: bound_args,
+        },
+        ret,
+    ))
+}
+
+/// `LPAD`／`RPAD(s, len[, fill])`（Issue #1904・SQL-65）。引数 2 個は `*2`、3 個は `*3`
+/// variant へ束縛する。型不一致は `42804`、個数不一致は `42883`。
+fn bind_pad(
+    name: &str,
+    lower_name: &str,
+    args: &[Expr],
+    env: &mut BindEnv<'_>,
+    node_budget: &mut usize,
+) -> Result<(BoundExpr, ExprType), SqlSurfaceError> {
+    let is_lpad = lower_name == "lpad";
+    let builtin = match (args.len(), is_lpad) {
+        (2, true) => BuiltinFn::Lpad2,
+        (3, true) => BuiltinFn::Lpad3,
+        (2, false) => BuiltinFn::Rpad2,
+        (3, false) => BuiltinFn::Rpad3,
+        (got, _) => {
+            return Err(SqlSurfaceError::undefined_function(format!(
+                "function {name} expects 2 or 3 arguments, got {got}"
+            )))
+        }
+    };
+    let (param_types, ret) = builtin_signature(builtin);
+    bind_strict_text_fn(name, builtin, args, param_types, ret, env, node_budget)
+}
+
+/// strict 組み込み（`lpad`／`rpad`／`split_part`。Issue #1904・SQL-65）の引数束縛。
+/// 裸の `NULL` 引数は [`bind_null_aware`] で型未確定のまま受理し、非 NULL 引数のみ
+/// 宣言型と照合する。いずれかが `NULL` なら結果型 `ret` の `NULL` として伝播させる。
+fn bind_strict_text_fn(
+    name: &str,
+    builtin: BuiltinFn,
+    args: &[Expr],
+    param_types: &[ExprType],
+    ret: ExprType,
+    env: &mut BindEnv<'_>,
+    node_budget: &mut usize,
+) -> Result<(BoundExpr, ExprType), SqlSurfaceError> {
+    let mut bound_args = Vec::with_capacity(args.len());
+    for (a, expected) in args.iter().zip(param_types.iter()) {
+        let (b, ty) = bind_null_aware(a, env, node_budget)?;
+        match ty {
+            // NULL リテラルは束縛時に呼び出し全体を NULL へ畳まず、評価時の strict な NULL 伝播に
+            // 委ねる（兄弟引数の評価時エラー、例えば 1/0 を握りつぶさないため）。
+            None => {}
+            Some(t) if t != *expected => {
+                return Err(SqlSurfaceError::datatype_mismatch(format!(
+                    "function {name} argument type mismatch"
+                )));
+            }
+            Some(_) => {}
         }
         bound_args.push(b);
     }
@@ -8887,6 +9315,14 @@ pub(crate) fn eval_with_scalars<'a>(
             }
             Ok(ExprValue::Null)
         }
+        BoundExpr::MinMax { op, args } => {
+            // PostgreSQL と同じく短絡せず全引数を評価する（評価エラーは伝播する）。
+            let mut values = Vec::with_capacity(args.len());
+            for a in args {
+                values.push(eval_with_scalars(a, id, embedding, row_scalars)?);
+            }
+            fold_min_max(*op, values)
+        }
         BoundExpr::NullIf { lhs, rhs } => {
             let l = eval_with_scalars(lhs, id, embedding, row_scalars)?;
             let r = eval_with_scalars(rhs, id, embedding, row_scalars)?;
@@ -8955,6 +9391,52 @@ pub(crate) fn eval_is_distinct_from<'a>(
         },
     };
     Ok(ExprValue::Bool(distinct != negated))
+}
+
+/// `GREATEST`／`LEAST` の畳み込み評価（対象ビヘイビア: SQL-65 ポインタ。Issue #1909）。
+/// `eval_with_scalars` の `BoundExpr::MinMax` 腕から呼ばれる（バイトコード経路は部分木ごと
+/// 木評価へ委ねるため実装は 1 箇所）。NULL は無視し、全引数 NULL なら NULL を返す。
+/// 比較は既存の比較演算（[`eval_binary`]）に任せ、同値のときは先に現れた値を残す。
+/// 比較結果が真偽値で返らないのは束縛段の不変条件が崩れた場合だけで、`Internal` で拒否する。
+fn fold_min_max<'a>(
+    op: MinMaxOp,
+    values: Vec<ExprValue<'a>>,
+) -> Result<ExprValue<'a>, SqlSurfaceError> {
+    let cmp = match op {
+        MinMaxOp::Greatest => BinOp::Gt,
+        MinMaxOp::Least => BinOp::Lt,
+    };
+    let mut acc: Option<ExprValue<'a>> = None;
+    for cand in values {
+        if matches!(cand, ExprValue::Null) {
+            continue;
+        }
+        acc = Some(match acc {
+            None => cand,
+            // 浮動小数（REAL／DOUBLE は `Scalar`）は集約 MIN/MAX と同じ `total_cmp` の全順序で
+            // 比較する。`>`／`<` は NaN を含むと常に偽で結果が引数順に依存するため使わない。
+            Some(ExprValue::Scalar(cur)) if matches!(cand, ExprValue::Scalar(_)) => {
+                let ExprValue::Scalar(c) = cand else {
+                    unreachable!("guarded by matches!")
+                };
+                let better = match op {
+                    MinMaxOp::Greatest => c.total_cmp(&cur).is_gt(),
+                    MinMaxOp::Least => c.total_cmp(&cur).is_lt(),
+                };
+                ExprValue::Scalar(if better { c } else { cur })
+            }
+            Some(cur) => match eval_binary(cmp, cand.clone(), cur.clone())? {
+                ExprValue::Bool(true) => cand,
+                ExprValue::Bool(false) => cur,
+                _ => {
+                    return Err(SqlSurfaceError::Internal {
+                        detail: "GREATEST/LEAST comparison did not evaluate to boolean".to_string(),
+                    })
+                }
+            },
+        });
+    }
+    Ok(acc.unwrap_or(ExprValue::Null))
 }
 
 /// `NULLIF(lhs, rhs)` を値ベースで評価する（`CASE WHEN lhs = rhs THEN NULL ELSE
@@ -9197,6 +9679,52 @@ pub(crate) fn apply_builtin<'a>(
                 _ => Ok(ExprValue::Null),
             }
         }
+        BuiltinFn::Lpad2 | BuiltinFn::Rpad2 => {
+            match (
+                take_text_or_null_arg(args, 0)?,
+                take_scalar_or_null_arg(args, 1)?,
+            ) {
+                (Some(s), Some(len)) => {
+                    let out = if matches!(f, BuiltinFn::Lpad2) {
+                        string_fn::lpad(&s, len, " ")?
+                    } else {
+                        string_fn::rpad(&s, len, " ")?
+                    };
+                    Ok(ExprValue::Text(Cow::Owned(out)))
+                }
+                _ => Ok(ExprValue::Null),
+            }
+        }
+        BuiltinFn::Lpad3 | BuiltinFn::Rpad3 => {
+            match (
+                take_text_or_null_arg(args, 0)?,
+                take_scalar_or_null_arg(args, 1)?,
+                take_text_or_null_arg(args, 2)?,
+            ) {
+                (Some(s), Some(len), Some(fill)) => {
+                    let out = if matches!(f, BuiltinFn::Lpad3) {
+                        string_fn::lpad(&s, len, &fill)?
+                    } else {
+                        string_fn::rpad(&s, len, &fill)?
+                    };
+                    Ok(ExprValue::Text(Cow::Owned(out)))
+                }
+                _ => Ok(ExprValue::Null),
+            }
+        }
+        BuiltinFn::SplitPart => {
+            match (
+                take_text_or_null_arg(args, 0)?,
+                take_text_or_null_arg(args, 1)?,
+                take_scalar_or_null_arg(args, 2)?,
+            ) {
+                (Some(s), Some(delim), Some(n)) => {
+                    let out = string_fn::split_part(&s, &delim, n)?;
+                    Ok(ExprValue::Text(Cow::Owned(out)))
+                }
+                _ => Ok(ExprValue::Null),
+            }
+        }
         BuiltinFn::Concat2 => {
             let a = take_text_or_null_arg(args, 0)?.unwrap_or(Cow::Borrowed(""));
             let b = take_text_or_null_arg(args, 1)?.unwrap_or(Cow::Borrowed(""));
@@ -9240,6 +9768,15 @@ pub(crate) fn apply_builtin<'a>(
             let n = take_scalar_arg(args, 1)?;
             crate::sql::numeric_fn::round2(x, n).map(ExprValue::Scalar)
         }
+        BuiltinFn::Trunc1 => {
+            let x = take_scalar_arg(args, 0)?;
+            crate::sql::numeric_fn::trunc1(x).map(ExprValue::Scalar)
+        }
+        BuiltinFn::Trunc2 => {
+            let x = take_scalar_arg(args, 0)?;
+            let n = take_scalar_arg(args, 1)?;
+            crate::sql::numeric_fn::trunc2(x, n).map(ExprValue::Scalar)
+        }
         BuiltinFn::Floor => {
             let x = take_scalar_arg(args, 0)?;
             crate::sql::numeric_fn::floor(x).map(ExprValue::Scalar)
@@ -9261,6 +9798,28 @@ pub(crate) fn apply_builtin<'a>(
         BuiltinFn::Sqrt => {
             let x = take_scalar_arg(args, 0)?;
             crate::sql::numeric_fn::sqrt(x).map(ExprValue::Scalar)
+        }
+        // Issue #1907・SQL-65: 対数・指数・符号。定義域外は numeric_fn が fail-closed に拒否する。
+        BuiltinFn::Ln => {
+            let x = take_scalar_arg(args, 0)?;
+            crate::sql::numeric_fn::ln(x).map(ExprValue::Scalar)
+        }
+        BuiltinFn::Log1 => {
+            let x = take_scalar_arg(args, 0)?;
+            crate::sql::numeric_fn::log10(x).map(ExprValue::Scalar)
+        }
+        BuiltinFn::Log2 => {
+            let b = take_scalar_arg(args, 0)?;
+            let x = take_scalar_arg(args, 1)?;
+            crate::sql::numeric_fn::log_base(b, x).map(ExprValue::Scalar)
+        }
+        BuiltinFn::Exp => {
+            let x = take_scalar_arg(args, 0)?;
+            crate::sql::numeric_fn::exp(x).map(ExprValue::Scalar)
+        }
+        BuiltinFn::Sign => {
+            let x = take_scalar_arg(args, 0)?;
+            crate::sql::numeric_fn::sign(x).map(ExprValue::Scalar)
         }
         // 対象ビヘイビア: SQL-26（Issue #920）。`date_part`／`date_trunc` の
         // 実行時引数は `src`（`Timestamp`）1 個のみ（field／unit は束縛済みの
@@ -10726,7 +11285,15 @@ mod tests {
         for name in [
             "concat",
             "substr",
+            "lpad",
+            "rpad",
+            "split_part",
             "round",
+            "log",
+            "ln",
+            "exp",
+            "sign",
+            "trunc",
             "date_part",
             "date_trunc",
             "timezone",
@@ -10737,6 +11304,8 @@ mod tests {
             "lower",
             "vec_norm",
             "justify_days",
+            "greatest",
+            "least",
         ] {
             assert!(is_builtin_function_name(name), "{name}");
             let a = builtin_call_arity(name).unwrap_or_else(|| panic!("{name} not in table"));
@@ -10751,7 +11320,58 @@ mod tests {
         );
         let lower = builtin_call_arity("lower").expect("lower");
         assert_eq!((lower.min, lower.max), (1, 1));
+        let lpad = builtin_call_arity("LPAD").expect("lpad");
+        assert_eq!((lpad.min, lpad.max), (2, 3));
+        let sp = builtin_call_arity("split_part").expect("split_part");
+        assert_eq!((sp.min, sp.max), (3, 3));
         assert!(builtin_call_arity("mystery_fn").is_none());
+    }
+
+    /// Issue #1909・SQL-65: `GREATEST`／`LEAST` の畳み込みは NULL を無視し、全 NULL なら NULL、
+    /// 同値では先に現れた値を残す。
+    #[test]
+    fn fold_min_max_ignores_nulls_and_keeps_first_on_ties() {
+        use ExprValue::{Null, Scalar, Text};
+        let v = |xs: Vec<ExprValue<'static>>| xs;
+        assert_eq!(
+            fold_min_max(
+                MinMaxOp::Greatest,
+                v(vec![Null, Scalar(1.0), Null, Scalar(3.0)])
+            )
+            .unwrap(),
+            Scalar(3.0)
+        );
+        assert_eq!(
+            fold_min_max(MinMaxOp::Least, v(vec![Scalar(2.0), Null, Scalar(-1.0)])).unwrap(),
+            Scalar(-1.0)
+        );
+        assert_eq!(
+            fold_min_max(MinMaxOp::Greatest, v(vec![Null, Null])).unwrap(),
+            Null
+        );
+        assert_eq!(
+            fold_min_max(
+                MinMaxOp::Least,
+                v(vec![Text("b".into()), Text("B".into()), Text("a".into())])
+            )
+            .unwrap(),
+            Text("B".into())
+        );
+        // NaN は最大として扱い、引数順に依存しない（集約 MIN/MAX の total_cmp 順序と一致）。
+        let nan = f64::NAN;
+        for xs in [
+            vec![Scalar(nan), Scalar(1.0), Scalar(2.0)],
+            vec![Scalar(1.0), Scalar(nan), Scalar(2.0)],
+            vec![Scalar(1.0), Scalar(2.0), Scalar(nan)],
+        ] {
+            match fold_min_max(MinMaxOp::Greatest, xs.clone()).unwrap() {
+                Scalar(x) => assert!(x.is_nan()),
+                other => panic!("unexpected {other:?}"),
+            }
+            assert_eq!(fold_min_max(MinMaxOp::Least, xs).unwrap(), Scalar(1.0));
+        }
+        // 型が混在した場合（束縛段の不変条件が崩れた場合）は Internal で拒否する。
+        assert!(fold_min_max(MinMaxOp::Greatest, v(vec![Scalar(1.0), Text("a".into())])).is_err());
     }
 
     /// PR #373 codex-review 指摘 2 対応の回帰テスト: `sql::expr_program::ExprStep::Builtin`
@@ -10773,6 +11393,11 @@ mod tests {
             BuiltinFn::Length,
             BuiltinFn::Substr2,
             BuiltinFn::Substr3,
+            BuiltinFn::Lpad2,
+            BuiltinFn::Lpad3,
+            BuiltinFn::Rpad2,
+            BuiltinFn::Rpad3,
+            BuiltinFn::SplitPart,
             BuiltinFn::Concat2,
             BuiltinFn::Trim,
             BuiltinFn::Replace,
@@ -10784,11 +11409,18 @@ mod tests {
             BuiltinFn::Abs,
             BuiltinFn::Round1,
             BuiltinFn::Round2,
+            BuiltinFn::Trunc1,
+            BuiltinFn::Trunc2,
             BuiltinFn::Floor,
             BuiltinFn::Ceil,
             BuiltinFn::Mod,
             BuiltinFn::Power,
             BuiltinFn::Sqrt,
+            BuiltinFn::Ln,
+            BuiltinFn::Log1,
+            BuiltinFn::Log2,
+            BuiltinFn::Exp,
+            BuiltinFn::Sign,
             BuiltinFn::IntervalPart(DatePartField::Day),
             BuiltinFn::IntervalTrunc(DateTruncUnit::Day),
             BuiltinFn::JustifyHours,
@@ -10977,6 +11609,43 @@ mod tests {
     }
 
     #[test]
+    fn trunc_resolves_by_arity_and_evaluates() {
+        let schema = schema_with_vector();
+        let registry = UdfRegistry::default();
+        for (args, want_two, expected) in [
+            (vec![num("42.8")], false, 42.0),
+            (vec![num("1234.5678"), num("-2")], true, 1200.0),
+        ] {
+            let mut budget = MAX_EXPR_NODES;
+            let (bound, ty) = bind_expr(&call("trunc", args), &schema, &registry, &mut budget)
+                .expect("bind should succeed");
+            assert_eq!(ty, ExprType::Scalar);
+            let ok = match &bound {
+                BoundExpr::Builtin { f, .. } => {
+                    *f == if want_two {
+                        BuiltinFn::Trunc2
+                    } else {
+                        BuiltinFn::Trunc1
+                    }
+                }
+                _ => false,
+            };
+            assert!(ok);
+            let value = eval(&bound, 1, &[0.0, 0.0, 0.0]).expect("eval should succeed");
+            assert_eq!(value, ExprValue::Scalar(expected));
+        }
+    }
+
+    #[test]
+    fn trunc_with_wrong_arity_is_rejected_at_bind_time() {
+        let schema = schema_with_vector();
+        let registry = UdfRegistry::default();
+        let mut budget = MAX_EXPR_NODES;
+        let err = bind_expr(&call("trunc", vec![]), &schema, &registry, &mut budget).unwrap_err();
+        assert_eq!(err.wire_code(), "42883");
+    }
+
+    #[test]
     fn round_with_wrong_arity_is_rejected_at_bind_time() {
         let schema = schema_with_vector();
         let registry = UdfRegistry::default();
@@ -10995,6 +11664,11 @@ mod tests {
             ("ceil", vec![num("2.1")], 3.0),
             ("ceiling", vec![num("2.1")], 3.0),
             ("sqrt", vec![num("9")], 3.0),
+            ("ln", vec![num("1")], 0.0),
+            ("log", vec![num("100")], 2.0),
+            ("log", vec![num("2"), num("8")], 3.0),
+            ("exp", vec![num("0")], 1.0),
+            ("sign", vec![bin(BinOp::Sub, num("0"), num("5"))], -1.0),
         ];
         for (name, args, expected) in cases {
             let mut budget = MAX_EXPR_NODES;

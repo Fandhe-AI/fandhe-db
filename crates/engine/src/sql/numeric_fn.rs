@@ -1,10 +1,10 @@
-//! 数値スカラー関数群（ABS/ROUND/FLOOR/CEIL/CEILING/MOD/POWER/SQRT）の純粋関数実装
-//! （Issue #920、対象ビヘイビア: SQL-26。ポインタ: `docs/spec/05-tasks.md`
+//! 数値スカラー関数群（ABS/ROUND/TRUNC/FLOOR/CEIL/CEILING/MOD/POWER/SQRT/LN/LOG/EXP/SIGN）の
+//! 純粋関数実装（Issue #920・#1907・#1908、対象ビヘイビア: SQL-26・SQL-65。ポインタ: `docs/spec/05-tasks.md`
 //! TASK-210・`docs/spec/04-behavior/sql-surface.md` SQL-26）。
 //!
 //! 責務境界: 本モジュールは行コンテキスト（`id`・`embedding`）を持たない値レベルの
-//! 計算のみを提供する。`sql::udf_call::BuiltinFn`（`Abs`/`Round1`/`Round2`/`Floor`/
-//! `Ceil`/`Mod`/`Power`/`Sqrt`）の解決・型検査・行ループでの呼び出しは
+//! 計算のみを提供する。`sql::udf_call::BuiltinFn`（`Abs`/`Round1`/`Round2`/`Trunc1`/`Trunc2`/`Floor`/
+//! `Ceil`/`Mod`/`Power`/`Sqrt`/`Ln`/`Log1`/`Log2`/`Exp`/`Sign`）の解決・型検査・行ループでの呼び出しは
 //! `sql::udf_call::bind_call`・`apply_builtin` が担い、本モジュールへ委譲する
 //! （関数本体を `udf_call.rs` へ複製しない）。
 //!
@@ -13,7 +13,9 @@
 //! 拒否する。オーバーフロー・アンダーフローは `SqlSurfaceError::numeric_out_of_range`
 //! （`22003`）、0 除算は `SqlSurfaceError::division_by_zero`（`22012`、Issue #1163）、
 //! それ以外の不正入力（非整数の丸め桁数・sqrt の負数等）は
-//! `SqlSurfaceError::invalid_input`（`22000`）に写像する。
+//! `SqlSurfaceError::invalid_input`（`22000`）に写像する。`ln`/`log` の定義域外（0・負）は
+//! PostgreSQL と同じ `2201E`（`invalid_argument_for_logarithm`）、`log(1, x)` の底 1 は `22012`、
+//! `exp` のあふれ・アンダーフローは `22003` に写像する（Issue #1907・SQL-65・ERR-2）。
 
 use crate::sql::allowlist::SqlSurfaceError;
 
@@ -182,6 +184,76 @@ pub(crate) fn round2(x: f64, n: f64) -> Result<f64, SqlSurfaceError> {
     finite_result(result, "round")
 }
 
+/// `trunc(x: Scalar) -> Scalar`（0 に向かって整数へ切り捨てる。`f64::trunc` と同じ
+/// 意味論。Issue #1908・SQL-65）。
+pub(crate) fn trunc1(x: f64) -> Result<f64, SqlSurfaceError> {
+    finite_result(x.trunc(), "trunc")
+}
+
+/// `trunc(x: Scalar, n: Scalar) -> Scalar`（小数点以下 `n` 桁での切り捨て。負の `n` は
+/// 整数部の下位 `|n|` 桁を 0 にする。Issue #1908・SQL-65）。
+///
+/// [`round2`] と同じく `x` の最短往復表現を 10 進数字列として扱い、桁の打ち切りを
+/// 数字列のまま行う（`x * 10^n` の二進誤差を避ける。桁上げは発生しない）。`n` の検査
+/// （非整数は `22000`、`i32` 範囲外は `22003`）も `round2` と同じ。呼び出し元は
+/// `sql::udf_call::apply_builtin`（`BuiltinFn::Trunc2`）。
+pub(crate) fn trunc2(x: f64, n: f64) -> Result<f64, SqlSurfaceError> {
+    if !n.is_finite() || n.fract() != 0.0 {
+        return Err(SqlSurfaceError::invalid_input(
+            "trunc: second argument must be an integer",
+        ));
+    }
+    if n < (i32::MIN as f64) || n > (i32::MAX as f64) {
+        return Err(SqlSurfaceError::numeric_out_of_range(
+            "trunc: second argument is out of range",
+        ));
+    }
+    // 直前の範囲検査済みのため安全な変換。
+    let n_i32 = n as i32;
+    if !x.is_finite() || x == 0.0 {
+        return Ok(x);
+    }
+    let negative = x.is_sign_negative();
+    let formatted = format!("{}", x.abs());
+    let (int_part, frac_part) = match formatted.split_once('.') {
+        Some((i, f)) => (i, f),
+        None => (formatted.as_str(), ""),
+    };
+    let magnitude = if n_i32 >= 0 {
+        let n_usize = n_i32 as usize;
+        if n_usize >= frac_part.len() {
+            // 切り捨てる桁が無い。
+            return Ok(x);
+        }
+        let kept = frac_part.get(..n_usize).unwrap_or("");
+        if kept.is_empty() {
+            int_part.to_string()
+        } else {
+            format!("{int_part}.{kept}")
+        }
+    } else {
+        // `unsigned_abs`: `i32::MIN` の符号反転オーバーフローを避ける。
+        let pos = n_i32.unsigned_abs() as usize;
+        if pos >= int_part.len() {
+            return Ok(if negative { -0.0 } else { 0.0 });
+        }
+        let keep_len = int_part.len() - pos;
+        let kept = int_part.get(..keep_len).unwrap_or("0");
+        format!("{kept}{}", "0".repeat(pos))
+    };
+    let signed = if negative {
+        format!("-{magnitude}")
+    } else {
+        magnitude
+    };
+    let Ok(result) = signed.parse::<f64>() else {
+        return Err(SqlSurfaceError::numeric_out_of_range(
+            "trunc: result is out of range",
+        ));
+    };
+    finite_result(result, "trunc")
+}
+
 /// `floor(x: Scalar) -> Scalar`。
 pub(crate) fn floor(x: f64) -> Result<f64, SqlSurfaceError> {
     finite_result(x.floor(), "floor")
@@ -239,6 +311,111 @@ pub(crate) fn sqrt(x: f64) -> Result<f64, SqlSurfaceError> {
     finite_result(x.sqrt(), "sqrt")
 }
 
+/// `ln`／`log` の定義域外メッセージ（PostgreSQL と同じ固定文言。値は含めない）。
+const LOG_OF_ZERO: &str = "cannot take logarithm of zero";
+const LOG_OF_NEGATIVE: &str = "cannot take logarithm of a negative number";
+
+/// 対数の引数の定義域検査。0 は zero、負（`-∞` 含む）は negative で `2201E`。
+/// NaN は比較が偽になるため素通りし、呼び出し側が NaN を伝播する（PG float8 と同じ）。
+fn check_log_domain(x: f64) -> Result<(), SqlSurfaceError> {
+    if x == 0.0 {
+        return Err(SqlSurfaceError::invalid_argument_for_logarithm(LOG_OF_ZERO));
+    }
+    if x < 0.0 {
+        return Err(SqlSurfaceError::invalid_argument_for_logarithm(
+            LOG_OF_NEGATIVE,
+        ));
+    }
+    Ok(())
+}
+
+/// `ln(x: Scalar) -> Scalar`（自然対数）。0・負は `2201E`。
+pub(crate) fn ln(x: f64) -> Result<f64, SqlSurfaceError> {
+    check_log_domain(x)?;
+    Ok(x.ln())
+}
+
+/// `log(x: Scalar) -> Scalar`（1 引数版。**底 10** の常用対数。自然対数は `ln`）。
+/// 0・負は `2201E`。
+pub(crate) fn log10(x: f64) -> Result<f64, SqlSurfaceError> {
+    check_log_domain(x)?;
+    Ok(x.log10())
+}
+
+/// `log(b: Scalar, x: Scalar) -> Scalar`（底 b の対数）。PG の `log_var` と同じく
+/// 底を先に検査し、0・負は `2201E`、底 1 は `22012`。結果が整数 k に極めて近く
+/// `b^k == x` が厳密に成り立つ場合は k に丸める（`log(10, 1000)` が
+/// `2.9999999999999996` になるのを避ける）。
+pub(crate) fn log_base(b: f64, x: f64) -> Result<f64, SqlSurfaceError> {
+    if b.is_nan() || x.is_nan() {
+        return Ok(f64::NAN);
+    }
+    // 底 1（ln(base) == 0）は x の値に関わらず 22012。PostgreSQL の log_var は ln(base) を
+    // 先に計算して 0 ならエラーにするため、引数ドメイン検証（2201E）より前に判定する。
+    if b == 1.0 {
+        return Err(SqlSurfaceError::division_by_zero("log"));
+    }
+    check_log_domain(b)?;
+    check_log_domain(x)?;
+    if b.is_infinite() {
+        return Ok(if x.is_infinite() { f64::NAN } else { 0.0 });
+    }
+    if x.is_infinite() {
+        // x = +∞ のとき ln(x)/ln(b) の符号は底で決まる（b>1 は +∞、0<b<1 は -∞）。
+        return Ok(if b > 1.0 {
+            f64::INFINITY
+        } else {
+            f64::NEG_INFINITY
+        });
+    }
+    let r = if b == 10.0 {
+        x.log10()
+    } else if b == 2.0 {
+        x.log2()
+    } else {
+        x.ln() / b.ln()
+    };
+    let k = r.round();
+    if r.is_finite() && k.abs() <= 1100.0 && (r - k).abs() <= 1e-12 * k.abs().max(1.0) {
+        // 範囲検査済みなので i32 へ切り詰めても欠落しない。
+        let ki = k as i32;
+        if b.powi(ki) == x {
+            return Ok(k);
+        }
+    }
+    finite_result(r, "log")
+}
+
+/// `exp(x: Scalar) -> Scalar`。有限入力でのあふれ（`±∞`）・アンダーフロー（`0`）は
+/// `22003`（PG `dexp` と同じ）。NaN・`+∞`・`-∞` 入力は PG と同様に伝播する。
+pub(crate) fn exp(x: f64) -> Result<f64, SqlSurfaceError> {
+    let r = x.exp();
+    if x.is_finite() {
+        if r.is_infinite() {
+            return Err(SqlSurfaceError::numeric_out_of_range(
+                "exp: result overflows",
+            ));
+        }
+        if r == 0.0 {
+            return Err(SqlSurfaceError::numeric_out_of_range(
+                "exp: result underflows",
+            ));
+        }
+    }
+    Ok(r)
+}
+
+/// `sign(x: Scalar) -> Scalar`（-1／0／1）。`-0.0`・NaN は 0（PG `dsign` と同じ）。
+pub(crate) fn sign(x: f64) -> Result<f64, SqlSurfaceError> {
+    Ok(if x > 0.0 {
+        1.0
+    } else if x < 0.0 {
+        -1.0
+    } else {
+        0.0
+    })
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -248,6 +425,55 @@ mod tests {
         assert_eq!(abs(-3.5).unwrap(), 3.5);
         assert_eq!(abs(3.5).unwrap(), 3.5);
         assert_eq!(abs(0.0).unwrap(), 0.0);
+    }
+
+    #[test]
+    fn trunc1_truncates_toward_zero() {
+        assert_eq!(trunc1(42.8).unwrap(), 42.0);
+        assert_eq!(trunc1(-42.8).unwrap(), -42.0);
+        let z = trunc1(-0.5).unwrap();
+        assert!(z == 0.0 && z.is_sign_negative());
+    }
+
+    #[test]
+    fn trunc2_truncates_decimal_digits_without_carry() {
+        assert_eq!(trunc2(42.4382, 2.0).unwrap(), 42.43);
+        assert_eq!(trunc2(-42.4382, 2.0).unwrap(), -42.43);
+        assert_eq!(trunc2(99.99, 1.0).unwrap(), 99.9);
+        assert_eq!(trunc2(2.675, 2.0).unwrap(), 2.67);
+        assert_eq!(trunc2(1.005, 2.0).unwrap(), 1.0);
+        assert_eq!(trunc2(5.0, 0.0).unwrap(), 5.0);
+        assert_eq!(trunc2(42.9, 0.0).unwrap(), 42.0);
+        assert_eq!(trunc2(0.000012349, 8.0).unwrap(), 0.00001234);
+        assert_eq!(trunc2(1.5, 400.0).unwrap(), 1.5);
+    }
+
+    #[test]
+    fn trunc2_with_negative_n_zeroes_integer_digits() {
+        assert_eq!(trunc2(1234.5678, -2.0).unwrap(), 1200.0);
+        assert_eq!(trunc2(-1234.5678, -2.0).unwrap(), -1200.0);
+        assert_eq!(trunc2(1234.0, -4.0).unwrap(), 0.0);
+        let z = trunc2(-12.0, -400.0).unwrap();
+        assert!(z == 0.0 && z.is_sign_negative());
+        assert_eq!(trunc2(12345.6789, -400.0).unwrap(), 0.0);
+        assert_eq!(
+            trunc2(f64::from(i32::MAX), f64::from(i32::MIN)).unwrap(),
+            0.0
+        );
+    }
+
+    #[test]
+    fn trunc2_rejects_invalid_second_argument() {
+        assert_eq!(trunc2(1.5, 0.5).unwrap_err().wire_code(), "22000");
+        assert_eq!(trunc2(1.5, f64::NAN).unwrap_err().wire_code(), "22000");
+        assert_eq!(trunc2(1.5, 3e9).unwrap_err().wire_code(), "22003");
+    }
+
+    #[test]
+    fn trunc2_returns_non_finite_and_zero_unchanged() {
+        assert!(trunc2(f64::NAN, 2.0).unwrap().is_nan());
+        assert_eq!(trunc2(f64::INFINITY, 2.0).unwrap(), f64::INFINITY);
+        assert_eq!(trunc2(0.0, 2.0).unwrap(), 0.0);
     }
 
     #[test]
@@ -431,5 +657,66 @@ mod tests {
     fn sqrt_of_nonnegative_matches_std() {
         assert_eq!(sqrt(9.0).unwrap(), 3.0);
         assert_eq!(sqrt(0.0).unwrap(), 0.0);
+    }
+
+    #[test]
+    fn ln_log_normal_values() {
+        assert_eq!(ln(1.0).unwrap(), 0.0);
+        assert!((ln(std::f64::consts::E).unwrap() - 1.0).abs() < 1e-15);
+        assert_eq!(log10(100.0).unwrap(), 2.0);
+        assert_eq!(log_base(2.0, 8.0).unwrap(), 3.0);
+        assert_eq!(log_base(10.0, 1000.0).unwrap(), 3.0);
+        assert!(ln(f64::NAN).unwrap().is_nan());
+        assert_eq!(ln(f64::INFINITY).unwrap(), f64::INFINITY);
+    }
+
+    #[test]
+    fn ln_log_domain_errors_are_2201e() {
+        for e in [
+            ln(0.0),
+            ln(-1.0),
+            ln(f64::NEG_INFINITY),
+            log10(0.0),
+            log10(-10.0),
+            log_base(0.0, 8.0),
+            log_base(-2.0, 8.0),
+            log_base(2.0, 0.0),
+            log_base(2.0, -1.0),
+        ] {
+            assert_eq!(e.unwrap_err().wire_code(), "2201E");
+        }
+    }
+
+    #[test]
+    fn log_base_one_is_division_by_zero() {
+        assert_eq!(log_base(1.0, 10.0).unwrap_err().wire_code(), "22012");
+        assert_eq!(log_base(1.0, 1.0).unwrap_err().wire_code(), "22012");
+        // 底 1 は x のドメイン違反（0・負数）より優先して 22012。
+        assert_eq!(log_base(1.0, 0.0).unwrap_err().wire_code(), "22012");
+        assert_eq!(log_base(1.0, -5.0).unwrap_err().wire_code(), "22012");
+    }
+
+    #[test]
+    fn log_base_infinite_x_sign_follows_base() {
+        assert_eq!(log_base(2.0, f64::INFINITY).unwrap(), f64::INFINITY);
+        assert_eq!(log_base(0.5, f64::INFINITY).unwrap(), f64::NEG_INFINITY);
+    }
+
+    #[test]
+    fn exp_cases() {
+        assert_eq!(exp(0.0).unwrap(), 1.0);
+        assert_eq!(exp(1000.0).unwrap_err().wire_code(), "22003");
+        assert_eq!(exp(-1000.0).unwrap_err().wire_code(), "22003");
+        assert_eq!(exp(f64::NEG_INFINITY).unwrap(), 0.0);
+        assert!(exp(f64::NAN).unwrap().is_nan());
+    }
+
+    #[test]
+    fn sign_cases() {
+        assert_eq!(sign(-3.0).unwrap(), -1.0);
+        assert_eq!(sign(2.5).unwrap(), 1.0);
+        assert_eq!(sign(0.0).unwrap(), 0.0);
+        assert_eq!(sign(-0.0).unwrap(), 0.0);
+        assert_eq!(sign(f64::NAN).unwrap(), 0.0);
     }
 }
