@@ -2479,6 +2479,12 @@ impl UdfRegistry {
         self.catalog_names.contains(&name.to_ascii_lowercase())
     }
 
+    /// カタログ由来として登録されている件数（`sql::udf_load` が「非カタログ登録が枠を占めているか」の
+    /// 判定に使う）。
+    pub(crate) fn catalog_entry_count(&self) -> usize {
+        self.catalog_names.len()
+    }
+
     /// 既に登録済みの `name` をカタログ由来として印付けする（`sql::udf_load`・
     /// `sql::udf_ddl::execute_create_function_persistent` から。未登録の名前は無視する）。
     pub(crate) fn mark_catalog_origin(&mut self, name: &str) {

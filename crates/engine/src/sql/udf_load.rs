@@ -19,7 +19,9 @@
 
 use crate::catalog::function::{FunctionDef, FunctionLanguage, MAX_FUNCTIONS};
 use crate::sql::allowlist::{parse_stored_function_body, SqlSurfaceError};
-use crate::sql::udf_call::{commit_function_definition, prepare_function_definition};
+use crate::sql::udf_call::{
+    commit_function_definition, prepare_function_definition, MAX_SESSION_UDFS,
+};
 use crate::sql::udf_call::{Expr, UdfRegistry};
 use crate::storage::Storage;
 
@@ -155,10 +157,16 @@ fn load_into(
     // カタログ定義が見えない状態を残さない）。
     // 恒久的にロード不能な定義（呼び出し先の消失・予約名など）は世代が変わらない限り結果も変わらないため
     // 再試行の対象にしない（残留すると Query／Parse ごとに全カタログを再ロードして世代 fast path を迂回する）。
-    // 再試行が意味を持つのは、同名のセッションローカル登録に阻まれている定義だけ。
-    let blocked_by_local = pending
-        .iter()
-        .any(|p| registry.get(&p.key).is_some() && !registry.is_catalog_origin(&p.key));
+    // 再試行が意味を持つのは、非カタログ由来の登録（セッションローカル宣言的関数・WASM 関数）に阻まれている
+    // 定義だけ: (1) 同名の非カタログ登録との衝突（WASM 含む）、(2) 非カタログ登録が枠を占めて
+    // MAX_SESSION_UDFS に達している場合。いずれもその登録の DROP で解消しうる。
+    let has_non_catalog_entries = registry.len() > registry.catalog_entry_count();
+    let at_capacity = registry.len() >= MAX_SESSION_UDFS;
+    let blocked_by_local = pending.iter().any(|p| {
+        let lower = p.key.to_ascii_lowercase();
+        (registry.is_name_taken(&lower) && !registry.is_catalog_origin(&lower))
+            || (at_capacity && has_non_catalog_entries)
+    });
     let recorded = if blocked_by_local {
         STALE_GENERATION
     } else {
@@ -300,6 +308,30 @@ mod tests {
         assert!(!reg.is_catalog_origin("f"));
         // ローカル登録が消えた後、世代が変わらなくても refresh が再試行して見えるようになる。
         assert!(reg.remove("f"));
+        refresh(&s, "t", &mut reg);
+        assert!(reg.is_catalog_origin("f"));
+    }
+
+    /// 上限到達で登録できなかった定義は、ローカル関数の DROP 後の refresh で見える。
+    #[test]
+    fn capacity_blocked_definition_is_retried_after_local_drop() {
+        let (s, _g) = tmp_storage("udf-load-cap");
+        let mut reg = UdfRegistry::default();
+        let body = {
+            let toks = crate::sql::lexer::tokenize_rendered("x").expect("tok");
+            parse_stored_function_body(&toks).expect("body")
+        };
+        for i in 0..MAX_SESSION_UDFS {
+            let name = format!("loc{i}");
+            let prepared =
+                prepare_function_definition(&reg, &name, &["x".to_string()], &body).expect("prep");
+            commit_function_definition(&mut reg, prepared);
+        }
+        s.create_function("t", &decl("f", &["x"], "x + 1"))
+            .expect("f");
+        load(&s, "t", &mut reg).expect("load");
+        assert!(reg.get("f").is_none());
+        assert!(reg.remove("loc0"));
         refresh(&s, "t", &mut reg);
         assert!(reg.is_catalog_origin("f"));
     }
