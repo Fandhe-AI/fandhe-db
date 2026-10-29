@@ -1660,6 +1660,14 @@ pub enum BuiltinFn {
     /// haystack)` 構文。`sql::allowlist::Parser` が引数順を並べ替えてこの順で
     /// `Expr::Call` を組み立てる）。
     Position,
+    /// `left(s: Text, n: Scalar) -> Text`（Issue #1902・SQL-65）。
+    Left,
+    /// `right(s: Text, n: Scalar) -> Text`（Issue #1902・SQL-65）。
+    Right,
+    /// `reverse(s: Text) -> Text`（Issue #1902・SQL-65）。
+    Reverse,
+    /// `initcap(s: Text) -> Text`（Issue #1902・SQL-65）。
+    Initcap,
     /// `abs(x: Scalar) -> Scalar`。
     Abs,
     /// `round(x: Scalar) -> Scalar`（1 引数形。`round` は arity で `Round1`／
@@ -1950,6 +1958,10 @@ fn builtin_from_name(name: &str) -> Option<BuiltinFn> {
         "trim" => Some(BuiltinFn::Trim),
         "replace" => Some(BuiltinFn::Replace),
         "position" => Some(BuiltinFn::Position),
+        "left" => Some(BuiltinFn::Left),
+        "right" => Some(BuiltinFn::Right),
+        "reverse" => Some(BuiltinFn::Reverse),
+        "initcap" => Some(BuiltinFn::Initcap),
         "abs" => Some(BuiltinFn::Abs),
         "floor" => Some(BuiltinFn::Floor),
         "ceil" | "ceiling" => Some(BuiltinFn::Ceil),
@@ -2009,6 +2021,8 @@ pub(crate) fn builtin_signature(f: BuiltinFn) -> (&'static [ExprType], ExprType)
             ExprType::Text,
         ),
         BuiltinFn::Position => (&[ExprType::Text, ExprType::Text], ExprType::Scalar),
+        BuiltinFn::Left | BuiltinFn::Right => (&[ExprType::Text, ExprType::Scalar], ExprType::Text),
+        BuiltinFn::Reverse | BuiltinFn::Initcap => (&[ExprType::Text], ExprType::Text),
         BuiltinFn::Abs => (&[ExprType::Scalar], ExprType::Scalar),
         BuiltinFn::Round1 => (&[ExprType::Scalar], ExprType::Scalar),
         BuiltinFn::Round2 => (&[ExprType::Scalar, ExprType::Scalar], ExprType::Scalar),
@@ -2134,7 +2148,11 @@ pub(crate) fn is_foldable_builtin(f: BuiltinFn) -> bool {
         | BuiltinFn::Concat2
         | BuiltinFn::Trim
         | BuiltinFn::Replace
-        | BuiltinFn::Position => false,
+        | BuiltinFn::Position
+        | BuiltinFn::Left
+        | BuiltinFn::Right
+        | BuiltinFn::Reverse
+        | BuiltinFn::Initcap => false,
         // 対象ビヘイビア: SQL-26（Issue #920）。`sql::expr_program::FoldedConst`
         // は `Scalar`／`Bool` のみを表現できる型（文字列組み込みと同じ制約。
         // 上記コメント参照）で `DATE`／`TIMESTAMP` 値を持てないため、
@@ -9042,24 +9060,44 @@ pub(crate) fn apply_builtin<'a>(
         // `CONCAT` 以外は strict（引数のいずれかが NULL なら NULL を返し、
         // `crate::sql::string_fn` の純粋関数を呼び出さない）。`CONCAT` は NULL を
         // 空文字として扱い常に非 NULL を返す。
-        BuiltinFn::Lower | BuiltinFn::Upper | BuiltinFn::Trim => {
-            match take_text_or_null_arg(args, 0)? {
-                None => Ok(ExprValue::Null),
-                Some(s) => {
-                    let out = match f {
-                        BuiltinFn::Lower => string_fn::lower(&s)?,
-                        BuiltinFn::Upper => string_fn::upper(&s)?,
-                        BuiltinFn::Trim => string_fn::trim(&s)?,
-                        _ => unreachable!("guarded by outer match arm"),
-                    };
-                    Ok(ExprValue::Text(Cow::Owned(out)))
-                }
+        BuiltinFn::Lower
+        | BuiltinFn::Upper
+        | BuiltinFn::Trim
+        | BuiltinFn::Reverse
+        | BuiltinFn::Initcap => match take_text_or_null_arg(args, 0)? {
+            None => Ok(ExprValue::Null),
+            Some(s) => {
+                let out = match f {
+                    BuiltinFn::Lower => string_fn::lower(&s)?,
+                    BuiltinFn::Upper => string_fn::upper(&s)?,
+                    BuiltinFn::Trim => string_fn::trim(&s)?,
+                    BuiltinFn::Reverse => string_fn::reverse(&s)?,
+                    BuiltinFn::Initcap => string_fn::initcap(&s)?,
+                    _ => unreachable!("guarded by outer match arm"),
+                };
+                Ok(ExprValue::Text(Cow::Owned(out)))
             }
-        }
+        },
         BuiltinFn::Length => match take_text_or_null_arg(args, 0)? {
             None => Ok(ExprValue::Null),
             Some(s) => finite_scalar(string_fn::length(&s), "length"),
         },
+        BuiltinFn::Left | BuiltinFn::Right => {
+            match (
+                take_text_or_null_arg(args, 0)?,
+                take_scalar_or_null_arg(args, 1)?,
+            ) {
+                (Some(s), Some(n)) => {
+                    let out = if matches!(f, BuiltinFn::Left) {
+                        string_fn::left(&s, n)?
+                    } else {
+                        string_fn::right(&s, n)?
+                    };
+                    Ok(ExprValue::Text(Cow::Owned(out)))
+                }
+                _ => Ok(ExprValue::Null),
+            }
+        }
         BuiltinFn::Substr2 => {
             match (
                 take_text_or_null_arg(args, 0)?,
@@ -10629,6 +10667,10 @@ mod tests {
             BuiltinFn::Trim,
             BuiltinFn::Replace,
             BuiltinFn::Position,
+            BuiltinFn::Left,
+            BuiltinFn::Right,
+            BuiltinFn::Reverse,
+            BuiltinFn::Initcap,
             BuiltinFn::Abs,
             BuiltinFn::Round1,
             BuiltinFn::Round2,

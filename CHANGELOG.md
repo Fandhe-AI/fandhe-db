@@ -9,6 +9,8 @@
 
 ### Added
 
+- 文字列関数 `left`／`right`／`reverse`／`initcap` を追加した（Issue #1902・SQL-65）。文字単位は Unicode スカラー値で、4 関数とも strict（NULL 引数で NULL）。`left`／`right` の長さは負で「除く文字数」を表し、`initcap` は英数字の連続を 1 語として扱う（ロケール非依存。PostgreSQL との既知の差は `string_fn.rs` のモジュール doc に記載）。
+  挙動変更: 4 名は組み込みの予約名になり、同名の `CREATE FUNCTION` は `42723` になる。
 - 派生表を JOIN／カンマ区切りの入力にでき、本文に派生表を入れ子にできるようにした（Issue #1867・SQL-62）。派生表と実表・派生表どうしの JOIN は合成 CTE を `WITH`＋JOIN 経路の slot として評価し、内側は参照者の可視行だけを読む。入れ子の深さはサブクエリ深さ上限（既定 4）を超えると `54000`。
   挙動変更: 従来 `0A000`／`42601` だった JOIN 入力・複数件・入れ子の派生表が実行される。別名なしの派生表の JOIN 入力・集計本文の JOIN 入力は `0A000`、`EXPLAIN` は `42601` のまま。公開 API の変更はない（非 BREAKING）。詳細は [cte.md](docs/design/cte.md) の「Issue #1867 追記」節。
 - FROM 直後の派生表 `(SELECT ...) [[AS] 別名 [(列名, ...)]]` を実行できるようにした（Issue #1866・SQL-62）。合成 CTE として既存の単一表 `WITH` 経路でインライン展開または具体化して評価し、外側の `WHERE`・投影・`ORDER BY` が派生列を参照でき、内側は参照者の可視行だけを読む。
@@ -180,6 +182,7 @@
 
 ### Breaking Changes
 
+- `sql::udf_call::BuiltinFn`（Issue #1902・SQL-65）: variant `Left`／`Right`／`Reverse`／`Initcap` を追加した。網羅 `match` する外部コードは腕を足す。
 - jsonpath の `like_regex` 配線（Issue #2677）に伴う公開型の変更。`PathNode::LikeRegex` に `matcher: LikeRegexMatcher` を追加、
   `JsonPathParseError` に `Regex(RegexError)`・`TooManyRegex`、`JsonPathEvalError` に `RegexInputTooLong` を追加し、
   `RegexNotSupported` は `x` フラグ専用になった。従来 `like_regex` を一律 `0A000` で拒否していた挙動が変わる。

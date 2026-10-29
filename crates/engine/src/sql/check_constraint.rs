@@ -2144,6 +2144,30 @@ mod tests {
                     Expr::String("a".to_string()),
                 ],
             ),
+            // Issue #1902・SQL-65: left／right／reverse／initcap。
+            call(
+                "left",
+                vec![
+                    Expr::Ident("label".to_string()),
+                    Expr::Number("2".to_string()),
+                ],
+            ),
+            call(
+                "LEFT",
+                vec![
+                    Expr::Ident("label".to_string()),
+                    Expr::Number("2".to_string()),
+                ],
+            ),
+            call(
+                "right",
+                vec![
+                    Expr::Ident("label".to_string()),
+                    Expr::Number("1".to_string()),
+                ],
+            ),
+            call("reverse", vec![Expr::Ident("label".to_string())]),
+            call("initcap", vec![Expr::Ident("label".to_string())]),
         ];
 
         for expr in cases {

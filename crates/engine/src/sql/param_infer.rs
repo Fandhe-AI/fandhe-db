@@ -161,7 +161,7 @@ fn is_comparison(op: BinOp) -> bool {
 fn builtin_arg_is_text(name: &str, index: usize) -> bool {
     match name.to_ascii_lowercase().as_str() {
         "lower" | "upper" | "length" | "trim" => index == 0,
-        "substr" => index == 0,
+        "substr" | "left" | "right" | "reverse" | "initcap" => index == 0,
         "replace" | "position" | "concat" => true,
         // jsonb_extract_path(_text) のパス要素（2 番目以降）は text（Issue #1599）。
         "jsonb_extract_path" | "jsonb_extract_path_text" => index >= 1,
@@ -174,9 +174,8 @@ fn builtin_arg_is_text(name: &str, index: usize) -> bool {
 /// 組み込み関数の戻り値の型（`$n` の相手として使うときの近似）。
 fn builtin_return_type(name: &str) -> Ty {
     match name.to_ascii_lowercase().as_str() {
-        "lower" | "upper" | "trim" | "replace" | "concat" | "substr" => {
-            Ty::Known(PreparedParamType::Text)
-        }
+        "lower" | "upper" | "trim" | "replace" | "concat" | "substr" | "left" | "right"
+        | "reverse" | "initcap" => Ty::Known(PreparedParamType::Text),
         "length" | "position" => Ty::Known(scalar("?column?", ColumnType::Integer)),
         // 配列関数（Issue #1604）。配列を返すものは `$n` の型付け対象外（Double と誤推論しない）。
         "array_length" | "cardinality" | "array_position" => {
@@ -229,6 +228,10 @@ fn operator_kind(other: &Expr) -> Option<ParamContextKind> {
                     | "substr"
                     | "length"
                     | "position"
+                    | "left"
+                    | "right"
+                    | "reverse"
+                    | "initcap"
             ),
             _ => false,
         }
