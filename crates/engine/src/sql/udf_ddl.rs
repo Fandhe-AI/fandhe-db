@@ -35,6 +35,7 @@ pub struct DropFunctionOutcome {}
 /// 判定順は [`prepare_function_definition`]（予約名・識別子・引数・閉じた本体。セッションの重複
 /// `42723` を含む）→ [`Storage::create_function`]（同名の定義があれば `42723`・件数上限 `54000`）→
 /// セッションへの登録。
+#[allow(clippy::too_many_arguments)]
 pub(crate) fn execute_create_function_persistent(
     storage: &Storage,
     tenant_id: &str,
