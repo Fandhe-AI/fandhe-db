@@ -10,7 +10,7 @@
 use std::collections::HashMap;
 
 use crate::sql::allowlist::SqlSurfaceError;
-use crate::sql::ddl_column_type::SqlColumnTypeName;
+use crate::sql::ddl_column_type::{parse_column_type_name, SqlColumnTypeName};
 use crate::sql::lexer::{Keyword, Token};
 
 use super::ast::{Block, Body, DeclType, EmbeddedKind, EmbeddedSql, SqlExpr, Stmt, VarRef};
@@ -629,20 +629,60 @@ pub(crate) fn is_ident_position(tokens: &[Token], i: usize) -> bool {
 pub(super) struct IdentCtx {
     slots: Vec<bool>,
     parens: ParenInfo,
+    /// `::型` と `CAST(式 AS 型)` の型指定の範囲（複数語・修飾子・`[]` を含む）に入るトークン。
+    type_range: Vec<bool>,
 }
 
 impl IdentCtx {
     pub(super) fn new(tokens: &[Token]) -> Self {
+        let parens = ParenInfo::new(tokens);
+        let type_range = type_ranges(tokens, &parens);
         Self {
             slots: from_relation_slots(tokens),
-            parens: ParenInfo::new(tokens),
+            parens,
+            type_range,
         }
     }
+}
+
+/// 型指定の範囲に入るトークンを塗る。範囲は SQL 側の列型パーサー
+/// （`sql::ddl_column_type::parse_column_type_name`。`double precision`・`character varying(n)`・
+/// `timestamp without time zone`・`numeric(p,s)`・`[]` を受理する）に決めさせ、1 トークンの
+/// 先読み特例を持たない。型として読めない場合（未対応の型名）は先頭 1 トークンだけを範囲にする
+/// （後続の許可リスト解析が拒否する）。`IdentCtx::new` から 1 文に 1 回だけ呼ばれる。
+fn type_ranges(tokens: &[Token], parens: &ParenInfo) -> Vec<bool> {
+    let mut out = vec![false; tokens.len()];
+    for (i, t) in tokens.iter().enumerate() {
+        let starts = match t {
+            Token::TypeCast => true,
+            // `CAST(式 AS 型)` の `AS`。別名の `AS` と区別するため直接囲む括弧の直前が `CAST`。
+            _ if ident_is(t, "AS") => parens
+                .enclosing_prev(tokens, i)
+                .is_some_and(|p| ident_is(p, "CAST")),
+            _ => false,
+        };
+        if !starts {
+            continue;
+        }
+        let start = i.saturating_add(1);
+        let mut pos = start;
+        let end = match parse_column_type_name(tokens, &mut pos) {
+            Ok(_) if pos > start => pos,
+            _ => start.saturating_add(1),
+        };
+        for slot in out.iter_mut().take(end).skip(start) {
+            *slot = true;
+        }
+    }
+    out
 }
 
 /// [`is_ident_position`] の本体。`ctx` は同じ `tokens` に対する [`IdentCtx::new`] の結果。
 pub(super) fn is_ident_position_with(tokens: &[Token], i: usize, ctx: &IdentCtx) -> bool {
     let slots = &ctx.slots;
+    if ctx.type_range.get(i).copied().unwrap_or(false) {
+        return true;
+    }
     if matches!(tokens.get(i.saturating_add(1)), Some(Token::Punct('('))) {
         return true;
     }

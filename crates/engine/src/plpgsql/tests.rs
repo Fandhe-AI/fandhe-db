@@ -1128,3 +1128,35 @@ fn declaration_default_resolves_in_the_scope_before_the_declaration() {
     };
     assert_eq!(e.var_refs[0].1, VarRef::Var(inner_id));
 }
+
+#[test]
+fn type_specifications_are_not_variable_references() {
+    // 型指定の範囲全体（複数語・修飾子・`[]`）は、同名の変数があっても置換しない。
+    let cases = [
+        ("precision", "double precision"),
+        ("varying", "character varying(10)"),
+        ("zone", "timestamp without time zone"),
+        ("zone", "timestamp with time zone"),
+        ("n", "int[]"),
+        ("p", "numeric(10,2)"),
+    ];
+    for (var, ty) in cases {
+        for expr in [format!("1::{ty}"), format!("CAST(1 AS {ty})")] {
+            let src = format!("DECLARE {var} int; BEGIN PERFORM {expr}; END");
+            let b = ok(&src);
+            assert_eq!(first_sql_refs(&b), 0, "for {src:?}");
+            // 型の範囲の後に続く変数参照は置換される。
+            let src = format!("DECLARE {var} int; BEGIN PERFORM {expr} + {var}; END");
+            let b = ok(&src);
+            assert_eq!(first_sql_refs(&b), 1, "for {src:?}");
+        }
+    }
+    // 型の外の `AS` 別名は従来どおり識別子位置、`CAST` の式部分の変数は参照になる。
+    let b = ok("DECLARE v int; BEGIN PERFORM CAST(v AS int); END");
+    assert_eq!(first_sql_refs(&b), 1);
+    let b = ok("DECLARE precision int; BEGIN RETURN 1::double precision; END");
+    let Some(Stmt::Return(Some(e))) = b.block.stmts.first() else {
+        panic!("return");
+    };
+    assert!(e.var_refs.is_empty());
+}
