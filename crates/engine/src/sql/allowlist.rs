@@ -22866,6 +22866,17 @@ fn parse_create_function(
     Ok((name, params, body, body_source))
 }
 
+/// カタログに保存された UDF の本体（`render_tokens` の出力を `tokenize_rendered` で再字句解析した
+/// トークン列）を式へ再パースする（SQL-66・Issue #1921。`sql::udf_load` から呼ばれる）。
+/// `CREATE FUNCTION` の本体と同じ式文法（`parse_value_expr`）を使い、式の後ろに余分なトークンが
+/// あれば拒否する。閉じた式の検証（列参照の禁止等）は呼び出し側が `prepare_function_definition` で行う。
+pub(crate) fn parse_stored_function_body(tokens: &[Token]) -> Result<Expr, SqlSurfaceError> {
+    let mut p = Parser::new(tokens);
+    let body = p.parse_value_expr(0)?;
+    p.expect_end_of_statement()?;
+    Ok(body)
+}
+
 /// SQL 文をトークン化し、許可リスト形式で構造検証する（TASK-161 の公開 API。
 /// TASK-74 の `validate_statement` を `SELECT`／`SET search_mode`／
 /// `CREATE FUNCTION`（TASK-79・SQL-9）の 3 statement 種別へ拡張したもの）。先頭
@@ -27770,6 +27781,30 @@ fn parse_update_form_shape_inner(
 
 #[cfg(test)]
 mod tests {
+    /// SQL-66・Issue #1921: 保存形（`render_tokens` の出力）を `tokenize_rendered` で再字句解析して
+    /// 再パースした本体が、作成時にパースした式と等しい（再接続後の content hash 安定性の前提）。
+    #[test]
+    fn stored_function_body_round_trips_to_the_same_expr() {
+        use super::*;
+        let cases = [
+            "(x + 1) * y - 2.5",
+            "greatest(x, 3, -1)",
+            "'it''s'",
+            "true",
+            "\"#12.f\"(x) + 1",
+        ];
+        for body_sql in cases {
+            let create = format!("CREATE FUNCTION g(x, y) AS {body_sql}");
+            let tokens = crate::sql::lexer::tokenize_rendered(&create).expect("lex create");
+            let (_, _, expr, body_source) = parse_create_function(&tokens).expect("create parse");
+            let again = crate::sql::lexer::tokenize_rendered(&body_source).expect("re-lex");
+            let reparsed = parse_stored_function_body(&again).expect("reparse");
+            assert_eq!(reparsed, expr, "{body_sql} -> {body_source}");
+        }
+        let extra = crate::sql::lexer::tokenize_rendered("x + 1 y").expect("lex");
+        assert!(parse_stored_function_body(&extra).is_err());
+    }
+
     /// SQL-53 (b)・Issue #1754: FROM／USING 形の先読み判定。`EXTRACT(.. FROM ..)`・`IS DISTINCT FROM`・
     /// サブクエリの `FROM` と `USING OPERATION_ID` は FROM／USING 形ではない。
     #[test]

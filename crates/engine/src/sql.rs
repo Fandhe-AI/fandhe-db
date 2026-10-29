@@ -206,6 +206,7 @@ mod temp_rows_tests;
 mod truncate_restart_identity_tests;
 // `CREATE FUNCTION`／`DROP FUNCTION` の UDF カタログ書き込み経路（SQL-66・Issue #1920）。
 pub mod udf_ddl;
+pub(crate) mod udf_load;
 pub(crate) mod upsert_add;
 pub(crate) mod upsert_expr;
 pub(crate) mod upsert_where;

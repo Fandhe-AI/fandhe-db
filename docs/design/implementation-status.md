@@ -1342,6 +1342,8 @@ Issue #1405（fix(engine)!: CREATE TYPE の型名の重複を 42710 で返す。
 
 **Issue #1920（feat(engine): CREATE／DROP FUNCTION をカタログへ書き込む。親 #1918・SQL-66 ポインタ。詳細は [udf-catalog.md](udf-catalog.md)）**: DDL 権限のあるセッションの `CREATE FUNCTION` を UDF カタログ（単一 write txn・1 回の commit）へ永続化し、`DROP FUNCTION <名前> [(<型>, ...)]` の最小形を追加した（`IF EXISTS`・`CASCADE`・複数名は `0A000` で #1917 へ）。権限なしのセッションは従来どおりセッション内のみ、同名の定義はシグネチャ違いでも `42723`、明示トランザクション内は `0A000`、`DROP SCHEMA` は配下の関数を `RESTRICT` で `2BP01`・`CASCADE` で同時削除する。`Statement::CreateFunction` に `body_source` を追加し、`ParsedSql::DropFunction`・`SqlOutcome::DropFunction` を追加した（破壊的変更。依存追加・`unsafe` はない）。
 
+**Issue #1921（feat(engine): セッション開始時に UDF をカタログからロードする。親 #1918・SQL-66 ポインタ。詳細は [udf-catalog.md](udf-catalog.md)）**: pg wire のハンドシェイクが認証後に認証済みテナントの UDF カタログをセッションのレジストリへロードする（`EngineCore::load_session_udfs`）。本体は許可リストパーサーで再パースして作成時と同じ検証を通し、依存は多パスで解決する。カタログ全体が読めなければ FATAL `XX000` で接続を拒否し、個別の定義が登録できなければその定義だけ skip する。Query／Parse の前にテナント単位の世代（プロセス内）を確認して他セッションの変更を反映する（`refresh_session_udfs`）。カタログ由来の関数を権限の無いセッションが DROP すると `42501`。依存追加・`unsafe` はない。
+
 **Issue #2223（docs(design): PL/pgSQL サブセットの範囲と実行モデルを設計する。SQL-68 ポインタ。詳細は [plpgsql-subset.md](plpgsql-subset.md)）**: `LANGUAGE plpgsql` のサブセットを設計記録として確定した。受理する構文と `0A000` の拒否方針、変数を型付きトークンで置換する値の受け渡し、呼び出し元と同一 Tx・同一 RLS の書き込み経路の事前決定、`EXECUTE`、資源上限と CLI、台帳を外側の文の単位で 1 エントリにする整合、トリガ関数と `DO` の接続点を定める。ドキュメントのみで、コード・依存・CI の変更なし。実装は #2224〜#2229。
 
 **Issue #1912（docs(design): wasmtime 採否の承認資料。親 #1911・EXT-9 ポインタ。詳細は [wasmtime-adoption.md](wasmtime-adoption.md)）**: 承認資料 ADR を Proposed で新設した（オーナー承認は未取得）。リポ外の probe で依存数・ライセンス・advisory・サイズを実測して載せた。依存・コード・CI の変更なし。承認が記録（#1913）されるまで #1923〜#1928 は着手停止。

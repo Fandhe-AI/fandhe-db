@@ -751,6 +751,9 @@ fn post_auth_loop<'e, S: WireStream>(
                 // 同じ fail-closed 分岐（`0A000`）へ倒す。
                 match (engine, txn.as_mut()) {
                     (Some(engine), Some(txn)) => {
+                        // SQL-66・Issue #1921: 他セッションの CREATE／DROP FUNCTION を実行前に反映する
+                        // （世代が変わっていなければ何もしない）。
+                        engine.refresh_session_udfs(ctx, session);
                         // Issue #1798: この Query（COPY のサブプロトコルを含む）の実行中だけ
                         // 切断検出の中断スコープを有効にする。
                         let _interrupt = crate::liveness::install(probe_sock.as_ref());
@@ -799,6 +802,8 @@ fn post_auth_loop<'e, S: WireStream>(
                 // 適用していた契約をそのまま維持）。
                 match (engine, txn.as_mut()) {
                     (Some(engine), Some(txn)) => {
+                        // SQL-66・Issue #1921: Parse 時の関数解決の前に UDF カタログの変更を反映する。
+                        engine.refresh_session_udfs(ctx, session);
                         match crate::extended_query::handle_parse(
                             stream, engine, session, txn, extended,
                         )? {
@@ -1650,6 +1655,21 @@ fn run_authenticated_session<S: WireStream>(
                 .map_err(|_| io::Error::other("failed to encode ErrorResponse"))?;
                 return stream.write_all(&msg);
             }
+        }
+    }
+    // SQL-66・Issue #1921: 認証済みテナントの UDF カタログをセッションへロードする（別接続で作った関数・
+    // 再起動前に作った関数を呼べるようにする）。カタログ全体が読めなければ fail-closed で接続を拒否する:
+    // AuthenticationOk の後に FATAL `XX000`（固定文言。tenant・内部キー・本体を含めない）を返して切断し、
+    // BackendKeyData・ReadyForQuery は送らない（TimeZone 不正時と同じ作法）。`engine: None`（後方互換
+    // 経路）は SQL 表層が無いため何もしない。
+    if let Some(engine) = engine {
+        if engine.load_session_udfs(&ctx, &mut session).is_err() {
+            let msg = crate::error_response::encode_fatal(
+                ErrorClass::InternalError,
+                "could not load function catalog",
+            )
+            .map_err(|_| io::Error::other("failed to encode ErrorResponse"))?;
+            return stream.write_all(&msg);
         }
     }
     // BackendKeyData の値そのものはキャンセル要求の照合以外に使わないため、

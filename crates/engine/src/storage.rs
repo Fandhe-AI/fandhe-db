@@ -718,6 +718,11 @@ pub struct Storage {
     /// セッション専用の一時表 DB か（[`Storage::open_with_backend`] だけが真）。永続 DB の SEQUENCE
     /// カタログを持たないため、`nextval`／`currval` を拒否する判定（TABLE-24・TABLE-44）に使う。
     temp_scoped: bool,
+    /// UDF カタログのテナント単位の世代（SQL-66・Issue #1921）。`CREATE`／`DROP FUNCTION` と
+    /// `DROP SCHEMA ... CASCADE` の commit 成功後に進め、他セッションの変更をセッションの
+    /// refresh が検知する材料になる。プロセス内だけの状態で永続化しない（redb は単一プロセスが占有し、
+    /// 再起動後は全セッションが開始時にロードし直すため）。
+    function_generations: std::sync::Mutex<std::collections::HashMap<Box<str>, u64>>,
     /// 書き込みトランザクション取得（autocommit・明示トランザクション双方）が
     /// [`Self::writer_gate`] を待つ上限（既定 30 秒）。超過時は
     /// [`StorageError::WriteLockTimeout`]（`55P03`）を返す。
@@ -762,6 +767,7 @@ impl Storage {
             partitioned_jobs: Default::default(),
             sequence_allocator: Default::default(),
             temp_scoped: false,
+            function_generations: Default::default(),
             write_lock_wait: DEFAULT_WRITE_LOCK_WAIT,
             #[cfg(feature = "test-sync-points")]
             sync_hook: std::sync::Mutex::new(None),
@@ -783,6 +789,26 @@ impl Storage {
         let mut storage = Self::from_db(db, WriteDurability::default());
         storage.temp_scoped = true;
         Ok(storage)
+    }
+
+    /// `scope` の UDF カタログの現在の世代（未変更なら 0）。ロックが汚染されていても世代は
+    /// 単調な数値なので中身を使う。
+    pub(crate) fn function_generation(&self, scope: &str) -> u64 {
+        let map = self
+            .function_generations
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        map.get(scope).copied().unwrap_or(0)
+    }
+
+    /// `scope` の UDF カタログの世代を進める（定義を変える commit が成功した後にだけ呼ぶ）。
+    pub(crate) fn bump_function_generation(&self, scope: &str) {
+        let mut map = self
+            .function_generations
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let slot = map.entry(scope.into()).or_insert(0);
+        *slot = slot.saturating_add(1);
     }
 
     /// セッション専用の一時表 DB か。一時表は永続 DB の SEQUENCE を解決できないため、
@@ -3247,6 +3273,7 @@ mod tests {
                 partitioned_jobs: Default::default(),
                 sequence_allocator: Default::default(),
                 temp_scoped: false,
+                function_generations: Default::default(),
                 write_lock_wait: DEFAULT_WRITE_LOCK_WAIT,
                 #[cfg(feature = "test-sync-points")]
                 sync_hook: std::sync::Mutex::new(None),
@@ -3314,6 +3341,7 @@ mod tests {
                 partitioned_jobs: Default::default(),
                 sequence_allocator: Default::default(),
                 temp_scoped: false,
+                function_generations: Default::default(),
                 write_lock_wait: DEFAULT_WRITE_LOCK_WAIT,
                 #[cfg(feature = "test-sync-points")]
                 sync_hook: std::sync::Mutex::new(None),
@@ -3377,6 +3405,7 @@ mod tests {
                 partitioned_jobs: Default::default(),
                 sequence_allocator: Default::default(),
                 temp_scoped: false,
+                function_generations: Default::default(),
                 write_lock_wait: DEFAULT_WRITE_LOCK_WAIT,
                 #[cfg(feature = "test-sync-points")]
                 sync_hook: std::sync::Mutex::new(None),
@@ -3420,6 +3449,7 @@ mod tests {
                 partitioned_jobs: Default::default(),
                 sequence_allocator: Default::default(),
                 temp_scoped: false,
+                function_generations: Default::default(),
                 write_lock_wait: DEFAULT_WRITE_LOCK_WAIT,
                 #[cfg(feature = "test-sync-points")]
                 sync_hook: std::sync::Mutex::new(None),
