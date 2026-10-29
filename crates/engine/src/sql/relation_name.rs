@@ -458,6 +458,8 @@ pub(crate) fn rewrite_relation_names_full(
         create_name: bool,
         matview: bool,
         function_pos: bool,
+        /// `DROP FUNCTION s.f` の関数名位置（存在しない SCHEMA は `3F000` で fail-closed にする）。
+        drop_name: bool,
     }
     let mut targets: Vec<Target> = walk
         .positions
@@ -467,8 +469,10 @@ pub(crate) fn rewrite_relation_names_full(
             create_name: p.create_name,
             matview: p.matview,
             function_pos: false,
+            drop_name: false,
         })
         .collect();
+    let mut public_drop_rewrites: Vec<(usize, String)> = Vec::new();
     for (i, t) in tokens.iter().enumerate() {
         let Token::QualifiedIdent { qualifier, .. } = t else {
             continue;
@@ -476,8 +480,20 @@ pub(crate) fn rewrite_relation_names_full(
         if walk.positions.iter().any(|p| p.index == i) {
             continue;
         }
+        // `DROP FUNCTION s.f`（#1920）は型の並びの括弧を省略できるため、先頭が `DROP FUNCTION` の文では
+        // 3 語目の修飾名を（括弧が無くても）関数位置として扱う。
+        let drop_function_name =
+            i == 2 && ident_is(tokens.first(), "DROP") && ident_is(tokens.get(1), "FUNCTION");
+        // `DROP FUNCTION public.f` は `DROP TABLE public.t` と同様に裸の名前へ正規化する
+        // （DROP は UDF カタログの削除だけで、組み込み関数へ化ける経路にならない）。
+        if drop_function_name && qualifier.eq_ignore_ascii_case("public") {
+            if let Token::QualifiedIdent { name, .. } = t {
+                public_drop_rewrites.push((i, name.clone()));
+            }
+            continue;
+        }
         let function_pos = resolver.is_some()
-            && matches!(tokens.get(i + 1), Some(Token::Punct('(')))
+            && (drop_function_name || matches!(tokens.get(i + 1), Some(Token::Punct('('))))
             && !qualifier.eq_ignore_ascii_case("public")
             && !is_builtin_schema_name(qualifier)
             && !qualifier.eq_ignore_ascii_case("pg_temp");
@@ -487,12 +503,18 @@ pub(crate) fn rewrite_relation_names_full(
                 create_name: false,
                 matview: false,
                 function_pos: true,
+                drop_name: drop_function_name,
             });
         } else {
             residual_column_qualifier = true;
         }
     }
     targets.sort_by_key(|t| t.index);
+    for (i, name) in public_drop_rewrites {
+        if let Some(slot) = tokens.get_mut(i) {
+            *slot = Token::Ident(name);
+        }
+    }
 
     for pos in &targets {
         let i = pos.index;
@@ -548,7 +570,9 @@ pub(crate) fn rewrite_relation_names_full(
             }
             // 関数名の位置で SCHEMA が見つからない場合は、`x.lower(col)` のような関数呼び出し形の
             // 修飾を従来どおり構文エラー（`42601`。SQL-44 の範囲外の形）のままにする。
-            Err(SqlSurfaceError::InvalidSchemaName { .. }) if pos.function_pos => {
+            Err(SqlSurfaceError::InvalidSchemaName { .. })
+                if pos.function_pos && !pos.drop_name =>
+            {
                 residual_column_qualifier = true;
             }
             Err(e) => {
@@ -1035,6 +1059,24 @@ mod tests {
             t.get(walk.positions[0].index),
             Some(Token::QualifiedIdent { .. })
         ));
+    }
+
+    /// #1920: `DROP FUNCTION public.f` は裸の名前へ正規化され、存在しない SCHEMA は `3F000`。
+    #[test]
+    fn drop_function_public_is_bare_and_unknown_schema_is_3f000() {
+        same("DROP FUNCTION public.f", "DROP FUNCTION f");
+        same(
+            "DROP FUNCTION PUBLIC.f(integer)",
+            "DROP FUNCTION f(integer)",
+        );
+        let none = |_: &str| -> Result<Option<u64>, SqlSurfaceError> { Ok(None) };
+        let mut t = tokenize("DROP FUNCTION nope.f").expect("lex");
+        let err = rewrite_relation_names(&mut t, Some(&none)).expect_err("unknown schema");
+        assert_eq!(err.wire_code(), "3F000");
+        let some = |_: &str| -> Result<Option<u64>, SqlSurfaceError> { Ok(Some(7)) };
+        let mut t = tokenize("DROP FUNCTION s.f(integer)").expect("lex");
+        rewrite_relation_names(&mut t, Some(&some)).expect("resolved");
+        assert!(matches!(t.get(2), Some(Token::Ident(k)) if k.contains('#')));
     }
 
     #[test]

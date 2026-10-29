@@ -234,3 +234,123 @@ fn wire_udf_call_registration_does_not_leak_across_connections() {
     expect_error_response_with_sqlstate(&mut conn2, "42883");
     read_ready_for_query(&mut conn2);
 }
+
+/// SQL-66（Issue #1920）: DDL 実行権限のあるユーザーの `CREATE FUNCTION`／`DROP FUNCTION` は
+/// それぞれ固定タグ `CREATE FUNCTION`／`DROP FUNCTION` を返し、DROP 済みの名前の再 DROP は `42883`。
+#[test]
+fn wire_drop_function_returns_tag_for_ddl_user() {
+    let (core, _guard) = new_core_with_docs();
+    let users_path = write_user_store_file(&[("alice", "tenant-a", "pw-alice")]);
+    let store = wire_server::auth::UserStore::load_from_file(&users_path).expect("user store");
+    let store = store
+        .with_ddl_allowed_users(&["alice".to_string()])
+        .expect("known user");
+    let listener = std::net::TcpListener::bind("127.0.0.1:0").expect("bind");
+    let addr = listener.local_addr().expect("addr");
+    let limiter = wire_server::limits::ConnectionLimiter::new(16);
+    let store = Arc::new(store);
+    std::thread::spawn(move || {
+        wire_server::server::accept_loop_with_engine(
+            listener,
+            store,
+            core,
+            limiter,
+            std::time::Duration::from_secs(5),
+        );
+    });
+    let mut stream = authenticate_to_ready_for_query(addr, "alice", "pw-alice");
+
+    send_simple_query(
+        &mut stream,
+        "CREATE FUNCTION persisted_fn(v) AS vec_norm(v)",
+    );
+    assert_eq!(read_command_complete(&mut stream), "CREATE FUNCTION");
+    read_ready_for_query(&mut stream);
+
+    send_simple_query(&mut stream, "DROP FUNCTION persisted_fn");
+    assert_eq!(read_command_complete(&mut stream), "DROP FUNCTION");
+    read_ready_for_query(&mut stream);
+
+    send_simple_query(&mut stream, "DROP FUNCTION persisted_fn");
+    expect_error_response_with_sqlstate(&mut stream, "42883");
+    read_ready_for_query(&mut stream);
+}
+/// DDL 許可ユーザー `alice` と、同じテナントの非許可ユーザー `carol`（SQL-66・Issue #1921 の検証用）。
+fn spawn_server_with_ddl_user(core: Arc<EngineCore>) -> std::net::SocketAddr {
+    use wire_server::auth::UserStore;
+    use wire_server::limits::ConnectionLimiter;
+
+    let users_path = write_user_store_file(&[
+        ("alice", "tenant-a", "pw-alice"),
+        ("carol", "tenant-a", "pw-carol"),
+    ]);
+    let store = UserStore::load_from_file(&users_path)
+        .expect("valid user store")
+        .with_ddl_allowed_users(&["alice".to_string()])
+        .expect("known user");
+    let listener = std::net::TcpListener::bind("127.0.0.1:0").expect("bind");
+    let addr = listener.local_addr().expect("local addr");
+    let store = Arc::new(store);
+    std::thread::spawn(move || {
+        wire_server::server::accept_loop_with_engine(
+            listener,
+            store,
+            core,
+            ConnectionLimiter::new(16),
+            std::time::Duration::from_secs(5),
+        );
+    });
+    addr
+}
+
+const CALL_DBL: &str =
+    "SELECT dbl(id) AS d FROM docs ORDER BY embedding <=> '[3.0,4.0,0.0]' LIMIT 1";
+
+/// SQL-66・Issue #1921: 接続 A が `CREATE FUNCTION` した関数を、その後に開いた別の接続 B
+/// （DDL 権限なし）が開始時のロードで呼べる。
+#[test]
+fn wire_udf_created_on_one_connection_is_callable_from_a_new_connection() {
+    let (core, _guard) = new_core_with_docs();
+    let addr = spawn_server_with_ddl_user(core);
+    let mut a = authenticate_to_ready_for_query(addr, "alice", "pw-alice");
+    send_simple_query(&mut a, "CREATE FUNCTION dbl(x) AS x * 2");
+    assert_eq!(read_command_complete(&mut a), "CREATE FUNCTION");
+    read_ready_for_query(&mut a);
+
+    let mut b = authenticate_to_ready_for_query(addr, "carol", "pw-carol");
+    send_simple_query(&mut b, CALL_DBL);
+    assert_eq!(read_row_description(&mut b), vec!["d"]);
+    let row = read_data_row(&mut b);
+    assert_eq!(
+        row[0].as_deref().map(|s| s.trim_end_matches(".0")),
+        Some("2")
+    );
+    assert_eq!(read_command_complete(&mut b), "SELECT 1");
+    read_ready_for_query(&mut b);
+}
+
+/// SQL-66・Issue #1921: 同時に開いている接続 B は、A の `DROP FUNCTION` を次の Query で反映する。
+#[test]
+fn wire_udf_drop_on_one_connection_is_reflected_on_another_open_connection() {
+    let (core, _guard) = new_core_with_docs();
+    let addr = spawn_server_with_ddl_user(core);
+    let mut a = authenticate_to_ready_for_query(addr, "alice", "pw-alice");
+    send_simple_query(&mut a, "CREATE FUNCTION dbl(x) AS x * 2");
+    assert_eq!(read_command_complete(&mut a), "CREATE FUNCTION");
+    read_ready_for_query(&mut a);
+
+    let mut b = authenticate_to_ready_for_query(addr, "carol", "pw-carol");
+    send_simple_query(&mut b, CALL_DBL);
+    assert_eq!(read_row_description(&mut b), vec!["d"]);
+    let _ = read_data_row(&mut b);
+    assert_eq!(read_command_complete(&mut b), "SELECT 1");
+    read_ready_for_query(&mut b);
+
+    send_simple_query(&mut a, "DROP FUNCTION dbl");
+    assert_eq!(read_command_complete(&mut a), "DROP FUNCTION");
+    read_ready_for_query(&mut a);
+
+    send_simple_query(&mut b, CALL_DBL);
+    expect_error_response_with_sqlstate(&mut b, "42883");
+    read_ready_for_query(&mut b);
+}

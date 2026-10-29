@@ -1845,6 +1845,10 @@ pub enum ParsedSql {
     CreateSequence(crate::sql::allowlist::ValidatedCreateSequence),
     /// `DROP SEQUENCE`（TABLE-24、Issue #1688）。
     DropSequence(crate::sql::allowlist::ValidatedDropSequence),
+    /// `DROP FUNCTION <name> [(<型>, ...)]`（SQL-66・TASK-309、Issue #1920）。
+    ///
+    /// **BREAKING CHANGE**（Issue #1920）: `ParsedSql` への variant 追加。
+    DropFunction(crate::sql::allowlist::ValidatedDropFunction),
     /// `CREATE SCHEMA [IF NOT EXISTS] <name>`（TABLE-27、Issue #1713）。
     ///
     /// **BREAKING CHANGE**（Issue #1713）: `ParsedSql` への variant 追加。
@@ -1967,6 +1971,7 @@ fn statement_clock_scope(
         | ParsedSql::DropType(_)
         | ParsedSql::CreateSequence(_)
         | ParsedSql::DropSequence(_)
+        | ParsedSql::DropFunction(_)
         | ParsedSql::CreateSchema(_)
         | ParsedSql::DropSchema(_)
         | ParsedSql::AlterSchema(_)
@@ -2032,6 +2037,7 @@ fn insert_sequence_scope(
         | ParsedSql::DropType(_)
         | ParsedSql::CreateSequence(_)
         | ParsedSql::DropSequence(_)
+        | ParsedSql::DropFunction(_)
         | ParsedSql::CreateSchema(_)
         | ParsedSql::DropSchema(_)
         | ParsedSql::AlterSchema(_)
@@ -2095,6 +2101,7 @@ fn insert_default_clock_scope(
         | ParsedSql::DropType(_)
         | ParsedSql::CreateSequence(_)
         | ParsedSql::DropSequence(_)
+        | ParsedSql::DropFunction(_)
         | ParsedSql::CreateSchema(_)
         | ParsedSql::DropSchema(_)
         | ParsedSql::AlterSchema(_)
@@ -4067,6 +4074,7 @@ impl EngineCore {
                     | crate::sql::SqlOutcome::DropType(_)
                     | crate::sql::SqlOutcome::CreateSequence(_)
                     | crate::sql::SqlOutcome::DropSequence(_)
+                    | crate::sql::SqlOutcome::DropFunction(_)
                     | crate::sql::SqlOutcome::CreateSchema(_)
                     | crate::sql::SqlOutcome::DropSchema(_)
                     | crate::sql::SqlOutcome::AlterSchema(_)
@@ -4122,6 +4130,7 @@ impl EngineCore {
                     | crate::sql::SqlOutcome::DropType(_)
                     | crate::sql::SqlOutcome::CreateSequence(_)
                     | crate::sql::SqlOutcome::DropSequence(_)
+                    | crate::sql::SqlOutcome::DropFunction(_)
                     | crate::sql::SqlOutcome::CreateSchema(_)
                     | crate::sql::SqlOutcome::DropSchema(_)
                     | crate::sql::SqlOutcome::AlterSchema(_)
@@ -4174,6 +4183,7 @@ impl EngineCore {
                     | crate::sql::SqlOutcome::DropType(_)
                     | crate::sql::SqlOutcome::CreateSequence(_)
                     | crate::sql::SqlOutcome::DropSequence(_)
+                    | crate::sql::SqlOutcome::DropFunction(_)
                     | crate::sql::SqlOutcome::CreateSchema(_)
                     | crate::sql::SqlOutcome::DropSchema(_)
                     | crate::sql::SqlOutcome::AlterSchema(_)
@@ -4233,6 +4243,7 @@ impl EngineCore {
                     | crate::sql::SqlOutcome::DropType(_)
                     | crate::sql::SqlOutcome::CreateSequence(_)
                     | crate::sql::SqlOutcome::DropSequence(_)
+                    | crate::sql::SqlOutcome::DropFunction(_)
                     | crate::sql::SqlOutcome::CreateSchema(_)
                     | crate::sql::SqlOutcome::DropSchema(_)
                     | crate::sql::SqlOutcome::AlterSchema(_)
@@ -4305,6 +4316,7 @@ impl EngineCore {
                     | crate::sql::SqlOutcome::DropType(_)
                     | crate::sql::SqlOutcome::CreateSequence(_)
                     | crate::sql::SqlOutcome::DropSequence(_)
+                    | crate::sql::SqlOutcome::DropFunction(_)
                     | crate::sql::SqlOutcome::CreateSchema(_)
                     | crate::sql::SqlOutcome::DropSchema(_)
                     | crate::sql::SqlOutcome::AlterSchema(_)
@@ -4460,14 +4472,24 @@ impl EngineCore {
         session: &crate::sql::mode::SessionState,
         ctx: &PolicyContext,
     ) -> Result<(), crate::sql::allowlist::SqlSurfaceError> {
-        match session.resolution_tenant() {
-            Some(bound) if bound != ctx.tenant_id() => {
-                Err(crate::sql::allowlist::SqlSurfaceError::Internal {
-                    detail: "session tenant binding mismatch".to_string(),
-                })
-            }
-            _ => Ok(()),
+        let mismatch = || crate::sql::allowlist::SqlSurfaceError::Internal {
+            detail: "session tenant binding mismatch".to_string(),
+        };
+        if session
+            .resolution_tenant()
+            .is_some_and(|bound| bound != ctx.tenant_id())
+        {
+            return Err(mismatch());
         }
+        // カタログ由来の UDF をロード済みのセッションは、ロードしたテナントの ctx でしか実行できない
+        // （別テナントの ctx での使い回しで UDF 本体が漏れる経路を作らない。Issue #1921・P0）。
+        // 解決テナント未束縛のまま UDF を保持するセッションも fail-closed で拒否する。
+        if let Some(scope) = session.udfs().catalog_scope() {
+            if scope != ctx.tenant_id() || session.resolution_tenant().is_none() {
+                return Err(mismatch());
+            }
+        }
+        Ok(())
     }
 
     /// エラー文言に現れる SCHEMA 配下の relation の内部キー（`#<id>.<name>`）を、呼び出し元テナントの
@@ -5396,6 +5418,11 @@ impl EngineCore {
         if crate::sql::allowlist::is_alter_schema_statement(&tokens) {
             let stmt = crate::sql::allowlist::validate_alter_schema_tokens(&tokens)?;
             return Ok(ParsedSql::AlterSchema(stmt));
+        }
+        // Issue #1920: `DROP FUNCTION` も汎用 `DROP` より前に分岐する（カタログ照会なし）。
+        if crate::sql::allowlist::is_drop_function_statement(&tokens) {
+            let stmt = crate::sql::allowlist::validate_drop_function_tokens(&tokens)?;
+            return Ok(ParsedSql::DropFunction(stmt));
         }
         if crate::sql::allowlist::is_drop_sequence_statement(&tokens) {
             let stmt = crate::sql::allowlist::validate_drop_sequence_tokens(&tokens)?;
@@ -6981,6 +7008,17 @@ impl EngineCore {
                 let outcome = crate::sql::ddl::execute_drop_sequence(&self.storage, stmt)?;
                 Ok(crate::sql::SqlOutcome::DropSequence(outcome))
             }
+            // SQL-66（Issue #1920）: 権限ゲートは置かない（権限の無いセッションはセッション内の定義だけを
+            // 消せる。CREATE FUNCTION と対称。42501 化は #1922）。カタログは DDL 権限ありのときだけ触る。
+            ParsedSql::DropFunction(stmt) => {
+                let outcome = crate::sql::udf_ddl::execute_drop_function(
+                    &self.storage,
+                    ctx.tenant_id(),
+                    session,
+                    stmt,
+                )?;
+                Ok(crate::sql::SqlOutcome::DropFunction(outcome))
+            }
             // TABLE-27（Issue #1713）: DDL 実行権限ゲート → 実行本体。SCHEMA はテナント単位のカタログ
             // のため `ctx.tenant_id()` を渡す（SEQUENCE との違い）。権限の無い主体には対象の有無を
             // 問わず常に `42501`。
@@ -7104,6 +7142,38 @@ impl EngineCore {
         // 一時カタログに対する細かいゲートは上の parse で通過済みのため、粗いゲートを持たない
         // 内部版を呼ぶ（TABLE-44・Issue #1681）。
         self.execute_parsed_in_session_inner(ctx, session, &parsed)
+    }
+
+    /// 認証済みテナントの UDF カタログをセッションの UDF レジストリへロードする（SQL-66・Issue #1921）。
+    /// wire-server のハンドシェイクが認証成功後・ReadyForQuery の前に 1 回呼ぶ。DDL 権限の有無を
+    /// 問わず、呼び出しは誰でもできる。カタログ全体が読めなければ `Err`（`XX000`・固定文言）で、
+    /// 呼び出し側は接続を拒否する（fail-closed）。個別の定義が登録できない場合はその定義だけ skip する。
+    pub fn load_session_udfs(
+        &self,
+        ctx: &PolicyContext,
+        session: &mut crate::sql::mode::SessionState,
+    ) -> Result<(), crate::sql::allowlist::SqlSurfaceError> {
+        // 解決テナントを ctx のテナントへ束縛する（別テナントへ束縛済みなら fail-closed）。実行入口の
+        // `check_resolution_tenant` がロード元テナントと異なる ctx での実行を拒否する前提になる。
+        if !session.bind_resolution_tenant(ctx.tenant_id()) {
+            session.udfs_mut().remove_catalog_entries();
+            return Err(crate::sql::allowlist::SqlSurfaceError::Internal {
+                detail: "could not load function catalog".to_string(),
+            });
+        }
+        crate::sql::udf_load::load(&self.storage, ctx.tenant_id(), session.udfs_mut())
+    }
+
+    /// 他セッションの `CREATE`／`DROP FUNCTION` を反映する（SQL-66・Issue #1921）。wire-server が
+    /// Query／Parse の実行前に呼ぶ。UDF カタログの世代が変わっていなければ何もしない。失敗したら
+    /// カタログ由来の登録を全部消して次回再試行する（stale な定義で実行し続けない）。未ロードの
+    /// セッションと、ロード時と異なるテナントの ctx では何もロードしない。
+    pub fn refresh_session_udfs(
+        &self,
+        ctx: &PolicyContext,
+        session: &mut crate::sql::mode::SessionState,
+    ) {
+        crate::sql::udf_load::refresh(&self.storage, ctx.tenant_id(), session.udfs_mut());
     }
 
     /// `execute_sql_in_session_unscrubbed` の公開入口。判定順序・エラー契約・実行結果は同関数と同一で、
@@ -7463,9 +7533,35 @@ impl EngineCore {
                 | Statement::SetTimeZone { .. }
                 | Statement::ShowTimeZone
                 | Statement::SetSearchPath { .. }
-                | Statement::ShowSearchPath
-                | Statement::CreateFunction { .. }),
+                | Statement::ShowSearchPath),
             ) => self.execute_validated_in_session(ctx, session, stmt.clone()),
+            // SQL-66（Issue #1920）: DDL 権限のあるセッションの `CREATE FUNCTION` は UDF カタログへ書く
+            // 永続 DDL のため、ROLLBACK で取り消せない書き込みを明示トランザクションの中で行わない
+            // （他の DDL と同じ `0A000`）。権限の無いセッションはセッション内だけの登録で、ROLLBACK で
+            // `session_at_begin` へ戻るため従来どおり通す。
+            ParsedSql::Statement(stmt @ Statement::CreateFunction { .. }) => {
+                if session.ddl_allowed() {
+                    Err(SqlSurfaceError::feature_not_supported(
+                        "CREATE FUNCTION is not supported inside a transaction block",
+                    ))
+                } else {
+                    self.execute_validated_in_session(ctx, session, stmt.clone())
+                }
+            }
+            ParsedSql::DropFunction(_) if session.ddl_allowed() => {
+                Err(SqlSurfaceError::feature_not_supported(
+                    "DROP FUNCTION is not supported inside a transaction block",
+                ))
+            }
+            ParsedSql::DropFunction(stmt) => {
+                let outcome = crate::sql::udf_ddl::execute_drop_function(
+                    &self.storage,
+                    ctx.tenant_id(),
+                    session,
+                    stmt,
+                )?;
+                Ok(crate::sql::SqlOutcome::DropFunction(outcome))
+            }
             // 検索・集計・広域取得・`EXPLAIN`・JOIN・評価後射影形ビュー・集合演算はすべて
             // 同じ読み取り経路へ入る（Issue #1179・#1192・#1353）。dirty テーブルの有無・
             // `USING PLAN`／`EXPLAIN` の読み取り源の切り替えは `read_only_in_active_txn`
@@ -8444,6 +8540,7 @@ impl EngineCore {
             // Issue #1688: SEQUENCE DDL も結果列を持たない。
             ParsedSql::CreateSequence(_) => Ok(None),
             ParsedSql::DropSequence(_) => Ok(None),
+            ParsedSql::DropFunction(_) => Ok(None),
             ParsedSql::CreateSchema(_) => Ok(None),
             ParsedSql::DropSchema(_) => Ok(None),
             ParsedSql::AlterSchema(_) => Ok(None),
@@ -8847,19 +8944,47 @@ impl EngineCore {
             // `sql::udf_call::define_function` に委譲する（検証→登録の順を守り、
             // 失敗時は `session.udfs()` を一切変更しない。`SET search_mode` と同じ
             // 「部分更新＝黙った既定化を防ぐ」方針）。
+            //
+            // Issue #1920（SQL-66）: DDL 実行権限のあるセッションでは、検証 → UDF カタログへの書き込み
+            // （単一 write txn・1 回の commit）→ レジストリへの登録の順で永続化する。権限の無いセッションは
+            // 従来どおりセッション内だけに登録し、カタログには触れない（42501 ゲートは #1922）。
+            //
+            // Issue #1915（SQL-66 (1)）: 型注釈つきの定義は、カタログへの型の永続化とロード側の
+            // 復元（`udf_load` は型注釈つきの行を読み飛ばす）が揃うまで、永続化経路では `0A000` で
+            // 拒否する（セッションにだけ残り再起動で消える黙った不整合を作らない・fail-closed）。
             crate::sql::allowlist::Statement::CreateFunction {
                 name,
                 params,
                 param_types,
                 body,
+                body_source,
             } => {
-                crate::sql::udf_call::define_function_with_types(
-                    session.udfs_mut(),
-                    &name,
-                    &params,
-                    &param_types,
-                    &body,
-                )?;
+                if session.ddl_allowed() {
+                    if param_types.iter().any(Option::is_some) {
+                        return Err(
+                            crate::sql::allowlist::SqlSurfaceError::feature_not_supported(
+                                "typed function parameters cannot be persisted yet",
+                            ),
+                        );
+                    }
+                    crate::sql::udf_ddl::execute_create_function_persistent(
+                        &self.storage,
+                        ctx.tenant_id(),
+                        session,
+                        &name,
+                        &params,
+                        &body,
+                        &body_source,
+                    )?;
+                } else {
+                    crate::sql::udf_call::define_function_with_types(
+                        session.udfs_mut(),
+                        &name,
+                        &params,
+                        &param_types,
+                        &body,
+                    )?;
+                }
                 Ok(crate::sql::SqlOutcome::CreateFunction { name })
             }
             crate::sql::allowlist::Statement::Select(validated) => {
@@ -15122,6 +15247,25 @@ mod tests {
     // 対象ビヘイビア: CORE-1。object-safety の固定（プロトコルアダプタは `&dyn VectorCore`
     // のみを介して呼び出せる）。
     fn _assert_object_safe(_: &dyn VectorCore) {}
+
+    /// Issue #1921（P0）: テナント A でロードした UDF 入りセッションを B の ctx で実行すると拒否される。
+    #[test]
+    fn loaded_udf_session_rejects_other_tenant_ctx() {
+        let dir = tempdir();
+        let core = new_core(dir.path());
+        let ctx_a = PolicyContext::new("tenant-a").expect("valid tenant");
+        let ctx_b = PolicyContext::new("tenant-b").expect("valid tenant");
+        let mut session = crate::sql::mode::SessionState::default();
+        core.load_session_udfs(&ctx_a, &mut session)
+            .expect("load a");
+        assert_eq!(session.resolution_tenant(), Some("tenant-a"));
+        let err = core
+            .execute_sql_in_session(&ctx_b, &mut session, "SELECT 1")
+            .expect_err("tenant mismatch must be rejected");
+        assert_eq!(err.wire_code(), "XX000");
+        // 別テナントへ束縛済みのセッションへの load も fail-closed。
+        assert!(core.load_session_udfs(&ctx_b, &mut session).is_err());
+    }
 
     #[test]
     fn search_rejects_k_zero_and_over_limit() {
