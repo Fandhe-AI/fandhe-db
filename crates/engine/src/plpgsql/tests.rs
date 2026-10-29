@@ -895,7 +895,7 @@ fn classification_is_linear_for_many_references() {
     assert!(start.elapsed().as_secs() < 5);
 }
 
-// ---- PR #2779 レビュー指摘の回帰（キーワード風の識別子の誤判定・RETURN QUERY・ラベル解決） ----
+// ---- PR #2779 レビュー指摘の回帰（曖昧な名前の宣言拒否・RETURN QUERY・ラベル解決・CTE 分類） ----
 
 fn first_sql_refs(b: &Body) -> usize {
     match b.block.stmts.first() {
@@ -907,75 +907,110 @@ fn first_sql_refs(b: &Body) -> usize {
 }
 
 #[test]
-fn structural_words_named_like_variables_are_not_references() {
-    // `set` 変数があっても `UPDATE t SET x = 1` の構造語 SET は参照にしない。
-    let b = ok("DECLARE set int; BEGIN UPDATE t SET x = 1; END");
-    assert_eq!(first_sql_refs(&b), 0);
-    // 値の位置の `set` は引き続き参照になる（誤って除外しない）。
-    let b = ok("DECLARE set int; BEGIN UPDATE t SET x = set; END");
-    assert_eq!(first_sql_refs(&b), 1);
-    let b = ok("DECLARE set int; BEGIN PERFORM set; END");
-    assert_eq!(first_sql_refs(&b), 1);
-    // GROUP BY・VALUES・RETURNING・OFFSET の構造語。
-    for (src, n) in [
-        (
-            "DECLARE \"group\" int; BEGIN PERFORM 1 FROM t GROUP BY x; END",
-            0,
-        ),
-        (
-            "DECLARE group_n int; BEGIN PERFORM 1 FROM t WHERE x = group_n GROUP BY x; END",
-            1,
-        ),
-        (
-            "DECLARE values_n int; BEGIN INSERT INTO t(x) VALUES (1); END",
-            0,
-        ),
-        (
-            "DECLARE returning int; BEGIN DELETE FROM t WHERE x = 1 RETURNING x; END",
-            0,
-        ),
-        (
-            "DECLARE returning int; BEGIN DELETE FROM t WHERE x = 1 RETURNING returning; END",
-            1,
-        ),
-        (
-            "DECLARE o int; BEGIN PERFORM 1 FROM t LIMIT 1 OFFSET o; END",
-            1,
-        ),
+fn ambiguous_names_are_rejected_at_declaration_with_0a000() {
+    // 構造語・リテラル語・文の語は、未引用でも引用付きでも変数名にできない。
+    for name in [
+        "set",
+        "into",
+        "using",
+        "values",
+        "insert",
+        "update",
+        "delete",
+        "with",
+        "get",
+        "first",
+        "next",
+        "strict",
+        "reverse",
+        "exception",
+        "operation_id",
+        "group",
+        "returning",
+        "offset",
+        "true",
+        "false",
+        "null_",
+        "default",
+        "array",
+        "current_date",
+        "current_timestamp",
     ] {
-        let b = ok(src);
-        assert_eq!(first_sql_refs(&b), n, "for {src:?}");
+        // `null_` は許可される名前（下で受理を確認する）。
+        if name == "null_" {
+            ok(&format!("DECLARE {name} int; BEGIN NULL; END"));
+            continue;
+        }
+        for decl in [name.to_string(), format!("\"{name}\"")] {
+            assert_eq!(
+                code(&format!("DECLARE {decl} int; BEGIN NULL; END")),
+                "0A000",
+                "for {decl}"
+            );
+        }
     }
+    // 引用付きの "null" は予約語経路（42601）か 0A000 のどちらでも拒否される。
+    assert_ne!(code("DECLARE \"null\" int; BEGIN NULL; END"), "");
+    // ループ変数・ラベル・パラメータ名も同じ。
+    assert_eq!(
+        code("BEGIN FOR set IN 1..3 LOOP NULL; END LOOP; END"),
+        "0A000"
+    );
+    assert_eq!(
+        code("BEGIN FOR \"into\" IN SELECT 1 LOOP NULL; END LOOP; END"),
+        "0A000"
+    );
+    // ラベルは修飾子としてだけ使われ識別子位置に現れないので、構造語と同名でも宣言できる。
+    ok("<<values>> BEGIN NULL; END");
+    let o = ParseOptions::new(
+        vec![ParamDecl {
+            name: Some("Set".to_string()),
+            ty: SqlColumnTypeName::Integer,
+        }],
+        ReturnShape::Scalar,
+    );
+    assert_eq!(code_with("BEGIN RETURN 1; END", &o), "0A000");
+    // エラー文言は名前を含めない。
+    let e = parse_body("DECLARE set int; BEGIN NULL; END", &opts()).expect_err("reject");
+    assert!(!e.to_string().to_lowercase().contains("set"), "leaked: {e}");
 }
 
 #[test]
-fn quoted_bool_word_names_resolve_and_unquoted_literals_are_rejected() {
-    let b = ok("DECLARE \"true\" int := 1; BEGIN RETURN \"true\"; END");
-    let Some(Stmt::Return(Some(e))) = b.block.stmts.first() else {
-        panic!("return");
+fn rejected_names_keep_literals_and_clauses_literal() {
+    // 同名の変数を宣言できないので、リテラル・構造語は変数参照にならない。
+    let b = ok("BEGIN IF true THEN NULL; END IF; END");
+    let Some(Stmt::If { branches, .. }) = b.block.stmts.first() else {
+        panic!("if");
     };
-    assert_eq!(e.var_refs.len(), 1);
-    // 未引用のリテラル語は変数名にできない（`RETURN true` を変数へ読み替えないため）。
-    assert_eq!(code("DECLARE true int := 1; BEGIN RETURN 1; END"), "42601");
-    assert_eq!(code("DECLARE default int; BEGIN RETURN 1; END"), "42601");
+    assert!(branches[0].0.var_refs.is_empty());
+    let b = ok("BEGIN INSERT INTO t(x) VALUES (default); END");
+    assert_eq!(first_sql_refs(&b), 0);
+    let b = ok("BEGIN PERFORM ARRAY[1, 2]; END");
+    assert_eq!(first_sql_refs(&b), 0);
+    let b = ok("DECLARE v int; BEGIN UPDATE t SET x = v; END");
+    assert_eq!(first_sql_refs(&b), 1);
+    let b = ok("DECLARE n int; BEGIN PERFORM 1 FROM t LIMIT 1 FETCH FIRST n ROWS ONLY; END");
+    assert_eq!(first_sql_refs(&b), 1);
+    let b = ok("DECLARE n int; BEGIN PERFORM 1 FROM t GROUP BY x HAVING count(*) > n; END");
+    assert_eq!(first_sql_refs(&b), 1);
 }
 
 #[test]
-fn assignment_takes_precedence_over_statement_keywords() {
-    for w in [
-        "insert", "update", "delete", "values", "with", "get", "set", "call",
-    ] {
-        let b = ok(&format!("DECLARE {w} int; BEGIN {w} := 1; END"));
-        assert!(
-            matches!(b.block.stmts.first(), Some(Stmt::Assign { .. })),
-            "for {w}"
-        );
-    }
-    // 変数が無ければ従来どおり fail-closed（代入先が未宣言で 42601）。
-    assert_eq!(code("BEGIN insert := 1; END"), "42601");
-    // SQL 文は従来どおり解析される。
-    ok("DECLARE insert int; BEGIN INSERT INTO t VALUES (1); END");
-    assert_eq!(code("BEGIN SET x = 1; END"), "0A000");
+fn execute_requires_a_command_expression() {
+    // 句としての先頭 INTO／USING は空のコマンド文字列（42601）。
+    assert_eq!(code("DECLARE x int; BEGIN EXECUTE INTO x; END"), "42601");
+    assert_eq!(code("DECLARE a int; BEGIN EXECUTE USING a; END"), "42601");
+    assert_eq!(code("BEGIN EXECUTE ; END"), "42601");
+    ok("DECLARE x int; BEGIN EXECUTE 'select 1' INTO x; END");
+}
+
+#[test]
+fn insert_assignment_is_not_declarable_so_statements_stay_sql() {
+    // `insert := 1` は変数が宣言できない（0A000）ので SQL 文として読まれることはない。
+    assert_eq!(code("DECLARE insert int; BEGIN insert := 1; END"), "0A000");
+    let b = ok("BEGIN insert := 1; END");
+    assert!(matches!(b.block.stmts.first(), Some(Stmt::Sql(_))));
+    ok("BEGIN INSERT INTO t VALUES (1); END");
 }
 
 #[test]
@@ -1001,10 +1036,8 @@ fn outermost_block_label_qualifies_params_and_found() {
     assert_eq!(e.var_refs.len(), 1);
     let b = ok("<<blk>> BEGIN PERFORM blk.found; END");
     assert_eq!(first_sql_refs(&b), 1);
-    // パラメータへの修飾代入も解決できる。
     let b = ok("<<blk>> BEGIN blk.a := 2; RETURN 1; END");
     assert!(matches!(b.block.stmts.first(), Some(Stmt::Assign { .. })));
-    // FOUND は定数なので代入は拒否のまま。
     assert_eq!(
         code("<<blk>> BEGIN blk.found := true; RETURN 1; END"),
         "42601"
@@ -1021,48 +1054,40 @@ fn outermost_block_label_qualifies_params_and_found() {
 }
 
 #[test]
-fn execute_into_using_named_variables_are_expressions() {
-    let b = ok("DECLARE into text := 'x'; BEGIN EXECUTE into; END");
-    let Some(Stmt::Execute { query, .. }) = b.block.stmts.first() else {
-        panic!("execute");
+fn with_classification_skips_cte_definitions() {
+    let kind = |src: &str| {
+        let b = ok(&format!("BEGIN {src}; END"));
+        match b.block.stmts.first() {
+            Some(Stmt::Sql(q)) => (q.kind, q.writes),
+            other => panic!("not sql: {other:?}"),
+        }
     };
-    assert_eq!(query.var_refs.len(), 1);
-    let b = ok("DECLARE using text := 'x'; BEGIN EXECUTE using; END");
-    assert!(matches!(b.block.stmts.first(), Some(Stmt::Execute { .. })));
-    let b = ok("DECLARE v int; into int; BEGIN EXECUTE 'x' USING v, into INTO v; END");
-    let Some(Stmt::Execute { using, into, .. }) = b.block.stmts.first() else {
-        panic!("execute");
-    };
-    assert_eq!(using.len(), 2);
-    assert!(into.is_some());
-    // 空のクエリ式は従来どおり拒否する。
-    assert_eq!(code("BEGIN EXECUTE ; END"), "42601");
+    // CTE 名が主文の語と同名でも、CTE 定義の後の主文で分類する。
     assert_eq!(
-        code("DECLARE v int; BEGIN EXECUTE 'x' USING ; END"),
+        kind("WITH \"values\" AS (SELECT 1) UPDATE t SET x = 1"),
+        (EmbeddedKind::Update, true)
+    );
+    assert_eq!(
+        kind("WITH \"update\" AS (SELECT 1) SELECT 1 FROM \"update\""),
+        (EmbeddedKind::Select, false)
+    );
+    assert_eq!(
+        kind("WITH \"delete\" (a, b) AS NOT MATERIALIZED (SELECT 1, 2), c AS (SELECT 2) DELETE FROM t"),
+        (EmbeddedKind::Delete, true)
+    );
+    assert_eq!(
+        kind("WITH RECURSIVE r AS (SELECT 1) INSERT INTO t SELECT * FROM r"),
+        (EmbeddedKind::Insert, true)
+    );
+    // データ変更 CTE を持つ SELECT は書き込み扱い。
+    assert_eq!(
+        kind("WITH c AS (DELETE FROM t RETURNING 1) SELECT 1 FROM c"),
+        (EmbeddedKind::Select, true)
+    );
+    // 形を読み解けない WITH は fail-closed で拒否する。
+    assert_eq!(code("BEGIN WITH c AS SELECT 1; END"), "42601");
+    assert_eq!(
+        code("BEGIN RETURN QUERY WITH c AS (SELECT 1) TABLE t; END"),
         "42601"
-    );
-}
-
-#[test]
-fn contextual_words_usable_as_variable_names() {
-    // EXCEPTION・STRICT・REVERSE・OPERATION_ID は予約語ではなく変数名になれる。
-    ok("DECLARE exception int; BEGIN exception := 1; END");
-    assert_eq!(
-        code("DECLARE x int; BEGIN x := 1; EXCEPTION WHEN OTHERS THEN NULL; END"),
-        "0A000"
-    );
-    ok("DECLARE strict int; BEGIN EXECUTE 'x' INTO strict; END");
-    ok("DECLARE strict int; BEGIN SELECT 1 INTO strict; END");
-    let b = ok("BEGIN SELECT 1 INTO STRICT a; END");
-    let Some(Stmt::Sql(q)) = b.block.stmts.first() else {
-        panic!("sql");
-    };
-    assert!(q.into.as_ref().is_some_and(|i| i.strict));
-    ok("DECLARE reverse int := 1; BEGIN FOR i IN reverse .. 3 LOOP NULL; END LOOP; END");
-    ok("BEGIN FOR i IN REVERSE 3 .. 1 LOOP NULL; END LOOP; END");
-    ok("DECLARE operation_id int; BEGIN EXECUTE 'x' USING operation_id; END");
-    assert_eq!(
-        code("BEGIN EXECUTE 'x' USING OPERATION_ID 'k'; END"),
-        "0A000"
     );
 }

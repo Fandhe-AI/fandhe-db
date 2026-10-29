@@ -59,13 +59,7 @@ pub(super) fn split_into(
     };
     let mut j = at.saturating_add(1);
     let mut strict = false;
-    // `STRICT` は直後に対象名が続くときだけ修飾語（`INTO strict,` の `strict` は変数名）。
-    if tokens.get(j).is_some_and(|t| ident_is(t, "STRICT"))
-        && matches!(
-            tokens.get(j.saturating_add(1)),
-            Some(Token::Ident(_) | Token::QualifiedIdent { .. })
-        )
-    {
+    if tokens.get(j).is_some_and(|t| ident_is(t, "STRICT")) {
         strict = true;
         j = j.saturating_add(1);
     }
@@ -507,33 +501,79 @@ fn is_cte_decl_name(tokens: &[Token], i: usize) -> bool {
 }
 
 /// `WITH` で始まる文の主文の種別と、データ変更 CTE（`( INSERT|UPDATE|DELETE`）の有無を返す。
-/// 括弧の深さ 0 で最初に現れる主文の語で種別を決める（CTE 本体は括弧内なので読み飛ばされる）。
-pub(super) fn classify_with(tokens: &[Token]) -> (EmbeddedKind, bool) {
-    let mut depth = 0usize;
-    let mut kind = EmbeddedKind::Select;
-    let mut found = false;
-    for t in tokens {
-        match t {
-            Token::Punct('(') => depth = depth.saturating_add(1),
-            Token::Punct(')') => depth = depth.saturating_sub(1),
-            _ if depth == 0 && !found => {
-                if ident_is(t, "INSERT") {
-                    kind = EmbeddedKind::Insert;
-                    found = true;
-                } else if ident_is(t, "UPDATE") {
-                    kind = EmbeddedKind::Update;
-                    found = true;
-                } else if ident_is(t, "DELETE") {
-                    kind = EmbeddedKind::Delete;
-                    found = true;
-                } else if matches!(t, Token::Keyword(Keyword::Select)) || ident_is(t, "VALUES") {
-                    found = true;
+///
+/// CTE 定義（`[RECURSIVE] 名前 [(列リスト)] AS [[NOT] MATERIALIZED] (本体)` のカンマ区切り）を構造的に
+/// 読み飛ばし、その直後の主文の語で種別を決める。CTE の宣言名は `"update"` のように主文の語と同名に
+/// なりうるため、深さ 0 の最初の語を見る方式は使わない。定義の形を読み解けない・主文が
+/// `SELECT`／`VALUES`／`INSERT`／`UPDATE`／`DELETE`／`(` 以外のときは `42601` で拒否する
+/// （書き込み経路の事前決定なので判定不能は fail-closed）。
+pub(super) fn classify_with(tokens: &[Token]) -> Result<(EmbeddedKind, bool), SqlSurfaceError> {
+    let bad = || syn_err("unsupported WITH statement in a PL/pgSQL body");
+    // `open` の `(` に対応する `)` の次の位置。
+    let skip_parens = |open: usize| -> Option<usize> {
+        let mut depth = 0usize;
+        for (k, t) in tokens.iter().enumerate().skip(open) {
+            match t {
+                Token::Punct('(') => depth = depth.saturating_add(1),
+                Token::Punct(')') => {
+                    depth = depth.saturating_sub(1);
+                    if depth == 0 {
+                        return Some(k.saturating_add(1));
+                    }
                 }
+                _ => {}
             }
-            _ => {}
+        }
+        None
+    };
+    if !tokens.first().is_some_and(|t| ident_is(t, "WITH")) {
+        return Err(bad());
+    }
+    let mut j = 1usize;
+    if tokens.get(j).is_some_and(|t| ident_is(t, "RECURSIVE")) {
+        j = j.saturating_add(1);
+    }
+    loop {
+        // CTE 名（1 トークン）。
+        if !matches!(
+            tokens.get(j),
+            Some(Token::Ident(_) | Token::QuotedBoolWord(_) | Token::QuotedNull(_))
+        ) {
+            return Err(bad());
+        }
+        j = j.saturating_add(1);
+        if matches!(tokens.get(j), Some(Token::Punct('('))) {
+            j = skip_parens(j).ok_or_else(bad)?;
+        }
+        if !tokens.get(j).is_some_and(|t| ident_is(t, "AS")) {
+            return Err(bad());
+        }
+        j = j.saturating_add(1);
+        if tokens.get(j).is_some_and(|t| ident_is(t, "NOT")) {
+            j = j.saturating_add(1);
+        }
+        if tokens.get(j).is_some_and(|t| ident_is(t, "MATERIALIZED")) {
+            j = j.saturating_add(1);
+        }
+        if !matches!(tokens.get(j), Some(Token::Punct('('))) {
+            return Err(bad());
+        }
+        j = skip_parens(j).ok_or_else(bad)?;
+        if matches!(tokens.get(j), Some(Token::Punct(','))) {
+            j = j.saturating_add(1);
+        } else {
+            break;
         }
     }
-    (kind, has_write_cte(tokens))
+    let kind = match tokens.get(j) {
+        Some(t) if ident_is(t, "INSERT") => EmbeddedKind::Insert,
+        Some(t) if ident_is(t, "UPDATE") => EmbeddedKind::Update,
+        Some(t) if ident_is(t, "DELETE") => EmbeddedKind::Delete,
+        Some(t) if ident_is(t, "VALUES") => EmbeddedKind::Select,
+        Some(Token::Keyword(Keyword::Select)) | Some(Token::Punct('(')) => EmbeddedKind::Select,
+        _ => return Err(bad()),
+    };
+    Ok((kind, has_write_cte(tokens)))
 }
 
 /// `(` の直後が `INSERT`／`UPDATE`／`DELETE` のトークンがあるか（データ変更 CTE）。
@@ -555,7 +595,7 @@ pub(super) fn classify_query(tokens: &[Token]) -> Result<EmbeddedKind, SqlSurfac
     } else if ident_is(first, "DELETE") {
         Ok(EmbeddedKind::Delete)
     } else if ident_is(first, "WITH") {
-        Ok(classify_with(tokens).0)
+        Ok(classify_with(tokens)?.0)
     } else {
         Err(syn_err("unsupported query in a PL/pgSQL statement"))
     }

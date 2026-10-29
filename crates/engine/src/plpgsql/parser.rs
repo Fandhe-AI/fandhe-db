@@ -33,68 +33,19 @@ const RESERVED: &[&str] = &[
 /// SQL 字句解析が `Token::Keyword` 化する語（変数名にできない）。
 const SQL_KEYWORD_NAMES: &[&str] = &["select", "from", "where", "and", "order", "by", "limit"];
 
-/// 埋め込み SQL の中で構造語（句の区切り）としても現れるが予約語ではないため、変数名にも
-/// なりうる語。`resolve_refs` は [`is_structural_use`] で文脈から構造語の位置を除外する。
-const STRUCTURAL_WORDS: &[&str] = &[
-    "set",
-    "into",
-    "group",
-    "having",
-    "values",
-    "returning",
-    "offset",
-    "union",
-    "intersect",
-    "except",
-    "join",
-    "on",
-    "using",
-    "inner",
-    "left",
-    "right",
-    "full",
-    "cross",
-    "natural",
-    "window",
-    "fetch",
-    "asc",
-    "desc",
-];
-
-/// 直後に値が来る語（演算子語・句の語）。これらの直後の語は構造語ではなく値の位置にある。
-const VALUE_PREFIX_WORDS: &[&str] = &[
-    "or",
-    "not",
-    "is",
-    "like",
-    "ilike",
-    "between",
-    "in",
-    "any",
-    "some",
-    "all",
-    "distinct",
-    "escape",
-    "similar",
-    "to",
-    "then",
-    "else",
-    "when",
-    "case",
-    "returning",
-    "offset",
-    "having",
-    "on",
-    "using",
-    "over",
-    "interval",
-];
-
-/// 未引用のままだと SQL 側でリテラル・特殊構文として読まれる語。変数名にすると `RETURN true`
-/// 等が変数参照へ読み替わるため、未引用での宣言を拒否する（引用付きなら別トークンで区別できる）。
-const SQL_LITERAL_NAMES: &[&str] = &[
+/// 変数・パラメータ・ループ変数の名前として宣言できない語（引用付き `"..."` でも拒否する）。
+///
+/// 解析器・`embedded` が識別子の位置判定や文種の判定で「構造語」「リテラル語」として特別扱いする語を
+/// この 1 か所に集約する。同名の変数を許すと、`UPDATE t SET x = 1` の `SET` や `IF true` の `true` が
+/// 変数参照に読み替わり正しい本体を拒否・誤実行しうる。位置ヒューリスティックで 1 語ずつ塞がず、
+/// 曖昧な名前は宣言時に `0A000` で拒否する（fail-closed。設計は `docs/design/plpgsql-subset.md`）。
+/// 比較は ASCII の大小を無視する。`declare`・`init_outer_scope` が参照する（ラベルは識別子位置に
+/// 現れず `lbl.name` の修飾子としてだけ使うため対象外）。
+pub(super) const UNSUPPORTED_NAMES: &[&str] = &[
+    // リテラル・値関数の語（`QuotedNull`／`QuotedBoolWord` と未引用の `Ident` の衝突を避ける）。
     "true",
     "false",
+    "null",
     "default",
     "array",
     "current_timestamp",
@@ -102,7 +53,83 @@ const SQL_LITERAL_NAMES: &[&str] = &[
     "current_time",
     "localtimestamp",
     "localtime",
+    // 文頭・文の構造語。
+    "insert",
+    "update",
+    "delete",
+    "values",
+    "with",
+    "get",
+    "set",
+    "into",
+    "using",
+    "strict",
+    "reverse",
+    "exception",
+    "operation_id",
+    "partitioned",
+    "first",
+    "next",
+    "query",
+    "stacked",
+    "current",
+    "diagnostics",
+    "row_count",
+    "alias",
+    "cursor",
+    "scroll",
+    "no",
+    "constant",
+    "collate",
+    // 埋め込み SQL の句・演算子の語（`embedded` の識別子位置判定が文脈語として扱う）。
+    "group",
+    "having",
+    "returning",
+    "offset",
+    "union",
+    "intersect",
+    "except",
+    "join",
+    "on",
+    "inner",
+    "left",
+    "right",
+    "full",
+    "cross",
+    "natural",
+    "outer",
+    "lateral",
+    "tablesample",
+    "overriding",
+    "window",
+    "fetch",
+    "rows",
+    "only",
+    "asc",
+    "desc",
+    "distinct",
+    "table",
+    "constraint",
+    "conflict",
+    "materialized",
+    "as",
+    "do",
+    "or",
+    "not",
 ];
+
+/// 名前が [`UNSUPPORTED_NAMES`] に含まれるなら `0A000`（エラー文言に名前は含めない）。
+fn check_supported_name(name: &str) -> Result<(), SqlSurfaceError> {
+    if UNSUPPORTED_NAMES
+        .iter()
+        .any(|w| w.eq_ignore_ascii_case(name))
+    {
+        return Err(oos_err(
+            "this name cannot be used for a PL/pgSQL variable or parameter",
+        ));
+    }
+    Ok(())
+}
 
 /// 範囲外（`0A000`）の文頭の語。
 const OUT_OF_SCOPE_STARTS: &[&str] = &[
@@ -228,33 +255,6 @@ fn strip_outer_parens(mut t: Vec<Token>) -> Vec<Token> {
     }
 }
 
-/// `tokens[i]`（変数名と同名の語）が SQL の構造語として使われているかを直前トークンで判定する。
-///
-/// `STRUCTURAL_WORDS` の語だけが対象。直前が値の終端（識別子・数値・文字列・`$n`・`)`・`]`）で、
-/// かつ直前が値の前置語でないとき、値が 2 つ並ぶことはないので構造語（`UPDATE t SET` の `SET`
-/// 等）とみなす。直前が句の語（`SELECT`/`WHERE`/`BY` 等の `Token::Keyword`）・演算子・`(`・`,`・
-/// 文頭なら値の位置なので変数参照のままにする。`resolve_refs` から呼ばれる。
-fn is_structural_use(tokens: &[Token], i: usize, name: &str) -> bool {
-    let lower = name.to_ascii_lowercase();
-    if !STRUCTURAL_WORDS.contains(&lower.as_str()) {
-        return false;
-    }
-    let Some(prev) = i.checked_sub(1).and_then(|p| tokens.get(p)) else {
-        return false;
-    };
-    match prev {
-        Token::Ident(w) => !VALUE_PREFIX_WORDS.contains(&w.to_ascii_lowercase().as_str()),
-        Token::QualifiedIdent { .. }
-        | Token::QuotedBoolWord(_)
-        | Token::Number(_)
-        | Token::StringLiteral(_)
-        | Token::Param(_)
-        | Token::Punct(')')
-        | Token::Punct(']') => true,
-        _ => false,
-    }
-}
-
 fn sql_tokens(text: &str) -> Result<Vec<Token>, SqlSurfaceError> {
     let t = tokenize_with_params(text)
         .map_err(|_| syn_err("invalid token in an embedded SQL fragment of the PL/pgSQL body"))?;
@@ -336,10 +336,7 @@ impl<'a> Parser<'a> {
                 let l = w.to_ascii_lowercase();
                 // SQL 側で `Token::Keyword` 化される語（limit/order/by 等）と同名の変数は式中で参照を
                 // 解決できないため、宣言時に拒否する（fail-closed）。
-                if RESERVED.contains(&l.as_str())
-                    || SQL_KEYWORD_NAMES.contains(&l.as_str())
-                    || SQL_LITERAL_NAMES.contains(&l.as_str())
-                {
+                if RESERVED.contains(&l.as_str()) || SQL_KEYWORD_NAMES.contains(&l.as_str()) {
                     return Err(syn_err("reserved word used as a PL/pgSQL name"));
                 }
                 l
@@ -382,18 +379,6 @@ impl<'a> Parser<'a> {
         from: usize,
         stop: &dyn Fn(&TokKind) -> bool,
     ) -> Result<usize, SqlSurfaceError> {
-        self.find_end_ex(from, stop, false)
-    }
-
-    /// [`Self::find_end`] の本体。`exempt_first` が真なら先頭トークン（`from`）は終端判定の対象外
-    /// （`;` を除く）。式の先頭の語は式の一部であり、`EXECUTE into`（`into` 変数）のように
-    /// 終端語と同名の変数が式の先頭に来うるため。
-    fn find_end_ex(
-        &self,
-        from: usize,
-        stop: &dyn Fn(&TokKind) -> bool,
-        exempt_first: bool,
-    ) -> Result<usize, SqlSurfaceError> {
         let mut paren = 0usize;
         let mut case = 0usize;
         let mut i = from;
@@ -410,8 +395,8 @@ impl<'a> Parser<'a> {
                 TokKind::Word(w) if case > 0 && w.eq_ignore_ascii_case("END") => case -= 1,
                 _ => {}
             }
-            let stops = case == 0 && !(exempt_first && i == from) && stop(&t.kind);
-            if paren == 0 && (stops || matches!(t.kind, TokKind::Punct(';'))) {
+            if paren == 0 && ((case == 0 && stop(&t.kind)) || matches!(t.kind, TokKind::Punct(';')))
+            {
                 return Ok(i);
             }
             i = i.saturating_add(1);
@@ -472,6 +457,7 @@ impl<'a> Parser<'a> {
                 scope_depth: 0,
             });
             if !name.is_empty() {
+                check_supported_name(&name)?;
                 scope.names.push((name, id));
             }
         }
@@ -499,6 +485,7 @@ impl<'a> Parser<'a> {
         not_null: bool,
         default: Option<SqlExpr>,
     ) -> Result<VarId, SqlSurfaceError> {
+        check_supported_name(&name)?;
         let id = VarId(
             u32::try_from(self.vars.len())
                 .map_err(|_| too_big_err("too many PL/pgSQL variables"))?,
@@ -611,12 +598,7 @@ impl<'a> Parser<'a> {
                     }
                     refs.push((i, VarRef::Var(VarId(u32::from(*n) - 1))));
                 }
-                // `QuotedBoolWord` は引用付きの `"true"`／`"false"`。引用付きで宣言された同名の変数は
-                // 未引用のリテラルと字句上で区別できるので、変数として解決する。
-                Token::Ident(name) | Token::QuotedBoolWord(name)
-                    if !is_ident_position_with(tokens, i, &slots)
-                        && !is_structural_use(tokens, i, name) =>
-                {
+                Token::Ident(name) if !is_ident_position_with(tokens, i, &slots) => {
                     if let Some(id) = self.lookup_var(&name.to_ascii_lowercase()) {
                         refs.push((i, VarRef::Var(id)));
                     }
@@ -921,15 +903,9 @@ impl<'a> Parser<'a> {
             match self.kind(0) {
                 None => return Err(syn_err("unexpected end of PL/pgSQL body")),
                 Some(TokKind::Word(w))
-                    if ["END", "ELSE", "ELSIF", "ELSEIF", "WHEN"]
+                    if ["END", "ELSE", "ELSIF", "ELSEIF", "WHEN", "EXCEPTION"]
                         .iter()
                         .any(|x| w.eq_ignore_ascii_case(x)) =>
-                {
-                    return Ok(out)
-                }
-                // `EXCEPTION` は予約語ではない。`exception := 1;` のような代入は文として読む。
-                Some(TokKind::Word(w))
-                    if w.eq_ignore_ascii_case("EXCEPTION") && !self.assignment_ahead() =>
                 {
                     return Ok(out)
                 }
@@ -974,16 +950,6 @@ impl<'a> Parser<'a> {
         let Some(w) = word else {
             return self.parse_assign();
         };
-        // 代入の判定は文種の判定より先に行う。`insert`・`update`・`get` 等は予約語ではなく変数名に
-        // できるため、`insert := 1;` を SQL 文として読むと誤って 42601 になる。予約語（制御構文の
-        // 語）は変数名になれないので、ここでは名前として使える語だけを対象にする。
-        let lower = w.to_ascii_lowercase();
-        if !RESERVED.contains(&lower.as_str())
-            && !SQL_KEYWORD_NAMES.contains(&lower.as_str())
-            && self.assignment_ahead()
-        {
-            return self.parse_assign();
-        }
         match w.as_str() {
             "DECLARE" | "BEGIN" => Ok(Stmt::Block(self.parse_block(label, false)?)),
             "IF" => self.parse_if(),
@@ -1001,7 +967,9 @@ impl<'a> Parser<'a> {
             }
             "SELECT" | "WITH" | "INSERT" | "UPDATE" | "DELETE" | "VALUES" => self.parse_sql(&w),
             _ => {
-                if OUT_OF_SCOPE_STARTS.contains(&w.as_str()) {
+                if self.assignment_ahead() {
+                    self.parse_assign()
+                } else if OUT_OF_SCOPE_STARTS.contains(&w.as_str()) {
                     Err(oos_err("this statement is not supported in PL/pgSQL"))
                 } else {
                     Err(syn_err("unrecognized PL/pgSQL statement"))
@@ -1149,8 +1117,7 @@ impl<'a> Parser<'a> {
         if self.is_kw(0, "EXECUTE") {
             return Err(oos_err("FOR ... IN EXECUTE is not supported in PL/pgSQL"));
         }
-        // `FOR i IN reverse .. 10` の `reverse` は変数（直後が `..` なら修飾語ではない）。
-        let reverse = !matches!(self.kind(1), Some(TokKind::DotDot)) && self.eat_kw("REVERSE");
+        let reverse = self.eat_kw("REVERSE");
         let a = self.pos;
         let e = self.find_end(a, &|k| {
             matches!(k, TokKind::DotDot)
@@ -1389,7 +1356,7 @@ impl<'a> Parser<'a> {
             "INSERT" => EmbeddedKind::Insert,
             "UPDATE" => EmbeddedKind::Update,
             "DELETE" => EmbeddedKind::Delete,
-            "WITH" => classify_with(&tokens).0,
+            "WITH" => classify_with(&tokens)?.0,
             _ => EmbeddedKind::Select,
         };
         let q = self.build_sql(tokens, kind, true)?;
@@ -1399,15 +1366,7 @@ impl<'a> Parser<'a> {
     }
 
     fn parse_into_targets(&mut self) -> Result<IntoClause, SqlSurfaceError> {
-        // `STRICT` は直後に対象名が続くときだけ修飾語（`INTO strict;` の `strict` は変数名）。
-        let strict = self.is_kw(0, "STRICT")
-            && matches!(
-                self.kind(1),
-                Some(TokKind::Word(_)) | Some(TokKind::Quoted(_))
-            );
-        if strict {
-            self.pos = self.pos.saturating_add(1);
-        }
+        let strict = self.eat_kw("STRICT");
         let mut targets = Vec::new();
         loop {
             let (q, n) = self.take_dotted()?;
@@ -1424,13 +1383,9 @@ impl<'a> Parser<'a> {
     fn parse_execute(&mut self) -> Result<Stmt, SqlSurfaceError> {
         self.pos = self.pos.saturating_add(1);
         let a = self.pos;
-        let e = self.find_end_ex(
-            a,
-            &|k| {
-                matches!(k, TokKind::Word(w) if w.eq_ignore_ascii_case("INTO") || w.eq_ignore_ascii_case("USING"))
-            },
-            true,
-        )?;
+        let e = self.find_end(a, &|k| {
+            matches!(k, TokKind::Word(w) if w.eq_ignore_ascii_case("INTO") || w.eq_ignore_ascii_case("USING"))
+        })?;
         let query = self.build_expr(a, e, false)?;
         self.pos = e;
         let mut into = None;
@@ -1449,45 +1404,20 @@ impl<'a> Parser<'a> {
                 }
                 seen_using = true;
                 self.pos = self.pos.saturating_add(1);
-                // `USING operation_id <値>` だけが予約構文。`operation_id` 変数（`USING operation_id,`）
-                // と区別するため、直後に値の語が続く形に限って範囲外とする。
-                if self.is_kw(0, "OPERATION_ID")
-                    && match self.kind(1) {
-                        Some(
-                            TokKind::Number | TokKind::Str | TokKind::Dollar | TokKind::Param(_),
-                        )
-                        | Some(TokKind::Quoted(_)) => true,
-                        Some(TokKind::Word(w)) => {
-                            !w.eq_ignore_ascii_case("INTO") && !w.eq_ignore_ascii_case("USING")
-                        }
-                        _ => false,
-                    }
-                {
+                if self.is_kw(0, "OPERATION_ID") {
                     return Err(oos_err(
                         "USING OPERATION_ID is not supported inside a PL/pgSQL body",
                     ));
                 }
-                // 要素ごとに終端を探す。各要素の先頭の語は終端語でも式の一部（`USING into`）。
-                loop {
-                    let a = self.pos;
-                    let e = self.find_end_ex(
-                        a,
-                        &|k| {
-                            matches!(k, TokKind::Punct(','))
-                                || matches!(k, TokKind::Word(w)
-                                    if w.eq_ignore_ascii_case("INTO")
-                                        || w.eq_ignore_ascii_case("USING"))
-                        },
-                        true,
-                    )?;
-                    using.push(self.build_expr(a, e, false)?);
-                    self.pos = e;
-                    if self.is_punct(0, ',') {
-                        self.pos = self.pos.saturating_add(1);
-                    } else {
-                        break;
-                    }
+                let a = self.pos;
+                let e = self.find_end(a, &|k| {
+                    matches!(k, TokKind::Word(w)
+                            if w.eq_ignore_ascii_case("INTO") || w.eq_ignore_ascii_case("USING"))
+                })?;
+                for (x, y) in self.split_commas(a, e) {
+                    using.push(self.build_expr(x, y, false)?);
                 }
+                self.pos = e;
             } else {
                 break;
             }

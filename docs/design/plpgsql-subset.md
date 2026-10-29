@@ -315,3 +315,21 @@ Issue #2227 で受理する。
   変数数は `sql::params::MAX_PARAMS`）。`ParseOptions::with_limits` はハード上限へ飽和し、`PlpgsqlLimits`・
   CLI は #2225 で入れる。入れ子の深さ超過は `54001`、それ以外は `54000`
 - エラー文言は固定の英語で、本体の断片・変数名を含めない
+
+### 未対応の変数名（Issue #2224 レビュー対応）
+
+- 変数・関数パラメータ・ループ変数の名前に、解析器と `embedded` が構造語・リテラル語として特別扱いする語を
+  使うと、宣言時に `0A000` で拒否する（引用付き `"..."` でも拒否。比較は大小無視。エラー文言に名前は含めない）。
+  対象の定数は `plpgsql::parser::UNSUPPORTED_NAMES` の 1 か所のみ
+- 理由: 埋め込み SQL は変数参照を識別子トークンの位置判定で解決する。`UPDATE t SET x = 1` の `SET`・
+  `IF true` の `true`・`EXECUTE INTO x` の `INTO` のような語を同名の変数と区別する位置ヒューリスティック
+  は、語ごとの例外が増え続け、正しい本体の誤拒否や引用付き名との衝突（`"true"` と未引用 `true` が同じキー）を
+  生む。曖昧な名前を宣言できなくすれば、これらは常にリテラル・構造語として読める（fail-closed）
+- 対象の語: リテラル・値関数（`true`・`false`・`null`・`default`・`array`・`current_*`・`localtime*`）、
+  文頭・文の語（`insert`・`update`・`delete`・`values`・`with`・`get`・`set`・`into`・`using`・`strict`・
+  `reverse`・`exception`・`operation_id`・`first`・`next`・`query` 等）、SQL の句・演算子語（`group`・`having`・
+  `returning`・`offset`・`union`・`join`・`on`・`left`・`fetch`・`rows`・`asc`・`desc`・`as`・`or`・`not` 等）。
+  完全な一覧は定数を参照する。PostgreSQL では多くが非予約語で宣言できるため、これは既知の差
+- ラベル名は対象外（識別子位置に現れず `lbl.name` の修飾子としてだけ使われるため曖昧さが無い）
+- `WITH` 文の種別は、CTE 定義（名前・列リスト・`AS`・`[NOT] MATERIALIZED`・本体）を構造的に読み飛ばした後の
+  主文で決める。CTE 名が `"update"` 等でも誤分類しない。形を読み解けない `WITH` は `42601` で拒否する
