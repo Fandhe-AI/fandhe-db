@@ -93,6 +93,7 @@ pub const fn http_status(class: ErrorClass) -> u16 {
         | ErrorClass::NumericOutOfRange
         // Issue #1163・SQL-26: 0 除算（`22012`）も入力値起因の拒否（`22000`／`22003` と同類）。
         | ErrorClass::DivisionByZero
+        | ErrorClass::SubstringError
         // Issue #1404・SQL-29・ERR-4: スカラーサブクエリの 2 行以上返却（`21000`）も入力起因の拒否。
         | ErrorClass::CardinalityViolation
         | ErrorClass::OperationIdContentMismatch
@@ -230,7 +231,7 @@ mod tests {
 
     /// 期待表を明示的に列挙し、`ErrorClass::ALL` との突き合わせで非 vacuous に検証する。
     /// `match` にアームを足したが期待表の更新を忘れた、という乖離を (a)(b) が検出する。
-    const EXPECTED: [(ErrorClass, u16); 89] = [
+    const EXPECTED: [(ErrorClass, u16); 90] = [
         (ErrorClass::InvalidInput, 400),
         (ErrorClass::StringDataRightTruncation, 400),
         (ErrorClass::AuthInvalid, 401),
@@ -249,6 +250,7 @@ mod tests {
         (ErrorClass::InternalError, 500),
         (ErrorClass::NumericOutOfRange, 400),
         (ErrorClass::DivisionByZero, 400),
+        (ErrorClass::SubstringError, 400),
         (ErrorClass::DuplicateObject, 400),
         (ErrorClass::InvalidTableDefinition, 400),
         (ErrorClass::PartialCompletion, 409),

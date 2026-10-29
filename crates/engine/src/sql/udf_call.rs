@@ -1990,7 +1990,7 @@ fn is_variadic_or_overloaded_builtin_name(name: &str) -> bool {
         // `date_part`／`date_trunc`（対象ビヘイビア: SQL-26。Issue #920）は
         // field／unit の解決結果を `BuiltinFn` のペイロードとして持つため、
         // 名前だけでは variant が一意に定まらない（`round` と同じ理由。§2-4）。
-        "substr" | "concat" | "round" | "date_part" | "date_trunc" | "timezone"
+        "substr" | "substring" | "concat" | "round" | "date_part" | "date_trunc" | "timezone"
     )
 }
 
@@ -2578,7 +2578,8 @@ fn validate_closed_expr(
                         "function concat expects at least 1 argument, got 0",
                     ));
                 }
-            } else if name.eq_ignore_ascii_case("substr") {
+            } else if name.eq_ignore_ascii_case("substr") || name.eq_ignore_ascii_case("substring")
+            {
                 if !matches!(args.len(), 2 | 3) {
                     return Err(SqlSurfaceError::undefined_function(format!(
                         "function {name} expects 2 or 3 arguments, got {}",
@@ -7084,7 +7085,7 @@ fn bind_call(
             detail: "set-returning functions are not supported".to_string(),
         });
     }
-    if lower_name == "substr" {
+    if lower_name == "substr" || lower_name == "substring" {
         return bind_substr(name, args, env, node_budget);
     }
     if name.eq_ignore_ascii_case("round") {
@@ -7857,6 +7858,13 @@ fn bind_substr(
     let mut bound_args = Vec::with_capacity(args.len());
     for (a, expected) in args.iter().zip(param_types.iter()) {
         let (b, ty) = bind_expr_in(a, env, node_budget)?;
+        // Issue #1903・SQL-65: `substring(s, 'pattern')` のように第 2 引数が文字列の形は
+        // 正規表現形（SQL-55 管轄）。型不一致（`42804`）へ落とさず `0A000` で拒否する。
+        if name.eq_ignore_ascii_case("substring") && bound_args.len() == 1 && ty == ExprType::Text {
+            return Err(SqlSurfaceError::FeatureNotSupported {
+                detail: "regular expression form of substring is not supported".to_string(),
+            });
+        }
         if ty != *expected {
             return Err(SqlSurfaceError::datatype_mismatch(format!(
                 "function {name} argument type mismatch"

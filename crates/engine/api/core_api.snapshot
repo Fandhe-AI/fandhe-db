@@ -336,5 +336,6 @@ pub enum ArenaError {
     AllocationFailed(String),
     InvalidInput(String),
     DivisionByZero(String),
+    SubstringError(String),
     NumericOutOfRange(String),
 }
