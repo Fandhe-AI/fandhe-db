@@ -160,7 +160,7 @@ fn is_comparison(op: BinOp) -> bool {
 /// 組み込み関数の引数位置が受け取る型。`None` は数値など推論対象外（`42P18`）。
 fn builtin_arg_is_text(name: &str, index: usize) -> bool {
     match name.to_ascii_lowercase().as_str() {
-        "lower" | "upper" | "length" | "trim" => index == 0,
+        "lower" | "upper" | "length" | "trim" | "md5" => index == 0,
         "substr" | "substring" => index == 0,
         "replace" | "position" | "concat" => true,
         // jsonb_extract_path(_text) のパス要素（2 番目以降）は text（Issue #1599）。
@@ -174,7 +174,7 @@ fn builtin_arg_is_text(name: &str, index: usize) -> bool {
 /// 組み込み関数の戻り値の型（`$n` の相手として使うときの近似）。
 fn builtin_return_type(name: &str) -> Ty {
     match name.to_ascii_lowercase().as_str() {
-        "lower" | "upper" | "trim" | "replace" | "concat" | "substr" | "substring" => {
+        "lower" | "upper" | "trim" | "replace" | "concat" | "substr" | "substring" | "md5" => {
             Ty::Known(PreparedParamType::Text)
         }
         "length" | "position" => Ty::Known(scalar("?column?", ColumnType::Integer)),
@@ -223,6 +223,7 @@ fn operator_kind(other: &Expr) -> Option<ParamContextKind> {
                 name.to_ascii_lowercase().as_str(),
                 "lower"
                     | "upper"
+                    | "md5"
                     | "trim"
                     | "replace"
                     | "concat"
