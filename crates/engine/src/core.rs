@@ -7134,6 +7134,30 @@ impl EngineCore {
         self.execute_parsed_in_session_inner(ctx, session, &parsed)
     }
 
+    /// 認証済みテナントの UDF カタログをセッションの UDF レジストリへロードする（SQL-66・Issue #1921）。
+    /// wire-server のハンドシェイクが認証成功後・ReadyForQuery の前に 1 回呼ぶ。DDL 権限の有無を
+    /// 問わず、呼び出しは誰でもできる。カタログ全体が読めなければ `Err`（`XX000`・固定文言）で、
+    /// 呼び出し側は接続を拒否する（fail-closed）。個別の定義が登録できない場合はその定義だけ skip する。
+    pub fn load_session_udfs(
+        &self,
+        ctx: &PolicyContext,
+        session: &mut crate::sql::mode::SessionState,
+    ) -> Result<(), crate::sql::allowlist::SqlSurfaceError> {
+        crate::sql::udf_load::load(&self.storage, ctx.tenant_id(), session.udfs_mut())
+    }
+
+    /// 他セッションの `CREATE`／`DROP FUNCTION` を反映する（SQL-66・Issue #1921）。wire-server が
+    /// Query／Parse の実行前に呼ぶ。UDF カタログの世代が変わっていなければ何もしない。失敗したら
+    /// カタログ由来の登録を全部消して次回再試行する（stale な定義で実行し続けない）。未ロードの
+    /// セッションと、ロード時と異なるテナントの ctx では何もロードしない。
+    pub fn refresh_session_udfs(
+        &self,
+        ctx: &PolicyContext,
+        session: &mut crate::sql::mode::SessionState,
+    ) {
+        crate::sql::udf_load::refresh(&self.storage, ctx.tenant_id(), session.udfs_mut());
+    }
+
     /// `execute_sql_in_session_unscrubbed` の公開入口。判定順序・エラー契約・実行結果は同関数と同一で、
     /// 出口でだけ SCHEMA 配下の relation の内部キー（`#<id>.<name>`）を利用者向けの
     /// `<schema>.<name>` へ戻す（TABLE-27・Issue #1717、ADR D2。内部 ID を文言へ出さない）。

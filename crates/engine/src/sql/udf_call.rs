@@ -2414,11 +2414,25 @@ pub struct UdfRegistry {
     /// [`define_wasm_function`]・[`define_function`] の双方が
     /// [`is_name_taken`] を通して行う）。
     wasm: std::collections::BTreeMap<String, Arc<dyn WasmUdfBackend>>,
+    /// SQL-66（Issue #1921）: UDF カタログからロードした宣言的 UDF の名前（小文字化済みのキー）。
+    /// セッション内で作った定義と区別するための出所（provenance）で、`DROP FUNCTION` の権限判定と
+    /// refresh 時の入れ替え（カタログ由来だけを消して入れ直す）に使う。
+    catalog_names: std::collections::BTreeSet<String>,
+    /// カタログ由来の登録を束縛したテナント（scope）。refresh で ctx のテナントが異なれば
+    /// 何もロードせずカタログ由来を全部消す（他テナントの定義を見せない。P0）。
+    catalog_scope: Option<Box<str>>,
+    /// ロード時に読んだ UDF カタログの世代（`Storage` のテナント単位の世代）。
+    catalog_generation: u64,
 }
 
 impl PartialEq for UdfRegistry {
     fn eq(&self, other: &Self) -> bool {
-        if self.defs != other.defs || self.wasm.len() != other.wasm.len() {
+        if self.defs != other.defs
+            || self.wasm.len() != other.wasm.len()
+            || self.catalog_names != other.catalog_names
+            || self.catalog_scope != other.catalog_scope
+            || self.catalog_generation != other.catalog_generation
+        {
             return false;
         }
         self.wasm.iter().all(|(name, backend)| {
@@ -2453,9 +2467,49 @@ impl UdfRegistry {
     /// （`DROP FUNCTION` から呼ばれる。同じ名前空間を共有するため両方の表から外す）。
     pub(crate) fn remove(&mut self, name: &str) -> bool {
         let lower = name.to_ascii_lowercase();
+        self.catalog_names.remove(&lower);
         let a = self.defs.remove(&lower).is_some();
         let b = self.wasm.remove(&lower).is_some();
         a || b
+    }
+
+    /// `name` の登録が UDF カタログ由来か（`sql::udf_ddl` が権限の無いセッションの `DROP FUNCTION` を
+    /// `42501` にするかの判定に使う）。
+    pub(crate) fn is_catalog_origin(&self, name: &str) -> bool {
+        self.catalog_names.contains(&name.to_ascii_lowercase())
+    }
+
+    /// 既に登録済みの `name` をカタログ由来として印付けする（`sql::udf_load`・
+    /// `sql::udf_ddl::execute_create_function_persistent` から。未登録の名前は無視する）。
+    pub(crate) fn mark_catalog_origin(&mut self, name: &str) {
+        let lower = name.to_ascii_lowercase();
+        if self.defs.contains_key(&lower) {
+            self.catalog_names.insert(lower);
+        }
+    }
+
+    /// カタログ由来の登録を全部消す（リロード・refresh 失敗時・テナント不一致時）。
+    /// セッション内由来・WASM UDF は残す。束縛した scope と世代は呼び出し側が管理する。
+    pub(crate) fn remove_catalog_entries(&mut self) {
+        for name in std::mem::take(&mut self.catalog_names) {
+            self.defs.remove(&name);
+        }
+    }
+
+    /// カタログ由来の登録を束縛した scope（未ロードなら `None`）。
+    pub(crate) fn catalog_scope(&self) -> Option<&str> {
+        self.catalog_scope.as_deref()
+    }
+
+    /// ロード時に読んだ UDF カタログの世代。
+    pub(crate) fn catalog_generation(&self) -> u64 {
+        self.catalog_generation
+    }
+
+    /// カタログ由来の登録を束縛する scope と世代を記録する。
+    pub(crate) fn set_catalog_binding(&mut self, scope: Option<&str>, generation: u64) {
+        self.catalog_scope = scope.map(Into::into);
+        self.catalog_generation = generation;
     }
 
     /// 名前空間（組み込み・宣言的 UDF・WASM UDF を横断した名前）が既に使われて
