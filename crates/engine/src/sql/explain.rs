@@ -919,13 +919,50 @@ pub(crate) fn build_relational_explain_result(
     access_path: AccessPath,
     names: &ExplainIndexNames,
 ) -> QueryResult {
+    build_relational_explain_result_with_windows(
+        scalar_plan,
+        scalar_fallback,
+        access_path,
+        names,
+        &[],
+    )
+}
+
+/// 窓の評価段 1 つ分の EXPLAIN 入力（Issue #1896・SQL-27・SQL-64 (6) ポインタ）。
+///
+/// `core::scan_explain_result` が束縛済みウィンドウ項目から作る。関数名は閉じた語彙
+/// （`WindowFunc::default_alias`）、キー数は構文段で上限検査済みの静的な値だけを持ち、
+/// 列名・リテラル・フレーム・行数などデータ依存の値は含めない（テナントの存在情報を
+/// 漏らさないため）。
+pub(crate) struct ExplainWindowStage {
+    pub(crate) func: &'static str,
+    pub(crate) partition_keys: usize,
+    pub(crate) order_keys: usize,
+}
+
+/// [`build_relational_explain_result`] に窓の評価段の行（`window[i]: <func>
+/// partition_keys=<n> order_keys=<m>`）を `access_path:` 行の後ろへ追記する版。
+/// `windows` が空なら既存関数と出力が同一（追記のみの安定契約）。
+pub(crate) fn build_relational_explain_result_with_windows(
+    scalar_plan: ScalarPlan,
+    scalar_fallback: Option<ScalarFallbackReason>,
+    access_path: AccessPath,
+    names: &ExplainIndexNames,
+    windows: &[ExplainWindowStage],
+) -> QueryResult {
     let mut scalar_line = format!("scalar_plan: {}", scalar_plan_token(scalar_plan));
     append_index_suffix(&mut scalar_line, names.scalar());
     append_reason_suffix(&mut scalar_line, scalar_fallback);
-    let lines = vec![
+    let mut lines = vec![
         scalar_line,
         format!("access_path: {}", access_path_token(access_path)),
     ];
+    lines.extend(windows.iter().enumerate().map(|(i, w)| {
+        format!(
+            "window[{i}]: {} partition_keys={} order_keys={}",
+            w.func, w.partition_keys, w.order_keys
+        )
+    }));
     lines_to_query_result(lines)
 }
 
@@ -1348,6 +1385,48 @@ mod tests {
         assert_eq!(
             cell_text(&result, 1),
             "access_path: scalar_index_candidates"
+        );
+    }
+
+    /// 窓が空なら既存 builder と出力が一致し、窓ありなら末尾へ追記される（Issue #1896）。
+    #[test]
+    fn window_stage_rows_are_appended_after_access_path() {
+        let names = ExplainIndexNames::default();
+        let base = build_relational_explain_result(
+            ScalarPlan::PlainScan,
+            None,
+            AccessPath::FullScan,
+            &names,
+        );
+        let with = build_relational_explain_result_with_windows(
+            ScalarPlan::PlainScan,
+            None,
+            AccessPath::FullScan,
+            &names,
+            &[
+                ExplainWindowStage {
+                    func: "row_number",
+                    partition_keys: 1,
+                    order_keys: 2,
+                },
+                ExplainWindowStage {
+                    func: "sum",
+                    partition_keys: 0,
+                    order_keys: 0,
+                },
+            ],
+        );
+        assert_eq!(base.rows.len(), 2);
+        assert_eq!(with.rows.len(), 4);
+        assert_eq!(cell_text(&with, 0), cell_text(&base, 0));
+        assert_eq!(cell_text(&with, 1), cell_text(&base, 1));
+        assert_eq!(
+            cell_text(&with, 2),
+            "window[0]: row_number partition_keys=1 order_keys=2"
+        );
+        assert_eq!(
+            cell_text(&with, 3),
+            "window[1]: sum partition_keys=0 order_keys=0"
         );
     }
 }
