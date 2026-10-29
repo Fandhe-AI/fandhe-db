@@ -10000,8 +10000,11 @@ fn bind_window_offset_args(
         .default
         .as_ref()
         .and_then(|d| lag_lead_declared_type(d, schema, udfs, node_budget));
-    let unsupported =
-        || SqlSurfaceError::feature_not_supported("this value type is not supported in LAG/LEAD");
+    let unsupported = || {
+        SqlSurfaceError::feature_not_supported(
+            "this value type is not supported in window value functions",
+        )
+    };
     let offset = match &args.offset {
         None => None,
         Some(Expr::Null) => Some(BoundExpr::Null),
@@ -10025,7 +10028,7 @@ fn bind_window_offset_args(
                 }
                 _ => {
                     return Err(SqlSurfaceError::datatype_mismatch(
-                        "LAG/LEAD offset must be of integer type",
+                        "window value function offset must be of integer type",
                     ))
                 }
             }
@@ -10038,7 +10041,7 @@ fn bind_window_offset_args(
                 }
                 _ => {
                     return Err(SqlSurfaceError::datatype_mismatch(
-                        "LAG/LEAD offset must be of integer type",
+                        "window value function offset must be of integer type",
                     ))
                 }
             }
@@ -10331,7 +10334,11 @@ fn bind_window_item(
                     });
                 }
                 // `LAG`／`LEAD` の引数は `offset_args` 経路で運び、`arg` は常に `None`。
-                WindowFunc::Lag | WindowFunc::Lead => {
+                WindowFunc::Lag
+                | WindowFunc::Lead
+                | WindowFunc::FirstValue
+                | WindowFunc::LastValue
+                | WindowFunc::NthValue => {
                     return Err(SqlSurfaceError::Internal {
                         detail: "offset window function unexpectedly carries an aggregate argument"
                             .to_string(),
@@ -10356,7 +10363,7 @@ fn bind_window_item(
     };
 
     let offset_args = match &item.offset_args {
-        Some(args) if item.func.is_value_offset() => {
+        Some(args) if item.func.takes_value_args() => {
             Some(bind_window_offset_args(args, schema, udfs, node_budget)?)
         }
         _ => None,
