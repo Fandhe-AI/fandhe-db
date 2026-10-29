@@ -224,6 +224,12 @@ impl FunctionType {
 
     /// タグ・param の文法を検証する（未知タグ・不正 param・ENUM は `Invalid`）。
     fn validate(&self) -> Result<()> {
+        // 復号側の上限（MAX_TYPE_FIELD_BYTES）と同じ長さを保存前に強制し、読み出せない定義を拒否する。
+        if self.tag.len() > MAX_TYPE_FIELD_BYTES || self.param.len() > MAX_TYPE_FIELD_BYTES {
+            return Err(CatalogError::Invalid(
+                "function type field too long".to_string(),
+            ));
+        }
         self.to_column_type().map(|_| ())
     }
 
@@ -1167,6 +1173,41 @@ mod tests {
                 .expect("col"),
             ColumnType::Text
         );
+    }
+
+    /// 型フィールドの長さ上限（128 受理・129 拒否）と、保存後の get/list/drop の往復。
+    #[test]
+    fn type_field_length_limit_is_enforced_before_store() {
+        let (s, _g) = tmp_storage("fn-typelen");
+        let vec_ty = |n: usize| FunctionType {
+            tag: "vector".to_string(),
+            param: format!("{}1", "0".repeat(n - 1)),
+        };
+        // 129 バイトは引数・戻り値どちらでも保存前に拒否する。
+        let long = Some(vec_ty(129));
+        let err = s
+            .create_function("t", &def("f_long", vec![param(None, long.clone())]))
+            .expect_err("param too long");
+        assert!(matches!(err, CatalogError::Invalid(_)));
+        let mut d = def("f_long_ret", vec![]);
+        d.return_type = long;
+        assert!(matches!(
+            s.create_function("t", &d),
+            Err(CatalogError::Invalid(_))
+        ));
+        // 128 バイトは受理され、get/list/drop が読み出せる。
+        let ok = Some(vec_ty(128));
+        let d = def("f_edge", vec![param(None, ok)]);
+        s.create_function("t", &d).expect("128 accepted");
+        let listed = s.list_functions("t").expect("list");
+        assert_eq!(listed.len(), 1);
+        let key = listed[0].params[0]
+            .ty
+            .as_ref()
+            .expect("ty")
+            .identity_token();
+        assert!(s.get_function("t", "f_edge", &key).expect("get").is_some());
+        assert!(s.drop_function("t", "f_edge", &key).expect("drop"));
     }
 
     /// SQL-66 (2): 多重定義の共存と重複の拒否（typmod 違いは同一シグネチャ）。
