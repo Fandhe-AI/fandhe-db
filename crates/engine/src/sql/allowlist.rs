@@ -11510,6 +11510,10 @@ impl<'a> Parser<'a> {
             || name.eq_ignore_ascii_case("lpad")
             || name.eq_ignore_ascii_case("rpad")
             || name.eq_ignore_ascii_case("split_part")
+            // `greatest`／`least`（Issue #1909・SQL-65）は NULL 引数を無視する新設の関数で、
+            // 裸の `NULL` をリテラルとして受理する（`COALESCE` の引数と同じ扱い）。
+            || name.eq_ignore_ascii_case("greatest")
+            || name.eq_ignore_ascii_case("least")
             || self.const_expr_null_args
             || is_json_fn_call
             || is_array_fn_call

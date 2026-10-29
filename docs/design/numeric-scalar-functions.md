@@ -129,3 +129,16 @@ datetime-scalar-functions.md`）で実装済み。`EXTRACT(field FROM src)` 構�
 判断（PR #1107 codex-review P1 是正で本 PR からは除外。上記「決定性（本 PR の
 対象範囲）」参照）も、日時スカラー関数群の実装時に spec の決定性要件と対にして
 判断すること。
+
+## `greatest`／`least`（Issue #1909・SQL-65 ポインタ）
+
+`greatest(v1, ..., vn)`／`least(v1, ..., vn)` は引数型を統一する可変長関数のため、固定 arity の
+`BuiltinFn` ではなく専用ノード `BoundExpr::MinMax` に束縛する（構文は `Expr::Call` のまま）。
+
+- **NULL**: 評価時に NULL 引数を無視し、全引数が NULL の行は NULL。リテラル `NULL` だけで型が決まらない呼び出しは
+  `CASE`／`COALESCE` と同じく `0A000`。
+- **型**: `COALESCE` と同じ統一規則。統一できなければ `42804`。比較できるのは数値・TEXT（既定照合のバイト順）・
+  DATE・TIMESTAMP・TIME・TIMESTAMPTZ。vector は `42883`、それ以外の型は `0A000`。
+- **評価**: 短絡せず全引数を評価し（評価エラーは伝播）、既存の比較（`eval_binary`）で畳み込む。同値は先に現れた値を残す。
+- **個数**: 1〜100 個（`builtin_call_arity`）。超過は `54023`、0 個は `42883`。
+- **位置**: SQL-26 の式位置（投影・`WHERE`・`ORDER BY`・CHECK・UDF 本体・INSERT VALUES の定数式）で使える。

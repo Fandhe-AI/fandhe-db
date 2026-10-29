@@ -210,6 +210,11 @@ fn builtin_return_type(name: &str) -> Ty {
     }
 }
 
+/// `greatest`／`least`（SQL-65・Issue #1909）か。`$n` の型を兄弟引数から推論する対象。
+fn is_min_max_name(name: &str) -> bool {
+    name.eq_ignore_ascii_case("greatest") || name.eq_ignore_ascii_case("least")
+}
+
 /// 演算子の相手 `other` の型が信頼できるときだけ変換可否判定の対象にする
 /// （Issue #2437）。列参照・数値リテラル・それらの算術・型を明示した組み込み関数に限り、
 /// 文字列リテラル（PG では unknown 型）や戻り型を近似で置く関数は対象外
@@ -272,6 +277,8 @@ impl Inferrer<'_> {
                 }
                 Ty::Unresolved
             }
+            // `greatest`／`least`（SQL-65・Issue #1909）は引数型を統一する兄弟扱い（`COALESCE` と同じ）。
+            Expr::Call { name, args } if is_min_max_name(name) => self.sibling_type(args.iter()),
             Expr::Call { name, .. } => builtin_return_type(name),
             Expr::Binary { op, lhs, rhs } => {
                 if is_comparison(*op) {
@@ -438,6 +445,10 @@ impl Inferrer<'_> {
                         self.walk(rhs)?;
                     }
                 }
+            }
+            Expr::Call { name, args } if is_min_max_name(name) => {
+                let refs: Vec<&Expr> = args.iter().collect();
+                self.walk_siblings(&refs)?;
             }
             Expr::Call { name, args } => {
                 for (i, arg) in args.iter().enumerate() {
