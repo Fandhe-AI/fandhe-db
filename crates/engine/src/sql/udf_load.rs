@@ -20,7 +20,8 @@
 use crate::catalog::function::{FunctionDef, FunctionLanguage, MAX_FUNCTIONS};
 use crate::sql::allowlist::{parse_stored_function_body, SqlSurfaceError};
 use crate::sql::udf_call::{
-    commit_function_definition, prepare_function_definition, MAX_SESSION_UDFS,
+    commit_function_definition, prepare_function_definition,
+    prepare_function_definition_ignoring_capacity, MAX_SESSION_UDFS,
 };
 use crate::sql::udf_call::{Expr, UdfRegistry};
 use crate::storage::Storage;
@@ -165,7 +166,12 @@ fn load_into(
     let blocked_by_local = pending.iter().any(|p| {
         let lower = p.key.to_ascii_lowercase();
         (registry.is_name_taken(&lower) && !registry.is_catalog_origin(&lower))
-            || (at_capacity && has_non_catalog_entries)
+            // 容量だけが阻害要因の定義（容量を無視すれば登録できる）に限る。欠落 callee・予約名など
+            // 恒久的にロード不能な定義は容量が空いても登録できないため再試行対象にしない。
+            || (at_capacity
+                && has_non_catalog_entries
+                && prepare_function_definition_ignoring_capacity(registry, &p.key, &p.params, &p.body)
+                    .is_ok())
     });
     let recorded = if blocked_by_local {
         STALE_GENERATION
@@ -334,6 +340,28 @@ mod tests {
         assert!(reg.remove("loc0"));
         refresh(&s, "t", &mut reg);
         assert!(reg.is_catalog_origin("f"));
+    }
+
+    /// 容量満杯でも、恒久的にロード不能な定義（呼び出し先の消失）だけなら世代は完了扱いで記録する。
+    #[test]
+    fn permanent_skip_at_capacity_does_not_mark_stale() {
+        let (s, _g) = tmp_storage("udf-load-cap-perm");
+        let mut reg = UdfRegistry::default();
+        let body = {
+            let toks = crate::sql::lexer::tokenize_rendered("x").expect("tok");
+            parse_stored_function_body(&toks).expect("body")
+        };
+        for i in 0..MAX_SESSION_UDFS {
+            let name = format!("loc{i}");
+            let prepared =
+                prepare_function_definition(&reg, &name, &["x".to_string()], &body).expect("prep");
+            commit_function_definition(&mut reg, prepared);
+        }
+        s.create_function("t", &decl("orphan", &["x"], "gone ( x )"))
+            .expect("orphan");
+        load(&s, "t", &mut reg).expect("load");
+        assert!(reg.get("orphan").is_none());
+        assert_eq!(reg.catalog_generation(), s.function_generation("t"));
     }
 
     /// 世代が進んだら refresh が再ロードし、カタログに無くなった定義は消える。

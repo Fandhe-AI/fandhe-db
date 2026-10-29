@@ -2568,6 +2568,27 @@ pub(crate) fn prepare_function_definition(
     params: &[String],
     body: &Expr,
 ) -> Result<PreparedUdf, SqlSurfaceError> {
+    prepare_function_definition_inner(registry, name, params, body, true)
+}
+
+/// レジストリ容量の上限だけを無視して登録可否を検査する（UDF カタログロードが「容量による一時的な
+/// ブロック」と「恒久的にロード不能（呼び出し先の消失・予約名など）」を区別するために使う）。
+pub(crate) fn prepare_function_definition_ignoring_capacity(
+    registry: &UdfRegistry,
+    name: &str,
+    params: &[String],
+    body: &Expr,
+) -> Result<PreparedUdf, SqlSurfaceError> {
+    prepare_function_definition_inner(registry, name, params, body, false)
+}
+
+fn prepare_function_definition_inner(
+    registry: &UdfRegistry,
+    name: &str,
+    params: &[String],
+    body: &Expr,
+    check_capacity: bool,
+) -> Result<PreparedUdf, SqlSurfaceError> {
     // 関数名は relation キー（裸の名前、または SCHEMA 配下の内部キー `#<id>.<name>`。
     // 名前解決器が `CREATE FUNCTION s.f(` を解決した出力。TABLE-27・Issue #1717）を受理する。
     catalog::validate_relation_key(name)
@@ -2583,7 +2604,7 @@ pub(crate) fn prepare_function_definition(
             "function {name} is already defined in this session"
         )));
     }
-    if registry.len() >= MAX_SESSION_UDFS {
+    if check_capacity && registry.len() >= MAX_SESSION_UDFS {
         return Err(SqlSurfaceError::payload_too_large(
             "too many functions defined in this session",
         ));
