@@ -301,6 +301,7 @@ impl EngineCore {
         core.jsonpath_limits = template.jsonpath_limits;
         core.regex_limits = template.regex_limits;
         core.nesting_limits = template.nesting_limits;
+        core.window_limits = template.window_limits;
         core.join_limits = template.join_limits;
         core.result_limits = template.result_limits;
         core.partitioned_dml_limits = template.partitioned_dml_limits;

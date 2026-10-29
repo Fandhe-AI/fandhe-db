@@ -177,6 +177,14 @@
 //! `EngineCore::with_nesting_limits` へ 1 回だけ注入する
 //! （`docs/design/nesting-limits-cli.md`）。
 //!
+//! `--max-window-keys`（Issue #1900。SQL-46・SQL-64）: 窓の `PARTITION BY`／`ORDER BY` の
+//! キー数上限（`1`〜`8`）を、プロセス全体に対して起動時に**下げる方向だけ**設定できる opt-in
+//! 注入点（未指定は現行のハード上限 8 と同値＝挙動不変）。設定値は構文解析段に効き、超過は
+//! 従来どおり `54000`（格納済みビュー本文の再パースはハード上限のまま）。範囲外・非数値・
+//! 値欠落・重複指定はいずれも fail-closed で起動エラー。値の解決は
+//! `wire_server::window_limits_opt::resolve` に一本化し、`EngineCore::with_window_limits` へ
+//! 1 回だけ注入する（`docs/design/window-limits-cli.md`）。
+//!
 //! `--max-join-relations`／`--max-join-input-rows`／`--max-join-output-rows`（Issue #1551。
 //! SQL-46）: JOIN のリレーション数（`2`〜`8`）・1 辺の可視入力行数（`1`〜`100000`）・
 //! 結合の出力行数（`1`〜`100000`）の上限を、プロセス全体に対して起動時に**下げる方向だけ**
@@ -474,6 +482,7 @@ fn run_server(args: &[String]) -> ExitCode {
     let mut max_subquery_executions_raw: Option<String> = None;
     let mut max_cte_definitions_raw: Option<String> = None;
     let mut max_cte_nesting_depth_raw: Option<String> = None;
+    let mut max_window_keys_raw: Option<String> = None;
     let mut max_join_relations_raw: Option<String> = None;
     let mut max_join_input_rows_raw: Option<String> = None;
     let mut max_join_output_rows_raw: Option<String> = None;
@@ -1128,6 +1137,26 @@ fn run_server(args: &[String]) -> ExitCode {
                     return ExitCode::FAILURE;
                 }
                 max_cte_nesting_depth_raw = Some(v.clone());
+                i += 2;
+            }
+            wire_server::window_limits_opt::MAX_WINDOW_KEYS_FLAG => {
+                let Some(v) = args.get(i + 1) else {
+                    engine::log_stderr!(
+                        "wire-server: {} requires a non-negative integer argument",
+                        wire_server::window_limits_opt::MAX_WINDOW_KEYS_FLAG
+                    );
+                    return ExitCode::FAILURE;
+                };
+                // Issue #1900: 他の起動時構成フラグと同じく 2 回目以降の指定を
+                // fail-closed に拒否する（last-wins にしない）。
+                if max_window_keys_raw.is_some() {
+                    engine::log_stderr!(
+                        "wire-server: {} specified more than once",
+                        wire_server::window_limits_opt::MAX_WINDOW_KEYS_FLAG
+                    );
+                    return ExitCode::FAILURE;
+                }
+                max_window_keys_raw = Some(v.clone());
                 i += 2;
             }
             wire_server::write_lock_wait_opt::FLAG => {
@@ -1922,6 +1951,20 @@ fn run_server(args: &[String]) -> ExitCode {
         }
     };
 
+    // Issue #1900: 窓キー数上限を bind・ユーザーストア読込より前に解決する（fail-closed）。
+    // 未指定は `WindowLimits::default()`＝ハード上限＝現行挙動。
+    let window_limits = match wire_server::window_limits_opt::resolve(
+        wire_server::window_limits_opt::WindowLimitsRawFlags {
+            max_window_keys: max_window_keys_raw.as_deref(),
+        },
+    ) {
+        Ok(limits) => limits,
+        Err(e) => {
+            engine::log_stderr!("wire-server: invalid window limit configuration: {e}");
+            return ExitCode::FAILURE;
+        }
+    };
+
     // Issue #1551: JOIN のリレーション数・入出力行数上限を bind・ユーザーストア読込より前に
     // 解決する（fail-closed）。未指定は `JoinSizeLimits::default()`＝ハード上限＝現行挙動。
     let join_limits = match wire_server::join_limits_opt::resolve(
@@ -2439,6 +2482,8 @@ fn run_server(args: &[String]) -> ExitCode {
     // Issue #1552: 未指定でも常に呼ぶ（`nesting_limits` は既定まで解決済み。既定は
     // ハード上限と同値で、未注入と挙動が同一）。
     core = core.with_nesting_limits(nesting_limits);
+    // Issue #1900: 未指定でも常に呼ぶ（既定はハード上限と同値で、未注入と挙動が同一）。
+    core = core.with_window_limits(window_limits);
     // Issue #1551: 未指定でも常に呼ぶ（既定はハード上限と同値で、未注入と挙動が同一）。
     core = core.with_join_limits(join_limits);
     // Issue #1847: 未指定でも常に呼ぶ（既定はハード上限と同値で、未注入と挙動が同一）。

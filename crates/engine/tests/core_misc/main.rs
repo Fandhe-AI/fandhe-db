@@ -114,4 +114,5 @@ mod truncate_table;
 mod update_row_without_vector_column;
 mod uuid_column;
 mod vector_core;
+mod window_limits;
 mod wire16_implicit_txn;
