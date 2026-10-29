@@ -25071,16 +25071,12 @@ fn validate_sql_tokens_impl(
             let target = match validate_select_statement(rest, lookup, None, limits)? {
                 Statement::Select(v) => ExplainTarget::Search(v),
                 Statement::Aggregate(v) => ExplainTarget::Aggregate(v),
-                // SQL-30・TASK-214（Issue #930）: `EXPLAIN` はウィンドウ関数に
-                // 未対応（§計画 2「対象外」）。`validate_select_statement` は
-                // 非 EXPLAIN 経路と共有のため window_items を持つ `ValidatedScan`
-                // も返しうるが、`sql::explain` 側に対応する記述がなくレビュー
-                // 未了のため、ここで明示的に `42601` へ倒す。
-                Statement::Scan(v)
-                    if !v.window_items.is_empty() || v.has_value_subqueries() =>
-                {
+                // Issue #1896・SQL-64 (6): ウィンドウ関数付きの `Scan` は `EXPLAIN` の
+                // 対象にする（窓の評価段は `sql::explain` が静的な行として追記する）。
+                // 値の部分クエリを含む文は従来どおり fail-closed で `42601`。
+                Statement::Scan(v) if v.has_value_subqueries() => {
                     return Err(SqlSurfaceError::unsupported(
-                        "EXPLAIN is not supported for window function queries",
+                        "EXPLAIN is not supported for queries with value subqueries",
                     ));
                 }
                 Statement::Scan(v) => ExplainTarget::Scan(v),
