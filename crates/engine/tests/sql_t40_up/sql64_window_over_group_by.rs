@@ -415,6 +415,33 @@ fn limit_precheck_ignores_keywords_and_type_names() {
     }
 }
 
+/// 疑似列 `id` を持たない採番方式の表では、LIMIT 付き暗黙グループの先行検査でも `id` は
+/// 未定義列（42703）。実列扱いの例外で 42803 に倒さない。
+#[test]
+fn limit_precheck_treats_id_as_undefined_on_allocated_table() {
+    let path = unique_db_path("sql64-gw-noid");
+    let _g = CleanupGuard(path.clone());
+    let storage = Storage::open(&path).expect("open storage");
+    let core = EngineCore::from_storage(storage, Box::new(CpuScalarProvider));
+    let mut s = SessionState::default();
+    s.allow_ddl();
+    core.execute_sql_in_session(
+        &ctx("tenant-a"),
+        &mut s,
+        "CREATE TABLE na (code TEXT PRIMARY KEY, k INTEGER)",
+    )
+    .expect("create");
+    let code = core
+        .execute_sql_in_session(
+            &ctx("tenant-a"),
+            &mut s,
+            "SELECT id, rank() OVER (ORDER BY sum(k)) FROM na LIMIT 1",
+        )
+        .err()
+        .map(|e| e.wire_code());
+    assert_eq!(code, Some("42703"));
+}
+
 /// 未対応の形は fail-closed（コード固定）。
 #[test]
 fn unsupported_shapes_fail_closed() {

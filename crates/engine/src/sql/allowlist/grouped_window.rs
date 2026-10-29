@@ -509,10 +509,7 @@ pub(super) fn try_build(
             }
             for n in column_ref_candidates(item) {
                 match &known_cols {
-                    Some(ks)
-                        if !n.eq_ignore_ascii_case("id")
-                            && !ks.iter().any(|c| c.eq_ignore_ascii_case(n)) =>
-                    {
+                    Some(ks) if !ks.iter().any(|c| c.eq_ignore_ascii_case(n)) => {
                         return Err(SqlSurfaceError::UndefinedColumn {
                             name: n.to_string(),
                         });
