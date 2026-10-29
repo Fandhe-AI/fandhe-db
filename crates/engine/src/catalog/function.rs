@@ -791,6 +791,8 @@ impl Storage {
         insert_function_in_txn(&write_txn, scope, &stored, &signature)?;
         crate::recovery::commit_boundary::commit(write_txn)
             .map_err(super::convert_storage_error)?;
+        // commit 成功後にだけ世代を進める（他セッションの refresh が検知する。SQL-66・#1921）。
+        self.bump_function_generation(scope);
         Ok(stored.id)
     }
 
@@ -810,7 +812,6 @@ impl Storage {
     }
 
     /// `scope` の全定義を `(関数名, シグネチャ)` の昇順で返す（読み取り専用。#1921 のロード用）。
-    #[allow(dead_code)] // #1921（セッション開始時のロード）が結線するまではテストからのみ呼ばれる。
     pub(crate) fn list_functions(&self, scope: &str) -> Result<Vec<FunctionDef>> {
         validate_scope(scope)?;
         let rt = self.db().begin_read()?;
@@ -848,6 +849,8 @@ impl Storage {
         }
         crate::recovery::commit_boundary::commit(write_txn)
             .map_err(super::convert_storage_error)?;
+        // commit 成功後にだけ世代を進める（他セッションの refresh が検知する。SQL-66・#1921）。
+        self.bump_function_generation(scope);
         Ok(true)
     }
 
@@ -877,6 +880,8 @@ impl Storage {
         }
         crate::recovery::commit_boundary::commit(write_txn)
             .map_err(super::convert_storage_error)?;
+        // commit 成功後にだけ世代を進める（他セッションの refresh が検知する。SQL-66・#1921）。
+        self.bump_function_generation(scope);
         Ok(true)
     }
 
@@ -908,6 +913,8 @@ impl Storage {
         }
         crate::recovery::commit_boundary::commit(write_txn)
             .map_err(super::convert_storage_error)?;
+        // commit 成功後にだけ世代を進める（他セッションの refresh が検知する。SQL-66・#1921）。
+        self.bump_function_generation(scope);
         Ok(Some(sig))
     }
 }

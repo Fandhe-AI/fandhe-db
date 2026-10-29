@@ -646,6 +646,9 @@ impl Storage {
             for id in &dropped_sequence_ids {
                 allocator.evict(*id);
             }
+            // CASCADE が配下の関数行も消すため、commit 成功後に UDF カタログの世代を進める
+            // （他セッションの refresh が検知する。SQL-66・#1921）。
+            self.bump_function_generation(tenant_id);
             crate::recovery::commit_boundary::PostCommitResult::Ok
         })
         .map_err(super::convert_storage_error)?;

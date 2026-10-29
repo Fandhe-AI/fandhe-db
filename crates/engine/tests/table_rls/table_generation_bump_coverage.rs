@@ -80,8 +80,8 @@ const ALLOWLIST: &[(&str, u32)] = &[
     // ための追随（旧: 930／961）。
     // Issue #1690（`Storage::sequence_allocator` の追加）で行番号が移動したための追随（旧: 950／981）。
     // PR #2566 レビュー対応（一時 DB 判定 `Storage::is_temp_scoped` の追加。+12 行）で追随（旧: 963／994）。
-    ("storage.rs", 983),
-    ("storage.rs", 1017),
+    ("storage.rs", 1009),
+    ("storage.rs", 1043),
     ("recovery/panic_hook.rs", 404),
     ("txn.rs", 210),
     ("txn.rs", 387),
@@ -521,10 +521,10 @@ const ALLOWLIST: &[(&str, u32)] = &[
     ("catalog/namespace.rs", 517),
     ("catalog/namespace.rs", 555),
     ("catalog/namespace.rs", 645),
-    ("catalog/namespace.rs", 686),
+    ("catalog/namespace.rs", 689),
     // Issue #1716: `rename_schema` も `schemas` の 1 行付け替えだけで、行ストア・世代を変えない。
-    ("catalog/namespace.rs", 942),
-    ("catalog/namespace.rs", 1058),
+    ("catalog/namespace.rs", 945),
+    ("catalog/namespace.rs", 1061),
     // Issue #1645（所有 SEQUENCE の定義 blob 版 3・`commit_and_finish` 経路の追加）と base 取り込みで行が移動したため
     // 全件を現行行へ追随（commit 対象は SEQUENCE 定義・状態表のみで同じ理由により対象外）。
     // Issue #1694（SERIAL の暗黙 SEQUENCE・所有 SEQUENCE の削除と追従）の追加で行番号が移動したための追随
@@ -552,12 +552,15 @@ const ALLOWLIST: &[(&str, u32)] = &[
     // のいずれにも触れない（行を持たない定義メタデータのため、世代照合の対象テーブルが
     // 存在せずバンプ対象がない）。
     ("catalog/function.rs", 792),
-    ("catalog/function.rs", 849),
-    ("catalog/function.rs", 878),
-    ("catalog/function.rs", 909),
+    ("catalog/function.rs", 850),
+    ("catalog/function.rs", 881),
+    ("catalog/function.rs", 914),
+    // Issue #1921: commit 後の世代（UDF カタログ）追加による行移動の追随。`sql/udf_load.rs` の 1 件は
+    // `#[cfg(test)]` 内で壊れた定義 blob を直接書くテスト補助（関数カタログ表だけを書き、世代の対象外）。
+    ("sql/udf_load.rs", 230),
     // Issue #1920: 上の `#[cfg(test)]` 内のテスト補助（多重定義・SCHEMA 接頭辞削除の状態を直接作る）。
-    ("catalog/function.rs", 1354),
-    ("catalog/function.rs", 1476),
+    ("catalog/function.rs", 1361),
+    ("catalog/function.rs", 1483),
     // Issue #1689（ALTER SEQUENCE）: `alter_sequence`／`rename_sequence`（803・842）も同じ表だけを書く
     // （定義 blob の上書き・キーの付け替え・状態行の削除）ため同じ理由で対象外。
     // Issue #1733（INSERT ... SELECT）: `core/insert_select_exec.rs` の 995・1127 行（Issue #2613・#2614・#2615・#2212 で追随）は `#[cfg(test)]` 内の

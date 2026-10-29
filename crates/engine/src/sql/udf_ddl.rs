@@ -63,7 +63,11 @@ pub(crate) fn execute_create_function_persistent(
     storage
         .create_function(tenant_id, &def)
         .map_err(map_function_error)?;
+    let key = prepared.key.clone();
     commit_function_definition(session.udfs_mut(), prepared);
+    // カタログに永続化した定義はカタログ由来として印付けする（他セッションの DROP を refresh が
+    // 反映するときの入れ替え対象・権限の無いセッションの DROP の判定に使う。#1921）。
+    session.udfs_mut().mark_catalog_origin(&key);
     Ok(())
 }
 
@@ -94,6 +98,11 @@ pub(crate) fn execute_drop_function(
             || udfs.get_wasm(&stmt.name).is_some_and(|_| arity_ok(2))
     };
     if session_match {
+        // カタログ由来の定義は権限の無いセッションからは消せない（SQL-66・Issue #1921）。呼べる関数に
+        // 対して 42883 を返すと事実と食い違うため 42501 にする。セッション内だけの登録は従来どおり消せる。
+        if !session.ddl_allowed() && session.udfs().is_catalog_origin(&stmt.name) {
+            return Err(SqlSurfaceError::InsufficientPrivilege);
+        }
         removed |= session.udfs_mut().remove(&stmt.name);
     }
     if removed {

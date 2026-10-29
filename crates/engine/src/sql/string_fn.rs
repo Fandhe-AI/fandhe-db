@@ -21,6 +21,12 @@
 //!   PostgreSQL とは `ß` → `SS` のように結果が変わる文字がありうる。
 //! - `trim` は半角空白 `' '` のみを除去する（PostgreSQL の `trim(both ' ' from s)`
 //!   既定と同じで、タブ・改行・全角空白は対象外）。
+//! - `initcap` は `char::is_alphanumeric` と Unicode 既定の大小文字変換（ロケール
+//!   非依存）を使う。PostgreSQL は lc_ctype 依存で、非 ASCII の変換（C ロケールで
+//!   は無変換、`ß`・titlecase 文字の扱い）が異なりうる。ASCII 入力では一致する。
+//! - `left`/`right` の `n` は `substr` と同じく `f64` Scalar で受け、`i64` 範囲内の
+//!   整数を受理する（PostgreSQL の int4 範囲外・非整数は関数解決エラー `42883`
+//!   だが、本実装では非整数は `22000`）。
 //! - `lpad`/`rpad`/`split_part` の長さ・位置引数は `substr` と同じく `f64` で受けて
 //!   整数性を検査する。非整数は `22000`（PostgreSQL は関数解決の `42883`）で、
 //!   int4 範囲外でも i64 範囲内なら受理する。
@@ -247,6 +253,60 @@ pub(crate) fn position(haystack: &str, needle: &str) -> f64 {
     }
 }
 
+/// `LEFT(s, n)`／`RIGHT(s, n)` が先頭から（または末尾から）取り出す文字数 `k` を
+/// 求める。`n >= 0` は `min(n, total)`、`n < 0` は `total - |n|`（0 で下限）。
+/// `i64::MIN` の符号反転でオーバーフローしないよう `unsigned_abs` で扱う。
+fn left_right_take(total: usize, n: i64) -> usize {
+    if n >= 0 {
+        usize::try_from(n).map_or(total, |n| n.min(total))
+    } else {
+        usize::try_from(n.unsigned_abs()).map_or(0, |m| total.saturating_sub(m))
+    }
+}
+
+/// `LEFT(s, n)`: `n >= 0` なら先頭 `n` 文字、`n < 0` なら末尾 `|n|` 文字を除いた残り
+/// （Issue #1902・SQL-65 ポインタ: `docs/spec/04-behavior/sql-surface.md` SQL-65）。
+/// `udf_call::apply_builtin` から非 NULL 引数でのみ呼ばれる。
+pub(crate) fn left(s: &str, n: f64) -> Result<String, SqlSurfaceError> {
+    let n = arg_as_i64(n, "left length")?;
+    let k = left_right_take(s.chars().count(), n);
+    let end = s.char_indices().nth(k).map_or(s.len(), |(i, _)| i);
+    Ok(s.get(..end).unwrap_or_default().to_string())
+}
+
+/// `RIGHT(s, n)`: `n >= 0` なら末尾 `n` 文字、`n < 0` なら先頭 `|n|` 文字を除いた残り
+/// （Issue #1902・SQL-65）。境界の扱いは [`left`] と対称。
+pub(crate) fn right(s: &str, n: f64) -> Result<String, SqlSurfaceError> {
+    let n = arg_as_i64(n, "right length")?;
+    let total = s.chars().count();
+    let k = left_right_take(total, n);
+    let skip = total.saturating_sub(k);
+    let start = s.char_indices().nth(skip).map_or(s.len(), |(i, _)| i);
+    Ok(s.get(start..).unwrap_or_default().to_string())
+}
+
+/// `REVERSE(s)`: コードポイント単位で逆順にする（Issue #1902・SQL-65）。
+pub(crate) fn reverse(s: &str) -> Result<String, SqlSurfaceError> {
+    check_result_len(s.chars().rev().collect())
+}
+
+/// `INITCAP(s)`: 英数字の連続を 1 語とみなし、語頭を大文字・残りを小文字にする
+/// （Issue #1902・SQL-65）。語境界は変換前の文字の `is_alphanumeric` で判定する。
+/// 変換で伸びうる（`ß` → `SS` 等）ため結果長を検査する（`54000`）。
+pub(crate) fn initcap(s: &str) -> Result<String, SqlSurfaceError> {
+    let mut out = String::with_capacity(s.len());
+    let mut in_word = false;
+    for c in s.chars() {
+        if in_word {
+            out.extend(c.to_lowercase());
+        } else {
+            out.extend(c.to_uppercase());
+        }
+        in_word = c.is_alphanumeric();
+    }
+    check_result_len(out)
+}
+
 /// `lpad`／`rpad` の共通実装（Issue #1904・SQL-65 ポインタ）。`s` を先頭 `len` 文字へ
 /// 切り詰めてから、`fill` を先頭から循環させて不足分を左（`left`）または右へ埋める。
 /// `len` は untrusted のため、確保前に結果バイト長を checked 演算で見積もり
@@ -362,6 +422,60 @@ pub(crate) fn md5(s: &str) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn left_right_follow_postgres_semantics() {
+        for (n, l, r) in [
+            (2.0, "ab", "de"),
+            (-2.0, "abc", "cde"),
+            (0.0, "", ""),
+            (10.0, "abcde", "abcde"),
+            (-10.0, "", ""),
+            (-9223372036854775808.0, "", ""),
+        ] {
+            assert_eq!(left("abcde", n).unwrap(), l);
+            assert_eq!(right("abcde", n).unwrap(), r);
+        }
+        assert_eq!(left("日本語テキスト", 3.0).unwrap(), "日本語");
+        assert_eq!(right("日本語テキスト", -3.0).unwrap(), "テキスト");
+        assert_eq!(right("日本語テキスト", 2.0).unwrap(), "スト");
+        assert_eq!(left("", 3.0).unwrap(), "");
+    }
+
+    #[test]
+    fn left_right_reject_bad_length() {
+        for n in [1.5, f64::NAN, f64::INFINITY, 9223372036854775808.0] {
+            assert!(left("abc", n).is_err());
+            assert!(right("abc", n).is_err());
+        }
+    }
+
+    #[test]
+    fn reverse_is_codepoint_based() {
+        assert_eq!(reverse("abc日本").unwrap(), "本日cba");
+        assert_eq!(reverse("").unwrap(), "");
+    }
+
+    #[test]
+    fn initcap_matches_postgres_word_rules() {
+        for (i, o) in [
+            ("hello world", "Hello World"),
+            ("HELLO-WORLD", "Hello-World"),
+            ("o'neil 2nd ALPHA", "O'Neil 2nd Alpha"),
+            ("abc123def", "Abc123def"),
+            ("a_b", "A_B"),
+            ("éa ça", "Éa Ça"),
+            ("", ""),
+        ] {
+            assert_eq!(initcap(i).unwrap(), o);
+        }
+    }
+
+    #[test]
+    fn initcap_rejects_oversized_result() {
+        let big = "ß".repeat(MAX_RESULT_LEN / 2 + 1);
+        assert!(initcap(&big).is_err());
+    }
 
     #[test]
     fn md5_is_lower_hex_of_utf8_bytes() {

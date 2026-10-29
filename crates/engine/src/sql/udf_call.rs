@@ -1699,6 +1699,14 @@ pub enum BuiltinFn {
     /// haystack)` 構文。`sql::allowlist::Parser` が引数順を並べ替えてこの順で
     /// `Expr::Call` を組み立てる）。
     Position,
+    /// `left(s: Text, n: Scalar) -> Text`（Issue #1902・SQL-65）。
+    Left,
+    /// `right(s: Text, n: Scalar) -> Text`（Issue #1902・SQL-65）。
+    Right,
+    /// `reverse(s: Text) -> Text`（Issue #1902・SQL-65）。
+    Reverse,
+    /// `initcap(s: Text) -> Text`（Issue #1902・SQL-65）。
+    Initcap,
     /// `abs(x: Scalar) -> Scalar`。
     Abs,
     /// `round(x: Scalar) -> Scalar`（1 引数形。`round` は arity で `Round1`／
@@ -2006,6 +2014,10 @@ fn builtin_from_name(name: &str) -> Option<BuiltinFn> {
         "trim" => Some(BuiltinFn::Trim),
         "replace" => Some(BuiltinFn::Replace),
         "position" => Some(BuiltinFn::Position),
+        "left" => Some(BuiltinFn::Left),
+        "right" => Some(BuiltinFn::Right),
+        "reverse" => Some(BuiltinFn::Reverse),
+        "initcap" => Some(BuiltinFn::Initcap),
         // Issue #1904・SQL-65: 引数 3 個固定。`lpad`／`rpad` は 2／3 引数の
         // オーバーロードのためここには含めない（`bind_pad` が個数で解決する）。
         "split_part" => Some(BuiltinFn::SplitPart),
@@ -2097,6 +2109,8 @@ pub(crate) fn builtin_signature(f: BuiltinFn) -> (&'static [ExprType], ExprType)
             ExprType::Text,
         ),
         BuiltinFn::Position => (&[ExprType::Text, ExprType::Text], ExprType::Scalar),
+        BuiltinFn::Left | BuiltinFn::Right => (&[ExprType::Text, ExprType::Scalar], ExprType::Text),
+        BuiltinFn::Reverse | BuiltinFn::Initcap => (&[ExprType::Text], ExprType::Text),
         BuiltinFn::Abs => (&[ExprType::Scalar], ExprType::Scalar),
         BuiltinFn::Round1 => (&[ExprType::Scalar], ExprType::Scalar),
         BuiltinFn::Round2 => (&[ExprType::Scalar, ExprType::Scalar], ExprType::Scalar),
@@ -2241,7 +2255,11 @@ pub(crate) fn is_foldable_builtin(f: BuiltinFn) -> bool {
         | BuiltinFn::Concat2
         | BuiltinFn::Trim
         | BuiltinFn::Replace
-        | BuiltinFn::Position => false,
+        | BuiltinFn::Position
+        | BuiltinFn::Left
+        | BuiltinFn::Right
+        | BuiltinFn::Reverse
+        | BuiltinFn::Initcap => false,
         // 対象ビヘイビア: SQL-26（Issue #920）。`sql::expr_program::FoldedConst`
         // は `Scalar`／`Bool` のみを表現できる型（文字列組み込みと同じ制約。
         // 上記コメント参照）で `DATE`／`TIMESTAMP` 値を持てないため、
@@ -2395,6 +2413,12 @@ fn is_reserved_function_name(name: &str) -> bool {
 #[derive(Debug, Clone, PartialEq)]
 pub struct UdfDefinition {
     pub params: Vec<String>,
+    /// パラメータごとの型注釈（SQL-66 (1)・TASK-309・Issue #1915）。`params` と同じ長さで、
+    /// `None` は型なし宣言（SQL-9 の従来形。呼び出し時に型検査・変換をしない）。型修飾子は
+    /// 関数シグネチャでは意味を持たないため構文段で正規化済み（`varchar(n)` → `varchar` 等）。
+    ///
+    /// **Issue #1915 で追加した破壊的変更（BREAKING CHANGE）**: pub フィールド追加。
+    pub param_types: Vec<Option<crate::sql::cast::CastType>>,
     pub body: Expr,
 }
 
@@ -2414,11 +2438,25 @@ pub struct UdfRegistry {
     /// [`define_wasm_function`]・[`define_function`] の双方が
     /// [`is_name_taken`] を通して行う）。
     wasm: std::collections::BTreeMap<String, Arc<dyn WasmUdfBackend>>,
+    /// SQL-66（Issue #1921）: UDF カタログからロードした宣言的 UDF の名前（小文字化済みのキー）。
+    /// セッション内で作った定義と区別するための出所（provenance）で、`DROP FUNCTION` の権限判定と
+    /// refresh 時の入れ替え（カタログ由来だけを消して入れ直す）に使う。
+    catalog_names: std::collections::BTreeSet<String>,
+    /// カタログ由来の登録を束縛したテナント（scope）。refresh で ctx のテナントが異なれば
+    /// 何もロードせずカタログ由来を全部消す（他テナントの定義を見せない。P0）。
+    catalog_scope: Option<Box<str>>,
+    /// ロード時に読んだ UDF カタログの世代（`Storage` のテナント単位の世代）。
+    catalog_generation: u64,
 }
 
 impl PartialEq for UdfRegistry {
     fn eq(&self, other: &Self) -> bool {
-        if self.defs != other.defs || self.wasm.len() != other.wasm.len() {
+        if self.defs != other.defs
+            || self.wasm.len() != other.wasm.len()
+            || self.catalog_names != other.catalog_names
+            || self.catalog_scope != other.catalog_scope
+            || self.catalog_generation != other.catalog_generation
+        {
             return false;
         }
         self.wasm.iter().all(|(name, backend)| {
@@ -2453,9 +2491,55 @@ impl UdfRegistry {
     /// （`DROP FUNCTION` から呼ばれる。同じ名前空間を共有するため両方の表から外す）。
     pub(crate) fn remove(&mut self, name: &str) -> bool {
         let lower = name.to_ascii_lowercase();
+        self.catalog_names.remove(&lower);
         let a = self.defs.remove(&lower).is_some();
         let b = self.wasm.remove(&lower).is_some();
         a || b
+    }
+
+    /// `name` の登録が UDF カタログ由来か（`sql::udf_ddl` が権限の無いセッションの `DROP FUNCTION` を
+    /// `42501` にするかの判定に使う）。
+    pub(crate) fn is_catalog_origin(&self, name: &str) -> bool {
+        self.catalog_names.contains(&name.to_ascii_lowercase())
+    }
+
+    /// カタログ由来として登録されている件数（`sql::udf_load` が「非カタログ登録が枠を占めているか」の
+    /// 判定に使う）。
+    pub(crate) fn catalog_entry_count(&self) -> usize {
+        self.catalog_names.len()
+    }
+
+    /// 既に登録済みの `name` をカタログ由来として印付けする（`sql::udf_load`・
+    /// `sql::udf_ddl::execute_create_function_persistent` から。未登録の名前は無視する）。
+    pub(crate) fn mark_catalog_origin(&mut self, name: &str) {
+        let lower = name.to_ascii_lowercase();
+        if self.defs.contains_key(&lower) {
+            self.catalog_names.insert(lower);
+        }
+    }
+
+    /// カタログ由来の登録を全部消す（リロード・refresh 失敗時・テナント不一致時）。
+    /// セッション内由来・WASM UDF は残す。束縛した scope と世代は呼び出し側が管理する。
+    pub(crate) fn remove_catalog_entries(&mut self) {
+        for name in std::mem::take(&mut self.catalog_names) {
+            self.defs.remove(&name);
+        }
+    }
+
+    /// カタログ由来の登録を束縛した scope（未ロードなら `None`）。
+    pub(crate) fn catalog_scope(&self) -> Option<&str> {
+        self.catalog_scope.as_deref()
+    }
+
+    /// ロード時に読んだ UDF カタログの世代。
+    pub(crate) fn catalog_generation(&self) -> u64 {
+        self.catalog_generation
+    }
+
+    /// カタログ由来の登録を束縛する scope と世代を記録する。
+    pub(crate) fn set_catalog_binding(&mut self, scope: Option<&str>, generation: u64) {
+        self.catalog_scope = scope.map(Into::into);
+        self.catalog_generation = generation;
     }
 
     /// 名前空間（組み込み・宣言的 UDF・WASM UDF を横断した名前）が既に使われて
@@ -2484,7 +2568,39 @@ pub fn define_function(
     params: &[String],
     body: &Expr,
 ) -> Result<(), SqlSurfaceError> {
-    let prepared = prepare_function_definition(registry, name, params, body)?;
+    let untyped = vec![None; params.len()];
+    define_function_with_types(registry, name, params, &untyped, body)
+}
+
+/// [`define_function`] の型注釈つき版（SQL-66 (1)・TASK-309・Issue #1915）。
+/// `core.rs::EngineCore::execute_sql_in_session` の `CreateFunction` 分岐（DDL 権限なしのセッション）が呼ぶ。
+/// `param_types` は `params` と同じ長さでなければならず（不一致は `42601`）、型を持つ
+/// パラメータは式の型を持つ型（[`crate::sql::cast::CastType::expr_type`] が `Some`）に
+/// 限る（対応する要素型の無い配列は定義時に `0A000`。呼び出しまで遅らせない）。
+/// 本体の型検査は行わない（RETURNS と併せて別 Issue の担当）。検証→登録の順は
+/// [`define_function`] と同じで、失敗時は `registry` を変更しない。
+pub fn define_function_with_types(
+    registry: &mut UdfRegistry,
+    name: &str,
+    params: &[String],
+    param_types: &[Option<crate::sql::cast::CastType>],
+    body: &Expr,
+) -> Result<(), SqlSurfaceError> {
+    if param_types.len() != params.len() {
+        return Err(SqlSurfaceError::unsupported(
+            "function parameter type list does not match the parameter list",
+        ));
+    }
+    for ty in param_types.iter().flatten() {
+        if ty.expr_type().is_none() {
+            return Err(SqlSurfaceError::feature_not_supported(format!(
+                "function parameter of type {} is not supported",
+                ty.pg_label()
+            )));
+        }
+    }
+    let mut prepared = prepare_function_definition(registry, name, params, body)?;
+    prepared.param_types = param_types.to_vec();
     commit_function_definition(registry, prepared);
     Ok(())
 }
@@ -2497,6 +2613,8 @@ pub(crate) struct PreparedUdf {
     pub(crate) key: String,
     /// 小文字化済みの引数名。
     pub(crate) params: Vec<String>,
+    /// 型注釈（`params` と同じ長さ。`prepare_*` は全要素 `None` で返し、型注釈つき定義だけが上書きする）。
+    pub(crate) param_types: Vec<Option<crate::sql::cast::CastType>>,
     pub(crate) body: Expr,
 }
 
@@ -2507,6 +2625,27 @@ pub(crate) fn prepare_function_definition(
     name: &str,
     params: &[String],
     body: &Expr,
+) -> Result<PreparedUdf, SqlSurfaceError> {
+    prepare_function_definition_inner(registry, name, params, body, true)
+}
+
+/// レジストリ容量の上限だけを無視して登録可否を検査する（UDF カタログロードが「容量による一時的な
+/// ブロック」と「恒久的にロード不能（呼び出し先の消失・予約名など）」を区別するために使う）。
+pub(crate) fn prepare_function_definition_ignoring_capacity(
+    registry: &UdfRegistry,
+    name: &str,
+    params: &[String],
+    body: &Expr,
+) -> Result<PreparedUdf, SqlSurfaceError> {
+    prepare_function_definition_inner(registry, name, params, body, false)
+}
+
+fn prepare_function_definition_inner(
+    registry: &UdfRegistry,
+    name: &str,
+    params: &[String],
+    body: &Expr,
+    check_capacity: bool,
 ) -> Result<PreparedUdf, SqlSurfaceError> {
     // 関数名は relation キー（裸の名前、または SCHEMA 配下の内部キー `#<id>.<name>`。
     // 名前解決器が `CREATE FUNCTION s.f(` を解決した出力。TABLE-27・Issue #1717）を受理する。
@@ -2523,7 +2662,7 @@ pub(crate) fn prepare_function_definition(
             "function {name} is already defined in this session"
         )));
     }
-    if registry.len() >= MAX_SESSION_UDFS {
+    if check_capacity && registry.len() >= MAX_SESSION_UDFS {
         return Err(SqlSurfaceError::payload_too_large(
             "too many functions defined in this session",
         ));
@@ -2564,6 +2703,7 @@ pub(crate) fn prepare_function_definition(
 
     Ok(PreparedUdf {
         key: lower,
+        param_types: vec![None; normalized_params.len()],
         params: normalized_params,
         body: body.clone(),
     })
@@ -2576,9 +2716,97 @@ pub(crate) fn commit_function_definition(registry: &mut UdfRegistry, prepared: P
         prepared.key,
         UdfDefinition {
             params: prepared.params,
+            param_types: prepared.param_types,
             body: prepared.body,
         },
     );
+}
+
+/// 型注釈つき宣言的 UDF のパラメータへ渡す実引数 1 つを束縛し、宣言型へ変換する
+/// （`bind_call` の宣言的 UDF 分岐から呼ばれる。SQL-66 (1)・TASK-309・Issue #1915）。
+///
+/// PostgreSQL の関数解決と同じく、型の決まった実引数は暗黙変換（規則表の `=`・`i`）だけで
+/// 受理し、それ以外は `42883`。型なしリテラル（文字列・NULL）は宣言型の入力関数で解釈する
+/// （形式不正は `22P02` 等）。静的に種別を決められない数値・vector は `cast_bound` の既存の
+/// 判定に任せて `0A000`（fail-closed）。エラー文言は静的な型名だけを使う。
+fn bind_typed_udf_arg(
+    name: &str,
+    arg: &Expr,
+    declared: &crate::sql::cast::CastType,
+    env: &mut BindEnv<'_>,
+    node_budget: &mut usize,
+) -> Result<(BoundExpr, ExprType), SqlSurfaceError> {
+    use crate::sql::cast::{self, CastRule, SourceKind};
+    let mismatch = |from: &str| {
+        SqlSurfaceError::undefined_function(format!(
+            "function {name} argument of type {from} cannot be implicitly converted to {}",
+            declared.pg_label()
+        ))
+    };
+    let implicit_ok = |rule: CastRule| matches!(rule, CastRule::Identity | CastRule::Implicit);
+    // 型どうしの暗黙変換可否。配列どうしは `Element`（要素型の規則に従う）を返すため要素の組で見る。
+    let types_implicit = |from: &cast::CastType, to: &cast::CastType| match (from, to) {
+        (cast::CastType::Array(a), cast::CastType::Array(b)) => {
+            implicit_ok(cast::cast_rule_types(a, b))
+        }
+        _ => implicit_ok(cast::cast_rule_types(from, to)),
+    };
+    match arg {
+        Expr::String(_) | Expr::Null => cast::bind_cast(arg, declared, env, node_budget),
+        Expr::Number(raw) => {
+            let from = cast::number_literal_kind(raw);
+            if !implicit_ok(cast::cast_rule(from, declared.kind())) {
+                return Err(mismatch(from.label()));
+            }
+            cast::bind_cast(arg, declared, env, node_budget)
+        }
+        _ => {
+            // 裸の識別子は BOOLEAN 列など `bind_expr_in` が拒否する列も葉として束縛できる
+            // `bind_operand`（CAST の被演算子と同じ規則）で読み、暗黙変換の判定へ進める。
+            let (bound, ty) = if matches!(arg, Expr::Ident(_)) {
+                cast::bind_operand(arg, env, node_budget)?
+            } else {
+                bind_expr_in(arg, env, node_budget)?
+            };
+            // 型注釈つきパラメータ参照は宣言型が分かっている（束縛済み式からは数値種別を復元できない）。
+            // 宣言型が同一ならそのまま渡し、異なるときは暗黙変換の可否だけ宣言型で判定して
+            // 変換自体は `cast_bound` に任せる（種別不明の数値は `0A000` のまま fail-closed）。
+            if let Expr::Ident(pn) = arg {
+                if let Some(src) = env.param_decl.get(pn.to_ascii_lowercase().as_str()) {
+                    if src == declared {
+                        return Ok((bound, ty));
+                    }
+                    if !types_implicit(src, declared) {
+                        return Err(mismatch(&src.pg_label()));
+                    }
+                    // 宣言型は既知なので、束縛済み定数から再推論せず宣言型を変換元として渡す。
+                    let known = match src {
+                        cast::CastType::Array(elem) => {
+                            SourceKind::Array(Some(elem.as_ref().clone()))
+                        }
+                        other => SourceKind::Known(other.kind()),
+                    };
+                    return cast::cast_bound_from(known, arg, bound, ty, declared, node_budget);
+                }
+            }
+            match cast::source_cast_kind(arg, &bound, ty, env.schema()) {
+                SourceKind::Known(k) => {
+                    if !implicit_ok(cast::cast_rule(k, declared.kind())) {
+                        return Err(mismatch(k.label()));
+                    }
+                }
+                SourceKind::Array(Some(elem)) => {
+                    let from = cast::CastType::Array(Box::new(elem));
+                    if !types_implicit(&from, declared) {
+                        return Err(mismatch(&from.pg_label()));
+                    }
+                }
+                // 種別を決められない数値・要素型不明の配列・vector は `cast_bound` が判定する。
+                SourceKind::Array(None) | SourceKind::UnknownNumeric | SourceKind::Outside => {}
+            }
+            cast::cast_bound(arg, bound, ty, declared, env, node_budget)
+        }
+    }
 }
 
 /// テスト専用: `define_function` のパラメータ名正規化（小文字化）を経由せず、
@@ -2870,6 +3098,10 @@ fn validate_closed_expr(
 pub(super) struct BindEnv<'a> {
     schema: Option<&'a TableSchema>,
     params: std::collections::HashMap<String, (BoundExpr, ExprType)>,
+    /// 型注釈つき UDF の本体展開中に限り、パラメータ名（小文字）→ 宣言型。入れ子の UDF 呼び出しで
+    /// パラメータ参照を実引数にしたとき、束縛済み式からは決められない数値種別を復元する
+    /// （[`bind_typed_udf_arg`]・Issue #1915）。型なしパラメータは載らない。
+    param_decl: std::collections::HashMap<String, crate::sql::cast::CastType>,
     registry: &'a UdfRegistry,
     /// `CASE`／`COALESCE`／`NULLIF` の現在の入れ子段数（対象ビヘイビア: SQL-26。
     /// Issue #921）。構文段（`sql::allowlist::Parser`）のネストカウンタとは別に
@@ -3643,6 +3875,7 @@ pub fn bind_expr(
     let mut env = BindEnv {
         schema: Some(schema),
         params: std::collections::HashMap::new(),
+        param_decl: std::collections::HashMap::new(),
         registry,
         case_nesting: 0,
         typed_arith: false,
@@ -3665,6 +3898,7 @@ pub(crate) fn bind_array_agg_element(
     let mut env = BindEnv {
         schema: Some(schema),
         params: std::collections::HashMap::new(),
+        param_decl: std::collections::HashMap::new(),
         registry,
         case_nesting: 0,
         typed_arith: false,
@@ -3769,6 +4003,7 @@ fn bind_projection_expr_inner(
     let mut env = BindEnv {
         schema: Some(schema),
         params: std::collections::HashMap::new(),
+        param_decl: std::collections::HashMap::new(),
         registry,
         case_nesting: 0,
         typed_arith: true,
@@ -3835,6 +4070,7 @@ pub(crate) fn bind_array_assignment_source(
     let mut env = BindEnv {
         schema: Some(schema),
         params: std::collections::HashMap::new(),
+        param_decl: std::collections::HashMap::new(),
         registry,
         case_nesting: 0,
         typed_arith: true,
@@ -3888,6 +4124,7 @@ pub(crate) fn bind_order_expr(
     let mut env = BindEnv {
         schema: Some(schema),
         params: std::collections::HashMap::new(),
+        param_decl: std::collections::HashMap::new(),
         registry,
         case_nesting: 0,
         typed_arith: false,
@@ -4017,6 +4254,7 @@ pub(crate) fn bind_const_projection_expr(
     let mut env = BindEnv {
         schema: None,
         params: std::collections::HashMap::new(),
+        param_decl: std::collections::HashMap::new(),
         registry,
         case_nesting: 0,
         typed_arith: true,
@@ -4092,6 +4330,7 @@ pub(crate) fn bind_const_expr(
     let mut env = BindEnv {
         schema: None,
         params: std::collections::HashMap::new(),
+        param_decl: std::collections::HashMap::new(),
         registry,
         case_nesting: 0,
         typed_arith: true,
@@ -4116,6 +4355,7 @@ pub(crate) fn bind_const_expr_array_top(
     let mut env = BindEnv {
         schema: None,
         params: std::collections::HashMap::new(),
+        param_decl: std::collections::HashMap::new(),
         registry,
         case_nesting: 0,
         typed_arith: true,
@@ -7514,13 +7754,24 @@ fn bind_call(
                 args.len()
             )));
         }
+        // 型注釈つきパラメータ（SQL-66 (1)）は実引数を宣言型へ暗黙変換する。型なしは従来どおり。
+        // `param_types.len() == params.len()` は `define_function_with_types` が確立する不変条件。
         let mut bound_args = Vec::with_capacity(args.len());
-        for a in args {
-            bound_args.push(bind_expr_in(a, env, node_budget)?);
+        for (i, a) in args.iter().enumerate() {
+            match def.param_types.get(i).and_then(Option::as_ref) {
+                Some(declared) => {
+                    bound_args.push(bind_typed_udf_arg(name, a, declared, env, node_budget)?)
+                }
+                None => bound_args.push(bind_expr_in(a, env, node_budget)?),
+            }
         }
         let mut inner_params = std::collections::HashMap::new();
-        for (pname, bound) in def.params.iter().zip(bound_args) {
+        let mut inner_decl = std::collections::HashMap::new();
+        for (i, (pname, bound)) in def.params.iter().zip(bound_args).enumerate() {
             inner_params.insert(pname.clone(), bound);
+            if let Some(declared) = def.param_types.get(i).and_then(Option::as_ref) {
+                inner_decl.insert(pname.clone(), declared.clone());
+            }
         }
         let mut inner_env = BindEnv {
             // UDF 本体は列参照を持たない閉じた関数であるべき契約（`define_function`
@@ -7529,6 +7780,7 @@ fn bind_call(
             // な多重防御）。
             schema: None,
             params: inner_params,
+            param_decl: inner_decl,
             registry: env.registry,
             // 呼び出し元の現在のネスト段数を引き継ぐ（UDF 本体のインライン展開
             // 後、呼び出し元の CASE/COALESCE/NULLIF と本体側のそれが合算される
@@ -9512,20 +9764,24 @@ pub(crate) fn apply_builtin<'a>(
         // `CONCAT` 以外は strict（引数のいずれかが NULL なら NULL を返し、
         // `crate::sql::string_fn` の純粋関数を呼び出さない）。`CONCAT` は NULL を
         // 空文字として扱い常に非 NULL を返す。
-        BuiltinFn::Lower | BuiltinFn::Upper | BuiltinFn::Trim => {
-            match take_text_or_null_arg(args, 0)? {
-                None => Ok(ExprValue::Null),
-                Some(s) => {
-                    let out = match f {
-                        BuiltinFn::Lower => string_fn::lower(&s)?,
-                        BuiltinFn::Upper => string_fn::upper(&s)?,
-                        BuiltinFn::Trim => string_fn::trim(&s)?,
-                        _ => unreachable!("guarded by outer match arm"),
-                    };
-                    Ok(ExprValue::Text(Cow::Owned(out)))
-                }
+        BuiltinFn::Lower
+        | BuiltinFn::Upper
+        | BuiltinFn::Trim
+        | BuiltinFn::Reverse
+        | BuiltinFn::Initcap => match take_text_or_null_arg(args, 0)? {
+            None => Ok(ExprValue::Null),
+            Some(s) => {
+                let out = match f {
+                    BuiltinFn::Lower => string_fn::lower(&s)?,
+                    BuiltinFn::Upper => string_fn::upper(&s)?,
+                    BuiltinFn::Trim => string_fn::trim(&s)?,
+                    BuiltinFn::Reverse => string_fn::reverse(&s)?,
+                    BuiltinFn::Initcap => string_fn::initcap(&s)?,
+                    _ => unreachable!("guarded by outer match arm"),
+                };
+                Ok(ExprValue::Text(Cow::Owned(out)))
             }
-        }
+        },
         // Issue #1905・SQL-65: strict（NULL 入力は NULL）。
         BuiltinFn::Md5 => match take_text_or_null_arg(args, 0)? {
             None => Ok(ExprValue::Null),
@@ -9535,6 +9791,22 @@ pub(crate) fn apply_builtin<'a>(
             None => Ok(ExprValue::Null),
             Some(s) => finite_scalar(string_fn::length(&s), "length"),
         },
+        BuiltinFn::Left | BuiltinFn::Right => {
+            match (
+                take_text_or_null_arg(args, 0)?,
+                take_scalar_or_null_arg(args, 1)?,
+            ) {
+                (Some(s), Some(n)) => {
+                    let out = if matches!(f, BuiltinFn::Left) {
+                        string_fn::left(&s, n)?
+                    } else {
+                        string_fn::right(&s, n)?
+                    };
+                    Ok(ExprValue::Text(Cow::Owned(out)))
+                }
+                _ => Ok(ExprValue::Null),
+            }
+        }
         BuiltinFn::Substr2 => {
             match (
                 take_text_or_null_arg(args, 0)?,
@@ -11283,6 +11555,10 @@ mod tests {
             BuiltinFn::Trim,
             BuiltinFn::Replace,
             BuiltinFn::Position,
+            BuiltinFn::Left,
+            BuiltinFn::Right,
+            BuiltinFn::Reverse,
+            BuiltinFn::Initcap,
             BuiltinFn::Abs,
             BuiltinFn::Round1,
             BuiltinFn::Round2,
