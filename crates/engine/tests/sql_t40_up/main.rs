@@ -111,5 +111,6 @@ mod sql65_ln_log_exp_sign;
 mod sql65_lpad_rpad_split_part;
 mod sql65_md5;
 mod sql65_substring_position_syntax;
+mod sql65_trunc;
 mod sql78_predicate_dml_noneq_between_params;
 mod sql78_where_noneq_between_params;

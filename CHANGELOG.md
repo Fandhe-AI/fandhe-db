@@ -10,6 +10,8 @@
 ### Added
 
 - `ln`／`log`／`exp`／`sign` を追加する（Issue #1907・SQL-65）。`log(x)` は底 10、`log(b, x)` は底 b の対数。`ln`・`log` の 0 と負は `2201E`、`log(1, x)` は `22012`、`exp` のあふれ・アンダーフローは `22003`。NUMERIC 型の引数は従来どおり `42804`。詳細は [numeric-scalar-functions.md](docs/design/numeric-scalar-functions.md) の「Issue #1907 追記」節。
+- 数値関数 `trunc(x)`／`trunc(x, n)` を追加した（Issue #1908・SQL-65）。0 方向への切り捨てで、2 引数形は小数点以下 `n` 桁（負の `n` は整数部の桁）で打ち切る。10 進数字列で処理するため桁上げ・二進誤差はない。`n` が非整数は `22000`、`i32` の範囲外は `22003`。
+  挙動変更: `trunc` が組み込み関数の予約名になり、同名の `CREATE FUNCTION` は `42723`。公開 enum `BuiltinFn` に variant `Trunc1`／`Trunc2` を追加した（BREAKING）。
 - 文字列関数 `lpad`／`rpad`／`split_part` を追加した（Issue #1904・SQL-65）。いずれも strict で、長さ・位置は文字単位。`lpad`／`rpad` は第 3 引数の省略時に半角空白で埋め、`split_part` は負の位置を末尾から数え、位置 0 は `22023`。結果長が上限（4 MiB）を超えると `54000`。
   挙動変更: 3 名は組み込みの予約名になり、同名の `CREATE FUNCTION` は `42723` で拒否される。
 - 文字列関数 `md5(text)` を追加した（Issue #1905・SQL-65）。UTF-8 バイト列の MD5 を 32 文字の小文字 16 進で返す strict 関数（NULL は NULL）で、依存追加なしの自作実装。`md5(bytea)` は bytea が関数引数に使えない既存規則どおり `0A000`（PostgreSQL との既知の差）。

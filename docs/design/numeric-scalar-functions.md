@@ -110,6 +110,27 @@ spec と対にして判断する。
 - 制約: NUMERIC 型の引数は従来の数値関数と同じく `42804`。PostgreSQL の numeric 版が返す表示桁（例: `3.0000000000000000`）や、`exp` の極小入力で 0 を返す挙動は再現しない（f64 の最短表現・`22003`）。
 - 既存の `power`・`sqrt` の `22000` は変更しない（PostgreSQL の `2201F` への揃えは別課題）。
 
+## Issue #1908 追記（trunc。SQL-65）
+
+`trunc(x)`／`trunc(x, n)` を組み込みに追加した（ポインタ: `docs/spec/04-behavior/` SQL-65）。
+`round` と同じ arity オーバーロードで、1 引数形は `BuiltinFn::Trunc1`、2 引数形は
+`BuiltinFn::Trunc2` へ `bind_call` が解決する。引数・戻り値とも Scalar（f64）で、
+NUMERIC 型の引数は他の数値関数と同じく `42804`。`trunc` は予約名になり、同名の
+`CREATE FUNCTION` は `42723`。
+
+- `trunc(x)`: 0 方向へ整数へ切り捨てる（`f64::trunc`）。`trunc(-0.5)` は `-0.0`
+  （PostgreSQL の float8 版と同じ）。
+- `trunc(x, n)`: `x` の最短往復表現（10 進数字列）を `n` 桁で打ち切る。桁上げは起きず、
+  `x * 10^n` の二進誤差も入らない（`trunc(2.675, 2)` = 2.67、`trunc(99.99, 1)` = 99.9）。
+  負の `n` は整数部の下位 `|n|` 桁を 0 にし（`trunc(1234.5678, -2)` = 1200）、`|n|` が整数部の
+  桁数以上なら符号付きの 0 を返す。`n` が小数部の桁数以上なら `x` をそのまま返す。
+- `n` の検査は `round` と同じ: 非整数は `22000`、`i32` の範囲外は `22003`。
+
+PostgreSQL との既知の差: PG の 2 引数形は `trunc(numeric, integer)` のみで型違いは `42883`
+だが、本エンジンは `round` と同じく Scalar を受け取る。PG の numeric 版は表示桁（スケール）を
+保つが、本エンジンは f64 の最短表現で返す。PG numeric に `-0` は無いが本エンジンは float8 版と
+同じく `-0` を返す。裸の `NULL` リテラルは関数引数に使えない既存規則のまま。
+
 ## スコープ外・後続課題（当時の記録。実装済みの部分は `docs/design/datetime-scalar-functions.md` を参照）
 
 `date_part('field', src)`・`date_trunc('unit', src)`・`DATE`/`TIMESTAMP`

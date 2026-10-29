@@ -154,10 +154,14 @@ fn domain_errors_use_postgres_sqlstates() {
             "{e}"
         );
     }
-    assert_eq!(
-        code_of(&core, "SELECT log(1, 10) FROM docs LIMIT 10"),
-        "22012"
-    );
+    // 底 1 は x の値（0・負数を含む）に関わらず 22012（引数ドメイン違反の 2201E より優先）。
+    for e in ["log(1, 10)", "log(1, 0)", "log(1, 0 - 5)"] {
+        assert_eq!(
+            code_of(&core, &format!("SELECT {e} FROM docs LIMIT 10")),
+            "22012",
+            "{e}"
+        );
+    }
     for e in ["exp(1000)", "exp(0 - 1000)"] {
         assert_eq!(
             code_of(&core, &format!("SELECT {e} FROM docs LIMIT 10")),
