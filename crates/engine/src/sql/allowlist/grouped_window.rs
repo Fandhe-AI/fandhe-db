@@ -139,6 +139,25 @@ fn window_item_has_inner_aggregate(item: &[Token]) -> bool {
     false
 }
 
+/// 直前のトークンが式の終端か（`ROWS`／`RANGE`／`GROUPS` をフレーム開始と見なす条件）。演算子・
+/// `,`・`BY` の直後の同名識別子（`sum(k) + rows` 等）は式の途中の識別子なのでフレームではない。
+fn ends_expression(prev: Option<&Token>) -> bool {
+    match prev {
+        Some(Token::Ident(n)) => ![
+            "AND", "OR", "NOT", "IS", "LIKE", "ILIKE", "IN", "BETWEEN", "DISTINCT",
+        ]
+        .iter()
+        .any(|k| n.eq_ignore_ascii_case(k)),
+        Some(
+            Token::Number(_)
+            | Token::StringLiteral(_)
+            | Token::QuotedBoolWord(_)
+            | Token::Punct(')' | ']'),
+        ) => true,
+        _ => false,
+    }
+}
+
 /// `open` の `(` に対応する `)` の添字。閉じない場合は `None`。
 fn find_close(tokens: &[Token], open: usize) -> Option<usize> {
     let mut depth = 0usize;
@@ -249,10 +268,7 @@ fn hoist_window_item(
                     && (n.eq_ignore_ascii_case("ROWS")
                         || n.eq_ignore_ascii_case("RANGE")
                         || n.eq_ignore_ascii_case("GROUPS"))
-                    && !matches!(
-                        item.get(i.saturating_sub(1)),
-                        Some(Token::Punct(',') | Token::Keyword(Keyword::By))
-                    ) =>
+                    && ends_expression(item.get(i.saturating_sub(1))) =>
             {
                 frame_start = i;
                 break;
@@ -403,6 +419,7 @@ pub(super) fn try_build(
     // 窓項目の有無と、非窓項目の集計呼び出しでこの経路の対象かを先に確定する（解析前）。
     let mut any_window = false;
     let mut plain_has_aggregate = false;
+    let mut any_plain = false;
     let mut window_has_aggregate = false;
     for &(s, e) in &ranges {
         let Some(item) = tokens.get(s..e) else {
@@ -413,12 +430,23 @@ pub(super) fn try_build(
             if window_item_has_inner_aggregate(item) {
                 window_has_aggregate = true;
             }
-        } else if item_has_aggregate_call(item) {
-            plain_has_aggregate = true;
+        } else {
+            any_plain = true;
+            if item_has_aggregate_call(item) {
+                plain_has_aggregate = true;
+            }
         }
     }
     if !any_window || !(has_group_by_or_having || plain_has_aggregate || window_has_aggregate) {
         return Ok(None);
+    }
+    // 窓の内側の集計だけが根拠で、GROUP BY／HAVING も非窓の集計も無いのに非窓項目がある文
+    // （`SELECT id, lag(count(*)) OVER ()` 等）は、暗黙の単一グループに非集計項目が混ざるので
+    // PostgreSQL と同じ `42803`。本文の形検査（`LIMIT` 付きで `42601` に倒れる）へ渡さず先に返す。
+    if !has_group_by_or_having && !plain_has_aggregate && any_plain {
+        return Err(SqlSurfaceError::GroupingError {
+            detail: "column must appear in the GROUP BY clause or be used in an aggregate function",
+        });
     }
     // Describe 経路は本文が `$n` を含まない前提でダミーフラグを渡すため、不一致を避けて拒否する。
     if tokens.iter().any(|t| matches!(t, Token::Param(_))) {
