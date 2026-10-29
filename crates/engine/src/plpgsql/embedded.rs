@@ -13,7 +13,7 @@ use crate::sql::allowlist::SqlSurfaceError;
 use crate::sql::ddl_column_type::SqlColumnTypeName;
 use crate::sql::lexer::{Keyword, Token};
 
-use super::ast::{Block, Body, DeclType, EmbeddedSql, SqlExpr, Stmt, VarRef};
+use super::ast::{Block, Body, DeclType, EmbeddedKind, EmbeddedSql, SqlExpr, Stmt, VarRef};
 use super::{oos_err, syn_err};
 
 /// `Ident` が（大小無視で）`word` か。
@@ -239,13 +239,28 @@ fn in_set_list(tokens: &[Token], i: usize) -> bool {
                 depth -= 1;
             }
             Some(t) if depth == 0 => {
+                // SET 節の開始は「直前が `,`／SELECT でなく、直後が `対象 =`」の `SET` だけ。
+                // SELECT リストの `set` 列（`SELECT set, v = 1`）を SET 節と誤認しない。
                 if ident_is(t, "SET") {
-                    return true;
+                    let prev_ok = k
+                        .checked_sub(1)
+                        .and_then(|p| tokens.get(p))
+                        .is_some_and(|p| {
+                            !matches!(p, Token::Punct(',') | Token::Keyword(Keyword::Select))
+                        });
+                    let next_ok =
+                        matches!(
+                            tokens.get(k.saturating_add(1)),
+                            Some(Token::Ident(_) | Token::QualifiedIdent { .. })
+                        ) && matches!(tokens.get(k.saturating_add(2)), Some(Token::Punct('=')));
+                    if prev_ok && next_ok {
+                        return true;
+                    }
                 }
-                if matches!(t, Token::Keyword(Keyword::From | Keyword::Where))
-                    || ["RETURNING", "ON", "VALUES", "SELECT"]
-                        .iter()
-                        .any(|w| ident_is(t, w))
+                if matches!(
+                    t,
+                    Token::Keyword(Keyword::From | Keyword::Where | Keyword::Select)
+                ) || ["RETURNING", "ON", "VALUES"].iter().any(|w| ident_is(t, w))
                 {
                     return false;
                 }
@@ -254,6 +269,112 @@ fn in_set_list(tokens: &[Token], i: usize) -> bool {
         }
     }
     false
+}
+
+/// `i` 以降が `AS [[NOT] MATERIALIZED] (` の形か（CTE 定義の入口）。`from` は `AS` の位置。
+fn cte_as_follows(tokens: &[Token], from: usize) -> bool {
+    if !tokens.get(from).is_some_and(|t| ident_is(t, "AS")) {
+        return false;
+    }
+    let mut j = from.saturating_add(1);
+    if tokens.get(j).is_some_and(|t| ident_is(t, "NOT")) {
+        j = j.saturating_add(1);
+    }
+    if tokens.get(j).is_some_and(|t| ident_is(t, "MATERIALIZED")) {
+        j = j.saturating_add(1);
+    }
+    matches!(tokens.get(j), Some(Token::Punct('(')))
+}
+
+/// `tokens[i]` が CTE の宣言名（直後が `AS (` 系）か。`SELECT c AS x` の別名元とは `(` の有無で区別する。
+fn is_cte_decl_name(tokens: &[Token], i: usize) -> bool {
+    cte_as_follows(tokens, i.saturating_add(1))
+}
+
+/// `tokens[i]` が CTE の列名リスト `name (a, b) AS (` の内側か。
+fn in_cte_column_list(tokens: &[Token], i: usize) -> bool {
+    let mut depth = 0usize;
+    let mut k = i;
+    while k > 0 {
+        k -= 1;
+        match tokens.get(k) {
+            Some(Token::Punct(')')) => depth = depth.saturating_add(1),
+            Some(Token::Punct('(')) => {
+                if depth == 0 {
+                    break;
+                }
+                depth -= 1;
+            }
+            _ => {}
+        }
+    }
+    if depth != 0
+        || !tokens
+            .get(k)
+            .is_some_and(|t| matches!(t, Token::Punct('(')))
+    {
+        return false;
+    }
+    // 対応する `)` を探す。
+    let mut d = 0usize;
+    let mut m = k;
+    while let Some(t) = tokens.get(m) {
+        match t {
+            Token::Punct('(') => d = d.saturating_add(1),
+            Token::Punct(')') => {
+                d = d.saturating_sub(1);
+                if d == 0 {
+                    return cte_as_follows(tokens, m.saturating_add(1))
+                        && k.checked_sub(1)
+                            .and_then(|p| tokens.get(p))
+                            .is_some_and(|p| matches!(p, Token::Ident(_)));
+                }
+            }
+            _ => {}
+        }
+        m = m.saturating_add(1);
+    }
+    false
+}
+
+/// `WITH` で始まる文の主文の種別と、データ変更 CTE（`( INSERT|UPDATE|DELETE`）の有無を返す。
+/// 括弧の深さ 0 で最初に現れる主文の語で種別を決める（CTE 本体は括弧内なので読み飛ばされる）。
+pub(super) fn classify_with(tokens: &[Token]) -> (EmbeddedKind, bool) {
+    let mut depth = 0usize;
+    let mut kind = EmbeddedKind::Select;
+    let mut found = false;
+    for t in tokens {
+        match t {
+            Token::Punct('(') => depth = depth.saturating_add(1),
+            Token::Punct(')') => depth = depth.saturating_sub(1),
+            _ if depth == 0 && !found => {
+                if ident_is(t, "INSERT") {
+                    kind = EmbeddedKind::Insert;
+                    found = true;
+                } else if ident_is(t, "UPDATE") {
+                    kind = EmbeddedKind::Update;
+                    found = true;
+                } else if ident_is(t, "DELETE") {
+                    kind = EmbeddedKind::Delete;
+                    found = true;
+                } else if matches!(t, Token::Keyword(Keyword::Select)) || ident_is(t, "VALUES") {
+                    found = true;
+                }
+            }
+            _ => {}
+        }
+    }
+    (kind, has_write_cte(tokens))
+}
+
+/// `(` の直後が `INSERT`／`UPDATE`／`DELETE` のトークンがあるか（データ変更 CTE）。
+pub(super) fn has_write_cte(tokens: &[Token]) -> bool {
+    tokens.windows(2).any(|w| {
+        matches!(w.first(), Some(Token::Punct('(')))
+            && w.get(1).is_some_and(|t| {
+                ident_is(t, "INSERT") || ident_is(t, "UPDATE") || ident_is(t, "DELETE")
+            })
+    })
 }
 
 /// `tokens[i]` の `Ident` が識別子の位置（関数名・表名・列名・別名・暗黙別名・`USING` の列／表・
@@ -265,6 +386,8 @@ pub(crate) fn is_ident_position(tokens: &[Token], i: usize) -> bool {
     }
     let prev = i.checked_sub(1).and_then(|p| tokens.get(p));
     match prev {
+        // `::型名` は型の位置であり値ではない。
+        Some(Token::TypeCast) => return true,
         Some(Token::Keyword(Keyword::From)) => return true,
         Some(p)
             if [
@@ -283,6 +406,10 @@ pub(crate) fn is_ident_position(tokens: &[Token], i: usize) -> bool {
             return true
         }
         _ => {}
+    }
+    // CTE の宣言名（`WITH c AS (`・`c AS MATERIALIZED (`）と列名リスト（`c (a, b) AS (`）。
+    if is_cte_decl_name(tokens, i) || in_cte_column_list(tokens, i) {
+        return true;
     }
     // 暗黙別名: 表名の直後の語（`FROM t x`）。句の語は別名ではない。
     if let (Some(p @ (Token::Ident(_) | Token::QualifiedIdent { .. })), Some(Token::Ident(me))) =

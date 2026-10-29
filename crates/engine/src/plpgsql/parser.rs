@@ -17,7 +17,9 @@ use super::ast::{
     AssignTarget, Block, Body, DeclType, DiagItem, EmbeddedKind, EmbeddedSql, IntoClause,
     ParseOptions, ReturnShape, SqlExpr, Stmt, VarDecl, VarId, VarKind, VarRef,
 };
-use super::embedded::{is_ident_position, reject_forbidden_clauses, split_into, RawInto};
+use super::embedded::{
+    classify_with, has_write_cte, is_ident_position, reject_forbidden_clauses, split_into, RawInto,
+};
 use super::lexer::{scan, TokKind};
 use super::{oos_err, syn_err, too_big_err};
 
@@ -123,6 +125,32 @@ pub(super) fn parse(src: &str, opts: &ParseOptions) -> Result<Body, SqlSurfaceEr
         block,
         vars: p.vars,
     })
+}
+
+/// 全体を囲む外側の括弧を剥がす（`(SELECT ...)` → `SELECT ...`。定義時検証は SELECT 始まりを要求する）。
+fn strip_outer_parens(mut t: Vec<Token>) -> Vec<Token> {
+    loop {
+        if !matches!(t.first(), Some(Token::Punct('(')))
+            || !matches!(t.last(), Some(Token::Punct(')')))
+        {
+            return t;
+        }
+        let mut d = 0usize;
+        for (i, x) in t.iter().enumerate() {
+            match x {
+                Token::Punct('(') => d = d.saturating_add(1),
+                Token::Punct(')') => {
+                    d = d.saturating_sub(1);
+                    if d == 0 && i.saturating_add(1) != t.len() {
+                        return t;
+                    }
+                }
+                _ => {}
+            }
+        }
+        t.remove(0);
+        t.pop();
+    }
 }
 
 fn sql_tokens(text: &str) -> Result<Vec<Token>, SqlSurfaceError> {
@@ -536,11 +564,16 @@ impl<'a> Parser<'a> {
             None => None,
         };
         let var_refs = self.resolve_refs(&tokens)?;
+        let writes = matches!(
+            kind,
+            EmbeddedKind::Insert | EmbeddedKind::Update | EmbeddedKind::Delete
+        ) || has_write_cte(&tokens);
         Ok(EmbeddedSql {
             kind,
             tokens,
             var_refs,
             into,
+            writes,
         })
     }
 
@@ -1043,7 +1076,7 @@ impl<'a> Parser<'a> {
             }
             return Err(syn_err("malformed PL/pgSQL FOR loop"));
         }
-        let tokens = sql_tokens(self.span_text(a, e)?)?;
+        let tokens = strip_outer_parens(sql_tokens(self.span_text(a, e)?)?);
         let query = self.build_sql(tokens, EmbeddedKind::Select, false)?;
         self.pos = e;
         self.expect_kw("LOOP")?;
@@ -1197,6 +1230,7 @@ impl<'a> Parser<'a> {
             "INSERT" => EmbeddedKind::Insert,
             "UPDATE" => EmbeddedKind::Update,
             "DELETE" => EmbeddedKind::Delete,
+            "WITH" => classify_with(&tokens).0,
             _ => EmbeddedKind::Select,
         };
         let q = self.build_sql(tokens, kind, true)?;

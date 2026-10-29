@@ -152,6 +152,8 @@ pub(crate) struct EmbeddedSql {
     pub(crate) tokens: Vec<Token>,
     pub(crate) var_refs: Vec<(usize, VarRef)>,
     pub(crate) into: Option<IntoClause>,
+    /// 書き込みを含むか（`kind` が DML、またはデータ変更 CTE を含む。ADR D5）。
+    pub(crate) writes: bool,
 }
 
 /// `GET DIAGNOSTICS` の項目（初版は `ROW_COUNT` のみ）。

@@ -695,3 +695,69 @@ fn extended_ident_positions() {
     let q = tokenize("SELECT 1 FROM r.items").expect("tokenize");
     assert!(is_ident_position(&q, 3));
 }
+
+#[test]
+fn type_name_and_cte_names_are_not_variable_references() {
+    let b = ok("DECLARE text text; BEGIN PERFORM 1::text; END");
+    let Some(Stmt::Perform(p)) = b.block.stmts.first() else {
+        panic!("perform");
+    };
+    assert!(p.var_refs.is_empty());
+    let b = ok("DECLARE c int; BEGIN WITH c AS (SELECT 1) SELECT * FROM c INTO STRICT c; END");
+    let Some(Stmt::Sql(s)) = b.block.stmts.first() else {
+        panic!("sql");
+    };
+    assert!(s.var_refs.is_empty());
+    let b = ok("DECLARE a int; BEGIN WITH c (a) AS (SELECT 1) SELECT 1 FROM c; END");
+    let Some(Stmt::Sql(s)) = b.block.stmts.first() else {
+        panic!("sql");
+    };
+    assert!(s.var_refs.is_empty());
+}
+
+#[test]
+fn with_statement_kind_follows_the_main_statement() {
+    let kind = |src: &str| {
+        let b = ok(src);
+        let Some(Stmt::Sql(s)) = b.block.stmts.first() else {
+            panic!("sql");
+        };
+        (s.kind, s.writes)
+    };
+    assert_eq!(
+        kind("BEGIN WITH c AS (SELECT 1) UPDATE t SET x = 1; END"),
+        (EmbeddedKind::Update, true)
+    );
+    assert_eq!(
+        kind("BEGIN WITH c AS (SELECT 1) DELETE FROM t; END"),
+        (EmbeddedKind::Delete, true)
+    );
+    assert_eq!(
+        kind("BEGIN WITH c AS (SELECT 1) SELECT 1 FROM c; END"),
+        (EmbeddedKind::Select, false)
+    );
+    assert_eq!(
+        kind("BEGIN WITH c AS (DELETE FROM t RETURNING 1) SELECT 1 FROM c; END"),
+        (EmbeddedKind::Select, true)
+    );
+}
+
+#[test]
+fn set_column_in_select_list_does_not_hide_variables() {
+    let c = |s: &str, i: usize| is_ident_position(&tokenize(s).expect("tokenize"), i);
+    // `SELECT set, v = 1`: v は SET 代入先ではない。
+    assert!(!c("SELECT set , v = 1", 3));
+    assert!(c("UPDATE t SET v = 1 , w = 2", 7));
+}
+
+#[test]
+fn parenthesized_for_query_passes_validation_shape() {
+    let b = ok("BEGIN FOR r IN (SELECT 1) LOOP NULL; END LOOP; END");
+    let Some(Stmt::ForQuery { query, .. }) = b.block.stmts.first() else {
+        panic!("for");
+    };
+    assert!(matches!(
+        query.tokens.first(),
+        Some(Token::Keyword(Keyword::Select))
+    ));
+}
