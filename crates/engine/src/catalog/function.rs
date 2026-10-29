@@ -811,6 +811,7 @@ impl Storage {
     }
 
     /// `scope` の同名の多重定義を返す（読み取り専用）。
+    #[cfg(test)]
     pub(crate) fn list_overloads(
         &self,
         scope: &str,
@@ -823,6 +824,7 @@ impl Storage {
     }
 
     /// 定義を削除する。存在して削除した場合に `true`。ID カウンタは巻き戻さない。
+    #[cfg(test)]
     pub(crate) fn drop_function(
         &self,
         scope: &str,
@@ -835,6 +837,35 @@ impl Storage {
             .begin_write_txn()
             .map_err(super::convert_storage_error)?;
         if !remove_function_in_txn(&write_txn, scope, &key, signature)? {
+            return Ok(false);
+        }
+        crate::recovery::commit_boundary::commit(write_txn)
+            .map_err(super::convert_storage_error)?;
+        Ok(true)
+    }
+
+    /// 同名の定義がちょうど 1 件で `matcher` が真のとき、同一 write txn で削除して `true`。
+    /// 0 件・2 件以上・不一致は `false`（型付き `DROP FUNCTION` 用。列挙・照合・削除を原子的にする）。
+    pub(crate) fn drop_function_matching(
+        &self,
+        scope: &str,
+        function_key: &str,
+        matcher: impl Fn(&FunctionDef) -> Result<bool>,
+    ) -> Result<bool> {
+        validate_scope(scope)?;
+        let key = normalize_key(function_key)?;
+        let write_txn = self
+            .begin_write_txn()
+            .map_err(super::convert_storage_error)?;
+        let found = list_in_txn(&*write_txn, scope, Some(&key))?;
+        let [def] = found.as_slice() else {
+            return Ok(false);
+        };
+        if !matcher(def)? {
+            return Ok(false);
+        }
+        let sig = arg_signature(&def.params)?;
+        if !remove_function_in_txn(&write_txn, scope, &key, &sig)? {
             return Ok(false);
         }
         crate::recovery::commit_boundary::commit(write_txn)
@@ -1341,6 +1372,25 @@ mod tests {
         assert!(!s.drop_function("t", "f", "integer").expect("again"));
         s.create_function("t", &def("f", vec![param(None, ty(&ColumnType::Text))]))
             .expect("name is free after drop");
+    }
+
+    /// #1920: 型付き削除は照合と削除が同一 txn。不一致・0 件・多重定義は削除しない。
+    #[test]
+    fn drop_matching_only_when_single_and_matcher_true() {
+        let (s, _g) = tmp_storage("fn-dropmatch");
+        assert!(!s
+            .drop_function_matching("t", "f", |_| Ok(true))
+            .expect("zero"));
+        s.create_function("t", &def("f", vec![param(None, ty(&ColumnType::Integer))]))
+            .expect("f");
+        assert!(!s
+            .drop_function_matching("t", "f", |_| Ok(false))
+            .expect("no match"));
+        assert_eq!(s.list_overloads("t", "f").expect("ov").len(), 1);
+        assert!(s
+            .drop_function_matching("t", "f", |_| Ok(true))
+            .expect("drop"));
+        assert!(s.list_overloads("t", "f").expect("ov").is_empty());
     }
 
     /// #1920: 名前での削除。0 件は `None`・1 件は削除・2 件（直接作った防御的な状態）は拒否。

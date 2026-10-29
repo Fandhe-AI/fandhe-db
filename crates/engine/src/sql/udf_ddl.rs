@@ -105,9 +105,7 @@ pub(crate) fn execute_drop_function(
     }
 }
 
-/// カタログから削除し、削除したら `true`。型の並びの照合は同じ write txn ではなく先に読む
-/// （単一ライタのため、読みと削除の間に他セッションが割り込めない前提は `Storage` の write lock
-/// ではなく、削除側が signature 完全一致でしか消さないことで担保する）。
+/// カタログから削除し、削除したら `true`。型付きの場合も照合と削除は同一 write txn で行う。
 fn drop_from_catalog(
     storage: &Storage,
     tenant_id: &str,
@@ -119,27 +117,24 @@ fn drop_from_catalog(
             .map(|sig| sig.is_some())
             .map_err(map_function_error);
     };
-    let found = storage
-        .list_overloads(tenant_id, &stmt.name)
-        .map_err(map_function_error)?;
-    let [def] = found.as_slice() else {
-        return Ok(false);
-    };
-    if def.params.len() != types.len() {
-        return Ok(false);
-    }
-    for (stored, want) in def.params.iter().zip(types) {
-        let Some(stored_ty) = &stored.ty else {
-            continue;
-        };
-        let want_ty = FunctionType::from_column_type(want).map_err(map_function_error)?;
-        if stored_ty.identity_token() != want_ty.identity_token() {
-            return Ok(false);
-        }
-    }
-    let sig = crate::catalog::function::arg_signature(&def.params).map_err(map_function_error)?;
+    // 列挙・署名照合・削除を 1 つの write txn で行う（読みと削除の間に別セッションの
+    // drop／再作成が割り込んで新しい定義を誤って消さないため）。
     storage
-        .drop_function(tenant_id, &stmt.name, &sig)
+        .drop_function_matching(tenant_id, &stmt.name, |def| {
+            if def.params.len() != types.len() {
+                return Ok(false);
+            }
+            for (stored, want) in def.params.iter().zip(types) {
+                let Some(stored_ty) = &stored.ty else {
+                    continue;
+                };
+                let want_ty = FunctionType::from_column_type(want)?;
+                if stored_ty.identity_token() != want_ty.identity_token() {
+                    return Ok(false);
+                }
+            }
+            Ok(true)
+        })
         .map_err(map_function_error)
 }
 
