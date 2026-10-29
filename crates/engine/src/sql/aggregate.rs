@@ -365,26 +365,8 @@ impl ReferencedColumns {
             // 行を観測しない `DecodeTier::Fast`（visible cache 経路）を構造的に選ばせない。
             if let Some(filter) = &item.filter {
                 has_scalar_reference = true;
-                for f in &filter.metadata_filters {
-                    if let Some(slot) = scalar_mask.get_mut(f.column_index()) {
-                        *slot = true;
-                    }
-                }
-                for expr in &filter.expr_filters {
-                    if udf_call::references_embedding(expr) {
-                        needs_embedding = true;
-                    }
-                    udf_call::mark_referenced_scalar_columns(expr, &mut scalar_mask);
-                }
-                for group in &filter.or_filters {
-                    group.visit_column_indices(&mut |idx| {
-                        if let Some(slot) = scalar_mask.get_mut(idx) {
-                            *slot = true;
-                        }
-                    });
-                    if group.references_embedding() {
-                        needs_embedding = true;
-                    }
+                if filter.mark_referenced(&mut scalar_mask) {
+                    needs_embedding = true;
                 }
             }
             match &item.input {

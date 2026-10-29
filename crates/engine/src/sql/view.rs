@@ -965,6 +965,10 @@ pub(crate) fn check_window_columns_within_view(
                 expr_columns_within(columns, e)?;
             }
         }
+        // FILTER 条件の参照列も公開列に限定する（非公開列を条件経由で推測させない。Issue #1894）。
+        for p in &item.filter {
+            check_predicate_columns_within(columns, p)?;
+        }
     }
     Ok(())
 }

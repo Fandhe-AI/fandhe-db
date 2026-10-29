@@ -37,7 +37,7 @@
 | 文全体のベクトル `ORDER BY`（検索 SELECT）・`USING PLAN`・`GROUP BY`／集計 SELECT・`SELECT DISTINCT` との併用 | `42601`（構造的に相互排他） |
 | 文全体の `ORDER BY` でのウィンドウ別名参照（実在する同名列がある場合はその列として解釈） | `42601` |
 | フレーム句（`ROWS`/`RANGE`/`GROUPS`。Issue #1887・#1889・#1890・#1891） | 構文は受理する（形の誤りは `42601`）。`ROWS` は #1889、`RANGE` は #1890、`GROUPS` は #1891 で評価する（詳細は末尾「Issue #1887 追記」「Issue #1889 追記」「Issue #1890 追記」「Issue #1891 追記」） |
-| 名前付きウィンドウ（`WINDOW`/`OVER w`）・`FILTER (...)`・関数内 `DISTINCT`・複合式の引数・式の中へのウィンドウ呼び出し（`ROW_NUMBER() OVER () + 1` 等）・`*` とウィンドウ項目の混在 | `42601` |
+| 名前付きウィンドウ（`WINDOW`/`OVER w`）・関数内 `DISTINCT`・複合式の引数・式の中へのウィンドウ呼び出し（`ROW_NUMBER() OVER () + 1` 等）・`*` とウィンドウ項目の混在 | `42601` |
 | `WHERE` でのウィンドウ別名参照（実在する同名列がある場合はその列として解釈） | `42601` |
 | `CREATE VIEW` 本文への `OVER` 混入 | `42601`（`parse_view_body` が構造上受理しない） |
 
@@ -127,7 +127,7 @@
 - ウィンドウ関数の結果による文全体の `ORDER BY`（`ORDER BY rn`）。base scan への委譲方式では評価できない
 - `EXPLAIN` とウィンドウ関数の併用（`ORDER BY` の有無を問わず `42601`）
 - `GROUP BY`／集計 SELECT とウィンドウの併用
-- 名前付きウィンドウ・`FILTER (...)`・
+- 名前付きウィンドウ・
   関数内 `DISTINCT`・複合式の引数
 - 式の中へのウィンドウ呼び出しの埋め込み
 - 検索 SELECT（ベクトル `ORDER BY`・`HYBRID`・`USING PLAN`）へのウィンドウ追加
@@ -452,3 +452,26 @@ ORDER BY なし・複数キーの `RANGE UNBOUNDED PRECEDING` 等も評価され
   影響しない。(3) フレームオフセット式の評価時点は PostgreSQL 16 以降の最適化との一致を未検証。
   (4) PostgreSQL 実機での実測は未実施（期待値は定義式から導出）。
 - **対象外**: 名前付きウィンドウ（#1892）との組み合わせ、仮説集合集約形式（`WITHIN GROUP`）。
+
+## Issue #1894 追記: ウィンドウ集計の FILTER（SQL-64・RLS-10 ポインタ）
+
+- **受理範囲**: `count`／`sum`／`avg`／`min`／`max` の `<func>(<arg>) FILTER (WHERE <条件>) OVER (...)`。
+  条件の文法は WHERE・集計 SELECT の FILTER と同一で、解析本体は共有する
+  （`Parser::parse_filter_clause_body`）。`FILTER` の直後が `(` のときだけ句として扱い、列名・別名の
+  `filter` は壊さない。
+- **SQLSTATE の判定順**: FILTER 内の集計 `42803`・ウィンドウ関数 `42P20`・`$n` と `WHERE` 欠落 `42601`
+  を先に判定し、そのあとで集計でないウィンドウ関数（順位系・分布系・`lag`／`lead`・
+  `first_value`／`last_value`／`nth_value`・`ntile`）に付いた FILTER を `0A000` にする
+  （PostgreSQL が FILTER 式の変換後に関数種別を検査する順に合わせる）。
+- **評価**: materialize 段で行ごと・項目ごとに FILTER を評価し（`aggregate::item_filter_matches` を
+  集計 SELECT と共有）、偽・NULL の行はその項目の累積器へ観測させないだけにする。パーティション・
+  peer・フレーム位置・`EXCLUDE`・出力行には影響しない。空入力は `count` が 0、他は NULL。評価は
+  可視性判定・文の `WHERE` を通過した行にだけ行い、FILTER は母集合を広げない。判定結果の領域は
+  状態予算へ確保前に計上する。
+- **デコード対象・ビュー**: FILTER の参照列・embedding を `decode_tier_for_window` へ反映する
+  （`BoundAggregateFilter::mark_referenced` を集計側と共有）。ビューは FILTER の参照列も公開列に
+  限定する（`42703`）。評価後射影形ビューは参照列を `collect_referenced_idents` へ含め、
+  embedding 参照・写せない型の列は `0A000` で拒否する。
+- **対象外**: FILTER 内の部分クエリ（束縛段で `42601`。PostgreSQL は受理する差異）、名前付きウィンドウ
+  （#1892）との組み合わせ、`GROUP BY`／集計 SELECT とウィンドウの併用、`OVER` 無しで非集計関数に
+  FILTER を付けた場合の SQLSTATE の差異。PostgreSQL 実機での照合は未実施（期待値は意味論から導出）。
