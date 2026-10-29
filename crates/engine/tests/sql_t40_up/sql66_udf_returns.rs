@@ -321,3 +321,18 @@ fn returns_udf_respects_session_boundary() {
         "42883"
     );
 }
+
+#[test]
+fn declared_return_type_propagates_to_explicit_cast() {
+    let (core, _g) = new_core("sql66r-cast");
+    let mut s = SessionState::default();
+    define(&core, &mut s, "CREATE FUNCTION f() RETURNS integer AS 1");
+    assert_eq!(
+        first_cell(&core, &mut s, "SELECT f()::text FROM docs LIMIT 1"),
+        Cell::Text("1".to_string())
+    );
+    assert_eq!(
+        first_cell(&core, &mut s, "SELECT f()::bigint FROM docs LIMIT 1"),
+        Cell::SignedInteger(1)
+    );
+}

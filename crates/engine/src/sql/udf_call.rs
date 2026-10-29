@@ -3342,6 +3342,12 @@ pub(super) struct BindEnv<'a> {
 }
 
 impl BindEnv<'_> {
+    /// 名前 `name` の UDF が RETURNS 句で宣言した戻り値型（`sql::cast` が `f()::型` の
+    /// 変換元の種別に使う。Issue #1916）。登録が無い・RETURNS 句なしは `None`。
+    pub(super) fn udf_return_type(&self, name: &str) -> Option<crate::sql::cast::CastType> {
+        self.registry.get(name).and_then(|d| d.return_type.clone())
+    }
+
     /// 列参照の解決元スキーマ（UDF 本体の展開中は `None`）。`sql::cast` が変換元の静的な型を
     /// 列参照から導くために使う。
     pub(super) fn schema(&self) -> Option<&TableSchema> {
