@@ -2483,6 +2483,7 @@ fn evaluate_partition(
         )?),
     };
 
+    let part_len = part.len();
     for (dense_rank, group) in part.peer_groups().enumerate() {
         let (idx, peer_end) = group?;
         // 順位関数の `rank` は peer グループ先頭の 0 始まり位置（= 先行行数）。
@@ -2506,7 +2507,11 @@ fn evaluate_partition(
         // レビュー指摘対応。PR #930 最終レビュー指摘 3）。順位関数
         // （`RowNumber`/`Rank`/`DenseRank`）は行ごとに値が変わるため対象外。
         let aggregate_cell: Option<Cell> = match item.func {
-            WindowFunc::RowNumber | WindowFunc::Rank | WindowFunc::DenseRank => None,
+            WindowFunc::RowNumber
+            | WindowFunc::Rank
+            | WindowFunc::DenseRank
+            | WindowFunc::PercentRank
+            | WindowFunc::CumeDist => None,
             // `LAG`／`LEAD` は上で専用の評価へ委譲済みのため到達しない（不変条件違反は fail-closed）。
             WindowFunc::Lag
             | WindowFunc::Lead
@@ -2536,6 +2541,9 @@ fn evaluate_partition(
                 WindowFunc::RowNumber => Cell::Integer(row_number as u64),
                 WindowFunc::Rank => Cell::Integer((rank + 1) as u64),
                 WindowFunc::DenseRank => Cell::Integer((dense_rank + 1) as u64),
+                // 分布関数は peer グループ内で一定（SQL-64・Issue #1885）。
+                WindowFunc::PercentRank => Cell::Float(percent_rank_value(rank, part_len)),
+                WindowFunc::CumeDist => Cell::Float(cume_dist_value(peer_end, part_len)),
                 WindowFunc::Lag
                 | WindowFunc::Lead
                 | WindowFunc::FirstValue
@@ -2569,6 +2577,24 @@ fn evaluate_partition(
     }
 
     Ok(())
+}
+
+/// `percent_rank` の値（`(rank - 1) / (n - 1)`。`n == 1` は 0）。PostgreSQL の
+/// `window_percent_rank` と同じく整数を先に `f64` へ変換してから除算する（SQL-64・Issue #1885）。
+fn percent_rank_value(idx: usize, n: usize) -> f64 {
+    if n > 1 {
+        idx as f64 / (n - 1) as f64
+    } else {
+        0.0
+    }
+}
+
+/// `cume_dist` の値（`peer グループ末尾までの行数 / n`。SQL-64・Issue #1885）。
+fn cume_dist_value(peer_end: usize, n: usize) -> f64 {
+    if n == 0 {
+        return 0.0;
+    }
+    peer_end as f64 / n as f64
 }
 
 /// 集計の `ROWS` フレーム評価（SQL-64 (2)・Issue #1889。[`evaluate_partition`] から呼ばれる）。
@@ -3430,6 +3456,8 @@ pub(crate) fn window_result_type(item: &BoundWindowItem) -> Option<ColumnType> {
         }
         // `ntile` は PostgreSQL と同じ `integer`（SQL-64 (4)・Issue #1884）。
         WindowFunc::Ntile => return Some(ColumnType::Integer),
+        // `percent_rank`／`cume_dist` は PostgreSQL と同じ `double precision`（SQL-64・Issue #1885）。
+        WindowFunc::PercentRank | WindowFunc::CumeDist => return Some(ColumnType::Double),
         WindowFunc::Sum => AggregateFunc::Sum,
         WindowFunc::Avg => AggregateFunc::Avg,
         WindowFunc::Min => AggregateFunc::Min,
@@ -3456,7 +3484,11 @@ fn window_func_to_aggregate_func(
         WindowFunc::Avg => Ok(AggregateFunc::Avg),
         WindowFunc::Min => Ok(AggregateFunc::Min),
         WindowFunc::Max => Ok(AggregateFunc::Max),
-        WindowFunc::RowNumber | WindowFunc::Rank | WindowFunc::DenseRank => Err(window_bug(
+        WindowFunc::RowNumber
+        | WindowFunc::Rank
+        | WindowFunc::DenseRank
+        | WindowFunc::PercentRank
+        | WindowFunc::CumeDist => Err(window_bug(
             "ranking window function unexpectedly requires an accumulator",
         )),
         WindowFunc::Lag
@@ -3920,6 +3952,21 @@ mod budget_regression_tests {
     }
 
     /// 順位関数と `COUNT` は `BigInt`、集計系は集計 SELECT と同じ規則（Issue #1344）。
+    /// SQL-64・Issue #1885: 分布関数の値と float8 テキスト表現。
+    #[test]
+    fn distribution_values_and_text() {
+        let pr = |i, n| crate::scalar_float::format_double(percent_rank_value(i, n));
+        let cd = |e, n| crate::scalar_float::format_double(cume_dist_value(e, n));
+        assert_eq!(pr(0, 1), "0");
+        assert_eq!(pr(1, 5), "0.25");
+        assert_eq!(pr(4, 5), "1");
+        assert_eq!(pr(1, 3), "0.5");
+        assert_eq!(cd(1, 3), "0.3333333333333333");
+        assert_eq!(cd(2, 3), "0.6666666666666666");
+        assert_eq!(cd(3, 5), "0.6");
+        assert_eq!(cd(5, 5), "1");
+    }
+
     #[test]
     fn window_result_type_maps_ranking_count_and_aggregates() {
         for f in [
@@ -3928,6 +3975,9 @@ mod budget_regression_tests {
             WindowFunc::DenseRank,
         ] {
             assert_eq!(window_result_type(&item(f, None)), Some(ColumnType::BigInt));
+        }
+        for f in [WindowFunc::PercentRank, WindowFunc::CumeDist] {
+            assert_eq!(window_result_type(&item(f, None)), Some(ColumnType::Double));
         }
         assert_eq!(
             window_result_type(&item(WindowFunc::Count, Some(AggregateInput::AllVisible))),

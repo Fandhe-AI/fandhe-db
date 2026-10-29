@@ -3914,6 +3914,10 @@ pub(crate) enum WindowFunc {
     NthValue,
     /// 分位割り当て関数（`ntile(num_buckets)`。SQL-64 (4)・Issue #1884）。フレームは無視する。
     Ntile,
+    /// 分布関数（`percent_rank()`／`cume_dist()`。SQL-64・Issue #1885）。引数を取らず、
+    /// peer 判定は `rank` と共通。結果型は `double precision`。
+    PercentRank,
+    CumeDist,
 }
 
 impl WindowFunc {
@@ -3936,16 +3940,22 @@ impl WindowFunc {
             "LAST_VALUE" => Some(WindowFunc::LastValue),
             "NTH_VALUE" => Some(WindowFunc::NthValue),
             "NTILE" => Some(WindowFunc::Ntile),
+            "PERCENT_RANK" => Some(WindowFunc::PercentRank),
+            "CUME_DIST" => Some(WindowFunc::CumeDist),
             _ => None,
         }
     }
 
-    /// 順位関数（引数を取らない。[`Parser::parse_window_item`] が引数の有無を
+    /// 順位・分布関数（引数を取らない。[`Parser::parse_window_item`] が引数の有無を
     /// この判定で分岐する）。
     pub(crate) fn is_ranking(self) -> bool {
         matches!(
             self,
-            WindowFunc::RowNumber | WindowFunc::Rank | WindowFunc::DenseRank
+            WindowFunc::RowNumber
+                | WindowFunc::Rank
+                | WindowFunc::DenseRank
+                | WindowFunc::PercentRank
+                | WindowFunc::CumeDist
         )
     }
 
@@ -3997,6 +4007,8 @@ impl WindowFunc {
             WindowFunc::LastValue => "last_value",
             WindowFunc::NthValue => "nth_value",
             WindowFunc::Ntile => "ntile",
+            WindowFunc::PercentRank => "percent_rank",
+            WindowFunc::CumeDist => "cume_dist",
             WindowFunc::RowNumber => "row_number",
             WindowFunc::Rank => "rank",
             WindowFunc::DenseRank => "dense_rank",

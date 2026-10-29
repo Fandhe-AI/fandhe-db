@@ -29,7 +29,7 @@
 
 | 形 | 扱い |
 | -- | ---- |
-| `ROW_NUMBER()`・`RANK()`・`DENSE_RANK()`（引数なし） | 受理 |
+| `ROW_NUMBER()`・`RANK()`・`DENSE_RANK()`・`PERCENT_RANK()`・`CUME_DIST()`（引数なし） | 受理 |
 | `COUNT(*)`・`COUNT(<列>)`・`SUM`/`AVG`/`MIN`/`MAX(<列>)`（引数は裸の列名・`id`・`*`〔`COUNT` のみ〕に限定） | 受理 |
 | `OVER ( [PARTITION BY <列>[, ...]] [ORDER BY <列> [ASC\|DESC][, ...]] )`（空 `OVER ()` も可） | 受理（列数は各 8 個まで） |
 | ウィンドウ項目と通常列の混在（位置を保持） | 受理 |
@@ -432,3 +432,23 @@ ORDER BY なし・複数キーの `RANGE UNBOUNDED PRECEDING` 等も評価され
   (3) `$n` は `42601`（`LAG`／`LEAD` と同じ）。(4) 同順位行の並びは `ORDER BY`→`id`→`seq` で決まる
   （PostgreSQL では不定）。PostgreSQL への実測は未実施で、期待値は状態機械から導いた。
 - **対象外**: `percent_rank`／`cume_dist`（#1885）、名前付きウィンドウ（#1892）。
+
+## Issue #1885 追記: percent_rank／cume_dist（SQL-64・RLS-10 ポインタ）
+
+- **意味論**: パーティション行数を n、peer グループ先頭の 0 始まり位置を idx、peer グループ末尾の
+  次の位置を peer_end として `percent_rank = idx / (n - 1)`（n = 1 は 0）、
+  `cume_dist = peer_end / n`。整数を先に `f64` へ変換してから除算する（PostgreSQL の
+  `window_percent_rank`／`window_cume_dist` と同じ演算順）。peer 判定は `rank` と共通
+  （`SortedPartition::peer_groups`）。`ORDER BY` なしは全行 peer（0 と 1）。
+- **結果型**: `double precision`（`ColumnType::Double`・wire OID 701）。テキスト表現は
+  `scalar_float::format_double` 経由で PostgreSQL の float8 出力と一致（例: `0.3333333333333333`）。
+- **引数**: 取らない。引数・`DISTINCT`・`*` は `rank` と同じく `42601`。
+- **フレーム**: 順位関数と同じく評価に使わない（`ignores_frame`）。フレームのオフセット式の
+  評価は `rank`／`dense_rank` と同じ扱いで、`ntile` のようにスキップしない。
+- **RLS**: 母集合は materialize 段を通った行のみ。他テナントの Private 行・不可視行・`WHERE` で
+  除いた行は分母にも分子にも入らない。
+- **既知の差異**: (1) 引数付き呼び出しの SQLSTATE は PostgreSQL（仮説集合集約との関係で別エラー）と
+  異なりうる。(2) 同順位行の並びは `ORDER BY`→`id`→`seq` で決まるが、値は peer 内で同一のため結果に
+  影響しない。(3) フレームオフセット式の評価時点は PostgreSQL 16 以降の最適化との一致を未検証。
+  (4) PostgreSQL 実機での実測は未実施（期待値は定義式から導出）。
+- **対象外**: 名前付きウィンドウ（#1892）との組み合わせ、仮説集合集約形式（`WITHIN GROUP`）。
