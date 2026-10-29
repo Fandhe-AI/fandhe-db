@@ -14,6 +14,7 @@ use crate::catalog::{ColumnDef, ColumnType, DropBehavior, MAX_COLUMN_COUNT};
 use crate::datetime::DateTimeLiteralError;
 use crate::error_format::{ClassifiedError, ErrorClass};
 use crate::recovery::required_op_id::LedgerMode;
+use crate::sql::cast::CastType;
 use crate::sql::copy_options;
 use crate::sql::ddl_column_type::StaticColumnType;
 use crate::sql::grouping_sets::{
@@ -2957,9 +2958,14 @@ pub enum Statement {
     /// 等の意味論的妥当性検証は `sql::udf_call::define_function`（呼び出し元
     /// `core.rs::EngineCore::execute_sql_in_session`）が行う（本モジュールは構造の
     /// 受理までを担う）。
+    ///
+    /// **Issue #1915（SQL-66 (1)・TASK-309）で追加した破壊的変更（BREAKING CHANGE）**:
+    /// `param_types` フィールドを追加した（`<名前> <型>` の型注釈。`params` と同じ長さで、
+    /// 型なしの従来形は全要素 `None`。型付きと型なしの混在は構文段で拒否済み）。
     CreateFunction {
         name: String,
         params: Vec<String>,
+        param_types: Vec<Option<CastType>>,
         body: Expr,
     },
     /// 集計関数のみを結果列とする `GROUP BY` なし・単一行結果の `SELECT`
@@ -22734,30 +22740,117 @@ fn parse_set_search_mode(tokens: &[Token]) -> Result<String, SqlSurfaceError> {
 /// `sql::udf_call::define_function` が担うが、アロケーション前の上限検証は
 /// `.claude/rules/security.md`「長さフィールドは上限検証してからアロケーションに
 /// 使う」に従い構造検証段階でも行う）。
-fn parse_create_function(tokens: &[Token]) -> Result<(String, Vec<String>, Expr), SqlSurfaceError> {
+fn parse_create_function(tokens: &[Token]) -> Result<ParsedCreateFunction, SqlSurfaceError> {
     let mut p = Parser::new(tokens);
     p.expect_ident_matching("CREATE")?;
     p.expect_ident_matching("FUNCTION")?;
     let name = p.expect_ident()?;
     p.expect_punct('(')?;
     let mut params = Vec::new();
+    let mut param_types: Vec<Option<CastType>> = Vec::new();
     if !matches!(p.peek(), Some(Token::Punct(')'))) {
-        params.push(p.expect_ident()?);
-        while matches!(p.peek(), Some(Token::Punct(','))) {
-            p.advance();
+        loop {
             if params.len() >= MAX_UDF_PARAMS {
                 return Err(SqlSurfaceError::payload_too_large(
                     "too many function parameters",
                 ));
             }
-            params.push(p.expect_ident()?);
+            let (pname, pty) = p.parse_create_function_param()?;
+            params.push(pname);
+            param_types.push(pty);
+            if matches!(p.peek(), Some(Token::Punct(','))) {
+                p.advance();
+            } else {
+                break;
+            }
         }
     }
     p.expect_punct(')')?;
+    // 型付きと型なしの混在は曖昧なため拒否する（SQL-66 (1)。定義単位で全部か無しか）。
+    if param_types.iter().any(Option::is_some) && param_types.iter().any(Option::is_none) {
+        return Err(SqlSurfaceError::unsupported(
+            "function parameters must be either all typed or all untyped",
+        ));
+    }
     p.expect_ident_matching("AS")?;
     let body = p.parse_value_expr(0)?;
     p.expect_end_of_statement()?;
-    Ok((name, params, body))
+    Ok((name, params, param_types, body))
+}
+
+/// [`parse_create_function`] の戻り値（名前・パラメータ名・パラメータ型注釈・本体式）。
+type ParsedCreateFunction = (String, Vec<String>, Vec<Option<CastType>>, Expr);
+
+/// 関数シグネチャに載せる型の正規化（SQL-66 (1)・Issue #1915）。PostgreSQL は関数の引数型の
+/// 型修飾子を捨てるため `varchar(n)`・`numeric(p,s)` は修飾子なしに揃える。`char(n)` は
+/// 修飾子なしの表現が無く、保持すると呼び出し時に空白埋め・切り詰めが起きて PostgreSQL と
+/// 食い違うため `0A000`（fail-closed）。
+fn normalize_udf_param_type(ty: CastType) -> Result<CastType, SqlSurfaceError> {
+    Ok(match ty {
+        CastType::Varchar(_) => CastType::Varchar(None),
+        CastType::Numeric(_) => CastType::Numeric(None),
+        CastType::Bpchar(_) => {
+            return Err(SqlSurfaceError::feature_not_supported(
+                "function parameter of type character(n) is not supported",
+            ))
+        }
+        CastType::Array(elem) => CastType::Array(Box::new(normalize_udf_param_type(*elem)?)),
+        other => other,
+    })
+}
+
+impl Parser<'_> {
+    /// `CREATE FUNCTION` の引数 1 個（`<名前>` または `<名前> <型>`）を読む
+    /// （[`parse_create_function`] から呼ばれる。SQL-66 (1)・TASK-309・Issue #1915）。
+    /// 引数モード・`DEFAULT`・`=`・`%TYPE` は未対応のため `0A000`。型名は CAST と DDL が
+    /// 共有する `cast::parse_cast_type` で読み、カタログは参照しない（未知の型・ENUM 候補は
+    /// `42704`。他テナントの型の存在オラクルにならない）。
+    fn parse_create_function_param(
+        &mut self,
+    ) -> Result<(String, Option<CastType>), SqlSurfaceError> {
+        let name = self.expect_ident()?;
+        if matches!(self.peek(), Some(Token::Punct(',' | ')')) | None) {
+            return Ok((name, None));
+        }
+        let is_mode = ["IN", "OUT", "INOUT", "VARIADIC"]
+            .iter()
+            .any(|m| name.eq_ignore_ascii_case(m));
+        if is_mode && matches!(self.peek(), Some(Token::Ident(_))) {
+            return Err(SqlSurfaceError::feature_not_supported(
+                "function argument modes are not supported",
+            ));
+        }
+        // `%TYPE`（修飾名 `docs.n%TYPE` を含む）は型名解決より先に検出し、カタログも型表も
+        // 参照せず `0A000` で拒否する（未知の型名として `42704` になるのを避ける）。
+        // 型名は括弧内の `,` を含みうるため、括弧の深さ 0 の `,`・`)` までを走査する。
+        let mut depth = 0usize;
+        for tok in self.tokens.iter().skip(self.pos) {
+            match tok {
+                Token::Punct('(') => depth += 1,
+                Token::Punct(')') if depth == 0 => break,
+                Token::Punct(')') => depth -= 1,
+                Token::Punct(',') if depth == 0 => break,
+                Token::Punct('%') => {
+                    return Err(SqlSurfaceError::feature_not_supported(
+                        "function parameter defaults and %TYPE are not supported",
+                    ));
+                }
+                _ => {}
+            }
+        }
+        let ty = normalize_udf_param_type(self.parse_cast_target_type()?)?;
+        let tail_unsupported = match self.peek() {
+            Some(Token::Punct('=' | '%')) => true,
+            Some(Token::Ident(w)) => w.eq_ignore_ascii_case("DEFAULT"),
+            _ => false,
+        };
+        if tail_unsupported {
+            return Err(SqlSurfaceError::feature_not_supported(
+                "function parameter defaults and %TYPE are not supported",
+            ));
+        }
+        Ok((name, Some(ty)))
+    }
 }
 
 /// SQL 文をトークン化し、許可リスト形式で構造検証する（TASK-161 の公開 API。
@@ -25164,8 +25257,13 @@ fn validate_sql_tokens_impl(
             Ok(Statement::SetSearchMode { value })
         }
         _ if is_create_function_statement => {
-            let (name, params, body) = parse_create_function(tokens)?;
-            Ok(Statement::CreateFunction { name, params, body })
+            let (name, params, param_types, body) = parse_create_function(tokens)?;
+            Ok(Statement::CreateFunction {
+                name,
+                params,
+                param_types,
+                body,
+            })
         }
         // Issue #922（SQL-27）: `EXPLAIN` の対象を通常検索・集計・広域取得へ
         // 拡大した。先頭の `EXPLAIN` トークンを消費した残りを、非 EXPLAIN の

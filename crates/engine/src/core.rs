@@ -8847,8 +8847,19 @@ impl EngineCore {
             // `sql::udf_call::define_function` に委譲する（検証→登録の順を守り、
             // 失敗時は `session.udfs()` を一切変更しない。`SET search_mode` と同じ
             // 「部分更新＝黙った既定化を防ぐ」方針）。
-            crate::sql::allowlist::Statement::CreateFunction { name, params, body } => {
-                crate::sql::udf_call::define_function(session.udfs_mut(), &name, &params, &body)?;
+            crate::sql::allowlist::Statement::CreateFunction {
+                name,
+                params,
+                param_types,
+                body,
+            } => {
+                crate::sql::udf_call::define_function_with_types(
+                    session.udfs_mut(),
+                    &name,
+                    &params,
+                    &param_types,
+                    &body,
+                )?;
                 Ok(crate::sql::SqlOutcome::CreateFunction { name })
             }
             crate::sql::allowlist::Statement::Select(validated) => {

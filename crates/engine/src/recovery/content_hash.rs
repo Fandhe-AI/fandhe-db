@@ -109,6 +109,10 @@ impl ContentHash {
 // プロジェクト名変更（vector-db → fandhe-db）後も値を固定する。永続化済みデータの整合性検証に使う識別子でありブランド名ではないため、変更すると既存 redb の recovery が不整合判定される。
 const DOMAIN_TAG: &[u8] = b"vector-db/op_ledger/content_hash/v1";
 
+/// 型注釈つき UDF 定義の件数フィールドに立てる識別ビット（SQL-66 (1)・Issue #1915）。
+/// 型なし定義の件数は `MAX_UDF_PARAMS` 以下で最上位ビットは立たない。
+const UDF_TYPED_PARAMS_FLAG: u32 = 0x8000_0000;
+
 /// 操作種別タグ（1 バイト）。同一フィールド列でも操作種別が異なれば必ず異なる
 /// ハッシュになるよう、[`HashInputBuilder::new`] が先頭に埋め込む。
 #[repr(u8)]
@@ -2228,15 +2232,36 @@ fn push_dml_where_predicates(
                 .map_err(|_| dml_hash_field_too_large())?;
             let param_count =
                 u32::try_from(def.params.len()).map_err(|_| dml_hash_field_too_large())?;
-            b.push_raw(&param_count.to_le_bytes());
+            // 型注釈つき定義（SQL-66 (1)・Issue #1915）は件数の最上位ビットを立てて型なし
+            // 定義と区別する（`MAX_UDF_PARAMS` が 32 のため型なし定義の件数でこのビットは
+            // 立たず、型なし定義の直列化は従来とビット同一）。同一 `operation_id` の再送で
+            // 型注釈だけが違う定義を同一内容と誤判定しないため（RECOVER-10）。
+            let typed = def.param_types.iter().any(Option::is_some);
+            let count_field = if typed {
+                param_count | UDF_TYPED_PARAMS_FLAG
+            } else {
+                param_count
+            };
+            b.push_raw(&count_field.to_le_bytes());
             // パラメータ名は小文字化してから連結する（`push_dml_expr` の `Ident`
             // 側パラメータ参照・`bind_expr_in` の呼び出し引数解決と同じ大文字小文字
             // 非区別契約に揃える。ここを原文のまま連結すると `x`／`X` のように
             // 意味的に同一なパラメータ宣言が異なる content_hash を生み、同一
             // `operation_id` の正当な再送を内容不一致〔`22023`〕として誤拒否する）。
-            for p in &def.params {
+            for (i, p) in def.params.iter().enumerate() {
                 b.push_bytes(p.to_ascii_lowercase().as_bytes())
                     .map_err(|_| dml_hash_field_too_large())?;
+                if typed {
+                    // 型は固定語彙の正規綴り（`CastType::to_sql`）だけを連結する。型なしは空。
+                    let ty = def
+                        .param_types
+                        .get(i)
+                        .and_then(Option::as_ref)
+                        .map(crate::sql::cast::CastType::to_sql)
+                        .unwrap_or_default();
+                    b.push_bytes(ty.as_bytes())
+                        .map_err(|_| dml_hash_field_too_large())?;
+                }
             }
             push_dml_expr(b, &def.body, Some(&def.params))?;
         }
@@ -5812,6 +5837,7 @@ mod tests {
             "raw_fn",
             UdfDefinition {
                 params: vec!["x".to_string()],
+                param_types: vec![None],
                 body: Expr::Ident("x".to_string()),
             },
         );
@@ -5822,6 +5848,7 @@ mod tests {
             "raw_fn",
             UdfDefinition {
                 params: vec!["X".to_string()],
+                param_types: vec![None],
                 body: Expr::Ident("X".to_string()),
             },
         );
@@ -5839,6 +5866,42 @@ mod tests {
             "definition-section serialization itself must fold parameter name case, \
              independent of any upstream normalization by define_function"
         );
+    }
+
+    /// SQL-66 (1)・Issue #1915: 型注釈つき定義は型なし定義・別の型の定義と異なるハッシュになる
+    /// （同一 `operation_id` の再送で型注釈だけが違う定義を同一内容と誤判定しない。RECOVER-10）。
+    /// 同じ型注釈なら安定して一致する。
+    #[test]
+    fn for_delete_where_udf_definition_hash_distinguishes_param_types() {
+        use crate::sql::cast::CastType;
+        use crate::sql::udf_call::{
+            insert_raw_definition_for_test, Expr, UdfDefinition, UdfRegistry,
+        };
+
+        let hash_with = |ty: Option<CastType>| {
+            let mut reg = UdfRegistry::default();
+            insert_raw_definition_for_test(
+                &mut reg,
+                "raw_fn",
+                UdfDefinition {
+                    params: vec!["x".to_string()],
+                    param_types: vec![ty],
+                    body: Expr::Ident("x".to_string()),
+                },
+            );
+            let predicate = where_predicate_id_gt_zero(Expr::Call {
+                name: "raw_fn".to_string(),
+                args: vec![Expr::Ident("id".to_string())],
+            });
+            for_delete_where("t", &[predicate], &reg).expect("hash")
+        };
+
+        let untyped = hash_with(None);
+        let int4 = hash_with(Some(CastType::Int4));
+        let int8 = hash_with(Some(CastType::Int8));
+        assert_ne!(untyped, int4);
+        assert_ne!(int4, int8);
+        assert_eq!(int4, hash_with(Some(CastType::Int4)));
     }
 
     /// 同じ形（`outer` が `inner` を呼ぶ）でも `inner` の本体演算子が異なれば

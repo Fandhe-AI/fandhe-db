@@ -2395,6 +2395,12 @@ fn is_reserved_function_name(name: &str) -> bool {
 #[derive(Debug, Clone, PartialEq)]
 pub struct UdfDefinition {
     pub params: Vec<String>,
+    /// パラメータごとの型注釈（SQL-66 (1)・TASK-309・Issue #1915）。`params` と同じ長さで、
+    /// `None` は型なし宣言（SQL-9 の従来形。呼び出し時に型検査・変換をしない）。型修飾子は
+    /// 関数シグネチャでは意味を持たないため構文段で正規化済み（`varchar(n)` → `varchar` 等）。
+    ///
+    /// **Issue #1915 で追加した破壊的変更（BREAKING CHANGE）**: pub フィールド追加。
+    pub param_types: Vec<Option<crate::sql::cast::CastType>>,
     pub body: Expr,
 }
 
@@ -2474,6 +2480,37 @@ pub fn define_function(
     params: &[String],
     body: &Expr,
 ) -> Result<(), SqlSurfaceError> {
+    let untyped = vec![None; params.len()];
+    define_function_with_types(registry, name, params, &untyped, body)
+}
+
+/// [`define_function`] の型注釈つき版（SQL-66 (1)・TASK-309・Issue #1915）。
+/// `core.rs::EngineCore::execute_sql_in_session` の `CreateFunction` 分岐が呼ぶ。
+/// `param_types` は `params` と同じ長さでなければならず（不一致は `42601`）、型を持つ
+/// パラメータは式の型を持つ型（[`crate::sql::cast::CastType::expr_type`] が `Some`）に
+/// 限る（対応する要素型の無い配列は定義時に `0A000`。呼び出しまで遅らせない）。
+/// 本体の型検査は行わない（RETURNS と併せて別 Issue の担当）。検証→登録の順は
+/// [`define_function`] と同じで、失敗時は `registry` を変更しない。
+pub fn define_function_with_types(
+    registry: &mut UdfRegistry,
+    name: &str,
+    params: &[String],
+    param_types: &[Option<crate::sql::cast::CastType>],
+    body: &Expr,
+) -> Result<(), SqlSurfaceError> {
+    if param_types.len() != params.len() {
+        return Err(SqlSurfaceError::unsupported(
+            "function parameter type list does not match the parameter list",
+        ));
+    }
+    for ty in param_types.iter().flatten() {
+        if ty.expr_type().is_none() {
+            return Err(SqlSurfaceError::feature_not_supported(format!(
+                "function parameter of type {} is not supported",
+                ty.pg_label()
+            )));
+        }
+    }
     // 関数名は relation キー（裸の名前、または SCHEMA 配下の内部キー `#<id>.<name>`。
     // 名前解決器が `CREATE FUNCTION s.f(` を解決した出力。TABLE-27・Issue #1717）を受理する。
     catalog::validate_relation_key(name)
@@ -2532,10 +2569,98 @@ pub fn define_function(
         lower,
         UdfDefinition {
             params: normalized_params,
+            param_types: param_types.to_vec(),
             body: body.clone(),
         },
     );
     Ok(())
+}
+
+/// 型注釈つき宣言的 UDF のパラメータへ渡す実引数 1 つを束縛し、宣言型へ変換する
+/// （`bind_call` の宣言的 UDF 分岐から呼ばれる。SQL-66 (1)・TASK-309・Issue #1915）。
+///
+/// PostgreSQL の関数解決と同じく、型の決まった実引数は暗黙変換（規則表の `=`・`i`）だけで
+/// 受理し、それ以外は `42883`。型なしリテラル（文字列・NULL）は宣言型の入力関数で解釈する
+/// （形式不正は `22P02` 等）。静的に種別を決められない数値・vector は `cast_bound` の既存の
+/// 判定に任せて `0A000`（fail-closed）。エラー文言は静的な型名だけを使う。
+fn bind_typed_udf_arg(
+    name: &str,
+    arg: &Expr,
+    declared: &crate::sql::cast::CastType,
+    env: &mut BindEnv<'_>,
+    node_budget: &mut usize,
+) -> Result<(BoundExpr, ExprType), SqlSurfaceError> {
+    use crate::sql::cast::{self, CastRule, SourceKind};
+    let mismatch = |from: &str| {
+        SqlSurfaceError::undefined_function(format!(
+            "function {name} argument of type {from} cannot be implicitly converted to {}",
+            declared.pg_label()
+        ))
+    };
+    let implicit_ok = |rule: CastRule| matches!(rule, CastRule::Identity | CastRule::Implicit);
+    // 型どうしの暗黙変換可否。配列どうしは `Element`（要素型の規則に従う）を返すため要素の組で見る。
+    let types_implicit = |from: &cast::CastType, to: &cast::CastType| match (from, to) {
+        (cast::CastType::Array(a), cast::CastType::Array(b)) => {
+            implicit_ok(cast::cast_rule_types(a, b))
+        }
+        _ => implicit_ok(cast::cast_rule_types(from, to)),
+    };
+    match arg {
+        Expr::String(_) | Expr::Null => cast::bind_cast(arg, declared, env, node_budget),
+        Expr::Number(raw) => {
+            let from = cast::number_literal_kind(raw);
+            if !implicit_ok(cast::cast_rule(from, declared.kind())) {
+                return Err(mismatch(from.label()));
+            }
+            cast::bind_cast(arg, declared, env, node_budget)
+        }
+        _ => {
+            // 裸の識別子は BOOLEAN 列など `bind_expr_in` が拒否する列も葉として束縛できる
+            // `bind_operand`（CAST の被演算子と同じ規則）で読み、暗黙変換の判定へ進める。
+            let (bound, ty) = if matches!(arg, Expr::Ident(_)) {
+                cast::bind_operand(arg, env, node_budget)?
+            } else {
+                bind_expr_in(arg, env, node_budget)?
+            };
+            // 型注釈つきパラメータ参照は宣言型が分かっている（束縛済み式からは数値種別を復元できない）。
+            // 宣言型が同一ならそのまま渡し、異なるときは暗黙変換の可否だけ宣言型で判定して
+            // 変換自体は `cast_bound` に任せる（種別不明の数値は `0A000` のまま fail-closed）。
+            if let Expr::Ident(pn) = arg {
+                if let Some(src) = env.param_decl.get(pn.to_ascii_lowercase().as_str()) {
+                    if src == declared {
+                        return Ok((bound, ty));
+                    }
+                    if !types_implicit(src, declared) {
+                        return Err(mismatch(&src.pg_label()));
+                    }
+                    // 宣言型は既知なので、束縛済み定数から再推論せず宣言型を変換元として渡す。
+                    let known = match src {
+                        cast::CastType::Array(elem) => {
+                            SourceKind::Array(Some(elem.as_ref().clone()))
+                        }
+                        other => SourceKind::Known(other.kind()),
+                    };
+                    return cast::cast_bound_from(known, arg, bound, ty, declared, node_budget);
+                }
+            }
+            match cast::source_cast_kind(arg, &bound, ty, env.schema()) {
+                SourceKind::Known(k) => {
+                    if !implicit_ok(cast::cast_rule(k, declared.kind())) {
+                        return Err(mismatch(k.label()));
+                    }
+                }
+                SourceKind::Array(Some(elem)) => {
+                    let from = cast::CastType::Array(Box::new(elem));
+                    if !types_implicit(&from, declared) {
+                        return Err(mismatch(&from.pg_label()));
+                    }
+                }
+                // 種別を決められない数値・要素型不明の配列・vector は `cast_bound` が判定する。
+                SourceKind::Array(None) | SourceKind::UnknownNumeric | SourceKind::Outside => {}
+            }
+            cast::cast_bound(arg, bound, ty, declared, env, node_budget)
+        }
+    }
 }
 
 /// テスト専用: `define_function` のパラメータ名正規化（小文字化）を経由せず、
@@ -2827,6 +2952,10 @@ fn validate_closed_expr(
 pub(super) struct BindEnv<'a> {
     schema: Option<&'a TableSchema>,
     params: std::collections::HashMap<String, (BoundExpr, ExprType)>,
+    /// 型注釈つき UDF の本体展開中に限り、パラメータ名（小文字）→ 宣言型。入れ子の UDF 呼び出しで
+    /// パラメータ参照を実引数にしたとき、束縛済み式からは決められない数値種別を復元する
+    /// （[`bind_typed_udf_arg`]・Issue #1915）。型なしパラメータは載らない。
+    param_decl: std::collections::HashMap<String, crate::sql::cast::CastType>,
     registry: &'a UdfRegistry,
     /// `CASE`／`COALESCE`／`NULLIF` の現在の入れ子段数（対象ビヘイビア: SQL-26。
     /// Issue #921）。構文段（`sql::allowlist::Parser`）のネストカウンタとは別に
@@ -3600,6 +3729,7 @@ pub fn bind_expr(
     let mut env = BindEnv {
         schema: Some(schema),
         params: std::collections::HashMap::new(),
+        param_decl: std::collections::HashMap::new(),
         registry,
         case_nesting: 0,
         typed_arith: false,
@@ -3622,6 +3752,7 @@ pub(crate) fn bind_array_agg_element(
     let mut env = BindEnv {
         schema: Some(schema),
         params: std::collections::HashMap::new(),
+        param_decl: std::collections::HashMap::new(),
         registry,
         case_nesting: 0,
         typed_arith: false,
@@ -3726,6 +3857,7 @@ fn bind_projection_expr_inner(
     let mut env = BindEnv {
         schema: Some(schema),
         params: std::collections::HashMap::new(),
+        param_decl: std::collections::HashMap::new(),
         registry,
         case_nesting: 0,
         typed_arith: true,
@@ -3792,6 +3924,7 @@ pub(crate) fn bind_array_assignment_source(
     let mut env = BindEnv {
         schema: Some(schema),
         params: std::collections::HashMap::new(),
+        param_decl: std::collections::HashMap::new(),
         registry,
         case_nesting: 0,
         typed_arith: true,
@@ -3845,6 +3978,7 @@ pub(crate) fn bind_order_expr(
     let mut env = BindEnv {
         schema: Some(schema),
         params: std::collections::HashMap::new(),
+        param_decl: std::collections::HashMap::new(),
         registry,
         case_nesting: 0,
         typed_arith: false,
@@ -3974,6 +4108,7 @@ pub(crate) fn bind_const_projection_expr(
     let mut env = BindEnv {
         schema: None,
         params: std::collections::HashMap::new(),
+        param_decl: std::collections::HashMap::new(),
         registry,
         case_nesting: 0,
         typed_arith: true,
@@ -4049,6 +4184,7 @@ pub(crate) fn bind_const_expr(
     let mut env = BindEnv {
         schema: None,
         params: std::collections::HashMap::new(),
+        param_decl: std::collections::HashMap::new(),
         registry,
         case_nesting: 0,
         typed_arith: true,
@@ -4073,6 +4209,7 @@ pub(crate) fn bind_const_expr_array_top(
     let mut env = BindEnv {
         schema: None,
         params: std::collections::HashMap::new(),
+        param_decl: std::collections::HashMap::new(),
         registry,
         case_nesting: 0,
         typed_arith: true,
@@ -7471,13 +7608,24 @@ fn bind_call(
                 args.len()
             )));
         }
+        // 型注釈つきパラメータ（SQL-66 (1)）は実引数を宣言型へ暗黙変換する。型なしは従来どおり。
+        // `param_types.len() == params.len()` は `define_function_with_types` が確立する不変条件。
         let mut bound_args = Vec::with_capacity(args.len());
-        for a in args {
-            bound_args.push(bind_expr_in(a, env, node_budget)?);
+        for (i, a) in args.iter().enumerate() {
+            match def.param_types.get(i).and_then(Option::as_ref) {
+                Some(declared) => {
+                    bound_args.push(bind_typed_udf_arg(name, a, declared, env, node_budget)?)
+                }
+                None => bound_args.push(bind_expr_in(a, env, node_budget)?),
+            }
         }
         let mut inner_params = std::collections::HashMap::new();
-        for (pname, bound) in def.params.iter().zip(bound_args) {
+        let mut inner_decl = std::collections::HashMap::new();
+        for (i, (pname, bound)) in def.params.iter().zip(bound_args).enumerate() {
             inner_params.insert(pname.clone(), bound);
+            if let Some(declared) = def.param_types.get(i).and_then(Option::as_ref) {
+                inner_decl.insert(pname.clone(), declared.clone());
+            }
         }
         let mut inner_env = BindEnv {
             // UDF 本体は列参照を持たない閉じた関数であるべき契約（`define_function`
@@ -7486,6 +7634,7 @@ fn bind_call(
             // な多重防御）。
             schema: None,
             params: inner_params,
+            param_decl: inner_decl,
             registry: env.registry,
             // 呼び出し元の現在のネスト段数を引き継ぐ（UDF 本体のインライン展開
             // 後、呼び出し元の CASE/COALESCE/NULLIF と本体側のそれが合算される
