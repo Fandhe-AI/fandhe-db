@@ -124,7 +124,7 @@
 
 - ウィンドウ関数の結果による文全体の `ORDER BY`（`ORDER BY rn`）。base scan への委譲方式では評価できない
 - `EXPLAIN` とウィンドウ関数の併用（`ORDER BY` の有無を問わず `42601`）
-- `GROUP BY`／集計 SELECT とウィンドウの併用
+- `GROUP BY`／集計 SELECT とウィンドウの併用（トップレベルは Issue #1898 で対応。それ以外の文脈は引き続き対象外）
 - 名前付きウィンドウ・
   関数内 `DISTINCT`
 - 式の中へのウィンドウ呼び出しの埋め込み
@@ -512,3 +512,32 @@ ORDER BY なし・複数キーの `RANGE UNBOUNDED PRECEDING` 等も評価され
 - **対象外**: `$n`・部分クエリ・Numeric（CAST）／Interval 式・`COUNT(DISTINCT 式)` のウィンドウ版、
   整数式の `sum` の結果型が倍精度になる差異（PostgreSQL は bigint／numeric。集計 SELECT と共通の既存契約）。
   PostgreSQL 実機での照合は未実施（期待値は意味論から導出）。
+
+## Issue #1898 追記: 集計結果行への窓（SQL-64 ポインタ）
+
+- **受理範囲**: トップレベルの集計 SELECT（`GROUP BY`／`HAVING`／集計呼び出し）と窓項目が同じ
+  SELECT リストに並ぶ文。評価順は「WHERE → GROUP BY → HAVING → 窓 → ORDER BY → LIMIT/OFFSET」で、
+  窓の母集合は集計後の結果行（1 グループ = 1 行）。`GROUP BY` なしの集計（1 行）と `HAVING` 偽（0 行）も同じ規則。
+- **方式**: 第 2 の実行器を作らず、評価後射影形ビューの仕組み（`Statement::BufferedView`、出所
+  `BufferedOrigin::GroupedWindow`）を使う。本文は窓項目を除いた集計 SELECT で既存の集計経路が実行し、
+  外側（`sql::view_buffered`）が評価済みセルに窓を適用する。振り分けは `sql::allowlist::grouped_window`。
+  可視行の確定は本文が参照者の `PolicyContext` で行い、外側は `PolicyContext` を受け取らない。
+- **名前解決**: 窓の引数・`PARTITION BY`・`ORDER BY`・`FILTER` が参照できるのはグループ化キー列（入力列）だけ。
+  窓が参照するキー列は本文へ隠し項目として足し、外側の束縛では本文の結果列を改名する
+  （利用者の非窓項目は利用者が書けない内部名、隠しキーは実キー列名）。そのため出力別名
+  （`sum(x) AS s` の `s`）を窓内で参照すると PostgreSQL と同じく未定義列になり、出力別名と入力列の
+  衝突や同名の集計列による曖昧さは起きない。グループ化されていない列は `42803`。隠し列は射影せず、
+  結果へ漏れない。出力列名（RowDescription）は `plan_outer` が改名前の本文列メタへ戻す。
+- **ORDER BY／LIMIT／OFFSET**: `ORDER BY` は本文に残す（窓は行順を変えない）。序数はユーザーの
+  SELECT リスト基準から本文基準へ付け替え、窓項目を指す序数は `42601`、範囲外は `42P10`。
+  `LIMIT`／`OFFSET` は窓の後に掛かるよう外側へ移す（窓の値は LIMIT 前の全グループで計算される）。
+  `GROUP BY` も `HAVING` も無い集計は従来どおり `ORDER BY`／`LIMIT` を受理しない。
+- **上限**: 本文は呼び出し段の `ResultLimits` で実行し、グループ数が `--max-result-rows` を超えたら
+  部分結果なしで `54000`。
+- **fail-closed（本 Issue では対象外）**: 窓の引数・`PARTITION BY`・`ORDER BY` の中の集計式
+  （`rank() OVER (ORDER BY sum(x))`。PostgreSQL は受理する形のため `0A000`。Issue #1899）、
+  `$n`（`0A000`）、`ROLLUP`／`CUBE`／`GROUPING SETS`・`SELECT DISTINCT`・式の中の窓・スカラー
+  サブクエリ項目（`42601`）、`WITH TIES`（`0A000`）、ビュー・CTE・派生表・JOIN・サブクエリ内での併用
+  （従来どおり）、窓の別名による ORDER BY（未定義列）。ICU 照合列を持つ表は外側が順序に依存するため
+  ビュー経路と同じ `0A000`。窓キー数上限の設定化は Issue #1900。PostgreSQL 実機での照合は未実施
+  （期待値は意味論から導出）。

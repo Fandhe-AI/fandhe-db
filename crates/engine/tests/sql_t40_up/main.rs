@@ -102,6 +102,7 @@ mod sql64_value_functions;
 mod sql64_window_expr_arg;
 mod sql64_window_filter;
 mod sql64_window_groups_frame;
+mod sql64_window_over_group_by;
 mod sql64_window_range_frame;
 mod sql64_window_rows_frame;
 mod sql78_predicate_dml_noneq_between_params;

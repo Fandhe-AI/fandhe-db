@@ -860,20 +860,32 @@ fn expect_rejected(core: &EngineCore, ctx: &PolicyContext, sql: &str, wire_code:
 }
 
 #[test]
-fn rejects_group_by_combined_with_window() {
-    let path = unique_db_path("window-reject-group-by");
+fn group_by_combined_with_window_runs_over_grouped_rows() {
+    // SQL-64・Issue #1898: 窓の母集合は集計後の結果行（1 グループ = 1 行）。
+    // 従来は一律 42601 で拒否していた形を、グループ数（ja・en の 2 つ）を母集合に評価する。
+    let path = unique_db_path("window-group-by");
     let _guard = CleanupGuard(path.clone());
     let storage = open_storage(&path);
     let ctx = ctx_for("tenant-a");
     seed_basic(&storage, &ctx);
     let core = new_core(storage);
 
-    expect_rejected(
-        &core,
+    let result = expect_query(core.execute_sql(
         &ctx,
-        "SELECT lang, COUNT(*) OVER () FROM docs GROUP BY lang",
-        "42601",
-    );
+        "SELECT lang, COUNT(*) OVER () FROM docs GROUP BY lang ORDER BY lang",
+    ));
+    let got: Vec<(String, u64)> = result
+        .rows
+        .iter()
+        .map(|r| {
+            let lang = match &r.cells[0] {
+                Cell::Text(s) => s.clone(),
+                other => panic!("expected Cell::Text, got {other:?}"),
+            };
+            (lang, cell_int(&r.cells[1]))
+        })
+        .collect();
+    assert_eq!(got, vec![("en".to_string(), 2), ("ja".to_string(), 2)]);
 }
 
 /// ORDER BY なしの同一文から `(id, ウィンドウ値)` を作るオラクル（Issue #1189）。
