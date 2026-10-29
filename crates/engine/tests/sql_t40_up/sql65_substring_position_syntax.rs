@@ -213,3 +213,15 @@ fn position_in_syntax_matches_postgres() {
         "42601"
     );
 }
+
+/// SQL-65: 負の長さは `22011`（substring_error）。`substr` も PostgreSQL に合わせて同じコード。
+#[test]
+fn substring_negative_length_is_22011() {
+    let path = unique_db_path("sql65-substring-neg");
+    let _guard = CleanupGuard(path.clone());
+    let core = new_core(&path);
+    let c = |expr: &str| code_of(&core, &format!("SELECT id, {expr} FROM docs LIMIT 1"));
+    assert_eq!(c("substring('hello' FROM 1 FOR -1)"), "22011");
+    assert_eq!(c("substr('hello', 1, -1)"), "22011");
+    assert_eq!(c("substring(label FOR -2)"), "22011");
+}

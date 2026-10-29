@@ -181,6 +181,8 @@
 
 ### Breaking Changes
 
+- `substring`／`substr` の負の長さを `22011`（substring_error）で拒否する（Issue #1903・SQL-65）。従来は `22000`。公開型の変更として
+  `SqlSurfaceError::SubstringError`・`ErrorClass::SubstringError`・`ArenaError::SubstringError` を追加した（HTTP 射影は 400）。
 - jsonpath の `like_regex` 配線（Issue #2677）に伴う公開型の変更。`PathNode::LikeRegex` に `matcher: LikeRegexMatcher` を追加、
   `JsonPathParseError` に `Regex(RegexError)`・`TooManyRegex`、`JsonPathEvalError` に `RegexInputTooLong` を追加し、
   `RegexNotSupported` は `x` フラグ専用になった。従来 `like_regex` を一律 `0A000` で拒否していた挙動が変わる。
