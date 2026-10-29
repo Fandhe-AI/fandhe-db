@@ -8641,7 +8641,8 @@ impl EngineCore {
                     // （result-limits-cli.md の「内側 LIMIT は連動しない」）。具体化 CTE
                     // （Issue #1860）は実行側と同じく呼び出し段の `limits` を渡す。
                     &match validated.origin {
-                        crate::sql::allowlist::BufferedOrigin::MaterializedCte => *limits,
+                        crate::sql::allowlist::BufferedOrigin::MaterializedCte
+                        | crate::sql::allowlist::BufferedOrigin::GroupedWindow => *limits,
                         crate::sql::allowlist::BufferedOrigin::View => {
                             crate::result_limits::ResultLimits::default()
                         }
@@ -9467,7 +9468,8 @@ impl EngineCore {
                 // （可視行が `--max-result-rows` を超えたら黙って切り詰めず `54000`）。ビュー本文は
                 // 従来どおり既定値（内側 LIMIT は外側の設定値と連動させない）。
                 let body_limits = match validated.origin {
-                    crate::sql::allowlist::BufferedOrigin::MaterializedCte => limits,
+                    crate::sql::allowlist::BufferedOrigin::MaterializedCte
+                    | crate::sql::allowlist::BufferedOrigin::GroupedWindow => limits,
                     crate::sql::allowlist::BufferedOrigin::View => {
                         crate::result_limits::ResultLimits::default()
                     }

@@ -80,7 +80,9 @@
 //! 済みの形も含む）:
 //! 名前付きウィンドウ・関数内 `DISTINCT`・
 //! ベクトル順位付け（`ORDER BY embedding <=> ...`）／`USING PLAN` との併用・
-//! ウィンドウ別名による文全体の `ORDER BY`・`GROUP BY`／集計 SELECT との併用。
+//! ウィンドウ別名による文全体の `ORDER BY`。なおトップレベルの `GROUP BY`／集計 SELECT との
+//! 併用は本モジュールの対象外で、`sql::allowlist::grouped_window` が評価後射影形の
+//! `BufferedView` として扱う（Issue #1898）。
 //!
 //! 集計の `FILTER (WHERE ...)`（Issue #1894）は行ごと項目ごとの判定結果（`filter_pass`）を
 //! materialize 段で持ち、偽・NULL の行をその項目の累積器の入力からだけ除く
