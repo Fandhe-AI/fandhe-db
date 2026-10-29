@@ -318,18 +318,26 @@ Issue #2227 で受理する。
 
 ### 未対応の変数名（Issue #2224 レビュー対応）
 
-- 変数・関数パラメータ・ループ変数の名前に、解析器と `embedded` が構造語・リテラル語として特別扱いする語を
-  使うと、宣言時に `0A000` で拒否する（引用付き `"..."` でも拒否。比較は大小無視。エラー文言に名前は含めない）。
-  対象の定数は `plpgsql::parser::UNSUPPORTED_NAMES` の 1 か所のみ
-- 理由: 埋め込み SQL は変数参照を識別子トークンの位置判定で解決する。`UPDATE t SET x = 1` の `SET`・
-  `IF true` の `true`・`EXECUTE INTO x` の `INTO` のような語を同名の変数と区別する位置ヒューリスティック
-  は、語ごとの例外が増え続け、正しい本体の誤拒否や引用付き名との衝突（`"true"` と未引用 `true` が同じキー）を
-  生む。曖昧な名前を宣言できなくすれば、これらは常にリテラル・構造語として読める（fail-closed）
-- 対象の語: リテラル・値関数（`true`・`false`・`null`・`default`・`array`・`current_*`・`localtime*`）、
-  文頭・文の語（`insert`・`update`・`delete`・`values`・`with`・`get`・`set`・`into`・`using`・`strict`・
-  `reverse`・`exception`・`operation_id`・`first`・`next`・`query` 等）、SQL の句・演算子語（`group`・`having`・
-  `returning`・`offset`・`union`・`join`・`on`・`left`・`fetch`・`rows`・`asc`・`desc`・`as`・`or`・`not` 等）。
-  完全な一覧は定数を参照する。PostgreSQL では多くが非予約語で宣言できるため、これは既知の差
+- **規則**: 変数・関数パラメータ・ループ変数の名前が「SQL 側でキーワード・文脈キーワードとして扱う語」と
+  同名の場合は、宣言時に `0A000` で拒否する（引用付き `"..."` でも拒否。比較は大小無視。エラー文言に
+  名前は含めない）。PostgreSQL では多くが非予約語で宣言できるため、既知の差（fail-closed）
+- 理由: 埋め込み SQL の変数参照は識別子トークンの位置判定で解決する。`IF 1 IS NULL` の `IS`・
+  `UPDATE t SET x = 1` の `SET`・`IF true` の `true`・`EXECUTE INTO x` の `INTO` のような語を同名の変数と
+  区別する位置ヒューリスティックは、語ごとの例外が増え続け、正しい本体の誤拒否や引用付き名との衝突
+  （`"true"` と未引用 `true` が同じキー）を生む。曖昧な名前を宣言できなくすれば、これらは常にリテラル・
+  構造語として読める
+- 拒否語の集合: (1) SQL 字句解析が `Token::Keyword` にする語、(2) `sql/` の解析器が文脈キーワードとして
+  文字列照合する語のうち DML・式の文法に現れるもの（演算子語・節の語・窓／集約の語・型リテラルの語・
+  JSON 式の節の語・`USING PLAN` の語）、(3) PL/pgSQL 側（`parser`・`embedded`）が構造語として照合する語
+- 定数とテスト: 定数は `crates/engine/src/plpgsql/parser.rs` の `UNSUPPORTED_NAMES`（1 か所）。
+  漏れ検出テスト `plpgsql::tests::every_matched_sql_word_is_rejected_or_excluded` が `sql/`・`plpgsql/` の
+  ソース（`#[cfg(test)] mod` を除く）から照合語を抽出し、すべてが「拒否語」か「理由付きの除外語」に
+  含まれることを確かめる。SQL 側に新しい照合語が増えるとこのテストが落ちるので、拒否語へ足すか、除外語
+  （テスト内の `EXCLUDED_*`）へ理由付きで足す。抽出規則は、照合ヘルパー呼び出しの引数リテラル・任意の呼び出し
+  引数の大文字だけのリテラル・`[..].iter()`／`.contains(` の配列・plpgsql 側の `&[&str]` 定数
+- 除外語（拒否しない）と理由: 関数名（直後が `(` の位置は識別子位置として扱う）、DDL・DCL・ユーティリティ・
+  トランザクション・カーソル・COPY の語（埋め込み文の文頭の語は `0A000` で、DML・式の文法に現れない）、
+  文字列値・内部の列名・スキーマ名・単位名の照合に使う語、宣言型だけで照合する多相型名
 - ラベル名は対象外（識別子位置に現れず `lbl.name` の修飾子としてだけ使われるため曖昧さが無い）
 - `WITH` 文の種別は、CTE 定義（名前・列リスト・`AS`・`[NOT] MATERIALIZED`・本体）を構造的に読み飛ばした後の
   主文で決める。CTE 名が `"update"` 等でも誤分類しない。形を読み解けない `WITH` は `42601` で拒否する

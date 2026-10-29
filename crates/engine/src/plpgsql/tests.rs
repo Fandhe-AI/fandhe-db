@@ -1131,30 +1131,43 @@ fn declaration_default_resolves_in_the_scope_before_the_declaration() {
 
 #[test]
 fn type_specifications_are_not_variable_references() {
-    // 型指定の範囲全体（複数語・修飾子・`[]`）は、同名の変数があっても置換しない。
-    let cases = [
-        ("precision", "double precision"),
-        ("varying", "character varying(10)"),
-        ("zone", "timestamp without time zone"),
-        ("zone", "timestamp with time zone"),
-        ("n", "int[]"),
-        ("p", "numeric(10,2)"),
+    // 型名の語（`precision`・`varying`・`zone` 等）は変数名にできない（宣言時に拒否）。
+    for w in [
+        "precision",
+        "varying",
+        "zone",
+        "time",
+        "timestamp",
+        "numeric",
+    ] {
+        assert_eq!(
+            code(&format!("DECLARE {w} int; BEGIN NULL; END")),
+            "0A000",
+            "for {w}"
+        );
+    }
+    // 型指定の範囲（複数語・修飾子・`[]`）は `::` と `CAST` の両方で識別子位置になり、その後に続く
+    // 変数参照だけが置換される。
+    let types = [
+        "double precision",
+        "character varying(10)",
+        "timestamp without time zone",
+        "timestamp with time zone",
+        "int[]",
+        "numeric(10,2)",
     ];
-    for (var, ty) in cases {
+    for ty in types {
         for expr in [format!("1::{ty}"), format!("CAST(1 AS {ty})")] {
-            let src = format!("DECLARE {var} int; BEGIN PERFORM {expr}; END");
-            let b = ok(&src);
-            assert_eq!(first_sql_refs(&b), 0, "for {src:?}");
-            // 型の範囲の後に続く変数参照は置換される。
-            let src = format!("DECLARE {var} int; BEGIN PERFORM {expr} + {var}; END");
-            let b = ok(&src);
-            assert_eq!(first_sql_refs(&b), 1, "for {src:?}");
+            let src = format!("DECLARE v int; BEGIN PERFORM {expr}; END");
+            assert_eq!(first_sql_refs(&ok(&src)), 0, "for {src:?}");
+            let src = format!("DECLARE v int; BEGIN PERFORM {expr} + v; END");
+            assert_eq!(first_sql_refs(&ok(&src)), 1, "for {src:?}");
         }
     }
     // 型の外の `AS` 別名は従来どおり識別子位置、`CAST` の式部分の変数は参照になる。
     let b = ok("DECLARE v int; BEGIN PERFORM CAST(v AS int); END");
     assert_eq!(first_sql_refs(&b), 1);
-    let b = ok("DECLARE precision int; BEGIN RETURN 1::double precision; END");
+    let b = ok("DECLARE v int; BEGIN RETURN 1::double precision; END");
     let Some(Stmt::Return(Some(e))) = b.block.stmts.first() else {
         panic!("return");
     };
@@ -1322,4 +1335,564 @@ fn quoted_flags_align_with_tokens() {
         .iter()
         .zip(&t)
         .all(|(f, t)| !*f || !matches!(t, Token::Keyword(_))));
+}
+
+// ---- 拒否語の網羅性（SQL 側が照合する語の漏れ検出） ----
+
+/// 照合語として扱う関数・メソッド名（引数の文字列リテラルを語として集める）。
+const MATCH_HELPERS: &[&str] = &[
+    "peek_ident_matches",
+    "peek_ident_matches_at",
+    "expect_ident_matching",
+    "expect_contextual_keyword",
+    "peek_contextual_keyword",
+    "ident_is",
+    "is_kw",
+    "eat_kw",
+    "expect_kw",
+    "eat_word",
+    "is_word",
+    "is_ident",
+    "ident_eq_ignore_case",
+    "eq_ignore_ascii_case",
+    "kw",
+    "word",
+    "ident_at",
+    "depth0_words",
+    "prev_is",
+    "next_is",
+    "expect_contextual_ident",
+    "peek_truncate_keyword",
+    "expr_until",
+    "parse_relation_alias",
+];
+
+/// 拒否語としない語（理由付き）。関数名は直後が `(` なら識別子位置として扱われ、変数参照にならない。
+const EXCLUDED_FUNCTIONS: &[&str] = &[
+    "array_agg",
+    "avg",
+    "bool_and",
+    "bool_or",
+    "coalesce",
+    "concat",
+    "count",
+    "cume_dist",
+    "currval",
+    "date_part",
+    "date_trunc",
+    "dense_rank",
+    "every",
+    "extract",
+    "first_value",
+    "greatest",
+    "json_array_length",
+    "justify_days",
+    "justify_hours",
+    "justify_interval",
+    "lag",
+    "last_value",
+    "lastval",
+    "lead",
+    "least",
+    "log",
+    "lpad",
+    "max",
+    "min",
+    "nextval",
+    "nth_value",
+    "ntile",
+    "nullif",
+    "overlay",
+    "percent_rank",
+    "position",
+    "rank",
+    "replace",
+    "round",
+    "row_number",
+    "rpad",
+    "set_config",
+    "setval",
+    "split_part",
+    "stddev",
+    "stddev_pop",
+    "stddev_samp",
+    "string_agg",
+    "substr",
+    "substring",
+    "sum",
+    "timezone",
+    "trim",
+    "trunc",
+    "var_pop",
+    "var_samp",
+    "variance",
+    "current_schema",
+    "current_schemas",
+    "visible",
+];
+
+/// DDL・DCL・ユーティリティ・トランザクション・カーソル・COPY の語。埋め込み文の文頭の語は
+/// `OUT_OF_SCOPE_STARTS` で `0A000` になり、DML・式の文法には現れない。
+const EXCLUDED_UTILITY: &[&str] = &[
+    "abort",
+    "action",
+    "add",
+    "alter",
+    "always",
+    "analyze",
+    "assert",
+    "authorization",
+    "binary",
+    "btree",
+    "cache",
+    "call",
+    "cancel",
+    "cascade",
+    "cascaded",
+    "check",
+    "chunk",
+    "close",
+    "cluster",
+    "column",
+    "comment",
+    "commit",
+    "concurrently",
+    "copy",
+    "create",
+    "csv",
+    "data",
+    "deallocate",
+    "deferrable",
+    "deferred",
+    "delimiter",
+    "discard",
+    "dml",
+    "drop",
+    "enum",
+    "explain",
+    "force",
+    "foreach",
+    "foreign",
+    "forward",
+    "freeze",
+    "function",
+    "generated",
+    "gin",
+    "global",
+    "grant",
+    "header",
+    "hnsw",
+    "identity",
+    "import",
+    "increment",
+    "index",
+    "initially",
+    "immediate",
+    "key",
+    "listen",
+    "local",
+    "lock",
+    "match",
+    "maxvalue",
+    "merge",
+    "minvalue",
+    "move",
+    "notify",
+    "nowait",
+    "open",
+    "option",
+    "owned",
+    "owner",
+    "prepare",
+    "preserve",
+    "primary",
+    "raise",
+    "references",
+    "refresh",
+    "reindex",
+    "release",
+    "rename",
+    "reset",
+    "restart",
+    "restrict",
+    "revoke",
+    "rollback",
+    "savepoint",
+    "schema",
+    "sequence",
+    "session",
+    "share",
+    "show",
+    "simple",
+    "start",
+    "stdin",
+    "stdout",
+    "temp",
+    "temporary",
+    "transaction",
+    "truncate",
+    "type",
+    "unique",
+    "unlogged",
+    "vacuum",
+    "view",
+    "work",
+];
+
+/// 構文上のキーワードではなく、文字列値・内部の列名・スキーマ名・単位名の照合に使われる語。
+const EXCLUDED_VALUES: &[&str] = &[
+    "day",
+    "hour",
+    "minute",
+    "month",
+    "second",
+    "year",
+    "f",
+    "t",
+    "inf",
+    "infinity",
+    "nan",
+    "id",
+    "tenant_id",
+    "visibility",
+    "pg_catalog",
+    "pg_temp",
+    "public",
+    "information_schema",
+    "search_path",
+];
+
+/// 宣言型（`DECLARE x anyelement`）の判定でだけ照合する多相型名（式には現れない）。
+const EXCLUDED_POLYMORPHIC_TYPES: &[&str] = &[
+    "anyarray",
+    "anyelement",
+    "anyenum",
+    "anymultirange",
+    "anynonarray",
+    "anyrange",
+];
+
+fn rust_sources(dir: &std::path::Path, out: &mut Vec<std::path::PathBuf>) {
+    let Ok(rd) = std::fs::read_dir(dir) else {
+        return;
+    };
+    for e in rd.flatten() {
+        let p = e.path();
+        let name = p.file_name().and_then(|n| n.to_str()).unwrap_or("");
+        if p.is_dir() {
+            if name != "tests" {
+                rust_sources(&p, out);
+            }
+        } else if name.ends_with(".rs") && name != "tests.rs" && !name.ends_with("_tests.rs") {
+            out.push(p);
+        }
+    }
+}
+
+/// `b[i]` が `"` のとき、文字列リテラルの内容と閉じ引用符の次の位置を返す。
+fn string_literal(b: &[u8], i: usize) -> Option<(&str, usize)> {
+    let mut j = i + 1;
+    while j < b.len() {
+        match b[j] {
+            b'\\' => j += 2,
+            b'"' => return std::str::from_utf8(&b[i + 1..j]).ok().map(|s| (s, j + 1)),
+            _ => j += 1,
+        }
+    }
+    None
+}
+
+fn is_word_literal(s: &str) -> bool {
+    !s.is_empty() && s.bytes().all(|c| c.is_ascii_alphabetic() || c == b'_')
+}
+
+/// 呼び出しの括弧の中（`i` は `(` の次）から、文字列リテラルを集める。
+fn call_literals(b: &[u8], mut i: usize) -> Vec<&str> {
+    let mut depth = 1usize;
+    let mut out = Vec::new();
+    while i < b.len() && depth > 0 {
+        match b[i] {
+            b'(' => depth += 1,
+            b')' => depth -= 1,
+            b'"' => match string_literal(b, i) {
+                Some((s, next)) => {
+                    out.push(s);
+                    i = next;
+                    continue;
+                }
+                None => break,
+            },
+            _ => {}
+        }
+        i += 1;
+    }
+    out
+}
+
+/// 1 ファイルの本体（`#[cfg(test)] mod` より前）から、SQL・PL/pgSQL が照合する語を集める。
+/// 規則: (1) `MATCH_HELPERS` の呼び出し引数の英字リテラル、(2) 任意の呼び出しの引数にある
+/// 大文字だけの英字リテラル（2 文字以上。照合ヘルパーの名前変更・追加の取りこぼし対策）、
+/// (3) `[ "A", "B" ].iter()`／`.contains(` の配列、(4) plpgsql 側の `&[&str]` 定数。
+fn matched_words(src: &str, is_plpgsql: bool, out: &mut std::collections::BTreeSet<String>) {
+    let src = src
+        .find("\n#[cfg(test)]\nmod ")
+        .map_or(src, |k| src.get(..k).unwrap_or(src));
+    let b = src.as_bytes();
+    let mut i = 0usize;
+    while i < b.len() {
+        let c = b[i];
+        if c.is_ascii_alphabetic() || c == b'_' {
+            let start = i;
+            while i < b.len() && (b[i].is_ascii_alphanumeric() || b[i] == b'_') {
+                i += 1;
+            }
+            let name = &src[start..i];
+            let mut k = i;
+            while k < b.len() && b[k].is_ascii_whitespace() {
+                k += 1;
+            }
+            if b.get(k) == Some(&b'(') {
+                let helper = MATCH_HELPERS.contains(&name);
+                for lit in call_literals(b, k + 1) {
+                    let upper =
+                        lit.len() >= 2 && lit.bytes().all(|c| c.is_ascii_uppercase() || c == b'_');
+                    if (helper && is_word_literal(lit)) || upper {
+                        out.insert(lit.to_ascii_lowercase());
+                    }
+                }
+            }
+            continue;
+        }
+        if c == b'"' {
+            // 通常の文字列は読み飛ばす（中の `[` や識別子風の語を拾わない）。
+            match string_literal(b, i) {
+                Some((_, next)) => i = next,
+                None => break,
+            }
+            continue;
+        }
+        if c == b'[' {
+            let mut j = i + 1;
+            let mut words = Vec::new();
+            let mut ok = false;
+            loop {
+                while j < b.len() && b[j].is_ascii_whitespace() {
+                    j += 1;
+                }
+                if b.get(j) != Some(&b'"') {
+                    break;
+                }
+                let Some((s, next)) = string_literal(b, j) else {
+                    break;
+                };
+                words.push(s);
+                j = next;
+                while j < b.len() && b[j].is_ascii_whitespace() {
+                    j += 1;
+                }
+                match b.get(j) {
+                    Some(b',') => j += 1,
+                    Some(b']') => {
+                        ok = true;
+                        break;
+                    }
+                    _ => break,
+                }
+                // 末尾カンマの後の `]`。
+                while j < b.len() && b[j].is_ascii_whitespace() {
+                    j += 1;
+                }
+                if b.get(j) == Some(&b']') {
+                    ok = true;
+                    break;
+                }
+            }
+            if ok {
+                let rest = src.get(j + 1..).unwrap_or("").trim_start();
+                if rest.starts_with(".iter()") || rest.starts_with(".contains(") {
+                    for w in words.iter().filter(|w| is_word_literal(w)) {
+                        out.insert(w.to_ascii_lowercase());
+                    }
+                }
+            }
+        }
+        i += 1;
+    }
+    if is_plpgsql {
+        let mut from = 0usize;
+        while let Some(k) = src.get(from..).and_then(|r| r.find("&[&str] = &[")) {
+            let at = from + k;
+            let head = src.get(at.saturating_sub(60)..at).unwrap_or("");
+            let end = src
+                .get(at..)
+                .and_then(|r| r.find("];"))
+                .map_or(src.len(), |e| at + e);
+            // 拒否語の定義そのものは検査対象にしない。
+            if !head.contains("UNSUPPORTED_NAMES") {
+                let body = src.get(at..end).unwrap_or("");
+                let bb = body.as_bytes();
+                let mut p = 0usize;
+                while p < bb.len() {
+                    if bb[p] == b'"' {
+                        match string_literal(bb, p) {
+                            Some((s, next)) => {
+                                if is_word_literal(s) {
+                                    out.insert(s.to_ascii_lowercase());
+                                }
+                                p = next;
+                                continue;
+                            }
+                            None => break,
+                        }
+                    }
+                    p += 1;
+                }
+            }
+            from = end.max(at + 1);
+        }
+    }
+}
+
+#[test]
+fn every_matched_sql_word_is_rejected_or_excluded() {
+    use super::parser::{OUT_OF_SCOPE_STARTS, RESERVED, SQL_KEYWORD_NAMES, UNSUPPORTED_NAMES};
+    use std::collections::BTreeSet;
+    let root = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("src");
+    let mut files = Vec::new();
+    rust_sources(&root.join("sql"), &mut files);
+    rust_sources(&root.join("plpgsql"), &mut files);
+    assert!(files.len() > 20, "source discovery failed: {}", files.len());
+    let mut words = BTreeSet::new();
+    for f in &files {
+        let src = std::fs::read_to_string(f).expect("read source");
+        let is_plpgsql = f.components().any(|c| c.as_os_str() == "plpgsql");
+        matched_words(&src, is_plpgsql, &mut words);
+    }
+    // SQL 字句解析が Keyword にする語（`"SELECT" => Some(Keyword::Select)` の腕）。
+    let lexer = std::fs::read_to_string(root.join("sql").join("lexer.rs")).expect("lexer");
+    let mut keywords = BTreeSet::new();
+    let mut rest = lexer.as_str();
+    while let Some(k) = rest.find("\" => Some(Keyword::") {
+        let head = rest.get(..k).unwrap_or("");
+        if let Some(q) = head.rfind('"') {
+            keywords.insert(head[q + 1..].to_ascii_lowercase());
+        }
+        rest = rest.get(k + 1..).unwrap_or("");
+    }
+    assert!(
+        keywords.len() >= 7,
+        "keyword extraction failed: {keywords:?}"
+    );
+    words.extend(keywords.iter().cloned());
+    // 抽出が空振りしていないこと（現状 350 語前後。大きく減ったら抽出規則の退行）。
+    assert!(words.len() > 250, "too few matched words: {}", words.len());
+
+    let rejected: BTreeSet<String> = UNSUPPORTED_NAMES.iter().map(|w| w.to_string()).collect();
+    let mut excluded: BTreeSet<String> = BTreeSet::new();
+    for list in [
+        EXCLUDED_FUNCTIONS,
+        EXCLUDED_UTILITY,
+        EXCLUDED_VALUES,
+        EXCLUDED_POLYMORPHIC_TYPES,
+        OUT_OF_SCOPE_STARTS,
+    ] {
+        excluded.extend(list.iter().map(|w| w.to_ascii_lowercase()));
+    }
+    let known: BTreeSet<String> = RESERVED
+        .iter()
+        .chain(SQL_KEYWORD_NAMES)
+        .map(|w| w.to_string())
+        .collect();
+    // 拒否語と除外語は排他（除外すべき語を拒否にも入れて矛盾させない）。
+    let both: Vec<&String> = rejected
+        .iter()
+        .filter(|w| {
+            excluded.contains(*w)
+                && !OUT_OF_SCOPE_STARTS
+                    .iter()
+                    .any(|o| o.eq_ignore_ascii_case(w))
+        })
+        .collect();
+    assert!(
+        both.is_empty(),
+        "words are both rejected and excluded: {both:?}"
+    );
+    // 字句解析の Keyword は必ず変数名にできない。
+    for k in &keywords {
+        assert!(
+            rejected.contains(k) || known.contains(k),
+            "keyword {k} is not rejected"
+        );
+    }
+    let missing: Vec<&String> = words
+        .iter()
+        .filter(|w| !rejected.contains(*w) && !excluded.contains(*w) && !known.contains(*w))
+        .collect();
+    assert!(
+        missing.is_empty(),
+        "SQL words matched by the parsers but neither rejected nor excluded \
+         (add to UNSUPPORTED_NAMES, or to an EXCLUDED_* list with a reason): {missing:?}"
+    );
+}
+
+#[test]
+fn operator_and_window_words_cannot_name_variables() {
+    for w in [
+        "is",
+        "like",
+        "ilike",
+        "between",
+        "filter",
+        "over",
+        "similar",
+        "escape",
+        "in",
+        "and",
+        "or",
+        "not",
+        "collate",
+        "at",
+        "zone",
+        "partition",
+        "range",
+        "groups",
+        "following",
+        "preceding",
+        "unbounded",
+        "exclude",
+        "ties",
+    ] {
+        for decl in [w.to_string(), format!("\"{w}\"")] {
+            let c = code(&format!("DECLARE {decl} int; BEGIN NULL; END"));
+            assert!(c == "0A000" || c == "42601", "for {decl}: {c}");
+        }
+    }
+    for w in ["is", "like", "between", "filter", "over"] {
+        assert_eq!(
+            code(&format!("DECLARE \"{w}\" int := 1; BEGIN NULL; END")),
+            "0A000"
+        );
+    }
+}
+
+#[test]
+fn operators_stay_operators_when_variables_exist() {
+    let b = ok("DECLARE v int; BEGIN IF 1 IS NULL THEN NULL; END IF; END");
+    let Some(Stmt::If { branches, .. }) = b.block.stmts.first() else {
+        panic!("if");
+    };
+    assert!(branches[0].0.var_refs.is_empty());
+    for (src, n) in [
+        ("PERFORM 'a' LIKE 'a%'", 0),
+        ("PERFORM v LIKE 'a%'", 1),
+        ("PERFORM v BETWEEN 1 AND 2", 1),
+        ("PERFORM 1 BETWEEN v AND 2", 1),
+        ("PERFORM v IS NOT NULL", 1),
+        ("PERFORM v ILIKE 'x' ESCAPE '\\'", 1),
+        ("PERFORM count(*) FILTER (WHERE v > 0) FROM t", 1),
+        ("PERFORM sum(v) OVER (PARTITION BY x) FROM t", 1),
+    ] {
+        let b = ok(&format!("DECLARE v int; BEGIN {src}; END"));
+        assert_eq!(first_sql_refs(&b), n, "for {src:?}");
+    }
 }
