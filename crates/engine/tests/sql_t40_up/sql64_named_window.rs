@@ -352,3 +352,81 @@ fn tenant_boundary_is_preserved() {
     assert_eq!(err.wire_code(), "42704");
     assert!(!err.to_string().contains("tenant-b"));
 }
+
+/// 句の位置判定が構文位置で行われる回帰（指摘 1〜3）: `offset`／`union` という名前の列や
+/// `JOIN ... USING` が WINDOW 句の前にあっても受理され、結果が等価なインラインと一致する。
+#[test]
+fn keyword_named_columns_and_join_using_before_window_clause() {
+    let path = unique_db_path("nw-kwcols");
+    let _guard = CleanupGuard(path.clone());
+    let storage = Storage::open(&path).expect("open storage");
+    let ctx = ctx_for("tenant-a");
+    for name in ["k", "k2"] {
+        let schema = TableSchema::new(
+            name,
+            vec![
+                ColumnDef::new("offset", ColumnType::Integer, true),
+                ColumnDef::new("union", ColumnType::Integer, true),
+                ColumnDef::new("s", ColumnType::Integer, true),
+            ],
+        );
+        storage.create_table(&schema).expect("create table");
+        for id in 1u64..=4 {
+            let op_id =
+                engine::recovery::required_op_id::OperationId::parse(&format!("nwkw-{name}-{id}"))
+                    .expect("valid operation_id");
+            engine::tenant::insert_typed_row(
+                &storage,
+                name,
+                &ctx,
+                id,
+                Visibility::Public,
+                &[
+                    Value::Integer(1),
+                    Value::Integer(id as i32 % 2),
+                    Value::Integer(id as i32 * 10),
+                ],
+                &op_id,
+            )
+            .expect("insert row");
+        }
+    }
+    let core = EngineCore::from_storage(storage, Box::new(CpuScalarProvider));
+    // 指摘 1: WHERE 内の列名 `offset`
+    assert_same(
+        &core,
+        &ctx,
+        "SELECT id, rank() OVER w FROM k WHERE offset = 1 WINDOW w AS (ORDER BY s, id) LIMIT 10",
+        "SELECT id, rank() OVER (ORDER BY s, id) FROM k WHERE offset = 1 LIMIT 10",
+    );
+    // 指摘 3: WHERE 内の列名 `union`
+    assert_same(
+        &core,
+        &ctx,
+        "SELECT id, rank() OVER w FROM k WHERE union = 1 WINDOW w AS (ORDER BY s, id) LIMIT 10",
+        "SELECT id, rank() OVER (ORDER BY s, id) FROM k WHERE union = 1 LIMIT 10",
+    );
+    // 指摘 2: FROM 内の JOIN ... USING。窓関数と JOIN の併用が未対応でも、名前付きとインラインで
+    // 同じ結果（成功なら同じ行、失敗なら同じ SQLSTATE）になり、WINDOW 句の位置判定で
+    // 余計に拒否されない（unit テスト `join_using_before_window_clause` がトークン列で固定）。
+    let named = "SELECT k.id, rank() OVER w FROM k JOIN k2 USING (id) WINDOW w AS (ORDER BY k.s, k.id) LIMIT 10";
+    let inline = "SELECT k.id, rank() OVER (ORDER BY k.s, k.id) FROM k JOIN k2 USING (id) LIMIT 10";
+    assert_eq!(outcome(&core, &ctx, named), outcome(&core, &ctx, inline));
+    // 本来の誤配置は引き続き 42601
+    assert_eq!(
+        outcome(
+            &core,
+            &ctx,
+            "SELECT id, rank() OVER w FROM k LIMIT 5 WINDOW w AS (ORDER BY s)"
+        ),
+        "42601"
+    );
+    assert_eq!(
+        outcome(
+            &core,
+            &ctx,
+            "SELECT id, rank() OVER w FROM k OFFSET 1 WINDOW w AS (ORDER BY s)"
+        ),
+        "42601"
+    );
+}

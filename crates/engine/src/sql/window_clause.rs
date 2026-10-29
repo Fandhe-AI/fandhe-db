@@ -34,6 +34,11 @@ struct Def {
 }
 
 impl Def {
+    /// [`Self::spec`] が返すトークン数（複写の前に予算を検査するために使う。確保はしない）。
+    fn spec_len(&self) -> usize {
+        self.partition.len() + self.order.len() + self.frame.len() + 2
+    }
+
     /// `( <partition> <order> <frame> )` を組み立てる。
     fn spec(&self) -> Vec<Token> {
         let mut v =
@@ -185,12 +190,7 @@ fn expand_scope(
         match t {
             Token::Punct('(') => d += 1,
             Token::Punct(')') => d = d.saturating_sub(1),
-            Token::Ident(s)
-                if d == 0
-                    && ["UNION", "INTERSECT", "EXCEPT"]
-                        .iter()
-                        .any(|w| s.eq_ignore_ascii_case(w)) =>
-            {
+            Token::Ident(_) if d == 0 && is_set_operator(&flat, k) => {
                 let branch = flat.get(start..k).unwrap_or(&[]);
                 out.extend(process_branch(branch, budget)?);
                 out.push(t.clone());
@@ -201,6 +201,55 @@ fn expand_scope(
     }
     out.extend(process_branch(flat.get(start..).unwrap_or(&[]), budget)?);
     Ok(out)
+}
+
+/// 深さ 0 の位置 `k` の `UNION`／`INTERSECT`／`EXCEPT` が集合演算子か。
+/// 同名の列（`SELECT union FROM t`・`WHERE except = 1` 等。lexer では通常の識別子）を
+/// 分割しないよう、直後（`ALL`／`DISTINCT` を除く）が問合せの先頭（`SELECT`・`VALUES`・`WITH`・
+/// 独立スコープの `(`）である場合だけ演算子とみなす。誤って演算子と判定しないだけで、
+/// 本物の演算子の見逃しは WINDOW 句の位置検査（`process_branch`）が `42601` で拒否する。
+fn is_set_operator(tokens: &[Token], k: usize) -> bool {
+    if !["UNION", "INTERSECT", "EXCEPT"]
+        .iter()
+        .any(|w| is_ident(tokens.get(k), w))
+    {
+        return false;
+    }
+    let mut n = k + 1;
+    if is_ident(tokens.get(n), "ALL") || is_ident(tokens.get(n), "DISTINCT") {
+        n += 1;
+    }
+    match tokens.get(n) {
+        Some(Token::Keyword(Keyword::Select)) => true,
+        Some(Token::Punct('(')) => is_scope_open(tokens, n),
+        t => is_ident(t, "VALUES") || is_ident(t, "WITH"),
+    }
+}
+
+/// 位置 `i` の `OFFSET`／`FETCH`／`FOR` が句の開始か（直前が式の末尾か）。
+/// 列名として値の位置に現れる場合（`WHERE offset = 1`・`AND for`・`= fetch` 等。直前が
+/// キーワード・演算子・論理語）は句ではない。
+fn starts_trailing_clause(tokens: &[Token], i: usize) -> bool {
+    if !["OFFSET", "FETCH", "FOR"]
+        .iter()
+        .any(|x| is_ident(tokens.get(i), x))
+    {
+        return false;
+    }
+    let Some(prev) = i.checked_sub(1).and_then(|j| tokens.get(j)) else {
+        return false;
+    };
+    match prev {
+        Token::Ident(w) => ![
+            "AND", "OR", "NOT", "IS", "IN", "LIKE", "ILIKE", "BETWEEN", "ON", "WHEN", "THEN",
+            "ELSE", "CASE", "DISTINCT", "AS",
+        ]
+        .iter()
+        .any(|x| w.eq_ignore_ascii_case(x)),
+        Token::Punct(')') | Token::Punct(']') => true,
+        Token::Number(_) | Token::StringLiteral(_) => true,
+        _ => false,
+    }
 }
 
 /// 括弧の外（深さ 0）にあるトークンの位置（括弧そのものを含む）。
@@ -268,9 +317,11 @@ fn process_branch(branch: &[Token], budget: &mut usize) -> Result<Vec<Token>, Sq
                     && (matches!(
                         branch.get(i),
                         Some(Token::Keyword(Keyword::Order | Keyword::Limit))
-                    ) || ["OFFSET", "FETCH", "FOR", "USING"]
-                        .iter()
-                        .any(|x| is_ident(branch.get(i), x)))
+                    ) || starts_trailing_clause(branch, i)
+                        // `JOIN ... USING (...)` は WINDOW の前に正当に現れる。拒否するのは
+                        // 検索 SELECT の `USING PLAN(...)` だけ。
+                        || (is_ident(branch.get(i), "USING")
+                            && is_ident(branch.get(i + 1), "PLAN")))
             });
             if bad_before {
                 return Err(SqlSurfaceError::unsupported("misplaced WINDOW clause"));
@@ -418,7 +469,7 @@ fn split_spec(inner: &[Token]) -> Result<Parts<'_>, SqlSurfaceError> {
 }
 
 /// 参照先 `r` に対する括弧付き継承の規則（PostgreSQL の判定順: PARTITION BY → ORDER BY → フレーム）。
-fn derive(parts: &Parts<'_>, r: &Def) -> Result<Def, SqlSurfaceError> {
+fn check_derive(parts: &Parts<'_>, r: &Def) -> Result<(), SqlSurfaceError> {
     if !parts.partition.is_empty() {
         return Err(windowing("cannot override PARTITION BY clause of window"));
     }
@@ -430,6 +481,22 @@ fn derive(parts: &Parts<'_>, r: &Def) -> Result<Def, SqlSurfaceError> {
             "cannot copy window because it has a frame clause",
         ));
     }
+    Ok(())
+}
+
+/// 派生の結果の `spec()` 長（確保なし。`check_derive` 通過後に呼ぶ）。
+fn derived_spec_len(parts: &Parts<'_>, r: &Def) -> usize {
+    let order = if parts.order.is_empty() {
+        r.order.len()
+    } else {
+        parts.order.len()
+    };
+    r.partition.len() + order + parts.frame.len() + 2
+}
+
+/// 検査（[`check_derive`]）の後で派生定義を複写して組み立てる。
+fn derive(parts: &Parts<'_>, r: &Def) -> Result<Def, SqlSurfaceError> {
+    check_derive(parts, r)?;
     Ok(Def {
         name: String::new(),
         partition: r.partition.clone(),
@@ -487,8 +554,9 @@ fn replace_refs(
         }
         match tokens.get(i + 1) {
             Some(Token::Ident(name)) => {
-                let spec = find_def(defs, name)?.spec();
-                charge(budget, spec.len())?;
+                let def = find_def(defs, name)?;
+                charge(budget, def.spec_len())?;
+                let spec = def.spec();
                 out.push(t.clone());
                 out.extend(spec);
                 i += 2;
@@ -506,8 +574,9 @@ fn replace_refs(
                         ))
                     }
                 };
+                check_derive(&parts, r)?;
+                charge(budget, derived_spec_len(&parts, r))?;
                 let spec = derive(&parts, r)?.spec();
-                charge(budget, spec.len())?;
                 out.push(t.clone());
                 out.extend(spec);
                 i = close + 1;
@@ -721,6 +790,74 @@ mod tests {
             .map(|i| format!("w{i} AS (ORDER BY s)"))
             .collect();
         let sql = format!("SELECT 1 FROM t WINDOW {}", defs.join(", "));
+        assert_eq!(code(&sql), "54000");
+    }
+
+    #[test]
+    fn keyword_like_columns_are_not_clause_boundaries() {
+        // 列名の `offset`／`for`／`fetch`・`union` は句・集合演算子ではない（WHERE・select リスト）。
+        same(
+            "SELECT id, RANK() OVER w FROM t WHERE offset = 1 AND for = 2 OR fetch = 3 WINDOW w AS (ORDER BY id) LIMIT 10",
+            "SELECT id, RANK() OVER (ORDER BY id) FROM t WHERE offset = 1 AND for = 2 OR fetch = 3 LIMIT 10",
+        );
+        same(
+            "SELECT union, except, RANK() OVER w FROM t WHERE union = 1 WINDOW w AS (ORDER BY id)",
+            "SELECT union, except, RANK() OVER (ORDER BY id) FROM t WHERE union = 1",
+        );
+        // 本物の集合演算子は引き続き枝に分かれ、枝ごとに WINDOW 句を持てる。
+        same(
+            "SELECT RANK() OVER w FROM t WINDOW w AS (ORDER BY id) UNION ALL SELECT RANK() OVER w FROM t WINDOW w AS (ORDER BY s)",
+            "SELECT RANK() OVER (ORDER BY id) FROM t UNION ALL SELECT RANK() OVER (ORDER BY s) FROM t",
+        );
+        // 本来の誤配置は fail-closed のまま。
+        assert_eq!(
+            code("SELECT RANK() OVER w FROM t OFFSET 5 WINDOW w AS (ORDER BY id)"),
+            "42601"
+        );
+        assert_eq!(
+            code("SELECT RANK() OVER w FROM t LIMIT 5 WINDOW w AS (ORDER BY id)"),
+            "42601"
+        );
+        assert_eq!(
+            code("SELECT RANK() OVER w FROM t FOR UPDATE WINDOW w AS (ORDER BY id)"),
+            "42601"
+        );
+        assert_eq!(
+            code("SELECT RANK() OVER w FROM t USING PLAN(x) WINDOW w AS (ORDER BY id)"),
+            "42601"
+        );
+    }
+
+    #[test]
+    fn join_using_before_window_clause() {
+        same(
+            "SELECT RANK() OVER w FROM a JOIN b USING (id) WINDOW w AS (ORDER BY id)",
+            "SELECT RANK() OVER (ORDER BY id) FROM a JOIN b USING (id)",
+        );
+    }
+
+    #[test]
+    fn spec_lengths_match_materialized_specs() {
+        let d = Def {
+            name: "w".into(),
+            partition: tokenize("PARTITION BY g").unwrap(),
+            order: tokenize("ORDER BY s").unwrap(),
+            frame: Vec::new(),
+        };
+        assert_eq!(d.spec_len(), d.spec().len());
+        let inner = tokenize("w ROWS 1 PRECEDING").unwrap();
+        let parts = split_spec(&inner).unwrap();
+        assert_eq!(
+            derived_spec_len(&parts, &d),
+            derive(&parts, &d).unwrap().spec().len()
+        );
+    }
+
+    #[test]
+    fn expansion_budget_rejects_with_54000() {
+        const WIDE: &str = "PARTITION BY a, b, c, d, e, f, g, h ORDER BY a, b, c, d, e, f, g, h";
+        let cols = vec!["RANK() OVER w"; 3_000].join(", ");
+        let sql = format!("SELECT {cols} FROM t WINDOW w AS ({WIDE})");
         assert_eq!(code(&sql), "54000");
     }
 }
