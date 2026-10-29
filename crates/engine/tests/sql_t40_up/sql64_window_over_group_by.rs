@@ -395,6 +395,26 @@ fn aggregate_inside_window_respects_tenant_boundary() {
     );
 }
 
+/// LIMIT 付き暗黙グループの先行検査は演算子キーワード・型名を列参照とみなさない（42703 にならない）。
+#[test]
+fn limit_precheck_ignores_keywords_and_type_names() {
+    let (core, _g) = build("sql64-gw-kw", None);
+    for expr in [
+        "1 OR 2",
+        "NULL IS NULL",
+        "1::int",
+        "'a' LIKE 'a'",
+        "1 IN (1)",
+    ] {
+        let sql = format!("SELECT {expr}, rank() OVER (ORDER BY sum(k)) FROM t LIMIT 1");
+        let code = core
+            .execute_sql(&ctx("tenant-a"), &sql)
+            .err()
+            .map(|e| e.wire_code());
+        assert_ne!(code, Some("42703"), "keyword misread as column: {sql}");
+    }
+}
+
 /// 未対応の形は fail-closed（コード固定）。
 #[test]
 fn unsupported_shapes_fail_closed() {

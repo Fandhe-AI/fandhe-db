@@ -390,7 +390,7 @@ fn tail_has_row_limit(tail: &[Token]) -> bool {
     })
 }
 
-/// 項目内の列参照候補（関数名・別名・型名・`CASE` 系キーワード・`NULL`／`TRUE`／`FALSE` 以外の識別子）。
+/// 項目内の列参照候補（関数名・別名・型名・演算子／`CASE` 系キーワード・`NULL`／`TRUE`／`FALSE` 以外の識別子）。
 fn column_ref_candidates(item: &[Token]) -> Vec<&str> {
     item.iter()
         .enumerate()
@@ -399,9 +399,29 @@ fn column_ref_candidates(item: &[Token]) -> Vec<&str> {
             let next_is_call = matches!(item.get(i.saturating_add(1)), Some(Token::Punct('(')));
             let prev = i.checked_sub(1).and_then(|j| item.get(j));
             let after_as = matches!(prev, Some(Token::Ident(p)) if p.eq_ignore_ascii_case("AS"));
-            let after_cast = matches!(prev, Some(Token::Punct(':')));
+            let after_cast = matches!(prev, Some(Token::TypeCast));
             let reserved = [
-                "AS", "CASE", "WHEN", "THEN", "ELSE", "END", "NULL", "TRUE", "FALSE",
+                "AS",
+                "CASE",
+                "WHEN",
+                "THEN",
+                "ELSE",
+                "END",
+                "NULL",
+                "TRUE",
+                "FALSE",
+                "OR",
+                "AND",
+                "NOT",
+                "IS",
+                "LIKE",
+                "ILIKE",
+                "IN",
+                "BETWEEN",
+                "ESCAPE",
+                "DISTINCT",
+                "PRECISION",
+                "VARYING",
             ]
             .iter()
             .any(|k| n.eq_ignore_ascii_case(k));
