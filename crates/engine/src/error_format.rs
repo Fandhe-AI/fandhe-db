@@ -94,7 +94,7 @@ macro_rules! define_error_classes {
 pub(crate) const SHARED_WIRE_CODES: &[&str] = &["23502", "23505", "22023"];
 
 define_error_classes! {
-    count = 88;
+    count = 89;
 
     /// 構文上受理された SQL の値・引数が不正（`22000`）。
     /// [`crate::sql::allowlist::SqlSurfaceError::InvalidInput`] の写像。
@@ -447,6 +447,9 @@ define_error_classes! {
     /// `nth_value` の第 2 引数が 0 以下（`22016`。SQL-64 (3)・Issue #1883 のポインタ）。固定文言のみで、
     /// 利用者の値は含めない。[`crate::sql::allowlist::SqlSurfaceError::InvalidArgumentForNthValue`] の写像。
     InvalidArgumentForNthValue => ("22016", "INVALID_ARGUMENT_FOR_NTH_VALUE"),
+    /// `ntile` の引数が 0 以下（`22014`。SQL-64 (4)・Issue #1884 のポインタ）。固定文言のみで、
+    /// 利用者の値は含めない。[`crate::sql::allowlist::SqlSurfaceError::InvalidArgumentForNtileFunction`] の写像。
+    InvalidArgumentForNtileFunction => ("22014", "INVALID_ARGUMENT_FOR_NTILE_FUNCTION"),
     /// `GROUP BY` の `ROLLUP`／`CUBE`／`GROUPING SETS` の展開後セット数が上限を超えた、または
     /// 入れ子が深すぎる（`54001`。Issue #1821・SQL-59 のポインタ）。文の形だけで決まり、行・
     /// テナントに依存しない。固定文言のみ。

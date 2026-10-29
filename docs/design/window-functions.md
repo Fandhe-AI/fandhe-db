@@ -409,3 +409,26 @@ ORDER BY なし・複数キーの `RANGE UNBOUNDED PRECEDING` 等も評価され
   (2) `bigint` 型の `n` を受理する（`LAG` のオフセットと同じ既存の差異）。(3) 運べない型は `0A000`。
   PostgreSQL への実測は未実施で、テストの期待値は意味論から導いた。
 - **対象外**: `IGNORE NULLS`／`RESPECT NULLS`（PostgreSQL 17 も未対応）、名前付きウィンドウ（#1892）。
+
+## Issue #1884 追記: ntile（SQL-64 (4)・RLS-10 ポインタ）
+
+- **意味論**: `ntile(n)` はパーティションの行を並べ替えた順に n 個のバケットへ分け、バケット番号
+  （1 始まり）を返す。PostgreSQL 17 の `window_ntile` と同じ状態機械（スカラー 4 つ）を
+  `sql::window::evaluate_ntile_partition` に移植した。先頭の `行数 % n` 個のバケットが 1 行多い。
+  peer（同順位行）は区別せず、行の位置ごとに進める。バケット数 n に比例する確保・ループは無い。
+- **引数**: 1 個（誤りは `42883`）。バケット数が未確定の行でだけ引数を評価する（PostgreSQL と同じ。
+  列・式を渡すと先頭行の値で固定される）。NULL の行は NULL を返して次の行で再評価する。裸の `NULL` は
+  全行 NULL。0 以下は新 `ErrorClass::InvalidArgumentForNtileFunction`（`22014`。固定文言）、`int4`
+  範囲外は `22003`、整数以外は `42804`。`DISTINCT`・`*`・`$n` は `42601`、入れ子のウィンドウ関数は
+  `42P20`、集計は `42803`。0 行のパーティションは引数を評価しないためエラーにならない。
+- **束縛**: 引数は `BoundWindowOffsetArgs.value` に載せる（評価エラー `22xxx` が参照まで遅延するため。
+  `offset` は全行で即時評価されるので使わない）。結果型は `integer`。
+- **フレーム**: `OVER` のフレーム句は順位関数と同じく無視する（`WindowFunc::ignores_frame`。
+  フレームのオフセットも検査しない）。
+- **RLS**: 母集合は materialize 段を通った行のみ。他テナントの Private 行・`WHERE` で除いた行は
+  バケット境界に影響しない。
+- **破壊的変更**: 公開 enum `ErrorClass`・`SqlSurfaceError` に `22014` の分類を追加した（網羅 enum）。
+- **既知の差異**: (1) 型エラーは PostgreSQL の `42883` ではなく `42804`。(2) `bigint` 型の引数を受理する。
+  (3) `$n` は `42601`（`LAG`／`LEAD` と同じ）。(4) 同順位行の並びは `ORDER BY`→`id`→`seq` で決まる
+  （PostgreSQL では不定）。PostgreSQL への実測は未実施で、期待値は状態機械から導いた。
+- **対象外**: `percent_rank`／`cume_dist`（#1885）、名前付きウィンドウ（#1892）。

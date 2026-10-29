@@ -1126,6 +1126,7 @@ Date: <IMF-fixdate>
 | `2200H` | `SEQUENCE_GENERATOR_LIMIT_EXCEEDED` | 400 | Bad Request | `DEFAULT nextval('<SEQUENCE>')` を持つ列を省略した `insert` で、NO CYCLE の SEQUENCE が上限・下限に達した（TABLE-24・Issue #1690。副作用ゼロ。値・SEQUENCE 名は含めない） |
 | `22012` | `DIVISION_BY_ZERO` | 400 | Bad Request | `insert`／`update` が書き込む行の `CHECK` 制約（TABLE-16・TASK-204）の式評価での 0 除算 |
 | `22013` | `INVALID_PRECEDING_OR_FOLLOWING_SIZE` | 400 | Bad Request | ウィンドウのフレーム句のオフセットが負（SQL 表層専用。NoSQL の `op` 語彙からは到達しない）。Issue #1889 |
+| `22014` | `INVALID_ARGUMENT_FOR_NTILE_FUNCTION` | 400 | Bad Request | `ntile` の引数が 0 以下（SQL 表層専用。NoSQL の `op` 語彙からは到達しない）。Issue #1884 |
 | `22015` | `INTERVAL_FIELD_OVERFLOW` | 400 | Bad Request | `INTERVAL` リテラルのフィールド値が範囲外（数値が `i64` に収まらない・単位換算や累積があふれる）。SQL 表層に加え、NoSQL の INTERVAL 列への `insert`／`update`／`filter` の文字列束縛からも到達する（型束縛は #1583 で対応）。Issue #1579 |
 | `22016` | `INVALID_ARGUMENT_FOR_NTH_VALUE` | 400 | Bad Request | `nth_value` の第 2 引数が 0 以下（SQL 表層専用。NoSQL の `op` 語彙からは到達しない）。Issue #1883 |
 | `2201B` | `INVALID_REGULAR_EXPRESSION` | 400 | Bad Request | 正規表現パターンの構文誤り（括弧の不整合・量指定の対象不在・回数の範囲外など）。SQL 表層（`~`／`~*`・`SIMILAR TO`）専用で、NoSQL の `op` 語彙からは到達しない。Issue #1786 |

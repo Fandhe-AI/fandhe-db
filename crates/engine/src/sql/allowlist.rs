@@ -980,6 +980,9 @@ pub enum SqlSurfaceError {
     /// `nth_value` の第 2 引数が 0 以下（`22016`。SQL-64 (3)・Issue #1883）。行の評価時に判定する。
     /// 固定文言のみで、利用者の値は含めない。
     InvalidArgumentForNthValue { detail: &'static str },
+    /// `ntile` の引数が 0 以下（`22014`。SQL-64 (4)・Issue #1884）。行の評価時に判定する。
+    /// 固定文言のみで、利用者の値は含めない。
+    InvalidArgumentForNtileFunction { detail: &'static str },
     /// `GROUP BY` のグルーピングセットの展開後セット数・入れ子の深さが上限を超えた
     /// （`54001`。Issue #1821・SQL-59）。固定文言のみ。
     StatementTooComplex { detail: &'static str },
@@ -1777,6 +1780,9 @@ impl ClassifiedError for SqlSurfaceError {
             SqlSurfaceError::InvalidArgumentForNthValue { .. } => {
                 ErrorClass::InvalidArgumentForNthValue
             }
+            SqlSurfaceError::InvalidArgumentForNtileFunction { .. } => {
+                ErrorClass::InvalidArgumentForNtileFunction
+            }
             SqlSurfaceError::StatementTooComplex { .. } => ErrorClass::StatementTooComplex,
             SqlSurfaceError::TooManyColumns { .. } => ErrorClass::TooManyColumns,
             SqlSurfaceError::TooManyArguments { .. } => ErrorClass::TooManyArguments,
@@ -1935,6 +1941,7 @@ impl std::fmt::Display for SqlSurfaceError {
             | SqlSurfaceError::WindowingError { detail }
             | SqlSurfaceError::InvalidPrecedingOrFollowingSize { detail }
             | SqlSurfaceError::InvalidArgumentForNthValue { detail }
+            | SqlSurfaceError::InvalidArgumentForNtileFunction { detail }
             | SqlSurfaceError::StatementTooComplex { detail }
             | SqlSurfaceError::TooManyColumns { detail }
             | SqlSurfaceError::TooManyArguments { detail } => f.write_str(detail),
@@ -3905,6 +3912,8 @@ pub(crate) enum WindowFunc {
     FirstValue,
     LastValue,
     NthValue,
+    /// 分位割り当て関数（`ntile(num_buckets)`。SQL-64 (4)・Issue #1884）。フレームは無視する。
+    Ntile,
 }
 
 impl WindowFunc {
@@ -3926,6 +3935,7 @@ impl WindowFunc {
             "FIRST_VALUE" => Some(WindowFunc::FirstValue),
             "LAST_VALUE" => Some(WindowFunc::LastValue),
             "NTH_VALUE" => Some(WindowFunc::NthValue),
+            "NTILE" => Some(WindowFunc::Ntile),
             _ => None,
         }
     }
@@ -3959,7 +3969,13 @@ impl WindowFunc {
     /// 式引数を [`WindowOffsetArgs`] 経路（`offset_args`）で運ぶ関数。`LAG`／`LEAD` と
     /// `first_value`／`last_value`／`nth_value`。集計関数の引数経路（[`AggregateArg`]）と分けるために使う。
     pub(crate) fn takes_value_args(self) -> bool {
-        self.is_value_offset() || self.is_frame_value()
+        self.is_value_offset() || self.is_frame_value() || self == WindowFunc::Ntile
+    }
+
+    /// フレーム句を評価に使わない関数（順位関数と `ntile`）。`sql::window::resolve_frames` が
+    /// フレームオフセットの検査・解決をこの判定で省く（SQL-64・Issue #1884）。
+    pub(crate) fn ignores_frame(self) -> bool {
+        self.is_ranking() || self == WindowFunc::Ntile
     }
 
     /// 呼び出しで受理する式引数の個数 `(最小, 最大)`（`takes_value_args` の関数のみ意味を持つ）。
@@ -3967,6 +3983,7 @@ impl WindowFunc {
         match self {
             WindowFunc::FirstValue | WindowFunc::LastValue => (1, 1),
             WindowFunc::NthValue => (2, 2),
+            WindowFunc::Ntile => (1, 1),
             _ => (1, 3),
         }
     }
@@ -3979,6 +3996,7 @@ impl WindowFunc {
             WindowFunc::FirstValue => "first_value",
             WindowFunc::LastValue => "last_value",
             WindowFunc::NthValue => "nth_value",
+            WindowFunc::Ntile => "ntile",
             WindowFunc::RowNumber => "row_number",
             WindowFunc::Rank => "rank",
             WindowFunc::DenseRank => "dense_rank",
@@ -7244,7 +7262,7 @@ impl<'a> Parser<'a> {
             let saved_minus = self.allow_unary_minus;
             let saved_null = self.allow_null_literal;
             self.allow_unary_minus = true;
-            self.allow_null_literal = !exprs.is_empty();
+            self.allow_null_literal = !exprs.is_empty() || func == WindowFunc::Ntile;
             let parsed = self.parse_value_expr(0);
             self.allow_null_literal = saved_null;
             self.allow_unary_minus = saved_minus;
