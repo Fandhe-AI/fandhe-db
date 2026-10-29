@@ -116,18 +116,24 @@ pub(super) fn reject_forbidden_clauses(tokens: &[Token]) -> Result<(), SqlSurfac
 }
 
 /// `INSERT INTO t ( cols ) ...` の列リスト（`(` の次から `)` の手前まで）の範囲。
-fn insert_column_list(tokens: &[Token]) -> Option<std::ops::Range<usize>> {
-    if !tokens.first().is_some_and(|t| ident_is(t, "INSERT")) {
+/// `start` は `INSERT` トークンの位置。
+fn insert_column_list_at(tokens: &[Token], start: usize) -> Option<std::ops::Range<usize>> {
+    if !tokens.get(start).is_some_and(|t| ident_is(t, "INSERT")) {
         return None;
     }
-    if !tokens.get(1).is_some_and(|t| ident_is(t, "INTO")) {
+    if !tokens
+        .get(start.saturating_add(1))
+        .is_some_and(|t| ident_is(t, "INTO"))
+    {
         return None;
     }
     // 表名は `Ident` または `QualifiedIdent` の 1 トークン。
-    if !matches!(tokens.get(3), Some(Token::Punct('('))) {
+    let open = start.saturating_add(3);
+    if !matches!(tokens.get(open), Some(Token::Punct('('))) {
         return None;
     }
-    let first = tokens.get(4)?;
+    let first_at = open.saturating_add(1);
+    let first = tokens.get(first_at)?;
     if matches!(first, Token::Keyword(Keyword::Select))
         || ident_is(first, "VALUES")
         || ident_is(first, "WITH")
@@ -135,14 +141,14 @@ fn insert_column_list(tokens: &[Token]) -> Option<std::ops::Range<usize>> {
         return None;
     }
     let mut depth = 1usize;
-    let mut k = 4usize;
+    let mut k = first_at;
     while let Some(t) = tokens.get(k) {
         match t {
             Token::Punct('(') => depth = depth.saturating_add(1),
             Token::Punct(')') => {
                 depth = depth.saturating_sub(1);
                 if depth == 0 {
-                    return Some(4..k);
+                    return Some(first_at..k);
                 }
             }
             _ => {}
@@ -150,6 +156,21 @@ fn insert_column_list(tokens: &[Token]) -> Option<std::ops::Range<usize>> {
         k = k.saturating_add(1);
     }
     None
+}
+
+/// `i` が `INSERT INTO t ( cols )` の列リスト内か。文頭の `INSERT` に加え、`WITH` の主文
+/// （`) INSERT ...`）とデータ変更 CTE 内（`( INSERT ...`）の `INSERT` も対象にする。
+fn in_insert_column_list(tokens: &[Token], i: usize) -> bool {
+    tokens.iter().enumerate().any(|(s, t)| {
+        if !ident_is(t, "INSERT") || s > i {
+            return false;
+        }
+        let at_stmt_start = s
+            .checked_sub(1)
+            .and_then(|p| tokens.get(p))
+            .is_none_or(|p| matches!(p, Token::Punct('(') | Token::Punct(')')));
+        at_stmt_start && insert_column_list_at(tokens, s).is_some_and(|r| r.contains(&i))
+    })
 }
 
 /// 表名位置（`FROM`・`JOIN`・`ONLY`・`UPDATE`・`INTO`・`TABLE`・`USING` の直後）の 1 トークン前か。
@@ -368,6 +389,30 @@ pub(super) fn classify_with(tokens: &[Token]) -> (EmbeddedKind, bool) {
 }
 
 /// `(` の直後が `INSERT`／`UPDATE`／`DELETE` のトークンがあるか（データ変更 CTE）。
+/// `RETURN QUERY`・問い合わせ `FOR` の主文を分類する（ADR D5: 書き込み経路を事前決定するため）。
+/// `SELECT`／`VALUES`／括弧始まりは `Select`、`INSERT`／`UPDATE`／`DELETE` はその種別、
+/// `WITH` は主文で判定。これら以外は `42601` で明示的に拒否する。
+pub(super) fn classify_query(tokens: &[Token]) -> Result<EmbeddedKind, SqlSurfaceError> {
+    let Some(first) = tokens.first() else {
+        return Err(syn_err("empty query in a PL/pgSQL statement"));
+    };
+    if matches!(first, Token::Keyword(Keyword::Select) | Token::Punct('('))
+        || ident_is(first, "VALUES")
+    {
+        Ok(EmbeddedKind::Select)
+    } else if ident_is(first, "INSERT") {
+        Ok(EmbeddedKind::Insert)
+    } else if ident_is(first, "UPDATE") {
+        Ok(EmbeddedKind::Update)
+    } else if ident_is(first, "DELETE") {
+        Ok(EmbeddedKind::Delete)
+    } else if ident_is(first, "WITH") {
+        Ok(classify_with(tokens).0)
+    } else {
+        Err(syn_err("unsupported query in a PL/pgSQL statement"))
+    }
+}
+
 pub(super) fn has_write_cte(tokens: &[Token]) -> bool {
     tokens.windows(2).any(|w| {
         matches!(w.first(), Some(Token::Punct('(')))
@@ -436,7 +481,7 @@ pub(crate) fn is_ident_position(tokens: &[Token], i: usize) -> bool {
     {
         return true;
     }
-    insert_column_list(tokens).is_some_and(|r| r.contains(&i))
+    in_insert_column_list(tokens, i)
 }
 
 /// 定義時検証に使うダミートークン。整数・浮動小数は `0`、真偽値は `false`、それ以外は文字列 `'0'`。

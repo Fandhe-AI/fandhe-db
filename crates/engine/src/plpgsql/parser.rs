@@ -18,7 +18,8 @@ use super::ast::{
     ParseOptions, ReturnShape, SqlExpr, Stmt, VarDecl, VarId, VarKind, VarRef,
 };
 use super::embedded::{
-    classify_with, has_write_cte, is_ident_position, reject_forbidden_clauses, split_into, RawInto,
+    classify_query, classify_with, has_write_cte, is_ident_position, reject_forbidden_clauses,
+    split_into, RawInto,
 };
 use super::lexer::{scan, TokKind};
 use super::{oos_err, syn_err, too_big_err};
@@ -1077,7 +1078,8 @@ impl<'a> Parser<'a> {
             return Err(syn_err("malformed PL/pgSQL FOR loop"));
         }
         let tokens = strip_outer_parens(sql_tokens(self.span_text(a, e)?)?);
-        let query = self.build_sql(tokens, EmbeddedKind::Select, false)?;
+        let kind = classify_query(&tokens)?;
+        let query = self.build_sql(tokens, kind, false)?;
         self.pos = e;
         self.expect_kw("LOOP")?;
         // 対象の解決は問い合わせ（外側のスコープ）の後。未宣言の単独対象は暗黙のレコード変数にする。
@@ -1185,7 +1187,8 @@ impl<'a> Parser<'a> {
             let a = self.pos;
             let e = self.find_end(a, &|_| false)?;
             let tokens = sql_tokens(self.span_text(a, e)?)?;
-            let q = self.build_sql(tokens, EmbeddedKind::Select, false)?;
+            let kind = classify_query(&tokens)?;
+            let q = self.build_sql(tokens, kind, false)?;
             self.pos = e;
             self.expect_punct(';')?;
             return Ok(Stmt::ReturnQuery(q));

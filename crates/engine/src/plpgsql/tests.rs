@@ -313,6 +313,49 @@ fn insert_column_list_and_update_set_target_are_not_variable_references() {
 }
 
 #[test]
+fn with_insert_and_cte_insert_column_lists_are_identifier_positions() {
+    for src in [
+        "DECLARE x int; BEGIN WITH c AS (SELECT 1) INSERT INTO t(x) VALUES (x); END",
+        "DECLARE x int; BEGIN WITH c AS (INSERT INTO t(x) VALUES (x) RETURNING 1) SELECT 1; END",
+    ] {
+        let b = ok(src);
+        let Some(Stmt::Sql(q)) = b.block.stmts.first() else {
+            panic!("sql");
+        };
+        assert_eq!(q.var_refs.len(), 1, "for {src:?}");
+        assert!(q.writes);
+    }
+}
+
+#[test]
+fn return_query_and_for_query_classify_write_main_statements() {
+    let o = opts_with(ReturnShape::SetOf);
+    let b = ok_with("BEGIN RETURN QUERY UPDATE t SET x = 1 RETURNING x; END", &o);
+    let Some(Stmt::ReturnQuery(q)) = b.block.stmts.first() else {
+        panic!("rq");
+    };
+    assert!(q.writes);
+    assert_eq!(q.kind, EmbeddedKind::Update);
+    let b = ok_with(
+        "BEGIN FOR r IN WITH c AS (SELECT 1) UPDATE t SET x = 1 RETURNING x LOOP NULL; END LOOP; END",
+        &opts(),
+    );
+    let Some(Stmt::ForQuery { query, .. }) = b.block.stmts.first() else {
+        panic!("for");
+    };
+    assert!(query.writes);
+    let b = ok_with("BEGIN RETURN QUERY SELECT 1; END", &o);
+    let Some(Stmt::ReturnQuery(q)) = b.block.stmts.first() else {
+        panic!("rq");
+    };
+    assert!(!q.writes);
+    assert_eq!(
+        code_with("BEGIN RETURN QUERY CREATE TABLE t(a int); END", &o),
+        "42601"
+    );
+}
+
+#[test]
 fn ident_position_classification() {
     let t = tokenize("SELECT f(x) FROM x AS y").expect("tokenize");
     // f( の f・FROM の x・AS の y は識別子位置、f( の引数 x は違う。
