@@ -312,7 +312,11 @@ pub(super) fn try_build(
         for key in g.order_by.iter_mut() {
             let Some(k) = key.ordinal else { continue };
             let out_of_range = || SqlSurfaceError::OrderByPositionNotInSelectList { position: k };
-            let u = usize::try_from(k.saturating_sub(1)).map_err(|_| out_of_range())?;
+            // 序数は 1 始まり。0・負数は範囲外として 42P10 で拒否する（fail-closed）。
+            let u = k
+                .checked_sub(1)
+                .and_then(|v| usize::try_from(v).ok())
+                .ok_or_else(out_of_range)?;
             match list.get(u) {
                 None => return Err(out_of_range()),
                 Some(ListItem::Window(..)) => return Err(SqlSurfaceError::unsupported(

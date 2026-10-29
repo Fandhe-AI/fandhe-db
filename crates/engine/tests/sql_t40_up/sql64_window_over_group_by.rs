@@ -314,7 +314,7 @@ fn group_count_over_cap_is_rejected() {
 #[test]
 fn unsupported_shapes_fail_closed() {
     let (core, _g) = build("sql64-gw-reject", None);
-    let cases: [(&str, &str); 15] = [
+    let cases: [(&str, &str); 17] = [
         // グループ化されていない列を窓が参照する。
         (
             "SELECT g, count(*), rank() OVER (ORDER BY k) FROM t GROUP BY g",
@@ -360,6 +360,15 @@ fn unsupported_shapes_fail_closed() {
         ),
         (
             "SELECT g, count(*), rank() OVER (ORDER BY g) FROM t GROUP BY g ORDER BY 9",
+            "42P10",
+        ),
+        // 序数 0 は先頭が通常列でも窓項目でも 42P10。
+        (
+            "SELECT g, count(*), rank() OVER (ORDER BY g) FROM t GROUP BY g ORDER BY 0",
+            "42P10",
+        ),
+        (
+            "SELECT rank() OVER (ORDER BY g), g, count(*) FROM t GROUP BY g ORDER BY 0",
             "42P10",
         ),
         // 存在しない列。
