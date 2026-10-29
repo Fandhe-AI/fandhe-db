@@ -2399,8 +2399,9 @@ pub struct UdfDefinition {
 }
 
 /// セッション単位の UDF レジストリ（`sql::mode::SessionState` が保持する）。
-/// 追記専用（再定義・`DROP` は許可しない。RLS-8 と同じ「認証済みテナントの接続単位」
-/// の外へ漏れない構造にするため、他セッション・永続化とは無関係に保つ）。
+/// 再定義は許可しない（同名は `42723`）。削除は `DROP FUNCTION`（#1920）だけが [`Self::remove`] で行う。
+/// 永続化（#1920）後も、レジストリは RLS-8 と同じ「認証済みテナントの接続単位」の外へ漏れない構造を
+/// 保つ（カタログは自テナントの scope でしか引けず、セッションへのロードは #1921 が担う）。
 ///
 /// `PartialEq` は手動実装する（`wasm` マップの値 `Arc<dyn WasmUdfBackend>` が
 /// `dyn` 型のため構造的な `derive` を導出できない。宣言的 UDF 定義は構造等価、
@@ -2448,10 +2449,19 @@ impl UdfRegistry {
         self.defs.is_empty() && self.wasm.is_empty()
     }
 
+    /// 宣言的 UDF・WASM UDF を名前（大文字小文字を区別しない）で削除し、削除したら `true`
+    /// （`DROP FUNCTION` から呼ばれる。同じ名前空間を共有するため両方の表から外す）。
+    pub(crate) fn remove(&mut self, name: &str) -> bool {
+        let lower = name.to_ascii_lowercase();
+        let a = self.defs.remove(&lower).is_some();
+        let b = self.wasm.remove(&lower).is_some();
+        a || b
+    }
+
     /// 名前空間（組み込み・宣言的 UDF・WASM UDF を横断した名前）が既に使われて
     /// いるかを判定する（[`define_function`]・[`define_wasm_function`] が共有する
     /// 衝突検査）。
-    fn is_name_taken(&self, lower: &str) -> bool {
+    pub(crate) fn is_name_taken(&self, lower: &str) -> bool {
         self.defs.contains_key(lower) || self.wasm.contains_key(lower)
     }
 }
@@ -2474,6 +2484,30 @@ pub fn define_function(
     params: &[String],
     body: &Expr,
 ) -> Result<(), SqlSurfaceError> {
+    let prepared = prepare_function_definition(registry, name, params, body)?;
+    commit_function_definition(registry, prepared);
+    Ok(())
+}
+
+/// [`prepare_function_definition`] が返す検証済みの定義（レジストリへ入れる直前の値。
+/// `CREATE FUNCTION` の永続化経路（`sql::udf_ddl`）がカタログへ書く値の元にもなる）。
+#[derive(Debug, Clone)]
+pub(crate) struct PreparedUdf {
+    /// 小文字化済みの関数キー（裸の名前または `#<id>.<name>`）。
+    pub(crate) key: String,
+    /// 小文字化済みの引数名。
+    pub(crate) params: Vec<String>,
+    pub(crate) body: Expr,
+}
+
+/// [`define_function`] の検証部（レジストリは変更しない）。永続化経路が「検証 → カタログ書き込み →
+/// 登録」の順を守れるよう、検証と登録（[`commit_function_definition`]）を分けている。
+pub(crate) fn prepare_function_definition(
+    registry: &UdfRegistry,
+    name: &str,
+    params: &[String],
+    body: &Expr,
+) -> Result<PreparedUdf, SqlSurfaceError> {
     // 関数名は relation キー（裸の名前、または SCHEMA 配下の内部キー `#<id>.<name>`。
     // 名前解決器が `CREATE FUNCTION s.f(` を解決した出力。TABLE-27・Issue #1717）を受理する。
     catalog::validate_relation_key(name)
@@ -2528,14 +2562,23 @@ pub fn define_function(
     let mut node_budget = MAX_EXPR_NODES;
     validate_closed_expr(body, &normalized_params, registry, &mut node_budget)?;
 
+    Ok(PreparedUdf {
+        key: lower,
+        params: normalized_params,
+        body: body.clone(),
+    })
+}
+
+/// 検証済みの定義をレジストリへ登録する（BTreeMap への挿入だけで失敗しない）。永続化経路では
+/// カタログの commit 成功後にだけ呼ぶ（カタログで失敗したらセッションは変わらない）。
+pub(crate) fn commit_function_definition(registry: &mut UdfRegistry, prepared: PreparedUdf) {
     registry.defs.insert(
-        lower,
+        prepared.key,
         UdfDefinition {
-            params: normalized_params,
-            body: body.clone(),
+            params: prepared.params,
+            body: prepared.body,
         },
     );
-    Ok(())
 }
 
 /// テスト専用: `define_function` のパラメータ名正規化（小文字化）を経由せず、

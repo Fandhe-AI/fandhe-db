@@ -5,9 +5,10 @@ TABLE-27・RLS-12・TASK-309）のポインタ表記のみで参照し、spec �
 
 ## 範囲
 
-- 本 Issue: redb のテーブル定義、定義 blob の版付き保存形式、crate 内部の保存・読み出し API
-  （`crates/engine/src/catalog/function.rs`）。呼び出し元は当面テストのみ。
-- 範囲外: `CREATE FUNCTION`／`DROP FUNCTION` からの書き込み（#1920）、セッション開始時のロード
+- #1919: redb のテーブル定義、定義 blob の版付き保存形式、crate 内部の保存・読み出し API
+  （`crates/engine/src/catalog/function.rs`）。
+- #1920: `CREATE FUNCTION`／`DROP FUNCTION` からの書き込み（下記「書き込み経路」）。
+- 範囲外: セッション開始時のロード
   （#1921）、件数上限の設定・DDL 権限（#1922）、依存追跡、`OR REPLACE` の意味論。
 
 ## テーブル
@@ -54,10 +55,45 @@ u8 version(=1) / u64 id / u8 owner(予約=0) / u8 language / u8 volatility / u8 
 上限超過、不正 UTF-8・識別子・型、キーと値のシグネチャ不一致はすべて固定文言の `CorruptSchema`。
 blob の断片・tenant_id・本体の原文はエラー文言へ出さない。
 
+## 書き込み経路（Issue #1920）
+
+`CREATE FUNCTION`／`DROP FUNCTION` をカタログへ結線した（実行本体は `sql/udf_ddl.rs`、呼び出し元は
+`core.rs`）。
+
+- **判定順（CREATE）**: 構文（`AS` 以降のトークン列を `lexer::render_tokens` で描画し `body_source` にする。
+  CREATE VIEW の `body_sql` と同じ規約。名前解決後のトークンのため SCHEMA 配下は `#<id>.f` 形のまま。
+  描画不能・上限超過は拒否）→ `prepare_function_definition`（予約名・識別子・引数・閉じた本体。レジストリ
+  不変）→ セッションに同名があれば `42723` → `Storage::create_function`（単一 write txn・1 回の commit。
+  同名の定義があれば `42723`・件数上限 `54000`）→ commit 成功後にレジストリへ登録。カタログで失敗した
+  場合セッションは変わらない。
+- **DROP（最小形）**: `DROP FUNCTION <名前> [(<型>, ...)]` のみ。`IF EXISTS`・`CASCADE`／`RESTRICT`・複数名は
+  `0A000`（#1917 が受理）。カタログ（DDL 権限ありのときだけ）とセッションのレジストリの両方から消し、
+  どちらでも消えなかった場合だけ `42883`（他テナントの定義も同じ。存在情報を出さない）。型の並びは引数の
+  数と、型注釈のある引数の型で照合する（型注釈なしの引数は任意の型に一致）。
+- **権限**: `session.ddl_allowed()` のときだけカタログへ書く。権限が無いセッションは従来どおりセッション内
+  だけ（カタログは読みも書きもしない）。`42501` ゲートへの切り替えは #1922。
+- **多重定義**: 同名の定義がカタログに 1 件でもあれば、シグネチャが違っても `42723`。`UdfRegistry` は名前
+  単位でしか持てず、書けても読めない状態を作らないため。名前だけの DROP が常に一意に解決できる。
+- **明示トランザクション**: DDL 権限ありのセッションの `CREATE`／`DROP FUNCTION` は `0A000`（ROLLBACK で
+  取り消せない書き込みを txn 内で行わない）。権限なしのセッションはセッション内登録のみで従来どおり。
+- **DROP SCHEMA との連動**: `RESTRICT` は配下に関数があれば `2BP01`。`CASCADE` は同じ write txn で配下の
+  関数行（自テナント・自 SCHEMA の接頭辞）も消す。残すと内部キーを書けない利用者が DROP できない孤児になる。
+- **crash 耐性**: 新しい crash-test ジョブは足さない。CREATE／DROP はいずれも単一 write txn の 1 回の
+  `commit_boundary::commit` で、CREATE VIEW・SEQUENCE と同じ保証になるため、再オープンを検証する
+  in-process テスト（`tests/sql_t40_up/sql66_udf_catalog_write.rs`）で足りる。
+- **public の共有**: 見送り（テナント単位を維持）。全テナント共有は予約 scope（空文字列）で後から足せ、
+  blob 形式は変わらない。spec 側の確認事項。
+- **スコープ外の扱い**: ENUM 型は解禁せず、カタログが拒否した場合は `0A000`。
+
 ## 後続への申し送り
 
-- 共有 `public` の扱い（#1920）: 本 Issue の実装はテナント単位である。共有の扱いは後続 Issue #1920 で扱う。
-- ENUM 型の引数・戻り値の解禁（#1920。形式は不変）。
-- `sql::udf_call::MAX_UDF_PARAMS`（32）と格納上限 100 の整合（#1920／#1922）。
-- 他セッションへの伝播の世代カウンタ（#1921）。独立テーブルとして後から追加でき、blob 形式は変わらない。
-- 依存追跡（`2BP01`）・多重定義の解決規則・`OR REPLACE`（#1920 以降）。
+- 共有 `public` の扱い: 上記のとおりテナント単位を維持。共有する場合は spec 側の確認が要る。
+- ENUM 型の引数・戻り値の解禁（形式は不変）。
+- `sql::udf_call::MAX_UDF_PARAMS`（32）は構文段で先に効き、格納上限 100 の内側に収まる。100 と `54023` への
+  引き上げは #1917／#1922。
+- #1921（ロード）: `body_source` は同じ字句解析（`tokenize_stored_view_body` 相当）と許可リストで再パース
+  する。他セッションの DROP 後に stale になった登録は世代カウンタで扱う（独立テーブルとして後から追加でき、
+  blob 形式は変わらない）。
+- #1917: `IF EXISTS`・`CASCADE`／`RESTRICT`・複数名・`OR REPLACE`・依存追跡（`2BP01`）・多重定義の解決規則と
+  `42725`（現状は名前の多重定義を作らないため、防御的な `Internal` に写している）。
+- #1922: `42501` ゲート（権限なしのセッション内経路の撤去を含む）、件数上限の CLI 設定、引数上限。

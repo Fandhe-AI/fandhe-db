@@ -816,6 +816,10 @@ pub(crate) fn map_outcome(outcome: SqlOutcome) -> OutcomeResponse {
         SqlOutcome::CreateFunction { .. } => OutcomeResponse::Command {
             tag: "CREATE FUNCTION".to_string(),
         },
+        // SQL-66（Issue #1920）: `DROP FUNCTION` の応答タグ。
+        SqlOutcome::DropFunction(_) => OutcomeResponse::Command {
+            tag: "DROP FUNCTION".to_string(),
+        },
         // TASK-82（SQL-10）: `INSERT`（行形・ファイル形いずれも
         // `exec::InsertOutcome::rows_affected` に書き込み件数を保持する。
         // `sql/exec.rs` ドキュメント参照）の応答を pg 互換の `CommandComplete`
