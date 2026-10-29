@@ -21,20 +21,44 @@ pub(super) fn ident_is(t: &Token, word: &str) -> bool {
     matches!(t, Token::Ident(s) if s.eq_ignore_ascii_case(word))
 }
 
+/// キーワード判定用の「見え方」を作る。二重引用符付き識別子（`quoted[i]`）の内容の先頭に `"` を付け、
+/// [`ident_is`] が決して一致しないようにする。SQL 字句解析器は `"into"` も `into` も `Ident("into")`
+/// に潰すため、これが無いと列名・別名の `"into"`／`"partitioned"` を句のキーワードと取り違える。
+/// 長さと添字は元の `tokens` と同一（構造の判定専用で、名前の取り出しには元の `tokens` を使う）。
+/// `split_into`・`reject_forbidden_clauses`・`IdentCtx::new`・`classify_*` が内部で使う。
+pub(super) fn keyword_view(tokens: &[Token], quoted: &[bool]) -> Vec<Token> {
+    tokens
+        .iter()
+        .enumerate()
+        .map(|(i, t)| match t {
+            Token::Ident(s) if quoted.get(i).copied().unwrap_or(false) => {
+                Token::Ident(format!("\"{s}"))
+            }
+            other => other.clone(),
+        })
+        .collect()
+}
+
 /// `INTO` 句の生の対象（修飾子, 名前）。
 pub(super) struct RawInto {
     pub(super) strict: bool,
     pub(super) targets: Vec<(Option<String>, String)>,
 }
 
+/// [`split_into`] の結果（INTO 区間を除いたトークン列・同じ長さの引用情報・取り出した INTO 句）。
+pub(super) type SplitInto = (Vec<Token>, Vec<bool>, Option<RawInto>);
+
 /// 括弧の深さ 0 の文脈キーワード `INTO` と対象列を取り除く。`INSERT INTO` の `INTO` は対象外。
-/// `INTO` が 2 個あれば `42601`。
+/// 引用付きの `"into"`（列名・別名）は句ではない。`INTO` が 2 個あれば `42601`。
+/// 戻り値のトークン列と引用情報は常に同じ長さ（取り除いた区間は両方から落とす）。
 pub(super) fn split_into(
-    tokens: Vec<Token>,
-) -> Result<(Vec<Token>, Option<RawInto>), SqlSurfaceError> {
+    mut tokens: Vec<Token>,
+    mut quoted: Vec<bool>,
+) -> Result<SplitInto, SqlSurfaceError> {
+    let view = keyword_view(&tokens, &quoted);
     let mut depth = 0usize;
     let mut found: Option<usize> = None;
-    for (i, t) in tokens.iter().enumerate() {
+    for (i, t) in view.iter().enumerate() {
         match t {
             Token::Punct('(') => depth = depth.saturating_add(1),
             Token::Punct(')') => depth = depth.saturating_sub(1),
@@ -43,7 +67,7 @@ pub(super) fn split_into(
         if depth == 0 && ident_is(t, "INTO") {
             let after_insert = i
                 .checked_sub(1)
-                .and_then(|p| tokens.get(p))
+                .and_then(|p| view.get(p))
                 .is_some_and(|p| ident_is(p, "INSERT"));
             if after_insert {
                 continue;
@@ -55,11 +79,11 @@ pub(super) fn split_into(
         }
     }
     let Some(at) = found else {
-        return Ok((tokens, None));
+        return Ok((tokens, quoted, None));
     };
     let mut j = at.saturating_add(1);
     let mut strict = false;
-    if tokens.get(j).is_some_and(|t| ident_is(t, "STRICT")) {
+    if view.get(j).is_some_and(|t| ident_is(t, "STRICT")) {
         strict = true;
         j = j.saturating_add(1);
     }
@@ -79,17 +103,19 @@ pub(super) fn split_into(
             break;
         }
     }
-    let mut out = Vec::with_capacity(tokens.len());
-    for (i, t) in tokens.into_iter().enumerate() {
-        if i < at || i >= j {
-            out.push(t);
-        }
-    }
-    Ok((out, Some(RawInto { strict, targets })))
+    tokens.drain(at..j.min(tokens.len()));
+    quoted.drain(at..j.min(quoted.len()));
+    debug_assert_eq!(tokens.len(), quoted.len());
+    Ok((tokens, quoted, Some(RawInto { strict, targets })))
 }
 
 /// 本体の中で禁止する句（`USING OPERATION_ID`・括弧の深さ 0 の `PARTITIONED`）を `0A000` で拒否する。
-pub(super) fn reject_forbidden_clauses(tokens: &[Token]) -> Result<(), SqlSurfaceError> {
+/// 引用付きの `"partitioned"`・`"operation_id"`（列名・別名）は句ではないので拒否しない。
+pub(super) fn reject_forbidden_clauses(
+    tokens: &[Token],
+    quoted: &[bool],
+) -> Result<(), SqlSurfaceError> {
+    let tokens = keyword_view(tokens, quoted);
     let mut depth = 0usize;
     for (i, t) in tokens.iter().enumerate() {
         match t {
@@ -153,6 +179,8 @@ fn insert_column_list_at(
 pub(super) struct ParenInfo {
     /// 各トークンを直接囲む `(` の 1 つ前のトークン位置（囲む括弧が無い／括弧が先頭なら `None`）。
     encl_prev: Vec<Option<usize>>,
+    /// 各トークンを直接囲む `(` のトークン位置（囲む括弧が無ければ `None`）。
+    encl_open: Vec<Option<usize>>,
     /// 各トークンが CTE 列名リスト `name (a, b) AS (` の内側か。
     cte_cols: Vec<bool>,
     /// 各トークンが `INSERT INTO t ( cols )` の列リスト内か。
@@ -188,7 +216,14 @@ impl ParenInfo {
                     cte_as_follows(tokens, m.saturating_add(1))
                         && k.checked_sub(1)
                             .and_then(|p| tokens.get(p))
-                            .is_some_and(|p| matches!(p, Token::Ident(_)))
+                            .is_some_and(|p| {
+                                matches!(
+                                    p,
+                                    Token::Ident(_)
+                                        | Token::QuotedBoolWord(_)
+                                        | Token::QuotedNull(_)
+                                )
+                            })
                 })
             })
             .collect();
@@ -231,6 +266,7 @@ impl ParenInfo {
             .collect();
         Self {
             encl_prev,
+            encl_open,
             cte_cols,
             insert_cols,
         }
@@ -245,14 +281,14 @@ impl ParenInfo {
 
 /// `tokens[k]`（`FROM`）が式の内部の `FROM`（`IS [NOT] DISTINCT FROM`・`substring`/`extract`/`trim`/
 /// `overlay` の `FROM`）か。表参照を導入する `FROM` ではないので、直後の語は変数でありうる。
-fn is_expr_from(tokens: &[Token], k: usize) -> bool {
+fn is_expr_from(tokens: &[Token], k: usize, parens: &ParenInfo) -> bool {
     if k.checked_sub(1)
         .and_then(|p| tokens.get(p))
         .is_some_and(|p| ident_is(p, "DISTINCT"))
     {
         return true;
     }
-    enclosing_paren_prev(tokens, k).is_some_and(|p| {
+    parens.enclosing_prev(tokens, k).is_some_and(|p| {
         ["SUBSTRING", "EXTRACT", "TRIM", "OVERLAY"]
             .iter()
             .any(|w| ident_is(p, w))
@@ -260,8 +296,8 @@ fn is_expr_from(tokens: &[Token], k: usize) -> bool {
 }
 
 /// `tokens[k]` が表参照を導入する `FROM` か。
-fn is_table_from(tokens: &[Token], k: usize) -> bool {
-    matches!(tokens.get(k), Some(Token::Keyword(Keyword::From))) && !is_expr_from(tokens, k)
+fn is_table_from(tokens: &[Token], k: usize, parens: &ParenInfo) -> bool {
+    matches!(tokens.get(k), Some(Token::Keyword(Keyword::From))) && !is_expr_from(tokens, k, parens)
 }
 
 /// `FROM` 句の関係リストを終える語。
@@ -296,7 +332,7 @@ fn is_join_word(t: &Token) -> bool {
 
 /// 各トークンが `FROM`／`USING` の関係リスト（カンマ区切りの表・JOIN 対象・別名）の内側にあるかを
 /// 前方走査で求める。`ON` 条件式・括弧の内側・式内部の `FROM` は含めない（括弧ごとに状態を持つ）。
-fn from_relation_slots(tokens: &[Token]) -> Vec<bool> {
+fn from_relation_slots(tokens: &[Token], parens: &ParenInfo) -> Vec<bool> {
     #[derive(Clone, Copy, PartialEq)]
     enum St {
         Idle,
@@ -325,7 +361,7 @@ fn from_relation_slots(tokens: &[Token]) -> Vec<bool> {
             _ => {}
         }
         let Some(st) = stack.last_mut() else { continue };
-        if is_table_from(tokens, k) {
+        if is_table_from(tokens, k, parens) {
             *st = St::Rel;
             continue;
         }
@@ -362,9 +398,9 @@ fn from_relation_slots(tokens: &[Token]) -> Vec<bool> {
 }
 
 /// 表名位置（`FROM`・`JOIN`・`ONLY`・`UPDATE`・`INTO`・`TABLE`・`USING` の直後）の 1 トークン前か。
-fn is_table_slot(tokens: &[Token], j: usize) -> bool {
+fn is_table_slot(tokens: &[Token], j: usize, parens: &ParenInfo) -> bool {
     match j.checked_sub(1).and_then(|p| tokens.get(p)) {
-        Some(Token::Keyword(Keyword::From)) => is_table_from(tokens, j - 1),
+        Some(Token::Keyword(Keyword::From)) => is_table_from(tokens, j - 1, parens),
         Some(p) => ["JOIN", "INTO", "UPDATE", "TABLE", "ONLY", "USING"]
             .iter()
             .any(|w| ident_is(p, w)),
@@ -413,71 +449,95 @@ const CLAUSE_WORDS: &[&str] = &[
     "NOT",
 ];
 
-/// `i` を直接囲む `(` の 1 つ前のトークン（囲む括弧が無ければ `None`）。
-fn enclosing_paren_prev(tokens: &[Token], i: usize) -> Option<&Token> {
-    let mut depth = 0usize;
-    let mut k = i;
-    while k > 0 {
-        k -= 1;
-        match tokens.get(k)? {
-            Token::Punct(')') => depth = depth.saturating_add(1),
+/// 各トークンが `UPDATE ... SET` の代入リスト内（直前までに有効な `SET` があり、`FROM`／`WHERE`／
+/// `SELECT`／`RETURNING`／`ON`／`VALUES` や括弧の境界で途切れていない）かを前方走査 1 回で求める。
+/// 括弧ごとに状態を持ち、トークンごとの後方再走査（二乗コスト）を避ける。値は「そのトークンを処理する
+/// 直前の状態」。`SET` 節の開始は「直前が `,`／SELECT でなく、直後が `対象 =`」の `SET` だけ
+/// （SELECT リストの `set` 列〔`SELECT set, v = 1`〕を SET 節と誤認しない）。
+fn set_list_mask(tokens: &[Token]) -> Vec<bool> {
+    let mut out = vec![false; tokens.len()];
+    let mut stack: Vec<bool> = vec![false];
+    for (k, t) in tokens.iter().enumerate() {
+        if let (Some(o), Some(st)) = (out.get_mut(k), stack.last()) {
+            *o = *st;
+        }
+        match t {
             Token::Punct('(') => {
-                if depth == 0 {
-                    return k.checked_sub(1).and_then(|p| tokens.get(p));
+                stack.push(false);
+                continue;
+            }
+            Token::Punct(')') => {
+                if stack.len() > 1 {
+                    stack.pop();
                 }
-                depth -= 1;
+                continue;
             }
             _ => {}
         }
+        let Some(st) = stack.last_mut() else { continue };
+        if ident_is(t, "SET") {
+            let prev_ok = k
+                .checked_sub(1)
+                .and_then(|p| tokens.get(p))
+                .is_some_and(|p| !matches!(p, Token::Punct(',') | Token::Keyword(Keyword::Select)));
+            let next_ok = matches!(
+                tokens.get(k.saturating_add(1)),
+                Some(Token::Ident(_) | Token::QualifiedIdent { .. })
+            ) && matches!(tokens.get(k.saturating_add(2)), Some(Token::Punct('=')));
+            if prev_ok && next_ok {
+                *st = true;
+            }
+        }
+        if matches!(
+            t,
+            Token::Keyword(Keyword::From | Keyword::Where | Keyword::Select)
+        ) || ["RETURNING", "ON", "VALUES"].iter().any(|w| ident_is(t, w))
+        {
+            *st = false;
+        }
     }
-    None
+    out
 }
 
-/// 括弧の外側（深さ 0）の直近の `SET` が、`FROM`/`WHERE` 等を挟まずに存在するか（`SET` 代入リスト内か）。
-fn in_set_list(tokens: &[Token], i: usize) -> bool {
-    let mut depth = 0usize;
-    let mut k = i;
-    while k > 0 {
-        k -= 1;
-        match tokens.get(k) {
-            Some(Token::Punct(')')) => depth = depth.saturating_add(1),
-            Some(Token::Punct('(')) => {
-                if depth == 0 {
-                    return false;
-                }
-                depth -= 1;
+/// 派生表・関数の列別名リスト（`(SELECT 1) AS d(v)`・`(SELECT 1) d(v)`・`t AS a(x)`・`t a(x)`）の
+/// 内側のトークンを求める。`(` の直前が関係リスト内の別名名で、その前が `)`・`AS`・表名のときだけ。
+/// `FROM generate_series(1, v)`（直前の前が `FROM`）や `JOIN f(..)`・`ONLY`・`LATERAL` の呼び出し
+/// 引数は含めない（引数の変数は参照のまま）。
+fn alias_column_mask(tokens: &[Token], slots: &[bool], parens: &ParenInfo) -> Vec<bool> {
+    let n = tokens.len();
+    let mut open_is_alias = vec![false; n];
+    for (k, t) in tokens.iter().enumerate() {
+        if !matches!(t, Token::Punct('(')) || k < 2 {
+            continue;
+        }
+        let name_ok = matches!(tokens.get(k - 1), Some(Token::Ident(_)))
+            && slots.get(k - 1).copied().unwrap_or(false);
+        if !name_ok {
+            continue;
+        }
+        let before = tokens.get(k - 2);
+        let after_clause = match before {
+            Some(Token::Punct(')')) => true,
+            Some(p) if ident_is(p, "AS") => true,
+            Some(p @ (Token::Ident(_) | Token::QualifiedIdent { .. })) => {
+                k >= 3
+                    && is_table_slot(tokens, k - 2, parens)
+                    && !ident_is(p, "ONLY")
+                    && !matches!(p, Token::Ident(w) if CLAUSE_WORDS.iter().any(|c| w.eq_ignore_ascii_case(c)))
             }
-            Some(t) if depth == 0 => {
-                // SET 節の開始は「直前が `,`／SELECT でなく、直後が `対象 =`」の `SET` だけ。
-                // SELECT リストの `set` 列（`SELECT set, v = 1`）を SET 節と誤認しない。
-                if ident_is(t, "SET") {
-                    let prev_ok = k
-                        .checked_sub(1)
-                        .and_then(|p| tokens.get(p))
-                        .is_some_and(|p| {
-                            !matches!(p, Token::Punct(',') | Token::Keyword(Keyword::Select))
-                        });
-                    let next_ok =
-                        matches!(
-                            tokens.get(k.saturating_add(1)),
-                            Some(Token::Ident(_) | Token::QualifiedIdent { .. })
-                        ) && matches!(tokens.get(k.saturating_add(2)), Some(Token::Punct('=')));
-                    if prev_ok && next_ok {
-                        return true;
-                    }
-                }
-                if matches!(
-                    t,
-                    Token::Keyword(Keyword::From | Keyword::Where | Keyword::Select)
-                ) || ["RETURNING", "ON", "VALUES"].iter().any(|w| ident_is(t, w))
-                {
-                    return false;
-                }
+            _ => false,
+        };
+        if after_clause {
+            if let Some(o) = open_is_alias.get_mut(k) {
+                *o = true;
             }
-            _ => {}
         }
     }
-    false
+    parens
+        .encl_open
+        .iter()
+        .map(|o| o.is_some_and(|k| open_is_alias.get(k).copied().unwrap_or(false)))
+        .collect()
 }
 
 /// `i` 以降が `AS [[NOT] MATERIALIZED] (` の形か（CTE 定義の入口）。`from` は `AS` の位置。
@@ -507,7 +567,12 @@ fn is_cte_decl_name(tokens: &[Token], i: usize) -> bool {
 /// なりうるため、深さ 0 の最初の語を見る方式は使わない。定義の形を読み解けない・主文が
 /// `SELECT`／`VALUES`／`INSERT`／`UPDATE`／`DELETE`／`(` 以外のときは `42601` で拒否する
 /// （書き込み経路の事前決定なので判定不能は fail-closed）。
-pub(super) fn classify_with(tokens: &[Token]) -> Result<(EmbeddedKind, bool), SqlSurfaceError> {
+pub(super) fn classify_with(
+    tokens: &[Token],
+    quoted: &[bool],
+) -> Result<(EmbeddedKind, bool), SqlSurfaceError> {
+    let tokens = keyword_view(tokens, quoted);
+    let tokens = tokens.as_slice();
     let bad = || syn_err("unsupported WITH statement in a PL/pgSQL body");
     // `open` の `(` に対応する `)` の次の位置。
     let skip_parens = |open: usize| -> Option<usize> {
@@ -530,15 +595,8 @@ pub(super) fn classify_with(tokens: &[Token]) -> Result<(EmbeddedKind, bool), Sq
         return Err(bad());
     }
     let mut j = 1usize;
-    // 引用の有無は `Token` で区別できないため先読みで決める。`recursive` の次が `(`（列リスト）または
-    // `AS (`／`AS NOT`／`AS MATERIALIZED`（CTE 定義の入口）なら CTE 名、それ以外は省略可能な
-    // `RECURSIVE` キーワード。
-    let names_cte = matches!(tokens.get(2), Some(Token::Punct('(')))
-        || (tokens.get(2).is_some_and(|t| ident_is(t, "AS"))
-            && tokens.get(3).is_some_and(|t| {
-                matches!(t, Token::Punct('(')) || ident_is(t, "NOT") || ident_is(t, "MATERIALIZED")
-            }));
-    if tokens.get(j).is_some_and(|t| ident_is(t, "RECURSIVE")) && !names_cte {
+    // 引用付きの `"recursive"` は `keyword_view` で `RECURSIVE` と一致しない（CTE 名として読む）。
+    if tokens.get(j).is_some_and(|t| ident_is(t, "RECURSIVE")) {
         j = j.saturating_add(1);
     }
     loop {
@@ -581,15 +639,20 @@ pub(super) fn classify_with(tokens: &[Token]) -> Result<(EmbeddedKind, bool), Sq
         Some(Token::Keyword(Keyword::Select)) | Some(Token::Punct('(')) => EmbeddedKind::Select,
         _ => return Err(bad()),
     };
-    Ok((kind, has_write_cte(tokens)))
+    Ok((kind, has_write_cte(tokens, &[])))
 }
 
 /// `(` の直後が `INSERT`／`UPDATE`／`DELETE` のトークンがあるか（データ変更 CTE）。
 /// `RETURN QUERY`・問い合わせ `FOR` の主文を分類する（ADR D5: 書き込み経路を事前決定するため）。
 /// `SELECT`／`VALUES`／括弧始まりは `Select`、`INSERT`／`UPDATE`／`DELETE` はその種別、
 /// `WITH` は主文で判定。これら以外は `42601` で明示的に拒否する。
-pub(super) fn classify_query(tokens: &[Token]) -> Result<EmbeddedKind, SqlSurfaceError> {
-    let Some(first) = tokens.first() else {
+pub(super) fn classify_query(
+    tokens: &[Token],
+    quoted: &[bool],
+) -> Result<EmbeddedKind, SqlSurfaceError> {
+    // 先頭の語は引用付きなら識別子（`"insert"` は問い合わせの語ではない）。
+    let view = keyword_view(tokens, quoted);
+    let Some(first) = view.first() else {
         return Err(syn_err("empty query in a PL/pgSQL statement"));
     };
     if matches!(first, Token::Keyword(Keyword::Select) | Token::Punct('('))
@@ -603,13 +666,14 @@ pub(super) fn classify_query(tokens: &[Token]) -> Result<EmbeddedKind, SqlSurfac
     } else if ident_is(first, "DELETE") {
         Ok(EmbeddedKind::Delete)
     } else if ident_is(first, "WITH") {
-        Ok(classify_with(tokens)?.0)
+        Ok(classify_with(tokens, quoted)?.0)
     } else {
         Err(syn_err("unsupported query in a PL/pgSQL statement"))
     }
 }
 
-pub(super) fn has_write_cte(tokens: &[Token]) -> bool {
+pub(super) fn has_write_cte(tokens: &[Token], quoted: &[bool]) -> bool {
+    let tokens = keyword_view(tokens, quoted);
     tokens.windows(2).any(|w| {
         matches!(w.first(), Some(Token::Punct('(')))
             && w.get(1).is_some_and(|t| {
@@ -621,26 +685,48 @@ pub(super) fn has_write_cte(tokens: &[Token]) -> bool {
 /// `tokens[i]` の `Ident` が識別子の位置（関数名・表名・列名・別名・暗黙別名・`USING` の列／表・
 /// `ON CONFLICT` の対象・`UPDATE ... SET`／`DO UPDATE SET` の代入先）にあるか。そうなら変数参照として
 /// 置換しない。#2226 の呼び出し時の置換と共有する単一の分類関数。
+///
+/// 引用情報を持たない呼び出し（全て未引用として扱う）。引用付き識別子を区別したい呼び出し元は
+/// [`is_ident_position_quoted`] を使う。
 pub(crate) fn is_ident_position(tokens: &[Token], i: usize) -> bool {
-    is_ident_position_with(tokens, i, &IdentCtx::new(tokens))
+    is_ident_position_quoted(tokens, &vec![false; tokens.len()], i)
+}
+
+/// [`is_ident_position`] の引用情報付き版。`quoted` は `sql::lexer::tokenize_with_params_quoted` の
+/// 並走配列（引用付き識別子は句のキーワードではなく常に識別子として扱う）。
+pub(crate) fn is_ident_position_quoted(tokens: &[Token], quoted: &[bool], i: usize) -> bool {
+    is_ident_position_with(i, &IdentCtx::new(tokens, quoted))
 }
 
 /// 識別子位置の分類に使う文単位の事前計算結果（関係リスト位置・括弧／CTE／INSERT 列位置）。
 pub(super) struct IdentCtx {
+    /// 引用付き識別子を句のキーワードと区別する見え方（[`keyword_view`]）。判定はすべてこれに対して行う。
+    view: Vec<Token>,
     slots: Vec<bool>,
     parens: ParenInfo,
     /// `::型` と `CAST(式 AS 型)` の型指定の範囲（複数語・修飾子・`[]` を含む）に入るトークン。
     type_range: Vec<bool>,
+    /// 派生表・関数の列別名リスト（`AS d(v)`）の内側のトークン。
+    alias_cols: Vec<bool>,
+    /// `UPDATE ... SET` の代入リスト内のトークン。
+    set_list: Vec<bool>,
 }
 
 impl IdentCtx {
-    pub(super) fn new(tokens: &[Token]) -> Self {
-        let parens = ParenInfo::new(tokens);
-        let type_range = type_ranges(tokens, &parens);
+    pub(super) fn new(tokens: &[Token], quoted: &[bool]) -> Self {
+        let view = keyword_view(tokens, quoted);
+        let parens = ParenInfo::new(&view);
+        let type_range = type_ranges(&view, tokens, &parens);
+        let slots = from_relation_slots(&view, &parens);
+        let alias_cols = alias_column_mask(&view, &slots, &parens);
+        let set_list = set_list_mask(&view);
         Self {
-            slots: from_relation_slots(tokens),
+            view,
+            slots,
             parens,
             type_range,
+            alias_cols,
+            set_list,
         }
     }
 }
@@ -650,14 +736,14 @@ impl IdentCtx {
 /// `timestamp without time zone`・`numeric(p,s)`・`[]` を受理する）に決めさせ、1 トークンの
 /// 先読み特例を持たない。型として読めない場合（未対応の型名）は先頭 1 トークンだけを範囲にする
 /// （後続の許可リスト解析が拒否する）。`IdentCtx::new` から 1 文に 1 回だけ呼ばれる。
-fn type_ranges(tokens: &[Token], parens: &ParenInfo) -> Vec<bool> {
+fn type_ranges(view: &[Token], tokens: &[Token], parens: &ParenInfo) -> Vec<bool> {
     let mut out = vec![false; tokens.len()];
-    for (i, t) in tokens.iter().enumerate() {
+    for (i, t) in view.iter().enumerate() {
         let starts = match t {
             Token::TypeCast => true,
             // `CAST(式 AS 型)` の `AS`。別名の `AS` と区別するため直接囲む括弧の直前が `CAST`。
             _ if ident_is(t, "AS") => parens
-                .enclosing_prev(tokens, i)
+                .enclosing_prev(view, i)
                 .is_some_and(|p| ident_is(p, "CAST")),
             _ => false,
         };
@@ -677,10 +763,13 @@ fn type_ranges(tokens: &[Token], parens: &ParenInfo) -> Vec<bool> {
     out
 }
 
-/// [`is_ident_position`] の本体。`ctx` は同じ `tokens` に対する [`IdentCtx::new`] の結果。
-pub(super) fn is_ident_position_with(tokens: &[Token], i: usize, ctx: &IdentCtx) -> bool {
+/// [`is_ident_position`] の本体。`ctx` は同じトークン列に対する [`IdentCtx::new`] の結果。
+pub(super) fn is_ident_position_with(i: usize, ctx: &IdentCtx) -> bool {
+    let tokens = ctx.view.as_slice();
     let slots = &ctx.slots;
-    if ctx.type_range.get(i).copied().unwrap_or(false) {
+    if ctx.type_range.get(i).copied().unwrap_or(false)
+        || ctx.alias_cols.get(i).copied().unwrap_or(false)
+    {
         return true;
     }
     if matches!(tokens.get(i.saturating_add(1)), Some(Token::Punct('('))) {
@@ -703,7 +792,9 @@ pub(super) fn is_ident_position_with(tokens: &[Token], i: usize, ctx: &IdentCtx)
         // `::型名` は型の位置であり値ではない。
         Some(Token::TypeCast) => return true,
         // 式内部の `FROM`（`IS DISTINCT FROM v` 等）の直後は変数でありうるので識別子位置にしない。
-        Some(Token::Keyword(Keyword::From)) if !is_expr_from(tokens, i - 1) => return true,
+        Some(Token::Keyword(Keyword::From)) if !is_expr_from(tokens, i - 1, &ctx.parens) => {
+            return true
+        }
         Some(p)
             if [
                 "JOIN",
@@ -735,7 +826,7 @@ pub(super) fn is_ident_position_with(tokens: &[Token], i: usize, ctx: &IdentCtx)
         (prev, tokens.get(i))
     {
         if i >= 1
-            && is_table_slot(tokens, i - 1)
+            && is_table_slot(tokens, i - 1, &ctx.parens)
             && !ident_is(p, "ONLY")
             && !CLAUSE_WORDS.iter().any(|w| me.eq_ignore_ascii_case(w))
         {
@@ -753,7 +844,7 @@ pub(super) fn is_ident_position_with(tokens: &[Token], i: usize, ctx: &IdentCtx)
     // `UPDATE ... SET` / `DO UPDATE SET` の代入先。
     if matches!(tokens.get(i.saturating_add(1)), Some(Token::Punct('=')))
         && prev.is_some_and(|p| ident_is(p, "SET") || matches!(p, Token::Punct(',')))
-        && in_set_list(tokens, i)
+        && ctx.set_list.get(i).copied().unwrap_or(false)
     {
         return true;
     }

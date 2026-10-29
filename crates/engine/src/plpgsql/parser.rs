@@ -8,10 +8,12 @@
 //! （fail-closed）。呼び出し元は `plpgsql::parse_body`（#2217／#2225 が結線）。
 //! 受信データの経路なので `unwrap`／`expect`／添字アクセスを使わない。再帰は入れ子の深さ上限で有界。
 
+use std::collections::{HashMap, HashSet};
+
 use crate::plpgsql_limits::MAX_PLPGSQL_VARS_PER_STATEMENT;
 use crate::sql::allowlist::SqlSurfaceError;
 use crate::sql::ddl_column_type::{parse_column_type_name, SqlColumnTypeName};
-use crate::sql::lexer::{tokenize_with_params, Keyword, Token};
+use crate::sql::lexer::{tokenize_with_params_quoted, Keyword, Token};
 
 use super::ast::{
     AssignTarget, Block, Body, DeclType, DiagItem, EmbeddedKind, EmbeddedSql, IntoClause,
@@ -186,7 +188,8 @@ const POLYMORPHIC: &[&str] = &[
 
 struct Scope {
     label: Option<String>,
-    names: Vec<(String, VarId)>,
+    /// 名前から変数への表。同名の再登録は後勝ち（検索のたびに全件を走査しない）。
+    names: HashMap<String, VarId>,
 }
 
 struct Ctrl {
@@ -229,39 +232,57 @@ pub(super) fn parse(src: &str, opts: &ParseOptions) -> Result<Body, SqlSurfaceEr
     })
 }
 
+/// SQL トークン列と、各トークンが二重引用符付き識別子由来かの並走配列（常に同じ長さ）。
+type QTokens = (Vec<Token>, Vec<bool>);
+
 /// 全体を囲む外側の括弧を剥がす（`(SELECT ...)` → `SELECT ...`。定義時検証は SELECT 始まりを要求する）。
-fn strip_outer_parens(mut t: Vec<Token>) -> Vec<Token> {
-    loop {
-        if !matches!(t.first(), Some(Token::Punct('(')))
-            || !matches!(t.last(), Some(Token::Punct(')')))
-        {
-            return t;
-        }
-        let mut d = 0usize;
-        for (i, x) in t.iter().enumerate() {
-            match x {
-                Token::Punct('(') => d = d.saturating_add(1),
-                Token::Punct(')') => {
-                    d = d.saturating_sub(1);
-                    if d == 0 && i.saturating_add(1) != t.len() {
-                        return t;
-                    }
-                }
-                _ => {}
-            }
-        }
-        t.remove(0);
-        t.pop();
+///
+/// 1 回の走査で「先頭の `(` の連続」「末尾の `)` の連続」「`[0, len-1)` の最小の括弧深さ」を求め、
+/// 剥がせる組数をまとめて決めて 1 回のスライスで切り出す（入れ子の深さに対して線形。
+/// 1 組ずつ全走査・`remove(0)` する方式は二乗時間になり DoS になりうる）。
+pub(super) fn strip_outer_parens((t, q): QTokens) -> QTokens {
+    let n = t.len();
+    let lead = t
+        .iter()
+        .take_while(|x| matches!(x, Token::Punct('(')))
+        .count();
+    let trail = t
+        .iter()
+        .rev()
+        .take_while(|x| matches!(x, Token::Punct(')')))
+        .count();
+    let mut cap = lead.min(trail);
+    if cap == 0 {
+        return (t, q);
     }
+    // 先頭の `(` の連続と末尾の `)` の連続に挟まれた中間部の最小の括弧深さが、外側全体を囲んだまま
+    // 剥がせる最大の組数（中間で深さが浅くなる位置があれば、その外側の組は全体を囲まない）。
+    let mid_end = n.saturating_sub(trail);
+    let mut depth = 0usize;
+    for (i, x) in t.iter().enumerate() {
+        match x {
+            Token::Punct('(') => depth = depth.saturating_add(1),
+            Token::Punct(')') => depth = depth.saturating_sub(1),
+            _ => {}
+        }
+        if i >= lead && i < mid_end {
+            cap = cap.min(depth);
+        }
+    }
+    let end = n.saturating_sub(cap);
+    (
+        t.get(cap..end).unwrap_or(&[]).to_vec(),
+        q.get(cap..end).unwrap_or(&[]).to_vec(),
+    )
 }
 
-fn sql_tokens(text: &str) -> Result<Vec<Token>, SqlSurfaceError> {
-    let t = tokenize_with_params(text)
+fn sql_tokens(text: &str) -> Result<QTokens, SqlSurfaceError> {
+    let (t, q) = tokenize_with_params_quoted(text)
         .map_err(|_| syn_err("invalid token in an embedded SQL fragment of the PL/pgSQL body"))?;
     if t.is_empty() {
         return Err(syn_err("empty SQL fragment in PL/pgSQL body"));
     }
-    Ok(t)
+    Ok((t, q))
 }
 
 impl<'a> Parser<'a> {
@@ -440,7 +461,7 @@ impl<'a> Parser<'a> {
     fn init_outer_scope(&mut self) -> Result<(), SqlSurfaceError> {
         let mut scope = Scope {
             label: None,
-            names: Vec::new(),
+            names: HashMap::new(),
         };
         for (i, p) in self.opts.params.iter().enumerate() {
             let n = u16::try_from(i.saturating_add(1))
@@ -458,7 +479,7 @@ impl<'a> Parser<'a> {
             });
             if !name.is_empty() {
                 check_supported_name(&name)?;
-                scope.names.push((name, id));
+                scope.names.insert(name, id);
             }
         }
         let found = VarId(u32::try_from(self.vars.len()).unwrap_or(u32::MAX));
@@ -471,7 +492,7 @@ impl<'a> Parser<'a> {
             default: None,
             scope_depth: 0,
         });
-        scope.names.push(("found".to_string(), found));
+        scope.names.insert("found".to_string(), found);
         self.scopes.push(scope);
         Ok(())
     }
@@ -501,7 +522,7 @@ impl<'a> Parser<'a> {
             scope_depth,
         });
         if let Some(s) = self.scopes.last_mut() {
-            s.names.push((name, id));
+            s.names.insert(name, id);
         }
         Ok(id)
     }
@@ -509,17 +530,14 @@ impl<'a> Parser<'a> {
     fn declared_in_current_scope(&self, name: &str) -> bool {
         self.scopes
             .last()
-            .is_some_and(|s| s.names.iter().any(|(n, _)| n == name))
+            .is_some_and(|s| s.names.contains_key(name))
     }
 
     fn lookup_var(&self, name: &str) -> Option<VarId> {
-        self.scopes.iter().rev().find_map(|s| {
-            s.names
-                .iter()
-                .rev()
-                .find(|(n, _)| n == name)
-                .map(|(_, id)| *id)
-        })
+        self.scopes
+            .iter()
+            .rev()
+            .find_map(|s| s.names.get(name).copied())
     }
 
     fn var(&self, id: VarId) -> Option<&VarDecl> {
@@ -537,17 +555,13 @@ impl<'a> Parser<'a> {
         let n = name.to_ascii_lowercase();
         for (idx, s) in self.scopes.iter().enumerate().rev() {
             if s.label.as_deref() == Some(q.as_str()) {
-                if let Some((_, id)) = s.names.iter().rev().find(|(x, _)| *x == n) {
+                if let Some(id) = s.names.get(&n) {
                     return Some(VarRef::Var(*id));
                 }
                 // 最外ブロック（`scopes[1]`。`scopes[0]` はパラメータと `FOUND` の外側スコープ）の
                 // ラベルでも、PostgreSQL と同様にパラメータと `FOUND` を修飾参照できる。
                 if idx == 1 {
-                    if let Some((_, id)) = self
-                        .scopes
-                        .first()
-                        .and_then(|o| o.names.iter().rev().find(|(x, _)| *x == n))
-                    {
+                    if let Some(id) = self.scopes.first().and_then(|o| o.names.get(&n)) {
                         return Some(VarRef::Var(*id));
                     }
                 }
@@ -585,10 +599,14 @@ impl<'a> Parser<'a> {
         Ok(target)
     }
 
-    fn resolve_refs(&self, tokens: &[Token]) -> Result<Vec<(usize, VarRef)>, SqlSurfaceError> {
+    fn resolve_refs(
+        &self,
+        tokens: &[Token],
+        quoted: &[bool],
+    ) -> Result<Vec<(usize, VarRef)>, SqlSurfaceError> {
         let mut refs: Vec<(usize, VarRef)> = Vec::new();
         // 関係リスト位置は文ごとに 1 回だけ求め、識別子ごとの再走査（二乗コスト）を避ける。
-        let slots = IdentCtx::new(tokens);
+        let slots = IdentCtx::new(tokens, quoted);
         for (i, t) in tokens.iter().enumerate() {
             match t {
                 Token::Param(n) => {
@@ -598,14 +616,12 @@ impl<'a> Parser<'a> {
                     }
                     refs.push((i, VarRef::Var(VarId(u32::from(*n) - 1))));
                 }
-                Token::Ident(name) if !is_ident_position_with(tokens, i, &slots) => {
+                Token::Ident(name) if !is_ident_position_with(i, &slots) => {
                     if let Some(id) = self.lookup_var(&name.to_ascii_lowercase()) {
                         refs.push((i, VarRef::Var(id)));
                     }
                 }
-                Token::QualifiedIdent { qualifier, name }
-                    if !is_ident_position_with(tokens, i, &slots) =>
-                {
+                Token::QualifiedIdent { qualifier, name } if !is_ident_position_with(i, &slots) => {
                     if let Some(r) = self.lookup_qualified(qualifier, name) {
                         refs.push((i, r));
                     }
@@ -613,17 +629,16 @@ impl<'a> Parser<'a> {
                 _ => {}
             }
         }
-        let mut distinct: Vec<&VarId> = Vec::new();
+        // 参照する変数の種類数を数える。上限を超えた時点で打ち切る（無制限に集合を育てない）。
+        let mut distinct: HashSet<VarId> = HashSet::new();
         for (_, r) in &refs {
             let (VarRef::Var(id) | VarRef::Field(id, _)) = r;
-            if !distinct.contains(&id) {
-                distinct.push(id);
+            distinct.insert(*id);
+            if distinct.len() > MAX_PLPGSQL_VARS_PER_STATEMENT {
+                return Err(too_big_err(
+                    "too many PL/pgSQL variables referenced in one statement",
+                ));
             }
-        }
-        if distinct.len() > MAX_PLPGSQL_VARS_PER_STATEMENT {
-            return Err(too_big_err(
-                "too many PL/pgSQL variables referenced in one statement",
-            ));
         }
         Ok(refs)
     }
@@ -631,8 +646,8 @@ impl<'a> Parser<'a> {
     // ---- 式・SQL の構築 ----
 
     fn build_expr(&self, a: usize, b: usize, cond: bool) -> Result<SqlExpr, SqlSurfaceError> {
-        let tokens = sql_tokens(self.span_text(a, b)?)?;
-        let var_refs = self.resolve_refs(&tokens)?;
+        let (tokens, quoted) = sql_tokens(self.span_text(a, b)?)?;
+        let var_refs = self.resolve_refs(&tokens, &quoted)?;
         Ok(SqlExpr {
             tokens,
             var_refs,
@@ -671,12 +686,12 @@ impl<'a> Parser<'a> {
 
     fn build_sql(
         &self,
-        text_tokens: Vec<Token>,
+        (text_tokens, text_quoted): QTokens,
         kind: EmbeddedKind,
         allow_into: bool,
     ) -> Result<EmbeddedSql, SqlSurfaceError> {
-        reject_forbidden_clauses(&text_tokens)?;
-        let (tokens, raw) = split_into(text_tokens)?;
+        reject_forbidden_clauses(&text_tokens, &text_quoted)?;
+        let (tokens, quoted, raw) = split_into(text_tokens, text_quoted)?;
         if raw.is_some() && !allow_into {
             return Err(syn_err("INTO is not allowed in this PL/pgSQL statement"));
         }
@@ -684,11 +699,11 @@ impl<'a> Parser<'a> {
             Some(r) => Some(self.resolve_into(r)?),
             None => None,
         };
-        let var_refs = self.resolve_refs(&tokens)?;
+        let var_refs = self.resolve_refs(&tokens, &quoted)?;
         let writes = matches!(
             kind,
             EmbeddedKind::Insert | EmbeddedKind::Update | EmbeddedKind::Delete
-        ) || has_write_cte(&tokens);
+        ) || has_write_cte(&tokens, &quoted);
         Ok(EmbeddedSql {
             kind,
             tokens,
@@ -753,7 +768,7 @@ impl<'a> Parser<'a> {
         self.enter()?;
         self.scopes.push(Scope {
             label: label.clone(),
-            names: Vec::new(),
+            names: HashMap::new(),
         });
         let mut decls = Vec::new();
         if self.eat_kw("DECLARE") {
@@ -885,7 +900,7 @@ impl<'a> Parser<'a> {
                 }
             }
         }
-        let tokens = sql_tokens(self.span_text(ts, te)?)?;
+        let (tokens, _) = sql_tokens(self.span_text(ts, te)?)?;
         let mut p = 0usize;
         let ty = parse_column_type_name(&tokens, &mut p)
             .map_err(|e| super::sanitize_delegated(&e, "a PL/pgSQL declaration type"))?;
@@ -1153,7 +1168,7 @@ impl<'a> Parser<'a> {
         self.expect_kw("LOOP")?;
         self.scopes.push(Scope {
             label: label.clone(),
-            names: Vec::new(),
+            names: HashMap::new(),
         });
         let var = self.declare(
             name,
@@ -1200,14 +1215,14 @@ impl<'a> Parser<'a> {
             return Err(syn_err("malformed PL/pgSQL FOR loop"));
         }
         let tokens = strip_outer_parens(sql_tokens(self.span_text(a, e)?)?);
-        let kind = classify_query(&tokens)?;
+        let kind = classify_query(&tokens.0, &tokens.1)?;
         let query = self.build_sql(tokens, kind, false)?;
         self.pos = e;
         self.expect_kw("LOOP")?;
         // 対象の解決は問い合わせ（外側のスコープ）の後。未宣言の単独対象は暗黙のレコード変数にする。
         self.scopes.push(Scope {
             label: label.clone(),
-            names: Vec::new(),
+            names: HashMap::new(),
         });
         let mut targets = Vec::new();
         let single = raw_targets.len() == 1;
@@ -1310,7 +1325,7 @@ impl<'a> Parser<'a> {
             let e = self.find_end(a, &|_| false)?;
             // `FOR ... IN` と同じく外側の括弧を剥がす（`RETURN QUERY (SELECT ...)`）。
             let tokens = strip_outer_parens(sql_tokens(self.span_text(a, e)?)?);
-            let kind = classify_query(&tokens)?;
+            let kind = classify_query(&tokens.0, &tokens.1)?;
             let q = self.build_sql(tokens, kind, false)?;
             self.pos = e;
             self.expect_punct(';')?;
@@ -1341,8 +1356,11 @@ impl<'a> Parser<'a> {
         let a = self.pos;
         let e = self.find_end(a, &|_| false)?;
         let mut tokens = vec![Token::Keyword(Keyword::Select)];
-        tokens.extend(sql_tokens(self.span_text(a, e)?)?);
-        let q = self.build_sql(tokens, EmbeddedKind::Perform, false)?;
+        let mut quoted = vec![false];
+        let (t, qd) = sql_tokens(self.span_text(a, e)?)?;
+        tokens.extend(t);
+        quoted.extend(qd);
+        let q = self.build_sql((tokens, quoted), EmbeddedKind::Perform, false)?;
         self.pos = e;
         self.expect_punct(';')?;
         Ok(Stmt::Perform(q))
@@ -1356,7 +1374,7 @@ impl<'a> Parser<'a> {
             "INSERT" => EmbeddedKind::Insert,
             "UPDATE" => EmbeddedKind::Update,
             "DELETE" => EmbeddedKind::Delete,
-            "WITH" => classify_with(&tokens)?.0,
+            "WITH" => classify_with(&tokens.0, &tokens.1)?.0,
             _ => EmbeddedKind::Select,
         };
         let q = self.build_sql(tokens, kind, true)?;

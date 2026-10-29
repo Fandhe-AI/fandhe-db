@@ -888,9 +888,9 @@ fn classification_is_linear_for_many_references() {
     let expr = vec!["a"; 3_000].join(" + ");
     let t = tokenize(&format!("SELECT {expr}")).expect("tokenize");
     let start = std::time::Instant::now();
-    let ctx = super::embedded::IdentCtx::new(&t);
+    let ctx = super::embedded::IdentCtx::new(&t, &vec![false; t.len()]);
     for i in 0..t.len() {
-        let _ = super::embedded::is_ident_position_with(&t, i, &ctx);
+        let _ = super::embedded::is_ident_position_with(i, &ctx);
     }
     assert!(start.elapsed().as_secs() < 5);
 }
@@ -1159,4 +1159,167 @@ fn type_specifications_are_not_variable_references() {
         panic!("return");
     };
     assert!(e.var_refs.is_empty());
+}
+
+// ---- 引用付き識別子・派生表の列別名・括弧剥がしの線形性（PR #2779 5 往復目） ----
+
+#[test]
+fn quoted_identifiers_named_like_clause_words_are_not_clauses() {
+    // `"into"` は別名であり INTO 句ではない。実際の INTO 句は 1 個だけ抽出される。
+    let b = ok("DECLARE n int; BEGIN SELECT 1 AS \"into\" INTO n; END");
+    let Some(Stmt::Sql(q)) = b.block.stmts.first() else {
+        panic!("sql");
+    };
+    assert_eq!(q.into.as_ref().map(|i| i.targets.len()), Some(1));
+    // 引用付きの "into" 自体を INTO 対象の名前にもできる（名前は元のトークンから取る）。
+    ok("DECLARE n int; BEGIN SELECT 1 AS \"x\" INTO n; END");
+    // 禁止句の語も引用付きなら識別子。
+    ok("BEGIN PERFORM 1 AS \"partitioned\"; END");
+    ok("BEGIN PERFORM 1 AS \"operation_id\"; END");
+    ok("DECLARE v int; BEGIN EXECUTE 'x' USING \"operation_id\"; END");
+    // 句としての語は従来どおり拒否される。
+    assert_eq!(code("BEGIN PERFORM 1 PARTITIONED BY x; END"), "0A000");
+    assert_eq!(
+        code("BEGIN EXECUTE 'x' USING OPERATION_ID 'k'; END"),
+        "0A000"
+    );
+    assert_eq!(
+        code("DECLARE n int; BEGIN SELECT 1 INTO n INTO n; END"),
+        "42601"
+    );
+    // INSERT INTO の INTO は句ではなく、引用付きの "insert" は文の語ではない。
+    ok("BEGIN INSERT INTO t(x) VALUES (1); END");
+}
+
+#[test]
+fn quoted_words_in_with_and_query_classification() {
+    let kind = |src: &str| {
+        let b = ok(&format!("BEGIN {src}; END"));
+        match b.block.stmts.first() {
+            Some(Stmt::Sql(q)) => (q.kind, q.writes),
+            other => panic!("not sql: {other:?}"),
+        }
+    };
+    assert_eq!(
+        kind("WITH \"recursive\" AS (SELECT 1) SELECT 1 FROM \"recursive\""),
+        (EmbeddedKind::Select, false)
+    );
+    assert_eq!(
+        kind("WITH \"recursive\" AS (SELECT 1) DELETE FROM t"),
+        (EmbeddedKind::Delete, true)
+    );
+    assert_eq!(
+        kind("WITH RECURSIVE r AS (SELECT 1) SELECT 1 FROM r"),
+        (EmbeddedKind::Select, false)
+    );
+    // 引用付きの "delete" CTE 名・"update" 括弧始まりの語は書き込み扱いにならない。
+    assert_eq!(
+        kind("WITH c AS (SELECT 1 AS \"delete\") SELECT 1 FROM c"),
+        (EmbeddedKind::Select, false)
+    );
+}
+
+#[test]
+fn derived_table_column_aliases_are_identifier_positions() {
+    let refs = |src: &str| {
+        let b = ok(&format!("DECLARE v int; BEGIN {src}; END"));
+        first_sql_refs(&b)
+    };
+    assert_eq!(refs("PERFORM 1 FROM (SELECT 1) AS d(v)"), 0);
+    assert_eq!(refs("PERFORM 1 FROM (SELECT 1) d(v)"), 0);
+    assert_eq!(refs("PERFORM 1 FROM t AS a(v)"), 0);
+    assert_eq!(refs("PERFORM 1 FROM t a(v)"), 0);
+    assert_eq!(refs("PERFORM 1 FROM t, (SELECT 1, 2) AS d(v, w)"), 0);
+    // 後続の値の位置の変数は参照のまま。
+    assert_eq!(refs("PERFORM 1 FROM (SELECT 1) AS d(x) WHERE d.x = v"), 1);
+    // 関数呼び出しの引数は列別名リストではない（変数は参照のまま）。
+    assert_eq!(refs("PERFORM 1 FROM generate_series(1, v)"), 1);
+    assert_eq!(
+        refs("PERFORM 1 FROM t JOIN generate_series(1, v) ON true"),
+        1
+    );
+    assert_eq!(refs("PERFORM 1 FROM t, generate_series(1, v)"), 1);
+    assert_eq!(refs("PERFORM 1 FROM ONLY t WHERE x = v"), 1);
+}
+
+#[test]
+fn strip_outer_parens_is_linear_and_correct() {
+    use super::parser::strip_outer_parens;
+    let q = |n: usize| {
+        let mut t = vec![Token::Punct('('); n];
+        t.push(Token::Number("1".to_string()));
+        t.extend(vec![Token::Punct(')'); n]);
+        let b = vec![false; t.len()];
+        (t, b)
+    };
+    // 10 万組でも一度の走査で全て剥がれる。
+    let (t, b) = strip_outer_parens(q(100_000));
+    assert_eq!(t, vec![Token::Number("1".to_string())]);
+    assert_eq!(b.len(), 1);
+    // 外側全体を囲まない括弧は残る。
+    let (t, _) = strip_outer_parens((
+        vec![
+            Token::Punct('('),
+            Token::Number("1".to_string()),
+            Token::Punct(')'),
+            Token::Punct('+'),
+            Token::Punct('('),
+            Token::Number("2".to_string()),
+            Token::Punct(')'),
+        ],
+        vec![false; 7],
+    ));
+    assert_eq!(t.len(), 7);
+    // `((a) + (b))` は 1 組だけ剥がす。
+    let (t, b) = strip_outer_parens((tokenize("((1) + (2))").expect("tokenize"), vec![false; 9]));
+    assert_eq!(t.len(), 7);
+    assert_eq!(b.len(), 7);
+}
+
+#[test]
+fn deeply_nested_parentheses_are_accepted_or_rejected_without_blowup() {
+    let n = 5_000;
+    let src = format!(
+        "BEGIN RETURN QUERY {}SELECT 1{}; END",
+        "(".repeat(n),
+        ")".repeat(n)
+    );
+    let o = opts_with(ReturnShape::SetOf);
+    // 受理でも上限超過の拒否でもよい。重要なのは線形時間で終わること。
+    let _ = parse_body(&src, &o);
+    let big = format!(
+        "BEGIN RETURN QUERY {}SELECT 1{}; END",
+        "(".repeat(30_000),
+        ")".repeat(30_000)
+    );
+    let _ = parse_body(&big, &o);
+}
+
+#[test]
+fn many_declarations_resolve_in_linear_time() {
+    // 変数名の表は連想配列なので、宣言数・代入数に対して線形で終わる。
+    let decls: String = (0..1_500).map(|i| format!("v{i} int; ")).collect();
+    let stmts: String = (0..1_500).map(|i| format!("v{i} := {i}; ")).collect();
+    let start = std::time::Instant::now();
+    ok(&format!("DECLARE {decls} BEGIN {stmts} END"));
+    assert!(start.elapsed().as_secs() < 5);
+}
+
+#[test]
+fn quoted_flags_align_with_tokens() {
+    use crate::sql::lexer::tokenize_with_params_quoted;
+    let (t, q) =
+        tokenize_with_params_quoted("SELECT \"into\" , into , \"true\" , \"x\"").expect("tokenize");
+    assert_eq!(t.len(), q.len());
+    let flagged: Vec<&Token> = t
+        .iter()
+        .zip(&q)
+        .filter(|(_, f)| **f)
+        .map(|(t, _)| t)
+        .collect();
+    assert_eq!(flagged.len(), 3);
+    assert!(q
+        .iter()
+        .zip(&t)
+        .all(|(f, t)| !*f || !matches!(t, Token::Keyword(_))));
 }
