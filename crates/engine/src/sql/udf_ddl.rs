@@ -84,11 +84,15 @@ pub(crate) fn execute_drop_function(
         removed |= drop_from_catalog(storage, tenant_id, stmt)?;
     }
     // 型の並びがある場合、セッション内の定義（型注釈なし）は引数の数で照合する。
-    let session_match = session.udfs().get(&stmt.name).is_some_and(|d| {
-        stmt.arg_types
-            .as_ref()
-            .is_none_or(|types| types.len() == d.params.len())
-    });
+    // WASM UDF は (vector, scalar) の固定 2 引数なので、同じ名前空間を共有する
+    // `UdfRegistry::remove` が両表を消す設計に合わせて判定にも含める。
+    let session_match = {
+        let udfs = session.udfs();
+        let arity_ok = |n: usize| stmt.arg_types.as_ref().is_none_or(|types| types.len() == n);
+        udfs.get(&stmt.name)
+            .is_some_and(|d| arity_ok(d.params.len()))
+            || udfs.get_wasm(&stmt.name).is_some_and(|_| arity_ok(2))
+    };
     if session_match {
         removed |= session.udfs_mut().remove(&stmt.name);
     }
