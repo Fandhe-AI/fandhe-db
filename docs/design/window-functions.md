@@ -29,7 +29,7 @@
 
 | 形 | 扱い |
 | -- | ---- |
-| `ROW_NUMBER()`・`RANK()`・`DENSE_RANK()`（引数なし） | 受理 |
+| `ROW_NUMBER()`・`RANK()`・`DENSE_RANK()`・`PERCENT_RANK()`・`CUME_DIST()`（引数なし） | 受理 |
 | `COUNT(*)`・`COUNT(<列>)`・`SUM`/`AVG`/`MIN`/`MAX(<列>)`（引数は裸の列名・`id`・`*`〔`COUNT` のみ〕に限定） | 受理 |
 | `OVER ( [PARTITION BY <列>[, ...]] [ORDER BY <列> [ASC\|DESC][, ...]] )`（空 `OVER ()` も可） | 受理（列数は各 8 個まで） |
 | ウィンドウ項目と通常列の混在（位置を保持） | 受理 |
@@ -37,7 +37,7 @@
 | 文全体のベクトル `ORDER BY`（検索 SELECT）・`USING PLAN`・`GROUP BY`／集計 SELECT・`SELECT DISTINCT` との併用 | `42601`（構造的に相互排他） |
 | 文全体の `ORDER BY` でのウィンドウ別名参照（実在する同名列がある場合はその列として解釈） | `42601` |
 | フレーム句（`ROWS`/`RANGE`/`GROUPS`。Issue #1887・#1889・#1890・#1891） | 構文は受理する（形の誤りは `42601`）。`ROWS` は #1889、`RANGE` は #1890、`GROUPS` は #1891 で評価する（詳細は末尾「Issue #1887 追記」「Issue #1889 追記」「Issue #1890 追記」「Issue #1891 追記」） |
-| `FILTER (...)`・関数内 `DISTINCT`・複合式の引数・式の中へのウィンドウ呼び出し（`ROW_NUMBER() OVER () + 1` 等）・`*` とウィンドウ項目の混在 | `42601` |
+| 関数内 `DISTINCT`・式の中へのウィンドウ呼び出し（`ROW_NUMBER() OVER () + 1` 等）・`*` とウィンドウ項目の混在 | `42601` |
 | `WHERE` でのウィンドウ別名参照（実在する同名列がある場合はその列として解釈） | `42601` |
 | `CREATE VIEW` 本文への `OVER` 混入 | `42601`（`parse_view_body` が構造上受理しない） |
 
@@ -111,10 +111,8 @@
 
 ## 実装上の簡略化（既知の制約・対象外）
 
-- `SUM`/`AVG`/`MIN`/`MAX` の集計引数は裸の列名・`*`（`COUNT` のみ）に限定し、
-  複合式（UDF・演算）は受理しない（構文段で `42601`）。この制約により、束縛結果
-  （`AggregateInput`）に `ScalarExpr` が現れないことが保証され、`Accumulator`
-  の観測をスカラー式評価（`ExprProgram`）を経由せず直接行える。
+- `SUM`/`AVG`/`MIN`/`MAX`/`COUNT` の集計引数は列名・`*`（`COUNT` のみ）・式を受理する
+  （式は Issue #1895。末尾「Issue #1895 追記」参照）。
 - ウィンドウ集計の集計本体は `sql::aggregate::Accumulator` を再利用しており、
   型ごとの桁あふれ検査・NULL 契約は集計 SELECT と同一。
 - 性能: materialize 段は `LIMIT` を適用できないため、`WHERE` に一致する全行を
@@ -127,8 +125,8 @@
 - ウィンドウ関数の結果による文全体の `ORDER BY`（`ORDER BY rn`）。base scan への委譲方式では評価できない
 - `EXPLAIN` とウィンドウ関数の併用（`ORDER BY` の有無を問わず `42601`）
 - `GROUP BY`／集計 SELECT とウィンドウの併用
-- 名前付きウィンドウ・`FILTER (...)`・
-  関数内 `DISTINCT`・複合式の引数
+- 名前付きウィンドウ・
+  関数内 `DISTINCT`
 - 式の中へのウィンドウ呼び出しの埋め込み
 - 検索 SELECT（ベクトル `ORDER BY`・`HYBRID`・`USING PLAN`）へのウィンドウ追加
 - NoSQL（HTTP JSON）表層（`BoundScan::new` は常に `windows` を空にするため
@@ -404,3 +402,113 @@ ORDER BY なし・複数キーの `RANGE UNBOUNDED PRECEDING` 等も評価され
 - **既知の差異**: 未使用の定義の中に存在しない列があっても、展開で取り除かれるため受理される
   （PostgreSQL は `42703`。形・フレームの誤りは検出する）。窓と `GROUP BY`／集計の併用は従来どおり対象外。
   `42P20` の文言は固定語（窓名を含めない）。
+
+## Issue #1883 追記: first_value／last_value／nth_value（SQL-64 (3) ポインタ）
+
+`first_value(v)`／`last_value(v)`／`nth_value(v, n)` を PostgreSQL 17 の意味論で評価する。親 #1882。
+`LAG`／`LEAD` と同じ引数経路（`offset_args`。`nth_value` の `n` はオフセット欄）で値を運び、
+フレームの評価は集計と境界関数を共有する。
+
+- **フレーム**: 既定は `RANGE BETWEEN UNBOUNDED PRECEDING AND CURRENT ROW`。`ORDER BY` があれば
+  現在行の peer グループ末尾まで（`last_value` は現在行でなく peer の最後の行の値）、無ければ
+  パーティション全体。明示の `ROWS`／`RANGE`／`GROUPS` と `EXCLUDE` も評価する
+  （`rows_frame_bounds`／`range_frame_bounds`／`groups_frame_bounds` を再利用。オフセットの検査時点も集計と同じ）。
+- **位置の求め方**: `pick_in_frame` が、フレームから除外区間を引いた高々 3 区間の上で先頭・末尾・n 番目を
+  O(1) に求める（フレームの幅に比例した走査をしない）。空フレーム・序数超過は NULL。
+- **引数**: `first_value`／`last_value` は 1 個、`nth_value` は 2 個（誤りは `42883`）。`n` は現在行で行ごとに
+  評価し、NULL は NULL、0 以下は新 `ErrorClass::InvalidArgumentForNthValue`（`22016`。固定文言。
+  行の評価時に判定するため 0 行では出ない）、整数以外は `42804`、`int4` 範囲外は `22003`。
+  `DISTINCT`・`*`・`$n` は `42601`、入れ子のウィンドウ関数は `42P20`、集計は `42803`、運べない型
+  （VECTOR・配列・BYTEA・JSON）は `0A000`（`LAG`／`LEAD` と同じ分類）。
+- **遅延エラー**: 値の評価エラー（`22xxx`）は参照された行のときだけ返す。
+- **RLS**: 母集合は materialize 段を通った行のみ（RLS-10 ポインタ）。他テナントの Private 行・`WHERE` で
+  除いた行は対象にならない。ビューの列スコープ検査は引数全体に及ぶ。
+- **破壊的変更**: 公開 enum `ErrorClass`・`SqlSurfaceError` に `22016` の分類を追加した（網羅 enum）。
+- **既知の差異**: (1) 同順位行の並びは PostgreSQL では不定だが、本実装は `ORDER BY`→`id`→`seq` で決まる。
+  (2) `bigint` 型の `n` を受理する（`LAG` のオフセットと同じ既存の差異）。(3) 運べない型は `0A000`。
+  PostgreSQL への実測は未実施で、テストの期待値は意味論から導いた。
+- **対象外**: `IGNORE NULLS`／`RESPECT NULLS`（PostgreSQL 17 も未対応）、名前付きウィンドウ（#1892）。
+
+## Issue #1884 追記: ntile（SQL-64 (4)・RLS-10 ポインタ）
+
+- **意味論**: `ntile(n)` はパーティションの行を並べ替えた順に n 個のバケットへ分け、バケット番号
+  （1 始まり）を返す。PostgreSQL 17 の `window_ntile` と同じ状態機械（スカラー 4 つ）を
+  `sql::window::evaluate_ntile_partition` に移植した。先頭の `行数 % n` 個のバケットが 1 行多い。
+  peer（同順位行）は区別せず、行の位置ごとに進める。バケット数 n に比例する確保・ループは無い。
+- **引数**: 1 個（誤りは `42883`）。バケット数が未確定の行でだけ引数を評価する（PostgreSQL と同じ。
+  列・式を渡すと先頭行の値で固定される）。NULL の行は NULL を返して次の行で再評価する。裸の `NULL` は
+  全行 NULL。0 以下は新 `ErrorClass::InvalidArgumentForNtileFunction`（`22014`。固定文言）、`int4`
+  範囲外は `22003`、整数以外は `42804`。`DISTINCT`・`*`・`$n` は `42601`、入れ子のウィンドウ関数は
+  `42P20`、集計は `42803`。0 行のパーティションは引数を評価しないためエラーにならない。
+- **束縛**: 引数は `BoundWindowOffsetArgs.value` に載せる（評価エラー `22xxx` が参照まで遅延するため。
+  `offset` は全行で即時評価されるので使わない）。結果型は `integer`。
+- **フレーム**: `OVER` のフレーム句は順位関数と同じく無視する（`WindowFunc::ignores_frame`。
+  フレームのオフセットも検査しない）。
+- **RLS**: 母集合は materialize 段を通った行のみ。他テナントの Private 行・`WHERE` で除いた行は
+  バケット境界に影響しない。
+- **破壊的変更**: 公開 enum `ErrorClass`・`SqlSurfaceError` に `22014` の分類を追加した（網羅 enum）。
+- **既知の差異**: (1) 型エラーは PostgreSQL の `42883` ではなく `42804`。(2) `bigint` 型の引数を受理する。
+  (3) `$n` は `42601`（`LAG`／`LEAD` と同じ）。(4) 同順位行の並びは `ORDER BY`→`id`→`seq` で決まる
+  （PostgreSQL では不定）。PostgreSQL への実測は未実施で、期待値は状態機械から導いた。
+- **対象外**: `percent_rank`／`cume_dist`（#1885）、名前付きウィンドウ（#1892）。
+
+## Issue #1885 追記: percent_rank／cume_dist（SQL-64・RLS-10 ポインタ）
+
+- **意味論**: パーティション行数を n、peer グループ先頭の 0 始まり位置を idx、peer グループ末尾の
+  次の位置を peer_end として `percent_rank = idx / (n - 1)`（n = 1 は 0）、
+  `cume_dist = peer_end / n`。整数を先に `f64` へ変換してから除算する（PostgreSQL の
+  `window_percent_rank`／`window_cume_dist` と同じ演算順）。peer 判定は `rank` と共通
+  （`SortedPartition::peer_groups`）。`ORDER BY` なしは全行 peer（0 と 1）。
+- **結果型**: `double precision`（`ColumnType::Double`・wire OID 701）。テキスト表現は
+  `scalar_float::format_double` 経由で PostgreSQL の float8 出力と一致（例: `0.3333333333333333`）。
+- **引数**: 取らない。引数・`DISTINCT`・`*` は `rank` と同じく `42601`。
+- **フレーム**: 順位関数と同じく評価に使わない（`ignores_frame`）。フレームのオフセット式の
+  評価は `rank`／`dense_rank` と同じ扱いで、`ntile` のようにスキップしない。
+- **RLS**: 母集合は materialize 段を通った行のみ。他テナントの Private 行・不可視行・`WHERE` で
+  除いた行は分母にも分子にも入らない。
+- **既知の差異**: (1) 引数付き呼び出しの SQLSTATE は PostgreSQL（仮説集合集約との関係で別エラー）と
+  異なりうる。(2) 同順位行の並びは `ORDER BY`→`id`→`seq` で決まるが、値は peer 内で同一のため結果に
+  影響しない。(3) フレームオフセット式の評価時点は PostgreSQL 16 以降の最適化との一致を未検証。
+  (4) PostgreSQL 実機での実測は未実施（期待値は定義式から導出）。
+- **対象外**: 名前付きウィンドウ（#1892）との組み合わせ、仮説集合集約形式（`WITHIN GROUP`）。
+
+## Issue #1894 追記: ウィンドウ集計の FILTER（SQL-64・RLS-10 ポインタ）
+
+- **受理範囲**: `count`／`sum`／`avg`／`min`／`max` の `<func>(<arg>) FILTER (WHERE <条件>) OVER (...)`。
+  条件の文法は WHERE・集計 SELECT の FILTER と同一で、解析本体は共有する
+  （`Parser::parse_filter_clause_body`）。`FILTER` の直後が `(` のときだけ句として扱い、列名・別名の
+  `filter` は壊さない。
+- **SQLSTATE の判定順**: FILTER 内の集計 `42803`・ウィンドウ関数 `42P20`・`$n` と `WHERE` 欠落 `42601`
+  を先に判定し、そのあとで集計でないウィンドウ関数（順位系・分布系・`lag`／`lead`・
+  `first_value`／`last_value`／`nth_value`・`ntile`）に付いた FILTER を `0A000` にする
+  （PostgreSQL が FILTER 式の変換後に関数種別を検査する順に合わせる）。
+- **評価**: materialize 段で行ごと・項目ごとに FILTER を評価し（`aggregate::item_filter_matches` を
+  集計 SELECT と共有）、偽・NULL の行はその項目の累積器へ観測させないだけにする。パーティション・
+  peer・フレーム位置・`EXCLUDE`・出力行には影響しない。空入力は `count` が 0、他は NULL。評価は
+  可視性判定・文の `WHERE` を通過した行にだけ行い、FILTER は母集合を広げない。判定結果の領域は
+  状態予算へ確保前に計上する。
+- **デコード対象・ビュー**: FILTER の参照列・embedding を `decode_tier_for_window` へ反映する
+  （`BoundAggregateFilter::mark_referenced` を集計側と共有）。ビューは FILTER の参照列も公開列に
+  限定する（`42703`）。評価後射影形ビューは参照列を `collect_referenced_idents` へ含め、
+  embedding 参照・写せない型の列は `0A000` で拒否する。
+- **対象外**: FILTER 内の部分クエリ（束縛段で `42601`。PostgreSQL は受理する差異）、名前付きウィンドウ
+  （#1892）との組み合わせ、`GROUP BY`／集計 SELECT とウィンドウの併用、`OVER` 無しで非集計関数に
+  FILTER を付けた場合の SQLSTATE の差異。PostgreSQL 実機での照合は未実施（期待値は意味論から導出）。
+
+## Issue #1895 追記: ウィンドウ集計の式引数（SQL-64 ポインタ）
+
+- **受理範囲**: `count`／`sum`／`avg`／`min`／`max` の `... OVER (...)` の引数に、集計 SELECT と同じ
+  値式（演算・組み込み関数・UDF・疑似列 `id`・embedding 参照）を受理する。構文段は
+  `parse_value_expr` で式を読み、束縛段は `resolve_aggregate_input`（`bind_expr` 経路）を共有するため、
+  型検査（`42883`・Interval／Numeric 式の `0A000`）と結果型（式は倍精度）は集計 SELECT と同じ。
+- **先読み検査**: 引数中の入れ子ウィンドウは `42P20`、集計呼び出しは `42803`、`$n` は `42601`
+  （LAG／LEAD と同じく Prepared の Describe との不整合を避ける fail-closed）。
+- **評価時点**: FILTER を引数評価より先に判定し、除外行の引数は評価しない
+  （`sum(10 / k) FILTER (WHERE k <> 0)` が除外行で `22012` にならない）。評価エラーは行ごとに保持し、
+  その行がフレームに入って観測されたときに初めて返す（どのフレームにも入らない行のエラーは出ない）。
+- **デコード対象**: 式が参照する列・embedding を `decode_tier_for_window` が参照集合へ反映する。
+  ビュー越しは、式中の非公開列を `42703` に統一する（存在情報を漏らさない）。評価後射影形
+  （バッファ済み）ビューでは、embedding 参照・写せない型の列・疑似 `id` を含む式を拒否する。
+- **対象外**: `$n`・部分クエリ・Numeric（CAST）／Interval 式・`COUNT(DISTINCT 式)` のウィンドウ版、
+  整数式の `sum` の結果型が倍精度になる差異（PostgreSQL は bigint／numeric。集計 SELECT と共通の既存契約）。
+  PostgreSQL 実機での照合は未実施（期待値は意味論から導出）。

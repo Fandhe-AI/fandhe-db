@@ -6509,6 +6509,37 @@ pub(crate) struct BoundAggregateFilter {
     pub(crate) or_filters: Vec<crate::sql::where_tree::BoundOrGroup>,
 }
 
+impl BoundAggregateFilter {
+    /// FILTER の参照列を `scalar_mask` へ反映し、embedding を参照するなら `true` を返す
+    /// （集計 `sql::aggregate::ReferencedColumns::derive` とウィンドウ `sql::window` の
+    /// デコード対象導出が共有する単一実装。漏れると縮小デコードで条件が NULL と取り違えられる）。
+    pub(crate) fn mark_referenced(&self, scalar_mask: &mut [bool]) -> bool {
+        let mut needs_embedding = false;
+        for f in &self.metadata_filters {
+            if let Some(slot) = scalar_mask.get_mut(f.column_index()) {
+                *slot = true;
+            }
+        }
+        for expr in &self.expr_filters {
+            if crate::sql::udf_call::references_embedding(expr) {
+                needs_embedding = true;
+            }
+            crate::sql::udf_call::mark_referenced_scalar_columns(expr, scalar_mask);
+        }
+        for group in &self.or_filters {
+            group.visit_column_indices(&mut |idx| {
+                if let Some(slot) = scalar_mask.get_mut(idx) {
+                    *slot = true;
+                }
+            });
+            if group.references_embedding() {
+                needs_embedding = true;
+            }
+        }
+        needs_embedding
+    }
+}
+
 /// 集計項目の `FILTER` 述語列を束縛する（[`bind_aggregate_with_dummy_flags`] の `Aggregate`
 /// 腕・`Expr` 腕〔隠し集計〕が共有）。空なら `None`。式ノード予算は文全体で共有する
 /// （DoS 有界）。`dummy_equality_flags` は渡さず全値検証（FILTER 内に `$n` は存在しない）。
@@ -9714,6 +9745,12 @@ pub(crate) struct BoundWindowItem {
     pub(crate) order_by: Vec<BoundWindowOrderKey>,
     /// 束縛済みのフレーム句（`ROWS`・`RANGE`・`GROUPS`。SQL-64 (2)・Issue #1889／#1890／#1891）。
     pub(crate) frame: Option<BoundWindowFrame>,
+    /// 集計の `FILTER (WHERE ...)`（SQL-64・Issue #1894）。偽・NULL の行はこの項目の累積器の入力
+    /// からだけ除く。集計 SELECT と同じ [`BoundAggregateFilter`] を共有する。
+    pub(crate) filter: Option<Box<BoundAggregateFilter>>,
+    /// 集計引数が式（`ScalarExpr`／`TypedExpr`）で疑似列 `id` を参照するか（Issue #1895）。
+    /// 評価済みセル上（バッファ済みビュー）では `id` を持てないため `sql::window` が拒否に使う。
+    pub(crate) input_uses_pseudo_id: bool,
     pub(crate) name: String,
 }
 
@@ -10000,8 +10037,11 @@ fn bind_window_offset_args(
         .default
         .as_ref()
         .and_then(|d| lag_lead_declared_type(d, schema, udfs, node_budget));
-    let unsupported =
-        || SqlSurfaceError::feature_not_supported("this value type is not supported in LAG/LEAD");
+    let unsupported = || {
+        SqlSurfaceError::feature_not_supported(
+            "this value type is not supported in window value functions",
+        )
+    };
     let offset = match &args.offset {
         None => None,
         Some(Expr::Null) => Some(BoundExpr::Null),
@@ -10025,7 +10065,7 @@ fn bind_window_offset_args(
                 }
                 _ => {
                     return Err(SqlSurfaceError::datatype_mismatch(
-                        "LAG/LEAD offset must be of integer type",
+                        "window value function offset must be of integer type",
                     ))
                 }
             }
@@ -10038,7 +10078,7 @@ fn bind_window_offset_args(
                 }
                 _ => {
                     return Err(SqlSurfaceError::datatype_mismatch(
-                        "LAG/LEAD offset must be of integer type",
+                        "window value function offset must be of integer type",
                     ))
                 }
             }
@@ -10238,6 +10278,70 @@ fn bind_window_offset_args(
     })
 }
 
+/// `ntile(num_buckets)` の引数を束縛する（SQL-64 (4)・Issue #1884。[`bind_window_item`] から呼ばれる）。
+/// 引数は整数系（SMALLINT／INTEGER／BIGINT）または裸の `NULL` のみ。`sql::window` は引数を
+/// 「バケット数を確定する最初の行」でだけ読むため、値は [`BoundWindowOffsetArgs::value`] に載せ
+/// （評価エラー `22xxx` が参照まで遅延する）、`offset`／`default` は使わない。整数でない型は
+/// `42804`（PostgreSQL は `42883`。既知の差異）。
+fn bind_ntile_args(
+    args: &crate::sql::allowlist::WindowOffsetArgs,
+    schema: &TableSchema,
+    udfs: &crate::sql::udf_call::UdfRegistry,
+    node_budget: &mut usize,
+) -> Result<BoundWindowOffsetArgs, SqlSurfaceError> {
+    use crate::sql::udf_call::{bind_projection_expr, BoundExpr, ExprType};
+    let mismatch =
+        || SqlSurfaceError::datatype_mismatch("argument of ntile must be of integer type");
+    let mut idents = std::collections::HashSet::new();
+    collect_expr_idents(&args.value, &mut idents);
+    let uses_pseudo_id = idents.contains("id")
+        && schema.has_pseudo_id()
+        && !schema.columns.iter().any(|c| c.name == "id");
+    let is_int = |t: &ColumnType| {
+        matches!(
+            t,
+            ColumnType::SmallInt | ColumnType::Integer | ColumnType::BigInt
+        )
+    };
+    let (value, result_type) = if matches!(&args.value, Expr::Null) {
+        (
+            BoundWindowValue::Expr {
+                bound: BoundExpr::Null,
+                ty: ExprType::Scalar,
+            },
+            ColumnType::Integer,
+        )
+    } else if is_pseudo_id_ref(&args.value, schema) {
+        (BoundWindowValue::PseudoId, ColumnType::BigInt)
+    } else if let Some((index, column)) = bare_schema_column(&args.value, schema) {
+        if !is_int(&column.ty) {
+            return Err(mismatch());
+        }
+        (
+            BoundWindowValue::Column {
+                index,
+                ty: column.ty.clone(),
+            },
+            column.ty.clone(),
+        )
+    } else {
+        let (bound, ty, col) = bind_projection_expr(&args.value, schema, udfs, node_budget)?;
+        match col {
+            Some(c) if is_int(&c) => (BoundWindowValue::Expr { bound, ty }, c),
+            _ => return Err(mismatch()),
+        }
+    };
+    Ok(BoundWindowOffsetArgs {
+        value,
+        offset: None,
+        default: None,
+        default_column: None,
+        default_pseudo_id: false,
+        result_type: Some(result_type),
+        uses_pseudo_id,
+    })
+}
+
 /// ウィンドウ `ORDER BY` の束縛済み 1 キー（キー参照・降順指定・NULL 位置。SQL-30・SQL-56）。
 #[derive(Debug, Clone, PartialEq)]
 pub(crate) struct BoundWindowOrderKey {
@@ -10324,14 +10428,23 @@ fn bind_window_item(
                 WindowFunc::Max => AggregateFunc::Max,
                 // 構文層（`Parser::parse_window_item`）が順位関数に引数を
                 // 持たせないため到達しない（防御的に内部バグとして扱う）。
-                WindowFunc::RowNumber | WindowFunc::Rank | WindowFunc::DenseRank => {
+                WindowFunc::RowNumber
+                | WindowFunc::Rank
+                | WindowFunc::DenseRank
+                | WindowFunc::PercentRank
+                | WindowFunc::CumeDist => {
                     return Err(SqlSurfaceError::Internal {
                         detail: "ranking window function unexpectedly carries an argument"
                             .to_string(),
                     });
                 }
                 // `LAG`／`LEAD` の引数は `offset_args` 経路で運び、`arg` は常に `None`。
-                WindowFunc::Lag | WindowFunc::Lead => {
+                WindowFunc::Lag
+                | WindowFunc::Lead
+                | WindowFunc::FirstValue
+                | WindowFunc::LastValue
+                | WindowFunc::NthValue
+                | WindowFunc::Ntile => {
                     return Err(SqlSurfaceError::Internal {
                         detail: "offset window function unexpectedly carries an aggregate argument"
                             .to_string(),
@@ -10351,12 +10464,40 @@ fn bind_window_item(
                     detail: "INTERVAL columns are not supported in window aggregates".to_string(),
                 });
             }
+            // Issue #1895: ウィンドウが受理する入力は列・`*`・式（`ScalarExpr`／`TypedExpr`）。
+            // `string_agg`／`array_agg`／比較式／`GROUPING` はウィンドウ集計では生成されない
+            // ため、到達したら束縛層の不整合として fail-closed に拒否する。
+            if matches!(
+                resolved,
+                AggregateInput::StringAgg(_)
+                    | AggregateInput::ArrayAgg(_)
+                    | AggregateInput::BoolExpr { .. }
+                    | AggregateInput::GroupingKeys(_)
+            ) {
+                return Err(SqlSurfaceError::Internal {
+                    detail: "window aggregate resolved to an unsupported input kind".to_string(),
+                });
+            }
             Some(resolved)
         }
     };
+    // 疑似列 `id` を式の中で参照するか（裸の `id` 引数は `IdU64` 専用経路なので対象外）。
+    let input_uses_pseudo_id = match &item.arg {
+        Some(crate::sql::allowlist::AggregateArg::Expr(e)) if !matches!(e, Expr::Ident(_)) => {
+            let mut idents = std::collections::HashSet::new();
+            collect_expr_idents(e, &mut idents);
+            idents.contains("id")
+                && schema.has_pseudo_id()
+                && !schema.columns.iter().any(|c| c.name == "id")
+        }
+        _ => false,
+    };
 
     let offset_args = match &item.offset_args {
-        Some(args) if item.func.is_value_offset() => {
+        Some(args) if item.func == WindowFunc::Ntile => {
+            Some(bind_ntile_args(args, schema, udfs, node_budget)?)
+        }
+        Some(args) if item.func.takes_value_args() => {
             Some(bind_window_offset_args(args, schema, udfs, node_budget)?)
         }
         _ => None,
@@ -10379,6 +10520,14 @@ fn bind_window_item(
 
     let frame = bind_window_frame(item, udfs, schema, node_budget)?;
 
+    let filter = bind_aggregate_filter(&item.filter, schema, udfs, node_budget)?;
+    // 構文層が非集計関数の FILTER を 0A000 で止めるため到達しない不変条件（fail-closed）。
+    if filter.is_some() && input.is_none() {
+        return Err(SqlSurfaceError::Internal {
+            detail: "window FILTER on a non-aggregate window function".to_string(),
+        });
+    }
+
     let name = item
         .alias
         .clone()
@@ -10392,6 +10541,8 @@ fn bind_window_item(
         partition_by,
         order_by,
         frame,
+        filter,
+        input_uses_pseudo_id,
         name,
     };
     // `LAG`／`LEAD` は構文受理・束縛・型検査（Issue #1880）の後、評価（`sql::window`。

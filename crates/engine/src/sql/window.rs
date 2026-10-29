@@ -31,13 +31,12 @@
 //! 集計の数値計算（`SUM`/`AVG`/`MIN`/`MAX` の NULL 契約・桁あふれ検査・NUMERIC の
 //! scale 保持）は [`crate::sql::aggregate::Accumulator`] を再利用し、集計 SELECT
 //! （`sql::aggregate`）と同一の規約を共有する（第 2 の集計実装を作らない）。
-//! ウィンドウ項目の集計引数は構文段（`sql::allowlist::Parser::parse_window_item`）で
-//! 裸の列参照・`*` のみに制限しているため（複合式は対象外）、束縛結果
-//! （[`AggregateInput`]）に `ScalarExpr` は現れない——本モジュールはこの前提のもとで
-//! のみ `Accumulator::observe` を呼ぶ。`observe` は借用形（`scanned: &[Option<
-//! row_codec::ScalarRef>]`・`vector: &RowVector`）を要求するため、materialize 段で
-//! owned 化した値を、観測のたびにその場で最小限の借用形へ組み立て直す
-//! （[`observe_window_row`]）。
+//! ウィンドウ項目の集計引数は裸の列参照・`*`・式（Issue #1895）を受理する。列参照は
+//! `Accumulator::observe` が要求する借用形（`scanned: &[Option<row_codec::ScalarRef>]`・
+//! `vector: &RowVector`）へ、materialize 段で owned 化した値を観測のたびにその場で最小限の
+//! 借用形へ組み立て直して渡す（[`observe_window_row`]）。式（`ScalarExpr`／`TypedExpr`）は
+//! materialize 段で FILTER 通過後の行についてだけ評価して owned 化し
+//! （[`eval_window_expr_input`]）、観測では `Accumulator::observe_value` へ評価済みの値を渡す。
 //!
 //! 文全体のスカラー `ORDER BY`（Issue #1189）は、materialize 段で並べ替えキーを
 //! 集め、[`compute_output_order`] が base scan と同一の比較器で出力順（順列）を
@@ -70,17 +69,29 @@
 //! オフセットは peer グループ数で、境界は [`groups_frame_bounds`] が前進のみの 2 本のカーソル
 //! （[`GroupCursor`]）で求める。グループ境界の配列は確保しないため状態予算は変わらない。
 //!
+//! `first_value`／`last_value`／`nth_value`（SQL-64 (3)・Issue #1883）は、`LAG`／`LEAD` と同じ
+//! 引数経路（[`OffsetRowValues`]。`nth_value` の `n` はオフセット欄）で参照先の値を集め、評価段
+//! （[`evaluate_value_frame_partition`]）が行ごとのフレーム（既定は `RANGE BETWEEN UNBOUNDED
+//! PRECEDING AND CURRENT ROW`。明示の `ROWS`／`RANGE`／`GROUPS`・`EXCLUDE` も評価する）から
+//! `EXCLUDE` 対象を除いた先頭・末尾・n 番目の行を [`pick_in_frame`] で O(1) に引く。境界の計算は
+//! 集計と同じ [`rows_frame_bounds`]／[`groups_frame_bounds`]／[`range_frame_bounds`] を再利用する。
+//!
 //! 対象外（`42601`／`54000`／`0A000` で fail-closed に拒否。allowlist・parser 側で既に拒否
 //! 済みの形も含む）:
-//! 名前付きウィンドウ・`FILTER (...)`・関数内 `DISTINCT`・複合式の引数・
+//! 名前付きウィンドウ・関数内 `DISTINCT`・
 //! ベクトル順位付け（`ORDER BY embedding <=> ...`）／`USING PLAN` との併用・
 //! ウィンドウ別名による文全体の `ORDER BY`・`GROUP BY`／集計 SELECT との併用。
+//!
+//! 集計の `FILTER (WHERE ...)`（Issue #1894）は行ごと項目ごとの判定結果（`filter_pass`）を
+//! materialize 段で持ち、偽・NULL の行をその項目の累積器の入力からだけ除く
+//! （[`observe_window_row_at`]）。パーティション・peer・フレーム位置・出力行には影響しない。
 
 use crate::catalog::{self, ColumnType, TableSchema};
 use crate::declarative_filter;
 use crate::policy::PolicyContext;
 use crate::row_codec;
 use crate::sql::aggregate::{self, Accumulator, DecodeTier, RowVector};
+use crate::sql::aggregate_input;
 use crate::sql::allowlist::{SqlSurfaceError, WindowFrameExclusion, WindowFrameMode, WindowFunc};
 use crate::sql::exec::{Cell, ColumnMeta, QueryResult, ResultRow};
 use crate::sql::expr_program::{ExprProgram, StackValue};
@@ -226,9 +237,39 @@ enum WindowKeyValue {
     Uuid(crate::uuid::Uuid),
 }
 
-/// ウィンドウ集計項目の引数値（実行時表現。SQL-30・TASK-214）。構文段が引数を
-/// 裸の列参照・`*` のみに制限しているため、束縛結果は必ずこの網羅で尽くされる
-/// （複合式は現れない）。
+/// 式引数（`ScalarExpr`／`TypedExpr`）の 1 行分の評価結果を owned 化した値（Issue #1895）。
+/// `AggregateRowValue` のうち式が生成しうる腕だけを持つ（借用を行の寿命から切り離すため）。
+#[derive(Debug, Clone)]
+enum EvaluatedAggValue {
+    Null,
+    Float(f64),
+    Text(String),
+    Bool(bool),
+    Date(i32),
+    Timestamp(i64),
+    Time(i64),
+    TimestampTz(i64),
+}
+
+impl EvaluatedAggValue {
+    /// 累積器の入口（`Accumulator::observe_value`）が受ける借用形へ戻す。
+    fn as_row_value(&self) -> aggregate_input::AggregateRowValue<'_> {
+        use aggregate_input::AggregateRowValue as V;
+        match self {
+            EvaluatedAggValue::Null => V::Null,
+            EvaluatedAggValue::Float(v) => V::Float(*v),
+            EvaluatedAggValue::Text(s) => V::Text(std::borrow::Cow::Borrowed(s.as_str())),
+            EvaluatedAggValue::Bool(b) => V::Bool(*b),
+            EvaluatedAggValue::Date(v) => V::Date(*v),
+            EvaluatedAggValue::Timestamp(v) => V::Timestamp(*v),
+            EvaluatedAggValue::Time(v) => V::Time(*v),
+            EvaluatedAggValue::TimestampTz(v) => V::TimestampTz(*v),
+        }
+    }
+}
+
+/// ウィンドウ集計項目の引数値（実行時表現。SQL-30・TASK-214）。引数は裸の列参照・`*`・式
+/// （Issue #1895。式は行ごとに評価済みの [`WindowInputValue::Evaluated`]）。
 #[derive(Debug, Clone)]
 enum WindowInputValue {
     /// 順位関数（`ROW_NUMBER`/`RANK`/`DENSE_RANK`）。引数を持たない。
@@ -251,6 +292,10 @@ enum WindowInputValue {
     /// （いずれも `COUNT` 限定。`Accumulator::observe` はこれらの型で値の中身を
     /// 見ず非 NULL の有無だけを見るため、実際の値は保持しない）。
     PresenceOnly(bool),
+    /// 式引数の評価結果（Issue #1895）。評価エラー（`22012`・`22003` 等）は、その行がフレームに
+    /// 入って観測されるときまで保持する（PostgreSQL と同じく、どのフレームにも入らない行の
+    /// エラーは表面化しない。`LAG`／`LEAD` の [`OffsetRowValues::value`] と同方針）。
+    Evaluated(Result<EvaluatedAggValue, SqlSurfaceError>),
 }
 
 /// `LAG`／`LEAD` 項目 1 つについての 1 行分の入力（Issue #1881）。この行が他の行から参照
@@ -720,7 +765,7 @@ fn check_range_bound(
 /// 項目ごとのフレームを実行開始時に解決する（`execute_window_scan_with_caps` と
 /// [`CellWindowEvaluator::new`] が行を引く前に 1 回呼ぶ。PostgreSQL がプラン時・WindowAgg 開始時に
 /// オフセットを評価するのと同じ位置で、0 行・`WHERE` 不一致でもエラーを返す）。
-/// 評価エラー（`22012`・`22003` 等）は関数種別を問わず返す。NULL／`ROWS`・`GROUPS` の負の検査は集計と
+/// 評価エラー（`22012`・`22003` 等）は `ntile`（フレーム式を評価しない）以外の関数種別で返す。NULL／`ROWS`・`GROUPS` の負の検査は集計と
 /// `LAG`／`LEAD` だけが行う（順位関数は PostgreSQL 16 以降フレームを最適化で置き換えるため
 /// 検査しない）。`RANGE` の負・NaN は検査を遅延する（集計と、オフセット付きの `LAG`／`LEAD` が
 /// 境界計算時に行う）。戻り値を保持するのは集計（と `RANGE` オフセット付きの `LAG`／`LEAD`）で、
@@ -731,6 +776,12 @@ fn resolve_frames(
     let mut scratch: Vec<StackValue> = Vec::new();
     let mut evaluated: Vec<Option<EvaluatedFrame>> = Vec::with_capacity(items.len());
     for item in items {
+        // `ntile` はフレームを無視し、オフセット式も評価・検査しない（Issue #1884。
+        // `ROWS BETWEEN (1 / 0) PRECEDING ...` でも `22012` を返さない）。
+        if item.func == WindowFunc::Ntile {
+            evaluated.push(None);
+            continue;
+        }
         evaluated.push(match &item.frame {
             None => None,
             Some(frame) => match frame.mode {
@@ -758,10 +809,7 @@ fn resolve_frames(
             out.push(None);
             continue;
         };
-        if matches!(
-            item.func,
-            WindowFunc::RowNumber | WindowFunc::Rank | WindowFunc::DenseRank
-        ) {
+        if item.func.ignores_frame() {
             out.push(None);
             continue;
         }
@@ -846,6 +894,10 @@ struct MaterializedRow {
     agg_values: Vec<WindowInputValue>,
     /// `LAG`／`LEAD` 項目の入力（外側添字がウィンドウ項目。それ以外の項目は `None`。Issue #1881）。
     offset_values: Vec<Option<OffsetRowValues>>,
+    /// 項目ごとの FILTER 判定結果（外側添字がウィンドウ項目。FILTER なしは `true`。Issue #1894）。
+    /// `false` の行はその項目の累積器へ観測させないだけで、パーティション・peer・フレーム位置・
+    /// 出力行には残す。
+    filter_pass: Vec<bool>,
     /// 文全体のスカラー `ORDER BY` キー値（`bound.order_by` と同順。`ORDER BY`
     /// なしなら空。Issue #1189）。出力順の計算（[`compute_output_order`]）専用で、
     /// 出力には現れない。
@@ -1180,6 +1232,7 @@ fn materialize_rows(
                 order_keys,
                 agg_values,
                 offset_values,
+                filter_pass,
             } = collect_window_row_values(
                 bound.windows(),
                 &mut offset_eval,
@@ -1245,6 +1298,7 @@ fn materialize_rows(
                 order_keys,
                 agg_values,
                 offset_values,
+                filter_pass,
                 stmt_order_keys,
                 tenant_idx,
             });
@@ -1269,6 +1323,7 @@ struct WindowRowValues {
     order_keys: Vec<Vec<Option<WindowKeyValue>>>,
     agg_values: Vec<WindowInputValue>,
     offset_values: Vec<Option<OffsetRowValues>>,
+    filter_pass: Vec<bool>,
 }
 
 /// `scanned`（1 行分のスカラー列）から `items`（`bound.windows()`）ごとのキー・引数の値を
@@ -1298,6 +1353,14 @@ fn collect_window_row_values(
         .ok_or_else(|| window_bug("offset slot size overflow"))?;
     *state_bytes = try_accumulate_state_budget(*state_bytes, offset_slots_bytes, state_cap)?;
     let mut offset_values = Vec::with_capacity(items.len());
+    // FILTER 判定結果の固定領域（項目数 × bool）も確保前に状態予算へ計上する（Issue #1894）。
+    let filter_slots_bytes = std::mem::size_of::<bool>()
+        .checked_mul(items.len())
+        .ok_or_else(|| window_bug("filter slot size overflow"))?;
+    *state_bytes = try_accumulate_state_budget(*state_bytes, filter_slots_bytes, state_cap)?;
+    let mut filter_pass = Vec::with_capacity(items.len());
+    let mut filter_scratch: Vec<StackValue> = Vec::new();
+    let mut expr_scratch: Vec<StackValue> = Vec::new();
     for (item_index, item) in items.iter().enumerate() {
         let mut pkeys = Vec::with_capacity(item.partition_by.len());
         for key in &item.partition_by {
@@ -1333,10 +1396,56 @@ fn collect_window_row_values(
             okeys.push(value);
         }
 
+        // FILTER は集計引数の評価より先に判定する（除外行の引数を評価しない。PostgreSQL と同じく
+        // `sum(10 / k) FILTER (WHERE k <> 0)` が除外行で `22012` を返さない。Issue #1895）。
+        // 可視性判定・文の WHERE を通過した行にだけ到達する（FILTER は母集合を広げない）。
+        let passes = match &item.filter {
+            None => true,
+            Some(filter) => {
+                let vector = RowVector {
+                    dim,
+                    // `dim > 0` なのに embedding が空なら未デコード（導出漏れ）として `None`＝
+                    // `XX000` fail-closed。`dim == 0`（NULL／未設定ベクトル）は空スライスのまま
+                    // `Some` とし、式評価側の 3VL（UNKNOWN）で FILTER から除外させる。
+                    values: if dim > 0 && embedding.is_empty() {
+                        None
+                    } else {
+                        Some(embedding)
+                    },
+                };
+                crate::sql::aggregate::item_filter_matches(
+                    filter,
+                    id,
+                    &vector,
+                    scanned,
+                    &mut filter_scratch,
+                )?
+            }
+        };
+
         let agg_value = match &item.input {
             None => WindowInputValue::None,
             Some(input) => {
-                let value = extract_window_input(input, dim, scanned)?;
+                let value = if matches!(
+                    input,
+                    AggregateInput::ScalarExpr { .. } | AggregateInput::TypedExpr { .. }
+                ) {
+                    if passes {
+                        // 式引数は FILTER を通過した行でだけ評価する（Issue #1895）。
+                        eval_window_expr_input(
+                            input,
+                            id,
+                            dim,
+                            embedding,
+                            scanned,
+                            &mut expr_scratch,
+                        )?
+                    } else {
+                        WindowInputValue::None
+                    }
+                } else {
+                    extract_window_input(input, dim, scanned)?
+                };
                 *state_bytes = try_accumulate_state_budget(
                     *state_bytes,
                     window_input_value_bytes(&value),
@@ -1363,12 +1472,14 @@ fn collect_window_row_values(
         order_keys.push(okeys);
         agg_values.push(agg_value);
         offset_values.push(offset_value);
+        filter_pass.push(passes);
     }
     Ok(WindowRowValues {
         partition_keys,
         order_keys,
         agg_values,
         offset_values,
+        filter_pass,
     })
 }
 
@@ -1424,7 +1535,47 @@ impl<'a> CellWindowEvaluator<'a> {
                         .any(|ty| !crate::sql::join::values::cell_scalar_supports(ty))
                 {
                     return Err(SqlSurfaceError::FeatureNotSupported {
-                        detail: "LAG/LEAD over TIME, TIMESTAMPTZ or INTERVAL columns of a buffered view is not supported"
+                        detail: "window value functions over TIME, TIMESTAMPTZ or INTERVAL columns of a buffered view are not supported"
+                            .to_string(),
+                    });
+                }
+            }
+            // FILTER は評価済みセル上では embedding を持てず、写せない型の列は読めないため、
+            // 黙って誤評価せず固定 `0A000` で拒否する（Issue #1894。fail-closed）。
+            if let Some(filter) = &item.filter {
+                let mut mask = vec![false; column_types.len()];
+                let needs_embedding = filter.mark_referenced(&mut mask);
+                let unsupported = mask.iter().zip(column_types.iter()).any(|(used, ty)| {
+                    *used
+                        && ty
+                            .as_ref()
+                            .is_some_and(|t| !crate::sql::join::values::cell_scalar_supports(t))
+                });
+                if needs_embedding || unsupported {
+                    return Err(SqlSurfaceError::FeatureNotSupported {
+                        detail: "window FILTER over a buffered view supports only scalar columns of plain types"
+                            .to_string(),
+                    });
+                }
+            }
+            // 式形の集計引数（Issue #1895）も、評価済みセル上では embedding を持てず、写せない型の
+            // 列は読めないため、固定 `0A000` で拒否する（fail-closed）。
+            if let Some(
+                AggregateInput::ScalarExpr { source, .. }
+                | AggregateInput::TypedExpr { source, .. },
+            ) = &item.input
+            {
+                let mut mask = vec![false; column_types.len()];
+                udf_call::mark_referenced_scalar_columns(source, &mut mask);
+                let unsupported = mask.iter().zip(column_types.iter()).any(|(used, ty)| {
+                    *used
+                        && ty
+                            .as_ref()
+                            .is_some_and(|t| !crate::sql::join::values::cell_scalar_supports(t))
+                });
+                if udf_call::references_embedding(source) || unsupported {
+                    return Err(SqlSurfaceError::FeatureNotSupported {
+                        detail: "window aggregate expressions over a buffered view support only scalar columns of plain types"
                             .to_string(),
                     });
                 }
@@ -1434,6 +1585,7 @@ impl<'a> CellWindowEvaluator<'a> {
                 .iter()
                 .chain(item.order_by.iter().map(|o| &o.key))
                 .any(|k| matches!(k, WindowKeyRef::Id))
+                || item.input_uses_pseudo_id
                 || matches!(item.input, Some(AggregateInput::IdU64))
                 || item
                     .offset_args
@@ -1471,6 +1623,7 @@ impl<'a> CellWindowEvaluator<'a> {
             order_keys,
             agg_values,
             offset_values,
+            filter_pass,
         } = collect_window_row_values(
             self.items,
             &mut self.offset_eval,
@@ -1490,6 +1643,7 @@ impl<'a> CellWindowEvaluator<'a> {
             order_keys,
             agg_values,
             offset_values,
+            filter_pass,
             stmt_order_keys: Vec::new(),
             tenant_idx: 0,
         });
@@ -1589,6 +1743,14 @@ fn decode_tier_for_window(schema: &TableSchema, bound: &BoundScan) -> (DecodeTie
     }
 
     for item in bound.windows() {
+        // 集計の FILTER が参照する列・embedding も反映する（Issue #1894。取りこぼすと縮小デコード
+        // した行で条件が NULL と取り違えられ、黙って誤集計になる）。
+        if let Some(filter) = &item.filter {
+            has_scalar_reference = true;
+            if filter.mark_referenced(&mut scalar_mask) {
+                needs_embedding = true;
+            }
+        }
         // `LAG`／`LEAD` の値・オフセット・既定値が参照する列も反映する（Issue #1880。
         // 取りこぼすとマスク外の列を NULL と誤判定する fail-closed 違反になるため、評価を
         // 接続する Issue #1881 より前に先回りで入れておく）。
@@ -1650,17 +1812,24 @@ fn decode_tier_for_window(schema: &TableSchema, bound: &BoundScan) -> (DecodeTie
                     *slot = true;
                 }
             }
-            // 構文段が複合式の引数を受理しないため到達しない
-            // （`Parser::parse_window_item` 参照）。
-            Some(AggregateInput::ScalarExpr { .. }) => {
+            // 式引数（Issue #1895）は集計 SELECT（`sql::aggregate`）と同じ契約で、参照する列・
+            // embedding をデコード対象へ反映する（取りこぼすと縮小デコードした行で列が NULL と
+            // 取り違えられ、黙って誤集計になる）。
+            Some(
+                AggregateInput::ScalarExpr { source, .. }
+                | AggregateInput::TypedExpr { source, .. },
+            ) => {
                 has_scalar_reference = true;
+                if udf_call::references_embedding(source) {
+                    needs_embedding = true;
+                }
+                udf_call::mark_referenced_scalar_columns(source, &mut scalar_mask);
             }
             // `string_agg` はウィンドウ関数ではない（`WindowFunc::from_name` が拒否済み）。
             Some(
                 AggregateInput::StringAgg(_)
                 | AggregateInput::ArrayAgg(_)
                 | AggregateInput::BoolExpr { .. }
-                | AggregateInput::TypedExpr { .. }
                 | AggregateInput::GroupingKeys(_),
             ) => {
                 has_scalar_reference = true;
@@ -1764,9 +1933,56 @@ fn extract_window_key(
     })
 }
 
+/// 式引数（`ScalarExpr`／`TypedExpr`）を 1 行分評価して owned 化する（Issue #1895）。
+/// 評価は集計 SELECT と同じ [`aggregate_input::eval_aggregate_input`] を共有する（第 2 の式評価を
+/// 作らない）。`22xxx` 系の評価エラーは [`WindowInputValue::Evaluated`] に保持して観測時に返し、
+/// 実装バグ（`XX000`）は fail-closed のため即座に返す。`dim > 0` なのに embedding が空なら
+/// 未デコード（導出漏れ）として `None` にし、式評価側が `XX000` で拒否する。
+fn eval_window_expr_input(
+    input: &AggregateInput,
+    id: u64,
+    dim: u32,
+    embedding: &[f32],
+    scanned: &[Option<row_codec::ScalarRef<'_>>],
+    scratch: &mut Vec<StackValue>,
+) -> Result<WindowInputValue, SqlSurfaceError> {
+    use aggregate_input::AggregateRowValue as V;
+    let vector = RowVector {
+        dim,
+        values: if dim > 0 && embedding.is_empty() {
+            None
+        } else {
+            Some(embedding)
+        },
+    };
+    let evaluated =
+        match aggregate_input::eval_aggregate_input(input, id, &vector, scanned, scratch) {
+            Ok(v) => v,
+            Err(e @ SqlSurfaceError::Internal { .. }) => return Err(e),
+            Err(e) => return Ok(WindowInputValue::Evaluated(Err(e))),
+        };
+    let owned = match evaluated {
+        V::Null => EvaluatedAggValue::Null,
+        V::Float(v) => EvaluatedAggValue::Float(v),
+        V::Text(s) => EvaluatedAggValue::Text(aggregate::try_clone_str(s.as_ref())?),
+        V::Bool(b) => EvaluatedAggValue::Bool(b),
+        V::Date(v) => EvaluatedAggValue::Date(v),
+        V::Timestamp(v) => EvaluatedAggValue::Timestamp(v),
+        V::Time(v) => EvaluatedAggValue::Time(v),
+        V::TimestampTz(v) => EvaluatedAggValue::TimestampTz(v),
+        _ => {
+            return Err(window_bug(
+                "window expression input evaluated to an unexpected value kind",
+            ))
+        }
+    };
+    Ok(WindowInputValue::Evaluated(Ok(owned)))
+}
+
 /// [`AggregateInput`] の値を `scanned`／`dim` から取り出す（SQL-30・TASK-214）。
-/// 構文段が複合式を受理しないため `ScalarExpr` は到達しない
-/// （到達した場合は実装バグとして fail-closed に拒否する）。
+/// 式引数（`ScalarExpr`／`TypedExpr`）は評価に id・embedding・FILTER 結果が要るため
+/// [`collect_window_row_values`] が [`eval_window_expr_input`] へ回す（ここへ到達したら
+/// 実装バグとして fail-closed に拒否する）。
 fn extract_window_input(
     input: &AggregateInput,
     dim: u32,
@@ -1861,8 +2077,8 @@ fn extract_window_input(
         | AggregateInput::UuidColumn(index) => {
             WindowInputValue::PresenceOnly(scanned.get(*index).copied().flatten().is_some())
         }
-        // 構文段（`Parser::parse_window_item`）が裸の列参照・`*` のみを受理する
-        // ため到達しない。
+        // 式引数は呼び出し元が [`eval_window_expr_input`] へ回す。`string_agg` 等は
+        // ウィンドウ関数ではないため到達しない。
         AggregateInput::ScalarExpr { .. }
         | AggregateInput::StringAgg(_)
         | AggregateInput::ArrayAgg(_)
@@ -1870,7 +2086,7 @@ fn extract_window_input(
         | AggregateInput::TypedExpr { .. }
         | AggregateInput::GroupingKeys(_) => {
             return Err(window_bug(
-                "window aggregate input unexpectedly carries a compound expression",
+                "window aggregate input reached the column extractor with an unsupported kind",
             ))
         }
     })
@@ -1891,6 +2107,9 @@ fn window_input_value_bytes(value: &WindowInputValue) -> usize {
     let base = std::mem::size_of::<WindowInputValue>();
     match value {
         WindowInputValue::Text(Some(s)) => base + s.len(),
+        WindowInputValue::Evaluated(Ok(EvaluatedAggValue::Text(s))) => base + s.len(),
+        // 保持する評価エラーの詳細文字列（固定の短い英語）の概算。
+        WindowInputValue::Evaluated(Err(_)) => base + 256,
         _ => base,
     }
 }
@@ -2138,6 +2357,287 @@ fn evaluate_offset_partition(
     Ok(())
 }
 
+/// フレーム内から引く位置の種別（[`pick_in_frame`]）。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum FramePick {
+    First,
+    Last,
+    /// 0 始まりの序数（`nth_value(v, n)` の `n - 1`）。
+    Nth(usize),
+}
+
+/// フレーム `[start, end)` から除外区間 `excluded`（半開区間。フレームの外にあってもよい）を除いた
+/// 行の中で、`pick` が指す位置を返す（無ければ `None`＝空フレーム・序数超過）。除外は高々 2 区間
+/// （`EXCLUDE TIES`）で、残りは高々 3 区間なので固定長配列と飽和演算だけで O(1) に求める。
+fn pick_in_frame(
+    start: usize,
+    end: usize,
+    excluded: &[(usize, usize)],
+    pick: FramePick,
+) -> Option<usize> {
+    const MAX_PIECES: usize = 4;
+    let mut pieces = [(0usize, 0usize); MAX_PIECES];
+    let mut count = 0usize;
+    if start < end {
+        pieces[0] = (start, end);
+        count = 1;
+    }
+    for &(ex_start, ex_end) in excluded {
+        if ex_start >= ex_end {
+            continue;
+        }
+        let mut next = [(0usize, 0usize); MAX_PIECES];
+        let mut next_count = 0usize;
+        for &(a, b) in pieces.iter().take(count) {
+            for (lo, hi) in [(a, b.min(ex_start)), (a.max(ex_end), b)] {
+                if lo < hi && next_count < MAX_PIECES {
+                    next[next_count] = (lo, hi);
+                    next_count += 1;
+                }
+            }
+        }
+        pieces = next;
+        count = next_count;
+    }
+    let live = pieces.get(..count)?;
+    match pick {
+        FramePick::First => live.first().map(|&(lo, _)| lo),
+        FramePick::Last => live.last().map(|&(_, hi)| hi.saturating_sub(1)),
+        FramePick::Nth(k) => {
+            let mut k = k;
+            for &(lo, hi) in live {
+                let len = hi.saturating_sub(lo);
+                if k < len {
+                    return Some(lo.saturating_add(k));
+                }
+                k -= len;
+            }
+            None
+        }
+    }
+}
+
+/// `ntile` の 1 パーティション分の状態（PostgreSQL の `window_ntile` と同じ状態機械。SQL-64 (4)・
+/// Issue #1884）。バケット数に比例する確保をしないよう、スカラー 4 つだけを持つ。
+#[derive(Debug, Default)]
+struct NtileState {
+    /// 現在のバケット番号（0 は未確定＝まだバケット数を読んでいない）。
+    ntile: i64,
+    rows_per_bucket: i64,
+    boundary: i64,
+    remainder: i64,
+}
+
+impl NtileState {
+    /// バケット数 `n`（1 以上）と総行数 `total` から初期状態を確定する。
+    fn start(&mut self, total: i64, n: i64) {
+        self.boundary = total / n;
+        if self.boundary == 0 {
+            self.boundary = 1;
+            self.remainder = 0;
+        } else {
+            self.remainder = total % n;
+            if self.remainder != 0 {
+                self.boundary += 1;
+            }
+        }
+        self.ntile = 1;
+        self.rows_per_bucket = 0;
+    }
+
+    /// 1 行分進め、その行のバケット番号を返す（[`NtileState::start`] 済みであること）。
+    fn advance(&mut self) -> i64 {
+        self.rows_per_bucket += 1;
+        if self.boundary < self.rows_per_bucket {
+            if self.remainder != 0 && self.ntile == self.remainder {
+                self.remainder = 0;
+                self.boundary -= 1;
+            }
+            self.ntile += 1;
+            self.rows_per_bucket = 1;
+        }
+        self.ntile
+    }
+}
+
+/// `ntile(num_buckets)` の 1 パーティション分の評価（SQL-64 (4)・Issue #1884。
+/// [`evaluate_partition`] から呼ばれる）。PostgreSQL の `window_ntile` と同じく、並べ替えた順に
+/// 行の位置ごとに進め（peer・フレームは区別しない）、バケット数が未確定の行でだけ引数を評価する。
+/// 引数が NULL ならその行は NULL で、次の行で再評価する。0 以下は `22014`、`integer` 範囲外は
+/// `22003`。0 行のパーティションは引数を評価しないためエラーにならない。母集合は materialize 段を
+/// 通った行のみで、不可視行・他テナントの Private 行はバケット境界に影響しない。
+fn evaluate_ntile_partition(
+    part: &SortedPartition<'_>,
+    out: &mut [Option<Cell>],
+    state_bytes: &mut usize,
+    state_cap: usize,
+) -> Result<(), SqlSurfaceError> {
+    let item_index = part.item_index;
+    let total = i64::try_from(part.len()).unwrap_or(i64::MAX);
+    let mut state = NtileState::default();
+    for pos in 0..part.len() {
+        crate::interrupt::check()?;
+        let row_idx = part.row_index(pos)?;
+        let cell = if state.ntile == 0 {
+            let values = part
+                .materialized
+                .get(row_idx)
+                .and_then(|r| r.offset_values.get(item_index))
+                .and_then(|v| v.as_ref())
+                .ok_or_else(|| window_bug("ntile argument missing for a row"))?;
+            let arg = values.value.as_ref().map_err(Clone::clone)?;
+            let n =
+                match arg {
+                    Cell::Null => None,
+                    Cell::SignedInteger(v) => Some(i32::try_from(*v).map_err(|_| {
+                        SqlSurfaceError::numeric_out_of_range("integer out of range")
+                    })?),
+                    _ => return Err(window_bug("ntile argument is not an integer cell")),
+                };
+            match n {
+                None => Cell::Null,
+                Some(n) if n <= 0 => {
+                    return Err(SqlSurfaceError::InvalidArgumentForNtileFunction {
+                        detail: "argument of ntile must be greater than zero",
+                    });
+                }
+                Some(n) => {
+                    state.start(total, i64::from(n));
+                    Cell::SignedInteger(state.advance())
+                }
+            }
+        } else {
+            Cell::SignedInteger(state.advance())
+        };
+        *state_bytes =
+            try_accumulate_state_budget(*state_bytes, window_cell_state_bytes(&cell), state_cap)?;
+        let slot = out
+            .get_mut(row_idx)
+            .ok_or_else(|| window_bug("ntile row index out of range for the result slice"))?;
+        *slot = Some(cell);
+    }
+    Ok(())
+}
+
+/// `first_value`／`last_value`／`nth_value` の 1 パーティション分の評価（SQL-64 (3)・Issue #1883。
+/// [`evaluate_partition`] から呼ばれる）。行ごとにフレーム（`frame` が `None` なら既定の
+/// `RANGE BETWEEN UNBOUNDED PRECEDING AND CURRENT ROW`＝先頭から現在行の peer グループ末尾まで）を
+/// 求め、`EXCLUDE` 対象を除いた先頭・末尾・n 番目の行の値（materialize 段が集めた
+/// [`OffsetRowValues::value`]）を返す。空フレーム・序数超過は NULL。`nth_value` の `n` は現在行で
+/// 評価した値で、NULL なら NULL、0 以下なら `22016`（行ごとに判定するため 0 行では出ない）。
+/// 値の評価エラー（`22xxx`）は参照された行のときだけ返す。母集合は materialize 段を通った行のみで、
+/// 不可視行・他テナントの Private 行は参照先にならない。
+fn evaluate_value_frame_partition(
+    part: &SortedPartition<'_>,
+    frame: Option<&ResolvedFrame>,
+    out: &mut [Option<Cell>],
+    state_bytes: &mut usize,
+    state_cap: usize,
+) -> Result<(), SqlSurfaceError> {
+    let item = part.item;
+    let item_index = part.item_index;
+    let len = part.len();
+    let values_of = |row_idx: usize| -> Result<&OffsetRowValues, SqlSurfaceError> {
+        part.materialized
+            .get(row_idx)
+            .and_then(|r| r.offset_values.get(item_index))
+            .and_then(|v| v.as_ref())
+            .ok_or_else(|| window_bug("value window values missing for a row"))
+    };
+    let non_null = match frame {
+        Some(ResolvedFrame::Range(range)) if range.offsets().next().is_some() => {
+            non_null_region(part)?
+        }
+        _ => (0, 0),
+    };
+    let mut head = GroupCursor::new(part)?;
+    let mut tail = GroupCursor::new(part)?;
+
+    for (c, group) in part.peer_groups().enumerate() {
+        let (g_start, g_end) = group?;
+        let (mut start, mut end, exclusion) = match frame {
+            None => (0, g_end, WindowFrameExclusion::NoOthers),
+            Some(ResolvedFrame::Rows(_)) | Some(ResolvedFrame::Range(_)) => {
+                (0, 0, WindowFrameExclusion::NoOthers)
+            }
+            Some(ResolvedFrame::Groups(f)) => {
+                let (s, e) =
+                    groups_frame_bounds(part, c, (g_start, g_end), f, &mut head, &mut tail)?;
+                (s, e, f.exclusion)
+            }
+        };
+        for pos in g_start..g_end {
+            crate::interrupt::check()?;
+            let mut exclusion = exclusion;
+            match frame {
+                Some(ResolvedFrame::Rows(f)) => {
+                    (start, end) = rows_frame_bounds(pos, len, f);
+                    exclusion = f.exclusion;
+                }
+                Some(ResolvedFrame::Range(f)) => {
+                    (start, end) = range_frame_bounds(part, non_null, pos, (g_start, g_end), f)?;
+                    exclusion = f.exclusion;
+                }
+                _ => {}
+            }
+            let row_idx = part.row_index(pos)?;
+            let current = values_of(row_idx)?;
+            let pick = match item.func {
+                WindowFunc::FirstValue => Some(FramePick::First),
+                WindowFunc::LastValue => Some(FramePick::Last),
+                WindowFunc::NthValue => match current.offset {
+                    None => None,
+                    Some(n) if n <= 0 => {
+                        return Err(SqlSurfaceError::InvalidArgumentForNthValue {
+                            detail: "argument of nth_value must be greater than zero",
+                        });
+                    }
+                    Some(n) => {
+                        let k = usize::try_from(n.saturating_sub(1)).unwrap_or(usize::MAX);
+                        Some(FramePick::Nth(k))
+                    }
+                },
+                _ => {
+                    return Err(window_bug(
+                        "non value-frame function reached the value frame",
+                    ))
+                }
+            };
+            let excluded: [(usize, usize); 2] = match exclusion {
+                WindowFrameExclusion::NoOthers => [(0, 0), (0, 0)],
+                WindowFrameExclusion::CurrentRow => [(pos, pos.saturating_add(1)), (0, 0)],
+                WindowFrameExclusion::Group => [(g_start, g_end), (0, 0)],
+                WindowFrameExclusion::Ties => [(g_start, pos), (pos.saturating_add(1), g_end)],
+            };
+            let target = pick.and_then(|p| pick_in_frame(start, end, &excluded, p));
+            let cell = match target {
+                None => Cell::Null,
+                Some(target_pos) => {
+                    let target_row = part.row_index(target_pos)?;
+                    let cell = values_of(target_row)?
+                        .value
+                        .as_ref()
+                        .map_err(Clone::clone)?;
+                    // 複製の前に状態予算へ計上する（確保前の検証）。
+                    *state_bytes = try_accumulate_state_budget(
+                        *state_bytes,
+                        window_cell_state_bytes(cell),
+                        state_cap,
+                    )?;
+                    cell.clone()
+                }
+            };
+            let slot = out.get_mut(row_idx).ok_or_else(|| {
+                window_bug(
+                    "evaluate_value_frame_partition row index out of range for the result slice",
+                )
+            })?;
+            *slot = Some(cell);
+        }
+    }
+    Ok(())
+}
+
 /// 1 パーティション分のウィンドウ値を計算する（並べ替え済み [`SortedPartition`] を
 /// peer グループ単位で走査し、順位/集計を評価する。§モジュールドキュメント「評価の意味」参照）。
 /// `evaluate_window_item` から呼ばれる。
@@ -2151,7 +2651,14 @@ fn evaluate_partition(
     let item = part.item;
     let item_index = part.item_index;
 
+    // `ntile` はフレームを無視し行の位置だけで進むため、peer 分割へ入れず専用の評価へ委譲する。
+    if item.func == WindowFunc::Ntile {
+        return evaluate_ntile_partition(part, out, state_bytes, state_cap);
+    }
     // `LAG`／`LEAD` は peer・フレームに依存しないため、peer 分割へ入れず専用の評価へ委譲する。
+    if item.func.is_frame_value() {
+        return evaluate_value_frame_partition(part, frame, out, state_bytes, state_cap);
+    }
     if item.func.is_value_offset() {
         // `RANGE` のオフセットの負・NaN は、非 NULL キーの行を持つパーティションで初めて
         // エラーになる（PostgreSQL の in_range 関数内の検査。NULL キーだけ・0 行では出ない）。
@@ -2185,6 +2692,7 @@ fn evaluate_partition(
         )?),
     };
 
+    let part_len = part.len();
     for (dense_rank, group) in part.peer_groups().enumerate() {
         let (idx, peer_end) = group?;
         // 順位関数の `rank` は peer グループ先頭の 0 始まり位置（= 先行行数）。
@@ -2193,11 +2701,7 @@ fn evaluate_partition(
         if let (Some(acc_mut), Some(input)) = (acc.as_mut(), &item.input) {
             for pos in idx..peer_end {
                 let row = part.row(pos)?;
-                let agg_value = row
-                    .agg_values
-                    .get(item_index)
-                    .ok_or_else(|| window_bug("aggregate window values missing for a row"))?;
-                observe_window_row(acc_mut, input, row.id, agg_value, &mut scratch)?;
+                observe_window_row_at(acc_mut, input, row, item_index, &mut scratch)?;
             }
         }
 
@@ -2208,9 +2712,18 @@ fn evaluate_partition(
         // レビュー指摘対応。PR #930 最終レビュー指摘 3）。順位関数
         // （`RowNumber`/`Rank`/`DenseRank`）は行ごとに値が変わるため対象外。
         let aggregate_cell: Option<Cell> = match item.func {
-            WindowFunc::RowNumber | WindowFunc::Rank | WindowFunc::DenseRank => None,
+            WindowFunc::RowNumber
+            | WindowFunc::Rank
+            | WindowFunc::DenseRank
+            | WindowFunc::PercentRank
+            | WindowFunc::CumeDist => None,
             // `LAG`／`LEAD` は上で専用の評価へ委譲済みのため到達しない（不変条件違反は fail-closed）。
-            WindowFunc::Lag | WindowFunc::Lead => {
+            WindowFunc::Lag
+            | WindowFunc::Lead
+            | WindowFunc::FirstValue
+            | WindowFunc::LastValue
+            | WindowFunc::NthValue
+            | WindowFunc::Ntile => {
                 return Err(window_bug("offset window function reached the peer loop"));
             }
             WindowFunc::Count
@@ -2233,7 +2746,15 @@ fn evaluate_partition(
                 WindowFunc::RowNumber => Cell::Integer(row_number as u64),
                 WindowFunc::Rank => Cell::Integer((rank + 1) as u64),
                 WindowFunc::DenseRank => Cell::Integer((dense_rank + 1) as u64),
-                WindowFunc::Lag | WindowFunc::Lead => {
+                // 分布関数は peer グループ内で一定（SQL-64・Issue #1885）。
+                WindowFunc::PercentRank => Cell::Float(percent_rank_value(rank, part_len)),
+                WindowFunc::CumeDist => Cell::Float(cume_dist_value(peer_end, part_len)),
+                WindowFunc::Lag
+                | WindowFunc::Lead
+                | WindowFunc::FirstValue
+                | WindowFunc::LastValue
+                | WindowFunc::NthValue
+                | WindowFunc::Ntile => {
                     return Err(window_bug("offset window function reached the peer loop"));
                 }
                 WindowFunc::Count
@@ -2261,6 +2782,24 @@ fn evaluate_partition(
     }
 
     Ok(())
+}
+
+/// `percent_rank` の値（`(rank - 1) / (n - 1)`。`n == 1` は 0）。PostgreSQL の
+/// `window_percent_rank` と同じく整数を先に `f64` へ変換してから除算する（SQL-64・Issue #1885）。
+fn percent_rank_value(idx: usize, n: usize) -> f64 {
+    if n > 1 {
+        idx as f64 / (n - 1) as f64
+    } else {
+        0.0
+    }
+}
+
+/// `cume_dist` の値（`peer グループ末尾までの行数 / n`。SQL-64・Issue #1885）。
+fn cume_dist_value(peer_end: usize, n: usize) -> f64 {
+    if n == 0 {
+        return 0.0;
+    }
+    peer_end as f64 / n as f64
 }
 
 /// 集計の `ROWS` フレーム評価（SQL-64 (2)・Issue #1889。[`evaluate_partition`] から呼ばれる）。
@@ -2292,11 +2831,7 @@ fn evaluate_rows_frame_partition(
                       scratch: &mut Vec<StackValue>|
      -> Result<(), SqlSurfaceError> {
         let row = part.row(pos)?;
-        let agg_value = row
-            .agg_values
-            .get(item_index)
-            .ok_or_else(|| window_bug("aggregate window values missing for a row"))?;
-        observe_window_row(acc, input, row.id, agg_value, scratch)
+        observe_window_row_at(acc, input, row, item_index, scratch)
     };
 
     let cumulative = frame.start == ResolvedBound::UnboundedPreceding
@@ -2465,11 +3000,7 @@ fn evaluate_groups_frame_partition(
                       scratch: &mut Vec<StackValue>|
      -> Result<(), SqlSurfaceError> {
         let row = part.row(pos)?;
-        let agg_value = row
-            .agg_values
-            .get(item_index)
-            .ok_or_else(|| window_bug("aggregate window values missing for a row"))?;
-        observe_window_row(acc, input, row.id, agg_value, scratch)
+        observe_window_row_at(acc, input, row, item_index, scratch)
     };
 
     let cumulative = frame.start == ResolvedBound::UnboundedPreceding
@@ -2556,11 +3087,7 @@ fn evaluate_range_frame_partition(
                       scratch: &mut Vec<StackValue>|
      -> Result<(), SqlSurfaceError> {
         let row = part.row(pos)?;
-        let agg_value = row
-            .agg_values
-            .get(item_index)
-            .ok_or_else(|| window_bug("aggregate window values missing for a row"))?;
-        observe_window_row(acc, input, row.id, agg_value, scratch)
+        observe_window_row_at(acc, input, row, item_index, scratch)
     };
 
     let cumulative = matches!(frame.start, ResolvedRangeBound::UnboundedPreceding)
@@ -3120,12 +3647,20 @@ pub(crate) fn window_result_type(item: &BoundWindowItem) -> Option<ColumnType> {
         WindowFunc::RowNumber | WindowFunc::Rank | WindowFunc::DenseRank | WindowFunc::Count => {
             return Some(ColumnType::BigInt);
         }
+        // `ntile` は PostgreSQL と同じ `integer`（SQL-64 (4)・Issue #1884）。
+        WindowFunc::Ntile => return Some(ColumnType::Integer),
+        // `percent_rank`／`cume_dist` は PostgreSQL と同じ `double precision`（SQL-64・Issue #1885）。
+        WindowFunc::PercentRank | WindowFunc::CumeDist => return Some(ColumnType::Double),
         WindowFunc::Sum => AggregateFunc::Sum,
         WindowFunc::Avg => AggregateFunc::Avg,
         WindowFunc::Min => AggregateFunc::Min,
         WindowFunc::Max => AggregateFunc::Max,
         // `LAG`／`LEAD` の結果型は値（既定値があれば統一後）の型（SQL-64 (1)・Issue #1880）。
-        WindowFunc::Lag | WindowFunc::Lead => {
+        WindowFunc::Lag
+        | WindowFunc::Lead
+        | WindowFunc::FirstValue
+        | WindowFunc::LastValue
+        | WindowFunc::NthValue => {
             return item.offset_args.as_ref()?.result_type.clone();
         }
     };
@@ -3142,10 +3677,19 @@ fn window_func_to_aggregate_func(
         WindowFunc::Avg => Ok(AggregateFunc::Avg),
         WindowFunc::Min => Ok(AggregateFunc::Min),
         WindowFunc::Max => Ok(AggregateFunc::Max),
-        WindowFunc::RowNumber | WindowFunc::Rank | WindowFunc::DenseRank => Err(window_bug(
+        WindowFunc::RowNumber
+        | WindowFunc::Rank
+        | WindowFunc::DenseRank
+        | WindowFunc::PercentRank
+        | WindowFunc::CumeDist => Err(window_bug(
             "ranking window function unexpectedly requires an accumulator",
         )),
-        WindowFunc::Lag | WindowFunc::Lead => Err(window_bug(
+        WindowFunc::Lag
+        | WindowFunc::Lead
+        | WindowFunc::FirstValue
+        | WindowFunc::LastValue
+        | WindowFunc::NthValue
+        | WindowFunc::Ntile => Err(window_bug(
             "offset window function unexpectedly requires an accumulator",
         )),
     }
@@ -3163,6 +3707,32 @@ fn build_scanned(
         *slot = value;
     }
     out
+}
+
+/// `row` の `item_index` 番目の項目について、FILTER を通過した場合だけ累積器へ観測させる
+/// （Issue #1894）。フレーム境界・peer・`EXCLUDE` の位置計算は FILTER に依存させないため、
+/// 呼び出し元の位置進行（`observed` 等）は変えず、ここで観測だけを抑止する。判定結果が
+/// 欠けているのは実装バグなので `XX000` で fail-closed にする。
+fn observe_window_row_at(
+    acc: &mut Accumulator,
+    input: &AggregateInput,
+    row: &MaterializedRow,
+    item_index: usize,
+    scratch: &mut Vec<StackValue>,
+) -> Result<(), SqlSurfaceError> {
+    let pass = row
+        .filter_pass
+        .get(item_index)
+        .copied()
+        .ok_or_else(|| window_bug("window filter result missing for a row"))?;
+    if !pass {
+        return Ok(());
+    }
+    let agg_value = row
+        .agg_values
+        .get(item_index)
+        .ok_or_else(|| window_bug("aggregate window values missing for a row"))?;
+    observe_window_row(acc, input, row.id, agg_value, scratch)
 }
 
 /// [`WindowInputValue`]（materialize 段で owned 化した値）を、
@@ -3256,6 +3826,14 @@ fn observe_window_row(
             );
             acc.observe(input, id, &no_vector, &scanned, scratch)
         }
+        (
+            AggregateInput::ScalarExpr { .. } | AggregateInput::TypedExpr { .. },
+            WindowInputValue::Evaluated(v),
+        ) => match v {
+            // 保持していた評価エラーは、行がフレームに入って観測されたここで初めて返す。
+            Err(e) => Err(e.clone()),
+            Ok(v) => acc.observe_value(v.as_row_value()),
+        },
         _ => Err(window_bug(
             "window aggregate input/value combination mismatch",
         )),
@@ -3546,6 +4124,8 @@ mod budget_regression_tests {
     fn item(func: WindowFunc, input: Option<AggregateInput>) -> BoundWindowItem {
         BoundWindowItem {
             frame: None,
+            filter: None,
+            input_uses_pseudo_id: false,
             position: 0,
             func,
             input,
@@ -3580,6 +4160,41 @@ mod budget_regression_tests {
         }
     }
 
+    /// `ntile` の状態機械は PostgreSQL の `window_ntile` と同じバケット境界を返す（Issue #1884）。
+    #[test]
+    fn ntile_state_machine_matches_postgres_boundaries() {
+        let run = |total: i64, n: i64| -> Vec<i64> {
+            let mut st = NtileState::default();
+            if total == 0 {
+                return Vec::new();
+            }
+            st.start(total, n);
+            (0..total).map(|_| st.advance()).collect()
+        };
+        assert_eq!(run(5, 2), vec![1, 1, 1, 2, 2]);
+        assert_eq!(run(7, 3), vec![1, 1, 1, 2, 2, 3, 3]);
+        assert_eq!(run(10, 4), vec![1, 1, 1, 2, 2, 2, 3, 3, 4, 4]);
+        assert_eq!(run(3, 5), vec![1, 2, 3]);
+        assert_eq!(run(4, 1), vec![1, 1, 1, 1]);
+        assert_eq!(run(6, 3), vec![1, 1, 2, 2, 3, 3]);
+        assert!(run(0, 3).is_empty());
+    }
+
+    /// SQL-64・Issue #1885: 分布関数の値と float8 テキスト表現。
+    #[test]
+    fn distribution_values_and_text() {
+        let pr = |i, n| crate::scalar_float::format_double(percent_rank_value(i, n));
+        let cd = |e, n| crate::scalar_float::format_double(cume_dist_value(e, n));
+        assert_eq!(pr(0, 1), "0");
+        assert_eq!(pr(1, 5), "0.25");
+        assert_eq!(pr(4, 5), "1");
+        assert_eq!(pr(1, 3), "0.5");
+        assert_eq!(cd(1, 3), "0.3333333333333333");
+        assert_eq!(cd(2, 3), "0.6666666666666666");
+        assert_eq!(cd(3, 5), "0.6");
+        assert_eq!(cd(5, 5), "1");
+    }
+
     /// 順位関数と `COUNT` は `BigInt`、集計系は集計 SELECT と同じ規則（Issue #1344）。
     #[test]
     fn window_result_type_maps_ranking_count_and_aggregates() {
@@ -3589,6 +4204,9 @@ mod budget_regression_tests {
             WindowFunc::DenseRank,
         ] {
             assert_eq!(window_result_type(&item(f, None)), Some(ColumnType::BigInt));
+        }
+        for f in [WindowFunc::PercentRank, WindowFunc::CumeDist] {
+            assert_eq!(window_result_type(&item(f, None)), Some(ColumnType::Double));
         }
         assert_eq!(
             window_result_type(&item(WindowFunc::Count, Some(AggregateInput::AllVisible))),
@@ -3673,6 +4291,8 @@ mod budget_regression_tests {
             offset: 0,
             windows: vec![BoundWindowItem {
                 frame: None,
+                filter: None,
+                input_uses_pseudo_id: false,
                 position: 1,
                 func: WindowFunc::Min,
                 input: Some(AggregateInput::TextColumn(0)),
@@ -4029,6 +4649,8 @@ mod partition_layout_tests {
     fn item(keys: &[(bool, NullPlacement)]) -> BoundWindowItem {
         BoundWindowItem {
             frame: None,
+            filter: None,
+            input_uses_pseudo_id: false,
             position: 0,
             func: WindowFunc::Rank,
             input: None,
@@ -4061,6 +4683,7 @@ mod partition_layout_tests {
                 .collect()],
             agg_values: vec![],
             offset_values: vec![],
+            filter_pass: vec![],
             stmt_order_keys: vec![],
             tenant_idx: 0,
         }
@@ -4429,5 +5052,60 @@ mod range_frame_tests {
                 assert_eq!(got, at, "len={len} at={at}");
             }
         }
+    }
+}
+/// `pick_in_frame`（SQL-64 (3)・Issue #1883）の位置計算の単体テスト。
+#[cfg(test)]
+mod pick_in_frame_tests {
+    use super::*;
+
+    #[test]
+    fn empty_frame_and_out_of_range_ordinal_pick_nothing() {
+        for pick in [FramePick::First, FramePick::Last, FramePick::Nth(0)] {
+            assert_eq!(pick_in_frame(3, 3, &[], pick), None);
+            assert_eq!(pick_in_frame(4, 2, &[], pick), None);
+        }
+        assert_eq!(pick_in_frame(0, 3, &[], FramePick::Nth(3)), None);
+        assert_eq!(pick_in_frame(0, 3, &[], FramePick::Nth(usize::MAX)), None);
+    }
+
+    #[test]
+    fn plain_frame_picks_first_last_nth() {
+        assert_eq!(pick_in_frame(2, 6, &[], FramePick::First), Some(2));
+        assert_eq!(pick_in_frame(2, 6, &[], FramePick::Last), Some(5));
+        assert_eq!(pick_in_frame(2, 6, &[], FramePick::Nth(2)), Some(4));
+    }
+
+    #[test]
+    fn exclusion_outside_the_frame_changes_nothing() {
+        let ex = [(0, 2), (8, 9)];
+        assert_eq!(pick_in_frame(2, 6, &ex, FramePick::First), Some(2));
+        assert_eq!(pick_in_frame(2, 6, &ex, FramePick::Last), Some(5));
+    }
+
+    #[test]
+    fn exclusion_at_the_edges_skips_to_the_next_row() {
+        assert_eq!(pick_in_frame(0, 4, &[(0, 1)], FramePick::First), Some(1));
+        assert_eq!(pick_in_frame(0, 4, &[(3, 4)], FramePick::Last), Some(2));
+        // フレーム全体が除外されたら空。
+        assert_eq!(pick_in_frame(1, 3, &[(0, 5)], FramePick::First), None);
+    }
+
+    #[test]
+    fn ties_exclusion_leaves_two_pieces() {
+        // フレーム [0, 6)、peer グループ [2, 5) の現在行 3 に対する `EXCLUDE TIES` は 2 と 4 を除く。
+        let ex = [(2, 3), (4, 5)];
+        assert_eq!(pick_in_frame(0, 6, &ex, FramePick::Nth(2)), Some(3));
+        assert_eq!(pick_in_frame(0, 6, &ex, FramePick::Nth(3)), Some(5));
+        assert_eq!(pick_in_frame(0, 6, &ex, FramePick::Nth(4)), None);
+        assert_eq!(pick_in_frame(0, 6, &ex, FramePick::Last), Some(5));
+    }
+
+    #[test]
+    fn empty_exclusion_intervals_are_ignored() {
+        assert_eq!(
+            pick_in_frame(0, 3, &[(2, 2), (1, 0)], FramePick::Last),
+            Some(2)
+        );
     }
 }

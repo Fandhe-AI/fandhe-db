@@ -365,26 +365,8 @@ impl ReferencedColumns {
             // 行を観測しない `DecodeTier::Fast`（visible cache 経路）を構造的に選ばせない。
             if let Some(filter) = &item.filter {
                 has_scalar_reference = true;
-                for f in &filter.metadata_filters {
-                    if let Some(slot) = scalar_mask.get_mut(f.column_index()) {
-                        *slot = true;
-                    }
-                }
-                for expr in &filter.expr_filters {
-                    if udf_call::references_embedding(expr) {
-                        needs_embedding = true;
-                    }
-                    udf_call::mark_referenced_scalar_columns(expr, &mut scalar_mask);
-                }
-                for group in &filter.or_filters {
-                    group.visit_column_indices(&mut |idx| {
-                        if let Some(slot) = scalar_mask.get_mut(idx) {
-                            *slot = true;
-                        }
-                    });
-                    if group.references_embedding() {
-                        needs_embedding = true;
-                    }
+                if filter.mark_referenced(&mut scalar_mask) {
+                    needs_embedding = true;
                 }
             }
             match &item.input {
@@ -1266,7 +1248,13 @@ impl Accumulator {
 
     /// 評価済みの行値をアキュムレータの入口（`observe_*`）へ振り分ける
     /// （Issue #1808。評価は [`eval_aggregate_input`]）。NULL は集計対象外。
-    fn observe_value(&mut self, value: AggregateRowValue<'_>) -> Result<(), SqlSurfaceError> {
+    ///
+    /// ウィンドウ評価段（`sql::window`）も、行ごとに先に評価した式入力（Issue #1895）を
+    /// この入口へ渡す。
+    pub(crate) fn observe_value(
+        &mut self,
+        value: AggregateRowValue<'_>,
+    ) -> Result<(), SqlSurfaceError> {
         match value {
             AggregateRowValue::Null => Ok(()),
             AggregateRowValue::Present => self.observe_present(),

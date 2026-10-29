@@ -465,15 +465,14 @@ fn error_contract_is_fail_closed() {
         code_of(&core, "SELECT count(*) FILTER (WHERE g = 'a' FROM t"),
         "42601"
     );
-    // ウィンドウ集計の FILTER は対象外（fail-closed。42601 か 0A000）。
-    let window_code = code_of(
-        &core,
-        "SELECT count(*) FILTER (WHERE g = 'a') OVER () FROM t",
-    );
-    assert!(
-        window_code == "42601" || window_code == "0A000",
-        "unexpected code {window_code}"
-    );
+    // ウィンドウ集計の FILTER は受理する（Issue #1894。結果は sql64_window_filter で固定）。
+    let accepted = core
+        .execute_sql(
+            &ctx("tenant-a"),
+            "SELECT count(*) FILTER (WHERE g = 'a') OVER () FROM t LIMIT 100",
+        )
+        .expect("window FILTER is accepted");
+    assert_eq!(accepted.rows.len(), 8);
     // FROM なしの集計の FILTER は対象外。
     let const_code = code_of(&core, "SELECT count(*) FILTER (WHERE 1 = 1)");
     assert!(

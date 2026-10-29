@@ -361,12 +361,28 @@ const FILTER_ARG_SITE: PrecheckSite = PrecheckSite {
     aggregate: "aggregate functions are not allowed in FILTER",
 };
 
-/// `LAG`／`LEAD` の引数内の先読み検査の文言（SQL-64 (1)・Issue #1880）。`$n` は
+/// ウィンドウ集計（`sum(<式>) OVER (...)` 等）の引数内の先読み検査の文言（SQL-64・Issue #1895）。
+const WINDOW_AGG_ARG_SITE: PrecheckSite = PrecheckSite {
+    param: "parameters are not supported inside window aggregate function arguments",
+    window: "window function calls cannot be nested",
+    aggregate: "aggregate function calls cannot be used inside window aggregate function arguments",
+};
+
+/// 引数個数の誤り文言の句（固定語彙。`function <name> requires <句>`）。
+fn arity_phrase(min: usize, max: usize) -> &'static str {
+    match (min, max) {
+        (1, 1) => "exactly one argument",
+        (2, 2) => "exactly two arguments",
+        _ => "one to three arguments",
+    }
+}
+
+/// `LAG`／`LEAD`／`first_value`／`last_value`／`nth_value` の引数内の先読み検査の文言（SQL-64 (1)・Issue #1880）。`$n` は
 /// Prepared の Describe で行うダミー値置換と型検査が食い違う恐れがあるため fail-closed に拒否する。
 const LAG_LEAD_ARG_SITE: PrecheckSite = PrecheckSite {
-    param: "parameters are not supported inside LAG/LEAD arguments",
+    param: "parameters are not supported inside window value function arguments",
     window: "window function calls cannot be nested",
-    aggregate: "aggregate function calls cannot be used inside LAG/LEAD arguments",
+    aggregate: "aggregate function calls cannot be used inside window value function arguments",
 };
 
 /// フレーム境界の組み合わせ検査（PostgreSQL が文法アクションで返す `42P20`。SQL-64 (2)・
@@ -968,6 +984,12 @@ pub enum SqlSurfaceError {
     /// ウィンドウのフレーム句の `ROWS`／`GROUPS` オフセットが負（`22013`。SQL-64 (2)・Issue #1889）。
     /// 固定文言のみで、利用者の値は含めない（NULL は `NullValueNotAllowed`＝`22004`）。
     InvalidPrecedingOrFollowingSize { detail: &'static str },
+    /// `nth_value` の第 2 引数が 0 以下（`22016`。SQL-64 (3)・Issue #1883）。行の評価時に判定する。
+    /// 固定文言のみで、利用者の値は含めない。
+    InvalidArgumentForNthValue { detail: &'static str },
+    /// `ntile` の引数が 0 以下（`22014`。SQL-64 (4)・Issue #1884）。行の評価時に判定する。
+    /// 固定文言のみで、利用者の値は含めない。
+    InvalidArgumentForNtileFunction { detail: &'static str },
     /// `GROUP BY` のグルーピングセットの展開後セット数・入れ子の深さが上限を超えた
     /// （`54001`。Issue #1821・SQL-59）。固定文言のみ。
     StatementTooComplex { detail: &'static str },
@@ -1766,6 +1788,12 @@ impl ClassifiedError for SqlSurfaceError {
             SqlSurfaceError::InvalidPrecedingOrFollowingSize { .. } => {
                 ErrorClass::InvalidPrecedingOrFollowingSize
             }
+            SqlSurfaceError::InvalidArgumentForNthValue { .. } => {
+                ErrorClass::InvalidArgumentForNthValue
+            }
+            SqlSurfaceError::InvalidArgumentForNtileFunction { .. } => {
+                ErrorClass::InvalidArgumentForNtileFunction
+            }
             SqlSurfaceError::StatementTooComplex { .. } => ErrorClass::StatementTooComplex,
             SqlSurfaceError::TooManyColumns { .. } => ErrorClass::TooManyColumns,
             SqlSurfaceError::TooManyArguments { .. } => ErrorClass::TooManyArguments,
@@ -1924,6 +1952,8 @@ impl std::fmt::Display for SqlSurfaceError {
             | SqlSurfaceError::GroupingError { detail }
             | SqlSurfaceError::WindowingError { detail }
             | SqlSurfaceError::InvalidPrecedingOrFollowingSize { detail }
+            | SqlSurfaceError::InvalidArgumentForNthValue { detail }
+            | SqlSurfaceError::InvalidArgumentForNtileFunction { detail }
             | SqlSurfaceError::StatementTooComplex { detail }
             | SqlSurfaceError::TooManyColumns { detail }
             | SqlSurfaceError::TooManyArguments { detail } => f.write_str(detail),
@@ -3893,6 +3923,17 @@ pub(crate) enum WindowFunc {
     /// オフセット参照関数（`LAG`／`LEAD`。SQL-64 (1)・Issue #1880）。
     Lag,
     Lead,
+    /// フレーム参照の値取得関数（`first_value`／`last_value`／`nth_value`。SQL-64 (3)・Issue #1883）。
+    FirstValue,
+    LastValue,
+    NthValue,
+    /// 分位割り当て関数（`ntile(num_buckets)`。SQL-64 (4)・Issue #1884）。フレームは無視する。
+    Ntile,
+    /// 分布関数（`percent_rank()`／`cume_dist()`。SQL-64・Issue #1885）。引数を取らず、
+    /// peer 判定は `rank` と共通。結果型は `double precision`。
+    PercentRank,
+    /// 累積分布（`cume_dist()`）。`PercentRank` と同じく引数なし・結果型は `double precision`。
+    CumeDist,
 }
 
 impl WindowFunc {
@@ -3911,16 +3952,26 @@ impl WindowFunc {
             "MAX" => Some(WindowFunc::Max),
             "LAG" => Some(WindowFunc::Lag),
             "LEAD" => Some(WindowFunc::Lead),
+            "FIRST_VALUE" => Some(WindowFunc::FirstValue),
+            "LAST_VALUE" => Some(WindowFunc::LastValue),
+            "NTH_VALUE" => Some(WindowFunc::NthValue),
+            "NTILE" => Some(WindowFunc::Ntile),
+            "PERCENT_RANK" => Some(WindowFunc::PercentRank),
+            "CUME_DIST" => Some(WindowFunc::CumeDist),
             _ => None,
         }
     }
 
-    /// 順位関数（引数を取らない。[`Parser::parse_window_item`] が引数の有無を
+    /// 順位・分布関数（引数を取らない。[`Parser::parse_window_item`] が引数の有無を
     /// この判定で分岐する）。
     pub(crate) fn is_ranking(self) -> bool {
         matches!(
             self,
-            WindowFunc::RowNumber | WindowFunc::Rank | WindowFunc::DenseRank
+            WindowFunc::RowNumber
+                | WindowFunc::Rank
+                | WindowFunc::DenseRank
+                | WindowFunc::PercentRank
+                | WindowFunc::CumeDist
         )
     }
 
@@ -3931,11 +3982,49 @@ impl WindowFunc {
         matches!(self, WindowFunc::Lag | WindowFunc::Lead)
     }
 
+    /// フレームを使う値取得関数（`first_value`／`last_value`／`nth_value`。SQL-64 (3)・
+    /// Issue #1883）。`LAG`／`LEAD` と違い、フレーム（既定は `RANGE BETWEEN UNBOUNDED PRECEDING AND
+    /// CURRENT ROW`）の中の行を引く。評価は `sql::window::evaluate_value_frame_partition`。
+    pub(crate) fn is_frame_value(self) -> bool {
+        matches!(
+            self,
+            WindowFunc::FirstValue | WindowFunc::LastValue | WindowFunc::NthValue
+        )
+    }
+
+    /// 式引数を [`WindowOffsetArgs`] 経路（`offset_args`）で運ぶ関数。`LAG`／`LEAD` と
+    /// `first_value`／`last_value`／`nth_value`。集計関数の引数経路（[`AggregateArg`]）と分けるために使う。
+    pub(crate) fn takes_value_args(self) -> bool {
+        self.is_value_offset() || self.is_frame_value() || self == WindowFunc::Ntile
+    }
+
+    /// フレーム句を評価に使わない関数（順位関数と `ntile`）。`sql::window::resolve_frames` が
+    /// フレームオフセットの検査・解決をこの判定で省く（SQL-64・Issue #1884）。
+    pub(crate) fn ignores_frame(self) -> bool {
+        self.is_ranking() || self == WindowFunc::Ntile
+    }
+
+    /// 呼び出しで受理する式引数の個数 `(最小, 最大)`（`takes_value_args` の関数のみ意味を持つ）。
+    fn value_arg_arity(self) -> (usize, usize) {
+        match self {
+            WindowFunc::FirstValue | WindowFunc::LastValue => (1, 1),
+            WindowFunc::NthValue => (2, 2),
+            WindowFunc::Ntile => (1, 1),
+            _ => (1, 3),
+        }
+    }
+
     /// `alias` 省略時の既定列名（[`AggregateFunc::default_alias`] と同じ命名規則）。
     pub(crate) fn default_alias(self) -> &'static str {
         match self {
             WindowFunc::Lag => "lag",
             WindowFunc::Lead => "lead",
+            WindowFunc::FirstValue => "first_value",
+            WindowFunc::LastValue => "last_value",
+            WindowFunc::NthValue => "nth_value",
+            WindowFunc::Ntile => "ntile",
+            WindowFunc::PercentRank => "percent_rank",
+            WindowFunc::CumeDist => "cume_dist",
             WindowFunc::RowNumber => "row_number",
             WindowFunc::Rank => "rank",
             WindowFunc::DenseRank => "dense_rank",
@@ -3958,12 +4047,13 @@ impl WindowFunc {
 pub(crate) struct WindowSelectItem {
     pub(crate) position: usize,
     pub(crate) func: WindowFunc,
-    /// 順位関数は常に `None`。集計関数は [`AggregateArg`]（`*`・裸の列名のみ。
-    /// 複合式は対象外——TASK-214 のスコープ縮小、`docs/design/window-functions.md`
-    /// 参照）。
+    /// 順位関数は常に `None`。集計関数は [`AggregateArg`]（`*`・列名・式。式は Issue #1895 で
+    /// 受理し、束縛は `sql::parser::bind_window_item` が集計 SELECT と同じ
+    /// `resolve_aggregate_input` で行う。`docs/design/window-functions.md` 参照）。
     pub(crate) arg: Option<AggregateArg>,
-    /// `LAG`／`LEAD` の引数（値・オフセット・既定値。それ以外の関数は `None`。
-    /// SQL-64 (1)・Issue #1880）。
+    /// `LAG`／`LEAD`／`first_value`／`last_value`／`nth_value` の引数（値・オフセット・既定値。
+    /// それ以外の関数は `None`。`first_value`／`last_value` は値のみ、`nth_value` は値と `n`
+    /// （`offset` に載せる）で、`default` は常に `None`。SQL-64 (1)(3)・Issue #1880／#1883）。
     pub(crate) offset_args: Option<WindowOffsetArgs>,
     /// `PARTITION BY` の列名一覧（順序保持。最大 [`MAX_WINDOW_KEYS`]）。
     pub(crate) partition_by: Vec<String>,
@@ -3972,6 +4062,9 @@ pub(crate) struct WindowSelectItem {
     /// フレーム句（`ROWS`／`RANGE`／`GROUPS`。SQL-64 (2)・Issue #1887）。構文と束縛段の検証までを
     /// 担い、評価は #1889〜#1891 が `sql::parser::bind_window_item` のゲートを外して行う。
     pub(crate) frame: Option<WindowFrame>,
+    /// 集計の `FILTER (WHERE ...)` の述語列（空なら FILTER なし。SQL-64・Issue #1894）。偽・NULL の
+    /// 行はこの項目の累積器の入力からだけ除き、パーティション・peer・フレーム位置には残す。
+    pub(crate) filter: Vec<WherePredicate>,
     pub(crate) alias: Option<String>,
 }
 
@@ -4053,6 +4146,8 @@ impl WindowSelectItem {
                 super::parser::collect_expr_idents(e, out);
             }
         }
+        // FILTER にしか現れない列を取りこぼすと NULL として評価される fail-open になる（Issue #1894）。
+        super::parser::collect_where_predicate_idents(&self.filter, out);
     }
 }
 
@@ -6903,9 +6998,20 @@ impl<'a> Parser<'a> {
         if !matches!(self.tokens.get(self.pos + 1), Some(Token::Punct('('))) {
             return false;
         }
-        let Some(close_idx) = self.find_matching_close_paren(self.pos + 1) else {
+        let Some(mut close_idx) = self.find_matching_close_paren(self.pos + 1) else {
             return false;
         };
+        // `FILTER (...)` を挟む形（Issue #1894）は括弧ごと読み飛ばして `OVER (` を探す。
+        if matches!(
+            self.tokens.get(close_idx + 1),
+            Some(Token::Ident(name)) if name.eq_ignore_ascii_case("FILTER")
+        ) && matches!(self.tokens.get(close_idx + 2), Some(Token::Punct('(')))
+        {
+            let Some(filter_close) = self.find_matching_close_paren(close_idx + 2) else {
+                return false;
+            };
+            close_idx = filter_close;
+        }
         matches!(
             self.tokens.get(close_idx + 1),
             Some(Token::Ident(name)) if name.eq_ignore_ascii_case("OVER")
@@ -6926,9 +7032,10 @@ impl<'a> Parser<'a> {
     /// 本関数の前段（`sql::window_clause::expand_named_windows`）がトークン列を等価な
     /// インライン `OVER (...)` へ展開済みで、本関数は名前を見ない。
     ///
+    /// `FILTER (WHERE ...)` は集計のみ受理し（Issue #1894）、非集計のウィンドウ関数は `0A000`。
+    ///
     /// スコープ縮小（`docs/design/window-functions.md` 参照。§計画 2「対象外」）:
-    /// `FILTER (...)`・関数内
-    /// `DISTINCT`・複合式の引数はいずれも許可リスト外として `42601` に落ちる
+    /// 関数内 `DISTINCT` は許可リスト外として `42601` に落ちる
     /// （該当する構文を消費する分岐を意図的に持たない）。
     fn parse_window_item(&mut self) -> Result<WindowSelectItem, SqlSurfaceError> {
         let name = self.expect_ident()?;
@@ -6939,8 +7046,8 @@ impl<'a> Parser<'a> {
         let mut offset_args = None;
         let arg = if func.is_ranking() {
             None
-        } else if func.is_value_offset() {
-            offset_args = Some(self.parse_window_offset_args(&name)?);
+        } else if func.takes_value_args() {
+            offset_args = Some(self.parse_window_offset_args(&name, func)?);
             None
         } else {
             // `DISTINCT` は本 Issue のスコープ外（`COUNT(DISTINCT ...) OVER (...)`
@@ -6959,27 +7066,47 @@ impl<'a> Parser<'a> {
                 self.advance();
                 Some(AggregateArg::Star)
             } else {
-                match self.peek() {
-                    // 引数は裸の列名のみを受理する（複合式・UDF 呼び出しは
-                    // §計画 2「対象外」）。
-                    Some(Token::Ident(_)) => {
-                        let column = self.expect_ident()?;
-                        Some(AggregateArg::Expr(Expr::Ident(column)))
-                    }
-                    Some(Token::Punct(')')) => {
-                        return Err(SqlSurfaceError::unsupported(
-                            "window aggregate function requires exactly one argument",
-                        ));
-                    }
-                    other => {
-                        return Err(SqlSurfaceError::unsupported(format!(
-                            "window aggregate function argument must be a bare column reference, got {other:?}"
-                        )));
-                    }
+                if matches!(self.peek(), Some(Token::Punct(')'))) {
+                    return Err(SqlSurfaceError::unsupported(
+                        "window aggregate function requires exactly one argument",
+                    ));
                 }
+                // Issue #1895: 引数は式を受理する（集計 SELECT と同じ `parse_value_expr`。
+                // 束縛は `bind_window_item` が `resolve_aggregate_input` で行う）。
+                // 先読み検査で入れ子ウィンドウ（42P20）・集計（42803）・`$n`（42601）を弾く。
+                precheck_call_arg_tokens(
+                    &self.tokens,
+                    self.pos.saturating_sub(1),
+                    &WINDOW_AGG_ARG_SITE,
+                )?;
+                let saved_calls = self.agg_calls.take();
+                let saved_minus = self.allow_unary_minus;
+                let saved_null = self.allow_null_literal;
+                self.allow_unary_minus = true;
+                self.allow_null_literal = false;
+                let parsed = self.parse_value_expr(0);
+                self.allow_null_literal = saved_null;
+                self.allow_unary_minus = saved_minus;
+                self.agg_calls = saved_calls;
+                Some(AggregateArg::Expr(parsed?))
             }
         };
         self.expect_punct(')')?;
+        let mut filter = Vec::new();
+        if self.peek_ident_matches("FILTER")
+            && matches!(self.tokens.get(self.pos + 1), Some(Token::Punct('(')))
+        {
+            self.advance();
+            self.advance();
+            // 先読み検査（42803／42P20／42601）は本体の内側で済むので、非集計関数の
+            // 0A000 より先に判定される（PostgreSQL は FILTER 式の変換後に関数種別を検査する）。
+            filter = self.parse_filter_clause_body()?;
+            if func.is_ranking() || func.takes_value_args() {
+                return Err(SqlSurfaceError::feature_not_supported(
+                    "FILTER is not implemented for non-aggregate window functions",
+                ));
+            }
+        }
         self.expect_ident_matching("OVER")?;
         self.expect_punct('(')?;
         let (partition_by, order_by, frame) = self.parse_window_spec()?;
@@ -6997,6 +7124,7 @@ impl<'a> Parser<'a> {
             partition_by,
             order_by,
             frame,
+            filter,
             alias,
         })
     }
@@ -7188,10 +7316,12 @@ impl<'a> Parser<'a> {
     fn parse_window_offset_args(
         &mut self,
         name: &str,
+        func: WindowFunc,
     ) -> Result<WindowOffsetArgs, SqlSurfaceError> {
+        let (min_args, max_args) = func.value_arg_arity();
         if is_distinct_modifier(&self.tokens, self.pos) {
             return Err(SqlSurfaceError::unsupported(
-                "DISTINCT is not supported inside LAG/LEAD",
+                "DISTINCT is not supported inside window value functions",
             ));
         }
         if matches!(self.peek(), Some(Token::Punct('*'))) {
@@ -7201,8 +7331,9 @@ impl<'a> Parser<'a> {
         }
         if matches!(self.peek(), Some(Token::Punct(')'))) {
             return Err(SqlSurfaceError::undefined_function(format!(
-                "function {} requires one to three arguments",
-                name.to_ascii_lowercase()
+                "function {} requires {}",
+                name.to_ascii_lowercase(),
+                arity_phrase(min_args, max_args)
             )));
         }
         precheck_call_arg_tokens(&self.tokens, self.pos.saturating_sub(1), &LAG_LEAD_ARG_SITE)?;
@@ -7212,17 +7343,18 @@ impl<'a> Parser<'a> {
             let saved_minus = self.allow_unary_minus;
             let saved_null = self.allow_null_literal;
             self.allow_unary_minus = true;
-            self.allow_null_literal = !exprs.is_empty();
+            self.allow_null_literal = !exprs.is_empty() || func == WindowFunc::Ntile;
             let parsed = self.parse_value_expr(0);
             self.allow_null_literal = saved_null;
             self.allow_unary_minus = saved_minus;
             self.agg_calls = saved_calls;
             exprs.push(parsed?);
             if matches!(self.peek(), Some(Token::Punct(','))) {
-                if exprs.len() >= 3 {
+                if exprs.len() >= max_args {
                     return Err(SqlSurfaceError::undefined_function(format!(
-                        "function {} requires one to three arguments",
-                        name.to_ascii_lowercase()
+                        "function {} requires {}",
+                        name.to_ascii_lowercase(),
+                        arity_phrase(min_args, max_args)
                     )));
                 }
                 self.advance();
@@ -7230,9 +7362,16 @@ impl<'a> Parser<'a> {
             }
             break;
         }
+        if exprs.len() < min_args {
+            return Err(SqlSurfaceError::undefined_function(format!(
+                "function {} requires {}",
+                name.to_ascii_lowercase(),
+                arity_phrase(min_args, max_args)
+            )));
+        }
         let mut it = exprs.into_iter();
         let value = it.next().ok_or_else(|| {
-            SqlSurfaceError::unsupported("LAG/LEAD requires at least one argument")
+            SqlSurfaceError::unsupported("window value function requires at least one argument")
         })?;
         Ok(WindowOffsetArgs {
             value,
@@ -7489,8 +7628,23 @@ impl<'a> Parser<'a> {
             return Ok(Vec::new());
         }
         self.advance();
-        let open = self.pos;
         self.advance();
+        let predicates = self.parse_filter_clause_body()?;
+        if self.peek_ident_matches("OVER") {
+            return Err(SqlSurfaceError::feature_not_supported(
+                "FILTER is not supported for window functions",
+            ));
+        }
+        Ok(predicates)
+    }
+
+    /// `FILTER (` を読み終えた位置から `WHERE <条件> )` までを読む共有本体（SQL-57・Issue #1806、
+    /// SQL-64・Issue #1894）。集計 SELECT の [`Self::parse_aggregate_filter_clause`] と
+    /// ウィンドウ項目の [`Self::parse_window_item`] の双方から呼ばれ、先読み検査
+    /// （集計 `42803`・ウィンドウ関数 `42P20`・`$n` `42601`）を本体の内側に置くことで、
+    /// CTE 本文・派生表・ビュー本文でも同じ SQLSTATE になる。
+    fn parse_filter_clause_body(&mut self) -> Result<Vec<WherePredicate>, SqlSurfaceError> {
+        let open = self.pos.saturating_sub(1);
         if !matches!(self.peek(), Some(Token::Keyword(Keyword::Where))) {
             return Err(SqlSurfaceError::unsupported(
                 "FILTER requires a WHERE condition",
@@ -7510,11 +7664,6 @@ impl<'a> Parser<'a> {
         self.agg_calls = saved_calls;
         let predicates = parsed?;
         self.expect_punct(')')?;
-        if self.peek_ident_matches("OVER") {
-            return Err(SqlSurfaceError::feature_not_supported(
-                "FILTER is not supported for window functions",
-            ));
-        }
         Ok(predicates)
     }
 
@@ -33858,6 +34007,55 @@ mod tests {
         ));
     }
 
+    /// SQL-64・Issue #1894: ウィンドウ集計の FILTER は受理し、非集計のウィンドウ関数は `0A000`。
+    /// FILTER 内の集計 `42803`・ウィンドウ関数 `42P20` は `0A000` より先に判定される。
+    #[test]
+    fn window_aggregate_filter_is_accepted_and_non_aggregates_rejected() {
+        let lookup = catalog_with(&["documents"]);
+        let code = |sql: &str| validate_sql(sql, &lookup).expect_err(sql).wire_code();
+        for sql in [
+            "SELECT count(*) FILTER (WHERE a = 'x') OVER () FROM documents",
+            "SELECT sum(n) FILTER (WHERE a = 'x') OVER (PARTITION BY a ORDER BY n) FROM documents",
+            "SELECT avg(n) FILTER (WHERE n > 1 OR a = 'x') OVER (ORDER BY n \
+             ROWS BETWEEN 1 PRECEDING AND CURRENT ROW) AS m FROM documents",
+            "SELECT count(*) AS filter FROM documents",
+        ] {
+            validate_sql(sql, &lookup).unwrap_or_else(|e| panic!("{sql}: {}", e.wire_code()));
+        }
+        for func in [
+            "row_number()",
+            "rank()",
+            "percent_rank()",
+            "lag(n)",
+            "first_value(n)",
+            "ntile(2)",
+        ] {
+            assert_eq!(
+                code(&format!(
+                    "SELECT {func} FILTER (WHERE a = 'x') OVER (ORDER BY n) FROM documents"
+                )),
+                "0A000",
+                "{func}"
+            );
+        }
+        assert_eq!(
+            code("SELECT row_number() FILTER (WHERE count(*) > 1) OVER () FROM documents"),
+            "42803"
+        );
+        assert_eq!(
+            code("SELECT rank() FILTER (WHERE sum(n) OVER () > 1) OVER () FROM documents"),
+            "42P20"
+        );
+        assert_eq!(
+            code("SELECT count(*) FILTER (WHERE a = $1) OVER () FROM documents"),
+            "42601"
+        );
+        assert_eq!(
+            code("SELECT count(*) FILTER (a = 'x') OVER () FROM documents"),
+            "42601"
+        );
+    }
+
     /// SQL-57・Issue #1806: FILTER の誤形は fail-closed。条件中の集計は `42803`、ウィンドウは
     /// `42P20`（OVER を集計より優先）、`$n` と `WHERE` の欠落は `42601`。部分クエリ内の集計は合法。
     #[test]
@@ -33890,10 +34088,6 @@ mod tests {
         );
         assert_eq!(
             code("SELECT count(*) FILTER (WHERE a = 'x' FROM documents"),
-            "42601"
-        );
-        assert_eq!(
-            code("SELECT count(*) FILTER (WHERE a = 'x') OVER () FROM documents"),
             "42601"
         );
         // 部分クエリの内側の集計は FILTER 内の集計禁止の対象外。
