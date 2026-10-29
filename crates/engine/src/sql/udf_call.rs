@@ -1652,6 +1652,8 @@ pub enum BuiltinFn {
     Lower,
     /// `upper(s: Text) -> Text`。
     Upper,
+    /// `md5(s: Text) -> Text`（Issue #1905・SQL-65。32 文字の小文字 16 進。`md5(bytea)` は未対応）。
+    Md5,
     /// `length(s: Text) -> Scalar`（文字数。Unicode スカラー値単位）。
     Length,
     /// `substr(s: Text, start: Scalar) -> Text`（`len` 省略形）。
@@ -1955,6 +1957,7 @@ fn builtin_from_name(name: &str) -> Option<BuiltinFn> {
         "vec_div" => Some(BuiltinFn::VecDiv),
         "lower" => Some(BuiltinFn::Lower),
         "upper" => Some(BuiltinFn::Upper),
+        "md5" => Some(BuiltinFn::Md5),
         "length" => Some(BuiltinFn::Length),
         "trim" => Some(BuiltinFn::Trim),
         "replace" => Some(BuiltinFn::Replace),
@@ -2005,6 +2008,7 @@ pub(crate) fn builtin_signature(f: BuiltinFn) -> (&'static [ExprType], ExprType)
         BuiltinFn::VecDiv => (&[ExprType::Vector, ExprType::Scalar], ExprType::Vector),
         BuiltinFn::Lower => (&[ExprType::Text], ExprType::Text),
         BuiltinFn::Upper => (&[ExprType::Text], ExprType::Text),
+        BuiltinFn::Md5 => (&[ExprType::Text], ExprType::Text),
         BuiltinFn::Length => (&[ExprType::Text], ExprType::Scalar),
         BuiltinFn::Substr2 => (&[ExprType::Text, ExprType::Scalar], ExprType::Text),
         BuiltinFn::Substr3 => (
@@ -2137,6 +2141,7 @@ pub(crate) fn is_foldable_builtin(f: BuiltinFn) -> bool {
         // 含めない。正しさには影響しない（§3-8 は対象外事項）。
         BuiltinFn::Lower
         | BuiltinFn::Upper
+        | BuiltinFn::Md5
         | BuiltinFn::Length
         | BuiltinFn::Substr2
         | BuiltinFn::Substr3
@@ -9112,6 +9117,11 @@ pub(crate) fn apply_builtin<'a>(
                 }
             }
         }
+        // Issue #1905・SQL-65: strict（NULL 入力は NULL）。
+        BuiltinFn::Md5 => match take_text_or_null_arg(args, 0)? {
+            None => Ok(ExprValue::Null),
+            Some(s) => Ok(ExprValue::Text(Cow::Owned(string_fn::md5(&s)))),
+        },
         BuiltinFn::Length => match take_text_or_null_arg(args, 0)? {
             None => Ok(ExprValue::Null),
             Some(s) => finite_scalar(string_fn::length(&s), "length"),
@@ -10713,6 +10723,7 @@ mod tests {
             BuiltinFn::VecDiv,
             BuiltinFn::Lower,
             BuiltinFn::Upper,
+            BuiltinFn::Md5,
             BuiltinFn::Length,
             BuiltinFn::Substr2,
             BuiltinFn::Substr3,
