@@ -108,6 +108,7 @@ mod sql64_window_range_frame;
 mod sql64_window_rows_frame;
 mod sql65_function_arg_limits;
 mod sql65_greatest_least;
+mod sql65_left_right_reverse_initcap;
 mod sql65_ln_log_exp_sign;
 mod sql65_lpad_rpad_split_part;
 mod sql65_md5;

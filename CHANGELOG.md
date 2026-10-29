@@ -9,6 +9,8 @@
 
 ### Added
 
+- 文字列関数 `left`／`right`／`reverse`／`initcap` を追加した（Issue #1902・SQL-65）。文字単位は Unicode スカラー値で、4 関数とも strict（NULL 引数で NULL）。`left`／`right` の長さは負で「除く文字数」を表し、`initcap` は英数字の連続を 1 語として扱う（ロケール非依存。PostgreSQL との既知の差は `string_fn.rs` のモジュール doc に記載）。
+  挙動変更: 4 名は組み込みの予約名になり、同名の `CREATE FUNCTION` は `42723` になる。
 - `ln`／`log`／`exp`／`sign` を追加する（Issue #1907・SQL-65）。`log(x)` は底 10、`log(b, x)` は底 b の対数。`ln`・`log` の 0 と負は `2201E`、`log(1, x)` は `22012`、`exp` のあふれ・アンダーフローは `22003`。NUMERIC 型の引数は従来どおり `42804`。詳細は [numeric-scalar-functions.md](docs/design/numeric-scalar-functions.md) の「Issue #1907 追記」節。
 - 数値関数 `trunc(x)`／`trunc(x, n)` を追加した（Issue #1908・SQL-65）。0 方向への切り捨てで、2 引数形は小数点以下 `n` 桁（負の `n` は整数部の桁）で打ち切る。10 進数字列で処理するため桁上げ・二進誤差はない。`n` が非整数は `22000`、`i32` の範囲外は `22003`。
   挙動変更: `trunc` が組み込み関数の予約名になり、同名の `CREATE FUNCTION` は `42723`。公開 enum `BuiltinFn` に variant `Trunc1`／`Trunc2` を追加した（BREAKING）。
@@ -195,6 +197,7 @@
 
 ### Breaking Changes
 
+- `sql::udf_call::BuiltinFn`（Issue #1902・SQL-65）: variant `Left`／`Right`／`Reverse`／`Initcap` を追加した。網羅 `match` する外部コードは腕を足す。
 - `sql::udf_call::BoundExpr`（Issue #1909・SQL-65）: variant `MinMax { op, args }` と公開型 `MinMaxOp` を追加した。
   網羅 `match` する外部コードは腕を足す。
 - `ln`／`log` の定義域外を `2201E` で拒否する（Issue #1907・SQL-65）。公開型の変更として `SqlSurfaceError::InvalidArgumentForLogarithm`・
