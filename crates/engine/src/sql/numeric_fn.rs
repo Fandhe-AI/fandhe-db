@@ -1,10 +1,10 @@
-//! 数値スカラー関数群（ABS/ROUND/FLOOR/CEIL/CEILING/MOD/POWER/SQRT）の純粋関数実装
-//! （Issue #920、対象ビヘイビア: SQL-26。ポインタ: `docs/spec/05-tasks.md`
+//! 数値スカラー関数群（ABS/ROUND/FLOOR/CEIL/CEILING/MOD/POWER/SQRT/LN/LOG/EXP/SIGN）の
+//! 純粋関数実装（Issue #920・#1907、対象ビヘイビア: SQL-26・SQL-65。ポインタ: `docs/spec/05-tasks.md`
 //! TASK-210・`docs/spec/04-behavior/sql-surface.md` SQL-26）。
 //!
 //! 責務境界: 本モジュールは行コンテキスト（`id`・`embedding`）を持たない値レベルの
 //! 計算のみを提供する。`sql::udf_call::BuiltinFn`（`Abs`/`Round1`/`Round2`/`Floor`/
-//! `Ceil`/`Mod`/`Power`/`Sqrt`）の解決・型検査・行ループでの呼び出しは
+//! `Ceil`/`Mod`/`Power`/`Sqrt`/`Ln`/`Log1`/`Log2`/`Exp`/`Sign`）の解決・型検査・行ループでの呼び出しは
 //! `sql::udf_call::bind_call`・`apply_builtin` が担い、本モジュールへ委譲する
 //! （関数本体を `udf_call.rs` へ複製しない）。
 //!
@@ -13,7 +13,9 @@
 //! 拒否する。オーバーフロー・アンダーフローは `SqlSurfaceError::numeric_out_of_range`
 //! （`22003`）、0 除算は `SqlSurfaceError::division_by_zero`（`22012`、Issue #1163）、
 //! それ以外の不正入力（非整数の丸め桁数・sqrt の負数等）は
-//! `SqlSurfaceError::invalid_input`（`22000`）に写像する。
+//! `SqlSurfaceError::invalid_input`（`22000`）に写像する。`ln`/`log` の定義域外（0・負）は
+//! PostgreSQL と同じ `2201E`（`invalid_argument_for_logarithm`）、`log(1, x)` の底 1 は `22012`、
+//! `exp` のあふれ・アンダーフローは `22003` に写像する（Issue #1907・SQL-65・ERR-2）。
 
 use crate::sql::allowlist::SqlSurfaceError;
 
@@ -239,6 +241,104 @@ pub(crate) fn sqrt(x: f64) -> Result<f64, SqlSurfaceError> {
     finite_result(x.sqrt(), "sqrt")
 }
 
+/// `ln`／`log` の定義域外メッセージ（PostgreSQL と同じ固定文言。値は含めない）。
+const LOG_OF_ZERO: &str = "cannot take logarithm of zero";
+const LOG_OF_NEGATIVE: &str = "cannot take logarithm of a negative number";
+
+/// 対数の引数の定義域検査。0 は zero、負（`-∞` 含む）は negative で `2201E`。
+/// NaN は比較が偽になるため素通りし、呼び出し側が NaN を伝播する（PG float8 と同じ）。
+fn check_log_domain(x: f64) -> Result<(), SqlSurfaceError> {
+    if x == 0.0 {
+        return Err(SqlSurfaceError::invalid_argument_for_logarithm(LOG_OF_ZERO));
+    }
+    if x < 0.0 {
+        return Err(SqlSurfaceError::invalid_argument_for_logarithm(
+            LOG_OF_NEGATIVE,
+        ));
+    }
+    Ok(())
+}
+
+/// `ln(x: Scalar) -> Scalar`（自然対数）。0・負は `2201E`。
+pub(crate) fn ln(x: f64) -> Result<f64, SqlSurfaceError> {
+    check_log_domain(x)?;
+    Ok(x.ln())
+}
+
+/// `log(x: Scalar) -> Scalar`（1 引数版。**底 10** の常用対数。自然対数は `ln`）。
+/// 0・負は `2201E`。
+pub(crate) fn log10(x: f64) -> Result<f64, SqlSurfaceError> {
+    check_log_domain(x)?;
+    Ok(x.log10())
+}
+
+/// `log(b: Scalar, x: Scalar) -> Scalar`（底 b の対数）。PG の `log_var` と同じく
+/// 底を先に検査し、0・負は `2201E`、底 1 は `22012`。結果が整数 k に極めて近く
+/// `b^k == x` が厳密に成り立つ場合は k に丸める（`log(10, 1000)` が
+/// `2.9999999999999996` になるのを避ける）。
+pub(crate) fn log_base(b: f64, x: f64) -> Result<f64, SqlSurfaceError> {
+    if b.is_nan() || x.is_nan() {
+        return Ok(f64::NAN);
+    }
+    check_log_domain(b)?;
+    check_log_domain(x)?;
+    if b.is_infinite() {
+        return Ok(if x.is_infinite() { f64::NAN } else { 0.0 });
+    }
+    if b == 1.0 {
+        return Err(SqlSurfaceError::division_by_zero("log"));
+    }
+    if x.is_infinite() {
+        return Ok(f64::INFINITY);
+    }
+    let r = if b == 10.0 {
+        x.log10()
+    } else if b == 2.0 {
+        x.log2()
+    } else {
+        x.ln() / b.ln()
+    };
+    let k = r.round();
+    if r.is_finite() && k.abs() <= 1100.0 && (r - k).abs() <= 1e-12 * k.abs().max(1.0) {
+        // 範囲検査済みなので i32 へ切り詰めても欠落しない。
+        let ki = k as i32;
+        if b.powi(ki) == x {
+            return Ok(k);
+        }
+    }
+    finite_result(r, "log")
+}
+
+/// `exp(x: Scalar) -> Scalar`。有限入力でのあふれ（`±∞`）・アンダーフロー（`0`）は
+/// `22003`（PG `dexp` と同じ）。NaN・`+∞`・`-∞` 入力は PG と同様に伝播する。
+pub(crate) fn exp(x: f64) -> Result<f64, SqlSurfaceError> {
+    let r = x.exp();
+    if x.is_finite() {
+        if r.is_infinite() {
+            return Err(SqlSurfaceError::numeric_out_of_range(
+                "exp: result overflows",
+            ));
+        }
+        if r == 0.0 {
+            return Err(SqlSurfaceError::numeric_out_of_range(
+                "exp: result underflows",
+            ));
+        }
+    }
+    Ok(r)
+}
+
+/// `sign(x: Scalar) -> Scalar`（-1／0／1）。`-0.0`・NaN は 0（PG `dsign` と同じ）。
+pub(crate) fn sign(x: f64) -> Result<f64, SqlSurfaceError> {
+    Ok(if x > 0.0 {
+        1.0
+    } else if x < 0.0 {
+        -1.0
+    } else {
+        0.0
+    })
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -431,5 +531,57 @@ mod tests {
     fn sqrt_of_nonnegative_matches_std() {
         assert_eq!(sqrt(9.0).unwrap(), 3.0);
         assert_eq!(sqrt(0.0).unwrap(), 0.0);
+    }
+
+    #[test]
+    fn ln_log_normal_values() {
+        assert_eq!(ln(1.0).unwrap(), 0.0);
+        assert!((ln(std::f64::consts::E).unwrap() - 1.0).abs() < 1e-15);
+        assert_eq!(log10(100.0).unwrap(), 2.0);
+        assert_eq!(log_base(2.0, 8.0).unwrap(), 3.0);
+        assert_eq!(log_base(10.0, 1000.0).unwrap(), 3.0);
+        assert!(ln(f64::NAN).unwrap().is_nan());
+        assert_eq!(ln(f64::INFINITY).unwrap(), f64::INFINITY);
+    }
+
+    #[test]
+    fn ln_log_domain_errors_are_2201e() {
+        for e in [
+            ln(0.0),
+            ln(-1.0),
+            ln(f64::NEG_INFINITY),
+            log10(0.0),
+            log10(-10.0),
+            log_base(0.0, 8.0),
+            log_base(-2.0, 8.0),
+            log_base(2.0, 0.0),
+            log_base(2.0, -1.0),
+        ] {
+            assert_eq!(e.unwrap_err().wire_code(), "2201E");
+        }
+    }
+
+    #[test]
+    fn log_base_one_is_division_by_zero() {
+        assert_eq!(log_base(1.0, 10.0).unwrap_err().wire_code(), "22012");
+        assert_eq!(log_base(1.0, 1.0).unwrap_err().wire_code(), "22012");
+    }
+
+    #[test]
+    fn exp_cases() {
+        assert_eq!(exp(0.0).unwrap(), 1.0);
+        assert_eq!(exp(1000.0).unwrap_err().wire_code(), "22003");
+        assert_eq!(exp(-1000.0).unwrap_err().wire_code(), "22003");
+        assert_eq!(exp(f64::NEG_INFINITY).unwrap(), 0.0);
+        assert!(exp(f64::NAN).unwrap().is_nan());
+    }
+
+    #[test]
+    fn sign_cases() {
+        assert_eq!(sign(-3.0).unwrap(), -1.0);
+        assert_eq!(sign(2.5).unwrap(), 1.0);
+        assert_eq!(sign(0.0).unwrap(), 0.0);
+        assert_eq!(sign(-0.0).unwrap(), 0.0);
+        assert_eq!(sign(f64::NAN).unwrap(), 0.0);
     }
 }

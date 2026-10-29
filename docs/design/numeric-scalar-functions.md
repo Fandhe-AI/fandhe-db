@@ -100,6 +100,16 @@ codex-review P1 是正）。`x * 10^n` を `f64` で計算すると、10 進小�
 日時スカラー関数群を実装する後続作業（下記「スコープ外・後続課題」参照）で
 spec と対にして判断する。
 
+## Issue #1907 追記（ln／log／exp／sign。SQL-65）
+
+- `ln(x)` は自然対数、`log(x)` は**底 10** の常用対数、`log(b, x)` は底 b の対数、`exp(x)` は e の x 乗、`sign(x)` は -1／0／1。戻り値は `Scalar`（double precision）。NULL は伝播する。
+- `log` は `round` と同じ arity オーバーロードで、`bind_call` が 1 引数を `Log1`、2 引数を `Log2` に解決する（`builtin_from_name` には載せず、予約名判定と個数表には載せる）。
+- エラー写像: `ln`・`log` の 0 と負（`-Infinity` 含む）は `2201E`（`ErrorClass::InvalidArgumentForLogarithm`、HTTP 400）、`log(1, x)` の底 1 は `22012`、`exp` の有限入力からのあふれ・アンダーフローは `22003`。文言は PostgreSQL と同じ固定文言で、値は埋め込まない。`log(b, x)` は底を先に検査する。
+- 非有限入力は PostgreSQL の float8 版に合わせ、NaN は伝播し、`ln(+Infinity)` は `+Infinity`、`exp(-Infinity)` は 0、`sign(NaN)` と `sign(-0.0)` は 0。
+- `log(b, x)` は結果が整数 k に極めて近く `b^k == x` が厳密に成り立つとき k に丸める（`log(10, 1000)` が 3 になる）。
+- 制約: NUMERIC 型の引数は従来の数値関数と同じく `42804`。PostgreSQL の numeric 版が返す表示桁（例: `3.0000000000000000`）や、`exp` の極小入力で 0 を返す挙動は再現しない（f64 の最短表現・`22003`）。
+- 既存の `power`・`sqrt` の `22000` は変更しない（PostgreSQL の `2201F` への揃えは別課題）。
+
 ## スコープ外・後続課題（当時の記録。実装済みの部分は `docs/design/datetime-scalar-functions.md` を参照）
 
 `date_part('field', src)`・`date_trunc('unit', src)`・`DATE`/`TIMESTAMP`

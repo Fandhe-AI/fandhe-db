@@ -337,5 +337,6 @@ pub enum ArenaError {
     InvalidInput(String),
     DivisionByZero(String),
     SubstringError(String),
+    InvalidArgumentForLogarithm(String),
     NumericOutOfRange(String),
 }

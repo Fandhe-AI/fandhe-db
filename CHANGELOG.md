@@ -9,6 +9,7 @@
 
 ### Added
 
+- `ln`／`log`／`exp`／`sign` を追加する（Issue #1907・SQL-65）。`log(x)` は底 10、`log(b, x)` は底 b の対数。`ln`・`log` の 0 と負は `2201E`、`log(1, x)` は `22012`、`exp` のあふれ・アンダーフローは `22003`。NUMERIC 型の引数は従来どおり `42804`。詳細は [numeric-scalar-functions.md](docs/design/numeric-scalar-functions.md) の「Issue #1907 追記」節。
 - `substring(s FROM n [FOR m])`／`substring(s FOR m [FROM n])` とカンマ形 `substring(s, n[, m])` を受理する（Issue #1903・SQL-65）。意味は `substr` と同じ文字単位の窓計算で、`substring` は組み込み関数名として予約される。正規表現形（第 2 引数が文字列・`SIMILAR ... ESCAPE`）は SQL-55 の管轄のため `0A000`。`position(needle IN haystack)` は Issue #919 の実装を SQL-65 の回帰テストで固定した。公開 API の変更はない（非 BREAKING）。
 - 派生表を JOIN／カンマ区切りの入力にでき、本文に派生表を入れ子にできるようにした（Issue #1867・SQL-62）。派生表と実表・派生表どうしの JOIN は合成 CTE を `WITH`＋JOIN 経路の slot として評価し、内側は参照者の可視行だけを読む。入れ子の深さはサブクエリ深さ上限（既定 4）を超えると `54000`。
   挙動変更: 従来 `0A000`／`42601` だった JOIN 入力・複数件・入れ子の派生表が実行される。別名なしの派生表の JOIN 入力・集計本文の JOIN 入力は `0A000`、`EXPLAIN` は `42601` のまま。公開 API の変更はない（非 BREAKING）。詳細は [cte.md](docs/design/cte.md) の「Issue #1867 追記」節。
@@ -183,6 +184,8 @@
 
 ### Breaking Changes
 
+- `ln`／`log` の定義域外を `2201E` で拒否する（Issue #1907・SQL-65）。公開型の変更として `SqlSurfaceError::InvalidArgumentForLogarithm`・
+  `ErrorClass::InvalidArgumentForLogarithm`・`ArenaError::InvalidArgumentForLogarithm` を追加した（HTTP 射影は 400）。
 - `substring`／`substr` の負の長さを `22011`（substring_error）で拒否する（Issue #1903・SQL-65）。従来は `22000`。公開型の変更として
   `SqlSurfaceError::SubstringError`・`ErrorClass::SubstringError`・`ArenaError::SubstringError` を追加した（HTTP 射影は 400）。
 - jsonpath の `like_regex` 配線（Issue #2677）に伴う公開型の変更。`PathNode::LikeRegex` に `matcher: LikeRegexMatcher` を追加、

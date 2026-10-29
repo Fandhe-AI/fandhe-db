@@ -1125,6 +1125,7 @@ Date: <IMF-fixdate>
 | `22008` | `DATETIME_FIELD_OVERFLOW` | 400 | Bad Request | `DATE`／`TIMESTAMP` リテラルの範囲外・暦上不正（`update` の `set` 経由） |
 | `2200H` | `SEQUENCE_GENERATOR_LIMIT_EXCEEDED` | 400 | Bad Request | `DEFAULT nextval('<SEQUENCE>')` を持つ列を省略した `insert` で、NO CYCLE の SEQUENCE が上限・下限に達した（TABLE-24・Issue #1690。副作用ゼロ。値・SEQUENCE 名は含めない） |
 | `22011` | `SUBSTRING_ERROR` | 400 | Bad Request | `insert`／`update` が書き込む行の `CHECK` 制約（TABLE-16・TASK-204）の式評価での `substring`／`substr` の負の長さ（SQL-65） |
+| `2201E` | `INVALID_ARGUMENT_FOR_LOGARITHM` | 400 | Bad Request | `insert`／`update` が書き込む行の `CHECK` 制約の式評価での `ln`／`log` の 0・負の引数（SQL-65） |
 | `22012` | `DIVISION_BY_ZERO` | 400 | Bad Request | `insert`／`update` が書き込む行の `CHECK` 制約（TABLE-16・TASK-204）の式評価での 0 除算 |
 | `22013` | `INVALID_PRECEDING_OR_FOLLOWING_SIZE` | 400 | Bad Request | ウィンドウのフレーム句のオフセットが負（SQL 表層専用。NoSQL の `op` 語彙からは到達しない）。Issue #1889 |
 | `22014` | `INVALID_ARGUMENT_FOR_NTILE_FUNCTION` | 400 | Bad Request | `ntile` の引数が 0 以下（SQL 表層専用。NoSQL の `op` 語彙からは到達しない）。Issue #1884 |
