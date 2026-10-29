@@ -92,7 +92,7 @@
 | `MAX_WINDOW_ROWS` | 1,000,000 | materialize 行数の合計上限（`54000`） |
 | `MAX_WINDOW_FRAME_ROWS` | 1,000,000 | 1 パーティションの行数上限（`54000`） |
 | `MAX_WINDOW_STATE_BYTES` | 64 MiB | キー値・引数値の累計バイト数上限（`54000`） |
-| `MAX_WINDOW_KEYS` | 8 | `PARTITION BY`／`ORDER BY` の列数上限（構文段、`54000`） |
+| `MAX_WINDOW_KEYS` | 8 | `PARTITION BY`／`ORDER BY` の列数上限（構文段、`54000`）。`--max-window-keys` で下げられる（[window-limits-cli.md](window-limits-cli.md)） |
 
 いずれも本リポの実装既定値であり、確定化（spec 側の層 B 検証）は別途 spec リポ
 側の管轄。
