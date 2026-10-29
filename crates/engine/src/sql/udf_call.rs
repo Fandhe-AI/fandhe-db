@@ -1678,6 +1678,11 @@ pub enum BuiltinFn {
     Round1,
     /// `round(x: Scalar, n: Scalar) -> Scalar`（2 引数形。小数点以下 `n` 桁）。
     Round2,
+    /// `trunc(x: Scalar) -> Scalar`（1 引数形。`trunc` は `round` と同じく arity で
+    /// `Trunc1`／`Trunc2` へオーバーロード解決される。Issue #1908・SQL-65）。
+    Trunc1,
+    /// `trunc(x: Scalar, n: Scalar) -> Scalar`（2 引数形。小数点以下 `n` 桁での切り捨て）。
+    Trunc2,
     /// `floor(x: Scalar) -> Scalar`。
     Floor,
     /// `ceil(x: Scalar) -> Scalar`（`ceiling` はこの variant の別名として解決
@@ -1993,7 +1998,14 @@ fn is_variadic_or_overloaded_builtin_name(name: &str) -> bool {
         // `date_part`／`date_trunc`（対象ビヘイビア: SQL-26。Issue #920）は
         // field／unit の解決結果を `BuiltinFn` のペイロードとして持つため、
         // 名前だけでは variant が一意に定まらない（`round` と同じ理由。§2-4）。
-        "substr" | "substring" | "concat" | "round" | "date_part" | "date_trunc" | "timezone"
+        "substr"
+            | "substring"
+            | "concat"
+            | "round"
+            | "trunc"
+            | "date_part"
+            | "date_trunc"
+            | "timezone"
     )
 }
 
@@ -2025,6 +2037,8 @@ pub(crate) fn builtin_signature(f: BuiltinFn) -> (&'static [ExprType], ExprType)
         BuiltinFn::Abs => (&[ExprType::Scalar], ExprType::Scalar),
         BuiltinFn::Round1 => (&[ExprType::Scalar], ExprType::Scalar),
         BuiltinFn::Round2 => (&[ExprType::Scalar, ExprType::Scalar], ExprType::Scalar),
+        BuiltinFn::Trunc1 => (&[ExprType::Scalar], ExprType::Scalar),
+        BuiltinFn::Trunc2 => (&[ExprType::Scalar, ExprType::Scalar], ExprType::Scalar),
         BuiltinFn::Floor => (&[ExprType::Scalar], ExprType::Scalar),
         BuiltinFn::Ceil => (&[ExprType::Scalar], ExprType::Scalar),
         BuiltinFn::Mod => (&[ExprType::Scalar, ExprType::Scalar], ExprType::Scalar),
@@ -2131,6 +2145,8 @@ pub(crate) fn is_foldable_builtin(f: BuiltinFn) -> bool {
         BuiltinFn::Abs
         | BuiltinFn::Round1
         | BuiltinFn::Round2
+        | BuiltinFn::Trunc1
+        | BuiltinFn::Trunc2
         | BuiltinFn::Floor
         | BuiltinFn::Ceil
         | BuiltinFn::Mod
@@ -2220,6 +2236,7 @@ pub(crate) fn builtin_call_arity(name: &str) -> Option<BuiltinArity> {
         "concat" => fixed(1, MAX_FUNCTION_CALL_ARGS),
         "substr" => fixed(2, 3),
         "round" => fixed(1, 2),
+        "trunc" => fixed(1, 2),
         "date_part" => fixed(2, 2),
         "date_trunc" => fixed(2, 3),
         "timezone" => fixed(1, 2),
@@ -2616,8 +2633,8 @@ fn validate_closed_expr(
                         args.len()
                     )));
                 }
-            } else if name.eq_ignore_ascii_case("round") {
-                // `round` は arity オーバーロード（1／2 引数）。他の組み込みと
+            } else if name.eq_ignore_ascii_case("round") || name.eq_ignore_ascii_case("trunc") {
+                // `round`／`trunc`（Issue #1908）は arity オーバーロード（1／2 引数）。他の組み込みと
                 // 異なり単一の `BuiltinFn` に定まらないため、ここでは引数個数の
                 // 妥当性のみ検査する（実際の variant 解決は呼び出し時の
                 // `bind_call` が行う）。
@@ -7093,17 +7110,20 @@ fn bind_call(
     if lower_name == "substr" || lower_name == "substring" {
         return bind_substr(name, args, env, node_budget);
     }
-    if name.eq_ignore_ascii_case("round") {
-        // `round` は arity オーバーロード（SQL-26）: 1 引数形は
-        // `BuiltinFn::Round1`、2 引数形（小数点以下 `n` 桁）は `BuiltinFn::Round2`
-        // へ解決する。他の組み込みのように `builtin_from_name` 1 個には
+    if lower_name == "round" || lower_name == "trunc" {
+        // `round`（SQL-26）／`trunc`（Issue #1908・SQL-65）は arity オーバーロード:
+        // 1 引数形は `Round1`／`Trunc1`、2 引数形（小数点以下 `n` 桁）は
+        // `Round2`／`Trunc2` へ解決する。他の組み込みのように `builtin_from_name` 1 個には
         // 定まらないため、ここで名前を先に見て arity から variant を選ぶ。
-        let builtin = match args.len() {
-            1 => BuiltinFn::Round1,
-            2 => BuiltinFn::Round2,
-            n => {
+        let is_round = lower_name == "round";
+        let builtin = match (args.len(), is_round) {
+            (1, true) => BuiltinFn::Round1,
+            (2, true) => BuiltinFn::Round2,
+            (1, false) => BuiltinFn::Trunc1,
+            (2, false) => BuiltinFn::Trunc2,
+            (n, _) => {
                 return Err(SqlSurfaceError::undefined_function(format!(
-                    "function round expects 1 or 2 argument(s), got {n}"
+                    "function {lower_name} expects 1 or 2 argument(s), got {n}"
                 )));
             }
         };
@@ -7112,9 +7132,9 @@ fn bind_call(
         for (a, expected) in args.iter().zip(param_types.iter()) {
             let (b, ty) = bind_expr_in(a, env, node_budget)?;
             if ty != *expected {
-                return Err(SqlSurfaceError::datatype_mismatch(
-                    "function round argument type mismatch",
-                ));
+                return Err(SqlSurfaceError::datatype_mismatch(format!(
+                    "function {lower_name} argument type mismatch"
+                )));
             }
             bound_args.push(b);
         }
@@ -9202,6 +9222,15 @@ pub(crate) fn apply_builtin<'a>(
             let n = take_scalar_arg(args, 1)?;
             crate::sql::numeric_fn::round2(x, n).map(ExprValue::Scalar)
         }
+        BuiltinFn::Trunc1 => {
+            let x = take_scalar_arg(args, 0)?;
+            crate::sql::numeric_fn::trunc1(x).map(ExprValue::Scalar)
+        }
+        BuiltinFn::Trunc2 => {
+            let x = take_scalar_arg(args, 0)?;
+            let n = take_scalar_arg(args, 1)?;
+            crate::sql::numeric_fn::trunc2(x, n).map(ExprValue::Scalar)
+        }
         BuiltinFn::Floor => {
             let x = take_scalar_arg(args, 0)?;
             crate::sql::numeric_fn::floor(x).map(ExprValue::Scalar)
@@ -10689,6 +10718,7 @@ mod tests {
             "concat",
             "substr",
             "round",
+            "trunc",
             "date_part",
             "date_trunc",
             "timezone",
@@ -10742,6 +10772,8 @@ mod tests {
             BuiltinFn::Abs,
             BuiltinFn::Round1,
             BuiltinFn::Round2,
+            BuiltinFn::Trunc1,
+            BuiltinFn::Trunc2,
             BuiltinFn::Floor,
             BuiltinFn::Ceil,
             BuiltinFn::Mod,
@@ -10932,6 +10964,43 @@ mod tests {
                 ..
             }
         ));
+    }
+
+    #[test]
+    fn trunc_resolves_by_arity_and_evaluates() {
+        let schema = schema_with_vector();
+        let registry = UdfRegistry::default();
+        for (args, want_two, expected) in [
+            (vec![num("42.8")], false, 42.0),
+            (vec![num("1234.5678"), num("-2")], true, 1200.0),
+        ] {
+            let mut budget = MAX_EXPR_NODES;
+            let (bound, ty) = bind_expr(&call("trunc", args), &schema, &registry, &mut budget)
+                .expect("bind should succeed");
+            assert_eq!(ty, ExprType::Scalar);
+            let ok = match &bound {
+                BoundExpr::Builtin { f, .. } => {
+                    *f == if want_two {
+                        BuiltinFn::Trunc2
+                    } else {
+                        BuiltinFn::Trunc1
+                    }
+                }
+                _ => false,
+            };
+            assert!(ok);
+            let value = eval(&bound, 1, &[0.0, 0.0, 0.0]).expect("eval should succeed");
+            assert_eq!(value, ExprValue::Scalar(expected));
+        }
+    }
+
+    #[test]
+    fn trunc_with_wrong_arity_is_rejected_at_bind_time() {
+        let schema = schema_with_vector();
+        let registry = UdfRegistry::default();
+        let mut budget = MAX_EXPR_NODES;
+        let err = bind_expr(&call("trunc", vec![]), &schema, &registry, &mut budget).unwrap_err();
+        assert_eq!(err.wire_code(), "42883");
     }
 
     #[test]
