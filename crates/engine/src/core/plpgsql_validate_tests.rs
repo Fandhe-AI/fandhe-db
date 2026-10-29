@@ -93,3 +93,14 @@ fn unsupported_embedded_syntax_is_rejected_at_definition_time() {
     let e = check(&core, "BEGIN SELECT 1 FROM docs WHERE lang @@@ 'x'; END").expect_err("reject");
     assert!(matches!(e.wire_code(), "42601" | "0A000"));
 }
+#[test]
+fn delegated_syntax_error_does_not_echo_fragments() {
+    let (core, _g) = new_core();
+    let e = check(
+        &core,
+        "BEGIN PERFORM secret_col_xyz FROM WHERE secret_w_xyz; END",
+    )
+    .expect_err("syntax");
+    assert_eq!(e.wire_code(), "42601");
+    assert!(!e.to_string().contains("xyz"), "leaked: {e}");
+}

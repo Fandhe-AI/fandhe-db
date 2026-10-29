@@ -37,3 +37,17 @@ pub(super) fn too_big_err(detail: impl Into<String>) -> SqlSurfaceError {
 pub(crate) fn parse_body(src: &str, opts: &ParseOptions) -> Result<Body, SqlSurfaceError> {
     parser::parse(src, opts)
 }
+
+/// 下位の型・SQL 構文解析器のエラーを、本体の断片・名前を含まない固定の英語文言へ丸める。
+/// SQLSTATE（`wire_code`）は保つ。想定外の符号は fail-closed に `42601` へ倒す。
+/// `parser`（型名解析）と `core::plpgsql_validate`（許可リスト解析）の委譲境界で使う。
+pub(crate) fn sanitize_delegated(e: &SqlSurfaceError, ctx: &'static str) -> SqlSurfaceError {
+    match e.wire_code() {
+        "0A000" => oos_err(format!("unsupported construct in {ctx}")),
+        "54000" => too_big_err(format!("limit exceeded in {ctx}")),
+        "54001" => SqlSurfaceError::StatementTooComplex {
+            detail: "statement too complex in a PL/pgSQL body",
+        },
+        _ => syn_err(format!("syntax error in {ctx}")),
+    }
+}

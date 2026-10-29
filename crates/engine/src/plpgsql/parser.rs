@@ -766,7 +766,8 @@ impl<'a> Parser<'a> {
         }
         let tokens = sql_tokens(self.span_text(ts, te)?)?;
         let mut p = 0usize;
-        let ty = parse_column_type_name(&tokens, &mut p)?;
+        let ty = parse_column_type_name(&tokens, &mut p)
+            .map_err(|e| super::sanitize_delegated(&e, "a PL/pgSQL declaration type"))?;
         if p != tokens.len() {
             return Err(syn_err("invalid type in PL/pgSQL declaration"));
         }

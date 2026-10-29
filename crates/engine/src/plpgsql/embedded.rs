@@ -173,10 +173,122 @@ fn in_insert_column_list(tokens: &[Token], i: usize) -> bool {
     })
 }
 
+/// `tokens[k]`（`FROM`）が式の内部の `FROM`（`IS [NOT] DISTINCT FROM`・`substring`/`extract`/`trim`/
+/// `overlay` の `FROM`）か。表参照を導入する `FROM` ではないので、直後の語は変数でありうる。
+fn is_expr_from(tokens: &[Token], k: usize) -> bool {
+    if k.checked_sub(1)
+        .and_then(|p| tokens.get(p))
+        .is_some_and(|p| ident_is(p, "DISTINCT"))
+    {
+        return true;
+    }
+    enclosing_paren_prev(tokens, k).is_some_and(|p| {
+        ["SUBSTRING", "EXTRACT", "TRIM", "OVERLAY"]
+            .iter()
+            .any(|w| ident_is(p, w))
+    })
+}
+
+/// `tokens[k]` が表参照を導入する `FROM` か。
+fn is_table_from(tokens: &[Token], k: usize) -> bool {
+    matches!(tokens.get(k), Some(Token::Keyword(Keyword::From))) && !is_expr_from(tokens, k)
+}
+
+/// `FROM` 句の関係リストを終える語。
+fn ends_from_list(t: &Token) -> bool {
+    matches!(
+        t,
+        Token::Keyword(Keyword::Where | Keyword::Select | Keyword::Order | Keyword::Limit)
+    ) || [
+        "GROUP",
+        "HAVING",
+        "OFFSET",
+        "UNION",
+        "EXCEPT",
+        "INTERSECT",
+        "WINDOW",
+        "FOR",
+        "FETCH",
+        "RETURNING",
+        "VALUES",
+        "SET",
+    ]
+    .iter()
+    .any(|w| ident_is(t, w))
+}
+
+/// JOIN の種別語（`ON` 条件式の終わり）。
+fn is_join_word(t: &Token) -> bool {
+    ["JOIN", "INNER", "LEFT", "RIGHT", "FULL", "CROSS", "NATURAL"]
+        .iter()
+        .any(|w| ident_is(t, w))
+}
+
+/// 各トークンが `FROM`／`USING` の関係リスト（カンマ区切りの表・JOIN 対象・別名）の内側にあるかを
+/// 前方走査で求める。`ON` 条件式・括弧の内側・式内部の `FROM` は含めない（括弧ごとに状態を持つ）。
+fn from_relation_slots(tokens: &[Token]) -> Vec<bool> {
+    #[derive(Clone, Copy, PartialEq)]
+    enum St {
+        Idle,
+        Rel,
+        On,
+    }
+    let mut out = vec![false; tokens.len()];
+    let mut stack = vec![St::Idle];
+    for (k, t) in tokens.iter().enumerate() {
+        match t {
+            Token::Punct('(') => {
+                stack.push(St::Idle);
+                continue;
+            }
+            Token::Punct(')') => {
+                if stack.len() > 1 {
+                    stack.pop();
+                }
+                continue;
+            }
+            _ => {}
+        }
+        let Some(st) = stack.last_mut() else { continue };
+        if is_table_from(tokens, k) {
+            *st = St::Rel;
+            continue;
+        }
+        if ends_from_list(t) {
+            *st = St::Idle;
+            continue;
+        }
+        let next_is_paren = matches!(tokens.get(k.saturating_add(1)), Some(Token::Punct('(')));
+        if ident_is(t, "USING") && !next_is_paren {
+            *st = St::Rel;
+            continue;
+        }
+        match *st {
+            St::Rel => {
+                if ident_is(t, "ON") {
+                    let conflict = tokens
+                        .get(k.saturating_add(1))
+                        .is_some_and(|n| ident_is(n, "CONFLICT"));
+                    *st = if conflict { St::Idle } else { St::On };
+                } else if let Some(o) = out.get_mut(k) {
+                    *o = true;
+                }
+            }
+            St::On => {
+                if matches!(t, Token::Punct(',')) || is_join_word(t) {
+                    *st = St::Rel;
+                }
+            }
+            St::Idle => {}
+        }
+    }
+    out
+}
+
 /// 表名位置（`FROM`・`JOIN`・`ONLY`・`UPDATE`・`INTO`・`TABLE`・`USING` の直後）の 1 トークン前か。
 fn is_table_slot(tokens: &[Token], j: usize) -> bool {
     match j.checked_sub(1).and_then(|p| tokens.get(p)) {
-        Some(Token::Keyword(Keyword::From)) => true,
+        Some(Token::Keyword(Keyword::From)) => is_table_from(tokens, j - 1),
         Some(p) => ["JOIN", "INTO", "UPDATE", "TABLE", "ONLY", "USING"]
             .iter()
             .any(|w| ident_is(p, w)),
@@ -433,7 +545,8 @@ pub(crate) fn is_ident_position(tokens: &[Token], i: usize) -> bool {
     match prev {
         // `::型名` は型の位置であり値ではない。
         Some(Token::TypeCast) => return true,
-        Some(Token::Keyword(Keyword::From)) => return true,
+        // 式内部の `FROM`（`IS DISTINCT FROM v` 等）の直後は変数でありうるので識別子位置にしない。
+        Some(Token::Keyword(Keyword::From)) if !is_expr_from(tokens, i - 1) => return true,
         Some(p)
             if [
                 "JOIN",
@@ -451,6 +564,10 @@ pub(crate) fn is_ident_position(tokens: &[Token], i: usize) -> bool {
             return true
         }
         _ => {}
+    }
+    // `FROM t, u`・JOIN 対象・別名など、関係リスト内の語。
+    if from_relation_slots(tokens).get(i).copied().unwrap_or(false) {
+        return true;
     }
     // CTE の宣言名（`WITH c AS (`・`c AS MATERIALIZED (`）と列名リスト（`c (a, b) AS (`）。
     if is_cte_decl_name(tokens, i) || in_cte_column_list(tokens, i) {

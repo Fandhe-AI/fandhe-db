@@ -804,3 +804,46 @@ fn parenthesized_for_query_passes_validation_shape() {
         Some(Token::Keyword(Keyword::Select))
     ));
 }
+#[test]
+fn expression_from_does_not_hide_variables() {
+    let b = ok("DECLARE v int; BEGIN PERFORM 1 IS DISTINCT FROM v; END");
+    let Some(Stmt::Perform(p)) = b.block.stmts.first() else {
+        panic!("perform");
+    };
+    assert_eq!(p.var_refs.len(), 1);
+    let b = ok("DECLARE v int; BEGIN PERFORM substring('abc' FROM v); END");
+    let Some(Stmt::Perform(p)) = b.block.stmts.first() else {
+        panic!("perform");
+    };
+    assert_eq!(p.var_refs.len(), 1);
+    let b = ok("DECLARE v int; BEGIN PERFORM 1 FROM t WHERE x IS NOT DISTINCT FROM v; END");
+    let Some(Stmt::Perform(p)) = b.block.stmts.first() else {
+        panic!("perform");
+    };
+    assert_eq!(p.var_refs.len(), 1);
+}
+
+#[test]
+fn from_list_tables_and_aliases_are_not_variables() {
+    let c = |s: &str, i: usize| is_ident_position(&tokenize(s).expect("tokenize"), i);
+    // `SELECT 1 FROM t , u` の u、`FROM t a , u b` の b、JOIN ON 後のカンマ以降の表。
+    assert!(c("SELECT 1 FROM t , u", 5));
+    assert!(c("SELECT 1 FROM t a , u b", 7));
+    assert!(c("SELECT 1 FROM t JOIN s ON a = b , u", 11));
+    // ON 条件式・WHERE の語は変数でありうる。
+    assert!(!c("SELECT 1 FROM t JOIN s ON a = v", 9));
+    assert!(!c("SELECT 1 FROM t , u WHERE v = 1", 8));
+    let b = ok("DECLARE u int; BEGIN PERFORM 1 FROM t , u; END");
+    let Some(Stmt::Perform(p)) = b.block.stmts.first() else {
+        panic!("perform");
+    };
+    assert!(p.var_refs.is_empty());
+}
+
+#[test]
+fn delegated_type_errors_do_not_echo_fragments() {
+    let e =
+        parse_body("DECLARE x float(secret_xyz); BEGIN NULL; END", &opts()).expect_err("bad type");
+    assert_eq!(e.wire_code(), "42601");
+    assert!(!e.to_string().contains("secret"), "leaked: {e}");
+}

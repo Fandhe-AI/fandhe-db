@@ -19,7 +19,10 @@ impl EmbeddedSqlChecker for EngineCore {
         match self.parse_tokens(tokens) {
             Ok(_) => Ok(()),
             Err(e) => match e.wire_code() {
-                "42601" | "0A000" | "54000" | "54001" => Err(e),
+                "42601" | "0A000" | "54000" | "54001" => Err(crate::plpgsql::sanitize_delegated(
+                    &e,
+                    "an embedded SQL fragment of a PL/pgSQL body",
+                )),
                 _ => Ok(()),
             },
         }
