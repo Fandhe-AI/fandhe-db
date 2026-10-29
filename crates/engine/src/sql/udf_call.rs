@@ -1704,6 +1704,17 @@ pub enum BuiltinFn {
     Power,
     /// `sqrt(x: Scalar) -> Scalar`。
     Sqrt,
+    /// `ln(x: Scalar) -> Scalar`（自然対数。0・負は `2201E`。Issue #1907・SQL-65）。
+    Ln,
+    /// `log(x: Scalar) -> Scalar`（1 引数形。**底 10** の常用対数であり、自然対数ではない。
+    /// `log` は arity で `Log1`／`Log2` へオーバーロード解決される。[`bind_call`] 参照）。
+    Log1,
+    /// `log(b: Scalar, x: Scalar) -> Scalar`（2 引数形。底 `b` の対数）。
+    Log2,
+    /// `exp(x: Scalar) -> Scalar`（あふれ・アンダーフローは `22003`）。
+    Exp,
+    /// `sign(x: Scalar) -> Scalar`（-1／0／1）。
+    Sign,
     /// `date_part(field: Text, src: Timestamp) -> Scalar`／`EXTRACT(field FROM
     /// src)`（対象ビヘイビア: SQL-26。Issue #920）。`field` は束縛時に解決済み
     /// （`bind_call` 参照。実行時の引数は `src` 1 個のみ）。
@@ -1986,6 +1997,9 @@ fn builtin_from_name(name: &str) -> Option<BuiltinFn> {
         "mod" => Some(BuiltinFn::Mod),
         "power" => Some(BuiltinFn::Power),
         "sqrt" => Some(BuiltinFn::Sqrt),
+        "ln" => Some(BuiltinFn::Ln),
+        "exp" => Some(BuiltinFn::Exp),
+        "sign" => Some(BuiltinFn::Sign),
         "clock_timestamp" => Some(BuiltinFn::ClockTimestamp),
         // Issue #1582・TABLE-34: INTERVAL の正規化関数（引数 1 個固定。予約名になる）。
         "justify_hours" => Some(BuiltinFn::JustifyHours),
@@ -2015,6 +2029,7 @@ fn is_variadic_or_overloaded_builtin_name(name: &str) -> bool {
             | "substring"
             | "concat"
             | "round"
+            | "log"
             | "trunc"
             | "date_part"
             | "date_trunc"
@@ -2070,6 +2085,10 @@ pub(crate) fn builtin_signature(f: BuiltinFn) -> (&'static [ExprType], ExprType)
         BuiltinFn::Mod => (&[ExprType::Scalar, ExprType::Scalar], ExprType::Scalar),
         BuiltinFn::Power => (&[ExprType::Scalar, ExprType::Scalar], ExprType::Scalar),
         BuiltinFn::Sqrt => (&[ExprType::Scalar], ExprType::Scalar),
+        BuiltinFn::Ln | BuiltinFn::Log1 | BuiltinFn::Exp | BuiltinFn::Sign => {
+            (&[ExprType::Scalar], ExprType::Scalar)
+        }
+        BuiltinFn::Log2 => (&[ExprType::Scalar, ExprType::Scalar], ExprType::Scalar),
         // `date_part`／`date_trunc` の実行時引数は `src`（`Timestamp`。`DATE`
         // 入力は束縛時に `DateToTimestamp` で昇格済み）1 個のみ。field／unit は
         // `BuiltinFn` のペイロードとして束縛時に解決済みのため実行時引数には
@@ -2177,7 +2196,12 @@ pub(crate) fn is_foldable_builtin(f: BuiltinFn) -> bool {
         | BuiltinFn::Ceil
         | BuiltinFn::Mod
         | BuiltinFn::Power
-        | BuiltinFn::Sqrt => true,
+        | BuiltinFn::Sqrt
+        | BuiltinFn::Ln
+        | BuiltinFn::Log1
+        | BuiltinFn::Log2
+        | BuiltinFn::Exp
+        | BuiltinFn::Sign => true,
         // Issue #919・SQL-26: 文字列組み込みは `try_fold_scalar`
         // （`FoldedConst::Scalar`/`Bool` のみを表現できる型）の畳み込み対象に
         // 含めない。正しさには影響しない（§3-8 は対象外事項）。
@@ -2268,6 +2292,7 @@ pub(crate) fn builtin_call_arity(name: &str) -> Option<BuiltinArity> {
         "substr" => fixed(2, 3),
         "lpad" | "rpad" => fixed(2, 3),
         "round" => fixed(1, 2),
+        "log" => fixed(1, 2),
         "trunc" => fixed(1, 2),
         "date_part" => fixed(2, 2),
         "date_trunc" => fixed(2, 3),
@@ -2668,8 +2693,11 @@ fn validate_closed_expr(
                         args.len()
                     )));
                 }
-            } else if name.eq_ignore_ascii_case("round") || name.eq_ignore_ascii_case("trunc") {
-                // `round`／`trunc`（Issue #1908）は arity オーバーロード（1／2 引数）。他の組み込みと
+            } else if name.eq_ignore_ascii_case("round")
+                || name.eq_ignore_ascii_case("trunc")
+                || name.eq_ignore_ascii_case("log")
+            {
+                // `round`／`trunc`／`log`（Issue #1907・#1908）は arity オーバーロード（1／2 引数）。他の組み込みと
                 // 異なり単一の `BuiltinFn` に定まらないため、ここでは引数個数の
                 // 妥当性のみ検査する（実際の variant 解決は呼び出し時の
                 // `bind_call` が行う）。
@@ -7145,6 +7173,37 @@ fn bind_call(
     if lower_name == "substr" || lower_name == "substring" {
         return bind_substr(name, args, env, node_budget);
     }
+    if name.eq_ignore_ascii_case("log") {
+        // `log` は arity オーバーロード（Issue #1907・SQL-65）: 1 引数形は底 10 の
+        // `BuiltinFn::Log1`、2 引数形（底, 真数）は `BuiltinFn::Log2` へ解決する。
+        let builtin = match args.len() {
+            1 => BuiltinFn::Log1,
+            2 => BuiltinFn::Log2,
+            n => {
+                return Err(SqlSurfaceError::undefined_function(format!(
+                    "function log expects 1 or 2 argument(s), got {n}"
+                )));
+            }
+        };
+        let (param_types, ret) = builtin_signature(builtin);
+        let mut bound_args = Vec::with_capacity(args.len());
+        for (a, expected) in args.iter().zip(param_types.iter()) {
+            let (b, ty) = bind_expr_in(a, env, node_budget)?;
+            if ty != *expected {
+                return Err(SqlSurfaceError::datatype_mismatch(
+                    "function log argument type mismatch",
+                ));
+            }
+            bound_args.push(b);
+        }
+        return Ok((
+            BoundExpr::Builtin {
+                f: builtin,
+                args: bound_args,
+            },
+            ret,
+        ));
+    }
     if lower_name == "lpad" || lower_name == "rpad" {
         return bind_pad(name, &lower_name, args, env, node_budget);
     }
@@ -9402,6 +9461,28 @@ pub(crate) fn apply_builtin<'a>(
             let x = take_scalar_arg(args, 0)?;
             crate::sql::numeric_fn::sqrt(x).map(ExprValue::Scalar)
         }
+        // Issue #1907・SQL-65: 対数・指数・符号。定義域外は numeric_fn が fail-closed に拒否する。
+        BuiltinFn::Ln => {
+            let x = take_scalar_arg(args, 0)?;
+            crate::sql::numeric_fn::ln(x).map(ExprValue::Scalar)
+        }
+        BuiltinFn::Log1 => {
+            let x = take_scalar_arg(args, 0)?;
+            crate::sql::numeric_fn::log10(x).map(ExprValue::Scalar)
+        }
+        BuiltinFn::Log2 => {
+            let b = take_scalar_arg(args, 0)?;
+            let x = take_scalar_arg(args, 1)?;
+            crate::sql::numeric_fn::log_base(b, x).map(ExprValue::Scalar)
+        }
+        BuiltinFn::Exp => {
+            let x = take_scalar_arg(args, 0)?;
+            crate::sql::numeric_fn::exp(x).map(ExprValue::Scalar)
+        }
+        BuiltinFn::Sign => {
+            let x = take_scalar_arg(args, 0)?;
+            crate::sql::numeric_fn::sign(x).map(ExprValue::Scalar)
+        }
         // 対象ビヘイビア: SQL-26（Issue #920）。`date_part`／`date_trunc` の
         // 実行時引数は `src`（`Timestamp`）1 個のみ（field／unit は束縛済みの
         // `BuiltinFn` ペイロード。§2-4）。
@@ -10870,6 +10951,10 @@ mod tests {
             "rpad",
             "split_part",
             "round",
+            "log",
+            "ln",
+            "exp",
+            "sign",
             "trunc",
             "date_part",
             "date_trunc",
@@ -10940,6 +11025,11 @@ mod tests {
             BuiltinFn::Mod,
             BuiltinFn::Power,
             BuiltinFn::Sqrt,
+            BuiltinFn::Ln,
+            BuiltinFn::Log1,
+            BuiltinFn::Log2,
+            BuiltinFn::Exp,
+            BuiltinFn::Sign,
             BuiltinFn::IntervalPart(DatePartField::Day),
             BuiltinFn::IntervalTrunc(DateTruncUnit::Day),
             BuiltinFn::JustifyHours,
@@ -11183,6 +11273,11 @@ mod tests {
             ("ceil", vec![num("2.1")], 3.0),
             ("ceiling", vec![num("2.1")], 3.0),
             ("sqrt", vec![num("9")], 3.0),
+            ("ln", vec![num("1")], 0.0),
+            ("log", vec![num("100")], 2.0),
+            ("log", vec![num("2"), num("8")], 3.0),
+            ("exp", vec![num("0")], 1.0),
+            ("sign", vec![bin(BinOp::Sub, num("0"), num("5"))], -1.0),
         ];
         for (name, args, expected) in cases {
             let mut budget = MAX_EXPR_NODES;
