@@ -551,8 +551,8 @@ const ALLOWLIST: &[(&str, u32)] = &[
     // UDF 定義は専用の関数カタログ表のみを書き、`CATALOG_TABLE`／`user_rows/{table_name}`
     // のいずれにも触れない（行を持たない定義メタデータのため、世代照合の対象テーブルが
     // 存在せずバンプ対象がない）。
-    ("catalog/function.rs", 716),
-    ("catalog/function.rs", 769),
+    ("catalog/function.rs", 722),
+    ("catalog/function.rs", 775),
     // Issue #1689（ALTER SEQUENCE）: `alter_sequence`／`rename_sequence`（803・842）も同じ表だけを書く
     // （定義 blob の上書き・キーの付け替え・状態行の削除）ため同じ理由で対象外。
     // Issue #1733（INSERT ... SELECT）: `core/insert_select_exec.rs` の 995・1127 行（Issue #2613・#2614・#2615・#2212 で追随）は `#[cfg(test)]` 内の
