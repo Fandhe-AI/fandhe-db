@@ -103,6 +103,7 @@ mod sql64_window_explain;
 mod sql64_window_expr_arg;
 mod sql64_window_filter;
 mod sql64_window_groups_frame;
+mod sql64_window_over_group_by;
 mod sql64_window_range_frame;
 mod sql64_window_rows_frame;
 mod sql65_function_arg_limits;

@@ -255,11 +255,31 @@ fn other_entry_points_agree_with_inline() {
     }
 }
 
+/// 集計 SELECT の結果行に対する名前付きウィンドウ（Issue #1898）。展開後は等価なインライン
+/// `OVER (...)` と同じ結果になる。グループ a は `s` の合計 30、グループ b は 70。
+#[test]
+fn named_window_over_grouped_rows() {
+    let (core, ctx, _g) = setup("nw-grouped", true);
+    let named = "SELECT g, sum(s), rank() OVER w FROM t GROUP BY g WINDOW w AS (ORDER BY g) \
+                 ORDER BY g";
+    let inline = "SELECT g, sum(s), rank() OVER (ORDER BY g) FROM t GROUP BY g ORDER BY g";
+    let rows = |sql: &str| -> Vec<String> {
+        core.execute_sql(&ctx, sql)
+            .unwrap_or_else(|e| panic!("sql={sql}: {}", e.wire_code()))
+            .rows
+            .iter()
+            .map(|r| r.cells.iter().map(show).collect::<Vec<_>>().join(","))
+            .collect()
+    };
+    assert_eq!(rows(named), strs(&["a,30,1", "b,70,2"]));
+    assert_eq!(rows(named), rows(inline));
+}
+
 /// 拒否: PostgreSQL 17 と同じ SQLSTATE。
 #[test]
 fn rejections() {
     let (core, ctx, _g) = setup("nw-reject", true);
-    let cases: [(&str, &str); 14] = [
+    let cases: [(&str, &str); 13] = [
         ("SELECT id, rank() OVER nosuch FROM t LIMIT 10", "42704"),
         ("SELECT id, rank() OVER (nosuch ORDER BY s) FROM t LIMIT 10", "42704"),
         (
@@ -305,17 +325,13 @@ fn rejections() {
         ),
         // 既存の未対応の形は従来どおり
         (
-            "SELECT g, sum(s), rank() OVER w FROM t GROUP BY g WINDOW w AS (ORDER BY g) LIMIT 10",
-            "42601",
-        ),
-        (
             "CREATE VIEW v_nw AS SELECT id, rank() OVER w FROM t WINDOW w AS (ORDER BY s) LIMIT 10",
             "42601",
         ),
     ];
     for (sql, want) in cases {
         let got = outcome(&core, &ctx, sql);
-        if sql.starts_with("SELECT g, sum") || sql.starts_with("CREATE VIEW") {
+        if sql.starts_with("CREATE VIEW") {
             assert_ne!(got, "OK", "sql={sql}");
         } else {
             assert_eq!(got, want, "sql={sql}");

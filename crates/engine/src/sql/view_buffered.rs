@@ -208,13 +208,30 @@ pub(crate) fn plan_outer(
     view: &ValidatedBufferedView,
     udfs: &UdfRegistry,
 ) -> Result<OuterPlan, SqlSurfaceError> {
-    plan_outer_parts(
+    let mut plan = plan_outer_parts(
         body_columns,
         &view.view_name,
         &view.column_aliases,
         &view.outer,
         udfs,
-    )
+    )?;
+    // 集計結果行への窓（SQL-64・Issue #1898）: 外側の束縛のために本文の結果列を内部名へ
+    // 改名しているため、利用者に見せる列名（`sum`・別名など）は改名前の本文列メタへ戻す。
+    // 窓列のメタ（別名または関数の既定名）はそのまま使う。Describe と Execute が同じ入口を通る。
+    if view.origin == crate::sql::allowlist::BufferedOrigin::GroupedWindow {
+        if let OuterKind::Rows(rows_plan) = &plan.kind {
+            for (pos, col) in rows_plan.out.iter().enumerate() {
+                if let OutCol::Plain(i) = col {
+                    if let (Some(orig), Some(slot)) =
+                        (body_columns.get(*i), plan.columns.get_mut(pos))
+                    {
+                        *slot = orig.clone();
+                    }
+                }
+            }
+        }
+    }
+    Ok(plan)
 }
 
 /// [`plan_outer`] の本体。外側の形（`view_name`・`column_aliases`・`outer`）だけを受け取る。
