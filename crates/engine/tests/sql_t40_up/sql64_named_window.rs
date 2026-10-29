@@ -430,3 +430,26 @@ fn keyword_named_columns_and_join_using_before_window_clause() {
         "42601"
     );
 }
+
+/// SELECT 以外の枝（データ変更 CTE 本体・UPDATE・INSERT）の WINDOW 句は除去されず `42601` で
+/// 拒否され、テーブルは変更されない。
+#[test]
+fn window_clause_on_data_modifying_statements_is_rejected_without_effect() {
+    let (core, ctx, _g) = setup("nw-dml", true);
+    let before = q(&core, &ctx, "SELECT id, s FROM t LIMIT 100");
+    for sql in [
+        "WITH d AS (DELETE FROM t WHERE id = 1 RETURNING id WINDOW w AS ()) SELECT * FROM d LIMIT 10",
+        "WITH d AS (UPDATE t SET s = 99 WHERE id = 1 RETURNING id WINDOW w AS (ORDER BY id)) SELECT * FROM d LIMIT 10",
+        "WITH d AS (DELETE FROM t RETURNING id WINDOW w AS (ORDER BY id)) SELECT * FROM d LIMIT 10",
+        "UPDATE t SET s = 99 WHERE id = 1 RETURNING id WINDOW w AS (ORDER BY id)",
+        "DELETE FROM t WHERE id = 1 RETURNING id WINDOW w AS (ORDER BY id)",
+        "INSERT INTO t (id, s) SELECT id + 100, s FROM t WINDOW w AS (ORDER BY id)",
+    ] {
+        assert_eq!(outcome(&core, &ctx, sql), "42601", "{sql}");
+    }
+    assert_eq!(q(&core, &ctx, "SELECT id, s FROM t LIMIT 100"), before);
+    assert_eq!(
+        q(&core, &ctx, "SELECT id, s FROM t LIMIT 100").len(),
+        ROWS.len()
+    );
+}

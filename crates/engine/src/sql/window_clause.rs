@@ -136,6 +136,14 @@ fn is_scope_open(tokens: &[Token], open: usize) -> bool {
     }
     matches!(tokens.get(k), Some(Token::Keyword(Keyword::Select)))
         || is_ident(tokens.get(k), "WITH")
+        // データ変更 CTE の本体も独立スコープ。WINDOW 句の誤配置を `process_branch` が検出できる
+        // ようにする（`(update + 1)` のような列名の式を誤認しない最小限の先読み）。
+        || (is_ident(tokens.get(k), "DELETE")
+            && matches!(tokens.get(k + 1), Some(Token::Keyword(Keyword::From))))
+        || (is_ident(tokens.get(k), "INSERT") && is_ident(tokens.get(k + 1), "INTO"))
+        || (is_ident(tokens.get(k), "UPDATE")
+            && matches!(tokens.get(k + 1), Some(Token::Ident(_)))
+            && is_ident(tokens.get(k + 2), "SET"))
 }
 
 /// `open` の `(` に対応する `)` の位置。
@@ -309,6 +317,29 @@ fn process_branch(branch: &[Token], budget: &mut usize) -> Result<Vec<Token>, Sq
                 && is_ident(branch.get(i + 2), "AS")
         })
     });
+
+    // WINDOW 句は SELECT 枝にしか置けない。DELETE／UPDATE／INSERT（データ変更 CTE の本体を含む）
+    // の枝に深さ 0 の `WINDOW <名> AS` があれば、除去すると不正な句が消えて有効な更新文に
+    // なってしまうため、除去せず拒否する（fail-closed。INSERT ... SELECT の SELECT 部も同様）。
+    let has_window_clause = d0.iter().copied().any(|i| {
+        is_ident(branch.get(i), "WINDOW")
+            && matches!(branch.get(i + 1), Some(Token::Ident(_)))
+            && is_ident(branch.get(i + 2), "AS")
+    });
+    if has_window_clause {
+        let verb = d0.iter().copied().find(|&i| {
+            matches!(branch.get(i), Some(Token::Keyword(Keyword::Select)))
+                || ["DELETE", "UPDATE", "INSERT"]
+                    .iter()
+                    .any(|w| is_ident(branch.get(i), w))
+        });
+        if !matches!(
+            verb.and_then(|v| branch.get(v)),
+            Some(Token::Keyword(Keyword::Select))
+        ) {
+            return Err(SqlSurfaceError::unsupported("misplaced WINDOW clause"));
+        }
+    }
 
     let mut defs: Vec<Def> = Vec::new();
     let (head, tail): (&[Token], &[Token]) = match (from, clause_at) {
@@ -879,5 +910,23 @@ mod tests {
             code("SELECT RANK() OVER w FROM t WHERE t.a = t.b OFFSET 1 WINDOW w AS (ORDER BY id)"),
             "42601"
         );
+    }
+
+    #[test]
+    fn window_clause_on_non_select_branches_is_rejected() {
+        for sql in [
+            "WITH d AS (DELETE FROM t WHERE id = 1 RETURNING id WINDOW w AS ()) SELECT * FROM d LIMIT 10",
+            "WITH d AS (UPDATE t SET s = 1 WHERE id = 1 RETURNING id WINDOW w AS (ORDER BY id)) SELECT * FROM d",
+            "WITH d AS (INSERT INTO t (id) VALUES (1) RETURNING id WINDOW w AS (ORDER BY id)) SELECT * FROM d",
+            "DELETE FROM t WHERE id = 1 RETURNING id WINDOW w AS (ORDER BY id)",
+            "INSERT INTO t (id) SELECT id FROM u WINDOW w AS (ORDER BY id)",
+        ] {
+            assert_eq!(code(sql), "42601", "{sql}");
+        }
+        // SELECT 枝（CTE 付き主クエリ・集合演算の枝）は従来どおり受理する。
+        assert!(run(
+            "WITH c AS (SELECT id FROM t) SELECT RANK() OVER w FROM c WINDOW w AS (ORDER BY id)"
+        )
+        .is_ok());
     }
 }
