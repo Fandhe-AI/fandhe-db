@@ -1330,3 +1330,5 @@ Issue #1405（fix(engine)!: CREATE TYPE の型名の重複を 42710 で返す。
 **Issue #1905（feat(engine)!: md5 を追加する。SQL-65・TASK-308 ポインタ）**: `md5(text)` を組み込み関数に追加した。自作 MD5（RFC 1321）は `crypto::md5`（crate 内専用）、16 進化は `sql::string_fn::md5`、評価は `udf_call::apply_builtin` の strict な腕。`md5(bytea)` は未対応（`0A000`）。結合テストは `tests/sql_t40_up/sql65_md5.rs`。
 
 **Issue #1908（feat(engine)!: trunc を追加する。SQL-65 ポインタ。詳細は [numeric-scalar-functions.md](numeric-scalar-functions.md) の「Issue #1908 追記」節）**: `trunc(x)`／`trunc(x, n)`（負の `n` 対応）を `round` と同じ arity オーバーロード（`BuiltinFn::Trunc1`／`Trunc2`）で追加。10 進数字列で打ち切るため桁上げ・二進誤差なし。`n` の検査は `round` と同じ（`22000`／`22003`）。`trunc` は予約名。結合テストは `tests/sql_t40_up/sql65_trunc.rs`。依存・CI 変更なし。
+
+**Issue #1919（feat(engine): UDF カタログのスキーマと保存形式を定義する。親 #1918・SQL-66 ポインタ。詳細は [udf-catalog.md](udf-catalog.md)）**: `catalog::function` に `functions`／`function_id_counter` 表（遅延作成）、版付き定義 blob v1、crate 内部の create／get／list／drop を追加した。キーは `(scope=tenant_id, 関数名, 引数シグネチャ)` でテナント境界を構造化し、多重定義を表現する。未結線（書き込み #1920・ロード #1921）で、公開 API の変更・依存追加・`unsafe` はない。

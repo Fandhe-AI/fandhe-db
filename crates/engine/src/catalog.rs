@@ -77,6 +77,10 @@ pub(crate) mod sequence;
 // `docs/design/schema-tenant-namespace.md`）。`public` は仮想 SCHEMA で行を持たない。
 #[allow(dead_code)]
 pub(crate) mod namespace;
+// UDF（ユーザー定義関数）のカタログ（SQL-66・Issue #1919。設計記録: `docs/design/udf-catalog.md`）。
+// 書き込み（#1920）・ロード（#1921）の結線までは crate 内の呼び出し元がテストだけになる。
+#[allow(dead_code)]
+pub(crate) mod function;
 pub(crate) use materialized::read_materialized_view_in;
 
 /// カタログ値を格納するテーブル。キーはテーブル名、値は [`encode_schema`] で
