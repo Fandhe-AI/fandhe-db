@@ -1490,7 +1490,6 @@ const EXCLUDED_UTILITY: &[&str] = &[
     "immediate",
     "key",
     "listen",
-    "local",
     "lock",
     "match",
     "maxvalue",
@@ -1895,4 +1894,31 @@ fn operators_stay_operators_when_variables_exist() {
         let b = ok(&format!("DECLARE v int; BEGIN {src}; END"));
         assert_eq!(first_sql_refs(&b), n, "for {src:?}");
     }
+}
+
+#[test]
+fn array_commas_inside_on_condition_keep_variable_references() {
+    // ON 条件の `ARRAY[1, v]` のカンマで関係リストの状態が変わらず、`v` は参照のまま。
+    let b =
+        ok("DECLARE v int; BEGIN PERFORM 1 FROM t JOIN u ON t.x = u.x AND t.a = ARRAY[1, v]; END");
+    assert_eq!(first_sql_refs(&b), 1);
+    let b =
+        ok("DECLARE v int; BEGIN PERFORM 1 FROM t JOIN u ON t.a = ARRAY[v, 2, 3] WHERE x = v; END");
+    assert_eq!(first_sql_refs(&b), 2);
+    // 添字の中でも同じ。
+    let b = ok("DECLARE v int; BEGIN PERFORM 1 FROM t, u WHERE t.a[v] = 1; END");
+    assert_eq!(first_sql_refs(&b), 1);
+}
+
+#[test]
+fn argument_mode_words_cannot_name_variables() {
+    for w in ["out", "inout", "variadic", "local"] {
+        assert_eq!(
+            code(&format!("DECLARE {w} int; BEGIN NULL; END")),
+            "0A000",
+            "for {w}"
+        );
+    }
+    // `AT LOCAL` は式の後置演算子であり、変数 `local` と取り違えない（宣言自体が拒否される）。
+    ok("BEGIN PERFORM now() AT LOCAL; END");
 }

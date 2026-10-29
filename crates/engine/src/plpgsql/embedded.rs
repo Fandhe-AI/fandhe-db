@@ -60,8 +60,8 @@ pub(super) fn split_into(
     let mut found: Option<usize> = None;
     for (i, t) in view.iter().enumerate() {
         match t {
-            Token::Punct('(') => depth = depth.saturating_add(1),
-            Token::Punct(')') => depth = depth.saturating_sub(1),
+            Token::Punct('(') | Token::Punct('[') => depth = depth.saturating_add(1),
+            Token::Punct(')') | Token::Punct(']') => depth = depth.saturating_sub(1),
             _ => {}
         }
         if depth == 0 && ident_is(t, "INTO") {
@@ -119,8 +119,8 @@ pub(super) fn reject_forbidden_clauses(
     let mut depth = 0usize;
     for (i, t) in tokens.iter().enumerate() {
         match t {
-            Token::Punct('(') => depth = depth.saturating_add(1),
-            Token::Punct(')') => depth = depth.saturating_sub(1),
+            Token::Punct('(') | Token::Punct('[') => depth = depth.saturating_add(1),
+            Token::Punct(')') | Token::Punct(']') => depth = depth.saturating_sub(1),
             _ => {}
         }
         if ident_is(t, "USING")
@@ -348,11 +348,13 @@ fn from_relation_slots(tokens: &[Token], parens: &ParenInfo) -> Vec<bool> {
             seen_delete = true;
         }
         match t {
-            Token::Punct('(') => {
+            // 角括弧（`ARRAY[1, v]`・添字）の内側のカンマが外側の関係リストの状態を変えないよう、
+            // 丸括弧と同様に状態を分離する。
+            Token::Punct('(') | Token::Punct('[') => {
                 stack.push(St::Idle);
                 continue;
             }
-            Token::Punct(')') => {
+            Token::Punct(')') | Token::Punct(']') => {
                 if stack.len() > 1 {
                     stack.pop();
                 }
@@ -462,11 +464,11 @@ fn set_list_mask(tokens: &[Token]) -> Vec<bool> {
             *o = *st;
         }
         match t {
-            Token::Punct('(') => {
+            Token::Punct('(') | Token::Punct('[') => {
                 stack.push(false);
                 continue;
             }
-            Token::Punct(')') => {
+            Token::Punct(')') | Token::Punct(']') => {
                 if stack.len() > 1 {
                     stack.pop();
                 }
@@ -895,15 +897,74 @@ fn substituted(tokens: &[Token], refs: &[(usize, VarRef)], body: &Body) -> Vec<T
         .collect()
 }
 
+/// 条件式の検証に使う仮の表名と列名。許可リストの `WHERE` は、`FROM` の無い `SELECT` では単一の述語しか
+/// 受理せず（ダミー置換で定数になった `a > 0 AND b < 3` が `42601`）、`FROM` があれば複合述語を受理する。
+/// また `IS NULL`・`BETWEEN`・`IN` は左辺に列を要求するため、定数では拒否される。未知の表・列の
+/// `42P01`／`42703` は定義時には握りつぶされる（late binding）ので、仮の表名・列名で構文だけを検査できる。
+const DUMMY_RELATION: &str = "plpgsql_validate_dummy_relation";
+const DUMMY_COLUMN: &str = "plpgsql_validate_dummy_column";
+
+/// `refs` の位置を `replace` で置き換えたトークン列を作る（`substituted` の列名版を兼ねる）。
+fn substituted_with_columns(tokens: &[Token], refs: &[(usize, VarRef)]) -> Vec<Token> {
+    let set: std::collections::HashSet<usize> = refs.iter().map(|(i, _)| *i).collect();
+    tokens
+        .iter()
+        .enumerate()
+        .map(|(i, t)| {
+            if set.contains(&i) {
+                Token::Ident(DUMMY_COLUMN.to_string())
+            } else {
+                t.clone()
+            }
+        })
+        .collect()
+}
+
+/// 式 1 個の定義時検証。次の形を順に試し、最初に受理された時点で成功とする。
+///
+/// 1. 値の式なら `SELECT <expr>`（変数は型に応じたダミーの値）
+/// 2. 条件式なら `SELECT 1 FROM <仮の表> WHERE <expr>`（変数はダミーの値）
+/// 3. 同じ形で変数を仮の列名に置換（`IS NULL`・`BETWEEN`・`IN` の左辺が変数のとき）
+///
+/// 許可リストは比較・論理演算を `WHERE` の中でしか受理しないため、値の式として拒否された式も条件式の形
+/// で試す（`b := 1 = 1`・`RETURN a AND b`・比較式の初期値）。すべて拒否なら、本来の構文誤りとして最初の
+/// エラーを返す（`42601` のまま）。
 fn check_expr(e: &SqlExpr, body: &Body, c: &dyn EmbeddedSqlChecker) -> Result<(), SqlSurfaceError> {
-    // 条件式は `SELECT 1 WHERE <cond>`、値の式は `SELECT <expr>` の形で検証する。
-    let mut toks = vec![Token::Keyword(Keyword::Select)];
-    if e.cond {
-        toks.push(Token::Number("1".to_string()));
-        toks.push(Token::Keyword(Keyword::Where));
+    let cond_form = |subst: Vec<Token>| {
+        let mut toks = vec![
+            Token::Keyword(Keyword::Select),
+            Token::Number("1".to_string()),
+            Token::Keyword(Keyword::From),
+            Token::Ident(DUMMY_RELATION.to_string()),
+            Token::Keyword(Keyword::Where),
+        ];
+        toks.extend(subst);
+        toks
+    };
+    let literal = substituted(&e.tokens, &e.var_refs, body);
+    let mut first: Option<SqlSurfaceError> = None;
+    let mut record = |r: Result<(), SqlSurfaceError>| -> bool {
+        match r {
+            Ok(()) => true,
+            Err(err) => {
+                first.get_or_insert(err);
+                false
+            }
+        }
+    };
+    if !e.cond {
+        let mut toks = vec![Token::Keyword(Keyword::Select)];
+        toks.extend(literal.iter().cloned());
+        if record(c.check_syntax(toks)) {
+            return Ok(());
+        }
     }
-    toks.extend(substituted(&e.tokens, &e.var_refs, body));
-    c.check_syntax(toks)
+    if record(c.check_syntax(cond_form(literal)))
+        || record(c.check_syntax(cond_form(substituted_with_columns(&e.tokens, &e.var_refs))))
+    {
+        return Ok(());
+    }
+    Err(first.unwrap_or_else(|| syn_err("invalid expression in a PL/pgSQL body")))
 }
 
 fn check_sql(

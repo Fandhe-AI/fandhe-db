@@ -104,3 +104,29 @@ fn delegated_syntax_error_does_not_echo_fragments() {
     assert_eq!(e.wire_code(), "42601");
     assert!(!e.to_string().contains("xyz"), "leaked: {e}");
 }
+
+#[test]
+fn boolean_expressions_validate_in_value_positions() {
+    // 値の式として拒否される比較・論理式も、代入・宣言初期値・RETURN で受理する（条件式の形でも検証）。
+    let (core, _g) = new_core();
+    for src in [
+        "DECLARE b boolean; v int := 1; BEGIN b := 1 = 1; RETURN b; END",
+        "DECLARE b boolean := 1 < 2; BEGIN RETURN b; END",
+        "DECLARE v int := 1; BEGIN RETURN v > 0 AND v < 10; END",
+        "DECLARE v int := 1; BEGIN RETURN v > 0 OR NOT (v = 3); END",
+        "DECLARE v int; b boolean; BEGIN b := v IS NULL; RETURN b; END",
+        "DECLARE v int := 5; BEGIN RETURN v BETWEEN 1 AND 10; END",
+        "DECLARE v int := 5; b boolean := v IS NOT NULL; BEGIN RETURN b; END",
+    ] {
+        check(&core, src).unwrap_or_else(|e| panic!("expected accept for {src:?}: {e}"));
+    }
+    // 本来の構文誤りは引き続き 42601。
+    for src in [
+        "DECLARE v int; BEGIN v := 1 +; RETURN v; END",
+        "DECLARE v int; BEGIN RETURN v AND; END",
+        "DECLARE v int; BEGIN v := (1 = ; RETURN v; END",
+    ] {
+        let e = check(&core, src).expect_err("syntax");
+        assert_eq!(e.wire_code(), "42601", "for {src:?}");
+    }
+}
