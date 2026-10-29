@@ -552,11 +552,12 @@ const ALLOWLIST: &[(&str, u32)] = &[
     // のいずれにも触れない（行を持たない定義メタデータのため、世代照合の対象テーブルが
     // 存在せずバンプ対象がない）。
     ("catalog/function.rs", 785),
-    ("catalog/function.rs", 840),
+    ("catalog/function.rs", 842),
     ("catalog/function.rs", 871),
+    ("catalog/function.rs", 902),
     // Issue #1920: 上の `#[cfg(test)]` 内のテスト補助（多重定義・SCHEMA 接頭辞削除の状態を直接作る）。
-    ("catalog/function.rs", 1316),
-    ("catalog/function.rs", 1411),
+    ("catalog/function.rs", 1347),
+    ("catalog/function.rs", 1461),
     // Issue #1689（ALTER SEQUENCE）: `alter_sequence`／`rename_sequence`（803・842）も同じ表だけを書く
     // （定義 blob の上書き・キーの付け替え・状態行の削除）ため同じ理由で対象外。
     // Issue #1733（INSERT ... SELECT）: `core/insert_select_exec.rs` の 995・1127 行（Issue #2613・#2614・#2615・#2212 で追随）は `#[cfg(test)]` 内の
