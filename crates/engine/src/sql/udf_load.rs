@@ -153,10 +153,16 @@ fn load_into(
     // 表せる形なのに登録できなかった定義（セッションローカル／WASM 関数との名前衝突・上限など）が
     // 残る場合は世代を「未完了」として記録し、次の refresh で再試行させる（ローカル登録の解除後に
     // カタログ定義が見えない状態を残さない）。
-    let recorded = if pending.is_empty() {
-        generation
-    } else {
+    // 恒久的にロード不能な定義（呼び出し先の消失・予約名など）は世代が変わらない限り結果も変わらないため
+    // 再試行の対象にしない（残留すると Query／Parse ごとに全カタログを再ロードして世代 fast path を迂回する）。
+    // 再試行が意味を持つのは、同名のセッションローカル登録に阻まれている定義だけ。
+    let blocked_by_local = pending
+        .iter()
+        .any(|p| registry.get(&p.key).is_some() && !registry.is_catalog_origin(&p.key));
+    let recorded = if blocked_by_local {
         STALE_GENERATION
+    } else {
+        generation
     };
     registry.set_catalog_binding(Some(tenant_id), recorded);
     Ok(())
@@ -255,6 +261,8 @@ mod tests {
         load(&s, "t", &mut reg).expect("load");
         assert!(reg.get("a").is_some() && reg.get("b").is_some());
         assert!(reg.get("orphan").is_none());
+        // 恒久的にロード不能な定義が残っても世代は完了扱いで記録され、refresh が再ロードし続けない。
+        assert_eq!(reg.catalog_generation(), s.function_generation("t"));
     }
 
     /// 他テナントの定義はロードされず、束縛と異なるテナントでの load／refresh はカタログ由来を消す。
