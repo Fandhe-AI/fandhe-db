@@ -1336,6 +1336,8 @@ Issue #1405（fix(engine)!: CREATE TYPE の型名の重複を 42710 で返す。
 
 **Issue #1908（feat(engine)!: trunc を追加する。SQL-65 ポインタ。詳細は [numeric-scalar-functions.md](numeric-scalar-functions.md) の「Issue #1908 追記」節）**: `trunc(x)`／`trunc(x, n)`（負の `n` 対応）を `round` と同じ arity オーバーロード（`BuiltinFn::Trunc1`／`Trunc2`）で追加。10 進数字列で打ち切るため桁上げ・二進誤差なし。`n` の検査は `round` と同じ（`22000`／`22003`）。`trunc` は予約名。結合テストは `tests/sql_t40_up/sql65_trunc.rs`。依存・CI 変更なし。
 
+- Issue #1721（docs(design): TRIGGER の実行モデルを設計記録として追加。親 #1720・TABLE-45 ポインタ。詳細は [trigger-execution-model.md](trigger-execution-model.md)）: 発火の時点と順序・NEW／OLD・BEFORE の戻り値・`WHEN`・未結線経路ガード・RLS・再帰上限・台帳整合を決定として記録し、#1722〜#1728 への引き継ぎを列挙。設計記録のみでコードの変更なし。
+
 **Issue #1919（feat(engine): UDF カタログのスキーマと保存形式を定義する。親 #1918・SQL-66 ポインタ。詳細は [udf-catalog.md](udf-catalog.md)）**: `catalog::function` に `functions`／`function_id_counter` 表（遅延作成）、版付き定義 blob v1、crate 内部の create／get／list／drop を追加した。キーは `(scope=tenant_id, 関数名, 引数シグネチャ)` でテナント境界を構造化し、多重定義を表現する。未結線（書き込み #1920・ロード #1921）で、公開 API の変更・依存追加・`unsafe` はない。
 
 **Issue #1920（feat(engine): CREATE／DROP FUNCTION をカタログへ書き込む。親 #1918・SQL-66 ポインタ。詳細は [udf-catalog.md](udf-catalog.md)）**: DDL 権限のあるセッションの `CREATE FUNCTION` を UDF カタログ（単一 write txn・1 回の commit）へ永続化し、`DROP FUNCTION <名前> [(<型>, ...)]` の最小形を追加した（`IF EXISTS`・`CASCADE`・複数名は `0A000` で #1917 へ）。権限なしのセッションは従来どおりセッション内のみ、同名の定義はシグネチャ違いでも `42723`、明示トランザクション内は `0A000`、`DROP SCHEMA` は配下の関数を `RESTRICT` で `2BP01`・`CASCADE` で同時削除する。`Statement::CreateFunction` に `body_source` を追加し、`ParsedSql::DropFunction`・`SqlOutcome::DropFunction` を追加した（破壊的変更。依存追加・`unsafe` はない）。
