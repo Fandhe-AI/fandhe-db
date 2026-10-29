@@ -4047,6 +4047,9 @@ pub(crate) struct WindowSelectItem {
     /// フレーム句（`ROWS`／`RANGE`／`GROUPS`。SQL-64 (2)・Issue #1887）。構文と束縛段の検証までを
     /// 担い、評価は #1889〜#1891 が `sql::parser::bind_window_item` のゲートを外して行う。
     pub(crate) frame: Option<WindowFrame>,
+    /// 集計の `FILTER (WHERE ...)` の述語列（空なら FILTER なし。SQL-64・Issue #1894）。偽・NULL の
+    /// 行はこの項目の累積器の入力からだけ除き、パーティション・peer・フレーム位置には残す。
+    pub(crate) filter: Vec<WherePredicate>,
     pub(crate) alias: Option<String>,
 }
 
@@ -4128,6 +4131,8 @@ impl WindowSelectItem {
                 super::parser::collect_expr_idents(e, out);
             }
         }
+        // FILTER にしか現れない列を取りこぼすと NULL として評価される fail-open になる（Issue #1894）。
+        super::parser::collect_where_predicate_idents(&self.filter, out);
     }
 }
 
@@ -6978,9 +6983,20 @@ impl<'a> Parser<'a> {
         if !matches!(self.tokens.get(self.pos + 1), Some(Token::Punct('('))) {
             return false;
         }
-        let Some(close_idx) = self.find_matching_close_paren(self.pos + 1) else {
+        let Some(mut close_idx) = self.find_matching_close_paren(self.pos + 1) else {
             return false;
         };
+        // `FILTER (...)` を挟む形（Issue #1894）は括弧ごと読み飛ばして `OVER (` を探す。
+        if matches!(
+            self.tokens.get(close_idx + 1),
+            Some(Token::Ident(name)) if name.eq_ignore_ascii_case("FILTER")
+        ) && matches!(self.tokens.get(close_idx + 2), Some(Token::Punct('(')))
+        {
+            let Some(filter_close) = self.find_matching_close_paren(close_idx + 2) else {
+                return false;
+            };
+            close_idx = filter_close;
+        }
         matches!(
             self.tokens.get(close_idx + 1),
             Some(Token::Ident(name)) if name.eq_ignore_ascii_case("OVER")
@@ -6997,9 +7013,11 @@ impl<'a> Parser<'a> {
     /// フレーム句（`ROWS`/`RANGE`/`GROUPS`）は構文のみ受理する（SQL-64 (2)・Issue #1887。
     /// [`Self::parse_window_frame`]。評価は束縛段のゲートが止める）。
     ///
+    /// `FILTER (WHERE ...)` は集計のみ受理し（Issue #1894）、非集計のウィンドウ関数は `0A000`。
+    ///
     /// スコープ縮小（`docs/design/window-functions.md` 参照。§計画 2「対象外」）:
     /// 名前付き
-    /// ウィンドウ（`WINDOW w AS (...)`/`OVER w`）・`FILTER (...)`・関数内
+    /// ウィンドウ（`WINDOW w AS (...)`/`OVER w`）・関数内
     /// `DISTINCT`・複合式の引数はいずれも許可リスト外として `42601` に落ちる
     /// （該当する構文を消費する分岐を意図的に持たない）。
     fn parse_window_item(&mut self) -> Result<WindowSelectItem, SqlSurfaceError> {
@@ -7052,6 +7070,21 @@ impl<'a> Parser<'a> {
             }
         };
         self.expect_punct(')')?;
+        let mut filter = Vec::new();
+        if self.peek_ident_matches("FILTER")
+            && matches!(self.tokens.get(self.pos + 1), Some(Token::Punct('(')))
+        {
+            self.advance();
+            self.advance();
+            // 先読み検査（42803／42P20／42601）は本体の内側で済むので、非集計関数の
+            // 0A000 より先に判定される（PostgreSQL は FILTER 式の変換後に関数種別を検査する）。
+            filter = self.parse_filter_clause_body()?;
+            if func.is_ranking() || func.takes_value_args() {
+                return Err(SqlSurfaceError::feature_not_supported(
+                    "FILTER is not implemented for non-aggregate window functions",
+                ));
+            }
+        }
         self.expect_ident_matching("OVER")?;
         self.expect_punct('(')?;
         let over_open = self.pos.saturating_sub(1);
@@ -7117,6 +7150,7 @@ impl<'a> Parser<'a> {
             partition_by,
             order_by,
             frame,
+            filter,
             alias,
         })
     }
@@ -7560,8 +7594,23 @@ impl<'a> Parser<'a> {
             return Ok(Vec::new());
         }
         self.advance();
-        let open = self.pos;
         self.advance();
+        let predicates = self.parse_filter_clause_body()?;
+        if self.peek_ident_matches("OVER") {
+            return Err(SqlSurfaceError::feature_not_supported(
+                "FILTER is not supported for window functions",
+            ));
+        }
+        Ok(predicates)
+    }
+
+    /// `FILTER (` を読み終えた位置から `WHERE <条件> )` までを読む共有本体（SQL-57・Issue #1806、
+    /// SQL-64・Issue #1894）。集計 SELECT の [`Self::parse_aggregate_filter_clause`] と
+    /// ウィンドウ項目の [`Self::parse_window_item`] の双方から呼ばれ、先読み検査
+    /// （集計 `42803`・ウィンドウ関数 `42P20`・`$n` `42601`）を本体の内側に置くことで、
+    /// CTE 本文・派生表・ビュー本文でも同じ SQLSTATE になる。
+    fn parse_filter_clause_body(&mut self) -> Result<Vec<WherePredicate>, SqlSurfaceError> {
+        let open = self.pos.saturating_sub(1);
         if !matches!(self.peek(), Some(Token::Keyword(Keyword::Where))) {
             return Err(SqlSurfaceError::unsupported(
                 "FILTER requires a WHERE condition",
@@ -7581,11 +7630,6 @@ impl<'a> Parser<'a> {
         self.agg_calls = saved_calls;
         let predicates = parsed?;
         self.expect_punct(')')?;
-        if self.peek_ident_matches("OVER") {
-            return Err(SqlSurfaceError::feature_not_supported(
-                "FILTER is not supported for window functions",
-            ));
-        }
         Ok(predicates)
     }
 
@@ -33904,6 +33948,55 @@ mod tests {
         ));
     }
 
+    /// SQL-64・Issue #1894: ウィンドウ集計の FILTER は受理し、非集計のウィンドウ関数は `0A000`。
+    /// FILTER 内の集計 `42803`・ウィンドウ関数 `42P20` は `0A000` より先に判定される。
+    #[test]
+    fn window_aggregate_filter_is_accepted_and_non_aggregates_rejected() {
+        let lookup = catalog_with(&["documents"]);
+        let code = |sql: &str| validate_sql(sql, &lookup).expect_err(sql).wire_code();
+        for sql in [
+            "SELECT count(*) FILTER (WHERE a = 'x') OVER () FROM documents",
+            "SELECT sum(n) FILTER (WHERE a = 'x') OVER (PARTITION BY a ORDER BY n) FROM documents",
+            "SELECT avg(n) FILTER (WHERE n > 1 OR a = 'x') OVER (ORDER BY n \
+             ROWS BETWEEN 1 PRECEDING AND CURRENT ROW) AS m FROM documents",
+            "SELECT count(*) AS filter FROM documents",
+        ] {
+            validate_sql(sql, &lookup).unwrap_or_else(|e| panic!("{sql}: {}", e.wire_code()));
+        }
+        for func in [
+            "row_number()",
+            "rank()",
+            "percent_rank()",
+            "lag(n)",
+            "first_value(n)",
+            "ntile(2)",
+        ] {
+            assert_eq!(
+                code(&format!(
+                    "SELECT {func} FILTER (WHERE a = 'x') OVER (ORDER BY n) FROM documents"
+                )),
+                "0A000",
+                "{func}"
+            );
+        }
+        assert_eq!(
+            code("SELECT row_number() FILTER (WHERE count(*) > 1) OVER () FROM documents"),
+            "42803"
+        );
+        assert_eq!(
+            code("SELECT rank() FILTER (WHERE sum(n) OVER () > 1) OVER () FROM documents"),
+            "42P20"
+        );
+        assert_eq!(
+            code("SELECT count(*) FILTER (WHERE a = $1) OVER () FROM documents"),
+            "42601"
+        );
+        assert_eq!(
+            code("SELECT count(*) FILTER (a = 'x') OVER () FROM documents"),
+            "42601"
+        );
+    }
+
     /// SQL-57・Issue #1806: FILTER の誤形は fail-closed。条件中の集計は `42803`、ウィンドウは
     /// `42P20`（OVER を集計より優先）、`$n` と `WHERE` の欠落は `42601`。部分クエリ内の集計は合法。
     #[test]
@@ -33936,10 +34029,6 @@ mod tests {
         );
         assert_eq!(
             code("SELECT count(*) FILTER (WHERE a = 'x' FROM documents"),
-            "42601"
-        );
-        assert_eq!(
-            code("SELECT count(*) FILTER (WHERE a = 'x') OVER () FROM documents"),
             "42601"
         );
         // 部分クエリの内側の集計は FILTER 内の集計禁止の対象外。

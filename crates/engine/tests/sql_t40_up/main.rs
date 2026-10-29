@@ -98,6 +98,7 @@ mod sql64_lag_lead;
 mod sql64_ntile;
 mod sql64_percent_rank_cume_dist;
 mod sql64_value_functions;
+mod sql64_window_filter;
 mod sql64_window_groups_frame;
 mod sql64_window_range_frame;
 mod sql64_window_rows_frame;

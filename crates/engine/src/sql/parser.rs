@@ -6509,6 +6509,37 @@ pub(crate) struct BoundAggregateFilter {
     pub(crate) or_filters: Vec<crate::sql::where_tree::BoundOrGroup>,
 }
 
+impl BoundAggregateFilter {
+    /// FILTER の参照列を `scalar_mask` へ反映し、embedding を参照するなら `true` を返す
+    /// （集計 `sql::aggregate::ReferencedColumns::derive` とウィンドウ `sql::window` の
+    /// デコード対象導出が共有する単一実装。漏れると縮小デコードで条件が NULL と取り違えられる）。
+    pub(crate) fn mark_referenced(&self, scalar_mask: &mut [bool]) -> bool {
+        let mut needs_embedding = false;
+        for f in &self.metadata_filters {
+            if let Some(slot) = scalar_mask.get_mut(f.column_index()) {
+                *slot = true;
+            }
+        }
+        for expr in &self.expr_filters {
+            if crate::sql::udf_call::references_embedding(expr) {
+                needs_embedding = true;
+            }
+            crate::sql::udf_call::mark_referenced_scalar_columns(expr, scalar_mask);
+        }
+        for group in &self.or_filters {
+            group.visit_column_indices(&mut |idx| {
+                if let Some(slot) = scalar_mask.get_mut(idx) {
+                    *slot = true;
+                }
+            });
+            if group.references_embedding() {
+                needs_embedding = true;
+            }
+        }
+        needs_embedding
+    }
+}
+
 /// 集計項目の `FILTER` 述語列を束縛する（[`bind_aggregate_with_dummy_flags`] の `Aggregate`
 /// 腕・`Expr` 腕〔隠し集計〕が共有）。空なら `None`。式ノード予算は文全体で共有する
 /// （DoS 有界）。`dummy_equality_flags` は渡さず全値検証（FILTER 内に `$n` は存在しない）。
@@ -9714,6 +9745,9 @@ pub(crate) struct BoundWindowItem {
     pub(crate) order_by: Vec<BoundWindowOrderKey>,
     /// 束縛済みのフレーム句（`ROWS`・`RANGE`・`GROUPS`。SQL-64 (2)・Issue #1889／#1890／#1891）。
     pub(crate) frame: Option<BoundWindowFrame>,
+    /// 集計の `FILTER (WHERE ...)`（SQL-64・Issue #1894）。偽・NULL の行はこの項目の累積器の入力
+    /// からだけ除く。集計 SELECT と同じ [`BoundAggregateFilter`] を共有する。
+    pub(crate) filter: Option<Box<BoundAggregateFilter>>,
     pub(crate) name: String,
 }
 
@@ -10458,6 +10492,14 @@ fn bind_window_item(
 
     let frame = bind_window_frame(item, udfs, schema, node_budget)?;
 
+    let filter = bind_aggregate_filter(&item.filter, schema, udfs, node_budget)?;
+    // 構文層が非集計関数の FILTER を 0A000 で止めるため到達しない不変条件（fail-closed）。
+    if filter.is_some() && input.is_none() {
+        return Err(SqlSurfaceError::Internal {
+            detail: "window FILTER on a non-aggregate window function".to_string(),
+        });
+    }
+
     let name = item
         .alias
         .clone()
@@ -10471,6 +10513,7 @@ fn bind_window_item(
         partition_by,
         order_by,
         frame,
+        filter,
         name,
     };
     // `LAG`／`LEAD` は構文受理・束縛・型検査（Issue #1880）の後、評価（`sql::window`。

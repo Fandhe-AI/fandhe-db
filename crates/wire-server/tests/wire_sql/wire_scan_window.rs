@@ -153,6 +153,51 @@ fn percent_rank_cume_dist_over_wire_use_float8() {
     read_ready_for_query(&mut stream);
 }
 
+/// ウィンドウ集計の `FILTER`（SQL-64・Issue #1894）は wire 越しに受理され、列型は int8（OID 20）で、
+/// 条件が偽の行は累積から除かれる（`score > 8` は id 1・2 のみ）。
+#[test]
+fn window_aggregate_filter_over_wire_returns_filtered_counts() {
+    let (core, _guard) = new_core_window_docs();
+    let (mut stream, _users_path) = spawn_with_alice(core);
+
+    send_simple_query(
+        &mut stream,
+        "SELECT id, count(*) FILTER (WHERE score > 8) OVER (ORDER BY id) FROM docs LIMIT 10",
+    );
+    let columns = read_row_description_with_oids(&mut stream);
+    assert_eq!(columns.get(1).map(|(_, oid)| *oid), Some(20));
+    let mut rows: Vec<(String, String)> = Vec::new();
+    for _ in 0..3 {
+        let row = read_data_row(&mut stream);
+        rows.push((
+            row[0].clone().expect("id must not be NULL"),
+            row[1].clone().expect("count must not be NULL"),
+        ));
+    }
+    rows.sort();
+    let owned = |a: &str, b: &str| (a.to_string(), b.to_string());
+    assert_eq!(
+        rows,
+        vec![owned("1", "1"), owned("2", "2"), owned("3", "2")]
+    );
+    assert_eq!(read_command_complete(&mut stream), "SELECT 3");
+    read_ready_for_query(&mut stream);
+}
+
+/// 非集計のウィンドウ関数に `FILTER` を付けると `0A000` の `ErrorResponse` になる。
+#[test]
+fn window_filter_on_non_aggregate_is_rejected_over_wire() {
+    let (core, _guard) = new_core_window_docs();
+    let (mut stream, _users_path) = spawn_with_alice(core);
+
+    send_simple_query(
+        &mut stream,
+        "SELECT id, row_number() FILTER (WHERE score > 8) OVER () FROM docs LIMIT 10",
+    );
+    expect_error_response_with_sqlstate(&mut stream, "0A000");
+    read_ready_for_query(&mut stream);
+}
+
 /// `GROUP BY` とウィンドウ項目の併用は `42601` の `ErrorResponse` になる。
 #[test]
 fn window_combined_with_group_by_is_rejected_over_wire() {

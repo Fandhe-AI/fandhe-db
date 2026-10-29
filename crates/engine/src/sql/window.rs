@@ -79,9 +79,13 @@
 //!
 //! 対象外（`42601`／`54000`／`0A000` で fail-closed に拒否。allowlist・parser 側で既に拒否
 //! 済みの形も含む）:
-//! 名前付きウィンドウ・`FILTER (...)`・関数内 `DISTINCT`・複合式の引数・
+//! 名前付きウィンドウ・関数内 `DISTINCT`・複合式の引数・
 //! ベクトル順位付け（`ORDER BY embedding <=> ...`）／`USING PLAN` との併用・
 //! ウィンドウ別名による文全体の `ORDER BY`・`GROUP BY`／集計 SELECT との併用。
+//!
+//! 集計の `FILTER (WHERE ...)`（Issue #1894）は行ごと項目ごとの判定結果（`filter_pass`）を
+//! materialize 段で持ち、偽・NULL の行をその項目の累積器の入力からだけ除く
+//! （[`observe_window_row_at`]）。パーティション・peer・フレーム位置・出力行には影響しない。
 
 use crate::catalog::{self, ColumnType, TableSchema};
 use crate::declarative_filter;
@@ -856,6 +860,10 @@ struct MaterializedRow {
     agg_values: Vec<WindowInputValue>,
     /// `LAG`／`LEAD` 項目の入力（外側添字がウィンドウ項目。それ以外の項目は `None`。Issue #1881）。
     offset_values: Vec<Option<OffsetRowValues>>,
+    /// 項目ごとの FILTER 判定結果（外側添字がウィンドウ項目。FILTER なしは `true`。Issue #1894）。
+    /// `false` の行はその項目の累積器へ観測させないだけで、パーティション・peer・フレーム位置・
+    /// 出力行には残す。
+    filter_pass: Vec<bool>,
     /// 文全体のスカラー `ORDER BY` キー値（`bound.order_by` と同順。`ORDER BY`
     /// なしなら空。Issue #1189）。出力順の計算（[`compute_output_order`]）専用で、
     /// 出力には現れない。
@@ -1190,6 +1198,7 @@ fn materialize_rows(
                 order_keys,
                 agg_values,
                 offset_values,
+                filter_pass,
             } = collect_window_row_values(
                 bound.windows(),
                 &mut offset_eval,
@@ -1255,6 +1264,7 @@ fn materialize_rows(
                 order_keys,
                 agg_values,
                 offset_values,
+                filter_pass,
                 stmt_order_keys,
                 tenant_idx,
             });
@@ -1279,6 +1289,7 @@ struct WindowRowValues {
     order_keys: Vec<Vec<Option<WindowKeyValue>>>,
     agg_values: Vec<WindowInputValue>,
     offset_values: Vec<Option<OffsetRowValues>>,
+    filter_pass: Vec<bool>,
 }
 
 /// `scanned`（1 行分のスカラー列）から `items`（`bound.windows()`）ごとのキー・引数の値を
@@ -1308,6 +1319,13 @@ fn collect_window_row_values(
         .ok_or_else(|| window_bug("offset slot size overflow"))?;
     *state_bytes = try_accumulate_state_budget(*state_bytes, offset_slots_bytes, state_cap)?;
     let mut offset_values = Vec::with_capacity(items.len());
+    // FILTER 判定結果の固定領域（項目数 × bool）も確保前に状態予算へ計上する（Issue #1894）。
+    let filter_slots_bytes = std::mem::size_of::<bool>()
+        .checked_mul(items.len())
+        .ok_or_else(|| window_bug("filter slot size overflow"))?;
+    *state_bytes = try_accumulate_state_budget(*state_bytes, filter_slots_bytes, state_cap)?;
+    let mut filter_pass = Vec::with_capacity(items.len());
+    let mut filter_scratch: Vec<StackValue> = Vec::new();
     for (item_index, item) in items.iter().enumerate() {
         let mut pkeys = Vec::with_capacity(item.partition_by.len());
         for key in &item.partition_by {
@@ -1369,16 +1387,43 @@ fn collect_window_row_values(
             None => None,
         };
 
+        // 可視性判定・文の WHERE を通過した行にだけ到達する（FILTER は母集合を広げない）。
+        let passes = match &item.filter {
+            None => true,
+            Some(filter) => {
+                let vector = RowVector {
+                    dim,
+                    // `dim > 0` なのに embedding が空なら未デコード（導出漏れ）として `None`＝
+                    // `XX000` fail-closed。`dim == 0`（NULL／未設定ベクトル）は空スライスのまま
+                    // `Some` とし、式評価側の 3VL（UNKNOWN）で FILTER から除外させる。
+                    values: if dim > 0 && embedding.is_empty() {
+                        None
+                    } else {
+                        Some(embedding)
+                    },
+                };
+                crate::sql::aggregate::item_filter_matches(
+                    filter,
+                    id,
+                    &vector,
+                    scanned,
+                    &mut filter_scratch,
+                )?
+            }
+        };
+
         partition_keys.push(pkeys);
         order_keys.push(okeys);
         agg_values.push(agg_value);
         offset_values.push(offset_value);
+        filter_pass.push(passes);
     }
     Ok(WindowRowValues {
         partition_keys,
         order_keys,
         agg_values,
         offset_values,
+        filter_pass,
     })
 }
 
@@ -1439,6 +1484,24 @@ impl<'a> CellWindowEvaluator<'a> {
                     });
                 }
             }
+            // FILTER は評価済みセル上では embedding を持てず、写せない型の列は読めないため、
+            // 黙って誤評価せず固定 `0A000` で拒否する（Issue #1894。fail-closed）。
+            if let Some(filter) = &item.filter {
+                let mut mask = vec![false; column_types.len()];
+                let needs_embedding = filter.mark_referenced(&mut mask);
+                let unsupported = mask.iter().zip(column_types.iter()).any(|(used, ty)| {
+                    *used
+                        && ty
+                            .as_ref()
+                            .is_some_and(|t| !crate::sql::join::values::cell_scalar_supports(t))
+                });
+                if needs_embedding || unsupported {
+                    return Err(SqlSurfaceError::FeatureNotSupported {
+                        detail: "window FILTER over a buffered view supports only scalar columns of plain types"
+                            .to_string(),
+                    });
+                }
+            }
             let uses_pseudo_id = item
                 .partition_by
                 .iter()
@@ -1481,6 +1544,7 @@ impl<'a> CellWindowEvaluator<'a> {
             order_keys,
             agg_values,
             offset_values,
+            filter_pass,
         } = collect_window_row_values(
             self.items,
             &mut self.offset_eval,
@@ -1500,6 +1564,7 @@ impl<'a> CellWindowEvaluator<'a> {
             order_keys,
             agg_values,
             offset_values,
+            filter_pass,
             stmt_order_keys: Vec::new(),
             tenant_idx: 0,
         });
@@ -1599,6 +1664,14 @@ fn decode_tier_for_window(schema: &TableSchema, bound: &BoundScan) -> (DecodeTie
     }
 
     for item in bound.windows() {
+        // 集計の FILTER が参照する列・embedding も反映する（Issue #1894。取りこぼすと縮小デコード
+        // した行で条件が NULL と取り違えられ、黙って誤集計になる）。
+        if let Some(filter) = &item.filter {
+            has_scalar_reference = true;
+            if filter.mark_referenced(&mut scalar_mask) {
+                needs_embedding = true;
+            }
+        }
         // `LAG`／`LEAD` の値・オフセット・既定値が参照する列も反映する（Issue #1880。
         // 取りこぼすとマスク外の列を NULL と誤判定する fail-closed 違反になるため、評価を
         // 接続する Issue #1881 より前に先回りで入れておく）。
@@ -2492,11 +2565,7 @@ fn evaluate_partition(
         if let (Some(acc_mut), Some(input)) = (acc.as_mut(), &item.input) {
             for pos in idx..peer_end {
                 let row = part.row(pos)?;
-                let agg_value = row
-                    .agg_values
-                    .get(item_index)
-                    .ok_or_else(|| window_bug("aggregate window values missing for a row"))?;
-                observe_window_row(acc_mut, input, row.id, agg_value, &mut scratch)?;
+                observe_window_row_at(acc_mut, input, row, item_index, &mut scratch)?;
             }
         }
 
@@ -2626,11 +2695,7 @@ fn evaluate_rows_frame_partition(
                       scratch: &mut Vec<StackValue>|
      -> Result<(), SqlSurfaceError> {
         let row = part.row(pos)?;
-        let agg_value = row
-            .agg_values
-            .get(item_index)
-            .ok_or_else(|| window_bug("aggregate window values missing for a row"))?;
-        observe_window_row(acc, input, row.id, agg_value, scratch)
+        observe_window_row_at(acc, input, row, item_index, scratch)
     };
 
     let cumulative = frame.start == ResolvedBound::UnboundedPreceding
@@ -2799,11 +2864,7 @@ fn evaluate_groups_frame_partition(
                       scratch: &mut Vec<StackValue>|
      -> Result<(), SqlSurfaceError> {
         let row = part.row(pos)?;
-        let agg_value = row
-            .agg_values
-            .get(item_index)
-            .ok_or_else(|| window_bug("aggregate window values missing for a row"))?;
-        observe_window_row(acc, input, row.id, agg_value, scratch)
+        observe_window_row_at(acc, input, row, item_index, scratch)
     };
 
     let cumulative = frame.start == ResolvedBound::UnboundedPreceding
@@ -2890,11 +2951,7 @@ fn evaluate_range_frame_partition(
                       scratch: &mut Vec<StackValue>|
      -> Result<(), SqlSurfaceError> {
         let row = part.row(pos)?;
-        let agg_value = row
-            .agg_values
-            .get(item_index)
-            .ok_or_else(|| window_bug("aggregate window values missing for a row"))?;
-        observe_window_row(acc, input, row.id, agg_value, scratch)
+        observe_window_row_at(acc, input, row, item_index, scratch)
     };
 
     let cumulative = matches!(frame.start, ResolvedRangeBound::UnboundedPreceding)
@@ -3516,6 +3573,32 @@ fn build_scanned(
     out
 }
 
+/// `row` の `item_index` 番目の項目について、FILTER を通過した場合だけ累積器へ観測させる
+/// （Issue #1894）。フレーム境界・peer・`EXCLUDE` の位置計算は FILTER に依存させないため、
+/// 呼び出し元の位置進行（`observed` 等）は変えず、ここで観測だけを抑止する。判定結果が
+/// 欠けているのは実装バグなので `XX000` で fail-closed にする。
+fn observe_window_row_at(
+    acc: &mut Accumulator,
+    input: &AggregateInput,
+    row: &MaterializedRow,
+    item_index: usize,
+    scratch: &mut Vec<StackValue>,
+) -> Result<(), SqlSurfaceError> {
+    let pass = row
+        .filter_pass
+        .get(item_index)
+        .copied()
+        .ok_or_else(|| window_bug("window filter result missing for a row"))?;
+    if !pass {
+        return Ok(());
+    }
+    let agg_value = row
+        .agg_values
+        .get(item_index)
+        .ok_or_else(|| window_bug("aggregate window values missing for a row"))?;
+    observe_window_row(acc, input, row.id, agg_value, scratch)
+}
+
 /// [`WindowInputValue`]（materialize 段で owned 化した値）を、
 /// [`Accumulator::observe`] が期待する借用形（`scanned: &[Option<ScalarRef>]`・
 /// `vector: &RowVector`）へその場で組み立てて 1 回観測する。owned 値は本関数の
@@ -3897,6 +3980,7 @@ mod budget_regression_tests {
     fn item(func: WindowFunc, input: Option<AggregateInput>) -> BoundWindowItem {
         BoundWindowItem {
             frame: None,
+            filter: None,
             position: 0,
             func,
             input,
@@ -4062,6 +4146,7 @@ mod budget_regression_tests {
             offset: 0,
             windows: vec![BoundWindowItem {
                 frame: None,
+                filter: None,
                 position: 1,
                 func: WindowFunc::Min,
                 input: Some(AggregateInput::TextColumn(0)),
@@ -4418,6 +4503,7 @@ mod partition_layout_tests {
     fn item(keys: &[(bool, NullPlacement)]) -> BoundWindowItem {
         BoundWindowItem {
             frame: None,
+            filter: None,
             position: 0,
             func: WindowFunc::Rank,
             input: None,
@@ -4450,6 +4536,7 @@ mod partition_layout_tests {
                 .collect()],
             agg_values: vec![],
             offset_values: vec![],
+            filter_pass: vec![],
             stmt_order_keys: vec![],
             tenant_idx: 0,
         }
