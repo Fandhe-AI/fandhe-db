@@ -8948,13 +8948,25 @@ impl EngineCore {
             // Issue #1920（SQL-66）: DDL 実行権限のあるセッションでは、検証 → UDF カタログへの書き込み
             // （単一 write txn・1 回の commit）→ レジストリへの登録の順で永続化する。権限の無いセッションは
             // 従来どおりセッション内だけに登録し、カタログには触れない（42501 ゲートは #1922）。
+            //
+            // Issue #1915（SQL-66 (1)）: 型注釈つきの定義は、カタログへの型の永続化とロード側の
+            // 復元（`udf_load` は型注釈つきの行を読み飛ばす）が揃うまで、永続化経路では `0A000` で
+            // 拒否する（セッションにだけ残り再起動で消える黙った不整合を作らない・fail-closed）。
             crate::sql::allowlist::Statement::CreateFunction {
                 name,
                 params,
+                param_types,
                 body,
                 body_source,
             } => {
                 if session.ddl_allowed() {
+                    if param_types.iter().any(Option::is_some) {
+                        return Err(
+                            crate::sql::allowlist::SqlSurfaceError::feature_not_supported(
+                                "typed function parameters cannot be persisted yet",
+                            ),
+                        );
+                    }
                     crate::sql::udf_ddl::execute_create_function_persistent(
                         &self.storage,
                         ctx.tenant_id(),
@@ -8965,10 +8977,11 @@ impl EngineCore {
                         &body_source,
                     )?;
                 } else {
-                    crate::sql::udf_call::define_function(
+                    crate::sql::udf_call::define_function_with_types(
                         session.udfs_mut(),
                         &name,
                         &params,
+                        &param_types,
                         &body,
                     )?;
                 }

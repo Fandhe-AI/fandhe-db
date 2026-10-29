@@ -1221,8 +1221,21 @@ pub(super) fn cast_bound(
     env: &mut BindEnv<'_>,
     node_budget: &mut usize,
 ) -> Result<(BoundExpr, ExprType), SqlSurfaceError> {
-    let target_ty = target.expr_type();
     let source = source_cast_kind(operand, &bound, ty, env.schema());
+    cast_bound_from(source, operand, bound, ty, target, node_budget)
+}
+
+/// 変換元の種別を呼び出し側が確定済みのときの `cast_bound`（UDF の型注釈つきパラメータ参照が
+/// 宣言型を保ったまま暗黙変換するために `udf_call` から呼ばれる。Issue #1915）。
+pub(super) fn cast_bound_from(
+    source: SourceKind,
+    operand: &Expr,
+    bound: BoundExpr,
+    ty: ExprType,
+    target: &CastType,
+    node_budget: &mut usize,
+) -> Result<(BoundExpr, ExprType), SqlSurfaceError> {
+    let target_ty = target.expr_type();
     // 配列は要素型つきで規則を引く（`Some(None)` は要素型を CAST の型で表せない ENUM 配列）。
     let mut array_from: Option<Option<CastType>> = None;
     let from_kind = match source {
