@@ -530,7 +530,15 @@ pub(super) fn classify_with(tokens: &[Token]) -> Result<(EmbeddedKind, bool), Sq
         return Err(bad());
     }
     let mut j = 1usize;
-    if tokens.get(j).is_some_and(|t| ident_is(t, "RECURSIVE")) {
+    // 引用の有無は `Token` で区別できないため先読みで決める。`recursive` の次が `(`（列リスト）または
+    // `AS (`／`AS NOT`／`AS MATERIALIZED`（CTE 定義の入口）なら CTE 名、それ以外は省略可能な
+    // `RECURSIVE` キーワード。
+    let names_cte = matches!(tokens.get(2), Some(Token::Punct('(')))
+        || (tokens.get(2).is_some_and(|t| ident_is(t, "AS"))
+            && tokens.get(3).is_some_and(|t| {
+                matches!(t, Token::Punct('(')) || ident_is(t, "NOT") || ident_is(t, "MATERIALIZED")
+            }));
+    if tokens.get(j).is_some_and(|t| ident_is(t, "RECURSIVE")) && !names_cte {
         j = j.saturating_add(1);
     }
     loop {

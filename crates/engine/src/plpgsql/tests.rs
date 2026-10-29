@@ -1079,6 +1079,19 @@ fn with_classification_skips_cte_definitions() {
         kind("WITH RECURSIVE r AS (SELECT 1) INSERT INTO t SELECT * FROM r"),
         (EmbeddedKind::Insert, true)
     );
+    // 引用付きの "recursive" は CTE 名（キーワードと取り違えない）。
+    assert_eq!(
+        kind("WITH \"recursive\" AS (SELECT 1) UPDATE t SET x = 1"),
+        (EmbeddedKind::Update, true)
+    );
+    assert_eq!(
+        kind("WITH \"recursive\"(a) AS (SELECT 1) SELECT a FROM \"recursive\""),
+        (EmbeddedKind::Select, false)
+    );
+    assert_eq!(
+        kind("WITH recursive \"recursive\" AS (SELECT 1) DELETE FROM t"),
+        (EmbeddedKind::Delete, true)
+    );
     // データ変更 CTE を持つ SELECT は書き込み扱い。
     assert_eq!(
         kind("WITH c AS (DELETE FROM t RETURNING 1) SELECT 1 FROM c"),
@@ -1090,4 +1103,28 @@ fn with_classification_skips_cte_definitions() {
         code("BEGIN RETURN QUERY WITH c AS (SELECT 1) TABLE t; END"),
         "42601"
     );
+}
+
+#[test]
+fn declaration_default_resolves_in_the_scope_before_the_declaration() {
+    // PostgreSQL 17 の `decl_statement`（pl_gram.y）は既定値を読んだ後に変数を名前空間へ追加するため、
+    // 内側 `DECLARE x int := x` の既定値の `x` は外側の x に解決される。
+    let b = ok("DECLARE x int := 10; BEGIN DECLARE x int := x; BEGIN RETURN x; END; END");
+    let outer = b.block.decls[0];
+    let Some(Stmt::Block(inner)) = b.block.stmts.first() else {
+        panic!("block");
+    };
+    let inner_id = inner.decls[0];
+    assert_ne!(outer, inner_id);
+    let default = b.vars[inner_id.0 as usize]
+        .default
+        .as_ref()
+        .expect("default");
+    assert_eq!(default.var_refs.len(), 1);
+    assert_eq!(default.var_refs[0].1, VarRef::Var(outer));
+    // 内側の宣言後の参照は内側の x（外側を隠す）。
+    let Some(Stmt::Return(Some(e))) = inner.stmts.first() else {
+        panic!("return");
+    };
+    assert_eq!(e.var_refs[0].1, VarRef::Var(inner_id));
 }
