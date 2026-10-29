@@ -9271,6 +9271,18 @@ fn fold_min_max<'a>(
         }
         acc = Some(match acc {
             None => cand,
+            // 浮動小数（REAL／DOUBLE は `Scalar`）は集約 MIN/MAX と同じ `total_cmp` の全順序で
+            // 比較する。`>`／`<` は NaN を含むと常に偽で結果が引数順に依存するため使わない。
+            Some(ExprValue::Scalar(cur)) if matches!(cand, ExprValue::Scalar(_)) => {
+                let ExprValue::Scalar(c) = cand else {
+                    unreachable!("guarded by matches!")
+                };
+                let better = match op {
+                    MinMaxOp::Greatest => c.total_cmp(&cur).is_gt(),
+                    MinMaxOp::Least => c.total_cmp(&cur).is_lt(),
+                };
+                ExprValue::Scalar(if better { c } else { cur })
+            }
             Some(cur) => match eval_binary(cmp, cand.clone(), cur.clone())? {
                 ExprValue::Bool(true) => cand,
                 ExprValue::Bool(false) => cur,
@@ -11183,6 +11195,19 @@ mod tests {
             .unwrap(),
             Text("B".into())
         );
+        // NaN は最大として扱い、引数順に依存しない（集約 MIN/MAX の total_cmp 順序と一致）。
+        let nan = f64::NAN;
+        for xs in [
+            vec![Scalar(nan), Scalar(1.0), Scalar(2.0)],
+            vec![Scalar(1.0), Scalar(nan), Scalar(2.0)],
+            vec![Scalar(1.0), Scalar(2.0), Scalar(nan)],
+        ] {
+            match fold_min_max(MinMaxOp::Greatest, xs.clone()).unwrap() {
+                Scalar(x) => assert!(x.is_nan()),
+                other => panic!("unexpected {other:?}"),
+            }
+            assert_eq!(fold_min_max(MinMaxOp::Least, xs).unwrap(), Scalar(1.0));
+        }
         // 型が混在した場合（束縛段の不変条件が崩れた場合）は Internal で拒否する。
         assert!(fold_min_max(MinMaxOp::Greatest, v(vec![Scalar(1.0), Text("a".into())])).is_err());
     }
