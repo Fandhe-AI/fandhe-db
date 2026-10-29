@@ -39,6 +39,11 @@ pub struct NestingLimits {
     max_subquery_executions: usize,
     max_cte_definitions: usize,
     max_cte_nesting_depth: usize,
+    /// 窓キー数上限（Issue #1900）の crate 内運搬フィールド。入れ子パーサーへ上限を届ける
+    /// 約 50 の関数シグネチャを変えずに済ませるため、構文解析段の `limits` に相乗りさせる。
+    /// 公開 API（[`NestingLimits::new`] の引数・公開アクセサ）には現れず、設定は
+    /// [`crate::window_limits::WindowLimits`] 経由で `EngineCore` が合成する。
+    max_window_keys: usize,
 }
 
 impl Default for NestingLimits {
@@ -48,6 +53,7 @@ impl Default for NestingLimits {
             max_subquery_executions: MAX_SUBQUERY_EXECUTIONS,
             max_cte_definitions: MAX_CTE_DEFINITIONS,
             max_cte_nesting_depth: hard_cte_nesting_depth(),
+            max_window_keys: crate::window_limits::HARD_MAX_WINDOW_KEYS,
         }
     }
 }
@@ -67,7 +73,22 @@ impl NestingLimits {
             max_cte_definitions: max_cte_definitions.clamp(MIN_NESTING_LIMIT, MAX_CTE_DEFINITIONS),
             max_cte_nesting_depth: max_cte_nesting_depth
                 .clamp(MIN_NESTING_LIMIT, hard_cte_nesting_depth()),
+            max_window_keys: crate::window_limits::HARD_MAX_WINDOW_KEYS,
         }
+    }
+
+    /// 窓キー数上限の運搬値を差し替える（crate 内専用。ハード上限で飽和）。
+    pub(crate) fn with_max_window_keys(mut self, n: usize) -> Self {
+        self.max_window_keys = n.clamp(
+            crate::window_limits::MIN_WINDOW_KEYS,
+            crate::window_limits::HARD_MAX_WINDOW_KEYS,
+        );
+        self
+    }
+
+    /// 構文解析段が参照する窓キー数上限（crate 内専用）。
+    pub(crate) fn max_window_keys(&self) -> usize {
+        self.max_window_keys
     }
 
     /// サブクエリ入れ子深さの上限。

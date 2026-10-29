@@ -59,6 +59,7 @@ pub mod tiering;
 pub mod txn;
 pub mod uuid;
 pub mod wasm_udf;
+pub mod window_limits;
 
 # source: crates/engine/src/core.rs :: VectorCore
 pub trait VectorCore: Send + Sync {

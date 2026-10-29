@@ -1277,6 +1277,10 @@ pub struct EngineCore {
     /// 差し替えは [`Self::with_nesting_limits`] のみ（起動時 1 回）。構文解析段と
     /// サブクエリ解決段にだけ効き、格納済みビュー本文の再パースはハード上限のまま。
     nesting_limits: crate::nesting_limits::NestingLimits,
+    /// 窓の `PARTITION BY`／`ORDER BY` キー数の上限（Issue #1900）。差し替えは
+    /// [`Self::with_window_limits`] のみ（起動時 1 回）。構文解析段にだけ効き、値は
+    /// `nesting_limits` の運搬フィールドへ合成される（入れ子パーサーまで届けるため）。
+    window_limits: crate::window_limits::WindowLimits,
     /// JOIN のリレーション数・入出力行数の上限（Issue #1551）。差し替えは
     /// [`Self::with_join_limits`] のみ（起動時 1 回）。JOIN の実行段（`sql::join`）にだけ効く。
     join_limits: crate::join_limits::JoinSizeLimits,
@@ -2778,6 +2782,7 @@ impl EngineCore {
             jsonpath_limits: crate::jsonpath_limits::JsonPathLimits::default(),
             regex_limits: crate::regex_limits::RegexLimits::default(),
             nesting_limits: crate::nesting_limits::NestingLimits::default(),
+            window_limits: crate::window_limits::WindowLimits::default(),
             join_limits: crate::join_limits::JoinSizeLimits::default(),
             correlated_limits: crate::correlated_limits::CorrelatedLimits::default(),
             recursive_cte_limits: crate::recursive_cte_limits::RecursiveCteLimits::default(),
@@ -3146,8 +3151,25 @@ impl EngineCore {
     /// `wire-server` の起動時 CLI フラグ（`--max-subquery-depth` 等）からのみ呼ぶ。
     /// 未呼び出しならハード上限と同値の既定（現行挙動）。
     pub fn with_nesting_limits(mut self, limits: crate::nesting_limits::NestingLimits) -> Self {
-        self.nesting_limits = limits;
+        // 窓キー数は別設定（[`Self::with_window_limits`]）が正。呼び出し順に依存しないよう再合成する。
+        self.nesting_limits = limits.with_max_window_keys(self.window_limits.max_window_keys());
         self
+    }
+
+    /// 窓の `PARTITION BY`／`ORDER BY` キー数上限（[`crate::window_limits::WindowLimits`]）を
+    /// 差し替えたビルダーを返す（Issue #1900）。`wire-server` の起動時 CLI フラグ
+    /// `--max-window-keys` からのみ呼ぶ。未呼び出しならハード上限と同値の既定（現行挙動）。
+    pub fn with_window_limits(mut self, limits: crate::window_limits::WindowLimits) -> Self {
+        self.window_limits = limits;
+        self.nesting_limits = self
+            .nesting_limits
+            .with_max_window_keys(limits.max_window_keys());
+        self
+    }
+
+    /// 現在の窓キー数上限（Issue #1900）。
+    pub fn window_limits(&self) -> crate::window_limits::WindowLimits {
+        self.window_limits
     }
 
     /// 現在の入れ子系上限（Issue #1552）。
