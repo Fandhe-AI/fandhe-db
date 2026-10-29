@@ -865,3 +865,32 @@ fn delegated_type_errors_do_not_echo_fragments() {
     assert_eq!(e.wire_code(), "42601");
     assert!(!e.to_string().contains("secret"), "leaked: {e}");
 }
+
+#[test]
+fn extract_field_is_ident_position() {
+    // `EXTRACT(year FROM ts)` の field は変数として置換しない。
+    let t = tokenize("SELECT EXTRACT(year FROM ts)").expect("tokenize");
+    assert!(is_ident_position(&t, 3));
+}
+
+#[test]
+fn sql_keyword_named_variable_is_rejected_at_declaration() {
+    // `limit` 等は式中で `Token::Keyword` になり参照を解決できないため、宣言時に拒否する。
+    assert_eq!(
+        code("DECLARE limit int := 1; BEGIN RETURN limit; END"),
+        "42601"
+    );
+}
+
+#[test]
+fn classification_is_linear_for_many_references() {
+    // 多数の変数参照を持つ式でも二乗時間にならない（事前計算した括弧情報を使う）。
+    let expr = vec!["a"; 3_000].join(" + ");
+    let t = tokenize(&format!("SELECT {expr}")).expect("tokenize");
+    let start = std::time::Instant::now();
+    let ctx = super::embedded::IdentCtx::new(&t);
+    for i in 0..t.len() {
+        let _ = super::embedded::is_ident_position_with(&t, i, &ctx);
+    }
+    assert!(start.elapsed().as_secs() < 5);
+}

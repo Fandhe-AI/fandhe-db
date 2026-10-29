@@ -116,8 +116,12 @@ pub(super) fn reject_forbidden_clauses(tokens: &[Token]) -> Result<(), SqlSurfac
 }
 
 /// `INSERT INTO t ( cols ) ...` の列リスト（`(` の次から `)` の手前まで）の範囲。
-/// `start` は `INSERT` トークンの位置。
-fn insert_column_list_at(tokens: &[Token], start: usize) -> Option<std::ops::Range<usize>> {
+/// `start` は `INSERT` トークンの位置。`close_of` は [`ParenInfo`] の対応括弧表（線形時間化のため）。
+fn insert_column_list_at(
+    tokens: &[Token],
+    start: usize,
+    close_of: &[Option<usize>],
+) -> Option<std::ops::Range<usize>> {
     if !tokens.get(start).is_some_and(|t| ident_is(t, "INSERT")) {
         return None;
     }
@@ -140,37 +144,103 @@ fn insert_column_list_at(tokens: &[Token], start: usize) -> Option<std::ops::Ran
     {
         return None;
     }
-    let mut depth = 1usize;
-    let mut k = first_at;
-    while let Some(t) = tokens.get(k) {
-        match t {
-            Token::Punct('(') => depth = depth.saturating_add(1),
-            Token::Punct(')') => {
-                depth = depth.saturating_sub(1);
-                if depth == 0 {
-                    return Some(first_at..k);
-                }
-            }
-            _ => {}
-        }
-        k = k.saturating_add(1);
-    }
-    None
+    let close = (*close_of.get(open)?)?;
+    Some(first_at..close)
 }
 
-/// `i` が `INSERT INTO t ( cols )` の列リスト内か。文頭の `INSERT` に加え、`WITH` の主文
-/// （`) INSERT ...`）とデータ変更 CTE 内（`( INSERT ...`）の `INSERT` も対象にする。
-fn in_insert_column_list(tokens: &[Token], i: usize) -> bool {
-    tokens.iter().enumerate().any(|(s, t)| {
-        if !ident_is(t, "INSERT") || s > i {
-            return false;
+/// 括弧・CTE 列名リスト・INSERT 列リスト位置の事前計算結果。識別子ごとの前方／後方再走査
+/// （二乗コスト）を避けるため、文ごとに線形走査で求める。
+pub(super) struct ParenInfo {
+    /// 各トークンを直接囲む `(` の 1 つ前のトークン位置（囲む括弧が無い／括弧が先頭なら `None`）。
+    encl_prev: Vec<Option<usize>>,
+    /// 各トークンが CTE 列名リスト `name (a, b) AS (` の内側か。
+    cte_cols: Vec<bool>,
+    /// 各トークンが `INSERT INTO t ( cols )` の列リスト内か。
+    insert_cols: Vec<bool>,
+}
+
+impl ParenInfo {
+    pub(super) fn new(tokens: &[Token]) -> Self {
+        let n = tokens.len();
+        let mut encl_open: Vec<Option<usize>> = vec![None; n];
+        let mut close_of: Vec<Option<usize>> = vec![None; n];
+        let mut stack: Vec<usize> = Vec::new();
+        for (k, t) in tokens.iter().enumerate() {
+            if let Some(o) = encl_open.get_mut(k) {
+                *o = stack.last().copied();
+            }
+            match t {
+                Token::Punct('(') => stack.push(k),
+                Token::Punct(')') => {
+                    if let Some(open) = stack.pop() {
+                        if let Some(c) = close_of.get_mut(open) {
+                            *c = Some(k);
+                        }
+                    }
+                }
+                _ => {}
+            }
         }
-        let at_stmt_start = s
-            .checked_sub(1)
-            .and_then(|p| tokens.get(p))
-            .is_none_or(|p| matches!(p, Token::Punct('(') | Token::Punct(')')));
-        at_stmt_start && insert_column_list_at(tokens, s).is_some_and(|r| r.contains(&i))
-    })
+        // 開き括弧ごとの「CTE 列名リストか」。
+        let is_cte_open: Vec<bool> = (0..n)
+            .map(|k| {
+                close_of.get(k).copied().flatten().is_some_and(|m| {
+                    cte_as_follows(tokens, m.saturating_add(1))
+                        && k.checked_sub(1)
+                            .and_then(|p| tokens.get(p))
+                            .is_some_and(|p| matches!(p, Token::Ident(_)))
+                })
+            })
+            .collect();
+        let encl_prev = encl_open
+            .iter()
+            .map(|o| o.and_then(|k| k.checked_sub(1)))
+            .collect();
+        let cte_cols = encl_open
+            .iter()
+            .map(|o| o.is_some_and(|k| is_cte_open.get(k).copied().unwrap_or(false)))
+            .collect();
+        // INSERT 列リストの範囲は入れ子になりうるため、差分配列で線形に塗る。
+        let mut diff = vec![0i64; n.saturating_add(1)];
+        for (s, t) in tokens.iter().enumerate() {
+            if !ident_is(t, "INSERT") {
+                continue;
+            }
+            let at_stmt_start = s
+                .checked_sub(1)
+                .and_then(|p| tokens.get(p))
+                .is_none_or(|p| matches!(p, Token::Punct('(') | Token::Punct(')')));
+            if !at_stmt_start {
+                continue;
+            }
+            if let Some(r) = insert_column_list_at(tokens, s, &close_of) {
+                if let Some(d) = diff.get_mut(r.start) {
+                    *d += 1;
+                }
+                if let Some(d) = diff.get_mut(r.end) {
+                    *d -= 1;
+                }
+            }
+        }
+        let mut acc = 0i64;
+        let insert_cols = (0..n)
+            .map(|k| {
+                acc += diff.get(k).copied().unwrap_or(0);
+                acc > 0
+            })
+            .collect();
+        Self {
+            encl_prev,
+            cte_cols,
+            insert_cols,
+        }
+    }
+
+    /// `i` を直接囲む `(` の 1 つ前のトークン。
+    fn enclosing_prev<'t>(&self, tokens: &'t [Token], i: usize) -> Option<&'t Token> {
+        let p = self.encl_prev.get(i).copied().flatten()?;
+        tokens.get(p)
+    }
 }
 
 /// `tokens[k]`（`FROM`）が式の内部の `FROM`（`IS [NOT] DISTINCT FROM`・`substring`/`extract`/`trim`/
@@ -430,52 +500,6 @@ fn is_cte_decl_name(tokens: &[Token], i: usize) -> bool {
     cte_as_follows(tokens, i.saturating_add(1))
 }
 
-/// `tokens[i]` が CTE の列名リスト `name (a, b) AS (` の内側か。
-fn in_cte_column_list(tokens: &[Token], i: usize) -> bool {
-    let mut depth = 0usize;
-    let mut k = i;
-    while k > 0 {
-        k -= 1;
-        match tokens.get(k) {
-            Some(Token::Punct(')')) => depth = depth.saturating_add(1),
-            Some(Token::Punct('(')) => {
-                if depth == 0 {
-                    break;
-                }
-                depth -= 1;
-            }
-            _ => {}
-        }
-    }
-    if depth != 0
-        || !tokens
-            .get(k)
-            .is_some_and(|t| matches!(t, Token::Punct('(')))
-    {
-        return false;
-    }
-    // 対応する `)` を探す。
-    let mut d = 0usize;
-    let mut m = k;
-    while let Some(t) = tokens.get(m) {
-        match t {
-            Token::Punct('(') => d = d.saturating_add(1),
-            Token::Punct(')') => {
-                d = d.saturating_sub(1);
-                if d == 0 {
-                    return cte_as_follows(tokens, m.saturating_add(1))
-                        && k.checked_sub(1)
-                            .and_then(|p| tokens.get(p))
-                            .is_some_and(|p| matches!(p, Token::Ident(_)));
-                }
-            }
-            _ => {}
-        }
-        m = m.saturating_add(1);
-    }
-    false
-}
-
 /// `WITH` で始まる文の主文の種別と、データ変更 CTE（`( INSERT|UPDATE|DELETE`）の有無を返す。
 /// 括弧の深さ 0 で最初に現れる主文の語で種別を決める（CTE 本体は括弧内なので読み飛ばされる）。
 pub(super) fn classify_with(tokens: &[Token]) -> (EmbeddedKind, bool) {
@@ -544,20 +568,43 @@ pub(super) fn has_write_cte(tokens: &[Token]) -> bool {
 /// `ON CONFLICT` の対象・`UPDATE ... SET`／`DO UPDATE SET` の代入先）にあるか。そうなら変数参照として
 /// 置換しない。#2226 の呼び出し時の置換と共有する単一の分類関数。
 pub(crate) fn is_ident_position(tokens: &[Token], i: usize) -> bool {
-    is_ident_position_with(tokens, i, &from_relation_slots(tokens))
+    is_ident_position_with(tokens, i, &IdentCtx::new(tokens))
 }
 
-/// 関係リスト位置 `slots`（[`relation_slots`] の結果）を呼び出し側が事前計算して渡す版。
-pub(super) fn relation_slots(tokens: &[Token]) -> Vec<bool> {
-    from_relation_slots(tokens)
+/// 識別子位置の分類に使う文単位の事前計算結果（関係リスト位置・括弧／CTE／INSERT 列位置）。
+pub(super) struct IdentCtx {
+    slots: Vec<bool>,
+    parens: ParenInfo,
 }
 
-/// [`is_ident_position`] の本体。`slots` は同じ `tokens` に対する [`relation_slots`] の結果。
-pub(super) fn is_ident_position_with(tokens: &[Token], i: usize, slots: &[bool]) -> bool {
+impl IdentCtx {
+    pub(super) fn new(tokens: &[Token]) -> Self {
+        Self {
+            slots: from_relation_slots(tokens),
+            parens: ParenInfo::new(tokens),
+        }
+    }
+}
+
+/// [`is_ident_position`] の本体。`ctx` は同じ `tokens` に対する [`IdentCtx::new`] の結果。
+pub(super) fn is_ident_position_with(tokens: &[Token], i: usize, ctx: &IdentCtx) -> bool {
+    let slots = &ctx.slots;
     if matches!(tokens.get(i.saturating_add(1)), Some(Token::Punct('('))) {
         return true;
     }
     let prev = i.checked_sub(1).and_then(|p| tokens.get(p));
+    // `EXTRACT(field FROM v)` の field は日時の部品名であり値ではない。
+    if matches!(prev, Some(Token::Punct('(')))
+        && matches!(
+            tokens.get(i.saturating_add(1)),
+            Some(Token::Keyword(Keyword::From))
+        )
+        && i.checked_sub(2)
+            .and_then(|p| tokens.get(p))
+            .is_some_and(|p| ident_is(p, "EXTRACT"))
+    {
+        return true;
+    }
     match prev {
         // `::型名` は型の位置であり値ではない。
         Some(Token::TypeCast) => return true,
@@ -586,7 +633,7 @@ pub(super) fn is_ident_position_with(tokens: &[Token], i: usize, slots: &[bool])
         return true;
     }
     // CTE の宣言名（`WITH c AS (`・`c AS MATERIALIZED (`）と列名リスト（`c (a, b) AS (`）。
-    if is_cte_decl_name(tokens, i) || in_cte_column_list(tokens, i) {
+    if is_cte_decl_name(tokens, i) || ctx.parens.cte_cols.get(i).copied().unwrap_or(false) {
         return true;
     }
     // 暗黙別名: 表名の直後の語（`FROM t x`）。句の語は別名ではない。
@@ -602,7 +649,9 @@ pub(super) fn is_ident_position_with(tokens: &[Token], i: usize, slots: &[bool])
         }
     }
     // `JOIN ... USING (cols)`・`ON CONFLICT (cols)` の列。
-    if enclosing_paren_prev(tokens, i)
+    if ctx
+        .parens
+        .enclosing_prev(tokens, i)
         .is_some_and(|p| ident_is(p, "USING") || ident_is(p, "CONFLICT"))
     {
         return true;
@@ -614,7 +663,7 @@ pub(super) fn is_ident_position_with(tokens: &[Token], i: usize, slots: &[bool])
     {
         return true;
     }
-    in_insert_column_list(tokens, i)
+    ctx.parens.insert_cols.get(i).copied().unwrap_or(false)
 }
 
 /// 定義時検証に使うダミートークン。整数・浮動小数は `0`、真偽値は `false`、それ以外は文字列 `'0'`。

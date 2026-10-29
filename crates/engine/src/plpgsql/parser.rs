@@ -19,7 +19,7 @@ use super::ast::{
 };
 use super::embedded::{
     classify_query, classify_with, has_write_cte, is_ident_position_with, reject_forbidden_clauses,
-    relation_slots, split_into, RawInto,
+    split_into, IdentCtx, RawInto,
 };
 use super::lexer::{scan, TokKind};
 use super::{oos_err, syn_err, too_big_err};
@@ -29,6 +29,9 @@ const RESERVED: &[&str] = &[
     "begin", "end", "if", "loop", "elsif", "elseif", "then", "declare", "else", "case", "when",
     "while", "for", "exit", "continue", "return", "execute", "perform", "null", "in",
 ];
+
+/// SQL 字句解析が `Token::Keyword` 化する語（変数名にできない）。
+const SQL_KEYWORD_NAMES: &[&str] = &["select", "from", "where", "and", "order", "by", "limit"];
 
 /// 範囲外（`0A000`）の文頭の語。
 const OUT_OF_SCOPE_STARTS: &[&str] = &[
@@ -233,7 +236,9 @@ impl<'a> Parser<'a> {
         let name = match self.kind(0) {
             Some(TokKind::Word(w)) => {
                 let l = w.to_ascii_lowercase();
-                if RESERVED.contains(&l.as_str()) {
+                // SQL 側で `Token::Keyword` 化される語（limit/order/by 等）と同名の変数は式中で参照を
+                // 解決できないため、宣言時に拒否する（fail-closed）。
+                if RESERVED.contains(&l.as_str()) || SQL_KEYWORD_NAMES.contains(&l.as_str()) {
                     return Err(syn_err("reserved word used as a PL/pgSQL name"));
                 }
                 l
@@ -472,7 +477,7 @@ impl<'a> Parser<'a> {
     fn resolve_refs(&self, tokens: &[Token]) -> Result<Vec<(usize, VarRef)>, SqlSurfaceError> {
         let mut refs: Vec<(usize, VarRef)> = Vec::new();
         // 関係リスト位置は文ごとに 1 回だけ求め、識別子ごとの再走査（二乗コスト）を避ける。
-        let slots = relation_slots(tokens);
+        let slots = IdentCtx::new(tokens);
         for (i, t) in tokens.iter().enumerate() {
             match t {
                 Token::Param(n) => {
