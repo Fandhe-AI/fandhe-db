@@ -1332,3 +1332,5 @@ Issue #1405（fix(engine)!: CREATE TYPE の型名の重複を 42710 で返す。
 **Issue #1905（feat(engine)!: md5 を追加する。SQL-65・TASK-308 ポインタ）**: `md5(text)` を組み込み関数に追加した。自作 MD5（RFC 1321）は `crypto::md5`（crate 内専用）、16 進化は `sql::string_fn::md5`、評価は `udf_call::apply_builtin` の strict な腕。`md5(bytea)` は未対応（`0A000`）。結合テストは `tests/sql_t40_up/sql65_md5.rs`。
 
 **Issue #1908（feat(engine)!: trunc を追加する。SQL-65 ポインタ。詳細は [numeric-scalar-functions.md](numeric-scalar-functions.md) の「Issue #1908 追記」節）**: `trunc(x)`／`trunc(x, n)`（負の `n` 対応）を `round` と同じ arity オーバーロード（`BuiltinFn::Trunc1`／`Trunc2`）で追加。10 進数字列で打ち切るため桁上げ・二進誤差なし。`n` の検査は `round` と同じ（`22000`／`22003`）。`trunc` は予約名。結合テストは `tests/sql_t40_up/sql65_trunc.rs`。依存・CI 変更なし。
+
+**Issue #2223（docs(design): PL/pgSQL サブセットの範囲と実行モデルを設計する。SQL-68 ポインタ。詳細は [plpgsql-subset.md](plpgsql-subset.md)）**: `LANGUAGE plpgsql` のサブセットを設計記録として確定した。受理する構文と `0A000` の拒否方針、変数を型付きトークンで置換する値の受け渡し、呼び出し元と同一 Tx・同一 RLS の書き込み経路の事前決定、`EXECUTE`、資源上限と CLI、台帳を外側の文の単位で 1 エントリにする整合、トリガ関数と `DO` の接続点を定める。ドキュメントのみで、コード・依存・CI の変更なし。実装は #2224〜#2229。
