@@ -4472,14 +4472,24 @@ impl EngineCore {
         session: &crate::sql::mode::SessionState,
         ctx: &PolicyContext,
     ) -> Result<(), crate::sql::allowlist::SqlSurfaceError> {
-        match session.resolution_tenant() {
-            Some(bound) if bound != ctx.tenant_id() => {
-                Err(crate::sql::allowlist::SqlSurfaceError::Internal {
-                    detail: "session tenant binding mismatch".to_string(),
-                })
-            }
-            _ => Ok(()),
+        let mismatch = || crate::sql::allowlist::SqlSurfaceError::Internal {
+            detail: "session tenant binding mismatch".to_string(),
+        };
+        if session
+            .resolution_tenant()
+            .is_some_and(|bound| bound != ctx.tenant_id())
+        {
+            return Err(mismatch());
         }
+        // カタログ由来の UDF をロード済みのセッションは、ロードしたテナントの ctx でしか実行できない
+        // （別テナントの ctx での使い回しで UDF 本体が漏れる経路を作らない。Issue #1921・P0）。
+        // 解決テナント未束縛のまま UDF を保持するセッションも fail-closed で拒否する。
+        if let Some(scope) = session.udfs().catalog_scope() {
+            if scope != ctx.tenant_id() || session.resolution_tenant().is_none() {
+                return Err(mismatch());
+            }
+        }
+        Ok(())
     }
 
     /// エラー文言に現れる SCHEMA 配下の relation の内部キー（`#<id>.<name>`）を、呼び出し元テナントの
@@ -7143,6 +7153,14 @@ impl EngineCore {
         ctx: &PolicyContext,
         session: &mut crate::sql::mode::SessionState,
     ) -> Result<(), crate::sql::allowlist::SqlSurfaceError> {
+        // 解決テナントを ctx のテナントへ束縛する（別テナントへ束縛済みなら fail-closed）。実行入口の
+        // `check_resolution_tenant` がロード元テナントと異なる ctx での実行を拒否する前提になる。
+        if !session.bind_resolution_tenant(ctx.tenant_id()) {
+            session.udfs_mut().remove_catalog_entries();
+            return Err(crate::sql::allowlist::SqlSurfaceError::Internal {
+                detail: "could not load function catalog".to_string(),
+            });
+        }
         crate::sql::udf_load::load(&self.storage, ctx.tenant_id(), session.udfs_mut())
     }
 
@@ -15216,6 +15234,25 @@ mod tests {
     // 対象ビヘイビア: CORE-1。object-safety の固定（プロトコルアダプタは `&dyn VectorCore`
     // のみを介して呼び出せる）。
     fn _assert_object_safe(_: &dyn VectorCore) {}
+
+    /// Issue #1921（P0）: テナント A でロードした UDF 入りセッションを B の ctx で実行すると拒否される。
+    #[test]
+    fn loaded_udf_session_rejects_other_tenant_ctx() {
+        let dir = tempdir();
+        let core = new_core(dir.path());
+        let ctx_a = PolicyContext::new("tenant-a").expect("valid tenant");
+        let ctx_b = PolicyContext::new("tenant-b").expect("valid tenant");
+        let mut session = crate::sql::mode::SessionState::default();
+        core.load_session_udfs(&ctx_a, &mut session)
+            .expect("load a");
+        assert_eq!(session.resolution_tenant(), Some("tenant-a"));
+        let err = core
+            .execute_sql_in_session(&ctx_b, &mut session, "SELECT 1")
+            .expect_err("tenant mismatch must be rejected");
+        assert_eq!(err.wire_code(), "XX000");
+        // 別テナントへ束縛済みのセッションへの load も fail-closed。
+        assert!(core.load_session_udfs(&ctx_b, &mut session).is_err());
+    }
 
     #[test]
     fn search_rejects_k_zero_and_over_limit() {

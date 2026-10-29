@@ -150,7 +150,15 @@ fn load_into(
             break;
         }
     }
-    registry.set_catalog_binding(Some(tenant_id), generation);
+    // 表せる形なのに登録できなかった定義（セッションローカル／WASM 関数との名前衝突・上限など）が
+    // 残る場合は世代を「未完了」として記録し、次の refresh で再試行させる（ローカル登録の解除後に
+    // カタログ定義が見えない状態を残さない）。
+    let recorded = if pending.is_empty() {
+        generation
+    } else {
+        STALE_GENERATION
+    };
+    registry.set_catalog_binding(Some(tenant_id), recorded);
     Ok(())
 }
 
@@ -263,6 +271,29 @@ mod tests {
         refresh(&s, "other", &mut reg);
         assert!(reg.get("f").is_none());
         assert!(load(&s, "other", &mut reg).is_err());
+    }
+
+    /// 登録できず skip した定義がある間は世代が未完了扱いになり、衝突が解消されたら refresh で見える。
+    #[test]
+    fn skipped_definition_is_retried_by_refresh() {
+        let (s, _g) = tmp_storage("udf-load-retry");
+        s.create_function("t", &decl("f", &["x"], "x + 1"))
+            .expect("f");
+        let mut reg = UdfRegistry::default();
+        // 同名のセッションローカル関数（カタログ由来ではない）が先に居る。
+        let body = {
+            let toks = crate::sql::lexer::tokenize_rendered("x").expect("tok");
+            parse_stored_function_body(&toks).expect("body")
+        };
+        let prepared =
+            prepare_function_definition(&reg, "f", &["x".to_string()], &body).expect("prep");
+        commit_function_definition(&mut reg, prepared);
+        load(&s, "t", &mut reg).expect("load");
+        assert!(!reg.is_catalog_origin("f"));
+        // ローカル登録が消えた後、世代が変わらなくても refresh が再試行して見えるようになる。
+        assert!(reg.remove("f"));
+        refresh(&s, "t", &mut reg);
+        assert!(reg.is_catalog_origin("f"));
     }
 
     /// 世代が進んだら refresh が再ロードし、カタログに無くなった定義は消える。
