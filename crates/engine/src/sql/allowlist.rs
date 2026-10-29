@@ -22955,16 +22955,16 @@ struct ParsedCreateFunction {
 /// 型修飾子を捨てるため `varchar(n)`・`numeric(p,s)` は修飾子なしに揃える。`char(n)` は
 /// 修飾子なしの表現が無く、保持すると呼び出し時に空白埋め・切り詰めが起きて PostgreSQL と
 /// 食い違うため `0A000`（fail-closed）。
-fn normalize_udf_param_type(ty: CastType) -> Result<CastType, SqlSurfaceError> {
+fn normalize_udf_param_type(ty: CastType, what: &str) -> Result<CastType, SqlSurfaceError> {
     Ok(match ty {
         CastType::Varchar(_) => CastType::Varchar(None),
         CastType::Numeric(_) => CastType::Numeric(None),
         CastType::Bpchar(_) => {
-            return Err(SqlSurfaceError::feature_not_supported(
-                "function parameter of type character(n) is not supported",
-            ))
+            return Err(SqlSurfaceError::feature_not_supported(format!(
+                "function {what} of type character(n) is not supported"
+            )))
         }
-        CastType::Array(elem) => CastType::Array(Box::new(normalize_udf_param_type(*elem)?)),
+        CastType::Array(elem) => CastType::Array(Box::new(normalize_udf_param_type(*elem, what)?)),
         other => other,
     })
 }
@@ -22985,7 +22985,7 @@ impl Parser<'_> {
                 ));
             }
         }
-        normalize_udf_param_type(self.parse_cast_target_type()?)
+        normalize_udf_param_type(self.parse_cast_target_type()?, "return type")
     }
 
     /// `CREATE FUNCTION` の引数 1 個（`<名前>` または `<名前> <型>`）を読む
@@ -23036,7 +23036,7 @@ impl Parser<'_> {
                 _ => {}
             }
         }
-        let ty = normalize_udf_param_type(self.parse_cast_target_type()?)?;
+        let ty = normalize_udf_param_type(self.parse_cast_target_type()?, "parameter")?;
         let tail_unsupported = match self.peek() {
             Some(Token::Punct('=' | '%')) => true,
             Some(Token::Ident(w)) => w.eq_ignore_ascii_case("DEFAULT"),
@@ -35658,6 +35658,10 @@ mod tests {
                 "{sql}"
             );
         }
+        let err = validate_sql("CREATE FUNCTION f(x integer) RETURNS char(3) AS x", &lookup)
+            .expect_err("reject")
+            .to_string();
+        assert!(err.contains("return type of type character(n)"), "{err}");
         assert_eq!(
             validate_sql("CREATE FUNCTION f(x integer) RETURNS nope AS x", &lookup)
                 .expect_err("reject")
