@@ -238,10 +238,9 @@ fn accepts_exit_continue_with_block_label() {
 #[test]
 fn accepts_return_forms() {
     ok("BEGIN RETURN a + 1; END");
-    ok("BEGIN RETURN; END");
     let o = opts_with(ReturnShape::SetOf);
     ok_with(
-        "BEGIN RETURN NEXT a; RETURN NEXT; RETURN QUERY SELECT 1; RETURN; END",
+        "BEGIN RETURN NEXT a; RETURN QUERY SELECT 1; RETURN; END",
         &o,
     );
     ok_with("BEGIN RETURN NEW; END", &opts_with(ReturnShape::Trigger));
@@ -653,4 +652,46 @@ fn dummy_token_by_type() {
         dummy_token(&DeclType::Record),
         Token::StringLiteral("0".to_string())
     );
+}
+
+#[test]
+fn return_requires_value_for_scalar_trigger_and_return_next() {
+    for shape in [ReturnShape::Scalar, ReturnShape::Trigger] {
+        assert_eq!(code_with("BEGIN RETURN; END", &opts_with(shape)), "42601");
+    }
+    assert_eq!(
+        code_with("BEGIN RETURN NEXT; END", &opts_with(ReturnShape::SetOf)),
+        "42601"
+    );
+}
+
+#[test]
+fn labeled_for_loop_variable_resolves_via_label() {
+    ok("<<l>> BEGIN <<m>> FOR i IN 1..3 LOOP PERFORM m.i; END LOOP; END");
+    ok("BEGIN <<l>> FOR i IN 1..3 LOOP PERFORM l.i; END LOOP; END");
+    ok("BEGIN <<l>> FOR r IN SELECT 1 LOOP PERFORM l.r; END LOOP; END");
+}
+
+#[test]
+fn parenthesized_query_for_loop_is_accepted() {
+    ok("BEGIN FOR r IN (SELECT 1) LOOP NULL; END LOOP; END");
+}
+
+#[test]
+fn extended_ident_positions() {
+    let c = |s: &str, i: usize| is_ident_position(&tokenize(s).expect("tokenize"), i);
+    assert!(c("SELECT 1 FROM t x", 4));
+    assert!(c("SELECT 1 FROM t JOIN u USING (k)", 8));
+    assert!(c("DELETE FROM t USING u", 4));
+    assert!(c(
+        "INSERT INTO t VALUES (1) ON CONFLICT (k) DO UPDATE SET v = 1",
+        10
+    ));
+    assert!(c(
+        "INSERT INTO t VALUES (1) ON CONFLICT (k) DO UPDATE SET v = 1, w = 2",
+        19
+    ));
+    assert!(!c("SELECT 1 FROM t WHERE x = 1", 5));
+    let q = tokenize("SELECT 1 FROM r.items").expect("tokenize");
+    assert!(is_ident_position(&q, 3));
 }

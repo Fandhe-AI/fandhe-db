@@ -456,7 +456,7 @@ impl<'a> Parser<'a> {
                         refs.push((i, VarRef::Var(id)));
                     }
                 }
-                Token::QualifiedIdent { qualifier, name } => {
+                Token::QualifiedIdent { qualifier, name } if !is_ident_position(tokens, i) => {
                     if let Some(r) = self.lookup_qualified(qualifier, name) {
                         refs.push((i, r));
                     }
@@ -996,7 +996,7 @@ impl<'a> Parser<'a> {
         };
         self.expect_kw("LOOP")?;
         self.scopes.push(Scope {
-            label: None,
+            label: label.clone(),
             names: Vec::new(),
         });
         let var = self.declare(
@@ -1028,11 +1028,14 @@ impl<'a> Parser<'a> {
         a: usize,
         e: usize,
     ) -> Result<Stmt, SqlSurfaceError> {
-        let first_is_query = matches!(
-            self.kind(0),
-            Some(TokKind::Word(w))
-                if ["SELECT", "WITH", "VALUES"].iter().any(|x| w.eq_ignore_ascii_case(x))
-        );
+        // 括弧で始まる問い合わせ（`FOR r IN (SELECT ...) LOOP`）も受理する。
+        let first_is_query = match self.kind(0) {
+            Some(TokKind::Word(w)) => ["SELECT", "WITH", "VALUES"]
+                .iter()
+                .any(|x| w.eq_ignore_ascii_case(x)),
+            Some(TokKind::Punct('(')) => true,
+            _ => false,
+        };
         if !first_is_query || reverse {
             // `FOR r IN cursor_name LOOP` はカーソル FOR（範囲外）。それ以外は構文誤り。
             if !reverse && e == a.saturating_add(1) {
@@ -1046,7 +1049,7 @@ impl<'a> Parser<'a> {
         self.expect_kw("LOOP")?;
         // 対象の解決は問い合わせ（外側のスコープ）の後。未宣言の単独対象は暗黙のレコード変数にする。
         self.scopes.push(Scope {
-            label: None,
+            label: label.clone(),
             names: Vec::new(),
         });
         let mut targets = Vec::new();
@@ -1128,13 +1131,13 @@ impl<'a> Parser<'a> {
                 ));
             }
             self.pos = self.pos.saturating_add(1);
-            let e = if self.is_punct(0, ';') {
-                None
-            } else {
-                Some(self.expr_to_semicolon(false)?)
-            };
+            // OUT/INOUT 引数は未サポートのため、値なしの `RETURN NEXT;` は不正構文。
+            if self.is_punct(0, ';') {
+                return Err(syn_err("RETURN NEXT must have a parameter"));
+            }
+            let e = self.expr_to_semicolon(false)?;
             self.expect_punct(';')?;
-            return Ok(Stmt::ReturnNext(e));
+            return Ok(Stmt::ReturnNext(Some(e)));
         }
         if self.is_kw(0, "QUERY") {
             if shape != ReturnShape::SetOf {
@@ -1155,6 +1158,12 @@ impl<'a> Parser<'a> {
             return Ok(Stmt::ReturnQuery(q));
         }
         if self.is_punct(0, ';') {
+            // 値を返す形（スカラ・トリガ）では値なしの `RETURN;` は不正（OUT 引数は未サポート）。
+            if matches!(shape, ReturnShape::Scalar | ReturnShape::Trigger) {
+                return Err(syn_err(
+                    "RETURN must have a parameter in this PL/pgSQL function",
+                ));
+            }
             self.pos = self.pos.saturating_add(1);
             return Ok(Stmt::Return(None));
         }

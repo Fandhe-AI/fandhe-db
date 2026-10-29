@@ -152,8 +152,113 @@ fn insert_column_list(tokens: &[Token]) -> Option<std::ops::Range<usize>> {
     None
 }
 
-/// `tokens[i]` の `Ident` が識別子の位置（関数名・表名・列名・別名・`UPDATE ... SET` の代入先）に
-/// あるか。そうなら変数参照として置換しない。#2226 の呼び出し時の置換と共有する単一の分類関数。
+/// 表名位置（`FROM`・`JOIN`・`ONLY`・`UPDATE`・`INTO`・`TABLE`・`USING` の直後）の 1 トークン前か。
+fn is_table_slot(tokens: &[Token], j: usize) -> bool {
+    match j.checked_sub(1).and_then(|p| tokens.get(p)) {
+        Some(Token::Keyword(Keyword::From)) => true,
+        Some(p) => ["JOIN", "INTO", "UPDATE", "TABLE", "ONLY", "USING"]
+            .iter()
+            .any(|w| ident_is(p, w)),
+        None => false,
+    }
+}
+
+/// 暗黙別名ではなく句の語になりうる語（表名の直後に現れる）。
+const CLAUSE_WORDS: &[&str] = &[
+    "WHERE",
+    "ON",
+    "USING",
+    "JOIN",
+    "INNER",
+    "LEFT",
+    "RIGHT",
+    "FULL",
+    "CROSS",
+    "NATURAL",
+    "GROUP",
+    "ORDER",
+    "LIMIT",
+    "OFFSET",
+    "HAVING",
+    "UNION",
+    "EXCEPT",
+    "INTERSECT",
+    "SET",
+    "VALUES",
+    "SELECT",
+    "RETURNING",
+    "FOR",
+    "WINDOW",
+    "FETCH",
+    "OVERRIDING",
+    "DEFAULT",
+    "LATERAL",
+    "TABLESAMPLE",
+    "OUTER",
+    "WHEN",
+    "AS",
+    "FROM",
+    "DO",
+    "AND",
+    "OR",
+    "NOT",
+];
+
+/// `i` を直接囲む `(` の 1 つ前のトークン（囲む括弧が無ければ `None`）。
+fn enclosing_paren_prev(tokens: &[Token], i: usize) -> Option<&Token> {
+    let mut depth = 0usize;
+    let mut k = i;
+    while k > 0 {
+        k -= 1;
+        match tokens.get(k)? {
+            Token::Punct(')') => depth = depth.saturating_add(1),
+            Token::Punct('(') => {
+                if depth == 0 {
+                    return k.checked_sub(1).and_then(|p| tokens.get(p));
+                }
+                depth -= 1;
+            }
+            _ => {}
+        }
+    }
+    None
+}
+
+/// 括弧の外側（深さ 0）の直近の `SET` が、`FROM`/`WHERE` 等を挟まずに存在するか（`SET` 代入リスト内か）。
+fn in_set_list(tokens: &[Token], i: usize) -> bool {
+    let mut depth = 0usize;
+    let mut k = i;
+    while k > 0 {
+        k -= 1;
+        match tokens.get(k) {
+            Some(Token::Punct(')')) => depth = depth.saturating_add(1),
+            Some(Token::Punct('(')) => {
+                if depth == 0 {
+                    return false;
+                }
+                depth -= 1;
+            }
+            Some(t) if depth == 0 => {
+                if ident_is(t, "SET") {
+                    return true;
+                }
+                if matches!(t, Token::Keyword(Keyword::From | Keyword::Where))
+                    || ["RETURNING", "ON", "VALUES", "SELECT"]
+                        .iter()
+                        .any(|w| ident_is(t, w))
+                {
+                    return false;
+                }
+            }
+            _ => {}
+        }
+    }
+    false
+}
+
+/// `tokens[i]` の `Ident` が識別子の位置（関数名・表名・列名・別名・暗黙別名・`USING` の列／表・
+/// `ON CONFLICT` の対象・`UPDATE ... SET`／`DO UPDATE SET` の代入先）にあるか。そうなら変数参照として
+/// 置換しない。#2226 の呼び出し時の置換と共有する単一の分類関数。
 pub(crate) fn is_ident_position(tokens: &[Token], i: usize) -> bool {
     if matches!(tokens.get(i.saturating_add(1)), Some(Token::Punct('('))) {
         return true;
@@ -162,17 +267,45 @@ pub(crate) fn is_ident_position(tokens: &[Token], i: usize) -> bool {
     match prev {
         Some(Token::Keyword(Keyword::From)) => return true,
         Some(p)
-            if ["JOIN", "INTO", "UPDATE", "TABLE", "AS", "ONLY"]
-                .iter()
-                .any(|w| ident_is(p, w)) =>
+            if [
+                "JOIN",
+                "INTO",
+                "UPDATE",
+                "TABLE",
+                "AS",
+                "ONLY",
+                "USING",
+                "CONSTRAINT",
+            ]
+            .iter()
+            .any(|w| ident_is(p, w)) =>
         {
             return true
         }
         _ => {}
     }
-    if tokens.first().is_some_and(|t| ident_is(t, "UPDATE"))
-        && matches!(tokens.get(i.saturating_add(1)), Some(Token::Punct('=')))
+    // 暗黙別名: 表名の直後の語（`FROM t x`）。句の語は別名ではない。
+    if let (Some(p @ (Token::Ident(_) | Token::QualifiedIdent { .. })), Some(Token::Ident(me))) =
+        (prev, tokens.get(i))
+    {
+        if i >= 1
+            && is_table_slot(tokens, i - 1)
+            && !ident_is(p, "ONLY")
+            && !CLAUSE_WORDS.iter().any(|w| me.eq_ignore_ascii_case(w))
+        {
+            return true;
+        }
+    }
+    // `JOIN ... USING (cols)`・`ON CONFLICT (cols)` の列。
+    if enclosing_paren_prev(tokens, i)
+        .is_some_and(|p| ident_is(p, "USING") || ident_is(p, "CONFLICT"))
+    {
+        return true;
+    }
+    // `UPDATE ... SET` / `DO UPDATE SET` の代入先。
+    if matches!(tokens.get(i.saturating_add(1)), Some(Token::Punct('=')))
         && prev.is_some_and(|p| ident_is(p, "SET") || matches!(p, Token::Punct(',')))
+        && in_set_list(tokens, i)
     {
         return true;
     }
