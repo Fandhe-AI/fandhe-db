@@ -1031,6 +1031,9 @@ pub enum SqlSurfaceError {
     /// `22000` と同じで、SQLSTATE のみ汎用 RDB に揃える。detail は演算種別の
     /// 固定文言に限り、行の値・テナント情報を含めない。
     DivisionByZero { detail: String },
+    /// `substring`／`substr` の負の長さ（`22011`、SQL-65・ERR-2、Issue #1903）。PostgreSQL と同じ
+    /// 固定文言で、行の値・テナント情報を含めない。
+    SubstringError { detail: String },
     /// `DATE`／`TIMESTAMP` リテラルが文法上は解析できたが、値が受理範囲外、
     /// または暦上不正（月 13・2 月 30 日・非閏年の 2/29・時 24・分 60・秒 60・
     /// 年 0000・年 10000 以上等。TABLE-13・TASK-197、Issue #884・D-1）。
@@ -1638,6 +1641,13 @@ impl SqlSurfaceError {
         }
     }
 
+    /// `pub(crate)`: 文字列関数 `substr`／`substring` の負の長さを報告する（Issue #1903・SQL-65）。
+    pub(crate) fn substring_error(detail: impl Into<String>) -> Self {
+        SqlSurfaceError::SubstringError {
+            detail: truncate_for_error(&detail.into()),
+        }
+    }
+
     /// `pub(crate)`: `sql::parser::bind_datetime_literal`（TABLE-13・TASK-197、
     /// Issue #884）が `DATE`／`TIMESTAMP` リテラルの範囲外・暦上不正を報告する
     /// ために使う。
@@ -1781,6 +1791,7 @@ impl ClassifiedError for SqlSurfaceError {
             SqlSurfaceError::DuplicateOperationId => ErrorClass::DuplicateOperationId,
             SqlSurfaceError::NumericOutOfRange { .. } => ErrorClass::NumericOutOfRange,
             SqlSurfaceError::DivisionByZero { .. } => ErrorClass::DivisionByZero,
+            SqlSurfaceError::SubstringError { .. } => ErrorClass::SubstringError,
             SqlSurfaceError::OperationIdContentMismatch => ErrorClass::OperationIdContentMismatch,
             SqlSurfaceError::InvalidParameterValue { .. } => ErrorClass::InvalidParameterValue,
             SqlSurfaceError::IndeterminateDatatype { .. } => ErrorClass::IndeterminateDatatype,
@@ -1944,6 +1955,10 @@ impl std::fmt::Display for SqlSurfaceError {
             }
             SqlSurfaceError::DivisionByZero { detail } => {
                 write!(f, "division by zero: {detail}")
+            }
+            // PostgreSQL と同じ固定文言（detail は埋め込まない）。
+            SqlSurfaceError::SubstringError { .. } => {
+                write!(f, "negative substring length not allowed")
             }
             SqlSurfaceError::OperationIdContentMismatch => {
                 write!(f, "operation_id already recorded with different content")
@@ -11233,6 +11248,72 @@ impl<'a> Parser<'a> {
         }
     }
 
+    /// `SUBSTRING(...)` の引数列（`(` 消費済み）を解析して `Expr::Call` を返す（Issue #1903・SQL-65）。
+    ///
+    /// `parse_call_expr` の `substring` 分岐から呼ばれる。`FOR`／`SIMILAR` は lexer の
+    /// キーワードではなく識別子のまま文脈的に照合する（既存の同名識別子を壊さないため）。
+    /// 正規表現形 `SIMILAR ... ESCAPE` は SQL-55 の管轄で、黙って別の意味にせず `0A000` で
+    /// fail-closed に拒否する。構文誤りは `42601`、個数の誤りは束縛段が `42883` で拒否する。
+    fn parse_substring_expr(
+        &mut self,
+        name: String,
+        depth: usize,
+    ) -> Result<Expr, SqlSurfaceError> {
+        let null_ctx = self.const_expr_null_args;
+        let source = self.parse_value_expr_with_null_context(depth + 1, null_ctx)?;
+        let mut args = vec![source];
+        match self.peek() {
+            Some(Token::Keyword(Keyword::From)) => {
+                self.advance();
+                args.push(self.parse_value_expr_with_null_context(depth + 1, null_ctx)?);
+                if self.peek_ident_matches("for") {
+                    self.advance();
+                    args.push(self.parse_value_expr_with_null_context(depth + 1, null_ctx)?);
+                }
+            }
+            Some(Token::Ident(kw)) if kw.eq_ignore_ascii_case("for") => {
+                self.advance();
+                let len = self.parse_value_expr_with_null_context(depth + 1, null_ctx)?;
+                if matches!(self.peek(), Some(Token::Keyword(Keyword::From))) {
+                    self.advance();
+                    let start = self.parse_value_expr_with_null_context(depth + 1, null_ctx)?;
+                    args.push(start);
+                } else {
+                    // `FOR n` 単独は開始位置 1 と同じ意味（PostgreSQL 互換）。
+                    args.push(Expr::Number("1".to_string()));
+                }
+                args.push(len);
+            }
+            Some(Token::Ident(kw)) if kw.eq_ignore_ascii_case("similar") => {
+                return Err(SqlSurfaceError::FeatureNotSupported {
+                    detail: "regular expression form of substring is not supported".to_string(),
+                });
+            }
+            Some(Token::Punct(',')) => {
+                while matches!(self.peek(), Some(Token::Punct(','))) {
+                    self.advance();
+                    // 通常の関数呼び出しと同じ上限・エラー（54023）を使う。上限以内の
+                    // 個数不一致は bind_substr が 42883 として判定する。
+                    if args.len() >= MAX_FUNCTION_CALL_ARGS {
+                        return Err(SqlSurfaceError::TooManyArguments {
+                            detail: crate::sql::udf_call::TOO_MANY_FUNCTION_ARGS_DETAIL,
+                        });
+                    }
+                    args.push(self.parse_value_expr_with_null_context(depth + 1, null_ctx)?);
+                }
+            }
+            Some(Token::Punct(')')) => {}
+            other => {
+                return Err(SqlSurfaceError::unsupported(format!(
+                    "expected FROM, FOR or ',' in SUBSTRING, near {other:?}"
+                )))
+            }
+        }
+        self.expect_punct(')')?;
+        self.consume_expr_node()?;
+        Ok(Expr::Call { name, args })
+    }
+
     /// 関数呼び出し式 `<name> '(' [expr {',' expr}] ')'` を解析する。呼び出し元は
     /// 直前に `name` を消費済みで、次のトークンが `'('` である前提（`peek` 済み）。
     ///
@@ -11320,6 +11401,13 @@ impl<'a> Parser<'a> {
                 name,
                 args: vec![haystack, needle],
             });
+        }
+        // Issue #1903・SQL-65: `SUBSTRING(s FROM n [FOR m])`／`SUBSTRING(s FOR m [FROM n])` と
+        // カンマ形 `SUBSTRING(s, n[, m])` を受理する。AST 上は `substring` 名のまま
+        // `Expr::Call { args: [s, start(, len)] }` へ脱糖し、束縛・評価は `substr` と共有する
+        // （既定の列名が `substring` になり、CHECK・ビューの描画も汎用のカンマ形で往復する）。
+        if name.eq_ignore_ascii_case("substring") {
+            return self.parse_substring_expr(name, depth);
         }
         // Issue #1188・SQL-26: `EXTRACT(field FROM src)` は `date_part('field', src)` の
         // SQL 標準構文糖。`(` の直後が「識別子または文字列リテラル」かつその次が

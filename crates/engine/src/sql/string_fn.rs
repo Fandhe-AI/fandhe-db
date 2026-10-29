@@ -123,8 +123,9 @@ pub(crate) fn substr(s: &str, start: f64, len: Option<f64>) -> Result<String, Sq
         Some(len_raw) => {
             let len_i = arg_as_i64(len_raw, "substr length")?;
             if len_i < 0 {
-                return Err(SqlSurfaceError::invalid_input(
-                    "substr length must not be negative",
+                // PostgreSQL と同じ `22011`（substring_error。Issue #1903・SQL-65）。
+                return Err(SqlSurfaceError::substring_error(
+                    "negative substring length not allowed",
                 ));
             }
             // `len_i >= 0`（上で検査済み）のため `end_i128 >= start_i128 >=
@@ -292,7 +293,7 @@ mod tests {
     #[test]
     fn substr_negative_length_is_rejected() {
         let err = substr("hello", 1.0, Some(-1.0)).unwrap_err();
-        assert_eq!(err.wire_code(), "22000");
+        assert_eq!(err.wire_code(), "22011");
     }
 
     /// codex-review P1 指摘の回帰テスト: `start`/`len` はそれぞれ `arg_as_i64`

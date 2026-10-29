@@ -107,6 +107,9 @@ pub enum ArenaError {
     /// フックが 0 除算を理由に拒否した（Issue #1163）。`sql::exec::map_arena_error` が
     /// `SqlSurfaceError::DivisionByZero`（`22012`）へ写像する。メッセージは固定文言。
     DivisionByZero(String),
+    /// フックが `substring` の負の長さを理由に拒否した（Issue #1903）。
+    /// `sql::exec::map_arena_error` が `SqlSurfaceError::SubstringError`（`22011`）へ写像する。
+    SubstringError(String),
     /// フックが算術あふれ（非有限値化）を理由に拒否した（Issue #1163）。
     /// `sql::exec::map_arena_error` が `SqlSurfaceError::NumericOutOfRange`（`22003`）へ
     /// 写像する。メッセージは固定文言。
@@ -131,6 +134,7 @@ impl std::fmt::Display for ArenaError {
             ArenaError::AllocationFailed(msg) => write!(f, "arena allocation failed: {msg}"),
             ArenaError::InvalidInput(msg)
             | ArenaError::DivisionByZero(msg)
+            | ArenaError::SubstringError(msg)
             | ArenaError::NumericOutOfRange(msg) => {
                 write!(f, "arena build rejected by hook: {msg}")
             }
@@ -149,6 +153,7 @@ impl std::error::Error for ArenaError {
             | ArenaError::AllocationFailed(_)
             | ArenaError::InvalidInput(_)
             | ArenaError::DivisionByZero(_)
+            | ArenaError::SubstringError(_)
             | ArenaError::NumericOutOfRange(_) => None,
         }
     }
