@@ -894,3 +894,175 @@ fn classification_is_linear_for_many_references() {
     }
     assert!(start.elapsed().as_secs() < 5);
 }
+
+// ---- PR #2779 レビュー指摘の回帰（キーワード風の識別子の誤判定・RETURN QUERY・ラベル解決） ----
+
+fn first_sql_refs(b: &Body) -> usize {
+    match b.block.stmts.first() {
+        Some(Stmt::Sql(q)) | Some(Stmt::Perform(q)) | Some(Stmt::ReturnQuery(q)) => {
+            q.var_refs.len()
+        }
+        other => panic!("not a SQL statement: {other:?}"),
+    }
+}
+
+#[test]
+fn structural_words_named_like_variables_are_not_references() {
+    // `set` 変数があっても `UPDATE t SET x = 1` の構造語 SET は参照にしない。
+    let b = ok("DECLARE set int; BEGIN UPDATE t SET x = 1; END");
+    assert_eq!(first_sql_refs(&b), 0);
+    // 値の位置の `set` は引き続き参照になる（誤って除外しない）。
+    let b = ok("DECLARE set int; BEGIN UPDATE t SET x = set; END");
+    assert_eq!(first_sql_refs(&b), 1);
+    let b = ok("DECLARE set int; BEGIN PERFORM set; END");
+    assert_eq!(first_sql_refs(&b), 1);
+    // GROUP BY・VALUES・RETURNING・OFFSET の構造語。
+    for (src, n) in [
+        (
+            "DECLARE \"group\" int; BEGIN PERFORM 1 FROM t GROUP BY x; END",
+            0,
+        ),
+        (
+            "DECLARE group_n int; BEGIN PERFORM 1 FROM t WHERE x = group_n GROUP BY x; END",
+            1,
+        ),
+        (
+            "DECLARE values_n int; BEGIN INSERT INTO t(x) VALUES (1); END",
+            0,
+        ),
+        (
+            "DECLARE returning int; BEGIN DELETE FROM t WHERE x = 1 RETURNING x; END",
+            0,
+        ),
+        (
+            "DECLARE returning int; BEGIN DELETE FROM t WHERE x = 1 RETURNING returning; END",
+            1,
+        ),
+        (
+            "DECLARE o int; BEGIN PERFORM 1 FROM t LIMIT 1 OFFSET o; END",
+            1,
+        ),
+    ] {
+        let b = ok(src);
+        assert_eq!(first_sql_refs(&b), n, "for {src:?}");
+    }
+}
+
+#[test]
+fn quoted_bool_word_names_resolve_and_unquoted_literals_are_rejected() {
+    let b = ok("DECLARE \"true\" int := 1; BEGIN RETURN \"true\"; END");
+    let Some(Stmt::Return(Some(e))) = b.block.stmts.first() else {
+        panic!("return");
+    };
+    assert_eq!(e.var_refs.len(), 1);
+    // 未引用のリテラル語は変数名にできない（`RETURN true` を変数へ読み替えないため）。
+    assert_eq!(code("DECLARE true int := 1; BEGIN RETURN 1; END"), "42601");
+    assert_eq!(code("DECLARE default int; BEGIN RETURN 1; END"), "42601");
+}
+
+#[test]
+fn assignment_takes_precedence_over_statement_keywords() {
+    for w in [
+        "insert", "update", "delete", "values", "with", "get", "set", "call",
+    ] {
+        let b = ok(&format!("DECLARE {w} int; BEGIN {w} := 1; END"));
+        assert!(
+            matches!(b.block.stmts.first(), Some(Stmt::Assign { .. })),
+            "for {w}"
+        );
+    }
+    // 変数が無ければ従来どおり fail-closed（代入先が未宣言で 42601）。
+    assert_eq!(code("BEGIN insert := 1; END"), "42601");
+    // SQL 文は従来どおり解析される。
+    ok("DECLARE insert int; BEGIN INSERT INTO t VALUES (1); END");
+    assert_eq!(code("BEGIN SET x = 1; END"), "0A000");
+}
+
+#[test]
+fn return_query_accepts_parenthesized_query() {
+    let o = opts_with(ReturnShape::SetOf);
+    let b = ok_with("BEGIN RETURN QUERY (SELECT 1); END", &o);
+    let Some(Stmt::ReturnQuery(q)) = b.block.stmts.first() else {
+        panic!("return query");
+    };
+    assert!(matches!(
+        q.tokens.first(),
+        Some(Token::Keyword(Keyword::Select))
+    ));
+    ok_with("BEGIN RETURN QUERY ((SELECT 1)); END", &o);
+}
+
+#[test]
+fn outermost_block_label_qualifies_params_and_found() {
+    let b = ok("<<blk>> BEGIN RETURN blk.a; END");
+    let Some(Stmt::Return(Some(e))) = b.block.stmts.first() else {
+        panic!("return");
+    };
+    assert_eq!(e.var_refs.len(), 1);
+    let b = ok("<<blk>> BEGIN PERFORM blk.found; END");
+    assert_eq!(first_sql_refs(&b), 1);
+    // パラメータへの修飾代入も解決できる。
+    let b = ok("<<blk>> BEGIN blk.a := 2; RETURN 1; END");
+    assert!(matches!(b.block.stmts.first(), Some(Stmt::Assign { .. })));
+    // FOUND は定数なので代入は拒否のまま。
+    assert_eq!(
+        code("<<blk>> BEGIN blk.found := true; RETURN 1; END"),
+        "42601"
+    );
+    // 内側ブロックのラベルではパラメータを修飾参照しない（最外ブロックのみ）。
+    let b = ok("BEGIN <<inner>> BEGIN PERFORM inner.a; END; END");
+    let Some(Stmt::Block(inner)) = b.block.stmts.first() else {
+        panic!("block");
+    };
+    let Some(Stmt::Perform(p)) = inner.stmts.first() else {
+        panic!("perform");
+    };
+    assert!(p.var_refs.is_empty());
+}
+
+#[test]
+fn execute_into_using_named_variables_are_expressions() {
+    let b = ok("DECLARE into text := 'x'; BEGIN EXECUTE into; END");
+    let Some(Stmt::Execute { query, .. }) = b.block.stmts.first() else {
+        panic!("execute");
+    };
+    assert_eq!(query.var_refs.len(), 1);
+    let b = ok("DECLARE using text := 'x'; BEGIN EXECUTE using; END");
+    assert!(matches!(b.block.stmts.first(), Some(Stmt::Execute { .. })));
+    let b = ok("DECLARE v int; into int; BEGIN EXECUTE 'x' USING v, into INTO v; END");
+    let Some(Stmt::Execute { using, into, .. }) = b.block.stmts.first() else {
+        panic!("execute");
+    };
+    assert_eq!(using.len(), 2);
+    assert!(into.is_some());
+    // 空のクエリ式は従来どおり拒否する。
+    assert_eq!(code("BEGIN EXECUTE ; END"), "42601");
+    assert_eq!(
+        code("DECLARE v int; BEGIN EXECUTE 'x' USING ; END"),
+        "42601"
+    );
+}
+
+#[test]
+fn contextual_words_usable_as_variable_names() {
+    // EXCEPTION・STRICT・REVERSE・OPERATION_ID は予約語ではなく変数名になれる。
+    ok("DECLARE exception int; BEGIN exception := 1; END");
+    assert_eq!(
+        code("DECLARE x int; BEGIN x := 1; EXCEPTION WHEN OTHERS THEN NULL; END"),
+        "0A000"
+    );
+    ok("DECLARE strict int; BEGIN EXECUTE 'x' INTO strict; END");
+    ok("DECLARE strict int; BEGIN SELECT 1 INTO strict; END");
+    let b = ok("BEGIN SELECT 1 INTO STRICT a; END");
+    let Some(Stmt::Sql(q)) = b.block.stmts.first() else {
+        panic!("sql");
+    };
+    assert!(q.into.as_ref().is_some_and(|i| i.strict));
+    ok("DECLARE reverse int := 1; BEGIN FOR i IN reverse .. 3 LOOP NULL; END LOOP; END");
+    ok("BEGIN FOR i IN REVERSE 3 .. 1 LOOP NULL; END LOOP; END");
+    ok("DECLARE operation_id int; BEGIN EXECUTE 'x' USING operation_id; END");
+    assert_eq!(
+        code("BEGIN EXECUTE 'x' USING OPERATION_ID 'k'; END"),
+        "0A000"
+    );
+}

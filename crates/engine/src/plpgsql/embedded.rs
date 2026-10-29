@@ -59,7 +59,13 @@ pub(super) fn split_into(
     };
     let mut j = at.saturating_add(1);
     let mut strict = false;
-    if tokens.get(j).is_some_and(|t| ident_is(t, "STRICT")) {
+    // `STRICT` は直後に対象名が続くときだけ修飾語（`INTO strict,` の `strict` は変数名）。
+    if tokens.get(j).is_some_and(|t| ident_is(t, "STRICT"))
+        && matches!(
+            tokens.get(j.saturating_add(1)),
+            Some(Token::Ident(_) | Token::QualifiedIdent { .. })
+        )
+    {
         strict = true;
         j = j.saturating_add(1);
     }
