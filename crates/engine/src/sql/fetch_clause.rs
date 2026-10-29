@@ -66,7 +66,7 @@ fn is_count_value(token: Option<&Token>) -> bool {
 /// `OFFSET`／`FETCH` は予約語ではなく識別子（列名・表名）としても使えるため、句として
 /// 解釈するのは直前がオペランド終端のときだけに限る（`SELECT offset + 1 rows`・
 /// `FROM fetch first` のように直前が `SELECT`／`FROM`／演算子・`,` ・`(` なら識別子）。
-fn follows_operand(prev: Option<&Token>) -> bool {
+pub(crate) fn follows_operand(prev: Option<&Token>) -> bool {
     matches!(
         prev,
         Some(

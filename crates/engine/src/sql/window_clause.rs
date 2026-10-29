@@ -239,17 +239,20 @@ fn starts_trailing_clause(tokens: &[Token], i: usize) -> bool {
     let Some(prev) = i.checked_sub(1).and_then(|j| tokens.get(j)) else {
         return false;
     };
-    match prev {
-        Token::Ident(w) => ![
+    // オペランド終端の判定は `fetch_clause` と共通（修飾名・パラメータ等も終端）。
+    // 素の識別子のうち論理・比較の語は演算子側なので終端から除く。
+    if let Token::Ident(w) = prev {
+        if [
             "AND", "OR", "NOT", "IS", "IN", "LIKE", "ILIKE", "BETWEEN", "ON", "WHEN", "THEN",
             "ELSE", "CASE", "DISTINCT", "AS",
         ]
         .iter()
-        .any(|x| w.eq_ignore_ascii_case(x)),
-        Token::Punct(')') | Token::Punct(']') => true,
-        Token::Number(_) | Token::StringLiteral(_) => true,
-        _ => false,
+        .any(|x| w.eq_ignore_ascii_case(x))
+        {
+            return false;
+        }
     }
+    super::fetch_clause::follows_operand(Some(prev))
 }
 
 /// 括弧の外（深さ 0）にあるトークンの位置（括弧そのものを含む）。
@@ -859,5 +862,22 @@ mod tests {
         let cols = vec!["RANK() OVER w"; 3_000].join(", ");
         let sql = format!("SELECT {cols} FROM t WINDOW w AS ({WIDE})");
         assert_eq!(code(&sql), "54000");
+    }
+
+    #[test]
+    fn trailing_clause_after_qualified_name_is_rejected() {
+        for tail in ["OFFSET 1", "FETCH FIRST 1 ROWS ONLY", "FOR UPDATE"] {
+            assert_eq!(
+                code(&format!(
+                    "SELECT t.id, RANK() OVER w FROM t ORDER BY t.id {tail} WINDOW w AS (ORDER BY id)"
+                )),
+                "42601",
+                "{tail}"
+            );
+        }
+        assert_eq!(
+            code("SELECT RANK() OVER w FROM t WHERE t.a = t.b OFFSET 1 WINDOW w AS (ORDER BY id)"),
+            "42601"
+        );
     }
 }
