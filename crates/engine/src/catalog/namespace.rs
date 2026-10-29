@@ -314,7 +314,11 @@ fn str_key_range_nonempty<R: ReadSource>(
 /// SCHEMA `schema_id` に属するオブジェクトが 1 件でもあるか（`DROP SCHEMA ... RESTRICT` の
 /// 空判定。設計記録 D8）。カタログ 5 表は `#<id>.` 接頭辞、SEQUENCE はキー第 1 要素
 /// `#<id>`（ドットなし）の一致で見る。どの表も読み取り専用で開き、表が無ければ空と扱う。
-pub(crate) fn schema_has_objects_in_txn<R: ReadSource>(src: &R, schema_id: u64) -> Result<bool> {
+pub(crate) fn schema_has_objects_in_txn<R: ReadSource>(
+    src: &R,
+    tenant_id: &str,
+    schema_id: u64,
+) -> Result<bool> {
     let start = RelationKey::schema_prefix(schema_id);
     let end = RelationKey::schema_prefix_end(schema_id);
     for def in [
@@ -327,6 +331,11 @@ pub(crate) fn schema_has_objects_in_txn<R: ReadSource>(src: &R, schema_id: u64) 
         if str_key_range_nonempty(src, def, &start, &end)? {
             return Ok(true);
         }
+    }
+    // UDF（#1920）: 関数はテナント単位（scope = tenant_id）で `#<id>.<name>` キーを持つ。残すと
+    // 利用者が内部キーを書けず DROP できない孤児になるため、RESTRICT では「オブジェクトあり」と数える。
+    if super::function::functions_in_schema_exist_in_txn(src, tenant_id, &start)? {
+        return Ok(true);
     }
     let seq_key = sequence_schema_key(schema_id);
     let seqs = match src.open_table(super::sequence::SEQUENCES_TABLE) {
@@ -506,7 +515,7 @@ impl Storage {
                 Err(CatalogError::SchemaNotFound(name.to_string()))
             };
         };
-        if schema_has_objects_in_txn(&*write_txn, id)? {
+        if schema_has_objects_in_txn(&*write_txn, tenant_id, id)? {
             return Err(CatalogError::DependentObjectsStillExist(name.to_string()));
         }
         {
@@ -595,6 +604,8 @@ impl Storage {
         // 配下に残った索引宣言（表を失った孤児。通常は無い）も消す。
         let prefix = RelationKey::schema_prefix(id);
         super::retain_index_defs_in_txn(&write_txn, |def| !def.name.starts_with(&prefix))?;
+        // UDF（#1920）: 配下の関数行も同じ txn で消す（自テナント・自 SCHEMA の接頭辞に限る）。
+        super::function::remove_functions_with_prefix_in_txn(&write_txn, tenant_id, &prefix)?;
         // (5) SCHEMA 行。
         {
             let mut table = write_txn.open_table(SCHEMAS_TABLE)?;

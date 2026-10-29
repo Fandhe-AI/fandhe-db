@@ -2957,10 +2957,16 @@ pub enum Statement {
     /// 等の意味論的妥当性検証は `sql::udf_call::define_function`（呼び出し元
     /// `core.rs::EngineCore::execute_sql_in_session`）が行う（本モジュールは構造の
     /// 受理までを担う）。
+    ///
+    /// **#1920 で追加した破壊的変更（BREAKING CHANGE）**: `body_source` を追加した。`AS` 以降の
+    /// トークン列を [`lexer::render_tokens`] で描画した本体の原文（名前解決後のトークンのため SCHEMA
+    /// 配下の名前は `#<id>.f` 形のまま。UDF カタログへ永続化する値で、ロード時は同じ字句解析と許可リストで
+    /// 再パースする）。
     CreateFunction {
         name: String,
         params: Vec<String>,
         body: Expr,
+        body_source: String,
     },
     /// 集計関数のみを結果列とする `GROUP BY` なし・単一行結果の `SELECT`
     /// （TASK-166・SQL-13。C6a）。`FROM` 単一テーブルのカタログ存在確認を通過済み。
@@ -19288,6 +19294,89 @@ pub(crate) fn validate_drop_sequence_tokens(
     p.expect_end_of_statement()?;
     Ok(ValidatedDropSequence { name })
 }
+/// 構造検証済みの `DROP FUNCTION <name> [ ( [<型>[, ...]] ) ]`（SQL-66・TASK-309、Issue #1920）。
+///
+/// 役割: UDF カタログ（`catalog::function`）とセッションのレジストリから関数を消す最小形。`IF EXISTS`・
+/// `CASCADE`／`RESTRICT`・複数名は後続 Issue（#1917）が受理するまで `0A000` で拒否する（fail-closed）。
+/// 実行は `sql::udf_ddl::execute_drop_function`、呼び出し元は `core.rs` の `ParsedSql::DropFunction` 腕。
+#[derive(Debug, Clone, PartialEq)]
+pub struct ValidatedDropFunction {
+    /// 名前解決後の関数キー（裸の名前、または SCHEMA 配下の内部キー `#<id>.<name>`）。
+    pub(crate) name: String,
+    /// 引数の型の並び。`None` は括弧なし（名前だけで指す）、`Some(空)` は `f()`。
+    pub(crate) arg_types: Option<Vec<crate::catalog::ColumnType>>,
+}
+
+/// 先頭 2 トークンが `DROP FUNCTION` か（汎用 `DROP`〔`DROP TABLE` 扱い〕より前に分岐するために使う）。
+pub(crate) fn is_drop_function_statement(tokens: &[Token]) -> bool {
+    matches!(tokens.first(), Some(Token::Ident(name)) if name.eq_ignore_ascii_case("DROP"))
+        && matches!(tokens.get(1), Some(Token::Ident(name)) if name.eq_ignore_ascii_case("FUNCTION"))
+}
+
+/// [`ValidatedDropFunction`] の構造検証本体（SQL-66、Issue #1920）。受理するのは
+/// `DROP FUNCTION <name>` と `DROP FUNCTION <name>(<型>[, ...])` だけで、`IF EXISTS`・`CASCADE`・
+/// `RESTRICT`・複数名は `0A000`、その他の形（引数名つき等）は型として読めず拒否する。型は
+/// [`crate::sql::cast::parse_cast_type`] で読む（型名として読めることまでが構文検証で、
+/// カタログの定義との一致判定は実行側）。
+pub(crate) fn validate_drop_function_tokens(
+    tokens: &[Token],
+) -> Result<ValidatedDropFunction, SqlSurfaceError> {
+    let mut p = Parser::new(tokens);
+    p.expect_ident_matching("DROP")?;
+    p.expect_ident_matching("FUNCTION")?;
+    if p.consume_if_exists() {
+        return Err(SqlSurfaceError::feature_not_supported(
+            "DROP FUNCTION ... IF EXISTS is not supported",
+        ));
+    }
+    if matches!(p.peek(), Some(Token::QualifiedIdent { .. })) {
+        return Err(SqlSurfaceError::feature_not_supported(
+            "unresolved schema-qualified function names are not supported",
+        ));
+    }
+    let name = p.expect_ident()?;
+    crate::catalog::validate_relation_key(&name)
+        .map_err(|_| SqlSurfaceError::unsupported("invalid function name in DROP FUNCTION"))?;
+    let mut arg_types = None;
+    if matches!(p.peek(), Some(Token::Punct('('))) {
+        p.advance();
+        let mut types = Vec::new();
+        if !matches!(p.peek(), Some(Token::Punct(')'))) {
+            loop {
+                if types.len() >= crate::sql::udf_call::MAX_UDF_PARAMS {
+                    return Err(SqlSurfaceError::payload_too_large(
+                        "too many function parameters",
+                    ));
+                }
+                let cast = crate::sql::cast::parse_cast_type(&p.tokens, &mut p.pos)?;
+                let ty = cast
+                    .result_column_type()
+                    .ok_or_else(|| SqlSurfaceError::unsupported("unsupported argument type"))?;
+                types.push(ty);
+                if matches!(p.peek(), Some(Token::Punct(','))) {
+                    p.advance();
+                } else {
+                    break;
+                }
+            }
+        }
+        p.expect_punct(')')?;
+        arg_types = Some(types);
+    }
+    if p.peek_ident_matches("CASCADE") || p.peek_ident_matches("RESTRICT") {
+        return Err(SqlSurfaceError::feature_not_supported(
+            "DROP FUNCTION ... CASCADE/RESTRICT is not supported",
+        ));
+    }
+    if matches!(p.peek(), Some(Token::Punct(','))) {
+        return Err(SqlSurfaceError::feature_not_supported(
+            "DROP FUNCTION with multiple names is not supported",
+        ));
+    }
+    p.expect_end_of_statement()?;
+    Ok(ValidatedDropFunction { name, arg_types })
+}
+
 /// `ALTER SEQUENCE <name> ...` の変更内容（TABLE-24・SQL-23、Issue #1689）。
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) enum AlterSequenceAction {
@@ -22734,7 +22823,9 @@ fn parse_set_search_mode(tokens: &[Token]) -> Result<String, SqlSurfaceError> {
 /// `sql::udf_call::define_function` が担うが、アロケーション前の上限検証は
 /// `.claude/rules/security.md`「長さフィールドは上限検証してからアロケーションに
 /// 使う」に従い構造検証段階でも行う）。
-fn parse_create_function(tokens: &[Token]) -> Result<(String, Vec<String>, Expr), SqlSurfaceError> {
+fn parse_create_function(
+    tokens: &[Token],
+) -> Result<(String, Vec<String>, Expr, String), SqlSurfaceError> {
     let mut p = Parser::new(tokens);
     p.expect_ident_matching("CREATE")?;
     p.expect_ident_matching("FUNCTION")?;
@@ -22755,9 +22846,24 @@ fn parse_create_function(tokens: &[Token]) -> Result<(String, Vec<String>, Expr)
     }
     p.expect_punct(')')?;
     p.expect_ident_matching("AS")?;
+    let body_start = p.pos;
     let body = p.parse_value_expr(0)?;
+    let body_end = p.pos;
     p.expect_end_of_statement()?;
-    Ok((name, params, body))
+    // 本体の原文は、`AS` の次から式の終端までのトークン列を CREATE VIEW の `body_sql` と同じ規約で
+    // 描画して保存する（AST からの再描画は等価性が崩れうるため使わない）。`Token::Param` を含む場合は
+    // 描画できず fail-closed で拒否する。長さは保存前（確保前）に上限検査する。
+    let body_tokens = tokens
+        .get(body_start..body_end)
+        .ok_or_else(|| SqlSurfaceError::unsupported("invalid function body"))?;
+    let body_source = super::lexer::render_tokens(body_tokens)
+        .ok_or_else(|| SqlSurfaceError::unsupported("function body cannot contain parameters"))?;
+    if body_source.len() > crate::catalog::function::MAX_FUNCTION_BODY_BYTES {
+        return Err(SqlSurfaceError::payload_too_large(
+            "function body too large",
+        ));
+    }
+    Ok((name, params, body, body_source))
 }
 
 /// SQL 文をトークン化し、許可リスト形式で構造検証する（TASK-161 の公開 API。
@@ -25164,8 +25270,13 @@ fn validate_sql_tokens_impl(
             Ok(Statement::SetSearchMode { value })
         }
         _ if is_create_function_statement => {
-            let (name, params, body) = parse_create_function(tokens)?;
-            Ok(Statement::CreateFunction { name, params, body })
+            let (name, params, body, body_source) = parse_create_function(tokens)?;
+            Ok(Statement::CreateFunction {
+                name,
+                params,
+                body,
+                body_source,
+            })
         }
         // Issue #922（SQL-27）: `EXPLAIN` の対象を通常検索・集計・広域取得へ
         // 拡大した。先頭の `EXPLAIN` トークンを消費した残りを、非 EXPLAIN の
@@ -35299,6 +35410,65 @@ mod tests {
         let err = validate_sql("CREATE FUNCTION f(x) AS COUNT(x)", &lookup)
             .expect_err("aggregate call in CREATE FUNCTION body must be rejected");
         assert_eq!(err.wire_code(), "42601");
+    }
+
+    /// SQL-66（Issue #1920）: 保存する本体の原文は、字句解析して再パースすると元の式に戻る
+    /// （ロード側が同じ許可リストで再パースできることの確認）。末尾の `;` は含めない。
+    #[test]
+    fn create_function_body_source_round_trips() {
+        let lookup = catalog_with(&["documents"]);
+        for sql in [
+            "CREATE FUNCTION f(x, y) AS (x + 1) * y - 2.5;",
+            "CREATE FUNCTION f(x) AS greatest(x, 3, -1)",
+            "CREATE FUNCTION f() AS 'it''s'",
+        ] {
+            let Statement::CreateFunction {
+                params,
+                body,
+                body_source,
+                ..
+            } = validate_sql(sql, &lookup).expect("valid")
+            else {
+                panic!("expected CreateFunction");
+            };
+            assert!(!body_source.contains(';'), "{body_source}");
+            let head = format!("CREATE FUNCTION f({}) AS {body_source}", params.join(", "));
+            let Statement::CreateFunction {
+                body: again,
+                body_source: again_source,
+                ..
+            } = validate_sql(&head, &lookup).expect("re-parse")
+            else {
+                panic!("expected CreateFunction");
+            };
+            assert_eq!(body, again, "{sql}");
+            assert_eq!(body_source, again_source, "{sql}");
+        }
+    }
+
+    #[test]
+    fn drop_function_syntax_is_minimal_and_fail_closed() {
+        let toks = |s: &str| crate::sql::lexer::tokenize(s).expect("tokenize");
+        let ok = validate_drop_function_tokens(&toks("DROP FUNCTION f")).expect("bare");
+        assert_eq!(ok.name, "f");
+        assert!(ok.arg_types.is_none());
+        let ok = validate_drop_function_tokens(&toks("DROP FUNCTION f()")).expect("empty");
+        assert_eq!(ok.arg_types.as_deref(), Some(&[][..]));
+        let ok =
+            validate_drop_function_tokens(&toks("DROP FUNCTION f(integer, text);")).expect("typed");
+        assert_eq!(ok.arg_types.as_ref().map(Vec::len), Some(2));
+        for sql in [
+            "DROP FUNCTION IF EXISTS f",
+            "DROP FUNCTION f CASCADE",
+            "DROP FUNCTION f(integer) RESTRICT",
+            "DROP FUNCTION f, g",
+        ] {
+            let err = validate_drop_function_tokens(&toks(sql)).expect_err(sql);
+            assert_eq!(err.wire_code(), "0A000", "{sql}");
+        }
+        let err = validate_drop_function_tokens(&toks("DROP FUNCTION f(x integer)"))
+            .expect_err("argument names are not accepted");
+        assert_eq!(err.wire_code(), "42704");
     }
 
     #[test]

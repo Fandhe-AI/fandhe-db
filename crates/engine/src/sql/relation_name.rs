@@ -476,8 +476,12 @@ pub(crate) fn rewrite_relation_names_full(
         if walk.positions.iter().any(|p| p.index == i) {
             continue;
         }
+        // `DROP FUNCTION s.f`（#1920）は型の並びの括弧を省略できるため、先頭が `DROP FUNCTION` の文では
+        // 3 語目の修飾名を（括弧が無くても）関数位置として扱う。
+        let drop_function_name =
+            i == 2 && ident_is(tokens.first(), "DROP") && ident_is(tokens.get(1), "FUNCTION");
         let function_pos = resolver.is_some()
-            && matches!(tokens.get(i + 1), Some(Token::Punct('(')))
+            && (drop_function_name || matches!(tokens.get(i + 1), Some(Token::Punct('('))))
             && !qualifier.eq_ignore_ascii_case("public")
             && !is_builtin_schema_name(qualifier)
             && !qualifier.eq_ignore_ascii_case("pg_temp");

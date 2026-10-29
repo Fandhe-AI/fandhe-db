@@ -78,8 +78,8 @@ pub(crate) mod sequence;
 #[allow(dead_code)]
 pub(crate) mod namespace;
 // UDF（ユーザー定義関数）のカタログ（SQL-66・Issue #1919。設計記録: `docs/design/udf-catalog.md`）。
-// 書き込み（#1920）・ロード（#1921）の結線までは crate 内の呼び出し元がテストだけになる。
-#[allow(dead_code)]
+// 書き込み（#1920）は結線済み。ロード（#1921）が使う読み出し API は当面テストからしか呼ばれない
+// ため、該当項目に個別に `dead_code` を許可している。
 pub(crate) mod function;
 pub(crate) use materialized::read_materialized_view_in;
 

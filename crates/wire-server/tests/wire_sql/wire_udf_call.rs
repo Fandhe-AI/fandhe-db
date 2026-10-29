@@ -234,3 +234,44 @@ fn wire_udf_call_registration_does_not_leak_across_connections() {
     expect_error_response_with_sqlstate(&mut conn2, "42883");
     read_ready_for_query(&mut conn2);
 }
+
+/// SQL-66（Issue #1920）: DDL 実行権限のあるユーザーの `CREATE FUNCTION`／`DROP FUNCTION` は
+/// それぞれ固定タグ `CREATE FUNCTION`／`DROP FUNCTION` を返し、DROP 済みの名前の再 DROP は `42883`。
+#[test]
+fn wire_drop_function_returns_tag_for_ddl_user() {
+    let (core, _guard) = new_core_with_docs();
+    let users_path = write_user_store_file(&[("alice", "tenant-a", "pw-alice")]);
+    let store = wire_server::auth::UserStore::load_from_file(&users_path).expect("user store");
+    let store = store
+        .with_ddl_allowed_users(&["alice".to_string()])
+        .expect("known user");
+    let listener = std::net::TcpListener::bind("127.0.0.1:0").expect("bind");
+    let addr = listener.local_addr().expect("addr");
+    let limiter = wire_server::limits::ConnectionLimiter::new(16);
+    let store = Arc::new(store);
+    std::thread::spawn(move || {
+        wire_server::server::accept_loop_with_engine(
+            listener,
+            store,
+            core,
+            limiter,
+            std::time::Duration::from_secs(5),
+        );
+    });
+    let mut stream = authenticate_to_ready_for_query(addr, "alice", "pw-alice");
+
+    send_simple_query(
+        &mut stream,
+        "CREATE FUNCTION persisted_fn(v) AS vec_norm(v)",
+    );
+    assert_eq!(read_command_complete(&mut stream), "CREATE FUNCTION");
+    read_ready_for_query(&mut stream);
+
+    send_simple_query(&mut stream, "DROP FUNCTION persisted_fn");
+    assert_eq!(read_command_complete(&mut stream), "DROP FUNCTION");
+    read_ready_for_query(&mut stream);
+
+    send_simple_query(&mut stream, "DROP FUNCTION persisted_fn");
+    expect_error_response_with_sqlstate(&mut stream, "42883");
+    read_ready_for_query(&mut stream);
+}
