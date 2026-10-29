@@ -111,6 +111,39 @@ fn lpad_rpad_project_expected_values_and_propagate_null() {
 }
 
 #[test]
+fn bare_null_literal_arguments_propagate_null() {
+    let path = unique_db_path("sql65-bare-null");
+    let _guard = CleanupGuard(path.clone());
+    let core = new_core(&path);
+    let ctx = ctx_for("tenant-a");
+    let mut session = SessionState::default();
+    for sql in [
+        "SELECT lpad(NULL, 5)",
+        "SELECT rpad('a', 5, NULL)",
+        "SELECT lpad('a', NULL)",
+        "SELECT split_part('a', NULL, 1)",
+        "SELECT split_part(NULL, ',', 1)",
+        "SELECT split_part('a', ',', NULL)",
+    ] {
+        match core
+            .execute_sql_in_session(&ctx, &mut session, sql)
+            .unwrap_or_else(|e| panic!("{sql} must succeed, got {e:?}"))
+        {
+            engine::sql::SqlOutcome::Query(r) => {
+                assert_eq!(r.rows.len(), 1, "{sql}");
+                assert_eq!(r.rows[0].cells, vec![Cell::Null], "{sql}");
+            }
+            other => panic!("expected a query result for {sql}, got {other:?}"),
+        }
+    }
+    // 非 NULL 引数の型不一致は NULL が混在しても 42804 で拒否される。
+    let err = core
+        .execute_sql_in_session(&ctx, &mut session, "SELECT lpad(NULL, 'x')")
+        .expect_err("type mismatch");
+    assert_eq!(err.wire_code(), "42804");
+}
+
+#[test]
 fn split_part_projects_positive_negative_and_out_of_range() {
     let path = unique_db_path("sql65-split-part");
     let _guard = CleanupGuard(path.clone());

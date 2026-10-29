@@ -7205,6 +7205,9 @@ fn bind_call(
                 args.len()
             )));
         }
+        if matches!(builtin, BuiltinFn::SplitPart) {
+            return bind_strict_text_fn(name, builtin, args, param_types, ret, env, node_budget);
+        }
         // `justify_*`（Issue #1582）は strict 関数: 裸の `NULL` 引数は型検査で
         // 弾かず、結果型 `Interval` の `NULL` として伝播させる（`date_part` 等と同方針）。
         if matches!(
@@ -7931,15 +7934,38 @@ fn bind_pad(
         }
     };
     let (param_types, ret) = builtin_signature(builtin);
+    bind_strict_text_fn(name, builtin, args, param_types, ret, env, node_budget)
+}
+
+/// strict 組み込み（`lpad`／`rpad`／`split_part`。Issue #1904・SQL-65）の引数束縛。
+/// 裸の `NULL` 引数は [`bind_null_aware`] で型未確定のまま受理し、非 NULL 引数のみ
+/// 宣言型と照合する。いずれかが `NULL` なら結果型 `ret` の `NULL` として伝播させる。
+fn bind_strict_text_fn(
+    name: &str,
+    builtin: BuiltinFn,
+    args: &[Expr],
+    param_types: &[ExprType],
+    ret: ExprType,
+    env: &mut BindEnv<'_>,
+    node_budget: &mut usize,
+) -> Result<(BoundExpr, ExprType), SqlSurfaceError> {
     let mut bound_args = Vec::with_capacity(args.len());
+    let mut any_null = false;
     for (a, expected) in args.iter().zip(param_types.iter()) {
-        let (b, ty) = bind_expr_in(a, env, node_budget)?;
-        if ty != *expected {
-            return Err(SqlSurfaceError::datatype_mismatch(format!(
-                "function {name} argument type mismatch"
-            )));
+        let (b, ty) = bind_null_aware(a, env, node_budget)?;
+        match ty {
+            None => any_null = true,
+            Some(t) if t != *expected => {
+                return Err(SqlSurfaceError::datatype_mismatch(format!(
+                    "function {name} argument type mismatch"
+                )));
+            }
+            Some(_) => {}
         }
         bound_args.push(b);
+    }
+    if any_null {
+        return Ok((BoundExpr::Null, ret));
     }
     Ok((
         BoundExpr::Builtin {
