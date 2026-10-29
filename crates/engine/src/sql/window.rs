@@ -765,10 +765,7 @@ fn resolve_frames(
             out.push(None);
             continue;
         };
-        if matches!(
-            item.func,
-            WindowFunc::RowNumber | WindowFunc::Rank | WindowFunc::DenseRank
-        ) {
+        if item.func.ignores_frame() {
             out.push(None);
             continue;
         }
@@ -2205,6 +2202,108 @@ fn pick_in_frame(
     }
 }
 
+/// `ntile` の 1 パーティション分の状態（PostgreSQL の `window_ntile` と同じ状態機械。SQL-64 (4)・
+/// Issue #1884）。バケット数に比例する確保をしないよう、スカラー 4 つだけを持つ。
+#[derive(Debug, Default)]
+struct NtileState {
+    /// 現在のバケット番号（0 は未確定＝まだバケット数を読んでいない）。
+    ntile: i64,
+    rows_per_bucket: i64,
+    boundary: i64,
+    remainder: i64,
+}
+
+impl NtileState {
+    /// バケット数 `n`（1 以上）と総行数 `total` から初期状態を確定する。
+    fn start(&mut self, total: i64, n: i64) {
+        self.boundary = total / n;
+        if self.boundary == 0 {
+            self.boundary = 1;
+            self.remainder = 0;
+        } else {
+            self.remainder = total % n;
+            if self.remainder != 0 {
+                self.boundary += 1;
+            }
+        }
+        self.ntile = 1;
+        self.rows_per_bucket = 0;
+    }
+
+    /// 1 行分進め、その行のバケット番号を返す（[`NtileState::start`] 済みであること）。
+    fn advance(&mut self) -> i64 {
+        self.rows_per_bucket += 1;
+        if self.boundary < self.rows_per_bucket {
+            if self.remainder != 0 && self.ntile == self.remainder {
+                self.remainder = 0;
+                self.boundary -= 1;
+            }
+            self.ntile += 1;
+            self.rows_per_bucket = 1;
+        }
+        self.ntile
+    }
+}
+
+/// `ntile(num_buckets)` の 1 パーティション分の評価（SQL-64 (4)・Issue #1884。
+/// [`evaluate_partition`] から呼ばれる）。PostgreSQL の `window_ntile` と同じく、並べ替えた順に
+/// 行の位置ごとに進め（peer・フレームは区別しない）、バケット数が未確定の行でだけ引数を評価する。
+/// 引数が NULL ならその行は NULL で、次の行で再評価する。0 以下は `22014`、`integer` 範囲外は
+/// `22003`。0 行のパーティションは引数を評価しないためエラーにならない。母集合は materialize 段を
+/// 通った行のみで、不可視行・他テナントの Private 行はバケット境界に影響しない。
+fn evaluate_ntile_partition(
+    part: &SortedPartition<'_>,
+    out: &mut [Option<Cell>],
+    state_bytes: &mut usize,
+    state_cap: usize,
+) -> Result<(), SqlSurfaceError> {
+    let item_index = part.item_index;
+    let total = i64::try_from(part.len()).unwrap_or(i64::MAX);
+    let mut state = NtileState::default();
+    for pos in 0..part.len() {
+        crate::interrupt::check()?;
+        let row_idx = part.row_index(pos)?;
+        let cell = if state.ntile == 0 {
+            let values = part
+                .materialized
+                .get(row_idx)
+                .and_then(|r| r.offset_values.get(item_index))
+                .and_then(|v| v.as_ref())
+                .ok_or_else(|| window_bug("ntile argument missing for a row"))?;
+            let arg = values.value.as_ref().map_err(Clone::clone)?;
+            let n =
+                match arg {
+                    Cell::Null => None,
+                    Cell::SignedInteger(v) => Some(i32::try_from(*v).map_err(|_| {
+                        SqlSurfaceError::numeric_out_of_range("integer out of range")
+                    })?),
+                    _ => return Err(window_bug("ntile argument is not an integer cell")),
+                };
+            match n {
+                None => Cell::Null,
+                Some(n) if n <= 0 => {
+                    return Err(SqlSurfaceError::InvalidArgumentForNtileFunction {
+                        detail: "argument of ntile must be greater than zero",
+                    });
+                }
+                Some(n) => {
+                    state.start(total, i64::from(n));
+                    Cell::SignedInteger(state.advance())
+                }
+            }
+        } else {
+            Cell::SignedInteger(state.advance())
+        };
+        *state_bytes =
+            try_accumulate_state_budget(*state_bytes, window_cell_state_bytes(&cell), state_cap)?;
+        let slot = out
+            .get_mut(row_idx)
+            .ok_or_else(|| window_bug("ntile row index out of range for the result slice"))?;
+        *slot = Some(cell);
+    }
+    Ok(())
+}
+
 /// `first_value`／`last_value`／`nth_value` の 1 パーティション分の評価（SQL-64 (3)・Issue #1883。
 /// [`evaluate_partition`] から呼ばれる）。行ごとにフレーム（`frame` が `None` なら既定の
 /// `RANGE BETWEEN UNBOUNDED PRECEDING AND CURRENT ROW`＝先頭から現在行の peer グループ末尾まで）を
@@ -2337,6 +2436,10 @@ fn evaluate_partition(
     let item = part.item;
     let item_index = part.item_index;
 
+    // `ntile` はフレームを無視し行の位置だけで進むため、peer 分割へ入れず専用の評価へ委譲する。
+    if item.func == WindowFunc::Ntile {
+        return evaluate_ntile_partition(part, out, state_bytes, state_cap);
+    }
     // `LAG`／`LEAD` は peer・フレームに依存しないため、peer 分割へ入れず専用の評価へ委譲する。
     if item.func.is_frame_value() {
         return evaluate_value_frame_partition(part, frame, out, state_bytes, state_cap);
@@ -2403,7 +2506,8 @@ fn evaluate_partition(
             | WindowFunc::Lead
             | WindowFunc::FirstValue
             | WindowFunc::LastValue
-            | WindowFunc::NthValue => {
+            | WindowFunc::NthValue
+            | WindowFunc::Ntile => {
                 return Err(window_bug("offset window function reached the peer loop"));
             }
             WindowFunc::Count
@@ -2430,7 +2534,8 @@ fn evaluate_partition(
                 | WindowFunc::Lead
                 | WindowFunc::FirstValue
                 | WindowFunc::LastValue
-                | WindowFunc::NthValue => {
+                | WindowFunc::NthValue
+                | WindowFunc::Ntile => {
                     return Err(window_bug("offset window function reached the peer loop"));
                 }
                 WindowFunc::Count
@@ -3317,6 +3422,8 @@ pub(crate) fn window_result_type(item: &BoundWindowItem) -> Option<ColumnType> {
         WindowFunc::RowNumber | WindowFunc::Rank | WindowFunc::DenseRank | WindowFunc::Count => {
             return Some(ColumnType::BigInt);
         }
+        // `ntile` は PostgreSQL と同じ `integer`（SQL-64 (4)・Issue #1884）。
+        WindowFunc::Ntile => return Some(ColumnType::Integer),
         WindowFunc::Sum => AggregateFunc::Sum,
         WindowFunc::Avg => AggregateFunc::Avg,
         WindowFunc::Min => AggregateFunc::Min,
@@ -3350,7 +3457,8 @@ fn window_func_to_aggregate_func(
         | WindowFunc::Lead
         | WindowFunc::FirstValue
         | WindowFunc::LastValue
-        | WindowFunc::NthValue => Err(window_bug(
+        | WindowFunc::NthValue
+        | WindowFunc::Ntile => Err(window_bug(
             "offset window function unexpectedly requires an accumulator",
         )),
     }
@@ -3783,6 +3891,26 @@ mod budget_regression_tests {
             // 引数が無い（束縛前の）項目は型を公告しない（fail-closed）。
             assert_eq!(window_result_type(&item(func, None)), None);
         }
+    }
+
+    /// `ntile` の状態機械は PostgreSQL の `window_ntile` と同じバケット境界を返す（Issue #1884）。
+    #[test]
+    fn ntile_state_machine_matches_postgres_boundaries() {
+        let run = |total: i64, n: i64| -> Vec<i64> {
+            let mut st = NtileState::default();
+            if total == 0 {
+                return Vec::new();
+            }
+            st.start(total, n);
+            (0..total).map(|_| st.advance()).collect()
+        };
+        assert_eq!(run(5, 2), vec![1, 1, 1, 2, 2]);
+        assert_eq!(run(7, 3), vec![1, 1, 1, 2, 2, 3, 3]);
+        assert_eq!(run(10, 4), vec![1, 1, 1, 2, 2, 2, 3, 3, 4, 4]);
+        assert_eq!(run(3, 5), vec![1, 2, 3]);
+        assert_eq!(run(4, 1), vec![1, 1, 1, 1]);
+        assert_eq!(run(6, 3), vec![1, 1, 2, 2, 3, 3]);
+        assert!(run(0, 3).is_empty());
     }
 
     /// 順位関数と `COUNT` は `BigInt`、集計系は集計 SELECT と同じ規則（Issue #1344）。

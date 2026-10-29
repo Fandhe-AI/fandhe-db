@@ -10241,6 +10241,70 @@ fn bind_window_offset_args(
     })
 }
 
+/// `ntile(num_buckets)` の引数を束縛する（SQL-64 (4)・Issue #1884。[`bind_window_item`] から呼ばれる）。
+/// 引数は整数系（SMALLINT／INTEGER／BIGINT）または裸の `NULL` のみ。`sql::window` は引数を
+/// 「バケット数を確定する最初の行」でだけ読むため、値は [`BoundWindowOffsetArgs::value`] に載せ
+/// （評価エラー `22xxx` が参照まで遅延する）、`offset`／`default` は使わない。整数でない型は
+/// `42804`（PostgreSQL は `42883`。既知の差異）。
+fn bind_ntile_args(
+    args: &crate::sql::allowlist::WindowOffsetArgs,
+    schema: &TableSchema,
+    udfs: &crate::sql::udf_call::UdfRegistry,
+    node_budget: &mut usize,
+) -> Result<BoundWindowOffsetArgs, SqlSurfaceError> {
+    use crate::sql::udf_call::{bind_projection_expr, BoundExpr, ExprType};
+    let mismatch =
+        || SqlSurfaceError::datatype_mismatch("argument of ntile must be of integer type");
+    let mut idents = std::collections::HashSet::new();
+    collect_expr_idents(&args.value, &mut idents);
+    let uses_pseudo_id = idents.contains("id")
+        && schema.has_pseudo_id()
+        && !schema.columns.iter().any(|c| c.name == "id");
+    let is_int = |t: &ColumnType| {
+        matches!(
+            t,
+            ColumnType::SmallInt | ColumnType::Integer | ColumnType::BigInt
+        )
+    };
+    let (value, result_type) = if matches!(&args.value, Expr::Null) {
+        (
+            BoundWindowValue::Expr {
+                bound: BoundExpr::Null,
+                ty: ExprType::Scalar,
+            },
+            ColumnType::Integer,
+        )
+    } else if is_pseudo_id_ref(&args.value, schema) {
+        (BoundWindowValue::PseudoId, ColumnType::BigInt)
+    } else if let Some((index, column)) = bare_schema_column(&args.value, schema) {
+        if !is_int(&column.ty) {
+            return Err(mismatch());
+        }
+        (
+            BoundWindowValue::Column {
+                index,
+                ty: column.ty.clone(),
+            },
+            column.ty.clone(),
+        )
+    } else {
+        let (bound, ty, col) = bind_projection_expr(&args.value, schema, udfs, node_budget)?;
+        match col {
+            Some(c) if is_int(&c) => (BoundWindowValue::Expr { bound, ty }, c),
+            _ => return Err(mismatch()),
+        }
+    };
+    Ok(BoundWindowOffsetArgs {
+        value,
+        offset: None,
+        default: None,
+        default_column: None,
+        default_pseudo_id: false,
+        result_type: Some(result_type),
+        uses_pseudo_id,
+    })
+}
+
 /// ウィンドウ `ORDER BY` の束縛済み 1 キー（キー参照・降順指定・NULL 位置。SQL-30・SQL-56）。
 #[derive(Debug, Clone, PartialEq)]
 pub(crate) struct BoundWindowOrderKey {
@@ -10338,7 +10402,8 @@ fn bind_window_item(
                 | WindowFunc::Lead
                 | WindowFunc::FirstValue
                 | WindowFunc::LastValue
-                | WindowFunc::NthValue => {
+                | WindowFunc::NthValue
+                | WindowFunc::Ntile => {
                     return Err(SqlSurfaceError::Internal {
                         detail: "offset window function unexpectedly carries an aggregate argument"
                             .to_string(),
@@ -10363,6 +10428,9 @@ fn bind_window_item(
     };
 
     let offset_args = match &item.offset_args {
+        Some(args) if item.func == WindowFunc::Ntile => {
+            Some(bind_ntile_args(args, schema, udfs, node_budget)?)
+        }
         Some(args) if item.func.takes_value_args() => {
             Some(bind_window_offset_args(args, schema, udfs, node_budget)?)
         }
