@@ -107,6 +107,7 @@ mod sql64_window_over_group_by;
 mod sql64_window_range_frame;
 mod sql64_window_rows_frame;
 mod sql65_function_arg_limits;
+mod sql65_lpad_rpad_split_part;
 mod sql65_md5;
 mod sql65_substring_position_syntax;
 mod sql65_trunc;
