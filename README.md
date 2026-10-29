@@ -130,7 +130,7 @@ cargo run -p fandhe-db-wire-server -- --users <ユーザーストアのパス> -
   [--max-regex-pattern-len <1-4096>] [--max-regex-input-len <1-4194304>] \
   [--max-regex-compiled-size <1-10485760>] \
   [--max-subquery-depth <1-4>] [--max-subquery-executions <1-16>] \
-  [--max-cte-definitions <1-16>] [--max-cte-nesting-depth <1-4>] \
+  [--max-cte-definitions <1-16>] [--max-cte-nesting-depth <1-4>] [--max-window-keys <1-8>] \
   [--max-join-relations <2-8>] [--max-join-input-rows <1-100000>] [--max-join-output-rows <1-100000>] \
   [--max-correlated-reevaluations <1-100000>] \
   [--max-recursive-cte-iterations <1-1000>] [--max-recursive-cte-rows <1-100000>] \
@@ -434,6 +434,12 @@ fail-closed で起動エラーです。上限を引き上げることはでき�
 （詳細: [docs/design/jsonpath-limits-cli.md](docs/design/jsonpath-limits-cli.md)）。
 
 `--max-regex-pattern-len <N>`（既定 4,096・範囲 `1`〜`4,096`）・`--max-regex-input-len <N>`（既定 4,194,304・範囲 `1`〜`4,194,304`）・`--max-regex-compiled-size <N>`（既定 10,485,760・範囲 `1`〜`10,485,760`）（Issue #1786・SQL-55）は、正規表現マッチャ（`engine::regex_match`）のパターン長（バイト）・入力長（バイト）・コンパイル後サイズの上限を、プロセス全体に対して起動時に**下げる方向だけ**設定します（未指定はハード上限と同じ値です）。超過時の SQLSTATE は `54000` です。マッチャは線形時間の `regex` クレートで実装し、後方参照・先読み等は `0A000`、構文誤りは `2201B` で拒否します。SQL 表層（`~`／`~*`・`SIMILAR TO`）への配線は後続 Issue（#1787・#1788）で、現時点でこれらの上限が効く SQL 構文はありません。範囲外・非数値・値欠落・2 回目以降の重複指定は fail-closed で起動エラーです（詳細: [docs/design/regex-limits-cli.md](docs/design/regex-limits-cli.md)・[docs/design/regex-matcher.md](docs/design/regex-matcher.md)）。
+
+`--max-window-keys <N>`（既定 8・範囲 `1`〜`8`）（Issue #1900・SQL-46・SQL-64）は、ウィンドウ項目の `PARTITION BY`／`ORDER BY` の
+キー数上限（両句で 1 つの値を共有）を、プロセス全体に対して起動時に**下げる方向だけ**設定します（未指定は現行の
+ハード上限 8 と同じ値で、挙動は変わりません）。設定値は構文解析段で判定し、超過時の SQLSTATE は従来と同じ `54000`
+です。範囲外・非数値・値欠落・2 回目以降の重複指定は fail-closed で起動エラーです
+（詳細: [docs/design/window-limits-cli.md](docs/design/window-limits-cli.md)）。
 
 `--max-subquery-depth <N>`（既定 4・範囲 `1`〜`4`）・`--max-subquery-executions <N>`（既定 16・範囲 `1`〜`16`）・
 `--max-cte-definitions <N>`（既定 16・範囲 `1`〜`16`）・`--max-cte-nesting-depth <N>`（既定 4・範囲 `1`〜`4`）
