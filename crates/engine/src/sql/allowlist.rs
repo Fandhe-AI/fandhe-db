@@ -34896,6 +34896,11 @@ mod tests {
             "SELECT lang, COUNT(*), rank() OVER (ORDER BY lang) FROM documents GROUP BY lang",
             "SELECT COUNT(*), COUNT(*) OVER () FROM documents",
             "SELECT lang, rank() OVER (ORDER BY lang) FROM documents GROUP BY lang LIMIT 1",
+            // Issue #1899: 窓の中の集計式は本文へ巻き上げて受理する。
+            "SELECT lang, rank() OVER (ORDER BY COUNT(*)) FROM documents GROUP BY lang",
+            // 式キーの途中にフレームキーワードと同名の識別子があってもフレーム開始と誤認しない。
+            "SELECT lang, rank() OVER (ORDER BY COUNT(*) + rows) FROM documents GROUP BY lang",
+            "SELECT lang, rank() OVER (ORDER BY COUNT(*) + rows ROWS BETWEEN UNBOUNDED PRECEDING AND CURRENT ROW) FROM documents GROUP BY lang",
         ] {
             match validate_sql(sql, &lookup).expect(sql) {
                 Statement::BufferedView(v) => {
@@ -34913,10 +34918,6 @@ mod tests {
             (
                 "SELECT DISTINCT lang, rank() OVER (ORDER BY lang) FROM documents GROUP BY lang",
                 "42601",
-            ),
-            (
-                "SELECT lang, rank() OVER (ORDER BY COUNT(*)) FROM documents GROUP BY lang",
-                "0A000",
             ),
             (
                 "SELECT lang, rank() OVER (ORDER BY lang) FROM documents GROUP BY lang WHERE 1 = 1",

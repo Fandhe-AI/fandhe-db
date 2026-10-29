@@ -225,17 +225,30 @@ fn window_over_grouped_rows_returns_group_level_rows_over_wire() {
     read_ready_for_query(&mut stream);
 }
 
-/// 窓の `ORDER BY` が集計式を参照する形は未対応（Issue #1899）で `0A000` の `ErrorResponse`。
+/// Issue #1899（SQL-64）: 窓の `ORDER BY` が集計式を参照する形も受理する。RowDescription は書いた
+/// とおりの列（巻き上げた隠し列を含まない 2 列）、順位は集計後の結果行（件数の多い順）に付く。
 #[test]
-fn window_over_grouped_rows_with_aggregate_in_window_is_rejected_over_wire() {
+fn window_over_grouped_rows_with_aggregate_in_window_over_wire() {
     let (core, _guard) = new_core_window_docs();
     let (mut stream, _users_path) = spawn_with_alice(core);
 
     send_simple_query(
         &mut stream,
-        "SELECT lang, rank() OVER (ORDER BY sum(score)) FROM docs GROUP BY lang",
+        "SELECT lang, rank() OVER (ORDER BY count(*) DESC) AS r FROM docs \
+         GROUP BY lang ORDER BY lang",
     );
-    expect_error_response_with_sqlstate(&mut stream, "0A000");
+    let columns = read_row_description(&mut stream);
+    assert_eq!(columns, vec!["lang", "r"]);
+
+    let mut rows: Vec<Vec<Option<String>>> = Vec::new();
+    for _ in 0..2 {
+        rows.push(read_data_row(&mut stream));
+    }
+    // ja は 2 行で 1 位、en は 1 行で 2 位。
+    let text =
+        |v: &[&str]| -> Vec<Option<String>> { v.iter().map(|s| Some((*s).to_string())).collect() };
+    assert_eq!(rows, vec![text(&["en", "2"]), text(&["ja", "1"])]);
+    assert_eq!(read_command_complete(&mut stream), "SELECT 2");
     read_ready_for_query(&mut stream);
 }
 

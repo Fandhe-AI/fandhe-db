@@ -535,7 +535,7 @@ ORDER BY なし・複数キーの `RANGE UNBOUNDED PRECEDING` 等も評価され
 - **上限**: 本文は呼び出し段の `ResultLimits` で実行し、グループ数が `--max-result-rows` を超えたら
   部分結果なしで `54000`。
 - **fail-closed（本 Issue では対象外）**: 窓の引数・`PARTITION BY`・`ORDER BY` の中の集計式
-  （`rank() OVER (ORDER BY sum(x))`。PostgreSQL は受理する形のため `0A000`。Issue #1899）、
+  （Issue #1899 で対応。下の追記節）、
   `$n`（`0A000`）、`ROLLUP`／`CUBE`／`GROUPING SETS`・`SELECT DISTINCT`・式の中の窓・スカラー
   サブクエリ項目（`42601`）、`WITH TIES`（`0A000`）、ビュー・CTE・派生表・JOIN・サブクエリ内での併用
   （従来どおり）、窓の別名による ORDER BY（未定義列）。ICU 照合列を持つ表は外側が順序に依存するため
@@ -555,3 +555,22 @@ ORDER BY なし・複数キーの `RANGE UNBOUNDED PRECEDING` 等も評価され
 - 対象外（`42601` のまま）: 値の部分クエリ併用、CTE・JOIN・集合演算、評価後射影形ビュー。ノードツリー表現は
   Phase 7 の EXPLAIN 拡張 Issue 群（#2045 ほか）が担い、本行はその WindowAgg ノードへ写像する前提。
 - 公開 API の変更なし・依存追加なし。
+
+## Issue #1899 追記: 窓の引数・PARTITION BY・ORDER BY の集計式（SQL-64 ポインタ）
+
+- **受理範囲**: `rank() OVER (ORDER BY sum(x))`・`sum(sum(x)) OVER ()`・`lag(sum(x)) OVER (...)`・
+  `OVER (PARTITION BY min(x) ...)` のように、窓の引数・`PARTITION BY`・`ORDER BY` に集計式を書ける。
+  `FILTER` 付き集計や `ASC`／`DESC`／`NULLS FIRST|LAST` 修飾子、`sum(x) + 1` のような式キーも同様。
+- **方式（巻き上げ）**: 窓項目の構文解析の前に、集計呼び出しを含むセグメント（引数 1 個分・キー 1 個の式部分）
+  全体を本文の隠し項目 `<式> AS \u{1}gwagg<j>` として積み、窓側のトークンは同名の識別子 1 トークンへ置き換える。
+  窓キーが識別子しか受理しないため、呼び出し部分だけでなくセグメント単位で置換する。同一のトークン列は
+  1 つの隠し列へ重複排除する。隠し列は `column_aliases` で外側の束縛にだけ渡り、結果へは漏れない。
+- **暗黙の単一グループ**: `GROUP BY` も非窓の集計も無くても、窓の内側に集計があれば集計 SELECT
+  （1 グループ・1 行）として扱う（PostgreSQL と同じ）。非グループ化列の射影は本文が `42803`。
+  この形では従来どおり `ORDER BY`／`LIMIT` は受理しない。
+- **境界の SQLSTATE**: 入れ子集計・窓呼び出しを含む集計・非グループ化列を含む集計式は `42803`、
+  窓の別名参照は `42703`、`FILTER` 内・フレームオフセット内の集計は既存の先読み検査の `42803`。
+  構造を読み取れない形は `0A000`（fail-closed）。
+- **制約**: 本文の集計項目数は `MAX_AGGREGATE_ITEMS`（PostgreSQL には無い上限）が掛かり超過は `54000`。
+  比較式などの真偽値を返す集計式（`PARTITION BY count(*) > 1`）は本文の SELECT 項目として未対応のため拒否される。
+  PostgreSQL 実機での照合は未実施（期待値は意味論から導出）。
