@@ -10391,7 +10391,11 @@ fn bind_window_item(
                 WindowFunc::Max => AggregateFunc::Max,
                 // 構文層（`Parser::parse_window_item`）が順位関数に引数を
                 // 持たせないため到達しない（防御的に内部バグとして扱う）。
-                WindowFunc::RowNumber | WindowFunc::Rank | WindowFunc::DenseRank => {
+                WindowFunc::RowNumber
+                | WindowFunc::Rank
+                | WindowFunc::DenseRank
+                | WindowFunc::PercentRank
+                | WindowFunc::CumeDist => {
                     return Err(SqlSurfaceError::Internal {
                         detail: "ranking window function unexpectedly carries an argument"
                             .to_string(),

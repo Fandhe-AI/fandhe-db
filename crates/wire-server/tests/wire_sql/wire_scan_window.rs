@@ -110,6 +110,49 @@ fn row_number_over_wire_returns_expected_rows() {
     read_ready_for_query(&mut stream);
 }
 
+/// `percent_rank()`／`cume_dist()`（SQL-64・Issue #1885）は float8（OID 701）で、テキスト表現は
+/// PostgreSQL の float8 出力形式（`1` と `0.5`）になる。
+#[test]
+fn percent_rank_cume_dist_over_wire_use_float8() {
+    let (core, _guard) = new_core_window_docs();
+    let (mut stream, _users_path) = spawn_with_alice(core);
+
+    send_simple_query(
+        &mut stream,
+        "SELECT id, percent_rank() OVER (ORDER BY id), cume_dist() OVER (ORDER BY id) \
+         FROM docs LIMIT 10",
+    );
+    let columns = read_row_description_with_oids(&mut stream);
+    assert_eq!(
+        columns.iter().map(|(n, _)| n.as_str()).collect::<Vec<_>>(),
+        vec!["id", "percent_rank", "cume_dist"]
+    );
+    assert_eq!(columns.get(1).map(|(_, oid)| *oid), Some(701));
+    assert_eq!(columns.get(2).map(|(_, oid)| *oid), Some(701));
+
+    let mut rows: Vec<(String, String, String)> = Vec::new();
+    for _ in 0..3 {
+        let row = read_data_row(&mut stream);
+        rows.push((
+            row[0].clone().expect("id must not be NULL"),
+            row[1].clone().expect("percent_rank must not be NULL"),
+            row[2].clone().expect("cume_dist must not be NULL"),
+        ));
+    }
+    rows.sort();
+    let owned = |a: &str, b: &str, c: &str| (a.to_string(), b.to_string(), c.to_string());
+    assert_eq!(
+        rows,
+        vec![
+            owned("1", "0", "0.3333333333333333"),
+            owned("2", "0.5", "0.6666666666666666"),
+            owned("3", "1", "1"),
+        ]
+    );
+    assert_eq!(read_command_complete(&mut stream), "SELECT 3");
+    read_ready_for_query(&mut stream);
+}
+
 /// `GROUP BY` とウィンドウ項目の併用は `42601` の `ErrorResponse` になる。
 #[test]
 fn window_combined_with_group_by_is_rejected_over_wire() {
