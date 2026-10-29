@@ -727,7 +727,7 @@ fn check_range_bound(
 /// 項目ごとのフレームを実行開始時に解決する（`execute_window_scan_with_caps` と
 /// [`CellWindowEvaluator::new`] が行を引く前に 1 回呼ぶ。PostgreSQL がプラン時・WindowAgg 開始時に
 /// オフセットを評価するのと同じ位置で、0 行・`WHERE` 不一致でもエラーを返す）。
-/// 評価エラー（`22012`・`22003` 等）は関数種別を問わず返す。NULL／`ROWS`・`GROUPS` の負の検査は集計と
+/// 評価エラー（`22012`・`22003` 等）は `ntile`（フレーム式を評価しない）以外の関数種別で返す。NULL／`ROWS`・`GROUPS` の負の検査は集計と
 /// `LAG`／`LEAD` だけが行う（順位関数は PostgreSQL 16 以降フレームを最適化で置き換えるため
 /// 検査しない）。`RANGE` の負・NaN は検査を遅延する（集計と、オフセット付きの `LAG`／`LEAD` が
 /// 境界計算時に行う）。戻り値を保持するのは集計（と `RANGE` オフセット付きの `LAG`／`LEAD`）で、
@@ -738,6 +738,12 @@ fn resolve_frames(
     let mut scratch: Vec<StackValue> = Vec::new();
     let mut evaluated: Vec<Option<EvaluatedFrame>> = Vec::with_capacity(items.len());
     for item in items {
+        // `ntile` はフレームを無視し、オフセット式も評価・検査しない（Issue #1884。
+        // `ROWS BETWEEN (1 / 0) PRECEDING ...` でも `22012` を返さない）。
+        if item.func == WindowFunc::Ntile {
+            evaluated.push(None);
+            continue;
+        }
         evaluated.push(match &item.frame {
             None => None,
             Some(frame) => match frame.mode {

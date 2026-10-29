@@ -298,6 +298,20 @@ fn frame_clause_is_ignored() {
     }
 }
 
+/// フレームのオフセット式は評価も検査もされない（`22012` 等を返さない）。
+#[test]
+fn frame_offset_expression_is_not_evaluated() {
+    let (core, ctx, _g) = setup("nt-frame-offset", true);
+    let expected = strs(&["1", "1", "1", "2", "2"]);
+    for over in [
+        "ORDER BY id ROWS BETWEEN (1 / 0) PRECEDING AND CURRENT ROW",
+        "ORDER BY id GROUPS BETWEEN CURRENT ROW AND (1 / 0) FOLLOWING",
+        "ORDER BY id ROWS BETWEEN -1 PRECEDING AND CURRENT ROW",
+    ] {
+        assert_eq!(win(&core, &ctx, "ntile(2)", over), expected, "over={over}");
+    }
+}
+
 /// 他のウィンドウ関数と同じ SELECT に混在させても独立に評価される。
 #[test]
 fn mixed_with_other_window_functions() {
