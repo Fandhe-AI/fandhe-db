@@ -104,5 +104,6 @@ mod sql64_window_filter;
 mod sql64_window_groups_frame;
 mod sql64_window_range_frame;
 mod sql64_window_rows_frame;
+mod sql65_function_arg_limits;
 mod sql78_predicate_dml_noneq_between_params;
 mod sql78_where_noneq_between_params;
