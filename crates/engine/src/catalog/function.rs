@@ -768,6 +768,13 @@ impl Storage {
         let write_txn = self
             .begin_write_txn()
             .map_err(super::convert_storage_error)?;
+        // SCHEMA 配下形のキーは、挿入と同じ write txn で当該テナントの SCHEMA の現存を確認する
+        // （名前解決後の `DROP SCHEMA` との競合で孤児定義を作らない。Issue #1920）。
+        super::namespace::ensure_tenant_key_schema_alive_in_txn(
+            &*write_txn,
+            scope,
+            &stored.function_key,
+        )?;
         // 同じ名前の定義が 1 件でもあれば、シグネチャが違っても既存扱いにする（`UdfRegistry` は
         // 名前単位で多重定義を持てず、書けても読めない永続状態を作らないため。設計記録 §書き込み経路）。
         if !list_in_txn(&*write_txn, scope, Some(&stored.function_key))?.is_empty() {
@@ -1442,30 +1449,41 @@ mod tests {
     #[test]
     fn schema_prefix_helpers_are_scoped() {
         let (s, _g) = tmp_storage("fn-prefix");
-        s.create_function("t", &def("#1.f", vec![]))
+        // 関数は生存する SCHEMA 配下にしか作れない（Issue #1920）ため実 SCHEMA を作る。
+        s.create_schema("t", "a", false).expect("a");
+        s.create_schema("t", "b", false).expect("b");
+        s.create_schema("u", "a", false).expect("u a");
+        let id = |t: &str, n: &str| s.schema_id(t, n).expect("id").expect("exists");
+        let (ta, tb, ua) = (id("t", "a"), id("t", "b"), id("u", "a"));
+        let key = |i: u64| format!("#{i}.f");
+        let prefix = |i: u64| format!("#{i}.");
+        s.create_function("t", &def(&key(ta), vec![]))
             .expect("in schema");
-        s.create_function("t", &def("#12.f", vec![]))
-            .expect("longer id");
+        s.create_function("t", &def(&key(tb), vec![]))
+            .expect("other schema");
         s.create_function("t", &def("plain", vec![]))
             .expect("public");
-        s.create_function("u", &def("#1.f", vec![]))
+        s.create_function("u", &def(&key(ua), vec![]))
             .expect("other tenant");
         {
             let rt = s.db().begin_read().expect("read");
-            assert!(functions_in_schema_exist_in_txn(&rt, "t", "#1.").expect("exist"));
-            assert!(!functions_in_schema_exist_in_txn(&rt, "t", "#2.").expect("none"));
-            assert!(!functions_in_schema_exist_in_txn(&rt, "v", "#1.").expect("tenant"));
+            assert!(functions_in_schema_exist_in_txn(&rt, "t", &prefix(ta)).expect("exist"));
+            assert!(!functions_in_schema_exist_in_txn(&rt, "t", "#999.").expect("none"));
+            assert!(!functions_in_schema_exist_in_txn(&rt, "v", &prefix(ta)).expect("tenant"));
         }
         let w = s.begin_write_txn().expect("w");
-        remove_functions_with_prefix_in_txn(&w, "t", "#1.").expect("remove");
+        remove_functions_with_prefix_in_txn(&w, "t", &prefix(ta)).expect("remove");
         crate::recovery::commit_boundary::commit(w).expect("commit");
-        let keys: Vec<String> = s
+        let mut keys: Vec<String> = s
             .list_functions("t")
             .expect("list")
             .into_iter()
             .map(|d| d.function_key)
             .collect();
-        assert_eq!(keys, vec!["#12.f".to_string(), "plain".to_string()]);
+        keys.sort();
+        let mut want = vec![key(tb), "plain".to_string()];
+        want.sort();
+        assert_eq!(keys, want);
         assert_eq!(s.list_functions("u").expect("u").len(), 1);
     }
 
@@ -1586,5 +1604,35 @@ mod tests {
         };
         assert!(bad.to_column_type().is_err());
         assert!(arg_signature(&[param(None, Some(bad))]).is_err());
+    }
+
+    /// 削除済み SCHEMA・他テナントの SCHEMA の ID 配下には関数を作れず、生存する自テナントの
+    /// SCHEMA 配下には作れる（名前解決後の `DROP SCHEMA` との競合・準備済み CREATE の再実行。Issue #1920）。
+    #[test]
+    fn create_function_requires_live_tenant_schema() {
+        use crate::catalog::namespace::RelationKey;
+        let (s, _g) = tmp_storage("fn-schema-alive");
+        s.create_schema("alice", "a", false).expect("schema");
+        let id = s.schema_id("alice", "a").expect("id").expect("exists");
+        let key = RelationKey::InSchema {
+            schema_id: id,
+            name: "f".to_string(),
+        }
+        .encode();
+        // 他テナントからは拒否（存在情報を区別しない）。
+        assert!(matches!(
+            s.create_function("bob", &def(&key, vec![])),
+            Err(CatalogError::TableNotFound(_))
+        ));
+        s.create_function("alice", &def(&key, vec![]))
+            .expect("live schema accepts");
+        s.drop_function_by_name("alice", &key).expect("drop fn");
+        s.drop_schema("alice", "a", false).expect("drop schema");
+        // DROP SCHEMA 後の CREATE（競合・準備済み文の再実行）は拒否され、何も残らない。
+        assert!(matches!(
+            s.create_function("alice", &def(&key, vec![])),
+            Err(CatalogError::TableNotFound(_))
+        ));
+        assert!(s.list_functions("alice").expect("list").is_empty());
     }
 }

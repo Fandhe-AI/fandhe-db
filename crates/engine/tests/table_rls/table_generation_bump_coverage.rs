@@ -518,13 +518,13 @@ const ALLOWLIST: &[(&str, u32)] = &[
     // `drop_schema_cascade` の `commit_and_finish`（615）は、表の削除を `drop_tables_collecting_sequences`
     // （各表の `bump_table_generation_in_txn` を同一 txn で呼ぶ）へ委譲しており、SCHEMA 行の削除自体は
     // 世代を持たないため、直前に bump を直接呼ばない（同じ txn・同じ commit で世代は進む）。
-    ("catalog/namespace.rs", 487),
-    ("catalog/namespace.rs", 525),
-    ("catalog/namespace.rs", 615),
-    ("catalog/namespace.rs", 656),
+    ("catalog/namespace.rs", 517),
+    ("catalog/namespace.rs", 555),
+    ("catalog/namespace.rs", 645),
+    ("catalog/namespace.rs", 686),
     // Issue #1716: `rename_schema` も `schemas` の 1 行付け替えだけで、行ストア・世代を変えない。
-    ("catalog/namespace.rs", 912),
-    ("catalog/namespace.rs", 1028),
+    ("catalog/namespace.rs", 942),
+    ("catalog/namespace.rs", 1058),
     // Issue #1645（所有 SEQUENCE の定義 blob 版 3・`commit_and_finish` 経路の追加）と base 取り込みで行が移動したため
     // 全件を現行行へ追随（commit 対象は SEQUENCE 定義・状態表のみで同じ理由により対象外）。
     // Issue #1694（SERIAL の暗黙 SEQUENCE・所有 SEQUENCE の削除と追従）の追加で行番号が移動したための追随
@@ -551,13 +551,13 @@ const ALLOWLIST: &[(&str, u32)] = &[
     // UDF 定義は専用の関数カタログ表のみを書き、`CATALOG_TABLE`／`user_rows/{table_name}`
     // のいずれにも触れない（行を持たない定義メタデータのため、世代照合の対象テーブルが
     // 存在せずバンプ対象がない）。
-    ("catalog/function.rs", 785),
-    ("catalog/function.rs", 842),
-    ("catalog/function.rs", 871),
-    ("catalog/function.rs", 902),
+    ("catalog/function.rs", 792),
+    ("catalog/function.rs", 849),
+    ("catalog/function.rs", 878),
+    ("catalog/function.rs", 909),
     // Issue #1920: 上の `#[cfg(test)]` 内のテスト補助（多重定義・SCHEMA 接頭辞削除の状態を直接作る）。
-    ("catalog/function.rs", 1347),
-    ("catalog/function.rs", 1461),
+    ("catalog/function.rs", 1354),
+    ("catalog/function.rs", 1476),
     // Issue #1689（ALTER SEQUENCE）: `alter_sequence`／`rename_sequence`（803・842）も同じ表だけを書く
     // （定義 blob の上書き・キーの付け替え・状態行の削除）ため同じ理由で対象外。
     // Issue #1733（INSERT ... SELECT）: `core/insert_select_exec.rs` の 995・1127 行（Issue #2613・#2614・#2615・#2212 で追随）は `#[cfg(test)]` 内の

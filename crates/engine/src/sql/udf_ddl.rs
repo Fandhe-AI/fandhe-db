@@ -157,6 +157,10 @@ fn map_function_error(e: CatalogError) -> SqlSurfaceError {
         CatalogError::ViewLimitExceeded(_) => {
             SqlSurfaceError::payload_too_large("too many functions")
         }
+        // 名前解決後に SCHEMA が削除された（または他テナントの ID）。存在情報を出さない固定文言。
+        CatalogError::TableNotFound(_) => {
+            SqlSurfaceError::undefined_function("function schema does not exist")
+        }
         CatalogError::WriteLockTimeout => SqlSurfaceError::LockNotAvailable,
         _ => SqlSurfaceError::Internal {
             detail: "function catalog operation failed".to_string(),

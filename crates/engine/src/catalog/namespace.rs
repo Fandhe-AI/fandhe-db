@@ -231,6 +231,36 @@ pub(crate) fn schema_id_in_txn<R: ReadSource>(
     }
 }
 
+/// 関数キー等の relation キー `key` が SCHEMA 配下形（`#<id>.<name>`）なら、その SCHEMA が
+/// **`tenant_id` のもの**として write txn の時点で生存していることを確認する（Issue #1920。
+/// `CREATE FUNCTION s.f` の名前解決後に別セッションが `DROP SCHEMA s` を完了しても、削除済み ID 配下に
+/// 関数が永続化されないよう、挿入と同じ txn で検査する）。`public` の裸の名前は常に生存扱い。不在
+/// （他テナントの SCHEMA を含む）は区別なく `TableNotFound`（fail-closed）。
+pub(crate) fn ensure_tenant_key_schema_alive_in_txn<R: ReadSource>(
+    src: &R,
+    tenant_id: &str,
+    key: &str,
+) -> Result<()> {
+    let RelationKey::InSchema { schema_id, .. } = RelationKey::parse(key)? else {
+        return Ok(());
+    };
+    let table = match src.open_table(SCHEMAS_TABLE) {
+        Ok(t) => t,
+        Err(redb::TableError::TableDoesNotExist(_)) => {
+            return Err(CatalogError::TableNotFound(String::new()))
+        }
+        Err(e) => return Err(e.into()),
+    };
+    for entry in table.iter()? {
+        let (k, v) = entry?;
+        if k.value().0 == tenant_id && decode_schema_def(v.value()).is_ok_and(|id| id == schema_id)
+        {
+            return Ok(());
+        }
+    }
+    Err(CatalogError::TableNotFound(String::new()))
+}
+
 /// relation キー `key` が SCHEMA 配下形（`#<id>.<name>`）なら、その SCHEMA が write txn の時点で
 /// 生存していることを確認する（Issue #1717。拡張クエリで Parse 後に `DROP SCHEMA` されると、
 /// Bind 済みの内部キーが削除済み ID を指したまま作成できてしまうため。作成と同じ txn で検査して
