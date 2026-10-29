@@ -180,6 +180,11 @@
   wire-server に値なしスイッチ `--require-where-for-dml` を追加した。明示した述語・NoSQL 表層・`TRUNCATE` は対象外。
   詳細は [require-where-for-dml-cli.md](docs/design/require-where-for-dml-cli.md)。
 
+- `greatest(v1, ..., vn)`／`least(v1, ..., vn)` を追加した（Issue #1909・SQL-65）。NULL 引数は無視し、全引数が NULL の行は NULL。
+  引数の型は `CASE`／`COALESCE` と同じ規則で統一し（統一できなければ `42804`）、引数は 100 個まで（超過は `54023`）。
+  数値・TEXT（バイト順）・DATE・TIMESTAMP・TIME・TIMESTAMPTZ を比較でき、それ以外の型は `0A000`（vector は `42883`）。
+  挙動変更: 2 名が組み込みの予約名になり、同名の `CREATE FUNCTION` は `42723`。
+
 ### Changed
 
 - 拡張クエリの Execute の `max_rows` 分割で、完了タグの件数を累計からその回の件数に変え、`max_rows` ちょうどで
@@ -190,6 +195,8 @@
 
 ### Breaking Changes
 
+- `sql::udf_call::BoundExpr`（Issue #1909・SQL-65）: variant `MinMax { op, args }` と公開型 `MinMaxOp` を追加した。
+  網羅 `match` する外部コードは腕を足す。
 - `ln`／`log` の定義域外を `2201E` で拒否する（Issue #1907・SQL-65）。公開型の変更として `SqlSurfaceError::InvalidArgumentForLogarithm`・
   `ErrorClass::InvalidArgumentForLogarithm`・`ArenaError::InvalidArgumentForLogarithm` を追加した（HTTP 射影は 400）。
 - `sql::udf_call::BuiltinFn`（Issue #1904・SQL-65）: variant を追加した（`Lpad2`／`Lpad3`／`Rpad2`／`Rpad3`／`SplitPart`）。
