@@ -174,6 +174,11 @@ fn substring_rejects_regex_form_and_bad_shapes() {
     assert_eq!(c("substring(label SIMILAR 'a%' ESCAPE '#')"), "0A000");
     assert_eq!(c("substring(label)"), "42883");
     assert_eq!(c("substring(label, 1, 2, 3)"), "42883");
+    // カンマ形の引数上限は通常の関数呼び出しと同じ 100（54023）。上限以内は個数不一致 42883。
+    let many = |n: usize| format!("substring(label{})", ", 1".repeat(n - 1));
+    assert_eq!(c(&many(33)), "42883");
+    assert_eq!(c(&many(100)), "42883");
+    assert_eq!(c(&many(101)), "54023");
     assert_eq!(c("substring(label FROM)"), "42601");
     assert_eq!(c("substring(label FOR)"), "42601");
 }

@@ -11292,10 +11292,12 @@ impl<'a> Parser<'a> {
             Some(Token::Punct(',')) => {
                 while matches!(self.peek(), Some(Token::Punct(','))) {
                     self.advance();
-                    if args.len() >= MAX_CALL_ARGS {
-                        return Err(SqlSurfaceError::payload_too_large(
-                            "too many call arguments",
-                        ));
+                    // 通常の関数呼び出しと同じ上限・エラー（54023）を使う。上限以内の
+                    // 個数不一致は bind_substr が 42883 として判定する。
+                    if args.len() >= MAX_FUNCTION_CALL_ARGS {
+                        return Err(SqlSurfaceError::TooManyArguments {
+                            detail: crate::sql::udf_call::TOO_MANY_FUNCTION_ARGS_DETAIL,
+                        });
                     }
                     args.push(self.parse_value_expr_with_null_context(depth + 1, null_ctx)?);
                 }
