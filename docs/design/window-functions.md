@@ -383,3 +383,29 @@ ORDER BY なし・複数キーの `RANGE UNBOUNDED PRECEDING` 等も評価され
   （#1887 から継続）。(2) 整数リテラル `2^53` 超は `22003`（#1889 から継続）。(3) 識別子を含むオフセットは
   一律 `42P10`（存在情報の秘匿）。
 - **対象外**: first_value／last_value／nth_value（#1882／#1883）・逆遷移やセグメント木による移動集計の高速化。
+
+## Issue #1883 追記: first_value／last_value／nth_value（SQL-64 (3) ポインタ）
+
+`first_value(v)`／`last_value(v)`／`nth_value(v, n)` を PostgreSQL 17 の意味論で評価する。親 #1882。
+`LAG`／`LEAD` と同じ引数経路（`offset_args`。`nth_value` の `n` はオフセット欄）で値を運び、
+フレームの評価は集計と境界関数を共有する。
+
+- **フレーム**: 既定は `RANGE BETWEEN UNBOUNDED PRECEDING AND CURRENT ROW`。`ORDER BY` があれば
+  現在行の peer グループ末尾まで（`last_value` は現在行でなく peer の最後の行の値）、無ければ
+  パーティション全体。明示の `ROWS`／`RANGE`／`GROUPS` と `EXCLUDE` も評価する
+  （`rows_frame_bounds`／`range_frame_bounds`／`groups_frame_bounds` を再利用。オフセットの検査時点も集計と同じ）。
+- **位置の求め方**: `pick_in_frame` が、フレームから除外区間を引いた高々 3 区間の上で先頭・末尾・n 番目を
+  O(1) に求める（フレームの幅に比例した走査をしない）。空フレーム・序数超過は NULL。
+- **引数**: `first_value`／`last_value` は 1 個、`nth_value` は 2 個（誤りは `42883`）。`n` は現在行で行ごとに
+  評価し、NULL は NULL、0 以下は新 `ErrorClass::InvalidArgumentForNthValue`（`22016`。固定文言。
+  行の評価時に判定するため 0 行では出ない）、整数以外は `42804`、`int4` 範囲外は `22003`。
+  `DISTINCT`・`*`・`$n` は `42601`、入れ子のウィンドウ関数は `42P20`、集計は `42803`、運べない型
+  （VECTOR・配列・BYTEA・JSON）は `0A000`（`LAG`／`LEAD` と同じ分類）。
+- **遅延エラー**: 値の評価エラー（`22xxx`）は参照された行のときだけ返す。
+- **RLS**: 母集合は materialize 段を通った行のみ（RLS-10 ポインタ）。他テナントの Private 行・`WHERE` で
+  除いた行は対象にならない。ビューの列スコープ検査は引数全体に及ぶ。
+- **破壊的変更**: 公開 enum `ErrorClass`・`SqlSurfaceError` に `22016` の分類を追加した（網羅 enum）。
+- **既知の差異**: (1) 同順位行の並びは PostgreSQL では不定だが、本実装は `ORDER BY`→`id`→`seq` で決まる。
+  (2) `bigint` 型の `n` を受理する（`LAG` のオフセットと同じ既存の差異）。(3) 運べない型は `0A000`。
+  PostgreSQL への実測は未実施で、テストの期待値は意味論から導いた。
+- **対象外**: `IGNORE NULLS`／`RESPECT NULLS`（PostgreSQL 17 も未対応）、名前付きウィンドウ（#1892）。

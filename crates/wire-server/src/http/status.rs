@@ -115,6 +115,8 @@ pub const fn http_status(class: ErrorClass) -> u16 {
         | ErrorClass::WindowingError
         // Issue #1889・SQL-64: フレーム句オフセットが負（`22013`）も入力起因で 400。
         | ErrorClass::InvalidPrecedingOrFollowingSize
+        // Issue #1883・SQL-64: `nth_value` の第 2 引数が 0 以下（`22016`）も入力起因で 400。
+        | ErrorClass::InvalidArgumentForNthValue
         // Issue #1821・SQL-59: グルーピングセットの上限超過（`54001`・`54011`）も入力起因で 400。
         | ErrorClass::StatementTooComplex
         | ErrorClass::TooManyColumns
@@ -226,7 +228,7 @@ mod tests {
 
     /// 期待表を明示的に列挙し、`ErrorClass::ALL` との突き合わせで非 vacuous に検証する。
     /// `match` にアームを足したが期待表の更新を忘れた、という乖離を (a)(b) が検出する。
-    const EXPECTED: [(ErrorClass, u16); 87] = [
+    const EXPECTED: [(ErrorClass, u16); 88] = [
         (ErrorClass::InvalidInput, 400),
         (ErrorClass::StringDataRightTruncation, 400),
         (ErrorClass::AuthInvalid, 401),
@@ -293,6 +295,7 @@ mod tests {
         (ErrorClass::GroupingError, 400),
         (ErrorClass::WindowingError, 400),
         (ErrorClass::InvalidPrecedingOrFollowingSize, 400),
+        (ErrorClass::InvalidArgumentForNthValue, 400),
         (ErrorClass::StatementTooComplex, 400),
         (ErrorClass::TooManyColumns, 400),
         (ErrorClass::TooManyArguments, 400),

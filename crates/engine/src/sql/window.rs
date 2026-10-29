@@ -70,6 +70,13 @@
 //! オフセットは peer グループ数で、境界は [`groups_frame_bounds`] が前進のみの 2 本のカーソル
 //! （[`GroupCursor`]）で求める。グループ境界の配列は確保しないため状態予算は変わらない。
 //!
+//! `first_value`／`last_value`／`nth_value`（SQL-64 (3)・Issue #1883）は、`LAG`／`LEAD` と同じ
+//! 引数経路（[`OffsetRowValues`]。`nth_value` の `n` はオフセット欄）で参照先の値を集め、評価段
+//! （[`evaluate_value_frame_partition`]）が行ごとのフレーム（既定は `RANGE BETWEEN UNBOUNDED
+//! PRECEDING AND CURRENT ROW`。明示の `ROWS`／`RANGE`／`GROUPS`・`EXCLUDE` も評価する）から
+//! `EXCLUDE` 対象を除いた先頭・末尾・n 番目の行を [`pick_in_frame`] で O(1) に引く。境界の計算は
+//! 集計と同じ [`rows_frame_bounds`]／[`groups_frame_bounds`]／[`range_frame_bounds`] を再利用する。
+//!
 //! 対象外（`42601`／`54000`／`0A000` で fail-closed に拒否。allowlist・parser 側で既に拒否
 //! 済みの形も含む）:
 //! 名前付きウィンドウ・`FILTER (...)`・関数内 `DISTINCT`・複合式の引数・
@@ -1424,7 +1431,7 @@ impl<'a> CellWindowEvaluator<'a> {
                         .any(|ty| !crate::sql::join::values::cell_scalar_supports(ty))
                 {
                     return Err(SqlSurfaceError::FeatureNotSupported {
-                        detail: "LAG/LEAD over TIME, TIMESTAMPTZ or INTERVAL columns of a buffered view is not supported"
+                        detail: "window value functions over TIME, TIMESTAMPTZ or INTERVAL columns of a buffered view are not supported"
                             .to_string(),
                     });
                 }
@@ -2138,6 +2145,185 @@ fn evaluate_offset_partition(
     Ok(())
 }
 
+/// フレーム内から引く位置の種別（[`pick_in_frame`]）。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum FramePick {
+    First,
+    Last,
+    /// 0 始まりの序数（`nth_value(v, n)` の `n - 1`）。
+    Nth(usize),
+}
+
+/// フレーム `[start, end)` から除外区間 `excluded`（半開区間。フレームの外にあってもよい）を除いた
+/// 行の中で、`pick` が指す位置を返す（無ければ `None`＝空フレーム・序数超過）。除外は高々 2 区間
+/// （`EXCLUDE TIES`）で、残りは高々 3 区間なので固定長配列と飽和演算だけで O(1) に求める。
+fn pick_in_frame(
+    start: usize,
+    end: usize,
+    excluded: &[(usize, usize)],
+    pick: FramePick,
+) -> Option<usize> {
+    const MAX_PIECES: usize = 4;
+    let mut pieces = [(0usize, 0usize); MAX_PIECES];
+    let mut count = 0usize;
+    if start < end {
+        pieces[0] = (start, end);
+        count = 1;
+    }
+    for &(ex_start, ex_end) in excluded {
+        if ex_start >= ex_end {
+            continue;
+        }
+        let mut next = [(0usize, 0usize); MAX_PIECES];
+        let mut next_count = 0usize;
+        for &(a, b) in pieces.iter().take(count) {
+            for (lo, hi) in [(a, b.min(ex_start)), (a.max(ex_end), b)] {
+                if lo < hi && next_count < MAX_PIECES {
+                    next[next_count] = (lo, hi);
+                    next_count += 1;
+                }
+            }
+        }
+        pieces = next;
+        count = next_count;
+    }
+    let live = pieces.get(..count)?;
+    match pick {
+        FramePick::First => live.first().map(|&(lo, _)| lo),
+        FramePick::Last => live.last().map(|&(_, hi)| hi.saturating_sub(1)),
+        FramePick::Nth(k) => {
+            let mut k = k;
+            for &(lo, hi) in live {
+                let len = hi.saturating_sub(lo);
+                if k < len {
+                    return Some(lo.saturating_add(k));
+                }
+                k -= len;
+            }
+            None
+        }
+    }
+}
+
+/// `first_value`／`last_value`／`nth_value` の 1 パーティション分の評価（SQL-64 (3)・Issue #1883。
+/// [`evaluate_partition`] から呼ばれる）。行ごとにフレーム（`frame` が `None` なら既定の
+/// `RANGE BETWEEN UNBOUNDED PRECEDING AND CURRENT ROW`＝先頭から現在行の peer グループ末尾まで）を
+/// 求め、`EXCLUDE` 対象を除いた先頭・末尾・n 番目の行の値（materialize 段が集めた
+/// [`OffsetRowValues::value`]）を返す。空フレーム・序数超過は NULL。`nth_value` の `n` は現在行で
+/// 評価した値で、NULL なら NULL、0 以下なら `22016`（行ごとに判定するため 0 行では出ない）。
+/// 値の評価エラー（`22xxx`）は参照された行のときだけ返す。母集合は materialize 段を通った行のみで、
+/// 不可視行・他テナントの Private 行は参照先にならない。
+fn evaluate_value_frame_partition(
+    part: &SortedPartition<'_>,
+    frame: Option<&ResolvedFrame>,
+    out: &mut [Option<Cell>],
+    state_bytes: &mut usize,
+    state_cap: usize,
+) -> Result<(), SqlSurfaceError> {
+    let item = part.item;
+    let item_index = part.item_index;
+    let len = part.len();
+    let values_of = |row_idx: usize| -> Result<&OffsetRowValues, SqlSurfaceError> {
+        part.materialized
+            .get(row_idx)
+            .and_then(|r| r.offset_values.get(item_index))
+            .and_then(|v| v.as_ref())
+            .ok_or_else(|| window_bug("value window values missing for a row"))
+    };
+    let non_null = match frame {
+        Some(ResolvedFrame::Range(range)) if range.offsets().next().is_some() => {
+            non_null_region(part)?
+        }
+        _ => (0, 0),
+    };
+    let mut head = GroupCursor::new(part)?;
+    let mut tail = GroupCursor::new(part)?;
+
+    for (c, group) in part.peer_groups().enumerate() {
+        let (g_start, g_end) = group?;
+        let (mut start, mut end, exclusion) = match frame {
+            None => (0, g_end, WindowFrameExclusion::NoOthers),
+            Some(ResolvedFrame::Rows(_)) | Some(ResolvedFrame::Range(_)) => {
+                (0, 0, WindowFrameExclusion::NoOthers)
+            }
+            Some(ResolvedFrame::Groups(f)) => {
+                let (s, e) =
+                    groups_frame_bounds(part, c, (g_start, g_end), f, &mut head, &mut tail)?;
+                (s, e, f.exclusion)
+            }
+        };
+        for pos in g_start..g_end {
+            crate::interrupt::check()?;
+            let mut exclusion = exclusion;
+            match frame {
+                Some(ResolvedFrame::Rows(f)) => {
+                    (start, end) = rows_frame_bounds(pos, len, f);
+                    exclusion = f.exclusion;
+                }
+                Some(ResolvedFrame::Range(f)) => {
+                    (start, end) = range_frame_bounds(part, non_null, pos, (g_start, g_end), f)?;
+                    exclusion = f.exclusion;
+                }
+                _ => {}
+            }
+            let row_idx = part.row_index(pos)?;
+            let current = values_of(row_idx)?;
+            let pick = match item.func {
+                WindowFunc::FirstValue => Some(FramePick::First),
+                WindowFunc::LastValue => Some(FramePick::Last),
+                WindowFunc::NthValue => match current.offset {
+                    None => None,
+                    Some(n) if n <= 0 => {
+                        return Err(SqlSurfaceError::InvalidArgumentForNthValue {
+                            detail: "argument of nth_value must be greater than zero",
+                        });
+                    }
+                    Some(n) => {
+                        let k = usize::try_from(n.saturating_sub(1)).unwrap_or(usize::MAX);
+                        Some(FramePick::Nth(k))
+                    }
+                },
+                _ => {
+                    return Err(window_bug(
+                        "non value-frame function reached the value frame",
+                    ))
+                }
+            };
+            let excluded: [(usize, usize); 2] = match exclusion {
+                WindowFrameExclusion::NoOthers => [(0, 0), (0, 0)],
+                WindowFrameExclusion::CurrentRow => [(pos, pos.saturating_add(1)), (0, 0)],
+                WindowFrameExclusion::Group => [(g_start, g_end), (0, 0)],
+                WindowFrameExclusion::Ties => [(g_start, pos), (pos.saturating_add(1), g_end)],
+            };
+            let target = pick.and_then(|p| pick_in_frame(start, end, &excluded, p));
+            let cell = match target {
+                None => Cell::Null,
+                Some(target_pos) => {
+                    let target_row = part.row_index(target_pos)?;
+                    let cell = values_of(target_row)?
+                        .value
+                        .as_ref()
+                        .map_err(Clone::clone)?;
+                    // 複製の前に状態予算へ計上する（確保前の検証）。
+                    *state_bytes = try_accumulate_state_budget(
+                        *state_bytes,
+                        window_cell_state_bytes(cell),
+                        state_cap,
+                    )?;
+                    cell.clone()
+                }
+            };
+            let slot = out.get_mut(row_idx).ok_or_else(|| {
+                window_bug(
+                    "evaluate_value_frame_partition row index out of range for the result slice",
+                )
+            })?;
+            *slot = Some(cell);
+        }
+    }
+    Ok(())
+}
+
 /// 1 パーティション分のウィンドウ値を計算する（並べ替え済み [`SortedPartition`] を
 /// peer グループ単位で走査し、順位/集計を評価する。§モジュールドキュメント「評価の意味」参照）。
 /// `evaluate_window_item` から呼ばれる。
@@ -2152,6 +2338,9 @@ fn evaluate_partition(
     let item_index = part.item_index;
 
     // `LAG`／`LEAD` は peer・フレームに依存しないため、peer 分割へ入れず専用の評価へ委譲する。
+    if item.func.is_frame_value() {
+        return evaluate_value_frame_partition(part, frame, out, state_bytes, state_cap);
+    }
     if item.func.is_value_offset() {
         // `RANGE` のオフセットの負・NaN は、非 NULL キーの行を持つパーティションで初めて
         // エラーになる（PostgreSQL の in_range 関数内の検査。NULL キーだけ・0 行では出ない）。
@@ -2210,7 +2399,11 @@ fn evaluate_partition(
         let aggregate_cell: Option<Cell> = match item.func {
             WindowFunc::RowNumber | WindowFunc::Rank | WindowFunc::DenseRank => None,
             // `LAG`／`LEAD` は上で専用の評価へ委譲済みのため到達しない（不変条件違反は fail-closed）。
-            WindowFunc::Lag | WindowFunc::Lead => {
+            WindowFunc::Lag
+            | WindowFunc::Lead
+            | WindowFunc::FirstValue
+            | WindowFunc::LastValue
+            | WindowFunc::NthValue => {
                 return Err(window_bug("offset window function reached the peer loop"));
             }
             WindowFunc::Count
@@ -2233,7 +2426,11 @@ fn evaluate_partition(
                 WindowFunc::RowNumber => Cell::Integer(row_number as u64),
                 WindowFunc::Rank => Cell::Integer((rank + 1) as u64),
                 WindowFunc::DenseRank => Cell::Integer((dense_rank + 1) as u64),
-                WindowFunc::Lag | WindowFunc::Lead => {
+                WindowFunc::Lag
+                | WindowFunc::Lead
+                | WindowFunc::FirstValue
+                | WindowFunc::LastValue
+                | WindowFunc::NthValue => {
                     return Err(window_bug("offset window function reached the peer loop"));
                 }
                 WindowFunc::Count
@@ -3125,7 +3322,11 @@ pub(crate) fn window_result_type(item: &BoundWindowItem) -> Option<ColumnType> {
         WindowFunc::Min => AggregateFunc::Min,
         WindowFunc::Max => AggregateFunc::Max,
         // `LAG`／`LEAD` の結果型は値（既定値があれば統一後）の型（SQL-64 (1)・Issue #1880）。
-        WindowFunc::Lag | WindowFunc::Lead => {
+        WindowFunc::Lag
+        | WindowFunc::Lead
+        | WindowFunc::FirstValue
+        | WindowFunc::LastValue
+        | WindowFunc::NthValue => {
             return item.offset_args.as_ref()?.result_type.clone();
         }
     };
@@ -3145,7 +3346,11 @@ fn window_func_to_aggregate_func(
         WindowFunc::RowNumber | WindowFunc::Rank | WindowFunc::DenseRank => Err(window_bug(
             "ranking window function unexpectedly requires an accumulator",
         )),
-        WindowFunc::Lag | WindowFunc::Lead => Err(window_bug(
+        WindowFunc::Lag
+        | WindowFunc::Lead
+        | WindowFunc::FirstValue
+        | WindowFunc::LastValue
+        | WindowFunc::NthValue => Err(window_bug(
             "offset window function unexpectedly requires an accumulator",
         )),
     }
@@ -4429,5 +4634,60 @@ mod range_frame_tests {
                 assert_eq!(got, at, "len={len} at={at}");
             }
         }
+    }
+}
+/// `pick_in_frame`（SQL-64 (3)・Issue #1883）の位置計算の単体テスト。
+#[cfg(test)]
+mod pick_in_frame_tests {
+    use super::*;
+
+    #[test]
+    fn empty_frame_and_out_of_range_ordinal_pick_nothing() {
+        for pick in [FramePick::First, FramePick::Last, FramePick::Nth(0)] {
+            assert_eq!(pick_in_frame(3, 3, &[], pick), None);
+            assert_eq!(pick_in_frame(4, 2, &[], pick), None);
+        }
+        assert_eq!(pick_in_frame(0, 3, &[], FramePick::Nth(3)), None);
+        assert_eq!(pick_in_frame(0, 3, &[], FramePick::Nth(usize::MAX)), None);
+    }
+
+    #[test]
+    fn plain_frame_picks_first_last_nth() {
+        assert_eq!(pick_in_frame(2, 6, &[], FramePick::First), Some(2));
+        assert_eq!(pick_in_frame(2, 6, &[], FramePick::Last), Some(5));
+        assert_eq!(pick_in_frame(2, 6, &[], FramePick::Nth(2)), Some(4));
+    }
+
+    #[test]
+    fn exclusion_outside_the_frame_changes_nothing() {
+        let ex = [(0, 2), (8, 9)];
+        assert_eq!(pick_in_frame(2, 6, &ex, FramePick::First), Some(2));
+        assert_eq!(pick_in_frame(2, 6, &ex, FramePick::Last), Some(5));
+    }
+
+    #[test]
+    fn exclusion_at_the_edges_skips_to_the_next_row() {
+        assert_eq!(pick_in_frame(0, 4, &[(0, 1)], FramePick::First), Some(1));
+        assert_eq!(pick_in_frame(0, 4, &[(3, 4)], FramePick::Last), Some(2));
+        // フレーム全体が除外されたら空。
+        assert_eq!(pick_in_frame(1, 3, &[(0, 5)], FramePick::First), None);
+    }
+
+    #[test]
+    fn ties_exclusion_leaves_two_pieces() {
+        // フレーム [0, 6)、peer グループ [2, 5) の現在行 3 に対する `EXCLUDE TIES` は 2 と 4 を除く。
+        let ex = [(2, 3), (4, 5)];
+        assert_eq!(pick_in_frame(0, 6, &ex, FramePick::Nth(2)), Some(3));
+        assert_eq!(pick_in_frame(0, 6, &ex, FramePick::Nth(3)), Some(5));
+        assert_eq!(pick_in_frame(0, 6, &ex, FramePick::Nth(4)), None);
+        assert_eq!(pick_in_frame(0, 6, &ex, FramePick::Last), Some(5));
+    }
+
+    #[test]
+    fn empty_exclusion_intervals_are_ignored() {
+        assert_eq!(
+            pick_in_frame(0, 3, &[(2, 2), (1, 0)], FramePick::Last),
+            Some(2)
+        );
     }
 }
