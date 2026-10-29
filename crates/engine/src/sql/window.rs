@@ -3951,7 +3951,6 @@ mod budget_regression_tests {
         assert!(run(0, 3).is_empty());
     }
 
-    /// 順位関数と `COUNT` は `BigInt`、集計系は集計 SELECT と同じ規則（Issue #1344）。
     /// SQL-64・Issue #1885: 分布関数の値と float8 テキスト表現。
     #[test]
     fn distribution_values_and_text() {
@@ -3967,6 +3966,7 @@ mod budget_regression_tests {
         assert_eq!(cd(5, 5), "1");
     }
 
+    /// 順位関数と `COUNT` は `BigInt`、集計系は集計 SELECT と同じ規則（Issue #1344）。
     #[test]
     fn window_result_type_maps_ranking_count_and_aggregates() {
         for f in [

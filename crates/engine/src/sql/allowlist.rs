@@ -3917,6 +3917,7 @@ pub(crate) enum WindowFunc {
     /// 分布関数（`percent_rank()`／`cume_dist()`。SQL-64・Issue #1885）。引数を取らず、
     /// peer 判定は `rank` と共通。結果型は `double precision`。
     PercentRank,
+    /// 累積分布（`cume_dist()`）。`PercentRank` と同じく引数なし・結果型は `double precision`。
     CumeDist,
 }
 
