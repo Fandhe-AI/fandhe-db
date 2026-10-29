@@ -1658,6 +1658,16 @@ pub enum BuiltinFn {
     Substr2,
     /// `substr(s: Text, start: Scalar, len: Scalar) -> Text`。
     Substr3,
+    /// `lpad(s: Text, len: Scalar) -> Text`（`fill` 省略形・半角空白で埋める。Issue #1904・SQL-65）。
+    Lpad2,
+    /// `lpad(s: Text, len: Scalar, fill: Text) -> Text`。
+    Lpad3,
+    /// `rpad(s: Text, len: Scalar) -> Text`（Issue #1904・SQL-65）。
+    Rpad2,
+    /// `rpad(s: Text, len: Scalar, fill: Text) -> Text`。
+    Rpad3,
+    /// `split_part(s: Text, delim: Text, n: Scalar) -> Text`（Issue #1904・SQL-65）。
+    SplitPart,
     /// `concat(a: Text, b: Text) -> Text`。可変長 `CONCAT` は束縛段
     /// （[`bind_call`]）でこの 2 引数版の左畳み込みへ展開する。
     Concat2,
@@ -1959,6 +1969,9 @@ fn builtin_from_name(name: &str) -> Option<BuiltinFn> {
         "trim" => Some(BuiltinFn::Trim),
         "replace" => Some(BuiltinFn::Replace),
         "position" => Some(BuiltinFn::Position),
+        // Issue #1904・SQL-65: 引数 3 個固定。`lpad`／`rpad` は 2／3 引数の
+        // オーバーロードのためここには含めない（`bind_pad` が個数で解決する）。
+        "split_part" => Some(BuiltinFn::SplitPart),
         "abs" => Some(BuiltinFn::Abs),
         "floor" => Some(BuiltinFn::Floor),
         "ceil" | "ceiling" => Some(BuiltinFn::Ceil),
@@ -1990,7 +2003,7 @@ fn is_variadic_or_overloaded_builtin_name(name: &str) -> bool {
         // `date_part`／`date_trunc`（対象ビヘイビア: SQL-26。Issue #920）は
         // field／unit の解決結果を `BuiltinFn` のペイロードとして持つため、
         // 名前だけでは variant が一意に定まらない（`round` と同じ理由。§2-4）。
-        "substr" | "concat" | "round" | "date_part" | "date_trunc" | "timezone"
+        "substr" | "concat" | "round" | "date_part" | "date_trunc" | "timezone" | "lpad" | "rpad"
     )
 }
 
@@ -2009,6 +2022,17 @@ pub(crate) fn builtin_signature(f: BuiltinFn) -> (&'static [ExprType], ExprType)
         BuiltinFn::Substr2 => (&[ExprType::Text, ExprType::Scalar], ExprType::Text),
         BuiltinFn::Substr3 => (
             &[ExprType::Text, ExprType::Scalar, ExprType::Scalar],
+            ExprType::Text,
+        ),
+        BuiltinFn::Lpad2 | BuiltinFn::Rpad2 => {
+            (&[ExprType::Text, ExprType::Scalar], ExprType::Text)
+        }
+        BuiltinFn::Lpad3 | BuiltinFn::Rpad3 => (
+            &[ExprType::Text, ExprType::Scalar, ExprType::Text],
+            ExprType::Text,
+        ),
+        BuiltinFn::SplitPart => (
+            &[ExprType::Text, ExprType::Text, ExprType::Scalar],
             ExprType::Text,
         ),
         BuiltinFn::Concat2 => (&[ExprType::Text, ExprType::Text], ExprType::Text),
@@ -2140,6 +2164,11 @@ pub(crate) fn is_foldable_builtin(f: BuiltinFn) -> bool {
         | BuiltinFn::Length
         | BuiltinFn::Substr2
         | BuiltinFn::Substr3
+        | BuiltinFn::Lpad2
+        | BuiltinFn::Lpad3
+        | BuiltinFn::Rpad2
+        | BuiltinFn::Rpad3
+        | BuiltinFn::SplitPart
         | BuiltinFn::Concat2
         | BuiltinFn::Trim
         | BuiltinFn::Replace
@@ -2214,6 +2243,7 @@ pub(crate) fn builtin_call_arity(name: &str) -> Option<BuiltinArity> {
     match name.to_ascii_lowercase().as_str() {
         "concat" => fixed(1, MAX_FUNCTION_CALL_ARGS),
         "substr" => fixed(2, 3),
+        "lpad" | "rpad" => fixed(2, 3),
         "round" => fixed(1, 2),
         "date_part" => fixed(2, 2),
         "date_trunc" => fixed(2, 3),
@@ -2578,7 +2608,10 @@ fn validate_closed_expr(
                         "function concat expects at least 1 argument, got 0",
                     ));
                 }
-            } else if name.eq_ignore_ascii_case("substr") {
+            } else if name.eq_ignore_ascii_case("substr")
+                || name.eq_ignore_ascii_case("lpad")
+                || name.eq_ignore_ascii_case("rpad")
+            {
                 if !matches!(args.len(), 2 | 3) {
                     return Err(SqlSurfaceError::undefined_function(format!(
                         "function {name} expects 2 or 3 arguments, got {}",
@@ -7087,6 +7120,9 @@ fn bind_call(
     if lower_name == "substr" {
         return bind_substr(name, args, env, node_budget);
     }
+    if lower_name == "lpad" || lower_name == "rpad" {
+        return bind_pad(name, &lower_name, args, env, node_budget);
+    }
     if name.eq_ignore_ascii_case("round") {
         // `round` は arity オーバーロード（SQL-26）: 1 引数形は
         // `BuiltinFn::Round1`、2 引数形（小数点以下 `n` 桁）は `BuiltinFn::Round2`
@@ -7848,6 +7884,47 @@ fn bind_substr(
         2 => BuiltinFn::Substr2,
         3 => BuiltinFn::Substr3,
         got => {
+            return Err(SqlSurfaceError::undefined_function(format!(
+                "function {name} expects 2 or 3 arguments, got {got}"
+            )))
+        }
+    };
+    let (param_types, ret) = builtin_signature(builtin);
+    let mut bound_args = Vec::with_capacity(args.len());
+    for (a, expected) in args.iter().zip(param_types.iter()) {
+        let (b, ty) = bind_expr_in(a, env, node_budget)?;
+        if ty != *expected {
+            return Err(SqlSurfaceError::datatype_mismatch(format!(
+                "function {name} argument type mismatch"
+            )));
+        }
+        bound_args.push(b);
+    }
+    Ok((
+        BoundExpr::Builtin {
+            f: builtin,
+            args: bound_args,
+        },
+        ret,
+    ))
+}
+
+/// `LPAD`／`RPAD(s, len[, fill])`（Issue #1904・SQL-65）。引数 2 個は `*2`、3 個は `*3`
+/// variant へ束縛する。型不一致は `42804`、個数不一致は `42883`。
+fn bind_pad(
+    name: &str,
+    lower_name: &str,
+    args: &[Expr],
+    env: &mut BindEnv<'_>,
+    node_budget: &mut usize,
+) -> Result<(BoundExpr, ExprType), SqlSurfaceError> {
+    let is_lpad = lower_name == "lpad";
+    let builtin = match (args.len(), is_lpad) {
+        (2, true) => BuiltinFn::Lpad2,
+        (3, true) => BuiltinFn::Lpad3,
+        (2, false) => BuiltinFn::Rpad2,
+        (3, false) => BuiltinFn::Rpad3,
+        (got, _) => {
             return Err(SqlSurfaceError::undefined_function(format!(
                 "function {name} expects 2 or 3 arguments, got {got}"
             )))
@@ -9136,6 +9213,52 @@ pub(crate) fn apply_builtin<'a>(
             ) {
                 (Some(s), Some(start), Some(len)) => {
                     let out = string_fn::substr(&s, start, Some(len))?;
+                    Ok(ExprValue::Text(Cow::Owned(out)))
+                }
+                _ => Ok(ExprValue::Null),
+            }
+        }
+        BuiltinFn::Lpad2 | BuiltinFn::Rpad2 => {
+            match (
+                take_text_or_null_arg(args, 0)?,
+                take_scalar_or_null_arg(args, 1)?,
+            ) {
+                (Some(s), Some(len)) => {
+                    let out = if matches!(f, BuiltinFn::Lpad2) {
+                        string_fn::lpad(&s, len, " ")?
+                    } else {
+                        string_fn::rpad(&s, len, " ")?
+                    };
+                    Ok(ExprValue::Text(Cow::Owned(out)))
+                }
+                _ => Ok(ExprValue::Null),
+            }
+        }
+        BuiltinFn::Lpad3 | BuiltinFn::Rpad3 => {
+            match (
+                take_text_or_null_arg(args, 0)?,
+                take_scalar_or_null_arg(args, 1)?,
+                take_text_or_null_arg(args, 2)?,
+            ) {
+                (Some(s), Some(len), Some(fill)) => {
+                    let out = if matches!(f, BuiltinFn::Lpad3) {
+                        string_fn::lpad(&s, len, &fill)?
+                    } else {
+                        string_fn::rpad(&s, len, &fill)?
+                    };
+                    Ok(ExprValue::Text(Cow::Owned(out)))
+                }
+                _ => Ok(ExprValue::Null),
+            }
+        }
+        BuiltinFn::SplitPart => {
+            match (
+                take_text_or_null_arg(args, 0)?,
+                take_text_or_null_arg(args, 1)?,
+                take_scalar_or_null_arg(args, 2)?,
+            ) {
+                (Some(s), Some(delim), Some(n)) => {
+                    let out = string_fn::split_part(&s, &delim, n)?;
                     Ok(ExprValue::Text(Cow::Owned(out)))
                 }
                 _ => Ok(ExprValue::Null),
@@ -10670,6 +10793,9 @@ mod tests {
         for name in [
             "concat",
             "substr",
+            "lpad",
+            "rpad",
+            "split_part",
             "round",
             "date_part",
             "date_trunc",
@@ -10695,6 +10821,10 @@ mod tests {
         );
         let lower = builtin_call_arity("lower").expect("lower");
         assert_eq!((lower.min, lower.max), (1, 1));
+        let lpad = builtin_call_arity("LPAD").expect("lpad");
+        assert_eq!((lpad.min, lpad.max), (2, 3));
+        let sp = builtin_call_arity("split_part").expect("split_part");
+        assert_eq!((sp.min, sp.max), (3, 3));
         assert!(builtin_call_arity("mystery_fn").is_none());
     }
 
@@ -10716,6 +10846,11 @@ mod tests {
             BuiltinFn::Length,
             BuiltinFn::Substr2,
             BuiltinFn::Substr3,
+            BuiltinFn::Lpad2,
+            BuiltinFn::Lpad3,
+            BuiltinFn::Rpad2,
+            BuiltinFn::Rpad3,
+            BuiltinFn::SplitPart,
             BuiltinFn::Concat2,
             BuiltinFn::Trim,
             BuiltinFn::Replace,
