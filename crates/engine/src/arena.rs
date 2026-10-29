@@ -110,6 +110,10 @@ pub enum ArenaError {
     /// フックが `substring` の負の長さを理由に拒否した（Issue #1903）。
     /// `sql::exec::map_arena_error` が `SqlSurfaceError::SubstringError`（`22011`）へ写像する。
     SubstringError(String),
+    /// フックが `ln`／`log` の定義域外を理由に拒否した（Issue #1907）。
+    /// `sql::exec::map_arena_error` が `SqlSurfaceError::InvalidArgumentForLogarithm`
+    /// （`2201E`）へ写像する。メッセージは固定文言。
+    InvalidArgumentForLogarithm(String),
     /// フックが算術あふれ（非有限値化）を理由に拒否した（Issue #1163）。
     /// `sql::exec::map_arena_error` が `SqlSurfaceError::NumericOutOfRange`（`22003`）へ
     /// 写像する。メッセージは固定文言。
@@ -135,6 +139,7 @@ impl std::fmt::Display for ArenaError {
             ArenaError::InvalidInput(msg)
             | ArenaError::DivisionByZero(msg)
             | ArenaError::SubstringError(msg)
+            | ArenaError::InvalidArgumentForLogarithm(msg)
             | ArenaError::NumericOutOfRange(msg) => {
                 write!(f, "arena build rejected by hook: {msg}")
             }
@@ -154,6 +159,7 @@ impl std::error::Error for ArenaError {
             | ArenaError::InvalidInput(_)
             | ArenaError::DivisionByZero(_)
             | ArenaError::SubstringError(_)
+            | ArenaError::InvalidArgumentForLogarithm(_)
             | ArenaError::NumericOutOfRange(_) => None,
         }
     }
