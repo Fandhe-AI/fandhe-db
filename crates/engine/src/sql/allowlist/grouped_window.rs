@@ -296,8 +296,10 @@ fn hoist_window_item(
                 }
             }
             if let Some(Token::Ident(x)) = item.get(e.saturating_sub(1)) {
+                // 直前がオペランドで終わる場合のみ修飾子（`sum(k) + desc` の `desc` は列名）。
                 if e.saturating_sub(1) > a
                     && (x.eq_ignore_ascii_case("ASC") || x.eq_ignore_ascii_case("DESC"))
+                    && ends_expression(item.get(e.saturating_sub(2)))
                 {
                     e = e.saturating_sub(1);
                 }
@@ -388,22 +390,24 @@ fn tail_has_row_limit(tail: &[Token]) -> bool {
     })
 }
 
-/// 項目が列参照（関数名・別名・型名・`NULL`／`TRUE`／`FALSE` 以外の識別子）を持つか。
-fn item_has_column_ref(item: &[Token]) -> bool {
-    item.iter().enumerate().any(|(i, t)| {
-        let Token::Ident(n) = t else { return false };
-        let next_is_call = matches!(item.get(i.saturating_add(1)), Some(Token::Punct('(')));
-        let prev = i.checked_sub(1).and_then(|j| item.get(j));
-        let after_as = matches!(prev, Some(Token::Ident(p)) if p.eq_ignore_ascii_case("AS"));
-        let after_cast = matches!(prev, Some(Token::Punct(':')));
-        !(next_is_call
-            || after_as
-            || after_cast
-            || n.eq_ignore_ascii_case("AS")
-            || n.eq_ignore_ascii_case("NULL")
-            || n.eq_ignore_ascii_case("TRUE")
-            || n.eq_ignore_ascii_case("FALSE"))
-    })
+/// 項目内の列参照候補（関数名・別名・型名・`CASE` 系キーワード・`NULL`／`TRUE`／`FALSE` 以外の識別子）。
+fn column_ref_candidates(item: &[Token]) -> Vec<&str> {
+    item.iter()
+        .enumerate()
+        .filter_map(|(i, t)| {
+            let Token::Ident(n) = t else { return None };
+            let next_is_call = matches!(item.get(i.saturating_add(1)), Some(Token::Punct('(')));
+            let prev = i.checked_sub(1).and_then(|j| item.get(j));
+            let after_as = matches!(prev, Some(Token::Ident(p)) if p.eq_ignore_ascii_case("AS"));
+            let after_cast = matches!(prev, Some(Token::Punct(':')));
+            let reserved = [
+                "AS", "CASE", "WHEN", "THEN", "ELSE", "END", "NULL", "TRUE", "FALSE",
+            ]
+            .iter()
+            .any(|k| n.eq_ignore_ascii_case(k));
+            (!(next_is_call || after_as || after_cast || reserved)).then_some(n.as_str())
+        })
+        .collect()
 }
 
 /// 集計 SELECT と窓項目の併用を [`Statement::BufferedView`]（`origin = GroupedWindow`）へ振り分ける。
@@ -469,18 +473,40 @@ pub(super) fn try_build(
     // 非窓項目が列参照を持たない（定数のみ）なら受理し、未定義列は束縛段の `42703`、未グループ化列は
     // 束縛側の `42803` に任せる。ただし `LIMIT`／`OFFSET` 付きでは本文の形検査が先に `42601` へ倒れて
     // しまうため、その場合に限り列参照を持つ非窓項目を先に `42803` で拒否する。
-    if !has_group_by_or_having
-        && !plain_has_aggregate
-        && tail_has_row_limit(tail)
-        && ranges.iter().any(|&(s, e)| {
-            tokens
-                .get(s..e)
-                .is_some_and(|item| !tokens_contain_window_over(item) && item_has_column_ref(item))
-        })
-    {
-        return Err(SqlSurfaceError::GroupingError {
-            detail: "column must appear in the GROUP BY clause or be used in an aggregate function",
-        });
+    // 未定義名は `42803` に倒さず `42703` にする（テーブルの列集合が分かるときのみ判別できる）。
+    if !has_group_by_or_having && !plain_has_aggregate && tail_has_row_limit(tail) {
+        let known_cols = match tail.get(1) {
+            Some(Token::Ident(t)) => lookup.table_columns(t)?,
+            _ => None,
+        };
+        let mut grouping = false;
+        for &(s, e) in &ranges {
+            let Some(item) = tokens.get(s..e) else {
+                continue;
+            };
+            if tokens_contain_window_over(item) {
+                continue;
+            }
+            for n in column_ref_candidates(item) {
+                match &known_cols {
+                    Some(ks)
+                        if !n.eq_ignore_ascii_case("id")
+                            && !ks.iter().any(|c| c.eq_ignore_ascii_case(n)) =>
+                    {
+                        return Err(SqlSurfaceError::UndefinedColumn {
+                            name: n.to_string(),
+                        });
+                    }
+                    _ => grouping = true,
+                }
+            }
+        }
+        if grouping {
+            return Err(SqlSurfaceError::GroupingError {
+                detail:
+                    "column must appear in the GROUP BY clause or be used in an aggregate function",
+            });
+        }
     }
     // Describe 経路は本文が `$n` を含まない前提でダミーフラグを渡すため、不一致を避けて拒否する。
     if tokens.iter().any(|t| matches!(t, Token::Param(_))) {

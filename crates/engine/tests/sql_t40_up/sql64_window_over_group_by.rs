@@ -399,7 +399,7 @@ fn aggregate_inside_window_respects_tenant_boundary() {
 #[test]
 fn unsupported_shapes_fail_closed() {
     let (core, _g) = build("sql64-gw-reject", None);
-    let cases: [(&str, &str); 22] = [
+    let cases: [(&str, &str); 25] = [
         // グループ化されていない列を窓が参照する。
         (
             "SELECT g, count(*), rank() OVER (ORDER BY k) FROM t GROUP BY g",
@@ -425,6 +425,21 @@ fn unsupported_shapes_fail_closed() {
         // 未定義列は束縛段の 42703（先行ゲートの 42803 に潰されない）。
         (
             "SELECT nosuch, rank() OVER (ORDER BY sum(k)) FROM t",
+            "42703",
+        ),
+        // LIMIT 付きでも未定義列は 42703（型名・CASE キーワードは列扱いしない）。
+        (
+            "SELECT nosuch, rank() OVER (ORDER BY sum(k)) FROM t LIMIT 1",
+            "42703",
+        ),
+        (
+            "SELECT CASE WHEN nosuch > 1 THEN 1 ELSE 2 END, rank() OVER (ORDER BY sum(k)) \
+             FROM t LIMIT 1",
+            "42703",
+        ),
+        // 列名 desc を末尾に持つ式は ASC/DESC 修飾子として剥がされず、未定義列として束縛される。
+        (
+            "SELECT g, rank() OVER (ORDER BY sum(k) + desc) FROM t GROUP BY g",
             "42703",
         ),
         // 窓の FILTER 内・フレームオフセット内の集計。
