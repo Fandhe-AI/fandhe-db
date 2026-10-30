@@ -873,6 +873,10 @@ fn is_null_conditions_are_supported() {
         ("a IS NULL", int(1), 0),
         ("a IS NOT NULL", int(1), 1),
         ("a IS NOT NULL", null_int(), 0),
+        ("(a IS NULL)", null_int(), 1),
+        ("(a IS NULL)", int(1), 0),
+        ("((a) IS NOT NULL)", int(1), 1),
+        ("((a) IS NOT NULL)", null_int(), 0),
     ] {
         let src = format!("BEGIN IF {cond} THEN RETURN 1; END IF; RETURN 0; END");
         let out = call(&src)

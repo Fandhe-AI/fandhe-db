@@ -550,7 +550,7 @@ impl PlHost for CorePlHost<'_, '_> {
         let toks = subst::substitute(&expr.tokens, &expr.var_refs, env, false)?;
         // `<式> IS [NOT] NULL` は `FROM` の無い `SELECT .. WHERE` が構文として受理しないため、式の
         // 値を直接求めて判定する（三値論理に乗らず、常に真偽値）。
-        if let Some((operand, negated)) = split_is_null(&toks) {
+        if let Some((operand, negated)) = split_is_null(strip_outer_parens(&toks)) {
             let is_null = self.operand_is_null(operand)?;
             return Ok(Some(is_null != negated));
         }
