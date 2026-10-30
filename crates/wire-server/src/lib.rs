@@ -154,6 +154,7 @@ pub mod jsonpath_limits_opt;
 pub mod limits;
 pub(crate) mod liveness;
 pub mod nesting_limits_opt;
+pub mod plpgsql_limits_opt;
 pub mod protocol_dispatch;
 pub mod recursive_cte_limits_opt;
 pub mod regex_limits_opt;

@@ -45,7 +45,7 @@ fn err2_all_classes_have_unique_wire_codes_except_shared() {
     // `NotNullViolation` が共有する。共有は許可された組のみで、それ以外の
     // `wire_code` は従来どおり分類ごとに一意でなければならない。
     let codes: HashSet<&str> = ErrorClass::ALL.iter().map(|c| c.wire_code()).collect();
-    let expected_unique = ErrorClass::ALL.len() - 3; // 23502・23505・22023 の重複ぶんを 1 ずつ引く
+    let expected_unique = ErrorClass::ALL.len() - 4; // 23502・23505・22023・P0002 の重複ぶんを 1 ずつ引く
     assert_eq!(
         codes.len(),
         expected_unique,
@@ -83,6 +83,15 @@ fn err2_all_classes_have_unique_wire_codes_except_shared() {
             ErrorClass::InvalidParameterValue
         ],
         "22023 を共有する分類は OperationIdContentMismatch・InvalidParameterValue の 2 つのみ"
+    );
+    let sharing_p0002: Vec<ErrorClass> = ErrorClass::ALL
+        .into_iter()
+        .filter(|c| c.wire_code() == "P0002")
+        .collect();
+    assert_eq!(
+        sharing_p0002,
+        vec![ErrorClass::RowNotFound, ErrorClass::NoDataFound],
+        "P0002 を共有する分類は RowNotFound・NoDataFound の 2 つのみ（Issue #2225）"
     );
 }
 
@@ -124,6 +133,12 @@ fn err2_wire_code_is_deterministic() {
             assert_eq!(
                 ErrorClass::from_wire_code(first),
                 Some(ErrorClass::OperationIdContentMismatch)
+            );
+        } else if first == "P0002" {
+            // 宣言順で最初の分類（`RowNotFound`）へ戻る（Issue #2225）。
+            assert_eq!(
+                ErrorClass::from_wire_code(first),
+                Some(ErrorClass::RowNotFound)
             );
         } else if first == "23505" {
             // 宣言順で最初の分類（`UniqueViolation`）へ戻る（Issue #1180）。

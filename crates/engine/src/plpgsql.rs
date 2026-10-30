@@ -6,13 +6,22 @@
 //! 許可リスト解析へ委譲して実装）経由で行う（ADR D3 の定義時ダミー検証）。サブセット外は `0A000`、
 //! 構文誤りは `42601`、上限超過は `54000`／`54001`。呼び出し元は #2217（`LANGUAGE plpgsql` の受理）・
 //! #2225（インタプリタ）が結線するまでテストだけ。ストレージ・テナントには触れない純粋な処理。
+//!
+//! 実行側（Issue #2225）: [`interp`] が AST を辿る木構造インタプリタ（変数環境・制御フロー・
+//! 実行予算）、[`host`] がインタプリタと外界（式の評価・SQL 実行・型解決）の境界トレイト、
+//! [`value`] が代入時の型変換。SQL・式の評価は [`host::PlHost`] 経由で、core の実装は #2226。
 
 pub(crate) mod ast;
 pub(crate) mod embedded;
+pub(crate) mod host;
+pub(crate) mod interp;
+#[cfg(test)]
+mod interp_tests;
 mod lexer;
 mod parser;
 #[cfg(test)]
 mod tests;
+pub(crate) mod value;
 
 use crate::sql::allowlist::SqlSurfaceError;
 

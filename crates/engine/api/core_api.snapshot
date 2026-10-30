@@ -33,6 +33,7 @@ pub mod kernel;
 pub mod nesting_limits;
 pub mod numeric;
 pub mod parallel_search;
+pub mod plpgsql_limits;
 pub mod policy;
 pub mod precision;
 pub mod query_planner;

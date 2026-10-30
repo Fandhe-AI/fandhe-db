@@ -267,9 +267,8 @@ pub mod parallel_search;
 // #2217／#2225 が行うため、呼び出し元は当面テストだけ（`catalog::function` と同じ扱い）。
 #[allow(dead_code)]
 pub(crate) mod plpgsql;
-// PL/pgSQL のハード上限（Issue #2224）。`PlpgsqlLimits` と CLI は #2225 が追加する。
-#[allow(dead_code)]
-pub(crate) mod plpgsql_limits;
+// PL/pgSQL の実行上限（Issue #2224・#2225）。wire-server の CLI が `PlpgsqlLimits` を組み立てる。
+pub mod plpgsql_limits;
 pub mod policy;
 pub mod precision;
 pub mod query_planner;

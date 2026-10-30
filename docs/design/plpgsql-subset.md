@@ -374,3 +374,85 @@ Issue #2227 で受理する。
   最初に受理された形の記録を採る。すべて拒否なら最初の `42601` を返す（変数がリテラル専用位置にあって
   拒否された場合だけ `0A000`）。許可リストが比較・論理演算を `WHERE` 内でだけ受理し、`FROM` の無い `WHERE` は
   単一の述語しか受理しないため仮の表を置く（構造解析では表は常に存在する扱い）
+
+## Issue #2225 追記: インタプリタと実行上限（SQL-68 ポインタ）
+
+D4（値の表現）・D7（上限と CLI）・D10（`ErrorClass` の新分類）の最終判断。実装は
+`crates/engine/src/plpgsql/{host,interp,value}.rs`・`plpgsql_limits.rs`。
+
+### 境界: `PlHost` トレイト
+
+- インタプリタ（`interp.rs`）は制御フロー・変数環境・代入時の型変換・`INTO`／`STRICT` の行数規則・
+  `FOUND`／`ROW_COUNT`・集合返却の蓄積・実行予算だけを持つ。式の評価・埋め込み SQL の実行・
+  `%TYPE` 等の型解決は `&mut dyn PlHost`（`host.rs`）へ委ね、SQL 文字列を組み立てない
+  （D1・D3。単純形 `CASE` の比較も `values_equal` をホストに頼む）。thread-local へ借用を載せる方式は採らない
+- core の `PlHost` 実装（変数値のトークン置換・同じ Tx／RLS での実行・FOUND／ROW_COUNT の実測値・
+  D5 の事前決定・D6 の動的 SQL・D8 の台帳）は #2226。#2225 の時点ではテスト専用ホストだけが実装する。
+  メソッドの形は #2226 の要件で変えうる（予算を引数で渡すのは、式の中の関数呼び出しが同じ予算へ合算するため）
+- `ReturnShape::Trigger` を通常の関数として呼ぶと `0A000`（入口は #2228）
+
+### 値の表現（D4 の最終判断）
+
+- スカラーは `PlScalar { cell: Cell, ty: ColumnType }`（NULL も型付き）。レコードは
+  `PlRecord { fields: Option<Vec<(String, PlScalar)>> }` で、`None`（未代入）のフィールド参照は `55000`
+  （`SqlSurfaceError::RecordNotAssigned`）
+- 宣言型 `Named` は `CastType::from_sql_type_name` → `result_column_type` で解く。`%TYPE` 等は
+  `resolve_type`（呼び出し時）
+- 代入時 CAST は `plpgsql/value.rs`。変換の実体は既存の `sql::cast_value::apply_cast` で、ここは `Cell` と
+  式評価値の往復だけ。代入規則（`cast_type_assignable`）に無い組は、PostgreSQL の PL/pgSQL と同じく
+  「文字列への出力変換 → 入力変換」（I/O 変換）で通し、不正な文字列は `22P02`／`22003` になる
+
+### 実行予算と上限（D7 の最終判断）
+
+- `ExecBudget` はトップレベルの 1 回の起動ごとに 1 個作り、入れ子の呼び出しへ `&mut` で渡して合算する
+  （文数・ループ反復・呼び出し深さ・集合返却の累積行数とバイト数）。検査はすべて**実行前・追加前**
+- 文数・反復は `54000`、呼び出し深さは `54001`。上限ちょうどの文数・反復までは実行でき、次で超過
+- 集合返却の行数上限は `--max-result-rows`、バイト数上限は `arena::MAX_ARENA_TOTAL_BYTES`
+  （`MAX_RETURNING_RESULT_BYTES` と同値。新しい CLI は作らない）
+- 毎文・毎反復で `interrupt::check()`（`57014`）。インタプリタは commit しないため確認点が commit の後ろに
+  回らない。超過・エラー時は `Err` だけを返し部分結果を返さない
+- CLI は 5 本（`--max-plpgsql-statements` 1〜100,000・`--max-plpgsql-loop-iterations` 1〜1,000,000・
+  `--max-plpgsql-nesting-depth` 1〜32・`--max-plpgsql-body-bytes` 1〜65,536・`--max-function-call-depth` 1〜32）。
+  既定値はハード上限と同値で、下げる方向だけ。実装既定値であり spec 由来の数値ではない。
+  `--max-function-call-depth` の名前はここで確定する（#2218 は `EngineCore::plpgsql_limits().max_call_depth()` を読む）。
+  入れ子・本体長は構文段（`ParseOptions::with_limits`）へ、文数・反復・呼び出し深さは `ExecBudget` へ渡す
+
+### エラー分類（D10 の最終判断。破壊的変更）
+
+| 事象 | SQLSTATE | `ErrorClass` |
+| ---- | -------- | ------------ |
+| `INTO STRICT` が 0 行 | `P0002` | `NoDataFound`（`RowNotFound` と `wire_code` を共有。`from_wire_code` は `RowNotFound`） |
+| `INTO STRICT` が 2 行以上。DML の `RETURNING INTO` は STRICT 無しでも 2 行以上 | `P0003` | `TooManyRows` |
+| `ELSE` の無い `CASE` 文が不一致 | `20000` | `CaseNotFound` |
+| スカラー関数が `RETURN` に達せず終わりに到達 | `2F005` | `FunctionExecutedNoReturnStatement` |
+
+- HTTP 射影は `NoDataFound` が 404、他は 400。NoSQL 表層から PL/pgSQL 関数を呼ぶ op は無く到達不能
+- 既存の分類を再利用するもの: NOT NULL 変数への NULL・整数 `FOR` の境界が NULL・`EXECUTE` の文字列が NULL は
+  `22004`、`BY` が 0 以下は `22023`、未代入レコードの参照は `55000`
+- `ErrorClass` と `SqlSurfaceError`（公開 enum）への variant 追加のため BREAKING
+
+### 制御構文の意味（PostgreSQL 17 の公開された挙動に合わせる）
+
+- ブロックは入るたびに `DECLARE` の既定値を宣言順に評価する（ループ内のブロックは反復ごとに再初期化）
+- `IF`／`WHILE`／`EXIT WHEN` の条件が NULL は偽。単純形 `CASE` はセレクタを 1 回だけ評価する
+- 整数 `FOR` は境界と `BY` を 1 回だけ int4 として評価し、`REVERSE` は書いた順（大..小）で、
+  小..大の順に書くと 0 回。次の値が int4 を溢れる時点で終了する（オーバーフローしない）
+- `FOR` は終了時に FOUND を「1 回以上反復したか」にする。`EXECUTE` は FOUND を変えず ROW_COUNT だけ変える
+- `INTO`（STRICT 無し）は 0 行で NULL、2 行以上で先頭行。対象が複数のスカラーなら列順で、列が足りなければ NULL
+- `RETURN NEXT`／`RETURN QUERY` は蓄積し、`RETURN` で打ち切る。`SETOF` は終わりに到達しても `2F005` にならない
+
+### 既知の差（security.md P0 の優先。後続で縮められる）
+
+- エラー文言は固定の英語で、PostgreSQL が含める変数名・値・行の内容は含めない
+- 代入時 CAST の対象は数値 6 型・`boolean`・文字列 3 型。同じ型の組は素通しだが、それ以外の型の組
+  （日時・配列・`json` 等の相互変換）は `0A000`。`bigint` の 2^53 超は式評価の制約で型をまたぐ変換が拒否される
+- `RETURN QUERY` の行型と戻り値の型の厳密な照合は行わない（1 列の場合だけ戻り値の型へ代入変換する）
+
+### 後続への引き継ぎ
+
+- #2226: `PlHost` の core 実装。変数値のトークン置換、同じ Tx・同じ RLS での実行、FOUND／ROW_COUNT の
+  実測値の検証、`resolve_type`（`%TYPE`／`%ROWTYPE` のカタログ解決）
+- #2217: `LANGUAGE plpgsql` の受理と定義時の `parse_body` 呼び出し（`PlpgsqlLimits` の入れ子・本体長を
+  `ParseOptions::with_limits` へ渡す）
+- #2218: `--max-function-call-depth` と `EngineCore::plpgsql_limits()` を共有
+- #2227: `RAISE`・`EXCEPTION`、#2228: `DO`・トリガ関数、#2229: 越境・crash 検証

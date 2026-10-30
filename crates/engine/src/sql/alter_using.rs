@@ -401,6 +401,11 @@ pub(crate) fn redact_row_conversion_error(e: SqlSurfaceError) -> SqlSurfaceError
         | E::SchemaDependencyForbidden
         | E::ConflictTargetNotVisible
         | E::InvalidCursorName
+        | E::RecordNotAssigned
+        | E::NoDataFound
+        | E::TooManyRows
+        | E::CaseNotFound
+        | E::FunctionExecutedNoReturnStatement
         | E::QueryCanceled { .. }
         | E::UniqueViolation
         | E::ColumnReferenceWithoutFrom

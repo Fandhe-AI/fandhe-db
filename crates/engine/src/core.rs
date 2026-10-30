@@ -1308,6 +1308,10 @@ pub struct EngineCore {
     /// [`Self::with_recursive_cte_limits`] のみが起動時に 1 回だけ差し替え、
     /// `sql::recursive_eval` の実行段だけに効く。
     recursive_cte_limits: crate::recursive_cte_limits::RecursiveCteLimits,
+    /// PL/pgSQL の文数・反復・入れ子・本体長・呼び出し深さの上限（Issue #2225・SQL-68）。
+    /// [`Self::with_plpgsql_limits`] のみが起動時に 1 回だけ差し替える。消費者（`LANGUAGE plpgsql`
+    /// の受理〔#2217〕・実行の結線〔#2226〕）が入るまでは getter の呼び出し元は無い。
+    plpgsql_limits: crate::plpgsql_limits::PlpgsqlLimits,
     /// 明示 `LIMIT` の範囲上限（Issue #1555）。差し替えは [`Self::with_result_limits`]
     /// のみ（起動時 1 回）。文の `LIMIT`・`FETCH n`・集合演算／JOIN 文の `LIMIT` の
     /// 範囲判定にだけ効き、`OFFSET`・枝行数・サブクエリ内側行数の上限とは連動しない。
@@ -2823,6 +2827,7 @@ impl EngineCore {
             join_limits: crate::join_limits::JoinSizeLimits::default(),
             correlated_limits: crate::correlated_limits::CorrelatedLimits::default(),
             recursive_cte_limits: crate::recursive_cte_limits::RecursiveCteLimits::default(),
+            plpgsql_limits: crate::plpgsql_limits::PlpgsqlLimits::default(),
             result_limits: crate::result_limits::ResultLimits::default(),
             materialization_contexts: None,
             partitioned_dml_limits: crate::sql::parser::PartitionedDmlLimits::default(),
@@ -3270,6 +3275,18 @@ impl EngineCore {
     /// 現在の再帰 CTE 上限設定。
     pub fn recursive_cte_limits(&self) -> crate::recursive_cte_limits::RecursiveCteLimits {
         self.recursive_cte_limits
+    }
+
+    /// PL/pgSQL の実行上限（[`crate::plpgsql_limits::PlpgsqlLimits`]）を差し替える。wire-server の
+    /// 起動時 CLI フラグからだけ呼ぶ。呼ばなければハード上限と同値の既定値（Issue #2225）。
+    pub fn with_plpgsql_limits(mut self, limits: crate::plpgsql_limits::PlpgsqlLimits) -> Self {
+        self.plpgsql_limits = limits;
+        self
+    }
+
+    /// 現在の PL/pgSQL 上限設定。#2218 の関数呼び出し深さもここの `max_call_depth` を読む。
+    pub fn plpgsql_limits(&self) -> crate::plpgsql_limits::PlpgsqlLimits {
+        self.plpgsql_limits
     }
 
     /// 束縛済み計画の `LIMIT` を設定値の範囲で再検査する（Issue #1555 の多層防御）。

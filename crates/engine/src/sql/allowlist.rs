@@ -1252,6 +1252,19 @@ pub enum SqlSurfaceError {
     /// 存在しない名前のいずれも区別しない固定文言のみを保持し、カーソル名
     /// 自体を含めない（security.md「存在情報を漏らさない」対応。ERR-6: `34000`）。
     InvalidCursorName,
+    /// PL/pgSQL の未代入のレコード変数のフィールドを参照した（`55000`。Issue #2225・SQL-68）。
+    /// 固定文言のみ（変数名・フィールド名を含めない）。
+    RecordNotAssigned,
+    /// PL/pgSQL の `INTO STRICT` が 0 行（`P0002`。Issue #2225・SQL-68）。固定文言のみ。
+    NoDataFound,
+    /// PL/pgSQL の `INTO STRICT`／DML の `RETURNING INTO` が 2 行以上（`P0003`。Issue #2225・
+    /// SQL-68）。固定文言のみ。
+    TooManyRows,
+    /// PL/pgSQL の `ELSE` の無い `CASE` 文が不一致（`20000`。Issue #2225・SQL-68）。固定文言のみ。
+    CaseNotFound,
+    /// PL/pgSQL のスカラー関数が `RETURN` に達せず終わりに到達（`2F005`。Issue #2225・SQL-68）。
+    /// 固定文言のみ。
+    FunctionExecutedNoReturnStatement,
     /// 実行中の文を協調的に打ち切った（Issue #1798。ERR-6: `57014`）。`crate::interrupt`
     /// の確認点が返し、commit 前の `Err` としてのみ起きる。理由は応答に出さない。
     QueryCanceled {
@@ -1887,6 +1900,7 @@ impl ClassifiedError for SqlSurfaceError {
             | SqlSurfaceError::MaterializedViewNotRefreshableConcurrently
             | SqlSurfaceError::SequenceNotYetDefined
             | SqlSurfaceError::LastvalNotYetDefined
+            | SqlSurfaceError::RecordNotAssigned
             | SqlSurfaceError::ViewNotAutoUpdatable { .. } => {
                 ErrorClass::ObjectNotInPrerequisiteState
             }
@@ -1925,6 +1939,12 @@ impl ClassifiedError for SqlSurfaceError {
             | SqlSurfaceError::ConflictTargetNotVisible
             | SqlSurfaceError::SchemaDependencyForbidden => ErrorClass::ForbiddenTenantMismatch,
             SqlSurfaceError::InvalidCursorName => ErrorClass::InvalidCursorName,
+            SqlSurfaceError::NoDataFound => ErrorClass::NoDataFound,
+            SqlSurfaceError::TooManyRows => ErrorClass::TooManyRows,
+            SqlSurfaceError::CaseNotFound => ErrorClass::CaseNotFound,
+            SqlSurfaceError::FunctionExecutedNoReturnStatement => {
+                ErrorClass::FunctionExecutedNoReturnStatement
+            }
             SqlSurfaceError::QueryCanceled { .. } => ErrorClass::QueryCanceled,
             SqlSurfaceError::DependentObjectsStillExist { .. } => {
                 ErrorClass::DependentObjectsStillExist
@@ -2239,6 +2259,14 @@ impl std::fmt::Display for SqlSurfaceError {
             // 参照）。
             SqlSurfaceError::InvalidCursorName => {
                 write!(f, "cursor does not exist")
+            }
+            // PostgreSQL と同じ固定文言（変数名・値・行の内容は含めない。Issue #2225）。
+            SqlSurfaceError::RecordNotAssigned => write!(f, "record is not assigned yet"),
+            SqlSurfaceError::NoDataFound => write!(f, "query returned no rows"),
+            SqlSurfaceError::TooManyRows => write!(f, "query returned more than one row"),
+            SqlSurfaceError::CaseNotFound => write!(f, "case not found"),
+            SqlSurfaceError::FunctionExecutedNoReturnStatement => {
+                write!(f, "control reached end of function without RETURN")
             }
             // PostgreSQL と同じ固定文言。理由（切断・取り消し等）は含めない。
             SqlSurfaceError::QueryCanceled { .. } => {
