@@ -1163,6 +1163,7 @@ Date: <IMF-fixdate>
 | `42704` | `UNDEFINED_OBJECT` | 400 | Bad Request | 未登録の ENUM 型名（`create_table`／`alter_table`。Issue #2306）で到達可能。`DROP INDEX` 由来は op 許可リスト外 |
 | `42710` | `DUPLICATE_OBJECT` | 400 | Bad Request | NoSQL 表層の実要求からは到達不能（`ALTER TABLE ... ADD CONSTRAINT` は SQL 表層専用。後述） |
 | `42723` | `DUPLICATE_FUNCTION` | 400 | Bad Request | NoSQL 表層の実要求からは到達不能（`CREATE FUNCTION` は SQL 表層専用。後述） |
+| `42725` | `AMBIGUOUS_FUNCTION` | 400 | Bad Request | NoSQL 表層の実要求からは到達不能（名前だけの `DROP FUNCTION` の候補曖昧は SQL 表層専用。Issue #1917） |
 | `42803` | `GROUPING_ERROR` | 400 | Bad Request | 式索引の式に集計関数がある（SQL 表層専用。NoSQL の `op` 語彙からは到達しない）。Issue #1647 |
 | `42804` | `DATATYPE_MISMATCH` | 400 | Bad Request | NoSQL 表層の実要求からは到達不能（`CASE`／`COALESCE`／`NULLIF`・集合演算・`INNER JOIN` の結合キー型不一致〔SQL-28・RLS-10、Issue #925〕・式層の演算子／関数引数の型不一致〔Issue #1186〕のいずれも SQL 表層専用。後述） |
 | `42809` | `WRONG_OBJECT_TYPE` | 400 | Bad Request | NoSQL 表層の実要求からは到達不能（`DROP TABLE`／`DROP VIEW`・ビューへの書き込みは SQL 表層専用の DDL。後述） |
@@ -1173,6 +1174,7 @@ Date: <IMF-fixdate>
 | `42939` | `RESERVED_NAME` | 400 | Bad Request | 予約名（`pg_` 接頭辞）の SCHEMA 名を指定した（TABLE-27・Issue #1713。NoSQL 表層からは到達しない） |
 | `42P02` | `UNDEFINED_PARAMETER` | 400 | Bad Request | 拡張クエリプロトコル（SQL 表層）の Parse で COPY 文に `$n` を置いた。NoSQL の `op` 語彙からは到達しない。Issue #1759 |
 | `42P10` | `INVALID_COLUMN_REFERENCE` | 400 | Bad Request | NoSQL 表層の実要求からは到達不能（`ON CONFLICT` 衝突対象の束縛は SQL 表層専用。NoSQL の `insert` は `on_conflict` を持たない） |
+| `42P13` | `INVALID_FUNCTION_DEFINITION` | 400 | Bad Request | NoSQL 表層の実要求からは到達不能（`CREATE FUNCTION ... RETURNS` の型検査は SQL 表層専用。後述） |
 | `42P16` | `INVALID_TABLE_DEFINITION` | 400 | Bad Request | `create_table.constraints` に `primary_key` を 2 個以上指定した場合（名前付きを含む。TABLE-22 (d)、Issue #1412・#1437。`ALTER TABLE ... ADD PRIMARY KEY` の重複宣言は SQL 表層専用。後述） |
 | `42P17` | `INVALID_OBJECT_DEFINITION` | 400 | Bad Request | 式索引の式が IMMUTABLE 相当でない（SQL 表層専用。NoSQL の `op` 語彙からは到達しない）。Issue #1647 |
 | `42P18` | `INDETERMINATE_DATATYPE` | 400 | Bad Request | 拡張クエリプロトコル（SQL 表層）の Parse で `$n` の型を決められない。NoSQL の `op` 語彙からは到達しない。Issue #1546 |
@@ -1207,8 +1209,8 @@ Date: <IMF-fixdate>
 | `55P03` | `LOCK_NOT_AVAILABLE` | 503 | Service Unavailable | SQL 表層の明示トランザクション（SQL-31・TASK-221）が単一ライタを保持している間に、書き込み op（`insert`／`update`／`delete`）が書き込みゲートの待機上限を超えた |
 | `57014` | `QUERY_CANCELED` | 503 | Service Unavailable | 実行中の文を協調的に打ち切った（クライアント切断の検出。Issue #1798）。SQL 表層の接続スレッドが起点で、現状 NoSQL の `op` からは到達しない |
 
-到達不能な 18 分類（`21000`・`42501`・`34000`・`P0002`・`42701`・`42P07`・`2BP01`・
-`42809`・`42703`・`42804`・`42710`・`42723`・`25000`・`25001`・`25P01`・`25P02`・`55000`・`44000`）の理由: NoSQL 表層はテナントをセッション
+到達不能な 19 分類（`21000`・`42501`・`34000`・`P0002`・`42701`・`42P07`・`2BP01`・
+`42809`・`42703`・`42804`・`42710`・`42723`・`42P13`・`25000`・`25001`・`25P01`・`25P02`・`55000`・`44000`）の理由: NoSQL 表層はテナントをセッション
 （`SessionPrincipal::policy_context()`）からのみ導出し、クライアント自己申告の
 `tenant_id` 相当値は JSON／ヘッダ／パスいずれの位置でも `42601` で先に拒否する
 ため、`ForbiddenTenantMismatch` を実要求から誘発する経路が構造的に存在しない。
@@ -1249,7 +1251,9 @@ RECOVER-11、Issue #1129）は SQL 表層の分割実行 DML と `CANCEL PARTITI
 （到達不能の一覧からは外した）。射影は部分完了・取り消しとも 409 とする。
 `DuplicateFunction`（`42723`。SQL-26、Issue #1186）は
 `CREATE FUNCTION`／WASM UDF 登録の名前衝突で、NoSQL `op` 許可リストに関数
-登録が無いため到達しない。`CREATE VIEW`／`DROP VIEW`（TABLE-18・SQL-23・
+登録が無いため到達しない。`InvalidFunctionDefinition`（`42P13`。SQL-66、Issue #1916）も
+`CREATE FUNCTION ... RETURNS` の型検査で、同じ理由で到達しない。`AmbiguousFunction`（`42725`。
+SQL-66、Issue #1917）も `DROP FUNCTION` の候補曖昧で、同じ理由で到達しない。`CREATE VIEW`／`DROP VIEW`（TABLE-18・SQL-23・
 TASK-205、Issue #909）は SQL 表層専用の DDL で、NoSQL `op` 許可リストに
 `view` 相当の語彙が無いため `42P07`（名前衝突を `CREATE TABLE` と共有）・
 `2BP01`・`42809` も同様に到達不能。`CREATE INDEX`／`DROP INDEX`（INDEX-7・
