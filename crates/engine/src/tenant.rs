@@ -1987,7 +1987,7 @@ fn insert_typed_row_impl(
             reject_missing_not_null(&schema, volatile_default_columns)?;
         }
         // 文ごとに 1 個の書き込み窓口（BEFORE STATEMENT・行トリガ・AFTER STATEMENT が共有する）。
-        let trigger_writes = trigger_insert_writes(write_txn, ctx);
+        let trigger_writes = trigger_insert_writes(write_txn, ctx, triggers);
         // BEFORE STATEMENT（段 2）は台帳の記録の後（再送ではトリガを呼ばない）、SEQUENCE の採番の前、
         // 行ストアを開く前に発火する（Issue #1726）。
         if let Some(chain) = &trigger_chain {
@@ -2105,8 +2105,9 @@ fn insert_typed_row_impl(
 fn trigger_insert_writes<'a>(
     write_txn: &'a redb::WriteTransaction,
     ctx: &'a PolicyContext,
+    triggers: Option<&'a crate::trigger::TriggerRuntime>,
 ) -> crate::trigger::write_handle::TriggerWriteHandle<'a> {
-    crate::trigger::write_handle::TriggerWriteHandle::new(write_txn, ctx)
+    crate::trigger::write_handle::TriggerWriteHandle::new(write_txn, ctx, triggers)
 }
 
 /// トリガ経路の書き込みの後始末（Issue #1723）。1 行以上書いたら表の世代を進めて `Wrote`。全行を
@@ -2281,6 +2282,10 @@ pub(crate) fn record_ledger_only_unchecked(
     target.with_txn(|write_txn| {
         // INSERT 文トリガは対象が 0 行でも 1 回発火する（Issue #1726）。分類は台帳より前に行う
         // （再送ではトリガを呼ばない）。行トリガは 0 行では発火しない。
+        let triggers = match &trigger_mode {
+            LedgerOnlyTriggers::Insert(t) => *t,
+            _ => None,
+        };
         let plan = match trigger_mode {
             LedgerOnlyTriggers::Skip => None,
             LedgerOnlyTriggers::Insert(triggers) => {
@@ -2304,7 +2309,7 @@ pub(crate) fn record_ledger_only_unchecked(
         let mut trigger_wrote = false;
         if let Some(plan) = &plan {
             let schema = require_table_schema_write_any_identity(write_txn, table)?;
-            let writes = trigger_insert_writes(write_txn, ctx);
+            let writes = trigger_insert_writes(write_txn, ctx, triggers);
             trigger_dml::fire_before_statement(
                 plan,
                 &writes,
@@ -2528,7 +2533,7 @@ pub(crate) fn insert_typed_rows_unchecked(
             }
             // 文ごとに 1 個の書き込み窓口。BEFORE STATEMENT は台帳の記録の後・SEQUENCE の採番の前に
             // 発火する（Issue #1726）。
-            let trigger_writes = trigger_insert_writes(write_txn, ctx);
+            let trigger_writes = trigger_insert_writes(write_txn, ctx, triggers);
             if let Some(chain) = &trigger_chain {
                 trigger_dml::fire_before_statement(
                     chain,
@@ -5007,7 +5012,7 @@ fn update_row_columns_impl(
             // 対象判定は従来と同じ（所有かつ可視。不存在・他テナント・不可視は区別せず `UPDATE 0`）。
             if let Some(plan) = trigger_plan {
                 // BEFORE STATEMENT（段 2）は対象判定の前に発火する（トリガが対象を変えうる。Issue #1726）。
-                let writes = trigger_insert_writes(write_txn, ctx);
+                let writes = trigger_insert_writes(write_txn, ctx, triggers);
                 trigger_dml::fire_before_statement(
                     &plan,
                     &writes,
@@ -5529,7 +5534,7 @@ fn delete_row_impl(
             // DELETE トリガのある表は、行ストアのハンドルを開かない別の適用段へ回す（Issue #1725）。
             if let Some(plan) = trigger_plan {
                 // BEFORE STATEMENT（段 2）は対象判定の前に発火する（Issue #1726）。
-                let writes = trigger_insert_writes(write_txn, ctx);
+                let writes = trigger_insert_writes(write_txn, ctx, triggers);
                 trigger_dml::fire_before_statement(
                     &plan,
                     &writes,
@@ -6219,7 +6224,7 @@ fn delete_rows_where_impl<E>(
     let triggers = if project.is_some() { None } else { triggers };
     target.with_txn(|write_txn| {
         // 文ごとに 1 個の書き込み窓口（BEFORE STATEMENT・行トリガ・AFTER STATEMENT が共有。Issue #1726）。
-        let trigger_writes = trigger_insert_writes(write_txn, ctx);
+        let trigger_writes = trigger_insert_writes(write_txn, ctx, triggers);
         let (candidate_ids, schema, trigger_plan) = {
             let schema =
                 require_table_schema_write_any_identity(write_txn, table).map_err(dml_write_err)?;
@@ -6502,7 +6507,7 @@ fn update_rows_where_impl<E>(
     let triggers = if project.is_some() { None } else { triggers };
     target.with_txn(|write_txn| {
         // 文ごとに 1 個の書き込み窓口（BEFORE STATEMENT・行トリガ・AFTER STATEMENT が共有。Issue #1726）。
-        let trigger_writes = trigger_insert_writes(write_txn, ctx);
+        let trigger_writes = trigger_insert_writes(write_txn, ctx, triggers);
         let (candidate_ids, schema, trigger_plan) = {
             let schema =
                 require_table_schema_write_any_identity(write_txn, table).map_err(dml_write_err)?;
@@ -6678,7 +6683,7 @@ pub(crate) fn update_rows_joined_unchecked<E>(
     let triggers = if project.is_some() { None } else { triggers };
     target.with_txn(|write_txn| {
         // 結合形は文トリガを拒否するため、行トリガの窓口だけを文ごとに 1 個作る（Issue #1726）。
-        let trigger_writes = trigger_insert_writes(write_txn, ctx);
+        let trigger_writes = trigger_insert_writes(write_txn, ctx, triggers);
         let (candidates, schema) = {
             let schema =
                 require_table_schema_write_any_identity(write_txn, table).map_err(dml_write_err)?;
@@ -7273,7 +7278,7 @@ pub(crate) fn truncate_tables_unchecked(
 
                 // BEFORE TRUNCATE（全表。最終集合の並び × トリガ名のバイト順）。行ストアのハンドルは
                 // 開いていない（D5）。書き込み窓口は文ごとに 1 個で、AFTER・確定処理と共有する。
-                let trigger_writes = trigger_insert_writes(write_txn, ctx);
+                let trigger_writes = trigger_insert_writes(write_txn, ctx, triggers);
                 if any_truncate_trigger {
                     let runtime = triggers.ok_or_else(|| {
                         TenantWriteError::TriggerFailed(SqlSurfaceError::FeatureNotSupported {

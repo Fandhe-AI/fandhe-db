@@ -33,7 +33,7 @@ macro_rules! handle {
             [crate::storage::Visibility::Private],
         )
         .expect("ctx");
-        let $h = TriggerWriteHandle::new(&txn, &pctx);
+        let $h = TriggerWriteHandle::new(&txn, &pctx, None);
     };
 }
 

@@ -10,7 +10,8 @@
 //!   作らない）。呼び出し元の `PolicyContext` を差し替える手段は無く、行キーは常に呼び出しテナントの
 //!   `(tenant_id, rowid)` になる（他テナントの行は構造上書けない）
 //! - 台帳は `Disabled`（外側の文の 1 エントリだけが台帳に載る。D10。共通化は #2226 の担当）
-//! - 書き込み先の表に INSERT トリガがあれば `0A000`（入れ子の発火は深さ上限〔#1727〕が入るまで行わない）
+//! - 書き込み先の表に INSERT トリガがあれば入れ子で発火する。深さは `trigger::depth` が数え、上限超過は
+//!   `54001`（Issue #1727）。通過証の無い（未結線の）経路では `0A000`
 //! - 表名は裸の識別子だけ受理し、SCHEMA 配下の内部キー（`#<id>.<name>`）は不在と同じ応答で拒否する
 //!   （内部 ID から他テナントの SCHEMA の表を指せない。本番の SCHEMA 修飾の解決は #2226）
 //! - 書いた表名を記録し、発火側が遅延 FK の検査対象にする
@@ -29,15 +30,23 @@ use crate::tenant::{TenantWriteError, WriteTarget};
 pub(crate) struct TriggerWriteHandle<'a> {
     write_txn: &'a redb::WriteTransaction,
     ctx: &'a PolicyContext,
+    /// 入れ子の発火に使う通過証。`None`（未結線の経路）なら入れ子は従来どおり `0A000`。
+    runtime: Option<&'a super::TriggerRuntime>,
     written_tables: RefCell<Vec<String>>,
 }
 
 impl<'a> TriggerWriteHandle<'a> {
-    /// 外側の文の write txn と呼び出しテナントの文脈を借用して作る。
-    pub(crate) fn new(write_txn: &'a redb::WriteTransaction, ctx: &'a PolicyContext) -> Self {
+    /// 外側の文の write txn と呼び出しテナントの文脈を借用して作る。`runtime` は外側の文が
+    /// 使った通過証で、トリガ本体の書き込みが別のトリガを発火させるときに引き継ぐ（Issue #1727）。
+    pub(crate) fn new(
+        write_txn: &'a redb::WriteTransaction,
+        ctx: &'a PolicyContext,
+        runtime: Option<&'a super::TriggerRuntime>,
+    ) -> Self {
         Self {
             write_txn,
             ctx,
+            runtime,
             written_tables: RefCell::new(Vec::new()),
         }
     }
@@ -84,8 +93,9 @@ impl<'a> TriggerWriteHandle<'a> {
             None,
             &[],
             id_omitted,
-            // 入れ子の発火は行わない（書き込み先に INSERT トリガがあれば `0A000`）。
-            None,
+            // 入れ子で発火する。深さは `trigger::depth` が数え、超過は `54001`。通過証が無い
+            // （未結線の）経路では書き込み先に INSERT トリガがあれば `0A000`（fail-closed）。
+            self.runtime,
         )
         .map_err(crate::sql::exec::map_insert_write_error)?;
         let mut written = self.written_tables.borrow_mut();

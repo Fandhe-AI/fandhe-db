@@ -299,6 +299,7 @@ pub mod tenant;
 pub mod test_sync;
 pub mod tiering;
 pub(crate) mod trigger;
+pub mod trigger_limits;
 pub mod txn;
 pub mod uuid;
 pub mod wasm_udf;

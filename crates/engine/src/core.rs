@@ -110,6 +110,9 @@ mod trigger_update_delete_tests;
 // 文レベルトリガと TRUNCATE トリガの発火の結合テスト（TABLE-45・Issue #1726）。
 #[cfg(test)]
 mod trigger_statement_tests;
+// トリガの入れ子の発火と深さ上限（`54001`）の結合テスト（TABLE-45 (5)・Issue #1727）。
+#[cfg(test)]
+mod trigger_depth_tests;
 
 /// 検索 `k` の上限（直接 Rust API 用）。明示 `LIMIT` の既定値と同値だが、SQL／NoSQL の
 /// `LIMIT` 範囲は起動時設定（`result_limits::ResultLimits`。Issue #1555）が決め、本定数は
@@ -1249,7 +1252,8 @@ pub struct EngineCore {
     ledger_mode: LedgerMode,
     /// BEFORE ROW INSERT トリガの呼び出し口を保持する通過証（TABLE-45・Issue #1723）。発火に対応した
     /// INSERT 経路（SQL の `INSERT ... VALUES`・`INSERT ... SELECT`）だけが `tenant` へ渡す。既定は
-    /// 未結線（トリガ関数の実行は `0A000`）で、実体への結線は Issue #2228。
+    /// 未結線（トリガ関数の実行は `0A000`）で、実体への結線は Issue #2228。入れ子の深さ上限
+    /// （Issue #1727）も保持し、`with_trigger_limits` が起動時に 1 回だけ差し替える。
     trigger_runtime: crate::trigger::TriggerRuntime,
     /// `WHERE` 省略の `UPDATE`／`DELETE` を `42601` で拒否する opt-in のサーバー側構成
     /// （Issue #2210・SQL-36 ポインタ。既定 `false`）。クエリ・セッション変数・HTTP から
@@ -3039,8 +3043,25 @@ impl EngineCore {
         mut self,
         invoker: std::sync::Arc<dyn crate::trigger::call::TriggerFunctionInvoker>,
     ) -> Self {
-        self.trigger_runtime = crate::trigger::TriggerRuntime::with_invoker(invoker);
+        // 深さ上限は `with_trigger_limits` との呼び出し順に依存しないよう保つ。
+        let limits = self.trigger_runtime.limits();
+        self.trigger_runtime =
+            crate::trigger::TriggerRuntime::with_invoker(invoker).with_limits(limits);
         self
+    }
+
+    /// トリガ呼び出しの入れ子深さ上限（[`crate::trigger_limits::TriggerLimits`]）を差し替えた
+    /// ビルダーを返す（Issue #1727。TABLE-45 (5)）。`wire-server` の起動時 CLI フラグ
+    /// `--max-trigger-depth` からのみ呼ぶ（クエリ・セッション変数・HTTP から到達する経路は無い）。
+    /// 未呼び出しならハード上限と同値の既定。超過は `54001` で文全体を拒否する。
+    pub fn with_trigger_limits(mut self, limits: crate::trigger_limits::TriggerLimits) -> Self {
+        self.trigger_runtime = self.trigger_runtime.with_limits(limits);
+        self
+    }
+
+    /// 現在のトリガ深さ上限（Issue #1727）。
+    pub fn trigger_limits(&self) -> crate::trigger_limits::TriggerLimits {
+        self.trigger_runtime.limits()
     }
 
     /// `WHERE` 省略の SQL `UPDATE`／`DELETE` を変更開始前に `42601` で拒否するか（Issue #2210・
