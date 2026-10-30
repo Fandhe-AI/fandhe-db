@@ -185,6 +185,13 @@
 //! `wire_server::window_limits_opt::resolve` に一本化し、`EngineCore::with_window_limits` へ
 //! 1 回だけ注入する（`docs/design/window-limits-cli.md`）。
 //!
+//! `--max-trigger-depth`（Issue #1727。TABLE-45 (5)・SQL-46）: トリガ呼び出しの入れ子（再帰）
+//! 深さの上限（`1`〜`16`）を、プロセス全体に対して起動時に**下げる方向だけ**設定できる opt-in
+//! 注入点（未指定は既定のハード上限 16）。超過は `54001` で文全体を拒否する。範囲外・非数値・
+//! 値欠落・重複指定はいずれも fail-closed で起動エラー。値の解決は
+//! `wire_server::trigger_limits_opt::resolve` に一本化し、`EngineCore::with_trigger_limits` へ
+//! 1 回だけ注入する（`docs/design/trigger-depth-limit-cli.md`）。
+//!
 //! `--max-join-relations`／`--max-join-input-rows`／`--max-join-output-rows`（Issue #1551。
 //! SQL-46）: JOIN のリレーション数（`2`〜`8`）・1 辺の可視入力行数（`1`〜`100000`）・
 //! 結合の出力行数（`1`〜`100000`）の上限を、プロセス全体に対して起動時に**下げる方向だけ**
@@ -492,6 +499,7 @@ fn run_server(args: &[String]) -> ExitCode {
     let mut max_cte_definitions_raw: Option<String> = None;
     let mut max_cte_nesting_depth_raw: Option<String> = None;
     let mut max_window_keys_raw: Option<String> = None;
+    let mut max_trigger_depth_raw: Option<String> = None;
     let mut max_join_relations_raw: Option<String> = None;
     let mut max_join_input_rows_raw: Option<String> = None;
     let mut max_join_output_rows_raw: Option<String> = None;
@@ -1167,6 +1175,26 @@ fn run_server(args: &[String]) -> ExitCode {
                     return ExitCode::FAILURE;
                 }
                 max_window_keys_raw = Some(v.clone());
+                i += 2;
+            }
+            wire_server::trigger_limits_opt::MAX_TRIGGER_DEPTH_FLAG => {
+                let Some(v) = args.get(i + 1) else {
+                    engine::log_stderr!(
+                        "wire-server: {} requires a non-negative integer argument",
+                        wire_server::trigger_limits_opt::MAX_TRIGGER_DEPTH_FLAG
+                    );
+                    return ExitCode::FAILURE;
+                };
+                // Issue #1727: 他の起動時構成フラグと同じく 2 回目以降の指定を
+                // fail-closed に拒否する（last-wins にしない）。
+                if max_trigger_depth_raw.is_some() {
+                    engine::log_stderr!(
+                        "wire-server: {} specified more than once",
+                        wire_server::trigger_limits_opt::MAX_TRIGGER_DEPTH_FLAG
+                    );
+                    return ExitCode::FAILURE;
+                }
+                max_trigger_depth_raw = Some(v.clone());
                 i += 2;
             }
             wire_server::write_lock_wait_opt::FLAG => {
@@ -1997,6 +2025,20 @@ fn run_server(args: &[String]) -> ExitCode {
         }
     };
 
+    // Issue #1727: トリガの入れ子深さ上限を bind・ユーザーストア読込より前に解決する
+    // （fail-closed）。未指定は `TriggerLimits::default()`＝ハード上限 16。
+    let trigger_limits = match wire_server::trigger_limits_opt::resolve(
+        wire_server::trigger_limits_opt::TriggerLimitsRawFlags {
+            max_trigger_depth: max_trigger_depth_raw.as_deref(),
+        },
+    ) {
+        Ok(limits) => limits,
+        Err(e) => {
+            engine::log_stderr!("wire-server: invalid trigger limit configuration: {e}");
+            return ExitCode::FAILURE;
+        }
+    };
+
     // Issue #1551: JOIN のリレーション数・入出力行数上限を bind・ユーザーストア読込より前に
     // 解決する（fail-closed）。未指定は `JoinSizeLimits::default()`＝ハード上限＝現行挙動。
     let join_limits = match wire_server::join_limits_opt::resolve(
@@ -2534,6 +2576,8 @@ fn run_server(args: &[String]) -> ExitCode {
     core = core.with_nesting_limits(nesting_limits);
     // Issue #1900: 未指定でも常に呼ぶ（既定はハード上限と同値で、未注入と挙動が同一）。
     core = core.with_window_limits(window_limits);
+    // Issue #1727: 未指定でも常に呼ぶ（既定はハード上限 16 で、未注入と挙動が同一）。
+    core = core.with_trigger_limits(trigger_limits);
     // Issue #1551: 未指定でも常に呼ぶ（既定はハード上限と同値で、未注入と挙動が同一）。
     core = core.with_join_limits(join_limits);
     // Issue #1847: 未指定でも常に呼ぶ（既定はハード上限と同値で、未注入と挙動が同一）。

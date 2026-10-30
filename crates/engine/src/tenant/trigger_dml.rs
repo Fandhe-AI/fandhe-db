@@ -47,6 +47,27 @@ pub(super) struct TriggeredDml {
     pub(super) trigger_wrote: bool,
 }
 
+/// BEFORE STATEMENT（段 2。Issue #1726）を発火する。対象の列挙より前・redb の表ハンドルを開く前に、
+/// 文につき 1 回、対象が 0 件でも呼ぶ（呼び出し元が台帳の記録の後に呼ぶ。再送ではトリガを呼ばない）。
+pub(super) fn fire_before_statement(
+    plan: &RowTriggerPlan<'_>,
+    writes: &TriggerWriteHandle<'_>,
+    table: &str,
+    schema: &TableSchema,
+    op: TriggerOp,
+) -> Result<(), TenantWriteError> {
+    crate::trigger::fire::fire_statement(
+        plan.runtime,
+        writes,
+        table,
+        schema,
+        &plan.before_stmt,
+        op,
+        crate::catalog::trigger::TriggerTiming::Before,
+    )
+    .map_err(TenantWriteError::TriggerFailed)
+}
+
 /// UPDATE の `SET` 入力（述語形・結合形・id 指定形が共有する）。
 pub(super) struct UpdateSpec<'a> {
     pub(super) assignments: &'a [(usize, Value)],
@@ -141,6 +162,7 @@ pub(super) fn update_rows_with_triggers(
     candidate_ids: &[u64],
     spec: &UpdateSpec<'_>,
     plan: &RowTriggerPlan<'_>,
+    writes: &TriggerWriteHandle<'_>,
 ) -> Result<TriggeredDml, TenantWriteError> {
     if spec
         .row_overrides
@@ -150,7 +172,6 @@ pub(super) fn update_rows_with_triggers(
             "internal: per-row SET values do not match the candidate rows",
         ));
     }
-    let writes = TriggerWriteHandle::new(write_txn, ctx);
     let track_pre_images =
         schema.primary_key().is_some() || !schema.unique_constraints().is_empty();
     let mut pre_images = crate::constraint::UpdatedKeyPreImages::new();
@@ -216,7 +237,7 @@ pub(super) fn update_rows_with_triggers(
             // 表ハンドルを開く前に発火する（再入の不変条件）。
             let fired = crate::trigger::fire::fire_before_row_update(
                 plan.runtime,
-                &writes,
+                writes,
                 table,
                 schema,
                 &plan.before,
@@ -266,8 +287,9 @@ pub(super) fn update_rows_with_triggers(
             &written,
             target.fk_check_mode(),
         )?;
-        // BEFORE が SET に無い主キー・UNIQUE 列を書き換えうるため、BEFORE UPDATE トリガがあれば
-        // 全列を更新済みとして扱う（fail-closed）。無ければ SET の列だけ。
+        // BEFORE ROW が SET に無い主キー・UNIQUE 列を書き換えうるため、BEFORE UPDATE の行トリガが
+        // あれば全列を更新済みとして扱う（fail-closed）。文トリガは NEW を書き換えられないので、
+        // 無ければ SET の列だけ。
         let updated_columns: Vec<usize> = if plan.before.is_empty() {
             let mut cols = update_set_columns(spec);
             cols.sort_unstable();
@@ -293,7 +315,7 @@ pub(super) fn update_rows_with_triggers(
     for (old, new) in &after_queue {
         crate::trigger::fire::fire_after_row(
             plan.runtime,
-            &writes,
+            writes,
             table,
             schema,
             &plan.after,
@@ -303,7 +325,18 @@ pub(super) fn update_rows_with_triggers(
         )
         .map_err(TenantWriteError::TriggerFailed)?;
     }
-    settle_trigger_written_tables(write_txn, target, ctx, &writes)?;
+    // AFTER STATEMENT（段 7。Issue #1726）。対象 0 件・全行スキップでも 1 回発火する。
+    crate::trigger::fire::fire_statement(
+        plan.runtime,
+        writes,
+        table,
+        schema,
+        &plan.after_stmt,
+        TriggerOp::Update,
+        crate::catalog::trigger::TriggerTiming::After,
+    )
+    .map_err(TenantWriteError::TriggerFailed)?;
+    settle_trigger_written_tables(write_txn, target, ctx, writes)?;
     Ok(TriggeredDml {
         applied: written.len(),
         trigger_wrote: !writes.written_tables().is_empty(),
@@ -327,6 +360,7 @@ pub(super) fn update_set_columns(spec: &UpdateSpec<'_>) -> Vec<usize> {
 
 /// `candidate_ids`（列挙済みの対象行）を、BEFORE DELETE トリガを通して削除し、全行の後に索引の後片付け・
 /// 参照先 FK 検査・AFTER DELETE トリガを行う。世代 bump・commit は呼び出し元の責務。
+#[allow(clippy::too_many_arguments)]
 pub(super) fn delete_rows_with_triggers(
     write_txn: &redb::WriteTransaction,
     target: &WriteTarget<'_>,
@@ -335,8 +369,8 @@ pub(super) fn delete_rows_with_triggers(
     schema: &TableSchema,
     candidate_ids: &[u64],
     plan: &RowTriggerPlan<'_>,
+    writes: &TriggerWriteHandle<'_>,
 ) -> Result<TriggeredDml, TenantWriteError> {
-    let writes = TriggerWriteHandle::new(write_txn, ctx);
     // `delete_row_impl` と同じ判定条件（`id` 参照 FK を含む）で、参照アクションの起点の旧値を残す。
     let needs_fk_removed_pre_image = schema.primary_key().is_some()
         || !schema.unique_constraints().is_empty()
@@ -362,7 +396,7 @@ pub(super) fn delete_rows_with_triggers(
         if !plan.before.is_empty() {
             let proceed = crate::trigger::fire::fire_before_row_delete(
                 plan.runtime,
-                &writes,
+                writes,
                 table,
                 schema,
                 &plan.before,
@@ -417,7 +451,7 @@ pub(super) fn delete_rows_with_triggers(
     for old in &after_queue {
         crate::trigger::fire::fire_after_row(
             plan.runtime,
-            &writes,
+            writes,
             table,
             schema,
             &plan.after,
@@ -427,7 +461,18 @@ pub(super) fn delete_rows_with_triggers(
         )
         .map_err(TenantWriteError::TriggerFailed)?;
     }
-    settle_trigger_written_tables(write_txn, target, ctx, &writes)?;
+    // AFTER STATEMENT（段 7。Issue #1726）。対象 0 件・全行スキップでも 1 回発火する。
+    crate::trigger::fire::fire_statement(
+        plan.runtime,
+        writes,
+        table,
+        schema,
+        &plan.after_stmt,
+        TriggerOp::Delete,
+        crate::catalog::trigger::TriggerTiming::After,
+    )
+    .map_err(TenantWriteError::TriggerFailed)?;
+    settle_trigger_written_tables(write_txn, target, ctx, writes)?;
     Ok(TriggeredDml {
         applied: removed.len(),
         trigger_wrote: !writes.written_tables().is_empty(),

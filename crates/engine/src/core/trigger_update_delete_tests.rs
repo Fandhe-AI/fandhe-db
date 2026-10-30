@@ -635,8 +635,9 @@ fn partitioned_dml_is_rejected_when_triggers_exist() {
         };
         assert!(q.rows.is_empty(), "no job record for {op}");
     }
-    // 文トリガは通常実行でも未結線（#1726）のため 0A000。
-    assert_eq!(code(&core, &a, "DELETE FROM trg WHERE id = 1"), "0A000");
+    // 文トリガは通常実行では発火する（Issue #1726。分割実行だけが未結線の `0A000`）。
+    run(&core, &a, "DELETE FROM trg WHERE id = 1").expect("normal delete fires statement trigger");
+    assert_eq!(count(&core, &a, "trg"), 2);
 }
 
 // 発火に未対応の経路（RETURNING・UPSERT・生の行 API）は 0A000。台帳は消費されない。

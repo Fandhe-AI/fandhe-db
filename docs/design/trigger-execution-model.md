@@ -153,6 +153,9 @@
 > `UPDATE OF`・分割実行と未結線経路のガード）。UPSERT の発火・`WHEN` の評価・D6（`27000`）は今回見送り、
 > UPSERT は INSERT・UPDATE のどちらかのトリガがあれば `0A000` のまま。ビュー経由・データ変更 CTE の副文は
 > 共有のフォーム関数を通るため INSERT と同様に発火する。
+>
+> Issue #1726 の実装記録: [trigger-statement-truncate.md](trigger-statement-truncate.md)（段 2・段 7 の文トリガ・
+> 対象 0 行での発火・TRUNCATE トリガの順序と PostgreSQL との差分）。
 
 - 中核の不変条件: **トリガが黙って発火しない経路を作らない**
 - `tenant.rs` の `*_unchecked` 系の書き込み関数（`foreign-key.md` の結線一覧と同じ集合）は、
@@ -219,8 +222,12 @@
 
 - トリガの入れ子の深さは専用のカウンタで数える。既定値＋起動時 CLI `--max-trigger-depth`
   （`engine::trigger_limits`／`wire-server::trigger_limits_opt`。下げる方向だけ）。超過時は
-  `54001` で文全体を拒否する。既定値は**実装既定値であり spec 由来ではない**（案: 16。
-  #1727 で確定）
+  `54001` で文全体を拒否する。既定値は**実装既定値であり spec 由来ではない**（16 で確定。
+  範囲 `1..=16`）
+
+> Issue #1727 の実装記録: [trigger-depth-limit-cli.md](trigger-depth-limit-cli.md)（検査点は
+> `TriggerRuntime::invoke` の 1 か所、計数は thread-local＋RAII ガード）。
+
 - トリガ関数の呼び出しは、関数呼び出し深さ（#2223 ADR の `--max-function-call-depth`）にも
   1 として数える
 - 文数・ループ回数の予算（#2223 ADR）は、外側の文の行が直接発火させた 1 回の呼び出しを

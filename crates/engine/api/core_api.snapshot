@@ -57,6 +57,7 @@ pub mod temp_table_limits;
 pub mod tenant;
 pub mod test_sync;
 pub mod tiering;
+pub mod trigger_limits;
 pub mod txn;
 pub mod uuid;
 pub mod wasm_udf;

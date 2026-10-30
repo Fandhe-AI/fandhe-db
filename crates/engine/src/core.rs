@@ -113,6 +113,12 @@ mod trigger_after_insert_tests;
 // BEFORE・AFTER ROW UPDATE／DELETE トリガの発火の結合テスト（TABLE-45・Issue #1725）。
 #[cfg(test)]
 mod trigger_update_delete_tests;
+// 文レベルトリガと TRUNCATE トリガの発火の結合テスト（TABLE-45・Issue #1726）。
+#[cfg(test)]
+mod trigger_statement_tests;
+// トリガの入れ子の発火と深さ上限（`54001`）の結合テスト（TABLE-45 (5)・Issue #1727）。
+#[cfg(test)]
+mod trigger_depth_tests;
 
 /// 検索 `k` の上限（直接 Rust API 用）。明示 `LIMIT` の既定値と同値だが、SQL／NoSQL の
 /// `LIMIT` 範囲は起動時設定（`result_limits::ResultLimits`。Issue #1555）が決め、本定数は
@@ -1252,7 +1258,8 @@ pub struct EngineCore {
     ledger_mode: LedgerMode,
     /// BEFORE ROW INSERT トリガの呼び出し口を保持する通過証（TABLE-45・Issue #1723）。発火に対応した
     /// INSERT 経路（SQL の `INSERT ... VALUES`・`INSERT ... SELECT`）だけが `tenant` へ渡す。既定は
-    /// 未結線（トリガ関数の実行は `0A000`）で、実体への結線は Issue #2228。
+    /// 未結線（トリガ関数の実行は `0A000`）で、実体への結線は Issue #2228。入れ子の深さ上限
+    /// （Issue #1727）も保持し、`with_trigger_limits` が起動時に 1 回だけ差し替える。
     trigger_runtime: crate::trigger::TriggerRuntime,
     /// `WHERE` 省略の `UPDATE`／`DELETE` を `42601` で拒否する opt-in のサーバー側構成
     /// （Issue #2210・SQL-36 ポインタ。既定 `false`）。クエリ・セッション変数・HTTP から
@@ -3042,8 +3049,25 @@ impl EngineCore {
         mut self,
         invoker: std::sync::Arc<dyn crate::trigger::call::TriggerFunctionInvoker>,
     ) -> Self {
-        self.trigger_runtime = crate::trigger::TriggerRuntime::with_invoker(invoker);
+        // 深さ上限は `with_trigger_limits` との呼び出し順に依存しないよう保つ。
+        let limits = self.trigger_runtime.limits();
+        self.trigger_runtime =
+            crate::trigger::TriggerRuntime::with_invoker(invoker).with_limits(limits);
         self
+    }
+
+    /// トリガ呼び出しの入れ子深さ上限（[`crate::trigger_limits::TriggerLimits`]）を差し替えた
+    /// ビルダーを返す（Issue #1727。TABLE-45 (5)）。`wire-server` の起動時 CLI フラグ
+    /// `--max-trigger-depth` からのみ呼ぶ（クエリ・セッション変数・HTTP から到達する経路は無い）。
+    /// 未呼び出しならハード上限と同値の既定。超過は `54001` で文全体を拒否する。
+    pub fn with_trigger_limits(mut self, limits: crate::trigger_limits::TriggerLimits) -> Self {
+        self.trigger_runtime = self.trigger_runtime.with_limits(limits);
+        self
+    }
+
+    /// 現在のトリガ深さ上限（Issue #1727）。
+    pub fn trigger_limits(&self) -> crate::trigger_limits::TriggerLimits {
+        self.trigger_runtime.limits()
     }
 
     /// `WHERE` 省略の SQL `UPDATE`／`DELETE` を変更開始前に `42601` で拒否するか（Issue #2210・
@@ -7637,16 +7661,23 @@ impl EngineCore {
                 let write_txn = txn.write_txn().ok_or_else(|| SqlSurfaceError::Internal {
                     detail: "internal error".to_string(),
                 })?;
+                // TRUNCATE トリガが書いた表も COMMIT 時の遅延 FK 検査の対象にする（Issue #1726）。
+                let trigger_scope =
+                    crate::tenant::trigger_writes::TriggerWrittenTablesScope::enter();
                 let outcome = crate::sql::exec::execute_truncate_in(
                     crate::tenant::WriteTarget::InTxn(write_txn),
                     ctx,
                     stmt,
                     self.ledger_mode,
+                    Some(&self.trigger_runtime),
                 )?;
                 // 全表に印を付ける（漏れると遅延 FK の COMMIT 時検査が取りこぼす。P0）。
                 // CASCADE（Issue #1644）で連鎖して空にした表も書き込み済みとして扱う。
                 for table in stmt.table_names.iter().chain(outcome.cascaded()) {
                     txn.mark_written(ctx.tenant_id(), table);
+                }
+                for table in trigger_scope.take() {
+                    txn.mark_written(ctx.tenant_id(), &table);
                 }
                 Ok(crate::sql::SqlOutcome::Truncate(outcome))
             }
@@ -14033,7 +14064,14 @@ impl EngineCore {
         ctx: &PolicyContext,
         stmt: &crate::sql::allowlist::ValidatedTruncate,
     ) -> Result<crate::sql::exec::TruncateOutcome, crate::sql::allowlist::SqlSurfaceError> {
-        crate::sql::exec::execute_truncate(&self.storage, ctx, stmt, self.ledger_mode)
+        crate::sql::exec::execute_truncate_in(
+            crate::tenant::WriteTarget::Autocommit(&self.storage),
+            ctx,
+            stmt,
+            self.ledger_mode,
+            // TRUNCATE トリガ（Issue #1726）は通過証を渡す結線済み経路だけが発火する。
+            Some(&self.trigger_runtime),
+        )
     }
 
     /// SQL 表層の単一 DELETE 文実行エントリポイント（SQL-18、TASK-191、#867）。
@@ -14561,7 +14599,7 @@ impl EngineCore {
     }
 
     /// UPDATE の束縛区間（`bind_*` 呼び出しの範囲だけ）で NOT NULL 検査を後回しにするガードを返す。
-    /// 対象表に BEFORE の UPDATE 行トリガ（NEW を書き換え得る）があるときだけで、AFTER のみのトリガ・
+    /// 対象表に BEFORE の UPDATE 行トリガ（NEW を書き換え得る）があるときだけで、AFTER のみ・文のみのトリガ・
     /// トリガ無しは従来どおり束縛時に `23502` を返す（`23502` と `UPDATE 0` の差で行の存在・可視性を
     /// 漏らさない。Issue #1725）。`table` は束縛に渡すスキーマの表名（表ごとに限定するため）。
     /// `UPDATE OF` 付きトリガは SET 列（`DEFAULT` 指定列を含む）と交差するときだけ「発火する」と数える
@@ -14580,6 +14618,9 @@ impl EngineCore {
             .iter()
             .any(|t| {
                 t.timing == crate::catalog::trigger::TriggerTiming::Before
+                    // 文トリガは NEW を書き換えられないので延期しない（延期すると `23502` と `UPDATE 0` の
+                    // 差で行の存在を漏らす。Issue #1726）。
+                    && t.level == crate::catalog::trigger::TriggerLevel::Row
                     && t.events
                         .contains(crate::catalog::trigger::TriggerEvents::UPDATE)
                     && (t.update_of.is_empty()
