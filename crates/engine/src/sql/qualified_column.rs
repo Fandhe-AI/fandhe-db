@@ -135,7 +135,21 @@ pub(crate) fn normalize_single_table_qualifiers(
         let outer_levels_up = if own {
             None
         } else {
-            Some(resolve_outer_levels_up(&scopes, cur, qualifier)?)
+            match resolve_outer_levels_up(&scopes, cur, qualifier) {
+                Ok(levels_up) => Some(levels_up),
+                // `colref_sink` の記録区間でスコープ内のレコード変数名と一致する修飾子は、表の公開名
+                // として解決できない場合に限り `rec.field` の変数参照として残す（表の公開名が常に優先。
+                // 記録区間が無ければ従来どおりエラー）。解釈は構文解析器の式項（`QualifiedIdent` 腕）が担う。
+                // どこにも一致しない（`42P01`）ときだけ。不透明スコープ越しの外側一致などの
+                // 他のエラーは従来どおり返す（外側の表の別名を変数へ化けさせない）。
+                Err(e)
+                    if e.wire_code() == "42P01"
+                        && crate::sql::colref_sink::is_scope_var(qualifier) =>
+                {
+                    continue
+                }
+                Err(e) => return Err(e),
+            }
         };
         if own || outer_levels_up.is_some() {
             let buf = out.get_or_insert_with(|| tokens.to_vec());
