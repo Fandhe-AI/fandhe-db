@@ -233,7 +233,7 @@ fn outer_aggregates_match_body_result_oracle_per_tenant() {
         .expect("where+count");
         assert_eq!(cells(&r), vec![vec![int(ja)]], "tenant={tenant} where");
 
-        // 数値集計（公開している id 列は NULL 可能な BIGINT として集計できる）。
+        // 数値集計（公開している id 列は NULL 可能な numeric(20,0)（疑似列 `id` と同じ型。Issue #2744）として集計できる）。
         let r = run(
             &core,
             tenant,
@@ -245,8 +245,8 @@ fn outer_aggregates_match_body_result_oracle_per_tenant() {
         assert_eq!(
             cells(&r),
             vec![vec![
-                Cell::SignedInteger(min_id as i64),
-                Cell::SignedInteger(max_id as i64),
+                Cell::Numeric(engine::numeric::Decimal::from_parts(i128::from(min_id), 0).unwrap()),
+                Cell::Numeric(engine::numeric::Decimal::from_parts(i128::from(max_id), 0).unwrap()),
                 int(by_lang.len() as u64)
             ]],
             "tenant={tenant} min/max/count distinct"
