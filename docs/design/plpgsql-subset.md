@@ -494,11 +494,12 @@ D3・D5・D6・D8 の最終判断。実装は `crates/engine/src/core/plpgsql_ho
   scale 0 の numeric を含む。NaN／Infinity は `0A000`）。(2) `ConstExpr`（`INSERT .. VALUES` の要素。
   定数式の束縛が利用者の `CAST` を拒否する。パーサーが `colref_sink::Role::ConstExpr` で記録し、
   `EXECUTE` は直前の `VALUES` から推定する）は、NULL は裸、日付・時刻は `DATE '...'` 等の型付きリテラル、
-  整数（smallint／integer／bigint）と浮動小数（real／double）は内部専用の型付き値トークン
-  （`lexer::Token::TypedValue`。字句解析器は利用者の文字列から生成せず、`render_tokens` は `None`、
-  内容ハッシュは拒否する）で置換する。許可リストの定数式の解析がこれを `trusted` な `Expr::Cast` へ
-  変換し、畳み込みが宣言型どおりの算術を行う（bigint の `p + 1` が int4 の範囲エラーにならない）。
-  利用者の `CAST` は `trusted: false` のままで、`VALUES (CAST(1 AS bigint))` は 0A000 のまま。
+  整数（smallint／integer／bigint）と浮動小数（real／double）は内部専用の型付き値（合成識別子
+  `$typed:<型>` + 数値。`$` で始まる識別子は字句解析器が生成せず利用者は書けない）で置換する。
+  許可リストの定数式の解析がこれを `Expr::Call`（`udf_call::typed_value_expr`）へ変換し、束縛は
+  `CAST` と同一に行うため、畳み込みが宣言型どおりの算術を行う（bigint の `p + 1` が int4 の範囲エラー
+  にならない）。公開の `Token`・`Expr` の形は変えない。利用者の `CAST` は従来どおり定数式で拒否され、
+  `VALUES (CAST(1 AS bigint))` は 0A000 のまま。
   numeric は定数式で算術できないため、単独の要素（符号付きを含む）は裸の数値（列型が決める）、
   式の中は 0A000。静的 SQL の `VALUES (-p)` は定義時の検証が拒否する（素の SQL の `-col` と同じ）。
   負値の numeric を単項マイナスの下に置く形（`-(-3)`）は括弧付きになり定数式が受理しない。
@@ -525,6 +526,8 @@ SQL 構文解析器は列の存在を束縛段（実行時）まで確かめな�
 できない。そこで、文が参照する関係（`relation_positions` の関係位置。SCHEMA 修飾は解決済み）のスキーマを
 引き、列としても読める位置（`Value`／`WhereHead`／`SelectItemBare`／`OrderKey`／`GroupKey`）の未修飾の
 変数名が、その表の列名（疑似列 `id` を含む）と一致すれば `42702`（固定文言。変数名を含めない）とする。
+`LiteralSlot` と `INSERT .. VALUES` の定数式（`ConstExpr`）は表の列を参照できないので対象外（列名と同名の
+変数を `VALUES (id, n)` に置いても衝突にしない）。
 検査結果は文・式ごとにキャッシュし、ループで繰り返さない。
 
 ### 既知の差（security.md P0 の優先。後続で縮められる）

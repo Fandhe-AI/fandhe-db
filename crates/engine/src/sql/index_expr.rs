@@ -593,10 +593,9 @@ pub(crate) fn fold_session_local_literals(expr: &Expr) -> Result<Expr, SqlSurfac
             collation: *collation,
         },
         Expr::SqlJsonQuery(q) => Expr::SqlJsonQuery(Box::new(q.try_map_children(&mut |e| rec(e))?)),
-        Expr::Cast { expr, ty, trusted } => Expr::Cast {
+        Expr::Cast { expr, ty } => Expr::Cast {
             expr: Box::new(rec(expr)?),
             ty: ty.clone(),
-            trusted: *trusted,
         },
     })
 }
@@ -747,9 +746,7 @@ pub(crate) fn check_bound_index_expression_determinism(
             rec(pattern)
         }
         Expr::Collate { expr, .. } => rec(expr),
-        Expr::Cast {
-            expr: inner, ty, ..
-        } => {
+        Expr::Cast { expr: inner, ty } => {
             let src = ty_of(inner);
             let src_tz = src == Some(ExprType::TimestampTz);
             let dst_tz = matches!(ty, crate::sql::cast::CastType::TimestampTz);

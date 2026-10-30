@@ -212,7 +212,14 @@ struct CorePlHost<'a, 'e> {
     conflict_checked: HashSet<(u8, usize)>,
 }
 
-/// 変数名と列名が衝突しうる役割（列としても読める位置）。リテラル専用位置は列を受理しない。
+/// オペランドを単独で評価できない形の失敗か（構文誤り `42601`・未対応の形 `0A000`）。これらは条件
+/// 全体を `WHERE` 形で評価し直す。それ以外（22xxx の評価エラー等）は本物のエラーとして返す。
+fn is_shape_failure(e: &SqlSurfaceError) -> bool {
+    matches!(e.wire_code(), "42601" | "0A000")
+}
+
+/// 変数名と列名が衝突しうる役割（列としても読める位置）。リテラル専用位置（`LiteralSlot`）と
+/// `INSERT .. VALUES` の定数式（`ConstExpr`。表の列を参照できない）は列を受理しないため除く。
 fn is_column_capable(role: VarRole) -> bool {
     matches!(
         role,
@@ -221,7 +228,6 @@ fn is_column_capable(role: VarRole) -> bool {
             | VarRole::SelectItemBare
             | VarRole::OrderKey
             | VarRole::GroupKey
-            | VarRole::ConstExpr
     )
 }
 
@@ -577,16 +583,22 @@ impl PlHost for CorePlHost<'_, '_> {
         let inner = strip_outer_parens(&toks);
         if !has_compound_word(inner) {
             if let Some((l, op, r)) = split_single_comparison(inner) {
-                // 評価できないオペランドはここでは無視し、後続の条件評価が同じエラーを返す。
-                if let (Ok(lv), Ok(rv)) = (self.operand_value(l), self.operand_value(r)) {
-                    let (Some(mut lt), Some(rt)) = (lv, rv) else {
-                        return Ok(None);
-                    };
-                    // 演算を含むオペランドは評価済みの値のリテラルに置き換えて比較する（`FROM` の無い
-                    // `WHERE` は演算を含む式を受理しない）。
-                    lt.extend_from_slice(op);
-                    lt.extend(rt);
-                    return Ok(Some(self.where_probe(lt)?));
+                // 「この形は評価できない」失敗（構文・未対応の形）だけを後続の条件評価へ回す。0 除算
+                // （22012）・範囲外（22003）などの評価の本物のエラーはそのまま返す（解析し直して
+                // 別のコードに化けさせない）。
+                match (self.operand_value(l), self.operand_value(r)) {
+                    (Ok(lv), Ok(rv)) => {
+                        let (Some(mut lt), Some(rt)) = (lv, rv) else {
+                            return Ok(None);
+                        };
+                        // 演算を含むオペランドは評価済みの値のリテラルに置き換えて比較する
+                        // （`FROM` の無い `WHERE` は演算を含む式を受理しない）。
+                        lt.extend_from_slice(op);
+                        lt.extend(rt);
+                        return Ok(Some(self.where_probe(lt)?));
+                    }
+                    (Err(e), _) | (_, Err(e)) if !is_shape_failure(&e) => return Err(e),
+                    _ => {}
                 }
             }
         }

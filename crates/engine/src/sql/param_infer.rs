@@ -525,7 +525,7 @@ impl Inferrer<'_> {
             // 変換（smallint・bigint・real・double precision 宛て）は `bind_cast` が未実装（`0A000`）の
             // ため、これらは推論せず `Untyped` に留める。それ以外（日付・jsonb・bool・numeric・配列等）も
             // Describe の仮値置換が成り立たないため従来どおり `Untyped`（不定。宣言型が無ければ `42P18`）。
-            Expr::Cast { expr, ty, .. } => match as_param(expr) {
+            Expr::Cast { expr, ty } => match as_param(expr) {
                 Some(n) => {
                     let inferred = match ty.result_column_type() {
                         Some(ct @ (ColumnType::Integer | ColumnType::Varchar(_))) => {

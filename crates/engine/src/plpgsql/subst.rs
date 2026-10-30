@@ -16,7 +16,7 @@ use crate::plpgsql::ast::{VarRole, VarSite};
 use crate::plpgsql::host::{PlScalar, VarLookup};
 use crate::sql::allowlist::SqlSurfaceError;
 use crate::sql::exec::Cell;
-use crate::sql::lexer::{self, Token, TypedKind};
+use crate::sql::lexer::{self, Token};
 
 fn unsupported_type() -> SqlSurfaceError {
     SqlSurfaceError::feature_not_supported(
@@ -179,8 +179,8 @@ fn bare_number_tokens(v: &PlScalar) -> Result<Vec<Token>, SqlSurfaceError> {
 }
 
 /// `INSERT .. VALUES` の要素（定数式。利用者の `CAST` を受理しない）の数値のトークン列。
-/// 整数（smallint／integer／bigint）と浮動小数（real／double）は、内部専用の型付き値トークン
-/// （[`Token::TypedValue`]。字句解析器は利用者の文字列から生成しない）で置換し、定数式の畳み込みが
+/// 整数（smallint／integer／bigint）と浮動小数（real／double）は、内部専用の型付き値（合成識別子
+/// `$typed:<型>` + 数値。字句解析器は利用者の文字列から生成しない）で置換し、定数式の畳み込みが
 /// 宣言型どおりの算術を行う（`p + 1` が bigint の算術になる）。numeric は定数式で算術できないため、
 /// 単独の要素（[`is_lone`]）なら裸の数値（書き込み先の列型が決める）、式の中では `0A000`
 /// （型が黙って変わる経路を残さない）。
@@ -199,18 +199,22 @@ fn const_number_tokens(
                 ))
             };
         }
-        (ColumnType::SmallInt, _) => TypedKind::Int2,
-        (ColumnType::Integer, _) => TypedKind::Int4,
-        (ColumnType::BigInt, _) => TypedKind::Int8,
-        (ColumnType::Real, _) => TypedKind::Float4,
-        (_, Cell::Float(_)) => TypedKind::Float8,
-        (_, Cell::SignedInteger(i)) if i32::try_from(*i).is_ok() => TypedKind::Int4,
-        (_, Cell::Integer(u)) if i32::try_from(*u).is_ok() => TypedKind::Int4,
-        _ => TypedKind::Int8,
+        (ColumnType::SmallInt, _) => "int2",
+        (ColumnType::Integer, _) => "int4",
+        (ColumnType::BigInt, _) => "int8",
+        (ColumnType::Real, _) => "float4",
+        (_, Cell::Float(_)) => "float8",
+        (_, Cell::SignedInteger(i)) if i32::try_from(*i).is_ok() => "int4",
+        (_, Cell::Integer(u)) if i32::try_from(*u).is_ok() => "int4",
+        _ => "int8",
     };
     match bare.pop() {
         Some(Token::Number(raw)) => {
-            bare.push(Token::TypedValue { kind, raw });
+            bare.push(Token::Ident(format!(
+                "{}{kind}",
+                crate::sql::udf_call::TYPED_VALUE_PREFIX
+            )));
+            bare.push(Token::Number(raw));
             Ok(bare)
         }
         _ => Err(unsupported_type()),

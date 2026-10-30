@@ -361,10 +361,6 @@ pub enum Expr {
     Cast {
         expr: Box<Expr>,
         ty: crate::sql::cast::CastType,
-        /// 内部トークン（[`Token::TypedValue`](crate::sql::lexer::Token::TypedValue)）由来で、
-        /// PL/pgSQL の変数の宣言型を定数式へ持ち込むためのもの。ユーザーが書いた `CAST` は常に偽で、
-        /// 定数式（`INSERT .. VALUES`）では従来どおり拒否される（`const_expr::prescan`）。
-        trusted: bool,
     },
     /// 配列コンストラクタ `ARRAY[<expr>, ...]`（対象ビヘイビア: TABLE-35。Issue #1602）。
     /// 要素型の統一は束縛段（`sql::array_expr`）が行う。多次元・`ARRAY(<subquery>)` は構文段が拒否する。
@@ -1851,7 +1847,8 @@ pub enum NumericKind {
 /// `Round1`／`Round2` へオーバーロード解決されるため [`builtin_from_name`] の
 /// 対象外だが、名前としては組み込み扱いにする必要があるためここで別途判定する。
 pub(crate) fn is_builtin_function_name(name: &str) -> bool {
-    builtin_from_name(name).is_some()
+    typed_value_cast_type(name).is_some()
+        || builtin_from_name(name).is_some()
         || is_variadic_or_overloaded_builtin_name(name)
         || is_current_time_function_name(name)
         || crate::sql::json_fn::is_json_fn_name(&name.to_ascii_lowercase())
@@ -1859,6 +1856,35 @@ pub(crate) fn is_builtin_function_name(name: &str) -> bool {
         || json_fn_from_name(name).is_some()
         || is_deferred_json_srf_name(name)
         || crate::sql::jsonpath_fn::is_jsonpath_fn_name(&name.to_ascii_lowercase())
+}
+
+/// 内部専用の型付き値の合成識別子の接頭辞。`$` で始まる識別子は字句化できない（引用識別子も `$` を
+/// 含められない）ため、利用者の SQL からは書けない。`Token`・公開 enum [`Expr`] の形を変えずに、
+/// 定数式へ宣言型を持ち込む（#2779 の合成識別子 `$k` と同じ考え方）。トークン列では
+/// `Ident("$typed:<型>")` の直後に数値トークン 1 個が続く。
+pub(crate) const TYPED_VALUE_PREFIX: &str = "$typed:";
+
+/// 内部専用の型付き値の式（`$typed:<型>(<数値リテラル>)`。`allowlist` の一次式が上記トークン列から
+/// 作る）。束縛は `bind_call` が `CAST(<数値> AS <型>)` と同一に行い、利用者の `CAST` は定数式で
+/// 拒否される（`const_expr::prescan`）ままになる。
+pub(crate) fn typed_value_expr(ident: &str, raw: String) -> Expr {
+    Expr::Call {
+        name: ident.to_string(),
+        args: vec![Expr::Number(raw)],
+    }
+}
+
+/// 内部専用の型付き値の呼び出し名なら、その変換先の型。
+fn typed_value_cast_type(name: &str) -> Option<crate::sql::cast::CastType> {
+    use crate::sql::cast::CastType;
+    Some(match name.strip_prefix(TYPED_VALUE_PREFIX)? {
+        "int2" => CastType::Int2,
+        "int4" => CastType::Int4,
+        "int8" => CastType::Int8,
+        "float4" => CastType::Float4,
+        "float8" => CastType::Float8,
+        _ => return None,
+    })
 }
 
 /// jsonb 関数（[`JsonFnKind`]）の名前解決（Issue #1599）。大小は無視する。
@@ -5927,9 +5953,7 @@ pub(super) fn bind_expr_any(
         Expr::ValueFunction { kind, precision } => bind_value_function(*kind, *precision, env),
         Expr::SqlJsonQuery(q) => crate::sql::jsonpath_fn::bind_sql_json_query(q, env, node_budget),
         // `CAST`／`<type> '<literal>'`（SQL-47・Issue #1590）。規則表の判定と束縛は `sql::cast`。
-        Expr::Cast {
-            expr: inner, ty, ..
-        } => crate::sql::cast::bind_cast(inner, ty, env, node_budget),
+        Expr::Cast { expr: inner, ty } => crate::sql::cast::bind_cast(inner, ty, env, node_budget),
         // 配列コンストラクタ・添字・スライス（TABLE-35・Issue #1602）。束縛は `sql::array_expr`。
         Expr::ArrayConstructor(items) => {
             crate::sql::array_expr::bind_array_constructor(items, env, node_budget)
@@ -7901,7 +7925,6 @@ fn schema_fn_bool_arg(arg: &Expr) -> Result<Option<bool>, SqlSurfaceError> {
         Expr::Cast {
             expr,
             ty: crate::sql::cast::CastType::Bool,
-            ..
         } => match &**expr {
             Expr::String(s) => parse(s).map(Some).ok_or_else(no_such),
             Expr::Null => Ok(None),
@@ -7965,6 +7988,14 @@ fn bind_call(
     env: &mut BindEnv<'_>,
     node_budget: &mut usize,
 ) -> Result<(BoundExpr, ExprType), SqlSurfaceError> {
+    if let Some(ty) = typed_value_cast_type(name) {
+        return match args {
+            [inner] => crate::sql::cast::bind_cast(inner, &ty, env, node_budget),
+            _ => Err(SqlSurfaceError::Internal {
+                detail: "malformed internal typed value".to_string(),
+            }),
+        };
+    }
     if args.len() > MAX_FUNCTION_CALL_ARGS {
         return Err(SqlSurfaceError::TooManyArguments {
             detail: TOO_MANY_FUNCTION_ARGS_DETAIL,

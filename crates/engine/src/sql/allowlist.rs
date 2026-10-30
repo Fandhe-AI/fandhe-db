@@ -11107,7 +11107,6 @@ impl<'a> Parser<'a> {
                 Ok(Expr::Cast {
                     expr: Box::new(Expr::String(literal)),
                     ty: crate::sql::cast::CastType::Bool,
-                    trusted: false,
                 })
             }
             Some(Token::Ident(name))
@@ -11145,30 +11144,40 @@ impl<'a> Parser<'a> {
                 self.consume_expr_node()?;
                 Ok(Expr::Number(n))
             }
-            // 内部専用の型付き数値（`plpgsql::subst` の `Role::ConstExpr` 置換だけが作る。字句解析器は
-            // ユーザーの文字列から生成しない）。宣言型の `trusted` な `CAST` へ変換する。符号は
-            // 直前の `-` を数値へ畳む（`i32::MIN` のような負の境界値を範囲内に保つ）。
-            Some(Token::TypedValue { kind, raw }) => {
-                self.advance();
-                self.consume_expr_node()?;
-                self.consume_expr_node()?;
-                Ok(typed_value_expr(kind, raw))
-            }
-            Some(Token::Punct('-'))
-                if matches!(
-                    self.tokens.get(self.pos + 1),
-                    Some(Token::TypedValue { .. })
-                ) =>
+            // 内部専用の型付き数値（`plpgsql::subst` の `Role::ConstExpr` 置換だけが作る合成識別子
+            // `$typed:<型>` + 数値。`$` で始まる識別子は字句解析器が生成しない）。
+            Some(Token::Ident(name))
+                if name.starts_with(crate::sql::udf_call::TYPED_VALUE_PREFIX)
+                    && matches!(self.tokens.get(self.pos + 1), Some(Token::Number(_))) =>
             {
                 self.advance();
-                let Some(Token::TypedValue { kind, raw }) = self.advance().cloned() else {
-                    return Err(SqlSurfaceError::unsupported(
-                        "expected a typed value after '-'",
-                    ));
+                let Some(Token::Number(raw)) = self.advance().cloned() else {
+                    return Err(SqlSurfaceError::unsupported("expected a typed number"));
                 };
                 self.consume_expr_node()?;
                 self.consume_expr_node()?;
-                Ok(typed_value_expr(kind, format!("-{raw}")))
+                Ok(crate::sql::udf_call::typed_value_expr(&name, raw))
+            }
+            // 符号付き（直前の `-` を数値へ畳む。`i32::MIN` のような負の境界値を範囲内に保つ）。
+            Some(Token::Punct('-'))
+                if matches!(
+                    (self.tokens.get(self.pos + 1), self.tokens.get(self.pos + 2)),
+                    (Some(Token::Ident(n)), Some(Token::Number(_)))
+                        if n.starts_with(crate::sql::udf_call::TYPED_VALUE_PREFIX)
+                ) =>
+            {
+                self.advance();
+                let (Some(Token::Ident(name)), Some(Token::Number(raw))) =
+                    (self.advance().cloned(), self.advance().cloned())
+                else {
+                    return Err(SqlSurfaceError::unsupported("expected a typed number"));
+                };
+                self.consume_expr_node()?;
+                self.consume_expr_node()?;
+                Ok(crate::sql::udf_call::typed_value_expr(
+                    &name,
+                    format!("-{raw}"),
+                ))
             }
             // Issue #1430・SQL-24: 負の数値リテラル（字句ペア `-` + Number を 1 ノードの
             // 数値へ畳む）。`-col`・`-(expr)`・`- -1` は一般の単項マイナスとして受理せず、
@@ -11452,7 +11461,6 @@ impl<'a> Parser<'a> {
                 Ok(Expr::Cast {
                     expr: Box::new(Expr::String(literal)),
                     ty,
-                    trusted: false,
                 })
             }
             // SQL-37（Issue #1586）: 括弧なし SQL 値関数（`CURRENT_TIMESTAMP`・`CURRENT_DATE`・
@@ -11763,7 +11771,6 @@ impl<'a> Parser<'a> {
         Ok(Expr::Cast {
             expr: Box::new(operand),
             ty,
-            trusted: false,
         })
     }
 
@@ -12923,14 +12930,11 @@ impl<'a> Parser<'a> {
                         || s.eq_ignore_ascii_case("null"));
                 !plain_keyword
             }
-            // 内部専用の型付き数値（符号付きを含む）は式として解析する。
-            Some(Token::TypedValue { .. }) => true,
-            Some(Token::Punct('-')) => {
-                matches!(
-                    self.tokens.get(self.pos + 1),
-                    Some(Token::TypedValue { .. })
-                )
-            }
+            // 符号付きの内部専用の型付き数値（`- $typed:<型> <数値>`）も式として解析する。
+            Some(Token::Punct('-')) => matches!(
+                self.tokens.get(self.pos + 1),
+                Some(Token::Ident(n)) if n.starts_with(crate::sql::udf_call::TYPED_VALUE_PREFIX)
+            ),
             // 記録区間でスコープ内レコード変数の `rec.field` で始まる式（記録区間が無ければ偽）。
             Some(Token::QualifiedIdent { .. }) => self.peek_is_scope_record_at(self.pos),
             _ => false,
@@ -16201,7 +16205,6 @@ impl<'a> Parser<'a> {
             lhs = Expr::Cast {
                 expr: Box::new(lhs),
                 ty,
-                trusted: false,
             };
         }
         Ok(lhs)
@@ -41139,24 +41142,5 @@ mod create_table_as_tests {
             let e = validate_create_temp_table_tokens(&tokens).expect_err(sql);
             assert_eq!(e.wire_code(), "0A000", "{sql}");
         }
-    }
-}
-
-/// 内部専用の型付き数値（[`Token::TypedValue`]）を、宣言型の `trusted` な `CAST` へ変換する。
-/// ユーザーが書いた `CAST` は `trusted: false` のまま定数式で拒否される（`const_expr::prescan`）。
-fn typed_value_expr(kind: crate::sql::lexer::TypedKind, raw: String) -> Expr {
-    use crate::sql::cast::CastType;
-    use crate::sql::lexer::TypedKind;
-    let ty = match kind {
-        TypedKind::Int2 => CastType::Int2,
-        TypedKind::Int4 => CastType::Int4,
-        TypedKind::Int8 => CastType::Int8,
-        TypedKind::Float4 => CastType::Float4,
-        TypedKind::Float8 => CastType::Float8,
-    };
-    Expr::Cast {
-        expr: Box::new(Expr::Number(raw)),
-        ty,
-        trusted: true,
     }
 }

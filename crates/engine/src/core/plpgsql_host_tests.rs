@@ -1243,3 +1243,61 @@ fn execute_using_values_follow_the_same_substitution() {
     .expect("literal slots");
     assert_eq!(as_i64(&out), 1);
 }
+
+// ---- Issue #2226 レビュー対応（列名と同名の変数・比較のエラーコード）----
+
+#[test]
+fn variables_named_like_columns_work_in_values_elements() {
+    let (core, _g) = new_core(LedgerMode::Optional);
+    let c = ctx("t1");
+    // VALUES の定数式は表の列を参照できないため、列名と同名の変数は 42702 にならない。
+    call(
+        "BEGIN INSERT INTO docs (id, embedding, lang, n) VALUES (id, '[0.1,0.2]', lang, n); RETURN 1; END",
+    )
+    .param("id", SqlColumnTypeName::BigInt, big(7))
+    .param("lang", SqlColumnTypeName::Text, text("xx"))
+    .param("n", SqlColumnTypeName::Integer, int(5))
+    .autocommit(&core, &c)
+    .expect("static VALUES with column-named variables");
+    assert_eq!(n_of(&core, &c, 7), Some(5));
+    // EXECUTE の USING は名前を持たないので同名でも通る。
+    call(
+        "BEGIN EXECUTE 'INSERT INTO docs (id, embedding, lang, n) VALUES ($1, ''[0.1,0.2]'', $2, $3)' USING id, lang, n; RETURN 1; END",
+    )
+    .param("id", SqlColumnTypeName::BigInt, big(8))
+    .param("lang", SqlColumnTypeName::Text, text("yy"))
+    .param("n", SqlColumnTypeName::Integer, int(6))
+    .autocommit(&core, &c)
+    .expect("execute with column-named variables");
+    assert_eq!(n_of(&core, &c, 8), Some(6));
+    // 列を参照できる位置（WHERE）では従来どおり 42702。
+    let e =
+        call("DECLARE c bigint; BEGIN SELECT count(*) INTO c FROM docs WHERE n = n; RETURN c; END")
+            .param("n", SqlColumnTypeName::Integer, int(1))
+            .autocommit(&core, &c)
+            .expect_err("ambiguous in WHERE");
+    assert_eq!(e.wire_code(), "42702");
+}
+
+#[test]
+fn comparison_evaluation_errors_keep_their_sqlstate() {
+    let (core, _g) = new_core(LedgerMode::Optional);
+    let c = ctx("t1");
+    let run = |cond: &str, arg: i64| {
+        call(&format!(
+            "BEGIN IF {cond} THEN RETURN 1; END IF; RETURN 0; END"
+        ))
+        .param("p", SqlColumnTypeName::Integer, int(arg))
+        .autocommit(&core, &c)
+    };
+    // 0 除算は 22012、int4 の範囲外は 22003（0A000・42601 に化けない）。
+    assert_eq!(run("p / 0 = 1", 5).expect_err("div0").wire_code(), "22012");
+    assert_eq!(
+        run("p + 1 = 0", 2_147_483_647)
+            .expect_err("overflow")
+            .wire_code(),
+        "22003"
+    );
+    // 評価できる比較は従来どおり。
+    assert_eq!(as_i64(&run("p + 1 = 6", 5).expect("ok")), 1);
+}

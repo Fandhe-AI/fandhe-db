@@ -9,7 +9,7 @@ use super::subst::{scalar_tokens, scalar_tokens_styled, substitute, substitute_p
 use crate::catalog::ColumnType;
 use crate::sql::allowlist::SqlSurfaceError;
 use crate::sql::exec::Cell;
-use crate::sql::lexer::{self, Token, TypedKind};
+use crate::sql::lexer::{self, Token};
 
 struct Env(Vec<PlScalar>);
 
@@ -414,11 +414,12 @@ fn dynamic_param_roles_survive_and_inside_case_and_literal_slots() {
     );
 }
 
-fn tv(kind: TypedKind, raw: &str) -> Token {
-    Token::TypedValue {
-        kind,
-        raw: raw.to_string(),
-    }
+/// 内部専用の型付き値（合成識別子 + 数値）のトークン列。
+fn tv(kind: &str, raw: &str) -> Vec<Token> {
+    vec![
+        Token::Ident(format!("$typed:{kind}")),
+        Token::Number(raw.to_string()),
+    ]
 }
 
 #[test]
@@ -427,27 +428,27 @@ fn const_expr_elements_use_internal_typed_values() {
     let cases: Vec<(PlScalar, Vec<Token>)> = vec![
         (
             typed(ColumnType::BigInt, Cell::SignedInteger(2_147_483_647)),
-            vec![tv(TypedKind::Int8, "2147483647")],
+            tv("int8", "2147483647"),
         ),
         (
             typed(ColumnType::BigInt, Cell::SignedInteger(-5)),
-            vec![Token::Punct('-'), tv(TypedKind::Int8, "5")],
+            [vec![Token::Punct('-')], tv("int8", "5")].concat(),
         ),
         (
             typed(ColumnType::SmallInt, Cell::SignedInteger(7)),
-            vec![tv(TypedKind::Int2, "7")],
+            tv("int2", "7"),
         ),
         (
             typed(ColumnType::Integer, Cell::SignedInteger(7)),
-            vec![tv(TypedKind::Int4, "7")],
+            tv("int4", "7"),
         ),
         (
             typed(ColumnType::Double, Cell::Float(1.5)),
-            vec![tv(TypedKind::Float8, "1.5")],
+            tv("float8", "1.5"),
         ),
         (
             typed(ColumnType::Real, Cell::Float(2.0)),
-            vec![tv(TypedKind::Float4, "2.0")],
+            tv("float4", "2.0"),
         ),
     ];
     for (v, want) in cases {
@@ -498,8 +499,10 @@ fn const_expr_numeric_is_bare_only_as_a_lone_element() {
 }
 
 #[test]
-fn internal_typed_value_cannot_be_rendered() {
-    assert!(lexer::render_tokens(&[tv(TypedKind::Int8, "1")]).is_none());
+fn internal_typed_value_cannot_be_written_by_users() {
+    // 利用者の SQL からは作れない（`$` で始まる識別子は字句化できない）。
+    assert!(lexer::tokenize("SELECT $typed:int8 1").is_err());
+    assert!(lexer::tokenize_with_params("SELECT $typed:int8 1").is_err());
 }
 
 #[test]
@@ -513,8 +516,6 @@ fn execute_values_role_survives_and_inside_case() {
         .iter()
         .position(|t| matches!(t, Token::Number(n) if n == "5"))
         .expect("five");
-    if let Some(slot) = want.get_mut(pos) {
-        *slot = tv(TypedKind::Int8, "5");
-    }
+    want.splice(pos..=pos, tv("int8", "5"));
     assert_eq!(out, want);
 }
