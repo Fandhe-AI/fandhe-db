@@ -300,6 +300,49 @@ pub(crate) fn substitute(
     Ok(out)
 }
 
+/// `EXECUTE` の文字列中の `$n`（`tokens[i]`）の構文上の役割を、同じ括弧深さの直前のトークンから
+/// 推定する。`ORDER BY`／`GROUP BY` の直接のキーは序数参照に化けないよう [`VarRole::OrderKey`]／
+/// [`VarRole::GroupKey`]、別名なしの投影項目は文字列・真偽値を `CAST` で包む [`VarRole::SelectItemBare`]、
+/// それ以外（括弧内を含む判定不能な位置）は [`VarRole::Value`] にする（静的 SQL の `role_tokens` と同じ保護）。
+fn param_role(tokens: &[Token], i: usize) -> VarRole {
+    let direct = matches!(
+        i.checked_sub(1).and_then(|p| tokens.get(p)),
+        Some(Token::Keyword(lexer::Keyword::Select | lexer::Keyword::By) | Token::Punct(','))
+    );
+    if !direct {
+        return VarRole::Value;
+    }
+    let mut depth = 0usize;
+    for j in (0..i).rev() {
+        match tokens.get(j) {
+            Some(Token::Punct(')')) => depth = depth.saturating_add(1),
+            Some(Token::Punct('(')) => {
+                if depth == 0 {
+                    return VarRole::Value;
+                }
+                depth -= 1;
+            }
+            _ if depth > 0 => {}
+            Some(Token::Keyword(lexer::Keyword::By)) => {
+                return match j.checked_sub(1).and_then(|p| tokens.get(p)) {
+                    Some(Token::Keyword(lexer::Keyword::Order)) => VarRole::OrderKey,
+                    Some(Token::Ident(g)) if g.eq_ignore_ascii_case("group") => VarRole::GroupKey,
+                    _ => VarRole::Value,
+                };
+            }
+            Some(Token::Keyword(lexer::Keyword::Select)) => return VarRole::SelectItemBare,
+            Some(Token::Keyword(
+                lexer::Keyword::From
+                | lexer::Keyword::Where
+                | lexer::Keyword::Limit
+                | lexer::Keyword::And,
+            )) => return VarRole::Value,
+            _ => {}
+        }
+    }
+    VarRole::Value
+}
+
 /// `EXECUTE` の文字列中の `$n` を `using` の値で置換する（D6）。`$n` の最大番号と `using` の個数が
 /// 一致しなければ `42601`（欠落・過剰とも）。文字列連結ではなく型付きのトークンで置換する。
 pub(crate) fn substitute_params(
@@ -333,7 +376,8 @@ pub(crate) fn substitute_params(
                     )
                 })?;
                 charge(&mut total, scalar_len_estimate(v))?;
-                let mut produced = scalar_tokens(v, VarRole::Value)?;
+                let role = param_role(tokens, i);
+                let mut produced = role_tokens(v, role, None)?;
                 parenthesize_if_needed(
                     i.checked_sub(1).and_then(|p| tokens.get(p)),
                     tokens.get(i.saturating_add(1)),

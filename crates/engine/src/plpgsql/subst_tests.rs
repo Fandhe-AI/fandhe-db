@@ -171,7 +171,7 @@ fn substituted_size_is_bounded() {
 fn params_must_match_using_values_exactly() {
     let tokens = lex("SELECT $1, $2");
     let ok = substitute_params(&tokens, &[int(1), text("a")]).expect("match");
-    assert_eq!(ok, lex("SELECT 1, 'a'"));
+    assert_eq!(ok, lex("SELECT 1, CAST('a' AS text)"));
     for using in [vec![int(1)], vec![int(1), int(2), int(3)], vec![]] {
         let e = substitute_params(&tokens, &using).expect_err("mismatch");
         assert_eq!(e.wire_code(), "42601");
@@ -191,7 +191,12 @@ fn param_values_cannot_inject_sql() {
         out,
         vec![
             Token::Keyword(lexer::Keyword::Select),
+            Token::Ident("CAST".to_string()),
+            Token::Punct('('),
             Token::StringLiteral("1; DROP TABLE t".to_string()),
+            Token::Ident("AS".to_string()),
+            Token::Ident("text".to_string()),
+            Token::Punct(')'),
         ]
     );
 }
@@ -211,4 +216,22 @@ fn order_and_group_keys_keep_the_integer_type_of_the_variable() {
         let out = substitute(&tokens, &sites, &Env(vec![small.clone()]), false).expect("small");
         assert_eq!(out, lex("SELECT 1 FROM t ORDER BY CAST(3 AS smallint)"));
     }
+}
+
+#[test]
+fn dynamic_params_get_role_based_protection() {
+    // 投影の裸の文字列・真偽値は CAST で包む（静的 SQL の SelectItemBare と同じ）。
+    let out = substitute_params(&lex("SELECT $1"), &[text("abc")]).expect("proj");
+    assert_eq!(out, lex("SELECT CAST('abc' AS text)"));
+    let b = PlScalar::new(Cell::Bool(true), ColumnType::Boolean);
+    let out = substitute_params(&lex("SELECT 1, $1 FROM t"), &[b]).expect("bool");
+    assert_eq!(out, lex("SELECT 1, CAST('true' AS boolean) FROM t"));
+    // ORDER BY／GROUP BY の整数は序数参照にならない。
+    let out = substitute_params(&lex("SELECT a FROM t ORDER BY $1"), &[int(1)]).expect("order");
+    assert_eq!(out, lex("SELECT a FROM t ORDER BY CAST(1 AS integer)"));
+    let out = substitute_params(&lex("SELECT a FROM t GROUP BY a, $1"), &[int(2)]).expect("group");
+    assert_eq!(out, lex("SELECT a FROM t GROUP BY a, CAST(2 AS integer)"));
+    // WHERE 内の値は従来どおり。
+    let out = substitute_params(&lex("SELECT a FROM t WHERE a = $1"), &[int(1)]).expect("where");
+    assert_eq!(out, lex("SELECT a FROM t WHERE a = 1"));
 }
