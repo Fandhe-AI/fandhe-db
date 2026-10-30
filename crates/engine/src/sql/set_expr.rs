@@ -285,6 +285,12 @@ pub(crate) fn eval_set_expr_to_value<'a>(
     row_scalars: &'a [Option<ScalarRef<'a>>],
 ) -> Result<Value, SqlSurfaceError> {
     if let Some(value) = &set.default_value {
+        // 延期束縛（`DeferNotNullBindScope`）で NULL のまま運ばれた DEFAULT が、トリガ有無の
+        // スナップショット不一致で本（検査する）経路へ来ても NOT NULL 列へ NULL を書かない
+        // （fail-closed。`23502`）。
+        if matches!(value, Value::Null) && !set.nullable {
+            return Err(SqlSurfaceError::not_null_violation(&set.column_name));
+        }
         return Ok(value.clone());
     }
     let evaluated = eval_with_scalars(&set.bound, id, embedding, row_scalars)?;
@@ -547,6 +553,21 @@ mod tests {
     fn bind(target: &str, expr: &Expr) -> Result<BoundSetExpr, SqlSurfaceError> {
         let s = schema();
         bind_set_expr(target, expr, col(&s, target), &s)
+    }
+
+    /// 延期束縛で NULL のまま運ばれた `SET col = DEFAULT`（NOT NULL・DEFAULT なし）は、検査する評価器
+    /// （トリガ有無のスナップショット不一致で到達しうる）では `23502` になり、延期評価器だけが通す。
+    #[test]
+    fn deferred_default_null_is_rejected_by_checking_evaluator() {
+        let s = schema();
+        let _scope = DeferNotNullBindScope::enter("t");
+        let set = bind_set_default("t", "m", col(&s, "m")).expect("deferred bind");
+        let scalars: Vec<Option<ScalarRef<'_>>> = Vec::new();
+        assert!(eval_set_expr_to_value(&set, 1, &[], &scalars).is_err());
+        assert!(matches!(
+            eval_set_expr_to_value_deferred_not_null(&set, 1, &[], &scalars),
+            Ok(Value::Null)
+        ));
     }
 
     #[test]
