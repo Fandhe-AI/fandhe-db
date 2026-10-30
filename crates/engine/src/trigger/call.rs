@@ -11,6 +11,14 @@ use crate::catalog::TableSchema;
 use crate::row_codec::Value;
 use crate::sql::allowlist::SqlSurfaceError;
 
+/// 発火した操作（`TG_OP`）。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum TriggerOp {
+    Insert,
+    Update,
+    Delete,
+}
+
 /// 1 回のトリガ呼び出しの入力。NEW に入るのは利用者の列（`schema.columns` 宣言順）だけで、テナントの
 /// キー・rowid・可視性は含めない（トリガ関数からは見えず、書き換えもできない。実行モデルの D2）。
 // 実体（#2228）が読むまでは、本クレート内で読む者がいない（呼び出し口の契約として先に定義する）。
@@ -24,7 +32,12 @@ pub(crate) struct TriggerCall<'a> {
     pub(crate) table: &'a str,
     /// 対象表のスキーマ（列名・列型の一覧。NEW の列対応づけに使う）。
     pub(crate) schema: &'a TableSchema,
-    /// `NEW`（`schema.columns` と同じ幅・順。DEFAULT・SEQUENCE の値は確定済み）。
+    /// `TG_OP`（INSERT・UPDATE・DELETE）。
+    pub(crate) op: TriggerOp,
+    /// `OLD`（UPDATE・DELETE の更新前・削除前の行。`schema.columns` と同じ幅・順。INSERT は `None`）。
+    pub(crate) old_row: Option<&'a [Value]>,
+    /// `NEW`（`schema.columns` と同じ幅・順。DEFAULT・SEQUENCE の値は確定済み）。DELETE は NEW を
+    /// 持たないため空スライス（`op` が `Delete` のとき読んではならない）。
     pub(crate) new_row: &'a [Value],
     /// `TG_ARGV`（`TG_NARGS` はその長さ）。値として渡し、SQL テキストへ連結しない。
     pub(crate) args: &'a [String],
@@ -36,8 +49,14 @@ pub(crate) struct TriggerCall<'a> {
 
 #[allow(dead_code)] // 実体（#2228）が参照する。
 impl TriggerCall<'_> {
-    /// `TG_OP`（本 Issue の範囲は INSERT のみ）。
-    pub(crate) const TG_OP: &'static str = "INSERT";
+    /// `TG_OP`（呼び出しごと）。
+    pub(crate) fn tg_op(&self) -> &'static str {
+        match self.op {
+            TriggerOp::Insert => "INSERT",
+            TriggerOp::Update => "UPDATE",
+            TriggerOp::Delete => "DELETE",
+        }
+    }
     /// `TG_LEVEL`。
     pub(crate) const TG_LEVEL: &'static str = "ROW";
 

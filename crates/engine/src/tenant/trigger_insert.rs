@@ -171,7 +171,7 @@ pub(super) fn write_rows_with_triggers(
 /// トリガが書いた表の遅延 FK の扱いを決める（fail-open の防止）。トリガ内の書き込みは `InTxn` 経由の
 /// ため文単位検査から遅延 FK が外れる。`Autocommit` は COMMIT 時検査が無いのでここで検査し、`InTxn` は
 /// 記録区間があれば `mark_written` 経由で COMMIT 時検査へ載せ、区間が無ければここで即時検査する。
-fn settle_trigger_written_tables(
+pub(super) fn settle_trigger_written_tables(
     write_txn: &redb::WriteTransaction,
     target: &WriteTarget<'_>,
     ctx: &PolicyContext,

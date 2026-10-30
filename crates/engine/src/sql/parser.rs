@@ -4162,7 +4162,7 @@ pub(crate) fn bind_set_assignments(
         if matches!(set_value, crate::sql::allowlist::SetValue::Default) {
             bound_exprs.push((
                 col_idx,
-                crate::sql::set_expr::bind_set_default(name, column)?,
+                crate::sql::set_expr::bind_set_default(&schema.name, name, column)?,
             ));
             continue;
         }
@@ -4370,6 +4370,15 @@ pub(crate) fn bind_set_assignments(
             // 扱いを共有する。束縛はスキーマだけを見る判定で対象行の探索・RLS 可視性
             // より前に終わるため、`23502` は対象行の有無で分かれない。
             (_, InsertLiteral::Null) if column.nullable => crate::row_codec::Value::Null,
+            // BEFORE UPDATE トリガ対応の経路では NOT NULL 検査を最終 NEW まで後回しにする
+            // （`DeferNotNullBindScope`。Issue #1725）。
+            (_, InsertLiteral::Null) if crate::sql::set_expr::defer_not_null_bind(&schema.name) => {
+                bound_exprs.push((
+                    col_idx,
+                    crate::sql::set_expr::bind_deferred_null(name, column),
+                ));
+                continue;
+            }
             (_, InsertLiteral::Null) => {
                 return Err(SqlSurfaceError::not_null_violation(name.clone()))
             }

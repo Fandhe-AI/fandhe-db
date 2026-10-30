@@ -3960,6 +3960,7 @@ pub fn execute_delete(
         ctx,
         bound,
         ledger_mode,
+        None,
     )
 }
 
@@ -3973,17 +3974,20 @@ pub(crate) fn execute_delete_in(
     ctx: &PolicyContext,
     bound: &crate::sql::parser::BoundDelete,
     ledger_mode: crate::recovery::required_op_id::LedgerMode,
+    // DELETE トリガの通過証（Issue #1725）。`None` では該当トリガがあれば `0A000`。
+    triggers: Option<&crate::trigger::TriggerRuntime>,
 ) -> Result<DeleteOutcome, SqlSurfaceError> {
     let ledger_write = ledger_mode
         .resolve(bound.operation_id.as_ref())
         .map_err(|_| SqlSurfaceError::MissingOperationId)?;
 
-    match crate::tenant::delete_row_ledgered_unchecked(
+    match crate::tenant::delete_row_ledgered_with_triggers(
         target,
         &bound.table,
         ctx,
         bound.id,
         ledger_write,
+        triggers,
     ) {
         Ok(crate::tenant::DeleteRowOutcome::Deleted) => Ok(DeleteOutcome { rows_affected: 1 }),
         Ok(crate::tenant::DeleteRowOutcome::NotFound) => Ok(DeleteOutcome { rows_affected: 0 }),
@@ -4209,6 +4213,7 @@ pub(crate) fn execute_update_with_schema(
         bound,
         ledger_mode,
         expected_schema,
+        None,
     )
 }
 
@@ -4223,12 +4228,14 @@ pub(crate) fn execute_update_with_schema_in(
     bound: &crate::sql::parser::BoundUpdate,
     ledger_mode: crate::recovery::required_op_id::LedgerMode,
     expected_schema: Option<&crate::catalog::TableSchema>,
+    // UPDATE トリガの通過証（Issue #1725）。`None` では該当トリガがあれば `0A000`。
+    triggers: Option<&crate::trigger::TriggerRuntime>,
 ) -> Result<UpdateOutcome, SqlSurfaceError> {
     let ledger_write = ledger_mode
         .resolve(bound.operation_id.as_ref())
         .map_err(|_| SqlSurfaceError::MissingOperationId)?;
 
-    let rows_affected = crate::tenant::update_row_columns_unchecked(
+    let rows_affected = crate::tenant::update_row_columns_with_triggers(
         target,
         &bound.table,
         ctx,
@@ -4237,6 +4244,7 @@ pub(crate) fn execute_update_with_schema_in(
         &bound.set_exprs,
         ledger_write,
         expected_schema,
+        triggers,
     )
     .map_err(|e| map_write_error(e, "update"))?;
 
@@ -4538,6 +4546,7 @@ pub(crate) fn execute_predicate_delete_in(
     content_hash_value: &crate::recovery::content_hash::ContentHash,
     max_affected_rows: Option<std::num::NonZeroUsize>,
     max_scanned_rows: usize,
+    triggers: Option<&crate::trigger::TriggerRuntime>,
 ) -> Result<DeleteOutcome, SqlSurfaceError> {
     let rows_affected = execute_predicate_delete_inner(
         target,
@@ -4549,6 +4558,7 @@ pub(crate) fn execute_predicate_delete_in(
         max_affected_rows,
         max_scanned_rows,
         None,
+        triggers,
     )?;
     Ok(DeleteOutcome { rows_affected })
 }
@@ -4594,6 +4604,7 @@ pub(crate) fn execute_predicate_delete_returning(
         max_affected_rows,
         max_scanned_rows,
         Some(&mut project),
+        None,
     )?;
     drop(project);
     Ok(ReturningOutcome {
@@ -4699,6 +4710,8 @@ fn execute_predicate_delete_inner(
     max_affected_rows: Option<std::num::NonZeroUsize>,
     max_scanned_rows: usize,
     project: Option<&mut crate::tenant::ReturningProjectFn<'_>>,
+    // DELETE トリガの通過証（Issue #1725）。`RETURNING` 付き（`project: Some`）は渡さない（`0A000`）。
+    triggers: Option<&crate::trigger::TriggerRuntime>,
 ) -> Result<u64, SqlSurfaceError> {
     let ledger_write = ledger_mode
         .resolve(bound.operation_id())
@@ -4714,7 +4727,7 @@ fn execute_predicate_delete_inner(
         bound.expr_filters(),
         bound.or_filters(),
         |needs_embedding, predicate| match project {
-            None => crate::tenant::delete_rows_where_unchecked(
+            None => crate::tenant::delete_rows_where_with_triggers(
                 target,
                 bound.table(),
                 ctx,
@@ -4725,6 +4738,7 @@ fn execute_predicate_delete_inner(
                 limit,
                 max_scanned_rows,
                 predicate,
+                triggers,
             ),
             Some(project) => crate::tenant::delete_rows_where_capturing_unchecked(
                 target,
@@ -4794,6 +4808,7 @@ pub(crate) fn execute_predicate_update_in(
     // 既定 `None`＝上限なし）。[`execute_predicate_delete`] のドキュメント参照。
     max_affected_rows: Option<std::num::NonZeroUsize>,
     max_scanned_rows: usize,
+    triggers: Option<&crate::trigger::TriggerRuntime>,
 ) -> Result<UpdateOutcome, SqlSurfaceError> {
     let rows_affected = execute_predicate_update_inner(
         target,
@@ -4806,6 +4821,7 @@ pub(crate) fn execute_predicate_update_in(
         max_affected_rows,
         max_scanned_rows,
         None,
+        triggers,
     )?;
     Ok(UpdateOutcome { rows_affected })
 }
@@ -4847,6 +4863,7 @@ pub(crate) fn execute_predicate_update_returning(
         max_affected_rows,
         max_scanned_rows,
         Some(&mut project),
+        None,
     )?;
     drop(project);
     Ok(ReturningOutcome {
@@ -4870,6 +4887,8 @@ fn execute_predicate_update_inner(
     max_affected_rows: Option<std::num::NonZeroUsize>,
     max_scanned_rows: usize,
     project: Option<&mut crate::tenant::ReturningProjectFn<'_>>,
+    // UPDATE トリガの通過証（Issue #1725）。`RETURNING` 付き（`project: Some`）は渡さない（`0A000`）。
+    triggers: Option<&crate::trigger::TriggerRuntime>,
 ) -> Result<u64, SqlSurfaceError> {
     let ledger_write = ledger_mode
         .resolve(bound.operation_id())
@@ -4885,7 +4904,7 @@ fn execute_predicate_update_inner(
         bound.expr_filters(),
         bound.or_filters(),
         |needs_embedding, predicate| match project {
-            None => crate::tenant::update_rows_where_unchecked(
+            None => crate::tenant::update_rows_where_with_triggers(
                 target,
                 bound.table(),
                 ctx,
@@ -4899,6 +4918,7 @@ fn execute_predicate_update_inner(
                 limit,
                 max_scanned_rows,
                 predicate,
+                triggers,
             ),
             Some(project) => crate::tenant::update_rows_where_capturing_unchecked(
                 target,

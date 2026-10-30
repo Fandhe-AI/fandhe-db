@@ -72,12 +72,61 @@ impl BoundSetExpr {
     }
 }
 
+thread_local! {
+    /// 束縛時の NOT NULL 検査（`SET col = NULL`・既定値の無い NOT NULL 列への `SET col = DEFAULT`）を
+    /// 後回しにしている対象表名（BEFORE UPDATE トリガ対応の経路。Issue #1725）。`None` は後回しなし。
+    static DEFER_NOT_NULL_BIND: std::cell::RefCell<Option<String>> = const { std::cell::RefCell::new(None) };
+}
+
+/// 束縛時の NOT NULL 検査を後回しにする RAII ガード。対象表に BEFORE の UPDATE 行トリガ（値を書き換え得る）が
+/// あるとき、`core.rs` の UPDATE 入口が `bind_*` 呼び出しの範囲だけ保持する（サブクエリ解決・適用・トリガ発火の
+/// 間は保持しない）。保持中でも、表名が一致する `bind_set_assignments` だけが後回しにする（別表の束縛へ
+/// 引き継がない）。NULL は式項（`default_value` または `BoundExpr::Null`）として運ばれ、BEFORE トリガが補正した
+/// 後の最終 NEW でだけ NOT NULL を検査する（`tenant::trigger_dml`）。drop で直前の値へ戻す。
+pub(crate) struct DeferNotNullBindScope {
+    prev: Option<String>,
+}
+
+impl DeferNotNullBindScope {
+    pub(crate) fn enter(table: &str) -> Self {
+        Self {
+            prev: DEFER_NOT_NULL_BIND.with(|c| c.replace(Some(table.to_string()))),
+        }
+    }
+}
+
+impl Drop for DeferNotNullBindScope {
+    fn drop(&mut self) {
+        let prev = self.prev.take();
+        DEFER_NOT_NULL_BIND.with(|c| *c.borrow_mut() = prev);
+    }
+}
+
+/// 現スレッドが表 `table` について [`DeferNotNullBindScope`] の区間内か。
+pub(crate) fn defer_not_null_bind(table: &str) -> bool {
+    DEFER_NOT_NULL_BIND.with(|c| c.borrow().as_deref() == Some(table))
+}
+
+/// NOT NULL 列への明示的な `SET col = NULL` を、NOT NULL 検査後回しの式項として束縛する
+/// （[`DeferNotNullBindScope`] の区間専用。評価は [`eval_set_expr_to_value_deferred_not_null`] が行う）。
+pub(crate) fn bind_deferred_null(name: &str, column: &ColumnDef) -> BoundSetExpr {
+    BoundSetExpr {
+        source: Expr::Null,
+        bound: BoundExpr::Null,
+        target_ty: column.ty.clone(),
+        nullable: column.nullable,
+        column_name: name.to_string(),
+        default_value: None,
+    }
+}
+
 /// `SET col = DEFAULT`（SQL-50・Issue #1746）を列 `column` への代入として束縛する。スキーマ
 /// （列定義）だけを参照し行には触れない。列 DEFAULT があればその定数値、無ければ NULL
 /// （`SET col = NULL` と同じ規則: NOT NULL 列は `23502`、VECTOR 列は `22000`）。
 /// 時刻関数・SEQUENCE・IDENTITY の DEFAULT は評価文脈が無いため `bind_column_default` の
 /// `0A000` をそのまま返す（fail-closed。GENERATED ALWAYS 列もこの拒否になる）。
 pub(crate) fn bind_set_default(
+    table: &str,
     name: &str,
     column: &ColumnDef,
 ) -> Result<BoundSetExpr, SqlSurfaceError> {
@@ -90,6 +139,8 @@ pub(crate) fn bind_set_default(
                 )))
             }
             _ if column.nullable => Value::Null,
+            // NOT NULL 検査後回しの区間（BEFORE UPDATE トリガ対応）では NULL のまま運ぶ。
+            _ if defer_not_null_bind(table) => Value::Null,
             _ => return Err(SqlSurfaceError::not_null_violation(name)),
         },
     };
@@ -234,10 +285,32 @@ pub(crate) fn eval_set_expr_to_value<'a>(
     row_scalars: &'a [Option<ScalarRef<'a>>],
 ) -> Result<Value, SqlSurfaceError> {
     if let Some(value) = &set.default_value {
+        // 延期束縛（`DeferNotNullBindScope`）で NULL のまま運ばれた DEFAULT が、トリガ有無の
+        // スナップショット不一致で本（検査する）経路へ来ても NOT NULL 列へ NULL を書かない
+        // （fail-closed。`23502`）。
+        if matches!(value, Value::Null) && !set.nullable {
+            return Err(SqlSurfaceError::not_null_violation(&set.column_name));
+        }
         return Ok(value.clone());
     }
     let evaluated = eval_with_scalars(&set.bound, id, embedding, row_scalars)?;
     expr_value_to_column_value(&set.target_ty, set.nullable, &set.column_name, evaluated)
+}
+
+/// [`eval_set_expr_to_value`] の NOT NULL 検査後回し版。評価結果が NULL なら列の NULL 可否に関わらず
+/// `Value::Null` を返す。BEFORE UPDATE トリガ経路（Issue #1725）が NEW 候補を値の列として作り、
+/// BEFORE の連鎖後の最終行にだけ NOT NULL 検査を行うために使う（BEFORE が NULL を補正・Skip できる）。
+pub(crate) fn eval_set_expr_to_value_deferred_not_null<'a>(
+    set: &BoundSetExpr,
+    id: u64,
+    embedding: &'a [f32],
+    row_scalars: &'a [Option<ScalarRef<'a>>],
+) -> Result<Value, SqlSurfaceError> {
+    if let Some(value) = &set.default_value {
+        return Ok(value.clone());
+    }
+    let evaluated = eval_with_scalars(&set.bound, id, embedding, row_scalars)?;
+    expr_value_to_column_value(&set.target_ty, true, &set.column_name, evaluated)
 }
 
 /// 式の評価結果 `evaluated` を列型 `target_ty` の [`Value`] へ変換する（列値化）。
@@ -480,6 +553,21 @@ mod tests {
     fn bind(target: &str, expr: &Expr) -> Result<BoundSetExpr, SqlSurfaceError> {
         let s = schema();
         bind_set_expr(target, expr, col(&s, target), &s)
+    }
+
+    /// 延期束縛で NULL のまま運ばれた `SET col = DEFAULT`（NOT NULL・DEFAULT なし）は、検査する評価器
+    /// （トリガ有無のスナップショット不一致で到達しうる）では `23502` になり、延期評価器だけが通す。
+    #[test]
+    fn deferred_default_null_is_rejected_by_checking_evaluator() {
+        let s = schema();
+        let _scope = DeferNotNullBindScope::enter("t");
+        let set = bind_set_default("t", "m", col(&s, "m")).expect("deferred bind");
+        let scalars: Vec<Option<ScalarRef<'_>>> = Vec::new();
+        assert!(eval_set_expr_to_value(&set, 1, &[], &scalars).is_err());
+        assert!(matches!(
+            eval_set_expr_to_value_deferred_not_null(&set, 1, &[], &scalars),
+            Ok(Value::Null)
+        ));
     }
 
     #[test]

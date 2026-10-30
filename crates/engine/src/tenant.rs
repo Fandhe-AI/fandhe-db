@@ -2134,6 +2134,61 @@ pub(crate) fn guard_no_insert_triggers(
     crate::trigger::plan::plan_insert(write_txn, tenant, table, None).map(|_| ())
 }
 
+/// UPDATE トリガ・子表の参照アクションのトリガがある表への、発火に未対応の書き込み経路（UPSERT の
+/// `DO UPDATE`・NoSQL の行更新など）を固定文言の `0A000` で拒否する（Issue #1725・実行モデルの D8）。
+/// スキーマ取得の直後・台帳より前に呼ぶ。トリガの無い環境では何もしない。
+pub(crate) fn guard_no_update_triggers(
+    write_txn: &redb::WriteTransaction,
+    tenant: &str,
+    table: &str,
+) -> Result<(), TenantWriteError> {
+    crate::trigger::plan::guard_unwired_dml(write_txn, tenant, table, false)
+}
+
+/// DELETE 版（[`guard_no_update_triggers`] と同じ契約）。
+pub(crate) fn guard_no_delete_triggers(
+    write_txn: &redb::WriteTransaction,
+    tenant: &str,
+    table: &str,
+) -> Result<(), TenantWriteError> {
+    crate::trigger::plan::guard_unwired_dml(write_txn, tenant, table, true)
+}
+
+/// UPDATE の発火計画（Issue #1725）。`UPDATE OF` の判定に使う SET 列は `assignments`・`set_exprs`・
+/// 結合形の行ごとの上書き列（`override_columns`）の和集合（BEFORE トリガが書き換える列は含めない。
+/// 実行モデルの D7）。
+#[allow(clippy::too_many_arguments)]
+fn plan_update_triggers<'a>(
+    write_txn: &redb::WriteTransaction,
+    ctx: &PolicyContext,
+    table: &str,
+    schema: &crate::catalog::TableSchema,
+    assignments: &[(usize, crate::row_codec::Value)],
+    set_exprs: &[(usize, crate::sql::set_expr::BoundSetExpr)],
+    override_columns: &[usize],
+    triggers: Option<&'a crate::trigger::TriggerRuntime>,
+) -> Result<Option<crate::trigger::plan::RowTriggerPlan<'a>>, TenantWriteError> {
+    let mut set_columns: Vec<usize> = assignments
+        .iter()
+        .map(|(idx, _)| *idx)
+        .chain(set_exprs.iter().map(|(idx, _)| *idx))
+        .chain(override_columns.iter().copied())
+        .collect();
+    set_columns.sort_unstable();
+    set_columns.dedup();
+    crate::trigger::plan::plan_row_triggers(
+        write_txn,
+        ctx.tenant_id(),
+        table,
+        crate::catalog::trigger::TriggerEvents::UPDATE,
+        Some(&crate::trigger::plan::UpdateTarget {
+            schema,
+            set_columns: &set_columns,
+        }),
+        triggers,
+    )
+}
+
 /// 採番方式の表（TABLE-23・Issue #2199）へ書く `n` 行分の rowid を、同じ write txn 内で払い出す
 /// （`catalog::rowid_alloc::allocate_in_txn` の薄い写像）。呼び出し元は行ストア
 /// （`user_rows/{table}`）のハンドルを開く**前**に呼ぶこと。`n` は呼び出し元がバッチ上限で検証済みの
@@ -2847,6 +2902,8 @@ fn upsert_typed_rows_impl(
             // INSERT トリガのある表への UPSERT の発火は未対応（#1725）。黙って飛ばさず `0A000`
             // （台帳より前に判定する。Issue #1723・実行モデルの D8）。
             guard_no_insert_triggers(write_txn, ctx.tenant_id(), table)?;
+            // `DO UPDATE` は UPDATE トリガを発火できないため、UPDATE トリガのある表も `0A000`（Issue #1725）。
+            guard_no_update_triggers(write_txn, ctx.tenant_id(), table)?;
             if let Some(expected) = expected_schema {
                 if expected != &schema {
                     return Err(TenantWriteError::Catalog(CatalogError::Invalid(
@@ -3704,6 +3761,8 @@ pub(crate) fn update_row_unchecked(
         let mut pre_images = crate::constraint::UpdatedKeyPreImages::new();
         {
             let schema = require_table_schema_write(write_txn, table)?;
+            // 生の全列置換はトリガの発火に未対応（Issue #1725）。UPDATE トリガのある表は `0A000`。
+            guard_no_update_triggers(write_txn, ctx.tenant_id(), table)?;
             schema.validate_row_embedding_dim(row.embedding.len())?;
             // エンコードは 1 回のみ（Issue #397）: `for_update` が内部で `encode_row` し、
             // 書き込み側で同じ行をもう一度 `encode_row` していた二重実行を排除する。
@@ -4494,6 +4553,34 @@ fn merge_row_for_update_set(
     if set_exprs.is_empty() && row_extra.is_empty() {
         return Ok(merge_row_for_update(schema, existing, assignments)?);
     }
+    let resolved = resolve_update_set_values(
+        schema,
+        &existing,
+        id,
+        assignments,
+        set_exprs,
+        row_extra,
+        false,
+    )?;
+    validate_set_assignments(schema, &resolved)?;
+    Ok(merge_row_for_update(schema, existing, &resolved)?)
+}
+
+/// UPDATE の SET 項（リテラル・式・行ごとの上書き値）を、更新前の行に対して評価して
+/// `(列 index, 値)` の列へ解決する。検証・encode は行わない（値の列を作るだけ）。
+/// [`merge_row_for_update_set`] が検証の前段として使うほか、BEFORE UPDATE トリガ経路
+/// （`trigger_dml`）が「BEFORE の連鎖後の最終行にだけ制約検査・encode を行う」ために
+/// NEW 候補を値の列として組み立てる目的で使う（Issue #1725）。
+pub(super) fn resolve_update_set_values(
+    schema: &crate::catalog::TableSchema,
+    existing: &crate::storage::Row,
+    id: u64,
+    assignments: &[(usize, crate::row_codec::Value)],
+    set_exprs: &[(usize, crate::sql::set_expr::BoundSetExpr)],
+    row_extra: &[(usize, crate::row_codec::Value)],
+    // 真なら式の評価結果が NULL でも NOT NULL 検査をしない（BEFORE トリガ経路。検査は最終行で行う）。
+    defer_not_null: bool,
+) -> Result<Vec<(usize, crate::row_codec::Value)>, TenantWriteError> {
     let mut resolved: Vec<(usize, crate::row_codec::Value)> = Vec::new();
     resolved
         .try_reserve_exact(
@@ -4508,23 +4595,22 @@ fn merge_row_for_update_set(
             ))
         })?;
     resolved.extend(assignments.iter().cloned());
-    {
+    if !set_exprs.is_empty() {
         let scanned = crate::row_codec::scan_scalar_columns(schema, &existing.metadata)
             .map_err(|e| CatalogError::CorruptSchema(e.to_string()))?;
         for (idx, set) in set_exprs {
-            let value = crate::sql::set_expr::eval_set_expr_to_value(
-                set,
-                id,
-                &existing.embedding,
-                &scanned,
-            )
-            .map_err(TenantWriteError::SetExpressionEvaluationFailed)?;
+            let eval = if defer_not_null {
+                crate::sql::set_expr::eval_set_expr_to_value_deferred_not_null
+            } else {
+                crate::sql::set_expr::eval_set_expr_to_value
+            };
+            let value = eval(set, id, &existing.embedding, &scanned)
+                .map_err(TenantWriteError::SetExpressionEvaluationFailed)?;
             resolved.push((*idx, value));
         }
     }
     resolved.extend(row_extra.iter().cloned());
-    validate_set_assignments(schema, &resolved)?;
-    Ok(merge_row_for_update(schema, existing, &resolved)?)
+    Ok(resolved)
 }
 
 /// 式を含む SET が束縛時のスキーマに結び付いていることを保証する（Issue #1544）。
@@ -4544,6 +4630,9 @@ fn require_expected_schema_for_set_exprs(
     Ok(())
 }
 
+// SQL 表層は `update_row_columns_with_triggers` を使う（Issue #1725）。本関数はトリガ未結線の薄い入口
+// として、テストと既存ドキュメントの参照名のために残す。
+#[cfg_attr(not(test), allow(dead_code))]
 #[allow(clippy::too_many_arguments)]
 pub(crate) fn update_row_columns_unchecked(
     target: WriteTarget<'_>,
@@ -4586,14 +4675,72 @@ pub(crate) fn update_row_columns_capturing_unchecked(
     ctx: &PolicyContext,
     id: u64,
     assignments: &[(usize, crate::row_codec::Value)],
+    set_exprs: &[(usize, crate::sql::set_expr::BoundSetExpr)],
+    ledger_write: LedgerWrite<'_>,
+    expected_schema: Option<&crate::catalog::TableSchema>,
+    project: Option<&mut ReturningProjectFn<'_>>,
+) -> Result<usize, TenantWriteError> {
+    update_row_columns_impl(
+        target,
+        table,
+        ctx,
+        id,
+        assignments,
+        set_exprs,
+        ledger_write,
+        expected_schema,
+        project,
+        None,
+    )
+}
+
+/// [`update_row_columns_unchecked`] のトリガ発火版（Issue #1725）。`triggers` を渡した経路だけが
+/// UPDATE トリガのある表を扱え、`None`（未結線の経路）では該当トリガがあれば `0A000`。
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn update_row_columns_with_triggers(
+    target: WriteTarget<'_>,
+    table: &str,
+    ctx: &PolicyContext,
+    id: u64,
+    assignments: &[(usize, crate::row_codec::Value)],
+    set_exprs: &[(usize, crate::sql::set_expr::BoundSetExpr)],
+    ledger_write: LedgerWrite<'_>,
+    expected_schema: Option<&crate::catalog::TableSchema>,
+    triggers: Option<&crate::trigger::TriggerRuntime>,
+) -> Result<usize, TenantWriteError> {
+    update_row_columns_impl(
+        target,
+        table,
+        ctx,
+        id,
+        assignments,
+        set_exprs,
+        ledger_write,
+        expected_schema,
+        None,
+        triggers,
+    )
+}
+
+/// [`update_row_columns_capturing_unchecked`]・[`update_row_columns_with_triggers`] の共有実体。
+/// `triggers` は `project`（`RETURNING`）が `Some` のとき常に未結線として扱う（`0A000`）。
+#[allow(clippy::too_many_arguments)]
+fn update_row_columns_impl(
+    target: WriteTarget<'_>,
+    table: &str,
+    ctx: &PolicyContext,
+    id: u64,
+    assignments: &[(usize, crate::row_codec::Value)],
     // SET 右辺が式の項（Issue #1544・SQL-45 のポインタ）。空ならリテラルだけの従来挙動
     // （ビット同一）。評価は所有・可視と確定した行に対してだけ行う。
     set_exprs: &[(usize, crate::sql::set_expr::BoundSetExpr)],
     ledger_write: LedgerWrite<'_>,
     expected_schema: Option<&crate::catalog::TableSchema>,
     mut project: Option<&mut ReturningProjectFn<'_>>,
+    triggers: Option<&crate::trigger::TriggerRuntime>,
 ) -> Result<usize, TenantWriteError> {
     validate_relation_key(table)?;
+    let triggers = if project.is_some() { None } else { triggers };
     target.with_txn(|write_txn| {
         let rows_affected: usize;
         let mut captured_row: Option<CapturedRow> = None;
@@ -4619,6 +4766,18 @@ pub(crate) fn update_row_columns_capturing_unchecked(
             // 式項の束縛は列 index でスキーマに結び付く（上の `expected` 照合が前提）。
             // 式項の静的な型照合は束縛段（`sql::set_expr::bind_set_expr`）で完了済み。
             require_expected_schema_for_set_exprs(set_exprs, expected_schema)?;
+
+            // トリガの分類は台帳より前・同じ write txn の中で行う（再送ではトリガを呼ばない。Issue #1725）。
+            let trigger_plan = plan_update_triggers(
+                write_txn,
+                ctx,
+                table,
+                &schema,
+                assignments,
+                set_exprs,
+                &[],
+                triggers,
+            )?;
 
             // `(スキーマ列 index, 列名, 値)` の順で構築し、ハッシュ計算前に列
             // index でソートして宣言順非依存にする（下記コメント参照）。列 index の
@@ -4752,6 +4911,34 @@ pub(crate) fn update_row_columns_capturing_unchecked(
                 &content_hash,
                 &legacy_hashes,
             )?;
+
+            // UPDATE トリガのある表は、行ストアのハンドルを開かない別の適用段へ回す（Issue #1725）。
+            // 対象判定は従来と同じ（所有かつ可視。不存在・他テナント・不可視は区別せず `UPDATE 0`）。
+            if let Some(plan) = trigger_plan {
+                let done = if trigger_dml::id_is_target(write_txn, table, ctx, id, true)? {
+                    trigger_dml::update_rows_with_triggers(
+                        write_txn,
+                        &target,
+                        table,
+                        ctx,
+                        &schema,
+                        &[id],
+                        &trigger_dml::UpdateSpec {
+                            assignments,
+                            set_exprs,
+                            row_overrides: None,
+                        },
+                        &plan,
+                    )?
+                } else {
+                    trigger_dml::TriggeredDml {
+                        applied: 0,
+                        trigger_wrote: false,
+                    }
+                };
+                crate::catalog::bump_table_generation_in_txn(write_txn, table)?;
+                return Ok((done.applied, TxnEffect::Wrote));
+            }
 
             let row_table_name = user_rows_table_name(table);
             let mut row_table = write_txn
@@ -4993,6 +5180,7 @@ pub(crate) fn delete_row_unchecked(
         DeleteNotFoundLedger::Discard,
         DeleteScope::Owned,
         None,
+        None,
     )?
     .0
     {
@@ -5173,8 +5361,12 @@ fn delete_row_impl(
     not_found_ledger: DeleteNotFoundLedger,
     scope: DeleteScope,
     mut capture: Option<DeleteCapture<'_>>,
+    // DELETE トリガの通過証（Issue #1725）。`capture`（`RETURNING`）が `Some` のときは常に未結線として扱う
+    // （`0A000`）。
+    triggers: Option<&crate::trigger::TriggerRuntime>,
 ) -> Result<(DeleteRowOutcome, Option<CapturedRow>), TenantWriteError> {
     validate_relation_key(table)?;
+    let triggers = if capture.is_some() { None } else { triggers };
     target.with_txn(|write_txn| {
         let mut captured_row: Option<CapturedRow> = None;
         // `ON DELETE` 参照アクション（Issue #1076 A14）の連鎖起点。削除された行が
@@ -5216,6 +5408,15 @@ fn delete_row_impl(
                     )));
                 }
             }
+            // トリガの分類は台帳より前・同じ write txn の中で行う（再送ではトリガを呼ばない。Issue #1725）。
+            let trigger_plan = crate::trigger::plan::plan_row_triggers(
+                write_txn,
+                ctx.tenant_id(),
+                table,
+                crate::catalog::trigger::TriggerEvents::DELETE,
+                None,
+                triggers,
+            )?;
             // 削除要求のクライアント由来の内容は id のみ（`content_hash::for_delete`
             // ドキュメント参照）。
             let content_hash = content_hash::for_delete(id);
@@ -5226,6 +5427,45 @@ fn delete_row_impl(
                 ledger_write,
                 &content_hash,
             )?;
+
+            // DELETE トリガのある表は、行ストアのハンドルを開かない別の適用段へ回す（Issue #1725）。
+            if let Some(plan) = trigger_plan {
+                let is_target = trigger_dml::id_is_target(
+                    write_txn,
+                    table,
+                    ctx,
+                    id,
+                    scope == DeleteScope::OwnedVisible,
+                )?;
+                if !is_target && not_found_ledger == DeleteNotFoundLedger::Discard {
+                    return Err(TenantWriteError::NotFound);
+                }
+                let done = if is_target {
+                    trigger_dml::delete_rows_with_triggers(
+                        write_txn,
+                        &target,
+                        table,
+                        ctx,
+                        &schema,
+                        &[id],
+                        &plan,
+                    )?
+                } else {
+                    trigger_dml::TriggeredDml {
+                        applied: 0,
+                        trigger_wrote: false,
+                    }
+                };
+                if done.applied > 0 || done.trigger_wrote {
+                    crate::catalog::bump_table_generation_in_txn(write_txn, table)?;
+                }
+                let outcome = if done.applied > 0 {
+                    DeleteRowOutcome::Deleted
+                } else {
+                    DeleteRowOutcome::NotFound
+                };
+                return Ok(((outcome, None), TxnEffect::Wrote));
+            }
 
             let row_table_name = user_rows_table_name(table);
             let mut row_table = write_txn
@@ -5411,6 +5651,10 @@ fn delete_row_impl(
 /// 対象選定は「所有かつ可視」（RLS-10・SQL-21。Issue #1253）: 所有だが不可視の行は
 /// 不存在・他テナント所有と同じ `NotFound`（台帳は commit）になる。Rust の行 API
 /// は従来どおり所有のみで判定する。
+///
+/// SQL 表層は [`delete_row_ledgered_with_triggers`]（Issue #1725）を使う。本関数はトリガ未結線の薄い
+/// 入口として、既存ドキュメントの参照名のために残す。
+#[allow(dead_code)]
 pub(crate) fn delete_row_ledgered_unchecked(
     target: WriteTarget<'_>,
     table: &str,
@@ -5448,7 +5692,32 @@ pub(crate) fn delete_row_ledgered_capturing_unchecked<'a>(
         DeleteNotFoundLedger::Record,
         DeleteScope::OwnedVisible,
         capture.map(|schema| DeleteCapture { schema, project }),
+        None,
     )
+}
+
+/// [`delete_row_ledgered_unchecked`] のトリガ発火版（Issue #1725。`RETURNING` なし）。`triggers` を
+/// 渡した経路だけが DELETE トリガのある表を扱え、`None` では該当トリガがあれば `0A000`。
+pub(crate) fn delete_row_ledgered_with_triggers(
+    target: WriteTarget<'_>,
+    table: &str,
+    ctx: &PolicyContext,
+    id: u64,
+    ledger_write: LedgerWrite<'_>,
+    triggers: Option<&crate::trigger::TriggerRuntime>,
+) -> Result<DeleteRowOutcome, TenantWriteError> {
+    delete_row_impl(
+        target,
+        table,
+        ctx,
+        id,
+        ledger_write,
+        DeleteNotFoundLedger::Record,
+        DeleteScope::OwnedVisible,
+        None,
+        triggers,
+    )
+    .map(|(outcome, _)| outcome)
 }
 
 /// SQL 表層 `TRUNCATE [TABLE] [ONLY] <table> [*] [, ...] USING OPERATION_ID '<id>'`（SQL-22、TASK-193。TABLE 省略・複数テーブルは SQL-48 (1)(4)、Issue #1643）
@@ -5728,6 +5997,10 @@ fn enumerate_dml_candidates_with<E, T>(
 /// 5. 候補 `id` をすべて `remove`。
 /// 6. 影響行数が 1 件以上のときのみ `bump_table_generation_in_txn`。
 /// 7. `commit_boundary::commit`。
+///
+/// SQL 表層は [`delete_rows_where_with_triggers`]（Issue #1725）を使う。本関数はトリガ未結線の
+/// 薄い入口として、テストと既存ドキュメントの参照名のために残す。
+#[cfg_attr(not(test), allow(dead_code))]
 #[allow(clippy::too_many_arguments)]
 pub(crate) fn delete_rows_where_unchecked<E>(
     target: WriteTarget<'_>,
@@ -5753,6 +6026,39 @@ pub(crate) fn delete_rows_where_unchecked<E>(
         max_scanned_rows,
         predicate,
         None,
+        None,
+    )
+}
+
+/// [`delete_rows_where_unchecked`] のトリガ発火版（Issue #1725）。`triggers` を渡した経路だけが
+/// DELETE トリガのある表を扱え、`None`（未結線の経路）では該当トリガがあれば `0A000`。
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn delete_rows_where_with_triggers<E>(
+    target: WriteTarget<'_>,
+    table: &str,
+    ctx: &PolicyContext,
+    ledger_write: LedgerWrite<'_>,
+    content_hash_value: &content_hash::ContentHash,
+    expected_schema: Option<&crate::catalog::TableSchema>,
+    needs_embedding: bool,
+    limit: Option<std::num::NonZeroUsize>,
+    max_scanned_rows: usize,
+    predicate: impl FnMut(&DmlCandidate<'_>) -> Result<bool, E>,
+    triggers: Option<&crate::trigger::TriggerRuntime>,
+) -> Result<PredicateDmlOutcome, PredicateDmlError<E>> {
+    delete_rows_where_impl(
+        target,
+        table,
+        ctx,
+        ledger_write,
+        content_hash_value,
+        expected_schema,
+        needs_embedding,
+        limit,
+        max_scanned_rows,
+        predicate,
+        None,
+        triggers,
     )
 }
 
@@ -5791,6 +6097,7 @@ pub(crate) fn delete_rows_where_capturing_unchecked<E>(
         max_scanned_rows,
         predicate,
         Some(project),
+        None,
     )
 }
 
@@ -5809,10 +6116,13 @@ fn delete_rows_where_impl<E>(
     max_scanned_rows: usize,
     mut predicate: impl FnMut(&DmlCandidate<'_>) -> Result<bool, E>,
     project: Option<&mut ReturningProjectFn<'_>>,
+    // DELETE トリガの通過証（Issue #1725）。`RETURNING` 付きは常に未結線として扱う（`0A000`）。
+    triggers: Option<&crate::trigger::TriggerRuntime>,
 ) -> Result<PredicateDmlOutcome, PredicateDmlError<E>> {
     validate_relation_key(table).map_err(dml_write_err)?;
+    let triggers = if project.is_some() { None } else { triggers };
     target.with_txn(|write_txn| {
-        let (candidate_ids, schema) = {
+        let (candidate_ids, schema, trigger_plan) = {
             let schema =
                 require_table_schema_write_any_identity(write_txn, table).map_err(dml_write_err)?;
             if let Some(expected) = expected_schema {
@@ -5822,6 +6132,17 @@ fn delete_rows_where_impl<E>(
                     )));
                 }
             }
+
+            // トリガの分類は台帳より前・同じ write txn の中で行う（再送ではトリガを呼ばない）。
+            let trigger_plan = crate::trigger::plan::plan_row_triggers(
+                write_txn,
+                ctx.tenant_id(),
+                table,
+                crate::catalog::trigger::TriggerEvents::DELETE,
+                None,
+                triggers,
+            )
+            .map_err(dml_write_err)?;
 
             ledger::record_in_txn(
                 write_txn,
@@ -5845,7 +6166,7 @@ fn delete_rows_where_impl<E>(
                 max_scanned_rows,
                 &mut predicate,
             )?;
-            (candidate_ids, schema)
+            (candidate_ids, schema, trigger_plan)
         };
 
         if limit.is_some_and(|limit| candidate_ids.len() > limit.get()) {
@@ -5856,6 +6177,28 @@ fn delete_rows_where_impl<E>(
                     count: candidate_ids.len(),
                 },
                 TxnEffect::NoOp,
+            ));
+        }
+
+        if let Some(plan) = trigger_plan {
+            let done = trigger_dml::delete_rows_with_triggers(
+                write_txn,
+                &target,
+                table,
+                ctx,
+                &schema,
+                &candidate_ids,
+                &plan,
+            )?;
+            if done.applied > 0 || done.trigger_wrote {
+                crate::catalog::bump_table_generation_in_txn(write_txn, table)
+                    .map_err(dml_write_err)?;
+            }
+            return Ok((
+                PredicateDmlOutcome::Applied {
+                    rows_affected: done.applied,
+                },
+                TxnEffect::Wrote,
             ));
         }
 
@@ -5895,6 +6238,10 @@ fn delete_rows_where_impl<E>(
 /// 対応スロットを上書きする。SET で触れない列・embedding・可視性は既存行の
 /// 値を保持する。SET 列が重複指定された場合は先勝ち——束縛段で拒否済みの
 /// ため表層からは到達しない）。
+///
+/// SQL 表層は [`update_rows_where_with_triggers`]（Issue #1725）を使う。本関数はトリガ未結線の
+/// 薄い入口として、テストと既存ドキュメントの参照名のために残す。
+#[cfg_attr(not(test), allow(dead_code))]
 #[allow(clippy::too_many_arguments)]
 pub(crate) fn update_rows_where_unchecked<E>(
     target: WriteTarget<'_>,
@@ -5936,6 +6283,45 @@ pub(crate) fn update_rows_where_unchecked<E>(
         max_scanned_rows,
         predicate,
         None,
+        None,
+    )
+}
+
+/// [`update_rows_where_unchecked`] のトリガ発火版（Issue #1725）。`triggers` を渡した経路だけが
+/// UPDATE トリガのある表を扱え、`None`（未結線の経路）では該当トリガがあれば `0A000`。
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn update_rows_where_with_triggers<E>(
+    target: WriteTarget<'_>,
+    table: &str,
+    ctx: &PolicyContext,
+    ledger_write: LedgerWrite<'_>,
+    content_hash_value: &content_hash::ContentHash,
+    legacy_hashes: &[content_hash::ContentHash],
+    expected_schema: Option<&crate::catalog::TableSchema>,
+    assignments: &[(usize, crate::row_codec::Value)],
+    set_exprs: &[(usize, crate::sql::set_expr::BoundSetExpr)],
+    needs_embedding: bool,
+    limit: Option<std::num::NonZeroUsize>,
+    max_scanned_rows: usize,
+    predicate: impl FnMut(&DmlCandidate<'_>) -> Result<bool, E>,
+    triggers: Option<&crate::trigger::TriggerRuntime>,
+) -> Result<PredicateDmlOutcome, PredicateDmlError<E>> {
+    update_rows_where_impl(
+        target,
+        table,
+        ctx,
+        ledger_write,
+        content_hash_value,
+        legacy_hashes,
+        expected_schema,
+        assignments,
+        set_exprs,
+        needs_embedding,
+        limit,
+        max_scanned_rows,
+        predicate,
+        None,
+        triggers,
     )
 }
 
@@ -5976,6 +6362,7 @@ pub(crate) fn update_rows_where_capturing_unchecked<E>(
         max_scanned_rows,
         predicate,
         Some(project),
+        None,
     )
 }
 
@@ -5997,10 +6384,13 @@ fn update_rows_where_impl<E>(
     max_scanned_rows: usize,
     mut predicate: impl FnMut(&DmlCandidate<'_>) -> Result<bool, E>,
     project: Option<&mut ReturningProjectFn<'_>>,
+    // UPDATE トリガの通過証（Issue #1725）。`RETURNING` 付きは常に未結線として扱う（`0A000`）。
+    triggers: Option<&crate::trigger::TriggerRuntime>,
 ) -> Result<PredicateDmlOutcome, PredicateDmlError<E>> {
     validate_relation_key(table).map_err(dml_write_err)?;
+    let triggers = if project.is_some() { None } else { triggers };
     target.with_txn(|write_txn| {
-        let (candidate_ids, schema) = {
+        let (candidate_ids, schema, trigger_plan) = {
             let schema =
                 require_table_schema_write_any_identity(write_txn, table).map_err(dml_write_err)?;
             if let Some(expected) = expected_schema {
@@ -6025,6 +6415,19 @@ fn update_rows_where_impl<E>(
             require_expected_schema_for_set_exprs(set_exprs, expected_schema)
                 .map_err(dml_write_err)?;
 
+            // トリガの分類は台帳より前・同じ write txn の中で行う（再送ではトリガを呼ばない）。
+            let trigger_plan = plan_update_triggers(
+                write_txn,
+                ctx,
+                table,
+                &schema,
+                assignments,
+                set_exprs,
+                &[],
+                triggers,
+            )
+            .map_err(dml_write_err)?;
+
             ledger::record_in_txn_accepting(
                 write_txn,
                 ctx.tenant_id(),
@@ -6048,7 +6451,7 @@ fn update_rows_where_impl<E>(
                 max_scanned_rows,
                 &mut predicate,
             )?;
-            (candidate_ids, schema)
+            (candidate_ids, schema, trigger_plan)
         };
 
         if limit.is_some_and(|limit| candidate_ids.len() > limit.get()) {
@@ -6057,6 +6460,33 @@ fn update_rows_where_impl<E>(
                     count: candidate_ids.len(),
                 },
                 TxnEffect::NoOp,
+            ));
+        }
+
+        if let Some(plan) = trigger_plan {
+            let done = trigger_dml::update_rows_with_triggers(
+                write_txn,
+                &target,
+                table,
+                ctx,
+                &schema,
+                &candidate_ids,
+                &trigger_dml::UpdateSpec {
+                    assignments,
+                    set_exprs,
+                    row_overrides: None,
+                },
+                &plan,
+            )?;
+            if done.applied > 0 || done.trigger_wrote {
+                crate::catalog::bump_table_generation_in_txn(write_txn, table)
+                    .map_err(dml_write_err)?;
+            }
+            return Ok((
+                PredicateDmlOutcome::Applied {
+                    rows_affected: done.applied,
+                },
+                TxnEffect::Wrote,
             ));
         }
 
@@ -6115,8 +6545,11 @@ pub(crate) fn update_rows_joined_unchecked<E>(
         &DmlCandidate<'_>,
     ) -> Result<Option<Vec<(usize, crate::row_codec::Value)>>, E>,
     project: Option<&mut ReturningProjectFn<'_>>,
+    // UPDATE トリガの通過証（Issue #1725）。`RETURNING` 付きは常に未結線として扱う（`0A000`）。
+    triggers: Option<&crate::trigger::TriggerRuntime>,
 ) -> Result<PredicateDmlOutcome, PredicateDmlError<E>> {
     validate_relation_key(table).map_err(dml_write_err)?;
+    let triggers = if project.is_some() { None } else { triggers };
     target.with_txn(|write_txn| {
         let (candidates, schema) = {
             let schema =
@@ -6129,6 +6562,22 @@ pub(crate) fn update_rows_joined_unchecked<E>(
                 }
             }
             validate_set_assignments(&schema, assignments).map_err(dml_write_err)?;
+            // カタログだけで決まる未対応の拒否（文トリガ・参照アクション先・通過証なし）は台帳記録と
+            // 候補列挙より前に行う（一致件数が上限を超えても `54000` でなく `0A000` にする）。
+            // `UPDATE OF` の絞り込みは候補ごとの上書き列が要るため、ここでは全列を SET 列とみなして
+            // 結果を捨て、確定の分類は候補列挙の後に行う。
+            let all_columns: Vec<usize> = (0..schema.columns.len()).collect();
+            plan_update_triggers(
+                write_txn,
+                ctx,
+                table,
+                &schema,
+                assignments,
+                &[],
+                &all_columns,
+                triggers,
+            )
+            .map_err(dml_write_err)?;
             ledger::record_in_txn_accepting(
                 write_txn,
                 ctx.tenant_id(),
@@ -6166,6 +6615,50 @@ pub(crate) fn update_rows_joined_unchecked<E>(
 
         let (candidate_ids, overrides): (Vec<u64>, Vec<Vec<(usize, crate::row_codec::Value)>>) =
             candidates.into_iter().unzip();
+
+        // 行ごとの上書き列は候補の列挙後にしか分からないため、トリガの分類はここで行う（失敗は
+        // txn の破棄で台帳・行とも残らない）。
+        let override_columns: Vec<usize> = overrides
+            .iter()
+            .flat_map(|row| row.iter().map(|(idx, _)| *idx))
+            .collect();
+        let trigger_plan = plan_update_triggers(
+            write_txn,
+            ctx,
+            table,
+            &schema,
+            assignments,
+            &[],
+            &override_columns,
+            triggers,
+        )
+        .map_err(dml_write_err)?;
+        if let Some(plan) = trigger_plan {
+            let done = trigger_dml::update_rows_with_triggers(
+                write_txn,
+                &target,
+                table,
+                ctx,
+                &schema,
+                &candidate_ids,
+                &trigger_dml::UpdateSpec {
+                    assignments,
+                    set_exprs: &[],
+                    row_overrides: Some(&overrides),
+                },
+                &plan,
+            )?;
+            if done.applied > 0 || done.trigger_wrote {
+                crate::catalog::bump_table_generation_in_txn(write_txn, table)
+                    .map_err(dml_write_err)?;
+            }
+            return Ok((
+                PredicateDmlOutcome::Applied {
+                    rows_affected: done.applied,
+                },
+                TxnEffect::Wrote,
+            ));
+        }
         let applied = apply_predicate_update_in_txn(
             write_txn,
             table,
@@ -6791,6 +7284,9 @@ pub(crate) fn replace_typed_rows_by_text_key(
             let schema = require_table_schema_write(write_txn, table)?;
             // INSERT トリガの発火に未対応の経路（Issue #1723）。台帳照合・行変更より前に拒否する。
             guard_no_insert_triggers(write_txn, ctx.tenant_id(), table)?;
+            // 旧行の置換（DELETE）・更新（UPDATE）もトリガ未対応（Issue #1725）。
+            guard_no_update_triggers(write_txn, ctx.tenant_id(), table)?;
+            guard_no_delete_triggers(write_txn, ctx.tenant_id(), table)?;
             let vector_idx = schema
                 .columns
                 .iter()
@@ -7178,6 +7674,7 @@ pub(crate) fn last_operation(
 
 pub(crate) mod partitioned_dml;
 pub(crate) mod statement_writes;
+mod trigger_dml;
 mod trigger_insert;
 pub(crate) mod trigger_writes;
 

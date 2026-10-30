@@ -812,7 +812,6 @@ impl Storage {
 
     /// `scope` の表 `table_key` のトリガを名前の昇順で返す（読み取り専用。発火側〔#1723〕が引く入口）。
     /// 他テナントの定義は構造上引けない。
-    #[allow(dead_code)] // #1723（発火）が結線するまではテストからのみ呼ばれる。
     pub(crate) fn list_triggers(&self, scope: &str, table_key: &str) -> Result<Vec<TriggerDef>> {
         validate_scope(scope)?;
         validate_relation_key(table_key)?;
