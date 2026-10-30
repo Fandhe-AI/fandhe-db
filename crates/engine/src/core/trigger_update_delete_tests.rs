@@ -236,9 +236,10 @@ fn before_update_can_repair_explicit_null_and_default() {
     );
 }
 
-// 自己参照 FK（CASCADE）を持つ表自身の UPDATE・DELETE トリガは、子表扱いで 0A000 にならず発火する。
+// 自己参照 FK（CASCADE）を持つ表の UPDATE・DELETE トリガは、参照アクションで同表の別行が書き換わり
+// 発火できないため、黙って飛ばさず 0A000（D8）。トリガは 1 度も呼ばれない。
 #[test]
-fn self_referencing_table_triggers_fire() {
+fn self_referencing_table_triggers_are_rejected() {
     let dir = tempdir();
     let (core, calls) = seeded(dir.path(), passthrough());
     let a = ctx("tenant-a");
@@ -257,11 +258,76 @@ fn self_referencing_table_triggers_fire() {
         &dml_trigger("t", TriggerTiming::Before, UPD | DEL, &[]),
     );
     run(&core, &a, "INSERT INTO selfr (k) VALUES (1)").expect("insert");
-    let out = run(&core, &a, "UPDATE selfr SET p = NULL WHERE k = 1").expect("update");
-    assert_eq!(affected(out), 1);
-    let out = run(&core, &a, "DELETE FROM selfr WHERE k = 1").expect("delete");
-    assert_eq!(affected(out), 1);
-    assert_eq!(calls.load(Ordering::SeqCst), 2);
+    assert_eq!(
+        code(&core, &a, "UPDATE selfr SET p = NULL WHERE k = 1"),
+        "0A000"
+    );
+    assert_eq!(code(&core, &a, "DELETE FROM selfr WHERE k = 1"), "0A000");
+    assert_eq!(calls.load(Ordering::SeqCst), 0);
+}
+
+// NoSQL の述語形 update・delete は、該当イベントのトリガがあれば 0A000（発火経路に載せない）。
+#[test]
+fn nosql_predicate_paths_are_rejected_when_triggers_exist() {
+    let dir = tempdir();
+    let (core, calls) = seeded(dir.path(), passthrough());
+    let a = ctx("tenant-a");
+    add_trigger(
+        &core.storage,
+        "tenant-a",
+        "trg",
+        &dml_trigger("t", TriggerTiming::Before, UPD | DEL, &[]),
+    );
+    let op = crate::recovery::required_op_id::OperationId::parse("op-nosql").expect("op");
+    let err = core
+        .execute_bound_predicate_update_in_session(&a, "trg", Some(&op), |_| {
+            Ok((
+                vec![(
+                    "n".to_string(),
+                    crate::sql::allowlist::InsertLiteral::Number("1".to_string()),
+                )],
+                vec![crate::sql::allowlist::WherePredicate::Equality {
+                    column: "a".to_string(),
+                    value: "x".to_string(),
+                }],
+            ))
+        })
+        .expect_err("update");
+    assert_eq!(err.wire_code(), "0A000");
+    let err = core
+        .execute_bound_predicate_delete_in_session(&a, "trg", Some(&op), |_| {
+            Ok(vec![crate::sql::allowlist::WherePredicate::Equality {
+                column: "a".to_string(),
+                value: "x".to_string(),
+            }])
+        })
+        .expect_err("delete");
+    assert_eq!(err.wire_code(), "0A000");
+    assert_eq!(calls.load(Ordering::SeqCst), 0);
+    assert_eq!(count(&core, &a, "trg"), 3);
+}
+
+// AFTER だけのトリガ・値を書き換え得ない構成では、NOT NULL 違反は束縛時に 23502（行の有無で分かれない）。
+#[test]
+fn not_null_is_checked_at_bind_without_before_trigger() {
+    let dir = tempdir();
+    let (core, _calls) = seeded(dir.path(), passthrough());
+    let a = ctx("tenant-a");
+    add_trigger(
+        &core.storage,
+        "tenant-a",
+        "trg",
+        &dml_trigger("t", TriggerTiming::After, UPD, &[]),
+    );
+    // 一致する行が無い述語でも 23502（UPDATE 0 にならない）。
+    assert_eq!(
+        code(&core, &a, "UPDATE trg SET n = NULL WHERE id = 999"),
+        "23502"
+    );
+    assert_eq!(
+        code(&core, &a, "UPDATE trg SET n = NULL WHERE id = 1"),
+        "23502"
+    );
 }
 
 // BEFORE が NULL を返した行は更新・削除されず、影響行数にも AFTER にも数えない。

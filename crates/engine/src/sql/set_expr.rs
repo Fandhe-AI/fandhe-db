@@ -74,37 +74,37 @@ impl BoundSetExpr {
 
 thread_local! {
     /// 束縛時の NOT NULL 検査（`SET col = NULL`・既定値の無い NOT NULL 列への `SET col = DEFAULT`）を
-    /// 後回しにする区間か（BEFORE UPDATE トリガ対応の経路。Issue #1725）。
-    static DEFER_NOT_NULL_BIND: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+    /// 後回しにしている対象表名（BEFORE UPDATE トリガ対応の経路。Issue #1725）。`None` は後回しなし。
+    static DEFER_NOT_NULL_BIND: std::cell::RefCell<Option<String>> = const { std::cell::RefCell::new(None) };
 }
 
-/// 束縛時の NOT NULL 検査を後回しにする RAII ガード。対象表に UPDATE の行トリガがあるとき、
-/// `core.rs` の UPDATE 入口が束縛区間だけ保持する。NULL は式項（`default_value` または `BoundExpr::Null`）
-/// として運ばれ、BEFORE トリガが補正した後の最終 NEW でだけ NOT NULL を検査する（`tenant::trigger_dml`）。
-/// トリガ無しの経路は検査が `validate_set_assignments` に残るため `23502` を返す契約は変わらない。
-/// drop で直前の値へ戻す。
+/// 束縛時の NOT NULL 検査を後回しにする RAII ガード。対象表に BEFORE の UPDATE 行トリガ（値を書き換え得る）が
+/// あるとき、`core.rs` の UPDATE 入口が `bind_*` 呼び出しの範囲だけ保持する（サブクエリ解決・適用・トリガ発火の
+/// 間は保持しない）。保持中でも、表名が一致する `bind_set_assignments` だけが後回しにする（別表の束縛へ
+/// 引き継がない）。NULL は式項（`default_value` または `BoundExpr::Null`）として運ばれ、BEFORE トリガが補正した
+/// 後の最終 NEW でだけ NOT NULL を検査する（`tenant::trigger_dml`）。drop で直前の値へ戻す。
 pub(crate) struct DeferNotNullBindScope {
-    prev: bool,
+    prev: Option<String>,
 }
 
 impl DeferNotNullBindScope {
-    pub(crate) fn enter() -> Self {
+    pub(crate) fn enter(table: &str) -> Self {
         Self {
-            prev: DEFER_NOT_NULL_BIND.with(|c| c.replace(true)),
+            prev: DEFER_NOT_NULL_BIND.with(|c| c.replace(Some(table.to_string()))),
         }
     }
 }
 
 impl Drop for DeferNotNullBindScope {
     fn drop(&mut self) {
-        let prev = self.prev;
-        DEFER_NOT_NULL_BIND.with(|c| c.set(prev));
+        let prev = self.prev.take();
+        DEFER_NOT_NULL_BIND.with(|c| *c.borrow_mut() = prev);
     }
 }
 
-/// 現スレッドが [`DeferNotNullBindScope`] の区間内か。
-pub(crate) fn defer_not_null_bind() -> bool {
-    DEFER_NOT_NULL_BIND.with(|c| c.get())
+/// 現スレッドが表 `table` について [`DeferNotNullBindScope`] の区間内か。
+pub(crate) fn defer_not_null_bind(table: &str) -> bool {
+    DEFER_NOT_NULL_BIND.with(|c| c.borrow().as_deref() == Some(table))
 }
 
 /// NOT NULL 列への明示的な `SET col = NULL` を、NOT NULL 検査後回しの式項として束縛する
@@ -126,6 +126,7 @@ pub(crate) fn bind_deferred_null(name: &str, column: &ColumnDef) -> BoundSetExpr
 /// 時刻関数・SEQUENCE・IDENTITY の DEFAULT は評価文脈が無いため `bind_column_default` の
 /// `0A000` をそのまま返す（fail-closed。GENERATED ALWAYS 列もこの拒否になる）。
 pub(crate) fn bind_set_default(
+    table: &str,
     name: &str,
     column: &ColumnDef,
 ) -> Result<BoundSetExpr, SqlSurfaceError> {
@@ -139,7 +140,7 @@ pub(crate) fn bind_set_default(
             }
             _ if column.nullable => Value::Null,
             // NOT NULL 検査後回しの区間（BEFORE UPDATE トリガ対応）では NULL のまま運ぶ。
-            _ if defer_not_null_bind() => Value::Null,
+            _ if defer_not_null_bind(table) => Value::Null,
             _ => return Err(SqlSurfaceError::not_null_violation(name)),
         },
     };

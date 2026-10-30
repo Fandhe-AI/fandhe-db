@@ -13,9 +13,10 @@ Issue #1725（親 #1720）の実装記録。上位の決定は [trigger-executio
 - 結合形（`UPDATE ... FROM`・`DELETE ... USING`）は内部の実行器（`execute_joined_dml_in`）だけがトリガに
   対応している。SQL の dispatch は未結線で、SQL から送ると従来どおり `0A000`（束縛後に拒否）になる。
   結線は #1757 以降の後続で行う
-- `SET n = NULL`・既定値の無い NOT NULL 列への `SET n = DEFAULT` も、対象表に UPDATE のトリガがあるときは
-  束縛時に `23502` にせず、BEFORE が補正した後の最終 NEW だけを検査する（束縛区間の
-  `DeferNotNullBindScope`。トリガの無い表は束縛時の `23502` のまま）
+- `SET n = NULL`・既定値の無い NOT NULL 列への `SET n = DEFAULT` は、対象表に **BEFORE の UPDATE トリガ**
+  （NEW を書き換え得るもの）があるときだけ束縛時に `23502` にせず、BEFORE が補正した後の最終 NEW だけを
+  検査する。AFTER のみ・トリガ無しの表は従来どおり束縛時に `23502`（行の有無・可視性で応答を分けない）。
+  後回しの区間（`DeferNotNullBindScope`）は `bind_*` 呼び出しの範囲だけで、表名で限定する
 - `UPDATE OF <列>` は、その列が `SET` の対象として書かれた文でだけ発火する。BEFORE による書き換えは
   判定に含めない（D7）
 - 分割実行 DML（`... PARTITIONED`）は、対象表に該当イベントのトリガ（行・文を問わない）が 1 つでもあれば
@@ -29,8 +30,8 @@ Issue #1725（親 #1720）の実装記録。上位の決定は [trigger-executio
 | 分割実行 DML | 該当イベントのトリガがあれば `0A000` |
 | `RETURNING` 付きの UPDATE／DELETE | 該当イベントのトリガがあれば `0A000`（最終値の投影は後続） |
 | UPSERT（`ON CONFLICT`） | INSERT・UPDATE のどちらかのトリガがあれば `0A000`（`DO UPDATE` を発火させるのは後続） |
-| NoSQL の更新・削除、生の行 API、`replace_typed_rows_by_text_key` | 該当イベントのトリガがあれば `0A000` |
-| 参照アクション（CASCADE・SET NULL・SET DEFAULT）が及ぶ子表に該当イベントのトリガ | `0A000`（カタログの FK 宣言だけから静的に判定。親にトリガが無くても拒否する）。対象表自身（自己参照 FK）は子表に数えず、参照アクションで書き換わる同表の別行ではトリガが発火しない（既知の制限） |
+| NoSQL の更新・削除（述語形を含む。入口で通過証を渡さず `None` で分類する）、生の行 API、`replace_typed_rows_by_text_key` | 該当イベントのトリガがあれば `0A000` |
+| 参照アクション（CASCADE・SET NULL・SET DEFAULT）が及ぶ子表に該当イベントのトリガ | `0A000`（カタログの FK 宣言だけから静的に判定。親にトリガが無くても拒否する）。自己参照 FK の対象表自身も子表に数える（参照アクションで書き換わる同表の別行ではトリガを発火できないため、黙って飛ばさず `0A000`） |
 | 文トリガ（UPDATE・DELETE の STATEMENT） | `0A000`（#1726） |
 | `WHEN` 付き | `0A000` のまま（発火時にも二重に拒否。評価は後続） |
 

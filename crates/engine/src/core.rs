@@ -14121,6 +14121,7 @@ impl EngineCore {
             resolved.as_ref().unwrap_or(stmt),
             stmt,
             &schema,
+            Some(&self.trigger_runtime),
         )
     }
 
@@ -14142,7 +14143,7 @@ impl EngineCore {
         stmt: &crate::sql::allowlist::ValidatedPredicateDelete,
         schema: &crate::catalog::TableSchema,
     ) -> Result<crate::sql::exec::DeleteOutcome, crate::sql::allowlist::SqlSurfaceError> {
-        self.run_predicate_delete_resolved(target, ctx, udfs, stmt, stmt, schema)
+        self.run_predicate_delete_resolved(target, ctx, udfs, stmt, stmt, schema, None)
     }
 
     /// [`Self::run_predicate_delete`] の本体。`bind_stmt` は束縛に使う文（サブクエリ解決済み）、
@@ -14157,6 +14158,7 @@ impl EngineCore {
         bind_stmt: &crate::sql::allowlist::ValidatedPredicateDelete,
         hash_stmt: &crate::sql::allowlist::ValidatedPredicateDelete,
         schema: &crate::catalog::TableSchema,
+        triggers: Option<&crate::trigger::TriggerRuntime>,
     ) -> Result<crate::sql::exec::DeleteOutcome, crate::sql::allowlist::SqlSurfaceError> {
         // 多層防御（Issue #1129）: 分割実行修飾付きの文は原子実行器へ到達させない
         // （黙って原子実行へ切り替えない。fail-closed）。
@@ -14174,7 +14176,7 @@ impl EngineCore {
             &content_hash_value,
             self.dml_limits.max_affected_rows,
             self.scan_limits.max_scanned_rows(),
-            Some(&self.trigger_runtime),
+            triggers,
         )
     }
 
@@ -14531,8 +14533,10 @@ impl EngineCore {
         Ok((bound, content_hash_value))
     }
 
-    /// UPDATE の束縛区間で NOT NULL 検査を後回しにするガードを返す（対象表に UPDATE のトリガがあるときだけ。
-    /// Issue #1725）。
+    /// UPDATE の束縛区間（`bind_*` 呼び出しの範囲だけ）で NOT NULL 検査を後回しにするガードを返す。
+    /// 対象表に BEFORE の UPDATE 行トリガ（NEW を書き換え得る）があるときだけで、AFTER のみのトリガ・
+    /// トリガ無しは従来どおり束縛時に `23502` を返す（`23502` と `UPDATE 0` の差で行の存在・可視性を
+    /// 漏らさない。Issue #1725）。`table` は束縛に渡すスキーマの表名（表ごとに限定するため）。
     fn defer_not_null_scope_for_update(
         &self,
         ctx: &PolicyContext,
@@ -14544,10 +14548,11 @@ impl EngineCore {
         triggers
             .iter()
             .any(|t| {
-                t.events
-                    .contains(crate::catalog::trigger::TriggerEvents::UPDATE)
+                t.timing == crate::catalog::trigger::TriggerTiming::Before
+                    && t.events
+                        .contains(crate::catalog::trigger::TriggerEvents::UPDATE)
             })
-            .then(crate::sql::set_expr::DeferNotNullBindScope::enter)
+            .then(|| crate::sql::set_expr::DeferNotNullBindScope::enter(table))
     }
 
     /// 対象テーブルのスキーマを取得する（`RETURNING` 付き DML の各実行本体が
@@ -14737,8 +14742,10 @@ impl EngineCore {
                     },
                 })?,
         };
-        let _defer = self.defer_not_null_scope_for_update(ctx, &stmt.table_name);
-        let bound = crate::sql::parser::bind_update(stmt, &schema)?;
+        let bound = {
+            let _defer = self.defer_not_null_scope_for_update(ctx, &schema.name);
+            crate::sql::parser::bind_update(stmt, &schema)?
+        };
         crate::sql::exec::execute_update_with_schema_in(
             target,
             ctx,
@@ -14800,13 +14807,15 @@ impl EngineCore {
                     detail: "failed to load table schema".to_string(),
                 },
             })?;
-        // 対象表に UPDATE の行トリガがあれば、束縛時の NOT NULL 検査を最終 NEW まで後回しにする。
-        let _defer = self.defer_not_null_scope_for_update(ctx, table_name);
         let ValidatedUpdateForm::Predicate(validated) = stmt else {
             // `Single` は `bind_update_form` へ渡す前にここで直接処理する
             // （`Predicate` 分岐専用の `Self::run_predicate_update` へは
             // 渡さない。抽出前と挙動を完全に同一に保つ）。
-            let bound = crate::sql::parser::bind_update_form(stmt, &schema, session.udfs())?;
+            let bound = {
+                // BEFORE の UPDATE トリガがあれば、束縛時の NOT NULL 検査を最終 NEW まで後回しにする。
+                let _defer = self.defer_not_null_scope_for_update(ctx, &schema.name);
+                crate::sql::parser::bind_update_form(stmt, &schema, session.udfs())?
+            };
             let crate::sql::parser::BoundUpdateForm::Single(bound) = bound else {
                 return Err(crate::sql::allowlist::SqlSurfaceError::Internal {
                     detail: "internal: bound single-row UPDATE from a predicate-form statement"
@@ -14836,6 +14845,7 @@ impl EngineCore {
             resolved.as_ref().unwrap_or(validated),
             validated,
             &schema,
+            Some(&self.trigger_runtime),
         )
     }
 
@@ -15005,7 +15015,7 @@ impl EngineCore {
         validated: &crate::sql::allowlist::ValidatedPredicateUpdate,
         schema: &crate::catalog::TableSchema,
     ) -> Result<crate::sql::exec::UpdateOutcome, crate::sql::allowlist::SqlSurfaceError> {
-        self.run_predicate_update_resolved(target, ctx, udfs, validated, validated, schema)
+        self.run_predicate_update_resolved(target, ctx, udfs, validated, validated, schema, None)
     }
 
     /// [`Self::run_predicate_update`] の本体（`bind_stmt`／`hash_stmt` の意味は
@@ -15019,13 +15029,18 @@ impl EngineCore {
         bind_stmt: &crate::sql::allowlist::ValidatedPredicateUpdate,
         hash_stmt: &crate::sql::allowlist::ValidatedPredicateUpdate,
         schema: &crate::catalog::TableSchema,
+        triggers: Option<&crate::trigger::TriggerRuntime>,
     ) -> Result<crate::sql::exec::UpdateOutcome, crate::sql::allowlist::SqlSurfaceError> {
         // 多層防御（Issue #1129）: 分割実行修飾付きの文は原子実行器へ到達させない。
         if bind_stmt.partitioned().is_some() {
             return Err(crate::sql::allowlist::SqlSurfaceError::PartitionedDmlInTransaction);
         }
-        let (predicate, content_hash_value, legacy_hash) =
-            Self::prepare_predicate_update(bind_stmt, hash_stmt, schema, udfs)?;
+        let (predicate, content_hash_value, legacy_hash) = {
+            // トリガ結線経路（SQL）だけ、BEFORE の UPDATE トリガがあれば束縛時の NOT NULL 検査を後回しにする。
+            let _defer =
+                triggers.and_then(|_| self.defer_not_null_scope_for_update(ctx, &schema.name));
+            Self::prepare_predicate_update(bind_stmt, hash_stmt, schema, udfs)?
+        };
         let legacy_hashes: &[crate::recovery::content_hash::ContentHash] = legacy_hash.as_slice();
         crate::sql::exec::execute_predicate_update_in(
             target,
@@ -15037,7 +15052,7 @@ impl EngineCore {
             legacy_hashes,
             self.dml_limits.max_affected_rows,
             self.scan_limits.max_scanned_rows(),
-            Some(&self.trigger_runtime),
+            triggers,
         )
     }
 
