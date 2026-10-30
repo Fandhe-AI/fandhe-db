@@ -566,11 +566,11 @@ const ALLOWLIST: &[(&str, u32)] = &[
     ("catalog/function.rs", 1723),
     // Issue #1689（ALTER SEQUENCE）: `alter_sequence`／`rename_sequence`（803・842）も同じ表だけを書く
     // （定義 blob の上書き・キーの付け替え・状態行の削除）ため同じ理由で対象外。
-    // Issue #1733（INSERT ... SELECT）: `core/insert_select_exec.rs` の 1003・1135 行（Issue #2613・#2614・#2615・#2212・#1726 で追随）は `#[cfg(test)]` 内の
+    // Issue #1733（INSERT ... SELECT）: `core/insert_select_exec.rs` の 1007・1139 行（Issue #2613・#2614・#2615・#2212・#1726 で追随）は `#[cfg(test)]` 内の
     // 明示トランザクション検証で共有 write txn を commit するだけの呼び出し。行の書き込みと世代 bump は
     // 既存の `sql::exec::execute_insert_*_in` 経路が同じ txn 内で済ませており、ここで追加の bump は不要。
-    ("core/insert_select_exec.rs", 1003),
-    ("core/insert_select_exec.rs", 1135),
+    ("core/insert_select_exec.rs", 1007),
+    ("core/insert_select_exec.rs", 1139),
     // Issue #1679（CTAS の台帳）: `core/ctas_exec.rs` の 302 行は `IF NOT EXISTS` の no-op（既存の表がある）で
     // `operation_id` の台帳だけを記録する commit。表の中身・定義は変えないため世代 bump は不要
     // （表を作る commit 側の 235 行は直前で bump 済み）。
