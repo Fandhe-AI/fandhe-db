@@ -59,6 +59,11 @@ pub(crate) const FUNCTION_ALREADY_EXISTS_MESSAGE: &str = "function already exist
 /// 名前指定の削除が複数の多重定義に当たった場合の `Invalid` の固定文言（防御的。42725 へ写す）。
 pub(crate) const FUNCTION_AMBIGUOUS_MESSAGE: &str = "function name is not unique";
 
+/// `CREATE OR REPLACE FUNCTION` の置換で再帰（循環）定義になるときの `Invalid` の固定文言
+/// （`sql::udf_ddl` が `0A000` へ写す。write txn 内の最新カタログに対する検査結果。Issue #1917）。
+pub(crate) const FUNCTION_RECURSIVE_MESSAGE: &str =
+    "recursive function definitions are not supported";
+
 /// `CREATE OR REPLACE FUNCTION` が戻り値の型を変えようとしたときの `Invalid` の固定文言
 /// （`sql::udf_ddl` が `42P13` へ写す。SQL-66 (2)・Issue #1917）。
 pub(crate) const FUNCTION_CANNOT_CHANGE_RETURN_TYPE_MESSAGE: &str =
@@ -792,12 +797,25 @@ impl Storage {
     /// シグネチャが一致すれば、**内部 ID を保ったまま**本体を置き換える（引数名・戻り値の型の変更は
     /// `Invalid`〔`42P13` へ写す固定文言〕）。シグネチャ不一致・2 件以上は `FUNCTION_ALREADY_EXISTS_MESSAGE`
     /// （多重定義は未対応のため `42723`）。`def.id` は無視される。
+    #[cfg(test)]
     pub(crate) fn replace_function(
         &self,
         scope: &str,
         def: &FunctionDef,
     ) -> Result<ReplaceOutcome> {
-        self.replace_function_with_limit(scope, def, MAX_FUNCTIONS)
+        self.replace_function_checked(scope, def, &|_| Ok(()))
+    }
+
+    /// [`Self::replace_function`] に、write txn 内で最新カタログ（`scope` の全定義）に対して走る
+    /// 検査 `check` を足したもの。redb の write txn は直列化されるため、検査から commit までが
+    /// 同じ排他区間になり、並行置換で循環が残らない（`sql::udf_ddl` の循環検査が使う）。
+    pub(crate) fn replace_function_checked(
+        &self,
+        scope: &str,
+        def: &FunctionDef,
+        check: &dyn Fn(&[FunctionDef]) -> Result<()>,
+    ) -> Result<ReplaceOutcome> {
+        self.replace_function_with_limit(scope, def, MAX_FUNCTIONS, check)
     }
 
     /// [`Self::replace_function`] の本体（件数上限を引数にしてテストで小さい値を注入する）。
@@ -806,6 +824,7 @@ impl Storage {
         scope: &str,
         def: &FunctionDef,
         max_functions: usize,
+        check: &dyn Fn(&[FunctionDef]) -> Result<()>,
     ) -> Result<ReplaceOutcome> {
         validate_scope(scope)?;
         let mut stored = def.clone();
@@ -858,6 +877,9 @@ impl Storage {
                 ));
             }
         };
+        // 最新カタログ（この txn が見ている全定義）に対する検査。失敗なら commit せず破棄する。
+        let latest = list_in_txn(&*write_txn, scope, None)?;
+        check(&latest)?;
         insert_function_in_txn(&write_txn, scope, &stored, &signature)?;
         crate::recovery::commit_boundary::commit(write_txn)
             .map_err(super::convert_storage_error)?;
@@ -1611,14 +1633,14 @@ mod tests {
     #[test]
     fn replace_creates_within_count_limit() {
         let (s, _g) = tmp_storage("fn_replace_limit");
-        s.replace_function_with_limit("t", &def("a", vec![]), 1)
+        s.replace_function_with_limit("t", &def("a", vec![]), 1, &|_| Ok(()))
             .expect("first");
         let err = s
-            .replace_function_with_limit("t", &def("b", vec![]), 1)
+            .replace_function_with_limit("t", &def("b", vec![]), 1, &|_| Ok(()))
             .expect_err("limit");
         assert!(matches!(err, CatalogError::ViewLimitExceeded(_)));
         // 置換は件数を増やさないので上限でも通る。
-        s.replace_function_with_limit("t", &def("a", vec![]), 1)
+        s.replace_function_with_limit("t", &def("a", vec![]), 1, &|_| Ok(()))
             .expect("replace at limit");
     }
 

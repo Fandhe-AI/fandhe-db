@@ -18,13 +18,14 @@ use crate::catalog::function::{
     FunctionAttributes, FunctionDef, FunctionLanguage, FunctionParam, FunctionType,
     FUNCTION_ALREADY_EXISTS_MESSAGE, FUNCTION_AMBIGUOUS_MESSAGE,
     FUNCTION_CANNOT_CHANGE_PARAM_NAME_MESSAGE, FUNCTION_CANNOT_CHANGE_RETURN_TYPE_MESSAGE,
+    FUNCTION_RECURSIVE_MESSAGE,
 };
 use crate::catalog::CatalogError;
 use crate::sql::allowlist::{DropFunctionBehavior, SqlSurfaceError, ValidatedDropFunction};
 use crate::sql::mode::SessionState;
 use crate::sql::udf_call::{
-    commit_function_definition, prepare_function_definition, prepare_function_replacement,
-    PreparedUdf,
+    body_reaches_function, commit_function_definition, prepare_function_definition,
+    prepare_function_replacement, PreparedUdf,
 };
 use crate::storage::Storage;
 
@@ -113,8 +114,33 @@ pub(crate) fn execute_create_or_replace_function_persistent(
     let prepared =
         prepare_function_replacement(session.udfs(), name, params, &untyped, None, body, true)?;
     let def = catalog_def_from_prepared(&prepared, body_source);
+    // 循環検査はセッションのレジストリ（古い可能性がある）ではなく、write txn 内の最新カタログで
+    // 再度行う（並行する別セッションの置換との合成で循環が残るのを防ぐ）。
+    let target = prepared.key.to_ascii_lowercase();
+    let new_body = &prepared.body;
     storage
-        .replace_function(tenant_id, &def)
+        .replace_function_checked(tenant_id, &def, &|latest| {
+            let mut bodies = std::collections::BTreeMap::new();
+            for d in latest {
+                let lower = d.function_key.to_ascii_lowercase();
+                if lower == target || d.language != FunctionLanguage::Declarative {
+                    continue;
+                }
+                let Ok(tokens) = crate::sql::lexer::tokenize_rendered(&d.body_source) else {
+                    continue;
+                };
+                let Ok(body) = crate::sql::allowlist::parse_stored_function_body(&tokens) else {
+                    continue;
+                };
+                bodies.insert(lower, body);
+            }
+            if body_reaches_function(new_body, &target, &bodies) {
+                return Err(CatalogError::Invalid(
+                    FUNCTION_RECURSIVE_MESSAGE.to_string(),
+                ));
+            }
+            Ok(())
+        })
         .map_err(map_function_error)?;
     let key = prepared.key.clone();
     commit_function_definition(session.udfs_mut(), prepared);
@@ -225,6 +251,11 @@ fn map_function_error(e: CatalogError) -> SqlSurfaceError {
                 "cannot change return type of existing function",
             )
         }
+        CatalogError::Invalid(m) if m == FUNCTION_RECURSIVE_MESSAGE => {
+            SqlSurfaceError::feature_not_supported(
+                "recursive function definitions are not supported",
+            )
+        }
         CatalogError::Invalid(m) if m.contains("enum") => {
             SqlSurfaceError::feature_not_supported("enum types are not supported in functions")
         }
@@ -252,6 +283,66 @@ fn map_function_error(e: CatalogError) -> SqlSurfaceError {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn parse_body(src: &str) -> crate::sql::udf_call::Expr {
+        let tokens = crate::sql::lexer::tokenize_rendered(src).expect("tokens");
+        crate::sql::allowlist::parse_stored_function_body(&tokens).expect("body")
+    }
+
+    /// Issue #1917: 古いレジストリで循環検査を通っても、write txn 内の最新カタログで再検査され、
+    /// 並行置換 f→g・g→f の合成による循環がカタログに残らない。
+    #[test]
+    fn replace_rechecks_cycle_against_latest_catalog() {
+        let path = crate::test_util::temp_db::unique_db_path("udf-ddl-cycle");
+        let _guard = crate::test_util::temp_db::CleanupGuard(path.clone());
+        let storage = Storage::open(&path).expect("open");
+        let mut a = SessionState::default();
+        let mut b = SessionState::default();
+        // 初期状態 f(x) AS x・g(x) AS x を両セッションが同じ状態として持つ。
+        for sess in [&mut a, &mut b] {
+            let _ = sess;
+        }
+        let p = vec!["x".to_string()];
+        let body_x = parse_body("x");
+        let mut seed = SessionState::default();
+        let _ = &mut seed;
+        let prepared_f = prepare_function_definition(a.udfs(), "f", &p, &body_x).expect("f");
+        storage
+            .create_function("t", &catalog_def_from_prepared(&prepared_f, "x"))
+            .expect("create f");
+        commit_function_definition(a.udfs_mut(), prepared_f);
+        let prepared_g = prepare_function_definition(a.udfs(), "g", &p, &body_x).expect("g");
+        storage
+            .create_function("t", &catalog_def_from_prepared(&prepared_g, "x"))
+            .expect("create g");
+        commit_function_definition(a.udfs_mut(), prepared_g);
+        for key in ["f", "g"] {
+            let prep = prepare_function_definition(b.udfs(), key, &p, &body_x).expect("b");
+            commit_function_definition(b.udfs_mut(), prep);
+        }
+        execute_create_or_replace_function_persistent(
+            &storage,
+            "t",
+            &mut a,
+            "f",
+            &p,
+            &parse_body("g(x)"),
+            "g ( x )",
+        )
+        .expect("f -> g");
+        // b のレジストリは f を単純な本体だと思っているため、レジストリ上の検査は通る。
+        let err = execute_create_or_replace_function_persistent(
+            &storage,
+            "t",
+            &mut b,
+            "g",
+            &p,
+            &parse_body("f(x)"),
+            "f ( x )",
+        )
+        .expect_err("g -> f must be rejected by the catalog-level check");
+        assert_eq!(err.wire_code(), "0A000");
+    }
 
     #[test]
     fn catalog_errors_map_to_fixed_sqlstates() {

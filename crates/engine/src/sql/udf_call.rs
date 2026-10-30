@@ -2736,6 +2736,31 @@ pub(crate) fn prepare_function_replacement(
     Ok(prepared)
 }
 
+/// 関数名（小文字）から宣言的 UDF の本体式を引く抽象。セッションのレジストリと、カタログの最新定義
+/// （`replace_function` の write txn 内の循環検査）の両方で同じ到達判定を使うための境界。
+pub(crate) trait BodyLookup {
+    fn body_of(&self, lower_name: &str) -> Option<&Expr>;
+}
+
+impl BodyLookup for UdfRegistry {
+    fn body_of(&self, lower_name: &str) -> Option<&Expr> {
+        self.defs.get(lower_name).map(|d| &d.body)
+    }
+}
+
+impl BodyLookup for std::collections::BTreeMap<String, Expr> {
+    fn body_of(&self, lower_name: &str) -> Option<&Expr> {
+        self.get(lower_name)
+    }
+}
+
+/// `body` が `defs`（小文字名 → 本体）を推移的にたどって関数 `target`（小文字）へ到達するか。
+/// カタログの最新定義に対する循環検査（`sql::udf_ddl`）が呼ぶ。
+pub(crate) fn body_reaches_function(body: &Expr, target: &str, defs: &dyn BodyLookup) -> bool {
+    let mut visited = std::collections::BTreeSet::new();
+    expr_reaches_function(body, target, defs, &mut visited)
+}
+
 /// `expr` の呼び出しが（宣言的 UDF の本体を推移的にたどって）関数 `target`（小文字）へ到達するか。
 /// [`prepare_function_replacement`] の循環検査。`visited` が再訪を止めるため、レジストリ内の既存の
 /// 巡回があっても必ず停止する。`Expr` の全 variant を網羅し `_ =>` を置かない（variant 追加時に
@@ -2743,7 +2768,7 @@ pub(crate) fn prepare_function_replacement(
 fn expr_reaches_function(
     expr: &Expr,
     target: &str,
-    registry: &UdfRegistry,
+    registry: &dyn BodyLookup,
     visited: &mut std::collections::BTreeSet<String>,
 ) -> bool {
     match expr {
@@ -2762,10 +2787,8 @@ fn expr_reaches_function(
             if lower == target {
                 return true;
             }
-            if let Some(def) = registry.defs.get(&lower) {
-                if visited.insert(lower)
-                    && expr_reaches_function(&def.body, target, registry, visited)
-                {
+            if let Some(body) = registry.body_of(&lower) {
+                if visited.insert(lower) && expr_reaches_function(body, target, registry, visited) {
                     return true;
                 }
             }
