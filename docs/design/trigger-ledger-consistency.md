@@ -5,9 +5,11 @@
 
 ## 範囲
 
-本 Issue は本番コードを変更せず、D10 が定める性質をテストで固定する。D10 の順序（事前照合 →
-BEFORE STATEMENT → 書き込み → 台帳の記録 → AFTER、すべて同じ write txn の単一 commit）は
-Issue #1723〜#1727 で実装済みである。
+本 Issue は本番コードを変更せず、D10 が定める性質をテストで固定する。D10 の順序は、事前照合（BEFORE STATEMENT より前）→
+BEFORE STATEMENT → 書き込み → AFTER ROW・AFTER STATEMENT（すべてのトリガの副作用）→ 台帳の
+記録 → commit で、すべて同じ write txn の単一 commit である。事前照合（読み取りのみ）と台帳の
+記録（書き込み）は別の段であり、後者は全トリガの副作用の後に置く。この順序は Issue
+#1723〜#1727 で実装済みで、実装上の順序と D10 の要求に差はない。
 
 ## テストと D10 の対応
 
