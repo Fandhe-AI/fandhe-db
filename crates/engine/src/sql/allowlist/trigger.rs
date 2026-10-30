@@ -99,7 +99,10 @@ fn parse_tg_args(p: &mut Parser<'_>) -> Result<Vec<String>, SqlSurfaceError> {
                     n.clone()
                 }
             }
-            Some(Token::Ident(w)) if !negative => w.clone(),
+            // 引用符なしの NULL は識別子ではなく NULL リテラル（`TG_ARGV` に載せられない）ため拒否する。
+            // 引用符付き `"NULL"` は通常の識別子として許容する（トークナイザが引用符を外すので
+            // ここでは区別できず、大文字小文字を問わず拒否する側に倒す）。
+            Some(Token::Ident(w)) if !negative && !w.eq_ignore_ascii_case("NULL") => w.clone(),
             _ => {
                 return Err(SqlSurfaceError::unsupported(
                     "trigger arguments must be literals or simple names",
@@ -347,6 +350,21 @@ mod tests {
         assert_eq!(v.level, TriggerLevel::Row);
         assert_eq!(v.function, "f");
         assert_eq!(v.tg_args, vec!["x", "1", "-2", "word"]);
+    }
+
+    /// 引用符なしの NULL は `TG_ARGV` の値にできず `42601`（後段のカタログエラーへ流さない）。
+    #[test]
+    fn bare_null_argument_is_42601() {
+        for sql in [
+            "CREATE TRIGGER g AFTER INSERT ON t EXECUTE FUNCTION f(NULL)",
+            "CREATE TRIGGER g AFTER INSERT ON t EXECUTE FUNCTION f('a', null)",
+        ] {
+            assert_eq!(code(sql), "42601", "{sql}");
+        }
+        // 文字列リテラルの 'NULL' は通常の値。
+        let v =
+            create("CREATE TRIGGER g AFTER INSERT ON t EXECUTE FUNCTION f('NULL')").expect("parse");
+        assert_eq!(v.tg_args, vec!["NULL"]);
     }
 
     #[test]

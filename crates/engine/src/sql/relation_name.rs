@@ -506,8 +506,17 @@ pub(crate) fn rewrite_relation_names_full(
             }
             continue;
         }
+        // `CREATE TRIGGER ... EXECUTE FUNCTION s.f(...)` の関数名（Issue #1722）も、`ON s.t` と同じく
+        // 存在しない SCHEMA は `3F000` で fail-closed にする（式中の関数呼び出しではないため）。
+        let trigger_function_name = i >= 2
+            && matches!(tokens.get(i + 1), Some(Token::Punct('(')))
+            && (ident_is(tokens.get(i - 1), "FUNCTION")
+                || ident_is(tokens.get(i - 1), "PROCEDURE"))
+            && ident_is(tokens.get(i - 2), "EXECUTE")
+            && crate::sql::allowlist::is_create_trigger_statement(tokens);
+        let strict_function_name = drop_function_name || trigger_function_name;
         let function_pos = resolver.is_some()
-            && (drop_function_name || matches!(tokens.get(i + 1), Some(Token::Punct('('))))
+            && (strict_function_name || matches!(tokens.get(i + 1), Some(Token::Punct('('))))
             && !qualifier.eq_ignore_ascii_case("public")
             && !is_builtin_schema_name(qualifier)
             && !qualifier.eq_ignore_ascii_case("pg_temp");
@@ -517,7 +526,7 @@ pub(crate) fn rewrite_relation_names_full(
                 create_name: false,
                 matview: false,
                 function_pos: true,
-                drop_name: drop_function_name,
+                drop_name: strict_function_name,
             });
         } else {
             residual_column_qualifier = true;
@@ -1384,6 +1393,25 @@ mod tests {
     }
 
     /// `nextval('s.q')` の文字列引数は、テナントの SCHEMA 修飾のときだけ内部キーの `Ident` へ置き換わる。
+    /// Issue #1722: `CREATE TRIGGER ... EXECUTE FUNCTION z.f()` の未知 SCHEMA は `ON z.t` と同じ `3F000`。
+    #[test]
+    fn trigger_function_unknown_schema_is_3f000() {
+        for sql in [
+            "CREATE TRIGGER g AFTER INSERT ON t EXECUTE FUNCTION z.f()",
+            "CREATE TRIGGER g AFTER INSERT ON t EXECUTE PROCEDURE z.f()",
+            "CREATE TRIGGER g AFTER INSERT ON z.t EXECUTE FUNCTION f()",
+        ] {
+            assert_eq!(
+                rewrite_in_tenant(sql).expect_err(sql).wire_code(),
+                "3F000",
+                "{sql}"
+            );
+        }
+        let ok = rewrite_in_tenant("CREATE TRIGGER g AFTER INSERT ON t EXECUTE FUNCTION s.f()")
+            .expect("known schema");
+        assert!(ok.contains(&Token::Ident("#12.f".to_string())));
+    }
+
     /// `public.`・組み込み SCHEMA・引用符・複数の `.`・不正な識別子は何もしない（従来の拒否に任せる）。
     #[test]
     fn sequence_name_literals_are_resolved_only_for_tenant_schemas() {
