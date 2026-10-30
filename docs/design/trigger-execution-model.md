@@ -85,6 +85,9 @@
 
 > Issue #1723 の実装記録: [trigger-before-insert.md](trigger-before-insert.md)（INSERT の BEFORE ROW 経路・
 > 経路ごとのガード・PostgreSQL との差分）。
+>
+> Issue #1724 の実装記録: [trigger-after-insert.md](trigger-after-insert.md)（INSERT の AFTER ROW 経路・
+> 段 6 のキュー消化・トリガ内書き込みの窓口・遅延 FK）。
 
 1. 台帳の事前照合（D10）。再送ならここで `23505` を返し、トリガは 1 つも呼ばない
 2. BEFORE STATEMENT（対象 0 行でも発火する）
@@ -171,6 +174,9 @@
   DEFERRABLE は `0A000`、一時表へのトリガは初版では `0A000`、NoSQL 表層からは定義できない
 
 ### D9. Tx・テナント文脈（RLS）
+
+> Issue #1724 の実装記録: [trigger-after-insert.md](trigger-after-insert.md)（トリガ内の書き込みは
+> `TriggerWriteHandle` が呼び出しテナントの `PolicyContext` を借用して行い、差し替えられない）。
 
 - トリガ関数は、書き込みを発行したセッションの `PolicyContext`（テナント）で、同じ write txn
   の中で実行する。作成者の文脈へは切り替えない。`SECURITY DEFINER` は #2223 ADR のとおり

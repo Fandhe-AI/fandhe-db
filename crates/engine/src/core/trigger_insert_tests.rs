@@ -25,13 +25,13 @@ use crate::storage::{Storage, Visibility};
 use crate::test_util::temp_db::tempdir;
 use crate::trigger::call::{TriggerCall, TriggerFunctionInvoker, TriggerOutcome};
 
-type Behavior =
+pub(super) type Behavior =
     Box<dyn Fn(&TriggerCall<'_>) -> Result<TriggerOutcome, SqlSurfaceError> + Send + Sync>;
 
 /// 振る舞いをクロージャで注入する呼び出し口（呼び出し回数を数える）。
-struct FnInvoker {
-    behavior: Behavior,
-    calls: Arc<AtomicUsize>,
+pub(super) struct FnInvoker {
+    pub(super) behavior: Behavior,
+    pub(super) calls: Arc<AtomicUsize>,
 }
 
 impl TriggerFunctionInvoker for FnInvoker {
@@ -41,13 +41,13 @@ impl TriggerFunctionInvoker for FnInvoker {
     }
 }
 
-fn ctx(tenant: &str) -> PolicyContext {
+pub(super) fn ctx(tenant: &str) -> PolicyContext {
     PolicyContext::with_visibilities(tenant, [Visibility::Public, Visibility::Private])
         .expect("valid tenant")
 }
 
 /// 列: embedding VECTOR(2) NOT NULL・a TEXT・n BIGINT NOT NULL（既定値なし）。
-fn trg_schema(name: &str) -> TableSchema {
+pub(super) fn trg_schema(name: &str) -> TableSchema {
     TableSchema::new(
         name,
         vec![
@@ -74,7 +74,7 @@ fn open_storage(dir: &std::path::Path) -> Storage {
     storage
 }
 
-fn func(key: &str) -> FunctionDef {
+pub(super) fn func(key: &str) -> FunctionDef {
     FunctionDef {
         id: 1,
         function_key: key.to_string(),
@@ -86,7 +86,7 @@ fn func(key: &str) -> FunctionDef {
     }
 }
 
-fn trigger_def(name: &str, timing: TriggerTiming, level: TriggerLevel) -> TriggerDef {
+pub(super) fn trigger_def(name: &str, timing: TriggerTiming, level: TriggerLevel) -> TriggerDef {
     TriggerDef {
         id: 0,
         name: name.to_string(),
@@ -100,7 +100,7 @@ fn trigger_def(name: &str, timing: TriggerTiming, level: TriggerLevel) -> Trigge
     }
 }
 
-fn add_trigger(storage: &Storage, scope: &str, table: &str, def: &TriggerDef) {
+pub(super) fn add_trigger(storage: &Storage, scope: &str, table: &str, def: &TriggerDef) {
     // 関数は同じ scope の引数なし関数。2 つ目以降のトリガは既存の関数を再利用する。
     let _ = storage.create_function(scope, &func("f"));
     storage
@@ -108,11 +108,14 @@ fn add_trigger(storage: &Storage, scope: &str, table: &str, def: &TriggerDef) {
         .expect("create trigger");
 }
 
-fn before_row(name: &str) -> TriggerDef {
+pub(super) fn before_row(name: &str) -> TriggerDef {
     trigger_def(name, TriggerTiming::Before, TriggerLevel::Row)
 }
 
-fn core_with(dir: &std::path::Path, behavior: Behavior) -> (EngineCore, Arc<AtomicUsize>) {
+pub(super) fn core_with(
+    dir: &std::path::Path,
+    behavior: Behavior,
+) -> (EngineCore, Arc<AtomicUsize>) {
     let calls = Arc::new(AtomicUsize::new(0));
     let core = EngineCore::from_storage(
         open_storage(dir),
@@ -125,12 +128,16 @@ fn core_with(dir: &std::path::Path, behavior: Behavior) -> (EngineCore, Arc<Atom
     (core, calls)
 }
 
-fn run(core: &EngineCore, c: &PolicyContext, sql: &str) -> Result<SqlOutcome, SqlSurfaceError> {
+pub(super) fn run(
+    core: &EngineCore,
+    c: &PolicyContext,
+    sql: &str,
+) -> Result<SqlOutcome, SqlSurfaceError> {
     let mut s = SessionState::default();
     core.execute_sql_in_session(c, &mut s, sql)
 }
 
-fn rows_affected(out: SqlOutcome) -> u64 {
+pub(super) fn rows_affected(out: SqlOutcome) -> u64 {
     match out {
         SqlOutcome::Insert(o) => o.rows_affected,
         SqlOutcome::Returning(o) => o.rows_affected,
@@ -138,7 +145,7 @@ fn rows_affected(out: SqlOutcome) -> u64 {
     }
 }
 
-fn count(core: &EngineCore, c: &PolicyContext, table: &str) -> u64 {
+pub(super) fn count(core: &EngineCore, c: &PolicyContext, table: &str) -> u64 {
     let SqlOutcome::Query(q) =
         run(core, c, &format!("SELECT COUNT(*) FROM {table}")).expect("count")
     else {
@@ -151,7 +158,11 @@ fn count(core: &EngineCore, c: &PolicyContext, table: &str) -> u64 {
 }
 
 /// `SELECT id, a, n` の結果を (id, a, n) の列で返す（id 昇順）。
-fn read_rows(core: &EngineCore, c: &PolicyContext, table: &str) -> Vec<(u64, String, i64)> {
+pub(super) fn read_rows(
+    core: &EngineCore,
+    c: &PolicyContext,
+    table: &str,
+) -> Vec<(u64, String, i64)> {
     let SqlOutcome::Query(q) =
         run(core, c, &format!("SELECT id, a, n FROM {table} LIMIT 100")).expect("select")
     else {
@@ -180,7 +191,7 @@ fn read_rows(core: &EngineCore, c: &PolicyContext, table: &str) -> Vec<(u64, Str
     out
 }
 
-fn text_of(row: &[Value], idx: usize) -> String {
+pub(super) fn text_of(row: &[Value], idx: usize) -> String {
     match row.get(idx) {
         Some(Value::Text(t)) => t.clone(),
         other => panic!("unexpected {other:?}"),
@@ -198,7 +209,8 @@ fn fill_n() -> Behavior {
     })
 }
 
-const INSERT_A1: &str = "INSERT INTO trg (id, embedding, a) VALUES (1, '[1.0,0.0]', 'x')";
+pub(super) const INSERT_A1: &str =
+    "INSERT INTO trg (id, embedding, a) VALUES (1, '[1.0,0.0]', 'x')";
 
 // 対象ビヘイビア: TABLE-45（ポインタ）。BEFORE トリガが省略した NOT NULL 列を補える。
 #[test]
@@ -393,11 +405,11 @@ fn unwired_invoker_is_0a000() {
     assert_eq!(count(&core, &a, "trg"), 0);
 }
 
-// AFTER ROW・文トリガ（INSERT）がある表への SQL INSERT は、結線するまで黙って発火させず `0A000`。
+// 文トリガ（INSERT）がある表への SQL INSERT は、結線するまで黙って発火させず `0A000`（AFTER ROW は Issue #1724 で結線済み）。
 #[test]
-fn after_and_statement_triggers_are_0a000() {
+fn statement_triggers_are_0a000() {
     for (timing, level) in [
-        (TriggerTiming::After, TriggerLevel::Row),
+        (TriggerTiming::After, TriggerLevel::Statement),
         (TriggerTiming::Before, TriggerLevel::Statement),
     ] {
         let dir = tempdir();
