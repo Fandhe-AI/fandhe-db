@@ -519,6 +519,16 @@ fn percent_type_resolves_a_column_type() {
     assert_eq!(e.wire_code(), "42703");
 }
 
+#[test]
+fn percent_type_resolves_the_visible_id_pseudo_column() {
+    let (core, _g) = new_core(LedgerMode::Optional);
+    let c = ctx("t1");
+    let out = call("DECLARE x docs.id%TYPE; BEGIN x := 5; RETURN x; END")
+        .autocommit(&core, &c)
+        .expect("id percent type");
+    assert_eq!(as_i64(&out), 5);
+}
+
 // ---- インジェクション ----
 
 #[test]

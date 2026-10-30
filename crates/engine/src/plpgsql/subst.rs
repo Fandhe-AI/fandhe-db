@@ -176,7 +176,13 @@ fn role_tokens(
             let mut wrapped = vec![Token::Ident("CAST".to_string()), Token::Punct('(')];
             wrapped.append(&mut out);
             wrapped.push(Token::Ident("AS".to_string()));
-            wrapped.push(Token::Ident("integer".to_string()));
+            // 変数の整数型を保つ（bigint 変数を int4 へ狭めると 2147483648 以上が範囲外になる）。
+            let word = match v.ty {
+                ColumnType::BigInt => "bigint",
+                ColumnType::SmallInt => "smallint",
+                _ => "integer",
+            };
+            wrapped.push(Token::Ident(word.to_string()));
             wrapped.push(Token::Punct(')'));
             out = wrapped;
         }

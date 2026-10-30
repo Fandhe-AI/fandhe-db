@@ -640,6 +640,10 @@ impl PlHost for CorePlHost<'_, '_> {
                     return Err(unsupported("unsupported %TYPE reference in PL/pgSQL"));
                 }
                 let schema = self.typed_relation_schema(rel)?;
+                // 可視の `id` 疑似列は `schema.columns` に無いが `SELECT id` では BigInt として読める。
+                if schema.has_pseudo_id() && col.eq_ignore_ascii_case("id") {
+                    return Ok(ResolvedType::Scalar(ColumnType::BigInt));
+                }
                 schema
                     .columns
                     .iter()

@@ -195,3 +195,20 @@ fn param_values_cannot_inject_sql() {
         ]
     );
 }
+
+#[test]
+fn order_and_group_keys_keep_the_integer_type_of_the_variable() {
+    let big = PlScalar::new(Cell::SignedInteger(2_147_483_648), ColumnType::BigInt);
+    let small = PlScalar::new(Cell::SignedInteger(3), ColumnType::SmallInt);
+    for role in [VarRole::OrderKey, VarRole::GroupKey] {
+        let tokens = lex("SELECT 1 FROM t ORDER BY w");
+        let sites = vec![site(6, role, 0)];
+        let out = substitute(&tokens, &sites, &Env(vec![big.clone()]), false).expect("big");
+        assert_eq!(
+            out,
+            lex("SELECT 1 FROM t ORDER BY CAST(2147483648 AS bigint)")
+        );
+        let out = substitute(&tokens, &sites, &Env(vec![small.clone()]), false).expect("small");
+        assert_eq!(out, lex("SELECT 1 FROM t ORDER BY CAST(3 AS smallint)"));
+    }
+}
