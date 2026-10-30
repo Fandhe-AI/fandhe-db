@@ -968,3 +968,87 @@ fn variable_named_id_conflicts_only_with_tables_that_have_an_id_column() {
     .expect_err("docs has an id column");
     assert_eq!(e.wire_code(), "42702");
 }
+
+// ---- Issue #2226 レビュー対応（数値の宣言型の保持・NULL の型付け）----
+
+fn big(i: i64) -> PlScalar {
+    PlScalar::new(Cell::SignedInteger(i), ColumnType::BigInt)
+}
+
+#[test]
+fn bigint_variable_keeps_its_type_at_the_int4_boundary() {
+    let (core, _g) = new_core(LedgerMode::Optional);
+    let c = ctx("t1");
+    // 2147483647 が裸のリテラルだと int4 同士の演算になり範囲エラーになる。
+    let out = call("BEGIN RETURN p + 1; END")
+        .returns(ColumnType::BigInt)
+        .param("p", SqlColumnTypeName::BigInt, big(2_147_483_647))
+        .autocommit(&core, &c)
+        .expect("bigint arithmetic");
+    assert_eq!(as_i64(&out), 2_147_483_648);
+    // 静的 SQL の投影（SELECT p INTO v）でも bigint のまま。
+    let out = call("DECLARE v bigint; BEGIN SELECT p + 1 INTO v; RETURN v; END")
+        .returns(ColumnType::BigInt)
+        .param("p", SqlColumnTypeName::BigInt, big(4_000_000_000))
+        .autocommit(&core, &c)
+        .expect("bigint select into");
+    assert_eq!(as_i64(&out), 4_000_000_001);
+    // smallint は smallint のまま（演算結果の型は SQL 側が決める）。
+    let out = call("BEGIN RETURN p + 1; END")
+        .param(
+            "p",
+            SqlColumnTypeName::SmallInt,
+            PlScalar::new(Cell::SignedInteger(7), ColumnType::SmallInt),
+        )
+        .autocommit(&core, &c)
+        .expect("smallint");
+    assert_eq!(as_i64(&out), 8);
+}
+
+#[test]
+fn float_variable_select_into_keeps_the_float_type() {
+    let (core, _g) = new_core(LedgerMode::Optional);
+    let c = ctx("t1");
+    let out = call("DECLARE v double precision; BEGIN SELECT p INTO v; RETURN v; END")
+        .returns(ColumnType::Double)
+        .param("p", SqlColumnTypeName::Double, float(2.5))
+        .autocommit(&core, &c)
+        .expect("float select into");
+    assert!(matches!(
+        out,
+        CallOutcome::Scalar(PlScalar { cell: Cell::Float(f), .. }) if (f - 2.5).abs() < f64::EPSILON
+    ));
+}
+
+#[test]
+fn execute_with_numbers_in_const_and_literal_positions() {
+    let (core, _g) = new_core(LedgerMode::Optional);
+    let c = ctx("t1");
+    seed(&core, &c, &[1, 2, 3], "en");
+    // INSERT .. VALUES は定数式で CAST を受理しないため、裸の数値へ切り替えて通る。IN リストは
+    // リテラル専用位置。
+    let out = call(
+        "DECLARE c bigint; BEGIN \
+         EXECUTE 'INSERT INTO docs (id, embedding, lang, n) VALUES ($1, ''[0.1,0.2]'', ''x'', $2)' USING 9, 4; \
+         EXECUTE 'UPDATE docs SET n = $1 WHERE id IN ($2, $3)' USING 5, 1, 2; \
+         SELECT count(*) INTO c FROM docs WHERE n BETWEEN 4 AND 5; RETURN c; END",
+    )
+    .returns(ColumnType::BigInt)
+    .autocommit(&core, &c)
+    .expect("execute params");
+    assert_eq!(as_i64(&out), 3);
+}
+
+#[test]
+fn null_order_key_is_typed_not_a_column_name() {
+    let (core, _g) = new_core(LedgerMode::Optional);
+    let c = ctx("t1");
+    seed(&core, &c, &[1, 2], "en");
+    // 裸の NULL は列名として解釈され 42703 になる。型付き NULL は定数キーとして受理される。
+    call(
+        "DECLARE c bigint; BEGIN EXECUTE 'SELECT id FROM docs ORDER BY $1' USING p; RETURN 1; END",
+    )
+    .param("p", SqlColumnTypeName::Integer, null_int())
+    .autocommit(&core, &c)
+    .expect("typed null order key");
+}

@@ -482,14 +482,26 @@ D3・D5・D6・D8 の最終判断。実装は `crates/engine/src/core/plpgsql_ho
 
 ### 値の置換（D3・D6）
 
-- 変数・`USING` の値は型付きの値から直接トークンを組み立てる（`subst::scalar_tokens`）。整数は `Number`
-  （負値は `-` + `Number`）、文字列は `StringLiteral`、真偽値は `true`／`false` の `Ident`、有限の浮動小数と
-  numeric は `Number`、日付・時刻・timestamp は `CAST('...' AS 型)`。NaN／Infinity・対応外の型は `0A000`。
-  構築したトークン列が字句解析器の出力と一致することを単体テストで固定した
-- 役割別: `Value`／`WhereHead`／`LiteralSlot` は同一のトークン。`SelectItemBare` は `AS <名前>` を付け、
-  投影が裸の文字列・真偽値を受理しないため `CAST('...' AS text)`／`CAST('true' AS boolean)` で包む。
-  `OrderKey`／`GroupKey` の整数は `CAST(n AS integer)` で包む（序数参照へ化けない）。NULL は値・投影の
-  位置で `CAST(NULL AS 型)`、それ以外は裸の `NULL`（`sql::params` の NULL 束縛と同じ）
+- 変数・`USING` の値は型付きの値から直接トークンを組み立てる（`subst::scalar_tokens`）。文字列は
+  `StringLiteral`、真偽値は `true`／`false` の `Ident`、日付・時刻・timestamp は `CAST('...' AS 型)`。
+  数値（整数・有限の浮動小数・numeric）は宣言型を保つため `CAST(<数値> AS <宣言型>)`（裸の整数は SQL 側が
+  値から型を推定し直し、bigint 変数が int4 の演算になる等の型の取り違えを起こす）。NaN／Infinity・
+  対応外の型は `0A000`。構築したトークン列が字句解析器の出力と一致することを、裸の形（`NumStyle::Bare`）
+  の単体テストで固定した
+- 数値が裸になる 2 箇所（どちらも宣言型が結果へ伝わらない位置）。(1) `LiteralSlot`（`LIMIT`・`IN` リスト・
+  `BETWEEN` 境界・`LIKE`。許可リストが `CAST` を受理しない）は値を保つ裸のリテラル。指数表記の浮動小数・
+  numeric は裸で表せないため `0A000`。(2) 構文解析が定数式（`INSERT .. VALUES` の要素・`DEFAULT` 等）で
+  `CAST` を拒否した場合に限り（`const_expr::is_cast_rejection`）、ホストが同じ文を裸の数値で置換し直す
+  （型は書き込み先の列型・定数畳み込みが決める。拒否は実行前のため副作用は重複しない）。`WHERE` 形の
+  比較の検査（`where_probe`）も値同士の比較なので裸の数値
+- 役割別: `SelectItemBare` は `AS <名前>` を付け、投影が裸の文字列・真偽値を受理しないため
+  `CAST('...' AS text)`／`CAST('true' AS boolean)` で包む。数値の `CAST` 包みは `OrderKey`／`GroupKey` の
+  序数参照への化け防止も兼ねる。NULL は `Value`・`SelectItemBare`・`OrderKey`・`GroupKey` で
+  `CAST(NULL AS 型)`（裸の `NULL` は列名として解釈される）。型語の無い型は `OrderKey`／`GroupKey` で
+  `0A000`。`LiteralSlot`・`WhereHead` は裸の `NULL`（`sql::params` の NULL 束縛と同じ）
+- `EXECUTE` の `$n` の役割は文字列のトークン走査で推定する（`param_role`）。`AND` は節境界とせず、
+  `CASE .. END` の内側を読み飛ばす。リテラル専用位置は `LIMIT`／`OFFSET`／`LIKE`／`BETWEEN`／`IN (..)` の
+  前後関係で判定する。推定を外しても数値は `CAST` 包みのため序数参照・型喪失にはならない
 - 負値が `::` の前、または直前が `-` の位置に来るときは括弧で包む。置換後の総バイト数は
   `MAX_INPUT_LEN` 以下（超過は `54000`。同じ変数の多重参照で値を増幅させない）
 - `EXECUTE ... USING`: 文字列は `MAX_INPUT_LEN` 以下・通常の字句解析（`$n` 許可）→ `$n` の最大番号と
@@ -524,8 +536,8 @@ SQL 構文解析器は列の存在を束縛段（実行時）まで確かめな�
 
 ### レビュー対応の補足
 
-- 小数点を持つ数値（Float・Numeric）は小数点つきのリテラル、持たない形は `CAST('..' AS ..)` で置換し、
-  整数リテラルへ化けて整数除算になるのを防ぐ
+- 小数点を持つ数値（Float・Numeric）は宣言型の `CAST` 包み（指数表記など小数点の無い形は
+  `CAST('..' AS ..)`）で置換し、整数リテラルへ化けて整数除算になるのを防ぐ
 - 置換の累積バイト数は値を複製する前に加算して上限（`MAX_INPUT_LEN`）を検査する
 - 条件の単純比較は、各オペランドを `SELECT` で評価して NULL なら結果を NULL とし、非 NULL なら評価済みの値の
   リテラルに置き換えて比較する。`<式> IS [NOT] NULL` はオペランドの値から直接判定する

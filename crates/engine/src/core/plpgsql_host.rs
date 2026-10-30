@@ -225,6 +225,22 @@ fn is_column_capable(role: VarRole) -> bool {
 }
 
 impl<'a, 'e> CorePlHost<'a, 'e> {
+    /// 数値を宣言型の `CAST` で包んで置換した文を実行し、構文解析が「定数式（`INSERT .. VALUES` の
+    /// 要素・`DEFAULT` 等）では `CAST` を受理しない」と拒否した場合に限り、値を保つ裸の数値で置換し直して
+    /// 実行する。その位置の型は書き込み先の列型・定数畳み込みが決め、宣言型は結果へ伝わらない。拒否は
+    /// 構文解析の段階（実行前）で起きるため、再実行で副作用は重複しない。他のエラーは再試行しない。
+    fn run_with_const_fallback(
+        &mut self,
+        build: impl Fn(subst::NumStyle) -> Result<Vec<Token>, SqlSurfaceError>,
+    ) -> Result<CoreOutcome, SqlSurfaceError> {
+        match self.run_tokens(build(subst::NumStyle::Typed)?) {
+            Err(e) if crate::sql::const_expr::is_cast_rejection(&e) => {
+                self.run_tokens(build(subst::NumStyle::Bare)?)
+            }
+            r => r,
+        }
+    }
+
     /// 許可リスト解析 → 文種・書き込みのゲート → 既存の実行本体、の順で 1 文を実行する。
     fn run_tokens(&mut self, tokens: Vec<Token>) -> Result<CoreOutcome, SqlSurfaceError> {
         let parsed = {
@@ -357,7 +373,11 @@ impl<'a, 'e> CorePlHost<'a, 'e> {
                         if v.is_null() {
                             Ok(None)
                         } else {
-                            Ok(Some(subst::scalar_tokens(&v, VarRole::Value)?))
+                            Ok(Some(subst::scalar_tokens_styled(
+                                &v,
+                                VarRole::Value,
+                                subst::NumStyle::Bare,
+                            )?))
                         }
                     }
                     _ => Err(internal("PL/pgSQL condition returned an unexpected result")),
@@ -510,10 +530,13 @@ impl PlHost for CorePlHost<'_, '_> {
                 None => PlScalar::null(ColumnType::Boolean),
             });
         }
-        let toks = subst::substitute(&expr.tokens, &expr.var_refs, env, true)?;
-        let mut full = vec![Token::Keyword(Keyword::Select)];
-        full.extend(toks);
-        match self.run_tokens(full) {
+        let build = |style| {
+            let toks = subst::substitute(&expr.tokens, &expr.var_refs, env, true, style)?;
+            let mut full = vec![Token::Keyword(Keyword::Select)];
+            full.extend(toks);
+            Ok(full)
+        };
+        match self.run_with_const_fallback(build) {
             Ok(CoreOutcome::Query(qr)) => single_scalar(&qr),
             Ok(_) => Err(internal(
                 "PL/pgSQL expression returned an unexpected result",
@@ -547,7 +570,13 @@ impl PlHost for CorePlHost<'_, '_> {
         }
         let key = (0u8, std::ptr::from_ref(expr) as usize);
         self.check_conflicts(key, &expr.tokens, &expr.var_refs)?;
-        let toks = subst::substitute(&expr.tokens, &expr.var_refs, env, false)?;
+        let toks = subst::substitute(
+            &expr.tokens,
+            &expr.var_refs,
+            env,
+            false,
+            subst::NumStyle::Typed,
+        )?;
         // `<式> IS [NOT] NULL` は `FROM` の無い `SELECT .. WHERE` が構文として受理しないため、式の
         // 値を直接求めて判定する（三値論理に乗らず、常に真偽値）。
         if let Some((operand, negated)) = split_is_null(strip_outer_parens(&toks)) {
@@ -572,7 +601,16 @@ impl PlHost for CorePlHost<'_, '_> {
                 }
             }
         }
-        Ok(Some(self.where_probe(toks)?))
+        // `FROM` の無い `WHERE` の比較は `CAST` を受理しないため、値を保つ裸の数値で置換し直す
+        // （比較は値同士で行われ、宣言型は結果へ伝わらない）。
+        let bare = subst::substitute(
+            &expr.tokens,
+            &expr.var_refs,
+            env,
+            false,
+            subst::NumStyle::Bare,
+        )?;
+        Ok(Some(self.where_probe(bare)?))
     }
 
     fn values_equal(
@@ -586,9 +624,10 @@ impl PlHost for CorePlHost<'_, '_> {
         if let (Cell::Bool(x), Cell::Bool(y)) = (&a.cell, &b.cell) {
             return Ok(Some(x == y));
         }
-        let mut toks = subst::scalar_tokens(a, VarRole::Value)?;
+        let bare = |v| subst::scalar_tokens_styled(v, VarRole::Value, subst::NumStyle::Bare);
+        let mut toks = bare(a)?;
         toks.push(Token::Punct('='));
-        toks.extend(subst::scalar_tokens(b, VarRole::Value)?);
+        toks.extend(bare(b)?);
         Ok(Some(self.where_probe(toks)?))
     }
 
@@ -601,8 +640,9 @@ impl PlHost for CorePlHost<'_, '_> {
     ) -> Result<HostOutcome, SqlSurfaceError> {
         let key = (1u8, std::ptr::from_ref(sql) as usize);
         self.check_conflicts(key, &sql.tokens, &sql.var_refs)?;
-        let toks = subst::substitute(&sql.tokens, &sql.var_refs, env, true)?;
-        let out = self.run_tokens(toks)?;
+        let out = self.run_with_const_fallback(|style| {
+            subst::substitute(&sql.tokens, &sql.var_refs, env, true, style)
+        })?;
         map_outcome(out, demand)
     }
 
@@ -620,8 +660,8 @@ impl PlHost for CorePlHost<'_, '_> {
         }
         let toks = lexer::tokenize_with_params(query)
             .map_err(|_| SqlSurfaceError::unsupported("syntax error in the EXECUTE string"))?;
-        let toks = subst::substitute_params(&toks, using)?;
-        let out = self.run_tokens(toks)?;
+        let out =
+            self.run_with_const_fallback(|style| subst::substitute_params(&toks, using, style))?;
         map_outcome(out, demand)
     }
 

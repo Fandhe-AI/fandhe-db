@@ -5,7 +5,7 @@
 
 use super::ast::{VarId, VarRef, VarRole, VarSite};
 use super::host::{PlScalar, VarLookup};
-use super::subst::{scalar_tokens, substitute, substitute_params};
+use super::subst::{scalar_tokens, scalar_tokens_styled, substitute, substitute_params, NumStyle};
 use crate::catalog::ColumnType;
 use crate::sql::allowlist::SqlSurfaceError;
 use crate::sql::exec::Cell;
@@ -47,7 +47,7 @@ fn site(pos: usize, role: VarRole, id: u32) -> VarSite {
 }
 
 #[test]
-fn value_tokens_equal_the_lexer_output_for_the_same_literal() {
+fn bare_value_tokens_equal_the_lexer_output_for_the_same_literal() {
     let cases: Vec<(PlScalar, &str)> = vec![
         (int(5), "5"),
         (int(0), "0"),
@@ -66,7 +66,7 @@ fn value_tokens_equal_the_lexer_output_for_the_same_literal() {
         (PlScalar::new(Cell::Float(-2.0), ColumnType::Double), "-2.0"),
     ];
     for (v, lit) in cases {
-        let got = scalar_tokens(&v, VarRole::Value).expect("tokens");
+        let got = scalar_tokens_styled(&v, VarRole::Value, NumStyle::Bare).expect("tokens");
         assert_eq!(got, lex(lit), "{lit}");
     }
 }
@@ -112,8 +112,11 @@ fn substitution_replaces_sites_in_place_and_keeps_other_tokens() {
     let tokens = lex("SELECT a FROM t WHERE n = v AND m > w");
     let sites = vec![site(7, VarRole::Value, 0), site(11, VarRole::Value, 1)];
     let env = Env(vec![int(-3), text("x")]);
-    let out = substitute(&tokens, &sites, &env, true).expect("substitute");
-    assert_eq!(out, lex("SELECT a FROM t WHERE n = -3 AND m > 'x'"));
+    let out = substitute(&tokens, &sites, &env, true, NumStyle::Typed).expect("substitute");
+    assert_eq!(
+        out,
+        lex("SELECT a FROM t WHERE n = CAST(-3 AS integer) AND m > 'x'")
+    );
 }
 
 #[test]
@@ -124,11 +127,14 @@ fn bare_select_item_gets_an_alias_and_order_key_is_wrapped() {
         site(6, VarRole::OrderKey, 1),
     ];
     let env = Env(vec![int(7), int(2)]);
-    let out = substitute(&tokens, &sites, &env, true).expect("substitute");
-    assert_eq!(out, lex("SELECT 7 AS v FROM t ORDER BY CAST(2 AS integer)"));
+    let out = substitute(&tokens, &sites, &env, true, NumStyle::Typed).expect("substitute");
+    assert_eq!(
+        out,
+        lex("SELECT CAST(7 AS integer) AS v FROM t ORDER BY CAST(2 AS integer)")
+    );
     // 別名付与を止めると（`WHERE` 形の式）素の値になる。
-    let out = substitute(&tokens, &sites[..1], &env, false).expect("no alias");
-    assert_eq!(out, lex("SELECT 7 FROM t ORDER BY w"));
+    let out = substitute(&tokens, &sites[..1], &env, false, NumStyle::Typed).expect("no alias");
+    assert_eq!(out, lex("SELECT CAST(7 AS integer) FROM t ORDER BY w"));
 }
 
 #[test]
@@ -136,7 +142,7 @@ fn text_select_item_is_cast_so_that_the_projection_accepts_it() {
     let tokens = lex("SELECT v FROM t");
     let sites = vec![site(1, VarRole::SelectItemBare, 0)];
     let env = Env(vec![text("a")]);
-    let out = substitute(&tokens, &sites, &env, true).expect("substitute");
+    let out = substitute(&tokens, &sites, &env, true, NumStyle::Typed).expect("substitute");
     assert_eq!(out, lex("SELECT CAST('a' AS text) AS v FROM t"));
 }
 
@@ -145,8 +151,11 @@ fn negative_values_before_a_type_cast_are_parenthesized() {
     let tokens = lex("SELECT v::int");
     let sites = vec![site(1, VarRole::Value, 0)];
     let env = Env(vec![int(-5)]);
-    let out = substitute(&tokens, &sites, &env, false).expect("substitute");
+    let out = substitute(&tokens, &sites, &env, false, NumStyle::Bare).expect("substitute");
     assert_eq!(out, lex("SELECT (-5)::int"));
+    // 型付きの置換は CAST が負値を包むため、`::` に先に結合しない。
+    let out = substitute(&tokens, &sites, &env, false, NumStyle::Typed).expect("typed");
+    assert_eq!(out, lex("SELECT CAST(-5 AS integer)::int"));
 }
 
 #[test]
@@ -163,30 +172,31 @@ fn substituted_size_is_bounded() {
         sites.push(site(tokens.len(), VarRole::Value, 0));
         tokens.push(Token::Ident("v".to_string()));
     }
-    let e = substitute(&tokens, &sites, &Env(vec![big]), false).expect_err("too big");
+    let e =
+        substitute(&tokens, &sites, &Env(vec![big]), false, NumStyle::Typed).expect_err("too big");
     assert_eq!(e.wire_code(), "54000");
 }
 
 #[test]
 fn params_must_match_using_values_exactly() {
     let tokens = lex("SELECT $1, $2");
-    let ok = substitute_params(&tokens, &[int(1), text("a")]).expect("match");
-    assert_eq!(ok, lex("SELECT 1, CAST('a' AS text)"));
+    let ok = substitute_params(&tokens, &[int(1), text("a")], NumStyle::Typed).expect("match");
+    assert_eq!(ok, lex("SELECT CAST(1 AS integer), CAST('a' AS text)"));
     for using in [vec![int(1)], vec![int(1), int(2), int(3)], vec![]] {
-        let e = substitute_params(&tokens, &using).expect_err("mismatch");
+        let e = substitute_params(&tokens, &using, NumStyle::Typed).expect_err("mismatch");
         assert_eq!(e.wire_code(), "42601");
     }
     // `$n` を含まない文に USING があれば過剰。
-    let e = substitute_params(&lex("SELECT 1"), &[int(1)]).expect_err("excess");
+    let e = substitute_params(&lex("SELECT 1"), &[int(1)], NumStyle::Typed).expect_err("excess");
     assert_eq!(e.wire_code(), "42601");
-    assert!(substitute_params(&lex("SELECT 1"), &[]).is_ok());
+    assert!(substitute_params(&lex("SELECT 1"), &[], NumStyle::Typed).is_ok());
 }
 
 #[test]
 fn param_values_cannot_inject_sql() {
     let tokens = lex("SELECT $1");
     let evil = text("1; DROP TABLE t");
-    let out = substitute_params(&tokens, &[evil]).expect("substitute");
+    let out = substitute_params(&tokens, &[evil], NumStyle::Typed).expect("substitute");
     assert_eq!(
         out,
         vec![
@@ -208,12 +218,26 @@ fn order_and_group_keys_keep_the_integer_type_of_the_variable() {
     for role in [VarRole::OrderKey, VarRole::GroupKey] {
         let tokens = lex("SELECT 1 FROM t ORDER BY w");
         let sites = vec![site(6, role, 0)];
-        let out = substitute(&tokens, &sites, &Env(vec![big.clone()]), false).expect("big");
+        let out = substitute(
+            &tokens,
+            &sites,
+            &Env(vec![big.clone()]),
+            false,
+            NumStyle::Typed,
+        )
+        .expect("big");
         assert_eq!(
             out,
             lex("SELECT 1 FROM t ORDER BY CAST(2147483648 AS bigint)")
         );
-        let out = substitute(&tokens, &sites, &Env(vec![small.clone()]), false).expect("small");
+        let out = substitute(
+            &tokens,
+            &sites,
+            &Env(vec![small.clone()]),
+            false,
+            NumStyle::Typed,
+        )
+        .expect("small");
         assert_eq!(out, lex("SELECT 1 FROM t ORDER BY CAST(3 AS smallint)"));
     }
 }
@@ -221,17 +245,154 @@ fn order_and_group_keys_keep_the_integer_type_of_the_variable() {
 #[test]
 fn dynamic_params_get_role_based_protection() {
     // 投影の裸の文字列・真偽値は CAST で包む（静的 SQL の SelectItemBare と同じ）。
-    let out = substitute_params(&lex("SELECT $1"), &[text("abc")]).expect("proj");
+    let out = substitute_params(&lex("SELECT $1"), &[text("abc")], NumStyle::Typed).expect("proj");
     assert_eq!(out, lex("SELECT CAST('abc' AS text)"));
     let b = PlScalar::new(Cell::Bool(true), ColumnType::Boolean);
-    let out = substitute_params(&lex("SELECT 1, $1 FROM t"), &[b]).expect("bool");
+    let out = substitute_params(&lex("SELECT 1, $1 FROM t"), &[b], NumStyle::Typed).expect("bool");
     assert_eq!(out, lex("SELECT 1, CAST('true' AS boolean) FROM t"));
     // ORDER BY／GROUP BY の整数は序数参照にならない。
-    let out = substitute_params(&lex("SELECT a FROM t ORDER BY $1"), &[int(1)]).expect("order");
+    let out = substitute_params(
+        &lex("SELECT a FROM t ORDER BY $1"),
+        &[int(1)],
+        NumStyle::Typed,
+    )
+    .expect("order");
     assert_eq!(out, lex("SELECT a FROM t ORDER BY CAST(1 AS integer)"));
-    let out = substitute_params(&lex("SELECT a FROM t GROUP BY a, $1"), &[int(2)]).expect("group");
+    let out = substitute_params(
+        &lex("SELECT a FROM t GROUP BY a, $1"),
+        &[int(2)],
+        NumStyle::Typed,
+    )
+    .expect("group");
     assert_eq!(out, lex("SELECT a FROM t GROUP BY a, CAST(2 AS integer)"));
     // WHERE 内の値は従来どおり。
-    let out = substitute_params(&lex("SELECT a FROM t WHERE a = $1"), &[int(1)]).expect("where");
-    assert_eq!(out, lex("SELECT a FROM t WHERE a = 1"));
+    let out = substitute_params(
+        &lex("SELECT a FROM t WHERE a = $1"),
+        &[int(1)],
+        NumStyle::Typed,
+    )
+    .expect("where");
+    assert_eq!(out, lex("SELECT a FROM t WHERE a = CAST(1 AS integer)"));
+}
+
+fn typed(ty: ColumnType, cell: Cell) -> PlScalar {
+    PlScalar::new(cell, ty)
+}
+
+#[test]
+fn numbers_keep_their_declared_type_in_value_positions() {
+    // 宣言型を保つ（裸の整数にすると SQL 側が値から型を推定し直す）。境界値・小数・smallint を固定する。
+    let cases: Vec<(PlScalar, &str)> = vec![
+        (
+            typed(ColumnType::BigInt, Cell::SignedInteger(2_147_483_647)),
+            "CAST(2147483647 AS bigint)",
+        ),
+        (
+            typed(ColumnType::BigInt, Cell::SignedInteger(i64::MIN)),
+            "CAST(-9223372036854775808 AS bigint)",
+        ),
+        (
+            typed(ColumnType::SmallInt, Cell::SignedInteger(7)),
+            "CAST(7 AS smallint)",
+        ),
+        (
+            typed(ColumnType::Double, Cell::Float(1.5)),
+            "CAST(1.5 AS double precision)",
+        ),
+        (
+            typed(ColumnType::Real, Cell::Float(2.0)),
+            "CAST(2.0 AS real)",
+        ),
+        (
+            typed(ColumnType::Double, Cell::Float(1e300)),
+            "CAST('1e300' AS double precision)",
+        ),
+    ];
+    for role in [
+        VarRole::Value,
+        VarRole::SelectItemBare,
+        VarRole::OrderKey,
+        VarRole::GroupKey,
+    ] {
+        for (v, want) in &cases {
+            assert_eq!(scalar_tokens(v, role).expect("typed"), lex(want), "{want}");
+        }
+    }
+}
+
+#[test]
+fn literal_slots_take_a_bare_literal_and_refuse_untyped_forms() {
+    // LIMIT／IN／BETWEEN は CAST を受理せず、値の型が結果へ伝わらないため裸のリテラル。
+    let big = typed(ColumnType::BigInt, Cell::SignedInteger(3_000_000_000));
+    assert_eq!(
+        scalar_tokens(&big, VarRole::LiteralSlot).expect("slot"),
+        lex("3000000000")
+    );
+    let d = typed(ColumnType::Double, Cell::Float(1.5));
+    assert_eq!(
+        scalar_tokens(&d, VarRole::LiteralSlot).expect("slot"),
+        lex("1.5")
+    );
+    // 裸で表せない形（指数表記）は型が黙って変わらないよう拒否する。
+    let e = scalar_tokens(
+        &typed(ColumnType::Double, Cell::Float(1e300)),
+        VarRole::LiteralSlot,
+    )
+    .expect_err("exponent");
+    assert_eq!(e.wire_code(), "0A000");
+}
+
+#[test]
+fn null_order_and_group_keys_are_typed_never_a_column_name() {
+    let n = PlScalar::null(ColumnType::Integer);
+    for role in [VarRole::OrderKey, VarRole::GroupKey] {
+        assert_eq!(
+            scalar_tokens(&n, role).expect("typed null"),
+            lex("CAST(NULL AS integer)")
+        );
+        // 型語の無い型は裸の NULL（列名）へ倒さず拒否する。
+        let e = scalar_tokens(&PlScalar::null(ColumnType::Bytea), role).expect_err("untyped");
+        assert_eq!(e.wire_code(), "0A000");
+    }
+}
+
+#[test]
+fn dynamic_param_roles_survive_and_inside_case_and_literal_slots() {
+    // CASE 内の AND で ORDER BY の役割判定が止まらない（後続キーの NULL が型付きになる）。
+    let n = PlScalar::null(ColumnType::Integer);
+    let sql = "SELECT a FROM t ORDER BY CASE WHEN a > 1 AND a < 5 THEN 1 ELSE 2 END, $1";
+    let out =
+        substitute_params(&lex(sql), std::slice::from_ref(&n), NumStyle::Typed).expect("order");
+    assert_eq!(
+        out,
+        lex("SELECT a FROM t ORDER BY CASE WHEN a > 1 AND a < 5 THEN 1 ELSE 2 END, CAST(NULL AS integer)")
+    );
+    // リテラル専用位置（LIMIT・IN リスト・BETWEEN の上側境界）は裸のリテラル。
+    let v = typed(ColumnType::BigInt, Cell::SignedInteger(3));
+    for (sql, want) in [
+        ("SELECT a FROM t LIMIT $1", "SELECT a FROM t LIMIT 3"),
+        (
+            "SELECT a FROM t WHERE a IN ($1, $1)",
+            "SELECT a FROM t WHERE a IN (3, 3)",
+        ),
+        (
+            "SELECT a FROM t WHERE a BETWEEN $1 AND $1",
+            "SELECT a FROM t WHERE a BETWEEN 3 AND 3",
+        ),
+    ] {
+        let out =
+            substitute_params(&lex(sql), std::slice::from_ref(&v), NumStyle::Typed).expect(sql);
+        assert_eq!(out, lex(want), "{sql}");
+    }
+    // BETWEEN の外側の AND の後ろは値の位置（型付き）。
+    let out = substitute_params(
+        &lex("SELECT a FROM t WHERE a BETWEEN 1 AND 2 AND a < $1"),
+        std::slice::from_ref(&v),
+        NumStyle::Typed,
+    )
+    .expect("and");
+    assert_eq!(
+        out,
+        lex("SELECT a FROM t WHERE a BETWEEN 1 AND 2 AND a < CAST(3 AS bigint)")
+    );
 }

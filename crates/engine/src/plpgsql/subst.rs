@@ -24,6 +24,14 @@ fn unsupported_type() -> SqlSurfaceError {
     )
 }
 
+/// 数値の置換形式。`Typed` は宣言型を保つ `CAST` 包み、`Bare` は裸のリテラル（`CAST` を受理しない
+/// 定数式の位置・`WHERE` 形の比較の検査用。呼び出し側が `Typed` の拒否を確かめたときだけ使う）。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum NumStyle {
+    Typed,
+    Bare,
+}
+
 fn too_big() -> SqlSurfaceError {
     SqlSurfaceError::payload_too_large("substituted PL/pgSQL statement is too large")
 }
@@ -68,10 +76,17 @@ fn null_type_words(ty: &ColumnType) -> Option<&'static [&'static str]> {
     })
 }
 
-/// `NULL` のトークン列。値・投影項目の位置（`Value`・`SelectItemBare`）は型付き（`SELECT NULL` 単独が受理されないため）、
-/// それ以外（リテラル専用位置・`WHERE` の先頭等）は裸の `NULL`（`sql::params` の NULL 束縛と同じ）。
-fn null_tokens(ty: &ColumnType, role: VarRole) -> Vec<Token> {
-    if matches!(role, VarRole::Value | VarRole::SelectItemBare) {
+/// `NULL` のトークン列。列としても読める位置（`Value`・`SelectItemBare`・`OrderKey`・`GroupKey`）は
+/// 型付き（`SELECT NULL` 単独が受理されない・裸の `NULL` は識別子として列名に解釈され `42703`
+/// や `null` 列での並べ替えに化ける）。型語の無い型は `OrderKey`／`GroupKey` では `0A000`
+/// （fail-closed）、`Value`・`SelectItemBare` では裸の `NULL`。リテラル専用位置・`WHERE` の先頭は
+/// 裸の `NULL`（`sql::params` の NULL 束縛と同じ）。
+fn null_tokens(ty: &ColumnType, role: VarRole) -> Result<Vec<Token>, SqlSurfaceError> {
+    let typed = matches!(
+        role,
+        VarRole::Value | VarRole::SelectItemBare | VarRole::OrderKey | VarRole::GroupKey
+    );
+    if typed {
         if let Some(words) = null_type_words(ty) {
             let mut out = vec![
                 Token::Ident("CAST".to_string()),
@@ -81,10 +96,13 @@ fn null_tokens(ty: &ColumnType, role: VarRole) -> Vec<Token> {
             ];
             out.extend(words.iter().map(|w| Token::Ident((*w).to_string())));
             out.push(Token::Punct(')'));
-            return out;
+            return Ok(out);
+        }
+        if matches!(role, VarRole::OrderKey | VarRole::GroupKey) {
+            return Err(unsupported_type());
         }
     }
-    vec![Token::Ident("NULL".to_string())]
+    Ok(vec![Token::Ident("NULL".to_string())])
 }
 
 /// 数値リテラルとして字句解析器が 1 個の `Number` にするテキストか（符号は呼び出し側で剥がす）。
@@ -113,31 +131,98 @@ fn float_type_words(ty: &ColumnType) -> &'static [&'static str] {
     }
 }
 
-/// 値 1 個を、字句解析器が同じ値のリテラルから生成するのと同一のトークン列にする。`role` は NULL の
-/// 表現だけに影響する（整数・文字列・真偽値は役割に依らず同一のトークン）。
-pub(crate) fn scalar_tokens(v: &PlScalar, role: VarRole) -> Result<Vec<Token>, SqlSurfaceError> {
-    Ok(match &v.cell {
-        Cell::Null => null_tokens(&v.ty, role),
-        Cell::SignedInteger(i) => int_tokens(*i < 0, i.unsigned_abs().to_string()),
-        Cell::Integer(u) => int_tokens(false, u.to_string()),
+/// 数値の `CAST` の型語。変数の宣言型を保つ（整数リテラルのまま置換すると SQL 側が値から型を
+/// 推定し直し、`bigint` 変数が `int4` として扱われて範囲エラーになる等、宣言型が失われる）。
+/// 数値型以外の宣言（`PlScalar` が数値セルを別の型で持つ場合）は値の大きさから整数型を選ぶ。
+fn number_type_words(v: &PlScalar) -> &'static [&'static str] {
+    match (&v.ty, &v.cell) {
+        (ColumnType::SmallInt, _) => &["smallint"],
+        (ColumnType::Integer, _) => &["integer"],
+        (ColumnType::BigInt, _) => &["bigint"],
+        (ColumnType::Real, _) => &["real"],
+        (ColumnType::Double, _) => &["double", "precision"],
+        (ColumnType::Numeric { .. }, _) => &["numeric"],
+        (_, Cell::Float(_)) => &["double", "precision"],
+        (_, Cell::Numeric(_)) => &["numeric"],
+        (_, Cell::SignedInteger(i)) if i32::try_from(*i).is_ok() => &["integer"],
+        (_, Cell::Integer(u)) if i32::try_from(*u).is_ok() => &["integer"],
+        _ => &["bigint"],
+    }
+}
+
+/// 数値セルの置換トークン。列としても式としても読める位置は `CAST(<literal> AS <宣言型>)` で
+/// 宣言型を保つ（`OrderKey`／`GroupKey` では裸の整数が序数参照に化けることの防止も兼ねる）。
+/// `CAST` を受理しないリテラル専用位置（`LiteralSlot`。`LIMIT`・`IN` リスト・`BETWEEN` 境界等）は
+/// 比較相手の列型・件数としてしか使われず値の型が結果へ伝わらないため、値を保つ裸のリテラルを返す。
+/// 小数点の無い浮動小数・numeric（指数表記）は裸で表せないので、その位置では `0A000`（型が黙って
+/// 変わる経路を残さない）。
+fn number_tokens(
+    v: &PlScalar,
+    role: VarRole,
+    style: NumStyle,
+) -> Result<Vec<Token>, SqlSurfaceError> {
+    // 第 2 要素は、トークン列が既に型語を含む（`CAST('<text>' AS ..)` 形）か。
+    let (bare, typed) = match &v.cell {
+        Cell::SignedInteger(i) => (int_tokens(*i < 0, i.unsigned_abs().to_string()), false),
+        Cell::Integer(u) => (int_tokens(false, u.to_string()), false),
         Cell::Float(f) => {
             if !f.is_finite() {
                 return Err(unsupported_type());
             }
-            // `Debug` は整数値でも `3.0` と小数点を残す（`Display` の `3` は整数リテラルになり、
-            // `p / 2` が整数除算へ化ける）。小数点の無い形（指数表記）は型を明示して保つ。
+            // `Debug` は整数値でも `3.0` と小数点を残す。小数点の無い形（指数表記）は型を明示する。
             let text = format!("{f:?}");
             match typed_decimal_tokens(&text) {
-                Some(t) => t,
-                None => cast_text_tokens(text, float_type_words(&v.ty)),
+                Some(t) => (t, false),
+                None => (cast_text_tokens(text, float_type_words(&v.ty)), true),
             }
         }
         Cell::Numeric(d) => {
             let text = d.to_string();
             match typed_decimal_tokens(&text) {
-                Some(t) => t,
-                None => cast_text_tokens(text, &["numeric"]),
+                Some(t) => (t, false),
+                None => (cast_text_tokens(text, &["numeric"]), true),
             }
+        }
+        _ => return Err(unsupported_type()),
+    };
+    if role == VarRole::LiteralSlot || style == NumStyle::Bare {
+        return if typed && role == VarRole::LiteralSlot {
+            Err(unsupported_type())
+        } else {
+            Ok(bare)
+        };
+    }
+    if typed {
+        return Ok(bare);
+    }
+    let mut out = vec![Token::Ident("CAST".to_string()), Token::Punct('(')];
+    out.extend(bare);
+    out.push(Token::Ident("AS".to_string()));
+    out.extend(
+        number_type_words(v)
+            .iter()
+            .map(|w| Token::Ident((*w).to_string())),
+    );
+    out.push(Token::Punct(')'));
+    Ok(out)
+}
+
+/// 値 1 個を、型を保った SQL トークン列にする。`role` は NULL・数値の表現に影響する（文字列・
+/// 真偽値は役割に依らず同一のトークン）。
+pub(crate) fn scalar_tokens(v: &PlScalar, role: VarRole) -> Result<Vec<Token>, SqlSurfaceError> {
+    scalar_tokens_styled(v, role, NumStyle::Typed)
+}
+
+/// 数値の形式を指定する [`scalar_tokens`]。
+pub(crate) fn scalar_tokens_styled(
+    v: &PlScalar,
+    role: VarRole,
+    style: NumStyle,
+) -> Result<Vec<Token>, SqlSurfaceError> {
+    Ok(match &v.cell {
+        Cell::Null => null_tokens(&v.ty, role)?,
+        Cell::SignedInteger(_) | Cell::Integer(_) | Cell::Float(_) | Cell::Numeric(_) => {
+            number_tokens(v, role, style)?
         }
         Cell::Bool(b) => vec![Token::Ident(if *b { "true" } else { "false" }.to_string())],
         Cell::Text(s) => vec![Token::StringLiteral(s.clone())],
@@ -150,14 +235,14 @@ pub(crate) fn scalar_tokens(v: &PlScalar, role: VarRole) -> Result<Vec<Token>, S
     })
 }
 
-/// 役割に応じた置換トークン。`OrderKey`／`GroupKey` の整数リテラルは序数参照に化けるため
-/// `CAST(n AS integer)` で包む。`SelectItemBare` の別名付与は呼び出し側（[`substitute`]）が行う。
+/// 役割に応じた置換トークン（数値の `CAST` 包みは [`scalar_tokens`]）。`SelectItemBare` の別名付与は呼び出し側（[`substitute`]）が行う。
 fn role_tokens(
     v: &PlScalar,
     role: VarRole,
     name_for_alias: Option<&str>,
+    style: NumStyle,
 ) -> Result<Vec<Token>, SqlSurfaceError> {
-    let mut out = scalar_tokens(v, role)?;
+    let mut out = scalar_tokens_styled(v, role, style)?;
     // 投影項目の位置は、文字列・真偽値の裸のリテラルを受理しない（`SELECT 'a' AS x`・`SELECT true AS x`
     // は `42601`／`42703`）ため、`CAST` で包んで式にする。
     if role == VarRole::SelectItemBare {
@@ -169,30 +254,11 @@ fn role_tokens(
             _ => {}
         }
     }
-    match role {
-        VarRole::OrderKey | VarRole::GroupKey
-            if matches!(v.cell, Cell::SignedInteger(_) | Cell::Integer(_)) =>
-        {
-            let mut wrapped = vec![Token::Ident("CAST".to_string()), Token::Punct('(')];
-            wrapped.append(&mut out);
-            wrapped.push(Token::Ident("AS".to_string()));
-            // 変数の整数型を保つ（bigint 変数を int4 へ狭めると 2147483648 以上が範囲外になる）。
-            let word = match v.ty {
-                ColumnType::BigInt => "bigint",
-                ColumnType::SmallInt => "smallint",
-                _ => "integer",
-            };
-            wrapped.push(Token::Ident(word.to_string()));
-            wrapped.push(Token::Punct(')'));
-            out = wrapped;
+    if role == VarRole::SelectItemBare {
+        if let Some(name) = name_for_alias {
+            out.push(Token::Ident("AS".to_string()));
+            out.push(Token::Ident(name.to_string()));
         }
-        VarRole::SelectItemBare => {
-            if let Some(name) = name_for_alias {
-                out.push(Token::Ident("AS".to_string()));
-                out.push(Token::Ident(name.to_string()));
-            }
-        }
-        _ => {}
     }
     Ok(out)
 }
@@ -263,6 +329,7 @@ pub(crate) fn substitute(
     sites: &[VarSite],
     env: &dyn VarLookup,
     alias: bool,
+    style: NumStyle,
 ) -> Result<Vec<Token>, SqlSurfaceError> {
     let mut by_pos: Vec<&VarSite> = sites.iter().collect();
     by_pos.sort_by_key(|s| s.pos);
@@ -285,7 +352,7 @@ pub(crate) fn substitute(
         let value: &PlScalar = env.scalar(&site.var)?;
         charge(&mut total, scalar_len_estimate(value))?;
         let name = if alias { alias_name(original) } else { None };
-        let mut produced = role_tokens(value, site.role, name)?;
+        let mut produced = role_tokens(value, site.role, name, style)?;
         parenthesize_if_needed(
             site.pos.checked_sub(1).and_then(|p| tokens.get(p)),
             tokens.get(site.pos.saturating_add(1)),
@@ -300,11 +367,75 @@ pub(crate) fn substitute(
     Ok(out)
 }
 
-/// `EXECUTE` の文字列中の `$n`（`tokens[i]`）の構文上の役割を、同じ括弧深さの直前のトークンから
-/// 推定する。`ORDER BY`／`GROUP BY` の直接のキーは序数参照に化けないよう [`VarRole::OrderKey`]／
-/// [`VarRole::GroupKey`]、別名なしの投影項目は文字列・真偽値を `CAST` で包む [`VarRole::SelectItemBare`]、
-/// それ以外（括弧内を含む判定不能な位置）は [`VarRole::Value`] にする（静的 SQL の `role_tokens` と同じ保護）。
+fn is_word(t: Option<&Token>, w: &str) -> bool {
+    matches!(t, Some(Token::Ident(s)) if s.eq_ignore_ascii_case(w))
+}
+
+/// `$n`（`tokens[i]`）がリテラル専用位置（`CAST` を受理しない位置）かを、同じ括弧深さの前後関係から
+/// 推定する。`LIMIT`／`OFFSET`／`LIKE`／`ILIKE`／`BETWEEN` の直後、`BETWEEN .. AND` の上側境界、`IN (..)`
+/// リストの要素が該当する。判定が確定しない位置は偽（`CAST` で型を保つ側）。
+fn is_literal_slot(tokens: &[Token], i: usize) -> bool {
+    let prev = i.checked_sub(1).and_then(|p| tokens.get(p));
+    if matches!(prev, Some(Token::Keyword(lexer::Keyword::Limit)))
+        || ["OFFSET", "LIKE", "ILIKE", "BETWEEN"]
+            .iter()
+            .any(|w| is_word(prev, w))
+    {
+        return true;
+    }
+    if matches!(prev, Some(Token::Keyword(lexer::Keyword::And))) {
+        // `BETWEEN a AND $n`: 同じ深さで直前の論理演算子・節境界より前に `BETWEEN` があるか。
+        let mut depth = 0usize;
+        for j in (0..i.saturating_sub(1)).rev() {
+            match tokens.get(j) {
+                Some(Token::Punct(')')) => depth = depth.saturating_add(1),
+                Some(Token::Punct('(')) => {
+                    if depth == 0 {
+                        return false;
+                    }
+                    depth -= 1;
+                }
+                _ if depth > 0 => {}
+                t if is_word(t, "BETWEEN") => return true,
+                t if is_word(t, "OR") => return false,
+                Some(Token::Keyword(_)) => return false,
+                _ => {}
+            }
+        }
+        return false;
+    }
+    if matches!(prev, Some(Token::Punct('(' | ','))) {
+        // `IN (.., $n, ..)`: 同じ深さの `(` まで遡り、その直前が `IN` か。
+        let mut depth = 0usize;
+        for j in (0..i).rev() {
+            match tokens.get(j) {
+                Some(Token::Punct(')')) => depth = depth.saturating_add(1),
+                Some(Token::Punct('(')) => {
+                    if depth == 0 {
+                        return is_word(j.checked_sub(1).and_then(|p| tokens.get(p)), "IN");
+                    }
+                    depth -= 1;
+                }
+                _ => {}
+            }
+        }
+    }
+    false
+}
+
+/// `EXECUTE` の文字列中の `$n`（`tokens[i]`）の構文上の役割を、同じ括弧深さの前後のトークンから
+/// 推定する。リテラル専用位置は [`VarRole::LiteralSlot`]、`ORDER BY`／`GROUP BY` の直接のキーは
+/// [`VarRole::OrderKey`]／[`VarRole::GroupKey`]、別名なしの投影項目は [`VarRole::SelectItemBare`]、
+/// それ以外（括弧内を含む判定不能な位置）は [`VarRole::Value`]（静的 SQL の `role_tokens` と同じ保護）。
+///
+/// 後方走査では `AND`（`CASE WHEN .. AND ..` や `BETWEEN .. AND ..` の内側にも現れ、節境界ではない）で
+/// 止めず、`CASE .. END` の内側も読み飛ばす。節境界は `FROM`／`WHERE`／`LIMIT` のみ。
+/// 数値は全役割（リテラル専用位置を除く）で `CAST` 包みのため、推定を外しても序数参照・宣言型喪失には
+/// ならず、`NULL` の型付けと投影項目の別名付与の要否だけに影響する。
 fn param_role(tokens: &[Token], i: usize) -> VarRole {
+    if is_literal_slot(tokens, i) {
+        return VarRole::LiteralSlot;
+    }
     let direct = matches!(
         i.checked_sub(1).and_then(|p| tokens.get(p)),
         Some(Token::Keyword(lexer::Keyword::Select | lexer::Keyword::By) | Token::Punct(','))
@@ -312,9 +443,11 @@ fn param_role(tokens: &[Token], i: usize) -> VarRole {
     if !direct {
         return VarRole::Value;
     }
+    // 括弧と `CASE .. END` の入れ子の深さ（後方走査なので `)`／`END` で増え `(`／`CASE` で減る）。
     let mut depth = 0usize;
     for j in (0..i).rev() {
-        match tokens.get(j) {
+        let t = tokens.get(j);
+        match t {
             Some(Token::Punct(')')) => depth = depth.saturating_add(1),
             Some(Token::Punct('(')) => {
                 if depth == 0 {
@@ -322,6 +455,8 @@ fn param_role(tokens: &[Token], i: usize) -> VarRole {
                 }
                 depth -= 1;
             }
+            _ if is_word(t, "END") => depth = depth.saturating_add(1),
+            _ if is_word(t, "CASE") => depth = depth.saturating_sub(1),
             _ if depth > 0 => {}
             Some(Token::Keyword(lexer::Keyword::By)) => {
                 return match j.checked_sub(1).and_then(|p| tokens.get(p)) {
@@ -332,10 +467,7 @@ fn param_role(tokens: &[Token], i: usize) -> VarRole {
             }
             Some(Token::Keyword(lexer::Keyword::Select)) => return VarRole::SelectItemBare,
             Some(Token::Keyword(
-                lexer::Keyword::From
-                | lexer::Keyword::Where
-                | lexer::Keyword::Limit
-                | lexer::Keyword::And,
+                lexer::Keyword::From | lexer::Keyword::Where | lexer::Keyword::Limit,
             )) => return VarRole::Value,
             _ => {}
         }
@@ -348,6 +480,7 @@ fn param_role(tokens: &[Token], i: usize) -> VarRole {
 pub(crate) fn substitute_params(
     tokens: &[Token],
     using: &[PlScalar],
+    style: NumStyle,
 ) -> Result<Vec<Token>, SqlSurfaceError> {
     let max = tokens
         .iter()
@@ -377,7 +510,7 @@ pub(crate) fn substitute_params(
                 })?;
                 charge(&mut total, scalar_len_estimate(v))?;
                 let role = param_role(tokens, i);
-                let mut produced = role_tokens(v, role, None)?;
+                let mut produced = role_tokens(v, role, None, style)?;
                 parenthesize_if_needed(
                     i.checked_sub(1).and_then(|p| tokens.get(p)),
                     tokens.get(i.saturating_add(1)),
