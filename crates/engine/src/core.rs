@@ -14541,10 +14541,14 @@ impl EngineCore {
     /// 対象表に BEFORE の UPDATE 行トリガ（NEW を書き換え得る）があるときだけで、AFTER のみのトリガ・
     /// トリガ無しは従来どおり束縛時に `23502` を返す（`23502` と `UPDATE 0` の差で行の存在・可視性を
     /// 漏らさない。Issue #1725）。`table` は束縛に渡すスキーマの表名（表ごとに限定するため）。
+    /// `UPDATE OF` 付きトリガは SET 列（`DEFAULT` 指定列を含む）と交差するときだけ「発火する」と数える
+    /// （発火しない文で延期すると、行の有無で `UPDATE 0` と `23502` が分かれる。`trigger::plan` の
+    /// `filter_update_of` と同じ規則）。
     fn defer_not_null_scope_for_update(
         &self,
         ctx: &PolicyContext,
         table: &str,
+        set_columns: &[&str],
     ) -> Option<crate::sql::set_expr::DeferNotNullBindScope> {
         // 読み取りの失敗・トリガ無しは従来どおり束縛時に検査する（fail-closed。トリガ有無の誤判定でも
         // 最終検査が `validate_set_assignments` に残る）。
@@ -14555,6 +14559,10 @@ impl EngineCore {
                 t.timing == crate::catalog::trigger::TriggerTiming::Before
                     && t.events
                         .contains(crate::catalog::trigger::TriggerEvents::UPDATE)
+                    && (t.update_of.is_empty()
+                        || t.update_of
+                            .iter()
+                            .any(|c| set_columns.contains(&c.as_str())))
             })
             .then(|| crate::sql::set_expr::DeferNotNullBindScope::enter(table))
     }
@@ -14747,7 +14755,8 @@ impl EngineCore {
                 })?,
         };
         let bound = {
-            let _defer = self.defer_not_null_scope_for_update(ctx, &schema.name);
+            let set_columns: Vec<&str> = stmt.assignments.iter().map(|(n, _)| n.as_str()).collect();
+            let _defer = self.defer_not_null_scope_for_update(ctx, &schema.name, &set_columns);
             crate::sql::parser::bind_update(stmt, &schema)?
         };
         crate::sql::exec::execute_update_with_schema_in(
@@ -14817,7 +14826,15 @@ impl EngineCore {
             // 渡さない。抽出前と挙動を完全に同一に保つ）。
             let bound = {
                 // BEFORE の UPDATE トリガがあれば、束縛時の NOT NULL 検査を最終 NEW まで後回しにする。
-                let _defer = self.defer_not_null_scope_for_update(ctx, &schema.name);
+                let set_columns: Vec<&str> = match stmt {
+                    ValidatedUpdateForm::Single(s) => {
+                        s.assignments.iter().map(|(n, _)| n.as_str()).collect()
+                    }
+                    ValidatedUpdateForm::Predicate(p) => {
+                        p.assignments().iter().map(|(n, _)| n.as_str()).collect()
+                    }
+                };
+                let _defer = self.defer_not_null_scope_for_update(ctx, &schema.name, &set_columns);
                 crate::sql::parser::bind_update_form(stmt, &schema, session.udfs())?
             };
             let crate::sql::parser::BoundUpdateForm::Single(bound) = bound else {
@@ -15041,8 +15058,14 @@ impl EngineCore {
         }
         let (predicate, content_hash_value, legacy_hash) = {
             // トリガ結線経路（SQL）だけ、BEFORE の UPDATE トリガがあれば束縛時の NOT NULL 検査を後回しにする。
-            let _defer =
-                triggers.and_then(|_| self.defer_not_null_scope_for_update(ctx, &schema.name));
+            let set_columns: Vec<&str> = bind_stmt
+                .assignments()
+                .iter()
+                .map(|(n, _)| n.as_str())
+                .collect();
+            let _defer = triggers.and_then(|_| {
+                self.defer_not_null_scope_for_update(ctx, &schema.name, &set_columns)
+            });
             Self::prepare_predicate_update(bind_stmt, hash_stmt, schema, udfs)?
         };
         let legacy_hashes: &[crate::recovery::content_hash::ContentHash] = legacy_hash.as_slice();

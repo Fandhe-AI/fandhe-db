@@ -236,6 +236,34 @@ fn before_update_can_repair_explicit_null_and_default() {
     );
 }
 
+// `UPDATE OF a` の BEFORE トリガは SET 列（`DEFAULT` 指定を含む）が `a` と交差しない文では発火しない。
+// その文で NOT NULL 検査を延期すると行の有無で `UPDATE 0` と `23502` が分かれるため、従来どおり
+// 束縛時に `23502` を返す（行の有無に依存しない）。交差する文では延期される。
+#[test]
+fn update_of_non_intersecting_set_keeps_bind_time_not_null_error() {
+    let dir = tempdir();
+    let (core, _calls) = seeded(dir.path(), passthrough());
+    let a = ctx("tenant-a");
+    add_trigger(
+        &core.storage,
+        "tenant-a",
+        "trg",
+        &dml_trigger("b", TriggerTiming::Before, UPD, &["a"]),
+    );
+    for sql in [
+        "UPDATE trg SET n = NULL WHERE id = 999",
+        "UPDATE trg SET n = NULL WHERE id = 1",
+        "UPDATE trg SET n = DEFAULT WHERE id = 999",
+        "UPDATE trg SET n = DEFAULT WHERE id = 1",
+        "UPDATE trg SET n = NULL WHERE n > 1000",
+    ] {
+        assert_eq!(code(&core, &a, sql), "23502", "{sql}");
+    }
+    // 交差する文では最終 NEW まで延期されるため、対象行がなければ `UPDATE 0`。
+    let out = run(&core, &a, "UPDATE trg SET a = 'q', n = NULL WHERE id = 999").expect("deferred");
+    assert_eq!(affected(out), 0);
+}
+
 // 自己参照 FK（CASCADE）を持つ表の UPDATE・DELETE トリガは、参照アクションで同表の別行が書き換わり
 // 発火できないため、黙って飛ばさず 0A000（D8）。トリガは 1 度も呼ばれない。
 #[test]
