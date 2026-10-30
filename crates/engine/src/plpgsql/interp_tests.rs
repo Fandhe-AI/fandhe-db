@@ -198,7 +198,9 @@ impl PlHost for ScriptedHost {
     fn resolve_type(&mut self, ty: &DeclType) -> Result<ResolvedType, SqlSurfaceError> {
         Ok(match ty {
             DeclType::Record => ResolvedType::Record(None),
-            DeclType::PercentRowType { .. } => ResolvedType::Record(Some(Vec::new())),
+            DeclType::PercentRowType { .. } => {
+                ResolvedType::Record(Some(vec![("f".to_string(), ColumnType::Integer)]))
+            }
             _ => ResolvedType::Scalar(ColumnType::Integer),
         })
     }
@@ -370,6 +372,22 @@ fn not_null_variable_rejects_null_on_init_and_assignment() {
 fn unassigned_record_field_reference_is_55000() {
     let src = "DECLARE r RECORD; BEGIN RETURN r.f; END";
     assert_eq!(err_code(call(src, vec![int(0)])), "55000");
+}
+
+#[test]
+fn rowtype_variable_has_typed_null_fields_from_declaration() {
+    let read = "DECLARE w t%ROWTYPE; BEGIN RETURN w.f; END";
+    assert_eq!(value(call(read, vec![int(0)])), Cell::Null);
+    let write = "DECLARE w t%ROWTYPE; BEGIN w.f := 7; RETURN w.f; END";
+    assert_eq!(ival(call(write, vec![int(0)])), 7);
+    let bad = "DECLARE w t%ROWTYPE; BEGIN w.f := 'abc'; RETURN w.f; END";
+    assert_eq!(err_code(call(bad, vec![int(0)])), "22P02");
+}
+
+#[test]
+fn record_variable_default_is_rejected_explicitly() {
+    let src = "DECLARE r RECORD := 1; BEGIN RETURN 0; END";
+    assert_eq!(err_code(call(src, vec![int(0)])), "0A000");
 }
 
 #[test]

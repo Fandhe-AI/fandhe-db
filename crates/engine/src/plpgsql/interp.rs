@@ -144,7 +144,9 @@ enum LoopCtl {
 enum SlotTy {
     Unset,
     Scalar(ColumnType),
-    Record,
+    /// `None` は動的な `RECORD`（代入時に形が決まる）、`Some` は `%ROWTYPE` の固定行型
+    /// （宣言時のフィールド名と型を保ち、代入時にも宣言型を適用する）。
+    Record(Option<Vec<(String, ColumnType)>>),
 }
 
 #[derive(Debug, Clone, PartialEq)]
@@ -309,6 +311,7 @@ fn scalar_bytes(v: &PlScalar) -> usize {
         Cell::Text(s) | Cell::Json(s) => s.len(),
         Cell::Bytes(b) => b.len(),
         Cell::Vector(x) => x.len().saturating_mul(4),
+        Cell::Array(a) => a.approx_heap_bytes().saturating_add(a.dims_header_len()),
         _ => 0,
     };
     payload.saturating_add(32)
@@ -340,7 +343,7 @@ impl<'a> Interp<'a> {
                     self.set_slot(id, SlotTy::Scalar(ColumnType::Integer), None, false)?;
                 }
                 VarKind::LoopRecord => {
-                    self.set_slot(id, SlotTy::Record, None, false)?;
+                    self.set_slot(id, SlotTy::Record(None), None, false)?;
                 }
                 VarKind::Local => {}
             }
@@ -360,7 +363,7 @@ impl<'a> Interp<'a> {
             }
             other => Ok(match self.host.resolve_type(other)? {
                 ResolvedType::Scalar(t) => SlotTy::Scalar(t),
-                ResolvedType::Record(_) => SlotTy::Record,
+                ResolvedType::Record(fields) => SlotTy::Record(fields),
             }),
         }
     }
@@ -381,7 +384,25 @@ impl<'a> Interp<'a> {
                 };
                 SlotVal::Scalar(v)
             }
-            SlotTy::Record => SlotVal::Record(PlRecord::default()),
+            SlotTy::Record(layout) => {
+                // PostgreSQL と同じく、行／レコード変数の既定値は受け付けない（黙って捨てない）。
+                if init.is_some() {
+                    return Err(unsupported(
+                        "default value for a record variable is not supported",
+                    ));
+                }
+                match layout {
+                    // 固定行型は宣言済みの型付き NULL フィールドで初期化する。
+                    Some(cols) => SlotVal::Record(PlRecord {
+                        fields: Some(
+                            cols.iter()
+                                .map(|(n, t)| (n.clone(), PlScalar::null(t.clone())))
+                                .collect(),
+                        ),
+                    }),
+                    None => SlotVal::Record(PlRecord::default()),
+                }
+            }
             SlotTy::Unset => SlotVal::Unset,
         };
         *self.env.slot_mut(id)? = Slot { ty, val, not_null };
@@ -458,15 +479,30 @@ impl<'a> Interp<'a> {
         row: Option<&Vec<Cell>>,
     ) -> Result<(), SqlSurfaceError> {
         if let [AssignTarget::Var(id)] = targets {
-            if matches!(self.env.slot(*id)?.ty, SlotTy::Record) {
-                let fields = columns
-                    .iter()
-                    .enumerate()
-                    .map(|(i, (name, ty))| {
-                        let cell = row.and_then(|r| r.get(i)).cloned().unwrap_or(Cell::Null);
-                        (name.clone(), PlScalar::new(cell, ty.clone()))
-                    })
-                    .collect();
+            if let SlotTy::Record(layout) = &self.env.slot(*id)?.ty {
+                let layout = layout.clone();
+                let mut fields = Vec::with_capacity(columns.len());
+                for (i, (name, ty)) in columns.iter().enumerate() {
+                    let cell = row.and_then(|r| r.get(i)).cloned().unwrap_or(Cell::Null);
+                    let v = PlScalar::new(cell, ty.clone());
+                    match &layout {
+                        // 固定行型は位置対応で宣言型へ代入変換し、宣言のフィールド名を保つ。
+                        Some(cols) => {
+                            let (dn, dt) = cols.get(i).ok_or_else(|| {
+                                SqlSurfaceError::datatype_mismatch(
+                                    "number of returned columns does not match the row type",
+                                )
+                            })?;
+                            fields.push((dn.clone(), assign_cast(v, dt)?));
+                        }
+                        None => fields.push((name.clone(), v)),
+                    }
+                }
+                if layout.as_ref().is_some_and(|c| c.len() != columns.len()) {
+                    return Err(SqlSurfaceError::datatype_mismatch(
+                        "number of returned columns does not match the row type",
+                    ));
+                }
                 self.env.slot_mut(*id)?.val = SlotVal::Record(PlRecord {
                     fields: Some(fields),
                 });

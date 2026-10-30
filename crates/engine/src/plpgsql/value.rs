@@ -101,13 +101,55 @@ fn sanitize(e: &SqlSurfaceError) -> SqlSurfaceError {
     match e.wire_code() {
         "22P02" => SqlSurfaceError::invalid_text_representation("invalid input syntax for type"),
         "22003" => SqlSurfaceError::numeric_out_of_range("value out of range for type"),
-        "22001" => SqlSurfaceError::invalid_input("value too long for type"),
+        "22001" => SqlSurfaceError::string_data_right_truncation("value too long for type"),
         "0A000" => unsupported(),
         _ => SqlSurfaceError::invalid_input("invalid value in PL/pgSQL assignment"),
     }
 }
 
+/// f64 で桁を失わずに表せる整数の絶対値上限（2^53）。
+const F64_EXACT_INT_MAX: u64 = 1 << 53;
+
+/// 整数セルの元の値（`f64` へ落とす前の `i128`）。整数以外は `None`。
+fn exact_int(cell: &Cell, from: CastSrc) -> Option<i128> {
+    match (cell, from) {
+        (Cell::SignedInteger(i), CastSrc::Int2 | CastSrc::Int4 | CastSrc::Int8) => {
+            Some(i128::from(*i))
+        }
+        (Cell::Integer(u), CastSrc::Int8) => Some(i128::from(*u)),
+        _ => None,
+    }
+}
+
 fn convert(cell: &Cell, from: CastSrc, to: CastDst) -> Result<Cell, SqlSurfaceError> {
+    // 整数は `f64` 経由で丸まる前に元の値で検査する。2^53 を超える値は、文字列化は
+    // 元の整数から直接行い、浮動小数点型への変換は丸めを許し、それ以外は 22003 で拒否する。
+    if let Some(i) = exact_int(cell, from) {
+        if i.unsigned_abs() > u128::from(F64_EXACT_INT_MAX) {
+            return match to {
+                CastDst::Text | CastDst::Varchar(_) | CastDst::Bpchar(_) => {
+                    let v = ExprValue::Text(Cow::Owned(i.to_string()));
+                    let out = apply_cast(
+                        CastFn {
+                            from: CastSrc::Text,
+                            to,
+                        },
+                        v,
+                    )
+                    .map_err(|e| sanitize(&e))?;
+                    from_expr(out, to)
+                }
+                CastDst::Float4 | CastDst::Float8 => {
+                    let v = ExprValue::Scalar(i as f64);
+                    let out = apply_cast(CastFn { from, to }, v).map_err(|e| sanitize(&e))?;
+                    from_expr(out, to)
+                }
+                _ => Err(SqlSurfaceError::numeric_out_of_range(
+                    "value out of range for type",
+                )),
+            };
+        }
+    }
     let v = to_expr(cell, from)?;
     let out = apply_cast(CastFn { from, to }, v).map_err(|e| sanitize(&e))?;
     from_expr(out, to)
@@ -191,6 +233,24 @@ mod tests {
             code(assign_cast(text("99999999999"), &ColumnType::Integer)),
             "22003"
         );
+    }
+
+    #[test]
+    fn large_bigint_to_text_is_exact() {
+        let b = PlScalar::new(
+            Cell::SignedInteger(9_007_199_254_740_993),
+            ColumnType::BigInt,
+        );
+        assert_eq!(
+            assign_cast(b, &ColumnType::Text).unwrap().cell,
+            Cell::Text("9007199254740993".to_string())
+        );
+    }
+
+    #[test]
+    fn sanitize_keeps_string_truncation_sqlstate() {
+        let e = SqlSurfaceError::string_data_right_truncation("x");
+        assert_eq!(sanitize(&e).wire_code(), "22001");
     }
 
     #[test]
