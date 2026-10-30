@@ -179,6 +179,27 @@ fn direct_var(expr: &SqlExpr, env: &dyn VarLookup) -> Result<Option<PlScalar>, S
     }
 }
 
+/// 式が `NULL`／`true`／`false` の裸のリテラル 1 個だけなら、その値を返す（FROM の無い `SELECT` は
+/// これらを列名として扱い `42703` になるため、SQL を経由しない）。`NULL` の型は `Text`（代入先の
+/// 宣言型への当てはめはインタプリタが行う）。
+fn bare_literal(expr: &SqlExpr) -> Option<PlScalar> {
+    if !expr.var_refs.is_empty() {
+        return None;
+    }
+    let [Token::Ident(w)] = expr.tokens.as_slice() else {
+        return None;
+    };
+    if w.eq_ignore_ascii_case("null") {
+        Some(PlScalar::null(ColumnType::Text))
+    } else if w.eq_ignore_ascii_case("true") {
+        Some(PlScalar::new(Cell::Bool(true), ColumnType::Boolean))
+    } else if w.eq_ignore_ascii_case("false") {
+        Some(PlScalar::new(Cell::Bool(false), ColumnType::Boolean))
+    } else {
+        None
+    }
+}
+
 /// `PlHost` の core 実装。1 回の起動の間だけ生きる（`'e` は `EngineCore` と Tx の寿命）。
 struct CorePlHost<'a, 'e> {
     core: &'e EngineCore,
@@ -282,7 +303,7 @@ impl<'a, 'e> CorePlHost<'a, 'e> {
                 continue;
             };
             let clash = names.iter().any(|n| {
-                n.eq_ignore_ascii_case("id")
+                (n.eq_ignore_ascii_case("id") && schema.has_pseudo_id())
                     || schema
                         .columns
                         .iter()
@@ -316,6 +337,40 @@ impl<'a, 'e> CorePlHost<'a, 'e> {
         }
     }
 
+    /// オペランド（置換済みのトークン列）の値を、同じ値を表すリテラルのトークン列にする。NULL は `None`。
+    /// 単独のリテラルは SQL を経由せずそのまま返し、それ以外は `SELECT <式>` を同じ Tx・RLS で実行して
+    /// 1 セルを取る。
+    fn operand_value(&mut self, operand: &[Token]) -> Result<Option<Vec<Token>>, SqlSurfaceError> {
+        match operand {
+            [] => Err(unsupported(
+                "this condition form is not supported in PL/pgSQL",
+            )),
+            [t] if is_word(t, "NULL") => Ok(None),
+            [Token::Number(_) | Token::StringLiteral(_)] => Ok(Some(operand.to_vec())),
+            [t] if is_word(t, "true") || is_word(t, "false") => Ok(Some(operand.to_vec())),
+            _ => {
+                let mut full = vec![Token::Keyword(Keyword::Select)];
+                full.extend_from_slice(operand);
+                match self.run_tokens(full)? {
+                    CoreOutcome::Query(qr) => {
+                        let v = single_scalar(&qr)?;
+                        if v.is_null() {
+                            Ok(None)
+                        } else {
+                            Ok(Some(subst::scalar_tokens(&v, VarRole::Value)?))
+                        }
+                    }
+                    _ => Err(internal("PL/pgSQL condition returned an unexpected result")),
+                }
+            }
+        }
+    }
+
+    /// オペランドの値が NULL か（[`Self::operand_value`] の NULL 判定）。
+    fn operand_is_null(&mut self, operand: &[Token]) -> Result<bool, SqlSurfaceError> {
+        Ok(self.operand_value(operand)?.is_none())
+    }
+
     fn typed_relation_schema(&self, parts: &[String]) -> Result<TableSchema, SqlSurfaceError> {
         // 表が無い場合も他テナントの SCHEMA の表の場合も、区別のない同じ応答にする。
         let not_found = || SqlSurfaceError::undefined_table("relation");
@@ -346,58 +401,91 @@ impl<'a, 'e> CorePlHost<'a, 'e> {
     }
 }
 
-/// 条件トークン列が、比較演算子の直接のオペランドに `NULL`（裸の `NULL` または置換後の型付き
-/// `CAST(NULL AS ..)`）を持つ単純比較（`a = NULL` 等）なら true。SQL の三値論理では結果が NULL に
-/// なるため、`where_probe` の「行の有無」（NULL は偽）に潰さず `None` で返すために使う。
-/// `COALESCE(a, 5) = 5`・`3 IN (a, 3)` のように NULL を吸収する式の内側にある `NULL` は直接のオペランド
-/// ではないので対象外（SQL 側へ渡す）。`IS [NOT] NULL`・`AND`／`OR`／`NOT` を含む形も対象外。
-fn comparison_with_null(toks: &[Token]) -> bool {
-    let word = |t: &Token, w: &str| matches!(t, Token::Ident(s) if s.eq_ignore_ascii_case(w));
-    if toks.iter().any(|t| {
-        matches!(t, Token::Keyword(Keyword::And))
-            || word(t, "IS")
-            || word(t, "OR")
-            || word(t, "NOT")
-    }) {
-        return false;
-    }
-    // `CAST ( NULL AS .. )` の開始位置 `start`（`CAST` の添字）から対応する `)` の直後までの長さ。
-    let typed_null_len = |start: usize| -> Option<usize> {
-        if !(toks.get(start).is_some_and(|t| word(t, "CAST"))
-            && matches!(toks.get(start + 1), Some(Token::Punct('(')))
-            && toks.get(start + 2).is_some_and(|t| word(t, "NULL")))
-        {
-            return None;
-        }
+/// 全体を囲む対応した外側の括弧を（入れ子の分まで）外した部分列。
+fn strip_outer_parens(mut toks: &[Token]) -> &[Token] {
+    loop {
+        let (Some(Token::Punct('(')), Some(Token::Punct(')'))) = (toks.first(), toks.last()) else {
+            return toks;
+        };
         let mut depth = 0usize;
-        for (k, t) in toks.iter().enumerate().skip(start + 1) {
+        for (i, t) in toks.iter().enumerate() {
             match t {
                 Token::Punct('(') => depth += 1,
                 Token::Punct(')') => {
                     depth -= 1;
-                    if depth == 0 {
-                        return Some(k + 1 - start);
+                    // 先頭の括弧が末尾より前で閉じるなら、全体を囲む括弧ではない（`(a) = (b)`）。
+                    if depth == 0 && i + 1 != toks.len() {
+                        return toks;
                     }
                 }
                 _ => {}
             }
         }
-        None
-    };
-    let is_cmp = |t: &Token| matches!(t, Token::Punct('=' | '<' | '>') | Token::Le | Token::Ge);
-    toks.iter().enumerate().any(|(i, t)| {
-        if !is_cmp(t) {
-            return false;
+        match toks.get(1..toks.len() - 1) {
+            Some(inner) => toks = inner,
+            None => return toks,
         }
-        let right = i + 1;
-        let right_null =
-            toks.get(right).is_some_and(|t| word(t, "NULL")) || typed_null_len(right).is_some();
-        let left_null = i > 0
-            && (word(&toks[i - 1], "NULL")
-                || (matches!(toks[i - 1], Token::Punct(')'))
-                    && (0..i).any(|st| typed_null_len(st) == Some(i - st))));
-        right_null || left_null
+    }
+}
+
+/// 語（`IS`・`NOT` 等）の一致（大文字小文字を区別しない）。
+fn is_word(t: &Token, w: &str) -> bool {
+    matches!(t, Token::Ident(s) if s.eq_ignore_ascii_case(w))
+}
+
+/// 論理結合・述語など、オペランド単位の NULL 判定では扱わない語を含むか。
+fn has_compound_word(toks: &[Token]) -> bool {
+    toks.iter().any(|t| {
+        matches!(t, Token::Keyword(Keyword::And))
+            || ["OR", "NOT", "IS", "BETWEEN", "IN", "LIKE", "ILIKE", "CASE"]
+                .iter()
+                .any(|w| is_word(t, w))
     })
+}
+
+/// 深さ 0 の比較演算子の連なり（`=`・`<`・`>`・`<=`・`>=`・`<>`）が 1 個だけなら、その前後のオペランド。
+fn split_single_comparison(toks: &[Token]) -> Option<(&[Token], &[Token], &[Token])> {
+    let is_cmp = |t: &Token| matches!(t, Token::Punct('=' | '<' | '>') | Token::Le | Token::Ge);
+    let mut depth = 0usize;
+    let mut runs: Vec<(usize, usize)> = Vec::new();
+    for (i, t) in toks.iter().enumerate() {
+        match t {
+            Token::Punct('(') => depth = depth.saturating_add(1),
+            Token::Punct(')') => depth = depth.checked_sub(1)?,
+            t if depth == 0 && is_cmp(t) => match runs.last_mut() {
+                Some(last) if last.1.checked_add(1) == Some(i) => last.1 = i,
+                _ => runs.push((i, i)),
+            },
+            _ => {}
+        }
+    }
+    let [(start, end)] = runs.as_slice() else {
+        return None;
+    };
+    Some((
+        toks.get(..*start)?,
+        toks.get(*start..=*end)?,
+        toks.get(end.checked_add(1)?..)?,
+    ))
+}
+
+/// 末尾が `IS [NOT] NULL` で、その前が単一のオペランド（論理結合なし）なら、(オペランド, 否定か)。
+fn split_is_null(toks: &[Token]) -> Option<(&[Token], bool)> {
+    let (last, rest) = toks.split_last()?;
+    if !is_word(last, "NULL") {
+        return None;
+    }
+    let (rest, negated) = match rest.split_last() {
+        Some((t, r)) if is_word(t, "NOT") => (r, true),
+        _ => (rest, false),
+    };
+    let (is, operand) = rest.split_last()?;
+    if !is_word(is, "IS") || operand.is_empty() || has_compound_word(operand) {
+        return None;
+    }
+    split_single_comparison(operand)
+        .is_none()
+        .then_some((operand, negated))
 }
 
 impl PlHost for CorePlHost<'_, '_> {
@@ -408,6 +496,9 @@ impl PlHost for CorePlHost<'_, '_> {
         _budget: &mut ExecBudget,
     ) -> Result<PlScalar, SqlSurfaceError> {
         if let Some(v) = direct_var(expr, env)? {
+            return Ok(v);
+        }
+        if let Some(v) = bare_literal(expr) {
             return Ok(v);
         }
         let key = (0u8, std::ptr::from_ref(expr) as usize);
@@ -457,8 +548,29 @@ impl PlHost for CorePlHost<'_, '_> {
         let key = (0u8, std::ptr::from_ref(expr) as usize);
         self.check_conflicts(key, &expr.tokens, &expr.var_refs)?;
         let toks = subst::substitute(&expr.tokens, &expr.var_refs, env, false)?;
-        if comparison_with_null(&toks) {
-            return Ok(None);
+        // `<式> IS [NOT] NULL` は `FROM` の無い `SELECT .. WHERE` が構文として受理しないため、式の
+        // 値を直接求めて判定する（三値論理に乗らず、常に真偽値）。
+        if let Some((operand, negated)) = split_is_null(&toks) {
+            let is_null = self.operand_is_null(operand)?;
+            return Ok(Some(is_null != negated));
+        }
+        // 単純比較は、いずれかのオペランドが NULL なら結果は NULL（`where_probe` の「行なし」＝偽に
+        // 潰さない）。`a + 1 = 3` のような演算・括弧を含むオペランドも、値を求めて判定する。
+        let inner = strip_outer_parens(&toks);
+        if !has_compound_word(inner) {
+            if let Some((l, op, r)) = split_single_comparison(inner) {
+                // 評価できないオペランドはここでは無視し、後続の条件評価が同じエラーを返す。
+                if let (Ok(lv), Ok(rv)) = (self.operand_value(l), self.operand_value(r)) {
+                    let (Some(mut lt), Some(rt)) = (lv, rv) else {
+                        return Ok(None);
+                    };
+                    // 演算を含むオペランドは評価済みの値のリテラルに置き換えて比較する（`FROM` の無い
+                    // `WHERE` は演算を含む式を受理しない）。
+                    lt.extend_from_slice(op);
+                    lt.extend(rt);
+                    return Ok(Some(self.where_probe(lt)?));
+                }
+            }
         }
         Ok(Some(self.where_probe(toks)?))
     }
@@ -537,13 +649,18 @@ impl PlHost for CorePlHost<'_, '_> {
             }
             DeclType::PercentRowType { path } => {
                 let schema = self.typed_relation_schema(path)?;
-                Ok(ResolvedType::Record(Some(
+                // `SELECT *` は可視の `id` 疑似列を先頭に返す（旧式・移行済みの表）ため、行型にも含める。
+                let mut fields: Vec<(String, ColumnType)> = Vec::new();
+                if schema.has_pseudo_id() {
+                    fields.push(("id".to_string(), ColumnType::BigInt));
+                }
+                fields.extend(
                     schema
                         .columns
                         .iter()
-                        .map(|c| (c.name.clone(), c.ty.clone()))
-                        .collect(),
-                )))
+                        .map(|c| (c.name.clone(), c.ty.clone())),
+                );
+                Ok(ResolvedType::Record(Some(fields)))
             }
         }
     }

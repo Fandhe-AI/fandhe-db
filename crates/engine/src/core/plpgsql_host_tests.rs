@@ -804,3 +804,153 @@ fn expressions_over_variables_are_evaluated_by_the_sql_surface() {
     .expect("simple case");
     assert_eq!(as_i64(&out), 20);
 }
+// ---- Issue #2226 レビュー対応 ----
+
+fn float(f: f64) -> PlScalar {
+    PlScalar::new(Cell::Float(f), ColumnType::Double)
+}
+
+fn null_int() -> PlScalar {
+    PlScalar::null(ColumnType::Integer)
+}
+
+#[test]
+fn float_variable_keeps_its_type_in_division() {
+    let (core, _g) = new_core(LedgerMode::Optional);
+    let c = ctx("t1");
+    // 3.0 が整数リテラル 3 に化けると `p / 2` は整数除算（1）になる。
+    let out = call("BEGIN IF p / 2 > 1.4 THEN RETURN 1; END IF; RETURN 0; END")
+        .param("p", SqlColumnTypeName::Double, float(3.0))
+        .autocommit(&core, &c)
+        .expect("float division");
+    assert_eq!(as_i64(&out), 1);
+}
+
+#[test]
+fn comparison_with_null_inside_an_expression_is_null() {
+    let (core, _g) = new_core(LedgerMode::Optional);
+    let c = ctx("t1");
+    let src = "DECLARE flag boolean; BEGIN flag := (a + 1 = 3); RETURN flag; END";
+    let out = call(src)
+        .returns(ColumnType::Boolean)
+        .param("a", SqlColumnTypeName::Integer, null_int())
+        .autocommit(&core, &c)
+        .expect("null expression comparison");
+    assert!(
+        matches!(out, CallOutcome::Scalar(ref v) if v.is_null()),
+        "{out:?}"
+    );
+    let out = call(src)
+        .returns(ColumnType::Boolean)
+        .param("a", SqlColumnTypeName::Integer, int(2))
+        .autocommit(&core, &c)
+        .expect("non-null expression comparison");
+    assert!(matches!(
+        out,
+        CallOutcome::Scalar(PlScalar {
+            cell: Cell::Bool(true),
+            ..
+        })
+    ));
+}
+
+#[test]
+fn is_null_conditions_are_supported() {
+    let (core, _g) = new_core(LedgerMode::Optional);
+    let c = ctx("t1");
+    for (cond, arg, want) in [
+        ("a IS NULL", null_int(), 1),
+        ("a IS NULL", int(1), 0),
+        ("a IS NOT NULL", int(1), 1),
+        ("a IS NOT NULL", null_int(), 0),
+    ] {
+        let src = format!("BEGIN IF {cond} THEN RETURN 1; END IF; RETURN 0; END");
+        let out = call(&src)
+            .param("a", SqlColumnTypeName::Integer, arg)
+            .autocommit(&core, &c)
+            .unwrap_or_else(|e| panic!("{cond}: {e:?}"));
+        assert_eq!(as_i64(&out), want, "{cond}");
+    }
+}
+
+#[test]
+fn bare_null_and_boolean_literals_can_be_assigned_and_returned() {
+    let (core, _g) = new_core(LedgerMode::Optional);
+    let c = ctx("t1");
+    let out = call(
+        "DECLARE x int := 5; BEGIN x := NULL; IF x IS NULL THEN RETURN 1; END IF; RETURN 0; END",
+    )
+    .autocommit(&core, &c)
+    .expect("assign null");
+    assert_eq!(as_i64(&out), 1);
+    let out = call("BEGIN RETURN true; END")
+        .returns(ColumnType::Boolean)
+        .autocommit(&core, &c)
+        .expect("return true");
+    assert!(matches!(
+        out,
+        CallOutcome::Scalar(PlScalar {
+            cell: Cell::Bool(true),
+            ..
+        })
+    ));
+}
+
+#[test]
+fn rowtype_includes_the_visible_id_pseudo_column() {
+    let (core, _g) = new_core(LedgerMode::Optional);
+    let c = ctx("t1");
+    seed(&core, &c, &[1], "en");
+    let out = call(
+        "DECLARE r docs%ROWTYPE; BEGIN SELECT * INTO r FROM docs WHERE lang = 'en'; RETURN r.id; END",
+    )
+    .autocommit(&core, &c)
+    .expect("select * into rowtype");
+    assert_eq!(as_i64(&out), 1);
+}
+
+#[test]
+fn repeated_large_text_reference_is_rejected_before_growing_past_the_limit() {
+    let (core, _g) = new_core(LedgerMode::Optional);
+    let c = ctx("t1");
+    let big = "x".repeat(crate::sql::lexer::MAX_INPUT_LEN / 3);
+    let e = call(
+        "DECLARE c bigint; BEGIN SELECT count(*) INTO c FROM docs WHERE lang = p OR lang = p OR lang = p OR lang = p; RETURN c; END",
+    )
+    .param("p", SqlColumnTypeName::Text, text(&big))
+    .autocommit(&core, &c)
+    .expect_err("too large");
+    assert!(
+        matches!(e.wire_code(), "54000" | "0A000" | "42601"),
+        "{}",
+        e.wire_code()
+    );
+}
+
+#[test]
+fn variable_named_id_conflicts_only_with_tables_that_have_an_id_column() {
+    let (core, _g) = new_core(LedgerMode::Optional);
+    let c = ctx("t1");
+    core.storage
+        .create_table(
+            &TableSchema::new(
+                "plain",
+                vec![ColumnDef::new("v", ColumnType::Integer, true)],
+            )
+            .with_row_identity(crate::catalog::RowIdentity::Allocated),
+        )
+        .expect("create table");
+    let out = call(
+        "DECLARE id int := 1; c bigint; BEGIN SELECT count(*) INTO c FROM plain WHERE v = id; RETURN c; END",
+    )
+    .autocommit(&core, &c)
+    .expect("no id column, no conflict");
+    assert_eq!(as_i64(&out), 0);
+    seed(&core, &c, &[1], "en");
+    let e = call(
+        "DECLARE id int := 1; c bigint; BEGIN SELECT count(*) INTO c FROM docs WHERE n = id; RETURN c; END",
+    )
+    .autocommit(&core, &c)
+    .expect_err("docs has an id column");
+    assert_eq!(e.wire_code(), "42702");
+}

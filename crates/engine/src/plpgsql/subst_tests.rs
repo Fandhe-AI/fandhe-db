@@ -63,7 +63,7 @@ fn value_tokens_equal_the_lexer_output_for_the_same_literal() {
             "false",
         ),
         (PlScalar::new(Cell::Float(1.5), ColumnType::Double), "1.5"),
-        (PlScalar::new(Cell::Float(-2.0), ColumnType::Double), "-2"),
+        (PlScalar::new(Cell::Float(-2.0), ColumnType::Double), "-2.0"),
     ];
     for (v, lit) in cases {
         let got = scalar_tokens(&v, VarRole::Value).expect("tokens");

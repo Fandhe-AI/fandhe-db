@@ -96,6 +96,23 @@ fn number_tokens_from_text(text: &str) -> Option<Vec<Token>> {
     lexer::is_single_number_literal(body).then(|| int_tokens(negative, body.to_string()))
 }
 
+/// 小数点を含む数値リテラル 1 個のトークン列（整数リテラルとは型が異なる値を、元の型を保って置換する）。
+fn typed_decimal_tokens(text: &str) -> Option<Vec<Token>> {
+    if !text.contains('.') {
+        return None;
+    }
+    number_tokens_from_text(text)
+}
+
+/// 浮動小数点の `CAST` の型語（`Real` 以外は倍精度）。
+fn float_type_words(ty: &ColumnType) -> &'static [&'static str] {
+    if matches!(ty, ColumnType::Real) {
+        &["real"]
+    } else {
+        &["double", "precision"]
+    }
+}
+
 /// 値 1 個を、字句解析器が同じ値のリテラルから生成するのと同一のトークン列にする。`role` は NULL の
 /// 表現だけに影響する（整数・文字列・真偽値は役割に依らず同一のトークン）。
 pub(crate) fn scalar_tokens(v: &PlScalar, role: VarRole) -> Result<Vec<Token>, SqlSurfaceError> {
@@ -107,11 +124,20 @@ pub(crate) fn scalar_tokens(v: &PlScalar, role: VarRole) -> Result<Vec<Token>, S
             if !f.is_finite() {
                 return Err(unsupported_type());
             }
-            number_tokens_from_text(&f.to_string()).ok_or_else(unsupported_type)?
+            // `Debug` は整数値でも `3.0` と小数点を残す（`Display` の `3` は整数リテラルになり、
+            // `p / 2` が整数除算へ化ける）。小数点の無い形（指数表記）は型を明示して保つ。
+            let text = format!("{f:?}");
+            match typed_decimal_tokens(&text) {
+                Some(t) => t,
+                None => cast_text_tokens(text, float_type_words(&v.ty)),
+            }
         }
         Cell::Numeric(d) => {
             let text = d.to_string();
-            number_tokens_from_text(&text).unwrap_or_else(|| cast_text_tokens(text, &["numeric"]))
+            match typed_decimal_tokens(&text) {
+                Some(t) => t,
+                None => cast_text_tokens(text, &["numeric"]),
+            }
         }
         Cell::Bool(b) => vec![Token::Ident(if *b { "true" } else { "false" }.to_string())],
         Cell::Text(s) => vec![Token::StringLiteral(s.clone())],
@@ -197,6 +223,24 @@ pub(crate) fn tokens_byte_len(tokens: &[Token]) -> Option<usize> {
     Some(total)
 }
 
+/// 値 1 個の置換トークンの総バイト数の見積り（複製の前に上限を検査するための上界寄りの値）。
+fn scalar_len_estimate(v: &PlScalar) -> usize {
+    // 文字列は本体、`CAST('..' AS ..)` 形の日時・数値は 64 バイトで上から押さえる。
+    match &v.cell {
+        Cell::Text(s) => s.len().saturating_add(64),
+        _ => 64,
+    }
+}
+
+/// 累積バイト数に `n` を足し、[`lexer::MAX_INPUT_LEN`] を超えるなら値を複製する前に拒否する。
+fn charge(total: &mut usize, n: usize) -> Result<(), SqlSurfaceError> {
+    *total = total.saturating_add(n);
+    if *total > lexer::MAX_INPUT_LEN {
+        return Err(too_big());
+    }
+    Ok(())
+}
+
 /// 変数参照の位置にあった元のトークンから、出力列名として使う名前を取る（`rec.f` はフィールド名）。
 fn alias_name(tok: &Token) -> Option<&str> {
     match tok {
@@ -218,12 +262,14 @@ pub(crate) fn substitute(
     by_pos.sort_by_key(|s| s.pos);
     let mut out: Vec<Token> = Vec::with_capacity(tokens.len());
     let mut cursor = 0usize;
+    let mut total = 0usize;
     for site in by_pos {
         let Some(before) = tokens.get(cursor..site.pos) else {
             return Err(SqlSurfaceError::Internal {
                 detail: "PL/pgSQL variable site out of order".to_string(),
             });
         };
+        charge(&mut total, tokens_byte_len(before).ok_or_else(too_big)?)?;
         out.extend_from_slice(before);
         let original = tokens
             .get(site.pos)
@@ -231,6 +277,7 @@ pub(crate) fn substitute(
                 detail: "PL/pgSQL variable site out of range".to_string(),
             })?;
         let value: &PlScalar = env.scalar(&site.var)?;
+        charge(&mut total, scalar_len_estimate(value))?;
         let name = if alias { alias_name(original) } else { None };
         let mut produced = role_tokens(value, site.role, name)?;
         parenthesize_if_needed(
@@ -241,11 +288,10 @@ pub(crate) fn substitute(
         out.extend(produced);
         cursor = site.pos.saturating_add(1);
     }
-    out.extend_from_slice(tokens.get(cursor..).unwrap_or(&[]));
-    match tokens_byte_len(&out) {
-        Some(n) if n <= lexer::MAX_INPUT_LEN => Ok(out),
-        _ => Err(too_big()),
-    }
+    let rest = tokens.get(cursor..).unwrap_or(&[]);
+    charge(&mut total, tokens_byte_len(rest).ok_or_else(too_big)?)?;
+    out.extend_from_slice(rest);
+    Ok(out)
 }
 
 /// `EXECUTE` の文字列中の `$n` を `using` の値で置換する（D6）。`$n` の最大番号と `using` の個数が
@@ -268,6 +314,7 @@ pub(crate) fn substitute_params(
         ));
     }
     let mut out: Vec<Token> = Vec::with_capacity(tokens.len());
+    let mut total = 0usize;
     for (i, t) in tokens.iter().enumerate() {
         match t {
             Token::Param(n) => {
@@ -279,6 +326,7 @@ pub(crate) fn substitute_params(
                         "the number of USING values does not match the parameters of the EXECUTE string",
                     )
                 })?;
+                charge(&mut total, scalar_len_estimate(v))?;
                 let mut produced = scalar_tokens(v, VarRole::Value)?;
                 parenthesize_if_needed(
                     i.checked_sub(1).and_then(|p| tokens.get(p)),
@@ -287,14 +335,14 @@ pub(crate) fn substitute_params(
                 );
                 out.extend(produced);
             }
-            other => out.push(other.clone()),
-        }
-        if out.len() > lexer::MAX_INPUT_LEN {
-            return Err(too_big());
+            other => {
+                charge(
+                    &mut total,
+                    tokens_byte_len(std::slice::from_ref(other)).ok_or_else(too_big)?,
+                )?;
+                out.push(other.clone());
+            }
         }
     }
-    match tokens_byte_len(&out) {
-        Some(n) if n <= lexer::MAX_INPUT_LEN => Ok(out),
-        _ => Err(too_big()),
-    }
+    Ok(out)
 }
