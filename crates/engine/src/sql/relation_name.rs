@@ -496,8 +496,11 @@ pub(crate) fn rewrite_relation_names_full(
         }
         // `DROP FUNCTION s.f`（#1920）は型の並びの括弧を省略できるため、先頭が `DROP FUNCTION` の文では
         // 3 語目の修飾名を（括弧が無くても）関数位置として扱う。
-        let drop_function_name =
-            i == 2 && ident_is(tokens.first(), "DROP") && ident_is(tokens.get(1), "FUNCTION");
+        // `DROP FUNCTION IF EXISTS s.f`（Issue #1917）は名前が 5 語目にある。
+        let drop_function_name = ident_is(tokens.first(), "DROP")
+            && ident_is(tokens.get(1), "FUNCTION")
+            && (i == 2
+                || (i == 4 && ident_is(tokens.get(2), "IF") && ident_is(tokens.get(3), "EXISTS")));
         // `DROP FUNCTION public.f` は `DROP TABLE public.t` と同様に裸の名前へ正規化する
         // （DROP は UDF カタログの削除だけで、組み込み関数へ化ける経路にならない）。
         if drop_function_name && qualifier.eq_ignore_ascii_case("public") {
@@ -1100,6 +1103,36 @@ mod tests {
         let mut t = tokenize("DROP FUNCTION s.f(integer)").expect("lex");
         rewrite_relation_names(&mut t, Some(&some)).expect("resolved");
         assert!(matches!(t.get(2), Some(Token::Ident(k)) if k.contains('#')));
+    }
+
+    /// Issue #1917: `DROP FUNCTION IF EXISTS s.f` の名前位置も判定し、`public.` は裸の名前へ正規化、
+    /// 存在しない SCHEMA は `3F000` のまま fail-closed にする。`CREATE OR REPLACE FUNCTION s.f(` も
+    /// 関数名位置として解決される。
+    #[test]
+    fn drop_function_if_exists_and_or_replace_resolve_schema() {
+        same(
+            "DROP FUNCTION IF EXISTS public.f CASCADE",
+            "DROP FUNCTION IF EXISTS f CASCADE",
+        );
+        let none = |_: &str| -> Result<Option<u64>, SqlSurfaceError> { Ok(None) };
+        let mut t = tokenize("DROP FUNCTION IF EXISTS nope.f").expect("lex");
+        let err = rewrite_relation_names(&mut t, Some(&none)).expect_err("unknown schema");
+        assert_eq!(err.wire_code(), "3F000");
+        let some = |_: &str| -> Result<Option<u64>, SqlSurfaceError> { Ok(Some(7)) };
+        let mut t = tokenize("DROP FUNCTION IF EXISTS s.f(integer)").expect("lex");
+        rewrite_relation_names(&mut t, Some(&some)).expect("resolved");
+        assert!(matches!(t.get(4), Some(Token::Ident(k)) if k.contains('#')));
+        let mut t = tokenize("CREATE OR REPLACE FUNCTION s.f(x) AS x").expect("lex");
+        rewrite_relation_names(&mut t, Some(&some)).expect("resolved");
+        assert!(matches!(t.get(4), Some(Token::Ident(k)) if k.contains('#')));
+        // 存在しない SCHEMA への作成は、`CREATE FUNCTION` と同じく書き換えでは拒否せず、
+        // 実行側（SCHEMA の現存確認）が拒否する。`OR REPLACE` の有無で挙動を変えない。
+        let mut plain = tokenize("CREATE FUNCTION nope.f(x) AS x").expect("lex");
+        let mut replace = tokenize("CREATE OR REPLACE FUNCTION nope.f(x) AS x").expect("lex");
+        assert_eq!(
+            rewrite_relation_names(&mut plain, Some(&none)).is_ok(),
+            rewrite_relation_names(&mut replace, Some(&none)).is_ok()
+        );
     }
 
     #[test]

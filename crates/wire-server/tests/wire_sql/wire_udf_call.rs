@@ -354,3 +354,57 @@ fn wire_udf_drop_on_one_connection_is_reflected_on_another_open_connection() {
     expect_error_response_with_sqlstate(&mut b, "42883");
     read_ready_for_query(&mut b);
 }
+/// SQL-66 (2)(3)・Issue #1917: `CREATE OR REPLACE FUNCTION` は固定タグ `CREATE FUNCTION` を返して
+/// 別接続の次の Query へ反映され、`DROP FUNCTION IF EXISTS` は対象が無くてもタグ `DROP FUNCTION` で成功し、
+/// 引数名の変更は `42P13`・同名の別シグネチャは `42723` になる。
+#[test]
+fn wire_create_or_replace_and_drop_if_exists() {
+    let (core, _guard) = new_core_with_docs();
+    let addr = spawn_server_with_ddl_user(core);
+    let mut a = authenticate_to_ready_for_query(addr, "alice", "pw-alice");
+    send_simple_query(&mut a, "CREATE OR REPLACE FUNCTION dbl(x) AS x * 2");
+    assert_eq!(read_command_complete(&mut a), "CREATE FUNCTION");
+    read_ready_for_query(&mut a);
+
+    let mut b = authenticate_to_ready_for_query(addr, "carol", "pw-carol");
+    send_simple_query(&mut b, CALL_DBL);
+    assert_eq!(read_row_description(&mut b), vec!["d"]);
+    let row = read_data_row(&mut b);
+    assert_eq!(
+        row[0].as_deref().map(|s| s.trim_end_matches(".0")),
+        Some("2")
+    );
+    assert_eq!(read_command_complete(&mut b), "SELECT 1");
+    read_ready_for_query(&mut b);
+
+    send_simple_query(&mut a, "CREATE OR REPLACE FUNCTION dbl(x) AS x * 5");
+    assert_eq!(read_command_complete(&mut a), "CREATE FUNCTION");
+    read_ready_for_query(&mut a);
+
+    send_simple_query(&mut b, CALL_DBL);
+    assert_eq!(read_row_description(&mut b), vec!["d"]);
+    let row = read_data_row(&mut b);
+    assert_eq!(
+        row[0].as_deref().map(|s| s.trim_end_matches(".0")),
+        Some("5")
+    );
+    assert_eq!(read_command_complete(&mut b), "SELECT 1");
+    read_ready_for_query(&mut b);
+
+    send_simple_query(&mut a, "CREATE OR REPLACE FUNCTION dbl(z) AS z");
+    expect_error_response_with_sqlstate(&mut a, "42P13");
+    read_ready_for_query(&mut a);
+    send_simple_query(&mut a, "CREATE OR REPLACE FUNCTION dbl(x, y) AS x");
+    expect_error_response_with_sqlstate(&mut a, "42723");
+    read_ready_for_query(&mut a);
+
+    send_simple_query(&mut a, "DROP FUNCTION IF EXISTS nothing_here");
+    assert_eq!(read_command_complete(&mut a), "DROP FUNCTION");
+    read_ready_for_query(&mut a);
+    send_simple_query(&mut a, "DROP FUNCTION IF EXISTS dbl CASCADE");
+    assert_eq!(read_command_complete(&mut a), "DROP FUNCTION");
+    read_ready_for_query(&mut a);
+    send_simple_query(&mut b, CALL_DBL);
+    expect_error_response_with_sqlstate(&mut b, "42883");
+    read_ready_for_query(&mut b);
+}

@@ -371,7 +371,10 @@ mod tests {
         s.create_function("t", &decl("f", &["x"], "x")).expect("f");
         let mut reg = UdfRegistry::default();
         load(&s, "t", &mut reg).expect("load");
-        assert!(s.drop_function_by_name("t", "f").expect("drop").is_some());
+        assert!(s
+            .drop_function_by_name("t", "f", false)
+            .expect("drop")
+            .is_some());
         refresh(&s, "t", &mut reg);
         assert!(reg.get("f").is_none());
         s.create_function("t", &decl("g", &["x"], "x")).expect("g");

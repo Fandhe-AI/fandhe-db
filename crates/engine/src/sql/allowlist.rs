@@ -1347,6 +1347,9 @@ pub enum SqlSurfaceError {
     /// （`42P13`。SQL-66 (1)・Issue #1916）。`detail` は静的な型名だけで作り、本体の原文・
     /// テナント・値を含めない。
     InvalidFunctionDefinition { detail: String },
+    /// 名前だけの `DROP FUNCTION` で同名の候補が複数あり一意に決まらない
+    /// （`42725`。SQL-66 (3)・Issue #1917）。`detail` は固定文言だけで作り、関数名以外を含めない。
+    AmbiguousFunction { detail: String },
     /// 複数テーブル参照スコープ（`sql::relation::BindingScope`、SQL-28・RLS-10・
     /// Issue #924）で、非修飾列参照が 2 つ以上の参照テーブルに一致した
     /// （候補が曖昧で一意に解決できない）。ERR-6: `42702`。文言には列名のみを
@@ -1418,6 +1421,7 @@ impl SqlSurfaceError {
             Self::InvalidFunctionDefinition { detail } => {
                 Self::InvalidFunctionDefinition { detail: f(&detail) }
             }
+            Self::AmbiguousFunction { detail } => Self::AmbiguousFunction { detail: f(&detail) },
             other => other,
         }
     }
@@ -1790,6 +1794,14 @@ impl SqlSurfaceError {
         }
     }
 
+    /// `pub(crate)`: 名前だけの `DROP FUNCTION` が複数の候補に当たったことの報告
+    /// （`sql::udf_ddl`、SQL-66 (3)・Issue #1917）。
+    pub(crate) fn ambiguous_function(detail: impl Into<String>) -> Self {
+        SqlSurfaceError::AmbiguousFunction {
+            detail: truncate_for_error(&detail.into()),
+        }
+    }
+
     /// `pub(crate)`: `sql::relation::BindingScope::resolve`（SQL-28・RLS-10、
     /// Issue #924）が非修飾列参照の曖昧な解決を報告するために使う。列名は
     /// untrusted な字句解析結果のため他 variant と同じ切り詰め規約を経由する。
@@ -1935,6 +1947,7 @@ impl ClassifiedError for SqlSurfaceError {
             SqlSurfaceError::InvalidFunctionDefinition { .. } => {
                 ErrorClass::InvalidFunctionDefinition
             }
+            SqlSurfaceError::AmbiguousFunction { .. } => ErrorClass::AmbiguousFunction,
             SqlSurfaceError::AmbiguousColumn { .. } => ErrorClass::AmbiguousColumn,
             SqlSurfaceError::JsonPathEval(e) => e.error_class(),
             SqlSurfaceError::JsonPathParse(e) => e.error_class(),
@@ -2302,6 +2315,9 @@ impl std::fmt::Display for SqlSurfaceError {
             }
             SqlSurfaceError::InvalidFunctionDefinition { detail } => {
                 write!(f, "invalid function definition: {detail}")
+            }
+            SqlSurfaceError::AmbiguousFunction { detail } => {
+                write!(f, "ambiguous function: {detail}")
             }
             SqlSurfaceError::AmbiguousColumn { name } => {
                 write!(f, "column reference {name:?} is ambiguous")
@@ -2998,7 +3014,11 @@ pub enum Statement {
     /// トークン列を [`lexer::render_tokens`] で描画した本体の原文（名前解決後のトークンのため SCHEMA
     /// 配下の名前は `#<id>.f` 形のまま。UDF カタログへ永続化する値で、ロード時は同じ字句解析と許可リストで
     /// 再パースする）。
+    ///
+    /// **Issue #1917（SQL-66 (2)）で追加した破壊的変更（BREAKING CHANGE）**: `or_replace` を追加した
+    /// （`CREATE OR REPLACE FUNCTION` なら `true`）。
     CreateFunction {
+        or_replace: bool,
         name: String,
         params: Vec<String>,
         param_types: Vec<Option<CastType>>,
@@ -19334,8 +19354,8 @@ pub(crate) fn validate_drop_sequence_tokens(
 }
 /// 構造検証済みの `DROP FUNCTION <name> [ ( [<型>[, ...]] ) ]`（SQL-66・TASK-309、Issue #1920）。
 ///
-/// 役割: UDF カタログ（`catalog::function`）とセッションのレジストリから関数を消す最小形。`IF EXISTS`・
-/// `CASCADE`／`RESTRICT`・複数名は後続 Issue（#1917）が受理するまで `0A000` で拒否する（fail-closed）。
+/// 役割: UDF カタログ（`catalog::function`）とセッションのレジストリから関数を消す。Issue #1917 で
+/// `IF EXISTS`・`CASCADE`／`RESTRICT` を受理した。複数名は `0A000` で拒否する（fail-closed）。
 /// 実行は `sql::udf_ddl::execute_drop_function`、呼び出し元は `core.rs` の `ParsedSql::DropFunction` 腕。
 #[derive(Debug, Clone, PartialEq)]
 pub struct ValidatedDropFunction {
@@ -19343,6 +19363,20 @@ pub struct ValidatedDropFunction {
     pub(crate) name: String,
     /// 引数の型の並び。`None` は括弧なし（名前だけで指す）、`Some(空)` は `f()`。
     pub(crate) arg_types: Option<Vec<crate::catalog::ColumnType>>,
+    /// `IF EXISTS` が付いたか（対象が無くても成功する。Issue #1917）。
+    pub(crate) if_exists: bool,
+    /// `CASCADE`／`RESTRICT`（既定は `RESTRICT`。Issue #1917）。
+    pub(crate) behavior: DropFunctionBehavior,
+}
+
+/// `DROP FUNCTION` の依存オブジェクトの扱い（SQL-66 (3)・Issue #1917）。現状、関数に依存できる
+/// 永続オブジェクトは TRIGGER だけ。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum DropFunctionBehavior {
+    /// 依存するトリガがあれば `2BP01` で拒否する（既定）。
+    Restrict,
+    /// 依存するトリガを同じ write txn で連鎖削除する。
+    Cascade,
 }
 
 /// 先頭 2 トークンが `DROP FUNCTION` か（汎用 `DROP`〔`DROP TABLE` 扱い〕より前に分岐するために使う）。
@@ -19352,8 +19386,8 @@ pub(crate) fn is_drop_function_statement(tokens: &[Token]) -> bool {
 }
 
 /// [`ValidatedDropFunction`] の構造検証本体（SQL-66、Issue #1920）。受理するのは
-/// `DROP FUNCTION <name>` と `DROP FUNCTION <name>(<型>[, ...])` だけで、`IF EXISTS`・`CASCADE`・
-/// `RESTRICT`・複数名は `0A000`、その他の形（引数名つき等）は型として読めず拒否する。型は
+/// `DROP FUNCTION [IF EXISTS] <name> [(<型>[, ...])] [CASCADE | RESTRICT]` だけで、複数名は
+/// `0A000`、その他の形（引数名つき等）は型として読めず拒否する。型は
 /// [`crate::sql::cast::parse_cast_type`] で読む（型名として読めることまでが構文検証で、
 /// カタログの定義との一致判定は実行側）。
 pub(crate) fn validate_drop_function_tokens(
@@ -19362,11 +19396,7 @@ pub(crate) fn validate_drop_function_tokens(
     let mut p = Parser::new(tokens);
     p.expect_ident_matching("DROP")?;
     p.expect_ident_matching("FUNCTION")?;
-    if p.consume_if_exists() {
-        return Err(SqlSurfaceError::feature_not_supported(
-            "DROP FUNCTION ... IF EXISTS is not supported",
-        ));
-    }
+    let if_exists = p.consume_if_exists();
     if matches!(p.peek(), Some(Token::QualifiedIdent { .. })) {
         return Err(SqlSurfaceError::feature_not_supported(
             "unresolved schema-qualified function names are not supported",
@@ -19401,10 +19431,12 @@ pub(crate) fn validate_drop_function_tokens(
         p.expect_punct(')')?;
         arg_types = Some(types);
     }
-    if p.peek_ident_matches("CASCADE") || p.peek_ident_matches("RESTRICT") {
-        return Err(SqlSurfaceError::feature_not_supported(
-            "DROP FUNCTION ... CASCADE/RESTRICT is not supported",
-        ));
+    let mut behavior = DropFunctionBehavior::Restrict;
+    if p.peek_ident_matches("CASCADE") {
+        p.advance();
+        behavior = DropFunctionBehavior::Cascade;
+    } else if p.peek_ident_matches("RESTRICT") {
+        p.advance();
     }
     if matches!(p.peek(), Some(Token::Punct(','))) {
         return Err(SqlSurfaceError::feature_not_supported(
@@ -19412,7 +19444,12 @@ pub(crate) fn validate_drop_function_tokens(
         ));
     }
     p.expect_end_of_statement()?;
-    Ok(ValidatedDropFunction { name, arg_types })
+    Ok(ValidatedDropFunction {
+        name,
+        arg_types,
+        if_exists,
+        behavior,
+    })
 }
 
 /// `ALTER SEQUENCE <name> ...` の変更内容（TABLE-24・SQL-23、Issue #1689）。
@@ -22865,6 +22902,15 @@ fn parse_set_search_mode(tokens: &[Token]) -> Result<String, SqlSurfaceError> {
 fn parse_create_function(tokens: &[Token]) -> Result<ParsedCreateFunction, SqlSurfaceError> {
     let mut p = Parser::new(tokens);
     p.expect_ident_matching("CREATE")?;
+    // `CREATE OR REPLACE FUNCTION`（SQL-66 (2)・Issue #1917）。`OR` の後が `REPLACE`／`FUNCTION`
+    // でなければ従来どおり `42601`（`CREATE OR REPLACE TABLE` 等はここへ来ても拒否される）。
+    let or_replace = if p.peek_ident_matches("OR") {
+        p.advance();
+        p.expect_ident_matching("REPLACE")?;
+        true
+    } else {
+        false
+    };
     p.expect_ident_matching("FUNCTION")?;
     let name = p.expect_ident()?;
     p.expect_punct('(')?;
@@ -22927,6 +22973,7 @@ fn parse_create_function(tokens: &[Token]) -> Result<ParsedCreateFunction, SqlSu
         ));
     }
     Ok(ParsedCreateFunction {
+        or_replace,
         name,
         params,
         param_types,
@@ -22950,6 +22997,7 @@ pub(crate) fn parse_stored_function_body(tokens: &[Token]) -> Result<Expr, SqlSu
 /// [`parse_create_function`] の戻り値（名前・パラメータ名・パラメータ型注釈・RETURNS 型・本体式・
 /// 本体の原文）。
 struct ParsedCreateFunction {
+    or_replace: bool,
     name: String,
     params: Vec<String>,
     param_types: Vec<Option<CastType>>,
@@ -25464,6 +25512,7 @@ fn validate_sql_tokens_impl(
         _ if is_create_function_statement => {
             let parsed = parse_create_function(tokens)?;
             Ok(Statement::CreateFunction {
+                or_replace: parsed.or_replace,
                 name: parsed.name,
                 params: parsed.params,
                 param_types: parsed.param_types,
@@ -35677,6 +35726,37 @@ mod tests {
         );
     }
 
+    /// SQL-66 (2)・Issue #1917: `CREATE OR REPLACE FUNCTION` を受理し、`OR` の後が `REPLACE`
+    /// `FUNCTION` 以外は `42601` で拒否する。
+    #[test]
+    fn create_or_replace_function_is_parsed() {
+        let lookup = catalog_with(&["documents"]);
+        let Statement::CreateFunction { or_replace, .. } =
+            validate_sql("CREATE OR REPLACE FUNCTION f(x) AS x", &lookup).expect("valid")
+        else {
+            panic!("expected CreateFunction");
+        };
+        assert!(or_replace);
+        let Statement::CreateFunction { or_replace, .. } =
+            validate_sql("create function f(x) as x", &lookup).expect("valid")
+        else {
+            panic!("expected CreateFunction");
+        };
+        assert!(!or_replace);
+        for sql in [
+            "CREATE OR REPLACE TABLE f(x) AS x",
+            "CREATE OR FUNCTION f(x) AS x",
+            "CREATE OR REPLACE f(x) AS x",
+            "CREATE OR",
+        ] {
+            assert_eq!(
+                validate_sql(sql, &lookup).expect_err("reject").wire_code(),
+                "42601",
+                "{sql}"
+            );
+        }
+    }
+
     #[test]
     fn create_function_body_source_round_trips() {
         let lookup = catalog_with(&["documents"]);
@@ -35720,15 +35800,28 @@ mod tests {
         let ok =
             validate_drop_function_tokens(&toks("DROP FUNCTION f(integer, text);")).expect("typed");
         assert_eq!(ok.arg_types.as_ref().map(Vec::len), Some(2));
-        for sql in [
-            "DROP FUNCTION IF EXISTS f",
-            "DROP FUNCTION f CASCADE",
-            "DROP FUNCTION f(integer) RESTRICT",
-            "DROP FUNCTION f, g",
-        ] {
-            let err = validate_drop_function_tokens(&toks(sql)).expect_err(sql);
-            assert_eq!(err.wire_code(), "0A000", "{sql}");
-        }
+        assert!(!ok.if_exists);
+        assert_eq!(ok.behavior, DropFunctionBehavior::Restrict);
+        // Issue #1917: IF EXISTS・CASCADE・RESTRICT は受理する。
+        let ok =
+            validate_drop_function_tokens(&toks("DROP FUNCTION IF EXISTS f")).expect("if exists");
+        assert!(ok.if_exists);
+        assert_eq!(ok.behavior, DropFunctionBehavior::Restrict);
+        let ok = validate_drop_function_tokens(&toks("DROP FUNCTION f CASCADE")).expect("cascade");
+        assert!(!ok.if_exists);
+        assert_eq!(ok.behavior, DropFunctionBehavior::Cascade);
+        let ok =
+            validate_drop_function_tokens(&toks("DROP FUNCTION IF EXISTS f(integer) RESTRICT"))
+                .expect("restrict");
+        assert!(ok.if_exists);
+        assert_eq!(ok.arg_types.as_ref().map(Vec::len), Some(1));
+        assert_eq!(ok.behavior, DropFunctionBehavior::Restrict);
+        // 複数名は 0A000、CASCADE と RESTRICT の併記は構文エラー。
+        let err = validate_drop_function_tokens(&toks("DROP FUNCTION f, g")).expect_err("multi");
+        assert_eq!(err.wire_code(), "0A000");
+        let err = validate_drop_function_tokens(&toks("DROP FUNCTION f CASCADE RESTRICT"))
+            .expect_err("both");
+        assert_eq!(err.wire_code(), "42601");
         let err = validate_drop_function_tokens(&toks("DROP FUNCTION f(x integer)"))
             .expect_err("argument names are not accepted");
         assert_eq!(err.wire_code(), "42704");

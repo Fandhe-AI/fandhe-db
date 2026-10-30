@@ -94,7 +94,7 @@ macro_rules! define_error_classes {
 pub(crate) const SHARED_WIRE_CODES: &[&str] = &["23502", "23505", "22023"];
 
 define_error_classes! {
-    count = 92;
+    count = 93;
 
     /// 構文上受理された SQL の値・引数が不正（`22000`）。
     /// [`crate::sql::allowlist::SqlSurfaceError::InvalidInput`] の写像。
@@ -362,6 +362,10 @@ define_error_classes! {
     /// （`42P13`。SQL-66 (1)・Issue #1916）。
     /// [`crate::sql::allowlist::SqlSurfaceError::InvalidFunctionDefinition`] の写像。
     InvalidFunctionDefinition => ("42P13", "INVALID_FUNCTION_DEFINITION"),
+    /// 名前だけの `DROP FUNCTION` で同名の候補が複数あり一意に決まらない
+    /// （`42725`。SQL-66 (3)・Issue #1917）。
+    /// [`crate::sql::allowlist::SqlSurfaceError::AmbiguousFunction`] の写像。
+    AmbiguousFunction => ("42725", "AMBIGUOUS_FUNCTION"),
     /// 複数テーブル参照スコープ（`sql::relation::BindingScope`、SQL-28・RLS-10、
     /// Issue #924）で、非修飾列参照が複数の参照テーブルへ一致し一意に解決
     /// できない（`42702`）。[`crate::sql::allowlist::SqlSurfaceError::

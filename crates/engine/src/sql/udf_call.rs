@@ -2429,7 +2429,9 @@ pub struct UdfDefinition {
 }
 
 /// セッション単位の UDF レジストリ（`sql::mode::SessionState` が保持する）。
-/// 再定義は許可しない（同名は `42723`）。削除は `DROP FUNCTION`（#1920）だけが [`Self::remove`] で行う。
+/// `CREATE FUNCTION` による同名の再定義は許可しない（`42723`）。置換は `CREATE OR REPLACE FUNCTION`
+/// （Issue #1917。シグネチャ・引数名・戻り値型が同じ場合だけ。[`prepare_function_replacement`]）、
+/// 削除は `DROP FUNCTION`（#1920）だけが [`Self::remove`] で行う。
 /// 永続化（#1920）後も、レジストリは RLS-8 と同じ「認証済みテナントの接続単位」の外へ漏れない構造を
 /// 保つ（カタログは自テナントの scope でしか引けず、セッションへのロードは #1921 が担う）。
 ///
@@ -2609,6 +2611,22 @@ pub fn define_function_with_signature(
     return_type: Option<&crate::sql::cast::CastType>,
     body: &Expr,
 ) -> Result<(), SqlSurfaceError> {
+    let prepared =
+        prepare_function_with_signature(registry, name, params, param_types, return_type, body)?;
+    commit_function_definition(registry, prepared);
+    Ok(())
+}
+
+/// [`define_function_with_signature`] の検証部（レジストリは変更しない）。`CREATE FUNCTION` と
+/// `CREATE OR REPLACE FUNCTION`（[`prepare_function_replacement`]）が共有する。
+fn prepare_function_with_signature(
+    registry: &UdfRegistry,
+    name: &str,
+    params: &[String],
+    param_types: &[Option<crate::sql::cast::CastType>],
+    return_type: Option<&crate::sql::cast::CastType>,
+    body: &Expr,
+) -> Result<PreparedUdf, SqlSurfaceError> {
     if param_types.len() != params.len() {
         return Err(SqlSurfaceError::unsupported(
             "function parameter type list does not match the parameter list",
@@ -2639,6 +2657,203 @@ pub fn define_function_with_signature(
         check_function_return_type(registry, &prepared, ret)?;
         prepared.return_type = Some(ret.clone());
     }
+    Ok(prepared)
+}
+
+/// `CREATE OR REPLACE FUNCTION` の検証部（レジストリは変更しない。SQL-66 (2)・Issue #1917）。
+/// 呼び出し元は `sql::udf_ddl`（DDL 権限のあるセッション。`allow_catalog_origin = true`）と
+/// [`define_or_replace_function_with_signature`]（権限の無いセッション。`false`）。
+///
+/// 判定順: 予約・組み込み名 `42723` → WASM UDF と同名 `42723` → 同名の宣言的 UDF が無ければ新規作成と
+/// 同じ検証（容量上限を含む）→ 引数の数・型注釈が違えば `42723`（多重定義は未対応）→ 引数名・戻り値型
+/// （`None` と `Some` の違いを含む）が違えば `42P13` → カタログ由来を権限の無いセッションが置換する
+/// と `42501` → 置換対象を除いたレジストリで本体を検証 → 本体が置換対象へ推移的に到達すれば `0A000`。
+///
+/// 最後の検査が循環の防止（DoS 対策）: `CREATE` は追記専用で循環しないが、置換は `f -> g -> f` を作れ、
+/// [`bind_call`] のインライン展開と `recovery::content_hash::collect_referenced_udfs` は非巡回を
+/// 前提にする。戻り値は検証済みの定義（[`commit_function_definition`] が同名を上書きする）。
+pub(crate) fn prepare_function_replacement(
+    registry: &UdfRegistry,
+    name: &str,
+    params: &[String],
+    param_types: &[Option<crate::sql::cast::CastType>],
+    return_type: Option<&crate::sql::cast::CastType>,
+    body: &Expr,
+    allow_catalog_origin: bool,
+) -> Result<PreparedUdf, SqlSurfaceError> {
+    catalog::validate_relation_key(name)
+        .map_err(|_| SqlSurfaceError::invalid_input(format!("invalid function name: {name}")))?;
+    let lower = name.to_ascii_lowercase();
+    if is_reserved_function_name(name) {
+        return Err(SqlSurfaceError::duplicate_function(format!(
+            "function name {name} collides with a built-in or reserved name"
+        )));
+    }
+    if registry.wasm.contains_key(&lower) {
+        return Err(SqlSurfaceError::duplicate_function(format!(
+            "function {name} is already defined in this session"
+        )));
+    }
+    let Some(old) = registry.defs.get(&lower) else {
+        return prepare_function_with_signature(
+            registry,
+            name,
+            params,
+            param_types,
+            return_type,
+            body,
+        );
+    };
+    let normalized: Vec<String> = params.iter().map(|p| p.to_ascii_lowercase()).collect();
+    if old.params.len() != normalized.len() || old.param_types.as_slice() != param_types {
+        return Err(SqlSurfaceError::duplicate_function(format!(
+            "function {name} is already defined with a different signature"
+        )));
+    }
+    if old.params != normalized {
+        return Err(SqlSurfaceError::invalid_function_definition(
+            "cannot change name of input parameter",
+        ));
+    }
+    if old.return_type.as_ref() != return_type {
+        return Err(SqlSurfaceError::invalid_function_definition(
+            "cannot change return type of existing function",
+        ));
+    }
+    if !allow_catalog_origin && registry.is_catalog_origin(&lower) {
+        return Err(SqlSurfaceError::InsufficientPrivilege);
+    }
+    // 循環検査は本体の名前解決より先に行う（自己再帰は probe から自身を除くため後段では 42883 に
+    // なり、契約の 0A000 とずれる）。元のレジストリと新しい本体で判定する。
+    let mut visited = std::collections::BTreeSet::new();
+    if expr_reaches_function(body, &lower, registry, &mut visited) {
+        return Err(SqlSurfaceError::feature_not_supported(
+            "recursive function definitions are not supported",
+        ));
+    }
+    let mut probe = registry.clone();
+    probe.remove(&lower);
+    let prepared =
+        prepare_function_with_signature(&probe, name, params, param_types, return_type, body)?;
+    Ok(prepared)
+}
+
+/// 関数名（小文字）から宣言的 UDF の本体式を引く抽象。セッションのレジストリと、カタログの最新定義
+/// （`replace_function` の write txn 内の循環検査）の両方で同じ到達判定を使うための境界。
+pub(crate) trait BodyLookup {
+    fn body_of(&self, lower_name: &str) -> Option<&Expr>;
+}
+
+impl BodyLookup for UdfRegistry {
+    fn body_of(&self, lower_name: &str) -> Option<&Expr> {
+        self.defs.get(lower_name).map(|d| &d.body)
+    }
+}
+
+impl BodyLookup for std::collections::BTreeMap<String, Expr> {
+    fn body_of(&self, lower_name: &str) -> Option<&Expr> {
+        self.get(lower_name)
+    }
+}
+
+/// `body` が `defs`（小文字名 → 本体）を推移的にたどって関数 `target`（小文字）へ到達するか。
+/// カタログの最新定義に対する循環検査（`sql::udf_ddl`）が呼ぶ。
+pub(crate) fn body_reaches_function(body: &Expr, target: &str, defs: &dyn BodyLookup) -> bool {
+    let mut visited = std::collections::BTreeSet::new();
+    expr_reaches_function(body, target, defs, &mut visited)
+}
+
+/// `expr` の呼び出しが（宣言的 UDF の本体を推移的にたどって）関数 `target`（小文字）へ到達するか。
+/// [`prepare_function_replacement`] の循環検査。`visited` が再訪を止めるため、レジストリ内の既存の
+/// 巡回があっても必ず停止する。`Expr` の全 variant を網羅し `_ =>` を置かない（variant 追加時に
+/// コンパイルエラーで検査漏れに気づく。fail-closed）。
+fn expr_reaches_function(
+    expr: &Expr,
+    target: &str,
+    registry: &dyn BodyLookup,
+    visited: &mut std::collections::BTreeSet<String>,
+) -> bool {
+    match expr {
+        Expr::Number(_)
+        | Expr::Ident(_)
+        | Expr::String(_)
+        | Expr::Null
+        | Expr::DateLiteral(_)
+        | Expr::TimestampLiteral(_)
+        | Expr::IntervalLiteral(_)
+        | Expr::TimeLiteral(_)
+        | Expr::TimestampTzLiteral { .. }
+        | Expr::ValueFunction { .. } => false,
+        Expr::Call { name, args } => {
+            let lower = name.to_ascii_lowercase();
+            if lower == target {
+                return true;
+            }
+            if let Some(body) = registry.body_of(&lower) {
+                if visited.insert(lower) && expr_reaches_function(body, target, registry, visited) {
+                    return true;
+                }
+            }
+            args.iter()
+                .any(|a| expr_reaches_function(a, target, registry, visited))
+        }
+        Expr::Binary { lhs, rhs, .. }
+        | Expr::NullIf(lhs, rhs)
+        | Expr::IsDistinctFrom { lhs, rhs, .. }
+        | Expr::RegexMatch {
+            lhs, pattern: rhs, ..
+        }
+        | Expr::JsonAccess { lhs, rhs, .. } => {
+            expr_reaches_function(lhs, target, registry, visited)
+                || expr_reaches_function(rhs, target, registry, visited)
+        }
+        Expr::Collate { expr, .. } | Expr::Cast { expr, .. } => {
+            expr_reaches_function(expr, target, registry, visited)
+        }
+        Expr::ArrayConstructor(_) | Expr::Subscript { .. } | Expr::Quantified { .. } => expr
+            .array_expr_children()
+            .into_iter()
+            .flatten()
+            .any(|c| expr_reaches_function(c, target, registry, visited)),
+        Expr::SqlJsonQuery(q) => q
+            .children()
+            .into_iter()
+            .any(|c| expr_reaches_function(c, target, registry, visited)),
+        Expr::Case { whens, else_result } => {
+            whens.iter().any(|(c, r)| {
+                expr_reaches_function(c, target, registry, visited)
+                    || expr_reaches_function(r, target, registry, visited)
+            }) || else_result
+                .as_deref()
+                .is_some_and(|e| expr_reaches_function(e, target, registry, visited))
+        }
+        Expr::Coalesce(args) => args
+            .iter()
+            .any(|a| expr_reaches_function(a, target, registry, visited)),
+    }
+}
+
+/// `CREATE OR REPLACE FUNCTION` をセッションのレジストリだけへ適用する（DDL 権限の無いセッション用。
+/// SQL-66 (2)・Issue #1917）。[`prepare_function_replacement`]（`allow_catalog_origin = false`）で検証
+/// してから [`commit_function_definition`] で上書きし、失敗時は `registry` を変更しない。
+/// `core.rs::EngineCore::execute_validated_in_session` の `CreateFunction` 分岐が呼ぶ。
+pub(crate) fn define_or_replace_function_with_signature(
+    registry: &mut UdfRegistry,
+    name: &str,
+    params: &[String],
+    param_types: &[Option<crate::sql::cast::CastType>],
+    return_type: Option<&crate::sql::cast::CastType>,
+    body: &Expr,
+) -> Result<(), SqlSurfaceError> {
+    let prepared = prepare_function_replacement(
+        registry,
+        name,
+        params,
+        param_types,
+        return_type,
+        body,
+        false,
+    )?;
     commit_function_definition(registry, prepared);
     Ok(())
 }

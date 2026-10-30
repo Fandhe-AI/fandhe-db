@@ -1163,6 +1163,7 @@ Date: <IMF-fixdate>
 | `42704` | `UNDEFINED_OBJECT` | 400 | Bad Request | 未登録の ENUM 型名（`create_table`／`alter_table`。Issue #2306）で到達可能。`DROP INDEX` 由来は op 許可リスト外 |
 | `42710` | `DUPLICATE_OBJECT` | 400 | Bad Request | NoSQL 表層の実要求からは到達不能（`ALTER TABLE ... ADD CONSTRAINT` は SQL 表層専用。後述） |
 | `42723` | `DUPLICATE_FUNCTION` | 400 | Bad Request | NoSQL 表層の実要求からは到達不能（`CREATE FUNCTION` は SQL 表層専用。後述） |
+| `42725` | `AMBIGUOUS_FUNCTION` | 400 | Bad Request | NoSQL 表層の実要求からは到達不能（名前だけの `DROP FUNCTION` の候補曖昧は SQL 表層専用。Issue #1917） |
 | `42803` | `GROUPING_ERROR` | 400 | Bad Request | 式索引の式に集計関数がある（SQL 表層専用。NoSQL の `op` 語彙からは到達しない）。Issue #1647 |
 | `42804` | `DATATYPE_MISMATCH` | 400 | Bad Request | NoSQL 表層の実要求からは到達不能（`CASE`／`COALESCE`／`NULLIF`・集合演算・`INNER JOIN` の結合キー型不一致〔SQL-28・RLS-10、Issue #925〕・式層の演算子／関数引数の型不一致〔Issue #1186〕のいずれも SQL 表層専用。後述） |
 | `42809` | `WRONG_OBJECT_TYPE` | 400 | Bad Request | NoSQL 表層の実要求からは到達不能（`DROP TABLE`／`DROP VIEW`・ビューへの書き込みは SQL 表層専用の DDL。後述） |
@@ -1251,7 +1252,8 @@ RECOVER-11、Issue #1129）は SQL 表層の分割実行 DML と `CANCEL PARTITI
 `DuplicateFunction`（`42723`。SQL-26、Issue #1186）は
 `CREATE FUNCTION`／WASM UDF 登録の名前衝突で、NoSQL `op` 許可リストに関数
 登録が無いため到達しない。`InvalidFunctionDefinition`（`42P13`。SQL-66、Issue #1916）も
-`CREATE FUNCTION ... RETURNS` の型検査で、同じ理由で到達しない。`CREATE VIEW`／`DROP VIEW`（TABLE-18・SQL-23・
+`CREATE FUNCTION ... RETURNS` の型検査で、同じ理由で到達しない。`AmbiguousFunction`（`42725`。
+SQL-66、Issue #1917）も `DROP FUNCTION` の候補曖昧で、同じ理由で到達しない。`CREATE VIEW`／`DROP VIEW`（TABLE-18・SQL-23・
 TASK-205、Issue #909）は SQL 表層専用の DDL で、NoSQL `op` 許可リストに
 `view` 相当の語彙が無いため `42P07`（名前衝突を `CREATE TABLE` と共有）・
 `2BP01`・`42809` も同様に到達不能。`CREATE INDEX`／`DROP INDEX`（INDEX-7・

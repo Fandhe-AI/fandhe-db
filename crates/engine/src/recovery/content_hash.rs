@@ -2548,8 +2548,10 @@ fn push_dml_subquery_tokens(
 /// 本体を再帰的に走査する（推移閉包。ADR §4.4.1「4.」）。WASM UDF に解決される
 /// 呼び出しは許可形状外として拒否する（`get_wasm` → `get` の順で必ず判定する。
 /// ADR §4.4.1「2.」の順序を維持しないと WASM UDF の名前が誤って「組み込み関数」
-/// 側へ分類されてしまう）。`UdfRegistry` は追記専用（自身より前に登録済みの
-/// UDF のみを呼べる）ため巡回はなく、この再帰は必ず停止する。
+/// 側へ分類されてしまう）。`CREATE OR REPLACE FUNCTION`（Issue #1917）は置換が呼び出しの
+/// 循環を作る場合を拒否する（`udf_call::prepare_function_replacement`）ため登録済み UDF の
+/// 呼び出しグラフは非巡回で、この再帰は停止する。さらに `out` の訪問済み検査が、仮に巡回があっても
+/// 再訪を止める。置換で本体が変わればここで集める定義も変わり、ハッシュも変わる（別内容として扱う）。
 fn collect_referenced_udfs(
     expr: &crate::sql::udf_call::Expr,
     udf_registry: &crate::sql::udf_call::UdfRegistry,
