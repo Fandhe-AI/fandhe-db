@@ -3,9 +3,9 @@
 //!
 //! `plpgsql::interp` は制御フローと変数環境だけを持ち、SQL も式も自分では評価しない
 //! （第 2 の SQL 実行器を作らない）。式の評価・埋め込み SQL の実行・`%TYPE` 等の型解決は
-//! [`PlHost`] へ委ね、core 側の実装（変数値のトークン置換・同じ Tx／RLS での実行）は #2226 が
-//! 入れる。`EmbeddedSqlChecker`（定義時検証）と同じ型の分業。#2225 の時点ではテスト専用ホスト
-//! （`interp_tests`）だけが実装する。メソッドの形は #2226 の要件で調整されうる。
+//! [`PlHost`] へ委ねる。core 側の実装（変数値のトークン置換・同じ Tx／RLS での実行）は
+//! `core::plpgsql_host::CorePlHost`（Issue #2226）で、テスト専用ホスト（`interp_tests`）と並ぶ
+//! 2 つ目の実装。`EmbeddedSqlChecker`（定義時検証）と同じ型の分業。
 //!
 //! ホストは入れ子の関数呼び出し（式の中の PL/pgSQL 関数）で `run_function` を再帰的に呼べるよう、
 //! 実行予算 [`super::interp::ExecBudget`] を引数で受け取る（文数・反復・呼び出し深さの合算）。

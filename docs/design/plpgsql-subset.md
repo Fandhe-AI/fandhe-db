@@ -456,3 +456,76 @@ D4（値の表現）・D7（上限と CLI）・D10（`ErrorClass` の新分類�
   `ParseOptions::with_limits` へ渡す）
 - #2218: `--max-function-call-depth` と `EngineCore::plpgsql_limits()` を共有
 - #2227: `RAISE`・`EXCEPTION`、#2228: `DO`・トリガ関数、#2229: 越境・crash 検証
+
+## Issue #2226 追記: PL/pgSQL 内の SQL 文の実行（SQL-68 ポインタ）
+
+D3・D5・D6・D8 の最終判断。実装は `crates/engine/src/core/plpgsql_host.rs`（`PlHost` の core 実装と
+入口）と `crates/engine/src/plpgsql/subst.rs`（値 → トークンの純粋関数）。
+
+### 入口と経路
+
+- 入口は 2 つ（`pub(crate)`）: `EngineCore::run_plpgsql_in_txn`（開いている Tx に参加。`Idle` は
+  `Internal`、`Failed` は `25P02`、本体のエラーで Tx を `Failed` にする）と `run_plpgsql_autocommit`
+  （`Idle` なら暗黙 Tx を開き、成功で commit・失敗で abort。開いていれば前者へ）。呼び出し元は
+  #2217／#2218／#2228 が結線するまでテストだけ
+- 1 文の実行は `parse_tokens_gated`（許可リスト解析。一時カタログ・テナント SCHEMA 解決つき）→ 文種と
+  書き込みのゲート → `execute_in_active_txn` の順。第 2 の実行器は作らず、`mark_written`・未 commit の
+  変更の読み取り・`--max-result-rows`・DML の影響行数上限・RLS-7 の暗黙述語は呼び出し元の文と同一に効く。
+  テナントの文脈を切り替える API は無い（`PolicyContext` は借用のまま）
+- 本体の各文は `check_and_register_statement` を呼ばない（外側の 1 文の一部。operation_id を持たず、
+  文数は `--max-plpgsql-statements`）。許す文は DML・`SELECT` 系だけで、DDL・Tx 制御・`SET`・`COPY`・
+  `USING OPERATION_ID`・`PARTITIONED` は `0A000`（定義時の検査との二重化。`EXECUTE` の文字列にも適用）
+- 書き込み可否は呼び出しごとの `PlCallOptions::may_write`（揮発性ゲート。#2217 が `Body::may_write` と
+  属性から決める）。偽で書き込む文は `0A000`
+- 再入の不変条件（D5）: 入口は、外側の実行器が同じ write txn の表ハンドルを開いていない時点からだけ呼ぶ
+
+### 値の置換（D3・D6）
+
+- 変数・`USING` の値は型付きの値から直接トークンを組み立てる（`subst::scalar_tokens`）。整数は `Number`
+  （負値は `-` + `Number`）、文字列は `StringLiteral`、真偽値は `true`／`false` の `Ident`、有限の浮動小数と
+  numeric は `Number`、日付・時刻・timestamp は `CAST('...' AS 型)`。NaN／Infinity・対応外の型は `0A000`。
+  構築したトークン列が字句解析器の出力と一致することを単体テストで固定した
+- 役割別: `Value`／`WhereHead`／`LiteralSlot` は同一のトークン。`SelectItemBare` は `AS <名前>` を付け、
+  投影が裸の文字列・真偽値を受理しないため `CAST('...' AS text)`／`CAST('true' AS boolean)` で包む。
+  `OrderKey`／`GroupKey` の整数は `CAST(n AS integer)` で包む（序数参照へ化けない）。NULL は値・投影の
+  位置で `CAST(NULL AS 型)`、それ以外は裸の `NULL`（`sql::params` の NULL 束縛と同じ）
+- 負値が `::` の前、または直前が `-` の位置に来るときは括弧で包む。置換後の総バイト数は
+  `MAX_INPUT_LEN` 以下（超過は `54000`。同じ変数の多重参照で値を増幅させない）
+- `EXECUTE ... USING`: 文字列は `MAX_INPUT_LEN` 以下・通常の字句解析（`$n` 許可）→ `$n` の最大番号と
+  `USING` の個数が一致しなければ `42601`（欠落・過剰とも）→ 型付きトークンで置換 → 通常の文と同じ経路
+- 式 1 個が変数 1 個だけ（`x := y`・`IF flag`）なら SQL を経由せず変数を直接返す（真偽値や日時が
+  `SELECT` の項目に置けない形を避け、型を保つ）。値の式は `SELECT <式>`、条件は `SELECT 1 WHERE <条件>`
+
+### `42702`（変数名と列名の衝突）の検出方式
+
+SQL 構文解析器は列の存在を束縛段（実行時）まで確かめないため、「列参照として解析できるか」では判定
+できない。そこで、文が参照する関係（`relation_positions` の関係位置。SCHEMA 修飾は解決済み）のスキーマを
+引き、列としても読める位置（`Value`／`WhereHead`／`SelectItemBare`／`OrderKey`／`GroupKey`）の未修飾の
+変数名が、その表の列名（疑似列 `id` を含む）と一致すれば `42702`（固定文言。変数名を含めない）とする。
+検査結果は文・式ごとにキャッシュし、ループで繰り返さない。
+
+### 既知の差（security.md P0 の優先。後続で縮められる）
+
+- 条件式は FROM の無い `WHERE` が受理する形（比較 1 個または真偽値の式）だけ。`AND`／`OR`／`NOT` の
+  複合条件は `0A000`（FROM の無い `WHERE` の拡張が必要。SQL-43 側の追跡事項）
+- `42702` の検査は永続の表だけが対象。CTE・導出表・ビュー・一時表の列と変数名の衝突は検出しない
+  （衝突した名前は変数として読まれる）
+- `x%TYPE`（変数の型を引く形）は `0A000`。`表.列%TYPE`・`スキーマ.表.列%TYPE`・`表%ROWTYPE` は呼び出し
+  テナントの SCHEMA 解決器で解く。表が無い場合も他テナントの SCHEMA の表の場合も、区別のない同じ
+  `42P01`（列が無ければ `42703`）
+- 真偽値・NULL・文字列の変数が、リテラルを受理しない位置（例: 真偽値を `SELECT` の項目の算術式の中）に
+  来る場合は、許可リストの拒否（`42703`／`42601`）がそのまま返る。日付・時刻の変数は `CAST` が受理される
+  位置でだけ使える。テキスト変数は文字列リテラルとして置換するため、PostgreSQL が型付きパラメータとして
+  `42883` にする比較が暗黙変換で通りうる（D 既知の制限のとおり）
+- `Ledgered` 構成（`--require-operation-id`）では、本体の書き込みを `23502` で拒否する（副作用ゼロ）。
+  実行器が構成の台帳モードを直接参照するため、外側の operation_id を本体の書き込みへ引き継いで成功させる
+  配線は、外側の operation_id を持つ入口（#2218 の呼び出し位置・#2228 の `DO`）と一緒に入れる
+
+### 後続への引き継ぎ
+
+- #2217: `LANGUAGE plpgsql` の結線で `PlCallOptions::may_write` を属性と `Body::may_write` から決める
+- #2218／#2228: 入口の呼び出し・複数文メッセージの分類（関数呼び出しを含む文の保守的な書き込み扱い）・
+  外側 operation_id の引き継ぎ。トリガ関数の `TriggerWriteHandle` 経由の経路（#2228）は、文の実行を
+  `CorePlHost::run_tokens` の 1 か所に集めてあるので、そこへ分岐を足す
+- #2229: 越境マトリクス・crash-test
+

@@ -9,7 +9,8 @@
 //!
 //! 実行側（Issue #2225）: [`interp`] が AST を辿る木構造インタプリタ（変数環境・制御フロー・
 //! 実行予算）、[`host`] がインタプリタと外界（式の評価・SQL 実行・型解決）の境界トレイト、
-//! [`value`] が代入時の型変換。SQL・式の評価は [`host::PlHost`] 経由で、core の実装は #2226。
+//! [`value`] が代入時の型変換。SQL・式の評価は [`host::PlHost`] 経由で、core の実装は
+//! `core::plpgsql_host`（Issue #2226）。[`subst`] は変数・`USING` の値を型付きトークンへ置換する純粋関数。
 
 pub(crate) mod ast;
 pub(crate) mod embedded;
@@ -19,6 +20,9 @@ pub(crate) mod interp;
 mod interp_tests;
 mod lexer;
 mod parser;
+pub(crate) mod subst;
+#[cfg(test)]
+mod subst_tests;
 #[cfg(test)]
 mod tests;
 pub(crate) mod value;

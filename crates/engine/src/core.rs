@@ -98,6 +98,12 @@ mod dml_subquery_exec_tests;
 mod plpgsql_validate;
 #[cfg(test)]
 mod plpgsql_validate_tests;
+// PL/pgSQL 本体の SQL を同じ Tx・同じ RLS で実行する `PlHost` 実装（Issue #2226・SQL-68）。
+// 呼び出し元は #2217／#2218／#2228 が結線するまでテストだけ。
+#[allow(dead_code)]
+mod plpgsql_host;
+#[cfg(test)]
+mod plpgsql_host_tests;
 // BEFORE ROW INSERT トリガの発火の結合テスト（TABLE-45・Issue #1723）。
 #[cfg(test)]
 mod trigger_insert_tests;

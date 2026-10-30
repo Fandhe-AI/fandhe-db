@@ -1,0 +1,760 @@
+//! `core/plpgsql_host.rs` の結合テスト（Issue #2226・SQL-68。ADR D3・D5・D6・D8）。
+//!
+//! `parse_body` → `validate_embedded` → `run_plpgsql_*` の順で、本物の `EngineCore`（許可リスト解析・
+//! 実行本体・RLS）に対して本体の SQL を実行する。同一 Tx でのコミット／ロールバック、`FOUND`／
+//! `ROW_COUNT` の実測値、既存上限、テナント境界、インジェクション、台帳・揮発性ゲートを固定する。
+
+use super::plpgsql_host::{PlCallOptions, PlInvocation};
+use super::EngineCore;
+use crate::catalog::{ColumnDef, ColumnType, TableSchema};
+use crate::kernel::CpuScalarProvider;
+use crate::plpgsql::ast::{ParamDecl, ParseOptions, ReturnShape};
+use crate::plpgsql::embedded::validate_embedded;
+use crate::plpgsql::host::PlScalar;
+use crate::plpgsql::interp::{CallOutcome, ReturnSpec};
+use crate::plpgsql::parse_body;
+use crate::policy::PolicyContext;
+use crate::recovery::required_op_id::LedgerMode;
+use crate::sql::allowlist::SqlSurfaceError;
+use crate::sql::ddl_column_type::SqlColumnTypeName;
+use crate::sql::exec::Cell;
+use crate::sql::mode::SessionState;
+use crate::sql::transaction::SessionTransaction;
+use crate::sql::SqlOutcome;
+use crate::storage::{Storage, Visibility};
+use crate::test_util::temp_db::{unique_db_path, CleanupGuard};
+
+fn new_core(mode: LedgerMode) -> (EngineCore, CleanupGuard) {
+    let path = unique_db_path("plpgsql-host");
+    let storage = Storage::open(&path).expect("open storage");
+    storage
+        .create_table(&TableSchema::new(
+            "docs",
+            vec![
+                ColumnDef::new("embedding", ColumnType::Vector(2), false),
+                ColumnDef::new("lang", ColumnType::Text, false),
+                ColumnDef::new("n", ColumnType::Integer, true),
+            ],
+        ))
+        .expect("create table");
+    (
+        EngineCore::from_storage(storage, Box::new(CpuScalarProvider)).with_ledger_mode(mode),
+        CleanupGuard(path),
+    )
+}
+
+fn ctx(tenant: &str) -> PolicyContext {
+    PolicyContext::with_visibilities(tenant, [Visibility::Public, Visibility::Private])
+        .expect("valid tenant")
+}
+
+fn sql(core: &EngineCore, c: &PolicyContext, s: &str) -> Result<SqlOutcome, SqlSurfaceError> {
+    let mut session = SessionState::default();
+    core.execute_sql_in_session(c, &mut session, s)
+}
+
+fn count(core: &EngineCore, c: &PolicyContext) -> u64 {
+    let SqlOutcome::Query(q) = sql(core, c, "SELECT COUNT(*) FROM docs").expect("count") else {
+        panic!("expected query");
+    };
+    match q.rows[0].cells[0] {
+        Cell::Integer(v) => v,
+        ref o => panic!("unexpected {o:?}"),
+    }
+}
+
+fn seed(core: &EngineCore, c: &PolicyContext, ids: &[u64], lang: &str) {
+    for id in ids {
+        sql(
+            core,
+            c,
+            &format!(
+                "INSERT INTO docs (id, embedding, lang, n) VALUES ({id}, '[0.1,0.2]', '{lang}', 0)"
+            ),
+        )
+        .expect("seed");
+    }
+}
+
+fn int(i: i64) -> PlScalar {
+    PlScalar::new(Cell::SignedInteger(i), ColumnType::Integer)
+}
+
+fn text(s: &str) -> PlScalar {
+    PlScalar::new(Cell::Text(s.to_string()), ColumnType::Text)
+}
+
+const WRITE: PlCallOptions = PlCallOptions { may_write: true };
+
+/// 戻り値の整数（`Integer`／`BigInt` のセル）。
+fn as_i64(out: &CallOutcome) -> i64 {
+    match out {
+        CallOutcome::Scalar(PlScalar {
+            cell: Cell::SignedInteger(i),
+            ..
+        }) => *i,
+        CallOutcome::Scalar(PlScalar {
+            cell: Cell::Integer(u),
+            ..
+        }) => i64::try_from(*u).expect("fits"),
+        other => panic!("expected an integer, got {other:?}"),
+    }
+}
+
+struct Call<'a> {
+    src: &'a str,
+    params: Vec<(&'a str, SqlColumnTypeName)>,
+    args: Vec<PlScalar>,
+    shape: ReturnShape,
+    ty: Option<ColumnType>,
+    opts: PlCallOptions,
+}
+
+fn call<'a>(src: &'a str) -> Call<'a> {
+    Call {
+        src,
+        params: Vec::new(),
+        args: Vec::new(),
+        shape: ReturnShape::Scalar,
+        ty: Some(ColumnType::Integer),
+        opts: WRITE,
+    }
+}
+
+impl<'a> Call<'a> {
+    fn param(mut self, name: &'a str, ty: SqlColumnTypeName, arg: PlScalar) -> Self {
+        self.params.push((name, ty));
+        self.args.push(arg);
+        self
+    }
+
+    fn set_of(mut self, ty: ColumnType) -> Self {
+        self.shape = ReturnShape::SetOf;
+        self.ty = Some(ty);
+        self
+    }
+
+    fn read_only(mut self) -> Self {
+        self.opts = PlCallOptions { may_write: false };
+        self
+    }
+
+    fn prepared(&self, core: &EngineCore) -> (crate::plpgsql::Body, ReturnSpec) {
+        let opts = ParseOptions::new(
+            self.params
+                .iter()
+                .map(|(n, t)| ParamDecl {
+                    name: Some((*n).to_string()),
+                    ty: t.clone(),
+                })
+                .collect(),
+            self.shape,
+        );
+        let mut body = parse_body(self.src, &opts).expect("parse body");
+        validate_embedded(&mut body, core).expect("validate body");
+        (
+            body,
+            ReturnSpec {
+                shape: self.shape,
+                ty: self.ty.clone(),
+            },
+        )
+    }
+
+    /// 開いている Tx（明示・暗黙）へ参加して実行する。
+    fn in_txn<'e>(
+        &self,
+        core: &'e EngineCore,
+        c: &PolicyContext,
+        s: &mut SessionState,
+        txn: &mut SessionTransaction<'e>,
+    ) -> Result<CallOutcome, SqlSurfaceError> {
+        let (body, ret) = self.prepared(core);
+        core.run_plpgsql_in_txn(
+            c,
+            s,
+            txn,
+            PlInvocation {
+                body: &body,
+                args: self.args.clone(),
+                ret: &ret,
+                opts: self.opts,
+            },
+        )
+    }
+
+    /// autocommit の入口で実行する。
+    fn autocommit(
+        &self,
+        core: &EngineCore,
+        c: &PolicyContext,
+    ) -> Result<CallOutcome, SqlSurfaceError> {
+        let (body, ret) = self.prepared(core);
+        let mut s = SessionState::default();
+        let mut txn = core.new_session_transaction();
+        core.run_plpgsql_autocommit(
+            c,
+            &mut s,
+            &mut txn,
+            PlInvocation {
+                body: &body,
+                args: self.args.clone(),
+                ret: &ret,
+                opts: self.opts,
+            },
+        )
+    }
+}
+
+const INSERT_P: &str =
+    "INSERT INTO docs (id, embedding, lang, n) VALUES (p, '[0.1,0.2]', 'body', 7)";
+
+// ---- 受入基準: 呼び出し元と一緒にコミット／ロールバックされる ----
+
+#[test]
+fn body_dml_rolls_back_and_commits_with_the_caller_transaction() {
+    let (core, _g) = new_core(LedgerMode::Optional);
+    let c = ctx("t1");
+    let mut s = SessionState::default();
+    let mut txn = core.new_session_transaction();
+    core.execute_sql_in_txn(&c, &mut s, &mut txn, "BEGIN")
+        .expect("begin");
+    core.execute_sql_in_txn(
+        &c,
+        &mut s,
+        &mut txn,
+        "INSERT INTO docs (id, embedding, lang, n) VALUES (1, '[0.1,0.2]', 'outer', 1)",
+    )
+    .expect("outer insert");
+    let src = format!("BEGIN {INSERT_P}; UPDATE docs SET n = p WHERE id = 1; RETURN 1; END");
+    let out = call(&src)
+        .param("p", SqlColumnTypeName::Integer, int(2))
+        .in_txn(&core, &c, &mut s, &mut txn)
+        .expect("body");
+    assert_eq!(as_i64(&out), 1);
+    core.execute_sql_in_txn(&c, &mut s, &mut txn, "ROLLBACK")
+        .expect("rollback");
+    assert_eq!(count(&core, &c), 0, "outer and body rows both rolled back");
+
+    core.execute_sql_in_txn(&c, &mut s, &mut txn, "BEGIN")
+        .expect("begin");
+    core.execute_sql_in_txn(
+        &c,
+        &mut s,
+        &mut txn,
+        "INSERT INTO docs (id, embedding, lang, n) VALUES (1, '[0.1,0.2]', 'outer', 1)",
+    )
+    .expect("outer insert");
+    call(&src)
+        .param("p", SqlColumnTypeName::Integer, int(2))
+        .in_txn(&core, &c, &mut s, &mut txn)
+        .expect("body");
+    core.execute_sql_in_txn(&c, &mut s, &mut txn, "COMMIT")
+        .expect("commit");
+    // 別セッションから外側・本体の両方が見える。
+    assert_eq!(count(&core, &c), 2);
+}
+
+#[test]
+fn body_error_fails_the_explicit_transaction() {
+    let (core, _g) = new_core(LedgerMode::Optional);
+    let c = ctx("t1");
+    let mut s = SessionState::default();
+    let mut txn = core.new_session_transaction();
+    core.execute_sql_in_txn(&c, &mut s, &mut txn, "BEGIN")
+        .expect("begin");
+    let src = format!(
+        "DECLARE v int; BEGIN {INSERT_P}; SELECT n INTO STRICT v FROM docs WHERE id = 999; RETURN v; END"
+    );
+    let e = call(&src)
+        .param("p", SqlColumnTypeName::Integer, int(5))
+        .in_txn(&core, &c, &mut s, &mut txn)
+        .expect_err("STRICT without rows");
+    assert_eq!(e.wire_code(), "P0002");
+    let e = core
+        .execute_sql_in_txn(&c, &mut s, &mut txn, "SELECT COUNT(*) FROM docs")
+        .expect_err("failed transaction");
+    assert_eq!(e.wire_code(), "25P02");
+    core.execute_sql_in_txn(&c, &mut s, &mut txn, "ROLLBACK")
+        .expect("rollback");
+    assert_eq!(count(&core, &c), 0);
+}
+
+#[test]
+fn autocommit_commits_on_success_and_leaves_nothing_on_error() {
+    let (core, _g) = new_core(LedgerMode::Optional);
+    let c = ctx("t1");
+    let ok = format!("BEGIN {INSERT_P}; RETURN 1; END");
+    call(&ok)
+        .param("p", SqlColumnTypeName::Integer, int(1))
+        .autocommit(&core, &c)
+        .expect("autocommit body");
+    assert_eq!(count(&core, &c), 1);
+
+    let bad = format!("DECLARE v int; BEGIN {INSERT_P}; SELECT n INTO STRICT v FROM docs WHERE id = 999; RETURN v; END");
+    let e = call(&bad)
+        .param("p", SqlColumnTypeName::Integer, int(2))
+        .autocommit(&core, &c)
+        .expect_err("error");
+    assert_eq!(e.wire_code(), "P0002");
+    assert_eq!(count(&core, &c), 1, "the failed body left no side effect");
+    // 暗黙 Tx が残っていない（次の書き込みがゲート待ちにならない）。
+    seed(&core, &c, &[50], "after");
+    assert_eq!(count(&core, &c), 2);
+}
+
+#[test]
+fn idle_transaction_is_rejected_by_the_in_txn_entry() {
+    let (core, _g) = new_core(LedgerMode::Optional);
+    let c = ctx("t1");
+    let mut s = SessionState::default();
+    let mut txn = core.new_session_transaction();
+    let e = call("BEGIN RETURN 1; END")
+        .in_txn(&core, &c, &mut s, &mut txn)
+        .expect_err("idle");
+    assert_eq!(e.wire_code(), "XX000");
+}
+
+// ---- 同一 Tx の読み取り・FOUND・ROW_COUNT ----
+
+#[test]
+fn select_after_insert_sees_uncommitted_row() {
+    let (core, _g) = new_core(LedgerMode::Optional);
+    let c = ctx("t1");
+    let src = format!(
+        "DECLARE c bigint; BEGIN {INSERT_P}; SELECT count(*) INTO c FROM docs; RETURN c; END"
+    );
+    let out = call(&src)
+        .param("p", SqlColumnTypeName::Integer, int(1))
+        .autocommit(&core, &c)
+        .expect("body");
+    assert_eq!(as_i64(&out), 1);
+}
+
+#[test]
+fn row_count_and_found_are_measured() {
+    let (core, _g) = new_core(LedgerMode::Optional);
+    let c = ctx("t1");
+    seed(&core, &c, &[1, 2, 3], "en");
+    let out = call(
+        "DECLARE rc int; BEGIN UPDATE docs SET n = 5 WHERE lang = 'en'; GET DIAGNOSTICS rc = ROW_COUNT; RETURN rc; END",
+    )
+    .autocommit(&core, &c)
+    .expect("update");
+    assert_eq!(as_i64(&out), 3);
+    let found = call("BEGIN UPDATE docs SET n = 5 WHERE lang = 'en'; RETURN FOUND; END");
+    let found = Call {
+        ty: Some(ColumnType::Boolean),
+        ..found
+    };
+    let out = found.autocommit(&core, &c).expect("found");
+    assert!(matches!(
+        out,
+        CallOutcome::Scalar(PlScalar {
+            cell: Cell::Bool(true),
+            ..
+        })
+    ));
+    let none = Call {
+        ty: Some(ColumnType::Boolean),
+        ..call("BEGIN UPDATE docs SET n = 5 WHERE lang = 'zz'; RETURN FOUND; END")
+    };
+    let out = none.autocommit(&core, &c).expect("no rows");
+    assert!(matches!(
+        out,
+        CallOutcome::Scalar(PlScalar {
+            cell: Cell::Bool(false),
+            ..
+        })
+    ));
+}
+
+#[test]
+fn select_into_without_rows_clears_found_and_perform_counts_rows() {
+    let (core, _g) = new_core(LedgerMode::Optional);
+    let c = ctx("t1");
+    seed(&core, &c, &[1, 2], "en");
+    let src = "DECLARE v int; rc int; BEGIN \
+        SELECT n INTO v FROM docs WHERE id = 999; \
+        IF FOUND THEN RETURN -1; END IF; \
+        PERFORM 1 FROM docs WHERE lang = 'en'; \
+        GET DIAGNOSTICS rc = ROW_COUNT; RETURN rc; END";
+    let out = call(src).autocommit(&core, &c).expect("body");
+    assert_eq!(as_i64(&out), 2);
+}
+
+#[test]
+fn delete_returning_into_is_strict_about_multiple_rows() {
+    let (core, _g) = new_core(LedgerMode::Optional);
+    let c = ctx("t1");
+    seed(&core, &c, &[1, 2], "en");
+    let e = call(
+        "DECLARE v int; BEGIN DELETE FROM docs WHERE lang = 'en' RETURNING n INTO v; RETURN v; END",
+    )
+    .autocommit(&core, &c)
+    .expect_err("two rows");
+    assert_eq!(e.wire_code(), "P0003");
+    assert_eq!(count(&core, &c), 2, "rolled back");
+    let out = call(
+        "DECLARE v int; BEGIN DELETE FROM docs WHERE id = 1 RETURNING n INTO v; RETURN v; END",
+    )
+    .autocommit(&core, &c)
+    .expect("one row");
+    assert_eq!(as_i64(&out), 0);
+    assert_eq!(count(&core, &c), 1);
+}
+
+#[test]
+fn for_query_and_return_query_iterate_rows() {
+    let (core, _g) = new_core(LedgerMode::Optional);
+    let c = ctx("t1");
+    seed(&core, &c, &[1, 2, 3], "en");
+    let out = call(
+        "DECLARE total int := 0; r record; BEGIN \
+         FOR r IN SELECT n FROM docs LIMIT 10 LOOP total := total + 1; END LOOP; RETURN total; END",
+    )
+    .autocommit(&core, &c)
+    .expect("for");
+    assert_eq!(as_i64(&out), 3);
+    let out = call("BEGIN RETURN QUERY SELECT id FROM docs LIMIT 10; END")
+        .set_of(ColumnType::BigInt)
+        .autocommit(&core, &c)
+        .expect("return query");
+    let CallOutcome::Rows(rows) = out else {
+        panic!("expected rows");
+    };
+    assert_eq!(rows.len(), 3);
+}
+
+#[test]
+fn select_item_bare_keeps_the_output_column_name() {
+    let (core, _g) = new_core(LedgerMode::Optional);
+    let c = ctx("t1");
+    seed(&core, &c, &[1], "en");
+    let src = "DECLARE tag text := 'zz'; t text; r record; BEGIN \
+        FOR r IN SELECT tag FROM docs LIMIT 10 LOOP t := r.tag; END LOOP; \
+        RETURN t; END";
+    let out = Call {
+        ty: Some(ColumnType::Text),
+        ..call(src)
+    }
+    .autocommit(&core, &c)
+    .expect("body");
+    assert!(
+        matches!(out, CallOutcome::Scalar(PlScalar { cell: Cell::Text(ref s), .. }) if s == "zz")
+    );
+}
+
+// ---- 既存上限 ----
+
+#[test]
+fn result_row_limit_applies_inside_the_body() {
+    let (core, _g) = new_core(LedgerMode::Optional);
+    let core = core.with_result_limits(crate::result_limits::ResultLimits::new(2));
+    let c = ctx("t1");
+    seed(&core, &c, &[1, 2, 3], "en");
+    let e = call("BEGIN RETURN QUERY SELECT id FROM docs LIMIT 10; END")
+        .set_of(ColumnType::BigInt)
+        .autocommit(&core, &c)
+        .expect_err("over the row cap");
+    assert!(
+        matches!(e.wire_code(), "54000" | "54001" | "22000"),
+        "{}",
+        e.wire_code()
+    );
+}
+
+// ---- テナント境界 ----
+
+#[test]
+fn body_cannot_read_or_update_another_tenants_rows() {
+    let (core, _g) = new_core(LedgerMode::Optional);
+    let c1 = ctx("t1");
+    let c2 = ctx("t2");
+    seed(&core, &c2, &[50], "secret");
+    let out = call(
+        "DECLARE rc int; BEGIN UPDATE docs SET n = 9 WHERE id = 50; GET DIAGNOSTICS rc = ROW_COUNT; RETURN rc; END",
+    )
+    .autocommit(&core, &c1)
+    .expect("update other tenant");
+    assert_eq!(as_i64(&out), 0);
+    let out = call("DECLARE c bigint; BEGIN SELECT count(*) INTO c FROM docs; RETURN c; END")
+        .autocommit(&core, &c1)
+        .expect("count");
+    assert_eq!(as_i64(&out), 0);
+    assert_eq!(count(&core, &c2), 1, "the other tenant's row is untouched");
+}
+
+#[test]
+fn rowtype_of_a_missing_relation_is_indistinguishable_from_an_unknown_schema() {
+    let (core, _g) = new_core(LedgerMode::Optional);
+    let c = ctx("t1");
+    let a = call("DECLARE r nosuch%ROWTYPE; BEGIN RETURN 1; END")
+        .autocommit(&core, &c)
+        .expect_err("missing table");
+    let b = call("DECLARE r other_schema.t%ROWTYPE; BEGIN RETURN 1; END")
+        .autocommit(&core, &c)
+        .expect_err("unknown schema");
+    assert_eq!(a.wire_code(), "42P01");
+    assert_eq!(b.wire_code(), "42P01");
+    assert_eq!(a.to_string(), b.to_string());
+}
+
+#[test]
+fn percent_type_resolves_a_column_type() {
+    let (core, _g) = new_core(LedgerMode::Optional);
+    let c = ctx("t1");
+    let out = call("DECLARE x docs.n%TYPE; BEGIN x := 5; RETURN x; END")
+        .autocommit(&core, &c)
+        .expect("percent type");
+    assert_eq!(as_i64(&out), 5);
+    let e = call("DECLARE x docs.nosuch%TYPE; BEGIN RETURN 1; END")
+        .autocommit(&core, &c)
+        .expect_err("missing column");
+    assert_eq!(e.wire_code(), "42703");
+}
+
+// ---- インジェクション ----
+
+#[test]
+fn text_values_are_stored_as_values_not_sql() {
+    let (core, _g) = new_core(LedgerMode::Optional);
+    let c = ctx("t1");
+    seed(&core, &c, &[1], "en");
+    let evil = "x'); DELETE FROM docs; --";
+    let src = "DECLARE t text; BEGIN \
+        INSERT INTO docs (id, embedding, lang, n) VALUES (10, '[0.1,0.2]', p, 1); \
+        SELECT lang INTO t FROM docs WHERE id = 10; RETURN t; END";
+    let out = Call {
+        ty: Some(ColumnType::Text),
+        ..call(src).param("p", SqlColumnTypeName::Text, text(evil))
+    }
+    .autocommit(&core, &c)
+    .expect("body");
+    assert!(
+        matches!(out, CallOutcome::Scalar(PlScalar { cell: Cell::Text(ref s), .. }) if s == evil)
+    );
+    assert_eq!(count(&core, &c), 2, "no table was touched");
+}
+
+#[test]
+fn execute_using_substitutes_typed_values() {
+    let (core, _g) = new_core(LedgerMode::Optional);
+    let c = ctx("t1");
+    seed(&core, &c, &[1, 2, 3], "en");
+    let src = "DECLARE rc int; BEGIN \
+        EXECUTE 'UPDATE docs SET n = $1 WHERE lang = $2' USING 9, 'en'; \
+        GET DIAGNOSTICS rc = ROW_COUNT; RETURN rc; END";
+    let out = call(src).autocommit(&core, &c).expect("execute");
+    assert_eq!(as_i64(&out), 3);
+    let evil = "DECLARE rc int; BEGIN \
+        EXECUTE 'UPDATE docs SET lang = $1 WHERE id = 1' USING 'a''; DELETE FROM docs; --'; \
+        GET DIAGNOSTICS rc = ROW_COUNT; RETURN rc; END";
+    let out = call(evil).autocommit(&core, &c).expect("execute evil");
+    assert_eq!(as_i64(&out), 1);
+    assert_eq!(count(&core, &c), 3);
+}
+
+#[test]
+fn execute_parameter_mismatch_is_a_syntax_error() {
+    let (core, _g) = new_core(LedgerMode::Optional);
+    let c = ctx("t1");
+    for src in [
+        "BEGIN EXECUTE 'UPDATE docs SET n = $1 WHERE id = $2' USING 1; RETURN 1; END",
+        "BEGIN EXECUTE 'UPDATE docs SET n = 1 WHERE id = 1' USING 1; RETURN 1; END",
+    ] {
+        let e = call(src).autocommit(&core, &c).expect_err("mismatch");
+        assert_eq!(e.wire_code(), "42601", "{src}");
+    }
+}
+
+#[test]
+fn execute_rejects_ddl_ledger_and_partitioned_clauses() {
+    let (core, _g) = new_core(LedgerMode::Optional);
+    let c = ctx("t1");
+    seed(&core, &c, &[1], "en");
+    for stmt in [
+        "DROP TABLE docs",
+        "DELETE FROM docs WHERE id = 1 USING OPERATION_ID ''op-1''",
+        "DELETE FROM docs WHERE lang = ''en'' PARTITIONED",
+        "DELETE FROM docs WHERE lang = ''en'' PARTITIONED USING OPERATION_ID ''op-2''",
+        "BEGIN",
+        "COMMIT",
+    ] {
+        let src = format!("BEGIN EXECUTE '{stmt}'; RETURN 1; END");
+        let e = call(&src).autocommit(&core, &c).expect_err(stmt);
+        assert!(
+            matches!(e.wire_code(), "0A000" | "42601" | "23502"),
+            "{stmt}: {}",
+            e.wire_code()
+        );
+    }
+    assert_eq!(count(&core, &c), 1, "nothing was executed");
+}
+
+// ---- 台帳・揮発性ゲート ----
+
+#[test]
+fn ledgered_mode_rejects_body_writes_without_side_effects() {
+    let (core, _g) = new_core(LedgerMode::Ledgered);
+    let c = ctx("t1");
+    let src = format!("BEGIN {INSERT_P}; RETURN 1; END");
+    let e = call(&src)
+        .param("p", SqlColumnTypeName::Integer, int(1))
+        .autocommit(&core, &c)
+        .expect_err("ledgered");
+    assert_eq!(e.wire_code(), "23502");
+    assert_eq!(count(&core, &c), 0);
+    // 読み取りは台帳の対象外。
+    call("DECLARE c bigint; BEGIN SELECT count(*) INTO c FROM docs; RETURN c; END")
+        .autocommit(&core, &c)
+        .expect("read");
+}
+
+#[test]
+fn non_volatile_body_cannot_write() {
+    let (core, _g) = new_core(LedgerMode::Optional);
+    let c = ctx("t1");
+    let src = format!("BEGIN {INSERT_P}; RETURN 1; END");
+    let e = call(&src)
+        .param("p", SqlColumnTypeName::Integer, int(1))
+        .read_only()
+        .autocommit(&core, &c)
+        .expect_err("read only");
+    assert_eq!(e.wire_code(), "0A000");
+    assert_eq!(count(&core, &c), 0);
+    call("DECLARE c bigint; BEGIN SELECT count(*) INTO c FROM docs; RETURN c; END")
+        .read_only()
+        .autocommit(&core, &c)
+        .expect("reads are fine");
+}
+
+#[test]
+fn body_may_write_is_computed_from_the_ast() {
+    let (core, _g) = new_core(LedgerMode::Optional);
+    let prepared = |src: &str| call(src).prepared(&core).0;
+    assert!(prepared("BEGIN INSERT INTO docs (id, embedding, lang, n) VALUES (1, '[0.1,0.2]', 'a', 1); RETURN 1; END").may_write());
+    assert!(prepared("BEGIN IF 1 > 0 THEN EXECUTE 'SELECT 1'; END IF; RETURN 1; END").may_write());
+    assert!(
+        !prepared("DECLARE c bigint; BEGIN SELECT count(*) INTO c FROM docs; RETURN 1; END")
+            .may_write()
+    );
+}
+
+// ---- 変数名と列名の衝突 ----
+
+#[test]
+fn variable_named_like_a_column_is_ambiguous() {
+    let (core, _g) = new_core(LedgerMode::Optional);
+    let c = ctx("t1");
+    seed(&core, &c, &[1], "en");
+    let e = call(
+        "DECLARE n int := 0; v int; BEGIN SELECT id INTO v FROM docs WHERE n = n; RETURN 1; END",
+    )
+    .autocommit(&core, &c)
+    .expect_err("conflict");
+    assert_eq!(e.wire_code(), "42702");
+    // 表を参照しない式では衝突しない。
+    call("DECLARE n int := 2; BEGIN RETURN n + 1; END")
+        .autocommit(&core, &c)
+        .expect("no relation");
+}
+
+// ---- 条件式 ----
+
+#[test]
+fn conditions_work_for_single_comparisons_and_reject_compound_forms() {
+    let (core, _g) = new_core(LedgerMode::Optional);
+    let c = ctx("t1");
+    let out = call("BEGIN IF p > 0 THEN RETURN 1; END IF; RETURN 0; END")
+        .param("p", SqlColumnTypeName::Integer, int(3))
+        .autocommit(&core, &c)
+        .expect("if");
+    assert_eq!(as_i64(&out), 1);
+    let out =
+        call("DECLARE i int := 0; BEGIN WHILE i < 3 LOOP i := i + 1; END LOOP; RETURN i; END")
+            .autocommit(&core, &c)
+            .expect("while");
+    assert_eq!(as_i64(&out), 3);
+    let out = call(
+        "DECLARE i int := 0; BEGIN LOOP i := i + 1; EXIT WHEN i >= 2; END LOOP; RETURN i; END",
+    )
+    .autocommit(&core, &c)
+    .expect("exit when");
+    assert_eq!(as_i64(&out), 2);
+    let e = call("BEGIN IF p > 0 AND p < 10 THEN RETURN 1; END IF; RETURN 0; END")
+        .param("p", SqlColumnTypeName::Integer, int(3))
+        .autocommit(&core, &c)
+        .expect_err("compound");
+    assert_eq!(e.wire_code(), "0A000");
+}
+
+// ---- 値の型ごとの置換（NULL・文字列・真偽値） ----
+
+#[test]
+fn null_text_and_bool_variables_substitute_in_every_position() {
+    let (core, _g) = new_core(LedgerMode::Optional);
+    let c = ctx("t1");
+    seed(&core, &c, &[1, 2], "en");
+    // NULL との比較は 0 行（`WHERE` の右辺）。
+    let out = call(
+        "DECLARE c bigint; BEGIN SELECT count(*) INTO c FROM docs WHERE lang = p; RETURN c; END",
+    )
+    .param(
+        "p",
+        SqlColumnTypeName::Text,
+        PlScalar::null(ColumnType::Text),
+    )
+    .autocommit(&core, &c)
+    .expect("null in where");
+    assert_eq!(as_i64(&out), 0);
+    // 文字列の等価比較（左右どちらの位置でも）。
+    let out = call(
+        "DECLARE c bigint; BEGIN SELECT count(*) INTO c FROM docs WHERE p = lang; RETURN c; END",
+    )
+    .param("p", SqlColumnTypeName::Text, text("en"))
+    .autocommit(&core, &c)
+    .expect("text on the left");
+    assert_eq!(as_i64(&out), 2);
+    // 投影項目の NULL・真偽値・文字列は別名つきの式になる。
+    let src = "DECLARE r record; k int := 0; BEGIN \
+        FOR r IN SELECT p, flag, q FROM docs LIMIT 10 LOOP k := k + 1; END LOOP; RETURN k; END";
+    let out = call(src)
+        .param(
+            "p",
+            SqlColumnTypeName::Text,
+            PlScalar::null(ColumnType::Text),
+        )
+        .param(
+            "flag",
+            SqlColumnTypeName::Boolean,
+            PlScalar::new(Cell::Bool(true), ColumnType::Boolean),
+        )
+        .param("q", SqlColumnTypeName::Text, text("it's"))
+        .autocommit(&core, &c)
+        .expect("select items");
+    assert_eq!(as_i64(&out), 2);
+}
+
+#[test]
+fn expressions_over_variables_are_evaluated_by_the_sql_surface() {
+    let (core, _g) = new_core(LedgerMode::Optional);
+    let c = ctx("t1");
+    let out = call("BEGIN RETURN p * 2 + 1; END")
+        .param("p", SqlColumnTypeName::Integer, int(-4))
+        .autocommit(&core, &c)
+        .expect("arithmetic");
+    assert_eq!(as_i64(&out), -7);
+    let out = call("BEGIN RETURN p; END")
+        .param("p", SqlColumnTypeName::Integer, int(-4))
+        .autocommit(&core, &c)
+        .expect("direct");
+    assert_eq!(as_i64(&out), -4);
+    // 単純形 CASE 文の比較は values_equal 経由。
+    let out = call(
+        "DECLARE a int := 2; BEGIN CASE a WHEN 1 THEN RETURN 10; WHEN 2, 3 THEN RETURN 20; ELSE RETURN 0; END CASE; END",
+    )
+    .autocommit(&core, &c)
+    .expect("simple case");
+    assert_eq!(as_i64(&out), 20);
+}

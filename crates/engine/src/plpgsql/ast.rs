@@ -441,3 +441,39 @@ pub(crate) struct Body {
     pub(crate) block: Block,
     pub(crate) vars: Vec<VarDecl>,
 }
+
+impl Body {
+    /// 本体がデータを書き得るか（Issue #2226・ADR D5）。書き込みを含む埋め込み SQL
+    /// （`EmbeddedSql::writes`）または `EXECUTE`（動的 SQL は静的に判定できないため保守的に書き得る
+    /// とみなす）を含めば真。入れ子のブロック・分岐・ループを辿る。呼び出し元（#2217 が揮発性属性と
+    /// 組み合わせて `PlCallOptions::may_write` を決める）が事前の経路決定に使う。
+    pub(crate) fn may_write(&self) -> bool {
+        fn any_write(stmts: &[Stmt]) -> bool {
+            stmts.iter().any(|s| match s {
+                Stmt::Block(b) => any_write(&b.stmts),
+                Stmt::If { branches, else_ } => {
+                    branches.iter().any(|(_, st)| any_write(st))
+                        || else_.as_deref().is_some_and(any_write)
+                }
+                Stmt::Case { whens, else_, .. } => {
+                    whens.iter().any(|(_, st)| any_write(st))
+                        || else_.as_deref().is_some_and(any_write)
+                }
+                Stmt::Loop { body, .. } | Stmt::While { body, .. } | Stmt::ForInt { body, .. } => {
+                    any_write(body)
+                }
+                Stmt::ForQuery { query, body, .. } => query.writes || any_write(body),
+                Stmt::ReturnQuery(q) | Stmt::Perform(q) | Stmt::Sql(q) => q.writes,
+                Stmt::Execute { .. } => true,
+                Stmt::Assign { .. }
+                | Stmt::Exit { .. }
+                | Stmt::Continue { .. }
+                | Stmt::Return(_)
+                | Stmt::ReturnNext(_)
+                | Stmt::GetDiagnostics { .. }
+                | Stmt::Null => false,
+            })
+        }
+        any_write(&self.block.stmts)
+    }
+}
