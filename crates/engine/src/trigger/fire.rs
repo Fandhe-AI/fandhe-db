@@ -1,14 +1,19 @@
-//! BEFORE ROW トリガの連鎖実行（TABLE-45・Issue #1723）。
+//! BEFORE ROW・AFTER ROW トリガの実行（TABLE-45・Issue #1723・#1724）。
 //!
 //! `tenant/trigger_insert.rs` が行ごとに呼ぶ。カタログ順（名前のバイト順）に各トリガの関数を
 //! [`TriggerFunctionInvoker`](super::call::TriggerFunctionInvoker) 経由で呼び、前のトリガが返した行を
 //! 次のトリガの NEW とする。`NULL` 返却（[`TriggerOutcome::Skip`]）はその行の残りのトリガを呼ばずに終える。
 //! 呼び出し元は redb の表ハンドルを 1 つも開かずに呼ぶこと（トリガ本体が同じ write txn へ再入しても
 //! 排他を壊さない。実行モデルの D5）。
+//!
+//! AFTER ROW は文の終わりに、書いた行ごと・トリガ名のバイト順に呼ぶ（[`fire_after_row_insert`]）。
+//! 戻り値は無視し（実行モデルの D3）、他表への書き込みは
+//! [`TriggerWriteHandle`](super::write_handle::TriggerWriteHandle) 経由で行う。
 
 use super::call::{TriggerCall, TriggerOutcome};
 use super::runtime::TriggerRuntime;
-use crate::catalog::trigger::TriggerDef;
+use super::write_handle::TriggerWriteHandle;
+use crate::catalog::trigger::{TriggerDef, TriggerTiming};
 use crate::catalog::{ColumnType, TableSchema};
 use crate::row_codec::Value;
 use crate::sql::allowlist::SqlSurfaceError;
@@ -56,6 +61,7 @@ pub(crate) fn check_returned_row(
 /// `Ok(None)` はその行の挿入をやめる（`NULL` 返却）、`Ok(Some(row))` は書き込む最終行。
 pub(crate) fn fire_before_row_insert(
     runtime: &TriggerRuntime,
+    writes: &TriggerWriteHandle<'_>,
     table: &str,
     schema: &TableSchema,
     triggers: &[TriggerDef],
@@ -77,6 +83,8 @@ pub(crate) fn fire_before_row_insert(
             schema,
             new_row: &row,
             args: &trigger.tg_args,
+            timing: TriggerTiming::Before,
+            writes,
         })?;
         match outcome {
             TriggerOutcome::Skip => return Ok(None),
@@ -87,4 +95,37 @@ pub(crate) fn fire_before_row_insert(
         }
     }
     Ok(Some(row))
+}
+
+/// `triggers`（INSERT・AFTER・ROW のみ。カタログ順）を、書いた 1 行の最終 NEW に対して順に発火する
+/// （Issue #1724）。戻り値（`Proceed`・`Skip`）は無視し、返却行の構造も検査しない（実行モデルの D3）。
+/// エラーは [`SqlSurfaceError`] のまま返し、呼び出し側（`tenant/trigger_insert.rs`）が文全体を
+/// 失敗させる。呼び出し元は redb の表ハンドルを 1 つも開かずに呼ぶこと。
+pub(crate) fn fire_after_row_insert(
+    runtime: &TriggerRuntime,
+    writes: &TriggerWriteHandle<'_>,
+    table: &str,
+    schema: &TableSchema,
+    triggers: &[TriggerDef],
+    new_row: &[Value],
+) -> Result<(), SqlSurfaceError> {
+    for trigger in triggers {
+        crate::interrupt::check()?;
+        if trigger.when_sql.is_some() {
+            return Err(SqlSurfaceError::FeatureNotSupported {
+                detail: WHEN_UNSUPPORTED.to_string(),
+            });
+        }
+        let _ignored = runtime.invoker().invoke(&TriggerCall {
+            trigger_name: &trigger.name,
+            function_key: &trigger.function_key,
+            table,
+            schema,
+            new_row,
+            args: &trigger.tg_args,
+            timing: TriggerTiming::After,
+            writes,
+        })?;
+    }
+    Ok(())
 }

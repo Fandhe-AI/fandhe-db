@@ -101,6 +101,9 @@ mod plpgsql_validate_tests;
 // BEFORE ROW INSERT トリガの発火の結合テスト（TABLE-45・Issue #1723）。
 #[cfg(test)]
 mod trigger_insert_tests;
+// AFTER ROW INSERT トリガの発火の結合テスト（TABLE-45・Issue #1724）。
+#[cfg(test)]
+mod trigger_after_insert_tests;
 
 /// 検索 `k` の上限（直接 Rust API 用）。明示 `LIMIT` の既定値と同値だが、SQL／NoSQL の
 /// `LIMIT` 範囲は起動時設定（`result_limits::ResultLimits`。Issue #1555）が決め、本定数は
@@ -7465,6 +7468,9 @@ impl EngineCore {
                     detail: "internal error".to_string(),
                 })?;
                 let target = crate::tenant::WriteTarget::InTxn(write_txn);
+                // AFTER ROW トリガが書いた表も COMMIT 時の遅延 FK 検査の対象にする（Issue #1724）。
+                let trigger_scope =
+                    crate::tenant::trigger_writes::TriggerWrittenTablesScope::enter();
                 let outcome = if stmt.returning.is_some() {
                     crate::sql::SqlOutcome::Returning(
                         self.execute_insert_returning_form(target, ctx, stmt, &lookup)?,
@@ -7475,6 +7481,9 @@ impl EngineCore {
                     )
                 };
                 txn.mark_written(ctx.tenant_id(), &stmt.table_name);
+                for table in trigger_scope.take() {
+                    txn.mark_written(ctx.tenant_id(), &table);
+                }
                 Ok(outcome)
             }
             // ビューへの INSERT（TABLE-43・Issue #1671）。基表形へ書き換えて同じフォーム関数へ
@@ -7713,6 +7722,9 @@ impl EngineCore {
                 let write_txn = txn.write_txn().ok_or_else(|| SqlSurfaceError::Internal {
                     detail: "internal error".to_string(),
                 })?;
+                // AFTER ROW トリガが書いた表も COMMIT 時の遅延 FK 検査の対象にする（Issue #1724）。
+                let trigger_scope =
+                    crate::tenant::trigger_writes::TriggerWrittenTablesScope::enter();
                 let outcome = self.execute_parsed_insert_select(
                     crate::core::insert_select_exec::InsertSelectTxn::InTxn(write_txn),
                     ctx,
@@ -7720,6 +7732,9 @@ impl EngineCore {
                     stmt,
                 )?;
                 txn.mark_written(ctx.tenant_id(), &stmt.table_name);
+                for table in trigger_scope.take() {
+                    txn.mark_written(ctx.tenant_id(), &table);
+                }
                 Ok(outcome)
             }
             // 拡張クエリの `COPY` は wire-server が先に横取りする（Issue #1760）ため通常は到達しない。
