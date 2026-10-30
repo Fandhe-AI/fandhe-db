@@ -8,21 +8,20 @@
 //! （fail-closed）。呼び出し元は `plpgsql::parse_body`（#2217／#2225 が結線）。
 //! 受信データの経路なので `unwrap`／`expect`／添字アクセスを使わない。再帰は入れ子の深さ上限で有界。
 
-use std::collections::{HashMap, HashSet};
+use std::cell::RefCell;
+use std::collections::HashMap;
+use std::sync::Arc;
 
-use crate::plpgsql_limits::MAX_PLPGSQL_VARS_PER_STATEMENT;
 use crate::sql::allowlist::SqlSurfaceError;
 use crate::sql::ddl_column_type::{parse_column_type_name, SqlColumnTypeName};
 use crate::sql::lexer::{tokenize_with_params_quoted, Keyword, Token};
 
 use super::ast::{
-    AssignTarget, Block, Body, DeclType, DiagItem, EmbeddedKind, EmbeddedSql, IntoClause,
-    ParseOptions, ReturnShape, SqlExpr, Stmt, VarDecl, VarId, VarKind, VarRef,
+    lookup_qualified_in, lookup_var_in, AssignTarget, Block, Body, DeclType, DiagItem,
+    EmbeddedKind, EmbeddedSql, IntoClause, ParseOptions, ReturnShape, ScopeLevel, ScopeRef,
+    ScopeView, SqlExpr, Stmt, VarDecl, VarId, VarKind, VarRef,
 };
-use super::embedded::{
-    classify_query, classify_with, has_write_cte, is_ident_position_with, reject_forbidden_clauses,
-    split_into, IdentCtx, RawInto,
-};
+use super::embedded::{head_kind, reject_forbidden_clauses, split_into, RawInto};
 use super::lexer::{scan, TokKind};
 use super::{oos_err, syn_err, too_big_err};
 
@@ -36,205 +35,99 @@ pub(super) const RESERVED: &[&str] = &[
 pub(super) const SQL_KEYWORD_NAMES: &[&str] =
     &["select", "from", "where", "and", "order", "by", "limit"];
 
-/// 変数・パラメータ・ループ変数の名前として宣言できない語（引用付き `"..."` でも拒否する）。
+/// SQL の予約語（PostgreSQL 公開ドキュメント付録「SQL Key Words」の「reserved」列。78 語。
+/// 変数名・引数名・ループ変数名にできない。引用付き `"..."` でも拒否する）。`true`・`false`・`null` を含む。
 ///
-/// 埋め込み SQL の変数参照は識別子トークンの位置判定で解決するため、SQL 側が「キーワード」または
-/// 「文脈キーワード」として扱う語と同名の変数を許すと、`IF 1 IS NULL` の `IS`・`UPDATE t SET x = 1` の
-/// `SET`・`IF true` の `true` が変数参照に読み替わり、正しい本体を拒否・誤実行しうる。位置の
-/// ヒューリスティックで 1 語ずつ塞がず、次の和集合を宣言時に `0A000` で拒否する（fail-closed）。
-///
-/// - SQL 字句解析が `Token::Keyword` にする語（`select`・`from`・`where`・`and`・`order`・`by`・`limit`）
-/// - `sql/` の解析器が文脈キーワードとして文字列照合する語のうち、DML・式の文法に現れるもの
-///   （演算子語・節の語・窓／集約の語・型リテラルの語・JSON 式の節の語・`USING PLAN` の語 等）
-/// - PL/pgSQL 側（`parser`・`embedded`）が構造語として照合する語
-///
-/// 除外した語（関数名・DDL／ユーティリティ文の語・値や内部名・多相型名）の一覧と理由、および
-/// 「`sql/`・`plpgsql/` のソースから照合語を抽出し、拒否語か除外語のいずれかに必ず含まれること」を
-/// 確かめる漏れ検出テストは `plpgsql::tests::every_matched_sql_word_is_rejected_or_excluded`。
-/// 一覧は設計文書（`docs/design/plpgsql-subset.md`「未対応の変数名」）にも規則として記す。
-/// 比較は ASCII の大小を無視する。`declare`・`init_outer_scope` が参照する（ラベルは識別子位置に
-/// 現れず `lbl.name` の修飾子としてだけ使うため対象外）。
-pub(super) const UNSUPPORTED_NAMES: &[&str] = &[
-    "alias",
+/// 埋め込み SQL の変数参照は SQL 構文解析器が列参照と確定した位置だけで解決する（位置の推定は
+/// しない）ため、列・別名・型名・関数名・SET の代入先などは同名の変数があっても変数にならない。
+/// 名前を縛るのは、PostgreSQL でも宣言できない予約語（これに加えて [`RESERVED`]・[`SQL_KEYWORD_NAMES`]）
+/// だけで、SQL 側の文脈キーワードとの照合による拒否は行わない。比較は ASCII の大小を無視する。
+/// `declare`・`init_outer_scope` が参照する（ラベルは識別子位置に現れず `lbl.name` の修飾子としてだけ
+/// 使うため対象外）。
+pub(super) const SQL_RESERVED: &[&str] = &[
     "all",
+    "analyse",
+    "analyze",
     "and",
     "any",
     "array",
     "as",
     "asc",
-    "at",
-    "begin",
-    "between",
-    "breadth",
-    "by",
+    "asymmetric",
+    "both",
     "case",
     "cast",
+    "check",
     "collate",
-    "conditional",
-    "conflict",
-    "constant",
+    "column",
     "constraint",
-    "continue",
-    "cross",
-    "cube",
-    "current",
+    "create",
+    "current_catalog",
     "current_date",
+    "current_role",
     "current_time",
     "current_timestamp",
-    "cursor",
-    "cycle",
-    "date",
-    "decimal",
-    "declare",
+    "current_user",
     "default",
-    "delete",
-    "depth",
+    "deferrable",
     "desc",
-    "diagnostics",
     "distinct",
     "do",
     "else",
-    "elseif",
-    "elsif",
-    "empty",
-    "encoding",
     "end",
-    "error",
-    "escape",
     "except",
-    "exception",
-    "exclude",
-    "excluded",
-    "execute",
-    "exists",
-    "exit",
     "false",
     "fetch",
-    "filter",
-    "first",
-    "following",
     "for",
-    "format",
+    "foreign",
     "from",
-    "full",
-    "get",
+    "grant",
     "group",
-    "grouping",
-    "groups",
     "having",
-    "hint",
-    "hybrid",
-    "hybrid_rrf",
-    "if",
-    "ilike",
     "in",
-    "inner",
-    "inout",
-    "insert",
+    "initially",
     "intersect",
-    "interval",
     "into",
-    "is",
-    "join",
-    "keep",
-    "last",
     "lateral",
-    "left",
-    "like",
+    "leading",
     "limit",
-    "local",
     "localtime",
     "localtimestamp",
-    "loop",
-    "materialized",
-    "mode",
-    "natural",
-    "next",
-    "no",
     "not",
-    "nothing",
     "null",
-    "nulls",
-    "numeric",
-    "object",
     "offset",
-    "omit",
     "on",
     "only",
-    "operation_id",
     "or",
     "order",
-    "others",
-    "out",
-    "outer",
-    "over",
-    "overriding",
-    "partition",
-    "partitioned",
-    "passing",
-    "perform",
-    "plan",
-    "preceding",
-    "precision",
-    "query",
-    "quote",
-    "quotes",
-    "range",
-    "recursive",
-    "return",
+    "placing",
+    "primary",
+    "references",
     "returning",
-    "reverse",
-    "right",
-    "rollup",
-    "row",
-    "row_count",
-    "rows",
-    "scalar",
-    "scroll",
-    "search",
-    "search_mode",
     "select",
-    "set",
-    "sets",
-    "similar",
+    "session_user",
     "some",
-    "stacked",
-    "strict",
-    "string",
+    "symmetric",
+    "system_user",
     "table",
-    "tablesample",
     "then",
-    "ties",
-    "time",
-    "timestamp",
-    "timestamptz",
     "to",
+    "trailing",
     "true",
-    "unbounded",
-    "unconditional",
     "union",
-    "unknown",
-    "update",
+    "unique",
+    "user",
     "using",
-    "values",
     "variadic",
-    "varying",
     "when",
     "where",
-    "while",
     "window",
     "with",
-    "without",
-    "wrapper",
-    "zone",
 ];
 
-/// 名前が [`UNSUPPORTED_NAMES`] に含まれるなら `0A000`（エラー文言に名前は含めない）。
-fn check_supported_name(name: &str) -> Result<(), SqlSurfaceError> {
-    if UNSUPPORTED_NAMES
-        .iter()
-        .any(|w| w.eq_ignore_ascii_case(name))
-    {
+/// 名前が [`SQL_RESERVED`] に含まれるなら `0A000`（エラー文言に名前は含めない）。
+fn check_reserved_name(name: &str) -> Result<(), SqlSurfaceError> {
+    if SQL_RESERVED.iter().any(|w| w.eq_ignore_ascii_case(name)) {
         return Err(oos_err(
             "this name cannot be used for a PL/pgSQL variable or parameter",
         ));
@@ -295,12 +188,6 @@ const POLYMORPHIC: &[&str] = &[
     "anymultirange",
 ];
 
-struct Scope {
-    label: Option<String>,
-    /// 名前から変数への表。同名の再登録は後勝ち（検索のたびに全件を走査しない）。
-    names: HashMap<String, VarId>,
-}
-
 struct Ctrl {
     label: Option<String>,
     is_loop: bool,
@@ -312,9 +199,11 @@ struct Parser<'a> {
     pos: usize,
     opts: &'a ParseOptions,
     vars: Vec<VarDecl>,
-    scopes: Vec<Scope>,
+    scopes: Vec<ScopeLevel>,
     ctrl: Vec<Ctrl>,
     depth: usize,
+    /// 直近のスコープの共有ハンドル（スコープが変わるたびに破棄し、同じスコープの文どうしで共有する）。
+    snap: RefCell<Option<ScopeRef>>,
 }
 
 /// 入口。本体長はスキャンより前に検査する（無制限確保の禁止）。
@@ -332,6 +221,7 @@ pub(super) fn parse(src: &str, opts: &ParseOptions) -> Result<Body, SqlSurfaceEr
         scopes: Vec::new(),
         ctrl: Vec::new(),
         depth: 0,
+        snap: RefCell::new(None),
     };
     p.init_outer_scope()?;
     let block = p.parse_top()?;
@@ -568,7 +458,7 @@ impl<'a> Parser<'a> {
     // ---- 変数・スコープ ----
 
     fn init_outer_scope(&mut self) -> Result<(), SqlSurfaceError> {
-        let mut scope = Scope {
+        let mut scope = ScopeLevel {
             label: None,
             names: HashMap::new(),
         };
@@ -587,7 +477,7 @@ impl<'a> Parser<'a> {
                 scope_depth: 0,
             });
             if !name.is_empty() {
-                check_supported_name(&name)?;
+                check_reserved_name(&name)?;
                 scope.names.insert(name, id);
             }
         }
@@ -603,6 +493,7 @@ impl<'a> Parser<'a> {
         });
         scope.names.insert("found".to_string(), found);
         self.scopes.push(scope);
+        self.invalidate_scope();
         Ok(())
     }
 
@@ -615,7 +506,7 @@ impl<'a> Parser<'a> {
         not_null: bool,
         default: Option<SqlExpr>,
     ) -> Result<VarId, SqlSurfaceError> {
-        check_supported_name(&name)?;
+        check_reserved_name(&name)?;
         let id = VarId(
             u32::try_from(self.vars.len())
                 .map_err(|_| too_big_err("too many PL/pgSQL variables"))?,
@@ -633,6 +524,7 @@ impl<'a> Parser<'a> {
         if let Some(s) = self.scopes.last_mut() {
             s.names.insert(name, id);
         }
+        self.invalidate_scope();
         Ok(id)
     }
 
@@ -643,10 +535,26 @@ impl<'a> Parser<'a> {
     }
 
     fn lookup_var(&self, name: &str) -> Option<VarId> {
-        self.scopes
-            .iter()
-            .rev()
-            .find_map(|s| s.names.get(name).copied())
+        lookup_var_in(&self.scopes, name)
+    }
+
+    /// スコープが変わったので共有ハンドルを破棄する（`declare`・スコープの出入りが呼ぶ）。
+    fn invalidate_scope(&self) {
+        *self.snap.borrow_mut() = None;
+    }
+
+    /// 現在のスコープの共有ハンドル。同じスコープの文・式どうしで同じ `Arc` を共有する
+    /// （文ごとにスコープ全体を複製しない）。
+    fn scope_ref(&self) -> ScopeRef {
+        let mut cache = self.snap.borrow_mut();
+        if let Some(r) = cache.as_ref() {
+            return Arc::clone(r);
+        }
+        let r = Arc::new(ScopeView {
+            levels: self.scopes.clone(),
+        });
+        *cache = Some(Arc::clone(&r));
+        r
     }
 
     fn var(&self, id: VarId) -> Option<&VarDecl> {
@@ -658,30 +566,9 @@ impl<'a> Parser<'a> {
             .is_some_and(|v| matches!(v.ty, DeclType::Record | DeclType::PercentRowType { .. }))
     }
 
-    /// `qualifier.name` の解決。ラベル修飾（`lbl.var`）を先に、次にレコードのフィールド。
+    /// `qualifier.name` の解決（共有の [`lookup_qualified_in`]。ラベル修飾を先に、次にレコードのフィールド）。
     fn lookup_qualified(&self, qualifier: &str, name: &str) -> Option<VarRef> {
-        let q = qualifier.to_ascii_lowercase();
-        let n = name.to_ascii_lowercase();
-        for (idx, s) in self.scopes.iter().enumerate().rev() {
-            if s.label.as_deref() == Some(q.as_str()) {
-                if let Some(id) = s.names.get(&n) {
-                    return Some(VarRef::Var(*id));
-                }
-                // 最外ブロック（`scopes[1]`。`scopes[0]` はパラメータと `FOUND` の外側スコープ）の
-                // ラベルでも、PostgreSQL と同様にパラメータと `FOUND` を修飾参照できる。
-                if idx == 1 {
-                    if let Some(id) = self.scopes.first().and_then(|o| o.names.get(&n)) {
-                        return Some(VarRef::Var(*id));
-                    }
-                }
-            }
-        }
-        let id = self.lookup_var(&q)?;
-        if self.is_record_like(id) {
-            Some(VarRef::Field(id, n))
-        } else {
-            None
-        }
+        lookup_qualified_in(&self.scopes, &|id| self.is_record_like(id), qualifier, name)
     }
 
     /// 代入・`INTO` の対象を解決する。`CONSTANT`・`FOUND` への代入は拒否する。
@@ -708,58 +595,29 @@ impl<'a> Parser<'a> {
         Ok(target)
     }
 
-    fn resolve_refs(
-        &self,
-        tokens: &[Token],
-        quoted: &[bool],
-    ) -> Result<Vec<(usize, VarRef)>, SqlSurfaceError> {
-        let mut refs: Vec<(usize, VarRef)> = Vec::new();
-        // 関係リスト位置は文ごとに 1 回だけ求め、識別子ごとの再走査（二乗コスト）を避ける。
-        let slots = IdentCtx::new(tokens, quoted);
-        for (i, t) in tokens.iter().enumerate() {
-            match t {
-                Token::Param(n) => {
-                    let idx = usize::from(*n);
-                    if idx == 0 || idx > self.opts.params.len() {
-                        return Err(SqlSurfaceError::UndefinedParameter { param: *n });
-                    }
-                    refs.push((i, VarRef::Var(VarId(u32::from(*n) - 1))));
+    /// `$n` が引数の範囲内かを検査する（範囲外は `42P02`）。変数参照そのものの分類は、定義時に SQL 構文
+    /// 解析器の記録から行う（`embedded::validate_embedded`）ため、ここでは位置を推定しない。
+    fn check_params(&self, tokens: &[Token]) -> Result<(), SqlSurfaceError> {
+        for t in tokens {
+            if let Token::Param(n) = t {
+                let idx = usize::from(*n);
+                if idx == 0 || idx > self.opts.params.len() {
+                    return Err(SqlSurfaceError::UndefinedParameter { param: *n });
                 }
-                Token::Ident(name) if !is_ident_position_with(i, &slots) => {
-                    if let Some(id) = self.lookup_var(&name.to_ascii_lowercase()) {
-                        refs.push((i, VarRef::Var(id)));
-                    }
-                }
-                Token::QualifiedIdent { qualifier, name } if !is_ident_position_with(i, &slots) => {
-                    if let Some(r) = self.lookup_qualified(qualifier, name) {
-                        refs.push((i, r));
-                    }
-                }
-                _ => {}
             }
         }
-        // 参照する変数の種類数を数える。上限を超えた時点で打ち切る（無制限に集合を育てない）。
-        let mut distinct: HashSet<VarId> = HashSet::new();
-        for (_, r) in &refs {
-            let (VarRef::Var(id) | VarRef::Field(id, _)) = r;
-            distinct.insert(*id);
-            if distinct.len() > MAX_PLPGSQL_VARS_PER_STATEMENT {
-                return Err(too_big_err(
-                    "too many PL/pgSQL variables referenced in one statement",
-                ));
-            }
-        }
-        Ok(refs)
+        Ok(())
     }
 
     // ---- 式・SQL の構築 ----
 
     fn build_expr(&self, a: usize, b: usize, cond: bool) -> Result<SqlExpr, SqlSurfaceError> {
-        let (tokens, quoted) = sql_tokens(self.span_text(a, b)?)?;
-        let var_refs = self.resolve_refs(&tokens, &quoted)?;
+        let (tokens, _quoted) = sql_tokens(self.span_text(a, b)?)?;
+        self.check_params(&tokens)?;
         Ok(SqlExpr {
             tokens,
-            var_refs,
+            var_refs: Vec::new(),
+            scope: self.scope_ref(),
             cond,
         })
     }
@@ -800,7 +658,7 @@ impl<'a> Parser<'a> {
         allow_into: bool,
     ) -> Result<EmbeddedSql, SqlSurfaceError> {
         reject_forbidden_clauses(&text_tokens, &text_quoted)?;
-        let (tokens, quoted, raw) = split_into(text_tokens, text_quoted)?;
+        let (tokens, _quoted, raw) = split_into(text_tokens, text_quoted)?;
         if raw.is_some() && !allow_into {
             return Err(syn_err("INTO is not allowed in this PL/pgSQL statement"));
         }
@@ -808,17 +666,19 @@ impl<'a> Parser<'a> {
             Some(r) => Some(self.resolve_into(r)?),
             None => None,
         };
-        let var_refs = self.resolve_refs(&tokens, &quoted)?;
+        self.check_params(&tokens)?;
+        // 書き込みの有無（データ変更 CTE を含む）は、定義時分類が解析木から確定する。
         let writes = matches!(
             kind,
             EmbeddedKind::Insert | EmbeddedKind::Update | EmbeddedKind::Delete
-        ) || has_write_cte(&tokens, &quoted);
+        );
         Ok(EmbeddedSql {
             kind,
             tokens,
-            var_refs,
+            var_refs: Vec::new(),
             into,
             writes,
+            scope: self.scope_ref(),
         })
     }
 
@@ -875,10 +735,11 @@ impl<'a> Parser<'a> {
 
     fn parse_block(&mut self, label: Option<String>, top: bool) -> Result<Block, SqlSurfaceError> {
         self.enter()?;
-        self.scopes.push(Scope {
+        self.scopes.push(ScopeLevel {
             label: label.clone(),
             names: HashMap::new(),
         });
+        self.invalidate_scope();
         let mut decls = Vec::new();
         if self.eat_kw("DECLARE") {
             while !self.is_kw(0, "BEGIN") {
@@ -898,6 +759,7 @@ impl<'a> Parser<'a> {
         self.expect_kw("END")?;
         self.end_label(&label)?;
         self.scopes.pop();
+        self.invalidate_scope();
         self.leave();
         if top {
             if self.is_punct(0, ';') {
@@ -1275,10 +1137,11 @@ impl<'a> Parser<'a> {
             None
         };
         self.expect_kw("LOOP")?;
-        self.scopes.push(Scope {
+        self.scopes.push(ScopeLevel {
             label: label.clone(),
             names: HashMap::new(),
         });
+        self.invalidate_scope();
         let var = self.declare(
             name,
             VarKind::LoopInt,
@@ -1289,6 +1152,7 @@ impl<'a> Parser<'a> {
         )?;
         let body = self.loop_body(&label)?;
         self.scopes.pop();
+        self.invalidate_scope();
         Ok(Stmt::ForInt {
             label,
             var,
@@ -1324,15 +1188,16 @@ impl<'a> Parser<'a> {
             return Err(syn_err("malformed PL/pgSQL FOR loop"));
         }
         let tokens = strip_outer_parens(sql_tokens(self.span_text(a, e)?)?);
-        let kind = classify_query(&tokens.0, &tokens.1)?;
+        let kind = head_kind(&tokens.0, &tokens.1)?;
         let query = self.build_sql(tokens, kind, false)?;
         self.pos = e;
         self.expect_kw("LOOP")?;
         // 対象の解決は問い合わせ（外側のスコープ）の後。未宣言の単独対象は暗黙のレコード変数にする。
-        self.scopes.push(Scope {
+        self.scopes.push(ScopeLevel {
             label: label.clone(),
             names: HashMap::new(),
         });
+        self.invalidate_scope();
         let mut targets = Vec::new();
         let single = raw_targets.len() == 1;
         for (q, n) in &raw_targets {
@@ -1351,6 +1216,7 @@ impl<'a> Parser<'a> {
         }
         let body = self.loop_body(&label)?;
         self.scopes.pop();
+        self.invalidate_scope();
         Ok(Stmt::ForQuery {
             label,
             targets,
@@ -1434,7 +1300,7 @@ impl<'a> Parser<'a> {
             let e = self.find_end(a, &|_| false)?;
             // `FOR ... IN` と同じく外側の括弧を剥がす（`RETURN QUERY (SELECT ...)`）。
             let tokens = strip_outer_parens(sql_tokens(self.span_text(a, e)?)?);
-            let kind = classify_query(&tokens.0, &tokens.1)?;
+            let kind = head_kind(&tokens.0, &tokens.1)?;
             let q = self.build_sql(tokens, kind, false)?;
             self.pos = e;
             self.expect_punct(';')?;
@@ -1483,7 +1349,7 @@ impl<'a> Parser<'a> {
             "INSERT" => EmbeddedKind::Insert,
             "UPDATE" => EmbeddedKind::Update,
             "DELETE" => EmbeddedKind::Delete,
-            "WITH" => classify_with(&tokens.0, &tokens.1)?.0,
+            // `WITH` 始まりの文種・データ変更 CTE の有無は、定義時分類が解析木から確定する（仮置きは Select）。
             _ => EmbeddedKind::Select,
         };
         let q = self.build_sql(tokens, kind, true)?;

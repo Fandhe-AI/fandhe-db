@@ -5,11 +5,12 @@
 //! `pub(crate)` モジュールのため crate 内テストとして置く（結合テストからは呼べない）。
 
 use super::ast::*;
-use super::embedded::{dummy_token, is_ident_position, validate_embedded, EmbeddedSqlChecker};
+use super::embedded::{dummy_token, validate_embedded, EmbeddedSqlChecker, StructuralChecker};
 use super::lexer::{scan, TokKind};
 use super::{parse_body, ParseOptions};
 use crate::sql::allowlist::SqlSurfaceError;
 use crate::sql::ddl_column_type::SqlColumnTypeName;
+use crate::sql::embedded_unit::UnitSummary;
 use crate::sql::lexer::{tokenize, Keyword, Token};
 
 fn opts_with(returns: ReturnShape) -> ParseOptions {
@@ -54,6 +55,32 @@ fn code(src: &str) -> &'static str {
     code_with(src, &opts())
 }
 
+/// 解析して、SQL 構文解析器の記録で定義時分類まで行う（`var_refs`・文種・書き込みの有無が確定する）。
+fn classified_with(src: &str, o: &ParseOptions) -> Body {
+    let mut b = ok_with(src, o);
+    if let Err(e) = validate_embedded(&mut b, &StructuralChecker) {
+        panic!("expected classify for {src:?}, got {} ({e})", e.wire_code());
+    }
+    b
+}
+
+fn classified(src: &str) -> Body {
+    classified_with(src, &opts())
+}
+
+/// 解析は通り、定義時分類で拒否されるときの `wire_code`。
+fn classify_code_with(src: &str, o: &ParseOptions) -> &'static str {
+    let mut b = ok_with(src, o);
+    match validate_embedded(&mut b, &StructuralChecker) {
+        Ok(()) => panic!("expected classify reject for {src:?}"),
+        Err(e) => e.wire_code(),
+    }
+}
+
+fn classify_code(src: &str) -> &'static str {
+    classify_code_with(src, &opts())
+}
+
 fn vid(b: &Body, name: &str) -> VarId {
     let i = b
         .vars
@@ -83,7 +110,7 @@ fn accepts_blocks_and_declarations() {
 
 #[test]
 fn accepts_assignment_and_resolves_variables() {
-    let b = ok("DECLARE x int; BEGIN x := a + x + $1; x = 3; END");
+    let b = classified("DECLARE x int; BEGIN x := a + x + $1; x = 3; END");
     let x = vid(&b, "x");
     let a = vid(&b, "a");
     assert_eq!(a, VarId(0));
@@ -94,9 +121,18 @@ fn accepts_assignment_and_resolves_variables() {
     assert_eq!(*target, AssignTarget::Var(x));
     // `a`・`x`・`$1` の 3 参照（`$1` は引数 1 番）。
     assert_eq!(expr.var_refs.len(), 3);
-    assert_eq!(expr.var_refs[0], (0, VarRef::Var(a)));
-    assert_eq!(expr.var_refs[1], (2, VarRef::Var(x)));
-    assert_eq!(expr.var_refs[2], (4, VarRef::Var(a)));
+    assert_eq!(
+        (expr.var_refs[0].pos, &expr.var_refs[0].var),
+        (0, &VarRef::Var(a))
+    );
+    assert_eq!(
+        (expr.var_refs[1].pos, &expr.var_refs[1].var),
+        (2, &VarRef::Var(x))
+    );
+    assert_eq!(
+        (expr.var_refs[2].pos, &expr.var_refs[2].var),
+        (4, &VarRef::Var(a))
+    );
     assert_eq!(b.block.stmts.len(), 2);
 }
 
@@ -118,24 +154,32 @@ fn inner_declaration_hides_outer() {
 
 #[test]
 fn label_qualified_reference_resolves_outer_variable() {
-    let b = ok("<<o>> DECLARE x int; BEGIN DECLARE x int; BEGIN x := o.x; END; END");
+    let b = classified("<<o>> DECLARE x int; BEGIN DECLARE x int; BEGIN x := o.x; END; END");
     let Some(Stmt::Block(inner)) = b.block.stmts.first() else {
         panic!("inner block");
     };
     let Some(Stmt::Assign { expr, .. }) = inner.stmts.first() else {
         panic!("assign");
     };
-    assert_eq!(expr.var_refs, vec![(0, VarRef::Var(b.block.decls[0]))]);
+    assert_eq!(expr.var_refs.len(), 1);
+    assert_eq!(
+        (expr.var_refs[0].pos, &expr.var_refs[0].var),
+        (0, &VarRef::Var(b.block.decls[0]))
+    );
 }
 
 #[test]
 fn record_field_reference_and_target() {
-    let b = ok("DECLARE r RECORD; n int; BEGIN n := r.f; r.g := 1; END");
+    let b = classified("DECLARE r RECORD; n int; BEGIN n := r.f; r.g := 1; END");
     let r = vid(&b, "r");
     let Some(Stmt::Assign { expr, .. }) = b.block.stmts.first() else {
         panic!("assign");
     };
-    assert_eq!(expr.var_refs, vec![(0, VarRef::Field(r, "f".to_string()))]);
+    assert_eq!(expr.var_refs.len(), 1);
+    assert_eq!(
+        (expr.var_refs[0].pos, &expr.var_refs[0].var),
+        (0, &VarRef::Field(r, "f".to_string()))
+    );
     let Some(Stmt::Assign { target, .. }) = b.block.stmts.get(1) else {
         panic!("assign2");
     };
@@ -195,14 +239,16 @@ fn accepts_if_and_case() {
 
 #[test]
 fn accepts_loops() {
-    let b = ok("DECLARE s int := 0; BEGIN \
+    let b = classified(
+        "DECLARE s int := 0; BEGIN \
          <<l1>> LOOP EXIT l1 WHEN s > 3; CONTINUE WHEN s = 1; s := s + 1; END LOOP l1; \
          WHILE s < 10 LOOP s := s + 1; END LOOP; \
          FOR i IN 1..10 LOOP s := s + i; END LOOP; \
          FOR i IN REVERSE 10..1 BY 2 LOOP NULL; END LOOP; \
          <<q>> FOR rec IN SELECT id FROM t WHERE id > a LOOP s := rec.id; CONTINUE q; END LOOP q; \
-         FOR rec2 IN WITH c AS (SELECT 1) SELECT * FROM c LOOP EXIT; END LOOP; \
-         END");
+         FOR rec2 IN WITH c AS (SELECT id FROM t) SELECT id FROM c LOOP EXIT; END LOOP; \
+         END",
+    );
     assert_eq!(b.block.stmts.len(), 6);
     let Some(Stmt::ForInt {
         var, reverse, step, ..
@@ -220,7 +266,7 @@ fn accepts_loops() {
     assert!(query
         .var_refs
         .iter()
-        .any(|(_, r)| *r == VarRef::Var(VarId(0))));
+        .any(|r| r.var == VarRef::Var(VarId(0))));
     let Some(Stmt::ForInt { lower, upper, .. }) = b.block.stmts.get(2) else {
         panic!("for int 1..10");
     };
@@ -249,7 +295,8 @@ fn accepts_return_forms() {
 
 #[test]
 fn accepts_sql_statements() {
-    let b = ok("DECLARE n int; r RECORD; BEGIN \
+    let b = classified(
+        "DECLARE n int; r RECORD; BEGIN \
          SELECT count(*) INTO STRICT n FROM t; \
          SELECT id, lang INTO r FROM t LIMIT 1; \
          PERFORM 1; PERFORM f(a); \
@@ -261,7 +308,8 @@ fn accepts_sql_statements() {
          GET DIAGNOSTICS n = ROW_COUNT; \
          GET CURRENT DIAGNOSTICS n := ROW_COUNT; \
          IF FOUND THEN NULL; END IF; \
-         END");
+         END",
+    );
     let Some(Stmt::Sql(s)) = b.block.stmts.first() else {
         panic!("select into");
     };
@@ -299,52 +347,50 @@ fn accepts_sql_statements() {
 
 #[test]
 fn insert_column_list_and_update_set_target_are_not_variable_references() {
-    let b = ok("DECLARE x int; BEGIN INSERT INTO t(x) VALUES (x); UPDATE t SET x = x + 1; END");
+    let b =
+        classified("DECLARE x int; BEGIN INSERT INTO t(x) VALUES (x); UPDATE t SET x = x + 1; END");
     let Some(Stmt::Sql(ins)) = b.block.stmts.first() else {
         panic!("insert");
     };
     assert_eq!(ins.var_refs.len(), 1);
-    assert_eq!(ins.var_refs[0].0, 8);
+    assert_eq!(ins.var_refs[0].pos, 8);
     let Some(Stmt::Sql(upd)) = b.block.stmts.get(1) else {
         panic!("update");
     };
     assert_eq!(upd.var_refs.len(), 1);
-    assert_eq!(upd.var_refs[0].0, 5);
+    assert_eq!(upd.var_refs[0].pos, 5);
 }
 
 #[test]
-fn with_insert_and_cte_insert_column_lists_are_identifier_positions() {
-    for src in [
-        "DECLARE x int; BEGIN WITH c AS (SELECT 1) INSERT INTO t(x) VALUES (x); END",
-        "DECLARE x int; BEGIN WITH c AS (INSERT INTO t(x) VALUES (x) RETURNING 1) SELECT 1; END",
-    ] {
-        let b = ok(src);
-        let Some(Stmt::Sql(q)) = b.block.stmts.first() else {
-            panic!("sql");
-        };
-        assert_eq!(q.var_refs.len(), 1, "for {src:?}");
-        assert!(q.writes);
-    }
+fn data_modifying_cte_needs_the_catalog_aware_checker() {
+    // データ変更 CTE の実行形はカタログ付きの解析でしか判定できない（構造専用の解析では 0A000。
+    // core の実装での分類は `core::plpgsql_validate_tests` が確かめる）。
+    assert_eq!(
+        classify_code(
+            "BEGIN WITH c AS (DELETE FROM t WHERE q = 1 RETURNING q) SELECT q FROM c; END"
+        ),
+        "0A000"
+    );
 }
 
 #[test]
 fn return_query_and_for_query_classify_write_main_statements() {
     let o = opts_with(ReturnShape::SetOf);
-    let b = ok_with("BEGIN RETURN QUERY UPDATE t SET x = 1 RETURNING x; END", &o);
+    let b = classified_with("BEGIN RETURN QUERY UPDATE t SET x = 1 RETURNING x; END", &o);
     let Some(Stmt::ReturnQuery(q)) = b.block.stmts.first() else {
         panic!("rq");
     };
     assert!(q.writes);
     assert_eq!(q.kind, EmbeddedKind::Update);
-    let b = ok_with(
-        "BEGIN FOR r IN WITH c AS (SELECT 1) UPDATE t SET x = 1 RETURNING x LOOP NULL; END LOOP; END",
+    let b = classified_with(
+        "BEGIN FOR r IN UPDATE t SET x = 1 RETURNING x LOOP NULL; END LOOP; END",
         &opts(),
     );
     let Some(Stmt::ForQuery { query, .. }) = b.block.stmts.first() else {
         panic!("for");
     };
     assert!(query.writes);
-    let b = ok_with("BEGIN RETURN QUERY SELECT 1; END", &o);
+    let b = classified_with("BEGIN RETURN QUERY SELECT 1; END", &o);
     let Some(Stmt::ReturnQuery(q)) = b.block.stmts.first() else {
         panic!("rq");
     };
@@ -353,16 +399,6 @@ fn return_query_and_for_query_classify_write_main_statements() {
         code_with("BEGIN RETURN QUERY CREATE TABLE t(a int); END", &o),
         "42601"
     );
-}
-
-#[test]
-fn ident_position_classification() {
-    let t = tokenize("SELECT f(x) FROM x AS y").expect("tokenize");
-    // f( の f・FROM の x・AS の y は識別子位置、f( の引数 x は違う。
-    assert!(is_ident_position(&t, 1));
-    assert!(!is_ident_position(&t, 3));
-    assert!(is_ident_position(&t, 6));
-    assert!(is_ident_position(&t, 8));
 }
 
 #[test]
@@ -557,8 +593,8 @@ fn variables_per_statement_limit() {
         let sum: Vec<String> = (0..n).map(|i| format!("v{i}")).collect();
         format!("DECLARE {decls}BEGIN PERFORM {}; END", sum.join(" + "))
     };
-    ok(&build(64));
-    assert_eq!(code(&build(65)), "54000");
+    classified(&build(64));
+    assert_eq!(classify_code(&build(65)), "54000");
 }
 
 #[test]
@@ -624,60 +660,75 @@ fn error_messages_do_not_echo_body_fragments() {
     }
 }
 
-// ---- 定義時ダミー検証（モック checker） ----
+// ---- 定義時分類（モック checker で受け渡しを、実体の構造解析で分類を確かめる） ----
 
-struct Recorder(std::cell::RefCell<Vec<Vec<Token>>>);
+type Call = (usize, bool, Vec<Token>);
+
+struct Recorder(std::cell::RefCell<Vec<Call>>);
 
 impl EmbeddedSqlChecker for Recorder {
-    fn check_syntax(&self, tokens: Vec<Token>) -> Result<(), SqlSurfaceError> {
-        self.0.borrow_mut().push(tokens);
-        Ok(())
+    fn check_unit(
+        &self,
+        tokens: &[Token],
+        depth: usize,
+        is_root: bool,
+    ) -> Result<UnitSummary, SqlSurfaceError> {
+        self.0.borrow_mut().push((depth, is_root, tokens.to_vec()));
+        Ok(UnitSummary {
+            kind: crate::sql::embedded_unit::UnitKind::Select,
+            has_write_cte: false,
+        })
     }
 }
 
 struct Failing;
 
 impl EmbeddedSqlChecker for Failing {
-    fn check_syntax(&self, _tokens: Vec<Token>) -> Result<(), SqlSurfaceError> {
+    fn check_unit(
+        &self,
+        _tokens: &[Token],
+        _depth: usize,
+        _is_root: bool,
+    ) -> Result<UnitSummary, SqlSurfaceError> {
         Err(SqlSurfaceError::unsupported("mock failure"))
     }
 }
 
 #[test]
-fn dummy_validation_replaces_variables_and_params() {
-    let b = ok("DECLARE n int := 1; flag boolean; s text; BEGIN \
-         n := n + a; PERFORM flag, s, $2; END");
+fn validation_hands_every_expression_and_statement_to_the_checker() {
+    let mut b = ok("DECLARE n int := 1; flag boolean; BEGIN \
+         n := n + a; PERFORM flag; END");
     let rec = Recorder(Default::default());
-    validate_embedded(&b, &rec).expect("validate");
+    validate_embedded(&mut b, &rec).expect("validate");
     let calls = rec.0.borrow();
-    // 既定値（n := 1）・代入式・PERFORM の 3 件。
+    // 既定値（n := 1）・代入式・PERFORM の 3 件。変数は置換せず、ルート（深さ 0）として渡す。
     assert_eq!(calls.len(), 3);
     assert_eq!(
         calls[1],
-        vec![
-            Token::Keyword(Keyword::Select),
-            Token::Number("0".to_string()),
-            Token::Punct('+'),
-            Token::Number("0".to_string()),
-        ]
+        (
+            0,
+            true,
+            vec![
+                Token::Keyword(Keyword::Select),
+                Token::Ident("n".to_string()),
+                Token::Punct('+'),
+                Token::Ident("a".to_string()),
+            ]
+        )
     );
     assert_eq!(
-        calls[2],
+        calls[2].2,
         vec![
             Token::Keyword(Keyword::Select),
-            Token::Ident("false".to_string()),
-            Token::Punct(','),
-            Token::StringLiteral("0".to_string()),
-            Token::Punct(','),
-            Token::StringLiteral("0".to_string()),
+            Token::Ident("flag".to_string()),
         ]
     );
 }
 
 #[test]
-fn dummy_validation_propagates_checker_errors() {
-    let b = ok("BEGIN PERFORM 1; END");
-    let e = validate_embedded(&b, &Failing).expect_err("must fail");
+fn validation_propagates_checker_errors() {
+    let mut b = ok("BEGIN PERFORM 1; END");
+    let e = validate_embedded(&mut b, &Failing).expect_err("must fail");
     assert_eq!(e.wire_code(), "42601");
 }
 
@@ -721,76 +772,36 @@ fn parenthesized_query_for_loop_is_accepted() {
 }
 
 #[test]
-fn extended_ident_positions() {
-    let c = |s: &str, i: usize| is_ident_position(&tokenize(s).expect("tokenize"), i);
-    assert!(c("SELECT 1 FROM t x", 4));
-    assert!(c("SELECT 1 FROM t JOIN u USING (k)", 8));
-    assert!(c("DELETE FROM t USING u", 4));
-    assert!(c(
-        "INSERT INTO t VALUES (1) ON CONFLICT (k) DO UPDATE SET v = 1",
-        10
-    ));
-    assert!(c(
-        "INSERT INTO t VALUES (1) ON CONFLICT (k) DO UPDATE SET v = 1, w = 2",
-        19
-    ));
-    assert!(!c("SELECT 1 FROM t WHERE x = 1", 5));
-    let q = tokenize("SELECT 1 FROM r.items").expect("tokenize");
-    assert!(is_ident_position(&q, 3));
-}
-
-#[test]
 fn type_name_and_cte_names_are_not_variable_references() {
-    let b = ok("DECLARE text text; BEGIN PERFORM 1::text; END");
+    let b = classified("DECLARE text text; BEGIN PERFORM 1::text; END");
     let Some(Stmt::Perform(p)) = b.block.stmts.first() else {
         panic!("perform");
     };
     assert!(p.var_refs.is_empty());
-    let b = ok("DECLARE c int; BEGIN WITH c AS (SELECT 1) SELECT * FROM c INTO STRICT c; END");
+    let b = classified(
+        "DECLARE c int; BEGIN WITH c AS (SELECT q FROM u) SELECT q FROM c INTO STRICT c; END",
+    );
     let Some(Stmt::Sql(s)) = b.block.stmts.first() else {
         panic!("sql");
     };
     assert!(s.var_refs.is_empty());
-    let b = ok("DECLARE a int; BEGIN WITH c (a) AS (SELECT 1) SELECT 1 FROM c; END");
+    assert!(s.into.is_some());
+}
+
+#[test]
+fn with_statement_kind_follows_the_syntax_tree() {
+    let b = classified("BEGIN WITH c AS (SELECT q FROM u) SELECT q FROM c; END");
     let Some(Stmt::Sql(s)) = b.block.stmts.first() else {
         panic!("sql");
     };
-    assert!(s.var_refs.is_empty());
-}
-
-#[test]
-fn with_statement_kind_follows_the_main_statement() {
-    let kind = |src: &str| {
-        let b = ok(src);
-        let Some(Stmt::Sql(s)) = b.block.stmts.first() else {
-            panic!("sql");
-        };
-        (s.kind, s.writes)
-    };
-    assert_eq!(
-        kind("BEGIN WITH c AS (SELECT 1) UPDATE t SET x = 1; END"),
-        (EmbeddedKind::Update, true)
-    );
-    assert_eq!(
-        kind("BEGIN WITH c AS (SELECT 1) DELETE FROM t; END"),
-        (EmbeddedKind::Delete, true)
-    );
-    assert_eq!(
-        kind("BEGIN WITH c AS (SELECT 1) SELECT 1 FROM c; END"),
-        (EmbeddedKind::Select, false)
-    );
-    assert_eq!(
-        kind("BEGIN WITH c AS (DELETE FROM t RETURNING 1) SELECT 1 FROM c; END"),
-        (EmbeddedKind::Select, true)
-    );
-}
-
-#[test]
-fn set_column_in_select_list_does_not_hide_variables() {
-    let c = |s: &str, i: usize| is_ident_position(&tokenize(s).expect("tokenize"), i);
-    // `SELECT set, v = 1`: v は SET 代入先ではない。
-    assert!(!c("SELECT set , v = 1", 3));
-    assert!(c("UPDATE t SET v = 1 , w = 2", 7));
+    assert_eq!((s.kind, s.writes), (EmbeddedKind::Select, false));
+    // 許可リストが受理しない主文（`WITH ... UPDATE`・`WITH ... INSERT`）は定義時に 42601。
+    for src in [
+        "BEGIN WITH c AS (SELECT q FROM u) UPDATE t SET x = 1; END",
+        "BEGIN WITH c AS (SELECT q FROM u) INSERT INTO t SELECT q FROM c; END",
+    ] {
+        assert_eq!(classify_code(src), "42601", "for {src:?}");
+    }
 }
 
 #[test]
@@ -806,17 +817,12 @@ fn parenthesized_for_query_passes_validation_shape() {
 }
 #[test]
 fn expression_from_does_not_hide_variables() {
-    let b = ok("DECLARE v int; BEGIN PERFORM 1 IS DISTINCT FROM v; END");
+    let b = classified("DECLARE v int; BEGIN PERFORM substring('abc' FROM v); END");
     let Some(Stmt::Perform(p)) = b.block.stmts.first() else {
         panic!("perform");
     };
     assert_eq!(p.var_refs.len(), 1);
-    let b = ok("DECLARE v int; BEGIN PERFORM substring('abc' FROM v); END");
-    let Some(Stmt::Perform(p)) = b.block.stmts.first() else {
-        panic!("perform");
-    };
-    assert_eq!(p.var_refs.len(), 1);
-    let b = ok("DECLARE v int; BEGIN PERFORM 1 FROM t WHERE x IS NOT DISTINCT FROM v; END");
+    let b = classified("DECLARE v int; BEGIN PERFORM 1 FROM t WHERE x IS NOT DISTINCT FROM v; END");
     let Some(Stmt::Perform(p)) = b.block.stmts.first() else {
         panic!("perform");
     };
@@ -825,19 +831,23 @@ fn expression_from_does_not_hide_variables() {
 
 #[test]
 fn from_list_tables_and_aliases_are_not_variables() {
-    let c = |s: &str, i: usize| is_ident_position(&tokenize(s).expect("tokenize"), i);
-    // `SELECT 1 FROM t , u` の u、`FROM t a , u b` の b、JOIN ON 後のカンマ以降の表。
-    assert!(c("SELECT 1 FROM t , u", 5));
-    assert!(c("SELECT 1 FROM t a , u b", 7));
-    assert!(c("SELECT 1 FROM t JOIN s ON a = b , u", 11));
-    // ON 条件式・WHERE の語は変数でありうる。
-    assert!(!c("SELECT 1 FROM t JOIN s ON a = v", 9));
-    assert!(!c("SELECT 1 FROM t , u WHERE v = 1", 8));
-    let b = ok("DECLARE u int; BEGIN PERFORM 1 FROM t , u; END");
-    let Some(Stmt::Perform(p)) = b.block.stmts.first() else {
-        panic!("perform");
-    };
-    assert!(p.var_refs.is_empty());
+    // 表名・別名の位置は解析器が列参照と確定しないので、同名の変数があっても変数にならない。
+    for src in [
+        "PERFORM 1 FROM u",
+        "PERFORM 1 FROM t AS u",
+        "PERFORM 1 FROM t u WHERE u.q = 1",
+        "PERFORM t.q FROM t JOIN u ON t.k = u.k",
+    ] {
+        let b = classified(&format!("DECLARE u int; BEGIN {src}; END"));
+        assert_eq!(first_sql_refs(&b), 0, "for {src:?}");
+    }
+    // 値の位置（WHERE）は変数でありうる。
+    let b = classified(
+        "DECLARE v int; BEGIN PERFORM t.q FROM t JOIN s ON t.k = s.k WHERE t.q = v; END",
+    );
+    assert_eq!(first_sql_refs(&b), 1);
+    let b = classified("DECLARE v int; BEGIN PERFORM 1 FROM t WHERE v = 1; END");
+    assert_eq!(first_sql_refs(&b), 1);
 }
 
 #[test]
@@ -851,14 +861,6 @@ fn for_query_accepts_returning_dml_and_rejects_collate() {
 }
 
 #[test]
-fn relation_slots_do_not_swallow_value_positions() {
-    // ON 式内の left(...) 関数呼び出しは JOIN 語ではなく、後続の値位置の語は関係位置にならない。
-    let s = "SELECT 1 FROM a JOIN b ON a.x = left(b.y, 2) AND a.z = v";
-    let t = tokenize(s).expect("tokenize");
-    assert!(!is_ident_position(&t, t.len() - 1));
-}
-
-#[test]
 fn delegated_type_errors_do_not_echo_fragments() {
     let e =
         parse_body("DECLARE x float(secret_xyz); BEGIN NULL; END", &opts()).expect_err("bad type");
@@ -867,15 +869,8 @@ fn delegated_type_errors_do_not_echo_fragments() {
 }
 
 #[test]
-fn extract_field_is_ident_position() {
-    // `EXTRACT(year FROM ts)` の field は変数として置換しない。
-    let t = tokenize("SELECT EXTRACT(year FROM ts)").expect("tokenize");
-    assert!(is_ident_position(&t, 3));
-}
-
-#[test]
 fn sql_keyword_named_variable_is_rejected_at_declaration() {
-    // `limit` 等は式中で `Token::Keyword` になり参照を解決できないため、宣言時に拒否する。
+    // `limit` 等は字句解析で `Token::Keyword` になり変数参照として記録できないため、宣言時に拒否する。
     assert_eq!(
         code("DECLARE limit int := 1; BEGIN RETURN limit; END"),
         "42601"
@@ -884,14 +879,14 @@ fn sql_keyword_named_variable_is_rejected_at_declaration() {
 
 #[test]
 fn classification_is_linear_for_many_references() {
-    // 多数の変数参照を持つ式でも二乗時間にならない（事前計算した括弧情報を使う）。
-    let expr = vec!["a"; 3_000].join(" + ");
-    let t = tokenize(&format!("SELECT {expr}")).expect("tokenize");
+    // 多数の変数参照を持つ式でも解析回数は参照数に比例しない（記録は 1 回の解析で得る）。
+    let expr = vec!["a"; 200].join(" + ");
     let start = std::time::Instant::now();
-    let ctx = super::embedded::IdentCtx::new(&t, &vec![false; t.len()]);
-    for i in 0..t.len() {
-        let _ = super::embedded::is_ident_position_with(i, &ctx);
-    }
+    let b = classified(&format!("BEGIN RETURN {expr}; END"));
+    let Some(Stmt::Return(Some(e))) = b.block.stmts.first() else {
+        panic!("return");
+    };
+    assert_eq!(e.var_refs.len(), 200);
     assert!(start.elapsed().as_secs() < 5);
 }
 
@@ -907,40 +902,36 @@ fn first_sql_refs(b: &Body) -> usize {
 }
 
 #[test]
-fn ambiguous_names_are_rejected_at_declaration_with_0a000() {
-    // 構造語・リテラル語・文の語は、未引用でも引用付きでも変数名にできない。
+fn reserved_names_are_rejected_at_declaration() {
+    // PL/pgSQL の予約語は 42601、SQL の予約語（`true`・`false`・`null` を含む）は 0A000。引用付きでも同じ。
     for name in [
-        "set",
-        "into",
-        "using",
-        "values",
-        "insert",
-        "update",
-        "delete",
-        "with",
-        "get",
-        "first",
-        "next",
-        "strict",
-        "reverse",
-        "exception",
-        "operation_id",
-        "group",
-        "returning",
-        "offset",
+        "select", "from", "where", "and", "order", "by", "limit", "begin", "loop",
+    ] {
+        assert_eq!(
+            code(&format!("DECLARE {name} int; BEGIN NULL; END")),
+            "42601",
+            "for {name}"
+        );
+    }
+    for name in [
         "true",
         "false",
-        "null_",
         "default",
         "array",
         "current_date",
         "current_timestamp",
+        "user",
+        "table",
+        "all",
+        "group",
+        "returning",
+        "offset",
+        "using",
+        "into",
+        "with",
+        "window",
+        "variadic",
     ] {
-        // `null_` は許可される名前（下で受理を確認する）。
-        if name == "null_" {
-            ok(&format!("DECLARE {name} int; BEGIN NULL; END"));
-            continue;
-        }
         for decl in [name.to_string(), format!("\"{name}\"")] {
             assert_eq!(
                 code(&format!("DECLARE {decl} int; BEGIN NULL; END")),
@@ -949,49 +940,343 @@ fn ambiguous_names_are_rejected_at_declaration_with_0a000() {
             );
         }
     }
-    // 引用付きの "null" は予約語経路（42601）か 0A000 のどちらでも拒否される。
-    assert_ne!(code("DECLARE \"null\" int; BEGIN NULL; END"), "");
-    // ループ変数・ラベル・パラメータ名も同じ。
+    // ループ変数・パラメータ名も同じ。ラベルは修飾子としてだけ使うので対象外。
     assert_eq!(
-        code("BEGIN FOR set IN 1..3 LOOP NULL; END LOOP; END"),
+        code("BEGIN FOR \"table\" IN 1..3 LOOP NULL; END LOOP; END"),
         "0A000"
     );
-    assert_eq!(
-        code("BEGIN FOR \"into\" IN SELECT 1 LOOP NULL; END LOOP; END"),
-        "0A000"
-    );
-    // ラベルは修飾子としてだけ使われ識別子位置に現れないので、構造語と同名でも宣言できる。
     ok("<<values>> BEGIN NULL; END");
     let o = ParseOptions::new(
         vec![ParamDecl {
-            name: Some("Set".to_string()),
+            name: Some("User".to_string()),
             ty: SqlColumnTypeName::Integer,
         }],
         ReturnShape::Scalar,
     );
     assert_eq!(code_with("BEGIN RETURN 1; END", &o), "0A000");
     // エラー文言は名前を含めない。
-    let e = parse_body("DECLARE set int; BEGIN NULL; END", &opts()).expect_err("reject");
-    assert!(!e.to_string().to_lowercase().contains("set"), "leaked: {e}");
+    let e = parse_body("DECLARE \"user\" int; BEGIN NULL; END", &opts()).expect_err("reject");
+    assert!(
+        !e.to_string().to_lowercase().contains("user"),
+        "leaked: {e}"
+    );
 }
 
 #[test]
-fn rejected_names_keep_literals_and_clauses_literal() {
-    // 同名の変数を宣言できないので、リテラル・構造語は変数参照にならない。
-    let b = ok("BEGIN IF true THEN NULL; END IF; END");
+fn keyword_like_names_are_accepted_and_do_not_capture_syntax() {
+    // SQL 側の文脈キーワード・文の語と同名の変数も宣言できる。構文上の語は解析器が列参照と確定しない
+    // ので、変数参照にならない（PostgreSQL の予約語だけが宣言できない）。
+    let names = [
+        "set",
+        "values",
+        "insert",
+        "update",
+        "delete",
+        "is",
+        "like",
+        "ilike",
+        "between",
+        "filter",
+        "over",
+        "similar",
+        "escape",
+        "partition",
+        "range",
+        "rows",
+        "zone",
+        "time",
+        "timestamp",
+        "interval",
+        "first",
+        "next",
+        "strict",
+        "reverse",
+        "exception",
+        "operation_id",
+        "out",
+        "inout",
+        "local",
+        "exists",
+        "at",
+        "nulls",
+        "conflict",
+        "nothing",
+        "plan",
+        "mode",
+        "hybrid",
+        "partitioned",
+        "recursive",
+        "materialized",
+        "ties",
+        "preceding",
+        "following",
+        "unbounded",
+        "exclude",
+        "cube",
+        "rollup",
+        "grouping",
+        "sets",
+        "search",
+        "cycle",
+        "left",
+        "right",
+        "inner",
+        "outer",
+        "join",
+        "natural",
+        "cross",
+        "full",
+        "key",
+    ];
+    let decls: String = names.iter().map(|n| format!("{n} int; ")).collect();
+    let refs = |stmt: &str| {
+        let b = classified(&format!("DECLARE {decls} BEGIN {stmt}; END"));
+        first_sql_refs(&b)
+    };
+    assert_eq!(refs("UPDATE t SET x = 1 WHERE y IS NULL"), 0);
+    assert_eq!(refs("UPDATE t SET x = 1, y = 2 WHERE z = 'a'"), 0);
+    assert_eq!(refs("PERFORM 1 FROM t WHERE y BETWEEN 1 AND 2"), 0);
+    assert_eq!(
+        refs("PERFORM 1 FROM t WHERE y LIKE 'a%' AND z ILIKE 'b'"),
+        0
+    );
+    assert_eq!(refs("PERFORM t.q FROM t LEFT JOIN u ON t.k = u.k"), 0);
+    assert_eq!(
+        refs("PERFORM sum(y) OVER (PARTITION BY z ORDER BY w) FROM t"),
+        0
+    );
+    assert_eq!(
+        refs("PERFORM 1 FROM t WHERE EXISTS (SELECT 1 FROM u WHERE u.k = 1)"),
+        0
+    );
+    assert_eq!(
+        refs("INSERT INTO t(x) VALUES (1) ON CONFLICT (x) DO UPDATE SET x = 2"),
+        0
+    );
+    assert_eq!(
+        refs("INSERT INTO t(x) VALUES (1) ON CONFLICT (x) DO NOTHING"),
+        0
+    );
+    assert_eq!(refs("PERFORM 1::timestamp"), 0);
+    assert_eq!(refs("PERFORM q FROM t ORDER BY y NULLS FIRST"), 0);
+    assert_eq!(refs("PERFORM q FROM t UNION SELECT q FROM u"), 0);
+    // 同名の変数は値の位置では参照になる。
+    assert_eq!(refs("PERFORM 1 FROM t WHERE y = set"), 1);
+    assert_eq!(refs("UPDATE t SET x = values + insert"), 2);
+}
+
+#[test]
+fn identifier_roles_are_not_variable_references_even_with_same_named_variables() {
+    // 列リスト・別名・型名・CTE 名・SET の代入先・関数名・表名は、同名の変数があっても変数にならない。
+    let refs = |stmt: &str| {
+        let b = classified(&format!(
+            "DECLARE x int; text int; n int; BEGIN {stmt}; END"
+        ));
+        first_sql_refs(&b)
+    };
+    assert_eq!(refs("INSERT INTO t(x) VALUES (1)"), 0);
+    assert_eq!(refs("INSERT INTO t(n, x) VALUES (1, 2)"), 0);
+    assert_eq!(refs("UPDATE t SET x = 1"), 0);
+    assert_eq!(refs("UPDATE t SET (n, x) = (1, 2)"), 0);
+    assert_eq!(refs("UPDATE t SET n = 1, x = 2 WHERE n = 3"), 1);
+    assert_eq!(refs("PERFORM 1 AS x"), 0);
+    assert_eq!(refs("PERFORM 1 FROM t AS x"), 0);
+    assert_eq!(refs("PERFORM 1 FROM t x"), 0);
+    assert_eq!(refs("PERFORM 1 FROM x"), 0);
+    assert_eq!(refs("PERFORM 1::text"), 0);
+    assert_eq!(refs("PERFORM x(1) FROM t"), 0);
+    assert_eq!(refs("WITH x AS (SELECT q FROM u) SELECT q FROM x"), 0);
+    // `INSERT INTO ONLY t (x)`・`INSERT INTO t AS a (x)` は SQL 構文解析器が受理しない形（42601）で、
+    // 列リストの `x` が変数として読まれることはない。
+    for stmt in [
+        "INSERT INTO ONLY t(x) VALUES (1)",
+        "INSERT INTO t AS r(x) VALUES (1)",
+    ] {
+        assert_eq!(
+            classify_code(&format!("DECLARE x int; BEGIN {stmt}; END")),
+            "42601",
+            "for {stmt:?}"
+        );
+    }
+}
+
+#[test]
+fn expression_left_hand_sides_resolve_variables() {
+    // 左辺が式（括弧付き・演算）の `IS [NOT] NULL`・`BETWEEN`・`IN` の変数も参照になる。
+    let refs = |cond: &str| {
+        let b = classified(&format!(
+            "DECLARE v int; w int; BEGIN IF {cond} THEN NULL; END IF; END"
+        ));
+        let Some(Stmt::If { branches, .. }) = b.block.stmts.first() else {
+            panic!("if");
+        };
+        branches[0].0.var_refs.len()
+    };
+    assert_eq!(refs("v IS NULL"), 1);
+    assert_eq!(refs("(v) IS NOT NULL"), 1);
+    assert_eq!(refs("(v + 1) IS NULL"), 1);
+    assert_eq!(refs("v + w IS NOT NULL"), 2);
+    assert_eq!(refs("v BETWEEN 1 AND 5"), 1);
+    assert_eq!(refs("(v) NOT BETWEEN w AND 5"), 2);
+    assert_eq!(refs("v IN (1, 2, 3)"), 1);
+    assert_eq!(refs("(v + 1) NOT IN (1, w)"), 2);
+    assert_eq!(refs("1 IS NULL"), 0);
+    assert_eq!(refs("v > 0 AND w IS NULL"), 2);
+}
+
+#[test]
+fn column_only_positions_reject_variables_with_0a000() {
+    // 値（リテラル）を置いても構文として成立しない位置（列名がそのまま構造になる位置）。
+    for stmt in [
+        "PERFORM q FROM t WHERE v IN (SELECT q FROM u)",
+        "PERFORM DISTINCT v FROM t",
+        "PERFORM sum(1) OVER (PARTITION BY v) FROM t",
+        "PERFORM sum(1) OVER (ORDER BY v) FROM t",
+        "PERFORM q FROM t UNION SELECT v FROM u",
+        "DELETE FROM t WHERE q = 1 RETURNING v",
+        "UPDATE t SET x = 1 RETURNING v",
+        "INSERT INTO t(x) VALUES (1) RETURNING v",
+        "PERFORM count(DISTINCT v) FROM t",
+    ] {
+        assert_eq!(
+            classify_code(&format!("DECLARE v int; BEGIN {stmt}; END")),
+            "0A000",
+            "for {stmt:?}"
+        );
+    }
+    // 同じ形で変数でない列は受理される（列専用位置そのものは拒否しない）。
+    classified("BEGIN PERFORM DISTINCT q FROM t; END");
+}
+
+#[test]
+fn variables_in_unsupported_literal_positions_are_rejected_with_0a000() {
+    // 解析器がリテラルしか受理しない位置のうち、変数を受理しない形（ESCAPE・型付きリテラル・SIMILAR TO）。
+    for stmt in [
+        "PERFORM q FROM t WHERE lower(q) LIKE 'x%' ESCAPE v",
+        "PERFORM q FROM t WHERE ts > TIMESTAMP v",
+        "PERFORM q FROM t WHERE q SIMILAR TO v",
+        "PERFORM 1 FROM t WHERE y = 1 AND q SIMILAR TO v",
+    ] {
+        assert_eq!(
+            classify_code(&format!("DECLARE v text; BEGIN {stmt}; END")),
+            "0A000",
+            "for {stmt:?}"
+        );
+    }
+    // 変数を含まない同じ形は受理される。
+    classified("BEGIN PERFORM q FROM t WHERE q SIMILAR TO 'x%'; END");
+}
+
+#[test]
+fn unclassifiable_parameter_positions_are_rejected_with_0a000() {
+    // `$n` が列参照として記録されない位置（表名など）は置換できないので 0A000（fail-closed）。
+    assert_eq!(classify_code("BEGIN PERFORM q FROM $1; END"), "0A000");
+    // 値の位置の `$n` は参照になり、リテラル専用位置（LIMIT）では LiteralSlot になる。
+    let b = classified("BEGIN PERFORM q FROM t WHERE q = $1; END");
+    assert_eq!(first_sql_refs(&b), 1);
+    let b = classified("BEGIN PERFORM q FROM t LIMIT $1; END");
+    let Some(Stmt::Perform(p)) = b.block.stmts.first() else {
+        panic!("perform");
+    };
+    assert_eq!(p.var_refs[0].role, VarRole::LiteralSlot);
+    // 範囲外の `$n` は解析時点で 42P02。
+    assert_eq!(code("BEGIN PERFORM q FROM t WHERE q = $9; END"), "42P02");
+}
+
+#[test]
+fn subquery_and_cte_bodies_are_classified_recursively() {
+    let refs = |stmt: &str| {
+        let b = classified(&format!("DECLARE v int; BEGIN {stmt}; END"));
+        first_sql_refs(&b)
+    };
+    assert_eq!(
+        refs("PERFORM q FROM t WHERE k IN (SELECT k FROM u WHERE z = v)"),
+        1
+    );
+    assert_eq!(
+        refs("PERFORM q FROM t WHERE EXISTS (SELECT 1 FROM u WHERE u.z = v)"),
+        1
+    );
+    assert_eq!(
+        refs("PERFORM q FROM t WHERE k IN (SELECT k FROM u WHERE z IN (SELECT z FROM w WHERE r = v))"),
+        1
+    );
+    // CTE 本体の変数: リテラル専用位置（`LIMIT`・`LIKE` のパターン）は LiteralSlot として分類される。
+    let b =
+        classified("DECLARE v int; BEGIN WITH c AS (SELECT q FROM u LIMIT v) SELECT q FROM c; END");
+    assert_eq!(first_sql_refs(&b), 1);
+    let Some(Stmt::Sql(s)) = b.block.stmts.first() else {
+        panic!("sql");
+    };
+    assert_eq!(s.var_refs[0].role, VarRole::LiteralSlot);
+    let b = classified(
+        "DECLARE v text; BEGIN WITH c AS (SELECT q FROM u WHERE z LIKE v) SELECT q FROM c; END",
+    );
+    assert_eq!(first_sql_refs(&b), 1);
+    // CTE 本体の WHERE は許可リストが `列 = '文字列'`・`LIKE` 等の形しか受理しない（ビュー本体と同じ制限）。
+    // `列 = 変数` は解析器が式述語として読み、CTE 本体では 42601 になる。リテラルを置けば通る形なので、
+    // 定義時は変数の置き場所が非対応として 0A000（fail-closed。既知の制限）。
+    assert_eq!(
+        classify_code(
+            "DECLARE v text; BEGIN WITH c AS (SELECT q FROM u WHERE z = v) SELECT q FROM c; END"
+        ),
+        "0A000"
+    );
+    // 外側の表を参照する相関サブクエリ（範囲の再解析で外側の別名が解決できない形）は fail-closed。
+    assert_eq!(
+        classify_code(
+            "DECLARE v int; BEGIN PERFORM q FROM t WHERE EXISTS (SELECT 1 FROM u WHERE u.k = t.k AND u.z = v); END"
+        ),
+        "0A000"
+    );
+}
+
+#[test]
+fn row_count_clause_and_named_window_are_normalized_before_classification() {
+    let b = classified(
+        "DECLARE n int; BEGIN PERFORM 1 FROM t LIMIT 1 OFFSET 0; \
+         PERFORM 1 FROM t FETCH FIRST n ROWS ONLY; \
+         PERFORM sum(x) OVER w FROM t WINDOW w AS (PARTITION BY y); END",
+    );
+    let Some(Stmt::Perform(p)) = b.block.stmts.get(1) else {
+        panic!("perform");
+    };
+    assert_eq!(p.var_refs.len(), 1);
+    assert_eq!(p.var_refs[0].role, VarRole::LiteralSlot);
+    // 保存されるトークン列は正規化後（`FETCH FIRST n ROWS ONLY` は `LIMIT n`）で、位置は保存側の列に対応する。
+    assert!(matches!(
+        p.tokens.get(p.var_refs[0].pos),
+        Some(Token::Ident(w)) if w == "n"
+    ));
+    assert!(!p
+        .tokens
+        .iter()
+        .any(|t| matches!(t, Token::Ident(w) if w.eq_ignore_ascii_case("FETCH"))));
+    let Some(Stmt::Perform(w)) = b.block.stmts.get(2) else {
+        panic!("perform");
+    };
+    assert!(!w
+        .tokens
+        .iter()
+        .any(|t| matches!(t, Token::Ident(x) if x.eq_ignore_ascii_case("WINDOW"))));
+}
+
+#[test]
+fn literal_words_are_not_variable_references() {
+    let b = classified("BEGIN IF true THEN NULL; END IF; END");
     let Some(Stmt::If { branches, .. }) = b.block.stmts.first() else {
         panic!("if");
     };
     assert!(branches[0].0.var_refs.is_empty());
-    let b = ok("BEGIN INSERT INTO t(x) VALUES (default); END");
+    let b = classified("BEGIN INSERT INTO t(x) VALUES (default); END");
     assert_eq!(first_sql_refs(&b), 0);
-    let b = ok("BEGIN PERFORM ARRAY[1, 2]; END");
+    let b = classified("BEGIN PERFORM ARRAY[1, 2]; END");
     assert_eq!(first_sql_refs(&b), 0);
-    let b = ok("DECLARE v int; BEGIN UPDATE t SET x = v; END");
+    let b = classified("DECLARE v int; BEGIN UPDATE t SET x = v; END");
     assert_eq!(first_sql_refs(&b), 1);
-    let b = ok("DECLARE n int; BEGIN PERFORM 1 FROM t LIMIT 1 FETCH FIRST n ROWS ONLY; END");
+    let b = classified("DECLARE n int; BEGIN PERFORM 1 FROM t FETCH FIRST n ROWS ONLY; END");
     assert_eq!(first_sql_refs(&b), 1);
-    let b = ok("DECLARE n int; BEGIN PERFORM 1 FROM t GROUP BY x HAVING count(*) > n; END");
+    let b = classified("DECLARE n int; BEGIN PERFORM 1 FROM t GROUP BY x HAVING count(*) > n; END");
     assert_eq!(first_sql_refs(&b), 1);
 }
 
@@ -1005,11 +1290,15 @@ fn execute_requires_a_command_expression() {
 }
 
 #[test]
-fn insert_assignment_is_not_declarable_so_statements_stay_sql() {
-    // `insert := 1` は変数が宣言できない（0A000）ので SQL 文として読まれることはない。
-    assert_eq!(code("DECLARE insert int; BEGIN insert := 1; END"), "0A000");
-    let b = ok("BEGIN insert := 1; END");
+fn statement_words_stay_sql_even_when_a_variable_has_the_same_name() {
+    // `insert` は宣言できるが、`insert := 1` は先頭の語から SQL 文として読まれ、定義時分類で 42601 になる
+    // （代入として黙って読み替えない）。
+    let b = ok("DECLARE insert int; BEGIN insert := 1; END");
     assert!(matches!(b.block.stmts.first(), Some(Stmt::Sql(_))));
+    assert_eq!(
+        classify_code("DECLARE insert int; BEGIN insert := 1; END"),
+        "42601"
+    );
     ok("BEGIN INSERT INTO t VALUES (1); END");
 }
 
@@ -1029,12 +1318,12 @@ fn return_query_accepts_parenthesized_query() {
 
 #[test]
 fn outermost_block_label_qualifies_params_and_found() {
-    let b = ok("<<blk>> BEGIN RETURN blk.a; END");
+    let b = classified("<<blk>> BEGIN RETURN blk.a; END");
     let Some(Stmt::Return(Some(e))) = b.block.stmts.first() else {
         panic!("return");
     };
     assert_eq!(e.var_refs.len(), 1);
-    let b = ok("<<blk>> BEGIN PERFORM blk.found; END");
+    let b = classified("<<blk>> BEGIN PERFORM blk.found; END");
     assert_eq!(first_sql_refs(&b), 1);
     let b = ok("<<blk>> BEGIN blk.a := 2; RETURN 1; END");
     assert!(matches!(b.block.stmts.first(), Some(Stmt::Assign { .. })));
@@ -1043,7 +1332,7 @@ fn outermost_block_label_qualifies_params_and_found() {
         "42601"
     );
     // 内側ブロックのラベルではパラメータを修飾参照しない（最外ブロックのみ）。
-    let b = ok("BEGIN <<inner>> BEGIN PERFORM inner.a; END; END");
+    let b = classified("BEGIN <<inner>> BEGIN PERFORM inner.a; END; END");
     let Some(Stmt::Block(inner)) = b.block.stmts.first() else {
         panic!("block");
     };
@@ -1054,53 +1343,37 @@ fn outermost_block_label_qualifies_params_and_found() {
 }
 
 #[test]
-fn with_classification_skips_cte_definitions() {
+fn with_classification_reads_cte_definitions_from_the_syntax_tree() {
     let kind = |src: &str| {
-        let b = ok(&format!("BEGIN {src}; END"));
+        let b = classified(&format!("BEGIN {src}; END"));
         match b.block.stmts.first() {
             Some(Stmt::Sql(q)) => (q.kind, q.writes),
             other => panic!("not sql: {other:?}"),
         }
     };
-    // CTE 名が主文の語と同名でも、CTE 定義の後の主文で分類する。
+    // CTE 名が主文の語と同名でも、解析木から文種を取る。
     assert_eq!(
-        kind("WITH \"values\" AS (SELECT 1) UPDATE t SET x = 1"),
-        (EmbeddedKind::Update, true)
-    );
-    assert_eq!(
-        kind("WITH \"update\" AS (SELECT 1) SELECT 1 FROM \"update\""),
+        kind("WITH \"update\" AS (SELECT q FROM u) SELECT q FROM \"update\""),
         (EmbeddedKind::Select, false)
     );
     assert_eq!(
-        kind("WITH \"delete\" (a, b) AS NOT MATERIALIZED (SELECT 1, 2), c AS (SELECT 2) DELETE FROM t"),
-        (EmbeddedKind::Delete, true)
-    );
-    assert_eq!(
-        kind("WITH RECURSIVE r AS (SELECT 1) INSERT INTO t SELECT * FROM r"),
-        (EmbeddedKind::Insert, true)
-    );
-    // 引用付きの "recursive" は CTE 名（キーワードと取り違えない）。
-    assert_eq!(
-        kind("WITH \"recursive\" AS (SELECT 1) UPDATE t SET x = 1"),
-        (EmbeddedKind::Update, true)
-    );
-    assert_eq!(
-        kind("WITH \"recursive\"(a) AS (SELECT 1) SELECT a FROM \"recursive\""),
+        kind("WITH c AS (SELECT q FROM u) SELECT q FROM c"),
         (EmbeddedKind::Select, false)
     );
+    // 形を読み解けない WITH は定義時に 42601（fail-closed）。
+    assert_eq!(classify_code("BEGIN WITH c AS SELECT 1; END"), "42601");
     assert_eq!(
-        kind("WITH recursive \"recursive\" AS (SELECT 1) DELETE FROM t"),
-        (EmbeddedKind::Delete, true)
+        classify_code_with(
+            "BEGIN RETURN QUERY WITH c AS (SELECT 1) TABLE t; END",
+            &opts_with(ReturnShape::SetOf)
+        ),
+        "42601"
     );
-    // データ変更 CTE を持つ SELECT は書き込み扱い。
     assert_eq!(
-        kind("WITH c AS (DELETE FROM t RETURNING 1) SELECT 1 FROM c"),
-        (EmbeddedKind::Select, true)
-    );
-    // 形を読み解けない WITH は fail-closed で拒否する。
-    assert_eq!(code("BEGIN WITH c AS SELECT 1; END"), "42601");
-    assert_eq!(
-        code("BEGIN RETURN QUERY WITH c AS (SELECT 1) TABLE t; END"),
+        code_with(
+            "BEGIN RETURN QUERY CREATE TABLE t(a int); END",
+            &opts_with(ReturnShape::SetOf)
+        ),
         "42601"
     );
 }
@@ -1109,7 +1382,7 @@ fn with_classification_skips_cte_definitions() {
 fn declaration_default_resolves_in_the_scope_before_the_declaration() {
     // PostgreSQL 17 の `decl_statement`（pl_gram.y）は既定値を読んだ後に変数を名前空間へ追加するため、
     // 内側 `DECLARE x int := x` の既定値の `x` は外側の x に解決される。
-    let b = ok("DECLARE x int := 10; BEGIN DECLARE x int := x; BEGIN RETURN x; END; END");
+    let b = classified("DECLARE x int := 10; BEGIN DECLARE x int := x; BEGIN RETURN x; END; END");
     let outer = b.block.decls[0];
     let Some(Stmt::Block(inner)) = b.block.stmts.first() else {
         panic!("block");
@@ -1121,17 +1394,17 @@ fn declaration_default_resolves_in_the_scope_before_the_declaration() {
         .as_ref()
         .expect("default");
     assert_eq!(default.var_refs.len(), 1);
-    assert_eq!(default.var_refs[0].1, VarRef::Var(outer));
+    assert_eq!(default.var_refs[0].var, VarRef::Var(outer));
     // 内側の宣言後の参照は内側の x（外側を隠す）。
     let Some(Stmt::Return(Some(e))) = inner.stmts.first() else {
         panic!("return");
     };
-    assert_eq!(e.var_refs[0].1, VarRef::Var(inner_id));
+    assert_eq!(e.var_refs[0].var, VarRef::Var(inner_id));
 }
 
 #[test]
 fn type_specifications_are_not_variable_references() {
-    // 型名の語（`precision`・`varying`・`zone` 等）は変数名にできない（宣言時に拒否）。
+    // 型名の語（`precision`・`varying`・`zone` 等）は予約語でないので宣言でき、型指定の位置では変数にならない。
     for w in [
         "precision",
         "varying",
@@ -1140,14 +1413,10 @@ fn type_specifications_are_not_variable_references() {
         "timestamp",
         "numeric",
     ] {
-        assert_eq!(
-            code(&format!("DECLARE {w} int; BEGIN NULL; END")),
-            "0A000",
-            "for {w}"
-        );
+        ok(&format!("DECLARE {w} int; BEGIN NULL; END"));
     }
-    // 型指定の範囲（複数語・修飾子・`[]`）は `::` と `CAST` の両方で識別子位置になり、その後に続く
-    // 変数参照だけが置換される。
+    // 型指定の範囲（複数語・修飾子・`[]`）は `::` と `CAST` の両方で列参照にならず、その後に続く
+    // 変数参照だけが記録される。
     let types = [
         "double precision",
         "character varying(10)",
@@ -1159,15 +1428,15 @@ fn type_specifications_are_not_variable_references() {
     for ty in types {
         for expr in [format!("1::{ty}"), format!("CAST(1 AS {ty})")] {
             let src = format!("DECLARE v int; BEGIN PERFORM {expr}; END");
-            assert_eq!(first_sql_refs(&ok(&src)), 0, "for {src:?}");
+            assert_eq!(first_sql_refs(&classified(&src)), 0, "for {src:?}");
             let src = format!("DECLARE v int; BEGIN PERFORM {expr} + v; END");
-            assert_eq!(first_sql_refs(&ok(&src)), 1, "for {src:?}");
+            assert_eq!(first_sql_refs(&classified(&src)), 1, "for {src:?}");
         }
     }
-    // 型の外の `AS` 別名は従来どおり識別子位置、`CAST` の式部分の変数は参照になる。
-    let b = ok("DECLARE v int; BEGIN PERFORM CAST(v AS int); END");
+    // `CAST` の式部分の変数は参照になる。
+    let b = classified("DECLARE v int; BEGIN PERFORM CAST(v AS int); END");
     assert_eq!(first_sql_refs(&b), 1);
-    let b = ok("DECLARE v int; BEGIN RETURN 1::double precision; END");
+    let b = classified("DECLARE v int; BEGIN RETURN 1::double precision; END");
     let Some(Stmt::Return(Some(e))) = b.block.stmts.first() else {
         panic!("return");
     };
@@ -1202,57 +1471,6 @@ fn quoted_identifiers_named_like_clause_words_are_not_clauses() {
     );
     // INSERT INTO の INTO は句ではなく、引用付きの "insert" は文の語ではない。
     ok("BEGIN INSERT INTO t(x) VALUES (1); END");
-}
-
-#[test]
-fn quoted_words_in_with_and_query_classification() {
-    let kind = |src: &str| {
-        let b = ok(&format!("BEGIN {src}; END"));
-        match b.block.stmts.first() {
-            Some(Stmt::Sql(q)) => (q.kind, q.writes),
-            other => panic!("not sql: {other:?}"),
-        }
-    };
-    assert_eq!(
-        kind("WITH \"recursive\" AS (SELECT 1) SELECT 1 FROM \"recursive\""),
-        (EmbeddedKind::Select, false)
-    );
-    assert_eq!(
-        kind("WITH \"recursive\" AS (SELECT 1) DELETE FROM t"),
-        (EmbeddedKind::Delete, true)
-    );
-    assert_eq!(
-        kind("WITH RECURSIVE r AS (SELECT 1) SELECT 1 FROM r"),
-        (EmbeddedKind::Select, false)
-    );
-    // 引用付きの "delete" CTE 名・"update" 括弧始まりの語は書き込み扱いにならない。
-    assert_eq!(
-        kind("WITH c AS (SELECT 1 AS \"delete\") SELECT 1 FROM c"),
-        (EmbeddedKind::Select, false)
-    );
-}
-
-#[test]
-fn derived_table_column_aliases_are_identifier_positions() {
-    let refs = |src: &str| {
-        let b = ok(&format!("DECLARE v int; BEGIN {src}; END"));
-        first_sql_refs(&b)
-    };
-    assert_eq!(refs("PERFORM 1 FROM (SELECT 1) AS d(v)"), 0);
-    assert_eq!(refs("PERFORM 1 FROM (SELECT 1) d(v)"), 0);
-    assert_eq!(refs("PERFORM 1 FROM t AS a(v)"), 0);
-    assert_eq!(refs("PERFORM 1 FROM t a(v)"), 0);
-    assert_eq!(refs("PERFORM 1 FROM t, (SELECT 1, 2) AS d(v, w)"), 0);
-    // 後続の値の位置の変数は参照のまま。
-    assert_eq!(refs("PERFORM 1 FROM (SELECT 1) AS d(x) WHERE d.x = v"), 1);
-    // 関数呼び出しの引数は列別名リストではない（変数は参照のまま）。
-    assert_eq!(refs("PERFORM 1 FROM generate_series(1, v)"), 1);
-    assert_eq!(
-        refs("PERFORM 1 FROM t JOIN generate_series(1, v) ON true"),
-        1
-    );
-    assert_eq!(refs("PERFORM 1 FROM t, generate_series(1, v)"), 1);
-    assert_eq!(refs("PERFORM 1 FROM ONLY t WHERE x = v"), 1);
 }
 
 #[test]
@@ -1337,588 +1555,21 @@ fn quoted_flags_align_with_tokens() {
         .all(|(f, t)| !*f || !matches!(t, Token::Keyword(_))));
 }
 
-// ---- 拒否語の網羅性（SQL 側が照合する語の漏れ検出） ----
-
-/// 照合語として扱う関数・メソッド名（引数の文字列リテラルを語として集める）。
-const MATCH_HELPERS: &[&str] = &[
-    "peek_ident_matches",
-    "peek_ident_matches_at",
-    "expect_ident_matching",
-    "expect_contextual_keyword",
-    "peek_contextual_keyword",
-    "ident_is",
-    "is_kw",
-    "eat_kw",
-    "expect_kw",
-    "eat_word",
-    "is_word",
-    "is_ident",
-    "ident_eq_ignore_case",
-    "eq_ignore_ascii_case",
-    "kw",
-    "word",
-    "ident_at",
-    "depth0_words",
-    "prev_is",
-    "next_is",
-    "expect_contextual_ident",
-    "peek_truncate_keyword",
-    "expr_until",
-    "parse_relation_alias",
-];
-
-/// 拒否語としない語（理由付き）。関数名は直後が `(` なら識別子位置として扱われ、変数参照にならない。
-const EXCLUDED_FUNCTIONS: &[&str] = &[
-    "array_agg",
-    "avg",
-    "bool_and",
-    "bool_or",
-    "coalesce",
-    "concat",
-    "count",
-    "cume_dist",
-    "currval",
-    "date_part",
-    "date_trunc",
-    "dense_rank",
-    "every",
-    "extract",
-    "first_value",
-    "greatest",
-    "json_array_length",
-    "justify_days",
-    "justify_hours",
-    "justify_interval",
-    "lag",
-    "last_value",
-    "lastval",
-    "lead",
-    "least",
-    "log",
-    "lpad",
-    "max",
-    "min",
-    "nextval",
-    "nth_value",
-    "ntile",
-    "nullif",
-    "overlay",
-    "percent_rank",
-    "position",
-    "rank",
-    "replace",
-    "round",
-    "row_number",
-    "rpad",
-    "set_config",
-    "setval",
-    "split_part",
-    "stddev",
-    "stddev_pop",
-    "stddev_samp",
-    "string_agg",
-    "substr",
-    "substring",
-    "sum",
-    "timezone",
-    "trim",
-    "trunc",
-    "var_pop",
-    "var_samp",
-    "variance",
-    "current_schema",
-    "current_schemas",
-    "visible",
-];
-
-/// DDL・DCL・ユーティリティ・トランザクション・カーソル・COPY の語。埋め込み文の文頭の語は
-/// `OUT_OF_SCOPE_STARTS` で `0A000` になり、DML・式の文法には現れない。
-const EXCLUDED_UTILITY: &[&str] = &[
-    "abort",
-    "action",
-    "add",
-    "alter",
-    "always",
-    "analyze",
-    "assert",
-    "authorization",
-    "binary",
-    "btree",
-    "cache",
-    "call",
-    "cancel",
-    "cascade",
-    "cascaded",
-    "check",
-    "chunk",
-    "close",
-    "cluster",
-    "column",
-    "comment",
-    "commit",
-    "concurrently",
-    "copy",
-    "create",
-    "csv",
-    "data",
-    "deallocate",
-    "deferrable",
-    "deferred",
-    "delimiter",
-    "discard",
-    "dml",
-    "drop",
-    "enum",
-    "explain",
-    "force",
-    "foreach",
-    "foreign",
-    "forward",
-    "freeze",
-    "function",
-    "generated",
-    "gin",
-    "global",
-    "grant",
-    "header",
-    "hnsw",
-    "identity",
-    "import",
-    "increment",
-    "index",
-    "initially",
-    "immediate",
-    "key",
-    "listen",
-    "lock",
-    "match",
-    "maxvalue",
-    "merge",
-    "minvalue",
-    "move",
-    "notify",
-    "nowait",
-    "open",
-    "option",
-    "owned",
-    "owner",
-    "prepare",
-    "preserve",
-    "primary",
-    "raise",
-    "references",
-    "refresh",
-    "reindex",
-    "release",
-    "rename",
-    "reset",
-    "restart",
-    "restrict",
-    "revoke",
-    "rollback",
-    "savepoint",
-    "schema",
-    "sequence",
-    "session",
-    "share",
-    "show",
-    "simple",
-    "start",
-    "stdin",
-    "stdout",
-    "temp",
-    "temporary",
-    "transaction",
-    "truncate",
-    "type",
-    "unique",
-    "unlogged",
-    "vacuum",
-    "view",
-    "work",
-];
-
-/// 構文上のキーワードではなく、文字列値・内部の列名・スキーマ名・単位名の照合に使われる語。
-const EXCLUDED_VALUES: &[&str] = &[
-    "day",
-    "hour",
-    "minute",
-    "month",
-    "second",
-    "year",
-    "f",
-    "t",
-    "inf",
-    "infinity",
-    "nan",
-    "id",
-    "tenant_id",
-    "visibility",
-    "pg_catalog",
-    "pg_temp",
-    "public",
-    "information_schema",
-    "search_path",
-];
-
-/// 宣言型（`DECLARE x anyelement`）の判定でだけ照合する多相型名（式には現れない）。
-const EXCLUDED_POLYMORPHIC_TYPES: &[&str] = &[
-    "anyarray",
-    "anyelement",
-    "anyenum",
-    "anymultirange",
-    "anynonarray",
-    "anyrange",
-];
-
-fn rust_sources(dir: &std::path::Path, out: &mut Vec<std::path::PathBuf>) {
-    let Ok(rd) = std::fs::read_dir(dir) else {
-        return;
-    };
-    for e in rd.flatten() {
-        let p = e.path();
-        let name = p.file_name().and_then(|n| n.to_str()).unwrap_or("");
-        if p.is_dir() {
-            if name != "tests" {
-                rust_sources(&p, out);
-            }
-        } else if name.ends_with(".rs") && name != "tests.rs" && !name.ends_with("_tests.rs") {
-            out.push(p);
-        }
-    }
-}
-
-/// `b[i]` が `"` のとき、文字列リテラルの内容と閉じ引用符の次の位置を返す。
-fn string_literal(b: &[u8], i: usize) -> Option<(&str, usize)> {
-    let mut j = i + 1;
-    while j < b.len() {
-        match b[j] {
-            b'\\' => j += 2,
-            b'"' => return std::str::from_utf8(&b[i + 1..j]).ok().map(|s| (s, j + 1)),
-            _ => j += 1,
-        }
-    }
-    None
-}
-
-fn is_word_literal(s: &str) -> bool {
-    !s.is_empty() && s.bytes().all(|c| c.is_ascii_alphabetic() || c == b'_')
-}
-
-/// 呼び出しの括弧の中（`i` は `(` の次）から、文字列リテラルを集める。
-fn call_literals(b: &[u8], mut i: usize) -> Vec<&str> {
-    let mut depth = 1usize;
-    let mut out = Vec::new();
-    while i < b.len() && depth > 0 {
-        match b[i] {
-            b'(' => depth += 1,
-            b')' => depth -= 1,
-            b'"' => match string_literal(b, i) {
-                Some((s, next)) => {
-                    out.push(s);
-                    i = next;
-                    continue;
-                }
-                None => break,
-            },
-            _ => {}
-        }
-        i += 1;
-    }
-    out
-}
-
-/// 1 ファイルの本体（`#[cfg(test)] mod` より前）から、SQL・PL/pgSQL が照合する語を集める。
-/// 規則: (1) `MATCH_HELPERS` の呼び出し引数の英字リテラル、(2) 任意の呼び出しの引数にある
-/// 大文字だけの英字リテラル（2 文字以上。照合ヘルパーの名前変更・追加の取りこぼし対策）、
-/// (3) `[ "A", "B" ].iter()`／`.contains(` の配列、(4) plpgsql 側の `&[&str]` 定数。
-fn matched_words(src: &str, is_plpgsql: bool, out: &mut std::collections::BTreeSet<String>) {
-    let src = src
-        .find("\n#[cfg(test)]\nmod ")
-        .map_or(src, |k| src.get(..k).unwrap_or(src));
-    let b = src.as_bytes();
-    let mut i = 0usize;
-    while i < b.len() {
-        let c = b[i];
-        if c.is_ascii_alphabetic() || c == b'_' {
-            let start = i;
-            while i < b.len() && (b[i].is_ascii_alphanumeric() || b[i] == b'_') {
-                i += 1;
-            }
-            let name = &src[start..i];
-            let mut k = i;
-            while k < b.len() && b[k].is_ascii_whitespace() {
-                k += 1;
-            }
-            if b.get(k) == Some(&b'(') {
-                let helper = MATCH_HELPERS.contains(&name);
-                for lit in call_literals(b, k + 1) {
-                    let upper =
-                        lit.len() >= 2 && lit.bytes().all(|c| c.is_ascii_uppercase() || c == b'_');
-                    if (helper && is_word_literal(lit)) || upper {
-                        out.insert(lit.to_ascii_lowercase());
-                    }
-                }
-            }
-            continue;
-        }
-        if c == b'"' {
-            // 通常の文字列は読み飛ばす（中の `[` や識別子風の語を拾わない）。
-            match string_literal(b, i) {
-                Some((_, next)) => i = next,
-                None => break,
-            }
-            continue;
-        }
-        if c == b'[' {
-            let mut j = i + 1;
-            let mut words = Vec::new();
-            let mut ok = false;
-            loop {
-                while j < b.len() && b[j].is_ascii_whitespace() {
-                    j += 1;
-                }
-                if b.get(j) != Some(&b'"') {
-                    break;
-                }
-                let Some((s, next)) = string_literal(b, j) else {
-                    break;
-                };
-                words.push(s);
-                j = next;
-                while j < b.len() && b[j].is_ascii_whitespace() {
-                    j += 1;
-                }
-                match b.get(j) {
-                    Some(b',') => j += 1,
-                    Some(b']') => {
-                        ok = true;
-                        break;
-                    }
-                    _ => break,
-                }
-                // 末尾カンマの後の `]`。
-                while j < b.len() && b[j].is_ascii_whitespace() {
-                    j += 1;
-                }
-                if b.get(j) == Some(&b']') {
-                    ok = true;
-                    break;
-                }
-            }
-            if ok {
-                let rest = src.get(j + 1..).unwrap_or("").trim_start();
-                if rest.starts_with(".iter()") || rest.starts_with(".contains(") {
-                    for w in words.iter().filter(|w| is_word_literal(w)) {
-                        out.insert(w.to_ascii_lowercase());
-                    }
-                }
-            }
-        }
-        i += 1;
-    }
-    if is_plpgsql {
-        let mut from = 0usize;
-        while let Some(k) = src.get(from..).and_then(|r| r.find("&[&str] = &[")) {
-            let at = from + k;
-            let head = src.get(at.saturating_sub(60)..at).unwrap_or("");
-            let end = src
-                .get(at..)
-                .and_then(|r| r.find("];"))
-                .map_or(src.len(), |e| at + e);
-            // 拒否語の定義そのものは検査対象にしない。
-            if !head.contains("UNSUPPORTED_NAMES") {
-                let body = src.get(at..end).unwrap_or("");
-                let bb = body.as_bytes();
-                let mut p = 0usize;
-                while p < bb.len() {
-                    if bb[p] == b'"' {
-                        match string_literal(bb, p) {
-                            Some((s, next)) => {
-                                if is_word_literal(s) {
-                                    out.insert(s.to_ascii_lowercase());
-                                }
-                                p = next;
-                                continue;
-                            }
-                            None => break,
-                        }
-                    }
-                    p += 1;
-                }
-            }
-            from = end.max(at + 1);
-        }
-    }
-}
-
 #[test]
-fn every_matched_sql_word_is_rejected_or_excluded() {
-    use super::parser::{OUT_OF_SCOPE_STARTS, RESERVED, SQL_KEYWORD_NAMES, UNSUPPORTED_NAMES};
-    use std::collections::BTreeSet;
-    let root = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("src");
-    let mut files = Vec::new();
-    rust_sources(&root.join("sql"), &mut files);
-    rust_sources(&root.join("plpgsql"), &mut files);
-    assert!(files.len() > 20, "source discovery failed: {}", files.len());
-    let mut words = BTreeSet::new();
-    for f in &files {
-        let src = std::fs::read_to_string(f).expect("read source");
-        let is_plpgsql = f.components().any(|c| c.as_os_str() == "plpgsql");
-        matched_words(&src, is_plpgsql, &mut words);
-    }
-    // SQL 字句解析が Keyword にする語（`"SELECT" => Some(Keyword::Select)` の腕）。
-    let lexer = std::fs::read_to_string(root.join("sql").join("lexer.rs")).expect("lexer");
-    let mut keywords = BTreeSet::new();
-    let mut rest = lexer.as_str();
-    while let Some(k) = rest.find("\" => Some(Keyword::") {
-        let head = rest.get(..k).unwrap_or("");
-        if let Some(q) = head.rfind('"') {
-            keywords.insert(head[q + 1..].to_ascii_lowercase());
-        }
-        rest = rest.get(k + 1..).unwrap_or("");
-    }
-    assert!(
-        keywords.len() >= 7,
-        "keyword extraction failed: {keywords:?}"
-    );
-    words.extend(keywords.iter().cloned());
-    // 抽出が空振りしていないこと（現状 350 語前後。大きく減ったら抽出規則の退行）。
-    assert!(words.len() > 250, "too few matched words: {}", words.len());
-
-    let rejected: BTreeSet<String> = UNSUPPORTED_NAMES.iter().map(|w| w.to_string()).collect();
-    let mut excluded: BTreeSet<String> = BTreeSet::new();
-    for list in [
-        EXCLUDED_FUNCTIONS,
-        EXCLUDED_UTILITY,
-        EXCLUDED_VALUES,
-        EXCLUDED_POLYMORPHIC_TYPES,
-        OUT_OF_SCOPE_STARTS,
-    ] {
-        excluded.extend(list.iter().map(|w| w.to_ascii_lowercase()));
-    }
-    let known: BTreeSet<String> = RESERVED
-        .iter()
-        .chain(SQL_KEYWORD_NAMES)
-        .map(|w| w.to_string())
-        .collect();
-    // 拒否語と除外語は排他（除外すべき語を拒否にも入れて矛盾させない）。
-    let both: Vec<&String> = rejected
-        .iter()
-        .filter(|w| {
-            excluded.contains(*w)
-                && !OUT_OF_SCOPE_STARTS
-                    .iter()
-                    .any(|o| o.eq_ignore_ascii_case(w))
-        })
-        .collect();
-    assert!(
-        both.is_empty(),
-        "words are both rejected and excluded: {both:?}"
-    );
-    // 字句解析の Keyword は必ず変数名にできない。
-    for k in &keywords {
-        assert!(
-            rejected.contains(k) || known.contains(k),
-            "keyword {k} is not rejected"
-        );
-    }
-    let missing: Vec<&String> = words
-        .iter()
-        .filter(|w| !rejected.contains(*w) && !excluded.contains(*w) && !known.contains(*w))
-        .collect();
-    assert!(
-        missing.is_empty(),
-        "SQL words matched by the parsers but neither rejected nor excluded \
-         (add to UNSUPPORTED_NAMES, or to an EXCLUDED_* list with a reason): {missing:?}"
-    );
-}
-
-#[test]
-fn operator_and_window_words_cannot_name_variables() {
-    for w in [
-        "is",
-        "like",
-        "ilike",
-        "between",
-        "filter",
-        "over",
-        "similar",
-        "escape",
-        "in",
-        "and",
-        "or",
-        "not",
-        "collate",
-        "at",
-        "zone",
-        "partition",
-        "range",
-        "groups",
-        "following",
-        "preceding",
-        "unbounded",
-        "exclude",
-        "ties",
-    ] {
-        for decl in [w.to_string(), format!("\"{w}\"")] {
-            let c = code(&format!("DECLARE {decl} int; BEGIN NULL; END"));
-            assert!(c == "0A000" || c == "42601", "for {decl}: {c}");
-        }
-    }
-    for w in ["is", "like", "between", "filter", "over"] {
-        assert_eq!(
-            code(&format!("DECLARE \"{w}\" int := 1; BEGIN NULL; END")),
-            "0A000"
-        );
-    }
-}
-
-#[test]
-fn operators_stay_operators_when_variables_exist() {
-    let b = ok("DECLARE v int; BEGIN IF 1 IS NULL THEN NULL; END IF; END");
-    let Some(Stmt::If { branches, .. }) = b.block.stmts.first() else {
-        panic!("if");
-    };
-    assert!(branches[0].0.var_refs.is_empty());
-    for (src, n) in [
-        ("PERFORM 'a' LIKE 'a%'", 0),
-        ("PERFORM v LIKE 'a%'", 1),
-        ("PERFORM v BETWEEN 1 AND 2", 1),
-        ("PERFORM 1 BETWEEN v AND 2", 1),
-        ("PERFORM v IS NOT NULL", 1),
-        ("PERFORM v ILIKE 'x' ESCAPE '\\'", 1),
-        ("PERFORM count(*) FILTER (WHERE v > 0) FROM t", 1),
-        ("PERFORM sum(v) OVER (PARTITION BY x) FROM t", 1),
-    ] {
-        let b = ok(&format!("DECLARE v int; BEGIN {src}; END"));
-        assert_eq!(first_sql_refs(&b), n, "for {src:?}");
-    }
-}
-
-#[test]
-fn array_commas_inside_on_condition_keep_variable_references() {
-    // ON 条件の `ARRAY[1, v]` のカンマで関係リストの状態が変わらず、`v` は参照のまま。
-    let b =
-        ok("DECLARE v int; BEGIN PERFORM 1 FROM t JOIN u ON t.x = u.x AND t.a = ARRAY[1, v]; END");
+fn array_commas_keep_variable_references() {
+    // `ARRAY[1, v]` のカンマの後でも、`v` は参照のまま。
+    let b = classified("DECLARE v int; BEGIN PERFORM ARRAY[1, v, 3]; END");
     assert_eq!(first_sql_refs(&b), 1);
-    let b =
-        ok("DECLARE v int; BEGIN PERFORM 1 FROM t JOIN u ON t.a = ARRAY[v, 2, 3] WHERE x = v; END");
+    let b = classified("DECLARE v int; BEGIN PERFORM ARRAY[v, v]; END");
     assert_eq!(first_sql_refs(&b), 2);
-    // 添字の中でも同じ。
-    let b = ok("DECLARE v int; BEGIN PERFORM 1 FROM t, u WHERE t.a[v] = 1; END");
-    assert_eq!(first_sql_refs(&b), 1);
 }
 
 #[test]
-fn argument_mode_words_cannot_name_variables() {
-    for w in ["out", "inout", "variadic", "local"] {
-        assert_eq!(
-            code(&format!("DECLARE {w} int; BEGIN NULL; END")),
-            "0A000",
-            "for {w}"
-        );
+fn argument_mode_words_can_name_variables() {
+    // 引数モードの語・`AT LOCAL` の語は予約語ではないので宣言でき、構文上の語は変数にならない。
+    for w in ["out", "inout", "variadic_", "local"] {
+        ok(&format!("DECLARE {w} int; BEGIN NULL; END"));
     }
-    // `AT LOCAL` は式の後置演算子であり、変数 `local` と取り違えない（宣言自体が拒否される）。
-    ok("BEGIN PERFORM now() AT LOCAL; END");
+    let b = classified("DECLARE local int; BEGIN PERFORM now() AT TIME ZONE 'UTC'; END");
+    assert_eq!(first_sql_refs(&b), 0);
 }

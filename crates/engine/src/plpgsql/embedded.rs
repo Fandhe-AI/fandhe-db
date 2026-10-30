@@ -1,20 +1,35 @@
-//! 埋め込み SQL・式のトークン列に対する純粋な補助処理と、定義時ダミー検証（Issue #2224・SQL-68）。
+//! 埋め込み SQL・式の定義時分類と、`INTO` 句の除去などの純粋な補助処理（Issue #2224・SQL-68）。
 //!
-//! `plpgsql::parser` が切り出した SQL トークン列に対して、`INTO` 句の除去・識別子位置の分類・
-//! 本体内で禁止する句（`USING OPERATION_ID`／`PARTITIONED`。ADR D8）の検出・ダミートークンの選択を行う。
-//! 検証の実体（許可リスト解析）は `EmbeddedSqlChecker` を介して core が実装する
-//! （`core::plpgsql_validate`）。`plpgsql` はストレージにもカタログにも触れない。
-//! [`is_ident_position`] は #2226 の呼び出し時の値置換でも同じ分類を共有する。
-//! ADR D3: 定義時はダミー、呼び出し時は型付きの値から作ったトークンで置換し、SQL テキストへ連結しない。
+//! `plpgsql::parser` が切り出した SQL トークン列を、**SQL 構文解析器の記録**（`sql::colref_sink`。
+//! 解析器が列参照と確定した識別子の位置と役割）に通して、変数参照を分類する。PL/pgSQL 側は SQL 文法を
+//! 推定しない（位置のマスクもダミー置換も持たない）。分類の流れ:
+//!
+//! 1. 行数制限句・名前付き `WINDOW` を正規化し（冪等。トークン数が変わるため以降は正規化後の列を保存して
+//!    分類する）、本体中の `$n` をスコープ内に見える合成識別子（字句解析器が作らない `$` 付きの名前）へ置く
+//! 2. 記録区間（ガード）の下で、変数を置換しないまま構造解析（`sql::embedded_unit`。カタログは引かない）に
+//!    通す。サブクエリ・CTE 本体は、解析器が取り込んだ範囲ごとにルート上のスライスで再帰的に解析する
+//! 3. 記録された位置のうち、PL/pgSQL のスコープで解決できる名前を [`VarSite`]（位置・役割・変数）として
+//!    AST へ保存する。範囲外の列参照・解決できないリテラル専用位置・列しか受理しない位置の変数は `0A000`
+//!    （fail-closed。黙って列として読む誤りを作らない）
+//!
+//! 検証の実体（構造解析）は `EmbeddedSqlChecker` を介して呼ぶ（core が実装。`plpgsql` はストレージにも
+//! カタログにも触れない）。呼び出し時の値の置換（役割別の置換・`42702` の判定）は #2226 の範囲で、
+//! ここは定義時に記録した位置と役割を後続が使える形で保存するところまでを担う（ADR D3）。
 
-use std::collections::HashMap;
+use std::collections::HashSet;
+use std::ops::Range;
 
 use crate::sql::allowlist::SqlSurfaceError;
-use crate::sql::ddl_column_type::{parse_column_type_name, SqlColumnTypeName};
+use crate::sql::colref_sink::{self, ColrefReport, Role};
+use crate::sql::ddl_column_type::SqlColumnTypeName;
+use crate::sql::embedded_unit::{normalize_statement, parse_unit, UnitKind, UnitSummary};
 use crate::sql::lexer::{Keyword, Token};
 
-use super::ast::{Block, Body, DeclType, EmbeddedKind, EmbeddedSql, SqlExpr, Stmt, VarRef};
-use super::{oos_err, syn_err};
+use super::ast::{
+    Block, Body, DeclType, EmbeddedKind, EmbeddedSql, ScopeView, SqlExpr, Stmt, VarDecl, VarId,
+    VarRef, VarSite,
+};
+use super::{oos_err, syn_err, too_big_err};
 
 /// `Ident` が（大小無視で）`word` か。
 pub(super) fn ident_is(t: &Token, word: &str) -> bool {
@@ -141,716 +156,25 @@ pub(super) fn reject_forbidden_clauses(
     Ok(())
 }
 
-/// `INSERT INTO t ( cols ) ...` の列リスト（`(` の次から `)` の手前まで）の範囲。
-/// `start` は `INSERT` トークンの位置。`close_of` は [`ParenInfo`] の対応括弧表（線形時間化のため）。
-fn insert_column_list_at(
-    tokens: &[Token],
-    start: usize,
-    close_of: &[Option<usize>],
-) -> Option<std::ops::Range<usize>> {
-    if !tokens.get(start).is_some_and(|t| ident_is(t, "INSERT")) {
-        return None;
-    }
-    if !tokens
-        .get(start.saturating_add(1))
-        .is_some_and(|t| ident_is(t, "INTO"))
-    {
-        return None;
-    }
-    // 表名は `Ident` または `QualifiedIdent` の 1 トークン。
-    let open = start.saturating_add(3);
-    if !matches!(tokens.get(open), Some(Token::Punct('('))) {
-        return None;
-    }
-    let first_at = open.saturating_add(1);
-    let first = tokens.get(first_at)?;
-    if matches!(first, Token::Keyword(Keyword::Select))
-        || ident_is(first, "VALUES")
-        || ident_is(first, "WITH")
-    {
-        return None;
-    }
-    let close = (*close_of.get(open)?)?;
-    Some(first_at..close)
-}
-
-/// 括弧・CTE 列名リスト・INSERT 列リスト位置の事前計算結果。識別子ごとの前方／後方再走査
-/// （二乗コスト）を避けるため、文ごとに線形走査で求める。
-pub(super) struct ParenInfo {
-    /// 各トークンを直接囲む `(` の 1 つ前のトークン位置（囲む括弧が無い／括弧が先頭なら `None`）。
-    encl_prev: Vec<Option<usize>>,
-    /// 各トークンを直接囲む `(` のトークン位置（囲む括弧が無ければ `None`）。
-    encl_open: Vec<Option<usize>>,
-    /// 各トークンが CTE 列名リスト `name (a, b) AS (` の内側か。
-    cte_cols: Vec<bool>,
-    /// 各トークンが `INSERT INTO t ( cols )` の列リスト内か。
-    insert_cols: Vec<bool>,
-}
-
-impl ParenInfo {
-    pub(super) fn new(tokens: &[Token]) -> Self {
-        let n = tokens.len();
-        let mut encl_open: Vec<Option<usize>> = vec![None; n];
-        let mut close_of: Vec<Option<usize>> = vec![None; n];
-        let mut stack: Vec<usize> = Vec::new();
-        for (k, t) in tokens.iter().enumerate() {
-            if let Some(o) = encl_open.get_mut(k) {
-                *o = stack.last().copied();
-            }
-            match t {
-                Token::Punct('(') => stack.push(k),
-                Token::Punct(')') => {
-                    if let Some(open) = stack.pop() {
-                        if let Some(c) = close_of.get_mut(open) {
-                            *c = Some(k);
-                        }
-                    }
-                }
-                _ => {}
-            }
-        }
-        // 開き括弧ごとの「CTE 列名リストか」。
-        let is_cte_open: Vec<bool> = (0..n)
-            .map(|k| {
-                close_of.get(k).copied().flatten().is_some_and(|m| {
-                    cte_as_follows(tokens, m.saturating_add(1))
-                        && k.checked_sub(1)
-                            .and_then(|p| tokens.get(p))
-                            .is_some_and(|p| {
-                                matches!(
-                                    p,
-                                    Token::Ident(_)
-                                        | Token::QuotedBoolWord(_)
-                                        | Token::QuotedNull(_)
-                                )
-                            })
-                })
-            })
-            .collect();
-        let encl_prev = encl_open
-            .iter()
-            .map(|o| o.and_then(|k| k.checked_sub(1)))
-            .collect();
-        let cte_cols = encl_open
-            .iter()
-            .map(|o| o.is_some_and(|k| is_cte_open.get(k).copied().unwrap_or(false)))
-            .collect();
-        // INSERT 列リストの範囲は入れ子になりうるため、差分配列で線形に塗る。
-        let mut diff = vec![0i64; n.saturating_add(1)];
-        for (s, t) in tokens.iter().enumerate() {
-            if !ident_is(t, "INSERT") {
-                continue;
-            }
-            let at_stmt_start = s
-                .checked_sub(1)
-                .and_then(|p| tokens.get(p))
-                .is_none_or(|p| matches!(p, Token::Punct('(') | Token::Punct(')')));
-            if !at_stmt_start {
-                continue;
-            }
-            if let Some(r) = insert_column_list_at(tokens, s, &close_of) {
-                if let Some(d) = diff.get_mut(r.start) {
-                    *d += 1;
-                }
-                if let Some(d) = diff.get_mut(r.end) {
-                    *d -= 1;
-                }
-            }
-        }
-        let mut acc = 0i64;
-        let insert_cols = (0..n)
-            .map(|k| {
-                acc += diff.get(k).copied().unwrap_or(0);
-                acc > 0
-            })
-            .collect();
-        Self {
-            encl_prev,
-            encl_open,
-            cte_cols,
-            insert_cols,
-        }
-    }
-
-    /// `i` を直接囲む `(` の 1 つ前のトークン。
-    fn enclosing_prev<'t>(&self, tokens: &'t [Token], i: usize) -> Option<&'t Token> {
-        let p = self.encl_prev.get(i).copied().flatten()?;
-        tokens.get(p)
-    }
-}
-
-/// `tokens[k]`（`FROM`）が式の内部の `FROM`（`IS [NOT] DISTINCT FROM`・`substring`/`extract`/`trim`/
-/// `overlay` の `FROM`）か。表参照を導入する `FROM` ではないので、直後の語は変数でありうる。
-fn is_expr_from(tokens: &[Token], k: usize, parens: &ParenInfo) -> bool {
-    if k.checked_sub(1)
-        .and_then(|p| tokens.get(p))
-        .is_some_and(|p| ident_is(p, "DISTINCT"))
-    {
-        return true;
-    }
-    parens.enclosing_prev(tokens, k).is_some_and(|p| {
-        ["SUBSTRING", "EXTRACT", "TRIM", "OVERLAY"]
-            .iter()
-            .any(|w| ident_is(p, w))
-    })
-}
-
-/// `tokens[k]` が表参照を導入する `FROM` か。
-fn is_table_from(tokens: &[Token], k: usize, parens: &ParenInfo) -> bool {
-    matches!(tokens.get(k), Some(Token::Keyword(Keyword::From))) && !is_expr_from(tokens, k, parens)
-}
-
-/// `FROM` 句の関係リストを終える語。
-fn ends_from_list(t: &Token) -> bool {
-    matches!(
-        t,
-        Token::Keyword(Keyword::Where | Keyword::Select | Keyword::Order | Keyword::Limit)
-    ) || [
-        "GROUP",
-        "HAVING",
-        "OFFSET",
-        "UNION",
-        "EXCEPT",
-        "INTERSECT",
-        "WINDOW",
-        "FOR",
-        "FETCH",
-        "RETURNING",
-        "VALUES",
-        "SET",
-    ]
-    .iter()
-    .any(|w| ident_is(t, w))
-}
-
-/// JOIN の種別語（`ON` 条件式の終わり）。
-fn is_join_word(t: &Token) -> bool {
-    ["JOIN", "INNER", "LEFT", "RIGHT", "FULL", "CROSS", "NATURAL"]
-        .iter()
-        .any(|w| ident_is(t, w))
-}
-
-/// 各トークンが `FROM`／`USING` の関係リスト（カンマ区切りの表・JOIN 対象・別名）の内側にあるかを
-/// 前方走査で求める。`ON` 条件式・括弧の内側・式内部の `FROM` は含めない（括弧ごとに状態を持つ）。
-fn from_relation_slots(tokens: &[Token], parens: &ParenInfo) -> Vec<bool> {
-    #[derive(Clone, Copy, PartialEq)]
-    enum St {
-        Idle,
-        Rel,
-        On,
-    }
-    let mut out = vec![false; tokens.len()];
-    let mut stack = vec![St::Idle];
-    // `DELETE ... USING t` だけが括弧なしの `USING` 関係リストを持つ。DELETE を見た後に限定する。
-    let mut seen_delete = false;
-    for (k, t) in tokens.iter().enumerate() {
-        if ident_is(t, "DELETE") {
-            seen_delete = true;
-        }
-        match t {
-            // 角括弧（`ARRAY[1, v]`・添字）の内側のカンマが外側の関係リストの状態を変えないよう、
-            // 丸括弧と同様に状態を分離する。
-            Token::Punct('(') | Token::Punct('[') => {
-                stack.push(St::Idle);
-                continue;
-            }
-            Token::Punct(')') | Token::Punct(']') => {
-                if stack.len() > 1 {
-                    stack.pop();
-                }
-                continue;
-            }
-            _ => {}
-        }
-        let Some(st) = stack.last_mut() else { continue };
-        if is_table_from(tokens, k, parens) {
-            *st = St::Rel;
-            continue;
-        }
-        if ends_from_list(t) {
-            *st = St::Idle;
-            continue;
-        }
-        let next_is_paren = matches!(tokens.get(k.saturating_add(1)), Some(Token::Punct('(')));
-        if ident_is(t, "USING") && !next_is_paren && seen_delete {
-            *st = St::Rel;
-            continue;
-        }
-        match *st {
-            St::Rel => {
-                if ident_is(t, "ON") {
-                    let conflict = tokens
-                        .get(k.saturating_add(1))
-                        .is_some_and(|n| ident_is(n, "CONFLICT"));
-                    *st = if conflict { St::Idle } else { St::On };
-                } else if let Some(o) = out.get_mut(k) {
-                    *o = true;
-                }
-            }
-            St::On => {
-                let is_call = matches!(tokens.get(k.saturating_add(1)), Some(Token::Punct('(')));
-                if matches!(t, Token::Punct(',')) || (is_join_word(t) && !is_call) {
-                    *st = St::Rel;
-                }
-            }
-            St::Idle => {}
-        }
-    }
-    out
-}
-
-/// 表名位置（`FROM`・`JOIN`・`ONLY`・`UPDATE`・`INTO`・`TABLE`・`USING` の直後）の 1 トークン前か。
-fn is_table_slot(tokens: &[Token], j: usize, parens: &ParenInfo) -> bool {
-    match j.checked_sub(1).and_then(|p| tokens.get(p)) {
-        Some(Token::Keyword(Keyword::From)) => is_table_from(tokens, j - 1, parens),
-        Some(p) => ["JOIN", "INTO", "UPDATE", "TABLE", "ONLY", "USING"]
-            .iter()
-            .any(|w| ident_is(p, w)),
-        None => false,
-    }
-}
-
-/// 暗黙別名ではなく句の語になりうる語（表名の直後に現れる）。
-const CLAUSE_WORDS: &[&str] = &[
-    "WHERE",
-    "ON",
-    "USING",
-    "JOIN",
-    "INNER",
-    "LEFT",
-    "RIGHT",
-    "FULL",
-    "CROSS",
-    "NATURAL",
-    "GROUP",
-    "ORDER",
-    "LIMIT",
-    "OFFSET",
-    "HAVING",
-    "UNION",
-    "EXCEPT",
-    "INTERSECT",
-    "SET",
-    "VALUES",
-    "SELECT",
-    "RETURNING",
-    "FOR",
-    "WINDOW",
-    "FETCH",
-    "OVERRIDING",
-    "DEFAULT",
-    "LATERAL",
-    "TABLESAMPLE",
-    "OUTER",
-    "WHEN",
-    "AS",
-    "FROM",
-    "DO",
-    "AND",
-    "OR",
-    "NOT",
-];
-
-/// 各トークンが `UPDATE ... SET` の代入リスト内（直前までに有効な `SET` があり、`FROM`／`WHERE`／
-/// `SELECT`／`RETURNING`／`ON`／`VALUES` や括弧の境界で途切れていない）かを前方走査 1 回で求める。
-/// 括弧ごとに状態を持ち、トークンごとの後方再走査（二乗コスト）を避ける。値は「そのトークンを処理する
-/// 直前の状態」。`SET` 節の開始は「直前が `,`／SELECT でなく、直後が `対象 =`」の `SET` だけ
-/// （SELECT リストの `set` 列〔`SELECT set, v = 1`〕を SET 節と誤認しない）。
-fn set_list_mask(tokens: &[Token]) -> Vec<bool> {
-    let mut out = vec![false; tokens.len()];
-    let mut stack: Vec<bool> = vec![false];
-    for (k, t) in tokens.iter().enumerate() {
-        if let (Some(o), Some(st)) = (out.get_mut(k), stack.last()) {
-            *o = *st;
-        }
-        match t {
-            Token::Punct('(') | Token::Punct('[') => {
-                stack.push(false);
-                continue;
-            }
-            Token::Punct(')') | Token::Punct(']') => {
-                if stack.len() > 1 {
-                    stack.pop();
-                }
-                continue;
-            }
-            _ => {}
-        }
-        let Some(st) = stack.last_mut() else { continue };
-        if ident_is(t, "SET") {
-            let prev_ok = k
-                .checked_sub(1)
-                .and_then(|p| tokens.get(p))
-                .is_some_and(|p| !matches!(p, Token::Punct(',') | Token::Keyword(Keyword::Select)));
-            let next_ok = matches!(
-                tokens.get(k.saturating_add(1)),
-                Some(Token::Ident(_) | Token::QualifiedIdent { .. })
-            ) && matches!(tokens.get(k.saturating_add(2)), Some(Token::Punct('=')));
-            if prev_ok && next_ok {
-                *st = true;
-            }
-        }
-        if matches!(
-            t,
-            Token::Keyword(Keyword::From | Keyword::Where | Keyword::Select)
-        ) || ["RETURNING", "ON", "VALUES"].iter().any(|w| ident_is(t, w))
-        {
-            *st = false;
-        }
-    }
-    out
-}
-
-/// 派生表・関数の列別名リスト（`(SELECT 1) AS d(v)`・`(SELECT 1) d(v)`・`t AS a(x)`・`t a(x)`）の
-/// 内側のトークンを求める。`(` の直前が関係リスト内の別名名で、その前が `)`・`AS`・表名のときだけ。
-/// `FROM generate_series(1, v)`（直前の前が `FROM`）や `JOIN f(..)`・`ONLY`・`LATERAL` の呼び出し
-/// 引数は含めない（引数の変数は参照のまま）。
-fn alias_column_mask(tokens: &[Token], slots: &[bool], parens: &ParenInfo) -> Vec<bool> {
-    let n = tokens.len();
-    let mut open_is_alias = vec![false; n];
-    for (k, t) in tokens.iter().enumerate() {
-        if !matches!(t, Token::Punct('(')) || k < 2 {
-            continue;
-        }
-        let name_ok = matches!(tokens.get(k - 1), Some(Token::Ident(_)))
-            && slots.get(k - 1).copied().unwrap_or(false);
-        if !name_ok {
-            continue;
-        }
-        let before = tokens.get(k - 2);
-        let after_clause = match before {
-            Some(Token::Punct(')')) => true,
-            Some(p) if ident_is(p, "AS") => true,
-            Some(p @ (Token::Ident(_) | Token::QualifiedIdent { .. })) => {
-                k >= 3
-                    && is_table_slot(tokens, k - 2, parens)
-                    && !ident_is(p, "ONLY")
-                    && !matches!(p, Token::Ident(w) if CLAUSE_WORDS.iter().any(|c| w.eq_ignore_ascii_case(c)))
-            }
-            _ => false,
-        };
-        if after_clause {
-            if let Some(o) = open_is_alias.get_mut(k) {
-                *o = true;
-            }
-        }
-    }
-    parens
-        .encl_open
-        .iter()
-        .map(|o| o.is_some_and(|k| open_is_alias.get(k).copied().unwrap_or(false)))
-        .collect()
-}
-
-/// `i` 以降が `AS [[NOT] MATERIALIZED] (` の形か（CTE 定義の入口）。`from` は `AS` の位置。
-fn cte_as_follows(tokens: &[Token], from: usize) -> bool {
-    if !tokens.get(from).is_some_and(|t| ident_is(t, "AS")) {
-        return false;
-    }
-    let mut j = from.saturating_add(1);
-    if tokens.get(j).is_some_and(|t| ident_is(t, "NOT")) {
-        j = j.saturating_add(1);
-    }
-    if tokens.get(j).is_some_and(|t| ident_is(t, "MATERIALIZED")) {
-        j = j.saturating_add(1);
-    }
-    matches!(tokens.get(j), Some(Token::Punct('(')))
-}
-
-/// `tokens[i]` が CTE の宣言名（直後が `AS (` 系）か。`SELECT c AS x` の別名元とは `(` の有無で区別する。
-fn is_cte_decl_name(tokens: &[Token], i: usize) -> bool {
-    cte_as_follows(tokens, i.saturating_add(1))
-}
-
-/// `WITH` で始まる文の主文の種別と、データ変更 CTE（`( INSERT|UPDATE|DELETE`）の有無を返す。
-///
-/// CTE 定義（`[RECURSIVE] 名前 [(列リスト)] AS [[NOT] MATERIALIZED] (本体)` のカンマ区切り）を構造的に
-/// 読み飛ばし、その直後の主文の語で種別を決める。CTE の宣言名は `"update"` のように主文の語と同名に
-/// なりうるため、深さ 0 の最初の語を見る方式は使わない。定義の形を読み解けない・主文が
-/// `SELECT`／`VALUES`／`INSERT`／`UPDATE`／`DELETE`／`(` 以外のときは `42601` で拒否する
-/// （書き込み経路の事前決定なので判定不能は fail-closed）。
-pub(super) fn classify_with(
-    tokens: &[Token],
-    quoted: &[bool],
-) -> Result<(EmbeddedKind, bool), SqlSurfaceError> {
-    let tokens = keyword_view(tokens, quoted);
-    let tokens = tokens.as_slice();
-    let bad = || syn_err("unsupported WITH statement in a PL/pgSQL body");
-    // `open` の `(` に対応する `)` の次の位置。
-    let skip_parens = |open: usize| -> Option<usize> {
-        let mut depth = 0usize;
-        for (k, t) in tokens.iter().enumerate().skip(open) {
-            match t {
-                Token::Punct('(') => depth = depth.saturating_add(1),
-                Token::Punct(')') => {
-                    depth = depth.saturating_sub(1);
-                    if depth == 0 {
-                        return Some(k.saturating_add(1));
-                    }
-                }
-                _ => {}
-            }
-        }
-        None
-    };
-    if !tokens.first().is_some_and(|t| ident_is(t, "WITH")) {
-        return Err(bad());
-    }
-    let mut j = 1usize;
-    // 引用付きの `"recursive"` は `keyword_view` で `RECURSIVE` と一致しない（CTE 名として読む）。
-    if tokens.get(j).is_some_and(|t| ident_is(t, "RECURSIVE")) {
-        j = j.saturating_add(1);
-    }
-    loop {
-        // CTE 名（1 トークン）。
-        if !matches!(
-            tokens.get(j),
-            Some(Token::Ident(_) | Token::QuotedBoolWord(_) | Token::QuotedNull(_))
-        ) {
-            return Err(bad());
-        }
-        j = j.saturating_add(1);
-        if matches!(tokens.get(j), Some(Token::Punct('('))) {
-            j = skip_parens(j).ok_or_else(bad)?;
-        }
-        if !tokens.get(j).is_some_and(|t| ident_is(t, "AS")) {
-            return Err(bad());
-        }
-        j = j.saturating_add(1);
-        if tokens.get(j).is_some_and(|t| ident_is(t, "NOT")) {
-            j = j.saturating_add(1);
-        }
-        if tokens.get(j).is_some_and(|t| ident_is(t, "MATERIALIZED")) {
-            j = j.saturating_add(1);
-        }
-        if !matches!(tokens.get(j), Some(Token::Punct('('))) {
-            return Err(bad());
-        }
-        j = skip_parens(j).ok_or_else(bad)?;
-        if matches!(tokens.get(j), Some(Token::Punct(','))) {
-            j = j.saturating_add(1);
-        } else {
-            break;
-        }
-    }
-    let kind = match tokens.get(j) {
-        Some(t) if ident_is(t, "INSERT") => EmbeddedKind::Insert,
-        Some(t) if ident_is(t, "UPDATE") => EmbeddedKind::Update,
-        Some(t) if ident_is(t, "DELETE") => EmbeddedKind::Delete,
-        Some(t) if ident_is(t, "VALUES") => EmbeddedKind::Select,
-        Some(Token::Keyword(Keyword::Select)) | Some(Token::Punct('(')) => EmbeddedKind::Select,
-        _ => return Err(bad()),
-    };
-    Ok((kind, has_write_cte(tokens, &[])))
-}
-
-/// `(` の直後が `INSERT`／`UPDATE`／`DELETE` のトークンがあるか（データ変更 CTE）。
-/// `RETURN QUERY`・問い合わせ `FOR` の主文を分類する（ADR D5: 書き込み経路を事前決定するため）。
-/// `SELECT`／`VALUES`／括弧始まりは `Select`、`INSERT`／`UPDATE`／`DELETE` はその種別、
-/// `WITH` は主文で判定。これら以外は `42601` で明示的に拒否する。
-pub(super) fn classify_query(
+/// 先頭の語から文種を仮置きする（`RETURN QUERY`・問い合わせ `FOR` 用）。`SELECT`／`VALUES`／括弧始まり／
+/// `WITH` は `Select`（`WITH` の実際の文種は定義時分類が解析木から確定する）、`INSERT`／`UPDATE`／`DELETE`
+/// はその種別。これら以外（引用付き識別子の先頭を含む）は `42601` で拒否する。
+pub(super) fn head_kind(
     tokens: &[Token],
     quoted: &[bool],
 ) -> Result<EmbeddedKind, SqlSurfaceError> {
-    // 先頭の語は引用付きなら識別子（`"insert"` は問い合わせの語ではない）。
-    let view = keyword_view(tokens, quoted);
-    let Some(first) = view.first() else {
-        return Err(syn_err("empty query in a PL/pgSQL statement"));
-    };
-    if matches!(first, Token::Keyword(Keyword::Select) | Token::Punct('('))
-        || ident_is(first, "VALUES")
-    {
-        Ok(EmbeddedKind::Select)
-    } else if ident_is(first, "INSERT") {
-        Ok(EmbeddedKind::Insert)
-    } else if ident_is(first, "UPDATE") {
-        Ok(EmbeddedKind::Update)
-    } else if ident_is(first, "DELETE") {
-        Ok(EmbeddedKind::Delete)
-    } else if ident_is(first, "WITH") {
-        Ok(classify_with(tokens, quoted)?.0)
-    } else {
-        Err(syn_err("unsupported query in a PL/pgSQL statement"))
+    let first_quoted = quoted.first().copied().unwrap_or(false);
+    match tokens.first() {
+        Some(Token::Keyword(Keyword::Select)) | Some(Token::Punct('(')) => Ok(EmbeddedKind::Select),
+        Some(Token::Ident(w)) if !first_quoted => match w.to_ascii_uppercase().as_str() {
+            "VALUES" | "WITH" => Ok(EmbeddedKind::Select),
+            "INSERT" => Ok(EmbeddedKind::Insert),
+            "UPDATE" => Ok(EmbeddedKind::Update),
+            "DELETE" => Ok(EmbeddedKind::Delete),
+            _ => Err(syn_err("unsupported query in a PL/pgSQL statement")),
+        },
+        _ => Err(syn_err("unsupported query in a PL/pgSQL statement")),
     }
-}
-
-pub(super) fn has_write_cte(tokens: &[Token], quoted: &[bool]) -> bool {
-    let tokens = keyword_view(tokens, quoted);
-    tokens.windows(2).any(|w| {
-        matches!(w.first(), Some(Token::Punct('(')))
-            && w.get(1).is_some_and(|t| {
-                ident_is(t, "INSERT") || ident_is(t, "UPDATE") || ident_is(t, "DELETE")
-            })
-    })
-}
-
-/// `tokens[i]` の `Ident` が識別子の位置（関数名・表名・列名・別名・暗黙別名・`USING` の列／表・
-/// `ON CONFLICT` の対象・`UPDATE ... SET`／`DO UPDATE SET` の代入先）にあるか。そうなら変数参照として
-/// 置換しない。#2226 の呼び出し時の置換と共有する単一の分類関数。
-///
-/// 引用情報を持たない呼び出し（全て未引用として扱う）。引用付き識別子を区別したい呼び出し元は
-/// [`is_ident_position_quoted`] を使う。
-pub(crate) fn is_ident_position(tokens: &[Token], i: usize) -> bool {
-    is_ident_position_quoted(tokens, &vec![false; tokens.len()], i)
-}
-
-/// [`is_ident_position`] の引用情報付き版。`quoted` は `sql::lexer::tokenize_with_params_quoted` の
-/// 並走配列（引用付き識別子は句のキーワードではなく常に識別子として扱う）。
-pub(crate) fn is_ident_position_quoted(tokens: &[Token], quoted: &[bool], i: usize) -> bool {
-    is_ident_position_with(i, &IdentCtx::new(tokens, quoted))
-}
-
-/// 識別子位置の分類に使う文単位の事前計算結果（関係リスト位置・括弧／CTE／INSERT 列位置）。
-pub(super) struct IdentCtx {
-    /// 引用付き識別子を句のキーワードと区別する見え方（[`keyword_view`]）。判定はすべてこれに対して行う。
-    view: Vec<Token>,
-    slots: Vec<bool>,
-    parens: ParenInfo,
-    /// `::型` と `CAST(式 AS 型)` の型指定の範囲（複数語・修飾子・`[]` を含む）に入るトークン。
-    type_range: Vec<bool>,
-    /// 派生表・関数の列別名リスト（`AS d(v)`）の内側のトークン。
-    alias_cols: Vec<bool>,
-    /// `UPDATE ... SET` の代入リスト内のトークン。
-    set_list: Vec<bool>,
-}
-
-impl IdentCtx {
-    pub(super) fn new(tokens: &[Token], quoted: &[bool]) -> Self {
-        let view = keyword_view(tokens, quoted);
-        let parens = ParenInfo::new(&view);
-        let type_range = type_ranges(&view, tokens, &parens);
-        let slots = from_relation_slots(&view, &parens);
-        let alias_cols = alias_column_mask(&view, &slots, &parens);
-        let set_list = set_list_mask(&view);
-        Self {
-            view,
-            slots,
-            parens,
-            type_range,
-            alias_cols,
-            set_list,
-        }
-    }
-}
-
-/// 型指定の範囲に入るトークンを塗る。範囲は SQL 側の列型パーサー
-/// （`sql::ddl_column_type::parse_column_type_name`。`double precision`・`character varying(n)`・
-/// `timestamp without time zone`・`numeric(p,s)`・`[]` を受理する）に決めさせ、1 トークンの
-/// 先読み特例を持たない。型として読めない場合（未対応の型名）は先頭 1 トークンだけを範囲にする
-/// （後続の許可リスト解析が拒否する）。`IdentCtx::new` から 1 文に 1 回だけ呼ばれる。
-fn type_ranges(view: &[Token], tokens: &[Token], parens: &ParenInfo) -> Vec<bool> {
-    let mut out = vec![false; tokens.len()];
-    for (i, t) in view.iter().enumerate() {
-        let starts = match t {
-            Token::TypeCast => true,
-            // `CAST(式 AS 型)` の `AS`。別名の `AS` と区別するため直接囲む括弧の直前が `CAST`。
-            _ if ident_is(t, "AS") => parens
-                .enclosing_prev(view, i)
-                .is_some_and(|p| ident_is(p, "CAST")),
-            _ => false,
-        };
-        if !starts {
-            continue;
-        }
-        let start = i.saturating_add(1);
-        let mut pos = start;
-        let end = match parse_column_type_name(tokens, &mut pos) {
-            Ok(_) if pos > start => pos,
-            _ => start.saturating_add(1),
-        };
-        for slot in out.iter_mut().take(end).skip(start) {
-            *slot = true;
-        }
-    }
-    out
-}
-
-/// [`is_ident_position`] の本体。`ctx` は同じトークン列に対する [`IdentCtx::new`] の結果。
-pub(super) fn is_ident_position_with(i: usize, ctx: &IdentCtx) -> bool {
-    let tokens = ctx.view.as_slice();
-    let slots = &ctx.slots;
-    if ctx.type_range.get(i).copied().unwrap_or(false)
-        || ctx.alias_cols.get(i).copied().unwrap_or(false)
-    {
-        return true;
-    }
-    if matches!(tokens.get(i.saturating_add(1)), Some(Token::Punct('('))) {
-        return true;
-    }
-    let prev = i.checked_sub(1).and_then(|p| tokens.get(p));
-    // `EXTRACT(field FROM v)` の field は日時の部品名であり値ではない。
-    if matches!(prev, Some(Token::Punct('(')))
-        && matches!(
-            tokens.get(i.saturating_add(1)),
-            Some(Token::Keyword(Keyword::From))
-        )
-        && i.checked_sub(2)
-            .and_then(|p| tokens.get(p))
-            .is_some_and(|p| ident_is(p, "EXTRACT"))
-    {
-        return true;
-    }
-    match prev {
-        // `::型名` は型の位置であり値ではない。
-        Some(Token::TypeCast) => return true,
-        // 式内部の `FROM`（`IS DISTINCT FROM v` 等）の直後は変数でありうるので識別子位置にしない。
-        Some(Token::Keyword(Keyword::From)) if !is_expr_from(tokens, i - 1, &ctx.parens) => {
-            return true
-        }
-        Some(p)
-            if [
-                "JOIN",
-                "INTO",
-                "UPDATE",
-                "TABLE",
-                "AS",
-                "ONLY",
-                "USING",
-                "CONSTRAINT",
-            ]
-            .iter()
-            .any(|w| ident_is(p, w)) =>
-        {
-            return true
-        }
-        _ => {}
-    }
-    // `FROM t, u`・JOIN 対象・別名など、関係リスト内の語。
-    if slots.get(i).copied().unwrap_or(false) {
-        return true;
-    }
-    // CTE の宣言名（`WITH c AS (`・`c AS MATERIALIZED (`）と列名リスト（`c (a, b) AS (`）。
-    if is_cte_decl_name(tokens, i) || ctx.parens.cte_cols.get(i).copied().unwrap_or(false) {
-        return true;
-    }
-    // 暗黙別名: 表名の直後の語（`FROM t x`）。句の語は別名ではない。
-    if let (Some(p @ (Token::Ident(_) | Token::QualifiedIdent { .. })), Some(Token::Ident(me))) =
-        (prev, tokens.get(i))
-    {
-        if i >= 1
-            && is_table_slot(tokens, i - 1, &ctx.parens)
-            && !ident_is(p, "ONLY")
-            && !CLAUSE_WORDS.iter().any(|w| me.eq_ignore_ascii_case(w))
-        {
-            return true;
-        }
-    }
-    // `JOIN ... USING (cols)`・`ON CONFLICT (cols)` の列。
-    if ctx
-        .parens
-        .enclosing_prev(tokens, i)
-        .is_some_and(|p| ident_is(p, "USING") || ident_is(p, "CONFLICT"))
-    {
-        return true;
-    }
-    // `UPDATE ... SET` / `DO UPDATE SET` の代入先。
-    if matches!(tokens.get(i.saturating_add(1)), Some(Token::Punct('=')))
-        && prev.is_some_and(|p| ident_is(p, "SET") || matches!(p, Token::Punct(',')))
-        && ctx.set_list.get(i).copied().unwrap_or(false)
-    {
-        return true;
-    }
-    ctx.parens.insert_cols.get(i).copied().unwrap_or(false)
 }
 
 /// 定義時検証に使うダミートークン。整数・浮動小数は `0`、真偽値は `false`、それ以外は文字列 `'0'`。
@@ -874,123 +198,573 @@ pub(crate) fn dummy_token(ty: &DeclType) -> Token {
     }
 }
 
-/// 埋め込み SQL の検証口。core が `parse_tokens`（許可リスト解析）へ委譲して実装する
-/// （`core::plpgsql_validate`）。受け取るのは変数をダミーへ置換したトークン列。
+/// 埋め込み SQL の構造解析口。`tokens` は文全体（`depth` 0・`is_root` 真）またはルート上のサブクエリ範囲
+/// （スライスをコピーせず渡す。位置の記録がアドレス基準のため）。core が `sql::embedded_unit::parse_unit`
+/// へ委譲して実装する（`core::plpgsql_validate`）。エラーは下位の解析器のものをそのまま返し、文言の
+/// 丸めは呼び出し側（本モジュール）が行う。
 pub(crate) trait EmbeddedSqlChecker {
-    /// 構文検証。定義時に拒否すべき失敗（`42601`／`0A000`／`54000`／`54001`）だけを `Err` にする。
-    fn check_syntax(&self, tokens: Vec<Token>) -> Result<(), SqlSurfaceError>;
+    fn check_unit(
+        &self,
+        tokens: &[Token],
+        depth: usize,
+        is_root: bool,
+    ) -> Result<UnitSummary, SqlSurfaceError>;
 }
 
-fn substituted(tokens: &[Token], refs: &[(usize, VarRef)], body: &Body) -> Vec<Token> {
-    let map: HashMap<usize, &VarRef> = refs.iter().map(|(i, r)| (*i, r)).collect();
-    tokens
-        .iter()
-        .enumerate()
-        .map(|(i, t)| match map.get(&i) {
-            Some(VarRef::Var(id)) => match body.vars.get(id.0 as usize) {
-                Some(v) => dummy_token(&v.ty),
-                None => Token::StringLiteral("0".to_string()),
-            },
-            Some(VarRef::Field(..)) => Token::StringLiteral("0".to_string()),
-            None => t.clone(),
-        })
-        .collect()
+/// カタログを引かない既定の構造解析（`parse_unit` への委譲）。core の実装とテストが共有する。
+pub(crate) struct StructuralChecker;
+
+impl EmbeddedSqlChecker for StructuralChecker {
+    fn check_unit(
+        &self,
+        tokens: &[Token],
+        depth: usize,
+        is_root: bool,
+    ) -> Result<UnitSummary, SqlSurfaceError> {
+        // 構文エラー以外の畳み込みエラー（0 除算等）は無視して文全体を走査させる。
+        let _defer = crate::sql::const_expr::defer_all_non_syntax_errors();
+        parse_unit(tokens, depth, is_root)
+    }
 }
 
-/// 条件式の検証に使う仮の表名と列名。許可リストの `WHERE` は、`FROM` の無い `SELECT` では単一の述語しか
-/// 受理せず（ダミー置換で定数になった `a > 0 AND b < 3` が `42601`）、`FROM` があれば複合述語を受理する。
-/// また `IS NULL`・`BETWEEN`・`IN` は左辺に列を要求するため、定数では拒否される。未知の表・列の
-/// `42P01`／`42703` は定義時には握りつぶされる（late binding）ので、仮の表名・列名で構文だけを検査できる。
+/// 条件式の検証に使う仮の表名。許可リストの `WHERE` は `FROM` の無い `SELECT` では単一の述語しか受理
+/// しないため、条件式は `SELECT 1 FROM <仮の表> WHERE <式>` の形で解析する（表は構造解析では常に存在
+/// する扱い）。
 const DUMMY_RELATION: &str = "plpgsql_validate_dummy_relation";
-const DUMMY_COLUMN: &str = "plpgsql_validate_dummy_column";
 
-/// `refs` の位置を `replace` で置き換えたトークン列を作る（`substituted` の列名版を兼ねる）。
-fn substituted_with_columns(tokens: &[Token], refs: &[(usize, VarRef)]) -> Vec<Token> {
-    let set: std::collections::HashSet<usize> = refs.iter().map(|(i, _)| *i).collect();
-    tokens
-        .iter()
-        .enumerate()
-        .map(|(i, t)| {
-            if set.contains(&i) {
-                Token::Ident(DUMMY_COLUMN.to_string())
-            } else {
-                t.clone()
-            }
-        })
-        .collect()
+/// 1 文・式の構造解析で処理するサブクエリ範囲の上限（超過は `54001`。無制限に再帰しない）。
+const MAX_UNITS: usize = 256;
+/// 列専用位置の判定を位置ごとに行う上限（超過は `0A000`。解析回数が参照数に比例して膨らむのを防ぐ）。
+const MAX_PER_SITE_CHECKS: usize = 64;
+
+/// 下位の解析器が「定義時に拒否すべき」とするエラー（それ以外は late binding として先送りする）。
+fn is_syntax_class(e: &SqlSurfaceError) -> bool {
+    matches!(e.wire_code(), "42601" | "0A000" | "54000" | "54001")
 }
 
-/// 式 1 個の定義時検証。次の形を順に試し、最初に受理された時点で成功とする。
-///
-/// 1. 値の式なら `SELECT <expr>`（変数は型に応じたダミーの値）
-/// 2. 条件式なら `SELECT 1 FROM <仮の表> WHERE <expr>`（変数はダミーの値）
-/// 3. 同じ形で変数を仮の列名に置換（`IS NULL`・`BETWEEN`・`IN` の左辺が変数のとき）
-///
-/// 許可リストは比較・論理演算を `WHERE` の中でしか受理しないため、値の式として拒否された式も条件式の形
-/// で試す（`b := 1 = 1`・`RETURN a AND b`・比較式の初期値）。すべて拒否なら、本来の構文誤りとして最初の
-/// エラーを返す（`42601` のまま）。
-fn check_expr(e: &SqlExpr, body: &Body, c: &dyn EmbeddedSqlChecker) -> Result<(), SqlSurfaceError> {
-    let cond_form = |subst: Vec<Token>| {
-        let mut toks = vec![
-            Token::Keyword(Keyword::Select),
-            Token::Number("1".to_string()),
-            Token::Keyword(Keyword::From),
-            Token::Ident(DUMMY_RELATION.to_string()),
-            Token::Keyword(Keyword::Where),
-        ];
-        toks.extend(subst);
-        toks
-    };
-    let literal = substituted(&e.tokens, &e.var_refs, body);
-    let mut first: Option<SqlSurfaceError> = None;
-    let mut record = |r: Result<(), SqlSurfaceError>| -> bool {
-        match r {
-            Ok(()) => true,
-            Err(err) => {
-                first.get_or_insert(err);
-                false
-            }
-        }
-    };
-    if !e.cond {
-        let mut toks = vec![Token::Keyword(Keyword::Select)];
-        toks.extend(literal.iter().cloned());
-        if record(c.check_syntax(toks)) {
-            return Ok(());
+fn sanitize(e: &SqlSurfaceError) -> SqlSurfaceError {
+    super::sanitize_delegated(e, "an embedded SQL fragment of a PL/pgSQL body")
+}
+
+/// 分類の失敗。`Parse` は解析器のエラー（変数の位置に起因する失敗かの説明を試みる）、`Verdict` は
+/// 分類側の判定（そのまま返す）。
+enum Fail {
+    Parse(SqlSurfaceError),
+    Verdict(SqlSurfaceError),
+}
+
+fn verdict(detail: &'static str) -> Fail {
+    Fail::Verdict(oos_err(detail))
+}
+
+/// 分類に必要な変数ごとの情報（本体の変数表の写し。分類中に変数表を書き換えるため分けて持つ）。
+struct VarInfo {
+    record_like: bool,
+    dummy: Token,
+}
+
+struct Cx<'a> {
+    checker: &'a dyn EmbeddedSqlChecker,
+    vars: Vec<VarInfo>,
+    nparams: usize,
+}
+
+impl Cx<'_> {
+    fn record_like(&self, id: VarId) -> bool {
+        self.vars.get(id.0 as usize).is_some_and(|v| v.record_like)
+    }
+
+    /// 検証用の置換トークン（呼び出し時に #2226 が置く型付きの値トークンと同じ種類）。
+    fn dummy(&self, var: &VarRef) -> Token {
+        match var {
+            VarRef::Var(id) => self.vars.get(id.0 as usize).map_or_else(
+                || Token::StringLiteral("0".to_string()),
+                |v| v.dummy.clone(),
+            ),
+            VarRef::Field(..) => Token::StringLiteral("0".to_string()),
         }
     }
-    if record(c.check_syntax(cond_form(literal)))
-        || record(c.check_syntax(cond_form(substituted_with_columns(&e.tokens, &e.var_refs))))
-    {
+}
+
+/// 分類の前処理済みの 1 本（正規化・`$n` の合成識別子化まで）。
+struct Prepared {
+    /// 正規化後のトークン列（`Token::Param` を保持。AST へ保存する側）。先頭に `prefix_len` 個の前置き。
+    norm: Vec<Token>,
+    /// `norm` の `Token::Param` を合成識別子（`$n`）へ置いた解析用の列（位置は `norm` と同じ）。
+    analysis: Vec<Token>,
+    /// 記録区間へ渡すスコープ内の名前（トークン上の綴りのまま。完全一致で照合される）。
+    spelled: HashSet<String>,
+    prefix_len: usize,
+}
+
+/// 分類結果。
+struct Classified {
+    tokens: Vec<Token>,
+    sites: Vec<VarSite>,
+    /// ルートの要約。ルート自体が先送りのエラー（late binding）で終わったときは `None`。
+    summary: Option<UnitSummary>,
+}
+
+fn prepare(
+    view: &ScopeView,
+    prefix: &[Token],
+    body: &[Token],
+) -> Result<Prepared, SqlSurfaceError> {
+    let mut all: Vec<Token> = prefix.to_vec();
+    all.extend_from_slice(body);
+    let known = view.known_names();
+    let mut spelled: HashSet<String> = HashSet::new();
+    for t in &all {
+        match t {
+            Token::Ident(n) if known.contains(&n.to_ascii_lowercase()) => {
+                spelled.insert(n.clone());
+            }
+            Token::QualifiedIdent { qualifier, .. }
+                if known.contains(&qualifier.to_ascii_lowercase()) =>
+            {
+                spelled.insert(qualifier.clone());
+            }
+            // 合成識別子 `$k` は字句解析器が作らない綴り（二重引用符付き識別子も `$` を含められず
+            // `unsupported quoted identifier` で字句解析が失敗する）ので、利用者の識別子と衝突しない。
+            Token::Param(k) => {
+                spelled.insert(format!("${k}"));
+            }
+            _ => {}
+        }
+    }
+    // `FETCH FIRST <変数> ROWS` の変数名を受理させるため、正規化も記録区間の下で行う（記録は使わない）。
+    let guard = colref_sink::enter(&all, spelled.iter().cloned());
+    let norm = normalize_statement(all);
+    drop(guard);
+    let norm = norm?;
+    if norm.get(..prefix.len()) != Some(prefix) {
+        return Err(oos_err(
+            "unsupported statement shape in a PL/pgSQL embedded SQL fragment",
+        ));
+    }
+    let analysis = norm
+        .iter()
+        .map(|t| match t {
+            Token::Param(k) => Token::Ident(format!("${k}")),
+            other => other.clone(),
+        })
+        .collect();
+    Ok(Prepared {
+        norm,
+        analysis,
+        spelled,
+        prefix_len: prefix.len(),
+    })
+}
+
+struct Run {
+    summary: Option<UnitSummary>,
+    report: ColrefReport,
+    /// 先送りのエラー（late binding）で解析が途中で終わった単位があった（記録が欠けうる）。
+    truncated: bool,
+}
+
+/// 記録区間の下で、ルートと、取り込まれたサブクエリ範囲（新しい範囲が出なくなるまで）を解析する。
+fn run_units(
+    cx: &Cx<'_>,
+    root: &[Token],
+    spelled: &HashSet<String>,
+) -> Result<Run, SqlSurfaceError> {
+    let guard = colref_sink::enter(root, spelled.iter().cloned());
+    let inner = run_units_inner(cx, root);
+    let report = guard.finish();
+    let (summary, truncated) = inner?;
+    Ok(Run {
+        summary,
+        report,
+        truncated,
+    })
+}
+
+fn run_units_inner(
+    cx: &Cx<'_>,
+    root: &[Token],
+) -> Result<(Option<UnitSummary>, bool), SqlSurfaceError> {
+    let mut truncated = false;
+    let summary = match cx.checker.check_unit(root, 0, true) {
+        Ok(s) => Some(s),
+        Err(e) if is_syntax_class(&e) => return Err(e),
+        Err(_) => {
+            truncated = true;
+            None
+        }
+    };
+    let mut done: Vec<Range<usize>> = Vec::new();
+    loop {
+        let all = colref_sink::pending_ranges();
+        let Some(next) = all.iter().find(|r| !done.contains(r)).cloned() else {
+            break;
+        };
+        if done.len() >= MAX_UNITS {
+            return Err(SqlSurfaceError::StatementTooComplex {
+                detail: "too many subqueries in a PL/pgSQL embedded SQL fragment",
+            });
+        }
+        let depth = unit_depth(&all, &next);
+        let Some(slice) = root.get(next.clone()) else {
+            return Err(oos_err(
+                "unsupported statement shape in a PL/pgSQL embedded SQL fragment",
+            ));
+        };
+        match cx.checker.check_unit(slice, depth, false) {
+            Ok(_) => {}
+            Err(e) if is_syntax_class(&e) => return Err(e),
+            Err(_) => truncated = true,
+        }
+        done.push(next);
+    }
+    Ok((summary, truncated))
+}
+
+/// 範囲の入れ子の深さ（自分を囲む範囲の数 + 1）。
+fn unit_depth(ranges: &[Range<usize>], r: &Range<usize>) -> usize {
+    1 + ranges
+        .iter()
+        .filter(|o| *o != r && o.start <= r.start && r.end <= o.end)
+        .count()
+}
+
+/// 解析器が拒否した原因が「リテラルしか受理しない位置の変数」かを確かめる。スコープ内の名前の識別子を
+/// すべて数値・文字列のリテラルへ置いて、ルートと取り込み範囲のすべてが受理されるなら、変数の置き場所が
+/// 非対応だったということなので `true`（呼び出し側が `0A000` にする）。スコープ内の名前が無い文は常に偽。
+fn failure_is_variable_position(cx: &Cx<'_>, prep: &Prepared) -> bool {
+    if prep.spelled.is_empty() {
+        return false;
+    }
+    let none = HashSet::new();
+    [
+        Token::Number("0".to_string()),
+        Token::StringLiteral("0".to_string()),
+    ]
+    .iter()
+    .any(|lit| {
+        let replaced: Vec<Token> = prep
+            .analysis
+            .iter()
+            .map(|t| match t {
+                Token::Ident(n) if prep.spelled.contains(n) => lit.clone(),
+                other => other.clone(),
+            })
+            .collect();
+        run_units(cx, &replaced, &none).is_ok()
+    })
+}
+
+/// 記録のトークンを PL/pgSQL のスコープで変数へ解決する。解決できなければ `None`。
+fn resolve_site(cx: &Cx<'_>, view: &ScopeView, tok: &Token) -> Option<VarRef> {
+    match tok {
+        Token::Ident(n) => match n.strip_prefix('$') {
+            Some(k) => {
+                let k: usize = k.parse().ok()?;
+                (k >= 1 && k <= cx.nparams)
+                    .then(|| VarRef::Var(VarId(u32::try_from(k - 1).unwrap_or(u32::MAX))))
+            }
+            None => view.lookup_var(&n.to_ascii_lowercase()).map(VarRef::Var),
+        },
+        Token::QualifiedIdent { qualifier, name } => {
+            view.lookup_qualified(&|id| cx.record_like(id), qualifier, name)
+        }
+        _ => None,
+    }
+}
+
+fn classify_prepared(cx: &Cx<'_>, view: &ScopeView, prep: &Prepared) -> Result<Classified, Fail> {
+    let run = run_units(cx, &prep.analysis, &prep.spelled).map_err(Fail::Parse)?;
+    if run.report.out_of_range {
+        return Err(verdict(
+            "unsupported statement shape for variable resolution in a PL/pgSQL body",
+        ));
+    }
+    let mut sites: Vec<VarSite> = Vec::new();
+    for rec in &run.report.records {
+        let Some(tok) = prep.analysis.get(rec.pos) else {
+            return Err(verdict("unsupported statement shape in a PL/pgSQL body"));
+        };
+        match resolve_site(cx, view, tok) {
+            Some(var) => {
+                if rec.pos < prep.prefix_len {
+                    return Err(verdict("unsupported statement shape in a PL/pgSQL body"));
+                }
+                sites.push(VarSite {
+                    pos: rec.pos,
+                    role: rec.role,
+                    var,
+                });
+            }
+            // リテラル専用位置は、スコープ内の名前だけが記録される。変数に解決できない名前（ラベル名等）は
+            // 受理しない。
+            None if rec.role == Role::LiteralSlot => {
+                return Err(verdict(
+                    "a name cannot be used at this position in a PL/pgSQL embedded SQL fragment",
+                ));
+            }
+            None => {}
+        }
+    }
+    // `$n` は必ず記録されていなければならない（未記録は列参照でない位置にあり、置換できない）。
+    for (i, t) in prep.norm.iter().enumerate() {
+        if matches!(t, Token::Param(_)) && !sites.iter().any(|s| s.pos == i) {
+            return Err(verdict(
+                "a positional parameter cannot be used at this position in a PL/pgSQL body",
+            ));
+        }
+    }
+    // 解析が途中で終わった場合、未記録の変数名の綴りは列参照だったかを判定できない（fail-closed）。
+    if run.truncated {
+        let recorded: HashSet<usize> = run.report.records.iter().map(|r| r.pos).collect();
+        for (i, t) in prep.analysis.iter().enumerate().skip(prep.prefix_len) {
+            let named = match t {
+                Token::Ident(n) => prep.spelled.contains(n),
+                Token::QualifiedIdent { qualifier, .. } => prep.spelled.contains(qualifier),
+                _ => false,
+            };
+            if named && !recorded.contains(&i) {
+                return Err(verdict(
+                    "a name cannot be classified in this PL/pgSQL embedded SQL fragment",
+                ));
+            }
+        }
+    }
+    // 参照する変数の種類数の上限（超えた時点で打ち切る。無制限に集合を育てない）。
+    let mut distinct: HashSet<VarId> = HashSet::new();
+    for s in &sites {
+        let (VarRef::Var(id) | VarRef::Field(id, _)) = &s.var;
+        distinct.insert(*id);
+        if distinct.len() > crate::plpgsql_limits::MAX_PLPGSQL_VARS_PER_STATEMENT {
+            return Err(Fail::Verdict(too_big_err(
+                "too many PL/pgSQL variables referenced in one statement",
+            )));
+        }
+    }
+    verify_positions(cx, prep, &run.report, &sites)?;
+    let tokens = prep.norm.get(prep.prefix_len..).unwrap_or(&[]).to_vec();
+    let sites = sites
+        .into_iter()
+        .map(|s| VarSite {
+            pos: s.pos - prep.prefix_len,
+            ..s
+        })
+        .collect();
+    Ok(Classified {
+        tokens,
+        sites,
+        summary: run.summary,
+    })
+}
+
+/// 変数の位置が、値（型付きリテラル）を置いても構文として成立するかを確かめる。成立しない位置（列名が
+/// そのまま構造になる窓の `PARTITION BY`／`ORDER BY`・`DISTINCT`・`RETURNING`・`IN (SELECT)` の左辺等）に
+/// 変数があれば `0A000`。呼び出し時（#2226）に値を置いても成立しない形を、定義時に拒否する。
+fn verify_positions(
+    cx: &Cx<'_>,
+    prep: &Prepared,
+    report: &ColrefReport,
+    sites: &[VarSite],
+) -> Result<(), Fail> {
+    if sites.is_empty() {
         return Ok(());
     }
-    Err(first.unwrap_or_else(|| syn_err("invalid expression in a PL/pgSQL body")))
+    let n = prep.analysis.len();
+    let mut replaced = prep.analysis.clone();
+    for s in sites {
+        if let Some(slot) = replaced.get_mut(s.pos) {
+            *slot = cx.dummy(&s.var);
+        }
+    }
+    // 速い経路: 全変数を型付きリテラルへ置いたまま、ルートと各範囲が成立するか。
+    let mut ok = true;
+    let units: Vec<(Range<usize>, usize, bool)> = std::iter::once((0..n, 0, true))
+        .chain(
+            report
+                .subquery_ranges
+                .iter()
+                .map(|r| (r.clone(), unit_depth(&report.subquery_ranges, r), false)),
+        )
+        .collect();
+    for (r, depth, is_root) in &units {
+        let Some(slice) = replaced.get(r.clone()) else {
+            return Err(verdict("unsupported statement shape in a PL/pgSQL body"));
+        };
+        if let Err(e) = cx.checker.check_unit(slice, *depth, *is_root) {
+            if is_syntax_class(&e) {
+                ok = false;
+                break;
+            }
+        }
+    }
+    if ok {
+        return Ok(());
+    }
+    // 遅い経路: 位置ごとに、数値・文字列のどちらかのリテラルで成立するか（他の変数は記録区間の下で
+    // そのまま識別子として受理させる）。
+    if sites.len() > MAX_PER_SITE_CHECKS {
+        return Err(verdict(
+            "too many variable references to validate in a PL/pgSQL embedded SQL fragment",
+        ));
+    }
+    for s in sites {
+        let (range, depth, is_root) = units
+            .iter()
+            .filter(|(r, _, _)| r.contains(&s.pos))
+            .min_by_key(|(r, _, _)| r.end - r.start)
+            .cloned()
+            .unwrap_or((0..n, 0, true));
+        let accepted = [
+            Token::Number("0".to_string()),
+            Token::StringLiteral("0".to_string()),
+        ]
+        .into_iter()
+        .any(|lit| {
+            let mut v = prep.analysis.clone();
+            if let Some(slot) = v.get_mut(s.pos) {
+                *slot = lit;
+            }
+            let guard = colref_sink::enter(&v, prep.spelled.iter().cloned());
+            let r = match v.get(range.clone()) {
+                Some(slice) => cx.checker.check_unit(slice, depth, is_root),
+                None => Ok(UnitSummary {
+                    kind: UnitKind::Select,
+                    has_write_cte: false,
+                }),
+            };
+            drop(guard);
+            match r {
+                Ok(_) => true,
+                Err(e) => !is_syntax_class(&e),
+            }
+        });
+        if !accepted {
+            return Err(verdict(
+                "a variable cannot be used at this position of a PL/pgSQL embedded SQL fragment",
+            ));
+        }
+    }
+    Ok(())
 }
 
-fn check_sql(
-    s: &EmbeddedSql,
-    body: &Body,
-    c: &dyn EmbeddedSqlChecker,
-) -> Result<(), SqlSurfaceError> {
-    c.check_syntax(substituted(&s.tokens, &s.var_refs, body))
+fn to_embedded_kind(k: UnitKind) -> EmbeddedKind {
+    match k {
+        UnitKind::Select => EmbeddedKind::Select,
+        UnitKind::Insert => EmbeddedKind::Insert,
+        UnitKind::Update => EmbeddedKind::Update,
+        UnitKind::Delete => EmbeddedKind::Delete,
+    }
 }
 
-fn check_stmts(
-    stmts: &[Stmt],
-    body: &Body,
-    c: &dyn EmbeddedSqlChecker,
+/// 埋め込み SQL 文 1 個を分類する。トークン列を正規化後のものへ置き換え、変数参照・文種・書き込みの
+/// 有無を確定する。
+fn classify_sql(cx: &Cx<'_>, s: &mut EmbeddedSql) -> Result<(), SqlSurfaceError> {
+    let view = s.scope.clone();
+    let prep = prepare(&view, &[], &s.tokens)?;
+    let c = match classify_prepared(cx, &view, &prep) {
+        Ok(c) => c,
+        Err(Fail::Verdict(e)) => return Err(e),
+        Err(Fail::Parse(e)) => {
+            return Err(if failure_is_variable_position(cx, &prep) {
+                oos_err("a variable cannot be used at this position of a PL/pgSQL embedded SQL fragment")
+            } else {
+                sanitize(&e)
+            })
+        }
+    };
+    let starts_with_with = matches!(
+        c.tokens.first(),
+        Some(Token::Ident(w)) if w.eq_ignore_ascii_case("WITH")
+    );
+    let (kind, write_cte) = match c.summary {
+        Some(sum) => (
+            if s.kind == EmbeddedKind::Perform {
+                EmbeddedKind::Perform
+            } else {
+                to_embedded_kind(sum.kind)
+            },
+            sum.has_write_cte,
+        ),
+        // ルートが late binding で終わった: `WITH` 始まりはデータ変更 CTE の有無を判定できない。
+        None if starts_with_with => {
+            return Err(oos_err(
+                "a WITH statement could not be classified in a PL/pgSQL body",
+            ))
+        }
+        None => (s.kind, false),
+    };
+    s.writes = matches!(
+        kind,
+        EmbeddedKind::Insert | EmbeddedKind::Update | EmbeddedKind::Delete
+    ) || write_cte;
+    s.kind = kind;
+    s.tokens = c.tokens;
+    s.var_refs = c.sites;
+    Ok(())
+}
+
+/// 式 1 個を分類する。値の式は `SELECT <式>`、許可リストが `WHERE` の中でしか受理しない比較・論理式は
+/// `SELECT 1 FROM <仮の表> WHERE <式>` の形で解析し、最初に受理された形の記録を採る。すべて拒否なら
+/// 本来の構文誤りとして最初のエラー（`42601`）を返す。
+fn classify_expr(cx: &Cx<'_>, e: &mut SqlExpr) -> Result<(), SqlSurfaceError> {
+    let select_prefix = vec![Token::Keyword(Keyword::Select)];
+    let cond_prefix = vec![
+        Token::Keyword(Keyword::Select),
+        Token::Number("1".to_string()),
+        Token::Keyword(Keyword::From),
+        Token::Ident(DUMMY_RELATION.to_string()),
+        Token::Keyword(Keyword::Where),
+    ];
+    let prefixes: Vec<&Vec<Token>> = if e.cond {
+        vec![&cond_prefix]
+    } else {
+        vec![&select_prefix, &cond_prefix]
+    };
+    let view = e.scope.clone();
+    let mut first: Option<SqlSurfaceError> = None;
+    let mut explained = false;
+    for prefix in prefixes {
+        let prep = prepare(&view, prefix, &e.tokens)?;
+        match classify_prepared(cx, &view, &prep) {
+            Ok(c) => {
+                e.tokens = c.tokens;
+                e.var_refs = c.sites;
+                return Ok(());
+            }
+            Err(Fail::Verdict(err)) => return Err(err),
+            Err(Fail::Parse(err)) => {
+                explained = explained || failure_is_variable_position(cx, &prep);
+                first.get_or_insert(err);
+            }
+        }
+    }
+    if explained {
+        return Err(oos_err(
+            "a variable cannot be used at this position of a PL/pgSQL embedded SQL fragment",
+        ));
+    }
+    Err(first.map_or_else(
+        || syn_err("invalid expression in a PL/pgSQL body"),
+        |err| sanitize(&err),
+    ))
+}
+
+fn walk_stmts(
+    stmts: &mut [Stmt],
+    vars: &mut [VarDecl],
+    cx: &Cx<'_>,
 ) -> Result<(), SqlSurfaceError> {
     for s in stmts {
         match s {
-            Stmt::Block(b) => check_block(b, body, c)?,
-            Stmt::Assign { expr, .. } => check_expr(expr, body, c)?,
+            Stmt::Block(b) => walk_block(b, vars, cx)?,
+            Stmt::Assign { expr, .. } => classify_expr(cx, expr)?,
             Stmt::If { branches, else_ } => {
                 for (cond, st) in branches {
-                    check_expr(cond, body, c)?;
-                    check_stmts(st, body, c)?;
+                    classify_expr(cx, cond)?;
+                    walk_stmts(st, vars, cx)?;
                 }
                 if let Some(st) = else_ {
-                    check_stmts(st, body, c)?;
+                    walk_stmts(st, vars, cx)?;
                 }
             }
             Stmt::Case {
@@ -999,22 +773,22 @@ fn check_stmts(
                 else_,
             } => {
                 if let Some(sel) = selector {
-                    check_expr(sel, body, c)?;
+                    classify_expr(cx, sel)?;
                 }
                 for (exprs, st) in whens {
                     for e in exprs {
-                        check_expr(e, body, c)?;
+                        classify_expr(cx, e)?;
                     }
-                    check_stmts(st, body, c)?;
+                    walk_stmts(st, vars, cx)?;
                 }
                 if let Some(st) = else_ {
-                    check_stmts(st, body, c)?;
+                    walk_stmts(st, vars, cx)?;
                 }
             }
-            Stmt::Loop { body: st, .. } => check_stmts(st, body, c)?,
+            Stmt::Loop { body: st, .. } => walk_stmts(st, vars, cx)?,
             Stmt::While { cond, body: st, .. } => {
-                check_expr(cond, body, c)?;
-                check_stmts(st, body, c)?;
+                classify_expr(cx, cond)?;
+                walk_stmts(st, vars, cx)?;
             }
             Stmt::ForInt {
                 lower,
@@ -1023,34 +797,34 @@ fn check_stmts(
                 body: st,
                 ..
             } => {
-                check_expr(lower, body, c)?;
-                check_expr(upper, body, c)?;
+                classify_expr(cx, lower)?;
+                classify_expr(cx, upper)?;
                 if let Some(e) = step {
-                    check_expr(e, body, c)?;
+                    classify_expr(cx, e)?;
                 }
-                check_stmts(st, body, c)?;
+                walk_stmts(st, vars, cx)?;
             }
             Stmt::ForQuery {
                 query, body: st, ..
             } => {
-                check_sql(query, body, c)?;
-                check_stmts(st, body, c)?;
+                classify_sql(cx, query)?;
+                walk_stmts(st, vars, cx)?;
             }
             Stmt::Exit { when, .. } | Stmt::Continue { when, .. } => {
                 if let Some(e) = when {
-                    check_expr(e, body, c)?;
+                    classify_expr(cx, e)?;
                 }
             }
             Stmt::Return(e) | Stmt::ReturnNext(e) => {
                 if let Some(e) = e {
-                    check_expr(e, body, c)?;
+                    classify_expr(cx, e)?;
                 }
             }
-            Stmt::ReturnQuery(q) | Stmt::Perform(q) | Stmt::Sql(q) => check_sql(q, body, c)?,
+            Stmt::ReturnQuery(q) | Stmt::Perform(q) | Stmt::Sql(q) => classify_sql(cx, q)?,
             Stmt::Execute { query, using, .. } => {
-                check_expr(query, body, c)?;
+                classify_expr(cx, query)?;
                 for e in using {
-                    check_expr(e, body, c)?;
+                    classify_expr(cx, e)?;
                 }
             }
             Stmt::GetDiagnostics { .. } | Stmt::Null => {}
@@ -1059,24 +833,39 @@ fn check_stmts(
     Ok(())
 }
 
-fn check_block(b: &Block, body: &Body, c: &dyn EmbeddedSqlChecker) -> Result<(), SqlSurfaceError> {
+fn walk_block(b: &mut Block, vars: &mut [VarDecl], cx: &Cx<'_>) -> Result<(), SqlSurfaceError> {
     for id in &b.decls {
-        if let Some(d) = body
-            .vars
-            .get(id.0 as usize)
-            .and_then(|v| v.default.as_ref())
-        {
-            check_expr(d, body, c)?;
+        if let Some(d) = vars.get_mut(id.0 as usize).and_then(|v| v.default.as_mut()) {
+            classify_expr(cx, d)?;
         }
     }
-    check_stmts(&b.stmts, body, c)
+    walk_stmts(&mut b.stmts, vars, cx)
 }
 
-/// 本体の全ての埋め込み SQL・式を、変数をダミーへ置換して `checker` へ渡す（ADR D3）。
+/// 本体の全ての埋め込み SQL・式を SQL 構文解析器の記録で分類し、変数参照（位置・役割・変数）・正規化後の
+/// トークン列・文種・書き込みの有無を AST へ書き込む（ADR D3）。構文誤り・範囲外は定義時に拒否する。
 /// 解析木の深さは `parse_body` が上限で抑えているため、再帰で辿ってよい。
 pub(crate) fn validate_embedded(
-    body: &Body,
+    body: &mut Body,
     checker: &dyn EmbeddedSqlChecker,
 ) -> Result<(), SqlSurfaceError> {
-    check_block(&body.block, body, checker)
+    let nparams = body
+        .vars
+        .iter()
+        .filter(|v| matches!(v.kind, super::ast::VarKind::Param(_)))
+        .count();
+    let cx = Cx {
+        checker,
+        vars: body
+            .vars
+            .iter()
+            .map(|v| VarInfo {
+                record_like: matches!(v.ty, DeclType::Record | DeclType::PercentRowType { .. }),
+                dummy: dummy_token(&v.ty),
+            })
+            .collect(),
+        nparams,
+    };
+    let Body { block, vars } = body;
+    walk_block(block, vars, &cx)
 }

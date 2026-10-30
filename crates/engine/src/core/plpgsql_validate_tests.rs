@@ -40,8 +40,8 @@ fn check(core: &EngineCore, src: &str) -> Result<(), SqlSurfaceError> {
         }],
         ReturnShape::Scalar,
     );
-    let body = parse_body(src, &opts)?;
-    validate_embedded(&body, core)
+    let mut body = parse_body(src, &opts)?;
+    validate_embedded(&mut body, core)
 }
 
 #[test]
@@ -129,4 +129,37 @@ fn boolean_expressions_validate_in_value_positions() {
         let e = check(&core, src).expect_err("syntax");
         assert_eq!(e.wire_code(), "42601", "for {src:?}");
     }
+}
+
+#[test]
+fn data_modifying_cte_is_classified_as_a_write_by_the_catalog_aware_checker() {
+    use crate::plpgsql::ast::{EmbeddedKind, Stmt};
+    let (core, _g) = new_core();
+    let opts = ParseOptions::new(vec![], ReturnShape::Void);
+    let mut body = parse_body(
+        "DECLARE v text := 'en'; BEGIN \
+         WITH d AS (DELETE FROM docs WHERE lang = v RETURNING lang) SELECT lang FROM d; END",
+        &opts,
+    )
+    .expect("parse");
+    validate_embedded(&mut body, &core).expect("classify");
+    let Some(Stmt::Sql(q)) = body.block.stmts.first() else {
+        panic!("sql");
+    };
+    assert_eq!(q.kind, EmbeddedKind::Select);
+    assert!(q.writes, "data-modifying CTE must be a write");
+    // 副文の WHERE の変数 `v` が記録される。
+    assert_eq!(q.var_refs.len(), 1);
+}
+
+#[test]
+fn data_modifying_cte_on_an_unknown_table_cannot_be_classified() {
+    // 表が無いと書き込みの実行形を判定できない（書き込みの有無を決められないので fail-closed）。
+    let (core, _g) = new_core();
+    let e = check(
+        &core,
+        "BEGIN WITH d AS (DELETE FROM no_such_table WHERE lang = 'x' RETURNING lang) SELECT lang FROM d; END",
+    )
+    .expect_err("must reject");
+    assert_eq!(e.wire_code(), "0A000");
 }
