@@ -969,3 +969,61 @@ fn error_messages_do_not_leak_names_or_values() {
 
 #[allow(dead_code)]
 fn _var_ref_is_used(_: &VarRef) {}
+
+#[test]
+fn for_propagating_exit_to_outer_label_sets_found() {
+    let int_for = "BEGIN <<b>> BEGIN FOR i IN 1..1 LOOP EXIT b; END LOOP; END b; RETURN FOUND; END";
+    let ret = || spec(ReturnShape::Scalar, Some(ColumnType::Boolean));
+    let r = run_with(
+        int_for,
+        &p_int(),
+        vec![int(0)],
+        ret(),
+        &mut ScriptedHost::default(),
+        PlpgsqlLimits::default(),
+    );
+    assert_eq!(value(r), Cell::Bool(true));
+    let q_for = "BEGIN <<b>> BEGIN FOR v IN SELECT x FROM t LOOP EXIT b; END LOOP; END b; \
+                 RETURN FOUND; END";
+    let mut host = ScriptedHost::default();
+    host.sql.push_back(rows(&[1]));
+    let r = run_with(
+        q_for,
+        &p_int(),
+        vec![int(0)],
+        ret(),
+        &mut host,
+        PlpgsqlLimits::default(),
+    );
+    assert_eq!(value(r), Cell::Bool(true));
+}
+
+#[test]
+fn execute_into_non_strict_dml_takes_first_row_without_p0003() {
+    let params = [("q", SqlColumnTypeName::Text)];
+    let src = "DECLARE v int; n int; BEGIN EXECUTE q INTO v; \
+               GET DIAGNOSTICS n = ROW_COUNT; RETURN v * 100 + n; END";
+    let mut host = ScriptedHost::default();
+    host.dynamic.push_back(dml_rows(&[7, 8]));
+    let r = run_with(
+        src,
+        &params,
+        vec![txt("UPDATE t SET x = 1 RETURNING x")],
+        spec(ReturnShape::Scalar, Some(ColumnType::Integer)),
+        &mut host,
+        PlpgsqlLimits::default(),
+    );
+    assert_eq!(ival(r), 702);
+    let strict = "DECLARE v int; BEGIN EXECUTE q INTO STRICT v; RETURN v; END";
+    let mut host = ScriptedHost::default();
+    host.dynamic.push_back(dml_rows(&[7, 8]));
+    let r = run_with(
+        strict,
+        &params,
+        vec![txt("UPDATE t SET x = 1 RETURNING x")],
+        spec(ReturnShape::Scalar, Some(ColumnType::Integer)),
+        &mut host,
+        PlpgsqlLimits::default(),
+    );
+    assert_eq!(err_code(r), "P0003");
+}

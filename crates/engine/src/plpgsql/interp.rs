@@ -770,7 +770,10 @@ impl<'a> Interp<'a> {
                     self.set_found(iterated)?;
                     return Ok(Flow::Normal);
                 }
-                LoopCtl::Propagate(f) => return Ok(f),
+                LoopCtl::Propagate(f) => {
+                    self.set_found(iterated)?;
+                    return Ok(f);
+                }
             }
             // int4 の範囲を溢れる次の値で終える（オーバーフローさせない）。
             let next = if reverse {
@@ -812,7 +815,10 @@ impl<'a> Interp<'a> {
                     self.set_found(iterated)?;
                     return Ok(Flow::Normal);
                 }
-                LoopCtl::Propagate(f) => return Ok(f),
+                LoopCtl::Propagate(f) => {
+                    self.set_found(iterated)?;
+                    return Ok(f);
+                }
             }
         }
         self.set_found(iterated)?;
@@ -968,7 +974,8 @@ impl<'a> Interp<'a> {
             .exec_dynamic(&text, &args, demand, &mut *self.budget)?;
         match into {
             Some(i) => {
-                self.apply_into(i, &out, out.dml, false)?;
+                // 複数行エラー（P0003）は STRICT のみ。非 STRICT は先頭行を代入し残りを捨てる。
+                self.apply_into(i, &out, false, false)?;
                 // 動的 SQL の ROW_COUNT は直前の文の行数をそのまま保つ（先頭行代入とは独立）。
                 self.row_count = out.row_count;
             }

@@ -140,8 +140,16 @@ fn convert(cell: &Cell, from: CastSrc, to: CastDst) -> Result<Cell, SqlSurfaceEr
                     from_expr(out, to)
                 }
                 CastDst::Float4 | CastDst::Float8 => {
+                    // 丸め済みの値を Float8 として渡す（整数用の検査で拒否させない）。
                     let v = ExprValue::Scalar(i as f64);
-                    let out = apply_cast(CastFn { from, to }, v).map_err(|e| sanitize(&e))?;
+                    let out = apply_cast(
+                        CastFn {
+                            from: CastSrc::Float8,
+                            to,
+                        },
+                        v,
+                    )
+                    .map_err(|e| sanitize(&e))?;
                     from_expr(out, to)
                 }
                 _ => Err(SqlSurfaceError::numeric_out_of_range(
@@ -262,6 +270,18 @@ mod tests {
         assert_eq!(
             assign_cast(int(100), &ColumnType::SmallInt).unwrap().cell,
             Cell::SignedInteger(100)
+        );
+    }
+
+    #[test]
+    fn large_bigint_to_double_rounds_instead_of_failing() {
+        let b = PlScalar::new(
+            Cell::SignedInteger(9_007_199_254_740_994),
+            ColumnType::BigInt,
+        );
+        assert_eq!(
+            assign_cast(b, &ColumnType::Double).unwrap().cell,
+            Cell::Float(9_007_199_254_740_994.0)
         );
     }
 
