@@ -175,6 +175,39 @@ pub(crate) fn assign_cast(v: PlScalar, to: &ColumnType) -> Result<PlScalar, SqlS
     let (Some(src), Some(dst)) = (src_of(&v.ty), dst_of(to)) else {
         return Err(unsupported());
     };
+    // bpchar → text／varchar は末尾の空白を除く（変換規則の文字列型の節）。
+    let mut v = v;
+    if matches!(v.ty, ColumnType::Bpchar(_))
+        && matches!(to, ColumnType::Text | ColumnType::Varchar(_))
+    {
+        if let Cell::Text(s) = &v.cell {
+            v.cell = Cell::Text(s.trim_end_matches(' ').to_string());
+        }
+    }
+    // 代入の変換は長さ超過を 22001 で拒否する（明示 CAST の黙った切り詰めとは別。超過部分が
+    // 空白のみなら受理して切り詰める）。文字列以外の値は出力変換した文字列で検査する。
+    let limit_of = match dst {
+        CastDst::Varchar(n) => n,
+        CastDst::Bpchar(n) => Some(n),
+        _ => None,
+    };
+    if let Some(n) = limit_of {
+        let text = match &v.cell {
+            Cell::Text(s) => Some(s.clone()),
+            other => match convert(other, src, CastDst::Text)? {
+                Cell::Text(s) => Some(s),
+                _ => None,
+            },
+        };
+        if let Some(t) = text {
+            let limit = usize::try_from(n).unwrap_or(usize::MAX);
+            if t.chars().count() > limit && t.chars().skip(limit).any(|c| c != ' ') {
+                return Err(SqlSurfaceError::string_data_right_truncation(
+                    "value too long for type",
+                ));
+            }
+        }
+    }
     let direct = match (cast_type_of_column(&v.ty), cast_type_of_column(to)) {
         (Some(f), Some(t)) => cast_type_assignable(&f, &t),
         _ => false,
@@ -259,6 +292,28 @@ mod tests {
     fn sanitize_keeps_string_truncation_sqlstate() {
         let e = SqlSurfaceError::string_data_right_truncation("x");
         assert_eq!(sanitize(&e).wire_code(), "22001");
+    }
+
+    #[test]
+    fn varchar_overflow_is_22001_but_trailing_spaces_truncate() {
+        let ty = ColumnType::Varchar(Some(3));
+        assert_eq!(code(assign_cast(text("abcdef"), &ty)), "22001");
+        assert_eq!(code(assign_cast(int(12345), &ty)), "22001");
+        let r = assign_cast(text("abc   "), &ty).unwrap();
+        assert_eq!(r.cell, Cell::Text("abc".to_string()));
+        assert_eq!(
+            code(assign_cast(text("abcdef"), &ColumnType::Bpchar(3))),
+            "22001"
+        );
+    }
+
+    #[test]
+    fn bpchar_to_text_strips_padding() {
+        let c = PlScalar::new(Cell::Text("x  ".to_string()), ColumnType::Bpchar(3));
+        let t = assign_cast(c.clone(), &ColumnType::Text).unwrap();
+        assert_eq!(t.cell, Cell::Text("x".to_string()));
+        let t = assign_cast(c, &ColumnType::Varchar(Some(5))).unwrap();
+        assert_eq!(t.cell, Cell::Text("x".to_string()));
     }
 
     #[test]
