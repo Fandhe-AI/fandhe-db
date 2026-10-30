@@ -218,6 +218,9 @@
   （欠番は許容。行・索引・台帳の取り消しとは別扱いで、D9 のエラー時の例外と同じ）
 - `--require-operation-id` 構成での `operation_id` 省略は、外側の文の段階で従来どおり `23502`
 
+> Issue #1728 の実装記録: [trigger-ledger-consistency.md](trigger-ledger-consistency.md)
+> （再送・越境・クラッシュ注入のテストで D10 を固定。本番コードの変更なし）。
+
 ### D11. 再帰（入れ子）の上限
 
 - トリガの入れ子の深さは専用のカウンタで数える。既定値＋起動時 CLI `--max-trigger-depth`
