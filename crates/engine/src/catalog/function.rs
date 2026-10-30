@@ -893,7 +893,8 @@ impl Storage {
     /// `scope` に関数定義を作り、払い出した内部 ID を返す。判定順は形状検証 → 同一
     /// `(関数名, 引数シグネチャ)` の既存（`Invalid`。SQLSTATE への写像は #1920 が決める）→ 件数
     /// 上限（`ViewLimitExceeded`）→ ID 払い出しと保存を同一 write txn・1 回の commit で行う。
-    /// `def.id` は無視される。本番経路は件数上限を起動時設定で渡す [`Self::create_function_with_limit`] を呼ぶ（Issue #1922。本関数は既定上限のテスト用ラッパー）。
+    /// `def.id` は無視される。本番経路は件数上限を起動時設定で渡す
+    /// [`Self::create_function_with_limit`] を呼ぶ（Issue #1922。本関数は既定上限のテスト用ラッパー）。
     #[cfg(test)]
     pub(crate) fn create_function(&self, scope: &str, def: &FunctionDef) -> Result<u64> {
         self.create_function_with_limit(scope, def, MAX_FUNCTIONS)
