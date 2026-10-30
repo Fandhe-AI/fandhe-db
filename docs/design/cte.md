@@ -374,3 +374,18 @@ CTE 本文の集計・`GROUP BY`・`SELECT DISTINCT`・ウィンドウ関数を�
 - `EXPLAIN`: 先頭が `SELECT` でないため派生表のゲートに入らず、CTE と同じく `42601`（JOIN・入れ子とも対象外）。
 - RLS-10 (b): 派生表は参照したセッションの `PolicyContext`・同一 `read_txn` の slot だけで評価され、別名が実表名と
   同じでも実表は読まれない。エラーは行・テナントに依存せず、内部名（`?derived`）は文言・結果列名に出ない。
+
+## Issue #2744 追記: 単一表の具体化経路での行 `id`（SQL-62・RLS-10 ポインタ）
+
+- 修正点: 単一表の外側（`view_buffered::plan_outer_parts`）が合成スキーマへ載せる公開 `id` 結果列の型を
+  `BIGINT` から numeric(20,0)（疑似列 `id` と同じ `ALIASED_ID_TYPE`）へ変えた。`BIGINT` だと
+  `normalize_cell` が `i64` 変換で `i64::MAX` 超の行 id を `22003` にしていた。JOIN 入力側
+  （`plan_rows_layer`）・再帰 CTE の作業表（`work_column`）と同じ写像に揃う。
+- 公告は変えない: 行形の結果列は `ColumnMeta::Id`・セルは `Cell::Integer(u64)` のまま。`ORDER BY id` の
+  比較クラスも従来どおり。NULL 可能な実列として束縛する性質（NULL を 0 と評価しない）も同じ。
+- 意図した型変化: 外側の `MIN`／`MAX(id)` と `GROUP BY id` のキー列は numeric(20,0)、`SUM`／`AVG(id)`・
+  `id` を引数にする窓関数は numeric 入力の型になる（値はインライン展開と一致）。
+- fail-closed: `id` 以外の `BIGINT` 列（`COUNT` 等）の `22003` は維持。`u64` を超えるリテラルは numeric
+  として比較され、どの行にも一致する形で切り詰めない。テナント境界の検査は変更しない。
+- 残置: `materialized_cte_statement` の `outer_may_evaluate_pseudo_id` によるインライン展開への
+  回避は残す（撤去は型公告差の扱いを含む別判断）。

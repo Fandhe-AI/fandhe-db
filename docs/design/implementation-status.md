@@ -1372,4 +1372,6 @@ Issue #1405（fix(engine)!: CREATE TYPE の型名の重複を 42710 で返す。
 
 **Issue #1728（test(engine): トリガ副作用と operation_id 台帳の整合を再送・越境・クラッシュ注入で固定する。親 #1720・TABLE-45 ポインタ。詳細は [trigger-ledger-consistency.md](trigger-ledger-consistency.md)）**: 本番コードは変更せず、D10 の性質（再送は `23505` でトリガ 0 回・副作用と採番が不変、トリガ内の書き込みは台帳に記録しない、3 テナントの境界とエラー文言、abort／SIGKILL 後の整合）を `core/trigger_ledger_tests.rs` で固定した。クラッシュ注入はトリガの呼び出し口が `cfg(test)` 限定のため自己再帰サブプロセス方式（新規 example・CI ジョブなし）。
 
+**Issue #2744（fix(engine): 単一表の具体化 CTE 経路で i64 を超える行 ID を正確に扱う。SQL-62・RLS-10 ポインタ。詳細は [cte.md](cte.md) の「Issue #2744 追記」節）**: `view_buffered::evaluable_type` が公開 `id` 結果列を numeric(20,0) の実列として束縛し、外側の述語・集計・窓が `i64::MAX` 超の行 id で `22003` にならない。結果列の公告は `Id` のまま。回帰テストは `tests/sql_t40_up/sql62_cte_single_table_huge_row_id.rs`。
+
 **Issue #1913（docs(design): wasmtime 採否の承認結果を記録する。親 #1911・EXT-9 ポインタ。詳細は [wasmtime-adoption.md](wasmtime-adoption.md) の第 8 節）**: 実装時点でオーナーの承認・却下は未取得だったため、記録先（#1911）とコメントが明示すべき項目、承認後の手順だけを確定した。ステータスは Proposed のままで、#1923〜#1928 の着手停止は継続する。#1913 はオーナー判断待ちで open のまま残る。依存・コードの変更なし（実際の追加は #1924）。

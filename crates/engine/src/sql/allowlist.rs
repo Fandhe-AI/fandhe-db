@@ -24492,10 +24492,11 @@ fn materialized_cte_statement(
             if projects_id && hazards.declares_real_id {
                 return None;
             }
-            // 具体化結果の疑似列 `id` は `BIGINT` として運ばれ、外側が値を評価（述語・集計・式・
-            // 並べ替え）すると `i64::MAX` 超の行 id で `22003` になる（インラインは `u64` のまま
-            // 評価できる。例: `MAX(id)`）。素通し射影（`*`・列名のみ）以外で `id` を読みうる外側は、
-            // 列別名で名前を追えない場合も含め安全側でインライン展開へ戻す（Issue #1860 レビュー指摘）。
+            // 具体化結果の外側の評価は `id` を numeric(20,0) で行う（Issue #2744）ため
+            // `i64::MAX` 超の行 id でも `22003` にならない。ただしインライン展開との型公告の差
+            // （`SUM`／`AVG(id)` の精度等）を避けるため、素通し射影（`*`・列名のみ）以外で `id` を
+            // 読みうる外側は、列別名で名前を追えない場合も含め現状は安全側でインライン展開へ戻す
+            // （Issue #1860 レビュー指摘。この回避の撤去は別判断）。
             let exposes_id = match &body_projection {
                 Projection::All => true,
                 Projection::Columns(names) => names.iter().any(|n| n.eq_ignore_ascii_case("id")),
