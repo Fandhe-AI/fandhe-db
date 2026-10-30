@@ -5916,6 +5916,8 @@ fn map_incremental_error(e: crate::incremental::IncrementalError) -> SqlSurfaceE
         IncrementalError::Write(TenantWriteError::TooManyRowsScanned { .. }) => {
             SqlSurfaceError::payload_too_large("too many rows scanned")
         }
+        // INSERT トリガの発火に未対応のファイル形 INSERT 拒否（`0A000`。Issue #1723）は行形と同じく透過する。
+        IncrementalError::Write(TenantWriteError::TriggerFailed(inner)) => inner,
         IncrementalError::Write(_) => SqlSurfaceError::Internal {
             detail: "incremental index write failed".to_string(),
         },

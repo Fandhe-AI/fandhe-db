@@ -2470,7 +2470,7 @@ pub(crate) fn insert_typed_rows_unchecked(
                     table,
                     written.len(),
                     ledger_outcome,
-                    allocated || id_omitted,
+                    allocated || id_omitted || sequence_rows.is_some(),
                 );
             }
             let row_table_name = user_rows_table_name(table);
@@ -6789,6 +6789,8 @@ pub(crate) fn replace_typed_rows_by_text_key(
         let mut removed_ids: Vec<RowId> = Vec::new();
         let outcome: Result<ReplaceOutcome, TenantWriteError> = (|| {
             let schema = require_table_schema_write(write_txn, table)?;
+            // INSERT トリガの発火に未対応の経路（Issue #1723）。台帳照合・行変更より前に拒否する。
+            guard_no_insert_triggers(write_txn, ctx.tenant_id(), table)?;
             let vector_idx = schema
                 .columns
                 .iter()

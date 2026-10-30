@@ -593,3 +593,68 @@ fn all_rows_skipped_without_operation_id_leaves_rowid_gap() {
         .expect("allocate");
     assert_eq!(next.start().raw_for_state(), 2, "skipped rowid was reused");
 }
+// 複数行 INSERT で SEQUENCE 値を払い出した後に全行を `NULL` 返却でスキップしても、払い出し済みの値は
+// 欠番になる（`NoOp` の abort で SEQUENCE の永続状態が巻き戻り、次の nextval が同じ値を再利用しない）。
+#[test]
+fn multi_row_all_skipped_keeps_sequence_state() {
+    let dir = tempdir();
+    let (core, _calls) = core_with(dir.path(), Box::new(|_| Ok(TriggerOutcome::Skip)));
+    let a = ctx("tenant-a");
+    add_trigger(&core.storage, "tenant-a", "trg", &before_row("skip"));
+    let mut s = SessionState::default();
+    s.allow_ddl();
+    core.execute_sql_in_session(&a, &mut s, "CREATE SEQUENCE s")
+        .expect("create sequence");
+    let out = run(
+        &core,
+        &a,
+        "INSERT INTO trg (id, embedding, a, n) VALUES \
+         (1, '[1.0,0.0]', 'x', nextval('s')), (2, '[1.0,0.0]', 'y', nextval('s'))",
+    )
+    .expect("skipped insert");
+    assert_eq!(rows_affected(out), 0);
+    run(
+        &core,
+        &a,
+        "INSERT INTO plain (id, embedding, a, n) VALUES (1, '[1.0,0.0]', 'z', nextval('s'))",
+    )
+    .expect("plain insert");
+    assert_eq!(
+        read_rows(&core, &a, "plain"),
+        vec![(1, "z".to_string(), 3)],
+        "skipped sequence values were reused"
+    );
+}
+
+// ファイル形 INSERT（`replace_typed_rows_by_text_key`）は発火に未対応のため、INSERT トリガのある表では
+// 台帳・行に触れる前に `0A000` で拒否する（黙ってトリガを飛ばさない）。
+#[test]
+fn file_shaped_insert_is_guarded_for_trigger_tables() {
+    let dir = tempdir();
+    let (core, calls) = core_with(dir.path(), fill_n());
+    let core = core.with_embedder(Box::new(
+        crate::embedding::HashingEmbedder::new(8).expect("dim"),
+    ));
+    let a = ctx("tenant-a");
+    core.storage
+        .create_table(&TableSchema::new(
+            "docs",
+            vec![
+                ColumnDef::new("embedding", ColumnType::Vector(8), false),
+                ColumnDef::new("path", ColumnType::Text, true),
+                ColumnDef::new("body", ColumnType::Text, true),
+            ],
+        ))
+        .expect("create docs");
+    add_trigger(&core.storage, "tenant-a", "docs", &before_row("t"));
+    let err = core
+        .execute_insert_sql(
+            &a,
+            "INSERT INTO docs (path, body) VALUES ('a.txt', 'hello world') \
+             USING OPERATION_ID 'op-file'",
+        )
+        .unwrap_err();
+    assert_eq!(err.wire_code(), "0A000", "{err:?}");
+    assert_eq!(calls.load(Ordering::SeqCst), 0);
+    assert_eq!(count(&core, &a, "docs"), 0);
+}
