@@ -113,6 +113,9 @@ mod trigger_statement_tests;
 // トリガの入れ子の発火と深さ上限（`54001`）の結合テスト（TABLE-45 (5)・Issue #1727）。
 #[cfg(test)]
 mod trigger_depth_tests;
+// トリガ副作用と operation_id 台帳の整合（再送・越境・クラッシュ注入）のテスト（TABLE-45・Issue #1728）。
+#[cfg(test)]
+mod trigger_ledger_tests;
 
 /// 検索 `k` の上限（直接 Rust API 用）。明示 `LIMIT` の既定値と同値だが、SQL／NoSQL の
 /// `LIMIT` 範囲は起動時設定（`result_limits::ResultLimits`。Issue #1555）が決め、本定数は
