@@ -1,16 +1,17 @@
-//! BEFORE ROW・AFTER ROW トリガの実行（TABLE-45・Issue #1723・#1724）。
+//! BEFORE ROW・AFTER ROW トリガの実行（TABLE-45・Issue #1723・#1724・#1725）。
 //!
-//! `tenant/trigger_insert.rs` が行ごとに呼ぶ。カタログ順（名前のバイト順）に各トリガの関数を
+//! `tenant/trigger_insert.rs`（INSERT）・`tenant/trigger_dml.rs`（UPDATE・DELETE）が行ごとに呼ぶ。
+//! カタログ順（名前のバイト順）に各トリガの関数を
 //! [`TriggerFunctionInvoker`](super::call::TriggerFunctionInvoker) 経由で呼び、前のトリガが返した行を
 //! 次のトリガの NEW とする。`NULL` 返却（[`TriggerOutcome::Skip`]）はその行の残りのトリガを呼ばずに終える。
 //! 呼び出し元は redb の表ハンドルを 1 つも開かずに呼ぶこと（トリガ本体が同じ write txn へ再入しても
 //! 排他を壊さない。実行モデルの D5）。
 //!
-//! AFTER ROW は文の終わりに、書いた行ごと・トリガ名のバイト順に呼ぶ（[`fire_after_row_insert`]）。
+//! AFTER ROW は文の終わりに、変更した行ごと・トリガ名のバイト順に呼ぶ（[`fire_after_row`]）。
 //! 戻り値は無視し（実行モデルの D3）、他表への書き込みは
 //! [`TriggerWriteHandle`](super::write_handle::TriggerWriteHandle) 経由で行う。
 
-use super::call::{TriggerCall, TriggerOutcome};
+use super::call::{TriggerCall, TriggerOp, TriggerOutcome};
 use super::runtime::TriggerRuntime;
 use super::write_handle::TriggerWriteHandle;
 use crate::catalog::trigger::{TriggerDef, TriggerTiming};
@@ -57,14 +58,18 @@ pub(crate) fn check_returned_row(
     Ok(())
 }
 
-/// `triggers`（INSERT・BEFORE・ROW のみ。カタログ順）を `new_row` に対して順に発火する。
-/// `Ok(None)` はその行の挿入をやめる（`NULL` 返却）、`Ok(Some(row))` は書き込む最終行。
-pub(crate) fn fire_before_row_insert(
+/// BEFORE ROW の連鎖の共通実体。`old`（UPDATE・DELETE の OLD）と `new_row`（INSERT・UPDATE の NEW。
+/// DELETE は空）を `op` に応じて渡す。`Ok(None)` は `NULL` 返却（その行の操作をやめる）、
+/// `Ok(Some(row))` は最終 NEW。
+#[allow(clippy::too_many_arguments)]
+fn fire_before_chain(
     runtime: &TriggerRuntime,
     writes: &TriggerWriteHandle<'_>,
     table: &str,
     schema: &TableSchema,
     triggers: &[TriggerDef],
+    op: TriggerOp,
+    old: Option<&[Value]>,
     new_row: Vec<Value>,
 ) -> Result<Option<Vec<Value>>, SqlSurfaceError> {
     let mut row = new_row;
@@ -81,6 +86,8 @@ pub(crate) fn fire_before_row_insert(
             function_key: &trigger.function_key,
             table,
             schema,
+            op,
+            old_row: old,
             new_row: &row,
             args: &trigger.tg_args,
             timing: TriggerTiming::Before,
@@ -89,24 +96,101 @@ pub(crate) fn fire_before_row_insert(
         match outcome {
             TriggerOutcome::Skip => return Ok(None),
             TriggerOutcome::Proceed(next) => {
-                check_returned_row(schema, &next)?;
-                row = next;
+                // DELETE は NEW を持たないため、返却行は使わず構造も検査しない（実行モデルの D3）。
+                if op != TriggerOp::Delete {
+                    check_returned_row(schema, &next)?;
+                    row = next;
+                }
             }
         }
     }
     Ok(Some(row))
 }
 
-/// `triggers`（INSERT・AFTER・ROW のみ。カタログ順）を、書いた 1 行の最終 NEW に対して順に発火する
-/// （Issue #1724）。戻り値（`Proceed`・`Skip`）は無視し、返却行の構造も検査しない（実行モデルの D3）。
-/// エラーは [`SqlSurfaceError`] のまま返し、呼び出し側（`tenant/trigger_insert.rs`）が文全体を
-/// 失敗させる。呼び出し元は redb の表ハンドルを 1 つも開かずに呼ぶこと。
-pub(crate) fn fire_after_row_insert(
+/// `triggers`（INSERT・BEFORE・ROW のみ。カタログ順）を `new_row` に対して順に発火する。
+/// `Ok(None)` はその行の挿入をやめる（`NULL` 返却）、`Ok(Some(row))` は書き込む最終行。
+pub(crate) fn fire_before_row_insert(
     runtime: &TriggerRuntime,
     writes: &TriggerWriteHandle<'_>,
     table: &str,
     schema: &TableSchema,
     triggers: &[TriggerDef],
+    new_row: Vec<Value>,
+) -> Result<Option<Vec<Value>>, SqlSurfaceError> {
+    fire_before_chain(
+        runtime,
+        writes,
+        table,
+        schema,
+        triggers,
+        TriggerOp::Insert,
+        None,
+        new_row,
+    )
+}
+
+/// `triggers`（UPDATE・BEFORE・ROW。カタログ順）を `old`（更新前の行）と `new_row`（`SET` 適用後の
+/// NEW の候補）に対して順に発火する（Issue #1725）。`Ok(None)` はその行の更新をやめる（`NULL` 返却）、
+/// `Ok(Some(row))` は書き込む最終 NEW。
+pub(crate) fn fire_before_row_update(
+    runtime: &TriggerRuntime,
+    writes: &TriggerWriteHandle<'_>,
+    table: &str,
+    schema: &TableSchema,
+    triggers: &[TriggerDef],
+    old: &[Value],
+    new_row: Vec<Value>,
+) -> Result<Option<Vec<Value>>, SqlSurfaceError> {
+    fire_before_chain(
+        runtime,
+        writes,
+        table,
+        schema,
+        triggers,
+        TriggerOp::Update,
+        Some(old),
+        new_row,
+    )
+}
+
+/// `triggers`（DELETE・BEFORE・ROW。カタログ順）を `old`（削除前の行）に対して順に発火する
+/// （Issue #1725）。`true` は削除を続行、`false` は `NULL` 返却（その行を削除しない）。続行時の返却行は
+/// 使わない（実行モデルの D3）。
+pub(crate) fn fire_before_row_delete(
+    runtime: &TriggerRuntime,
+    writes: &TriggerWriteHandle<'_>,
+    table: &str,
+    schema: &TableSchema,
+    triggers: &[TriggerDef],
+    old: &[Value],
+) -> Result<bool, SqlSurfaceError> {
+    let outcome = fire_before_chain(
+        runtime,
+        writes,
+        table,
+        schema,
+        triggers,
+        TriggerOp::Delete,
+        Some(old),
+        Vec::new(),
+    )?;
+    Ok(outcome.is_some())
+}
+
+/// `triggers`（AFTER・ROW のみ。カタログ順）を、変更した 1 行に対して順に発火する（Issue #1724・#1725）。
+/// INSERT は `old = None`・`new_row` が最終 NEW、UPDATE は `(OLD, 最終 NEW)`、DELETE は `old = Some` と
+/// 空の `new_row`。戻り値（`Proceed`・`Skip`）は無視し、返却行の構造も検査しない（実行モデルの D3）。
+/// エラーは [`SqlSurfaceError`] のまま返し、呼び出し側（`tenant/trigger_insert.rs`・`trigger_dml.rs`）が
+/// 文全体を失敗させる。呼び出し元は redb の表ハンドルを 1 つも開かずに呼ぶこと。
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn fire_after_row(
+    runtime: &TriggerRuntime,
+    writes: &TriggerWriteHandle<'_>,
+    table: &str,
+    schema: &TableSchema,
+    triggers: &[TriggerDef],
+    op: TriggerOp,
+    old: Option<&[Value]>,
     new_row: &[Value],
 ) -> Result<(), SqlSurfaceError> {
     for trigger in triggers {
@@ -121,6 +205,8 @@ pub(crate) fn fire_after_row_insert(
             function_key: &trigger.function_key,
             table,
             schema,
+            op,
+            old_row: old,
             new_row,
             args: &trigger.tg_args,
             timing: TriggerTiming::After,
@@ -128,4 +214,25 @@ pub(crate) fn fire_after_row_insert(
         })?;
     }
     Ok(())
+}
+
+/// `triggers`（INSERT・AFTER・ROW のみ）を、書いた 1 行の最終 NEW に対して順に発火する（Issue #1724）。
+pub(crate) fn fire_after_row_insert(
+    runtime: &TriggerRuntime,
+    writes: &TriggerWriteHandle<'_>,
+    table: &str,
+    schema: &TableSchema,
+    triggers: &[TriggerDef],
+    new_row: &[Value],
+) -> Result<(), SqlSurfaceError> {
+    fire_after_row(
+        runtime,
+        writes,
+        table,
+        schema,
+        triggers,
+        TriggerOp::Insert,
+        None,
+        new_row,
+    )
 }

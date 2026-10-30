@@ -187,6 +187,7 @@ impl EngineCore {
                         max_scanned_rows,
                         predicate,
                         project,
+                        Some(&self.trigger_runtime),
                     )
                 }
                 None => {
@@ -197,7 +198,7 @@ impl EngineCore {
                         probe.probe_delete(schema, c)
                     };
                     match project {
-                        None => crate::tenant::delete_rows_where_unchecked(
+                        None => crate::tenant::delete_rows_where_with_triggers(
                             target,
                             &plan.target.table,
                             ctx,
@@ -208,6 +209,7 @@ impl EngineCore {
                             max_affected_rows,
                             max_scanned_rows,
                             predicate,
+                            Some(&self.trigger_runtime),
                         ),
                         Some(project) => crate::tenant::delete_rows_where_capturing_unchecked(
                             target,

@@ -100,6 +100,9 @@ mod trigger_insert_tests;
 // AFTER ROW INSERT トリガの発火の結合テスト（TABLE-45・Issue #1724）。
 #[cfg(test)]
 mod trigger_after_insert_tests;
+// BEFORE・AFTER ROW UPDATE／DELETE トリガの発火の結合テスト（TABLE-45・Issue #1725）。
+#[cfg(test)]
+mod trigger_update_delete_tests;
 
 /// 検索 `k` の上限（直接 Rust API 用）。明示 `LIMIT` の既定値と同値だが、SQL／NoSQL の
 /// `LIMIT` 範囲は起動時設定（`result_limits::ResultLimits`。Issue #1555）が決め、本定数は
@@ -7529,6 +7532,9 @@ impl EngineCore {
                     detail: "internal error".to_string(),
                 })?;
                 let target = crate::tenant::WriteTarget::InTxn(write_txn);
+                // トリガ（BEFORE・AFTER）が書いた表も COMMIT 時の遅延 FK 検査の対象にする（Issue #1725）。
+                let trigger_scope =
+                    crate::tenant::trigger_writes::TriggerWrittenTablesScope::enter();
                 let (outcome, table) = match stmt {
                     crate::sql::allowlist::DeleteStatement::SingleRow(v) => {
                         let outcome = if v.returning.is_some() {
@@ -7560,6 +7566,9 @@ impl EngineCore {
                     }
                 };
                 txn.mark_written(ctx.tenant_id(), table);
+                for written in trigger_scope.take() {
+                    txn.mark_written(ctx.tenant_id(), &written);
+                }
                 Ok(outcome)
             }
             ParsedSql::Update(stmt) => {
@@ -7575,6 +7584,9 @@ impl EngineCore {
                     detail: "internal error".to_string(),
                 })?;
                 let target = crate::tenant::WriteTarget::InTxn(write_txn);
+                // トリガ（BEFORE・AFTER）が書いた表も COMMIT 時の遅延 FK 検査の対象にする（Issue #1725）。
+                let trigger_scope =
+                    crate::tenant::trigger_writes::TriggerWrittenTablesScope::enter();
                 let outcome = if has_returning {
                     crate::sql::SqlOutcome::Returning(
                         self.execute_update_returning_form(target, ctx, session, stmt)?,
@@ -7589,6 +7601,9 @@ impl EngineCore {
                     crate::sql::allowlist::ValidatedUpdateForm::Predicate(v) => v.table_name(),
                 };
                 txn.mark_written(ctx.tenant_id(), table);
+                for written in trigger_scope.take() {
+                    txn.mark_written(ctx.tenant_id(), &written);
+                }
                 Ok(outcome)
             }
             ParsedSql::Truncate(stmt) => {
@@ -14036,7 +14051,13 @@ impl EngineCore {
         stmt: &crate::sql::allowlist::ValidatedDelete,
     ) -> Result<crate::sql::exec::DeleteOutcome, crate::sql::allowlist::SqlSurfaceError> {
         let bound = crate::sql::parser::bind_delete(stmt)?;
-        crate::sql::exec::execute_delete_in(target, ctx, &bound, self.dml_ledger_mode())
+        crate::sql::exec::execute_delete_in(
+            target,
+            ctx,
+            &bound,
+            self.dml_ledger_mode(),
+            Some(&self.trigger_runtime),
+        )
     }
 
     /// [`Self::execute_sql_in_session`] の `DELETE`（述語形。SQL-19・TASK-192、
@@ -14153,6 +14174,7 @@ impl EngineCore {
             &content_hash_value,
             self.dml_limits.max_affected_rows,
             self.scan_limits.max_scanned_rows(),
+            Some(&self.trigger_runtime),
         )
     }
 
@@ -14703,6 +14725,7 @@ impl EngineCore {
             &bound,
             self.dml_ledger_mode(),
             Some(&schema),
+            Some(&self.trigger_runtime),
         )
     }
 
@@ -14774,6 +14797,7 @@ impl EngineCore {
                 &bound,
                 self.dml_ledger_mode(),
                 Some(&schema),
+                Some(&self.trigger_runtime),
             );
         };
         // SQL-53（Issue #1751）: WHERE 内のサブクエリは束縛の前に書き込み txn のスナップショットで解決する。
@@ -14991,6 +15015,7 @@ impl EngineCore {
             legacy_hashes,
             self.dml_limits.max_affected_rows,
             self.scan_limits.max_scanned_rows(),
+            Some(&self.trigger_runtime),
         )
     }
 
