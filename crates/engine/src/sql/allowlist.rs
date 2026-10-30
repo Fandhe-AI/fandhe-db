@@ -15,6 +15,7 @@ use crate::datetime::DateTimeLiteralError;
 use crate::error_format::{ClassifiedError, ErrorClass};
 use crate::recovery::required_op_id::LedgerMode;
 use crate::sql::cast::CastType;
+use crate::sql::colref_sink::RegisterInner as _;
 use crate::sql::copy_options;
 use crate::sql::ddl_column_type::StaticColumnType;
 use crate::sql::grouping_sets::{
@@ -31,7 +32,7 @@ use crate::sql::udf_call::{
     MAX_CASE_NESTING, MAX_EXPR_DEPTH, MAX_EXPR_NODES, MAX_FUNCTION_CALL_ARGS, MAX_UDF_PARAMS,
 };
 use crate::sql::using_operation_id::OperationId;
-use crate::sql::where_negation::negate_conjunction;
+use crate::sql::where_negation::{expr_node_count, negate_conjunction};
 
 mod grouped_window;
 // TRIGGER DDL の構文検証（TABLE-45・Issue #1722）。
@@ -6297,6 +6298,9 @@ struct Parser<'a> {
     /// 非修飾の `Expr::Ident` へ正規化するが、曖昧性検査（`42702`）は非修飾で書かれた名前にだけ
     /// 適用する必要があり、その区別をここで運ぶ。
     dml_from_unqualified: Vec<String>,
+    /// `Parser::new` が `Token::QuotedNull` 等を降格した複製を持つ間だけ、元のトークン列への 1 対 1 の
+    /// 別名を `colref_sink` へ登録しておくガード（記録区間が無ければ何もしない）。
+    _colref_alias: super::colref_sink::AliasGuard,
 }
 
 /// WHERE の式述語 1 葉の解析結果（[`Parser::parse_expression_predicate`]）。`<>` は式の AST に
@@ -6310,10 +6314,24 @@ enum ExprLeaf {
     /// 式左辺の `<式> [NOT] LIKE|ILIKE '<lit>' [ESCAPE '<c>']`（SQL-54・Issue #1782）。
     /// 中身は [`WherePredicate::Prefix`]、後置 `NOT` ありなら `Not(Prefix)`。
     Like(WherePredicate),
+    /// 式左辺の `[NOT] BETWEEN`・`[NOT] IN (list)`（SQL-24 の拡張）。比較の連言（`BETWEEN`）・
+    /// `Or`（`IN`）へ脱糖済みで、後置 `NOT` は構文段で葉まで押し下げ済み。呼び出し元は前置 `NOT` の
+    /// 奇数個だけ [`negate_conjunction`] で反転する。
+    Preds(Vec<WherePredicate>),
+}
+
+/// 式左辺の述語の後置語（`IS [NOT] NULL`・`[NOT] BETWEEN`・`[NOT] IN (`）。
+/// [`Parser::expr_lhs_postfix_at`] が先読みで判定する。`kw_len` は後置語が占めるトークン数。
+#[derive(Clone, Copy)]
+enum ExprPostfix {
+    IsNull { negated: bool, kw_len: usize },
+    Between { negated: bool, kw_len: usize },
+    InList { negated: bool, kw_len: usize },
 }
 
 impl<'a> Parser<'a> {
     fn new(tokens: &'a [Token]) -> Self {
+        let original = tokens;
         let mut quoted_null = Vec::new();
         // ALTER 文には WHERE 述語葉が無いため、字句段が残した `"true"`／`"false"` の印は
         // 引用付き識別子として `quoted_null` に記録する（Issue #1635 USING 式の列参照保護）。
@@ -6341,7 +6359,12 @@ impl<'a> Parser<'a> {
         } else {
             std::borrow::Cow::Borrowed(tokens)
         };
+        let _colref_alias = match &tokens {
+            std::borrow::Cow::Owned(copy) => super::colref_sink::register_alias(copy, original),
+            std::borrow::Cow::Borrowed(_) => super::colref_sink::AliasGuard::none(),
+        };
         Self {
+            _colref_alias,
             tokens,
             quoted_null,
             pos: 0,
@@ -6372,6 +6395,41 @@ impl<'a> Parser<'a> {
             dml_from_unqualified: Vec::new(),
             legacy_implicit_id: false,
         }
+    }
+
+    /// 位置 `idx` のトークンを列参照として `colref_sink` へ記録する（記録区間が無ければ何もしない）。
+    fn sink_mark(&self, idx: usize, role: super::colref_sink::Role) {
+        if let Some(t) = self.tokens.get(idx) {
+            super::colref_sink::record(t, role);
+        }
+    }
+
+    /// 現在位置のトークンがスコープ内変数の名前の `Ident` か（記録区間が無ければ常に偽）。
+    /// リテラル専用位置でのみ受理を広げる分岐の条件に使う。
+    fn peek_is_scope_var_at(&self, idx: usize) -> bool {
+        matches!(self.tokens.get(idx), Some(Token::Ident(n)) if super::colref_sink::is_scope_var(n))
+    }
+
+    /// 位置 `idx` が、修飾子がスコープ内変数の名前の `QualifiedIdent`（レコード変数の `rec.field`）か
+    /// （記録区間が無ければ常に偽）。式として読む位置の振り分けにだけ使う。
+    fn peek_is_scope_record_at(&self, idx: usize) -> bool {
+        matches!(
+            self.tokens.get(idx),
+            Some(Token::QualifiedIdent { qualifier, .. }) if super::colref_sink::is_scope_var(qualifier)
+        )
+    }
+
+    /// リテラルしか受理しない位置で、現在位置がスコープ内変数の名前なら 1 トークン消費して
+    /// [`super::colref_sink::Role::LiteralSlot`] を記録し `true` を返す（記録区間が無ければ常に
+    /// `false` で何も消費しない＝従来どおりの構文エラー経路へ進む）。呼び出し側は戻り値が真のとき
+    /// 値の代わりにプレースホルダを返す（ガード下の AST は分類専用で実行しない）。
+    fn take_scope_var_slot(&mut self) -> bool {
+        if !self.peek_is_scope_var_at(self.pos) {
+            return false;
+        }
+        self.sink_mark(self.pos, super::colref_sink::Role::LiteralSlot);
+        self.advance();
+        true
     }
 
     /// `CREATE TABLE` を従来方式（暗黙の `id` 疑似列を持つ）として検証する（TABLE-23・Issue #2199。
@@ -6479,7 +6537,7 @@ impl<'a> Parser<'a> {
                     .ok_or_else(|| {
                         SqlSurfaceError::unsupported("malformed scalar subquery boundary")
                     })?
-                    .to_vec();
+                    .to_vec_registered();
                 self.embedded_scalars.push((
                     open_idx,
                     EmbeddedScalarSubquery {
@@ -6739,6 +6797,9 @@ impl<'a> Parser<'a> {
     }
 
     fn expect_string_literal(&mut self) -> Result<String, SqlSurfaceError> {
+        if self.take_scope_var_slot() {
+            return Ok(String::new());
+        }
         match self.advance() {
             Some(Token::StringLiteral(s)) => Ok(s.clone()),
             other => Err(SqlSurfaceError::unsupported(format!(
@@ -6748,6 +6809,9 @@ impl<'a> Parser<'a> {
     }
 
     fn expect_number(&mut self) -> Result<String, SqlSurfaceError> {
+        if self.take_scope_var_slot() {
+            return Ok("0".to_string());
+        }
         match self.advance() {
             Some(Token::Number(n)) => Ok(n.clone()),
             other => Err(SqlSurfaceError::unsupported(format!(
@@ -6898,6 +6962,7 @@ impl<'a> Parser<'a> {
                 } else if next_is_op {
                     self.parse_projection_infix(0)?
                 } else {
+                    self.sink_mark(self.pos, super::colref_sink::Role::SelectItemBare);
                     let col = self.expect_ident()?;
                     // Issue #1540（SQL-42）: 裸の列・疑似列 `id` への `AS` 別名。
                     // 別名なしは従来どおり `Column`（`Projection::Columns` を保つ）。
@@ -6915,13 +6980,21 @@ impl<'a> Parser<'a> {
             Some(Token::Punct('(' | '-')) | Some(Token::Number(_)) => {
                 self.parse_projection_infix(0)?
             }
+            // 記録区間でのスコープ内レコード変数の `rec.field`（式の列参照の腕が受理して記録する。
+            // 記録区間が無ければ守りが偽で、下の既定腕の `42601` のまま）。
+            Some(Token::QualifiedIdent { .. }) if self.peek_is_scope_record_at(self.pos) => {
+                self.parse_projection_infix(0)?
+            }
             // Issue #1593: `'1'::int` のように文字列リテラルへ `::` が続く形だけ式項目として扱う。
             Some(Token::StringLiteral(_))
                 if matches!(self.tokens.get(self.pos + 1), Some(Token::TypeCast)) =>
             {
                 self.parse_projection_infix(0)?
             }
-            _ => return Ok(SelectItem::Column(self.expect_ident()?)),
+            _ => {
+                self.sink_mark(self.pos, super::colref_sink::Role::SelectItemBare);
+                return Ok(SelectItem::Column(self.expect_ident()?));
+            }
         };
         let has_alias = self.peek_ident_matches("AS");
         // `(n)` ≡ `n`: 別名なしの括弧付き裸識別子は列項目へ戻す（`Projection::Columns` を保つ）。
@@ -6935,6 +7008,9 @@ impl<'a> Parser<'a> {
                 ));
             }
             if !has_alias {
+                // 括弧付きの裸識別子 `(n)` は列項目へ戻すため、直前に式の列参照として記録した位置の
+                // 役割を別名なしの裸識別子へ付け替える（`expr` が識別子 1 個のときだけ到達）。
+                super::colref_sink::retag_last_value(super::colref_sink::Role::SelectItemBare);
                 return Ok(SelectItem::Column(name.clone()));
             }
         }
@@ -7081,7 +7157,7 @@ impl<'a> Parser<'a> {
             .tokens
             .get((open_idx + 1)..close_idx)
             .ok_or_else(|| SqlSurfaceError::unsupported("malformed scalar subquery boundary"))?
-            .to_vec();
+            .to_vec_registered();
         self.pos = close_idx + 1;
         let alias = if self.peek_ident_matches("AS") {
             self.advance();
@@ -7253,6 +7329,7 @@ impl<'a> Parser<'a> {
         if self.peek_contextual_keyword("PARTITION") {
             self.advance();
             self.expect_keyword(Keyword::By)?;
+            self.sink_mark(self.pos, super::colref_sink::Role::Value);
             partition_by.push(self.expect_ident()?);
             while matches!(self.peek(), Some(Token::Punct(','))) {
                 self.advance();
@@ -7261,6 +7338,7 @@ impl<'a> Parser<'a> {
                         "too many PARTITION BY columns",
                     ));
                 }
+                self.sink_mark(self.pos, super::colref_sink::Role::Value);
                 partition_by.push(self.expect_ident()?);
             }
         }
@@ -7272,6 +7350,7 @@ impl<'a> Parser<'a> {
                 if order_by.len() >= self.max_window_keys {
                     return Err(SqlSurfaceError::payload_too_large("too many ORDER BY keys"));
                 }
+                self.sink_mark(self.pos, super::colref_sink::Role::Value);
                 let column = self.expect_ident()?;
                 let descending = if self.peek_ident_matches("DESC") {
                     self.advance();
@@ -8099,6 +8178,7 @@ impl<'a> Parser<'a> {
         {
             return self.parse_aggregate_expr_item(None);
         }
+        self.sink_mark(self.pos, super::colref_sink::Role::SelectItemBare);
         let column = self.expect_ident()?;
         let alias = if self.peek_ident_matches("AS") {
             self.advance();
@@ -8122,6 +8202,7 @@ impl<'a> Parser<'a> {
                 .get(self.pos.saturating_add(1))
                 .is_none_or(is_group_key_boundary);
         if is_plain_column || !self.allow_aggregate_expr_items {
+            self.sink_mark(self.pos, super::colref_sink::Role::GroupKey);
             return Ok(RawGroupKey::Column(self.expect_ident()?));
         }
         let start = self.pos;
@@ -8148,7 +8229,11 @@ impl<'a> Parser<'a> {
             ));
         }
         Ok(match expr {
-            Expr::Ident(column) => RawGroupKey::Column(column),
+            Expr::Ident(column) => {
+                // 括弧で囲んだだけの列（`(a)`）は列キーへ正規化するため役割も付け替える。
+                super::colref_sink::retag_last_value(super::colref_sink::Role::GroupKey);
+                RawGroupKey::Column(column)
+            }
             other => RawGroupKey::Expr(other),
         })
     }
@@ -8704,6 +8789,7 @@ impl<'a> Parser<'a> {
                     other => (String::new(), Some(other), None),
                 }
             } else {
+                self.sink_mark(self.pos, super::colref_sink::Role::OrderKey);
                 (self.expect_ident()?, None, None)
             };
             let descending = if self.peek_ident_matches("DESC") {
@@ -8919,7 +9005,8 @@ impl<'a> Parser<'a> {
                 let is_value_group = matches!(
                     self.tokens.get(close_idx + 1),
                     Some(token) if is_where_group_operator_token(token)
-                ) || self.like_follows_group(close_idx);
+                ) || self.like_follows_group(close_idx)
+                    || self.postfix_follows_group(close_idx);
                 if !is_value_group {
                     let next_depth = depth
                         .checked_add(1)
@@ -8947,7 +9034,8 @@ impl<'a> Parser<'a> {
             let is_value_group = matches!(
                 self.tokens.get(close_idx + 1),
                 Some(token) if is_where_group_operator_token(token)
-            ) || self.like_follows_group(close_idx);
+            ) || self.like_follows_group(close_idx)
+                || self.postfix_follows_group(close_idx);
             if !is_value_group {
                 let next_depth = depth
                     .checked_add(1)
@@ -8966,6 +9054,16 @@ impl<'a> Parser<'a> {
             // （`parse_primary_expr` が '(' expr ')' を再帰的に処理する）。
         }
         self.parse_where_leaf(extra_close_paren, set_operators, leaf_count)
+    }
+
+    /// 閉じ括弧 `close_idx` の直後が式左辺の後置語（`IS [NOT] NULL`・`[NOT] BETWEEN`・`[NOT] IN (`）か。
+    /// 真なら括弧は論理グループではなく値式（`(a + 1) IS NULL` 等）で、式述語へ委譲する。
+    /// CHECK 本体では後置語を受理しないため常に偽（従来どおり）。
+    fn postfix_follows_group(&self, close_idx: usize) -> bool {
+        !self.in_check_body
+            && close_idx
+                .checked_add(1)
+                .is_some_and(|i| self.expr_lhs_postfix_at(i).is_some())
     }
 
     /// `(` の位置（`open_idx`）に対応する `)` のトークン位置を探す。`get()` のみを
@@ -9012,7 +9110,11 @@ impl<'a> Parser<'a> {
         if let (Some(from_ref), Some(Token::QualifiedIdent { qualifier, .. })) =
             (self.from_ref.as_ref(), self.peek())
         {
-            from_ref.ensure_qualifier(qualifier)?;
+            // 記録区間でスコープ内レコード変数の `rec.field` として残された修飾子は表の公開名ではない
+            // ため照合しない（記録区間が無ければ守りが偽で従来どおり）。
+            if !super::colref_sink::is_scope_var(qualifier) {
+                from_ref.ensure_qualifier(qualifier)?;
+            }
         }
         let predicates: Vec<WherePredicate> = if let Some(leaf) =
             self.try_parse_const_bool_leaf(extra_close_paren, set_operators)
@@ -9134,6 +9236,10 @@ impl<'a> Parser<'a> {
                         vec![WherePredicate::Expression(eq)],
                         &mut self.expr_node_budget,
                     )?,
+                    ExprLeaf::Preds(preds) if negate_odd => {
+                        negate_conjunction(preds, &mut self.expr_node_budget)?
+                    }
+                    ExprLeaf::Preds(preds) => preds,
                 }
             }
         } else {
@@ -9145,6 +9251,7 @@ impl<'a> Parser<'a> {
                     vec![WherePredicate::Expression(eq)],
                     &mut self.expr_node_budget,
                 )?,
+                ExprLeaf::Preds(preds) => preds,
             }
         };
         *leaf_count = leaf_count.checked_add(1).ok_or_else(|| {
@@ -9230,6 +9337,22 @@ impl<'a> Parser<'a> {
         if let Some((negated, kw_len)) = self.similar_at(self.pos) {
             return self.parse_similar_rest(negated, kw_len, lhs);
         }
+        // 左辺が式の `IS [NOT] NULL`・`[NOT] BETWEEN`・`[NOT] IN (list)`（SQL-24 の拡張）。CHECK 本体では
+        // 従来どおり受理しない（下の比較演算子検査が `42601`）。
+        if !self.in_check_body {
+            match self.expr_lhs_postfix_at(self.pos) {
+                Some(ExprPostfix::IsNull { negated, kw_len }) => {
+                    return self.parse_expr_lhs_is_null(negated, kw_len, lhs);
+                }
+                Some(ExprPostfix::Between { negated, kw_len }) => {
+                    return self.parse_expr_lhs_between(negated, kw_len, lhs);
+                }
+                Some(ExprPostfix::InList { negated, kw_len }) => {
+                    return self.parse_expr_lhs_in_list(negated, kw_len, lhs);
+                }
+                None => {}
+            }
+        }
         if let Expr::JsonAccess { op, .. } = &lhs {
             if op.is_predicate() && !self.peek_is_cmp_op() {
                 return Ok(ExprLeaf::Plain(lhs));
@@ -9288,6 +9411,181 @@ impl<'a> Parser<'a> {
         })
     }
 
+    /// `tokens[idx]` が式左辺の後置語（`IS [NOT] NULL`・`[NOT] BETWEEN`・`[NOT] IN (`）なら種別を返す
+    /// （消費しない）。`IN (SELECT ...)` は式左辺では未対応のため `None`（従来どおり `42601`）。
+    /// `IS [NOT] DISTINCT FROM` は呼び出し元が先に処理する。先読みは `get()` のみ。
+    fn expr_lhs_postfix_at(&self, idx: usize) -> Option<ExprPostfix> {
+        let word = |i: usize, k: &str| matches!(self.tokens.get(i), Some(Token::Ident(w)) if w.eq_ignore_ascii_case(k));
+        if word(idx, "IS") {
+            let (negated, null_at) = if word(idx.checked_add(1)?, "NOT") {
+                (true, idx.checked_add(2)?)
+            } else {
+                (false, idx.checked_add(1)?)
+            };
+            if word(null_at, "NULL") && !self.quoted_null.contains(&null_at) {
+                return Some(ExprPostfix::IsNull {
+                    negated,
+                    kw_len: null_at.checked_add(1)?.checked_sub(idx)?,
+                });
+            }
+            return None;
+        }
+        let (negated, kw) = if word(idx, "NOT") {
+            (true, idx.checked_add(1)?)
+        } else {
+            (false, idx)
+        };
+        let kw_len = kw.checked_add(1)?.checked_sub(idx)?;
+        if word(kw, "BETWEEN") {
+            return Some(ExprPostfix::Between { negated, kw_len });
+        }
+        if word(kw, "IN")
+            && matches!(self.tokens.get(kw.checked_add(1)?), Some(Token::Punct('(')))
+            && !matches!(
+                self.tokens.get(kw.checked_add(2)?),
+                Some(Token::Keyword(Keyword::Select))
+            )
+        {
+            return Some(ExprPostfix::InList { negated, kw_len });
+        }
+        None
+    }
+
+    /// 式ノード予算から `n` 個を課金する（左辺式の複製分など、まとめて課金する用途）。
+    fn charge_expr_nodes(&mut self, n: usize) -> Result<(), SqlSurfaceError> {
+        self.expr_node_budget = self.expr_node_budget.checked_sub(n).ok_or_else(|| {
+            SqlSurfaceError::payload_too_large("expression exceeds the allowed node count")
+        })?;
+        Ok(())
+    }
+
+    /// 式左辺の `<式> IS [NOT] NULL`（SQL-24 の拡張）。`IS NOT DISTINCT FROM NULL` と同値で、結果は
+    /// 常に真偽値（NULL にならない）。AST は既存の [`Expr::IsDistinctFrom`] に写し、`where_negation` が
+    /// 前置 `NOT` を `negated` の反転へ押し下げる（三値論理でも厳密）。
+    fn parse_expr_lhs_is_null(
+        &mut self,
+        negated: bool,
+        kw_len: usize,
+        lhs: Expr,
+    ) -> Result<ExprLeaf, SqlSurfaceError> {
+        self.pos = self.pos.saturating_add(kw_len);
+        // `Null` リテラルと `IsDistinctFrom` の 2 ノード。
+        self.charge_expr_nodes(2)?;
+        Ok(ExprLeaf::Plain(Expr::IsDistinctFrom {
+            // `x IS NULL` は `x IS NOT DISTINCT FROM NULL`（`negated` は IS NOT DISTINCT FROM 側の印）。
+            negated: !negated,
+            lhs: Box::new(lhs),
+            rhs: Box::new(Expr::Null),
+        }))
+    }
+
+    /// 式左辺の `<式> [NOT] BETWEEN <下限> AND <上限>`（SQL-24 の拡張）。`<式> >= 下限 AND
+    /// <式> <= 上限` の連言へ脱糖し、`NOT BETWEEN` は [`negate_conjunction`]（De Morgan。Kleene 三値論理
+    /// でも厳密）で葉まで押し下げる。`SYMMETRIC`／`ASYMMETRIC` は未対応（`42601`）。左辺の複製分は
+    /// 式ノード予算へ課金する。
+    fn parse_expr_lhs_between(
+        &mut self,
+        negated: bool,
+        kw_len: usize,
+        lhs: Expr,
+    ) -> Result<ExprLeaf, SqlSurfaceError> {
+        self.pos = self.pos.saturating_add(kw_len);
+        if matches!(self.peek(), Some(Token::Ident(w))
+            if (w.eq_ignore_ascii_case("SYMMETRIC") || w.eq_ignore_ascii_case("ASYMMETRIC"))
+                && !self.quoted_null.contains(&self.pos))
+        {
+            return Err(SqlSurfaceError::unsupported(
+                "BETWEEN SYMMETRIC/ASYMMETRIC is not supported",
+            ));
+        }
+        let low = self.parse_value_expr_with_null_context(0, true)?;
+        match self.advance() {
+            Some(Token::Keyword(Keyword::And)) => {}
+            other => {
+                return Err(SqlSurfaceError::unsupported(format!(
+                    "expected AND in BETWEEN, got {other:?}"
+                )))
+            }
+        }
+        let high = self.parse_value_expr_with_null_context(0, true)?;
+        // 左辺の複製 1 回分と `Binary` 2 ノード。
+        self.charge_expr_nodes(expr_node_count(&lhs).saturating_add(2))?;
+        let binary = |op: BinOp, l: Expr, r: Expr| {
+            WherePredicate::Expression(Expr::Binary {
+                op,
+                lhs: Box::new(l),
+                rhs: Box::new(r),
+            })
+        };
+        let preds = vec![
+            binary(BinOp::Ge, lhs.clone(), low),
+            binary(BinOp::Le, lhs, high),
+        ];
+        Ok(ExprLeaf::Preds(if negated {
+            negate_conjunction(preds, &mut self.expr_node_budget)?
+        } else {
+            preds
+        }))
+    }
+
+    /// 式左辺の `<式> [NOT] IN (<値式>, ...)`（SQL-24 の拡張）。`<式> = e1 OR <式> = e2 ...` の
+    /// [`WherePredicate::Or`] へ脱糖し（要素 1 個は単独の比較）、`NOT IN` は [`negate_conjunction`] で
+    /// 葉まで押し下げる。要素数は積む前に [`MAX_IN_LIST_ITEMS`] で検査する（`54000`）。空リスト・
+    /// 要素のカンマ／閉じ括弧の不備は `42601`。左辺の複製分は式ノード予算へ課金する。
+    fn parse_expr_lhs_in_list(
+        &mut self,
+        negated: bool,
+        kw_len: usize,
+        lhs: Expr,
+    ) -> Result<ExprLeaf, SqlSurfaceError> {
+        self.pos = self.pos.saturating_add(kw_len);
+        self.expect_punct('(')?;
+        if matches!(self.peek(), Some(Token::Punct(')'))) {
+            return Err(SqlSurfaceError::unsupported("IN list must not be empty"));
+        }
+        let lhs_nodes = expr_node_count(&lhs);
+        let mut branches: Vec<Vec<WherePredicate>> = Vec::new();
+        loop {
+            if branches.len() >= MAX_IN_LIST_ITEMS {
+                return Err(SqlSurfaceError::payload_too_large(format!(
+                    "IN list item count exceeds limit {MAX_IN_LIST_ITEMS}"
+                )));
+            }
+            let element = self.parse_value_expr_with_null_context(0, true)?;
+            // 左辺の複製 1 回分と `Binary` 1 ノード。
+            self.charge_expr_nodes(lhs_nodes.saturating_add(1))?;
+            branches.push(vec![WherePredicate::Expression(Expr::Binary {
+                op: BinOp::Eq,
+                lhs: Box::new(lhs.clone()),
+                rhs: Box::new(element),
+            })]);
+            match self.peek() {
+                Some(Token::Punct(',')) => {
+                    self.advance();
+                }
+                Some(Token::Punct(')')) => {
+                    self.advance();
+                    break;
+                }
+                other => {
+                    return Err(SqlSurfaceError::unsupported(format!(
+                        "expected ',' or ')' in IN list, got {other:?}"
+                    )))
+                }
+            }
+        }
+        let preds = if branches.len() == 1 {
+            branches.pop().unwrap_or_default()
+        } else {
+            vec![WherePredicate::Or(branches)]
+        };
+        Ok(ExprLeaf::Preds(if negated {
+            negate_conjunction(preds, &mut self.expr_node_budget)?
+        } else {
+            preds
+        }))
+    }
+
     /// `tokens[idx]` から `[NOT] LIKE|ILIKE '<文字列リテラル>'` が並んでいれば
     /// `(negated, case_insensitive, キーワード部のトークン数)` を返す（消費しない。SQL-54・
     /// Issue #1782）。パターンが文字列リテラルでない形（`$n`・列・式・`::` 型キャスト付き）は
@@ -9307,7 +9605,9 @@ impl<'a> Parser<'a> {
             return None;
         };
         let lit = kw.checked_add(1)?;
-        if !matches!(self.tokens.get(lit), Some(Token::StringLiteral(_)))
+        if self.peek_is_scope_var_at(lit) {
+            // 記録区間でスコープ内変数がパターン位置に置かれた形（`parse_like_rest` が消費して記録）。
+        } else if !matches!(self.tokens.get(lit), Some(Token::StringLiteral(_)))
             || literal_followed_by_typecast(&self.tokens, lit)
         {
             return None;
@@ -9336,12 +9636,13 @@ impl<'a> Parser<'a> {
         let ok = match self.tokens.get(pat) {
             Some(Token::StringLiteral(_)) => !literal_followed_by_typecast(&self.tokens, pat),
             Some(Token::Ident(w)) => {
-                w.eq_ignore_ascii_case("NULL")
-                    && !self.quoted_null.contains(&pat)
-                    && !matches!(
-                        self.tokens.get(pat.saturating_add(1)),
-                        Some(Token::TypeCast)
-                    )
+                super::colref_sink::is_scope_var(w)
+                    || (w.eq_ignore_ascii_case("NULL")
+                        && !self.quoted_null.contains(&pat)
+                        && !matches!(
+                            self.tokens.get(pat.saturating_add(1)),
+                            Some(Token::TypeCast)
+                        ))
             }
             _ => false,
         };
@@ -9365,7 +9666,9 @@ impl<'a> Parser<'a> {
             });
         }
         self.advance();
-        let pattern = if matches!(self.peek(), Some(Token::StringLiteral(_))) {
+        let pattern = if matches!(self.peek(), Some(Token::StringLiteral(_)))
+            || self.peek_is_scope_var_at(self.pos)
+        {
             Expr::String(self.expect_string_literal()?)
         } else {
             self.advance();
@@ -9669,6 +9972,18 @@ impl<'a> Parser<'a> {
     fn try_parse_numeric_list_leaf(
         &mut self,
     ) -> Result<Option<Vec<WherePredicate>>, SqlSurfaceError> {
+        let head = self.pos;
+        let leaf = self.try_parse_numeric_list_leaf_inner()?;
+        if leaf.is_some() {
+            self.sink_mark(head, super::colref_sink::Role::WhereHead);
+        }
+        Ok(leaf)
+    }
+
+    /// [`Self::try_parse_numeric_list_leaf`] の本体（先頭の列識別子の記録は呼び出し側が行う）。
+    fn try_parse_numeric_list_leaf_inner(
+        &mut self,
+    ) -> Result<Option<Vec<WherePredicate>>, SqlSurfaceError> {
         if self.in_check_body {
             return Ok(None);
         }
@@ -9684,11 +9999,13 @@ impl<'a> Parser<'a> {
             self.tokens.get(kw_idx),
             Some(Token::Ident(w)) if w.eq_ignore_ascii_case("IN")
         ) && matches!(self.tokens.get(kw_idx + 1), Some(Token::Punct('(')))
-            && self.signed_number_at(kw_idx + 2);
+            && (self.signed_number_at(kw_idx + 2)
+                || self.scope_var_list_head_is_numeric(kw_idx + 2));
         let is_between = matches!(
             self.tokens.get(kw_idx),
             Some(Token::Ident(w)) if w.eq_ignore_ascii_case("BETWEEN")
-        ) && self.signed_number_at(kw_idx + 1);
+        ) && (self.signed_number_at(kw_idx + 1)
+            || self.scope_var_between_is_numeric(kw_idx + 1));
         if !is_in && !is_between {
             return Ok(None);
         }
@@ -9751,6 +10068,44 @@ impl<'a> Parser<'a> {
         }
     }
 
+    /// 記録区間で `IN (` の先頭要素がスコープ内変数のとき、数値リスト形として読んでよいか。
+    /// リスト内（対応する `)` まで）に文字列リテラルがあれば文字列リスト形が担当するため偽。
+    /// 記録区間が無ければ常に偽（従来の判定を変えない）。
+    fn scope_var_list_head_is_numeric(&self, idx: usize) -> bool {
+        if !self.peek_is_scope_var_at(idx) {
+            return false;
+        }
+        let mut depth = 0usize;
+        for tok in self.tokens.iter().skip(idx) {
+            match tok {
+                Token::Punct('(') => depth = depth.saturating_add(1),
+                Token::Punct(')') => {
+                    if depth == 0 {
+                        return true;
+                    }
+                    depth -= 1;
+                }
+                Token::StringLiteral(_) => return false,
+                _ => {}
+            }
+        }
+        false
+    }
+
+    /// 記録区間で `BETWEEN` の下限がスコープ内変数のとき、数値の範囲形として読んでよいか。
+    /// 上限が文字列リテラルなら文字列形が担当するため偽。記録区間が無ければ常に偽。
+    fn scope_var_between_is_numeric(&self, idx: usize) -> bool {
+        self.peek_is_scope_var_at(idx)
+            && matches!(
+                self.tokens.get(idx.saturating_add(1)),
+                Some(Token::Keyword(Keyword::And))
+            )
+            && !matches!(
+                self.tokens.get(idx.saturating_add(2)),
+                Some(Token::StringLiteral(_))
+            )
+    }
+
     /// `tokens[idx..]` の先頭が符号なし数値、または `-` + 数値のペアか（Issue #1430）。
     fn signed_number_at(&self, idx: usize) -> bool {
         match self.tokens.get(idx) {
@@ -9764,6 +10119,9 @@ impl<'a> Parser<'a> {
     /// 数値リスト形（`IN`／`BETWEEN`）の構文段から呼ばれる。`what` はエラー文言用で
     /// リテラル本文は含めない（Issue #1430・SQL-24）。
     fn expect_signed_number(&mut self, what: &str) -> Result<String, SqlSurfaceError> {
+        if self.take_scope_var_slot() {
+            return Ok("0".to_string());
+        }
         let negative = matches!(self.peek(), Some(Token::Punct('-')));
         if negative {
             self.advance();
@@ -9826,6 +10184,26 @@ impl<'a> Parser<'a> {
         extra_close_paren: bool,
         set_operators: bool,
     ) -> Result<Option<WherePredicate>, SqlSurfaceError> {
+        let head = self.pos;
+        let leaf = self.try_parse_structural_leaf_inner(extra_close_paren, set_operators)?;
+        // 先頭の識別子を列として確定した葉だけを記録する（`EXISTS (...)`・`name()` 形の述語呼び出しは
+        // 先頭が列ではない）。
+        if matches!(
+            leaf,
+            Some(ref p)
+                if !matches!(p, WherePredicate::Exists { .. } | WherePredicate::PredicateCall { .. })
+        ) {
+            self.sink_mark(head, super::colref_sink::Role::WhereHead);
+        }
+        Ok(leaf)
+    }
+
+    /// [`Self::try_parse_structural_leaf`] の本体（先頭の列識別子の記録は呼び出し側が行う）。
+    fn try_parse_structural_leaf_inner(
+        &mut self,
+        extra_close_paren: bool,
+        set_operators: bool,
+    ) -> Result<Option<WherePredicate>, SqlSurfaceError> {
         // 引用付き `"true"`／`"false"` は列名（従来経路）。未引用の真偽リテラルは
         // `try_parse_const_bool_leaf` が先に畳むため、ここへ来る `true`／`false`
         // は引用付きか、畳み込み対象外の文脈（CHECK 本体・`TRUE = x` 等）だけ。
@@ -9861,7 +10239,7 @@ impl<'a> Parser<'a> {
                 .tokens
                 .get((open_idx + 1)..close_idx)
                 .ok_or_else(|| SqlSurfaceError::unsupported("malformed EXISTS subquery boundary"))?
-                .to_vec();
+                .to_vec_registered();
             self.pos = close_idx + 1;
             return Ok(Some(WherePredicate::Exists {
                 inner_tokens,
@@ -9888,7 +10266,7 @@ impl<'a> Parser<'a> {
                 .tokens
                 .get((open_idx + 1)..close_idx)
                 .ok_or_else(|| SqlSurfaceError::unsupported("malformed IN subquery boundary"))?
-                .to_vec();
+                .to_vec_registered();
             self.pos = close_idx + 1;
             return Ok(Some(WherePredicate::InSubquery {
                 column: name,
@@ -9930,7 +10308,7 @@ impl<'a> Parser<'a> {
                         .ok_or_else(|| {
                             SqlSurfaceError::unsupported("malformed ANY/ALL subquery boundary")
                         })?
-                        .to_vec();
+                        .to_vec_registered();
                     self.pos = close_idx + 1;
                     return Ok(Some(WherePredicate::QuantifiedSubqueryCompare {
                         column: name,
@@ -9978,7 +10356,7 @@ impl<'a> Parser<'a> {
                     .ok_or_else(|| {
                         SqlSurfaceError::unsupported("malformed scalar subquery boundary")
                     })?
-                    .to_vec();
+                    .to_vec_registered();
                 self.pos = close_idx + 1;
                 return Ok(Some(WherePredicate::ScalarSubqueryCompare {
                     column: name,
@@ -10188,7 +10566,7 @@ impl<'a> Parser<'a> {
                     .ok_or_else(|| {
                         SqlSurfaceError::unsupported("malformed NOT IN subquery boundary")
                     })?
-                    .to_vec();
+                    .to_vec_registered();
                 self.pos = close_idx + 1;
                 return Ok(Some(WherePredicate::Not(Box::new(
                     WherePredicate::InSubquery {
@@ -10267,7 +10645,17 @@ impl<'a> Parser<'a> {
         }
         let mut values = Vec::new();
         loop {
-            match self.advance() {
+            // 記録区間でスコープ内変数が置かれた要素はプレースホルダの文字列要素にする。
+            let slot = self.take_scope_var_slot();
+            match if slot { None } else { self.advance() } {
+                _ if slot => {
+                    if values.len() >= MAX_IN_LIST_ITEMS {
+                        return Err(SqlSurfaceError::payload_too_large(format!(
+                            "IN list item count exceeds limit {MAX_IN_LIST_ITEMS}"
+                        )));
+                    }
+                    values.push(String::new());
+                }
                 Some(Token::StringLiteral(s)) => {
                     if values.len() >= MAX_IN_LIST_ITEMS {
                         return Err(SqlSurfaceError::payload_too_large(format!(
@@ -11066,12 +11454,14 @@ impl<'a> Parser<'a> {
             }
             // `ON CONFLICT ... DO UPDATE SET` の右辺だけで有効な修飾列参照（SQL-49、Issue #1739）。
             Some(Token::QualifiedIdent { qualifier, name }) if self.upsert_table.is_some() => {
+                self.sink_mark(self.pos, super::colref_sink::Role::Value);
                 self.advance();
                 self.consume_expr_node()?;
                 self.resolve_upsert_qualified_column(&qualifier, name)
             }
             // `UPDATE ... SET <式> ... FROM` の右辺だけで有効な修飾列参照（SQL-53 (b)、Issue #1754）。
             Some(Token::QualifiedIdent { qualifier, name }) if self.dml_from_target.is_some() => {
+                self.sink_mark(self.pos, super::colref_sink::Role::Value);
                 self.advance();
                 self.consume_expr_node()?;
                 if self.dml_from_target.as_deref() == Some(qualifier.as_str()) {
@@ -11081,6 +11471,18 @@ impl<'a> Parser<'a> {
                     "UPDATE ... FROM: expressions referencing FROM-clause tables are not supported yet",
                 ))
             }
+            // `colref_sink` の記録区間でだけ有効な、スコープ内レコード変数の `rec.field`
+            // （`qualified_column` が表の公開名として解決できず残した修飾子）。記録区間が無いときは
+            // 守りが偽で、従来どおり下の `other` 腕（`42601`）へ落ちる。AST は分類専用で、
+            // 修飾子を落とした列名の識別子にしておく。
+            Some(Token::QualifiedIdent { qualifier, name })
+                if super::colref_sink::is_scope_var(&qualifier) =>
+            {
+                self.sink_mark(self.pos, super::colref_sink::Role::Value);
+                self.advance();
+                self.consume_expr_node()?;
+                Ok(Expr::Ident(name))
+            }
             Some(Token::Ident(name)) => {
                 // 予約接頭辞で始まる識別子（引用識別子での偽装）は `EXCLUDED.<列>` の解決結果と
                 // 区別できないため拒否する（fail-closed。SQL-49、Issue #1739）。
@@ -11089,6 +11491,7 @@ impl<'a> Parser<'a> {
                         "reserved identifier prefix in ON CONFLICT SET expression",
                     ));
                 }
+                let ident_at = self.pos;
                 self.advance();
                 if matches!(self.peek(), Some(Token::Punct('('))) {
                     self.parse_call_expr(name, depth)
@@ -11097,6 +11500,7 @@ impl<'a> Parser<'a> {
                     if self.dml_from_target.is_some() {
                         self.dml_from_unqualified.push(name.clone());
                     }
+                    self.sink_mark(ident_at, super::colref_sink::Role::Value);
                     Ok(Expr::Ident(name))
                 }
             }
@@ -11856,9 +12260,11 @@ impl<'a> Parser<'a> {
     /// 許可された名前（[`is_allowed_order_by_function_name`]）のみを受理し、
     /// 未知の名前は拒否する。
     fn parse_order_by(&mut self) -> Result<OrderByForm, SqlSurfaceError> {
+        let name_at = self.pos;
         let name = self.expect_ident()?;
         match self.peek() {
             Some(Token::DistanceOp) => {
+                self.sink_mark(name_at, super::colref_sink::Role::OrderKey);
                 self.advance();
                 let literal = self.expect_string_literal()?;
                 Ok(OrderByForm::Distance {
@@ -11919,6 +12325,7 @@ impl<'a> Parser<'a> {
                 // 算術で始まるキー・括弧始まりは従来どおり構文拒否（`42601`）。
                 Key::Expr(self.parse_value_expr(0)?)
             } else {
+                self.sink_mark(self.pos, super::colref_sink::Role::OrderKey);
                 Key::Column(self.expect_ident()?)
             };
             if matches!(
@@ -12044,6 +12451,8 @@ impl<'a> Parser<'a> {
         match self.peek() {
             // Issue #1848: 式の内側のスカラーサブクエリを受理する文脈では `( SELECT ...)` 始まりも式キー。
             Some(Token::Punct('(')) if self.embedded_scalar_ok && self.at_paren_select() => true,
+            // 記録区間でのスコープ内レコード変数の `rec.field`（記録区間が無ければ偽）。
+            Some(Token::QualifiedIdent { .. }) if self.peek_is_scope_record_at(self.pos) => true,
             // Issue #1593: `ORDER BY '2026-10-10'::date`／`1::int`（CAST 形と同じく式キー）。
             Some(Token::StringLiteral(_) | Token::Number(_))
                 if matches!(self.tokens.get(self.pos + 1), Some(Token::TypeCast)) =>
@@ -12103,11 +12512,13 @@ impl<'a> Parser<'a> {
         match name.to_ascii_uppercase().as_str() {
             "HYBRID_RRF" | "HYBRID" => {
                 let mut args = Vec::new();
+                self.sink_mark(self.pos, super::colref_sink::Role::Value);
                 args.push(FunctionArg::Ident(self.expect_ident()?));
                 self.expect_punct(',')?;
                 args.push(FunctionArg::StringLiteral(self.expect_string_literal()?));
                 if matches!(self.peek(), Some(Token::Punct(','))) {
                     self.advance();
+                    self.sink_mark(self.pos, super::colref_sink::Role::Value);
                     args.push(FunctionArg::Ident(self.expect_ident()?));
                     self.expect_punct(',')?;
                     args.push(FunctionArg::StringLiteral(self.expect_string_literal()?));
@@ -12456,6 +12867,8 @@ impl<'a> Parser<'a> {
                         || s.eq_ignore_ascii_case("null"));
                 !plain_keyword
             }
+            // 記録区間でスコープ内レコード変数の `rec.field` で始まる式（記録区間が無ければ偽）。
+            Some(Token::QualifiedIdent { .. }) => self.peek_is_scope_record_at(self.pos),
             _ => false,
         };
         if !is_expr_start {
@@ -12510,7 +12923,9 @@ impl<'a> Parser<'a> {
             }
             // `UPDATE ... FROM` の右辺だけ、修飾列参照で始まる式（`t.a + 1`）を式として解析する
             // （SQL-53 (b)、Issue #1754。それ以外の文脈では従来どおり `42601`）。
-            Some(Token::QualifiedIdent { .. }) => self.dml_from_target.is_some(),
+            Some(Token::QualifiedIdent { .. }) => {
+                self.dml_from_target.is_some() || self.peek_is_scope_record_at(self.pos)
+            }
             _ => false,
         };
         if !is_expr_start {
@@ -13227,7 +13642,16 @@ impl<'a> Parser<'a> {
             end = end.saturating_add(1);
         }
         if !rewrites.is_empty() {
+            // 借用のトークン列を複製して書き換えるため、複製を元の位置へ換算できるよう 1 対 1 の別名を
+            // `colref_sink` へ登録し直す（既に複製を持つ場合は領域が動かないので登録済みのまま）。
+            let borrowed_src: Option<&'a [Token]> = match &self.tokens {
+                std::borrow::Cow::Borrowed(b) => Some(*b),
+                std::borrow::Cow::Owned(_) => None,
+            };
             let tokens = self.tokens.to_mut();
+            if let Some(src) = borrowed_src {
+                self._colref_alias = super::colref_sink::register_alias(tokens, src);
+            }
             for (idx, replacement) in rewrites {
                 if let Some(slot) = tokens.get_mut(idx) {
                     *slot = replacement;
@@ -13287,6 +13711,19 @@ impl<'a> Parser<'a> {
         let parsed = self.try_parse_upsert_add_inner(column);
         if !matches!(parsed, Ok(Some(_))) {
             self.pos = start;
+        } else {
+            // 加算形が確定したときだけ、右辺の左オペランド（既存行の列）と `EXCLUDED.<col>` の
+            // オペランドを列参照として記録する（棄却した試行では記録しない）。
+            self.sink_mark(start, super::colref_sink::Role::Value);
+            if matches!(
+                parsed,
+                Ok(Some(UpsertValue::Add {
+                    operand: UpsertAddOperand::Excluded(_),
+                    ..
+                }))
+            ) {
+                self.sink_mark(start.saturating_add(2), super::colref_sink::Role::Value);
+            }
         }
         parsed
     }
@@ -13371,6 +13808,7 @@ impl<'a> Parser<'a> {
             if qualifier.eq_ignore_ascii_case("EXCLUDED")
                 && self.at_upsert_value_end(self.pos.saturating_add(1))
             {
+                self.sink_mark(self.pos, super::colref_sink::Role::Value);
                 self.advance();
                 return Ok((column, UpsertValue::Excluded(name)));
             }
@@ -13844,7 +14282,9 @@ impl<'a> Parser<'a> {
                     self.advance();
                     DmlFromReturningItem::QualifiedAll(qualifier)
                 }
-                _ => DmlFromReturningItem::Column(self.parse_join_colref()?),
+                _ => DmlFromReturningItem::Column(
+                    self.parse_join_colref_as(super::colref_sink::Role::SelectItemBare)?,
+                ),
             };
             if self.peek_ident_matches("AS") || matches!(self.peek(), Some(Token::Punct('('))) {
                 return Err(SqlSurfaceError::unsupported(
@@ -16174,7 +16614,7 @@ impl<'a> Parser<'a> {
                     "duplicate CTE name: {name}"
                 )));
             }
-            let body = inner.to_vec();
+            let body = inner.to_vec_registered();
             self.pos = self.tokens.len().saturating_sub(after.len());
             defs.push(RawRecursiveDef {
                 name,
@@ -16228,7 +16668,7 @@ impl<'a> Parser<'a> {
         }
         Ok(RecursiveWithHeader {
             defs,
-            main_tokens: self.remaining().to_vec(),
+            main_tokens: self.remaining().to_vec_registered(),
         })
     }
 }
@@ -20254,6 +20694,21 @@ impl<'a> Parser<'a> {
     /// `colref := <ident> | <qualifier>.<ident>`（`Token::QualifiedIdent`。
     /// SQL-20・TASK-193 由来の字句を JOIN の列参照解決へ再利用する）。
     fn parse_join_colref(&mut self) -> Result<ColumnRef, SqlSurfaceError> {
+        self.parse_join_colref_as(super::colref_sink::Role::Value)
+    }
+
+    /// [`Self::parse_join_colref`] の役割指定版。読んだトークンを列参照として `colref_sink` へ
+    /// 記録する（JOIN 系の列参照はすべてここを通る）。
+    fn parse_join_colref_as(
+        &mut self,
+        role: super::colref_sink::Role,
+    ) -> Result<ColumnRef, SqlSurfaceError> {
+        if matches!(
+            self.peek(),
+            Some(Token::Ident(_) | Token::QuotedBoolWord(_) | Token::QualifiedIdent { .. })
+        ) {
+            self.sink_mark(self.pos, role);
+        }
         match self.advance() {
             // 引用付き `"true"`／`"false"` は列名（従来経路。Issue #1526・PR #2297 指摘）。
             Some(Token::Ident(name)) | Some(Token::QuotedBoolWord(name)) => {
@@ -20678,7 +21133,7 @@ fn parse_join_select_list(p: &mut Parser<'_>) -> Result<JoinSelectList, SqlSurfa
             has_aggregate = true;
             items.push(parse_join_aggregate_item(p)?);
         } else {
-            let column = p.parse_join_colref()?;
+            let column = p.parse_join_colref_as(super::colref_sink::Role::SelectItemBare)?;
             let alias = parse_join_optional_alias(p)?;
             any_alias |= alias.is_some();
             items.push(JoinSelectItem::Key { column, alias });
@@ -21116,7 +21571,7 @@ fn parse_join_group_by(p: &mut Parser<'_>) -> Result<Vec<ColumnRef>, SqlSurfaceE
     p.expect_keyword(Keyword::By)?;
     let mut cols: Vec<ColumnRef> = Vec::new();
     loop {
-        let c = p.parse_join_colref()?;
+        let c = p.parse_join_colref_as(super::colref_sink::Role::GroupKey)?;
         if cols.contains(&c) {
             return Err(SqlSurfaceError::unsupported(format!(
                 "duplicate GROUP BY column {c:?}"
@@ -21191,7 +21646,10 @@ fn parse_join_order_by(p: &mut Parser<'_>) -> Result<Vec<JoinOrderKey>, SqlSurfa
             p.pos = p.pos.saturating_add(len);
             (ColumnRef::unqualified(""), Some(position))
         } else {
-            (p.parse_join_colref()?, None)
+            (
+                p.parse_join_colref_as(super::colref_sink::Role::OrderKey)?,
+                None,
+            )
         };
         if matches!(p.peek(), Some(Token::DistanceOp) | Some(Token::Punct('('))) {
             return Err(SqlSurfaceError::unsupported(
@@ -22630,6 +23088,7 @@ fn parse_distinct_shape(tokens: &[Token]) -> Result<ParsedAggregateShape, SqlSur
     let mut columns: Vec<String> = Vec::new();
     let mut items: Vec<AggregateSelectItem> = Vec::new();
     loop {
+        p.sink_mark(p.pos, super::colref_sink::Role::SelectItemBare);
         let column = p.expect_ident()?;
         let alias = if p.peek_ident_matches("AS") {
             p.advance();
@@ -23574,6 +24033,8 @@ fn parse_with_main(
 ) -> Result<(MainShape, String), SqlSurfaceError> {
     // Issue #1535: 主クエリも通常 SELECT と同じ修飾列正規化を通す（CTE 定義本体は対象外）。
     let main_normalized = super::qualified_column::normalize_single_table_qualifiers(remaining)?;
+    // 列参照の記録（`colref_sink`）が正規化後の複製を元の位置へ換算できるよう 1 対 1 の別名を登録する。
+    let _colref_alias = super::colref_sink::register_alias(&main_normalized, remaining);
     let main_tokens: &[Token] = &main_normalized;
 
     if !matches!(main_tokens.first(), Some(Token::Keyword(Keyword::Select))) {
@@ -24647,7 +25108,7 @@ pub(super) fn parse_with_clause_and_main(
 ) -> Result<(Vec<super::cte::CteDef>, Vec<Token>), SqlSurfaceError> {
     let mut p = Parser::new(tokens).with_nesting_limits(limits);
     let ctes = p.parse_with_clause()?;
-    Ok((ctes, p.remaining().to_vec()))
+    Ok((ctes, p.remaining().to_vec_registered()))
 }
 
 /// 派生表の本文 `ctes[idx]` の公開列名を静的に導く（SQL-62・Issue #1865。`sql::derived_table` が
@@ -25710,6 +26171,8 @@ fn validate_select_statement(
     // （`t.col`）を非修飾へ 1 対 1 で正規化する。以降の先読み・パースはすべて
     // 正規化後のトークン列を見る（`sql::qualified_column` 参照）。
     let normalized = super::qualified_column::normalize_single_table_qualifiers(tokens)?;
+    // 列参照の記録（`colref_sink`）が正規化後の複製を元の位置へ換算できるよう 1 対 1 の別名を登録する。
+    let _colref_alias = super::colref_sink::register_alias(&normalized, tokens);
     let tokens: &[Token] = &normalized;
     // SQL-57・Issue #1806: `FILTER (WHERE ...)` 内のウィンドウ関数・集計は、文全体の
     // `) OVER (` 走査（下の `contains_window_over`）でウィンドウ形へ誤振り分けされて
@@ -26490,7 +26953,7 @@ pub(crate) fn parse_insert_any_shape_tokens_with_limit(
             .ok_or_else(|| SqlSurfaceError::Internal {
                 detail: "internal error".to_string(),
             })?
-            .to_vec();
+            .to_vec_registered();
         return Ok(ParsedInsertTokens::Select(InsertSelectShape {
             table_name: shape.table_name,
             columns: shape.columns,

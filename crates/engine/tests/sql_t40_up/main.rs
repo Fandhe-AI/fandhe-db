@@ -12,6 +12,7 @@ mod temp_db;
 
 mod sql1797_early_stop;
 mod sql1798_interrupt;
+mod sql24_expr_lhs_null_between_in;
 mod sql41_bool_literal_where;
 mod sql42_aggregate_arith_projection;
 mod sql42_aggregate_expr_tree_projection;

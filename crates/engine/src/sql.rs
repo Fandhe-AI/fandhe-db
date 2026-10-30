@@ -161,6 +161,9 @@ mod array_ops;
 pub mod cast;
 pub mod cast_value;
 pub(crate) mod check_constraint;
+pub(crate) mod colref_sink;
+#[cfg(test)]
+mod colref_sink_tests;
 pub(crate) mod const_expr;
 pub mod const_select;
 pub mod copy;
