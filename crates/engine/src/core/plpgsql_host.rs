@@ -346,6 +346,20 @@ impl<'a, 'e> CorePlHost<'a, 'e> {
     }
 }
 
+/// 条件トークン列が `NULL` を含む単純比較（`a = NULL` 等）なら true。SQL の三値論理では結果が NULL に
+/// なるため、`where_probe` の「行の有無」（NULL は偽）に潰さず `None` で返すために使う。`IS [NOT] NULL`・
+/// `AND`／`OR`／`NOT` を含む形は NULL を判定する演算子なので対象外（従来どおり SQL 側へ渡す）。
+fn comparison_with_null(toks: &[Token]) -> bool {
+    let word = |t: &Token, w: &str| matches!(t, Token::Ident(s) if s.eq_ignore_ascii_case(w));
+    toks.iter().any(|t| word(t, "NULL"))
+        && !toks.iter().any(|t| {
+            matches!(t, Token::Keyword(Keyword::And))
+                || word(t, "IS")
+                || word(t, "OR")
+                || word(t, "NOT")
+        })
+}
+
 impl PlHost for CorePlHost<'_, '_> {
     fn eval_value(
         &mut self,
@@ -403,6 +417,9 @@ impl PlHost for CorePlHost<'_, '_> {
         let key = std::ptr::from_ref(expr) as usize;
         self.check_conflicts(key, &expr.tokens, &expr.var_refs)?;
         let toks = subst::substitute(&expr.tokens, &expr.var_refs, env, false)?;
+        if comparison_with_null(&toks) {
+            return Ok(None);
+        }
         Ok(Some(self.where_probe(toks)?))
     }
 

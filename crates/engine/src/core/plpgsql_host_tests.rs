@@ -134,6 +134,11 @@ impl<'a> Call<'a> {
         self
     }
 
+    fn returns(mut self, ty: ColumnType) -> Self {
+        self.ty = Some(ty);
+        self
+    }
+
     fn read_only(mut self) -> Self {
         self.opts = PlCallOptions { may_write: false };
         self
@@ -734,6 +739,28 @@ fn null_text_and_bool_variables_substitute_in_every_position() {
         .autocommit(&core, &c)
         .expect("select items");
     assert_eq!(as_i64(&out), 2);
+}
+
+#[test]
+fn comparison_with_null_variable_yields_null_not_false() {
+    let (core, _g) = new_core(LedgerMode::Optional);
+    let c = ctx("t1");
+    // `flag := (a = b)` は a が NULL なら NULL（真でも偽でもない）であり、false に潰れない。
+    let src = "DECLARE flag boolean; BEGIN flag := (a = b); RETURN flag; END";
+    let out = call(src)
+        .returns(ColumnType::Boolean)
+        .param(
+            "a",
+            SqlColumnTypeName::Integer,
+            PlScalar::null(ColumnType::Integer),
+        )
+        .param("b", SqlColumnTypeName::Integer, int(3))
+        .autocommit(&core, &c)
+        .expect("null comparison");
+    assert!(
+        matches!(out, CallOutcome::Scalar(ref v) if v.is_null()),
+        "{out:?}"
+    );
 }
 
 #[test]
