@@ -64,6 +64,11 @@ fn open_storage(dir: &std::path::Path) -> Storage {
         .create_table(&trg_schema("trg"))
         .expect("create trg");
     storage
+        .create_table(
+            &trg_schema("alloc").with_row_identity(crate::catalog::RowIdentity::Allocated),
+        )
+        .expect("create alloc");
+    storage
         .create_table(&trg_schema("plain"))
         .expect("create plain");
     storage
@@ -555,4 +560,36 @@ fn insert_select_fires_before_triggers() {
         read_rows(&core, &a, "trg"),
         vec![(1, "p1!".to_string(), 1), (2, "p2!".to_string(), 2)]
     );
+}
+
+// 採番方式の表で `operation_id` 省略かつ全行スキップでも、払い出し済みの rowid は欠番になる
+// （Autocommit が `NoOp` で abort して採番状態を巻き戻し、次の INSERT が再利用しない）。
+#[test]
+fn all_rows_skipped_without_operation_id_leaves_rowid_gap() {
+    let dir = tempdir();
+    let (core, _calls) = core_with(
+        dir.path(),
+        Box::new(|c| {
+            if text_of(c.new_row, 1) == "skip" {
+                return Ok(TriggerOutcome::Skip);
+            }
+            let mut row = c.new_row.to_vec();
+            row[2] = Value::BigInt(1);
+            Ok(TriggerOutcome::Proceed(row))
+        }),
+    );
+    let a = ctx("tenant-a");
+    add_trigger(&core.storage, "tenant-a", "alloc", &before_row("t"));
+    let out = run(
+        &core,
+        &a,
+        "INSERT INTO alloc (embedding, a) VALUES ('[1.0,0.0]', 'skip')",
+    )
+    .expect("skipped insert");
+    assert_eq!(rows_affected(out), 0);
+    // skip 行が rowid 1 を払い出し済みなら、次の払い出しは 2（abort で巻き戻れば 1 になる）。
+    let txn = core.storage.begin_write_txn().expect("txn");
+    let next = crate::catalog::rowid_alloc::allocate_in_txn(&txn, "tenant-a", "alloc", 1)
+        .expect("allocate");
+    assert_eq!(next.start().raw_for_state(), 2, "skipped rowid was reused");
 }

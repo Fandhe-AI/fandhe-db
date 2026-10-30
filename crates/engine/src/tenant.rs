@@ -2030,7 +2030,13 @@ fn insert_typed_row_impl(
                 &[(row_id, values)],
                 chain,
             )?;
-            return finish_trigger_insert(write_txn, table, written.len(), ledger_outcome);
+            return finish_trigger_insert(
+                write_txn,
+                table,
+                written.len(),
+                ledger_outcome,
+                allocated || id_omitted || sequence_rows.is_some(),
+            );
         }
         // 行のエンコードは台帳照合と NOT NULL 検査の後に行う（省略された非 nullable 列の仮値
         // `Null` が、再送判定より先に `22000` を起こさないため。Issue #1629）。
@@ -2082,12 +2088,15 @@ fn insert_typed_row_impl(
 
 /// トリガ経路の書き込みの後始末（Issue #1723）。1 行以上書いたら表の世代を進めて `Wrote`。全行を
 /// `NULL` 返却でスキップした場合は、台帳を記録したときだけ `Wrote`（世代は進めない。再送の `23505`
-/// を保つため台帳は commit する）、台帳も無ければ `NoOp`。
+/// を保つため台帳は commit する）、台帳も無ければ `NoOp`。ただし rowid・SEQUENCE の採番状態を
+/// 更新済み（`state_consumed`）なら `Wrote` とし、払い出し済みの値が欠番になる契約を保つ
+/// （`NoOp` の abort で採番状態が巻き戻り、次の INSERT が同じ rowid を再利用するのを防ぐ）。
 fn finish_trigger_insert(
     write_txn: &redb::WriteTransaction,
     table: &str,
     written: usize,
     ledger_outcome: ledger::RecordOutcome,
+    state_consumed: bool,
 ) -> Result<(InsertWriteReport, TxnEffect), TenantWriteError> {
     let rows_written = u64::try_from(written).map_err(|_| {
         TenantWriteError::Catalog(CatalogError::Invalid(
@@ -2097,7 +2106,7 @@ fn finish_trigger_insert(
     let effect = if written > 0 {
         crate::catalog::bump_table_generation_in_txn(write_txn, table)?;
         TxnEffect::Wrote
-    } else if matches!(ledger_outcome, ledger::RecordOutcome::Recorded) {
+    } else if state_consumed || matches!(ledger_outcome, ledger::RecordOutcome::Recorded) {
         TxnEffect::Wrote
     } else {
         TxnEffect::NoOp
@@ -2456,7 +2465,13 @@ pub(crate) fn insert_typed_rows_unchecked(
                     &trigger_rows,
                     chain,
                 )?;
-                return finish_trigger_insert(write_txn, table, written.len(), ledger_outcome);
+                return finish_trigger_insert(
+                    write_txn,
+                    table,
+                    written.len(),
+                    ledger_outcome,
+                    allocated || id_omitted,
+                );
             }
             let row_table_name = user_rows_table_name(table);
             let mut row_table = write_txn
