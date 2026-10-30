@@ -468,21 +468,11 @@ fn nested_trigger_target_is_0a000() {
     assert_eq!(count(&core, &a, "audit"), 0);
 }
 
-// 文トリガは引き続き `0A000`。`WHEN` 付き AFTER も `0A000`（発火時に二重化）。副作用なし。
+// `WHEN` 付き AFTER は `0A000`（発火時に二重化）。副作用なし。文トリガの発火は
+// `trigger_statement_tests.rs`（Issue #1726）で固定する。
 #[test]
-fn statement_level_and_when_are_0a000() {
-    let dir = tempdir();
-    let (core, calls) = core_with(dir.path(), audit_after());
+fn when_is_0a000() {
     let a = ctx("tenant-a");
-    add_trigger(
-        &core.storage,
-        "tenant-a",
-        "trg",
-        &trigger_def("s", TriggerTiming::After, TriggerLevel::Statement),
-    );
-    let err = run(&core, &a, INSERT_A1_N).unwrap_err();
-    assert_eq!(err.wire_code(), "0A000");
-
     let dir2 = tempdir();
     let (core2, calls2) = core_with(dir2.path(), audit_after());
     let mut def = after_row("w");
@@ -497,11 +487,7 @@ fn statement_level_and_when_are_0a000() {
         .expect("create");
     let err = run(&core2, &a, INSERT_A1_N).unwrap_err();
     assert_eq!(err.wire_code(), "0A000");
-    assert_eq!(
-        calls.load(Ordering::SeqCst) + calls2.load(Ordering::SeqCst),
-        0
-    );
-    assert_eq!(count(&core, &a, "trg"), 0);
+    assert_eq!(calls2.load(Ordering::SeqCst), 0);
     assert_eq!(count(&core2, &a, "trg"), 0);
 }
 

@@ -39,8 +39,12 @@ const ROW_ENCODE_MISMATCH: &str = "trigger function returned a row that does not
 
 /// `rows`（払い出し済みの行キーと、DEFAULT・SEQUENCE 確定後の NEW）を、BEFORE ROW トリガを通して
 /// 書き、全行の後に AFTER ROW トリガを発火する。書いた行の行キーを返す（`NULL` 返却でスキップした行は
-/// 含まない）。あわせて、トリガ本体が別表へ書き込んだか（BEFORE・AFTER を問わない）を返す。
+/// 含まない）。あわせて、トリガ本体が別表へ書き込んだか（BEFORE・AFTER・文トリガを問わない）を返す。
 /// 全行スキップでも別表への書き込みがあれば、呼び出し元は txn を commit 対象にする。
+///
+/// `writes` は文ごとに 1 個、呼び出し元が作って BEFORE STATEMENT から共有する（文トリガ・行トリガが
+/// 書いた表をまとめて遅延 FK の確定対象にするため。Issue #1726）。BEFORE STATEMENT は呼び出し元が
+/// 台帳の記録の後・SEQUENCE の採番の前に発火済みで、本関数は AFTER STATEMENT までを担う。
 #[allow(clippy::too_many_arguments)]
 pub(super) fn write_rows_with_triggers(
     write_txn: &redb::WriteTransaction,
@@ -51,6 +55,7 @@ pub(super) fn write_rows_with_triggers(
     visibility: Visibility,
     rows: &[(RowId, &[Value])],
     plan: &InsertTriggerPlan<'_>,
+    writes: &TriggerWriteHandle<'_>,
 ) -> Result<(Vec<RowId>, bool), TenantWriteError> {
     let vector_idx = schema
         .columns
@@ -71,13 +76,12 @@ pub(super) fn write_rows_with_triggers(
             ))
         })?;
     }
-    let writes = TriggerWriteHandle::new(write_txn, ctx);
     for (row_id, values) in rows {
         crate::interrupt::check().map_err(TenantWriteError::TriggerFailed)?;
         // 表ハンドルを開く前に発火する（再入の不変条件）。
         let fired = crate::trigger::fire::fire_before_row_insert(
             plan.runtime,
-            &writes,
+            writes,
             table,
             schema,
             &plan.before,
@@ -155,7 +159,7 @@ pub(super) fn write_rows_with_triggers(
     for new_row in &after_queue {
         crate::trigger::fire::fire_after_row_insert(
             plan.runtime,
-            &writes,
+            writes,
             table,
             schema,
             &plan.after,
@@ -163,7 +167,18 @@ pub(super) fn write_rows_with_triggers(
         )
         .map_err(TenantWriteError::TriggerFailed)?;
     }
-    settle_trigger_written_tables(write_txn, target, ctx, &writes)?;
+    // AFTER STATEMENT（段 7。Issue #1726）。全行スキップ・0 行でも 1 回発火する。
+    crate::trigger::fire::fire_statement(
+        plan.runtime,
+        writes,
+        table,
+        schema,
+        &plan.after_stmt,
+        crate::trigger::call::TriggerOp::Insert,
+        crate::catalog::trigger::TriggerTiming::After,
+    )
+    .map_err(TenantWriteError::TriggerFailed)?;
+    settle_trigger_written_tables(write_txn, target, ctx, writes)?;
     let trigger_wrote = !writes.written_tables().is_empty();
     Ok((written, trigger_wrote))
 }

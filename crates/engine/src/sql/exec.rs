@@ -3890,6 +3890,8 @@ pub fn execute_truncate(
         ctx,
         validated,
         ledger_mode,
+        // 公開入口はトリガの通過証を持たない（TRUNCATE トリガがあれば `0A000`。Issue #1726）。
+        None,
     )
 }
 
@@ -3900,6 +3902,7 @@ pub(crate) fn execute_truncate_in(
     ctx: &PolicyContext,
     validated: &crate::sql::allowlist::ValidatedTruncate,
     ledger_mode: crate::recovery::required_op_id::LedgerMode,
+    triggers: Option<&crate::trigger::TriggerRuntime>,
 ) -> Result<TruncateOutcome, SqlSurfaceError> {
     let ledger_write = ledger_mode
         .resolve(validated.operation_id.as_ref())
@@ -3912,6 +3915,7 @@ pub(crate) fn execute_truncate_in(
         validated.restart_identity,
         ctx,
         ledger_write,
+        triggers,
     )
     .map_err(map_insert_write_error)?;
 
@@ -5253,7 +5257,9 @@ pub(crate) fn precheck_insert_select_ledger(
     result.map_err(|e| map_insert_write_error(crate::tenant::TenantWriteError::from(e)))
 }
 
-/// `INSERT ... SELECT` が 0 行だったときの台帳だけの記録（SQL-51 (5)・Issue #1733）。
+/// `INSERT ... SELECT` が 0 行だったときの台帳だけの記録（SQL-51 (5)・Issue #1733）。`trigger_mode` が
+/// `Insert(Some)` のとき、INSERT 文トリガ（BEFORE／AFTER STATEMENT）を 1 回ずつ発火する（Issue #1726）。
+/// CTAS・データ変更 CTE からは `Skip`（トリガを見ない純粋な台帳記録）で呼ぶ。
 pub(crate) fn record_insert_select_ledger_only(
     target: crate::tenant::WriteTarget<'_>,
     ctx: &PolicyContext,
@@ -5261,12 +5267,20 @@ pub(crate) fn record_insert_select_ledger_only(
     operation_id: Option<&crate::recovery::required_op_id::OperationId>,
     ledger_mode: crate::recovery::required_op_id::LedgerMode,
     statement_hash: &crate::recovery::content_hash::ContentHash,
+    trigger_mode: crate::tenant::LedgerOnlyTriggers<'_>,
 ) -> Result<(), SqlSurfaceError> {
     let ledger_write = ledger_mode
         .resolve(operation_id)
         .map_err(|_| SqlSurfaceError::MissingOperationId)?;
-    crate::tenant::record_ledger_only_unchecked(target, table, ctx, ledger_write, statement_hash)
-        .map_err(map_insert_write_error)
+    crate::tenant::record_ledger_only_unchecked(
+        target,
+        table,
+        ctx,
+        ledger_write,
+        statement_hash,
+        trigger_mode,
+    )
+    .map_err(map_insert_write_error)
 }
 
 /// `id` 省略の行を受理できない経路（UPSERT）の固定文言拒否（`0A000`。設計記録 D9）。
