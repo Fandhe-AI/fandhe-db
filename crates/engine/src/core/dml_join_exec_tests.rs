@@ -898,6 +898,7 @@ fn explicit_transaction_sees_uncommitted_source_rows_and_rolls_back() {
         None,
         &[],
         false,
+        None,
     )
     .expect("insert uncommitted source row");
     let out = core

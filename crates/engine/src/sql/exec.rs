@@ -3823,6 +3823,7 @@ pub(crate) fn execute_insert_with_schema(
         bound,
         ledger_mode,
         expected_schema,
+        None,
     )
 }
 
@@ -3837,6 +3838,7 @@ pub(crate) fn execute_insert_with_schema_in(
     bound: &crate::sql::parser::BoundInsert,
     ledger_mode: crate::recovery::required_op_id::LedgerMode,
     expected_schema: Option<&crate::catalog::TableSchema>,
+    triggers: Option<&crate::trigger::TriggerRuntime>,
 ) -> Result<InsertOutcome, SqlSurfaceError> {
     use crate::storage::Visibility;
 
@@ -3844,7 +3846,7 @@ pub(crate) fn execute_insert_with_schema_in(
         .resolve(bound.operation_id.as_ref())
         .map_err(|_| SqlSurfaceError::MissingOperationId)?;
 
-    crate::tenant::insert_typed_row_unchecked(
+    let report = crate::tenant::insert_typed_row_unchecked(
         target,
         &bound.table,
         ctx,
@@ -3855,11 +3857,12 @@ pub(crate) fn execute_insert_with_schema_in(
         expected_schema,
         &bound.volatile_default_columns,
         bound.id_omitted,
+        triggers,
     )
     .map_err(map_insert_write_error)?;
 
     Ok(InsertOutcome {
-        rows_affected: 1,
+        rows_affected: report.rows_written,
         incremental: None,
     })
 }
@@ -4381,6 +4384,9 @@ pub(crate) fn map_write_error(
         // `nextval`／`currval` の採番・解決の失敗（`2200H`・`55000`・`22003`・`0A000` 等。
         // TABLE-24・Issue #1690）も内側の `SqlSurfaceError` を透過する。
         TenantWriteError::SequenceEvaluationFailed(inner) => inner,
+        // BEFORE ROW INSERT トリガの発火失敗（`0A000`・`42804`・`57014`・関数が返したエラー。
+        // TABLE-45・Issue #1723）も内側の `SqlSurfaceError` を透過する。
+        TenantWriteError::TriggerFailed(inner) => inner,
         // `FOREIGN KEY` 制約違反（`23503`。TABLE-17・TASK-205、Issue #907）。`_` 節
         // （`XX000`）へ丸めると、クライアントが参照整合性違反をサーバー内部事象と
         // 取り違える。値・参照先の有無の理由を含まない固定文言。
@@ -5103,6 +5109,7 @@ pub(crate) fn execute_insert_batch_with_schema(
         bounds,
         ledger_mode,
         expected_schema,
+        None,
     )
 }
 
@@ -5117,6 +5124,7 @@ pub(crate) fn execute_insert_batch_with_schema_in(
     bounds: &[crate::sql::parser::BoundInsert],
     ledger_mode: crate::recovery::required_op_id::LedgerMode,
     expected_schema: Option<&crate::catalog::TableSchema>,
+    triggers: Option<&crate::trigger::TriggerRuntime>,
 ) -> Result<InsertOutcome, SqlSurfaceError> {
     let Some(first) = bounds.first() else {
         return Err(SqlSurfaceError::invalid_input(
@@ -5124,7 +5132,14 @@ pub(crate) fn execute_insert_batch_with_schema_in(
         ));
     };
     if bounds.len() == 1 {
-        return execute_insert_with_schema_in(target, ctx, first, ledger_mode, expected_schema);
+        return execute_insert_with_schema_in(
+            target,
+            ctx,
+            first,
+            ledger_mode,
+            expected_schema,
+            triggers,
+        );
     }
 
     let table = first.table.as_str();
@@ -5153,7 +5168,7 @@ pub(crate) fn execute_insert_batch_with_schema_in(
         bounds.iter().map(|b| (b.id, b.values.as_slice())).collect();
 
     let volatile = volatile_default_columns_of(bounds);
-    crate::tenant::insert_typed_rows_unchecked(
+    let report = crate::tenant::insert_typed_rows_unchecked(
         target,
         table,
         ctx,
@@ -5163,14 +5178,12 @@ pub(crate) fn execute_insert_batch_with_schema_in(
         ledger_write,
         expected_schema,
         &volatile,
+        triggers,
     )
     .map_err(map_insert_write_error)?;
 
-    let rows_affected = u64::try_from(bounds.len()).map_err(|_| SqlSurfaceError::Internal {
-        detail: "insert batch row count overflow".to_string(),
-    })?;
     Ok(InsertOutcome {
-        rows_affected,
+        rows_affected: report.rows_written,
         incremental: None,
     })
 }
@@ -5429,7 +5442,7 @@ pub(crate) fn execute_insert_returning_in(
         _ => None,
     };
     let insert_outcome =
-        execute_insert_batch_with_schema_in(target, ctx, bounds, ledger_mode, Some(schema))?;
+        execute_insert_batch_with_schema_in(target, ctx, bounds, ledger_mode, Some(schema), None)?;
 
     if has_sequence {
         // 行・列をキーにした索引を一度だけ構築し、RETURNING の検索を線形時間に保つ

@@ -420,6 +420,16 @@ fn list_in_txn<R: ReadSource>(src: &R, table_key: &str, scope: &str) -> Result<V
     Ok(out)
 }
 
+/// 書き込み txn の中で `scope` の表 `table_key` のトリガを名前の昇順で引く（発火側〔Issue #1723〕が
+/// 文の開始時に同じ txn から読む入口。存在しないテーブルは作成せず空を返す。他テナントの定義は構造上引けない）。
+pub(crate) fn list_triggers_in_txn(
+    write_txn: &redb::WriteTransaction,
+    scope: &str,
+    table_key: &str,
+) -> Result<Vec<TriggerDef>> {
+    list_in_txn(write_txn, table_key, scope)
+}
+
 /// 内部 ID を 1 つ払い出す（1 始まり・`checked_add`・再利用しない）。
 fn allocate_id_in_txn(write_txn: &redb::WriteTransaction) -> Result<u64> {
     let mut counter = write_txn.open_table(TRIGGER_ID_COUNTER_TABLE)?;
@@ -753,6 +763,21 @@ impl Storage {
         crate::recovery::commit_boundary::commit(write_txn)
             .map_err(super::convert_storage_error)?;
         Ok(stored.id)
+    }
+
+    /// テスト専用: 「どの関数もトリガ関数」と見なして定義を作る（トリガ関数の保存形式〔#2228〕が未整備で、
+    /// SQL の `CREATE TRIGGER` が `42P17` で止まるため、発火側のテストが定義を注入する入口）。
+    #[cfg(test)]
+    #[allow(dead_code)] // 発火側のテスト（`core/trigger_insert_tests.rs`）が使う。
+    pub(crate) fn create_trigger_for_test(
+        &self,
+        scope: &str,
+        table_key: &str,
+        def: &TriggerDef,
+    ) -> Result<u64> {
+        self.create_trigger_inner(scope, table_key, def, false, MAX_TRIGGERS_PER_TABLE, |_| {
+            true
+        })
     }
 
     /// `scope` のトリガ `name` を削除し、存在して削除したら `true`。表が無ければ `TableNotFound`、トリガが

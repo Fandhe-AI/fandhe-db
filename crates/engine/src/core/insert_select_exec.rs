@@ -332,6 +332,7 @@ impl EngineCore {
                 &bounds,
                 self.ledger_mode,
                 Some(&schema),
+                Some(&self.trigger_runtime),
             )
             .map(SqlOutcome::Insert),
             Some(projection) => crate::sql::exec::execute_insert_returning_in(
