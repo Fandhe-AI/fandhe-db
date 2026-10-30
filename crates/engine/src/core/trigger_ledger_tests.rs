@@ -572,7 +572,8 @@ fn tenant_boundary_for_trigger_side_effects_and_ledger() {
 }
 
 // トリガ内の書き込みが失敗したとき（内部キーの指定・制約違反・自前のエラー）、エラーは他テナントの
-// 識別子を含まず、文全体が取り消される（行・監査行・台帳が残らない）。内部キーは不在と同じ `42P01`。
+// 識別子を含まず、文全体が取り消される（行・監査行・台帳が残らない。台帳は同じ operation_id の
+// 再送成功で確認する）。内部キーは不在と同じ `42P01`。
 #[test]
 fn trigger_write_failures_do_not_leak_or_leave_side_effects() {
     let behaviors: Vec<(&str, Behavior)> = vec![
@@ -604,7 +605,7 @@ fn trigger_write_failures_do_not_leak_or_leave_side_effects() {
     ];
     for (code, behavior) in behaviors {
         let dir = tempdir();
-        let (core, _calls) = build(&dir.path().join("db.redb"), true, behavior);
+        let (core, calls) = build(&dir.path().join("db.redb"), true, behavior);
         add_all_triggers(&core, "tenant-a");
         let (a, b) = (ctx("tenant-a"), ctx("tenant-b"));
         run(
@@ -624,6 +625,19 @@ fn trigger_write_failures_do_not_leak_or_leave_side_effects() {
         assert_eq!(count(&core, &a, "trg"), 0, "{code}");
         assert_eq!(count(&core, &a, "audit"), 0, "{code}");
         assert_eq!(count(&core, &b, "audit"), 1, "{code}");
+
+        // 失敗した文の operation_id が台帳に残っていないこと。正常なトリガへ切り替えて同じ SQL・
+        // 同じ operation_id を流すと、重複（`23505` 相当）や内容不一致ではなく成功する。
+        let core = core.with_trigger_invoker_for_test(Arc::new(FnInvoker {
+            behavior: effects(None),
+            calls: Arc::clone(&calls),
+        }));
+        run(&core, &a, sql).unwrap_or_else(|e| panic!("{code}: retry after failure: {e}"));
+        assert_eq!(count(&core, &a, "trg"), 1, "{code}");
+        assert!(count(&core, &a, "audit") > 0, "{code}");
+        // 成功した後は通常どおり台帳に載り、再送は重複として拒否される。
+        let replay = run(&core, &a, sql).expect_err("replay after success");
+        assert!(is_duplicate(&replay), "{code}: {replay}");
     }
 }
 
