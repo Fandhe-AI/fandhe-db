@@ -166,6 +166,13 @@ pub(crate) fn relation_positions(tokens: &[Token]) -> RelationWalk {
         .iter()
         .any(|k| ident_is(tokens.first(), k));
     let mut index_on_pending = head_create && head.iter().any(|t| ident_is(Some(t), "INDEX"));
+    // `CREATE [OR REPLACE] TRIGGER <名前> ... ON <表> ...`・`DROP TRIGGER [IF EXISTS] <名前> ON <表>`
+    // （TABLE-45・Issue #1722）。関係名の位置は最初の `ON` の直後だけ。それ以外の語（`UPDATE OF`・
+    // `TRUNCATE ON` 等）を関係位置と誤検出して `search_path` ゲートへ渡さないよう、この文では下で
+    // 位置判定を上書きする。
+    let trigger_head = ((head_create || head_drop) && ident_is(tokens.get(1), "TRIGGER"))
+        || (head_create && ident_is(tokens.get(1), "OR") && ident_is(tokens.get(3), "TRIGGER"));
+    let mut trigger_on_pending = trigger_head;
 
     let mut levels: Vec<Level> = vec![Level::default()];
     let mut out = RelationWalk {
@@ -377,6 +384,13 @@ pub(crate) fn relation_positions(tokens: &[Token]) -> RelationWalk {
                 _ => false,
             };
         }
+        if trigger_head {
+            relation_pos = trigger_on_pending && ident_is(prev, "ON") && is_ident_like(cur);
+            is_create_name = false;
+            if ident_is(prev, "ON") {
+                trigger_on_pending = false;
+            }
+        }
         // 索引 DDL の最初の `ON` だけが表参照を導く（JOIN の `ON <条件>` と区別する）。
         if ident_is(prev, "ON") {
             index_on_pending = false;
@@ -492,8 +506,17 @@ pub(crate) fn rewrite_relation_names_full(
             }
             continue;
         }
+        // `CREATE TRIGGER ... EXECUTE FUNCTION s.f(...)` の関数名（Issue #1722）も、`ON s.t` と同じく
+        // 存在しない SCHEMA は `3F000` で fail-closed にする（式中の関数呼び出しではないため）。
+        let trigger_function_name = i >= 2
+            && matches!(tokens.get(i + 1), Some(Token::Punct('(')))
+            && (ident_is(tokens.get(i - 1), "FUNCTION")
+                || ident_is(tokens.get(i - 1), "PROCEDURE"))
+            && ident_is(tokens.get(i - 2), "EXECUTE")
+            && crate::sql::allowlist::is_create_trigger_statement(tokens);
+        let strict_function_name = drop_function_name || trigger_function_name;
         let function_pos = resolver.is_some()
-            && (drop_function_name || matches!(tokens.get(i + 1), Some(Token::Punct('('))))
+            && (strict_function_name || matches!(tokens.get(i + 1), Some(Token::Punct('('))))
             && !qualifier.eq_ignore_ascii_case("public")
             && !is_builtin_schema_name(qualifier)
             && !qualifier.eq_ignore_ascii_case("pg_temp");
@@ -503,7 +526,7 @@ pub(crate) fn rewrite_relation_names_full(
                 create_name: false,
                 matview: false,
                 function_pos: true,
-                drop_name: drop_function_name,
+                drop_name: strict_function_name,
             });
         } else {
             residual_column_qualifier = true;
@@ -1228,6 +1251,48 @@ mod tests {
         assert!(t.iter().any(|x| matches!(x, Token::QualifiedIdent { .. })));
     }
 
+    /// TABLE-45・Issue #1722: `CREATE TRIGGER ... ON <表>`／`DROP TRIGGER ... ON <表>` の表名と
+    /// `EXECUTE FUNCTION <関数>(...)` の関数名は解決される。`UPDATE OF <列>` の語は関係位置にならない。
+    #[test]
+    fn trigger_ddl_names_are_resolved() {
+        same(
+            "CREATE TRIGGER g AFTER UPDATE OF a ON public.t EXECUTE FUNCTION f()",
+            "CREATE TRIGGER g AFTER UPDATE OF a ON t EXECUTE FUNCTION f()",
+        );
+        same(
+            "DROP TRIGGER IF EXISTS g ON public.t",
+            "DROP TRIGGER IF EXISTS g ON t",
+        );
+        let got = rewrite_in_tenant(
+            "CREATE OR REPLACE TRIGGER g BEFORE INSERT ON s.t EXECUTE FUNCTION s.f()",
+        )
+        .expect("resolved");
+        let keys: Vec<&str> = got
+            .iter()
+            .filter_map(|t| match t {
+                Token::Ident(n) if n.starts_with('#') => Some(n.as_str()),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(keys, vec!["#12.t", "#12.f"]);
+        let got = rewrite_in_tenant("DROP TRIGGER g ON s.t").expect("resolved");
+        assert!(got
+            .iter()
+            .any(|t| matches!(t, Token::Ident(n) if n == "#12.t")));
+        assert_eq!(
+            rewrite_in_tenant("DROP TRIGGER g ON z.t")
+                .expect_err("unknown")
+                .wire_code(),
+            "3F000"
+        );
+        // 位置走査は `ON` の直後の 1 つだけ（`UPDATE OF`・`TRUNCATE ON` を関係位置にしない）。
+        let t = tokenize("CREATE TRIGGER g AFTER TRUNCATE ON t EXECUTE FUNCTION f()").expect("lex");
+        assert_eq!(relation_positions(&t).positions.len(), 1);
+        let t = tokenize("CREATE TRIGGER g AFTER UPDATE OF a, b ON t EXECUTE FUNCTION f()")
+            .expect("lex");
+        assert_eq!(relation_positions(&t).positions.len(), 1);
+    }
+
     /// MATERIALIZED VIEW の SCHEMA 配置は未対応（`0A000`）。存在しない SCHEMA は `3F000`。
     #[test]
     fn matview_in_tenant_schema_is_unsupported() {
@@ -1328,6 +1393,25 @@ mod tests {
     }
 
     /// `nextval('s.q')` の文字列引数は、テナントの SCHEMA 修飾のときだけ内部キーの `Ident` へ置き換わる。
+    /// Issue #1722: `CREATE TRIGGER ... EXECUTE FUNCTION z.f()` の未知 SCHEMA は `ON z.t` と同じ `3F000`。
+    #[test]
+    fn trigger_function_unknown_schema_is_3f000() {
+        for sql in [
+            "CREATE TRIGGER g AFTER INSERT ON t EXECUTE FUNCTION z.f()",
+            "CREATE TRIGGER g AFTER INSERT ON t EXECUTE PROCEDURE z.f()",
+            "CREATE TRIGGER g AFTER INSERT ON z.t EXECUTE FUNCTION f()",
+        ] {
+            assert_eq!(
+                rewrite_in_tenant(sql).expect_err(sql).wire_code(),
+                "3F000",
+                "{sql}"
+            );
+        }
+        let ok = rewrite_in_tenant("CREATE TRIGGER g AFTER INSERT ON t EXECUTE FUNCTION s.f()")
+            .expect("known schema");
+        assert!(ok.contains(&Token::Ident("#12.f".to_string())));
+    }
+
     /// `public.`・組み込み SCHEMA・引用符・複数の `.`・不正な識別子は何もしない（従来の拒否に任せる）。
     #[test]
     fn sequence_name_literals_are_resolved_only_for_tenant_schemas() {

@@ -81,6 +81,8 @@ pub(crate) mod namespace;
 // 書き込み（#1920）は結線済み。ロード（#1921）が使う読み出し API は当面テストからしか呼ばれない
 // ため、該当項目に個別に `dead_code` を許可している。
 pub(crate) mod function;
+// TRIGGER のカタログ（TABLE-45・Issue #1722。設計記録: `docs/design/trigger-catalog.md`）。
+pub(crate) mod trigger;
 pub(crate) use materialized::read_materialized_view_in;
 
 /// カタログ値を格納するテーブル。キーはテーブル名、値は [`encode_schema`] で
@@ -12302,6 +12304,8 @@ impl Storage {
                 .map_err(convert_storage_error)?;
             // rowid 採番状態（TABLE-23・Issue #2193）。残置すると同名再作成が旧状態を引き継ぐ。
             rowid_alloc::delete_table_in_txn(write_txn, name)?;
+            // TRIGGER 定義（全テナント分。TABLE-45・Issue #1722）。残置すると同名再作成で旧定義が復活する。
+            trigger::remove_triggers_for_table_in_txn(write_txn, name)?;
             // 永続キー索引（Issue #1071）。残置すると参照整合性検査が fail-open になりうる。
             crate::key_index::drop_indexes_for_table_in_txn(write_txn, name)?;
             bump_table_generation_in_txn(write_txn, name)?;
@@ -12690,6 +12694,13 @@ impl Storage {
             if ty.is_vector() {
                 return Err(CatalogError::ProtectedColumn(column_name.to_string()));
             }
+            // `UPDATE OF` が参照する列は削除できない（TABLE-45・Issue #1722。CASCADE による連鎖削除は
+            // 未対応のため RESTRICT・CASCADE とも `2BP01`。トリガ名・テナントを応答に含めない）。
+            if trigger::triggers_referencing_column_in_txn(write_txn, table_name, column_name)? {
+                return Err(CatalogError::DependentObjectsStillExist(
+                    column_name.to_string(),
+                ));
+            }
             // `PRIMARY KEY`（TABLE-16・TASK-204、Issue #903）の構成列は
             // `constraint::enforce_unique_keys_in_txn` がテナント全行を走査する
             // 前提として生存し続けなければならない。ここで拒否せず
@@ -12846,6 +12857,12 @@ impl Storage {
             return Err(AlterCheckError::Sql(SqlSurfaceError::FeatureNotSupported {
                 detail: "renaming a column of a table used by a materialized view is not supported"
                     .to_string(),
+            }));
+        }
+        // `UPDATE OF` が参照する列の改名は追随が入るまで拒否する（TABLE-45・Issue #1722 の暫定ガード）。
+        if trigger::triggers_referencing_column_in_txn(&*write_txn, table_name, old_name)? {
+            return Err(AlterCheckError::Sql(SqlSurfaceError::FeatureNotSupported {
+                detail: "renaming a column used by a trigger is not supported".to_string(),
             }));
         }
         let mut schema = {
@@ -13081,6 +13098,8 @@ impl Storage {
         }
         // 索引宣言の所有テーブル名の付け替え（索引カタログ世代も bump する）。
         rename_index_def_table_in_txn(&write_txn, table_name, new_table_name)?;
+        // TRIGGER 定義（全テナント分）も新しい表キーへ移す（TABLE-45・Issue #1722）。
+        trigger::rename_table_in_txn(&write_txn, table_name, new_table_name)?;
 
         // カタログの付け替え（`encode_schema` が不変条件を再検証する）。
         schema.rename_table_references(new_table_name);
@@ -14512,6 +14531,12 @@ impl Storage {
         {
             return Err(AlterCheckError::Sql(SqlSurfaceError::FeatureNotSupported {
                 detail: "cannot alter type of a column used by a view or rule".to_string(),
+            }));
+        }
+        // `UPDATE OF` が参照する列の型変更は拒否する（TABLE-45・Issue #1722 の暫定ガード）。
+        if trigger::triggers_referencing_column_in_txn(&*write_txn, table_name, column_name)? {
+            return Err(AlterCheckError::Sql(SqlSurfaceError::FeatureNotSupported {
+                detail: "cannot alter type of a column used by a trigger".to_string(),
             }));
         }
         let mut revalidate_schema: Option<TableSchema> = None;

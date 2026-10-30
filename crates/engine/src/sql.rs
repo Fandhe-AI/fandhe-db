@@ -206,6 +206,8 @@ mod temp_rows_tests;
 mod truncate_restart_identity_tests;
 // `CREATE FUNCTION`／`DROP FUNCTION` の UDF カタログ書き込み経路（SQL-66・Issue #1920）。
 pub mod udf_ddl;
+// TRIGGER DDL（TABLE-45・Issue #1722）。
+pub mod trigger_ddl;
 pub(crate) mod udf_load;
 pub(crate) mod upsert_add;
 pub(crate) mod upsert_expr;
@@ -391,6 +393,15 @@ pub enum SqlOutcome {
     /// **BREAKING CHANGE**（Issue #1920）: 本 variant の追加により `SqlOutcome` を網羅的に
     /// マッチする既存コードはすべて更新済み。
     DropFunction(udf_ddl::DropFunctionOutcome),
+    /// `CREATE [OR REPLACE] TRIGGER`（TABLE-45・Issue #1722）が成功したことを示す応答。
+    ///
+    /// **BREAKING CHANGE**（Issue #1722）: 本 variant の追加により `SqlOutcome` を網羅的に
+    /// マッチする既存コードはすべて更新済み。
+    CreateTrigger(trigger_ddl::CreateTriggerOutcome),
+    /// `DROP TRIGGER [IF EXISTS]`（TABLE-45・Issue #1722）が成功したことを示す応答。
+    ///
+    /// **BREAKING CHANGE**（Issue #1722）: `CreateTrigger` と同じ。
+    DropTrigger(trigger_ddl::DropTriggerOutcome),
     /// `EXPLAIN SELECT ... USING PLAN(...)`（TASK-78・SQL-6）の応答。検索本体は
     /// 実行せず、LLM クエリ展開・モード解決結果を可視化する `QUERY PLAN` 単一列の
     /// [`exec::QueryResult`]（`sql::explain` モジュールが構築）を返す。
