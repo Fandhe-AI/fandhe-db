@@ -241,9 +241,12 @@ fn guard_referential_children(
                 TriggerEvents::UPDATE
             };
             let child = child_schema.name.clone();
-            let hit = list_triggers_in_txn(write_txn, tenant, &child)?
-                .iter()
-                .any(|t| t.events.contains(event));
+            // 対象表自身（自己参照 FK）は子表として数えない。自身のトリガは通常経路で発火し、
+            // 参照アクションで書き換わる同表の別行の扱いは設計記録の既知の制限に書く。
+            let hit = child != table
+                && list_triggers_in_txn(write_txn, tenant, &child)?
+                    .iter()
+                    .any(|t| t.events.contains(event));
             if hit {
                 return Err(unsupported(
                     "triggers on tables affected by referential actions are not supported",

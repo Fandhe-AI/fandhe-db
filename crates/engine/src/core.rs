@@ -14531,6 +14531,25 @@ impl EngineCore {
         Ok((bound, content_hash_value))
     }
 
+    /// UPDATE の束縛区間で NOT NULL 検査を後回しにするガードを返す（対象表に UPDATE のトリガがあるときだけ。
+    /// Issue #1725）。
+    fn defer_not_null_scope_for_update(
+        &self,
+        ctx: &PolicyContext,
+        table: &str,
+    ) -> Option<crate::sql::set_expr::DeferNotNullBindScope> {
+        // 読み取りの失敗・トリガ無しは従来どおり束縛時に検査する（fail-closed。トリガ有無の誤判定でも
+        // 最終検査が `validate_set_assignments` に残る）。
+        let triggers = self.storage.list_triggers(ctx.tenant_id(), table).ok()?;
+        triggers
+            .iter()
+            .any(|t| {
+                t.events
+                    .contains(crate::catalog::trigger::TriggerEvents::UPDATE)
+            })
+            .then(crate::sql::set_expr::DeferNotNullBindScope::enter)
+    }
+
     /// 対象テーブルのスキーマを取得する（`RETURNING` 付き DML の各実行本体が
     /// 共有。`TableNotFound` は `42P01`、それ以外は詳細を含まない固定文言の
     /// `XX000`）。
@@ -14718,6 +14737,7 @@ impl EngineCore {
                     },
                 })?,
         };
+        let _defer = self.defer_not_null_scope_for_update(ctx, &stmt.table_name);
         let bound = crate::sql::parser::bind_update(stmt, &schema)?;
         crate::sql::exec::execute_update_with_schema_in(
             target,
@@ -14780,6 +14800,8 @@ impl EngineCore {
                     detail: "failed to load table schema".to_string(),
                 },
             })?;
+        // 対象表に UPDATE の行トリガがあれば、束縛時の NOT NULL 検査を最終 NEW まで後回しにする。
+        let _defer = self.defer_not_null_scope_for_update(ctx, table_name);
         let ValidatedUpdateForm::Predicate(validated) = stmt else {
             // `Single` は `bind_update_form` へ渡す前にここで直接処理する
             // （`Predicate` 分岐専用の `Self::run_predicate_update` へは

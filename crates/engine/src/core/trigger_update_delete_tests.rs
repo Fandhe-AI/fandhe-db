@@ -176,6 +176,94 @@ fn before_update_can_repair_null_in_not_null_column() {
     );
 }
 
+// 明示的な `SET n = NULL`・既定値の無い NOT NULL 列への `SET n = DEFAULT` も、束縛時に `23502` にせず
+// BEFORE UPDATE が補正できる（最終 NEW だけを検査する）。補正しなければ `23502`。
+#[test]
+fn before_update_can_repair_explicit_null_and_default() {
+    let dir = tempdir();
+    let (core, _calls) = seeded(
+        dir.path(),
+        Box::new(|c| {
+            let mut new = c.new_row.to_vec();
+            if let Some(slot) = new.get_mut(2) {
+                *slot = Value::BigInt(88);
+            }
+            Ok(TriggerOutcome::Proceed(new))
+        }),
+    );
+    let a = ctx("tenant-a");
+    add_trigger(
+        &core.storage,
+        "tenant-a",
+        "trg",
+        &dml_trigger("b", TriggerTiming::Before, UPD, &[]),
+    );
+    for sql in [
+        "UPDATE trg SET n = NULL WHERE id = 1",
+        "UPDATE trg SET n = DEFAULT WHERE id = 1",
+        "UPDATE trg SET n = NULL WHERE n > 0",
+    ] {
+        run(&core, &a, sql).expect(sql);
+    }
+    assert_eq!(read_rows(&core, &a, "trg")[0].2, 88);
+
+    let dir2 = tempdir();
+    let (core2, _) = seeded(dir2.path(), passthrough());
+    add_trigger(
+        &core2.storage,
+        "tenant-a",
+        "trg",
+        &dml_trigger("b", TriggerTiming::Before, UPD, &[]),
+    );
+    assert_eq!(
+        code(&core2, &a, "UPDATE trg SET n = NULL WHERE id = 1"),
+        "23502"
+    );
+    assert_eq!(
+        code(&core2, &a, "UPDATE trg SET n = DEFAULT WHERE id = 1"),
+        "23502"
+    );
+    assert_eq!(
+        code(&core2, &a, "UPDATE trg SET n = NULL WHERE n > 0"),
+        "23502"
+    );
+    // トリガの無い表では従来どおり束縛時に `23502`。
+    let dir3 = tempdir();
+    let (core3, _) = seeded(dir3.path(), passthrough());
+    assert_eq!(
+        code(&core3, &a, "UPDATE trg SET n = NULL WHERE id = 1"),
+        "23502"
+    );
+}
+
+// 自己参照 FK（CASCADE）を持つ表自身の UPDATE・DELETE トリガは、子表扱いで 0A000 にならず発火する。
+#[test]
+fn self_referencing_table_triggers_fire() {
+    let dir = tempdir();
+    let (core, calls) = seeded(dir.path(), passthrough());
+    let a = ctx("tenant-a");
+    let mut s = SessionState::default();
+    s.allow_ddl();
+    core.execute_sql_in_session(
+        &a,
+        &mut s,
+        "CREATE TABLE selfr (k BIGINT PRIMARY KEY, p BIGINT REFERENCES selfr(k) ON DELETE CASCADE ON UPDATE CASCADE)",
+    )
+    .expect("ddl");
+    add_trigger(
+        &core.storage,
+        "tenant-a",
+        "selfr",
+        &dml_trigger("t", TriggerTiming::Before, UPD | DEL, &[]),
+    );
+    run(&core, &a, "INSERT INTO selfr (k) VALUES (1)").expect("insert");
+    let out = run(&core, &a, "UPDATE selfr SET p = NULL WHERE k = 1").expect("update");
+    assert_eq!(affected(out), 1);
+    let out = run(&core, &a, "DELETE FROM selfr WHERE k = 1").expect("delete");
+    assert_eq!(affected(out), 1);
+    assert_eq!(calls.load(Ordering::SeqCst), 2);
+}
+
 // BEFORE が NULL を返した行は更新・削除されず、影響行数にも AFTER にも数えない。
 #[test]
 fn before_skip_excludes_row_from_update_and_delete() {

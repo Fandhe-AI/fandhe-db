@@ -72,6 +72,54 @@ impl BoundSetExpr {
     }
 }
 
+thread_local! {
+    /// 束縛時の NOT NULL 検査（`SET col = NULL`・既定値の無い NOT NULL 列への `SET col = DEFAULT`）を
+    /// 後回しにする区間か（BEFORE UPDATE トリガ対応の経路。Issue #1725）。
+    static DEFER_NOT_NULL_BIND: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+}
+
+/// 束縛時の NOT NULL 検査を後回しにする RAII ガード。対象表に UPDATE の行トリガがあるとき、
+/// `core.rs` の UPDATE 入口が束縛区間だけ保持する。NULL は式項（`default_value` または `BoundExpr::Null`）
+/// として運ばれ、BEFORE トリガが補正した後の最終 NEW でだけ NOT NULL を検査する（`tenant::trigger_dml`）。
+/// トリガ無しの経路は検査が `validate_set_assignments` に残るため `23502` を返す契約は変わらない。
+/// drop で直前の値へ戻す。
+pub(crate) struct DeferNotNullBindScope {
+    prev: bool,
+}
+
+impl DeferNotNullBindScope {
+    pub(crate) fn enter() -> Self {
+        Self {
+            prev: DEFER_NOT_NULL_BIND.with(|c| c.replace(true)),
+        }
+    }
+}
+
+impl Drop for DeferNotNullBindScope {
+    fn drop(&mut self) {
+        let prev = self.prev;
+        DEFER_NOT_NULL_BIND.with(|c| c.set(prev));
+    }
+}
+
+/// 現スレッドが [`DeferNotNullBindScope`] の区間内か。
+pub(crate) fn defer_not_null_bind() -> bool {
+    DEFER_NOT_NULL_BIND.with(|c| c.get())
+}
+
+/// NOT NULL 列への明示的な `SET col = NULL` を、NOT NULL 検査後回しの式項として束縛する
+/// （[`DeferNotNullBindScope`] の区間専用。評価は [`eval_set_expr_to_value_deferred_not_null`] が行う）。
+pub(crate) fn bind_deferred_null(name: &str, column: &ColumnDef) -> BoundSetExpr {
+    BoundSetExpr {
+        source: Expr::Null,
+        bound: BoundExpr::Null,
+        target_ty: column.ty.clone(),
+        nullable: column.nullable,
+        column_name: name.to_string(),
+        default_value: None,
+    }
+}
+
 /// `SET col = DEFAULT`（SQL-50・Issue #1746）を列 `column` への代入として束縛する。スキーマ
 /// （列定義）だけを参照し行には触れない。列 DEFAULT があればその定数値、無ければ NULL
 /// （`SET col = NULL` と同じ規則: NOT NULL 列は `23502`、VECTOR 列は `22000`）。
@@ -90,6 +138,8 @@ pub(crate) fn bind_set_default(
                 )))
             }
             _ if column.nullable => Value::Null,
+            // NOT NULL 検査後回しの区間（BEFORE UPDATE トリガ対応）では NULL のまま運ぶ。
+            _ if defer_not_null_bind() => Value::Null,
             _ => return Err(SqlSurfaceError::not_null_violation(name)),
         },
     };

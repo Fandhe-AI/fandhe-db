@@ -6562,6 +6562,22 @@ pub(crate) fn update_rows_joined_unchecked<E>(
                 }
             }
             validate_set_assignments(&schema, assignments).map_err(dml_write_err)?;
+            // カタログだけで決まる未対応の拒否（文トリガ・参照アクション先・通過証なし）は台帳記録と
+            // 候補列挙より前に行う（一致件数が上限を超えても `54000` でなく `0A000` にする）。
+            // `UPDATE OF` の絞り込みは候補ごとの上書き列が要るため、ここでは全列を SET 列とみなして
+            // 結果を捨て、確定の分類は候補列挙の後に行う。
+            let all_columns: Vec<usize> = (0..schema.columns.len()).collect();
+            plan_update_triggers(
+                write_txn,
+                ctx,
+                table,
+                &schema,
+                assignments,
+                &[],
+                &all_columns,
+                triggers,
+            )
+            .map_err(dml_write_err)?;
             ledger::record_in_txn_accepting(
                 write_txn,
                 ctx.tenant_id(),
