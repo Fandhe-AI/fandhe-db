@@ -9010,10 +9010,30 @@ impl EngineCore {
                 name,
                 params,
                 param_types,
+                return_type,
                 body,
                 body_source,
             } => {
                 if session.ddl_allowed() {
+                    // Issue #1916: RETURNS 付きは永続化の前に、非 DDL セッションと同じ検証（本体の型検査）を
+                    // レジストリの複製に対して行う。型の不一致は権限によらず `42P13` になり、
+                    // 検証を通った定義だけが下の `0A000`（未対応の永続化）に到達する。
+                    if return_type.is_some() {
+                        let mut probe = session.udfs().clone();
+                        crate::sql::udf_call::define_function_with_signature(
+                            &mut probe,
+                            &name,
+                            &params,
+                            &param_types,
+                            return_type.as_ref(),
+                            &body,
+                        )?;
+                        return Err(
+                            crate::sql::allowlist::SqlSurfaceError::feature_not_supported(
+                                "function return types cannot be persisted yet",
+                            ),
+                        );
+                    }
                     if param_types.iter().any(Option::is_some) {
                         return Err(
                             crate::sql::allowlist::SqlSurfaceError::feature_not_supported(
@@ -9031,11 +9051,12 @@ impl EngineCore {
                         &body_source,
                     )?;
                 } else {
-                    crate::sql::udf_call::define_function_with_types(
+                    crate::sql::udf_call::define_function_with_signature(
                         session.udfs_mut(),
                         &name,
                         &params,
                         &param_types,
+                        return_type.as_ref(),
                         &body,
                     )?;
                 }

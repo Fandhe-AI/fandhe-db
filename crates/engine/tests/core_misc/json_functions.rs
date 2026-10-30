@@ -615,7 +615,7 @@ fn unsupported_contexts_fail_closed() {
     let e = core
         .execute_sql(
             &alice,
-            "CREATE FUNCTION jsonb_typeof(x) RETURNS DOUBLE AS x",
+            "CREATE FUNCTION jsonb_typeof(x double precision) RETURNS double precision AS x",
         )
         .map(|_| ())
         .expect_err("reserved name");

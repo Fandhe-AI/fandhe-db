@@ -216,6 +216,9 @@ pub const fn http_status(class: ErrorClass) -> u16 {
         // 専用で、NoSQL の filter レーンは `Leaf` しか組み立てないため到達しない。
         | ErrorClass::UndefinedFunction
         | ErrorClass::DuplicateFunction
+        // `InvalidFunctionDefinition`（`42P13`。SQL-66、Issue #1916）も NoSQL に
+        // `CREATE FUNCTION` の op が無く到達しない。網羅性のため 400。
+        | ErrorClass::InvalidFunctionDefinition
         // `AmbiguousColumn`（`42702`。SQL-28・RLS-10、Issue #924）は複数テーブル
         // 参照スコープでの非修飾列の曖昧解決。SQL 表層は `INNER JOIN`（Issue
         // #925）で到達可能になった。NoSQL 表層は JOIN 経路を持たないが、
@@ -233,7 +236,7 @@ mod tests {
 
     /// 期待表を明示的に列挙し、`ErrorClass::ALL` との突き合わせで非 vacuous に検証する。
     /// `match` にアームを足したが期待表の更新を忘れた、という乖離を (a)(b) が検出する。
-    const EXPECTED: [(ErrorClass, u16); 91] = [
+    const EXPECTED: [(ErrorClass, u16); 92] = [
         (ErrorClass::InvalidInput, 400),
         (ErrorClass::StringDataRightTruncation, 400),
         (ErrorClass::AuthInvalid, 401),
@@ -291,6 +294,7 @@ mod tests {
         (ErrorClass::DatatypeMismatch, 400),
         (ErrorClass::UndefinedFunction, 400),
         (ErrorClass::DuplicateFunction, 400),
+        (ErrorClass::InvalidFunctionDefinition, 400),
         (ErrorClass::AmbiguousColumn, 400),
         (ErrorClass::InvalidParameterValue, 400),
         (ErrorClass::IndeterminateDatatype, 400),
