@@ -66,7 +66,7 @@ fn bare_value_tokens_equal_the_lexer_output_for_the_same_literal() {
         (PlScalar::new(Cell::Float(-2.0), ColumnType::Double), "-2.0"),
     ];
     for (v, lit) in cases {
-        let got = scalar_tokens_styled(&v, VarRole::Value, NumStyle::Bare).expect("tokens");
+        let got = scalar_tokens_styled(&v, VarRole::Value, NumStyle::Bare, false).expect("tokens");
         assert_eq!(got, lex(lit), "{lit}");
     }
 }
@@ -305,7 +305,7 @@ fn numbers_keep_their_declared_type_in_value_positions() {
         ),
         (
             typed(ColumnType::Double, Cell::Float(1e300)),
-            "CAST('1e300' AS double precision)",
+            "CAST(1e300 AS double precision)",
         ),
     ];
     for role in [
@@ -333,12 +333,29 @@ fn literal_slots_take_a_bare_literal_and_refuse_untyped_forms() {
         scalar_tokens(&d, VarRole::LiteralSlot).expect("slot"),
         lex("1.5")
     );
-    // 裸で表せない形（指数表記）は型が黙って変わらないよう拒否する。
+    // 指数表記・scale 0 の numeric も裸のリテラル（リテラル専用位置は値で比較される）。
+    let e = typed(ColumnType::Double, Cell::Float(1e300));
+    assert_eq!(
+        scalar_tokens(&e, VarRole::LiteralSlot).expect("exponent"),
+        lex("1e300")
+    );
+    let n0 = typed(
+        ColumnType::Numeric {
+            precision: 5,
+            scale: 0,
+        },
+        Cell::Numeric(crate::numeric::Decimal::from_parts(3, 0).expect("decimal")),
+    );
+    assert_eq!(
+        scalar_tokens(&n0, VarRole::LiteralSlot).expect("numeric"),
+        lex("3")
+    );
+    // NaN は拒否する。
     let e = scalar_tokens(
-        &typed(ColumnType::Double, Cell::Float(1e300)),
+        &typed(ColumnType::Double, Cell::Float(f64::NAN)),
         VarRole::LiteralSlot,
     )
-    .expect_err("exponent");
+    .expect_err("nan");
     assert_eq!(e.wire_code(), "0A000");
 }
 
@@ -394,5 +411,57 @@ fn dynamic_param_roles_survive_and_inside_case_and_literal_slots() {
     assert_eq!(
         out,
         lex("SELECT a FROM t WHERE a BETWEEN 1 AND 2 AND a < CAST(3 AS bigint)")
+    );
+}
+
+#[test]
+fn const_expr_elements_use_cast_free_typed_substitution() {
+    // bigint（int4 に収まる値）は 2^31 を足し引きして bigint の算術に載せる（CAST は定数式で不可）。
+    let v = typed(ColumnType::BigInt, Cell::SignedInteger(2_147_483_647));
+    assert_eq!(
+        scalar_tokens(&v, VarRole::ConstExpr).expect("bigint"),
+        lex("((2147483647 + 2147483648) - 2147483648)")
+    );
+    // int4 を超える値はリテラルのまま bigint。
+    let v = typed(ColumnType::BigInt, Cell::SignedInteger(3_000_000_000));
+    assert_eq!(
+        scalar_tokens(&v, VarRole::ConstExpr).expect("big"),
+        lex("3000000000")
+    );
+    // 日付は型付きリテラル、NULL は裸（列型が決める）。
+    let d = typed(ColumnType::Date, Cell::Date(0));
+    assert_eq!(
+        scalar_tokens(&d, VarRole::ConstExpr).expect("date"),
+        lex("DATE '1970-01-01'")
+    );
+    assert_eq!(
+        scalar_tokens(&PlScalar::null(ColumnType::Integer), VarRole::ConstExpr).expect("null"),
+        lex("NULL")
+    );
+    // scale 0 の numeric: 単独は `3`、式の中は `3.0`。
+    let n0 = typed(
+        ColumnType::Numeric {
+            precision: 5,
+            scale: 0,
+        },
+        Cell::Numeric(crate::numeric::Decimal::from_parts(3, 0).expect("decimal")),
+    );
+    let tokens = lex("VALUES (v, v * 2)");
+    let sites = vec![
+        site(2, VarRole::ConstExpr, 0),
+        site(4, VarRole::ConstExpr, 0),
+    ];
+    let out = substitute(&tokens, &sites, &Env(vec![n0]), false, NumStyle::Typed).expect("numeric");
+    assert_eq!(out, lex("VALUES (3, 3.0 * 2)"));
+}
+
+#[test]
+fn execute_values_role_survives_and_inside_case() {
+    let v = typed(ColumnType::BigInt, Cell::SignedInteger(5));
+    let sql = "INSERT INTO t (a) VALUES (CASE WHEN 1 > 0 AND 2 > 1 THEN $1 END)";
+    let out = substitute_params(&lex(sql), std::slice::from_ref(&v), NumStyle::Typed).expect(sql);
+    assert_eq!(
+        out,
+        lex("INSERT INTO t (a) VALUES (CASE WHEN 1 > 0 AND 2 > 1 THEN ((5 + 2147483648) - 2147483648) END)")
     );
 }

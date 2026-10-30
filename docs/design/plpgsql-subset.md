@@ -488,17 +488,21 @@ D3・D5・D6・D8 の最終判断。実装は `crates/engine/src/core/plpgsql_ho
   値から型を推定し直し、bigint 変数が int4 の演算になる等の型の取り違えを起こす）。NaN／Infinity・
   対応外の型は `0A000`。構築したトークン列が字句解析器の出力と一致することを、裸の形（`NumStyle::Bare`）
   の単体テストで固定した
-- 数値が裸になる 2 箇所（どちらも宣言型が結果へ伝わらない位置）。(1) `LiteralSlot`（`LIMIT`・`IN` リスト・
-  `BETWEEN` 境界・`LIKE`。許可リストが `CAST` を受理しない）は値を保つ裸のリテラル。指数表記の浮動小数・
-  numeric は裸で表せないため `0A000`。(2) 構文解析が定数式（`INSERT .. VALUES` の要素・`DEFAULT` 等）で
-  `CAST` を拒否した場合に限り（`const_expr::is_cast_rejection`）、ホストが同じ文を裸の数値で置換し直す
-  （型は書き込み先の列型・定数畳み込みが決める。拒否は実行前のため副作用は重複しない）。`WHERE` 形の
-  比較の検査（`where_probe`）も値同士の比較なので裸の数値
+- `CAST` を受理しない位置は、拡張クエリの `$n` の型付き置換（`sql::params::substitute_values_typed`）と
+  同じく、字句解析器がリテラルから作るトークンで置換する（再試行・文字列の判定には頼らない）。
+  (1) `LiteralSlot`（`LIMIT`・`IN` リスト・`BETWEEN` 境界・`LIKE`）は値を保つ裸のリテラル（指数表記・
+  scale 0 の numeric を含む。NaN／Infinity は `0A000`）。(2) `ConstExpr`（`INSERT .. VALUES` の要素。
+  定数式の束縛が `CAST` を拒否する。パーサーが `colref_sink::Role::ConstExpr` で記録し、`EXECUTE` は
+  直前の `VALUES` から推定する）は、NULL は裸、日付・時刻は `DATE '...'` 等の型付きリテラル、数値は
+  bigint で int4 に収まる値を `((v + 2147483648) - 2147483648)`（リテラルのまま `p + 1` とすると
+  int4 の算術として範囲エラーになる。畳み込み後は値と同じリテラル）、scale 0 の numeric は単独の
+  要素なら `3`・式の中では `3.0`（整数除算への化け防止）。`WHERE` 形の比較の検査（`where_probe`）は
+  値同士の比較なので裸の数値（`NumStyle::Bare`）
 - 役割別: `SelectItemBare` は `AS <名前>` を付け、投影が裸の文字列・真偽値を受理しないため
   `CAST('...' AS text)`／`CAST('true' AS boolean)` で包む。数値の `CAST` 包みは `OrderKey`／`GroupKey` の
   序数参照への化け防止も兼ねる。NULL は `Value`・`SelectItemBare`・`OrderKey`・`GroupKey` で
   `CAST(NULL AS 型)`（裸の `NULL` は列名として解釈される）。型語の無い型は `OrderKey`／`GroupKey` で
-  `0A000`。`LiteralSlot`・`WhereHead` は裸の `NULL`（`sql::params` の NULL 束縛と同じ）
+  `0A000`。`LiteralSlot`・`WhereHead`・`ConstExpr` は裸の `NULL`（`sql::params` の NULL 束縛と同じ）
 - `EXECUTE` の `$n` の役割は文字列のトークン走査で推定する（`param_role`）。`AND` は節境界とせず、
   `CASE .. END` の内側を読み飛ばす。リテラル専用位置は `LIMIT`／`OFFSET`／`LIKE`／`BETWEEN`／`IN (..)` の
   前後関係で判定する。推定を外しても数値は `CAST` 包みのため序数参照・型喪失にはならない

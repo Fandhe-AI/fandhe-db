@@ -24,8 +24,8 @@ fn unsupported_type() -> SqlSurfaceError {
     )
 }
 
-/// 数値の置換形式。`Typed` は宣言型を保つ `CAST` 包み、`Bare` は裸のリテラル（`CAST` を受理しない
-/// 定数式の位置・`WHERE` 形の比較の検査用。呼び出し側が `Typed` の拒否を確かめたときだけ使う）。
+/// 数値の置換形式。`Typed` は役割に応じた型を保つ形、`Bare` は裸のリテラル（`WHERE` 形の比較の
+/// 検査〔`where_probe`〕のように、値同士の比較で宣言型が結果へ伝わらない用途だけに使う）。
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum NumStyle {
     Typed,
@@ -131,6 +131,19 @@ fn float_type_words(ty: &ColumnType) -> &'static [&'static str] {
     }
 }
 
+/// 日付・時刻のトークン列。`CAST` を受理しない定数式（`ConstExpr`）は型付きリテラル
+/// （`DATE '...'` 等）、それ以外は `CAST('...' AS 型)`。
+fn temporal_tokens(text: String, word: &str, role: VarRole) -> Vec<Token> {
+    if role == VarRole::ConstExpr {
+        vec![
+            Token::Ident(word.to_ascii_uppercase()),
+            Token::StringLiteral(text),
+        ]
+    } else {
+        cast_text_tokens(text, &[word])
+    }
+}
+
 /// 数値の `CAST` の型語。変数の宣言型を保つ（整数リテラルのまま置換すると SQL 側が値から型を
 /// 推定し直し、`bigint` 変数が `int4` として扱われて範囲エラーになる等、宣言型が失われる）。
 /// 数値型以外の宣言（`PlScalar` が数値セルを別の型で持つ場合）は値の大きさから整数型を選ぶ。
@@ -150,50 +163,76 @@ fn number_type_words(v: &PlScalar) -> &'static [&'static str] {
     }
 }
 
+/// 数値セルの値を表す裸のリテラルのトークン列（符号は `Punct('-')`）。NaN／Infinity・裸で書けない
+/// 形は `0A000`。浮動小数は `Debug` 表記（整数値でも `3.0` と小数点を残す。`Display` の `3` は
+/// 整数リテラルになり `p / 2` が整数除算へ化ける）、numeric は `Display` 表記（scale 0 は `3`）。
+fn bare_number_tokens(v: &PlScalar) -> Result<Vec<Token>, SqlSurfaceError> {
+    match &v.cell {
+        Cell::SignedInteger(i) => Ok(int_tokens(*i < 0, i.unsigned_abs().to_string())),
+        Cell::Integer(u) => Ok(int_tokens(false, u.to_string())),
+        Cell::Float(f) if f.is_finite() => {
+            number_tokens_from_text(&format!("{f:?}")).ok_or_else(unsupported_type)
+        }
+        Cell::Numeric(d) => number_tokens_from_text(&d.to_string()).ok_or_else(unsupported_type),
+        _ => Err(unsupported_type()),
+    }
+}
+
+/// `INSERT .. VALUES` の要素（定数式。`CAST` を受理しない）の数値のトークン列。拡張クエリの `$n`
+/// の型付き置換（`sql::params::substitute_values_typed`）と同じく、値を字句解析器がリテラルから作る
+/// トークンで置換し、型は書き込み先の列型が決める。式の中では次のとおり型を保つ。
+/// - bigint で int4 に収まる値は `((v + 2147483648) - 2147483648)`（リテラルのまま `p + 1` とすると
+///   int4 の算術として範囲エラーになる。畳み込み後は値と同じリテラルで、列型の検査は従来どおり）
+/// - scale 0 の numeric は、要素が単独（`lone`）なら `3`（整数列にも受理される）、式の中では `3.0`
+///   （整数リテラルだと `p / 2` が整数除算へ化ける）
+fn const_number_tokens(
+    v: &PlScalar,
+    bare: Vec<Token>,
+    lone: bool,
+) -> Result<Vec<Token>, SqlSurfaceError> {
+    let int_value = match &v.cell {
+        Cell::SignedInteger(i) => Some(i128::from(*i)),
+        Cell::Integer(u) => Some(i128::from(*u)),
+        _ => None,
+    };
+    if let (Some(n), ColumnType::BigInt) = (int_value, &v.ty) {
+        if i32::try_from(n).is_ok() {
+            let shift = || Token::Number("2147483648".to_string());
+            let mut out = vec![Token::Punct('('), Token::Punct('(')];
+            out.extend(bare);
+            out.extend([Token::Punct('+'), shift(), Token::Punct(')')]);
+            out.extend([Token::Punct('-'), shift(), Token::Punct(')')]);
+            return Ok(out);
+        }
+    }
+    if let (Cell::Numeric(_), false) = (&v.cell, lone) {
+        let mut out = bare;
+        if let Some(Token::Number(n)) = out.last_mut() {
+            if !n.contains(['.', 'e', 'E']) {
+                n.push_str(".0");
+            }
+        }
+        return Ok(out);
+    }
+    Ok(bare)
+}
+
 /// 数値セルの置換トークン。列としても式としても読める位置は `CAST(<literal> AS <宣言型>)` で
 /// 宣言型を保つ（`OrderKey`／`GroupKey` では裸の整数が序数参照に化けることの防止も兼ねる）。
-/// `CAST` を受理しないリテラル専用位置（`LiteralSlot`。`LIMIT`・`IN` リスト・`BETWEEN` 境界等）は
-/// 比較相手の列型・件数としてしか使われず値の型が結果へ伝わらないため、値を保つ裸のリテラルを返す。
-/// 小数点の無い浮動小数・numeric（指数表記）は裸で表せないので、その位置では `0A000`（型が黙って
-/// 変わる経路を残さない）。
+/// `CAST` を受理しない位置は、宣言型が結果へ伝わらない `LiteralSlot`（`LIMIT`・`IN` リスト・
+/// `BETWEEN` 境界・`LIKE`）では値を保つ裸のリテラル、`ConstExpr` では [`const_number_tokens`]。
 fn number_tokens(
     v: &PlScalar,
     role: VarRole,
     style: NumStyle,
+    lone: bool,
 ) -> Result<Vec<Token>, SqlSurfaceError> {
-    // 第 2 要素は、トークン列が既に型語を含む（`CAST('<text>' AS ..)` 形）か。
-    let (bare, typed) = match &v.cell {
-        Cell::SignedInteger(i) => (int_tokens(*i < 0, i.unsigned_abs().to_string()), false),
-        Cell::Integer(u) => (int_tokens(false, u.to_string()), false),
-        Cell::Float(f) => {
-            if !f.is_finite() {
-                return Err(unsupported_type());
-            }
-            // `Debug` は整数値でも `3.0` と小数点を残す。小数点の無い形（指数表記）は型を明示する。
-            let text = format!("{f:?}");
-            match typed_decimal_tokens(&text) {
-                Some(t) => (t, false),
-                None => (cast_text_tokens(text, float_type_words(&v.ty)), true),
-            }
-        }
-        Cell::Numeric(d) => {
-            let text = d.to_string();
-            match typed_decimal_tokens(&text) {
-                Some(t) => (t, false),
-                None => (cast_text_tokens(text, &["numeric"]), true),
-            }
-        }
-        _ => return Err(unsupported_type()),
-    };
+    let bare = bare_number_tokens(v)?;
     if role == VarRole::LiteralSlot || style == NumStyle::Bare {
-        return if typed && role == VarRole::LiteralSlot {
-            Err(unsupported_type())
-        } else {
-            Ok(bare)
-        };
-    }
-    if typed {
         return Ok(bare);
+    }
+    if role == VarRole::ConstExpr {
+        return const_number_tokens(v, bare, lone);
     }
     let mut out = vec![Token::Ident("CAST".to_string()), Token::Punct('(')];
     out.extend(bare);
@@ -210,7 +249,7 @@ fn number_tokens(
 /// 値 1 個を、型を保った SQL トークン列にする。`role` は NULL・数値の表現に影響する（文字列・
 /// 真偽値は役割に依らず同一のトークン）。
 pub(crate) fn scalar_tokens(v: &PlScalar, role: VarRole) -> Result<Vec<Token>, SqlSurfaceError> {
-    scalar_tokens_styled(v, role, NumStyle::Typed)
+    scalar_tokens_styled(v, role, NumStyle::Typed, false)
 }
 
 /// 数値の形式を指定する [`scalar_tokens`]。
@@ -218,19 +257,20 @@ pub(crate) fn scalar_tokens_styled(
     v: &PlScalar,
     role: VarRole,
     style: NumStyle,
+    lone: bool,
 ) -> Result<Vec<Token>, SqlSurfaceError> {
     Ok(match &v.cell {
         Cell::Null => null_tokens(&v.ty, role)?,
         Cell::SignedInteger(_) | Cell::Integer(_) | Cell::Float(_) | Cell::Numeric(_) => {
-            number_tokens(v, role, style)?
+            number_tokens(v, role, style, lone)?
         }
         Cell::Bool(b) => vec![Token::Ident(if *b { "true" } else { "false" }.to_string())],
         Cell::Text(s) => vec![Token::StringLiteral(s.clone())],
-        Cell::Date(d) => cast_text_tokens(crate::datetime::format_date(*d), &["date"]),
+        Cell::Date(d) => temporal_tokens(crate::datetime::format_date(*d), "date", role),
         Cell::Timestamp(us) => {
-            cast_text_tokens(crate::datetime::format_timestamp(*us), &["timestamp"])
+            temporal_tokens(crate::datetime::format_timestamp(*us), "timestamp", role)
         }
-        Cell::Time(us) => cast_text_tokens(crate::datetime::format_time(*us), &["time"]),
+        Cell::Time(us) => temporal_tokens(crate::datetime::format_time(*us), "time", role),
         _ => return Err(unsupported_type()),
     })
 }
@@ -241,8 +281,9 @@ fn role_tokens(
     role: VarRole,
     name_for_alias: Option<&str>,
     style: NumStyle,
+    lone: bool,
 ) -> Result<Vec<Token>, SqlSurfaceError> {
-    let mut out = scalar_tokens_styled(v, role, style)?;
+    let mut out = scalar_tokens_styled(v, role, style, lone)?;
     // 投影項目の位置は、文字列・真偽値の裸のリテラルを受理しない（`SELECT 'a' AS x`・`SELECT true AS x`
     // は `42601`／`42703`）ため、`CAST` で包んで式にする。
     if role == VarRole::SelectItemBare {
@@ -261,6 +302,17 @@ fn role_tokens(
         }
     }
     Ok(out)
+}
+
+/// `tokens[pos]` が値リスト・括弧の中で単独の要素（直前が `(` か `,`、直後が `,` か `)`）か。
+fn is_lone(tokens: &[Token], pos: usize) -> bool {
+    matches!(
+        pos.checked_sub(1).and_then(|p| tokens.get(p)),
+        Some(Token::Punct('(' | ','))
+    ) && matches!(
+        tokens.get(pos.saturating_add(1)),
+        Some(Token::Punct(',' | ')'))
+    )
 }
 
 /// 負値（`-` + 数値の 2 トークン）を、`::` の直前または直前が `-` の位置で括弧に包む
@@ -352,7 +404,7 @@ pub(crate) fn substitute(
         let value: &PlScalar = env.scalar(&site.var)?;
         charge(&mut total, scalar_len_estimate(value))?;
         let name = if alias { alias_name(original) } else { None };
-        let mut produced = role_tokens(value, site.role, name, style)?;
+        let mut produced = role_tokens(value, site.role, name, style, is_lone(tokens, site.pos))?;
         parenthesize_if_needed(
             site.pos.checked_sub(1).and_then(|p| tokens.get(p)),
             tokens.get(site.pos.saturating_add(1)),
@@ -423,6 +475,34 @@ fn is_literal_slot(tokens: &[Token], i: usize) -> bool {
     false
 }
 
+/// `$n`（`tokens[i]`）が `INSERT .. VALUES` の要素の中か（直前の `VALUES` から `SELECT`／`SET`／
+/// `RETURNING` 等を挟まずに到達する）。外れても、`ConstExpr` の置換形はどの位置でも受理される形。
+fn in_values_list(tokens: &[Token], i: usize) -> bool {
+    for j in (0..i).rev() {
+        let t = tokens.get(j);
+        if is_word(t, "VALUES") {
+            return true;
+        }
+        // `AND`・`BY` は式の内側にも現れる（`CASE WHEN .. AND ..`）ため、境界にしない。
+        let boundary = matches!(
+            t,
+            Some(Token::Keyword(
+                lexer::Keyword::Select
+                    | lexer::Keyword::From
+                    | lexer::Keyword::Where
+                    | lexer::Keyword::Order
+                    | lexer::Keyword::Limit
+            ))
+        ) || ["SET", "RETURNING", "CONFLICT"]
+            .iter()
+            .any(|w| is_word(t, w));
+        if boundary {
+            return false;
+        }
+    }
+    false
+}
+
 /// `EXECUTE` の文字列中の `$n`（`tokens[i]`）の構文上の役割を、同じ括弧深さの前後のトークンから
 /// 推定する。リテラル専用位置は [`VarRole::LiteralSlot`]、`ORDER BY`／`GROUP BY` の直接のキーは
 /// [`VarRole::OrderKey`]／[`VarRole::GroupKey`]、別名なしの投影項目は [`VarRole::SelectItemBare`]、
@@ -435,6 +515,9 @@ fn is_literal_slot(tokens: &[Token], i: usize) -> bool {
 fn param_role(tokens: &[Token], i: usize) -> VarRole {
     if is_literal_slot(tokens, i) {
         return VarRole::LiteralSlot;
+    }
+    if in_values_list(tokens, i) {
+        return VarRole::ConstExpr;
     }
     let direct = matches!(
         i.checked_sub(1).and_then(|p| tokens.get(p)),
@@ -510,7 +593,7 @@ pub(crate) fn substitute_params(
                 })?;
                 charge(&mut total, scalar_len_estimate(v))?;
                 let role = param_role(tokens, i);
-                let mut produced = role_tokens(v, role, None, style)?;
+                let mut produced = role_tokens(v, role, None, style, is_lone(tokens, i))?;
                 parenthesize_if_needed(
                     i.checked_sub(1).and_then(|p| tokens.get(p)),
                     tokens.get(i.saturating_add(1)),

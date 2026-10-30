@@ -1025,8 +1025,7 @@ fn execute_with_numbers_in_const_and_literal_positions() {
     let (core, _g) = new_core(LedgerMode::Optional);
     let c = ctx("t1");
     seed(&core, &c, &[1, 2, 3], "en");
-    // INSERT .. VALUES は定数式で CAST を受理しないため、裸の数値へ切り替えて通る。IN リストは
-    // リテラル専用位置。
+    // INSERT .. VALUES は定数式（CAST 不可）、IN リストはリテラル専用位置。
     let out = call(
         "DECLARE c bigint; BEGIN \
          EXECUTE 'INSERT INTO docs (id, embedding, lang, n) VALUES ($1, ''[0.1,0.2]'', ''x'', $2)' USING 9, 4; \
@@ -1051,4 +1050,126 @@ fn null_order_key_is_typed_not_a_column_name() {
     .param("p", SqlColumnTypeName::Integer, null_int())
     .autocommit(&core, &c)
     .expect("typed null order key");
+}
+
+fn numeric0(n: i128) -> PlScalar {
+    PlScalar::new(
+        Cell::Numeric(crate::numeric::Decimal::from_parts(n, 0).expect("decimal")),
+        ColumnType::Numeric {
+            precision: 10,
+            scale: 0,
+        },
+    )
+}
+
+const NUMERIC0: SqlColumnTypeName = SqlColumnTypeName::Numeric {
+    precision: 10,
+    scale: 0,
+};
+
+/// `docs.n` の値（id 指定）。
+fn n_of(core: &EngineCore, c: &PolicyContext, id: u64) -> Option<i64> {
+    let out = call(&format!(
+        "DECLARE v int; BEGIN SELECT n INTO v FROM docs WHERE id = {id}; RETURN v; END"
+    ))
+    .autocommit(core, c)
+    .expect("read n");
+    match out {
+        CallOutcome::Scalar(v) if v.is_null() => None,
+        other => Some(as_i64(&other)),
+    }
+}
+
+#[test]
+fn values_elements_keep_bigint_semantics_without_cast() {
+    let (core, _g) = new_core(LedgerMode::Optional);
+    let c = ctx("t1");
+    // 裸のリテラルだと `2147483647 + 1` が int4 の算術として範囲エラーになる（VALUES は CAST 不可）。
+    call(
+        "BEGIN INSERT INTO docs (id, embedding, lang, n) VALUES (1, '[0.1,0.2]', 'a', p + 1 - 5); RETURN 1; END",
+    )
+    .param("p", SqlColumnTypeName::BigInt, big(2_147_483_647))
+    .autocommit(&core, &c)
+    .expect("bigint boundary in VALUES");
+    assert_eq!(n_of(&core, &c, 1), Some(2_147_483_643));
+    // 単独の要素・負値。
+    call("BEGIN INSERT INTO docs (id, embedding, lang, n) VALUES (2, '[0.1,0.2]', 'a', p); RETURN 1; END")
+        .param("p", SqlColumnTypeName::BigInt, big(-2_147_483_648))
+        .autocommit(&core, &c)
+        .expect("bigint lone");
+    assert_eq!(n_of(&core, &c, 2), Some(-2_147_483_648));
+}
+
+#[test]
+fn values_elements_accept_numeric_scale_zero_and_null() {
+    let (core, _g) = new_core(LedgerMode::Optional);
+    let c = ctx("t1");
+    call("BEGIN INSERT INTO docs (id, embedding, lang, n) VALUES (1, '[0.1,0.2]', 'a', p); RETURN 1; END")
+        .param("p", NUMERIC0, numeric0(3))
+        .autocommit(&core, &c)
+        .expect("numeric lone");
+    assert_eq!(n_of(&core, &c, 1), Some(3));
+    // 式の中の numeric は numeric のまま（整数リテラルだと `p / 2` が整数除算になる）。
+    call("BEGIN INSERT INTO docs (id, embedding, lang, n) VALUES (2, '[0.1,0.2]', 'a', p * 2); RETURN 1; END")
+        .param("p", NUMERIC0, numeric0(3))
+        .autocommit(&core, &c)
+        .expect("numeric expression");
+    assert_eq!(n_of(&core, &c, 2), Some(6));
+    call("BEGIN INSERT INTO docs (id, embedding, lang, n) VALUES (3, '[0.1,0.2]', 'a', p); RETURN 1; END")
+        .param("p", SqlColumnTypeName::Integer, null_int())
+        .autocommit(&core, &c)
+        .expect("null lone");
+    assert_eq!(n_of(&core, &c, 3), None);
+}
+
+#[test]
+fn in_and_between_accept_numeric_integer_form() {
+    let (core, _g) = new_core(LedgerMode::Optional);
+    let c = ctx("t1");
+    seed(&core, &c, &[1, 2], "en");
+    sql(&core, &c, "UPDATE docs SET n = 3 WHERE id = 1").expect("n1");
+    sql(&core, &c, "UPDATE docs SET n = 8 WHERE id = 2").expect("n2");
+    let out = call("DECLARE c bigint; BEGIN SELECT count(*) INTO c FROM docs WHERE n IN (p, 99); RETURN c; END")
+        .returns(ColumnType::BigInt)
+        .param("p", NUMERIC0, numeric0(3))
+        .autocommit(&core, &c)
+        .expect("in");
+    assert_eq!(as_i64(&out), 1);
+    let out = call("DECLARE c bigint; BEGIN SELECT count(*) INTO c FROM docs WHERE n BETWEEN p AND 9; RETURN c; END")
+        .returns(ColumnType::BigInt)
+        .param("p", NUMERIC0, numeric0(3))
+        .autocommit(&core, &c)
+        .expect("between");
+    assert_eq!(as_i64(&out), 2);
+}
+
+#[test]
+fn execute_using_values_follow_the_same_substitution() {
+    let (core, _g) = new_core(LedgerMode::Optional);
+    let c = ctx("t1");
+    let src = "BEGIN EXECUTE 'INSERT INTO docs (id, embedding, lang, n) VALUES (1, ''[0.1,0.2]'', ''a'', $1 + 1 - 5)' USING p; \
+        EXECUTE 'INSERT INTO docs (id, embedding, lang, n) VALUES (2, ''[0.1,0.2]'', ''a'', $1)' USING q; \
+        EXECUTE 'INSERT INTO docs (id, embedding, lang, n) VALUES (3, ''[0.1,0.2]'', ''a'', $1)' USING r; \
+        RETURN 1; END";
+    call(src)
+        .param("p", SqlColumnTypeName::BigInt, big(2_147_483_647))
+        .param("q", NUMERIC0, numeric0(3))
+        .param("r", SqlColumnTypeName::Integer, null_int())
+        .autocommit(&core, &c)
+        .expect("execute using");
+    assert_eq!(n_of(&core, &c, 1), Some(2_147_483_643));
+    assert_eq!(n_of(&core, &c, 2), Some(3));
+    assert_eq!(n_of(&core, &c, 3), None);
+    // IN・BETWEEN（リテラル専用位置）の numeric 整数形。
+    let out = call(
+        "DECLARE c bigint; BEGIN \
+         EXECUTE 'UPDATE docs SET lang = ''z'' WHERE n IN ($1, 99)' USING q; \
+         EXECUTE 'UPDATE docs SET lang = ''y'' WHERE n BETWEEN $1 AND 9' USING q; \
+         SELECT count(*) INTO c FROM docs WHERE lang = 'y'; RETURN c; END",
+    )
+    .returns(ColumnType::BigInt)
+    .param("q", NUMERIC0, numeric0(3))
+    .autocommit(&core, &c)
+    .expect("literal slots");
+    assert_eq!(as_i64(&out), 1);
 }

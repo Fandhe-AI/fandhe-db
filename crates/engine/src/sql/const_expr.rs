@@ -138,14 +138,6 @@ const VALUE_FUNCTION_NAMES: &[&str] = &[
     "DEFAULT",
 ];
 
-/// 定数式での `CAST` 拒否（[`prescan`] の `Expr::Cast` の腕）のエラーか。`plpgsql` のホストが、数値の
-/// 置換形式を `CAST` 包みから裸のリテラルへ切り替える唯一の条件として使う（他の `0A000` は対象外）。
-pub(crate) fn is_cast_rejection(e: &SqlSurfaceError) -> bool {
-    matches!(e, SqlSurfaceError::FeatureNotSupported { detail } if detail == CAST_REJECTION)
-}
-
-const CAST_REJECTION: &str = "CAST is not supported in a constant expression";
-
 /// 構文的な事前走査。`Expr` の全 variant を網羅する（`_ =>` を置かない）。
 fn prescan(expr: &Expr) -> Result<(), SqlSurfaceError> {
     match expr {
@@ -163,7 +155,7 @@ fn prescan(expr: &Expr) -> Result<(), SqlSurfaceError> {
         // `CAST`（SQL-47・Issue #1590）も定数式（INSERT VALUES・DEFAULT 等）では未対応（`0A000`）。
         // 値の変換は #1591／#1592 の担当で、評価できない式を定数として黙って通さない。
         Expr::Cast { .. } => Err(SqlSurfaceError::FeatureNotSupported {
-            detail: CAST_REJECTION.to_string(),
+            detail: "CAST is not supported in a constant expression".to_string(),
         }),
         // 配列コンストラクタ・添字（TABLE-35・Issue #1602）は子を再帰で検査する（列参照は
         // `Expr::Ident` の腕で `42703`）。評価結果の配列は `fold_const_literal` が配列テキストへ畳む。

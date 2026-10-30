@@ -12919,7 +12919,11 @@ impl<'a> Parser<'a> {
         // 関数引数の `NULL` も列参照ではなく `NULL` 定数として解析する
         // （型は `const_expr::fold_null_call` が決める）。
         let prev_null_args = std::mem::replace(&mut self.const_expr_null_args, true);
-        let parsed = self.parse_value_expr_with_null_context(0, true);
+        let parsed = {
+            // 記録区間では、要素内の変数を定数式の役割（`Role::ConstExpr`）で記録する。
+            let _const_scope = super::colref_sink::const_expr_scope();
+            self.parse_value_expr_with_null_context(0, true)
+        };
         self.const_expr_null_args = prev_null_args;
         self.expr_node_budget = saved;
         crate::sql::const_expr::fold_const_literal_deferrable(&parsed?, span_start..self.pos)
