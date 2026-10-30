@@ -94,6 +94,10 @@ mod dml_join_exec;
 mod dml_join_exec_tests;
 #[cfg(test)]
 mod dml_subquery_exec_tests;
+// PL/pgSQL 本体の埋め込み SQL の定義時構文検証（Issue #2224・SQL-68。`plpgsql::embedded` の検証口）。
+mod plpgsql_validate;
+#[cfg(test)]
+mod plpgsql_validate_tests;
 // BEFORE ROW INSERT トリガの発火の結合テスト（TABLE-45・Issue #1723）。
 #[cfg(test)]
 mod trigger_insert_tests;

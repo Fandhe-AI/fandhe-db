@@ -19,10 +19,6 @@
 //!   [`ColrefReport::out_of_range`] を立てる（記録漏れを黙って許さない fail-closed。
 //!   利用側は `0A000` にする）。
 
-// 利用側（plpgsql の定義時検証）は Issue #2224 の後続 PR で接続する。それまで公開 API
-// （`enter`・`finish`・`ColrefReport` 等）は本クレート内のテストだけが使う。
-#![allow(dead_code)]
-
 use std::cell::RefCell;
 use std::collections::HashSet;
 
@@ -204,7 +200,8 @@ fn with_state<R>(f: impl FnOnce(&mut SinkState) -> R) -> Option<R> {
     .flatten()
 }
 
-/// 記録区間が有効か。
+/// 記録区間が有効か（ガードの復元を確かめるテスト用）。
+#[cfg(test)]
 pub(crate) fn is_active() -> bool {
     SINK.try_with(|c| c.try_borrow().map(|b| b.is_some()).unwrap_or(false))
         .unwrap_or(false)
@@ -266,6 +263,12 @@ pub(crate) fn register_subquery(inner: &[Token]) {
         },
         None => s.out_of_range = true,
     });
+}
+
+/// これまでに取り込まれたサブクエリ本体の範囲（重複・順不同）。利用側が記録区間を保ったまま、
+/// 範囲ごとの再帰解析を進める（新しい範囲が出なくなるまで繰り返す）ために使う。
+pub(crate) fn pending_ranges() -> Vec<std::ops::Range<usize>> {
+    with_state(|s| s.subquery_ranges.clone()).unwrap_or_default()
 }
 
 /// 別名登録の解除用ガード（Drop で登録を外す）。ガードが無いとき・登録不要のときは何もしない。

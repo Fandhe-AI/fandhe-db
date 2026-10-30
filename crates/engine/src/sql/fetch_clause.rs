@@ -58,8 +58,20 @@ fn is_row_word(token: Option<&Token>) -> bool {
     matches!(token, Some(t) if is_word(t, "ROW") || is_word(t, "ROWS"))
 }
 
+/// 行数・オフセット値として受理するトークンか。数値・`$n` に加え、PL/pgSQL の定義時分類
+/// （`colref_sink` の記録区間）が有効なときだけ、スコープ内変数の名前も受理する（記録区間が無い通常の
+/// 経路では従来どおり数値・`$n` のみ）。正規化後の `LIMIT <変数>` は `colref_sink` のリテラル専用位置として
+/// 記録される。
+fn is_count_token(token: &Token) -> bool {
+    match token {
+        Token::Number(_) | Token::Param(_) => true,
+        Token::Ident(name) => super::colref_sink::is_scope_var(name),
+        _ => false,
+    }
+}
+
 fn is_count_value(token: Option<&Token>) -> bool {
-    matches!(token, Some(Token::Number(_) | Token::Param(_)))
+    token.is_some_and(is_count_token)
 }
 
 /// `prev`（直前の入力トークン）が式・表参照・`LIMIT` 値などの「オペランドの終端」かどうか。
@@ -214,7 +226,7 @@ pub(crate) fn normalize_fetch_clauses(tokens: Vec<Token>) -> Result<Normalized, 
                         j += 1;
                     }
                     match tokens.get(j) {
-                        Some(v @ (Token::Number(_) | Token::Param(_))) => {
+                        Some(v) if is_count_token(v) => {
                             count.push(v.clone());
                             j += 1;
                         }
