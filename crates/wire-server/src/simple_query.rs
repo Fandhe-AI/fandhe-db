@@ -980,6 +980,13 @@ pub(crate) fn map_outcome(outcome: SqlOutcome) -> OutcomeResponse {
         SqlOutcome::DropSequence(_) => OutcomeResponse::Command {
             tag: "DROP SEQUENCE".to_string(),
         },
+        // TABLE-45（Issue #1722）: TRIGGER DDL も件数を持たない固定タグ。
+        SqlOutcome::CreateTrigger(_) => OutcomeResponse::Command {
+            tag: "CREATE TRIGGER".to_string(),
+        },
+        SqlOutcome::DropTrigger(_) => OutcomeResponse::Command {
+            tag: "DROP TRIGGER".to_string(),
+        },
         // TABLE-27（Issue #1713）: SCHEMA DDL も件数を持たない固定タグ。
         SqlOutcome::CreateSchema(_) => OutcomeResponse::Command {
             tag: "CREATE SCHEMA".to_string(),

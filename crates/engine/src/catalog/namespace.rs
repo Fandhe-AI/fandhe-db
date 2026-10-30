@@ -634,6 +634,11 @@ impl Storage {
         // 配下に残った索引宣言（表を失った孤児。通常は無い）も消す。
         let prefix = RelationKey::schema_prefix(id);
         super::retain_index_defs_in_txn(&write_txn, |def| !def.name.starts_with(&prefix))?;
+        // TRIGGER（#1722）: 配下の関数を実行するトリガ（`public` 表のものを含む）を、関数を消す前に
+        // 同じ txn で消す（消えた関数を参照する孤児定義を作らない。自テナントの定義に限る）。
+        super::trigger::remove_triggers_with_function_prefix_in_txn(
+            &write_txn, tenant_id, &prefix,
+        )?;
         // UDF（#1920）: 配下の関数行も同じ txn で消す（自テナント・自 SCHEMA の接頭辞に限る）。
         super::function::remove_functions_with_prefix_in_txn(&write_txn, tenant_id, &prefix)?;
         // (5) SCHEMA 行。

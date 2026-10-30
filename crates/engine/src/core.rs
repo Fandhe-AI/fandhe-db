@@ -1849,6 +1849,12 @@ pub enum ParsedSql {
     ///
     /// **BREAKING CHANGE**（Issue #1920）: `ParsedSql` への variant 追加。
     DropFunction(crate::sql::allowlist::ValidatedDropFunction),
+    /// `CREATE [OR REPLACE] TRIGGER`（TABLE-45、Issue #1722）。
+    ///
+    /// **BREAKING CHANGE**（Issue #1722）: `ParsedSql` への variant 追加。
+    CreateTrigger(crate::sql::allowlist::ValidatedCreateTrigger),
+    /// `DROP TRIGGER [IF EXISTS] <名前> ON <表>`（TABLE-45、Issue #1722）。
+    DropTrigger(crate::sql::allowlist::ValidatedDropTrigger),
     /// `CREATE SCHEMA [IF NOT EXISTS] <name>`（TABLE-27、Issue #1713）。
     ///
     /// **BREAKING CHANGE**（Issue #1713）: `ParsedSql` への variant 追加。
@@ -1972,6 +1978,8 @@ fn statement_clock_scope(
         | ParsedSql::CreateSequence(_)
         | ParsedSql::DropSequence(_)
         | ParsedSql::DropFunction(_)
+        | ParsedSql::CreateTrigger(_)
+        | ParsedSql::DropTrigger(_)
         | ParsedSql::CreateSchema(_)
         | ParsedSql::DropSchema(_)
         | ParsedSql::AlterSchema(_)
@@ -2038,6 +2046,8 @@ fn insert_sequence_scope(
         | ParsedSql::CreateSequence(_)
         | ParsedSql::DropSequence(_)
         | ParsedSql::DropFunction(_)
+        | ParsedSql::CreateTrigger(_)
+        | ParsedSql::DropTrigger(_)
         | ParsedSql::CreateSchema(_)
         | ParsedSql::DropSchema(_)
         | ParsedSql::AlterSchema(_)
@@ -2102,6 +2112,8 @@ fn insert_default_clock_scope(
         | ParsedSql::CreateSequence(_)
         | ParsedSql::DropSequence(_)
         | ParsedSql::DropFunction(_)
+        | ParsedSql::CreateTrigger(_)
+        | ParsedSql::DropTrigger(_)
         | ParsedSql::CreateSchema(_)
         | ParsedSql::DropSchema(_)
         | ParsedSql::AlterSchema(_)
@@ -4075,6 +4087,8 @@ impl EngineCore {
                     | crate::sql::SqlOutcome::CreateSequence(_)
                     | crate::sql::SqlOutcome::DropSequence(_)
                     | crate::sql::SqlOutcome::DropFunction(_)
+                    | crate::sql::SqlOutcome::CreateTrigger(_)
+                    | crate::sql::SqlOutcome::DropTrigger(_)
                     | crate::sql::SqlOutcome::CreateSchema(_)
                     | crate::sql::SqlOutcome::DropSchema(_)
                     | crate::sql::SqlOutcome::AlterSchema(_)
@@ -4131,6 +4145,8 @@ impl EngineCore {
                     | crate::sql::SqlOutcome::CreateSequence(_)
                     | crate::sql::SqlOutcome::DropSequence(_)
                     | crate::sql::SqlOutcome::DropFunction(_)
+                    | crate::sql::SqlOutcome::CreateTrigger(_)
+                    | crate::sql::SqlOutcome::DropTrigger(_)
                     | crate::sql::SqlOutcome::CreateSchema(_)
                     | crate::sql::SqlOutcome::DropSchema(_)
                     | crate::sql::SqlOutcome::AlterSchema(_)
@@ -4184,6 +4200,8 @@ impl EngineCore {
                     | crate::sql::SqlOutcome::CreateSequence(_)
                     | crate::sql::SqlOutcome::DropSequence(_)
                     | crate::sql::SqlOutcome::DropFunction(_)
+                    | crate::sql::SqlOutcome::CreateTrigger(_)
+                    | crate::sql::SqlOutcome::DropTrigger(_)
                     | crate::sql::SqlOutcome::CreateSchema(_)
                     | crate::sql::SqlOutcome::DropSchema(_)
                     | crate::sql::SqlOutcome::AlterSchema(_)
@@ -4244,6 +4262,8 @@ impl EngineCore {
                     | crate::sql::SqlOutcome::CreateSequence(_)
                     | crate::sql::SqlOutcome::DropSequence(_)
                     | crate::sql::SqlOutcome::DropFunction(_)
+                    | crate::sql::SqlOutcome::CreateTrigger(_)
+                    | crate::sql::SqlOutcome::DropTrigger(_)
                     | crate::sql::SqlOutcome::CreateSchema(_)
                     | crate::sql::SqlOutcome::DropSchema(_)
                     | crate::sql::SqlOutcome::AlterSchema(_)
@@ -4317,6 +4337,8 @@ impl EngineCore {
                     | crate::sql::SqlOutcome::CreateSequence(_)
                     | crate::sql::SqlOutcome::DropSequence(_)
                     | crate::sql::SqlOutcome::DropFunction(_)
+                    | crate::sql::SqlOutcome::CreateTrigger(_)
+                    | crate::sql::SqlOutcome::DropTrigger(_)
                     | crate::sql::SqlOutcome::CreateSchema(_)
                     | crate::sql::SqlOutcome::DropSchema(_)
                     | crate::sql::SqlOutcome::AlterSchema(_)
@@ -5424,6 +5446,11 @@ impl EngineCore {
             let stmt = crate::sql::allowlist::validate_drop_function_tokens(&tokens)?;
             return Ok(ParsedSql::DropFunction(stmt));
         }
+        // Issue #1722: `DROP TRIGGER` も汎用 `DROP` より前に分岐する（カタログ照会なし）。
+        if crate::sql::allowlist::is_drop_trigger_statement(&tokens) {
+            let stmt = crate::sql::allowlist::validate_drop_trigger_tokens(&tokens)?;
+            return Ok(ParsedSql::DropTrigger(stmt));
+        }
         if crate::sql::allowlist::is_drop_sequence_statement(&tokens) {
             let stmt = crate::sql::allowlist::validate_drop_sequence_tokens(&tokens)?;
             return Ok(ParsedSql::DropSequence(stmt));
@@ -5517,6 +5544,11 @@ impl EngineCore {
         // Issue #1194: `CREATE TYPE` も `CREATE FUNCTION` 分岐へ渡さない。
         // Issue #1688: `CREATE [TEMP|UNLOGGED] SEQUENCE` も `CREATE TABLE`／`FUNCTION` 分岐へ渡さない。
         // Issue #1713: `CREATE SCHEMA` も `CREATE TABLE`／`FUNCTION` 分岐へ渡さない（カタログ照会なし）。
+        // Issue #1722: `CREATE [OR REPLACE] TRIGGER` も `CREATE TABLE`／`FUNCTION` 分岐へ渡さない（カタログ照会なし）。
+        if crate::sql::allowlist::is_create_trigger_statement(&tokens) {
+            let stmt = crate::sql::allowlist::validate_create_trigger_tokens(&tokens)?;
+            return Ok(ParsedSql::CreateTrigger(stmt));
+        }
         if crate::sql::allowlist::is_create_schema_statement(&tokens) {
             let stmt = crate::sql::allowlist::validate_create_schema_tokens(&tokens)?;
             return Ok(ParsedSql::CreateSchema(stmt));
@@ -7018,6 +7050,26 @@ impl EngineCore {
                     stmt,
                 )?;
                 Ok(crate::sql::SqlOutcome::DropFunction(outcome))
+            }
+            // TABLE-45（Issue #1722）: DDL 実行権限ゲート → 実行本体。権限の無い主体には対象表・トリガの
+            // 有無を問わず常に `42501`。TRIGGER 定義はテナント単位のため `ctx.tenant_id()` を渡す。
+            ParsedSql::CreateTrigger(stmt) => {
+                crate::sql::ddl::require_ddl_permission(session)?;
+                let outcome = crate::sql::trigger_ddl::execute_create_trigger(
+                    &self.storage,
+                    ctx.tenant_id(),
+                    stmt,
+                )?;
+                Ok(crate::sql::SqlOutcome::CreateTrigger(outcome))
+            }
+            ParsedSql::DropTrigger(stmt) => {
+                crate::sql::ddl::require_ddl_permission(session)?;
+                let outcome = crate::sql::trigger_ddl::execute_drop_trigger(
+                    &self.storage,
+                    ctx.tenant_id(),
+                    stmt,
+                )?;
+                Ok(crate::sql::SqlOutcome::DropTrigger(outcome))
             }
             // TABLE-27（Issue #1713）: DDL 実行権限ゲート → 実行本体。SCHEMA はテナント単位のカタログ
             // のため `ctx.tenant_id()` を渡す（SEQUENCE との違い）。権限の無い主体には対象の有無を
@@ -8541,6 +8593,8 @@ impl EngineCore {
             ParsedSql::CreateSequence(_) => Ok(None),
             ParsedSql::DropSequence(_) => Ok(None),
             ParsedSql::DropFunction(_) => Ok(None),
+            ParsedSql::CreateTrigger(_) => Ok(None),
+            ParsedSql::DropTrigger(_) => Ok(None),
             ParsedSql::CreateSchema(_) => Ok(None),
             ParsedSql::DropSchema(_) => Ok(None),
             ParsedSql::AlterSchema(_) => Ok(None),

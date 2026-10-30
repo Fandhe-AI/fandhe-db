@@ -34,6 +34,13 @@ use crate::sql::using_operation_id::OperationId;
 use crate::sql::where_negation::negate_conjunction;
 
 mod grouped_window;
+// TRIGGER DDL の構文検証（TABLE-45・Issue #1722）。
+mod trigger;
+pub(crate) use trigger::{
+    is_create_trigger_statement, is_drop_trigger_statement, validate_create_trigger_tokens,
+    validate_drop_trigger_tokens,
+};
+pub use trigger::{ValidatedCreateTrigger, ValidatedDropTrigger};
 
 /// エラーメッセージへ含める入力断片の長さ上限。untrusted 入力をそのまま無加工で
 /// 長大にエラーへ埋め込まない（security.md「情報漏えい」対応）。値は

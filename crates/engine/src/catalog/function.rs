@@ -690,6 +690,22 @@ fn remove_function_in_txn(
     Ok(removed)
 }
 
+/// `scope` の関数 `function_key` を実行する TRIGGER があれば `DependentObjectsStillExist`（`2BP01`）。
+/// `DROP FUNCTION` の削除と同じ write txn で判定する（TABLE-45・Issue #1722。依存の連鎖削除は #1917）。
+/// 文言は固定の関数キーのみで、トリガ名・対象表・他テナントの情報を含めない。
+fn ensure_no_dependent_triggers(
+    write_txn: &redb::WriteTransaction,
+    scope: &str,
+    function_key: &str,
+) -> Result<()> {
+    if super::trigger::triggers_referencing_function_in_txn(write_txn, scope, function_key)? {
+        return Err(CatalogError::DependentObjectsStillExist(
+            function_key.to_string(),
+        ));
+    }
+    Ok(())
+}
+
 /// SCHEMA 接頭辞（`#<id>.`）配下に `scope` の関数が 1 件でもあるか（`DROP SCHEMA ... RESTRICT` の
 /// 空判定用。表が無ければ `false`）。
 pub(crate) fn functions_in_schema_exist_in_txn<R: ReadSource>(
@@ -875,6 +891,7 @@ impl Storage {
             return Ok(false);
         }
         let sig = arg_signature(&def.params)?;
+        ensure_no_dependent_triggers(&write_txn, scope, &key)?;
         if !remove_function_in_txn(&write_txn, scope, &key, &sig)? {
             return Ok(false);
         }
@@ -908,6 +925,7 @@ impl Storage {
                 ));
             }
         };
+        ensure_no_dependent_triggers(&write_txn, scope, &key)?;
         if !remove_function_in_txn(&write_txn, scope, &key, &sig)? {
             return Ok(None);
         }
