@@ -231,6 +231,32 @@ fn skipped_rows_do_not_fire_after() {
     assert_eq!(read_audit(&core, &a), vec![("x".to_string(), 10)]);
 }
 
+// BEFORE が別表へ書いてから NULL を返し全行スキップになっても、autocommit（台帳なし・利用者指定 id・
+// SEQUENCE なし）でトリガ内の書き込みは commit される（NoOp で abort されない）。
+#[test]
+fn before_write_survives_when_all_rows_are_skipped() {
+    let dir = tempdir();
+    let (core, _calls) = core_with(
+        dir.path(),
+        Box::new(|c| {
+            if c.tg_when() == "BEFORE" {
+                c.writes.insert_row("audit", None, c.new_row)?;
+                return Ok(TriggerOutcome::Skip);
+            }
+            Ok(TriggerOutcome::Proceed(c.new_row.to_vec()))
+        }),
+    );
+    let a = ctx("tenant-a");
+    add_trigger(&core.storage, "tenant-a", "trg", &before_row("b"));
+    let out = run(&core, &a, MULTI).expect("insert");
+    assert_eq!(rows_affected(out), 0);
+    assert_eq!(count(&core, &a, "trg"), 0);
+    assert_eq!(
+        read_audit(&core, &a),
+        vec![("x".to_string(), 10), ("y".to_string(), 20)]
+    );
+}
+
 // AFTER の戻り値（NULL・構造違いの行）は無視され、外側の行・`rows_affected` は変わらない。
 #[test]
 fn after_outcome_is_ignored() {

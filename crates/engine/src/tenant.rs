@@ -2020,7 +2020,7 @@ fn insert_typed_row_impl(
             } else {
                 RowId::from_legacy_id(id)
             };
-            let written = trigger_insert::write_rows_with_triggers(
+            let (written, trigger_wrote) = trigger_insert::write_rows_with_triggers(
                 write_txn,
                 &target,
                 table,
@@ -2035,7 +2035,7 @@ fn insert_typed_row_impl(
                 table,
                 written.len(),
                 ledger_outcome,
-                allocated || id_omitted || sequence_rows.is_some(),
+                allocated || id_omitted || sequence_rows.is_some() || trigger_wrote,
             );
         }
         // 行のエンコードは台帳照合と NOT NULL 検査の後に行う（省略された非 nullable 列の仮値
@@ -2089,7 +2089,7 @@ fn insert_typed_row_impl(
 /// トリガ経路の書き込みの後始末（Issue #1723）。1 行以上書いたら表の世代を進めて `Wrote`。全行を
 /// `NULL` 返却でスキップした場合は、台帳を記録したときだけ `Wrote`（世代は進めない。再送の `23505`
 /// を保つため台帳は commit する）、台帳も無ければ `NoOp`。ただし rowid・SEQUENCE の採番状態を
-/// 更新済み（`state_consumed`）なら `Wrote` とし、払い出し済みの値が欠番になる契約を保つ
+/// 更新済み、またはトリガ本体が別表へ書き込み済み（`state_consumed`）なら `Wrote` とし、払い出し済みの値が欠番になる契約を保つ
 /// （`NoOp` の abort で採番状態が巻き戻り、次の INSERT が同じ rowid を再利用するのを防ぐ）。
 fn finish_trigger_insert(
     write_txn: &redb::WriteTransaction,
@@ -2455,7 +2455,7 @@ pub(crate) fn insert_typed_rows_unchecked(
                     })?;
                     trigger_rows.push((row_id, values));
                 }
-                let written = trigger_insert::write_rows_with_triggers(
+                let (written, trigger_wrote) = trigger_insert::write_rows_with_triggers(
                     write_txn,
                     &target,
                     table,
@@ -2470,7 +2470,7 @@ pub(crate) fn insert_typed_rows_unchecked(
                     table,
                     written.len(),
                     ledger_outcome,
-                    allocated || id_omitted || sequence_rows.is_some(),
+                    allocated || id_omitted || sequence_rows.is_some() || trigger_wrote,
                 );
             }
             let row_table_name = user_rows_table_name(table);

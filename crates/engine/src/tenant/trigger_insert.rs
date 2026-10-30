@@ -39,7 +39,8 @@ const ROW_ENCODE_MISMATCH: &str = "trigger function returned a row that does not
 
 /// `rows`（払い出し済みの行キーと、DEFAULT・SEQUENCE 確定後の NEW）を、BEFORE ROW トリガを通して
 /// 書き、全行の後に AFTER ROW トリガを発火する。書いた行の行キーを返す（`NULL` 返却でスキップした行は
-/// 含まない）。
+/// 含まない）。あわせて、トリガ本体が別表へ書き込んだか（BEFORE・AFTER を問わない）を返す。
+/// 全行スキップでも別表への書き込みがあれば、呼び出し元は txn を commit 対象にする。
 #[allow(clippy::too_many_arguments)]
 pub(super) fn write_rows_with_triggers(
     write_txn: &redb::WriteTransaction,
@@ -50,7 +51,7 @@ pub(super) fn write_rows_with_triggers(
     visibility: Visibility,
     rows: &[(RowId, &[Value])],
     plan: &InsertTriggerPlan<'_>,
-) -> Result<Vec<RowId>, TenantWriteError> {
+) -> Result<(Vec<RowId>, bool), TenantWriteError> {
     let vector_idx = schema
         .columns
         .iter()
@@ -163,7 +164,8 @@ pub(super) fn write_rows_with_triggers(
         .map_err(TenantWriteError::TriggerFailed)?;
     }
     settle_trigger_written_tables(write_txn, target, ctx, &writes)?;
-    Ok(written)
+    let trigger_wrote = !writes.written_tables().is_empty();
+    Ok((written, trigger_wrote))
 }
 
 /// トリガが書いた表の遅延 FK の扱いを決める（fail-open の防止）。トリガ内の書き込みは `InTxn` 経由の
