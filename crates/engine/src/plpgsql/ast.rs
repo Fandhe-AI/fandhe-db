@@ -6,7 +6,7 @@
 //! 変数をトークンへ置換して既存の許可リスト解析へ渡す。
 
 use std::collections::HashMap;
-use std::sync::Arc;
+use std::sync::{Arc, RwLock};
 
 use crate::plpgsql_limits::{HARD_MAX_PLPGSQL_BODY_BYTES, HARD_MAX_PLPGSQL_NESTING_DEPTH};
 use crate::sql::ddl_column_type::SqlColumnTypeName;
@@ -125,81 +125,174 @@ pub(crate) struct VarSite {
     pub(crate) var: VarRef,
 }
 
-/// スコープの 1 階層（ブロック・ループ）。同名の再登録は後勝ち。
-#[derive(Debug, Clone, PartialEq)]
-pub(crate) struct ScopeLevel {
-    pub(crate) label: Option<String>,
-    pub(crate) names: HashMap<String, VarId>,
+/// スコープの登録簿の 1 件（宣言 1 個）。
+#[derive(Debug)]
+struct ScopeEntry {
+    id: VarId,
+    /// 宣言したスコープ階層（登録簿内で一意な番号）。
+    level: u32,
 }
 
-/// 文・式を解析した時点で見えていたスコープ（外側から内側の順）。定義時分類が、解析器の記録を
-/// 変数へ解決するために使う。`levels[0]` は引数と `FOUND` の外側スコープ。
-#[derive(Debug, Clone, PartialEq)]
-pub(crate) struct ScopeView {
-    pub(crate) levels: Vec<ScopeLevel>,
+/// 構文解析 1 回分のスコープの登録簿。宣言を追記専用で全件ここへ 1 度だけ持ち、文・式ごとのスコープは
+/// [`ScopeView`]（階層の番号列と宣言数の上限）で表す。宣言ごとに名前表全体を複製しないため、保持する
+/// 名前の総数は宣言数に比例する（既定値付きの宣言が数千あっても二乗にならない）。
+#[derive(Debug, Default)]
+pub(crate) struct ScopeRegistry {
+    entries: Vec<ScopeEntry>,
+    /// 名前から `entries` の添字（昇順）への表。
+    by_name: HashMap<String, Vec<u32>>,
+    /// 階層ごとのラベル（階層の番号で引く）。
+    labels: Vec<Option<String>>,
 }
 
-/// 構文解析中の生きたスコープ列と、保存済みの [`ScopeView`] が共有する名前解決。
-/// `record_like` は変数がレコード型（`RECORD`・`%ROWTYPE`）かの判定。
-pub(super) fn lookup_var_in(levels: &[ScopeLevel], name: &str) -> Option<VarId> {
-    levels.iter().rev().find_map(|s| s.names.get(name).copied())
-}
-
-/// `qualifier.name` の解決。ラベル修飾（`lbl.var`）を先に、次にレコードのフィールド。
-pub(super) fn lookup_qualified_in(
-    levels: &[ScopeLevel],
-    record_like: &dyn Fn(VarId) -> bool,
-    qualifier: &str,
-    name: &str,
-) -> Option<VarRef> {
-    let q = qualifier.to_ascii_lowercase();
-    let n = name.to_ascii_lowercase();
-    for (idx, s) in levels.iter().enumerate().rev() {
-        if s.label.as_deref() == Some(q.as_str()) {
-            if let Some(id) = s.names.get(&n) {
-                return Some(VarRef::Var(*id));
-            }
-            // 最外ブロック（`levels[1]`。`levels[0]` は引数と `FOUND` の外側スコープ）のラベルでも、
-            // PostgreSQL と同様に引数と `FOUND` を修飾参照できる。
-            if idx == 1 {
-                if let Some(id) = levels.first().and_then(|o| o.names.get(&n)) {
-                    return Some(VarRef::Var(*id));
-                }
-            }
-        }
+impl ScopeRegistry {
+    /// 新しい階層を作って番号を返す。
+    pub(super) fn new_level(&mut self, label: Option<String>) -> u32 {
+        self.labels.push(label);
+        u32::try_from(self.labels.len().saturating_sub(1)).unwrap_or(u32::MAX)
     }
-    let id = lookup_var_in(levels, &q)?;
-    if record_like(id) {
-        Some(VarRef::Field(id, n))
-    } else {
-        None
+
+    /// 階層 `level` へ宣言を追記する。
+    pub(super) fn add(&mut self, level: u32, name: String, id: VarId) {
+        let idx = u32::try_from(self.entries.len()).unwrap_or(u32::MAX);
+        self.by_name.entry(name.clone()).or_default().push(idx);
+        self.entries.push(ScopeEntry { id, level });
+    }
+
+    /// 登録済みの宣言の総数。
+    #[cfg(test)]
+    pub(super) fn entry_count(&self) -> usize {
+        self.entries.len()
+    }
+
+    /// 階層 `level` で、宣言数の上限 `limit` までに見える名前（同名は後勝ち）。
+    fn lookup_in_level(&self, level: u32, limit: u32, name: &str) -> Option<VarId> {
+        self.by_name
+            .get(name)?
+            .iter()
+            .rev()
+            .filter(|i| **i < limit)
+            .find_map(|i| {
+                let e = self.entries.get(*i as usize)?;
+                (e.level == level).then_some(e.id)
+            })
+    }
+}
+
+/// 登録簿の共有ハンドル（構文解析が書き、各文のスコープが読む）。
+pub(super) type SharedRegistry = Arc<RwLock<ScopeRegistry>>;
+
+/// 文・式を解析した時点で見えていたスコープ。定義時分類が、解析器の記録を変数へ解決するために使う。
+/// `chain` は外側から内側の階層の番号（`chain[0]` は引数と `FOUND` の外側スコープ）、`limit` は
+/// その時点の宣言数（それ以降の宣言は見えない）。文ごとの大きさは階層の深さに比例する。
+#[derive(Clone)]
+pub(crate) struct ScopeView {
+    reg: SharedRegistry,
+    chain: Vec<u32>,
+    limit: u32,
+}
+
+impl std::fmt::Debug for ScopeView {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("ScopeView")
+            .field("chain", &self.chain)
+            .field("limit", &self.limit)
+            .finish()
+    }
+}
+
+impl PartialEq for ScopeView {
+    fn eq(&self, other: &Self) -> bool {
+        Arc::ptr_eq(&self.reg, &other.reg) && self.chain == other.chain && self.limit == other.limit
     }
 }
 
 impl ScopeView {
-    pub(crate) fn lookup_var(&self, name: &str) -> Option<VarId> {
-        lookup_var_in(&self.levels, name)
+    /// 現在の登録簿と階層の並びからスコープを作る。
+    pub(super) fn new(reg: &SharedRegistry, chain: &[u32]) -> Self {
+        let limit = reg
+            .read()
+            .map(|r| u32::try_from(r.entries.len()).unwrap_or(u32::MAX))
+            .unwrap_or(0);
+        Self {
+            reg: Arc::clone(reg),
+            chain: chain.to_vec(),
+            limit,
+        }
     }
 
+    /// 保持している宣言の総数（登録簿は構文解析 1 回で共有。テストが線形性の確認に使う）。
+    #[cfg(test)]
+    pub(crate) fn registry_entry_count(&self) -> usize {
+        self.reg.read().map_or(0, |r| r.entry_count())
+    }
+
+    /// 同じ登録簿を共有しているか（テスト用）。
+    #[cfg(test)]
+    pub(crate) fn shares_registry_with(&self, other: &Self) -> bool {
+        Arc::ptr_eq(&self.reg, &other.reg)
+    }
+
+    /// このスコープの階層の深さ（テスト用）。
+    #[cfg(test)]
+    pub(crate) fn chain_len(&self) -> usize {
+        self.chain.len()
+    }
+
+    pub(crate) fn lookup_var(&self, name: &str) -> Option<VarId> {
+        let reg = self.reg.read().ok()?;
+        self.chain
+            .iter()
+            .rev()
+            .find_map(|l| reg.lookup_in_level(*l, self.limit, name))
+    }
+
+    /// `qualifier.name` の解決。ラベル修飾（`lbl.var`）を先に、次にレコードのフィールド。
     pub(crate) fn lookup_qualified(
         &self,
         record_like: &dyn Fn(VarId) -> bool,
         qualifier: &str,
         name: &str,
     ) -> Option<VarRef> {
-        lookup_qualified_in(&self.levels, record_like, qualifier, name)
+        let q = qualifier.to_ascii_lowercase();
+        let n = name.to_ascii_lowercase();
+        {
+            let reg = self.reg.read().ok()?;
+            for (idx, level) in self.chain.iter().enumerate().rev() {
+                let label = reg.labels.get(*level as usize).and_then(|l| l.as_deref());
+                if label == Some(q.as_str()) {
+                    if let Some(id) = reg.lookup_in_level(*level, self.limit, &n) {
+                        return Some(VarRef::Var(id));
+                    }
+                    // 最外ブロック（`chain[1]`。`chain[0]` は引数と `FOUND` の外側スコープ）のラベルでも、
+                    // PostgreSQL と同様に引数と `FOUND` を修飾参照できる。
+                    if idx == 1 {
+                        if let Some(id) = self
+                            .chain
+                            .first()
+                            .and_then(|o| reg.lookup_in_level(*o, self.limit, &n))
+                        {
+                            return Some(VarRef::Var(id));
+                        }
+                    }
+                }
+            }
+        }
+        let id = self.lookup_var(&q)?;
+        record_like(id).then_some(VarRef::Field(id, n))
     }
 
-    /// SQL 構文解析器へ渡す、スコープ内の名前の集合（小文字。変数名とブロック・ループのラベル）。
-    pub(crate) fn known_names(&self) -> std::collections::HashSet<String> {
-        let mut out = std::collections::HashSet::new();
-        for l in &self.levels {
-            if let Some(label) = &l.label {
-                out.insert(label.clone());
-            }
-            out.extend(l.names.keys().cloned());
+    /// 変数名またはラベル名として見える名前か（`name` は小文字）。SQL 構文解析器へ渡すスコープ内の名前の
+    /// 判定に使う。
+    pub(crate) fn is_known(&self, name: &str) -> bool {
+        if self.lookup_var(name).is_some() {
+            return true;
         }
-        out
+        self.reg.read().is_ok_and(|reg| {
+            self.chain
+                .iter()
+                .any(|l| reg.labels.get(*l as usize).and_then(|x| x.as_deref()) == Some(name))
+        })
     }
 }
 

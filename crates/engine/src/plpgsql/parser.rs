@@ -8,8 +8,6 @@
 //! （fail-closed）。呼び出し元は `plpgsql::parse_body`（#2217／#2225 が結線）。
 //! 受信データの経路なので `unwrap`／`expect`／添字アクセスを使わない。再帰は入れ子の深さ上限で有界。
 
-use std::cell::RefCell;
-use std::collections::HashMap;
 use std::sync::Arc;
 
 use crate::sql::allowlist::SqlSurfaceError;
@@ -17,9 +15,9 @@ use crate::sql::ddl_column_type::{parse_column_type_name, SqlColumnTypeName};
 use crate::sql::lexer::{tokenize_with_params_quoted, Keyword, Token};
 
 use super::ast::{
-    lookup_qualified_in, lookup_var_in, AssignTarget, Block, Body, DeclType, DiagItem,
-    EmbeddedKind, EmbeddedSql, IntoClause, ParseOptions, ReturnShape, ScopeLevel, ScopeRef,
-    ScopeView, SqlExpr, Stmt, VarDecl, VarId, VarKind, VarRef,
+    AssignTarget, Block, Body, DeclType, DiagItem, EmbeddedKind, EmbeddedSql, IntoClause,
+    ParseOptions, ReturnShape, ScopeRef, ScopeView, SharedRegistry, SqlExpr, Stmt, VarDecl, VarId,
+    VarKind, VarRef,
 };
 use super::embedded::{head_kind, reject_forbidden_clauses, split_into, RawInto};
 use super::lexer::{scan, TokKind};
@@ -222,11 +220,12 @@ struct Parser<'a> {
     pos: usize,
     opts: &'a ParseOptions,
     vars: Vec<VarDecl>,
-    scopes: Vec<ScopeLevel>,
+    /// 宣言の登録簿（追記専用。全スコープで 1 つ。文・式のスコープは階層の番号列と宣言数の上限で表す）。
+    reg: SharedRegistry,
+    /// 現在のスコープ階層の番号（外側から内側。`chain[0]` は引数と `FOUND` の外側スコープ）。
+    chain: Vec<u32>,
     ctrl: Vec<Ctrl>,
     depth: usize,
-    /// 直近のスコープの共有ハンドル（スコープが変わるたびに破棄し、同じスコープの文どうしで共有する）。
-    snap: RefCell<Option<ScopeRef>>,
 }
 
 /// 入口。本体長はスキャンより前に検査する（無制限確保の禁止）。
@@ -241,10 +240,10 @@ pub(super) fn parse(src: &str, opts: &ParseOptions) -> Result<Body, SqlSurfaceEr
         pos: 0,
         opts,
         vars: Vec::new(),
-        scopes: Vec::new(),
+        reg: SharedRegistry::default(),
+        chain: Vec::new(),
         ctrl: Vec::new(),
         depth: 0,
-        snap: RefCell::new(None),
     };
     p.init_outer_scope()?;
     let block = p.parse_top()?;
@@ -492,10 +491,7 @@ impl<'a> Parser<'a> {
     // ---- 変数・スコープ ----
 
     fn init_outer_scope(&mut self) -> Result<(), SqlSurfaceError> {
-        let mut scope = ScopeLevel {
-            label: None,
-            names: HashMap::new(),
-        };
+        let level = self.push_level(None);
         for (i, p) in self.opts.params.iter().enumerate() {
             let n = u16::try_from(i.saturating_add(1))
                 .map_err(|_| too_big_err("too many parameters for a PL/pgSQL function"))?;
@@ -512,7 +508,7 @@ impl<'a> Parser<'a> {
             });
             if !name.is_empty() {
                 check_reserved_name(&name, false)?;
-                scope.names.insert(name, id);
+                self.register(level, name, id);
             }
         }
         let found = VarId(u32::try_from(self.vars.len()).unwrap_or(u32::MAX));
@@ -525,9 +521,7 @@ impl<'a> Parser<'a> {
             default: None,
             scope_depth: 0,
         });
-        scope.names.insert("found".to_string(), found);
-        self.scopes.push(scope);
-        self.invalidate_scope();
+        self.register(level, "found".to_string(), found);
         Ok(())
     }
 
@@ -548,7 +542,7 @@ impl<'a> Parser<'a> {
             u32::try_from(self.vars.len())
                 .map_err(|_| too_big_err("too many PL/pgSQL variables"))?,
         );
-        let scope_depth = self.scopes.len().saturating_sub(1);
+        let scope_depth = self.chain.len().saturating_sub(1);
         self.vars.push(VarDecl {
             name: name.clone(),
             kind,
@@ -558,40 +552,52 @@ impl<'a> Parser<'a> {
             default,
             scope_depth,
         });
-        if let Some(s) = self.scopes.last_mut() {
-            s.names.insert(name, id);
+        if let Some(level) = self.chain.last().copied() {
+            self.register(level, name, id);
         }
-        self.invalidate_scope();
         Ok(id)
     }
 
+    /// 新しいスコープ階層を作って現在のスコープへ積む。
+    fn push_level(&mut self, label: Option<String>) -> u32 {
+        let level = self.reg.write().map_or(0, |mut r| r.new_level(label));
+        self.chain.push(level);
+        level
+    }
+
+    /// 現在のスコープ階層を 1 つ戻す。
+    fn pop_level(&mut self) {
+        self.chain.pop();
+    }
+
+    /// 階層 `level` へ宣言を追記する（名前表全体は複製しない）。
+    fn register(&self, level: u32, name: String, id: VarId) {
+        if let Ok(mut r) = self.reg.write() {
+            r.add(level, name, id);
+        }
+    }
+
+    /// 現在のスコープ。
+    fn view(&self) -> ScopeView {
+        ScopeView::new(&self.reg, &self.chain)
+    }
+
     fn declared_in_current_scope(&self, name: &str) -> bool {
-        self.scopes
-            .last()
-            .is_some_and(|s| s.names.contains_key(name))
+        let Some(top) = self.chain.last() else {
+            return false;
+        };
+        ScopeView::new(&self.reg, std::slice::from_ref(top))
+            .lookup_var(name)
+            .is_some()
     }
 
     fn lookup_var(&self, name: &str) -> Option<VarId> {
-        lookup_var_in(&self.scopes, name)
+        self.view().lookup_var(name)
     }
 
-    /// スコープが変わったので共有ハンドルを破棄する（`declare`・スコープの出入りが呼ぶ）。
-    fn invalidate_scope(&self) {
-        *self.snap.borrow_mut() = None;
-    }
-
-    /// 現在のスコープの共有ハンドル。同じスコープの文・式どうしで同じ `Arc` を共有する
-    /// （文ごとにスコープ全体を複製しない）。
+    /// 現在のスコープの共有ハンドル。大きさは階層の深さに比例し、名前表は複製しない。
     fn scope_ref(&self) -> ScopeRef {
-        let mut cache = self.snap.borrow_mut();
-        if let Some(r) = cache.as_ref() {
-            return Arc::clone(r);
-        }
-        let r = Arc::new(ScopeView {
-            levels: self.scopes.clone(),
-        });
-        *cache = Some(Arc::clone(&r));
-        r
+        Arc::new(self.view())
     }
 
     fn var(&self, id: VarId) -> Option<&VarDecl> {
@@ -603,9 +609,10 @@ impl<'a> Parser<'a> {
             .is_some_and(|v| matches!(v.ty, DeclType::Record | DeclType::PercentRowType { .. }))
     }
 
-    /// `qualifier.name` の解決（共有の [`lookup_qualified_in`]。ラベル修飾を先に、次にレコードのフィールド）。
+    /// `qualifier.name` の解決（[`ScopeView::lookup_qualified`]。ラベル修飾を先に、次にレコードのフィールド）。
     fn lookup_qualified(&self, qualifier: &str, name: &str) -> Option<VarRef> {
-        lookup_qualified_in(&self.scopes, &|id| self.is_record_like(id), qualifier, name)
+        self.view()
+            .lookup_qualified(&|id| self.is_record_like(id), qualifier, name)
     }
 
     /// 代入・`INTO` の対象を解決する。`CONSTANT`・`FOUND` への代入は拒否する。
@@ -772,11 +779,7 @@ impl<'a> Parser<'a> {
 
     fn parse_block(&mut self, label: Option<String>, top: bool) -> Result<Block, SqlSurfaceError> {
         self.enter()?;
-        self.scopes.push(ScopeLevel {
-            label: label.clone(),
-            names: HashMap::new(),
-        });
-        self.invalidate_scope();
+        self.push_level(label.clone());
         let mut decls = Vec::new();
         if self.eat_kw("DECLARE") {
             while !self.is_kw(0, "BEGIN") {
@@ -795,8 +798,7 @@ impl<'a> Parser<'a> {
         }
         self.expect_kw("END")?;
         self.end_label(&label)?;
-        self.scopes.pop();
-        self.invalidate_scope();
+        self.pop_level();
         self.leave();
         if top {
             if self.is_punct(0, ';') {
@@ -1192,11 +1194,7 @@ impl<'a> Parser<'a> {
             None
         };
         self.expect_kw("LOOP")?;
-        self.scopes.push(ScopeLevel {
-            label: label.clone(),
-            names: HashMap::new(),
-        });
-        self.invalidate_scope();
+        self.push_level(label.clone());
         let var = self.declare(
             name,
             VarKind::LoopInt,
@@ -1207,8 +1205,7 @@ impl<'a> Parser<'a> {
             name_quoted,
         )?;
         let body = self.loop_body(&label)?;
-        self.scopes.pop();
-        self.invalidate_scope();
+        self.pop_level();
         Ok(Stmt::ForInt {
             label,
             var,
@@ -1250,11 +1247,7 @@ impl<'a> Parser<'a> {
         self.pos = e;
         self.expect_kw("LOOP")?;
         // 対象の解決は問い合わせ（外側のスコープ）の後。未宣言の単独対象は暗黙のレコード変数にする。
-        self.scopes.push(ScopeLevel {
-            label: label.clone(),
-            names: HashMap::new(),
-        });
-        self.invalidate_scope();
+        self.push_level(label.clone());
         let mut targets = Vec::new();
         let single = raw_targets.len() == 1;
         for (q, n) in &raw_targets {
@@ -1273,8 +1266,7 @@ impl<'a> Parser<'a> {
             targets.push(resolved);
         }
         let body = self.loop_body(&label)?;
-        self.scopes.pop();
-        self.invalidate_scope();
+        self.pop_level();
         Ok(Stmt::ForQuery {
             label,
             targets,

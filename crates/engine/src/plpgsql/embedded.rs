@@ -312,15 +312,14 @@ fn prepare(
 ) -> Result<Prepared, SqlSurfaceError> {
     let mut all: Vec<Token> = prefix.to_vec();
     all.extend_from_slice(body);
-    let known = view.known_names();
     let mut spelled: HashSet<String> = HashSet::new();
     for t in &all {
         match t {
-            Token::Ident(n) if known.contains(&n.to_ascii_lowercase()) => {
+            Token::Ident(n) if view.is_known(&n.to_ascii_lowercase()) => {
                 spelled.insert(n.clone());
             }
             Token::QualifiedIdent { qualifier, .. }
-                if known.contains(&qualifier.to_ascii_lowercase()) =>
+                if view.is_known(&qualifier.to_ascii_lowercase()) =>
             {
                 spelled.insert(qualifier.clone());
             }

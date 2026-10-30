@@ -1668,3 +1668,28 @@ fn first_sql_refs_at(b: &Body, i: usize) -> usize {
         other => panic!("not sql: {other:?}"),
     }
 }
+
+#[test]
+fn scope_storage_is_linear_in_the_number_of_declarations() {
+    // 既定値付きの宣言ごとにそれまでの名前表を複製しない: 全文・式が 1 つの登録簿を共有し、保持する名前の
+    // 総数は宣言数（名前付き引数 1 + FOUND 1 を含む）に等しい。各スコープの大きさは階層の深さだけに比例する。
+    let n = 3_000;
+    let decls: String = (0..n).map(|i| format!("v{i} int := {i}; ")).collect();
+    let b = ok(&format!("DECLARE {decls} BEGIN RETURN v0; END"));
+    let views: Vec<&ScopeRef> = b
+        .vars
+        .iter()
+        .filter_map(|v| v.default.as_ref().map(|d| &d.scope))
+        .collect();
+    assert_eq!(views.len(), n);
+    assert_eq!(views[0].registry_entry_count(), n + 2);
+    assert!(views.iter().all(|v| v.shares_registry_with(views[0])));
+    assert!(views.iter().all(|v| v.chain_len() <= 2));
+    // 宣言順に見える名前が増える（自分より後の宣言は見えない）。
+    assert!(views[10].lookup_var("v9").is_some());
+    assert!(views[10].lookup_var("v10").is_none());
+    let Some(Stmt::Return(Some(e))) = b.block.stmts.first() else {
+        panic!("return");
+    };
+    assert!(e.scope.lookup_var("v2999").is_some());
+}
