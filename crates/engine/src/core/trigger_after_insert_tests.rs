@@ -454,18 +454,19 @@ fn audit_rows_stay_in_the_writing_tenant() {
     assert_eq!(count(&core, &b, "audit"), 0);
 }
 
-// 入れ子: トリガ内の書き込み先に INSERT トリガがあると `0A000`（再帰しない）。文全体は巻き戻る。
+// 入れ子: トリガ内の書き込み先の INSERT トリガも発火する（深さ上限内。Issue #1727）。
+// 通過証の無い（未結線の）経路での `0A000` は `trigger_depth_tests.rs` の回帰で固定する。
 #[test]
-fn nested_trigger_target_is_0a000() {
+fn nested_trigger_target_fires() {
     let dir = tempdir();
-    let (core, _calls) = core_with(dir.path(), audit_after());
+    let (core, calls) = core_with(dir.path(), audit_after());
     let a = ctx("tenant-a");
     add_trigger(&core.storage, "tenant-a", "trg", &after_row("audit_t"));
     add_trigger(&core.storage, "tenant-a", "audit", &before_row("nested"));
-    let err = run(&core, &a, INSERT_A1_N).unwrap_err();
-    assert_eq!(err.wire_code(), "0A000");
-    assert_eq!(count(&core, &a, "trg"), 0);
-    assert_eq!(count(&core, &a, "audit"), 0);
+    run(&core, &a, INSERT_A1_N).expect("nested insert");
+    assert_eq!(calls.load(Ordering::SeqCst), 2);
+    assert_eq!(count(&core, &a, "trg"), 1);
+    assert_eq!(count(&core, &a, "audit"), 1);
 }
 
 // `WHEN` 付き AFTER は `0A000`（発火時に二重化）。副作用なし。文トリガの発火は

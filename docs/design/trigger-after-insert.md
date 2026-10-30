@@ -41,7 +41,7 @@ AFTER が失敗すれば台帳エントリも破棄され、D10 の「全トリ�
 | 経路 | SQL `INSERT` と同じ `tenant::insert_typed_row_unchecked`（同じ可視性・制約検査・索引同期・世代更新）。第 2 の書き込み経路を作らない |
 | テナント | 呼び出し元の `PolicyContext` を借用し差し替えられない（行キーは常に呼び出しテナントの `(tenant_id, rowid)`） |
 | 台帳 | `LedgerWrite::Disabled`（外側の文の 1 エントリだけ。D10。`SubstatementLedgerScope` の共通化は #2226） |
-| 入れ子 | 書き込み先に INSERT トリガがあれば `0A000`（深さ上限〔#1727〕が入るまで発火しない。自己再帰を起こさない） |
+| 入れ子 | 書き込み先の INSERT トリガも発火する。深さ上限超過は `54001`（Issue #1727。[trigger-depth-limit-cli.md](trigger-depth-limit-cli.md)）。通過証の無い経路は `0A000` |
 | 表名 | 裸の識別子だけ。SCHEMA 配下の内部キー（`#<id>.<name>`）は不在と同じ `42P01` で拒否する（SCHEMA 修飾の解決は #2226） |
 | エラー | `SqlSurfaceError` へ既存の写像で変換し、トリガ本体 → 発火側へ透過（最終的に `TriggerFailed`） |
 
@@ -82,7 +82,7 @@ AFTER が失敗すれば台帳エントリも破棄され、D10 の「全トリ�
 ## 後続への引き継ぎ
 
 - トリガ関数の実体・PL/pgSQL の SQL 文の実行ホスト・`SubstatementLedgerScope` の共通化・SQL E2E は
-  #2226・#2228。実体を結線する前に入れ子の深さ上限（D11・#1727）が要る
+  #2226・#2228。入れ子の深さ上限（D11）は #1727 で実装済み
 - `WHEN` の評価・UPDATE／DELETE・UPSERT は #1725、文トリガ・TRUNCATE は #1726
 - crash-test・越境マトリクス・台帳との整合の強化は #1728
 - `RETURNING` の最終値投影・共有 `public` 表の全テナント発火（D9）は要判断

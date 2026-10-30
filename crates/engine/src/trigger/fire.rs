@@ -84,7 +84,7 @@ fn fire_before_chain(
                 detail: WHEN_UNSUPPORTED.to_string(),
             });
         }
-        let outcome = runtime.invoker().invoke(&TriggerCall {
+        let outcome = runtime.invoke(&TriggerCall {
             trigger_name: &trigger.name,
             function_key: &trigger.function_key,
             table,
@@ -204,7 +204,7 @@ pub(crate) fn fire_after_row(
                 detail: WHEN_UNSUPPORTED.to_string(),
             });
         }
-        let _ignored = runtime.invoker().invoke(&TriggerCall {
+        let _ignored = runtime.invoke(&TriggerCall {
             trigger_name: &trigger.name,
             function_key: &trigger.function_key,
             table,
@@ -263,7 +263,7 @@ pub(crate) fn fire_statement(
                 detail: WHEN_UNSUPPORTED.to_string(),
             });
         }
-        let _ignored = runtime.invoker().invoke(&TriggerCall {
+        let _ignored = runtime.invoke(&TriggerCall {
             trigger_name: &trigger.name,
             function_key: &trigger.function_key,
             table,
