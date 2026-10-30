@@ -32,7 +32,7 @@ use crate::sql::udf_call::{
     MAX_CASE_NESTING, MAX_EXPR_DEPTH, MAX_EXPR_NODES, MAX_FUNCTION_CALL_ARGS, MAX_UDF_PARAMS,
 };
 use crate::sql::using_operation_id::OperationId;
-use crate::sql::where_negation::negate_conjunction;
+use crate::sql::where_negation::{expr_node_count, negate_conjunction};
 
 mod grouped_window;
 // TRIGGER DDL の構文検証（TABLE-45・Issue #1722）。
@@ -6314,6 +6314,19 @@ enum ExprLeaf {
     /// 式左辺の `<式> [NOT] LIKE|ILIKE '<lit>' [ESCAPE '<c>']`（SQL-54・Issue #1782）。
     /// 中身は [`WherePredicate::Prefix`]、後置 `NOT` ありなら `Not(Prefix)`。
     Like(WherePredicate),
+    /// 式左辺の `[NOT] BETWEEN`・`[NOT] IN (list)`（SQL-24 の拡張）。比較の連言（`BETWEEN`）・
+    /// `Or`（`IN`）へ脱糖済みで、後置 `NOT` は構文段で葉まで押し下げ済み。呼び出し元は前置 `NOT` の
+    /// 奇数個だけ [`negate_conjunction`] で反転する。
+    Preds(Vec<WherePredicate>),
+}
+
+/// 式左辺の述語の後置語（`IS [NOT] NULL`・`[NOT] BETWEEN`・`[NOT] IN (`）。
+/// [`Parser::expr_lhs_postfix_at`] が先読みで判定する。`kw_len` は後置語が占めるトークン数。
+#[derive(Clone, Copy)]
+enum ExprPostfix {
+    IsNull { negated: bool, kw_len: usize },
+    Between { negated: bool, kw_len: usize },
+    InList { negated: bool, kw_len: usize },
 }
 
 impl<'a> Parser<'a> {
@@ -9211,6 +9224,10 @@ impl<'a> Parser<'a> {
                         vec![WherePredicate::Expression(eq)],
                         &mut self.expr_node_budget,
                     )?,
+                    ExprLeaf::Preds(preds) if negate_odd => {
+                        negate_conjunction(preds, &mut self.expr_node_budget)?
+                    }
+                    ExprLeaf::Preds(preds) => preds,
                 }
             }
         } else {
@@ -9222,6 +9239,7 @@ impl<'a> Parser<'a> {
                     vec![WherePredicate::Expression(eq)],
                     &mut self.expr_node_budget,
                 )?,
+                ExprLeaf::Preds(preds) => preds,
             }
         };
         *leaf_count = leaf_count.checked_add(1).ok_or_else(|| {
@@ -9307,6 +9325,22 @@ impl<'a> Parser<'a> {
         if let Some((negated, kw_len)) = self.similar_at(self.pos) {
             return self.parse_similar_rest(negated, kw_len, lhs);
         }
+        // 左辺が式の `IS [NOT] NULL`・`[NOT] BETWEEN`・`[NOT] IN (list)`（SQL-24 の拡張）。CHECK 本体では
+        // 従来どおり受理しない（下の比較演算子検査が `42601`）。
+        if !self.in_check_body {
+            match self.expr_lhs_postfix_at(self.pos) {
+                Some(ExprPostfix::IsNull { negated, kw_len }) => {
+                    return self.parse_expr_lhs_is_null(negated, kw_len, lhs);
+                }
+                Some(ExprPostfix::Between { negated, kw_len }) => {
+                    return self.parse_expr_lhs_between(negated, kw_len, lhs);
+                }
+                Some(ExprPostfix::InList { negated, kw_len }) => {
+                    return self.parse_expr_lhs_in_list(negated, kw_len, lhs);
+                }
+                None => {}
+            }
+        }
         if let Expr::JsonAccess { op, .. } = &lhs {
             if op.is_predicate() && !self.peek_is_cmp_op() {
                 return Ok(ExprLeaf::Plain(lhs));
@@ -9363,6 +9397,181 @@ impl<'a> Parser<'a> {
             ArrayCmpOp::Gt => ExprLeaf::Plain(binary(BinOp::Gt, lhs, rhs)),
             ArrayCmpOp::Ge => ExprLeaf::Plain(binary(BinOp::Ge, lhs, rhs)),
         })
+    }
+
+    /// `tokens[idx]` が式左辺の後置語（`IS [NOT] NULL`・`[NOT] BETWEEN`・`[NOT] IN (`）なら種別を返す
+    /// （消費しない）。`IN (SELECT ...)` は式左辺では未対応のため `None`（従来どおり `42601`）。
+    /// `IS [NOT] DISTINCT FROM` は呼び出し元が先に処理する。先読みは `get()` のみ。
+    fn expr_lhs_postfix_at(&self, idx: usize) -> Option<ExprPostfix> {
+        let word = |i: usize, k: &str| matches!(self.tokens.get(i), Some(Token::Ident(w)) if w.eq_ignore_ascii_case(k));
+        if word(idx, "IS") {
+            let (negated, null_at) = if word(idx.checked_add(1)?, "NOT") {
+                (true, idx.checked_add(2)?)
+            } else {
+                (false, idx.checked_add(1)?)
+            };
+            if word(null_at, "NULL") && !self.quoted_null.contains(&null_at) {
+                return Some(ExprPostfix::IsNull {
+                    negated,
+                    kw_len: null_at.checked_add(1)?.checked_sub(idx)?,
+                });
+            }
+            return None;
+        }
+        let (negated, kw) = if word(idx, "NOT") {
+            (true, idx.checked_add(1)?)
+        } else {
+            (false, idx)
+        };
+        let kw_len = kw.checked_add(1)?.checked_sub(idx)?;
+        if word(kw, "BETWEEN") {
+            return Some(ExprPostfix::Between { negated, kw_len });
+        }
+        if word(kw, "IN")
+            && matches!(self.tokens.get(kw.checked_add(1)?), Some(Token::Punct('(')))
+            && !matches!(
+                self.tokens.get(kw.checked_add(2)?),
+                Some(Token::Keyword(Keyword::Select))
+            )
+        {
+            return Some(ExprPostfix::InList { negated, kw_len });
+        }
+        None
+    }
+
+    /// 式ノード予算から `n` 個を課金する（左辺式の複製分など、まとめて課金する用途）。
+    fn charge_expr_nodes(&mut self, n: usize) -> Result<(), SqlSurfaceError> {
+        self.expr_node_budget = self.expr_node_budget.checked_sub(n).ok_or_else(|| {
+            SqlSurfaceError::payload_too_large("expression exceeds the allowed node count")
+        })?;
+        Ok(())
+    }
+
+    /// 式左辺の `<式> IS [NOT] NULL`（SQL-24 の拡張）。`IS NOT DISTINCT FROM NULL` と同値で、結果は
+    /// 常に真偽値（NULL にならない）。AST は既存の [`Expr::IsDistinctFrom`] に写し、`where_negation` が
+    /// 前置 `NOT` を `negated` の反転へ押し下げる（三値論理でも厳密）。
+    fn parse_expr_lhs_is_null(
+        &mut self,
+        negated: bool,
+        kw_len: usize,
+        lhs: Expr,
+    ) -> Result<ExprLeaf, SqlSurfaceError> {
+        self.pos = self.pos.saturating_add(kw_len);
+        // `Null` リテラルと `IsDistinctFrom` の 2 ノード。
+        self.charge_expr_nodes(2)?;
+        Ok(ExprLeaf::Plain(Expr::IsDistinctFrom {
+            // `x IS NULL` は `x IS NOT DISTINCT FROM NULL`（`negated` は IS NOT DISTINCT FROM 側の印）。
+            negated: !negated,
+            lhs: Box::new(lhs),
+            rhs: Box::new(Expr::Null),
+        }))
+    }
+
+    /// 式左辺の `<式> [NOT] BETWEEN <下限> AND <上限>`（SQL-24 の拡張）。`<式> >= 下限 AND
+    /// <式> <= 上限` の連言へ脱糖し、`NOT BETWEEN` は [`negate_conjunction`]（De Morgan。Kleene 三値論理
+    /// でも厳密）で葉まで押し下げる。`SYMMETRIC`／`ASYMMETRIC` は未対応（`42601`）。左辺の複製分は
+    /// 式ノード予算へ課金する。
+    fn parse_expr_lhs_between(
+        &mut self,
+        negated: bool,
+        kw_len: usize,
+        lhs: Expr,
+    ) -> Result<ExprLeaf, SqlSurfaceError> {
+        self.pos = self.pos.saturating_add(kw_len);
+        if matches!(self.peek(), Some(Token::Ident(w))
+            if (w.eq_ignore_ascii_case("SYMMETRIC") || w.eq_ignore_ascii_case("ASYMMETRIC"))
+                && !self.quoted_null.contains(&self.pos))
+        {
+            return Err(SqlSurfaceError::unsupported(
+                "BETWEEN SYMMETRIC/ASYMMETRIC is not supported",
+            ));
+        }
+        let low = self.parse_value_expr_with_null_context(0, true)?;
+        match self.advance() {
+            Some(Token::Keyword(Keyword::And)) => {}
+            other => {
+                return Err(SqlSurfaceError::unsupported(format!(
+                    "expected AND in BETWEEN, got {other:?}"
+                )))
+            }
+        }
+        let high = self.parse_value_expr_with_null_context(0, true)?;
+        // 左辺の複製 1 回分と `Binary` 2 ノード。
+        self.charge_expr_nodes(expr_node_count(&lhs).saturating_add(2))?;
+        let binary = |op: BinOp, l: Expr, r: Expr| {
+            WherePredicate::Expression(Expr::Binary {
+                op,
+                lhs: Box::new(l),
+                rhs: Box::new(r),
+            })
+        };
+        let preds = vec![
+            binary(BinOp::Ge, lhs.clone(), low),
+            binary(BinOp::Le, lhs, high),
+        ];
+        Ok(ExprLeaf::Preds(if negated {
+            negate_conjunction(preds, &mut self.expr_node_budget)?
+        } else {
+            preds
+        }))
+    }
+
+    /// 式左辺の `<式> [NOT] IN (<値式>, ...)`（SQL-24 の拡張）。`<式> = e1 OR <式> = e2 ...` の
+    /// [`WherePredicate::Or`] へ脱糖し（要素 1 個は単独の比較）、`NOT IN` は [`negate_conjunction`] で
+    /// 葉まで押し下げる。要素数は積む前に [`MAX_IN_LIST_ITEMS`] で検査する（`54000`）。空リスト・
+    /// 要素のカンマ／閉じ括弧の不備は `42601`。左辺の複製分は式ノード予算へ課金する。
+    fn parse_expr_lhs_in_list(
+        &mut self,
+        negated: bool,
+        kw_len: usize,
+        lhs: Expr,
+    ) -> Result<ExprLeaf, SqlSurfaceError> {
+        self.pos = self.pos.saturating_add(kw_len);
+        self.expect_punct('(')?;
+        if matches!(self.peek(), Some(Token::Punct(')'))) {
+            return Err(SqlSurfaceError::unsupported("IN list must not be empty"));
+        }
+        let lhs_nodes = expr_node_count(&lhs);
+        let mut branches: Vec<Vec<WherePredicate>> = Vec::new();
+        loop {
+            if branches.len() >= MAX_IN_LIST_ITEMS {
+                return Err(SqlSurfaceError::payload_too_large(format!(
+                    "IN list item count exceeds limit {MAX_IN_LIST_ITEMS}"
+                )));
+            }
+            let element = self.parse_value_expr_with_null_context(0, true)?;
+            // 左辺の複製 1 回分と `Binary` 1 ノード。
+            self.charge_expr_nodes(lhs_nodes.saturating_add(1))?;
+            branches.push(vec![WherePredicate::Expression(Expr::Binary {
+                op: BinOp::Eq,
+                lhs: Box::new(lhs.clone()),
+                rhs: Box::new(element),
+            })]);
+            match self.peek() {
+                Some(Token::Punct(',')) => {
+                    self.advance();
+                }
+                Some(Token::Punct(')')) => {
+                    self.advance();
+                    break;
+                }
+                other => {
+                    return Err(SqlSurfaceError::unsupported(format!(
+                        "expected ',' or ')' in IN list, got {other:?}"
+                    )))
+                }
+            }
+        }
+        let preds = if branches.len() == 1 {
+            branches.pop().unwrap_or_default()
+        } else {
+            vec![WherePredicate::Or(branches)]
+        };
+        Ok(ExprLeaf::Preds(if negated {
+            negate_conjunction(preds, &mut self.expr_node_budget)?
+        } else {
+            preds
+        }))
     }
 
     /// `tokens[idx]` から `[NOT] LIKE|ILIKE '<文字列リテラル>'` が並んでいれば

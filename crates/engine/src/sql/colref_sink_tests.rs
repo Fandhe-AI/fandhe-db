@@ -132,6 +132,11 @@ const CORPUS: &[&str] = &[
     "SELECT t.a, u.b FROM t LEFT JOIN u ON t.k = u.k AND u.z = 'x'",
     "SELECT t.a, u.b FROM t JOIN u ON t.k = u.k WHERE t.n = 'x'",
     "SELECT t.a, u.b FROM t JOIN u ON t.k = u.k WHERE t.n = 'x' ORDER BY t.a LIMIT 5",
+    "SELECT * FROM t WHERE n + 1 IS NULL",
+    "SELECT * FROM t WHERE n + 1 IS NOT NULL AND lower(a) IN ('x', 'y')",
+    "SELECT * FROM t WHERE NOT n + 1 BETWEEN 1 AND m",
+    "SELECT * FROM t WHERE n + 1 NOT IN (m, 2)",
+    "DELETE FROM t WHERE n + 1 BETWEEN 1 AND 5",
     "SELECT a FROM u",
     "SELECT max(n) FROM u",
     "SELECT 1 FROM u WHERE u.a = 'x'",
@@ -307,16 +312,11 @@ fn every_literal_accepting_identifier_position_is_recorded() {
 }
 
 /// 列専用位置（記録済みなのにリテラルへ置き換えると受理されない位置）の既知一覧。
-/// 先頭の 5 件は左辺が列の `IS [NOT] NULL`・`[NOT] IN (list)`・`[NOT] BETWEEN`（左辺が式の形は
-/// SQL-24 の拡張〔別コミット〕で受理され、この一覧から消える）。それ以外は列名がそのまま
-/// 出力名・構造になる位置（集合演算の枝・DISTINCT・窓の PARTITION BY／ORDER BY・サブクエリ連動の
-/// 左辺・RETURNING など）で、変数を置くと置換後に構文エラー（42601）になる。
+/// 左辺が列の `IS [NOT] NULL`・`[NOT] IN (list)`・`[NOT] BETWEEN` は、左辺が式の形を受理する
+/// SQL-24 の拡張で列専用ではなくなった。残るのは、サブクエリ連動（`IN (SELECT)`・`ANY`・
+/// スカラー比較）の左辺と、列名がそのまま出力名・構造になる位置（集合演算の枝・DISTINCT・
+/// 窓の PARTITION BY／ORDER BY・RETURNING など）。変数を置くと置換後に構文エラー（42601）になる。
 const COLUMN_ONLY: &[&str] = &[
-    "SELECT * FROM t WHERE a IS NULL @5 WhereHead",
-    "SELECT * FROM t WHERE a IS NOT NULL @5 WhereHead",
-    "SELECT * FROM t WHERE a IN ('x', 'y') @5 WhereHead",
-    "SELECT * FROM t WHERE a NOT IN ('x', 'y') @5 WhereHead",
-    "SELECT * FROM t WHERE n BETWEEN 1 AND 5 @5 WhereHead",
     "SELECT DISTINCT a FROM t @2 SelectItemBare",
     "SELECT row_number() OVER (ORDER BY n) FROM t @8 Value",
     "SELECT sum(n) OVER (PARTITION BY a ORDER BY m) FROM t @9 Value",
@@ -326,8 +326,6 @@ const COLUMN_ONLY: &[&str] = &[
     "SELECT a FROM t UNION SELECT a FROM u @6 SelectItemBare",
     "WITH c AS (SELECT a FROM t) SELECT a FROM c @5 SelectItemBare",
     "SELECT * FROM t WHERE n = ANY (SELECT n FROM u) @5 WhereHead",
-    "SELECT * FROM t WHERE n IN (1, 2, 3) @5 WhereHead",
-    "SELECT * FROM t WHERE n NOT BETWEEN 1 AND 5 @5 WhereHead",
     "SELECT DISTINCT a, b FROM t ORDER BY a @2 SelectItemBare",
     "SELECT DISTINCT a, b FROM t ORDER BY a @4 SelectItemBare",
     "SELECT * FROM t ORDER BY embedding <=> '[1,2]' LIMIT 5 @6 OrderKey",
@@ -339,14 +337,10 @@ const COLUMN_ONLY: &[&str] = &[
     "SELECT a FROM t WHERE n > 1 UNION ALL SELECT a FROM u WHERE n < 5 @11 SelectItemBare",
     "SELECT a FROM t INTERSECT SELECT a FROM u @1 SelectItemBare",
     "SELECT a FROM t INTERSECT SELECT a FROM u @6 SelectItemBare",
-    "UPDATE t SET n = abs(m) WHERE a IN ('x', 'y') @10 WhereHead",
-    "UPDATE t SET n = n + 1 WHERE n BETWEEN 1 AND 5 RETURNING a, n @9 WhereHead",
     "UPDATE t SET n = n + 1 WHERE n BETWEEN 1 AND 5 RETURNING a, n @15 SelectItemBare",
     "UPDATE t SET n = n + 1 WHERE n BETWEEN 1 AND 5 RETURNING a, n @17 SelectItemBare",
     "DELETE FROM t WHERE a IN (SELECT a FROM u) @4 WhereHead",
     "DELETE FROM t WHERE n > (SELECT max(n) FROM u) @4 WhereHead",
-    "DELETE FROM t WHERE lower(a) = 'x' OR n IS NULL @11 WhereHead",
-    "DELETE FROM t WHERE a = 'x' AND n BETWEEN 1 AND 5 RETURNING a, n @8 WhereHead",
     "DELETE FROM t WHERE a = 'x' AND n BETWEEN 1 AND 5 RETURNING a, n @14 SelectItemBare",
     "DELETE FROM t WHERE a = 'x' AND n BETWEEN 1 AND 5 RETURNING a, n @16 SelectItemBare",
     "DELETE FROM t WHERE n = (SELECT max(n) FROM u) RETURNING n @4 WhereHead",
@@ -666,4 +660,26 @@ fn guard_restores_previous_state_on_drop() {
     }
     assert!(!colref_sink::is_active());
     assert!(!colref_sink::is_scope_var("v"));
+}
+
+/// 左辺が `rec.field` の `IS NULL`・`BETWEEN`・`IN`（SQL-24 の拡張経由）も変数参照として記録される。
+#[test]
+fn record_field_as_expression_lhs_of_null_between_in() {
+    for sql in [
+        "SELECT a FROM t WHERE rec.g IS NULL",
+        "SELECT a FROM t WHERE rec.g IS NOT NULL",
+        "SELECT a FROM t WHERE rec.g BETWEEN 1 AND 5",
+        "SELECT a FROM t WHERE rec.g NOT IN (1, 2)",
+        "DELETE FROM t WHERE rec.g IN (1, 2)",
+    ] {
+        let toks = lex(sql);
+        let (r, rep) = recorded(&toks, &["rec"]);
+        assert!(r.is_ok(), "{sql}: {r:?}");
+        assert!(!rep.out_of_range, "{sql}");
+        let pos = toks
+            .iter()
+            .position(|t| matches!(t, Token::QualifiedIdent { .. }))
+            .expect("rec.g");
+        assert!(rep.records.iter().any(|r| r.pos == pos), "{sql}");
+    }
 }
