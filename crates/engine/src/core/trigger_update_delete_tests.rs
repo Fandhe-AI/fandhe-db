@@ -136,6 +136,46 @@ fn before_update_rewrites_new_and_receives_old() {
     assert_eq!(rows[2], (3, "q".to_string(), 1030));
 }
 
+// BEFORE UPDATE の前に NEW 候補の NOT NULL 検査をしない。SET が NOT NULL 列へ NULL を入れても、BEFORE が
+// 有効な値へ補正すれば成功する。補正しなければ最終 NEW の検査で `23502` になる。
+#[test]
+fn before_update_can_repair_null_in_not_null_column() {
+    let dir = tempdir();
+    let (core, _calls) = seeded(
+        dir.path(),
+        Box::new(|c| {
+            let mut new = c.new_row.to_vec();
+            if let Some(slot) = new.get_mut(2) {
+                *slot = Value::BigInt(77);
+            }
+            Ok(TriggerOutcome::Proceed(new))
+        }),
+    );
+    let a = ctx("tenant-a");
+    add_trigger(
+        &core.storage,
+        "tenant-a",
+        "trg",
+        &dml_trigger("b", TriggerTiming::Before, UPD, &[]),
+    );
+    let out = run(&core, &a, "UPDATE trg SET n = NULLIF(n, n) WHERE id = 1").expect("repaired");
+    assert_eq!(affected(out), 1);
+    assert_eq!(read_rows(&core, &a, "trg")[0].2, 77);
+
+    let dir2 = tempdir();
+    let (core2, _) = seeded(dir2.path(), passthrough());
+    add_trigger(
+        &core2.storage,
+        "tenant-a",
+        "trg",
+        &dml_trigger("b", TriggerTiming::Before, UPD, &[]),
+    );
+    assert_eq!(
+        code(&core2, &a, "UPDATE trg SET n = NULLIF(n, n) WHERE id = 1"),
+        "23502"
+    );
+}
+
 // BEFORE が NULL を返した行は更新・削除されず、影響行数にも AFTER にも数えない。
 #[test]
 fn before_skip_excludes_row_from_update_and_delete() {

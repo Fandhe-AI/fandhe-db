@@ -240,6 +240,22 @@ pub(crate) fn eval_set_expr_to_value<'a>(
     expr_value_to_column_value(&set.target_ty, set.nullable, &set.column_name, evaluated)
 }
 
+/// [`eval_set_expr_to_value`] の NOT NULL 検査後回し版。評価結果が NULL なら列の NULL 可否に関わらず
+/// `Value::Null` を返す。BEFORE UPDATE トリガ経路（Issue #1725）が NEW 候補を値の列として作り、
+/// BEFORE の連鎖後の最終行にだけ NOT NULL 検査を行うために使う（BEFORE が NULL を補正・Skip できる）。
+pub(crate) fn eval_set_expr_to_value_deferred_not_null<'a>(
+    set: &BoundSetExpr,
+    id: u64,
+    embedding: &'a [f32],
+    row_scalars: &'a [Option<ScalarRef<'a>>],
+) -> Result<Value, SqlSurfaceError> {
+    if let Some(value) = &set.default_value {
+        return Ok(value.clone());
+    }
+    let evaluated = eval_with_scalars(&set.bound, id, embedding, row_scalars)?;
+    expr_value_to_column_value(&set.target_ty, true, &set.column_name, evaluated)
+}
+
 /// 式の評価結果 `evaluated` を列型 `target_ty` の [`Value`] へ変換する（列値化）。
 /// `UPDATE ... SET` の [`eval_set_expr_to_value`] と、`ALTER COLUMN TYPE` の全行変換
 /// （`column_rewrite`。TABLE-40・Issue #1636）が共有する単一の変換器で、第 2 の変換器は

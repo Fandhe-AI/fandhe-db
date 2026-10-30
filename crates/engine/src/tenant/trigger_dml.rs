@@ -23,8 +23,9 @@ use redb::ReadableTable;
 
 use super::trigger_insert::settle_trigger_written_tables;
 use super::{
-    captured_values_from_parts, encode_row, merge_row_for_update_set, row_key, statement_writes,
-    user_rows_table_def, user_rows_table_name, RowId, TenantWriteError, WriteTarget,
+    captured_values_from_parts, encode_row, merge_row_for_update_set, resolve_update_set_values,
+    row_key, statement_writes, user_rows_table_def, user_rows_table_name, RowId, TenantWriteError,
+    WriteTarget,
 };
 use crate::catalog::{map_row_table_error, CatalogError, ColumnType, TableSchema};
 use crate::policy::PolicyContext;
@@ -175,20 +176,44 @@ pub(super) fn update_rows_with_triggers(
         let visibility = existing.visibility;
         let old_values =
             captured_values_from_parts(schema, existing.embedding.clone(), &existing.metadata)?;
-        let (merged_embedding, merged_metadata) = merge_row_for_update_set(
-            schema,
-            existing,
-            *id,
-            spec.assignments,
-            spec.set_exprs,
-            row_extra,
-        )?;
-        let new_candidate =
-            captured_values_from_parts(schema, merged_embedding.clone(), &merged_metadata)?;
-        // 表ハンドルを開く前に発火する（再入の不変条件）。
+        // BEFORE トリガがあるときは、NEW 候補を値の列として作るだけで制約検査・encode をしない
+        // （BEFORE が NULL 等を補正・Skip できるよう、検査は BEFORE の連鎖後の最終行に対して行う）。
         let (embedding, metadata, final_row) = if plan.before.is_empty() {
+            let (merged_embedding, merged_metadata) = merge_row_for_update_set(
+                schema,
+                existing,
+                *id,
+                spec.assignments,
+                spec.set_exprs,
+                row_extra,
+            )?;
+            let new_candidate =
+                captured_values_from_parts(schema, merged_embedding.clone(), &merged_metadata)?;
             (merged_embedding, merged_metadata, new_candidate)
         } else {
+            let resolved = resolve_update_set_values(
+                schema,
+                &existing,
+                *id,
+                spec.assignments,
+                spec.set_exprs,
+                row_extra,
+                true,
+            )?;
+            let mut new_candidate = old_values.clone();
+            let mut seen: Vec<usize> = Vec::with_capacity(resolved.len());
+            for (idx, value) in resolved {
+                // 重複指定は先勝ち（merge_encode_scalar_columns と同じ意味論）。
+                if seen.contains(&idx) {
+                    continue;
+                }
+                seen.push(idx);
+                let slot = new_candidate
+                    .get_mut(idx)
+                    .ok_or_else(|| internal("internal: SET column index out of range"))?;
+                *slot = value;
+            }
+            // 表ハンドルを開く前に発火する（再入の不変条件）。
             let fired = crate::trigger::fire::fire_before_row_update(
                 plan.runtime,
                 &writes,

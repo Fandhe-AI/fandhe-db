@@ -4553,6 +4553,34 @@ fn merge_row_for_update_set(
     if set_exprs.is_empty() && row_extra.is_empty() {
         return Ok(merge_row_for_update(schema, existing, assignments)?);
     }
+    let resolved = resolve_update_set_values(
+        schema,
+        &existing,
+        id,
+        assignments,
+        set_exprs,
+        row_extra,
+        false,
+    )?;
+    validate_set_assignments(schema, &resolved)?;
+    Ok(merge_row_for_update(schema, existing, &resolved)?)
+}
+
+/// UPDATE の SET 項（リテラル・式・行ごとの上書き値）を、更新前の行に対して評価して
+/// `(列 index, 値)` の列へ解決する。検証・encode は行わない（値の列を作るだけ）。
+/// [`merge_row_for_update_set`] が検証の前段として使うほか、BEFORE UPDATE トリガ経路
+/// （`trigger_dml`）が「BEFORE の連鎖後の最終行にだけ制約検査・encode を行う」ために
+/// NEW 候補を値の列として組み立てる目的で使う（Issue #1725）。
+pub(super) fn resolve_update_set_values(
+    schema: &crate::catalog::TableSchema,
+    existing: &crate::storage::Row,
+    id: u64,
+    assignments: &[(usize, crate::row_codec::Value)],
+    set_exprs: &[(usize, crate::sql::set_expr::BoundSetExpr)],
+    row_extra: &[(usize, crate::row_codec::Value)],
+    // 真なら式の評価結果が NULL でも NOT NULL 検査をしない（BEFORE トリガ経路。検査は最終行で行う）。
+    defer_not_null: bool,
+) -> Result<Vec<(usize, crate::row_codec::Value)>, TenantWriteError> {
     let mut resolved: Vec<(usize, crate::row_codec::Value)> = Vec::new();
     resolved
         .try_reserve_exact(
@@ -4567,23 +4595,22 @@ fn merge_row_for_update_set(
             ))
         })?;
     resolved.extend(assignments.iter().cloned());
-    {
+    if !set_exprs.is_empty() {
         let scanned = crate::row_codec::scan_scalar_columns(schema, &existing.metadata)
             .map_err(|e| CatalogError::CorruptSchema(e.to_string()))?;
         for (idx, set) in set_exprs {
-            let value = crate::sql::set_expr::eval_set_expr_to_value(
-                set,
-                id,
-                &existing.embedding,
-                &scanned,
-            )
-            .map_err(TenantWriteError::SetExpressionEvaluationFailed)?;
+            let eval = if defer_not_null {
+                crate::sql::set_expr::eval_set_expr_to_value_deferred_not_null
+            } else {
+                crate::sql::set_expr::eval_set_expr_to_value
+            };
+            let value = eval(set, id, &existing.embedding, &scanned)
+                .map_err(TenantWriteError::SetExpressionEvaluationFailed)?;
             resolved.push((*idx, value));
         }
     }
     resolved.extend(row_extra.iter().cloned());
-    validate_set_assignments(schema, &resolved)?;
-    Ok(merge_row_for_update(schema, existing, &resolved)?)
+    Ok(resolved)
 }
 
 /// 式を含む SET が束縛時のスキーマに結び付いていることを保証する（Issue #1544）。
