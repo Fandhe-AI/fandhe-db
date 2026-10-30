@@ -444,7 +444,8 @@ pub(crate) fn redact_row_conversion_error(e: SqlSurfaceError) -> SqlSurfaceError
         | E::InvalidRecursion { .. }
         | E::InvalidForeignKey { .. }
         | E::UndefinedFunction { .. }
-        | E::DuplicateFunction { .. } => E::Internal {
+        | E::DuplicateFunction { .. }
+        | E::InvalidFunctionDefinition { .. } => E::Internal {
             detail: CONVERSION_FAILED.to_string(),
         },
     }
