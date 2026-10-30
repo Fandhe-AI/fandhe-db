@@ -764,6 +764,25 @@ fn comparison_with_null_variable_yields_null_not_false() {
 }
 
 #[test]
+fn null_absorbing_expressions_with_null_variable_are_not_null() {
+    let (core, _g) = new_core(LedgerMode::Optional);
+    let c = ctx("t1");
+    // COALESCE は NULL を吸収する（現状の SQL 表層は変数入りの IN 一覧を受理しない）ので、a が NULL でも条件は真になる。
+    for cond in ["coalesce(a, 5) = 5", "3 = coalesce(a, 3)"] {
+        let src = format!("BEGIN IF {cond} THEN RETURN 1; END IF; RETURN 0; END");
+        let out = call(&src)
+            .param(
+                "a",
+                SqlColumnTypeName::Integer,
+                PlScalar::null(ColumnType::Integer),
+            )
+            .autocommit(&core, &c)
+            .unwrap_or_else(|e| panic!("{cond}: {e:?}"));
+        assert_eq!(as_i64(&out), 1, "{cond}");
+    }
+}
+
+#[test]
 fn expressions_over_variables_are_evaluated_by_the_sql_surface() {
     let (core, _g) = new_core(LedgerMode::Optional);
     let c = ctx("t1");

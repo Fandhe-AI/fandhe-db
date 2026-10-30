@@ -186,9 +186,9 @@ struct CorePlHost<'a, 'e> {
     session: &'a mut SessionState,
     txn: &'a mut SessionTransaction<'e>,
     opts: PlCallOptions,
-    /// `42702` の検査済みの文・式（アドレスをキーにする。本体の AST は起動の間不変で、ループで検査を
+    /// `42702` の検査済みの文・式（種別（式 0・埋め込み SQL 1）とアドレスをキーにする。本体の AST は起動の間不変で、ループで検査を
     /// 繰り返さない）。値は読み出さないので、アドレスの再利用で誤って参照されることはない。
-    conflict_checked: HashSet<usize>,
+    conflict_checked: HashSet<(u8, usize)>,
 }
 
 /// 変数名と列名が衝突しうる役割（列としても読める位置）。リテラル専用位置は列を受理しない。
@@ -241,7 +241,7 @@ impl<'a, 'e> CorePlHost<'a, 'e> {
     /// キャッシュする。CTE・導出表・ビューの列は対象外（既知の差。設計書の追記参照）。
     fn check_conflicts(
         &mut self,
-        key: usize,
+        key: (u8, usize),
         tokens: &[Token],
         sites: &[VarSite],
     ) -> Result<(), SqlSurfaceError> {
@@ -346,18 +346,58 @@ impl<'a, 'e> CorePlHost<'a, 'e> {
     }
 }
 
-/// 条件トークン列が `NULL` を含む単純比較（`a = NULL` 等）なら true。SQL の三値論理では結果が NULL に
-/// なるため、`where_probe` の「行の有無」（NULL は偽）に潰さず `None` で返すために使う。`IS [NOT] NULL`・
-/// `AND`／`OR`／`NOT` を含む形は NULL を判定する演算子なので対象外（従来どおり SQL 側へ渡す）。
+/// 条件トークン列が、比較演算子の直接のオペランドに `NULL`（裸の `NULL` または置換後の型付き
+/// `CAST(NULL AS ..)`）を持つ単純比較（`a = NULL` 等）なら true。SQL の三値論理では結果が NULL に
+/// なるため、`where_probe` の「行の有無」（NULL は偽）に潰さず `None` で返すために使う。
+/// `COALESCE(a, 5) = 5`・`3 IN (a, 3)` のように NULL を吸収する式の内側にある `NULL` は直接のオペランド
+/// ではないので対象外（SQL 側へ渡す）。`IS [NOT] NULL`・`AND`／`OR`／`NOT` を含む形も対象外。
 fn comparison_with_null(toks: &[Token]) -> bool {
     let word = |t: &Token, w: &str| matches!(t, Token::Ident(s) if s.eq_ignore_ascii_case(w));
-    toks.iter().any(|t| word(t, "NULL"))
-        && !toks.iter().any(|t| {
-            matches!(t, Token::Keyword(Keyword::And))
-                || word(t, "IS")
-                || word(t, "OR")
-                || word(t, "NOT")
-        })
+    if toks.iter().any(|t| {
+        matches!(t, Token::Keyword(Keyword::And))
+            || word(t, "IS")
+            || word(t, "OR")
+            || word(t, "NOT")
+    }) {
+        return false;
+    }
+    // `CAST ( NULL AS .. )` の開始位置 `start`（`CAST` の添字）から対応する `)` の直後までの長さ。
+    let typed_null_len = |start: usize| -> Option<usize> {
+        if !(toks.get(start).is_some_and(|t| word(t, "CAST"))
+            && matches!(toks.get(start + 1), Some(Token::Punct('(')))
+            && toks.get(start + 2).is_some_and(|t| word(t, "NULL")))
+        {
+            return None;
+        }
+        let mut depth = 0usize;
+        for (k, t) in toks.iter().enumerate().skip(start + 1) {
+            match t {
+                Token::Punct('(') => depth += 1,
+                Token::Punct(')') => {
+                    depth -= 1;
+                    if depth == 0 {
+                        return Some(k + 1 - start);
+                    }
+                }
+                _ => {}
+            }
+        }
+        None
+    };
+    let is_cmp = |t: &Token| matches!(t, Token::Punct('=' | '<' | '>') | Token::Le | Token::Ge);
+    toks.iter().enumerate().any(|(i, t)| {
+        if !is_cmp(t) {
+            return false;
+        }
+        let right = i + 1;
+        let right_null =
+            toks.get(right).is_some_and(|t| word(t, "NULL")) || typed_null_len(right).is_some();
+        let left_null = i > 0
+            && (word(&toks[i - 1], "NULL")
+                || (matches!(toks[i - 1], Token::Punct(')'))
+                    && (0..i).any(|st| typed_null_len(st) == Some(i - st))));
+        right_null || left_null
+    })
 }
 
 impl PlHost for CorePlHost<'_, '_> {
@@ -370,7 +410,7 @@ impl PlHost for CorePlHost<'_, '_> {
         if let Some(v) = direct_var(expr, env)? {
             return Ok(v);
         }
-        let key = std::ptr::from_ref(expr) as usize;
+        let key = (0u8, std::ptr::from_ref(expr) as usize);
         self.check_conflicts(key, &expr.tokens, &expr.var_refs)?;
         if expr.cond {
             let c = self.eval_cond(expr, env, _budget)?;
@@ -414,7 +454,7 @@ impl PlHost for CorePlHost<'_, '_> {
                 )),
             };
         }
-        let key = std::ptr::from_ref(expr) as usize;
+        let key = (0u8, std::ptr::from_ref(expr) as usize);
         self.check_conflicts(key, &expr.tokens, &expr.var_refs)?;
         let toks = subst::substitute(&expr.tokens, &expr.var_refs, env, false)?;
         if comparison_with_null(&toks) {
@@ -447,7 +487,7 @@ impl PlHost for CorePlHost<'_, '_> {
         demand: RowDemand,
         _budget: &mut ExecBudget,
     ) -> Result<HostOutcome, SqlSurfaceError> {
-        let key = std::ptr::from_ref(sql) as usize;
+        let key = (1u8, std::ptr::from_ref(sql) as usize);
         self.check_conflicts(key, &sql.tokens, &sql.var_refs)?;
         let toks = subst::substitute(&sql.tokens, &sql.var_refs, env, true)?;
         let out = self.run_tokens(toks)?;
