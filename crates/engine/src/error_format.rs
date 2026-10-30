@@ -82,19 +82,20 @@ macro_rules! define_error_classes {
 /// ラベル（[`ErrorClass::label`]）でのみ区別する。本モジュール下部の
 /// `wire_codes_are_pairwise_distinct_except_shared_wire_codes`
 /// テストがこの集合に載っていない `wire_code` の重複だけを偶発的な乖離として
-/// 検出する。共有は 3 組: `23502`（`MissingOperationId` / `NotNullViolation`）と
+/// 検出する。共有は 4 組: `23502`（`MissingOperationId` / `NotNullViolation`）と
 /// `23505`（`UniqueViolation` / `DuplicateOperationId`。台帳由来の重複を行制約
 /// 由来と `code` ラベルで区別する。Issue #1180・RECOVER-12・ERR-6）と
-/// `22023`（`OperationIdContentMismatch` / `InvalidParameterValue`。Issue #2304）。
+/// `22023`（`OperationIdContentMismatch` / `InvalidParameterValue`。Issue #2304）と
+/// `P0002`（`RowNotFound` / `NoDataFound`。Issue #2225）。
 ///
 /// 本体は `#[cfg(test)]` の単体テストからのみ参照される（`pub(crate)` のため
 /// integration test crate からは到達できない）。通常ビルドでは未参照のため
 /// `dead_code` を明示的に許容する。
 #[allow(dead_code)]
-pub(crate) const SHARED_WIRE_CODES: &[&str] = &["23502", "23505", "22023"];
+pub(crate) const SHARED_WIRE_CODES: &[&str] = &["23502", "23505", "22023", "P0002"];
 
 define_error_classes! {
-    count = 93;
+    count = 97;
 
     /// 構文上受理された SQL の値・引数が不正（`22000`）。
     /// [`crate::sql::allowlist::SqlSurfaceError::InvalidInput`] の写像。
@@ -526,6 +527,21 @@ define_error_classes! {
     /// `Failed` になる。文言は固定で件数・テナント・行の内容を含めない。
     /// [`crate::sql::allowlist::SqlSurfaceError::QueryCanceled`] の写像。
     QueryCanceled => ("57014", "QUERY_CANCELED"),
+    /// PL/pgSQL の `SELECT INTO STRICT` が 0 行だった（`P0002`。Issue #2225・SQL-68）。
+    /// `wire_code` は [`ErrorClass::RowNotFound`] と共有し `code` ラベルで区別する
+    /// （[`SHARED_WIRE_CODES`]）。**宣言順の制約**: [`ErrorClass::from_wire_code`] の逆引きが
+    /// `RowNotFound` を返し続けるよう、必ず `RowNotFound` より後に宣言する。
+    /// [`crate::sql::allowlist::SqlSurfaceError::NoDataFound`] の写像。
+    NoDataFound => ("P0002", "NO_DATA_FOUND"),
+    /// PL/pgSQL の `INTO STRICT`（または DML の `RETURNING INTO`）が 2 行以上だった（`P0003`。
+    /// Issue #2225・SQL-68）。[`crate::sql::allowlist::SqlSurfaceError::TooManyRows`] の写像。
+    TooManyRows => ("P0003", "TOO_MANY_ROWS"),
+    /// PL/pgSQL の `ELSE` の無い `CASE` 文がどの分岐にも一致しなかった（`20000`。Issue #2225・
+    /// SQL-68）。[`crate::sql::allowlist::SqlSurfaceError::CaseNotFound`] の写像。
+    CaseNotFound => ("20000", "CASE_NOT_FOUND"),
+    /// PL/pgSQL のスカラー関数が `RETURN` に達せず本体の終わりに到達した（`2F005`。Issue #2225・
+    /// SQL-68）。[`crate::sql::allowlist::SqlSurfaceError::FunctionExecutedNoReturnStatement`] の写像。
+    FunctionExecutedNoReturnStatement => ("2F005", "FUNCTION_EXECUTED_NO_RETURN_STATEMENT"),
 }
 
 impl ErrorClass {
@@ -536,7 +552,7 @@ impl ErrorClass {
     /// 共有するため、本関数は [`ErrorClass::ALL`] の宣言順で最初に一致した分類
     /// （`23502` は [`ErrorClass::MissingOperationId`]、`23505` は
     /// [`ErrorClass::UniqueViolation`]、`22023` は
-    /// [`ErrorClass::OperationIdContentMismatch`]）を返す。この関数は
+    /// [`ErrorClass::OperationIdContentMismatch`]、`P0002` は [`ErrorClass::RowNotFound`]）を返す。この関数は
     /// HTTP ステータス射影の往復確認（同じ `wire_code` は同じステータスへ写像
     /// される）にのみ使われ、応答本文の `code` ラベルは各エラー型の
     /// `error_class()` が直接返す分類から得るため、共有コードの逆引きが

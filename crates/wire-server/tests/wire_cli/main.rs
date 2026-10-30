@@ -23,6 +23,7 @@ mod wire_hnsw_scope_cli;
 mod wire_join_limits_cli;
 mod wire_jsonpath_limits_cli;
 mod wire_nesting_limits_cli;
+mod wire_plpgsql_limits_cli;
 mod wire_recursive_cte_limits_cli;
 mod wire_regex_limits_cli;
 mod wire_require_operation_id_cli;

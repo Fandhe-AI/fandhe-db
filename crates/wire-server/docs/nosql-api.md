@@ -1116,6 +1116,7 @@ Date: <IMF-fixdate>
 | `wire_code` | `code` | HTTP ステータス | 理由句 | NoSQL 表層での主な発生源 |
 | --- | --- | --- | --- | --- |
 | `08P01` | `PROTOCOL_VIOLATION` | 400 | Bad Request | 要求行・ヘッダ形状違反、未知ターゲットへのアクセス |
+| `20000` | `CASE_NOT_FOUND` | 400 | Bad Request | PL/pgSQL の `ELSE` の無い `CASE` 文が不一致（SQL 表層の PL/pgSQL 専用。NoSQL の `op` 語彙からは到達しない）。Issue #2225・SQL-68 |
 | `21000` | `CARDINALITY_VIOLATION` | 400 | Bad Request | NoSQL 表層の実要求からは到達不能（スカラーサブクエリは SQL 表層専用。後述） |
 | `22000` | `INVALID_INPUT` | 400 | Bad Request | `op` 別スキーマ検証での値の型・形状不正 |
 | `22001` | `STRING_DATA_RIGHT_TRUNCATION` | 400 | Bad Request | `VARCHAR(n)` 列への書き込みで文字数が n を超過（Issue #1564。超過部分が半角空白のみなら切り詰めて受理） |
@@ -1156,6 +1157,7 @@ Date: <IMF-fixdate>
 | `25P01` | `NO_ACTIVE_SQL_TRANSACTION` | 400 | Bad Request | NoSQL 表層の実要求からは到達不能（同上） |
 | `25P02` | `IN_FAILED_SQL_TRANSACTION` | 400 | Bad Request | NoSQL 表層の実要求からは到達不能（同上） |
 | `2BP01` | `DEPENDENT_OBJECTS_STILL_EXIST` | 400 | Bad Request | NoSQL 表層の実要求からは到達不能（`DROP TABLE`／`DROP VIEW` は SQL 表層専用の DDL。後述） |
+| `2F005` | `FUNCTION_EXECUTED_NO_RETURN_STATEMENT` | 400 | Bad Request | PL/pgSQL のスカラー関数が `RETURN` に達せず終わりに到達（SQL 表層の PL/pgSQL 専用。NoSQL の `op` 語彙からは到達しない）。Issue #2225・SQL-68 |
 | `42601` | `UNSUPPORTED_SQL_SYNTAX` | 400 | Bad Request | JSON 構文エラー、`op` 別スキーマ違反、`tenant_id` 相当値の自己申告 |
 | `42701` | `DUPLICATE_COLUMN` | 400 | Bad Request | NoSQL 表層の実要求からは到達不能（`CREATE TABLE`・`ALTER TABLE ADD COLUMN` は op 許可リスト外。後述） |
 | `42702` | `AMBIGUOUS_COLUMN` | 400 | Bad Request | `aggregate.sort` が複数一致する出力名を参照したとき到達可能（Issue #1270）。`INNER JOIN`〔SQL-28・RLS-10、Issue #925〕は NoSQL 表層の op 語彙に無い。後述 |
@@ -1186,6 +1188,7 @@ Date: <IMF-fixdate>
 | `54001` | `STATEMENT_TOO_COMPLEX` | 400 | Bad Request | `GROUP BY` のグルーピングセットの展開後セット数・入れ子の上限超過（SQL 表層専用。NoSQL の `op` 語彙からは到達しない）。Issue #1821・SQL-59 |
 | `54011` | `TOO_MANY_COLUMNS` | 400 | Bad Request | `CUBE` の要素数の上限超過（SQL 表層専用。NoSQL の `op` 語彙からは到達しない）。Issue #1821・SQL-59 |
 | `54023` | `TOO_MANY_ARGUMENTS` | 400 | Bad Request | `GROUPING()` の引数が 31 個、または関数呼び出しの引数が 100 個を超えた（SQL 表層専用。NoSQL の `op` 語彙からは到達しない）。Issue #1823・SQL-59、Issue #1910・SQL-65 |
+| `P0003` | `TOO_MANY_ROWS` | 400 | Bad Request | PL/pgSQL の `INTO STRICT`（および DML の `RETURNING INTO`）が 2 行以上（SQL 表層の PL/pgSQL 専用。NoSQL の `op` 語彙からは到達しない）。Issue #2225・SQL-68 |
 | `28000` | `AUTH_REQUIRED` | 401 | Unauthorized | `Authorization` ヘッダ欠落 |
 | `28P01` | `AUTH_INVALID` | 401 | Unauthorized | トークン形式不正・失効・セッション未存在 |
 | `42501` | `FORBIDDEN_TENANT_MISMATCH` | 403 | Forbidden | NoSQL 表層の実要求からは到達不能（射影のみ production エンコーダで固定。後述） |
@@ -1193,6 +1196,7 @@ Date: <IMF-fixdate>
 | `3F000` | `INVALID_SCHEMA_NAME` | 404 | Not Found | 呼び出し元テナントに存在しない SCHEMA を指した（TABLE-27・Issue #1713。他テナントの名前も同じ応答。NoSQL 表層からは到達しない） |
 | `42P01` | `TABLE_NOT_FOUND` | 404 | Not Found | 未定義テーブルへの `search`／`scan`／`aggregate`／`insert` |
 | `P0002` | `ROW_NOT_FOUND` | 404 | Not Found | NoSQL 表層の実要求からは到達不能（対応する op が許可リストに無い。後述） |
+| `P0002` | `NO_DATA_FOUND` | 404 | Not Found | PL/pgSQL の `INTO STRICT` が 0 行（`wire_code` は `ROW_NOT_FOUND` と共有。SQL 表層の PL/pgSQL 専用で NoSQL の `op` 語彙からは到達しない）。Issue #2225・SQL-68 |
 | `23503` | `FOREIGN_KEY_VIOLATION` | 409 | Conflict | `FOREIGN KEY`（TABLE-17・TASK-205）を宣言したテーブルへの `insert`／`update` で参照先の値が同一テナント内に無い、または参照先の `update`／`delete` で参照元の行が残る |
 | `23505` | `UNIQUE_VIOLATION` | 409 | Conflict | 行 `id` の重複、`PRIMARY KEY`／UNIQUE 制約のテナント内一意性違反（`insert`／`update`）。行制約由来のため commit 済みの根拠にならない |
 | `23505` | `DUPLICATE_OPERATION_ID` | 409 | Conflict | 台帳照合で内容一致と判定された `operation_id` の再送（`insert`／`update`／`delete`。`wire_code` は `UNIQUE_VIOLATION` と共有し `code` で区別。commit 済み確定の根拠。Issue #1180） |
@@ -1209,7 +1213,7 @@ Date: <IMF-fixdate>
 | `55P03` | `LOCK_NOT_AVAILABLE` | 503 | Service Unavailable | SQL 表層の明示トランザクション（SQL-31・TASK-221）が単一ライタを保持している間に、書き込み op（`insert`／`update`／`delete`）が書き込みゲートの待機上限を超えた |
 | `57014` | `QUERY_CANCELED` | 503 | Service Unavailable | 実行中の文を協調的に打ち切った（クライアント切断の検出。Issue #1798）。SQL 表層の接続スレッドが起点で、現状 NoSQL の `op` からは到達しない |
 
-到達不能な 19 分類（`21000`・`42501`・`34000`・`P0002`・`42701`・`42P07`・`2BP01`・
+到達不能な 23 分類（`20000`・`2F005`・`P0003`・`21000`・`42501`・`34000`・`P0002`（`ROW_NOT_FOUND`・`NO_DATA_FOUND`）・`42701`・`42P07`・`2BP01`・
 `42809`・`42703`・`42804`・`42710`・`42723`・`42P13`・`25000`・`25001`・`25P01`・`25P02`・`55000`・`44000`）の理由: NoSQL 表層はテナントをセッション
 （`SessionPrincipal::policy_context()`）からのみ導出し、クライアント自己申告の
 `tenant_id` 相当値は JSON／ヘッダ／パスいずれの位置でも `42601` で先に拒否する

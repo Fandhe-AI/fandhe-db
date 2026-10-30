@@ -210,6 +210,15 @@
 //! `wire_server::recursive_cte_limits_opt::resolve` に一本化し、
 //! `EngineCore::with_recursive_cte_limits` へ 1 回だけ注入する（`docs/design/recursive-cte.md`）。
 //!
+//! `--max-plpgsql-statements <1-100000>`・`--max-plpgsql-loop-iterations <1-1000000>`・
+//! `--max-plpgsql-nesting-depth <1-32>`・`--max-plpgsql-body-bytes <1-65536>`・
+//! `--max-function-call-depth <1-32>`（Issue #2225。SQL-68）: PL/pgSQL の文数・ループ反復数・
+//! 入れ子の深さ・本体バイト数・関数呼び出しの深さの上限を、プロセス全体に対して起動時に**下げる方向
+//! だけ**設定できる opt-in 注入点（未指定は現行のハード上限と同値＝挙動不変）。文数・反復の超過は
+//! `54000`、入れ子・呼び出し深さの超過は `54001`。範囲外・非数値・値欠落・重複指定はいずれも
+//! fail-closed で起動エラー。値の解決は `wire_server::plpgsql_limits_opt::resolve` に一本化し、
+//! `EngineCore::with_plpgsql_limits` へ 1 回だけ注入する（`docs/design/plpgsql-subset.md`）。
+//!
 //! `--max-result-rows`（Issue #1555・#2211。SQL-34・SQL-46）: 明示 `LIMIT` の範囲上限と `LIMIT` 省略時の結果行数上限
 //! （`1`〜`100000`・既定 10000）を、プロセス全体に対して起動時に**上げ下げ両方向**へ設定できる
 //! opt-in 注入点（未指定は従来の 10000 と同値＝挙動不変）。走査・kNN の `LIMIT k`・`FETCH n`・
@@ -489,6 +498,7 @@ fn run_server(args: &[String]) -> ExitCode {
     let mut max_correlated_reevaluations_raw: Option<String> = None;
     let mut max_recursive_cte_iterations_raw: Option<String> = None;
     let mut max_recursive_cte_rows_raw: Option<String> = None;
+    let mut plpgsql_limits_raw: [Option<String>; 5] = Default::default();
     let mut max_result_rows_raw: Option<String> = None;
     let mut write_lock_wait_raw: Option<String> = None;
     let mut read_timeout_secs_raw: Option<String> = None;
@@ -1359,6 +1369,28 @@ fn run_server(args: &[String]) -> ExitCode {
                 max_recursive_cte_rows_raw = Some(v.clone());
                 i += 2;
             }
+            // Issue #2225: PL/pgSQL 実行上限の 5 フラグ（添字は `plpgsql_limits_opt::FLAGS`）。
+            flag if wire_server::plpgsql_limits_opt::flag_index(flag).is_some() => {
+                let Some(idx) = wire_server::plpgsql_limits_opt::flag_index(flag) else {
+                    return ExitCode::FAILURE;
+                };
+                let Some(v) = args.get(i + 1) else {
+                    engine::log_stderr!(
+                        "wire-server: {flag} requires a non-negative integer argument"
+                    );
+                    return ExitCode::FAILURE;
+                };
+                // 他の起動時構成フラグと同じく 2 回目以降の指定を fail-closed に拒否する。
+                let Some(slot) = plpgsql_limits_raw.get_mut(idx) else {
+                    return ExitCode::FAILURE;
+                };
+                if slot.is_some() {
+                    engine::log_stderr!("wire-server: {flag} specified more than once");
+                    return ExitCode::FAILURE;
+                }
+                *slot = Some(v.clone());
+                i += 2;
+            }
             wire_server::result_limits_opt::MAX_RESULT_ROWS_FLAG => {
                 let Some(v) = args.get(i + 1) else {
                     engine::log_stderr!(
@@ -2008,6 +2040,24 @@ fn run_server(args: &[String]) -> ExitCode {
         }
     };
 
+    // Issue #2225: PL/pgSQL の実行上限を bind・ユーザーストア読込より前に解決する（fail-closed）。
+    // 未指定は `PlpgsqlLimits::default()`＝ハード上限＝現行挙動。
+    let plpgsql_limits = match wire_server::plpgsql_limits_opt::resolve(
+        wire_server::plpgsql_limits_opt::PlpgsqlLimitsRawFlags {
+            max_statements: plpgsql_limits_raw.first().and_then(|v| v.as_deref()),
+            max_loop_iterations: plpgsql_limits_raw.get(1).and_then(|v| v.as_deref()),
+            max_nesting_depth: plpgsql_limits_raw.get(2).and_then(|v| v.as_deref()),
+            max_body_bytes: plpgsql_limits_raw.get(3).and_then(|v| v.as_deref()),
+            max_call_depth: plpgsql_limits_raw.get(4).and_then(|v| v.as_deref()),
+        },
+    ) {
+        Ok(limits) => limits,
+        Err(e) => {
+            engine::log_stderr!("wire-server: invalid PL/pgSQL limit configuration: {e}");
+            return ExitCode::FAILURE;
+        }
+    };
+
     // Issue #1555: 明示 `LIMIT` の範囲上限を bind・ユーザーストア読込より前に解決する
     // （fail-closed）。未指定は `ResultLimits::default()`＝従来の 10,000＝現行挙動。
     let result_limits =
@@ -2490,6 +2540,7 @@ fn run_server(args: &[String]) -> ExitCode {
     core = core.with_correlated_limits(correlated_limits);
     // Issue #1871: 未指定でも常に呼ぶ（既定はハード上限と同値で、未注入と挙動が同一）。
     core = core.with_recursive_cte_limits(recursive_cte_limits);
+    core = core.with_plpgsql_limits(plpgsql_limits);
     // Issue #1555: 未指定でも常に呼ぶ（既定は従来の 10,000 と同値で、未注入と挙動が同一）。
     core = core.with_result_limits(result_limits);
     // Issue #1664（TABLE-42）: MATERIALIZED VIEW の初回実体化の対象文脈は、認証構成（ユーザー
