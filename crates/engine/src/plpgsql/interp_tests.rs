@@ -640,6 +640,33 @@ fn execute_updates_row_count_but_not_found() {
 }
 
 #[test]
+fn query_for_over_empty_result_nulls_the_scalar_target() {
+    let src = "DECLARE v int := 99; BEGIN FOR v IN SELECT x FROM t LOOP NULL; END LOOP; \
+               RETURN v; END";
+    let mut host = ScriptedHost::default();
+    host.sql.push_back(rows(&[]));
+    assert_eq!(value(call_host(src, vec![int(0)], &mut host)), Cell::Null);
+}
+
+#[test]
+fn execute_into_keeps_the_full_row_count() {
+    let params = [("q", SqlColumnTypeName::Text)];
+    let src = "DECLARE v int; n int; BEGIN EXECUTE q INTO v; \
+               GET DIAGNOSTICS n = ROW_COUNT; RETURN n; END";
+    let mut host = ScriptedHost::default();
+    host.dynamic.push_back(rows(&[7, 8, 9]));
+    let r = run_with(
+        src,
+        &params,
+        vec![txt("SELECT x FROM t")],
+        spec(ReturnShape::Scalar, Some(ColumnType::Integer)),
+        &mut host,
+        PlpgsqlLimits::default(),
+    );
+    assert_eq!(ival(r), 3);
+}
+
+#[test]
 fn execute_with_null_query_is_22004() {
     let params = [("q", SqlColumnTypeName::Text)];
     let r = run_with(

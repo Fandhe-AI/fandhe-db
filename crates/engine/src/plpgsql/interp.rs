@@ -797,6 +797,10 @@ impl<'a> Interp<'a> {
         // 行は INSENSITIVE に実体化してから回す（ループ本体の書き込みを見ない）。
         let out = self.run_sql(query, RowDemand::All)?;
         let mut iterated = false;
+        if out.rows.is_empty() {
+            // 空結果でも対象変数は NULL に更新する（旧値を残さない）。
+            self.assign_row(targets, &out.columns, None)?;
+        }
         for row in &out.rows {
             self.budget.tick_iteration()?;
             iterated = true;
@@ -963,7 +967,11 @@ impl<'a> Interp<'a> {
             .host
             .exec_dynamic(&text, &args, demand, &mut *self.budget)?;
         match into {
-            Some(i) => self.apply_into(i, &out, out.dml, false)?,
+            Some(i) => {
+                self.apply_into(i, &out, out.dml, false)?;
+                // 動的 SQL の ROW_COUNT は直前の文の行数をそのまま保つ（先頭行代入とは独立）。
+                self.row_count = out.row_count;
+            }
             None => self.row_count = out.row_count,
         }
         Ok(Flow::Normal)
