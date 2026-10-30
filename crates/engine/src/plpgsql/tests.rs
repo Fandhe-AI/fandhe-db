@@ -51,6 +51,12 @@ fn code_with(src: &str, o: &ParseOptions) -> &'static str {
     }
 }
 
+fn code_result(src: &str) -> Result<(), &'static str> {
+    parse_body(src, &opts())
+        .map(|_| ())
+        .map_err(|e| e.wire_code())
+}
+
 fn code(src: &str) -> &'static str {
     code_with(src, &opts())
 }
@@ -932,19 +938,33 @@ fn reserved_names_are_rejected_at_declaration() {
         "window",
         "variadic",
     ] {
-        for decl in [name.to_string(), format!("\"{name}\"")] {
-            assert_eq!(
-                code(&format!("DECLARE {decl} int; BEGIN NULL; END")),
-                "0A000",
-                "for {decl}"
-            );
-        }
+        // 引用なしは拒否。引用付きは SQL 字句解析が専用トークンにする語（`true` 等）だけ拒否する。
+        assert_eq!(
+            code(&format!("DECLARE {name} int; BEGIN NULL; END")),
+            "0A000",
+            "for {name}"
+        );
+        let special = [
+            "true",
+            "false",
+            "default",
+            "array",
+            "current_date",
+            "current_timestamp",
+        ];
+        let quoted = code_result(&format!("DECLARE \"{name}\" int; BEGIN NULL; END"));
+        assert_eq!(quoted.is_err(), special.contains(&name), "quoted {name}");
     }
     // ループ変数・パラメータ名も同じ。ラベルは修飾子としてだけ使うので対象外。
     assert_eq!(
-        code("BEGIN FOR \"table\" IN 1..3 LOOP NULL; END LOOP; END"),
+        code("BEGIN FOR \"true\" IN 1..3 LOOP NULL; END LOOP; END"),
         "0A000"
     );
+    assert_eq!(
+        code("BEGIN FOR table IN 1..3 LOOP NULL; END LOOP; END"),
+        "0A000"
+    );
+    ok("BEGIN FOR \"table\" IN 1..3 LOOP NULL; END LOOP; END");
     ok("<<values>> BEGIN NULL; END");
     let o = ParseOptions::new(
         vec![ParamDecl {
@@ -955,9 +975,9 @@ fn reserved_names_are_rejected_at_declaration() {
     );
     assert_eq!(code_with("BEGIN RETURN 1; END", &o), "0A000");
     // エラー文言は名前を含めない。
-    let e = parse_body("DECLARE \"user\" int; BEGIN NULL; END", &opts()).expect_err("reject");
+    let e = parse_body("DECLARE \"default\" int; BEGIN NULL; END", &opts()).expect_err("reject");
     assert!(
-        !e.to_string().to_lowercase().contains("user"),
+        !e.to_string().to_lowercase().contains("default"),
         "leaked: {e}"
     );
 }
@@ -1599,4 +1619,52 @@ fn into_after_insert_word_follows_postgresql_make_execsql_stmt() {
         code("BEGIN MERGE INTO t USING u ON true WHEN MATCHED THEN DELETE; END"),
         "0A000"
     );
+}
+
+#[test]
+fn quoted_reserved_words_can_name_variables_and_are_referenced_quoted() {
+    // PostgreSQL 17: 二重引用付きの語は core スキャナが `IDENT` を返し、`plpgsql_yylex` は引用付きの語を
+    // 未予約キーワード表と照合せず `T_WORD` にする（`!word.quoted` の条件）。`decl_varname : T_WORD` なので
+    // `DECLARE "begin" int;` は宣言でき、引用付きで参照できる。引用なしの `begin` は予約語（文の開始語・
+    // SQL の Keyword）のため変数として参照できない。
+    let b = classified(
+        "DECLARE \"begin\" int := 1; \"loop\" int; \"user\" int; \"table\" int; BEGIN \
+         \"begin\" := \"loop\" + 1; \
+         PERFORM q FROM t WHERE q = \"loop\"; \
+         PERFORM \"user\"; \
+         PERFORM q FROM t LIMIT \"table\"; END",
+    );
+    let begin = vid(&b, "begin");
+    let loop_ = vid(&b, "loop");
+    let Some(Stmt::Assign { target, expr }) = b.block.stmts.first() else {
+        panic!("assign");
+    };
+    assert_eq!(*target, AssignTarget::Var(begin));
+    assert_eq!(expr.var_refs.len(), 1);
+    assert_eq!(expr.var_refs[0].var, VarRef::Var(loop_));
+    assert_eq!(first_sql_refs_at(&b, 1), 1);
+    assert_eq!(first_sql_refs_at(&b, 2), 1);
+    assert_eq!(first_sql_refs_at(&b, 3), 1);
+    // SQL 字句解析が Keyword 化する語（`by`・`limit` 等）は引用付きでも字句解析が拒否し、引用付きで参照
+    // できないため、宣言時に 0A000（fail-closed）。
+    for w in ["by", "limit", "select", "from", "where", "and", "order"] {
+        assert_eq!(
+            code(&format!("DECLARE \"{w}\" int; BEGIN NULL; END")),
+            "0A000",
+            "for {w}"
+        );
+    }
+    // 引用なしの予約語は変数名にも参照にもならない（PostgreSQL と同じくエラー）。
+    assert_eq!(code("DECLARE begin int; BEGIN NULL; END"), "42601");
+    assert_eq!(code("DECLARE \"x\" int; BEGIN begin := 1; END"), "42601");
+    // 既知の差: 埋め込み SQL 内の引用なしの `loop` は SQL 字句解析が `Ident` にし、引用の有無を保持しない
+    // ため、引用付きで宣言した `"loop"` と同じ名前として変数に束縛される（PostgreSQL は構文エラー）。
+    // 黙って別の値を読む経路ではなく、PL/pgSQL の文頭の語（上の `begin := 1`）は PostgreSQL と同じく拒否する。
+}
+
+fn first_sql_refs_at(b: &Body, i: usize) -> usize {
+    match b.block.stmts.get(i) {
+        Some(Stmt::Sql(q)) | Some(Stmt::Perform(q)) => q.var_refs.len(),
+        other => panic!("not sql: {other:?}"),
+    }
 }

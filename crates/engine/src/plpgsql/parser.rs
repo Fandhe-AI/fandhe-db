@@ -125,9 +125,32 @@ pub(super) const SQL_RESERVED: &[&str] = &[
     "with",
 ];
 
-/// 名前が [`SQL_RESERVED`] に含まれるなら `0A000`（エラー文言に名前は含めない）。
-fn check_reserved_name(name: &str) -> Result<(), SqlSurfaceError> {
-    if SQL_RESERVED.iter().any(|w| w.eq_ignore_ascii_case(name)) {
+/// 二重引用符付きでも専用トークン（`QuotedBoolWord`・`QuotedNull`）になり、変数参照として分類できない語
+/// （SQL 字句解析が引用付きの `true`・`false`・`null`・`array`・`default`・SQL 値関数予約語を区別して
+/// 印付けする）。引用付きの宣言でも拒否する（fail-closed）。
+fn is_lexer_special_word(name: &str) -> bool {
+    ["true", "false", "null", "array", "default"]
+        .iter()
+        .any(|w| name.eq_ignore_ascii_case(w))
+        || crate::sql::lexer::is_value_function_keyword(name)
+}
+
+/// 宣言できない名前なら `0A000`（エラー文言に名前は含めない）。引用なしでは [`SQL_RESERVED`] の全語、
+/// 引用付きでは [`is_lexer_special_word`] だけを拒否する。PostgreSQL は引用付きの語を未予約キーワード表と
+/// 照合せず `T_WORD`（`pl_scanner.c` の `!word.quoted`）にするので、`DECLARE "limit" int;` は宣言でき、
+/// 引用付きで参照できる（SQL 字句解析も引用付きの語は `Ident` にして列参照として記録する）。
+/// 引数名は引用の有無が分からないため、引用なし相当（全語）で検査する。
+fn check_reserved_name(name: &str, quoted: bool) -> Result<(), SqlSurfaceError> {
+    let reject = if quoted {
+        // SQL 字句解析が `Token::Keyword` 化する語は、引用付きでも字句解析が拒否する（引用付きで参照できない）。
+        is_lexer_special_word(name)
+            || SQL_KEYWORD_NAMES
+                .iter()
+                .any(|w| w.eq_ignore_ascii_case(name))
+    } else {
+        SQL_RESERVED.iter().any(|w| w.eq_ignore_ascii_case(name))
+    };
+    if reject {
         return Err(oos_err(
             "this name cannot be used for a PL/pgSQL variable or parameter",
         ));
@@ -351,7 +374,12 @@ impl<'a> Parser<'a> {
 
     /// 名前（変数・ラベル）を 1 個読む。小文字へ正規化する。未引用の予約語は拒否する。
     fn take_name(&mut self) -> Result<String, SqlSurfaceError> {
-        let name = match self.kind(0) {
+        self.take_name_q().map(|(n, _)| n)
+    }
+
+    /// [`Self::take_name`] と同じで、二重引用符付きだったかも返す。
+    fn take_name_q(&mut self) -> Result<(String, bool), SqlSurfaceError> {
+        let (name, quoted) = match self.kind(0) {
             Some(TokKind::Word(w)) => {
                 let l = w.to_ascii_lowercase();
                 // SQL 側で `Token::Keyword` 化される語（limit/order/by 等）と同名の変数は式中で参照を
@@ -359,24 +387,30 @@ impl<'a> Parser<'a> {
                 if RESERVED.contains(&l.as_str()) || SQL_KEYWORD_NAMES.contains(&l.as_str()) {
                     return Err(syn_err("reserved word used as a PL/pgSQL name"));
                 }
-                l
+                (l, false)
             }
-            Some(TokKind::Quoted(q)) => q.to_ascii_lowercase(),
+            Some(TokKind::Quoted(q)) => (q.to_ascii_lowercase(), true),
             _ => return Err(syn_err("expected a name in PL/pgSQL body")),
         };
         self.pos = self.pos.saturating_add(1);
-        Ok(name)
+        Ok((name, quoted))
     }
 
     /// `name [. name]` を読む。
     fn take_dotted(&mut self) -> Result<(Option<String>, String), SqlSurfaceError> {
-        let first = self.take_name()?;
+        self.take_dotted_q().map(|(q, n, _)| (q, n))
+    }
+
+    /// [`Self::take_dotted`] と同じで、最後の名前が引用付きだったかも返す。
+    #[allow(clippy::type_complexity)]
+    fn take_dotted_q(&mut self) -> Result<(Option<String>, String, bool), SqlSurfaceError> {
+        let first = self.take_name_q()?;
         if self.is_punct(0, '.') {
             self.pos = self.pos.saturating_add(1);
-            let second = self.take_name()?;
-            Ok((Some(first), second))
+            let second = self.take_name_q()?;
+            Ok((Some(first.0), second.0, second.1))
         } else {
-            Ok((None, first))
+            Ok((None, first.0, first.1))
         }
     }
 
@@ -477,7 +511,7 @@ impl<'a> Parser<'a> {
                 scope_depth: 0,
             });
             if !name.is_empty() {
-                check_reserved_name(&name)?;
+                check_reserved_name(&name, false)?;
                 scope.names.insert(name, id);
             }
         }
@@ -497,6 +531,8 @@ impl<'a> Parser<'a> {
         Ok(())
     }
 
+    // 宣言の属性（型・定数・NOT NULL・既定値・引用の有無）を 1 か所で受けるため引数が多い。
+    #[allow(clippy::too_many_arguments)]
     fn declare(
         &mut self,
         name: String,
@@ -505,8 +541,9 @@ impl<'a> Parser<'a> {
         constant: bool,
         not_null: bool,
         default: Option<SqlExpr>,
+        quoted: bool,
     ) -> Result<VarId, SqlSurfaceError> {
-        check_reserved_name(&name)?;
+        check_reserved_name(&name, quoted)?;
         let id = VarId(
             u32::try_from(self.vars.len())
                 .map_err(|_| too_big_err("too many PL/pgSQL variables"))?,
@@ -779,7 +816,7 @@ impl<'a> Parser<'a> {
     }
 
     fn parse_decl(&mut self) -> Result<VarId, SqlSurfaceError> {
-        let name = self.take_name()?;
+        let (name, name_quoted) = self.take_name_q()?;
         if self.is_kw(0, "ALIAS") {
             return Err(oos_err("ALIAS declarations are not supported in PL/pgSQL"));
         }
@@ -819,7 +856,15 @@ impl<'a> Parser<'a> {
         if self.declared_in_current_scope(&name) {
             return Err(syn_err("duplicate PL/pgSQL variable declaration"));
         }
-        self.declare(name, VarKind::Local, ty, constant, not_null, default)
+        self.declare(
+            name,
+            VarKind::Local,
+            ty,
+            constant,
+            not_null,
+            default,
+            name_quoted,
+        )
     }
 
     fn parse_decl_type(&self, ts: usize, te: usize) -> Result<DeclType, SqlSurfaceError> {
@@ -1091,8 +1136,13 @@ impl<'a> Parser<'a> {
 
     fn parse_for(&mut self, label: Option<String>) -> Result<Stmt, SqlSurfaceError> {
         let mut raw_targets: Vec<(Option<String>, String)> = Vec::new();
+        let mut first_quoted = false;
         loop {
-            raw_targets.push(self.take_dotted()?);
+            let (q, n, quoted) = self.take_dotted_q()?;
+            if raw_targets.is_empty() {
+                first_quoted = quoted;
+            }
+            raw_targets.push((q, n));
             if self.is_punct(0, ',') {
                 self.pos = self.pos.saturating_add(1);
             } else {
@@ -1110,8 +1160,12 @@ impl<'a> Parser<'a> {
                 || matches!(k, TokKind::Word(w) if w.eq_ignore_ascii_case("LOOP"))
         })?;
         match self.toks.get(e).map(|t| &t.kind) {
-            Some(TokKind::DotDot) => self.parse_for_int(label, raw_targets, reverse, a, e),
-            Some(TokKind::Word(_)) => self.parse_for_query(label, raw_targets, reverse, a, e),
+            Some(TokKind::DotDot) => {
+                self.parse_for_int(label, raw_targets, first_quoted, reverse, a, e)
+            }
+            Some(TokKind::Word(_)) => {
+                self.parse_for_query(label, raw_targets, first_quoted, reverse, a, e)
+            }
             _ => Err(syn_err("malformed PL/pgSQL FOR loop")),
         }
     }
@@ -1120,6 +1174,7 @@ impl<'a> Parser<'a> {
         &mut self,
         label: Option<String>,
         raw_targets: Vec<(Option<String>, String)>,
+        name_quoted: bool,
         reverse: bool,
         a: usize,
         e: usize,
@@ -1149,6 +1204,7 @@ impl<'a> Parser<'a> {
             false,
             false,
             None,
+            name_quoted,
         )?;
         let body = self.loop_body(&label)?;
         self.scopes.pop();
@@ -1168,6 +1224,7 @@ impl<'a> Parser<'a> {
         &mut self,
         label: Option<String>,
         raw_targets: Vec<(Option<String>, String)>,
+        name_quoted: bool,
         reverse: bool,
         a: usize,
         e: usize,
@@ -1209,6 +1266,7 @@ impl<'a> Parser<'a> {
                     false,
                     false,
                     None,
+                    name_quoted,
                 )?),
                 _ => self.resolve_target(q.as_deref(), n)?,
             };
