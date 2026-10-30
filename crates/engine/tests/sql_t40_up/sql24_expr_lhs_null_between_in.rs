@@ -287,3 +287,21 @@ fn tenant_boundary_is_preserved() {
         );
     }
 }
+
+/// 括弧付きの左辺（`(式) IS NULL` 等）も同じ述語として受理し、本物の論理グループは従来どおり。
+#[test]
+fn parenthesized_expression_lhs() {
+    let (core, _g) = setup("sql24-paren");
+    assert_eq!(ids(&core, "(a + 1) IS NULL"), vec![3]);
+    assert_eq!(ids(&core, "(a + 1) IS NOT NULL"), vec![1, 2, 4, 5]);
+    assert_eq!(ids(&core, "(a + 0) BETWEEN 1 AND 2"), vec![1, 2]);
+    assert_eq!(ids(&core, "(a + 0) NOT BETWEEN 1 AND 2"), vec![4, 5]);
+    assert_eq!(ids(&core, "(a + 0) IN (1, 5)"), vec![1, 4]);
+    assert_eq!(ids(&core, "(a + 0) NOT IN (1, 5)"), vec![2, 5]);
+    assert_eq!(ids(&core, "NOT (a + 0) IN (1, 5)"), vec![2, 5]);
+    assert_eq!(ids(&core, "NOT (a + 1) IS NULL"), vec![1, 2, 4, 5]);
+    assert_eq!(ids(&core, "(a + 1) IS NULL OR (a + 0) IN (1)"), vec![1, 3]);
+    // 論理グループは従来どおり。
+    assert_eq!(ids(&core, "(a = 1 OR a = 2) AND b IS NOT NULL"), vec![1]);
+    assert_eq!(ids(&core, "NOT (a = 1 OR a = 2)"), vec![4, 5]);
+}

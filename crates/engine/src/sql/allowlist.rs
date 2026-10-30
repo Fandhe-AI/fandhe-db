@@ -9005,7 +9005,8 @@ impl<'a> Parser<'a> {
                 let is_value_group = matches!(
                     self.tokens.get(close_idx + 1),
                     Some(token) if is_where_group_operator_token(token)
-                ) || self.like_follows_group(close_idx);
+                ) || self.like_follows_group(close_idx)
+                    || self.postfix_follows_group(close_idx);
                 if !is_value_group {
                     let next_depth = depth
                         .checked_add(1)
@@ -9033,7 +9034,8 @@ impl<'a> Parser<'a> {
             let is_value_group = matches!(
                 self.tokens.get(close_idx + 1),
                 Some(token) if is_where_group_operator_token(token)
-            ) || self.like_follows_group(close_idx);
+            ) || self.like_follows_group(close_idx)
+                || self.postfix_follows_group(close_idx);
             if !is_value_group {
                 let next_depth = depth
                     .checked_add(1)
@@ -9052,6 +9054,16 @@ impl<'a> Parser<'a> {
             // （`parse_primary_expr` が '(' expr ')' を再帰的に処理する）。
         }
         self.parse_where_leaf(extra_close_paren, set_operators, leaf_count)
+    }
+
+    /// 閉じ括弧 `close_idx` の直後が式左辺の後置語（`IS [NOT] NULL`・`[NOT] BETWEEN`・`[NOT] IN (`）か。
+    /// 真なら括弧は論理グループではなく値式（`(a + 1) IS NULL` 等）で、式述語へ委譲する。
+    /// CHECK 本体では後置語を受理しないため常に偽（従来どおり）。
+    fn postfix_follows_group(&self, close_idx: usize) -> bool {
+        !self.in_check_body
+            && close_idx
+                .checked_add(1)
+                .is_some_and(|i| self.expr_lhs_postfix_at(i).is_some())
     }
 
     /// `(` の位置（`open_idx`）に対応する `)` のトークン位置を探す。`get()` のみを
