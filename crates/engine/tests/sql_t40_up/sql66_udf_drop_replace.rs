@@ -470,13 +470,15 @@ fn replace_rejects_cycles_and_leaves_state_unchanged() {
         ok(&core, "alice", &mut a, "CREATE FUNCTION g(x) AS x + 1");
         ok(&core, "alice", &mut a, "CREATE FUNCTION dbl(x) AS g(x) * 2");
         // 自己参照
-        assert!(run(
-            &core,
-            "alice",
-            &mut a,
-            "CREATE OR REPLACE FUNCTION dbl(x) AS dbl(x)"
-        )
-        .is_err());
+        assert_eq!(
+            code(
+                &core,
+                "alice",
+                &mut a,
+                "CREATE OR REPLACE FUNCTION dbl(x) AS dbl(x)"
+            ),
+            "0A000"
+        );
         // 相互参照: g が dbl（= g を呼ぶ）を呼ぶ
         assert_eq!(
             code(
@@ -494,6 +496,17 @@ fn replace_rejects_cycles_and_leaves_state_unchanged() {
     assert!(call(&core, "alice", &mut s, CALL_DBL).contains("12"));
     // 非 DDL セッションでも同じ。
     let mut n = SessionState::default();
+    // 本体が自身だけを呼ぶ関数の自己再帰置換も 0A000（未定義関数 42883 にならない）。
+    ok(&core, "alice", &mut n, "CREATE FUNCTION selfref(x) AS x");
+    assert_eq!(
+        code(
+            &core,
+            "alice",
+            &mut n,
+            "CREATE OR REPLACE FUNCTION selfref(x) AS selfref(x)"
+        ),
+        "0A000"
+    );
     ok(&core, "alice", &mut n, "CREATE FUNCTION a1(x) AS x");
     ok(&core, "alice", &mut n, "CREATE FUNCTION b1(x) AS a1(x)");
     assert_eq!(

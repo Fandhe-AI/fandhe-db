@@ -2723,16 +2723,18 @@ pub(crate) fn prepare_function_replacement(
     if !allow_catalog_origin && registry.is_catalog_origin(&lower) {
         return Err(SqlSurfaceError::InsufficientPrivilege);
     }
-    let mut probe = registry.clone();
-    probe.remove(&lower);
-    let prepared =
-        prepare_function_with_signature(&probe, name, params, param_types, return_type, body)?;
+    // 循環検査は本体の名前解決より先に行う（自己再帰は probe から自身を除くため後段では 42883 に
+    // なり、契約の 0A000 とずれる）。元のレジストリと新しい本体で判定する。
     let mut visited = std::collections::BTreeSet::new();
-    if expr_reaches_function(&prepared.body, &lower, registry, &mut visited) {
+    if expr_reaches_function(body, &lower, registry, &mut visited) {
         return Err(SqlSurfaceError::feature_not_supported(
             "recursive function definitions are not supported",
         ));
     }
+    let mut probe = registry.clone();
+    probe.remove(&lower);
+    let prepared =
+        prepare_function_with_signature(&probe, name, params, param_types, return_type, body)?;
     Ok(prepared)
 }
 
