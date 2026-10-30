@@ -1573,3 +1573,30 @@ fn argument_mode_words_can_name_variables() {
     let b = classified("DECLARE local int; BEGIN PERFORM now() AT TIME ZONE 'UTC'; END");
     assert_eq!(first_sql_refs(&b), 0);
 }
+
+#[test]
+fn into_after_insert_word_follows_postgresql_make_execsql_stmt() {
+    // PostgreSQL 17 `make_execsql_stmt`（pl_gram.y）は、深さを問わず `K_INTO` の直前が `K_INSERT` なら
+    // 「INSERT INTO」とみなして代入先として切り出さない（`MERGE INTO`・先頭が `IMPORT` の `INTO` も同様）。
+    // 引用なしの `insert` は文脈によらず `K_INSERT` なので、列名の `insert` の直後の `INTO` も同じ扱いで、
+    // 切り出さない（本実装の `split_into` と一致）。引用付きの `"insert"` は識別子なので代入先として切り出す。
+    let into_of = |src: &str| {
+        let b = ok(&format!("DECLARE n int; BEGIN {src}; END"));
+        match b.block.stmts.first() {
+            Some(Stmt::Sql(q)) => q.into.is_some(),
+            other => panic!("not sql: {other:?}"),
+        }
+    };
+    assert!(!into_of("SELECT insert INTO n FROM t"));
+    assert!(!into_of("SELECT x AS insert INTO n FROM t"));
+    assert!(into_of("SELECT \"insert\" INTO n FROM t"));
+    assert!(into_of("SELECT x AS \"insert\" INTO n FROM t"));
+    // 通常の `INSERT INTO`（切り出さない）と `RETURNING ... INTO`（切り出す）。
+    assert!(!into_of("INSERT INTO t(x) VALUES (1)"));
+    assert!(into_of("INSERT INTO t(x) VALUES (1) RETURNING x INTO n"));
+    // MERGE・IMPORT は本実装では範囲外（0A000）。
+    assert_eq!(
+        code("BEGIN MERGE INTO t USING u ON true WHEN MATCHED THEN DELETE; END"),
+        "0A000"
+    );
+}
