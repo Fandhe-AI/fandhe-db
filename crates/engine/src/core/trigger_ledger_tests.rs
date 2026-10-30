@@ -864,7 +864,8 @@ fn kill_child(path: &str) {
     use std::io::Write as _;
     let (core, _calls) = build(Path::new(path), false, effects(None));
     let a = ctx("tenant-a");
-    for n in 1..=5_000u64 {
+    // 上限を置かず親の SIGKILL まで書き続ける（完走後の待機中に kill される空振り合格を防ぐ）。
+    for n in 1..=u64::MAX {
         let sql = format!(
             "INSERT INTO trg (id, embedding, a, n) VALUES ({n}, '[1.0,0.0]', 'x', 1) \
              USING OPERATION_ID 'trg-{n}'"
@@ -875,10 +876,8 @@ fn kill_child(path: &str) {
         println!("COMMITTED op=trg-{n}");
         let _ = std::io::stdout().flush();
     }
-    // 完走しても自然終了せず、親の SIGKILL を待つ（正常終了による空振り合格を防ぐ）。
-    loop {
-        std::thread::sleep(std::time::Duration::from_secs(1));
-    }
+    // 到達不能（u64 を使い切るまで書き続ける）。万一到達したら親が検知できるよう異常終了する。
+    std::process::exit(3);
 }
 
 // SIGKILL による中断。何件目で止まっても、再オープン後は行・監査行・台帳が整合し、確認済みの commit は
@@ -932,7 +931,7 @@ fn sigkill_during_trigger_writes_keeps_ledger_rows_and_side_effects_consistent()
             });
         // 固定の待機の後に kill する（round ごとに待機を変えて中断位置をずらす）。
         std::thread::sleep(std::time::Duration::from_millis(100 + 150 * round));
-        // kill 前に子が自然終了していたら（5,000 件を完走した等）空振りの合格になるため fail-closed。
+        // kill 前に子が自然終了していたら（子が書き込みを続けられず終了した等）空振りの合格になるため fail-closed。
         assert!(
             child.try_wait().expect("try_wait").is_none(),
             "round {round}: child exited before being killed"
