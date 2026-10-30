@@ -89,6 +89,7 @@ mod sql62_cte_column_list;
 mod sql62_cte_join_input;
 mod sql62_cte_materialization_path;
 mod sql62_cte_materialized;
+mod sql62_cte_single_table_huge_row_id;
 mod sql62_derived_table_exec;
 mod sql62_derived_table_join;
 mod sql62_derived_table_syntax;
