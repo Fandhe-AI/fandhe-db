@@ -135,6 +135,9 @@ cargo run -p fandhe-db-wire-server -- --users <ユーザーストアのパス> -
   [--max-join-relations <2-8>] [--max-join-input-rows <1-100000>] [--max-join-output-rows <1-100000>] \
   [--max-correlated-reevaluations <1-100000>] \
   [--max-recursive-cte-iterations <1-1000>] [--max-recursive-cte-rows <1-100000>] \
+  [--max-plpgsql-statements <1-100000>] [--max-plpgsql-loop-iterations <1-1000000>] \
+  [--max-plpgsql-nesting-depth <1-32>] [--max-plpgsql-body-bytes <1-65536>] \
+  [--max-function-call-depth <1-32>] [--max-trigger-depth <1-16>] \
   [--max-result-rows <1-100000>] \
   [--write-lock-wait-ms <100-60000>] \
   [--read-timeout-secs <1-600>] [--max-connections <1-256>] [--max-prepared-statements <1-1024>] \
@@ -479,6 +482,21 @@ CTE 連鎖の深さの上限を、プロセス全体に対して起動時に**�
 同じ値で、挙動は変わりません）。累積行数は `--max-result-rows` との小さい方が実効上限です。超過時の SQLSTATE は
 `54000` です。範囲外・非数値・値欠落・2 回目以降の重複指定は fail-closed で起動エラーです（詳細:
 [docs/design/recursive-cte.md](docs/design/recursive-cte.md)）。
+
+`--max-plpgsql-statements <N>`（既定 100,000）・`--max-plpgsql-loop-iterations <N>`（既定 1,000,000）・
+`--max-plpgsql-nesting-depth <N>`（既定 32）・`--max-plpgsql-body-bytes <N>`（既定 65,536）・
+`--max-function-call-depth <N>`（既定 32）（Issue #2225・SQL-68）は、PL/pgSQL 関数の 1 回の起動あたりの実行文数・
+ループ反復数（入れ子の呼び出しを合算）、ブロックの入れ子の深さ、本体のバイト数、関数呼び出しの深さの上限を、
+プロセス全体に対して起動時に**下げる方向だけ**設定します（未指定は現行のハード上限と同じ値で、挙動は変わりません）。
+超過時の SQLSTATE は文数・反復・本体長が `54000`、入れ子・呼び出し深さが `54001` で、部分結果は返しません。
+範囲外・非数値・値欠落・2 回目以降の重複指定は fail-closed で起動エラーです（詳細:
+[docs/design/plpgsql-subset.md](docs/design/plpgsql-subset.md) の「Issue #2225 追記」節）。
+
+`--max-trigger-depth <N>`（既定 16）（Issue #1727・TABLE-45）は、トリガの入れ子（再帰）の深さの上限を、
+プロセス全体に対して起動時に**下げる方向だけ**設定します（外側の文が直接発火したトリガ呼び出しが深さ 1。
+未指定は既定のハード上限 16）。超過時は SQLSTATE `54001` で文全体を拒否し、部分結果は残しません。
+範囲外・非数値・値欠落・2 回目以降の重複指定は fail-closed で起動エラーです（詳細:
+[docs/design/trigger-depth-limit-cli.md](docs/design/trigger-depth-limit-cli.md)）。
 
 `--max-result-rows <N>`（既定 10,000・範囲 `1`〜`100,000`）（Issue #1555・SQL-34／SQL-46）は、明示 `LIMIT` の
 範囲上限（従来のコンパイル時定数 10,000）を、プロセス全体に対して起動時に**上げ下げ両方向**へ設定します

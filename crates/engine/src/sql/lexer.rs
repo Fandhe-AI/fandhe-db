@@ -363,7 +363,7 @@ pub(crate) fn requote_legacy_value_function_columns(tokens: &mut [Token]) {
 /// 未引用が真偽リテラルを意味する形式）は戻さない。`= true` のような値位置は対象外。
 /// 呼び出し元は `sql::view`（参照時）・カタログのビュー本文検査・作成時の自己検証。
 pub(crate) fn tokenize_stored_view_body(input: &str) -> Result<Vec<Token>, LexError> {
-    let mut tokens = tokenize_impl(input, false, false, true)?;
+    let mut tokens = tokenize_impl(input, false, false, true, None)?;
     requote_legacy_value_function_columns(&mut tokens);
     if input.starts_with(STORED_BODY_BOOL_LITERAL_MARKER) {
         return Ok(tokens);
@@ -474,14 +474,14 @@ pub(crate) fn quoted_bool_word_in_leaf_position(tokens: &[Token], i: usize) -> b
 /// のみが受理する。両者は [`tokenize_impl`] を共有し、この関数の既存の受理・拒否
 /// 契約は一切変えない）。
 pub fn tokenize(input: &str) -> Result<Vec<Token>, LexError> {
-    tokenize_impl(input, false, false, false)
+    tokenize_impl(input, false, false, false, None)
 }
 
 /// 本実装自身が描画した SQL（[`render_tokens`]・ビュー本文の正規化描画）の再字句解析。
 /// [`tokenize`] と同一だが、SCHEMA 配下の内部キーの引用形（`"#<id>.<name>"`）を受理する
 /// （利用者入力には使わない。Issue #1717）。
 pub(crate) fn tokenize_rendered(input: &str) -> Result<Vec<Token>, LexError> {
-    tokenize_impl(input, false, false, true)
+    tokenize_impl(input, false, false, true, None)
 }
 
 /// 括弧なし SQL 値関数の予約語か（大小無視。SQL-37・Issue #1586。引用付きの同名識別子を
@@ -504,7 +504,7 @@ pub(crate) fn is_value_function_keyword(s: &str) -> bool {
 /// 返したトークン列を許可リストの `Parser` 以外へ渡す場合は [`demote_quoted_null`] で
 /// `Ident` へ戻す（識別子位置では従来どおり `Ident` として扱うため）。
 pub fn tokenize_marked(input: &str) -> Result<Vec<Token>, LexError> {
-    tokenize_impl(input, false, true, false)
+    tokenize_impl(input, false, true, false, None)
 }
 
 /// 引用付き `NULL` の [`Token::QuotedNull`] を `Token::Ident` へ戻す（引用情報を捨てる。
@@ -531,7 +531,28 @@ pub fn demote_quoted_null(tokens: Vec<Token>) -> Vec<Token> {
 /// プロトコル・許可リスト構造検証（`sql::allowlist`）は引き続き [`tokenize`]
 /// （`$` を拒否する既定の字句解析）を使う。
 pub fn tokenize_with_params(input: &str) -> Result<Vec<Token>, LexError> {
-    tokenize_impl(input, true, true, false)
+    tokenize_impl(input, true, true, false, None)
+}
+
+/// [`tokenize_with_params`] と同一の字句解析に、各トークンが二重引用符付き識別子から作られたかを
+/// 示す並走配列（`tokens` と同じ長さ）を添えて返す（Issue #2224。`plpgsql::embedded` 用）。
+///
+/// 引用付き識別子は引用符なしでも 1 個の [`Token::Ident`] になる語は `Ident` に潰れるため
+/// （`"into"` と `into` が同じ `Ident("into")`）、句のキーワードと列名・別名を `Token` だけでは
+/// 区別できない。PL/pgSQL 層はこの配列で「引用付きは常に識別子」として扱う。`Token` の定義と
+/// 既存の字句解析の結果は変えない（既存の呼び出し元は影響を受けない）。
+pub(crate) fn tokenize_with_params_quoted(
+    input: &str,
+) -> Result<(Vec<Token>, Vec<bool>), LexError> {
+    let mut quoted_at: Vec<usize> = Vec::new();
+    let tokens = tokenize_impl(input, true, true, false, Some(&mut quoted_at))?;
+    let mut quoted = vec![false; tokens.len()];
+    for i in quoted_at {
+        if let Some(q) = quoted.get_mut(i) {
+            *q = true;
+        }
+    }
+    Ok((tokens, quoted))
 }
 
 /// [`tokenize`]／[`tokenize_with_params`] が共有する走査本体。`allow_params` が
@@ -542,6 +563,7 @@ fn tokenize_impl(
     allow_params: bool,
     mark_quoted_null: bool,
     allow_internal_keys: bool,
+    mut quoted_out: Option<&mut Vec<usize>>,
 ) -> Result<Vec<Token>, LexError> {
     if input.len() > MAX_INPUT_LEN {
         return Err(LexError {
@@ -715,6 +737,10 @@ fn tokenize_impl(
         // 二重引用符識別子（Issue #1346）。中身は引用符なしでも 1 個の `Ident` に
         // なる語に限る（モジュールドキュメント参照）。それ以外は fail-closed に拒否。
         if c == '"' {
+            // この分岐は成功時にちょうど 1 トークンを積む。積む前の位置を並走配列用に記録する。
+            if let Some(q) = quoted_out.as_deref_mut() {
+                q.push(tokens.len());
+            }
             let Some(end) = quoted_identifier_end(input, offset) else {
                 return Err(LexError {
                     message: "unterminated quoted identifier".to_string(),
@@ -1100,7 +1126,11 @@ fn advance_to(chars: &mut std::iter::Peekable<std::str::CharIndices<'_>>, byte_o
 /// `'...'` 文字列リテラルを読む。`''` を単一の `'` へのエスケープとして扱う。
 /// 閉じ引用符が見つからない場合は `Err`。リテラルの内容自体の意味論的妥当性は
 /// 検証しない（本レイヤは文字列として正しく閉じているかのみを構造的に見る）。
-fn lex_string_literal(input: &str, start: usize) -> Result<(String, usize), LexError> {
+///
+/// `pub(crate)`: `plpgsql::lexer`（Issue #2224）が PL/pgSQL 本体の走査で文字列の区切りを
+/// SQL 字句解析器と一致させるために再利用する（`''` のみがエスケープで、バックスラッシュは
+/// エスケープではない。独自実装すると埋め込み SQL との境界が食い違う）。
+pub(crate) fn lex_string_literal(input: &str, start: usize) -> Result<(String, usize), LexError> {
     let bytes = input.as_bytes();
     // start は呼び出し元で確認済みの `'` の位置。
     let mut idx = start + 1;

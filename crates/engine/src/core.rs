@@ -94,6 +94,28 @@ mod dml_join_exec;
 mod dml_join_exec_tests;
 #[cfg(test)]
 mod dml_subquery_exec_tests;
+// PL/pgSQL 本体の埋め込み SQL の定義時構文検証（Issue #2224・SQL-68。`plpgsql::embedded` の検証口）。
+mod plpgsql_validate;
+#[cfg(test)]
+mod plpgsql_validate_tests;
+// BEFORE ROW INSERT トリガの発火の結合テスト（TABLE-45・Issue #1723）。
+#[cfg(test)]
+mod trigger_insert_tests;
+// AFTER ROW INSERT トリガの発火の結合テスト（TABLE-45・Issue #1724）。
+#[cfg(test)]
+mod trigger_after_insert_tests;
+// BEFORE・AFTER ROW UPDATE／DELETE トリガの発火の結合テスト（TABLE-45・Issue #1725）。
+#[cfg(test)]
+mod trigger_update_delete_tests;
+// 文レベルトリガと TRUNCATE トリガの発火の結合テスト（TABLE-45・Issue #1726）。
+#[cfg(test)]
+mod trigger_statement_tests;
+// トリガの入れ子の発火と深さ上限（`54001`）の結合テスト（TABLE-45 (5)・Issue #1727）。
+#[cfg(test)]
+mod trigger_depth_tests;
+// トリガ副作用と operation_id 台帳の整合（再送・越境・クラッシュ注入）のテスト（TABLE-45・Issue #1728）。
+#[cfg(test)]
+mod trigger_ledger_tests;
 
 /// 検索 `k` の上限（直接 Rust API 用）。明示 `LIMIT` の既定値と同値だが、SQL／NoSQL の
 /// `LIMIT` 範囲は起動時設定（`result_limits::ResultLimits`。Issue #1555）が決め、本定数は
@@ -1231,6 +1253,11 @@ pub struct EngineCore {
     /// [`Self::with_ledger_mode`] のみ。`crate::recovery::required_op_id` モジュール
     /// ドキュメント参照）。
     ledger_mode: LedgerMode,
+    /// BEFORE ROW INSERT トリガの呼び出し口を保持する通過証（TABLE-45・Issue #1723）。発火に対応した
+    /// INSERT 経路（SQL の `INSERT ... VALUES`・`INSERT ... SELECT`）だけが `tenant` へ渡す。既定は
+    /// 未結線（トリガ関数の実行は `0A000`）で、実体への結線は Issue #2228。入れ子の深さ上限
+    /// （Issue #1727）も保持し、`with_trigger_limits` が起動時に 1 回だけ差し替える。
+    trigger_runtime: crate::trigger::TriggerRuntime,
     /// `WHERE` 省略の `UPDATE`／`DELETE` を `42601` で拒否する opt-in のサーバー側構成
     /// （Issue #2210・SQL-36 ポインタ。既定 `false`）。クエリ・セッション変数・HTTP から
     /// 到達できる経路を持たない（差し替えは [`Self::with_require_where_for_dml`] のみ）。
@@ -1293,6 +1320,10 @@ pub struct EngineCore {
     /// [`Self::with_recursive_cte_limits`] のみが起動時に 1 回だけ差し替え、
     /// `sql::recursive_eval` の実行段だけに効く。
     recursive_cte_limits: crate::recursive_cte_limits::RecursiveCteLimits,
+    /// PL/pgSQL の文数・反復・入れ子・本体長・呼び出し深さの上限（Issue #2225・SQL-68）。
+    /// [`Self::with_plpgsql_limits`] のみが起動時に 1 回だけ差し替える。消費者（`LANGUAGE plpgsql`
+    /// の受理〔#2217〕・実行の結線〔#2226〕）が入るまでは getter の呼び出し元は無い。
+    plpgsql_limits: crate::plpgsql_limits::PlpgsqlLimits,
     /// 明示 `LIMIT` の範囲上限（Issue #1555）。差し替えは [`Self::with_result_limits`]
     /// のみ（起動時 1 回）。文の `LIMIT`・`FETCH n`・集合演算／JOIN 文の `LIMIT` の
     /// 範囲判定にだけ効き、`OFFSET`・枝行数・サブクエリ内側行数の上限とは連動しない。
@@ -1851,6 +1882,12 @@ pub enum ParsedSql {
     ///
     /// **BREAKING CHANGE**（Issue #1920）: `ParsedSql` への variant 追加。
     DropFunction(crate::sql::allowlist::ValidatedDropFunction),
+    /// `CREATE [OR REPLACE] TRIGGER`（TABLE-45、Issue #1722）。
+    ///
+    /// **BREAKING CHANGE**（Issue #1722）: `ParsedSql` への variant 追加。
+    CreateTrigger(crate::sql::allowlist::ValidatedCreateTrigger),
+    /// `DROP TRIGGER [IF EXISTS] <名前> ON <表>`（TABLE-45、Issue #1722）。
+    DropTrigger(crate::sql::allowlist::ValidatedDropTrigger),
     /// `CREATE SCHEMA [IF NOT EXISTS] <name>`（TABLE-27、Issue #1713）。
     ///
     /// **BREAKING CHANGE**（Issue #1713）: `ParsedSql` への variant 追加。
@@ -1974,6 +2011,8 @@ fn statement_clock_scope(
         | ParsedSql::CreateSequence(_)
         | ParsedSql::DropSequence(_)
         | ParsedSql::DropFunction(_)
+        | ParsedSql::CreateTrigger(_)
+        | ParsedSql::DropTrigger(_)
         | ParsedSql::CreateSchema(_)
         | ParsedSql::DropSchema(_)
         | ParsedSql::AlterSchema(_)
@@ -2040,6 +2079,8 @@ fn insert_sequence_scope(
         | ParsedSql::CreateSequence(_)
         | ParsedSql::DropSequence(_)
         | ParsedSql::DropFunction(_)
+        | ParsedSql::CreateTrigger(_)
+        | ParsedSql::DropTrigger(_)
         | ParsedSql::CreateSchema(_)
         | ParsedSql::DropSchema(_)
         | ParsedSql::AlterSchema(_)
@@ -2104,6 +2145,8 @@ fn insert_default_clock_scope(
         | ParsedSql::CreateSequence(_)
         | ParsedSql::DropSequence(_)
         | ParsedSql::DropFunction(_)
+        | ParsedSql::CreateTrigger(_)
+        | ParsedSql::DropTrigger(_)
         | ParsedSql::CreateSchema(_)
         | ParsedSql::DropSchema(_)
         | ParsedSql::AlterSchema(_)
@@ -2780,6 +2823,7 @@ impl EngineCore {
             query_planner: None,
             incremental_config: crate::incremental::IncrementalConfig::default(),
             ledger_mode: LedgerMode::default(),
+            trigger_runtime: crate::trigger::TriggerRuntime::unwired(),
             require_where_for_dml: false,
             batch_limits: crate::batch_limits::BatchLimits::default(),
             transaction_limits: crate::sql::transaction::TransactionLimits::default(),
@@ -2796,6 +2840,7 @@ impl EngineCore {
             join_limits: crate::join_limits::JoinSizeLimits::default(),
             correlated_limits: crate::correlated_limits::CorrelatedLimits::default(),
             recursive_cte_limits: crate::recursive_cte_limits::RecursiveCteLimits::default(),
+            plpgsql_limits: crate::plpgsql_limits::PlpgsqlLimits::default(),
             result_limits: crate::result_limits::ResultLimits::default(),
             materialization_contexts: None,
             partitioned_dml_limits: crate::sql::parser::PartitionedDmlLimits::default(),
@@ -2995,6 +3040,34 @@ impl EngineCore {
     pub fn with_ledger_mode(mut self, mode: LedgerMode) -> Self {
         self.ledger_mode = mode;
         self
+    }
+
+    /// テスト専用: トリガ関数の呼び出し口を差し替える（トリガ関数の保存形式・PL/pgSQL 結線〔Issue #2228〕が
+    /// 未整備のため、発火側の意味論を注入した呼び出し口で固定する。本番の結線は #2228 が行う）。
+    #[cfg(test)]
+    pub(crate) fn with_trigger_invoker_for_test(
+        mut self,
+        invoker: std::sync::Arc<dyn crate::trigger::call::TriggerFunctionInvoker>,
+    ) -> Self {
+        // 深さ上限は `with_trigger_limits` との呼び出し順に依存しないよう保つ。
+        let limits = self.trigger_runtime.limits();
+        self.trigger_runtime =
+            crate::trigger::TriggerRuntime::with_invoker(invoker).with_limits(limits);
+        self
+    }
+
+    /// トリガ呼び出しの入れ子深さ上限（[`crate::trigger_limits::TriggerLimits`]）を差し替えた
+    /// ビルダーを返す（Issue #1727。TABLE-45 (5)）。`wire-server` の起動時 CLI フラグ
+    /// `--max-trigger-depth` からのみ呼ぶ（クエリ・セッション変数・HTTP から到達する経路は無い）。
+    /// 未呼び出しならハード上限と同値の既定。超過は `54001` で文全体を拒否する。
+    pub fn with_trigger_limits(mut self, limits: crate::trigger_limits::TriggerLimits) -> Self {
+        self.trigger_runtime = self.trigger_runtime.with_limits(limits);
+        self
+    }
+
+    /// 現在のトリガ深さ上限（Issue #1727）。
+    pub fn trigger_limits(&self) -> crate::trigger_limits::TriggerLimits {
+        self.trigger_runtime.limits()
     }
 
     /// `WHERE` 省略の SQL `UPDATE`／`DELETE` を変更開始前に `42601` で拒否するか（Issue #2210・
@@ -3245,6 +3318,18 @@ impl EngineCore {
     /// 現在の再帰 CTE 上限設定。
     pub fn recursive_cte_limits(&self) -> crate::recursive_cte_limits::RecursiveCteLimits {
         self.recursive_cte_limits
+    }
+
+    /// PL/pgSQL の実行上限（[`crate::plpgsql_limits::PlpgsqlLimits`]）を差し替える。wire-server の
+    /// 起動時 CLI フラグからだけ呼ぶ。呼ばなければハード上限と同値の既定値（Issue #2225）。
+    pub fn with_plpgsql_limits(mut self, limits: crate::plpgsql_limits::PlpgsqlLimits) -> Self {
+        self.plpgsql_limits = limits;
+        self
+    }
+
+    /// 現在の PL/pgSQL 上限設定。#2218 の関数呼び出し深さもここの `max_call_depth` を読む。
+    pub fn plpgsql_limits(&self) -> crate::plpgsql_limits::PlpgsqlLimits {
+        self.plpgsql_limits
     }
 
     /// 束縛済み計画の `LIMIT` を設定値の範囲で再検査する（Issue #1555 の多層防御）。
@@ -4091,6 +4176,8 @@ impl EngineCore {
                     | crate::sql::SqlOutcome::CreateSequence(_)
                     | crate::sql::SqlOutcome::DropSequence(_)
                     | crate::sql::SqlOutcome::DropFunction(_)
+                    | crate::sql::SqlOutcome::CreateTrigger(_)
+                    | crate::sql::SqlOutcome::DropTrigger(_)
                     | crate::sql::SqlOutcome::CreateSchema(_)
                     | crate::sql::SqlOutcome::DropSchema(_)
                     | crate::sql::SqlOutcome::AlterSchema(_)
@@ -4147,6 +4234,8 @@ impl EngineCore {
                     | crate::sql::SqlOutcome::CreateSequence(_)
                     | crate::sql::SqlOutcome::DropSequence(_)
                     | crate::sql::SqlOutcome::DropFunction(_)
+                    | crate::sql::SqlOutcome::CreateTrigger(_)
+                    | crate::sql::SqlOutcome::DropTrigger(_)
                     | crate::sql::SqlOutcome::CreateSchema(_)
                     | crate::sql::SqlOutcome::DropSchema(_)
                     | crate::sql::SqlOutcome::AlterSchema(_)
@@ -4200,6 +4289,8 @@ impl EngineCore {
                     | crate::sql::SqlOutcome::CreateSequence(_)
                     | crate::sql::SqlOutcome::DropSequence(_)
                     | crate::sql::SqlOutcome::DropFunction(_)
+                    | crate::sql::SqlOutcome::CreateTrigger(_)
+                    | crate::sql::SqlOutcome::DropTrigger(_)
                     | crate::sql::SqlOutcome::CreateSchema(_)
                     | crate::sql::SqlOutcome::DropSchema(_)
                     | crate::sql::SqlOutcome::AlterSchema(_)
@@ -4260,6 +4351,8 @@ impl EngineCore {
                     | crate::sql::SqlOutcome::CreateSequence(_)
                     | crate::sql::SqlOutcome::DropSequence(_)
                     | crate::sql::SqlOutcome::DropFunction(_)
+                    | crate::sql::SqlOutcome::CreateTrigger(_)
+                    | crate::sql::SqlOutcome::DropTrigger(_)
                     | crate::sql::SqlOutcome::CreateSchema(_)
                     | crate::sql::SqlOutcome::DropSchema(_)
                     | crate::sql::SqlOutcome::AlterSchema(_)
@@ -4333,6 +4426,8 @@ impl EngineCore {
                     | crate::sql::SqlOutcome::CreateSequence(_)
                     | crate::sql::SqlOutcome::DropSequence(_)
                     | crate::sql::SqlOutcome::DropFunction(_)
+                    | crate::sql::SqlOutcome::CreateTrigger(_)
+                    | crate::sql::SqlOutcome::DropTrigger(_)
                     | crate::sql::SqlOutcome::CreateSchema(_)
                     | crate::sql::SqlOutcome::DropSchema(_)
                     | crate::sql::SqlOutcome::AlterSchema(_)
@@ -5440,6 +5535,11 @@ impl EngineCore {
             let stmt = crate::sql::allowlist::validate_drop_function_tokens(&tokens)?;
             return Ok(ParsedSql::DropFunction(stmt));
         }
+        // Issue #1722: `DROP TRIGGER` も汎用 `DROP` より前に分岐する（カタログ照会なし）。
+        if crate::sql::allowlist::is_drop_trigger_statement(&tokens) {
+            let stmt = crate::sql::allowlist::validate_drop_trigger_tokens(&tokens)?;
+            return Ok(ParsedSql::DropTrigger(stmt));
+        }
         if crate::sql::allowlist::is_drop_sequence_statement(&tokens) {
             let stmt = crate::sql::allowlist::validate_drop_sequence_tokens(&tokens)?;
             return Ok(ParsedSql::DropSequence(stmt));
@@ -5533,6 +5633,11 @@ impl EngineCore {
         // Issue #1194: `CREATE TYPE` も `CREATE FUNCTION` 分岐へ渡さない。
         // Issue #1688: `CREATE [TEMP|UNLOGGED] SEQUENCE` も `CREATE TABLE`／`FUNCTION` 分岐へ渡さない。
         // Issue #1713: `CREATE SCHEMA` も `CREATE TABLE`／`FUNCTION` 分岐へ渡さない（カタログ照会なし）。
+        // Issue #1722: `CREATE [OR REPLACE] TRIGGER` も `CREATE TABLE`／`FUNCTION` 分岐へ渡さない（カタログ照会なし）。
+        if crate::sql::allowlist::is_create_trigger_statement(&tokens) {
+            let stmt = crate::sql::allowlist::validate_create_trigger_tokens(&tokens)?;
+            return Ok(ParsedSql::CreateTrigger(stmt));
+        }
         if crate::sql::allowlist::is_create_schema_statement(&tokens) {
             let stmt = crate::sql::allowlist::validate_create_schema_tokens(&tokens)?;
             return Ok(ParsedSql::CreateSchema(stmt));
@@ -7035,6 +7140,26 @@ impl EngineCore {
                 )?;
                 Ok(crate::sql::SqlOutcome::DropFunction(outcome))
             }
+            // TABLE-45（Issue #1722）: DDL 実行権限ゲート → 実行本体。権限の無い主体には対象表・トリガの
+            // 有無を問わず常に `42501`。TRIGGER 定義はテナント単位のため `ctx.tenant_id()` を渡す。
+            ParsedSql::CreateTrigger(stmt) => {
+                crate::sql::ddl::require_ddl_permission(session)?;
+                let outcome = crate::sql::trigger_ddl::execute_create_trigger(
+                    &self.storage,
+                    ctx.tenant_id(),
+                    stmt,
+                )?;
+                Ok(crate::sql::SqlOutcome::CreateTrigger(outcome))
+            }
+            ParsedSql::DropTrigger(stmt) => {
+                crate::sql::ddl::require_ddl_permission(session)?;
+                let outcome = crate::sql::trigger_ddl::execute_drop_trigger(
+                    &self.storage,
+                    ctx.tenant_id(),
+                    stmt,
+                )?;
+                Ok(crate::sql::SqlOutcome::DropTrigger(outcome))
+            }
             // TABLE-27（Issue #1713）: DDL 実行権限ゲート → 実行本体。SCHEMA はテナント単位のカタログ
             // のため `ctx.tenant_id()` を渡す（SEQUENCE との違い）。権限の無い主体には対象の有無を
             // 問わず常に `42501`。
@@ -7406,6 +7531,9 @@ impl EngineCore {
                     detail: "internal error".to_string(),
                 })?;
                 let target = crate::tenant::WriteTarget::InTxn(write_txn);
+                // AFTER ROW トリガが書いた表も COMMIT 時の遅延 FK 検査の対象にする（Issue #1724）。
+                let trigger_scope =
+                    crate::tenant::trigger_writes::TriggerWrittenTablesScope::enter();
                 let outcome = if stmt.returning.is_some() {
                     crate::sql::SqlOutcome::Returning(
                         self.execute_insert_returning_form(target, ctx, stmt, &lookup)?,
@@ -7416,6 +7544,9 @@ impl EngineCore {
                     )
                 };
                 txn.mark_written(ctx.tenant_id(), &stmt.table_name);
+                for table in trigger_scope.take() {
+                    txn.mark_written(ctx.tenant_id(), &table);
+                }
                 Ok(outcome)
             }
             // ビューへの INSERT（TABLE-43・Issue #1671）。基表形へ書き換えて同じフォーム関数へ
@@ -7465,6 +7596,9 @@ impl EngineCore {
                     detail: "internal error".to_string(),
                 })?;
                 let target = crate::tenant::WriteTarget::InTxn(write_txn);
+                // トリガ（BEFORE・AFTER）が書いた表も COMMIT 時の遅延 FK 検査の対象にする（Issue #1725）。
+                let trigger_scope =
+                    crate::tenant::trigger_writes::TriggerWrittenTablesScope::enter();
                 let (outcome, table) = match stmt {
                     crate::sql::allowlist::DeleteStatement::SingleRow(v) => {
                         let outcome = if v.returning.is_some() {
@@ -7496,6 +7630,9 @@ impl EngineCore {
                     }
                 };
                 txn.mark_written(ctx.tenant_id(), table);
+                for written in trigger_scope.take() {
+                    txn.mark_written(ctx.tenant_id(), &written);
+                }
                 Ok(outcome)
             }
             ParsedSql::Update(stmt) => {
@@ -7511,6 +7648,9 @@ impl EngineCore {
                     detail: "internal error".to_string(),
                 })?;
                 let target = crate::tenant::WriteTarget::InTxn(write_txn);
+                // トリガ（BEFORE・AFTER）が書いた表も COMMIT 時の遅延 FK 検査の対象にする（Issue #1725）。
+                let trigger_scope =
+                    crate::tenant::trigger_writes::TriggerWrittenTablesScope::enter();
                 let outcome = if has_returning {
                     crate::sql::SqlOutcome::Returning(
                         self.execute_update_returning_form(target, ctx, session, stmt)?,
@@ -7525,22 +7665,32 @@ impl EngineCore {
                     crate::sql::allowlist::ValidatedUpdateForm::Predicate(v) => v.table_name(),
                 };
                 txn.mark_written(ctx.tenant_id(), table);
+                for written in trigger_scope.take() {
+                    txn.mark_written(ctx.tenant_id(), &written);
+                }
                 Ok(outcome)
             }
             ParsedSql::Truncate(stmt) => {
                 let write_txn = txn.write_txn().ok_or_else(|| SqlSurfaceError::Internal {
                     detail: "internal error".to_string(),
                 })?;
+                // TRUNCATE トリガが書いた表も COMMIT 時の遅延 FK 検査の対象にする（Issue #1726）。
+                let trigger_scope =
+                    crate::tenant::trigger_writes::TriggerWrittenTablesScope::enter();
                 let outcome = crate::sql::exec::execute_truncate_in(
                     crate::tenant::WriteTarget::InTxn(write_txn),
                     ctx,
                     stmt,
                     self.ledger_mode,
+                    Some(&self.trigger_runtime),
                 )?;
                 // 全表に印を付ける（漏れると遅延 FK の COMMIT 時検査が取りこぼす。P0）。
                 // CASCADE（Issue #1644）で連鎖して空にした表も書き込み済みとして扱う。
                 for table in stmt.table_names.iter().chain(outcome.cascaded()) {
                     txn.mark_written(ctx.tenant_id(), table);
+                }
+                for table in trigger_scope.take() {
+                    txn.mark_written(ctx.tenant_id(), &table);
                 }
                 Ok(crate::sql::SqlOutcome::Truncate(outcome))
             }
@@ -7558,7 +7708,7 @@ impl EngineCore {
             ParsedSql::Statement(stmt @ Statement::CreateFunction { .. }) => {
                 if session.ddl_allowed() {
                     Err(SqlSurfaceError::feature_not_supported(
-                        "CREATE FUNCTION is not supported inside a transaction block",
+                        "CREATE [OR REPLACE] FUNCTION is not supported inside a transaction block",
                     ))
                 } else {
                     self.execute_validated_in_session(ctx, session, stmt.clone())
@@ -7654,6 +7804,9 @@ impl EngineCore {
                 let write_txn = txn.write_txn().ok_or_else(|| SqlSurfaceError::Internal {
                     detail: "internal error".to_string(),
                 })?;
+                // AFTER ROW トリガが書いた表も COMMIT 時の遅延 FK 検査の対象にする（Issue #1724）。
+                let trigger_scope =
+                    crate::tenant::trigger_writes::TriggerWrittenTablesScope::enter();
                 let outcome = self.execute_parsed_insert_select(
                     crate::core::insert_select_exec::InsertSelectTxn::InTxn(write_txn),
                     ctx,
@@ -7661,6 +7814,9 @@ impl EngineCore {
                     stmt,
                 )?;
                 txn.mark_written(ctx.tenant_id(), &stmt.table_name);
+                for table in trigger_scope.take() {
+                    txn.mark_written(ctx.tenant_id(), &table);
+                }
                 Ok(outcome)
             }
             // 拡張クエリの `COPY` は wire-server が先に横取りする（Issue #1760）ため通常は到達しない。
@@ -8557,6 +8713,8 @@ impl EngineCore {
             ParsedSql::CreateSequence(_) => Ok(None),
             ParsedSql::DropSequence(_) => Ok(None),
             ParsedSql::DropFunction(_) => Ok(None),
+            ParsedSql::CreateTrigger(_) => Ok(None),
+            ParsedSql::DropTrigger(_) => Ok(None),
             ParsedSql::CreateSchema(_) => Ok(None),
             ParsedSql::DropSchema(_) => Ok(None),
             ParsedSql::AlterSchema(_) => Ok(None),
@@ -8969,14 +9127,52 @@ impl EngineCore {
             // Issue #1915（SQL-66 (1)）: 型注釈つきの定義は、カタログへの型の永続化とロード側の
             // 復元（`udf_load` は型注釈つきの行を読み飛ばす）が揃うまで、永続化経路では `0A000` で
             // 拒否する（セッションにだけ残り再起動で消える黙った不整合を作らない・fail-closed）。
+            //
+            // Issue #1917（SQL-66 (2)）: `CREATE OR REPLACE FUNCTION` は同じ分岐で `or_replace` により
+            // 置換経路（`prepare_function_replacement`）へ切り替える。DDL セッションの型付き・RETURNS つきの
+            // `0A000`・`42P13` の順序は `CREATE` と同じ。
             crate::sql::allowlist::Statement::CreateFunction {
+                or_replace,
                 name,
                 params,
                 param_types,
+                return_type,
                 body,
                 body_source,
             } => {
                 if session.ddl_allowed() {
+                    // Issue #1916: RETURNS 付きは永続化の前に、非 DDL セッションと同じ検証（本体の型検査）を
+                    // レジストリの複製に対して行う。型の不一致は権限によらず `42P13` になり、
+                    // 検証を通った定義だけが下の `0A000`（未対応の永続化）に到達する。
+                    if return_type.is_some() {
+                        let mut probe = session.udfs().clone();
+                        if or_replace {
+                            crate::sql::udf_call::define_or_replace_function_with_signature(
+                                &mut probe,
+                                &name,
+                                &params,
+                                &param_types,
+                                return_type.as_ref(),
+                                &body,
+                                self.function_limits.max_functions(),
+                            )?;
+                        } else {
+                            crate::sql::udf_call::define_function_with_signature_capped(
+                                &mut probe,
+                                &name,
+                                &params,
+                                &param_types,
+                                return_type.as_ref(),
+                                &body,
+                                self.function_limits.max_functions(),
+                            )?;
+                        }
+                        return Err(
+                            crate::sql::allowlist::SqlSurfaceError::feature_not_supported(
+                                "function return types cannot be persisted yet",
+                            ),
+                        );
+                    }
                     if param_types.iter().any(Option::is_some) {
                         return Err(
                             crate::sql::allowlist::SqlSurfaceError::feature_not_supported(
@@ -8984,22 +9180,46 @@ impl EngineCore {
                             ),
                         );
                     }
-                    crate::sql::udf_ddl::execute_create_function_persistent(
-                        &self.storage,
-                        ctx.tenant_id(),
-                        session,
-                        &name,
-                        &params,
-                        &body,
-                        &body_source,
-                        self.function_limits.max_functions(),
-                    )?;
-                } else {
-                    crate::sql::udf_call::define_function_with_types_capped(
+                    if or_replace {
+                        crate::sql::udf_ddl::execute_create_or_replace_function_persistent(
+                            &self.storage,
+                            ctx.tenant_id(),
+                            session,
+                            &name,
+                            &params,
+                            &body,
+                            &body_source,
+                            self.function_limits.max_functions(),
+                        )?;
+                    } else {
+                        crate::sql::udf_ddl::execute_create_function_persistent(
+                            &self.storage,
+                            ctx.tenant_id(),
+                            session,
+                            &name,
+                            &params,
+                            &body,
+                            &body_source,
+                            self.function_limits.max_functions(),
+                        )?;
+                    }
+                } else if or_replace {
+                    crate::sql::udf_call::define_or_replace_function_with_signature(
                         session.udfs_mut(),
                         &name,
                         &params,
                         &param_types,
+                        return_type.as_ref(),
+                        &body,
+                        self.function_limits.max_functions(),
+                    )?;
+                } else {
+                    crate::sql::udf_call::define_function_with_signature_capped(
+                        session.udfs_mut(),
+                        &name,
+                        &params,
+                        &param_types,
+                        return_type.as_ref(),
                         &body,
                         self.function_limits.max_functions(),
                     )?;
@@ -11811,12 +12031,14 @@ impl EngineCore {
         // に検出する（codex-review P1 指摘・PR #823。`tenant::insert_typed_row_unchecked`
         // のドキュメント参照。束縛後・書き込み前にテーブルが再定義され列順が
         // 入れ替わっても、値が誤った列へ保存されるのを防ぐ）。
+        // NoSQL 表層はトリガの発火に未対応（`None`。INSERT トリガのある表は `0A000`。Issue #1723）。
         crate::sql::exec::execute_insert_batch_with_schema_in(
             target,
             ctx,
             &bounds,
             self.ledger_mode,
             Some(&schema),
+            None,
         )
     }
 
@@ -13667,6 +13889,7 @@ impl EngineCore {
                     &bound,
                     self.dml_ledger_mode(),
                     None,
+                    Some(&self.trigger_runtime),
                 )
             }
             // 複数行 `VALUES`（SQL-16、TASK-190）。NoSQL 表層の `rows[]`
@@ -13692,6 +13915,7 @@ impl EngineCore {
                     &bounds,
                     self.dml_ledger_mode(),
                     Some(&schema),
+                    Some(&self.trigger_runtime),
                 )
             }
             crate::sql::parser::BoundInsertForm::File(bound) => {
@@ -13860,7 +14084,14 @@ impl EngineCore {
         ctx: &PolicyContext,
         stmt: &crate::sql::allowlist::ValidatedTruncate,
     ) -> Result<crate::sql::exec::TruncateOutcome, crate::sql::allowlist::SqlSurfaceError> {
-        crate::sql::exec::execute_truncate(&self.storage, ctx, stmt, self.ledger_mode)
+        crate::sql::exec::execute_truncate_in(
+            crate::tenant::WriteTarget::Autocommit(&self.storage),
+            ctx,
+            stmt,
+            self.ledger_mode,
+            // TRUNCATE トリガ（Issue #1726）は通過証を渡す結線済み経路だけが発火する。
+            Some(&self.trigger_runtime),
+        )
     }
 
     /// SQL 表層の単一 DELETE 文実行エントリポイント（SQL-18、TASK-191、#867）。
@@ -13905,7 +14136,13 @@ impl EngineCore {
         stmt: &crate::sql::allowlist::ValidatedDelete,
     ) -> Result<crate::sql::exec::DeleteOutcome, crate::sql::allowlist::SqlSurfaceError> {
         let bound = crate::sql::parser::bind_delete(stmt)?;
-        crate::sql::exec::execute_delete_in(target, ctx, &bound, self.dml_ledger_mode())
+        crate::sql::exec::execute_delete_in(
+            target,
+            ctx,
+            &bound,
+            self.dml_ledger_mode(),
+            Some(&self.trigger_runtime),
+        )
     }
 
     /// [`Self::execute_sql_in_session`] の `DELETE`（述語形。SQL-19・TASK-192、
@@ -13969,6 +14206,7 @@ impl EngineCore {
             resolved.as_ref().unwrap_or(stmt),
             stmt,
             &schema,
+            Some(&self.trigger_runtime),
         )
     }
 
@@ -13990,7 +14228,7 @@ impl EngineCore {
         stmt: &crate::sql::allowlist::ValidatedPredicateDelete,
         schema: &crate::catalog::TableSchema,
     ) -> Result<crate::sql::exec::DeleteOutcome, crate::sql::allowlist::SqlSurfaceError> {
-        self.run_predicate_delete_resolved(target, ctx, udfs, stmt, stmt, schema)
+        self.run_predicate_delete_resolved(target, ctx, udfs, stmt, stmt, schema, None)
     }
 
     /// [`Self::run_predicate_delete`] の本体。`bind_stmt` は束縛に使う文（サブクエリ解決済み）、
@@ -14005,6 +14243,7 @@ impl EngineCore {
         bind_stmt: &crate::sql::allowlist::ValidatedPredicateDelete,
         hash_stmt: &crate::sql::allowlist::ValidatedPredicateDelete,
         schema: &crate::catalog::TableSchema,
+        triggers: Option<&crate::trigger::TriggerRuntime>,
     ) -> Result<crate::sql::exec::DeleteOutcome, crate::sql::allowlist::SqlSurfaceError> {
         // 多層防御（Issue #1129）: 分割実行修飾付きの文は原子実行器へ到達させない
         // （黙って原子実行へ切り替えない。fail-closed）。
@@ -14022,6 +14261,7 @@ impl EngineCore {
             &content_hash_value,
             self.dml_limits.max_affected_rows,
             self.scan_limits.max_scanned_rows(),
+            triggers,
         )
     }
 
@@ -14378,6 +14618,39 @@ impl EngineCore {
         Ok((bound, content_hash_value))
     }
 
+    /// UPDATE の束縛区間（`bind_*` 呼び出しの範囲だけ）で NOT NULL 検査を後回しにするガードを返す。
+    /// 対象表に BEFORE の UPDATE 行トリガ（NEW を書き換え得る）があるときだけで、AFTER のみ・文のみのトリガ・
+    /// トリガ無しは従来どおり束縛時に `23502` を返す（`23502` と `UPDATE 0` の差で行の存在・可視性を
+    /// 漏らさない。Issue #1725）。`table` は束縛に渡すスキーマの表名（表ごとに限定するため）。
+    /// `UPDATE OF` 付きトリガは SET 列（`DEFAULT` 指定列を含む）と交差するときだけ「発火する」と数える
+    /// （発火しない文で延期すると、行の有無で `UPDATE 0` と `23502` が分かれる。`trigger::plan` の
+    /// `filter_update_of` と同じ規則）。
+    fn defer_not_null_scope_for_update(
+        &self,
+        ctx: &PolicyContext,
+        table: &str,
+        set_columns: &[&str],
+    ) -> Option<crate::sql::set_expr::DeferNotNullBindScope> {
+        // 読み取りの失敗・トリガ無しは従来どおり束縛時に検査する（fail-closed。トリガ有無の誤判定でも
+        // 最終検査が `validate_set_assignments` に残る）。
+        let triggers = self.storage.list_triggers(ctx.tenant_id(), table).ok()?;
+        triggers
+            .iter()
+            .any(|t| {
+                t.timing == crate::catalog::trigger::TriggerTiming::Before
+                    // 文トリガは NEW を書き換えられないので延期しない（延期すると `23502` と `UPDATE 0` の
+                    // 差で行の存在を漏らす。Issue #1726）。
+                    && t.level == crate::catalog::trigger::TriggerLevel::Row
+                    && t.events
+                        .contains(crate::catalog::trigger::TriggerEvents::UPDATE)
+                    && (t.update_of.is_empty()
+                        || t.update_of
+                            .iter()
+                            .any(|c| set_columns.contains(&c.as_str())))
+            })
+            .then(|| crate::sql::set_expr::DeferNotNullBindScope::enter(table))
+    }
+
     /// 対象テーブルのスキーマを取得する（`RETURNING` 付き DML の各実行本体が
     /// 共有。`TableNotFound` は `42P01`、それ以外は詳細を含まない固定文言の
     /// `XX000`）。
@@ -14565,13 +14838,18 @@ impl EngineCore {
                     },
                 })?,
         };
-        let bound = crate::sql::parser::bind_update(stmt, &schema)?;
+        let bound = {
+            let set_columns: Vec<&str> = stmt.assignments.iter().map(|(n, _)| n.as_str()).collect();
+            let _defer = self.defer_not_null_scope_for_update(ctx, &schema.name, &set_columns);
+            crate::sql::parser::bind_update(stmt, &schema)?
+        };
         crate::sql::exec::execute_update_with_schema_in(
             target,
             ctx,
             &bound,
             self.dml_ledger_mode(),
             Some(&schema),
+            Some(&self.trigger_runtime),
         )
     }
 
@@ -14630,7 +14908,19 @@ impl EngineCore {
             // `Single` は `bind_update_form` へ渡す前にここで直接処理する
             // （`Predicate` 分岐専用の `Self::run_predicate_update` へは
             // 渡さない。抽出前と挙動を完全に同一に保つ）。
-            let bound = crate::sql::parser::bind_update_form(stmt, &schema, session.udfs())?;
+            let bound = {
+                // BEFORE の UPDATE トリガがあれば、束縛時の NOT NULL 検査を最終 NEW まで後回しにする。
+                let set_columns: Vec<&str> = match stmt {
+                    ValidatedUpdateForm::Single(s) => {
+                        s.assignments.iter().map(|(n, _)| n.as_str()).collect()
+                    }
+                    ValidatedUpdateForm::Predicate(p) => {
+                        p.assignments().iter().map(|(n, _)| n.as_str()).collect()
+                    }
+                };
+                let _defer = self.defer_not_null_scope_for_update(ctx, &schema.name, &set_columns);
+                crate::sql::parser::bind_update_form(stmt, &schema, session.udfs())?
+            };
             let crate::sql::parser::BoundUpdateForm::Single(bound) = bound else {
                 return Err(crate::sql::allowlist::SqlSurfaceError::Internal {
                     detail: "internal: bound single-row UPDATE from a predicate-form statement"
@@ -14643,6 +14933,7 @@ impl EngineCore {
                 &bound,
                 self.dml_ledger_mode(),
                 Some(&schema),
+                Some(&self.trigger_runtime),
             );
         };
         // SQL-53（Issue #1751）: WHERE 内のサブクエリは束縛の前に書き込み txn のスナップショットで解決する。
@@ -14659,6 +14950,7 @@ impl EngineCore {
             resolved.as_ref().unwrap_or(validated),
             validated,
             &schema,
+            Some(&self.trigger_runtime),
         )
     }
 
@@ -14828,7 +15120,7 @@ impl EngineCore {
         validated: &crate::sql::allowlist::ValidatedPredicateUpdate,
         schema: &crate::catalog::TableSchema,
     ) -> Result<crate::sql::exec::UpdateOutcome, crate::sql::allowlist::SqlSurfaceError> {
-        self.run_predicate_update_resolved(target, ctx, udfs, validated, validated, schema)
+        self.run_predicate_update_resolved(target, ctx, udfs, validated, validated, schema, None)
     }
 
     /// [`Self::run_predicate_update`] の本体（`bind_stmt`／`hash_stmt` の意味は
@@ -14842,13 +15134,24 @@ impl EngineCore {
         bind_stmt: &crate::sql::allowlist::ValidatedPredicateUpdate,
         hash_stmt: &crate::sql::allowlist::ValidatedPredicateUpdate,
         schema: &crate::catalog::TableSchema,
+        triggers: Option<&crate::trigger::TriggerRuntime>,
     ) -> Result<crate::sql::exec::UpdateOutcome, crate::sql::allowlist::SqlSurfaceError> {
         // 多層防御（Issue #1129）: 分割実行修飾付きの文は原子実行器へ到達させない。
         if bind_stmt.partitioned().is_some() {
             return Err(crate::sql::allowlist::SqlSurfaceError::PartitionedDmlInTransaction);
         }
-        let (predicate, content_hash_value, legacy_hash) =
-            Self::prepare_predicate_update(bind_stmt, hash_stmt, schema, udfs)?;
+        let (predicate, content_hash_value, legacy_hash) = {
+            // トリガ結線経路（SQL）だけ、BEFORE の UPDATE トリガがあれば束縛時の NOT NULL 検査を後回しにする。
+            let set_columns: Vec<&str> = bind_stmt
+                .assignments()
+                .iter()
+                .map(|(n, _)| n.as_str())
+                .collect();
+            let _defer = triggers.and_then(|_| {
+                self.defer_not_null_scope_for_update(ctx, &schema.name, &set_columns)
+            });
+            Self::prepare_predicate_update(bind_stmt, hash_stmt, schema, udfs)?
+        };
         let legacy_hashes: &[crate::recovery::content_hash::ContentHash] = legacy_hash.as_slice();
         crate::sql::exec::execute_predicate_update_in(
             target,
@@ -14860,6 +15163,7 @@ impl EngineCore {
             legacy_hashes,
             self.dml_limits.max_affected_rows,
             self.scan_limits.max_scanned_rows(),
+            triggers,
         )
     }
 

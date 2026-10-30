@@ -56,6 +56,8 @@ fn expected_class(e: &TenantWriteError) -> ErrorClass {
         TenantWriteError::SetExpressionEvaluationFailed(inner) => inner.error_class(),
         // Issue #1690: nextval／currval の採番・解決の失敗も内側の分類へ委譲する。
         TenantWriteError::SequenceEvaluationFailed(inner) => inner.error_class(),
+        // Issue #1723: BEFORE ROW INSERT トリガの発火失敗も内側の分類へ委譲する。
+        TenantWriteError::TriggerFailed(inner) => inner.error_class(),
         TenantWriteError::ForeignKeyViolation => ErrorClass::ForeignKeyViolation,
         TenantWriteError::ReferentialActionLimitExceeded => ErrorClass::PayloadTooLarge,
         // Issue #2207（INDEX-8）: GIN 相当索引の抽出上限超過は `54000`。

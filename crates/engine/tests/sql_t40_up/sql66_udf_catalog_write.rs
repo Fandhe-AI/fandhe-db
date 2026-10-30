@@ -3,8 +3,9 @@
 //!
 //! 固定する契約: 作成した定義は再オープン後も残り、DROP した定義は再オープン後に消えている／テナント
 //! 境界（他テナントの定義は不在と同じ `42883`・同名の独立作成が可能）／DDL 権限の無いセッションは
-//! カタログに書かない／DDL 権限ありの明示トランザクション内は `0A000`／DROP FUNCTION の最小形
-//! （`IF EXISTS`・`CASCADE`・複数名は `0A000`）。
+//! カタログに書かない／DDL 権限ありの明示トランザクション内は `0A000`／DROP FUNCTION の受理形
+//! （複数名は `0A000`。`IF EXISTS`・`CASCADE`・`RESTRICT` は #1917 で受理。置換・IF EXISTS の
+//! 結合テストは `sql66_udf_drop_replace.rs`）。
 
 use engine::core::EngineCore;
 use engine::kernel::CpuScalarProvider;
@@ -208,8 +209,8 @@ fn ddl_inside_explicit_transaction_is_rejected() {
     );
 }
 
-/// DROP FUNCTION の受理形: 型の並び（`f(<型>)`・`f()`）と SCHEMA 修飾（括弧なし）。最小形の外
-/// （`IF EXISTS`・`CASCADE`・`RESTRICT`・複数名）は 0A000。
+/// DROP FUNCTION の受理形: 型の並び（`f(<型>)`・`f()`）と SCHEMA 修飾（括弧なし）。複数名は 0A000
+/// （`IF EXISTS`・`CASCADE`・`RESTRICT` は #1917 で受理するため `sql66_udf_drop_replace.rs` が担う）。
 #[test]
 fn drop_function_forms() {
     let path = unique_db_path("sql66-write-forms");
@@ -220,14 +221,11 @@ fn drop_function_forms() {
     ok(&core, "alice", &mut s, "CREATE FUNCTION s.f(x) AS x");
     ok(&core, "alice", &mut s, "CREATE FUNCTION g() AS 1");
     ok(&core, "alice", &mut s, "CREATE FUNCTION h(x) AS x");
-    for sql in [
-        "DROP FUNCTION IF EXISTS h",
-        "DROP FUNCTION h CASCADE",
-        "DROP FUNCTION h RESTRICT",
-        "DROP FUNCTION h, g",
-    ] {
-        assert_eq!(code(&core, "alice", &mut s, sql), "0A000", "{sql}");
-    }
+    assert_eq!(
+        code(&core, "alice", &mut s, "DROP FUNCTION h, g"),
+        "0A000",
+        "multiple names stay unsupported"
+    );
     // 引数の数が合わない型の並びは不在と同じ 42883。
     assert_eq!(
         code(&core, "alice", &mut s, "DROP FUNCTION h(integer, integer)"),

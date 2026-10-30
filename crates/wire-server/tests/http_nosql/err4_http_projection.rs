@@ -305,7 +305,7 @@ fn query_as_alice(addr: SocketAddr, body: &[u8]) -> HttpResponse {
 /// `status.rs::EXPECTED`（`#[cfg(test)]` 内で外部から参照不可）と同値の
 /// 期待表。両者の乖離は [`err4_projection_table_is_closed_over_all_error_classes`]
 /// が `http_status` 経由で検出する。
-const EXPECTED_STATUS: [(&str, u16); 88] = [
+const EXPECTED_STATUS: [(&str, u16); 93] = [
     ("22000", 400),
     ("22001", 400),
     ("22012", 400),
@@ -385,6 +385,9 @@ const EXPECTED_STATUS: [(&str, u16); 88] = [
     // （Issue #1186）。いずれも 400。
     ("42883", 400),
     ("42723", 400),
+    ("42P13", 400),
+    // `AmbiguousFunction`（`42725`。SQL-66、Issue #1917）: SQL 表層専用の分類で 400。
+    ("42725", 400),
     // `IndeterminateDatatype`（`42P18`。Issue #1546）: 拡張クエリの Parse で `$n` の型を
     // 決められない。SQL 表層専用の分類で 400。
     ("42P18", 400),
@@ -430,6 +433,10 @@ const EXPECTED_STATUS: [(&str, u16); 88] = [
     ("22035", 400),
     ("2203F", 400),
     ("57014", 503),
+    // Issue #2225・SQL-68: PL/pgSQL の実行時エラー。
+    ("P0003", 400),
+    ("20000", 400),
+    ("2F005", 400),
     // `UntranslatableCharacter`（`22P05`。Issue #2185）: jsonpath リテラルの NUL 文字。400。
     ("22P05", 400),
     // `InvalidEscapeSequence`（`22025`。Issue #1779）: LIKE の不正エスケープ。400。
@@ -536,7 +543,7 @@ fn assert_projected_as(resp: &HttpResponse, expected_class: ErrorClass) {
 
 // --- R7: 射影表が ErrorClass::ALL 全体を閉じて覆うことの機械検証 -----------
 
-const _: () = assert!(ErrorClass::ALL.len() == 91);
+const _: () = assert!(ErrorClass::ALL.len() == 97);
 
 /// `wire_code` を共有する分類と、逆引き（`from_wire_code`）が返す分類の組
 /// （ERR-6。`23502`: TABLE-16・TASK-204・Issue #904、`23505`: Issue #1180）。
@@ -544,7 +551,7 @@ const _: () = assert!(ErrorClass::ALL.len() == 91);
 /// 「`wire_code` からの厳密往復」を免除する（`EXPECTED_STATUS` は wire_code
 /// 単位の一意テーブルのままで、共有側は同じステータスのためテーブル自体は
 /// 増やさない）。
-const SHARED_WIRE_CODE_CLASSES: [(ErrorClass, ErrorClass); 3] = [
+const SHARED_WIRE_CODE_CLASSES: [(ErrorClass, ErrorClass); 4] = [
     (ErrorClass::NotNullViolation, ErrorClass::MissingOperationId),
     (
         ErrorClass::DuplicateOperationId,
@@ -555,6 +562,8 @@ const SHARED_WIRE_CODE_CLASSES: [(ErrorClass, ErrorClass); 3] = [
         ErrorClass::InvalidParameterValue,
         ErrorClass::OperationIdContentMismatch,
     ),
+    // `P0002`（Issue #2225）。逆引きは `RowNotFound` へ固定される。
+    (ErrorClass::NoDataFound, ErrorClass::RowNotFound),
 ];
 
 #[test]
@@ -992,6 +1001,12 @@ fn err4_f_unreachable_classes_project_via_production_encoder() {
     for class in [
         ErrorClass::RowNotFound,
         ErrorClass::InvalidCursorName,
+        // PL/pgSQL の実行時エラー（Issue #2225・SQL-68）: PL/pgSQL 関数を呼ぶ op が NoSQL 表層に
+        // 無く到達不能。
+        ErrorClass::NoDataFound,
+        ErrorClass::TooManyRows,
+        ErrorClass::CaseNotFound,
+        ErrorClass::FunctionExecutedNoReturnStatement,
         ErrorClass::DependentObjectsStillExist,
         ErrorClass::WrongObjectType,
         ErrorClass::InvalidTransactionState,
@@ -1014,6 +1029,12 @@ fn err4_f_unreachable_classes_project_via_production_encoder() {
         // （`UndefinedFunction`〔`42883`〕は `aggregate` op から到達可能。固定は
         // `err4_f_sum_on_date_column_projects_42883_to_400` が担う）
         ErrorClass::DuplicateFunction,
+        // `InvalidFunctionDefinition`（`42P13`。SQL-66、Issue #1916）: `CREATE FUNCTION ...
+        // RETURNS` の型検査。NoSQL 表層に `CREATE FUNCTION` が無いため到達不能。
+        ErrorClass::InvalidFunctionDefinition,
+        // `AmbiguousFunction`（`42725`。SQL-66、Issue #1917）: `DROP FUNCTION` の候補曖昧。
+        // NoSQL 表層に `DROP FUNCTION` が無いため到達不能。
+        ErrorClass::AmbiguousFunction,
         // （`AmbiguousColumn`〔`42702`〕は Issue #1270 で `aggregate.sort` から到達
         // 可能になったためこの一覧から外した。固定は
         // `err4_f_ambiguous_sort_reachable_via_nosql_aggregate` が担う）
@@ -1092,7 +1113,7 @@ fn err4_f_unreachable_classes_project_via_production_encoder() {
         let raw =
             wire_server::http::response::encode_error(class, "test message", SystemTime::now());
         let resp = http_common::parse_single_response(&raw);
-        assert_projected(&resp, class.wire_code());
+        assert_projected_as(&resp, class);
     }
 }
 

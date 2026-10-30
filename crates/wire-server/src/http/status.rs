@@ -35,6 +35,13 @@ pub const fn http_status(class: ErrorClass) -> u16 {
         ErrorClass::TableNotFound | ErrorClass::RowNotFound | ErrorClass::InvalidCursorName => {
             404
         }
+        // Issue #2225・SQL-68: PL/pgSQL の実行時エラー。NoSQL 表層から PL/pgSQL 関数を
+        // 呼ぶ op は無く構造的に到達しないが、網羅性のため定める。`NoDataFound`（`P0002`）は
+        // `RowNotFound` と同じ 404、他は入力・定義起因の拒否として 400。
+        ErrorClass::NoDataFound => 404,
+        ErrorClass::TooManyRows
+        | ErrorClass::CaseNotFound
+        | ErrorClass::FunctionExecutedNoReturnStatement => 400,
         // `DuplicateTable`（`42P07`。SQL-23・TASK-85、Issue #899）は
         // `CREATE TABLE` が指定したテーブル名の既存衝突であり、`UniqueViolation`
         // と同じ「対象が既に存在する」意味論のため同じ 409 とする。
@@ -216,6 +223,12 @@ pub const fn http_status(class: ErrorClass) -> u16 {
         // 専用で、NoSQL の filter レーンは `Leaf` しか組み立てないため到達しない。
         | ErrorClass::UndefinedFunction
         | ErrorClass::DuplicateFunction
+        // `InvalidFunctionDefinition`（`42P13`。SQL-66、Issue #1916）も NoSQL に
+        // `CREATE FUNCTION` の op が無く到達しない。網羅性のため 400。
+        | ErrorClass::InvalidFunctionDefinition
+        // `AmbiguousFunction`（`42725`。SQL-66、Issue #1917）も NoSQL に `DROP FUNCTION` の op が無く
+        // 到達しない。網羅性のため 400。
+        | ErrorClass::AmbiguousFunction
         // `AmbiguousColumn`（`42702`。SQL-28・RLS-10、Issue #924）は複数テーブル
         // 参照スコープでの非修飾列の曖昧解決。SQL 表層は `INNER JOIN`（Issue
         // #925）で到達可能になった。NoSQL 表層は JOIN 経路を持たないが、
@@ -233,7 +246,7 @@ mod tests {
 
     /// 期待表を明示的に列挙し、`ErrorClass::ALL` との突き合わせで非 vacuous に検証する。
     /// `match` にアームを足したが期待表の更新を忘れた、という乖離を (a)(b) が検出する。
-    const EXPECTED: [(ErrorClass, u16); 91] = [
+    const EXPECTED: [(ErrorClass, u16); 97] = [
         (ErrorClass::InvalidInput, 400),
         (ErrorClass::StringDataRightTruncation, 400),
         (ErrorClass::AuthInvalid, 401),
@@ -280,6 +293,10 @@ mod tests {
         (ErrorClass::DuplicateColumn, 400),
         (ErrorClass::InvalidColumnReference, 400),
         (ErrorClass::InvalidCursorName, 404),
+        (ErrorClass::NoDataFound, 404),
+        (ErrorClass::TooManyRows, 400),
+        (ErrorClass::CaseNotFound, 400),
+        (ErrorClass::FunctionExecutedNoReturnStatement, 400),
         (ErrorClass::DependentObjectsStillExist, 400),
         (ErrorClass::WrongObjectType, 400),
         (ErrorClass::NotNullViolation, 400),
@@ -291,6 +308,8 @@ mod tests {
         (ErrorClass::DatatypeMismatch, 400),
         (ErrorClass::UndefinedFunction, 400),
         (ErrorClass::DuplicateFunction, 400),
+        (ErrorClass::InvalidFunctionDefinition, 400),
+        (ErrorClass::AmbiguousFunction, 400),
         (ErrorClass::AmbiguousColumn, 400),
         (ErrorClass::InvalidParameterValue, 400),
         (ErrorClass::IndeterminateDatatype, 400),

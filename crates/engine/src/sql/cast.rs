@@ -1221,7 +1221,17 @@ pub(super) fn cast_bound(
     env: &mut BindEnv<'_>,
     node_budget: &mut usize,
 ) -> Result<(BoundExpr, ExprType), SqlSurfaceError> {
-    let source = source_cast_kind(operand, &bound, ty, env.schema());
+    // RETURNS 付き UDF の呼び出しは宣言した戻り値型が変換元（展開結果の型推論に頼ると
+    // 数値が `UnknownNumeric` になり有効な CAST が `0A000` になるため。Issue #1916）。
+    let declared = match strip_collate(operand) {
+        Expr::Call { name, .. } => env.udf_return_type(name),
+        _ => None,
+    };
+    let source = match declared {
+        Some(CastType::Array(elem)) => SourceKind::Array(Some(elem.as_ref().clone())),
+        Some(other) => SourceKind::Known(other.kind()),
+        None => source_cast_kind(operand, &bound, ty, env.schema()),
+    };
     cast_bound_from(source, operand, bound, ty, target, node_budget)
 }
 

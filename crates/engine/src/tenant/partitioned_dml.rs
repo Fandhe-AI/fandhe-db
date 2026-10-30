@@ -419,6 +419,19 @@ fn chunk_loop<E>(
             require_expected_schema_for_set_exprs(set_exprs, expected_schema).map_err(w)?;
         }
 
+        // 該当イベントのトリガ（行・文を問わない）と、参照アクションが及ぶ子表のトリガがあれば `0A000`
+        // （Issue #1725・実行モデルの D8）。チャンクは複数 txn に分かれトリガの文脈（`OLD`・`NEW` の
+        // 一貫した文単位）を保てないため、黙って飛ばさず拒否する。ジョブ記録・台帳照合より前に判定
+        // するので、第 1 チャンクでは commit 前に止まり副作用はゼロ（登録簿の登録は drop で外れる）。
+        // 途中のチャンクで DDL によりトリガが追加された場合は、既存の部分完了の写像に従う。
+        crate::trigger::plan::guard_unwired_dml(
+            &write_txn,
+            tenant,
+            table,
+            matches!(kind, Kind::Delete),
+        )
+        .map_err(w)?;
+
         // ジョブ記録の照合。最初のチャンクは再送判定、以降はメモリ上の状態との一致確認。
         let record = partitioned_job::lookup_in_write_txn(&write_txn, &key).map_err(map_job_err)?;
         if state.first_chunk {

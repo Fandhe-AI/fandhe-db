@@ -113,6 +113,11 @@ const DOMAIN_TAG: &[u8] = b"vector-db/op_ledger/content_hash/v1";
 /// 型なし定義の件数は `MAX_UDF_PARAMS` 以下で最上位ビットは立たない。
 const UDF_TYPED_PARAMS_FLAG: u32 = 0x8000_0000;
 
+/// `RETURNS` つき UDF 定義の件数フィールドに立てる第 2 の識別ビット（SQL-66 (1)・Issue #1916）。
+/// 立てた定義は、引数の列の後・本体の前に戻り値型の正規綴りを連結する。立てない定義の直列化は
+/// 従来とビット同一。
+const UDF_RETURN_TYPE_FLAG: u32 = 0x4000_0000;
+
 /// 操作種別タグ（1 バイト）。同一フィールド列でも操作種別が異なれば必ず異なる
 /// ハッシュになるよう、[`HashInputBuilder::new`] が先頭に埋め込む。
 #[repr(u8)]
@@ -2237,11 +2242,15 @@ fn push_dml_where_predicates(
             // 立たず、型なし定義の直列化は従来とビット同一）。同一 `operation_id` の再送で
             // 型注釈だけが違う定義を同一内容と誤判定しないため（RECOVER-10）。
             let typed = def.param_types.iter().any(Option::is_some);
-            let count_field = if typed {
+            let mut count_field = if typed {
                 param_count | UDF_TYPED_PARAMS_FLAG
             } else {
                 param_count
             };
+            // RETURNS の有無・型だけが違う定義を同一内容と誤判定しない（RECOVER-10。Issue #1916）。
+            if def.return_type.is_some() {
+                count_field |= UDF_RETURN_TYPE_FLAG;
+            }
             b.push_raw(&count_field.to_le_bytes());
             // パラメータ名は小文字化してから連結する（`push_dml_expr` の `Ident`
             // 側パラメータ参照・`bind_expr_in` の呼び出し引数解決と同じ大文字小文字
@@ -2262,6 +2271,11 @@ fn push_dml_where_predicates(
                     b.push_bytes(ty.as_bytes())
                         .map_err(|_| dml_hash_field_too_large())?;
                 }
+            }
+            if let Some(ret) = &def.return_type {
+                // 戻り値型も固定語彙の正規綴り（`CastType::to_sql`）だけを連結する。
+                b.push_bytes(ret.to_sql().as_bytes())
+                    .map_err(|_| dml_hash_field_too_large())?;
             }
             push_dml_expr(b, &def.body, Some(&def.params))?;
         }
@@ -2534,8 +2548,10 @@ fn push_dml_subquery_tokens(
 /// 本体を再帰的に走査する（推移閉包。ADR §4.4.1「4.」）。WASM UDF に解決される
 /// 呼び出しは許可形状外として拒否する（`get_wasm` → `get` の順で必ず判定する。
 /// ADR §4.4.1「2.」の順序を維持しないと WASM UDF の名前が誤って「組み込み関数」
-/// 側へ分類されてしまう）。`UdfRegistry` は追記専用（自身より前に登録済みの
-/// UDF のみを呼べる）ため巡回はなく、この再帰は必ず停止する。
+/// 側へ分類されてしまう）。`CREATE OR REPLACE FUNCTION`（Issue #1917）は置換が呼び出しの
+/// 循環を作る場合を拒否する（`udf_call::prepare_function_replacement`）ため登録済み UDF の
+/// 呼び出しグラフは非巡回で、この再帰は停止する。さらに `out` の訪問済み検査が、仮に巡回があっても
+/// 再訪を止める。置換で本体が変わればここで集める定義も変わり、ハッシュも変わる（別内容として扱う）。
 fn collect_referenced_udfs(
     expr: &crate::sql::udf_call::Expr,
     udf_registry: &crate::sql::udf_call::UdfRegistry,
@@ -5838,6 +5854,7 @@ mod tests {
             UdfDefinition {
                 params: vec!["x".to_string()],
                 param_types: vec![None],
+                return_type: None,
                 body: Expr::Ident("x".to_string()),
             },
         );
@@ -5849,6 +5866,7 @@ mod tests {
             UdfDefinition {
                 params: vec!["X".to_string()],
                 param_types: vec![None],
+                return_type: None,
                 body: Expr::Ident("X".to_string()),
             },
         );
@@ -5886,6 +5904,7 @@ mod tests {
                 UdfDefinition {
                     params: vec!["x".to_string()],
                     param_types: vec![ty],
+                    return_type: None,
                     body: Expr::Ident("x".to_string()),
                 },
             );
@@ -5900,6 +5919,42 @@ mod tests {
         let int4 = hash_with(Some(CastType::Int4));
         let int8 = hash_with(Some(CastType::Int8));
         assert_ne!(untyped, int4);
+        assert_ne!(int4, int8);
+        assert_eq!(int4, hash_with(Some(CastType::Int4)));
+    }
+
+    /// SQL-66 (1)・Issue #1916: `RETURNS` の有無・型だけが違う定義は異なるハッシュになる
+    /// （同一 `operation_id` の再送で戻り値型だけが違う定義を同一内容と誤判定しない。RECOVER-10）。
+    #[test]
+    fn for_delete_where_udf_definition_hash_distinguishes_return_type() {
+        use crate::sql::cast::CastType;
+        use crate::sql::udf_call::{
+            insert_raw_definition_for_test, Expr, UdfDefinition, UdfRegistry,
+        };
+
+        let hash_with = |ret: Option<CastType>| {
+            let mut reg = UdfRegistry::default();
+            insert_raw_definition_for_test(
+                &mut reg,
+                "raw_fn",
+                UdfDefinition {
+                    params: vec!["x".to_string()],
+                    param_types: vec![Some(CastType::Int4)],
+                    return_type: ret,
+                    body: Expr::Ident("x".to_string()),
+                },
+            );
+            let predicate = where_predicate_id_gt_zero(Expr::Call {
+                name: "raw_fn".to_string(),
+                args: vec![Expr::Ident("id".to_string())],
+            });
+            for_delete_where("t", &[predicate], &reg).expect("hash")
+        };
+
+        let none = hash_with(None);
+        let int4 = hash_with(Some(CastType::Int4));
+        let int8 = hash_with(Some(CastType::Int8));
+        assert_ne!(none, int4);
         assert_ne!(int4, int8);
         assert_eq!(int4, hash_with(Some(CastType::Int4)));
     }

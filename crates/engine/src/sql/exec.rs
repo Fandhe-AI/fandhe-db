@@ -3823,6 +3823,7 @@ pub(crate) fn execute_insert_with_schema(
         bound,
         ledger_mode,
         expected_schema,
+        None,
     )
 }
 
@@ -3837,6 +3838,7 @@ pub(crate) fn execute_insert_with_schema_in(
     bound: &crate::sql::parser::BoundInsert,
     ledger_mode: crate::recovery::required_op_id::LedgerMode,
     expected_schema: Option<&crate::catalog::TableSchema>,
+    triggers: Option<&crate::trigger::TriggerRuntime>,
 ) -> Result<InsertOutcome, SqlSurfaceError> {
     use crate::storage::Visibility;
 
@@ -3844,7 +3846,7 @@ pub(crate) fn execute_insert_with_schema_in(
         .resolve(bound.operation_id.as_ref())
         .map_err(|_| SqlSurfaceError::MissingOperationId)?;
 
-    crate::tenant::insert_typed_row_unchecked(
+    let report = crate::tenant::insert_typed_row_unchecked(
         target,
         &bound.table,
         ctx,
@@ -3855,11 +3857,12 @@ pub(crate) fn execute_insert_with_schema_in(
         expected_schema,
         &bound.volatile_default_columns,
         bound.id_omitted,
+        triggers,
     )
     .map_err(map_insert_write_error)?;
 
     Ok(InsertOutcome {
-        rows_affected: 1,
+        rows_affected: report.rows_written,
         incremental: None,
     })
 }
@@ -3887,6 +3890,8 @@ pub fn execute_truncate(
         ctx,
         validated,
         ledger_mode,
+        // 公開入口はトリガの通過証を持たない（TRUNCATE トリガがあれば `0A000`。Issue #1726）。
+        None,
     )
 }
 
@@ -3897,6 +3902,7 @@ pub(crate) fn execute_truncate_in(
     ctx: &PolicyContext,
     validated: &crate::sql::allowlist::ValidatedTruncate,
     ledger_mode: crate::recovery::required_op_id::LedgerMode,
+    triggers: Option<&crate::trigger::TriggerRuntime>,
 ) -> Result<TruncateOutcome, SqlSurfaceError> {
     let ledger_write = ledger_mode
         .resolve(validated.operation_id.as_ref())
@@ -3909,6 +3915,7 @@ pub(crate) fn execute_truncate_in(
         validated.restart_identity,
         ctx,
         ledger_write,
+        triggers,
     )
     .map_err(map_insert_write_error)?;
 
@@ -3957,6 +3964,7 @@ pub fn execute_delete(
         ctx,
         bound,
         ledger_mode,
+        None,
     )
 }
 
@@ -3970,17 +3978,20 @@ pub(crate) fn execute_delete_in(
     ctx: &PolicyContext,
     bound: &crate::sql::parser::BoundDelete,
     ledger_mode: crate::recovery::required_op_id::LedgerMode,
+    // DELETE トリガの通過証（Issue #1725）。`None` では該当トリガがあれば `0A000`。
+    triggers: Option<&crate::trigger::TriggerRuntime>,
 ) -> Result<DeleteOutcome, SqlSurfaceError> {
     let ledger_write = ledger_mode
         .resolve(bound.operation_id.as_ref())
         .map_err(|_| SqlSurfaceError::MissingOperationId)?;
 
-    match crate::tenant::delete_row_ledgered_unchecked(
+    match crate::tenant::delete_row_ledgered_with_triggers(
         target,
         &bound.table,
         ctx,
         bound.id,
         ledger_write,
+        triggers,
     ) {
         Ok(crate::tenant::DeleteRowOutcome::Deleted) => Ok(DeleteOutcome { rows_affected: 1 }),
         Ok(crate::tenant::DeleteRowOutcome::NotFound) => Ok(DeleteOutcome { rows_affected: 0 }),
@@ -4206,6 +4217,7 @@ pub(crate) fn execute_update_with_schema(
         bound,
         ledger_mode,
         expected_schema,
+        None,
     )
 }
 
@@ -4220,12 +4232,14 @@ pub(crate) fn execute_update_with_schema_in(
     bound: &crate::sql::parser::BoundUpdate,
     ledger_mode: crate::recovery::required_op_id::LedgerMode,
     expected_schema: Option<&crate::catalog::TableSchema>,
+    // UPDATE トリガの通過証（Issue #1725）。`None` では該当トリガがあれば `0A000`。
+    triggers: Option<&crate::trigger::TriggerRuntime>,
 ) -> Result<UpdateOutcome, SqlSurfaceError> {
     let ledger_write = ledger_mode
         .resolve(bound.operation_id.as_ref())
         .map_err(|_| SqlSurfaceError::MissingOperationId)?;
 
-    let rows_affected = crate::tenant::update_row_columns_unchecked(
+    let rows_affected = crate::tenant::update_row_columns_with_triggers(
         target,
         &bound.table,
         ctx,
@@ -4234,6 +4248,7 @@ pub(crate) fn execute_update_with_schema_in(
         &bound.set_exprs,
         ledger_write,
         expected_schema,
+        triggers,
     )
     .map_err(|e| map_write_error(e, "update"))?;
 
@@ -4381,6 +4396,9 @@ pub(crate) fn map_write_error(
         // `nextval`／`currval` の採番・解決の失敗（`2200H`・`55000`・`22003`・`0A000` 等。
         // TABLE-24・Issue #1690）も内側の `SqlSurfaceError` を透過する。
         TenantWriteError::SequenceEvaluationFailed(inner) => inner,
+        // BEFORE ROW INSERT トリガの発火失敗（`0A000`・`42804`・`57014`・関数が返したエラー。
+        // TABLE-45・Issue #1723）も内側の `SqlSurfaceError` を透過する。
+        TenantWriteError::TriggerFailed(inner) => inner,
         // `FOREIGN KEY` 制約違反（`23503`。TABLE-17・TASK-205、Issue #907）。`_` 節
         // （`XX000`）へ丸めると、クライアントが参照整合性違反をサーバー内部事象と
         // 取り違える。値・参照先の有無の理由を含まない固定文言。
@@ -4532,6 +4550,7 @@ pub(crate) fn execute_predicate_delete_in(
     content_hash_value: &crate::recovery::content_hash::ContentHash,
     max_affected_rows: Option<std::num::NonZeroUsize>,
     max_scanned_rows: usize,
+    triggers: Option<&crate::trigger::TriggerRuntime>,
 ) -> Result<DeleteOutcome, SqlSurfaceError> {
     let rows_affected = execute_predicate_delete_inner(
         target,
@@ -4543,6 +4562,7 @@ pub(crate) fn execute_predicate_delete_in(
         max_affected_rows,
         max_scanned_rows,
         None,
+        triggers,
     )?;
     Ok(DeleteOutcome { rows_affected })
 }
@@ -4588,6 +4608,7 @@ pub(crate) fn execute_predicate_delete_returning(
         max_affected_rows,
         max_scanned_rows,
         Some(&mut project),
+        None,
     )?;
     drop(project);
     Ok(ReturningOutcome {
@@ -4693,6 +4714,8 @@ fn execute_predicate_delete_inner(
     max_affected_rows: Option<std::num::NonZeroUsize>,
     max_scanned_rows: usize,
     project: Option<&mut crate::tenant::ReturningProjectFn<'_>>,
+    // DELETE トリガの通過証（Issue #1725）。`RETURNING` 付き（`project: Some`）は渡さない（`0A000`）。
+    triggers: Option<&crate::trigger::TriggerRuntime>,
 ) -> Result<u64, SqlSurfaceError> {
     let ledger_write = ledger_mode
         .resolve(bound.operation_id())
@@ -4708,7 +4731,7 @@ fn execute_predicate_delete_inner(
         bound.expr_filters(),
         bound.or_filters(),
         |needs_embedding, predicate| match project {
-            None => crate::tenant::delete_rows_where_unchecked(
+            None => crate::tenant::delete_rows_where_with_triggers(
                 target,
                 bound.table(),
                 ctx,
@@ -4719,6 +4742,7 @@ fn execute_predicate_delete_inner(
                 limit,
                 max_scanned_rows,
                 predicate,
+                triggers,
             ),
             Some(project) => crate::tenant::delete_rows_where_capturing_unchecked(
                 target,
@@ -4788,6 +4812,7 @@ pub(crate) fn execute_predicate_update_in(
     // 既定 `None`＝上限なし）。[`execute_predicate_delete`] のドキュメント参照。
     max_affected_rows: Option<std::num::NonZeroUsize>,
     max_scanned_rows: usize,
+    triggers: Option<&crate::trigger::TriggerRuntime>,
 ) -> Result<UpdateOutcome, SqlSurfaceError> {
     let rows_affected = execute_predicate_update_inner(
         target,
@@ -4800,6 +4825,7 @@ pub(crate) fn execute_predicate_update_in(
         max_affected_rows,
         max_scanned_rows,
         None,
+        triggers,
     )?;
     Ok(UpdateOutcome { rows_affected })
 }
@@ -4841,6 +4867,7 @@ pub(crate) fn execute_predicate_update_returning(
         max_affected_rows,
         max_scanned_rows,
         Some(&mut project),
+        None,
     )?;
     drop(project);
     Ok(ReturningOutcome {
@@ -4864,6 +4891,8 @@ fn execute_predicate_update_inner(
     max_affected_rows: Option<std::num::NonZeroUsize>,
     max_scanned_rows: usize,
     project: Option<&mut crate::tenant::ReturningProjectFn<'_>>,
+    // UPDATE トリガの通過証（Issue #1725）。`RETURNING` 付き（`project: Some`）は渡さない（`0A000`）。
+    triggers: Option<&crate::trigger::TriggerRuntime>,
 ) -> Result<u64, SqlSurfaceError> {
     let ledger_write = ledger_mode
         .resolve(bound.operation_id())
@@ -4879,7 +4908,7 @@ fn execute_predicate_update_inner(
         bound.expr_filters(),
         bound.or_filters(),
         |needs_embedding, predicate| match project {
-            None => crate::tenant::update_rows_where_unchecked(
+            None => crate::tenant::update_rows_where_with_triggers(
                 target,
                 bound.table(),
                 ctx,
@@ -4893,6 +4922,7 @@ fn execute_predicate_update_inner(
                 limit,
                 max_scanned_rows,
                 predicate,
+                triggers,
             ),
             Some(project) => crate::tenant::update_rows_where_capturing_unchecked(
                 target,
@@ -5103,6 +5133,7 @@ pub(crate) fn execute_insert_batch_with_schema(
         bounds,
         ledger_mode,
         expected_schema,
+        None,
     )
 }
 
@@ -5117,6 +5148,7 @@ pub(crate) fn execute_insert_batch_with_schema_in(
     bounds: &[crate::sql::parser::BoundInsert],
     ledger_mode: crate::recovery::required_op_id::LedgerMode,
     expected_schema: Option<&crate::catalog::TableSchema>,
+    triggers: Option<&crate::trigger::TriggerRuntime>,
 ) -> Result<InsertOutcome, SqlSurfaceError> {
     let Some(first) = bounds.first() else {
         return Err(SqlSurfaceError::invalid_input(
@@ -5124,7 +5156,14 @@ pub(crate) fn execute_insert_batch_with_schema_in(
         ));
     };
     if bounds.len() == 1 {
-        return execute_insert_with_schema_in(target, ctx, first, ledger_mode, expected_schema);
+        return execute_insert_with_schema_in(
+            target,
+            ctx,
+            first,
+            ledger_mode,
+            expected_schema,
+            triggers,
+        );
     }
 
     let table = first.table.as_str();
@@ -5153,7 +5192,7 @@ pub(crate) fn execute_insert_batch_with_schema_in(
         bounds.iter().map(|b| (b.id, b.values.as_slice())).collect();
 
     let volatile = volatile_default_columns_of(bounds);
-    crate::tenant::insert_typed_rows_unchecked(
+    let report = crate::tenant::insert_typed_rows_unchecked(
         target,
         table,
         ctx,
@@ -5163,14 +5202,12 @@ pub(crate) fn execute_insert_batch_with_schema_in(
         ledger_write,
         expected_schema,
         &volatile,
+        triggers,
     )
     .map_err(map_insert_write_error)?;
 
-    let rows_affected = u64::try_from(bounds.len()).map_err(|_| SqlSurfaceError::Internal {
-        detail: "insert batch row count overflow".to_string(),
-    })?;
     Ok(InsertOutcome {
-        rows_affected,
+        rows_affected: report.rows_written,
         incremental: None,
     })
 }
@@ -5220,7 +5257,9 @@ pub(crate) fn precheck_insert_select_ledger(
     result.map_err(|e| map_insert_write_error(crate::tenant::TenantWriteError::from(e)))
 }
 
-/// `INSERT ... SELECT` が 0 行だったときの台帳だけの記録（SQL-51 (5)・Issue #1733）。
+/// `INSERT ... SELECT` が 0 行だったときの台帳だけの記録（SQL-51 (5)・Issue #1733）。`trigger_mode` が
+/// `Insert(Some)` のとき、INSERT 文トリガ（BEFORE／AFTER STATEMENT）を 1 回ずつ発火する（Issue #1726）。
+/// CTAS・データ変更 CTE からは `Skip`（トリガを見ない純粋な台帳記録）で呼ぶ。
 pub(crate) fn record_insert_select_ledger_only(
     target: crate::tenant::WriteTarget<'_>,
     ctx: &PolicyContext,
@@ -5228,12 +5267,20 @@ pub(crate) fn record_insert_select_ledger_only(
     operation_id: Option<&crate::recovery::required_op_id::OperationId>,
     ledger_mode: crate::recovery::required_op_id::LedgerMode,
     statement_hash: &crate::recovery::content_hash::ContentHash,
+    trigger_mode: crate::tenant::LedgerOnlyTriggers<'_>,
 ) -> Result<(), SqlSurfaceError> {
     let ledger_write = ledger_mode
         .resolve(operation_id)
         .map_err(|_| SqlSurfaceError::MissingOperationId)?;
-    crate::tenant::record_ledger_only_unchecked(target, table, ctx, ledger_write, statement_hash)
-        .map_err(map_insert_write_error)
+    crate::tenant::record_ledger_only_unchecked(
+        target,
+        table,
+        ctx,
+        ledger_write,
+        statement_hash,
+        trigger_mode,
+    )
+    .map_err(map_insert_write_error)
 }
 
 /// `id` 省略の行を受理できない経路（UPSERT）の固定文言拒否（`0A000`。設計記録 D9）。
@@ -5429,7 +5476,7 @@ pub(crate) fn execute_insert_returning_in(
         _ => None,
     };
     let insert_outcome =
-        execute_insert_batch_with_schema_in(target, ctx, bounds, ledger_mode, Some(schema))?;
+        execute_insert_batch_with_schema_in(target, ctx, bounds, ledger_mode, Some(schema), None)?;
 
     if has_sequence {
         // 行・列をキーにした索引を一度だけ構築し、RETURNING の検索を線形時間に保つ
@@ -5903,6 +5950,8 @@ fn map_incremental_error(e: crate::incremental::IncrementalError) -> SqlSurfaceE
         IncrementalError::Write(TenantWriteError::TooManyRowsScanned { .. }) => {
             SqlSurfaceError::payload_too_large("too many rows scanned")
         }
+        // INSERT トリガの発火に未対応のファイル形 INSERT 拒否（`0A000`。Issue #1723）は行形と同じく透過する。
+        IncrementalError::Write(TenantWriteError::TriggerFailed(inner)) => inner,
         IncrementalError::Write(_) => SqlSurfaceError::Internal {
             detail: "incremental index write failed".to_string(),
         },

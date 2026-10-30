@@ -66,6 +66,8 @@ fn assert_describe_matches_execute(core: &EngineCore, ctx: &PolicyContext, sql: 
         | SqlOutcome::Show(_)
         | SqlOutcome::CreateFunction { .. }
         | SqlOutcome::DropFunction(_)
+        | SqlOutcome::CreateTrigger(_)
+        | SqlOutcome::DropTrigger(_)
         | SqlOutcome::Insert(_)
         | SqlOutcome::Truncate(_)
         | SqlOutcome::Delete(_)

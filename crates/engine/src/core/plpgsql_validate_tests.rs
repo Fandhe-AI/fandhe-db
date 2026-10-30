@@ -1,0 +1,165 @@
+//! `core/plpgsql_validate.rs` の単体テスト（Issue #2224・SQL-68。ADR D2・D3）。
+//!
+//! 本物の `EngineCore`（既存の許可リスト解析）へ委譲した定義時のダミー検証を固定する。
+//! 構文誤り・範囲外は定義時に拒否し、未知の表などは呼び出し時の検証へ回す（late binding）。
+
+use super::EngineCore;
+use crate::catalog::{ColumnDef, ColumnType, TableSchema};
+use crate::kernel::CpuScalarProvider;
+use crate::plpgsql::ast::{ParamDecl, ParseOptions, ReturnShape};
+use crate::plpgsql::embedded::validate_embedded;
+use crate::plpgsql::parse_body;
+use crate::sql::allowlist::SqlSurfaceError;
+use crate::sql::ddl_column_type::SqlColumnTypeName;
+use crate::storage::Storage;
+use crate::test_util::temp_db::{unique_db_path, CleanupGuard};
+
+fn new_core() -> (EngineCore, CleanupGuard) {
+    let path = unique_db_path("plpgsql-validate");
+    let storage = Storage::open(&path).expect("open storage");
+    storage
+        .create_table(&TableSchema::new(
+            "docs",
+            vec![
+                ColumnDef::new("embedding", ColumnType::Vector(2), false),
+                ColumnDef::new("lang", ColumnType::Text, false),
+            ],
+        ))
+        .expect("create table");
+    (
+        EngineCore::from_storage(storage, Box::new(CpuScalarProvider)),
+        CleanupGuard(path),
+    )
+}
+
+fn check(core: &EngineCore, src: &str) -> Result<(), SqlSurfaceError> {
+    let opts = ParseOptions::new(
+        vec![ParamDecl {
+            name: Some("p".to_string()),
+            ty: SqlColumnTypeName::Integer,
+        }],
+        ReturnShape::Scalar,
+    );
+    let mut body = parse_body(src, &opts)?;
+    validate_embedded(&mut body, core)
+}
+
+#[test]
+fn unknown_table_passes_at_definition_time() {
+    let (core, _g) = new_core();
+    check(
+        &core,
+        "DECLARE n int; BEGIN SELECT count(*) INTO n FROM no_such_table; RETURN n; END",
+    )
+    .expect("late binding");
+}
+
+#[test]
+fn syntax_error_is_rejected_with_42601() {
+    let (core, _g) = new_core();
+    let e = check(&core, "BEGIN SELECT FROM WHERE; END").expect_err("syntax");
+    assert_eq!(e.wire_code(), "42601");
+}
+
+#[test]
+fn valid_insert_and_variable_expressions_pass() {
+    let (core, _g) = new_core();
+    check(
+        &core,
+        "DECLARE v int := 1; BEGIN \
+         INSERT INTO docs (id, embedding, lang) VALUES (v, '[0.1,0.2]', 'en'); \
+         PERFORM v + 1; \
+         IF v + p > 3 THEN v := v + 1; END IF; \
+         RETURN v; END",
+    )
+    .expect("valid body");
+}
+
+#[test]
+fn variable_in_identifier_position_is_not_replaced() {
+    let (core, _g) = new_core();
+    check(
+        &core,
+        "DECLARE lang text := 'en'; BEGIN \
+         INSERT INTO docs (id, embedding, lang) VALUES (1, '[0.1,0.2]', lang); END",
+    )
+    .expect("column list keeps the identifier");
+}
+
+#[test]
+fn unsupported_embedded_syntax_is_rejected_at_definition_time() {
+    let (core, _g) = new_core();
+    // 許可リスト外の構文（式の位置の未対応演算子など）は 42601／0A000 のどちらかで拒否される。
+    let e = check(&core, "BEGIN SELECT 1 FROM docs WHERE lang @@@ 'x'; END").expect_err("reject");
+    assert!(matches!(e.wire_code(), "42601" | "0A000"));
+}
+#[test]
+fn delegated_syntax_error_does_not_echo_fragments() {
+    let (core, _g) = new_core();
+    let e = check(
+        &core,
+        "BEGIN PERFORM secret_col_xyz FROM WHERE secret_w_xyz; END",
+    )
+    .expect_err("syntax");
+    assert_eq!(e.wire_code(), "42601");
+    assert!(!e.to_string().contains("xyz"), "leaked: {e}");
+}
+
+#[test]
+fn boolean_expressions_validate_in_value_positions() {
+    // 値の式として拒否される比較・論理式も、代入・宣言初期値・RETURN で受理する（条件式の形でも検証）。
+    let (core, _g) = new_core();
+    for src in [
+        "DECLARE b boolean; v int := 1; BEGIN b := 1 = 1; RETURN b; END",
+        "DECLARE b boolean := 1 < 2; BEGIN RETURN b; END",
+        "DECLARE v int := 1; BEGIN RETURN v > 0 AND v < 10; END",
+        "DECLARE v int := 1; BEGIN RETURN v > 0 OR NOT (v = 3); END",
+        "DECLARE v int; b boolean; BEGIN b := v IS NULL; RETURN b; END",
+        "DECLARE v int := 5; BEGIN RETURN v BETWEEN 1 AND 10; END",
+        "DECLARE v int := 5; b boolean := v IS NOT NULL; BEGIN RETURN b; END",
+    ] {
+        check(&core, src).unwrap_or_else(|e| panic!("expected accept for {src:?}: {e}"));
+    }
+    // 本来の構文誤りは引き続き 42601。
+    for src in [
+        "DECLARE v int; BEGIN v := 1 +; RETURN v; END",
+        "DECLARE v int; BEGIN RETURN v AND; END",
+        "DECLARE v int; BEGIN v := (1 = ; RETURN v; END",
+    ] {
+        let e = check(&core, src).expect_err("syntax");
+        assert_eq!(e.wire_code(), "42601", "for {src:?}");
+    }
+}
+
+#[test]
+fn data_modifying_cte_is_classified_as_a_write_by_the_catalog_aware_checker() {
+    use crate::plpgsql::ast::{EmbeddedKind, Stmt};
+    let (core, _g) = new_core();
+    let opts = ParseOptions::new(vec![], ReturnShape::Void);
+    let mut body = parse_body(
+        "DECLARE v text := 'en'; BEGIN \
+         WITH d AS (DELETE FROM docs WHERE lang = v RETURNING lang) SELECT lang FROM d; END",
+        &opts,
+    )
+    .expect("parse");
+    validate_embedded(&mut body, &core).expect("classify");
+    let Some(Stmt::Sql(q)) = body.block.stmts.first() else {
+        panic!("sql");
+    };
+    assert_eq!(q.kind, EmbeddedKind::Select);
+    assert!(q.writes, "data-modifying CTE must be a write");
+    // 副文の WHERE の変数 `v` が記録される。
+    assert_eq!(q.var_refs.len(), 1);
+}
+
+#[test]
+fn data_modifying_cte_on_an_unknown_table_cannot_be_classified() {
+    // 表が無いと書き込みの実行形を判定できない（書き込みの有無を決められないので fail-closed）。
+    let (core, _g) = new_core();
+    let e = check(
+        &core,
+        "BEGIN WITH d AS (DELETE FROM no_such_table WHERE lang = 'x' RETURNING lang) SELECT lang FROM d; END",
+    )
+    .expect_err("must reject");
+    assert_eq!(e.wire_code(), "0A000");
+}

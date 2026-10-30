@@ -264,6 +264,12 @@ pub(crate) mod key_index;
 pub mod nesting_limits;
 pub mod numeric;
 pub mod parallel_search;
+// PL/pgSQL の構文解析器（Issue #2224・SQL-68）。結線（`LANGUAGE plpgsql` の受理・実行器）は
+// #2217／#2225 が行うため、呼び出し元は当面テストだけ（`catalog::function` と同じ扱い）。
+#[allow(dead_code)]
+pub(crate) mod plpgsql;
+// PL/pgSQL の実行上限（Issue #2224・#2225）。wire-server の CLI が `PlpgsqlLimits` を組み立てる。
+pub mod plpgsql_limits;
 pub mod policy;
 pub mod precision;
 pub mod query_planner;
@@ -293,6 +299,8 @@ pub mod tenant;
 #[cfg(feature = "test-sync-points")]
 pub mod test_sync;
 pub mod tiering;
+pub(crate) mod trigger;
+pub mod trigger_limits;
 pub mod txn;
 pub mod uuid;
 pub mod wasm_udf;

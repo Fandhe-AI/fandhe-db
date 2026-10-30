@@ -71,6 +71,9 @@
 
 ### D3. BEFORE ROW の戻り値
 
+> Issue #1723 の実装記録: [trigger-before-insert.md](trigger-before-insert.md)（INSERT の BEFORE ROW 経路・
+> 経路ごとのガード・PostgreSQL との差分）。
+
 - 同じ行の BEFORE トリガを名前順に連鎖させ、各トリガが受け取る NEW は前のトリガが返した行
 - NULL が返った場合、その行の操作を行わず後続のトリガを呼ばない。影響行数・`RETURNING`・
   AFTER のキューにも入れない
@@ -79,6 +82,12 @@
 - 行の書き換えは BEFORE だけが行える。AFTER と文トリガの戻り値は無視する
 
 ### D4. 発火の時点と順序（1 文のライフサイクル）
+
+> Issue #1723 の実装記録: [trigger-before-insert.md](trigger-before-insert.md)（INSERT の BEFORE ROW 経路・
+> 経路ごとのガード・PostgreSQL との差分）。
+>
+> Issue #1724 の実装記録: [trigger-after-insert.md](trigger-after-insert.md)（INSERT の AFTER ROW 経路・
+> 段 6 のキュー消化・トリガ内書き込みの窓口・遅延 FK）。
 
 1. 台帳の事前照合（D10）。再送ならここで `23505` を返し、トリガは 1 つも呼ばない
 2. BEFORE STATEMENT（対象 0 行でも発火する）
@@ -97,6 +106,9 @@
   終わりで消化する（PG と同じ入れ子）
 
 ### D5. 行単位の処理と再入の不変条件
+
+> Issue #1723 の実装記録: [trigger-before-insert.md](trigger-before-insert.md)（INSERT の BEFORE ROW 経路・
+> 経路ごとのガード・PostgreSQL との差分）。
 
 - 表に該当イベントのトリガがある文だけ「トリガ経路」で実行する。トリガ経路は行単位で、
   対象行を先に実体化（UPDATE／DELETE の対象、INSERT ... SELECT の入力行、VALUES の行と
@@ -134,6 +146,17 @@
 
 ### D8. 経路ごとの扱いと「未結線の経路」ガード
 
+> Issue #1723 の実装記録: [trigger-before-insert.md](trigger-before-insert.md)（INSERT の BEFORE ROW 経路・
+> 経路ごとのガード・PostgreSQL との差分）。
+>
+> Issue #1725 の実装記録: [trigger-update-delete.md](trigger-update-delete.md)（UPDATE／DELETE の行トリガ・
+> `UPDATE OF`・分割実行と未結線経路のガード）。UPSERT の発火・`WHEN` の評価・D6（`27000`）は今回見送り、
+> UPSERT は INSERT・UPDATE のどちらかのトリガがあれば `0A000` のまま。ビュー経由・データ変更 CTE の副文は
+> 共有のフォーム関数を通るため INSERT と同様に発火する。
+>
+> Issue #1726 の実装記録: [trigger-statement-truncate.md](trigger-statement-truncate.md)（段 2・段 7 の文トリガ・
+> 対象 0 行での発火・TRUNCATE トリガの順序と PostgreSQL との差分）。
+
 - 中核の不変条件: **トリガが黙って発火しない経路を作らない**
 - `tenant.rs` の `*_unchecked` 系の書き込み関数（`foreign-key.md` の結線一覧と同じ集合）は、
   発火側が発行した通過証（型）を持たない呼び出しを拒否する。対象表に該当イベントのトリガが
@@ -159,6 +182,9 @@
   DEFERRABLE は `0A000`、一時表へのトリガは初版では `0A000`、NoSQL 表層からは定義できない
 
 ### D9. Tx・テナント文脈（RLS）
+
+> Issue #1724 の実装記録: [trigger-after-insert.md](trigger-after-insert.md)（トリガ内の書き込みは
+> `TriggerWriteHandle` が呼び出しテナントの `PolicyContext` を借用して行い、差し替えられない）。
 
 - トリガ関数は、書き込みを発行したセッションの `PolicyContext`（テナント）で、同じ write txn
   の中で実行する。作成者の文脈へは切り替えない。`SECURITY DEFINER` は #2223 ADR のとおり
@@ -192,12 +218,19 @@
   （欠番は許容。行・索引・台帳の取り消しとは別扱いで、D9 のエラー時の例外と同じ）
 - `--require-operation-id` 構成での `operation_id` 省略は、外側の文の段階で従来どおり `23502`
 
+> Issue #1728 の実装記録: [trigger-ledger-consistency.md](trigger-ledger-consistency.md)
+> （再送・越境・クラッシュ注入のテストで D10 を固定。本番コードの変更なし）。
+
 ### D11. 再帰（入れ子）の上限
 
 - トリガの入れ子の深さは専用のカウンタで数える。既定値＋起動時 CLI `--max-trigger-depth`
   （`engine::trigger_limits`／`wire-server::trigger_limits_opt`。下げる方向だけ）。超過時は
-  `54001` で文全体を拒否する。既定値は**実装既定値であり spec 由来ではない**（案: 16。
-  #1727 で確定）
+  `54001` で文全体を拒否する。既定値は**実装既定値であり spec 由来ではない**（16 で確定。
+  範囲 `1..=16`）
+
+> Issue #1727 の実装記録: [trigger-depth-limit-cli.md](trigger-depth-limit-cli.md)（検査点は
+> `TriggerRuntime::invoke` の 1 か所、計数は thread-local＋RAII ガード）。
+
 - トリガ関数の呼び出しは、関数呼び出し深さ（#2223 ADR の `--max-function-call-depth`）にも
   1 として数える
 - 文数・ループ回数の予算（#2223 ADR）は、外側の文の行が直接発火させた 1 回の呼び出しを
@@ -209,6 +242,10 @@
   方式は、大量行の書き込みで常に `54000` になるため採らない
 
 ### D12. カタログ・DDL の契約（レイアウトは #1722 が決める）
+
+> Issue #1722 の実装記録: カタログのレイアウトと判定順は [trigger-catalog.md](trigger-catalog.md)。
+> UDF カタログがテナント単位のため、トリガ関数は同じテナントの関数に限り、D9 の共有 `public` 表の
+> 全テナント発火は現状のカタログでは表現できない（オーナー確認事項。同ファイルの「キー設計」節）。
 
 - トリガは表に属し、表の削除とともに削除する。名前は表ごとに一意で重複は `42710`。
   `OR REPLACE` は原子的に置き換える

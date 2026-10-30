@@ -12,6 +12,7 @@ mod temp_db;
 
 mod sql1797_early_stop;
 mod sql1798_interrupt;
+mod sql24_expr_lhs_null_between_in;
 mod sql41_bool_literal_where;
 mod sql42_aggregate_arith_projection;
 mod sql42_aggregate_expr_tree_projection;
@@ -116,7 +117,9 @@ mod sql65_substring_position_syntax;
 mod sql65_trunc;
 mod sql66_udf_catalog_load;
 mod sql66_udf_catalog_write;
+mod sql66_udf_drop_replace;
 mod sql66_udf_limits;
 mod sql66_udf_param_types;
+mod sql66_udf_returns;
 mod sql78_predicate_dml_noneq_between_params;
 mod sql78_where_noneq_between_params;
