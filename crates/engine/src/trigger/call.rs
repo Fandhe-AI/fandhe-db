@@ -6,7 +6,7 @@
 //! 無い間にトリガを黙って飛ばさない（fail-closed。実行モデルの D8）。
 
 use super::write_handle::TriggerWriteHandle;
-use crate::catalog::trigger::TriggerTiming;
+use crate::catalog::trigger::{TriggerLevel, TriggerTiming};
 use crate::catalog::TableSchema;
 use crate::row_codec::Value;
 use crate::sql::allowlist::SqlSurfaceError;
@@ -17,6 +17,8 @@ pub(crate) enum TriggerOp {
     Insert,
     Update,
     Delete,
+    /// 文トリガのみ（TRUNCATE は文単位だけ。Issue #1726）。
+    Truncate,
 }
 
 /// 1 回のトリガ呼び出しの入力。NEW に入るのは利用者の列（`schema.columns` 宣言順）だけで、テナントの
@@ -32,8 +34,11 @@ pub(crate) struct TriggerCall<'a> {
     pub(crate) table: &'a str,
     /// 対象表のスキーマ（列名・列型の一覧。NEW の列対応づけに使う）。
     pub(crate) schema: &'a TableSchema,
-    /// `TG_OP`（INSERT・UPDATE・DELETE）。
+    /// `TG_OP`（INSERT・UPDATE・DELETE・TRUNCATE）。
     pub(crate) op: TriggerOp,
+    /// `TG_LEVEL`（ROW・STATEMENT）。文トリガ（Issue #1726）は `old_row: None`・`new_row` は空
+    /// （実行モデルの D1: NEW／OLD は NULL）。
+    pub(crate) level: TriggerLevel,
     /// `OLD`（UPDATE・DELETE の更新前・削除前の行。`schema.columns` と同じ幅・順。INSERT は `None`）。
     pub(crate) old_row: Option<&'a [Value]>,
     /// `NEW`（`schema.columns` と同じ幅・順。DEFAULT・SEQUENCE の値は確定済み）。DELETE は NEW を
@@ -55,10 +60,16 @@ impl TriggerCall<'_> {
             TriggerOp::Insert => "INSERT",
             TriggerOp::Update => "UPDATE",
             TriggerOp::Delete => "DELETE",
+            TriggerOp::Truncate => "TRUNCATE",
         }
     }
-    /// `TG_LEVEL`。
-    pub(crate) const TG_LEVEL: &'static str = "ROW";
+    /// `TG_LEVEL`（呼び出しごと）。
+    pub(crate) fn tg_level(&self) -> &'static str {
+        match self.level {
+            TriggerLevel::Row => "ROW",
+            TriggerLevel::Statement => "STATEMENT",
+        }
+    }
 
     /// `TG_WHEN`（呼び出しごと）。
     pub(crate) fn tg_when(&self) -> &'static str {

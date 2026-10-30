@@ -1,12 +1,14 @@
-//! ROW トリガの発火計画（TABLE-45・Issue #1723・#1724・#1725）。
+//! ROW・STATEMENT トリガの発火計画（TABLE-45・Issue #1723・#1724・#1725・#1726）。
 //!
 //! 書き込み txn 内でカタログを 1 回読み（文の開始時に同じ txn から決める。実行モデルの D5。txn の外で
 //! 読むと並行 DDL との TOCTOU になる）、書き込みテナント自身の該当イベント（INSERT・UPDATE・DELETE）の
-//! トリガを次の 3 つに分類する。
+//! トリガを次の 2 つに分類する。
 //!
 //! - 該当イベントのトリガなし: 従来経路（`Ok(None)`）
-//! - BEFORE ROW・AFTER ROW だけ: トリガ経路（`Ok(Some(plan))`。通過証が無ければ `0A000`）
-//! - 文トリガを含む: `0A000`（#1726 で結線するまで黙って発火させない）
+//! - 1 件でもある（BEFORE／AFTER × ROW／STATEMENT の 4 群に分ける）: トリガ経路（`Ok(Some(plan))`。
+//!   通過証が無ければ `0A000`）。文トリガしか無い表も従来経路へ落とさない（黙って発火しないのを防ぐ）
+//!
+//! TRUNCATE は文トリガだけで、[`plan_truncate`] が表ごとに分類する（Issue #1726）。
 //!
 //! 判定は書き込みテナントの scope のカタログだけで行い、他テナントのトリガ・行の有無に依存しない
 //! （存在情報を応答の差に出さない）。呼び出し元は `tenant` の書き込み関数（INSERT・UPSERT・述語形・
@@ -21,14 +23,19 @@ use crate::catalog::{CatalogError, ReferentialAction, TableSchema};
 use crate::sql::allowlist::SqlSurfaceError;
 use crate::tenant::TenantWriteError;
 
-/// 発火対象の ROW トリガ（BEFORE・AFTER とも名前のバイト順）と、それを呼ぶ通過証。INSERT・UPDATE・
-/// DELETE で共通（イベントごとに [`plan_row_triggers`] が絞り込む）。
+/// 発火対象のトリガ（4 群とも名前のバイト順）と、それを呼ぶ通過証。INSERT・UPDATE・DELETE で共通
+/// （イベントごとに [`plan_row_triggers`] が絞り込む）。型名は ROW 時代のまま残す（Issue #1726 で
+/// 文トリガの群を足した）。
 pub(crate) struct RowTriggerPlan<'a> {
     pub(crate) runtime: &'a TriggerRuntime,
     /// BEFORE ROW（行ごとに書き込みの前に発火する。Issue #1723）。
     pub(crate) before: Vec<TriggerDef>,
     /// AFTER ROW（文の終わりに、書いた行ごとに発火する。Issue #1724）。
     pub(crate) after: Vec<TriggerDef>,
+    /// BEFORE STATEMENT（対象の列挙より前に 1 回、対象 0 件でも発火する。Issue #1726）。
+    pub(crate) before_stmt: Vec<TriggerDef>,
+    /// AFTER STATEMENT（AFTER ROW の後に 1 回、対象 0 件でも発火する。Issue #1726）。
+    pub(crate) after_stmt: Vec<TriggerDef>,
 }
 
 /// INSERT 経路が使う従来名（Issue #1723・#1724）。
@@ -69,7 +76,7 @@ pub(crate) struct UpdateTarget<'a> {
 /// トリガを分類する。
 ///
 /// - 該当イベントのトリガなし: `Ok(None)`（従来経路）
-/// - 文トリガを含む: `0A000`（#1726 で結線するまで黙って発火させない）
+/// - ROW・STATEMENT の別を問わず該当トリガあり: 4 群に分けて `Ok(Some(plan))`
 /// - `runtime` が `None`（未結線の経路）で該当トリガがある: `0A000`
 /// - UPDATE で `UPDATE OF` を持つトリガは、`update` の SET 列と交差しなければ外す。列名を解決できなければ
 ///   fail-closed に `0A000`
@@ -99,9 +106,6 @@ pub(crate) fn plan_row_triggers<'a>(
     if matching.is_empty() {
         return Ok(None);
     }
-    if matching.iter().any(|t| t.level != TriggerLevel::Row) {
-        return Err(unsupported("statement-level triggers are not supported"));
-    }
     let Some(runtime) = runtime else {
         return Err(unsupported(
             "triggers are not supported for this write path",
@@ -110,17 +114,75 @@ pub(crate) fn plan_row_triggers<'a>(
     if event == TriggerEvents::UPDATE {
         matching = filter_update_of(matching, update)?;
     }
-    let (before, after): (Vec<TriggerDef>, Vec<TriggerDef>) = matching
+    let (row, stmt): (Vec<TriggerDef>, Vec<TriggerDef>) = matching
+        .into_iter()
+        .partition(|t| t.level == TriggerLevel::Row);
+    let (before, after): (Vec<TriggerDef>, Vec<TriggerDef>) = row
         .into_iter()
         .partition(|t| t.timing == TriggerTiming::Before);
-    if before.is_empty() && after.is_empty() {
+    let (before_stmt, after_stmt): (Vec<TriggerDef>, Vec<TriggerDef>) = stmt
+        .into_iter()
+        .partition(|t| t.timing == TriggerTiming::Before);
+    // `UPDATE OF` の絞り込みで全て外れたときだけ従来経路（4 群とも空）。
+    if before.is_empty() && after.is_empty() && before_stmt.is_empty() && after_stmt.is_empty() {
         return Ok(None);
     }
     Ok(Some(RowTriggerPlan {
         runtime,
         before,
         after,
+        before_stmt,
+        after_stmt,
     }))
+}
+
+/// TRUNCATE の発火計画（表ごと。BEFORE／AFTER 別のトリガ。Issue #1726）。
+pub(crate) struct TruncatePlan {
+    /// BEFORE TRUNCATE（名前のバイト順）。
+    pub(crate) before: Vec<TriggerDef>,
+    /// AFTER TRUNCATE（名前のバイト順）。
+    pub(crate) after: Vec<TriggerDef>,
+}
+
+impl TruncatePlan {
+    /// 発火するトリガが 1 件も無いか。
+    pub(crate) fn is_empty(&self) -> bool {
+        self.before.is_empty() && self.after.is_empty()
+    }
+}
+
+/// `tenant` の表 `table` の TRUNCATE トリガを分類する（書き込みテナントの scope のカタログだけを見る）。
+/// 該当が無ければ空の計画。該当があり `runtime` が `None`（未結線の経路）なら `0A000`。TRUNCATE は
+/// 文トリガだけ（行トリガは定義の段で拒否済み）。参照アクションは発火しないので子表は見ない。
+pub(crate) fn plan_truncate(
+    write_txn: &redb::WriteTransaction,
+    tenant: &str,
+    table: &str,
+    runtime: Option<&TriggerRuntime>,
+) -> Result<TruncatePlan, TenantWriteError> {
+    let empty = TruncatePlan {
+        before: Vec::new(),
+        after: Vec::new(),
+    };
+    if !any_triggers_exist(write_txn)? {
+        return Ok(empty);
+    }
+    let matching: Vec<TriggerDef> = list_triggers_in_txn(write_txn, tenant, table)?
+        .into_iter()
+        .filter(|t| t.events.contains(TriggerEvents::TRUNCATE))
+        .collect();
+    if matching.is_empty() {
+        return Ok(empty);
+    }
+    if runtime.is_none() {
+        return Err(unsupported(
+            "triggers are not supported for this write path",
+        ));
+    }
+    let (before, after): (Vec<TriggerDef>, Vec<TriggerDef>) = matching
+        .into_iter()
+        .partition(|t| t.timing == TriggerTiming::Before);
+    Ok(TruncatePlan { before, after })
 }
 
 /// `UPDATE OF` を持つトリガを SET 列との交差で絞る。`update` が `None`（SET 列を知らない経路）で

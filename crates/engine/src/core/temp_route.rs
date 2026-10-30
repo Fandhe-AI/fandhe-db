@@ -1043,7 +1043,13 @@ impl EngineCore {
                 }
             }
             ParsedSql::Truncate(stmt) => Ok(crate::sql::SqlOutcome::Truncate(
-                crate::sql::exec::execute_truncate_in(target, ctx, stmt, self.ledger_mode)?,
+                crate::sql::exec::execute_truncate_in(
+                    target,
+                    ctx,
+                    stmt,
+                    self.ledger_mode,
+                    Some(&self.trigger_runtime),
+                )?,
             )),
             // 読み取り系は開いている書き込みトランザクションを読み取り源にする（自トランザクションの
             // 未 commit の変更を読める。キャッシュは使われない brute-force 経路）。

@@ -153,6 +153,9 @@
 > `UPDATE OF`・分割実行と未結線経路のガード）。UPSERT の発火・`WHEN` の評価・D6（`27000`）は今回見送り、
 > UPSERT は INSERT・UPDATE のどちらかのトリガがあれば `0A000` のまま。ビュー経由・データ変更 CTE の副文は
 > 共有のフォーム関数を通るため INSERT と同様に発火する。
+>
+> Issue #1726 の実装記録: [trigger-statement-truncate.md](trigger-statement-truncate.md)（段 2・段 7 の文トリガ・
+> 対象 0 行での発火・TRUNCATE トリガの順序と PostgreSQL との差分）。
 
 - 中核の不変条件: **トリガが黙って発火しない経路を作らない**
 - `tenant.rs` の `*_unchecked` 系の書き込み関数（`foreign-key.md` の結線一覧と同じ集合）は、

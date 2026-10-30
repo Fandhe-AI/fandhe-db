@@ -405,28 +405,7 @@ fn unwired_invoker_is_0a000() {
     assert_eq!(count(&core, &a, "trg"), 0);
 }
 
-// 文トリガ（INSERT）がある表への SQL INSERT は、結線するまで黙って発火させず `0A000`（AFTER ROW は Issue #1724 で結線済み）。
-#[test]
-fn statement_triggers_are_0a000() {
-    for (timing, level) in [
-        (TriggerTiming::After, TriggerLevel::Statement),
-        (TriggerTiming::Before, TriggerLevel::Statement),
-    ] {
-        let dir = tempdir();
-        let (core, calls) = core_with(dir.path(), fill_n());
-        let a = ctx("tenant-a");
-        add_trigger(
-            &core.storage,
-            "tenant-a",
-            "trg",
-            &trigger_def("t", timing, level),
-        );
-        let err = run(&core, &a, INSERT_A1).unwrap_err();
-        assert_eq!(err.wire_code(), "0A000");
-        assert_eq!(calls.load(Ordering::SeqCst), 0);
-        assert_eq!(count(&core, &a, "trg"), 0);
-    }
-}
+// 文トリガ（INSERT）の発火は `trigger_statement_tests.rs`（Issue #1726）で固定する。
 
 // 発火に未対応の経路（RETURNING・生の型付き挿入・UPSERT）は、INSERT トリガのある表で `0A000`。
 // 台帳は消費されない（同じ operation_id を、トリガを消した後の経路で使える）。

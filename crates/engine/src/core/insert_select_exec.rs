@@ -258,6 +258,13 @@ impl EngineCore {
                 req.operation_id.as_ref(),
                 self.ledger_mode,
                 &req.statement_hash,
+                // INSERT 文トリガは 0 行でも 1 回発火する（Issue #1726）。RETURNING 付きは未結線
+                // （INSERT トリガがあれば `0A000`）。
+                if returning.is_some() {
+                    None
+                } else {
+                    Some(&self.trigger_runtime)
+                },
             )?;
             return Ok(match returning {
                 None => SqlOutcome::Insert(InsertOutcome {
