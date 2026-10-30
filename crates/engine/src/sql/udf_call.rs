@@ -361,6 +361,10 @@ pub enum Expr {
     Cast {
         expr: Box<Expr>,
         ty: crate::sql::cast::CastType,
+        /// 内部トークン（[`Token::TypedValue`](crate::sql::lexer::Token::TypedValue)）由来で、
+        /// PL/pgSQL の変数の宣言型を定数式へ持ち込むためのもの。ユーザーが書いた `CAST` は常に偽で、
+        /// 定数式（`INSERT .. VALUES`）では従来どおり拒否される（`const_expr::prescan`）。
+        trusted: bool,
     },
     /// 配列コンストラクタ `ARRAY[<expr>, ...]`（対象ビヘイビア: TABLE-35。Issue #1602）。
     /// 要素型の統一は束縛段（`sql::array_expr`）が行う。多次元・`ARRAY(<subquery>)` は構文段が拒否する。
@@ -5923,7 +5927,9 @@ pub(super) fn bind_expr_any(
         Expr::ValueFunction { kind, precision } => bind_value_function(*kind, *precision, env),
         Expr::SqlJsonQuery(q) => crate::sql::jsonpath_fn::bind_sql_json_query(q, env, node_budget),
         // `CAST`／`<type> '<literal>'`（SQL-47・Issue #1590）。規則表の判定と束縛は `sql::cast`。
-        Expr::Cast { expr: inner, ty } => crate::sql::cast::bind_cast(inner, ty, env, node_budget),
+        Expr::Cast {
+            expr: inner, ty, ..
+        } => crate::sql::cast::bind_cast(inner, ty, env, node_budget),
         // 配列コンストラクタ・添字・スライス（TABLE-35・Issue #1602）。束縛は `sql::array_expr`。
         Expr::ArrayConstructor(items) => {
             crate::sql::array_expr::bind_array_constructor(items, env, node_budget)
@@ -7895,6 +7901,7 @@ fn schema_fn_bool_arg(arg: &Expr) -> Result<Option<bool>, SqlSurfaceError> {
         Expr::Cast {
             expr,
             ty: crate::sql::cast::CastType::Bool,
+            ..
         } => match &**expr {
             Expr::String(s) => parse(s).map(Some).ok_or_else(no_such),
             Expr::Null => Ok(None),

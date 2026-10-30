@@ -153,6 +153,26 @@ pub enum Token {
     /// （テーブル名・列名等）では従来どおり受理し、値位置（`expect_literal`）でだけ
     /// NULL 定数として受理せず `42601` で拒否する（`SET lang = "NULL"` が NULL 更新に化けるのを防ぐ）。
     QuotedNull(String),
+    /// 内部専用の型付き数値（`INSERT .. VALUES` の定数式で、PL/pgSQL の変数の宣言型を保つための値。
+    /// `raw` は符号を含まない数値リテラルの文字列）。字句解析器はユーザーの文字列からこのトークンを
+    /// **決して生成しない**（どの `tokenize*` も作らない）。生成するのは `plpgsql::subst` の
+    /// `Role::ConstExpr` 置換だけで、`sql::allowlist` の定数式の解析が `trusted` な
+    /// [`Expr::Cast`](crate::sql::udf_call::Expr::Cast) へ変換する。SQL テキストへ戻せないため
+    /// [`render_tokens`] は `None`、内容ハッシュ（`recovery::content_hash`）は拒否する（fail-closed）。
+    TypedValue {
+        kind: TypedKind,
+        raw: String,
+    },
+}
+
+/// [`Token::TypedValue`] の型（`sql::cast::CastType` の整数・浮動小数に対応する）。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum TypedKind {
+    Int2,
+    Int4,
+    Int8,
+    Float4,
+    Float8,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -274,7 +294,7 @@ pub(crate) fn render_tokens(tokens: &[Token]) -> Option<String> {
                 out.push_str(s);
                 out.push('"');
             }
-            Token::Param(_) => return None,
+            Token::Param(_) | Token::TypedValue { .. } => return None,
         }
     }
     Some(out)

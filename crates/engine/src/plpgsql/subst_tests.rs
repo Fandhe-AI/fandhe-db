@@ -9,7 +9,7 @@ use super::subst::{scalar_tokens, scalar_tokens_styled, substitute, substitute_p
 use crate::catalog::ColumnType;
 use crate::sql::allowlist::SqlSurfaceError;
 use crate::sql::exec::Cell;
-use crate::sql::lexer::{self, Token};
+use crate::sql::lexer::{self, Token, TypedKind};
 
 struct Env(Vec<PlScalar>);
 
@@ -414,20 +414,45 @@ fn dynamic_param_roles_survive_and_inside_case_and_literal_slots() {
     );
 }
 
+fn tv(kind: TypedKind, raw: &str) -> Token {
+    Token::TypedValue {
+        kind,
+        raw: raw.to_string(),
+    }
+}
+
 #[test]
-fn const_expr_elements_use_cast_free_typed_substitution() {
-    // bigint（int4 に収まる値）は 2^31 を足し引きして bigint の算術に載せる（CAST は定数式で不可）。
-    let v = typed(ColumnType::BigInt, Cell::SignedInteger(2_147_483_647));
-    assert_eq!(
-        scalar_tokens(&v, VarRole::ConstExpr).expect("bigint"),
-        lex("((2147483647 + 2147483648) - 2147483648)")
-    );
-    // int4 を超える値はリテラルのまま bigint。
-    let v = typed(ColumnType::BigInt, Cell::SignedInteger(3_000_000_000));
-    assert_eq!(
-        scalar_tokens(&v, VarRole::ConstExpr).expect("big"),
-        lex("3000000000")
-    );
+fn const_expr_elements_use_internal_typed_values() {
+    // 整数・浮動小数は内部専用の型付き値トークン（宣言型を畳み込みへ持ち込む）。
+    let cases: Vec<(PlScalar, Vec<Token>)> = vec![
+        (
+            typed(ColumnType::BigInt, Cell::SignedInteger(2_147_483_647)),
+            vec![tv(TypedKind::Int8, "2147483647")],
+        ),
+        (
+            typed(ColumnType::BigInt, Cell::SignedInteger(-5)),
+            vec![Token::Punct('-'), tv(TypedKind::Int8, "5")],
+        ),
+        (
+            typed(ColumnType::SmallInt, Cell::SignedInteger(7)),
+            vec![tv(TypedKind::Int2, "7")],
+        ),
+        (
+            typed(ColumnType::Integer, Cell::SignedInteger(7)),
+            vec![tv(TypedKind::Int4, "7")],
+        ),
+        (
+            typed(ColumnType::Double, Cell::Float(1.5)),
+            vec![tv(TypedKind::Float8, "1.5")],
+        ),
+        (
+            typed(ColumnType::Real, Cell::Float(2.0)),
+            vec![tv(TypedKind::Float4, "2.0")],
+        ),
+    ];
+    for (v, want) in cases {
+        assert_eq!(scalar_tokens(&v, VarRole::ConstExpr).expect("typed"), want);
+    }
     // 日付は型付きリテラル、NULL は裸（列型が決める）。
     let d = typed(ColumnType::Date, Cell::Date(0));
     assert_eq!(
@@ -438,7 +463,10 @@ fn const_expr_elements_use_cast_free_typed_substitution() {
         scalar_tokens(&PlScalar::null(ColumnType::Integer), VarRole::ConstExpr).expect("null"),
         lex("NULL")
     );
-    // scale 0 の numeric: 単独は `3`、式の中は `3.0`。
+}
+
+#[test]
+fn const_expr_numeric_is_bare_only_as_a_lone_element() {
     let n0 = typed(
         ColumnType::Numeric {
             precision: 5,
@@ -446,13 +474,32 @@ fn const_expr_elements_use_cast_free_typed_substitution() {
         },
         Cell::Numeric(crate::numeric::Decimal::from_parts(3, 0).expect("decimal")),
     );
-    let tokens = lex("VALUES (v, v * 2)");
-    let sites = vec![
-        site(2, VarRole::ConstExpr, 0),
-        site(4, VarRole::ConstExpr, 0),
-    ];
-    let out = substitute(&tokens, &sites, &Env(vec![n0]), false, NumStyle::Typed).expect("numeric");
-    assert_eq!(out, lex("VALUES (3, 3.0 * 2)"));
+    let env = Env(vec![n0]);
+    // 単独（符号付きを含む）は裸の数値。
+    for (sql, pos, want) in [
+        ("VALUES (v)", 2, "VALUES (3)"),
+        ("VALUES (1, v)", 4, "VALUES (1, 3)"),
+        ("VALUES (-v)", 3, "VALUES (-3)"),
+    ] {
+        let sites = vec![site(pos, VarRole::ConstExpr, 0)];
+        let out = substitute(&lex(sql), &sites, &env, false, NumStyle::Typed).expect(sql);
+        assert_eq!(out, lex(want), "{sql}");
+    }
+    // 式の中・関数の引数は 0A000（numeric の算術は定数式で扱えない）。
+    for (sql, pos) in [
+        ("VALUES (v / 2)", 2),
+        ("VALUES (abs(v))", 4),
+        ("VALUES (1 + v)", 4),
+    ] {
+        let sites = vec![site(pos, VarRole::ConstExpr, 0)];
+        let e = substitute(&lex(sql), &sites, &env, false, NumStyle::Typed).expect_err(sql);
+        assert_eq!(e.wire_code(), "0A000", "{sql}");
+    }
+}
+
+#[test]
+fn internal_typed_value_cannot_be_rendered() {
+    assert!(lexer::render_tokens(&[tv(TypedKind::Int8, "1")]).is_none());
 }
 
 #[test]
@@ -460,8 +507,14 @@ fn execute_values_role_survives_and_inside_case() {
     let v = typed(ColumnType::BigInt, Cell::SignedInteger(5));
     let sql = "INSERT INTO t (a) VALUES (CASE WHEN 1 > 0 AND 2 > 1 THEN $1 END)";
     let out = substitute_params(&lex(sql), std::slice::from_ref(&v), NumStyle::Typed).expect(sql);
-    assert_eq!(
-        out,
-        lex("INSERT INTO t (a) VALUES (CASE WHEN 1 > 0 AND 2 > 1 THEN ((5 + 2147483648) - 2147483648) END)")
-    );
+    let mut want = lex("INSERT INTO t (a) VALUES (CASE WHEN 1 > 0 AND 2 > 1 THEN 5 END)");
+    // `5` を内部専用の型付き値トークンへ差し替えたものと一致する。
+    let pos = want
+        .iter()
+        .position(|t| matches!(t, Token::Number(n) if n == "5"))
+        .expect("five");
+    if let Some(slot) = want.get_mut(pos) {
+        *slot = tv(TypedKind::Int8, "5");
+    }
+    assert_eq!(out, want);
 }

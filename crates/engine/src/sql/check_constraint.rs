@@ -190,7 +190,7 @@ pub(crate) fn render_expr(expr: &Expr) -> String {
         Expr::SqlJsonQuery(q) => render_sql_json_query(q),
         // `CAST`（SQL-47・Issue #1590）。構文段が CHECK 本体での使用を `0A000` で拒否するため通常は
         // 到達しないが、全 variant 網羅と往復のため、変換先は `CastType::to_sql` の固定語彙で出す。
-        Expr::Cast { expr, ty } => format!("CAST({} AS {})", render_expr(expr), ty.to_sql()),
+        Expr::Cast { expr, ty, .. } => format!("CAST({} AS {})", render_expr(expr), ty.to_sql()),
         // 配列コンストラクタ・添字（TABLE-35・Issue #1602）。構文段が CHECK 本体での使用を `0A000` で
         // 拒否するため通常は到達しないが、全 variant 網羅のため PG 構文で出す（基底は括弧付き）。
         Expr::ArrayConstructor(items) => format!(
@@ -1146,9 +1146,10 @@ pub(crate) fn map_expr_idents(expr: &Expr, f: &dyn Fn(&str) -> String) -> Expr {
                 Err(never) => match never {},
             }
         }
-        Expr::Cast { expr, ty } => Expr::Cast {
+        Expr::Cast { expr, ty, trusted } => Expr::Cast {
             expr: Box::new(rec(expr)),
             ty: ty.clone(),
+            trusted: *trusted,
         },
     }
 }

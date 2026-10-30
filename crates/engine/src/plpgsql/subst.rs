@@ -16,7 +16,7 @@ use crate::plpgsql::ast::{VarRole, VarSite};
 use crate::plpgsql::host::{PlScalar, VarLookup};
 use crate::sql::allowlist::SqlSurfaceError;
 use crate::sql::exec::Cell;
-use crate::sql::lexer::{self, Token};
+use crate::sql::lexer::{self, Token, TypedKind};
 
 fn unsupported_type() -> SqlSurfaceError {
     SqlSurfaceError::feature_not_supported(
@@ -178,43 +178,43 @@ fn bare_number_tokens(v: &PlScalar) -> Result<Vec<Token>, SqlSurfaceError> {
     }
 }
 
-/// `INSERT .. VALUES` の要素（定数式。`CAST` を受理しない）の数値のトークン列。拡張クエリの `$n`
-/// の型付き置換（`sql::params::substitute_values_typed`）と同じく、値を字句解析器がリテラルから作る
-/// トークンで置換し、型は書き込み先の列型が決める。式の中では次のとおり型を保つ。
-/// - bigint で int4 に収まる値は `((v + 2147483648) - 2147483648)`（リテラルのまま `p + 1` とすると
-///   int4 の算術として範囲エラーになる。畳み込み後は値と同じリテラルで、列型の検査は従来どおり）
-/// - scale 0 の numeric は、要素が単独（`lone`）なら `3`（整数列にも受理される）、式の中では `3.0`
-///   （整数リテラルだと `p / 2` が整数除算へ化ける）
+/// `INSERT .. VALUES` の要素（定数式。利用者の `CAST` を受理しない）の数値のトークン列。
+/// 整数（smallint／integer／bigint）と浮動小数（real／double）は、内部専用の型付き値トークン
+/// （[`Token::TypedValue`]。字句解析器は利用者の文字列から生成しない）で置換し、定数式の畳み込みが
+/// 宣言型どおりの算術を行う（`p + 1` が bigint の算術になる）。numeric は定数式で算術できないため、
+/// 単独の要素（[`is_lone`]）なら裸の数値（書き込み先の列型が決める）、式の中では `0A000`
+/// （型が黙って変わる経路を残さない）。
 fn const_number_tokens(
     v: &PlScalar,
-    bare: Vec<Token>,
+    mut bare: Vec<Token>,
     lone: bool,
 ) -> Result<Vec<Token>, SqlSurfaceError> {
-    let int_value = match &v.cell {
-        Cell::SignedInteger(i) => Some(i128::from(*i)),
-        Cell::Integer(u) => Some(i128::from(*u)),
-        _ => None,
+    let kind = match (&v.ty, &v.cell) {
+        (_, Cell::Numeric(_)) => {
+            return if lone {
+                Ok(bare)
+            } else {
+                Err(SqlSurfaceError::feature_not_supported(
+                    "a numeric variable inside an expression of an INSERT VALUES element is not supported",
+                ))
+            };
+        }
+        (ColumnType::SmallInt, _) => TypedKind::Int2,
+        (ColumnType::Integer, _) => TypedKind::Int4,
+        (ColumnType::BigInt, _) => TypedKind::Int8,
+        (ColumnType::Real, _) => TypedKind::Float4,
+        (_, Cell::Float(_)) => TypedKind::Float8,
+        (_, Cell::SignedInteger(i)) if i32::try_from(*i).is_ok() => TypedKind::Int4,
+        (_, Cell::Integer(u)) if i32::try_from(*u).is_ok() => TypedKind::Int4,
+        _ => TypedKind::Int8,
     };
-    if let (Some(n), ColumnType::BigInt) = (int_value, &v.ty) {
-        if i32::try_from(n).is_ok() {
-            let shift = || Token::Number("2147483648".to_string());
-            let mut out = vec![Token::Punct('('), Token::Punct('(')];
-            out.extend(bare);
-            out.extend([Token::Punct('+'), shift(), Token::Punct(')')]);
-            out.extend([Token::Punct('-'), shift(), Token::Punct(')')]);
-            return Ok(out);
+    match bare.pop() {
+        Some(Token::Number(raw)) => {
+            bare.push(Token::TypedValue { kind, raw });
+            Ok(bare)
         }
+        _ => Err(unsupported_type()),
     }
-    if let (Cell::Numeric(_), false) = (&v.cell, lone) {
-        let mut out = bare;
-        if let Some(Token::Number(n)) = out.last_mut() {
-            if !n.contains(['.', 'e', 'E']) {
-                n.push_str(".0");
-            }
-        }
-        return Ok(out);
-    }
-    Ok(bare)
 }
 
 /// 数値セルの置換トークン。列としても式としても読める位置は `CAST(<literal> AS <宣言型>)` で
@@ -304,15 +304,26 @@ fn role_tokens(
     Ok(out)
 }
 
-/// `tokens[pos]` が値リスト・括弧の中で単独の要素（直前が `(` か `,`、直後が `,` か `)`）か。
+/// `tokens[pos]` が `VALUES` の行の中で単独の要素（符号 `-` を除いて、直前が `,` か行頭の `(`、直後が
+/// `,` か `)`）か。行頭の `(` は直前が `VALUES`・`,`・`(` のものに限る（`abs(p)` の `(` を除く）。
+/// 関数の第 2 引数以降（`f(a, p)`）は区別できず単独とみなす（numeric の型は書き込み先の列型が決める）。
 fn is_lone(tokens: &[Token], pos: usize) -> bool {
-    matches!(
-        pos.checked_sub(1).and_then(|p| tokens.get(p)),
-        Some(Token::Punct('(' | ','))
-    ) && matches!(
-        tokens.get(pos.saturating_add(1)),
-        Some(Token::Punct(',' | ')'))
-    )
+    let before = |n: usize| pos.checked_sub(n).and_then(|p| tokens.get(p));
+    let skip = usize::from(matches!(before(1), Some(Token::Punct('-')))) + 1;
+    let prev_ok = match before(skip) {
+        Some(Token::Punct(',')) => true,
+        Some(Token::Punct('(')) => match pos.checked_sub(skip + 1).and_then(|p| tokens.get(p)) {
+            Some(Token::Punct(',' | '(')) => true,
+            Some(Token::Ident(w)) => w.eq_ignore_ascii_case("VALUES"),
+            _ => false,
+        },
+        _ => false,
+    };
+    prev_ok
+        && matches!(
+            tokens.get(pos.saturating_add(1)),
+            Some(Token::Punct(',' | ')'))
+        )
 }
 
 /// 負値（`-` + 数値の 2 トークン）を、`::` の直前または直前が `-` の位置で括弧に包む

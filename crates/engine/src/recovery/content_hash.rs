@@ -1540,6 +1540,11 @@ fn push_token(b: &mut HashInputBuilder, t: &crate::sql::lexer::Token) -> Result<
                 "content hash: unbound parameter placeholder".to_string(),
             ))
         }
+        Token::TypedValue { .. } => {
+            return Err(StorageError::Codec(
+                "content hash: internal typed value token".to_string(),
+            ))
+        }
     }
     Ok(())
 }
@@ -3114,7 +3119,7 @@ fn push_dml_expr(
         // 前置順に直列化する。型だけ・被演算子だけ・CAST の有無だけが異なる再送を同一内容と誤判定しない
         // （RECOVER-10）。UPDATE の `SET` 式や述語形の WHERE に CAST が入りうるため、拒否せずハッシュする。
         // 既存タグ 1〜15 は不変。
-        Expr::Cast { expr, ty } => {
+        Expr::Cast { expr, ty, .. } => {
             b.push_u8(16);
             b.push_bytes(ty.to_sql().as_bytes())
                 .map_err(|_| dml_hash_field_too_large())?;
@@ -6767,6 +6772,7 @@ mod tests {
         crate::sql::udf_call::Expr::Cast {
             expr: Box::new(inner),
             ty,
+            trusted: false,
         }
     }
     fn array_ctor(items: Vec<crate::sql::udf_call::Expr>) -> crate::sql::udf_call::Expr {

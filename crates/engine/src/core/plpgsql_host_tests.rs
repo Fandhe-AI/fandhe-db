@@ -1080,46 +1080,107 @@ fn n_of(core: &EngineCore, c: &PolicyContext, id: u64) -> Option<i64> {
     }
 }
 
-#[test]
-fn values_elements_keep_bigint_semantics_without_cast() {
-    let (core, _g) = new_core(LedgerMode::Optional);
-    let c = ctx("t1");
-    // 裸のリテラルだと `2147483647 + 1` が int4 の算術として範囲エラーになる（VALUES は CAST 不可）。
-    call(
-        "BEGIN INSERT INTO docs (id, embedding, lang, n) VALUES (1, '[0.1,0.2]', 'a', p + 1 - 5); RETURN 1; END",
-    )
-    .param("p", SqlColumnTypeName::BigInt, big(2_147_483_647))
-    .autocommit(&core, &c)
-    .expect("bigint boundary in VALUES");
-    assert_eq!(n_of(&core, &c, 1), Some(2_147_483_643));
-    // 単独の要素・負値。
-    call("BEGIN INSERT INTO docs (id, embedding, lang, n) VALUES (2, '[0.1,0.2]', 'a', p); RETURN 1; END")
-        .param("p", SqlColumnTypeName::BigInt, big(-2_147_483_648))
-        .autocommit(&core, &c)
-        .expect("bigint lone");
-    assert_eq!(n_of(&core, &c, 2), Some(-2_147_483_648));
+const VALUES_HEAD: &str = "INSERT INTO docs (id, embedding, lang, n) VALUES";
+
+/// `VALUES` の要素式 `expr`（変数 `p` を含む）を持つ本体を実行する（id 固定）。
+fn insert_with(
+    core: &EngineCore,
+    c: &PolicyContext,
+    id: u64,
+    expr: &str,
+    ty: SqlColumnTypeName,
+    arg: PlScalar,
+) -> Result<CallOutcome, SqlSurfaceError> {
+    let src = format!("BEGIN {VALUES_HEAD} ({id}, '[0.1,0.2]', 'a', {expr}); RETURN 1; END");
+    call(&src).param("p", ty, arg).autocommit(core, c)
 }
 
 #[test]
-fn values_elements_accept_numeric_scale_zero_and_null() {
+fn values_elements_keep_bigint_semantics() {
     let (core, _g) = new_core(LedgerMode::Optional);
     let c = ctx("t1");
-    call("BEGIN INSERT INTO docs (id, embedding, lang, n) VALUES (1, '[0.1,0.2]', 'a', p); RETURN 1; END")
-        .param("p", NUMERIC0, numeric0(3))
-        .autocommit(&core, &c)
-        .expect("numeric lone");
+    // 宣言型（bigint）を保つため、`2147483647 + 1` が int4 の算術として範囲エラーにならない。
+    insert_with(
+        &core,
+        &c,
+        1,
+        "p + 1 - 5",
+        SqlColumnTypeName::BigInt,
+        big(2_147_483_647),
+    )
+    .expect("bigint boundary");
+    assert_eq!(n_of(&core, &c, 1), Some(2_147_483_643));
+    // 単独・負値。
+    insert_with(
+        &core,
+        &c,
+        2,
+        "p",
+        SqlColumnTypeName::BigInt,
+        big(-2_147_483_648),
+    )
+    .expect("bigint lone");
+    assert_eq!(n_of(&core, &c, 2), Some(-2_147_483_648));
+    // integer の変数は int4 の算術（範囲エラーは PostgreSQL と同じ 22003）。
+    let e = insert_with(
+        &core,
+        &c,
+        3,
+        "p + 1",
+        SqlColumnTypeName::Integer,
+        int(2_147_483_647),
+    )
+    .expect_err("int4 overflow");
+    assert_eq!(e.wire_code(), "22003");
+}
+
+#[test]
+fn values_elements_accept_null_and_float() {
+    let (core, _g) = new_core(LedgerMode::Optional);
+    let c = ctx("t1");
+    insert_with(&core, &c, 1, "p", SqlColumnTypeName::Integer, null_int()).expect("null");
+    assert_eq!(n_of(&core, &c, 1), None);
+    insert_with(&core, &c, 2, "p", SqlColumnTypeName::Double, float(4.0)).expect("float");
+    assert_eq!(n_of(&core, &c, 2), Some(4));
+    insert_with(&core, &c, 3, "p * 2", SqlColumnTypeName::Double, float(2.5)).expect("float expr");
+    assert_eq!(n_of(&core, &c, 3), Some(5));
+}
+
+#[test]
+fn values_elements_numeric_is_lone_only() {
+    let (core, _g) = new_core(LedgerMode::Optional);
+    let c = ctx("t1");
+    insert_with(&core, &c, 1, "p", NUMERIC0, numeric0(3)).expect("numeric lone");
     assert_eq!(n_of(&core, &c, 1), Some(3));
-    // 式の中の numeric は numeric のまま（整数リテラルだと `p / 2` が整数除算になる）。
-    call("BEGIN INSERT INTO docs (id, embedding, lang, n) VALUES (2, '[0.1,0.2]', 'a', p * 2); RETURN 1; END")
-        .param("p", NUMERIC0, numeric0(3))
-        .autocommit(&core, &c)
-        .expect("numeric expression");
-    assert_eq!(n_of(&core, &c, 2), Some(6));
-    call("BEGIN INSERT INTO docs (id, embedding, lang, n) VALUES (3, '[0.1,0.2]', 'a', p); RETURN 1; END")
-        .param("p", SqlColumnTypeName::Integer, null_int())
-        .autocommit(&core, &c)
-        .expect("null lone");
-    assert_eq!(n_of(&core, &c, 3), None);
+    // 静的な `-p` は定義時の検証が拒否する（定数式に変数への単項マイナスは無い。素の SQL の `-col` と同じ）。
+    // 符号付きの単独要素は EXECUTE の `-$1` で確かめる（`execute_using_values_follow_the_same_substitution`）。
+    // 式の中の numeric は型を保てないため拒否する（整数除算への化けを残さない）。
+    for expr in ["p / 2", "p * 2"] {
+        let e = insert_with(&core, &c, 9, expr, NUMERIC0, numeric0(3)).expect_err(expr);
+        assert_eq!(e.wire_code(), "0A000", "{expr}");
+    }
+}
+
+#[test]
+fn plain_sql_values_behavior_is_unchanged() {
+    let (core, _g) = new_core(LedgerMode::Optional);
+    let c = ctx("t1");
+    let ins = |e: &str| {
+        sql(
+            &core,
+            &c,
+            &format!("{VALUES_HEAD} (50, '[0.1,0.2]', 'x', {e})"),
+        )
+    };
+    // 利用者が書く SQL: int4 の算術は 22003、CAST は定数式で 0A000 のまま。
+    assert_eq!(
+        ins("2147483647 + 1").expect_err("overflow").wire_code(),
+        "22003"
+    );
+    assert_eq!(
+        ins("CAST(1 AS bigint)").expect_err("cast").wire_code(),
+        "0A000"
+    );
 }
 
 #[test]
@@ -1147,19 +1208,28 @@ fn in_and_between_accept_numeric_integer_form() {
 fn execute_using_values_follow_the_same_substitution() {
     let (core, _g) = new_core(LedgerMode::Optional);
     let c = ctx("t1");
-    let src = "BEGIN EXECUTE 'INSERT INTO docs (id, embedding, lang, n) VALUES (1, ''[0.1,0.2]'', ''a'', $1 + 1 - 5)' USING p; \
-        EXECUTE 'INSERT INTO docs (id, embedding, lang, n) VALUES (2, ''[0.1,0.2]'', ''a'', $1)' USING q; \
-        EXECUTE 'INSERT INTO docs (id, embedding, lang, n) VALUES (3, ''[0.1,0.2]'', ''a'', $1)' USING r; \
-        RETURN 1; END";
-    call(src)
-        .param("p", SqlColumnTypeName::BigInt, big(2_147_483_647))
-        .param("q", NUMERIC0, numeric0(3))
-        .param("r", SqlColumnTypeName::Integer, null_int())
-        .autocommit(&core, &c)
-        .expect("execute using");
+    let exec = |id: u64, expr: &str, ty: SqlColumnTypeName, arg: PlScalar| {
+        let src = format!(
+            "BEGIN EXECUTE '{VALUES_HEAD} ({id}, ''[0.1,0.2]'', ''a'', {expr})' USING p; RETURN 1; END"
+        );
+        call(&src).param("p", ty, arg).autocommit(&core, &c)
+    };
+    exec(
+        1,
+        "$1 + 1 - 5",
+        SqlColumnTypeName::BigInt,
+        big(2_147_483_647),
+    )
+    .expect("bigint");
     assert_eq!(n_of(&core, &c, 1), Some(2_147_483_643));
-    assert_eq!(n_of(&core, &c, 2), Some(3));
-    assert_eq!(n_of(&core, &c, 3), None);
+    exec(2, "$1", SqlColumnTypeName::Integer, null_int()).expect("null");
+    assert_eq!(n_of(&core, &c, 2), None);
+    exec(3, "$1", SqlColumnTypeName::Double, float(4.0)).expect("float");
+    assert_eq!(n_of(&core, &c, 3), Some(4));
+    exec(4, "-$1", NUMERIC0, numeric0(3)).expect("numeric signed lone");
+    assert_eq!(n_of(&core, &c, 4), Some(-3));
+    let e = exec(9, "$1 / 2", NUMERIC0, numeric0(3)).expect_err("numeric expr");
+    assert_eq!(e.wire_code(), "0A000");
     // IN・BETWEEN（リテラル専用位置）の numeric 整数形。
     let out = call(
         "DECLARE c bigint; BEGIN \

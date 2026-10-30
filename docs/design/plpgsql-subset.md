@@ -492,11 +492,17 @@ D3・D5・D6・D8 の最終判断。実装は `crates/engine/src/core/plpgsql_ho
   同じく、字句解析器がリテラルから作るトークンで置換する（再試行・文字列の判定には頼らない）。
   (1) `LiteralSlot`（`LIMIT`・`IN` リスト・`BETWEEN` 境界・`LIKE`）は値を保つ裸のリテラル（指数表記・
   scale 0 の numeric を含む。NaN／Infinity は `0A000`）。(2) `ConstExpr`（`INSERT .. VALUES` の要素。
-  定数式の束縛が `CAST` を拒否する。パーサーが `colref_sink::Role::ConstExpr` で記録し、`EXECUTE` は
-  直前の `VALUES` から推定する）は、NULL は裸、日付・時刻は `DATE '...'` 等の型付きリテラル、数値は
-  bigint で int4 に収まる値を `((v + 2147483648) - 2147483648)`（リテラルのまま `p + 1` とすると
-  int4 の算術として範囲エラーになる。畳み込み後は値と同じリテラル）、scale 0 の numeric は単独の
-  要素なら `3`・式の中では `3.0`（整数除算への化け防止）。`WHERE` 形の比較の検査（`where_probe`）は
+  定数式の束縛が利用者の `CAST` を拒否する。パーサーが `colref_sink::Role::ConstExpr` で記録し、
+  `EXECUTE` は直前の `VALUES` から推定する）は、NULL は裸、日付・時刻は `DATE '...'` 等の型付きリテラル、
+  整数（smallint／integer／bigint）と浮動小数（real／double）は内部専用の型付き値トークン
+  （`lexer::Token::TypedValue`。字句解析器は利用者の文字列から生成せず、`render_tokens` は `None`、
+  内容ハッシュは拒否する）で置換する。許可リストの定数式の解析がこれを `trusted` な `Expr::Cast` へ
+  変換し、畳み込みが宣言型どおりの算術を行う（bigint の `p + 1` が int4 の範囲エラーにならない）。
+  利用者の `CAST` は `trusted: false` のままで、`VALUES (CAST(1 AS bigint))` は 0A000 のまま。
+  numeric は定数式で算術できないため、単独の要素（符号付きを含む）は裸の数値（列型が決める）、
+  式の中は 0A000。静的 SQL の `VALUES (-p)` は定義時の検証が拒否する（素の SQL の `-col` と同じ）。
+  負値の numeric を単項マイナスの下に置く形（`-(-3)`）は括弧付きになり定数式が受理しない。
+  `WHERE` 形の比較の検査（`where_probe`）は
   値同士の比較なので裸の数値（`NumStyle::Bare`）
 - 役割別: `SelectItemBare` は `AS <名前>` を付け、投影が裸の文字列・真偽値を受理しないため
   `CAST('...' AS text)`／`CAST('true' AS boolean)` で包む。数値の `CAST` 包みは `OrderKey`／`GroupKey` の

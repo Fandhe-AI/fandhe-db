@@ -154,9 +154,16 @@ fn prescan(expr: &Expr) -> Result<(), SqlSurfaceError> {
         }),
         // `CAST`（SQL-47・Issue #1590）も定数式（INSERT VALUES・DEFAULT 等）では未対応（`0A000`）。
         // 値の変換は #1591／#1592 の担当で、評価できない式を定数として黙って通さない。
-        Expr::Cast { .. } => Err(SqlSurfaceError::FeatureNotSupported {
+        Expr::Cast { trusted: false, .. } => Err(SqlSurfaceError::FeatureNotSupported {
             detail: "CAST is not supported in a constant expression".to_string(),
         }),
+        // 内部専用の型付き数値（`lexer::Token::TypedValue` 由来）。PL/pgSQL の変数の宣言型を
+        // 定数式へ持ち込む唯一の経路で、被演算子は数値リテラルだけ。
+        Expr::Cast {
+            expr,
+            trusted: true,
+            ..
+        } => prescan(expr),
         // 配列コンストラクタ・添字（TABLE-35・Issue #1602）は子を再帰で検査する（列参照は
         // `Expr::Ident` の腕で `42703`）。評価結果の配列は `fold_const_literal` が配列テキストへ畳む。
         Expr::ArrayConstructor(_) | Expr::Subscript { .. } | Expr::Quantified { .. } => expr
@@ -254,7 +261,8 @@ fn check_intermediate_precision(expr: &Expr) -> Result<(), SqlSurfaceError> {
         | Expr::TimestampTzLiteral { .. }
         | Expr::ValueFunction { .. } => Ok(()),
         Expr::Collate { expr, .. } => check_intermediate_precision(expr),
-        // 到達しない（`prescan` が拒否済み）。
+        // `SqlJsonQuery` と利用者の `CAST` は到達しない（`prescan` が拒否済み）。`trusted` な `CAST` は
+        // 数値リテラルの宣言型変換で、値の範囲は評価側（束縛後の型付き算術）が検査する。
         Expr::SqlJsonQuery(_) | Expr::Cast { .. } => Ok(()),
         // 配列の要素・添字は子ごとに精度を検査する（要素値の範囲は配列の構築側が検査する）。
         Expr::ArrayConstructor(_) | Expr::Subscript { .. } | Expr::Quantified { .. } => expr
