@@ -16,6 +16,9 @@
 - 範囲外（後続）: 発火、`RETURNS trigger` 関数の保存形式と成功経路の E2E（#2228・#1723）、
   `DROP FUNCTION ... CASCADE` によるトリガの連鎖削除（#1917）、件数上限の CLI 設定、一時表のトリガ。
 
+> 発火側（Issue #1723）は書き込みテナント自身の scope のトリガだけを引いて発火する。共有 `public` 表への
+> 他テナントの書き込みで、別テナントが作ったトリガは発火しない（[trigger-before-insert.md](trigger-before-insert.md)）。
+
 ## 関数側が未整備であることの帰結
 
 `RETURNS trigger` 関数（#2228）はまだ無く、UDF カタログの `FunctionDef` はトリガ関数を表現できない。

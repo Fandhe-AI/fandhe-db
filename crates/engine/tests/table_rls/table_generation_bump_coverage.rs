@@ -498,7 +498,8 @@ const ALLOWLIST: &[(&str, u32)] = &[
     // Issue #2199（行識別方式の導入）の変更に伴い行が移動したための追随（旧: 561）。
     // Issue #2207（GIN 相当索引の維持。`TenantWriteError::GinIndexEntryLimitExceeded` の追加・`catalog.rs` の行追加）で
     // `tenant.rs`・`catalog.rs` の各エントリを現行行へ追随（commit 対象は変わらない）。
-    ("tenant.rs", 591),
+    // Issue #1723（`TenantWriteError::TriggerFailed` の追加）で現行行へ追随（commit 対象は変わらない）。
+    ("tenant.rs", 598),
     // Issue #1688（SEQUENCE のカタログ）: `catalog/sequence.rs` の `create_sequence`／`drop_sequence` は
     // SEQUENCE の定義表・状態表・ID カウンタだけを書く。表の行スキーマ（`user_rows/{table}`）も
     // 表のスキーマ世代も変えないため、`bump_table_generation_in_txn` を伴わない。Issue #1690 の
@@ -568,8 +569,8 @@ const ALLOWLIST: &[(&str, u32)] = &[
     // Issue #1733（INSERT ... SELECT）: `core/insert_select_exec.rs` の 995・1127 行（Issue #2613・#2614・#2615・#2212 で追随）は `#[cfg(test)]` 内の
     // 明示トランザクション検証で共有 write txn を commit するだけの呼び出し。行の書き込みと世代 bump は
     // 既存の `sql::exec::execute_insert_*_in` 経路が同じ txn 内で済ませており、ここで追加の bump は不要。
-    ("core/insert_select_exec.rs", 995),
-    ("core/insert_select_exec.rs", 1127),
+    ("core/insert_select_exec.rs", 996),
+    ("core/insert_select_exec.rs", 1128),
     // Issue #1679（CTAS の台帳）: `core/ctas_exec.rs` の 300 行は `IF NOT EXISTS` の no-op（既存の表がある）で
     // `operation_id` の台帳だけを記録する commit。表の中身・定義は変えないため世代 bump は不要
     // （表を作る commit 側の 235 行は直前で bump 済み）。

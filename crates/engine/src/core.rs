@@ -94,6 +94,9 @@ mod dml_join_exec;
 mod dml_join_exec_tests;
 #[cfg(test)]
 mod dml_subquery_exec_tests;
+// BEFORE ROW INSERT トリガの発火の結合テスト（TABLE-45・Issue #1723）。
+#[cfg(test)]
+mod trigger_insert_tests;
 
 /// 検索 `k` の上限（直接 Rust API 用）。明示 `LIMIT` の既定値と同値だが、SQL／NoSQL の
 /// `LIMIT` 範囲は起動時設定（`result_limits::ResultLimits`。Issue #1555）が決め、本定数は
@@ -1231,6 +1234,10 @@ pub struct EngineCore {
     /// [`Self::with_ledger_mode`] のみ。`crate::recovery::required_op_id` モジュール
     /// ドキュメント参照）。
     ledger_mode: LedgerMode,
+    /// BEFORE ROW INSERT トリガの呼び出し口を保持する通過証（TABLE-45・Issue #1723）。発火に対応した
+    /// INSERT 経路（SQL の `INSERT ... VALUES`・`INSERT ... SELECT`）だけが `tenant` へ渡す。既定は
+    /// 未結線（トリガ関数の実行は `0A000`）で、実体への結線は Issue #2228。
+    trigger_runtime: crate::trigger::TriggerRuntime,
     /// `WHERE` 省略の `UPDATE`／`DELETE` を `42601` で拒否する opt-in のサーバー側構成
     /// （Issue #2210・SQL-36 ポインタ。既定 `false`）。クエリ・セッション変数・HTTP から
     /// 到達できる経路を持たない（差し替えは [`Self::with_require_where_for_dml`] のみ）。
@@ -2790,6 +2797,7 @@ impl EngineCore {
             query_planner: None,
             incremental_config: crate::incremental::IncrementalConfig::default(),
             ledger_mode: LedgerMode::default(),
+            trigger_runtime: crate::trigger::TriggerRuntime::unwired(),
             require_where_for_dml: false,
             batch_limits: crate::batch_limits::BatchLimits::default(),
             transaction_limits: crate::sql::transaction::TransactionLimits::default(),
@@ -3003,6 +3011,17 @@ impl EngineCore {
     /// required_op_id` モジュールドキュメント参照）。
     pub fn with_ledger_mode(mut self, mode: LedgerMode) -> Self {
         self.ledger_mode = mode;
+        self
+    }
+
+    /// テスト専用: トリガ関数の呼び出し口を差し替える（トリガ関数の保存形式・PL/pgSQL 結線〔Issue #2228〕が
+    /// 未整備のため、発火側の意味論を注入した呼び出し口で固定する。本番の結線は #2228 が行う）。
+    #[cfg(test)]
+    pub(crate) fn with_trigger_invoker_for_test(
+        mut self,
+        invoker: std::sync::Arc<dyn crate::trigger::call::TriggerFunctionInvoker>,
+    ) -> Self {
+        self.trigger_runtime = crate::trigger::TriggerRuntime::with_invoker(invoker);
         self
     }
 
@@ -11904,12 +11923,14 @@ impl EngineCore {
         // に検出する（codex-review P1 指摘・PR #823。`tenant::insert_typed_row_unchecked`
         // のドキュメント参照。束縛後・書き込み前にテーブルが再定義され列順が
         // 入れ替わっても、値が誤った列へ保存されるのを防ぐ）。
+        // NoSQL 表層はトリガの発火に未対応（`None`。INSERT トリガのある表は `0A000`。Issue #1723）。
         crate::sql::exec::execute_insert_batch_with_schema_in(
             target,
             ctx,
             &bounds,
             self.ledger_mode,
             Some(&schema),
+            None,
         )
     }
 
@@ -13760,6 +13781,7 @@ impl EngineCore {
                     &bound,
                     self.dml_ledger_mode(),
                     None,
+                    Some(&self.trigger_runtime),
                 )
             }
             // 複数行 `VALUES`（SQL-16、TASK-190）。NoSQL 表層の `rows[]`
@@ -13785,6 +13807,7 @@ impl EngineCore {
                     &bounds,
                     self.dml_ledger_mode(),
                     Some(&schema),
+                    Some(&self.trigger_runtime),
                 )
             }
             crate::sql::parser::BoundInsertForm::File(bound) => {
