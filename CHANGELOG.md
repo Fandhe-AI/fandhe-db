@@ -9,6 +9,7 @@
 
 ### Added
 
+- `DROP FUNCTION [IF EXISTS] ... [CASCADE | RESTRICT]` と `CREATE OR REPLACE FUNCTION` を追加した（Issue #1917・SQL-66）。置換は同じ内部 ID のまま本体を差し替え、引数名・戻り値型の変更は `42P13`、引数の型の並びが違う同名は `42723`、呼び出しの循環を作る置換は `0A000`。`CASCADE` は依存トリガを同じ write txn で消し、`RESTRICT`（既定）は `2BP01`。公開 enum `Statement::CreateFunction` にフィールド `or_replace`、`SqlSurfaceError` に variant `AmbiguousFunction`（`42725`）、`ErrorClass` に `AmbiguousFunction` を追加し、`DropFunctionOutcome` はフィールドを持つ（`skipped()`）ため外部から `{}` で構築できなくなった（BREAKING）。
 - `CREATE [OR REPLACE] TRIGGER`／`DROP TRIGGER [IF EXISTS]` と TRIGGER カタログを追加した（Issue #1722・TABLE-45）。定義は表・テナントごとに永続化され、表の DROP・改名、`DROP FUNCTION`（`2BP01`）、`DROP SCHEMA ... CASCADE` と同じ書き込みで連動する。`INSTEAD OF`・`REFERENCING`・`WHEN`・`CONSTRAINT TRIGGER` は `0A000`。`RETURNS trigger` 関数（#2228）が未整備のため、`EXECUTE FUNCTION` は関数が無ければ `42883`、あれば `42P17` で、現状は作成に成功しない。詳細は [trigger-catalog.md](docs/design/trigger-catalog.md)。
   挙動変更: `UPDATE OF` が参照する列の `DROP COLUMN` は `2BP01`、`RENAME COLUMN`・`ALTER COLUMN TYPE` は `0A000`（トリガが無ければ従来どおり）。公開 enum `SqlOutcome` に `CreateTrigger`／`DropTrigger`、`ParsedSql` に同名の variant を追加した（BREAKING）。
 - 文字列関数 `left`／`right`／`reverse`／`initcap` を追加した（Issue #1902・SQL-65）。文字単位は Unicode スカラー値で、4 関数とも strict（NULL 引数で NULL）。`left`／`right` の長さは負で「除く文字数」を表し、`initcap` は英数字の連続を 1 語として扱う（ロケール非依存。PostgreSQL との既知の差は `string_fn.rs` のモジュール doc に記載）。

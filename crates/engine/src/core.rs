@@ -7594,7 +7594,7 @@ impl EngineCore {
             ParsedSql::Statement(stmt @ Statement::CreateFunction { .. }) => {
                 if session.ddl_allowed() {
                     Err(SqlSurfaceError::feature_not_supported(
-                        "CREATE FUNCTION is not supported inside a transaction block",
+                        "CREATE [OR REPLACE] FUNCTION is not supported inside a transaction block",
                     ))
                 } else {
                     self.execute_validated_in_session(ctx, session, stmt.clone())
@@ -9006,7 +9006,12 @@ impl EngineCore {
             // Issue #1915（SQL-66 (1)）: 型注釈つきの定義は、カタログへの型の永続化とロード側の
             // 復元（`udf_load` は型注釈つきの行を読み飛ばす）が揃うまで、永続化経路では `0A000` で
             // 拒否する（セッションにだけ残り再起動で消える黙った不整合を作らない・fail-closed）。
+            //
+            // Issue #1917（SQL-66 (2)）: `CREATE OR REPLACE FUNCTION` は同じ分岐で `or_replace` により
+            // 置換経路（`prepare_function_replacement`）へ切り替える。DDL セッションの型付き・RETURNS つきの
+            // `0A000`・`42P13` の順序は `CREATE` と同じ。
             crate::sql::allowlist::Statement::CreateFunction {
+                or_replace,
                 name,
                 params,
                 param_types,
@@ -9020,14 +9025,25 @@ impl EngineCore {
                     // 検証を通った定義だけが下の `0A000`（未対応の永続化）に到達する。
                     if return_type.is_some() {
                         let mut probe = session.udfs().clone();
-                        crate::sql::udf_call::define_function_with_signature(
-                            &mut probe,
-                            &name,
-                            &params,
-                            &param_types,
-                            return_type.as_ref(),
-                            &body,
-                        )?;
+                        if or_replace {
+                            crate::sql::udf_call::define_or_replace_function_with_signature(
+                                &mut probe,
+                                &name,
+                                &params,
+                                &param_types,
+                                return_type.as_ref(),
+                                &body,
+                            )?;
+                        } else {
+                            crate::sql::udf_call::define_function_with_signature(
+                                &mut probe,
+                                &name,
+                                &params,
+                                &param_types,
+                                return_type.as_ref(),
+                                &body,
+                            )?;
+                        }
                         return Err(
                             crate::sql::allowlist::SqlSurfaceError::feature_not_supported(
                                 "function return types cannot be persisted yet",
@@ -9041,14 +9057,35 @@ impl EngineCore {
                             ),
                         );
                     }
-                    crate::sql::udf_ddl::execute_create_function_persistent(
-                        &self.storage,
-                        ctx.tenant_id(),
-                        session,
+                    if or_replace {
+                        crate::sql::udf_ddl::execute_create_or_replace_function_persistent(
+                            &self.storage,
+                            ctx.tenant_id(),
+                            session,
+                            &name,
+                            &params,
+                            &body,
+                            &body_source,
+                        )?;
+                    } else {
+                        crate::sql::udf_ddl::execute_create_function_persistent(
+                            &self.storage,
+                            ctx.tenant_id(),
+                            session,
+                            &name,
+                            &params,
+                            &body,
+                            &body_source,
+                        )?;
+                    }
+                } else if or_replace {
+                    crate::sql::udf_call::define_or_replace_function_with_signature(
+                        session.udfs_mut(),
                         &name,
                         &params,
+                        &param_types,
+                        return_type.as_ref(),
                         &body,
-                        &body_source,
                     )?;
                 } else {
                     crate::sql::udf_call::define_function_with_signature(

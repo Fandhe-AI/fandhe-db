@@ -341,14 +341,57 @@ fn drop_function_is_blocked_by_dependent_trigger() {
     setup(&s, "t1", "docs", "f");
     create(&s, "t1", "docs", &tdef("trg", "f")).expect("create");
     assert!(matches!(
-        s.drop_function_by_name("t1", "f"),
+        s.drop_function_by_name("t1", "f", false),
         Err(CatalogError::DependentObjectsStillExist(_))
     ));
     assert!(s.drop_trigger("t1", "docs", "trg").expect("drop"));
     assert!(s
-        .drop_function_by_name("t1", "f")
+        .drop_function_by_name("t1", "f", false)
         .expect("drop fn")
         .is_some());
+}
+
+/// SQL-66 (3)・Issue #1917: `CASCADE` は同じ scope の依存トリガだけを関数と同じ txn で消し、
+/// 他テナントのトリガ・無関係な関数のトリガは残す。再オープン後も削除が残る。
+#[test]
+fn drop_function_cascade_removes_only_dependent_triggers_of_same_scope() {
+    let (path, _g) = tmp_path("trg_dropfn_cascade");
+    let s = Storage::open(&path).expect("open");
+    setup(&s, "t1", "docs", "f");
+    s.create_function("t1", &func("g")).expect("g");
+    s.create_function("t2", &func("f")).expect("other tenant f");
+    create(&s, "t1", "docs", &tdef("trg", "f")).expect("create");
+    create(&s, "t1", "docs", &tdef("keep", "g")).expect("create g");
+    create(&s, "t2", "docs", &tdef("other", "f")).expect("create other tenant");
+    // RESTRICT（cascade = false）は 2BP01 のまま、何も消えない。
+    assert!(matches!(
+        s.drop_function_by_name("t1", "f", false),
+        Err(CatalogError::DependentObjectsStillExist(_))
+    ));
+    assert_eq!(s.list_triggers("t1", "docs").expect("list").len(), 2);
+    let before =
+        crate::catalog::table_generation_in_txn(&s.db().begin_read().expect("read"), "docs")
+            .expect("gen");
+    assert!(s
+        .drop_function_by_name("t1", "f", true)
+        .expect("cascade")
+        .is_some());
+    let names: Vec<String> = s
+        .list_triggers("t1", "docs")
+        .expect("list")
+        .into_iter()
+        .map(|t| t.name)
+        .collect();
+    assert_eq!(names, vec!["keep".to_string()]);
+    assert_eq!(s.list_triggers("t2", "docs").expect("list").len(), 1);
+    let after =
+        crate::catalog::table_generation_in_txn(&s.db().begin_read().expect("read"), "docs")
+            .expect("gen");
+    assert!(after > before, "table generation must advance");
+    drop(s);
+    let s = Storage::open(&path).expect("reopen");
+    assert_eq!(s.list_triggers("t1", "docs").expect("list").len(), 1);
+    assert!(s.get_function("t1", "f", "").expect("get").is_none());
 }
 
 #[test]

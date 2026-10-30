@@ -567,6 +567,55 @@ pub(crate) fn remove_triggers_with_function_prefix_in_txn(
     }
 }
 
+/// `scope` の関数 `function_key` を実行するトリガをすべて削除する（`DROP FUNCTION ... CASCADE`
+/// が関数の削除と同じ write txn で呼ぶ。SQL-66 (3)・Issue #1917）。キーの完全一致・同じ `scope` の
+/// トリガだけが対象で、他テナントのトリガには触れない。影響した表の世代は `drop_trigger` と同様に進める
+/// （`USING PLAN` の世代照合がトリガの消失を見逃さないため）。表が無ければ何もしない。
+pub(crate) fn remove_triggers_referencing_function_in_txn(
+    write_txn: &redb::WriteTransaction,
+    scope: &str,
+    function_key: &str,
+) -> Result<()> {
+    let mut touched_tables: Vec<String> = Vec::new();
+    loop {
+        let mut targets: Vec<(String, String)> = Vec::new();
+        {
+            let table = match ReadSource::open_table(write_txn, TRIGGERS_TABLE) {
+                Ok(t) => t,
+                Err(redb::TableError::TableDoesNotExist(_)) => return Ok(()),
+                Err(e) => return Err(e.into()),
+            };
+            for entry in table.iter()? {
+                let (k, v) = entry?;
+                let (t, s, name) = k.value();
+                if s != scope {
+                    continue;
+                }
+                if decode_trigger_def(name, v.value())?.function_key == function_key {
+                    targets.push((t.to_string(), name.to_string()));
+                    if targets.len() >= SWEEP_BATCH {
+                        break;
+                    }
+                }
+            }
+        }
+        if targets.is_empty() {
+            break;
+        }
+        let mut table = write_txn.open_table(TRIGGERS_TABLE)?;
+        for (t, name) in &targets {
+            table.remove((t.as_str(), scope, name.as_str()))?;
+            if !touched_tables.iter().any(|x| x == t) {
+                touched_tables.push(t.clone());
+            }
+        }
+    }
+    for t in &touched_tables {
+        bump_table_generation_in_txn(write_txn, t)?;
+    }
+    Ok(())
+}
+
 /// 表 `table_key` のいずれかのテナントのトリガが `UPDATE OF` で列 `column` を参照しているか
 /// （`RENAME COLUMN`・`DROP COLUMN`・`ALTER COLUMN TYPE` の暫定ガード用。表が無ければ `false`）。
 pub(crate) fn triggers_referencing_column_in_txn<R: ReadSource>(

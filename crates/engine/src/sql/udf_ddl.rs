@@ -1,5 +1,5 @@
-//! `CREATE FUNCTION`／`DROP FUNCTION` の永続化経路（SQL-66・TASK-309、Issue #1920。親: #1918。
-//! 設計記録: `docs/design/udf-catalog.md`「書き込み経路」）。
+//! `CREATE [OR REPLACE] FUNCTION`／`DROP FUNCTION [IF EXISTS]` の永続化経路（SQL-66・TASK-309、
+//! Issue #1920・#1917。親: #1918。設計記録: `docs/design/udf-catalog.md`「書き込み経路」）。
 //!
 //! 役割: セッションの [`UdfRegistry`] だけにあった UDF 定義を UDF カタログ（`catalog::function`）へ
 //! 書く・消す実行本体と、[`CatalogError`] → SQLSTATE の写像を担う。呼び出し元は `core.rs` の
@@ -17,16 +17,56 @@
 use crate::catalog::function::{
     FunctionAttributes, FunctionDef, FunctionLanguage, FunctionParam, FunctionType,
     FUNCTION_ALREADY_EXISTS_MESSAGE, FUNCTION_AMBIGUOUS_MESSAGE,
+    FUNCTION_CANNOT_CHANGE_PARAM_NAME_MESSAGE, FUNCTION_CANNOT_CHANGE_RETURN_TYPE_MESSAGE,
 };
 use crate::catalog::CatalogError;
-use crate::sql::allowlist::{SqlSurfaceError, ValidatedDropFunction};
+use crate::sql::allowlist::{DropFunctionBehavior, SqlSurfaceError, ValidatedDropFunction};
 use crate::sql::mode::SessionState;
-use crate::sql::udf_call::{commit_function_definition, prepare_function_definition};
+use crate::sql::udf_call::{
+    commit_function_definition, prepare_function_definition, prepare_function_replacement,
+    PreparedUdf,
+};
 use crate::storage::Storage;
 
-/// `DROP FUNCTION` の成功応答（応答は結果を持たない。wire はコマンドタグ `DROP FUNCTION` を返す）。
+/// `DROP FUNCTION` の成功応答。結果行は持たず、wire はコマンドタグ `DROP FUNCTION` を返す。
+///
+/// **Issue #1917 で追加した破壊的変更（BREAKING CHANGE）**: `IF EXISTS` で対象が無く何も消さなかった
+/// ことを表す `skipped` を追加した（外部から `{}` で構築できなくなる）。
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub struct DropFunctionOutcome {}
+pub struct DropFunctionOutcome {
+    pub(crate) skipped: bool,
+}
+
+impl DropFunctionOutcome {
+    /// `IF EXISTS` で対象が無く、何も削除しなかったか。他テナントの定義・存在しない定義はどちらも
+    /// `true` になり、存在情報を区別できない（P0）。
+    pub fn skipped(&self) -> bool {
+        self.skipped
+    }
+}
+
+/// カタログへ書く [`FunctionDef`] を検証済みの定義から組み立てる（`CREATE`・`OR REPLACE` 共通）。
+/// 型注釈つき・RETURNS つきは呼び出し側（`core.rs`）が永続化の前に `0A000` で拒否済みのため、
+/// ここでは型なし・戻り値型なしだけを扱う。
+fn catalog_def_from_prepared(prepared: &PreparedUdf, body_source: &str) -> FunctionDef {
+    FunctionDef {
+        id: 1,
+        function_key: prepared.key.clone(),
+        // 引数の型注釈は未対応（宣言的 UDF〔SQL-9〕は型なし）。型付き引数は #1915 が足す。
+        params: prepared
+            .params
+            .iter()
+            .map(|p| FunctionParam {
+                name: Some(p.clone()),
+                ty: None::<FunctionType>,
+            })
+            .collect(),
+        return_type: None,
+        language: FunctionLanguage::Declarative,
+        body_source: body_source.to_string(),
+        attrs: FunctionAttributes::default(),
+    }
+}
 
 /// `CREATE FUNCTION` をカタログへ永続化してセッションへ登録する（DDL 権限のあるセッション用）。
 ///
@@ -43,23 +83,7 @@ pub(crate) fn execute_create_function_persistent(
     body_source: &str,
 ) -> Result<(), SqlSurfaceError> {
     let prepared = prepare_function_definition(session.udfs(), name, params, body)?;
-    let def = FunctionDef {
-        id: 1,
-        function_key: prepared.key.clone(),
-        // 引数の型注釈は未対応（宣言的 UDF〔SQL-9〕は型なし）。型付き引数は #1915 が足す。
-        params: prepared
-            .params
-            .iter()
-            .map(|p| FunctionParam {
-                name: Some(p.clone()),
-                ty: None::<FunctionType>,
-            })
-            .collect(),
-        return_type: None,
-        language: FunctionLanguage::Declarative,
-        body_source: body_source.to_string(),
-        attrs: FunctionAttributes::default(),
-    };
+    let def = catalog_def_from_prepared(&prepared, body_source);
     storage
         .create_function(tenant_id, &def)
         .map_err(map_function_error)?;
@@ -71,9 +95,39 @@ pub(crate) fn execute_create_function_persistent(
     Ok(())
 }
 
-/// `DROP FUNCTION` を実行する。DDL 権限のあるセッションはカタログ（自テナントの scope）から削除し、
-/// いずれのセッションもレジストリから削除する。**どちらでも消えなかった場合だけ** `42883`
-/// （存在情報を出さない固定文言）。権限の無いセッションはカタログを見ない。
+/// `CREATE OR REPLACE FUNCTION` をカタログへ永続化してセッションへ反映する（DDL 権限のあるセッション用。
+/// SQL-66 (2)・Issue #1917）。順序は [`prepare_function_replacement`]（レジストリ不変。シグネチャ・引数名・
+/// 戻り値型・循環の検査）→ [`Storage::replace_function`]（同名が無ければ作成、あれば同じ内部 ID のまま
+/// 置換。単一 write txn・1 回の commit）→ commit 成功後にレジストリを上書きしてカタログ由来の印を付け直す。
+/// カタログで失敗したらセッションは変わらない。
+pub(crate) fn execute_create_or_replace_function_persistent(
+    storage: &Storage,
+    tenant_id: &str,
+    session: &mut SessionState,
+    name: &str,
+    params: &[String],
+    body: &crate::sql::udf_call::Expr,
+    body_source: &str,
+) -> Result<(), SqlSurfaceError> {
+    let untyped = vec![None; params.len()];
+    let prepared =
+        prepare_function_replacement(session.udfs(), name, params, &untyped, None, body, true)?;
+    let def = catalog_def_from_prepared(&prepared, body_source);
+    storage
+        .replace_function(tenant_id, &def)
+        .map_err(map_function_error)?;
+    let key = prepared.key.clone();
+    commit_function_definition(session.udfs_mut(), prepared);
+    session.udfs_mut().mark_catalog_origin(&key);
+    Ok(())
+}
+
+/// `DROP FUNCTION [IF EXISTS] ... [CASCADE | RESTRICT]` を実行する。DDL 権限のあるセッションは
+/// カタログ（自テナントの scope）から削除し、いずれのセッションもレジストリから削除する。
+/// **どちらでも消えなかった場合だけ** `42883`（存在情報を出さない固定文言）。`IF EXISTS` なら代わりに
+/// `skipped` の成功を返す（他テナントの定義・不在はどちらも同じ応答）。権限の無いセッションはカタログを
+/// 見ない。カタログ由来の定義を権限の無いセッションが消そうとすると、`IF EXISTS` でも `42501`。
+/// 依存トリガは `RESTRICT`（既定）なら `2BP01`、`CASCADE` なら関数と同じ write txn で連鎖削除する。
 ///
 /// 型の並びが指定されたときは、カタログ上の定義の引数の数と（型注釈のある引数の）型が一致する
 /// 場合だけ削除する（型注釈なしの引数は任意の型に一致する）。不一致は不在と同じ `42883`。
@@ -106,7 +160,9 @@ pub(crate) fn execute_drop_function(
         removed |= session.udfs_mut().remove(&stmt.name);
     }
     if removed {
-        Ok(DropFunctionOutcome {})
+        Ok(DropFunctionOutcome { skipped: false })
+    } else if stmt.if_exists {
+        Ok(DropFunctionOutcome { skipped: true })
     } else {
         Err(SqlSurfaceError::undefined_function(
             "function does not exist",
@@ -120,16 +176,17 @@ fn drop_from_catalog(
     tenant_id: &str,
     stmt: &ValidatedDropFunction,
 ) -> Result<bool, SqlSurfaceError> {
+    let cascade = stmt.behavior == DropFunctionBehavior::Cascade;
     let Some(types) = &stmt.arg_types else {
         return storage
-            .drop_function_by_name(tenant_id, &stmt.name)
+            .drop_function_by_name(tenant_id, &stmt.name, cascade)
             .map(|sig| sig.is_some())
             .map_err(map_function_error);
     };
     // 列挙・署名照合・削除を 1 つの write txn で行う（読みと削除の間に別セッションの
     // drop／再作成が割り込んで新しい定義を誤って消さないため）。
     storage
-        .drop_function_matching(tenant_id, &stmt.name, |def| {
+        .drop_function_matching(tenant_id, &stmt.name, cascade, |def| {
             if def.params.len() != types.len() {
                 return Ok(false);
             }
@@ -155,16 +212,31 @@ fn map_function_error(e: CatalogError) -> SqlSurfaceError {
         CatalogError::Invalid(m) if m == FUNCTION_ALREADY_EXISTS_MESSAGE => {
             SqlSurfaceError::duplicate_function("function already exists")
         }
-        // 作成時に同名の多重定義を拒否しているため通常は起きない（42725 の扱いは #1917）。
-        CatalogError::Invalid(m) if m == FUNCTION_AMBIGUOUS_MESSAGE => SqlSurfaceError::Internal {
-            detail: "DROP FUNCTION failed".to_string(),
-        },
+        // 作成時に同名の多重定義を拒否しているため通常は起きない防御（Issue #1917 で `42725` にした）。
+        CatalogError::Invalid(m) if m == FUNCTION_AMBIGUOUS_MESSAGE => {
+            SqlSurfaceError::ambiguous_function("function name is not unique")
+        }
+        // `CREATE OR REPLACE FUNCTION` が引数名・戻り値型を変えようとした（SQL-66 (2)・Issue #1917）。
+        CatalogError::Invalid(m) if m == FUNCTION_CANNOT_CHANGE_PARAM_NAME_MESSAGE => {
+            SqlSurfaceError::invalid_function_definition("cannot change name of input parameter")
+        }
+        CatalogError::Invalid(m) if m == FUNCTION_CANNOT_CHANGE_RETURN_TYPE_MESSAGE => {
+            SqlSurfaceError::invalid_function_definition(
+                "cannot change return type of existing function",
+            )
+        }
         CatalogError::Invalid(m) if m.contains("enum") => {
             SqlSurfaceError::feature_not_supported("enum types are not supported in functions")
         }
         CatalogError::Invalid(_) => SqlSurfaceError::invalid_input("invalid function definition"),
         CatalogError::ViewLimitExceeded(_) => {
             SqlSurfaceError::payload_too_large("too many functions")
+        }
+        // 依存する TRIGGER が残っている（`RESTRICT`。`2BP01`）。内部キー・トリガ名を出さない固定文言。
+        CatalogError::DependentObjectsStillExist(_) => {
+            SqlSurfaceError::DependentObjectsStillExist {
+                name: "function".to_string(),
+            }
         }
         // 名前解決後に SCHEMA が削除された（または他テナントの ID）。存在情報を出さない固定文言。
         CatalogError::TableNotFound(_) => {
@@ -195,6 +267,23 @@ mod tests {
         assert_eq!(enum_ty.wire_code(), "0A000");
         let other = map_function_error(CatalogError::Invalid("bad".to_string()));
         assert_eq!(other.wire_code(), "22000");
+        let ambiguous = map_function_error(CatalogError::Invalid(
+            FUNCTION_AMBIGUOUS_MESSAGE.to_string(),
+        ));
+        assert_eq!(ambiguous.wire_code(), "42725");
+        let rename = map_function_error(CatalogError::Invalid(
+            FUNCTION_CANNOT_CHANGE_PARAM_NAME_MESSAGE.to_string(),
+        ));
+        assert_eq!(rename.wire_code(), "42P13");
+        let retype = map_function_error(CatalogError::Invalid(
+            FUNCTION_CANNOT_CHANGE_RETURN_TYPE_MESSAGE.to_string(),
+        ));
+        assert_eq!(retype.wire_code(), "42P13");
+        let dep = map_function_error(CatalogError::DependentObjectsStillExist(
+            "#7.secret".to_string(),
+        ));
+        assert_eq!(dep.wire_code(), "2BP01");
+        assert!(!dep.client_message().contains("secret"));
         let corrupt = map_function_error(CatalogError::CorruptSchema("secret #1.f".to_string()));
         assert_eq!(corrupt.wire_code(), "XX000");
         assert!(!corrupt.client_message().contains("secret"));
