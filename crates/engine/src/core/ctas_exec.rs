@@ -226,7 +226,7 @@ impl EngineCore {
                 operation_id,
                 self.ledger_mode,
                 &stmt.statement_hash,
-                None,
+                crate::tenant::LedgerOnlyTriggers::Skip,
             )?;
         }
 
@@ -297,7 +297,7 @@ impl EngineCore {
             stmt.operation_id(),
             self.ledger_mode,
             &stmt.statement_hash,
-            None,
+            crate::tenant::LedgerOnlyTriggers::Skip,
         )?;
         crate::recovery::commit_boundary::commit(write_txn)
             .map_err(crate::catalog::convert_storage_error)
@@ -388,7 +388,7 @@ impl EngineCore {
                     stmt.operation_id(),
                     self.ledger_mode,
                     &stmt.statement_hash,
-                    None,
+                    crate::tenant::LedgerOnlyTriggers::Skip,
                 )?;
             }
             return Ok(0);

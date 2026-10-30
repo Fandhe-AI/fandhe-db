@@ -463,6 +463,32 @@ fn unwired_paths_stay_guarded_for_statement_triggers() {
     assert_eq!(count(&core, &a, "trg"), 3);
 }
 
+// 0 行の `INSERT ... SELECT ... ON CONFLICT` も非空と同じく UPSERT 未結線として `0A000`。INSERT・UPDATE
+// どちらの文トリガでも呼び出しは 0 回で、台帳も残らない（同じ operation_id を後でトリガ無しに再送できる）。
+#[test]
+fn zero_row_insert_select_upsert_stays_guarded() {
+    for events in [INS, UPD] {
+        let dir = tempdir();
+        let (core, calls) = seeded(
+            dir.path(),
+            Box::new(|c| Ok(TriggerOutcome::Proceed(c.new_row.to_vec()))),
+        );
+        let a = ctx("tenant-a");
+        add_trigger(
+            &core.storage,
+            "tenant-a",
+            "trg",
+            &stmt("s", TriggerTiming::After, events),
+        );
+        let before = calls.load(Ordering::SeqCst);
+        let sql = "INSERT INTO trg (id, embedding, a, n) SELECT id, embedding, a, n FROM trg \
+                   WHERE n < 0 ON CONFLICT (id) DO NOTHING USING OPERATION_ID 'z1'";
+        assert_eq!(code(&core, &a, sql), "0A000", "{sql}");
+        assert_eq!(calls.load(Ordering::SeqCst), before);
+        assert_eq!(count(&core, &a, "trg"), 3);
+    }
+}
+
 // BEFORE STATEMENT UPDATE しか無い表では、NOT NULL の検査を延期しない（`23502` と `UPDATE 0` の差で
 // 行の存在を漏らさない）。該当行の有無にかかわらず束縛時に `23502`。省略した NOT NULL 列の INSERT も事前に `23502`。
 #[test]

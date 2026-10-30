@@ -380,7 +380,7 @@ impl EngineCore {
             stmt.operation_id.as_ref(),
             self.ledger_mode,
             &stmt.statement_hash,
-            None,
+            crate::tenant::LedgerOnlyTriggers::Skip,
         )?;
 
         let DmMain::Referenced {

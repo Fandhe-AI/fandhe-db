@@ -5257,8 +5257,9 @@ pub(crate) fn precheck_insert_select_ledger(
     result.map_err(|e| map_insert_write_error(crate::tenant::TenantWriteError::from(e)))
 }
 
-/// `INSERT ... SELECT` が 0 行だったときの台帳だけの記録（SQL-51 (5)・Issue #1733）。`triggers` が `Some`
-/// のとき、INSERT 文トリガ（BEFORE／AFTER STATEMENT）を 1 回ずつ発火する（Issue #1726）。
+/// `INSERT ... SELECT` が 0 行だったときの台帳だけの記録（SQL-51 (5)・Issue #1733）。`trigger_mode` が
+/// `Insert(Some)` のとき、INSERT 文トリガ（BEFORE／AFTER STATEMENT）を 1 回ずつ発火する（Issue #1726）。
+/// CTAS・データ変更 CTE からは `Skip`（トリガを見ない純粋な台帳記録）で呼ぶ。
 pub(crate) fn record_insert_select_ledger_only(
     target: crate::tenant::WriteTarget<'_>,
     ctx: &PolicyContext,
@@ -5266,7 +5267,7 @@ pub(crate) fn record_insert_select_ledger_only(
     operation_id: Option<&crate::recovery::required_op_id::OperationId>,
     ledger_mode: crate::recovery::required_op_id::LedgerMode,
     statement_hash: &crate::recovery::content_hash::ContentHash,
-    triggers: Option<&crate::trigger::TriggerRuntime>,
+    trigger_mode: crate::tenant::LedgerOnlyTriggers<'_>,
 ) -> Result<(), SqlSurfaceError> {
     let ledger_write = ledger_mode
         .resolve(operation_id)
@@ -5277,7 +5278,7 @@ pub(crate) fn record_insert_select_ledger_only(
         ctx,
         ledger_write,
         statement_hash,
-        triggers,
+        trigger_mode,
     )
     .map_err(map_insert_write_error)
 }
