@@ -482,6 +482,13 @@ pub enum TenantWriteError {
     /// **BREAKING CHANGE**（Issue #1690）: variant を追加した（本 enum は `#[non_exhaustive]`
     /// ではないため網羅的 `match` の下流は追随が必要）。
     SequenceEvaluationFailed(SqlSurfaceError),
+    /// BEFORE ROW INSERT トリガの発火が失敗した（TABLE-45・Issue #1723）。未結線の経路・AFTER／文トリガの
+    /// 拒否（`0A000`）、返却行の構造違い（`42804`）、割り込み（`57014`）、トリガ関数が返したエラーを
+    /// 内側の [`SqlSurfaceError`] のまま保持する（[`TenantWriteError::SequenceEvaluationFailed`] と同じ透過）。
+    /// 値・行・トリガ名・テナントは含めない。write トランザクションは commit せず破棄する。
+    /// **BREAKING CHANGE**（Issue #1723）: variant を追加した（本 enum は `#[non_exhaustive]`
+    /// ではないため網羅的 `match` の下流は追随が必要）。
+    TriggerFailed(SqlSurfaceError),
     /// `FOREIGN KEY` 制約（TABLE-17・TASK-205、Issue #907）の参照整合性違反
     /// （`23503`）: 参照元の書き込みで参照先の値の組が同一テナント内に存在しない、
     /// または参照先の削除・更新・TRUNCATE・置換で参照元の行が残る。一意性制約と
@@ -702,6 +709,9 @@ impl crate::error_format::ClassifiedError for TenantWriteError {
             TenantWriteError::SequenceEvaluationFailed(inner) => {
                 crate::error_format::ClassifiedError::error_class(inner)
             }
+            TenantWriteError::TriggerFailed(inner) => {
+                crate::error_format::ClassifiedError::error_class(inner)
+            }
             TenantWriteError::ForeignKeyViolation => ErrorClass::ForeignKeyViolation,
             TenantWriteError::ReferentialActionLimitExceeded => ErrorClass::PayloadTooLarge,
             TenantWriteError::GinIndexEntryLimitExceeded => ErrorClass::PayloadTooLarge,
@@ -790,6 +800,9 @@ impl std::fmt::Display for TenantWriteError {
             TenantWriteError::SequenceEvaluationFailed(inner) => {
                 write!(f, "{}", inner.client_message())
             }
+            TenantWriteError::TriggerFailed(inner) => {
+                write!(f, "{}", inner.client_message())
+            }
             TenantWriteError::ForeignKeyViolation => {
                 write!(f, "foreign key constraint violation")
             }
@@ -857,6 +870,7 @@ impl std::fmt::Debug for TenantWriteError {
             TenantWriteError::SequenceEvaluationFailed(_) => {
                 f.write_str("SequenceEvaluationFailed(<redacted>)")
             }
+            TenantWriteError::TriggerFailed(_) => f.write_str("TriggerFailed(<redacted>)"),
             TenantWriteError::ForeignKeyViolation => f.write_str("ForeignKeyViolation"),
             TenantWriteError::GinIndexEntryLimitExceeded => {
                 f.write_str("GinIndexEntryLimitExceeded")
@@ -1029,6 +1043,8 @@ pub(crate) fn insert_row_unchecked(
     // `COMMIT`/`ROLLBACK` まで持ち越し）のいずれとも共有する（SQL-31・TASK-221）。
     target.with_txn(|write_txn| {
         let schema = require_table_schema_write(write_txn, table)?;
+        // 生の行挿入はトリガの発火に未対応（Issue #1723）。INSERT トリガのある表は `0A000`。
+        guard_no_insert_triggers(write_txn, ctx.tenant_id(), table)?;
         schema.validate_row_embedding_dim(row.embedding.len())?;
         // エンコードは 1 回のみ（Issue #397）: 以前は台帳ハッシュ計算用と redb 書き込み用で
         // それぞれ `encode_row` していた二重実行を排除し、ここで計算した結果を
@@ -1160,6 +1176,8 @@ pub(crate) fn insert_rows_unchecked(
 
     target.with_txn(|write_txn| {
         let schema = require_table_schema_write(write_txn, table)?;
+        // 生の行挿入はトリガの発火に未対応（Issue #1723）。INSERT トリガのある表は `0A000`。
+        guard_no_insert_triggers(write_txn, ctx.tenant_id(), table)?;
         if rows.is_empty() {
             // 空バッチは書き込みを一切行わない。`NoOp` を返し、autocommit 経路では
             // commit せずに abort させる（グローバル世代を進めない。main と同じ挙動）。
@@ -1790,7 +1808,9 @@ pub fn insert_typed_row(
         None,
         &[],
         false,
+        None,
     )
+    .map(|_| ())
 }
 
 /// [`insert_typed_row`] のガードなし実体（`pub(crate)`。[`insert_row_unchecked`] と
@@ -1830,7 +1850,8 @@ pub(crate) fn insert_typed_row_unchecked(
     expected_schema: Option<&crate::catalog::TableSchema>,
     volatile_default_columns: &[VolatileColumn],
     id_omitted: bool,
-) -> Result<(), TenantWriteError> {
+    triggers: Option<&crate::trigger::TriggerRuntime>,
+) -> Result<InsertWriteReport, TenantWriteError> {
     insert_typed_row_impl(
         false,
         target,
@@ -1843,6 +1864,7 @@ pub(crate) fn insert_typed_row_unchecked(
         expected_schema,
         volatile_default_columns,
         id_omitted,
+        triggers,
     )
 }
 
@@ -1861,7 +1883,8 @@ fn insert_typed_row_impl(
     expected_schema: Option<&crate::catalog::TableSchema>,
     volatile_default_columns: &[VolatileColumn],
     id_omitted: bool,
-) -> Result<(), TenantWriteError> {
+    triggers: Option<&crate::trigger::TriggerRuntime>,
+) -> Result<InsertWriteReport, TenantWriteError> {
     validate_relation_key(table)?;
     target.with_txn(|write_txn| {
         let schema = require_table_schema_write_any_identity(write_txn, table)?;
@@ -1884,6 +1907,10 @@ fn insert_typed_row_impl(
                 )));
             }
         }
+        // INSERT トリガの分類（Issue #1723。台帳より前・同じ write txn 内で読む。未結線の経路・
+        // AFTER／文トリガは `0A000`）。
+        let trigger_chain =
+            crate::trigger::plan::plan_insert(write_txn, ctx.tenant_id(), table, triggers)?;
         // 採番方式の表（TABLE-23・Issue #2199）は呼び出し元の `id` を使わず、内容照合ハッシュの
         // 材料には固定値 0 を使う（rowid は再送前に分からないため。再送判定を決定的に保つ）。
         let allocated = schema.is_allocated();
@@ -1947,14 +1974,17 @@ fn insert_typed_row_impl(
                 content_hash::for_typed_insert(hash_id, visibility, embedding, &named_columns)?
             }
         };
-        ledger::record_in_txn(
+        let ledger_outcome = ledger::record_in_txn(
             write_txn,
             ctx.tenant_id(),
             table,
             ledger_write,
             &content_hash,
         )?;
-        reject_missing_not_null(&schema, volatile_default_columns)?;
+        // BEFORE トリガが省略列を補えるよう、トリガ経路では最終 NEW の NOT NULL 検査へ遅らせる。
+        if trigger_chain.is_none() {
+            reject_missing_not_null(&schema, volatile_default_columns)?;
+        }
         // SEQUENCE の採番は台帳照合の後（再送の `23505` で値を消費しない。TABLE-24 (3)・
         // Issue #1690）。印が無い文は何もしない。
         let sequence_rows = assign_sequence_values(
@@ -1976,6 +2006,38 @@ fn insert_typed_row_impl(
         } else {
             id
         };
+        // トリガ経路（Issue #1723）: rowid を払い出し、行を書くループだけを差し替える。
+        if let Some(chain) = &trigger_chain {
+            let row_id = if allocated {
+                allocate_rowids(write_txn, ctx.tenant_id(), table, 1)?
+                    .first()
+                    .copied()
+                    .ok_or_else(|| {
+                        TenantWriteError::Catalog(CatalogError::Invalid(
+                            "row id allocation returned no id".to_string(),
+                        ))
+                    })?
+            } else {
+                RowId::from_legacy_id(id)
+            };
+            let written = trigger_insert::write_rows_with_triggers(
+                write_txn,
+                &target,
+                table,
+                ctx,
+                &schema,
+                visibility,
+                &[(row_id, values)],
+                chain,
+            )?;
+            return finish_trigger_insert(
+                write_txn,
+                table,
+                written.len(),
+                ledger_outcome,
+                allocated || id_omitted || sequence_rows.is_some(),
+            );
+        }
         // 行のエンコードは台帳照合と NOT NULL 検査の後に行う（省略された非 nullable 列の仮値
         // `Null` が、再送判定より先に `22000` を起こさないため。Issue #1629）。
         let metadata = crate::row_codec::encode_scalar_columns(&schema, values)
@@ -2020,8 +2082,56 @@ fn insert_typed_row_impl(
             target.fk_check_mode(),
         )?;
         crate::catalog::bump_table_generation_in_txn(write_txn, table)?;
-        Ok(((), TxnEffect::Wrote))
+        Ok((InsertWriteReport { rows_written: 1 }, TxnEffect::Wrote))
     })
+}
+
+/// トリガ経路の書き込みの後始末（Issue #1723）。1 行以上書いたら表の世代を進めて `Wrote`。全行を
+/// `NULL` 返却でスキップした場合は、台帳を記録したときだけ `Wrote`（世代は進めない。再送の `23505`
+/// を保つため台帳は commit する）、台帳も無ければ `NoOp`。ただし rowid・SEQUENCE の採番状態を
+/// 更新済み（`state_consumed`）なら `Wrote` とし、払い出し済みの値が欠番になる契約を保つ
+/// （`NoOp` の abort で採番状態が巻き戻り、次の INSERT が同じ rowid を再利用するのを防ぐ）。
+fn finish_trigger_insert(
+    write_txn: &redb::WriteTransaction,
+    table: &str,
+    written: usize,
+    ledger_outcome: ledger::RecordOutcome,
+    state_consumed: bool,
+) -> Result<(InsertWriteReport, TxnEffect), TenantWriteError> {
+    let rows_written = u64::try_from(written).map_err(|_| {
+        TenantWriteError::Catalog(CatalogError::Invalid(
+            "insert row count overflow".to_string(),
+        ))
+    })?;
+    let effect = if written > 0 {
+        crate::catalog::bump_table_generation_in_txn(write_txn, table)?;
+        TxnEffect::Wrote
+    } else if state_consumed || matches!(ledger_outcome, ledger::RecordOutcome::Recorded) {
+        TxnEffect::Wrote
+    } else {
+        TxnEffect::NoOp
+    };
+    Ok((InsertWriteReport { rows_written }, effect))
+}
+
+/// 型付き INSERT の書き込み結果（Issue #1723）。BEFORE ROW トリガが `NULL` を返した行は書かれないため、
+/// SQL の `rows_affected` は束縛した行数ではなく実際に書いた行数を使う。トリガの無い表では常に
+/// 束縛した行数と一致する。
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub(crate) struct InsertWriteReport {
+    /// 実際に行ストアへ書いた行数。
+    pub(crate) rows_written: u64,
+}
+
+/// INSERT トリガのある表への、発火に未対応の書き込み経路を固定文言の `0A000` で拒否する
+/// （実行モデルの D8: 黙ってトリガを飛ばさない）。スキーマ取得の直後・台帳より前に呼ぶ
+/// （結線していない経路は台帳に触れない）。トリガの無い表は何もしない。
+pub(crate) fn guard_no_insert_triggers(
+    write_txn: &redb::WriteTransaction,
+    tenant: &str,
+    table: &str,
+) -> Result<(), TenantWriteError> {
+    crate::trigger::plan::plan_insert(write_txn, tenant, table, None).map(|_| ())
 }
 
 /// 採番方式の表（TABLE-23・Issue #2199）へ書く `n` 行分の rowid を、同じ write txn 内で払い出す
@@ -2127,16 +2237,21 @@ pub(crate) fn insert_typed_rows_unchecked(
     ledger_write: LedgerWrite<'_>,
     expected_schema: Option<&crate::catalog::TableSchema>,
     volatile_default_columns: VolatileDefaultColumns<'_>,
-) -> Result<(), TenantWriteError> {
+    triggers: Option<&crate::trigger::TriggerRuntime>,
+) -> Result<InsertWriteReport, TenantWriteError> {
     validate_relation_key(table)?;
     if rows.is_empty() {
-        return Ok(());
+        return Ok(InsertWriteReport::default());
     }
     check_volatile_len(volatile_default_columns, rows.len())?;
 
     target.with_txn(|write_txn| {
         let row_ids: Vec<RowId> = {
             let schema = require_table_schema_write_any_identity(write_txn, table)?;
+            // INSERT トリガの分類（Issue #1723。台帳より前・同じ write txn 内。未結線の経路・
+            // AFTER／文トリガは `0A000`）。
+            let trigger_chain =
+                crate::trigger::plan::plan_insert(write_txn, ctx.tenant_id(), table, triggers)?;
             // `id` 省略（Issue #1700。全行一様）は移行済み表だけが受理できる。束縛段の判定を、
             // 書き込み txn 内で取得したスキーマで再確認する（仮値 `id` を書かない fail-closed）。
             if id_omitted && !schema.is_migrated_id() {
@@ -2265,15 +2380,18 @@ pub(crate) fn insert_typed_rows_unchecked(
                     .collect();
                 content_hash::for_typed_insert_batch(&hash_input)?
             };
-            ledger::record_in_txn(
+            let ledger_outcome = ledger::record_in_txn(
                 write_txn,
                 ctx.tenant_id(),
                 table,
                 ledger_write,
                 &content_hash,
             )?;
-            for row_volatile in volatile_default_columns {
-                reject_missing_not_null(&schema, row_volatile)?;
+            // BEFORE トリガが省略列を補えるよう、トリガ経路では最終 NEW の NOT NULL 検査へ遅らせる。
+            if trigger_chain.is_none() {
+                for row_volatile in volatile_default_columns {
+                    reject_missing_not_null(&schema, row_volatile)?;
+                }
             }
             // SEQUENCE の採番は台帳照合の後・行の順に行う（TABLE-24・Issue #1690）。
             let row_marks: Vec<&[VolatileColumn]> = (0..rows.len())
@@ -2314,6 +2432,47 @@ pub(crate) fn insert_typed_rows_unchecked(
                     .map(|(id, _)| RowId::from_legacy_id(*id))
                     .collect()
             };
+            // トリガ経路（Issue #1723）: 行を書いて制約を検査するループだけを差し替える。
+            if let Some(chain) = &trigger_chain {
+                let mut trigger_rows: Vec<(RowId, &[crate::row_codec::Value])> = Vec::new();
+                trigger_rows.try_reserve_exact(rows.len()).map_err(|_| {
+                    TenantWriteError::Storage(StorageError::Codec(
+                        "failed to reserve trigger insert batch".to_string(),
+                    ))
+                })?;
+                for (row_idx, (_, orig_values)) in rows.iter().enumerate() {
+                    let values: &[crate::row_codec::Value] = match &sequence_rows {
+                        Some(owned) => owned
+                            .get(row_idx)
+                            .map(Vec::as_slice)
+                            .unwrap_or(*orig_values),
+                        None => orig_values,
+                    };
+                    let row_id = row_ids.get(row_idx).copied().ok_or_else(|| {
+                        TenantWriteError::Catalog(CatalogError::Invalid(
+                            "row id allocation count mismatch".to_string(),
+                        ))
+                    })?;
+                    trigger_rows.push((row_id, values));
+                }
+                let written = trigger_insert::write_rows_with_triggers(
+                    write_txn,
+                    &target,
+                    table,
+                    ctx,
+                    &schema,
+                    visibility,
+                    &trigger_rows,
+                    chain,
+                )?;
+                return finish_trigger_insert(
+                    write_txn,
+                    table,
+                    written.len(),
+                    ledger_outcome,
+                    allocated || id_omitted || sequence_rows.is_some(),
+                );
+            }
             let row_table_name = user_rows_table_name(table);
             let mut row_table = write_txn
                 .open_table(user_rows_table_def(&row_table_name))
@@ -2373,7 +2532,12 @@ pub(crate) fn insert_typed_rows_unchecked(
             )?;
         }
         crate::catalog::bump_table_generation_in_txn(write_txn, table)?;
-        Ok(((), TxnEffect::Wrote))
+        let rows_written = u64::try_from(rows.len()).map_err(|_| {
+            TenantWriteError::Catalog(CatalogError::Invalid(
+                "insert row count overflow".to_string(),
+            ))
+        })?;
+        Ok((InsertWriteReport { rows_written }, TxnEffect::Wrote))
     })
 }
 
@@ -2680,6 +2844,9 @@ fn upsert_typed_rows_impl(
         let mut updated: u64 = 0;
         {
             let schema = require_table_schema_write_any_identity(write_txn, table)?;
+            // INSERT トリガのある表への UPSERT の発火は未対応（#1725）。黙って飛ばさず `0A000`
+            // （台帳より前に判定する。Issue #1723・実行モデルの D8）。
+            guard_no_insert_triggers(write_txn, ctx.tenant_id(), table)?;
             if let Some(expected) = expected_schema {
                 if expected != &schema {
                     return Err(TenantWriteError::Catalog(CatalogError::Invalid(
@@ -6622,6 +6789,8 @@ pub(crate) fn replace_typed_rows_by_text_key(
         let mut removed_ids: Vec<RowId> = Vec::new();
         let outcome: Result<ReplaceOutcome, TenantWriteError> = (|| {
             let schema = require_table_schema_write(write_txn, table)?;
+            // INSERT トリガの発火に未対応の経路（Issue #1723）。台帳照合・行変更より前に拒否する。
+            guard_no_insert_triggers(write_txn, ctx.tenant_id(), table)?;
             let vector_idx = schema
                 .columns
                 .iter()
@@ -7009,6 +7178,7 @@ pub(crate) fn last_operation(
 
 pub(crate) mod partitioned_dml;
 pub(crate) mod statement_writes;
+mod trigger_insert;
 
 #[cfg(test)]
 mod tests {
@@ -9464,6 +9634,7 @@ mod tests {
             ledger_write,
             None,
             &[],
+            None,
         )
         .expect("insert_typed_rows_unchecked");
         expected += 1;
@@ -10505,6 +10676,7 @@ mod tests {
             LedgerMode::Ledgered.resolve(Some(&op)).expect("resolve"),
             None,
             &[],
+            None,
         )
         .expect("seed unique row");
         truncate_row_body(&storage, 1);
@@ -10570,6 +10742,7 @@ mod tests {
             LedgerMode::Ledgered.resolve(Some(&op)).expect("resolve"),
             None,
             &[],
+            None,
         )
         .expect("seed unique row");
 
@@ -10654,6 +10827,7 @@ mod tests {
             LedgerMode::Ledgered.resolve(Some(&op)).expect("resolve"),
             None,
             &[],
+            None,
         )
         .expect("seed unique row");
         truncate_row_body(&storage, 1);

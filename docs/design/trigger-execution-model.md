@@ -71,6 +71,9 @@
 
 ### D3. BEFORE ROW の戻り値
 
+> Issue #1723 の実装記録: [trigger-before-insert.md](trigger-before-insert.md)（INSERT の BEFORE ROW 経路・
+> 経路ごとのガード・PostgreSQL との差分）。
+
 - 同じ行の BEFORE トリガを名前順に連鎖させ、各トリガが受け取る NEW は前のトリガが返した行
 - NULL が返った場合、その行の操作を行わず後続のトリガを呼ばない。影響行数・`RETURNING`・
   AFTER のキューにも入れない
@@ -79,6 +82,9 @@
 - 行の書き換えは BEFORE だけが行える。AFTER と文トリガの戻り値は無視する
 
 ### D4. 発火の時点と順序（1 文のライフサイクル）
+
+> Issue #1723 の実装記録: [trigger-before-insert.md](trigger-before-insert.md)（INSERT の BEFORE ROW 経路・
+> 経路ごとのガード・PostgreSQL との差分）。
 
 1. 台帳の事前照合（D10）。再送ならここで `23505` を返し、トリガは 1 つも呼ばない
 2. BEFORE STATEMENT（対象 0 行でも発火する）
@@ -97,6 +103,9 @@
   終わりで消化する（PG と同じ入れ子）
 
 ### D5. 行単位の処理と再入の不変条件
+
+> Issue #1723 の実装記録: [trigger-before-insert.md](trigger-before-insert.md)（INSERT の BEFORE ROW 経路・
+> 経路ごとのガード・PostgreSQL との差分）。
 
 - 表に該当イベントのトリガがある文だけ「トリガ経路」で実行する。トリガ経路は行単位で、
   対象行を先に実体化（UPDATE／DELETE の対象、INSERT ... SELECT の入力行、VALUES の行と
@@ -133,6 +142,9 @@
   よる書き換えは判定に含めない。UPSERT では `DO UPDATE SET` の列で判定する
 
 ### D8. 経路ごとの扱いと「未結線の経路」ガード
+
+> Issue #1723 の実装記録: [trigger-before-insert.md](trigger-before-insert.md)（INSERT の BEFORE ROW 経路・
+> 経路ごとのガード・PostgreSQL との差分）。
 
 - 中核の不変条件: **トリガが黙って発火しない経路を作らない**
 - `tenant.rs` の `*_unchecked` 系の書き込み関数（`foreign-key.md` の結線一覧と同じ集合）は、

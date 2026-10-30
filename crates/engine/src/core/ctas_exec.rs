@@ -413,6 +413,8 @@ impl EngineCore {
             &bounds,
             self.ledger_mode,
             Some(&schema),
+            // CTAS が作る表にトリガは無い（作成と同じ txn で書く）。
+            None,
         )?;
         Ok(row_count)
     }

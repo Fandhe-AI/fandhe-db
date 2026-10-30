@@ -597,6 +597,10 @@ impl UniqueKeyPlan {
 pub(crate) enum FkCheckMode {
     All,
     ImmediateOnly,
+    /// 行ごとの検査では FK を検査しない（BEFORE ROW トリガ経路が、同じ文の後の行を参照する行を
+    /// 誤って拒否しないよう、全行を書いた後に [`enforce_foreign_keys_for_rows_in_txn`] で 1 回検査する。
+    /// Issue #1723）。
+    Skip,
 }
 
 impl FkCheckMode {
@@ -605,6 +609,7 @@ impl FkCheckMode {
         match self {
             FkCheckMode::All => true,
             FkCheckMode::ImmediateOnly => !fk.is_initially_deferred(),
+            FkCheckMode::Skip => false,
         }
     }
 }
@@ -645,6 +650,27 @@ pub(crate) fn enforce_row_constraints_in_txn(
         written_ids,
         fk_mode,
         true,
+    )
+}
+
+/// `FOREIGN KEY` の参照元側だけを検査する文単位の入口（Issue #1723。BEFORE ROW トリガ経路が、
+/// [`FkCheckMode::Skip`] で行ごとの検査を省いた FK を全行を書いた後に 1 回検査するために使う）。
+/// 検査内容・順序は [`enforce_row_constraints_in_txn`] 末尾の FK 段と同一。
+pub(crate) fn enforce_foreign_keys_for_rows_in_txn(
+    write_txn: &redb::WriteTransaction,
+    table_name: &str,
+    schema: &TableSchema,
+    tenant_id: &str,
+    written_ids: &[RowId],
+    fk_mode: FkCheckMode,
+) -> Result<(), TenantWriteError> {
+    enforce_foreign_keys_in_txn(
+        write_txn,
+        table_name,
+        schema,
+        tenant_id,
+        written_ids,
+        fk_mode,
     )
 }
 
