@@ -7179,6 +7179,7 @@ pub(crate) fn last_operation(
 pub(crate) mod partitioned_dml;
 pub(crate) mod statement_writes;
 mod trigger_insert;
+pub(crate) mod trigger_writes;
 
 #[cfg(test)]
 mod tests {

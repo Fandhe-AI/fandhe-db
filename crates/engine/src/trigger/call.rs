@@ -1,10 +1,12 @@
-//! トリガ関数の呼び出し口（TABLE-45・Issue #1723）。
+//! トリガ関数の呼び出し口（TABLE-45・Issue #1723・#1724）。
 //!
 //! 発火側（`trigger::fire`）が NEW 行などを [`TriggerCall`] に詰めて [`TriggerFunctionInvoker`] を
 //! 呼び、[`TriggerOutcome`] を受け取る。トリガ関数の実体（PL/pgSQL 関数・Issue #2228）はこの
 //! トレイトを実装して差し替える。既定の [`UnwiredInvoker`] は固定文言の `0A000` を返し、実体が
 //! 無い間にトリガを黙って飛ばさない（fail-closed。実行モデルの D8）。
 
+use super::write_handle::TriggerWriteHandle;
+use crate::catalog::trigger::TriggerTiming;
 use crate::catalog::TableSchema;
 use crate::row_codec::Value;
 use crate::sql::allowlist::SqlSurfaceError;
@@ -26,16 +28,26 @@ pub(crate) struct TriggerCall<'a> {
     pub(crate) new_row: &'a [Value],
     /// `TG_ARGV`（`TG_NARGS` はその長さ）。値として渡し、SQL テキストへ連結しない。
     pub(crate) args: &'a [String],
+    /// `TG_WHEN` の元（BEFORE・AFTER）。
+    pub(crate) timing: TriggerTiming,
+    /// 他表への書き込みの窓口（外側の文と同じ write txn・呼び出しテナントの文脈。Issue #1724）。
+    pub(crate) writes: &'a TriggerWriteHandle<'a>,
 }
 
 #[allow(dead_code)] // 実体（#2228）が参照する。
 impl TriggerCall<'_> {
     /// `TG_OP`（本 Issue の範囲は INSERT のみ）。
     pub(crate) const TG_OP: &'static str = "INSERT";
-    /// `TG_WHEN`。
-    pub(crate) const TG_WHEN: &'static str = "BEFORE";
     /// `TG_LEVEL`。
     pub(crate) const TG_LEVEL: &'static str = "ROW";
+
+    /// `TG_WHEN`（呼び出しごと）。
+    pub(crate) fn tg_when(&self) -> &'static str {
+        match self.timing {
+            TriggerTiming::Before => "BEFORE",
+            TriggerTiming::After => "AFTER",
+        }
+    }
 }
 
 /// トリガ関数の戻り値。
