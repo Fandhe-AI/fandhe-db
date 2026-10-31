@@ -1222,6 +1222,22 @@ mod tests {
     }
 
     #[test]
+    fn numeric_context_big_literal_under_non_binary_parent_is_fail_closed() {
+        // 二項演算の直下以外の巨大整数リテラルは束縛側が f64 で受けるため、numeric 文脈でも
+        // 非 numeric 文脈でも 22003 で拒否する（fail-closed。誤った丸め値を返さない）。
+        let big = "100000000000000000000";
+        let case = Expr::Case {
+            whens: vec![(bin(BinOp::Gt, num("1"), num("0")), num(big))],
+            else_result: Some(Box::new(num("1"))),
+        };
+        assert_eq!(fold_code(&bin(BinOp::Add, n("1"), case.clone())), "22003");
+        assert_eq!(fold_code(&case), "22003");
+        let co = Expr::Coalesce(vec![Expr::Null, num(big)]);
+        assert_eq!(fold_code(&bin(BinOp::Add, n("1"), co.clone())), "22003");
+        assert_eq!(fold_code(&co), "22003");
+    }
+
+    #[test]
     fn expressions_without_typed_numeric_are_unchanged() {
         assert_eq!(fold_text(&bin(BinOp::Div, num("7"), num("2"))), "3");
         assert_eq!(fold_text(&bin(BinOp::Mul, num("1.5"), num("2"))), "3");
