@@ -236,6 +236,15 @@
 //! 文数と呼び出し深さの上限は `LANGUAGE sql` 関数の本体にも同じ値が効き、入れ子の呼び出しを
 //! 跨いで合算する（Issue #2218。新しいフラグは無い）。
 //!
+//! `--wasm-max-memory-bytes <65536-8388608>`・`--wasm-max-call-duration-ms <100-5000>`・
+//! `--wasm-max-fuel <1-100000000>`（Issue #1927。EXT-6／EXT-9）: WASM UDF サンドボックスの
+//! 線形メモリ・呼び出し 1 回の実行時間（100 ms 刻みへ切り捨て）・燃料（命令数予算）の上限を、
+//! プロセス全体に対して起動時に**下げる方向だけ**設定できる opt-in 注入点（未指定は現行の
+//! ハード上限と同値）。超過は `54000`。範囲外・非数値・値欠落・重複指定はいずれも fail-closed で
+//! 起動エラー。値の解決は `wire_server::wasm_limits_opt::resolve` に一本化し、
+//! `EngineCore::with_wasm_limits` へ 1 回だけ注入する。実際に効くのは engine の `wasm-udf`
+//! feature を有効にしたビルドだけ（`docs/design/wasmtime-adoption.md`）。
+//!
 //! `--max-result-rows`（Issue #1555・#2211。SQL-34・SQL-46）: 明示 `LIMIT` の範囲上限と `LIMIT` 省略時の結果行数上限
 //! （`1`〜`100000`・既定 10000）を、プロセス全体に対して起動時に**上げ下げ両方向**へ設定できる
 //! opt-in 注入点（未指定は従来の 10000 と同値＝挙動不変）。走査・kNN の `LIMIT k`・`FETCH n`・
@@ -518,6 +527,7 @@ fn run_server(args: &[String]) -> ExitCode {
     let mut max_recursive_cte_iterations_raw: Option<String> = None;
     let mut max_recursive_cte_rows_raw: Option<String> = None;
     let mut plpgsql_limits_raw: [Option<String>; 5] = Default::default();
+    let mut wasm_limits_raw: [Option<String>; 3] = Default::default();
     let mut max_result_rows_raw: Option<String> = None;
     let mut write_lock_wait_raw: Option<String> = None;
     let mut read_timeout_secs_raw: Option<String> = None;
@@ -1450,6 +1460,27 @@ fn run_server(args: &[String]) -> ExitCode {
                 *slot = Some(v.clone());
                 i += 2;
             }
+            // Issue #1927: WASM UDF サンドボックス上限の 3 フラグ（添字は `wasm_limits_opt::FLAGS`）。
+            flag if wire_server::wasm_limits_opt::flag_index(flag).is_some() => {
+                let Some(idx) = wire_server::wasm_limits_opt::flag_index(flag) else {
+                    return ExitCode::FAILURE;
+                };
+                let Some(v) = args.get(i + 1) else {
+                    engine::log_stderr!(
+                        "wire-server: {flag} requires a non-negative integer argument"
+                    );
+                    return ExitCode::FAILURE;
+                };
+                let Some(slot) = wasm_limits_raw.get_mut(idx) else {
+                    return ExitCode::FAILURE;
+                };
+                if slot.is_some() {
+                    engine::log_stderr!("wire-server: {flag} specified more than once");
+                    return ExitCode::FAILURE;
+                }
+                *slot = Some(v.clone());
+                i += 2;
+            }
             wire_server::result_limits_opt::MAX_RESULT_ROWS_FLAG => {
                 let Some(v) = args.get(i + 1) else {
                     engine::log_stderr!(
@@ -2142,6 +2173,22 @@ fn run_server(args: &[String]) -> ExitCode {
         }
     };
 
+    // Issue #1927: WASM UDF サンドボックスの上限を bind・ユーザーストア読込より前に解決する
+    // （fail-closed）。未指定は `SandboxLimits::default()`＝ハード上限＝現行挙動。
+    let wasm_limits = match wire_server::wasm_limits_opt::resolve(
+        wire_server::wasm_limits_opt::WasmLimitsRawFlags {
+            max_memory_bytes: wasm_limits_raw.first().and_then(|v| v.as_deref()),
+            max_call_duration_ms: wasm_limits_raw.get(1).and_then(|v| v.as_deref()),
+            max_fuel: wasm_limits_raw.get(2).and_then(|v| v.as_deref()),
+        },
+    ) {
+        Ok(limits) => limits,
+        Err(e) => {
+            engine::log_stderr!("wire-server: invalid WASM sandbox limit configuration: {e}");
+            return ExitCode::FAILURE;
+        }
+    };
+
     // Issue #1555: 明示 `LIMIT` の範囲上限を bind・ユーザーストア読込より前に解決する
     // （fail-closed）。未指定は `ResultLimits::default()`＝従来の 10,000＝現行挙動。
     let result_limits =
@@ -2629,6 +2676,8 @@ fn run_server(args: &[String]) -> ExitCode {
     // Issue #1871: 未指定でも常に呼ぶ（既定はハード上限と同値で、未注入と挙動が同一）。
     core = core.with_recursive_cte_limits(recursive_cte_limits);
     core = core.with_plpgsql_limits(plpgsql_limits);
+    // Issue #1927: 未指定でも常に呼ぶ（既定はハード上限と同値で、未注入と挙動が同一）。
+    core = core.with_wasm_limits(wasm_limits);
     // Issue #1555: 未指定でも常に呼ぶ（既定は従来の 10,000 と同値で、未注入と挙動が同一）。
     core = core.with_result_limits(result_limits);
     // Issue #1664（TABLE-42）: MATERIALIZED VIEW の初回実体化の対象文脈は、認証構成（ユーザー

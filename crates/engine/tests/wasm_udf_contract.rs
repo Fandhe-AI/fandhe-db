@@ -448,6 +448,45 @@ fn non_finite_backend_result_is_rejected_fail_closed() {
     assert_eq!(err.wire_code(), "22000");
 }
 
+/// 指定したエラーを常に返すバックエンド（資源上限超過の SQLSTATE 写像検証用）。
+#[derive(Debug)]
+struct FixedErrBackend(WasmUdfError);
+impl WasmUdfBackend for FixedErrBackend {
+    fn call_vector_scalar(&self, _v: &[f32], _scalar: f64) -> Result<f64, WasmUdfError> {
+        Err(self.0)
+    }
+}
+
+#[test]
+fn resource_limit_errors_map_to_54000_in_both_positions() {
+    // 結果列と WHERE は別の評価経路（再帰 eval と ExprProgram）を通りうるため両方を固定する。
+    // 上限超過以外のトラップは従来どおり `22000`（上のテスト）。EXT-9 ポインタ。
+    let limit_errors = [
+        WasmUdfError::Trap(TrapKind::DeadlineExceeded),
+        WasmUdfError::Trap(TrapKind::FuelExhausted),
+        WasmUdfError::MemoryLimitExceeded,
+    ];
+    for e in limit_errors {
+        let (core, _guard) = new_core_with_docs();
+        let ctx = PolicyContext::new("tenant-a").expect("valid tenant");
+        let mut session = SessionState::default();
+        session
+            .register_wasm_udf("limited", Arc::new(FixedErrBackend(e)))
+            .expect("register_wasm_udf should succeed");
+        for sql in [
+            "SELECT id, limited(embedding, 1.0) AS n FROM docs \
+             ORDER BY embedding <=> '[3.0,4.0,0.0]' LIMIT 3",
+            "SELECT id FROM docs WHERE limited(embedding, 1.0) > 0.0 \
+             ORDER BY embedding <=> '[3.0,4.0,0.0]' LIMIT 3",
+        ] {
+            let err = core
+                .execute_sql_in_session(&ctx, &mut session, sql)
+                .expect_err("resource limit must fail the statement");
+            assert_eq!(err.wire_code(), "54000", "{e:?} {sql}");
+        }
+    }
+}
+
 // --- セッション分離 ------------------------------------------------------------------
 
 #[test]

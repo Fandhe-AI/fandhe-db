@@ -127,6 +127,8 @@ cargo run -p fandhe-db-wire-server -- --users <ユーザーストアのパス> -
   [--max-group-by-columns <1-8>] [--max-groups <1-10000>] \
   [--max-temp-tables <1-64>] [--max-temp-bytes <1-67108864>] \
   [--max-functions <1-64>] \
+  [--wasm-max-memory-bytes <65536-8388608>] [--wasm-max-call-duration-ms <100-5000>] \
+  [--wasm-max-fuel <1-100000000>] \
   [--max-jsonpath-steps <1-4000000>] [--max-jsonpath-depth <1-1024>] \
   [--max-regex-pattern-len <1-4096>] [--max-regex-input-len <1-4194304>] \
   [--max-regex-compiled-size <1-10485760>] \
@@ -428,6 +430,15 @@ NoSQL（HTTP）の `update`／`delete` は従来どおり filter 必須で、本
 一時表には永続表と同じ `INSERT`／`UPDATE`／`DELETE`／`TRUNCATE`／`SELECT`／`COPY`・制約・索引（`CREATE [UNIQUE] INDEX`）
 が使えます（Issue #1684）。書き込みは `operation_id` 台帳の対象外（`USING OPERATION_ID` は `0A000`）で、
 一時表と永続表を 1 文で参照する文・`ALTER TABLE`・カーソル・`VECTOR` 列は `0A000` です。
+
+`--wasm-max-memory-bytes <N>`（既定・上限 8388608、範囲 `65536`〜`8388608`）・
+`--wasm-max-call-duration-ms <N>`（既定・上限 5000、範囲 `100`〜`5000`。100 ms 刻みへ切り捨て）・
+`--wasm-max-fuel <N>`（既定・上限 100000000、範囲 `1`〜`100000000`）（Issue #1927・EXT-6／EXT-9）は、
+WASM UDF サンドボックスの線形メモリ・呼び出し 1 回の実行時間・燃料（命令数予算）の上限を、
+プロセス全体に対して起動時に**下げる方向だけ**設定します（未指定はハード上限と同じ）。
+上限を超えた呼び出しは文全体が `54000` で拒否され、プロセスとセッションは生存します。
+範囲外・非数値・値欠落・重複指定は起動エラーです。実際に効くのは engine の `wasm-udf` feature を
+有効にしたビルドだけです（既定ビルドではフラグは検証されるだけで、WASM UDF は実行できません）。
 
 `--max-functions <N>`（既定 64・範囲 `1`〜`64`）（Issue #1922・SQL-66 (5)）は、`CREATE FUNCTION` の件数上限を、
 プロセス全体に対して起動時に**下げる方向だけ**設定します（未指定は従来のハード上限 64 と同じで、挙動は変わりません）。

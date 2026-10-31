@@ -58,3 +58,14 @@ fn create_function_language_wasm_is_0a000() {
     assert_eq!(err.wire_code(), "0A000");
     assert!(session.udfs().is_empty());
 }
+
+#[test]
+fn sandbox_limit_helpers_are_available_without_the_feature() {
+    // wire-server の起動時 CLI が既定ビルドでも範囲検証できること（Issue #1927）。
+    assert_eq!(SandboxLimits::default(), SandboxLimits::default().clamped());
+    assert!(engine::wasm_udf::validate_wasm_max_fuel(0).is_err());
+    assert_eq!(
+        engine::wasm_udf::validate_wasm_max_call_duration_ms(199),
+        Ok(1)
+    );
+}

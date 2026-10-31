@@ -32,7 +32,8 @@ use crate::sql::interval_arith;
 use crate::sql::string_fn;
 use crate::sql::time_fn::{self, StatementClock};
 use crate::wasm_udf::{
-    check_signature_against_abi, SandboxLimits, WasmUdfBackend, WasmUdfError, WasmUdfSignature,
+    check_signature_against_abi, SandboxLimits, TrapKind, WasmUdfBackend, WasmUdfError,
+    WasmUdfSignature,
 };
 
 /// UDF 定義が持てるパラメータ数の上限（`54000` で拒否）。
@@ -10287,14 +10288,13 @@ pub(crate) fn eval_with_scalars<'a>(
                     })
                 }
             };
-            // バックエンドの失敗（deadline 超過・トラップ・メモリ確保失敗・
-            // `Mutex` poison 等）は種別を問わずすべて `22000` に写像する（行値・
-            // テナント情報を含まない固定文言。`crate::wasm_udf::WasmUdfError` の
-            // `Display` を利用。EXT-6 の拒否・強制中断はここで行単位のエラーへ
-            // 収束し、プロセスは生存する）。
+            // バックエンドの失敗は `map_wasm_call_error` で SQLSTATE へ写像する
+            // （上限超過は `54000`、それ以外のトラップは `22000`。行値・テナント情報を
+            // 含まない固定文言。EXT-6／EXT-9 の強制中断は文単位のエラーへ収束し、
+            // プロセスは生存する）。
             let result = backend
                 .call_vector_scalar(&v, s)
-                .map_err(|e| SqlSurfaceError::invalid_input(e.to_string()))?;
+                .map_err(map_wasm_call_error)?;
             finite_scalar(result, "wasm udf")
         }
         BoundExpr::Null => Ok(ExprValue::Null),
@@ -11289,6 +11289,26 @@ fn take_timestamp_arg(
         None => Err(SqlSurfaceError::Internal {
             detail: "missing function argument at evaluation time".to_string(),
         }),
+    }
+}
+
+/// WASM UDF 呼び出し時の失敗を SQLSTATE へ写像する（Issue #1927・EXT-9 ポインタ）。
+/// 再帰 `eval` と `sql::expr_program::ExprProgram::eval` の `WasmCall` が共有し、
+/// 判定を 1 か所に集める。資源上限の超過（実行時間・燃料・メモリ）は `54000`、
+/// それ以外のトラップは `22000`。`_ =>` は置かず variant 追加時に判断を強制する。
+pub(crate) fn map_wasm_call_error(err: WasmUdfError) -> SqlSurfaceError {
+    match err {
+        WasmUdfError::Trap(TrapKind::DeadlineExceeded | TrapKind::FuelExhausted)
+        | WasmUdfError::MemoryLimitExceeded => SqlSurfaceError::payload_too_large(err.to_string()),
+        WasmUdfError::Trap(TrapKind::Unreachable | TrapKind::MemoryOutOfBounds | TrapKind::Other)
+        | WasmUdfError::Poisoned
+        // 以下は定義時にのみ起きる種別。防御的に `22000` へ畳む。
+        | WasmUdfError::ModuleTooLarge
+        | WasmUdfError::InvalidModule
+        | WasmUdfError::ImportsNotAllowed
+        | WasmUdfError::MissingMemoryExport
+        | WasmUdfError::MissingEntryExport
+        | WasmUdfError::SignatureMismatch => SqlSurfaceError::invalid_input(err.to_string()),
     }
 }
 
@@ -13687,7 +13707,34 @@ mod as_bare_column_tests {
 mod wasm_define_tests {
     //! `define_wasm_function_from_module` の前段検査とエラー写像の単体テスト（Issue #1926）。
     use super::*;
-    use crate::wasm_udf::{TrapKind, WasmSqlType};
+    use crate::wasm_udf::WasmSqlType;
+
+    #[test]
+    fn call_error_mapping_covers_every_variant() {
+        let limit = [
+            WasmUdfError::Trap(TrapKind::DeadlineExceeded),
+            WasmUdfError::Trap(TrapKind::FuelExhausted),
+            WasmUdfError::MemoryLimitExceeded,
+        ];
+        for e in limit {
+            assert_eq!(map_wasm_call_error(e).wire_code(), "54000", "{e:?}");
+        }
+        let other = [
+            WasmUdfError::Trap(TrapKind::Unreachable),
+            WasmUdfError::Trap(TrapKind::MemoryOutOfBounds),
+            WasmUdfError::Trap(TrapKind::Other),
+            WasmUdfError::Poisoned,
+            WasmUdfError::ModuleTooLarge,
+            WasmUdfError::InvalidModule,
+            WasmUdfError::ImportsNotAllowed,
+            WasmUdfError::MissingMemoryExport,
+            WasmUdfError::MissingEntryExport,
+            WasmUdfError::SignatureMismatch,
+        ];
+        for e in other {
+            assert_eq!(map_wasm_call_error(e).wire_code(), "22000", "{e:?}");
+        }
+    }
 
     #[test]
     fn define_error_mapping_covers_every_variant() {
