@@ -610,3 +610,29 @@ SQL-68 ポインタ。D9 の内部 API と `DO` を実装した。公開 enum `S
 - SQL の `CREATE FUNCTION ... RETURNS trigger LANGUAGE plpgsql` は #2217（ドル引用は #2216）。
 - `TG_ARGV`・`TG_RELID` 等は未宣言。参照は通常の識別子扱いで、列として解決できず失敗する（fail-closed）。
   `TG_NARGS` は使える。
+
+## Issue #2229 追記（RLS 境界・資源上限・台帳整合の検証。SQL-68・RLS-10 ポインタ）
+
+本体の変更を伴わない回帰テストの追加（`test(engine)`）。到達経路の制約から、公開 API の `DO` と crate 内の
+関数入口（`run_plpgsql_in_txn`／`run_plpgsql_autocommit`）の 2 系統で検証する。
+
+### 追加したテストと性質
+
+| 性質 | 場所 |
+| ---- | ---- |
+| 越境マトリクス（`DO`。3 テナント × 可視性 2 × 経路 2 × flood × 読み 4 形・書き 3 形。双子オラクル・真実値・flood 不変・他テナント行の不変・エラー文面・試行総数の固定） | `tests/table_rls/rls10_plpgsql_paths.rs` |
+| 越境マトリクス（関数本体。`SELECT INTO`／`FOR`／`PERFORM`／`RETURN QUERY`／`UPDATE`／`DELETE`・読み取り専用関数の拒否・エラー文面） | `src/core/plpgsql_boundary_tests.rs` |
+| 上限超過の fail-closed（文数・ループ・入れ子〔`54001`〕・本体長・結果行数。上限ちょうどは成功・+1 で失敗・明示 Tx は `25P02` から `ROLLBACK`・既定上限での陽性対照） | `tests/sql_t40_up/sql68_do_limits_ledger.rs`、関数本体は `plpgsql_boundary_tests.rs` |
+| 台帳（`DO ... USING OPERATION_ID` の `0A000` と未記録・未実行、`Ledgered` の `23502`、証人 INSERT との順序 A／B の再送、失敗時に台帳が残らない、再オープン後の再送、テナント別の台帳） | `tests/sql_t40_up/sql68_do_limits_ledger.rs` |
+| crash（SIGKILL 後の `DO` の全か無か・台帳と本体の原子性・第 2 テナントの不干渉・再送の `23505` と全体破棄） | `examples/crash_tool_sequence.rs` の `*-do` サブコマンド（`scripts/crash_test_sequence.sh` の 3 つ目のモード。新しい CI ジョブは作らない） |
+
+### 到達経路の制約と既知の制限（起票はしない。要対応事項）
+
+- `DO` の本体は単一引用リテラルのみ（#2216 のドル引用待ち）。PL/pgSQL 関数本体は crate 内入口のみ
+  （#2217・#2218 待ち）。
+- 呼び出し深さ（`54001`）の本番経路での検証は #2218 以降。ScriptedHost の `plpgsql/interp_tests.rs` で固定済み。
+- `DO ... USING OPERATION_ID` の受理（台帳キーの設計）は #2228 追記の要対応事項のまま。明示 Tx の証人 INSERT が
+  台帳の鍵になる形だけを固定した。外側の operation_id を本体の書き込みへ引き継ぐ形（`Ledgered` での `SELECT f()` 等）の
+  再送検証は #2218 以降。
+- `nextval()` を本体から使う採番の検証は行っていない（本体 SQL の `DEFAULT nextval` の扱いは別途）。
+- トリガ発火経由の越境・crash は #1720。

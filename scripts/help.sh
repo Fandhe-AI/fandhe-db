@@ -82,7 +82,7 @@ cat <<'EOF'
       ビュー書き込みの crash 耐性・台帳再送の回帰テスト
       $ scripts/crash_test_view_write.sh
   crash-test-sequence
-      採番状態・operation_id 台帳の crash 耐性回帰テスト
+      採番状態・operation_id 台帳・DO ブロックの crash 耐性回帰テスト
       $ scripts/crash_test_sequence.sh
   crash-test-gin-index
       GIN 相当索引の crash 耐性回帰テスト
