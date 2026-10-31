@@ -471,8 +471,8 @@ Search・Aggregate・Scan）は確定済みのまま出力が決まる。想定�
 `docs/spec/04-behavior/data-model.md` TABLE-3、`docs/spec/04-behavior/persistence.md` PERSIST-4。
 構文の実装は #1938（`ISOLATION LEVEL`）・#1939（`SET TRANSACTION`／`SET SESSION CHARACTERISTICS`）・
 Issue #1931（`READ ONLY`）、挙動テストは #1940、`40001` は #2396 が担う。
-現状の main では `BEGIN ISOLATION LEVEL ...`・`BEGIN READ ONLY` は `42601` で拒否される
-（`validate_transaction_control_tokens`）。#1938 がこの拒否を受理へ変え、コードコメントとテストも更新する。
+現状の main では `BEGIN ISOLATION LEVEL ...` は `42601` で拒否される
+（`validate_transaction_control_tokens`）。`BEGIN READ ONLY` は構文受理後に暫定ゲートで `0A000` となる。#1938 がこの拒否を受理へ変え、コードコメントとテストも更新する。
 
 - **engine の宣言型**: `crates/engine/src/txn.rs` の `IsolationLevel` は単一バリアントのまま維持する。
   保持の形は #1938・#1939 で決める。
@@ -713,7 +713,8 @@ production コード（`crates/wire-server/src/`）は無変更・テスト専�
 - 失敗状態の `END` は `COMMIT` と同じく `25P02` で拒否する（PostgreSQL の「巻き戻して `ROLLBACK` を返す」
   動作はしない）。`ABORT` は `ROLLBACK` と同じく失敗状態でも受理して `Idle` へ戻す。
 - `AND CHAIN`（`AND NO CHAIN` を含む。安全側に倒す）と `PREPARE TRANSACTION` は `0A000`。
-  `START TRANSACTION` の修飾子（分離レベル・`READ ONLY`）は `BEGIN` と同じく `42601`。
+  `START TRANSACTION` の修飾子（分離レベル・`READ ONLY`）は `42601`。
+  `BEGIN READ ONLY` は構文として受理され、`begin_with_mode` の暫定ゲートで `0A000` になる（上記アクセスモード修飾子の項）。
 - 複数文メッセージの分割器は `START TRANSACTION`（`TRANSACTION` を伴う形のみ）・`END`・`ABORT` を
   制御文として分類する。分類しないと未知の先頭語（`Write`）として暗黙トランザクションに入り、
   暗黙 `Active` 内の `begin` が不変条件違反になる。
