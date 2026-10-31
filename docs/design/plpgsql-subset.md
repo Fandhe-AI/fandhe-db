@@ -500,8 +500,9 @@ D3・D5・D6・D8 の最終判断。実装は `crates/engine/src/core/plpgsql_ho
   `CAST` と同一に行うため、畳み込みが宣言型どおりの算術を行う（bigint の `p + 1` が int4 の範囲エラー
   にならない）。公開の `Token`・`Expr` の形は変えない。利用者の `CAST` は従来どおり定数式で拒否され、
   `VALUES (CAST(1 AS bigint))` は 0A000 のまま。
-  numeric は定数式で算術できないため、単独の要素（符号付きを含む）は裸の数値（列型が決める）、
-  式の中は 0A000。静的 SQL の `VALUES (-p)` は定義時の検証が拒否する（素の SQL の `-col` と同じ）。
+  numeric は、単独の要素（符号付きを含む）は裸の数値（列型が決める）、式の中は内部専用の
+  `$typed:numeric` で置換して近似なしで畳み込む（Issue #2799 追記節）。
+  静的 SQL の `VALUES (-p)` は定義時の検証が拒否する（素の SQL の `-col` と同じ）。
   負値の numeric を単項マイナスの下に置く形（`-(-3)`）は括弧付きになり定数式が受理しない。
   `WHERE` 形の比較の検査（`where_probe`）は
   値同士の比較なので裸の数値（`NumStyle::Bare`）
@@ -662,3 +663,21 @@ SQL-68 ポインタ。D9 の内部 API と `DO` を実装した。公開 enum `S
   評価できず fail-open になるため。未定義名が `0A000`（PostgreSQL は `42883`）なのは既知の差。
 - 既知の差・後続: 呼び出しと `STRICT` の実行時の意味は #2218、`RETURN`／`BEGIN ATOMIC` は #2219、
   `SETOF`／`TABLE`／`void` は #2220 以降。IMMUTABLE 関数・内容で決定的な宣言的 UDF を索引で受け入れる対応は未着手。
+
+## Issue #2799 追記（定数式の畳み込みで numeric の算術を扱う。SQL-24・SQL-68 ポインタ）
+
+- 式の中の numeric 変数（`VALUES (p / 2)`・`coalesce(p, 1) * 2` 等。静的 SQL と `EXECUTE ... USING` の
+  両方）は、`plpgsql::subst` が内部専用の型付き値 `$typed:numeric <数値>` で置換する。`$` で始まる識別子
+  は字句解析器が生成せず、利用者の SQL からは書けない。単独の要素は従来どおり裸の数値（列型が決める）。
+- 束縛は `CAST ... AS numeric`（scale を固定する）を通さず、変数自身の scale の `Decimal` へ直接束縛する
+  （`3 / 2` は `1.5000000000000000`、`p * 2` は scale を保つ）。畳み込みは `numeric::decimal_arith` で
+  近似せず、桁あふれは `22003`、0 除算は `22012`。
+- NUMERIC 算術の束縛モード（`BindEnv::numeric_arith`）は、式に `$typed:numeric` が含まれるときだけ
+  `sql::const_expr` が立てる。含まない式の束縛経路は従来と同一で、int・float の畳み込みは変わらない。
+  FROM なし SELECT（`const_select`）も不変。
+- 結果は `InsertLiteral::Number`（Decimal の正規テキスト。小数部がすべて 0 なら整数表記）へ戻し、列側の
+  リテラル束縛が列型で解釈し直す。`InsertLiteral` の variant は増やさないため content_hash・DDL・wire は
+  不変。
+- 境界（fail-closed または既存のリテラル規則）: 小数が残る値を INTEGER 系の列へ入れる場合は素のリテラル
+  `1.5` と同じ規則で `22P02`（PostgreSQL は丸める）。numeric と real／double の混合、numeric 引数の関数
+  （`abs` 等）、`CAST` は未対応で拒否する。素の小数リテラルは従来どおり f64 のまま扱う。
