@@ -9,6 +9,9 @@
 
 ### Added
 
+- トランザクション制御の別名 `START TRANSACTION`・`END`・`ABORT` を受理する（Issue #1930・SQL-69 (1)・SQL-31）。`BEGIN`／`COMMIT`／`ROLLBACK` と同じ遷移・上限・エラーで、完了タグは `START TRANSACTION`／`COMMIT`／`ROLLBACK`。
+  `COMMIT AND CHAIN` 等の `AND [NO] CHAIN` と `PREPARE TRANSACTION` は `0A000`（従来 `AND CHAIN` は `42601`）。
+  BREAKING CHANGE: 公開 enum `SqlOutcome`・`TxnControl` に `StartTransaction` を追加した。網羅 `match` する外部コードは腕を足す。
 - `CREATE [OR REPLACE] FUNCTION` が SQL 標準形の関数本体 `RETURN <式>`・`BEGIN ATOMIC <文>; ... END` を受理する（Issue #2219・SQL-67 (2)。`LANGUAGE` 省略は sql）。標準形は定義時に名前を解決して参照先への依存辺を記録し、参照先の DROP・改名・列変更を `2BP01` で止める（CASCADE でも。連鎖削除・改名への追随は未対応）。簡易クエリの複数文メッセージは本体内の `;` で分割しない。詳細は [plpgsql-subset.md](docs/design/plpgsql-subset.md)。
   公開 enum `CreateFunctionBody` に `SqlStandard` を追加した（BREAKING CHANGE）。
 - WASM UDF サンドボックスの資源上限を追加した（Issue #1927・EXT-6／EXT-9）。`wasm_udf::SandboxLimits` に `fuel` を追加（BREAKING: 公開フィールドの追加）、`SandboxLimits::clamped`・`HARD_MAX_*`・`validate_wasm_*`・`WasmLimitOutOfRange`・`TrapKind::FuelExhausted`・`EngineCore::with_wasm_limits`／`wasm_limits` を追加した。`wasm-udf` ビルドでは epoch ティッカーで実行時間上限が効き、実行時の上限超過は `54000`（従来は `22000`）。起動フラグ `--wasm-max-memory-bytes`・`--wasm-max-call-duration-ms`・`--wasm-max-fuel`（下げる方向だけ）を追加。

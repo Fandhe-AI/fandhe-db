@@ -680,13 +680,7 @@ impl EngineCore {
         // `public.<一時表の名前>` は解決より前に拒否する（TABLE-27・Issue #1714）。
         crate::sql::temp_catalog::reject_public_qualified_temp(&tokens, temp)?;
         // トランザクション制御・`CREATE [TEMP] TABLE`・`DROP TABLE` は実行段が一時カタログで名前を解決する。
-        let txn_control_head = matches!(
-            tokens.first(),
-            Some(crate::sql::lexer::Token::Ident(name))
-                if name.eq_ignore_ascii_case("BEGIN")
-                    || name.eq_ignore_ascii_case("COMMIT")
-                    || name.eq_ignore_ascii_case("ROLLBACK")
-        );
+        let txn_control_head = crate::sql::transaction::is_transaction_control_head(&tokens);
         let is_drop_table = matches!(tokens.first(), Some(crate::sql::lexer::Token::Ident(a)) if a.eq_ignore_ascii_case("DROP"))
             && matches!(tokens.get(1), Some(crate::sql::lexer::Token::Ident(b)) if b.eq_ignore_ascii_case("TABLE"));
         if txn_control_head

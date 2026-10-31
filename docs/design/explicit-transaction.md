@@ -410,7 +410,8 @@ production コード（`crates/wire-server/src/`）は無変更・テスト専�
   使える文は明示トランザクションと同じ許可リスト（Issue #1179 で拡大済み。`RETURNING`
   は UPSERT のみ未対応）。`BEGIN` より前の書き込みを
   明示ブロックへ昇格させる PostgreSQL の意味論（`INSERT; BEGIN; ...`）は対象外。
-- savepoint、分離レベルの指定、`START TRANSACTION`／`END`／`ABORT` などの別名。
+- savepoint、分離レベルの指定、`COMMIT AND CHAIN`・`PREPARE TRANSACTION`（いずれも `0A000`）。
+  別名 `START TRANSACTION`／`END`／`ABORT` は Issue #1930 で受理した（下記「別名」節）。
 - NoSQL 表層のトランザクション（設計上 `0A000`。`op` 許可リストに追加しない）。
 - 上限の既定値（20 秒・1,000 件・30 秒）と CLI のハード上限（60 秒・10,000 件。Issue #1553 で暫定採用）の確定 → オーナー判断。
 
@@ -420,3 +421,17 @@ production コード（`crates/wire-server/src/`）は無変更・テスト専�
 機構の上に実装されており、カーソルは `sql::transaction::ActiveTxn` に埋め込
 まれるため、`COMMIT`／`ROLLBACK`／`fail`／期限切れ／接続断のいずれでも自動的に
 クローズされる。詳細は `docs/design/sql-cursor.md` 参照。
+
+## 別名（Issue #1930・SQL-69 (1) ポインタ）
+
+- `START TRANSACTION` は `BEGIN`、`END [WORK|TRANSACTION]` は `COMMIT`、`ABORT [WORK|TRANSACTION]` は
+  `ROLLBACK` と同じ状態遷移・上限・エラー（`25001`・`25P01`・`25P02`・`54000`）に載る。
+  `START TRANSACTION` に `WORK` の別形は無く、`TRANSACTION` は必須。
+- CommandComplete タグは `START TRANSACTION`／`COMMIT`／`ROLLBACK`（`SqlOutcome::StartTransaction` を新設）。
+- 失敗状態の `END` は `COMMIT` と同じく `25P02` で拒否する（PostgreSQL の「巻き戻して `ROLLBACK` を返す」
+  動作はしない）。`ABORT` は `ROLLBACK` と同じく失敗状態でも受理して `Idle` へ戻す。
+- `AND CHAIN`（`AND NO CHAIN` を含む。安全側に倒す）と `PREPARE TRANSACTION` は `0A000`。
+  `START TRANSACTION` の修飾子（分離レベル・`READ ONLY`）は `BEGIN` と同じく `42601`。
+- 複数文メッセージの分割器は `START TRANSACTION`（`TRANSACTION` を伴う形のみ）・`END`・`ABORT` を
+  制御文として分類する。分類しないと未知の先頭語（`Write`）として暗黙トランザクションに入り、
+  暗黙 `Active` 内の `begin` が不変条件違反になる。

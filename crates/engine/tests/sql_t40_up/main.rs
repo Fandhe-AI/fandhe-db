@@ -131,5 +131,6 @@ mod sql67_sql_function_limits;
 mod sql67_standard_body;
 mod sql68_do_block;
 mod sql68_do_limits_ledger;
+mod sql69_txn_aliases;
 mod sql78_predicate_dml_noneq_between_params;
 mod sql78_where_noneq_between_params;
