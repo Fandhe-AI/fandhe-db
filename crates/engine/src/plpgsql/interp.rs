@@ -480,8 +480,9 @@ impl<'a> Interp<'a> {
                         not_null: false,
                     },
                     Some(_) => return Err(internal("trigger row width mismatch")),
+                    // 未代入でも対象表の固定行型で束縛し、後続の `INTO NEW` 等の列数・列型検査を効かせる。
                     None => Slot {
-                        ty: SlotTy::Record(None),
+                        ty: SlotTy::Record(Some(t.columns.clone())),
                         val: SlotVal::Record(PlRecord::default()),
                         not_null: false,
                     },

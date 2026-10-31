@@ -1050,7 +1050,17 @@ impl EngineCore {
         };
         match run_trigger_function(inv.body, &inv.vars, &mut host, &mut budget)? {
             TriggerReturn::Null => Ok(TriggerOutcome::Skip),
-            TriggerReturn::Row(fields) => {
+            TriggerReturn::Row(mut fields) => {
+                // `%ROWTYPE`／`SELECT *` は可視の `id` 疑似列を先頭に含める。`id` はトリガから書き換えられず
+                // 元の行 ID を保つため、戻り値に先頭の `id` があれば構造検査の前に取り除く。
+                if inv.schema.has_pseudo_id()
+                    && fields.len() == inv.schema.columns.len().saturating_add(1)
+                    && fields
+                        .first()
+                        .is_some_and(|(n, _)| n.eq_ignore_ascii_case("id"))
+                {
+                    fields.remove(0);
+                }
                 let mismatch = || {
                     SqlSurfaceError::datatype_mismatch(
                         "returned row structure does not match the structure of the triggering table",
