@@ -164,7 +164,7 @@ pub(crate) fn extract(tokens: &[Token]) -> Result<Option<FunctionScanParts>, Sql
             "a function in FROM cannot be combined with other relations",
         ));
     }
-    let public = alias.clone().unwrap_or_else(|| name.clone());
+    let public = alias.clone().unwrap_or_else(|| display_function_name(name));
     let mut outer: Vec<Token> = Vec::with_capacity(tokens.len());
     outer.extend(tokens.iter().take(from.saturating_add(1)).cloned());
     outer.push(Token::Ident(public));
@@ -176,6 +176,15 @@ pub(crate) fn extract(tokens: &[Token]) -> Result<Option<FunctionScanParts>, Sql
         column_aliases,
         outer_tokens: outer,
     }))
+}
+
+/// スキーマ修飾の呼び出しが解決器で内部キー（`#<id>.<name>`）へ書き換わっていても、クライアントへ出す
+/// 既定の列名・relation 名には関数名だけを使う（schema id を RowDescription へ漏らさない）。
+fn display_function_name(name: &str) -> String {
+    match name.strip_prefix('#').and_then(|r| r.split_once('.')) {
+        Some((_, bare)) => bare.to_string(),
+        None => name.to_string(),
+    }
 }
 
 fn is_join_word(n: &str) -> bool {
@@ -238,7 +247,7 @@ pub(crate) fn plan(
     let default_name = scan
         .alias
         .clone()
-        .unwrap_or_else(|| scan.name.to_ascii_lowercase());
+        .unwrap_or_else(|| display_function_name(&scan.name).to_ascii_lowercase());
     let columns = cols
         .iter()
         .map(|(n, t)| (n.clone().unwrap_or_else(|| default_name.clone()), t.clone()))

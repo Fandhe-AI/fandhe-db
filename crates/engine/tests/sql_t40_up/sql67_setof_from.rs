@@ -252,6 +252,35 @@ fn result_shape_mismatch_is_42p13() {
     assert_eq!(code(&core, &mut s, "SELECT * FROM wrong()"), "42P13");
 }
 
+/// 0 行の結果でも宣言型との不一致は `42P13`（空集合として成功させない）。
+#[test]
+fn empty_result_with_type_mismatch_is_42p13() {
+    let (core, mut s, _g) = setup("sql67_setof_empty_mismatch");
+    run(
+        &core,
+        &mut s,
+        "CREATE FUNCTION e() RETURNS SETOF int LANGUAGE sql AS \
+         $$ SELECT b FROM t WHERE 1 = 0 $$",
+    );
+    assert_eq!(code(&core, &mut s, "SELECT * FROM e()"), "42P13");
+}
+
+/// スキーマ修飾の呼び出しでも既定の列名は関数名で、内部キー（`#<id>.`）を出さない。
+#[test]
+fn schema_qualified_call_does_not_leak_internal_key() {
+    let (core, mut s, _g) = setup("sql67_setof_schema_name");
+    run(&core, &mut s, "CREATE SCHEMA sc");
+    run(
+        &core,
+        &mut s,
+        "CREATE FUNCTION sc.g() RETURNS SETOF int LANGUAGE sql AS $$ SELECT a FROM t $$",
+    );
+    for n in names(&core, &mut s, "SELECT * FROM sc.g()") {
+        assert!(!n.contains('#'), "leaked: {n}");
+        assert_eq!(n, "g");
+    }
+}
+
 #[test]
 fn strict_function_with_null_argument_returns_an_empty_set() {
     let (core, mut s, _g) = setup("sql67_setof_strict");

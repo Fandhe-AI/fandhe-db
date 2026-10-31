@@ -658,6 +658,12 @@ fn run_sql_set_inner(
         if out.columns.len() != cols.len() {
             return Err(shape_error());
         }
+        // 0 行でも宣言型との代入互換性を検査する（行ループだけだと空集合が型不一致をすり抜ける）。
+        if out.rows.is_empty() {
+            for (col_ty, ret) in out.columns.iter().map(|(_, t)| t).zip(cols) {
+                convert_result_cell(Cell::Null, col_ty, ret)?;
+            }
+        }
         let mut rows: Vec<Vec<PlScalar>> = Vec::new();
         for row in out.rows {
             if row.len() != cols.len() {
