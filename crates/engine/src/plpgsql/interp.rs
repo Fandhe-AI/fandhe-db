@@ -16,7 +16,7 @@
 use crate::catalog::ColumnType;
 use crate::plpgsql::ast::{
     AssignTarget, Block, Body, DeclType, DiagItem, EmbeddedKind, EmbeddedSql, IntoClause,
-    ReturnShape, SqlExpr, Stmt, VarId, VarKind, VarRef,
+    ReturnShape, SqlExpr, Stmt, TriggerVar, VarId, VarKind, VarRef,
 };
 use crate::plpgsql::host::{
     PlHost, PlRecord, PlScalar, ResolvedType, RowDemand, SqlOutcome, VarLookup,
@@ -236,6 +236,94 @@ struct Interp<'a> {
     row_count: u64,
     result: Option<PlScalar>,
     rows: Vec<Vec<PlScalar>>,
+    /// トリガ呼び出しの入力（トリガ関数の実行だけ `Some`。Issue #2228）。
+    trig: Option<&'a TriggerVars>,
+    /// トリガ関数の `RETURN` の結果（`None` は RETURN 未到達）。
+    trig_ret: Option<TriggerReturn>,
+}
+
+/// トリガ関数 1 回分の入力（Issue #2228）。core の `trigger::call::TriggerCall` から純粋な変換で
+/// 作る（#1720 の発火側が呼ぶ）。NEW／OLD は表の列名・型に沿った値で、該当しない側（INSERT の OLD・
+/// DELETE の NEW・文トリガの両方）は `None`（未代入レコード。フィールド参照は `55000`）。
+#[derive(Debug, Clone, PartialEq)]
+pub(crate) struct TriggerVars {
+    pub(crate) name: String,
+    pub(crate) when: String,
+    pub(crate) level: String,
+    pub(crate) op: String,
+    pub(crate) table_name: String,
+    pub(crate) table_schema: String,
+    pub(crate) nargs: i32,
+    /// 対象表の列名と型（`NEW`／`OLD` の固定行型。代入時に列型へ変換させる）。
+    pub(crate) columns: Vec<(String, ColumnType)>,
+    pub(crate) new: Option<Vec<PlScalar>>,
+    pub(crate) old: Option<Vec<PlScalar>>,
+}
+
+/// トリガ関数の戻り値（PostgreSQL の BEFORE 行トリガの規則。NULL は行の取りやめ）。
+#[derive(Debug, Clone, PartialEq)]
+pub(crate) enum TriggerReturn {
+    /// 返した行（フィールド名つき。core が表の列と照合する）。
+    Row(Vec<(String, PlScalar)>),
+    Null,
+}
+
+/// トリガ関数本体を実行する（Issue #2228）。呼び出し深さを 1 回数え、`RETURN` に達さず終わると
+/// PostgreSQL と同じく `2F005`。呼び出し元は core の `invoke_trigger_function_in_txn`。
+pub(crate) fn run_trigger_function(
+    body: &Body,
+    vars: &TriggerVars,
+    host: &mut dyn PlHost,
+    budget: &mut ExecBudget,
+) -> Result<TriggerReturn, SqlSurfaceError> {
+    budget.enter_call()?;
+    let r = run_trigger_inner(body, vars, host, budget);
+    budget.leave_call();
+    r
+}
+
+fn run_trigger_inner(
+    body: &Body,
+    vars: &TriggerVars,
+    host: &mut dyn PlHost,
+    budget: &mut ExecBudget,
+) -> Result<TriggerReturn, SqlSurfaceError> {
+    let ret = ReturnSpec {
+        shape: ReturnShape::Trigger,
+        ty: None,
+    };
+    let blank = Slot {
+        ty: SlotTy::Unset,
+        val: SlotVal::Unset,
+        not_null: false,
+    };
+    let mut it = Interp {
+        body,
+        env: VarEnv {
+            slots: vec![blank; body.vars.len()],
+        },
+        host,
+        budget,
+        ret: &ret,
+        found: None,
+        row_count: 0,
+        result: None,
+        rows: Vec::new(),
+        trig: Some(vars),
+        trig_ret: None,
+    };
+    it.bind_fixed_vars(Vec::new())?;
+    let flow = it.exec_block(&body.block)?;
+    match flow {
+        Flow::Normal | Flow::Return => {}
+        Flow::Exit(_) | Flow::Continue(_) => {
+            return Err(internal("PL/pgSQL control flow escaped the function body"))
+        }
+    }
+    match (flow, it.trig_ret) {
+        (Flow::Return, Some(r)) => Ok(r),
+        _ => Err(SqlSurfaceError::FunctionExecutedNoReturnStatement),
+    }
 }
 
 /// 関数本体を実行する。トップレベルの起動は呼び出し側が [`ExecBudget`] を作って渡し、入れ子の
@@ -282,6 +370,8 @@ fn run_inner(
         row_count: 0,
         result: None,
         rows: Vec::new(),
+        trig: None,
+        trig_ret: None,
     };
     it.bind_fixed_vars(args)?;
     let flow = it.exec_block(&body.block)?;
@@ -346,9 +436,61 @@ impl<'a> Interp<'a> {
                     self.set_slot(id, SlotTy::Record(None), None, false)?;
                 }
                 VarKind::Local => {}
+                VarKind::Trigger(tv) => self.bind_trigger_var(id, tv)?,
             }
         }
         Ok(())
+    }
+
+    /// トリガ変数 1 個を束縛する（トリガ入力が無い呼び出しでは起こり得ず内部エラー）。
+    fn bind_trigger_var(&mut self, id: VarId, tv: TriggerVar) -> Result<(), SqlSurfaceError> {
+        let t = self
+            .trig
+            .ok_or_else(|| internal("trigger variable outside a trigger function"))?;
+        let text = |s: &str| PlScalar::new(Cell::Text(s.to_string()), ColumnType::Text);
+        let (ty, v) = match tv {
+            TriggerVar::TgName => (ColumnType::Text, text(&t.name)),
+            TriggerVar::TgWhen => (ColumnType::Text, text(&t.when)),
+            TriggerVar::TgLevel => (ColumnType::Text, text(&t.level)),
+            TriggerVar::TgOp => (ColumnType::Text, text(&t.op)),
+            TriggerVar::TgTableName => (ColumnType::Text, text(&t.table_name)),
+            TriggerVar::TgTableSchema => (ColumnType::Text, text(&t.table_schema)),
+            TriggerVar::TgNargs => (
+                ColumnType::Integer,
+                PlScalar::new(Cell::SignedInteger(i64::from(t.nargs)), ColumnType::Integer),
+            ),
+            TriggerVar::New | TriggerVar::Old => {
+                let vals = if tv == TriggerVar::New {
+                    &t.new
+                } else {
+                    &t.old
+                };
+                let slot = match vals {
+                    Some(vals) if vals.len() == t.columns.len() => Slot {
+                        ty: SlotTy::Record(Some(t.columns.clone())),
+                        val: SlotVal::Record(PlRecord {
+                            fields: Some(
+                                t.columns
+                                    .iter()
+                                    .zip(vals.iter())
+                                    .map(|((n, _), v)| (n.clone(), v.clone()))
+                                    .collect(),
+                            ),
+                        }),
+                        not_null: false,
+                    },
+                    Some(_) => return Err(internal("trigger row width mismatch")),
+                    None => Slot {
+                        ty: SlotTy::Record(None),
+                        val: SlotVal::Record(PlRecord::default()),
+                        not_null: false,
+                    },
+                };
+                *self.env.slot_mut(id)? = slot;
+                return Ok(());
+            }
+        };
+        self.set_slot(id, SlotTy::Scalar(ty), Some(v), false)
     }
 
     /// 宣言型を実行時の型へ。`Named` は自前で、`%TYPE` 等はホストに解決させる。
@@ -854,9 +996,40 @@ impl<'a> Interp<'a> {
                 };
                 self.result = Some(v);
             }
-            ReturnShape::Void | ReturnShape::SetOf | ReturnShape::Trigger => {}
+            ReturnShape::Trigger => {
+                let e = e.ok_or_else(|| internal("PL/pgSQL trigger RETURN without a value"))?;
+                self.trig_ret = Some(self.trigger_return_value(e)?);
+            }
+            ReturnShape::Void | ReturnShape::SetOf => {}
         }
         Ok(Flow::Return)
+    }
+
+    /// トリガ関数の `RETURN <式>` の意味。許すのは裸の `NULL` とレコード変数 1 個（`NEW`／`OLD`／
+    /// 他のレコード）だけで、未代入のレコードは NULL 扱い。それ以外の式は式を評価せず `42804`
+    /// （PostgreSQL は行型を要求する。式の副作用を起こさないため評価しない）。
+    fn trigger_return_value(&mut self, e: &SqlExpr) -> Result<TriggerReturn, SqlSurfaceError> {
+        let mismatch =
+            || SqlSurfaceError::datatype_mismatch("trigger function must return a row or NULL");
+        let [tok] = e.tokens.as_slice() else {
+            return Err(mismatch());
+        };
+        if matches!(tok, crate::sql::lexer::Token::Ident(w) if w.eq_ignore_ascii_case("null")) {
+            return Ok(TriggerReturn::Null);
+        }
+        let [site] = e.var_refs.as_slice() else {
+            return Err(mismatch());
+        };
+        let VarRef::Var(id) = &site.var else {
+            return Err(mismatch());
+        };
+        match &self.env.slot(*id)?.val {
+            SlotVal::Record(rec) => Ok(match &rec.fields {
+                Some(f) => TriggerReturn::Row(f.clone()),
+                None => TriggerReturn::Null,
+            }),
+            _ => Err(mismatch()),
+        }
     }
 
     fn push_row(&mut self, row: Vec<PlScalar>) -> Result<(), SqlSurfaceError> {

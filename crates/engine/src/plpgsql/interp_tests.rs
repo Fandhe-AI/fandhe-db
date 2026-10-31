@@ -13,7 +13,10 @@ use std::collections::VecDeque;
 use super::ast::{Body, DeclType, EmbeddedSql, ParamDecl, ReturnShape, SqlExpr, VarRef};
 use super::embedded::{validate_embedded, StructuralChecker};
 use super::host::{PlHost, PlScalar, ResolvedType, RowDemand, SqlOutcome, VarLookup};
-use super::interp::{run_function, CallOutcome, ExecBudget, ReturnSpec};
+use super::interp::{
+    run_function, run_trigger_function, CallOutcome, ExecBudget, ReturnSpec, TriggerReturn,
+    TriggerVars,
+};
 use super::{parse_body, ParseOptions};
 use crate::catalog::ColumnType;
 use crate::interrupt::{InterruptReason, InterruptScope};
@@ -1026,4 +1029,119 @@ fn execute_into_non_strict_dml_takes_first_row_without_p0003() {
         PlpgsqlLimits::default(),
     );
     assert_eq!(err_code(r), "P0003");
+}
+// ---- トリガ関数（Issue #2228。PostgreSQL 17 の PL/pgSQL「トリガ関数」の節に合わせる） ----
+
+fn trig_vars(op: &str, new: Option<i64>, old: Option<i64>) -> TriggerVars {
+    TriggerVars {
+        name: "trg".to_string(),
+        when: "BEFORE".to_string(),
+        level: "ROW".to_string(),
+        op: op.to_string(),
+        table_name: "t".to_string(),
+        table_schema: "public".to_string(),
+        nargs: 0,
+        columns: vec![("n".to_string(), ColumnType::Integer)],
+        new: new.map(|v| vec![int(v)]),
+        old: old.map(|v| vec![int(v)]),
+    }
+}
+
+fn run_trig(src: &str, vars: &TriggerVars) -> Result<TriggerReturn, SqlSurfaceError> {
+    let body = prepare(src, &[], ReturnShape::Trigger);
+    let mut budget = ExecBudget::new(PlpgsqlLimits::default(), 10_000);
+    run_trigger_function(&body, vars, &mut ScriptedHost::default(), &mut budget)
+}
+
+fn trig_code(r: Result<TriggerReturn, SqlSurfaceError>) -> &'static str {
+    match r {
+        Ok(v) => panic!("expected an error, got {v:?}"),
+        Err(e) => e.wire_code(),
+    }
+}
+
+fn row_n(v: i64) -> TriggerReturn {
+    TriggerReturn::Row(vec![("n".to_string(), int(v))])
+}
+
+#[test]
+fn trigger_return_new_unchanged_and_rewritten() {
+    let v = trig_vars("INSERT", Some(1), None);
+    assert_eq!(run_trig("BEGIN RETURN NEW; END", &v).unwrap(), row_n(1));
+    assert_eq!(
+        run_trig("BEGIN NEW.n := NEW.n + 1; RETURN NEW; END", &v).unwrap(),
+        row_n(2)
+    );
+}
+
+#[test]
+fn trigger_return_null_cancels_the_row() {
+    let v = trig_vars("INSERT", Some(1), None);
+    assert_eq!(
+        run_trig("BEGIN RETURN NULL; END", &v).unwrap(),
+        TriggerReturn::Null
+    );
+}
+
+#[test]
+fn trigger_unassigned_side_returns_null_and_field_access_is_55000() {
+    // INSERT の OLD・DELETE の NEW は未代入（PostgreSQL では NULL。フィールド参照は不可）。
+    let ins = trig_vars("INSERT", Some(1), None);
+    assert_eq!(
+        run_trig("BEGIN RETURN OLD; END", &ins).unwrap(),
+        TriggerReturn::Null
+    );
+    assert_eq!(
+        trig_code(run_trig("BEGIN NEW.n := OLD.n; RETURN NEW; END", &ins)),
+        "55000"
+    );
+    let del = trig_vars("DELETE", None, Some(7));
+    assert_eq!(run_trig("BEGIN RETURN OLD; END", &del).unwrap(), row_n(7));
+    assert_eq!(
+        run_trig("BEGIN RETURN NEW; END", &del).unwrap(),
+        TriggerReturn::Null
+    );
+}
+
+#[test]
+fn trigger_scalar_return_is_42804() {
+    let v = trig_vars("INSERT", Some(1), None);
+    assert_eq!(trig_code(run_trig("BEGIN RETURN 1; END", &v)), "42804");
+}
+
+#[test]
+fn trigger_reaching_the_end_is_2f005() {
+    let v = trig_vars("INSERT", Some(1), None);
+    assert_eq!(trig_code(run_trig("BEGIN NULL; END", &v)), "2F005");
+}
+
+#[test]
+fn trigger_tg_nargs_is_bound() {
+    let mut v = trig_vars("UPDATE", Some(1), Some(0));
+    v.nargs = 3;
+    assert_eq!(
+        run_trig("BEGIN NEW.n := TG_NARGS; RETURN NEW; END", &v).unwrap(),
+        row_n(3)
+    );
+}
+
+#[test]
+fn trigger_variables_are_not_declared_outside_trigger_functions() {
+    let body = prepare("BEGIN RETURN 1; END", &[], ReturnShape::Scalar);
+    assert!(body.vars.iter().all(|d| d.name != "new"));
+    let body = prepare("BEGIN NULL; END", &[], ReturnShape::Void);
+    assert!(body.vars.iter().all(|d| d.name != "tg_op"));
+}
+
+#[test]
+fn trigger_statement_budget_applies() {
+    let v = trig_vars("INSERT", Some(1), None);
+    let body = prepare(
+        "BEGIN NULL; NULL; RETURN NEW; END",
+        &[],
+        ReturnShape::Trigger,
+    );
+    let mut budget = ExecBudget::new(small_limits(2, 10, 4), 10_000);
+    let r = run_trigger_function(&body, &v, &mut ScriptedHost::default(), &mut budget);
+    assert_eq!(trig_code(r), "54000");
 }

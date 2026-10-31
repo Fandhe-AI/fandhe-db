@@ -29,7 +29,7 @@ impl TriggerRuntime {
         }
     }
 
-    /// 呼び出し口を差し替えた通過証（#2228 が結線する。本 Issue ではテストが使う）。
+    /// 呼び出し口を差し替えた通過証（本番の結線は #1720。内部 API は #2228。テストが使う）。
     #[cfg_attr(not(test), allow(dead_code))]
     pub(crate) fn with_invoker(invoker: Arc<dyn TriggerFunctionInvoker>) -> Self {
         Self {

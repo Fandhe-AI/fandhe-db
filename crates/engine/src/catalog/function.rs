@@ -226,7 +226,34 @@ fn reject_enum(_name: &str) -> Result<std::sync::Arc<super::EnumTypeDef>> {
     ))
 }
 
+/// 擬似型 `trigger` のタグ（`RETURNS trigger` の保存形。Issue #2228）。列型ではないため
+/// [`FunctionType::to_column_type`]・引数の型には使えない。
+const TRIGGER_TAG: &str = "trigger";
+
 impl FunctionType {
+    /// 擬似型 `trigger`（`RETURNS trigger` の戻り値の位置だけに置ける。Issue #2228）。
+    #[cfg_attr(not(test), allow(dead_code))] // 作る入口は #2217（`RETURNS trigger` の受理）が結線する。
+    pub(crate) fn trigger() -> Self {
+        Self {
+            tag: TRIGGER_TAG.to_string(),
+            param: String::new(),
+        }
+    }
+
+    /// 擬似型 `trigger` か（`catalog::trigger::returns_trigger` の判定の根拠）。
+    pub(crate) fn is_trigger(&self) -> bool {
+        self.tag == TRIGGER_TAG && self.param.is_empty()
+    }
+
+    /// 戻り値の位置の検証。擬似型 `trigger` を許す以外は [`Self::validate`] と同じ。
+    fn validate_return(&self) -> Result<()> {
+        if self.is_trigger() {
+            Ok(())
+        } else {
+            self.validate()
+        }
+    }
+
     /// `ColumnType` から保存値を作る。ENUM（および要素が ENUM の配列）は拒否する。
     pub(crate) fn from_column_type(ty: &ColumnType) -> Result<Self> {
         let (tag, param) = ty.catalog_fields();
@@ -351,7 +378,7 @@ fn validate_shape(def: &FunctionDef) -> Result<()> {
         }
     }
     if let Some(t) = &def.return_type {
-        t.validate()?;
+        t.validate_return()?;
     }
     for v in [def.attrs.cost, def.attrs.rows].into_iter().flatten() {
         if !v.is_finite() || v <= 0.0 {

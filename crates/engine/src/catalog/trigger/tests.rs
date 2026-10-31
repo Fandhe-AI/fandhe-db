@@ -428,3 +428,63 @@ fn lazy_table_creation_leaves_existing_layout_untouched() {
         .any(|h| h.name() == "triggers" || h.name() == "trigger_id_counter");
     assert!(!has_trigger_table);
 }
+
+/// Issue #2228: `RETURNS trigger` の PL/pgSQL 関数（引数なし）だけがトリガ関数として判定される。
+fn trigger_func(key: &str) -> FunctionDef {
+    FunctionDef {
+        return_type: Some(FunctionType::trigger()),
+        language: FunctionLanguage::Plpgsql,
+        body_source: "BEGIN RETURN NEW; END".to_string(),
+        ..func(key)
+    }
+}
+
+#[test]
+fn returns_trigger_requires_plpgsql_trigger_type_and_no_params() {
+    assert!(returns_trigger(&trigger_func("f")));
+    assert!(!returns_trigger(&func("f")));
+    let mut sql_lang = trigger_func("f");
+    sql_lang.language = FunctionLanguage::Sql;
+    assert!(!returns_trigger(&sql_lang));
+    let mut with_param = trigger_func("f");
+    with_param.params = vec![FunctionParam {
+        name: None,
+        ty: Some(FunctionType::from_column_type(&ColumnType::Integer).expect("ty")),
+    }];
+    assert!(!returns_trigger(&with_param));
+}
+
+#[test]
+fn trigger_pseudo_type_is_valid_only_as_a_return_type() {
+    use crate::catalog::function::{decode_function_def, encode_function_def};
+    let def = trigger_func("f");
+    let bytes = encode_function_def(&def).expect("encode");
+    assert_eq!(decode_function_def("f", "", &bytes).expect("decode"), def);
+    // 引数の型には置けず、列型としても復元できない（誤用させない）。
+    let mut as_param = trigger_func("f");
+    as_param.params = vec![FunctionParam {
+        name: None,
+        ty: Some(FunctionType::trigger()),
+    }];
+    assert!(encode_function_def(&as_param).is_err());
+    assert!(FunctionType::trigger().to_column_type().is_err());
+}
+
+#[test]
+fn create_trigger_accepts_a_real_trigger_function_and_rejects_others() {
+    let (path, _g) = tmp_path("trg-real-fn");
+    let s = Storage::open(&path).expect("open");
+    setup(&s, "t1", "docs", "plain");
+    s.create_function("t1", &trigger_func("tf")).expect("tf");
+    s.create_trigger("t1", "docs", &tdef("ok", "tf"), false)
+        .expect("trigger function is accepted");
+    // 非トリガ関数は `Invalid`（`42P17`）。
+    assert!(matches!(
+        s.create_trigger("t1", "docs", &tdef("bad", "plain"), false),
+        Err(CatalogError::Invalid(_))
+    ));
+    // 他テナントのトリガ関数は不在と同じ扱い（存在を区別しない）。
+    assert!(s
+        .create_trigger("t2", "docs", &tdef("x", "tf"), false)
+        .is_err());
+}

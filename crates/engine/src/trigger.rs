@@ -1,9 +1,10 @@
 //! トリガの発火側（TABLE-45・Issue #1723）。`catalog::trigger`（定義の保存・Issue #1722）が持つ
 //! TRIGGER 定義を、行の書き込み経路から呼び出す責務を持つ。
 //!
-//! - [`call`]: 呼び出し口。トリガ関数の実体（`RETURNS trigger` の PL/pgSQL 関数・Issue #2228）は
-//!   本クレートの別担当のため、ここでは入出力の型とトレイトだけを定義し、実体への結線は #2228 が
-//!   [`call::TriggerFunctionInvoker`] を実装して差し替える（型を二重に定義しない）
+//! - [`call`]: 呼び出し口。トリガ関数の内部 API は Issue #2228 が `core::plpgsql_host` の
+//!   `invoke_trigger_function_in_txn` と [`call::trigger_vars_from_call`] で用意した。発火時に
+//!   セッション・Tx を持たない本番の [`call::TriggerFunctionInvoker`] 実装とトリガ文脈のホストは
+//!   #1720 の担当で、ここでは入出力の型とトレイトだけを定義する（型を二重に定義しない）
 //! - [`runtime`]: 呼び出し口と深さ上限を保持する通過証（`EngineCore` が 1 つ持つ。結線済み経路だけが渡す）
 //! - [`depth`]: トリガ呼び出しの入れ子深さの計数（上限超過は `54001`。Issue #1727）
 //! - [`plan`]: 書き込み txn 内でカタログを 1 回読み、発火する経路か・未結線で拒否する経路かを決める
