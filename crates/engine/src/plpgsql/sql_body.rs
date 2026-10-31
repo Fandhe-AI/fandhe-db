@@ -142,13 +142,10 @@ pub(crate) fn check_result_shape(body: &Body) -> Result<(), SqlSurfaceError> {
                     return false;
                 }
                 let prev_ok = match toks.get(i - 1) {
-                    Some(Token::Punct(c)) => *c == ')',
-                    Some(Token::Ident(p)) => ![
-                        "FROM", "INTO", "UPDATE", "JOIN", "USING", "SET", "AS", "WHERE", "AND",
-                        "OR", "ON", "NOT",
-                    ]
-                    .iter()
-                    .any(|k| p.eq_ignore_ascii_case(k)),
+                    Some(Token::Punct(c)) => matches!(*c, ')' | ']'),
+                    Some(Token::Ident(p)) => !is_clause_word(p),
+                    // `FROM`・`WHERE`・`AND` 等は lexer が `Keyword` で出すため、識別子位置として扱う。
+                    Some(Token::Keyword(_)) => false,
                     Some(_) => true,
                     None => false,
                 };
@@ -166,5 +163,42 @@ pub(crate) fn check_result_shape(body: &Body) -> Result<(), SqlSurfaceError> {
         Err(bad_shape(
             "the last statement of a SQL function must return a result",
         ))
+    }
+}
+
+/// 直後が識別子（表名・列名）になる語か（`RETURNING` 句の直前判定用）。
+fn is_clause_word(p: &str) -> bool {
+    [
+        "FROM", "INTO", "UPDATE", "JOIN", "USING", "SET", "AS", "WHERE", "AND", "OR", "ON", "NOT",
+    ]
+    .iter()
+    .any(|k| p.eq_ignore_ascii_case(k))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn shape_ok(src: &str) -> bool {
+        let opts = ParseOptions::new(Vec::new(), ReturnShape::Scalar);
+        parse_sql_function_body(src, &opts)
+            .and_then(|b| check_result_shape(&b))
+            .is_ok()
+    }
+
+    /// `]` で終わる式（配列構築子・添字）の直後の `RETURNING` 句を受理する。
+    #[test]
+    fn returning_after_bracket_is_a_clause() {
+        assert!(shape_ok("UPDATE t SET nums = ARRAY[1,2] RETURNING id"));
+        assert!(shape_ok("UPDATE t SET a = nums[1] RETURNING id"));
+        assert!(shape_ok("UPDATE t SET a = 1 RETURNING id"));
+    }
+
+    /// `FROM`・`WHERE`・`AND`（`Keyword`）の直後の `returning` は表名・列名で、句ではない。
+    #[test]
+    fn returning_identifier_after_keyword_is_not_a_clause() {
+        assert!(!shape_ok("DELETE FROM returning WHERE id = 1"));
+        assert!(!shape_ok("DELETE FROM t WHERE returning = 1"));
+        assert!(!shape_ok("DELETE FROM t WHERE a = 1 AND returning > 2"));
     }
 }

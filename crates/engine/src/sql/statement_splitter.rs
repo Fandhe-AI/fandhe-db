@@ -465,21 +465,6 @@ fn calls_non_builtin_function(tokens: &[Token]) -> bool {
         "JSON_VALUE",
         "JSON_QUERY",
         "ROW",
-        "NUMERIC",
-        "DECIMAL",
-        "VARCHAR",
-        "CHAR",
-        "CHARACTER",
-        "BPCHAR",
-        "VECTOR",
-        "TIMESTAMP",
-        "TIMESTAMPTZ",
-        "TIME",
-        "TIMETZ",
-        "INTERVAL",
-        "BIT",
-        "VARBIT",
-        "FLOAT",
         "TRIM",
         "POSITION",
         "OVERLAY",
@@ -495,6 +480,25 @@ fn calls_non_builtin_function(tokens: &[Token]) -> bool {
         "FIRST_VALUE",
         "LAST_VALUE",
         "NTH_VALUE",
+    ];
+    // 型名と同名のユーザー関数がありうる語。直前が `::`・`AS`（型修飾子の位置）と確認できる場合に
+    // 限り構文語として除外し、確認できなければ呼び出し（`Write`）とする。
+    const TYPE_WORDS: &[&str] = &[
+        "NUMERIC",
+        "DECIMAL",
+        "VARCHAR",
+        "CHAR",
+        "CHARACTER",
+        "BPCHAR",
+        "VECTOR",
+        "TIMESTAMP",
+        "TIMESTAMPTZ",
+        "TIME",
+        "TIMETZ",
+        "INTERVAL",
+        "BIT",
+        "VARBIT",
+        "FLOAT",
     ];
     tokens.iter().enumerate().any(|(i, t)| {
         let (Token::Ident(name), Some(Token::Punct('('))) = (t, tokens.get(i.saturating_add(1)))
@@ -525,8 +529,36 @@ fn calls_non_builtin_function(tokens: &[Token]) -> bool {
             && prev_ident_is(&["AS", "NOT"]))
             || ((name.eq_ignore_ascii_case("FILTER") || name.eq_ignore_ascii_case("OVER"))
                 && prev_is_close);
+        let is_type_modifier = TYPE_WORDS.iter().any(|k| name.eq_ignore_ascii_case(k))
+            && i > 0
+            && match tokens.get(i - 1) {
+                Some(Token::TypeCast) => true,
+                Some(Token::Ident(a)) => a.eq_ignore_ascii_case("AS"),
+                _ => false,
+            };
+        // 型付きリテラル `TIMESTAMP(3) '...'`（修飾子の閉じ括弧の直後が文字列リテラル）も型修飾子。
+        let is_typed_literal = TYPE_WORDS.iter().any(|k| name.eq_ignore_ascii_case(k)) && {
+            let mut depth = 0usize;
+            let mut after = None;
+            for (j, tk) in tokens.iter().enumerate().skip(i.saturating_add(1)) {
+                match tk {
+                    Token::Punct('(') => depth = depth.saturating_add(1),
+                    Token::Punct(')') => {
+                        depth = depth.saturating_sub(1);
+                        if depth == 0 {
+                            after = tokens.get(j.saturating_add(1));
+                            break;
+                        }
+                    }
+                    _ => {}
+                }
+            }
+            matches!(after, Some(Token::StringLiteral(_)))
+        };
         if is_using_plan
             || is_contextual_syntax
+            || is_type_modifier
+            || is_typed_literal
             || SYNTAX_WORDS.iter().any(|k| name.eq_ignore_ascii_case(k))
             || crate::sql::udf_call::is_reserved_function_name(name)
         {
@@ -1076,6 +1108,9 @@ mod tests {
             assert_eq!(classify_statement(sql), StatementEffect::ReadOnly, "{sql}");
         }
         for sql in [
+            "SELECT numeric()",
+            "SELECT varchar(1)",
+            "SELECT 1/0, vector(1)",
             "SELECT my_fn(1)",
             "SELECT abs(my_fn(1))",
             "SELECT a FROM t WHERE my_fn(a) = 1",
