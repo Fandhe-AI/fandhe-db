@@ -126,15 +126,15 @@ tokenizers = { version = "=0.23.2", optional = true, default-features = false, f
 # `wasm_udf.rs` の契約層（`WasmUdfBackend`）の実装が WASM の検証・コンパイル・
 # サンドボックス実行を自作せず wasmtime に委ねるための依存。
 # オーナー承認済み（2026-10-31・承認記録は Issue #1911 のコメントと
-# `docs/design/wasmtime-adoption.md`〔Accepted〕第 8 節）。承認範囲はこの 1 行だけで、
+# `docs/design/wasmtime-adoption.md`〔Accepted〕第 8 節）。承認範囲はこの 1 行だけ（版は 48.0.8。RUSTSEC-2026-0422・0423・0424 の修正版。承認は #1911 のコメント 2026-10-31）で、
 # 版の変更（セキュリティ更新を含む）や `wasmtime-*` サブクレートの直接依存化は再承認が要る。
-#   - `wasmtime = "=48.0.7"`（LTS 系列。default-features = false に `runtime`・
+#   - `wasmtime = "=48.0.8"`（LTS 系列。default-features = false に `runtime`・
 #     `cranelift`・`std` のみ。WASI・component-model・async・cache・profiling は含めない。
 #     ライセンス: Apache-2.0 WITH LLVM-exception）
 # 依存の規模が大きく用途が限られるため optional・下記 `wasm-udf` feature の背後に限定し、
 # `wire-server` はリンクしない（既定ビルドの依存木に出現しない）。
 # .claude/rules/dependency-policy.md に従い完全固定（=x.y.z）で管理する。
-wasmtime = { version = "=48.0.7", optional = true, default-features = false, features = [
+wasmtime = { version = "=48.0.8", optional = true, default-features = false, features = [
     "runtime",
     "cranelift",
     "std",
