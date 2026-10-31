@@ -44,6 +44,10 @@ pub(crate) enum Role {
     /// `INSERT .. VALUES` の要素（定数式）の中の変数。定数式の束縛は `CAST` を受理せず、値の型は
     /// 書き込み先の列型・リテラルの大きさで決まる（置換方法は #2226 の `plpgsql::subst`）。
     ConstExpr,
+    /// `INSERT .. VALUES` の要素全体が変数 1 個だけ（符号 `-`・冗長な括弧を除く）である位置。
+    /// 要素の範囲は構文解析器が確定する（トークンの前後関係からの推測ではない）。numeric を裸の
+    /// 数値で置換してよいのはこの役割だけで、書き込み先の列型が型を決める。
+    ConstLone,
 }
 
 /// 1 件の記録（ルートのトークン列上の位置と役割）。
@@ -256,6 +260,23 @@ impl Drop for ConstExprScope {
             with_state(|s| s.const_depth = s.const_depth.saturating_sub(1));
         }
     }
+}
+
+/// 定数式の要素全体が変数 1 個だけだと確定した位置 `tok` を [`Role::ConstLone`] へ昇格する。
+/// 記録が [`Role::ConstExpr`] のときだけ昇格する（記録区間が無い・別の役割なら何もしない）。
+pub(crate) fn mark_const_lone(tok: &Token) {
+    let addr = tok as *const Token as usize;
+    with_state(|s| {
+        if let Some(pos) = s.resolve(addr) {
+            if let Some(r) = s
+                .records
+                .iter_mut()
+                .find(|r| r.pos == pos && r.role == Role::ConstExpr)
+            {
+                r.role = Role::ConstLone;
+            }
+        }
+    });
 }
 
 /// 直近に [`Role::Value`] で記録した位置を `role` へ付け替える（位置が呼び出し側から

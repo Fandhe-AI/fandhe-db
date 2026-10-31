@@ -66,7 +66,7 @@ fn bare_value_tokens_equal_the_lexer_output_for_the_same_literal() {
         (PlScalar::new(Cell::Float(-2.0), ColumnType::Double), "-2.0"),
     ];
     for (v, lit) in cases {
-        let got = scalar_tokens_styled(&v, VarRole::Value, NumStyle::Bare, false).expect("tokens");
+        let got = scalar_tokens_styled(&v, VarRole::Value, NumStyle::Bare).expect("tokens");
         assert_eq!(got, lex(lit), "{lit}");
     }
 }
@@ -539,7 +539,7 @@ fn const_expr_numeric_is_bare_only_as_a_lone_element() {
         ("VALUES (1, v)", 4, "VALUES (1, 3)"),
         ("VALUES (-v)", 3, "VALUES (-3)"),
     ] {
-        let sites = vec![site(pos, VarRole::ConstExpr, 0)];
+        let sites = vec![site(pos, VarRole::ConstLone, 0)];
         let out = substitute(&lex(sql), &sites, &env, false, NumStyle::Typed).expect(sql);
         assert_eq!(out, lex(want), "{sql}");
     }
@@ -575,4 +575,119 @@ fn execute_values_role_survives_and_inside_case() {
         .expect("five");
     want.splice(pos..=pos, tv("int8", "5"));
     assert_eq!(out, want);
+}
+
+/// 境界値の整数・浮動小数の単独要素は、畳み込みが `22003` にする |v| >= 2^53 だけ裸の数値になり、
+/// それ未満は型付き値のまま（畳み込み定義は `sql::const_expr` と共有）。
+#[test]
+fn const_lone_bare_boundary_matches_the_fold_limit() {
+    let two53: i64 = 1 << 53;
+    for (v, bare) in [
+        (two53, true),
+        (-two53, true),
+        (two53 - 1, false),
+        (-(two53 - 1), false),
+        (two53 + 1, true),
+    ] {
+        let p = typed(ColumnType::BigInt, Cell::SignedInteger(v));
+        let out = scalar_tokens(&p, VarRole::ConstLone).expect("lone");
+        let typed_form = out
+            .iter()
+            .any(|t| matches!(t, Token::Ident(n) if n.starts_with("$typed:")));
+        assert_eq!(!typed_form, bare, "bigint {v}");
+    }
+    for (f, bare) in [
+        (9_007_199_254_740_992.0_f64, true),
+        (-9_007_199_254_740_992.0, true),
+        (9_007_199_254_740_991.0, false),
+        (-9_007_199_254_740_991.0, false),
+        (1e300, true),
+    ] {
+        let p = typed(ColumnType::Double, Cell::Float(f));
+        let out = scalar_tokens(&p, VarRole::ConstLone).expect("lone");
+        let typed_form = out
+            .iter()
+            .any(|t| matches!(t, Token::Ident(n) if n.starts_with("$typed:")));
+        assert_eq!(!typed_form, bare, "double {f:e}");
+    }
+    // 式の中（ConstExpr）は境界値でも型付きのまま（畳み込みが 22003 にする）。
+    let p = typed(ColumnType::BigInt, Cell::SignedInteger(two53));
+    let out = scalar_tokens(&p, VarRole::ConstExpr).expect("expr");
+    assert!(out
+        .iter()
+        .any(|t| matches!(t, Token::Ident(n) if n.starts_with("$typed:"))));
+}
+
+/// EXECUTE の `$n` が「行の要素全体」かは括弧の所属で決まる。関数引数・部分式は裸の数値にしない
+/// （numeric は 0A000）。
+#[test]
+fn execute_numeric_param_is_bare_only_as_a_whole_values_element() {
+    let n0 = typed(
+        ColumnType::Numeric {
+            precision: 5,
+            scale: 0,
+        },
+        Cell::Numeric(crate::numeric::Decimal::from_parts(3, 0).expect("decimal")),
+    );
+    let two = std::slice::from_ref(&n0);
+    let ok = [
+        (
+            "INSERT INTO t (a) VALUES ($1)",
+            "INSERT INTO t (a) VALUES (3)",
+        ),
+        (
+            "INSERT INTO t (a) VALUES (($1))",
+            "INSERT INTO t (a) VALUES ((3))",
+        ),
+        (
+            "INSERT INTO t (a) VALUES (-$1)",
+            "INSERT INTO t (a) VALUES (-3)",
+        ),
+        (
+            "INSERT INTO t (a) VALUES (1, $1)",
+            "INSERT INTO t (a) VALUES (1, 3)",
+        ),
+        (
+            "INSERT INTO t (a) VALUES (1), ($1)",
+            "INSERT INTO t (a) VALUES (1), (3)",
+        ),
+    ];
+    for (sql, want) in ok {
+        let out = substitute_params(&lex(sql), two, NumStyle::Typed).expect(sql);
+        assert_eq!(out, lex(want), "{sql}");
+    }
+    for sql in [
+        "INSERT INTO t (a) VALUES (coalesce(NULL, $1) / 2)",
+        "INSERT INTO t (a) VALUES (coalesce(NULL, $1))",
+        "INSERT INTO t (a) VALUES (coalesce($1, 1))",
+        "INSERT INTO t (a) VALUES (f($1, 1))",
+        "INSERT INTO t (a) VALUES (f(1, $1))",
+        "INSERT INTO t (a) VALUES ($1 / 2)",
+        "INSERT INTO t (a) VALUES (1 + $1)",
+        "INSERT INTO t (a) VALUES ((1, $1) )",
+        "INSERT INTO t (a) VALUES (($1) / 2)",
+        "INSERT INTO t (a) VALUES (-(-$1))",
+    ] {
+        let e = substitute_params(&lex(sql), two, NumStyle::Typed).expect_err(sql);
+        assert_eq!(e.wire_code(), "0A000", "{sql}");
+    }
+}
+
+/// 複数要素（`$1, $2`）はどちらも行の要素全体。
+#[test]
+fn execute_numeric_params_in_one_row_are_both_lone() {
+    let n0 = typed(
+        ColumnType::Numeric {
+            precision: 5,
+            scale: 0,
+        },
+        Cell::Numeric(crate::numeric::Decimal::from_parts(3, 0).expect("decimal")),
+    );
+    let out = substitute_params(
+        &lex("INSERT INTO t (a, b) VALUES ($1, $2)"),
+        &[n0.clone(), n0],
+        NumStyle::Typed,
+    )
+    .expect("two");
+    assert_eq!(out, lex("INSERT INTO t (a, b) VALUES (3, 3)"));
 }

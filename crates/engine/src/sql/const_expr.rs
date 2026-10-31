@@ -122,6 +122,18 @@ pub(crate) fn fold_const_literal_deferrable(
 /// f64 が整数を正確に表現できる上限（2^53）。
 const MAX_EXACT_F64: f64 = 9_007_199_254_740_992.0;
 
+/// 型付き値 1 個の単独評価（`check_node_value`）が `22003` にする大きさか（|v| >= 2^53）。
+/// `plpgsql::subst` が「畳み込みを通すと必ず `22003` になる値」を判定する際も同じ定義を使う
+/// （境界の二重定義による食い違いを防ぐ）。非有限値は対象外。
+pub(crate) fn float_beyond_fold_range(v: f64) -> bool {
+    v.is_finite() && v.abs() >= MAX_EXACT_F64
+}
+
+/// 整数の絶対値版の [`float_beyond_fold_range`]（|v| >= 2^53）。
+pub(crate) fn int_magnitude_beyond_fold_range(magnitude: u64) -> bool {
+    u128::from(magnitude) >= MAX_EXACT_F64 as u128
+}
+
 /// 揮発性・セッション依存の SQL 値関数名（定数畳み込み対象外。`42601`）。
 const VALUE_FUNCTION_NAMES: &[&str] = &[
     "CURRENT_TIMESTAMP",
@@ -335,7 +347,7 @@ fn check_node_value(expr: &Expr, enabled: bool) -> Result<(), SqlSurfaceError> {
         return Ok(());
     };
     if let Ok(ExprValue::Scalar(v)) = eval(&bound, 0, &[]) {
-        if v.is_finite() && v.abs() >= MAX_EXACT_F64 {
+        if float_beyond_fold_range(v) {
             return Err(SqlSurfaceError::numeric_out_of_range(
                 "constant expression loses integer precision",
             ));

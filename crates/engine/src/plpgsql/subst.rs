@@ -135,7 +135,7 @@ fn float_type_words(ty: &ColumnType) -> &'static [&'static str] {
 /// 日付・時刻のトークン列。`CAST` を受理しない定数式（`ConstExpr`）は型付きリテラル
 /// （`DATE '...'` 等）、それ以外は `CAST('...' AS 型)`。
 fn temporal_tokens(text: String, word: &str, role: VarRole) -> Vec<Token> {
-    if role == VarRole::ConstExpr {
+    if is_const_role(role) {
         vec![
             Token::Ident(word.to_ascii_uppercase()),
             Token::StringLiteral(text),
@@ -179,13 +179,15 @@ fn bare_number_tokens(v: &PlScalar) -> Result<Vec<Token>, SqlSurfaceError> {
     }
 }
 
-/// 定数式の畳み込み（f64 で値を扱う）が正確に保持できない大きさの整数・浮動小数か。
+/// 定数式の畳み込み（f64 で値を扱う）が `22003` にする大きさの整数・浮動小数か。境界は定数式
+/// 検査（`sql::const_expr`）と同じ定義（|v| >= 2^53）を共有する。
 fn beyond_fold_precision(cell: &Cell) -> bool {
-    const EXACT: u64 = 1 << 53;
     match cell {
-        Cell::SignedInteger(i) => i.unsigned_abs() > EXACT,
-        Cell::Integer(u) => *u > EXACT,
-        Cell::Float(f) => f.is_finite() && f.abs() >= EXACT as f64,
+        Cell::SignedInteger(i) => {
+            crate::sql::const_expr::int_magnitude_beyond_fold_range(i.unsigned_abs())
+        }
+        Cell::Integer(u) => crate::sql::const_expr::int_magnitude_beyond_fold_range(*u),
+        Cell::Float(f) => crate::sql::const_expr::float_beyond_fold_range(*f),
         _ => false,
     }
 }
@@ -194,7 +196,7 @@ fn beyond_fold_precision(cell: &Cell) -> bool {
 /// 整数（smallint／integer／bigint）と浮動小数（real／double）は、内部専用の型付き値（合成識別子
 /// `$typed:<型>` + 数値。字句解析器は利用者の文字列から生成しない）で置換し、定数式の畳み込みが
 /// 宣言型どおりの算術を行う（`p + 1` が bigint の算術になる）。numeric は定数式で算術できないため、
-/// 単独の要素（[`is_lone`]）なら裸の数値（書き込み先の列型が決める）、式の中では `0A000`
+/// 単独の要素（[`VarRole::ConstLone`]）なら裸の数値（書き込み先の列型が決める）、式の中では `0A000`
 /// （型が黙って変わる経路を残さない）。定数式の畳み込みは値を f64 で扱い 2^53 以上を `22003` に
 /// するため、単独の要素でその範囲の整数・浮動小数は畳み込みを通さず裸の数値にする（i64 全域・
 /// 大きな double を書き込み先の列型で正確に束縛させる）。式の中の同範囲の値は畳み込みが `22003`
@@ -247,14 +249,13 @@ fn number_tokens(
     v: &PlScalar,
     role: VarRole,
     style: NumStyle,
-    lone: bool,
 ) -> Result<Vec<Token>, SqlSurfaceError> {
     let bare = bare_number_tokens(v)?;
     if role == VarRole::LiteralSlot || style == NumStyle::Bare {
         return Ok(bare);
     }
-    if role == VarRole::ConstExpr {
-        return const_number_tokens(v, bare, lone);
+    if is_const_role(role) {
+        return const_number_tokens(v, bare, role == VarRole::ConstLone);
     }
     let mut out = vec![Token::Ident("CAST".to_string()), Token::Punct('(')];
     out.extend(bare);
@@ -271,7 +272,7 @@ fn number_tokens(
 /// 値 1 個を、型を保った SQL トークン列にする。`role` は NULL・数値の表現に影響する（文字列・
 /// 真偽値は役割に依らず同一のトークン）。
 pub(crate) fn scalar_tokens(v: &PlScalar, role: VarRole) -> Result<Vec<Token>, SqlSurfaceError> {
-    scalar_tokens_styled(v, role, NumStyle::Typed, false)
+    scalar_tokens_styled(v, role, NumStyle::Typed)
 }
 
 /// 数値の形式を指定する [`scalar_tokens`]。
@@ -279,12 +280,11 @@ pub(crate) fn scalar_tokens_styled(
     v: &PlScalar,
     role: VarRole,
     style: NumStyle,
-    lone: bool,
 ) -> Result<Vec<Token>, SqlSurfaceError> {
     Ok(match &v.cell {
         Cell::Null => null_tokens(&v.ty, role)?,
         Cell::SignedInteger(_) | Cell::Integer(_) | Cell::Float(_) | Cell::Numeric(_) => {
-            number_tokens(v, role, style, lone)?
+            number_tokens(v, role, style)?
         }
         Cell::Bool(b) => vec![Token::Ident(if *b { "true" } else { "false" }.to_string())],
         Cell::Text(s) => vec![Token::StringLiteral(s.clone())],
@@ -303,9 +303,8 @@ fn role_tokens(
     role: VarRole,
     name_for_alias: Option<&str>,
     style: NumStyle,
-    lone: bool,
 ) -> Result<Vec<Token>, SqlSurfaceError> {
-    let mut out = scalar_tokens_styled(v, role, style, lone)?;
+    let mut out = scalar_tokens_styled(v, role, style)?;
     // 投影項目の位置は、文字列・真偽値の裸のリテラルを受理しない（`SELECT 'a' AS x`・`SELECT true AS x`
     // は `42601`／`42703`）ため、`CAST` で包んで式にする。
     if role == VarRole::SelectItemBare {
@@ -326,26 +325,62 @@ fn role_tokens(
     Ok(out)
 }
 
-/// `tokens[pos]` が `VALUES` の行の中で単独の要素（符号 `-` を除いて、直前が `,` か行頭の `(`、直後が
-/// `,` か `)`）か。行頭の `(` は直前が `VALUES`・`,`・`(` のものに限る（`abs(p)` の `(` を除く）。
-/// 関数の第 2 引数以降（`f(a, p)`）は区別できず単独とみなす（numeric の型は書き込み先の列型が決める）。
-fn is_lone(tokens: &[Token], pos: usize) -> bool {
-    let before = |n: usize| pos.checked_sub(n).and_then(|p| tokens.get(p));
-    let skip = usize::from(matches!(before(1), Some(Token::Punct('-')))) + 1;
-    let prev_ok = match before(skip) {
-        Some(Token::Punct(',')) => true,
-        Some(Token::Punct('(')) => match pos.checked_sub(skip + 1).and_then(|p| tokens.get(p)) {
-            Some(Token::Punct(',' | '(')) => true,
-            Some(Token::Ident(w)) => w.eq_ignore_ascii_case("VALUES"),
-            _ => false,
-        },
-        _ => false,
-    };
-    prev_ok
-        && matches!(
-            tokens.get(pos.saturating_add(1)),
-            Some(Token::Punct(',' | ')'))
-        )
+/// `INSERT .. VALUES` の定数式の要素の中の変数（`CAST` を受理しない位置）の役割か。
+fn is_const_role(role: VarRole) -> bool {
+    matches!(role, VarRole::ConstExpr | VarRole::ConstLone)
+}
+
+/// `EXECUTE` の文字列中の `$n`（`tokens[i]`）が `VALUES` の行の要素全体（符号 `-`・冗長な括弧を除いて
+/// `$n` 1 個）か。SQL 構文解析器を通さない文字列のため、先頭から括弧の入れ子を数えて確定する。
+/// `(` は直前が `VALUES`、または直前が `,` でその前が行を閉じた `)` のとき行の括弧、それ以外
+/// （関数呼び出し・部分式）は通常の括弧。`$n` を包む通常の括弧は「`(` の直後かつ `)` の直前」の
+/// ものだけ外し、外側が行の括弧で、直前が行頭の `(`・`,`、直後が `,`・`)` のときだけ真。
+/// 関数の引数（`f(a, $1)`・`coalesce(NULL, $1)`）・部分式（`$1 / 2`）は偽。
+fn is_lone_values_element(tokens: &[Token], i: usize) -> bool {
+    // 開き括弧の (位置, 行の括弧か)。
+    let mut stack: Vec<(usize, bool)> = Vec::new();
+    let mut last_row_close: Option<usize> = None;
+    for (j, t) in tokens.iter().enumerate().take(i) {
+        match t {
+            Token::Punct('(') => {
+                let prev = j.checked_sub(1).and_then(|p| tokens.get(p));
+                let is_row = match prev {
+                    Some(Token::Punct(',')) => {
+                        j.checked_sub(2).is_some() && last_row_close == j.checked_sub(2)
+                    }
+                    other => is_word(other, "VALUES"),
+                };
+                stack.push((j, is_row));
+            }
+            Token::Punct(')') => {
+                if let Some((_, true)) = stack.pop() {
+                    last_row_close = Some(j);
+                }
+            }
+            _ => {}
+        }
+    }
+    let (mut lo, mut hi) = (i, i);
+    let mut negated = false;
+    while let Some((open, is_row)) = stack.pop() {
+        let at = |k: usize| tokens.get(k);
+        if !negated && lo > 0 && matches!(lo.checked_sub(1).and_then(at), Some(Token::Punct('-'))) {
+            negated = true;
+            lo -= 1;
+        }
+        let next = at(hi.saturating_add(1));
+        let prev = lo.checked_sub(1).and_then(at);
+        if is_row {
+            return (lo.checked_sub(1) == Some(open) || matches!(prev, Some(Token::Punct(','))))
+                && matches!(next, Some(Token::Punct(',' | ')')));
+        }
+        if lo.checked_sub(1) != Some(open) || !matches!(next, Some(Token::Punct(')'))) {
+            return false;
+        }
+        lo = open;
+        hi = hi.saturating_add(1);
+    }
+    false
 }
 
 /// `-` の直前のトークンが値の終端（二項演算子の左オペランドの末尾）か。単項の `-` かの判定に使う。
@@ -482,7 +517,7 @@ pub(crate) fn substitute(
         let value: &PlScalar = env.scalar(&site.var)?;
         charge(&mut total, scalar_len_estimate(value))?;
         let name = if alias { alias_name(original) } else { None };
-        let mut produced = role_tokens(value, site.role, name, style, is_lone(tokens, site.pos))?;
+        let mut produced = role_tokens(value, site.role, name, style)?;
         fold_double_negation(tokens, site.pos, &mut out, &mut produced);
         parenthesize_if_needed(
             site.pos.checked_sub(1).and_then(|p| tokens.get(p)),
@@ -596,7 +631,11 @@ fn param_role(tokens: &[Token], i: usize) -> VarRole {
         return VarRole::LiteralSlot;
     }
     if in_values_list(tokens, i) {
-        return VarRole::ConstExpr;
+        return if is_lone_values_element(tokens, i) {
+            VarRole::ConstLone
+        } else {
+            VarRole::ConstExpr
+        };
     }
     let direct = matches!(
         i.checked_sub(1).and_then(|p| tokens.get(p)),
@@ -672,7 +711,7 @@ pub(crate) fn substitute_params(
                 })?;
                 charge(&mut total, scalar_len_estimate(v))?;
                 let role = param_role(tokens, i);
-                let mut produced = role_tokens(v, role, None, style, is_lone(tokens, i))?;
+                let mut produced = role_tokens(v, role, None, style)?;
                 fold_double_negation(tokens, i, &mut out, &mut produced);
                 parenthesize_if_needed(
                     i.checked_sub(1).and_then(|p| tokens.get(p)),

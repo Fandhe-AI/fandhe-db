@@ -12966,7 +12966,40 @@ impl<'a> Parser<'a> {
         };
         self.const_expr_null_args = prev_null_args;
         self.expr_node_budget = saved;
-        crate::sql::const_expr::fold_const_literal_deferrable(&parsed?, span_start..self.pos)
+        let parsed = parsed?;
+        self.mark_lone_const_element(span_start..self.pos);
+        crate::sql::const_expr::fold_const_literal_deferrable(&parsed, span_start..self.pos)
+    }
+
+    /// 定数式の要素の解析区間 `span`（要素の先頭から解析終了位置まで）が、符号 `-` と冗長な括弧を
+    /// 除いて変数 1 個だけなら、その変数の記録を [`super::colref_sink::Role::ConstLone`] へ昇格する
+    /// （記録区間が無ければ何もしない）。`plpgsql::subst` が numeric を裸の数値で置換してよい
+    /// 「要素全体が変数 1 個」の判定の唯一の根拠で、解析区間の境界はこの構文解析器が確定している。
+    fn mark_lone_const_element(&self, span: std::ops::Range<usize>) {
+        let (mut lo, mut hi) = (span.start, span.end);
+        let mut negated = false;
+        while hi > lo.saturating_add(1) {
+            let first = self.tokens.get(lo);
+            let last = hi.checked_sub(1).and_then(|i| self.tokens.get(i));
+            if !negated && matches!(first, Some(Token::Punct('-'))) {
+                negated = true;
+                lo += 1;
+            } else if hi - lo >= 3
+                && matches!(first, Some(Token::Punct('(')))
+                && matches!(last, Some(Token::Punct(')')))
+            {
+                lo += 1;
+                hi -= 1;
+            } else {
+                return;
+            }
+        }
+        if hi == lo.saturating_add(1) {
+            if let Some(t @ (Token::Ident(_) | Token::QualifiedIdent { .. })) = self.tokens.get(lo)
+            {
+                super::colref_sink::mark_const_lone(t);
+            }
+        }
     }
 
     /// `UPDATE ... SET <col> = <右辺>` の右辺の入口（Issue #1544・SQL-45 のポインタ）。

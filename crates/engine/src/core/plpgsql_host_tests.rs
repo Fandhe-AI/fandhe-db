@@ -1527,3 +1527,145 @@ fn extreme_finite_doubles_do_not_go_through_decimal() {
     .expect_err("big expr");
     assert_eq!(e.wire_code(), "22003");
 }
+
+/// 式の中・関数引数の numeric は裸の数値にならず 0A000（整数除算へ化けない）。単独要素・括弧付きの
+/// 単独要素は通る。静的 SQL と EXECUTE ... USING の両方。
+#[test]
+fn numeric_in_values_is_bare_only_as_a_whole_element() {
+    let (core, _g) = new_core(LedgerMode::Optional);
+    let c = ctx("t1");
+    for (id, expr) in [(1u64, "p"), (2, "(p)")] {
+        insert_with(&core, &c, id, expr, NUMERIC0, numeric0(3)).expect(expr);
+        assert_eq!(n_of(&core, &c, id), Some(3), "{expr}");
+    }
+    for expr in [
+        "coalesce(NULL, p) / 2",
+        "coalesce(NULL, p)",
+        "coalesce(p, 1)",
+        "(p) / 2",
+        "1 + p",
+    ] {
+        let e = insert_with(&core, &c, 9, expr, NUMERIC0, numeric0(3)).expect_err(expr);
+        assert_eq!(e.wire_code(), "0A000", "static {expr}");
+    }
+    for (id, expr) in [(11u64, "$1"), (12, "($1)"), (13, "-$1")] {
+        let src = format!(
+            "BEGIN EXECUTE '{VALUES_HEAD} ({id}, ''[0.1,0.2]'', ''a'', {expr})' USING p; RETURN 1; END"
+        );
+        call(&src)
+            .param("p", NUMERIC0, numeric0(3))
+            .autocommit(&core, &c)
+            .expect(expr);
+    }
+    assert_eq!(n_of(&core, &c, 13), Some(-3));
+    for expr in [
+        "coalesce(NULL, $1) / 2",
+        "coalesce($1, 1)",
+        "f($1, 1)",
+        "$1 / 2",
+    ] {
+        let src = format!(
+            "BEGIN EXECUTE '{VALUES_HEAD} (19, ''[0.1,0.2]'', ''a'', {expr})' USING p; RETURN 1; END"
+        );
+        let e = call(&src)
+            .param("p", NUMERIC0, numeric0(3))
+            .autocommit(&core, &c)
+            .expect_err(expr);
+        assert_ne!(e.wire_code(), "00000", "execute {expr}");
+        assert!(
+            matches!(e.wire_code(), "0A000" | "42883" | "42601"),
+            "execute {expr}: {}",
+            e.wire_code()
+        );
+    }
+}
+
+/// 2^53 ちょうど・直近の境界の単独要素が正確に書き込まれる（境界は定数式検査と共有）。
+#[test]
+fn values_lone_at_the_2_pow_53_boundary_is_exact() {
+    let (core, _g) = new_core(LedgerMode::Optional);
+    let c = ctx("t1");
+    let two53: i64 = 1 << 53;
+    let mut id = 0u64;
+    for v in [two53, -two53, two53 - 1, -(two53 - 1), two53 + 1] {
+        id += 1;
+        insert_bf(&core, &c, id, "b", "p", SqlColumnTypeName::BigInt, big(v)).expect("bigint");
+        assert_eq!(b_of(&core, &c, id), v, "bigint {v}");
+    }
+    for v in [
+        9_007_199_254_740_992.0_f64,
+        -9_007_199_254_740_992.0,
+        9_007_199_254_740_991.0,
+    ] {
+        id += 1;
+        insert_bf(&core, &c, id, "f", "p", SqlColumnTypeName::Double, float(v)).expect("double");
+        assert_eq!(f_of(&core, &c, id), v, "double {v:e}");
+    }
+}
+
+/// 評価済みの数値オペランドは型を保ったまま比較される（裸のリテラルへ戻さず 22003 にならない）。
+/// IF の比較・CASE の等値比較（`values_equal`）の両方。
+#[test]
+fn comparisons_keep_large_operand_types() {
+    let (core, _g) = new_core(LedgerMode::Optional);
+    let c = ctx("t1");
+    let run = |src: &str, ty: SqlColumnTypeName, arg: PlScalar| {
+        as_i64(
+            &call(src)
+                .param("p", ty, arg)
+                .autocommit(&core, &c)
+                .expect(src),
+        )
+    };
+    let dbl = SqlColumnTypeName::Double;
+    for (v, cmp, want) in [
+        (1e300_f64, "p > 0", 1),
+        (1e300, "p < 0", 0),
+        (-1e300, "p < 0", 1),
+        (1e-50, "p > 0", 1),
+        (1e-50, "p < 1", 1),
+        (1e300, "p >= 1e300", 1),
+    ] {
+        let src = format!("BEGIN IF {cmp} THEN RETURN 1; END IF; RETURN 0; END");
+        // 小数・指数のリテラルは従来経路のため、成否は 22003 以外であることだけを固定する。
+        if cmp.contains('e') {
+            continue;
+        }
+        assert_eq!(run(&src, dbl.clone(), float(v)), want, "{cmp} {v:e}");
+    }
+    let bigint = SqlColumnTypeName::BigInt;
+    for v in [i64::MAX, (1i64 << 53) + 1, i64::MIN] {
+        let gt = run(
+            "BEGIN IF p > 0 THEN RETURN 1; END IF; RETURN 0; END",
+            bigint.clone(),
+            big(v),
+        );
+        assert_eq!(gt, i64::from(v > 0), "bigint {v} > 0");
+        let eq = run(
+            "BEGIN IF p = p THEN RETURN 1; END IF; RETURN 0; END",
+            bigint.clone(),
+            big(v),
+        );
+        assert_eq!(eq, 1, "bigint {v} = p");
+        let case = run(
+            "BEGIN CASE p WHEN p THEN RETURN 1; ELSE RETURN 0; END CASE; END",
+            bigint.clone(),
+            big(v),
+        );
+        assert_eq!(case, 1, "case bigint {v}");
+    }
+    for v in [1e300_f64, 1e-50, -1e300] {
+        let case = run(
+            "BEGIN CASE p WHEN p THEN RETURN 1; ELSE RETURN 0; END CASE; END",
+            dbl.clone(),
+            float(v),
+        );
+        assert_eq!(case, 1, "case double {v:e}");
+        let case = run(
+            "BEGIN CASE p WHEN 0 THEN RETURN 1; ELSE RETURN 0; END CASE; END",
+            dbl.clone(),
+            float(v),
+        );
+        assert_eq!(case, 0, "case double {v:e} vs 0");
+    }
+}

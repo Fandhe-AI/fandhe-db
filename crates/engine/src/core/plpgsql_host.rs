@@ -212,6 +212,75 @@ struct CorePlHost<'a, 'e> {
     conflict_checked: HashSet<(u8, usize)>,
 }
 
+/// 条件の比較オペランド。リテラルのトークン（SQL を経由しない）か、SQL で求めた型付きの値。
+enum Operand {
+    Literal(Vec<Token>),
+    Value(PlScalar),
+}
+
+/// 比較に使う数値（整数は i128 で厳密、浮動小数は f64）。
+#[derive(Clone, Copy)]
+enum Num {
+    Int(i128),
+    Float(f64),
+}
+
+impl Operand {
+    /// 値を保つ裸のリテラルのトークン列にする（`FROM` の無い `WHERE` の比較へ渡す形）。
+    fn into_bare_tokens(self) -> Result<Vec<Token>, SqlSurfaceError> {
+        match self {
+            Operand::Literal(t) => Ok(t),
+            Operand::Value(v) => {
+                subst::scalar_tokens_styled(&v, VarRole::Value, subst::NumStyle::Bare)
+            }
+        }
+    }
+
+    /// 整数・有限の浮動小数なら比較用の数値（numeric・小数リテラル・非有限値・数値以外は `None`）。
+    fn num(&self) -> Option<Num> {
+        match self {
+            Operand::Literal(t) => match t.as_slice() {
+                [Token::Number(n)] if !n.is_empty() && n.bytes().all(|b| b.is_ascii_digit()) => {
+                    n.parse::<i128>().ok().map(Num::Int)
+                }
+                _ => None,
+            },
+            Operand::Value(v) => match &v.cell {
+                Cell::SignedInteger(i) => Some(Num::Int(i128::from(*i))),
+                Cell::Integer(u) => Some(Num::Int(i128::from(*u))),
+                Cell::Float(f) if f.is_finite() => Some(Num::Float(*f)),
+                _ => None,
+            },
+        }
+    }
+}
+
+/// 整数・浮動小数同士の比較を値のまま行う（`=`・`<`・`>`・`<=`・`>=`）。整数同士は厳密、浮動小数が
+/// 絡むときは f64（PostgreSQL の暗黙の型昇格と同じ）。numeric・小数リテラル・非有限値・数値以外は
+/// `None`（呼び出し側が従来の値のリテラル経由の比較へ回す）。
+fn native_compare(l: &Operand, op: &[Token], r: &Operand) -> Option<bool> {
+    use std::cmp::Ordering;
+    let (l, r) = (l.num()?, r.num()?);
+    let ord = match (l, r) {
+        (Num::Int(a), Num::Int(b)) => a.cmp(&b),
+        (a, b) => {
+            let f = |n| match n {
+                Num::Int(i) => i as f64,
+                Num::Float(f) => f,
+            };
+            f(a).partial_cmp(&f(b))?
+        }
+    };
+    Some(match op {
+        [Token::Punct('=')] => ord == Ordering::Equal,
+        [Token::Punct('<')] => ord == Ordering::Less,
+        [Token::Punct('>')] => ord == Ordering::Greater,
+        [Token::Le] => ord != Ordering::Greater,
+        [Token::Ge] => ord != Ordering::Less,
+        _ => return None,
+    })
+}
+
 /// オペランドを単独で評価できない形の失敗か（構文誤り `42601`・未対応の形 `0A000`）。これらは条件
 /// 全体を `WHERE` 形で評価し直す。それ以外（22xxx の評価エラー等）は本物のエラーとして返す。
 fn is_shape_failure(e: &SqlSurfaceError) -> bool {
@@ -219,7 +288,7 @@ fn is_shape_failure(e: &SqlSurfaceError) -> bool {
 }
 
 /// 変数名と列名が衝突しうる役割（列としても読める位置）。リテラル専用位置（`LiteralSlot`）と
-/// `INSERT .. VALUES` の定数式（`ConstExpr`。表の列を参照できない）は列を受理しないため除く。
+/// `INSERT .. VALUES` の定数式（`ConstExpr`・`ConstLone`。表の列を参照できない）は列を受理しないため除く。
 fn is_column_capable(role: VarRole) -> bool {
     matches!(
         role,
@@ -344,33 +413,29 @@ impl<'a, 'e> CorePlHost<'a, 'e> {
         }
     }
 
-    /// オペランド（置換済みのトークン列）の値を、同じ値を表すリテラルのトークン列にする。NULL は `None`。
-    /// 単独のリテラルは SQL を経由せずそのまま返し、それ以外は `SELECT <式>` を同じ Tx・RLS で実行して
-    /// 1 セルを取る。
-    fn operand_value(&mut self, operand: &[Token]) -> Result<Option<Vec<Token>>, SqlSurfaceError> {
+    /// オペランド（置換済みのトークン列）の値を求める。NULL は `None`。単独のリテラルは SQL を
+    /// 経由せずそのまま返し、それ以外は `SELECT <式>` を同じ Tx・RLS で実行して 1 セルを取る。
+    /// SQL で求めた値は型付きの [`PlScalar`] のまま返す（裸のリテラルへ戻すと、大きな整数・浮動小数が
+    /// 整数精度の検査で `22003` になる。比較は [`native_compare`] か [`Operand::into_bare_tokens`]）。
+    fn operand_value(&mut self, operand: &[Token]) -> Result<Option<Operand>, SqlSurfaceError> {
         match operand {
             [] => Err(unsupported(
                 "this condition form is not supported in PL/pgSQL",
             )),
             [t] if is_word(t, "NULL") => Ok(None),
-            [Token::Number(_) | Token::StringLiteral(_)] => Ok(Some(operand.to_vec())),
-            [t] if is_word(t, "true") || is_word(t, "false") => Ok(Some(operand.to_vec())),
+            [Token::Number(_) | Token::StringLiteral(_)] => {
+                Ok(Some(Operand::Literal(operand.to_vec())))
+            }
+            [t] if is_word(t, "true") || is_word(t, "false") => {
+                Ok(Some(Operand::Literal(operand.to_vec())))
+            }
             _ => {
                 let mut full = vec![Token::Keyword(Keyword::Select)];
                 full.extend_from_slice(operand);
                 match self.run_tokens(full)? {
                     CoreOutcome::Query(qr) => {
                         let v = single_scalar(&qr)?;
-                        if v.is_null() {
-                            Ok(None)
-                        } else {
-                            Ok(Some(subst::scalar_tokens_styled(
-                                &v,
-                                VarRole::Value,
-                                subst::NumStyle::Bare,
-                                false,
-                            )?))
-                        }
+                        Ok((!v.is_null()).then_some(Operand::Value(v)))
                     }
                     _ => Err(internal("PL/pgSQL condition returned an unexpected result")),
                 }
@@ -378,9 +443,34 @@ impl<'a, 'e> CorePlHost<'a, 'e> {
         }
     }
 
-    /// オペランドの値が NULL か（[`Self::operand_value`] の NULL 判定）。
-    fn operand_is_null(&mut self, operand: &[Token]) -> Result<bool, SqlSurfaceError> {
-        Ok(self.operand_value(operand)?.is_none())
+    /// 式 `expr` の置換前トークン列の範囲 `range` を 1 個のオペランドとして評価する。範囲が変数 1 個
+    /// だけなら環境の値をそのまま返し（NULL は `None`）、それ以外は範囲内の変数を置換して
+    /// [`Self::operand_value`] で求める。
+    fn operand_value_in(
+        &mut self,
+        expr: &SqlExpr,
+        env: &dyn VarLookup,
+        range: std::ops::Range<usize>,
+    ) -> Result<Option<Operand>, SqlSurfaceError> {
+        let Some(slice) = expr.tokens.get(range.clone()) else {
+            return Err(internal("PL/pgSQL condition operand out of range"));
+        };
+        let sites: Vec<VarSite> = expr
+            .var_refs
+            .iter()
+            .filter(|s| range.contains(&s.pos))
+            .map(|s| VarSite {
+                pos: s.pos - range.start,
+                role: s.role,
+                var: s.var.clone(),
+            })
+            .collect();
+        if let ([_], [site]) = (slice, sites.as_slice()) {
+            let v = env.scalar(&site.var)?;
+            return Ok((!v.is_null()).then(|| Operand::Value(v.clone())));
+        }
+        let toks = subst::substitute(slice, &sites, env, false, subst::NumStyle::Typed)?;
+        self.operand_value(&toks)
     }
 
     fn typed_relation_schema(&self, parts: &[String]) -> Result<TableSchema, SqlSurfaceError> {
@@ -412,31 +502,36 @@ impl<'a, 'e> CorePlHost<'a, 'e> {
             .map_err(|_| not_found())
     }
 }
-
 /// 全体を囲む対応した外側の括弧を（入れ子の分まで）外した部分列。
-fn strip_outer_parens(mut toks: &[Token]) -> &[Token] {
+/// 全体を囲む対応した外側の括弧を（入れ子の分まで）外した部分列の、`toks` 上の範囲。
+fn strip_outer_parens_range(toks: &[Token]) -> std::ops::Range<usize> {
+    let mut lo = 0usize;
+    let mut hi = toks.len();
     loop {
-        let (Some(Token::Punct('(')), Some(Token::Punct(')'))) = (toks.first(), toks.last()) else {
-            return toks;
+        let Some(cur) = toks.get(lo..hi) else {
+            return lo..hi;
+        };
+        let (Some(Token::Punct('(')), Some(Token::Punct(')'))) = (cur.first(), cur.last()) else {
+            return lo..hi;
         };
         let mut depth = 0usize;
-        for (i, t) in toks.iter().enumerate() {
+        for (i, t) in cur.iter().enumerate() {
             match t {
                 Token::Punct('(') => depth += 1,
                 Token::Punct(')') => {
-                    depth -= 1;
-                    // 先頭の括弧が末尾より前で閉じるなら、全体を囲む括弧ではない（`(a) = (b)`）。
-                    if depth == 0 && i + 1 != toks.len() {
-                        return toks;
+                    depth = depth.saturating_sub(1);
+                    if depth == 0 && i + 1 != cur.len() {
+                        return lo..hi;
                     }
                 }
                 _ => {}
             }
         }
-        match toks.get(1..toks.len() - 1) {
-            Some(inner) => toks = inner,
-            None => return toks,
+        if hi.saturating_sub(lo) < 2 {
+            return lo..hi;
         }
+        lo += 1;
+        hi -= 1;
     }
 }
 
@@ -565,36 +660,45 @@ impl PlHost for CorePlHost<'_, '_> {
         }
         let key = (0u8, std::ptr::from_ref(expr) as usize);
         self.check_conflicts(key, &expr.tokens, &expr.var_refs)?;
-        let toks = subst::substitute(
-            &expr.tokens,
-            &expr.var_refs,
-            env,
-            false,
-            subst::NumStyle::Typed,
-        )?;
+        // 以降のオペランドは置換前のトークン列の範囲で扱う。変数 1 個だけのオペランドは値を環境から直接
+        // 取り、SQL を経由しない（経由すると大きな整数・浮動小数が整数精度の検査で `22003` になる）。
+        let orig = expr.tokens.as_slice();
+        let base_range = strip_outer_parens_range(orig);
+        let inner = orig.get(base_range.clone()).unwrap_or(orig);
+        let base = base_range.start;
         // `<式> IS [NOT] NULL` は `FROM` の無い `SELECT .. WHERE` が構文として受理しないため、式の
         // 値を直接求めて判定する（三値論理に乗らず、常に真偽値）。
-        if let Some((operand, negated)) = split_is_null(strip_outer_parens(&toks)) {
-            let is_null = self.operand_is_null(operand)?;
+        if let Some((operand, negated)) = split_is_null(inner) {
+            let range = base..base.saturating_add(operand.len());
+            let is_null = self.operand_value_in(expr, env, range)?.is_none();
             return Ok(Some(is_null != negated));
         }
         // 単純比較は、いずれかのオペランドが NULL なら結果は NULL（`where_probe` の「行なし」＝偽に
         // 潰さない）。`a + 1 = 3` のような演算・括弧を含むオペランドも、値を求めて判定する。
-        let inner = strip_outer_parens(&toks);
         if !has_compound_word(inner) {
-            if let Some((l, op, r)) = split_single_comparison(inner) {
+            if let Some((l, op, _)) = split_single_comparison(inner) {
+                let l_end = base.saturating_add(l.len());
+                let r_start = l_end.saturating_add(op.len());
+                let r_end = base.saturating_add(inner.len());
                 // 「この形は評価できない」失敗（構文・未対応の形）だけを後続の条件評価へ回す。0 除算
                 // （22012）・範囲外（22003）などの評価の本物のエラーはそのまま返す（解析し直して
                 // 別のコードに化けさせない）。
-                match (self.operand_value(l), self.operand_value(r)) {
+                let lv = self.operand_value_in(expr, env, base..l_end);
+                let rv = self.operand_value_in(expr, env, r_start..r_end);
+                match (lv, rv) {
                     (Ok(lv), Ok(rv)) => {
-                        let (Some(mut lt), Some(rt)) = (lv, rv) else {
+                        let (Some(lv), Some(rv)) = (lv, rv) else {
                             return Ok(None);
                         };
-                        // 演算を含むオペランドは評価済みの値のリテラルに置き換えて比較する
+                        // 整数・浮動小数同士は評価済みの値のまま比較する（裸のリテラルへ戻すと大きな値が
+                        // 整数精度の検査で `22003` になる）。それ以外は値のリテラルに置き換えて比較する
                         // （`FROM` の無い `WHERE` は演算を含む式を受理しない）。
+                        if let Some(b) = native_compare(&lv, op, &rv) {
+                            return Ok(Some(b));
+                        }
+                        let mut lt = lv.into_bare_tokens()?;
                         lt.extend_from_slice(op);
-                        lt.extend(rt);
+                        lt.extend(rv.into_bare_tokens()?);
                         return Ok(Some(self.where_probe(lt)?));
                     }
                     (Err(e), _) | (_, Err(e)) if !is_shape_failure(&e) => return Err(e),
@@ -625,10 +729,14 @@ impl PlHost for CorePlHost<'_, '_> {
         if let (Cell::Bool(x), Cell::Bool(y)) = (&a.cell, &b.cell) {
             return Ok(Some(x == y));
         }
-        let bare = |v| subst::scalar_tokens_styled(v, VarRole::Value, subst::NumStyle::Bare, false);
-        let mut toks = bare(a)?;
+        // 整数・浮動小数同士は値のまま比較する（裸のリテラルへ戻すと大きな値が `22003` になる）。
+        let (la, lb) = (Operand::Value(a.clone()), Operand::Value(b.clone()));
+        if let Some(eq) = native_compare(&la, &[Token::Punct('=')], &lb) {
+            return Ok(Some(eq));
+        }
+        let mut toks = la.into_bare_tokens()?;
         toks.push(Token::Punct('='));
-        toks.extend(bare(b)?);
+        toks.extend(lb.into_bare_tokens()?);
         Ok(Some(self.where_probe(toks)?))
     }
 
