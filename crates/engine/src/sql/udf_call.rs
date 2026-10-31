@@ -2762,7 +2762,7 @@ fn prepare_function_with_signature_inner(
 /// `CREATE OR REPLACE FUNCTION` の検証部（レジストリは変更しない。SQL-66 (2)・Issue #1917）。
 /// 呼び出し元は `sql::udf_ddl`（DDL 権限のあるセッションの永続化経路）。
 ///
-/// 判定順: 予約・組み込み名 `42723` → WASM UDF と同名 `42723` → 同名の宣言的 UDF が無ければ新規作成と
+/// 判定順: 予約・組み込み名 `42723` → WASM UDF と同名 `42723` → 先行判定（カタログに行が無ければ新規扱いで件数 `54000`。レジストリ上の有無に依らない）→ 同名の宣言的 UDF が無ければ新規作成と
 /// 同じ検証（容量上限を含む）→ 引数の数・型注釈が違えば `42723`（多重定義は未対応）→ 引数名・戻り値型
 /// （`None` と `Some` の違いを含む）が違えば `42P13` → 置換対象を除いたレジストリで本体を検証 → 本体が置換対象へ推移的に到達すれば `0A000`。
 ///
@@ -2803,6 +2803,10 @@ pub(crate) fn prepare_function_replacement(
             precheck,
         );
     };
+    // 置換か新規かはセッションのレジストリではなく書き込み先のカタログの行で決まる（セッション限定の
+    // 同名定義・別接続が DROP した後の古いセッションでは、実際の書き込みは新規挿入になる）。先行判定は
+    // カタログに行が無いときだけ件数を見るため、ここで本体検証より前に必ず呼ぶ。
+    precheck()?;
     let normalized: Vec<String> = params.iter().map(|p| p.to_ascii_lowercase()).collect();
     if old.params.len() != normalized.len() || old.param_types.as_slice() != param_types {
         return Err(SqlSurfaceError::duplicate_function(format!(

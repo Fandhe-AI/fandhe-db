@@ -319,6 +319,50 @@ fn replacing_existing_function_skips_the_configured_limit() {
     );
 }
 
+/// T7b: 置換か新規かはセッションのレジストリではなくカタログの行で決まる。カタログが満杯のとき、
+/// (a) セッション限定の同名定義だけがある、(b) 別接続が行を DROP した後の古いセッションは、実際の
+/// 書き込みが新規挿入になるため本体検証（未定義関数の 42883）より先に 54000。(c) カタログに行がある
+/// 置換は上限到達でも件数検査を省き、本体検証まで進む（42883）。
+#[test]
+fn replace_precheck_follows_catalog_row_not_session_registry() {
+    let path = unique_db_path("sql66-limit-replace-catalog-row");
+    let _g = CleanupGuard(path.clone());
+    let core = open(&path, 1);
+    let bad_replace = |name: &str| format!("CREATE OR REPLACE FUNCTION {name}(x) AS no_such_fn(x)");
+    // カタログを満杯にする（上限 1）。
+    let mut owner = session(true);
+    ok(&core, "alice", &mut owner, &create(1));
+    // (a) セッション限定の同名定義がある状態。
+    let mut local = session(true);
+    define_function(
+        local.udfs_mut(),
+        "loc",
+        &["x".to_string()],
+        &Expr::Ident("x".to_string()),
+    )
+    .expect("define loc");
+    assert_eq!(
+        code(&core, "alice", &mut local, &bad_replace("loc")),
+        "54000"
+    );
+    // (b) 別接続がカタログの行を DROP し、別の関数で満杯に戻した後の古いセッション。
+    let mut stale = session(true);
+    core.load_session_udfs(&ctx("alice"), &mut stale)
+        .expect("load session udfs");
+    let mut other = session(true);
+    ok(&core, "alice", &mut other, "DROP FUNCTION f1");
+    ok(&core, "alice", &mut other, "CREATE FUNCTION g1(x) AS x");
+    assert_eq!(
+        code(&core, "alice", &mut stale, &bad_replace("f1")),
+        "54000"
+    );
+    // (c) カタログに既存行がある置換は、上限到達でも本体検証まで進む。
+    assert_eq!(
+        code(&core, "alice", &mut other, &bad_replace("g1")),
+        "42883"
+    );
+}
+
 /// T8: 永続定義はセッション限定の関数へ直接・推移的に依存できない（0A000）。OR REPLACE も同じ。
 /// セッション限定がカタログ関数を呼ぶのは許可。拒否後はカタログも変わらず、別接続は 42883 にならない。
 #[test]
