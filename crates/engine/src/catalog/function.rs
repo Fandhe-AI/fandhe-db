@@ -791,7 +791,7 @@ fn verify_dependencies_in_txn(
 ) -> Result<()> {
     use super::function_dependency as dep;
     for d in deps {
-        if d.kind == dep::DependencyKind::Function && d.key == own_key {
+        if d.kind == dep::DependencyKind::Function && d.key.eq_ignore_ascii_case(own_key) {
             return Err(CatalogError::Invalid(
                 FUNCTION_RECURSIVE_MESSAGE.to_string(),
             ));

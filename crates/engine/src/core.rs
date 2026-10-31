@@ -9290,6 +9290,7 @@ impl EngineCore {
                                 } else if spec.standard_body {
                                     self.validate_sql_standard_function_definition(
                                         ctx.tenant_id(),
+                                        &name,
                                         &params,
                                         &param_types,
                                         &body_source,

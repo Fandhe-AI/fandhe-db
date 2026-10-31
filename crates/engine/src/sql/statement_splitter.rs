@@ -23,7 +23,7 @@
 //!
 //! SQL 標準形の関数本体（`CREATE FUNCTION ... BEGIN ATOMIC <文>; ... END`。SQL-67 (2)・Issue #2219）は、
 //! 通常状態の語を追跡して本体の内側の `;` で分割しない。文の先頭語が `CREATE` で `BEGIN` の直後が
-//! `ATOMIC` のときだけ入れ子の深さを数え始め（`BEGIN`・`CASE` で +1、`END` で -1）、深さが 0 に戻るまで
+//! `ATOMIC` のときだけ入れ子の深さを数え始め（`CASE` で +1、`END` で -1。識別子にもなる `BEGIN` は数えない）、深さが 0 に戻るまで
 //! `;` を区切りとしない。入力の終端までに閉じない場合・深さが上限を超える場合は `Single`（fail-closed。
 //! engine が `42601` で拒否し、1 文も実行しない）。
 //!
@@ -63,7 +63,7 @@ use crate::sql::lexer::{
 /// （`.claude/rules/coding-rust.md`）。
 pub const MAX_STATEMENTS_PER_QUERY: usize = 16;
 
-/// `BEGIN ATOMIC` 本体の入れ子（`BEGIN`・`CASE`）の深さの上限（Issue #2219）。超過は `Single`。
+/// `BEGIN ATOMIC` 本体の入れ子（`CASE`）の深さの上限（Issue #2219）。超過は `Single`。
 const MAX_ATOMIC_DEPTH: usize = 64;
 
 /// [`split_statements`] の結果。
@@ -265,7 +265,10 @@ pub fn split_statements(input: &str) -> Result<SplitOutcome<'_>, MultiStatementE
                 }
                 word_count = word_count.saturating_add(1);
                 if atomic_depth > 0 {
-                    if word.eq_ignore_ascii_case("BEGIN") || word.eq_ignore_ascii_case("CASE") {
+                    // 本体の入れ子は `CASE ... END` だけを数える（本体解析器 `parse_standard_function_body`
+                    // と同じ構造判定。`BEGIN` は非予約語で引数名・列名にもなり、標準形の本体は入れ子の
+                    // `BEGIN` 文を受理しないため深さに含めない）。
+                    if word.eq_ignore_ascii_case("CASE") {
                         atomic_depth = atomic_depth.saturating_add(1);
                         if atomic_depth > MAX_ATOMIC_DEPTH {
                             return Ok(SplitOutcome::Single);
@@ -1040,6 +1043,17 @@ mod tests {
     fn statements(outcome: SplitOutcome<'_>) -> Vec<&str> {
         match outcome {
             SplitOutcome::Statements(v) => v,
+            other => panic!("expected Statements, got {other:?}"),
+        }
+    }
+
+    // 識別子位置の `BEGIN`（引数名・列名）は本体の深さに数えない（codex 指摘・P1）。
+    #[test]
+    fn begin_as_identifier_does_not_unbalance_atomic_body() {
+        let f = "CREATE FUNCTION f(begin int) RETURNS int BEGIN ATOMIC SELECT begin; END";
+        let both = format!("{f}; SELECT f(1)");
+        match split_statements(&both).expect("split") {
+            SplitOutcome::Statements(v) => assert_eq!(v, vec![f, "SELECT f(1)"]),
             other => panic!("expected Statements, got {other:?}"),
         }
     }

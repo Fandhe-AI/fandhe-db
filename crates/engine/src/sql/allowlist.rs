@@ -24071,6 +24071,18 @@ fn check_return_expression(tokens: &[Token]) -> Result<(), SqlSurfaceError> {
 const MAX_STANDARD_BODY_STATEMENTS: usize = 256;
 
 impl Parser<'_> {
+    /// 位置 `i` のトークンを返す。元が引用付き識別子だった `Ident` は [`Token::QuotedNull`] の印へ戻す
+    /// （`Parser::new` が `Ident` へ潰した引用情報を、標準形の本体の検査・描画へ引き継ぐ。Issue #2219）。
+    fn requoted_token_at(&self, i: usize) -> Option<Token> {
+        let tok = self.tokens.get(i)?;
+        Some(match tok {
+            Token::Ident(s) if self.quoted_null.binary_search(&i).is_ok() => {
+                Token::QuotedNull(s.clone())
+            }
+            other => other.clone(),
+        })
+    }
+
     /// SQL 標準形の関数本体（`RETURN <式>`、または `BEGIN ATOMIC <文>; ... END`）を読み、
     /// `LANGUAGE sql` の文字列本体と同じ形の本文へ組み替える（Issue #2219・SQL-67 (2)。
     /// [`parse_create_function`] から呼ばれる）。
@@ -24089,10 +24101,13 @@ impl Parser<'_> {
             // 式は `AND`・`OR` を含む真理値式も書けるため、`parse_value_expr` では範囲を決めず、
             // 残りのトークン（末尾の `;` を除く）を式とみなす。射影の別名・`FROM` 句などの SELECT の
             // 句が混ざる形は `check_return_expression` が `42601` で拒否する。
-            let rest = self.tokens.get(self.pos..).unwrap_or(&[]);
-            let rest = match rest.split_last() {
+            // 引用識別子は印付きへ戻す（`"into"` 等が句の語として読まれず、描画で引用符も保たれる）。
+            let rest: Vec<Token> = (self.pos..self.tokens.len())
+                .filter_map(|i| self.requoted_token_at(i))
+                .collect();
+            let rest: &[Token] = match rest.split_last() {
                 Some((Token::Punct(';'), head)) => head,
-                _ => rest,
+                _ => &rest,
             };
             check_return_expression(rest)?;
             let mut stmt = vec![Token::Keyword(Keyword::Select)];
@@ -24105,9 +24120,10 @@ impl Parser<'_> {
             let mut paren = 0usize;
             let mut nest = 0usize;
             loop {
-                let Some(tok) = self.advance().cloned() else {
+                let Some(tok) = self.requoted_token_at(self.pos) else {
                     return Err(SqlSurfaceError::unsupported("expected END"));
                 };
+                self.pos = self.pos.saturating_add(1);
                 match &tok {
                     Token::Punct('(' | '[') => paren = paren.saturating_add(1),
                     Token::Punct(')' | ']') => paren = paren.saturating_sub(1),

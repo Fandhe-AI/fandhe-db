@@ -145,6 +145,7 @@ impl EngineCore {
     pub(crate) fn validate_sql_standard_function_definition(
         &self,
         tenant_id: &str,
+        own_name: &str,
         params: &[String],
         param_types: &[Option<CastType>],
         body_source: &str,
@@ -189,7 +190,9 @@ impl EngineCore {
                         detail: "function catalog operation failed".to_string(),
                     }
                 })?;
-                if !overloads.is_empty() {
+                // 新規作成では定義対象がまだカタログに無く `overloads` が空になるため、自己参照は
+                // 存在判定と独立に拾う（辺に載せ、カタログ側の write txn 内の検査が `0A000` で拒否する）。
+                if !overloads.is_empty() || name.eq_ignore_ascii_case(own_name) {
                     functions.insert(name);
                 }
             }

@@ -468,3 +468,47 @@ fn definitions_and_dependencies_survive_reopen() {
     assert_eq!(one(&core, &mut s, "SELECT f()"), int(7));
     assert_eq!(code(&core, &mut s, "DROP TABLE t"), "2BP01");
 }
+
+/// 新規作成での自己参照（定義対象がまだカタログに無い）も `0A000`（codex 指摘・P1）。
+#[test]
+fn self_reference_on_fresh_create_is_rejected() {
+    let (core, mut s, _g) = setup("sql67_std_selfnew");
+    assert_eq!(
+        code(
+            &core,
+            &mut s,
+            "CREATE FUNCTION f(x int) RETURNS int RETURN f(x)"
+        ),
+        "0A000"
+    );
+    assert_eq!(
+        code(
+            &core,
+            &mut s,
+            "CREATE FUNCTION f(x int) RETURNS int BEGIN ATOMIC SELECT F(x); END"
+        ),
+        "0A000"
+    );
+}
+
+/// 引用付きの識別子（句の語と同じ綴り）は本体の切り出し・保存・再解析を通じて識別子のまま残る。
+#[test]
+fn quoted_clause_words_stay_identifiers() {
+    let (core, mut s, _g) = setup("sql67_std_quoted");
+    run(
+        &core,
+        &mut s,
+        "alice",
+        "CREATE FUNCTION q1(x int) RETURNS int BEGIN ATOMIC SELECT x AS \"into\"; END",
+    );
+    assert_eq!(one(&core, &mut s, "SELECT q1(4)"), int(4));
+    run(&core, &mut s, "alice", "CREATE TABLE t2 (\"end\" INTEGER)");
+    run(&core, &mut s, "alice", "INSERT INTO t2 VALUES (4)");
+    run(
+        &core,
+        &mut s,
+        "alice",
+        "CREATE FUNCTION q2() RETURNS int BEGIN ATOMIC SELECT \"end\" + 1 FROM t2; END",
+    );
+    assert_eq!(one(&core, &mut s, "SELECT q2()"), int(5));
+}
