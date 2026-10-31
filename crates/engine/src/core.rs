@@ -105,6 +105,8 @@ mod plpgsql_host;
 // `DO` ブロックの実行（SQL-68・Issue #2228）。
 mod do_block;
 #[cfg(test)]
+mod plpgsql_boundary_tests;
+#[cfg(test)]
 mod plpgsql_host_tests;
 // トリガ関数の内部 API の結合テスト（Issue #2228・SQL-68）。
 #[cfg(test)]
