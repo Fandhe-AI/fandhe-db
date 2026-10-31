@@ -1415,3 +1415,5 @@ Issue #1405（fix(engine)!: CREATE TYPE の型名の重複を 42710 で返す。
 **Issue #1932（feat(engine)!: BEGIN の READ ONLY／READ WRITE 修飾子を構文解釈する。SQL-38 ポインタ。詳細は [explicit-transaction.md](explicit-transaction.md)）**: `ParsedSql::Transaction` の中身を `ValidatedTxnControl`（`control`＋`access_mode: Option<TxnAccessMode>`）へ変更（破壊的変更）。`BEGIN [WORK|TRANSACTION] [READ ONLY|READ WRITE]` を受理し、`ActiveTxn` にモードを保持する。`READ ONLY` は #1933／#1934 まで `0A000` の暫定ゲートで拒否（fail-closed）。重複・矛盾モードや未知の修飾子は `42601`。単体テストと `sql38_begin_access_mode` 結合テストを追加。依存の変更なし。
 
 **Issue #1937（docs(design): 分離レベルの受理方針を設計文書へ記録する。SQL-38・TABLE-3・PERSIST-4 ポインタ）**: [explicit-transaction.md](explicit-transaction.md) に「分離レベルの受理方針」節を追加した（契約は spec ポインタのみ。受理範囲は記述しない）。コードは変更していない。
+
+**Issue #1956（docs(design): 行ロック句・LOCK TABLE の扱いを設計文書へ記録する。SQL-38・TABLE-3・PERSIST-4・SQL-31 ポインタ）**: [explicit-transaction.md](explicit-transaction.md) に「行ロック句・`LOCK TABLE` の扱い」節を追加した（単一ライタの writer 取得への写像・取得経路・形ごとの担当 Issue・要確認事項を記録。契約はポインタのみ）。コードは変更していない。
