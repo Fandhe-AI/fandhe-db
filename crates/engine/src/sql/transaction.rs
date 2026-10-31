@@ -48,13 +48,57 @@ pub enum TxnControl {
     Rollback,
 }
 
-/// `BEGIN`/`COMMIT`/`ROLLBACK` の規範形（`[WORK|TRANSACTION]` 修飾語のみ許容。
-/// 分離レベル指定・`READ ONLY`・`AND CHAIN`・`$n` 等は `42601`）を受理する。
+/// トランザクションのアクセスモード（SQL-38・Issue #1932）。`BEGIN READ ONLY`／
+/// `BEGIN READ WRITE` の修飾子を表し、[`ActiveTxn`] が保持する。読み取り専用の実体
+/// （読み取り Tx で開く・書き込みの `25006`）は #1933／#1934 の範囲で、それまで
+/// `ReadOnly` は [`SessionTransaction::begin_with_mode`] が `0A000` で拒否する。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum TxnAccessMode {
+    ReadWrite,
+    ReadOnly,
+}
+
+/// [`validate_transaction_control_tokens`] の検証結果。`access_mode` は `BEGIN` で
+/// 明示されたときだけ `Some`（`COMMIT`／`ROLLBACK` は常に `None`）。`None` を残すのは
+/// 将来のセッション既定値（#1939）を適用する余地のため。`core.rs` の
+/// `ParsedSql::Transaction` が保持し、実行時に `begin_with_mode` へ渡される。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct ValidatedTxnControl {
+    pub control: TxnControl,
+    pub access_mode: Option<TxnAccessMode>,
+}
+
+fn unsupported_txn_mode() -> SqlSurfaceError {
+    SqlSurfaceError::unsupported("unsupported transaction mode")
+}
+
+/// `BEGIN` のモード句 1 項目（`READ ONLY`／`READ WRITE`）を読み、残りのトークンを返す。
+/// 未知の語・単独の `READ` は `42601`（fail-closed）。#1938 は ISOLATION LEVEL をここへ足す。
+fn parse_txn_mode_item(rest: &[Token]) -> Result<(TxnAccessMode, &[Token]), SqlSurfaceError> {
+    let word = |t: Option<&Token>, w: &str| matches!(t, Some(Token::Ident(x)) if x.eq_ignore_ascii_case(w));
+    if !word(rest.first(), "READ") {
+        return Err(unsupported_txn_mode());
+    }
+    let after_read = rest.split_first().map_or(&[][..], |(_, t)| t);
+    let mode = if word(after_read.first(), "ONLY") {
+        TxnAccessMode::ReadOnly
+    } else if word(after_read.first(), "WRITE") {
+        TxnAccessMode::ReadWrite
+    } else {
+        return Err(unsupported_txn_mode());
+    };
+    let tail = after_read.split_first().map_or(&[][..], |(_, t)| t);
+    Ok((mode, tail))
+}
+
+/// `BEGIN`/`COMMIT`/`ROLLBACK` の規範形（`[WORK|TRANSACTION]` 修飾語と、`BEGIN` に限り
+/// アクセスモード `READ ONLY`／`READ WRITE` を受理。分離レベル指定・`DEFERRABLE`・
+/// `AND CHAIN`・`$n`・重複／矛盾するモード等は `42601`）を受理する。
 /// 先頭トークンが `BEGIN`/`COMMIT`/`ROLLBACK`（大小無視）であることは
 /// 呼び出し元（`core.rs::parse_tokens`）が確認済みの前提。
 pub(crate) fn validate_transaction_control_tokens(
     tokens: &[Token],
-) -> Result<TxnControl, SqlSurfaceError> {
+) -> Result<ValidatedTxnControl, SqlSurfaceError> {
     let Some(Token::Ident(head)) = tokens.first() else {
         return Err(SqlSurfaceError::unsupported(
             "malformed transaction control statement",
@@ -74,7 +118,7 @@ pub(crate) fn validate_transaction_control_tokens(
 
     // 受信 SQL 由来のトークン列のため添字スライスを使わず `split_first` で進める。
     let rest = tokens.split_first().map_or(&[][..], |(_, tail)| tail);
-    let rest = match rest.split_first() {
+    let mut rest = match rest.split_first() {
         Some((Token::Ident(kw), tail))
             if kw.eq_ignore_ascii_case("WORK") || kw.eq_ignore_ascii_case("TRANSACTION") =>
         {
@@ -82,12 +126,34 @@ pub(crate) fn validate_transaction_control_tokens(
         }
         _ => rest,
     };
+    let mut access_mode = None;
+    if ctrl == TxnControl::Begin {
+        // モード句ループ。2 項目目以降は任意の `,` で区切れる構造にしてある（#1938 向け）が、
+        // 現状は項目がアクセスモード 1 つのため、重複・矛盾は `42601`。トークン数で有界。
+        let mut first = true;
+        while !rest.is_empty() {
+            if !first {
+                if let Some((Token::Punct(','), tail)) = rest.split_first() {
+                    rest = tail;
+                }
+            }
+            first = false;
+            let (mode, tail) = parse_txn_mode_item(rest)?;
+            if access_mode.replace(mode).is_some() {
+                return Err(unsupported_txn_mode());
+            }
+            rest = tail;
+        }
+    }
     if !rest.is_empty() {
         return Err(SqlSurfaceError::unsupported(
             "unsupported clause after transaction control statement",
         ));
     }
-    Ok(ctrl)
+    Ok(ValidatedTxnControl {
+        control: ctrl,
+        access_mode,
+    })
 }
 
 /// SQL テキストの先頭トークンが `ROLLBACK`（大小無視）かどうか。明示トランザクションが
@@ -131,6 +197,9 @@ enum TxnOrigin {
 /// permit を内包し、drop 時は abort してから permit を解放する。
 struct ActiveTxn<'e> {
     origin: TxnOrigin,
+    /// アクセスモード（SQL-38・Issue #1932）。#1933／#1934 が読み取り Tx の開始と
+    /// 書き込み拒否の判定に使う。現状 `ReadOnly` は開始前に拒否されるため常に `ReadWrite`。
+    access_mode: TxnAccessMode,
     write_txn: crate::storage::GatedWriteTxn,
     /// 一時表（TABLE-44・Issue #1684）の書き込みトランザクション。最初の一時表の文で遅延して開く。
     /// `ActiveTxn` を取り出して drop する全経路（`rollback`／`fail`／`release_if_expired`／
@@ -364,6 +433,15 @@ impl<'e> SessionTransaction<'e> {
         self.is_active().then_some(self.generation)
     }
 
+    /// 開始中のトランザクションのアクセスモード（SQL-38・Issue #1932）。`Active` のときだけ
+    /// `Some`。#1934 が書き込み文の `25006` 判定に使う。
+    pub fn access_mode(&self) -> Option<TxnAccessMode> {
+        match &self.state {
+            TxnState::Active(active) => Some(active.access_mode),
+            _ => None,
+        }
+    }
+
     /// `BEGIN`。`Idle` から `Active` へ遷移する。`storage` から
     /// [`crate::storage::Storage::begin_explicit_write_txn`] で単一ライタの
     /// permit を取得したまま保持する（`writer_gate` モジュールドキュメント
@@ -373,13 +451,25 @@ impl<'e> SessionTransaction<'e> {
         storage: &'e crate::storage::Storage,
         session: &SessionState,
     ) -> Result<(), SqlSurfaceError> {
+        self.begin_with_mode(storage, session, TxnAccessMode::ReadWrite)
+    }
+
+    /// アクセスモード付きの `BEGIN`（SQL-38・Issue #1932。`core.rs` の実行分岐が呼ぶ）。
+    /// `ReadOnly` は #1933／#1934 まで `Idle` 分岐の先頭で `0A000` 拒否する暫定ゲート
+    /// （書き込み可能な Tx を読み取り専用として渡さない fail-closed）。
+    pub fn begin_with_mode(
+        &mut self,
+        storage: &'e crate::storage::Storage,
+        session: &SessionState,
+        access_mode: TxnAccessMode,
+    ) -> Result<(), SqlSurfaceError> {
         // 暗黙トランザクションはメッセージ内で完結する。明示 `BEGIN` が届くのは
         // 呼び出し側の不変条件違反（制御文を含むメッセージは暗黙にならない）なので、
         // 暗黙の `Active` は abort して `Idle` へ戻し、内部エラーで拒否する。
         if self.abort_if_implicit() {
             return Err(internal_error());
         }
-        self.begin_with_origin(storage, session, TxnOrigin::Explicit)
+        self.begin_with_origin(storage, session, TxnOrigin::Explicit, access_mode)
     }
 
     /// 暗黙トランザクション（Issue #1175）を開始する。`BEGIN` を含まない複数文
@@ -399,7 +489,12 @@ impl<'e> SessionTransaction<'e> {
         if !matches!(self.state, TxnState::Idle) {
             return Err(internal_error());
         }
-        self.begin_with_origin(storage, session, TxnOrigin::Implicit)
+        self.begin_with_origin(
+            storage,
+            session,
+            TxnOrigin::Implicit,
+            TxnAccessMode::ReadWrite,
+        )
     }
 
     /// 暗黙トランザクションの commit（Issue #1175）。最後の文の実行に成功した
@@ -478,9 +573,17 @@ impl<'e> SessionTransaction<'e> {
         storage: &'e crate::storage::Storage,
         session: &SessionState,
         origin: TxnOrigin,
+        access_mode: TxnAccessMode,
     ) -> Result<(), SqlSurfaceError> {
         match &self.state {
             TxnState::Idle => {
+                // 暫定ゲート（#1933／#1934 で除去）: 読み取り専用を宣言した接続へ書き込み可能な
+                // Tx を渡さないよう、write_txn を取る前に拒否する（状態は `Idle` のまま）。
+                if access_mode == TxnAccessMode::ReadOnly {
+                    return Err(SqlSurfaceError::feature_not_supported(
+                        "BEGIN READ ONLY is not supported yet",
+                    ));
+                }
                 // 壁時計の読み取り失敗（範囲外）は write_txn を開く前に fail-closed で返す
                 // （状態は `Idle` のまま）。
                 let txn_start_micros = crate::sql::time_fn::now_micros()?;
@@ -507,6 +610,7 @@ impl<'e> SessionTransaction<'e> {
                 self.generation = next_generation;
                 self.state = TxnState::Active(Box::new(ActiveTxn {
                     origin,
+                    access_mode,
                     write_txn,
                     temp: None,
                     started_at: Instant::now(),
@@ -1047,44 +1151,68 @@ mod tests {
         crate::sql::lexer::tokenize(sql).expect("tokenize")
     }
 
+    fn validated(sql: &str) -> Result<ValidatedTxnControl, SqlSurfaceError> {
+        validate_transaction_control_tokens(&tokens_of(sql))
+    }
+
     #[test]
-    fn begin_variants_are_accepted() {
+    fn begin_variants_are_accepted_without_access_mode() {
         for sql in ["BEGIN", "BEGIN WORK", "BEGIN TRANSACTION", "begin"] {
-            let ctrl = validate_transaction_control_tokens(&tokens_of(sql)).expect("accepted");
-            assert_eq!(ctrl, TxnControl::Begin);
+            let v = validated(sql).expect("accepted");
+            assert_eq!(v.control, TxnControl::Begin);
+            assert_eq!(v.access_mode, None);
+        }
+    }
+
+    #[test]
+    fn begin_access_mode_is_accepted() {
+        for (sql, mode) in [
+            ("BEGIN READ ONLY", TxnAccessMode::ReadOnly),
+            ("BEGIN READ WRITE", TxnAccessMode::ReadWrite),
+            ("BEGIN WORK READ ONLY", TxnAccessMode::ReadOnly),
+            ("BEGIN TRANSACTION READ WRITE", TxnAccessMode::ReadWrite),
+            ("begin read only", TxnAccessMode::ReadOnly),
+        ] {
+            let v = validated(sql).expect("accepted");
+            assert_eq!(v.control, TxnControl::Begin, "{sql}");
+            assert_eq!(v.access_mode, Some(mode), "{sql}");
         }
     }
 
     #[test]
     fn commit_and_rollback_variants_are_accepted() {
-        assert_eq!(
-            validate_transaction_control_tokens(&tokens_of("COMMIT")).unwrap(),
-            TxnControl::Commit
-        );
-        assert_eq!(
-            validate_transaction_control_tokens(&tokens_of("COMMIT WORK")).unwrap(),
-            TxnControl::Commit
-        );
-        assert_eq!(
-            validate_transaction_control_tokens(&tokens_of("ROLLBACK")).unwrap(),
-            TxnControl::Rollback
-        );
-        assert_eq!(
-            validate_transaction_control_tokens(&tokens_of("ROLLBACK TRANSACTION")).unwrap(),
-            TxnControl::Rollback
-        );
+        for (sql, ctrl) in [
+            ("COMMIT", TxnControl::Commit),
+            ("COMMIT WORK", TxnControl::Commit),
+            ("ROLLBACK", TxnControl::Rollback),
+            ("ROLLBACK TRANSACTION", TxnControl::Rollback),
+        ] {
+            let v = validated(sql).unwrap();
+            assert_eq!(v.control, ctrl);
+            assert_eq!(v.access_mode, None);
+        }
     }
 
     #[test]
     fn trailing_clauses_are_rejected() {
         for sql in [
+            "BEGIN READ",
+            "BEGIN ONLY",
+            "BEGIN WRITE",
+            "BEGIN READ ONLY READ WRITE",
+            "BEGIN READ ONLY, READ ONLY",
+            "BEGIN READ ONLY,",
+            "BEGIN , READ ONLY",
+            "BEGIN READ ONLY DEFERRABLE",
             "BEGIN ISOLATION LEVEL SERIALIZABLE",
-            "BEGIN READ ONLY",
+            "BEGIN READ ONLY ISOLATION LEVEL SERIALIZABLE",
+            "COMMIT READ ONLY",
+            "ROLLBACK READ WRITE",
             "COMMIT AND CHAIN",
             "ROLLBACK TO SAVEPOINT x",
         ] {
-            let err = validate_transaction_control_tokens(&tokens_of(sql)).unwrap_err();
-            assert_eq!(err.wire_code(), "42601");
+            let err = validated(sql).unwrap_err();
+            assert_eq!(err.wire_code(), "42601", "{sql}");
         }
     }
 
