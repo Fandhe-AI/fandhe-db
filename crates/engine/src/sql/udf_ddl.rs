@@ -183,16 +183,8 @@ pub(crate) fn execute_create_or_replace_function_persistent(
     body_source: &str,
     max_functions: usize,
 ) -> Result<(), SqlSurfaceError> {
-    let prepared = prepare_function_replacement(
-        session.udfs(),
-        name,
-        params,
-        param_types,
-        return_type,
-        body,
-        true,
-        None,
-    )?;
+    let prepared =
+        prepare_function_replacement(session.udfs(), name, params, param_types, return_type, body)?;
     reject_session_local_dependency(session, &prepared.body)?;
     let def = catalog_def_from_prepared(&prepared, body_source)?;
     // 循環検査はセッションのレジストリ（古い可能性がある）ではなく、write txn 内の最新カタログで
@@ -231,8 +223,8 @@ pub(crate) fn execute_create_or_replace_function_persistent(
 
 /// `DROP FUNCTION [IF EXISTS] ... [CASCADE | RESTRICT]` を実行する。DDL 権限の無いセッションは
 /// 何も見ず `42501`（`IF EXISTS` でも同じ。存在情報を出さない）。権限のあるセッションはカタログ
-/// （自テナントの scope）から削除し、レジストリからも削除する（型付き・RETURNS 付きのセッション限定の
-/// 定義〔#2798 まで〕はレジストリからだけ消える）。
+/// （自テナントの scope）から削除し、レジストリからも削除する（カタログに載らない定義、たとえば WASM UDF は
+/// レジストリからだけ消える）。
 /// **どちらでも消えなかった場合だけ** `42883`（存在情報を出さない固定文言）。`IF EXISTS` なら代わりに
 /// `skipped` の成功を返す（他テナントの定義・不在はどちらも同じ応答）。
 /// 依存トリガは `RESTRICT`（既定）なら `2BP01`、`CASCADE` なら関数と同じ write txn で連鎖削除する。

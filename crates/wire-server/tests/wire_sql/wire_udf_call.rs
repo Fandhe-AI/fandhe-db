@@ -332,10 +332,10 @@ fn spawn_server_with_ddl_user(core: Arc<EngineCore>) -> std::net::SocketAddr {
 const CALL_DBL: &str =
     "SELECT dbl(id) AS d FROM docs ORDER BY embedding <=> '[3.0,4.0,0.0]' LIMIT 1";
 
-/// SQL-66（Issue #1922）: DDL 権限のあるユーザーの型付き引数・RETURNS 付き `CREATE FUNCTION` は
-/// #2798 までセッション限定で成功し、同じ接続では呼べるが、別接続（同じテナントを含む）からは見えない。
+/// SQL-66（Issue #1922・#2798）: DDL 権限のあるユーザーの型付き引数・RETURNS 付き `CREATE FUNCTION` も
+/// カタログへ永続化され、同じ接続でも、その後に開いた別接続（同じテナント）でも呼べる。
 #[test]
-fn wire_typed_and_returns_udf_is_session_only_for_ddl_user() {
+fn wire_typed_and_returns_udf_is_persisted_for_ddl_user() {
     let (core, _guard) = new_core_with_docs();
     let addr = spawn_server_with_ddl_user(core);
     let mut a = authenticate_to_ready_for_query(addr, "alice", "pw-alice");
@@ -355,7 +355,9 @@ fn wire_typed_and_returns_udf_is_session_only_for_ddl_user() {
 
     let mut b = authenticate_to_ready_for_query(addr, "alice", "pw-alice");
     send_simple_query(&mut b, "SELECT rdbl(2) AS d FROM docs LIMIT 1");
-    expect_error_response_with_sqlstate(&mut b, "42883");
+    assert_eq!(read_row_description(&mut b), vec!["d"]);
+    let _ = read_data_row(&mut b);
+    assert_eq!(read_command_complete(&mut b), "SELECT 1");
     read_ready_for_query(&mut b);
 }
 

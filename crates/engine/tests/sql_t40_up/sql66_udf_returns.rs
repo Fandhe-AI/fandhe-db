@@ -17,8 +17,8 @@ use engine::storage::{Storage, Visibility};
 use crate::temp_db;
 use temp_db::{unique_db_path, CleanupGuard};
 
-/// DDL 権限つきのセッション。型付き引数・RETURNS 付きの定義は #2798 までカタログへ書かず、
-/// 権限のあるセッションのセッション限定レジストリへ登録される（Issue #1922）。
+/// DDL 権限つきのセッション。権限の無いセッションの `CREATE FUNCTION` は `42501` のため、定義を作る
+/// テストはこのセッションで行う（定義はカタログへ永続化される。Issue #1922・#2798）。
 fn ddl_session() -> SessionState {
     let mut s = SessionState::default();
     s.allow_ddl();
@@ -319,13 +319,11 @@ fn ddl_session_validates_then_persists() {
         ),
         "42723"
     );
-    define(
-        &core,
-        &mut s,
-        "CREATE FUNCTION f(x integer) RETURNS integer AS x + 1",
-    );
+    // 永続化された定義は別セッションがロードして呼べる。
     let mut other = ddl_session();
-    assert_eq!(code(&core, &mut other, "DROP FUNCTION f"), "42883");
+    core.load_session_udfs(&ctx_for("tenant-a"), &mut other)
+        .expect("load session udfs");
+    assert!(other.udfs().get("f").is_some());
     let mut no_ddl = SessionState::default();
     assert_eq!(
         code(

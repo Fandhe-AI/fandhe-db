@@ -600,11 +600,7 @@ fn replace_with_typed_signature_is_persisted_in_ddl_sessions() {
         ),
         "42723"
     );
-    let mut other = loaded(&core, "alice", true);
-    for name in ["tf", "tr"] {
-        assert_eq!(
-            code(&core, "alice", &mut other, &format!("DROP FUNCTION {name}")),
-            "42883"
-        );
-    }
+    // 型付き・RETURNS 付きの定義も永続化されており、別セッションがロードして見える。
+    let other = loaded(&core, "alice", true);
+    assert!(other.udfs().get("tf").is_some());
 }

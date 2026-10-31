@@ -9120,23 +9120,15 @@ impl EngineCore {
                     }],
                 },
             )),
-            // TASK-79（SQL-9）: `CREATE FUNCTION` の検証・登録は
-            // `sql::udf_call::define_function` に委譲する（検証→登録の順を守り、
-            // 失敗時は `session.udfs()` を一切変更しない。`SET search_mode` と同じ
-            // 「部分更新＝黙った既定化を防ぐ」方針）。
+            // TASK-79（SQL-9）・SQL-66: `CREATE [OR REPLACE] FUNCTION` は、検証 → UDF カタログへの書き込み
+            // （単一 write txn・1 回の commit）→ レジストリへの登録の順で永続化する（`sql::udf_ddl`）。
+            // 失敗時は `session.udfs()` を一切変更しない（`SET search_mode` と同じ「部分更新＝黙った既定化を
+            // 防ぐ」方針）。型注釈・RETURNS つきの定義も同じ経路でカタログへ書く（Issue #2798）。
             //
-            // Issue #1920（SQL-66）: DDL 実行権限のあるセッションでは、検証 → UDF カタログへの書き込み
-            // （単一 write txn・1 回の commit）→ レジストリへの登録の順で永続化する。Issue #1922: 権限の無い
-            // セッションは保存先の振り分けより前に `42501`（セッション限定の登録経路は無い。
-            // 型付き引数・RETURNS の永続化は #2798。docs/design/udf-catalog.md）。
-            //
-            // Issue #1915・#1916・#2798（SQL-66 (1)）: 型注釈・RETURNS つきの定義も同じ永続化経路で
-            // カタログへ書く（検証は非 DDL セッションと同じ prepare で行うため `42P13`・`0A000` の
-            // 結果は権限によらず一致する）。ロード側は書き込み経路の正規形の型だけを復元し、
-            // それ以外の行は定義単位で読み飛ばす（`udf_load`）。
-            //
-            // Issue #1917（SQL-66 (2)）: `CREATE OR REPLACE FUNCTION` は同じ分岐で `or_replace` により
-            // 置換経路（`prepare_function_replacement`）へ切り替える。
+            // Issue #1922: DDL 権限の無いセッションは保存先の振り分け・本体検証・重複判定のいずれより前に
+            // `42501`（fail-closed。セッション限定の登録経路は無い。docs/design/udf-catalog.md）。
+            // 件数上限は起動時設定 `--max-functions`（下げる方向のみ）で、永続化経路がテナントのカタログ件数で
+            // 判定する（置換は件数を増やさないため判定しない）。
             crate::sql::allowlist::Statement::CreateFunction {
                 or_replace,
                 name,
@@ -9146,65 +9138,33 @@ impl EngineCore {
                 body,
                 body_source,
             } => {
-                // SQL-66（Issue #1922）: 権限検査は保存先の振り分け・本体検証より前に行う。権限の無い
-                // セッションはカタログにもセッション内レジストリにも触れず `42501` になる。
                 crate::sql::ddl::require_ddl_permission(session)?;
-                {
-                    // 暫定（#2798 まで）: 型付き引数・RETURNS 付きの定義はカタログへ型を永続化できないため、
-                    // セッション限定のレジストリへ登録する（再起動・別セッションからは見えない）。検証（本体の
-                    // 型検査 `42P13` を含む）と上限（重複 `42723` → 件数 `54000`）は永続化経路と同じ順で、
-                    // 失敗時はレジストリを変更しない。カタログ由来の定義は置換しない。
-                    if return_type.is_some() || param_types.iter().any(Option::is_some) {
-                        if or_replace {
-                            crate::sql::udf_call::define_or_replace_function_with_signature(
-                                session.udfs_mut(),
-                                &name,
-                                &params,
-                                &param_types,
-                                return_type.as_ref(),
-                                &body,
-                                self.function_limits.max_functions(),
-                            )?;
-                        } else {
-                            crate::sql::udf_call::define_function_with_signature_capped(
-                                session.udfs_mut(),
-                                &name,
-                                &params,
-                                &param_types,
-                                return_type.as_ref(),
-                                &body,
-                                self.function_limits.max_functions(),
-                            )?;
-                        }
-                        return Ok(crate::sql::SqlOutcome::CreateFunction { name });
-                    }
-                    if or_replace {
-                        crate::sql::udf_ddl::execute_create_or_replace_function_persistent(
-                            &self.storage,
-                            ctx.tenant_id(),
-                            session,
-                            &name,
-                            &params,
-                            &param_types,
-                            return_type.as_ref(),
-                            &body,
-                            &body_source,
-                            self.function_limits.max_functions(),
-                        )?;
-                    } else {
-                        crate::sql::udf_ddl::execute_create_function_persistent(
-                            &self.storage,
-                            ctx.tenant_id(),
-                            session,
-                            &name,
-                            &params,
-                            &param_types,
-                            return_type.as_ref(),
-                            &body,
-                            &body_source,
-                            self.function_limits.max_functions(),
-                        )?;
-                    }
+                if or_replace {
+                    crate::sql::udf_ddl::execute_create_or_replace_function_persistent(
+                        &self.storage,
+                        ctx.tenant_id(),
+                        session,
+                        &name,
+                        &params,
+                        &param_types,
+                        return_type.as_ref(),
+                        &body,
+                        &body_source,
+                        self.function_limits.max_functions(),
+                    )?;
+                } else {
+                    crate::sql::udf_ddl::execute_create_function_persistent(
+                        &self.storage,
+                        ctx.tenant_id(),
+                        session,
+                        &name,
+                        &params,
+                        &param_types,
+                        return_type.as_ref(),
+                        &body,
+                        &body_source,
+                        self.function_limits.max_functions(),
+                    )?;
                 }
                 Ok(crate::sql::SqlOutcome::CreateFunction { name })
             }

@@ -5,7 +5,8 @@
 //! 重複 `42723` が上限 `54000` より先／上限を下げて再オープンしても既存の関数はロードされ呼べる／
 //! 権限の無いセッションの `CREATE`（`OR REPLACE`・型付き引数・RETURNS を含む）と `DROP FUNCTION` は
 //! カタログにもセッション内レジストリにも触れず `42501`（保存先の振り分けより前に拒否）。権限ありの
-//! 型付き引数・RETURNS 付きは #2798 までセッション限定のレジストリへ登録され、上限・判定順が効く。
+//! 型付き引数・RETURNS 付きも同じカタログ経路で永続化され、上限・判定順が効く（Issue #2798）。永続定義が
+//! セッション限定の関数（カタログに載らない宣言的 UDF・WASM UDF）へ依存する形は `0A000`。
 
 use engine::core::EngineCore;
 use engine::function_limits::FunctionLimits;
@@ -13,6 +14,7 @@ use engine::kernel::CpuScalarProvider;
 use engine::policy::PolicyContext;
 use engine::recovery::required_op_id::LedgerMode;
 use engine::sql::mode::SessionState;
+use engine::sql::udf_call::{define_function, Expr};
 use engine::sql::SqlOutcome;
 use engine::storage::{Storage, Visibility};
 
@@ -212,11 +214,11 @@ fn create_and_drop_in_explicit_transaction_without_permission_are_42501() {
     }
 }
 
-/// T7（暫定・#2798 まで）: 権限ありの型付き引数・RETURNS 付き定義はセッション限定のレジストリへ登録され、
-/// 別セッションからは見えない。上限・判定順（重複 `42723` → 件数 `54000`）と `DROP FUNCTION` も効く。
+/// T7: 権限ありの型付き引数・RETURNS 付き定義も、カタログへ永続化され上限・判定順（重複 `42723` →
+/// 件数 `54000`）が効く。別セッションから見え、`DROP FUNCTION` で枠が空く。
 #[test]
-fn typed_and_returns_definitions_are_session_only_with_limit_and_drop() {
-    let path = unique_db_path("sql66-limit-session-only");
+fn typed_and_returns_definitions_are_persisted_with_limit_and_drop() {
+    let path = unique_db_path("sql66-limit-typed-persisted");
     let _g = CleanupGuard(path.clone());
     let core = open(&path, 2);
     let mut s = session(true);
@@ -227,7 +229,6 @@ fn typed_and_returns_definitions_are_session_only_with_limit_and_drop() {
         &mut s,
         "CREATE FUNCTION t2() RETURNS integer AS 2",
     );
-    assert_eq!(s.udfs().len(), 2);
     // 重複は件数上限より先に 42723、超過は 54000。失敗時はレジストリが変わらない。
     assert_eq!(
         code(&core, "alice", &mut s, "CREATE FUNCTION t1(x integer) AS x"),
@@ -238,16 +239,17 @@ fn typed_and_returns_definitions_are_session_only_with_limit_and_drop() {
         "54000"
     );
     assert_eq!(s.udfs().len(), 2);
-    // 別セッションから見えず、カタログにも書かれていない（untyped はカタログ側の件数で数える）。
+    // 別セッションにロードされ、同じカタログ件数で数えられる（上限に達している）。
     let mut other = session(true);
     core.load_session_udfs(&ctx("alice"), &mut other)
         .expect("load session udfs");
-    assert_eq!(other.udfs().len(), 0);
-    ok(&core, "alice", &mut other, &create(1));
-    ok(&core, "alice", &mut other, &create(2));
-    // DROP でセッション限定の定義が消え、枠が空く。
+    assert_eq!(other.udfs().len(), 2);
+    assert_eq!(code(&core, "alice", &mut other, &create(1)), "54000");
+    // 別テナントには見えず、枠も独立。
+    let mut bob = session(true);
+    ok(&core, "bob", &mut bob, "CREATE FUNCTION t1(x integer) AS x");
+    // DROP でカタログから消え、枠が空く。
     ok(&core, "alice", &mut s, "DROP FUNCTION t1");
-    assert_eq!(s.udfs().len(), 1);
     ok(&core, "alice", &mut s, "CREATE FUNCTION t3(x integer) AS x");
     // 権限なしは状態不変で 42501（T5 と同じ）。
     let mut n = session(false);
@@ -256,6 +258,14 @@ fn typed_and_returns_definitions_are_session_only_with_limit_and_drop() {
         "42501"
     );
     assert_eq!(n.udfs().len(), 0);
+    // 再起動後も型付き・RETURNS 付きの定義がロードされ、呼べる。
+    drop(core);
+    let core = open(&path, 2);
+    let mut r = session(false);
+    core.load_session_udfs(&ctx("alice"), &mut r)
+        .expect("load session udfs");
+    assert!(r.udfs().get("t2").is_some());
+    assert!(r.udfs().get("t3").is_some());
 }
 
 /// T6: 権限ありの明示トランザクション内の CREATE FUNCTION は上限の設定に関係なく 0A000。
@@ -276,7 +286,6 @@ fn create_in_explicit_transaction_stays_rejected() {
 }
 
 /// T7: 既存関数の置換は設定上限を下げた DB でも通り（件数が増えない）、新規作成だけが 54000 になる。
-/// セッション限定経路の置換・新規作成も同じ（カタログ由来の件数を数えない）。
 #[test]
 fn replacing_existing_function_skips_the_configured_limit() {
     let path = unique_db_path("sql66-limit-replace");
@@ -308,18 +317,6 @@ fn replacing_existing_function_skips_the_configured_limit() {
         ),
         "54000"
     );
-    // セッション限定経路: カタログ由来 3 件は数えず、1 件目は通り、2 件目は 54000、既存の置換は通る。
-    ok(&core, "alice", &mut s, "CREATE FUNCTION t1(x integer) AS x");
-    assert_eq!(
-        code(&core, "alice", &mut s, "CREATE FUNCTION t2(x integer) AS x"),
-        "54000"
-    );
-    ok(
-        &core,
-        "alice",
-        &mut s,
-        "CREATE OR REPLACE FUNCTION t1(x integer) AS x + 1",
-    );
 }
 
 /// T8: 永続定義はセッション限定の関数へ直接・推移的に依存できない（0A000）。OR REPLACE も同じ。
@@ -330,23 +327,30 @@ fn persistent_function_cannot_depend_on_session_local_function() {
     let _g = CleanupGuard(path.clone());
     let core = open(&path, 8);
     let mut s = session(true);
-    ok(
-        &core,
-        "alice",
-        &mut s,
-        "CREATE FUNCTION loc(x integer) AS x",
-    );
+    // セッション限定の定義は SQL では作れない（権限ありの CREATE はすべて永続化する）ため、公開 API の
+    // `define_function`（カタログ由来の印を付けない登録）で用意する。
+    define_function(
+        s.udfs_mut(),
+        "loc",
+        &["x".to_string()],
+        &Expr::Ident("x".to_string()),
+    )
+    .expect("define loc");
     // 直接依存・推移的依存（セッション限定 → セッション限定）。
     assert_eq!(
         code(&core, "alice", &mut s, "CREATE FUNCTION p1(x) AS loc(x)"),
         "0A000"
     );
-    ok(
-        &core,
-        "alice",
-        &mut s,
-        "CREATE FUNCTION loc2(x integer) AS loc(x) + 1",
-    );
+    define_function(
+        s.udfs_mut(),
+        "loc2",
+        &["x".to_string()],
+        &Expr::Call {
+            name: "loc".to_string(),
+            args: vec![Expr::Ident("x".to_string())],
+        },
+    )
+    .expect("define loc2");
     assert_eq!(
         code(
             &core,
@@ -368,12 +372,16 @@ fn persistent_function_cannot_depend_on_session_local_function() {
         "0A000"
     );
     // 逆向き: セッション限定がカタログ関数を呼ぶのは通る。
-    ok(
-        &core,
-        "alice",
-        &mut s,
-        "CREATE FUNCTION loc3(x integer) AS p3(x)",
-    );
+    define_function(
+        s.udfs_mut(),
+        "loc3",
+        &["x".to_string()],
+        &Expr::Call {
+            name: "p3".to_string(),
+            args: vec![Expr::Ident("x".to_string())],
+        },
+    )
+    .expect("define loc3");
     // 永続定義どうしの依存は通る。
     ok(&core, "alice", &mut s, "CREATE FUNCTION p4(x) AS p3(x) + 1");
     // 別接続では p3 は元の定義のまま、p1・p2 は存在しない。
@@ -384,28 +392,4 @@ fn persistent_function_cannot_depend_on_session_local_function() {
     assert!(other.udfs().get("p4").is_some());
     assert!(other.udfs().get("p1").is_none());
     assert!(other.udfs().get("p2").is_none());
-}
-
-/// T9: 件数はカタログ経路ではテナントのカタログ件数、セッション限定経路ではセッション限定の定義数で
-/// 数え、互いに枠を奪わない（それぞれ独立に設定上限を適用する）。
-#[test]
-fn catalog_and_session_local_limits_are_counted_independently() {
-    let path = unique_db_path("sql66-limit-independent");
-    let _g = CleanupGuard(path.clone());
-    let core = open(&path, 2);
-    let mut s = session(true);
-    ok(&core, "alice", &mut s, "CREATE FUNCTION t1(x integer) AS x");
-    ok(&core, "alice", &mut s, "CREATE FUNCTION t2(x integer) AS x");
-    // セッション限定が枠を埋めていても、カタログ経路は CREATE・OR REPLACE（新規）とも通る。
-    ok(&core, "alice", &mut s, &create(1));
-    ok(
-        &core,
-        "alice",
-        &mut s,
-        "CREATE OR REPLACE FUNCTION f2(x) AS x",
-    );
-    assert_eq!(code(&core, "alice", &mut s, &create(3)), "54000");
-    // カタログが枠を埋めていても、セッション限定経路の枠は別（t1・t2 を消して作り直せる）。
-    ok(&core, "alice", &mut s, "DROP FUNCTION t1");
-    ok(&core, "alice", &mut s, "CREATE FUNCTION t3(x integer) AS x");
 }
