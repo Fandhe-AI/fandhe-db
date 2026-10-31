@@ -4,7 +4,7 @@
 //! `runtime`・`cranelift`・`std`）が、`docs/design/wasmtime-adoption.md` 第 5 節の
 //! サンドボックス設計が前提にする API（epoch 割り込み・`StoreLimits`・検証）を
 //! コンパイル・リンクできることだけを確かめる。インスタンス化・関数実行・
-//! `wasm_udf.rs` の `WasmUdfBackend` との接続は #1925 以降の範囲で、ここでは行わない。
+//! `wasm_udf.rs` の `WasmUdfBackend` との接続は #1925 の `wasm_udf_backend.rs` の範囲で、ここでは行わない。
 //! feature 無効の既定ビルドではこのファイルは空になる。
 
 #![cfg(feature = "wasm-udf")]

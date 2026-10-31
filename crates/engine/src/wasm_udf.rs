@@ -16,14 +16,17 @@
 //!
 //! サンドボックス（EXT-6）: 無限ループは epoch interruption（[`SandboxLimits::deadline_ticks`]）、
 //! 過大メモリ確保は `StoreLimits`（[`SandboxLimits::memory_limit_bytes`]）、ホスト
-//! ファイルアクセスは import 全拒否＋ WASI 未リンクで防ぐ設計だが、これらを実装する
-//! wasmtime バックエンドは依存追加のユーザー承認が未取得（`.claude/rules/dependency-policy.md`。
-//! 承認記録は Issue #97 参照）。承認が得られるまで本ファイルは実行時コンパイル API
-//! を公開しない契約層のみを実装する（モジュールを一切実行しない、実行できると
-//! 誤認させる公開関数を置かない）。承認後は、モジュールの検証・コンパイルを行う
-//! バックエンド構築関数をこのファイルへ新規追加し、`sql::udf_call::define_wasm_function`
-//! ／`sql::mode::SessionState::register_wasm_udf` から呼び出す配線を追加する変更のみ
-//! で足りるよう、本ファイルの他 API・呼び出し元は変更不要な設計にしてある。
+//! ファイルアクセスは import 全拒否＋ WASI 未リンクで防ぐ設計（`docs/design/wasmtime-adoption.md`
+//! 第 5 節）。wasmtime は Issue #1924 で承認済みの optional 依存として追加済みで、
+//! `wasm-udf` feature 有効時に限り、検証・コンパイルを行うバックエンド構築関数
+//! （[`compile_wasm_udf_backend`]。Issue #1925・EXT-9 ポインタ）を本ファイルが持つ。
+//! 構築関数は fuel（`consume_fuel(true)`・`Store::set_fuel`）で命令数を制限し、
+//! 枯渇は `DeadlineExceeded` へ写像するため無限ループは停止する。epoch による
+//! 時間制限（ティッカー）は Issue #1927 で追加する。
+//! `sql::udf_call::define_wasm_function`／`SessionState::register_wasm_udf` からの
+//! 呼び出し配線は Issue #1926 の範囲で、本 Issue の時点では SQL からの実行経路は
+//! 存在しない（fail-open な実行経路はできない）。feature 無効の既定ビルドでは
+//! 契約層のみで、モジュールを実行できると誤認させる公開関数は存在しない。
 //!
 //! fail-closed: 登録時・呼び出し時のあらゆる失敗は `Result` として伝播し
 //! （`unwrap`/`expect`/添字アクセス禁止。`.claude/rules/coding-rust.md`）、
@@ -31,6 +34,11 @@
 //! 行値・テナント情報を含めない（security.md「情報漏えい」対応）。
 
 use std::fmt;
+
+#[cfg(feature = "wasm-udf")]
+mod backend;
+#[cfg(feature = "wasm-udf")]
+pub use backend::compile_wasm_udf_backend;
 
 /// 登録対象モジュールのバイト長上限（パース前に検証する。WIRE-4 の 1 メッセージ
 /// 上限と整合させ、無制限 `Vec` 確保を防ぐ。security.md「不安全な設計」対応）。
@@ -151,10 +159,10 @@ impl std::error::Error for WasmUdfError {}
 /// `BoundExpr` は複数スレッドから参照されうる契約はないが、`Send + Sync` を要求する
 /// ことで将来の並列実行経路にも安全に対応する）。
 ///
-/// 本モジュールは実装（wasmtime バックエンド）を提供しない契約層のみであり
-/// （モジュール冒頭のドキュメント参照）、呼び出し元は検証済みの実装を
+/// 実装は `wasm-udf` feature 有効時の [`compile_wasm_udf_backend`] が返す wasmtime
+/// バックエンドのみ（モジュール冒頭のドキュメント参照）。呼び出し元は検証済みの実装を
 /// `Arc<dyn WasmUdfBackend>` として構築したうえで
-/// `sql::mode::SessionState::register_wasm_udf` へ渡す。
+/// `sql::mode::SessionState::register_wasm_udf` へ渡す（配線は Issue #1926）。
 pub trait WasmUdfBackend: fmt::Debug + Send + Sync {
     fn call_vector_scalar(&self, v: &[f32], scalar: f64) -> Result<f64, WasmUdfError>;
 }
