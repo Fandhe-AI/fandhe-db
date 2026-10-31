@@ -113,6 +113,11 @@ fn small_limits() -> PlpgsqlLimits {
     PlpgsqlLimits::new(5, 4, 3, 300, 2)
 }
 
+/// ループ上限だけを効かせる設定（文数・本体長は十分大きく、ループ回数のみ 4）。
+fn loop_only_limits() -> PlpgsqlLimits {
+    PlpgsqlLimits::new(10_000, 4, 3, 10_000, 2)
+}
+
 fn recorded(core: &EngineCore, tenant: &str, op: &str) -> bool {
     let op = OperationId::parse(op).expect("op id");
     matches!(
@@ -173,7 +178,7 @@ fn statement_limit_is_exact_and_fails_closed() {
 fn loop_iteration_limit_applies_to_every_loop_form() {
     let (core, _g) = setup(
         "sql68-lim-loop",
-        Some(small_limits()),
+        Some(loop_only_limits()),
         None,
         LedgerMode::Optional,
     );
@@ -184,7 +189,9 @@ fn loop_iteration_limit_applies_to_every_loop_form() {
         format!("BEGIN FOR i IN 1..100 LOOP {ins} END LOOP; END"),
     ];
     for b in &bodies {
-        assert_eq!(fail(&core, "alice", &do_lit(b)).0, "54000", "{b}");
+        let (code, msg) = fail(&core, "alice", &do_lit(b));
+        assert_eq!(code, "54000", "{b}");
+        assert!(msg.contains("loop iteration limit"), "{b}: {msg}");
         assert_eq!(count(&core, "alice", "t"), 0, "no partial rows: {b}");
     }
     // 上限ちょうど（4 回）は成功し、5 回は失敗する。

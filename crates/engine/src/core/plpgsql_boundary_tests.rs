@@ -164,6 +164,30 @@ fn owned_by(core: &EngineCore, t: &str) -> i64 {
     }
 }
 
+/// 各テナントが所有する行 `(owner, id, n)` を、所有者自身の視点（Private 込み）で全件読んで並べ替える。
+fn owned_rows(core: &EngineCore) -> Vec<(String, u64, i64)> {
+    let mut out = Vec::new();
+    for &t in TENANTS.iter() {
+        let mut s = SessionState::default();
+        let SqlOutcome::Query(q) = core
+            .execute_sql_in_session(&ctx(t), &mut s, "SELECT lang, n FROM docs LIMIT 1000")
+            .expect("owned rows")
+        else {
+            panic!("expected query");
+        };
+        for row in &q.rows {
+            let (Cell::Text(owner), Cell::SignedInteger(n)) = (&row.cells[0], &row.cells[1]) else {
+                panic!("unexpected cells {:?}", row.cells);
+            };
+            if owner == t {
+                out.push((owner.clone(), row.id, *n));
+            }
+        }
+    }
+    out.sort();
+    out
+}
+
 fn owned_total(core: &EngineCore) -> i64 {
     TENANTS.iter().map(|t| owned_by(core, t)).sum()
 }
@@ -229,32 +253,46 @@ fn function_body_reads_and_writes_follow_the_truth_table() {
                         ),
                     ] {
                         let (core, truths, _g) = fixture("plpgsql-bnd-write", viewer, flood, None);
-                        let others_before: Vec<i64> = TENANTS
-                            .iter()
-                            .filter(|t| **t != viewer)
-                            .map(|t| owned_by(&core, t))
-                            .collect();
-                        let mine_before = owned_by(&core, viewer);
+                        let before = owned_rows(&core);
                         let out = run_body(&core, &c, explicit_txn, src).expect("write body");
                         let w = writable(&truths, viewer, allow_private);
                         assert_eq!(as_i64(&out), w, "{label}: {verb} ROW_COUNT");
-                        // 他テナントが所有する行は 1 行も変わらない。
-                        let others_after: Vec<i64> = TENANTS
-                            .iter()
-                            .filter(|t| **t != viewer)
-                            .map(|t| owned_by(&core, t))
-                            .collect();
+                        let after = owned_rows(&core);
+                        // 他テナントが所有する行は（所有者・行 ID・n とも）1 行も変わらない。
+                        let others = |rows: &[(String, u64, i64)]| -> Vec<(String, u64, i64)> {
+                            rows.iter().filter(|r| r.0 != viewer).cloned().collect()
+                        };
                         assert_eq!(
-                            others_before, others_after,
+                            others(&before),
+                            others(&after),
                             "{label}: {verb} touched others"
                         );
-                        let mine_after = owned_by(&core, viewer);
-                        let expected = if verb == "delete" {
-                            mine_before - w
-                        } else {
-                            mine_before
+                        let mine = |rows: &[(String, u64, i64)]| -> Vec<(String, u64, i64)> {
+                            rows.iter().filter(|r| r.0 == viewer).cloned().collect()
                         };
-                        assert_eq!(mine_after, expected, "{label}: {verb} own rows");
+                        let (mine_before, mine_after) = (mine(&before), mine(&after));
+                        if verb == "delete" {
+                            assert_eq!(
+                                mine_before.len() as i64 - mine_after.len() as i64,
+                                w,
+                                "{label}: {verb} own rows"
+                            );
+                            assert!(
+                                mine_after.iter().all(|r| mine_before.contains(r)),
+                                "{label}: {verb} survivors unchanged"
+                            );
+                        } else {
+                            let ids = |rows: &[(String, u64, i64)]| -> Vec<u64> {
+                                rows.iter().map(|r| r.1).collect()
+                            };
+                            assert_eq!(ids(&mine_before), ids(&mine_after), "{label}: {verb} ids");
+                            let updated = mine_after.iter().filter(|r| r.2 == 99).count() as i64;
+                            assert_eq!(updated, w, "{label}: {verb} rows with n = 99");
+                            assert!(
+                                mine_after.iter().all(|r| r.2 == 99 || r.2 == 10),
+                                "{label}: {verb} unexpected values"
+                            );
+                        }
                         trials += 1;
                     }
                 }
