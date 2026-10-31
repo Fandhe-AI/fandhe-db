@@ -41,6 +41,13 @@ pub(crate) enum Role {
     /// リテラルしか受理しない位置（`LIKE` パターン・`IN` リスト・`BETWEEN` 境界・`LIMIT` 等）に
     /// 置かれたスコープ内変数の名前。
     LiteralSlot,
+    /// `INSERT .. VALUES` の要素（定数式）の中の変数。定数式の束縛は `CAST` を受理せず、値の型は
+    /// 書き込み先の列型・リテラルの大きさで決まる（置換方法は #2226 の `plpgsql::subst`）。
+    ConstExpr,
+    /// `INSERT .. VALUES` の要素全体が変数 1 個だけ（符号 `-`・冗長な括弧を除く）である位置。
+    /// 要素の範囲は構文解析器が確定する（トークンの前後関係からの推測ではない）。numeric を裸の
+    /// 数値で置換してよいのはこの役割だけで、書き込み先の列型が型を決める。
+    ConstLone,
 }
 
 /// 1 件の記録（ルートのトークン列上の位置と役割）。
@@ -103,6 +110,9 @@ struct SinkState {
     records: Vec<Recorded>,
     subquery_ranges: Vec<std::ops::Range<usize>>,
     out_of_range: bool,
+    /// 定数式（`INSERT .. VALUES` の要素）の解析中の入れ子数。正の間、`Value` の記録は
+    /// [`Role::ConstExpr`] になる。
+    const_depth: u32,
 }
 
 /// 別名の連鎖の最大段数（正規化 → 降格 → …。無限ループ防止）。
@@ -153,6 +163,7 @@ where
         records: Vec::new(),
         subquery_ranges: Vec::new(),
         out_of_range: false,
+        const_depth: 0,
     };
     let prev = SINK.with(|c| c.replace(Some(state)));
     ColrefGuard { prev }
@@ -219,6 +230,11 @@ pub(crate) fn record(tok: &Token, role: Role) {
     let addr = tok as *const Token as usize;
     with_state(|s| match s.resolve(addr) {
         Some(pos) => {
+            let role = if role == Role::Value && s.const_depth > 0 {
+                Role::ConstExpr
+            } else {
+                role
+            };
             if let Some(r) = s.records.iter_mut().find(|r| r.pos == pos) {
                 r.role = role;
             } else {
@@ -226,6 +242,40 @@ pub(crate) fn record(tok: &Token, role: Role) {
             }
         }
         None => s.out_of_range = true,
+    });
+}
+
+/// 定数式（`INSERT .. VALUES` の要素）の解析区間を表す RAII ガード（記録区間が無ければ何もしない）。
+pub(crate) struct ConstExprScope(bool);
+
+/// 定数式の解析区間を開始する。生きている間の `Value` の記録は [`Role::ConstExpr`] になる。
+pub(crate) fn const_expr_scope() -> ConstExprScope {
+    let active = with_state(|s| s.const_depth = s.const_depth.saturating_add(1)).is_some();
+    ConstExprScope(active)
+}
+
+impl Drop for ConstExprScope {
+    fn drop(&mut self) {
+        if self.0 {
+            with_state(|s| s.const_depth = s.const_depth.saturating_sub(1));
+        }
+    }
+}
+
+/// 定数式の要素全体が変数 1 個だけだと確定した位置 `tok` を [`Role::ConstLone`] へ昇格する。
+/// 記録が [`Role::ConstExpr`] のときだけ昇格する（記録区間が無い・別の役割なら何もしない）。
+pub(crate) fn mark_const_lone(tok: &Token) {
+    let addr = tok as *const Token as usize;
+    with_state(|s| {
+        if let Some(pos) = s.resolve(addr) {
+            if let Some(r) = s
+                .records
+                .iter_mut()
+                .find(|r| r.pos == pos && r.role == Role::ConstExpr)
+            {
+                r.role = Role::ConstLone;
+            }
+        }
     });
 }
 
