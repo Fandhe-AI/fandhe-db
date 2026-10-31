@@ -325,15 +325,23 @@ DML は `PredicateDmlError<E>` を使う）を導入した。Issue #942 では�
 
 `SessionTransaction<'e>`（`enum TxnState<'e> { Idle, Active(Box<ActiveTxn<'e>>),
 Failed { session_at_begin: SessionState, expired: bool } }`）。`ActiveTxn` は
-`write_txn: GatedWriteTxn`（permit を内包）・`started_at`・
+`writer: Option<GatedWriteTxn>`（permit を内包）・`read_snapshot: ReadTransaction`・`started_at`・
 `statements`・`seen_operation_ids`・`written_tables`・`written_by_tenant`・`has_writes`・
 `session_at_begin` と、dirty テーブル判定（確定済みの世代の読み取り）に使う
 `&'e Storage` を保持する。
 
-- **改訂（#2396・1a）**: `ActiveTxn.write_txn` は常に持つ前提ではなくなる。`BEGIN` 時点の
-  確定済み `ReadTransaction` と `Option` の writer（未取得／取得済み）の形に変わる（#2399）。
-  writer を取得しないまま `COMMIT` した場合は読み取りトランザクションを drop するだけで、
-  commit も世代の更新もしない。以下の記述は改訂前（`BEGIN` で取得）のもの。
+- **改訂（#2396・1a。#2399 で状態の形を実施済み）**: `ActiveTxn` は `writer: Option<GatedWriteTxn>`
+  （未取得／取得済み）と `BEGIN` 時点の確定済み `read_snapshot: ReadTransaction` を持つ。
+  - 挙動不変のリファクタ（SQL-31・PERSIST-4・TASK-333）。writer は現状も `BEGIN` で取得するため、
+    `Active` の間は常に `Some`。スナップショットはどの読み取り経路にも結線していない
+    （結線は #2400・#2403）。
+  - スナップショットは writer の取得**後**に開く（permit 保持中に開けば文ごとの読み取りと同じ確定
+    状態になり挙動が変わらない）。#2400 で `BEGIN` 時に先に開く順序へ変える。
+  - writer が `None` で `has_writes` が真の状態は不変条件違反で、`COMMIT` は `XX000`
+    （`session` を開始時点へ復元）、`dirty_tables` は `Err` で fail-closed に倒す。
+  - writer を取得しないまま `COMMIT` した場合は読み取りトランザクションを drop するだけで、
+    commit も世代の更新もしない（一時側の確定・`ON COMMIT` は従来どおり実行する）。
+  以下の記述は改訂前（`BEGIN` で取得）のもの。
 - **`BEGIN`**: `Idle` → `Active`（`Storage::begin_explicit_write_txn` 経由。改訂後は
   `BEGIN` で writer を取得しない。取得は最初の書き込み文）。
   `Active` 中の再 `BEGIN` は `25001`（`ActiveSqlTransaction`）で `Failed` へ
