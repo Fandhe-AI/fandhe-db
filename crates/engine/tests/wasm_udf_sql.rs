@@ -346,7 +346,7 @@ fn runtime_trap_is_row_error_and_session_survives() {
     register(&mut session, "boom", &unreachable_module()).expect("register");
     register(&mut session, "wfn", &first_times_scalar()).expect("register");
 
-    // 実行時上限の `54000` 化は #1927 の範囲。ここでは現状の `22000` 写像だけを固定する。
+    // 上限超過ではないトラップ（`unreachable`）は `22000`（上限超過は下の `54000` テスト）。
     let err = core
         .execute_sql_in_session(
             &ctx,
@@ -363,6 +363,90 @@ fn runtime_trap_is_row_error_and_session_survives() {
          ORDER BY embedding <=> '[3.0,4.0,0.0]' LIMIT 3",
     );
     assert_eq!(result.rows.len(), 3);
+}
+
+fn infinite_loop_module() -> Vec<u8> {
+    // loop { br 0 } f32.const 0
+    Spec::new(plain_body(&[0x03, 0x40, 0x0C, 0, 0x0B, 0x43, 0, 0, 0, 0])).build()
+}
+
+/// `memory.grow(129)` を捨てる（130 ページ = 約 8.1 MiB > 8 MiB）。
+fn grow_over_limit_module() -> Vec<u8> {
+    Spec::new(plain_body(&[
+        0x41, 0x81, 0x01, 0x40, 0x00, 0x1A, 0x43, 0, 0, 0, 0,
+    ]))
+    .build()
+}
+
+#[test]
+fn infinite_loop_is_54000_in_both_positions_and_session_survives() {
+    // EXT-6／EXT-9: 上限超過は文全体を `54000` で拒否し、プロセス・セッションは生存する。
+    let (core, _guard) = new_core_with_docs();
+    let ctx = PolicyContext::new("tenant-a").expect("valid tenant");
+    let mut session = SessionState::default();
+    // 注入点（`EngineCore::with_wasm_limits` / `wasm_limits`）で下げた上限が登録経路へ効く。
+    let core = core.with_wasm_limits(SandboxLimits {
+        fuel: 10_000,
+        ..SandboxLimits::default()
+    });
+    let limits = core.wasm_limits();
+    session
+        .register_wasm_udf_from_module(
+            "spin",
+            &sig_vec_real_to_real(),
+            &infinite_loop_module(),
+            "f",
+            limits,
+        )
+        .expect("register");
+    register(&mut session, "wfn", &first_times_scalar()).expect("register");
+    for sql in [
+        "SELECT id, spin(embedding, 1.0) AS a FROM docs \
+         ORDER BY embedding <=> '[3.0,4.0,0.0]' LIMIT 3",
+        "SELECT id FROM docs WHERE spin(embedding, 1.0) > 0.0 \
+         ORDER BY embedding <=> '[3.0,4.0,0.0]' LIMIT 3",
+    ] {
+        let err = core
+            .execute_sql_in_session(&ctx, &mut session, sql)
+            .expect_err("limit must fail the statement");
+        assert_eq!(err.wire_code(), "54000", "{sql}");
+    }
+    let result = select(
+        &core,
+        &mut session,
+        "SELECT id, wfn(embedding, 1.0) AS a FROM docs \
+         ORDER BY embedding <=> '[3.0,4.0,0.0]' LIMIT 3",
+    );
+    assert_eq!(result.rows.len(), 3);
+}
+
+#[test]
+fn memory_grow_over_limit_is_54000() {
+    let (core, _guard) = new_core_with_docs();
+    let ctx = PolicyContext::new("tenant-a").expect("valid tenant");
+    let mut session = SessionState::default();
+    register(&mut session, "grow", &grow_over_limit_module()).expect("register");
+    let err = core
+        .execute_sql_in_session(
+            &ctx,
+            &mut session,
+            "SELECT id, grow(embedding, 1.0) AS a FROM docs LIMIT 1",
+        )
+        .expect_err("memory limit must fail the statement");
+    assert_eq!(err.wire_code(), "54000");
+}
+
+#[test]
+fn engine_core_wasm_limits_are_clamped_and_injectable() {
+    let (core, _guard) = new_core_with_docs();
+    assert_eq!(core.wasm_limits(), SandboxLimits::default());
+    let huge = SandboxLimits {
+        memory_limit_bytes: usize::MAX,
+        deadline_ticks: u64::MAX,
+        fuel: u64::MAX,
+    };
+    let core = core.with_wasm_limits(huge);
+    assert_eq!(core.wasm_limits(), SandboxLimits::default());
 }
 
 #[test]

@@ -20,9 +20,12 @@
 //! 第 5 節）。wasmtime は Issue #1924 で承認済みの optional 依存として追加済みで、
 //! `wasm-udf` feature 有効時に限り、検証・コンパイルを行うバックエンド構築関数
 //! （[`compile_wasm_udf_backend`]。Issue #1925・EXT-9 ポインタ）を本ファイルが持つ。
-//! 構築関数は fuel（`consume_fuel(true)`・`Store::set_fuel`）で命令数を制限し、
-//! 枯渇は `DeadlineExceeded` へ写像するため無限ループは停止する。epoch による
-//! 時間制限（ティッカー）は Issue #1927 で追加する。
+//! 構築関数は fuel（`consume_fuel(true)`・[`SandboxLimits::fuel`]）で命令数を、共有
+//! epoch ティッカー（`EPOCH_TICK_INTERVAL_MS` ごとに `Engine::increment_epoch`。
+//! [`SandboxLimits::deadline_ticks`]）で実行時間を制限し、無限ループは二重に停止する
+//! （Issue #1927・EXT-6／EXT-9 ポインタ）。上限はハード上限（`HARD_MAX_*`）で頭打ちに
+//! し、wire-server の `--wasm-max-*` は下げる方向にだけ効く（検証は `validate_wasm_*`）。
+//! 実行時の上限超過（燃料・時間・メモリ）は `54000` へ写像される。
 //! モジュールのバイト列からの登録は `SessionState::register_wasm_udf_from_module`
 //! （`sql::udf_call::define_wasm_function_from_module`。Issue #1926・EXT-9 ポインタ）が
 //! 担い、宣言シグネチャ（[`WasmUdfSignature`]）を ABI と照合してから
@@ -57,13 +60,40 @@ pub const DEFAULT_CALL_DEADLINE_TICKS: u64 = 50;
 /// インスタンスへ許可する線形メモリの既定上限（バイト）。
 pub const DEFAULT_MEMORY_LIMIT_BYTES: usize = 8 * 1024 * 1024;
 
-/// サンドボックスの実行時上限（wasmtime 承認後、モジュール検証・コンパイルを行う
-/// バックエンド構築関数が受け取る契約。テストは短い `deadline_ticks` を指定し、
-/// 既定値〔約 5 秒〕への依存を避けられる）。
+/// 呼び出し 1 回あたりの既定 fuel（命令数予算の目安）。
+pub const DEFAULT_CALL_FUEL: u64 = 100_000_000;
+
+/// メモリ上限のハード上限（バイト）。呼び出し元・CLI のどちらも超えられない
+/// （EXT-9 ポインタ。既定値と同じ＝上げる経路を作らない）。
+pub const HARD_MAX_MEMORY_LIMIT_BYTES: usize = DEFAULT_MEMORY_LIMIT_BYTES;
+
+/// deadline（ティック数）のハード上限。
+pub const HARD_MAX_CALL_DEADLINE_TICKS: u64 = DEFAULT_CALL_DEADLINE_TICKS;
+
+/// fuel のハード上限。
+pub const HARD_MAX_CALL_FUEL: u64 = DEFAULT_CALL_FUEL;
+
+/// メモリ上限の下限（バイト。wasm 1 ページ）。
+pub const MIN_MEMORY_LIMIT_BYTES: usize = 65536;
+
+/// 呼び出し時間上限の下限（ミリ秒。1 tick）。
+pub const MIN_CALL_DURATION_MS: u64 = EPOCH_TICK_INTERVAL_MS;
+
+/// 呼び出し時間上限の上限（ミリ秒。ハード上限 tick 数に対応）。
+pub const MAX_CALL_DURATION_MS: u64 = DEFAULT_CALL_DEADLINE_TICKS * EPOCH_TICK_INTERVAL_MS;
+
+/// fuel 上限の下限。
+pub const MIN_CALL_FUEL: u64 = 1;
+
+/// サンドボックスの実行時上限（バックエンド構築関数が受け取る契約。
+/// [`compile_wasm_udf_backend`] は入口で [`SandboxLimits::clamped`] を適用するため、
+/// ハード上限を超える値は頭打ちになる。テストは小さな値を指定して短時間で停止させる）。
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct SandboxLimits {
     pub memory_limit_bytes: usize,
     pub deadline_ticks: u64,
+    /// 呼び出し 1 回あたりの fuel（命令数予算）。
+    pub fuel: u64,
 }
 
 impl Default for SandboxLimits {
@@ -71,8 +101,68 @@ impl Default for SandboxLimits {
         SandboxLimits {
             memory_limit_bytes: DEFAULT_MEMORY_LIMIT_BYTES,
             deadline_ticks: DEFAULT_CALL_DEADLINE_TICKS,
+            fuel: DEFAULT_CALL_FUEL,
         }
     }
+}
+
+impl SandboxLimits {
+    /// 各上限をハード上限で頭打ちにする（下側は引き上げない。fail-closed）。
+    pub fn clamped(self) -> Self {
+        SandboxLimits {
+            memory_limit_bytes: self.memory_limit_bytes.min(HARD_MAX_MEMORY_LIMIT_BYTES),
+            deadline_ticks: self.deadline_ticks.min(HARD_MAX_CALL_DEADLINE_TICKS),
+            fuel: self.fuel.min(HARD_MAX_CALL_FUEL),
+        }
+    }
+}
+
+/// `--wasm-max-*` の値が許容範囲外（`Display` は値と範囲だけを出す）。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct WasmLimitOutOfRange {
+    pub value: u64,
+    pub min: u64,
+    pub max: u64,
+}
+
+impl fmt::Display for WasmLimitOutOfRange {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(
+            f,
+            "value {} is out of range ({}..={})",
+            self.value, self.min, self.max
+        )
+    }
+}
+
+impl std::error::Error for WasmLimitOutOfRange {}
+
+fn check_range(value: u64, min: u64, max: u64) -> Result<u64, WasmLimitOutOfRange> {
+    if value < min || value > max {
+        return Err(WasmLimitOutOfRange { value, min, max });
+    }
+    Ok(value)
+}
+
+/// `--wasm-max-memory-bytes` の範囲検証（wire-server 起動時が呼ぶ唯一の情報源）。
+pub fn validate_wasm_max_memory_bytes(v: u64) -> Result<usize, WasmLimitOutOfRange> {
+    let v = check_range(
+        v,
+        MIN_MEMORY_LIMIT_BYTES as u64,
+        HARD_MAX_MEMORY_LIMIT_BYTES as u64,
+    )?;
+    Ok(usize::try_from(v).unwrap_or(HARD_MAX_MEMORY_LIMIT_BYTES))
+}
+
+/// `--wasm-max-call-duration-ms` の範囲検証。tick へは切り捨てる（上限を緩めない）。
+pub fn validate_wasm_max_call_duration_ms(v: u64) -> Result<u64, WasmLimitOutOfRange> {
+    let v = check_range(v, MIN_CALL_DURATION_MS, MAX_CALL_DURATION_MS)?;
+    Ok((v / EPOCH_TICK_INTERVAL_MS).max(1))
+}
+
+/// `--wasm-max-fuel` の範囲検証。
+pub fn validate_wasm_max_fuel(v: u64) -> Result<u64, WasmLimitOutOfRange> {
+    check_range(v, MIN_CALL_FUEL, HARD_MAX_CALL_FUEL)
 }
 
 /// 実行時トラップの種別（閉じた集合）。バックエンド実装はここに定義された種別
@@ -83,6 +173,8 @@ impl Default for SandboxLimits {
 pub enum TrapKind {
     /// [`SandboxLimits::deadline_ticks`] を超過した（epoch interruption）。
     DeadlineExceeded,
+    /// [`SandboxLimits::fuel`] を使い切った。
+    FuelExhausted,
     /// `unreachable` 命令の実行、または `f(...)` 実行中の演算失敗（0 除算等）。
     Unreachable,
     /// 線形メモリの範囲外アクセス。
@@ -95,6 +187,7 @@ impl fmt::Display for TrapKind {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
             TrapKind::DeadlineExceeded => write!(f, "deadline exceeded"),
+            TrapKind::FuelExhausted => write!(f, "fuel exhausted"),
             TrapKind::Unreachable => write!(f, "unreachable"),
             TrapKind::MemoryOutOfBounds => write!(f, "memory out of bounds"),
             TrapKind::Other => write!(f, "trap"),
@@ -252,6 +345,62 @@ mod tests {
         let limits = SandboxLimits::default();
         assert_eq!(limits.memory_limit_bytes, DEFAULT_MEMORY_LIMIT_BYTES);
         assert_eq!(limits.deadline_ticks, DEFAULT_CALL_DEADLINE_TICKS);
+        assert_eq!(limits.fuel, DEFAULT_CALL_FUEL);
+        assert_eq!(limits, limits.clamped());
+    }
+
+    #[test]
+    fn clamped_saturates_only_upward() {
+        let l = SandboxLimits {
+            memory_limit_bytes: usize::MAX,
+            deadline_ticks: u64::MAX,
+            fuel: u64::MAX,
+        }
+        .clamped();
+        assert_eq!(l, SandboxLimits::default());
+        let small = SandboxLimits {
+            memory_limit_bytes: 1,
+            deadline_ticks: 0,
+            fuel: 0,
+        };
+        assert_eq!(small.clamped(), small);
+    }
+
+    #[test]
+    fn validate_limits_boundaries() {
+        assert!(validate_wasm_max_memory_bytes(0).is_err());
+        assert!(validate_wasm_max_memory_bytes(65535).is_err());
+        assert_eq!(validate_wasm_max_memory_bytes(65536), Ok(65536));
+        assert_eq!(
+            validate_wasm_max_memory_bytes(HARD_MAX_MEMORY_LIMIT_BYTES as u64),
+            Ok(HARD_MAX_MEMORY_LIMIT_BYTES)
+        );
+        assert!(validate_wasm_max_memory_bytes(HARD_MAX_MEMORY_LIMIT_BYTES as u64 + 1).is_err());
+        assert!(validate_wasm_max_call_duration_ms(0).is_err());
+        assert!(validate_wasm_max_call_duration_ms(99).is_err());
+        assert_eq!(validate_wasm_max_call_duration_ms(100), Ok(1));
+        assert_eq!(validate_wasm_max_call_duration_ms(199), Ok(1));
+        assert_eq!(validate_wasm_max_call_duration_ms(5000), Ok(50));
+        assert!(validate_wasm_max_call_duration_ms(5001).is_err());
+        assert!(validate_wasm_max_fuel(0).is_err());
+        assert_eq!(validate_wasm_max_fuel(1), Ok(1));
+        assert_eq!(
+            validate_wasm_max_fuel(HARD_MAX_CALL_FUEL),
+            Ok(HARD_MAX_CALL_FUEL)
+        );
+        assert!(validate_wasm_max_fuel(HARD_MAX_CALL_FUEL + 1).is_err());
+        assert_eq!(
+            validate_wasm_max_fuel(0).unwrap_err().to_string(),
+            "value 0 is out of range (1..=100000000)"
+        );
+    }
+
+    #[test]
+    fn fuel_exhausted_display_is_stable() {
+        assert_eq!(
+            WasmUdfError::Trap(TrapKind::FuelExhausted).to_string(),
+            "wasm udf: trap (fuel exhausted)"
+        );
     }
 
     #[test]

@@ -3,7 +3,8 @@
 //! 外部依存（wat 等）を増やさないため、WASM バイナリは `tests/support/wasm_encoder.rs` の小さな
 //! エンコーダで手書きする。各 fixture のコメントに対応する WAT 相当を書く。
 //! `wasm-udf` feature 無効の既定ビルドではこのファイルは空になる。
-//! SQL からの呼び出しは `tests/wasm_udf_sql.rs`（#1926）、epoch ティッカーは #1927 の範囲。
+//! SQL からの呼び出しは `tests/wasm_udf_sql.rs`（#1926）。資源上限（燃料・epoch ティッカー・
+//! ハード上限の頭打ち。epoch ティッカー単独の停止は `src/wasm_udf/backend.rs` の単体テスト。#1927・EXT-6／EXT-9 ポインタ）もここで検証する。時間計測を含むため単独で置く。
 
 #![cfg(feature = "wasm-udf")]
 
@@ -243,18 +244,61 @@ fn errors_use_fixed_messages() {
     assert_eq!(dbg, "WasmtimeBackend { entry_len: 1, .. }");
 }
 
+/// `(loop (br 0)) f32.const 0`
+fn infinite_loop_body() -> Vec<u8> {
+    plain_body(&[0x03, 0x40, 0x0C, 0, 0x0B, 0x43, 0, 0, 0, 0])
+}
+
 #[test]
 fn infinite_loop_is_stopped_by_fuel() {
-    // (loop (br 0)) f32.const 0
-    let body = plain_body(&[0x03, 0x40, 0x0C, 0, 0x0B, 0x43, 0, 0, 0, 0]);
     let limits = SandboxLimits {
-        deadline_ticks: 1,
+        fuel: 10_000,
+        ..SandboxLimits::default()
+    };
+    let be =
+        compile_wasm_udf_backend(&Spec::new(infinite_loop_body()).build(), "f", limits).unwrap();
+    assert_eq!(
+        be.call_vector_scalar(&[], 0.0).err(),
+        Some(WasmUdfError::Trap(TrapKind::FuelExhausted))
+    );
+}
+
+#[test]
+fn caller_supplied_limits_are_clamped_to_hard_max() {
+    let huge = SandboxLimits {
+        memory_limit_bytes: usize::MAX,
+        deadline_ticks: u64::MAX,
+        fuel: u64::MAX,
+    };
+    // 初期メモリが 8 MiB を超えるモジュールは、呼び出し元が上限を引き上げても定義時に拒否される。
+    let mut big = Spec::new(sum_body());
+    big.memory_min = Some(200);
+    assert_eq!(
+        compile_wasm_udf_backend(&big.build(), "f", huge).err(),
+        Some(WasmUdfError::MemoryLimitExceeded)
+    );
+    // 8 MiB を超える memory.grow は実行時に拒否される（130 ページ = 約 8.1 MiB）。
+    // (drop (memory.grow (i32.const 129))) f32.const 0
+    let body = plain_body(&[0x41, 0x81, 0x01, 0x40, 0x00, 0x1A, 0x43, 0, 0, 0, 0]);
+    let be = compile_wasm_udf_backend(&Spec::new(body).build(), "f", huge).unwrap();
+    assert_eq!(
+        be.call_vector_scalar(&[], 0.0).err(),
+        Some(WasmUdfError::MemoryLimitExceeded)
+    );
+}
+
+#[test]
+fn lowered_memory_limit_is_enforced() {
+    // (drop (memory.grow (i32.const 1))) f32.const 0。上限 1 ページでは 2 ページ目が拒否される。
+    let body = plain_body(&[0x41, 1, 0x40, 0x00, 0x1A, 0x43, 0, 0, 0, 0]);
+    let limits = SandboxLimits {
+        memory_limit_bytes: 65536,
         ..SandboxLimits::default()
     };
     let be = compile_wasm_udf_backend(&Spec::new(body).build(), "f", limits).unwrap();
     assert_eq!(
         be.call_vector_scalar(&[], 0.0).err(),
-        Some(WasmUdfError::Trap(TrapKind::DeadlineExceeded))
+        Some(WasmUdfError::MemoryLimitExceeded)
     );
 }
 

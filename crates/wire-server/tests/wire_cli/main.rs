@@ -38,4 +38,5 @@ mod wire_temp_table_limits_cli;
 mod wire_tls_cli;
 mod wire_transaction_limits_cli;
 mod wire_trigger_limits_cli;
+mod wire_wasm_limits_cli;
 mod wire_window_limits_cli;

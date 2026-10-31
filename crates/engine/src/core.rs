@@ -1342,6 +1342,9 @@ pub struct EngineCore {
     /// [`Self::with_plpgsql_limits`] のみが起動時に 1 回だけ差し替える。消費者（`LANGUAGE plpgsql`
     /// の受理〔#2217〕・実行の結線〔#2226〕）が入るまでは getter の呼び出し元は無い。
     plpgsql_limits: crate::plpgsql_limits::PlpgsqlLimits,
+    /// WASM UDF サンドボックスの資源上限（Issue #1927・EXT-9）。[`Self::with_wasm_limits`] のみが
+    /// 起動時に 1 回だけ差し替える。本番の消費者（`LANGUAGE wasm` の定義経路）は #1923 で結線する。
+    wasm_limits: crate::wasm_udf::SandboxLimits,
     /// 明示 `LIMIT` の範囲上限（Issue #1555）。差し替えは [`Self::with_result_limits`]
     /// のみ（起動時 1 回）。文の `LIMIT`・`FETCH n`・集合演算／JOIN 文の `LIMIT` の
     /// 範囲判定にだけ効き、`OFFSET`・枝行数・サブクエリ内側行数の上限とは連動しない。
@@ -2872,6 +2875,7 @@ impl EngineCore {
             correlated_limits: crate::correlated_limits::CorrelatedLimits::default(),
             recursive_cte_limits: crate::recursive_cte_limits::RecursiveCteLimits::default(),
             plpgsql_limits: crate::plpgsql_limits::PlpgsqlLimits::default(),
+            wasm_limits: crate::wasm_udf::SandboxLimits::default(),
             result_limits: crate::result_limits::ResultLimits::default(),
             materialization_contexts: None,
             partitioned_dml_limits: crate::sql::parser::PartitionedDmlLimits::default(),
@@ -3356,6 +3360,18 @@ impl EngineCore {
     pub fn with_plpgsql_limits(mut self, limits: crate::plpgsql_limits::PlpgsqlLimits) -> Self {
         self.plpgsql_limits = limits;
         self
+    }
+
+    /// WASM UDF サンドボックスの資源上限を差し替える（保存時にハード上限で頭打ち）。wire-server の
+    /// 起動時 `--wasm-max-*` からだけ呼ぶ。本番の消費者は #1923（`LANGUAGE wasm` の定義）。
+    pub fn with_wasm_limits(mut self, limits: crate::wasm_udf::SandboxLimits) -> Self {
+        self.wasm_limits = limits.clamped();
+        self
+    }
+
+    /// 現在の WASM UDF 上限設定。`register_wasm_udf_from_module` へ渡す値の供給元。
+    pub fn wasm_limits(&self) -> crate::wasm_udf::SandboxLimits {
+        self.wasm_limits
     }
 
     /// 現在の PL/pgSQL 上限設定。#2218 の関数呼び出し深さもここの `max_call_depth` を読む。

@@ -43,8 +43,8 @@ use std::sync::Arc;
 use crate::row_codec::ScalarRef;
 use crate::sql::allowlist::SqlSurfaceError;
 use crate::sql::udf_call::{
-    self, apply_builtin, finite_scalar, id_as_finite_scalar, id_compare, BinOp, BoundExpr,
-    BuiltinFn, ExprValue, MAX_BUILTIN_ARITY,
+    self, apply_builtin, finite_scalar, id_as_finite_scalar, id_compare, map_wasm_call_error,
+    BinOp, BoundExpr, BuiltinFn, ExprValue, MAX_BUILTIN_ARITY,
 };
 use crate::wasm_udf::WasmUdfBackend;
 
@@ -1244,15 +1244,12 @@ impl ExprProgram {
                             | ExprValue::Array(_)
                             | ExprValue::Timestamp(_) => return Err(type_mismatch()),
                         };
-                        // バックエンドの失敗（deadline 超過・トラップ・メモリ確保
-                        // 失敗・`Mutex` poison 等）は種別を問わずすべて `22000` へ
-                        // 写像する（行値・テナント情報を含まない固定文言。
-                        // `sql::udf_call::eval` の `WasmCall` 分岐と同じ契約。
-                        // EXT-6 の拒否・強制中断はここで行単位のエラーへ収束し、
-                        // プロセスは生存する）。
+                        // バックエンドの失敗は `map_wasm_call_error` で写像する
+                        // （`sql::udf_call::eval` の `WasmCall` 分岐と同じ契約。上限超過は
+                        // `54000`、他のトラップは `22000`。プロセスは生存する）。
                         let result = backend
                             .call_vector_scalar(&v, s)
-                            .map_err(|e| SqlSurfaceError::invalid_input(e.to_string()))?;
+                            .map_err(map_wasm_call_error)?;
                         scratch.push(expr_value_to_stack(finite_scalar(result, "wasm udf")?));
                     }
                     pc += 1;
