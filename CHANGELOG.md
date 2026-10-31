@@ -9,6 +9,8 @@
 
 ### Added
 
+- `CREATE FUNCTION` の `LANGUAGE sql|plpgsql` 句と関数属性（揮発性・`STRICT`・`PARALLEL`・`COST`）を受理する（Issue #2217・SQL-67 (3)）。本体は文字列リテラル（`$$...$$` 可）で原文のまま保存し、plpgsql は定義時に検証する。`RETURNS trigger` は plpgsql・引数なしだけ受理する。非 IMMUTABLE の `sql`／`plpgsql` 関数を使う式索引・部分索引は `42P17`。`sql`／`plpgsql` 関数の呼び出しは #2218 まで `42883`。
+  公開 `Statement::CreateFunction` に `language`・`attributes`・`returns_trigger` を追加し、`body` を `CreateFunctionBody` に置き換えた（BREAKING CHANGE）。
 - トリガ関数の内部 API と `DO` ブロックを追加した（Issue #2228・SQL-68）。`DO [LANGUAGE plpgsql] '<本体>'` を受理し、暗黙・明示トランザクションの上で本体を実行する（CommandComplete タグ `DO`。本体のエラーで副作用なし。`USING OPERATION_ID` は `0A000`）。トリガ関数は `NEW`／`OLD`／`TG_*` を使え、`RETURN NEW`・`RETURN NULL` の意味は PostgreSQL に合わせる（発火への結線は #1720）。
   公開 enum `SqlOutcome` に `Do`、`ParsedSql` に `Do` を追加した（BREAKING CHANGE）。
 - DDL 権限のあるセッションで、型付き引数と `RETURNS` つきの `CREATE [OR REPLACE] FUNCTION` を UDF カタログへ永続化する（Issue #2798・SQL-66）。従来の `0A000` 拒否は無くなり、再起動後のロードで型が復元される（blob v1 は不変）。公開 API の変更はない。詳細は [udf-catalog.md](docs/design/udf-catalog.md)。

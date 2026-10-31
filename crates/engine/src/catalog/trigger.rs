@@ -175,7 +175,7 @@ pub(crate) struct TriggerDef {
 
 /// 関数が `RETURNS trigger` を宣言しているか（Issue #2228）。トリガ関数は PL/pgSQL で書き、引数を
 /// 持たない（`TG_ARGV` で受ける）。それ以外は `CREATE TRIGGER` が `42P17` で拒否する（fail-closed）。
-/// SQL から `RETURNS trigger` の関数を作る入口は #2217 が結線するまで無く、Storage 水準でだけ作れる。
+/// SQL からは `CREATE FUNCTION ... RETURNS trigger LANGUAGE plpgsql`（#2217）で作る。
 pub(crate) fn returns_trigger(def: &FunctionDef) -> bool {
     def.language == FunctionLanguage::Plpgsql
         && def.params.is_empty()

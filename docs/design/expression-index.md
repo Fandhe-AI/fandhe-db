@@ -348,3 +348,11 @@ must be marked IMMUTABLE`）にする。型を決められない部分式は判�
 - 式要素への `COLLATE`・matview への式索引（従来どおり `0A000`）、ORDER BY の式一致による索引順走査。
 
 > Issue #2194 注記: 本書の索引の行参照は `SqlArenaSnapshot` のスロットで、Issue #2194 では変更していない（`id_index` を含め #2195 が扱う）。詳細は [rowid-primary-key-separation.md](rowid-primary-key-separation.md) の §8。
+
+## Issue #2217（`LANGUAGE sql|plpgsql` 関数の揮発性による判定）
+
+組み込み以外の関数は、構文段では判定を保留し、権限検査の後に自テナントの UDF カタログで解決する
+（`sql::index_udf`）。非 IMMUTABLE（既定の `VOLATILE` を含む）の `sql`／`plpgsql` 関数はキー式・述語とも
+`42P17`。IMMUTABLE でも本体の実行が未実装で索引の維持を評価できないため受け入れず `0A000`。宣言的 UDF（内容で
+判定する従来方針）・未定義名・引数の数が合わない呼び出し・権限の無いセッションは従来どおり `0A000`。他テナントの
+関数は見えず、結果を変えない。

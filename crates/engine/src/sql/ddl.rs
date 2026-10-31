@@ -3062,6 +3062,13 @@ pub(crate) fn execute_create_index(
     // 済みだが、将来の経路変更で届いても、式を黙って落として列だけで保存しない（fail-closed）。
     // 式要素そのものは `create_index_bound` が書き込み txn 内で束縛する。一意索引と式要素の組
     // （Issue #1651）は受理し、`create_index_bound` が強制の前提を同一 txn で整える。
+    // 防御ゲート（Issue #2217）: 組み込み以外の関数の判定を保留した文は、`core.rs` が UDF カタログの
+    // 揮発性で必ずエラーへ解決する。ここへ届いても索引を作らない（fail-closed）。
+    if validated.pending_user_function.is_some() {
+        return Err(SqlSurfaceError::FeatureNotSupported {
+            detail: "user-defined functions in index expressions are not supported".to_string(),
+        });
+    }
     let has_expressions = validated.expression_keys().iter().any(Option::is_some);
     if has_expressions
         && !matches!(
@@ -3949,6 +3956,7 @@ mod tests {
             collations: vec![None],
             unique: false,
             predicate: None,
+            pending_user_function: None,
         };
         execute_create_index(&storage, &index).expect("create index");
         let snapshot = |storage: &Storage| {

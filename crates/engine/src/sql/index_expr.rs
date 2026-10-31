@@ -257,7 +257,7 @@ fn not_immutable() -> SqlSurfaceError {
 }
 
 /// 文脈に応じた非決定的な式の拒否（`42P17`。文言は固定で、列名・値を載せない）。
-fn not_immutable_at(site: IndexExprSite) -> SqlSurfaceError {
+pub(crate) fn not_immutable_at(site: IndexExprSite) -> SqlSurfaceError {
     SqlSurfaceError::InvalidObjectDefinition {
         detail: site.not_immutable(),
     }
@@ -271,9 +271,87 @@ fn not_immutable_at(site: IndexExprSite) -> SqlSurfaceError {
 /// （時刻型の `CAST`・`date_part`・`date_trunc`・2 引数の `timezone`・`TIMESTAMPTZ` リテラル・
 /// `COLLATE`・SQL/JSON 問い合わせ）は本段では通して子だけ再帰する。型依存の再判定は束縛段
 /// （Issue #1648）の責務。
+#[cfg(test)] // 本番経路は保留版を使う。従来の拒否（`0A000`）との同値を単体テストで固定する。
 pub(crate) fn check_index_expression_determinism(
     expr: &Expr,
     site: IndexExprSite,
+) -> Result<(), SqlSurfaceError> {
+    check_expr_with(expr, site, &|_, _| Err(udf_unsupported(site)))
+}
+
+/// 組み込み以外の関数の呼び出しに対する従来の拒否（`0A000`。[`check_index_expression_determinism`]）。
+pub(crate) fn udf_unsupported(site: IndexExprSite) -> SqlSurfaceError {
+    SqlSurfaceError::FeatureNotSupported {
+        detail: site.udf().to_string(),
+    }
+}
+
+/// 組み込み以外の関数の呼び出しの手がかり（Issue #2217）。構文段はカタログを引けないため、最初に
+/// 見つけた時点で走査を止めて持ち帰り、`core.rs` が権限検査の後にテナントの UDF カタログで揮発性を
+/// 判定する（`sql::index_udf`）。
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct IndexUserFunctionRef {
+    /// 名前解決後の関数名（SCHEMA 配下は `#<id>.<name>` 形。応答には載せない）。
+    pub(crate) name: String,
+    /// 呼び出しの引数の数。
+    pub(crate) arity: usize,
+    /// キー式か述語か（拒否文言の出し分け）。
+    pub(crate) site: IndexExprSite,
+}
+
+/// 保留付きの決定性検査の結果。
+pub(crate) type PendingUserFunction = Option<IndexUserFunctionRef>;
+
+/// [`check_index_expression_determinism`] の保留版。組み込み以外の関数に最初に達した時点で走査を止め、
+/// その手がかりを `Ok(Some(..))` で返す（従来は同じ位置で `0A000`）。それ以前の確定した拒否は従来どおり
+/// `Err` になる（判定順は不変）。
+pub(crate) fn check_index_expression_determinism_deferring_udf(
+    expr: &Expr,
+    site: IndexExprSite,
+) -> Result<PendingUserFunction, SqlSurfaceError> {
+    defer_udf(site, |udf| check_expr_with(expr, site, udf))
+}
+
+/// [`check_index_predicate_determinism`] の保留版（部分索引の述語。INDEX-11）。
+pub(crate) fn check_index_predicate_determinism_deferring_udf(
+    preds: &[WherePredicate],
+) -> Result<PendingUserFunction, SqlSurfaceError> {
+    defer_udf(IndexExprSite::Predicate, |udf| {
+        check_predicates_with(preds, udf)
+    })
+}
+
+/// 保留版の共通部。`run` に渡す閉包は組み込み以外の関数に達すると手がかりを記録して走査を打ち切る
+/// （打ち切りの `Err` は保留として吸収する。他のエラーはそのまま返す）。
+fn defer_udf(
+    site: IndexExprSite,
+    run: impl FnOnce(&UdfHook<'_>) -> Result<(), SqlSurfaceError>,
+) -> Result<PendingUserFunction, SqlSurfaceError> {
+    let found = std::cell::RefCell::new(None);
+    let hook = |name: &str, arity: usize| {
+        *found.borrow_mut() = Some(IndexUserFunctionRef {
+            name: name.to_string(),
+            arity,
+            site,
+        });
+        Err(SqlSurfaceError::unsupported("pending user function"))
+    };
+    match run(&hook) {
+        Ok(()) => Ok(None),
+        Err(e) => match found.into_inner() {
+            Some(r) => Ok(Some(r)),
+            None => Err(e),
+        },
+    }
+}
+
+/// 組み込み以外の関数に達したときに呼ばれるフック（`Err` で走査を打ち切る）。
+type UdfHook<'a> = dyn Fn(&str, usize) -> Result<(), SqlSurfaceError> + 'a;
+
+fn check_expr_with(
+    expr: &Expr,
+    site: IndexExprSite,
+    udf: &UdfHook<'_>,
 ) -> Result<(), SqlSurfaceError> {
     match expr {
         Expr::Number(_)
@@ -294,32 +372,29 @@ pub(crate) fn check_index_expression_determinism(
                 return Err(not_immutable_at(site));
             }
             if !is_builtin_function_name(name) {
-                return Err(SqlSurfaceError::FeatureNotSupported {
-                    detail: site.udf().to_string(),
-                });
+                return udf(name, args.len());
             }
-            args.iter()
-                .try_for_each(|e| check_index_expression_determinism(e, site))
+            args.iter().try_for_each(|e| check_expr_with(e, site, udf))
         }
         Expr::Binary { lhs, rhs, .. } | Expr::JsonAccess { lhs, rhs, .. } => {
-            check_index_expression_determinism(lhs, site)?;
-            check_index_expression_determinism(rhs, site)
+            check_expr_with(lhs, site, udf)?;
+            check_expr_with(rhs, site, udf)
         }
         Expr::Case { whens, else_result } => {
             for (cond, result) in whens {
-                check_index_expression_determinism(cond, site)?;
-                check_index_expression_determinism(result, site)?;
+                check_expr_with(cond, site, udf)?;
+                check_expr_with(result, site, udf)?;
             }
             else_result
                 .as_deref()
-                .map_or(Ok(()), |e| check_index_expression_determinism(e, site))
+                .map_or(Ok(()), |e| check_expr_with(e, site, udf))
         }
-        Expr::Coalesce(items) | Expr::ArrayConstructor(items) => items
-            .iter()
-            .try_for_each(|e| check_index_expression_determinism(e, site)),
+        Expr::Coalesce(items) | Expr::ArrayConstructor(items) => {
+            items.iter().try_for_each(|e| check_expr_with(e, site, udf))
+        }
         Expr::NullIf(a, b) => {
-            check_index_expression_determinism(a, site)?;
-            check_index_expression_determinism(b, site)
+            check_expr_with(a, site, udf)?;
+            check_expr_with(b, site, udf)
         }
         // `IS [NOT] DISTINCT FROM` は索引の式・述語では対象外（fail-closed。設計文書の対象外節）。
         Expr::IsDistinctFrom { .. } => Err(SqlSurfaceError::FeatureNotSupported {
@@ -332,28 +407,26 @@ pub(crate) fn check_index_expression_determinism(
                 "regular expression operators are not supported in an index expression or predicate"
                     .to_string(),
         }),
-        Expr::Collate { expr, .. } | Expr::Cast { expr, .. } => {
-            check_index_expression_determinism(expr, site)
-        }
+        Expr::Collate { expr, .. } | Expr::Cast { expr, .. } => check_expr_with(expr, site, udf),
         Expr::SqlJsonQuery(q) => q
             .children()
             .into_iter()
-            .try_for_each(|e| check_index_expression_determinism(e, site)),
+            .try_for_each(|e| check_expr_with(e, site, udf)),
         Expr::Subscript { base, subscript } => {
-            check_index_expression_determinism(base, site)?;
+            check_expr_with(base, site, udf)?;
             match subscript {
-                ArraySubscript::Index(i) => check_index_expression_determinism(i, site),
+                ArraySubscript::Index(i) => check_expr_with(i, site, udf),
                 ArraySubscript::Slice { lo, hi } => {
                     for bound in [lo, hi].into_iter().flatten() {
-                        check_index_expression_determinism(bound, site)?;
+                        check_expr_with(bound, site, udf)?;
                     }
                     Ok(())
                 }
             }
         }
         Expr::Quantified { lhs, rhs, .. } => {
-            check_index_expression_determinism(lhs, site)?;
-            check_index_expression_determinism(rhs, site)
+            check_expr_with(lhs, site, udf)?;
+            check_expr_with(rhs, site, udf)
         }
     }
 }
@@ -366,10 +439,19 @@ pub(crate) fn check_index_expression_determinism(
 pub(crate) fn check_index_predicate_determinism(
     preds: &[WherePredicate],
 ) -> Result<(), SqlSurfaceError> {
-    preds.iter().try_for_each(check_one_predicate)
+    check_predicates_with(preds, &|_, _| {
+        Err(udf_unsupported(IndexExprSite::Predicate))
+    })
 }
 
-fn check_one_predicate(pred: &WherePredicate) -> Result<(), SqlSurfaceError> {
+fn check_predicates_with(
+    preds: &[WherePredicate],
+    udf: &UdfHook<'_>,
+) -> Result<(), SqlSurfaceError> {
+    preds.iter().try_for_each(|p| check_one_predicate(p, udf))
+}
+
+fn check_one_predicate(pred: &WherePredicate, udf: &UdfHook<'_>) -> Result<(), SqlSurfaceError> {
     let site = IndexExprSite::Predicate;
     match pred {
         // 式左辺の LIKE（SQL-54、Issue #1782）は部分索引の述語として扱えない。含意判定・索引再構築の
@@ -390,11 +472,11 @@ fn check_one_predicate(pred: &WherePredicate) -> Result<(), SqlSurfaceError> {
         | WherePredicate::InList { .. }
         | WherePredicate::Between { .. }
         | WherePredicate::IsNull { .. } => Ok(()),
-        WherePredicate::Expression(expr) => check_index_expression_determinism(expr, site),
-        WherePredicate::Not(inner) => check_one_predicate(inner),
+        WherePredicate::Expression(expr) => check_expr_with(expr, site, udf),
+        WherePredicate::Not(inner) => check_one_predicate(inner, udf),
         WherePredicate::Or(branches) => branches
             .iter()
-            .try_for_each(|branch| check_index_predicate_determinism(branch)),
+            .try_for_each(|branch| check_predicates_with(branch, udf)),
         // RLS 述語呼び出しはセッション主体に依存する。永続する索引へ埋め込ませない（P0）。
         WherePredicate::PredicateCall { .. } => Err(SqlSurfaceError::unsupported(
             "visible() is not allowed in an index predicate",
@@ -1146,6 +1228,42 @@ mod like_lhs_expr_tests {
         assert!(matches!(
             check_index_predicate_determinism(&[det]),
             Err(SqlSurfaceError::FeatureNotSupported { .. })
+        ));
+    }
+
+    /// Issue #2217: 組み込み以外の関数は、従来版では `0A000`、保留版では最初の呼び出しの手がかりを返す。
+    /// 保留より前に確定した拒否（非決定的な組み込み）は保留版でも `Err` のまま（判定順は不変）。
+    #[test]
+    fn user_function_is_rejected_by_the_classic_check_and_deferred_by_the_deferring_one() {
+        let call = Expr::Call {
+            name: "f".to_string(),
+            args: vec![Expr::Ident("a".to_string()), Expr::Number("1".to_string())],
+        };
+        assert!(matches!(
+            check_index_expression_determinism(&call, IndexExprSite::Key),
+            Err(SqlSurfaceError::FeatureNotSupported { .. })
+        ));
+        let pending = check_index_expression_determinism_deferring_udf(&call, IndexExprSite::Key)
+            .expect("deferred");
+        assert_eq!(
+            pending,
+            Some(IndexUserFunctionRef {
+                name: "f".to_string(),
+                arity: 2,
+                site: IndexExprSite::Key,
+            })
+        );
+        let nondet_first = Expr::Binary {
+            op: crate::sql::udf_call::BinOp::Add,
+            lhs: Box::new(Expr::Call {
+                name: "random".to_string(),
+                args: vec![],
+            }),
+            rhs: Box::new(call),
+        };
+        assert!(matches!(
+            check_index_expression_determinism_deferring_udf(&nondet_first, IndexExprSite::Key),
+            Err(SqlSurfaceError::InvalidObjectDefinition { .. })
         ));
     }
 }

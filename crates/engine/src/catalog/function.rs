@@ -198,6 +198,16 @@ pub(crate) struct FunctionAttributes {
     pub(crate) rows: Option<f64>,
 }
 
+impl FunctionAttributes {
+    /// 本体の書き込みを許す揮発性か（`VOLATILE` のみ）。`IMMUTABLE`／`STABLE` は PostgreSQL と同じく
+    /// 定義時には拒否せず、実行時に書き込みを `0A000` にする。#2218 が `PlCallOptions::may_write` を
+    /// 決めるとき、本体の書き込みの有無と組み合わせて使う入口（Issue #2217）。
+    #[allow(dead_code)] // 呼び出しの実行経路（#2218）が結線するまでテストからのみ呼ばれる。
+    pub(crate) fn allows_writes(&self) -> bool {
+        self.volatility == Volatility::Volatile
+    }
+}
+
 impl Default for FunctionAttributes {
     fn default() -> Self {
         Self {
@@ -232,7 +242,6 @@ const TRIGGER_TAG: &str = "trigger";
 
 impl FunctionType {
     /// 擬似型 `trigger`（`RETURNS trigger` の戻り値の位置だけに置ける。Issue #2228）。
-    #[cfg_attr(not(test), allow(dead_code))] // 作る入口は #2217（`RETURNS trigger` の受理）が結線する。
     pub(crate) fn trigger() -> Self {
         Self {
             tag: TRIGGER_TAG.to_string(),
@@ -1030,8 +1039,7 @@ impl Storage {
         list_in_txn(&rt, scope, None)
     }
 
-    /// `scope` の同名の多重定義を返す（読み取り専用）。
-    #[cfg(test)]
+    /// `scope` の同名の多重定義を返す（読み取り専用。`sql::index_udf` が式索引の判定に使う）。
     pub(crate) fn list_overloads(
         &self,
         scope: &str,

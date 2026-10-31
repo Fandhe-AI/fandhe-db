@@ -42,9 +42,10 @@ impl DropTriggerOutcome {
 
 /// `CREATE [OR REPLACE] TRIGGER` を実行する（権限・明示 Tx のゲートは呼び出し元で通過済み）。
 ///
-/// `RETURNS trigger` の PL/pgSQL 関数（#2228 が保存形式を追加）だけが成功する。SQL の `CREATE FUNCTION`
-/// が `RETURNS trigger` を受理する（#2217）までは SQL から関数を作れず、`42883`／`42P17` で止まる
-/// （`catalog::trigger::returns_trigger`。fail-closed）。成功経路は Storage 水準のテストで固定している。
+/// `RETURNS trigger` の PL/pgSQL 関数（#2228 が保存形式を追加し、#2217 が SQL の
+/// `CREATE FUNCTION ... RETURNS trigger LANGUAGE plpgsql` の受理で作れるようにした）だけが成功する。
+/// それ以外は `42883`／`42P17` で止まる（`catalog::trigger::returns_trigger`。fail-closed）。
+/// 発火側の本番 invoker は #1720 が結線するまで未結線で、該当表への DML は `0A000` で止まる。
 pub(crate) fn execute_create_trigger(
     storage: &Storage,
     tenant_id: &str,
