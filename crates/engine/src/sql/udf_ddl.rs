@@ -22,10 +22,11 @@ use crate::catalog::function::{
 };
 use crate::catalog::CatalogError;
 use crate::sql::allowlist::{DropFunctionBehavior, SqlSurfaceError, ValidatedDropFunction};
+use crate::sql::cast::CastType;
 use crate::sql::mode::SessionState;
 use crate::sql::udf_call::{
-    body_reaches_function, commit_function_definition, prepare_function_definition,
-    prepare_function_replacement, PreparedUdf,
+    body_reaches_function, commit_function_definition, prepare_function_replacement,
+    prepare_function_with_signature, PreparedUdf,
 };
 use crate::storage::Storage;
 
@@ -46,27 +47,65 @@ impl DropFunctionOutcome {
     }
 }
 
+/// UDF シグネチャの型（[`CastType`]）をカタログの保存値へ写す（Issue #2798。SQL-66）。
+/// 作成時の検証（`expr_type()` が `Some`）を通った型だけが来る前提で、写せなければ固定文言の
+/// `0A000`（fail-closed）。修飾子なしの `numeric` は `result_column_type` が返す正規の
+/// `numeric(38,16)` として保存し、ロード側の [`udf_cast_from_function_type`] が `Numeric(None)` へ戻す。
+pub(crate) fn function_type_from_udf_cast(ty: &CastType) -> Result<FunctionType, SqlSurfaceError> {
+    let unsupported =
+        || SqlSurfaceError::feature_not_supported("function type cannot be persisted");
+    if ty.expr_type().is_none() {
+        return Err(unsupported());
+    }
+    let column = ty.result_column_type().ok_or_else(unsupported)?;
+    FunctionType::from_column_type(&column).map_err(|_| unsupported())
+}
+
+/// カタログの保存値を UDF シグネチャの型へ戻す（ロード経路用。Issue #2798）。
+/// 書き込み経路が作る正規形（[`function_type_from_udf_cast`] の出力）に往復一致する値だけを `Some` にし、
+/// それ以外（`varchar(n)`・`numeric(p,s)`・`bpchar`・`vector`・ENUM・式型の無い配列など）は黙って補正せず
+/// `None` とする。呼び出し側はその定義だけを skip する（fail-closed）。
+pub(crate) fn udf_cast_from_function_type(ft: &FunctionType) -> Option<CastType> {
+    let column = ft.to_column_type().ok()?;
+    let cast = match crate::sql::cast::cast_type_of_column(&column)? {
+        CastType::Numeric(Some(_)) => CastType::Numeric(None),
+        // 構文段が `varchar(n)` を修飾子なしへ正規化するため、長さつきの行は本番経路では書かれない。
+        CastType::Varchar(Some(_)) | CastType::Bpchar(_) => return None,
+        other => other,
+    };
+    (function_type_from_udf_cast(&cast).ok().as_ref() == Some(ft)).then_some(cast)
+}
+
 /// カタログへ書く [`FunctionDef`] を検証済みの定義から組み立てる（`CREATE`・`OR REPLACE` 共通）。
-/// 型注釈つき・RETURNS つきは呼び出し側（`core.rs`）が永続化の前に `0A000` で拒否済みのため、
-/// ここでは型なし・戻り値型なしだけを扱う。
-fn catalog_def_from_prepared(prepared: &PreparedUdf, body_source: &str) -> FunctionDef {
-    FunctionDef {
+/// 型注釈・RETURNS は保存値へ写す（Issue #2798）。
+fn catalog_def_from_prepared(
+    prepared: &PreparedUdf,
+    body_source: &str,
+) -> Result<FunctionDef, SqlSurfaceError> {
+    let params = prepared
+        .params
+        .iter()
+        .zip(prepared.param_types.iter())
+        .map(|(p, ty)| {
+            Ok(FunctionParam {
+                name: Some(p.clone()),
+                ty: ty.as_ref().map(function_type_from_udf_cast).transpose()?,
+            })
+        })
+        .collect::<Result<Vec<_>, SqlSurfaceError>>()?;
+    Ok(FunctionDef {
         id: 1,
         function_key: prepared.key.clone(),
-        // 引数の型注釈は未対応（宣言的 UDF〔SQL-9〕は型なし）。型付き引数は #1915 が足す。
-        params: prepared
-            .params
-            .iter()
-            .map(|p| FunctionParam {
-                name: Some(p.clone()),
-                ty: None::<FunctionType>,
-            })
-            .collect(),
-        return_type: None,
+        params,
+        return_type: prepared
+            .return_type
+            .as_ref()
+            .map(function_type_from_udf_cast)
+            .transpose()?,
         language: FunctionLanguage::Declarative,
         body_source: body_source.to_string(),
         attrs: FunctionAttributes::default(),
-    }
+    })
 }
 
 /// 永続定義がセッション限定の関数（カタログ由来でない宣言的 UDF・WASM UDF）へ直接・推移的に依存する
@@ -89,7 +128,7 @@ fn reject_session_local_dependency(
 ///
 /// `max_functions` は起動時設定の件数上限（Issue #1922。ハード上限で飽和される）。
 ///
-/// 判定順は [`prepare_function_definition`]（予約名・識別子・引数・閉じた本体。セッションの重複
+/// 判定順は [`prepare_function_with_signature`]（予約名・識別子・引数・閉じた本体。セッションの重複
 /// `42723` を含む）→ [`Storage::create_function`]（同名の定義があれば `42723`・件数上限 `54000`）→
 /// セッションへの登録。
 #[allow(clippy::too_many_arguments)]
@@ -99,13 +138,22 @@ pub(crate) fn execute_create_function_persistent(
     session: &mut SessionState,
     name: &str,
     params: &[String],
+    param_types: &[Option<CastType>],
+    return_type: Option<&CastType>,
     body: &crate::sql::udf_call::Expr,
     body_source: &str,
     max_functions: usize,
 ) -> Result<(), SqlSurfaceError> {
-    let prepared = prepare_function_definition(session.udfs(), name, params, body)?;
+    let prepared = prepare_function_with_signature(
+        session.udfs(),
+        name,
+        params,
+        param_types,
+        return_type,
+        body,
+    )?;
     reject_session_local_dependency(session, &prepared.body)?;
-    let def = catalog_def_from_prepared(&prepared, body_source);
+    let def = catalog_def_from_prepared(&prepared, body_source)?;
     storage
         .create_function_with_limit(tenant_id, &def, max_functions)
         .map_err(map_function_error)?;
@@ -129,23 +177,24 @@ pub(crate) fn execute_create_or_replace_function_persistent(
     session: &mut SessionState,
     name: &str,
     params: &[String],
+    param_types: &[Option<CastType>],
+    return_type: Option<&CastType>,
     body: &crate::sql::udf_call::Expr,
     body_source: &str,
     max_functions: usize,
 ) -> Result<(), SqlSurfaceError> {
-    let untyped = vec![None; params.len()];
     let prepared = prepare_function_replacement(
         session.udfs(),
         name,
         params,
-        &untyped,
-        None,
+        param_types,
+        return_type,
         body,
         true,
         None,
     )?;
     reject_session_local_dependency(session, &prepared.body)?;
-    let def = catalog_def_from_prepared(&prepared, body_source);
+    let def = catalog_def_from_prepared(&prepared, body_source)?;
     // 循環検査はセッションのレジストリ（古い可能性がある）ではなく、write txn 内の最新カタログで
     // 再度行う（並行する別セッションの置換との合成で循環が残るのを防ぐ）。
     let target = prepared.key.to_ascii_lowercase();
@@ -201,14 +250,14 @@ pub(crate) fn execute_drop_function(
     crate::sql::ddl::require_ddl_permission(session)?;
     let mut removed = false;
     removed |= drop_from_catalog(storage, tenant_id, stmt)?;
-    // 型の並びがある場合、セッション内の定義（型注釈なし）は引数の数で照合する。
+    // 型の並びがある場合、セッション内の定義は引数の数と（型注釈のある引数の）型で照合する。
     // WASM UDF は (vector, scalar) の固定 2 引数なので、同じ名前空間を共有する
     // `UdfRegistry::remove` が両表を消す設計に合わせて判定にも含める。
     let session_match = {
         let udfs = session.udfs();
         let arity_ok = |n: usize| stmt.arg_types.as_ref().is_none_or(|types| types.len() == n);
         udfs.get(&stmt.name)
-            .is_some_and(|d| arity_ok(d.params.len()))
+            .is_some_and(|d| arity_ok(d.params.len()) && session_types_match(d, stmt))
             || udfs.get_wasm(&stmt.name).is_some_and(|_| arity_ok(2))
     };
     if session_match {
@@ -223,6 +272,31 @@ pub(crate) fn execute_drop_function(
             "function does not exist",
         ))
     }
+}
+
+/// セッション内の定義の型注釈が `DROP FUNCTION` の型の並びと一致するか（Issue #2798）。カタログ側の
+/// 照合（[`drop_from_catalog`]）と同じ規則: 型の並びが無い・型注釈なしの引数は任意の型に一致し、
+/// 型注釈のある引数は同一性トークン（typmod を落とした形）で比べる。不一致は不在と同じ扱いにするため、
+/// カタログに無い定義だけがレジストリから消えて成功応答になる食い違いを防ぐ。
+fn session_types_match(
+    def: &crate::sql::udf_call::UdfDefinition,
+    stmt: &ValidatedDropFunction,
+) -> bool {
+    let Some(types) = &stmt.arg_types else {
+        return true;
+    };
+    def.param_types.iter().zip(types).all(|(declared, want)| {
+        let Some(declared) = declared else {
+            return true;
+        };
+        let (Ok(have), Ok(want)) = (
+            function_type_from_udf_cast(declared),
+            FunctionType::from_column_type(want),
+        ) else {
+            return false;
+        };
+        have.identity_token() == want.identity_token()
+    })
 }
 
 /// カタログから削除し、削除したら `true`。型付きの場合も照合と削除は同一 write txn で行う。
@@ -312,6 +386,7 @@ fn map_function_error(e: CatalogError) -> SqlSurfaceError {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::sql::udf_call::prepare_function_definition;
 
     fn parse_body(src: &str) -> crate::sql::udf_call::Expr {
         let tokens = crate::sql::lexer::tokenize_rendered(src).expect("tokens");
@@ -337,14 +412,20 @@ mod tests {
         let _ = &mut seed;
         let prepared_f = prepare_function_definition(a.udfs(), "f", &p, &body_x).expect("f");
         storage
-            .create_function("t", &catalog_def_from_prepared(&prepared_f, "x"))
+            .create_function(
+                "t",
+                &catalog_def_from_prepared(&prepared_f, "x").expect("def"),
+            )
             .expect("create f");
         commit_function_definition(a.udfs_mut(), prepared_f);
         // 実運用ではカタログ由来のロード・永続化が印を付ける（付けないとセッション限定の依存として拒否される）。
         a.udfs_mut().mark_catalog_origin("f");
         let prepared_g = prepare_function_definition(a.udfs(), "g", &p, &body_x).expect("g");
         storage
-            .create_function("t", &catalog_def_from_prepared(&prepared_g, "x"))
+            .create_function(
+                "t",
+                &catalog_def_from_prepared(&prepared_g, "x").expect("def"),
+            )
             .expect("create g");
         commit_function_definition(a.udfs_mut(), prepared_g);
         a.udfs_mut().mark_catalog_origin("g");
@@ -359,6 +440,8 @@ mod tests {
             &mut a,
             "f",
             &p,
+            &[None],
+            None,
             &parse_body("g(x)"),
             "g ( x )",
             crate::catalog::function::MAX_FUNCTIONS,
@@ -371,6 +454,8 @@ mod tests {
             &mut b,
             "g",
             &p,
+            &[None],
+            None,
             &parse_body("f(x)"),
             "f ( x )",
             crate::catalog::function::MAX_FUNCTIONS,
@@ -413,5 +498,79 @@ mod tests {
         let corrupt = map_function_error(CatalogError::CorruptSchema("secret #1.f".to_string()));
         assert_eq!(corrupt.wire_code(), "XX000");
         assert!(!corrupt.client_message().contains("secret"));
+    }
+
+    /// SQL-66・#2798: UDF シグネチャで受理される型は保存値を経て元の型へ往復一致する
+    /// （修飾子なしの numeric は正規の `numeric(38,16)` で保存され `Numeric(None)` へ戻る）。
+    #[test]
+    fn udf_signature_types_round_trip_through_catalog_values() {
+        let types = [
+            CastType::Int2,
+            CastType::Int4,
+            CastType::Int8,
+            CastType::Float4,
+            CastType::Float8,
+            CastType::Numeric(None),
+            CastType::Bool,
+            CastType::Text,
+            CastType::Varchar(None),
+            CastType::Date,
+            CastType::Time,
+            CastType::Timestamp,
+            CastType::TimestampTz,
+            CastType::Interval,
+            CastType::Json,
+            CastType::Jsonb,
+            CastType::Uuid,
+            CastType::Bytea,
+            CastType::Array(Box::new(CastType::Int4)),
+            CastType::Array(Box::new(CastType::Text)),
+        ];
+        for ty in types {
+            let ft = function_type_from_udf_cast(&ty).unwrap_or_else(|e| panic!("{ty:?}: {e}"));
+            assert_eq!(udf_cast_from_function_type(&ft), Some(ty.clone()), "{ty:?}");
+        }
+    }
+
+    /// SQL-66・#2798: 正規形に往復しない保存値は黙って補正せず `None`（呼び出し側がその定義を skip する）。
+    #[test]
+    fn non_canonical_stored_types_are_not_restored() {
+        use crate::catalog::ColumnType;
+        let cols = [
+            ColumnType::Numeric {
+                precision: 10,
+                scale: 2,
+            },
+            ColumnType::Varchar(Some(5)),
+            ColumnType::Bpchar(3),
+        ];
+        for c in cols {
+            let ft = FunctionType::from_column_type(&c).expect("ft");
+            assert_eq!(udf_cast_from_function_type(&ft), None, "{c:?}");
+        }
+    }
+
+    /// SQL-66・#2798: 型付き・RETURNS つきの定義がカタログの保存値へ写る。
+    #[test]
+    fn catalog_def_carries_param_and_return_types() {
+        let reg = crate::sql::udf_call::UdfRegistry::default();
+        let prepared = prepare_function_with_signature(
+            &reg,
+            "f",
+            &["x".to_string()],
+            &[Some(CastType::Int4)],
+            Some(&CastType::Int8),
+            &parse_body("x + 1"),
+        )
+        .expect("prepare");
+        let def = catalog_def_from_prepared(&prepared, "x + 1").expect("def");
+        assert_eq!(
+            def.params[0].ty.as_ref().map(FunctionType::identity_token),
+            Some("integer".to_string())
+        );
+        assert_eq!(
+            def.return_type.as_ref().map(FunctionType::identity_token),
+            Some("bigint".to_string())
+        );
     }
 }

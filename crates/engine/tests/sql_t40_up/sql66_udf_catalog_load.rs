@@ -251,3 +251,123 @@ fn refresh_with_other_tenant_drops_catalog_entries() {
     core.refresh_session_udfs(&ctx("bob"), &mut s);
     assert_eq!(code(&core, "alice", &mut s, CALL_DBL), "42883");
 }
+/// SQL-66・#2798: 型付き引数と RETURNS つきの関数が再オープン後の新しいセッション（DDL 権限の有無を
+/// 問わない）で呼べる。引数 0 個の RETURNS・text・配列・numeric の定義も永続化される。
+#[test]
+fn typed_function_with_returns_survives_reopen() {
+    let path = unique_db_path("sql66-load-typed-reopen");
+    let _g = CleanupGuard(path.clone());
+    {
+        let core = open(&path);
+        let mut s = ddl_session();
+        setup_table(&core, "alice", &mut s);
+        for sql in [
+            "CREATE FUNCTION inc(x integer) RETURNS bigint AS x + 1",
+            "CREATE FUNCTION seven() RETURNS integer AS 7",
+            "CREATE FUNCTION shout(x text) RETURNS text AS upper(x)",
+            "CREATE FUNCTION num(x numeric) AS x",
+        ] {
+            ok(&core, "alice", &mut s, sql);
+        }
+    }
+    let core = open(&path);
+    for ddl in [true, false] {
+        let mut s = loaded(&core, "alice", ddl);
+        assert!(call(&core, "alice", &mut s, "SELECT inc(n) AS d FROM t LIMIT 1").contains('6'));
+        assert!(call(&core, "alice", &mut s, "SELECT seven() AS d FROM t LIMIT 1").contains('7'));
+        assert!(call(
+            &core,
+            "alice",
+            &mut s,
+            "SELECT shout('ab') AS d FROM t LIMIT 1"
+        )
+        .contains("AB"));
+        // 型が復元されている証拠: 型違いの引数は黙って受理されない。
+        assert!(run(
+            &core,
+            "alice",
+            &mut s,
+            "SELECT inc('abc') AS d FROM t LIMIT 1"
+        )
+        .is_err());
+    }
+    let mut s = loaded(&core, "alice", true);
+    assert_eq!(
+        code(
+            &core,
+            "alice",
+            &mut s,
+            "CREATE FUNCTION num(x numeric) AS x"
+        ),
+        "42723"
+    );
+}
+
+/// SQL-66・#2798: 型付き DROP は型が一致するときだけ消える（不一致は 42883 で行もセッション登録も残る）。
+#[test]
+fn typed_drop_requires_matching_types() {
+    let path = unique_db_path("sql66-load-typed-drop");
+    let _g = CleanupGuard(path.clone());
+    let core = open(&path);
+    let mut s = ddl_session();
+    setup_table(&core, "alice", &mut s);
+    ok(
+        &core,
+        "alice",
+        &mut s,
+        "CREATE FUNCTION inc(x integer) RETURNS integer AS x + 1",
+    );
+    assert_eq!(
+        code(&core, "alice", &mut s, "DROP FUNCTION inc(text)"),
+        "42883"
+    );
+    assert!(call(&core, "alice", &mut s, "SELECT inc(n) AS d FROM t LIMIT 1").contains('6'));
+    let mut other = loaded(&core, "alice", false);
+    assert!(call(
+        &core,
+        "alice",
+        &mut other,
+        "SELECT inc(n) AS d FROM t LIMIT 1"
+    )
+    .contains('6'));
+    ok(&core, "alice", &mut s, "DROP FUNCTION inc(integer)");
+    assert_eq!(
+        code(&core, "alice", &mut s, "SELECT inc(n) AS d FROM t LIMIT 1"),
+        "42883"
+    );
+}
+
+/// SQL-66・RLS-12・#2798: 型付き関数は他テナントに見えず、他セッションの作成が refresh で反映され、
+/// カタログ由来の型付き関数は権限の無いセッションから DROP できない（42501）。
+#[test]
+fn typed_function_respects_tenant_and_privilege_boundaries() {
+    let path = unique_db_path("sql66-load-typed-boundary");
+    let _g = CleanupGuard(path.clone());
+    let core = open(&path);
+    let mut a = ddl_session();
+    setup_table(&core, "alice", &mut a);
+    let mut reader = loaded(&core, "alice", false);
+    ok(
+        &core,
+        "alice",
+        &mut a,
+        "CREATE FUNCTION inc(x integer) RETURNS integer AS x + 1",
+    );
+    core.refresh_session_udfs(&ctx("alice"), &mut reader);
+    assert!(call(
+        &core,
+        "alice",
+        &mut reader,
+        "SELECT inc(n) AS d FROM t LIMIT 1"
+    )
+    .contains('6'));
+    assert_eq!(
+        code(&core, "alice", &mut reader, "DROP FUNCTION inc(integer)"),
+        "42501"
+    );
+    let mut bob = loaded(&core, "bob", true);
+    assert_eq!(
+        code(&core, "bob", &mut bob, "SELECT inc(n) AS d FROM t LIMIT 1"),
+        "42883"
+    );
+}

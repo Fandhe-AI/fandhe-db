@@ -9130,12 +9130,13 @@ impl EngineCore {
             // セッションは保存先の振り分けより前に `42501`（セッション限定の登録経路は無い。
             // 型付き引数・RETURNS の永続化は #2798。docs/design/udf-catalog.md）。
             //
-            // Issue #1915（SQL-66 (1)）: 型注釈つきの定義は、カタログへの型の永続化とロード側の
-            // 復元（`udf_load` は型注釈つきの行を読み飛ばす）が揃う（#2798）まで、カタログへ書かず
-            // セッション限定のレジストリにだけ登録する（上の暫定経路）。
+            // Issue #1915・#1916・#2798（SQL-66 (1)）: 型注釈・RETURNS つきの定義も同じ永続化経路で
+            // カタログへ書く（検証は非 DDL セッションと同じ prepare で行うため `42P13`・`0A000` の
+            // 結果は権限によらず一致する）。ロード側は書き込み経路の正規形の型だけを復元し、
+            // それ以外の行は定義単位で読み飛ばす（`udf_load`）。
             //
             // Issue #1917（SQL-66 (2)）: `CREATE OR REPLACE FUNCTION` は同じ分岐で `or_replace` により
-            // 置換経路（`prepare_function_replacement`）へ切り替える。`42P13` などの順序は `CREATE` と同じ。
+            // 置換経路（`prepare_function_replacement`）へ切り替える。
             crate::sql::allowlist::Statement::CreateFunction {
                 or_replace,
                 name,
@@ -9184,6 +9185,8 @@ impl EngineCore {
                             session,
                             &name,
                             &params,
+                            &param_types,
+                            return_type.as_ref(),
                             &body,
                             &body_source,
                             self.function_limits.max_functions(),
@@ -9195,6 +9198,8 @@ impl EngineCore {
                             session,
                             &name,
                             &params,
+                            &param_types,
+                            return_type.as_ref(),
                             &body,
                             &body_source,
                             self.function_limits.max_functions(),

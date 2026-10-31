@@ -291,12 +291,13 @@ fn nested_returns_call_has_static_type() {
     );
 }
 
-/// 権限ありセッションの RETURNS 付き定義は、本体の型検査（不一致は 42P13）を通ればセッション限定に
-/// 登録される（カタログへは書かない。#2798 まで）。別の DDL セッションからは見えない。
+/// SQL-66・#2798: DDL セッションでも非 DDL セッションと同じ検証（`42P13`）を通り、通った定義は
+/// カタログへ永続化される（同名の再作成は `42723`）。検証に失敗した定義は何も書かない。
 #[test]
-fn ddl_session_validates_then_registers_session_only() {
+fn ddl_session_validates_then_persists() {
     let (core, _g) = new_core("sql66r-ddl");
-    let mut s = ddl_session();
+    let mut s = SessionState::default();
+    s.allow_ddl();
     assert_eq!(
         code(
             &core,
@@ -304,6 +305,19 @@ fn ddl_session_validates_then_registers_session_only() {
             "CREATE FUNCTION f(x integer) RETURNS boolean AS x + 1"
         ),
         "42P13"
+    );
+    define(
+        &core,
+        &mut s,
+        "CREATE FUNCTION f(x integer) RETURNS integer AS x + 1",
+    );
+    assert_eq!(
+        code(
+            &core,
+            &mut s,
+            "CREATE FUNCTION f(x integer) RETURNS integer AS x + 2"
+        ),
+        "42723"
     );
     define(
         &core,

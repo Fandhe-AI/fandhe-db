@@ -2669,15 +2669,15 @@ pub(crate) fn define_function_with_signature_capped(
     body: &Expr,
     max_functions: usize,
 ) -> Result<(), SqlSurfaceError> {
-    let prepared = prepare_function_with_signature(
+    let prepared = prepare_function_with_signature_inner(
         registry,
         name,
         params,
         param_types,
         return_type,
         body,
-        Some(max_functions),
         true,
+        Some(max_functions),
     )?;
     commit_function_definition(registry, prepared);
     Ok(())
@@ -2688,17 +2688,59 @@ pub(crate) fn define_function_with_signature_capped(
 ///
 /// 件数の検査は `check_capacity`（新規作成のときだけ `true`。既存定義の置換は件数を増やさないため
 /// 省略する。Issue #1922）と `local_limit`（セッション限定の定義数に対する設定上限。`None` は
-/// 設定上限なし = カタログ経路）で制御する。
-#[allow(clippy::too_many_arguments)]
-fn prepare_function_with_signature(
+/// 設定上限なし = カタログ経路）で制御する。本関数は新規作成・設定上限なしの検証（カタログ経路）。
+pub(crate) fn prepare_function_with_signature(
     registry: &UdfRegistry,
     name: &str,
     params: &[String],
     param_types: &[Option<crate::sql::cast::CastType>],
     return_type: Option<&crate::sql::cast::CastType>,
     body: &Expr,
-    local_limit: Option<usize>,
+) -> Result<PreparedUdf, SqlSurfaceError> {
+    prepare_function_with_signature_inner(
+        registry,
+        name,
+        params,
+        param_types,
+        return_type,
+        body,
+        true,
+        None,
+    )
+}
+
+/// [`prepare_function_with_signature`] からレジストリ容量の上限だけを無視した版。UDF カタログのロード
+/// （`sql::udf_load`）が「容量による一時的なブロック」と「恒久的にロード不能」を区別するために使う。
+pub(crate) fn prepare_function_with_signature_ignoring_capacity(
+    registry: &UdfRegistry,
+    name: &str,
+    params: &[String],
+    param_types: &[Option<crate::sql::cast::CastType>],
+    return_type: Option<&crate::sql::cast::CastType>,
+    body: &Expr,
+) -> Result<PreparedUdf, SqlSurfaceError> {
+    prepare_function_with_signature_inner(
+        registry,
+        name,
+        params,
+        param_types,
+        return_type,
+        body,
+        false,
+        None,
+    )
+}
+
+#[allow(clippy::too_many_arguments)]
+fn prepare_function_with_signature_inner(
+    registry: &UdfRegistry,
+    name: &str,
+    params: &[String],
+    param_types: &[Option<crate::sql::cast::CastType>],
+    return_type: Option<&crate::sql::cast::CastType>,
+    body: &Expr,
     check_capacity: bool,
+    local_limit: Option<usize>,
 ) -> Result<PreparedUdf, SqlSurfaceError> {
     if param_types.len() != params.len() {
         return Err(SqlSurfaceError::unsupported(
@@ -2785,15 +2827,15 @@ pub(crate) fn prepare_function_replacement(
         )));
     }
     let Some(old) = registry.defs.get(&lower) else {
-        return prepare_function_with_signature(
+        return prepare_function_with_signature_inner(
             registry,
             name,
             params,
             param_types,
             return_type,
             body,
-            local_limit,
             true,
+            local_limit,
         );
     };
     let normalized: Vec<String> = params.iter().map(|p| p.to_ascii_lowercase()).collect();
@@ -2825,15 +2867,15 @@ pub(crate) fn prepare_function_replacement(
     }
     let mut probe = registry.clone();
     probe.remove(&lower);
-    let prepared = prepare_function_with_signature(
+    let prepared = prepare_function_with_signature_inner(
         &probe,
         name,
         params,
         param_types,
         return_type,
         body,
-        local_limit,
         false,
+        local_limit,
     )?;
     Ok(prepared)
 }
@@ -3217,8 +3259,10 @@ pub(crate) struct PreparedUdf {
     pub(crate) body: Expr,
 }
 
-/// [`define_function`] の検証部（レジストリは変更しない）。永続化経路が「検証 → カタログ書き込み →
+/// [`define_function`] の検証部（レジストリは変更しない。型なし専用。本番経路は
+/// [`prepare_function_with_signature`] に統一済みで、単体テストの補助として残す）。永続化経路が「検証 → カタログ書き込み →
 /// 登録」の順を守れるよう、検証と登録（[`commit_function_definition`]）を分けている。
+#[cfg(test)]
 pub(crate) fn prepare_function_definition(
     registry: &UdfRegistry,
     name: &str,
@@ -3226,17 +3270,6 @@ pub(crate) fn prepare_function_definition(
     body: &Expr,
 ) -> Result<PreparedUdf, SqlSurfaceError> {
     prepare_function_definition_inner(registry, name, params, body, Some(MAX_SESSION_UDFS), None)
-}
-
-/// レジストリ容量の上限だけを無視して登録可否を検査する（UDF カタログロードが「容量による一時的な
-/// ブロック」と「恒久的にロード不能（呼び出し先の消失・予約名など）」を区別するために使う）。
-pub(crate) fn prepare_function_definition_ignoring_capacity(
-    registry: &UdfRegistry,
-    name: &str,
-    params: &[String],
-    body: &Expr,
-) -> Result<PreparedUdf, SqlSurfaceError> {
-    prepare_function_definition_inner(registry, name, params, body, None, None)
 }
 
 fn prepare_function_definition_inner(

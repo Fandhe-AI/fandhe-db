@@ -553,10 +553,10 @@ fn replace_inside_explicit_transaction_is_rejected_for_ddl_sessions() {
         .expect("rollback");
 }
 
-/// 権限ありセッションの型付き・RETURNS つきの OR REPLACE は、対象が無ければ新規作成になり、CREATE と
-/// 同じくカタログへ書かずセッション限定に登録される（#2798 まで）。別セッションからは見えない。
+/// SQL-66・#2798: DDL セッションの型付き・RETURNS つきの OR REPLACE は永続化される。
+/// 同じシグネチャなら置換でき、戻り値型の変更・RETURNS の有無の変更は 42P13、引数の型の変更は 42723。
 #[test]
-fn replace_with_typed_signature_is_session_only_in_ddl_sessions() {
+fn replace_with_typed_signature_is_persisted_in_ddl_sessions() {
     let path = unique_db_path("sql66-dr-replace-typed-ddl");
     let _g = CleanupGuard(path.clone());
     let core = open(&path);
@@ -565,13 +565,40 @@ fn replace_with_typed_signature_is_session_only_in_ddl_sessions() {
         &core,
         "alice",
         &mut s,
-        "CREATE OR REPLACE FUNCTION tf(x integer) AS x",
+        "CREATE FUNCTION tf(x integer) RETURNS integer AS x",
     );
     ok(
         &core,
         "alice",
         &mut s,
-        "CREATE OR REPLACE FUNCTION tr(x integer) RETURNS integer AS x",
+        "CREATE OR REPLACE FUNCTION tf(x integer) RETURNS integer AS x + 1",
+    );
+    assert_eq!(
+        code(
+            &core,
+            "alice",
+            &mut s,
+            "CREATE OR REPLACE FUNCTION tf(x integer) RETURNS bigint AS x"
+        ),
+        "42P13"
+    );
+    assert_eq!(
+        code(
+            &core,
+            "alice",
+            &mut s,
+            "CREATE OR REPLACE FUNCTION tf(x integer) AS x"
+        ),
+        "42P13"
+    );
+    assert_eq!(
+        code(
+            &core,
+            "alice",
+            &mut s,
+            "CREATE OR REPLACE FUNCTION tf(x text) RETURNS text AS x"
+        ),
+        "42723"
     );
     let mut other = loaded(&core, "alice", true);
     for name in ["tf", "tr"] {

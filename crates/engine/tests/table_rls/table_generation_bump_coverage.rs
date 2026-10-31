@@ -560,7 +560,10 @@ const ALLOWLIST: &[(&str, u32)] = &[
     ("catalog/function.rs", 1070),
     // Issue #1921: commit 後の世代（UDF カタログ）追加による行移動の追随。`sql/udf_load.rs` の 1 件は
     // `#[cfg(test)]` 内で壊れた定義 blob を直接書くテスト補助（関数カタログ表だけを書き、世代の対象外）。
-    ("sql/udf_load.rs", 230),
+    // Issue #2798（型付き永続化の単体テスト追加）で行番号が移動したための追随（旧: 230）。
+    ("sql/udf_load.rs", 272),
+    // 同上（#2798 で追加した未知バージョン blob を直接書く単体テスト補助。関数カタログ表だけを書く）。
+    ("sql/udf_load.rs", 474),
     // Issue #1920: 上の `#[cfg(test)]` 内のテスト補助（多重定義・SCHEMA 接頭辞削除の状態を直接作る）。
     ("catalog/function.rs", 1517),
     ("catalog/function.rs", 1729),
