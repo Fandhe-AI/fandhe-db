@@ -2649,13 +2649,54 @@ pub fn define_function_with_signature(
 
 /// [`define_function_with_signature`] の検証部（レジストリは変更しない）。`CREATE FUNCTION` と
 /// `CREATE OR REPLACE FUNCTION`（[`prepare_function_replacement`]）が共有する。
-fn prepare_function_with_signature(
+pub(crate) fn prepare_function_with_signature(
     registry: &UdfRegistry,
     name: &str,
     params: &[String],
     param_types: &[Option<crate::sql::cast::CastType>],
     return_type: Option<&crate::sql::cast::CastType>,
     body: &Expr,
+) -> Result<PreparedUdf, SqlSurfaceError> {
+    prepare_function_with_signature_inner(
+        registry,
+        name,
+        params,
+        param_types,
+        return_type,
+        body,
+        true,
+    )
+}
+
+/// [`prepare_function_with_signature`] からレジストリ容量の上限だけを無視した版。UDF カタログのロード
+/// （`sql::udf_load`）が「容量による一時的なブロック」と「恒久的にロード不能」を区別するために使う。
+pub(crate) fn prepare_function_with_signature_ignoring_capacity(
+    registry: &UdfRegistry,
+    name: &str,
+    params: &[String],
+    param_types: &[Option<crate::sql::cast::CastType>],
+    return_type: Option<&crate::sql::cast::CastType>,
+    body: &Expr,
+) -> Result<PreparedUdf, SqlSurfaceError> {
+    prepare_function_with_signature_inner(
+        registry,
+        name,
+        params,
+        param_types,
+        return_type,
+        body,
+        false,
+    )
+}
+
+fn prepare_function_with_signature_inner(
+    registry: &UdfRegistry,
+    name: &str,
+    params: &[String],
+    param_types: &[Option<crate::sql::cast::CastType>],
+    return_type: Option<&crate::sql::cast::CastType>,
+    body: &Expr,
+    check_capacity: bool,
 ) -> Result<PreparedUdf, SqlSurfaceError> {
     if param_types.len() != params.len() {
         return Err(SqlSurfaceError::unsupported(
@@ -2670,7 +2711,8 @@ fn prepare_function_with_signature(
             )));
         }
     }
-    let mut prepared = prepare_function_definition(registry, name, params, body)?;
+    let mut prepared =
+        prepare_function_definition_inner(registry, name, params, body, check_capacity)?;
     prepared.param_types = param_types.to_vec();
     if let Some(ret) = return_type {
         if ret.expr_type().is_none() {
@@ -3061,8 +3103,10 @@ pub(crate) struct PreparedUdf {
     pub(crate) body: Expr,
 }
 
-/// [`define_function`] の検証部（レジストリは変更しない）。永続化経路が「検証 → カタログ書き込み →
+/// [`define_function`] の検証部（レジストリは変更しない。型なし専用。本番経路は
+/// [`prepare_function_with_signature`] に統一済みで、単体テストの補助として残す）。永続化経路が「検証 → カタログ書き込み →
 /// 登録」の順を守れるよう、検証と登録（[`commit_function_definition`]）を分けている。
+#[cfg(test)]
 pub(crate) fn prepare_function_definition(
     registry: &UdfRegistry,
     name: &str,
@@ -3070,17 +3114,6 @@ pub(crate) fn prepare_function_definition(
     body: &Expr,
 ) -> Result<PreparedUdf, SqlSurfaceError> {
     prepare_function_definition_inner(registry, name, params, body, true)
-}
-
-/// レジストリ容量の上限だけを無視して登録可否を検査する（UDF カタログロードが「容量による一時的な
-/// ブロック」と「恒久的にロード不能（呼び出し先の消失・予約名など）」を区別するために使う）。
-pub(crate) fn prepare_function_definition_ignoring_capacity(
-    registry: &UdfRegistry,
-    name: &str,
-    params: &[String],
-    body: &Expr,
-) -> Result<PreparedUdf, SqlSurfaceError> {
-    prepare_function_definition_inner(registry, name, params, body, false)
 }
 
 fn prepare_function_definition_inner(

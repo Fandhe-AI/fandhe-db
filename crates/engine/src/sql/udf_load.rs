@@ -19,11 +19,13 @@
 
 use crate::catalog::function::{FunctionDef, FunctionLanguage, MAX_FUNCTIONS};
 use crate::sql::allowlist::{parse_stored_function_body, SqlSurfaceError};
+use crate::sql::cast::CastType;
 use crate::sql::udf_call::{
-    commit_function_definition, prepare_function_definition,
-    prepare_function_definition_ignoring_capacity, MAX_SESSION_UDFS,
+    commit_function_definition, prepare_function_with_signature,
+    prepare_function_with_signature_ignoring_capacity, MAX_SESSION_UDFS,
 };
 use crate::sql::udf_call::{Expr, UdfRegistry};
+use crate::sql::udf_ddl::udf_cast_from_function_type;
 use crate::storage::Storage;
 
 /// refresh に失敗したセッションが次回必ず再試行するための世代（実在の世代と一致しない値）。
@@ -36,21 +38,52 @@ fn load_failed() -> SqlSurfaceError {
     }
 }
 
-/// レジストリ（宣言的 UDF）で表せる形か。型注釈・戻り値型・言語付きの行は後続の機能（#2215 等）が
-/// 書くため、宣言的 UDF として誤ってロードしない。
-fn representable(def: &FunctionDef) -> bool {
-    def.language == FunctionLanguage::Declarative
-        && def.return_type.is_none()
-        && def
-            .params
-            .iter()
-            .all(|p| p.ty.is_none() && p.name.is_some())
+/// 登録待ちへ復元した宣言的 UDF のシグネチャ（引数名・引数型・戻り値型）。
+type Signature = (Vec<String>, Vec<Option<CastType>>, Option<CastType>);
+
+/// レジストリ（宣言的 UDF）で表せる形か。表せれば引数名・型注釈・戻り値型を復元して返す
+/// （Issue #2798。書き込み経路が作る正規形の型だけを受理し、`udf_cast_from_function_type` で
+/// 往復一致しない型・型注釈の混在・型なし引数つきの RETURNS・宣言的でない言語の行は `None`＝その
+/// 定義だけ skip する。構文段と同じ不変条件）。
+fn representable(def: &FunctionDef) -> Option<Signature> {
+    if def.language != FunctionLanguage::Declarative {
+        return None;
+    }
+    let names = def
+        .params
+        .iter()
+        .map(|p| p.name.clone())
+        .collect::<Option<Vec<String>>>()?;
+    let types = def
+        .params
+        .iter()
+        .map(|p| match &p.ty {
+            None => Some(None),
+            Some(ft) => udf_cast_from_function_type(ft).map(Some),
+        })
+        .collect::<Option<Vec<Option<CastType>>>>()?;
+    let typed = types.iter().filter(|t| t.is_some()).count();
+    if typed != 0 && typed != types.len() {
+        return None;
+    }
+    let ret = match &def.return_type {
+        None => None,
+        Some(ft) => {
+            if typed != types.len() {
+                return None;
+            }
+            Some(udf_cast_from_function_type(ft)?)
+        }
+    };
+    Some((names, types, ret))
 }
 
 /// 再パース済みの登録待ち定義。
 struct Pending {
     key: String,
     params: Vec<String>,
+    param_types: Vec<Option<CastType>>,
+    return_type: Option<CastType>,
     body: Expr,
 }
 
@@ -105,26 +138,20 @@ fn load_into(
 
     let mut pending: Vec<Pending> = Vec::new();
     for def in defs {
-        if !representable(&def) {
+        let Some((params, param_types, return_type)) = representable(&def) else {
             continue;
-        }
+        };
         let Ok(tokens) = crate::sql::lexer::tokenize_rendered(&def.body_source) else {
             continue;
         };
         let Ok(body) = parse_stored_function_body(&tokens) else {
             continue;
         };
-        let Some(params) = def
-            .params
-            .iter()
-            .map(|p| p.name.clone())
-            .collect::<Option<Vec<String>>>()
-        else {
-            continue;
-        };
         pending.push(Pending {
             key: def.function_key,
             params,
+            param_types,
+            return_type,
             body,
         });
     }
@@ -138,7 +165,14 @@ fn load_into(
         let mut progressed = false;
         let mut retry = Vec::new();
         for p in pending {
-            match prepare_function_definition(registry, &p.key, &p.params, &p.body) {
+            match prepare_function_with_signature(
+                registry,
+                &p.key,
+                &p.params,
+                &p.param_types,
+                p.return_type.as_ref(),
+                &p.body,
+            ) {
                 Ok(prepared) => {
                     let key = prepared.key.clone();
                     commit_function_definition(registry, prepared);
@@ -170,8 +204,15 @@ fn load_into(
             // 恒久的にロード不能な定義は容量が空いても登録できないため再試行対象にしない。
             || (at_capacity
                 && has_non_catalog_entries
-                && prepare_function_definition_ignoring_capacity(registry, &p.key, &p.params, &p.body)
-                    .is_ok())
+                && prepare_function_with_signature_ignoring_capacity(
+                    registry,
+                    &p.key,
+                    &p.params,
+                    &p.param_types,
+                    p.return_type.as_ref(),
+                    &p.body,
+                )
+                .is_ok())
     });
     let recorded = if blocked_by_local {
         STALE_GENERATION
@@ -189,6 +230,7 @@ mod tests {
         FunctionAttributes, FunctionParam, FunctionType, FUNCTIONS_TABLE,
     };
     use crate::catalog::ColumnType;
+    use crate::sql::udf_call::prepare_function_definition;
 
     fn tmp_storage(label: &str) -> (Storage, crate::test_util::temp_db::CleanupGuard) {
         let path = crate::test_util::temp_db::unique_db_path(label);
@@ -244,10 +286,25 @@ mod tests {
             .expect("good");
         s.create_function("t", &decl("concat", &["x"], "x"))
             .expect("reserved");
+        // 正規形でない型（numeric(10,2)）の行は定義単位で skip される（#2798）。
         let mut typed = decl("typed", &["x"], "x");
-        typed.params[0].ty =
-            Some(FunctionType::from_column_type(&ColumnType::Integer).expect("ty"));
+        typed.params[0].ty = Some(
+            FunctionType::from_column_type(&ColumnType::Numeric {
+                precision: 10,
+                scale: 2,
+            })
+            .expect("ty"),
+        );
         s.create_function("t", &typed).expect("typed");
+        // 型注釈の混在・型なし引数つきの RETURNS も skip される。
+        let mut mixed = decl("mixed", &["x", "y"], "x");
+        mixed.params[0].ty =
+            Some(FunctionType::from_column_type(&ColumnType::Integer).expect("ty"));
+        s.create_function("t", &mixed).expect("mixed");
+        let mut ret_untyped = decl("retu", &["x"], "x");
+        ret_untyped.return_type =
+            Some(FunctionType::from_column_type(&ColumnType::Integer).expect("ty"));
+        s.create_function("t", &ret_untyped).expect("retu");
         let mut sql_lang = decl("sqllang", &["x"], "x");
         sql_lang.language = FunctionLanguage::Sql;
         s.create_function("t", &sql_lang).expect("lang");
@@ -380,5 +437,42 @@ mod tests {
         s.create_function("t", &decl("g", &["x"], "x")).expect("g");
         refresh(&s, "t", &mut reg);
         assert!(reg.get("g").is_some());
+    }
+
+    /// SQL-66・#2798: 正規形の型付き行（RETURNS つき）はロードされ、型が復元される。
+    #[test]
+    fn canonical_typed_definition_is_loaded_with_types() {
+        let (s, _g) = tmp_storage("udf-load-typed");
+        let mut f = decl("inc", &["x"], "x + 1");
+        f.params[0].ty = Some(FunctionType::from_column_type(&ColumnType::Integer).expect("ty"));
+        f.return_type = Some(FunctionType::from_column_type(&ColumnType::BigInt).expect("ty"));
+        s.create_function("t", &f).expect("inc");
+        let mut reg = UdfRegistry::default();
+        load(&s, "t", &mut reg).expect("load");
+        let d = reg.get("inc").expect("loaded");
+        assert_eq!(d.param_types, vec![Some(CastType::Int4)]);
+        assert_eq!(d.return_type, Some(CastType::Int8));
+    }
+
+    /// SQL-66・#2798: 本変更前に書かれた v1 の型なし blob は従来どおりロードでき、版が未知の blob は
+    /// テナント全体のロードを `XX000` で拒否する（版は上げていない）。
+    #[test]
+    fn legacy_untyped_v1_blob_loads_and_unknown_version_fails_closed() {
+        let (s, _g) = tmp_storage("udf-load-legacy");
+        s.create_function("t", &decl("old", &["x"], "x + 1"))
+            .expect("old");
+        let mut reg = UdfRegistry::default();
+        load(&s, "t", &mut reg).expect("load");
+        assert!(reg.get("old").is_some());
+        let w = s.begin_write_txn().expect("w");
+        {
+            let mut table = w.open_table(FUNCTIONS_TABLE).expect("table");
+            table
+                .insert(("t", "future", ""), [2u8, 1, 2, 3].as_slice())
+                .expect("insert");
+        }
+        crate::recovery::commit_boundary::commit(w).expect("commit");
+        let err = load(&s, "t", &mut reg).expect_err("unknown version");
+        assert_eq!(err.wire_code(), "XX000");
     }
 }

@@ -9142,13 +9142,13 @@ impl EngineCore {
             // （単一 write txn・1 回の commit）→ レジストリへの登録の順で永続化する。権限の無いセッションは
             // 従来どおりセッション内だけに登録し、カタログには触れない（42501 ゲートは #1922）。
             //
-            // Issue #1915（SQL-66 (1)）: 型注釈つきの定義は、カタログへの型の永続化とロード側の
-            // 復元（`udf_load` は型注釈つきの行を読み飛ばす）が揃うまで、永続化経路では `0A000` で
-            // 拒否する（セッションにだけ残り再起動で消える黙った不整合を作らない・fail-closed）。
+            // Issue #1915・#1916・#2798（SQL-66 (1)）: 型注釈・RETURNS つきの定義も同じ永続化経路で
+            // カタログへ書く（検証は非 DDL セッションと同じ prepare で行うため `42P13`・`0A000` の
+            // 結果は権限によらず一致する）。ロード側は書き込み経路の正規形の型だけを復元し、
+            // それ以外の行は定義単位で読み飛ばす（`udf_load`）。
             //
             // Issue #1917（SQL-66 (2)）: `CREATE OR REPLACE FUNCTION` は同じ分岐で `or_replace` により
-            // 置換経路（`prepare_function_replacement`）へ切り替える。DDL セッションの型付き・RETURNS つきの
-            // `0A000`・`42P13` の順序は `CREATE` と同じ。
+            // 置換経路（`prepare_function_replacement`）へ切り替える。
             crate::sql::allowlist::Statement::CreateFunction {
                 or_replace,
                 name,
@@ -9159,43 +9159,6 @@ impl EngineCore {
                 body_source,
             } => {
                 if session.ddl_allowed() {
-                    // Issue #1916: RETURNS 付きは永続化の前に、非 DDL セッションと同じ検証（本体の型検査）を
-                    // レジストリの複製に対して行う。型の不一致は権限によらず `42P13` になり、
-                    // 検証を通った定義だけが下の `0A000`（未対応の永続化）に到達する。
-                    if return_type.is_some() {
-                        let mut probe = session.udfs().clone();
-                        if or_replace {
-                            crate::sql::udf_call::define_or_replace_function_with_signature(
-                                &mut probe,
-                                &name,
-                                &params,
-                                &param_types,
-                                return_type.as_ref(),
-                                &body,
-                            )?;
-                        } else {
-                            crate::sql::udf_call::define_function_with_signature(
-                                &mut probe,
-                                &name,
-                                &params,
-                                &param_types,
-                                return_type.as_ref(),
-                                &body,
-                            )?;
-                        }
-                        return Err(
-                            crate::sql::allowlist::SqlSurfaceError::feature_not_supported(
-                                "function return types cannot be persisted yet",
-                            ),
-                        );
-                    }
-                    if param_types.iter().any(Option::is_some) {
-                        return Err(
-                            crate::sql::allowlist::SqlSurfaceError::feature_not_supported(
-                                "typed function parameters cannot be persisted yet",
-                            ),
-                        );
-                    }
                     if or_replace {
                         crate::sql::udf_ddl::execute_create_or_replace_function_persistent(
                             &self.storage,
@@ -9203,6 +9166,8 @@ impl EngineCore {
                             session,
                             &name,
                             &params,
+                            &param_types,
+                            return_type.as_ref(),
                             &body,
                             &body_source,
                         )?;
@@ -9213,6 +9178,8 @@ impl EngineCore {
                             session,
                             &name,
                             &params,
+                            &param_types,
+                            return_type.as_ref(),
                             &body,
                             &body_source,
                         )?;
