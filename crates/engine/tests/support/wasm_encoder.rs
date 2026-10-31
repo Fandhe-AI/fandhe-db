@@ -36,8 +36,12 @@ pub fn section(id: u8, body: &[u8], out: &mut Vec<u8>) {
 pub struct Spec {
     pub params: Vec<u8>,
     pub results: Vec<u8>,
-    /// 関数 import の数（module "env"・field "h"・型 0）。
+    /// 関数 import の数（既定は module "env"・field "h"・型 0。名前は下の 2 項目で差し替える）。
     pub func_imports: u32,
+    /// 関数 import の module 名（既定 "env"。WASI 名の import 拒否を検証するため差し替え可能）。
+    pub import_module: &'static str,
+    /// 関数 import の field 名（既定 "h"）。
+    pub import_field: &'static str,
     /// memory を import する（memory section は出さない）。
     pub memory_import: bool,
     /// (minimum pages)。None なら memory 無し。
@@ -57,6 +61,8 @@ impl Spec {
             params: vec![I32, I32, F32],
             results: vec![F32],
             func_imports: 0,
+            import_module: "env",
+            import_field: "h",
             memory_import: false,
             memory_min: Some(1),
             mutable_i32_global: false,
@@ -82,8 +88,8 @@ impl Spec {
             let mut s = Vec::new();
             leb(self.func_imports + u32::from(self.memory_import), &mut s);
             for _ in 0..self.func_imports {
-                name("env", &mut s);
-                name("h", &mut s);
+                name(self.import_module, &mut s);
+                name(self.import_field, &mut s);
                 s.push(0);
                 leb(0, &mut s);
             }
