@@ -1848,6 +1848,7 @@ pub enum NumericKind {
 /// 対象外だが、名前としては組み込み扱いにする必要があるためここで別途判定する。
 pub(crate) fn is_builtin_function_name(name: &str) -> bool {
     typed_value_cast_type(name).is_some()
+        || is_typed_numeric_name(name)
         || builtin_from_name(name).is_some()
         || is_variadic_or_overloaded_builtin_name(name)
         || is_current_time_function_name(name)
@@ -1871,6 +1872,58 @@ pub(crate) fn typed_value_expr(ident: &str, raw: String) -> Expr {
     Expr::Call {
         name: ident.to_string(),
         args: vec![Expr::Number(raw)],
+    }
+}
+
+/// 内部専用の型付き NUMERIC 値（`$typed:numeric <数値>`。Issue #2799）の呼び出し名か。
+/// PL/pgSQL の numeric 変数を定数式（INSERT VALUES・DEFAULT）の中へ持ち込む入口で、
+/// `plpgsql::subst` だけが生成する。束縛は `CAST` を経由せず変数自身の scale を保つ
+/// （`bind_call` 参照）。
+pub(crate) fn is_typed_numeric_name(name: &str) -> bool {
+    name.strip_prefix(TYPED_VALUE_PREFIX) == Some("numeric")
+}
+
+/// 式木に内部専用の型付き NUMERIC 値（[`is_typed_numeric_name`]）が含まれるか
+/// （Issue #2799）。含まれるときだけ `const_expr` が NUMERIC 算術の束縛モードで畳み込むため、
+/// 含まない式の束縛経路は従来と同一に保たれる。`Expr` の全 variant を網羅する。
+pub(crate) fn contains_typed_numeric(expr: &Expr) -> bool {
+    match expr {
+        Expr::Call { name, args } => {
+            is_typed_numeric_name(name) || args.iter().any(contains_typed_numeric)
+        }
+        Expr::Binary { lhs, rhs, .. }
+        | Expr::NullIf(lhs, rhs)
+        | Expr::IsDistinctFrom { lhs, rhs, .. }
+        | Expr::RegexMatch {
+            lhs, pattern: rhs, ..
+        }
+        | Expr::JsonAccess { lhs, rhs, .. } => {
+            contains_typed_numeric(lhs) || contains_typed_numeric(rhs)
+        }
+        Expr::Case { whens, else_result } => {
+            whens
+                .iter()
+                .any(|(c, r)| contains_typed_numeric(c) || contains_typed_numeric(r))
+                || else_result.as_deref().is_some_and(contains_typed_numeric)
+        }
+        Expr::Coalesce(args) => args.iter().any(contains_typed_numeric),
+        Expr::Collate { expr, .. } | Expr::Cast { expr, .. } => contains_typed_numeric(expr),
+        Expr::ArrayConstructor(_) | Expr::Subscript { .. } | Expr::Quantified { .. } => expr
+            .array_expr_children()
+            .into_iter()
+            .flatten()
+            .any(contains_typed_numeric),
+        Expr::Number(_)
+        | Expr::String(_)
+        | Expr::Null
+        | Expr::Ident(_)
+        | Expr::DateLiteral(_)
+        | Expr::TimestampLiteral(_)
+        | Expr::IntervalLiteral(_)
+        | Expr::TimeLiteral(_)
+        | Expr::TimestampTzLiteral { .. }
+        | Expr::ValueFunction { .. }
+        | Expr::SqlJsonQuery(_) => false,
     }
 }
 
@@ -4927,6 +4980,17 @@ pub(crate) fn bind_const_expr(
     registry: &UdfRegistry,
     node_budget: &mut usize,
 ) -> Result<(BoundExpr, ExprType, Option<ColumnType>), SqlSurfaceError> {
+    bind_const_expr_mode(expr, registry, node_budget, false)
+}
+
+/// [`bind_const_expr`] に NUMERIC 算術モード（[`BindEnv::numeric_arith`]）の指定を足した版
+/// （Issue #2799。`const_expr` が内部専用の型付き NUMERIC 値を含む式の畳み込みでだけ `true`）。
+pub(crate) fn bind_const_expr_mode(
+    expr: &Expr,
+    registry: &UdfRegistry,
+    node_budget: &mut usize,
+    numeric: bool,
+) -> Result<(BoundExpr, ExprType, Option<ColumnType>), SqlSurfaceError> {
     // Issue #1539・SQL-42: `FROM` なし SELECT も投影と同じ型規則（整数算術は int4／int8）。
     let mut env = BindEnv {
         schema: None,
@@ -4937,21 +5001,32 @@ pub(crate) fn bind_const_expr(
         typed_arith: true,
         clock: time_fn::current_clock(),
         collation_leaf: false,
-        numeric_arith: false,
+        numeric_arith: numeric,
     };
-    let (bound, ty) = bind_expr_in(expr, &mut env, node_budget)?;
+    let (bound, ty) = if numeric {
+        // Issue #2799: NUMERIC 算術モードの最上位 NUMERIC 値は受理する（NULL 候補の探索・
+        // 短絡判定のプローブが Numeric 型の式を束縛できるようにする）。
+        let (b, t) = bind_expr_any(expr, &mut env, node_budget)?;
+        if t != ExprType::Numeric {
+            reject_json_operand(t)?;
+        }
+        (b, t)
+    } else {
+        bind_expr_in(expr, &mut env, node_budget)?
+    };
     let col = expr_result_column_type(expr, &bound, ty, None, registry);
     Ok((bound, ty, col))
 }
 
-/// [`bind_const_expr`] の最上位だけ配列値を許す版（`INSERT ... VALUES` の定数式の畳み込み用。
+/// [`bind_const_expr_mode`] の最上位だけ配列値を許す版（`INSERT ... VALUES` の定数式の畳み込み用。
 /// 配列は評価後に PG 配列テキストへ畳まれ、列側の入力関数が列の要素型で解釈し直す。
 /// TABLE-35・Issue #1602）。式の内側（演算の被演算子・関数引数・`CASE` 等）の拒否規則は
 /// [`bind_expr_any`] 側のまま維持される。
-pub(crate) fn bind_const_expr_array_top(
+pub(crate) fn bind_const_expr_array_top_mode(
     expr: &Expr,
     registry: &UdfRegistry,
     node_budget: &mut usize,
+    numeric: bool,
 ) -> Result<(BoundExpr, ExprType, Option<ColumnType>), SqlSurfaceError> {
     let mut env = BindEnv {
         schema: None,
@@ -4962,10 +5037,12 @@ pub(crate) fn bind_const_expr_array_top(
         typed_arith: true,
         clock: time_fn::current_clock(),
         collation_leaf: false,
-        numeric_arith: false,
+        numeric_arith: numeric,
     };
     let (bound, ty) = bind_expr_any(expr, &mut env, node_budget)?;
-    if ty != ExprType::Array {
+    // Issue #2799: NUMERIC 算術モードの最上位 NUMERIC 値は呼び出し元（`const_expr`）が数値リテラルへ
+    // 戻して列側へ渡すため受理する。それ以外の cast-only 型・jsonb は従来どおり拒否する。
+    if ty != ExprType::Array && !(numeric && ty == ExprType::Numeric) {
         reject_json_operand(ty)?;
     }
     let col = expr_result_column_type(expr, &bound, ty, None, registry);
@@ -7096,6 +7173,12 @@ fn scalar_numeric_kind(
     if let Expr::Cast { ty, .. } = expr {
         return ty.numeric_kind();
     }
+    // 内部専用の型付き値（`$typed:<型>`。Issue #2779・#2799）も宣言型どおり（`$typed:int4 2` は int4）。
+    if let Expr::Call { name, .. } = expr {
+        if let Some(ty) = typed_value_cast_type(name) {
+            return ty.numeric_kind();
+        }
+    }
     match bound {
         BoundExpr::ColumnRef { index } => {
             let column = schema?.columns.get(*index)?;
@@ -8122,6 +8205,24 @@ fn bind_call(
     env: &mut BindEnv<'_>,
     node_budget: &mut usize,
 ) -> Result<(BoundExpr, ExprType), SqlSurfaceError> {
+    if is_typed_numeric_name(name) {
+        // Issue #2799: 変数自身の scale を保つため `CAST ... AS numeric`（scale 16 へ固定）を
+        // 通さず、リテラルを正確な Decimal として直接束縛する。raw は subst が Decimal の
+        // 正規テキストから作るため、解釈できなければ内部不変条件違反。
+        *node_budget = node_budget
+            .checked_sub(1)
+            .ok_or_else(|| SqlSurfaceError::payload_too_large("expression is too large"))?;
+        return match args {
+            [Expr::Number(raw)] => crate::numeric::parse_literal_exact(raw)
+                .map(|d| (BoundExpr::Numeric(d), ExprType::Numeric))
+                .map_err(|_| SqlSurfaceError::Internal {
+                    detail: "malformed internal typed numeric value".to_string(),
+                }),
+            _ => Err(SqlSurfaceError::Internal {
+                detail: "malformed internal typed value".to_string(),
+            }),
+        };
+    }
     if let Some(ty) = typed_value_cast_type(name) {
         return match args {
             [inner] => crate::sql::cast::bind_cast(inner, &ty, env, node_budget),
