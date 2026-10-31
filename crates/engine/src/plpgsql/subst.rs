@@ -385,7 +385,7 @@ fn is_lone_values_element(tokens: &[Token], i: usize) -> bool {
 
 /// `-` の直前のトークンが値の終端（二項演算子の左オペランドの末尾）か。単項の `-` かの判定に使う。
 /// 値を終えない語（`THEN`・`ELSE`・`AND` など。字句解析器は `Keyword` 以外を `Ident` にする）は偽。
-fn ends_operand(t: Option<&Token>) -> bool {
+pub(crate) fn ends_operand(t: Option<&Token>) -> bool {
     match t {
         Some(Token::Ident(w)) => ![
             "THEN", "ELSE", "WHEN", "CASE", "OR", "NOT", "IN", "BETWEEN", "LIKE", "ILIKE", "IS",

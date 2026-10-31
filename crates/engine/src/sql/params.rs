@@ -1758,6 +1758,176 @@ pub(crate) enum ParamLiteralKind {
     Boolean,
 }
 
+/// 型付き値（[`crate::sql::udf_call::TYPED_VALUE_PREFIX`]）で `$n` を置換するときの数値型
+/// （Issue #2797・WIRE-12・SQL-24 のポインタ）。`INSERT ... VALUES` の式内 `$n` は裸の数値だと
+/// 定数式の畳み込みが値の大きさで型を決めてしまい、Parse で宣言・推定した型が失われるため、
+/// `core.rs` の Parse が決めた実効型をここへ写して Bind の置換に渡す。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum TypedNumeric {
+    Int2,
+    Int4,
+    Int8,
+    Float4,
+    Float8,
+}
+
+impl TypedNumeric {
+    /// 合成識別子の末尾に付ける型名（`udf_call` の型付き値が解釈する 5 種）。
+    #[deny(clippy::wildcard_enum_match_arm)]
+    fn type_name(self) -> &'static str {
+        match self {
+            TypedNumeric::Int2 => "int2",
+            TypedNumeric::Int4 => "int4",
+            TypedNumeric::Int8 => "int8",
+            TypedNumeric::Float4 => "float4",
+            TypedNumeric::Float8 => "float8",
+        }
+    }
+
+    /// 整数系か（値の文法検証を整数にするか浮動小数にするか）。
+    #[deny(clippy::wildcard_enum_match_arm)]
+    fn is_integer(self) -> bool {
+        match self {
+            TypedNumeric::Int2 | TypedNumeric::Int4 | TypedNumeric::Int8 => true,
+            TypedNumeric::Float4 | TypedNumeric::Float8 => false,
+        }
+    }
+
+    /// 合成識別子（`$typed:<型>`）。
+    fn ident(self) -> String {
+        format!(
+            "{}{}",
+            crate::sql::udf_call::TYPED_VALUE_PREFIX,
+            self.type_name()
+        )
+    }
+
+    /// 置換で 1 出現あたりに増える識別子のバイト数（`$n` 自体の値長に上乗せして上限判定する）。
+    fn ident_len(self) -> usize {
+        crate::sql::udf_call::TYPED_VALUE_PREFIX.len() + self.type_name().len()
+    }
+
+    /// float4 か（Bind の値を丸めた正規値へ差し替える対象）。
+    fn is_float4(self) -> bool {
+        self == TypedNumeric::Float4
+    }
+
+    #[deny(clippy::wildcard_enum_match_arm)]
+    fn from_declared(d: DeclaredParamType) -> Option<Self> {
+        match d {
+            DeclaredParamType::Int2 => Some(TypedNumeric::Int2),
+            DeclaredParamType::Int4 => Some(TypedNumeric::Int4),
+            DeclaredParamType::Int8 => Some(TypedNumeric::Int8),
+            DeclaredParamType::Float4 => Some(TypedNumeric::Float4),
+            DeclaredParamType::Float8 => Some(TypedNumeric::Float8),
+            DeclaredParamType::Bool
+            | DeclaredParamType::Text
+            | DeclaredParamType::Varchar
+            | DeclaredParamType::Bpchar
+            | DeclaredParamType::Numeric
+            | DeclaredParamType::Date
+            | DeclaredParamType::Timestamp
+            | DeclaredParamType::TimestampTz
+            | DeclaredParamType::Interval
+            | DeclaredParamType::Time
+            | DeclaredParamType::Bytea
+            | DeclaredParamType::Uuid
+            | DeclaredParamType::Json
+            | DeclaredParamType::Jsonb => None,
+        }
+    }
+
+    fn from_inferred(t: &PreparedParamType) -> Option<Self> {
+        use crate::catalog::ColumnType;
+        use crate::sql::exec::ColumnMeta;
+        match t {
+            PreparedParamType::Column(ColumnMeta::Scalar { ty, .. }) => match ty {
+                ColumnType::SmallInt => Some(TypedNumeric::Int2),
+                ColumnType::Integer => Some(TypedNumeric::Int4),
+                ColumnType::BigInt => Some(TypedNumeric::Int8),
+                ColumnType::Real => Some(TypedNumeric::Float4),
+                ColumnType::Double => Some(TypedNumeric::Float8),
+                _ => None,
+            },
+            PreparedParamType::Declared(d) => Self::from_declared(*d),
+            _ => None,
+        }
+    }
+
+    /// `$n` の実効型。宣言型があれば宣言型を優先し（PostgreSQL で宣言した型がパラメータの型に
+    /// なるのと同じ）、無ければ推論型。数値型でなければ `None`（従来の裸の置換のまま）。
+    pub(crate) fn effective(
+        declared: Option<DeclaredParamType>,
+        inferred: Option<&PreparedParamType>,
+    ) -> Option<Self> {
+        match declared {
+            Some(d) => Self::from_declared(d),
+            None => inferred.and_then(Self::from_inferred),
+        }
+    }
+}
+
+/// `INSERT ... VALUES` の式内（パターン 7）にある `$n` のトークン添字から、型付き値で置換する
+/// 数値型への表（Issue #2797）。Parse が 1 度だけ構築して [`crate::core::PreparedSql`] に持たせ、
+/// Bind の置換・正規化・上限計上が共有する。`$n` 単独の要素（パターン 5）、`SET` 右辺・UPSERT・
+/// `WHERE` の `$n`、直後が `::` の `$n` は含めず、従来の置換のままにする。
+#[derive(Debug, Clone, Default)]
+pub(crate) struct TypedPositions {
+    /// 対象位置が無い文（大多数）で `PreparedSql` を大きくしないよう、表は間接保持する
+    /// （wire-server の `large_enum_variant` を避ける）。
+    at: Option<std::sync::Arc<HashMap<usize, TypedNumeric>>>,
+}
+
+impl TypedPositions {
+    /// `typed`（`$n` の実効型を番号順に並べたもの）から、型付き置換の対象位置を求める。
+    pub(crate) fn build(tokens: &[Token], typed: &[Option<TypedNumeric>]) -> Self {
+        if typed.iter().all(Option::is_none) {
+            return Self::default();
+        }
+        let layout = ParamLayout::build(tokens);
+        let mut at = HashMap::new();
+        for (i, token) in tokens.iter().enumerate() {
+            let Token::Param(n) = token else { continue };
+            let Some(ty) = usize::from(*n)
+                .checked_sub(1)
+                .and_then(|k| typed.get(k))
+                .copied()
+                .flatten()
+            else {
+                continue;
+            };
+            let in_insert_expr = layout
+                .segment_index_at(i)
+                .and_then(|idx| layout.segments.get(idx))
+                .is_some_and(|seg| matches!(seg.target, ExprTarget::Insert(_)));
+            let cast_follows = matches!(tokens.get(i + 1), Some(Token::TypeCast));
+            if in_insert_expr && !cast_follows {
+                at.insert(i, ty);
+            }
+        }
+        Self {
+            at: (!at.is_empty()).then(|| std::sync::Arc::new(at)),
+        }
+    }
+
+    fn get(&self, i: usize) -> Option<TypedNumeric> {
+        self.at.as_ref()?.get(&i).copied()
+    }
+
+    /// 型付き置換の対象位置が 1 つも無いか。
+    #[cfg(test)]
+    pub(crate) fn is_empty(&self) -> bool {
+        self.at.is_none()
+    }
+
+    /// 番号 `n`（1 始まり）の `$n` が、型付き置換される位置で float4 になるか。
+    pub(crate) fn slot_is_float4(&self, tokens: &[Token], n: u16) -> bool {
+        self.at.iter().flat_map(|m| m.iter()).any(|(i, ty)| {
+            ty.is_float4() && matches!(tokens.get(*i), Some(Token::Param(m)) if *m == n)
+        })
+    }
+}
+
 /// 整数文法（`-?[0-9]+`）の判定。符号の有無と数字列を返す。置換
 /// （[`integer_literal_tokens`]）と宣言型検証（[`validate_declared_value`]）で共有する。
 fn split_integer(n: u16, value: &str) -> Result<(bool, &str), SqlSurfaceError> {
@@ -1939,6 +2109,15 @@ pub fn order_by_distance_literal_is_param(tokens: &[Token]) -> bool {
     })
 }
 
+/// 型付き値の負値（`-` + `$typed:<型>` + 数値）か。
+fn is_typed_negative(produced: &[Token]) -> bool {
+    matches!(
+        produced,
+        [Token::Punct('-'), Token::Ident(w), Token::Number(_)]
+            if w.starts_with(crate::sql::udf_call::TYPED_VALUE_PREFIX)
+    )
+}
+
 /// [`Token::Param`] をすべて `value_for` が返すトークン列へ置換したトークン列を
 /// 返す（1 個の `$n` から複数トークン〔負の整数の `-` + 数値〕を出せる）。
 /// `value_for` は 1 始まりのパラメータ番号を受け取る。
@@ -1950,7 +2129,43 @@ fn substitute_with<E>(
     for (i, token) in tokens.iter().enumerate() {
         match token {
             Token::Param(n) => {
-                let produced = value_for(*n, i)?;
+                let mut produced = value_for(*n, i)?;
+                // Issue #2797: 型付きの負値（`-` + `$typed:<型>` + 数値の 3 トークン）。直前が単項の `-`
+                // なら二重否定を畳み、二項の `-` の直後なら括弧で包む（`plpgsql::subst` と同じ規則。
+                // 定数式の解析は `-(..)` を受理しないため、単項の場合は括弧では包めない）。
+                if is_typed_negative(&produced) {
+                    let minus = i.checked_sub(1);
+                    let prev_minus =
+                        minus.is_some_and(|m| matches!(tokens.get(m), Some(Token::Punct('-'))));
+                    if prev_minus {
+                        let before = minus
+                            .and_then(|m| m.checked_sub(1))
+                            .and_then(|p| tokens.get(p));
+                        let unary = !crate::plpgsql::subst::ends_operand(before);
+                        if unary && matches!(out.last(), Some(Token::Punct('-'))) {
+                            out.pop();
+                            produced.remove(0);
+                        } else {
+                            produced.insert(0, Token::Punct('('));
+                            produced.push(Token::Punct(')'));
+                        }
+                    }
+                    // 直前が単項の `+`（`+$n`）なら `+` を落とし、負値をそのまま評価させる（符号なしと等価。
+                    // 残すと `+ - $typed:..` となり定数式の解析が `42601` にする）。
+                    let plus = i.checked_sub(1);
+                    if plus.is_some_and(|m| matches!(tokens.get(m), Some(Token::Punct('+'))))
+                        && matches!(out.last(), Some(Token::Punct('+')))
+                    {
+                        let before = plus
+                            .and_then(|m| m.checked_sub(1))
+                            .and_then(|p| tokens.get(p));
+                        if !crate::plpgsql::subst::ends_operand(before) {
+                            out.pop();
+                        }
+                    }
+                    out.extend(produced);
+                    continue;
+                }
                 // Issue #1593: `$n::T` の `$n` が負値（`-` + 数値の 2 トークン）になる場合は括弧で
                 // 包む。`::` は単項マイナスより強いため、包まないと `-5::int` が `-(5::int)` と
                 // 読まれ、リテラル `(-5)::int` と値の意味が食い違う。`Punct` の長さは
@@ -2030,6 +2245,75 @@ pub(crate) fn substitute_values_typed(
     values: &[Option<String>],
     kinds: &[ParamLiteralKind],
 ) -> Result<Vec<Token>, SqlSurfaceError> {
+    substitute_values_typed_with(tokens, values, kinds, &TypedPositions::default())
+}
+
+/// 符号なし整数の数字列が畳み込みの精度境界（|v| >= 2^53）以上か。u64 に収まらない桁は
+/// 境界以上として扱う。
+fn integer_digits_beyond_fold_range(digits: &str) -> bool {
+    match digits.parse::<u64>() {
+        Ok(m) => crate::sql::const_expr::int_magnitude_beyond_fold_range(m),
+        Err(_) => true,
+    }
+}
+
+/// 型付き位置（[`TypedPositions`]）の `$n` を、`ty` の型付き値のトークン列にする（Issue #2797）。
+/// 値の文法検証は実効型で行う（`22P02`）。畳み込みの精度境界（|v| >= 2^53）以上の値は、従来経路と
+/// 同じ結果になるよう裸の数値のままにする。
+fn typed_numeric_tokens(
+    n: u16,
+    value: &str,
+    ty: TypedNumeric,
+) -> Result<Vec<Token>, SqlSurfaceError> {
+    let bare = if ty.is_integer() {
+        integer_literal_tokens(n, value)?
+    } else {
+        float_literal_tokens(n, value)?
+    };
+    let beyond = match bare.last() {
+        Some(Token::Number(raw)) if ty.is_integer() => integer_digits_beyond_fold_range(raw),
+        Some(Token::Number(raw)) => raw
+            .parse::<f64>()
+            .is_ok_and(crate::sql::const_expr::float_beyond_fold_range),
+        _ => true,
+    };
+    if beyond {
+        return Ok(bare);
+    }
+    let mut out = Vec::with_capacity(bare.len() + 1);
+    for t in bare {
+        match t {
+            Token::Number(raw) => {
+                out.push(Token::Ident(ty.ident()));
+                out.push(Token::Number(raw));
+            }
+            other => out.push(other),
+        }
+    }
+    Ok(out)
+}
+
+/// [`substitute_values_typed`] の型付き位置対応版（Issue #2797）。`typed` の位置の非 NULL 値は
+/// 実効型の型付き値へ、それ以外は従来どおりに置換する。
+pub(crate) fn substitute_values_typed_with(
+    tokens: &[Token],
+    values: &[Option<String>],
+    kinds: &[ParamLiteralKind],
+    typed: &TypedPositions,
+) -> Result<Vec<Token>, SqlSurfaceError> {
+    substitute_values_typed_split(tokens, values, values, kinds, typed)
+}
+
+/// [`substitute_values_typed_with`] の値分離版（Issue #2797）。型付き置換の位置には
+/// `typed_values`（float4 を丸めた正規値を含む）を、それ以外の位置には `values` を使う。
+/// 型付き位置でない同番号の `$n`（単独 `$n` 等）へ丸め値が漏れて 22P02 になる後退を防ぐ。
+pub(crate) fn substitute_values_typed_split(
+    tokens: &[Token],
+    values: &[Option<String>],
+    typed_values: &[Option<String>],
+    kinds: &[ParamLiteralKind],
+    typed: &TypedPositions,
+) -> Result<Vec<Token>, SqlSurfaceError> {
     let (_, between_bounds, _) = where_noneq_param_slots_and_bounds(tokens);
     substitute_with(tokens, |n, ti| {
         let idx = usize::from(n).checked_sub(1).ok_or_else(|| {
@@ -2041,6 +2325,13 @@ pub(crate) fn substitute_values_typed(
         let Some(value) = value else {
             return Ok(vec![Token::Ident("NULL".to_string())]);
         };
+        if let Some(ty) = typed.get(ti) {
+            let typed_value = typed_values
+                .get(idx)
+                .and_then(Option::as_ref)
+                .unwrap_or(value);
+            return typed_numeric_tokens(n, typed_value, ty);
+        }
         match kind_of(kinds, n) {
             ParamLiteralKind::String => Ok(vec![Token::StringLiteral(value.clone())]),
             ParamLiteralKind::Integer => integer_literal_tokens(n, value),
@@ -2106,6 +2397,16 @@ pub(crate) fn decode_bind_values_nullable(
     tokens: &[Token],
     values: &[Option<Vec<u8>>],
 ) -> Result<Vec<Option<String>>, SqlSurfaceError> {
+    decode_bind_values_nullable_typed(tokens, values, &TypedPositions::default())
+}
+
+/// [`decode_bind_values_nullable`] の型付き位置対応版（Issue #2797）。型付き置換で 1 出現あたりに
+/// 増える合成識別子（`$typed:<型>`）の分も、置換後総バイト数の上限判定へ計上する。
+pub(crate) fn decode_bind_values_nullable_typed(
+    tokens: &[Token],
+    values: &[Option<Vec<u8>>],
+    typed: &TypedPositions,
+) -> Result<Vec<Option<String>>, SqlSurfaceError> {
     // 借用のまま UTF-8 検証・NUL 拒否を行う（値の複製より前）。
     let mut borrowed: Vec<Option<&str>> = Vec::with_capacity(values.len());
     for raw in values {
@@ -2137,14 +2438,22 @@ pub(crate) fn decode_bind_values_nullable(
     // 超えうる（`tokenize_with_params` が検証する「元の SQL テキストの長さ」
     // と「置換後のトークン列が表す総バイト長」は別物であるため）。
     let mut total: usize = 0;
-    for token in tokens {
+    for (ti, token) in tokens.iter().enumerate() {
         let len = match token {
             Token::Param(n) => {
                 let idx = usize::from(*n).checked_sub(1);
                 // NULL は置換後に `NULL` 1 トークン（4 バイト）になる。
-                idx.and_then(|i| borrowed.get(i))
+                let base = idx
+                    .and_then(|i| borrowed.get(i))
                     .map(|s| s.map_or(4, str::len))
-                    .unwrap_or(0)
+                    .unwrap_or(0);
+                // 型付き位置は合成識別子の分が増える（NULL・精度境界超えの裸置換でも上界として計上）。
+                base.checked_add(typed.get(ti).map_or(0, TypedNumeric::ident_len))
+                    .ok_or_else(|| {
+                        SqlSurfaceError::payload_too_large(
+                            "substituted parameter payload size overflowed",
+                        )
+                    })?
             }
             Token::Ident(s)
             | Token::QuotedNull(s)
@@ -3640,5 +3949,128 @@ mod typed_tests {
         assert!(bound.contains(&Token::Punct('-')));
         assert!(bound.contains(&Token::Ident("true".into())));
         assert!(!bound.iter().any(|t| matches!(t, Token::Param(_))));
+    }
+}
+/// `INSERT ... VALUES` の式内 `$n` の型付き置換（Issue #2797・WIRE-12・SQL-24 のポインタ）の
+/// 単体テスト。
+#[cfg(test)]
+mod typed_value_tests {
+    use super::*;
+    use crate::sql::lexer::tokenize_with_params;
+
+    const INSERT_EXPR: &str = "INSERT INTO t (id, n) VALUES (1, $1 + 1)";
+
+    fn bind(sql: &str, ty: TypedNumeric, value: &str) -> Vec<Token> {
+        let tokens = tokenize_with_params(sql).expect("tokenize");
+        let typed = TypedPositions::build(&tokens, &[Some(ty)]);
+        substitute_values_typed_with(&tokens, &[Some(value.to_string())], &[], &typed)
+            .expect("substitute")
+    }
+
+    fn typed_ident(ty: &str) -> Token {
+        Token::Ident(format!("$typed:{ty}"))
+    }
+
+    #[test]
+    fn expression_param_is_replaced_with_typed_value() {
+        let out = bind(INSERT_EXPR, TypedNumeric::Int8, "5");
+        let at = out.iter().position(|t| *t == typed_ident("int8")).unwrap();
+        assert_eq!(out.get(at + 1), Some(&Token::Number("5".into())));
+    }
+
+    #[test]
+    fn lone_element_set_and_cast_params_stay_bare() {
+        for sql in [
+            "INSERT INTO t (id, n) VALUES (1, $1)",
+            "UPDATE t SET n = n + $1 WHERE id = 1",
+            "INSERT INTO t (id, n) VALUES (1, $1::bigint + 1)",
+        ] {
+            let tokens = tokenize_with_params(sql).expect("tokenize");
+            let typed = TypedPositions::build(&tokens, &[Some(TypedNumeric::Int8)]);
+            assert!(typed.is_empty(), "{sql}");
+        }
+    }
+
+    #[test]
+    fn effective_type_prefers_declared_over_inferred() {
+        use crate::catalog::ColumnType;
+        use crate::sql::exec::ColumnMeta;
+        let inferred = PreparedParamType::Column(ColumnMeta::Scalar {
+            ty: ColumnType::Integer,
+            name: "n".to_string(),
+        });
+        assert_eq!(
+            TypedNumeric::effective(Some(DeclaredParamType::Int8), Some(&inferred)),
+            Some(TypedNumeric::Int8)
+        );
+        assert_eq!(
+            TypedNumeric::effective(None, Some(&inferred)),
+            Some(TypedNumeric::Int4)
+        );
+        assert_eq!(
+            TypedNumeric::effective(Some(DeclaredParamType::Numeric), Some(&inferred)),
+            None
+        );
+        assert_eq!(
+            TypedNumeric::effective(None, Some(&PreparedParamType::Text)),
+            None
+        );
+    }
+
+    #[test]
+    fn beyond_fold_range_stays_bare() {
+        let out = bind(INSERT_EXPR, TypedNumeric::Int8, "9007199254740993");
+        assert!(!out
+            .iter()
+            .any(|t| matches!(t, Token::Ident(w) if w.starts_with("$typed:"))));
+    }
+
+    #[test]
+    fn float_value_is_validated_as_float() {
+        let out = bind(INSERT_EXPR, TypedNumeric::Float8, "1.5");
+        assert!(out.contains(&typed_ident("float8")));
+        let tokens = tokenize_with_params(INSERT_EXPR).unwrap();
+        let typed = TypedPositions::build(&tokens, &[Some(TypedNumeric::Int8)]);
+        let err =
+            substitute_values_typed_with(&tokens, &[Some("1.5".into())], &[], &typed).unwrap_err();
+        assert_eq!(err.wire_code(), "22P02");
+    }
+
+    #[test]
+    fn negative_value_folds_unary_minus_and_parenthesizes_binary_minus() {
+        let unary = bind(
+            "INSERT INTO t (id, n) VALUES (1, -$1)",
+            TypedNumeric::Int8,
+            "-5",
+        );
+        assert!(!unary.contains(&Token::Punct('-')));
+        let binary = bind(
+            "INSERT INTO t (id, n) VALUES (1, 1 - $1)",
+            TypedNumeric::Int8,
+            "-5",
+        );
+        let at = binary
+            .iter()
+            .position(|t| *t == typed_ident("int8"))
+            .unwrap();
+        assert_eq!(binary.get(at - 2), Some(&Token::Punct('(')));
+        assert_eq!(binary.get(at + 2), Some(&Token::Punct(')')));
+    }
+
+    #[test]
+    fn typed_identifier_bytes_count_toward_size_limit() {
+        let tokens = tokenize_with_params(INSERT_EXPR).unwrap();
+        let typed = TypedPositions::build(&tokens, &[Some(TypedNumeric::Float4)]);
+        let small = decode_bind_values_nullable_typed(&tokens, &[Some(b"1".to_vec())], &typed);
+        assert!(small.is_ok());
+        // 型付きでない場合に上限ちょうどで通る長さを探し、同じ長さが型付きでは `54000` になる
+        // （合成識別子 13 バイトの上乗せ分が上限判定に入る）ことを確かめる。
+        let max_plain = (0..=lexer::MAX_INPUT_LEN)
+            .rev()
+            .find(|len| decode_bind_values_nullable(&tokens, &[Some(vec![b'1'; *len])]).is_ok())
+            .expect("some length fits");
+        let big = vec![b'1'; max_plain];
+        let err = decode_bind_values_nullable_typed(&tokens, &[Some(big)], &typed).unwrap_err();
+        assert_eq!(err.wire_code(), "54000");
     }
 }
