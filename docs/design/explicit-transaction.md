@@ -471,9 +471,8 @@ Search・Aggregate・Scan）は確定済みのまま出力が決まる。想定�
 `docs/spec/04-behavior/data-model.md` TABLE-3、`docs/spec/04-behavior/persistence.md` PERSIST-4。
 構文の実装は #1938（`ISOLATION LEVEL`）・#1939（`SET TRANSACTION`／`SET SESSION CHARACTERISTICS`）・
 Issue #1931（`READ ONLY`）、挙動テストは #1940、`40001` は #2396 が担う。
-`BEGIN ISOLATION LEVEL <レベル>` は Issue #1938 で受理へ変えた（`validate_transaction_control_tokens`。
-`READ ONLY`/`READ WRITE` との併記は #1932 の構文と同じループで受理）。重複指定は PostgreSQL の後勝ちと異なり `42601`（既知差）、
-`[NOT] DEFERRABLE` は担当 sub-issue が無く `42601` のまま。
+`BEGIN ISOLATION LEVEL ...` の構文解釈は Issue #1938 で実装した（`validate_transaction_control_tokens`）。
+受理範囲・エラー契約は上記ポインタ先に従い、本書には記述しない。
 
 - **engine の宣言型**: `crates/engine/src/txn.rs` の `IsolationLevel` は単一バリアントのまま維持する。
   #1938 は要求されたレベルを別の `sql::transaction::RequestedIsolationLevel` として

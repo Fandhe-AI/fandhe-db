@@ -9,7 +9,7 @@
 
 ### Added
 
-- `BEGIN ISOLATION LEVEL {SERIALIZABLE|REPEATABLE READ|READ COMMITTED|READ UNCOMMITTED}` を受理する（Issue #1938・SQL-38 (1)。要求レベルは記録のみで実行は不変）。`sql::transaction::RequestedIsolationLevel`・`ValidatedTxnControl`・`SessionTransaction::begin_with_isolation`／`isolation_level` を追加し、`ParsedSql::Transaction` の payload を `TxnControl` から `ValidatedTxnControl` に変えた（BREAKING CHANGE）。重複指定は `42601`。
+- `BEGIN ISOLATION LEVEL {SERIALIZABLE|REPEATABLE READ|READ COMMITTED|READ UNCOMMITTED}` を受理する（Issue #1938・SQL-38 (1)。要求レベルは記録のみで実行は不変）。`sql::transaction::RequestedIsolationLevel`・`SessionTransaction::begin_with_modes`（`isolation_level` 引数）・`SessionTransaction::isolation_level` を追加し、公開構造体 `ValidatedTxnControl` に `isolation_level` フィールドを追加した（BREAKING CHANGE）。
 - `CREATE [OR REPLACE] FUNCTION` が SQL 標準形の関数本体 `RETURN <式>`・`BEGIN ATOMIC <文>; ... END` を受理する（Issue #2219・SQL-67 (2)。`LANGUAGE` 省略は sql）。標準形は定義時に名前を解決して参照先への依存辺を記録し、参照先の DROP・改名・列変更を `2BP01` で止める（CASCADE でも。連鎖削除・改名への追随は未対応）。簡易クエリの複数文メッセージは本体内の `;` で分割しない。詳細は [plpgsql-subset.md](docs/design/plpgsql-subset.md)。
   公開 enum `CreateFunctionBody` に `SqlStandard` を追加した（BREAKING CHANGE）。
 - WASM UDF サンドボックスの資源上限を追加した（Issue #1927・EXT-6／EXT-9）。`wasm_udf::SandboxLimits` に `fuel` を追加（BREAKING: 公開フィールドの追加）、`SandboxLimits::clamped`・`HARD_MAX_*`・`validate_wasm_*`・`WasmLimitOutOfRange`・`TrapKind::FuelExhausted`・`EngineCore::with_wasm_limits`／`wasm_limits` を追加した。`wasm-udf` ビルドでは epoch ティッカーで実行時間上限が効き、実行時の上限超過は `54000`（従来は `22000`）。起動フラグ `--wasm-max-memory-bytes`・`--wasm-max-call-duration-ms`・`--wasm-max-fuel`（下げる方向だけ）を追加。
