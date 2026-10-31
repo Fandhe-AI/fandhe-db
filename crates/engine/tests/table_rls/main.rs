@@ -40,6 +40,7 @@ mod recovery_optional_op_id;
 mod recovery_required_op_id;
 mod recovery_two_path;
 mod rls10_gin_index_paths;
+mod rls10_plpgsql_paths;
 mod rls10_recursive_cte_paths;
 mod rls10_relational_paths;
 mod rls11_read_your_writes;

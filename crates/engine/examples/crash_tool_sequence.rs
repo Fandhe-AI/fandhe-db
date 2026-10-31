@@ -43,6 +43,17 @@
 //!   再送が `22023` になり、いずれも行数・最大 `id` を変えず、続く新しい op の 1 行がちょうど
 //!   `max + 1` を採番する（再送が値を消費していない）ことを確かめる。
 //! - `self-check-identity <db_path>`: 負の対照（不正な列と、DB へ逆順の `id` を明示して書いた表）。
+//!
+//! Issue #2229（SQL-68・RLS-10・RECOVER-11・RECOVER-12）の `DO` ブロックの段（`*-do` サブコマンド）:
+//! 表 `do_a`（k ごとに 3 行）・`do_b`（k ごとに 1 行）・証人 `do_w` へ書く `DO` を、偶数 k は autocommit、
+//! 奇数 k は明示 Tx の `DO` + `USING OPERATION_ID 'do-<k>'` 付き証人 INSERT で書き続ける。
+//! - `write-do <db_path>`: 成功ごとに `COMMITTED op=do-<k> rows=<do_a の総行数> n=<適用済みの k の個数>`。
+//! - `verify-do <db_path>`: 読み取り専用。オラクルは (1) `do_a` と `do_b` が k ごとに全か無か、(2) 適用済み
+//!   の k が 0 からの連続、(3) 奇数 k で台帳・証人・本体が一致（偶数 k は台帳なし）、(4) 第 2 テナントの
+//!   行・台帳が不変。`RESULT` の `rows` は `do_a` の行数、`max` は適用済みの k の個数。
+//! - `finish-do <db_path>`: 最後の奇数 k を順序 B（`DO` → 証人 INSERT）で再送して `23505`・全体の破棄、
+//!   `DO ... USING OPERATION_ID` が `0A000`、新しい k がちょうど 1 回分適用されることを確かめる。
+//! - `self-check-do <db_path>`: 負の対照（オラクルの純関数と、DB へ書いた不完全な状態）。
 
 use std::io::Write as _;
 
@@ -88,7 +99,8 @@ fn main() {
         _ => {
             eprintln!(
                 "usage: crash_tool_sequence <write|verify|finish|self-check|write-identity|\
-                 verify-identity|finish-identity|self-check-identity> <db_path>"
+                 verify-identity|finish-identity|self-check-identity|write-do|verify-do|finish-do|\
+                 self-check-do> <db_path>"
             );
             std::process::exit(2);
         }
@@ -102,6 +114,10 @@ fn main() {
         "verify-identity" => report(identity::verify_inner(&path)),
         "finish-identity" => report(identity::finish_inner(&path)),
         "self-check-identity" => identity::run_self_check(&path),
+        "write-do" => run_write_do(&path),
+        "verify-do" => report(do_block::verify_inner(&path)),
+        "finish-do" => report(do_block::finish_inner(&path)),
+        "self-check-do" => do_block::run_self_check(&path),
         other => {
             eprintln!("ERROR: unknown subcommand: {other}");
             2
@@ -908,6 +924,441 @@ mod identity {
 
 fn run_write_identity(path: &str) -> i32 {
     match identity::write_inner(path) {
+        Ok(()) => 0,
+        Err(reason) => {
+            eprintln!("ERROR: {reason}");
+            1
+        }
+    }
+}
+/// Issue #2229（SQL-68・RLS-10・RECOVER-11・RECOVER-12）の `DO` ブロックの段（`*-do` サブコマンド）。
+///
+/// `DO` の本体（複数表への INSERT）が「全か無か」で永続化され、明示 Tx で `USING OPERATION_ID` 付きの
+/// 証人 INSERT と同じコミットに載せた場合は台帳と本体の書き込みが原子的であることを、SIGKILL 後の
+/// 再オープンで検証する。`DO` 自体は `USING OPERATION_ID` を受理しない（`0A000`）ため、台帳の鍵は
+/// 証人表 `do_w` への INSERT が担う（設計記録 `docs/design/plpgsql-subset.md` 「Issue #2229 追記」）。
+mod do_block {
+    use super::*;
+
+    /// 本体が 3 行を書く表（`k` = 反復番号、`j` = 1..=3）。
+    const TABLE_A: &str = "do_a";
+    /// 本体が 1 行を書く表（`k` ごとにちょうど 1 行）。
+    const TABLE_B: &str = "do_b";
+    /// 証人表（奇数 `k` の明示 Tx で `USING OPERATION_ID 'do-<k>'` と一緒に書く）。
+    const TABLE_W: &str = "do_w";
+    /// 不干渉確認用の第 2 テナント。
+    const OTHER_TENANT: &str = "crash-tool-sequence-other";
+    /// 第 2 テナントの種行の `k`（反復番号とは重ならない負値）。
+    const SEED_K: i64 = -1;
+    /// 1 反復が `do_a` に書く行数。
+    const ROWS_PER_K: u64 = 3;
+
+    fn other_ctx() -> Result<PolicyContext, String> {
+        PolicyContext::with_visibilities(OTHER_TENANT, [Visibility::Public, Visibility::Private])
+            .map_err(|e| format!("invalid tenant context: {e}"))
+    }
+
+    /// 表と第 2 テナントの種行を冪等に用意する（再オープン時は重複エラー・既存の種行を無視する）。
+    fn ensure_schema(core: &EngineCore) -> Result<(), String> {
+        let ctx = tenant_ctx()?;
+        let mut session = SessionState::default();
+        session.allow_ddl();
+        for sql in [
+            format!("CREATE TABLE {TABLE_A} (k BIGINT, j INTEGER)"),
+            format!("CREATE TABLE {TABLE_B} (k BIGINT)"),
+            format!("CREATE TABLE {TABLE_W} (k BIGINT)"),
+        ] {
+            match core.execute_sql_in_session(&ctx, &mut session, &sql) {
+                Ok(_) => {}
+                Err(e) if is_already_exists(&e) => {}
+                Err(e) => return Err(format!("ddl failed ({sql}): {e}")),
+            }
+        }
+        let other = other_ctx()?;
+        let seeded = read_i64(
+            core,
+            &other,
+            &format!("SELECT k FROM {TABLE_A} LIMIT {SCAN_LIMIT}"),
+        )?;
+        if seeded.is_empty() {
+            let mut s = SessionState::default();
+            core.execute_sql_in_session(
+                &other,
+                &mut s,
+                &format!("INSERT INTO {TABLE_A} (k, j) VALUES ({SEED_K}, 0)"),
+            )
+            .map_err(|e| format!("seed failed: {e}"))?;
+        }
+        Ok(())
+    }
+
+    fn cell_i64(cell: Option<&Cell>) -> Result<i64, String> {
+        match cell {
+            Some(Cell::SignedInteger(v)) => Ok(*v),
+            Some(Cell::Integer(v)) => i64::try_from(*v).map_err(|_| "cell overflow".to_string()),
+            other => Err(format!("unexpected cell: {other:?}")),
+        }
+    }
+
+    /// 1 列目の整数を全件読む（`SCAN_LIMIT` へ達したら全件を見られないため fail-closed）。
+    fn read_i64(core: &EngineCore, ctx: &PolicyContext, sql: &str) -> Result<Vec<i64>, String> {
+        let r = core
+            .execute_sql(ctx, sql)
+            .map_err(|e| format!("scan failed ({sql}): {e}"))?;
+        if r.rows.len() as u64 >= SCAN_LIMIT {
+            return Err(format!(
+                "scan limit ({SCAN_LIMIT}) reached; reduce sets/iterations"
+            ));
+        }
+        r.rows
+            .iter()
+            .map(|row| cell_i64(row.cells.first()))
+            .collect()
+    }
+
+    /// 反復 `k` の `DO` 文（本体の文字列へはツール内部の整数だけを埋め込む）。
+    fn do_sql(k: u64) -> String {
+        format!(
+            "DO 'BEGIN INSERT INTO {TABLE_A} (k, j) VALUES ({k}, 1); \
+             INSERT INTO {TABLE_A} (k, j) VALUES ({k}, 2); \
+             INSERT INTO {TABLE_A} (k, j) VALUES ({k}, 3); \
+             INSERT INTO {TABLE_B} (k) VALUES ({k}); END'"
+        )
+    }
+
+    fn witness_sql(k: u64) -> String {
+        format!("INSERT INTO {TABLE_W} (k) VALUES ({k}) USING OPERATION_ID 'do-{k}'")
+    }
+
+    /// 反復 `k` を適用する。偶数は autocommit の `DO`、奇数は明示 Tx の `DO` + 証人 INSERT。
+    fn apply_k(core: &EngineCore, ctx: &PolicyContext, k: u64) -> Result<(), String> {
+        let mut session = SessionState::default();
+        if k.is_multiple_of(2) {
+            core.execute_sql_in_session(ctx, &mut session, &do_sql(k))
+                .map_err(|e| format!("do failed at k={k}: {e}"))?;
+        } else {
+            let mut txn = core.new_session_transaction();
+            for stmt in [
+                "BEGIN".to_string(),
+                do_sql(k),
+                witness_sql(k),
+                "COMMIT".to_string(),
+            ] {
+                core.execute_sql_in_txn(ctx, &mut session, &mut txn, &stmt)
+                    .map_err(|e| format!("txn statement failed at k={k}: {e}"))?;
+            }
+        }
+        Ok(())
+    }
+
+    /// オラクル本体（純関数）。`a` = `do_a` の `(k, j)`、`b` = `do_b` の `k`、`w` = `do_w` の `k`、
+    /// `ledger` = 台帳に記録済みの `k`。戻り値は `(do_a の行数, 適用済みの k の個数)`。
+    pub(super) fn check_state(
+        a: &[(i64, i64)],
+        b: &[i64],
+        w: &[i64],
+        ledger: &[i64],
+    ) -> Result<(u64, i64), String> {
+        use std::collections::BTreeMap;
+        let mut per_k: BTreeMap<i64, Vec<i64>> = BTreeMap::new();
+        for (k, j) in a {
+            per_k.entry(*k).or_default().push(*j);
+        }
+        let mut per_b: BTreeMap<i64, u64> = BTreeMap::new();
+        for k in b {
+            *per_b.entry(*k).or_default() += 1;
+        }
+        // (1) 全か無か: do_a がちょうど j=1..=3 ⟺ do_b がちょうど 1 行。
+        for (k, js) in &per_k {
+            let mut js = js.clone();
+            js.sort_unstable();
+            if js != [1, 2, 3] {
+                return Err(format!("partial do_a rows at k={k} (count={})", js.len()));
+            }
+            if per_b.get(k) != Some(&1) {
+                return Err(format!("do_a without exactly one do_b row at k={k}"));
+            }
+        }
+        if let Some(k) = per_b.keys().find(|k| !per_k.contains_key(k)) {
+            return Err(format!("do_b row without do_a rows at k={k}"));
+        }
+        // (2) 適用済みの k は 0 から連続する接頭辞。
+        let applied = i64::try_from(per_k.len()).map_err(|_| "overflow".to_string())?;
+        if per_k.keys().copied().ne(0..applied) {
+            return Err("applied k values are not a contiguous prefix from 0".to_string());
+        }
+        // (3) 台帳・証人・本体の書き込みが一致する（奇数 k のみ）。
+        for k in 0..applied {
+            let witnessed = w.iter().filter(|x| **x == k).count();
+            let recorded = ledger.contains(&k);
+            let expect = k % 2 == 1;
+            if witnessed != usize::from(expect) || recorded != expect {
+                return Err(format!(
+                    "ledger/witness/body mismatch at k={k} (witness={witnessed}, recorded={recorded})"
+                ));
+            }
+        }
+        if w.iter().chain(ledger).any(|k| *k >= applied || *k < 0) {
+            return Err("witness or ledger entry without an applied body".to_string());
+        }
+        let rows = u64::try_from(applied).map_err(|_| "overflow".to_string())? * ROWS_PER_K;
+        Ok((rows, applied))
+    }
+
+    fn read_a(core: &EngineCore, ctx: &PolicyContext) -> Result<Vec<(i64, i64)>, String> {
+        let r = core
+            .execute_sql(
+                ctx,
+                &format!("SELECT k, j FROM {TABLE_A} LIMIT {SCAN_LIMIT}"),
+            )
+            .map_err(|e| format!("scan failed: {e}"))?;
+        if r.rows.len() as u64 >= SCAN_LIMIT {
+            return Err(format!(
+                "scan limit ({SCAN_LIMIT}) reached; reduce sets/iterations"
+            ));
+        }
+        r.rows
+            .iter()
+            .map(|row| Ok((cell_i64(row.cells.first())?, cell_i64(row.cells.get(1))?)))
+            .collect()
+    }
+
+    fn recorded(core: &EngineCore, ctx: &PolicyContext, k: i64) -> Result<bool, String> {
+        use engine::recovery::ledger::LedgerLookup;
+        use engine::recovery::required_op_id::OperationId;
+        let op = OperationId::parse(&format!("do-{k}")).map_err(|e| format!("op id: {e:?}"))?;
+        match core.operation_recorded(ctx, TABLE_W, &op) {
+            Ok(LedgerLookup::Recorded) => Ok(true),
+            Ok(LedgerLookup::NotRecorded) => Ok(false),
+            Ok(LedgerLookup::NoLedger) => Err("ledger unavailable".to_string()),
+            Err(e) => Err(format!("ledger lookup failed: {e}")),
+        }
+    }
+
+    fn verify_with(core: &EngineCore, ctx: &PolicyContext) -> Result<(u64, i64), String> {
+        // 書き込みが走っていない前提（kill 後・finish 中）の連続 read。
+        let a_all = read_a(core, ctx)?;
+        let b_all = read_i64(
+            core,
+            ctx,
+            &format!("SELECT k FROM {TABLE_B} LIMIT {SCAN_LIMIT}"),
+        )?;
+        let w_all = read_i64(
+            core,
+            ctx,
+            &format!("SELECT k FROM {TABLE_W} LIMIT {SCAN_LIMIT}"),
+        )?;
+        // 台帳は奇数 k を、適用済みの個数 + 2 まで探る（未適用の k が記録されていれば検出する）。
+        let probe_to = i64::try_from(a_all.len() as u64 / ROWS_PER_K + 2)
+            .map_err(|_| "overflow".to_string())?;
+        let mut ledger = Vec::new();
+        for k in (1..probe_to).step_by(2) {
+            if recorded(core, ctx, k)? {
+                ledger.push(k);
+            }
+        }
+        let state = check_state(&a_all, &b_all, &w_all, &ledger)?;
+        // (4) 第 2 テナントは種行のまま、台帳に do-* が載っていない。
+        let other = other_ctx()?;
+        let seen = read_i64(
+            core,
+            &other,
+            &format!("SELECT k FROM {TABLE_A} LIMIT {SCAN_LIMIT}"),
+        )?;
+        if seen != [SEED_K] {
+            return Err(format!("other tenant rows changed (count={})", seen.len()));
+        }
+        for k in 0..probe_to {
+            if recorded(core, &other, k)? {
+                return Err("other tenant ledger holds a do-* entry".to_string());
+            }
+        }
+        Ok(state)
+    }
+
+    pub(super) fn verify_inner(path: &str) -> Result<(u64, i64), String> {
+        let core = open_core(path)?;
+        verify_with(&core, &tenant_ctx()?)
+    }
+
+    pub(super) fn write_inner(path: &str) -> Result<(), String> {
+        let core = open_core(path)?;
+        ensure_schema(&core)?;
+        let ctx = tenant_ctx()?;
+        // 再開: verify が接頭辞を保証しているため、既存の行数から次の k を決める。
+        let first = u64::try_from(read_a(&core, &ctx)?.len())
+            .map_err(|_| "overflow".to_string())?
+            / ROWS_PER_K;
+        let stdout = std::io::stdout();
+        let mut handle = stdout.lock();
+        for k in first..first.saturating_add(MAX_ROWS) {
+            apply_k(&core, &ctx, k)?;
+            let total = (k + 1) * ROWS_PER_K;
+            writeln!(handle, "COMMITTED op=do-{k} rows={total} n={}", k + 1)
+                .map_err(|e| format!("stdout write failed: {e}"))?;
+            handle
+                .flush()
+                .map_err(|e| format!("stdout flush failed: {e}"))?;
+            std::thread::sleep(std::time::Duration::from_millis(15));
+        }
+        Ok(())
+    }
+
+    pub(super) fn finish_inner(path: &str) -> Result<(u64, i64), String> {
+        let core = open_core(path)?;
+        ensure_schema(&core)?;
+        let ctx = tenant_ctx()?;
+        let (mut rows, mut max) = verify_with(&core, &ctx)?;
+        // 再送対象の奇数 k が無いほど短い実行でも検証が空振りしないよう、足りない分を適用する。
+        while max < 2 {
+            apply_k(
+                &core,
+                &ctx,
+                u64::try_from(max).map_err(|_| "overflow".to_string())?,
+            )?;
+            (rows, max) = verify_with(&core, &ctx)?;
+        }
+        let applied = u64::try_from(max).map_err(|_| "overflow".to_string())?;
+        let last_odd = if (applied - 1) % 2 == 1 {
+            applied - 1
+        } else {
+            applied - 2
+        };
+
+        // (i) 順序 B（DO が先、続く証人 INSERT が台帳で拒否される）の再送は全体が破棄される。
+        let mut session = SessionState::default();
+        let mut txn = core.new_session_transaction();
+        core.execute_sql_in_txn(&ctx, &mut session, &mut txn, "BEGIN")
+            .map_err(|e| format!("begin failed: {e}"))?;
+        core.execute_sql_in_txn(&ctx, &mut session, &mut txn, &do_sql(last_odd))
+            .map_err(|e| format!("resend do failed: {e}"))?;
+        match core.execute_sql_in_txn(&ctx, &mut session, &mut txn, &witness_sql(last_odd)) {
+            Err(SqlSurfaceError::DuplicateOperationId) => {}
+            Err(e) => return Err(format!("resend failed with an unexpected error: {e}")),
+            Ok(_) => return Err("resend of a committed operation_id was wrongly accepted".into()),
+        }
+        core.execute_sql_in_txn(&ctx, &mut session, &mut txn, "ROLLBACK")
+            .map_err(|e| format!("rollback failed: {e}"))?;
+        let after = verify_with(&core, &ctx)?;
+        if after != (rows, max) {
+            return Err(format!(
+                "resend changed the tables: before=({rows},{max}) after=({},{})",
+                after.0, after.1
+            ));
+        }
+        // (ii) `DO ... USING OPERATION_ID` は受理せず（0A000）、何も書かない。
+        let mut s2 = SessionState::default();
+        let sql = format!("{} USING OPERATION_ID 'do-x'", do_sql(applied));
+        match core.execute_sql_in_session(&ctx, &mut s2, &sql) {
+            Err(e) if e.wire_code() == "0A000" => {}
+            Err(e) => return Err(format!("unexpected error for DO USING OPERATION_ID: {e}")),
+            Ok(_) => return Err("DO USING OPERATION_ID was wrongly accepted".to_string()),
+        }
+        if verify_with(&core, &ctx)? != (rows, max) {
+            return Err("rejected DO USING OPERATION_ID changed the tables".to_string());
+        }
+        // (iii) 新しい k がちょうど 1 回分だけ適用される。
+        apply_k(&core, &ctx, applied)?;
+        let done = verify_with(&core, &ctx)?;
+        if done != (rows + ROWS_PER_K, max + 1) {
+            return Err(format!("unexpected state after the new k: {done:?}"));
+        }
+        Ok(done)
+    }
+
+    pub(super) fn run_self_check(path: &str) -> i32 {
+        match self_check_inner(path) {
+            Ok(()) => {
+                println!("SELF-CHECK ok=true");
+                0
+            }
+            Err(reason) => {
+                println!("SELF-CHECK ok=false reason={reason}");
+                1
+            }
+        }
+    }
+
+    fn self_check_inner(path: &str) -> Result<(), String> {
+        let full = |k: i64| [(k, 1), (k, 2), (k, 3)];
+        // 妥当な状態（k=0 は autocommit、k=1 は証人と台帳つき）。
+        let a: Vec<(i64, i64)> = full(0).into_iter().chain(full(1)).collect();
+        if check_state(&a, &[0, 1], &[1], &[1]) != Ok((6, 2)) {
+            return Err("oracle rejected a valid state".to_string());
+        }
+        type Case = (&'static str, Vec<(i64, i64)>, Vec<i64>, Vec<i64>, Vec<i64>);
+        let bad: Vec<Case> = vec![
+            ("do_a only", full(0).to_vec(), vec![], vec![], vec![]),
+            ("do_b only", vec![], vec![0], vec![], vec![]),
+            (
+                "partial do_a",
+                vec![(0, 1), (0, 2)],
+                vec![0],
+                vec![],
+                vec![],
+            ),
+            (
+                "duplicate do_b",
+                full(0).to_vec(),
+                vec![0, 0],
+                vec![],
+                vec![],
+            ),
+            ("gap in k", full(1).to_vec(), vec![1], vec![1], vec![1]),
+            (
+                "ledger without witness",
+                a.clone(),
+                vec![0, 1],
+                vec![],
+                vec![1],
+            ),
+            (
+                "witness without ledger",
+                a.clone(),
+                vec![0, 1],
+                vec![1],
+                vec![],
+            ),
+            (
+                "ledger without body effect",
+                full(0).to_vec(),
+                vec![0],
+                vec![],
+                vec![1],
+            ),
+            (
+                "duplicate witness",
+                a.clone(),
+                vec![0, 1],
+                vec![1, 1],
+                vec![1],
+            ),
+        ];
+        for (label, a, b, w, ledger) in &bad {
+            if check_state(a, b, w, ledger).is_ok() {
+                return Err(format!("oracle accepted a bad state: {label}"));
+            }
+        }
+        // DB 経由: do_a だけが書かれた状態を verify 本体が検出する。
+        let core = open_core(path)?;
+        ensure_schema(&core)?;
+        let ctx = tenant_ctx()?;
+        let mut session = SessionState::default();
+        core.execute_sql_in_session(
+            &ctx,
+            &mut session,
+            &format!("INSERT INTO {TABLE_A} (k, j) VALUES (0, 1)"),
+        )
+        .map_err(|e| format!("self-check insert failed: {e}"))?;
+        if verify_with(&core, &ctx).is_ok() {
+            return Err("oracle accepted a partial state written to the database".to_string());
+        }
+        Ok(())
+    }
+}
+
+fn run_write_do(path: &str) -> i32 {
+    match do_block::write_inner(path) {
         Ok(()) => 0,
         Err(reason) => {
             eprintln!("ERROR: {reason}");

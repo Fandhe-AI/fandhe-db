@@ -24,7 +24,7 @@ use crate::sql::SqlOutcome;
 use crate::storage::{Storage, Visibility};
 use crate::test_util::temp_db::{unique_db_path, CleanupGuard};
 
-fn new_core(mode: LedgerMode) -> (EngineCore, CleanupGuard) {
+pub(super) fn new_core(mode: LedgerMode) -> (EngineCore, CleanupGuard) {
     let path = unique_db_path("plpgsql-host");
     let storage = Storage::open(&path).expect("open storage");
     storage
@@ -45,17 +45,21 @@ fn new_core(mode: LedgerMode) -> (EngineCore, CleanupGuard) {
     )
 }
 
-fn ctx(tenant: &str) -> PolicyContext {
+pub(super) fn ctx(tenant: &str) -> PolicyContext {
     PolicyContext::with_visibilities(tenant, [Visibility::Public, Visibility::Private])
         .expect("valid tenant")
 }
 
-fn sql(core: &EngineCore, c: &PolicyContext, s: &str) -> Result<SqlOutcome, SqlSurfaceError> {
+pub(super) fn sql(
+    core: &EngineCore,
+    c: &PolicyContext,
+    s: &str,
+) -> Result<SqlOutcome, SqlSurfaceError> {
     let mut session = SessionState::default();
     core.execute_sql_in_session(c, &mut session, s)
 }
 
-fn count(core: &EngineCore, c: &PolicyContext) -> u64 {
+pub(super) fn count(core: &EngineCore, c: &PolicyContext) -> u64 {
     let SqlOutcome::Query(q) = sql(core, c, "SELECT COUNT(*) FROM docs").expect("count") else {
         panic!("expected query");
     };
@@ -65,7 +69,7 @@ fn count(core: &EngineCore, c: &PolicyContext) -> u64 {
     }
 }
 
-fn seed(core: &EngineCore, c: &PolicyContext, ids: &[u64], lang: &str) {
+pub(super) fn seed(core: &EngineCore, c: &PolicyContext, ids: &[u64], lang: &str) {
     for id in ids {
         sql(
             core,
@@ -78,18 +82,18 @@ fn seed(core: &EngineCore, c: &PolicyContext, ids: &[u64], lang: &str) {
     }
 }
 
-fn int(i: i64) -> PlScalar {
+pub(super) fn int(i: i64) -> PlScalar {
     PlScalar::new(Cell::SignedInteger(i), ColumnType::Integer)
 }
 
-fn text(s: &str) -> PlScalar {
+pub(super) fn text(s: &str) -> PlScalar {
     PlScalar::new(Cell::Text(s.to_string()), ColumnType::Text)
 }
 
-const WRITE: PlCallOptions = PlCallOptions { may_write: true };
+pub(super) const WRITE: PlCallOptions = PlCallOptions { may_write: true };
 
 /// 戻り値の整数（`Integer`／`BigInt` のセル）。
-fn as_i64(out: &CallOutcome) -> i64 {
+pub(super) fn as_i64(out: &CallOutcome) -> i64 {
     match out {
         CallOutcome::Scalar(PlScalar {
             cell: Cell::SignedInteger(i),
@@ -103,7 +107,7 @@ fn as_i64(out: &CallOutcome) -> i64 {
     }
 }
 
-struct Call<'a> {
+pub(super) struct Call<'a> {
     src: &'a str,
     params: Vec<(&'a str, SqlColumnTypeName)>,
     args: Vec<PlScalar>,
@@ -112,7 +116,7 @@ struct Call<'a> {
     opts: PlCallOptions,
 }
 
-fn call<'a>(src: &'a str) -> Call<'a> {
+pub(super) fn call<'a>(src: &'a str) -> Call<'a> {
     Call {
         src,
         params: Vec::new(),
@@ -124,24 +128,24 @@ fn call<'a>(src: &'a str) -> Call<'a> {
 }
 
 impl<'a> Call<'a> {
-    fn param(mut self, name: &'a str, ty: SqlColumnTypeName, arg: PlScalar) -> Self {
+    pub(super) fn param(mut self, name: &'a str, ty: SqlColumnTypeName, arg: PlScalar) -> Self {
         self.params.push((name, ty));
         self.args.push(arg);
         self
     }
 
-    fn set_of(mut self, ty: ColumnType) -> Self {
+    pub(super) fn set_of(mut self, ty: ColumnType) -> Self {
         self.shape = ReturnShape::SetOf;
         self.ty = Some(ty);
         self
     }
 
-    fn returns(mut self, ty: ColumnType) -> Self {
+    pub(super) fn returns(mut self, ty: ColumnType) -> Self {
         self.ty = Some(ty);
         self
     }
 
-    fn read_only(mut self) -> Self {
+    pub(super) fn read_only(mut self) -> Self {
         self.opts = PlCallOptions { may_write: false };
         self
     }
@@ -169,7 +173,7 @@ impl<'a> Call<'a> {
     }
 
     /// 開いている Tx（明示・暗黙）へ参加して実行する。
-    fn in_txn<'e>(
+    pub(super) fn in_txn<'e>(
         &self,
         core: &'e EngineCore,
         c: &PolicyContext,
@@ -191,7 +195,7 @@ impl<'a> Call<'a> {
     }
 
     /// autocommit の入口で実行する。
-    fn autocommit(
+    pub(super) fn autocommit(
         &self,
         core: &EngineCore,
         c: &PolicyContext,
