@@ -596,11 +596,13 @@ fn check_unambiguous(
 /// 本文の結果列のうち、述語が評価できる型（`VECTOR`・`ARRAY` 以外）を返す。
 fn evaluable_type(meta: &ColumnMeta) -> Option<&ColumnType> {
     // 公開されている `id` 結果列は NULL を取りうる（LEFT JOIN の右辺・集合演算）ため、
-    // 疑似列ではなく NULL 可能な `BIGINT` の実列として合成スキーマへ載せる
+    // 疑似列ではなく NULL 可能な numeric(20,0)（疑似列 `id` と同じ型）の実列として合成スキーマへ載せる
     // （束縛器は同名の実列を疑似列 `id` より優先する。NULL を 0 として評価しない）。
-    static ID_TYPE: ColumnType = ColumnType::BigInt;
+    // BIGINT にすると `normalize_cell` が i64 変換で `i64::MAX` 超の行 id を `22003` にするため
+    // numeric で運ぶ（Issue #2744。JOIN 側 `plan_rows_layer`・再帰 CTE `work_column` と同じ写像）。
+    // 結果列の公告（`ColumnMeta::Id`）とセル（`Cell::Integer(u64)`）は変えない。
     let ty = match meta {
-        ColumnMeta::Id => &ID_TYPE,
+        ColumnMeta::Id => &crate::sql::exec::ALIASED_ID_TYPE,
         ColumnMeta::AliasedId { .. } => &crate::sql::exec::ALIASED_ID_TYPE,
         ColumnMeta::Scalar { ty, .. } => ty,
         ColumnMeta::Computed { ty: Some(ty), .. } => ty,
@@ -1565,6 +1567,48 @@ mod tests {
         .unwrap();
         assert!(out.rows.is_empty());
         let out = run(r, &view(Projection::All, vec![eq(3)], vec![], 10, 0)).unwrap();
+        assert_eq!(out.rows.len(), 1);
+    }
+
+    /// `i64::MAX` を超える行 id を公開した `id` 結果列でも、外側の `WHERE` は `22003` にならない
+    /// （numeric で評価する。Issue #2744）。
+    #[test]
+    fn where_on_exposed_id_column_accepts_ids_above_i64_max() {
+        let huge = i64::MAX as u64 + 7;
+        let mut r = result();
+        r.columns.push(ColumnMeta::Id);
+        for (i, row) in r.rows.iter_mut().enumerate() {
+            row.cells.push(if i == 0 {
+                Cell::Integer(huge)
+            } else {
+                Cell::Integer(1)
+            });
+        }
+        let total = r.rows.len();
+        let gt = |n: &str| {
+            WherePredicate::Expression(Expr::Binary {
+                op: BinOp::Gt,
+                lhs: Box::new(Expr::Ident("id".to_string())),
+                rhs: Box::new(Expr::Number(n.to_string())),
+            })
+        };
+        let out = run(
+            r.clone(),
+            &view(Projection::All, vec![gt("0")], vec![], 10, 0),
+        )
+        .unwrap();
+        assert_eq!(out.rows.len(), total);
+        let out = run(
+            r,
+            &view(
+                Projection::All,
+                vec![gt("9223372036854775807")],
+                vec![],
+                10,
+                0,
+            ),
+        )
+        .unwrap();
         assert_eq!(out.rows.len(), 1);
     }
 

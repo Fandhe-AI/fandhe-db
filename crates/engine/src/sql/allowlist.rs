@@ -11144,6 +11144,41 @@ impl<'a> Parser<'a> {
                 self.consume_expr_node()?;
                 Ok(Expr::Number(n))
             }
+            // 内部専用の型付き数値（`plpgsql::subst` の `Role::ConstExpr` 置換だけが作る合成識別子
+            // `$typed:<型>` + 数値。`$` で始まる識別子は字句解析器が生成しない）。
+            Some(Token::Ident(name))
+                if name.starts_with(crate::sql::udf_call::TYPED_VALUE_PREFIX)
+                    && matches!(self.tokens.get(self.pos + 1), Some(Token::Number(_))) =>
+            {
+                self.advance();
+                let Some(Token::Number(raw)) = self.advance().cloned() else {
+                    return Err(SqlSurfaceError::unsupported("expected a typed number"));
+                };
+                self.consume_expr_node()?;
+                self.consume_expr_node()?;
+                Ok(crate::sql::udf_call::typed_value_expr(&name, raw))
+            }
+            // 符号付き（直前の `-` を数値へ畳む。`i32::MIN` のような負の境界値を範囲内に保つ）。
+            Some(Token::Punct('-'))
+                if matches!(
+                    (self.tokens.get(self.pos + 1), self.tokens.get(self.pos + 2)),
+                    (Some(Token::Ident(n)), Some(Token::Number(_)))
+                        if n.starts_with(crate::sql::udf_call::TYPED_VALUE_PREFIX)
+                ) =>
+            {
+                self.advance();
+                let (Some(Token::Ident(name)), Some(Token::Number(raw))) =
+                    (self.advance().cloned(), self.advance().cloned())
+                else {
+                    return Err(SqlSurfaceError::unsupported("expected a typed number"));
+                };
+                self.consume_expr_node()?;
+                self.consume_expr_node()?;
+                Ok(crate::sql::udf_call::typed_value_expr(
+                    &name,
+                    format!("-{raw}"),
+                ))
+            }
             // Issue #1430・SQL-24: 負の数値リテラル（字句ペア `-` + Number を 1 ノードの
             // 数値へ畳む）。`-col`・`-(expr)`・`- -1` は一般の単項マイナスとして受理せず、
             // 下の既定分岐で従来どおり `42601` のままとする（fail-closed）。
@@ -12895,6 +12930,11 @@ impl<'a> Parser<'a> {
                         || s.eq_ignore_ascii_case("null"));
                 !plain_keyword
             }
+            // 符号付きの内部専用の型付き数値（`- $typed:<型> <数値>`）も式として解析する。
+            Some(Token::Punct('-')) => matches!(
+                self.tokens.get(self.pos + 1),
+                Some(Token::Ident(n)) if n.starts_with(crate::sql::udf_call::TYPED_VALUE_PREFIX)
+            ),
             // 記録区間でスコープ内レコード変数の `rec.field` で始まる式（記録区間が無ければ偽）。
             Some(Token::QualifiedIdent { .. }) => self.peek_is_scope_record_at(self.pos),
             _ => false,
@@ -12919,10 +12959,47 @@ impl<'a> Parser<'a> {
         // 関数引数の `NULL` も列参照ではなく `NULL` 定数として解析する
         // （型は `const_expr::fold_null_call` が決める）。
         let prev_null_args = std::mem::replace(&mut self.const_expr_null_args, true);
-        let parsed = self.parse_value_expr_with_null_context(0, true);
+        let parsed = {
+            // 記録区間では、要素内の変数を定数式の役割（`Role::ConstExpr`）で記録する。
+            let _const_scope = super::colref_sink::const_expr_scope();
+            self.parse_value_expr_with_null_context(0, true)
+        };
         self.const_expr_null_args = prev_null_args;
         self.expr_node_budget = saved;
-        crate::sql::const_expr::fold_const_literal_deferrable(&parsed?, span_start..self.pos)
+        let parsed = parsed?;
+        self.mark_lone_const_element(span_start..self.pos);
+        crate::sql::const_expr::fold_const_literal_deferrable(&parsed, span_start..self.pos)
+    }
+
+    /// 定数式の要素の解析区間 `span`（要素の先頭から解析終了位置まで）が、符号 `-` と冗長な括弧を
+    /// 除いて変数 1 個だけなら、その変数の記録を [`super::colref_sink::Role::ConstLone`] へ昇格する
+    /// （記録区間が無ければ何もしない）。`plpgsql::subst` が numeric を裸の数値で置換してよい
+    /// 「要素全体が変数 1 個」の判定の唯一の根拠で、解析区間の境界はこの構文解析器が確定している。
+    fn mark_lone_const_element(&self, span: std::ops::Range<usize>) {
+        let (mut lo, mut hi) = (span.start, span.end);
+        let mut negated = false;
+        while hi > lo.saturating_add(1) {
+            let first = self.tokens.get(lo);
+            let last = hi.checked_sub(1).and_then(|i| self.tokens.get(i));
+            if !negated && matches!(first, Some(Token::Punct('-'))) {
+                negated = true;
+                lo += 1;
+            } else if hi - lo >= 3
+                && matches!(first, Some(Token::Punct('(')))
+                && matches!(last, Some(Token::Punct(')')))
+            {
+                lo += 1;
+                hi -= 1;
+            } else {
+                return;
+            }
+        }
+        if hi == lo.saturating_add(1) {
+            if let Some(t @ (Token::Ident(_) | Token::QualifiedIdent { .. })) = self.tokens.get(lo)
+            {
+                super::colref_sink::mark_const_lone(t);
+            }
+        }
     }
 
     /// `UPDATE ... SET <col> = <右辺>` の右辺の入口（Issue #1544・SQL-45 のポインタ）。
@@ -24492,10 +24569,11 @@ fn materialized_cte_statement(
             if projects_id && hazards.declares_real_id {
                 return None;
             }
-            // 具体化結果の疑似列 `id` は `BIGINT` として運ばれ、外側が値を評価（述語・集計・式・
-            // 並べ替え）すると `i64::MAX` 超の行 id で `22003` になる（インラインは `u64` のまま
-            // 評価できる。例: `MAX(id)`）。素通し射影（`*`・列名のみ）以外で `id` を読みうる外側は、
-            // 列別名で名前を追えない場合も含め安全側でインライン展開へ戻す（Issue #1860 レビュー指摘）。
+            // 具体化結果の外側の評価は `id` を numeric(20,0) で行う（Issue #2744）ため
+            // `i64::MAX` 超の行 id でも `22003` にならない。ただしインライン展開との型公告の差
+            // （`SUM`／`AVG(id)` の精度等）を避けるため、素通し射影（`*`・列名のみ）以外で `id` を
+            // 読みうる外側は、列別名で名前を追えない場合も含め現状は安全側でインライン展開へ戻す
+            // （Issue #1860 レビュー指摘。この回避の撤去は別判断）。
             let exposes_id = match &body_projection {
                 Projection::All => true,
                 Projection::Columns(names) => names.iter().any(|n| n.eq_ignore_ascii_case("id")),

@@ -202,6 +202,8 @@
   BREAKING CHANGE: 分割送出の最終 Execute の完了タグ（例: 5 行を `max_rows=2` で 3 回に分けた最後が `SELECT 5` から
   `SELECT 1`）と、行がちょうど尽きた回の応答（`CommandComplete` から `PortalSuspended`）が変わる。
   `FETCH` は utility 文のため対象外で、完了タグは分割しても FETCH 文全体の取得件数（`FETCH 5`）のまま。
+- 単一表の具体化 CTE・評価後射影形ビューの外側で、`i64::MAX` を超える行 id を `22003` にせず評価するようにした
+  （Issue #2744・SQL-62）。外側の `MIN`／`MAX`／`SUM`／`AVG(id)` と `GROUP BY id` の結果型は numeric になる。
 
 ### Breaking Changes
 
