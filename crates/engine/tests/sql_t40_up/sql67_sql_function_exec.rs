@@ -344,6 +344,34 @@ fn result_shape_errors_at_call_time() {
     assert_eq!(code(&core, &mut s, "SELECT mism()"), "42P13");
 }
 
+/// `RETURNS numeric` でも NULL 結果（空の表・NULL 値）が列型の検査を迂回しない。
+#[test]
+fn numeric_return_checks_column_type_even_for_null_results() {
+    let (core, mut s, _g) = setup("sql67_exec_numeric_null");
+    run(&core, &mut s, "alice", "CREATE TABLE nt (name text)");
+    run(
+        &core,
+        &mut s,
+        "alice",
+        "CREATE FUNCTION nt_name() RETURNS numeric LANGUAGE sql AS $$ SELECT name FROM nt $$",
+    );
+    assert_eq!(code(&core, &mut s, "SELECT nt_name()"), "42P13");
+    run(
+        &core,
+        &mut s,
+        "alice",
+        "CREATE FUNCTION null_date() RETURNS numeric LANGUAGE sql AS $$ SELECT NULL::date $$",
+    );
+    assert_eq!(code(&core, &mut s, "SELECT null_date()"), "42P13");
+    run(
+        &core,
+        &mut s,
+        "alice",
+        "CREATE FUNCTION null_int() RETURNS numeric LANGUAGE sql AS $$ SELECT NULL::int $$",
+    );
+    assert_eq!(one(&core, &mut s, "SELECT null_int()"), Cell::Null);
+}
+
 #[test]
 fn recursion_hits_the_call_depth_limit_with_no_side_effects() {
     let (core, mut s, _g) = setup("sql67_exec_depth");

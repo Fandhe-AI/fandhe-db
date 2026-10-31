@@ -450,7 +450,6 @@ fn calls_non_builtin_function(tokens: &[Token]) -> bool {
         "COLLATE",
         "CAST",
         "EXTRACT",
-        "WINDOW",
         "FROM",
         "BY",
         "END",
@@ -458,7 +457,6 @@ fn calls_non_builtin_function(tokens: &[Token]) -> bool {
         "TRUE",
         "FALSE",
         "UNNEST",
-        "RETURNING",
         "ON",
         "DEFAULT",
         "JSON_EXISTS",
@@ -1122,6 +1120,8 @@ mod tests {
             "SELECT plan(1)",
             "SELECT materialized()",
             "SELECT filter(1), over(2), search(3), rows(4)",
+            "SELECT returning()",
+            "SELECT window(1)",
         ] {
             assert_eq!(classify_statement(sql), StatementEffect::Write, "{sql}");
         }

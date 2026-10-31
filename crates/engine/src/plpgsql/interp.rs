@@ -554,7 +554,15 @@ fn sql_function_result(out: SqlOutcome, ret: &CastType) -> Result<PlScalar, SqlS
     // 修飾子なしの `numeric` は値の scale を保つ（`numeric(38,16)` へ丸めない）。
     if matches!(ret, CastType::Numeric(None)) {
         match (&v.cell, col_ty) {
-            (Cell::Null, _) => return Ok(PlScalar::null(ret_ty)),
+            // NULL の早期 return は列型が numeric 互換のときに限る（他の列型は後段の代入互換性検査
+            // へ進み、行の有無・値にかかわらず型不一致を `42P13` で拒否する）。
+            (
+                Cell::Null,
+                ColumnType::Numeric { .. }
+                | ColumnType::SmallInt
+                | ColumnType::Integer
+                | ColumnType::BigInt,
+            ) => return Ok(PlScalar::null(ret_ty)),
             (Cell::Numeric(_), ColumnType::Numeric { .. }) => {
                 return Ok(PlScalar::new(v.cell, ret_ty))
             }
