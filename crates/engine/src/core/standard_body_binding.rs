@@ -101,9 +101,25 @@ impl EmbeddedSqlChecker for BindingChecker<'_> {
     }
 }
 
-/// ルートの DML 文の対象表名（`INSERT INTO <t>`・`UPDATE [ONLY] <t>`・`DELETE FROM [ONLY] <t>`）。
-/// 構造専用の解析は DML の対象表を引かないため、標準形の定義時に明示的に存在を確認する。
-fn dml_target(tokens: &[Token]) -> Option<&str> {
+/// 文のトークン列に現れる DML の対象表名（`INSERT INTO <t>`・`UPDATE [ONLY] <t>`・
+/// `DELETE FROM [ONLY] <t>`）を、データ変更 CTE（`WITH d AS (DELETE FROM t ...)`）の内側も含めて
+/// 位置を問わず集める。構造専用の解析は DML の対象表を引かないため、標準形の定義時に明示的に存在を
+/// 確認し依存辺へ載せる。`ON CONFLICT DO UPDATE SET`・`FOR UPDATE` の `UPDATE` は対象表を取らないので除く。
+fn dml_targets(tokens: &[Token]) -> Vec<&str> {
+    (0..tokens.len())
+        .filter_map(|i| dml_target_at(tokens, i))
+        .collect()
+}
+
+/// 位置 `at` から始まる DML の対象表名（[`dml_targets`] の 1 位置分）。
+fn dml_target_at(tokens: &[Token], at: usize) -> Option<&str> {
+    let tokens_all = tokens;
+    let tokens = tokens.get(at..)?;
+    let prev_is = |w: &str| {
+        at.checked_sub(1)
+            .and_then(|p| tokens_all.get(p))
+            .is_some_and(|t| matches!(t, Token::Ident(x) if x.eq_ignore_ascii_case(w)))
+    };
     let ident_at = |i: usize| match tokens.get(i) {
         Some(Token::Ident(n)) => Some(n.as_str()),
         _ => None,
@@ -114,7 +130,10 @@ fn dml_target(tokens: &[Token]) -> Option<&str> {
         return ident_at(2);
     }
     if is(0, "UPDATE") {
-        return ident_at(skip_only(1));
+        if prev_is("DO") || prev_is("FOR") {
+            return None;
+        }
+        return ident_at(skip_only(1)).filter(|n| !n.eq_ignore_ascii_case("SET"));
     }
     if is(0, "DELETE") && matches!(tokens.get(1), Some(Token::Keyword(Keyword::From))) {
         return ident_at(skip_only(2));
@@ -123,13 +142,19 @@ fn dml_target(tokens: &[Token]) -> Option<&str> {
 }
 
 /// 文のトークン列に現れる `名前(`（関数呼び出しの形）の名前を集める（小文字化。重複は呼び出し側で除く）。
+/// `INSERT INTO f(a)` の対象表と列リスト、`AS x(a, b)` の別名と列別名リストは呼び出しではないので除く。
 fn call_names(tokens: &[Token]) -> impl Iterator<Item = String> + '_ {
-    tokens
-        .windows(2)
-        .filter_map(|w| match (w.first(), w.get(1)) {
-            (Some(Token::Ident(n)), Some(Token::Punct('('))) => Some(n.to_ascii_lowercase()),
-            _ => None,
-        })
+    tokens.iter().enumerate().filter_map(move |(i, t)| {
+        let (Token::Ident(n), Some(Token::Punct('('))) = (t, tokens.get(i + 1)) else {
+            return None;
+        };
+        let decl = matches!(
+            i.checked_sub(1).and_then(|p| tokens.get(p)),
+            Some(Token::Ident(w))
+                if ["INTO", "AS", "UPDATE", "ONLY"].iter().any(|k| w.eq_ignore_ascii_case(k))
+        );
+        (!decl).then(|| n.to_ascii_lowercase())
+    })
 }
 
 impl EngineCore {
@@ -175,7 +200,7 @@ impl EngineCore {
         let mut functions: BTreeSet<String> = BTreeSet::new();
         for stmt in &body.block.stmts {
             let Stmt::Sql(q) = stmt else { continue };
-            if let Some(target) = dml_target(&q.tokens) {
+            for target in dml_targets(&q.tokens) {
                 if !checker.lookup.table_exists(target)? {
                     return Err(SqlSurfaceError::UndefinedTable {
                         name: target.to_string(),

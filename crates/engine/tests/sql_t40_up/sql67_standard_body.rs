@@ -512,3 +512,35 @@ fn quoted_clause_words_stay_identifiers() {
     );
     assert_eq!(one(&core, &mut s, "SELECT q2()"), int(5));
 }
+
+/// `INSERT INTO f(a)` の対象表・列リストは関数呼び出しではない（同名の関数 `f` を定義しても自己参照にならない）。
+#[test]
+fn insert_target_with_column_list_is_not_a_call() {
+    let (core, mut s, _g) = setup("sql67_std_insert_cols");
+    run(&core, &mut s, "alice", "CREATE TABLE f (a INTEGER)");
+    run(
+        &core,
+        &mut s,
+        "alice",
+        "CREATE FUNCTION f(x int) RETURNS int BEGIN ATOMIC INSERT INTO f(a) VALUES (x); SELECT x; END",
+    );
+    // 対象表への依存辺が残り、表の DROP は 2BP01 で止まる。
+    assert_eq!(code(&core, &mut s, "DROP TABLE f"), "2BP01");
+}
+
+/// データ変更 CTE を含む本体は定義時に拒否される（依存辺を取りこぼす形を保存しない。fail-closed）。
+/// 対象表が存在しない場合も同じ拒否で、依存を迂回して保存される経路は無い。
+#[test]
+fn data_modifying_cte_is_rejected_at_definition_time() {
+    let (core, mut s, _g) = setup("sql67_std_cte_dep");
+    for target in ["t", "nope"] {
+        let sql = format!(
+            "CREATE FUNCTION fd(x int) RETURNS int BEGIN ATOMIC \
+             WITH d AS (DELETE FROM {target} WHERE a = x RETURNING a) SELECT x; END"
+        );
+        let e = err(&core, &mut s, "alice", &sql);
+        assert!(["42601", "42P01"].contains(&e.wire_code()), "{sql}: {e}");
+    }
+    // 何も保存されていないので表は DROP できる。
+    run(&core, &mut s, "alice", "DROP TABLE t");
+}
