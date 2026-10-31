@@ -2,7 +2,7 @@
 //! ポインタ: `docs/spec/04-behavior/sql-surface.md` SQL-67 (3)、`indexing.md` INDEX-10・INDEX-11。
 //! 言語・属性の受理と再起動後の保持、揮発性による式索引・部分索引の判定（`42P17`）、
 //! テナント境界（他テナントの関数が結果を変えない）を production 経路で固定する。
-//! `LANGUAGE sql|plpgsql` の関数の呼び出しは #2218 が結線するまで `42883` になる（暫定の挙動）。
+//! `LANGUAGE sql|plpgsql` の関数の呼び出しは #2218 が結線した（本体の実行は `sql67_sql_function_exec`）。
 
 use engine::core::EngineCore;
 use engine::kernel::CpuScalarProvider;
@@ -266,18 +266,37 @@ fn declarative_functions_keep_their_behavior() {
 }
 
 #[test]
-fn routine_calls_are_undefined_until_the_execution_path_lands() {
-    // 暫定の挙動（#2218 が解消する）: sql／plpgsql の関数は式から呼べず 42883。
+fn routine_calls_run_in_the_defining_session_and_in_loaded_sessions() {
+    // Issue #2218: sql／plpgsql の関数は、作成した同じセッションと、カタログからロードした別セッションの
+    // 両方で式から呼べる。ロードしていない（カタログを引かない）入口 `execute_sql` では未定義（42883）。
     let (path, _g) = setup("sql67_call");
     let core = open(&path);
-    run(
-        &core,
+    let mut s = ddl_session();
+    let c = ctx_of("alice");
+    for sql in [
         "CREATE FUNCTION f(a int) RETURNS int LANGUAGE sql AS $$ SELECT a $$",
-    )
-    .expect("f");
-    let e = core
-        .execute_sql(&ctx_of("alice"), "SELECT f(1)")
-        .expect_err("call");
+        "CREATE FUNCTION g(a int) RETURNS int LANGUAGE plpgsql AS $$ BEGIN RETURN a + 1; END $$",
+    ] {
+        core.execute_sql_in_session(&c, &mut s, sql).expect(sql);
+    }
+    for (sql, want) in [("SELECT f(1)", 1), ("SELECT g(1)", 2)] {
+        let r = core.execute_sql_in_session(&c, &mut s, sql).expect(sql);
+        let SqlOutcome::Query(q) = r else {
+            panic!("{sql}: expected a query result");
+        };
+        let cell = q.rows.first().and_then(|r| r.cells.first()).cloned();
+        assert_eq!(
+            cell,
+            Some(engine::sql::exec::Cell::SignedInteger(want)),
+            "{sql}"
+        );
+    }
+    let mut loaded = SessionState::default();
+    core.load_session_udfs(&c, &mut loaded).expect("load");
+    assert!(core
+        .execute_sql_in_session(&c, &mut loaded, "SELECT f(2)")
+        .is_ok());
+    let e = core.execute_sql(&c, "SELECT f(1)").expect_err("call");
     assert_eq!(e.wire_code(), "42883");
 }
 

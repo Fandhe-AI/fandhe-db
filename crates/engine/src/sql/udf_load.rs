@@ -24,7 +24,7 @@ use crate::sql::udf_call::{
     commit_function_definition, prepare_function_with_signature,
     prepare_function_with_signature_ignoring_capacity, MAX_SESSION_UDFS,
 };
-use crate::sql::udf_call::{Expr, UdfRegistry};
+use crate::sql::udf_call::{Expr, RoutineDefinition, UdfRegistry};
 use crate::sql::udf_ddl::udf_cast_from_function_type;
 use crate::storage::Storage;
 
@@ -76,6 +76,41 @@ fn representable(def: &FunctionDef) -> Option<Signature> {
         }
     };
     Some((names, types, ret))
+}
+
+/// `LANGUAGE sql|plpgsql` の行をルーチン定義へ復元できるか（Issue #2218。全引数が名前付き・型付きで、
+/// 型が往復一致し、`RETURNS` がある行だけ。表せない行はその定義だけ skip する）。
+fn representable_routine(def: &FunctionDef) -> Option<RoutineDefinition> {
+    if !matches!(
+        def.language,
+        FunctionLanguage::Sql | FunctionLanguage::Plpgsql
+    ) {
+        return None;
+    }
+    let params = def
+        .params
+        .iter()
+        .map(|p| p.name.clone())
+        .collect::<Option<Vec<String>>>()?;
+    let param_types = def
+        .params
+        .iter()
+        .map(|p| p.ty.as_ref().and_then(udf_cast_from_function_type))
+        .collect::<Option<Vec<CastType>>>()?;
+    let ft = def.return_type.as_ref()?;
+    let ret = if ft.is_trigger() {
+        None
+    } else {
+        Some(udf_cast_from_function_type(ft)?)
+    };
+    Some(RoutineDefinition {
+        params,
+        param_types,
+        ret,
+        language: def.language,
+        attrs: def.attrs.clone(),
+        body_source: def.body_source.clone(),
+    })
 }
 
 /// 再パース済みの登録待ち定義。
@@ -137,7 +172,12 @@ fn load_into(
     defs.sort_by_key(|d| d.id);
 
     let mut pending: Vec<Pending> = Vec::new();
+    let mut routines: Vec<(String, RoutineDefinition)> = Vec::new();
     for def in defs {
+        if let Some(r) = representable_routine(&def) {
+            routines.push((def.function_key, r));
+            continue;
+        }
         let Some((params, param_types, return_type)) = representable(&def) else {
             continue;
         };
@@ -187,6 +227,26 @@ fn load_into(
             break;
         }
     }
+    // `LANGUAGE sql|plpgsql` の関数（Issue #2218）。呼び出し先を持たないため宣言的 UDF の後に 1 パスで
+    // 登録する。予約名・名前衝突・上限で登録できない定義はその定義だけ skip し、非カタログ登録に阻まれて
+    // いる場合は次の refresh で再試行させる。
+    let mut routine_blocked = false;
+    for (key, def) in routines {
+        let lower = key.to_ascii_lowercase();
+        if crate::sql::udf_call::is_reserved_function_name(&key) {
+            continue;
+        }
+        if registry.is_name_taken(&lower) {
+            routine_blocked = true;
+            continue;
+        }
+        if registry.len() >= MAX_SESSION_UDFS {
+            routine_blocked |= registry.len() > registry.catalog_entry_count();
+            continue;
+        }
+        registry.insert_routine(&key, def);
+        registry.mark_catalog_origin(&key);
+    }
     // 表せる形なのに登録できなかった定義（セッションローカル／WASM 関数との名前衝突・上限など）が
     // 残る場合は世代を「未完了」として記録し、次の refresh で再試行させる（ローカル登録の解除後に
     // カタログ定義が見えない状態を残さない）。
@@ -197,9 +257,10 @@ fn load_into(
     // MAX_SESSION_UDFS に達している場合。いずれもその登録の DROP で解消しうる。
     let has_non_catalog_entries = registry.len() > registry.catalog_entry_count();
     let at_capacity = registry.len() >= MAX_SESSION_UDFS;
-    let blocked_by_local = pending.iter().any(|p| {
-        let lower = p.key.to_ascii_lowercase();
-        (registry.is_name_taken(&lower) && !registry.is_catalog_origin(&lower))
+    let blocked_by_local = routine_blocked
+        || pending.iter().any(|p| {
+            let lower = p.key.to_ascii_lowercase();
+            (registry.is_name_taken(&lower) && !registry.is_catalog_origin(&lower))
             // 容量だけが阻害要因の定義（容量を無視すれば登録できる）に限る。欠落 callee・予約名など
             // 恒久的にロード不能な定義は容量が空いても登録できないため再試行対象にしない。
             || (at_capacity
@@ -213,7 +274,7 @@ fn load_into(
                     &p.body,
                 )
                 .is_ok())
-    });
+        });
     let recorded = if blocked_by_local {
         STALE_GENERATION
     } else {

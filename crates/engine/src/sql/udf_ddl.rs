@@ -281,7 +281,7 @@ pub(crate) fn execute_create_or_replace_function_persistent(
 }
 
 /// `LANGUAGE sql|plpgsql` の関数 1 件の定義入力（[`execute_create_routine_persistent`] の引数束）。
-/// 本体は原文のまま保存し、解析・束縛・実行は呼び出し時の経路（#2218）が担う。
+/// 本体は原文のまま保存し、解析・束縛・実行は呼び出し時の経路（`core::routine_call`。#2218）が担う。
 pub(crate) struct RoutineSpec<'a> {
     pub(crate) name: &'a str,
     pub(crate) params: &'a [String],
@@ -298,10 +298,9 @@ pub(crate) struct RoutineSpec<'a> {
 /// `require_ddl_permission` の後にだけ来る。
 ///
 /// 判定順は 予約名・識別子 → セッションの同名衝突 `42723` → カタログの重複 `42723`・件数 `54000`
-/// （先行判定）→ 引数名 → 本体検証 `validate`（plpgsql の定義時検証。sql は呼び出し側が何もしない
-/// 閉包を渡す）→ カタログの単一 write txn。セッションの [`UdfRegistry`] へは登録しない（呼び出しの
-/// 実行経路は #2218。それまで呼び出しは `42883`）。ただし OR REPLACE が宣言的 UDF を置き換えた場合は、
-/// commit 後にセッションの旧本体の展開を取り除く。
+/// （先行判定）→ 引数名 → 本体検証 `validate`（sql・plpgsql の定義時検証）→ カタログの単一 write txn。
+/// commit 後に同じセッションの [`UdfRegistry`] へ載せる（呼び出しの実行は `core::routine_call`。#2218）。
+/// OR REPLACE が宣言的 UDF を置き換えた場合は、commit 後にセッションの旧本体の展開を取り除く。
 ///
 /// [`UdfRegistry`]: crate::sql::udf_call::UdfRegistry
 pub(crate) fn execute_create_routine_persistent(
@@ -391,7 +390,51 @@ pub(crate) fn execute_create_routine_persistent(
             .create_function_with_limit(tenant_id, &def, max_functions)
             .map_err(map_function_error)?;
     }
+    // commit 後に同じセッションへ登録する（すぐ呼べるようにする。他セッションは世代で refresh）。
+    // 非カタログ登録・WASM・容量で入れられない場合は登録せず、次の refresh のロードに任せる。
+    if let Some(def) = routine_from_spec(spec) {
+        let session_udfs = session.udfs_mut();
+        session_udfs.remove(name);
+        if session_udfs.len() < crate::sql::udf_call::MAX_SESSION_UDFS {
+            session_udfs.insert_routine(name, def);
+            session_udfs.mark_catalog_origin(name);
+        }
+    }
     Ok(())
+}
+
+/// 関数の定義入力から、セッションのレジストリへ載せるルーチン定義を作る（`RETURNS` が無い・型が
+/// 写せない場合は `None`＝登録しない）。
+fn routine_from_spec(spec: &RoutineSpec<'_>) -> Option<crate::sql::udf_call::RoutineDefinition> {
+    // カタログから再ロードしたときと同じ型になるよう、保存値への往復で正規化する（往復一致しない型の
+    // 関数はロード側でも skip されるため、同じセッションにも載せない）。
+    let normalize = |t: &CastType| {
+        function_type_from_udf_cast(t)
+            .ok()
+            .and_then(|ft| udf_cast_from_function_type(&ft))
+    };
+    let param_types = spec
+        .param_types
+        .iter()
+        .map(|t| t.as_ref().and_then(normalize))
+        .collect::<Option<Vec<CastType>>>()?;
+    let ret = if spec.returns_trigger {
+        None
+    } else {
+        Some(normalize(spec.return_type?)?)
+    };
+    Some(crate::sql::udf_call::RoutineDefinition {
+        params: spec.params.iter().map(|p| p.to_ascii_lowercase()).collect(),
+        param_types,
+        ret,
+        language: match spec.language {
+            FunctionLanguageClause::Sql => FunctionLanguage::Sql,
+            FunctionLanguageClause::Plpgsql => FunctionLanguage::Plpgsql,
+            FunctionLanguageClause::Declarative => return None,
+        },
+        attrs: spec.attrs.clone(),
+        body_source: spec.body_source.to_string(),
+    })
 }
 
 /// `DROP FUNCTION [IF EXISTS] ... [CASCADE | RESTRICT]` を実行する。DDL 権限の無いセッションは
@@ -424,6 +467,9 @@ pub(crate) fn execute_drop_function(
         udfs.get(&stmt.name)
             .is_some_and(|d| arity_ok(d.params.len()) && session_types_match(d, stmt))
             || udfs.get_wasm(&stmt.name).is_some_and(|_| arity_ok(2))
+            || udfs.get_routine(&stmt.name).is_some_and(|r| {
+                arity_ok(r.params.len()) && routine_types_match(&r.param_types, stmt)
+            })
     };
     if session_match {
         removed |= session.udfs_mut().remove(&stmt.name);
@@ -454,6 +500,23 @@ fn session_types_match(
         let Some(declared) = declared else {
             return true;
         };
+        let (Ok(have), Ok(want)) = (
+            function_type_from_udf_cast(declared),
+            FunctionType::from_column_type(want),
+        ) else {
+            return false;
+        };
+        have.identity_token() == want.identity_token()
+    })
+}
+
+/// セッション内のルーチンの引数型が `DROP FUNCTION` の型の並びと一致するか（[`session_types_match`] と
+/// 同じ規則。ルーチンの引数は全て型注釈つき）。
+fn routine_types_match(declared: &[CastType], stmt: &ValidatedDropFunction) -> bool {
+    let Some(types) = &stmt.arg_types else {
+        return true;
+    };
+    declared.iter().zip(types).all(|(declared, want)| {
         let (Ok(have), Ok(want)) = (
             function_type_from_udf_cast(declared),
             FunctionType::from_column_type(want),
