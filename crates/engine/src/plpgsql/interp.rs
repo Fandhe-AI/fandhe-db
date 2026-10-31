@@ -477,13 +477,8 @@ pub(crate) fn run_sql_function(
     r
 }
 
-fn run_sql_inner(
-    body: &Body,
-    args: Vec<PlScalar>,
-    ret: &CastType,
-    host: &mut dyn PlHost,
-    budget: &mut ExecBudget,
-) -> Result<PlScalar, SqlSurfaceError> {
+/// `LANGUAGE sql` 関数の引数を宣言型へ代入変換して、埋め込み SQL の変数環境を作る（スカラー・集合返却で共有）。
+fn bind_sql_args(body: &Body, args: Vec<PlScalar>) -> Result<ArgEnv, SqlSurfaceError> {
     let mut vals: Vec<Option<PlScalar>> = vec![None; body.vars.len()];
     for (slot, decl) in vals.iter_mut().zip(body.vars.iter()) {
         match (decl.kind, &decl.ty) {
@@ -504,7 +499,17 @@ fn run_sql_inner(
             _ => {}
         }
     }
-    let env = ArgEnv { vals };
+    Ok(ArgEnv { vals })
+}
+
+fn run_sql_inner(
+    body: &Body,
+    args: Vec<PlScalar>,
+    ret: &CastType,
+    host: &mut dyn PlHost,
+    budget: &mut ExecBudget,
+) -> Result<PlScalar, SqlSurfaceError> {
+    let env = bind_sql_args(body, args)?;
     let stmts = &body.block.stmts;
     let total = stmts.len();
     for (i, st) in stmts.iter().enumerate() {
@@ -535,21 +540,31 @@ fn bad_function_result(detail: &str) -> SqlSurfaceError {
 
 /// 最後の文の結果（1 列。最初の行の値、0 行は NULL）を戻り値型 `ret` へ代入変換する。
 fn sql_function_result(out: SqlOutcome, ret: &CastType) -> Result<PlScalar, SqlSurfaceError> {
-    let mismatch = || bad_function_result("return type mismatch in a SQL function");
     let [(_, col_ty)] = out.columns.as_slice() else {
         return Err(bad_function_result(
             "the last statement of a SQL function must return exactly one column",
         ));
     };
-    let ret_ty = ret
-        .result_column_type()
-        .ok_or_else(|| unsupported("unsupported return type in a SQL function"))?;
     let cell = out
         .rows
         .first()
         .and_then(|r| r.first())
         .cloned()
         .unwrap_or(Cell::Null);
+    convert_result_cell(cell, col_ty, ret)
+}
+
+/// 最後の文の結果セル 1 個（列型 `col_ty`）を宣言された戻り値型 `ret` へ代入変換する（スカラー関数の
+/// [`sql_function_result`] と、集合返却の [`run_sql_set_function`] が共有する。代入互換でなければ `42P13`）。
+fn convert_result_cell(
+    cell: Cell,
+    col_ty: &ColumnType,
+    ret: &CastType,
+) -> Result<PlScalar, SqlSurfaceError> {
+    let mismatch = || bad_function_result("return type mismatch in a SQL function");
+    let ret_ty = ret
+        .result_column_type()
+        .ok_or_else(|| unsupported("unsupported return type in a SQL function"))?;
     let v = PlScalar::new(cell, col_ty.clone());
     // 修飾子なしの `numeric` は値の scale を保つ（`numeric(38,16)` へ丸めない）。
     if matches!(ret, CastType::Numeric(None)) {
@@ -590,6 +605,85 @@ fn sql_function_result(out: SqlOutcome, ret: &CastType) -> Result<PlScalar, SqlS
         }
     }
     assign_cast(v, &ret_ty)
+}
+
+/// 集合返却の `LANGUAGE sql` 関数の本体を実行する（Issue #2220・SQL-67）。`cols` は宣言された出力列
+/// の型。最後の文だけを `RowDemand::All` で実行し、各行の列数を宣言と照合してセルごとに
+/// 宣言型へ代入変換する（不一致は `42P13`）。各行を足す前に [`ExecBudget::add_set_row`] を呼び、
+/// 行数（`--max-result-rows`）・累積バイト数の上限を超えたら黙って切り詰めず `54000`。呼び出し深さ
+/// （`54001`）と文数（`54000`）は [`run_sql_function`] と同じ共有カウンタに数える。
+pub(crate) fn run_sql_set_function(
+    body: &Body,
+    args: Vec<PlScalar>,
+    cols: &[CastType],
+    host: &mut dyn PlHost,
+    budget: &mut ExecBudget,
+) -> Result<Vec<Vec<PlScalar>>, SqlSurfaceError> {
+    budget.enter_call()?;
+    let r = run_sql_set_inner(body, args, cols, host, budget);
+    budget.leave_call();
+    r
+}
+
+fn run_sql_set_inner(
+    body: &Body,
+    args: Vec<PlScalar>,
+    cols: &[CastType],
+    host: &mut dyn PlHost,
+    budget: &mut ExecBudget,
+) -> Result<Vec<Vec<PlScalar>>, SqlSurfaceError> {
+    let env = bind_sql_args(body, args)?;
+    let stmts = &body.block.stmts;
+    let total = stmts.len();
+    for (i, st) in stmts.iter().enumerate() {
+        let Stmt::Sql(q) = st else {
+            return Err(internal("unexpected statement in a SQL function body"));
+        };
+        budget.tick_statement()?;
+        let last = i.saturating_add(1) == total;
+        let demand = if last {
+            RowDemand::All
+        } else {
+            RowDemand::None
+        };
+        let out = host.exec_sql(q, &env, demand, budget)?;
+        if !last {
+            continue;
+        }
+        let shape_error = || {
+            bad_function_result(
+                "the last statement of a SQL function must return the declared columns",
+            )
+        };
+        if out.columns.len() != cols.len() {
+            return Err(shape_error());
+        }
+        // 0 行でも宣言型との代入互換性を検査する（行ループだけだと空集合が型不一致をすり抜ける）。
+        if out.rows.is_empty() {
+            for (col_ty, ret) in out.columns.iter().map(|(_, t)| t).zip(cols) {
+                convert_result_cell(Cell::Null, col_ty, ret)?;
+            }
+        }
+        let mut rows: Vec<Vec<PlScalar>> = Vec::new();
+        for row in out.rows {
+            if row.len() != cols.len() {
+                return Err(shape_error());
+            }
+            let mut converted: Vec<PlScalar> = Vec::with_capacity(cols.len());
+            for ((cell, (_, col_ty)), ret) in row.into_iter().zip(out.columns.iter()).zip(cols) {
+                converted.push(convert_result_cell(cell, col_ty, ret)?);
+            }
+            let bytes = converted
+                .iter()
+                .fold(0usize, |acc, v| acc.saturating_add(scalar_bytes(v)));
+            budget.add_set_row(bytes)?;
+            rows.push(converted);
+        }
+        return Ok(rows);
+    }
+    Err(bad_function_result(
+        "SQL function body must contain a statement",
+    ))
 }
 
 /// 概算バイト数（集合返却の累積上限の検査に使う）。

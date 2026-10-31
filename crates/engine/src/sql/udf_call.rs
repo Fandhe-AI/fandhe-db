@@ -2546,14 +2546,28 @@ pub struct UdfRegistry {
     routines: std::collections::BTreeMap<String, Arc<RoutineDefinition>>,
 }
 
+/// `LANGUAGE sql|plpgsql` の関数の戻り値の形（Issue #2220）。スカラー位置の呼び出し
+/// （`sql::routine_fold`）は `Scalar` だけを起動し、`Set` は `FROM` 句の呼び出し
+/// （`core::function_scan_exec`）だけが起動する。形を enum にして、集合返却をスカラーとして
+/// 起動する経路をコンパイル時に作れなくする。
+#[derive(Debug, Clone, PartialEq)]
+pub(crate) enum RoutineReturn {
+    /// `RETURNS <型>`。
+    Scalar(crate::sql::cast::CastType),
+    /// `RETURNS trigger`（通常の関数としては呼べない）。
+    Trigger,
+    /// `RETURNS SETOF <スカラー>`（名前なし 1 列）または `RETURNS TABLE (...)`（名前付き列）。
+    Set(Vec<(Option<String>, crate::sql::cast::CastType)>),
+}
+
 /// `LANGUAGE sql|plpgsql` の関数 1 件の呼び出しに必要な定義（Issue #2218）。UDF カタログの行から
 /// 復元し、本体は原文のまま保持する（解析は呼び出し時。設計記録 `plpgsql-subset.md` の D2）。
-/// 引数は全て名前付き・型付きで、型修飾子は構文段で正規化済み。`ret` は `RETURNS trigger` なら `None`。
+/// 引数は全て名前付き・型付きで、型修飾子は構文段で正規化済み。
 #[derive(Debug, Clone, PartialEq)]
 pub(crate) struct RoutineDefinition {
     pub(crate) params: Vec<String>,
     pub(crate) param_types: Vec<crate::sql::cast::CastType>,
-    pub(crate) ret: Option<crate::sql::cast::CastType>,
+    pub(crate) ret: RoutineReturn,
     pub(crate) language: crate::catalog::function::FunctionLanguage,
     pub(crate) attrs: crate::catalog::function::FunctionAttributes,
     pub(crate) body_source: String,

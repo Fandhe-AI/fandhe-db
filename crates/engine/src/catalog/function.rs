@@ -41,7 +41,19 @@ pub(crate) const FUNCTION_ID_COUNTER_TABLE: TableDefinition<&str, u64> =
 const FUNCTION_ID_COUNTER_KEY: &str = "next_id";
 
 /// 定義 blob の版。形式を変える場合は新しい版を足し、旧版の decode を残す。
+/// 集合返却（`RETURNS SETOF`／`RETURNS TABLE`。Issue #2220）の定義だけが v2 で書かれ、スカラー・
+/// トリガ・宣言的な定義は従来どおり v1 のまま書く（既存 DB のバイト列を変えない）。
 pub(crate) const FUNCTION_DEF_VERSION: u8 = 1;
+
+/// 集合返却の定義を書く blob の版（v1 のフィールド列の後ろに戻り値の形を足す）。
+pub(crate) const FUNCTION_DEF_VERSION_SET: u8 = 2;
+
+/// `RETURNS TABLE (...)` の列数の上限（引数数の上限と同じ値。確保の前に検査する）。
+pub(crate) const MAX_FUNCTION_TABLE_COLUMNS: usize = MAX_FUNCTION_PARAMS;
+
+/// v2 の戻り値の形のタグ。
+const SHAPE_TAG_SETOF: u8 = 1;
+const SHAPE_TAG_TABLE: u8 = 2;
 
 /// 引数数の格納形式上の上限（SQL-66 (5) の引数の数の上限に合わせる）。
 pub(crate) const MAX_FUNCTION_PARAMS: usize = 100;
@@ -310,6 +322,19 @@ pub(crate) struct FunctionParam {
     pub(crate) ty: Option<FunctionType>,
 }
 
+/// 関数の戻り値の形（Issue #2220）。`SetOf` の要素型は [`FunctionDef::return_type`] に持ち、`Table` は
+/// 列名つきの列の並びを持つ（このとき `return_type` は `None`）。
+#[derive(Debug, Clone, PartialEq, Default)]
+pub(crate) enum ReturnShape {
+    /// `RETURNS <型>`・`RETURNS trigger`・型注釈なし（従来の形）。
+    #[default]
+    Scalar,
+    /// `RETURNS SETOF <スカラー型>`。
+    SetOf,
+    /// `RETURNS TABLE (<列名> <型>, ...)`。
+    Table(Vec<(String, FunctionType)>),
+}
+
 /// 関数定義の保存値。
 #[derive(Debug, Clone, PartialEq)]
 pub(crate) struct FunctionDef {
@@ -318,8 +343,10 @@ pub(crate) struct FunctionDef {
     /// relation キー形（`public` は裸の名前、SCHEMA 配下は `#<schema_id>.<name>`）。ASCII 小文字。
     pub(crate) function_key: String,
     pub(crate) params: Vec<FunctionParam>,
-    /// `None` = 型注釈なし。
+    /// `None` = 型注釈なし（`RETURNS TABLE` のときも `None`。列は [`Self::return_shape`]）。
     pub(crate) return_type: Option<FunctionType>,
+    /// 戻り値の形（Issue #2220）。`Scalar` 以外の定義だけ blob v2 で保存する。
+    pub(crate) return_shape: ReturnShape,
     pub(crate) language: FunctionLanguage,
     /// 本体の原文（ドル引用を含めそのまま）。再解析は呼び出し側が許可リストパーサーで行う。
     pub(crate) body_source: String,
@@ -389,6 +416,49 @@ fn validate_shape(def: &FunctionDef) -> Result<()> {
     if let Some(t) = &def.return_type {
         t.validate_return()?;
     }
+    match &def.return_shape {
+        ReturnShape::Scalar => {}
+        ReturnShape::SetOf => {
+            // 集合の要素型は列型でなければならない（`trigger` 等は不可）。
+            match &def.return_type {
+                Some(t) if !t.is_trigger() => {}
+                _ => {
+                    return Err(CatalogError::Invalid(
+                        "set-returning function needs an element type".to_string(),
+                    ))
+                }
+            }
+        }
+        ReturnShape::Table(cols) => {
+            if def.return_type.is_some() {
+                return Err(CatalogError::Invalid(
+                    "table-returning function cannot have a scalar return type".to_string(),
+                ));
+            }
+            if cols.is_empty() || cols.len() > MAX_FUNCTION_TABLE_COLUMNS {
+                return Err(CatalogError::Invalid(
+                    "invalid number of function result columns".to_string(),
+                ));
+            }
+            let mut names: Vec<String> = Vec::new();
+            for (name, ty) in cols {
+                validate_identifier(name)?;
+                let lower = name.to_ascii_lowercase();
+                if names.contains(&lower) {
+                    return Err(CatalogError::Invalid(
+                        "duplicate function result column name".to_string(),
+                    ));
+                }
+                names.push(lower);
+                if ty.is_trigger() {
+                    return Err(CatalogError::Invalid(
+                        "invalid function result column type".to_string(),
+                    ));
+                }
+                ty.validate()?;
+            }
+        }
+    }
     for v in [def.attrs.cost, def.attrs.rows].into_iter().flatten() {
         if !v.is_finite() || v <= 0.0 {
             return Err(CatalogError::Invalid(
@@ -442,7 +512,12 @@ pub(crate) fn encode_function_def(def: &FunctionDef) -> Result<Vec<u8>> {
     let mut out = Vec::new();
     out.try_reserve_exact(64 + def.body_source.len())
         .map_err(|_| CatalogError::Invalid("function definition too large".to_string()))?;
-    out.push(FUNCTION_DEF_VERSION);
+    let is_set = !matches!(def.return_shape, ReturnShape::Scalar);
+    out.push(if is_set {
+        FUNCTION_DEF_VERSION_SET
+    } else {
+        FUNCTION_DEF_VERSION
+    });
     out.extend_from_slice(&def.id.to_le_bytes());
     out.push(OWNER_TAG_NONE);
     out.push(def.language.tag());
@@ -473,6 +548,23 @@ pub(crate) fn encode_function_def(def: &FunctionDef) -> Result<Vec<u8>> {
     }
     push_type(&mut out, &def.return_type)?;
     push_str(&mut out, &def.body_source)?;
+    // v2: 戻り値の形（SETOF は要素型が `return_type` にあるためタグだけ、TABLE は列数と列）。
+    match &def.return_shape {
+        ReturnShape::Scalar => {}
+        ReturnShape::SetOf => out.push(SHAPE_TAG_SETOF),
+        ReturnShape::Table(cols) => {
+            out.push(SHAPE_TAG_TABLE);
+            let n = u32::try_from(cols.len()).map_err(|_| {
+                CatalogError::Invalid("too many function result columns".to_string())
+            })?;
+            out.extend_from_slice(&n.to_le_bytes());
+            for (name, ty) in cols {
+                push_str(&mut out, name)?;
+                push_str(&mut out, &ty.tag)?;
+                push_str(&mut out, &ty.param)?;
+            }
+        }
+    }
     Ok(out)
 }
 
@@ -554,7 +646,8 @@ pub(crate) fn decode_function_def(
 
 fn decode_inner(function_key: &str, arg_signature_key: &str, bytes: &[u8]) -> Result<FunctionDef> {
     let mut r = Reader { bytes, offset: 0 };
-    if r.u8()? != FUNCTION_DEF_VERSION {
+    let version = r.u8()?;
+    if version != FUNCTION_DEF_VERSION && version != FUNCTION_DEF_VERSION_SET {
         return Err(corrupt());
     }
     let id = r.u64()?;
@@ -589,6 +682,32 @@ fn decode_inner(function_key: &str, arg_signature_key: &str, bytes: &[u8]) -> Re
     }
     let return_type = r.opt_type()?;
     let body_source = r.string(MAX_FUNCTION_BODY_BYTES)?;
+    // v2 は戻り値の形が続く（v1 は常に `Scalar`。v2 で `Scalar` に当たる値は書かれないため拒否する）。
+    let return_shape = if version == FUNCTION_DEF_VERSION_SET {
+        match r.u8()? {
+            SHAPE_TAG_SETOF => ReturnShape::SetOf,
+            SHAPE_TAG_TABLE => {
+                let n = usize::try_from(r.u32()?).map_err(|_| corrupt())?;
+                if n == 0 || n > MAX_FUNCTION_TABLE_COLUMNS {
+                    return Err(corrupt());
+                }
+                let mut cols = Vec::new();
+                cols.try_reserve_exact(n).map_err(|_| corrupt())?;
+                for _ in 0..n {
+                    let name = r.string(MAX_NAME_FIELD_BYTES)?;
+                    let ty = FunctionType {
+                        tag: r.string(MAX_TYPE_FIELD_BYTES)?,
+                        param: r.string(MAX_TYPE_FIELD_BYTES)?,
+                    };
+                    cols.push((name, ty));
+                }
+                ReturnShape::Table(cols)
+            }
+            _ => return Err(corrupt()),
+        }
+    } else {
+        ReturnShape::Scalar
+    };
     if r.offset != bytes.len() {
         return Err(corrupt());
     }
@@ -597,6 +716,7 @@ fn decode_inner(function_key: &str, arg_signature_key: &str, bytes: &[u8]) -> Re
         function_key: function_key.to_string(),
         params,
         return_type,
+        return_shape,
         language,
         body_source,
         attrs: FunctionAttributes {
@@ -901,7 +1021,8 @@ impl Storage {
                         FUNCTION_CANNOT_CHANGE_PARAM_NAME_MESSAGE.to_string(),
                     ));
                 }
-                if old.return_type != stored.return_type {
+                if old.return_type != stored.return_type || old.return_shape != stored.return_shape
+                {
                     return Err(CatalogError::Invalid(
                         FUNCTION_CANNOT_CHANGE_RETURN_TYPE_MESSAGE.to_string(),
                     ));
@@ -1177,6 +1298,7 @@ mod tests {
             function_key: key.to_string(),
             params,
             return_type: ty(&ColumnType::Integer),
+            return_shape: ReturnShape::Scalar,
             language: FunctionLanguage::Sql,
             body_source: "SELECT 1".to_string(),
             attrs: FunctionAttributes::default(),
@@ -1328,6 +1450,98 @@ mod tests {
         assert_eq!(d.return_type, ty(&ColumnType::Text));
         assert_eq!(d.body_source, "x");
         assert_eq!(encode_function_def(&d).expect("re-encode"), b);
+    }
+
+    /// Issue #2220: 集合返却だけが v2 で保存され、スカラー・トリガは v1 のまま（既存 DB のバイト列不変）。
+    /// `SETOF`・`TABLE` は往復一致し、`OR REPLACE` が形の違いを検出できる。
+    #[test]
+    fn set_returning_defs_use_v2_and_roundtrip() {
+        let scalar = def("f", vec![]);
+        assert_eq!(encode_function_def(&scalar).expect("enc").first(), Some(&1));
+
+        let mut setof = def("f", vec![]);
+        setof.return_shape = ReturnShape::SetOf;
+        let blob = encode_function_def(&setof).expect("enc setof");
+        assert_eq!(blob.first(), Some(&FUNCTION_DEF_VERSION_SET));
+        let mut expected = setof.clone();
+        expected.id = 1;
+        assert_eq!(decode_function_def("f", "", &blob).expect("dec"), expected);
+
+        let mut table = def("f", vec![]);
+        table.return_type = None;
+        table.return_shape = ReturnShape::Table(vec![
+            (
+                "a".to_string(),
+                FunctionType::from_column_type(&ColumnType::Integer).expect("ty"),
+            ),
+            (
+                "b".to_string(),
+                FunctionType::from_column_type(&ColumnType::Text).expect("ty"),
+            ),
+        ]);
+        let blob = encode_function_def(&table).expect("enc table");
+        assert_eq!(decode_function_def("f", "", &blob).expect("dec"), table);
+        assert_ne!(setof.return_shape, table.return_shape);
+    }
+
+    /// Issue #2220: v2 の破損（未知の形タグ・列数 0 や超過・切断・末尾の余り・重複列名）は `CorruptSchema`、
+    /// 形状が矛盾する定義は書く前に `Invalid`。
+    #[test]
+    fn set_returning_blob_is_fail_closed() {
+        let mut table = def("f", vec![]);
+        table.return_type = None;
+        table.return_shape = ReturnShape::Table(vec![(
+            "a".to_string(),
+            FunctionType::from_column_type(&ColumnType::Integer).expect("ty"),
+        )]);
+        let good = encode_function_def(&table).expect("enc");
+        assert!(decode_function_def("f", "", &good).is_ok());
+        for cut in 1..good.len() {
+            let cut_blob = good.get(..cut).expect("cut").to_vec();
+            assert!(
+                decode_function_def("f", "", &cut_blob).is_err(),
+                "cut {cut}"
+            );
+        }
+        assert!(decode_function_def("f", "", &[good.as_slice(), &[0]].concat()).is_err());
+        // 未知の形タグ。
+        let tag_pos = good.len() - (4 + 4 + 1 + 4 + 7 + 4 + 1) - 1;
+        let mut bad = good.clone();
+        if let Some(b) = bad.get_mut(tag_pos) {
+            *b = 9;
+        }
+        assert!(decode_function_def("f", "", &bad).is_err());
+        // バージョン 3 は未知。
+        let mut v3 = good.clone();
+        if let Some(b) = v3.get_mut(0) {
+            *b = 3;
+        }
+        assert!(decode_function_def("f", "", &v3).is_err());
+        // 形状の矛盾（SETOF なのに要素型が無い・TABLE なのに return_type がある・重複列名・列なし）。
+        let mut d = def("f", vec![]);
+        d.return_type = None;
+        d.return_shape = ReturnShape::SetOf;
+        assert!(encode_function_def(&d).is_err());
+        let mut d = table.clone();
+        d.return_type = ty(&ColumnType::Integer);
+        assert!(encode_function_def(&d).is_err());
+        let mut d = table.clone();
+        let col = (
+            "A".to_string(),
+            FunctionType::from_column_type(&ColumnType::Integer).expect("ty"),
+        );
+        d.return_shape = ReturnShape::Table(vec![d_first(&table), col]);
+        assert!(encode_function_def(&d).is_err());
+        let mut d = table.clone();
+        d.return_shape = ReturnShape::Table(Vec::new());
+        assert!(encode_function_def(&d).is_err());
+    }
+
+    fn d_first(d: &FunctionDef) -> (String, FunctionType) {
+        match &d.return_shape {
+            ReturnShape::Table(c) => c.first().cloned().expect("col"),
+            _ => panic!("not a table"),
+        }
     }
 
     /// 破損・未知値・上限超過はすべて固定文言の `CorruptSchema`。

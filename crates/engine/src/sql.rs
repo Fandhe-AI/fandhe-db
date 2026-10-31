@@ -186,6 +186,7 @@ pub(crate) mod derived_table;
 pub(crate) mod describe;
 pub mod dml_from;
 pub(crate) mod embedded_unit;
+pub(crate) mod function_scan;
 #[cfg(test)]
 mod identity_column_tests;
 pub(crate) mod insert_select;

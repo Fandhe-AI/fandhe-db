@@ -39,11 +39,11 @@ use crate::plpgsql::embedded::validate_embedded;
 use crate::plpgsql::host::{
     PlHost, PlScalar, ResolvedType, RowDemand, SqlOutcome as HostOutcome, VarLookup,
 };
-use crate::plpgsql::interp::run_sql_function;
 use crate::plpgsql::interp::{
     run_function, run_trigger_function, CallOutcome, ExecBudget, ReturnSpec, TriggerReturn,
     TriggerVars,
 };
+use crate::plpgsql::interp::{run_sql_function, run_sql_set_function};
 use crate::plpgsql::subst;
 use crate::plpgsql::{check_result_shape, parse_body, parse_sql_function_body};
 use crate::policy::PolicyContext;
@@ -54,7 +54,7 @@ use crate::sql::exec::{Cell, ColumnMeta, QueryResult};
 use crate::sql::lexer::{self, Keyword, Token};
 use crate::sql::mode::SessionState;
 use crate::sql::transaction::{SessionTransaction, TransactionStatus};
-use crate::sql::udf_call::RoutineDefinition;
+use crate::sql::udf_call::{RoutineDefinition, RoutineReturn};
 use crate::sql::SqlOutcome as CoreOutcome;
 use crate::trigger::call::TriggerOutcome;
 
@@ -1029,9 +1029,10 @@ impl EngineCore {
         args: Vec<PlScalar>,
         may_write: bool,
     ) -> Result<PlScalar, SqlSurfaceError> {
-        let Some(ret) = def.ret.as_ref() else {
+        // 集合返却・トリガ関数はここ（スカラー起動）では実行しない。集合返却は `run_set_routine_active`。
+        let RoutineReturn::Scalar(ret) = &def.ret else {
             return Err(unsupported(
-                "trigger functions cannot be called as ordinary functions",
+                "this function cannot be called as an ordinary scalar function",
             ));
         };
         let typed: Vec<Option<CastType>> = def.param_types.iter().cloned().map(Some).collect();
@@ -1073,6 +1074,50 @@ impl EngineCore {
                 Err(internal("declarative function routed as routine"))
             }
         }
+    }
+
+    /// 集合返却の `LANGUAGE sql` 関数 1 回を、既に開いている Tx の上で実行する（Issue #2220・SQL-67）。
+    /// 呼び出し元は `core::function_scan_exec`（`FROM` 句の関数呼び出し）だけ。本体は原文から毎回解析して
+    /// 定義時と同じ検証を通し、呼び出し元と同じ `PolicyContext`（RLS）・Tx で実行する。返す行は宣言された
+    /// 出力列の型へ変換済みで、行数・バイト数は `ExecBudget`（`--max-result-rows`）の上限内。
+    /// Tx の状態遷移とエラーの `scrub_error` は外側の実行入口が担う。
+    pub(crate) fn run_set_routine_active<'e>(
+        &'e self,
+        ctx: &PolicyContext,
+        session: &mut SessionState,
+        txn: &mut SessionTransaction<'e>,
+        def: &RoutineDefinition,
+        args: Vec<PlScalar>,
+        may_write: bool,
+    ) -> Result<Vec<Vec<PlScalar>>, SqlSurfaceError> {
+        let RoutineReturn::Set(cols) = &def.ret else {
+            return Err(unsupported("this function is not a set-returning function"));
+        };
+        // 集合返却は `LANGUAGE sql` だけ（構文段が拒否済み。ここは防御）。
+        if def.language != FunctionLanguage::Sql {
+            return Err(unsupported(
+                "set-returning functions are supported only for LANGUAGE sql",
+            ));
+        }
+        let col_types: Vec<CastType> = cols.iter().map(|(_, t)| t.clone()).collect();
+        let typed: Vec<Option<CastType>> = def.param_types.iter().cloned().map(Some).collect();
+        let decls = super::function_define::param_decls(&def.params, &typed)?;
+        let limits = &self.plpgsql_limits;
+        let opts = ParseOptions::new(decls, ReturnShape::Scalar)
+            .with_limits(limits.max_nesting_depth(), limits.max_body_bytes());
+        let mut budget = ExecBudget::new(self.plpgsql_limits, self.result_limits.max_result_rows());
+        let mut host = CorePlHost {
+            core: self,
+            ctx,
+            session,
+            txn,
+            opts: PlCallOptions { may_write },
+            conflict_checked: HashSet::new(),
+        };
+        let mut body = parse_sql_function_body(&def.body_source, &opts)?;
+        validate_embedded(&mut body, self)?;
+        check_result_shape(&body)?;
+        run_sql_set_function(&body, args, &col_types, &mut host, &mut budget)
     }
 
     /// 既に開いている Tx の上でトリガ関数を 1 回実行する内部 API（Issue #2228・ADR D9）。状態ゲートと
