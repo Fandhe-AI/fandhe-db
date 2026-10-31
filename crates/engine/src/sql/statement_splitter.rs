@@ -498,6 +498,41 @@ fn calls_non_builtin_function(tokens: &[Token]) -> bool {
         "VARBIT",
         "FLOAT",
     ];
+    // 同名のユーザー関数がありうる構文語（位置で構文かどうかを確認する語）。
+    const POSITIONAL_SYNTAX_WORDS: &[&str] = &[
+        "LATERAL", "TO", "JOIN", "INNER", "CROSS", "NATURAL", "FULL", "LEFT", "RIGHT",
+    ];
+    // 直後に式（関数呼び出し）が来る語。直前がこれらなら `(` 直前の語は式の先頭＝呼び出し形。
+    const EXPR_PREFIX_WORDS: &[&str] = &[
+        "DISTINCT",
+        "ALL",
+        "AND",
+        "OR",
+        "NOT",
+        "WHEN",
+        "THEN",
+        "ELSE",
+        "CASE",
+        "BY",
+        "IN",
+        "IS",
+        "LIKE",
+        "ILIKE",
+        "BETWEEN",
+        "SELECT",
+        "WHERE",
+        "ON",
+        "HAVING",
+        "OFFSET",
+        "LIMIT",
+        "RETURNING",
+        "SET",
+        "VALUES",
+        "DEFAULT",
+        "FROM",
+        "USING",
+        "AS",
+    ];
     tokens.iter().enumerate().any(|(i, t)| {
         let (Token::Ident(name), Some(Token::Punct('('))) = (t, tokens.get(i.saturating_add(1)))
         else {
@@ -553,11 +588,40 @@ fn calls_non_builtin_function(tokens: &[Token]) -> bool {
             }
             matches!(after, Some(Token::StringLiteral(_)))
         };
+        // `LATERAL`・`TO`・`JOIN` 系は `is_reserved_function_name` に含まれず、同名のユーザー関数
+        // （`lateral()` 等）を定義・呼び出せる。構文位置と確認できる場合に限り構文語として除外し、
+        // 確認できなければ呼び出し（`Write`＝fail-closed）とする。
+        //   - `LATERAL (` は直後が `SELECT`／`WITH`／`VALUES`（副問い合わせ）のときだけ構文
+        //   - `JOIN`・`TO` 等は直前が式の終端（識別子・`)`）で、式演算子語でないときだけ構文
+        let is_contextual_word = POSITIONAL_SYNTAX_WORDS
+            .iter()
+            .any(|k| name.eq_ignore_ascii_case(k));
+        let positional_confirmed = if name.eq_ignore_ascii_case("LATERAL") {
+            matches!(
+                tokens.get(i.saturating_add(2)),
+                Some(Token::Keyword(Keyword::Select))
+            ) || matches!(
+                tokens.get(i.saturating_add(2)),
+                Some(Token::Ident(a))
+                    if a.eq_ignore_ascii_case("WITH") || a.eq_ignore_ascii_case("VALUES")
+            )
+        } else {
+            i > 0
+                && match tokens.get(i - 1) {
+                    Some(Token::Punct(')')) | Some(Token::QualifiedIdent { .. }) => true,
+                    Some(Token::Ident(a)) => {
+                        !EXPR_PREFIX_WORDS.iter().any(|w| a.eq_ignore_ascii_case(w))
+                    }
+                    _ => false,
+                }
+        };
+        let is_syntax_word = SYNTAX_WORDS.iter().any(|k| name.eq_ignore_ascii_case(k))
+            && (!is_contextual_word || positional_confirmed);
         if is_using_plan
             || is_contextual_syntax
             || is_type_modifier
             || is_typed_literal
-            || SYNTAX_WORDS.iter().any(|k| name.eq_ignore_ascii_case(k))
+            || is_syntax_word
             || crate::sql::udf_call::is_reserved_function_name(name)
         {
             return false;
@@ -1102,6 +1166,8 @@ mod tests {
             "WITH x AS MATERIALIZED (SELECT id FROM t) SELECT * FROM x",
             "WITH x AS NOT MATERIALIZED (SELECT id FROM t) SELECT * FROM x",
             "SELECT count(*) FILTER (WHERE a > 1) FROM t",
+            "SELECT a FROM t JOIN (SELECT a FROM u) x ON t.a = x.a",
+            "SELECT a FROM t, LATERAL (SELECT a FROM u) x",
         ] {
             assert_eq!(classify_statement(sql), StatementEffect::ReadOnly, "{sql}");
         }
@@ -1122,6 +1188,11 @@ mod tests {
             "SELECT filter(1), over(2), search(3), rows(4)",
             "SELECT returning()",
             "SELECT window(1)",
+            "SELECT lateral()",
+            "SELECT 1, lateral(1)",
+            "SELECT a FROM t WHERE to(a) = 1",
+            "SELECT DISTINCT join()",
+            "SELECT a FROM t WHERE a > 0 AND left_()",
         ] {
             assert_eq!(classify_statement(sql), StatementEffect::Write, "{sql}");
         }

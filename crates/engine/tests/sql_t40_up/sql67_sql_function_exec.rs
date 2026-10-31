@@ -767,3 +767,28 @@ fn where_clause_calls_gate_the_projection() {
     );
     assert_eq!(count(&core, &mut s, "alice", "log"), 1);
 }
+
+/// 構文語と同名の書き込み関数（`lateral()`・`to()`）を含む複数文メッセージは読み取り専用に
+/// 分類されず（Sequential にならず）、後続文の失敗で関数内の INSERT も残らない。
+#[test]
+fn syntax_word_named_write_function_keeps_multi_statement_atomic() {
+    let (core, mut s, _g) = setup("sql67_exec_syntax_word_write");
+    for name in ["lateral", "to", "join"] {
+        run(
+            &core,
+            &mut s,
+            "alice",
+            &format!(
+                "CREATE FUNCTION {name}() RETURNS int LANGUAGE sql AS \
+                 $$ INSERT INTO log VALUES (1) RETURNING n $$"
+            ),
+        );
+        let _ = err(
+            &core,
+            &mut s,
+            "alice",
+            &format!("SELECT {name}(); SELECT 1 / 0"),
+        );
+        assert_eq!(count(&core, &mut s, "alice", "log"), 0, "{name}");
+    }
+}
