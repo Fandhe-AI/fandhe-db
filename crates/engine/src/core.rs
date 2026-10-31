@@ -6587,6 +6587,7 @@ impl EngineCore {
         // 差し替えは復号（総バイト数上限 MAX_INPUT_LEN の検証）より前に行い、正規化で
         // 長くなった値も参照回数込みで上限検査の対象にする。
         let mut canonical_values: Vec<(usize, Vec<u8>)> = Vec::new();
+        let mut typed_only_values: Vec<(usize, Vec<u8>)> = Vec::new();
         for (i, decl) in prepared.declared.iter().enumerate() {
             let (Some(ty), Some(Some(raw))) = (decl, values.get(i)) else {
                 continue;
@@ -6601,38 +6602,60 @@ impl EngineCore {
             // 宣言型としての検証だけを行う。
             // Issue #2797: 型付き置換の位置で float4 になる `$n` も対象にする（推論種別が整数でも、
             // 宣言 float4 の式内 `$n` は float4 として丸める）。
-            let is_float_slot =
-                prepared.param_types.get(i).is_some_and(|t| {
-                    t.literal_kind() == crate::sql::params::ParamLiteralKind::Float
-                }) || prepared.typed_positions.slot_is_float4(&prepared.tokens, n);
-            if let (Some(canonical), true) = (canonical, is_float_slot) {
-                canonical_values.push((i, canonical.into_bytes()));
+            let is_float_slot = prepared
+                .param_types
+                .get(i)
+                .is_some_and(|t| t.literal_kind() == crate::sql::params::ParamLiteralKind::Float);
+            if let Some(canonical) = canonical {
+                if is_float_slot {
+                    canonical_values.push((i, canonical.into_bytes()));
+                } else if prepared.typed_positions.slot_is_float4(&prepared.tokens, n) {
+                    // 型付き置換の位置だけで使う正規値。同番号の対象外位置（単独 `$n` 等）には
+                    // 元の値を渡す（正規値が整数スロットへ漏れて 22P02 になるのを避ける）。
+                    typed_only_values.push((i, canonical.into_bytes()));
+                }
             }
         }
+        let overlay = |base: &[Option<Vec<u8>>], extra: &[(usize, Vec<u8>)]| {
+            let mut v = base.to_vec();
+            for (i, bytes) in extra {
+                if let Some(slot) = v.get_mut(*i) {
+                    *slot = Some(bytes.clone());
+                }
+            }
+            v
+        };
         let effective: std::borrow::Cow<'_, [Option<Vec<u8>>]> = if canonical_values.is_empty() {
             std::borrow::Cow::Borrowed(values)
         } else {
-            let mut v = values.to_vec();
-            for (i, bytes) in canonical_values {
-                if let Some(slot) = v.get_mut(i) {
-                    *slot = Some(bytes);
-                }
-            }
-            std::borrow::Cow::Owned(v)
+            std::borrow::Cow::Owned(overlay(values, &canonical_values))
         };
         let decoded = crate::sql::params::decode_bind_values_nullable_typed(
             &prepared.tokens,
             &effective,
             &prepared.typed_positions,
         )?;
+        // 型付き位置用の値。正規化で長くなった値も上限検査の対象にするため別途復号する。
+        let decoded_typed = if typed_only_values.is_empty() {
+            None
+        } else {
+            let mut all = canonical_values.clone();
+            all.extend(typed_only_values);
+            Some(crate::sql::params::decode_bind_values_nullable_typed(
+                &prepared.tokens,
+                &overlay(values, &all),
+                &prepared.typed_positions,
+            )?)
+        };
         let kinds: Vec<crate::sql::params::ParamLiteralKind> = prepared
             .param_types
             .iter()
             .map(|t| t.literal_kind())
             .collect();
-        let substituted = crate::sql::params::substitute_values_typed_with(
+        let substituted = crate::sql::params::substitute_values_typed_split(
             &prepared.tokens,
             &decoded,
+            decoded_typed.as_deref().unwrap_or(&decoded),
             &kinds,
             &prepared.typed_positions,
         )?;

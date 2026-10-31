@@ -544,3 +544,30 @@ fn typed_substitution_keeps_fail_closed_shapes() {
     );
     exec_typed(&core, &ctx, &mut s, div, &[Some(D::Int8)], &["5"]).expect("division ok");
 }
+
+/// Issue #2797: float4 宣言の `$1` が INSERT の式内（型付き置換）と単独位置（整数スロット）の
+/// 両方に現れても、丸めた正規値は型付き位置だけに使い、単独位置には元の値（`5`）を渡す。
+/// 正規値 `5.0` が整数スロットへ漏れると `22P02` になる後退を固定する。
+#[test]
+fn float4_canonical_value_is_limited_to_typed_positions() {
+    let path = unique_db_path("decl-f4-typed-only");
+    let _g = CleanupGuard(path.clone());
+    let storage = Storage::open(&path).expect("open storage");
+    let core = EngineCore::from_storage(storage, Box::new(CpuScalarProvider));
+    let ctx = PolicyContext::with_visibilities("sys", [Visibility::Public, Visibility::Private])
+        .expect("valid tenant");
+    let mut session = SessionState::default();
+    session.allow_ddl();
+    core.execute_sql_in_session(
+        &ctx,
+        &mut session,
+        "CREATE TABLE t (id BIGINT, a BIGINT, b BIGINT)",
+    )
+    .expect("create table");
+    let sql = "INSERT INTO t (id, a, b) VALUES (1, $1, $1 + 1) USING OPERATION_ID 'op'";
+    let prepared = core
+        .parse_sql_prepared_with_declared(sql, &[Some(D::Float4)])
+        .expect("parse");
+    core.bind_prepared(&prepared, &[some("5")])
+        .expect("standalone $1 keeps the original value");
+}

@@ -2301,6 +2301,19 @@ pub(crate) fn substitute_values_typed_with(
     kinds: &[ParamLiteralKind],
     typed: &TypedPositions,
 ) -> Result<Vec<Token>, SqlSurfaceError> {
+    substitute_values_typed_split(tokens, values, values, kinds, typed)
+}
+
+/// [`substitute_values_typed_with`] の値分離版（Issue #2797）。型付き置換の位置には
+/// `typed_values`（float4 を丸めた正規値を含む）を、それ以外の位置には `values` を使う。
+/// 型付き位置でない同番号の `$n`（単独 `$n` 等）へ丸め値が漏れて 22P02 になる後退を防ぐ。
+pub(crate) fn substitute_values_typed_split(
+    tokens: &[Token],
+    values: &[Option<String>],
+    typed_values: &[Option<String>],
+    kinds: &[ParamLiteralKind],
+    typed: &TypedPositions,
+) -> Result<Vec<Token>, SqlSurfaceError> {
     let (_, between_bounds, _) = where_noneq_param_slots_and_bounds(tokens);
     substitute_with(tokens, |n, ti| {
         let idx = usize::from(n).checked_sub(1).ok_or_else(|| {
@@ -2313,7 +2326,11 @@ pub(crate) fn substitute_values_typed_with(
             return Ok(vec![Token::Ident("NULL".to_string())]);
         };
         if let Some(ty) = typed.get(ti) {
-            return typed_numeric_tokens(n, value, ty);
+            let typed_value = typed_values
+                .get(idx)
+                .and_then(Option::as_ref)
+                .unwrap_or(value);
+            return typed_numeric_tokens(n, typed_value, ty);
         }
         match kind_of(kinds, n) {
             ParamLiteralKind::String => Ok(vec![Token::StringLiteral(value.clone())]),
