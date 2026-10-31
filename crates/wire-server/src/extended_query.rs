@@ -1861,7 +1861,10 @@ fn handle_bind_body(
                 PreparedStatement::Empty
                     | PreparedStatement::Parsed {
                         parsed: ParsedSql::Transaction(
-                            engine::sql::transaction::TxnControl::Rollback
+                            engine::sql::transaction::ValidatedTxnControl {
+                                control: engine::sql::transaction::TxnControl::Rollback,
+                                ..
+                            }
                         ),
                         ..
                     }
@@ -2187,7 +2190,10 @@ fn portal_is_exempt_while_failed(state: &ExtendedQueryState, portal_name: &str) 
             PortalBody::Parsed(parsed) => {
                 matches!(
                     **parsed,
-                    ParsedSql::Transaction(engine::sql::transaction::TxnControl::Rollback)
+                    ParsedSql::Transaction(engine::sql::transaction::ValidatedTxnControl {
+                        control: engine::sql::transaction::TxnControl::Rollback,
+                        ..
+                    })
                 ) && matches!(portal.state, PortalState::Ready)
             }
         },
@@ -2343,7 +2349,10 @@ fn execute_portal<'e, S: WireStream>(
             // `lastval()` は読み取りのみ。`setval` は永続状態を書くため下の既定（autocommit なら
             // commit 成功境界を越える）へ落とす（TABLE-24・Issue #1691）。
             ParsedSql::SequenceFunction(f) if !f.writes() => false,
-            ParsedSql::Transaction(engine::sql::transaction::TxnControl::Commit) => true,
+            ParsedSql::Transaction(engine::sql::transaction::ValidatedTxnControl {
+                control: engine::sql::transaction::TxnControl::Commit,
+                ..
+            }) => true,
             ParsedSql::Transaction(_) => false,
             // Issue #1129: `SHOW`・`EXPLAIN ... PARTITIONED` は読み取りのみで commit を伴わない
             // （`CANCEL` と分割実行 DML は書き込みとして下の既定へ落とす）。
