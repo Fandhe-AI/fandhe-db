@@ -69,6 +69,22 @@ fn catalog_def_from_prepared(prepared: &PreparedUdf, body_source: &str) -> Funct
     }
 }
 
+/// 永続定義がセッション限定の関数（カタログ由来でない宣言的 UDF・WASM UDF）へ直接・推移的に依存する
+/// 場合は `0A000` で拒否する。永続定義は別接続・再起動後にその呼び出し先が無く、ロードで読み飛ばされて
+/// 呼べなくなるため（Issue #1922）。`0A000` は同じ「現状では永続化できない形」の既存拒否
+/// （明示トランザクション内の永続化など）と同じ契約。エラー文言に関数名は含めない。
+fn reject_session_local_dependency(
+    session: &SessionState,
+    body: &crate::sql::udf_call::Expr,
+) -> Result<(), SqlSurfaceError> {
+    if crate::sql::udf_call::body_depends_on_session_local(body, session.udfs()) {
+        return Err(SqlSurfaceError::feature_not_supported(
+            "a persistent function cannot depend on a session-local function",
+        ));
+    }
+    Ok(())
+}
+
 /// `CREATE FUNCTION` をカタログへ永続化してセッションへ登録する（DDL 権限のあるセッション用）。
 ///
 /// `max_functions` は起動時設定の件数上限（Issue #1922。ハード上限で飽和される）。
@@ -88,6 +104,7 @@ pub(crate) fn execute_create_function_persistent(
     max_functions: usize,
 ) -> Result<(), SqlSurfaceError> {
     let prepared = prepare_function_definition(session.udfs(), name, params, body)?;
+    reject_session_local_dependency(session, &prepared.body)?;
     let def = catalog_def_from_prepared(&prepared, body_source);
     storage
         .create_function_with_limit(tenant_id, &def, max_functions)
@@ -125,8 +142,9 @@ pub(crate) fn execute_create_or_replace_function_persistent(
         None,
         body,
         true,
-        max_functions,
+        None,
     )?;
+    reject_session_local_dependency(session, &prepared.body)?;
     let def = catalog_def_from_prepared(&prepared, body_source);
     // 循環検査はセッションのレジストリ（古い可能性がある）ではなく、write txn 内の最新カタログで
     // 再度行う（並行する別セッションの置換との合成で循環が残るのを防ぐ）。
@@ -322,14 +340,18 @@ mod tests {
             .create_function("t", &catalog_def_from_prepared(&prepared_f, "x"))
             .expect("create f");
         commit_function_definition(a.udfs_mut(), prepared_f);
+        // 実運用ではカタログ由来のロード・永続化が印を付ける（付けないとセッション限定の依存として拒否される）。
+        a.udfs_mut().mark_catalog_origin("f");
         let prepared_g = prepare_function_definition(a.udfs(), "g", &p, &body_x).expect("g");
         storage
             .create_function("t", &catalog_def_from_prepared(&prepared_g, "x"))
             .expect("create g");
         commit_function_definition(a.udfs_mut(), prepared_g);
+        a.udfs_mut().mark_catalog_origin("g");
         for key in ["f", "g"] {
             let prep = prepare_function_definition(b.udfs(), key, &p, &body_x).expect("b");
             commit_function_definition(b.udfs_mut(), prep);
+            b.udfs_mut().mark_catalog_origin(key);
         }
         execute_create_or_replace_function_persistent(
             &storage,

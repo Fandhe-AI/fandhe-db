@@ -274,3 +274,138 @@ fn create_in_explicit_transaction_stays_rejected() {
         .expect_err("rejected");
     assert_eq!(err.wire_code(), "0A000");
 }
+
+/// T7: 既存関数の置換は設定上限を下げた DB でも通り（件数が増えない）、新規作成だけが 54000 になる。
+/// セッション限定経路の置換・新規作成も同じ（カタログ由来の件数を数えない）。
+#[test]
+fn replacing_existing_function_skips_the_configured_limit() {
+    let path = unique_db_path("sql66-limit-replace");
+    let _g = CleanupGuard(path.clone());
+    {
+        let core = open(&path, 64);
+        let mut s = session(true);
+        for n in 1..=3 {
+            ok(&core, "alice", &mut s, &create(n));
+        }
+    }
+    let core = open(&path, 1);
+    let mut s = session(true);
+    core.load_session_udfs(&ctx("alice"), &mut s)
+        .expect("load session udfs");
+    // カタログ経路: 既存の置換は通り、新規は 54000。
+    ok(
+        &core,
+        "alice",
+        &mut s,
+        "CREATE OR REPLACE FUNCTION f2(x) AS x + 100",
+    );
+    assert_eq!(
+        code(
+            &core,
+            "alice",
+            &mut s,
+            "CREATE OR REPLACE FUNCTION f4(x) AS x"
+        ),
+        "54000"
+    );
+    // セッション限定経路: カタログ由来 3 件は数えず、1 件目は通り、2 件目は 54000、既存の置換は通る。
+    ok(&core, "alice", &mut s, "CREATE FUNCTION t1(x integer) AS x");
+    assert_eq!(
+        code(&core, "alice", &mut s, "CREATE FUNCTION t2(x integer) AS x"),
+        "54000"
+    );
+    ok(
+        &core,
+        "alice",
+        &mut s,
+        "CREATE OR REPLACE FUNCTION t1(x integer) AS x + 1",
+    );
+}
+
+/// T8: 永続定義はセッション限定の関数へ直接・推移的に依存できない（0A000）。OR REPLACE も同じ。
+/// セッション限定がカタログ関数を呼ぶのは許可。拒否後はカタログも変わらず、別接続は 42883 にならない。
+#[test]
+fn persistent_function_cannot_depend_on_session_local_function() {
+    let path = unique_db_path("sql66-persist-dep");
+    let _g = CleanupGuard(path.clone());
+    let core = open(&path, 8);
+    let mut s = session(true);
+    ok(
+        &core,
+        "alice",
+        &mut s,
+        "CREATE FUNCTION loc(x integer) AS x",
+    );
+    // 直接依存・推移的依存（セッション限定 → セッション限定）。
+    assert_eq!(
+        code(&core, "alice", &mut s, "CREATE FUNCTION p1(x) AS loc(x)"),
+        "0A000"
+    );
+    ok(
+        &core,
+        "alice",
+        &mut s,
+        "CREATE FUNCTION loc2(x integer) AS loc(x) + 1",
+    );
+    assert_eq!(
+        code(
+            &core,
+            "alice",
+            &mut s,
+            "CREATE FUNCTION p2(x) AS loc2(x) * 2"
+        ),
+        "0A000"
+    );
+    // OR REPLACE でカタログ関数をセッション限定への依存へ置き換えるのも拒否。
+    ok(&core, "alice", &mut s, "CREATE FUNCTION p3(x) AS x + 1");
+    assert_eq!(
+        code(
+            &core,
+            "alice",
+            &mut s,
+            "CREATE OR REPLACE FUNCTION p3(x) AS loc(x)"
+        ),
+        "0A000"
+    );
+    // 逆向き: セッション限定がカタログ関数を呼ぶのは通る。
+    ok(
+        &core,
+        "alice",
+        &mut s,
+        "CREATE FUNCTION loc3(x integer) AS p3(x)",
+    );
+    // 永続定義どうしの依存は通る。
+    ok(&core, "alice", &mut s, "CREATE FUNCTION p4(x) AS p3(x) + 1");
+    // 別接続では p3 は元の定義のまま、p1・p2 は存在しない。
+    let mut other = session(true);
+    core.load_session_udfs(&ctx("alice"), &mut other)
+        .expect("load session udfs");
+    assert!(other.udfs().get("p3").is_some());
+    assert!(other.udfs().get("p4").is_some());
+    assert!(other.udfs().get("p1").is_none());
+    assert!(other.udfs().get("p2").is_none());
+}
+
+/// T9: 件数はカタログ経路ではテナントのカタログ件数、セッション限定経路ではセッション限定の定義数で
+/// 数え、互いに枠を奪わない（それぞれ独立に設定上限を適用する）。
+#[test]
+fn catalog_and_session_local_limits_are_counted_independently() {
+    let path = unique_db_path("sql66-limit-independent");
+    let _g = CleanupGuard(path.clone());
+    let core = open(&path, 2);
+    let mut s = session(true);
+    ok(&core, "alice", &mut s, "CREATE FUNCTION t1(x integer) AS x");
+    ok(&core, "alice", &mut s, "CREATE FUNCTION t2(x integer) AS x");
+    // セッション限定が枠を埋めていても、カタログ経路は CREATE・OR REPLACE（新規）とも通る。
+    ok(&core, "alice", &mut s, &create(1));
+    ok(
+        &core,
+        "alice",
+        &mut s,
+        "CREATE OR REPLACE FUNCTION f2(x) AS x",
+    );
+    assert_eq!(code(&core, "alice", &mut s, &create(3)), "54000");
+    // カタログが枠を埋めていても、セッション限定経路の枠は別（t1・t2 を消して作り直せる）。
+    ok(&core, "alice", &mut s, "DROP FUNCTION t1");
+    ok(&core, "alice", &mut s, "CREATE FUNCTION t3(x integer) AS x");
+}

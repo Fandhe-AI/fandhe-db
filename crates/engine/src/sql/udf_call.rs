@@ -2540,6 +2540,11 @@ impl UdfRegistry {
         self.catalog_names.contains(&name.to_ascii_lowercase())
     }
 
+    /// セッション限定の登録件数（宣言的・WASM のうちカタログ由来を除く。設定上限の判定に使う）。
+    pub(crate) fn session_local_count(&self) -> usize {
+        self.len().saturating_sub(self.catalog_names.len())
+    }
+
     /// カタログ由来として登録されている件数（`sql::udf_load` が「非カタログ登録が枠を占めているか」の
     /// 判定に使う）。
     pub(crate) fn catalog_entry_count(&self) -> usize {
@@ -2671,7 +2676,8 @@ pub(crate) fn define_function_with_signature_capped(
         param_types,
         return_type,
         body,
-        max_functions,
+        Some(max_functions),
+        true,
     )?;
     commit_function_definition(registry, prepared);
     Ok(())
@@ -2679,6 +2685,11 @@ pub(crate) fn define_function_with_signature_capped(
 
 /// [`define_function_with_signature`] の検証部（レジストリは変更しない）。`CREATE FUNCTION` と
 /// `CREATE OR REPLACE FUNCTION`（[`prepare_function_replacement`]）が共有する。
+///
+/// 件数の検査は `check_capacity`（新規作成のときだけ `true`。既存定義の置換は件数を増やさないため
+/// 省略する。Issue #1922）と `local_limit`（セッション限定の定義数に対する設定上限。`None` は
+/// 設定上限なし = カタログ経路）で制御する。
+#[allow(clippy::too_many_arguments)]
 fn prepare_function_with_signature(
     registry: &UdfRegistry,
     name: &str,
@@ -2686,7 +2697,8 @@ fn prepare_function_with_signature(
     param_types: &[Option<crate::sql::cast::CastType>],
     return_type: Option<&crate::sql::cast::CastType>,
     body: &Expr,
-    max_functions: usize,
+    local_limit: Option<usize>,
+    check_capacity: bool,
 ) -> Result<PreparedUdf, SqlSurfaceError> {
     if param_types.len() != params.len() {
         return Err(SqlSurfaceError::unsupported(
@@ -2706,7 +2718,12 @@ fn prepare_function_with_signature(
         name,
         params,
         body,
-        Some(max_functions.min(MAX_SESSION_UDFS)),
+        check_capacity.then_some(MAX_SESSION_UDFS),
+        if check_capacity {
+            local_limit.map(|m| m.min(MAX_SESSION_UDFS))
+        } else {
+            None
+        },
     )?;
     prepared.param_types = param_types.to_vec();
     if let Some(ret) = return_type {
@@ -2731,6 +2748,9 @@ fn prepare_function_with_signature(
 /// 呼び出し元は `sql::udf_ddl`（DDL 権限のあるセッション。`allow_catalog_origin = true`）と
 /// [`define_or_replace_function_with_signature`]（型付き・RETURNS 付きのセッション限定登録。`false`）。
 ///
+/// `local_limit` はセッション限定の定義数（レジストリのうちカタログ由来を除く件数）に対する設定上限
+/// （`Some` はセッション限定経路。`None` はカタログ経路で、件数はカタログ側が数える）。
+///
 /// 判定順: 予約・組み込み名 `42723` → WASM UDF と同名 `42723` → 同名の宣言的 UDF が無ければ新規作成と
 /// 同じ検証（容量上限を含む）→ 引数の数・型注釈が違えば `42723`（多重定義は未対応）→ 引数名・戻り値型
 /// （`None` と `Some` の違いを含む）が違えば `42P13` → カタログ由来を権限の無いセッションが置換する
@@ -2738,7 +2758,8 @@ fn prepare_function_with_signature(
 ///
 /// 最後の検査が循環の防止（DoS 対策）: `CREATE` は追記専用で循環しないが、置換は `f -> g -> f` を作れ、
 /// [`bind_call`] のインライン展開と `recovery::content_hash::collect_referenced_udfs` は非巡回を
-/// 前提にする。戻り値は検証済みの定義（[`commit_function_definition`] が同名を上書きする）。
+/// 前提にする。既存定義の置換は件数を増やさないため、容量の検査は新規作成のときだけ行う（設定上限を
+/// 下げて再起動した DB でも既存関数の置換は通る）。戻り値は検証済みの定義（[`commit_function_definition`] が同名を上書きする）。
 #[allow(clippy::too_many_arguments)]
 pub(crate) fn prepare_function_replacement(
     registry: &UdfRegistry,
@@ -2748,7 +2769,7 @@ pub(crate) fn prepare_function_replacement(
     return_type: Option<&crate::sql::cast::CastType>,
     body: &Expr,
     allow_catalog_origin: bool,
-    max_functions: usize,
+    local_limit: Option<usize>,
 ) -> Result<PreparedUdf, SqlSurfaceError> {
     catalog::validate_relation_key(name)
         .map_err(|_| SqlSurfaceError::invalid_input(format!("invalid function name: {name}")))?;
@@ -2771,7 +2792,8 @@ pub(crate) fn prepare_function_replacement(
             param_types,
             return_type,
             body,
-            max_functions,
+            local_limit,
+            true,
         );
     };
     let normalized: Vec<String> = params.iter().map(|p| p.to_ascii_lowercase()).collect();
@@ -2810,7 +2832,8 @@ pub(crate) fn prepare_function_replacement(
         param_types,
         return_type,
         body,
-        max_functions,
+        local_limit,
+        false,
     )?;
     Ok(prepared)
 }
@@ -2910,6 +2933,89 @@ fn expr_reaches_function(
     }
 }
 
+/// `body` が（宣言的 UDF の本体を推移的にたどって）セッション限定の関数へ依存するか。セッション限定とは
+/// カタログ由来でない宣言的 UDF と WASM UDF で、永続定義が依存すると別接続・再起動後に呼び出し先が
+/// 無く `udf_load` が読み飛ばす。永続化経路（`sql::udf_ddl`）が書き込み前に呼んで拒否する
+/// （Issue #1922。逆向き = セッション限定がカタログ関数を呼ぶのは問題ない）。
+pub(crate) fn body_depends_on_session_local(body: &Expr, registry: &UdfRegistry) -> bool {
+    let mut names = Vec::new();
+    collect_call_names(body, &mut names);
+    let mut visited = std::collections::BTreeSet::new();
+    while let Some(lower) = names.pop() {
+        if !visited.insert(lower.clone()) {
+            continue;
+        }
+        if registry.wasm.contains_key(&lower) {
+            return true;
+        }
+        if let Some(def) = registry.defs.get(&lower) {
+            if !registry.is_catalog_origin(&lower) {
+                return true;
+            }
+            collect_call_names(&def.body, &mut names);
+        }
+    }
+    false
+}
+
+/// `expr` 内の関数呼び出し名（小文字）を `out` へ集める（UDF 本体は展開しない）。`Expr` の全 variant を
+/// 網羅し `_ =>` を置かない（variant 追加時にコンパイルエラーで検査漏れに気づく。fail-closed）。
+fn collect_call_names(expr: &Expr, out: &mut Vec<String>) {
+    match expr {
+        Expr::Number(_)
+        | Expr::Ident(_)
+        | Expr::String(_)
+        | Expr::Null
+        | Expr::DateLiteral(_)
+        | Expr::TimestampLiteral(_)
+        | Expr::IntervalLiteral(_)
+        | Expr::TimeLiteral(_)
+        | Expr::TimestampTzLiteral { .. }
+        | Expr::ValueFunction { .. } => {}
+        Expr::Call { name, args } => {
+            out.push(name.to_ascii_lowercase());
+            for a in args {
+                collect_call_names(a, out);
+            }
+        }
+        Expr::Binary { lhs, rhs, .. }
+        | Expr::NullIf(lhs, rhs)
+        | Expr::IsDistinctFrom { lhs, rhs, .. }
+        | Expr::RegexMatch {
+            lhs, pattern: rhs, ..
+        }
+        | Expr::JsonAccess { lhs, rhs, .. } => {
+            collect_call_names(lhs, out);
+            collect_call_names(rhs, out);
+        }
+        Expr::Collate { expr, .. } | Expr::Cast { expr, .. } => collect_call_names(expr, out),
+        Expr::ArrayConstructor(_) | Expr::Subscript { .. } | Expr::Quantified { .. } => {
+            for c in expr.array_expr_children().into_iter().flatten() {
+                collect_call_names(c, out);
+            }
+        }
+        Expr::SqlJsonQuery(q) => {
+            for c in q.children() {
+                collect_call_names(c, out);
+            }
+        }
+        Expr::Case { whens, else_result } => {
+            for (c, r) in whens {
+                collect_call_names(c, out);
+                collect_call_names(r, out);
+            }
+            if let Some(e) = else_result.as_deref() {
+                collect_call_names(e, out);
+            }
+        }
+        Expr::Coalesce(args) => {
+            for a in args {
+                collect_call_names(a, out);
+            }
+        }
+    }
+}
+
 /// `CREATE OR REPLACE FUNCTION` をセッション限定のレジストリへ適用する（権限ありセッションの
 /// 型付き・RETURNS 付き定義用。#2798 まで。SQL-66 (2)・Issue #1917）。[`prepare_function_replacement`]（`allow_catalog_origin = false`。
 /// セッション限定の登録がカタログ由来の定義を置換して食い違わないよう `42501`）で検証
@@ -2932,7 +3038,7 @@ pub(crate) fn define_or_replace_function_with_signature(
         return_type,
         body,
         false,
-        max_functions,
+        Some(max_functions),
     )?;
     commit_function_definition(registry, prepared);
     Ok(())
@@ -3119,7 +3225,7 @@ pub(crate) fn prepare_function_definition(
     params: &[String],
     body: &Expr,
 ) -> Result<PreparedUdf, SqlSurfaceError> {
-    prepare_function_definition_inner(registry, name, params, body, Some(MAX_SESSION_UDFS))
+    prepare_function_definition_inner(registry, name, params, body, Some(MAX_SESSION_UDFS), None)
 }
 
 /// レジストリ容量の上限だけを無視して登録可否を検査する（UDF カタログロードが「容量による一時的な
@@ -3130,7 +3236,7 @@ pub(crate) fn prepare_function_definition_ignoring_capacity(
     params: &[String],
     body: &Expr,
 ) -> Result<PreparedUdf, SqlSurfaceError> {
-    prepare_function_definition_inner(registry, name, params, body, None)
+    prepare_function_definition_inner(registry, name, params, body, None, None)
 }
 
 fn prepare_function_definition_inner(
@@ -3139,6 +3245,7 @@ fn prepare_function_definition_inner(
     params: &[String],
     body: &Expr,
     capacity: Option<usize>,
+    local_limit: Option<usize>,
 ) -> Result<PreparedUdf, SqlSurfaceError> {
     // 関数名は relation キー（裸の名前、または SCHEMA 配下の内部キー `#<id>.<name>`。
     // 名前解決器が `CREATE FUNCTION s.f(` を解決した出力。TABLE-27・Issue #1717）を受理する。
@@ -3156,6 +3263,13 @@ fn prepare_function_definition_inner(
         )));
     }
     if capacity.is_some_and(|cap| registry.len() >= cap) {
+        return Err(SqlSurfaceError::payload_too_large(
+            "too many functions defined in this session",
+        ));
+    }
+    // 設定上限（セッション限定経路）はセッション限定の定義数だけを数える（カタログ由来は含めない。
+    // カタログ経路の設定上限は `Storage` がテナントのカタログ件数で判定する。Issue #1922）。
+    if local_limit.is_some_and(|lim| registry.session_local_count() >= lim) {
         return Err(SqlSurfaceError::payload_too_large(
             "too many functions defined in this session",
         ));
