@@ -332,6 +332,33 @@ fn spawn_server_with_ddl_user(core: Arc<EngineCore>) -> std::net::SocketAddr {
 const CALL_DBL: &str =
     "SELECT dbl(id) AS d FROM docs ORDER BY embedding <=> '[3.0,4.0,0.0]' LIMIT 1";
 
+/// SQL-66（Issue #1922）: DDL 権限のあるユーザーの型付き引数・RETURNS 付き `CREATE FUNCTION` は
+/// #2798 までセッション限定で成功し、同じ接続では呼べるが、別接続（同じテナントを含む）からは見えない。
+#[test]
+fn wire_typed_and_returns_udf_is_session_only_for_ddl_user() {
+    let (core, _guard) = new_core_with_docs();
+    let addr = spawn_server_with_ddl_user(core);
+    let mut a = authenticate_to_ready_for_query(addr, "alice", "pw-alice");
+    for sql in [
+        "CREATE FUNCTION tdbl(x bigint) AS x * 2",
+        "CREATE FUNCTION rdbl(x bigint) RETURNS bigint AS x * 2",
+    ] {
+        send_simple_query(&mut a, sql);
+        assert_eq!(read_command_complete(&mut a), "CREATE FUNCTION");
+        read_ready_for_query(&mut a);
+    }
+    send_simple_query(&mut a, "SELECT rdbl(2) AS d FROM docs LIMIT 1");
+    assert_eq!(read_row_description(&mut a), vec!["d"]);
+    let _ = read_data_row(&mut a);
+    assert_eq!(read_command_complete(&mut a), "SELECT 1");
+    read_ready_for_query(&mut a);
+
+    let mut b = authenticate_to_ready_for_query(addr, "alice", "pw-alice");
+    send_simple_query(&mut b, "SELECT rdbl(2) AS d FROM docs LIMIT 1");
+    expect_error_response_with_sqlstate(&mut b, "42883");
+    read_ready_for_query(&mut b);
+}
+
 /// SQL-66・Issue #1921: 接続 A が `CREATE FUNCTION` した関数を、その後に開いた別の接続 B
 /// （DDL 権限なし）が開始時のロードで呼べる。
 #[test]

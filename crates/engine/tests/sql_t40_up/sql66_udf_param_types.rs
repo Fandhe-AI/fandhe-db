@@ -17,6 +17,14 @@ use engine::storage::{Storage, Visibility};
 use crate::temp_db;
 use temp_db::{unique_db_path, CleanupGuard};
 
+/// DDL 権限つきのセッション。型付き引数・RETURNS 付きの定義は #2798 までカタログへ書かず、
+/// 権限のあるセッションのセッション限定レジストリへ登録される（Issue #1922）。
+fn ddl_session() -> SessionState {
+    let mut s = SessionState::default();
+    s.allow_ddl();
+    s
+}
+
 fn ctx_for(tenant: &str) -> PolicyContext {
     PolicyContext::with_visibilities(tenant, [Visibility::Public, Visibility::Private])
         .expect("valid tenant")
@@ -65,9 +73,6 @@ fn new_core(label: &str) -> (EngineCore, CleanupGuard) {
 }
 
 fn run(core: &EngineCore, session: &mut SessionState, sql: &str) -> Result<SqlOutcome, String> {
-    if let Some(result) = crate::udf_direct::try_define_directly(session, sql) {
-        return result;
-    }
     core.execute_sql_in_session(&ctx_for("tenant-a"), session, sql)
         .map_err(|e| e.wire_code().to_string())
 }
@@ -93,7 +98,7 @@ fn first_cell(core: &EngineCore, session: &mut SessionState, sql: &str) -> Cell 
 #[test]
 fn typed_definition_is_accepted_and_callable() {
     let (core, _g) = new_core("sql66-basic");
-    let mut s = SessionState::default();
+    let mut s = ddl_session();
     define(&core, &mut s, "CREATE FUNCTION add1(x integer) AS x + 1");
     assert_eq!(
         first_cell(&core, &mut s, "SELECT add1(2) FROM docs LIMIT 1"),
@@ -104,7 +109,7 @@ fn typed_definition_is_accepted_and_callable() {
 #[test]
 fn multi_word_and_array_types_are_accepted() {
     let (core, _g) = new_core("sql66-types");
-    let mut s = SessionState::default();
+    let mut s = ddl_session();
     for (i, ty) in [
         "double precision",
         "character varying",
@@ -127,7 +132,7 @@ fn multi_word_and_array_types_are_accepted() {
 #[test]
 fn untyped_form_is_unchanged() {
     let (core, _g) = new_core("sql66-untyped");
-    let mut s = SessionState::default();
+    let mut s = ddl_session();
     define(&core, &mut s, "CREATE FUNCTION f(x) AS x + 1");
     assert_eq!(
         first_cell(&core, &mut s, "SELECT f(2) FROM docs LIMIT 1"),
@@ -139,7 +144,7 @@ fn untyped_form_is_unchanged() {
 #[test]
 fn unknown_and_serial_types_are_42704_deterministically() {
     let (core, _g) = new_core("sql66-unknown");
-    let mut s = SessionState::default();
+    let mut s = ddl_session();
     for _ in 0..2 {
         assert_eq!(
             code(&core, &mut s, "CREATE FUNCTION f(x nosuchtype) AS x"),
@@ -155,7 +160,7 @@ fn unknown_and_serial_types_are_42704_deterministically() {
 #[test]
 fn unsupported_forms_are_fail_closed() {
     let (core, _g) = new_core("sql66-unsupported");
-    let mut s = SessionState::default();
+    let mut s = ddl_session();
     for sql in [
         "CREATE FUNCTION f(v vector(3)) AS 1",
         "CREATE FUNCTION f(x char(3)) AS 1",
@@ -182,7 +187,7 @@ fn unsupported_forms_are_fail_closed() {
 #[test]
 fn argument_mode_after_name_is_0a000_like_before_name() {
     let (core, _g) = new_core("sql66-mode-after-name");
-    let mut s = SessionState::default();
+    let mut s = ddl_session();
     for sql in [
         "CREATE FUNCTION f(a OUT integer) AS a",
         "CREATE FUNCTION f(a IN integer) AS a",
@@ -199,7 +204,7 @@ fn argument_mode_after_name_is_0a000_like_before_name() {
 #[test]
 fn varchar_modifier_is_normalized_and_does_not_truncate() {
     let (core, _g) = new_core("sql66-varchar");
-    let mut s = SessionState::default();
+    let mut s = ddl_session();
     define(&core, &mut s, "CREATE FUNCTION id_t(x varchar(3)) AS x");
     assert_eq!(
         first_cell(&core, &mut s, "SELECT id_t('abcdef') FROM docs LIMIT 1"),
@@ -210,7 +215,7 @@ fn varchar_modifier_is_normalized_and_does_not_truncate() {
 #[test]
 fn implicit_conversions_are_accepted() {
     let (core, _g) = new_core("sql66-implicit");
-    let mut s = SessionState::default();
+    let mut s = ddl_session();
     define(&core, &mut s, "CREATE FUNCTION b(x bigint) AS x");
     define(&core, &mut s, "CREATE FUNCTION d(x float8) AS x");
     define(&core, &mut s, "CREATE FUNCTION tx(x text) AS x");
@@ -229,7 +234,7 @@ fn implicit_conversions_are_accepted() {
 #[test]
 fn malformed_unknown_literal_is_input_error() {
     let (core, _g) = new_core("sql66-22p02");
-    let mut s = SessionState::default();
+    let mut s = ddl_session();
     define(&core, &mut s, "CREATE FUNCTION i(x integer) AS x");
     assert_eq!(
         code(&core, &mut s, "SELECT i('abc') FROM docs LIMIT 1"),
@@ -240,7 +245,7 @@ fn malformed_unknown_literal_is_input_error() {
 #[test]
 fn type_mismatch_is_42883() {
     let (core, _g) = new_core("sql66-mismatch");
-    let mut s = SessionState::default();
+    let mut s = ddl_session();
     define(&core, &mut s, "CREATE FUNCTION i(x integer) AS x");
     define(&core, &mut s, "CREATE FUNCTION dt(x date) AS 1");
     define(&core, &mut s, "CREATE FUNCTION nt(x text) AS x");
@@ -266,7 +271,7 @@ fn type_mismatch_is_42883() {
 #[test]
 fn statically_unknown_numeric_argument_is_fail_closed() {
     let (core, _g) = new_core("sql66-unknown-numeric");
-    let mut s = SessionState::default();
+    let mut s = ddl_session();
     define(&core, &mut s, "CREATE FUNCTION i(x integer) AS x");
     assert_eq!(
         code(&core, &mut s, "SELECT i(id) FROM docs LIMIT 1"),
@@ -294,7 +299,7 @@ fn sessionless_entry_still_rejects_create_function() {
 #[test]
 fn typed_udf_respects_rls_and_session_boundaries() {
     let (core, _g) = new_core("sql66-rls");
-    let mut s = SessionState::default();
+    let mut s = ddl_session();
     define(&core, &mut s, "CREATE FUNCTION big(x bigint) AS x");
     // tenant-b の行 (n = 100) は不可視。
     match run(
@@ -305,7 +310,7 @@ fn typed_udf_respects_rls_and_session_boundaries() {
         Ok(SqlOutcome::Query(q)) => assert_eq!(q.rows.len(), 1),
         other => panic!("unexpected {other:?}"),
     }
-    let mut other_session = SessionState::default();
+    let mut other_session = ddl_session();
     assert_eq!(
         code(&core, &mut other_session, "SELECT big(1) FROM docs LIMIT 1"),
         "42883"
@@ -317,7 +322,7 @@ fn typed_udf_respects_rls_and_session_boundaries() {
 #[test]
 fn nested_typed_udf_call_keeps_declared_param_type() {
     let (core, _g) = new_core("sql66-nested");
-    let mut s = SessionState::default();
+    let mut s = ddl_session();
     define(&core, &mut s, "CREATE FUNCTION f(x integer) AS x");
     define(&core, &mut s, "CREATE FUNCTION g(y integer) AS f(y)");
     run(&core, &mut s, "SELECT g(1) FROM docs LIMIT 1").expect("nested integer");
@@ -334,7 +339,7 @@ fn nested_typed_udf_call_keeps_declared_param_type() {
 #[test]
 fn nested_typed_udf_call_widens_integer_to_bigint() {
     let (core, _g) = new_core("sql66-nested-widen");
-    let mut s = SessionState::default();
+    let mut s = ddl_session();
     define(&core, &mut s, "CREATE FUNCTION f(x bigint) AS x");
     define(&core, &mut s, "CREATE FUNCTION g(y integer) AS f(y)");
     run(&core, &mut s, "SELECT g(1) FROM docs LIMIT 1").expect("integer to bigint");
@@ -346,7 +351,7 @@ fn nested_typed_udf_call_widens_integer_to_bigint() {
 #[test]
 fn exact_type_array_argument_is_not_a_type_mismatch() {
     let (core, _g) = new_core("sql66-array-arg");
-    let mut s = SessionState::default();
+    let mut s = ddl_session();
     define(&core, &mut s, "CREATE FUNCTION a(x int[]) AS 1");
     assert_eq!(
         code(&core, &mut s, "SELECT a(ARRAY[1, 2]) FROM docs LIMIT 1"),
@@ -359,7 +364,7 @@ fn exact_type_array_argument_is_not_a_type_mismatch() {
 #[test]
 fn boolean_column_is_accepted_for_boolean_param() {
     let (core, _g) = new_core("sql66-bool-col");
-    let mut s = SessionState::default();
+    let mut s = ddl_session();
     define(&core, &mut s, "CREATE FUNCTION f(x boolean) AS x");
     run(&core, &mut s, "SELECT f(flag) FROM docs LIMIT 1").expect("boolean column argument");
 }
@@ -368,7 +373,7 @@ fn boolean_column_is_accepted_for_boolean_param() {
 #[test]
 fn percent_type_forms_are_0a000_before_type_resolution() {
     let (core, _g) = new_core("sql66-percent-type");
-    let mut s = SessionState::default();
+    let mut s = ddl_session();
     for sql in [
         "CREATE FUNCTION f(x docs.n%TYPE) AS x",
         "CREATE FUNCTION f(x n%TYPE) AS x",

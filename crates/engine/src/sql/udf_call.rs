@@ -2654,7 +2654,7 @@ pub fn define_function_with_signature(
 /// [`define_function_with_signature`] の件数上限指定版（SQL-66 (5)・Issue #1922）。`max_functions` は
 /// 起動時設定（`crate::function_limits::FunctionLimits`）で、ハード上限 [`MAX_SESSION_UDFS`] で
 /// 飽和させる（設定で上げられない）。判定順は既存のまま（重複 `42723` が上限 `54000` より先）。
-/// `core.rs::EngineCore::execute_sql_in_session` の `CreateFunction` 分岐が RETURNS 付き定義の事前検証（権限ありのみ）で呼ぶ。
+/// `core.rs::EngineCore::execute_sql_in_session` の `CreateFunction` 分岐が型付き・RETURNS 付き定義のセッション限定登録（権限ありのみ。#2798 まで）で呼ぶ。
 pub(crate) fn define_function_with_signature_capped(
     registry: &mut UdfRegistry,
     name: &str,
@@ -2729,7 +2729,7 @@ fn prepare_function_with_signature(
 
 /// `CREATE OR REPLACE FUNCTION` の検証部（レジストリは変更しない。SQL-66 (2)・Issue #1917）。
 /// 呼び出し元は `sql::udf_ddl`（DDL 権限のあるセッション。`allow_catalog_origin = true`）と
-/// [`define_or_replace_function_with_signature`]（事前検証の複製。同じく権限検査済みで `true`）。
+/// [`define_or_replace_function_with_signature`]（型付き・RETURNS 付きのセッション限定登録。`false`）。
 ///
 /// 判定順: 予約・組み込み名 `42723` → WASM UDF と同名 `42723` → 同名の宣言的 UDF が無ければ新規作成と
 /// 同じ検証（容量上限を含む）→ 引数の数・型注釈が違えば `42723`（多重定義は未対応）→ 引数名・戻り値型
@@ -2910,9 +2910,9 @@ fn expr_reaches_function(
     }
 }
 
-/// `CREATE OR REPLACE FUNCTION` をレジストリの複製へ適用する（権限ありセッションの RETURNS 付き定義の事前検証用。
-/// SQL-66 (2)・Issue #1917）。呼び出し元は権限検査済みのため [`prepare_function_replacement`]
-/// （`allow_catalog_origin = true`。カタログ由来の定義の置換を `42501` にしない）で検証
+/// `CREATE OR REPLACE FUNCTION` をセッション限定のレジストリへ適用する（権限ありセッションの
+/// 型付き・RETURNS 付き定義用。#2798 まで。SQL-66 (2)・Issue #1917）。[`prepare_function_replacement`]（`allow_catalog_origin = false`。
+/// セッション限定の登録がカタログ由来の定義を置換して食い違わないよう `42501`）で検証
 /// してから [`commit_function_definition`] で上書きし、失敗時は `registry` を変更しない。
 /// `core.rs::EngineCore::execute_validated_in_session` の `CreateFunction` 分岐が呼ぶ。
 pub(crate) fn define_or_replace_function_with_signature(
@@ -2931,7 +2931,7 @@ pub(crate) fn define_or_replace_function_with_signature(
         param_types,
         return_type,
         body,
-        true,
+        false,
         max_functions,
     )?;
     commit_function_definition(registry, prepared);

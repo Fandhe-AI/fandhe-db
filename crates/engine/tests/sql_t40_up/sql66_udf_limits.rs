@@ -4,7 +4,8 @@
 //! 固定する契約: 設定した上限が権限ありのカタログ経路で効く（既定は 64）／件数はテナントごと／
 //! 重複 `42723` が上限 `54000` より先／上限を下げて再オープンしても既存の関数はロードされ呼べる／
 //! 権限の無いセッションの `CREATE`（`OR REPLACE`・型付き引数・RETURNS を含む）と `DROP FUNCTION` は
-//! カタログにもセッション内レジストリにも触れず `42501`（保存先の振り分けより前に拒否）。
+//! カタログにもセッション内レジストリにも触れず `42501`（保存先の振り分けより前に拒否）。権限ありの
+//! 型付き引数・RETURNS 付きは #2798 までセッション限定のレジストリへ登録され、上限・判定順が効く。
 
 use engine::core::EngineCore;
 use engine::function_limits::FunctionLimits;
@@ -155,7 +156,7 @@ fn lowering_the_limit_keeps_existing_functions_usable() {
 
 /// T5: 権限の無いセッションの CREATE／CREATE OR REPLACE／型付き引数／RETURNS／DROP はすべて `42501`
 /// で、カタログ・セッション内レジストリ・件数のいずれも変わらない（受け入れ条件「権限なしは拒否」）。
-/// 型付き引数と RETURNS の永続化（#2798）が無くても、権限検査は保存先の振り分けより前に効く。
+/// 権限検査は保存先の振り分け（カタログ・セッション限定）より前に効く。
 #[test]
 fn session_without_permission_is_rejected_and_nothing_changes() {
     let path = unique_db_path("sql66-limit-perm");
@@ -209,6 +210,52 @@ fn create_and_drop_in_explicit_transaction_without_permission_are_42501() {
             .expect_err("rejected");
         assert_eq!(err.wire_code(), "42501", "{sql}");
     }
+}
+
+/// T7（暫定・#2798 まで）: 権限ありの型付き引数・RETURNS 付き定義はセッション限定のレジストリへ登録され、
+/// 別セッションからは見えない。上限・判定順（重複 `42723` → 件数 `54000`）と `DROP FUNCTION` も効く。
+#[test]
+fn typed_and_returns_definitions_are_session_only_with_limit_and_drop() {
+    let path = unique_db_path("sql66-limit-session-only");
+    let _g = CleanupGuard(path.clone());
+    let core = open(&path, 2);
+    let mut s = session(true);
+    ok(&core, "alice", &mut s, "CREATE FUNCTION t1(x integer) AS x");
+    ok(
+        &core,
+        "alice",
+        &mut s,
+        "CREATE FUNCTION t2() RETURNS integer AS 2",
+    );
+    assert_eq!(s.udfs().len(), 2);
+    // 重複は件数上限より先に 42723、超過は 54000。失敗時はレジストリが変わらない。
+    assert_eq!(
+        code(&core, "alice", &mut s, "CREATE FUNCTION t1(x integer) AS x"),
+        "42723"
+    );
+    assert_eq!(
+        code(&core, "alice", &mut s, "CREATE FUNCTION t3(x integer) AS x"),
+        "54000"
+    );
+    assert_eq!(s.udfs().len(), 2);
+    // 別セッションから見えず、カタログにも書かれていない（untyped はカタログ側の件数で数える）。
+    let mut other = session(true);
+    core.load_session_udfs(&ctx("alice"), &mut other)
+        .expect("load session udfs");
+    assert_eq!(other.udfs().len(), 0);
+    ok(&core, "alice", &mut other, &create(1));
+    ok(&core, "alice", &mut other, &create(2));
+    // DROP でセッション限定の定義が消え、枠が空く。
+    ok(&core, "alice", &mut s, "DROP FUNCTION t1");
+    assert_eq!(s.udfs().len(), 1);
+    ok(&core, "alice", &mut s, "CREATE FUNCTION t3(x integer) AS x");
+    // 権限なしは状態不変で 42501（T5 と同じ）。
+    let mut n = session(false);
+    assert_eq!(
+        code(&core, "alice", &mut n, "CREATE FUNCTION t9(x integer) AS x"),
+        "42501"
+    );
+    assert_eq!(n.udfs().len(), 0);
 }
 
 /// T6: 権限ありの明示トランザクション内の CREATE FUNCTION は上限の設定に関係なく 0A000。

@@ -7710,12 +7710,23 @@ impl EngineCore {
             // SQL-66（Issue #1920・#1922）: `CREATE FUNCTION` は DDL 権限が無ければ保存先（カタログ／
             // セッション内）の振り分けより前に `42501` で拒否する（fail-closed）。権限のあるセッションは
             // UDF カタログへ書く永続 DDL のため、ROLLBACK で取り消せない書き込みを明示トランザクションの
-            // 中で行わない（他の DDL と同じ `0A000`）。
-            ParsedSql::Statement(Statement::CreateFunction { .. }) => {
+            // 中で行わない（他の DDL と同じ `0A000`）。型付き引数・RETURNS 付き（#2798 までセッション限定）は
+            // カタログへ書かず ROLLBACK で `session_at_begin` へ戻るため、そのまま通す。
+            ParsedSql::Statement(
+                stmt @ Statement::CreateFunction {
+                    param_types,
+                    return_type,
+                    ..
+                },
+            ) => {
                 crate::sql::ddl::require_ddl_permission(session)?;
-                Err(SqlSurfaceError::feature_not_supported(
-                    "CREATE [OR REPLACE] FUNCTION is not supported inside a transaction block",
-                ))
+                if return_type.is_some() || param_types.iter().any(Option::is_some) {
+                    self.execute_validated_in_session(ctx, session, stmt.clone())
+                } else {
+                    Err(SqlSurfaceError::feature_not_supported(
+                        "CREATE [OR REPLACE] FUNCTION is not supported inside a transaction block",
+                    ))
+                }
             }
             ParsedSql::DropFunction(_) => {
                 crate::sql::ddl::require_ddl_permission(session)?;
@@ -9120,12 +9131,11 @@ impl EngineCore {
             // 型付き引数・RETURNS の永続化は #2798。docs/design/udf-catalog.md）。
             //
             // Issue #1915（SQL-66 (1)）: 型注釈つきの定義は、カタログへの型の永続化とロード側の
-            // 復元（`udf_load` は型注釈つきの行を読み飛ばす）が揃うまで、永続化経路では `0A000` で
-            // 拒否する（セッションにだけ残り再起動で消える黙った不整合を作らない・fail-closed）。
+            // 復元（`udf_load` は型注釈つきの行を読み飛ばす）が揃う（#2798）まで、カタログへ書かず
+            // セッション限定のレジストリにだけ登録する（上の暫定経路）。
             //
             // Issue #1917（SQL-66 (2)）: `CREATE OR REPLACE FUNCTION` は同じ分岐で `or_replace` により
-            // 置換経路（`prepare_function_replacement`）へ切り替える。DDL セッションの型付き・RETURNS つきの
-            // `0A000`・`42P13` の順序は `CREATE` と同じ。
+            // 置換経路（`prepare_function_replacement`）へ切り替える。`42P13` などの順序は `CREATE` と同じ。
             crate::sql::allowlist::Statement::CreateFunction {
                 or_replace,
                 name,
@@ -9139,14 +9149,14 @@ impl EngineCore {
                 // セッションはカタログにもセッション内レジストリにも触れず `42501` になる。
                 crate::sql::ddl::require_ddl_permission(session)?;
                 {
-                    // Issue #1916: RETURNS 付きは永続化の前に、非 DDL セッションと同じ検証（本体の型検査）を
-                    // レジストリの複製に対して行う。型の不一致は権限によらず `42P13` になり、
-                    // 検証を通った定義だけが下の `0A000`（未対応の永続化）に到達する。
-                    if return_type.is_some() {
-                        let mut probe = session.udfs().clone();
+                    // 暫定（#2798 まで）: 型付き引数・RETURNS 付きの定義はカタログへ型を永続化できないため、
+                    // セッション限定のレジストリへ登録する（再起動・別セッションからは見えない）。検証（本体の
+                    // 型検査 `42P13` を含む）と上限（重複 `42723` → 件数 `54000`）は永続化経路と同じ順で、
+                    // 失敗時はレジストリを変更しない。カタログ由来の定義は置換しない。
+                    if return_type.is_some() || param_types.iter().any(Option::is_some) {
                         if or_replace {
                             crate::sql::udf_call::define_or_replace_function_with_signature(
-                                &mut probe,
+                                session.udfs_mut(),
                                 &name,
                                 &params,
                                 &param_types,
@@ -9156,7 +9166,7 @@ impl EngineCore {
                             )?;
                         } else {
                             crate::sql::udf_call::define_function_with_signature_capped(
-                                &mut probe,
+                                session.udfs_mut(),
                                 &name,
                                 &params,
                                 &param_types,
@@ -9165,18 +9175,7 @@ impl EngineCore {
                                 self.function_limits.max_functions(),
                             )?;
                         }
-                        return Err(
-                            crate::sql::allowlist::SqlSurfaceError::feature_not_supported(
-                                "function return types cannot be persisted yet",
-                            ),
-                        );
-                    }
-                    if param_types.iter().any(Option::is_some) {
-                        return Err(
-                            crate::sql::allowlist::SqlSurfaceError::feature_not_supported(
-                                "typed function parameters cannot be persisted yet",
-                            ),
-                        );
+                        return Ok(crate::sql::SqlOutcome::CreateFunction { name });
                     }
                     if or_replace {
                         crate::sql::udf_ddl::execute_create_or_replace_function_persistent(

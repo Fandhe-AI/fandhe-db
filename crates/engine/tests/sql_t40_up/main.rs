@@ -124,4 +124,3 @@ mod sql66_udf_param_types;
 mod sql66_udf_returns;
 mod sql78_predicate_dml_noneq_between_params;
 mod sql78_where_noneq_between_params;
-mod udf_direct;

@@ -387,22 +387,21 @@ fn replace_rejects_param_name_change_and_overloads() {
     assert!(call(&core, "alice", &mut a, CALL_DBL).contains("10"));
 }
 
-/// 戻り値型・型注釈の変更。型付き・RETURNS 付きの定義は SQL 経由では作れない（永続化は #2798）ため、
-/// 前提の定義はレジストリへ直接置き、DDL セッションの OR REPLACE が事前検証で返す SQLSTATE を固定する。
-/// RETURNS 付きの戻り値型の変更は 42P13、引数の型の違いは多重定義扱いで 42723、
-/// 同じシグネチャは検証を通って未対応の永続化（0A000）になる。
+/// 戻り値型・型注釈の変更（権限ありセッションの型付き・RETURNS 付き定義は #2798 までセッション限定）。
+/// 戻り値型の変更・RETURNS の有無の変更は 42P13、引数の型の違いは多重定義扱いで 42723、
+/// 同じシグネチャなら置換できる。
 #[test]
-fn replace_rejects_return_type_and_signature_changes_in_ddl_session() {
+fn replace_rejects_return_type_and_signature_changes_in_session_only_definitions() {
     let path = unique_db_path("sql66-dr-replace-returns");
     let _g = CleanupGuard(path.clone());
     let core = open(&path);
     let mut s = ddl_session();
-    crate::udf_direct::define_directly(
+    ok(
+        &core,
+        "alice",
         &mut s,
         "CREATE FUNCTION tf(x integer) RETURNS integer AS x",
-    )
-    .expect("applicable")
-    .expect("direct define");
+    );
     assert_eq!(
         code(
             &core,
@@ -419,8 +418,7 @@ fn replace_rejects_return_type_and_signature_changes_in_ddl_session() {
             &mut s,
             "CREATE OR REPLACE FUNCTION tf(x integer) AS x"
         ),
-        // RETURNS の無い型付き定義は事前検証を通らず、永続化の未対応（#2798）で止まる。
-        "0A000"
+        "42P13"
     );
     assert_eq!(
         code(
@@ -431,14 +429,11 @@ fn replace_rejects_return_type_and_signature_changes_in_ddl_session() {
         ),
         "42723"
     );
-    assert_eq!(
-        code(
-            &core,
-            "alice",
-            &mut s,
-            "CREATE OR REPLACE FUNCTION tf(x integer) RETURNS integer AS x + 1"
-        ),
-        "0A000"
+    ok(
+        &core,
+        "alice",
+        &mut s,
+        "CREATE OR REPLACE FUNCTION tf(x integer) RETURNS integer AS x + 1",
     );
 }
 
@@ -558,30 +553,31 @@ fn replace_inside_explicit_transaction_is_rejected_for_ddl_sessions() {
         .expect("rollback");
 }
 
-/// DDL セッションの型付き・RETURNS つきの OR REPLACE は、CREATE と同じく永続化できない（0A000）。
-/// 本体の型不一致（42P13）が先に出る。
+/// 権限ありセッションの型付き・RETURNS つきの OR REPLACE は、対象が無ければ新規作成になり、CREATE と
+/// 同じくカタログへ書かずセッション限定に登録される（#2798 まで）。別セッションからは見えない。
 #[test]
-fn replace_with_typed_signature_is_not_persisted_in_ddl_sessions() {
+fn replace_with_typed_signature_is_session_only_in_ddl_sessions() {
     let path = unique_db_path("sql66-dr-replace-typed-ddl");
     let _g = CleanupGuard(path.clone());
     let core = open(&path);
     let mut s = ddl_session();
-    assert_eq!(
-        code(
-            &core,
-            "alice",
-            &mut s,
-            "CREATE OR REPLACE FUNCTION tf(x integer) AS x"
-        ),
-        "0A000"
+    ok(
+        &core,
+        "alice",
+        &mut s,
+        "CREATE OR REPLACE FUNCTION tf(x integer) AS x",
     );
-    assert_eq!(
-        code(
-            &core,
-            "alice",
-            &mut s,
-            "CREATE OR REPLACE FUNCTION tf(x integer) RETURNS integer AS x"
-        ),
-        "0A000"
+    ok(
+        &core,
+        "alice",
+        &mut s,
+        "CREATE OR REPLACE FUNCTION tr(x integer) RETURNS integer AS x",
     );
+    let mut other = loaded(&core, "alice", true);
+    for name in ["tf", "tr"] {
+        assert_eq!(
+            code(&core, "alice", &mut other, &format!("DROP FUNCTION {name}")),
+            "42883"
+        );
+    }
 }

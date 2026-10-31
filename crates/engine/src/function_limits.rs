@@ -4,8 +4,8 @@
 //! `wire-server` の `function_limits_opt` が CLI フラグ（`--max-functions`）を厳密パースし、
 //! 本モジュールの [`validate_max_functions`] で範囲検証したうえで [`FunctionLimits`] を組み立て、
 //! `EngineCore::with_function_limits` へ 1 回だけ注入する。範囲検証の単一情報源は本モジュール。
-//! 実行段は `CREATE FUNCTION` の件数判定（`sql::udf_ddl` 経由のカタログ件数、事前検証の
-//! レジストリ複製）へ同じ値を渡す。DDL 権限の無いセッションは判定の前に `42501` になる。
+//! 実行段は `CREATE FUNCTION` の件数判定（`sql::udf_ddl` 経由のカタログ件数と、型付き・RETURNS 付き
+//! 定義のセッション限定レジストリ件数。#2798 まで）へ同じ値を渡す。DDL 権限の無いセッションは判定の前に `42501` になる。
 //!
 //! 設計上の不変条件:
 //!
