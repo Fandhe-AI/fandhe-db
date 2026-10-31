@@ -2,10 +2,12 @@
 
 - ステータス: **Accepted（実装既定値）**
 - 対応: Issue #942・TASK-221
+- 改訂: Issue #2396・TASK-333（決定 1 を改訂。writer の遅延取得と `40001` の判定は
+  下記 1a。実装は #2399〜#2405・#2408 で進行中。設計記録は #2397）
 - ポインタ: `docs/spec/04-behavior/sql-surface.md` SQL-31・
   `docs/spec/04-behavior/persistence.md` RECOVER-12・
   `docs/spec/04-behavior/error-format.md` ERR-6
-- 関連ポインタ: RECOVER-5・RECOVER-6・RECOVER-8・TASK-96・TASK-97・TASK-99・
+- 関連ポインタ: SQL-38・SQL-19・ERR-7・PERSIST-4・WIRE-15・RLS-7・TASK-335・RECOVER-5・RECOVER-6・RECOVER-8・TASK-96・TASK-97・TASK-99・
   TABLE-3・SQL-18（SQL 表層の 0 行 DELETE も台帳記録。#983）・WIRE-16（複数文実行。
   `wire-multi-statement.md`）・WIRE-19（`ReadyForQuery` 状態バイト。PR #1041
   レビュー指摘対応で #943 の担当分を本 PR へ吸収し実装済み）
@@ -24,7 +26,10 @@
 
 ## 設計の要点（判断記録）
 
-### 1. `BEGIN` の時点で redb の write txn を取得して保持する
+### 1. `BEGIN` の時点で redb の write txn を取得して保持する（改訂前の判断）
+
+> 2026-10 の改訂（Issue #2396）で、下記 1a に置き換わる（Explicit のみ。
+> Implicit は従来どおり開始時に取得する）。以下は経緯として残す改訂前の判断。
 
 `redb::WriteTransaction`（`=4.2.0`）はライフタイム引数を持たず、全フィールドが
 `Arc`／`Mutex`／`Atomic` なので `Send`。`Drop` は abort 相当（panicking 中を
@@ -35,13 +40,173 @@
 接続断で消える」（RECOVER-12）は追加コードなしで成立する。
 
 代償: 読み取り専用のトランザクションでも単一ライタを占有する。既知のトレード
-オフとして記録する。
+オフとして記録する（#2396 で解消予定。1a 参照）。
+
+### 1a. writer の遅延取得と `40001` の判定（Issue #2396・TASK-333）
+
+決定 1 の代償（読み取りだけの明示トランザクションも、他セッションの書き込みを
+待機上限まで待たせる）を解消するため、writer の取得を最初の書き込み文へ遅らせる。
+取得前の読み取りが古くなった場合は `40001`（serialization_failure）として判定する
+（1.0 前の BREAKING CHANGE。ポインタ: SQL-31・SQL-38・SQL-19）。本節は後続の実装
+Issue（#2399〜#2405・#2408〜#2413）が拠り所にする設計記録で、実装前の判断を固定する。
+
+#### 1a-1. writer の取得時点
+
+- `BEGIN` では writer を取らない。`BEGIN` 時点の確定済み `redb::ReadTransaction`
+  （読み取りスナップショット）だけを開く。
+- writer は最初の書き込み文で取得する。書き込み文は DML（INSERT・UPDATE・DELETE・
+  TRUNCATE・UPSERT・ファイル形 INSERT・COPY FROM）、ロック句、`LOCK TABLE`。
+- トランザクション内の DDL は、これまでどおり writer を取得する前に `0A000` で拒否する。
+- 読み取りだけのトランザクションは writer を一度も取得しないため、他セッションの
+  書き込みを待たせない。
+- 暗黙のトランザクション（WIRE-16）は対象外。従来どおり開始時に取得する（#2401）。
+
+#### 1a-2. スナップショットの切り替え（SQL-19）
+
+- writer を取得する前の読み取り: `BEGIN` 時点のスナップショット。
+- writer を取得した後の、書き込み文の述語・対象行の評価とそれ以降の読み取り:
+  取得時点の最新の確定状態＋自トランザクションの未 commit 変更（#2403）。
+
+#### 1a-3. 判定の時点と順序
+
+最初の書き込み文で、次の順に処理する。
+
+1. writer gate を取得する（待機上限を超えたら `55P03`）。
+2. permit を保持したまま `40001` を判定する。
+3. 該当すれば write txn を書き込み前に drop（abort）し、permit を解放して `Failed`
+   へ遷移し、`40001` を返す。
+4. 該当しなければ、取得時点のスナップショットで文を実行する。
+
+- 行・台帳（RECOVER-12）・カタログ・世代に一切書く前に判定するため、副作用はゼロ。
+  以降の文は `25P02` を返し、受け付けるのは `ROLLBACK` だけ（ERR-7。クライアントは
+  `ROLLBACK` の後に再試行する）。
+- permit を保持して判定するのは、取得時点までのすべての commit が記録済みである
+  ことを保証するため（1a-5 の順序不変条件）。
+- writer 取得前に読み取りが無い（読み取り集合が空）場合は判定せず、`40001` にならない。
+- `40001` のエラーメッセージにテナント ID・表名・世代を含めない（既存の stderr 方針と同じ）。
+
+#### 1a-4. 読み取り集合（#2404）
+
+- 持ち方: `ActiveTxn` が保持する「読み取った基底表の名前の集合」。
+- 記録する期間: writer を取得する前の読み取りだけ。取得後は記録しない。
+- 含める読み取り: 結合・部分クエリ・集合演算の各表、ビューを展開した先の基底表、
+  `USING PLAN` の辞書構築と検索本体、`EXPLAIN`、`COPY (...) TO STDOUT`、
+  カーソル（`DECLARE`）の内側の SELECT。
+- 除外する読み取り: 一時表（TABLE-44。セッションローカルで他セッションの commit の
+  影響を受けない）。
+- fail-closed: 文の種別ごとに参照先を確定できない場合（カタログの参照など）は
+  「全表を読んだ」というワイルドカードとして扱う。読み取り側を過大に見積もっても、
+  1a-6 の可視性フィルタは書き込み側に掛かるため、他テナントの存在情報は漏れず、
+  偽陽性が増えるだけで済む。
+
+#### 1a-5. commit 記録（書き込み側の足跡。#2404）
+
+**置き場所**: `Storage` が持つインメモリの有界な記録とする（redb には永続化しない）。
+明示トランザクションはプロセスの再起動をまたがないため永続化は要らず、redb に置くと
+刈り込みのたびに durable な書き込みが発生してファイルが育つ。
+
+**キー**: 既存のストレージ全体の書き込み世代（`GENERATION_TABLE`）。
+`commit_boundary::commit` を通るすべての commit は、`prepare_generation_bump` で世代を
+必ず 1 つ進めてから commit する（既存の契約）。commit 記録にはその commit が書き込んだ
+世代の値 `G_c` を付ける。読み取りスナップショットの世代 `G_s` は、`BEGIN` で開いた
+`ReadTransaction` 自身から `current_generation_in_txn` で読む（対応が正確になる）。
+
+**順序不変条件（偽陰性を防ぐ要）**:
+
+- 記録の追加は、redb の commit が成功した後、`WriterPermit` を解放する前に行う。
+- writer を取得したセッションから見ると、取得時点の世代 `G_now` までのすべての
+  commit が記録済みになる。判定では `G_s < G_c ≤ G_now` の範囲の記録をすべて照合する。
+- この範囲に記録が欠けた世代があれば、fail-closed で衝突として扱う（構造上の多層防御）。
+  欠けが通常の経路で起きないことは構造テストで固定する。
+
+**内容**: commit ごとに、書き込んだ表それぞれについて次の 2 つを持つ。
+
+- 行の足跡: その commit が書き換えた行の、書き込み前の行と書き込み後の行の
+  (`tenant_id`, `visibility`) の組の集合。INSERT は後の行だけ、DELETE は前の行だけ、
+  UPDATE と UPSERT は前後の両方。
+- DDL フラグ: その表のスキーマやカタログを変えたかどうか。
+
+**収集する箇所**:
+
+- 既存の契約「行を書き換えるすべての経路は、commit 前に `bump_table_generation_in_txn`
+  を呼ぶ」（`tests/table_generation_bump_coverage.rs` が構造的に固定）を起点にし、
+  同じ箇所で足跡を積む。
+- 対象は autocommit・暗黙のトランザクション・明示トランザクションの COMMIT・DDL・
+  参照アクションの連鎖で書き換わった子表・ファイル形 INSERT・NoSQL 表層の書き込み。
+- 行の (`tenant_id`, `visibility`) が分からない経路は「その表の全組」として記録する
+  （fail-closed）。ただしこの記録は、その表について他テナントの書き込みを観測できる
+  側チャネルになりうる。そのため通常の経路が全組の記録へ落ちないことを構造テストで固定する。
+
+#### 1a-6. 判定規則（テナントと表の組の粒度。SQL-31・SQL-38 (2)）
+
+読み取り集合の表 T について、`G_s` より後の記録が次のいずれかに当たれば `40001`。
+
+- DDL フラグが立っている。
+- 行の足跡に、判定するセッションから可視な組が含まれる。可視かどうかは、読み取り時の
+  RLS 暗黙適用（RLS-7 の `PolicyContext`）と同じ判定関数で評価する（判定ロジックを
+  二重に実装しない）。
+
+**他テナントの Private 行を除外する根拠（側チャネルを作らない）**:
+
+- 他テナントが Private 行だけを書き換えた commit の足跡には、判定するセッションから
+  可視な組が含まれない。その commit は `40001` の原因にならない。
+- このセッションの読み取りはもともと RLS の暗黙適用で可視の行に限られるため、不可視の
+  行への書き込みを除外しても取りこぼし（偽陰性）は生じない。
+- その結果、`40001` が起きるかどうかと起きる時点から、他テナントの不可視の行への書き込みの
+  有無も件数も推測できない。
+- 既存の表単位・全テナント共通の `table_generation` を `40001` の判定に流用しない。
+  流用すると他テナントの不可視の行への書き込みでも世代が進み、側チャネルになる
+  （`table-generation-rejection-granularity.md` の判断は `USING PLAN` の照合に限った話で、
+  本判定には適用しない）。
+
+**粒度**: 行や述語ではなく表の粒度で判定する。偽陽性の `40001` はあり得るが、偽陰性は許さない。
+
+#### 1a-7. 保持範囲と上限
+
+**保持範囲**:
+
+- 「生存中の明示トランザクションのうち、writer 未取得で読み取り集合が空でないもの」の
+  `G_s` の最小値より古い記録は捨てる。
+- 生存中トランザクションの `G_s` は、`Storage` 上の登録簿に RAII のハンドルで登録する。
+  `COMMIT`・`ROLLBACK`・`fail`・期限切れ・writer の取得・drop のどの経路でも登録を外す。
+- 生存中のものが無ければ、記録は保持しない。
+- `max_duration`（既定 20 秒、CLI のハード上限 60 秒）で生存期間に上限があるため、
+  通常の保持範囲は直近の数十秒分に限られる。
+
+**上限（無制限に増えない）**:
+
+- 記録の総量（表ごとの記録の総数）に固定の上限を設ける。具体値は実装既定値として
+  #2404 で決める（決定 5 と同じく spec 由来の数値ではない）。
+- 上限を超えたら最古の記録から捨て、捨てた最大の世代を「床」として保持する。
+- `G_s` が床より古いトランザクションは、writer の取得時に fail-closed で `40001` とする
+  （偽陽性は許容）。
+- 上限に達したことで出る `40001` から観測できるのは全体の commit 量だけ。これは writer の
+  保持と待機が既に観測されうるのと同程度の情報で、行や件数の情報は含まない。この残余
+  リスクを許容し、上限は通常の負荷で到達しない大きさに取る。
+- 上限と刈り込みを検証するテストは #2404 の担当。
+
+#### 1a-8. カーソルとの関係
+
+- writer の取得前に宣言したカーソルは `BEGIN` 時点のスナップショット、取得後に宣言した
+  カーソルは取得時点のスナップショットを読む（WIRE-15）。
+- 取得前に宣言したカーソルの内側の SELECT は読み取り集合に入る。
+- 取得前のカーソルが残っている間は、`BEGIN` 時点の `ReadTransaction` を保持する。
+- 実装は #2411、検証は #2408。
+
+#### 1a-9. 本節で決めないこと（申し送り）
+
+- `55P03` が出る箇所・上限の起点・状態バイトの検証と層 B → #2408
+- READ ONLY → #1933、行ロック句 → #2230
+- CHANGELOG と `implementation-status.md` → #2413
+- 早期の事前判定（gate を待つ前に明らかな衝突を返す最適化）は任意とし、#2405 の判断に委ねる。
 
 ### 2. writer gate（待機上限付き。ロック待ちで `55P03`）
 
 `crates/engine/src/storage/writer_gate.rs`。`Mutex<GateState>` と `Condvar` で
 構成し、`GateState` は `{ held_by: Option<ThreadId> }`。
 
+- **改訂（#2396・1a）**: `begin_explicit_write_txn` の呼び出しが `BEGIN` から最初の書き込み文へ
+  移り、`55P03` が出る箇所も最初の書き込み文へ移る。待機上限と gate の構造は変えない。
 - **autocommit 経路**（`Storage::begin_write_txn`）と**明示トランザクション
   経路**（`Storage::begin_explicit_write_txn`）は同じ保持方針をとる。どちらも
   ゲートを待機上限つきで取得し、`redb` の書き込みトランザクションが commit／abort
@@ -140,7 +305,12 @@ Failed { session_at_begin: SessionState, expired: bool } }`）。`ActiveTxn` は
 `session_at_begin` と、dirty テーブル判定（確定済みの世代の読み取り）に使う
 `&'e Storage` を保持する。
 
-- **`BEGIN`**: `Idle` → `Active`（`Storage::begin_explicit_write_txn` 経由）。
+- **改訂（#2396・1a）**: `ActiveTxn.write_txn` は常に持つ前提ではなくなる。`BEGIN` 時点の
+  確定済み `ReadTransaction` と `Option` の writer（未取得／取得済み）の形に変わる（#2399）。
+  writer を取得しないまま `COMMIT` した場合は読み取りトランザクションを drop するだけで、
+  commit も世代の更新もしない。以下の記述は改訂前（`BEGIN` で取得）のもの。
+- **`BEGIN`**: `Idle` → `Active`（`Storage::begin_explicit_write_txn` 経由。改訂後は
+  `BEGIN` で writer を取得しない。取得は最初の書き込み文）。
   `Active` 中の再 `BEGIN` は `25001`（`ActiveSqlTransaction`）で `Failed` へ
   遷移。`Failed` 中は `25P02`。
 - **`COMMIT`**: `Idle` は `25P01`（`NoActiveSqlTransaction`）。`Active` は
@@ -177,6 +347,10 @@ Failed { session_at_begin: SessionState, expired: bool } }`）。`ActiveTxn` は
 
 - `max_duration`（`BEGIN` からの経過時間の上限）: **20 秒**
 - `max_statements`（トランザクション内の文数の上限）: **1,000**
+- **改訂（#2396・1a）**: `max_duration`・`max_statements` はこれまでどおり `BEGIN` から数える
+  （不変）。`lock_wait` が効き始めるのは最初の書き込み文から。下記の「`Active` の間だけ
+  読み取りタイムアウトを切り詰める」規則には「`Active` かつ writer 未取得」の場合が新たに
+  生じる。その扱いは本節では決めず、#2408 へ申し送る。
 - 超過時は `54000`（`PayloadTooLarge`）で `Failed` へ遷移する。
 - 起動時 CLI（`--max-transaction-duration-ms`・`--max-transaction-statements`。Issue #1553）で
   設定できる。範囲・ハード上限は [transaction-limits-cli.md](transaction-limits-cli.md) 参照。
@@ -216,6 +390,12 @@ Failed { session_at_begin: SessionState, expired: bool } }`）。`ActiveTxn` は
 `group_by`・`window`・`subquery`・`set_op`・`join`・`relation_snapshot`・`exec`・
 `arena`・`catalog` の読み取り本体を同じコードで動かす。`EngineCore::read_only_in_active_txn`
 が次のとおり経路を選ぶ。
+
+> 改訂（#2396・1a）: 以下の「単一ライタにより BEGIN 時点と厳密に一致する」「BEGIN 以降カタログと
+> 世代は誰にも変えられない」という根拠は、writer を保持している間（取得後）にしか成り立たない。
+> writer 取得前は「`BEGIN` で開いた確定済み `ReadTransaction` に固定する」、取得後は「取得時点の
+> 最新状態＋自トランザクションの未 commit 変更を読む」（#2403）に差し替わる。`USING PLAN` の
+> 世代の事前・事後照合も同じ考え方で書き直す。
 
 - 自トランザクションが未 commit の変更を持たない（`SessionTransaction::dirty_tables`
   が空）間: 従来どおり BEGIN 時点の確定済みスナップショットで読む（キャッシュ利用可。
@@ -312,6 +492,7 @@ production コード（`crates/wire-server/src/`）は無変更・テスト専�
 | ---- | ---- | ---- |
 | 簡易クエリ: 複数文の分割・位置検証（`simple_query::respond_splitter_error`） | `txn.fail()` | `25P02` |
 | 簡易クエリ: 各文（`EngineCore::execute_sql_in_txn`） | 字句・構文・許可リスト検証のエラーは `fail()`、上限超過・`operation_id` 再利用・実行エラーは `execute_parsed_in_txn` が `fail()` | parse より前に先頭トークンで判定し、`ROLLBACK` 以外は `25P02` |
+| 最初の書き込み文での `40001`（writer 取得時の判定。#2396・1a） | `execute_parsed_in_txn` が `fail()`（write txn は書き込み前に abort） | `25P02` |
 | 簡易クエリ: `BEGIN` | 入れ子は `25001` で `fail()` | `25P02` |
 | 簡易クエリ: `COMMIT` | 期限切れは abort して `Failed`・`54000`。commit 失敗はロールバック扱いで `Idle` | `25P02` |
 | 簡易クエリ: `COPY`（`handshake::post_auth_loop`） | 実行エラー・CopyFail は `copy::run` が `fail()`（Issue #1179。正常終了は `'T'` のまま） | `25P02`（`crate::copy::run` へ委譲しない） |
@@ -327,6 +508,8 @@ production コード（`crates/wire-server/src/`）は無変更・テスト専�
 | 無通信（受信待ち） | 期限到達で受信待ちを打ち切り、`release_if_expired` で `Failed` にしてライタを解放 | — |
 
 ## 検証
+
+- 予告（#2398）: NoSQL 表層から到達できない分類に `40001` を加える。
 
 - `crates/engine/tests/sql31_transaction.rs`: BEGIN/INSERT/INSERT/COMMIT の
   可視性・ROLLBACK の完全巻き戻し・入れ子 BEGIN の `25001`・トランザクション外
@@ -389,6 +572,7 @@ production コード（`crates/wire-server/src/`）は無変更・テスト専�
 
 | 事象 | Explicit | Implicit |
 | ---- | -------- | -------- |
+| writer の取得時点（#2396・1a） | 最初の書き込み文（取得前の読み取りは `40001` の判定対象） | 開始時（従来どおり。#2401・WIRE-16。取得前に読み取りが無いため `40001` の経路を持たない） |
 | 開始 | `BEGIN`（`begin`） | メッセージ先頭で wire 層が `begin_implicit`（`Idle` からのみ。それ以外は `XX000`） |
 | 文のエラー・上限超過・`operation_id` 再利用（`fail`） | `Failed`（`ROLLBACK` 待ち） | `Idle`（write txn を abort・ライタ解放） |
 | 確定 | `COMMIT`（上限超過は `Failed` へ遷移し `54000`） | 最後の文の成功後に `commit_implicit`（上限超過・commit 失敗のどちらも `Idle`） |
@@ -398,6 +582,9 @@ production コード（`crates/wire-server/src/`）は無変更・テスト専�
 
 ## 対象外・申し送り
 
+- #2396 関連の申し送り: #2408（`55P03`・上限の起点・カーソル・状態バイトの整合と層 B）、
+  #2411（カーソルの分割の実装）、#2413（CHANGELOG・実装記録）、#1933（READ ONLY）、
+  #2230（行ロック句）。
 - 書き込み後の読み取りでのキャッシュ・HNSW の再利用（テーブル単位の最適化。現状は
   brute-force）。
 - `DUPLICATE_OPERATION_ID` と `UNIQUE_VIOLATION` の `code` ラベル区別は Issue #1180 で
@@ -420,3 +607,7 @@ production コード（`crates/wire-server/src/`）は無変更・テスト専�
 機構の上に実装されており、カーソルは `sql::transaction::ActiveTxn` に埋め込
 まれるため、`COMMIT`／`ROLLBACK`／`fail`／期限切れ／接続断のいずれでも自動的に
 クローズされる。詳細は `docs/design/sql-cursor.md` 参照。
+
+改訂（#2396・1a-8）: writer の取得前に宣言したカーソルは `BEGIN` 時点のスナップショット、
+取得後に宣言したカーソルは取得時点のスナップショットを読む（WIRE-15。実装は #2411）。
+取得前に宣言したカーソルが残っている間は、`BEGIN` 時点の `ReadTransaction` を保持し続ける。
