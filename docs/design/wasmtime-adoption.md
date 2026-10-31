@@ -1,7 +1,7 @@
 # ADR: WASM UDF 実行基盤としての wasmtime クレート導入（承認資料）
 
-- ステータス: Proposed（オーナー承認は未取得）
-  - 承認が記録されるまで #1923・#1924・#1925・#1926・#1927・#1928 に着手しない運用とする（第 8 節）
+- ステータス: Accepted（2026-10-31 オーナー承認。#1911 のコメント。承認範囲は第 8 節）
+  - 承認範囲内で #1924 → #1925 → #1926・#1927 → #1928・#1923 の順に着手する（第 7 節）
 - 対応: Issue #1912（親 #1911。後続は #1913。承認後は #1924 → #1925 → #1926・#1927 → #1928・#1923）
 - 関連ビヘイビア: EXT-9（親として EXT-5・EXT-6。契約層は TASK-149）。ポインタ: `docs/spec/04-behavior/`・`docs/spec/03-poc/udf-mechanism/`。本文は転記しない（[spec-confidentiality](../../.claude/rules/spec-confidentiality.md)）
 - 関連コード: `crates/engine/src/wasm_udf.rs`（契約層。wasmtime 型を露出しない）、`crates/engine/src/sql/udf_call.rs`（`define_wasm_function`）、`crates/engine/src/sql/mode.rs`（`register_wasm_udf`）、`crates/engine/tests/wasm_udf_contract.rs`
@@ -87,7 +87,7 @@ feature 名は crates.io API の 48.0.7 の feature 一覧による。最小構�
 
 ## 7. 着手停止
 
-- 承認が #1913 で記録されるまで、#1923・#1924・#1925・#1926・#1927・#1928 に着手しない。承認前の挙動（モジュールを一切実行しない契約層だけの状態）を維持する
+- 2026-10-31 の承認（第 8 節）により、#1923〜#1928 の着手停止は解除した。着手は承認範囲内に限る
 - 第 4 節 4 の承認範囲外の依存・版の変更が必要になった場合も停止して再承認を得る
 
 ## 8. 判断記録
@@ -103,3 +103,10 @@ feature 名は crates.io API の 48.0.7 の feature 一覧による。最小構�
   - 第 4 節の決定事項 1〜4 それぞれの採否
   - 却下の場合は、#1923〜#1928 の close を指示するかどうか
 - 承認後の手順の更新: #1911 のコメントを根拠に、本 ADR のステータスと第 7 節・第 8 節を更新する（後続の記録 PR で実施。#1913 はそれまで open のまま残す）
+- 2026-10-31: オーナーが #1911 のコメント（https://github.com/Fandhe-AI/fandhe-db/issues/1911#issuecomment-6538261249）で**承認**した。ステータスを Accepted に変更し、第 7 節の着手停止を解除した。承認内容は次のとおり
+  - 版: `wasmtime = "=48.0.7"`（LTS 系列）
+  - feature セット: 案 A（`default-features = false` ＋ `runtime`・`cranelift`・`std`）
+  - 第 4 節 1（feature ゲート）: 採用。`optional = true`、`wasm-udf = ["dep:wasmtime"]`、default に含めない
+  - 第 4 節 2（feature セット）: 案 A を採用
+  - 第 4 節 3（`--all-features` と CI 時間）: 受け入れる。増分の実測は #1924 で行い、許容を超える場合は専用ジョブへの分離を検討する
+  - 第 4 節 4（承認範囲）: 直接依存 `wasmtime = "=48.0.7"` の 1 行に限る。版の変更（セキュリティ更新を含む）とサブクレートの直接依存化は範囲外で、再承認を要する
