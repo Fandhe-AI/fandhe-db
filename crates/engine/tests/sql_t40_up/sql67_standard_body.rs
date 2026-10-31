@@ -286,6 +286,34 @@ fn missing_relations_are_rejected_at_definition_time() {
     }
 }
 
+/// 列名・別名が `update` / `delete` でも DML の対象表として誤認されない（列名 `update` の後の `AS` を
+/// 表名として引いて `42P01` にならない）。一方、データ変更 CTE 内の不在の対象表は `42P01` のまま。
+#[test]
+fn column_named_like_dml_keyword_is_not_a_target() {
+    let (core, mut s, _g) = setup("sql67_std_kwcol");
+    run(
+        &core,
+        &mut s,
+        "alice",
+        "CREATE TABLE u (\"update\" INTEGER)",
+    );
+    run(
+        &core,
+        &mut s,
+        "alice",
+        "CREATE FUNCTION k1() RETURNS int BEGIN ATOMIC SELECT \"update\" AS n FROM u; END",
+    );
+    run(
+        &core,
+        &mut s,
+        "alice",
+        "CREATE FUNCTION k2() RETURNS int BEGIN ATOMIC SELECT CAST(\"update\" AS int) FROM u; END",
+    );
+    let cte = "CREATE FUNCTION k3() RETURNS int BEGIN ATOMIC \
+               WITH d AS (DELETE FROM nope WHERE a = 1 RETURNING a) SELECT count(*) FROM d; END";
+    assert_eq!(code(&core, &mut s, cte), "42P01");
+}
+
 /// 依存: 参照される表・ビュー・関数の DROP は RESTRICT・CASCADE とも `2BP01`（副作用なし）。依存元の
 /// 関数を消した後は消せる。
 #[test]

@@ -106,7 +106,18 @@ impl EmbeddedSqlChecker for BindingChecker<'_> {
 /// 位置を問わず集める。構造専用の解析は DML の対象表を引かないため、標準形の定義時に明示的に存在を
 /// 確認し依存辺へ載せる。`ON CONFLICT DO UPDATE SET`・`FOR UPDATE` の `UPDATE` は対象表を取らないので除く。
 fn dml_targets(tokens: &[Token]) -> Vec<&str> {
+    let is_with = matches!(tokens.first(), Some(Token::Ident(w)) if w.eq_ignore_ascii_case("WITH"));
+    let word = |i: Option<usize>, w: &[&str]| matches!(i.and_then(|p| tokens.get(p)), Some(Token::Ident(x)) if w.iter().any(|k| x.eq_ignore_ascii_case(k)));
     (0..tokens.len())
+        .filter(|&i| {
+            // 文の先頭、または CTE 本体の `AS [[NOT] MATERIALIZED] (` の直後、`WITH` 文の末尾の主文
+            // （CTE の閉じ括弧の直後）だけを文頭とみなす。列名・別名の `update` 等を DML と誤認しない。
+            let prev = i.checked_sub(1);
+            i == 0
+                || (matches!(prev.and_then(|p| tokens.get(p)), Some(Token::Punct('(')))
+                    && word(i.checked_sub(2), &["AS", "MATERIALIZED"]))
+                || (is_with && matches!(prev.and_then(|p| tokens.get(p)), Some(Token::Punct(')'))))
+        })
         .filter_map(|i| dml_target_at(tokens, i))
         .collect()
 }
