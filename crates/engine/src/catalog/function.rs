@@ -226,7 +226,34 @@ fn reject_enum(_name: &str) -> Result<std::sync::Arc<super::EnumTypeDef>> {
     ))
 }
 
+/// 擬似型 `trigger` のタグ（`RETURNS trigger` の保存形。Issue #2228）。列型ではないため
+/// [`FunctionType::to_column_type`]・引数の型には使えない。
+const TRIGGER_TAG: &str = "trigger";
+
 impl FunctionType {
+    /// 擬似型 `trigger`（`RETURNS trigger` の戻り値の位置だけに置ける。Issue #2228）。
+    #[cfg_attr(not(test), allow(dead_code))] // 作る入口は #2217（`RETURNS trigger` の受理）が結線する。
+    pub(crate) fn trigger() -> Self {
+        Self {
+            tag: TRIGGER_TAG.to_string(),
+            param: String::new(),
+        }
+    }
+
+    /// 擬似型 `trigger` か（`catalog::trigger::returns_trigger` の判定の根拠）。
+    pub(crate) fn is_trigger(&self) -> bool {
+        self.tag == TRIGGER_TAG && self.param.is_empty()
+    }
+
+    /// 戻り値の位置の検証。擬似型 `trigger` を許す以外は [`Self::validate`] と同じ。
+    fn validate_return(&self) -> Result<()> {
+        if self.is_trigger() {
+            Ok(())
+        } else {
+            self.validate()
+        }
+    }
+
     /// `ColumnType` から保存値を作る。ENUM（および要素が ENUM の配列）は拒否する。
     pub(crate) fn from_column_type(ty: &ColumnType) -> Result<Self> {
         let (tag, param) = ty.catalog_fields();
@@ -351,7 +378,7 @@ fn validate_shape(def: &FunctionDef) -> Result<()> {
         }
     }
     if let Some(t) = &def.return_type {
-        t.validate()?;
+        t.validate_return()?;
     }
     for v in [def.attrs.cost, def.attrs.rows].into_iter().flatten() {
         if !v.is_finite() || v <= 0.0 {
@@ -945,6 +972,40 @@ impl Storage {
         // commit 成功後にだけ世代を進める（他セッションの refresh が検知する。SQL-66・#1921）。
         self.bump_function_generation(scope);
         Ok(stored.id)
+    }
+
+    /// 本体検証より前に行う、カタログ側の重複・件数の先行判定（読み取り専用。Issue #1922）。
+    /// `sql::udf_ddl` の `CREATE [OR REPLACE] FUNCTION` が、設計文書の判定順（重複 → 件数 → 引数数 →
+    /// 本体）に合わせて呼ぶ。`replace` が偽で同名の定義があれば重複（`Invalid`＝`42723`）、同名が無い
+    /// ときだけ件数（設定上限をハード上限で飽和。`ViewLimitExceeded`＝`54000`）を見る。`replace` が真で
+    /// 同名が既にあれば置換は件数を増やさないので何も検査しない。権威ある判定は write txn 内の再検査
+    /// （[`Self::create_function_with_limit`]・[`Self::replace_function_checked`]）が担い、本関数は
+    /// 並行する書き込みに対する排他を持たない早期拒否でしかない。
+    pub(crate) fn precheck_function_capacity(
+        &self,
+        scope: &str,
+        function_key: &str,
+        max_functions: usize,
+        replace: bool,
+    ) -> Result<()> {
+        validate_scope(scope)?;
+        let key = normalize_key(function_key)?;
+        let max_functions = max_functions.min(MAX_FUNCTIONS);
+        let rt = self.db().begin_read()?;
+        if !list_in_txn(&rt, scope, Some(&key))?.is_empty() {
+            if replace {
+                return Ok(());
+            }
+            return Err(CatalogError::Invalid(
+                FUNCTION_ALREADY_EXISTS_MESSAGE.to_string(),
+            ));
+        }
+        if count_functions_capped(&rt, scope, max_functions)? >= max_functions {
+            return Err(CatalogError::ViewLimitExceeded(
+                "too many functions".to_string(),
+            ));
+        }
+        Ok(())
     }
 
     /// `(scope, 関数名, 引数シグネチャ)` の定義を 1 件引く（読み取り専用）。他スコープの定義は

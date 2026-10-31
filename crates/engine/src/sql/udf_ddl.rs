@@ -26,7 +26,7 @@ use crate::sql::cast::CastType;
 use crate::sql::mode::SessionState;
 use crate::sql::udf_call::{
     body_reaches_function, commit_function_definition, prepare_function_replacement,
-    prepare_function_with_signature, PreparedUdf,
+    prepare_function_with_signature_prechecked, PreparedUdf,
 };
 use crate::storage::Storage;
 
@@ -124,13 +124,28 @@ fn reject_session_local_dependency(
     Ok(())
 }
 
+/// 本体検証より前のカタログ側の重複・件数の先行判定（[`Storage::precheck_function_capacity`]）を
+/// `SqlSurfaceError` へ写す。`CREATE`／`CREATE OR REPLACE` の永続化が共有し、判定順の実装を 1 箇所に
+/// 保つ（重複 `42723`・件数 `54000` の写像は書き込み時の再検査と同じ [`map_function_error`]）。
+fn precheck_catalog_capacity(
+    storage: &Storage,
+    tenant_id: &str,
+    name: &str,
+    max_functions: usize,
+    replace: bool,
+) -> Result<(), SqlSurfaceError> {
+    storage
+        .precheck_function_capacity(tenant_id, name, max_functions, replace)
+        .map_err(map_function_error)
+}
+
 /// `CREATE FUNCTION` をカタログへ永続化してセッションへ登録する（DDL 権限のあるセッション用）。
 ///
 /// `max_functions` は起動時設定の件数上限（Issue #1922。ハード上限で飽和される）。
 ///
-/// 判定順は [`prepare_function_with_signature`]（予約名・識別子・引数・閉じた本体。セッションの重複
-/// `42723` を含む）→ [`Storage::create_function`]（同名の定義があれば `42723`・件数上限 `54000`）→
-/// セッションへの登録。
+/// 判定順は 予約名・識別子 → セッションの重複 `42723` → カタログの重複 `42723`・件数上限 `54000`
+/// （先行判定）→ 引数数・閉じた本体 → [`Storage::create_function_with_limit`]（同じ重複・件数の
+/// 排他的な再検査）→ セッションへの登録。
 #[allow(clippy::too_many_arguments)]
 pub(crate) fn execute_create_function_persistent(
     storage: &Storage,
@@ -144,13 +159,16 @@ pub(crate) fn execute_create_function_persistent(
     body_source: &str,
     max_functions: usize,
 ) -> Result<(), SqlSurfaceError> {
-    let prepared = prepare_function_with_signature(
+    // 判定順（設計文書）は 重複 → 件数 → 引数数 → 本体。カタログ側の重複・件数は本体検証より前に
+    // 先行判定し、書き込み時の排他的な再検査（`create_function_with_limit`）は権威として残す。
+    let prepared = prepare_function_with_signature_prechecked(
         session.udfs(),
         name,
         params,
         param_types,
         return_type,
         body,
+        &|| precheck_catalog_capacity(storage, tenant_id, name, max_functions, false),
     )?;
     reject_session_local_dependency(session, &prepared.body)?;
     let def = catalog_def_from_prepared(&prepared, body_source)?;
@@ -183,8 +201,17 @@ pub(crate) fn execute_create_or_replace_function_persistent(
     body_source: &str,
     max_functions: usize,
 ) -> Result<(), SqlSurfaceError> {
-    let prepared =
-        prepare_function_replacement(session.udfs(), name, params, param_types, return_type, body)?;
+    // 置換（カタログに同名の定義がある）は件数を増やさないため先行の件数判定を省く。新規作成になる
+    // ときだけ本体検証より前に件数を判定する（write txn 内の再検査は権威として残す）。
+    let prepared = prepare_function_replacement(
+        session.udfs(),
+        name,
+        params,
+        param_types,
+        return_type,
+        body,
+        &|| precheck_catalog_capacity(storage, tenant_id, name, max_functions, true),
+    )?;
     reject_session_local_dependency(session, &prepared.body)?;
     let def = catalog_def_from_prepared(&prepared, body_source)?;
     // 循環検査はセッションのレジストリ（古い可能性がある）ではなく、write txn 内の最新カタログで
@@ -378,7 +405,7 @@ fn map_function_error(e: CatalogError) -> SqlSurfaceError {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::sql::udf_call::prepare_function_definition;
+    use crate::sql::udf_call::{prepare_function_definition, prepare_function_with_signature};
 
     fn parse_body(src: &str) -> crate::sql::udf_call::Expr {
         let tokens = crate::sql::lexer::tokenize_rendered(src).expect("tokens");
@@ -454,6 +481,62 @@ mod tests {
         )
         .expect_err("g -> f must be rejected by the catalog-level check");
         assert_eq!(err.wire_code(), "0A000");
+    }
+
+    /// Issue #1922: 件数上限に達したテナントでは、本体・引数数の検証より先に件数超過 `54000` を返す。
+    /// 重複 `42723` は件数より先、置換（既存定義あり）は上限到達でも本体検証まで進む。
+    #[test]
+    fn limit_is_judged_before_body_and_param_count_validation() {
+        let path = crate::test_util::temp_db::unique_db_path("udf-ddl-limit-order");
+        let _guard = crate::test_util::temp_db::CleanupGuard(path.clone());
+        let storage = Storage::open(&path).expect("open");
+        let mut s = SessionState::default();
+        let p = vec!["x".to_string()];
+        let create = |s: &mut SessionState, name: &str, params: &[String], body: &str| {
+            execute_create_function_persistent(
+                &storage,
+                "t",
+                s,
+                name,
+                params,
+                &vec![None; params.len()],
+                None,
+                &parse_body(body),
+                body,
+                1,
+            )
+        };
+        let replace = |s: &mut SessionState, name: &str, body: &str| {
+            execute_create_or_replace_function_persistent(
+                &storage,
+                "t",
+                s,
+                name,
+                &p,
+                &[None],
+                None,
+                &parse_body(body),
+                body,
+                1,
+            )
+        };
+        create(&mut s, "f", &p, "x").expect("first function");
+        // 未定義関数を呼ぶ本体・引数数超過のいずれも件数超過が先。
+        let err = create(&mut s, "g", &p, "missing(x)").expect_err("limit");
+        assert_eq!(err.wire_code(), "54000");
+        let many: Vec<String> = (0..200).map(|i| format!("a{i}")).collect();
+        let err = create(&mut s, "g", &many, "a0").expect_err("limit");
+        assert_eq!(err.wire_code(), "54000");
+        // 新規作成になる OR REPLACE も同じ。
+        let err = replace(&mut s, "h", "missing(x)").expect_err("limit");
+        assert_eq!(err.wire_code(), "54000");
+        // 重複は件数より先。
+        let err = create(&mut s, "f", &p, "x").expect_err("duplicate");
+        assert_eq!(err.wire_code(), "42723");
+        // 置換は上限到達でも本体検証まで進む（未定義関数は 42883、正しい本体は成功）。
+        let err = replace(&mut s, "f", "missing(x)").expect_err("body");
+        assert_eq!(err.wire_code(), "42883");
+        replace(&mut s, "f", "x").expect("replace at the limit");
     }
 
     #[test]

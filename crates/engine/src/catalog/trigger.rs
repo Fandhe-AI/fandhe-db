@@ -24,7 +24,7 @@ use redb::{ReadableDatabase, ReadableTable, TableDefinition};
 use crate::storage::read_source::ReadSource;
 use crate::storage::MAX_TENANT_ID_LEN;
 
-use super::function::{arg_signature, get_function_in_txn, FunctionDef};
+use super::function::{arg_signature, get_function_in_txn, FunctionDef, FunctionLanguage};
 use super::{
     bump_table_generation_in_txn, index_name_exists_in_txn, materialized_view_exists_in_txn,
     require_table_schema_write_any_identity, validate_identifier, validate_relation_key,
@@ -173,11 +173,13 @@ pub(crate) struct TriggerDef {
     pub(crate) when_sql: Option<String>,
 }
 
-/// 関数が `RETURNS trigger` を宣言しているか。トリガ関数の保存形式（#2228）が入るまで、どの関数も
-/// トリガ関数ではない（`CREATE TRIGGER` は `42P17` で拒否される。fail-closed）。#2228 がトリガ関数の
-/// 表現を `FunctionDef` に足したら、ここだけを結線する。
-pub(crate) fn returns_trigger(_def: &FunctionDef) -> bool {
-    false
+/// 関数が `RETURNS trigger` を宣言しているか（Issue #2228）。トリガ関数は PL/pgSQL で書き、引数を
+/// 持たない（`TG_ARGV` で受ける）。それ以外は `CREATE TRIGGER` が `42P17` で拒否する（fail-closed）。
+/// SQL から `RETURNS trigger` の関数を作る入口は #2217 が結線するまで無く、Storage 水準でだけ作れる。
+pub(crate) fn returns_trigger(def: &FunctionDef) -> bool {
+    def.language == FunctionLanguage::Plpgsql
+        && def.params.is_empty()
+        && def.return_type.as_ref().is_some_and(|t| t.is_trigger())
 }
 
 fn corrupt() -> CatalogError {
@@ -683,7 +685,7 @@ impl Storage {
     }
 
     /// [`Self::create_trigger`] の本体。件数上限とトリガ関数の判定を引数にし、テストが小さい上限と
-    /// 「`RETURNS trigger` の関数がある」状況（保存形式は #2228）を注入できるようにする。
+    /// 「`RETURNS trigger` の関数がある」状況（保存形式の追加は #2228）を注入できるようにする。
     fn create_trigger_inner(
         &self,
         scope: &str,

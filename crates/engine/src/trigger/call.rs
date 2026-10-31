@@ -91,6 +91,76 @@ pub(crate) enum TriggerOutcome {
     Skip,
 }
 
+/// [`TriggerCall`] からトリガ関数へ渡す変数（`NEW`・`OLD`・`TG_*`）を作る純粋関数（Issue #2228）。
+///
+/// 発火側（#1720 の本番 invoker）が呼ぶ。`table_name`・`table_schema` は利用者向けの名前（内部キー
+/// `#<id>.<name>` を `TG_TABLE_NAME` に出さないため、呼び出し側が解決して渡す）。NEW／OLD は行トリガ
+/// の該当する側だけ値を持ち、それ以外（INSERT の OLD・DELETE の NEW・文トリガ）は未代入にする。
+/// 値の変換ができない列型（表現できない型）は固定文言の `0A000`（fail-closed）。
+// 本番の invoker（#1720）が結線するまでは、結合テストだけが呼ぶ。
+#[allow(dead_code)]
+pub(crate) fn trigger_vars_from_call(
+    call: &TriggerCall<'_>,
+    table_name: &str,
+    table_schema: &str,
+) -> Result<crate::plpgsql::interp::TriggerVars, SqlSurfaceError> {
+    use crate::plpgsql::host::PlScalar;
+    use crate::sql::matview::value_to_cell;
+
+    let unsupported = |_: SqlSurfaceError| {
+        SqlSurfaceError::feature_not_supported(
+            "trigger row has a column type unsupported in PL/pgSQL",
+        )
+    };
+    let to_scalars = |row: &[Value]| -> Result<Vec<PlScalar>, SqlSurfaceError> {
+        if row.len() != call.schema.columns.len() {
+            return Err(SqlSurfaceError::Internal {
+                detail: "trigger row width mismatch".to_string(),
+            });
+        }
+        call.schema
+            .columns
+            .iter()
+            .zip(row)
+            .map(|(col, v)| {
+                let cell = value_to_cell(v.clone(), &col.ty).map_err(unsupported)?;
+                Ok(PlScalar::new(cell, col.ty.clone()))
+            })
+            .collect()
+    };
+    let is_row = call.level == TriggerLevel::Row;
+    let new = if is_row && matches!(call.op, TriggerOp::Insert | TriggerOp::Update) {
+        Some(to_scalars(call.new_row)?)
+    } else {
+        None
+    };
+    let old = match (is_row, call.old_row) {
+        (true, Some(row)) if matches!(call.op, TriggerOp::Update | TriggerOp::Delete) => {
+            Some(to_scalars(row)?)
+        }
+        _ => None,
+    };
+    Ok(crate::plpgsql::interp::TriggerVars {
+        name: call.trigger_name.to_string(),
+        when: call.tg_when().to_string(),
+        level: call.tg_level().to_string(),
+        op: call.tg_op().to_string(),
+        table_name: table_name.to_string(),
+        table_schema: table_schema.to_string(),
+        nargs: i32::try_from(call.args.len()).map_err(|_| SqlSurfaceError::Internal {
+            detail: "too many trigger arguments".to_string(),
+        })?,
+        columns: call
+            .schema
+            .columns
+            .iter()
+            .map(|c| (c.name.clone(), c.ty.clone()))
+            .collect(),
+        new,
+        old,
+    })
+}
+
 /// トリガ関数を実行する実体の差し込み口。実装は #2228（PL/pgSQL 結線）が与える。
 pub(crate) trait TriggerFunctionInvoker: Send + Sync {
     /// 関数を 1 回実行する。エラーは [`SqlSurfaceError`] のまま呼び出し元へ透過する。

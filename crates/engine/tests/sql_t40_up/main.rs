@@ -122,5 +122,6 @@ mod sql66_udf_drop_replace;
 mod sql66_udf_limits;
 mod sql66_udf_param_types;
 mod sql66_udf_returns;
+mod sql68_do_block;
 mod sql78_predicate_dml_noneq_between_params;
 mod sql78_where_noneq_between_params;

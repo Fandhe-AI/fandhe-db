@@ -102,8 +102,13 @@ mod plpgsql_validate_tests;
 // 呼び出し元は #2217／#2218／#2228 が結線するまでテストだけ。
 #[allow(dead_code)]
 mod plpgsql_host;
+// `DO` ブロックの実行（SQL-68・Issue #2228）。
+mod do_block;
 #[cfg(test)]
 mod plpgsql_host_tests;
+// トリガ関数の内部 API の結合テスト（Issue #2228・SQL-68）。
+#[cfg(test)]
+mod plpgsql_trigger_tests;
 // BEFORE ROW INSERT トリガの発火の結合テスト（TABLE-45・Issue #1723）。
 #[cfg(test)]
 mod trigger_insert_tests;
@@ -1261,7 +1266,7 @@ pub struct EngineCore {
     ledger_mode: LedgerMode,
     /// BEFORE ROW INSERT トリガの呼び出し口を保持する通過証（TABLE-45・Issue #1723）。発火に対応した
     /// INSERT 経路（SQL の `INSERT ... VALUES`・`INSERT ... SELECT`）だけが `tenant` へ渡す。既定は
-    /// 未結線（トリガ関数の実行は `0A000`）で、実体への結線は Issue #2228。入れ子の深さ上限
+    /// 未結線（トリガ関数の実行は `0A000`）で、本番の結線は Issue #1720（内部 API は #2228）。入れ子の深さ上限
     /// （Issue #1727）も保持し、`with_trigger_limits` が起動時に 1 回だけ差し替える。
     trigger_runtime: crate::trigger::TriggerRuntime,
     /// `WHERE` 省略の `UPDATE`／`DELETE` を `42601` で拒否する opt-in のサーバー側構成
@@ -1894,6 +1899,11 @@ pub enum ParsedSql {
     CreateTrigger(crate::sql::allowlist::ValidatedCreateTrigger),
     /// `DROP TRIGGER [IF EXISTS] <名前> ON <表>`（TABLE-45、Issue #1722）。
     DropTrigger(crate::sql::allowlist::ValidatedDropTrigger),
+    /// `DO [LANGUAGE plpgsql] '<本体>'`（SQL-68、Issue #2228）。
+    ///
+    /// `ParsedSql::Statement` には載せない（DataModifyingCte・CreateTrigger と同じ理由。wire 側が
+    /// 非書き込みと誤判定しないため）。**BREAKING CHANGE**（Issue #2228）: `ParsedSql` への variant 追加。
+    Do(crate::sql::allowlist::ValidatedDo),
     /// `CREATE SCHEMA [IF NOT EXISTS] <name>`（TABLE-27、Issue #1713）。
     ///
     /// **BREAKING CHANGE**（Issue #1713）: `ParsedSql` への variant 追加。
@@ -2019,6 +2029,7 @@ fn statement_clock_scope(
         | ParsedSql::DropFunction(_)
         | ParsedSql::CreateTrigger(_)
         | ParsedSql::DropTrigger(_)
+        | ParsedSql::Do(_)
         | ParsedSql::CreateSchema(_)
         | ParsedSql::DropSchema(_)
         | ParsedSql::AlterSchema(_)
@@ -2087,6 +2098,7 @@ fn insert_sequence_scope(
         | ParsedSql::DropFunction(_)
         | ParsedSql::CreateTrigger(_)
         | ParsedSql::DropTrigger(_)
+        | ParsedSql::Do(_)
         | ParsedSql::CreateSchema(_)
         | ParsedSql::DropSchema(_)
         | ParsedSql::AlterSchema(_)
@@ -2153,6 +2165,7 @@ fn insert_default_clock_scope(
         | ParsedSql::DropFunction(_)
         | ParsedSql::CreateTrigger(_)
         | ParsedSql::DropTrigger(_)
+        | ParsedSql::Do(_)
         | ParsedSql::CreateSchema(_)
         | ParsedSql::DropSchema(_)
         | ParsedSql::AlterSchema(_)
@@ -3048,8 +3061,8 @@ impl EngineCore {
         self
     }
 
-    /// テスト専用: トリガ関数の呼び出し口を差し替える（トリガ関数の保存形式・PL/pgSQL 結線〔Issue #2228〕が
-    /// 未整備のため、発火側の意味論を注入した呼び出し口で固定する。本番の結線は #2228 が行う）。
+    /// テスト専用: トリガ関数の呼び出し口を差し替える（本番の invoker 結線〔#1720〕が未整備のため、
+    /// 発火側の意味論を注入した呼び出し口で固定する。内部 API は #2228）。
     #[cfg(test)]
     pub(crate) fn with_trigger_invoker_for_test(
         mut self,
@@ -4184,6 +4197,7 @@ impl EngineCore {
                     | crate::sql::SqlOutcome::DropFunction(_)
                     | crate::sql::SqlOutcome::CreateTrigger(_)
                     | crate::sql::SqlOutcome::DropTrigger(_)
+                    | crate::sql::SqlOutcome::Do
                     | crate::sql::SqlOutcome::CreateSchema(_)
                     | crate::sql::SqlOutcome::DropSchema(_)
                     | crate::sql::SqlOutcome::AlterSchema(_)
@@ -4242,6 +4256,7 @@ impl EngineCore {
                     | crate::sql::SqlOutcome::DropFunction(_)
                     | crate::sql::SqlOutcome::CreateTrigger(_)
                     | crate::sql::SqlOutcome::DropTrigger(_)
+                    | crate::sql::SqlOutcome::Do
                     | crate::sql::SqlOutcome::CreateSchema(_)
                     | crate::sql::SqlOutcome::DropSchema(_)
                     | crate::sql::SqlOutcome::AlterSchema(_)
@@ -4297,6 +4312,7 @@ impl EngineCore {
                     | crate::sql::SqlOutcome::DropFunction(_)
                     | crate::sql::SqlOutcome::CreateTrigger(_)
                     | crate::sql::SqlOutcome::DropTrigger(_)
+                    | crate::sql::SqlOutcome::Do
                     | crate::sql::SqlOutcome::CreateSchema(_)
                     | crate::sql::SqlOutcome::DropSchema(_)
                     | crate::sql::SqlOutcome::AlterSchema(_)
@@ -4359,6 +4375,7 @@ impl EngineCore {
                     | crate::sql::SqlOutcome::DropFunction(_)
                     | crate::sql::SqlOutcome::CreateTrigger(_)
                     | crate::sql::SqlOutcome::DropTrigger(_)
+                    | crate::sql::SqlOutcome::Do
                     | crate::sql::SqlOutcome::CreateSchema(_)
                     | crate::sql::SqlOutcome::DropSchema(_)
                     | crate::sql::SqlOutcome::AlterSchema(_)
@@ -4434,6 +4451,7 @@ impl EngineCore {
                     | crate::sql::SqlOutcome::DropFunction(_)
                     | crate::sql::SqlOutcome::CreateTrigger(_)
                     | crate::sql::SqlOutcome::DropTrigger(_)
+                    | crate::sql::SqlOutcome::Do
                     | crate::sql::SqlOutcome::CreateSchema(_)
                     | crate::sql::SqlOutcome::DropSchema(_)
                     | crate::sql::SqlOutcome::AlterSchema(_)
@@ -5485,6 +5503,12 @@ impl EngineCore {
                 Some(crate::sql::allowlist::ViewWriteOp::Update),
                 crate::sql::allowlist::SqlSurfaceError::undefined_table(table_name),
             ));
+        }
+
+        // SQL-68・Issue #2228: `DO` はカタログ照会なしの構造検証だけで束縛する。
+        if crate::sql::allowlist::is_do_statement(&tokens) {
+            let stmt = crate::sql::allowlist::validate_do_tokens(&tokens)?;
+            return Ok(ParsedSql::Do(stmt));
         }
 
         let is_declare_statement = matches!(
@@ -6688,8 +6712,10 @@ impl EngineCore {
         // SQL-63・Issue #1876: データ変更 CTE も同じ暗黙トランザクションで実行する（全副文・台帳記録・
         // 主クエリが 1 つの write txn に乗り、commit 時に遅延 FK の検査を通る。副文ごとの autocommit
         // では原子的にならない）。
+        // SQL-68・Issue #2228: `DO` も同じ暗黙トランザクションで実行する（本体の全文が 1 つの write txn に
+        // 乗り、失敗時は副作用ゼロ）。
         if Self::is_subquery_predicate_dml(parsed)
-            || matches!(parsed, ParsedSql::DataModifyingCte(_))
+            || matches!(parsed, ParsedSql::DataModifyingCte(_) | ParsedSql::Do(_))
         {
             return self.execute_subquery_dml_autocommit(ctx, session, parsed);
         }
@@ -6767,7 +6793,7 @@ impl EngineCore {
             // SQL-63・Issue #1876: 入口（`execute_parsed_in_session_inner`）が暗黙トランザクションへ
             // 振り分けるため、ここへ到達するのは構造上の誤りだけ（副文ごとの autocommit で原子性を
             // 失わないよう、実行せず fail-closed）。
-            ParsedSql::DataModifyingCte(_) => {
+            ParsedSql::DataModifyingCte(_) | ParsedSql::Do(_) => {
                 Err(crate::sql::allowlist::SqlSurfaceError::Internal {
                     detail: "internal error".to_string(),
                 })
@@ -7784,6 +7810,7 @@ impl EngineCore {
             // （読み取り源にも書き込み先にもなる）。台帳・世代の単位は挿入先の表。
             // SQL-63・Issue #1876: 全副文・台帳記録・主クエリを共有 write txn で実行する。書いた全表へ
             // `mark_written` する（漏れると遅延 FK の COMMIT 時検査が取りこぼす。P0）。
+            ParsedSql::Do(stmt) => self.execute_do_in_txn(ctx, session, txn, stmt),
             ParsedSql::DataModifyingCte(stmt) => {
                 let write_txn = txn.write_txn().ok_or_else(|| SqlSurfaceError::Internal {
                     detail: "internal error".to_string(),
@@ -8710,6 +8737,8 @@ impl EngineCore {
             ParsedSql::DropFunction(_) => Ok(None),
             ParsedSql::CreateTrigger(_) => Ok(None),
             ParsedSql::DropTrigger(_) => Ok(None),
+            // SQL-68・Issue #2228: `DO` は行を返さない（Describe は NoData）。
+            ParsedSql::Do(_) => Ok(None),
             ParsedSql::CreateSchema(_) => Ok(None),
             ParsedSql::DropSchema(_) => Ok(None),
             ParsedSql::AlterSchema(_) => Ok(None),

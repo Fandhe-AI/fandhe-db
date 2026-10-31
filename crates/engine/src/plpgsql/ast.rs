@@ -73,6 +73,23 @@ pub(crate) enum VarKind {
     LoopRecord,
     /// 暗黙宣言の `FOUND`。
     Found,
+    /// トリガ関数（`ReturnShape::Trigger`）にだけ暗黙宣言するトリガ変数（Issue #2228）。
+    Trigger(TriggerVar),
+}
+
+/// トリガ変数の種別（`NEW`・`OLD`・`TG_*`。PostgreSQL の PL/pgSQL がトリガ関数へ渡す変数のうち、
+/// 本実装が宣言する範囲。`TG_ARGV`・`TG_RELID` 等は未宣言で、参照は通常の識別子扱いになる）。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum TriggerVar {
+    New,
+    Old,
+    TgName,
+    TgWhen,
+    TgLevel,
+    TgOp,
+    TgTableName,
+    TgTableSchema,
+    TgNargs,
 }
 
 /// 変数の宣言型。`%TYPE`・`%ROWTYPE`・`RECORD` の解決は呼び出し時（#2225）。

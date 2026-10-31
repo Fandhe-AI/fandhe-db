@@ -2664,6 +2664,31 @@ pub(crate) fn prepare_function_with_signature(
         return_type,
         body,
         true,
+        None,
+    )
+}
+
+/// [`prepare_function_with_signature`] に、セッション内の重複判定の直後（容量・引数数・本体の検証より
+/// 前）で走る先行検査 `precheck` を足した版。永続 DDL（`sql::udf_ddl`）がカタログ側の重複・件数上限を
+/// 判定順どおりに差し込むために使う。`precheck` の失敗はそのまま返り、レジストリは変更しない。
+pub(crate) fn prepare_function_with_signature_prechecked(
+    registry: &UdfRegistry,
+    name: &str,
+    params: &[String],
+    param_types: &[Option<crate::sql::cast::CastType>],
+    return_type: Option<&crate::sql::cast::CastType>,
+    body: &Expr,
+    precheck: &dyn Fn() -> Result<(), SqlSurfaceError>,
+) -> Result<PreparedUdf, SqlSurfaceError> {
+    prepare_function_with_signature_inner(
+        registry,
+        name,
+        params,
+        param_types,
+        return_type,
+        body,
+        true,
+        Some(precheck),
     )
 }
 
@@ -2685,9 +2710,11 @@ pub(crate) fn prepare_function_with_signature_ignoring_capacity(
         return_type,
         body,
         false,
+        None,
     )
 }
 
+#[allow(clippy::too_many_arguments)]
 fn prepare_function_with_signature_inner(
     registry: &UdfRegistry,
     name: &str,
@@ -2696,6 +2723,7 @@ fn prepare_function_with_signature_inner(
     return_type: Option<&crate::sql::cast::CastType>,
     body: &Expr,
     check_capacity: bool,
+    precheck: Option<&dyn Fn() -> Result<(), SqlSurfaceError>>,
 ) -> Result<PreparedUdf, SqlSurfaceError> {
     if param_types.len() != params.len() {
         return Err(SqlSurfaceError::unsupported(
@@ -2711,7 +2739,7 @@ fn prepare_function_with_signature_inner(
         }
     }
     let mut prepared =
-        prepare_function_definition_inner(registry, name, params, body, check_capacity)?;
+        prepare_function_definition_inner(registry, name, params, body, check_capacity, precheck)?;
     prepared.param_types = param_types.to_vec();
     if let Some(ret) = return_type {
         if ret.expr_type().is_none() {
@@ -2749,6 +2777,7 @@ pub(crate) fn prepare_function_replacement(
     param_types: &[Option<crate::sql::cast::CastType>],
     return_type: Option<&crate::sql::cast::CastType>,
     body: &Expr,
+    precheck: &dyn Fn() -> Result<(), SqlSurfaceError>,
 ) -> Result<PreparedUdf, SqlSurfaceError> {
     catalog::validate_relation_key(name)
         .map_err(|_| SqlSurfaceError::invalid_input(format!("invalid function name: {name}")))?;
@@ -2764,13 +2793,14 @@ pub(crate) fn prepare_function_replacement(
         )));
     }
     let Some(old) = registry.defs.get(&lower) else {
-        return prepare_function_with_signature(
+        return prepare_function_with_signature_prechecked(
             registry,
             name,
             params,
             param_types,
             return_type,
             body,
+            precheck,
         );
     };
     let normalized: Vec<String> = params.iter().map(|p| p.to_ascii_lowercase()).collect();
@@ -3174,7 +3204,7 @@ pub(crate) fn prepare_function_definition(
     params: &[String],
     body: &Expr,
 ) -> Result<PreparedUdf, SqlSurfaceError> {
-    prepare_function_definition_inner(registry, name, params, body, true)
+    prepare_function_definition_inner(registry, name, params, body, true, None)
 }
 
 fn prepare_function_definition_inner(
@@ -3183,6 +3213,7 @@ fn prepare_function_definition_inner(
     params: &[String],
     body: &Expr,
     check_capacity: bool,
+    precheck: Option<&dyn Fn() -> Result<(), SqlSurfaceError>>,
 ) -> Result<PreparedUdf, SqlSurfaceError> {
     // 関数名は relation キー（裸の名前、または SCHEMA 配下の内部キー `#<id>.<name>`。
     // 名前解決器が `CREATE FUNCTION s.f(` を解決した出力。TABLE-27・Issue #1717）を受理する。
@@ -3198,6 +3229,11 @@ fn prepare_function_definition_inner(
         return Err(SqlSurfaceError::duplicate_function(format!(
             "function {name} is already defined in this session"
         )));
+    }
+    // 呼び出し元が差し込む先行検査（カタログ側の重複・件数上限）。判定順は
+    // 重複 → 件数 → 引数数 → 本体のため、引数数・本体の検証より前に置く。
+    if let Some(precheck) = precheck {
+        precheck()?;
     }
     if check_capacity && registry.len() >= MAX_SESSION_UDFS {
         return Err(SqlSurfaceError::payload_too_large(

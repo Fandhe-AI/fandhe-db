@@ -522,6 +522,40 @@ impl<'a> Parser<'a> {
             scope_depth: 0,
         });
         self.register(level, "found".to_string(), found);
+        // トリガ関数だけに NEW／OLD／TG_* を暗黙宣言する（DO・通常関数では宣言しない。PostgreSQL と同じ）。
+        // 固定名のため予約語検査は通さない。
+        if self.opts.returns == ReturnShape::Trigger {
+            use super::ast::TriggerVar as T;
+            let text = || DeclType::Named(SqlColumnTypeName::Text);
+            let table: [(&str, T, DeclType); 9] = [
+                ("new", T::New, DeclType::Record),
+                ("old", T::Old, DeclType::Record),
+                ("tg_name", T::TgName, text()),
+                ("tg_when", T::TgWhen, text()),
+                ("tg_level", T::TgLevel, text()),
+                ("tg_op", T::TgOp, text()),
+                ("tg_table_name", T::TgTableName, text()),
+                ("tg_table_schema", T::TgTableSchema, text()),
+                (
+                    "tg_nargs",
+                    T::TgNargs,
+                    DeclType::Named(SqlColumnTypeName::Integer),
+                ),
+            ];
+            for (name, tv, ty) in table {
+                let id = VarId(u32::try_from(self.vars.len()).unwrap_or(u32::MAX));
+                self.vars.push(VarDecl {
+                    name: name.to_string(),
+                    kind: VarKind::Trigger(tv),
+                    constant: false,
+                    not_null: false,
+                    ty,
+                    default: None,
+                    scope_depth: 0,
+                });
+                self.register(level, name.to_string(), id);
+            }
+        }
         Ok(())
     }
 

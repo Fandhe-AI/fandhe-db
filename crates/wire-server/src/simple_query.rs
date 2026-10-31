@@ -987,6 +987,10 @@ pub(crate) fn map_outcome(outcome: SqlOutcome) -> OutcomeResponse {
         SqlOutcome::DropTrigger(_) => OutcomeResponse::Command {
             tag: "DROP TRIGGER".to_string(),
         },
+        // SQL-68（Issue #2228）: `DO` ブロックも件数を持たない固定タグ。
+        SqlOutcome::Do => OutcomeResponse::Command {
+            tag: "DO".to_string(),
+        },
         // TABLE-27（Issue #1713）: SCHEMA DDL も件数を持たない固定タグ。
         SqlOutcome::CreateSchema(_) => OutcomeResponse::Command {
             tag: "CREATE SCHEMA".to_string(),
