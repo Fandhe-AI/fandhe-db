@@ -128,6 +128,7 @@ mod sql67_function_privileges;
 mod sql67_setof_from;
 mod sql67_sql_function_exec;
 mod sql67_sql_function_limits;
+mod sql67_standard_body;
 mod sql68_do_block;
 mod sql68_do_limits_ledger;
 mod sql78_predicate_dml_noneq_between_params;

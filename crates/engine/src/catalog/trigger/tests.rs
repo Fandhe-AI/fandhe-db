@@ -30,6 +30,7 @@ fn func(key: &str) -> FunctionDef {
         language: FunctionLanguage::Sql,
         body_source: "SELECT 1".to_string(),
         attrs: FunctionAttributes::default(),
+        standard_body: false,
     }
 }
 

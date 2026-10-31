@@ -3012,7 +3012,9 @@ fn map_drop_view_error(e: CatalogError) -> SqlSurfaceError {
     match e {
         CatalogError::ViewNotFound(name) => SqlSurfaceError::UndefinedTable { name },
         CatalogError::WrongObjectKind(name) => SqlSurfaceError::WrongObjectType { name },
-        CatalogError::DependentViewsExist(name) => {
+        // 標準形の関数本体が参照するビュー（Issue #2219）も同じ `2BP01`。
+        CatalogError::DependentViewsExist(name)
+        | CatalogError::DependentObjectsStillExist(name) => {
             SqlSurfaceError::DependentObjectsStillExist { name }
         }
         CatalogError::Invalid(_) => {

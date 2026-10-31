@@ -16,6 +16,10 @@
 //! テナントの定義を構造上引けないようにする。存在しない名前と他テナントにしか無い名前は同じ経路・
 //! 同じ結果になる。エラー文言は固定で、blob の断片・tenant_id・本体の原文を含めない。
 //!
+//! 標準形の本体（Issue #2219）: `FunctionDef::standard_body` と、参照先への依存辺
+//! （`catalog::function_dependency`）を持つ。辺は作成・置換と同じ write txn で検証・記録し、
+//! 関数の削除で掃除する。参照先関数の `DROP` は依存元があれば `CASCADE` でも `2BP01`。
+//!
 //! fail-closed: 未知の版・タグ・flag ビット、切断、末尾の余り、上限超過、キーと値のシグネチャ
 //! 不一致は `CorruptSchema` とし、decode で黙って補正・既定化しない。
 
@@ -103,7 +107,11 @@ const SIGNATURE_SEPARATOR: char = ';';
 
 const FLAG_STRICT: u8 = 0b01;
 const FLAG_SECURITY_DEFINER: u8 = 0b10;
-const FLAG_MASK: u8 = FLAG_STRICT | FLAG_SECURITY_DEFINER;
+/// SQL 標準形の本体（`RETURN`・`BEGIN ATOMIC`。Issue #2219）。予約ビットの 1 つを使うだけで配置は
+/// 変わらないため、版は上げない（旧 blob の decode は不変。新 blob を旧バイナリが読むと未知ビットの
+/// `CorruptSchema`＝fail-closed）。
+const FLAG_SQL_STANDARD_BODY: u8 = 0b100;
+const FLAG_MASK: u8 = FLAG_STRICT | FLAG_SECURITY_DEFINER | FLAG_SQL_STANDARD_BODY;
 
 /// 関数の実装言語。将来の言語（WASM 等）は新しいタグ値で足す（既存値は変えない）。
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -351,6 +359,9 @@ pub(crate) struct FunctionDef {
     /// 本体の原文（ドル引用を含めそのまま）。再解析は呼び出し側が許可リストパーサーで行う。
     pub(crate) body_source: String,
     pub(crate) attrs: FunctionAttributes,
+    /// SQL 標準形の本体で定義された関数か（Issue #2219）。`body_source` は `LANGUAGE sql` の文字列本体と
+    /// 同じ形で、呼び出し時の経路も同じ。目印は「定義時に名前を解決し、依存辺を持つ」ことを表す。
+    pub(crate) standard_body: bool,
 }
 
 fn corrupt() -> CatalogError {
@@ -528,6 +539,9 @@ pub(crate) fn encode_function_def(def: &FunctionDef) -> Result<Vec<u8>> {
     }
     if def.attrs.security == Security::Definer {
         flags |= FLAG_SECURITY_DEFINER;
+    }
+    if def.standard_body {
+        flags |= FLAG_SQL_STANDARD_BODY;
     }
     out.push(flags);
     out.push(def.attrs.parallel.tag());
@@ -731,6 +745,7 @@ fn decode_inner(function_key: &str, arg_signature_key: &str, bytes: &[u8]) -> Re
             cost,
             rows,
         },
+        standard_body: flags & FLAG_SQL_STANDARD_BODY != 0,
     };
     validate_shape(&def)?;
     if arg_signature(&def.params)? != arg_signature_key {
@@ -856,9 +871,63 @@ fn remove_function_in_txn(
     if get_function_in_txn(write_txn, scope, function_key, signature)?.is_none() {
         return Ok(false);
     }
+    // 標準形の依存辺も同じ txn で掃除する（唯一の削除経路。`DROP SCHEMA ... CASCADE` の
+    // `remove_functions_with_prefix_in_txn` もここを通る。Issue #2219）。
+    super::function_dependency::remove_for_function_in_txn(
+        write_txn,
+        scope,
+        function_key,
+        signature,
+    )?;
     let mut table = write_txn.open_table(FUNCTIONS_TABLE)?;
     let removed = table.remove((scope, function_key, signature))?.is_some();
     Ok(removed)
+}
+
+/// `scope` の関数 `function_key` を参照する標準形の関数があれば `DependentObjectsStillExist`（`2BP01`）。
+/// `CASCADE` でも同じ（連鎖削除は未対応。依存元を黙って消さず fail-closed。Issue #2219 の既知の差）。
+/// 文言は削除対象の関数キーだけで、依存元の関数名を含めない。
+fn reject_dependent_functions(
+    write_txn: &redb::WriteTransaction,
+    scope: &str,
+    function_key: &str,
+) -> Result<()> {
+    if super::function_dependency::function_has_dependents_in_txn(write_txn, scope, function_key)? {
+        return Err(CatalogError::DependentObjectsStillExist(
+            function_key.to_string(),
+        ));
+    }
+    Ok(())
+}
+
+/// 作成・置換が記録する依存辺を、同じ write txn で検証する（Issue #2219）。各参照先の現存（定義時の
+/// 解決と commit の間の競合を拒否する）、自己参照、関数間の循環を検査し、問題があれば `Invalid` を返す
+/// （txn は呼び出し側が破棄する）。文言は固定で、参照先の名前を含めない。
+fn verify_dependencies_in_txn(
+    write_txn: &redb::WriteTransaction,
+    scope: &str,
+    own_key: &str,
+    deps: &[super::function_dependency::FunctionDependency],
+) -> Result<()> {
+    use super::function_dependency as dep;
+    for d in deps {
+        if d.kind == dep::DependencyKind::Function && d.key.eq_ignore_ascii_case(own_key) {
+            return Err(CatalogError::Invalid(
+                FUNCTION_RECURSIVE_MESSAGE.to_string(),
+            ));
+        }
+        if !dep::dependee_exists_in_txn(write_txn, scope, d)? {
+            return Err(CatalogError::Invalid(
+                dep::FUNCTION_DEPENDEE_MISSING_MESSAGE.to_string(),
+            ));
+        }
+    }
+    if dep::function_edges_reach_in_txn(write_txn, scope, deps, own_key)? {
+        return Err(CatalogError::Invalid(
+            FUNCTION_RECURSIVE_MESSAGE.to_string(),
+        ));
+    }
+    Ok(())
 }
 
 /// `scope` の関数 `function_key` に依存する TRIGGER の扱い。`cascade` が偽なら TRIGGER があれば
@@ -972,8 +1041,22 @@ impl Storage {
         max_functions: usize,
         check: &dyn Fn(&[FunctionDef]) -> Result<()>,
     ) -> Result<ReplaceOutcome> {
+        self.replace_function_with_deps(scope, def, max_functions, check, &[])
+    }
+
+    /// [`Self::replace_function_checked`] に、標準形の依存辺 `deps`（Issue #2219）を足したもの。同じ
+    /// write txn で参照先の現存・循環を検証し、旧い辺を消して新しい辺を記録する（標準形でない定義への
+    /// 置換は `deps` が空で、旧い辺だけが消える）。
+    pub(crate) fn replace_function_with_deps(
+        &self,
+        scope: &str,
+        def: &FunctionDef,
+        max_functions: usize,
+        check: &dyn Fn(&[FunctionDef]) -> Result<()>,
+        deps: &[super::function_dependency::FunctionDependency],
+    ) -> Result<ReplaceOutcome> {
         // 設定値でハード上限を超えさせない（fail-closed。Issue #1922）。
-        self.replace_function_with_limit(scope, def, max_functions.min(MAX_FUNCTIONS), check)
+        self.replace_function_with_limit(scope, def, max_functions.min(MAX_FUNCTIONS), check, deps)
     }
 
     /// [`Self::replace_function`] の本体（件数上限を引数にしてテストで小さい値を注入する）。
@@ -983,6 +1066,7 @@ impl Storage {
         def: &FunctionDef,
         max_functions: usize,
         check: &dyn Fn(&[FunctionDef]) -> Result<()>,
+        deps: &[super::function_dependency::FunctionDependency],
     ) -> Result<ReplaceOutcome> {
         validate_scope(scope)?;
         let mut stored = def.clone();
@@ -1039,7 +1123,15 @@ impl Storage {
         // 最新カタログ（この txn が見ている全定義）に対する検査。失敗なら commit せず破棄する。
         let latest = list_in_txn(&*write_txn, scope, None)?;
         check(&latest)?;
+        verify_dependencies_in_txn(&write_txn, scope, &stored.function_key, deps)?;
         insert_function_in_txn(&write_txn, scope, &stored, &signature)?;
+        super::function_dependency::replace_edges_in_txn(
+            &write_txn,
+            scope,
+            &stored.function_key,
+            &signature,
+            deps,
+        )?;
         crate::recovery::commit_boundary::commit(write_txn)
             .map_err(super::convert_storage_error)?;
         // commit 成功後にだけ世代を進める（他セッションの refresh が置換後の本体を読み直す）。
@@ -1063,6 +1155,18 @@ impl Storage {
         scope: &str,
         def: &FunctionDef,
         max_functions: usize,
+    ) -> Result<u64> {
+        self.create_function_with_deps(scope, def, max_functions, &[])
+    }
+
+    /// [`Self::create_function_with_limit`] に、標準形の依存辺 `deps`（Issue #2219）を足したもの。
+    /// 参照先の現存・循環の検証と辺の記録は、定義の挿入と同じ write txn・1 回の commit で行う。
+    pub(crate) fn create_function_with_deps(
+        &self,
+        scope: &str,
+        def: &FunctionDef,
+        max_functions: usize,
+        deps: &[super::function_dependency::FunctionDependency],
     ) -> Result<u64> {
         validate_scope(scope)?;
         // 設定値でハード上限（読み取り側の上限でもある）を超えさせない（fail-closed）。
@@ -1095,8 +1199,16 @@ impl Storage {
                 "too many functions".to_string(),
             ));
         }
+        verify_dependencies_in_txn(&write_txn, scope, &stored.function_key, deps)?;
         stored.id = allocate_function_id_in_txn(&write_txn)?;
         insert_function_in_txn(&write_txn, scope, &stored, &signature)?;
+        super::function_dependency::replace_edges_in_txn(
+            &write_txn,
+            scope,
+            &stored.function_key,
+            &signature,
+            deps,
+        )?;
         crate::recovery::commit_boundary::commit(write_txn)
             .map_err(super::convert_storage_error)?;
         // commit 成功後にだけ世代を進める（他セッションの refresh が検知する。SQL-66・#1921）。
@@ -1219,6 +1331,7 @@ impl Storage {
         }
         let sig = arg_signature(&def.params)?;
         resolve_dependent_triggers(&write_txn, scope, &key, cascade)?;
+        reject_dependent_functions(&write_txn, scope, &key)?;
         if !remove_function_in_txn(&write_txn, scope, &key, &sig)? {
             return Ok(false);
         }
@@ -1254,6 +1367,7 @@ impl Storage {
             }
         };
         resolve_dependent_triggers(&write_txn, scope, &key, cascade)?;
+        reject_dependent_functions(&write_txn, scope, &key)?;
         if !remove_function_in_txn(&write_txn, scope, &key, &sig)? {
             return Ok(None);
         }
@@ -1302,7 +1416,31 @@ mod tests {
             language: FunctionLanguage::Sql,
             body_source: "SELECT 1".to_string(),
             attrs: FunctionAttributes::default(),
+            standard_body: false,
         }
+    }
+
+    /// Issue #2219: 標準形の目印ビットが往復し、目印の無い blob（既存の形）の decode は変わらない。
+    #[test]
+    fn standard_body_flag_round_trips_and_old_blobs_are_unchanged() {
+        let mut d = def("f", vec![]);
+        let plain = encode_function_def(&d).expect("encode");
+        d.standard_body = true;
+        let flagged = encode_function_def(&d).expect("encode");
+        assert_ne!(plain, flagged);
+        let back = decode_function_def("f", "", &flagged).expect("decode");
+        assert!(back.standard_body);
+        let back = decode_function_def("f", "", &plain).expect("decode");
+        assert!(!back.standard_body);
+        // 目印以外のバイト列は同一（配置は変わらない）。
+        let diff = plain.iter().zip(&flagged).filter(|(a, b)| a != b).count();
+        assert_eq!(diff, 1);
+        // 未知のビットは従来どおり拒否する。
+        let mut bad = flagged.clone();
+        if let Some(b) = bad.get_mut(1 + 8 + 1 + 1 + 1) {
+            *b |= 0b1000;
+        }
+        assert!(decode_function_def("f", "", &bad).is_err());
     }
 
     fn array_ty(elem: ArrayElemType, max_len: u32, ndims: u8) -> ColumnType {
@@ -1573,7 +1711,8 @@ mod tests {
             (10, 4),
             (11, 0),
             (11, 4),
-            (12, 4),
+            // 未知の flags ビット（`0b100` は Issue #2219 で標準形の目印になった）。
+            (12, 8),
             (12, 255),
             (13, 0),
             (13, 4),
@@ -1922,14 +2061,14 @@ mod tests {
     #[test]
     fn replace_creates_within_count_limit() {
         let (s, _g) = tmp_storage("fn_replace_limit");
-        s.replace_function_with_limit("t", &def("a", vec![]), 1, &|_| Ok(()))
+        s.replace_function_with_limit("t", &def("a", vec![]), 1, &|_| Ok(()), &[])
             .expect("first");
         let err = s
-            .replace_function_with_limit("t", &def("b", vec![]), 1, &|_| Ok(()))
+            .replace_function_with_limit("t", &def("b", vec![]), 1, &|_| Ok(()), &[])
             .expect_err("limit");
         assert!(matches!(err, CatalogError::ViewLimitExceeded(_)));
         // 置換は件数を増やさないので上限でも通る。
-        s.replace_function_with_limit("t", &def("a", vec![]), 1, &|_| Ok(()))
+        s.replace_function_with_limit("t", &def("a", vec![]), 1, &|_| Ok(()), &[])
             .expect("replace at limit");
     }
 

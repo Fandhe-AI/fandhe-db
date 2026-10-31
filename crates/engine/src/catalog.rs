@@ -81,6 +81,7 @@ pub(crate) mod namespace;
 // 書き込み（#1920）は結線済み。ロード（#1921）が使う読み出し API は当面テストからしか呼ばれない
 // ため、該当項目に個別に `dead_code` を許可している。
 pub(crate) mod function;
+pub(crate) mod function_dependency;
 // TRIGGER のカタログ（TABLE-45・Issue #1722。設計記録: `docs/design/trigger-catalog.md`）。
 pub(crate) mod trigger;
 pub(crate) use materialized::read_materialized_view_in;
@@ -5570,9 +5571,26 @@ fn apply_cascaded_objects_in_txn(
     Ok(applied)
 }
 
+/// SQL 標準形の関数本体（`RETURN`・`BEGIN ATOMIC`。Issue #2219）が参照している relation（表・ビュー・
+/// マテリアライズドビュー）の削除・改名・列変更を `2BP01`（`DependentObjectsStillExist`）で拒否する。
+/// 全テナントの関数を見るが、文言は操作対象自身の名前だけで、依存元の関数名・テナント・件数を含めない
+/// （列削除時のトリガ検査と同じ前例）。`CASCADE` でも拒否する（関数の連鎖削除は未対応。fail-closed）。
+/// 依存辺の表が無ければ何もしない（標準形を使わない DB への副作用なし）。
+pub(crate) fn reject_relation_with_function_dependents_in_txn(
+    write_txn: &redb::WriteTransaction,
+    name: &str,
+) -> Result<()> {
+    if function_dependency::relation_has_dependents_in_txn(write_txn, name)? {
+        return Err(CatalogError::DependentObjectsStillExist(name.to_string()));
+    }
+    Ok(())
+}
+
 /// ビュー定義を `VIEWS_TABLE` から削除する（無ければ `ViewNotFound`）。ビューは行ストア・
-/// 世代を持たないため bump しない（[`Storage::drop_view`] と同じ）。
+/// 世代を持たないため bump しない（[`Storage::drop_view`] と同じ）。標準形の関数が参照するビューは
+/// 削除できない（`2BP01`。Issue #2219。CASCADE の連鎖削除の適用も同じ入口を通る）。
 fn drop_view_in_txn(write_txn: &redb::WriteTransaction, name: &str) -> Result<()> {
+    reject_relation_with_function_dependents_in_txn(write_txn, name)?;
     let mut views_table = write_txn.open_table(VIEWS_TABLE)?;
     if views_table.remove(name)?.is_none() {
         return Err(CatalogError::ViewNotFound(name.to_string()));
@@ -12244,6 +12262,10 @@ impl Storage {
                 Vec::new(),
             ));
         }
+        // 標準形の関数本体が参照する表は削除できない（`2BP01`。RESTRICT・CASCADE とも。Issue #2219）。
+        for name in &existing {
+            reject_relation_with_function_dependents_in_txn(write_txn, name)?;
+        }
         let mut cascaded: Vec<CascadedObject> = Vec::new();
         match behavior {
             DropBehavior::Restrict => {
@@ -12694,6 +12716,9 @@ impl Storage {
             if ty.is_vector() {
                 return Err(CatalogError::ProtectedColumn(column_name.to_string()));
             }
+            // 標準形の関数本体が参照する表の列は、列単位の依存を持たないため削除を拒否する
+            // （`2BP01`。Issue #2219）。
+            reject_relation_with_function_dependents_in_txn(write_txn, table_name)?;
             // `UPDATE OF` が参照する列は削除できない（TABLE-45・Issue #1722。CASCADE による連鎖削除は
             // 未対応のため RESTRICT・CASCADE とも `2BP01`。トリガ名・テナントを応答に含めない）。
             if trigger::triggers_referencing_column_in_txn(write_txn, table_name, column_name)? {
@@ -12859,6 +12884,8 @@ impl Storage {
                     .to_string(),
             }));
         }
+        // 標準形の関数本体が参照する表の列の改名は拒否する（`2BP01`。Issue #2219）。
+        reject_relation_with_function_dependents_in_txn(&write_txn, table_name)?;
         // `UPDATE OF` が参照する列の改名は追随が入るまで拒否する（TABLE-45・Issue #1722 の暫定ガード）。
         if trigger::triggers_referencing_column_in_txn(&*write_txn, table_name, old_name)? {
             return Err(AlterCheckError::Sql(SqlSurfaceError::FeatureNotSupported {
@@ -13067,6 +13094,8 @@ impl Storage {
         {
             return Err(CatalogError::TableAlreadyExists(new_table_name.to_string()).into());
         }
+        // 標準形の関数本体が表を名前で保存しているため、改名は追随が入るまで拒否する（`2BP01`。Issue #2219）。
+        reject_relation_with_function_dependents_in_txn(&write_txn, table_name)?;
         // 暫定ガード（Issue #1663）: matview の参照元の改名は、追随が入るまで拒否する（別 Issue で追跡。Issue #1667 でも対象外）。
         if !materialized::materialized_views_referencing_in_txn(&write_txn, table_name)?.is_empty()
         {
@@ -14533,6 +14562,8 @@ impl Storage {
                 detail: "cannot alter type of a column used by a view or rule".to_string(),
             }));
         }
+        // 標準形の関数本体が参照する表の列の型変更は拒否する（`2BP01`。Issue #2219）。
+        reject_relation_with_function_dependents_in_txn(&write_txn, table_name)?;
         // `UPDATE OF` が参照する列の型変更は拒否する（TABLE-45・Issue #1722 の暫定ガード）。
         if trigger::triggers_referencing_column_in_txn(&*write_txn, table_name, column_name)? {
             return Err(AlterCheckError::Sql(SqlSurfaceError::FeatureNotSupported {
@@ -15044,6 +15075,8 @@ impl Storage {
                 return Err(CatalogError::WrongObjectKind(name.to_string()));
             }
         }
+        // 標準形の関数本体が参照するビューは削除できない（`2BP01`。RESTRICT・CASCADE とも。Issue #2219）。
+        reject_relation_with_function_dependents_in_txn(&write_txn, name)?;
         let cascaded = match behavior {
             DropBehavior::Restrict => {
                 // matview の参照元になっているビューは削除しない（TABLE-42 (5)、Issue #1667。

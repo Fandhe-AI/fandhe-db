@@ -21,6 +21,12 @@
 //! その文だけが lexer の `42601` になる（WIRE-16 の「文ごとに独立して許可リストを
 //! 検証し、複数文であることを理由に受理範囲を変えない」に従う）。
 //!
+//! SQL 標準形の関数本体（`CREATE FUNCTION ... BEGIN ATOMIC <文>; ... END`。SQL-67 (2)・Issue #2219）は、
+//! 通常状態の語を追跡して本体の内側の `;` で分割しない。文の先頭語が `CREATE` で `BEGIN` の直後が
+//! `ATOMIC` のときだけ入れ子の深さを数え始め（`CASE` で +1、`END` で -1。識別子にもなる `BEGIN` は数えない）、深さが 0 に戻るまで
+//! `;` を区切りとしない。入力の終端までに閉じない場合・深さが上限を超える場合は `Single`（fail-closed。
+//! engine が `42601` で拒否し、1 文も実行しない）。
+//!
 //! **PostgreSQL と分割結果が食い違いうる構文では分割しない**（fail-closed）。
 //! 未終端の `'...'`・`"..."`・`/* */`、通常状態の `$<数字>`・未終端／識別子隣接のドル引用、E 文字列の接頭辞
 //! （`E'`／`e'`）を検出した場合は [`SplitOutcome::Single`] を返し、全文を engine へ
@@ -56,6 +62,9 @@ use crate::sql::lexer::{
 /// 拒否し、untrusted 入力に対する無制限 `Vec` 確保を避ける
 /// （`.claude/rules/coding-rust.md`）。
 pub const MAX_STATEMENTS_PER_QUERY: usize = 16;
+
+/// `BEGIN ATOMIC` 本体の入れ子（`CASE`）の深さの上限（Issue #2219）。超過は `Single`。
+const MAX_ATOMIC_DEPTH: usize = 64;
 
 /// [`split_statements`] の結果。
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -167,6 +176,12 @@ pub fn split_statements(input: &str) -> Result<SplitOutcome<'_>, MultiStatementE
     let mut start = 0usize;
     // 現在の断片に、空白・コメント以外の文字が 1 つでもあるか。
     let mut has_content = false;
+    // `BEGIN ATOMIC` 追跡（Issue #2219）: 現在の文の先頭語が `CREATE` か・何語目か・直前の語が
+    // `BEGIN` か・本体の入れ子の深さ（0 は本体の外）。
+    let mut stmt_create = false;
+    let mut word_count = 0usize;
+    let mut prev_begin = false;
+    let mut atomic_depth = 0usize;
 
     while let Some(&b) = bytes.get(i) {
         let next = bytes.get(i.saturating_add(1)).copied();
@@ -174,6 +189,7 @@ pub fn split_statements(input: &str) -> Result<SplitOutcome<'_>, MultiStatementE
             b'\'' => match skip_quoted(bytes, i, b) {
                 Some(end) => {
                     has_content = true;
+                    prev_begin = false;
                     i = end;
                 }
                 // 未終端の引用。lexer が同一入力を必ず拒否するため分割せず全文を渡す。
@@ -182,6 +198,7 @@ pub fn split_statements(input: &str) -> Result<SplitOutcome<'_>, MultiStatementE
             b'"' => match quoted_identifier_end(input, i) {
                 Some(end) => {
                     has_content = true;
+                    prev_begin = false;
                     i = end;
                 }
                 None => return Ok(SplitOutcome::Single),
@@ -209,7 +226,16 @@ pub fn split_statements(input: &str) -> Result<SplitOutcome<'_>, MultiStatementE
             b'E' | b'e' if next == Some(b'\'') && !is_ident_continue_before(bytes, i) => {
                 return Ok(SplitOutcome::Single);
             }
+            // `BEGIN ATOMIC` 本体の内側の `;` は文の区切りではない。
+            b';' if atomic_depth > 0 => {
+                has_content = true;
+                prev_begin = false;
+                i = i.saturating_add(1);
+            }
             b';' => {
+                stmt_create = false;
+                word_count = 0;
+                prev_begin = false;
                 let piece = input.get(start..i).unwrap_or("").trim();
                 if has_content && !piece.is_empty() {
                     statements.push(piece);
@@ -223,9 +249,43 @@ pub fn split_statements(input: &str) -> Result<SplitOutcome<'_>, MultiStatementE
                 start = i;
                 has_content = false;
             }
+            // 語（識別子・キーワード）。`BEGIN ATOMIC` の追跡に使う（Issue #2219）。
+            _ if (b.is_ascii_alphabetic() || b == b'_') && !is_ident_continue_before(bytes, i) => {
+                has_content = true;
+                let mut j = i.saturating_add(1);
+                while bytes
+                    .get(j)
+                    .is_some_and(|&c| c.is_ascii_alphanumeric() || c == b'_' || c >= 0x80)
+                {
+                    j = j.saturating_add(1);
+                }
+                let word = input.get(i..j).unwrap_or("");
+                if word_count == 0 {
+                    stmt_create = word.eq_ignore_ascii_case("CREATE");
+                }
+                word_count = word_count.saturating_add(1);
+                if atomic_depth > 0 {
+                    // 本体の入れ子は `CASE ... END` だけを数える（本体解析器 `parse_standard_function_body`
+                    // と同じ構造判定。`BEGIN` は非予約語で引数名・列名にもなり、標準形の本体は入れ子の
+                    // `BEGIN` 文を受理しないため深さに含めない）。
+                    if word.eq_ignore_ascii_case("CASE") {
+                        atomic_depth = atomic_depth.saturating_add(1);
+                        if atomic_depth > MAX_ATOMIC_DEPTH {
+                            return Ok(SplitOutcome::Single);
+                        }
+                    } else if word.eq_ignore_ascii_case("END") {
+                        atomic_depth = atomic_depth.saturating_sub(1);
+                    }
+                } else if stmt_create && prev_begin && word.eq_ignore_ascii_case("ATOMIC") {
+                    atomic_depth = 1;
+                }
+                prev_begin = stmt_create && atomic_depth == 0 && word.eq_ignore_ascii_case("BEGIN");
+                i = j;
+            }
             _ if b.is_ascii() => {
                 if !b.is_ascii_whitespace() {
                     has_content = true;
+                    prev_begin = false;
                 }
                 i = i.saturating_add(1);
             }
@@ -249,6 +309,10 @@ pub fn split_statements(input: &str) -> Result<SplitOutcome<'_>, MultiStatementE
         }
     }
 
+    // `BEGIN ATOMIC` の本体が入力の終端までに閉じない。分割せず全文を渡して拒否させる。
+    if atomic_depth > 0 {
+        return Ok(SplitOutcome::Single);
+    }
     let tail = input.get(start..).unwrap_or("");
     let tail_trimmed = tail.trim();
     let tail_has_content = has_content && !tail_trimmed.is_empty();
@@ -568,6 +632,17 @@ fn syntax_form_confirmed(
 /// `(` の直前の語が構文上の語（`IN`・`AS`・`OVER` 等）でも組み込み関数名でもない呼び出しを含むか
 /// （ユーザー定義関数の呼び出しの保守的な検出。構文語の取りこぼしは `Write` 側へ倒れるだけ）。
 fn calls_non_builtin_function(tokens: &[Token]) -> bool {
+    (0..tokens.len()).any(|i| is_non_builtin_call_at(tokens, i))
+}
+
+/// 位置 `i` が、構文語でも組み込み関数でもない呼び出し（`名前(`・`schema.名前(`）の名前か。構文位置と
+/// 確認できない語は呼び出し扱い（`true`。fail-closed）。[`calls_non_builtin_function`] の 1 位置分で、
+/// `core::standard_body_binding` が標準形の本体の関数依存を集めるときにも共有する（`IN (`・`VALUES (`・
+/// `EXISTS (SELECT` のような構文語を同名の永続関数への依存として記録しないため。Issue #2219）。
+pub(crate) fn is_non_builtin_call_at(tokens: &[Token], i: usize) -> bool {
+    let Some(t) = tokens.get(i) else {
+        return false;
+    };
     // 構文上 `(` の直前に現れない語（`END`・`NULL`・`TRUE`・`FALSE`・`DEFAULT`）は含めない。これらは
     // 予約されない名前として同名のユーザー関数がありうるため、`(` が続けば呼び出し（`Write`）とする。
     const SYNTAX_WORDS: &[&str] = &[
@@ -693,7 +768,7 @@ fn calls_non_builtin_function(tokens: &[Token]) -> bool {
         "USING",
         "AS",
     ];
-    tokens.iter().enumerate().any(|(i, t)| {
+    {
         // `schema.func(...)`（修飾付き呼び出し）は構文語になりえないため常に呼び出しとして扱う。
         if matches!(t, Token::QualifiedIdent { .. })
             && matches!(tokens.get(i.saturating_add(1)), Some(Token::Punct('(')))
@@ -845,7 +920,7 @@ fn calls_non_builtin_function(tokens: &[Token]) -> bool {
             }
         }
         true
-    })
+    }
 }
 
 /// `COPY` 文のトークン列を [`StatementEffect`] へ分類する（[`classify_statement`] の
@@ -981,6 +1056,72 @@ mod tests {
             SplitOutcome::Statements(v) => v,
             other => panic!("expected Statements, got {other:?}"),
         }
+    }
+
+    // 識別子位置の `BEGIN`（引数名・列名）は本体の深さに数えない（codex 指摘・P1）。
+    #[test]
+    fn begin_as_identifier_does_not_unbalance_atomic_body() {
+        let f = "CREATE FUNCTION f(begin int) RETURNS int BEGIN ATOMIC SELECT begin; END";
+        let both = format!("{f}; SELECT f(1)");
+        match split_statements(&both).expect("split") {
+            SplitOutcome::Statements(v) => assert_eq!(v, vec![f, "SELECT f(1)"]),
+            other => panic!("expected Statements, got {other:?}"),
+        }
+    }
+
+    // Issue #2219（SQL-67 (2)）: `BEGIN ATOMIC` 本体の内側の `;` では分割しない。
+    #[test]
+    fn begin_atomic_body_is_not_split() {
+        let f = "CREATE FUNCTION f(x int) RETURNS int BEGIN ATOMIC SELECT x; SELECT x + 1; END";
+        assert_eq!(split_statements(f).expect("split"), SplitOutcome::Single);
+        let both = format!("{f}; SELECT f(1)");
+        assert_eq!(
+            statements(split_statements(&both).expect("split")),
+            vec![f, "SELECT f(1)"]
+        );
+        let with_semi = format!("{f};");
+        assert_eq!(
+            split_statements(&with_semi).expect("split"),
+            SplitOutcome::Single
+        );
+    }
+
+    #[test]
+    fn begin_atomic_tracks_case_end_nesting() {
+        let f = "create function f(x int) returns int begin atomic \
+                 select case when x > 0 then 1 else 2 end; end";
+        let both = format!("{f}; SELECT 1");
+        assert_eq!(
+            statements(split_statements(&both).expect("split")),
+            vec![f, "SELECT 1"]
+        );
+    }
+
+    #[test]
+    fn unterminated_begin_atomic_is_single() {
+        let f = "CREATE FUNCTION f() RETURNS int BEGIN ATOMIC SELECT 1; SELECT 2";
+        assert_eq!(split_statements(f).expect("split"), SplitOutcome::Single);
+    }
+
+    #[test]
+    fn begin_atomic_in_quotes_or_comments_is_ignored_and_tx_begin_unchanged() {
+        let q = "SELECT 'BEGIN ATOMIC'; SELECT 2";
+        assert_eq!(
+            statements(split_statements(q).expect("split")),
+            vec!["SELECT 'BEGIN ATOMIC'", "SELECT 2"]
+        );
+        let c = "SELECT 1 /* CREATE BEGIN ATOMIC */; SELECT 2";
+        assert_eq!(statements(split_statements(c).expect("split")).len(), 2);
+        let tx = "BEGIN; SELECT 1; COMMIT";
+        assert_eq!(
+            statements(split_statements(tx).expect("split")),
+            vec!["BEGIN", "SELECT 1", "COMMIT"]
+        );
+        let create_then_begin = "CREATE FUNCTION f() RETURNS int AS 1; BEGIN ATOMIC; SELECT 1";
+        assert_eq!(
+            statements(split_statements(create_then_begin).expect("split")).len(),
+            3
+        );
     }
 
     #[test]

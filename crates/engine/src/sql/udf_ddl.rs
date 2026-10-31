@@ -20,6 +20,7 @@ use crate::catalog::function::{
     FUNCTION_CANNOT_CHANGE_PARAM_NAME_MESSAGE, FUNCTION_CANNOT_CHANGE_RETURN_TYPE_MESSAGE,
     FUNCTION_RECURSIVE_MESSAGE,
 };
+use crate::catalog::function_dependency::{FunctionDependency, FUNCTION_DEPENDEE_MISSING_MESSAGE};
 use crate::catalog::CatalogError;
 use crate::sql::allowlist::{
     DropFunctionBehavior, FunctionAttributeClauses, FunctionLanguageClause, FunctionParallelClause,
@@ -110,6 +111,7 @@ fn catalog_def_from_prepared(
         language: FunctionLanguage::Declarative,
         body_source: body_source.to_string(),
         attrs: attrs.clone(),
+        standard_body: false,
     })
 }
 
@@ -296,6 +298,9 @@ pub(crate) struct RoutineSpec<'a> {
     pub(crate) language: FunctionLanguageClause,
     pub(crate) attrs: FunctionAttributes,
     pub(crate) body_source: &'a str,
+    /// SQL 標準形の本体（`RETURN`・`BEGIN ATOMIC`。Issue #2219）か。真なら定義時に名前を解決済みで、
+    /// `validate` が返す依存辺をカタログへ記録する。
+    pub(crate) standard_body: bool,
 }
 
 /// `CREATE [OR REPLACE] FUNCTION ... LANGUAGE sql|plpgsql` をカタログへ永続化する（DDL 権限のある
@@ -315,7 +320,7 @@ pub(crate) fn execute_create_routine_persistent(
     spec: &RoutineSpec<'_>,
     or_replace: bool,
     max_functions: usize,
-    validate: &dyn Fn() -> Result<(), SqlSurfaceError>,
+    validate: &dyn Fn() -> Result<Vec<FunctionDependency>, SqlSurfaceError>,
 ) -> Result<(), SqlSurfaceError> {
     let name = spec.name;
     crate::catalog::validate_relation_key(name)
@@ -382,7 +387,8 @@ pub(crate) fn execute_create_routine_persistent(
         })?;
         (Some(function_type_from_udf_cast(ty)?), ReturnShape::Scalar)
     };
-    validate()?;
+    // 標準形は定義時に名前を解決し、参照先への依存辺を返す（それ以外は空）。
+    let dependencies = validate()?;
     let def = FunctionDef {
         id: 1,
         function_key: lower.clone(),
@@ -400,17 +406,19 @@ pub(crate) fn execute_create_routine_persistent(
         },
         body_source: spec.body_source.to_string(),
         attrs: spec.attrs.clone(),
+        standard_body: spec.standard_body,
     };
     if or_replace {
-        // 非宣言的な新定義は別の定義を呼ばないため循環検査は常に成功する。
+        // 関数間の循環は、標準形の依存辺について write txn 内で検査される（`replace_function_with_deps`）。
+        // 辺を持たない新定義は別の定義を呼ばないため、置換で辺だけが消える。
         storage
-            .replace_function_checked(tenant_id, &def, max_functions, &|_| Ok(()))
+            .replace_function_with_deps(tenant_id, &def, max_functions, &|_| Ok(()), &dependencies)
             .map_err(map_function_error)?;
         // 宣言的 UDF を置き換えた場合、セッションに旧本体の展開が残らないよう取り除く。
         session.udfs_mut().remove(name);
     } else {
         storage
-            .create_function_with_limit(tenant_id, &def, max_functions)
+            .create_function_with_deps(tenant_id, &def, max_functions, &dependencies)
             .map_err(map_function_error)?;
     }
     // commit 後に同じセッションへ登録する（すぐ呼べるようにする。他セッションは世代で refresh）。
@@ -615,6 +623,12 @@ fn map_function_error(e: CatalogError) -> SqlSurfaceError {
             SqlSurfaceError::feature_not_supported(
                 "recursive function definitions are not supported",
             )
+        }
+        // 標準形の依存先が定義時の解決と commit の間に消えた（Issue #2219）。名前は出さない固定文言。
+        CatalogError::Invalid(m) if m == FUNCTION_DEPENDEE_MISSING_MESSAGE => {
+            SqlSurfaceError::UndefinedTable {
+                name: "relation".to_string(),
+            }
         }
         CatalogError::Invalid(m) if m.contains("enum") => {
             SqlSurfaceError::feature_not_supported("enum types are not supported in functions")

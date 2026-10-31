@@ -98,6 +98,7 @@ mod dml_subquery_exec_tests;
 mod plpgsql_validate;
 #[cfg(test)]
 mod plpgsql_validate_tests;
+mod standard_body_binding;
 // PL/pgSQL 本体の SQL を同じ Tx・同じ RLS で実行する `PlHost` 実装（Issue #2226・SQL-68）。
 // 呼び出し元は #2217・#2218（`routine_call`）・#2228（`DO`）。
 #[allow(dead_code)]
@@ -9285,6 +9286,8 @@ impl EngineCore {
                 let attrs = crate::sql::udf_ddl::function_attributes_from_clauses(&attributes);
                 // Issue #2217（SQL-67 (3)）: `LANGUAGE sql|plpgsql` は本体を原文のまま保存する経路へ。
                 // 呼び出しの実行は #2218（`core::routine_call`）。sql・plpgsql とも保存前に定義時検証。
+                let is_standard_body =
+                    matches!(body, crate::sql::allowlist::CreateFunctionBody::SqlStandard);
                 let body = match (language, body) {
                     (
                         crate::sql::allowlist::FunctionLanguageClause::Declarative,
@@ -9301,6 +9304,9 @@ impl EngineCore {
                             language,
                             attrs,
                             body_source: &body_source,
+                            // Issue #2219（SQL-67 (2)）: `RETURN`・`BEGIN ATOMIC` の標準形は定義時に名前を
+                            // 解決し、依存辺を記録する（`validate_sql_standard_function_definition`）。
+                            standard_body: is_standard_body,
                         };
                         let is_plpgsql =
                             language == crate::sql::allowlist::FunctionLanguageClause::Plpgsql;
@@ -9319,12 +9325,22 @@ impl EngineCore {
                                         returns_trigger,
                                         &body_source,
                                     )
+                                    .map(|()| Vec::new())
+                                } else if spec.standard_body {
+                                    self.validate_sql_standard_function_definition(
+                                        ctx.tenant_id(),
+                                        &name,
+                                        &params,
+                                        &param_types,
+                                        &body_source,
+                                    )
                                 } else {
                                     self.validate_sql_function_definition(
                                         &params,
                                         &param_types,
                                         &body_source,
                                     )
+                                    .map(|()| Vec::new())
                                 }
                             },
                         )?;

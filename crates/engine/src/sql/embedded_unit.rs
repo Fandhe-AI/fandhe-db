@@ -9,7 +9,7 @@
 
 use crate::recovery::required_op_id::LedgerMode;
 use crate::sql::allowlist::{
-    self, ParsedInsertTokens, SessionWith, SqlSurfaceError, StructuralOnlyLookup,
+    self, ParsedInsertTokens, SessionWith, SqlSurfaceError, StructuralOnlyLookup, TableLookup,
 };
 use crate::sql::lexer::Token;
 
@@ -46,9 +46,34 @@ pub(crate) fn parse_unit(
     depth: usize,
     is_root: bool,
 ) -> Result<UnitSummary, SqlSurfaceError> {
+    parse_unit_with_lookup(tokens, depth, is_root, &StructuralOnlyLookup)
+}
+
+/// [`parse_unit`] の本体。表の存在照会に使う `lookup` を呼び出し側が選べる（Issue #2219）。
+/// `parse_unit` は構造専用の `StructuralOnlyLookup`（表は常に存在する）で呼ぶ薄い入口で、既存の挙動は
+/// 変わらない。SQL 標準形の関数本体（`RETURN`・`BEGIN ATOMIC`）の定義時検証だけが、実カタログを引く
+/// lookup を渡して名前を解決し、参照した表・ビューを記録する（`core::standard_body_binding`）。
+pub(crate) fn parse_unit_with_lookup<L: TableLookup>(
+    tokens: &[Token],
+    depth: usize,
+    is_root: bool,
+    lookup: &L,
+) -> Result<UnitSummary, SqlSurfaceError> {
+    parse_unit_with_target(tokens, depth, is_root, lookup).map(|(summary, _)| summary)
+}
+
+/// [`parse_unit_with_lookup`] の本体。DML 文（`INSERT`・`UPDATE`・`DELETE`）では、解析器が確定した
+/// 対象表名（存在確認前の名前）を併せて返す。`ONLY`・引用識別子の `"SET"` 等の綴りの扱いを自前で
+/// 推定せず解析木から取るための入口（Issue #2219。`core::standard_body_binding` が依存辺と存在確認に使う）。
+/// DML 以外の文は `None`。
+pub(crate) fn parse_unit_with_target<L: TableLookup>(
+    tokens: &[Token],
+    depth: usize,
+    is_root: bool,
+    lookup: &L,
+) -> Result<(UnitSummary, Option<String>), SqlSurfaceError> {
     let limits = crate::nesting_limits::NestingLimits::default();
     let ledger = LedgerMode::default();
-    let lookup = StructuralOnlyLookup;
     let summary = |kind| UnitSummary {
         kind,
         has_write_cte: false,
@@ -57,44 +82,65 @@ pub(crate) fn parse_unit(
         "INSERT" => {
             // 値の形・`INSERT ... SELECT` のどちらも構文は受理する（内側 SELECT は取り込み範囲として
             // 呼び出し側が再帰的に解析する）。
-            let _shape: ParsedInsertTokens =
+            let shape: ParsedInsertTokens =
                 allowlist::parse_insert_any_shape_tokens_with_limit(tokens, ledger, None)?;
-            Ok(summary(UnitKind::Insert))
+            let target = match shape {
+                ParsedInsertTokens::Values(v) => v.table_name,
+                ParsedInsertTokens::Select(v) => v.table_name,
+            };
+            Ok((summary(UnitKind::Insert), Some(target)))
         }
         "UPDATE" if allowlist::looks_like_update_from(tokens) => {
-            allowlist::validate_update_from_tokens_with_limits(
-                tokens, ledger, false, limits, &lookup,
+            let v = allowlist::validate_update_from_tokens_with_limits(
+                tokens, ledger, false, limits, lookup,
             )?;
-            Ok(summary(UnitKind::Update))
+            Ok((
+                summary(UnitKind::Update),
+                Some(v.target.table().to_string()),
+            ))
         }
         "UPDATE" => {
-            allowlist::parse_update_form_shape_tokens_with_limits(tokens, ledger, limits)?;
-            Ok(summary(UnitKind::Update))
+            let target = match allowlist::parse_update_form_shape_tokens_with_limits(
+                tokens, ledger, limits,
+            )? {
+                allowlist::ValidatedUpdateForm::Single(v) => v.table_name,
+                allowlist::ValidatedUpdateForm::Predicate(v) => v.table_name,
+            };
+            Ok((summary(UnitKind::Update), Some(target)))
         }
         "DELETE" if allowlist::looks_like_delete_using(tokens) => {
-            allowlist::validate_delete_using_tokens_with_limits(
-                tokens, ledger, false, limits, &lookup,
+            let v = allowlist::validate_delete_using_tokens_with_limits(
+                tokens, ledger, false, limits, lookup,
             )?;
-            Ok(summary(UnitKind::Delete))
+            Ok((
+                summary(UnitKind::Delete),
+                Some(v.target.table().to_string()),
+            ))
         }
         "DELETE" => {
-            allowlist::parse_delete_statement_shape_tokens_with_limits(tokens, ledger, limits)?;
-            Ok(summary(UnitKind::Delete))
+            let target = match allowlist::parse_delete_statement_shape_tokens_with_limits(
+                tokens, ledger, limits,
+            )? {
+                allowlist::DeleteStatement::SingleRow(v) => v.table_name,
+                allowlist::DeleteStatement::Predicate(v) => v.table_name,
+            };
+            Ok((summary(UnitKind::Delete), Some(target)))
         }
         "WITH" if is_root => {
-            match allowlist::validate_session_with_tokens(tokens, &lookup, depth, limits, ledger)? {
-                SessionWith::Statement(_) => Ok(summary(UnitKind::Select)),
-                SessionWith::DataModifying(_) => Ok(UnitSummary {
-                    kind: UnitKind::Select,
-                    has_write_cte: true,
-                }),
+            match allowlist::validate_session_with_tokens(tokens, lookup, depth, limits, ledger)? {
+                SessionWith::Statement(_) => Ok((summary(UnitKind::Select), None)),
+                SessionWith::DataModifying(_) => Ok((
+                    UnitSummary {
+                        kind: UnitKind::Select,
+                        has_write_cte: true,
+                    },
+                    None,
+                )),
             }
         }
         _ => {
-            allowlist::validate_sql_tokens_with_subquery_ctx_limits(
-                tokens, &lookup, depth, limits,
-            )?;
-            Ok(summary(UnitKind::Select))
+            allowlist::validate_sql_tokens_with_subquery_ctx_limits(tokens, lookup, depth, limits)?;
+            Ok((summary(UnitKind::Select), None))
         }
     }
 }

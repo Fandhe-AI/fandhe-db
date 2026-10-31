@@ -1271,6 +1271,8 @@ pub(crate) fn drop_materialized_view_in_txn(
     write_txn: &redb::WriteTransaction,
     name: &str,
 ) -> Result<()> {
+    // 標準形の関数本体が参照する matview は削除できない（`2BP01`。Issue #2219）。
+    super::reject_relation_with_function_dependents_in_txn(write_txn, name)?;
     {
         let mut table = write_txn.open_table(MATERIALIZED_VIEWS_TABLE)?;
         if table.remove(name)?.is_none() {
