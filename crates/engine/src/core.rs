@@ -1302,6 +1302,8 @@ pub struct EngineCore {
     /// 一時表のセッションあたりの件数・総バイト数の上限（TABLE-44・Issue #1683）。差し替えは
     /// [`Self::with_temp_table_limits`] のみ（起動時 1 回）。`CREATE TEMP TABLE` の実行段にだけ効く。
     temp_table_limits: crate::temp_table_limits::TempTableLimits,
+    /// UDF 件数上限の起動時設定（SQL-66 (5)・Issue #1922）。注入点は [`Self::with_function_limits`] のみ。
+    function_limits: crate::function_limits::FunctionLimits,
     /// jsonpath 評価のステップ数・再帰深さの上限（Issue #2184・TABLE-25 ポインタ）。
     /// 差し替えは [`Self::with_jsonpath_limits`] のみ（起動時 1 回）。SQL 表層の `jsonb_path_*`
     /// （Issue #2185）は、文実行入口が張る `JsonPathLimitsScope` 経由で束縛時にこの値を焼き込む。
@@ -2849,6 +2851,7 @@ impl EngineCore {
             scan_limits: crate::scan_limits::ScanLimits::default(),
             group_by_limits: crate::group_by_limits::GroupByLimits::default(),
             temp_table_limits: crate::temp_table_limits::TempTableLimits::default(),
+            function_limits: crate::function_limits::FunctionLimits::default(),
             jsonpath_limits: crate::jsonpath_limits::JsonPathLimits::default(),
             regex_limits: crate::regex_limits::RegexLimits::default(),
             nesting_limits: crate::nesting_limits::NestingLimits::default(),
@@ -3215,6 +3218,19 @@ impl EngineCore {
     /// 現在の一時表上限（TABLE-44・Issue #1683）。
     pub fn temp_table_limits(&self) -> crate::temp_table_limits::TempTableLimits {
         self.temp_table_limits
+    }
+
+    /// UDF 件数上限（[`crate::function_limits::FunctionLimits`]）を差し替えたビルダーを返す
+    /// （SQL-66 (5)・Issue #1922）。`wire-server` の起動時 CLI フラグ `--max-functions` からのみ
+    /// 呼ぶ。未呼び出しならハード上限と同値の既定（現行挙動）。
+    pub fn with_function_limits(mut self, limits: crate::function_limits::FunctionLimits) -> Self {
+        self.function_limits = limits;
+        self
+    }
+
+    /// 現在の UDF 件数上限（SQL-66 (5)・Issue #1922）。
+    pub fn function_limits(&self) -> crate::function_limits::FunctionLimits {
+        self.function_limits
     }
 
     /// jsonpath 評価のステップ数・再帰深さ上限（[`crate::jsonpath_limits::JsonPathLimits`]）を
@@ -7145,8 +7161,8 @@ impl EngineCore {
                 let outcome = crate::sql::ddl::execute_drop_sequence(&self.storage, stmt)?;
                 Ok(crate::sql::SqlOutcome::DropSequence(outcome))
             }
-            // SQL-66（Issue #1920）: 権限ゲートは置かない（権限の無いセッションはセッション内の定義だけを
-            // 消せる。CREATE FUNCTION と対称。42501 化は #1922）。カタログは DDL 権限ありのときだけ触る。
+            // SQL-66（Issue #1920・#1922）: 権限ゲート（`42501`）は `execute_drop_function` の先頭にあり、
+            // カタログにもレジストリにも触れる前に権限の無いセッションを拒否する（CREATE FUNCTION と対称）。
             ParsedSql::DropFunction(stmt) => {
                 let outcome = crate::sql::udf_ddl::execute_drop_function(
                     &self.storage,
@@ -7717,32 +7733,21 @@ impl EngineCore {
                 | Statement::SetSearchPath { .. }
                 | Statement::ShowSearchPath),
             ) => self.execute_validated_in_session(ctx, session, stmt.clone()),
-            // SQL-66（Issue #1920）: DDL 権限のあるセッションの `CREATE FUNCTION` は UDF カタログへ書く
-            // 永続 DDL のため、ROLLBACK で取り消せない書き込みを明示トランザクションの中で行わない
-            // （他の DDL と同じ `0A000`）。権限の無いセッションはセッション内だけの登録で、ROLLBACK で
-            // `session_at_begin` へ戻るため従来どおり通す。
-            ParsedSql::Statement(stmt @ Statement::CreateFunction { .. }) => {
-                if session.ddl_allowed() {
-                    Err(SqlSurfaceError::feature_not_supported(
-                        "CREATE [OR REPLACE] FUNCTION is not supported inside a transaction block",
-                    ))
-                } else {
-                    self.execute_validated_in_session(ctx, session, stmt.clone())
-                }
+            // SQL-66（Issue #1920・#1922）: `CREATE [OR REPLACE] FUNCTION` は DDL 権限が無ければ `42501` で
+            // 拒否する（fail-closed）。権限のあるセッションでも UDF カタログへ書く永続 DDL は独立した
+            // write txn で commit され ROLLBACK で取り消せないため、型注釈・RETURNS の有無によらず
+            // 明示トランザクションの中では行わない（他の DDL と同じ `0A000`）。
+            ParsedSql::Statement(Statement::CreateFunction { .. }) => {
+                crate::sql::ddl::require_ddl_permission(session)?;
+                Err(SqlSurfaceError::feature_not_supported(
+                    "CREATE [OR REPLACE] FUNCTION is not supported inside a transaction block",
+                ))
             }
-            ParsedSql::DropFunction(_) if session.ddl_allowed() => {
+            ParsedSql::DropFunction(_) => {
+                crate::sql::ddl::require_ddl_permission(session)?;
                 Err(SqlSurfaceError::feature_not_supported(
                     "DROP FUNCTION is not supported inside a transaction block",
                 ))
-            }
-            ParsedSql::DropFunction(stmt) => {
-                let outcome = crate::sql::udf_ddl::execute_drop_function(
-                    &self.storage,
-                    ctx.tenant_id(),
-                    session,
-                    stmt,
-                )?;
-                Ok(crate::sql::SqlOutcome::DropFunction(outcome))
             }
             // 検索・集計・広域取得・`EXPLAIN`・JOIN・評価後射影形ビュー・集合演算はすべて
             // 同じ読み取り経路へ入る（Issue #1179・#1192・#1353）。dirty テーブルの有無・
@@ -9133,22 +9138,15 @@ impl EngineCore {
                     }],
                 },
             )),
-            // TASK-79（SQL-9）: `CREATE FUNCTION` の検証・登録は
-            // `sql::udf_call::define_function` に委譲する（検証→登録の順を守り、
-            // 失敗時は `session.udfs()` を一切変更しない。`SET search_mode` と同じ
-            // 「部分更新＝黙った既定化を防ぐ」方針）。
+            // TASK-79（SQL-9）・SQL-66: `CREATE [OR REPLACE] FUNCTION` は、検証 → UDF カタログへの書き込み
+            // （単一 write txn・1 回の commit）→ レジストリへの登録の順で永続化する（`sql::udf_ddl`）。
+            // 失敗時は `session.udfs()` を一切変更しない（`SET search_mode` と同じ「部分更新＝黙った既定化を
+            // 防ぐ」方針）。型注釈・RETURNS つきの定義も同じ経路でカタログへ書く（Issue #2798）。
             //
-            // Issue #1920（SQL-66）: DDL 実行権限のあるセッションでは、検証 → UDF カタログへの書き込み
-            // （単一 write txn・1 回の commit）→ レジストリへの登録の順で永続化する。権限の無いセッションは
-            // 従来どおりセッション内だけに登録し、カタログには触れない（42501 ゲートは #1922）。
-            //
-            // Issue #1915・#1916・#2798（SQL-66 (1)）: 型注釈・RETURNS つきの定義も同じ永続化経路で
-            // カタログへ書く（検証は非 DDL セッションと同じ prepare で行うため `42P13`・`0A000` の
-            // 結果は権限によらず一致する）。ロード側は書き込み経路の正規形の型だけを復元し、
-            // それ以外の行は定義単位で読み飛ばす（`udf_load`）。
-            //
-            // Issue #1917（SQL-66 (2)）: `CREATE OR REPLACE FUNCTION` は同じ分岐で `or_replace` により
-            // 置換経路（`prepare_function_replacement`）へ切り替える。
+            // Issue #1922: DDL 権限の無いセッションは保存先の振り分け・本体検証・重複判定のいずれより前に
+            // `42501`（fail-closed。セッション限定の登録経路は無い。docs/design/udf-catalog.md）。
+            // 件数上限は起動時設定 `--max-functions`（下げる方向のみ）で、永続化経路がテナントのカタログ件数で
+            // 判定する（置換は件数を増やさないため判定しない）。
             crate::sql::allowlist::Statement::CreateFunction {
                 or_replace,
                 name,
@@ -9158,49 +9156,32 @@ impl EngineCore {
                 body,
                 body_source,
             } => {
-                if session.ddl_allowed() {
-                    if or_replace {
-                        crate::sql::udf_ddl::execute_create_or_replace_function_persistent(
-                            &self.storage,
-                            ctx.tenant_id(),
-                            session,
-                            &name,
-                            &params,
-                            &param_types,
-                            return_type.as_ref(),
-                            &body,
-                            &body_source,
-                        )?;
-                    } else {
-                        crate::sql::udf_ddl::execute_create_function_persistent(
-                            &self.storage,
-                            ctx.tenant_id(),
-                            session,
-                            &name,
-                            &params,
-                            &param_types,
-                            return_type.as_ref(),
-                            &body,
-                            &body_source,
-                        )?;
-                    }
-                } else if or_replace {
-                    crate::sql::udf_call::define_or_replace_function_with_signature(
-                        session.udfs_mut(),
+                crate::sql::ddl::require_ddl_permission(session)?;
+                if or_replace {
+                    crate::sql::udf_ddl::execute_create_or_replace_function_persistent(
+                        &self.storage,
+                        ctx.tenant_id(),
+                        session,
                         &name,
                         &params,
                         &param_types,
                         return_type.as_ref(),
                         &body,
+                        &body_source,
+                        self.function_limits.max_functions(),
                     )?;
                 } else {
-                    crate::sql::udf_call::define_function_with_signature(
-                        session.udfs_mut(),
+                    crate::sql::udf_ddl::execute_create_function_persistent(
+                        &self.storage,
+                        ctx.tenant_id(),
+                        session,
                         &name,
                         &params,
                         &param_types,
                         return_type.as_ref(),
                         &body,
+                        &body_source,
+                        self.function_limits.max_functions(),
                     )?;
                 }
                 Ok(crate::sql::SqlOutcome::CreateFunction { name })

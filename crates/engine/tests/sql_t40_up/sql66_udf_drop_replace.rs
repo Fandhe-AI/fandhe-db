@@ -120,16 +120,6 @@ fn dropped_function_call_is_42883_in_every_session_kind_and_after_reopen() {
         // 別セッションは refresh で削除を知る。
         core.refresh_session_udfs(&ctx("alice"), &mut b);
         assert_eq!(code(&core, "alice", &mut b, CALL_DBL), "42883");
-        // 非 DDL セッションのセッション内の関数も DROP の後は呼べない。
-        let mut local = SessionState::default();
-        ok(
-            &core,
-            "alice",
-            &mut local,
-            "CREATE FUNCTION dbl(x) AS x * 2",
-        );
-        ok(&core, "alice", &mut local, "DROP FUNCTION dbl");
-        assert_eq!(code(&core, "alice", &mut local, CALL_DBL), "42883");
     }
     let core = open(&path);
     for ddl in [true, false] {
@@ -196,7 +186,7 @@ fn if_exists_cascade_restrict_forms() {
 }
 
 /// テナント境界（P0）: `IF EXISTS` は他テナントの定義に対しても不在と同じ skipped で、その定義は消えない。
-/// 非 DDL セッションでも不在の IF EXISTS は skipped。
+/// 非 DDL セッションは不在の IF EXISTS でも 42501（SQL-66・Issue #1922）。
 #[test]
 fn if_exists_does_not_reveal_or_drop_other_tenants_function() {
     let path = unique_db_path("sql66-dr-if-exists-tenant");
@@ -212,13 +202,12 @@ fn if_exists_does_not_reveal_or_drop_other_tenants_function() {
             &mut b,
             "DROP FUNCTION IF EXISTS dbl"
         )));
+        // 権限の無いセッションは対象の有無によらず 42501（存在情報を区別させない）。
         let mut c = loaded(&core, "bob", false);
-        assert!(skipped(&ok(
-            &core,
-            "bob",
-            &mut c,
-            "DROP FUNCTION IF EXISTS dbl"
-        )));
+        assert_eq!(
+            code(&core, "bob", &mut c, "DROP FUNCTION IF EXISTS dbl"),
+            "42501"
+        );
     }
     let core = open(&path);
     let mut a = ddl_session();
@@ -305,26 +294,44 @@ fn replacing_a_callee_changes_its_callers() {
     assert!(call(&core, "alice", &mut a, CALL_DBL).contains("30"));
 }
 
-/// 非 DDL セッション: セッション内の関数を置換できる。カタログには書かない。
+/// 非 DDL セッションの OR REPLACE は 42501（Issue #1922）。レジストリもカタログも変わらない。
 #[test]
-fn replace_in_session_without_ddl_permission() {
+fn replace_in_session_without_ddl_permission_is_rejected() {
     let path = unique_db_path("sql66-dr-replace-noddl");
     let _g = CleanupGuard(path.clone());
     let core = open(&path);
     let mut d = ddl_session();
     setup_table(&core, "alice", &mut d);
-    let mut s = SessionState::default();
-    ok(&core, "alice", &mut s, "CREATE FUNCTION dbl(x) AS x * 2");
-    ok(
-        &core,
-        "alice",
-        &mut s,
-        "CREATE OR REPLACE FUNCTION dbl(x) AS x * 7",
+    ok(&core, "alice", &mut d, "CREATE FUNCTION dbl(x) AS x * 2");
+    let mut s = loaded(&core, "alice", false);
+    let before = s.udfs().len();
+    assert_eq!(
+        code(
+            &core,
+            "alice",
+            &mut s,
+            "CREATE OR REPLACE FUNCTION dbl(x) AS x * 7"
+        ),
+        "42501"
     );
-    assert!(call(&core, "alice", &mut s, CALL_DBL).contains("35"));
-    // カタログには書いていない（DDL セッションから見えない）。
+    assert_eq!(
+        code(
+            &core,
+            "alice",
+            &mut s,
+            "CREATE OR REPLACE FUNCTION fresh(x) AS x * 7"
+        ),
+        "42501"
+    );
+    assert_eq!(s.udfs().len(), before);
+    assert!(call(&core, "alice", &mut s, CALL_DBL).contains("10"));
+    // カタログも変わらない: 別セッションから見ても元の本体で、fresh は無い。
     let mut other = loaded(&core, "alice", true);
-    assert_eq!(code(&core, "alice", &mut other, CALL_DBL), "42883");
+    assert!(call(&core, "alice", &mut other, CALL_DBL).contains("10"));
+    assert_eq!(
+        code(&core, "alice", &mut other, "SELECT fresh(n) FROM t LIMIT 1"),
+        "42883"
+    );
 }
 
 /// カタログ由来の関数を権限の無いセッションが置換すると 42501（DROP と同じ。関数は変わらない）。
@@ -380,14 +387,15 @@ fn replace_rejects_param_name_change_and_overloads() {
     assert!(call(&core, "alice", &mut a, CALL_DBL).contains("10"));
 }
 
-/// 戻り値型・型注釈の変更（非 DDL セッション。DDL セッションは RETURNS 自体が 0A000 のため対象外）。
-/// 戻り値型の変更・RETURNS の有無の変更は 42P13、引数の型の違いは多重定義扱いで 42723。
+/// 戻り値型・型注釈の変更（権限ありセッションの型付き・RETURNS 付き定義は #2798 までセッション限定）。
+/// 戻り値型の変更・RETURNS の有無の変更は 42P13、引数の型の違いは多重定義扱いで 42723、
+/// 同じシグネチャなら置換できる。
 #[test]
-fn replace_rejects_return_type_and_signature_changes_in_session() {
+fn replace_rejects_return_type_and_signature_changes_in_session_only_definitions() {
     let path = unique_db_path("sql66-dr-replace-returns");
     let _g = CleanupGuard(path.clone());
     let core = open(&path);
-    let mut s = SessionState::default();
+    let mut s = ddl_session();
     ok(
         &core,
         "alice",
@@ -421,7 +429,6 @@ fn replace_rejects_return_type_and_signature_changes_in_session() {
         ),
         "42723"
     );
-    // 同じシグネチャなら置換できる。
     ok(
         &core,
         "alice",
@@ -430,7 +437,8 @@ fn replace_rejects_return_type_and_signature_changes_in_session() {
     );
 }
 
-/// 組み込み名・予約名に対する OR REPLACE は 42723（組み込み関数を置換できない）。
+/// 組み込み名・予約名に対する OR REPLACE は 42723（組み込み関数を置換できない）。権限の無い
+/// セッションは名前の検証より先に 42501。
 #[test]
 fn replace_cannot_shadow_builtin_or_reserved_names() {
     let path = unique_db_path("sql66-dr-replace-builtin");
@@ -450,7 +458,7 @@ fn replace_cannot_shadow_builtin_or_reserved_names() {
                     &mut s,
                     &format!("CREATE OR REPLACE FUNCTION {name}(x) AS x")
                 ),
-                "42723",
+                if ddl { "42723" } else { "42501" },
                 "{name} ddl={ddl}"
             );
         }
@@ -494,8 +502,8 @@ fn replace_rejects_cycles_and_leaves_state_unchanged() {
     let core = open(&path);
     let mut s = loaded(&core, "alice", true);
     assert!(call(&core, "alice", &mut s, CALL_DBL).contains("12"));
-    // 非 DDL セッションでも同じ。
-    let mut n = SessionState::default();
+    // 追加の関数でも同じ（ロード済みの DDL セッション）。
+    let mut n = ddl_session();
     // 本体が自身だけを呼ぶ関数の自己再帰置換も 0A000（未定義関数 42883 にならない）。
     ok(&core, "alice", &mut n, "CREATE FUNCTION selfref(x) AS x");
     assert_eq!(
@@ -592,4 +600,7 @@ fn replace_with_typed_signature_is_persisted_in_ddl_sessions() {
         ),
         "42723"
     );
+    // 型付き・RETURNS 付きの定義も永続化されており、別セッションがロードして見える。
+    let other = loaded(&core, "alice", true);
+    assert!(other.udfs().get("tf").is_some());
 }

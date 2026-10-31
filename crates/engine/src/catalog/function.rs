@@ -830,7 +830,7 @@ impl Storage {
         scope: &str,
         def: &FunctionDef,
     ) -> Result<ReplaceOutcome> {
-        self.replace_function_checked(scope, def, &|_| Ok(()))
+        self.replace_function_checked(scope, def, MAX_FUNCTIONS, &|_| Ok(()))
     }
 
     /// [`Self::replace_function`] に、write txn 内で最新カタログ（`scope` の全定義）に対して走る
@@ -840,9 +840,11 @@ impl Storage {
         &self,
         scope: &str,
         def: &FunctionDef,
+        max_functions: usize,
         check: &dyn Fn(&[FunctionDef]) -> Result<()>,
     ) -> Result<ReplaceOutcome> {
-        self.replace_function_with_limit(scope, def, MAX_FUNCTIONS, check)
+        // 設定値でハード上限を超えさせない（fail-closed。Issue #1922）。
+        self.replace_function_with_limit(scope, def, max_functions.min(MAX_FUNCTIONS), check)
     }
 
     /// [`Self::replace_function`] の本体（件数上限を引数にしてテストで小さい値を注入する）。
@@ -918,19 +920,23 @@ impl Storage {
     /// `scope` に関数定義を作り、払い出した内部 ID を返す。判定順は形状検証 → 同一
     /// `(関数名, 引数シグネチャ)` の既存（`Invalid`。SQLSTATE への写像は #1920 が決める）→ 件数
     /// 上限（`ViewLimitExceeded`）→ ID 払い出しと保存を同一 write txn・1 回の commit で行う。
-    /// `def.id` は無視される。#1920 の `CREATE FUNCTION` が呼ぶ予定。
+    /// `def.id` は無視される。本番経路は件数上限を起動時設定で渡す
+    /// [`Self::create_function_with_limit`] を呼ぶ（Issue #1922。本関数は既定上限のテスト用ラッパー）。
+    #[cfg(test)]
     pub(crate) fn create_function(&self, scope: &str, def: &FunctionDef) -> Result<u64> {
         self.create_function_with_limit(scope, def, MAX_FUNCTIONS)
     }
 
     /// [`Self::create_function`] の本体（件数上限を引数にしてテストで小さい値を注入する）。
-    fn create_function_with_limit(
+    pub(crate) fn create_function_with_limit(
         &self,
         scope: &str,
         def: &FunctionDef,
         max_functions: usize,
     ) -> Result<u64> {
         validate_scope(scope)?;
+        // 設定値でハード上限（読み取り側の上限でもある）を超えさせない（fail-closed）。
+        let max_functions = max_functions.min(MAX_FUNCTIONS);
         let mut stored = def.clone();
         stored.function_key = normalize_key(&def.function_key)?;
         stored.id = 1;
@@ -966,6 +972,40 @@ impl Storage {
         // commit 成功後にだけ世代を進める（他セッションの refresh が検知する。SQL-66・#1921）。
         self.bump_function_generation(scope);
         Ok(stored.id)
+    }
+
+    /// 本体検証より前に行う、カタログ側の重複・件数の先行判定（読み取り専用。Issue #1922）。
+    /// `sql::udf_ddl` の `CREATE [OR REPLACE] FUNCTION` が、設計文書の判定順（重複 → 件数 → 引数数 →
+    /// 本体）に合わせて呼ぶ。`replace` が偽で同名の定義があれば重複（`Invalid`＝`42723`）、同名が無い
+    /// ときだけ件数（設定上限をハード上限で飽和。`ViewLimitExceeded`＝`54000`）を見る。`replace` が真で
+    /// 同名が既にあれば置換は件数を増やさないので何も検査しない。権威ある判定は write txn 内の再検査
+    /// （[`Self::create_function_with_limit`]・[`Self::replace_function_checked`]）が担い、本関数は
+    /// 並行する書き込みに対する排他を持たない早期拒否でしかない。
+    pub(crate) fn precheck_function_capacity(
+        &self,
+        scope: &str,
+        function_key: &str,
+        max_functions: usize,
+        replace: bool,
+    ) -> Result<()> {
+        validate_scope(scope)?;
+        let key = normalize_key(function_key)?;
+        let max_functions = max_functions.min(MAX_FUNCTIONS);
+        let rt = self.db().begin_read()?;
+        if !list_in_txn(&rt, scope, Some(&key))?.is_empty() {
+            if replace {
+                return Ok(());
+            }
+            return Err(CatalogError::Invalid(
+                FUNCTION_ALREADY_EXISTS_MESSAGE.to_string(),
+            ));
+        }
+        if count_functions_capped(&rt, scope, max_functions)? >= max_functions {
+            return Err(CatalogError::ViewLimitExceeded(
+                "too many functions".to_string(),
+            ));
+        }
+        Ok(())
     }
 
     /// `(scope, 関数名, 引数シグネチャ)` の定義を 1 件引く（読み取り専用）。他スコープの定義は

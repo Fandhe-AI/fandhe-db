@@ -253,6 +253,7 @@ fn builtin_names_are_reserved() {
     let core = new_core(&path);
     let ctx = ctx_for("tenant-a");
     let mut session = SessionState::default();
+    session.allow_ddl();
     for name in ["left", "right", "reverse", "initcap"] {
         let err = core
             .execute_sql_in_session(

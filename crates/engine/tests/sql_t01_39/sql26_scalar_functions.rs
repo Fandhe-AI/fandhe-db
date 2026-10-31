@@ -266,6 +266,7 @@ fn builtin_string_function_names_are_reserved_against_udf_definition() {
     let core = new_core(&path);
     let ctx = ctx_for("tenant-a");
     let mut session = SessionState::default();
+    session.allow_ddl();
 
     for name in [
         "lower", "upper", "length", "substr", "concat", "trim", "replace", "position",
@@ -692,6 +693,8 @@ fn wrong_arity_calls_are_rejected_with_42883() {
     }
 
     let mut session = SessionState::default();
+
+    session.allow_ddl();
     core.execute_sql_in_session(&ctx, &mut session, "CREATE FUNCTION f1(x) AS x")
         .expect("define f1");
     for sql in [

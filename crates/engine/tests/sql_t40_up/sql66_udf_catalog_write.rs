@@ -149,9 +149,10 @@ fn tenants_are_isolated() {
     ok(&core, "bob", &mut b2, "CREATE FUNCTION dbl(x) AS x");
 }
 
-/// DDL 権限の無いセッションは従来どおりセッション内だけ（カタログへ書かない・カタログを消さない）。
+/// DDL 権限の無いセッションの CREATE／DROP FUNCTION は `42501`（SQL-66・Issue #1922）。カタログは
+/// 読みも書きもされず、永続関数は消えない。
 #[test]
-fn session_without_ddl_permission_does_not_touch_the_catalog() {
+fn session_without_ddl_permission_is_rejected_and_does_not_touch_the_catalog() {
     let path = unique_db_path("sql66-write-noddl");
     let _g = CleanupGuard(path.clone());
     {
@@ -159,17 +160,19 @@ fn session_without_ddl_permission_does_not_touch_the_catalog() {
         let mut d = ddl_session();
         ok(&core, "alice", &mut d, "CREATE FUNCTION persisted(x) AS x");
         let mut s = SessionState::default();
-        ok(&core, "alice", &mut s, "CREATE FUNCTION local_only(x) AS x");
-        // 権限の無いセッションから永続関数は見えず消せない（存在情報を出さない 42883）。
+        assert_eq!(
+            code(&core, "alice", &mut s, "CREATE FUNCTION local_only(x) AS x"),
+            "42501"
+        );
         assert_eq!(
             code(&core, "alice", &mut s, "DROP FUNCTION persisted"),
-            "42883"
+            "42501"
         );
-        ok(&core, "alice", &mut s, "DROP FUNCTION local_only");
+        assert_eq!(s.udfs().len(), 0);
     }
     let core = open(&path);
     let mut d = ddl_session();
-    // local_only は永続化されていない。persisted は残っている。
+    // local_only は作られていない。persisted は残っている。
     ok(&core, "alice", &mut d, "CREATE FUNCTION local_only(x) AS x");
     assert_eq!(
         code(&core, "alice", &mut d, "CREATE FUNCTION persisted(x) AS x"),

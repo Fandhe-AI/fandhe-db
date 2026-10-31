@@ -236,6 +236,8 @@ fn scan_over_declared_udf_call_evaluates_computed_column() {
     let ctx = ctx_for("tenant-a");
 
     let mut session = SessionState::default();
+
+    session.allow_ddl();
     core.execute_sql_in_session(&ctx, &mut session, "CREATE FUNCTION n(v) AS vec_norm(v)")
         .expect("CREATE FUNCTION should succeed");
     let result = expect_query(

@@ -510,6 +510,7 @@ fn udf_named_after_a_time_function_is_rejected_and_udf_bodies_inherit_the_clock(
     let (core, _g) = new_core();
     let ctx = ctx_for("tenant-a");
     let mut session = SessionState::default();
+    session.allow_ddl();
     for name in ["now", "clock_timestamp", "statement_timestamp"] {
         let err = core
             .execute_sql_in_session(

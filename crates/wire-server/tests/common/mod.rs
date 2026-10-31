@@ -387,6 +387,37 @@ pub fn spawn_server_with_engine(
     addr
 }
 
+/// [`spawn_server_with_engine`] と同型で、`ddl_allowed_users`（`--ddl-allowed-users` 相当）に
+/// 挙げたユーザーへ DDL 実行権限を付ける（`UserStore::with_ddl_allowed_users`。Issue #1922）。
+/// DDL 権限の無い接続の `CREATE FUNCTION` は `42501` のため、UDF を定義するテストはこちらを使う。
+pub fn spawn_server_with_engine_ddl_users(
+    users_path: &std::path::Path,
+    engine: std::sync::Arc<engine::core::EngineCore>,
+    ddl_allowed_users: &[&str],
+) -> std::net::SocketAddr {
+    let names: Vec<String> = ddl_allowed_users.iter().map(|s| s.to_string()).collect();
+    let store = UserStore::load_from_file(users_path)
+        .expect("valid user store")
+        .with_ddl_allowed_users(&names)
+        .expect("ddl principals must reference known users");
+    let store = Arc::new(store);
+    let listener = TcpListener::bind("127.0.0.1:0").expect("bind ephemeral port");
+    let addr = listener.local_addr().expect("local addr");
+    let limiter = ConnectionLimiter::new(16);
+
+    std::thread::spawn(move || {
+        wire_server::server::accept_loop_with_engine(
+            listener,
+            store,
+            engine,
+            limiter,
+            Duration::from_secs(5),
+        );
+    });
+
+    addr
+}
+
 /// `accept_loop_with_session_limits` 経由でサーバースレッドを起動する（Issue #2455。
 /// ポインタ: WIRE-25）。接続数・読み取りタイムアウト・セッション単位上限を設定値で
 /// 注入し、呼び出し側が `ConnectionLimiter` のクローンで `active()` を観測できる

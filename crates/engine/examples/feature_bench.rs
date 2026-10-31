@@ -532,14 +532,18 @@ fn run_mode_phase(
     build_phase(name, samples, after.vm_rss_kb, cpu_delta, extra)
 }
 
-/// UDF 呼び出しフェーズ（TASK-79・SQL-9）。`CREATE FUNCTION` はセッションへの
-/// 登録のため計測対象外（1 回だけセットアップし、以降はそのセッションを使い回して
+/// UDF 呼び出しフェーズ（TASK-79・SQL-9）。`CREATE FUNCTION` は DDL 権限のあるセッションが
+/// テナントのカタログへ書く定義（SQL-66・Issue #1922）で計測対象外（1 回だけセットアップし、以降はそのセッションを使い回して
 /// `SELECT ... norm_scale(embedding, 2.0) ...` を計測する）。プローブ・各反復が
 /// `Err` あるいは `SqlOutcome::Query` 以外を返した場合は構文・実行契約の退行を
 /// 示すため、エラー生成時間を p50/p95 として報告せず [`fail_bench`] でベンチを
 /// 止める（PR #380 codex-review P1 指摘）。
 fn run_udf_phase(core: &EngineCore, ctx: &PolicyContext, query_vec_literal: &str) -> PhaseStat {
     let mut session = SessionState::default();
+    session.allow_ddl();
+    // 再実行・使い回しの DB でも重複 `42723` にならないよう、先に消してから作る。
+    core.execute_sql_in_session(ctx, &mut session, "DROP FUNCTION IF EXISTS norm_scale")
+        .expect("DROP FUNCTION IF EXISTS should succeed");
     core.execute_sql_in_session(
         ctx,
         &mut session,
