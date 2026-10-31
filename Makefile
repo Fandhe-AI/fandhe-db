@@ -92,7 +92,7 @@ test: ## cargo test（workspace 全体）
 
 # 既定ビルド（feature fault-injection 無効）専用の回帰テストを実行する（Issue #710・#715・#1926。make test は --all-features のため対象外のテストをピンポイント実行）
 .PHONY: test-default-build
-test-default-build: ## 既定ビルド（fault-injection 無効）専用の回帰テスト
+test-default-build: ## 既定ビルド（fault-injection・wasm-udf 無効）専用の回帰テスト
 	@scripts/test_default_build.sh
 
 # クラッシュ耐性回帰テスト（TASK-142・PERSIST-1。scripts/crash_test.sh を実行）

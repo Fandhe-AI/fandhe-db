@@ -135,7 +135,7 @@ cat <<'EOF'
       $ cargo fmt --all --check
       $ cargo clippy --workspace --all-targets --all-features -- -D warnings
       $ cargo test --workspace --all-features
-      $ cargo test -p fandhe-db-wire-server --test wire_fault_injection_cli
+      $ scripts/test_default_build.sh
       $ scripts/crash_test.sh
       $ scripts/crash_test_interrupt.sh
       $ scripts/crash_test_cross_table.sh
