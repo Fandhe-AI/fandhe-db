@@ -632,6 +632,9 @@ pub fn bind(
 struct Replaced {
     items: Vec<Option<Expr>>,
     where_expr: Option<Expr>,
+    /// `Run` で評価済みの `WHERE` の真偽（`Some(None)` は NULL）。あれば `where_expr` を再評価せず
+    /// この定数を使う（`clock_timestamp()` 等の非決定式で投影の起動可否と最終結果が食い違わないため）。
+    where_decided: Option<Option<bool>>,
 }
 
 fn bind_inner(
@@ -694,14 +697,18 @@ fn bind_inner(
         Some(ConstSelectCondition::Bool(b)) => Some(BoundCondition::Const(Some(*b))),
         Some(ConstSelectCondition::Null) => Some(BoundCondition::Const(None)),
         Some(ConstSelectCondition::Expr(e)) => {
-            let e = replaced.and_then(|r| r.where_expr.as_ref()).unwrap_or(e);
-            let (bound, ty, _) = bind_const_expr(e, registry, &mut budget)?;
-            if ty != ExprType::Bool {
-                return Err(SqlSurfaceError::datatype_mismatch(
-                    "argument of WHERE must be type boolean",
-                ));
+            if let Some(decided) = replaced.and_then(|r| r.where_decided) {
+                Some(BoundCondition::Const(decided))
+            } else {
+                let e = replaced.and_then(|r| r.where_expr.as_ref()).unwrap_or(e);
+                let (bound, ty, _) = bind_const_expr(e, registry, &mut budget)?;
+                if ty != ExprType::Bool {
+                    return Err(SqlSurfaceError::datatype_mismatch(
+                        "argument of WHERE must be type boolean",
+                    ));
+                }
+                Some(BoundCondition::Expr(bound))
             }
-            Some(BoundCondition::Expr(bound))
         }
     };
     let having = match validated.having() {
@@ -929,6 +936,7 @@ fn fold_and_bind(
         _ => None,
     };
     // `WHERE` の真偽（`Run` のときだけ評価する）。通らなければ投影の呼び出しは起動しない。
+    let mut where_decided = None;
     if let Some(e) = &where_expr {
         let mut budget = MAX_EXPR_NODES;
         let (bound, ty, _) = bind_const_expr(e, registry, &mut budget)?;
@@ -939,8 +947,14 @@ fn fold_and_bind(
         }
         if folder.runs() {
             let passes = match eval(&bound, 0, &[])? {
-                ExprValue::Bool(b) => b,
-                ExprValue::Null => false,
+                ExprValue::Bool(b) => {
+                    where_decided = Some(Some(b));
+                    b
+                }
+                ExprValue::Null => {
+                    where_decided = Some(None);
+                    false
+                }
                 _ => {
                     return Err(SqlSurfaceError::Internal {
                         detail: "WHERE did not evaluate to boolean".to_string(),
@@ -962,7 +976,11 @@ fn fold_and_bind(
             Some(folder.fold(item.expr(), false)?)
         });
     }
-    let replaced = Replaced { items, where_expr };
+    let replaced = Replaced {
+        items,
+        where_expr,
+        where_decided,
+    };
     bind_inner(validated, registry, Some(&replaced))
 }
 

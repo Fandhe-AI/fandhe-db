@@ -409,6 +409,8 @@ pub fn classify_statement(stmt: &str) -> StatementEffect {
 /// `(` の直前の語が構文上の語（`IN`・`AS`・`OVER` 等）でも組み込み関数名でもない呼び出しを含むか
 /// （ユーザー定義関数の呼び出しの保守的な検出。構文語の取りこぼしは `Write` 側へ倒れるだけ）。
 fn calls_non_builtin_function(tokens: &[Token]) -> bool {
+    // 構文上 `(` の直前に現れない語（`END`・`NULL`・`TRUE`・`FALSE`・`DEFAULT`）は含めない。これらは
+    // 予約されない名前として同名のユーザー関数がありうるため、`(` が続けば呼び出し（`Write`）とする。
     const SYNTAX_WORDS: &[&str] = &[
         "IN",
         "AS",
@@ -452,13 +454,7 @@ fn calls_non_builtin_function(tokens: &[Token]) -> bool {
         "EXTRACT",
         "FROM",
         "BY",
-        "END",
-        "NULL",
-        "TRUE",
-        "FALSE",
         "UNNEST",
-        "ON",
-        "DEFAULT",
         "JSON_EXISTS",
         "JSON_VALUE",
         "JSON_QUERY",
@@ -504,6 +500,11 @@ fn calls_non_builtin_function(tokens: &[Token]) -> bool {
     ];
     // 直後に式（関数呼び出し）が来る語。直前がこれらなら `(` 直前の語は式の先頭＝呼び出し形。
     const EXPR_PREFIX_WORDS: &[&str] = &[
+        "ZONE",
+        "ESCAPE",
+        "TO",
+        "JOIN",
+        "LATERAL",
         "DISTINCT",
         "ALL",
         "AND",
@@ -534,6 +535,12 @@ fn calls_non_builtin_function(tokens: &[Token]) -> bool {
         "AS",
     ];
     tokens.iter().enumerate().any(|(i, t)| {
+        // `schema.func(...)`（修飾付き呼び出し）は構文語になりえないため常に呼び出しとして扱う。
+        if matches!(t, Token::QualifiedIdent { .. })
+            && matches!(tokens.get(i.saturating_add(1)), Some(Token::Punct('(')))
+        {
+            return true;
+        }
         let (Token::Ident(name), Some(Token::Punct('('))) = (t, tokens.get(i.saturating_add(1)))
         else {
             return false;
@@ -1172,6 +1179,13 @@ mod tests {
             assert_eq!(classify_statement(sql), StatementEffect::ReadOnly, "{sql}");
         }
         for sql in [
+            "SELECT s.f()",
+            "SELECT 1 FROM t WHERE s.f(a) = 1",
+            "SELECT end()",
+            "SELECT null(), true(), false(), default()",
+            "SELECT now() AT TIME ZONE to(1)",
+            "SELECT now() AT TIME ZONE join(1)",
+            "SELECT a FROM t WHERE a LIKE 'x' ESCAPE to(1)",
             "SELECT numeric()",
             "SELECT varchar(1)",
             "SELECT 1/0, vector(1)",
