@@ -797,6 +797,40 @@ fn clause_words_are_not_function_dependencies() {
     assert_eq!(code(&core, &mut s, "DROP FUNCTION \"values\""), "2BP01");
 }
 
+/// `INSERT ... SELECT` の中の `values(...)` 呼び出し（JOIN ON・HAVING・`SELECT ALL`）は、INSERT の
+/// VALUES 句と誤認されず依存として記録される（DROP FUNCTION が 2BP01 になる）。
+#[test]
+fn values_function_calls_inside_insert_select_are_dependencies() {
+    let (core, mut s, _g) = setup("sql67_std_values_in_insert_select");
+    for (i, body) in [
+        "INSERT INTO log SELECT values(a) FROM t",
+        "INSERT INTO log (n) SELECT values(a) FROM t",
+    ]
+    .iter()
+    .enumerate()
+    {
+        run(
+            &core,
+            &mut s,
+            "alice",
+            "CREATE FUNCTION \"values\"(x int) RETURNS int LANGUAGE sql AS $$ SELECT x $$",
+        );
+        run(
+            &core,
+            &mut s,
+            "alice",
+            &format!("CREATE FUNCTION vi{i}() RETURNS int BEGIN ATOMIC {body}; SELECT 1; END"),
+        );
+        assert_eq!(
+            code(&core, &mut s, "DROP FUNCTION \"values\""),
+            "2BP01",
+            "{body}"
+        );
+        run(&core, &mut s, "alice", &format!("DROP FUNCTION vi{i}"));
+        run(&core, &mut s, "alice", "DROP FUNCTION \"values\"");
+    }
+}
+
 fn run_or_err(core: &EngineCore, s: &mut SessionState, sql: &str) -> Result<(), &'static str> {
     core.execute_sql_in_session(&ctx("alice"), s, sql)
         .map(|_| ())

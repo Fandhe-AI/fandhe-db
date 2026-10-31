@@ -147,37 +147,61 @@ fn call_names(tokens: &[Token]) -> impl Iterator<Item = String> + '_ {
     })
 }
 
-/// 位置 `at` の `VALUES (` が行値の句（`INSERT INTO t [(列)] VALUES (`・`FROM (VALUES (`・
-/// `UNION VALUES (` 等）と構文位置で確認できるか。`statement_splitter` の共有判定は `VALUES` を式の先頭の
-/// 呼び出しと区別できないため常に呼び出し扱いにするので、ここで構文位置が確かな形だけを追加で除く
-/// （確認できない形は呼び出し＝依存として記録する側に倒す）。
+/// 位置 `at` の `VALUES (` が行値の句と、構文位置で厳密に確認できるか。確認できる形は次の 3 つだけで、
+/// それ以外は呼び出し（依存として記録＝fail-closed）として扱う。`statement_splitter` の共有判定は
+/// `VALUES` を式の先頭の呼び出しと区別できないため常に呼び出し扱いにするので、ここで追加で除く。
+///   - `INSERT INTO <表名> VALUES (`・`INSERT INTO <表名> (<列リスト>) VALUES (`（トークン位置で照合）
+///   - `FROM (VALUES (`・`JOIN (VALUES (`（開き括弧の直後）
+///   - `UNION|INTERSECT|EXCEPT [ALL] VALUES (`
 fn is_values_clause(tokens: &[Token], at: usize) -> bool {
-    if !matches!(tokens.get(at), Some(Token::Ident(w)) if w.eq_ignore_ascii_case("VALUES")) {
+    let word = |j: usize, ws: &[&str]| matches!(tokens.get(j), Some(Token::Ident(x)) if ws.iter().any(|w| x.eq_ignore_ascii_case(w)));
+    if !word(at, &["VALUES"]) {
         return false;
     }
-    let word = |j: usize, ws: &[&str]| matches!(tokens.get(j), Some(Token::Ident(x)) if ws.iter().any(|w| x.eq_ignore_ascii_case(w)));
     let Some(prev) = at.checked_sub(1) else {
         return false;
     };
-    match tokens.get(prev) {
-        // `INSERT INTO t VALUES (`・`INSERT INTO t (a, b) VALUES (`（対象表または列リストの直後）。
-        Some(Token::Ident(_) | Token::QuotedNull(_) | Token::Punct(')'))
-            if word(0, &["INSERT"])
-                && !word(prev, &["SELECT", "AND", "OR", "NOT", "IN", "WHERE"]) =>
-        {
-            true
+    // `INSERT INTO <表名>` の直後、または列リストの閉じ括弧の直後。
+    if word(0, &["INSERT"])
+        && word(1, &["INTO"])
+        && matches!(tokens.get(2), Some(Token::Ident(_) | Token::QuotedNull(_)))
+    {
+        if at == 3 {
+            return true;
         }
-        // `UNION [ALL] VALUES (`。
-        Some(Token::Ident(x)) => ["UNION", "INTERSECT", "EXCEPT", "ALL"]
+        if matches!(tokens.get(3), Some(Token::Punct('('))) {
+            let mut depth = 0usize;
+            for (j, t) in tokens.iter().enumerate().skip(3) {
+                match t {
+                    Token::Punct('(') => depth = depth.saturating_add(1),
+                    Token::Punct(')') => {
+                        depth = depth.saturating_sub(1);
+                        if depth == 0 {
+                            if j == prev {
+                                return true;
+                            }
+                            break;
+                        }
+                    }
+                    _ => {}
+                }
+            }
+        }
+    }
+    match tokens.get(prev) {
+        Some(Token::Punct('(')) => {
+            let before = prev.checked_sub(1);
+            matches!(
+                before.and_then(|p| tokens.get(p)),
+                Some(Token::Keyword(crate::sql::lexer::Keyword::From))
+            ) || before.is_some_and(|p| word(p, &["JOIN"]))
+        }
+        Some(Token::Ident(x)) if x.eq_ignore_ascii_case("ALL") => prev
+            .checked_sub(1)
+            .is_some_and(|p| word(p, &["UNION", "INTERSECT", "EXCEPT"])),
+        Some(Token::Ident(x)) => ["UNION", "INTERSECT", "EXCEPT"]
             .iter()
             .any(|w| x.eq_ignore_ascii_case(w)),
-        // `FROM (VALUES (`・`AS (VALUES (`・`JOIN (VALUES (`・`IN (VALUES (`。
-        Some(Token::Punct('(')) => {
-            matches!(
-                prev.checked_sub(1).and_then(|p| tokens.get(p)),
-                Some(Token::Keyword(crate::sql::lexer::Keyword::From))
-            ) || word(prev.saturating_sub(1), &["AS", "JOIN", "LATERAL", "IN"])
-        }
         _ => false,
     }
 }
@@ -288,5 +312,43 @@ impl EngineCore {
             key,
         }));
         Ok(deps)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::sql::lexer::tokenize;
+
+    fn values_calls(sql: &str) -> bool {
+        let tokens = tokenize(sql).expect("tokenize");
+        let found = call_names(&tokens).any(|n| n == "values");
+        found
+    }
+
+    /// `VALUES (` を句と確定できる構文位置（INSERT の表名・列リストの直後、`FROM (`・`JOIN (` の直後、
+    /// 集合演算の直後）だけが依存から除かれ、INSERT ... SELECT 内の呼び出しは記録される。
+    #[test]
+    fn values_clause_requires_a_confirmed_syntax_position() {
+        for clause in [
+            "INSERT INTO t VALUES (1)",
+            "INSERT INTO t (a, b) VALUES (1, 2)",
+            "SELECT a FROM (VALUES (1)) v",
+            "SELECT 1 UNION ALL VALUES (1)",
+            "SELECT 1 EXCEPT VALUES (1)",
+            "SELECT t.a FROM t JOIN (VALUES (1)) v ON t.a = v.column1",
+        ] {
+            assert!(!values_calls(clause), "{clause}");
+        }
+        for call in [
+            "INSERT INTO t SELECT a FROM t JOIN u ON values(1) = u.a",
+            "INSERT INTO t SELECT a FROM t GROUP BY a HAVING values(1) > 0",
+            "INSERT INTO t SELECT ALL values(1)",
+            "INSERT INTO t (a) SELECT values(1)",
+            "SELECT ALL values(1)",
+            "SELECT 1 WHERE x = values(1)",
+        ] {
+            assert!(values_calls(call), "{call}");
+        }
     }
 }
