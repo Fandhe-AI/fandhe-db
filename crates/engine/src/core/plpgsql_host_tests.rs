@@ -1627,10 +1627,6 @@ fn comparisons_keep_large_operand_types() {
         (1e300, "p >= 1e300", 1),
     ] {
         let src = format!("BEGIN IF {cmp} THEN RETURN 1; END IF; RETURN 0; END");
-        // 小数・指数のリテラルは従来経路のため、成否は 22003 以外であることだけを固定する。
-        if cmp.contains('e') {
-            continue;
-        }
         assert_eq!(run(&src, dbl.clone(), float(v)), want, "{cmp} {v:e}");
     }
     let bigint = SqlColumnTypeName::BigInt;
@@ -1667,5 +1663,145 @@ fn comparisons_keep_large_operand_types() {
             float(v),
         );
         assert_eq!(case, 0, "case double {v:e} vs 0");
+    }
+}
+
+/// 数値の比較は、全比較演算子（`<>`・`!=` を含む）と全リテラル形（小数・指数・符号付き）で、
+/// PostgreSQL の型昇格どおり（整数と numeric は numeric、double が絡めば double）に評価される。
+#[test]
+fn numeric_comparisons_follow_type_promotion_for_every_operator_and_literal() {
+    let (core, _g) = new_core(LedgerMode::Optional);
+    let c = ctx("t1");
+    let run = |cond: &str, ty: SqlColumnTypeName, arg: PlScalar| {
+        let src = format!("BEGIN IF {cond} THEN RETURN 1; END IF; RETURN 0; END");
+        as_i64(
+            &call(&src)
+                .param("p", ty, arg)
+                .autocommit(&core, &c)
+                .expect(cond),
+        )
+    };
+    let bigint = SqlColumnTypeName::BigInt;
+    let dbl = SqlColumnTypeName::Double;
+    // (条件, p = 2^53+1 の期待)
+    for (cond, want) in [
+        ("p <> 0", 1),
+        ("p != 0", 1),
+        ("p <> 9007199254740992", 1),
+        ("p != 9007199254740993", 0),
+        ("p <> 9007199254740993", 0),
+        ("p = 9007199254740993", 1),
+        ("p > 0.5", 1),
+        ("p < 0.5", 0),
+        ("p > 9007199254740992.5", 1),
+        ("p < 9007199254740993.5", 1),
+        ("p = 9007199254740993.0", 1),
+        ("p < 1e301", 1),
+        ("p > -1e301", 1),
+        ("p > 1e-50", 1),
+        ("p > -0.5", 1),
+        ("p >= 9007199254740993", 1),
+        ("p <= 9007199254740992", 0),
+        ("0.5 < p", 1),
+    ] {
+        assert_eq!(
+            run(cond, bigint.clone(), big((1i64 << 53) + 1)),
+            want,
+            "{cond}"
+        );
+    }
+    for v in [i64::MAX, i64::MIN] {
+        assert_eq!(run("p <> 0", bigint.clone(), big(v)), 1, "{v} <> 0");
+        assert_eq!(run("p != 0", bigint.clone(), big(v)), 1, "{v} != 0");
+        assert_eq!(
+            run("p > 0.5", bigint.clone(), big(v)),
+            i64::from(v > 0),
+            "{v} > 0.5"
+        );
+        assert_eq!(run("p < 1e301", bigint.clone(), big(v)), 1, "{v} < 1e301");
+        assert_eq!(run("p > -1e301", bigint.clone(), big(v)), 1, "{v} > -1e301");
+        assert_eq!(
+            run(&format!("p = {v}"), bigint.clone(), big(v)),
+            1,
+            "{v} = literal"
+        );
+    }
+    // double: 比較は double 精度（numeric リテラルは double へ変換して比較する）。
+    for (v, cond, want) in [
+        (1e300_f64, "p <> 0", 1),
+        (1e300, "p != 1e300", 0),
+        (1e300, "p > 0.5", 1),
+        (1e300, "p < 1e301", 1),
+        (1e300, "p = 1e300", 1),
+        (-1e300, "p < -0.5", 1),
+        (-1e300, "p > -1e301", 1),
+        (1e-50, "p > 0", 1),
+        (1e-50, "p < 0.5", 1),
+        (1e-50, "p = 1e-50", 1),
+        (1e-50, "p <> 1e-50", 0),
+        (1e-50, "p > 1e-51", 1),
+        (9007199254740993.0, "p = 9007199254740992", 1),
+    ] {
+        assert_eq!(
+            run(cond, dbl.clone(), float(v)),
+            want,
+            "double {v:e} {cond}"
+        );
+    }
+    // CASE の等値比較。
+    for v in [(1i64 << 53) + 1, i64::MAX, i64::MIN] {
+        let src =
+            "BEGIN CASE p WHEN 0 THEN RETURN 0; WHEN p THEN RETURN 1; ELSE RETURN 2; END CASE; END";
+        let out = call(src)
+            .param("p", bigint.clone(), big(v))
+            .autocommit(&core, &c);
+        assert_eq!(as_i64(&out.expect("case")), 1, "case {v}");
+    }
+}
+
+/// numeric 変数と小数・整数・指数リテラルの比較（厳密な十進比較。double とは混ぜない）。
+#[test]
+fn numeric_variable_comparisons_are_exact_decimal() {
+    let (core, _g) = new_core(LedgerMode::Optional);
+    let c = ctx("t1");
+    let d = |unscaled: i128, scale: u8| {
+        PlScalar::new(
+            Cell::Numeric(crate::numeric::Decimal::from_parts(unscaled, scale).expect("decimal")),
+            ColumnType::Numeric {
+                precision: 38,
+                scale,
+            },
+        )
+    };
+    let run = |cond: &str, arg: PlScalar| {
+        let src = format!("BEGIN IF {cond} THEN RETURN 1; END IF; RETURN 0; END");
+        as_i64(
+            &call(&src)
+                .param(
+                    "p",
+                    SqlColumnTypeName::Numeric {
+                        precision: 38,
+                        scale: 2,
+                    },
+                    arg,
+                )
+                .autocommit(&core, &c)
+                .expect(cond),
+        )
+    };
+    for (cond, want) in [
+        ("p = 1.25", 1),
+        ("p <> 1.25", 0),
+        ("p != 1.2", 1),
+        ("p > 1.2", 1),
+        ("p < 1.3", 1),
+        ("p > 1", 1),
+        ("p < 2", 1),
+        ("p = 1.250", 1),
+        ("p < 1e301", 1),
+        ("p > 1e-50", 1),
+        ("p > -1.25", 1),
+    ] {
+        assert_eq!(run(cond, d(125, 2)), want, "{cond}");
     }
 }

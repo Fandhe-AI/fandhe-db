@@ -29,6 +29,7 @@ use super::{
     is_partitioned_write, parsed_operation_id, session_time_zone_scope, EngineCore, ParsedSql,
 };
 use crate::catalog::{ColumnType, TableSchema};
+use crate::numeric::{self, Decimal};
 use crate::plpgsql::ast::{Body, DeclType, EmbeddedSql, SqlExpr, VarRole, VarSite};
 use crate::plpgsql::host::{
     PlHost, PlScalar, ResolvedType, RowDemand, SqlOutcome as HostOutcome, VarLookup,
@@ -218,15 +219,113 @@ enum Operand {
     Value(PlScalar),
 }
 
-/// 比較に使う数値（整数は i128 で厳密、浮動小数は f64）。
+/// 比較に使う数値。PostgreSQL の型昇格に合わせ、整数同士・整数と numeric・numeric 同士は厳密に、
+/// 浮動小数が絡むときは f64（double 精度）で比較する。
 #[derive(Clone, Copy)]
 enum Num {
     Int(i128),
+    Dec(Decimal),
     Float(f64),
+    /// `Decimal` に収まらない桁数の numeric リテラル（`1e301`・`1e-50` 等）の f64 近似。整数・
+    /// `Decimal` との比較は、符号だけで大小が決まる極端な大きさ・小ささのときに限って行う。
+    Wide(f64),
+}
+
+/// 符号付きの数値リテラル 1 個（`[Number]`・`[-, Number]`）を比較用の数値にする。整数形は i128、
+/// 小数・指数形は `Decimal`（桁が収まらなければ [`Num::Wide`]）。解釈できない形は `None`。
+fn literal_num(t: &[Token]) -> Option<Num> {
+    let (neg, text) = match t {
+        [Token::Number(n)] => (false, n.as_str()),
+        [Token::Punct('-'), Token::Number(n)] => (true, n.as_str()),
+        _ => return None,
+    };
+    if !lexer::is_single_number_literal(text) {
+        return None;
+    }
+    if text.bytes().all(|b| b.is_ascii_digit()) {
+        if let Ok(i) = text.parse::<i128>() {
+            return Some(Num::Int(if neg { -i } else { i }));
+        }
+    } else if let Ok(d) = numeric::parse_literal_exact(text) {
+        let u = if neg {
+            d.unscaled().checked_neg()?
+        } else {
+            d.unscaled()
+        };
+        return Decimal::from_parts(u, d.scale()).ok().map(Num::Dec);
+    }
+    let f = text.parse::<f64>().ok().filter(|f| f.is_finite())?;
+    Some(Num::Wide(if neg { -f } else { f }))
+}
+
+impl Num {
+    /// f64 への変換（double との比較用。numeric は十進表記からの丸めで PostgreSQL の変換と一致する）。
+    fn to_f64(self) -> Option<f64> {
+        match self {
+            Num::Int(i) => Some(i as f64),
+            Num::Dec(d) => d.to_string().parse::<f64>().ok(),
+            Num::Float(f) | Num::Wide(f) => Some(f),
+        }
+    }
+
+    /// 厳密な十進表現（整数・`Decimal`）。
+    fn to_decimal(self) -> Option<Decimal> {
+        match self {
+            Num::Int(i) => Decimal::from_parts(i, 0).ok(),
+            Num::Dec(d) => Some(d),
+            _ => None,
+        }
+    }
+
+    fn sign(self) -> std::cmp::Ordering {
+        match self {
+            Num::Int(i) => i.cmp(&0),
+            Num::Dec(d) => d.unscaled().cmp(&0),
+            Num::Float(f) | Num::Wide(f) => {
+                f.partial_cmp(&0.0).unwrap_or(std::cmp::Ordering::Equal)
+            }
+        }
+    }
+}
+
+/// 厳密な数値（整数・`Decimal`）と [`Num::Wide`] の比較。`Wide` が整数・`Decimal` の表現範囲を
+/// 十分に超える大きさ（|f| >= 1e39）なら符号で、十分に小さい（0 < |f| < 1e-38）なら相手の符号
+/// （0 のときは `Wide` の符号）で決まる。どちらでもない境界の値は `None`。
+fn cmp_exact_wide(exact: Num, wide: f64) -> Option<std::cmp::Ordering> {
+    use std::cmp::Ordering;
+    if wide.abs() >= 1e39 {
+        return Some(if wide > 0.0 {
+            Ordering::Less
+        } else {
+            Ordering::Greater
+        });
+    }
+    if wide != 0.0 && wide.abs() < 1e-38 {
+        return Some(match exact.sign() {
+            Ordering::Equal if wide > 0.0 => Ordering::Less,
+            Ordering::Equal => Ordering::Greater,
+            o => o,
+        });
+    }
+    None
+}
+
+/// 2 つの数値の大小（PostgreSQL の数値型昇格に沿う。解釈できない組は `None`）。
+fn cmp_num(l: Num, r: Num) -> Option<std::cmp::Ordering> {
+    match (l, r) {
+        (Num::Int(a), Num::Int(b)) => Some(a.cmp(&b)),
+        (Num::Float(_), _) | (_, Num::Float(_)) | (Num::Wide(_), Num::Wide(_)) => {
+            l.to_f64()?.partial_cmp(&r.to_f64()?)
+        }
+        (Num::Wide(w), e) => cmp_exact_wide(e, w).map(std::cmp::Ordering::reverse),
+        (e, Num::Wide(w)) => cmp_exact_wide(e, w),
+        (a, b) => Some(numeric::cmp_exact(&a.to_decimal()?, &b.to_decimal()?)),
+    }
 }
 
 impl Operand {
-    /// 値を保つ裸のリテラルのトークン列にする（`FROM` の無い `WHERE` の比較へ渡す形）。
+    /// 値を保つ裸のリテラルのトークン列にする（`FROM` の無い `WHERE` の比較へ渡す形。数値以外の比較と
+    /// 非対応の形のフォールバック専用。数値同士は [`native_compare`] が先に評価する）。
     fn into_bare_tokens(self) -> Result<Vec<Token>, SqlSurfaceError> {
         match self {
             Operand::Literal(t) => Ok(t),
@@ -236,47 +335,35 @@ impl Operand {
         }
     }
 
-    /// 整数・有限の浮動小数なら比較用の数値（numeric・小数リテラル・非有限値・数値以外は `None`）。
+    /// 数値オペランドなら比較用の数値（非有限の浮動小数・数値以外は `None`）。
     fn num(&self) -> Option<Num> {
         match self {
-            Operand::Literal(t) => match t.as_slice() {
-                [Token::Number(n)] if !n.is_empty() && n.bytes().all(|b| b.is_ascii_digit()) => {
-                    n.parse::<i128>().ok().map(Num::Int)
-                }
-                _ => None,
-            },
+            Operand::Literal(t) => literal_num(t),
             Operand::Value(v) => match &v.cell {
                 Cell::SignedInteger(i) => Some(Num::Int(i128::from(*i))),
                 Cell::Integer(u) => Some(Num::Int(i128::from(*u))),
                 Cell::Float(f) if f.is_finite() => Some(Num::Float(*f)),
+                Cell::Numeric(d) => Some(Num::Dec(*d)),
                 _ => None,
             },
         }
     }
 }
 
-/// 整数・浮動小数同士の比較を値のまま行う（`=`・`<`・`>`・`<=`・`>=`）。整数同士は厳密、浮動小数が
-/// 絡むときは f64（PostgreSQL の暗黙の型昇格と同じ）。numeric・小数リテラル・非有限値・数値以外は
-/// `None`（呼び出し側が従来の値のリテラル経由の比較へ回す）。
+/// 数値同士の比較を値のまま行う（`=`・`<`・`>`・`<=`・`>=`・`<>`／`!=`）。`FROM` の無い `SELECT` の
+/// 評価器は 2^53 以上の整数・値を正確に扱えない（どの書き方でも `22003`）ため、数値の比較は SQL を
+/// 経由せずここで PostgreSQL の型昇格どおりに決める。数値以外・非有限値・判定できない組は `None`
+/// （呼び出し側が従来の値のリテラル経由の比較へ回す）。
 fn native_compare(l: &Operand, op: &[Token], r: &Operand) -> Option<bool> {
     use std::cmp::Ordering;
-    let (l, r) = (l.num()?, r.num()?);
-    let ord = match (l, r) {
-        (Num::Int(a), Num::Int(b)) => a.cmp(&b),
-        (a, b) => {
-            let f = |n| match n {
-                Num::Int(i) => i as f64,
-                Num::Float(f) => f,
-            };
-            f(a).partial_cmp(&f(b))?
-        }
-    };
+    let ord = cmp_num(l.num()?, r.num()?)?;
     Some(match op {
         [Token::Punct('=')] => ord == Ordering::Equal,
         [Token::Punct('<')] => ord == Ordering::Less,
         [Token::Punct('>')] => ord == Ordering::Greater,
         [Token::Le] => ord != Ordering::Greater,
         [Token::Ge] => ord != Ordering::Less,
+        [Token::Punct('<'), Token::Punct('>')] => ord != Ordering::Equal,
         _ => return None,
     })
 }
@@ -423,9 +510,8 @@ impl<'a, 'e> CorePlHost<'a, 'e> {
                 "this condition form is not supported in PL/pgSQL",
             )),
             [t] if is_word(t, "NULL") => Ok(None),
-            [Token::Number(_) | Token::StringLiteral(_)] => {
-                Ok(Some(Operand::Literal(operand.to_vec())))
-            }
+            [Token::Number(_) | Token::StringLiteral(_)]
+            | [Token::Punct('-'), Token::Number(_)] => Ok(Some(Operand::Literal(operand.to_vec()))),
             [t] if is_word(t, "true") || is_word(t, "false") => {
                 Ok(Some(Operand::Literal(operand.to_vec())))
             }
@@ -690,8 +776,8 @@ impl PlHost for CorePlHost<'_, '_> {
                         let (Some(lv), Some(rv)) = (lv, rv) else {
                             return Ok(None);
                         };
-                        // 整数・浮動小数同士は評価済みの値のまま比較する（裸のリテラルへ戻すと大きな値が
-                        // 整数精度の検査で `22003` になる）。それ以外は値のリテラルに置き換えて比較する
+                        // 数値同士は評価済みの値のまま比較する（SQL へ戻すと、書き方によらず 2^53 以上の値が
+                        // `22003` になる）。それ以外（文字列・日時等）は値のリテラルに置き換えて比較する
                         // （`FROM` の無い `WHERE` は演算を含む式を受理しない）。
                         if let Some(b) = native_compare(&lv, op, &rv) {
                             return Ok(Some(b));
@@ -706,8 +792,10 @@ impl PlHost for CorePlHost<'_, '_> {
                 }
             }
         }
-        // `FROM` の無い `WHERE` の比較は `CAST` を受理しないため、値を保つ裸の数値で置換し直す
-        // （比較は値同士で行われ、宣言型は結果へ伝わらない）。
+        // 単純比較・`IS NULL` 以外の形（複合条件・述語・真偽値の式）の最終手段。`FROM` の無い `WHERE` は
+        // 比較に出る `CAST` の結果を受理しない場合があるため値を保つ裸の数値で置換し直す。この `WHERE` は
+        // 比較 1 個の形しか受理せず（`AND`・`OR`・`BETWEEN`・`IN` は `0A000`）、また SQL の評価器は 2^53
+        // 以上の値を `CAST` 形でも裸でも `22003` にするため、ここでの置換形は精度の可否を変えない。
         let bare = subst::substitute(
             &expr.tokens,
             &expr.var_refs,
