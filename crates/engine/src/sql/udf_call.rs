@@ -2477,7 +2477,7 @@ pub struct UdfRegistry {
     /// [`is_name_taken`] を通して行う）。
     wasm: std::collections::BTreeMap<String, Arc<dyn WasmUdfBackend>>,
     /// SQL-66（Issue #1921）: UDF カタログからロードした宣言的 UDF の名前（小文字化済みのキー）。
-    /// セッション内で作った定義と区別するための出所（provenance）で、`DROP FUNCTION` の権限判定と
+    /// セッション内で作った定義と区別するための出所（provenance）で、置換の可否判定と
     /// refresh 時の入れ替え（カタログ由来だけを消して入れ直す）に使う。
     catalog_names: std::collections::BTreeSet<String>,
     /// カタログ由来の登録を束縛したテナント（scope）。refresh で ctx のテナントが異なれば
@@ -2535,8 +2535,7 @@ impl UdfRegistry {
         a || b
     }
 
-    /// `name` の登録が UDF カタログ由来か（`sql::udf_ddl` が権限の無いセッションの `DROP FUNCTION` を
-    /// `42501` にするかの判定に使う）。
+    /// `name` の登録が UDF カタログ由来か（非カタログ定義による置換の拒否・ロード時の衝突判定に使う）。
     pub(crate) fn is_catalog_origin(&self, name: &str) -> bool {
         self.catalog_names.contains(&name.to_ascii_lowercase())
     }
@@ -2611,7 +2610,7 @@ pub fn define_function(
 }
 
 /// [`define_function`] の型注釈つき版（SQL-66 (1)・TASK-309・Issue #1915）。
-/// `core.rs::EngineCore::execute_sql_in_session` の `CreateFunction` 分岐（DDL 権限なしのセッション）が呼ぶ。
+/// `core.rs::EngineCore::execute_sql_in_session` の `CreateFunction` 分岐が呼ぶ（DDL 権限なしは分岐前に `42501`）。
 /// `param_types` は `params` と同じ長さでなければならず（不一致は `42601`）、型を持つ
 /// パラメータは式の型を持つ型（[`crate::sql::cast::CastType::expr_type`] が `Some`）に
 /// 限る（対応する要素型の無い配列は定義時に `0A000`。呼び出しまで遅らせない）。
@@ -2655,7 +2654,7 @@ pub fn define_function_with_signature(
 /// [`define_function_with_signature`] の件数上限指定版（SQL-66 (5)・Issue #1922）。`max_functions` は
 /// 起動時設定（`crate::function_limits::FunctionLimits`）で、ハード上限 [`MAX_SESSION_UDFS`] で
 /// 飽和させる（設定で上げられない）。判定順は既存のまま（重複 `42723` が上限 `54000` より先）。
-/// `core.rs::EngineCore::execute_sql_in_session` の `CreateFunction` 分岐（権限なしのセッション内経路）が呼ぶ。
+/// `core.rs::EngineCore::execute_sql_in_session` の `CreateFunction` 分岐が RETURNS 付き定義の事前検証（権限ありのみ）で呼ぶ。
 pub(crate) fn define_function_with_signature_capped(
     registry: &mut UdfRegistry,
     name: &str,
@@ -2730,7 +2729,7 @@ fn prepare_function_with_signature(
 
 /// `CREATE OR REPLACE FUNCTION` の検証部（レジストリは変更しない。SQL-66 (2)・Issue #1917）。
 /// 呼び出し元は `sql::udf_ddl`（DDL 権限のあるセッション。`allow_catalog_origin = true`）と
-/// [`define_or_replace_function_with_signature`]（権限の無いセッション。`false`）。
+/// [`define_or_replace_function_with_signature`]（事前検証の複製。同じく権限検査済みで `true`）。
 ///
 /// 判定順: 予約・組み込み名 `42723` → WASM UDF と同名 `42723` → 同名の宣言的 UDF が無ければ新規作成と
 /// 同じ検証（容量上限を含む）→ 引数の数・型注釈が違えば `42723`（多重定義は未対応）→ 引数名・戻り値型
@@ -2911,8 +2910,9 @@ fn expr_reaches_function(
     }
 }
 
-/// `CREATE OR REPLACE FUNCTION` をセッションのレジストリだけへ適用する（DDL 権限の無いセッション用。
-/// SQL-66 (2)・Issue #1917）。[`prepare_function_replacement`]（`allow_catalog_origin = false`）で検証
+/// `CREATE OR REPLACE FUNCTION` をレジストリの複製へ適用する（権限ありセッションの RETURNS 付き定義の事前検証用。
+/// SQL-66 (2)・Issue #1917）。呼び出し元は権限検査済みのため [`prepare_function_replacement`]
+/// （`allow_catalog_origin = true`。カタログ由来の定義の置換を `42501` にしない）で検証
 /// してから [`commit_function_definition`] で上書きし、失敗時は `registry` を変更しない。
 /// `core.rs::EngineCore::execute_validated_in_session` の `CreateFunction` 分岐が呼ぶ。
 pub(crate) fn define_or_replace_function_with_signature(
@@ -2931,7 +2931,7 @@ pub(crate) fn define_or_replace_function_with_signature(
         param_types,
         return_type,
         body,
-        false,
+        true,
         max_functions,
     )?;
     commit_function_definition(registry, prepared);

@@ -1,9 +1,10 @@
 //! UDF 件数上限の起動時設定と DDL 権限の整合の結合テスト（Issue #1922、
 //! 対象ビヘイビア: SQL-66 (5)・関連 SQL-46・SQL-9 のポインタ。設計記録: `docs/design/udf-catalog.md`）。
 //!
-//! 固定する契約: 設定した上限が権限あり（カタログ）・権限なし（セッション内）の両経路で効く／
-//! 件数はテナントごと／重複 `42723` が上限 `54000` より先／上限を下げて再オープンしても既存の
-//! 関数はロードされ呼べる／権限の無いセッションはカタログに書かず、カタログ由来の関数を消せない。
+//! 固定する契約: 設定した上限が権限ありのカタログ経路で効く（既定は 64）／件数はテナントごと／
+//! 重複 `42723` が上限 `54000` より先／上限を下げて再オープンしても既存の関数はロードされ呼べる／
+//! 権限の無いセッションの `CREATE`（`OR REPLACE`・型付き引数・RETURNS を含む）と `DROP FUNCTION` は
+//! カタログにもセッション内レジストリにも触れず `42501`（保存先の振り分けより前に拒否）。
 
 use engine::core::EngineCore;
 use engine::function_limits::FunctionLimits;
@@ -81,24 +82,17 @@ fn configured_limit_applies_to_catalog_path_per_tenant() {
     assert_eq!(code(&core, "bob", &mut b, &create(3)), "54000");
 }
 
-/// T2: 権限なし（セッション内）の経路にも同じ上限が効く。既定は従来どおり 64。
+/// T2: 既定の上限は 64（設定なしの `EngineCore`）。
 #[test]
-fn configured_limit_applies_to_session_path_and_default_is_64() {
-    let path = unique_db_path("sql66-limit-session");
+fn default_limit_is_64() {
+    let path = unique_db_path("sql66-limit-default");
     let _g = CleanupGuard(path.clone());
-    {
-        let core = open(&path, 2);
-        let mut s = session(false);
-        ok(&core, "alice", &mut s, &create(1));
-        ok(&core, "alice", &mut s, &create(2));
-        assert_eq!(code(&core, "alice", &mut s, &create(3)), "54000");
-    }
     let core = EngineCore::from_storage(
         Storage::open(&path).expect("open"),
         Box::new(CpuScalarProvider),
     )
     .with_ledger_mode(LedgerMode::CompareOnlyWithoutLedger);
-    let mut s = session(false);
+    let mut s = session(true);
     for n in 0..64 {
         ok(&core, "alice", &mut s, &create(n));
     }
@@ -111,12 +105,9 @@ fn duplicate_is_reported_before_limit() {
     let path = unique_db_path("sql66-limit-order");
     let _g = CleanupGuard(path.clone());
     let core = open(&path, 1);
-    for ddl in [true, false] {
-        let tenant = if ddl { "alice" } else { "carol" };
-        let mut s = session(ddl);
-        ok(&core, tenant, &mut s, &create(1));
-        assert_eq!(code(&core, tenant, &mut s, &create(1)), "42723");
-    }
+    let mut s = session(true);
+    ok(&core, "alice", &mut s, &create(1));
+    assert_eq!(code(&core, "alice", &mut s, &create(1)), "42723");
 }
 
 /// T4: 上限を下げて再オープンしても既存の関数はロードされ呼べる。新規作成だけが拒否される。
@@ -162,29 +153,62 @@ fn lowering_the_limit_keeps_existing_functions_usable() {
     ok(&core, "alice", &mut s, &create(4));
 }
 
-/// T5: 権限の無いセッションはカタログに書かず、カタログ由来の関数を消せない（42501）。
+/// T5: 権限の無いセッションの CREATE／CREATE OR REPLACE／型付き引数／RETURNS／DROP はすべて `42501`
+/// で、カタログ・セッション内レジストリ・件数のいずれも変わらない（受け入れ条件「権限なしは拒否」）。
+/// 型付き引数と RETURNS の永続化（#2798）が無くても、権限検査は保存先の振り分けより前に効く。
 #[test]
-fn session_without_permission_cannot_change_the_catalog() {
+fn session_without_permission_is_rejected_and_nothing_changes() {
     let path = unique_db_path("sql66-limit-perm");
     let _g = CleanupGuard(path.clone());
-    {
-        let core = open(&path, 2);
-        let mut d = session(true);
-        ok(&core, "alice", &mut d, &create(1));
-        let mut s = session(false);
-        core.load_session_udfs(&ctx("alice"), &mut s)
-            .expect("load session udfs");
-        ok(&core, "alice", &mut s, &create(2));
-        assert_eq!(code(&core, "alice", &mut s, "DROP FUNCTION f1"), "42501");
-    }
-    // f2（権限なしで作成）は永続化されていない: 権限ありの再オープン後に作成できる。
     let core = open(&path, 2);
     let mut d = session(true);
-    core.load_session_udfs(&ctx("alice"), &mut d)
+    ok(&core, "alice", &mut d, &create(1));
+    let mut s = session(false);
+    core.load_session_udfs(&ctx("alice"), &mut s)
         .expect("load session udfs");
-    ok(&core, "alice", &mut d, &create(2));
-    // f1 は残っている。
-    assert_eq!(code(&core, "alice", &mut d, &create(1)), "42723");
+    assert_eq!(s.udfs().len(), 1);
+    for sql in [
+        create(2),
+        "CREATE OR REPLACE FUNCTION f2(x) AS x + 2".to_string(),
+        "CREATE OR REPLACE FUNCTION f1(x) AS x + 100".to_string(),
+        "CREATE FUNCTION f3(x integer) AS x + 3".to_string(),
+        "CREATE OR REPLACE FUNCTION f3(x integer) AS x + 3".to_string(),
+        "CREATE FUNCTION f4() RETURNS integer AS 4".to_string(),
+        "DROP FUNCTION f1".to_string(),
+        "DROP FUNCTION IF EXISTS f1".to_string(),
+        "DROP FUNCTION IF EXISTS never_defined".to_string(),
+        "DROP FUNCTION never_defined".to_string(),
+    ] {
+        assert_eq!(code(&core, "alice", &mut s, &sql), "42501", "{sql}");
+        assert_eq!(s.udfs().len(), 1, "registry must not change: {sql}");
+    }
+    // カタログ: f1 は残り、件数は 1 のまま（上限 2 のもとで 1 件だけ追加できる）。
+    let mut d2 = session(true);
+    core.load_session_udfs(&ctx("alice"), &mut d2)
+        .expect("load session udfs");
+    assert_eq!(d2.udfs().len(), 1);
+    ok(&core, "alice", &mut d2, &create(2));
+    assert_eq!(code(&core, "alice", &mut d2, &create(3)), "54000");
+    assert_eq!(code(&core, "alice", &mut d2, &create(1)), "42723");
+}
+
+/// T5b: 権限の無いセッションは明示トランザクション内でも `42501`（`0A000` より先に権限を検査する）。
+#[test]
+fn create_and_drop_in_explicit_transaction_without_permission_are_42501() {
+    let path = unique_db_path("sql66-limit-perm-txn");
+    let _g = CleanupGuard(path.clone());
+    let core = open(&path, 2);
+    let mut s = session(false);
+    let alice = ctx("alice");
+    for sql in [create(1), "DROP FUNCTION f1".to_string()] {
+        let mut txn = core.new_session_transaction();
+        core.execute_sql_in_txn(&alice, &mut s, &mut txn, "BEGIN")
+            .expect("begin");
+        let err = core
+            .execute_sql_in_txn(&alice, &mut s, &mut txn, &sql)
+            .expect_err("rejected");
+        assert_eq!(err.wire_code(), "42501", "{sql}");
+    }
 }
 
 /// T6: 権限ありの明示トランザクション内の CREATE FUNCTION は上限の設定に関係なく 0A000。

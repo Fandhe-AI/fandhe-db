@@ -160,6 +160,7 @@ fn wasm_call_in_result_column_matches_independent_oracle_and_declarative_udf() {
     let (core, _guard) = new_core_with_docs();
     let ctx = PolicyContext::new("tenant-a").expect("valid tenant");
     let mut session = SessionState::default();
+    session.allow_ddl();
     let call_count = Arc::new(AtomicUsize::new(0));
     session
         .register_wasm_udf("norm_scale_wasm", mock_backend(&call_count))
@@ -489,6 +490,7 @@ fn registering_wasm_udf_with_name_used_by_declarative_udf_is_rejected() {
     let (core, _guard) = new_core_with_docs();
     let ctx = PolicyContext::new("tenant-a").expect("valid tenant");
     let mut session = SessionState::default();
+    session.allow_ddl();
     core.execute_sql_in_session(
         &ctx,
         &mut session,

@@ -4,7 +4,7 @@
 //! 役割: セッションの [`UdfRegistry`] だけにあった UDF 定義を UDF カタログ（`catalog::function`）へ
 //! 書く・消す実行本体と、[`CatalogError`] → SQLSTATE の写像を担う。呼び出し元は `core.rs` の
 //! `execute_validated_in_session`（`CREATE FUNCTION`）と `ParsedSql::DropFunction` 腕で、どちらも
-//! `session.ddl_allowed()` を満たす場合だけここへ来る（権限ゲートの 42501 化は #1922）。
+//! `require_ddl_permission` を通った場合だけここへ来る（権限なしは `42501`・#1922）。
 //!
 //! 順序の契約: 検証（レジストリ不変）→ カタログの単一 write txn・1 回の commit → commit 成功後に
 //! レジストリへ反映。カタログで失敗したらセッションは変わらない。クラッシュしても commit 境界で
@@ -162,11 +162,11 @@ pub(crate) fn execute_create_or_replace_function_persistent(
     Ok(())
 }
 
-/// `DROP FUNCTION [IF EXISTS] ... [CASCADE | RESTRICT]` を実行する。DDL 権限のあるセッションは
-/// カタログ（自テナントの scope）から削除し、いずれのセッションもレジストリから削除する。
+/// `DROP FUNCTION [IF EXISTS] ... [CASCADE | RESTRICT]` を実行する。DDL 権限の無いセッションは
+/// 何も見ず `42501`（`IF EXISTS` でも同じ。存在情報を出さない）。権限のあるセッションはカタログ
+/// （自テナントの scope）から削除し、レジストリからも削除する。
 /// **どちらでも消えなかった場合だけ** `42883`（存在情報を出さない固定文言）。`IF EXISTS` なら代わりに
-/// `skipped` の成功を返す（他テナントの定義・不在はどちらも同じ応答）。権限の無いセッションはカタログを
-/// 見ない。カタログ由来の定義を権限の無いセッションが消そうとすると、`IF EXISTS` でも `42501`。
+/// `skipped` の成功を返す（他テナントの定義・不在はどちらも同じ応答）。
 /// 依存トリガは `RESTRICT`（既定）なら `2BP01`、`CASCADE` なら関数と同じ write txn で連鎖削除する。
 ///
 /// 型の並びが指定されたときは、カタログ上の定義の引数の数と（型注釈のある引数の）型が一致する
@@ -177,10 +177,11 @@ pub(crate) fn execute_drop_function(
     session: &mut SessionState,
     stmt: &ValidatedDropFunction,
 ) -> Result<DropFunctionOutcome, SqlSurfaceError> {
+    // 権限検査は保存先（カタログ／セッション内）の振り分けより前。`IF EXISTS` でも `42501` にして、
+    // 権限の無いセッションに対象の有無を区別させない（SQL-66・Issue #1922・fail-closed）。
+    crate::sql::ddl::require_ddl_permission(session)?;
     let mut removed = false;
-    if session.ddl_allowed() {
-        removed |= drop_from_catalog(storage, tenant_id, stmt)?;
-    }
+    removed |= drop_from_catalog(storage, tenant_id, stmt)?;
     // 型の並びがある場合、セッション内の定義（型注釈なし）は引数の数で照合する。
     // WASM UDF は (vector, scalar) の固定 2 引数なので、同じ名前空間を共有する
     // `UdfRegistry::remove` が両表を消す設計に合わせて判定にも含める。
@@ -192,11 +193,6 @@ pub(crate) fn execute_drop_function(
             || udfs.get_wasm(&stmt.name).is_some_and(|_| arity_ok(2))
     };
     if session_match {
-        // カタログ由来の定義は権限の無いセッションからは消せない（SQL-66・Issue #1921）。呼べる関数に
-        // 対して 42883 を返すと事実と食い違うため 42501 にする。セッション内だけの登録は従来どおり消せる。
-        if !session.ddl_allowed() && session.udfs().is_catalog_origin(&stmt.name) {
-            return Err(SqlSurfaceError::InsufficientPrivilege);
-        }
         removed |= session.udfs_mut().remove(&stmt.name);
     }
     if removed {

@@ -444,6 +444,7 @@ fn create_function_still_works() {
     let _guard = CleanupGuard(path);
     let alice = ctx("alice");
     let mut session = SessionState::default();
+    session.allow_ddl();
     let outcome = core
         .execute_sql_in_session_legacy(&alice, &mut session, "CREATE FUNCTION double(x) AS x + x")
         .expect("CREATE FUNCTION must still work without DDL privilege");

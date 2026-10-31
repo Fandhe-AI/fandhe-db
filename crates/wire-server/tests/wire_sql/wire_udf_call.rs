@@ -72,7 +72,7 @@ fn new_core_with_docs() -> (Arc<EngineCore>, temp_db::CleanupGuard) {
 fn wire_udf_call_define_then_use_in_result_column_succeeds() {
     let (core, _guard) = new_core_with_docs();
     let users_path = write_user_store_file(&[("alice", "tenant-a", "pw-alice")]);
-    let addr = spawn_server_with_engine(&users_path, core);
+    let addr = spawn_server_with_engine_ddl_users(&users_path, core, &["alice"]);
     let mut stream = authenticate_to_ready_for_query(addr, "alice", "pw-alice");
 
     send_simple_query(
@@ -119,7 +119,7 @@ fn wire_udf_call_define_then_use_in_result_column_succeeds() {
 fn wire_udf_call_use_in_where_clause_succeeds() {
     let (core, _guard) = new_core_with_docs();
     let users_path = write_user_store_file(&[("alice", "tenant-a", "pw-alice")]);
-    let addr = spawn_server_with_engine(&users_path, core);
+    let addr = spawn_server_with_engine_ddl_users(&users_path, core, &["alice"]);
     let mut stream = authenticate_to_ready_for_query(addr, "alice", "pw-alice");
 
     send_simple_query(
@@ -186,7 +186,7 @@ fn wire_udf_call_undefined_function_is_rejected_and_connection_survives() {
 fn wire_udf_call_invalid_definition_is_rejected_without_partial_registration() {
     let (core, _guard) = new_core_with_docs();
     let users_path = write_user_store_file(&[("alice", "tenant-a", "pw-alice")]);
-    let addr = spawn_server_with_engine(&users_path, core);
+    let addr = spawn_server_with_engine_ddl_users(&users_path, core, &["alice"]);
     let mut stream = authenticate_to_ready_for_query(addr, "alice", "pw-alice");
 
     send_simple_query(
@@ -206,33 +206,59 @@ fn wire_udf_call_invalid_definition_is_rejected_without_partial_registration() {
     read_ready_for_query(&mut stream);
 }
 
-/// UDF 登録はセッション（接続）境界を越えて漏れない: 接続 1 で登録した関数を
-/// 接続 2 から呼び出すと未定義関数として `42883` で拒否される
-/// （`tests/sql_udf_call.rs::udf_defined_in_one_session_is_not_visible_from_another_session`
-/// の同型確認）。
+/// SQL-66（Issue #1922）以降、UDF は DDL 権限のあるユーザーがテナントのカタログへ書く永続定義で、
+/// 同じテナントの別接続からは見える（旧 SQL-9 のセッション限定の契約からの変更）。守る境界はテナント間の
+/// 不可視で、別テナントの接続からの呼び出しは不在と同じ `42883` になる
+/// （`tests/sql_udf_call.rs::udf_defined_by_one_tenant_is_not_visible_from_another_tenant` の同型確認）。
 #[test]
-fn wire_udf_call_registration_does_not_leak_across_connections() {
+fn wire_udf_call_registration_does_not_leak_across_tenants() {
     let (core, _guard) = new_core_with_docs();
-    let users_path = write_user_store_file(&[("alice", "tenant-a", "pw-alice")]);
-    let addr = spawn_server_with_engine(&users_path, core);
+    let users_path = write_user_store_file(&[
+        ("alice", "tenant-a", "pw-alice"),
+        ("bob", "tenant-b", "pw-bob"),
+    ]);
+    let addr = spawn_server_with_engine_ddl_users(&users_path, core, &["alice"]);
 
     let mut conn1 = authenticate_to_ready_for_query(addr, "alice", "pw-alice");
     send_simple_query(
         &mut conn1,
-        "CREATE FUNCTION only_in_conn1(v) AS vec_norm(v)",
+        "CREATE FUNCTION only_in_tenant_a(v) AS vec_norm(v)",
     );
     let tag = read_command_complete(&mut conn1);
     assert_eq!(tag, "CREATE FUNCTION");
     read_ready_for_query(&mut conn1);
 
-    let mut conn2 = authenticate_to_ready_for_query(addr, "alice", "pw-alice");
+    let mut conn2 = authenticate_to_ready_for_query(addr, "bob", "pw-bob");
     send_simple_query(
         &mut conn2,
-        "SELECT id, only_in_conn1(embedding) FROM docs \
+        "SELECT id, only_in_tenant_a(embedding) FROM docs \
          ORDER BY embedding <=> '[3.0,4.0,0.0]' LIMIT 3",
     );
     expect_error_response_with_sqlstate(&mut conn2, "42883");
     read_ready_for_query(&mut conn2);
+}
+
+/// SQL-66（Issue #1922）: DDL 権限の無いユーザー `carol` の `CREATE [OR REPLACE] FUNCTION`（型付き引数を
+/// 含む）と `DROP FUNCTION`（`IF EXISTS` を含む）は `42501`。接続は生き残り、関数は何も登録されない。
+#[test]
+fn wire_create_and_drop_function_without_ddl_permission_are_42501() {
+    let (core, _guard) = new_core_with_docs();
+    let addr = spawn_server_with_ddl_user(core);
+    let mut carol = authenticate_to_ready_for_query(addr, "carol", "pw-carol");
+    for sql in [
+        "CREATE FUNCTION dbl(x) AS x * 2",
+        "CREATE OR REPLACE FUNCTION dbl(x) AS x * 2",
+        "CREATE FUNCTION typed(x integer) AS x * 2",
+        "DROP FUNCTION dbl",
+        "DROP FUNCTION IF EXISTS dbl",
+    ] {
+        send_simple_query(&mut carol, sql);
+        expect_error_response_with_sqlstate(&mut carol, "42501");
+        read_ready_for_query(&mut carol);
+    }
+    send_simple_query(&mut carol, CALL_DBL);
+    expect_error_response_with_sqlstate(&mut carol, "42883");
+    read_ready_for_query(&mut carol);
 }
 
 /// SQL-66（Issue #1920）: DDL 実行権限のあるユーザーの `CREATE FUNCTION`／`DROP FUNCTION` は

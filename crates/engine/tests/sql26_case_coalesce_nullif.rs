@@ -449,6 +449,7 @@ fn case_with_only_null_branches_is_rejected_with_0a000() {
 fn defining_a_udf_named_coalesce_is_rejected() {
     let (core, _guard) = new_core_with_docs();
     let mut session = SessionState::default();
+    session.allow_ddl();
     let err = core
         .execute_sql_in_session(&ctx(), &mut session, "CREATE FUNCTION coalesce(x) AS x")
         .unwrap_err();

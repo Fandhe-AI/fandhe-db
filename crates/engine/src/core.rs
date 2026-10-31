@@ -7135,8 +7135,8 @@ impl EngineCore {
                 let outcome = crate::sql::ddl::execute_drop_sequence(&self.storage, stmt)?;
                 Ok(crate::sql::SqlOutcome::DropSequence(outcome))
             }
-            // SQL-66（Issue #1920）: 権限ゲートは置かない（権限の無いセッションはセッション内の定義だけを
-            // 消せる。CREATE FUNCTION と対称。42501 化は #1922）。カタログは DDL 権限ありのときだけ触る。
+            // SQL-66（Issue #1920・#1922）: 権限ゲート（`42501`）は `execute_drop_function` の先頭にあり、
+            // カタログにもレジストリにも触れる前に権限の無いセッションを拒否する（CREATE FUNCTION と対称）。
             ParsedSql::DropFunction(stmt) => {
                 let outcome = crate::sql::udf_ddl::execute_drop_function(
                     &self.storage,
@@ -7707,32 +7707,21 @@ impl EngineCore {
                 | Statement::SetSearchPath { .. }
                 | Statement::ShowSearchPath),
             ) => self.execute_validated_in_session(ctx, session, stmt.clone()),
-            // SQL-66（Issue #1920）: DDL 権限のあるセッションの `CREATE FUNCTION` は UDF カタログへ書く
-            // 永続 DDL のため、ROLLBACK で取り消せない書き込みを明示トランザクションの中で行わない
-            // （他の DDL と同じ `0A000`）。権限の無いセッションはセッション内だけの登録で、ROLLBACK で
-            // `session_at_begin` へ戻るため従来どおり通す。
-            ParsedSql::Statement(stmt @ Statement::CreateFunction { .. }) => {
-                if session.ddl_allowed() {
-                    Err(SqlSurfaceError::feature_not_supported(
-                        "CREATE [OR REPLACE] FUNCTION is not supported inside a transaction block",
-                    ))
-                } else {
-                    self.execute_validated_in_session(ctx, session, stmt.clone())
-                }
+            // SQL-66（Issue #1920・#1922）: `CREATE FUNCTION` は DDL 権限が無ければ保存先（カタログ／
+            // セッション内）の振り分けより前に `42501` で拒否する（fail-closed）。権限のあるセッションは
+            // UDF カタログへ書く永続 DDL のため、ROLLBACK で取り消せない書き込みを明示トランザクションの
+            // 中で行わない（他の DDL と同じ `0A000`）。
+            ParsedSql::Statement(Statement::CreateFunction { .. }) => {
+                crate::sql::ddl::require_ddl_permission(session)?;
+                Err(SqlSurfaceError::feature_not_supported(
+                    "CREATE [OR REPLACE] FUNCTION is not supported inside a transaction block",
+                ))
             }
-            ParsedSql::DropFunction(_) if session.ddl_allowed() => {
+            ParsedSql::DropFunction(_) => {
+                crate::sql::ddl::require_ddl_permission(session)?;
                 Err(SqlSurfaceError::feature_not_supported(
                     "DROP FUNCTION is not supported inside a transaction block",
                 ))
-            }
-            ParsedSql::DropFunction(stmt) => {
-                let outcome = crate::sql::udf_ddl::execute_drop_function(
-                    &self.storage,
-                    ctx.tenant_id(),
-                    session,
-                    stmt,
-                )?;
-                Ok(crate::sql::SqlOutcome::DropFunction(outcome))
             }
             // 検索・集計・広域取得・`EXPLAIN`・JOIN・評価後射影形ビュー・集合演算はすべて
             // 同じ読み取り経路へ入る（Issue #1179・#1192・#1353）。dirty テーブルの有無・
@@ -9126,9 +9115,9 @@ impl EngineCore {
             // 「部分更新＝黙った既定化を防ぐ」方針）。
             //
             // Issue #1920（SQL-66）: DDL 実行権限のあるセッションでは、検証 → UDF カタログへの書き込み
-            // （単一 write txn・1 回の commit）→ レジストリへの登録の順で永続化する。権限の無いセッションは
-            // 従来どおりセッション内だけに登録し、カタログには触れない（権限なしの CREATE は永続化されない。
-            // セッション内経路の撤去は型付き引数・RETURNS の永続化が前提のため未実施。docs/design/udf-catalog.md）。
+            // （単一 write txn・1 回の commit）→ レジストリへの登録の順で永続化する。Issue #1922: 権限の無い
+            // セッションは保存先の振り分けより前に `42501`（セッション限定の登録経路は無い。
+            // 型付き引数・RETURNS の永続化は #2798。docs/design/udf-catalog.md）。
             //
             // Issue #1915（SQL-66 (1)）: 型注釈つきの定義は、カタログへの型の永続化とロード側の
             // 復元（`udf_load` は型注釈つきの行を読み飛ばす）が揃うまで、永続化経路では `0A000` で
@@ -9146,7 +9135,10 @@ impl EngineCore {
                 body,
                 body_source,
             } => {
-                if session.ddl_allowed() {
+                // SQL-66（Issue #1922）: 権限検査は保存先の振り分け・本体検証より前に行う。権限の無い
+                // セッションはカタログにもセッション内レジストリにも触れず `42501` になる。
+                crate::sql::ddl::require_ddl_permission(session)?;
+                {
                     // Issue #1916: RETURNS 付きは永続化の前に、非 DDL セッションと同じ検証（本体の型検査）を
                     // レジストリの複製に対して行う。型の不一致は権限によらず `42P13` になり、
                     // 検証を通った定義だけが下の `0A000`（未対応の永続化）に到達する。
@@ -9209,26 +9201,6 @@ impl EngineCore {
                             self.function_limits.max_functions(),
                         )?;
                     }
-                } else if or_replace {
-                    crate::sql::udf_call::define_or_replace_function_with_signature(
-                        session.udfs_mut(),
-                        &name,
-                        &params,
-                        &param_types,
-                        return_type.as_ref(),
-                        &body,
-                        self.function_limits.max_functions(),
-                    )?;
-                } else {
-                    crate::sql::udf_call::define_function_with_signature_capped(
-                        session.udfs_mut(),
-                        &name,
-                        &params,
-                        &param_types,
-                        return_type.as_ref(),
-                        &body,
-                        self.function_limits.max_functions(),
-                    )?;
                 }
                 Ok(crate::sql::SqlOutcome::CreateFunction { name })
             }

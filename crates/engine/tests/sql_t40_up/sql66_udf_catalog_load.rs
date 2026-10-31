@@ -125,8 +125,8 @@ fn other_session_sees_function_and_other_tenant_does_not() {
     assert!(!m.contains("alice") && !m.contains('#'), "{m}");
 }
 
-/// カタログ由来の関数は権限の無いセッションから DROP できず（42501）、同名の CREATE は 42723。
-/// セッション内だけの関数は従来どおり作成・削除できる。
+/// カタログ由来の関数は権限の無いセッションから DROP できず（42501）、CREATE も 42501（権限検査が
+/// 重複判定より先。SQL-66・Issue #1922）。ロード済みの関数の呼び出しは権限によらず可能。
 #[test]
 fn catalog_origin_function_cannot_be_dropped_without_ddl_permission() {
     let path = unique_db_path("sql66-load-privilege");
@@ -139,11 +139,13 @@ fn catalog_origin_function_cannot_be_dropped_without_ddl_permission() {
     assert_eq!(code(&core, "alice", &mut b, "DROP FUNCTION dbl"), "42501");
     assert_eq!(
         code(&core, "alice", &mut b, "CREATE FUNCTION dbl(x) AS x"),
-        "42723"
+        "42501"
+    );
+    assert_eq!(
+        code(&core, "alice", &mut b, "CREATE FUNCTION local(x) AS x + 1"),
+        "42501"
     );
     assert!(call(&core, "alice", &mut b, CALL_DBL).contains("10"));
-    ok(&core, "alice", &mut b, "CREATE FUNCTION local(x) AS x + 1");
-    ok(&core, "alice", &mut b, "DROP FUNCTION local");
 }
 
 /// 呼び出し先を DROP して作り直しても（呼び出し先の id の方が大きくても）、再オープン後のロードで
@@ -212,7 +214,7 @@ fn schema_qualified_function_loads_after_reopen() {
     assert!(out.contains("11"), "{out}");
 }
 
-/// refresh: 別セッションの DROP が反映され、別セッションの新しい関数が呼べる。セッション内の関数は残る。
+/// refresh: 別セッションの DROP が反映され、別セッションの新しい関数が呼べる。
 #[test]
 fn refresh_reflects_other_sessions_ddl() {
     let path = unique_db_path("sql66-load-refresh");
@@ -222,11 +224,11 @@ fn refresh_reflects_other_sessions_ddl() {
     setup_table(&core, "alice", &mut y);
     ok(&core, "alice", &mut y, "CREATE FUNCTION dbl(x) AS x * 2");
     let mut x = loaded(&core, "alice", false);
-    ok(&core, "alice", &mut x, "CREATE FUNCTION mine(x) AS x + 100");
     assert!(call(&core, "alice", &mut x, CALL_DBL).contains("10"));
 
     ok(&core, "alice", &mut y, "DROP FUNCTION dbl");
     ok(&core, "alice", &mut y, "CREATE FUNCTION trp(x) AS x * 3");
+    ok(&core, "alice", &mut y, "CREATE FUNCTION mine(x) AS x + 100");
     core.refresh_session_udfs(&ctx("alice"), &mut x);
     assert_eq!(code(&core, "alice", &mut x, CALL_DBL), "42883");
     let out = call(&core, "alice", &mut x, "SELECT trp(n) AS d FROM t LIMIT 1");

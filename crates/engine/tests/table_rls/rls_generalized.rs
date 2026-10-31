@@ -453,6 +453,11 @@ fn udf_reads_only_reach_visible_rows_across_tables_and_sessions() {
             for allow_private in [false, true] {
                 let ctx = ctx_for(tenant, allow_private);
                 let mut session = SessionState::default();
+                session.allow_ddl();
+                // SQL-66（Issue #1922）以降は DDL 権限のあるセッションの定義がテナントのカタログへ
+                // 永続化されるため、繰り返しの前に前回分を消す（`IF EXISTS` で初回は何もしない）。
+                core.execute_sql_in_session(&ctx, &mut session, "DROP FUNCTION IF EXISTS unit_sum")
+                    .expect("DROP FUNCTION IF EXISTS should succeed");
                 core.execute_sql_in_session(
                     &ctx,
                     &mut session,

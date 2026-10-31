@@ -146,6 +146,7 @@ fn udf_calls_and_bodies_follow_the_limits() {
     let core = new_core(&path);
     let ctx = ctx_for("tenant-a");
     let mut session = SessionState::default();
+    session.allow_ddl();
     core.execute_sql_in_session(&ctx, &mut session, "CREATE FUNCTION f1(x) AS x")
         .expect("define f1");
     for (n, code) in [(33usize, "42883"), (100, "42883"), (101, "54023")] {

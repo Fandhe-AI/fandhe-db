@@ -58,6 +58,9 @@ fn run_as(
     session: &mut SessionState,
     sql: &str,
 ) -> Result<SqlOutcome, String> {
+    if let Some(result) = crate::udf_direct::try_define_directly(session, sql) {
+        return result;
+    }
     core.execute_sql_in_session(&ctx_for(tenant), session, sql)
         .map_err(|e| e.wire_code().to_string())
 }
