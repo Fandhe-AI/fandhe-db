@@ -463,3 +463,38 @@ fn wire_create_or_replace_and_drop_if_exists() {
     expect_error_response_with_sqlstate(&mut b, "42883");
     read_ready_for_query(&mut b);
 }
+
+/// SQL-67・Issue #2220: 集合返却の `LANGUAGE sql` 関数を `FROM` 句で呼ぶと、宣言列の
+/// `RowDescription`（列名・型 OID）と行が wire 越しに返る。
+#[test]
+fn wire_set_returning_function_in_from_returns_rows_and_columns() {
+    let (core, _guard) = new_core_with_docs();
+    let addr = spawn_server_with_ddl_user(core);
+    let mut a = authenticate_to_ready_for_query(addr, "alice", "pw-alice");
+    for sql in [
+        "CREATE FUNCTION pair(x int) RETURNS TABLE (n int, label text) LANGUAGE sql STABLE \
+         AS $$ SELECT 1, 'a' $$",
+        "CREATE FUNCTION one_col(x int) RETURNS SETOF int LANGUAGE sql STABLE \
+         AS $$ SELECT $1 + 1 $$",
+    ] {
+        send_simple_query(&mut a, sql);
+        assert_eq!(read_command_complete(&mut a), "CREATE FUNCTION", "{sql}");
+        read_ready_for_query(&mut a);
+    }
+    send_simple_query(&mut a, "SELECT * FROM one_col(4)");
+    let cols = read_row_description_with_oids(&mut a);
+    assert_eq!(cols, vec![("one_col".to_string(), 23)]);
+    assert_eq!(read_data_row(&mut a), vec![Some("5".to_string())]);
+    assert_eq!(read_command_complete(&mut a), "SELECT 1");
+    read_ready_for_query(&mut a);
+
+    send_simple_query(&mut a, "SELECT n, label FROM pair(0) ORDER BY n DESC");
+    let cols = read_row_description_with_oids(&mut a);
+    assert_eq!(cols, vec![("n".to_string(), 23), ("label".to_string(), 25)]);
+    assert_eq!(
+        read_data_row(&mut a),
+        vec![Some("1".to_string()), Some("a".to_string())]
+    );
+    assert_eq!(read_command_complete(&mut a), "SELECT 1");
+    read_ready_for_query(&mut a);
+}

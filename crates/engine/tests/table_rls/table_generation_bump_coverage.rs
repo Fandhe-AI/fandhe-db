@@ -553,21 +553,22 @@ const ALLOWLIST: &[(&str, u32)] = &[
     // のいずれにも触れない（行を持たない定義メタデータのため、世代照合の対象テーブルが
     // 存在せずバンプ対象がない）。
     // Issue #1917: `replace_function`（862）の追加と行移動の追随（同じ表だけを書く）。
-    ("catalog/function.rs", 922),
-    ("catalog/function.rs", 979),
-    ("catalog/function.rs", 1070),
-    ("catalog/function.rs", 1104),
-    ("catalog/function.rs", 1139),
+    ("catalog/function.rs", 1043),
+    ("catalog/function.rs", 1100),
+    ("catalog/function.rs", 1191),
+    ("catalog/function.rs", 1225),
+    ("catalog/function.rs", 1260),
+    // Issue #2220（集合返却の blob v2・テスト追加）による行移動の追随（同じ表だけを書く）。
     // Issue #1921: commit 後の世代（UDF カタログ）追加による行移動の追随。`sql/udf_load.rs` の 1 件は
     // `#[cfg(test)]` 内で壊れた定義 blob を直接書くテスト補助（関数カタログ表だけを書き、世代の対象外）。
     // Issue #2798（型付き永続化の単体テスト追加）・#2218（ルーチンのロード追加）で行番号が移動したための
     // 追随（旧: 230・272）。
-    ("sql/udf_load.rs", 333),
+    ("sql/udf_load.rs", 348),
     // 同上（#2798 で追加した未知バージョン blob を直接書く単体テスト補助。関数カタログ表だけを書く）。
-    ("sql/udf_load.rs", 535),
+    ("sql/udf_load.rs", 550),
     // Issue #1920: 上の `#[cfg(test)]` 内のテスト補助（多重定義・SCHEMA 接頭辞削除の状態を直接作る）。
-    ("catalog/function.rs", 1586),
-    ("catalog/function.rs", 1798),
+    ("catalog/function.rs", 1800),
+    ("catalog/function.rs", 2012),
     // Issue #1689（ALTER SEQUENCE）: `alter_sequence`／`rename_sequence`（803・842）も同じ表だけを書く
     // （定義 blob の上書き・キーの付け替え・状態行の削除）ため同じ理由で対象外。
     // Issue #1733（INSERT ... SELECT）: `core/insert_select_exec.rs` の 1007・1139 行（Issue #2613・#2614・#2615・#2212・#1726 で追随）は `#[cfg(test)]` 内の

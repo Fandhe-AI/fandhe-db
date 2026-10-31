@@ -46,6 +46,13 @@ u8 version(=1) / u64 id / u8 owner(予約=0) / u8 language / u8 volatility / u8 
 
 - 版の運用: 未知の版は拒否する（`CorruptSchema`）。形式を変える場合は新しい版を足し、v1 の decode を
   残す。ゴールデンバイト列のテストで v1 を固定している。
+- blob v2（Issue #2220）: 集合返却（`RETURNS SETOF`／`RETURNS TABLE`）の定義だけが v2 で書かれる。v1 の
+  フィールド列の後ろに戻り値の形（`u8` タグ: 1 = SETOF、2 = TABLE）が付き、TABLE はさらに `u32` の列数と
+  列ごとの（名前・型タグ・型 param）が続く。SETOF の要素型は v1 の戻り値型欄に持つ。スカラー・トリガ・
+  宣言的な定義は従来どおり v1 で書くため、既存 DB のバイト列は変わらない。decode は v1・v2 の両方を受け、未知の版・
+  形タグ・列数 0 や上限超過・切断・末尾の余りは `CorruptSchema`（上限は確保の前に検査）。`OR REPLACE` は戻り値の形の
+  違いも `42P13`（戻り値型の変更）にする。降格の注意: v2 の行を旧バイナリが読むと未知の版としてテナント全体の
+  ロードが `XX000` になる（トリガ戻り値の保存形〔#2228〕と同じ fail-closed の帰結）。
 - 型は `ColumnType::catalog_fields` の `(tag, param)` 1 対で持つ。ENUM は本 Issue では encode・decode
   とも拒否する。受理に広げても `(tag, param)` のバイト表現は変わらないため、版を上げずに解禁できる。
 - 上限: 引数 100（格納形式上の上限）・本体 64 KiB・スコープあたり 64 件（`ViewLimitExceeded`）。長さ・件数は
