@@ -1414,4 +1414,6 @@ Issue #1405（fix(engine)!: CREATE TYPE の型名の重複を 42710 で返す。
 
 **Issue #2399（refactor(engine): 明示トランザクションの状態に読み取りスナップショットと未取得の writer を持たせる。SQL-31・PERSIST-4・TASK-333 ポインタ。詳細は [explicit-transaction.md](explicit-transaction.md) 決定 4）**: `sql::transaction::ActiveTxn` の `write_txn` を `writer: Option<GatedWriteTxn>` に変え、`read_snapshot: redb::ReadTransaction` を追加した。挙動は不変で、writer は従来どおり `BEGIN`（明示・暗黙）で取得し、スナップショットは writer 取得後に開く。`SessionTransaction::read_snapshot()`（`pub(crate)`・本番経路未使用）を追加した。writer が `None` で書き込み記録がある状態は `commit_active`・`dirty_tables` が `XX000` で fail-closed にする。後続の #2400 でスナップショットを先に開く順序へ反転し、#2403 で読み取り経路へ結線する。
 
+**Issue #1932（feat(engine)!: BEGIN の READ ONLY／READ WRITE 修飾子を構文解釈する。SQL-38 ポインタ。詳細は [explicit-transaction.md](explicit-transaction.md)）**: `ParsedSql::Transaction` の中身を `ValidatedTxnControl`（`control`＋`access_mode: Option<TxnAccessMode>`）へ変更（破壊的変更）。`BEGIN [WORK|TRANSACTION] [READ ONLY|READ WRITE]` を受理し、`ActiveTxn` にモードを保持する。`READ ONLY` は #1933／#1934 まで `0A000` の暫定ゲートで拒否（fail-closed）。重複・矛盾モードや未知の修飾子は `42601`。単体テストと `sql38_begin_access_mode` 結合テストを追加。依存の変更なし。
+
 **Issue #1937（docs(design): 分離レベルの受理方針を設計文書へ記録する。SQL-38・TABLE-3・PERSIST-4 ポインタ）**: [explicit-transaction.md](explicit-transaction.md) に「分離レベルの受理方針」節を追加した（契約は spec ポインタのみ。受理範囲は記述しない）。コードは変更していない。
