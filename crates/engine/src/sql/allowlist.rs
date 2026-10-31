@@ -24086,6 +24086,11 @@ fn check_return_expression(tokens: &[Token]) -> Result<(), SqlSurfaceError> {
             Token::Punct(';') if depth == 0 => {
                 return Err(SqlSurfaceError::unsupported("unexpected ; in expression"));
             }
+            // 括弧・配列の外のカンマは `SELECT 1, 2` のような複数列へ化けるため拒否する（`RETURN` は
+            // 単一の式）。括弧・`[` の内側（関数引数・配列要素・`IN` 一覧）のカンマは式の一部。
+            Token::Punct(',') if depth == 0 => {
+                return Err(SqlSurfaceError::unsupported("unexpected , in expression"));
+            }
             Token::Keyword(super::lexer::Keyword::From)
                 if depth == 0
                     && !matches!(prev, Some(Token::Ident(w)) if w.eq_ignore_ascii_case("DISTINCT")) =>

@@ -632,6 +632,17 @@ fn syntax_form_confirmed(
 /// `(` の直前の語が構文上の語（`IN`・`AS`・`OVER` 等）でも組み込み関数名でもない呼び出しを含むか
 /// （ユーザー定義関数の呼び出しの保守的な検出。構文語の取りこぼしは `Write` 側へ倒れるだけ）。
 fn calls_non_builtin_function(tokens: &[Token]) -> bool {
+    (0..tokens.len()).any(|i| is_non_builtin_call_at(tokens, i))
+}
+
+/// 位置 `i` が、構文語でも組み込み関数でもない呼び出し（`名前(`・`schema.名前(`）の名前か。構文位置と
+/// 確認できない語は呼び出し扱い（`true`。fail-closed）。[`calls_non_builtin_function`] の 1 位置分で、
+/// `core::standard_body_binding` が標準形の本体の関数依存を集めるときにも共有する（`IN (`・`VALUES (`・
+/// `EXISTS (SELECT` のような構文語を同名の永続関数への依存として記録しないため。Issue #2219）。
+pub(crate) fn is_non_builtin_call_at(tokens: &[Token], i: usize) -> bool {
+    let Some(t) = tokens.get(i) else {
+        return false;
+    };
     // 構文上 `(` の直前に現れない語（`END`・`NULL`・`TRUE`・`FALSE`・`DEFAULT`）は含めない。これらは
     // 予約されない名前として同名のユーザー関数がありうるため、`(` が続けば呼び出し（`Write`）とする。
     const SYNTAX_WORDS: &[&str] = &[
@@ -757,7 +768,7 @@ fn calls_non_builtin_function(tokens: &[Token]) -> bool {
         "USING",
         "AS",
     ];
-    tokens.iter().enumerate().any(|(i, t)| {
+    {
         // `schema.func(...)`（修飾付き呼び出し）は構文語になりえないため常に呼び出しとして扱う。
         if matches!(t, Token::QualifiedIdent { .. })
             && matches!(tokens.get(i.saturating_add(1)), Some(Token::Punct('(')))
@@ -909,7 +920,7 @@ fn calls_non_builtin_function(tokens: &[Token]) -> bool {
             }
         }
         true
-    })
+    }
 }
 
 /// `COPY` 文のトークン列を [`StatementEffect`] へ分類する（[`classify_statement`] の

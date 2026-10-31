@@ -673,6 +673,130 @@ fn nested_relations_of_dml_are_bound() {
     }
 }
 
+/// 引用識別子の `"partitioned"` 等は、標準形でも文字列本体と同じく列名として受理され、描画（保存）後の
+/// 再解析でも句に化けない（再解析が特別扱いする語を個別に列挙せず、本体の引用識別子は引用符を保つ）。
+#[test]
+fn quoted_words_special_cased_by_reparse_stay_identifiers() {
+    let (core, mut s, _g) = setup("sql67_std_quoted_special");
+    for (i, w) in ["partitioned", "operation_id", "using", "plan", "only"]
+        .iter()
+        .enumerate()
+    {
+        run(
+            &core,
+            &mut s,
+            "alice",
+            &format!("CREATE FUNCTION qs{i}() RETURNS int BEGIN ATOMIC SELECT 1 AS \"{w}\"; END"),
+        );
+        run(
+            &core,
+            &mut s,
+            "alice",
+            &format!(
+                "CREATE FUNCTION qt{i}() RETURNS int LANGUAGE sql AS $$ SELECT 1 AS \"{w}\" $$"
+            ),
+        );
+        let r = same(
+            &core,
+            &mut s,
+            &format!("SELECT qs{i}()"),
+            &format!("SELECT qt{i}()"),
+        );
+        assert_eq!(r, vec![vec![int(1)]], "{w}");
+    }
+    // 引用付きの関数名の呼び出しは依存辺になり、DROP は止まる。
+    run(
+        &core,
+        &mut s,
+        "alice",
+        "CREATE FUNCTION target1() RETURNS int RETURN 5",
+    );
+    run(
+        &core,
+        &mut s,
+        "alice",
+        "CREATE FUNCTION caller1() RETURNS int BEGIN ATOMIC SELECT \"target1\"(); END",
+    );
+    assert_eq!(code(&core, &mut s, "DROP FUNCTION target1"), "2BP01");
+}
+
+/// `RETURN` は単一の式。括弧・配列の外のカンマは 42601 で拒否し、括弧・配列の中は式の一部として通る。
+#[test]
+fn return_expression_rejects_top_level_comma() {
+    let (core, mut s, _g) = setup("sql67_std_return_comma");
+    for body in ["1, 2", "1,", "x, x + 1"] {
+        assert_eq!(
+            code(
+                &core,
+                &mut s,
+                &format!("CREATE FUNCTION rc(x int) RETURNS int RETURN {body}")
+            ),
+            "42601",
+            "{body}"
+        );
+    }
+    run(
+        &core,
+        &mut s,
+        "alice",
+        "CREATE FUNCTION rc1(x int) RETURNS int RETURN greatest(x, 2)",
+    );
+    run(
+        &core,
+        &mut s,
+        "alice",
+        "CREATE FUNCTION rc2(x int) RETURNS int RETURN (ARRAY[x, 2])[1]",
+    );
+    run(
+        &core,
+        &mut s,
+        "alice",
+        "CREATE FUNCTION rc3(x int) RETURNS int RETURN coalesce(x, (2))",
+    );
+    assert_eq!(one(&core, &mut s, "SELECT rc1(1)"), int(2));
+}
+
+/// 構文位置で句と確定できる `IN (`・`EXISTS (SELECT`・`VALUES (` は、同名の永続関数への依存にならない
+/// （同名の関数の DROP が 2BP01 にならない）。構文位置でない呼び出しは依存になる。
+#[test]
+fn clause_words_are_not_function_dependencies() {
+    let (core, mut s, _g) = setup("sql67_std_clause_deps");
+    for name in ["values", "in", "exists"] {
+        run(
+            &core,
+            &mut s,
+            "alice",
+            &format!("CREATE FUNCTION \"{name}\"() RETURNS int LANGUAGE sql AS $$ SELECT 1 $$"),
+        );
+    }
+    run(
+        &core,
+        &mut s,
+        "alice",
+        "CREATE FUNCTION cw() RETURNS int BEGIN ATOMIC \
+         INSERT INTO log VALUES (1); \
+         SELECT a FROM t WHERE a IN (1, 2) AND EXISTS (SELECT 1 FROM t); \
+         END",
+    );
+    for name in ["values", "in", "exists"] {
+        run(&core, &mut s, "alice", &format!("DROP FUNCTION \"{name}\""));
+    }
+    // 呼び出しの形（式の先頭の `values()`）は依存として記録される。
+    run(
+        &core,
+        &mut s,
+        "alice",
+        "CREATE FUNCTION \"values\"() RETURNS int LANGUAGE sql AS $$ SELECT 1 $$",
+    );
+    run(
+        &core,
+        &mut s,
+        "alice",
+        "CREATE FUNCTION cw2() RETURNS int BEGIN ATOMIC SELECT \"values\"(); END",
+    );
+    assert_eq!(code(&core, &mut s, "DROP FUNCTION \"values\""), "2BP01");
+}
+
 fn run_or_err(core: &EngineCore, s: &mut SessionState, sql: &str) -> Result<(), &'static str> {
     core.execute_sql_in_session(&ctx("alice"), s, sql)
         .map(|_| ())

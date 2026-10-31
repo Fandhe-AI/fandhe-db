@@ -788,7 +788,8 @@ fn tokenize_impl(
                 && (content.eq_ignore_ascii_case("NULL")
                     || content.eq_ignore_ascii_case("ARRAY")
                     || content.eq_ignore_ascii_case("DEFAULT")
-                    || (is_create_function_head(&tokens) && is_clause_word(content))))
+                    || (is_create_function_head(&tokens)
+                        && (is_clause_word(content) || is_standard_body_started(&tokens)))))
                 || is_value_function_keyword(content)
             {
                 // 引用付きの `NULL`・`DEFAULT`（`VALUES` 要素の `DEFAULT` キーワードと区別する。
@@ -1218,6 +1219,17 @@ fn is_create_function_head(tokens: &[Token]) -> bool {
     let word = |i: usize, w: &str| matches!(tokens.get(i), Some(Token::Ident(x)) if x.eq_ignore_ascii_case(w));
     word(0, "CREATE")
         && (word(1, "FUNCTION") || (word(1, "OR") && word(2, "REPLACE") && word(3, "FUNCTION")))
+}
+
+/// 走査済みのトークン列が、標準形の本体（`RETURN <式>`・`BEGIN ATOMIC ...`）に入っているか
+/// （Issue #2219）。本体では、再解析が特別扱いする語（`PARTITIONED`・`OPERATION_ID`・各種の句の語など）を
+/// 個別に列挙せず、引用識別子をすべて [`Token::QuotedNull`] で印を残して描画で引用符を保つ。
+/// 引用なしの `RETURN`・`ATOMIC` は予約的な語で、本体の前（引数名・関数名）には現れない。
+fn is_standard_body_started(tokens: &[Token]) -> bool {
+    tokens.iter().any(|t| {
+        matches!(t, Token::Ident(x)
+            if x.eq_ignore_ascii_case("RETURN") || x.eq_ignore_ascii_case("ATOMIC"))
+    })
 }
 
 /// 引用なしで書くと SQL の句・構文の語として読まれる語か（大小無視。Issue #2219）。

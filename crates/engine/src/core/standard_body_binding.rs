@@ -28,6 +28,7 @@ use crate::sql::allowlist::{SqlSurfaceError, TableLookup};
 use crate::sql::cast::CastType;
 use crate::sql::embedded_unit::{parse_unit_with_target, UnitSummary};
 use crate::sql::lexer::Token;
+use crate::sql::statement_splitter::is_non_builtin_call_at;
 use crate::storage::Storage;
 
 /// 実カタログへ委譲しつつ、存在を確認できた relation の名前を記録する [`TableLookup`]。
@@ -114,12 +115,25 @@ impl EmbeddedSqlChecker for BindingChecker<'_> {
     }
 }
 
-/// 文のトークン列に現れる `名前(`（関数呼び出しの形）の名前を集める（小文字化。重複は呼び出し側で除く）。
-/// `INSERT INTO f(a)` の対象表と列リスト、`AS x(a, b)` の別名と列別名リストは呼び出しではないので除く。
+/// 文のトークン列に現れる関数呼び出し（`名前(`）の名前を集める（小文字化。重複は呼び出し側で除く）。
+/// 構文語（`x IN (`・`WHERE EXISTS (SELECT`・`INSERT ... VALUES (` 等）は、`statement_splitter` の
+/// 判定（[`is_non_builtin_call_at`]。構文位置と確認できる語だけ除外し、曖昧なものは呼び出し扱い）を
+/// 共有して除くので、同名の永続関数への依存にならない。引用付きの名前（`"f"(`）は構文語になりえない
+/// ので常に呼び出し。`INSERT INTO f(a)` の対象表と列リスト、`AS x(a, b)` の別名と列別名リストは
+/// 呼び出しではないので除く。
 fn call_names(tokens: &[Token]) -> impl Iterator<Item = String> + '_ {
     tokens.iter().enumerate().filter_map(move |(i, t)| {
-        let (Token::Ident(n), Some(Token::Punct('('))) = (t, tokens.get(i + 1)) else {
+        if !matches!(tokens.get(i + 1), Some(Token::Punct('('))) {
             return None;
+        }
+        let name = match t {
+            Token::QuotedNull(n) => n,
+            Token::Ident(n)
+                if is_non_builtin_call_at(tokens, i) && !is_values_clause(tokens, i) =>
+            {
+                n
+            }
+            _ => return None,
         };
         if is_cte_declaration(tokens, i) {
             return None;
@@ -129,8 +143,43 @@ fn call_names(tokens: &[Token]) -> impl Iterator<Item = String> + '_ {
             Some(Token::Ident(w))
                 if ["INTO", "AS", "UPDATE", "ONLY"].iter().any(|k| w.eq_ignore_ascii_case(k))
         );
-        (!decl).then(|| n.to_ascii_lowercase())
+        (!decl).then(|| name.to_ascii_lowercase())
     })
+}
+
+/// 位置 `at` の `VALUES (` が行値の句（`INSERT INTO t [(列)] VALUES (`・`FROM (VALUES (`・
+/// `UNION VALUES (` 等）と構文位置で確認できるか。`statement_splitter` の共有判定は `VALUES` を式の先頭の
+/// 呼び出しと区別できないため常に呼び出し扱いにするので、ここで構文位置が確かな形だけを追加で除く
+/// （確認できない形は呼び出し＝依存として記録する側に倒す）。
+fn is_values_clause(tokens: &[Token], at: usize) -> bool {
+    if !matches!(tokens.get(at), Some(Token::Ident(w)) if w.eq_ignore_ascii_case("VALUES")) {
+        return false;
+    }
+    let word = |j: usize, ws: &[&str]| matches!(tokens.get(j), Some(Token::Ident(x)) if ws.iter().any(|w| x.eq_ignore_ascii_case(w)));
+    let Some(prev) = at.checked_sub(1) else {
+        return false;
+    };
+    match tokens.get(prev) {
+        // `INSERT INTO t VALUES (`・`INSERT INTO t (a, b) VALUES (`（対象表または列リストの直後）。
+        Some(Token::Ident(_) | Token::QuotedNull(_) | Token::Punct(')'))
+            if word(0, &["INSERT"])
+                && !word(prev, &["SELECT", "AND", "OR", "NOT", "IN", "WHERE"]) =>
+        {
+            true
+        }
+        // `UNION [ALL] VALUES (`。
+        Some(Token::Ident(x)) => ["UNION", "INTERSECT", "EXCEPT", "ALL"]
+            .iter()
+            .any(|w| x.eq_ignore_ascii_case(w)),
+        // `FROM (VALUES (`・`AS (VALUES (`・`JOIN (VALUES (`・`IN (VALUES (`。
+        Some(Token::Punct('(')) => {
+            matches!(
+                prev.checked_sub(1).and_then(|p| tokens.get(p)),
+                Some(Token::Keyword(crate::sql::lexer::Keyword::From))
+            ) || word(prev.saturating_sub(1), &["AS", "JOIN", "LATERAL", "IN"])
+        }
+        _ => false,
+    }
 }
 
 /// 位置 `at` の `名前(` が CTE の列名リスト付き宣言（`WITH f(a, b) AS [[NOT] MATERIALIZED] (`）か。
