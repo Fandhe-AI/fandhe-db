@@ -6337,6 +6337,9 @@ struct Parser<'a> {
     /// （Issue #1544）。`UPDATE ... SET` 右辺の式解析中だけ `true` にする。
     /// `const_expr_null_args` を立てない SET 経路でも `+5 + 1`・`(+5)` を解析するため。
     allow_plus_number: bool,
+    /// 単項 `+` の直後の `$n` 擬似識別子を受理してよいか（Issue #2797。`$n` の型推論専用）。
+    /// 置換後の通常 parse は `+` + 型付き値を 1 ノードへ畳むが、推論時は `$n` が識別子のため。
+    allow_plus_param: bool,
     /// `CHECK ( ... )` 本体（TABLE-16）を解析中かどうか（Issue #1184）。`true` の間は
     /// `NOT ( ... )`・裸の `NOT <式比較>`・数値の `IN`／`BETWEEN` を従来どおり
     /// `42601` にする（脱糖後の形が `check_constraint` の許可形と区別できず、
@@ -6482,6 +6485,7 @@ impl<'a> Parser<'a> {
             using_keyword_literals: false,
             allow_unary_minus: false,
             allow_plus_number: false,
+            allow_plus_param: false,
             in_check_body: false,
             max_insert_rows: None,
             from_ref: None,
@@ -11252,6 +11256,41 @@ impl<'a> Parser<'a> {
                     format!("-{raw}"),
                 ))
             }
+            // Issue #2797: 定数式文脈限定の単項 `+` + 型付き値（`+$n` の置換結果）。`+` は符号なしと
+            // 等価のため、上の負値の腕と同じく `$typed:<型>` + 数値を 1 ノードへ畳む。
+            Some(Token::Punct('+'))
+                if (self.const_expr_null_args || self.allow_plus_number)
+                    && matches!(
+                        (self.tokens.get(self.pos + 1), self.tokens.get(self.pos + 2)),
+                        (Some(Token::Ident(n)), Some(Token::Number(_)))
+                            if n.starts_with(crate::sql::udf_call::TYPED_VALUE_PREFIX)
+                    ) =>
+            {
+                self.advance();
+                let (Some(Token::Ident(name)), Some(Token::Number(raw))) =
+                    (self.advance().cloned(), self.advance().cloned())
+                else {
+                    return Err(SqlSurfaceError::unsupported("expected a typed number"));
+                };
+                self.consume_expr_node()?;
+                self.consume_expr_node()?;
+                Ok(crate::sql::udf_call::typed_value_expr(&name, raw))
+            }
+            // Issue #2797: 推論専用の単項 `+` + `$n` 擬似識別子（`+$n`）。`+` は符号なしと等価のため
+            // 識別子をそのまま返す（`+col` は従来どおり下の既定分岐で `42601`）。
+            Some(Token::Punct('+'))
+                if self.allow_plus_param
+                    && matches!(
+                        self.tokens.get(self.pos + 1),
+                        Some(Token::Ident(n))
+                            if n.strip_prefix('$').is_some_and(|d| {
+                                !d.is_empty() && d.bytes().all(|b| b.is_ascii_digit())
+                            })
+                    ) =>
+            {
+                self.advance();
+                self.parse_primary_expr(depth + 1)
+            }
             // Issue #1430・SQL-24: 負の数値リテラル（字句ペア `-` + Number を 1 ノードの
             // 数値へ畳む）。`-col`・`-(expr)`・`- -1` は一般の単項マイナスとして受理せず、
             // 下の既定分岐で従来どおり `42601` のままとする（fail-closed）。
@@ -13003,8 +13042,8 @@ impl<'a> Parser<'a> {
                         || s.eq_ignore_ascii_case("null"));
                 !plain_keyword
             }
-            // 符号付きの内部専用の型付き数値（`- $typed:<型> <数値>`）も式として解析する。
-            Some(Token::Punct('-')) => matches!(
+            // 符号付きの内部専用の型付き数値（`[+-] $typed:<型> <数値>`）も式として解析する。
+            Some(Token::Punct('-' | '+')) => matches!(
                 self.tokens.get(self.pos + 1),
                 Some(Token::Ident(n)) if n.starts_with(crate::sql::udf_call::TYPED_VALUE_PREFIX)
             ),
@@ -27446,6 +27485,7 @@ pub(crate) fn parse_param_inference_expr(
         // 推論専用: `-$1` は置換後の通常 parse では `- <数値>` の符号付きリテラルとして
         // 受理されるが、推論時は `$1` が識別子のため単項マイナスを許可して脱糖させる。
         p.allow_unary_minus = true;
+        p.allow_plus_param = true;
         p.parse_value_expr_with_null_context(0, true)?
     };
     p.expect_end_of_statement()?;
