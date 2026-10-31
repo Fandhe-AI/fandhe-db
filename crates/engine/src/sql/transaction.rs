@@ -48,13 +48,68 @@ pub enum TxnControl {
     Rollback,
 }
 
-/// `BEGIN`/`COMMIT`/`ROLLBACK` の規範形（`[WORK|TRANSACTION]` 修飾語のみ許容。
-/// 分離レベル指定・`READ ONLY`・`AND CHAIN`・`$n` 等は `42601`）を受理する。
-/// 先頭トークンが `BEGIN`/`COMMIT`/`ROLLBACK`（大小無視）であることは
-/// 呼び出し元（`core.rs::parse_tokens`）が確認済みの前提。
+/// `BEGIN ISOLATION LEVEL ...` でクライアントが要求した分離レベル（SQL-38 (1) ポインタ）。
+/// 要求を記録するだけで実行時の保証は変えない（実行は単一ライタの直列化のまま。
+/// `crate::txn::IsolationLevel` 参照）。後続の `SET TRANSACTION` 系・表示系が読む口として
+/// [`SessionTransaction::isolation_level`] から取り出せる。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum RequestedIsolationLevel {
+    ReadUncommitted,
+    ReadCommitted,
+    RepeatableRead,
+    Serializable,
+}
+
+/// 検証済みの制御文。`core.rs::parse_tokens` が `ParsedSql::Transaction` へ載せ、
+/// 実行側（`core.rs`）と wire-server の拡張クエリ層が `control` で分岐する。
+/// `isolation_level` は `BEGIN` で明示されたときだけ `Some`（未指定は `None`）。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct ValidatedTxnControl {
+    pub control: TxnControl,
+    pub isolation_level: Option<RequestedIsolationLevel>,
+}
+
+/// `ISOLATION LEVEL <レベル>` 項目を 1 つ消費する。先頭トークンが `ISOLATION` である前提。
+/// 不完全・未知のレベルは `42601`（fail-closed。入力語はメッセージへ含めない）。
+fn parse_isolation_level_item(
+    rest: &[Token],
+) -> Result<(RequestedIsolationLevel, &[Token]), SqlSurfaceError> {
+    fn word<'a>(rest: &'a [Token], kw: &str) -> Option<&'a [Token]> {
+        match rest.split_first() {
+            Some((Token::Ident(w), tail)) if w.eq_ignore_ascii_case(kw) => Some(tail),
+            _ => None,
+        }
+    }
+    let bad = || SqlSurfaceError::unsupported("unsupported transaction mode");
+    let rest = word(rest, "ISOLATION").ok_or_else(bad)?;
+    let rest = word(rest, "LEVEL").ok_or_else(bad)?;
+    if let Some(t) = word(rest, "SERIALIZABLE") {
+        return Ok((RequestedIsolationLevel::Serializable, t));
+    }
+    if let Some(t) = word(rest, "REPEATABLE") {
+        let t = word(t, "READ").ok_or_else(bad)?;
+        return Ok((RequestedIsolationLevel::RepeatableRead, t));
+    }
+    if let Some(t) = word(rest, "READ") {
+        if let Some(t) = word(t, "COMMITTED") {
+            return Ok((RequestedIsolationLevel::ReadCommitted, t));
+        }
+        if let Some(t) = word(t, "UNCOMMITTED") {
+            return Ok((RequestedIsolationLevel::ReadUncommitted, t));
+        }
+    }
+    Err(bad())
+}
+
+/// `BEGIN`/`COMMIT`/`ROLLBACK` の規範形を受理する。`[WORK|TRANSACTION]` 修飾語に加え、
+/// `BEGIN` だけは `ISOLATION LEVEL <4 レベル>` を受理して
+/// [`ValidatedTxnControl::isolation_level`] へ記録する（SQL-38 (1) ポインタ。実行は不変）。
+/// 重複指定・`READ ONLY`・`DEFERRABLE`・`COMMIT`／`ROLLBACK` への分離レベル・
+/// `AND CHAIN`・`$n` 等は `42601`。先頭トークンが `BEGIN`/`COMMIT`/`ROLLBACK`（大小無視）
+/// であることは呼び出し元（`core.rs::parse_tokens`）が確認済みの前提。
 pub(crate) fn validate_transaction_control_tokens(
     tokens: &[Token],
-) -> Result<TxnControl, SqlSurfaceError> {
+) -> Result<ValidatedTxnControl, SqlSurfaceError> {
     let Some(Token::Ident(head)) = tokens.first() else {
         return Err(SqlSurfaceError::unsupported(
             "malformed transaction control statement",
@@ -74,7 +129,7 @@ pub(crate) fn validate_transaction_control_tokens(
 
     // 受信 SQL 由来のトークン列のため添字スライスを使わず `split_first` で進める。
     let rest = tokens.split_first().map_or(&[][..], |(_, tail)| tail);
-    let rest = match rest.split_first() {
+    let mut rest = match rest.split_first() {
         Some((Token::Ident(kw), tail))
             if kw.eq_ignore_ascii_case("WORK") || kw.eq_ignore_ascii_case("TRANSACTION") =>
         {
@@ -82,12 +137,42 @@ pub(crate) fn validate_transaction_control_tokens(
         }
         _ => rest,
     };
+    let mut isolation_level = None;
+    if ctrl == TxnControl::Begin {
+        // 各反復は 1 トークン以上消費するか `Err` で抜けるのでトークン数で有界。
+        let mut first = true;
+        while !rest.is_empty() {
+            if !first {
+                if let Some((Token::Punct(','), tail)) = rest.split_first() {
+                    rest = tail;
+                }
+            }
+            first = false;
+            match rest.split_first() {
+                Some((Token::Ident(kw), _)) if kw.eq_ignore_ascii_case("ISOLATION") => {
+                    let (level, tail) = parse_isolation_level_item(rest)?;
+                    if isolation_level.replace(level).is_some() {
+                        return Err(SqlSurfaceError::unsupported("unsupported transaction mode"));
+                    }
+                    rest = tail;
+                }
+                _ => {
+                    return Err(SqlSurfaceError::unsupported(
+                        "unsupported clause after transaction control statement",
+                    ));
+                }
+            }
+        }
+    }
     if !rest.is_empty() {
         return Err(SqlSurfaceError::unsupported(
             "unsupported clause after transaction control statement",
         ));
     }
-    Ok(ctrl)
+    Ok(ValidatedTxnControl {
+        control: ctrl,
+        isolation_level,
+    })
 }
 
 /// SQL テキストの先頭トークンが `ROLLBACK`（大小無視）かどうか。明示トランザクションが
@@ -131,6 +216,8 @@ enum TxnOrigin {
 /// permit を内包し、drop 時は abort してから permit を解放する。
 struct ActiveTxn<'e> {
     origin: TxnOrigin,
+    /// `BEGIN ISOLATION LEVEL` で明示された要求レベル（記録のみ。暗黙・未指定は `None`）。
+    isolation_level: Option<RequestedIsolationLevel>,
     write_txn: crate::storage::GatedWriteTxn,
     /// 一時表（TABLE-44・Issue #1684）の書き込みトランザクション。最初の一時表の文で遅延して開く。
     /// `ActiveTxn` を取り出して drop する全経路（`rollback`／`fail`／`release_if_expired`／
@@ -379,7 +466,31 @@ impl<'e> SessionTransaction<'e> {
         if self.abort_if_implicit() {
             return Err(internal_error());
         }
-        self.begin_with_origin(storage, session, TxnOrigin::Explicit)
+        self.begin_with_origin(storage, session, TxnOrigin::Explicit, None)
+    }
+
+    /// 要求された分離レベルを記録して `BEGIN` する（`core.rs` の `TxnControl::Begin` 分岐が
+    /// 呼ぶ）。実行は [`Self::begin`] と同一（単一ライタ。レベルは
+    /// [`Self::isolation_level`] で読めるだけ）。
+    pub fn begin_with_isolation(
+        &mut self,
+        storage: &'e crate::storage::Storage,
+        session: &SessionState,
+        isolation_level: Option<RequestedIsolationLevel>,
+    ) -> Result<(), SqlSurfaceError> {
+        if self.abort_if_implicit() {
+            return Err(internal_error());
+        }
+        self.begin_with_origin(storage, session, TxnOrigin::Explicit, isolation_level)
+    }
+
+    /// `Active` なトランザクションが `BEGIN` で明示された分離レベル。未指定・暗黙・
+    /// `Active` 以外は `None`。
+    pub fn isolation_level(&self) -> Option<RequestedIsolationLevel> {
+        match &self.state {
+            TxnState::Active(a) => a.isolation_level,
+            _ => None,
+        }
     }
 
     /// 暗黙トランザクション（Issue #1175）を開始する。`BEGIN` を含まない複数文
@@ -399,7 +510,7 @@ impl<'e> SessionTransaction<'e> {
         if !matches!(self.state, TxnState::Idle) {
             return Err(internal_error());
         }
-        self.begin_with_origin(storage, session, TxnOrigin::Implicit)
+        self.begin_with_origin(storage, session, TxnOrigin::Implicit, None)
     }
 
     /// 暗黙トランザクションの commit（Issue #1175）。最後の文の実行に成功した
@@ -478,6 +589,7 @@ impl<'e> SessionTransaction<'e> {
         storage: &'e crate::storage::Storage,
         session: &SessionState,
         origin: TxnOrigin,
+        isolation_level: Option<RequestedIsolationLevel>,
     ) -> Result<(), SqlSurfaceError> {
         match &self.state {
             TxnState::Idle => {
@@ -507,6 +619,7 @@ impl<'e> SessionTransaction<'e> {
                 self.generation = next_generation;
                 self.state = TxnState::Active(Box::new(ActiveTxn {
                     origin,
+                    isolation_level,
                     write_txn,
                     temp: None,
                     started_at: Instant::now(),
@@ -1051,26 +1164,35 @@ mod tests {
     fn begin_variants_are_accepted() {
         for sql in ["BEGIN", "BEGIN WORK", "BEGIN TRANSACTION", "begin"] {
             let ctrl = validate_transaction_control_tokens(&tokens_of(sql)).expect("accepted");
-            assert_eq!(ctrl, TxnControl::Begin);
+            assert_eq!(ctrl.control, TxnControl::Begin);
+            assert_eq!(ctrl.isolation_level, None);
         }
     }
 
     #[test]
     fn commit_and_rollback_variants_are_accepted() {
         assert_eq!(
-            validate_transaction_control_tokens(&tokens_of("COMMIT")).unwrap(),
+            validate_transaction_control_tokens(&tokens_of("COMMIT"))
+                .unwrap()
+                .control,
             TxnControl::Commit
         );
         assert_eq!(
-            validate_transaction_control_tokens(&tokens_of("COMMIT WORK")).unwrap(),
+            validate_transaction_control_tokens(&tokens_of("COMMIT WORK"))
+                .unwrap()
+                .control,
             TxnControl::Commit
         );
         assert_eq!(
-            validate_transaction_control_tokens(&tokens_of("ROLLBACK")).unwrap(),
+            validate_transaction_control_tokens(&tokens_of("ROLLBACK"))
+                .unwrap()
+                .control,
             TxnControl::Rollback
         );
         assert_eq!(
-            validate_transaction_control_tokens(&tokens_of("ROLLBACK TRANSACTION")).unwrap(),
+            validate_transaction_control_tokens(&tokens_of("ROLLBACK TRANSACTION"))
+                .unwrap()
+                .control,
             TxnControl::Rollback
         );
     }
@@ -1078,13 +1200,59 @@ mod tests {
     #[test]
     fn trailing_clauses_are_rejected() {
         for sql in [
-            "BEGIN ISOLATION LEVEL SERIALIZABLE",
             "BEGIN READ ONLY",
             "COMMIT AND CHAIN",
             "ROLLBACK TO SAVEPOINT x",
         ] {
             let err = validate_transaction_control_tokens(&tokens_of(sql)).unwrap_err();
             assert_eq!(err.wire_code(), "42601");
+        }
+    }
+
+    /// SQL-38 (1)・Issue #1938: 4 レベルすべてを `BEGIN`／`BEGIN WORK`／`BEGIN TRANSACTION` で
+    /// 受理し、要求レベルを記録する（大小無視）。
+    #[test]
+    fn begin_isolation_levels_are_accepted() {
+        let levels = [
+            ("SERIALIZABLE", RequestedIsolationLevel::Serializable),
+            ("REPEATABLE READ", RequestedIsolationLevel::RepeatableRead),
+            ("read committed", RequestedIsolationLevel::ReadCommitted),
+            ("Read Uncommitted", RequestedIsolationLevel::ReadUncommitted),
+        ];
+        for head in ["BEGIN", "BEGIN WORK", "BEGIN TRANSACTION", "begin"] {
+            for (text, expected) in levels {
+                let sql = format!("{head} ISOLATION LEVEL {text}");
+                let v = validate_transaction_control_tokens(&tokens_of(&sql)).expect(&sql);
+                assert_eq!(v.control, TxnControl::Begin, "{sql}");
+                assert_eq!(v.isolation_level, Some(expected), "{sql}");
+            }
+        }
+    }
+
+    /// 不完全・未知・重複・区切り誤り・未対応の併記・`COMMIT`／`ROLLBACK` への指定は `42601`。
+    #[test]
+    fn malformed_isolation_level_clauses_are_rejected() {
+        for sql in [
+            "BEGIN ISOLATION",
+            "BEGIN ISOLATION LEVEL",
+            "BEGIN ISOLATION LEVEL READ",
+            "BEGIN ISOLATION LEVEL REPEATABLE",
+            "BEGIN ISOLATION LEVEL FOO",
+            "BEGIN ISOLATION SERIALIZABLE",
+            "BEGIN LEVEL SERIALIZABLE",
+            "BEGIN ISOLATION LEVEL READ WRITE",
+            "BEGIN ISOLATION LEVEL SERIALIZABLE ISOLATION LEVEL READ COMMITTED",
+            "BEGIN ISOLATION LEVEL SERIALIZABLE ISOLATION LEVEL SERIALIZABLE",
+            "BEGIN , ISOLATION LEVEL SERIALIZABLE",
+            "BEGIN ISOLATION LEVEL SERIALIZABLE,",
+            "BEGIN ISOLATION LEVEL SERIALIZABLE DEFERRABLE",
+            "BEGIN ISOLATION LEVEL SERIALIZABLE NOT DEFERRABLE",
+            "BEGIN ISOLATION LEVEL SERIALIZABLE READ ONLY",
+            "COMMIT ISOLATION LEVEL SERIALIZABLE",
+            "ROLLBACK ISOLATION LEVEL READ COMMITTED",
+        ] {
+            let err = validate_transaction_control_tokens(&tokens_of(sql)).unwrap_err();
+            assert_eq!(err.wire_code(), "42601", "{sql}");
         }
     }
 
