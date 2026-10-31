@@ -490,7 +490,9 @@ fn rejects_syntax_errors_with_42601() {
         "DECLARE n int; BEGIN SELECT 1 INTO n INTO n; END",
         "DECLARE n int; BEGIN PERFORM 1 INTO n; END",
         "BEGIN y := 'abc; END",
-        "BEGIN EXECUTE $q$select 1$q$; END",
+        // #2216 でドル引用が字句化されたため、旧 `$q$...$q$` の拒否例は未終端形へ置換した
+        // （受理側は dollar_quoted_execute_argument_is_accepted）。
+        "BEGIN EXECUTE $q$select 1; END",
         "DECLARE x int NOT NULL; BEGIN NULL; END",
         "DECLARE begin int; BEGIN NULL; END",
         "BEGIN FOO; END",
@@ -1692,4 +1694,22 @@ fn scope_storage_is_linear_in_the_number_of_declarations() {
         panic!("return");
     };
     assert!(e.scope.lookup_var("v2999").is_some());
+}
+
+// ---- ドル引用の字句化（Issue #2216・SQL-67 (1)） ----
+
+#[test]
+fn dollar_quoted_execute_argument_is_accepted() {
+    let _ = ok("BEGIN EXECUTE $q$select 1$q$; END");
+    let _ = ok("BEGIN EXECUTE $$select 1$$; END");
+}
+
+#[test]
+fn dollar_tag_longer_than_limit_is_rejected() {
+    let tag = "a".repeat(64);
+    let src = format!("BEGIN EXECUTE ${tag}$select 1${tag}$; END");
+    assert_eq!(code(&src), "42601");
+    let tag = "a".repeat(63);
+    let src = format!("BEGIN EXECUTE ${tag}$select 1${tag}$; END");
+    let _ = ok(&src);
 }

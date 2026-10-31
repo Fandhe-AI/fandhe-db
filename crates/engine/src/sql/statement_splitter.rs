@@ -22,7 +22,7 @@
 //! 検証し、複数文であることを理由に受理範囲を変えない」に従う）。
 //!
 //! **PostgreSQL と分割結果が食い違いうる構文では分割しない**（fail-closed）。
-//! 未終端の `'...'`・`"..."`・`/* */`、通常状態の `$`（ドル引用）、E 文字列の接頭辞
+//! 未終端の `'...'`・`"..."`・`/* */`、通常状態の `$<数字>`・未終端／識別子隣接のドル引用、E 文字列の接頭辞
 //! （`E'`／`e'`）を検出した場合は [`SplitOutcome::Single`] を返し、全文を engine へ
 //! そのまま渡す（lexer が `42601` で拒否し、1 文も実行されない）。これにより
 //! 「区切りの解釈差を突いて後続の文を密輸する」経路を構造的に塞ぐ。
@@ -47,7 +47,8 @@
 
 use crate::error_format::{ClassifiedError, ErrorClass};
 use crate::sql::lexer::{
-    block_comment_end, line_comment_end, quoted_identifier_end, tokenize, Keyword, Token,
+    block_comment_end, dollar_quote_scan, line_comment_end, quoted_identifier_end, tokenize,
+    DollarQuoteScan, Keyword, Token,
 };
 
 /// 1 メッセージで許容する非空文の上限（実装既定値。WIRE-16 のポインタ）。
@@ -192,9 +193,16 @@ pub fn split_statements(input: &str) -> Result<SplitOutcome<'_>, MultiStatementE
                 Some(end) => i = end,
                 None => return Ok(SplitOutcome::Single),
             },
-            // ドル引用（`$tag$...$tag$`）は PostgreSQL と分割結果が食い違いうる
-            // うえ、`tokenize` も `$` を拒否する。分割せず全文を渡す。
-            b'$' => return Ok(SplitOutcome::Single),
+            // ドル引用（`$tag$...$tag$`）は lexer と同じ `dollar_quote_scan` で本文ごと
+            // 読み飛ばす。未終端・識別子に隣接する形は lexer も拒否するため分割せず
+            // 全文を渡す。`$<数字>` は引用ではないので従来どおり `Single`。
+            b'$' => match dollar_quote_scan(input, i) {
+                DollarQuoteScan::Quoted { end, .. } => {
+                    i = end;
+                    has_content = true;
+                }
+                _ => return Ok(SplitOutcome::Single),
+            },
             // E 文字列（`E'...'`）はバックスラッシュエスケープの解釈が異なり、
             // 引用の終端位置が PostgreSQL と食い違いうる。識別子の途中の `e`
             // （`name'..'` 等）は接頭辞ではないので除外する。
@@ -691,6 +699,24 @@ mod tests {
     }
 
     #[test]
+    fn dollar_quoted_bodies_do_not_split() {
+        for (input, first) in [
+            ("SELECT $$a;b$$; SELECT 2", "SELECT $$a;b$$"),
+            ("SELECT $t$ ; $t$; SELECT 2", "SELECT $t$ ; $t$"),
+            ("SELECT $$ -- ' /* $$; SELECT 2", "SELECT $$ -- ' /* $$"),
+        ] {
+            match split_statements(input).expect("split") {
+                SplitOutcome::Statements(v) => {
+                    assert_eq!(v.len(), 2, "{input}");
+                    assert_eq!(v.first().map(|s| s.trim()), Some(first), "{input}");
+                }
+                other => panic!("expected Statements for {input}: {other:?}"),
+            }
+            assert!(tokenize(first).is_ok(), "{first}");
+        }
+    }
+
+    #[test]
     fn unterminated_constructs_and_ambiguous_syntax_fall_back_to_single() {
         let inputs = [
             "SELECT 'unterminated; SELECT 2",
@@ -698,7 +724,8 @@ mod tests {
             "SELECT 1 /* unterminated; SELECT 2",
             "SELECT 1; /* a /* b */ ; SELECT 2",
             "SELECT $1; SELECT 2",
-            "SELECT $$a;b$$; SELECT 2",
+            "SELECT $$a; SELECT 2",
+            "SELECT a$$x$$; SELECT 2",
             "SELECT E'a\\';b'; SELECT 2",
         ];
         for input in inputs {

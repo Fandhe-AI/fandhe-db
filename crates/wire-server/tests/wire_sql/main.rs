@@ -66,6 +66,7 @@ mod wire_sql58_group_key_expr_matching;
 mod wire_sql58_having_aggregate_calls;
 mod wire_sql58_having_without_group_by;
 mod wire_sql58_order_by_aggregate_calls;
+mod wire_sql67_dollar_quoting;
 mod wire_sql78_noneq_between_param;
 mod wire_sql78_noneq_between_rls;
 mod wire_trigger_ddl;
