@@ -140,7 +140,8 @@ pub enum Token {
     },
     /// 拡張クエリプロトコルのパラメータプレースホルダ `$n`（1 始まり。
     /// Issue #935・WIRE-12・TASK-217）。既定の [`tokenize`] は本トークンを一切
-    /// 生成せず、`$` を引き続き「未対応文字」として拒否する
+    /// 生成せず、`$<数字>` を引き続き「未対応文字」として拒否する（ドル引用は常に
+    /// 1 個の `StringLiteral`。Issue #2216）
     /// （[`tests::rejects_dollar_parameter_placeholder`] で固定）。生成するのは
     /// [`tokenize_with_params`] のみで、生成した `Param` を消費するのは
     /// `sql::params`（Bind 時に実値の [`Token::StringLiteral`] へ置換する）に
@@ -918,6 +919,41 @@ fn tokenize_impl(
             continue;
         }
 
+        // ドル引用（Issue #2216・SQL-67 (1)）: `allow_params` に関わらず 1 個の
+        // `StringLiteral` にする（本文はエスケープを解釈しない）。`$<数字>` は
+        // `NotDollarQuote` となり下の `$n` 分岐へ進む。
+        if c == '$' {
+            match dollar_quote_scan(input, offset) {
+                DollarQuoteScan::Quoted {
+                    content_start,
+                    content_end,
+                    end,
+                } => {
+                    let body = input
+                        .get(content_start..content_end)
+                        .unwrap_or_default()
+                        .to_string();
+                    tokens.push(Token::StringLiteral(body));
+                    advance_to(&mut chars, end);
+                    continue;
+                }
+                DollarQuoteScan::Unterminated => {
+                    return Err(LexError {
+                        message: "unterminated dollar-quoted string".to_string(),
+                        byte_offset: offset,
+                    });
+                }
+                DollarQuoteScan::AdjacentToWord => {
+                    return Err(LexError {
+                        message: "dollar quote must be separated from the preceding word"
+                            .to_string(),
+                        byte_offset: offset,
+                    });
+                }
+                DollarQuoteScan::NotDollarQuote => {}
+            }
+        }
+
         // `$n`（Issue #935・WIRE-12）: `allow_params` が `false` のとき（既定の
         // `tokenize`）は何もせずこの if を素通りし、下の「未対応文字」へ
         // フォールスルーする（既存契約を変えない）。
@@ -1011,6 +1047,79 @@ pub(crate) fn line_comment_end(input: &str, start: usize) -> usize {
         j = j.saturating_add(1);
     }
     j.min(bytes.len())
+}
+
+/// ドル引用（`$$...$$`・`$tag$...$tag$`）の走査結果。lexer・分割器・PL/pgSQL
+/// スキャナが同じ境界判定を共有するための型（SQL-67 (1) のポインタ）。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum DollarQuoteScan {
+    /// ドル引用の開始形ではない（`$<数字>`・単独 `$`・不正なタグ等）。
+    NotDollarQuote,
+    /// 開始形だが直前が識別子継続文字（`a$$x$$`）。PostgreSQL では識別子の一部に
+    /// なる形で、本実装は識別子に `$` を許さないため fail-closed に拒否する。
+    AdjacentToWord,
+    /// 開始形だが同じ区切りの終端が無い。
+    Unterminated,
+    /// 完結したドル引用。本文は `content_start..content_end`、直後は `end`。
+    Quoted {
+        content_start: usize,
+        content_end: usize,
+        end: usize,
+    },
+}
+
+/// ドル引用のタグの最大バイト長（PostgreSQL の識別子長上限 63 に揃える）。
+const MAX_DOLLAR_TAG_LEN: usize = 63;
+
+/// `start`（`$` の位置）がドル引用の開始形なら終端まで走査する。タグは ASCII の
+/// `[A-Za-z_][A-Za-z0-9_]*`（空も可）。終端は開始と完全に同じ区切り（大小区別）の
+/// 最初の出現位置で、`str::find` による線形走査。確保はしない。
+pub(crate) fn dollar_quote_scan(input: &str, start: usize) -> DollarQuoteScan {
+    let bytes = input.as_bytes();
+    if bytes.get(start) != Some(&b'$') {
+        return DollarQuoteScan::NotDollarQuote;
+    }
+    let tag_start = start.saturating_add(1);
+    let mut j = tag_start;
+    match bytes.get(j) {
+        Some(b'$') => {}
+        Some(c) if c.is_ascii_alphabetic() || *c == b'_' => {
+            while bytes
+                .get(j)
+                .is_some_and(|c| c.is_ascii_alphanumeric() || *c == b'_')
+            {
+                j = j.saturating_add(1);
+            }
+            if bytes.get(j) != Some(&b'$') || j.saturating_sub(tag_start) > MAX_DOLLAR_TAG_LEN {
+                return DollarQuoteScan::NotDollarQuote;
+            }
+        }
+        _ => return DollarQuoteScan::NotDollarQuote,
+    }
+    // `j` は閉じ `$` の位置。
+    let content_start = j.saturating_add(1);
+    if let Some(prev) = start.checked_sub(1).and_then(|p| bytes.get(p)) {
+        if prev.is_ascii_alphanumeric() || *prev == b'_' {
+            return DollarQuoteScan::AdjacentToWord;
+        }
+    }
+    let Some(delim) = input.get(start..content_start) else {
+        return DollarQuoteScan::NotDollarQuote;
+    };
+    let Some(rest) = input.get(content_start..) else {
+        return DollarQuoteScan::Unterminated;
+    };
+    match rest.find(delim) {
+        Some(pos) => {
+            let content_end = content_start.saturating_add(pos);
+            DollarQuoteScan::Quoted {
+                content_start,
+                content_end,
+                end: content_end.saturating_add(delim.len()),
+            }
+        }
+        None => DollarQuoteScan::Unterminated,
+    }
 }
 
 /// `/*` で始まるブロックコメントの終端の直後の位置を返す。PostgreSQL と同じく
@@ -1353,6 +1462,74 @@ fn lex_word(input: &str, start: usize) -> (String, usize) {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn dollar_quote_lexes_as_single_string_literal() {
+        let lit = |s: &str| vec![Token::StringLiteral(s.to_string())];
+        let cases: [(&str, &str); 10] = [
+            ("$$abc$$", "abc"),
+            ("$tag$abc$tag$", "abc"),
+            ("$$$$", ""),
+            ("$_$x$_$", "x"),
+            ("$a1$x$a1$", "x"),
+            (
+                "$$it's ''x'' \\ ; -- /* \" $1 $b$\n$$",
+                "it's ''x'' \\ ; -- /* \" $1 $b$\n",
+            ),
+            ("$a$ x $b$a$", " x $b"),
+            ("$$a$$ ", "a"),
+            ("$A$x$a$ y$A$", "x$a$ y"),
+            ("$t$$$$t$", "$$"),
+        ];
+        for (input, body) in cases {
+            assert_eq!(tokenize(input).expect(input), lit(body), "{input}");
+            assert_eq!(
+                tokenize_with_params(input).expect(input),
+                lit(body),
+                "{input}"
+            );
+        }
+    }
+
+    #[test]
+    fn dollar_quote_body_is_not_a_parameter() {
+        let t = tokenize_with_params("SELECT $$ $1 $$, $1").expect("tokenize");
+        let params = t.iter().filter(|t| matches!(t, Token::Param(_))).count();
+        assert_eq!(params, 1);
+    }
+
+    #[test]
+    fn dollar_quote_rejects_malformed_forms() {
+        let long_tag = format!("${}$x${}$", "a".repeat(64), "a".repeat(64));
+        for input in [
+            "$$abc",
+            "$t$abc$T$",
+            "$$",
+            "a$$x$$",
+            "1$$x$$",
+            "$é$x$é$",
+            "$1a$",
+            long_tag.as_str(),
+        ] {
+            assert!(tokenize(input).is_err(), "{input}");
+            assert!(tokenize_with_params(input).is_err(), "{input}");
+        }
+    }
+
+    #[test]
+    fn dollar_quote_render_round_trips_through_single_quotes() {
+        let t = tokenize("SELECT $$it's$$").expect("tokenize");
+        let rendered = render_tokens(&t).expect("render");
+        assert_eq!(rendered, "SELECT 'it''s'");
+        assert_eq!(tokenize(&rendered).expect("re-tokenize"), t);
+        assert_eq!(t, tokenize("SELECT 'it''s'").expect("tokenize"));
+    }
+
+    #[test]
+    fn unterminated_long_dollar_quote_fails_fast() {
+        let input = format!("$$ {}", "x".repeat(MAX_INPUT_LEN - 8));
+        assert!(tokenize(&input).is_err());
+    }
+
     #[test]
     fn bang_equal_lexes_as_not_equal_punct_pair() {
         // Issue #1431: `!=` は `<>` と同じトークン列。`!` 単独・文字列内の `!` は影響しない。

@@ -163,21 +163,18 @@ fn scan_dollar(src: &str, i: &mut usize) -> Result<TokKind, SqlSurfaceError> {
         *i = j;
         return Ok(TokKind::Param(n));
     }
-    while bytes
-        .get(j)
-        .is_some_and(|c| c.is_ascii_alphanumeric() || *c == b'_')
-    {
-        j = j.saturating_add(1);
-    }
-    if bytes.get(j) == Some(&b'$') {
-        let tag_end = j.saturating_add(1);
-        let tag = src.get(start..tag_end).unwrap_or("$$");
-        let rest = src.get(tag_end..).unwrap_or("");
-        let pos = rest
-            .find(tag)
-            .ok_or_else(|| syn_err("unterminated dollar-quoted string in PL/pgSQL body"))?;
-        *i = tag_end.saturating_add(pos).saturating_add(tag.len());
-        return Ok(TokKind::Dollar);
+    // ドル引用の境界判定は SQL 字句解析器と共有する（Issue #2216・SQL-67 (1)）。
+    match crate::sql::lexer::dollar_quote_scan(src, start) {
+        crate::sql::lexer::DollarQuoteScan::Quoted { end, .. } => {
+            *i = end;
+            return Ok(TokKind::Dollar);
+        }
+        crate::sql::lexer::DollarQuoteScan::Unterminated => {
+            return Err(syn_err(
+                "unterminated dollar-quoted string in PL/pgSQL body",
+            ));
+        }
+        _ => {}
     }
     *i = start.saturating_add(1);
     Ok(TokKind::Punct('$'))
