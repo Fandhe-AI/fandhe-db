@@ -30,27 +30,64 @@ use crate::sql::exec::Cell;
 /// 集合返却の累積バイト数の上限（`sql::returning::MAX_RETURNING_RESULT_BYTES` と同値の arena 上限）。
 const MAX_SET_RESULT_BYTES: usize = crate::arena::MAX_ARENA_TOTAL_BYTES;
 
+/// 実行予算の合算カウンタ（文数・ループ反復・呼び出し深さ）。入れ子の起動（式の中の関数呼び出しが
+/// core を経由して再入する経路。Issue #2218・D7）でも合算されるよう、現スレッドの値として持つ。
+/// 実行はスレッドを跨がないため、別接続・別テストのカウンタとは混ざらない。
+#[derive(Debug, Clone, Copy, Default)]
+struct SharedCounters {
+    /// 生きている [`ExecBudget`] の数。0 から 1 になる（最外の）作成でだけカウンタを零へ戻す。
+    live: usize,
+    statements: usize,
+    iterations: usize,
+    depth: usize,
+}
+
+thread_local! {
+    static COUNTERS: std::cell::Cell<SharedCounters> =
+        const { std::cell::Cell::new(SharedCounters { live: 0, statements: 0, iterations: 0, depth: 0 }) };
+}
+
+fn counters() -> SharedCounters {
+    COUNTERS.with(std::cell::Cell::get)
+}
+
+fn set_counters(c: SharedCounters) {
+    COUNTERS.with(|cell| cell.set(c));
+}
+
 /// 1 回のトップレベル起動ごとに 1 個作り、入れ子の呼び出しへ `&mut` で渡して合算する実行予算。
+/// 文数・反復・深さのカウンタは現スレッドの共有値で、`ExecBudget` が生きている間に作られた別の
+/// `ExecBudget`（core 経由で再入した入れ子の起動）とも合算される（`--max-plpgsql-statements`・
+/// `--max-function-call-depth` を LANGUAGE sql の関数と共有するための構造）。
 #[derive(Debug)]
 pub(crate) struct ExecBudget {
     limits: PlpgsqlLimits,
     max_set_rows: usize,
-    statements: usize,
-    iterations: usize,
-    depth: usize,
     set_rows: usize,
     set_bytes: usize,
 }
 
+impl Drop for ExecBudget {
+    fn drop(&mut self) {
+        let mut c = counters();
+        c.live = c.live.saturating_sub(1);
+        set_counters(c);
+    }
+}
+
 impl ExecBudget {
-    /// `max_set_rows` は集合返却の累積行数の上限（`--max-result-rows` の値）。
+    /// `max_set_rows` は集合返却の累積行数の上限（`--max-result-rows` の値）。別の `ExecBudget` が
+    /// 生きていなければ（最外の起動なら）共有カウンタを零へ戻す。
     pub(crate) fn new(limits: PlpgsqlLimits, max_set_rows: usize) -> Self {
+        let mut c = counters();
+        if c.live == 0 {
+            c = SharedCounters::default();
+        }
+        c.live = c.live.saturating_add(1);
+        set_counters(c);
         Self {
             limits,
             max_set_rows,
-            statements: 0,
-            iterations: 0,
-            depth: 0,
             set_rows: 0,
             set_bytes: 0,
         }
@@ -58,39 +95,47 @@ impl ExecBudget {
 
     /// 文を 1 つ実行する前に呼ぶ。上限ちょうどの文数までは実行でき、次の文で `54000`。
     pub(crate) fn tick_statement(&mut self) -> Result<(), SqlSurfaceError> {
-        if self.statements >= self.limits.max_statements() {
+        let mut c = counters();
+        if c.statements >= self.limits.max_statements() {
             return Err(SqlSurfaceError::payload_too_large(
                 "PL/pgSQL statement limit exceeded",
             ));
         }
-        self.statements = self.statements.saturating_add(1);
+        c.statements = c.statements.saturating_add(1);
+        set_counters(c);
         crate::interrupt::check()
     }
 
     /// ループの各反復の頭で呼ぶ。
     pub(crate) fn tick_iteration(&mut self) -> Result<(), SqlSurfaceError> {
-        if self.iterations >= self.limits.max_loop_iterations() {
+        let mut c = counters();
+        if c.iterations >= self.limits.max_loop_iterations() {
             return Err(SqlSurfaceError::payload_too_large(
                 "PL/pgSQL loop iteration limit exceeded",
             ));
         }
-        self.iterations = self.iterations.saturating_add(1);
+        c.iterations = c.iterations.saturating_add(1);
+        set_counters(c);
         crate::interrupt::check()
     }
 
     /// 関数に入る時に呼ぶ（超過は `54001`）。出口では必ず [`Self::leave_call`] を呼ぶ。
     pub(crate) fn enter_call(&mut self) -> Result<(), SqlSurfaceError> {
-        if self.depth >= self.limits.max_call_depth() {
+        let mut c = counters();
+        if c.depth >= self.limits.max_call_depth() {
             return Err(SqlSurfaceError::StatementTooComplex {
                 detail: "PL/pgSQL function call depth limit exceeded",
             });
         }
-        self.depth = self.depth.saturating_add(1);
+        c.depth = c.depth.saturating_add(1);
+        set_counters(c);
         Ok(())
     }
 
     pub(crate) fn leave_call(&mut self) {
-        self.depth = self.depth.saturating_sub(1);
+        let mut c = counters();
+        c.depth = c.depth.saturating_sub(1);
+        set_counters(c);
     }
 
     /// 集合返却に 1 行（概算 `bytes` バイト）を足す前に呼ぶ（追加前検査）。
@@ -393,6 +438,158 @@ fn run_inner(
             "trigger functions cannot be called as ordinary functions",
         )),
     }
+}
+
+/// `LANGUAGE sql` 関数の実行時に埋め込み SQL の変数参照（引数）を引く環境。`vals` は [`VarId`] の
+/// 添字で引き、引数と `FOUND` だけが値を持つ。
+struct ArgEnv {
+    vals: Vec<Option<PlScalar>>,
+}
+
+impl VarLookup for ArgEnv {
+    fn scalar(&self, r: &VarRef) -> Result<&PlScalar, SqlSurfaceError> {
+        match r {
+            VarRef::Var(id) => self
+                .vals
+                .get(id.0 as usize)
+                .and_then(Option::as_ref)
+                .ok_or_else(|| internal("SQL function variable is not bound")),
+            VarRef::Field(..) => Err(internal("SQL function has no record variables")),
+        }
+    }
+}
+
+/// `LANGUAGE sql` 関数の本体（[`crate::plpgsql::parse_sql_function_body`] の結果）を実行する
+/// （Issue #2218・SQL-67 (5)）。各文を順に [`PlHost::exec_sql`] で実行し（呼び出し元と同じ Tx・RLS。
+/// ホストの実装は `core::plpgsql_host`）、最後の文の最初の行の第 1 列を戻り値にする（0 行は NULL）。
+/// 呼び出し深さと文数は [`ExecBudget`] の共有カウンタに数える（上限は `54001`／`54000`）。最後の文が
+/// 1 列でない・型が `ret` へ代入変換できない場合は `42P13`。
+pub(crate) fn run_sql_function(
+    body: &Body,
+    args: Vec<PlScalar>,
+    ret: &CastType,
+    host: &mut dyn PlHost,
+    budget: &mut ExecBudget,
+) -> Result<PlScalar, SqlSurfaceError> {
+    budget.enter_call()?;
+    let r = run_sql_inner(body, args, ret, host, budget);
+    budget.leave_call();
+    r
+}
+
+fn run_sql_inner(
+    body: &Body,
+    args: Vec<PlScalar>,
+    ret: &CastType,
+    host: &mut dyn PlHost,
+    budget: &mut ExecBudget,
+) -> Result<PlScalar, SqlSurfaceError> {
+    let mut vals: Vec<Option<PlScalar>> = vec![None; body.vars.len()];
+    for (slot, decl) in vals.iter_mut().zip(body.vars.iter()) {
+        match (decl.kind, &decl.ty) {
+            (VarKind::Param(n), DeclType::Named(name)) => {
+                let ty = CastType::from_sql_type_name(name)
+                    .ok()
+                    .and_then(|c| c.result_column_type())
+                    .ok_or_else(|| unsupported("unsupported parameter type in a SQL function"))?;
+                let arg = args
+                    .get(usize::from(n).saturating_sub(1))
+                    .cloned()
+                    .ok_or_else(|| internal("SQL function argument count mismatch"))?;
+                *slot = Some(assign_cast(arg, &ty)?);
+            }
+            (VarKind::Found, _) => {
+                *slot = Some(PlScalar::new(Cell::Bool(false), ColumnType::Boolean));
+            }
+            _ => {}
+        }
+    }
+    let env = ArgEnv { vals };
+    let stmts = &body.block.stmts;
+    let total = stmts.len();
+    for (i, st) in stmts.iter().enumerate() {
+        let Stmt::Sql(q) = st else {
+            return Err(internal("unexpected statement in a SQL function body"));
+        };
+        budget.tick_statement()?;
+        let last = i.saturating_add(1) == total;
+        let demand = if last {
+            RowDemand::AtMostTwo
+        } else {
+            RowDemand::None
+        };
+        let out = host.exec_sql(q, &env, demand, budget)?;
+        if !last {
+            continue;
+        }
+        return sql_function_result(out, ret);
+    }
+    Err(bad_function_result(
+        "SQL function body must contain a statement",
+    ))
+}
+
+fn bad_function_result(detail: &str) -> SqlSurfaceError {
+    SqlSurfaceError::invalid_function_definition(detail)
+}
+
+/// 最後の文の結果（1 列。最初の行の値、0 行は NULL）を戻り値型 `ret` へ代入変換する。
+fn sql_function_result(out: SqlOutcome, ret: &CastType) -> Result<PlScalar, SqlSurfaceError> {
+    let mismatch = || bad_function_result("return type mismatch in a SQL function");
+    let [(_, col_ty)] = out.columns.as_slice() else {
+        return Err(bad_function_result(
+            "the last statement of a SQL function must return exactly one column",
+        ));
+    };
+    let ret_ty = ret
+        .result_column_type()
+        .ok_or_else(|| unsupported("unsupported return type in a SQL function"))?;
+    let cell = out
+        .rows
+        .first()
+        .and_then(|r| r.first())
+        .cloned()
+        .unwrap_or(Cell::Null);
+    let v = PlScalar::new(cell, col_ty.clone());
+    // 修飾子なしの `numeric` は値の scale を保つ（`numeric(38,16)` へ丸めない）。
+    if matches!(ret, CastType::Numeric(None)) {
+        match (&v.cell, col_ty) {
+            // NULL の早期 return は列型が numeric 互換のときに限る（他の列型は後段の代入互換性検査
+            // へ進み、行の有無・値にかかわらず型不一致を `42P13` で拒否する）。
+            (
+                Cell::Null,
+                ColumnType::Numeric { .. }
+                | ColumnType::SmallInt
+                | ColumnType::Integer
+                | ColumnType::BigInt,
+            ) => return Ok(PlScalar::null(ret_ty)),
+            (Cell::Numeric(_), ColumnType::Numeric { .. }) => {
+                return Ok(PlScalar::new(v.cell, ret_ty))
+            }
+            (
+                Cell::SignedInteger(i),
+                ColumnType::SmallInt | ColumnType::Integer | ColumnType::BigInt,
+            ) => {
+                let d = crate::numeric::Decimal::from_parts(i128::from(*i), 0)
+                    .map_err(|_| SqlSurfaceError::numeric_out_of_range("value out of range"))?;
+                return Ok(PlScalar::new(Cell::Numeric(d), ret_ty));
+            }
+            _ => {}
+        }
+    }
+    if *col_ty != ret_ty {
+        let assignable = match (
+            crate::sql::cast::cast_type_of_column(col_ty),
+            crate::sql::cast::cast_type_of_column(&ret_ty),
+        ) {
+            (Some(f), Some(t)) => crate::sql::cast::cast_type_assignable(&f, &t),
+            _ => false,
+        };
+        if !assignable {
+            return Err(mismatch());
+        }
+    }
+    assign_cast(v, &ret_ty)
 }
 
 /// 概算バイト数（集合返却の累積上限の検査に使う）。
@@ -1179,7 +1376,7 @@ pub(crate) mod test_support {
 
     impl ExecBudget {
         pub(crate) fn statements_run(&self) -> usize {
-            self.statements
+            super::counters().statements
         }
     }
 }

@@ -13,7 +13,7 @@
 use super::EngineCore;
 use crate::plpgsql::ast::{ParamDecl, ParseOptions, ReturnShape};
 use crate::plpgsql::embedded::validate_embedded;
-use crate::plpgsql::parse_body;
+use crate::plpgsql::{check_result_shape, parse_body, parse_sql_function_body};
 use crate::sql::allowlist::SqlSurfaceError;
 use crate::sql::cast::CastType;
 use crate::sql::ddl_column_type::SqlColumnTypeName;
@@ -64,7 +64,46 @@ fn sql_type_name_of(ty: &CastType) -> Result<SqlColumnTypeName, SqlSurfaceError>
     })
 }
 
+/// 関数シグネチャの引数を PL/pgSQL・SQL 関数本体の解析器へ渡す宣言（名前は小文字へ正規化）へ。
+pub(super) fn param_decls(
+    params: &[String],
+    param_types: &[Option<CastType>],
+) -> Result<Vec<ParamDecl>, SqlSurfaceError> {
+    params
+        .iter()
+        .zip(param_types.iter())
+        .map(|(name, ty)| {
+            let ty = ty
+                .as_ref()
+                .ok_or_else(|| SqlSurfaceError::unsupported("function parameters must be typed"))?;
+            Ok(ParamDecl {
+                name: Some(name.to_ascii_lowercase()),
+                ty: sql_type_name_of(ty)?,
+            })
+        })
+        .collect()
+}
+
 impl EngineCore {
+    /// `LANGUAGE sql` の本体を定義時に検証する（保存はしない。Issue #2218）。本体を文の並びとして解析
+    /// （`plpgsql::parse_sql_function_body`。許可外の文は `0A000`・構文誤りは `42601`・空や結果を返さない
+    /// 最後の文は `42P13`）し、埋め込み SQL を許可リスト解析で分類する。呼び出し元は `core.rs` の
+    /// `Statement::CreateFunction` 腕（`require_ddl_permission` の後・カタログ書き込みの前）。
+    pub(crate) fn validate_sql_function_definition(
+        &self,
+        params: &[String],
+        param_types: &[Option<CastType>],
+        body_source: &str,
+    ) -> Result<(), SqlSurfaceError> {
+        let decls = param_decls(params, param_types)?;
+        let limits = &self.plpgsql_limits;
+        let opts = ParseOptions::new(decls, ReturnShape::Scalar)
+            .with_limits(limits.max_nesting_depth(), limits.max_body_bytes());
+        let mut body = parse_sql_function_body(body_source, &opts)?;
+        validate_embedded(&mut body, self)?;
+        check_result_shape(&body)
+    }
+
     /// `LANGUAGE plpgsql` の本体を定義時に検証する（保存はしない）。`params` は正規化前の名前、
     /// `param_types` は全要素 `Some`（構文段が型なし引数を拒否済み）。呼び出し元は `core.rs` の
     /// `Statement::CreateFunction` 腕で、`require_ddl_permission` の後・カタログ書き込みの前。
@@ -75,19 +114,7 @@ impl EngineCore {
         returns_trigger: bool,
         body_source: &str,
     ) -> Result<(), SqlSurfaceError> {
-        let decls = params
-            .iter()
-            .zip(param_types.iter())
-            .map(|(name, ty)| {
-                let ty = ty.as_ref().ok_or_else(|| {
-                    SqlSurfaceError::unsupported("function parameters must be typed")
-                })?;
-                Ok(ParamDecl {
-                    name: Some(name.to_ascii_lowercase()),
-                    ty: sql_type_name_of(ty)?,
-                })
-            })
-            .collect::<Result<Vec<_>, SqlSurfaceError>>()?;
+        let decls = param_decls(params, param_types)?;
         let shape = if returns_trigger {
             ReturnShape::Trigger
         } else {

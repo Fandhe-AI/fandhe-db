@@ -12,8 +12,8 @@
 //! - 明示 Tx の証人 INSERT（`USING OPERATION_ID`）と同じコミットに載せた `DO` は、再送されても
 //!   副作用が重複しない（証人が先でも `DO` が先でも。再オープン後も同じ）。
 //!
-//! 呼び出し深さ（`54001`）は本番 SQL から PL/pgSQL 関数を呼ぶ配線が無い（#2217・#2218 待ち）ため、
-//! 本ファイルの対象外（`plpgsql/interp_tests.rs` の ScriptedHost で固定済み）。
+//! 呼び出し深さ（`54001`）・文数の入れ子合算の本番経路（SQL から関数を呼ぶ配線）での検証は
+//! `sql67_sql_function_exec.rs`（Issue #2218）に置く。`plpgsql/interp_tests.rs` の ScriptedHost でも固定済み。
 
 use engine::core::EngineCore;
 use engine::kernel::CpuScalarProvider;

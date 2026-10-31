@@ -322,7 +322,16 @@ pub fn classify_statement(stmt: &str) -> StatementEffect {
     };
 
     match first {
-        Token::Keyword(Keyword::Select) => StatementEffect::ReadOnly,
+        // SQL-67 (5)・Issue #2218: ユーザー定義関数（組み込みでない名前の呼び出し）を含む `SELECT` は、
+        // `LANGUAGE sql|plpgsql` の本体が書き込みうるため `Write` に倒す（fail-closed。複数文メッセージの
+        // 書き込み配置制約をすり抜けない）。誤って `Write` にしても暗黙トランザクションになるだけ。
+        Token::Keyword(Keyword::Select) => {
+            if calls_non_builtin_function(&tokens) {
+                StatementEffect::Write
+            } else {
+                StatementEffect::ReadOnly
+            }
+        }
         Token::Ident(name) if name.eq_ignore_ascii_case("EXPLAIN") => StatementEffect::ReadOnly,
         // Issue #1129: `SHOW PARTITIONED DML` はジョブ表の読み取りのみ（commit を伴わない）。
         // `CANCEL`（書き込み）は未知の先頭語として `Write`（fail-closed）に落とす。
@@ -359,7 +368,7 @@ pub fn classify_statement(stmt: &str) -> StatementEffect {
                                 || n.eq_ignore_ascii_case("DELETE")
                     )
             });
-            if has_dml_body {
+            if has_dml_body || calls_non_builtin_function(&tokens) {
                 StatementEffect::Write
             } else {
                 StatementEffect::ReadOnly
@@ -395,6 +404,448 @@ pub fn classify_statement(stmt: &str) -> StatementEffect {
         // 形であり、必ず `validate_sql` の許可リスト外（`42601`）へ落ちる。
         _ => StatementEffect::Rejected,
     }
+}
+
+/// `calls_non_builtin_function` 用: `名前(` が構文語としての用法と確認できるか。確認できない
+/// （呼び出しとも読める）場合は `false`＝呼び出し扱い（`Write`＝fail-closed）。
+/// 構文語は予約されないため同名のユーザー関数が定義でき、構文位置でない `(` 直前の出現は呼び出しになる。
+///   - 中置語（`IN`・`ON`・`OR`・`IS`・`LIKE`・`BETWEEN`・`AS`・`USING`・`THEN`・`ELSE`・集合演算・
+///     `OFFSET`・`GROUP`・`HAVING`・`WITH`・`COLLATE`）: 直前が式の終端のときだけ構文
+///     （`NOT IN (` 等は `NOT` の更に前が式の終端のとき）
+///   - `NOT`: 述語の文脈語（`WHERE`・`AND`・`OR`・`HAVING`・`ON`・`WHEN`・`THEN`・`ELSE`）の直後だけ構文
+///   - `EXISTS`・`ARRAY`: 直後が副問い合わせ（`SELECT`／`WITH`／`VALUES`）のときだけ構文
+///   - `WHEN`: 直前が `CASE` か式の終端のときだけ構文
+///   - `EXTRACT`・`OVERLAY`: 引数内に `FROM`・`PLACING` の構文形があるときだけ構文
+///   - 窓関数名: 対応する `)` の直後が `OVER` のときだけ構文
+///   - `VALUES`・`DISTINCT`・`ROW`・`UNNEST`: 式の先頭の呼び出しと区別できないため常に呼び出し扱い
+///   - `FROM`・`BY`: `Ident` で届くのは引用識別子のみ（構文の `FROM`・`BY` は `Keyword`）なので常に呼び出し扱い
+///   - 上記以外（`JSON_EXISTS` 等の専用構文）は従来どおり構文語
+fn syntax_form_confirmed(
+    tokens: &[Token],
+    i: usize,
+    name: &str,
+    expr_prefix_words: &[&str],
+) -> bool {
+    let is = |w: &str| name.eq_ignore_ascii_case(w);
+    let ident_at = |idx: usize, words: &[&str]| {
+        matches!(
+            tokens.get(idx),
+            Some(Token::Ident(a)) if words.iter().any(|w| a.eq_ignore_ascii_case(w))
+        )
+    };
+    // 位置 `idx` の直前が式の終端（識別子・`)`・リテラル。式演算子語・句の語は除く）か。
+    let terminator_before = |idx: usize| {
+        idx > 0
+            && match tokens.get(idx - 1) {
+                Some(Token::Punct(')'))
+                | Some(Token::QualifiedIdent { .. })
+                | Some(Token::Number(_))
+                | Some(Token::StringLiteral(_)) => true,
+                Some(Token::Ident(a)) => {
+                    !expr_prefix_words.iter().any(|w| a.eq_ignore_ascii_case(w))
+                }
+                _ => false,
+            }
+    };
+    let subquery_follows = matches!(
+        tokens.get(i.saturating_add(2)),
+        Some(Token::Keyword(Keyword::Select))
+    ) || ident_at(i.saturating_add(2), &["WITH", "VALUES"]);
+    // `(` に対応する `)` の位置（なければ `None`）。
+    let matching_close = || {
+        let mut depth = 0usize;
+        for (j, tk) in tokens.iter().enumerate().skip(i.saturating_add(1)) {
+            match tk {
+                Token::Punct('(') => depth = depth.saturating_add(1),
+                Token::Punct(')') => {
+                    depth = depth.saturating_sub(1);
+                    if depth == 0 {
+                        return Some(j);
+                    }
+                }
+                _ => {}
+            }
+        }
+        None
+    };
+    // `FROM`・`BY` は引用符なしならトークナイザが `Keyword` にするため、`Ident` で届くのは引用識別子
+    // （`"from"(...)`）だけで、構文ではなく関数呼び出しになる。常に呼び出し扱い（`Write`）とする。
+    if is("VALUES") || is("DISTINCT") || is("ROW") || is("UNNEST") || is("FROM") || is("BY") {
+        return false;
+    }
+    if is("NOT") {
+        return i > 0
+            && (matches!(
+                tokens.get(i - 1),
+                Some(Token::Keyword(Keyword::Where)) | Some(Token::Keyword(Keyword::And))
+            ) || ident_at(i - 1, &["OR", "HAVING", "ON", "WHEN", "THEN", "ELSE"]));
+    }
+    if is("EXISTS") || is("ARRAY") {
+        return subquery_follows;
+    }
+    if is("WHEN") {
+        return (i > 0 && ident_at(i - 1, &["CASE"])) || terminator_before(i);
+    }
+    if is("EXTRACT") || is("OVERLAY") {
+        let target = if is("EXTRACT") { "FROM" } else { "PLACING" };
+        let Some(close) = matching_close() else {
+            return false;
+        };
+        let mut depth = 0usize;
+        return tokens
+            .iter()
+            .enumerate()
+            .skip(i.saturating_add(2))
+            .take_while(|(j, _)| *j < close)
+            .any(|(_, tk)| match tk {
+                Token::Punct('(') => {
+                    depth = depth.saturating_add(1);
+                    false
+                }
+                Token::Punct(')') => {
+                    depth = depth.saturating_sub(1);
+                    false
+                }
+                Token::Ident(a) => depth == 0 && a.eq_ignore_ascii_case(target),
+                Token::Keyword(Keyword::From) => depth == 0 && target == "FROM",
+                _ => false,
+            });
+    }
+    if [
+        "ROW_NUMBER",
+        "RANK",
+        "DENSE_RANK",
+        "PERCENT_RANK",
+        "CUME_DIST",
+        "NTILE",
+        "LAG",
+        "LEAD",
+        "FIRST_VALUE",
+        "LAST_VALUE",
+        "NTH_VALUE",
+    ]
+    .iter()
+    .any(|w| is(w))
+    {
+        return matching_close().is_some_and(|close| ident_at(close.saturating_add(1), &["OVER"]));
+    }
+    if [
+        "IN",
+        "ON",
+        "OR",
+        "IS",
+        "LIKE",
+        "ILIKE",
+        "BETWEEN",
+        "AS",
+        "USING",
+        "THEN",
+        "ELSE",
+        "UNION",
+        "INTERSECT",
+        "EXCEPT",
+        "OFFSET",
+        "GROUP",
+        "HAVING",
+        "WITH",
+        "COLLATE",
+    ]
+    .iter()
+    .any(|w| is(w))
+    {
+        if terminator_before(i) {
+            return true;
+        }
+        // `a NOT IN (` / `a NOT LIKE (` / `a IS NOT (` の `NOT` を挟む形。
+        return i > 0
+            && ident_at(i - 1, &["NOT"])
+            && (is("IN") || is("LIKE") || is("ILIKE") || is("BETWEEN") || is("IS"))
+            && terminator_before(i - 1);
+    }
+    true
+}
+
+/// `(` の直前の語が構文上の語（`IN`・`AS`・`OVER` 等）でも組み込み関数名でもない呼び出しを含むか
+/// （ユーザー定義関数の呼び出しの保守的な検出。構文語の取りこぼしは `Write` 側へ倒れるだけ）。
+fn calls_non_builtin_function(tokens: &[Token]) -> bool {
+    // 構文上 `(` の直前に現れない語（`END`・`NULL`・`TRUE`・`FALSE`・`DEFAULT`）は含めない。これらは
+    // 予約されない名前として同名のユーザー関数がありうるため、`(` が続けば呼び出し（`Write`）とする。
+    const SYNTAX_WORDS: &[&str] = &[
+        "IN",
+        "AS",
+        "ON",
+        "OR",
+        "NOT",
+        "ANY",
+        "ALL",
+        "SOME",
+        "EXISTS",
+        "VALUES",
+        "USING",
+        "WHEN",
+        "THEN",
+        "ELSE",
+        "CASE",
+        "BETWEEN",
+        "LIKE",
+        "ILIKE",
+        "DISTINCT",
+        "WITH",
+        "UNION",
+        "INTERSECT",
+        "EXCEPT",
+        "OFFSET",
+        "GROUP",
+        "HAVING",
+        "TO",
+        "IS",
+        "ARRAY",
+        "LATERAL",
+        "JOIN",
+        "INNER",
+        "LEFT",
+        "RIGHT",
+        "FULL",
+        "CROSS",
+        "NATURAL",
+        "COLLATE",
+        "CAST",
+        "EXTRACT",
+        "FROM",
+        "BY",
+        "UNNEST",
+        "JSON_EXISTS",
+        "JSON_VALUE",
+        "JSON_QUERY",
+        "ROW",
+        "TRIM",
+        "POSITION",
+        "OVERLAY",
+        "SUBSTRING",
+        "ROW_NUMBER",
+        "RANK",
+        "DENSE_RANK",
+        "PERCENT_RANK",
+        "CUME_DIST",
+        "NTILE",
+        "LAG",
+        "LEAD",
+        "FIRST_VALUE",
+        "LAST_VALUE",
+        "NTH_VALUE",
+    ];
+    // 型名と同名のユーザー関数がありうる語。直前が `::`・`AS`（型修飾子の位置）と確認できる場合に
+    // 限り構文語として除外し、確認できなければ呼び出し（`Write`）とする。
+    const TYPE_WORDS: &[&str] = &[
+        "NUMERIC",
+        "DECIMAL",
+        "VARCHAR",
+        "CHAR",
+        "CHARACTER",
+        "BPCHAR",
+        "VECTOR",
+        "TIMESTAMP",
+        "TIMESTAMPTZ",
+        "TIME",
+        "TIMETZ",
+        "INTERVAL",
+        "BIT",
+        "VARBIT",
+        "FLOAT",
+    ];
+    // 同名のユーザー関数がありうる構文語（位置で構文かどうかを確認する語）。
+    const POSITIONAL_SYNTAX_WORDS: &[&str] = &[
+        "LATERAL", "TO", "JOIN", "INNER", "CROSS", "NATURAL", "FULL", "LEFT", "RIGHT",
+    ];
+    // 直後に式（関数呼び出し）が来る語。直前がこれらなら `(` 直前の語は式の先頭＝呼び出し形。
+    const EXPR_PREFIX_WORDS: &[&str] = &[
+        "ZONE",
+        "ESCAPE",
+        "TO",
+        "JOIN",
+        "LATERAL",
+        "DISTINCT",
+        "ALL",
+        "AND",
+        "OR",
+        "NOT",
+        "WHEN",
+        "THEN",
+        "ELSE",
+        "CASE",
+        "BY",
+        "IN",
+        "IS",
+        "LIKE",
+        "ILIKE",
+        "BETWEEN",
+        "SELECT",
+        "WHERE",
+        "ON",
+        "HAVING",
+        "OFFSET",
+        "LIMIT",
+        "RETURNING",
+        "SET",
+        "VALUES",
+        "DEFAULT",
+        "FROM",
+        "USING",
+        "AS",
+    ];
+    tokens.iter().enumerate().any(|(i, t)| {
+        // `schema.func(...)`（修飾付き呼び出し）は構文語になりえないため常に呼び出しとして扱う。
+        if matches!(t, Token::QualifiedIdent { .. })
+            && matches!(tokens.get(i.saturating_add(1)), Some(Token::Punct('(')))
+        {
+            return true;
+        }
+        let (Token::Ident(name), Some(Token::Punct('('))) = (t, tokens.get(i.saturating_add(1)))
+        else {
+            return false;
+        };
+        // `USING PLAN(...)` の `PLAN` は直前が `USING` のときだけ構文語。それ以外の `plan(...)`、
+        // および `ERROR`・`EMPTY`・`KEYS` 等の予約されない名前は同名のユーザー関数でありうるため
+        // 構文語として除外せず、呼び出しとして扱う（`Write` 側＝fail-closed）。
+        let is_using_plan = name.eq_ignore_ascii_case("PLAN")
+            && i > 0
+            && matches!(
+                tokens.get(i - 1),
+                Some(Token::Ident(a)) if a.eq_ignore_ascii_case("USING")
+            );
+        // 予約されない名前（`materialized`・`filter`・`over` 等）は同名のユーザー関数でありうる。
+        // 直前のトークンで構文位置（`AS|NOT MATERIALIZED (`・`) FILTER (`・`) OVER (`）と
+        // 確認できる場合に限り構文語として除外し、確認できなければ呼び出し（`Write`）とする。
+        let prev_ident_is = |words: &[&str]| {
+            i > 0
+                && matches!(
+                    tokens.get(i - 1),
+                    Some(Token::Ident(a)) if words.iter().any(|w| a.eq_ignore_ascii_case(w))
+                )
+        };
+        let prev_is_close = i > 0 && matches!(tokens.get(i - 1), Some(Token::Punct(')')));
+        let is_contextual_syntax = (name.eq_ignore_ascii_case("MATERIALIZED")
+            && prev_ident_is(&["AS", "NOT"]))
+            || ((name.eq_ignore_ascii_case("FILTER") || name.eq_ignore_ascii_case("OVER"))
+                && prev_is_close);
+        let is_type_modifier = TYPE_WORDS.iter().any(|k| name.eq_ignore_ascii_case(k))
+            && i > 0
+            && match tokens.get(i - 1) {
+                Some(Token::TypeCast) => true,
+                Some(Token::Ident(a)) => a.eq_ignore_ascii_case("AS"),
+                _ => false,
+            };
+        // 型付きリテラル `TIMESTAMP(3) '...'`（修飾子の閉じ括弧の直後が文字列リテラル）も型修飾子。
+        let is_typed_literal = TYPE_WORDS.iter().any(|k| name.eq_ignore_ascii_case(k)) && {
+            let mut depth = 0usize;
+            let mut after = None;
+            for (j, tk) in tokens.iter().enumerate().skip(i.saturating_add(1)) {
+                match tk {
+                    Token::Punct('(') => depth = depth.saturating_add(1),
+                    Token::Punct(')') => {
+                        depth = depth.saturating_sub(1);
+                        if depth == 0 {
+                            after = tokens.get(j.saturating_add(1));
+                            break;
+                        }
+                    }
+                    _ => {}
+                }
+            }
+            matches!(after, Some(Token::StringLiteral(_)))
+        };
+        // `LATERAL`・`TO`・`JOIN` 系は `is_reserved_function_name` に含まれず、同名のユーザー関数
+        // （`lateral()` 等）を定義・呼び出せる。構文位置と確認できる場合に限り構文語として除外し、
+        // 確認できなければ呼び出し（`Write`＝fail-closed）とする。
+        //   - `LATERAL (` は直後が `SELECT`／`WITH`／`VALUES`（副問い合わせ）のときだけ構文
+        //   - `JOIN`・`TO` 等は直前が式の終端（識別子・`)`）で、式演算子語でないときだけ構文
+        let is_contextual_word = POSITIONAL_SYNTAX_WORDS
+            .iter()
+            .any(|k| name.eq_ignore_ascii_case(k));
+        let positional_confirmed = if name.eq_ignore_ascii_case("LATERAL") {
+            matches!(
+                tokens.get(i.saturating_add(2)),
+                Some(Token::Keyword(Keyword::Select))
+            ) || matches!(
+                tokens.get(i.saturating_add(2)),
+                Some(Token::Ident(a))
+                    if a.eq_ignore_ascii_case("WITH") || a.eq_ignore_ascii_case("VALUES")
+            )
+        } else {
+            i > 0
+                && match tokens.get(i - 1) {
+                    Some(Token::Punct(')')) | Some(Token::QualifiedIdent { .. }) => true,
+                    Some(Token::Ident(a)) => {
+                        !EXPR_PREFIX_WORDS.iter().any(|w| a.eq_ignore_ascii_case(w))
+                    }
+                    _ => false,
+                }
+        };
+        // 上記以外の構文語（`ON`・`IN`・`OR`・`NOT`・`EXISTS`・`VALUES`・`WHEN`・`EXTRACT`・窓関数名 等）も
+        // 予約語ではなく、同名のユーザー関数を定義して式の先頭位置（`SELECT on()` 等）から呼べる。
+        // 位置・形から構文と確認できる場合に限り除外し、確認できなければ呼び出し（`Write`）とする。
+        let is_syntax_word = SYNTAX_WORDS.iter().any(|k| name.eq_ignore_ascii_case(k))
+            && if is_contextual_word {
+                positional_confirmed
+            } else {
+                syntax_form_confirmed(tokens, i, name, EXPR_PREFIX_WORDS)
+            };
+        if is_using_plan
+            || is_contextual_syntax
+            || is_type_modifier
+            || is_typed_literal
+            || is_syntax_word
+            || crate::sql::udf_call::is_reserved_function_name(name)
+        {
+            return false;
+        }
+        // `AS 別名(列, ...)` は別名の列名リストで、呼び出しではない。
+        if i > 0
+            && matches!(
+                tokens.get(i - 1),
+                Some(Token::Ident(a)) if a.eq_ignore_ascii_case("AS")
+            )
+        {
+            return false;
+        }
+        // `名前(列, ...) AS (` は CTE の列名リストで、呼び出しではない。
+        let mut depth = 0usize;
+        for (j, tk) in tokens.iter().enumerate().skip(i.saturating_add(1)) {
+            match tk {
+                Token::Punct('(') => depth = depth.saturating_add(1),
+                Token::Punct(')') => {
+                    depth = depth.saturating_sub(1);
+                    if depth == 0 {
+                        // CTE 定義は `AS [NOT] [MATERIALIZED] (` の形に限る。投影の別名
+                        // `w() AS result` は後ろが `(` にならないため呼び出しとして扱う。
+                        let mut k = j.saturating_add(1);
+                        if !matches!(
+                            tokens.get(k),
+                            Some(Token::Ident(a)) if a.eq_ignore_ascii_case("AS")
+                        ) {
+                            return true;
+                        }
+                        k = k.saturating_add(1);
+                        if matches!(
+                            tokens.get(k),
+                            Some(Token::Ident(a)) if a.eq_ignore_ascii_case("NOT")
+                        ) {
+                            k = k.saturating_add(1);
+                        }
+                        if matches!(
+                            tokens.get(k),
+                            Some(Token::Ident(a)) if a.eq_ignore_ascii_case("MATERIALIZED")
+                        ) {
+                            k = k.saturating_add(1);
+                        }
+                        return !matches!(tokens.get(k), Some(Token::Punct('(')));
+                    }
+                }
+                _ => {}
+            }
+        }
+        true
+    })
 }
 
 /// `COPY` 文のトークン列を [`StatementEffect`] へ分類する（[`classify_statement`] の
@@ -860,6 +1311,98 @@ mod tests {
             statements(outcome),
             vec!["SELECT 1 WHERE body = 'あ;い'", "SELECT 2"]
         );
+    }
+
+    /// Issue #2218: 組み込みだけの `SELECT` は読み取り、ユーザー定義関数の呼び出しを含めば書き込み
+    /// 扱い（`LANGUAGE sql|plpgsql` の本体が書きうるため）。構文語の括弧は呼び出しと誤認しない。
+    #[test]
+    fn classify_statement_treats_user_defined_calls_as_writes() {
+        for sql in [
+            "SELECT 1",
+            "SELECT abs(1), upper('a')",
+            "SELECT count(*) FROM t",
+            "SELECT a FROM t WHERE a IN (1, 2)",
+            "SELECT CAST(1 AS int)",
+            "SELECT a FROM t WHERE NOT (a = 1)",
+            "WITH x AS (SELECT id FROM t) SELECT * FROM x LIMIT 1",
+            "SELECT id FROM t USING PLAN('find the invoices')",
+            "SELECT coalesce(a, 1), nullif(a, 2), greatest(a, 1), least(a, 1) FROM t",
+            "SELECT date_trunc('day', ts), date_part('year', ts), now() FROM t",
+            "SELECT timezone('UTC', ts), extract(year FROM ts) FROM t",
+            "SELECT id FROM t AS x(a, b)",
+            "SELECT CAST(a AS numeric(10, 2)), a::varchar(5), b::vector(3) FROM t",
+            "SELECT a FROM t WHERE a BETWEEN 1 AND (2)",
+            "SELECT row_number() OVER (ORDER BY a) FROM t",
+            "SELECT array_length(arr, 1), jsonb_build_object('a', 1) FROM t",
+            "SELECT trim(b), position('a' IN b), overlay(b PLACING 'x' FROM 1) FROM t",
+            "SELECT TIMESTAMP(3) '2024-01-01 00:00:00'",
+            "WITH x AS MATERIALIZED (SELECT id FROM t) SELECT * FROM x",
+            "WITH x AS NOT MATERIALIZED (SELECT id FROM t) SELECT * FROM x",
+            "SELECT count(*) FILTER (WHERE a > 1) FROM t",
+            "SELECT a FROM t JOIN (SELECT a FROM u) x ON t.a = x.a",
+            "SELECT a FROM t, LATERAL (SELECT a FROM u) x",
+            "SELECT a FROM t JOIN u ON (t.a = u.a)",
+            "SELECT a FROM t WHERE a NOT IN (1, 2) OR (a = 3)",
+            "SELECT a FROM t WHERE EXISTS (SELECT 1 FROM u) AND NOT (a = 1)",
+            "SELECT CASE WHEN (a = 1) THEN (2) ELSE (3) END FROM t",
+            "SELECT a FROM t UNION (SELECT a FROM u)",
+            "SELECT a FROM t JOIN u USING (a)",
+            "SELECT a FROM t GROUP BY a HAVING (count(*) > 1)",
+            "SELECT a FROM t LIMIT 1 OFFSET (1)",
+            "SELECT ntile(2) OVER (ORDER BY a), lag(a) OVER (ORDER BY a) FROM t",
+        ] {
+            assert_eq!(classify_statement(sql), StatementEffect::ReadOnly, "{sql}");
+        }
+        for sql in [
+            "SELECT s.f()",
+            "SELECT 1 FROM t WHERE s.f(a) = 1",
+            "SELECT end()",
+            "SELECT null(), true(), false(), default()",
+            "SELECT now() AT TIME ZONE to(1)",
+            "SELECT now() AT TIME ZONE join(1)",
+            "SELECT a FROM t WHERE a LIKE 'x' ESCAPE to(1)",
+            "SELECT numeric()",
+            "SELECT varchar(1)",
+            "SELECT 1/0, vector(1)",
+            "SELECT my_fn(1)",
+            "SELECT abs(my_fn(1))",
+            "SELECT a FROM t WHERE my_fn(a) = 1",
+            "WITH x AS (SELECT my_fn(1)) SELECT * FROM x",
+            "SELECT w() AS result",
+            "SELECT error()",
+            "SELECT empty(1), keys(2)",
+            "SELECT a FROM t USING PLAN(w())",
+            "SELECT plan(1)",
+            "SELECT materialized()",
+            "SELECT filter(1), over(2), search(3), rows(4)",
+            "SELECT returning()",
+            "SELECT window(1)",
+            "SELECT lateral()",
+            "SELECT 1, lateral(1)",
+            "SELECT a FROM t WHERE to(a) = 1",
+            "SELECT DISTINCT join()",
+            "SELECT a FROM t WHERE a > 0 AND left_()",
+            "SELECT on()",
+            "SELECT \"on\"()",
+            "SELECT in(1), or(1), is(1), like(1), ilike(1), between(1)",
+            "SELECT a FROM t WHERE a = on(1)",
+            "SELECT not(1), exists(1), values(1), when(1), then(1), else(1)",
+            "SELECT distinct(1), row(1), unnest(1), with(1), union(1), offset(1)",
+            "SELECT extract(1), overlay(1), row_number(), rank(), lag(1)",
+            "SELECT using(1), group(1), having(1), collate(1), intersect(1), except(1)",
+            "SELECT a FROM t WHERE a = 1 AND in(1)",
+        ] {
+            assert_eq!(classify_statement(sql), StatementEffect::Write, "{sql}");
+        }
+    }
+
+    /// 引用識別子の構文語名（`"from"`・`"by"`）は ReadOnly にならない。現状は lexer が
+    /// `Rejected` へ落とすが、将来受理されても呼び出し（`Write`）側に倒れる契約を固定する。
+    #[test]
+    fn quoted_syntax_word_calls_are_never_read_only() {
+        for sql in ["SELECT \"from\"()", "SELECT \"by\"()", "SELECT \"on\"()"] {
+            assert_ne!(classify_statement(sql), StatementEffect::ReadOnly, "{sql}");
+        }
     }
 
     #[test]

@@ -2538,12 +2538,30 @@ pub struct UdfRegistry {
     catalog_scope: Option<Box<str>>,
     /// ロード時に読んだ UDF カタログの世代（`Storage` のテナント単位の世代）。
     catalog_generation: u64,
+    /// `LANGUAGE sql|plpgsql` の関数（Issue #2218・SQL-67）。宣言的 UDF（`defs`）・WASM UDF と同じ
+    /// 名前空間を共有し、出所管理（`catalog_names`）も共通。式のインライン展開はせず、呼び出し時に
+    /// `core::routine_call` が本体を実行する。
+    routines: std::collections::BTreeMap<String, Arc<RoutineDefinition>>,
+}
+
+/// `LANGUAGE sql|plpgsql` の関数 1 件の呼び出しに必要な定義（Issue #2218）。UDF カタログの行から
+/// 復元し、本体は原文のまま保持する（解析は呼び出し時。設計記録 `plpgsql-subset.md` の D2）。
+/// 引数は全て名前付き・型付きで、型修飾子は構文段で正規化済み。`ret` は `RETURNS trigger` なら `None`。
+#[derive(Debug, Clone, PartialEq)]
+pub(crate) struct RoutineDefinition {
+    pub(crate) params: Vec<String>,
+    pub(crate) param_types: Vec<crate::sql::cast::CastType>,
+    pub(crate) ret: Option<crate::sql::cast::CastType>,
+    pub(crate) language: crate::catalog::function::FunctionLanguage,
+    pub(crate) attrs: crate::catalog::function::FunctionAttributes,
+    pub(crate) body_source: String,
 }
 
 impl PartialEq for UdfRegistry {
     fn eq(&self, other: &Self) -> bool {
         if self.defs != other.defs
             || self.wasm.len() != other.wasm.len()
+            || self.routines != other.routines
             || self.catalog_names != other.catalog_names
             || self.catalog_scope != other.catalog_scope
             || self.catalog_generation != other.catalog_generation
@@ -2571,11 +2589,29 @@ impl UdfRegistry {
     }
 
     pub fn len(&self) -> usize {
-        self.defs.len() + self.wasm.len()
+        self.defs.len() + self.wasm.len() + self.routines.len()
     }
 
     pub fn is_empty(&self) -> bool {
-        self.defs.is_empty() && self.wasm.is_empty()
+        self.defs.is_empty() && self.wasm.is_empty() && self.routines.is_empty()
+    }
+
+    /// `LANGUAGE sql|plpgsql` の関数を名前で引く（Issue #2218。`core::routine_call` と
+    /// `sql::const_select` の呼び出し位置の畳み込みが使う）。
+    pub(crate) fn get_routine(&self, name: &str) -> Option<&Arc<RoutineDefinition>> {
+        self.routines.get(&name.to_ascii_lowercase())
+    }
+
+    /// ルーチンを 1 件登録する（呼び出し側が名前の衝突を検査済み。`sql::udf_load`・
+    /// `sql::udf_ddl` が使う）。
+    pub(crate) fn insert_routine(&mut self, name: &str, def: RoutineDefinition) {
+        self.routines
+            .insert(name.to_ascii_lowercase(), Arc::new(def));
+    }
+
+    /// ルーチンが 1 件でも登録されているか（呼び出し位置の走査を省く判定）。
+    pub(crate) fn has_routines(&self) -> bool {
+        !self.routines.is_empty()
     }
 
     /// 宣言的 UDF・WASM UDF を名前（大文字小文字を区別しない）で削除し、削除したら `true`
@@ -2585,7 +2621,8 @@ impl UdfRegistry {
         self.catalog_names.remove(&lower);
         let a = self.defs.remove(&lower).is_some();
         let b = self.wasm.remove(&lower).is_some();
-        a || b
+        let c = self.routines.remove(&lower).is_some();
+        a || b || c
     }
 
     /// `name` の登録が UDF カタログ由来か（永続定義の依存検査・ロード時の衝突判定に使う）。
@@ -2603,7 +2640,7 @@ impl UdfRegistry {
     /// `sql::udf_ddl::execute_create_function_persistent` から。未登録の名前は無視する）。
     pub(crate) fn mark_catalog_origin(&mut self, name: &str) {
         let lower = name.to_ascii_lowercase();
-        if self.defs.contains_key(&lower) {
+        if self.defs.contains_key(&lower) || self.routines.contains_key(&lower) {
             self.catalog_names.insert(lower);
         }
     }
@@ -2613,6 +2650,7 @@ impl UdfRegistry {
     pub(crate) fn remove_catalog_entries(&mut self) {
         for name in std::mem::take(&mut self.catalog_names) {
             self.defs.remove(&name);
+            self.routines.remove(&name);
         }
     }
 
@@ -2636,7 +2674,9 @@ impl UdfRegistry {
     /// いるかを判定する（[`define_function`]・[`define_wasm_function`] が共有する
     /// 衝突検査）。
     pub(crate) fn is_name_taken(&self, lower: &str) -> bool {
-        self.defs.contains_key(lower) || self.wasm.contains_key(lower)
+        self.defs.contains_key(lower)
+            || self.wasm.contains_key(lower)
+            || self.routines.contains_key(lower)
     }
 }
 
@@ -8230,6 +8270,15 @@ fn bind_call(
                 detail: "malformed internal typed value".to_string(),
             }),
         };
+    }
+    // `LANGUAGE sql|plpgsql` の関数（Issue #2218）は、`FROM` の無い `SELECT` の投影・`WHERE` で畳み込まれる
+    // （`sql::routine_fold`）。畳み込みを経ないこの束縛器へ届いた呼び出し（表を読む `SELECT`・`INSERT`・
+    // `CHECK`・`DEFAULT`・宣言的 UDF の本体等）は、未定義（`42883`）に化けさせず `0A000` で拒否する。
+    if env.registry.get_routine(name).is_some() {
+        return Err(SqlSurfaceError::FeatureNotSupported {
+            detail: "calling a LANGUAGE sql or plpgsql function is not supported in this context"
+                .to_string(),
+        });
     }
     if args.len() > MAX_FUNCTION_CALL_ARGS {
         return Err(SqlSurfaceError::TooManyArguments {

@@ -653,8 +653,8 @@ SQL-68 ポインタ。D9 の内部 API と `DO` を実装した。公開 enum `S
   `0A000`）。
 - 名前空間: セッションのレジストリは多重定義を持たないため、言語をまたぐ同名は `42723`（PostgreSQL は型で
   解決する）。`CREATE OR REPLACE` で宣言的 UDF を置き換えたら、commit 後にセッションの旧本体の展開を取り除く。
-- 呼び出し: `sql`／`plpgsql` 関数は #2218 が結線するまで式から呼べず `42883`（`udf_load` が非宣言的な定義を
-  読み飛ばす）。`FunctionAttributes::allows_writes()`（`VOLATILE` のみ真）を #2218 が `PlCallOptions::may_write` の
+- 呼び出し: `sql`／`plpgsql` 関数は #2217 の時点では式から呼べず `42883` だった（#2218 で解消。下記の
+  「Issue #2218 追記」）。`FunctionAttributes::allows_writes()`（`VOLATILE` のみ真）を #2218 が `PlCallOptions::may_write` の
   決定に使う。`IMMUTABLE`／`STABLE` の本体の書き込みは定義時に拒否せず、実行時に `0A000` にする。
 - 式索引・部分索引: 構文段（カタログ非参照）は組み込み以外の関数に達した時点で判定を保留し、`core.rs` が
   権限検査の後（権限が無ければ従来の `0A000` のまま）に自テナントの UDF カタログで解決する
@@ -663,6 +663,68 @@ SQL-68 ポインタ。D9 の内部 API と `DO` を実装した。公開 enum `S
   評価できず fail-open になるため。未定義名が `0A000`（PostgreSQL は `42883`）なのは既知の差。
 - 既知の差・後続: 呼び出しと `STRICT` の実行時の意味は #2218、`RETURN`／`BEGIN ATOMIC` は #2219、
   `SETOF`／`TABLE`／`void` は #2220 以降。IMMUTABLE 関数・内容で決定的な宣言的 UDF を索引で受け入れる対応は未着手。
+
+## Issue #2218 追記（`LANGUAGE sql` 関数の本体の実行と呼び出し位置）
+
+SQL-67 の (2)(3)(5)(6)(7) のポインタ。仕様本文は転記しない。
+
+- 登録: `UdfRegistry` に `routines` 表（`RoutineDefinition`。引数名・引数型・戻り値型・言語・属性・原文）を足し、
+  宣言的 UDF・WASM UDF と同じ名前空間・出所管理（テナント scope・世代）を共有する。`sql::udf_load` が
+  全引数が名前付き・型付きで `RETURNS` がある `sql`／`plpgsql` の行を読み込む（表せない行はその行だけ skip）。
+  作成した同じセッションには commit 後に登録し、他セッションは世代の refresh で見える。
+- 呼び出し位置（D5 の初版）: `FROM` の無い `SELECT` の投影項目と `WHERE` だけ。式木を `sql::routine_fold` が
+  引数から先に・左から右へ畳み込み、引数を既存の束縛器・評価器で評価して起動し、結果を型付きリテラルの `Expr` に
+  置き換えてから既存の束縛・評価へ渡す（`BoundExpr` に variant を足さないため公開 API の破壊的変更はない）。
+  束縛・評価の対象外（その他の位置）の呼び出しは `bind_call` が `0A000`（未定義の `42883` に化けさせない）。
+  `WHERE` が偽・NULL のときは投影の呼び出しを起動しない。Describe は型検査だけを行い、戻り値型の型付き NULL に
+  置き換えて本体を実行しない。`STRICT` の関数は引数のいずれかが NULL なら本体を実行せず NULL を返す。
+- 実行経路: ルーチンを呼ぶ `SELECT` は暗黙 Tx（`execute_subquery_dml_autocommit`）か明示 Tx の上で実行する
+  （`core::routine_call`）。本体の各文は `CorePlHost`（`run_tokens`）が呼び出し元と同じ Tx・`PolicyContext`・
+  許可リスト解析で実行するため、`mark_written`・未 commit の変更の読み取り・結果行数の上限・RLS の暗黙述語・
+  `Ledgered` 構成の `23502`（本体の書き込みは operation_id を持たない）が呼び出し元の文と同一に効く。失敗時は
+  暗黙 Tx の破棄か明示 Tx の `Failed` で副作用が残らない。
+- `LANGUAGE sql` の本体（`plpgsql::sql_body`）: 括弧の深さ 0 の `;` で文に分け、先頭語が DML・`SELECT` 系で
+  あることを確かめてから、PL/pgSQL の構文解析器が受理する単純ブロックへ組み替えて解析する（第 2 の解析器を
+  作らない）。トランザクション制御・DDL・`SET`・`USING OPERATION_ID` 等は `0A000`、構文誤りは `42601`、
+  空の本体・結果を返さない最後の文は `42P13`。実行（`interp::run_sql_function`）は最後の文の最初の行の第 1 列を
+  戻り値にする（0 行は NULL）。列数が 1 でない・戻り値型へ代入変換できない場合は `42P13`。修飾子なしの
+  `numeric` は値の scale を保つ。
+- 上限（D7）: 文数・ループ反復・呼び出し深さのカウンタを `ExecBudget` が現スレッドの共有値として持つ。最外の
+  `ExecBudget` の作成で零へ戻し、core を経由して再入した入れ子の起動は同じカウンタへ合算する。呼び出し深さの
+  超過は `54001`、文数の超過は `54000`。`--max-plpgsql-statements`・`--max-function-call-depth` を `LANGUAGE sql` と
+  共有し、新しい CLI は足さない。トリガの深さ（`--max-trigger-depth`）とは別のカウンタ。
+- 揮発性: `IMMUTABLE`／`STABLE` の関数の本体の書き込みは `0A000`。その本体から呼んだ入れ子の関数も書き込み不可に
+  する（PostgreSQL より厳しいが fail-closed）。`RETURNS trigger` の関数を式から呼ぶと `0A000`（D9）。
+- 複数文メッセージ（D5）: 組み込みでない関数の呼び出しを含む `SELECT`／`WITH` は `Write` に分類する（構文語・
+  CTE の列名リストは呼び出しと見なさない。誤分類は暗黙 Tx になるだけ）。
+- 台帳（D8）: 本 Issue の呼び出し位置は operation_id を持たない `SELECT` だけで、`SELECT ... USING OPERATION_ID` は
+  足さない。外側の operation_id を本体へ引き継ぐ配線は、`INSERT ... VALUES` の位置と一緒に入れる（要対応）。
+- テスト: `tests/sql_t40_up/sql67_sql_function_exec.rs`（結果・DML・STRICT・揮発性・`42P13`・上限・`Ledgered`・
+  位置の制限・テナント境界・Describe）、`sql67_function_language_attrs.rs`、`statement_splitter` の単体テスト。
+
+### 既知の差と要対応事項（起票はしない）
+
+- 呼び出し位置は `FROM` の無い `SELECT` の投影・`WHERE` のみ。表を読む `SELECT` の行ごとの呼び出し・`ON`・
+  `GROUP BY`・`ORDER BY`・`CHECK`・`DEFAULT`・式索引・ビュー本文・`INSERT ... VALUES (f())` は `0A000`（宣言的 UDF の本体
+  からの呼び出しも `0A000`）。条件付きで評価される位置（`CASE` の分岐・`COALESCE` の第 2 引数以降）・集計・
+  `HAVING`・`LIMIT`／`OFFSET` を伴う文の呼び出しも `0A000`。
+- 読み取りだけの関数も暗黙の書き込み Tx で実行する（読み取りスナップショットへの最適化は未着手）。
+- 引数名と列名の衝突は `42702`（PostgreSQL の `LANGUAGE sql` は列名を優先する。回避は `$n`）。本体の列名 `found` は
+  変数 `FOUND` として解釈される。
+- 戻り値型の定義時検査（Describe 相当）は行わず、呼び出し時に `42P13` になる。
+- 代入変換の範囲は PL/pgSQL と共有（数値・真偽値・文字列。他の型の組は同一型のみ）。戻り値型が配列の関数は
+  呼び出し時に `0A000`。
+- `IMMUTABLE` のルーチンを式索引・部分索引で使うのは `0A000` のまま（索引の維持を純粋な評価器で行えないため）。
+- `--max-plpgsql-statements` を `LANGUAGE sql` と共有しているため、フラグ名が PL/pgSQL 寄りになっている。
+- `RETURNS void`／`SETOF`・`FROM` 句は #2220、`RETURN`／`BEGIN ATOMIC` は #2219、横断の検証テストは #2221。
+- 裸の `NULL` を関数の引数に直接書く（`SELECT f(NULL)`）と、`FROM` の無い `SELECT` の既存規則により `42703` になる
+  （`f(CAST(NULL AS int))` は可）。PostgreSQL との差で、定数式の `NULL` の扱いを広げる別の変更で解消する。
+- `numeric` の引数を本体で算術に使うと、型付きの値の置換形（`CAST` の値）が算術に使えない既存の制限により `0A000`
+  になる（PL/pgSQL と共有。値をそのまま返す・比較する・連結は可）。
+- `ExecBudget` の共有カウンタにより、関数本体から発火したトリガ関数の文数・呼び出し深さも外側へ合算される
+  （以前はトリガ起動ごとに新しい予算だった）。上限は下がる方向にだけ効くため緩和にはならない。
+- 複数文メッセージの分類（組み込みでない関数の呼び出しを `Write`）は構文語の許可リストによる保守的な検出で、
+  取りこぼした構文語は `Write` 側（暗黙 Tx・書き込みの配置制約）へ倒れる。
 
 ## Issue #2799 追記（定数式の畳み込みで numeric の算術を扱う。SQL-24・SQL-68 ポインタ）
 
