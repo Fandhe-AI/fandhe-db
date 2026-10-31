@@ -463,6 +463,25 @@ Search・Aggregate・Scan）は確定済みのまま出力が決まる。想定�
 書き込み後の読み取りはキャッシュ・HNSW を使わない brute-force になる
 （性能上のトレードオフ。テーブル単位のキャッシュ再利用は後続課題）。
 
+## 分離レベルの受理方針（Issue #1937）
+
+明示トランザクションの分離レベル指定の受理方針は spec 側が定義する。
+本節はポインタ表記のみとし、受理範囲・表示・修飾子の契約は本書へ記述しない。
+ポインタは `docs/spec/04-behavior/sql-surface.md` SQL-38・SQL-31、
+`docs/spec/04-behavior/data-model.md` TABLE-3、`docs/spec/04-behavior/persistence.md` PERSIST-4。
+構文の実装は #1938（`ISOLATION LEVEL`）・#1939（`SET TRANSACTION`／`SET SESSION CHARACTERISTICS`）・
+Issue #1931（`READ ONLY`）、挙動テストは #1940、`40001` は #2396 が担う。
+現状の main では `BEGIN ISOLATION LEVEL ...`・`BEGIN READ ONLY` は `42601` で拒否される
+（`validate_transaction_control_tokens`）。#1938 がこの拒否を受理へ変え、コードコメントとテストも更新する。
+
+- **engine の宣言型**: `crates/engine/src/txn.rs` の `IsolationLevel` は単一バリアントのまま維持する。
+  保持の形は #1938・#1939 で決める。
+- **fail-closed・テナント境界**: 未対応・不正な形は従来どおり `42601`／`0A000` で拒否する。
+  分離レベルの指定は RLS 相当のテナント境界にも可視集合にも影響しない。
+- **未割り当ての後続**: `SHOW` による分離レベル等の表示対応を担う sub-issue は #1936 配下にまだ無い。担当は #1936 で決める。
+- **公開境界**: 受理範囲などの契約詳細を本書へ記述する場合は、AGENTS.md の公開境界拡張手順（管理者承認）が必要。
+  現時点では承認を得ておらず、記述していない。
+
 ## `#943` との分担
 
 `ReadyForQuery` の状態バイト（`'I'`／`'T'`／`'E'`。WIRE-19）は当初 `#943` が
@@ -622,7 +641,7 @@ production コード（`crates/wire-server/src/`）は無変更・テスト専�
   使える文は明示トランザクションと同じ許可リスト（Issue #1179 で拡大済み。`RETURNING`
   は UPSERT のみ未対応）。`BEGIN` より前の書き込みを
   明示ブロックへ昇格させる PostgreSQL の意味論（`INSERT; BEGIN; ...`）は対象外。
-- savepoint、分離レベルの指定、`START TRANSACTION`／`END`／`ABORT` などの別名。
+- savepoint、`START TRANSACTION`／`END`／`ABORT` などの別名。分離レベルの指定は「分離レベルの受理方針」節のポインタ先の契約に従い #1938・#1939 が実装する。
 - NoSQL 表層のトランザクション（設計上 `0A000`。`op` 許可リストに追加しない）。
 - 上限の既定値（20 秒・1,000 件・30 秒）と CLI のハード上限（60 秒・10,000 件。Issue #1553 で暫定採用）の確定 → オーナー判断。
 
