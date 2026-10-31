@@ -1216,7 +1216,8 @@ fn is_plain_identifier(content: &str) -> bool {
 /// 標準形の関数本体の引用識別子を描画で保つために使う（[`is_clause_word`]）。
 fn is_create_function_head(tokens: &[Token]) -> bool {
     let word = |i: usize, w: &str| matches!(tokens.get(i), Some(Token::Ident(x)) if x.eq_ignore_ascii_case(w));
-    word(0, "CREATE") && (word(1, "FUNCTION") || (word(1, "OR") && word(2, "REPLACE")))
+    word(0, "CREATE")
+        && (word(1, "FUNCTION") || (word(1, "OR") && word(2, "REPLACE") && word(3, "FUNCTION")))
 }
 
 /// 引用なしで書くと SQL の句・構文の語として読まれる語か（大小無視。Issue #2219）。

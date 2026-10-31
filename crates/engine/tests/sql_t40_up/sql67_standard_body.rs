@@ -311,7 +311,7 @@ fn column_named_like_dml_keyword_is_not_a_target() {
     );
     let cte = "CREATE FUNCTION k3() RETURNS int BEGIN ATOMIC \
                WITH d AS (DELETE FROM nope WHERE a = 1 RETURNING a) SELECT count(*) FROM d; END";
-    assert_eq!(code(&core, &mut s, cte), "42P01");
+    assert_eq!(code(&core, &mut s, cte), "0A000");
 }
 
 /// 依存: 参照される表・ビュー・関数の DROP は RESTRICT・CASCADE とも `2BP01`（副作用なし）。依存元の
@@ -567,8 +567,85 @@ fn data_modifying_cte_is_rejected_at_definition_time() {
              WITH d AS (DELETE FROM {target} WHERE a = x RETURNING a) SELECT x; END"
         );
         let e = err(&core, &mut s, "alice", &sql);
-        assert!(["42601", "42P01"].contains(&e.wire_code()), "{sql}: {e}");
+        assert_eq!(e.wire_code(), "0A000", "{sql}: {e}");
     }
     // 何も保存されていないので表は DROP できる。
     run(&core, &mut s, "alice", "DROP TABLE t");
+}
+
+/// 引用識別子の対象表（`"NULL"`・`"true"` 等は別トークンになる）も存在確認と依存記録の対象になる。
+#[test]
+fn quoted_keyword_like_dml_targets_are_bound() {
+    let (core, mut s, _g) = setup("sql67_std_quoted_target");
+    for (i, (name, dml)) in [
+        ("NULL", "INSERT INTO \"NULL\" VALUES (1)"),
+        ("ARRAY", "UPDATE \"ARRAY\" SET a = 1"),
+        ("true", "DELETE FROM \"true\" WHERE a = 1"),
+    ]
+    .iter()
+    .enumerate()
+    {
+        let create =
+            format!("CREATE FUNCTION qt{i}() RETURNS int BEGIN ATOMIC {dml}; SELECT 1; END");
+        // 不在の表は定義時に 42P01。
+        assert_eq!(code(&core, &mut s, &create), "42P01", "{dml}");
+        run(
+            &core,
+            &mut s,
+            "alice",
+            &format!("CREATE TABLE \"{name}\" (a INTEGER)"),
+        );
+        run(&core, &mut s, "alice", &create);
+        // 依存が記録され、表の DROP は止まる。
+        assert_eq!(
+            code(&core, &mut s, &format!("DROP TABLE \"{name}\"")),
+            "2BP01",
+            "{dml}"
+        );
+    }
+}
+
+/// CTE の列名リスト宣言 `WITH f(a) AS (...)` は関数呼び出しではない（同名関数への依存も自己参照も作らない）。
+#[test]
+fn cte_column_list_declaration_is_not_a_call() {
+    let (core, mut s, _g) = setup("sql67_std_cte_decl");
+    run(
+        &core,
+        &mut s,
+        "alice",
+        "CREATE FUNCTION g(x int) RETURNS int BEGIN ATOMIC SELECT x; END",
+    );
+    run(
+        &core,
+        &mut s,
+        "alice",
+        "CREATE FUNCTION f(x int) RETURNS int BEGIN ATOMIC \
+         WITH f(a) AS (SELECT b FROM t) SELECT count(*) FROM t; END",
+    );
+    assert_eq!(one(&core, &mut s, "SELECT f(3)"), int(0));
+    run(
+        &core,
+        &mut s,
+        "alice",
+        "CREATE FUNCTION h(x int) RETURNS int BEGIN ATOMIC \
+         WITH g(a) AS (SELECT b FROM t) SELECT count(*) FROM t; END",
+    );
+    // g への依存辺は無いので DROP できる。
+    run(&core, &mut s, "alice", "DROP FUNCTION g");
+}
+
+/// `CREATE OR REPLACE VIEW` では引用句語識別子が特別扱いされず、ビューが通常どおり作れる。
+#[test]
+fn or_replace_view_with_quoted_clause_word() {
+    let (core, mut s, _g) = setup("sql67_std_or_replace_view");
+    run(
+        &core,
+        &mut s,
+        "alice",
+        "CREATE OR REPLACE VIEW vv AS SELECT a, b FROM t",
+    );
+    assert_eq!(
+        rows(&core, &mut s, "alice", "SELECT * FROM vv").len(),
+        rows(&core, &mut s, "alice", "SELECT a FROM t").len()
+    );
 }

@@ -63,7 +63,6 @@ impl TableLookup for RecordingLookup<'_> {
 /// 級以外のエラーは `validate_embedded` が late binding として先送りする）だが、表の照会に
 /// [`RecordingLookup`] を使う。解決できない表（`42P01`）は先送りされて失われないよう `missing` に残す。
 struct BindingChecker<'a> {
-    core: &'a EngineCore,
     lookup: RecordingLookup<'a>,
     missing: RefCell<Option<String>>,
 }
@@ -77,25 +76,18 @@ impl EmbeddedSqlChecker for BindingChecker<'_> {
     ) -> Result<UnitSummary, SqlSurfaceError> {
         // 構文エラー以外の畳み込みエラー（0 除算等）は無視して文全体を走査させる（構造専用の検査器と同じ）。
         let _defer = crate::sql::const_expr::defer_all_non_syntax_errors();
+        // データ変更 CTE は入れ子の DML の対象表を依存辺へ記録しきれないため、標準形の定義時には
+        // 対象表の存否によらず拒否する（fail-closed。保存して依存を取りこぼす経路を作らない）。
+        if looks_like_data_modifying_with(tokens) {
+            return Err(SqlSurfaceError::feature_not_supported(
+                "data-modifying WITH in a standard function body is not supported",
+            ));
+        }
         let result = parse_unit_with_lookup(tokens, depth, is_root, &self.lookup);
-        match &result {
-            Err(SqlSurfaceError::UndefinedTable { name }) => {
-                self.missing
-                    .borrow_mut()
-                    .get_or_insert_with(|| name.clone());
-            }
-            // データ変更 CTE を含む最上位の `WITH` は、構造専用の解析では判定できないためカタログ付きの
-            // 解析（`EngineCore` の検査器）へ回す（表が無ければそちらが `42P01` を返す）。
-            Err(_) if is_root && looks_like_data_modifying_with(tokens) => {
-                let fallback = EmbeddedSqlChecker::check_unit(self.core, tokens, depth, is_root);
-                if let Err(SqlSurfaceError::UndefinedTable { name }) = &fallback {
-                    self.missing
-                        .borrow_mut()
-                        .get_or_insert_with(|| name.clone());
-                }
-                return fallback;
-            }
-            _ => {}
+        if let Err(SqlSurfaceError::UndefinedTable { name }) = &result {
+            self.missing
+                .borrow_mut()
+                .get_or_insert_with(|| name.clone());
         }
         result
     }
@@ -132,7 +124,8 @@ fn dml_target_at(tokens: &[Token], at: usize) -> Option<&str> {
             .is_some_and(|t| matches!(t, Token::Ident(x) if x.eq_ignore_ascii_case(w)))
     };
     let ident_at = |i: usize| match tokens.get(i) {
-        Some(Token::Ident(n)) => Some(n.as_str()),
+        // 引用識別子が `NULL`・`ARRAY`・`true` 等の綴りだと別トークンになるが、対象表名としては同じ。
+        Some(Token::Ident(n) | Token::QuotedNull(n) | Token::QuotedBoolWord(n)) => Some(n.as_str()),
         _ => None,
     };
     let is = |i: usize, w: &str| matches!(tokens.get(i), Some(Token::Ident(x)) if x.eq_ignore_ascii_case(w));
@@ -159,6 +152,9 @@ fn call_names(tokens: &[Token]) -> impl Iterator<Item = String> + '_ {
         let (Token::Ident(n), Some(Token::Punct('('))) = (t, tokens.get(i + 1)) else {
             return None;
         };
+        if is_cte_declaration(tokens, i) {
+            return None;
+        }
         let decl = matches!(
             i.checked_sub(1).and_then(|p| tokens.get(p)),
             Some(Token::Ident(w))
@@ -166,6 +162,33 @@ fn call_names(tokens: &[Token]) -> impl Iterator<Item = String> + '_ {
         );
         (!decl).then(|| n.to_ascii_lowercase())
     })
+}
+
+/// 位置 `at` の `名前(` が CTE の列名リスト付き宣言（`WITH f(a, b) AS [[NOT] MATERIALIZED] (`）か。
+/// 対応する `)` の直後が `AS` で、その次が `(`・`NOT`・`MATERIALIZED` のとき宣言とみなす
+/// （関数呼び出しの直後にこの形は現れない）。
+fn is_cte_declaration(tokens: &[Token], at: usize) -> bool {
+    let mut depth = 0usize;
+    let mut close = None;
+    for (j, t) in tokens.iter().enumerate().skip(at + 1) {
+        match t {
+            Token::Punct('(') => depth += 1,
+            Token::Punct(')') => {
+                depth = depth.saturating_sub(1);
+                if depth == 0 {
+                    close = Some(j);
+                    break;
+                }
+            }
+            _ => {}
+        }
+    }
+    let word = |j: usize, w: &str| matches!(tokens.get(j), Some(Token::Ident(x)) if x.eq_ignore_ascii_case(w));
+    let Some(c) = close else { return false };
+    word(c + 1, "AS")
+        && (matches!(tokens.get(c + 2), Some(Token::Punct('(')))
+            || word(c + 2, "NOT")
+            || word(c + 2, "MATERIALIZED"))
 }
 
 impl EngineCore {
@@ -192,7 +215,6 @@ impl EngineCore {
             .with_limits(limits.max_nesting_depth(), limits.max_body_bytes());
         let mut body = parse_sql_function_body(body_source, &opts)?;
         let checker = BindingChecker {
-            core: self,
             lookup: RecordingLookup {
                 storage: &self.storage,
                 seen: RefCell::new(BTreeSet::new()),
