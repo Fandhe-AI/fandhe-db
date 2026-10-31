@@ -743,3 +743,45 @@ SQL-67 の (2)(3)(5)(6)(7) のポインタ。仕様本文は転記しない。
 - 境界（fail-closed または既存のリテラル規則）: 小数が残る値を INTEGER 系の列へ入れる場合は素のリテラル
   `1.5` と同じ規則で `22P02`（PostgreSQL は丸める）。numeric と real／double の混合、numeric 引数の関数
   （`abs` 等）、`CAST` は未対応で拒否する。素の小数リテラルは従来どおり f64 のまま扱う。
+
+## Issue #2219 追記（SQL 標準形の関数本体 `RETURN`・`BEGIN ATOMIC`。SQL-67 (2)・SQL-66 (3) ポインタ）
+
+`CREATE [OR REPLACE] FUNCTION` の本体として、`AS` の文字列・式に加えて SQL 標準形を受理する。`LANGUAGE` を
+省略した場合は sql とみなす（`LANGUAGE plpgsql` との併用と `AS` との併記は `42P13`。本体の後ろに句は置けない）。
+
+- **D1 内部表現**: 標準形は `LANGUAGE sql` の本体文字列へ組み替えて保存する（`RETURN e` は `SELECT e`、
+  `BEGIN ATOMIC s1; ...; sN; END` は各文を `;` と改行で連結。文中の `RETURN e` も `SELECT e`）。呼び出し時の
+  経路（`plpgsql_host` → `parse_sql_function_body` → `run_sql_function`）は文字列本体と同一のため、
+  同じ内容なら同じ結果・同じ SQLSTATE になる。第 2 の実行器は作らない。
+- **D2 描画**: 検証済みトークン列を `lexer::render_tokens` で描画する。`Token::Param`（`$n`）は字句段で
+  受理されず `42601`、内部キー（SCHEMA 配下の名前）を含む本体は再解析で解決できないため `0A000`（fail-closed）。
+  `RETURN` の式は `AND`・`OR` を含められるが、`FROM`・別名の `AS`・`ORDER BY` など SELECT の句が括弧の外に
+  混ざる形は `42601`。
+- **D3 目印**: 定義 blob の flags に `FLAG_SQL_STANDARD_BODY`（`0b100`）を足した。配置は変えず版も上げない
+  （旧 blob の decode は不変。新 blob を旧バイナリが読むと未知ビットの `CorruptSchema`）。
+- **D5・D6 定義時の束縛**: 標準形だけが定義時に名前を解決する。`EngineCore::validate_sql_standard_function_definition`
+  が、実カタログの存在照会だけを委譲する `RecordingLookup`（ビューは展開せず、列集合も照会しない）で本体を
+  検証し、不在の表・ビューを `42P01` にする。参照した表・ビュー・マテリアライズドビューと、本体が呼ぶ同じ
+  テナントの永続関数が依存辺になる。`INSERT`／`UPDATE`／`DELETE` の対象表は構造解析が引かないため、ルート文の
+  トークンから取り出して明示的に照合する。`LANGUAGE sql` の文字列本体は従来どおり late binding のまま。
+- **D7・D8 依存辺**: `catalog/function_dependency.rs` が 2 表（参照先から引く表と関数から引く表）を持つ。
+  遅延作成で、標準形を使わない DB のファイル構成は変わらない。辺は関数の作成・置換と同じ write txn で
+  参照先の現存・自己参照・関数間の循環（`0A000`）を再検証してから記録し、置換で張り替え、関数の削除
+  （`remove_function_in_txn`。`DROP SCHEMA ... CASCADE` を含む）で掃除する。関数あたり 64 件まで（`54000`）。
+- **D9 DROP の RESTRICT**: 参照されている表・ビュー・マテリアライズドビュー・関数の DROP は `2BP01`。
+  文言は削除対象自身の名前だけで、依存元の関数名・テナント・件数を含めない（列削除時のトリガ検査と同じ流儀。
+  検査は全テナントの関数を見る）。
+- **D10 DROP の CASCADE**: 依存する標準形の関数があれば CASCADE でも `2BP01`（fail-closed）。
+- **D11 改名・列変更**: 参照されている表の `RENAME TO`・`RENAME COLUMN`・`DROP COLUMN`・`ALTER COLUMN TYPE` は
+  表単位で `2BP01`（暫定ガード）。`ADD COLUMN` は影響を受けない。
+- **D12 複数文メッセージ**: `statement_splitter` が `CREATE ... BEGIN ATOMIC` を認識し、本体の内側の `;` で
+  分割しない（`BEGIN`・`CASE` で +1、`END` で -1。閉じない・深さ超過は `Single`＝拒否）。
+
+### 既知の差・後続
+
+- CASCADE での関数の連鎖削除、改名・列変更への追随（PostgreSQL は OID で束縛するため改名を許す）は未対応。
+- SCHEMA 修飾付きの参照（内部キー）は `0A000`、一時表への参照は定義時に `42P01`。`$n` は字句段で `42601`
+  （名前参照を使う）。
+- 未定義の関数の呼び出しは定義時の `42883` ではなく呼び出し時のエラー（解決できた永続関数だけを依存にする）。
+  入れ子の DML 文（データ変更 CTE の内側等）の対象表は依存に記録しないが、呼び出し時の検証で拒否される。
+- `RETURNS void`／`SETOF`／`TABLE` の標準形は #2220、呼び出し位置の制限は #2218 のまま、RLS・権限・上限の横断検証は #2221。

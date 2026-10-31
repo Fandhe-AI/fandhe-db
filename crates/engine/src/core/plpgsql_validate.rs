@@ -23,7 +23,7 @@ use crate::sql::lexer::Token;
 /// `( INSERT|UPDATE|DELETE` を含む `WITH` 始まりか。構造専用の解析で拒否されたときに、カタログ付きの
 /// 解析へ回すかの**経路選択の目印**にだけ使う（書き込みの有無は解析木で決め、この目印では決めない。
 /// 目印が外れても拒否側にしか倒れない）。
-fn looks_like_data_modifying_with(tokens: &[Token]) -> bool {
+pub(super) fn looks_like_data_modifying_with(tokens: &[Token]) -> bool {
     matches!(tokens.first(), Some(Token::Ident(w)) if w.eq_ignore_ascii_case("WITH"))
         && tokens.windows(2).any(|w| {
             matches!(w.first(), Some(Token::Punct('(')))

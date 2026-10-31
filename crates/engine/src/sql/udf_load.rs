@@ -314,6 +314,7 @@ mod tests {
             language: FunctionLanguage::Declarative,
             body_source: body.to_string(),
             attrs: FunctionAttributes::default(),
+            standard_body: false,
         }
     }
 

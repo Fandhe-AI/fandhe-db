@@ -9,7 +9,7 @@
 
 use crate::recovery::required_op_id::LedgerMode;
 use crate::sql::allowlist::{
-    self, ParsedInsertTokens, SessionWith, SqlSurfaceError, StructuralOnlyLookup,
+    self, ParsedInsertTokens, SessionWith, SqlSurfaceError, StructuralOnlyLookup, TableLookup,
 };
 use crate::sql::lexer::Token;
 
@@ -46,9 +46,21 @@ pub(crate) fn parse_unit(
     depth: usize,
     is_root: bool,
 ) -> Result<UnitSummary, SqlSurfaceError> {
+    parse_unit_with_lookup(tokens, depth, is_root, &StructuralOnlyLookup)
+}
+
+/// [`parse_unit`] の本体。表の存在照会に使う `lookup` を呼び出し側が選べる（Issue #2219）。
+/// `parse_unit` は構造専用の `StructuralOnlyLookup`（表は常に存在する）で呼ぶ薄い入口で、既存の挙動は
+/// 変わらない。SQL 標準形の関数本体（`RETURN`・`BEGIN ATOMIC`）の定義時検証だけが、実カタログを引く
+/// lookup を渡して名前を解決し、参照した表・ビューを記録する（`core::standard_body_binding`）。
+pub(crate) fn parse_unit_with_lookup<L: TableLookup>(
+    tokens: &[Token],
+    depth: usize,
+    is_root: bool,
+    lookup: &L,
+) -> Result<UnitSummary, SqlSurfaceError> {
     let limits = crate::nesting_limits::NestingLimits::default();
     let ledger = LedgerMode::default();
-    let lookup = StructuralOnlyLookup;
     let summary = |kind| UnitSummary {
         kind,
         has_write_cte: false,
@@ -63,7 +75,7 @@ pub(crate) fn parse_unit(
         }
         "UPDATE" if allowlist::looks_like_update_from(tokens) => {
             allowlist::validate_update_from_tokens_with_limits(
-                tokens, ledger, false, limits, &lookup,
+                tokens, ledger, false, limits, lookup,
             )?;
             Ok(summary(UnitKind::Update))
         }
@@ -73,7 +85,7 @@ pub(crate) fn parse_unit(
         }
         "DELETE" if allowlist::looks_like_delete_using(tokens) => {
             allowlist::validate_delete_using_tokens_with_limits(
-                tokens, ledger, false, limits, &lookup,
+                tokens, ledger, false, limits, lookup,
             )?;
             Ok(summary(UnitKind::Delete))
         }
@@ -82,7 +94,7 @@ pub(crate) fn parse_unit(
             Ok(summary(UnitKind::Delete))
         }
         "WITH" if is_root => {
-            match allowlist::validate_session_with_tokens(tokens, &lookup, depth, limits, ledger)? {
+            match allowlist::validate_session_with_tokens(tokens, lookup, depth, limits, ledger)? {
                 SessionWith::Statement(_) => Ok(summary(UnitKind::Select)),
                 SessionWith::DataModifying(_) => Ok(UnitSummary {
                     kind: UnitKind::Select,
@@ -91,9 +103,7 @@ pub(crate) fn parse_unit(
             }
         }
         _ => {
-            allowlist::validate_sql_tokens_with_subquery_ctx_limits(
-                tokens, &lookup, depth, limits,
-            )?;
+            allowlist::validate_sql_tokens_with_subquery_ctx_limits(tokens, lookup, depth, limits)?;
             Ok(summary(UnitKind::Select))
         }
     }

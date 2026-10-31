@@ -463,3 +463,25 @@ fn wire_create_or_replace_and_drop_if_exists() {
     expect_error_response_with_sqlstate(&mut b, "42883");
     read_ready_for_query(&mut b);
 }
+
+/// SQL 標準形の関数本体（`BEGIN ATOMIC <文>; ... END`。SQL-67 (2)・Issue #2219）は、本体の内側の `;` で
+/// 分割されず、1 メッセージで定義と呼び出しを送ると関数が作られて正しい値が返る。
+#[test]
+fn wire_begin_atomic_body_is_not_split_in_a_multi_statement_message() {
+    let (core, _guard) = new_core_with_docs();
+    let users_path = write_user_store_file(&[("alice", "tenant-a", "pw-alice")]);
+    let addr = spawn_server_with_engine_ddl_users(&users_path, core, &["alice"]);
+    let mut stream = authenticate_to_ready_for_query(addr, "alice", "pw-alice");
+
+    send_simple_query(
+        &mut stream,
+        "CREATE FUNCTION add_one(x int) RETURNS int BEGIN ATOMIC SELECT x + 1; END; \
+         SELECT add_one(41)",
+    );
+    assert_eq!(read_command_complete(&mut stream), "CREATE FUNCTION");
+    let _columns = read_row_description(&mut stream);
+    let row = read_data_row(&mut stream);
+    assert_eq!(row[0].as_deref(), Some("42"));
+    assert_eq!(read_command_complete(&mut stream), "SELECT 1");
+    read_ready_for_query(&mut stream);
+}

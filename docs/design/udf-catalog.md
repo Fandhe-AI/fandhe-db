@@ -203,3 +203,18 @@ blob の断片・tenant_id・本体の原文はエラー文言へ出さない。
 がカタログへ書く（宣言的 UDF も揮発性・`PARALLEL`・`COST` を同じ blob v1 の属性欄へ保存する）。セッションの
 レジストリへは登録しない。言語をまたぐ同名は `42723`、`CREATE OR REPLACE` が宣言的 UDF を置き換えたときは
 commit 後にレジストリから取り除く。詳細は [plpgsql-subset.md](plpgsql-subset.md)「Issue #2217 追記」。
+
+## 標準形の本体の目印と依存辺（Issue #2219）
+
+- `FunctionDef::standard_body`: 定義 blob の flags の `0b100`。`RETURN`・`BEGIN ATOMIC` で定義された関数に
+  立つ（配置・版は不変）。`body_source` は `LANGUAGE sql` の文字列本体と同じ形で、呼び出し時の経路も同じ。
+- 依存辺の 2 表（`catalog/function_dependency.rs`。いずれも最初の書き込みまで作らない）:
+  `function_deps_by_dependee`（`(kind, 参照先キー, scope, 関数キー, シグネチャ)`。参照先からの全 scope の
+  範囲走査用）と `function_deps_by_function`（`(scope, 関数キー, シグネチャ, kind, 参照先キー)`。関数側の
+  掃除・循環検査用）。値は持たない。常に同じ write txn で同時に更新する。
+- テナント境界: 表・ビューは全テナント共通のカタログなので、参照先からの検査は全 scope を見る。応答には
+  削除対象自身の名前だけを出す。関数への依存は同じ scope の中だけで解決し、CASCADE でもテナントを
+  跨いで削除しない。
+- 書き込み: 作成・置換の write txn が参照先の現存・自己参照・循環を再検証してから記録する。
+  関数の削除は `remove_function_in_txn` が辺を掃除する。詳細は [plpgsql-subset.md](plpgsql-subset.md)
+  「Issue #2219 追記」。

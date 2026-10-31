@@ -3049,6 +3049,12 @@ impl FunctionAttributeClauses {
 pub enum CreateFunctionBody {
     Expression(Expr),
     Source,
+    /// SQL 標準形の本体（`RETURN <式>`・`BEGIN ATOMIC <文>; ... END`。Issue #2219・SQL-67 (2)）。
+    /// `body_source` には `LANGUAGE sql` の文字列本体と同じ形（`RETURN e` は `SELECT e`、各文は `;` と
+    /// 改行で連結）へ組み替えた本文が入る。標準形は定義時に名前を解決する点だけが文字列本体と異なる。
+    ///
+    /// **Issue #2219 で追加した破壊的変更（BREAKING CHANGE）**: variant 追加。
+    SqlStandard,
 }
 
 /// [`validate_sql`]（TASK-161 の公開 API）が返す statement 種別。`SELECT` 以外の
@@ -3116,6 +3122,9 @@ pub enum Statement {
     /// `returns_trigger` を追加し、`body` を [`CreateFunctionBody`] へ置き換えた（`LANGUAGE sql|plpgsql` の
     /// 本体は式ではなく文字列リテラルのため）。`LANGUAGE` 句の無い従来形は `Declarative`・`Expression`。
     /// `LANGUAGE` 付きの `body_source` は文字列リテラルを復号した本文（引用符・ドル区切りを除いた内容）。
+    ///
+    /// **Issue #2219（SQL-67 (2)）で追加した破壊的変更（BREAKING CHANGE）**: [`CreateFunctionBody`] に
+    /// `SqlStandard` を追加した（`RETURN`・`BEGIN ATOMIC` 形。`language` は `Sql`、`body_source` は組み替え後）。
     CreateFunction {
         or_replace: bool,
         name: String,
@@ -23649,6 +23658,8 @@ fn parse_create_function(tokens: &[Token]) -> Result<ParsedCreateFunction, SqlSu
     let mut returns_seen = false;
     let mut language: Option<FunctionLanguageClause> = None;
     let mut as_range: Option<(usize, usize, Expr)> = None;
+    // SQL 標準形の本体（Issue #2219）。組み替え済みの本文。
+    let mut standard_body: Option<String> = None;
     let mut attrs = FunctionAttributeClauses::default();
     let mut security_seen = false;
     let conflict = || SqlSurfaceError::unsupported("conflicting or redundant options");
@@ -23698,9 +23709,26 @@ fn parse_create_function(tokens: &[Token]) -> Result<ParsedCreateFunction, SqlSu
                     });
                 });
             }
+            // SQL 標準形（Issue #2219・SQL-67 (2)）。本体は関数定義の末尾に置かれるため、残りの
+            // トークンをすべて本体として読む。`AS` との併記・重複は PostgreSQL と同じ `42P13`。
+            "RETURN" | "BEGIN" => {
+                if as_range.is_some() {
+                    return Err(SqlSurfaceError::invalid_function_definition(
+                        "duplicate function body specified",
+                    ));
+                }
+                standard_body = Some(p.parse_standard_function_body()?);
+                // 本体の後ろに句は置けない（PostgreSQL と同じ）。続きは `expect_end_of_statement` が拒否する。
+                break;
+            }
             "AS" => {
                 if as_range.is_some() {
                     return Err(conflict());
+                }
+                if standard_body.is_some() {
+                    return Err(SqlSurfaceError::invalid_function_definition(
+                        "duplicate function body specified",
+                    ));
                 }
                 p.advance();
                 let start = p.pos;
@@ -23798,8 +23826,41 @@ fn parse_create_function(tokens: &[Token]) -> Result<ParsedCreateFunction, SqlSu
         }
     }
     p.expect_end_of_statement()?;
-    let language = language.unwrap_or(FunctionLanguageClause::Declarative);
     let invalid_def = |m: &'static str| SqlSurfaceError::invalid_function_definition(m);
+    if let Some(body_source) = standard_body {
+        // `LANGUAGE` の省略は sql とみなす（PostgreSQL と同じ）。plpgsql との併用は不可。
+        if language == Some(FunctionLanguageClause::Plpgsql) {
+            return Err(invalid_def(
+                "inline SQL function body only valid for language SQL",
+            ));
+        }
+        if !returns_seen {
+            return Err(invalid_def("function result type must be specified"));
+        }
+        if !params.is_empty() && param_types.iter().any(Option::is_none) {
+            return Err(SqlSurfaceError::unsupported(
+                "function parameters must be typed for LANGUAGE sql and plpgsql",
+            ));
+        }
+        if returns_trigger {
+            return Err(invalid_def(
+                "trigger functions must be plpgsql without arguments",
+            ));
+        }
+        return Ok(ParsedCreateFunction {
+            or_replace,
+            name,
+            params,
+            param_types,
+            return_type,
+            returns_trigger: false,
+            language: FunctionLanguageClause::Sql,
+            attributes: attrs,
+            body: CreateFunctionBody::SqlStandard,
+            body_source,
+        });
+    }
+    let language = language.unwrap_or(FunctionLanguageClause::Declarative);
     let (body_start, body_end, body_expr) = match as_range {
         Some(v) => v,
         None if language == FunctionLanguageClause::Declarative => {
@@ -23943,7 +24004,186 @@ fn normalize_udf_param_type(ty: CastType, what: &str) -> Result<CastType, SqlSur
     })
 }
 
+/// `RETURN <式>` の式が空でなく、SELECT の句（`FROM`・`WHERE`・`ORDER BY`・`LIMIT`・別名の `AS`・
+/// 集合演算など）を括弧の外に含まないことを確かめる（Issue #2219。`SELECT <式>` へ組み替えるため、
+/// `RETURN x FROM t` のような式でない形が通らないようにする。`IS DISTINCT FROM` の `FROM` は式の一部）。
+fn check_return_expression(tokens: &[Token]) -> Result<(), SqlSurfaceError> {
+    if tokens.is_empty() {
+        return Err(SqlSurfaceError::unsupported("expected expression"));
+    }
+    let mut depth = 0usize;
+    let mut prev: Option<&Token> = None;
+    for tok in tokens {
+        match tok {
+            Token::Punct('(' | '[') => depth = depth.saturating_add(1),
+            Token::Punct(')' | ']') => depth = depth.saturating_sub(1),
+            Token::Punct(';') if depth == 0 => {
+                return Err(SqlSurfaceError::unsupported("unexpected ; in expression"));
+            }
+            Token::Keyword(super::lexer::Keyword::From)
+                if depth == 0
+                    && !matches!(prev, Some(Token::Ident(w)) if w.eq_ignore_ascii_case("DISTINCT")) =>
+            {
+                return Err(SqlSurfaceError::unsupported(
+                    "unexpected FROM in expression",
+                ));
+            }
+            Token::Keyword(
+                super::lexer::Keyword::Where
+                | super::lexer::Keyword::Order
+                | super::lexer::Keyword::By
+                | super::lexer::Keyword::Limit,
+            ) if depth == 0 => {
+                return Err(SqlSurfaceError::unsupported(
+                    "unexpected clause in expression",
+                ));
+            }
+            Token::Ident(w)
+                if depth == 0
+                    && [
+                        "AS",
+                        "GROUP",
+                        "HAVING",
+                        "UNION",
+                        "INTERSECT",
+                        "EXCEPT",
+                        "INTO",
+                        "OFFSET",
+                        "FETCH",
+                        "WINDOW",
+                        "FOR",
+                    ]
+                    .iter()
+                    .any(|k| w.eq_ignore_ascii_case(k)) =>
+            {
+                return Err(SqlSurfaceError::unsupported(
+                    "unexpected clause in expression",
+                ));
+            }
+            _ => {}
+        }
+        prev = Some(tok);
+    }
+    Ok(())
+}
+
+/// SQL 標準形の本体に置ける文数の上限（確保前の検査。Issue #2219）。
+const MAX_STANDARD_BODY_STATEMENTS: usize = 256;
+
 impl Parser<'_> {
+    /// SQL 標準形の関数本体（`RETURN <式>`、または `BEGIN ATOMIC <文>; ... END`）を読み、
+    /// `LANGUAGE sql` の文字列本体と同じ形の本文へ組み替える（Issue #2219・SQL-67 (2)。
+    /// [`parse_create_function`] から呼ばれる）。
+    ///
+    /// 位置は `RETURN`／`BEGIN` の語に立っている前提で、残りのトークンをすべて消費する（本体は
+    /// 定義の末尾）。式・文の中身はここでは解釈せず、検証済みのトークン列を [`render_tokens`] で
+    /// 描画して組み替える（`RETURN e` の `RETURN` だけを `SELECT` へ置き換える）。本文の検証は呼び出し時と
+    /// 同じ `parse_sql_function_body`・`validate_embedded` が担う。`Token::Param` は描画できず `42601`、
+    /// 内部キー（SCHEMA 配下の名前）は再解析で解決できないため `0A000`（fail-closed）。
+    fn parse_standard_function_body(&mut self) -> Result<String, SqlSurfaceError> {
+        use super::lexer::Keyword;
+        let is_return = self.peek_ident_matches("RETURN");
+        self.advance();
+        let mut stmts: Vec<Vec<Token>> = Vec::new();
+        if is_return {
+            // 式は `AND`・`OR` を含む真理値式も書けるため、`parse_value_expr` では範囲を決めず、
+            // 残りのトークン（末尾の `;` を除く）を式とみなす。射影の別名・`FROM` 句などの SELECT の
+            // 句が混ざる形は `check_return_expression` が `42601` で拒否する。
+            let rest = self.tokens.get(self.pos..).unwrap_or(&[]);
+            let rest = match rest.split_last() {
+                Some((Token::Punct(';'), head)) => head,
+                _ => rest,
+            };
+            check_return_expression(rest)?;
+            let mut stmt = vec![Token::Keyword(Keyword::Select)];
+            stmt.extend_from_slice(rest);
+            stmts.push(stmt);
+            self.pos = self.tokens.len();
+        } else {
+            self.expect_ident_matching("ATOMIC")?;
+            let mut cur: Vec<Token> = Vec::new();
+            let mut paren = 0usize;
+            let mut nest = 0usize;
+            loop {
+                let Some(tok) = self.advance().cloned() else {
+                    return Err(SqlSurfaceError::unsupported("expected END"));
+                };
+                match &tok {
+                    Token::Punct('(' | '[') => paren = paren.saturating_add(1),
+                    Token::Punct(')' | ']') => paren = paren.saturating_sub(1),
+                    // 入れ子は `CASE ... END` だけを数える（分割器は `BEGIN` も数えるが、本体中の `BEGIN`
+                    // 文は `parse_sql_function_body` の先頭語検査が `0A000` で拒否するため差は表に出ない）。
+                    Token::Ident(w) if w.eq_ignore_ascii_case("CASE") => {
+                        nest = nest.saturating_add(1);
+                    }
+                    Token::Ident(w) if w.eq_ignore_ascii_case("END") => {
+                        if nest == 0 {
+                            // 本体の `END`。直前の文は `;` で終わっている必要がある。
+                            if !cur.is_empty() {
+                                return Err(SqlSurfaceError::unsupported("expected ; before END"));
+                            }
+                            break;
+                        }
+                        nest = nest.saturating_sub(1);
+                    }
+                    Token::Punct(';') if paren == 0 && nest == 0 => {
+                        if !cur.is_empty() {
+                            if stmts.len() >= MAX_STANDARD_BODY_STATEMENTS {
+                                return Err(SqlSurfaceError::payload_too_large(
+                                    "function body too large",
+                                ));
+                            }
+                            let mut stmt = std::mem::take(&mut cur);
+                            if matches!(stmt.first(), Some(Token::Ident(w)) if w.eq_ignore_ascii_case("RETURN"))
+                            {
+                                check_return_expression(stmt.get(1..).unwrap_or(&[]))?;
+                                if let Some(first) = stmt.first_mut() {
+                                    *first = Token::Keyword(Keyword::Select);
+                                }
+                            }
+                            stmts.push(stmt);
+                        }
+                        continue;
+                    }
+                    _ => {}
+                }
+                cur.push(tok);
+            }
+            if matches!(self.peek(), Some(Token::Punct(';'))) {
+                self.advance();
+            }
+            if stmts.is_empty() {
+                return Err(SqlSurfaceError::invalid_function_definition(
+                    "SQL function body must contain a statement",
+                ));
+            }
+        }
+        let mut out = String::new();
+        for (i, stmt) in stmts.iter().enumerate() {
+            if stmt
+                .iter()
+                .any(|t| matches!(t, Token::Ident(s) if s.starts_with('#')))
+            {
+                return Err(SqlSurfaceError::feature_not_supported(
+                    "schema-qualified names are not supported in an inline SQL function body",
+                ));
+            }
+            let text = super::lexer::render_tokens(stmt).ok_or_else(|| {
+                SqlSurfaceError::unsupported("function body cannot contain parameters")
+            })?;
+            if i > 0 {
+                out.push_str(";\n");
+            }
+            out.push_str(&text);
+            if out.len() > crate::catalog::function::MAX_FUNCTION_BODY_BYTES {
+                return Err(SqlSurfaceError::payload_too_large(
+                    "function body too large",
+                ));
+            }
+        }
+        Ok(out)
+    }
+
     /// `COST`／`ROWS` の数値を読む（有限かつ正の値のみ。Issue #2217。不正値は `invalid_input`）。
     fn parse_create_function_positive_number(
         &mut self,
