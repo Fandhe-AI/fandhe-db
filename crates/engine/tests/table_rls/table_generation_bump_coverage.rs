@@ -448,8 +448,8 @@ const ALLOWLIST: &[(&str, u32)] = &[
     // Issue #1553（明示トランザクションの最大時間・最大文数の CLI 設定化）の行追加でさらに移動（旧: 793）。
     // TABLE-44・Issue #1684（一時表の DML）: `commit_active` に一時側の確定・`ON COMMIT` 適用が加わり
     // 行が移動したための追随（旧: 899）。書き込み内容・commit の意味は不変。
-    // Issue #1930（START TRANSACTION/END/ABORT 別名の受理）で行が移動したための追随（旧: 966）。
-    ("sql/transaction.rs", 1019),
+    // Issue #1930・#1932（別名受理・READ ONLY／READ WRITE 構文解釈）で行が移動したための追随（旧: 966）。
+    ("sql/transaction.rs", 1126),
     // TABLE-44・Issue #1684: 一時表ストア（セッション専用のインメモリ DB。永続 DB とは別インスタンス）の
     // 書き込みトランザクションの確定口（`TempRowStore::commit`）。確定するのは、一時コアの書き込み本体
     // （`tenant::*`・`catalog::*`。いずれも自分の DB の表世代を `bump_table_generation_in_txn` で進める）が
