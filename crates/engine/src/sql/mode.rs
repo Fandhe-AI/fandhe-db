@@ -491,16 +491,36 @@ impl SessionState {
     /// をこのセッションのレジストリへ登録する。名前空間の衝突検査は
     /// `udf_call::define_wasm_function` が担い、登録は宣言的 UDF と同じ
     /// 「セッション（＝認証済みテナントの接続単位）に閉じる・永続化しない」構造に
-    /// 従う。SQL からの登録構文（`CREATE FUNCTION ... AS WASM ...`）・wire 経由の
-    /// モジュール搬送・モジュールバイト列からのバックエンド構築（wasmtime 依存の
-    /// ユーザー承認待ち。`crate::wasm_udf` モジュールドキュメント参照）は本タスクの
-    /// スコープ外で、呼び出し元が検証済みバックエンドの構築を担う。
+    /// 従う。モジュールのバイト列からの登録は [`Self::register_wasm_udf_from_module`]。
+    /// SQL からの登録構文（`LANGUAGE wasm`）・wire 経由のモジュール搬送は範囲外。
     pub fn register_wasm_udf(
         &mut self,
         name: &str,
         backend: std::sync::Arc<dyn crate::wasm_udf::WasmUdfBackend>,
     ) -> Result<(), crate::sql::allowlist::SqlSurfaceError> {
         crate::sql::udf_call::define_wasm_function(&mut self.udfs, name, backend)
+    }
+
+    /// Issue #1926（EXT-9 ポインタ）: WASM モジュールのバイト列を宣言シグネチャと ABI の
+    /// 照合・検証・コンパイルを経てこのセッションへ登録する。feature `wasm-udf` 無効の
+    /// ビルドでは常に `0A000`。失敗時はレジストリを変えない。Rust の呼び出し元専用で、
+    /// SQL・wire からは到達できない。
+    pub fn register_wasm_udf_from_module(
+        &mut self,
+        name: &str,
+        signature: &crate::wasm_udf::WasmUdfSignature,
+        module_bytes: &[u8],
+        entry: &str,
+        limits: crate::wasm_udf::SandboxLimits,
+    ) -> Result<(), crate::sql::allowlist::SqlSurfaceError> {
+        crate::sql::udf_call::define_wasm_function_from_module(
+            &mut self.udfs,
+            name,
+            signature,
+            module_bytes,
+            entry,
+            limits,
+        )
     }
 
     /// 検証済みの値のみを受け取る契約（呼び出し元 `core.rs::EngineCore::execute_sql_in_session`
