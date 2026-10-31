@@ -258,6 +258,42 @@ Search・Aggregate・Scan）は確定済みのまま出力が決まる。想定�
 書き込み後の読み取りはキャッシュ・HNSW を使わない brute-force になる
 （性能上のトレードオフ。テーブル単位のキャッシュ再利用は後続課題）。
 
+## 分離レベルの受理方針（Issue #1937）
+
+PostgreSQL 互換のため、明示トランザクションの 4 つの分離レベルをすべて受理し、実体は常に単一ライタの直列化とする。
+本節は方針の記録で、ポインタは `docs/spec/04-behavior/sql-surface.md` SQL-38（(1)・(3)・(7)）・SQL-31、
+`docs/spec/04-behavior/data-model.md` TABLE-3、`docs/spec/04-behavior/persistence.md` PERSIST-4。
+構文の実装は #1938（`ISOLATION LEVEL`）・#1939（`SET TRANSACTION`／`SET SESSION CHARACTERISTICS`）・
+Issue #1931（`READ ONLY`）、挙動テストは #1940、`40001` は #2396 が担う。
+現状の main では `BEGIN ISOLATION LEVEL ...`・`BEGIN READ ONLY` は `42601` で拒否される
+（`validate_transaction_control_tokens`）。#1938 がこの拒否を受理へ変え、コードコメントとテストも更新する。
+
+| 指定レベル | 受理 | 実際の分離 | `SHOW transaction_isolation` | ポインタ |
+| ---------- | ---- | ---------- | ---------------------------- | -------- |
+| `READ UNCOMMITTED` | 受理 | 単一ライタの直列化（SERIALIZABLE 相当） | 指定したレベル | SQL-38 (1) |
+| `READ COMMITTED` | 受理 | 同上 | 指定したレベル | SQL-38 (1) |
+| `REPEATABLE READ` | 受理 | 同上 | 指定したレベル | SQL-38 (1) |
+| `SERIALIZABLE` | 受理 | 同上 | 指定したレベル | SQL-38 (1) |
+| 指定なし | 受理 | 同上 | セッションの既定値（#1939・SQL-38 (7)(a)） | SQL-38 (7) |
+
+- **強い分離で実行する根拠**: SQL 標準は要求より強い分離での実行を許す。PostgreSQL も
+  `READ UNCOMMITTED` を `READ COMMITTED` として実行しつつ、表示は指定値を返す。
+- **表示値は保証の表明ではない**: `SHOW` が返すのは要求された属性で、実際の保証は指定より弱くならない
+  （TABLE-3・PERSIST-4）。現行（決定 1）は `BEGIN` で writer を取得しトランザクション全体を直列化する。
+  #2396 の完了後は書き込みが直列化され、writer 取得時点で `40001` が生じうる。判定規則は #2397 の
+  設計記録を参照し、本書では再記述しない。「実体は常に SERIALIZABLE」は #2396 の完了後はこの意味に読み替える。
+- **engine の宣言型**: `crates/engine/src/txn.rs` の `IsolationLevel` は単一バリアントのまま維持する。
+  SQL で指定されたレベルは表示用の属性として状態に保持するだけで実行経路を分岐させない
+  （弱い分離の経路を作らないので fail-closed）。保持の形は #1938・#1939 で決める。
+- **他の修飾子**: `READ ONLY`／`READ WRITE` は受理する（意味は #1931 の範囲。SQL-38 (3)）。
+  `[NOT] DEFERRABLE` は受理し実体は変えない。`SET TRANSACTION`・`SET SESSION CHARACTERISTICS AS TRANSACTION`
+  は受理し、時機とエラーコードは #1939 で決める（SQL-38 (7)(a)）。`START TRANSACTION` は `BEGIN` と同じ構文位置で扱う。
+- **fail-closed・テナント境界**: 未知のレベル名・重複や矛盾した指定などの未対応・不正な形は従来どおり
+  `42601`／`0A000` で拒否する。分離レベルの指定は RLS 相当のテナント境界にも可視集合にも影響しない。
+  NoSQL 表層は対象外（SQL-38 (6)）。
+- **未割り当ての後続**: `SHOW transaction_isolation`・`default_transaction_isolation`・`transaction_read_only`
+  の実装を担う sub-issue は #1936 配下にまだ無い（現在の `SHOW` 対応は `time_zone`・`search_path` のみ）。担当は #1936 で決める。
+
 ## `#943` との分担
 
 `ReadyForQuery` の状態バイト（`'I'`／`'T'`／`'E'`。WIRE-19）は当初 `#943` が
@@ -410,7 +446,7 @@ production コード（`crates/wire-server/src/`）は無変更・テスト専�
   使える文は明示トランザクションと同じ許可リスト（Issue #1179 で拡大済み。`RETURNING`
   は UPSERT のみ未対応）。`BEGIN` より前の書き込みを
   明示ブロックへ昇格させる PostgreSQL の意味論（`INSERT; BEGIN; ...`）は対象外。
-- savepoint、分離レベルの指定、`START TRANSACTION`／`END`／`ABORT` などの別名。
+- savepoint、`START TRANSACTION`／`END`／`ABORT` などの別名。分離レベルの指定は「分離レベルの受理方針」節の方針で #1938・#1939 が実装する。
 - NoSQL 表層のトランザクション（設計上 `0A000`。`op` 許可リストに追加しない）。
 - 上限の既定値（20 秒・1,000 件・30 秒）と CLI のハード上限（60 秒・10,000 件。Issue #1553 で暫定採用）の確定 → オーナー判断。
 
