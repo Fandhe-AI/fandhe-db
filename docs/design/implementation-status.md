@@ -1417,3 +1417,5 @@ Issue #1405（fix(engine)!: CREATE TYPE の型名の重複を 42710 で返す。
 **Issue #1930（feat(engine): START TRANSACTION／END／ABORT の別名を受理する。SQL-69 (1)・SQL-31 ポインタ。詳細は [explicit-transaction.md](explicit-transaction.md)「別名」節）**: `TxnControl::StartTransaction`・`SqlOutcome::StartTransaction` を追加し（BREAKING CHANGE）、先頭語判定を `sql::transaction::is_transaction_control_head` に一本化した。`END`→`Commit`、`ABORT`→`Rollback`（`is_rollback_statement` も `ABORT` を含む）。`AND [NO] CHAIN`・`PREPARE TRANSACTION` は `0A000`（従来 `COMMIT AND CHAIN` は `42601`）。文分割器は別名を制御文として分類する。テストは `crates/engine/tests/sql_t40_up/sql69_txn_aliases.rs`・`crates/wire-server/tests/wire_proto/sql69_txn_aliases.rs`・`wire942_extended_transaction.rs`。
 
 **Issue #1937（docs(design): 分離レベルの受理方針を設計文書へ記録する。SQL-38・TABLE-3・PERSIST-4 ポインタ）**: [explicit-transaction.md](explicit-transaction.md) に「分離レベルの受理方針」節を追加した（契約は spec ポインタのみ。受理範囲は記述しない）。コードは変更していない。
+
+**Issue #1956（docs(design): 行ロック句・LOCK TABLE の扱いを設計文書へ記録する。SQL-38・TABLE-3・PERSIST-4・SQL-31 ポインタ）**: [explicit-transaction.md](explicit-transaction.md) に「行ロック句・`LOCK TABLE` の扱い」節を追加した（単一ライタの writer 取得への写像・取得経路・形ごとの担当 Issue・要確認事項を記録。契約はポインタのみ）。コードは変更していない。
