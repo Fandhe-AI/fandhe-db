@@ -1201,10 +1201,10 @@ Date: <IMF-fixdate>
 | `23505` | `UNIQUE_VIOLATION` | 409 | Conflict | 行 `id` の重複、`PRIMARY KEY`／UNIQUE 制約のテナント内一意性違反（`insert`／`update`）。行制約由来のため commit 済みの根拠にならない |
 | `23505` | `DUPLICATE_OPERATION_ID` | 409 | Conflict | 台帳照合で内容一致と判定された `operation_id` の再送（`insert`／`update`／`delete`。`wire_code` は `UNIQUE_VIOLATION` と共有し `code` で区別。commit 済み確定の根拠。Issue #1180） |
 | `23514` | `CHECK_VIOLATION` | 409 | Conflict | `insert`／`update` が書き込む行が `CHECK` 制約（TABLE-16・TASK-204）を満たさない |
+| `40001` | `SERIALIZATION_FAILURE` | 409 | Conflict | 明示トランザクションの writer 取得時に直列化の失敗を検出した（`ROLLBACK` の後に最初から再試行してよい。NoSQL の 1 要求は開始時に writer を取る暗黙トランザクションのため到達不能。TASK-333・Issue #2398・ERR-7） |
 | `42P06` | `DUPLICATE_SCHEMA` | 409 | Conflict | SCHEMA 名が同一テナント内の既存 SCHEMA または組み込み SCHEMA と衝突した（TABLE-27・Issue #1713。NoSQL 表層からは到達しない） |
 | `42P07` | `DUPLICATE_TABLE` | 409 | Conflict | NoSQL 表層の実要求からは到達不能（`CREATE TABLE`／`CREATE VIEW`／`CREATE INDEX` は op 許可リスト外。後述） |
 | `55000` | `OBJECT_NOT_IN_PREREQUISITE_STATE` | 409 | Conflict | NoSQL 表層の実要求からは到達不能（未実体化の MATERIALIZED VIEW〔TABLE-42〕の読み取りは SQL 表層のみ。後述） |
-| `40001` | `SERIALIZATION_FAILURE` | 409 | Conflict | 明示トランザクションの writer 取得時に直列化の失敗を検出した（`ROLLBACK` の後に最初から再試行してよい。NoSQL の 1 要求は開始時に writer を取る暗黙トランザクションのため到達不能。TASK-333・Issue #2398・ERR-7） |
 | `VD001` | `PARTIAL_COMPLETION` | 409 | Conflict | 分割実行 DML（`update`／`delete` の `mode: "partitioned"`。SQL 表層は `... PARTITIONED`）が 1 チャンク以上 commit した後に止まった（Issue #1130。本文に `data` が付く。後述） |
 | `VD002` | `PARTITIONED_DML_CANCELLED` | 409 | Conflict | `cancel_partitioned_dml`（SQL 表層は `CANCEL PARTITIONED DML`）で取り消された分割実行 DML、または取り消し済みジョブへの再送（Issue #1130。本文に `data` が付く。後述） |
 | `54000` | `PAYLOAD_TOO_LARGE` | 413 | Content Too Large | 要求本文サイズ超過、`filter` 件数超過、INDEX-4 バッチ上限超過、`FOREIGN KEY` 参照アクション連鎖（`ON DELETE CASCADE` 等。宣言が SQL／NoSQL いずれでも。Issue #1148）の深さ・行数上限超過（副作用ゼロ） |
