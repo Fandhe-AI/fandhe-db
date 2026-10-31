@@ -132,10 +132,33 @@ pub(crate) fn check_result_shape(body: &Body) -> Result<(), SqlSurfaceError> {
     };
     let returns_rows = match last.kind {
         EmbeddedKind::Select | EmbeddedKind::Perform => true,
-        EmbeddedKind::Insert | EmbeddedKind::Update | EmbeddedKind::Delete => last
-            .tokens
-            .iter()
-            .any(|t| matches!(t, Token::Ident(w) if w.eq_ignore_ascii_case("returning"))),
+        EmbeddedKind::Insert | EmbeddedKind::Update | EmbeddedKind::Delete => {
+            // 識別子 `returning`（表名・列名）を句と誤認しない。句なら直前は式の終わり（語・値・`)`）
+            // で、直後に式（語・`*`・`(` 等）が続く。識別子位置は直前が `FROM`・`INTO`・`SET` 等の
+            // 語か演算子・`,`・`(`・`.`、または直後が `,`・`)`・`=`・`.`・終端になる。
+            let toks = &last.tokens;
+            toks.iter().enumerate().any(|(i, t)| {
+                if !matches!(t, Token::Ident(w) if w.eq_ignore_ascii_case("returning")) || i == 0 {
+                    return false;
+                }
+                let prev_ok = match toks.get(i - 1) {
+                    Some(Token::Punct(c)) => *c == ')',
+                    Some(Token::Ident(p)) => ![
+                        "FROM", "INTO", "UPDATE", "JOIN", "USING", "SET", "AS", "WHERE", "AND",
+                        "OR", "ON", "NOT",
+                    ]
+                    .iter()
+                    .any(|k| p.eq_ignore_ascii_case(k)),
+                    Some(_) => true,
+                    None => false,
+                };
+                let next_ok = !matches!(
+                    toks.get(i.saturating_add(1)),
+                    None | Some(Token::Punct(',' | ')' | '=' | '.' | ';'))
+                );
+                prev_ok && next_ok
+            })
+        }
     };
     if returns_rows {
         Ok(())

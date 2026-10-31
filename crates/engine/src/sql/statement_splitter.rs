@@ -420,7 +420,6 @@ fn calls_non_builtin_function(tokens: &[Token]) -> bool {
         "SOME",
         "EXISTS",
         "VALUES",
-        "OVER",
         "USING",
         "WHEN",
         "THEN",
@@ -429,7 +428,6 @@ fn calls_non_builtin_function(tokens: &[Token]) -> bool {
         "BETWEEN",
         "LIKE",
         "ILIKE",
-        "SIMILAR",
         "DISTINCT",
         "WITH",
         "UNION",
@@ -438,8 +436,6 @@ fn calls_non_builtin_function(tokens: &[Token]) -> bool {
         "OFFSET",
         "GROUP",
         "HAVING",
-        "FILTER",
-        "WITHIN",
         "TO",
         "IS",
         "ARRAY",
@@ -451,38 +447,23 @@ fn calls_non_builtin_function(tokens: &[Token]) -> bool {
         "FULL",
         "CROSS",
         "NATURAL",
-        "MATERIALIZED",
-        "RECURSIVE",
-        "SEARCH",
-        "CYCLE",
         "COLLATE",
-        "ESCAPE",
         "CAST",
         "EXTRACT",
         "WINDOW",
-        "PARTITION",
-        "ROWS",
-        "RANGE",
         "FROM",
         "BY",
-        "AT",
-        "ZONE",
         "END",
         "NULL",
         "TRUE",
         "FALSE",
         "UNNEST",
-        "PASSING",
         "RETURNING",
         "ON",
         "DEFAULT",
-        "ERROR",
-        "EMPTY",
-        "KEYS",
         "JSON_EXISTS",
         "JSON_VALUE",
         "JSON_QUERY",
-        "PLAN",
         "ROW",
         "NUMERIC",
         "DECIMAL",
@@ -520,7 +501,33 @@ fn calls_non_builtin_function(tokens: &[Token]) -> bool {
         else {
             return false;
         };
-        if SYNTAX_WORDS.iter().any(|k| name.eq_ignore_ascii_case(k))
+        // `USING PLAN(...)` の `PLAN` は直前が `USING` のときだけ構文語。それ以外の `plan(...)`、
+        // および `ERROR`・`EMPTY`・`KEYS` 等の予約されない名前は同名のユーザー関数でありうるため
+        // 構文語として除外せず、呼び出しとして扱う（`Write` 側＝fail-closed）。
+        let is_using_plan = name.eq_ignore_ascii_case("PLAN")
+            && i > 0
+            && matches!(
+                tokens.get(i - 1),
+                Some(Token::Ident(a)) if a.eq_ignore_ascii_case("USING")
+            );
+        // 予約されない名前（`materialized`・`filter`・`over` 等）は同名のユーザー関数でありうる。
+        // 直前のトークンで構文位置（`AS|NOT MATERIALIZED (`・`) FILTER (`・`) OVER (`）と
+        // 確認できる場合に限り構文語として除外し、確認できなければ呼び出し（`Write`）とする。
+        let prev_ident_is = |words: &[&str]| {
+            i > 0
+                && matches!(
+                    tokens.get(i - 1),
+                    Some(Token::Ident(a)) if words.iter().any(|w| a.eq_ignore_ascii_case(w))
+                )
+        };
+        let prev_is_close = i > 0 && matches!(tokens.get(i - 1), Some(Token::Punct(')')));
+        let is_contextual_syntax = (name.eq_ignore_ascii_case("MATERIALIZED")
+            && prev_ident_is(&["AS", "NOT"]))
+            || ((name.eq_ignore_ascii_case("FILTER") || name.eq_ignore_ascii_case("OVER"))
+                && prev_is_close);
+        if is_using_plan
+            || is_contextual_syntax
+            || SYNTAX_WORDS.iter().any(|k| name.eq_ignore_ascii_case(k))
             || crate::sql::udf_call::is_reserved_function_name(name)
         {
             return false;
@@ -542,10 +549,29 @@ fn calls_non_builtin_function(tokens: &[Token]) -> bool {
                 Token::Punct(')') => {
                     depth = depth.saturating_sub(1);
                     if depth == 0 {
-                        return !matches!(
-                            tokens.get(j.saturating_add(1)),
+                        // CTE 定義は `AS [NOT] [MATERIALIZED] (` の形に限る。投影の別名
+                        // `w() AS result` は後ろが `(` にならないため呼び出しとして扱う。
+                        let mut k = j.saturating_add(1);
+                        if !matches!(
+                            tokens.get(k),
                             Some(Token::Ident(a)) if a.eq_ignore_ascii_case("AS")
-                        );
+                        ) {
+                            return true;
+                        }
+                        k = k.saturating_add(1);
+                        if matches!(
+                            tokens.get(k),
+                            Some(Token::Ident(a)) if a.eq_ignore_ascii_case("NOT")
+                        ) {
+                            k = k.saturating_add(1);
+                        }
+                        if matches!(
+                            tokens.get(k),
+                            Some(Token::Ident(a)) if a.eq_ignore_ascii_case("MATERIALIZED")
+                        ) {
+                            k = k.saturating_add(1);
+                        }
+                        return !matches!(tokens.get(k), Some(Token::Punct('(')));
                     }
                 }
                 _ => {}
@@ -1043,6 +1069,9 @@ mod tests {
             "SELECT array_length(arr, 1), jsonb_build_object('a', 1) FROM t",
             "SELECT trim(b), position('a' IN b), overlay(b PLACING 'x' FROM 1) FROM t",
             "SELECT TIMESTAMP(3) '2024-01-01 00:00:00'",
+            "WITH x AS MATERIALIZED (SELECT id FROM t) SELECT * FROM x",
+            "WITH x AS NOT MATERIALIZED (SELECT id FROM t) SELECT * FROM x",
+            "SELECT count(*) FILTER (WHERE a > 1) FROM t",
         ] {
             assert_eq!(classify_statement(sql), StatementEffect::ReadOnly, "{sql}");
         }
@@ -1051,6 +1080,13 @@ mod tests {
             "SELECT abs(my_fn(1))",
             "SELECT a FROM t WHERE my_fn(a) = 1",
             "WITH x AS (SELECT my_fn(1)) SELECT * FROM x",
+            "SELECT w() AS result",
+            "SELECT error()",
+            "SELECT empty(1), keys(2)",
+            "SELECT a FROM t USING PLAN(w())",
+            "SELECT plan(1)",
+            "SELECT materialized()",
+            "SELECT filter(1), over(2), search(3), rows(4)",
         ] {
             assert_eq!(classify_statement(sql), StatementEffect::Write, "{sql}");
         }
