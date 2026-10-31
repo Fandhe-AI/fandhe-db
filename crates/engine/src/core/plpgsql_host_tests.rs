@@ -34,6 +34,8 @@ fn new_core(mode: LedgerMode) -> (EngineCore, CleanupGuard) {
                 ColumnDef::new("embedding", ColumnType::Vector(2), false),
                 ColumnDef::new("lang", ColumnType::Text, false),
                 ColumnDef::new("n", ColumnType::Integer, true),
+                ColumnDef::new("b", ColumnType::BigInt, true),
+                ColumnDef::new("f", ColumnType::Double, true),
             ],
         ))
         .expect("create table");
@@ -1375,4 +1377,153 @@ fn comparison_evaluation_errors_keep_their_sqlstate() {
     );
     // 評価できる比較は従来どおり。
     assert_eq!(as_i64(&run("p + 1 = 6", 5).expect("ok")), 1);
+}
+
+/// 書き込み先の bigint 列 `b`・double 列 `f` へ `VALUES` の要素式 `expr`（変数 `p`）を入れる。
+fn insert_bf(
+    core: &EngineCore,
+    c: &PolicyContext,
+    id: u64,
+    col: &str,
+    expr: &str,
+    ty: SqlColumnTypeName,
+    arg: PlScalar,
+) -> Result<CallOutcome, SqlSurfaceError> {
+    let src = format!(
+        "BEGIN INSERT INTO docs (id, embedding, lang, {col}) VALUES ({id}, '[0.1,0.2]', 'a', {expr}); RETURN 1; END"
+    );
+    call(&src).param("p", ty, arg).autocommit(core, c)
+}
+
+/// `docs` の bigint 列 `b`（id 指定）を `i64` で読む。
+fn b_of(core: &EngineCore, c: &PolicyContext, id: u64) -> i64 {
+    let out = call(&format!(
+        "DECLARE v bigint; BEGIN SELECT b INTO v FROM docs WHERE id = {id}; RETURN v; END"
+    ))
+    .returns(ColumnType::BigInt)
+    .autocommit(core, c)
+    .expect("read b");
+    as_i64(&out)
+}
+
+/// `docs` の double 列 `f`（id 指定）を読む。
+fn f_of(core: &EngineCore, c: &PolicyContext, id: u64) -> f64 {
+    let out = call(&format!(
+        "DECLARE v double precision; BEGIN SELECT f INTO v FROM docs WHERE id = {id}; RETURN v; END"
+    ))
+    .returns(ColumnType::Double)
+    .autocommit(core, c)
+    .expect("read f");
+    match out {
+        CallOutcome::Scalar(PlScalar {
+            cell: Cell::Float(f),
+            ..
+        }) => f,
+        other => panic!("unexpected {other:?}"),
+    }
+}
+
+/// bigint 変数の i64 全域・2^53 超の値が、`VALUES` の単独要素・式の中でも正確に書き込まれる。
+#[test]
+fn bigint_values_beyond_2_53_are_exact_in_values() {
+    let (core, _g) = new_core(LedgerMode::Optional);
+    let c = ctx("t1");
+    let mut id = 0u64;
+    for v in [
+        i64::MAX,
+        i64::MIN,
+        (1i64 << 53) + 1,
+        -((1i64 << 53) + 1),
+        1_234_567_890_123_456,
+    ] {
+        id += 1;
+        insert_bf(&core, &c, id, "b", "p", SqlColumnTypeName::BigInt, big(v)).expect("lone");
+        assert_eq!(b_of(&core, &c, id), v, "lone {v}");
+        // 式の中は定数式の畳み込み（f64）が正確に保てない 2^53 超を 22003 で拒否する（fail-closed）。
+        id += 1;
+        let r = insert_bf(
+            &core,
+            &c,
+            id,
+            "b",
+            "p - 1 + 1",
+            SqlColumnTypeName::BigInt,
+            big(v),
+        );
+        if v.unsigned_abs() > (1 << 53) {
+            assert_eq!(r.expect_err("expr").wire_code(), "22003", "expr {v}");
+        } else {
+            r.expect("expr");
+            assert_eq!(b_of(&core, &c, id), v, "expr {v}");
+        }
+    }
+    // 範囲を超える算術は 22003（PostgreSQL と同じ）。
+    let e = insert_bf(
+        &core,
+        &c,
+        99,
+        "b",
+        "p + 1",
+        SqlColumnTypeName::BigInt,
+        big(i64::MAX),
+    )
+    .expect_err("overflow");
+    assert_eq!(e.wire_code(), "22003");
+}
+
+/// double 変数の極端な値（有限）が `CAST` 置換・`VALUES` のどちらでも Decimal を経由せず通る。
+#[test]
+fn extreme_finite_doubles_do_not_go_through_decimal() {
+    let (core, _g) = new_core(LedgerMode::Optional);
+    let c = ctx("t1");
+    for v in [
+        1e300_f64,
+        1e-50,
+        -1e300,
+        1.5e-300,
+        f64::MAX,
+        f64::MIN_POSITIVE,
+        0.1,
+    ] {
+        let out = call("BEGIN RETURN p + 0; END")
+            .returns(ColumnType::Double)
+            .param("p", SqlColumnTypeName::Double, float(v))
+            .autocommit(&core, &c)
+            .unwrap_or_else(|e| panic!("return {v:e}: {}", e.wire_code()));
+        assert!(
+            matches!(out, CallOutcome::Scalar(PlScalar { cell: Cell::Float(f), .. }) if f == v),
+            "return {v:e}"
+        );
+    }
+    let mut id = 0u64;
+    for v in [1e300_f64, 1e-50, -1e300, f64::MAX, 1e-300] {
+        id += 1;
+        insert_bf(&core, &c, id, "f", "p", SqlColumnTypeName::Double, float(v))
+            .unwrap_or_else(|e| panic!("values lone {v:e}: {}", e.wire_code()));
+        assert_eq!(f_of(&core, &c, id), v, "values lone {v:e}");
+    }
+    // 式の中の 2^53 以上は畳み込みが 22003（fail-closed）、小さい側は通る。
+    id += 1;
+    insert_bf(
+        &core,
+        &c,
+        id,
+        "f",
+        "p + 0",
+        SqlColumnTypeName::Double,
+        float(1e-50),
+    )
+    .expect("tiny");
+    assert_eq!(f_of(&core, &c, id), 1e-50);
+    let e = insert_bf(
+        &core,
+        &c,
+        99,
+        "f",
+        "p + 0",
+        SqlColumnTypeName::Double,
+        float(1e300),
+    )
+    .expect_err("big expr");
+    assert_eq!(e.wire_code(), "22003");
 }

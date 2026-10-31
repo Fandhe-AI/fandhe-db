@@ -1192,9 +1192,20 @@ pub(super) fn bind_cast(
             if number_literal_kind(raw) == CastKind::Numeric || exceeds_exact_integer(raw) =>
         {
             charge_node(node_budget)?;
-            let d = crate::numeric::parse_literal_exact(raw).map_err(|_| {
-                SqlSurfaceError::numeric_out_of_range("value overflows numeric format")
-            })?;
+            let d = match crate::numeric::parse_literal_exact(raw) {
+                Ok(d) => d,
+                // 浮動小数への変換は numeric（38 桁・位取り上限）を経由させない。有限の double として
+                // 有効な値（`1e300`・`1e-50`）を `22003` にしないため、文字列からの変換と同じ経路で
+                // 解釈する（範囲外・非有限は文字列変換側が `22003`）。
+                Err(_) if matches!(target, CastType::Float4 | CastType::Float8) => {
+                    return bind_string_literal_as(raw, target, env, node_budget);
+                }
+                Err(_) => {
+                    return Err(SqlSurfaceError::numeric_out_of_range(
+                        "value overflows numeric format",
+                    ))
+                }
+            };
             (BoundExpr::Numeric(d), ExprType::Numeric)
         }
         Expr::Ident(name) => match bind_cast_operand_column(name, env) {

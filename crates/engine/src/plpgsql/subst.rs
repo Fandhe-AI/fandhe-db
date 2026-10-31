@@ -72,6 +72,7 @@ fn null_type_words(ty: &ColumnType) -> Option<&'static [&'static str]> {
         ColumnType::Text | ColumnType::Varchar(_) | ColumnType::Bpchar(_) => &["text"],
         ColumnType::Date => &["date"],
         ColumnType::Timestamp => &["timestamp"],
+        ColumnType::Time => &["time"],
         _ => return None,
     })
 }
@@ -178,17 +179,34 @@ fn bare_number_tokens(v: &PlScalar) -> Result<Vec<Token>, SqlSurfaceError> {
     }
 }
 
+/// 定数式の畳み込み（f64 で値を扱う）が正確に保持できない大きさの整数・浮動小数か。
+fn beyond_fold_precision(cell: &Cell) -> bool {
+    const EXACT: u64 = 1 << 53;
+    match cell {
+        Cell::SignedInteger(i) => i.unsigned_abs() > EXACT,
+        Cell::Integer(u) => *u > EXACT,
+        Cell::Float(f) => f.is_finite() && f.abs() >= EXACT as f64,
+        _ => false,
+    }
+}
+
 /// `INSERT .. VALUES` の要素（定数式。利用者の `CAST` を受理しない）の数値のトークン列。
 /// 整数（smallint／integer／bigint）と浮動小数（real／double）は、内部専用の型付き値（合成識別子
 /// `$typed:<型>` + 数値。字句解析器は利用者の文字列から生成しない）で置換し、定数式の畳み込みが
 /// 宣言型どおりの算術を行う（`p + 1` が bigint の算術になる）。numeric は定数式で算術できないため、
 /// 単独の要素（[`is_lone`]）なら裸の数値（書き込み先の列型が決める）、式の中では `0A000`
-/// （型が黙って変わる経路を残さない）。
+/// （型が黙って変わる経路を残さない）。定数式の畳み込みは値を f64 で扱い 2^53 以上を `22003` に
+/// するため、単独の要素でその範囲の整数・浮動小数は畳み込みを通さず裸の数値にする（i64 全域・
+/// 大きな double を書き込み先の列型で正確に束縛させる）。式の中の同範囲の値は畳み込みが `22003`
+/// で拒否する（fail-closed）。
 fn const_number_tokens(
     v: &PlScalar,
     mut bare: Vec<Token>,
     lone: bool,
 ) -> Result<Vec<Token>, SqlSurfaceError> {
+    if lone && beyond_fold_precision(&v.cell) {
+        return Ok(bare);
+    }
     let kind = match (&v.ty, &v.cell) {
         (_, Cell::Numeric(_)) => {
             return if lone {

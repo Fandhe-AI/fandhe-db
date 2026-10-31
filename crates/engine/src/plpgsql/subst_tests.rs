@@ -402,6 +402,34 @@ fn null_order_and_group_keys_are_typed_never_a_column_name() {
     }
 }
 
+/// 非 NULL のとき型付き形（`CAST`／型付きリテラル）で置換する型（日付・時刻・数値・真偽値・文字列）は、
+/// NULL でも列名として読まれない型付き形（`CAST(NULL AS 型)`）になる（`time` の漏れの回帰）。
+#[test]
+fn null_of_every_substitutable_type_is_typed_in_column_like_positions() {
+    let cases: [(ColumnType, &str); 5] = [
+        (ColumnType::Time, "time"),
+        (ColumnType::Date, "date"),
+        (ColumnType::Timestamp, "timestamp"),
+        (ColumnType::Boolean, "boolean"),
+        (ColumnType::Text, "text"),
+    ];
+    for (ty, word) in cases {
+        let n = PlScalar::null(ty);
+        for role in [
+            VarRole::Value,
+            VarRole::SelectItemBare,
+            VarRole::OrderKey,
+            VarRole::GroupKey,
+        ] {
+            assert_eq!(
+                scalar_tokens(&n, role).expect("typed null"),
+                lex(&format!("CAST(NULL AS {word})")),
+                "{word} {role:?}"
+            );
+        }
+    }
+}
+
 #[test]
 fn dynamic_param_roles_survive_and_inside_case_and_literal_slots() {
     // CASE 内の AND で ORDER BY の役割判定が止まらない（後続キーの NULL が型付きになる）。
