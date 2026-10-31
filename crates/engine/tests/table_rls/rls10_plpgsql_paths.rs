@@ -110,7 +110,8 @@ fn fixture(label: &str, viewer: &str, flood: bool) -> Fixture {
         seed_row(&storage, t, 1, Visibility::Public, 10, &mut truths);
         seed_row(&storage, t, 2, Visibility::Private, 20, &mut truths);
         if flood && t != viewer {
-            for id in 3..=8u64 {
+            // id=500 は write_ops の INSERT が使う id。他テナントが同一 id を持っても衝突しないことを確かめる。
+            for id in (3..=8u64).chain([500]) {
                 seed_row(&storage, t, id, Visibility::Private, 20, &mut truths);
             }
         }
@@ -260,7 +261,7 @@ fn write_ops() -> [(&'static str, &'static str); 3] {
         ),
         (
             "insert",
-            // 他テナントも同じ id=1 を持つ（物理キーは (tenant, id)。TABLE-12）。
+            // flood 構成では他テナントも同じ id=500 を持つ（物理キーは (tenant, id)。TABLE-12）。
             "DECLARE rc int; BEGIN INSERT INTO docs (id, embedding, owner, v) \
              VALUES (500, '[0.5,0.5]', '@VIEWER@', 5); GET DIAGNOSTICS rc = ROW_COUNT; \
              INSERT INTO probe (tag, v) VALUES ('insert', rc); END",

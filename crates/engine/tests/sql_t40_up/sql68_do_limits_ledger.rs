@@ -445,12 +445,12 @@ fn failed_do_leaves_no_ledger_entry_and_the_retry_applies_once() {
     let failing = vec![
         "BEGIN".to_string(),
         witness(1, "k3"),
-        do_lit("BEGIN INSERT INTO t (n) VALUES (1); RAISE EXCEPTION ''x''; END"),
+        do_lit("BEGIN INSERT INTO t (n) VALUES (1); INSERT INTO t (n) VALUES (1 / 0); END"),
         "ROLLBACK".to_string(),
     ];
     assert_eq!(
         txn_script(&core, "alice", &failing),
-        ["ok", "ok", "0A000", "ok"]
+        ["ok", "ok", "22012", "ok"]
     );
     assert!(!recorded(&core, "alice", "k3"), "rolled back with the Tx");
     assert_eq!(count(&core, "alice", "t"), 0);
