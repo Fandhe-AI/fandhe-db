@@ -9,6 +9,8 @@
 
 ### Added
 
+- トリガ関数の内部 API と `DO` ブロックを追加した（Issue #2228・SQL-68）。`DO [LANGUAGE plpgsql] '<本体>'` を受理し、暗黙・明示トランザクションの上で本体を実行する（CommandComplete タグ `DO`。本体のエラーで副作用なし。`USING OPERATION_ID` は `0A000`）。トリガ関数は `NEW`／`OLD`／`TG_*` を使え、`RETURN NEW`・`RETURN NULL` の意味は PostgreSQL に合わせる（発火への結線は #1720）。
+  公開 enum `SqlOutcome` に `Do`、`ParsedSql` に `Do` を追加した（BREAKING CHANGE）。
 - DDL 権限のあるセッションで、型付き引数と `RETURNS` つきの `CREATE [OR REPLACE] FUNCTION` を UDF カタログへ永続化する（Issue #2798・SQL-66）。従来の `0A000` 拒否は無くなり、再起動後のロードで型が復元される（blob v1 は不変）。公開 API の変更はない。詳細は [udf-catalog.md](docs/design/udf-catalog.md)。
 - トリガの入れ子（再帰）の発火と深さ上限を追加した（Issue #1727・TABLE-45）。トリガ本体の書き込み先のトリガも発火し、入れ子の深さが上限（既定 16）を超えると `54001` で文全体を拒否する。起動フラグ `--max-trigger-depth` と `EngineCore::with_trigger_limits`／`engine::trigger_limits::TriggerLimits` を追加（下げる方向だけ）。挙動変更: 書き込み先に INSERT トリガがある場合の `0A000` は入れ子の発火に変わる（未結線の経路は従来どおり `0A000`）。詳細は [trigger-depth-limit-cli.md](docs/design/trigger-depth-limit-cli.md)。
 - PL/pgSQL インタプリタと実行上限を追加した（Issue #2225・SQL-68）。AST を辿る木構造インタプリタ（変数環境・制御構文・`INTO`／`STRICT`・`FOUND`／`ROW_COUNT`・集合返却）と、式・SQL を委ねる境界トレイトを crate 内部に置いた（`LANGUAGE plpgsql` の受理と core 実装は #2217／#2226 のため、SQL からは従来どおり利用できない）。起動フラグ `--max-plpgsql-statements`・`--max-plpgsql-loop-iterations`・`--max-plpgsql-nesting-depth`・`--max-plpgsql-body-bytes`・`--max-function-call-depth` と `EngineCore::with_plpgsql_limits`／`engine::plpgsql_limits::PlpgsqlLimits` を追加（既定はハード上限と同値で下げる方向だけ）。公開 enum `ErrorClass` に `NoDataFound`（`P0002`。`RowNotFound` と `wire_code` を共有）・`TooManyRows`（`P0003`）・`CaseNotFound`（`20000`）・`FunctionExecutedNoReturnStatement`（`2F005`）、`SqlSurfaceError` に同名の variant と `RecordNotAssigned`（`55000`）を追加した（BREAKING）。詳細は [plpgsql-subset.md](docs/design/plpgsql-subset.md)。

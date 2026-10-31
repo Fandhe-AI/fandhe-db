@@ -34,7 +34,10 @@ use crate::plpgsql::ast::{Body, DeclType, EmbeddedSql, SqlExpr, VarRole, VarSite
 use crate::plpgsql::host::{
     PlHost, PlScalar, ResolvedType, RowDemand, SqlOutcome as HostOutcome, VarLookup,
 };
-use crate::plpgsql::interp::{run_function, CallOutcome, ExecBudget, ReturnSpec};
+use crate::plpgsql::interp::{
+    run_function, run_trigger_function, CallOutcome, ExecBudget, ReturnSpec, TriggerReturn,
+    TriggerVars,
+};
 use crate::plpgsql::subst;
 use crate::policy::PolicyContext;
 use crate::recovery::required_op_id::LedgerMode;
@@ -44,6 +47,7 @@ use crate::sql::lexer::{self, Keyword, Token};
 use crate::sql::mode::SessionState;
 use crate::sql::transaction::{SessionTransaction, TransactionStatus};
 use crate::sql::SqlOutcome as CoreOutcome;
+use crate::trigger::call::TriggerOutcome;
 
 /// 呼び出しごとの実行オプション。
 #[derive(Debug, Clone, Copy)]
@@ -58,6 +62,15 @@ pub(crate) struct PlInvocation<'a> {
     pub(crate) body: &'a Body,
     pub(crate) args: Vec<PlScalar>,
     pub(crate) ret: &'a ReturnSpec,
+    pub(crate) opts: PlCallOptions,
+}
+
+/// トリガ関数 1 回の呼び出しの入力（Issue #2228）。入口の引数を束ねる。
+pub(crate) struct TriggerInvocation<'a> {
+    pub(crate) body: &'a Body,
+    pub(crate) vars: TriggerVars,
+    /// 対象表のスキーマ（戻り値の行を列名・数・順で照合する）。
+    pub(crate) schema: &'a TableSchema,
     pub(crate) opts: PlCallOptions,
 }
 
@@ -991,5 +1004,88 @@ impl EngineCore {
             conflict_checked: HashSet::new(),
         };
         run_function(body, args, ret, &mut host, &mut budget)
+    }
+
+    /// 既に開いている Tx の上でトリガ関数を 1 回実行する内部 API（Issue #2228・ADR D9）。状態ゲートと
+    /// エラー時の `Failed` 化は [`Self::run_plpgsql_in_txn`] と同じ。戻り値は発火側の
+    /// [`TriggerOutcome`]（NULL は `Skip`、行は表の列と照合して `Proceed`）。本番の
+    /// `TriggerFunctionInvoker`（発火時はセッション・Tx を持たない）は #1720 が結線する。
+    pub(crate) fn invoke_trigger_function_in_txn<'e>(
+        &'e self,
+        ctx: &PolicyContext,
+        session: &mut SessionState,
+        txn: &mut SessionTransaction<'e>,
+        inv: TriggerInvocation<'_>,
+    ) -> Result<TriggerOutcome, SqlSurfaceError> {
+        Self::check_resolution_tenant(session, ctx)?;
+        match txn.status() {
+            TransactionStatus::Idle => {
+                return Err(internal("PL/pgSQL body requires an active transaction"))
+            }
+            TransactionStatus::Failed => return Err(txn.take_failed_error()),
+            TransactionStatus::InTransaction => {}
+        }
+        let r = self.run_trigger_active(ctx, session, txn, inv);
+        if r.is_err() {
+            txn.fail();
+        }
+        r.map_err(|e| self.scrub_error(ctx, e))
+    }
+
+    fn run_trigger_active<'e>(
+        &'e self,
+        ctx: &PolicyContext,
+        session: &mut SessionState,
+        txn: &mut SessionTransaction<'e>,
+        inv: TriggerInvocation<'_>,
+    ) -> Result<TriggerOutcome, SqlSurfaceError> {
+        let mut budget = ExecBudget::new(self.plpgsql_limits, self.result_limits.max_result_rows());
+        let mut host = CorePlHost {
+            core: self,
+            ctx,
+            session,
+            txn,
+            opts: inv.opts,
+            conflict_checked: HashSet::new(),
+        };
+        match run_trigger_function(inv.body, &inv.vars, &mut host, &mut budget)? {
+            TriggerReturn::Null => Ok(TriggerOutcome::Skip),
+            TriggerReturn::Row(mut fields) => {
+                // `%ROWTYPE`／`SELECT *` は可視の `id` 疑似列を先頭に含める。`id` はトリガから書き換えられず
+                // 元の行 ID を保つため、戻り値に先頭の `id` があれば構造検査の前に取り除く。
+                if inv.schema.has_pseudo_id()
+                    && fields.len() == inv.schema.columns.len().saturating_add(1)
+                    && fields
+                        .first()
+                        .is_some_and(|(n, _)| n.eq_ignore_ascii_case("id"))
+                {
+                    fields.remove(0);
+                }
+                let mismatch = || {
+                    SqlSurfaceError::datatype_mismatch(
+                        "returned row structure does not match the structure of the triggering table",
+                    )
+                };
+                if fields.len() != inv.schema.columns.len() {
+                    return Err(mismatch());
+                }
+                let mut row = Vec::with_capacity(fields.len());
+                for ((name, v), col) in fields.into_iter().zip(&inv.schema.columns) {
+                    if name != col.name {
+                        return Err(mismatch());
+                    }
+                    let v = crate::plpgsql::value::assign_cast(v, &col.ty)?;
+                    row.push(crate::sql::matview::cell_to_value(v.cell, &col.ty).map_err(
+                        |_| {
+                            SqlSurfaceError::feature_not_supported(
+                                "trigger row has a column type unsupported in PL/pgSQL",
+                            )
+                        },
+                    )?);
+                }
+                crate::trigger::fire::check_returned_row(inv.schema, &row)?;
+                Ok(TriggerOutcome::Proceed(row))
+            }
+        }
     }
 }

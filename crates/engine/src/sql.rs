@@ -406,6 +406,10 @@ pub enum SqlOutcome {
     ///
     /// **BREAKING CHANGE**（Issue #1722）: `CreateTrigger` と同じ。
     DropTrigger(trigger_ddl::DropTriggerOutcome),
+    /// `DO` ブロックの実行完了（CommandComplete タグ `DO`。SQL-68・Issue #2228）。
+    ///
+    /// **BREAKING CHANGE**（Issue #2228）: `SqlOutcome` への variant 追加。
+    Do,
     /// `EXPLAIN SELECT ... USING PLAN(...)`（TASK-78・SQL-6）の応答。検索本体は
     /// 実行せず、LLM クエリ展開・モード解決結果を可視化する `QUERY PLAN` 単一列の
     /// [`exec::QueryResult`]（`sql::explain` モジュールが構築）を返す。

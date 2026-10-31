@@ -289,7 +289,7 @@ Issue #2227 で受理する。
 | #2224 | 構文表の網羅テスト・範囲外の `0A000`・本体長と入れ子深さ・D3 の定義時分類（記録した位置と役割を AST に保存） |
 | #2225 | 変数環境・D7 の上限と CLI・キャンセル・D10 の新 variant（`!`） |
 | #2226 | D3 の値置換（役割別の置換、`42702` の判定規則）・D5 の経路決定と再入の不変条件・D6・D8・`42702` 検出・既知の制限の照合 |
-| #2228 | D9 の内部 API と `DO` |
+| #2228 | D9 の内部 API と `DO`（実装記録は「Issue #2228 追記」節） |
 | #2229 | 越境マトリクス（RLS-10 ポインタ）・上限超過の fail-closed・再送で副作用が重複しないこと・crash-test |
 | #2227 | `RAISE`・`EXCEPTION` 節（SAVEPOINT #1941 の後） |
 | #1721／#1720 | 発火規則・発火位置が D5 の不変条件を満たすこと・トリガ経由の台帳 |
@@ -564,3 +564,49 @@ SQL 構文解析器は列の存在を束縛段（実行時）まで確かめな�
   外側 operation_id の引き継ぎ。トリガ関数の `TriggerWriteHandle` 経由の経路（#2228）は、文の実行を
   `CorePlHost::run_tokens` の 1 か所に集めてあるので、そこへ分岐を足す
 - #2229: 越境マトリクス・crash-test
+
+## Issue #2228 追記（トリガ関数の内部 API と `DO` ブロック）
+
+SQL-68 ポインタ。D9 の内部 API と `DO` を実装した。公開 enum `SqlOutcome`・`ParsedSql` に `Do` variant を
+追加したため BREAKING（`feat(engine)!:`）。
+
+### トリガ変数と戻り値
+
+- パーサーは `ReturnShape::Trigger` のときだけ `NEW`・`OLD`（レコード）、`TG_NAME`・`TG_WHEN`・`TG_LEVEL`・
+  `TG_OP`・`TG_TABLE_NAME`・`TG_TABLE_SCHEMA`（text）、`TG_NARGS`（integer）を外側スコープへ暗黙宣言する
+  （`VarKind::Trigger`）。`DO`・通常関数では宣言しない（PostgreSQL と同じ）。
+- `NEW`／`OLD` は表の列名・型の固定行型。INSERT の OLD・DELETE の NEW・文トリガは未代入で、フィールド参照は
+  `55000`、`RETURN` では NULL 扱い。
+- `RETURN` が許す式は裸の `NULL` とレコード変数 1 個だけ。それ以外は式を評価せず `42804`。`RETURN;`・
+  `RETURN NEXT`・`RETURN QUERY` は従来どおりパーサーで拒否する。
+- **D10 の「トリガ関数は `2F005` を除く」を上書きする**: RETURN に達せず終わったトリガ関数は PostgreSQL 17 と同じく
+  `2F005`。
+- core の `invoke_trigger_function_in_txn` が `CorePlHost` 上で実行し、`NULL` は `TriggerOutcome::Skip`、行は
+  `TableSchema.columns` の名前・数・順で照合して `Proceed`（合わなければ `42804`。列型を変換できなければ `0A000`）。
+  `trigger::call::trigger_vars_from_call` が `TriggerCall` から変数を作る純粋関数で、`TG_TABLE_NAME` には
+  呼び出し側が解決した利用者向けの名前を渡す（内部キーを出さない）。
+- `RETURNS trigger` は `FunctionType::trigger()`（タグ `trigger`・戻り値の位置だけ有効）で保存し、
+  `returns_trigger` は「PL/pgSQL・引数なし・戻り値が trigger」のときだけ真。blob の版は変えない。旧バイナリへ
+  降格した場合、その定義は復号できず fail-closed になる。
+
+### `DO`
+
+- 構文は `DO [LANGUAGE <名>] '<文字列リテラル>' [LANGUAGE <名>]`。`sql` は `0A000`、未知の言語は `42704`
+  （言語名は応答に含めない）。`USING OPERATION_ID`・`PARTITIONED` は `0A000`、それ以外の形は `42601`。
+  `$$...$$` は #2216 のドル引用が入れば同じ経路で通る。
+- `ParsedSql::Do` として持ち、`ParsedSql::Statement` には載せない（wire 側の非書き込み誤判定を避ける。D9 の
+  `Statement::Do` からの変更）。autocommit は `execute_subquery_dml_autocommit` と同じ暗黙 Tx に載せ、明示 Tx は
+  参加する。本体長は字句化の前に検査する（`54000`）。`Ledgered` 構成では本体の書き込みは `23502`。
+- **`DO ... USING OPERATION_ID` を `0A000` で拒否する（D8 との差）**: 台帳のキーが `(テナント, 表, operation_id)` で、
+  表を持たない文のキーが未設計。受理して記録しないと再送で二重実行になる（fail-open）ため。要対応事項。
+- 本体内・`EXECUTE` の文字列内の `DO` は PL/pgSQL の構文表に無く `42601`（本体の文として解析できない）。
+  `statement_splitter` は先頭語 `DO` を未知語として `Write` に分類する（D5 の保守的な書き込み扱い）。
+- wire-server は CommandComplete タグ `DO`、Describe は NoData。
+
+### 既知の差・対象外
+
+- 本番の `TriggerFunctionInvoker` とトリガ文脈（`TriggerWriteHandle`・セッションなし）で本体を実行するホスト、
+  入れ子トリガ間の `ExecBudget` の合算（D11）は #1720。
+- SQL の `CREATE FUNCTION ... RETURNS trigger LANGUAGE plpgsql` は #2217（ドル引用は #2216）。
+- `TG_ARGV`・`TG_RELID` 等は未宣言。参照は通常の識別子扱いで、列として解決できず失敗する（fail-closed）。
+  `TG_NARGS` は使える。

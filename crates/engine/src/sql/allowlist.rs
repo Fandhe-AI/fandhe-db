@@ -35,6 +35,10 @@ use crate::sql::using_operation_id::OperationId;
 use crate::sql::where_negation::{expr_node_count, negate_conjunction};
 
 mod grouped_window;
+// `DO` ブロックの構文検証（SQL-68・Issue #2228）。
+mod do_block;
+pub use do_block::ValidatedDo;
+pub(crate) use do_block::{is_do_statement, validate_do_tokens};
 // TRIGGER DDL の構文検証（TABLE-45・Issue #1722）。
 mod trigger;
 pub(crate) use trigger::{
