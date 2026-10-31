@@ -89,7 +89,9 @@ jobs:
   # --all-features` で実行するため feature fault-injection が常に有効になり、
   # 既定ビルド（feature 無効）時の挙動を検証する
   # default_build_rejects_fault_inject_flag_as_unknown_argument
-  # （wire_fault_injection_cli）が実行対象に入らない。Makefile の
+  # （wire_fault_injection_cli）と、wasm-udf 無効時に WASM UDF の登録・
+  # LANGUAGE wasm が 0A000 になること（Issue #1926。engine の wasm_udf_feature_off）が
+  # 実行対象に入らない。Makefile の
   # test-default-build ターゲット（--all-features を付けない単体実行）を直接
   # 呼び出す独立ジョブとして接続する（Bugbot 指摘・PR #718）。rust-ci
   # （reusable workflow）とは異なり生の steps を持つ独立ジョブとして定義するため、

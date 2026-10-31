@@ -31,7 +31,9 @@ use crate::sql::datetime_fn::{self, DatePartField, DateTruncUnit};
 use crate::sql::interval_arith;
 use crate::sql::string_fn;
 use crate::sql::time_fn::{self, StatementClock};
-use crate::wasm_udf::WasmUdfBackend;
+use crate::wasm_udf::{
+    check_signature_against_abi, SandboxLimits, WasmUdfBackend, WasmUdfError, WasmUdfSignature,
+};
 
 /// UDF 定義が持てるパラメータ数の上限（`54000` で拒否）。
 pub const MAX_UDF_PARAMS: usize = 32;
@@ -3524,16 +3526,28 @@ pub(crate) fn insert_raw_definition_for_test(
 
 /// 検証済みの `Arc<dyn WasmUdfBackend>` をセッションのレジストリへ登録する
 /// （TASK-149、対象ビヘイビア: EXT-5, EXT-6。`sql::mode::SessionState::register_wasm_udf`
-/// から呼ばれる）。名前空間・上限は宣言的 UDF（[`define_function`]）と共有し、
-/// SQL からの `CREATE FUNCTION` 構文・wire 経由のモジュール搬送・モジュールバイト
-/// 列からのバックエンド構築（wasmtime 依存のユーザー承認待ち。`crate::wasm_udf`
-/// モジュールドキュメント参照）は本タスクのスコープ外（呼び出し元が検証済み
-/// バックエンドの構築を担う）。
+/// から呼ばれる）。名前空間・上限は宣言的 UDF（[`define_function`]）と共有する。
+/// モジュールのバイト列からの登録は [`define_wasm_function_from_module`]（Issue #1926）
+/// を使う。SQL 文からの定義（`CREATE FUNCTION ... LANGUAGE wasm`）は永続化設計が
+/// 未確定のため範囲外（`0A000`）。
 pub fn define_wasm_function(
     registry: &mut UdfRegistry,
     name: &str,
     backend: Arc<dyn WasmUdfBackend>,
 ) -> Result<(), SqlSurfaceError> {
+    let lower = precheck_wasm_registration(registry, name)?;
+    registry.wasm.insert(lower, backend);
+    Ok(())
+}
+
+/// WASM 登録の前段検査（名前・予約名・同名衝突・件数上限）。成功時は小文字化した名前を返す。
+/// コンパイルより前に置くことで、失敗が確定している登録で Cranelift のコンパイルを
+/// 走らせない（DoS 抑制）。[`define_wasm_function`]・[`define_wasm_function_from_module`]
+/// が共有する。レジストリは変更しない。
+fn precheck_wasm_registration(
+    registry: &UdfRegistry,
+    name: &str,
+) -> Result<String, SqlSurfaceError> {
     catalog::validate_identifier(name)
         .map_err(|_| SqlSurfaceError::invalid_input(format!("invalid function name: {name}")))?;
     let lower = name.to_ascii_lowercase();
@@ -3552,6 +3566,75 @@ pub fn define_wasm_function(
             "too many functions defined in this session",
         ));
     }
+    Ok(lower)
+}
+
+/// 定義時点の [`WasmUdfError`] を SQLSTATE へ写像する（Issue #1926）。エラー文言は
+/// `WasmUdfError` の固定英語文言のみで、モジュール内容・entry 名を含めない。
+/// variant 追加をコンパイルエラーで検知できるよう `_ =>` は置かない。
+fn map_wasm_define_error(err: WasmUdfError) -> SqlSurfaceError {
+    match err {
+        WasmUdfError::ModuleTooLarge => SqlSurfaceError::payload_too_large(err.to_string()),
+        WasmUdfError::InvalidModule
+        | WasmUdfError::ImportsNotAllowed
+        | WasmUdfError::MissingMemoryExport
+        | WasmUdfError::MissingEntryExport
+        | WasmUdfError::SignatureMismatch
+        | WasmUdfError::MemoryLimitExceeded => {
+            SqlSurfaceError::invalid_function_definition(err.to_string())
+        }
+        // 定義時点では到達しない防御的経路。
+        WasmUdfError::Trap(_) | WasmUdfError::Poisoned => SqlSurfaceError::Internal {
+            detail: "wasm udf: unexpected error while defining function".to_string(),
+        },
+    }
+}
+
+/// feature 無効ビルド: モジュールを扱う経路を持たない（fail-closed。ADR 第 4 節 1）。
+#[cfg(not(feature = "wasm-udf"))]
+fn build_wasm_backend(
+    _module_bytes: &[u8],
+    _entry: &str,
+    _limits: SandboxLimits,
+) -> Result<Arc<dyn WasmUdfBackend>, SqlSurfaceError> {
+    Err(SqlSurfaceError::feature_not_supported(
+        "WASM functions are not supported in this build",
+    ))
+}
+
+/// feature 有効ビルド: 検証・コンパイルは [`crate::wasm_udf::compile_wasm_udf_backend`]。
+#[cfg(feature = "wasm-udf")]
+fn build_wasm_backend(
+    module_bytes: &[u8],
+    entry: &str,
+    limits: SandboxLimits,
+) -> Result<Arc<dyn WasmUdfBackend>, SqlSurfaceError> {
+    crate::wasm_udf::compile_wasm_udf_backend(module_bytes, entry, limits)
+        .map_err(map_wasm_define_error)
+}
+
+/// WASM モジュールのバイト列を検証・コンパイルしてセッションのレジストリへ登録する
+/// （Issue #1926・EXT-9 ポインタ。`SessionState::register_wasm_udf_from_module` から
+/// 呼ばれる）。判定順は、feature 無効なら即 `0A000` → 名前・件数の前段検査 →
+/// 宣言シグネチャの ABI 照合（`42P13`）→ コンパイル → 登録。登録だけが状態変更で、
+/// それ以前の失敗はレジストリを変えない。Rust の呼び出し元からのみ到達でき、
+/// SQL・wire からの登録経路は無い。
+pub fn define_wasm_function_from_module(
+    registry: &mut UdfRegistry,
+    name: &str,
+    signature: &WasmUdfSignature,
+    module_bytes: &[u8],
+    entry: &str,
+    limits: SandboxLimits,
+) -> Result<(), SqlSurfaceError> {
+    if !cfg!(feature = "wasm-udf") {
+        return Err(SqlSurfaceError::feature_not_supported(
+            "WASM functions are not supported in this build",
+        ));
+    }
+    let lower = precheck_wasm_registration(registry, name)?;
+    check_signature_against_abi(signature).map_err(map_wasm_define_error)?;
+    let backend = build_wasm_backend(module_bytes, entry, limits)?;
     registry.wasm.insert(lower, backend);
     Ok(())
 }
@@ -13598,5 +13681,82 @@ mod as_bare_column_tests {
         };
         assert_eq!(call.as_bare_column(), None);
         assert_eq!(Expr::String("a".to_string()).as_bare_column(), None);
+    }
+}
+#[cfg(test)]
+mod wasm_define_tests {
+    //! `define_wasm_function_from_module` の前段検査とエラー写像の単体テスト（Issue #1926）。
+    use super::*;
+    use crate::wasm_udf::{TrapKind, WasmSqlType};
+
+    #[test]
+    fn define_error_mapping_covers_every_variant() {
+        let invalid_definition = [
+            WasmUdfError::InvalidModule,
+            WasmUdfError::ImportsNotAllowed,
+            WasmUdfError::MissingMemoryExport,
+            WasmUdfError::MissingEntryExport,
+            WasmUdfError::SignatureMismatch,
+            WasmUdfError::MemoryLimitExceeded,
+        ];
+        for e in invalid_definition {
+            assert_eq!(map_wasm_define_error(e).wire_code(), "42P13", "{e:?}");
+        }
+        assert_eq!(
+            map_wasm_define_error(WasmUdfError::ModuleTooLarge).wire_code(),
+            "54000"
+        );
+        for e in [WasmUdfError::Trap(TrapKind::Other), WasmUdfError::Poisoned] {
+            assert_eq!(map_wasm_define_error(e).wire_code(), "XX000", "{e:?}");
+        }
+    }
+
+    #[derive(Debug)]
+    struct Nop;
+    impl WasmUdfBackend for Nop {
+        fn call_vector_scalar(&self, _: &[f32], s: f64) -> Result<f64, WasmUdfError> {
+            Ok(s)
+        }
+    }
+
+    #[test]
+    fn precheck_rejects_reserved_and_duplicate_names_without_mutation() {
+        let mut registry = UdfRegistry::default();
+        assert_eq!(
+            precheck_wasm_registration(&registry, "vec_sum")
+                .unwrap_err()
+                .wire_code(),
+            "42723"
+        );
+        assert_eq!(precheck_wasm_registration(&registry, "Wfn").unwrap(), "wfn");
+        assert!(registry.is_empty());
+        define_wasm_function(&mut registry, "wfn", Arc::new(Nop)).unwrap();
+        assert_eq!(
+            define_wasm_function(&mut registry, "WFN", Arc::new(Nop))
+                .unwrap_err()
+                .wire_code(),
+            "42723"
+        );
+        let sig = WasmUdfSignature {
+            params: vec![WasmSqlType::Vector, WasmSqlType::Real],
+            ret: WasmSqlType::Real,
+        };
+        let err = define_wasm_function_from_module(
+            &mut registry,
+            "wfn",
+            &sig,
+            b"",
+            "f",
+            SandboxLimits::default(),
+        )
+        .unwrap_err();
+        // feature 無効なら 0A000、有効なら前段検査の 42723（いずれもレジストリ不変）。
+        let expected = if cfg!(feature = "wasm-udf") {
+            "42723"
+        } else {
+            "0A000"
+        };
+        assert_eq!(err.wire_code(), expected);
+        assert_eq!(registry.len(), 1);
     }
 }

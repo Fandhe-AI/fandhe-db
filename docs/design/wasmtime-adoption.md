@@ -111,3 +111,4 @@ feature 名は crates.io API の 48.0.7 の feature 一覧による。最小構�
   - 第 4 節 3（`--all-features` と CI 時間）: 受け入れる。増分の実測は #1924 で行い、許容を超える場合は専用ジョブへの分離を検討する
   - 第 4 節 4（承認範囲）: 直接依存 `wasmtime = "=48.0.8"` の 1 行に限る。版の変更（セキュリティ更新を含む）とサブクレートの直接依存化は範囲外で、再承認を要する
 - 2026-10-31: Issue #1924 で依存を追加した。版は承認どおり `=48.0.8`（48.0.7 から変更。理由は RUSTSEC-2026-0422・0423・0424 の修正版であるため。承認は #1911 のコメント）。`Cargo.lock` は wasmtime 系の新規エントリのみで既存エントリの版は不変。`make deny` は通過し、既定ビルドの engine・wire-server の依存木に wasmtime・cranelift は出ない
+- 2026-10-31: Issue #1926 で第 4 節 1 の feature 無効時の SQLSTATE を `0A000` に確定した（登録 API・`CREATE FUNCTION ... LANGUAGE wasm` とも両ビルドで拒否）。登録は Rust API（`register_wasm_udf_from_module`）のみで、SQL による永続定義は永続化設計待ちのため範囲外

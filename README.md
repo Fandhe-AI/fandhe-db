@@ -93,7 +93,7 @@ cargo test -p fandhe-db-wire-server --test wire_framing
 | `make ci` | CI（`.github/workflows/ci.yml`）と同等のチェックをローカル一括実行 |
 | `make lint-docs` | ドキュメント／設定ファイル系 lint（markdownlint・yamllint・editorconfig-checker・commitlint） |
 | `make fmt` / `make fmt-check` / `make lint` / `make test` / `make deny` | Rust 系チェック（workspace 追加により有効化済み） |
-| `make test-default-build` | 既定ビルド（feature `fault-injection` 無効）専用の回帰テスト（`ci` に含む）。`make test` は `--all-features` のため対象外のテストをピンポイント実行 |
+| `make test-default-build` | 既定ビルド（feature `fault-injection`・`wasm-udf` 無効）専用の回帰テスト（`ci` に含む）。`make test` は `--all-features` のため対象外のテストをピンポイント実行 |
 | `make crash-test` / `make crash-test-interrupt` / `make crash-test-cross-table` / `make crash-test-unique-index` / `make crash-test-partitioned-dml` / `make tmp-leak-check` / `make core-api-check` / `make sort-determinism-check` / `make simd-codegen-check` | `ci` に含まれるガード系（クラッシュ耐性・テスト一時領域の残置検出・コア API 差分・ソート非決定性・SIMD 生成コード検査）。個別実行や詳細は `make help` を参照 |
 | `make check-cross` / `make simd-codegen-check-cross` | aarch64 クロスコンパイル確認（`ci.yml` の cross-check ジョブから実行。`ci` には含めない）。beta toolchain での週次先行検知は `toolchain-canary.yml` |
 | `make scripts-test` | `scripts/tests` 配下の Python 補助スクリプトの単体テスト（要 `python3`・標準ライブラリのみ。`ci` に含む） |
