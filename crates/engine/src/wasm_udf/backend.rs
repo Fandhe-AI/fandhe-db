@@ -3,8 +3,8 @@
 //!
 //! 責務境界: untrusted な WASM モジュールのバイト列を検証・コンパイルし、
 //! [`WasmUdfBackend`] を実装する値（`Arc<dyn WasmUdfBackend>`）を返す。wasmtime の型は
-//! 本ファイルの外へ出さない。将来 Issue #1926 で `sql::udf_call::define_wasm_function`
-//! が [`compile_wasm_udf_backend`] を呼ぶ。epoch を進めるティッカーと上限の設定経路は
+//! 本ファイルの外へ出さない。`sql::udf_call::define_wasm_function_from_module`
+//! （Issue #1926）が [`compile_wasm_udf_backend`] を呼ぶ。epoch を進めるティッカーと上限の設定経路は
 //! Issue #1927 の範囲。それまでの停止手段として、Store ごとに fuel（命令数予算。
 //! `deadline_ticks` に比例）を設定し、無限ループする entry・start 関数も必ず停止する。
 //!

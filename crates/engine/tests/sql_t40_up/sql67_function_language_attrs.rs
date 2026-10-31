@@ -79,6 +79,8 @@ fn invalid_option_combinations_are_rejected_with_fixed_codes() {
     let cases = [
         // 未知の言語は応答に言語名を含めない。
         ("CREATE FUNCTION f(a int) RETURNS int LANGUAGE c AS $$ x $$", "42704"),
+        // `LANGUAGE wasm` は SQL 定義の永続化設計が未確定のため両ビルドで 0A000（Issue #1926）。
+        ("CREATE FUNCTION f(a int) RETURNS int LANGUAGE wasm AS $$ x $$", "0A000"),
         // 重複・矛盾。
         ("CREATE FUNCTION f(a int) RETURNS int LANGUAGE sql LANGUAGE sql AS $$ x $$", "42601"),
         ("CREATE FUNCTION f(a int) RETURNS int LANGUAGE sql IMMUTABLE VOLATILE AS $$ x $$", "42601"),

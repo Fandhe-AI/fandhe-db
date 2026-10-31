@@ -23691,6 +23691,11 @@ fn parse_create_function(tokens: &[Token]) -> Result<ParsedCreateFunction, SqlSu
                     FunctionLanguageClause::Sql
                 } else if name.eq_ignore_ascii_case("plpgsql") {
                     FunctionLanguageClause::Plpgsql
+                } else if name.eq_ignore_ascii_case("wasm") {
+                    // SQL 定義の WASM 関数は永続化設計が未確定のため両ビルドで拒否する（Issue #1926）。
+                    return Err(SqlSurfaceError::feature_not_supported(
+                        "LANGUAGE wasm is not supported",
+                    ));
                 } else {
                     // 言語名は応答に含めない（`DO` と同じ固定文言）。
                     return Err(SqlSurfaceError::UndefinedObject {

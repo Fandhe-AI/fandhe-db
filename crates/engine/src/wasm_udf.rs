@@ -23,10 +23,13 @@
 //! 構築関数は fuel（`consume_fuel(true)`・`Store::set_fuel`）で命令数を制限し、
 //! 枯渇は `DeadlineExceeded` へ写像するため無限ループは停止する。epoch による
 //! 時間制限（ティッカー）は Issue #1927 で追加する。
-//! `sql::udf_call::define_wasm_function`／`SessionState::register_wasm_udf` からの
-//! 呼び出し配線は Issue #1926 の範囲で、本 Issue の時点では SQL からの実行経路は
-//! 存在しない（fail-open な実行経路はできない）。feature 無効の既定ビルドでは
-//! 契約層のみで、モジュールを実行できると誤認させる公開関数は存在しない。
+//! モジュールのバイト列からの登録は `SessionState::register_wasm_udf_from_module`
+//! （`sql::udf_call::define_wasm_function_from_module`。Issue #1926・EXT-9 ポインタ）が
+//! 担い、宣言シグネチャ（[`WasmUdfSignature`]）を ABI と照合してから
+//! [`compile_wasm_udf_backend`] を呼ぶ。登録は Rust の呼び出し元からのみ到達でき、
+//! SQL 文（`CREATE FUNCTION ... LANGUAGE wasm`）・wire からの登録経路は無い
+//! （`0A000`。永続化設計が未確定のため）。feature 無効の既定ビルドでは登録 API が
+//! 常に `0A000` を返し、モジュールを実行できる経路は存在しない（fail-closed）。
 //!
 //! fail-closed: 登録時・呼び出し時のあらゆる失敗は `Result` として伝播し
 //! （`unwrap`/`expect`/添字アクセス禁止。`.claude/rules/coding-rust.md`）、
@@ -162,14 +165,87 @@ impl std::error::Error for WasmUdfError {}
 /// 実装は `wasm-udf` feature 有効時の [`compile_wasm_udf_backend`] が返す wasmtime
 /// バックエンドのみ（モジュール冒頭のドキュメント参照）。呼び出し元は検証済みの実装を
 /// `Arc<dyn WasmUdfBackend>` として構築したうえで
-/// `sql::mode::SessionState::register_wasm_udf` へ渡す（配線は Issue #1926）。
+/// `sql::mode::SessionState::register_wasm_udf` へ渡す。モジュールのバイト列からの
+/// 登録は `register_wasm_udf_from_module`（Issue #1926）が構築まで担う。
 pub trait WasmUdfBackend: fmt::Debug + Send + Sync {
     fn call_vector_scalar(&self, v: &[f32], scalar: f64) -> Result<f64, WasmUdfError>;
+}
+
+/// WASM UDF の宣言シグネチャで許す SQL 型（閉じた集合）。`sql::cast::CastType` には
+/// vector 型が無いため、ABI 照合専用にここで定義する（wasmtime 非依存・両ビルドに存在）。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum WasmSqlType {
+    /// ベクトル。ABI 上は `(ptr: i32, len: i32)` の 2 引数へ展開される。
+    Vector,
+    /// `real`。ABI 上は `f32`。
+    Real,
+    /// `double precision`。ABI 上は `f32` へ狭まる（バックエンドが `scalar as f32` で
+    /// 渡すため精度が落ちる）。
+    DoublePrecision,
+}
+
+/// WASM UDF の宣言シグネチャ（`sql::udf_call::define_wasm_function_from_module` の入力）。
+/// 受理する形は [`check_signature_against_abi`] が固定する。
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct WasmUdfSignature {
+    pub params: Vec<WasmSqlType>,
+    pub ret: WasmSqlType,
+}
+
+/// 宣言シグネチャが ABI（`(Vector, Scalar) -> Scalar`）と一致するか検査する。
+/// 受理は `[Vector, Real|DoublePrecision] -> Real|DoublePrecision` のみで、
+/// それ以外は [`WasmUdfError::SignatureMismatch`]（fail-closed）。
+/// export 側の照合は [`compile_wasm_udf_backend`] が担い、2 段で宣言と export の
+/// 一致を保証する。
+pub fn check_signature_against_abi(sig: &WasmUdfSignature) -> Result<(), WasmUdfError> {
+    let is_scalar = |t: &WasmSqlType| matches!(t, WasmSqlType::Real | WasmSqlType::DoublePrecision);
+    match sig.params.as_slice() {
+        [WasmSqlType::Vector, scalar] if is_scalar(scalar) && is_scalar(&sig.ret) => Ok(()),
+        _ => Err(WasmUdfError::SignatureMismatch),
+    }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    use WasmSqlType::{DoublePrecision as D, Real as R, Vector as V};
+
+    fn sig(params: &[WasmSqlType], ret: WasmSqlType) -> WasmUdfSignature {
+        WasmUdfSignature {
+            params: params.to_vec(),
+            ret,
+        }
+    }
+
+    #[test]
+    fn signature_accepts_vector_scalar_to_scalar_forms() {
+        for p in [R, D] {
+            for r in [R, D] {
+                assert_eq!(check_signature_against_abi(&sig(&[V, p], r)), Ok(()));
+            }
+        }
+    }
+
+    #[test]
+    fn signature_rejects_other_shapes() {
+        let bad = [
+            sig(&[], R),
+            sig(&[V], R),
+            sig(&[V, R, R], R),
+            sig(&[R, V], R),
+            sig(&[R, R], R),
+            sig(&[V, V], R),
+            sig(&[V, R], V),
+        ];
+        for s in bad {
+            assert_eq!(
+                check_signature_against_abi(&s),
+                Err(WasmUdfError::SignatureMismatch),
+                "{s:?}"
+            );
+        }
+    }
 
     #[test]
     fn sandbox_limits_default_matches_documented_constants() {

@@ -1,9 +1,9 @@
 //! `compile_wasm_udf_backend`（Issue #1925・EXT-9 ポインタ）の結合テスト。
 //!
-//! 外部依存（wat 等）を増やさないため、WASM バイナリは本ファイル内の小さな
+//! 外部依存（wat 等）を増やさないため、WASM バイナリは `tests/support/wasm_encoder.rs` の小さな
 //! エンコーダで手書きする。各 fixture のコメントに対応する WAT 相当を書く。
 //! `wasm-udf` feature 無効の既定ビルドではこのファイルは空になる。
-//! 配線（SQL からの呼び出し）は #1926、epoch ティッカーは #1927 の範囲。
+//! SQL からの呼び出しは `tests/wasm_udf_sql.rs`（#1926）、epoch ティッカーは #1927 の範囲。
 
 #![cfg(feature = "wasm-udf")]
 
@@ -14,145 +14,9 @@ use engine::wasm_udf::{
     MAX_MODULE_BYTES,
 };
 
-const I32: u8 = 0x7F;
-const F32: u8 = 0x7D;
-const F64: u8 = 0x7C;
-
-fn leb(mut v: u32, out: &mut Vec<u8>) {
-    loop {
-        let b = (v & 0x7F) as u8;
-        v >>= 7;
-        if v == 0 {
-            out.push(b);
-            return;
-        }
-        out.push(b | 0x80);
-    }
-}
-
-fn name(s: &str, out: &mut Vec<u8>) {
-    leb(s.len() as u32, out);
-    out.extend_from_slice(s.as_bytes());
-}
-
-fn section(id: u8, body: &[u8], out: &mut Vec<u8>) {
-    out.push(id);
-    leb(body.len() as u32, out);
-    out.extend_from_slice(body);
-}
-
-struct Spec {
-    params: Vec<u8>,
-    results: Vec<u8>,
-    /// 関数 import の数（module "env"・field "h"・型 0）。
-    func_imports: u32,
-    /// memory を import する（memory section は出さない）。
-    memory_import: bool,
-    /// (minimum pages)。None なら memory 無し。
-    memory_min: Option<u32>,
-    mutable_i32_global: bool,
-    /// funcref テーブルの初期要素数。None ならテーブル無し。
-    table_min: Option<u32>,
-    memory_export: Option<&'static str>,
-    entry_export: Option<&'static str>,
-    /// ローカル宣言を含む関数本体（end を含む）。
-    body: Vec<u8>,
-}
-
-impl Spec {
-    fn new(body: Vec<u8>) -> Self {
-        Spec {
-            params: vec![I32, I32, F32],
-            results: vec![F32],
-            func_imports: 0,
-            memory_import: false,
-            memory_min: Some(1),
-            mutable_i32_global: false,
-            table_min: None,
-            memory_export: Some("memory"),
-            entry_export: Some("f"),
-            body,
-        }
-    }
-
-    fn build(&self) -> Vec<u8> {
-        let mut m = b"\0asm\x01\0\0\0".to_vec();
-        let mut s = Vec::new();
-        leb(1, &mut s);
-        s.push(0x60);
-        leb(self.params.len() as u32, &mut s);
-        s.extend_from_slice(&self.params);
-        leb(self.results.len() as u32, &mut s);
-        s.extend_from_slice(&self.results);
-        section(1, &s, &mut m);
-
-        if self.func_imports > 0 || self.memory_import {
-            let mut s = Vec::new();
-            leb(self.func_imports + u32::from(self.memory_import), &mut s);
-            for _ in 0..self.func_imports {
-                name("env", &mut s);
-                name("h", &mut s);
-                s.push(0);
-                leb(0, &mut s);
-            }
-            if self.memory_import {
-                name("env", &mut s);
-                name("mem", &mut s);
-                s.push(2);
-                s.push(0);
-                leb(1, &mut s);
-            }
-            section(2, &s, &mut m);
-        }
-
-        section(3, &[1, 0], &mut m);
-
-        if let Some(min) = self.table_min {
-            let mut s = vec![1, 0x70, 0];
-            leb(min, &mut s);
-            section(4, &s, &mut m);
-        }
-        if let (Some(min), false) = (self.memory_min, self.memory_import) {
-            let mut s = vec![1, 0];
-            leb(min, &mut s);
-            section(5, &s, &mut m);
-        }
-        if self.mutable_i32_global {
-            // (global (mut i32) (i32.const 0))
-            section(6, &[1, I32, 1, 0x41, 0, 0x0B], &mut m);
-        }
-
-        let mut exports: Vec<(&str, u8, u32)> = Vec::new();
-        if let Some(n) = self.memory_export {
-            exports.push((n, 2, 0));
-        }
-        if let Some(n) = self.entry_export {
-            exports.push((n, 0, self.func_imports));
-        }
-        let mut s = Vec::new();
-        leb(exports.len() as u32, &mut s);
-        for (n, kind, idx) in exports {
-            name(n, &mut s);
-            s.push(kind);
-            leb(idx, &mut s);
-        }
-        section(7, &s, &mut m);
-
-        let mut s = vec![1];
-        leb(self.body.len() as u32, &mut s);
-        s.extend_from_slice(&self.body);
-        section(10, &s, &mut m);
-        m
-    }
-}
-
-/// ローカルなしの関数本体を作る（命令列に `end` を付ける）。
-fn plain_body(instrs: &[u8]) -> Vec<u8> {
-    let mut b = vec![0];
-    b.extend_from_slice(instrs);
-    b.push(0x0B);
-    b
-}
+#[path = "support/wasm_encoder.rs"]
+mod wasm_encoder;
+use wasm_encoder::{plain_body, Spec, F32, F64, I32};
 
 /// `len` 個の f32 の総和 × scalar を返す本体。
 ///
