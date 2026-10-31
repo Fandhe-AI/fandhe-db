@@ -605,6 +605,80 @@ fn quoted_keyword_like_dml_targets_are_bound() {
     }
 }
 
+/// 対象表名は綴りではなく解析器の結果で束縛する（Issue #2219 レビュー指摘）。`UPDATE only SET ...` は
+/// 表 `only` への更新、`UPDATE "SET" SET ...` は表 `SET` への更新で、不在なら定義時に 42P01、存在すれば
+/// DROP・改名が 2BP01 で止まる。INSERT・DELETE・副問い合わせ内の表も同様に解決される。
+#[test]
+fn dml_target_names_come_from_the_parser() {
+    let (core, mut s, _g) = setup("sql67_std_parser_targets");
+    for (i, (name, dml)) in [
+        ("only", "UPDATE only SET a = 1"),
+        ("SET", "UPDATE \"SET\" SET a = 1"),
+        ("only", "DELETE FROM only WHERE a = 1"),
+        ("only", "INSERT INTO only VALUES (1)"),
+    ]
+    .iter()
+    .enumerate()
+    {
+        let create =
+            format!("CREATE FUNCTION pt{i}() RETURNS int BEGIN ATOMIC {dml}; SELECT 1; END");
+        assert_eq!(run_or_err(&core, &mut s, &create), Err("42P01"), "{dml}");
+        run(
+            &core,
+            &mut s,
+            "alice",
+            &format!("CREATE TABLE \"{name}\" (a INTEGER)"),
+        );
+        run(&core, &mut s, "alice", &create);
+        assert_eq!(
+            code(&core, &mut s, &format!("DROP TABLE \"{name}\"")),
+            "2BP01",
+            "{dml}"
+        );
+        assert_eq!(
+            code(
+                &core,
+                &mut s,
+                &format!("ALTER TABLE \"{name}\" RENAME TO renamed_{i}")
+            ),
+            "2BP01",
+            "{dml}"
+        );
+        run(&core, &mut s, "alice", &format!("DROP FUNCTION pt{i}"));
+        run(&core, &mut s, "alice", &format!("DROP TABLE \"{name}\""));
+    }
+}
+
+/// DML の副問い合わせ・`INSERT ... SELECT`・`UPDATE ... FROM`・`DELETE ... USING`・JOIN に現れる不在の表も、
+/// 定義時に 42P01 で拒否される（取りこぼして定義を通さない）。
+#[test]
+fn nested_relations_of_dml_are_bound() {
+    let (core, mut s, _g) = setup("sql67_std_nested_bound");
+    run(&core, &mut s, "alice", "CREATE TABLE here1 (a INTEGER)");
+    for (i, dml) in [
+        "UPDATE here1 SET a = 1 WHERE a IN (SELECT a FROM gone)",
+        "DELETE FROM here1 WHERE a IN (SELECT a FROM gone)",
+        "INSERT INTO here1 SELECT a FROM gone",
+        "UPDATE here1 SET a = g.a FROM gone g WHERE here1.a = g.a",
+        "DELETE FROM here1 USING gone g WHERE here1.a = g.a",
+        "SELECT x.a FROM here1 x JOIN gone g ON x.a = g.a",
+        "WITH c AS (SELECT a FROM gone) SELECT a FROM c",
+    ]
+    .iter()
+    .enumerate()
+    {
+        let create =
+            format!("CREATE FUNCTION nb{i}() RETURNS int BEGIN ATOMIC {dml}; SELECT 1; END");
+        assert_eq!(run_or_err(&core, &mut s, &create), Err("42P01"), "{dml}");
+    }
+}
+
+fn run_or_err(core: &EngineCore, s: &mut SessionState, sql: &str) -> Result<(), &'static str> {
+    core.execute_sql_in_session(&ctx("alice"), s, sql)
+        .map(|_| ())
+        .map_err(|e| e.wire_code())
+}
+
 /// CTE の列名リスト宣言 `WITH f(a) AS (...)` は関数呼び出しではない（同名関数への依存も自己参照も作らない）。
 #[test]
 fn cte_column_list_declaration_is_not_a_call() {

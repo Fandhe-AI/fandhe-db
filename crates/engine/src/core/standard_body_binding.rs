@@ -26,8 +26,8 @@ use crate::plpgsql::embedded::{validate_embedded, EmbeddedSqlChecker};
 use crate::plpgsql::{check_result_shape, parse_sql_function_body};
 use crate::sql::allowlist::{SqlSurfaceError, TableLookup};
 use crate::sql::cast::CastType;
-use crate::sql::embedded_unit::{parse_unit_with_lookup, UnitSummary};
-use crate::sql::lexer::{Keyword, Token};
+use crate::sql::embedded_unit::{parse_unit_with_target, UnitSummary};
+use crate::sql::lexer::Token;
 use crate::storage::Storage;
 
 /// 実カタログへ委譲しつつ、存在を確認できた relation の名前を記録する [`TableLookup`]。
@@ -65,6 +65,10 @@ impl TableLookup for RecordingLookup<'_> {
 struct BindingChecker<'a> {
     lookup: RecordingLookup<'a>,
     missing: RefCell<Option<String>>,
+    /// 解析器が確定した DML 文の対象表名（`INSERT INTO`・`UPDATE`・`DELETE FROM` の対象）。
+    /// 綴りの走査ではなく解析木から取るので、`UPDATE only SET ...`（表 `only`）や引用識別子の
+    /// `"SET"` も取りこぼさない。定義時の存在確認と依存辺の記録に使う。
+    targets: RefCell<BTreeSet<String>>,
 }
 
 impl EmbeddedSqlChecker for BindingChecker<'_> {
@@ -83,66 +87,31 @@ impl EmbeddedSqlChecker for BindingChecker<'_> {
                 "data-modifying WITH in a standard function body is not supported",
             ));
         }
-        let result = parse_unit_with_lookup(tokens, depth, is_root, &self.lookup);
-        if let Err(SqlSurfaceError::UndefinedTable { name }) = &result {
-            self.missing
-                .borrow_mut()
-                .get_or_insert_with(|| name.clone());
+        let result = parse_unit_with_target(tokens, depth, is_root, &self.lookup);
+        match result {
+            Ok((summary, target)) => {
+                // データ変更 CTE は上の目印を外れても解析木で判定できる。保存して依存を取りこぼさない
+                // よう同じく拒否する（fail-closed）。
+                if summary.has_write_cte {
+                    return Err(SqlSurfaceError::feature_not_supported(
+                        "data-modifying WITH in a standard function body is not supported",
+                    ));
+                }
+                if let Some(t) = target {
+                    self.targets.borrow_mut().insert(t);
+                }
+                Ok(summary)
+            }
+            Err(e) => {
+                if let SqlSurfaceError::UndefinedTable { name } = &e {
+                    self.missing
+                        .borrow_mut()
+                        .get_or_insert_with(|| name.clone());
+                }
+                Err(e)
+            }
         }
-        result
     }
-}
-
-/// 文のトークン列に現れる DML の対象表名（`INSERT INTO <t>`・`UPDATE [ONLY] <t>`・
-/// `DELETE FROM [ONLY] <t>`）を、データ変更 CTE（`WITH d AS (DELETE FROM t ...)`）の内側も含めて
-/// 位置を問わず集める。構造専用の解析は DML の対象表を引かないため、標準形の定義時に明示的に存在を
-/// 確認し依存辺へ載せる。`ON CONFLICT DO UPDATE SET`・`FOR UPDATE` の `UPDATE` は対象表を取らないので除く。
-fn dml_targets(tokens: &[Token]) -> Vec<&str> {
-    let is_with = matches!(tokens.first(), Some(Token::Ident(w)) if w.eq_ignore_ascii_case("WITH"));
-    let word = |i: Option<usize>, w: &[&str]| matches!(i.and_then(|p| tokens.get(p)), Some(Token::Ident(x)) if w.iter().any(|k| x.eq_ignore_ascii_case(k)));
-    (0..tokens.len())
-        .filter(|&i| {
-            // 文の先頭、または CTE 本体の `AS [[NOT] MATERIALIZED] (` の直後、`WITH` 文の末尾の主文
-            // （CTE の閉じ括弧の直後）だけを文頭とみなす。列名・別名の `update` 等を DML と誤認しない。
-            let prev = i.checked_sub(1);
-            i == 0
-                || (matches!(prev.and_then(|p| tokens.get(p)), Some(Token::Punct('(')))
-                    && word(i.checked_sub(2), &["AS", "MATERIALIZED"]))
-                || (is_with && matches!(prev.and_then(|p| tokens.get(p)), Some(Token::Punct(')'))))
-        })
-        .filter_map(|i| dml_target_at(tokens, i))
-        .collect()
-}
-
-/// 位置 `at` から始まる DML の対象表名（[`dml_targets`] の 1 位置分）。
-fn dml_target_at(tokens: &[Token], at: usize) -> Option<&str> {
-    let tokens_all = tokens;
-    let tokens = tokens.get(at..)?;
-    let prev_is = |w: &str| {
-        at.checked_sub(1)
-            .and_then(|p| tokens_all.get(p))
-            .is_some_and(|t| matches!(t, Token::Ident(x) if x.eq_ignore_ascii_case(w)))
-    };
-    let ident_at = |i: usize| match tokens.get(i) {
-        // 引用識別子が `NULL`・`ARRAY`・`true` 等の綴りだと別トークンになるが、対象表名としては同じ。
-        Some(Token::Ident(n) | Token::QuotedNull(n) | Token::QuotedBoolWord(n)) => Some(n.as_str()),
-        _ => None,
-    };
-    let is = |i: usize, w: &str| matches!(tokens.get(i), Some(Token::Ident(x)) if x.eq_ignore_ascii_case(w));
-    let skip_only = |i: usize| if is(i, "ONLY") { i + 1 } else { i };
-    if is(0, "INSERT") && is(1, "INTO") {
-        return ident_at(2);
-    }
-    if is(0, "UPDATE") {
-        if prev_is("DO") || prev_is("FOR") {
-            return None;
-        }
-        return ident_at(skip_only(1)).filter(|n| !n.eq_ignore_ascii_case("SET"));
-    }
-    if is(0, "DELETE") && matches!(tokens.get(1), Some(Token::Keyword(Keyword::From))) {
-        return ident_at(skip_only(2));
-    }
-    None
 }
 
 /// 文のトークン列に現れる `名前(`（関数呼び出しの形）の名前を集める（小文字化。重複は呼び出し側で除く）。
@@ -220,6 +189,7 @@ impl EngineCore {
                 seen: RefCell::new(BTreeSet::new()),
             },
             missing: RefCell::new(None),
+            targets: RefCell::new(BTreeSet::new()),
         };
         let validated = validate_embedded(&mut body, &checker);
         // 解決できなかった表は、他の失敗（先送りされた解析の打ち切りに由来する拒否）より優先して返す。
@@ -231,16 +201,18 @@ impl EngineCore {
 
         let mut relations = checker.lookup.seen.borrow().clone();
         let mut functions: BTreeSet<String> = BTreeSet::new();
+        // DML の対象表は構造専用の解析では引かれないので、解析器が確定した名前で存在を確認する
+        // （`exists` の副作用で `relations` と同じ記録に載る）。
+        for target in checker.targets.borrow().iter() {
+            if !checker.lookup.table_exists(target)? {
+                return Err(SqlSurfaceError::UndefinedTable {
+                    name: target.clone(),
+                });
+            }
+            relations.insert(target.clone());
+        }
         for stmt in &body.block.stmts {
             let Stmt::Sql(q) = stmt else { continue };
-            for target in dml_targets(&q.tokens) {
-                if !checker.lookup.table_exists(target)? {
-                    return Err(SqlSurfaceError::UndefinedTable {
-                        name: target.to_string(),
-                    });
-                }
-                relations.insert(target.to_string());
-            }
             for name in call_names(&q.tokens) {
                 // カタログの照会失敗は依存を取りこぼさないよう拒否する（fail-closed）。
                 let overloads = self.storage.list_overloads(tenant_id, &name).map_err(|_| {
