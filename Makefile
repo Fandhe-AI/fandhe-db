@@ -90,10 +90,10 @@ lint: ## cargo clippy -D warnings
 test: ## cargo test（workspace 全体）
 	cargo test --workspace --all-features
 
-# 既定ビルド（feature fault-injection 無効）専用の回帰テストを実行する（Issue #710・#715。make test は --all-features のため対象外のテストをピンポイント実行）
+# 既定ビルド（feature fault-injection 無効）専用の回帰テストを実行する（Issue #710・#715・#1926。make test は --all-features のため対象外のテストをピンポイント実行）
 .PHONY: test-default-build
 test-default-build: ## 既定ビルド（fault-injection 無効）専用の回帰テスト
-	cargo test -p fandhe-db-wire-server --test wire_fault_injection_cli
+	@scripts/test_default_build.sh
 
 # クラッシュ耐性回帰テスト（TASK-142・PERSIST-1。scripts/crash_test.sh を実行）
 .PHONY: crash-test

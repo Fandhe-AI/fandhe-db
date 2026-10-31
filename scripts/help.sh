@@ -58,8 +58,8 @@ cat <<'EOF'
       cargo test（workspace 全体）
       $ cargo test --workspace --all-features
   test-default-build
-      既定ビルド（fault-injection 無効）専用の回帰テスト
-      $ cargo test -p fandhe-db-wire-server --test wire_fault_injection_cli
+      既定ビルド（fault-injection・wasm-udf 無効）専用の回帰テスト
+      $ scripts/test_default_build.sh
   crash-test
       クラッシュ耐性回帰テスト（PERSIST-1）
       $ scripts/crash_test.sh
