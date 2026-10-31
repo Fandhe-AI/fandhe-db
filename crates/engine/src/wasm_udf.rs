@@ -20,8 +20,9 @@
 //! 第 5 節）。wasmtime は Issue #1924 で承認済みの optional 依存として追加済みで、
 //! `wasm-udf` feature 有効時に限り、検証・コンパイルを行うバックエンド構築関数
 //! （[`compile_wasm_udf_backend`]。Issue #1925・EXT-9 ポインタ）を本ファイルが持つ。
-//! 構築関数は Store の `set_epoch_deadline` までを設定するが、epoch を進める
-//! ティッカーは Issue #1927 の範囲のため、本 Issue の時点では無限ループは停止しない。
+//! 構築関数は fuel（`consume_fuel(true)`・`Store::set_fuel`）で命令数を制限し、
+//! 枯渇は `DeadlineExceeded` へ写像するため無限ループは停止する。epoch による
+//! 時間制限（ティッカー）は Issue #1927 で追加する。
 //! `sql::udf_call::define_wasm_function`／`SessionState::register_wasm_udf` からの
 //! 呼び出し配線は Issue #1926 の範囲で、本 Issue の時点では SQL からの実行経路は
 //! 存在しない（fail-open な実行経路はできない）。feature 無効の既定ビルドでは
