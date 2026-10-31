@@ -4427,6 +4427,12 @@ impl EngineCore {
                     detail: "unexpected recursive CTE statement".to_string(),
                 })
             }
+            // Issue #2220: FROM の関数呼び出しも `BufferedView` の本文としてのみ現れる（防御的に fail-closed）。
+            crate::sql::allowlist::Statement::FunctionScan(_) => {
+                Err(crate::sql::allowlist::SqlSurfaceError::Internal {
+                    detail: "unexpected function scan statement".to_string(),
+                })
+            }
             stmt @ (crate::sql::allowlist::Statement::Join(_)
             | crate::sql::allowlist::Statement::BufferedView(_)
             | crate::sql::allowlist::Statement::ConstSelect(_)) => {
@@ -7825,6 +7831,13 @@ impl EngineCore {
                     "DROP FUNCTION is not supported inside a transaction block",
                 ))
             }
+            // SQL-67・Issue #2220: FROM 句の集合返却関数の呼び出しも、本体を同じ Tx・RLS で実行するため
+            // 汎用の読み取り腕より前で受け、Tx 上で本体を実行してから外側の後処理を適用する。
+            ParsedSql::Statement(Statement::BufferedView(validated))
+                if Self::is_function_scan_view(validated) =>
+            {
+                self.execute_function_scan(ctx, session, txn, validated)
+            }
             // SQL-67 (5)・Issue #2218: ルーチンを呼ぶ `FROM` なし `SELECT` は、本体を同じ Tx・RLS で実行する
             // ため読み取り経路へ回さず、Tx 上で畳み込みと実行を行う。
             ParsedSql::Statement(Statement::ConstSelect(validated))
@@ -8192,6 +8205,7 @@ impl EngineCore {
             | Statement::CreateFunction { .. }
             | Statement::MaterializedView(_)
             | Statement::RecursiveCte(_)
+            | Statement::FunctionScan(_)
             | Statement::ConstSelect(_) => Err(crate::sql::allowlist::SqlSurfaceError::Internal {
                 detail: "unexpected statement in transactional read path".to_string(),
             }),
@@ -8990,6 +9004,12 @@ impl EngineCore {
             ParsedSql::Statement(Statement::MaterializedView(v)) => {
                 Ok(Some(crate::sql::matview::describe_columns(v)))
             }
+            // Issue #2220: FROM 句の関数呼び出し。Execute と同じ `plan` で解決・引数の型検査をして宣言列を
+            // 返す（本体も引数の評価も行わない。Describe は本体を実行しない契約）。
+            ParsedSql::Statement(Statement::FunctionScan(scan)) => {
+                let plan = crate::sql::function_scan::plan(session.udfs(), scan)?;
+                Ok(Some(crate::sql::function_scan::column_metas(&plan)?))
+            }
             // SQL-35・Issue #1870: 再帰 CTE。アンカー項の結果列を（本文は実行せずに）導出し、
             // 再帰項の束縛・列整合の検査だけを行う（Execute と同じ `recursive_eval` の計画を通る
             // ため、束縛エラーが両経路で一致する）。
@@ -9020,7 +9040,8 @@ impl EngineCore {
                     // （Issue #1860）は実行側と同じく呼び出し段の `limits` を渡す。
                     &match validated.origin {
                         crate::sql::allowlist::BufferedOrigin::MaterializedCte
-                        | crate::sql::allowlist::BufferedOrigin::GroupedWindow => *limits,
+                        | crate::sql::allowlist::BufferedOrigin::GroupedWindow
+                        | crate::sql::allowlist::BufferedOrigin::FunctionScan => *limits,
                         crate::sql::allowlist::BufferedOrigin::View => {
                             crate::result_limits::ResultLimits::default()
                         }
@@ -9237,6 +9258,7 @@ impl EngineCore {
                 params,
                 param_types,
                 return_type,
+                return_set,
                 returns_trigger,
                 language,
                 attributes,
@@ -9258,6 +9280,7 @@ impl EngineCore {
                             params: &params,
                             param_types: &param_types,
                             return_type: return_type.as_ref(),
+                            return_set: return_set.as_deref(),
                             returns_trigger,
                             language,
                             attrs,
@@ -9643,6 +9666,13 @@ impl EngineCore {
                     detail: "unexpected recursive CTE statement".to_string(),
                 })
             }
+            // Issue #2220: FROM の関数呼び出しは本体の実行に Tx とセッションを要するため、読み取り源だけを
+            // 持つこの経路へは来ない（`execute_function_scan` が担う。防御的に fail-closed）。
+            crate::sql::allowlist::Statement::FunctionScan(_) => {
+                Err(crate::sql::allowlist::SqlSurfaceError::Internal {
+                    detail: "unexpected function scan statement".to_string(),
+                })
+            }
         }
     }
 
@@ -9941,7 +9971,8 @@ impl EngineCore {
                 // 従来どおり既定値（内側 LIMIT は外側の設定値と連動させない）。
                 let body_limits = match validated.origin {
                     crate::sql::allowlist::BufferedOrigin::MaterializedCte
-                    | crate::sql::allowlist::BufferedOrigin::GroupedWindow => limits,
+                    | crate::sql::allowlist::BufferedOrigin::GroupedWindow
+                    | crate::sql::allowlist::BufferedOrigin::FunctionScan => limits,
                     crate::sql::allowlist::BufferedOrigin::View => {
                         crate::result_limits::ResultLimits::default()
                     }
@@ -9957,33 +9988,7 @@ impl EngineCore {
                     body_limits,
                 )? {
                     crate::sql::SqlOutcome::Query(result) => {
-                        // Issue #1360: 外側の WHERE・ORDER BY・射影・LIMIT/OFFSET は
-                        // 評価済みの本文結果に対する後処理（Describe と同じ
-                        // `plan_outer` で束縛する）。
-                        let plan = crate::sql::view_buffered::plan_outer(
-                            &result.columns,
-                            &validated,
-                            session.udfs(),
-                        )?;
-                        let processed = crate::sql::view_buffered::apply_outer(
-                            result,
-                            &plan,
-                            self.group_by_limits,
-                        )?;
-                        // Issue #1796・SQL-34: 外側の `LIMIT` 省略・`LIMIT ALL` は後処理後の
-                        // 件数が結果行数上限を超えたら `54000`（連鎖の素通しは対象外）。
-                        let processed = match &validated.outer {
-                            crate::sql::allowlist::BufferedOuter::Rows(r) if r.limit_implicit => {
-                                Self::enforce_result_cap(processed, limits.max_result_rows())?
-                            }
-                            // 外側の `GROUP BY` も同様（`limit: None` のときだけ HAVING・OFFSET
-                            // 適用後の件数を呼び出し段の上限で検査する）。
-                            crate::sql::allowlist::BufferedOuter::Aggregate(agg) => {
-                                Self::enforce_group_result_cap(agg, processed, &limits)?
-                            }
-                            _ => processed,
-                        };
-                        Ok(crate::sql::SqlOutcome::Query(processed))
+                        self.finish_buffered_view(&*session, &validated, result, &limits)
                     }
                     _ => Err(crate::sql::allowlist::SqlSurfaceError::Internal {
                         detail: "internal error".to_string(),
@@ -10064,6 +10069,39 @@ impl EngineCore {
                 detail: "internal error".to_string(),
             }),
         }
+    }
+
+    /// 評価後射影形ビューの本文の結果 `result` へ外側（WHERE・ORDER BY・射影・集計・LIMIT/OFFSET）を
+    /// 適用して応答にする。読み取り経路の `BufferedView` 腕と、FROM 句の関数呼び出し
+    /// （[`Self::execute_function_scan`]。Issue #2220）が共有する（第 2 の後処理を作らない）。
+    fn finish_buffered_view(
+        &self,
+        session: &crate::sql::mode::SessionState,
+        validated: &crate::sql::allowlist::ValidatedBufferedView,
+        result: crate::sql::exec::QueryResult,
+        limits: &crate::result_limits::ResultLimits,
+    ) -> Result<crate::sql::SqlOutcome, crate::sql::allowlist::SqlSurfaceError> {
+        // Issue #1360: 外側の WHERE・ORDER BY・射影・LIMIT/OFFSET は
+        // 評価済みの本文結果に対する後処理（Describe と同じ
+        // `plan_outer` で束縛する）。
+        let plan =
+            crate::sql::view_buffered::plan_outer(&result.columns, validated, session.udfs())?;
+        let processed =
+            crate::sql::view_buffered::apply_outer(result, &plan, self.group_by_limits)?;
+        // Issue #1796・SQL-34: 外側の `LIMIT` 省略・`LIMIT ALL` は後処理後の
+        // 件数が結果行数上限を超えたら `54000`（連鎖の素通しは対象外）。
+        let processed = match &validated.outer {
+            crate::sql::allowlist::BufferedOuter::Rows(r) if r.limit_implicit => {
+                Self::enforce_result_cap(processed, limits.max_result_rows())?
+            }
+            // 外側の `GROUP BY` も同様（`limit: None` のときだけ HAVING・OFFSET
+            // 適用後の件数を呼び出し段の上限で検査する）。
+            crate::sql::allowlist::BufferedOuter::Aggregate(agg) => {
+                Self::enforce_group_result_cap(agg, processed, limits)?
+            }
+            _ => processed,
+        };
+        Ok(crate::sql::SqlOutcome::Query(processed))
     }
 
     /// 具体化経路が CTE 本文を記憶域に対して 1 回実行したことを数える（観測専用。

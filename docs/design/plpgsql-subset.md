@@ -644,8 +644,8 @@ SQL-68 ポインタ。D9 の内部 API と `DO` を実装した。公開 enum `S
   `42601`。`LANGUAGE` が無ければ従来の宣言的 UDF（本体は式）で、`AS $$...$$` も従来どおり定数式の本体。
   `LANGUAGE sql|plpgsql` は本体が文字列リテラル 1 個に限り、`RETURNS` と型付き引数が必須（欠落は
   `42P13`／`42601`）。保存する `body_source` は文字列を復号した本文。
-- 属性: 揮発性・`STRICT`・`PARALLEL`・`COST` を blob v1 のまま保存する。`ROWS` は集合返却が無いため常に非適用
-  として拒否し、`SECURITY DEFINER` は `0A000`（ロール・権限の確定まで）。宣言的 UDF の `STRICT` は束縛時に式へ
+- 属性: 揮発性・`STRICT`・`PARALLEL`・`COST` を blob v1 のまま保存する。`ROWS` は #2217 の時点では集合返却が無く
+  常に非適用として拒否した（#2220 で集合返却のときだけ受理）。`SECURITY DEFINER` は `0A000`（ロール・権限の確定まで）。宣言的 UDF の `STRICT` は束縛時に式へ
   展開する方式では意味を保てないため `0A000`。
 - 定義時検証: plpgsql は `core::function_define` が `parse_body`（構文 `42601`・範囲外 `0A000`・本体長
   `54000`）と `validate_embedded` を通す。AST は保存せず、呼び出し時に再解析する（D2）。`RETURNS trigger` は
@@ -716,7 +716,8 @@ SQL-67 の (2)(3)(5)(6)(7) のポインタ。仕様本文は転記しない。
   呼び出し時に `0A000`。
 - `IMMUTABLE` のルーチンを式索引・部分索引で使うのは `0A000` のまま（索引の維持を純粋な評価器で行えないため）。
 - `--max-plpgsql-statements` を `LANGUAGE sql` と共有しているため、フラグ名が PL/pgSQL 寄りになっている。
-- `RETURNS void`／`SETOF`・`FROM` 句は #2220、`RETURN`／`BEGIN ATOMIC` は #2219、横断の検証テストは #2221。
+- `RETURNS void` は未着手、`SETOF`・`FROM` 句は #2220 で対応（下記「Issue #2220 追記」）、`RETURN`／`BEGIN ATOMIC` は #2219、
+  横断の検証テストは #2221。
 - 裸の `NULL` を関数の引数に直接書く（`SELECT f(NULL)`）と、`FROM` の無い `SELECT` の既存規則により `42703` になる
   （`f(CAST(NULL AS int))` は可）。PostgreSQL との差で、定数式の `NULL` の扱いを広げる別の変更で解消する。
 - `numeric` の引数を本体で算術に使うと、型付きの値の置換形（`CAST` の値）が算術に使えない既存の制限により `0A000`
@@ -725,6 +726,41 @@ SQL-67 の (2)(3)(5)(6)(7) のポインタ。仕様本文は転記しない。
   （以前はトリガ起動ごとに新しい予算だった）。上限は下がる方向にだけ効くため緩和にはならない。
 - 複数文メッセージの分類（組み込みでない関数の呼び出しを `Write`）は構文語の許可リストによる保守的な検出で、
   取りこぼした構文語は `Write` 側（暗黙 Tx・書き込みの配置制約）へ倒れる。
+
+## Issue #2220 追記（集合返却の `LANGUAGE sql` 関数を `FROM` 句で使う。SQL-67 ポインタ）
+
+- 定義: `CREATE [OR REPLACE] FUNCTION ... LANGUAGE sql` が `RETURNS SETOF <スカラー型>` と
+  `RETURNS TABLE (<列名> <型>, ...)` を受理する。`ROWS n` は集合返却のときだけ受理し（それ以外は従来どおり
+  `22000`）、句の順序は自由なので適用可否は句ループの後で判定する。`TABLE` の列名は識別子で、列名どうし・
+  入力引数名との重複は `42P13`、列数は引数数の上限（`MAX_UDF_PARAMS`）以下（確保の前に検査し超過は `54000`）。
+  `OR REPLACE` で戻り値の形（スカラーと `SETOF`、`TABLE` の列名・型）を変えると `42P13`。
+- 呼び出し: セッション最上位の `SELECT` で、`FROM` が集合返却関数 1 件だけの形
+  `FROM f(<定数式>...) [[AS] 別名 [(列名, ...)]]`。`sql::function_scan::extract` が関数呼び出しを公開名（別名、
+  無ければ関数名）の 1 トークンへ置き換えて外側を既存の評価後射影形ビュー（`BufferedView`・本文は
+  `Statement::FunctionScan`・`BufferedOrigin::FunctionScan`）へ流す。WHERE・射影・`ORDER BY`・集計・`LIMIT` は
+  既存の外側処理（`finish_buffered_view`。読み取り経路と共有）が行う。派生表と同じく、セッション最上位以外の入口
+  （ビュー本文・CTE 本文・サブクエリ・cursor・COPY・CTAS・`EXPLAIN`）は従来どおり下流が `42601` にする。
+- 列名: `SETOF` は別名があれば別名、無ければ小文字化した関数名の 1 列。`TABLE` は宣言名。列名リスト
+  （`AS x(c, d)`）は既存の `plan_outer` の改名処理を使う。
+- 実行: autocommit は `calls_session_routine` が構造（本文が `FunctionScan`）で暗黙 Tx へ振り分け、明示 Tx は
+  `execute_in_active_txn` の専用の腕へ来る。本体は呼び出し元と同じ Tx・`PolicyContext`（RLS）・権限で実行し
+  （`run_set_routine_active`）、書き込み可否の規則（`IMMUTABLE`／`STABLE` は書き込み不可）はスカラー位置の起動と
+  共通（`enter_routine_call`）。最後の文だけを全行で実行し、列数・型が宣言と合わなければ `42P13`（代入変換は
+  スカラー関数と共有の `convert_result_cell`）。行ごとに `ExecBudget::add_set_row` を呼ぶため、行数は
+  `--max-result-rows`、累積バイト数は固定上限で、超過は黙って切り詰めず `54000`。呼び出し深さ（`54001`）と文数
+  （`54000`）は #2218 と同じ共有カウンタ。`STRICT` で引数に NULL があれば本体を実行せず空集合。
+- Describe: Execute と同じ `sql::function_scan::plan`（解決・個数・型検査）を通って宣言列だけを返し、本体も引数の
+  評価も行わない。他テナントの関数・不在・個数不一致はどれも同じ `42883`。
+- 永続化: 集合返却の定義だけが blob v2 で保存される（`udf-catalog.md` の「blob v2」）。`RoutineDefinition::ret` は
+  `RoutineReturn`（`Scalar`／`Trigger`／`Set`）の enum で、スカラー位置の起動（`routine_fold`・
+  `run_routine_active`）は `Set` を `0A000` で拒否する（最初の 1 行をスカラーとして返す誤動作を作らない）。
+- 対象外（固定文言の `0A000`、または下流の `42601`）: `RETURNS void`・`SETOF record`・`SETOF <表名>`、OUT／INOUT 引数、
+  PL/pgSQL の `SETOF`／`TABLE`（`RETURN NEXT`／`RETURN QUERY`）と宣言的 UDF の `SETOF`、スカラー関数・宣言的 UDF・
+  組み込み関数を `FROM` に置く形、`WITH ORDINALITY`・`ROWS FROM`・`LATERAL`、関数が先頭でない複数リレーション
+  （`FROM t, f(1)`・`JOIN f(1)` は従来どおり `42601`）、`f(1), t`・`f(1) JOIN t`（`0A000`）、スカラー位置
+  （投影・`WHERE`）で集合返却関数を呼ぶ形（target-list SRF）、引数の中のルーチン呼び出し、引数の列参照（`22000`）、
+  拡張クエリの `$n` を引数に置く形（Parse で `42601`）。
+- 既知の差: 列名リストが列数より多いと `42601`（PostgreSQL は `42P10`）。最後の文が `UNION` 等の `FROM` なし集合演算になる本体は埋め込み SQL の許可範囲外（`42601`）。
 
 ## Issue #2799 追記（定数式の畳み込みで numeric の算術を扱う。SQL-24・SQL-68 ポインタ）
 

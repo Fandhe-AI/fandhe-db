@@ -3022,6 +3022,7 @@ pub struct FunctionAttributeClauses {
     strict: Option<bool>,
     parallel: Option<FunctionParallelClause>,
     cost: Option<f64>,
+    rows: Option<f64>,
 }
 
 impl FunctionAttributeClauses {
@@ -3040,6 +3041,10 @@ impl FunctionAttributeClauses {
     /// 指定された `COST`（有限かつ正）。
     pub fn cost(&self) -> Option<f64> {
         self.cost
+    }
+    /// 指定された `ROWS`（有限かつ正。集合返却の関数だけに付けられる。Issue #2220）。
+    pub fn rows(&self) -> Option<f64> {
+        self.rows
     }
 }
 
@@ -3116,12 +3121,19 @@ pub enum Statement {
     /// `returns_trigger` を追加し、`body` を [`CreateFunctionBody`] へ置き換えた（`LANGUAGE sql|plpgsql` の
     /// 本体は式ではなく文字列リテラルのため）。`LANGUAGE` 句の無い従来形は `Declarative`・`Expression`。
     /// `LANGUAGE` 付きの `body_source` は文字列リテラルを復号した本文（引用符・ドル区切りを除いた内容）。
+    ///
+    /// **Issue #2220（SQL-67）で追加した破壊的変更（BREAKING CHANGE）**: `return_set` を追加した
+    /// （`RETURNS SETOF`／`RETURNS TABLE` の列。`LANGUAGE sql` の関数だけ）。`ROWS` は集合返却のときだけ
+    /// `attributes` に載る。
     CreateFunction {
         or_replace: bool,
         name: String,
         params: Vec<String>,
         param_types: Vec<Option<CastType>>,
         return_type: Option<CastType>,
+        /// `RETURNS SETOF <型>`（名前なし 1 列）／`RETURNS TABLE (...)`（名前つき列）の列（Issue #2220。
+        /// 集合返却のとき `return_type` は `None`。`LANGUAGE sql` だけに付く）。
+        return_set: Option<Vec<(Option<String>, CastType)>>,
         returns_trigger: bool,
         language: FunctionLanguageClause,
         attributes: FunctionAttributeClauses,
@@ -3204,6 +3216,22 @@ pub enum Statement {
     /// **本 variant の追加は破壊的変更（BREAKING CHANGE）**: 既存の網羅的 `match` はアームの
     /// 追加が必要（`MaterializedView` 追加時と同じ運用）。
     RecursiveCte(ValidatedRecursiveCte),
+    /// `FROM f(<引数>...)` の集合返却関数の呼び出し（Issue #2220・SQL-67 のポインタ）。
+    /// [`Statement::BufferedView`] の本文としてのみ現れ（外側の WHERE・射影・ORDER BY・集計・LIMIT は
+    /// 評価後射影形ビューと同じ処理）、単独の文としては生成されない。実行は `core::function_scan_exec`。
+    FunctionScan(ValidatedFunctionScan),
+}
+
+/// 検証済みの関数呼び出し FROM（[`Statement::FunctionScan`]。Issue #2220）。関数の解決・引数の型検査・
+/// 評価は呼び出し段がセッションのレジストリで行う（構文段はカタログ・テナントに触れない）。
+#[derive(Debug, Clone, PartialEq)]
+pub struct ValidatedFunctionScan {
+    /// 呼び出す関数名（綴りのまま。解決は小文字化で行う）。
+    pub(crate) name: String,
+    /// 実引数の式（書かれた順。定数式だけが後段の検査を通る）。
+    pub(crate) args: Vec<Expr>,
+    /// 利用者が書いた別名（`SETOF` の列名の決定に使う）。
+    pub(crate) alias: Option<String>,
 }
 
 /// 検証済みの再帰 CTE（[`Statement::RecursiveCte`]。SQL-35・Issue #1870）。フィールドは
@@ -3404,6 +3432,9 @@ pub(crate) enum BufferedOrigin {
     /// `MaterializedCte` と同じく呼び出し段の `ResultLimits` で実行する（グループ数が上限を
     /// 超えたら黙って切り詰めず `54000`）。出力列名の復元は `sql::view_buffered::plan_outer`。
     GroupedWindow,
+    /// FROM 句の集合返却関数の呼び出し（Issue #2220）。本文は呼び出し段の `ResultLimits`
+    /// （`--max-result-rows`）で実行する（行数の超過は黙って切り詰めず `54000`）。
+    FunctionScan,
 }
 
 /// 評価後射影形ビューへの外側クエリの形（Issue #1411）。どちらも本文の評価済みセルに
@@ -18763,6 +18794,10 @@ pub(crate) fn require_row_query_statement(
         Statement::RecursiveCte(_) => Err(SqlSurfaceError::feature_not_supported(format!(
             "{what} with WITH RECURSIVE is not supported"
         ))),
+        // Issue #2220: FROM の関数呼び出しもセッション最上位の入口だけが組み立てる（防御的に拒否する）。
+        Statement::FunctionScan(_) => Err(SqlSurfaceError::feature_not_supported(format!(
+            "{what} with a function in FROM is not supported"
+        ))),
         Statement::Explain(_)
         | Statement::SetSearchMode { .. }
         | Statement::SetTimeZone { .. }
@@ -23645,6 +23680,8 @@ fn parse_create_function(tokens: &[Token]) -> Result<ParsedCreateFunction, SqlSu
     // シグネチャの後ろの句は順不同のオプション列（PostgreSQL と同じ。SQL-67 (3)・Issue #2217）。
     // 句の種類ごとに高々 1 回なのでループは有界で、重複・矛盾は `42601`。
     let mut return_type: Option<CastType> = None;
+    let mut return_set: Option<Vec<(Option<String>, CastType)>> = None;
+    let mut rows_clause: Option<f64> = None;
     let mut returns_trigger = false;
     let mut returns_seen = false;
     let mut language: Option<FunctionLanguageClause> = None;
@@ -23674,6 +23711,13 @@ fn parse_create_function(tokens: &[Token]) -> Result<ParsedCreateFunction, SqlSu
                 if p.peek_ident_matches("TRIGGER") {
                     p.advance();
                     returns_trigger = true;
+                } else if p.peek_ident_matches("SETOF") {
+                    p.advance();
+                    let ty = p.parse_create_function_return_type()?;
+                    return_set = Some(vec![(None, ty)]);
+                } else if p.peek_ident_matches("TABLE") {
+                    p.advance();
+                    return_set = Some(p.parse_create_function_table_columns(&params)?);
                 } else {
                     return_type = Some(p.parse_create_function_return_type()?);
                 }
@@ -23781,13 +23825,14 @@ fn parse_create_function(tokens: &[Token]) -> Result<ParsedCreateFunction, SqlSu
                     return Err(conflict());
                 }
             }
-            // 集合返却は未対応のため `ROWS` は常に非適用（PostgreSQL の "ROWS is not applicable"）。
+            // `ROWS` は集合返却の関数だけに付けられる（PostgreSQL の "ROWS is not applicable"）。句の順序は
+            // 自由なため適用可否は句ループの後で判定する（Issue #2220）。
             "ROWS" => {
                 p.advance();
-                p.parse_create_function_positive_number("ROWS")?;
-                return Err(SqlSurfaceError::invalid_input(
-                    "ROWS is not applicable when function does not return a set",
-                ));
+                let v = p.parse_create_function_positive_number("ROWS")?;
+                if rows_clause.replace(v).is_some() {
+                    return Err(conflict());
+                }
             }
             "LEAKPROOF" | "NOT" | "SET" | "SUPPORT" | "TRANSFORM" | "WINDOW" => {
                 return Err(SqlSurfaceError::feature_not_supported(
@@ -23798,6 +23843,12 @@ fn parse_create_function(tokens: &[Token]) -> Result<ParsedCreateFunction, SqlSu
         }
     }
     p.expect_end_of_statement()?;
+    if rows_clause.is_some() && return_set.is_none() {
+        return Err(SqlSurfaceError::invalid_input(
+            "ROWS is not applicable when function does not return a set",
+        ));
+    }
+    attrs.rows = rows_clause;
     let language = language.unwrap_or(FunctionLanguageClause::Declarative);
     let invalid_def = |m: &'static str| SqlSurfaceError::invalid_function_definition(m);
     let (body_start, body_end, body_expr) = match as_range {
@@ -23816,7 +23867,7 @@ fn parse_create_function(tokens: &[Token]) -> Result<ParsedCreateFunction, SqlSu
                 "STRICT is not supported for functions without LANGUAGE",
             ));
         }
-        if returns_trigger {
+        if returns_trigger || return_set.is_some() {
             return Err(SqlSurfaceError::feature_not_supported(
                 "RETURNS SETOF, TABLE and pseudo-types are not supported",
             ));
@@ -23851,6 +23902,7 @@ fn parse_create_function(tokens: &[Token]) -> Result<ParsedCreateFunction, SqlSu
             params,
             param_types,
             return_type,
+            return_set: None,
             returns_trigger: false,
             language,
             attributes: attrs,
@@ -23865,6 +23917,12 @@ fn parse_create_function(tokens: &[Token]) -> Result<ParsedCreateFunction, SqlSu
     if !params.is_empty() && param_types.iter().any(Option::is_none) {
         return Err(SqlSurfaceError::unsupported(
             "function parameters must be typed for LANGUAGE sql and plpgsql",
+        ));
+    }
+    // 集合返却は `LANGUAGE sql` だけ（PL/pgSQL の `RETURN NEXT`／`RETURN QUERY` は後続。Issue #2220）。
+    if return_set.is_some() && language != FunctionLanguageClause::Sql {
+        return Err(SqlSurfaceError::feature_not_supported(
+            "set-returning functions are supported only for LANGUAGE sql",
         ));
     }
     if returns_trigger && (language != FunctionLanguageClause::Plpgsql || !params.is_empty()) {
@@ -23891,6 +23949,7 @@ fn parse_create_function(tokens: &[Token]) -> Result<ParsedCreateFunction, SqlSu
         params,
         param_types,
         return_type,
+        return_set,
         returns_trigger,
         language,
         attributes: attrs,
@@ -23918,6 +23977,7 @@ struct ParsedCreateFunction {
     params: Vec<String>,
     param_types: Vec<Option<CastType>>,
     return_type: Option<CastType>,
+    return_set: Option<Vec<(Option<String>, CastType)>>,
     returns_trigger: bool,
     language: FunctionLanguageClause,
     attributes: FunctionAttributeClauses,
@@ -23979,6 +24039,44 @@ impl Parser<'_> {
             }
         }
         normalize_udf_param_type(self.parse_cast_target_type()?, "return type")
+    }
+
+    /// `RETURNS TABLE (<列名> <型> [, ...])` の `TABLE` の直後（`(` から）を読む（Issue #2220）。列数は
+    /// [`MAX_UDF_PARAMS`] 以下（確保の前に検査し、超過は `54000`）。列名は識別子で、列名どうし・入力引数名と
+    /// 重複すると PostgreSQL と同じ `42P13`。型は戻り値型と同じ規則（擬似型は `0A000`）。
+    fn parse_create_function_table_columns(
+        &mut self,
+        params: &[String],
+    ) -> Result<Vec<(Option<String>, CastType)>, SqlSurfaceError> {
+        self.expect_punct('(')?;
+        let mut cols: Vec<(Option<String>, CastType)> = Vec::new();
+        loop {
+            if cols.len() >= MAX_UDF_PARAMS {
+                return Err(SqlSurfaceError::payload_too_large(
+                    "too many function result columns",
+                ));
+            }
+            let name = self.expect_ident()?;
+            let taken = cols
+                .iter()
+                .filter_map(|(n, _)| n.as_deref())
+                .chain(params.iter().map(String::as_str))
+                .any(|n| n.eq_ignore_ascii_case(&name));
+            if taken {
+                return Err(SqlSurfaceError::invalid_function_definition(
+                    "function result column name is used more than once",
+                ));
+            }
+            let ty = self.parse_create_function_return_type()?;
+            cols.push((Some(name), ty));
+            if matches!(self.peek(), Some(Token::Punct(','))) {
+                self.advance();
+            } else {
+                break;
+            }
+        }
+        self.expect_punct(')')?;
+        Ok(cols)
     }
 
     /// `CREATE FUNCTION` の引数 1 個（`<名前>` または `<名前> <型>`）を読む
@@ -26334,6 +26432,72 @@ fn recursive_cte_statement(
     }
 }
 
+/// FROM 句の関数呼び出し（Issue #2220）を、評価後射影形ビュー（本文は [`Statement::FunctionScan`]）として
+/// 組む。外側は再帰 CTE と同じく [`parse_with_main`] で解析し（公開名の 1 トークンだけを FROM に持つ形。
+/// カタログは引かない）、WHERE・射影・ORDER BY・集計・LIMIT を既存の評価後射影の外側へ任せる。
+/// 引数のトークン列は 1 個ずつ値の式として解析する（SQL 文字列へ再連結しない）。呼び出し元は
+/// `sql::function_scan` の抽出結果を受ける [`validate_sql_tokens_impl`] だけ。
+fn function_scan_statement(
+    parts: super::function_scan::FunctionScanParts,
+    limits: crate::nesting_limits::NestingLimits,
+) -> Result<Statement, SqlSurfaceError> {
+    let super::function_scan::FunctionScanParts {
+        name,
+        arg_tokens,
+        alias,
+        column_aliases,
+        outer_tokens,
+    } = parts;
+    let mut args: Vec<Expr> = Vec::with_capacity(arg_tokens.len());
+    for toks in &arg_tokens {
+        let mut p = Parser::new(toks);
+        // 引数の `NULL` は列参照ではなく定数（INSERT VALUES・列 DEFAULT と同じ定数式の解析）。
+        p.const_expr_null_args = true;
+        let e = p.parse_value_expr(0)?;
+        p.expect_end_of_statement()?;
+        // 引数全体が裸の `NULL`／`true`／`false` のときは列参照ではなくリテラル（引数の内側の関数呼び出しは
+        // 上の定数式の解析が扱う）。真偽値は束縛段が型を決められるよう `CAST('true' AS boolean)` へ脱糖する。
+        let e = match e {
+            Expr::Ident(n) if n.eq_ignore_ascii_case("null") => Expr::Null,
+            Expr::Ident(n) if n.eq_ignore_ascii_case("true") || n.eq_ignore_ascii_case("false") => {
+                Expr::Cast {
+                    expr: Box::new(Expr::String(n.to_ascii_lowercase())),
+                    ty: CastType::Bool,
+                }
+            }
+            other => other,
+        };
+        args.push(e);
+    }
+    let (main, main_table_name) = parse_with_main(&outer_tokens, limits)?;
+    let body = Box::new(Statement::FunctionScan(ValidatedFunctionScan {
+        name,
+        args,
+        alias,
+    }));
+    let view_name = main_table_name;
+    let stmt = match main {
+        MainShape::Scan(shape) => buffered_scan_statement(view_name, body, shape)?,
+        MainShape::Aggregate(shape) => aggregate_statement_from_resolved(
+            shape.table_name,
+            super::view::Resolved::Buffered { view_name, body },
+            shape.items,
+            shape.where_predicates,
+            shape.group_by,
+        )?,
+    };
+    match stmt {
+        Statement::BufferedView(mut v) => {
+            v.origin = BufferedOrigin::FunctionScan;
+            v.column_aliases = column_aliases;
+            Ok(Statement::BufferedView(v))
+        }
+        _ => Err(SqlSurfaceError::Internal {
+            detail: "function scan outer query was not a buffered view".to_string(),
+        }),
+    }
+}
+
 /// [`validate_sql_tokens`]／[`validate_sql_tokens_with_subquery_ctx`] が共有する
 /// 本体。`subquery_ctx` が `None` の呼び出し（cursor・view・copy・params・
 /// aggregate 等の既存の内部呼び出しがすべてここへ委譲する）は本 Issue 追加前と
@@ -26384,6 +26548,10 @@ fn validate_sql_tokens_impl(
     if cte_evaluation == CteEvaluation::AllowMaterialize {
         if let Some(stmt) = super::derived_table::gate(tokens, lookup, limits)? {
             return Ok(stmt);
+        }
+        // Issue #2220: FROM が集合返却関数の呼び出し 1 件の `SELECT`（`sql::function_scan`）。
+        if let Some(parts) = super::function_scan::extract(tokens)? {
+            return function_scan_statement(parts, limits);
         }
     }
     if looks_like_join(tokens) {
@@ -26458,6 +26626,7 @@ fn validate_sql_tokens_impl(
                 params: parsed.params,
                 param_types: parsed.param_types,
                 return_type: parsed.return_type,
+                return_set: parsed.return_set,
                 returns_trigger: parsed.returns_trigger,
                 language: parsed.language,
                 attributes: parsed.attributes,
@@ -26540,7 +26709,9 @@ fn validate_sql_tokens_impl(
                 // TABLE-42・Issue #1664: matview の葉は `BufferedView` の本文としてのみ現れる。
                 | Statement::MaterializedView(_)
                 // SQL-35・Issue #1870: 再帰 CTE は `WITH` 分岐だけが組み立てる。
-                | Statement::RecursiveCte(_) => {
+                | Statement::RecursiveCte(_)
+                // Issue #2220: FROM の関数呼び出しは `BufferedView` の本文としてのみ現れる。
+                | Statement::FunctionScan(_) => {
                     return Err(SqlSurfaceError::Internal {
                         detail: "validate_select_statement returned a non-SELECT statement"
                             .to_string(),
@@ -26893,6 +27064,10 @@ pub fn validate_statement(
         // SQL-35・Issue #1870: 再帰 CTE は単独の文としては現れない（防御的経路）。
         Statement::RecursiveCte(_) => Err(SqlSurfaceError::unsupported(
             "recursive CTE is not a search query statement (use a session-aware entry point)",
+        )),
+        // Issue #2220: FROM の関数呼び出しは単独の文としては現れない（防御的経路）。
+        Statement::FunctionScan(_) => Err(SqlSurfaceError::unsupported(
+            "function scan is not a search query statement (use a session-aware entry point)",
         )),
     }
 }

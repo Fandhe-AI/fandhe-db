@@ -26,6 +26,7 @@ fn func(key: &str) -> FunctionDef {
         function_key: key.to_string(),
         params: Vec::<FunctionParam>::new(),
         return_type: Some(FunctionType::from_column_type(&ColumnType::Integer).expect("ty")),
+        return_shape: crate::catalog::function::ReturnShape::Scalar,
         language: FunctionLanguage::Sql,
         body_source: "SELECT 1".to_string(),
         attrs: FunctionAttributes::default(),
@@ -433,6 +434,7 @@ fn lazy_table_creation_leaves_existing_layout_untouched() {
 fn trigger_func(key: &str) -> FunctionDef {
     FunctionDef {
         return_type: Some(FunctionType::trigger()),
+        return_shape: crate::catalog::function::ReturnShape::Scalar,
         language: FunctionLanguage::Plpgsql,
         body_source: "BEGIN RETURN NEW; END".to_string(),
         ..func(key)
