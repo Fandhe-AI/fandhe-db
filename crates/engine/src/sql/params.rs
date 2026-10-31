@@ -2150,6 +2150,19 @@ fn substitute_with<E>(
                             produced.push(Token::Punct(')'));
                         }
                     }
+                    // 直前が単項の `+`（`+$n`）なら `+` を落とし、負値をそのまま評価させる（符号なしと等価。
+                    // 残すと `+ - $typed:..` となり定数式の解析が `42601` にする）。
+                    let plus = i.checked_sub(1);
+                    if plus.is_some_and(|m| matches!(tokens.get(m), Some(Token::Punct('+'))))
+                        && matches!(out.last(), Some(Token::Punct('+')))
+                    {
+                        let before = plus
+                            .and_then(|m| m.checked_sub(1))
+                            .and_then(|p| tokens.get(p));
+                        if !crate::plpgsql::subst::ends_operand(before) {
+                            out.pop();
+                        }
+                    }
                     out.extend(produced);
                     continue;
                 }

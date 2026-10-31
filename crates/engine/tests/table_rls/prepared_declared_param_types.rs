@@ -501,6 +501,8 @@ fn negative_values_in_typed_expressions() {
     exec_typed(&core, &ctx, &mut s, binary, &[Some(D::Int8)], &["-5"]).expect("binary minus");
     let plus = "INSERT INTO tv (id, b) VALUES (4, +$1) USING OPERATION_ID 'op-4'";
     exec_typed(&core, &ctx, &mut s, plus, &[Some(D::Int8)], &["7"]).expect("unary plus");
+    let plus_neg = "INSERT INTO tv (id, b) VALUES (5, +$1) USING OPERATION_ID 'op-5'";
+    exec_typed(&core, &ctx, &mut s, plus_neg, &[Some(D::Int8)], &["-9"]).expect("unary plus neg");
     let plain = "INSERT INTO tv (id, b) VALUES (3, $1 + 0) USING OPERATION_ID 'op-3'";
     exec_typed(&core, &ctx, &mut s, plain, &[Some(D::Int8)], &["-5"]).expect("negative");
     let out = cell_text(
@@ -510,7 +512,11 @@ fn negative_values_in_typed_expressions() {
         "SELECT id, b FROM tv ORDER BY id LIMIT 10",
     );
     assert!(
-        out.contains('5') && out.contains('6') && out.contains('7') && out.contains("-5"),
+        out.contains('5')
+            && out.contains('6')
+            && out.contains('7')
+            && out.contains("-5")
+            && out.contains("-9"),
         "{out}"
     );
 }
