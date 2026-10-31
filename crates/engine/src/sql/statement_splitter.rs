@@ -418,6 +418,7 @@ pub fn classify_statement(stmt: &str) -> StatementEffect {
 ///   - `EXTRACT`・`OVERLAY`: 引数内に `FROM`・`PLACING` の構文形があるときだけ構文
 ///   - 窓関数名: 対応する `)` の直後が `OVER` のときだけ構文
 ///   - `VALUES`・`DISTINCT`・`ROW`・`UNNEST`: 式の先頭の呼び出しと区別できないため常に呼び出し扱い
+///   - `FROM`・`BY`: `Ident` で届くのは引用識別子のみ（構文の `FROM`・`BY` は `Keyword`）なので常に呼び出し扱い
 ///   - 上記以外（`JSON_EXISTS` 等の専用構文）は従来どおり構文語
 fn syntax_form_confirmed(
     tokens: &[Token],
@@ -467,7 +468,9 @@ fn syntax_form_confirmed(
         }
         None
     };
-    if is("VALUES") || is("DISTINCT") || is("ROW") || is("UNNEST") {
+    // `FROM`・`BY` は引用符なしならトークナイザが `Keyword` にするため、`Ident` で届くのは引用識別子
+    // （`"from"(...)`）だけで、構文ではなく関数呼び出しになる。常に呼び出し扱い（`Write`）とする。
+    if is("VALUES") || is("DISTINCT") || is("ROW") || is("UNNEST") || is("FROM") || is("BY") {
         return false;
     }
     if is("NOT") {
@@ -1380,6 +1383,7 @@ mod tests {
             "SELECT DISTINCT join()",
             "SELECT a FROM t WHERE a > 0 AND left_()",
             "SELECT on()",
+            "SELECT \"on\"()",
             "SELECT in(1), or(1), is(1), like(1), ilike(1), between(1)",
             "SELECT a FROM t WHERE a = on(1)",
             "SELECT not(1), exists(1), values(1), when(1), then(1), else(1)",
@@ -1389,6 +1393,15 @@ mod tests {
             "SELECT a FROM t WHERE a = 1 AND in(1)",
         ] {
             assert_eq!(classify_statement(sql), StatementEffect::Write, "{sql}");
+        }
+    }
+
+    /// 引用識別子の構文語名（`"from"`・`"by"`）は ReadOnly にならない。現状は lexer が
+    /// `Rejected` へ落とすが、将来受理されても呼び出し（`Write`）側に倒れる契約を固定する。
+    #[test]
+    fn quoted_syntax_word_calls_are_never_read_only() {
+        for sql in ["SELECT \"from\"()", "SELECT \"by\"()", "SELECT \"on\"()"] {
+            assert_ne!(classify_statement(sql), StatementEffect::ReadOnly, "{sql}");
         }
     }
 
