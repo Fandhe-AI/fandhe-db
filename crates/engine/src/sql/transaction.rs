@@ -48,7 +48,17 @@ pub enum TxnControl {
     Rollback,
 }
 
-/// `BEGIN ISOLATION LEVEL ...` でクライアントが要求した分離レベル（SQL-38 (1) ポインタ）。
+/// トランザクションのアクセスモード（SQL-38・Issue #1932）。`BEGIN READ ONLY`／
+/// `BEGIN READ WRITE` の修飾子を表し、[`ActiveTxn`] が保持する。読み取り専用の実体
+/// （読み取り Tx で開く・書き込みの `25006`）は #1933／#1934 の範囲で、それまで
+/// `ReadOnly` は [`SessionTransaction::begin_with_mode`] が `0A000` で拒否する。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum TxnAccessMode {
+    ReadWrite,
+    ReadOnly,
+}
+
+/// `BEGIN ISOLATION LEVEL ...` でクライアントが要求した分離レベル（SQL-38 (1) ポインタ・Issue #1938）。
 /// 要求を記録するだけで実行時の保証は変えない（実行は単一ライタの直列化のまま。
 /// `crate::txn::IsolationLevel` 参照）。後続の `SET TRANSACTION` 系・表示系が読む口として
 /// [`SessionTransaction::isolation_level`] から取り出せる。
@@ -60,16 +70,29 @@ pub enum RequestedIsolationLevel {
     Serializable,
 }
 
-/// 検証済みの制御文。`core.rs::parse_tokens` が `ParsedSql::Transaction` へ載せ、
-/// 実行側（`core.rs`）と wire-server の拡張クエリ層が `control` で分岐する。
-/// `isolation_level` は `BEGIN` で明示されたときだけ `Some`（未指定は `None`）。
+/// [`validate_transaction_control_tokens`] の検証結果。`access_mode` は `BEGIN` で
+/// 明示されたときだけ `Some`（`COMMIT`／`ROLLBACK` は常に `None`）。`None` を残すのは
+/// 将来のセッション既定値（#1939）を適用する余地のため。`core.rs` の
+/// `ParsedSql::Transaction` が保持し、実行時に `begin_with_mode` へ渡される。
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct ValidatedTxnControl {
     pub control: TxnControl,
+    pub access_mode: Option<TxnAccessMode>,
+    /// `BEGIN ISOLATION LEVEL` で明示されたときだけ `Some`（Issue #1938）。
     pub isolation_level: Option<RequestedIsolationLevel>,
 }
 
-/// `ISOLATION LEVEL <レベル>` 項目を 1 つ消費する。先頭トークンが `ISOLATION` である前提。
+fn unsupported_txn_mode() -> SqlSurfaceError {
+    SqlSurfaceError::unsupported("unsupported transaction mode")
+}
+
+/// `BEGIN` のモード句 1 項目。アクセスモードか分離レベルのどちらか。
+enum TxnModeItem {
+    Access(TxnAccessMode),
+    Isolation(RequestedIsolationLevel),
+}
+
+/// `ISOLATION LEVEL <レベル>` 項目を 1 つ消費する（先頭が `ISOLATION` の前提）。
 /// 不完全・未知のレベルは `42601`（fail-closed。入力語はメッセージへ含めない）。
 fn parse_isolation_level_item(
     rest: &[Token],
@@ -80,14 +103,13 @@ fn parse_isolation_level_item(
             _ => None,
         }
     }
-    let bad = || SqlSurfaceError::unsupported("unsupported transaction mode");
-    let rest = word(rest, "ISOLATION").ok_or_else(bad)?;
-    let rest = word(rest, "LEVEL").ok_or_else(bad)?;
+    let rest = word(rest, "ISOLATION").ok_or_else(unsupported_txn_mode)?;
+    let rest = word(rest, "LEVEL").ok_or_else(unsupported_txn_mode)?;
     if let Some(t) = word(rest, "SERIALIZABLE") {
         return Ok((RequestedIsolationLevel::Serializable, t));
     }
     if let Some(t) = word(rest, "REPEATABLE") {
-        let t = word(t, "READ").ok_or_else(bad)?;
+        let t = word(t, "READ").ok_or_else(unsupported_txn_mode)?;
         return Ok((RequestedIsolationLevel::RepeatableRead, t));
     }
     if let Some(t) = word(rest, "READ") {
@@ -98,15 +120,37 @@ fn parse_isolation_level_item(
             return Ok((RequestedIsolationLevel::ReadUncommitted, t));
         }
     }
-    Err(bad())
+    Err(unsupported_txn_mode())
 }
 
-/// `BEGIN`/`COMMIT`/`ROLLBACK` の規範形を受理する。`[WORK|TRANSACTION]` 修飾語に加え、
-/// `BEGIN` だけは `ISOLATION LEVEL <4 レベル>` を受理して
-/// [`ValidatedTxnControl::isolation_level`] へ記録する（SQL-38 (1) ポインタ。実行は不変）。
-/// 重複指定・`READ ONLY`・`DEFERRABLE`・`COMMIT`／`ROLLBACK` への分離レベル・
-/// `AND CHAIN`・`$n` 等は `42601`。先頭トークンが `BEGIN`/`COMMIT`/`ROLLBACK`（大小無視）
-/// であることは呼び出し元（`core.rs::parse_tokens`）が確認済みの前提。
+/// `BEGIN` のモード句 1 項目（`READ ONLY`／`READ WRITE`／`ISOLATION LEVEL ...`）を読み、
+/// 残りのトークンを返す。未知の語・単独の `READ` は `42601`（fail-closed）。
+fn parse_txn_mode_item(rest: &[Token]) -> Result<(TxnModeItem, &[Token]), SqlSurfaceError> {
+    if matches!(rest.first(), Some(Token::Ident(x)) if x.eq_ignore_ascii_case("ISOLATION")) {
+        let (level, tail) = parse_isolation_level_item(rest)?;
+        return Ok((TxnModeItem::Isolation(level), tail));
+    }
+    let word = |t: Option<&Token>, w: &str| matches!(t, Some(Token::Ident(x)) if x.eq_ignore_ascii_case(w));
+    if !word(rest.first(), "READ") {
+        return Err(unsupported_txn_mode());
+    }
+    let after_read = rest.split_first().map_or(&[][..], |(_, t)| t);
+    let mode = if word(after_read.first(), "ONLY") {
+        TxnAccessMode::ReadOnly
+    } else if word(after_read.first(), "WRITE") {
+        TxnAccessMode::ReadWrite
+    } else {
+        return Err(unsupported_txn_mode());
+    };
+    let tail = after_read.split_first().map_or(&[][..], |(_, t)| t);
+    Ok((TxnModeItem::Access(mode), tail))
+}
+
+/// `BEGIN`/`COMMIT`/`ROLLBACK` の規範形（`[WORK|TRANSACTION]` 修飾語と、`BEGIN` に限り
+/// アクセスモード `READ ONLY`／`READ WRITE` を受理。分離レベル指定・`DEFERRABLE`・
+/// `AND CHAIN`・`$n`・重複／矛盾するモード等は `42601`）を受理する。
+/// 先頭トークンが `BEGIN`/`COMMIT`/`ROLLBACK`（大小無視）であることは
+/// 呼び出し元（`core.rs::parse_tokens`）が確認済みの前提。
 pub(crate) fn validate_transaction_control_tokens(
     tokens: &[Token],
 ) -> Result<ValidatedTxnControl, SqlSurfaceError> {
@@ -137,9 +181,11 @@ pub(crate) fn validate_transaction_control_tokens(
         }
         _ => rest,
     };
+    let mut access_mode = None;
     let mut isolation_level = None;
     if ctrl == TxnControl::Begin {
-        // 各反復は 1 トークン以上消費するか `Err` で抜けるのでトークン数で有界。
+        // モード句ループ。2 項目目以降は任意の `,` で区切れる構造にしてある（#1938 向け）が、
+        // 現状は項目がアクセスモード 1 つのため、重複・矛盾は `42601`。トークン数で有界。
         let mut first = true;
         while !rest.is_empty() {
             if !first {
@@ -148,20 +194,15 @@ pub(crate) fn validate_transaction_control_tokens(
                 }
             }
             first = false;
-            match rest.split_first() {
-                Some((Token::Ident(kw), _)) if kw.eq_ignore_ascii_case("ISOLATION") => {
-                    let (level, tail) = parse_isolation_level_item(rest)?;
-                    if isolation_level.replace(level).is_some() {
-                        return Err(SqlSurfaceError::unsupported("unsupported transaction mode"));
-                    }
-                    rest = tail;
-                }
-                _ => {
-                    return Err(SqlSurfaceError::unsupported(
-                        "unsupported clause after transaction control statement",
-                    ));
-                }
+            let (item, tail) = parse_txn_mode_item(rest)?;
+            let duplicated = match item {
+                TxnModeItem::Access(m) => access_mode.replace(m).is_some(),
+                TxnModeItem::Isolation(l) => isolation_level.replace(l).is_some(),
+            };
+            if duplicated {
+                return Err(unsupported_txn_mode());
             }
+            rest = tail;
         }
     }
     if !rest.is_empty() {
@@ -171,6 +212,7 @@ pub(crate) fn validate_transaction_control_tokens(
     }
     Ok(ValidatedTxnControl {
         control: ctrl,
+        access_mode,
         isolation_level,
     })
 }
@@ -216,7 +258,10 @@ enum TxnOrigin {
 /// permit を内包し、drop 時は abort してから permit を解放する。
 struct ActiveTxn<'e> {
     origin: TxnOrigin,
-    /// `BEGIN ISOLATION LEVEL` で明示された要求レベル（記録のみ。暗黙・未指定は `None`）。
+    /// アクセスモード（SQL-38・Issue #1932）。#1933／#1934 が読み取り Tx の開始と
+    /// 書き込み拒否の判定に使う。現状 `ReadOnly` は開始前に拒否されるため常に `ReadWrite`。
+    access_mode: TxnAccessMode,
+    /// `BEGIN ISOLATION LEVEL` で明示された要求レベル（記録のみ。暗黙・未指定は `None`。Issue #1938）。
     isolation_level: Option<RequestedIsolationLevel>,
     write_txn: crate::storage::GatedWriteTxn,
     /// 一時表（TABLE-44・Issue #1684）の書き込みトランザクション。最初の一時表の文で遅延して開く。
@@ -451,6 +496,15 @@ impl<'e> SessionTransaction<'e> {
         self.is_active().then_some(self.generation)
     }
 
+    /// 開始中のトランザクションのアクセスモード（SQL-38・Issue #1932）。`Active` のときだけ
+    /// `Some`。#1934 が書き込み文の `25006` 判定に使う。
+    pub fn access_mode(&self) -> Option<TxnAccessMode> {
+        match &self.state {
+            TxnState::Active(active) => Some(active.access_mode),
+            _ => None,
+        }
+    }
+
     /// `BEGIN`。`Idle` から `Active` へ遷移する。`storage` から
     /// [`crate::storage::Storage::begin_explicit_write_txn`] で単一ライタの
     /// permit を取得したまま保持する（`writer_gate` モジュールドキュメント
@@ -460,37 +514,52 @@ impl<'e> SessionTransaction<'e> {
         storage: &'e crate::storage::Storage,
         session: &SessionState,
     ) -> Result<(), SqlSurfaceError> {
+        self.begin_with_mode(storage, session, TxnAccessMode::ReadWrite)
+    }
+
+    /// `Active` なトランザクションが `BEGIN` で明示された分離レベル（Issue #1938）。
+    /// 未指定・暗黙・`Active` 以外は `None`。
+    pub fn isolation_level(&self) -> Option<RequestedIsolationLevel> {
+        match &self.state {
+            TxnState::Active(a) => a.isolation_level,
+            _ => None,
+        }
+    }
+
+    /// アクセスモード付きの `BEGIN`（SQL-38・Issue #1932。`core.rs` の実行分岐が呼ぶ）。
+    /// `ReadOnly` は #1933／#1934 まで `Idle` 分岐の先頭で `0A000` 拒否する暫定ゲート
+    /// （書き込み可能な Tx を読み取り専用として渡さない fail-closed）。
+    pub fn begin_with_mode(
+        &mut self,
+        storage: &'e crate::storage::Storage,
+        session: &SessionState,
+        access_mode: TxnAccessMode,
+    ) -> Result<(), SqlSurfaceError> {
+        self.begin_with_modes(storage, session, access_mode, None)
+    }
+
+    /// アクセスモードと要求分離レベル付きの `BEGIN`（Issue #1938。`core.rs` の実行分岐が呼ぶ）。
+    /// レベルは記録のみで実行は [`Self::begin_with_mode`] と同一。
+    pub fn begin_with_modes(
+        &mut self,
+        storage: &'e crate::storage::Storage,
+        session: &SessionState,
+        access_mode: TxnAccessMode,
+        isolation_level: Option<RequestedIsolationLevel>,
+    ) -> Result<(), SqlSurfaceError> {
         // 暗黙トランザクションはメッセージ内で完結する。明示 `BEGIN` が届くのは
         // 呼び出し側の不変条件違反（制御文を含むメッセージは暗黙にならない）なので、
         // 暗黙の `Active` は abort して `Idle` へ戻し、内部エラーで拒否する。
         if self.abort_if_implicit() {
             return Err(internal_error());
         }
-        self.begin_with_origin(storage, session, TxnOrigin::Explicit, None)
-    }
-
-    /// 要求された分離レベルを記録して `BEGIN` する（`core.rs` の `TxnControl::Begin` 分岐が
-    /// 呼ぶ）。実行は [`Self::begin`] と同一（単一ライタ。レベルは
-    /// [`Self::isolation_level`] で読めるだけ）。
-    pub fn begin_with_isolation(
-        &mut self,
-        storage: &'e crate::storage::Storage,
-        session: &SessionState,
-        isolation_level: Option<RequestedIsolationLevel>,
-    ) -> Result<(), SqlSurfaceError> {
-        if self.abort_if_implicit() {
-            return Err(internal_error());
-        }
-        self.begin_with_origin(storage, session, TxnOrigin::Explicit, isolation_level)
-    }
-
-    /// `Active` なトランザクションが `BEGIN` で明示された分離レベル。未指定・暗黙・
-    /// `Active` 以外は `None`。
-    pub fn isolation_level(&self) -> Option<RequestedIsolationLevel> {
-        match &self.state {
-            TxnState::Active(a) => a.isolation_level,
-            _ => None,
-        }
+        self.begin_with_origin(
+            storage,
+            session,
+            TxnOrigin::Explicit,
+            access_mode,
+            isolation_level,
+        )
     }
 
     /// 暗黙トランザクション（Issue #1175）を開始する。`BEGIN` を含まない複数文
@@ -510,7 +579,13 @@ impl<'e> SessionTransaction<'e> {
         if !matches!(self.state, TxnState::Idle) {
             return Err(internal_error());
         }
-        self.begin_with_origin(storage, session, TxnOrigin::Implicit, None)
+        self.begin_with_origin(
+            storage,
+            session,
+            TxnOrigin::Implicit,
+            TxnAccessMode::ReadWrite,
+            None,
+        )
     }
 
     /// 暗黙トランザクションの commit（Issue #1175）。最後の文の実行に成功した
@@ -589,10 +664,18 @@ impl<'e> SessionTransaction<'e> {
         storage: &'e crate::storage::Storage,
         session: &SessionState,
         origin: TxnOrigin,
+        access_mode: TxnAccessMode,
         isolation_level: Option<RequestedIsolationLevel>,
     ) -> Result<(), SqlSurfaceError> {
         match &self.state {
             TxnState::Idle => {
+                // 暫定ゲート（#1933／#1934 で除去）: 読み取り専用を宣言した接続へ書き込み可能な
+                // Tx を渡さないよう、write_txn を取る前に拒否する（状態は `Idle` のまま）。
+                if access_mode == TxnAccessMode::ReadOnly {
+                    return Err(SqlSurfaceError::feature_not_supported(
+                        "BEGIN READ ONLY is not supported yet",
+                    ));
+                }
                 // 壁時計の読み取り失敗（範囲外）は write_txn を開く前に fail-closed で返す
                 // （状態は `Idle` のまま）。
                 let txn_start_micros = crate::sql::time_fn::now_micros()?;
@@ -619,6 +702,7 @@ impl<'e> SessionTransaction<'e> {
                 self.generation = next_generation;
                 self.state = TxnState::Active(Box::new(ActiveTxn {
                     origin,
+                    access_mode,
                     isolation_level,
                     write_txn,
                     temp: None,
@@ -1160,57 +1244,71 @@ mod tests {
         crate::sql::lexer::tokenize(sql).expect("tokenize")
     }
 
+    fn validated(sql: &str) -> Result<ValidatedTxnControl, SqlSurfaceError> {
+        validate_transaction_control_tokens(&tokens_of(sql))
+    }
+
     #[test]
-    fn begin_variants_are_accepted() {
+    fn begin_variants_are_accepted_without_access_mode() {
         for sql in ["BEGIN", "BEGIN WORK", "BEGIN TRANSACTION", "begin"] {
-            let ctrl = validate_transaction_control_tokens(&tokens_of(sql)).expect("accepted");
-            assert_eq!(ctrl.control, TxnControl::Begin);
-            assert_eq!(ctrl.isolation_level, None);
+            let v = validated(sql).expect("accepted");
+            assert_eq!(v.control, TxnControl::Begin);
+            assert_eq!(v.access_mode, None);
+        }
+    }
+
+    #[test]
+    fn begin_access_mode_is_accepted() {
+        for (sql, mode) in [
+            ("BEGIN READ ONLY", TxnAccessMode::ReadOnly),
+            ("BEGIN READ WRITE", TxnAccessMode::ReadWrite),
+            ("BEGIN WORK READ ONLY", TxnAccessMode::ReadOnly),
+            ("BEGIN TRANSACTION READ WRITE", TxnAccessMode::ReadWrite),
+            ("begin read only", TxnAccessMode::ReadOnly),
+        ] {
+            let v = validated(sql).expect("accepted");
+            assert_eq!(v.control, TxnControl::Begin, "{sql}");
+            assert_eq!(v.access_mode, Some(mode), "{sql}");
         }
     }
 
     #[test]
     fn commit_and_rollback_variants_are_accepted() {
-        assert_eq!(
-            validate_transaction_control_tokens(&tokens_of("COMMIT"))
-                .unwrap()
-                .control,
-            TxnControl::Commit
-        );
-        assert_eq!(
-            validate_transaction_control_tokens(&tokens_of("COMMIT WORK"))
-                .unwrap()
-                .control,
-            TxnControl::Commit
-        );
-        assert_eq!(
-            validate_transaction_control_tokens(&tokens_of("ROLLBACK"))
-                .unwrap()
-                .control,
-            TxnControl::Rollback
-        );
-        assert_eq!(
-            validate_transaction_control_tokens(&tokens_of("ROLLBACK TRANSACTION"))
-                .unwrap()
-                .control,
-            TxnControl::Rollback
-        );
+        for (sql, ctrl) in [
+            ("COMMIT", TxnControl::Commit),
+            ("COMMIT WORK", TxnControl::Commit),
+            ("ROLLBACK", TxnControl::Rollback),
+            ("ROLLBACK TRANSACTION", TxnControl::Rollback),
+        ] {
+            let v = validated(sql).unwrap();
+            assert_eq!(v.control, ctrl);
+            assert_eq!(v.access_mode, None);
+        }
     }
 
     #[test]
     fn trailing_clauses_are_rejected() {
         for sql in [
-            "BEGIN READ ONLY",
+            "BEGIN READ",
+            "BEGIN ONLY",
+            "BEGIN WRITE",
+            "BEGIN READ ONLY READ WRITE",
+            "BEGIN READ ONLY, READ ONLY",
+            "BEGIN READ ONLY,",
+            "BEGIN , READ ONLY",
+            "BEGIN READ ONLY DEFERRABLE",
+            "COMMIT READ ONLY",
+            "ROLLBACK READ WRITE",
             "COMMIT AND CHAIN",
             "ROLLBACK TO SAVEPOINT x",
         ] {
-            let err = validate_transaction_control_tokens(&tokens_of(sql)).unwrap_err();
-            assert_eq!(err.wire_code(), "42601");
+            let err = validated(sql).unwrap_err();
+            assert_eq!(err.wire_code(), "42601", "{sql}");
         }
     }
 
     /// SQL-38 (1)・Issue #1938: 4 レベルすべてを `BEGIN`／`BEGIN WORK`／`BEGIN TRANSACTION` で
-    /// 受理し、要求レベルを記録する（大小無視）。
+    /// 受理し、要求レベルを記録する（大小無視）。アクセスモードとの併記も受理する。
     #[test]
     fn begin_isolation_levels_are_accepted() {
         let levels = [
@@ -1222,10 +1320,24 @@ mod tests {
         for head in ["BEGIN", "BEGIN WORK", "BEGIN TRANSACTION", "begin"] {
             for (text, expected) in levels {
                 let sql = format!("{head} ISOLATION LEVEL {text}");
-                let v = validate_transaction_control_tokens(&tokens_of(&sql)).expect(&sql);
+                let v = validated(&sql).expect(&sql);
                 assert_eq!(v.control, TxnControl::Begin, "{sql}");
                 assert_eq!(v.isolation_level, Some(expected), "{sql}");
+                assert_eq!(v.access_mode, None, "{sql}");
             }
+        }
+        for sql in [
+            "BEGIN ISOLATION LEVEL SERIALIZABLE READ ONLY",
+            "BEGIN READ ONLY, ISOLATION LEVEL SERIALIZABLE",
+            "BEGIN READ ONLY ISOLATION LEVEL SERIALIZABLE",
+        ] {
+            let v = validated(sql).expect(sql);
+            assert_eq!(
+                v.isolation_level,
+                Some(RequestedIsolationLevel::Serializable),
+                "{sql}"
+            );
+            assert_eq!(v.access_mode, Some(TxnAccessMode::ReadOnly), "{sql}");
         }
     }
 
@@ -1247,11 +1359,10 @@ mod tests {
             "BEGIN ISOLATION LEVEL SERIALIZABLE,",
             "BEGIN ISOLATION LEVEL SERIALIZABLE DEFERRABLE",
             "BEGIN ISOLATION LEVEL SERIALIZABLE NOT DEFERRABLE",
-            "BEGIN ISOLATION LEVEL SERIALIZABLE READ ONLY",
             "COMMIT ISOLATION LEVEL SERIALIZABLE",
             "ROLLBACK ISOLATION LEVEL READ COMMITTED",
         ] {
-            let err = validate_transaction_control_tokens(&tokens_of(sql)).unwrap_err();
+            let err = validated(sql).unwrap_err();
             assert_eq!(err.wire_code(), "42601", "{sql}");
         }
     }

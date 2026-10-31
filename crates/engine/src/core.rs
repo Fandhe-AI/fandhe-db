@@ -1737,6 +1737,7 @@ pub enum ParsedSql {
     /// 持たない [`EngineCore::execute_parsed_in_session`] はこの variant を
     /// `0A000` で拒否する（トランザクション対応の実行入口は
     /// [`EngineCore::execute_sql_in_txn`]／[`EngineCore::execute_parsed_in_txn`]）。
+    /// `BEGIN` のアクセスモード修飾子を含む検証結果（Issue #1932。破壊的変更: 中身を `TxnControl` から変更）。
     Transaction(crate::sql::transaction::ValidatedTxnControl),
     /// `DROP TABLE [IF EXISTS] <table> [, <table>]*`（SQL-23・TASK-203、Issue #902。複数指定は
     /// TABLE-37 (1)・Issue #1639）。DDL 実行権限ゲート
@@ -7564,7 +7565,13 @@ impl EngineCore {
         if let ParsedSql::Transaction(ctrl) = parsed {
             return match ctrl.control {
                 TxnControl::Begin => {
-                    txn.begin_with_isolation(&self.storage, session, ctrl.isolation_level)?;
+                    txn.begin_with_modes(
+                        &self.storage,
+                        session,
+                        ctrl.access_mode
+                            .unwrap_or(crate::sql::transaction::TxnAccessMode::ReadWrite),
+                        ctrl.isolation_level,
+                    )?;
                     Ok(crate::sql::SqlOutcome::Begin)
                 }
                 TxnControl::Commit => {

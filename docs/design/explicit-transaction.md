@@ -472,7 +472,7 @@ Search・Aggregate・Scan）は確定済みのまま出力が決まる。想定�
 構文の実装は #1938（`ISOLATION LEVEL`）・#1939（`SET TRANSACTION`／`SET SESSION CHARACTERISTICS`）・
 Issue #1931（`READ ONLY`）、挙動テストは #1940、`40001` は #2396 が担う。
 `BEGIN ISOLATION LEVEL <レベル>` は Issue #1938 で受理へ変えた（`validate_transaction_control_tokens`。
-`BEGIN READ ONLY` は従来どおり `42601`）。重複指定は PostgreSQL の後勝ちと異なり `42601`（既知差）、
+`READ ONLY`/`READ WRITE` との併記は #1932 の構文と同じループで受理）。重複指定は PostgreSQL の後勝ちと異なり `42601`（既知差）、
 `[NOT] DEFERRABLE` は担当 sub-issue が無く `42601` のまま。
 
 - **engine の宣言型**: `crates/engine/src/txn.rs` の `IsolationLevel` は単一バリアントのまま維持する。
@@ -645,6 +645,12 @@ production コード（`crates/wire-server/src/`）は無変更・テスト専�
   使える文は明示トランザクションと同じ許可リスト（Issue #1179 で拡大済み。`RETURNING`
   は UPSERT のみ未対応）。`BEGIN` より前の書き込みを
   明示ブロックへ昇格させる PostgreSQL の意味論（`INSERT; BEGIN; ...`）は対象外。
+- アクセスモード修飾子（SQL-38・Issue #1932）: `BEGIN [WORK|TRANSACTION] [READ ONLY|READ WRITE]` を
+  構文解釈し、`ActiveTxn` が `TxnAccessMode` を持つ。モードなしの `BEGIN` と `READ WRITE` は
+  従来どおりの読み書き Tx。読み取り専用の実体（#1933・#1934）が入るまで `READ ONLY` は
+  書き込み可能な Tx を渡さないよう `0A000` で拒否する暫定ゲート（write txn を取る前・状態は
+  `Idle` のまま）。PostgreSQL との差異として、アクセスモードの重複・矛盾（`READ ONLY READ WRITE`）
+  は `42601`（fail-closed）。引用識別子 `"READ"` も受理される（既存の `"WORK"` と同じ性質）。
 - savepoint、`START TRANSACTION`／`END`／`ABORT` などの別名。分離レベルの指定は「分離レベルの受理方針」節のポインタ先の契約に従う（`BEGIN ISOLATION LEVEL` は #1938 で実装済み、`SET TRANSACTION` 系は #1939）。
 - NoSQL 表層のトランザクション（設計上 `0A000`。`op` 許可リストに追加しない）。
 - 上限の既定値（20 秒・1,000 件・30 秒）と CLI のハード上限（60 秒・10,000 件。Issue #1553 で暫定採用）の確定 → オーナー判断。

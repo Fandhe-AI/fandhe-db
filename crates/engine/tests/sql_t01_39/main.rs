@@ -49,4 +49,5 @@ mod sql36_require_where_for_dml;
 mod sql36_where_omitted_dml;
 mod sql37_current_time_functions;
 mod sql37_default_now;
+mod sql38_begin_access_mode;
 mod sql38_begin_isolation_level;
