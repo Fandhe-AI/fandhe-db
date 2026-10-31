@@ -4,9 +4,10 @@
 //! 責務境界: untrusted な WASM モジュールのバイト列を検証・コンパイルし、
 //! [`WasmUdfBackend`] を実装する値（`Arc<dyn WasmUdfBackend>`）を返す。wasmtime の型は
 //! 本ファイルの外へ出さない。`sql::udf_call::define_wasm_function_from_module`
-//! （Issue #1926）が [`compile_wasm_udf_backend`] を呼ぶ。epoch を進めるティッカーと上限の設定経路は
-//! Issue #1927 の範囲。それまでの停止手段として、Store ごとに fuel（命令数予算。
-//! `deadline_ticks` に比例）を設定し、無限ループする entry・start 関数も必ず停止する。
+//! （Issue #1926）が [`compile_wasm_udf_backend`] を呼ぶ。資源上限（Issue #1927・EXT-6／EXT-9 ポインタ）:
+//! プロセス共有 `Engine` の epoch をティッカースレッドが `EPOCH_TICK_INTERVAL_MS` ごとに進め
+//! （実行時間上限）、Store ごとの fuel（命令数上限）と併せて、無限ループする entry・start
+//! 関数も必ず停止する。入口で上限をハード上限へ頭打ちにする。
 //!
 //! fail-closed: 検証の失敗はすべて固定文言の [`WasmUdfError`] へ畳み、wasmtime の
 //! エラー文字列（モジュール内容を含みうる）は破棄する。モジュール／entry 名の経路で
@@ -19,7 +20,9 @@ use wasmtime::{
     Config, Engine, ExternType, InstancePre, Linker, Module, ResourceLimiter, Store, Trap, ValType,
 };
 
-use super::{SandboxLimits, TrapKind, WasmUdfBackend, WasmUdfError, MAX_MODULE_BYTES};
+use super::{
+    SandboxLimits, TrapKind, WasmUdfBackend, WasmUdfError, EPOCH_TICK_INTERVAL_MS, MAX_MODULE_BYTES,
+};
 
 /// entry 名の長さ上限（バイト）。untrusted な長さをコンパイル前に検証する。
 const MAX_ENTRY_NAME_BYTES: usize = 256;
@@ -30,9 +33,6 @@ const WASM_PAGE_BYTES: u64 = 65536;
 /// ホストがベクトルを書き込む線形メモリ上の固定オフセット（ABI の固定作業領域。
 /// ポインタ: `docs/spec/03-poc/udf-mechanism/`）。
 pub(crate) const VECTOR_ARG_OFFSET: u32 = 1024;
-
-/// `deadline_ticks` 1 tick あたりの fuel（命令数予算）。ティッカー導入前の停止手段。
-const FUEL_PER_TICK: u64 = 2_000_000;
 
 /// テーブル要素数の上限（funcref 1 要素はポインタ幅。巨大テーブル宣言による
 /// ホストメモリ枯渇を防ぐ）。
@@ -102,7 +102,19 @@ fn build_engine() -> Option<Engine> {
     config.wasm_gc(false);
     config.wasm_shared_everything_threads(false);
     config.max_wasm_stack(MAX_WASM_STACK_BYTES);
-    Engine::new(&config).ok()
+    let engine = Engine::new(&config).ok()?;
+    // 実行時間上限（epoch）を成立させるティッカー。プロセス全体で 1 本（OnceLock の
+    // 初期化内でのみ起動）。起動できなければ None を返し、モジュール登録を拒否する
+    // （時間上限の契約が成り立たない状態でモジュールを動かさない。fail-closed）。
+    let ticker = engine.clone();
+    std::thread::Builder::new()
+        .name("wasm-udf-epoch".to_string())
+        .spawn(move || loop {
+            std::thread::sleep(std::time::Duration::from_millis(EPOCH_TICK_INTERVAL_MS));
+            ticker.increment_epoch();
+        })
+        .ok()?;
+    Some(engine)
 }
 
 fn shared_engine() -> Result<&'static Engine, WasmUdfError> {
@@ -140,7 +152,8 @@ fn map_call_error(err: &wasmtime::Error, limit_exceeded: bool) -> WasmUdfError {
         return WasmUdfError::MemoryLimitExceeded;
     }
     let kind = match err.downcast_ref::<Trap>() {
-        Some(Trap::Interrupt | Trap::OutOfFuel) => TrapKind::DeadlineExceeded,
+        Some(Trap::Interrupt) => TrapKind::DeadlineExceeded,
+        Some(Trap::OutOfFuel) => TrapKind::FuelExhausted,
         Some(
             Trap::UnreachableCodeReached
             | Trap::IntegerDivisionByZero
@@ -155,6 +168,14 @@ fn map_call_error(err: &wasmtime::Error, limit_exceeded: bool) -> WasmUdfError {
 
 impl WasmUdfBackend for WasmtimeBackend {
     fn call_vector_scalar(&self, v: &[f32], scalar: f64) -> Result<f64, WasmUdfError> {
+        self.call_with_fuel(v, scalar, self.limits.fuel)
+    }
+}
+
+impl WasmtimeBackend {
+    /// fuel を引数で受ける本体。本番は `limits.fuel` を渡す。単体テストだけが epoch の停止を
+    /// fuel と切り分けて検証するため、ハード上限を超える fuel を渡す。
+    fn call_with_fuel(&self, v: &[f32], scalar: f64, fuel: u64) -> Result<f64, WasmUdfError> {
         let oob = WasmUdfError::Trap(TrapKind::MemoryOutOfBounds);
         let len = i32::try_from(v.len()).map_err(|_| oob)?;
         let byte_len = v.len().checked_mul(4).ok_or(oob)?;
@@ -166,8 +187,9 @@ impl WasmUdfBackend for WasmtimeBackend {
         let mut store = Store::new(self.engine, limiter);
         store.limiter(|s| s);
         store.set_epoch_deadline(self.limits.deadline_ticks);
+        store.epoch_deadline_trap();
         store
-            .set_fuel(self.limits.deadline_ticks.saturating_mul(FUEL_PER_TICK))
+            .set_fuel(fuel)
             .map_err(|_| WasmUdfError::InvalidModule)?;
 
         let instance = match self.pre.instantiate(&mut store) {
@@ -213,6 +235,8 @@ pub fn compile_wasm_udf_backend(
     entry: &str,
     limits: SandboxLimits,
 ) -> Result<Arc<dyn WasmUdfBackend>, WasmUdfError> {
+    // 呼び出し元が渡す値でハード上限を緩められないようにする（pub 関数の直接呼び出しも覆う）。
+    let limits = limits.clamped();
     if module_bytes.len() > MAX_MODULE_BYTES {
         return Err(WasmUdfError::ModuleTooLarge);
     }
@@ -267,8 +291,41 @@ pub fn compile_wasm_udf_backend(
 }
 
 #[cfg(test)]
+#[path = "../../tests/support/wasm_encoder.rs"]
+mod wasm_encoder;
+
+#[cfg(test)]
 mod tests {
+    use super::wasm_encoder::{plain_body, Spec};
     use super::*;
+
+    #[test]
+    fn infinite_loop_is_stopped_by_epoch_ticker_alone() {
+        // fuel を実質無制限にして、停止できるのが epoch ティッカーだけの状態を作る
+        // （ティッカーの存在証明。EXT-6 ポインタ）。loop { br 0 } f32.const 0
+        let body = plain_body(&[0x03, 0x40, 0x0C, 0, 0x0B, 0x43, 0, 0, 0, 0]);
+        let limits = SandboxLimits {
+            deadline_ticks: 1,
+            ..SandboxLimits::default()
+        };
+        let engine = shared_engine().expect("engine");
+        let module = Module::new(engine, Spec::new(body).build()).expect("module");
+        let pre = Linker::<UdfLimiter>::new(engine)
+            .instantiate_pre(&module)
+            .expect("pre");
+        let be = WasmtimeBackend {
+            engine,
+            pre,
+            entry: "f".to_string(),
+            limits,
+        };
+        let started = std::time::Instant::now();
+        assert_eq!(
+            be.call_with_fuel(&[], 0.0, u64::MAX),
+            Err(WasmUdfError::Trap(TrapKind::DeadlineExceeded))
+        );
+        assert!(started.elapsed() < std::time::Duration::from_secs(3));
+    }
 
     #[test]
     fn shared_engine_builds() {

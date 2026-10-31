@@ -71,6 +71,7 @@ feature 名は crates.io API の 48.0.7 の feature 一覧による。最小構�
 | ------------ | ----------------- |
 | `SandboxLimits::deadline_ticks`・`EPOCH_TICK_INTERVAL_MS`（既定 100 ms × 50 ティック） | epoch interruption（`Config::epoch_interruption`・`Store::set_epoch_deadline`・`Engine::increment_epoch`）。超過は `TrapKind` に写像 |
 | `memory_limit_bytes` | `StoreLimitsBuilder::memory_size` ＋ `Store::limiter` |
+| `SandboxLimits::fuel`（既定 1 億） | `Config::consume_fuel`・`Store::set_fuel`。演算子ごとの定数コストで、枯渇は `TrapKind::FuelExhausted`（Issue #1927） |
 | import の全拒否・WASI 未リンク | `Linker` を空のまま使い、import を持つモジュールは登録時に拒否。ホスト能力を付与しない |
 | `MAX_MODULE_BYTES`（1 MiB） | コンパイル前に長さを上限検証する（現行の契約を維持） |
 | `WasmUdfError`・`TrapKind` | 固定の英語文言。wasmtime のエラー文字列（モジュール内容を含みうる）を外へ出さない |
@@ -112,3 +113,4 @@ feature 名は crates.io API の 48.0.7 の feature 一覧による。最小構�
   - 第 4 節 4（承認範囲）: 直接依存 `wasmtime = "=48.0.8"` の 1 行に限る。版の変更（セキュリティ更新を含む）とサブクレートの直接依存化は範囲外で、再承認を要する
 - 2026-10-31: Issue #1924 で依存を追加した。版は承認どおり `=48.0.8`（48.0.7 から変更。理由は RUSTSEC-2026-0422・0423・0424 の修正版であるため。承認は #1911 のコメント）。`Cargo.lock` は wasmtime 系の新規エントリのみで既存エントリの版は不変。`make deny` は通過し、既定ビルドの engine・wire-server の依存木に wasmtime・cranelift は出ない
 - 2026-10-31: Issue #1926 で第 4 節 1 の feature 無効時の SQLSTATE を `0A000` に確定した（登録 API・`CREATE FUNCTION ... LANGUAGE wasm` とも両ビルドで拒否）。登録は Rust API（`register_wasm_udf_from_module`）のみで、SQL による永続定義は永続化設計待ちのため範囲外
+- 2026-10-31: Issue #1927 で資源上限を実装した（EXT-6／EXT-9 ポインタ）。epoch ティッカー（プロセス共有の `wasm-udf-epoch` スレッドが 100 ms ごとに `Engine::increment_epoch`。起動失敗時は登録を拒否）で実行時間上限を成立させ、fuel を独立の上限にした。メモリ 8 MiB・時間 50 tick（約 5 秒）・燃料 1 億を既定かつハード上限とし、`compile_wasm_udf_backend` 入口で頭打ちにする。起動フラグ `--wasm-max-memory-bytes`・`--wasm-max-call-duration-ms`・`--wasm-max-fuel` は下げる方向だけ（A05）で、環境変数・SQL の `SET` による変更経路は作らない。実行時の時間・燃料・メモリの超過は `54000`、他のトラップは `22000`。定義時の初期メモリ超過は従来どおり `42P13`。コンパイル時間・メモリの上限とキャッシュは引き続き未対応（A04 の申し送り）。

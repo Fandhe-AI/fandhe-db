@@ -9,6 +9,7 @@
 
 ### Added
 
+- WASM UDF サンドボックスの資源上限を追加した（Issue #1927・EXT-6／EXT-9）。`wasm_udf::SandboxLimits` に `fuel` を追加（BREAKING: 公開フィールドの追加）、`SandboxLimits::clamped`・`HARD_MAX_*`・`validate_wasm_*`・`WasmLimitOutOfRange`・`TrapKind::FuelExhausted`・`EngineCore::with_wasm_limits`／`wasm_limits` を追加した。`wasm-udf` ビルドでは epoch ティッカーで実行時間上限が効き、実行時の上限超過は `54000`（従来は `22000`）。起動フラグ `--wasm-max-memory-bytes`・`--wasm-max-call-duration-ms`・`--wasm-max-fuel`（下げる方向だけ）を追加。
 - WASM UDF をモジュールのバイト列から登録して SQL の結果列・`WHERE` から呼べるようにした（Issue #1926・EXT-9）。`SessionState::register_wasm_udf_from_module`・`sql::udf_call::define_wasm_function_from_module`・`wasm_udf::WasmUdfSignature`／`WasmSqlType`／`check_signature_against_abi` を追加した（追加のみ）。実体のコンパイルは feature `wasm-udf` 有効時に限り、無効ビルドでは `0A000`。
   挙動変更: `CREATE FUNCTION ... LANGUAGE wasm` の拒否が `42704` から `0A000` になった（SQL による WASM 関数の定義は未対応）。
 - `CREATE FUNCTION` の `LANGUAGE sql|plpgsql` 句と関数属性（揮発性・`STRICT`・`PARALLEL`・`COST`）を受理する（Issue #2217・SQL-67 (3)）。本体は文字列リテラル（`$$...$$` 可）で原文のまま保存し、plpgsql は定義時に検証する。`RETURNS trigger` は plpgsql・引数なしだけ受理する。非 IMMUTABLE の `sql`／`plpgsql` 関数を使う式索引・部分索引は `42P17`。`sql`／`plpgsql` 関数の呼び出しは #2218 まで `42883`。
