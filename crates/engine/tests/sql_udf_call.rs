@@ -104,6 +104,7 @@ fn udf_call_in_result_column_matches_independent_oracle() {
     let (core, _guard) = new_core_with_docs();
     let ctx = PolicyContext::new("tenant-a").expect("valid tenant");
     let mut session = SessionState::default();
+    session.allow_ddl();
 
     core.execute_sql_in_session(
         &ctx,
@@ -453,27 +454,61 @@ fn udf_expression_never_evaluates_on_invisible_rows() {
 
 // --- セッション分離 ------------------------------------------------------------------
 
+/// SQL-66（Issue #1922）以降、SQL で作った UDF は DDL 権限のあるセッションがテナントの UDF カタログへ
+/// 書く永続定義になり、同じテナントの別セッションからは見える（旧 SQL-9 のセッション限定の契約から
+/// の変更）。守るべき境界はテナント間の不可視で、他テナントの関数は不在と同じ `42883` になる。
 #[test]
-fn udf_defined_in_one_session_is_not_visible_from_another_session() {
+fn udf_defined_by_one_tenant_is_not_visible_from_another_tenant() {
     let (core, _guard) = new_core_with_docs();
-    let ctx = PolicyContext::new("tenant-a").expect("valid tenant");
+    let ctx_a = PolicyContext::new("tenant-a").expect("valid tenant");
+    let ctx_b = PolicyContext::new("tenant-b").expect("valid tenant");
 
     let mut session_a = SessionState::default();
+    session_a.allow_ddl();
     core.execute_sql_in_session(
-        &ctx,
+        &ctx_a,
         &mut session_a,
         "CREATE FUNCTION only_in_a(v) AS vec_norm(v)",
     )
-    .expect("CREATE FUNCTION should succeed in session A");
+    .expect("CREATE FUNCTION should succeed for a DDL-permitted session");
 
+    let sql =
+        "SELECT only_in_a(embedding) FROM docs ORDER BY embedding <=> '[3.0,4.0,0.0]' LIMIT 1";
     let mut session_b = SessionState::default();
+    let err = core
+        .execute_sql_in_session(&ctx_b, &mut session_b, sql)
+        .expect_err("another tenant must not see tenant A's UDF");
+    assert_eq!(err.wire_code(), "42883");
+
+    // 同じテナントの別セッションにはカタログ経由で見える（エラーが 42883 でないこと）。
+    let mut session_a2 = SessionState::default();
+    core.load_session_udfs(&ctx_a, &mut session_a2)
+        .expect("load session udfs");
+    let res = core.execute_sql_in_session(&ctx_a, &mut session_a2, sql);
+    assert!(
+        !matches!(&res, Err(e) if e.wire_code() == "42883"),
+        "same-tenant session must resolve the catalog UDF"
+    );
+}
+
+/// DDL 権限の無いセッションの `CREATE FUNCTION` は `42501` で拒否され、何も登録されない
+/// （SQL-66・Issue #1922。fail-closed）。
+#[test]
+fn create_function_without_ddl_permission_is_42501_and_registers_nothing() {
+    let (core, _guard) = new_core_with_docs();
+    let ctx = PolicyContext::new("tenant-a").expect("valid tenant");
+    let mut session = SessionState::default();
+    let err = core
+        .execute_sql_in_session(&ctx, &mut session, "CREATE FUNCTION f(v) AS vec_norm(v)")
+        .expect_err("CREATE FUNCTION without DDL permission must be rejected");
+    assert_eq!(err.wire_code(), "42501");
     let err = core
         .execute_sql_in_session(
             &ctx,
-            &mut session_b,
-            "SELECT only_in_a(embedding) FROM docs ORDER BY embedding <=> '[3.0,4.0,0.0]' LIMIT 1",
+            &mut session,
+            "SELECT f(embedding) FROM docs ORDER BY embedding <=> '[3.0,4.0,0.0]' LIMIT 1",
         )
-        .expect_err("session B must not see session A's UDF");
+        .expect_err("nothing must be registered");
     assert_eq!(err.wire_code(), "42883");
 }
 
@@ -667,6 +702,7 @@ fn redefining_a_function_in_the_same_session_is_rejected_with_42723() {
     let (core, _guard) = new_core_with_docs();
     let ctx = PolicyContext::new("tenant-a").expect("valid tenant");
     let mut session = SessionState::default();
+    session.allow_ddl();
     core.execute_sql_in_session(&ctx, &mut session, "CREATE FUNCTION f(v) AS vec_norm(v)")
         .expect("first definition should succeed");
     let err = core
@@ -680,6 +716,7 @@ fn function_body_referencing_an_undefined_name_is_rejected_with_42883() {
     let (core, _guard) = new_core_with_docs();
     let ctx = PolicyContext::new("tenant-a").expect("valid tenant");
     let mut session = SessionState::default();
+    session.allow_ddl();
     let err = core
         .execute_sql_in_session(
             &ctx,
@@ -695,6 +732,7 @@ fn defining_a_function_named_after_a_builtin_is_rejected_with_42723() {
     let (core, _guard) = new_core_with_docs();
     let ctx = PolicyContext::new("tenant-a").expect("valid tenant");
     let mut session = SessionState::default();
+    session.allow_ddl();
     let err = core
         .execute_sql_in_session(&ctx, &mut session, "CREATE FUNCTION vec_norm(v) AS v")
         .expect_err("a UDF name colliding with a built-in must be rejected");
@@ -784,6 +822,7 @@ fn chained_udf_parameter_doubling_is_rejected_before_expansion_blows_up() {
     let (core, _guard) = new_core_with_docs();
     let ctx = PolicyContext::new("tenant-a").expect("valid tenant");
     let mut session = SessionState::default();
+    session.allow_ddl();
 
     core.execute_sql_in_session(&ctx, &mut session, "CREATE FUNCTION g0(v) AS v + v")
         .expect("g0 definition should succeed (small syntactic body)");
@@ -834,6 +873,7 @@ fn defining_a_udf_with_a_reserved_name_is_rejected_with_42723() {
     let (core, _guard) = new_core_with_docs();
     let ctx = PolicyContext::new("tenant-a").expect("valid tenant");
     let mut session = SessionState::default();
+    session.allow_ddl();
     for name in ["lower", "hybrid", "sum"] {
         let err = core
             .execute_sql_in_session(

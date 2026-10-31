@@ -647,6 +647,8 @@ fn sql13_aggregate_over_declared_udf_call() {
     let ctx = ctx_for("tenant-a", true);
 
     let mut session = engine::sql::mode::SessionState::default();
+
+    session.allow_ddl();
     core.execute_sql_in_session(&ctx, &mut session, "CREATE FUNCTION n(v) AS vec_norm(v)")
         .expect("CREATE FUNCTION should succeed");
     let result = core

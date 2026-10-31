@@ -425,6 +425,7 @@ fn udf_body_can_call_date_part_and_reserved_names_are_rejected() {
     let (core, _guard) = new_core();
     let ctx = ctx_for("tenant-a");
     let mut session = SessionState::default();
+    session.allow_ddl();
     core.execute_insert_sql(
         &ctx,
         &insert_sql(1, "2024-06-15", "2024-06-15 00:00:00", "op-1"),

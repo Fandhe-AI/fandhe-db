@@ -237,6 +237,7 @@ fn names_are_reserved_and_arity_type_errors_are_classified() {
     let core = new_core(&path);
     let ctx = ctx_for("tenant-a");
     let mut session = SessionState::default();
+    session.allow_ddl();
     for name in ["lpad", "rpad", "split_part"] {
         let err = core
             .execute_sql_in_session(
@@ -287,6 +288,7 @@ fn function_body_may_use_lpad_and_rpad_with_both_arities() {
     let core = new_core(&path);
     let ctx = ctx_for("tenant-a");
     let mut session = SessionState::default();
+    session.allow_ddl();
     core.execute_sql_in_session(&ctx, &mut session, "CREATE FUNCTION f2(x) AS lpad('a', x)")
         .expect("2-arg lpad in body");
     core.execute_sql_in_session(

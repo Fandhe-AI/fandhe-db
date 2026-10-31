@@ -18,6 +18,7 @@ mod wire_correlated_limits_cli;
 mod wire_ddl_permission_cli;
 mod wire_dml_limits_cli;
 mod wire_durability_cli;
+mod wire_function_limits_cli;
 mod wire_group_by_limits_cli;
 mod wire_hnsw_scope_cli;
 mod wire_join_limits_cli;

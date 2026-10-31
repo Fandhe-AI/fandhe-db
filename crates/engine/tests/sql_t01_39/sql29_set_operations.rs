@@ -574,6 +574,7 @@ fn udf_call_form_is_still_not_misdetected_as_set_operation_after_paren_scan_chan
     let core = new_core(storage);
     let tenant_ctx = ctx("tenant-a");
     let mut session = SessionState::default();
+    session.allow_ddl();
     core.execute_sql_in_session(
         &tenant_ctx,
         &mut session,
@@ -610,6 +611,7 @@ fn udf_named_union_in_select_list_is_not_routed_to_set_operation() {
     let core = new_core(storage);
     let tenant_ctx = ctx("tenant-a");
     let mut session = SessionState::default();
+    session.allow_ddl();
     core.execute_sql_in_session(
         &tenant_ctx,
         &mut session,
@@ -636,6 +638,7 @@ fn udf_named_intersect_and_except_in_select_list_is_not_routed_to_set_operation(
     let core = new_core(storage);
     let tenant_ctx = ctx("tenant-a");
     let mut session = SessionState::default();
+    session.allow_ddl();
     core.execute_sql_in_session(
         &tenant_ctx,
         &mut session,
@@ -670,6 +673,7 @@ fn udf_named_union_in_where_clause_is_not_routed_to_set_operation() {
     let core = new_core(storage);
     let tenant_ctx = ctx("tenant-a");
     let mut session = SessionState::default();
+    session.allow_ddl();
     core.execute_sql_in_session(
         &tenant_ctx,
         &mut session,

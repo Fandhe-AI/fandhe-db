@@ -220,6 +220,7 @@ fn udf_body_can_call_numeric_builtin_functions() {
     let (core, _guard) = new_core_with_docs();
     let ctx = PolicyContext::new("tenant-a").expect("valid tenant");
     let mut session = SessionState::default();
+    session.allow_ddl();
 
     core.execute_sql_in_session(
         &ctx,
@@ -334,6 +335,7 @@ fn defining_a_udf_named_after_a_numeric_builtin_is_rejected() {
     let (core, _guard) = new_core_with_docs();
     let ctx = PolicyContext::new("tenant-a").expect("valid tenant");
     let mut session = SessionState::default();
+    session.allow_ddl();
     for name in [
         "abs", "round", "floor", "ceil", "ceiling", "mod", "power", "sqrt",
     ] {
@@ -358,6 +360,7 @@ fn defining_and_calling_a_udf_named_after_an_unimplemented_non_deterministic_fun
     let (core, _guard) = new_core_with_docs();
     let ctx = PolicyContext::new("tenant-a").expect("valid tenant");
     let mut session = SessionState::default();
+    session.allow_ddl();
 
     let err = core
         .execute_sql_in_session(&ctx, &mut session, "CREATE FUNCTION now(x) AS x")

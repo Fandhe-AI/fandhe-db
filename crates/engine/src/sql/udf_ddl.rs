@@ -4,7 +4,7 @@
 //! 役割: セッションの [`UdfRegistry`] だけにあった UDF 定義を UDF カタログ（`catalog::function`）へ
 //! 書く・消す実行本体と、[`CatalogError`] → SQLSTATE の写像を担う。呼び出し元は `core.rs` の
 //! `execute_validated_in_session`（`CREATE FUNCTION`）と `ParsedSql::DropFunction` 腕で、どちらも
-//! `session.ddl_allowed()` を満たす場合だけここへ来る（権限ゲートの 42501 化は #1922）。
+//! `require_ddl_permission` を通った場合だけここへ来る（権限なしは `42501`・#1922）。
 //!
 //! 順序の契約: 検証（レジストリ不変）→ カタログの単一 write txn・1 回の commit → commit 成功後に
 //! レジストリへ反映。カタログで失敗したらセッションは変わらない。クラッシュしても commit 境界で
@@ -26,7 +26,7 @@ use crate::sql::cast::CastType;
 use crate::sql::mode::SessionState;
 use crate::sql::udf_call::{
     body_reaches_function, commit_function_definition, prepare_function_replacement,
-    prepare_function_with_signature, PreparedUdf,
+    prepare_function_with_signature_prechecked, PreparedUdf,
 };
 use crate::storage::Storage;
 
@@ -108,11 +108,44 @@ fn catalog_def_from_prepared(
     })
 }
 
+/// 永続定義がセッション限定の関数（カタログ由来でない宣言的 UDF・WASM UDF）へ直接・推移的に依存する
+/// 場合は `0A000` で拒否する。永続定義は別接続・再起動後にその呼び出し先が無く、ロードで読み飛ばされて
+/// 呼べなくなるため（Issue #1922）。`0A000` は同じ「現状では永続化できない形」の既存拒否
+/// （明示トランザクション内の永続化など）と同じ契約。エラー文言に関数名は含めない。
+fn reject_session_local_dependency(
+    session: &SessionState,
+    body: &crate::sql::udf_call::Expr,
+) -> Result<(), SqlSurfaceError> {
+    if crate::sql::udf_call::body_depends_on_session_local(body, session.udfs()) {
+        return Err(SqlSurfaceError::feature_not_supported(
+            "a persistent function cannot depend on a session-local function",
+        ));
+    }
+    Ok(())
+}
+
+/// 本体検証より前のカタログ側の重複・件数の先行判定（[`Storage::precheck_function_capacity`]）を
+/// `SqlSurfaceError` へ写す。`CREATE`／`CREATE OR REPLACE` の永続化が共有し、判定順の実装を 1 箇所に
+/// 保つ（重複 `42723`・件数 `54000` の写像は書き込み時の再検査と同じ [`map_function_error`]）。
+fn precheck_catalog_capacity(
+    storage: &Storage,
+    tenant_id: &str,
+    name: &str,
+    max_functions: usize,
+    replace: bool,
+) -> Result<(), SqlSurfaceError> {
+    storage
+        .precheck_function_capacity(tenant_id, name, max_functions, replace)
+        .map_err(map_function_error)
+}
+
 /// `CREATE FUNCTION` をカタログへ永続化してセッションへ登録する（DDL 権限のあるセッション用）。
 ///
-/// 判定順は [`prepare_function_with_signature`]（予約名・識別子・引数・閉じた本体。セッションの重複
-/// `42723` を含む）→ [`Storage::create_function`]（同名の定義があれば `42723`・件数上限 `54000`）→
-/// セッションへの登録。
+/// `max_functions` は起動時設定の件数上限（Issue #1922。ハード上限で飽和される）。
+///
+/// 判定順は 予約名・識別子 → セッションの重複 `42723` → カタログの重複 `42723`・件数上限 `54000`
+/// （先行判定）→ 引数数・閉じた本体 → [`Storage::create_function_with_limit`]（同じ重複・件数の
+/// 排他的な再検査）→ セッションへの登録。
 #[allow(clippy::too_many_arguments)]
 pub(crate) fn execute_create_function_persistent(
     storage: &Storage,
@@ -124,18 +157,23 @@ pub(crate) fn execute_create_function_persistent(
     return_type: Option<&CastType>,
     body: &crate::sql::udf_call::Expr,
     body_source: &str,
+    max_functions: usize,
 ) -> Result<(), SqlSurfaceError> {
-    let prepared = prepare_function_with_signature(
+    // 判定順（設計文書）は 重複 → 件数 → 引数数 → 本体。カタログ側の重複・件数は本体検証より前に
+    // 先行判定し、書き込み時の排他的な再検査（`create_function_with_limit`）は権威として残す。
+    let prepared = prepare_function_with_signature_prechecked(
         session.udfs(),
         name,
         params,
         param_types,
         return_type,
         body,
+        &|| precheck_catalog_capacity(storage, tenant_id, name, max_functions, false),
     )?;
+    reject_session_local_dependency(session, &prepared.body)?;
     let def = catalog_def_from_prepared(&prepared, body_source)?;
     storage
-        .create_function(tenant_id, &def)
+        .create_function_with_limit(tenant_id, &def, max_functions)
         .map_err(map_function_error)?;
     let key = prepared.key.clone();
     commit_function_definition(session.udfs_mut(), prepared);
@@ -161,7 +199,10 @@ pub(crate) fn execute_create_or_replace_function_persistent(
     return_type: Option<&CastType>,
     body: &crate::sql::udf_call::Expr,
     body_source: &str,
+    max_functions: usize,
 ) -> Result<(), SqlSurfaceError> {
+    // 置換（カタログに同名の定義がある）は件数を増やさないため先行の件数判定を省く。新規作成になる
+    // ときだけ本体検証より前に件数を判定する（write txn 内の再検査は権威として残す）。
     let prepared = prepare_function_replacement(
         session.udfs(),
         name,
@@ -169,15 +210,16 @@ pub(crate) fn execute_create_or_replace_function_persistent(
         param_types,
         return_type,
         body,
-        true,
+        &|| precheck_catalog_capacity(storage, tenant_id, name, max_functions, true),
     )?;
+    reject_session_local_dependency(session, &prepared.body)?;
     let def = catalog_def_from_prepared(&prepared, body_source)?;
     // 循環検査はセッションのレジストリ（古い可能性がある）ではなく、write txn 内の最新カタログで
     // 再度行う（並行する別セッションの置換との合成で循環が残るのを防ぐ）。
     let target = prepared.key.to_ascii_lowercase();
     let new_body = &prepared.body;
     storage
-        .replace_function_checked(tenant_id, &def, &|latest| {
+        .replace_function_checked(tenant_id, &def, max_functions, &|latest| {
             let mut bodies = std::collections::BTreeMap::new();
             for d in latest {
                 let lower = d.function_key.to_ascii_lowercase();
@@ -206,11 +248,12 @@ pub(crate) fn execute_create_or_replace_function_persistent(
     Ok(())
 }
 
-/// `DROP FUNCTION [IF EXISTS] ... [CASCADE | RESTRICT]` を実行する。DDL 権限のあるセッションは
-/// カタログ（自テナントの scope）から削除し、いずれのセッションもレジストリから削除する。
+/// `DROP FUNCTION [IF EXISTS] ... [CASCADE | RESTRICT]` を実行する。DDL 権限の無いセッションは
+/// 何も見ず `42501`（`IF EXISTS` でも同じ。存在情報を出さない）。権限のあるセッションはカタログ
+/// （自テナントの scope）から削除し、レジストリからも削除する（カタログに載らない定義、たとえば WASM UDF は
+/// レジストリからだけ消える）。
 /// **どちらでも消えなかった場合だけ** `42883`（存在情報を出さない固定文言）。`IF EXISTS` なら代わりに
-/// `skipped` の成功を返す（他テナントの定義・不在はどちらも同じ応答）。権限の無いセッションはカタログを
-/// 見ない。カタログ由来の定義を権限の無いセッションが消そうとすると、`IF EXISTS` でも `42501`。
+/// `skipped` の成功を返す（他テナントの定義・不在はどちらも同じ応答）。
 /// 依存トリガは `RESTRICT`（既定）なら `2BP01`、`CASCADE` なら関数と同じ write txn で連鎖削除する。
 ///
 /// 型の並びが指定されたときは、カタログ上の定義の引数の数と（型注釈のある引数の）型が一致する
@@ -221,10 +264,11 @@ pub(crate) fn execute_drop_function(
     session: &mut SessionState,
     stmt: &ValidatedDropFunction,
 ) -> Result<DropFunctionOutcome, SqlSurfaceError> {
+    // 権限検査は保存先（カタログ／セッション内）の振り分けより前。`IF EXISTS` でも `42501` にして、
+    // 権限の無いセッションに対象の有無を区別させない（SQL-66・Issue #1922・fail-closed）。
+    crate::sql::ddl::require_ddl_permission(session)?;
     let mut removed = false;
-    if session.ddl_allowed() {
-        removed |= drop_from_catalog(storage, tenant_id, stmt)?;
-    }
+    removed |= drop_from_catalog(storage, tenant_id, stmt)?;
     // 型の並びがある場合、セッション内の定義は引数の数と（型注釈のある引数の）型で照合する。
     // WASM UDF は (vector, scalar) の固定 2 引数なので、同じ名前空間を共有する
     // `UdfRegistry::remove` が両表を消す設計に合わせて判定にも含める。
@@ -236,11 +280,6 @@ pub(crate) fn execute_drop_function(
             || udfs.get_wasm(&stmt.name).is_some_and(|_| arity_ok(2))
     };
     if session_match {
-        // カタログ由来の定義は権限の無いセッションからは消せない（SQL-66・Issue #1921）。呼べる関数に
-        // 対して 42883 を返すと事実と食い違うため 42501 にする。セッション内だけの登録は従来どおり消せる。
-        if !session.ddl_allowed() && session.udfs().is_catalog_origin(&stmt.name) {
-            return Err(SqlSurfaceError::InsufficientPrivilege);
-        }
         removed |= session.udfs_mut().remove(&stmt.name);
     }
     if removed {
@@ -366,7 +405,7 @@ fn map_function_error(e: CatalogError) -> SqlSurfaceError {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::sql::udf_call::prepare_function_definition;
+    use crate::sql::udf_call::{prepare_function_definition, prepare_function_with_signature};
 
     fn parse_body(src: &str) -> crate::sql::udf_call::Expr {
         let tokens = crate::sql::lexer::tokenize_rendered(src).expect("tokens");
@@ -398,6 +437,8 @@ mod tests {
             )
             .expect("create f");
         commit_function_definition(a.udfs_mut(), prepared_f);
+        // 実運用ではカタログ由来のロード・永続化が印を付ける（付けないとセッション限定の依存として拒否される）。
+        a.udfs_mut().mark_catalog_origin("f");
         let prepared_g = prepare_function_definition(a.udfs(), "g", &p, &body_x).expect("g");
         storage
             .create_function(
@@ -406,9 +447,11 @@ mod tests {
             )
             .expect("create g");
         commit_function_definition(a.udfs_mut(), prepared_g);
+        a.udfs_mut().mark_catalog_origin("g");
         for key in ["f", "g"] {
             let prep = prepare_function_definition(b.udfs(), key, &p, &body_x).expect("b");
             commit_function_definition(b.udfs_mut(), prep);
+            b.udfs_mut().mark_catalog_origin(key);
         }
         execute_create_or_replace_function_persistent(
             &storage,
@@ -420,6 +463,7 @@ mod tests {
             None,
             &parse_body("g(x)"),
             "g ( x )",
+            crate::catalog::function::MAX_FUNCTIONS,
         )
         .expect("f -> g");
         // b のレジストリは f を単純な本体だと思っているため、レジストリ上の検査は通る。
@@ -433,9 +477,66 @@ mod tests {
             None,
             &parse_body("f(x)"),
             "f ( x )",
+            crate::catalog::function::MAX_FUNCTIONS,
         )
         .expect_err("g -> f must be rejected by the catalog-level check");
         assert_eq!(err.wire_code(), "0A000");
+    }
+
+    /// Issue #1922: 件数上限に達したテナントでは、本体・引数数の検証より先に件数超過 `54000` を返す。
+    /// 重複 `42723` は件数より先、置換（既存定義あり）は上限到達でも本体検証まで進む。
+    #[test]
+    fn limit_is_judged_before_body_and_param_count_validation() {
+        let path = crate::test_util::temp_db::unique_db_path("udf-ddl-limit-order");
+        let _guard = crate::test_util::temp_db::CleanupGuard(path.clone());
+        let storage = Storage::open(&path).expect("open");
+        let mut s = SessionState::default();
+        let p = vec!["x".to_string()];
+        let create = |s: &mut SessionState, name: &str, params: &[String], body: &str| {
+            execute_create_function_persistent(
+                &storage,
+                "t",
+                s,
+                name,
+                params,
+                &vec![None; params.len()],
+                None,
+                &parse_body(body),
+                body,
+                1,
+            )
+        };
+        let replace = |s: &mut SessionState, name: &str, body: &str| {
+            execute_create_or_replace_function_persistent(
+                &storage,
+                "t",
+                s,
+                name,
+                &p,
+                &[None],
+                None,
+                &parse_body(body),
+                body,
+                1,
+            )
+        };
+        create(&mut s, "f", &p, "x").expect("first function");
+        // 未定義関数を呼ぶ本体・引数数超過のいずれも件数超過が先。
+        let err = create(&mut s, "g", &p, "missing(x)").expect_err("limit");
+        assert_eq!(err.wire_code(), "54000");
+        let many: Vec<String> = (0..200).map(|i| format!("a{i}")).collect();
+        let err = create(&mut s, "g", &many, "a0").expect_err("limit");
+        assert_eq!(err.wire_code(), "54000");
+        // 新規作成になる OR REPLACE も同じ。
+        let err = replace(&mut s, "h", "missing(x)").expect_err("limit");
+        assert_eq!(err.wire_code(), "54000");
+        // 重複は件数より先。
+        let err = create(&mut s, "f", &p, "x").expect_err("duplicate");
+        assert_eq!(err.wire_code(), "42723");
+        // 置換は上限到達でも本体検証まで進む（未定義関数は 42883、正しい本体は成功）。
+        let err = replace(&mut s, "f", "missing(x)").expect_err("body");
+        assert_eq!(err.wire_code(), "42883");
+        replace(&mut s, "f", "x").expect("replace at the limit");
     }
 
     #[test]

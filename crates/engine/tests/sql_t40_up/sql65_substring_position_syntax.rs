@@ -191,6 +191,7 @@ fn substring_is_reserved_against_udf_definition() {
     let core = new_core(&path);
     let ctx = ctx_for("tenant-a");
     let mut session = SessionState::default();
+    session.allow_ddl();
     let err = core
         .execute_sql_in_session(&ctx, &mut session, "CREATE FUNCTION substring(x) AS x")
         .expect_err("reserved");

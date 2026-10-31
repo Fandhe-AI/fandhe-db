@@ -246,6 +246,7 @@ pub mod dispatch;
 pub mod embedding;
 pub mod error_format;
 pub(crate) mod f16;
+pub mod function_limits;
 pub(crate) mod gin_index;
 pub mod gpu_batch;
 pub mod group_by_limits;

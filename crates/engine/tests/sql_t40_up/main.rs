@@ -119,6 +119,7 @@ mod sql65_trunc;
 mod sql66_udf_catalog_load;
 mod sql66_udf_catalog_write;
 mod sql66_udf_drop_replace;
+mod sql66_udf_limits;
 mod sql66_udf_param_types;
 mod sql66_udf_returns;
 mod sql68_do_block;

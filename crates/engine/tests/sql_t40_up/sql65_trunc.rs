@@ -142,6 +142,7 @@ fn contract_errors() {
         "22003"
     );
     let mut session = engine::sql::mode::SessionState::default();
+    session.allow_ddl();
     let err = core
         .execute_sql_in_session(
             &ctx_for("tenant-a"),

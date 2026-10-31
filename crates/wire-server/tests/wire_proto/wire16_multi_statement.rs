@@ -420,20 +420,19 @@ fn set_search_mode_persists_when_the_whole_message_succeeds() {
     read_ready_for_query(&mut stream);
 }
 
-/// `CREATE FUNCTION` を含む複数文メッセージが途中で失敗した場合も同様に
-/// 巻き戻り、次のメッセージでその関数は未定義のまま（未定義関数呼び出しは
-/// `sql::udf_call` の束縛時検証により `42883`〔`UndefinedFunction`〕になる）。
+/// DDL 権限の無いユーザーの `CREATE FUNCTION` を含む複数文メッセージは、その文の `42501` で止まり、
+/// 後続の文は実行されず、関数も登録されない（SQL-66・Issue #1922。旧: セッション内登録が後続の失敗で
+/// 巻き戻ることの確認。DDL 権限ありの永続定義は暗黙トランザクションでも巻き戻らないため対象外）。
 #[test]
-fn create_function_is_rolled_back_when_a_later_statement_in_the_message_fails() {
+fn create_function_without_ddl_permission_aborts_the_multi_statement_message() {
     let (core, _guard) = new_core_three_tenant_docs();
     let mut stream = spawn_with_alice(core);
 
     send_simple_query(
         &mut stream,
-        "CREATE FUNCTION double_it(v) AS v * 2.0; SELECT id FROM no_such_table LIMIT 1",
+        "CREATE FUNCTION double_it(v) AS v * 2.0; SELECT id FROM docs LIMIT 1",
     );
-    assert_eq!(read_command_complete(&mut stream), "CREATE FUNCTION");
-    expect_error_response_with_sqlstate(&mut stream, "42P01");
+    expect_error_response_with_sqlstate(&mut stream, "42501");
     read_ready_for_query(&mut stream);
 
     send_simple_query(

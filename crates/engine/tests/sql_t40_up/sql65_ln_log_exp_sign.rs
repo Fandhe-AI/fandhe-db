@@ -211,6 +211,7 @@ fn reserved_names_and_udf_bodies() {
     let core = new_core(&path);
     let ctx = ctx_for("tenant-a");
     let mut session = SessionState::default();
+    session.allow_ddl();
     for name in ["ln", "log", "exp", "sign"] {
         let err = core
             .execute_sql_in_session(

@@ -17,6 +17,14 @@ use engine::storage::{Storage, Visibility};
 use crate::temp_db;
 use temp_db::{unique_db_path, CleanupGuard};
 
+/// DDL 権限つきのセッション。権限の無いセッションの `CREATE FUNCTION` は `42501` のため、定義を作る
+/// テストはこのセッションで行う（定義はカタログへ永続化される。Issue #1922・#2798）。
+fn ddl_session() -> SessionState {
+    let mut s = SessionState::default();
+    s.allow_ddl();
+    s
+}
+
 fn ctx_for(tenant: &str) -> PolicyContext {
     PolicyContext::with_visibilities(tenant, [Visibility::Public, Visibility::Private])
         .expect("valid tenant")
@@ -87,7 +95,7 @@ fn first_cell(core: &EngineCore, session: &mut SessionState, sql: &str) -> Cell 
 #[test]
 fn returns_clause_is_accepted_and_result_is_converted() {
     let (core, _g) = new_core("sql66r-basic");
-    let mut s = SessionState::default();
+    let mut s = ddl_session();
     define(
         &core,
         &mut s,
@@ -101,7 +109,7 @@ fn returns_clause_is_accepted_and_result_is_converted() {
 #[test]
 fn identity_and_widening_bodies_are_accepted() {
     let (core, _g) = new_core("sql66r-widen");
-    let mut s = SessionState::default();
+    let mut s = ddl_session();
     define(
         &core,
         &mut s,
@@ -140,7 +148,7 @@ fn identity_and_widening_bodies_are_accepted() {
 #[test]
 fn numeric_literal_bodies_are_assignable_to_numeric_returns() {
     let (core, _g) = new_core("sql66r-numlit");
-    let mut s = SessionState::default();
+    let mut s = ddl_session();
     for (i, ret) in ["integer", "double precision", "numeric", "bigint"]
         .iter()
         .enumerate()
@@ -173,7 +181,7 @@ fn numeric_literal_bodies_are_assignable_to_numeric_returns() {
 #[test]
 fn body_type_mismatch_is_42p13() {
     let (core, _g) = new_core("sql66r-mismatch");
-    let mut s = SessionState::default();
+    let mut s = ddl_session();
     for (i, sql) in [
         "CREATE FUNCTION f(x integer) RETURNS boolean AS x + 1",
         "CREATE FUNCTION f(x integer) RETURNS integer AS 1::boolean",
@@ -197,7 +205,7 @@ fn body_type_mismatch_is_42p13() {
 #[test]
 fn statically_undecidable_forms_are_fail_closed() {
     let (core, _g) = new_core("sql66r-failclosed");
-    let mut s = SessionState::default();
+    let mut s = ddl_session();
     for sql in [
         "CREATE FUNCTION f(x integer) RETURNS text AS x + 1",
         "CREATE FUNCTION f(x integer) RETURNS char(5) AS x",
@@ -221,7 +229,7 @@ fn statically_undecidable_forms_are_fail_closed() {
 #[test]
 fn untyped_form_without_returns_is_unchanged() {
     let (core, _g) = new_core("sql66r-regress");
-    let mut s = SessionState::default();
+    let mut s = ddl_session();
     define(&core, &mut s, "CREATE FUNCTION f(x) AS x + 1");
     assert_eq!(
         first_cell(&core, &mut s, "SELECT f(2) FROM docs LIMIT 1"),
@@ -233,7 +241,7 @@ fn untyped_form_without_returns_is_unchanged() {
 #[test]
 fn call_time_argument_type_checks_still_apply() {
     let (core, _g) = new_core("sql66r-args");
-    let mut s = SessionState::default();
+    let mut s = ddl_session();
     define(
         &core,
         &mut s,
@@ -252,7 +260,7 @@ fn call_time_argument_type_checks_still_apply() {
 #[test]
 fn nested_returns_call_has_static_type() {
     let (core, _g) = new_core("sql66r-nested");
-    let mut s = SessionState::default();
+    let mut s = ddl_session();
     define(
         &core,
         &mut s,
@@ -311,18 +319,32 @@ fn ddl_session_validates_then_persists() {
         ),
         "42723"
     );
+    // 永続化された定義は別セッションがロードして呼べる。
+    let mut other = ddl_session();
+    core.load_session_udfs(&ctx_for("tenant-a"), &mut other)
+        .expect("load session udfs");
+    assert!(other.udfs().get("f").is_some());
+    let mut no_ddl = SessionState::default();
+    assert_eq!(
+        code(
+            &core,
+            &mut no_ddl,
+            "CREATE FUNCTION g(x integer) RETURNS integer AS x"
+        ),
+        "42501"
+    );
 }
 
 #[test]
 fn returns_udf_respects_session_boundary() {
     let (core, _g) = new_core("sql66r-rls");
-    let mut a = SessionState::default();
+    let mut a = ddl_session();
     define(
         &core,
         &mut a,
         "CREATE FUNCTION f(x integer) RETURNS integer AS x + 1",
     );
-    let mut b = SessionState::default();
+    let mut b = ddl_session();
     assert_eq!(
         run_as(&core, "tenant-b", &mut b, "SELECT f(1) FROM docs LIMIT 1").expect_err("err"),
         "42883"
@@ -332,7 +354,7 @@ fn returns_udf_respects_session_boundary() {
 #[test]
 fn declared_return_type_propagates_to_explicit_cast() {
     let (core, _g) = new_core("sql66r-cast");
-    let mut s = SessionState::default();
+    let mut s = ddl_session();
     define(&core, &mut s, "CREATE FUNCTION f() RETURNS integer AS 1");
     assert_eq!(
         first_cell(&core, &mut s, "SELECT f()::text FROM docs LIMIT 1"),

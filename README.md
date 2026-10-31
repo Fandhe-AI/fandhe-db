@@ -126,6 +126,7 @@ cargo run -p fandhe-db-wire-server -- --users <ユーザーストアのパス> -
   [--max-scanned-rows <1-1000000>] \
   [--max-group-by-columns <1-8>] [--max-groups <1-10000>] \
   [--max-temp-tables <1-64>] [--max-temp-bytes <1-67108864>] \
+  [--max-functions <1-64>] \
   [--max-jsonpath-steps <1-4000000>] [--max-jsonpath-depth <1-1024>] \
   [--max-regex-pattern-len <1-4096>] [--max-regex-input-len <1-4194304>] \
   [--max-regex-compiled-size <1-10485760>] \
@@ -427,6 +428,14 @@ NoSQL（HTTP）の `update`／`delete` は従来どおり filter 必須で、本
 一時表には永続表と同じ `INSERT`／`UPDATE`／`DELETE`／`TRUNCATE`／`SELECT`／`COPY`・制約・索引（`CREATE [UNIQUE] INDEX`）
 が使えます（Issue #1684）。書き込みは `operation_id` 台帳の対象外（`USING OPERATION_ID` は `0A000`）で、
 一時表と永続表を 1 文で参照する文・`ALTER TABLE`・カーソル・`VECTOR` 列は `0A000` です。
+
+`--max-functions <N>`（既定 64・範囲 `1`〜`64`）（Issue #1922・SQL-66 (5)）は、`CREATE FUNCTION` の件数上限を、
+プロセス全体に対して起動時に**下げる方向だけ**設定します（未指定は従来のハード上限 64 と同じで、挙動は変わりません）。
+DDL 権限のあるセッションのテナントごとのカタログ件数（型付き引数・RETURNS 付きを含む）に効き、
+超過時の SQLSTATE は `54000` です。
+DDL 権限の無いセッションの `CREATE FUNCTION`・`DROP FUNCTION` は `42501` で拒否されます。上限を下げて再起動しても、既存の関数は読み込まれて呼べます
+（新規の作成だけが拒否されます）。範囲外・非数値・値欠落・2 回目以降の重複指定は fail-closed で起動エラーです。
+上限を引き上げることはできません（詳細: [docs/design/udf-catalog.md](docs/design/udf-catalog.md)）。
 
 `--max-jsonpath-steps <N>`（既定 4,000,000・範囲 `1`〜`4,000,000`）・`--max-jsonpath-depth <N>`（既定 1,024・
 範囲 `1`〜`1,024`）（Issue #2184・TABLE-25）は、jsonpath 評価器の評価ステップ数と再帰深さの上限を、

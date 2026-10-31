@@ -284,6 +284,7 @@ fn reserved_name_and_udf_body() {
     let (core, _g) = fixture!("sql65-gl-udf");
     let ctx = ctx_for("tenant-a");
     let mut session = engine::sql::mode::SessionState::default();
+    session.allow_ddl();
     for name in ["greatest", "least"] {
         let err = core
             .execute_sql_in_session(

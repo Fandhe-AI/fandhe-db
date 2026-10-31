@@ -148,6 +148,14 @@
 //! `wire_server::temp_table_limits_opt::resolve` に一本化し、
 //! `EngineCore::with_temp_table_limits` へ 1 回だけ注入する。
 //!
+//! `--max-functions`（Issue #1922。SQL-66 (5)）: UDF（`CREATE FUNCTION`）の件数上限（`1`〜`64`）を、
+//! プロセス全体に対して起動時に**下げる方向だけ**設定できる opt-in 注入点（未指定は現行の
+//! ハード上限 `64` と同値＝挙動不変）。DDL 権限ありのカタログ（テナントごと）の件数に効き（型付き引数・RETURNS 付きを含む）、超過は `54000`
+//! （権限なしの `CREATE`／`DROP FUNCTION` は `42501`）。起動時のロードには適用しない（下げても既存の関数は呼べる）。
+//! 範囲外・非数値・値欠落・重複指定はいずれも fail-closed で起動エラー。値の解決は
+//! `wire_server::function_limits_opt::resolve` に一本化し、`EngineCore::with_function_limits` へ
+//! 1 回だけ注入する。
+//!
 //! `--max-jsonpath-steps`／`--max-jsonpath-depth`（Issue #2184。TABLE-25）: jsonpath 評価器の
 //! ステップ数（`1`〜`4000000`）・再帰深さ（`1`〜`1024`）の上限を、プロセス全体に対して
 //! 起動時に**下げる方向だけ**設定できる opt-in 注入点（未指定は評価器のハード上限と同値）。
@@ -488,6 +496,7 @@ fn run_server(args: &[String]) -> ExitCode {
     let mut max_group_by_columns_raw: Option<String> = None;
     let mut max_groups_raw: Option<String> = None;
     let mut max_temp_tables_raw: Option<String> = None;
+    let mut max_functions_raw: Option<String> = None;
     let mut max_temp_bytes_raw: Option<String> = None;
     let mut max_jsonpath_steps_raw: Option<String> = None;
     let mut max_jsonpath_depth_raw: Option<String> = None;
@@ -935,6 +944,26 @@ fn run_server(args: &[String]) -> ExitCode {
                     return ExitCode::FAILURE;
                 }
                 max_groups_raw = Some(v.clone());
+                i += 2;
+            }
+            wire_server::function_limits_opt::MAX_FUNCTIONS_FLAG => {
+                let Some(v) = args.get(i + 1) else {
+                    engine::log_stderr!(
+                        "wire-server: {} requires a non-negative integer argument",
+                        wire_server::function_limits_opt::MAX_FUNCTIONS_FLAG
+                    );
+                    return ExitCode::FAILURE;
+                };
+                // Issue #1922: 他の起動時構成フラグと同じく 2 回目以降の指定を
+                // fail-closed に拒否する（last-wins にしない）。
+                if max_functions_raw.is_some() {
+                    engine::log_stderr!(
+                        "wire-server: {} specified more than once",
+                        wire_server::function_limits_opt::MAX_FUNCTIONS_FLAG
+                    );
+                    return ExitCode::FAILURE;
+                }
+                max_functions_raw = Some(v.clone());
                 i += 2;
             }
             wire_server::temp_table_limits_opt::MAX_TEMP_TABLES_FLAG => {
@@ -1960,6 +1989,17 @@ fn run_server(args: &[String]) -> ExitCode {
         }
     };
 
+    // Issue #1922: UDF 件数上限を bind・ユーザーストア読込より前に解決する（fail-closed）。
+    // 未指定は `FunctionLimits::default()`＝ハード上限＝現行挙動。
+    let function_limits =
+        match wire_server::function_limits_opt::resolve(max_functions_raw.as_deref()) {
+            Ok(limits) => limits,
+            Err(e) => {
+                engine::log_stderr!("wire-server: invalid function limit configuration: {e}");
+                return ExitCode::FAILURE;
+            }
+        };
+
     // Issue #2184: jsonpath 評価のステップ数・再帰深さ上限を bind・ユーザーストア読込より
     // 前に解決する（fail-closed。範囲外・非数値は listen へ進まず起動エラー）。未指定は
     // `JsonPathLimits::default()`＝ハード上限。
@@ -2565,6 +2605,8 @@ fn run_server(args: &[String]) -> ExitCode {
     // Issue #1683: 未指定でも常に呼ぶ（`temp_table_limits` は既定まで解決済み。既定は
     // ハード上限と同値で、未注入と挙動が同一）。
     core = core.with_temp_table_limits(temp_table_limits);
+    // Issue #1922: 未指定でも常に呼ぶ（既定はハード上限と同値で、未注入と挙動が同一）。
+    core = core.with_function_limits(function_limits);
     // Issue #2184: 未指定でも常に呼ぶ（`jsonpath_limits` は既定まで解決済み。既定は
     // ハード上限と同値）。SQL 表層からの利用は Issue #2185 以降。
     core = core.with_jsonpath_limits(jsonpath_limits);
