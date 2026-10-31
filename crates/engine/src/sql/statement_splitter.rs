@@ -406,6 +406,162 @@ pub fn classify_statement(stmt: &str) -> StatementEffect {
     }
 }
 
+/// `calls_non_builtin_function` 用: `名前(` が構文語としての用法と確認できるか。確認できない
+/// （呼び出しとも読める）場合は `false`＝呼び出し扱い（`Write`＝fail-closed）。
+/// 構文語は予約されないため同名のユーザー関数が定義でき、構文位置でない `(` 直前の出現は呼び出しになる。
+///   - 中置語（`IN`・`ON`・`OR`・`IS`・`LIKE`・`BETWEEN`・`AS`・`USING`・`THEN`・`ELSE`・集合演算・
+///     `OFFSET`・`GROUP`・`HAVING`・`WITH`・`COLLATE`）: 直前が式の終端のときだけ構文
+///     （`NOT IN (` 等は `NOT` の更に前が式の終端のとき）
+///   - `NOT`: 述語の文脈語（`WHERE`・`AND`・`OR`・`HAVING`・`ON`・`WHEN`・`THEN`・`ELSE`）の直後だけ構文
+///   - `EXISTS`・`ARRAY`: 直後が副問い合わせ（`SELECT`／`WITH`／`VALUES`）のときだけ構文
+///   - `WHEN`: 直前が `CASE` か式の終端のときだけ構文
+///   - `EXTRACT`・`OVERLAY`: 引数内に `FROM`・`PLACING` の構文形があるときだけ構文
+///   - 窓関数名: 対応する `)` の直後が `OVER` のときだけ構文
+///   - `VALUES`・`DISTINCT`・`ROW`・`UNNEST`: 式の先頭の呼び出しと区別できないため常に呼び出し扱い
+///   - 上記以外（`JSON_EXISTS` 等の専用構文）は従来どおり構文語
+fn syntax_form_confirmed(
+    tokens: &[Token],
+    i: usize,
+    name: &str,
+    expr_prefix_words: &[&str],
+) -> bool {
+    let is = |w: &str| name.eq_ignore_ascii_case(w);
+    let ident_at = |idx: usize, words: &[&str]| {
+        matches!(
+            tokens.get(idx),
+            Some(Token::Ident(a)) if words.iter().any(|w| a.eq_ignore_ascii_case(w))
+        )
+    };
+    // 位置 `idx` の直前が式の終端（識別子・`)`・リテラル。式演算子語・句の語は除く）か。
+    let terminator_before = |idx: usize| {
+        idx > 0
+            && match tokens.get(idx - 1) {
+                Some(Token::Punct(')'))
+                | Some(Token::QualifiedIdent { .. })
+                | Some(Token::Number(_))
+                | Some(Token::StringLiteral(_)) => true,
+                Some(Token::Ident(a)) => {
+                    !expr_prefix_words.iter().any(|w| a.eq_ignore_ascii_case(w))
+                }
+                _ => false,
+            }
+    };
+    let subquery_follows = matches!(
+        tokens.get(i.saturating_add(2)),
+        Some(Token::Keyword(Keyword::Select))
+    ) || ident_at(i.saturating_add(2), &["WITH", "VALUES"]);
+    // `(` に対応する `)` の位置（なければ `None`）。
+    let matching_close = || {
+        let mut depth = 0usize;
+        for (j, tk) in tokens.iter().enumerate().skip(i.saturating_add(1)) {
+            match tk {
+                Token::Punct('(') => depth = depth.saturating_add(1),
+                Token::Punct(')') => {
+                    depth = depth.saturating_sub(1);
+                    if depth == 0 {
+                        return Some(j);
+                    }
+                }
+                _ => {}
+            }
+        }
+        None
+    };
+    if is("VALUES") || is("DISTINCT") || is("ROW") || is("UNNEST") {
+        return false;
+    }
+    if is("NOT") {
+        return i > 0
+            && (matches!(
+                tokens.get(i - 1),
+                Some(Token::Keyword(Keyword::Where)) | Some(Token::Keyword(Keyword::And))
+            ) || ident_at(i - 1, &["OR", "HAVING", "ON", "WHEN", "THEN", "ELSE"]));
+    }
+    if is("EXISTS") || is("ARRAY") {
+        return subquery_follows;
+    }
+    if is("WHEN") {
+        return (i > 0 && ident_at(i - 1, &["CASE"])) || terminator_before(i);
+    }
+    if is("EXTRACT") || is("OVERLAY") {
+        let target = if is("EXTRACT") { "FROM" } else { "PLACING" };
+        let Some(close) = matching_close() else {
+            return false;
+        };
+        let mut depth = 0usize;
+        return tokens
+            .iter()
+            .enumerate()
+            .skip(i.saturating_add(2))
+            .take_while(|(j, _)| *j < close)
+            .any(|(_, tk)| match tk {
+                Token::Punct('(') => {
+                    depth = depth.saturating_add(1);
+                    false
+                }
+                Token::Punct(')') => {
+                    depth = depth.saturating_sub(1);
+                    false
+                }
+                Token::Ident(a) => depth == 0 && a.eq_ignore_ascii_case(target),
+                Token::Keyword(Keyword::From) => depth == 0 && target == "FROM",
+                _ => false,
+            });
+    }
+    if [
+        "ROW_NUMBER",
+        "RANK",
+        "DENSE_RANK",
+        "PERCENT_RANK",
+        "CUME_DIST",
+        "NTILE",
+        "LAG",
+        "LEAD",
+        "FIRST_VALUE",
+        "LAST_VALUE",
+        "NTH_VALUE",
+    ]
+    .iter()
+    .any(|w| is(w))
+    {
+        return matching_close().is_some_and(|close| ident_at(close.saturating_add(1), &["OVER"]));
+    }
+    if [
+        "IN",
+        "ON",
+        "OR",
+        "IS",
+        "LIKE",
+        "ILIKE",
+        "BETWEEN",
+        "AS",
+        "USING",
+        "THEN",
+        "ELSE",
+        "UNION",
+        "INTERSECT",
+        "EXCEPT",
+        "OFFSET",
+        "GROUP",
+        "HAVING",
+        "WITH",
+        "COLLATE",
+    ]
+    .iter()
+    .any(|w| is(w))
+    {
+        if terminator_before(i) {
+            return true;
+        }
+        // `a NOT IN (` / `a NOT LIKE (` / `a IS NOT (` の `NOT` を挟む形。
+        return i > 0
+            && ident_at(i - 1, &["NOT"])
+            && (is("IN") || is("LIKE") || is("ILIKE") || is("BETWEEN") || is("IS"))
+            && terminator_before(i - 1);
+    }
+    true
+}
+
 /// `(` の直前の語が構文上の語（`IN`・`AS`・`OVER` 等）でも組み込み関数名でもない呼び出しを含むか
 /// （ユーザー定義関数の呼び出しの保守的な検出。構文語の取りこぼしは `Write` 側へ倒れるだけ）。
 fn calls_non_builtin_function(tokens: &[Token]) -> bool {
@@ -622,8 +778,15 @@ fn calls_non_builtin_function(tokens: &[Token]) -> bool {
                     _ => false,
                 }
         };
+        // 上記以外の構文語（`ON`・`IN`・`OR`・`NOT`・`EXISTS`・`VALUES`・`WHEN`・`EXTRACT`・窓関数名 等）も
+        // 予約語ではなく、同名のユーザー関数を定義して式の先頭位置（`SELECT on()` 等）から呼べる。
+        // 位置・形から構文と確認できる場合に限り除外し、確認できなければ呼び出し（`Write`）とする。
         let is_syntax_word = SYNTAX_WORDS.iter().any(|k| name.eq_ignore_ascii_case(k))
-            && (!is_contextual_word || positional_confirmed);
+            && if is_contextual_word {
+                positional_confirmed
+            } else {
+                syntax_form_confirmed(tokens, i, name, EXPR_PREFIX_WORDS)
+            };
         if is_using_plan
             || is_contextual_syntax
             || is_type_modifier
@@ -1175,6 +1338,15 @@ mod tests {
             "SELECT count(*) FILTER (WHERE a > 1) FROM t",
             "SELECT a FROM t JOIN (SELECT a FROM u) x ON t.a = x.a",
             "SELECT a FROM t, LATERAL (SELECT a FROM u) x",
+            "SELECT a FROM t JOIN u ON (t.a = u.a)",
+            "SELECT a FROM t WHERE a NOT IN (1, 2) OR (a = 3)",
+            "SELECT a FROM t WHERE EXISTS (SELECT 1 FROM u) AND NOT (a = 1)",
+            "SELECT CASE WHEN (a = 1) THEN (2) ELSE (3) END FROM t",
+            "SELECT a FROM t UNION (SELECT a FROM u)",
+            "SELECT a FROM t JOIN u USING (a)",
+            "SELECT a FROM t GROUP BY a HAVING (count(*) > 1)",
+            "SELECT a FROM t LIMIT 1 OFFSET (1)",
+            "SELECT ntile(2) OVER (ORDER BY a), lag(a) OVER (ORDER BY a) FROM t",
         ] {
             assert_eq!(classify_statement(sql), StatementEffect::ReadOnly, "{sql}");
         }
@@ -1207,6 +1379,14 @@ mod tests {
             "SELECT a FROM t WHERE to(a) = 1",
             "SELECT DISTINCT join()",
             "SELECT a FROM t WHERE a > 0 AND left_()",
+            "SELECT on()",
+            "SELECT in(1), or(1), is(1), like(1), ilike(1), between(1)",
+            "SELECT a FROM t WHERE a = on(1)",
+            "SELECT not(1), exists(1), values(1), when(1), then(1), else(1)",
+            "SELECT distinct(1), row(1), unnest(1), with(1), union(1), offset(1)",
+            "SELECT extract(1), overlay(1), row_number(), rank(), lag(1)",
+            "SELECT using(1), group(1), having(1), collate(1), intersect(1), except(1)",
+            "SELECT a FROM t WHERE a = 1 AND in(1)",
         ] {
             assert_eq!(classify_statement(sql), StatementEffect::Write, "{sql}");
         }
