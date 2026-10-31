@@ -14,8 +14,9 @@
 
 use crate::sql::allowlist::{InsertLiteral, SqlSurfaceError};
 use crate::sql::udf_call::{
-    bind_const_expr, bind_const_expr_array_top, eval, first_non_builtin_call_with, BinOp,
-    BoundExpr, Expr, ExprType, ExprValue, UdfRegistry, MAX_EXPR_NODES,
+    bind_const_expr_array_top_mode, bind_const_expr_mode, contains_typed_numeric, eval,
+    first_non_builtin_call_with, BinOp, BoundExpr, Expr, ExprType, ExprValue, UdfRegistry,
+    MAX_EXPR_NODES,
 };
 
 /// 仮値評価で起きたエラーの遅延方針（Issue #1546）。
@@ -242,7 +243,7 @@ fn prescan(expr: &Expr) -> Result<(), SqlSurfaceError> {
 /// 中間で丸められた値が最終結果の範囲検査を通過して誤った整数になるのを `22003` で
 /// 防ぐ（fail-closed）。サブ式の評価エラーは（実行されない CASE 分岐等で偽陽性に
 /// ならないよう）ここでは無視し、最終評価側に報告させる。
-fn check_intermediate_precision(expr: &Expr) -> Result<(), SqlSurfaceError> {
+fn check_intermediate_precision(expr: &Expr, numeric: bool) -> Result<(), SqlSurfaceError> {
     let out_of_range =
         || SqlSurfaceError::numeric_out_of_range("constant expression loses integer precision");
     match expr {
@@ -265,7 +266,7 @@ fn check_intermediate_precision(expr: &Expr) -> Result<(), SqlSurfaceError> {
         | Expr::TimeLiteral(_)
         | Expr::TimestampTzLiteral { .. }
         | Expr::ValueFunction { .. } => Ok(()),
-        Expr::Collate { expr, .. } => check_intermediate_precision(expr),
+        Expr::Collate { expr, .. } => check_intermediate_precision(expr, numeric),
         // 到達しない（`prescan` が拒否済み）。
         Expr::SqlJsonQuery(_) | Expr::Cast { .. } => Ok(()),
         // 配列の要素・添字は子ごとに精度を検査する（要素値の範囲は配列の構築側が検査する）。
@@ -273,15 +274,25 @@ fn check_intermediate_precision(expr: &Expr) -> Result<(), SqlSurfaceError> {
             .array_expr_children()
             .into_iter()
             .flatten()
-            .try_for_each(check_intermediate_precision),
+            .try_for_each(|c| check_intermediate_precision(c, numeric)),
+        // Issue #2799: 型付き NUMERIC 値の raw 数値は 2^53 を超えてよい（Decimal で正確に運ぶ）ため、
+        // f64 前提の桁検査を適用しない。
+        Expr::Call { name, .. } if crate::sql::udf_call::is_typed_numeric_name(name) => Ok(()),
         Expr::Call { args, .. } => {
-            args.iter().try_for_each(check_intermediate_precision)?;
-            check_node_value(expr, true)
+            args.iter()
+                .try_for_each(|c| check_intermediate_precision(c, numeric))?;
+            check_node_value(expr, true, numeric)
         }
+        // Issue #2799: NUMERIC 算術（結果が Numeric に束縛される二項演算）は f64 を経由しないため、
+        // 直下の数値リテラルの桁検査と f64 専用の結果検査を省き、非リテラルの子だけ再帰する。
+        Expr::Binary { lhs, rhs, .. } if numeric && binds_to_numeric(expr) => [lhs, rhs]
+            .into_iter()
+            .filter(|c| !matches!(&***c, Expr::Number(_)))
+            .try_for_each(|c| check_intermediate_precision(c, numeric)),
         Expr::Binary { lhs, rhs, .. } => {
-            check_intermediate_precision(lhs)?;
-            check_intermediate_precision(rhs)?;
-            check_node_value(expr, true)
+            check_intermediate_precision(lhs, numeric)?;
+            check_intermediate_precision(rhs, numeric)?;
+            check_node_value(expr, true, numeric)
         }
         // jsonb パス演算子は列参照を要し、定数式では `prescan` が列参照として拒否する。
         Expr::JsonAccess { .. } => Ok(()),
@@ -290,8 +301,8 @@ fn check_intermediate_precision(expr: &Expr) -> Result<(), SqlSurfaceError> {
         | Expr::RegexMatch {
             lhs, pattern: rhs, ..
         } => {
-            check_intermediate_precision(lhs)?;
-            check_intermediate_precision(rhs)
+            check_intermediate_precision(lhs, numeric)?;
+            check_intermediate_precision(rhs, numeric)
         }
         // COALESCE は短絡評価（`udf_call::eval` と同じ）に沿い、評価される引数
         // （最初の非 NULL まで）だけを検査する。未評価引数の巨大値で偽陽性にしない。
@@ -300,8 +311,8 @@ fn check_intermediate_precision(expr: &Expr) -> Result<(), SqlSurfaceError> {
                 if matches!(a, Expr::Null) {
                     continue;
                 }
-                check_intermediate_precision(a)?;
-                if !matches!(eval_node(a), Some(ExprValue::Null)) {
+                check_intermediate_precision(a, numeric)?;
+                if !matches!(eval_node(a, numeric), Some(ExprValue::Null)) {
                     break;
                 }
             }
@@ -311,39 +322,49 @@ fn check_intermediate_precision(expr: &Expr) -> Result<(), SqlSurfaceError> {
         // 条件が評価不能なら以降は最終評価側に報告させる。
         Expr::Case { whens, else_result } => {
             for (c, r) in whens {
-                check_intermediate_precision(c)?;
-                match eval_node(c) {
-                    Some(ExprValue::Bool(true)) => return check_intermediate_precision(r),
+                check_intermediate_precision(c, numeric)?;
+                match eval_node(c, numeric) {
+                    Some(ExprValue::Bool(true)) => return check_intermediate_precision(r, numeric),
                     Some(ExprValue::Bool(false) | ExprValue::Null) => {}
                     _ => return Ok(()),
                 }
             }
             match else_result {
-                Some(e) => check_intermediate_precision(e),
+                Some(e) => check_intermediate_precision(e, numeric),
                 None => Ok(()),
             }
         }
     }
 }
 
+/// NUMERIC 算術モードで `expr` が Numeric 型に束縛されるか（束縛不能は `false`）。
+fn binds_to_numeric(expr: &Expr) -> bool {
+    let registry = UdfRegistry::default();
+    let mut budget = MAX_EXPR_NODES;
+    matches!(
+        bind_const_expr_mode(expr, &registry, &mut budget, true),
+        Ok((_, ExprType::Numeric, _))
+    )
+}
+
 /// 1 ノードを束縛・評価する（束縛・評価不能は `None`。短絡判定専用）。
-fn eval_node(expr: &Expr) -> Option<ExprValue<'static>> {
+fn eval_node(expr: &Expr, numeric: bool) -> Option<ExprValue<'static>> {
     let registry = UdfRegistry::default();
     let mut budget = MAX_EXPR_NODES;
     // 裸の NULL を含む式は型付き NULL へ畳んでから束縛し、短絡判定に使えるようにする。
-    let folded = propagate_null(expr).ok()?;
-    let (bound, _ty, _) = bind_const_expr(&folded, &registry, &mut budget).ok()?;
+    let folded = propagate_null(expr, numeric).ok()?;
+    let (bound, _ty, _) = bind_const_expr_mode(&folded, &registry, &mut budget, numeric).ok()?;
     eval(&bound, 0, &[]).ok()
 }
 
 /// 1 ノードを単独評価し、スカラ結果が 2^53 以上なら `22003`（評価不能は無視）。
-fn check_node_value(expr: &Expr, enabled: bool) -> Result<(), SqlSurfaceError> {
+fn check_node_value(expr: &Expr, enabled: bool, numeric: bool) -> Result<(), SqlSurfaceError> {
     if !enabled {
         return Ok(());
     }
     let registry = UdfRegistry::default();
     let mut budget = MAX_EXPR_NODES;
-    let Ok((bound, _ty, _)) = bind_const_expr(expr, &registry, &mut budget) else {
+    let Ok((bound, _ty, _)) = bind_const_expr_mode(expr, &registry, &mut budget, numeric) else {
         return Ok(());
     };
     if let Ok(ExprValue::Scalar(v)) = eval(&bound, 0, &[]) {
@@ -495,13 +516,14 @@ fn interval_preference(
     op: BinOp,
     other: &Expr,
     other_null: Option<Option<ExprType>>,
+    numeric: bool,
 ) -> Option<ExprType> {
     if other_null.is_some() || !matches!(op, BinOp::Add | BinOp::Sub) {
         return None;
     }
     let registry = UdfRegistry::default();
     let mut budget = MAX_EXPR_NODES;
-    match bind_const_expr(other, &registry, &mut budget) {
+    match bind_const_expr_mode(other, &registry, &mut budget, numeric) {
         Ok((_, ExprType::Interval, _)) => Some(ExprType::Interval),
         _ => None,
     }
@@ -519,10 +541,11 @@ fn fold_null_binary(
     r: &Expr,
     ln: Option<Option<ExprType>>,
     rn: Option<Option<ExprType>>,
+    numeric: bool,
 ) -> Result<Expr, SqlSurfaceError> {
     let mut first_err: Option<SqlSurfaceError> = None;
-    let lpref = interval_preference(op, r, rn);
-    let rpref = interval_preference(op, l, ln);
+    let lpref = interval_preference(op, r, rn, numeric);
+    let rpref = interval_preference(op, l, ln, numeric);
     for lhs in operand_options(l, ln, lpref) {
         for rhs in operand_options(r, rn, rpref) {
             let probe = Expr::Binary {
@@ -532,7 +555,7 @@ fn fold_null_binary(
             };
             let registry = UdfRegistry::default();
             let mut budget = MAX_EXPR_NODES;
-            match bind_const_expr(&probe, &registry, &mut budget) {
+            match bind_const_expr_mode(&probe, &registry, &mut budget, numeric) {
                 Ok((_, ty, _)) => {
                     return if ln.is_some() && rn.is_some() {
                         typed_null(ty)
@@ -555,7 +578,7 @@ fn fold_null_binary(
 /// そのまま束縛できれば（`CONCAT` 等）変更しない。束縛できなければ裸の `NULL` 位置ごとに
 /// 型候補を順に試し（組み合わせ数は [`MAX_NULL_ARG_PROBES`] で打ち切る）、最初に束縛
 /// できた組を採る。他の引数は式のまま残すため、その評価エラーは最終評価で伝播する。
-fn fold_null_call(name: &str, args: Vec<Expr>) -> Result<Expr, SqlSurfaceError> {
+fn fold_null_call(name: &str, args: Vec<Expr>, numeric: bool) -> Result<Expr, SqlSurfaceError> {
     let try_bind = |args: &[Expr]| {
         let probe = Expr::Call {
             name: name.to_string(),
@@ -563,7 +586,7 @@ fn fold_null_call(name: &str, args: Vec<Expr>) -> Result<Expr, SqlSurfaceError> 
         };
         let registry = UdfRegistry::default();
         let mut budget = MAX_EXPR_NODES;
-        bind_const_expr(&probe, &registry, &mut budget).map(|_| probe)
+        bind_const_expr_mode(&probe, &registry, &mut budget, numeric).map(|_| probe)
     };
     if !args.iter().any(|a| matches!(a, Expr::Null)) {
         return Ok(Expr::Call {
@@ -610,14 +633,14 @@ fn fold_null_call(name: &str, args: Vec<Expr>) -> Result<Expr, SqlSurfaceError> 
 /// （3 値論理の NULL 伝播。束縛器は型を決められない裸の `NULL` を `0A000` で
 /// 拒否するため、束縛前に定数として確定させる）。CASE／COALESCE／NULLIF 内の
 /// `NULL` は束縛器が扱うのでそのまま残す。
-fn propagate_null(expr: &Expr) -> Result<Expr, SqlSurfaceError> {
+fn propagate_null(expr: &Expr, numeric: bool) -> Result<Expr, SqlSurfaceError> {
     Ok(match expr {
         Expr::Binary { op, lhs, rhs } => {
-            let l = propagate_null(lhs)?;
-            let r = propagate_null(rhs)?;
+            let l = propagate_null(lhs, numeric)?;
+            let r = propagate_null(rhs, numeric)?;
             let (ln, rn) = (null_kind(&l), null_kind(&r));
             if ln.is_some() || rn.is_some() {
-                fold_null_binary(*op, &l, &r, ln, rn)?
+                fold_null_binary(*op, &l, &r, ln, rn, numeric)?
             } else {
                 Expr::Binary {
                     op: *op,
@@ -628,40 +651,51 @@ fn propagate_null(expr: &Expr) -> Result<Expr, SqlSurfaceError> {
         }
         Expr::Call { name, args } => fold_null_call(
             name,
-            args.iter().map(propagate_null).collect::<Result<_, _>>()?,
+            args.iter()
+                .map(|a| propagate_null(a, numeric))
+                .collect::<Result<_, _>>()?,
+            numeric,
         )?,
-        Expr::Coalesce(args) => {
-            Expr::Coalesce(args.iter().map(propagate_null).collect::<Result<_, _>>()?)
-        }
-        Expr::NullIf(l, r) => {
-            Expr::NullIf(Box::new(propagate_null(l)?), Box::new(propagate_null(r)?))
-        }
+        Expr::Coalesce(args) => Expr::Coalesce(
+            args.iter()
+                .map(|a| propagate_null(a, numeric))
+                .collect::<Result<_, _>>()?,
+        ),
+        Expr::NullIf(l, r) => Expr::NullIf(
+            Box::new(propagate_null(l, numeric)?),
+            Box::new(propagate_null(r, numeric)?),
+        ),
         Expr::Case { whens, else_result } => Expr::Case {
             whens: whens
                 .iter()
-                .map(|(c, r)| Ok((propagate_null(c)?, propagate_null(r)?)))
+                .map(|(c, r)| Ok((propagate_null(c, numeric)?, propagate_null(r, numeric)?)))
                 .collect::<Result<_, SqlSurfaceError>>()?,
             else_result: match else_result {
-                Some(e) => Some(Box::new(propagate_null(e)?)),
+                Some(e) => Some(Box::new(propagate_null(e, numeric)?)),
                 None => None,
             },
         },
         // 配列コンストラクタ・添字（TABLE-35・Issue #1602）。要素・添字の中の `NULL` を含む
         // 演算だけを型付き `NULL` へ畳み、裸の `NULL` 要素はそのまま残す（束縛器が共通型へ解決する）。
-        Expr::ArrayConstructor(items) => {
-            Expr::ArrayConstructor(items.iter().map(propagate_null).collect::<Result<_, _>>()?)
-        }
+        Expr::ArrayConstructor(items) => Expr::ArrayConstructor(
+            items
+                .iter()
+                .map(|a| propagate_null(a, numeric))
+                .collect::<Result<_, _>>()?,
+        ),
         Expr::Subscript { base, subscript } => {
             use crate::sql::udf_call::ArraySubscript;
             let opt = |b: &Option<Box<Expr>>| -> Result<Option<Box<Expr>>, SqlSurfaceError> {
                 b.as_deref()
-                    .map(|e| propagate_null(e).map(Box::new))
+                    .map(|e| propagate_null(e, numeric).map(Box::new))
                     .transpose()
             };
             Expr::Subscript {
-                base: Box::new(propagate_null(base)?),
+                base: Box::new(propagate_null(base, numeric)?),
                 subscript: match subscript {
-                    ArraySubscript::Index(i) => ArraySubscript::Index(Box::new(propagate_null(i)?)),
+                    ArraySubscript::Index(i) => {
+                        ArraySubscript::Index(Box::new(propagate_null(i, numeric)?))
+                    }
                     ArraySubscript::Slice { lo, hi } => ArraySubscript::Slice {
                         lo: opt(lo)?,
                         hi: opt(hi)?,
@@ -676,6 +710,9 @@ fn propagate_null(expr: &Expr) -> Result<Expr, SqlSurfaceError> {
 /// 列参照を含まない式を評価して [`InsertLiteral`] へ畳み込む。
 pub(crate) fn fold_const_literal(expr: &Expr) -> Result<InsertLiteral, SqlSurfaceError> {
     prescan(expr)?;
+    // Issue #2799: 内部専用の型付き NUMERIC 値を含む式だけ NUMERIC 算術モードで束縛する。
+    // 含まない式の束縛経路は従来と同一（int・float の畳み込みの挙動を変えない）。
+    let numeric = contains_typed_numeric(expr);
     if first_non_builtin_call_with(expr, false, true).is_some() {
         return Err(SqlSurfaceError::unsupported(
             "only built-in functions are allowed in a constant expression",
@@ -684,15 +721,15 @@ pub(crate) fn fold_const_literal(expr: &Expr) -> Result<InsertLiteral, SqlSurfac
     // 最終評価は NULL 伝播（型付き NULL への畳み込み）後の式で行う。
     // 精度検査は NULL 畳み込み前の元の式に対し短絡評価で選ばれた枝だけで行う
     // （畳み込みは型検証専用。未評価枝の精度欠落を 22003 にしない）。
-    check_intermediate_precision(expr)?;
-    let propagated = propagate_null(expr)?;
+    check_intermediate_precision(expr, numeric)?;
+    let propagated = propagate_null(expr, numeric)?;
     if matches!(propagated, Expr::Null) {
         return Ok(InsertLiteral::Null);
     }
     let expr = &propagated;
     let registry = UdfRegistry::default();
     let mut budget = MAX_EXPR_NODES;
-    let (bound, _ty, _) = bind_const_expr_array_top(expr, &registry, &mut budget)?;
+    let (bound, _ty, _) = bind_const_expr_array_top_mode(expr, &registry, &mut budget, numeric)?;
     if crate::sql::udf_call::references_embedding(&bound) || matches!(bound, BoundExpr::IdRef) {
         return Err(SqlSurfaceError::Internal {
             detail: "constant expression resolved to a row reference".to_string(),
@@ -746,11 +783,31 @@ pub(crate) fn fold_const_literal(expr: &Expr) -> Result<InsertLiteral, SqlSurfac
                     "constant array expression exceeds the maximum array literal length",
                 )
             }),
-        ExprValue::Numeric(_) | ExprValue::Uuid(_) | ExprValue::Bytes(_) => {
-            Err(SqlSurfaceError::unsupported(
-                "a value produced by CAST is not allowed in a constant expression",
-            ))
-        }
+        // Issue #2799: NUMERIC 値は正規テキストの数値リテラルへ戻し、列側のリテラル束縛が列型で
+        // 解釈し直す（Date・Interval と同じ前例。`InsertLiteral` を増やさないため content_hash・
+        // DDL・wire は不変）。整数値は整数表記へ正規化する（`4 / 2` が INTEGER 列へ入る）。
+        // `numeric` モードでしか生成されない（`CAST` は `prescan` が拒否済み）。
+        ExprValue::Numeric(d) => numeric_literal_text(&d).map(InsertLiteral::Number),
+        ExprValue::Uuid(_) | ExprValue::Bytes(_) => Err(SqlSurfaceError::unsupported(
+            "a value produced by CAST is not allowed in a constant expression",
+        )),
+    }
+}
+
+/// NUMERIC 値の数値リテラルテキスト。小数部がすべて 0 なら整数表記（f64 側の畳み込みと同じ規則）、
+/// それ以外は `Decimal` の正規テキスト（scale を保つ）。
+fn numeric_literal_text(d: &crate::numeric::Decimal) -> Result<String, SqlSurfaceError> {
+    let internal = || SqlSurfaceError::Internal {
+        detail: "numeric scale out of range".to_string(),
+    };
+    let divisor = 10i128
+        .checked_pow(u32::from(d.scale()))
+        .ok_or_else(internal)?;
+    if d.unscaled().checked_rem(divisor) == Some(0) {
+        let int = d.unscaled().checked_div(divisor).ok_or_else(internal)?;
+        Ok(int.to_string())
+    } else {
+        Ok(d.to_string())
     }
 }
 
@@ -1085,5 +1142,108 @@ mod tests {
             fold_const_literal(&call("abs", vec![bin(BinOp::Div, num("1"), num("0"))])),
             Err(SqlSurfaceError::DivisionByZero { .. })
         ));
+    }
+
+    // ---- Issue #2799: 型付き NUMERIC 値の算術（SQL-24・SQL-68 ポインタ） ----
+
+    fn n(raw: &str) -> Expr {
+        crate::sql::udf_call::typed_value_expr("$typed:numeric", raw.to_string())
+    }
+    fn fold_text(e: &Expr) -> String {
+        match fold_const_literal(e).expect("fold") {
+            InsertLiteral::Number(t) => t,
+            other => panic!("unexpected literal {other:?}"),
+        }
+    }
+    fn fold_code(e: &Expr) -> &'static str {
+        fold_const_literal(e).expect_err("must fail").wire_code()
+    }
+
+    #[test]
+    fn numeric_arith_keeps_pg_scale_rules() {
+        // PostgreSQL: 3::numeric / 2 = 1.5000000000000000
+        assert_eq!(
+            fold_text(&bin(BinOp::Div, n("3"), num("2"))),
+            "1.5000000000000000"
+        );
+        // 割り切れる値は整数表記へ正規化する。
+        assert_eq!(fold_text(&bin(BinOp::Div, n("4"), num("2"))), "2");
+        assert_eq!(fold_text(&bin(BinOp::Add, n("1.25"), num("1"))), "2.25");
+        assert_eq!(fold_text(&bin(BinOp::Add, n("0.1"), num("0.2"))), "0.3");
+        assert_eq!(fold_text(&bin(BinOp::Mul, n("-3"), num("2"))), "-6");
+        assert_eq!(fold_text(&bin(BinOp::Add, num("1"), n("1.5"))), "2.5");
+        assert_eq!(
+            fold_text(&bin(BinOp::Add, n("100000000000000000000"), num("1"))),
+            "100000000000000000001"
+        );
+        assert_eq!(
+            fold_text(&bin(
+                BinOp::Add,
+                bin(BinOp::Div, n("3"), num("2")),
+                num("1")
+            )),
+            "2.5000000000000000"
+        );
+    }
+
+    #[test]
+    fn numeric_arith_errors_and_nulls() {
+        assert_eq!(fold_code(&bin(BinOp::Div, n("1"), num("0"))), "22012");
+        let big = "9".repeat(38);
+        assert_eq!(fold_code(&bin(BinOp::Mul, n(&big), num("10"))), "22003");
+        let r = fold_const_literal(&bin(BinOp::Div, n("3"), Expr::Null));
+        assert!(matches!(r, Ok(InsertLiteral::Null)), "{r:?}");
+        assert_eq!(
+            fold_text(&bin(
+                BinOp::Div,
+                Expr::Coalesce(vec![Expr::Null, n("3")]),
+                num("2")
+            )),
+            "1.5000000000000000"
+        );
+        let case = Expr::Case {
+            whens: vec![(
+                bin(BinOp::Gt, num("1"), num("0")),
+                bin(BinOp::Add, n("3"), num("1")),
+            )],
+            else_result: Some(Box::new(num("1"))),
+        };
+        assert_eq!(fold_text(&case), "4");
+    }
+
+    #[test]
+    fn numeric_arith_mixing_is_fail_closed() {
+        let f8 = crate::sql::udf_call::typed_value_expr("$typed:float8", "1.5".to_string());
+        assert_eq!(fold_code(&bin(BinOp::Add, f8, n("1"))), "0A000");
+        let i4 = crate::sql::udf_call::typed_value_expr("$typed:int4", "2".to_string());
+        assert_eq!(fold_text(&bin(BinOp::Add, i4, n("1.5"))), "3.5");
+        let code = fold_code(&call("abs", vec![n("3")]));
+        assert!(matches!(code, "0A000" | "42883"), "{code}");
+    }
+
+    #[test]
+    fn numeric_context_big_literal_under_non_binary_parent_is_fail_closed() {
+        // 二項演算の直下以外の巨大整数リテラルは束縛側が f64 で受けるため、numeric 文脈でも
+        // 非 numeric 文脈でも 22003 で拒否する（fail-closed。誤った丸め値を返さない）。
+        let big = "100000000000000000000";
+        let case = Expr::Case {
+            whens: vec![(bin(BinOp::Gt, num("1"), num("0")), num(big))],
+            else_result: Some(Box::new(num("1"))),
+        };
+        assert_eq!(fold_code(&bin(BinOp::Add, n("1"), case.clone())), "22003");
+        assert_eq!(fold_code(&case), "22003");
+        let co = Expr::Coalesce(vec![Expr::Null, num(big)]);
+        assert_eq!(fold_code(&bin(BinOp::Add, n("1"), co.clone())), "22003");
+        assert_eq!(fold_code(&co), "22003");
+    }
+
+    #[test]
+    fn expressions_without_typed_numeric_are_unchanged() {
+        assert_eq!(fold_text(&bin(BinOp::Div, num("7"), num("2"))), "3");
+        assert_eq!(fold_text(&bin(BinOp::Mul, num("1.5"), num("2"))), "3");
+        assert_eq!(
+            fold_text(&bin(BinOp::Add, num("0.1"), num("0.2"))),
+            "0.30000000000000004"
+        );
     }
 }
