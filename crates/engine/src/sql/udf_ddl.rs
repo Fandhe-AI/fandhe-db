@@ -15,13 +15,16 @@
 //! 原文を含めない。
 
 use crate::catalog::function::{
-    FunctionAttributes, FunctionDef, FunctionLanguage, FunctionParam, FunctionType,
-    FUNCTION_ALREADY_EXISTS_MESSAGE, FUNCTION_AMBIGUOUS_MESSAGE,
+    FunctionAttributes, FunctionDef, FunctionLanguage, FunctionParam, FunctionType, Parallel,
+    Volatility, FUNCTION_ALREADY_EXISTS_MESSAGE, FUNCTION_AMBIGUOUS_MESSAGE,
     FUNCTION_CANNOT_CHANGE_PARAM_NAME_MESSAGE, FUNCTION_CANNOT_CHANGE_RETURN_TYPE_MESSAGE,
     FUNCTION_RECURSIVE_MESSAGE,
 };
 use crate::catalog::CatalogError;
-use crate::sql::allowlist::{DropFunctionBehavior, SqlSurfaceError, ValidatedDropFunction};
+use crate::sql::allowlist::{
+    DropFunctionBehavior, FunctionAttributeClauses, FunctionLanguageClause, FunctionParallelClause,
+    FunctionVolatilityClause, SqlSurfaceError, ValidatedDropFunction,
+};
 use crate::sql::cast::CastType;
 use crate::sql::mode::SessionState;
 use crate::sql::udf_call::{
@@ -81,6 +84,7 @@ pub(crate) fn udf_cast_from_function_type(ft: &FunctionType) -> Option<CastType>
 fn catalog_def_from_prepared(
     prepared: &PreparedUdf,
     body_source: &str,
+    attrs: &FunctionAttributes,
 ) -> Result<FunctionDef, SqlSurfaceError> {
     let params = prepared
         .params
@@ -104,8 +108,34 @@ fn catalog_def_from_prepared(
             .transpose()?,
         language: FunctionLanguage::Declarative,
         body_source: body_source.to_string(),
-        attrs: FunctionAttributes::default(),
+        attrs: attrs.clone(),
     })
+}
+
+/// 構文段の属性句（[`FunctionAttributeClauses`]）をカタログの保存値へ写す（Issue #2217・SQL-67 (3)）。
+/// 未指定の項目はカタログ既定（`VOLATILE`・`CALLED ON NULL INPUT`・`PARALLEL UNSAFE`）になる。
+/// `SECURITY`・`ROWS` は構文段が `SECURITY INVOKER` 以外・集合返却なしの `ROWS` を拒否済みで、ここへ来ない。
+pub(crate) fn function_attributes_from_clauses(
+    clauses: &FunctionAttributeClauses,
+) -> FunctionAttributes {
+    let mut attrs = FunctionAttributes::default();
+    if let Some(v) = clauses.volatility() {
+        attrs.volatility = match v {
+            FunctionVolatilityClause::Immutable => Volatility::Immutable,
+            FunctionVolatilityClause::Stable => Volatility::Stable,
+            FunctionVolatilityClause::Volatile => Volatility::Volatile,
+        };
+    }
+    attrs.strict = clauses.strict().unwrap_or(false);
+    if let Some(v) = clauses.parallel() {
+        attrs.parallel = match v {
+            FunctionParallelClause::Unsafe => Parallel::Unsafe,
+            FunctionParallelClause::Restricted => Parallel::Restricted,
+            FunctionParallelClause::Safe => Parallel::Safe,
+        };
+    }
+    attrs.cost = clauses.cost();
+    attrs
 }
 
 /// 永続定義がセッション限定の関数（カタログ由来でない宣言的 UDF・WASM UDF）へ直接・推移的に依存する
@@ -158,6 +188,7 @@ pub(crate) fn execute_create_function_persistent(
     body: &crate::sql::udf_call::Expr,
     body_source: &str,
     max_functions: usize,
+    attrs: &FunctionAttributes,
 ) -> Result<(), SqlSurfaceError> {
     // 判定順（設計文書）は 重複 → 件数 → 引数数 → 本体。カタログ側の重複・件数は本体検証より前に
     // 先行判定し、書き込み時の排他的な再検査（`create_function_with_limit`）は権威として残す。
@@ -171,7 +202,7 @@ pub(crate) fn execute_create_function_persistent(
         &|| precheck_catalog_capacity(storage, tenant_id, name, max_functions, false),
     )?;
     reject_session_local_dependency(session, &prepared.body)?;
-    let def = catalog_def_from_prepared(&prepared, body_source)?;
+    let def = catalog_def_from_prepared(&prepared, body_source, attrs)?;
     storage
         .create_function_with_limit(tenant_id, &def, max_functions)
         .map_err(map_function_error)?;
@@ -200,6 +231,7 @@ pub(crate) fn execute_create_or_replace_function_persistent(
     body: &crate::sql::udf_call::Expr,
     body_source: &str,
     max_functions: usize,
+    attrs: &FunctionAttributes,
 ) -> Result<(), SqlSurfaceError> {
     // 置換（カタログに同名の定義がある）は件数を増やさないため先行の件数判定を省く。新規作成になる
     // ときだけ本体検証より前に件数を判定する（write txn 内の再検査は権威として残す）。
@@ -213,7 +245,7 @@ pub(crate) fn execute_create_or_replace_function_persistent(
         &|| precheck_catalog_capacity(storage, tenant_id, name, max_functions, true),
     )?;
     reject_session_local_dependency(session, &prepared.body)?;
-    let def = catalog_def_from_prepared(&prepared, body_source)?;
+    let def = catalog_def_from_prepared(&prepared, body_source, attrs)?;
     // 循環検査はセッションのレジストリ（古い可能性がある）ではなく、write txn 内の最新カタログで
     // 再度行う（並行する別セッションの置換との合成で循環が残るのを防ぐ）。
     let target = prepared.key.to_ascii_lowercase();
@@ -245,6 +277,120 @@ pub(crate) fn execute_create_or_replace_function_persistent(
     let key = prepared.key.clone();
     commit_function_definition(session.udfs_mut(), prepared);
     session.udfs_mut().mark_catalog_origin(&key);
+    Ok(())
+}
+
+/// `LANGUAGE sql|plpgsql` の関数 1 件の定義入力（[`execute_create_routine_persistent`] の引数束）。
+/// 本体は原文のまま保存し、解析・束縛・実行は呼び出し時の経路（#2218）が担う。
+pub(crate) struct RoutineSpec<'a> {
+    pub(crate) name: &'a str,
+    pub(crate) params: &'a [String],
+    pub(crate) param_types: &'a [Option<CastType>],
+    pub(crate) return_type: Option<&'a CastType>,
+    pub(crate) returns_trigger: bool,
+    pub(crate) language: FunctionLanguageClause,
+    pub(crate) attrs: FunctionAttributes,
+    pub(crate) body_source: &'a str,
+}
+
+/// `CREATE [OR REPLACE] FUNCTION ... LANGUAGE sql|plpgsql` をカタログへ永続化する（DDL 権限のある
+/// セッション用。Issue #2217・SQL-67 (3)）。呼び出し元は `core.rs` の `CreateFunction` 腕で、
+/// `require_ddl_permission` の後にだけ来る。
+///
+/// 判定順は 予約名・識別子 → セッションの同名衝突 `42723` → カタログの重複 `42723`・件数 `54000`
+/// （先行判定）→ 引数名 → 本体検証 `validate`（plpgsql の定義時検証。sql は呼び出し側が何もしない
+/// 閉包を渡す）→ カタログの単一 write txn。セッションの [`UdfRegistry`] へは登録しない（呼び出しの
+/// 実行経路は #2218。それまで呼び出しは `42883`）。ただし OR REPLACE が宣言的 UDF を置き換えた場合は、
+/// commit 後にセッションの旧本体の展開を取り除く。
+///
+/// [`UdfRegistry`]: crate::sql::udf_call::UdfRegistry
+pub(crate) fn execute_create_routine_persistent(
+    storage: &Storage,
+    tenant_id: &str,
+    session: &mut SessionState,
+    spec: &RoutineSpec<'_>,
+    or_replace: bool,
+    max_functions: usize,
+    validate: &dyn Fn() -> Result<(), SqlSurfaceError>,
+) -> Result<(), SqlSurfaceError> {
+    let name = spec.name;
+    crate::catalog::validate_relation_key(name)
+        .map_err(|_| SqlSurfaceError::invalid_input("invalid function name"))?;
+    let lower = name.to_ascii_lowercase();
+    if crate::sql::udf_call::is_reserved_function_name(name) {
+        return Err(SqlSurfaceError::duplicate_function(
+            "function name collides with a built-in or reserved name",
+        ));
+    }
+    // セッションの WASM UDF とは名前空間を共有する。CREATE は宣言的 UDF の同名も衝突、OR REPLACE は
+    // 宣言的 UDF の置換だけ許す（commit 後に取り除く）。
+    let session_wasm = session.udfs().get_wasm(name).is_some();
+    if session_wasm || (!or_replace && session.udfs().is_name_taken(&lower)) {
+        return Err(SqlSurfaceError::duplicate_function(
+            "function is already defined in this session",
+        ));
+    }
+    precheck_catalog_capacity(storage, tenant_id, name, max_functions, or_replace)?;
+    if spec.params.len() > crate::sql::udf_call::MAX_UDF_PARAMS {
+        return Err(SqlSurfaceError::payload_too_large(
+            "too many function parameters",
+        ));
+    }
+    let mut seen = std::collections::HashSet::new();
+    let mut params = Vec::with_capacity(spec.params.len());
+    for (p, ty) in spec.params.iter().zip(spec.param_types.iter()) {
+        crate::catalog::validate_identifier(p)
+            .map_err(|_| SqlSurfaceError::invalid_input("invalid parameter name"))?;
+        let normalized = p.to_ascii_lowercase();
+        if !seen.insert(normalized.clone()) {
+            return Err(SqlSurfaceError::invalid_input("duplicate parameter name"));
+        }
+        let ty = ty
+            .as_ref()
+            .ok_or_else(|| SqlSurfaceError::unsupported("function parameters must be typed"))?;
+        params.push(FunctionParam {
+            name: Some(normalized),
+            ty: Some(function_type_from_udf_cast(ty)?),
+        });
+    }
+    let return_type = if spec.returns_trigger {
+        FunctionType::trigger()
+    } else {
+        let ty = spec.return_type.ok_or_else(|| {
+            SqlSurfaceError::invalid_function_definition("function result type must be specified")
+        })?;
+        function_type_from_udf_cast(ty)?
+    };
+    validate()?;
+    let def = FunctionDef {
+        id: 1,
+        function_key: lower.clone(),
+        params,
+        return_type: Some(return_type),
+        language: match spec.language {
+            FunctionLanguageClause::Sql => FunctionLanguage::Sql,
+            FunctionLanguageClause::Plpgsql => FunctionLanguage::Plpgsql,
+            FunctionLanguageClause::Declarative => {
+                return Err(SqlSurfaceError::Internal {
+                    detail: "declarative function routed as routine".to_string(),
+                })
+            }
+        },
+        body_source: spec.body_source.to_string(),
+        attrs: spec.attrs.clone(),
+    };
+    if or_replace {
+        // 非宣言的な新定義は別の定義を呼ばないため循環検査は常に成功する。
+        storage
+            .replace_function_checked(tenant_id, &def, max_functions, &|_| Ok(()))
+            .map_err(map_function_error)?;
+        // 宣言的 UDF を置き換えた場合、セッションに旧本体の展開が残らないよう取り除く。
+        session.udfs_mut().remove(name);
+    } else {
+        storage
+            .create_function_with_limit(tenant_id, &def, max_functions)
+            .map_err(map_function_error)?;
+    }
     Ok(())
 }
 
@@ -433,7 +579,8 @@ mod tests {
         storage
             .create_function(
                 "t",
-                &catalog_def_from_prepared(&prepared_f, "x").expect("def"),
+                &catalog_def_from_prepared(&prepared_f, "x", &FunctionAttributes::default())
+                    .expect("def"),
             )
             .expect("create f");
         commit_function_definition(a.udfs_mut(), prepared_f);
@@ -443,7 +590,8 @@ mod tests {
         storage
             .create_function(
                 "t",
-                &catalog_def_from_prepared(&prepared_g, "x").expect("def"),
+                &catalog_def_from_prepared(&prepared_g, "x", &FunctionAttributes::default())
+                    .expect("def"),
             )
             .expect("create g");
         commit_function_definition(a.udfs_mut(), prepared_g);
@@ -464,6 +612,7 @@ mod tests {
             &parse_body("g(x)"),
             "g ( x )",
             crate::catalog::function::MAX_FUNCTIONS,
+            &FunctionAttributes::default(),
         )
         .expect("f -> g");
         // b のレジストリは f を単純な本体だと思っているため、レジストリ上の検査は通る。
@@ -478,6 +627,7 @@ mod tests {
             &parse_body("f(x)"),
             "f ( x )",
             crate::catalog::function::MAX_FUNCTIONS,
+            &FunctionAttributes::default(),
         )
         .expect_err("g -> f must be rejected by the catalog-level check");
         assert_eq!(err.wire_code(), "0A000");
@@ -504,6 +654,7 @@ mod tests {
                 &parse_body(body),
                 body,
                 1,
+                &FunctionAttributes::default(),
             )
         };
         let replace = |s: &mut SessionState, name: &str, body: &str| {
@@ -518,6 +669,7 @@ mod tests {
                 &parse_body(body),
                 body,
                 1,
+                &FunctionAttributes::default(),
             )
         };
         create(&mut s, "f", &p, "x").expect("first function");
@@ -638,7 +790,8 @@ mod tests {
             &parse_body("x + 1"),
         )
         .expect("prepare");
-        let def = catalog_def_from_prepared(&prepared, "x + 1").expect("def");
+        let def = catalog_def_from_prepared(&prepared, "x + 1", &FunctionAttributes::default())
+            .expect("def");
         assert_eq!(
             def.params[0].ty.as_ref().map(FunctionType::identity_token),
             Some("integer".to_string())

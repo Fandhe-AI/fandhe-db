@@ -196,3 +196,10 @@ blob の断片・tenant_id・本体の原文はエラー文言へ出さない。
   セッション限定の定義がカタログ関数を呼ぶのは許可。
 - 結合テストは `crates/engine/tests/sql_t40_up/sql66_udf_limits.rs`、CLI の外形は
   `crates/wire-server/tests/wire_cli/wire_function_limits_cli.rs`。
+
+## 言語と属性の書き込み経路（Issue #2217）
+
+`CREATE FUNCTION` の `LANGUAGE sql|plpgsql` と属性句は `sql::udf_ddl::execute_create_routine_persistent`
+がカタログへ書く（宣言的 UDF も揮発性・`PARALLEL`・`COST` を同じ blob v1 の属性欄へ保存する）。セッションの
+レジストリへは登録しない。言語をまたぐ同名は `42723`、`CREATE OR REPLACE` が宣言的 UDF を置き換えたときは
+commit 後にレジストリから取り除く。詳細は [plpgsql-subset.md](plpgsql-subset.md)「Issue #2217 追記」。

@@ -2990,6 +2990,67 @@ impl ValidatedStatement {
     }
 }
 
+/// `CREATE FUNCTION` の `LANGUAGE` 句（SQL-67 (3)・Issue #2217）。句が無い従来形は `Declarative`。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum FunctionLanguageClause {
+    Declarative,
+    Sql,
+    Plpgsql,
+}
+
+/// 関数の揮発性句（`IMMUTABLE`／`STABLE`／`VOLATILE`）。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum FunctionVolatilityClause {
+    Immutable,
+    Stable,
+    Volatile,
+}
+
+/// `PARALLEL` 句（受理と保存のみで結果を変えない）。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum FunctionParallelClause {
+    Unsafe,
+    Restricted,
+    Safe,
+}
+
+/// `CREATE FUNCTION` の属性句（Issue #2217）。未指定の項目は `None`（カタログ側の既定になる）。
+/// フィールドは非公開で、構文段が構築し `udf_ddl` が読む。
+#[derive(Debug, Clone, PartialEq, Default)]
+pub struct FunctionAttributeClauses {
+    volatility: Option<FunctionVolatilityClause>,
+    strict: Option<bool>,
+    parallel: Option<FunctionParallelClause>,
+    cost: Option<f64>,
+}
+
+impl FunctionAttributeClauses {
+    /// 指定された揮発性。
+    pub fn volatility(&self) -> Option<FunctionVolatilityClause> {
+        self.volatility
+    }
+    /// `STRICT`（`true`）／`CALLED ON NULL INPUT`（`false`）の指定。
+    pub fn strict(&self) -> Option<bool> {
+        self.strict
+    }
+    /// 指定された `PARALLEL`。
+    pub fn parallel(&self) -> Option<FunctionParallelClause> {
+        self.parallel
+    }
+    /// 指定された `COST`（有限かつ正）。
+    pub fn cost(&self) -> Option<f64> {
+        self.cost
+    }
+}
+
+/// `CREATE FUNCTION` の本体（Issue #2217）。宣言的 UDF は式、`LANGUAGE sql|plpgsql` は文字列で、
+/// 後者の本文は [`Statement::CreateFunction`] の `body_source` に入る。
+#[derive(Debug, Clone, PartialEq)]
+pub enum CreateFunctionBody {
+    Expression(Expr),
+    Source,
+}
+
 /// [`validate_sql`]（TASK-161 の公開 API）が返す statement 種別。`SELECT` 以外の
 /// 文が増えても [`ValidatedStatement`] 自体は SELECT 専用の構造を保つため、
 /// 統一的な enum で包む。
@@ -3050,13 +3111,21 @@ pub enum Statement {
     ///
     /// **Issue #1917（SQL-66 (2)）で追加した破壊的変更（BREAKING CHANGE）**: `or_replace` を追加した
     /// （`CREATE OR REPLACE FUNCTION` なら `true`）。
+    ///
+    /// **Issue #2217（SQL-67 (3)）で追加した破壊的変更（BREAKING CHANGE）**: `language`・`attributes`・
+    /// `returns_trigger` を追加し、`body` を [`CreateFunctionBody`] へ置き換えた（`LANGUAGE sql|plpgsql` の
+    /// 本体は式ではなく文字列リテラルのため）。`LANGUAGE` 句の無い従来形は `Declarative`・`Expression`。
+    /// `LANGUAGE` 付きの `body_source` は文字列リテラルを復号した本文（引用符・ドル区切りを除いた内容）。
     CreateFunction {
         or_replace: bool,
         name: String,
         params: Vec<String>,
         param_types: Vec<Option<CastType>>,
         return_type: Option<CastType>,
-        body: Expr,
+        returns_trigger: bool,
+        language: FunctionLanguageClause,
+        attributes: FunctionAttributeClauses,
+        body: CreateFunctionBody,
         body_source: String,
     },
     /// 集計関数のみを結果列とする `GROUP BY` なし・単一行結果の `SELECT`
@@ -18787,6 +18856,11 @@ pub struct ValidatedCreateIndex {
     /// 部分索引の述語（INDEX-11、Issue #1653）。最終ゲートが拒否するため現状は常に `None`
     /// （#1654 が格納を実装するまで）。
     pub(crate) predicate: Option<Vec<WherePredicate>>,
+    /// 式・述語に組み込み以外の関数の呼び出しがあり、構文段が判定を保留した手がかり（Issue #2217）。
+    /// `Some` の文は実行できない（`core.rs` が権限検査の後にテナントの UDF カタログの揮発性で必ず
+    /// エラーへ解決する。実行段 `execute_create_index` も多重防御で `0A000`）。保留した位置より後ろの
+    /// 構文・最終ゲートの検査は行っていない（従来は同じ位置で `0A000` を返していたため判定順は不変）。
+    pub(crate) pending_user_function: Option<crate::sql::index_expr::IndexUserFunctionRef>,
 }
 
 impl ValidatedCreateIndex {
@@ -19042,11 +19116,27 @@ pub(crate) fn validate_create_index_tokens(
     }
     // 式要素の決定性（`42P17`／組み込み以外の関数は `0A000`。INDEX-10、Issue #1647）。判定順は
     // 要素の構文・集計/ウィンドウ/部分クエリ → 上の構造検査 → 決定性 → `WHERE` → 最終ゲート。
+    let pending_result = |pending| ValidatedCreateIndex {
+        name: name.clone(),
+        if_not_exists,
+        table: table.clone(),
+        method,
+        columns: columns.clone(),
+        expressions: expressions.clone(),
+        collations: collations.clone(),
+        unique,
+        predicate: None,
+        pending_user_function: Some(pending),
+    };
     for expr in expressions.iter().flatten() {
-        crate::sql::index_expr::check_index_expression_determinism(
-            expr,
-            crate::sql::index_expr::IndexExprSite::Key,
-        )?;
+        if let Some(pending) =
+            crate::sql::index_expr::check_index_expression_determinism_deferring_udf(
+                expr,
+                crate::sql::index_expr::IndexExprSite::Key,
+            )?
+        {
+            return Ok(pending_result(pending));
+        }
     }
     // 部分索引の述語（INDEX-11、Issue #1653）。判定順は 述語の先読み（集計・ウィンドウ・部分
     // クエリ・SRF を PostgreSQL と同じ SQLSTATE へ）→ 解析 → 決定性 → 文末 → 最終ゲート。
@@ -19059,7 +19149,11 @@ pub(crate) fn validate_create_index_tokens(
             crate::sql::index_expr::IndexExprSite::Predicate,
         )?;
         let preds = p.parse_where()?;
-        crate::sql::index_expr::check_index_predicate_determinism(&preds)?;
+        if let Some(pending) =
+            crate::sql::index_expr::check_index_predicate_determinism_deferring_udf(&preds)?
+        {
+            return Ok(pending_result(pending));
+        }
         Some(preds)
     } else {
         None
@@ -19083,6 +19177,7 @@ pub(crate) fn validate_create_index_tokens(
         collations,
         unique,
         predicate,
+        pending_user_function: None,
     })
 }
 
@@ -23508,33 +23603,244 @@ fn parse_create_function(tokens: &[Token]) -> Result<ParsedCreateFunction, SqlSu
             "function parameters must be either all typed or all untyped",
         ));
     }
-    // `RETURNS <型>`（SQL-66 (1)・Issue #1916）。RETURNS 付きは本体の型を静的に決める必要が
-    // あるため、引数がすべて型なしの関数（引数 1 個以上）には付けられない（fail-closed）。
-    let return_type = if p.peek_ident_matches("RETURNS") {
-        p.advance();
-        let ty = p.parse_create_function_return_type()?;
-        if !param_types.is_empty() && param_types.iter().all(Option::is_none) {
+    // シグネチャの後ろの句は順不同のオプション列（PostgreSQL と同じ。SQL-67 (3)・Issue #2217）。
+    // 句の種類ごとに高々 1 回なのでループは有界で、重複・矛盾は `42601`。
+    let mut return_type: Option<CastType> = None;
+    let mut returns_trigger = false;
+    let mut returns_seen = false;
+    let mut language: Option<FunctionLanguageClause> = None;
+    let mut as_range: Option<(usize, usize, Expr)> = None;
+    let mut attrs = FunctionAttributeClauses::default();
+    let mut security_seen = false;
+    let conflict = || SqlSurfaceError::unsupported("conflicting or redundant options");
+    while let Some(Token::Ident(word)) = p.peek() {
+        let word = word.to_ascii_uppercase();
+        match word.as_str() {
+            "RETURNS" if p.peek_ident_matches_at(1, "NULL") => {
+                p.advance();
+                p.advance();
+                p.expect_ident_matching("ON")?;
+                p.expect_ident_matching("NULL")?;
+                p.expect_ident_matching("INPUT")?;
+                if attrs.strict.replace(true).is_some() {
+                    return Err(conflict());
+                }
+            }
+            "RETURNS" => {
+                if returns_seen {
+                    return Err(conflict());
+                }
+                returns_seen = true;
+                p.advance();
+                if p.peek_ident_matches("TRIGGER") {
+                    p.advance();
+                    returns_trigger = true;
+                } else {
+                    return_type = Some(p.parse_create_function_return_type()?);
+                }
+            }
+            "LANGUAGE" => {
+                if language.is_some() {
+                    return Err(conflict());
+                }
+                p.advance();
+                let name = match p.advance() {
+                    Some(Token::Ident(n) | Token::StringLiteral(n)) => n.clone(),
+                    _ => return Err(SqlSurfaceError::unsupported("expected language name")),
+                };
+                language = Some(if name.eq_ignore_ascii_case("sql") {
+                    FunctionLanguageClause::Sql
+                } else if name.eq_ignore_ascii_case("plpgsql") {
+                    FunctionLanguageClause::Plpgsql
+                } else {
+                    // 言語名は応答に含めない（`DO` と同じ固定文言）。
+                    return Err(SqlSurfaceError::UndefinedObject {
+                        name: "language".to_string(),
+                    });
+                });
+            }
+            "AS" => {
+                if as_range.is_some() {
+                    return Err(conflict());
+                }
+                p.advance();
+                let start = p.pos;
+                let body = p.parse_value_expr(0)?;
+                as_range = Some((start, p.pos, body));
+            }
+            "IMMUTABLE" | "STABLE" | "VOLATILE" => {
+                p.advance();
+                let v = match word.as_str() {
+                    "IMMUTABLE" => FunctionVolatilityClause::Immutable,
+                    "STABLE" => FunctionVolatilityClause::Stable,
+                    _ => FunctionVolatilityClause::Volatile,
+                };
+                if attrs.volatility.replace(v).is_some() {
+                    return Err(conflict());
+                }
+            }
+            "CALLED" => {
+                p.advance();
+                p.expect_ident_matching("ON")?;
+                p.expect_ident_matching("NULL")?;
+                p.expect_ident_matching("INPUT")?;
+                if attrs.strict.replace(false).is_some() {
+                    return Err(conflict());
+                }
+            }
+            "STRICT" => {
+                p.advance();
+                if attrs.strict.replace(true).is_some() {
+                    return Err(conflict());
+                }
+            }
+            "EXTERNAL" | "SECURITY" => {
+                if word == "EXTERNAL" {
+                    p.advance();
+                }
+                p.expect_ident_matching("SECURITY")?;
+                if security_seen {
+                    return Err(conflict());
+                }
+                security_seen = true;
+                if p.peek_ident_matches("INVOKER") {
+                    p.advance();
+                } else if p.peek_ident_matches("DEFINER") {
+                    return Err(SqlSurfaceError::feature_not_supported(
+                        "SECURITY DEFINER is not supported",
+                    ));
+                } else {
+                    return Err(SqlSurfaceError::unsupported("invalid SECURITY option"));
+                }
+            }
+            "PARALLEL" => {
+                p.advance();
+                let v = match p.advance() {
+                    Some(Token::Ident(w)) if w.eq_ignore_ascii_case("UNSAFE") => {
+                        FunctionParallelClause::Unsafe
+                    }
+                    Some(Token::Ident(w)) if w.eq_ignore_ascii_case("RESTRICTED") => {
+                        FunctionParallelClause::Restricted
+                    }
+                    Some(Token::Ident(w)) if w.eq_ignore_ascii_case("SAFE") => {
+                        FunctionParallelClause::Safe
+                    }
+                    _ => {
+                        return Err(SqlSurfaceError::invalid_input(
+                            "invalid parameter value for PARALLEL",
+                        ))
+                    }
+                };
+                if attrs.parallel.replace(v).is_some() {
+                    return Err(conflict());
+                }
+            }
+            "COST" => {
+                p.advance();
+                let v = p.parse_create_function_positive_number("COST")?;
+                if attrs.cost.replace(v).is_some() {
+                    return Err(conflict());
+                }
+            }
+            // 集合返却は未対応のため `ROWS` は常に非適用（PostgreSQL の "ROWS is not applicable"）。
+            "ROWS" => {
+                p.advance();
+                p.parse_create_function_positive_number("ROWS")?;
+                return Err(SqlSurfaceError::invalid_input(
+                    "ROWS is not applicable when function does not return a set",
+                ));
+            }
+            "LEAKPROOF" | "NOT" | "SET" | "SUPPORT" | "TRANSFORM" | "WINDOW" => {
+                return Err(SqlSurfaceError::feature_not_supported(
+                    "unsupported function option",
+                ));
+            }
+            _ => break,
+        }
+    }
+    p.expect_end_of_statement()?;
+    let language = language.unwrap_or(FunctionLanguageClause::Declarative);
+    let invalid_def = |m: &'static str| SqlSurfaceError::invalid_function_definition(m);
+    let (body_start, body_end, body_expr) = match as_range {
+        Some(v) => v,
+        None if language == FunctionLanguageClause::Declarative => {
+            // 従来どおり `AS` 欠落は構文誤り（`expect_ident_matching("AS")` と同じ `42601`）。
+            return Err(SqlSurfaceError::unsupported("expected AS"));
+        }
+        None => return Err(invalid_def("no function body specified")),
+    };
+    if language == FunctionLanguageClause::Declarative {
+        // 宣言的 UDF は束縛時に式へ展開するため、STRICT の意味（NULL 引数で本体を実行せず NULL を返す）
+        // を黙って落とさず fail-closed にする。
+        if attrs.strict == Some(true) {
+            return Err(SqlSurfaceError::feature_not_supported(
+                "STRICT is not supported for functions without LANGUAGE",
+            ));
+        }
+        if returns_trigger {
+            return Err(SqlSurfaceError::feature_not_supported(
+                "RETURNS SETOF, TABLE and pseudo-types are not supported",
+            ));
+        }
+        // `RETURNS <型>` 付きは本体の型を静的に決める必要があるため、引数がすべて型なしの関数
+        // （引数 1 個以上）には付けられない（fail-closed）。
+        if return_type.is_some()
+            && !param_types.is_empty()
+            && param_types.iter().all(Option::is_none)
+        {
             return Err(SqlSurfaceError::feature_not_supported(
                 "RETURNS requires typed function parameters",
             ));
         }
-        Some(ty)
-    } else {
-        None
+        // 本体の原文は、`AS` の次から式の終端までのトークン列を CREATE VIEW の `body_sql` と同じ規約で
+        // 描画して保存する（AST からの再描画は等価性が崩れうるため使わない）。`Token::Param` を含む場合は
+        // 描画できず fail-closed で拒否する。長さは保存前（確保前）に上限検査する。
+        let body_tokens = tokens
+            .get(body_start..body_end)
+            .ok_or_else(|| SqlSurfaceError::unsupported("invalid function body"))?;
+        let body_source = super::lexer::render_tokens(body_tokens).ok_or_else(|| {
+            SqlSurfaceError::unsupported("function body cannot contain parameters")
+        })?;
+        if body_source.len() > crate::catalog::function::MAX_FUNCTION_BODY_BYTES {
+            return Err(SqlSurfaceError::payload_too_large(
+                "function body too large",
+            ));
+        }
+        return Ok(ParsedCreateFunction {
+            or_replace,
+            name,
+            params,
+            param_types,
+            return_type,
+            returns_trigger: false,
+            language,
+            attributes: attrs,
+            body: CreateFunctionBody::Expression(body_expr),
+            body_source,
+        });
+    }
+    // LANGUAGE sql／plpgsql: 本体は文字列リテラル 1 個（`'...'`・`$$...$$`・`$tag$...$tag$`）に限る。
+    if !returns_seen {
+        return Err(invalid_def("function result type must be specified"));
+    }
+    if !params.is_empty() && param_types.iter().any(Option::is_none) {
+        return Err(SqlSurfaceError::unsupported(
+            "function parameters must be typed for LANGUAGE sql and plpgsql",
+        ));
+    }
+    if returns_trigger && (language != FunctionLanguageClause::Plpgsql || !params.is_empty()) {
+        return Err(invalid_def(
+            "trigger functions must be plpgsql without arguments",
+        ));
+    }
+    let body_source = match tokens.get(body_start..body_end) {
+        Some([Token::StringLiteral(s)]) => s.clone(),
+        _ => {
+            return Err(SqlSurfaceError::unsupported(
+                "function body must be a string literal",
+            ))
+        }
     };
-    p.expect_ident_matching("AS")?;
-    let body_start = p.pos;
-    let body = p.parse_value_expr(0)?;
-    let body_end = p.pos;
-    p.expect_end_of_statement()?;
-    // 本体の原文は、`AS` の次から式の終端までのトークン列を CREATE VIEW の `body_sql` と同じ規約で
-    // 描画して保存する（AST からの再描画は等価性が崩れうるため使わない）。`Token::Param` を含む場合は
-    // 描画できず fail-closed で拒否する。長さは保存前（確保前）に上限検査する。
-    let body_tokens = tokens
-        .get(body_start..body_end)
-        .ok_or_else(|| SqlSurfaceError::unsupported("invalid function body"))?;
-    let body_source = super::lexer::render_tokens(body_tokens)
-        .ok_or_else(|| SqlSurfaceError::unsupported("function body cannot contain parameters"))?;
     if body_source.len() > crate::catalog::function::MAX_FUNCTION_BODY_BYTES {
         return Err(SqlSurfaceError::payload_too_large(
             "function body too large",
@@ -23546,7 +23852,10 @@ fn parse_create_function(tokens: &[Token]) -> Result<ParsedCreateFunction, SqlSu
         params,
         param_types,
         return_type,
-        body,
+        returns_trigger,
+        language,
+        attributes: attrs,
+        body: CreateFunctionBody::Source,
         body_source,
     })
 }
@@ -23570,7 +23879,10 @@ struct ParsedCreateFunction {
     params: Vec<String>,
     param_types: Vec<Option<CastType>>,
     return_type: Option<CastType>,
-    body: Expr,
+    returns_trigger: bool,
+    language: FunctionLanguageClause,
+    attributes: FunctionAttributeClauses,
+    body: CreateFunctionBody,
     body_source: String,
 }
 
@@ -23593,6 +23905,25 @@ fn normalize_udf_param_type(ty: CastType, what: &str) -> Result<CastType, SqlSur
 }
 
 impl Parser<'_> {
+    /// `COST`／`ROWS` の数値を読む（有限かつ正の値のみ。Issue #2217。不正値は `invalid_input`）。
+    fn parse_create_function_positive_number(
+        &mut self,
+        what: &'static str,
+    ) -> Result<f64, SqlSurfaceError> {
+        let bad = || SqlSurfaceError::invalid_input(format!("invalid parameter value for {what}"));
+        match self.advance() {
+            Some(Token::Number(n)) => {
+                let v: f64 = n.parse().map_err(|_| bad())?;
+                if v.is_finite() && v > 0.0 {
+                    Ok(v)
+                } else {
+                    Err(bad())
+                }
+            }
+            _ => Err(SqlSurfaceError::unsupported("expected a number")),
+        }
+    }
+
     /// `RETURNS` の直後の戻り値型を読む（[`parse_create_function`] から呼ばれる。SQL-66 (1)・
     /// Issue #1916）。`SETOF`・`TABLE (...)`・`void`／`trigger`／`record` 等の擬似型は型名解決より
     /// 先に識別子で検出して `0A000` にする（未知の型名として `42704` になるのを避ける）。型名は
@@ -26088,6 +26419,9 @@ fn validate_sql_tokens_impl(
                 params: parsed.params,
                 param_types: parsed.param_types,
                 return_type: parsed.return_type,
+                returns_trigger: parsed.returns_trigger,
+                language: parsed.language,
+                attributes: parsed.attributes,
                 body: parsed.body,
                 body_source: parsed.body_source,
             })
@@ -28605,7 +28939,11 @@ mod tests {
             let (expr, body_source) = (parsed.body, parsed.body_source);
             let again = crate::sql::lexer::tokenize_rendered(&body_source).expect("re-lex");
             let reparsed = parse_stored_function_body(&again).expect("reparse");
-            assert_eq!(reparsed, expr, "{body_sql} -> {body_source}");
+            assert_eq!(
+                CreateFunctionBody::Expression(reparsed),
+                expr,
+                "{body_sql} -> {body_source}"
+            );
         }
         let extra = crate::sql::lexer::tokenize_rendered("x + 1 y").expect("lex");
         assert!(parse_stored_function_body(&extra).is_err());
@@ -29035,7 +29373,6 @@ mod tests {
             ),
             ("CREATE UNIQUE INDEX i ON t (b, (now()))", "42P17"),
             // 組み込み以外の関数（セッション UDF・未知名）は 0A000。
-            ("CREATE INDEX i ON t ((my_udf(a)))", "0A000"),
             // 集計・ウィンドウ・部分クエリ・SRF（左端優先）。
             ("CREATE INDEX i ON t ((count(*)))", "42803"),
             ("CREATE INDEX i ON t (sum(a))", "42803"),
@@ -29064,6 +29401,33 @@ mod tests {
         ] {
             assert_eq!(parse(sql).expect_err(sql).wire_code(), code, "{sql}");
         }
+    }
+
+    /// Issue #2217: 組み込み以外の関数は構文段では判定せず（`0A000` にせず）手がかりを保留する。
+    /// 保留より前の確定した拒否（非決定的な組み込み）は従来どおり構文段で返る。実行は
+    /// `core.rs` の `CreateIndex` 腕がテナントの UDF カタログの揮発性でエラーへ解決する。
+    #[test]
+    fn create_index_defers_user_function_classification() {
+        use super::*;
+        let parse = |sql: &str| {
+            let tokens = crate::sql::lexer::tokenize(sql).expect("tokenize");
+            validate_create_index_tokens(&tokens)
+        };
+        let key = parse("CREATE INDEX i ON t ((my_udf(a)))").expect("deferred");
+        let pending = key.pending_user_function.expect("pending");
+        assert_eq!((pending.name.as_str(), pending.arity), ("my_udf", 1));
+        let pred = parse("CREATE INDEX i ON t (a) WHERE my_udf(a) > 0").expect("deferred");
+        assert!(pred.pending_user_function.is_some());
+        assert_eq!(
+            parse("CREATE INDEX i ON t ((random() + my_udf(a)))")
+                .expect_err("nondeterministic first")
+                .wire_code(),
+            "42P17"
+        );
+        assert!(parse("CREATE INDEX i ON t ((lower(a)))")
+            .expect("builtin")
+            .pending_user_function
+            .is_none());
     }
 
     /// 式索引の式のノード数・深さの上限（無制限確保なし）。上限超過は `54000`。

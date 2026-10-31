@@ -10,7 +10,8 @@
 //! 解析では書き込みの実行形（副文の `RETURNING` 公開列・主クエリの形）を判定できない。この形だけは
 //! カタログ付きの `EngineCore::parse_tokens` で解析し、解析木（`ParsedSql::DataModifyingCte`）から書き込みを
 //! 確定する（表が未作成などで判定できなければ、書き込みの有無を決められないので呼び出し側が `0A000`
-//! にする）。呼び出し元は #2217／#2225 が結線するまでテストだけ。
+//! にする）。呼び出し元は `core::function_define`（`CREATE FUNCTION ... LANGUAGE plpgsql` の定義時検証。#2217）
+//! と `DO` ブロック（#2228）。
 
 use super::{EngineCore, ParsedSql};
 use crate::plpgsql::embedded::{EmbeddedSqlChecker, StructuralChecker};

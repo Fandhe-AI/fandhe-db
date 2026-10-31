@@ -2397,7 +2397,7 @@ fn check_builtin_arity(name: &str, n: usize) -> Result<(), SqlSurfaceError> {
 /// （集計関数名を含めない版では `CREATE FUNCTION min(...)` が成功したまま
 /// `SELECT min(id)` が集計として実行され、当該 UDF が呼び出し不能になる不整合が
 /// あった。Cursor Bugbot 指摘対応・PR #229）。
-fn is_reserved_function_name(name: &str) -> bool {
+pub(crate) fn is_reserved_function_name(name: &str) -> bool {
     let upper = name.to_ascii_uppercase();
     // `CASE`／`COALESCE`／`NULLIF`（対象ビヘイビア: SQL-26。Issue #921）は式文法の
     // 専用ノード（`Expr::Case`／`Expr::Coalesce`／`Expr::NullIf`）として解析される

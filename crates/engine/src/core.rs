@@ -104,6 +104,8 @@ mod plpgsql_validate_tests;
 mod plpgsql_host;
 // `DO` ブロックの実行（SQL-68・Issue #2228）。
 mod do_block;
+// `CREATE FUNCTION ... LANGUAGE plpgsql` の定義時検証（Issue #2217・SQL-67 (3)）。
+mod function_define;
 #[cfg(test)]
 mod plpgsql_boundary_tests;
 #[cfg(test)]
@@ -7126,7 +7128,24 @@ impl EngineCore {
             // なく、索引の物理表現は既存の `(table, PolicyContext)` 可視
             // スナップショット由来キャッシュのまま）。
             ParsedSql::CreateIndex(stmt) => {
+                // Issue #2217: 権限の無いセッションにはカタログを引かず、従来どおりの `0A000`（構文段で
+                // 組み込み以外の関数に当たったときの拒否。権限検査より前）を返す。存在情報を出さない。
+                if let Some(pending) = stmt.pending_user_function.as_ref() {
+                    if crate::sql::ddl::require_ddl_permission(session).is_err() {
+                        return Err(crate::sql::index_expr::udf_unsupported(pending.site));
+                    }
+                }
                 crate::sql::ddl::require_ddl_permission(session)?;
+                // Issue #2217: 構文段が保留した組み込み以外の関数は、権限検査の後に自テナントの UDF
+                // カタログの揮発性でエラーへ解決する（必ずエラー。`sql::index_udf`）。
+                if let Some(pending) = stmt.pending_user_function.as_ref() {
+                    return Err(crate::sql::index_udf::index_user_function_verdict(
+                        &self.storage,
+                        ctx.tenant_id(),
+                        session,
+                        pending,
+                    ));
+                }
                 let outcome = crate::sql::ddl::execute_create_index(&self.storage, stmt)?;
                 Ok(crate::sql::SqlOutcome::CreateIndex(outcome))
             }
@@ -9155,10 +9174,57 @@ impl EngineCore {
                 params,
                 param_types,
                 return_type,
+                returns_trigger,
+                language,
+                attributes,
                 body,
                 body_source,
             } => {
                 crate::sql::ddl::require_ddl_permission(session)?;
+                let attrs = crate::sql::udf_ddl::function_attributes_from_clauses(&attributes);
+                // Issue #2217（SQL-67 (3)）: `LANGUAGE sql|plpgsql` は本体を原文のまま保存する経路へ。
+                // 呼び出しの実行は #2218（それまで式からの呼び出しは `42883`）。plpgsql は保存前に定義時検証。
+                let body = match (language, body) {
+                    (
+                        crate::sql::allowlist::FunctionLanguageClause::Declarative,
+                        crate::sql::allowlist::CreateFunctionBody::Expression(body),
+                    ) => body,
+                    (language, _) => {
+                        let spec = crate::sql::udf_ddl::RoutineSpec {
+                            name: &name,
+                            params: &params,
+                            param_types: &param_types,
+                            return_type: return_type.as_ref(),
+                            returns_trigger,
+                            language,
+                            attrs,
+                            body_source: &body_source,
+                        };
+                        let is_plpgsql =
+                            language == crate::sql::allowlist::FunctionLanguageClause::Plpgsql;
+                        crate::sql::udf_ddl::execute_create_routine_persistent(
+                            &self.storage,
+                            ctx.tenant_id(),
+                            session,
+                            &spec,
+                            or_replace,
+                            self.function_limits.max_functions(),
+                            &|| {
+                                if is_plpgsql {
+                                    self.validate_plpgsql_definition(
+                                        &params,
+                                        &param_types,
+                                        returns_trigger,
+                                        &body_source,
+                                    )
+                                } else {
+                                    Ok(())
+                                }
+                            },
+                        )?;
+                        return Ok(crate::sql::SqlOutcome::CreateFunction { name });
+                    }
+                };
                 if or_replace {
                     crate::sql::udf_ddl::execute_create_or_replace_function_persistent(
                         &self.storage,
@@ -9171,6 +9237,7 @@ impl EngineCore {
                         &body,
                         &body_source,
                         self.function_limits.max_functions(),
+                        &attrs,
                     )?;
                 } else {
                     crate::sql::udf_ddl::execute_create_function_persistent(
@@ -9184,6 +9251,7 @@ impl EngineCore {
                         &body,
                         &body_source,
                         self.function_limits.max_functions(),
+                        &attrs,
                     )?;
                 }
                 Ok(crate::sql::SqlOutcome::CreateFunction { name })

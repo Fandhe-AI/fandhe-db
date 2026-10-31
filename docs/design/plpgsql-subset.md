@@ -636,3 +636,29 @@ SQL-68 ポインタ。D9 の内部 API と `DO` を実装した。公開 enum `S
   再送検証は #2218 以降。
 - `nextval()` を本体から使う採番の検証は行っていない（本体 SQL の `DEFAULT nextval` の扱いは別途）。
 - トリガ発火経由の越境・crash は #1720。
+
+## Issue #2217 追記（`CREATE FUNCTION` の `LANGUAGE` 句と属性）
+
+- 構文: シグネチャの後は `RETURNS`・`LANGUAGE`・`AS`・属性を順不同で受理する。同じ種類の句の重複・矛盾は
+  `42601`。`LANGUAGE` が無ければ従来の宣言的 UDF（本体は式）で、`AS $$...$$` も従来どおり定数式の本体。
+  `LANGUAGE sql|plpgsql` は本体が文字列リテラル 1 個に限り、`RETURNS` と型付き引数が必須（欠落は
+  `42P13`／`42601`）。保存する `body_source` は文字列を復号した本文。
+- 属性: 揮発性・`STRICT`・`PARALLEL`・`COST` を blob v1 のまま保存する。`ROWS` は集合返却が無いため常に非適用
+  として拒否し、`SECURITY DEFINER` は `0A000`（ロール・権限の確定まで）。宣言的 UDF の `STRICT` は束縛時に式へ
+  展開する方式では意味を保てないため `0A000`。
+- 定義時検証: plpgsql は `core::function_define` が `parse_body`（構文 `42601`・範囲外 `0A000`・本体長
+  `54000`）と `validate_embedded` を通す。AST は保存せず、呼び出し時に再解析する（D2）。`RETURNS trigger` は
+  `ReturnShape::Trigger`・`FunctionType::trigger()` で保存し、`CREATE TRIGGER` が受理できる（発火は #1720 まで
+  `0A000`）。
+- 名前空間: セッションのレジストリは多重定義を持たないため、言語をまたぐ同名は `42723`（PostgreSQL は型で
+  解決する）。`CREATE OR REPLACE` で宣言的 UDF を置き換えたら、commit 後にセッションの旧本体の展開を取り除く。
+- 呼び出し: `sql`／`plpgsql` 関数は #2218 が結線するまで式から呼べず `42883`（`udf_load` が非宣言的な定義を
+  読み飛ばす）。`FunctionAttributes::allows_writes()`（`VOLATILE` のみ真）を #2218 が `PlCallOptions::may_write` の
+  決定に使う。`IMMUTABLE`／`STABLE` の本体の書き込みは定義時に拒否せず、実行時に `0A000` にする。
+- 式索引・部分索引: 構文段（カタログ非参照）は組み込み以外の関数に達した時点で判定を保留し、`core.rs` が
+  権限検査の後（権限が無ければ従来の `0A000` のまま）に自テナントの UDF カタログで解決する
+  （`sql::index_udf`）。非 IMMUTABLE の `sql`／`plpgsql` 関数は `42P17`、未定義・宣言的 UDF・IMMUTABLE は
+  `0A000`。IMMUTABLE を受け入れないのは、本体の実行が未実装で索引の維持（空の UDF レジストリでの再束縛）が
+  評価できず fail-open になるため。未定義名が `0A000`（PostgreSQL は `42883`）なのは既知の差。
+- 既知の差・後続: 呼び出しと `STRICT` の実行時の意味は #2218、`RETURN`／`BEGIN ATOMIC` は #2219、
+  `SETOF`／`TABLE`／`void` は #2220 以降。IMMUTABLE 関数・内容で決定的な宣言的 UDF を索引で受け入れる対応は未着手。
