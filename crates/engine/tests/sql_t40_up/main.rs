@@ -124,6 +124,7 @@ mod sql66_udf_param_types;
 mod sql66_udf_returns;
 mod sql67_dollar_quoting;
 mod sql67_function_language_attrs;
+mod sql67_sql_function_exec;
 mod sql68_do_block;
 mod sql68_do_limits_ledger;
 mod sql78_predicate_dml_noneq_between_params;

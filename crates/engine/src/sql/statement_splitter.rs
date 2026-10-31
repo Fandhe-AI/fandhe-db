@@ -322,7 +322,16 @@ pub fn classify_statement(stmt: &str) -> StatementEffect {
     };
 
     match first {
-        Token::Keyword(Keyword::Select) => StatementEffect::ReadOnly,
+        // SQL-67 (5)・Issue #2218: ユーザー定義関数（組み込みでない名前の呼び出し）を含む `SELECT` は、
+        // `LANGUAGE sql|plpgsql` の本体が書き込みうるため `Write` に倒す（fail-closed。複数文メッセージの
+        // 書き込み配置制約をすり抜けない）。誤って `Write` にしても暗黙トランザクションになるだけ。
+        Token::Keyword(Keyword::Select) => {
+            if calls_non_builtin_function(&tokens) {
+                StatementEffect::Write
+            } else {
+                StatementEffect::ReadOnly
+            }
+        }
         Token::Ident(name) if name.eq_ignore_ascii_case("EXPLAIN") => StatementEffect::ReadOnly,
         // Issue #1129: `SHOW PARTITIONED DML` はジョブ表の読み取りのみ（commit を伴わない）。
         // `CANCEL`（書き込み）は未知の先頭語として `Write`（fail-closed）に落とす。
@@ -359,7 +368,7 @@ pub fn classify_statement(stmt: &str) -> StatementEffect {
                                 || n.eq_ignore_ascii_case("DELETE")
                     )
             });
-            if has_dml_body {
+            if has_dml_body || calls_non_builtin_function(&tokens) {
                 StatementEffect::Write
             } else {
                 StatementEffect::ReadOnly
@@ -395,6 +404,155 @@ pub fn classify_statement(stmt: &str) -> StatementEffect {
         // 形であり、必ず `validate_sql` の許可リスト外（`42601`）へ落ちる。
         _ => StatementEffect::Rejected,
     }
+}
+
+/// `(` の直前の語が構文上の語（`IN`・`AS`・`OVER` 等）でも組み込み関数名でもない呼び出しを含むか
+/// （ユーザー定義関数の呼び出しの保守的な検出。構文語の取りこぼしは `Write` 側へ倒れるだけ）。
+fn calls_non_builtin_function(tokens: &[Token]) -> bool {
+    const SYNTAX_WORDS: &[&str] = &[
+        "IN",
+        "AS",
+        "ON",
+        "OR",
+        "NOT",
+        "ANY",
+        "ALL",
+        "SOME",
+        "EXISTS",
+        "VALUES",
+        "OVER",
+        "USING",
+        "WHEN",
+        "THEN",
+        "ELSE",
+        "CASE",
+        "BETWEEN",
+        "LIKE",
+        "ILIKE",
+        "SIMILAR",
+        "DISTINCT",
+        "WITH",
+        "UNION",
+        "INTERSECT",
+        "EXCEPT",
+        "OFFSET",
+        "GROUP",
+        "HAVING",
+        "FILTER",
+        "WITHIN",
+        "TO",
+        "IS",
+        "ARRAY",
+        "LATERAL",
+        "JOIN",
+        "INNER",
+        "LEFT",
+        "RIGHT",
+        "FULL",
+        "CROSS",
+        "NATURAL",
+        "MATERIALIZED",
+        "RECURSIVE",
+        "SEARCH",
+        "CYCLE",
+        "COLLATE",
+        "ESCAPE",
+        "CAST",
+        "EXTRACT",
+        "WINDOW",
+        "PARTITION",
+        "ROWS",
+        "RANGE",
+        "FROM",
+        "BY",
+        "AT",
+        "ZONE",
+        "END",
+        "NULL",
+        "TRUE",
+        "FALSE",
+        "UNNEST",
+        "PASSING",
+        "RETURNING",
+        "ON",
+        "DEFAULT",
+        "ERROR",
+        "EMPTY",
+        "KEYS",
+        "JSON_EXISTS",
+        "JSON_VALUE",
+        "JSON_QUERY",
+        "PLAN",
+        "ROW",
+        "NUMERIC",
+        "DECIMAL",
+        "VARCHAR",
+        "CHAR",
+        "CHARACTER",
+        "BPCHAR",
+        "VECTOR",
+        "TIMESTAMP",
+        "TIMESTAMPTZ",
+        "TIME",
+        "TIMETZ",
+        "INTERVAL",
+        "BIT",
+        "VARBIT",
+        "FLOAT",
+        "TRIM",
+        "POSITION",
+        "OVERLAY",
+        "SUBSTRING",
+        "ROW_NUMBER",
+        "RANK",
+        "DENSE_RANK",
+        "PERCENT_RANK",
+        "CUME_DIST",
+        "NTILE",
+        "LAG",
+        "LEAD",
+        "FIRST_VALUE",
+        "LAST_VALUE",
+        "NTH_VALUE",
+    ];
+    tokens.iter().enumerate().any(|(i, t)| {
+        let (Token::Ident(name), Some(Token::Punct('('))) = (t, tokens.get(i.saturating_add(1)))
+        else {
+            return false;
+        };
+        if SYNTAX_WORDS.iter().any(|k| name.eq_ignore_ascii_case(k))
+            || crate::sql::udf_call::is_reserved_function_name(name)
+        {
+            return false;
+        }
+        // `AS 別名(列, ...)` は別名の列名リストで、呼び出しではない。
+        if i > 0
+            && matches!(
+                tokens.get(i - 1),
+                Some(Token::Ident(a)) if a.eq_ignore_ascii_case("AS")
+            )
+        {
+            return false;
+        }
+        // `名前(列, ...) AS (` は CTE の列名リストで、呼び出しではない。
+        let mut depth = 0usize;
+        for (j, tk) in tokens.iter().enumerate().skip(i.saturating_add(1)) {
+            match tk {
+                Token::Punct('(') => depth = depth.saturating_add(1),
+                Token::Punct(')') => {
+                    depth = depth.saturating_sub(1);
+                    if depth == 0 {
+                        return !matches!(
+                            tokens.get(j.saturating_add(1)),
+                            Some(Token::Ident(a)) if a.eq_ignore_ascii_case("AS")
+                        );
+                    }
+                }
+                _ => {}
+            }
+        }
+        true
+    })
 }
 
 /// `COPY` 文のトークン列を [`StatementEffect`] へ分類する（[`classify_statement`] の
@@ -860,6 +1018,42 @@ mod tests {
             statements(outcome),
             vec!["SELECT 1 WHERE body = 'あ;い'", "SELECT 2"]
         );
+    }
+
+    /// Issue #2218: 組み込みだけの `SELECT` は読み取り、ユーザー定義関数の呼び出しを含めば書き込み
+    /// 扱い（`LANGUAGE sql|plpgsql` の本体が書きうるため）。構文語の括弧は呼び出しと誤認しない。
+    #[test]
+    fn classify_statement_treats_user_defined_calls_as_writes() {
+        for sql in [
+            "SELECT 1",
+            "SELECT abs(1), upper('a')",
+            "SELECT count(*) FROM t",
+            "SELECT a FROM t WHERE a IN (1, 2)",
+            "SELECT CAST(1 AS int)",
+            "SELECT a FROM t WHERE NOT (a = 1)",
+            "WITH x AS (SELECT id FROM t) SELECT * FROM x LIMIT 1",
+            "SELECT id FROM t USING PLAN('find the invoices')",
+            "SELECT coalesce(a, 1), nullif(a, 2), greatest(a, 1), least(a, 1) FROM t",
+            "SELECT date_trunc('day', ts), date_part('year', ts), now() FROM t",
+            "SELECT timezone('UTC', ts), extract(year FROM ts) FROM t",
+            "SELECT id FROM t AS x(a, b)",
+            "SELECT CAST(a AS numeric(10, 2)), a::varchar(5), b::vector(3) FROM t",
+            "SELECT a FROM t WHERE a BETWEEN 1 AND (2)",
+            "SELECT row_number() OVER (ORDER BY a) FROM t",
+            "SELECT array_length(arr, 1), jsonb_build_object('a', 1) FROM t",
+            "SELECT trim(b), position('a' IN b), overlay(b PLACING 'x' FROM 1) FROM t",
+            "SELECT TIMESTAMP(3) '2024-01-01 00:00:00'",
+        ] {
+            assert_eq!(classify_statement(sql), StatementEffect::ReadOnly, "{sql}");
+        }
+        for sql in [
+            "SELECT my_fn(1)",
+            "SELECT abs(my_fn(1))",
+            "SELECT a FROM t WHERE my_fn(a) = 1",
+            "WITH x AS (SELECT my_fn(1)) SELECT * FROM x",
+        ] {
+            assert_eq!(classify_statement(sql), StatementEffect::Write, "{sql}");
+        }
     }
 
     #[test]

@@ -200,9 +200,9 @@ pub(crate) struct FunctionAttributes {
 
 impl FunctionAttributes {
     /// 本体の書き込みを許す揮発性か（`VOLATILE` のみ）。`IMMUTABLE`／`STABLE` は PostgreSQL と同じく
-    /// 定義時には拒否せず、実行時に書き込みを `0A000` にする。#2218 が `PlCallOptions::may_write` を
-    /// 決めるとき、本体の書き込みの有無と組み合わせて使う入口（Issue #2217）。
-    #[allow(dead_code)] // 呼び出しの実行経路（#2218）が結線するまでテストからのみ呼ばれる。
+    /// 定義時には拒否せず、実行時に書き込みを `0A000` にする。`core::routine_call` が呼び出しごとの
+    /// `PlCallOptions::may_write` を決める入口（Issue #2217・#2218）。入れ子の呼び出しでは外側の
+    /// 呼び出しが書き込み不可なら内側も書き込み不可になる（fail-closed）。
     pub(crate) fn allows_writes(&self) -> bool {
         self.volatility == Volatility::Volatile
     }

@@ -99,11 +99,13 @@ mod plpgsql_validate;
 #[cfg(test)]
 mod plpgsql_validate_tests;
 // PL/pgSQL 本体の SQL を同じ Tx・同じ RLS で実行する `PlHost` 実装（Issue #2226・SQL-68）。
-// 呼び出し元は #2217／#2218／#2228 が結線するまでテストだけ。
+// 呼び出し元は #2217・#2218（`routine_call`）・#2228（`DO`）。
 #[allow(dead_code)]
 mod plpgsql_host;
 // `DO` ブロックの実行（SQL-68・Issue #2228）。
 mod do_block;
+// `LANGUAGE sql|plpgsql` 関数の呼び出し位置の実行（SQL-67 (5)・Issue #2218）。
+mod routine_call;
 // `CREATE FUNCTION ... LANGUAGE plpgsql` の定義時検証（Issue #2217・SQL-67 (3)）。
 mod function_define;
 #[cfg(test)]
@@ -6768,8 +6770,11 @@ impl EngineCore {
         // では原子的にならない）。
         // SQL-68・Issue #2228: `DO` も同じ暗黙トランザクションで実行する（本体の全文が 1 つの write txn に
         // 乗り、失敗時は副作用ゼロ）。
+        // SQL-67 (5)・Issue #2218: `LANGUAGE sql|plpgsql` の関数を呼ぶ `FROM` なし `SELECT` も同じ暗黙
+        // トランザクションで実行する（本体の書き込みが外側の文と同じ write txn に乗り、失敗時は副作用ゼロ）。
         if Self::is_subquery_predicate_dml(parsed)
             || matches!(parsed, ParsedSql::DataModifyingCte(_) | ParsedSql::Do(_))
+            || Self::calls_session_routine(session, parsed)
         {
             return self.execute_subquery_dml_autocommit(ctx, session, parsed);
         }
@@ -7819,6 +7824,13 @@ impl EngineCore {
                 Err(SqlSurfaceError::feature_not_supported(
                     "DROP FUNCTION is not supported inside a transaction block",
                 ))
+            }
+            // SQL-67 (5)・Issue #2218: ルーチンを呼ぶ `FROM` なし `SELECT` は、本体を同じ Tx・RLS で実行する
+            // ため読み取り経路へ回さず、Tx 上で畳み込みと実行を行う。
+            ParsedSql::Statement(Statement::ConstSelect(validated))
+                if crate::sql::const_select::calls_routine(validated, session.udfs()) =>
+            {
+                self.execute_const_select_routines(ctx, session, txn, validated)
             }
             // 検索・集計・広域取得・`EXPLAIN`・JOIN・評価後射影形ビュー・集合演算はすべて
             // 同じ読み取り経路へ入る（Issue #1179・#1192・#1353）。dirty テーブルの有無・
@@ -9036,7 +9048,8 @@ impl EngineCore {
                 let _schema_fn = crate::sql::search_path::SchemaFnScope::enter(
                     crate::sql::search_path::SchemaFnMode::TypesOnly,
                 );
-                let bound = crate::sql::const_select::bind(validated, session.udfs())?;
+                // ルーチン呼び出し（Issue #2218）は型検査だけして戻り値型を公告する（本体は実行しない）。
+                let bound = crate::sql::const_select::bind_describe(validated, session.udfs())?;
                 Ok(Some(bound.columns()))
             }
             ParsedSql::Statement(Statement::Select(validated)) => {
@@ -9233,7 +9246,7 @@ impl EngineCore {
                 crate::sql::ddl::require_ddl_permission(session)?;
                 let attrs = crate::sql::udf_ddl::function_attributes_from_clauses(&attributes);
                 // Issue #2217（SQL-67 (3)）: `LANGUAGE sql|plpgsql` は本体を原文のまま保存する経路へ。
-                // 呼び出しの実行は #2218（それまで式からの呼び出しは `42883`）。plpgsql は保存前に定義時検証。
+                // 呼び出しの実行は #2218（`core::routine_call`）。sql・plpgsql とも保存前に定義時検証。
                 let body = match (language, body) {
                     (
                         crate::sql::allowlist::FunctionLanguageClause::Declarative,
@@ -9268,7 +9281,11 @@ impl EngineCore {
                                         &body_source,
                                     )
                                 } else {
-                                    Ok(())
+                                    self.validate_sql_function_definition(
+                                        &params,
+                                        &param_types,
+                                        &body_source,
+                                    )
                                 }
                             },
                         )?;

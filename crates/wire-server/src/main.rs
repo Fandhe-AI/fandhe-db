@@ -233,6 +233,8 @@
 //! `54000`、入れ子・呼び出し深さの超過は `54001`。範囲外・非数値・値欠落・重複指定はいずれも
 //! fail-closed で起動エラー。値の解決は `wire_server::plpgsql_limits_opt::resolve` に一本化し、
 //! `EngineCore::with_plpgsql_limits` へ 1 回だけ注入する（`docs/design/plpgsql-subset.md`）。
+//! 文数と呼び出し深さの上限は `LANGUAGE sql` 関数の本体にも同じ値が効き、入れ子の呼び出しを
+//! 跨いで合算する（Issue #2218。新しいフラグは無い）。
 //!
 //! `--max-result-rows`（Issue #1555・#2211。SQL-34・SQL-46）: 明示 `LIMIT` の範囲上限と `LIMIT` 省略時の結果行数上限
 //! （`1`〜`100000`・既定 10000）を、プロセス全体に対して起動時に**上げ下げ両方向**へ設定できる

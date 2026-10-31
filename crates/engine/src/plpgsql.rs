@@ -20,6 +20,7 @@ pub(crate) mod interp;
 mod interp_tests;
 mod lexer;
 mod parser;
+pub(crate) mod sql_body;
 pub(crate) mod subst;
 #[cfg(test)]
 mod subst_tests;
@@ -30,6 +31,7 @@ pub(crate) mod value;
 use crate::sql::allowlist::SqlSurfaceError;
 
 pub(crate) use ast::{Body, ParseOptions};
+pub(crate) use sql_body::{check_result_shape, parse_sql_function_body};
 
 /// 構文誤り（`42601`）。文言は固定の英語で、本体の断片や名前の値を含めない。
 pub(super) fn syn_err(detail: impl Into<String>) -> SqlSurfaceError {

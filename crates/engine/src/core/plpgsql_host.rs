@@ -10,8 +10,8 @@
 //!
 //! 入口は [`EngineCore::run_plpgsql_in_txn`]（既に開いている Tx に参加する）と
 //! [`EngineCore::run_plpgsql_autocommit`]（Tx が無ければ暗黙 Tx を開き、成功で commit・失敗で abort
-//! する）。呼び出し元は #2217（`LANGUAGE plpgsql` の結線）・#2218（呼び出し位置）・#2228（`DO`・
-//! トリガ関数）が結線するまでテストだけ。
+//! する）。関数の呼び出し位置は [`EngineCore::run_routine_active`]（Issue #2218。`core::routine_call`
+//! が式の畳み込みから呼ぶ）、`DO` は #2228、トリガ関数は #1720 が結線する。
 //!
 //! 再入の不変条件（ADR D5）: 入口は、外側の実行器が同じ write txn の表ハンドルを開いていない時点
 //! からだけ呼ぶこと（同じ表を二重に開くと `TableAlreadyOpen`）。外側の対象行・可視行は呼び出しの前に
@@ -21,31 +21,40 @@
 //! fail-closed: 解析・実行のエラーは固定文言のまま返し、明示 Tx は `Failed`（後続は `25P02`）にする。
 //! 本体で許す文は DML と `SELECT` 系だけで、DDL・Tx 制御・`SET`・`COPY`・`USING OPERATION_ID`・
 //! `PARTITIONED` は `0A000`。`Ledgered` 構成では本体の書き込みを `23502` で拒否する（外側の
-//! operation_id を本体の実行器へ引き継ぐ配線は #2218／#2228 で入れる）。
+//! operation_id を本体の実行器へ引き継ぐ配線は、呼び出し位置が operation_id を持つ `INSERT ... VALUES`
+//! 等へ広がる時に入れる。#2218 の呼び出し位置は `SELECT` で operation_id を持たない）。
 
 use std::collections::HashSet;
 
 use super::{
     is_partitioned_write, parsed_operation_id, session_time_zone_scope, EngineCore, ParsedSql,
 };
+use crate::catalog::function::FunctionLanguage;
 use crate::catalog::{ColumnType, TableSchema};
 use crate::numeric::{self, Decimal};
-use crate::plpgsql::ast::{Body, DeclType, EmbeddedSql, SqlExpr, VarRole, VarSite};
+use crate::plpgsql::ast::{
+    Body, DeclType, EmbeddedSql, ParseOptions, ReturnShape, SqlExpr, VarRole, VarSite,
+};
+use crate::plpgsql::embedded::validate_embedded;
 use crate::plpgsql::host::{
     PlHost, PlScalar, ResolvedType, RowDemand, SqlOutcome as HostOutcome, VarLookup,
 };
+use crate::plpgsql::interp::run_sql_function;
 use crate::plpgsql::interp::{
     run_function, run_trigger_function, CallOutcome, ExecBudget, ReturnSpec, TriggerReturn,
     TriggerVars,
 };
 use crate::plpgsql::subst;
+use crate::plpgsql::{check_result_shape, parse_body, parse_sql_function_body};
 use crate::policy::PolicyContext;
 use crate::recovery::required_op_id::LedgerMode;
 use crate::sql::allowlist::{SqlSurfaceError, Statement};
+use crate::sql::cast::CastType;
 use crate::sql::exec::{Cell, ColumnMeta, QueryResult};
 use crate::sql::lexer::{self, Keyword, Token};
 use crate::sql::mode::SessionState;
 use crate::sql::transaction::{SessionTransaction, TransactionStatus};
+use crate::sql::udf_call::RoutineDefinition;
 use crate::sql::SqlOutcome as CoreOutcome;
 use crate::trigger::call::TriggerOutcome;
 
@@ -1004,6 +1013,66 @@ impl EngineCore {
             conflict_checked: HashSet::new(),
         };
         run_function(body, args, ret, &mut host, &mut budget)
+    }
+
+    /// `LANGUAGE sql|plpgsql` の関数 1 回を、既に開いている Tx の上で実行する（Issue #2218・SQL-67 (5)）。
+    /// 呼び出し元は `core::routine_call` の `RoutineCallHost`（式の畳み込みから）。本体は原文から毎回
+    /// 解析して定義時と同じ検証を通し、呼び出し元と同じ `PolicyContext`（RLS）・Tx で実行する。Tx の
+    /// 状態遷移（`Failed` 化・暗黙 Tx の破棄）とエラーの `scrub_error` は外側の実行入口が担う。
+    /// 再入の不変条件は本モジュールの doc を参照（外側の実行器が表ハンドルを開いていない時点から呼ぶ）。
+    pub(crate) fn run_routine_active<'e>(
+        &'e self,
+        ctx: &PolicyContext,
+        session: &mut SessionState,
+        txn: &mut SessionTransaction<'e>,
+        def: &RoutineDefinition,
+        args: Vec<PlScalar>,
+        may_write: bool,
+    ) -> Result<PlScalar, SqlSurfaceError> {
+        let Some(ret) = def.ret.as_ref() else {
+            return Err(unsupported(
+                "trigger functions cannot be called as ordinary functions",
+            ));
+        };
+        let typed: Vec<Option<CastType>> = def.param_types.iter().cloned().map(Some).collect();
+        let decls = super::function_define::param_decls(&def.params, &typed)?;
+        let limits = &self.plpgsql_limits;
+        let opts = ParseOptions::new(decls, ReturnShape::Scalar)
+            .with_limits(limits.max_nesting_depth(), limits.max_body_bytes());
+        let mut budget = ExecBudget::new(self.plpgsql_limits, self.result_limits.max_result_rows());
+        let mut host = CorePlHost {
+            core: self,
+            ctx,
+            session,
+            txn,
+            opts: PlCallOptions { may_write },
+            conflict_checked: HashSet::new(),
+        };
+        match def.language {
+            FunctionLanguage::Sql => {
+                let mut body = parse_sql_function_body(&def.body_source, &opts)?;
+                validate_embedded(&mut body, self)?;
+                check_result_shape(&body)?;
+                run_sql_function(&body, args, ret, &mut host, &mut budget)
+            }
+            FunctionLanguage::Plpgsql => {
+                let mut body = parse_body(&def.body_source, &opts)?;
+                validate_embedded(&mut body, self)?;
+                let spec = ReturnSpec {
+                    shape: ReturnShape::Scalar,
+                    ty: Some(ret.result_column_type().ok_or_else(|| {
+                        unsupported("unsupported return type of a function call")
+                    })?),
+                };
+                match run_function(&body, args, &spec, &mut host, &mut budget)? {
+                    CallOutcome::Scalar(v) => Ok(v),
+                    _ => Err(internal("PL/pgSQL function did not return a scalar")),
+                }
+            }
+            FunctionLanguage::Declarative => {
+                Err(internal("declarative function routed as routine"))
+            }
+        }
     }
 
     /// 既に開いている Tx の上でトリガ関数を 1 回実行する内部 API（Issue #2228・ADR D9）。状態ゲートと

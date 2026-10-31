@@ -40,6 +40,7 @@ use crate::sql::allowlist::{
     SqlSurfaceError, ValidatedConstSelect,
 };
 use crate::sql::exec::{scalar_cell_for, Cell, ColumnMeta, QueryResult, ResultRow};
+use crate::sql::routine_fold::{FoldMode, Folder, RoutineInvoker};
 use crate::sql::udf_call::{
     bind_const_expr, bind_const_projection_expr, bind_projection_expr, classify_integer_literal,
     eval, eval_with_scalars, into_owned_vector, BoundExpr, Expr, ExprType, ExprValue, NumericKind,
@@ -564,7 +565,10 @@ fn bind_having(
 }
 
 /// 評価結果 [`ExprValue`] を応答セルへ変換する（式項目・集計引数で共有）。
-fn expr_value_to_cell(v: ExprValue<'_>, ty: Option<&ColumnType>) -> Result<Cell, SqlSurfaceError> {
+pub(crate) fn expr_value_to_cell(
+    v: ExprValue<'_>,
+    ty: Option<&ColumnType>,
+) -> Result<Cell, SqlSurfaceError> {
     Ok(match v {
         ExprValue::Scalar(f) => scalar_cell_for(f, ty)?,
         ExprValue::Bool(b) => Cell::Bool(b),
@@ -620,6 +624,21 @@ pub fn bind(
     validated: &ValidatedConstSelect,
     registry: &UdfRegistry,
 ) -> Result<BoundConstSelect, SqlSurfaceError> {
+    bind_inner(validated, registry, None)
+}
+
+/// ルーチン呼び出しの畳み込み後の式（Issue #2218）。`items` は投影項目と添字が揃い、`None` は元の式を
+/// そのまま使う。列名は元の式から決める（畳み込み後の式の名前にしない）。
+struct Replaced {
+    items: Vec<Option<Expr>>,
+    where_expr: Option<Expr>,
+}
+
+fn bind_inner(
+    validated: &ValidatedConstSelect,
+    registry: &UdfRegistry,
+    replaced: Option<&Replaced>,
+) -> Result<BoundConstSelect, SqlSurfaceError> {
     validated
         .items()
         .iter()
@@ -636,9 +655,13 @@ pub fn bind(
     }
     let mut budget = MAX_EXPR_NODES;
     let mut items = Vec::with_capacity(validated.items().len());
-    for item in validated.items() {
+    for (idx, item) in validated.items().iter().enumerate() {
         let name = item_name(item);
-        let bound = match item.expr() {
+        let item_expr = replaced
+            .and_then(|r| r.items.get(idx))
+            .and_then(Option::as_ref)
+            .unwrap_or_else(|| item.expr());
+        let bound = match item_expr {
             _ if item.aggregate().is_some() => {
                 let Some(agg) = item.aggregate() else {
                     return Err(SqlSurfaceError::Internal {
@@ -671,6 +694,7 @@ pub fn bind(
         Some(ConstSelectCondition::Bool(b)) => Some(BoundCondition::Const(Some(*b))),
         Some(ConstSelectCondition::Null) => Some(BoundCondition::Const(None)),
         Some(ConstSelectCondition::Expr(e)) => {
+            let e = replaced.and_then(|r| r.where_expr.as_ref()).unwrap_or(e);
             let (bound, ty, _) = bind_const_expr(e, registry, &mut budget)?;
             if ty != ExprType::Bool {
                 return Err(SqlSurfaceError::datatype_mismatch(
@@ -819,5 +843,150 @@ pub fn run(
     registry: &UdfRegistry,
 ) -> Result<QueryResult, SqlSurfaceError> {
     let bound = bind(validated, registry)?;
+    execute(&bound)
+}
+
+/// 検証済みの文がセッションのルーチン（`LANGUAGE sql|plpgsql`）を呼ぶか（Issue #2218）。core の実行経路
+/// （暗黙 Tx への振り分け・Tx 上の実行）が使う判定で、ルーチンが 1 件も無ければ式木を走査しない。
+pub(crate) fn calls_routine(validated: &ValidatedConstSelect, registry: &UdfRegistry) -> bool {
+    if !registry.has_routines() {
+        return false;
+    }
+    let mut f = Folder::new(registry, FoldMode::Detect);
+    let mut scan = |e: &Expr| {
+        // `Detect` は式木を変えず、拒否もしない。
+        let _ = f.fold(e, false);
+    };
+    for item in validated.items() {
+        match item.aggregate() {
+            Some(agg) => {
+                if let AggregateArg::Expr(e) = &agg.arg {
+                    scan(e);
+                }
+            }
+            None => scan(item.expr()),
+        }
+    }
+    if let Some(ConstSelectCondition::Expr(e)) = validated.where_clause() {
+        scan(e);
+    }
+    if let Some(h) = validated.having() {
+        if let ConstSelectCondition::Expr(e) = h.condition() {
+            scan(e);
+        }
+        for agg in h.aggregates() {
+            if let AggregateArg::Expr(e) = &agg.arg {
+                scan(e);
+            }
+        }
+    }
+    f.found()
+}
+
+/// 集計・`HAVING`・`LIMIT`／`OFFSET` を伴う文の中のルーチン呼び出しを拒否する（PostgreSQL が評価しない
+/// 位置で副作用を起こさないための保守的な制限。`0A000`）。
+fn reject_unsupported_routine_context(
+    validated: &ValidatedConstSelect,
+    registry: &UdfRegistry,
+) -> Result<(), SqlSurfaceError> {
+    let has_aggregate_or_limit = validated.having().is_some()
+        || validated.limit().is_some()
+        || validated.offset().is_some()
+        || validated.items().iter().any(|i| i.aggregate().is_some());
+    if has_aggregate_or_limit && calls_routine(validated, registry) {
+        return Err(SqlSurfaceError::feature_not_supported(
+            "calling a LANGUAGE sql or plpgsql function together with aggregates, HAVING, LIMIT or OFFSET is not supported",
+        ));
+    }
+    Ok(())
+}
+
+/// 畳み込み（`mode`）を適用した式で定数式 SELECT を束縛する。`WHERE` を先に、`WHERE` が通るときだけ
+/// 投影項目の呼び出しを起動する（出力行が無いなら投影の副作用を起こさない）。
+fn fold_and_bind(
+    validated: &ValidatedConstSelect,
+    registry: &UdfRegistry,
+    mode: FoldMode<'_>,
+) -> Result<BoundConstSelect, SqlSurfaceError> {
+    reject_unsupported_routine_context(validated, registry)?;
+    // 列参照・集計の禁止検査は畳み込み（評価）より前に済ませる（引数の列参照を評価前に `42703` にする）。
+    validated
+        .items()
+        .iter()
+        .try_for_each(|i| match i.aggregate() {
+            Some(agg) => match &agg.arg {
+                AggregateArg::Star => Ok(()),
+                AggregateArg::Expr(e) => reject_non_constant(e),
+            },
+            None => reject_non_constant(i.expr()),
+        })?;
+    if let Some(ConstSelectCondition::Expr(e)) = validated.where_clause() {
+        reject_non_constant(e)?;
+    }
+    let mut folder = Folder::new(registry, mode);
+    let where_expr = match validated.where_clause() {
+        Some(ConstSelectCondition::Expr(e)) => Some(folder.fold(e, false)?),
+        _ => None,
+    };
+    // `WHERE` の真偽（`Run` のときだけ評価する）。通らなければ投影の呼び出しは起動しない。
+    if let Some(e) = &where_expr {
+        let mut budget = MAX_EXPR_NODES;
+        let (bound, ty, _) = bind_const_expr(e, registry, &mut budget)?;
+        if ty != ExprType::Bool {
+            return Err(SqlSurfaceError::datatype_mismatch(
+                "argument of WHERE must be type boolean",
+            ));
+        }
+        if folder.runs() {
+            let passes = match eval(&bound, 0, &[])? {
+                ExprValue::Bool(b) => b,
+                ExprValue::Null => false,
+                _ => {
+                    return Err(SqlSurfaceError::Internal {
+                        detail: "WHERE did not evaluate to boolean".to_string(),
+                    })
+                }
+            };
+            folder.set_active(passes);
+        }
+    } else if let Some(ConstSelectCondition::Bool(false) | ConstSelectCondition::Null) =
+        validated.where_clause()
+    {
+        folder.set_active(false);
+    }
+    let mut items = Vec::with_capacity(validated.items().len());
+    for item in validated.items() {
+        items.push(if item.aggregate().is_some() {
+            None
+        } else {
+            Some(folder.fold(item.expr(), false)?)
+        });
+    }
+    let replaced = Replaced { items, where_expr };
+    bind_inner(validated, registry, Some(&replaced))
+}
+
+/// Describe 用: ルーチン呼び出しを型検査だけして束縛する（本体は実行しない）。
+pub(crate) fn bind_describe(
+    validated: &ValidatedConstSelect,
+    registry: &UdfRegistry,
+) -> Result<BoundConstSelect, SqlSurfaceError> {
+    if !calls_routine(validated, registry) {
+        return bind(validated, registry);
+    }
+    fold_and_bind(validated, registry, FoldMode::Describe)
+}
+
+/// ルーチン呼び出しを `invoker` で起動して畳み込み、束縛と実行をまとめて行う（core が Tx の上で
+/// 呼ぶ入口。ルーチンを呼ばない文は [`run`] と同じ）。
+pub(crate) fn run_with_routines(
+    validated: &ValidatedConstSelect,
+    registry: &UdfRegistry,
+    invoker: &mut dyn RoutineInvoker,
+) -> Result<QueryResult, SqlSurfaceError> {
+    if !calls_routine(validated, registry) {
+        return run(validated, registry);
+    }
+    let bound = fold_and_bind(validated, registry, FoldMode::Run(invoker))?;
     execute(&bound)
 }
