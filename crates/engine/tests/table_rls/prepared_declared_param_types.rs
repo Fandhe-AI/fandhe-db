@@ -397,3 +397,142 @@ fn float8_canonical_text_keeps_float_literal_type() {
         );
     }
 }
+// ---- Issue #2797: `INSERT ... VALUES` の式内 `$n` を宣言型どおりに評価する ----
+// ポインタ: WIRE-12・SQL-24（併せて WIRE-24・SQL-45 (6)）。
+
+fn setup_typed(label: &str) -> (EngineCore, CleanupGuard, PolicyContext, SessionState) {
+    let path = unique_db_path(label);
+    let storage = Storage::open(&path).expect("open storage");
+    let core = EngineCore::from_storage(storage, Box::new(CpuScalarProvider));
+    let ctx = PolicyContext::with_visibilities("sys", [Visibility::Public, Visibility::Private])
+        .expect("valid tenant");
+    let mut session = SessionState::default();
+    session.allow_ddl();
+    core.execute_sql_in_session(
+        &ctx,
+        &mut session,
+        "CREATE TABLE tv (id BIGINT PRIMARY KEY, b BIGINT, d DOUBLE PRECISION, r REAL)",
+    )
+    .expect("create table");
+    (core, CleanupGuard(path), ctx, session)
+}
+
+/// 宣言型つきで Parse → Bind → Execute し、結果コード（成功は `Ok`）を返す。
+fn exec_typed(
+    core: &EngineCore,
+    ctx: &PolicyContext,
+    session: &mut SessionState,
+    sql: &str,
+    declared: &[Option<D>],
+    values: &[&str],
+) -> Result<(), String> {
+    let prepared = core
+        .parse_sql_prepared_with_declared(sql, declared)
+        .map_err(|e| e.wire_code().to_string())?;
+    let binds: Vec<Option<Vec<u8>>> = values.iter().map(|v| some(v)).collect();
+    let parsed = core
+        .bind_prepared(&prepared, &binds)
+        .map_err(|e| e.wire_code().to_string())?;
+    core.execute_parsed_in_session(ctx, session, &parsed)
+        .map(|_| ())
+        .map_err(|e| e.wire_code().to_string())
+}
+
+fn cell_text(core: &EngineCore, ctx: &PolicyContext, s: &mut SessionState, q: &str) -> String {
+    match core.execute_sql_in_session(ctx, s, q).expect("select") {
+        engine::sql::SqlOutcome::Query(r) => format!(
+            "{:?}",
+            r.rows.into_iter().map(|row| row.cells).collect::<Vec<_>>()
+        ),
+        _ => panic!("expected Query outcome"),
+    }
+}
+
+#[test]
+fn bigint_declared_expression_is_evaluated_as_bigint() {
+    let (core, _g, ctx, mut s) = setup_typed("typed-i8");
+    let sql = "INSERT INTO tv (id, b) VALUES (1, $1 + 1) USING OPERATION_ID 'op-1'";
+    // int4 の上限 + 1 は bigint の算術として成功する（従来は int4 の算術で `22003`）。
+    exec_typed(&core, &ctx, &mut s, sql, &[Some(D::Int8)], &["2147483647"]).expect("bigint");
+    let out = cell_text(&core, &ctx, &mut s, "SELECT b FROM tv LIMIT 10");
+    assert!(out.contains("2147483648"), "{out}");
+}
+
+#[test]
+fn smallint_declared_expression_overflows_as_smallint() {
+    let (core, _g, ctx, mut s) = setup_typed("typed-i2");
+    let sql = "INSERT INTO tv (id, b) VALUES (1, $1 + $2) USING OPERATION_ID 'op-1'";
+    let both = [Some(D::Int2), Some(D::Int2)];
+    // smallint 同士の算術は smallint の範囲で `22003` になる。
+    assert_eq!(
+        exec_typed(&core, &ctx, &mut s, sql, &both, &["32767", "1"]),
+        Err("22003".to_string())
+    );
+    exec_typed(&core, &ctx, &mut s, sql, &both, &["32766", "1"]).expect("in range");
+    // smallint + integer リテラルは integer の算術になり成功する（PostgreSQL と同じ）。
+    let mixed = "INSERT INTO tv (id, b) VALUES (2, $1 + 1) USING OPERATION_ID 'op-2'";
+    exec_typed(&core, &ctx, &mut s, mixed, &[Some(D::Int2)], &["32767"]).expect("int4 arithmetic");
+}
+
+#[test]
+fn float8_declared_expression_is_evaluated_as_float() {
+    let (core, _g, ctx, mut s) = setup_typed("typed-f8");
+    let div = "INSERT INTO tv (id, d) VALUES (1, $1 / 2) USING OPERATION_ID 'op-1'";
+    exec_typed(&core, &ctx, &mut s, div, &[Some(D::Float8)], &["5"]).expect("float division");
+    let out = cell_text(&core, &ctx, &mut s, "SELECT d FROM tv LIMIT 10");
+    assert!(out.contains("2.5"), "{out}");
+    let add = "INSERT INTO tv (id, d) VALUES (2, $1 + 1) USING OPERATION_ID 'op-2'";
+    exec_typed(&core, &ctx, &mut s, add, &[Some(D::Float8)], &["1.5"]).expect("fraction");
+    let out = cell_text(
+        &core,
+        &ctx,
+        &mut s,
+        "SELECT d FROM tv WHERE id = 2 LIMIT 10",
+    );
+    assert!(out.contains("2.5"), "{out}");
+}
+
+#[test]
+fn negative_values_in_typed_expressions() {
+    let (core, _g, ctx, mut s) = setup_typed("typed-neg");
+    let unary = "INSERT INTO tv (id, b) VALUES (1, -$1) USING OPERATION_ID 'op-1'";
+    exec_typed(&core, &ctx, &mut s, unary, &[Some(D::Int8)], &["-5"]).expect("unary minus");
+    let binary = "INSERT INTO tv (id, b) VALUES (2, 1 - $1) USING OPERATION_ID 'op-2'";
+    exec_typed(&core, &ctx, &mut s, binary, &[Some(D::Int8)], &["-5"]).expect("binary minus");
+    let plain = "INSERT INTO tv (id, b) VALUES (3, $1 + 0) USING OPERATION_ID 'op-3'";
+    exec_typed(&core, &ctx, &mut s, plain, &[Some(D::Int8)], &["-5"]).expect("negative");
+    let out = cell_text(
+        &core,
+        &ctx,
+        &mut s,
+        "SELECT id, b FROM tv ORDER BY id LIMIT 10",
+    );
+    assert!(
+        out.contains('5') && out.contains('6') && out.contains("-5"),
+        "{out}"
+    );
+}
+
+#[test]
+fn typed_substitution_keeps_fail_closed_shapes() {
+    let (core, _g, ctx, mut s) = setup_typed("typed-closed");
+    // `$n::T` は従来どおり定数式で拒否される。
+    let cast = "INSERT INTO tv (id, b) VALUES (1, $1::bigint + 1) USING OPERATION_ID 'op-1'";
+    assert_eq!(
+        exec_typed(&core, &ctx, &mut s, cast, &[Some(D::Int8)], &["1"]),
+        Err("0A000".to_string())
+    );
+    // 宣言 int4 の範囲外は宣言型の検証で `22003`。
+    let sql = "INSERT INTO tv (id, b) VALUES (2, $1 + 1) USING OPERATION_ID 'op-2'";
+    assert_eq!(
+        exec_typed(&core, &ctx, &mut s, sql, &[Some(D::Int4)], &["3000000000"]),
+        Err("22003".to_string())
+    );
+    // Parse 段の値依存エラー（0 除算）は Bind まで遅延され、Bind で `22012` になる。
+    let div = "INSERT INTO tv (id, b) VALUES (3, 10 / $1) USING OPERATION_ID 'op-3'";
+    assert_eq!(
+        exec_typed(&core, &ctx, &mut s, div, &[Some(D::Int8)], &["0"]),
+        Err("22012".to_string())
+    );
+    exec_typed(&core, &ctx, &mut s, div, &[Some(D::Int8)], &["5"]).expect("division ok");
+}
