@@ -122,6 +122,24 @@ tokenizers = { version = "=0.23.2", optional = true, default-features = false, f
     "onig",
 ] }
 
+# Issue #1924（EXT-9 ポインタ。WASM UDF の実行バックエンド用依存）:
+# `wasm_udf.rs` の契約層（`WasmUdfBackend`）の実装が WASM の検証・コンパイル・
+# サンドボックス実行を自作せず wasmtime に委ねるための依存。
+# オーナー承認済み（2026-10-31・承認記録は Issue #1911 のコメントと
+# `docs/design/wasmtime-adoption.md`〔Accepted〕第 8 節）。承認範囲はこの 1 行だけ（版は 48.0.8。RUSTSEC-2026-0422・0423・0424 の修正版。承認は #1911 のコメント 2026-10-31）で、
+# 版の変更（セキュリティ更新を含む）や `wasmtime-*` サブクレートの直接依存化は再承認が要る。
+#   - `wasmtime = "=48.0.8"`（LTS 系列。default-features = false に `runtime`・
+#     `cranelift`・`std` のみ。WASI・component-model・async・cache・profiling は含めない。
+#     ライセンス: Apache-2.0 WITH LLVM-exception）
+# 依存の規模が大きく用途が限られるため optional・下記 `wasm-udf` feature の背後に限定し、
+# `wire-server` はリンクしない（既定ビルドの依存木に出現しない）。
+# .claude/rules/dependency-policy.md に従い完全固定（=x.y.z）で管理する。
+wasmtime = { version = "=48.0.8", optional = true, default-features = false, features = [
+    "runtime",
+    "cranelift",
+    "std",
+] }
+
 [features]
 # CORE-5 の対照エンジン（usearch の総当たり `exact_search`）を bench 専用に有効化する
 # feature。`test-support` feature 廃止時（本ファイル上部の redb dev-dependency コメント
@@ -149,6 +167,12 @@ bench-internals = []
 # `wire-server` でも有効化しない。テナント境界・RLS・認証・fail-closed の経路を迂回する
 # API は露出せず、コールバックへ渡すのは同期点の種別だけ（行・テナント・テーブル名は渡さない）。
 test-sync-points = []
+
+# Issue #1924（EXT-9 ポインタ）: WASM UDF の実行バックエンド用依存（wasmtime）を有効化する
+# feature。`contrast-bench`/`cross-encoder` と同パターンで、既定ビルド・`wire-server` には
+# 一切結線しない（テナント境界・RLS 迂回 API は露出しない）。現時点では依存を有効にする
+# だけで実行経路はない（実装は #1925 以降）。feature 無効時の fail-closed な拒否は #1926 で決める。
+wasm-udf = ["dep:wasmtime"]
 
 [dev-dependencies]
 # codex P0-2 指摘（Issue #137）対応: 以前は `test-support` feature ＋ self

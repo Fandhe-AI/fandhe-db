@@ -35,7 +35,7 @@
 
 | 項目 | 内容 |
 | ---- | ---- |
-| クレート・版 | 推奨は `wasmtime = "=48.0.7"`（2026-10-19 公開。**LTS 系列**）。最新安定版は 50.0.0（2026-10-20）だが公開から 9 日で、非 LTS（サポートは 2 か月）のため推奨しない。代替は 49.0.4（非 LTS）・36.0.19（旧 LTS）。最終的な版はオーナーが決める |
+| クレート・版 | 推奨は `wasmtime = "=48.0.7"`（2026-10-19 公開。**LTS 系列**。承認時に `=48.0.8` へ変更。第 8 節）。最新安定版は 50.0.0（2026-10-20）だが公開から 9 日で、非 LTS（サポートは 2 か月）のため推奨しない。代替は 49.0.4（非 LTS）・36.0.19（旧 LTS）。最終的な版はオーナーが決める |
 | LTS 方針 | 公式ドキュメント（`docs/stability-release.md`）による: 毎月 20 日に新メジャー版を出し、12 の倍数の版が LTS（サポート 24 か月）、それ以外は 2 か月。セキュリティ修正は全サポート版へバックポートが保証され、バグ修正は有志ベース。48 は LTS |
 | 目的 | WASM UDF（EXT-5・EXT-6）の検証・コンパイル・サンドボックス実行を自作せずに得るため（第 1 節） |
 | ライセンス | `Apache-2.0 WITH LLVM-exception`（`deny.toml` の allow に既存）。推移的依存（最小構成 72 crate）のライセンスは `MIT OR Apache-2.0`・`Apache-2.0 WITH LLVM-exception`・`Unlicense OR MIT`・`Zlib`・`MIT`・`(MIT OR Apache-2.0) AND Unicode-3.0`・`Apache-2.0 / MIT` で、**allow list 外のものは無し**。probe に `deny.toml` を複製して `cargo deny --all-features check licenses advisories bans` を実行し、advisories・bans は ok、licenses は probe 自身（ライセンス未記載）以外の違反なし。`deny.toml` の変更は不要の見込み（確認は #1924 の `make deny`） |
@@ -104,9 +104,10 @@ feature 名は crates.io API の 48.0.7 の feature 一覧による。最小構�
   - 却下の場合は、#1923〜#1928 の close を指示するかどうか
 - 承認後の手順の更新: #1911 のコメントを根拠に、本 ADR のステータスと第 7 節・第 8 節を更新する（後続の記録 PR で実施。#1913 はそれまで open のまま残す）
 - 2026-10-31: オーナーが #1911 のコメント（https://github.com/Fandhe-AI/fandhe-db/issues/1911#issuecomment-6538261249）で**承認**した。ステータスを Accepted に変更し、第 7 節の着手停止を解除した。承認内容は次のとおり
-  - 版: `wasmtime = "=48.0.7"`（LTS 系列）
+  - 版: `wasmtime = "=48.0.8"`（LTS 系列。推奨の 48.0.7 から変更。理由は RUSTSEC-2026-0422・0423・0424 の修正版であるため）
   - feature セット: 案 A（`default-features = false` ＋ `runtime`・`cranelift`・`std`）
   - 第 4 節 1（feature ゲート）: 採用。`optional = true`、`wasm-udf = ["dep:wasmtime"]`、default に含めない
   - 第 4 節 2（feature セット）: 案 A を採用
   - 第 4 節 3（`--all-features` と CI 時間）: 受け入れる。増分の実測は #1924 で行い、許容を超える場合は専用ジョブへの分離を検討する
-  - 第 4 節 4（承認範囲）: 直接依存 `wasmtime = "=48.0.7"` の 1 行に限る。版の変更（セキュリティ更新を含む）とサブクレートの直接依存化は範囲外で、再承認を要する
+  - 第 4 節 4（承認範囲）: 直接依存 `wasmtime = "=48.0.8"` の 1 行に限る。版の変更（セキュリティ更新を含む）とサブクレートの直接依存化は範囲外で、再承認を要する
+- 2026-10-31: Issue #1924 で依存を追加した。版は承認どおり `=48.0.8`（48.0.7 から変更。理由は RUSTSEC-2026-0422・0423・0424 の修正版であるため。承認は #1911 のコメント）。`Cargo.lock` は wasmtime 系の新規エントリのみで既存エントリの版は不変。`make deny` は通過し、既定ビルドの engine・wire-server の依存木に wasmtime・cranelift は出ない
