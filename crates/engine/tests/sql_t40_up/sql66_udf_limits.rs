@@ -393,3 +393,98 @@ fn persistent_function_cannot_depend_on_session_local_function() {
     assert!(other.udfs().get("p1").is_none());
     assert!(other.udfs().get("p2").is_none());
 }
+
+/// T8b: SCHEMA 修飾で呼ぶセッション限定の関数（内部キー `#<id>.<name>` で登録）も依存として拒否する。
+/// 呼び出し時と同じ名前の引き方（`UdfRegistry::get`・`get_wasm`）で依存を解決するため、修飾の有無で
+/// 検査が素通りしない。未修飾の `loc` は呼び出し時にも解決されない（`search_path` は関数名に効かない）
+/// ため依存にならず、作成は従来どおり 42883。
+#[test]
+fn persistent_function_dependency_follows_call_time_name_resolution() {
+    let path = unique_db_path("sql66-persist-dep-schema");
+    let _g = CleanupGuard(path.clone());
+    let core = open(&path, 8);
+    let mut s = session(true);
+    ok(&core, "alice", &mut s, "CREATE SCHEMA s");
+    // SCHEMA の内部 ID は公開されないため、候補 ID すべてへセッション限定の関数を登録する。
+    for n in 1..8 {
+        let _ = define_function(
+            s.udfs_mut(),
+            &format!("#{n}.loc"),
+            &["x".to_string()],
+            &Expr::Ident("x".to_string()),
+        );
+    }
+    assert_eq!(
+        code(&core, "alice", &mut s, "CREATE FUNCTION p1(x) AS s.loc(x)"),
+        "0A000"
+    );
+    ok(&core, "alice", &mut s, "SET search_path = s, public");
+    assert_eq!(
+        code(&core, "alice", &mut s, "CREATE FUNCTION p3(x) AS loc(x)"),
+        "42883"
+    );
+    let mut other = session(true);
+    core.load_session_udfs(&ctx("alice"), &mut other)
+        .expect("load session udfs");
+    for n in ["p1", "p3"] {
+        assert!(other.udfs().get(n).is_none(), "{n}");
+    }
+}
+
+/// 明示トランザクション（BEGIN → `sql` → ROLLBACK）で `sql` を実行し、エラーの wire_code を返す。
+fn code_in_txn(core: &EngineCore, tenant: &str, s: &mut SessionState, sql: &str) -> String {
+    let c = ctx(tenant);
+    let mut txn = core.new_session_transaction();
+    core.execute_sql_in_txn(&c, s, &mut txn, "BEGIN")
+        .expect("begin");
+    let err = core
+        .execute_sql_in_txn(&c, s, &mut txn, sql)
+        .expect_err("persistent function DDL inside a transaction must be rejected");
+    core.execute_sql_in_txn(&c, s, &mut txn, "ROLLBACK")
+        .expect("rollback");
+    err.wire_code().to_string()
+}
+
+/// T9: 明示トランザクション内の永続 DDL は、型注釈・RETURNS の有無によらず 0A000（権限なしは 42501 が先）。
+/// ROLLBACK 後も別セッション・再起動後に関数は存在せず、OR REPLACE も取り消し不要（変更されない）。
+#[test]
+fn persistent_function_ddl_in_explicit_transaction_is_rejected() {
+    let path = unique_db_path("sql66-txn-ddl");
+    let _g = CleanupGuard(path.clone());
+    let sqls = [
+        "CREATE FUNCTION t1(x integer) AS x",
+        "CREATE FUNCTION t3(x integer) RETURNS integer AS x",
+        "CREATE FUNCTION t4(x) AS x",
+        "CREATE OR REPLACE FUNCTION keep(x integer) RETURNS integer AS x + 100",
+        "CREATE OR REPLACE FUNCTION t5(x integer) AS x",
+        "DROP FUNCTION keep",
+    ];
+    {
+        let core = open(&path, 8);
+        let mut s = session(true);
+        ok(&core, "alice", &mut s, "CREATE FUNCTION keep(x) AS x + 1");
+        for sql in sqls {
+            assert_eq!(code_in_txn(&core, "alice", &mut s, sql), "0A000", "{sql}");
+        }
+        // 権限なしは 42501 が先。
+        let mut nd = session(false);
+        for sql in sqls {
+            assert_eq!(code_in_txn(&core, "alice", &mut nd, sql), "42501", "{sql}");
+        }
+        let mut other = session(true);
+        core.load_session_udfs(&ctx("alice"), &mut other)
+            .expect("load session udfs");
+        assert!(other.udfs().get("keep").is_some());
+        for n in ["t1", "t3", "t4", "t5"] {
+            assert!(other.udfs().get(n).is_none(), "{n}");
+        }
+    }
+    let core = open(&path, 8);
+    let mut s = session(true);
+    core.load_session_udfs(&ctx("alice"), &mut s)
+        .expect("load session udfs");
+    assert!(s.udfs().get("keep").is_some());
+    for n in ["t1", "t3", "t4", "t5"] {
+        assert!(s.udfs().get(n).is_none(), "{n}");
+    }
+}

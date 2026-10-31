@@ -2917,10 +2917,13 @@ pub(crate) fn body_depends_on_session_local(body: &Expr, registry: &UdfRegistry)
         if !visited.insert(lower.clone()) {
             continue;
         }
-        if registry.wasm.contains_key(&lower) {
+        // 呼び出し時（`bind_call`）と同じ `get_wasm`・`get` で名前を引く。SCHEMA 修飾の呼び出しは名前解決器が
+        // 内部キー（`#<id>.<name>`）へ置き換え済みで、未修飾名は `search_path` では解決されないため、
+        // 呼び出し時に解決される先と依存検査が見る先が一致する。
+        if registry.get_wasm(&lower).is_some() {
             return true;
         }
-        if let Some(def) = registry.defs.get(&lower) {
+        if let Some(def) = registry.get(&lower) {
             if !registry.is_catalog_origin(&lower) {
                 return true;
             }

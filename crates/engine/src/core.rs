@@ -7707,26 +7707,15 @@ impl EngineCore {
                 | Statement::SetSearchPath { .. }
                 | Statement::ShowSearchPath),
             ) => self.execute_validated_in_session(ctx, session, stmt.clone()),
-            // SQL-66（Issue #1920・#1922）: `CREATE FUNCTION` は DDL 権限が無ければ保存先（カタログ／
-            // セッション内）の振り分けより前に `42501` で拒否する（fail-closed）。権限のあるセッションは
-            // UDF カタログへ書く永続 DDL のため、ROLLBACK で取り消せない書き込みを明示トランザクションの
-            // 中で行わない（他の DDL と同じ `0A000`）。型付き引数・RETURNS 付き（#2798 までセッション限定）は
-            // カタログへ書かず ROLLBACK で `session_at_begin` へ戻るため、そのまま通す。
-            ParsedSql::Statement(
-                stmt @ Statement::CreateFunction {
-                    param_types,
-                    return_type,
-                    ..
-                },
-            ) => {
+            // SQL-66（Issue #1920・#1922）: `CREATE [OR REPLACE] FUNCTION` は DDL 権限が無ければ `42501` で
+            // 拒否する（fail-closed）。権限のあるセッションでも UDF カタログへ書く永続 DDL は独立した
+            // write txn で commit され ROLLBACK で取り消せないため、型注釈・RETURNS の有無によらず
+            // 明示トランザクションの中では行わない（他の DDL と同じ `0A000`）。
+            ParsedSql::Statement(Statement::CreateFunction { .. }) => {
                 crate::sql::ddl::require_ddl_permission(session)?;
-                if return_type.is_some() || param_types.iter().any(Option::is_some) {
-                    self.execute_validated_in_session(ctx, session, stmt.clone())
-                } else {
-                    Err(SqlSurfaceError::feature_not_supported(
-                        "CREATE [OR REPLACE] FUNCTION is not supported inside a transaction block",
-                    ))
-                }
+                Err(SqlSurfaceError::feature_not_supported(
+                    "CREATE [OR REPLACE] FUNCTION is not supported inside a transaction block",
+                ))
             }
             ParsedSql::DropFunction(_) => {
                 crate::sql::ddl::require_ddl_permission(session)?;
