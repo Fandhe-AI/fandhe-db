@@ -545,14 +545,35 @@ fn replace_inside_explicit_transaction_is_rejected_for_ddl_sessions() {
         .expect("rollback");
 }
 
-/// DDL セッションの型付き・RETURNS つきの OR REPLACE は、CREATE と同じく永続化できない（0A000）。
-/// 本体の型不一致（42P13）が先に出る。
+/// SQL-66・#2798: DDL セッションの型付き・RETURNS つきの OR REPLACE は永続化される。
+/// 同じシグネチャなら置換でき、戻り値型の変更・RETURNS の有無の変更は 42P13、引数の型の変更は 42723。
 #[test]
-fn replace_with_typed_signature_is_not_persisted_in_ddl_sessions() {
+fn replace_with_typed_signature_is_persisted_in_ddl_sessions() {
     let path = unique_db_path("sql66-dr-replace-typed-ddl");
     let _g = CleanupGuard(path.clone());
     let core = open(&path);
     let mut s = ddl_session();
+    ok(
+        &core,
+        "alice",
+        &mut s,
+        "CREATE FUNCTION tf(x integer) RETURNS integer AS x",
+    );
+    ok(
+        &core,
+        "alice",
+        &mut s,
+        "CREATE OR REPLACE FUNCTION tf(x integer) RETURNS integer AS x + 1",
+    );
+    assert_eq!(
+        code(
+            &core,
+            "alice",
+            &mut s,
+            "CREATE OR REPLACE FUNCTION tf(x integer) RETURNS bigint AS x"
+        ),
+        "42P13"
+    );
     assert_eq!(
         code(
             &core,
@@ -560,15 +581,15 @@ fn replace_with_typed_signature_is_not_persisted_in_ddl_sessions() {
             &mut s,
             "CREATE OR REPLACE FUNCTION tf(x integer) AS x"
         ),
-        "0A000"
+        "42P13"
     );
     assert_eq!(
         code(
             &core,
             "alice",
             &mut s,
-            "CREATE OR REPLACE FUNCTION tf(x integer) RETURNS integer AS x"
+            "CREATE OR REPLACE FUNCTION tf(x text) RETURNS text AS x"
         ),
-        "0A000"
+        "42723"
     );
 }

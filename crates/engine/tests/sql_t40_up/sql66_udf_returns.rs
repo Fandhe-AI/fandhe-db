@@ -283,8 +283,10 @@ fn nested_returns_call_has_static_type() {
     );
 }
 
+/// SQL-66・#2798: DDL セッションでも非 DDL セッションと同じ検証（`42P13`）を通り、通った定義は
+/// カタログへ永続化される（同名の再作成は `42723`）。検証に失敗した定義は何も書かない。
 #[test]
-fn ddl_session_validates_then_refuses_persistence() {
+fn ddl_session_validates_then_persists() {
     let (core, _g) = new_core("sql66r-ddl");
     let mut s = SessionState::default();
     s.allow_ddl();
@@ -292,17 +294,22 @@ fn ddl_session_validates_then_refuses_persistence() {
         code(
             &core,
             &mut s,
-            "CREATE FUNCTION f(x integer) RETURNS integer AS x + 1"
+            "CREATE FUNCTION f(x integer) RETURNS boolean AS x + 1"
         ),
-        "0A000"
+        "42P13"
+    );
+    define(
+        &core,
+        &mut s,
+        "CREATE FUNCTION f(x integer) RETURNS integer AS x + 1",
     );
     assert_eq!(
         code(
             &core,
             &mut s,
-            "CREATE FUNCTION f(x integer) RETURNS boolean AS x + 1"
+            "CREATE FUNCTION f(x integer) RETURNS integer AS x + 2"
         ),
-        "42P13"
+        "42723"
     );
 }
 
