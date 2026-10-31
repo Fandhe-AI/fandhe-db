@@ -500,8 +500,9 @@ D3・D5・D6・D8 の最終判断。実装は `crates/engine/src/core/plpgsql_ho
   `CAST` と同一に行うため、畳み込みが宣言型どおりの算術を行う（bigint の `p + 1` が int4 の範囲エラー
   にならない）。公開の `Token`・`Expr` の形は変えない。利用者の `CAST` は従来どおり定数式で拒否され、
   `VALUES (CAST(1 AS bigint))` は 0A000 のまま。
-  numeric は定数式で算術できないため、単独の要素（符号付きを含む）は裸の数値（列型が決める）、
-  式の中は 0A000。静的 SQL の `VALUES (-p)` は定義時の検証が拒否する（素の SQL の `-col` と同じ）。
+  numeric は、単独の要素（符号付きを含む）は裸の数値（列型が決める）、式の中は内部専用の
+  `$typed:numeric` で置換して近似なしで畳み込む（Issue #2799 追記節）。
+  静的 SQL の `VALUES (-p)` は定義時の検証が拒否する（素の SQL の `-col` と同じ）。
   負値の numeric を単項マイナスの下に置く形（`-(-3)`）は括弧付きになり定数式が受理しない。
   `WHERE` 形の比較の検査（`where_probe`）は
   値同士の比較なので裸の数値（`NumStyle::Bare`）
@@ -610,3 +611,73 @@ SQL-68 ポインタ。D9 の内部 API と `DO` を実装した。公開 enum `S
 - SQL の `CREATE FUNCTION ... RETURNS trigger LANGUAGE plpgsql` は #2217（ドル引用は #2216）。
 - `TG_ARGV`・`TG_RELID` 等は未宣言。参照は通常の識別子扱いで、列として解決できず失敗する（fail-closed）。
   `TG_NARGS` は使える。
+
+## Issue #2229 追記（RLS 境界・資源上限・台帳整合の検証。SQL-68・RLS-10 ポインタ）
+
+本体の変更を伴わない回帰テストの追加（`test(engine)`）。到達経路の制約から、公開 API の `DO` と crate 内の
+関数入口（`run_plpgsql_in_txn`／`run_plpgsql_autocommit`）の 2 系統で検証する。
+
+### 追加したテストと性質
+
+| 性質 | 場所 |
+| ---- | ---- |
+| 越境マトリクス（`DO`。3 テナント × 可視性 2 × 経路 2 × flood × 読み 4 形・書き 3 形。双子オラクル・真実値・flood 不変・他テナント行の不変・エラー文面・試行総数の固定） | `tests/table_rls/rls10_plpgsql_paths.rs` |
+| 越境マトリクス（関数本体。`SELECT INTO`／`FOR`／`PERFORM`／`RETURN QUERY`／`UPDATE`／`DELETE`・読み取り専用関数の拒否・エラー文面） | `src/core/plpgsql_boundary_tests.rs` |
+| 上限超過の fail-closed（文数・ループ・入れ子〔`54001`〕・本体長・結果行数。上限ちょうどは成功・+1 で失敗・明示 Tx は `25P02` から `ROLLBACK`・既定上限での陽性対照） | `tests/sql_t40_up/sql68_do_limits_ledger.rs`、関数本体は `plpgsql_boundary_tests.rs` |
+| 台帳（`DO ... USING OPERATION_ID` の `0A000` と未記録・未実行、`Ledgered` の `23502`、証人 INSERT との順序 A／B の再送、失敗時に台帳が残らない、再オープン後の再送、テナント別の台帳） | `tests/sql_t40_up/sql68_do_limits_ledger.rs` |
+| crash（SIGKILL 後の `DO` の全か無か・台帳と本体の原子性・第 2 テナントの不干渉・再送の `23505` と全体破棄） | `examples/crash_tool_sequence.rs` の `*-do` サブコマンド（`scripts/crash_test_sequence.sh` の 3 つ目のモード。新しい CI ジョブは作らない） |
+
+### 到達経路の制約と既知の制限（起票はしない。要対応事項）
+
+- `DO` の本体は単一引用リテラルのみ（#2216 のドル引用待ち）。PL/pgSQL 関数本体は crate 内入口のみ
+  （#2217・#2218 待ち）。
+- 呼び出し深さ（`54001`）の本番経路での検証は #2218 以降。ScriptedHost の `plpgsql/interp_tests.rs` で固定済み。
+- `DO ... USING OPERATION_ID` の受理（台帳キーの設計）は #2228 追記の要対応事項のまま。明示 Tx の証人 INSERT が
+  台帳の鍵になる形だけを固定した。外側の operation_id を本体の書き込みへ引き継ぐ形（`Ledgered` での `SELECT f()` 等）の
+  再送検証は #2218 以降。
+- `nextval()` を本体から使う採番の検証は行っていない（本体 SQL の `DEFAULT nextval` の扱いは別途）。
+- トリガ発火経由の越境・crash は #1720。
+
+## Issue #2217 追記（`CREATE FUNCTION` の `LANGUAGE` 句と属性）
+
+- 構文: シグネチャの後は `RETURNS`・`LANGUAGE`・`AS`・属性を順不同で受理する。同じ種類の句の重複・矛盾は
+  `42601`。`LANGUAGE` が無ければ従来の宣言的 UDF（本体は式）で、`AS $$...$$` も従来どおり定数式の本体。
+  `LANGUAGE sql|plpgsql` は本体が文字列リテラル 1 個に限り、`RETURNS` と型付き引数が必須（欠落は
+  `42P13`／`42601`）。保存する `body_source` は文字列を復号した本文。
+- 属性: 揮発性・`STRICT`・`PARALLEL`・`COST` を blob v1 のまま保存する。`ROWS` は集合返却が無いため常に非適用
+  として拒否し、`SECURITY DEFINER` は `0A000`（ロール・権限の確定まで）。宣言的 UDF の `STRICT` は束縛時に式へ
+  展開する方式では意味を保てないため `0A000`。
+- 定義時検証: plpgsql は `core::function_define` が `parse_body`（構文 `42601`・範囲外 `0A000`・本体長
+  `54000`）と `validate_embedded` を通す。AST は保存せず、呼び出し時に再解析する（D2）。`RETURNS trigger` は
+  `ReturnShape::Trigger`・`FunctionType::trigger()` で保存し、`CREATE TRIGGER` が受理できる（発火は #1720 まで
+  `0A000`）。
+- 名前空間: セッションのレジストリは多重定義を持たないため、言語をまたぐ同名は `42723`（PostgreSQL は型で
+  解決する）。`CREATE OR REPLACE` で宣言的 UDF を置き換えたら、commit 後にセッションの旧本体の展開を取り除く。
+- 呼び出し: `sql`／`plpgsql` 関数は #2218 が結線するまで式から呼べず `42883`（`udf_load` が非宣言的な定義を
+  読み飛ばす）。`FunctionAttributes::allows_writes()`（`VOLATILE` のみ真）を #2218 が `PlCallOptions::may_write` の
+  決定に使う。`IMMUTABLE`／`STABLE` の本体の書き込みは定義時に拒否せず、実行時に `0A000` にする。
+- 式索引・部分索引: 構文段（カタログ非参照）は組み込み以外の関数に達した時点で判定を保留し、`core.rs` が
+  権限検査の後（権限が無ければ従来の `0A000` のまま）に自テナントの UDF カタログで解決する
+  （`sql::index_udf`）。非 IMMUTABLE の `sql`／`plpgsql` 関数は `42P17`、未定義・宣言的 UDF・IMMUTABLE は
+  `0A000`。IMMUTABLE を受け入れないのは、本体の実行が未実装で索引の維持（空の UDF レジストリでの再束縛）が
+  評価できず fail-open になるため。未定義名が `0A000`（PostgreSQL は `42883`）なのは既知の差。
+- 既知の差・後続: 呼び出しと `STRICT` の実行時の意味は #2218、`RETURN`／`BEGIN ATOMIC` は #2219、
+  `SETOF`／`TABLE`／`void` は #2220 以降。IMMUTABLE 関数・内容で決定的な宣言的 UDF を索引で受け入れる対応は未着手。
+
+## Issue #2799 追記（定数式の畳み込みで numeric の算術を扱う。SQL-24・SQL-68 ポインタ）
+
+- 式の中の numeric 変数（`VALUES (p / 2)`・`coalesce(p, 1) * 2` 等。静的 SQL と `EXECUTE ... USING` の
+  両方）は、`plpgsql::subst` が内部専用の型付き値 `$typed:numeric <数値>` で置換する。`$` で始まる識別子
+  は字句解析器が生成せず、利用者の SQL からは書けない。単独の要素は従来どおり裸の数値（列型が決める）。
+- 束縛は `CAST ... AS numeric`（scale を固定する）を通さず、変数自身の scale の `Decimal` へ直接束縛する
+  （`3 / 2` は `1.5000000000000000`、`p * 2` は scale を保つ）。畳み込みは `numeric::decimal_arith` で
+  近似せず、桁あふれは `22003`、0 除算は `22012`。
+- NUMERIC 算術の束縛モード（`BindEnv::numeric_arith`）は、式に `$typed:numeric` が含まれるときだけ
+  `sql::const_expr` が立てる。含まない式の束縛経路は従来と同一で、int・float の畳み込みは変わらない。
+  FROM なし SELECT（`const_select`）も不変。
+- 結果は `InsertLiteral::Number`（Decimal の正規テキスト。小数部がすべて 0 なら整数表記）へ戻し、列側の
+  リテラル束縛が列型で解釈し直す。`InsertLiteral` の variant は増やさないため content_hash・DDL・wire は
+  不変。
+- 境界（fail-closed または既存のリテラル規則）: 小数が残る値を INTEGER 系の列へ入れる場合は素のリテラル
+  `1.5` と同じ規則で `22P02`（PostgreSQL は丸める）。numeric と real／double の混合、numeric 引数の関数
+  （`abs` 等）、`CAST` は未対応で拒否する。素の小数リテラルは従来どおり f64 のまま扱う。

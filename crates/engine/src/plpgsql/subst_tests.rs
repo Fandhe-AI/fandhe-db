@@ -543,15 +543,22 @@ fn const_expr_numeric_is_bare_only_as_a_lone_element() {
         let out = substitute(&lex(sql), &sites, &env, false, NumStyle::Typed).expect(sql);
         assert_eq!(out, lex(want), "{sql}");
     }
-    // 式の中・関数の引数は 0A000（numeric の算術は定数式で扱えない）。
+    // 式の中・関数の引数は内部専用の型付き NUMERIC 値（Issue #2799）。定数式の畳み込みが
+    // 変数自身の scale のまま算術する（SQL-24・SQL-68 ポインタ）。
     for (sql, pos) in [
         ("VALUES (v / 2)", 2),
         ("VALUES (abs(v))", 4),
         ("VALUES (1 + v)", 4),
     ] {
         let sites = vec![site(pos, VarRole::ConstExpr, 0)];
-        let e = substitute(&lex(sql), &sites, &env, false, NumStyle::Typed).expect_err(sql);
-        assert_eq!(e.wire_code(), "0A000", "{sql}");
+        let out = substitute(&lex(sql), &sites, &env, false, NumStyle::Typed).expect(sql);
+        assert!(
+            out.windows(2).any(|w| matches!(
+                w,
+                [Token::Ident(n), Token::Number(d)] if n == "$typed:numeric" && d == "3"
+            )),
+            "{sql}: {out:?}"
+        );
     }
 }
 
@@ -619,7 +626,7 @@ fn const_lone_bare_boundary_matches_the_fold_limit() {
 }
 
 /// EXECUTE の `$n` が「行の要素全体」かは括弧の所属で決まる。関数引数・部分式は裸の数値にしない
-/// （numeric は 0A000）。
+/// （numeric は式の中なら型付き値で置換する）。
 #[test]
 fn execute_numeric_param_is_bare_only_as_a_whole_values_element() {
     let n0 = typed(
@@ -656,6 +663,7 @@ fn execute_numeric_param_is_bare_only_as_a_whole_values_element() {
         let out = substitute_params(&lex(sql), two, NumStyle::Typed).expect(sql);
         assert_eq!(out, lex(want), "{sql}");
     }
+    // 式の中の `$n` は型付き NUMERIC 値へ置換する（Issue #2799）。
     for sql in [
         "INSERT INTO t (a) VALUES (coalesce(NULL, $1) / 2)",
         "INSERT INTO t (a) VALUES (coalesce(NULL, $1))",
@@ -668,8 +676,12 @@ fn execute_numeric_param_is_bare_only_as_a_whole_values_element() {
         "INSERT INTO t (a) VALUES (($1) / 2)",
         "INSERT INTO t (a) VALUES (-(-$1))",
     ] {
-        let e = substitute_params(&lex(sql), two, NumStyle::Typed).expect_err(sql);
-        assert_eq!(e.wire_code(), "0A000", "{sql}");
+        let out = substitute_params(&lex(sql), two, NumStyle::Typed).expect(sql);
+        assert!(
+            out.iter()
+                .any(|t| matches!(t, Token::Ident(n) if n == "$typed:numeric")),
+            "{sql}: {out:?}"
+        );
     }
 }
 

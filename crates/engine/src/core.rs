@@ -104,6 +104,10 @@ mod plpgsql_validate_tests;
 mod plpgsql_host;
 // `DO` ブロックの実行（SQL-68・Issue #2228）。
 mod do_block;
+// `CREATE FUNCTION ... LANGUAGE plpgsql` の定義時検証（Issue #2217・SQL-67 (3)）。
+mod function_define;
+#[cfg(test)]
+mod plpgsql_boundary_tests;
 #[cfg(test)]
 mod plpgsql_host_tests;
 // トリガ関数の内部 API の結合テスト（Issue #2228・SQL-68）。
@@ -2401,6 +2405,11 @@ pub struct PreparedSql {
     /// 推論型（`param_types`）を上書きせず並べて保持する（変換可否の判定が両方を見るため）。
     /// Bind は値を宣言型として検証する（[`EngineCore::bind_prepared`]）。
     declared: Vec<Option<crate::sql::params::DeclaredParamType>>,
+    /// `INSERT ... VALUES` の式内 `$n`（`$1 + 1` 等）を型付き値で置換する位置と数値型
+    /// （Issue #2797・WIRE-12・SQL-24 のポインタ）。宣言型を推論型より優先した実効型を Parse で
+    /// 1 度だけ求める。裸の数値で置換すると定数式の畳み込みが値の大きさで型を決め、宣言・推定した型が
+    /// 失われるため。対象外の位置は従来の置換のまま。
+    typed_positions: crate::sql::params::TypedPositions,
     /// Parse 時の構造検証 parse がセッション TimeZone を読んだか（ゾーン無し `TIMESTAMPTZ`
     /// リテラル・`AT LOCAL` の定数畳み込み。Issue #1576）。`true` の文は `dummy_parsed` を
     /// 実行へ再利用せず、Bind ごとにセッション TimeZone の下で再 parse する。
@@ -6148,6 +6157,7 @@ impl EngineCore {
                 where_equality_dummy_flags: Vec::new(),
                 param_types: Vec::new(),
                 declared: Vec::new(),
+                typed_positions: crate::sql::params::TypedPositions::default(),
                 session_tz_dependent: false,
                 public_qualified,
                 qualified_positions,
@@ -6242,6 +6252,17 @@ impl EngineCore {
             }
         }
         let session_tz_dependent = crate::datetime::take_session_time_zone_read();
+        let typed_numeric: Vec<Option<crate::sql::params::TypedNumeric>> = param_types
+            .iter()
+            .enumerate()
+            .map(|(i, t)| {
+                crate::sql::params::TypedNumeric::effective(
+                    declared.get(i).copied().flatten(),
+                    Some(t),
+                )
+            })
+            .collect();
+        let typed_positions = crate::sql::params::TypedPositions::build(&tokens, &typed_numeric);
         Ok(PreparedSql {
             resolution_tenant: None,
             tokens,
@@ -6253,6 +6274,7 @@ impl EngineCore {
             declared: (0..usize::from(param_count))
                 .map(|i| declared.get(i).copied().flatten())
                 .collect(),
+            typed_positions,
             session_tz_dependent,
             public_qualified,
             qualified_positions,
@@ -6567,6 +6589,7 @@ impl EngineCore {
         // 差し替えは復号（総バイト数上限 MAX_INPUT_LEN の検証）より前に行い、正規化で
         // 長くなった値も参照回数込みで上限検査の対象にする。
         let mut canonical_values: Vec<(usize, Vec<u8>)> = Vec::new();
+        let mut typed_only_values: Vec<(usize, Vec<u8>)> = Vec::new();
         for (i, decl) in prepared.declared.iter().enumerate() {
             let (Some(ty), Some(Some(raw))) = (decl, values.get(i)) else {
                 continue;
@@ -6579,34 +6602,65 @@ impl EngineCore {
             // 正規値への差し替えは、置換先が浮動小数リテラルのスロットに限る。整数・文字列・
             // 真偽値スロットでは元の値を据え置き（`'2'` が `'2.0'` になる等を避ける）、
             // 宣言型としての検証だけを行う。
+            // Issue #2797: 型付き置換の位置で float4 になる `$n` も対象にする（推論種別が整数でも、
+            // 宣言 float4 の式内 `$n` は float4 として丸める）。
             let is_float_slot = prepared
                 .param_types
                 .get(i)
                 .is_some_and(|t| t.literal_kind() == crate::sql::params::ParamLiteralKind::Float);
-            if let (Some(canonical), true) = (canonical, is_float_slot) {
-                canonical_values.push((i, canonical.into_bytes()));
+            if let Some(canonical) = canonical {
+                if is_float_slot {
+                    canonical_values.push((i, canonical.into_bytes()));
+                } else if prepared.typed_positions.slot_is_float4(&prepared.tokens, n) {
+                    // 型付き置換の位置だけで使う正規値。同番号の対象外位置（単独 `$n` 等）には
+                    // 元の値を渡す（正規値が整数スロットへ漏れて 22P02 になるのを避ける）。
+                    typed_only_values.push((i, canonical.into_bytes()));
+                }
             }
         }
+        let overlay = |base: &[Option<Vec<u8>>], extra: &[(usize, Vec<u8>)]| {
+            let mut v = base.to_vec();
+            for (i, bytes) in extra {
+                if let Some(slot) = v.get_mut(*i) {
+                    *slot = Some(bytes.clone());
+                }
+            }
+            v
+        };
         let effective: std::borrow::Cow<'_, [Option<Vec<u8>>]> = if canonical_values.is_empty() {
             std::borrow::Cow::Borrowed(values)
         } else {
-            let mut v = values.to_vec();
-            for (i, bytes) in canonical_values {
-                if let Some(slot) = v.get_mut(i) {
-                    *slot = Some(bytes);
-                }
-            }
-            std::borrow::Cow::Owned(v)
+            std::borrow::Cow::Owned(overlay(values, &canonical_values))
         };
-        let decoded =
-            crate::sql::params::decode_bind_values_nullable(&prepared.tokens, &effective)?;
+        let decoded = crate::sql::params::decode_bind_values_nullable_typed(
+            &prepared.tokens,
+            &effective,
+            &prepared.typed_positions,
+        )?;
+        // 型付き位置用の値。正規化で長くなった値も上限検査の対象にするため別途復号する。
+        let decoded_typed = if typed_only_values.is_empty() {
+            None
+        } else {
+            let mut all = canonical_values.clone();
+            all.extend(typed_only_values);
+            Some(crate::sql::params::decode_bind_values_nullable_typed(
+                &prepared.tokens,
+                &overlay(values, &all),
+                &prepared.typed_positions,
+            )?)
+        };
         let kinds: Vec<crate::sql::params::ParamLiteralKind> = prepared
             .param_types
             .iter()
             .map(|t| t.literal_kind())
             .collect();
-        let substituted =
-            crate::sql::params::substitute_values_typed(&prepared.tokens, &decoded, &kinds)?;
+        let substituted = crate::sql::params::substitute_values_typed_split(
+            &prepared.tokens,
+            &decoded,
+            decoded_typed.as_deref().unwrap_or(&decoded),
+            &kinds,
+            &prepared.typed_positions,
+        )?;
         let mut parsed = self.parse_tokens(substituted)?;
         attach_public_qualified(
             &mut parsed,
@@ -7124,7 +7178,24 @@ impl EngineCore {
             // なく、索引の物理表現は既存の `(table, PolicyContext)` 可視
             // スナップショット由来キャッシュのまま）。
             ParsedSql::CreateIndex(stmt) => {
+                // Issue #2217: 権限の無いセッションにはカタログを引かず、従来どおりの `0A000`（構文段で
+                // 組み込み以外の関数に当たったときの拒否。権限検査より前）を返す。存在情報を出さない。
+                if let Some(pending) = stmt.pending_user_function.as_ref() {
+                    if crate::sql::ddl::require_ddl_permission(session).is_err() {
+                        return Err(crate::sql::index_expr::udf_unsupported(pending.site));
+                    }
+                }
                 crate::sql::ddl::require_ddl_permission(session)?;
+                // Issue #2217: 構文段が保留した組み込み以外の関数は、権限検査の後に自テナントの UDF
+                // カタログの揮発性でエラーへ解決する（必ずエラー。`sql::index_udf`）。
+                if let Some(pending) = stmt.pending_user_function.as_ref() {
+                    return Err(crate::sql::index_udf::index_user_function_verdict(
+                        &self.storage,
+                        ctx.tenant_id(),
+                        session,
+                        pending,
+                    ));
+                }
                 let outcome = crate::sql::ddl::execute_create_index(&self.storage, stmt)?;
                 Ok(crate::sql::SqlOutcome::CreateIndex(outcome))
             }
@@ -9153,10 +9224,57 @@ impl EngineCore {
                 params,
                 param_types,
                 return_type,
+                returns_trigger,
+                language,
+                attributes,
                 body,
                 body_source,
             } => {
                 crate::sql::ddl::require_ddl_permission(session)?;
+                let attrs = crate::sql::udf_ddl::function_attributes_from_clauses(&attributes);
+                // Issue #2217（SQL-67 (3)）: `LANGUAGE sql|plpgsql` は本体を原文のまま保存する経路へ。
+                // 呼び出しの実行は #2218（それまで式からの呼び出しは `42883`）。plpgsql は保存前に定義時検証。
+                let body = match (language, body) {
+                    (
+                        crate::sql::allowlist::FunctionLanguageClause::Declarative,
+                        crate::sql::allowlist::CreateFunctionBody::Expression(body),
+                    ) => body,
+                    (language, _) => {
+                        let spec = crate::sql::udf_ddl::RoutineSpec {
+                            name: &name,
+                            params: &params,
+                            param_types: &param_types,
+                            return_type: return_type.as_ref(),
+                            returns_trigger,
+                            language,
+                            attrs,
+                            body_source: &body_source,
+                        };
+                        let is_plpgsql =
+                            language == crate::sql::allowlist::FunctionLanguageClause::Plpgsql;
+                        crate::sql::udf_ddl::execute_create_routine_persistent(
+                            &self.storage,
+                            ctx.tenant_id(),
+                            session,
+                            &spec,
+                            or_replace,
+                            self.function_limits.max_functions(),
+                            &|| {
+                                if is_plpgsql {
+                                    self.validate_plpgsql_definition(
+                                        &params,
+                                        &param_types,
+                                        returns_trigger,
+                                        &body_source,
+                                    )
+                                } else {
+                                    Ok(())
+                                }
+                            },
+                        )?;
+                        return Ok(crate::sql::SqlOutcome::CreateFunction { name });
+                    }
+                };
                 if or_replace {
                     crate::sql::udf_ddl::execute_create_or_replace_function_persistent(
                         &self.storage,
@@ -9169,6 +9287,7 @@ impl EngineCore {
                         &body,
                         &body_source,
                         self.function_limits.max_functions(),
+                        &attrs,
                     )?;
                 } else {
                     crate::sql::udf_ddl::execute_create_function_persistent(
@@ -9182,6 +9301,7 @@ impl EngineCore {
                         &body,
                         &body_source,
                         self.function_limits.max_functions(),
+                        &attrs,
                     )?;
                 }
                 Ok(crate::sql::SqlOutcome::CreateFunction { name })

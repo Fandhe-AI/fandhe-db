@@ -195,9 +195,9 @@ fn beyond_fold_precision(cell: &Cell) -> bool {
 /// `INSERT .. VALUES` の要素（定数式。利用者の `CAST` を受理しない）の数値のトークン列。
 /// 整数（smallint／integer／bigint）と浮動小数（real／double）は、内部専用の型付き値（合成識別子
 /// `$typed:<型>` + 数値。字句解析器は利用者の文字列から生成しない）で置換し、定数式の畳み込みが
-/// 宣言型どおりの算術を行う（`p + 1` が bigint の算術になる）。numeric は定数式で算術できないため、
-/// 単独の要素（[`VarRole::ConstLone`]）なら裸の数値（書き込み先の列型が決める）、式の中では `0A000`
-/// （型が黙って変わる経路を残さない）。定数式の畳み込みは値を f64 で扱い 2^53 以上を `22003` に
+/// 宣言型どおりの算術を行う（`p + 1` が bigint の算術になる）。numeric は単独の要素
+/// （[`VarRole::ConstLone`]）なら裸の数値（書き込み先の列型が決める）、式の中では `$typed:numeric` で
+/// 置換し、定数式の畳み込みが変数自身の scale のまま近似なしで算術する（Issue #2799・SQL-24 ポインタ）。定数式の畳み込みは値を f64 で扱い 2^53 以上を `22003` に
 /// するため、単独の要素でその範囲の整数・浮動小数は畳み込みを通さず裸の数値にする（i64 全域・
 /// 大きな double を書き込み先の列型で正確に束縛させる）。式の中の同範囲の値は畳み込みが `22003`
 /// で拒否する（fail-closed）。
@@ -210,15 +210,10 @@ fn const_number_tokens(
         return Ok(bare);
     }
     let kind = match (&v.ty, &v.cell) {
-        (_, Cell::Numeric(_)) => {
-            return if lone {
-                Ok(bare)
-            } else {
-                Err(SqlSurfaceError::feature_not_supported(
-                    "a numeric variable inside an expression of an INSERT VALUES element is not supported",
-                ))
-            };
-        }
+        // numeric は内部専用の型付き NUMERIC 値（Issue #2799）。定数式の畳み込みが変数自身の scale の
+        // まま NUMERIC 算術（近似なし）を行う。単独の要素は上で裸の数値のまま（列型が決める）。
+        (_, Cell::Numeric(_)) if lone => return Ok(bare),
+        (_, Cell::Numeric(_)) => "numeric",
         (ColumnType::SmallInt, _) => "int2",
         (ColumnType::Integer, _) => "int4",
         (ColumnType::BigInt, _) => "int8",
@@ -385,7 +380,7 @@ fn is_lone_values_element(tokens: &[Token], i: usize) -> bool {
 
 /// `-` の直前のトークンが値の終端（二項演算子の左オペランドの末尾）か。単項の `-` かの判定に使う。
 /// 値を終えない語（`THEN`・`ELSE`・`AND` など。字句解析器は `Keyword` 以外を `Ident` にする）は偽。
-fn ends_operand(t: Option<&Token>) -> bool {
+pub(crate) fn ends_operand(t: Option<&Token>) -> bool {
     match t {
         Some(Token::Ident(w)) => ![
             "THEN", "ELSE", "WHEN", "CASE", "OR", "NOT", "IN", "BETWEEN", "LIKE", "ILIKE", "IS",

@@ -24,7 +24,7 @@ use crate::sql::SqlOutcome;
 use crate::storage::{Storage, Visibility};
 use crate::test_util::temp_db::{unique_db_path, CleanupGuard};
 
-fn new_core(mode: LedgerMode) -> (EngineCore, CleanupGuard) {
+pub(super) fn new_core(mode: LedgerMode) -> (EngineCore, CleanupGuard) {
     let path = unique_db_path("plpgsql-host");
     let storage = Storage::open(&path).expect("open storage");
     storage
@@ -45,17 +45,21 @@ fn new_core(mode: LedgerMode) -> (EngineCore, CleanupGuard) {
     )
 }
 
-fn ctx(tenant: &str) -> PolicyContext {
+pub(super) fn ctx(tenant: &str) -> PolicyContext {
     PolicyContext::with_visibilities(tenant, [Visibility::Public, Visibility::Private])
         .expect("valid tenant")
 }
 
-fn sql(core: &EngineCore, c: &PolicyContext, s: &str) -> Result<SqlOutcome, SqlSurfaceError> {
+pub(super) fn sql(
+    core: &EngineCore,
+    c: &PolicyContext,
+    s: &str,
+) -> Result<SqlOutcome, SqlSurfaceError> {
     let mut session = SessionState::default();
     core.execute_sql_in_session(c, &mut session, s)
 }
 
-fn count(core: &EngineCore, c: &PolicyContext) -> u64 {
+pub(super) fn count(core: &EngineCore, c: &PolicyContext) -> u64 {
     let SqlOutcome::Query(q) = sql(core, c, "SELECT COUNT(*) FROM docs").expect("count") else {
         panic!("expected query");
     };
@@ -65,7 +69,7 @@ fn count(core: &EngineCore, c: &PolicyContext) -> u64 {
     }
 }
 
-fn seed(core: &EngineCore, c: &PolicyContext, ids: &[u64], lang: &str) {
+pub(super) fn seed(core: &EngineCore, c: &PolicyContext, ids: &[u64], lang: &str) {
     for id in ids {
         sql(
             core,
@@ -78,18 +82,18 @@ fn seed(core: &EngineCore, c: &PolicyContext, ids: &[u64], lang: &str) {
     }
 }
 
-fn int(i: i64) -> PlScalar {
+pub(super) fn int(i: i64) -> PlScalar {
     PlScalar::new(Cell::SignedInteger(i), ColumnType::Integer)
 }
 
-fn text(s: &str) -> PlScalar {
+pub(super) fn text(s: &str) -> PlScalar {
     PlScalar::new(Cell::Text(s.to_string()), ColumnType::Text)
 }
 
-const WRITE: PlCallOptions = PlCallOptions { may_write: true };
+pub(super) const WRITE: PlCallOptions = PlCallOptions { may_write: true };
 
 /// 戻り値の整数（`Integer`／`BigInt` のセル）。
-fn as_i64(out: &CallOutcome) -> i64 {
+pub(super) fn as_i64(out: &CallOutcome) -> i64 {
     match out {
         CallOutcome::Scalar(PlScalar {
             cell: Cell::SignedInteger(i),
@@ -103,7 +107,7 @@ fn as_i64(out: &CallOutcome) -> i64 {
     }
 }
 
-struct Call<'a> {
+pub(super) struct Call<'a> {
     src: &'a str,
     params: Vec<(&'a str, SqlColumnTypeName)>,
     args: Vec<PlScalar>,
@@ -112,7 +116,7 @@ struct Call<'a> {
     opts: PlCallOptions,
 }
 
-fn call<'a>(src: &'a str) -> Call<'a> {
+pub(super) fn call<'a>(src: &'a str) -> Call<'a> {
     Call {
         src,
         params: Vec::new(),
@@ -124,24 +128,24 @@ fn call<'a>(src: &'a str) -> Call<'a> {
 }
 
 impl<'a> Call<'a> {
-    fn param(mut self, name: &'a str, ty: SqlColumnTypeName, arg: PlScalar) -> Self {
+    pub(super) fn param(mut self, name: &'a str, ty: SqlColumnTypeName, arg: PlScalar) -> Self {
         self.params.push((name, ty));
         self.args.push(arg);
         self
     }
 
-    fn set_of(mut self, ty: ColumnType) -> Self {
+    pub(super) fn set_of(mut self, ty: ColumnType) -> Self {
         self.shape = ReturnShape::SetOf;
         self.ty = Some(ty);
         self
     }
 
-    fn returns(mut self, ty: ColumnType) -> Self {
+    pub(super) fn returns(mut self, ty: ColumnType) -> Self {
         self.ty = Some(ty);
         self
     }
 
-    fn read_only(mut self) -> Self {
+    pub(super) fn read_only(mut self) -> Self {
         self.opts = PlCallOptions { may_write: false };
         self
     }
@@ -169,7 +173,7 @@ impl<'a> Call<'a> {
     }
 
     /// 開いている Tx（明示・暗黙）へ参加して実行する。
-    fn in_txn<'e>(
+    pub(super) fn in_txn<'e>(
         &self,
         core: &'e EngineCore,
         c: &PolicyContext,
@@ -191,7 +195,7 @@ impl<'a> Call<'a> {
     }
 
     /// autocommit の入口で実行する。
-    fn autocommit(
+    pub(super) fn autocommit(
         &self,
         core: &EngineCore,
         c: &PolicyContext,
@@ -1156,11 +1160,58 @@ fn values_elements_numeric_is_lone_only() {
     assert_eq!(n_of(&core, &c, 1), Some(3));
     // 静的な `-p` は定義時の検証が拒否する（定数式に変数への単項マイナスは無い。素の SQL の `-col` と同じ）。
     // 符号付きの単独要素は EXECUTE の `-$1` で確かめる（`execute_using_values_follow_the_same_substitution`）。
-    // 式の中の numeric は型を保てないため拒否する（整数除算への化けを残さない）。
-    for expr in ["p / 2", "p * 2"] {
-        let e = insert_with(&core, &c, 9, expr, NUMERIC0, numeric0(3)).expect_err(expr);
-        assert_eq!(e.wire_code(), "0A000", "{expr}");
+    // 式の中の numeric は変数自身の scale のまま近似なしで畳み込まれる（Issue #2799・SQL-24・
+    // SQL-68 ポインタ）。小数が残る値の INTEGER 列への代入は素のリテラル `1.5` と同じ規則で 22P02。
+    let e = insert_with(&core, &c, 9, "p / 2", NUMERIC0, numeric0(3)).expect_err("1.5 into int");
+    assert_eq!(e.wire_code(), "22P02");
+    insert_with(&core, &c, 2, "p * 2", NUMERIC0, numeric0(3)).expect("p * 2");
+    assert_eq!(n_of(&core, &c, 2), Some(6));
+    insert_with(&core, &c, 3, "p / 2", NUMERIC0, numeric0(4)).expect("divisible");
+    assert_eq!(n_of(&core, &c, 3), Some(2));
+}
+
+/// numeric 変数の算術は近似なしで double 列へも入る（`3 / 2` が整数除算の 1 にも f64 の誤差にもならない）。
+#[test]
+fn numeric_variable_arithmetic_is_exact_in_values() {
+    let (core, _g) = new_core(LedgerMode::Optional);
+    let c = ctx("t1");
+    let mut id = 0u64;
+    for (expr, want) in [
+        ("p / 2", 1.5),
+        ("1 + p", 4.0),
+        ("(p) / 2", 1.5),
+        ("coalesce(NULL, p) / 2", 1.5),
+        ("coalesce(p, 1) * 2", 6.0),
+        ("p * p", 9.0),
+    ] {
+        id += 1;
+        insert_bf(&core, &c, id, "f", expr, NUMERIC0, numeric0(3)).unwrap_or_else(|e| {
+            panic!("{expr}: {} {e:?}", e.wire_code());
+        });
+        assert_eq!(f_of(&core, &c, id), want, "static {expr}");
     }
+    for (expr, want) in [("$1 / 2", 1.5), ("coalesce(NULL, $1) / 2", 1.5)] {
+        id += 1;
+        let src = format!(
+            "BEGIN EXECUTE 'INSERT INTO docs (id, embedding, lang, f) VALUES ({id}, ''[0.1,0.2]'', ''a'', {expr})' USING p; RETURN 1; END"
+        );
+        call(&src)
+            .param("p", NUMERIC0, numeric0(3))
+            .autocommit(&core, &c)
+            .unwrap_or_else(|e| panic!("{expr}: {}", e.wire_code()));
+        assert_eq!(f_of(&core, &c, id), want, "execute {expr}");
+    }
+    // 0 除算・桁あふれは PostgreSQL と同じコード。
+    let e = insert_bf(&core, &c, 90, "f", "p / 0", NUMERIC0, numeric0(3)).expect_err("div0");
+    assert_eq!(e.wire_code(), "22012");
+    // numeric と倍精度の混合・numeric 引数の関数は fail-closed（XX000 にならない）。
+    let e = insert_bf(&core, &c, 91, "f", "p + 1.5", NUMERIC0, numeric0(3));
+    // 素の小数リテラルは従来どおり f64 のまま。numeric との混在は近似を避けて拒否される。
+    if let Err(e) = e {
+        assert_ne!(e.wire_code(), "XX000");
+    }
+    let e = insert_bf(&core, &c, 92, "f", "abs(p)", NUMERIC0, numeric0(3)).expect_err("abs");
+    assert_ne!(e.wire_code(), "XX000");
 }
 
 #[test]
@@ -1217,7 +1268,7 @@ fn negative_variables_under_unary_and_binary_minus_in_values() {
             assert_eq!(n_of(&core, &c, id), Some(want), "execute {expr}");
         }
     }
-    // numeric（scale 0）。式の中の numeric は設計どおり 0A000 のため、単独要素の符号付きだけ確かめる。
+    // numeric（scale 0）。単独要素の符号付きを確かめる（式の中は別テストで確かめる）。
     for (expr, want) in [("-$1", 5), ("$1", -5)] {
         id += 1;
         let src = format!(
@@ -1305,8 +1356,11 @@ fn execute_using_values_follow_the_same_substitution() {
     assert_eq!(n_of(&core, &c, 3), Some(4));
     exec(4, "-$1", NUMERIC0, numeric0(3)).expect("numeric signed lone");
     assert_eq!(n_of(&core, &c, 4), Some(-3));
+    // 式の中の numeric は近似なしで畳み込まれる（Issue #2799）。1.5 は INTEGER 列へ入らない（22P02）。
     let e = exec(9, "$1 / 2", NUMERIC0, numeric0(3)).expect_err("numeric expr");
-    assert_eq!(e.wire_code(), "0A000");
+    assert_eq!(e.wire_code(), "22P02");
+    exec(10, "$1 - 3", NUMERIC0, numeric0(3)).expect("numeric expr");
+    assert_eq!(n_of(&core, &c, 10), Some(0));
     // IN・BETWEEN（リテラル専用位置）の numeric 整数形。
     let out = call(
         "DECLARE c bigint; BEGIN \
@@ -1528,8 +1582,9 @@ fn extreme_finite_doubles_do_not_go_through_decimal() {
     assert_eq!(e.wire_code(), "22003");
 }
 
-/// 式の中・関数引数の numeric は裸の数値にならず 0A000（整数除算へ化けない）。単独要素・括弧付きの
-/// 単独要素は通る。静的 SQL と EXECUTE ... USING の両方。
+/// 式の中・関数引数の numeric は裸の数値にならず、型付き NUMERIC 値として近似なしで畳み込まれる
+/// （整数除算へ化けない。Issue #2799）。単独要素・括弧付きの単独要素は裸の数値。静的 SQL と
+/// EXECUTE ... USING の両方。
 #[test]
 fn numeric_in_values_is_bare_only_as_a_whole_element() {
     let (core, _g) = new_core(LedgerMode::Optional);
@@ -1538,15 +1593,19 @@ fn numeric_in_values_is_bare_only_as_a_whole_element() {
         insert_with(&core, &c, id, expr, NUMERIC0, numeric0(3)).expect(expr);
         assert_eq!(n_of(&core, &c, id), Some(3), "{expr}");
     }
-    for expr in [
-        "coalesce(NULL, p) / 2",
-        "coalesce(NULL, p)",
-        "coalesce(p, 1)",
-        "(p) / 2",
-        "1 + p",
+    // 式の中の numeric は畳み込まれる（Issue #2799）。小数が残る `/ 2` は INTEGER 列で 22P02。
+    for (id, expr, want) in [
+        (21u64, "coalesce(NULL, p)", 3),
+        (22, "coalesce(p, 1)", 3),
+        (23, "1 + p", 4),
+        (24, "(p) * 2", 6),
     ] {
+        insert_with(&core, &c, id, expr, NUMERIC0, numeric0(3)).expect(expr);
+        assert_eq!(n_of(&core, &c, id), Some(want), "static {expr}");
+    }
+    for expr in ["coalesce(NULL, p) / 2", "(p) / 2"] {
         let e = insert_with(&core, &c, 9, expr, NUMERIC0, numeric0(3)).expect_err(expr);
-        assert_eq!(e.wire_code(), "0A000", "static {expr}");
+        assert_eq!(e.wire_code(), "22P02", "static {expr}");
     }
     for (id, expr) in [(11u64, "$1"), (12, "($1)"), (13, "-$1")] {
         let src = format!(
@@ -1558,12 +1617,7 @@ fn numeric_in_values_is_bare_only_as_a_whole_element() {
             .expect(expr);
     }
     assert_eq!(n_of(&core, &c, 13), Some(-3));
-    for expr in [
-        "coalesce(NULL, $1) / 2",
-        "coalesce($1, 1)",
-        "f($1, 1)",
-        "$1 / 2",
-    ] {
+    for expr in ["coalesce(NULL, $1) / 2", "f($1, 1)", "$1 / 2"] {
         let src = format!(
             "BEGIN EXECUTE '{VALUES_HEAD} (19, ''[0.1,0.2]'', ''a'', {expr})' USING p; RETURN 1; END"
         );
@@ -1573,7 +1627,7 @@ fn numeric_in_values_is_bare_only_as_a_whole_element() {
             .expect_err(expr);
         assert_ne!(e.wire_code(), "00000", "execute {expr}");
         assert!(
-            matches!(e.wire_code(), "0A000" | "42883" | "42601"),
+            matches!(e.wire_code(), "22P02" | "0A000" | "42883" | "42601"),
             "execute {expr}: {}",
             e.wire_code()
         );

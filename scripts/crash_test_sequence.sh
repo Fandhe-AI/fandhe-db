@@ -15,6 +15,9 @@
 # 従来方式の表を開き直して移行した表へ、`id` を省略した単一行・複数行・明示 txn の INSERT を
 # 採番させ、「`n` の順に `id` が狭義単調増加する」ことなどを検証する。`finish-identity` は再送の
 # `23505`・内容違いの `22023`・値を消費しないことを確かめる）。新しい CI ジョブは作らない。
+# Issue #2229（SQL-68・RLS-10・RECOVER-11・RECOVER-12）の `DO` ブロックの段も同じ構成で続ける
+# （`*-do` サブコマンド。複数表への `DO` の全か無か、明示 Tx の証人 INSERT との台帳の原子性、
+# 順序 B の再送が `23505` で全体破棄になることを検証する。新しい CI ジョブは作らない）。
 # Makefile の crash-test-sequence ターゲット・CI の crash-test-sequence ジョブから呼ばれる。
 #
 # 使い方: scripts/crash_test_sequence.sh [セット数（既定 2）] [反復回数（既定 10）]
@@ -237,16 +240,17 @@ run_mode() {
     done
 }
 
-# 進捗の合計（2 モード分）。各モードが `completed` を加算する。
-total_iterations=$((2 * SETS * ITERATIONS))
+# 進捗の合計（3 モード分）。各モードが `completed` を加算する。
+total_iterations=$((3 * SETS * ITERATIONS))
 completed=0
 
 run_mode sequence write verify finish self-check
 run_mode identity write-identity verify-identity finish-identity self-check-identity
+run_mode do write-do verify-do finish-do self-check-do
 
 if [ "${completed}" -ne "${total_iterations}" ]; then
   echo "ERROR: completed ${completed} iterations, expected ${total_iterations}" >&2
   exit 1
 fi
 
-echo "crash_test_sequence.sh: OK (2 modes x ${SETS} sets x ${ITERATIONS} iterations = ${completed} SIGKILL reps)"
+echo "crash_test_sequence.sh: OK (3 modes x ${SETS} sets x ${ITERATIONS} iterations = ${completed} SIGKILL reps)"

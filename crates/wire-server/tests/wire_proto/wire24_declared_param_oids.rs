@@ -954,3 +954,36 @@ fn rejections_and_acceptance_are_identical_across_three_tenants() {
     assert_eq!(tags[1], vec!["UPDATE 0", "UPDATE 1", "UPDATE 0"]);
     assert_eq!(tags[2], vec!["UPDATE 0", "UPDATE 0", "UPDATE 0"]);
 }
+/// 宣言 int8 の `INSERT ... VALUES (.., $1 + 1)` は、text／binary のどちらでも bigint の算術で
+/// 評価される（int4 の上限 + 1 が `22003` にならない。Issue #2797。WIRE-12・SQL-24 のポインタ）。
+#[test]
+fn int8_expression_in_insert_values_is_evaluated_as_bigint() {
+    let (core, _g) = new_core();
+    let mut s = connect(core.clone());
+    let sql = "INSERT INTO t (id, b) VALUES ($1, $2 + 1) USING OPERATION_ID $3";
+    let tag = run_declared(
+        &mut s,
+        sql,
+        &[OID_INT8, OID_INT8],
+        &[0],
+        &[b"20", b"2147483647", b"i8-text"],
+    )
+    .expect("text bind");
+    assert_eq!(tag, "INSERT 0 1");
+    assert_eq!(cell(&core, "b", 20), Cell::SignedInteger(2_147_483_648));
+
+    let tag = run_declared(
+        &mut s,
+        sql,
+        &[OID_INT8, OID_INT8],
+        &[1, 1, 0],
+        &[
+            &21i64.to_be_bytes(),
+            &2_147_483_647i64.to_be_bytes(),
+            b"i8-bin",
+        ],
+    )
+    .expect("binary bind");
+    assert_eq!(tag, "INSERT 0 1");
+    assert_eq!(cell(&core, "b", 21), Cell::SignedInteger(2_147_483_648));
+}
