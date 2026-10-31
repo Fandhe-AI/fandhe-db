@@ -330,11 +330,56 @@ fn is_lone(tokens: &[Token], pos: usize) -> bool {
         )
 }
 
-/// 負値（`-` + 数値の 2 トークン）を、`::` の直前または直前が `-` の位置で括弧に包む
-/// （`-5::int` が `-(5::int)` と読まれるのを防ぐ。`sql::params` の `$n` 置換と同じ規則）。
+/// `-` の直前のトークンが値の終端（二項演算子の左オペランドの末尾）か。単項の `-` かの判定に使う。
+/// 値を終えない語（`THEN`・`ELSE`・`AND` など。字句解析器は `Keyword` 以外を `Ident` にする）は偽。
+fn ends_operand(t: Option<&Token>) -> bool {
+    match t {
+        Some(Token::Ident(w)) => ![
+            "THEN", "ELSE", "WHEN", "CASE", "OR", "NOT", "IN", "BETWEEN", "LIKE", "ILIKE", "IS",
+            "VALUES", "SET", "DISTINCT", "ON", "AS", "BY",
+        ]
+        .iter()
+        .any(|k| w.eq_ignore_ascii_case(k)),
+        Some(
+            Token::Number(_)
+            | Token::StringLiteral(_)
+            | Token::Param(_)
+            | Token::QualifiedIdent { .. }
+            | Token::Punct(')' | ']'),
+        ) => true,
+        _ => false,
+    }
+}
+
+/// 負値の直前が単項の `-`（`-v`・`VALUES (-$1)`）なら、二重否定を畳んで `-` を取り除き値を正にする。
+/// `VALUES` の定数式の解析は `-(..)`（単項マイナス + 括弧）を受理せず、括弧で包む方式では整数・
+/// 浮動小数（3 トークン）が `42601` になる。範囲外になる値（`-(-2147483648)` の int4）は型付き値の
+/// 検査が `22003` にする。二項の `-`（`a - v`）は畳まず、[`parenthesize_if_needed`] が括弧で包む。
+fn fold_double_negation(
+    tokens: &[Token],
+    pos: usize,
+    out: &mut Vec<Token>,
+    produced: &mut Vec<Token>,
+) {
+    let Some(minus) = pos.checked_sub(1) else {
+        return;
+    };
+    let unary = matches!(tokens.get(minus), Some(Token::Punct('-')))
+        && !ends_operand(minus.checked_sub(1).and_then(|p| tokens.get(p)));
+    let negative = produced.len() >= 2 && matches!(produced.first(), Some(Token::Punct('-')));
+    if unary && negative && matches!(out.last(), Some(Token::Punct('-'))) {
+        out.pop();
+        produced.remove(0);
+    }
+}
+
+/// 負値（先頭が `-` のトークン列。`-` + 数値の 2 トークンも、`ConstExpr` の整数・浮動小数が作る
+/// `-` + `$typed:<型>` + 数値の 3 トークンも含む。トークン数には依存しない）を、`::` の直前または
+/// 直前が `-` の位置で括弧に包む（`-5::int` が `-(5::int)`、`--5` がコメントや二重否定と読まれるのを
+/// 防ぐ。`sql::params` の `$n` 置換と同じ規則）。
 fn parenthesize_if_needed(prev: Option<&Token>, next: Option<&Token>, out: &mut Vec<Token>) {
-    let negative_pair = out.len() == 2 && matches!(out.first(), Some(Token::Punct('-')));
-    let needs = negative_pair
+    let negative = out.len() >= 2 && matches!(out.first(), Some(Token::Punct('-')));
+    let needs = negative
         && (matches!(next, Some(Token::TypeCast)) || matches!(prev, Some(Token::Punct('-'))));
     if needs {
         out.insert(0, Token::Punct('('));
@@ -420,6 +465,7 @@ pub(crate) fn substitute(
         charge(&mut total, scalar_len_estimate(value))?;
         let name = if alias { alias_name(original) } else { None };
         let mut produced = role_tokens(value, site.role, name, style, is_lone(tokens, site.pos))?;
+        fold_double_negation(tokens, site.pos, &mut out, &mut produced);
         parenthesize_if_needed(
             site.pos.checked_sub(1).and_then(|p| tokens.get(p)),
             tokens.get(site.pos.saturating_add(1)),
@@ -609,6 +655,7 @@ pub(crate) fn substitute_params(
                 charge(&mut total, scalar_len_estimate(v))?;
                 let role = param_role(tokens, i);
                 let mut produced = role_tokens(v, role, None, style, is_lone(tokens, i))?;
+                fold_double_negation(tokens, i, &mut out, &mut produced);
                 parenthesize_if_needed(
                     i.checked_sub(1).and_then(|p| tokens.get(p)),
                     tokens.get(i.saturating_add(1)),

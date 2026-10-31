@@ -159,6 +159,35 @@ fn negative_values_before_a_type_cast_are_parenthesized() {
 }
 
 #[test]
+fn negative_typed_const_values_after_minus_keep_the_sign_semantics() {
+    // ConstExpr の負の整数は 3 トークン（`-` + `$typed:<型>` + 数値）。単項の `-` の直後は二重否定を
+    // 畳み、二項の `-` の直後は括弧で包む（どちらも `--` を作らない）。
+    let env = Env(vec![typed(ColumnType::BigInt, Cell::SignedInteger(-5))]);
+    let neg = [vec![Token::Punct('-')], tv("int8", "5")].concat();
+    let unary = lex("VALUES (-v)");
+    let out = substitute(
+        &unary,
+        &[site(3, VarRole::ConstExpr, 0)],
+        &env,
+        false,
+        NumStyle::Typed,
+    )
+    .expect("unary");
+    assert_eq!(out, [lex("VALUES ("), tv("int8", "5"), lex(")")].concat());
+    let binary = lex("VALUES (1 - v)");
+    let out = substitute(
+        &binary,
+        &[site(4, VarRole::ConstExpr, 0)],
+        &env,
+        false,
+        NumStyle::Typed,
+    )
+    .expect("binary");
+    let want = [lex("VALUES (1 - ("), neg, lex(")"), lex(")")].concat();
+    assert_eq!(out, want);
+}
+
+#[test]
 fn substituted_size_is_bounded() {
     // 同じ変数を多数参照して巨大な値を複製しても、置換後の総バイト数で拒否する。
     let big = text(&"x".repeat(200_000));

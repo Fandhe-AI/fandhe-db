@@ -1183,6 +1183,81 @@ fn plain_sql_values_behavior_is_unchanged() {
     );
 }
 
+/// 負の変数に単項マイナス・二項マイナスを重ねても、整数・浮動小数（3 トークンの型付き値）と
+/// numeric（2 トークン）で同じ結果になる（`--` を作らない。EXECUTE ... USING と静的 SQL の両方）。
+#[test]
+fn negative_variables_under_unary_and_binary_minus_in_values() {
+    let (core, _g) = new_core(LedgerMode::Optional);
+    let c = ctx("t1");
+    let cases: Vec<(SqlColumnTypeName, PlScalar)> = vec![
+        (SqlColumnTypeName::Integer, int(-5)),
+        (SqlColumnTypeName::BigInt, big(-5)),
+        (SqlColumnTypeName::Double, float(-5.0)),
+    ];
+    let mut id = 0u64;
+    for (ty, arg) in cases {
+        // 静的 SQL: `-p` は定義時に拒否されるため、二項マイナスと乗算を確かめる。
+        for (expr, want) in [("1 - p", 6), ("2 * p", -10), ("p", -5)] {
+            id += 1;
+            insert_with(&core, &c, id, expr, ty.clone(), arg.clone()).expect(expr);
+            assert_eq!(n_of(&core, &c, id), Some(want), "static {expr}");
+        }
+        // EXECUTE ... USING: 単項マイナス・二項マイナス。
+        for (expr, want) in [("-$1", 5), ("1 - $1", 6), ("2 * -$1", 10), ("$1", -5)] {
+            id += 1;
+            let src = format!(
+                "BEGIN EXECUTE '{VALUES_HEAD} ({id}, ''[0.1,0.2]'', ''a'', {expr})' USING p; RETURN 1; END"
+            );
+            call(&src)
+                .param("p", ty.clone(), arg.clone())
+                .autocommit(&core, &c)
+                .unwrap_or_else(|e| panic!("{expr}: {}", e.wire_code()));
+            assert_eq!(n_of(&core, &c, id), Some(want), "execute {expr}");
+        }
+    }
+    // numeric（scale 0）。式の中の numeric は設計どおり 0A000 のため、単独要素の符号付きだけ確かめる。
+    for (expr, want) in [("-$1", 5), ("$1", -5)] {
+        id += 1;
+        let src = format!(
+            "BEGIN EXECUTE '{VALUES_HEAD} ({id}, ''[0.1,0.2]'', ''a'', {expr})' USING p; RETURN 1; END"
+        );
+        call(&src)
+            .param("p", NUMERIC0, numeric0(-5))
+            .autocommit(&core, &c)
+            .unwrap_or_else(|e| panic!("numeric {expr}: {}", e.wire_code()));
+        assert_eq!(n_of(&core, &c, id), Some(want), "numeric {expr}");
+    }
+}
+
+/// WHERE の比較で負の変数に単項・二項マイナスを重ねても受理され、結果が正しい（静的 SQL は変数を式に置ける形だけ）。
+#[test]
+fn negative_variables_under_minus_in_where() {
+    let (core, _g) = new_core(LedgerMode::Optional);
+    let c = ctx("t1");
+    seed(&core, &c, &[1], "en");
+    sql(&core, &c, "UPDATE docs SET n = 5 WHERE id = 1").expect("n");
+    let cases: Vec<(SqlColumnTypeName, PlScalar)> = vec![
+        (SqlColumnTypeName::Integer, int(-5)),
+        (SqlColumnTypeName::BigInt, big(-5)),
+        (SqlColumnTypeName::Double, float(-5.0)),
+    ];
+    for (ty, arg) in cases {
+        for body in [
+            "SELECT count(*) INTO c FROM docs WHERE n = p + 10",
+            "EXECUTE 'SELECT count(*) FROM docs WHERE n = 0 - $1' INTO c USING p",
+            "EXECUTE 'SELECT count(*) FROM docs WHERE n - $1 = 10' INTO c USING p",
+        ] {
+            let src = format!("DECLARE c bigint; BEGIN {body}; RETURN c; END");
+            let out = call(&src)
+                .returns(ColumnType::BigInt)
+                .param("p", ty.clone(), arg.clone())
+                .autocommit(&core, &c)
+                .unwrap_or_else(|e| panic!("{body}: {}", e.wire_code()));
+            assert_eq!(as_i64(&out), 1, "{body}");
+        }
+    }
+}
+
 #[test]
 fn in_and_between_accept_numeric_integer_form() {
     let (core, _g) = new_core(LedgerMode::Optional);
