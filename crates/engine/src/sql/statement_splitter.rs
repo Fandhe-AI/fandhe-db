@@ -1535,6 +1535,19 @@ mod tests {
         }
     }
 
+    /// SQL-67・Issue #2220: FROM 句の関数呼び出し（本体が書き込みうる）は `Write` に分類する
+    /// （複数文メッセージの書き込み配置制約をすり抜けない）。
+    #[test]
+    fn function_in_from_is_classified_as_write() {
+        for sql in [
+            "SELECT * FROM f(1)",
+            "SELECT a FROM f(1) AS t(a) WHERE a > 1",
+            "SELECT count(*) FROM g()",
+        ] {
+            assert_eq!(classify_statement(sql), StatementEffect::Write, "{sql}");
+        }
+    }
+
     #[test]
     fn classify_statement_covers_all_effects() {
         assert_eq!(classify_statement("SELECT 1"), StatementEffect::ReadOnly);

@@ -16,7 +16,7 @@
 
 use crate::catalog::function::{
     FunctionAttributes, FunctionDef, FunctionLanguage, FunctionParam, FunctionType, Parallel,
-    Volatility, FUNCTION_ALREADY_EXISTS_MESSAGE, FUNCTION_AMBIGUOUS_MESSAGE,
+    ReturnShape, Volatility, FUNCTION_ALREADY_EXISTS_MESSAGE, FUNCTION_AMBIGUOUS_MESSAGE,
     FUNCTION_CANNOT_CHANGE_PARAM_NAME_MESSAGE, FUNCTION_CANNOT_CHANGE_RETURN_TYPE_MESSAGE,
     FUNCTION_RECURSIVE_MESSAGE,
 };
@@ -30,7 +30,7 @@ use crate::sql::cast::CastType;
 use crate::sql::mode::SessionState;
 use crate::sql::udf_call::{
     body_reaches_function, commit_function_definition, prepare_function_replacement,
-    prepare_function_with_signature_prechecked, PreparedUdf,
+    prepare_function_with_signature_prechecked, PreparedUdf, RoutineReturn,
 };
 use crate::storage::Storage;
 
@@ -107,6 +107,7 @@ fn catalog_def_from_prepared(
             .as_ref()
             .map(function_type_from_udf_cast)
             .transpose()?,
+        return_shape: ReturnShape::Scalar,
         language: FunctionLanguage::Declarative,
         body_source: body_source.to_string(),
         attrs: attrs.clone(),
@@ -116,7 +117,7 @@ fn catalog_def_from_prepared(
 
 /// 構文段の属性句（[`FunctionAttributeClauses`]）をカタログの保存値へ写す（Issue #2217・SQL-67 (3)）。
 /// 未指定の項目はカタログ既定（`VOLATILE`・`CALLED ON NULL INPUT`・`PARALLEL UNSAFE`）になる。
-/// `SECURITY`・`ROWS` は構文段が `SECURITY INVOKER` 以外・集合返却なしの `ROWS` を拒否済みで、ここへ来ない。
+/// `SECURITY` は構文段が `SECURITY INVOKER` 以外を拒否済みで、ここへ来ない。`ROWS` は集合返却のときだけ構文段が通す。
 pub(crate) fn function_attributes_from_clauses(
     clauses: &FunctionAttributeClauses,
 ) -> FunctionAttributes {
@@ -137,6 +138,7 @@ pub(crate) fn function_attributes_from_clauses(
         };
     }
     attrs.cost = clauses.cost();
+    attrs.rows = clauses.rows();
     attrs
 }
 
@@ -289,6 +291,9 @@ pub(crate) struct RoutineSpec<'a> {
     pub(crate) params: &'a [String],
     pub(crate) param_types: &'a [Option<CastType>],
     pub(crate) return_type: Option<&'a CastType>,
+    /// `RETURNS SETOF <型>`（名前なし 1 列）／`RETURNS TABLE (...)`（名前つき列）の列（Issue #2220。
+    /// 集合返却のとき `return_type` は `None`）。
+    pub(crate) return_set: Option<&'a [(Option<String>, CastType)]>,
     pub(crate) returns_trigger: bool,
     pub(crate) language: FunctionLanguageClause,
     pub(crate) attrs: FunctionAttributes,
@@ -357,13 +362,30 @@ pub(crate) fn execute_create_routine_persistent(
             ty: Some(function_type_from_udf_cast(ty)?),
         });
     }
-    let return_type = if spec.returns_trigger {
-        FunctionType::trigger()
+    let (return_type, return_shape) = if let Some(cols) = spec.return_set {
+        match cols {
+            [(None, ty)] => (Some(function_type_from_udf_cast(ty)?), ReturnShape::SetOf),
+            _ => {
+                let mut out =
+                    Vec::with_capacity(cols.len().min(crate::sql::udf_call::MAX_UDF_PARAMS));
+                for (name, ty) in cols {
+                    let name = name.as_ref().ok_or_else(|| {
+                        SqlSurfaceError::invalid_function_definition(
+                            "function result column must be named",
+                        )
+                    })?;
+                    out.push((name.to_ascii_lowercase(), function_type_from_udf_cast(ty)?));
+                }
+                (None, ReturnShape::Table(out))
+            }
+        }
+    } else if spec.returns_trigger {
+        (Some(FunctionType::trigger()), ReturnShape::Scalar)
     } else {
         let ty = spec.return_type.ok_or_else(|| {
             SqlSurfaceError::invalid_function_definition("function result type must be specified")
         })?;
-        function_type_from_udf_cast(ty)?
+        (Some(function_type_from_udf_cast(ty)?), ReturnShape::Scalar)
     };
     // 標準形は定義時に名前を解決し、参照先への依存辺を返す（それ以外は空）。
     let dependencies = validate()?;
@@ -371,7 +393,8 @@ pub(crate) fn execute_create_routine_persistent(
         id: 1,
         function_key: lower.clone(),
         params,
-        return_type: Some(return_type),
+        return_type,
+        return_shape,
         language: match spec.language {
             FunctionLanguageClause::Sql => FunctionLanguage::Sql,
             FunctionLanguageClause::Plpgsql => FunctionLanguage::Plpgsql,
@@ -426,10 +449,16 @@ fn routine_from_spec(spec: &RoutineSpec<'_>) -> Option<crate::sql::udf_call::Rou
         .iter()
         .map(|t| t.as_ref().and_then(normalize))
         .collect::<Option<Vec<CastType>>>()?;
-    let ret = if spec.returns_trigger {
-        None
+    let ret = if let Some(cols) = spec.return_set {
+        let cols = cols
+            .iter()
+            .map(|(n, t)| Some((n.as_ref().map(|n| n.to_ascii_lowercase()), normalize(t)?)))
+            .collect::<Option<Vec<_>>>()?;
+        RoutineReturn::Set(cols)
+    } else if spec.returns_trigger {
+        RoutineReturn::Trigger
     } else {
-        Some(normalize(spec.return_type?)?)
+        RoutineReturn::Scalar(normalize(spec.return_type?)?)
     };
     Some(crate::sql::udf_call::RoutineDefinition {
         params: spec.params.iter().map(|p| p.to_ascii_lowercase()).collect(),

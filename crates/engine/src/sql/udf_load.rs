@@ -17,14 +17,14 @@
 //! 異なるテナントでの呼び出しは、カタログ由来を全部消して何もロードしない。エラー・skip の経路は
 //! tenant_id・内部キー・本体の原文を出さない。
 
-use crate::catalog::function::{FunctionDef, FunctionLanguage, MAX_FUNCTIONS};
+use crate::catalog::function::{FunctionDef, FunctionLanguage, ReturnShape, MAX_FUNCTIONS};
 use crate::sql::allowlist::{parse_stored_function_body, SqlSurfaceError};
 use crate::sql::cast::CastType;
 use crate::sql::udf_call::{
     commit_function_definition, prepare_function_with_signature,
     prepare_function_with_signature_ignoring_capacity, MAX_SESSION_UDFS,
 };
-use crate::sql::udf_call::{Expr, RoutineDefinition, UdfRegistry};
+use crate::sql::udf_call::{Expr, RoutineDefinition, RoutineReturn, UdfRegistry};
 use crate::sql::udf_ddl::udf_cast_from_function_type;
 use crate::storage::Storage;
 
@@ -97,11 +97,25 @@ fn representable_routine(def: &FunctionDef) -> Option<RoutineDefinition> {
         .iter()
         .map(|p| p.ty.as_ref().and_then(udf_cast_from_function_type))
         .collect::<Option<Vec<CastType>>>()?;
-    let ft = def.return_type.as_ref()?;
-    let ret = if ft.is_trigger() {
-        None
-    } else {
-        Some(udf_cast_from_function_type(ft)?)
+    // 戻り値の形を先に見る（`RETURNS TABLE` は `return_type` を持たない。Issue #2220）。
+    let ret = match &def.return_shape {
+        ReturnShape::Table(cols) => RoutineReturn::Set(
+            cols.iter()
+                .map(|(n, t)| Some((Some(n.clone()), udf_cast_from_function_type(t)?)))
+                .collect::<Option<Vec<_>>>()?,
+        ),
+        ReturnShape::SetOf => RoutineReturn::Set(vec![(
+            None,
+            udf_cast_from_function_type(def.return_type.as_ref()?)?,
+        )]),
+        ReturnShape::Scalar => {
+            let ft = def.return_type.as_ref()?;
+            if ft.is_trigger() {
+                RoutineReturn::Trigger
+            } else {
+                RoutineReturn::Scalar(udf_cast_from_function_type(ft)?)
+            }
+        }
     };
     Some(RoutineDefinition {
         params,
@@ -311,6 +325,7 @@ mod tests {
                 })
                 .collect(),
             return_type: None,
+            return_shape: crate::catalog::function::ReturnShape::Scalar,
             language: FunctionLanguage::Declarative,
             body_source: body.to_string(),
             attrs: FunctionAttributes::default(),

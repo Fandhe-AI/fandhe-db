@@ -80,6 +80,7 @@ pub(super) fn func(key: &str) -> FunctionDef {
         function_key: key.to_string(),
         params: Vec::<FunctionParam>::new(),
         return_type: Some(FunctionType::from_column_type(&ColumnType::Integer).expect("ty")),
+        return_shape: crate::catalog::function::ReturnShape::Scalar,
         language: FunctionLanguage::Sql,
         body_source: "SELECT 1".to_string(),
         attrs: FunctionAttributes::default(),

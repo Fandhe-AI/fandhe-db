@@ -22,7 +22,8 @@ use crate::sql::cast::{self, CastRule, CastType};
 use crate::sql::const_select::expr_value_to_cell;
 use crate::sql::exec::Cell;
 use crate::sql::udf_call::{
-    bind_const_projection_expr, eval, Expr, RoutineDefinition, UdfRegistry, MAX_EXPR_NODES,
+    bind_const_projection_expr, eval, Expr, RoutineDefinition, RoutineReturn, UdfRegistry,
+    MAX_EXPR_NODES,
 };
 
 /// ルーチン 1 回の起動を担う側（core が実装する。`sql` モジュールはストレージ・Tx に触れない）。
@@ -201,10 +202,20 @@ impl<'a, 'b> Folder<'a, 'b> {
             self.found = true;
             return Ok(original.clone());
         }
-        let Some(ret) = def.ret.clone() else {
-            return Err(unsupported(
-                "trigger functions cannot be called as ordinary functions",
-            ));
+        let ret = match &def.ret {
+            RoutineReturn::Scalar(t) => t.clone(),
+            RoutineReturn::Trigger => {
+                return Err(unsupported(
+                    "trigger functions cannot be called as ordinary functions",
+                ))
+            }
+            // 集合返却関数をスカラー位置で呼ぶ形（PostgreSQL の target-list SRF）は未対応。最初の 1 行を
+            // スカラーとして返す誤動作を作らないよう、引数の評価・起動の前に拒否する（Issue #2220）。
+            RoutineReturn::Set(_) => {
+                return Err(unsupported(
+                    "set-returning functions are supported only in the FROM clause",
+                ))
+            }
         };
         if conditional {
             return Err(unsupported(
@@ -247,7 +258,7 @@ impl<'a, 'b> Folder<'a, 'b> {
 
 /// 実引数 1 個の型検査（宣言的 UDF の型付き引数 `bind_typed_udf_arg` と同じ規則。型の決まった実引数は
 /// 暗黙変換だけで受理し、型なしリテラル〔文字列・NULL〕は宣言型の入力関数で解釈する）。
-fn check_arg(
+pub(crate) fn check_arg(
     registry: &UdfRegistry,
     arg: &Expr,
     declared: &CastType,
@@ -290,7 +301,7 @@ fn check_arg(
 }
 
 /// 型検査済みの実引数を宣言型へ変換して評価する。
-fn eval_arg(
+pub(crate) fn eval_arg(
     registry: &UdfRegistry,
     arg: &Expr,
     declared: &CastType,
