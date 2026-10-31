@@ -3,7 +3,7 @@
 //! 外部依存（wat 等）を増やさないため、WASM バイナリは本ファイル内の小さな
 //! エンコーダで手書きする。各 fixture のコメントに対応する WAT 相当を書く。
 //! `wasm-udf` feature 無効の既定ビルドではこのファイルは空になる。
-//! 配線（SQL からの呼び出し）は #1926、無限ループの停止は #1927 の範囲。
+//! 配線（SQL からの呼び出し）は #1926、epoch ティッカーは #1927 の範囲。
 
 #![cfg(feature = "wasm-udf")]
 
@@ -51,6 +51,8 @@ struct Spec {
     /// (minimum pages)。None なら memory 無し。
     memory_min: Option<u32>,
     mutable_i32_global: bool,
+    /// funcref テーブルの初期要素数。None ならテーブル無し。
+    table_min: Option<u32>,
     memory_export: Option<&'static str>,
     entry_export: Option<&'static str>,
     /// ローカル宣言を含む関数本体（end を含む）。
@@ -66,6 +68,7 @@ impl Spec {
             memory_import: false,
             memory_min: Some(1),
             mutable_i32_global: false,
+            table_min: None,
             memory_export: Some("memory"),
             entry_export: Some("f"),
             body,
@@ -104,6 +107,11 @@ impl Spec {
 
         section(3, &[1, 0], &mut m);
 
+        if let Some(min) = self.table_min {
+            let mut s = vec![1, 0x70, 0];
+            leb(min, &mut s);
+            section(4, &s, &mut m);
+        }
         if let (Some(min), false) = (self.memory_min, self.memory_import) {
             let mut s = vec![1, 0];
             leb(min, &mut s);
@@ -369,4 +377,41 @@ fn errors_use_fixed_messages() {
     let be = sum_backend();
     let dbg = format!("{be:?}");
     assert_eq!(dbg, "WasmtimeBackend { entry_len: 1, .. }");
+}
+
+#[test]
+fn infinite_loop_is_stopped_by_fuel() {
+    // (loop (br 0)) f32.const 0
+    let body = plain_body(&[0x03, 0x40, 0x0C, 0, 0x0B, 0x43, 0, 0, 0, 0]);
+    let limits = SandboxLimits {
+        deadline_ticks: 1,
+        ..SandboxLimits::default()
+    };
+    let be = compile_wasm_udf_backend(&Spec::new(body).build(), "f", limits).unwrap();
+    assert_eq!(
+        be.call_vector_scalar(&[], 0.0).err(),
+        Some(WasmUdfError::Trap(TrapKind::DeadlineExceeded))
+    );
+}
+
+#[test]
+fn memory_grow_over_limit_is_an_error_even_if_result_is_dropped() {
+    // (drop (memory.grow (i32.const 100000))) f32.const 0
+    let body = plain_body(&[0x41, 0xA0, 0x8D, 0x06, 0x40, 0x00, 0x1A, 0x43, 0, 0, 0, 0]);
+    let be = compile(&Spec::new(body)).unwrap();
+    assert_eq!(
+        be.call_vector_scalar(&[], 0.0).err(),
+        Some(WasmUdfError::MemoryLimitExceeded)
+    );
+}
+
+#[test]
+fn huge_table_declaration_is_rejected_at_instantiation() {
+    let mut spec = Spec::new(plain_body(&[0x43, 0, 0, 0, 0]));
+    spec.table_min = Some(100_000_000);
+    let be = compile(&spec).unwrap();
+    assert_eq!(
+        be.call_vector_scalar(&[], 0.0).err(),
+        Some(WasmUdfError::MemoryLimitExceeded)
+    );
 }

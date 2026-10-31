@@ -5,8 +5,8 @@
 //! [`WasmUdfBackend`] を実装する値（`Arc<dyn WasmUdfBackend>`）を返す。wasmtime の型は
 //! 本ファイルの外へ出さない。将来 Issue #1926 で `sql::udf_call::define_wasm_function`
 //! が [`compile_wasm_udf_backend`] を呼ぶ。epoch を進めるティッカーと上限の設定経路は
-//! Issue #1927 の範囲で、本ファイルは Store ごとに `set_epoch_deadline` を設定するのみ
-//! （ティッカーが無いため現時点では無限ループは停止しない）。
+//! Issue #1927 の範囲。それまでの停止手段として、Store ごとに fuel（命令数予算。
+//! `deadline_ticks` に比例）を設定し、無限ループする entry・start 関数も必ず停止する。
 //!
 //! fail-closed: 検証の失敗はすべて固定文言の [`WasmUdfError`] へ畳み、wasmtime の
 //! エラー文字列（モジュール内容を含みうる）は破棄する。モジュール／entry 名の経路で
@@ -16,8 +16,7 @@ use std::fmt;
 use std::sync::{Arc, OnceLock};
 
 use wasmtime::{
-    Config, Engine, ExternType, InstancePre, Linker, Module, Store, StoreLimits,
-    StoreLimitsBuilder, Trap, ValType,
+    Config, Engine, ExternType, InstancePre, Linker, Module, ResourceLimiter, Store, Trap, ValType,
 };
 
 use super::{SandboxLimits, TrapKind, WasmUdfBackend, WasmUdfError, MAX_MODULE_BYTES};
@@ -32,6 +31,61 @@ const WASM_PAGE_BYTES: u64 = 65536;
 /// ポインタ: `docs/spec/03-poc/udf-mechanism/`）。
 pub(crate) const VECTOR_ARG_OFFSET: u32 = 1024;
 
+/// `deadline_ticks` 1 tick あたりの fuel（命令数予算）。ティッカー導入前の停止手段。
+const FUEL_PER_TICK: u64 = 2_000_000;
+
+/// テーブル要素数の上限（funcref 1 要素はポインタ幅。巨大テーブル宣言による
+/// ホストメモリ枯渇を防ぐ）。
+const MAX_TABLE_ELEMENTS: usize = 10_000;
+
+/// 資源上限の限定子。上限超過を検知した印を残し、呼び出し結果を
+/// [`WasmUdfError::MemoryLimitExceeded`] へ写像できるようにする
+/// （`memory.grow` の -1 返却をゲストが握りつぶしても Ok にしない）。
+struct UdfLimiter {
+    memory_limit_bytes: usize,
+    exceeded: bool,
+}
+
+impl ResourceLimiter for UdfLimiter {
+    fn memory_growing(
+        &mut self,
+        _current: usize,
+        desired: usize,
+        _maximum: Option<usize>,
+    ) -> wasmtime::Result<bool> {
+        if desired > self.memory_limit_bytes {
+            self.exceeded = true;
+            return Err(wasmtime::Error::msg("memory limit"));
+        }
+        Ok(true)
+    }
+
+    fn table_growing(
+        &mut self,
+        _current: usize,
+        desired: usize,
+        _maximum: Option<usize>,
+    ) -> wasmtime::Result<bool> {
+        if desired > MAX_TABLE_ELEMENTS {
+            self.exceeded = true;
+            return Err(wasmtime::Error::msg("table limit"));
+        }
+        Ok(true)
+    }
+
+    fn instances(&self) -> usize {
+        1
+    }
+
+    fn tables(&self) -> usize {
+        1
+    }
+
+    fn memories(&self) -> usize {
+        1
+    }
+}
+
 /// wasm スタック深さの上限（バイト）。
 const MAX_WASM_STACK_BYTES: usize = 512 * 1024;
 
@@ -42,7 +96,7 @@ static ENGINE: OnceLock<Option<Engine>> = OnceLock::new();
 fn build_engine() -> Option<Engine> {
     let mut config = Config::new();
     config.epoch_interruption(true);
-    config.consume_fuel(false);
+    config.consume_fuel(true);
     config.wasm_memory64(false);
     config.wasm_multi_memory(false);
     config.wasm_gc(false);
@@ -62,7 +116,7 @@ fn shared_engine() -> Result<&'static Engine, WasmUdfError> {
 /// 行・呼び出しをまたぐ状態を残さない）。
 struct WasmtimeBackend {
     engine: &'static Engine,
-    pre: InstancePre<StoreLimits>,
+    pre: InstancePre<UdfLimiter>,
     entry: String,
     limits: SandboxLimits,
 }
@@ -81,9 +135,12 @@ impl fmt::Debug for WasmtimeBackend {
 }
 
 /// wasmtime のエラーを閉じた [`WasmUdfError`] へ写像する（文字列は破棄する）。
-fn map_call_error(err: &wasmtime::Error) -> WasmUdfError {
+fn map_call_error(err: &wasmtime::Error, limit_exceeded: bool) -> WasmUdfError {
+    if limit_exceeded {
+        return WasmUdfError::MemoryLimitExceeded;
+    }
     let kind = match err.downcast_ref::<Trap>() {
-        Some(Trap::Interrupt) => TrapKind::DeadlineExceeded,
+        Some(Trap::Interrupt | Trap::OutOfFuel) => TrapKind::DeadlineExceeded,
         Some(
             Trap::UnreachableCodeReached
             | Trap::IntegerDivisionByZero
@@ -102,20 +159,21 @@ impl WasmUdfBackend for WasmtimeBackend {
         let len = i32::try_from(v.len()).map_err(|_| oob)?;
         let byte_len = v.len().checked_mul(4).ok_or(oob)?;
 
-        let store_limits = StoreLimitsBuilder::new()
-            .memory_size(self.limits.memory_limit_bytes)
-            .instances(1)
-            .memories(1)
-            .tables(1)
-            .build();
-        let mut store = Store::new(self.engine, store_limits);
+        let limiter = UdfLimiter {
+            memory_limit_bytes: self.limits.memory_limit_bytes,
+            exceeded: false,
+        };
+        let mut store = Store::new(self.engine, limiter);
         store.limiter(|s| s);
         store.set_epoch_deadline(self.limits.deadline_ticks);
+        store
+            .set_fuel(self.limits.deadline_ticks.saturating_mul(FUEL_PER_TICK))
+            .map_err(|_| WasmUdfError::InvalidModule)?;
 
-        let instance = self
-            .pre
-            .instantiate(&mut store)
-            .map_err(|e| map_call_error(&e))?;
+        let instance = match self.pre.instantiate(&mut store) {
+            Ok(i) => i,
+            Err(e) => return Err(map_call_error(&e, store.data().exceeded)),
+        };
         let memory = instance
             .get_memory(&mut store, "memory")
             .ok_or(WasmUdfError::MissingMemoryExport)?;
@@ -137,9 +195,10 @@ impl WasmUdfBackend for WasmtimeBackend {
             .map_err(|_| WasmUdfError::SignatureMismatch)?;
         let ptr = i32::try_from(VECTOR_ARG_OFFSET).map_err(|_| oob)?;
         // 非有限値の扱いは呼び出し元（`expr_program` の有限値検査）の契約に任せる。
-        let out = func
-            .call(&mut store, (ptr, len, scalar as f32))
-            .map_err(|e| map_call_error(&e))?;
+        let out = match func.call(&mut store, (ptr, len, scalar as f32)) {
+            Ok(o) => o,
+            Err(e) => return Err(map_call_error(&e, store.data().exceeded)),
+        };
         Ok(f64::from(out))
     }
 }
@@ -195,7 +254,7 @@ pub fn compile_wasm_udf_backend(
         return Err(WasmUdfError::SignatureMismatch);
     }
     // 空の Linker（WASI・ホスト関数なし）。import 0 件はここまでで確認済み。
-    let linker: Linker<StoreLimits> = Linker::new(engine);
+    let linker: Linker<UdfLimiter> = Linker::new(engine);
     let pre = linker
         .instantiate_pre(&module)
         .map_err(|_| WasmUdfError::InvalidModule)?;
