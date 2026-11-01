@@ -126,7 +126,7 @@ pub(crate) fn execute_alter_policy(
         AlterPolicyAction::Rename(new_name) => {
             storage
                 .rename_policy(tenant_id, &stmt.table, &stmt.name, new_name)
-                .map_err(|e| map_policy_error(e.into(), &stmt.name))?;
+                .map_err(|e| map_policy_error(e.into(), new_name))?;
         }
         AlterPolicyAction::Modify {
             roles,
@@ -290,6 +290,52 @@ mod tests {
         );
         assert_eq!(corrupt.wire_code(), "XX000");
         assert!(!corrupt.client_message().contains("secret"));
+    }
+
+    #[test]
+    fn rename_to_existing_name_reports_the_target_name() {
+        use crate::catalog::policy::{PolicyCommand, PolicyDef, PolicyExprs, PolicyRole};
+        use crate::catalog::{ColumnDef, ColumnType, TableSchema};
+        let path = crate::test_util::temp_db::unique_db_path("pol_rename_dup");
+        let _g = crate::test_util::temp_db::CleanupGuard(path.clone());
+        let s = Storage::open(&path).expect("open");
+        s.create_table(&TableSchema::new(
+            "docs",
+            vec![ColumnDef::new("a", ColumnType::Text, true)],
+        ))
+        .expect("table");
+        for name in ["src_pol", "dst_pol"] {
+            let def = PolicyDef {
+                id: 0,
+                name: name.to_string(),
+                permissive: true,
+                command: PolicyCommand::All,
+                roles: vec![PolicyRole::Public],
+                using_sql: None,
+                check_sql: None,
+                referenced_columns: Vec::new(),
+            };
+            s.create_policy::<CatalogError, _>("t1", "docs", &def, |_| {
+                Ok(PolicyExprs {
+                    using_sql: None,
+                    check_sql: None,
+                    referenced_columns: Vec::new(),
+                })
+            })
+            .expect("create");
+        }
+        let stmt = ValidatedAlterPolicy {
+            name: "src_pol".to_string(),
+            table: "docs".to_string(),
+            action: AlterPolicyAction::Rename("dst_pol".to_string()),
+        };
+        let err = match execute_alter_policy(&s, "t1", &stmt) {
+            Err(e) => e,
+            Ok(_) => panic!("rename onto an existing name must fail"),
+        };
+        assert_eq!(err.wire_code(), "42710");
+        let m = err.client_message();
+        assert!(m.contains("dst_pol") && !m.contains("src_pol"), "{m}");
     }
 
     #[test]

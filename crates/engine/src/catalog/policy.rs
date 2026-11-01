@@ -619,6 +619,8 @@ impl Storage {
                 .map_err(CatalogError::from)?;
         }
         bump_table_generation_in_txn(&write_txn, table_key)?;
+        // commit 記録（SQL-38・Issue #2404）: ポリシー DDL は表世代の更新と同じ txn で DDL として記録する。
+        crate::storage::commit_log::note_ddl(&write_txn, table_key);
         crate::recovery::commit_boundary::commit(write_txn)
             .map_err(super::convert_storage_error)?;
         Ok(stored.id)
@@ -663,6 +665,8 @@ impl Storage {
                 .map_err(CatalogError::from)?;
         }
         bump_table_generation_in_txn(&write_txn, table_key)?;
+        // commit 記録（SQL-38・Issue #2404）: ポリシー DDL は表世代の更新と同じ txn で DDL として記録する。
+        crate::storage::commit_log::note_ddl(&write_txn, table_key);
         crate::recovery::commit_boundary::commit(write_txn)
             .map_err(super::convert_storage_error)?;
         Ok(())
@@ -700,6 +704,8 @@ impl Storage {
             table.insert((table_key, scope, new_name), blob.as_slice())?;
         }
         bump_table_generation_in_txn(&write_txn, table_key)?;
+        // commit 記録（SQL-38・Issue #2404）: ポリシー DDL は表世代の更新と同じ txn で DDL として記録する。
+        crate::storage::commit_log::note_ddl(&write_txn, table_key);
         crate::recovery::commit_boundary::commit(write_txn)
             .map_err(super::convert_storage_error)?;
         Ok(())
@@ -724,6 +730,8 @@ impl Storage {
             table.remove((table_key, scope, name))?;
         }
         bump_table_generation_in_txn(&write_txn, table_key)?;
+        // commit 記録（SQL-38・Issue #2404）: ポリシー DDL は表世代の更新と同じ txn で DDL として記録する。
+        crate::storage::commit_log::note_ddl(&write_txn, table_key);
         crate::recovery::commit_boundary::commit(write_txn)
             .map_err(super::convert_storage_error)?;
         Ok(true)
