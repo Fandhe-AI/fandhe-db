@@ -255,11 +255,13 @@ pub struct SessionState {
     row_security_off: bool,
     /// `RESET row_security`／`SET row_security TO DEFAULT` の戻り先が off か（起動パラメータ由来）。
     row_security_reset_off: bool,
-    /// 現在のロール ID（#1971 以降で認証層が認証成功後に 1 回だけ設定する契約。SQL 文から書き換える
-    /// 経路は持たない）。`None`（現状の全セッション）は「BYPASSRLS なし・非所有者」として扱う
-    /// （利用者ポリシーを適用する＝狭める側。fail-closed）。
+    /// 現在のロール ID（#1971 以降で認証層が認証成功後に 1 回だけ束縛する契約。以後 SQL 文から変えられる
+    /// のは認可済みの `SET ROLE`／`RESET ROLE`〔`sql::role_ddl`〕だけで、`session_role_id` に戻る側へも
+    /// 到達できる範囲にしか動かない）。`None`（現状の全セッション）は「BYPASSRLS なし・非所有者」として
+    /// 扱う（利用者ポリシーを適用する＝狭める側。fail-closed）。
     current_role_id: Option<u64>,
-    /// セッションのロール ID（`SESSION_USER` 相当。設定契約は `current_role_id` と同じ）。
+    /// セッションのロール ID（`SESSION_USER` 相当。認証層の束縛だけで決まり、SQL 文から書き換える経路は
+    /// 持たない。`SET ROLE` の認可の起点）。
     session_role_id: Option<u64>,
     /// `SET SESSION CHARACTERISTICS AS TRANSACTION READ ONLY|READ WRITE` で設定した、以後の明示
     /// トランザクション（`BEGIN`／`START TRANSACTION`）の既定アクセスモード（Issue #1939）。`None` は
@@ -410,10 +412,23 @@ impl SessionState {
     }
 
     /// 認証主体のロール ID を束縛する。認証層が認証成功後に 1 回だけ呼ぶ契約（`set_session_user` と同じ。
-    /// SQL 文経由の経路は持たない）。
+    /// `session_role_id` を SQL 文から書き換える経路は持たない）。
     pub fn bind_role_ids(&mut self, current: u64, session: u64) {
         self.current_role_id = Some(current);
         self.session_role_id = Some(session);
+    }
+
+    /// 認可済みの `SET ROLE` の結果を現在のロールにする（`sql::role_ddl::execute_set_role` だけが、
+    /// セッションのロールから `SET` 真のメンバーシップの経路で到達できると確認した後に呼ぶ。
+    /// `session_role_id`・`ddl_allowed`・テナントの可視範囲は変えない。Issue #1963）。
+    pub(crate) fn set_current_role_id(&mut self, id: u64) {
+        self.current_role_id = Some(id);
+    }
+
+    /// `RESET ROLE`／`SET ROLE NONE` の実体。現在のロールをセッションのロールへ戻す（未束縛なら何も
+    /// 変えない。権限は何も与えない。Issue #1963）。
+    pub(crate) fn reset_current_role(&mut self) {
+        self.current_role_id = self.session_role_id;
     }
 
     pub fn search_mode(&self) -> Option<SearchMode> {
