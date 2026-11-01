@@ -1,6 +1,6 @@
 //! RFC 4648 標準アルファベット・padding 必須の base64 エンコード／厳格デコード。
 //!
-//! `auth::scram`（SCRAM-SHA-256 認証。Issue #940・WIRE-18・TASK-222）の
+//! wire-server の `auth::scram`（Issue #940・WIRE-18・TASK-222）と engine の `scram_verifier` の
 //! salt・StoredKey／ServerKey・nonce・proof のエンコードに使う。依存追加なし
 //! （`.claude/rules/dependency-policy.md`）。デコードは untrusted 入力
 //! （wire 経由の client-first/client-final メッセージ）を扱うため、

@@ -7,13 +7,12 @@
 //! 対応: TASK-67（ポインタ: `docs/spec/05-tasks.md`。対象ビヘイビア WIRE-2, WIRE-3）。
 
 pub mod argon2id;
-pub mod base64_std;
+pub use engine::crypto::base64_std;
 pub mod blake2b;
-pub mod hmac_sha256;
+pub use engine::crypto::hmac_sha256;
 pub mod scram;
 
 use std::collections::{HashMap, HashSet};
-use std::io::Read;
 use std::path::Path;
 use std::sync::OnceLock;
 use std::time::{Duration, Instant};
@@ -599,10 +598,7 @@ pub fn verify(
 /// セッショントークン生成。TASK-174・HTTP-4。Issue #750）からも同じ乱数源
 /// として再利用される。
 pub fn read_urandom(len: usize) -> std::io::Result<Vec<u8>> {
-    let mut f = std::fs::File::open("/dev/urandom")?;
-    let mut buf = vec![0u8; len];
-    f.read_exact(&mut buf)?;
-    Ok(buf)
+    engine::crypto::random::read_urandom(len)
 }
 
 /// [`read_urandom`] を既定の salt 長（16 バイト）で呼ぶ補助関数。

@@ -1946,6 +1946,12 @@ pub enum ParsedSql {
     AlterPolicy(crate::sql::allowlist::ValidatedAlterPolicy),
     /// `DROP POLICY [IF EXISTS] <名前> ON <表>`（RLS-13、Issue #2274）。
     DropPolicy(crate::sql::allowlist::ValidatedDropPolicy),
+    /// `CREATE ROLE|USER`（SQL-39、Issue #1962）。
+    ///
+    /// **BREAKING CHANGE**（Issue #1962）: `ParsedSql` への variant 追加。
+    CreateRole(crate::sql::allowlist::ValidatedCreateRole),
+    /// `DROP ROLE|USER [IF EXISTS] <名前>[, ...]`（SQL-39、Issue #1962）。
+    DropRole(crate::sql::allowlist::ValidatedDropRole),
     /// `DO [LANGUAGE plpgsql] '<本体>'`（SQL-68、Issue #2228）。
     ///
     /// `ParsedSql::Statement` には載せない（DataModifyingCte・CreateTrigger と同じ理由。wire 側が
@@ -2092,6 +2098,8 @@ fn statement_clock_scope(
         | ParsedSql::CreatePolicy(_)
         | ParsedSql::AlterPolicy(_)
         | ParsedSql::DropPolicy(_)
+        | ParsedSql::CreateRole(_)
+        | ParsedSql::DropRole(_)
         | ParsedSql::Do(_)
         | ParsedSql::Lock(_)
         | ParsedSql::CreateSchema(_)
@@ -2166,6 +2174,8 @@ fn insert_sequence_scope(
         | ParsedSql::CreatePolicy(_)
         | ParsedSql::AlterPolicy(_)
         | ParsedSql::DropPolicy(_)
+        | ParsedSql::CreateRole(_)
+        | ParsedSql::DropRole(_)
         | ParsedSql::Do(_)
         | ParsedSql::Lock(_)
         | ParsedSql::CreateSchema(_)
@@ -2238,6 +2248,8 @@ fn insert_default_clock_scope(
         | ParsedSql::CreatePolicy(_)
         | ParsedSql::AlterPolicy(_)
         | ParsedSql::DropPolicy(_)
+        | ParsedSql::CreateRole(_)
+        | ParsedSql::DropRole(_)
         | ParsedSql::Do(_)
         | ParsedSql::Lock(_)
         | ParsedSql::CreateSchema(_)
@@ -4351,6 +4363,8 @@ impl EngineCore {
                     | crate::sql::SqlOutcome::CreatePolicy(_)
                     | crate::sql::SqlOutcome::AlterPolicy(_)
                     | crate::sql::SqlOutcome::DropPolicy(_)
+                    | crate::sql::SqlOutcome::CreateRole(_)
+                    | crate::sql::SqlOutcome::DropRole(_)
                     | crate::sql::SqlOutcome::Do
                     | crate::sql::SqlOutcome::Lock
                     | crate::sql::SqlOutcome::CreateSchema(_)
@@ -4415,6 +4429,8 @@ impl EngineCore {
                     | crate::sql::SqlOutcome::CreatePolicy(_)
                     | crate::sql::SqlOutcome::AlterPolicy(_)
                     | crate::sql::SqlOutcome::DropPolicy(_)
+                    | crate::sql::SqlOutcome::CreateRole(_)
+                    | crate::sql::SqlOutcome::DropRole(_)
                     | crate::sql::SqlOutcome::Do
                     | crate::sql::SqlOutcome::Lock
                     | crate::sql::SqlOutcome::CreateSchema(_)
@@ -4476,6 +4492,8 @@ impl EngineCore {
                     | crate::sql::SqlOutcome::CreatePolicy(_)
                     | crate::sql::SqlOutcome::AlterPolicy(_)
                     | crate::sql::SqlOutcome::DropPolicy(_)
+                    | crate::sql::SqlOutcome::CreateRole(_)
+                    | crate::sql::SqlOutcome::DropRole(_)
                     | crate::sql::SqlOutcome::Do
                     | crate::sql::SqlOutcome::Lock
                     | crate::sql::SqlOutcome::CreateSchema(_)
@@ -4544,6 +4562,8 @@ impl EngineCore {
                     | crate::sql::SqlOutcome::CreatePolicy(_)
                     | crate::sql::SqlOutcome::AlterPolicy(_)
                     | crate::sql::SqlOutcome::DropPolicy(_)
+                    | crate::sql::SqlOutcome::CreateRole(_)
+                    | crate::sql::SqlOutcome::DropRole(_)
                     | crate::sql::SqlOutcome::Do
                     | crate::sql::SqlOutcome::Lock
                     | crate::sql::SqlOutcome::CreateSchema(_)
@@ -4631,6 +4651,8 @@ impl EngineCore {
                     | crate::sql::SqlOutcome::CreatePolicy(_)
                     | crate::sql::SqlOutcome::AlterPolicy(_)
                     | crate::sql::SqlOutcome::DropPolicy(_)
+                    | crate::sql::SqlOutcome::CreateRole(_)
+                    | crate::sql::SqlOutcome::DropRole(_)
                     | crate::sql::SqlOutcome::Do
                     | crate::sql::SqlOutcome::Lock
                     | crate::sql::SqlOutcome::CreateSchema(_)
@@ -5254,6 +5276,8 @@ impl EngineCore {
                     | ParsedSql::CreateSchema(_)
                     | ParsedSql::DropSchema(_)
                     | ParsedSql::AlterSchema(_)
+                    | ParsedSql::CreateRole(_)
+                    | ParsedSql::DropRole(_)
             )
         {
             return Ok(());
@@ -5812,6 +5836,11 @@ impl EngineCore {
             let stmt = crate::sql::allowlist::validate_drop_trigger_tokens(&tokens)?;
             return Ok(ParsedSql::DropTrigger(stmt));
         }
+        // SQL-39・Issue #1962: `DROP ROLE|USER` も汎用 `DROP` より前に分岐する（カタログ照会なし）。
+        if crate::sql::allowlist::is_drop_role_statement(&tokens) {
+            let stmt = crate::sql::allowlist::validate_drop_role_tokens(&tokens)?;
+            return Ok(ParsedSql::DropRole(stmt));
+        }
         // RLS-13・Issue #2274: `DROP POLICY` も汎用 `DROP` より前に分岐する（カタログ照会なし）。
         if crate::sql::allowlist::is_drop_policy_statement(&tokens) {
             let stmt = crate::sql::allowlist::validate_drop_policy_tokens(&tokens)?;
@@ -5919,6 +5948,11 @@ impl EngineCore {
         if crate::sql::allowlist::is_create_trigger_statement(&tokens) {
             let stmt = crate::sql::allowlist::validate_create_trigger_tokens(&tokens)?;
             return Ok(ParsedSql::CreateTrigger(stmt));
+        }
+        // SQL-39・Issue #1962: `CREATE ROLE|USER` も `CREATE TABLE`／`FUNCTION` 分岐へ渡さない（カタログ照会なし）。
+        if crate::sql::allowlist::is_create_role_statement(&tokens) {
+            let stmt = crate::sql::allowlist::validate_create_role_tokens(&tokens)?;
+            return Ok(ParsedSql::CreateRole(stmt));
         }
         // RLS-13・Issue #2274: `CREATE POLICY` も `CREATE TABLE`／`FUNCTION` 分岐へ渡さない（カタログ照会なし）。
         if crate::sql::allowlist::is_create_policy_statement(&tokens) {
@@ -7635,6 +7669,24 @@ impl EngineCore {
                 )?;
                 Ok(crate::sql::SqlOutcome::DropPolicy(outcome))
             }
+            // SQL-39（Issue #1962）: DDL 実行権限ゲート → 実行本体。CREATEROLE／ADMIN OPTION による判定は
+            // セッションへロールが束縛される #1966・#1971 の担当で、それまでは DDL 権限ゲートで代替する。
+            // ロールはテナント単位のため `ctx.tenant_id()` を渡す。権限の無い主体には対象の有無を問わず `42501`。
+            ParsedSql::CreateRole(stmt) => {
+                crate::sql::ddl::require_ddl_permission(session)?;
+                let outcome = crate::sql::role_ddl::execute_create_role(
+                    &self.storage,
+                    ctx.tenant_id(),
+                    stmt,
+                )?;
+                Ok(crate::sql::SqlOutcome::CreateRole(outcome))
+            }
+            ParsedSql::DropRole(stmt) => {
+                crate::sql::ddl::require_ddl_permission(session)?;
+                let outcome =
+                    crate::sql::role_ddl::execute_drop_role(&self.storage, ctx.tenant_id(), stmt)?;
+                Ok(crate::sql::SqlOutcome::DropRole(outcome))
+            }
             // TABLE-27（Issue #1713）: DDL 実行権限ゲート → 実行本体。SCHEMA はテナント単位のカタログ
             // のため `ctx.tenant_id()` を渡す（SEQUENCE との違い）。権限の無い主体には対象の有無を
             // 問わず常に `42501`。
@@ -8285,6 +8337,14 @@ impl EngineCore {
                 crate::sql::ddl::require_ddl_permission(session)?;
                 Err(SqlSurfaceError::feature_not_supported(
                     "policy DDL is not supported inside a transaction block",
+                ))
+            }
+            // SQL-39（Issue #1962）: ロール DDL も独立した write txn で commit され ROLLBACK で取り消せないため
+            // 明示トランザクション内では行わない。権限の無いセッションには存在を問わず `42501`（fail-closed）。
+            ParsedSql::CreateRole(_) | ParsedSql::DropRole(_) => {
+                crate::sql::ddl::require_ddl_permission(session)?;
+                Err(SqlSurfaceError::feature_not_supported(
+                    "role DDL is not supported inside a transaction block",
                 ))
             }
             // SQL-67・Issue #2220: FROM 句の集合返却関数の呼び出しも、本体を同じ Tx・RLS で実行するため
@@ -9538,6 +9598,7 @@ impl EngineCore {
             ParsedSql::CreatePolicy(_) | ParsedSql::AlterPolicy(_) | ParsedSql::DropPolicy(_) => {
                 Ok(None)
             }
+            ParsedSql::CreateRole(_) | ParsedSql::DropRole(_) => Ok(None),
             // SQL-68・Issue #2228: `DO` は行を返さない（Describe は NoData）。
             ParsedSql::Do(_) | ParsedSql::Lock(_) => Ok(None),
             ParsedSql::CreateSchema(_) => Ok(None),
