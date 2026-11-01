@@ -10,6 +10,8 @@
 ### Added
 
 - `ALTER ROLE`／`ALTER USER`（属性・パスワードの変更と `RENAME TO`）と `SET ROLE`／`RESET ROLE` を追加した（Issue #1963・SQL-39）。`SET ROLE` はセッションのロールから `SET` 真のメンバーシップを辿れる対象にだけ切り替え、未所属は `42501`、他テナントのロールは不在と同じ `42704`。`PolicyContext`・DDL 権限は変えない。BREAKING CHANGE: 公開 enum `ParsedSql`・`SqlOutcome` に variant（`AlterRole`・`SetRole`）を追加した。
+- `SET TRANSACTION` と `SET SESSION CHARACTERISTICS AS TRANSACTION` を受理する（Issue #1939・SQL-38 (7)(a)・SQL-31 ポインタ。契約の詳細は spec 側を参照）。
+  BREAKING CHANGE: 公開 enum `SqlOutcome`・`ParsedSql` に `SetTransaction`、`SqlSurfaceError` に `SetTransactionAfterQuery` を追加した。修飾子なしの `START TRANSACTION` がセッション既定を継承するようになった。
 - `row_security`（`SET`／`RESET`／`SHOW`・StartupMessage）とポリシーの適用判定（`BYPASSRLS`・所有者・対象ロール）を追加した（Issue #2278・RLS-12・RLS-13・SQL-39）。RLS 有効な表への読み取り・書き込み・`COPY` は `row_security = off` のとき行を扱う前に `42501`（`query would be affected by row-level security policy for table "..."`。表名は自テナントのみ）で拒否する。
   BREAKING CHANGE: 公開 enum `SqlSurfaceError`・`TenantWriteError` に `RowSecurityOffRejected` を追加した（`wire_code` は既存の `42501` のまま）。網羅 `match` する外部コードは腕を足す。
 - `BEGIN READ ONLY` の Tx を開始できるようにし、書き込み系の文（DML・DDL・`COPY FROM`・ロック・`USING OPERATION_ID` 付き）を `25006`（`read_only_sql_transaction`）で拒否して Tx を `Failed` にする（Issue #1934・SQL-38 (3)・ERR-6）。判定は許可リスト方式で、writer・台帳・採番・カタログへ触れる前に拒否する。HTTP は 403 に射影する。

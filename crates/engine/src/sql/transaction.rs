@@ -95,8 +95,8 @@ pub enum RequestedIsolationLevel {
 }
 
 /// [`validate_transaction_control_tokens`] の検証結果。`access_mode` は `BEGIN` で
-/// 明示されたときだけ `Some`（`COMMIT`／`ROLLBACK` は常に `None`）。`None` を残すのは
-/// 将来のセッション既定値（#1939）を適用する余地のため。`core.rs` の
+/// 明示されたときだけ `Some`（`COMMIT`／`ROLLBACK` は常に `None`）。`None` のときは
+/// セッションの既定（`SET SESSION CHARACTERISTICS`。Issue #1939）が適用される。`core.rs` の
 /// `ParsedSql::Transaction` が保持し、実行時に `begin_with_mode` へ渡される。
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct ValidatedTxnControl {
@@ -168,6 +168,106 @@ fn parse_txn_mode_item(rest: &[Token]) -> Result<(TxnModeItem, &[Token]), SqlSur
     };
     let tail = after_read.split_first().map_or(&[][..], |(_, t)| t);
     Ok((TxnModeItem::Access(mode), tail))
+}
+
+/// トランザクションのモード列（`READ ONLY`／`READ WRITE`／`ISOLATION LEVEL ...`。区切りは任意の `,`
+/// か空白）を読み切る。`BEGIN`・`SET TRANSACTION`・`SET SESSION CHARACTERISTICS AS TRANSACTION`
+/// が共有する語彙の唯一の実装（面ごとの受理範囲のずれを防ぐ）。空列は `(None, None)`。同種項目の
+/// 重複・未知の語・末尾の `,` は `42601`（fail-closed）。受信 SQL 由来のため添字は使わず、
+/// ループはトークン数で有界。
+fn parse_txn_mode_list(
+    mut rest: &[Token],
+) -> Result<(Option<TxnAccessMode>, Option<RequestedIsolationLevel>), SqlSurfaceError> {
+    let mut access_mode = None;
+    let mut isolation_level = None;
+    let mut first = true;
+    while !rest.is_empty() {
+        if !first {
+            if let Some((Token::Punct(','), tail)) = rest.split_first() {
+                rest = tail;
+            }
+        }
+        first = false;
+        let (item, tail) = parse_txn_mode_item(rest)?;
+        let duplicated = match item {
+            TxnModeItem::Access(m) => access_mode.replace(m).is_some(),
+            TxnModeItem::Isolation(l) => isolation_level.replace(l).is_some(),
+        };
+        if duplicated {
+            return Err(unsupported_txn_mode());
+        }
+        rest = tail;
+    }
+    Ok((access_mode, isolation_level))
+}
+
+/// `SET TRANSACTION ...`／`SET SESSION CHARACTERISTICS AS TRANSACTION ...` の適用範囲。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum SetTxnScope {
+    /// `SET TRANSACTION`: 実行中の明示トランザクションだけに効く。
+    Transaction,
+    /// `SET SESSION CHARACTERISTICS AS TRANSACTION`: 以後の `BEGIN`／`START TRANSACTION` の既定。
+    SessionDefault,
+}
+
+/// [`validate_set_transaction_tokens`] の検証結果（Issue #1939。SQL-38 (7)(a) のポインタ先に従う）。
+/// `None` の項目は文で指定されなかったもの（既存値を変えない）。`core.rs` の
+/// `ParsedSql::SetTransaction` が保持する。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[non_exhaustive]
+pub struct ValidatedSetTransaction {
+    pub scope: SetTxnScope,
+    pub access_mode: Option<TxnAccessMode>,
+    pub isolation_level: Option<RequestedIsolationLevel>,
+}
+
+/// 先頭が `SET TRANSACTION` または `SET SESSION CHARACTERISTICS` か。`core.rs` の parse 入口と
+/// 一時表経路のトークン走査免除が共通で使う。受理可否は [`validate_set_transaction_tokens`] が決める。
+pub(crate) fn is_set_transaction_head(tokens: &[Token]) -> bool {
+    ident_is(tokens.first(), "SET")
+        && (ident_is(tokens.get(1), "TRANSACTION")
+            || (ident_is(tokens.get(1), "SESSION") && ident_is(tokens.get(2), "CHARACTERISTICS")))
+}
+
+/// `SET TRANSACTION <モード列>` と `SET SESSION CHARACTERISTICS AS TRANSACTION <モード列>` を
+/// 検証する。モード列は `BEGIN` と同じ語彙で、空列は `42601`。`[NOT] DEFERRABLE`・`SNAPSHOT`
+/// などは `BEGIN` と揃えて `42601`（どれか 1 つの面だけで受理しない）。
+pub(crate) fn validate_set_transaction_tokens(
+    tokens: &[Token],
+) -> Result<ValidatedSetTransaction, SqlSurfaceError> {
+    let rest = match tokens.split_first() {
+        Some((first, tail)) if ident_is(Some(first), "SET") => tail,
+        _ => return Err(unsupported_txn_mode()),
+    };
+    let (scope, rest) = match rest.split_first() {
+        Some((t, tail)) if ident_is(Some(t), "TRANSACTION") => (SetTxnScope::Transaction, tail),
+        Some((t, tail)) if ident_is(Some(t), "SESSION") => {
+            let tail = match tail.split_first() {
+                Some((c, t)) if ident_is(Some(c), "CHARACTERISTICS") => t,
+                _ => return Err(unsupported_txn_mode()),
+            };
+            let tail = match tail.split_first() {
+                Some((a, t)) if ident_is(Some(a), "AS") => t,
+                _ => return Err(unsupported_txn_mode()),
+            };
+            match tail.split_first() {
+                Some((t, tail)) if ident_is(Some(t), "TRANSACTION") => {
+                    (SetTxnScope::SessionDefault, tail)
+                }
+                _ => return Err(unsupported_txn_mode()),
+            }
+        }
+        _ => return Err(unsupported_txn_mode()),
+    };
+    if rest.is_empty() {
+        return Err(unsupported_txn_mode());
+    }
+    let (access_mode, isolation_level) = parse_txn_mode_list(rest)?;
+    Ok(ValidatedSetTransaction {
+        scope,
+        access_mode,
+        isolation_level,
+    })
 }
 
 /// トランザクション制御文の規範形を受理する。`BEGIN`/`START TRANSACTION`/`COMMIT`/`END`/
@@ -242,26 +342,8 @@ pub(crate) fn validate_transaction_control_tokens(
     let mut access_mode = None;
     let mut isolation_level = None;
     if ctrl == TxnControl::Begin {
-        // モード句ループ。2 項目目以降は任意の `,` で区切れる構造にしてある（#1938 向け）が、
-        // 現状は項目がアクセスモード 1 つのため、重複・矛盾は `42601`。トークン数で有界。
-        let mut first = true;
-        while !rest.is_empty() {
-            if !first {
-                if let Some((Token::Punct(','), tail)) = rest.split_first() {
-                    rest = tail;
-                }
-            }
-            first = false;
-            let (item, tail) = parse_txn_mode_item(rest)?;
-            let duplicated = match item {
-                TxnModeItem::Access(m) => access_mode.replace(m).is_some(),
-                TxnModeItem::Isolation(l) => isolation_level.replace(l).is_some(),
-            };
-            if duplicated {
-                return Err(unsupported_txn_mode());
-            }
-            rest = tail;
-        }
+        (access_mode, isolation_level) = parse_txn_mode_list(rest)?;
+        rest = &[];
     }
     if !rest.is_empty() {
         return Err(SqlSurfaceError::unsupported(
@@ -351,6 +433,9 @@ struct ActiveTxn<'e> {
     /// 値で、トランザクション内の全文で固定する（`started_at` は壁時計でないため別に持つ）。
     txn_start_micros: i64,
     statements: u32,
+    /// `check_and_register_statement` を通った文が 1 つでもあるか（Issue #1939）。`SET TRANSACTION` は
+    /// 最初の問い合わせの前でだけ受理するため、その判定に使う（`SET TRANSACTION` 自身は立てない）。
+    queried: bool,
     seen_operation_ids: HashSet<String>,
     written_tables: HashSet<String>,
     /// このトランザクション内で書き込んだ `(tenant_id, table)` の組の集合
@@ -814,6 +899,7 @@ impl<'e> SessionTransaction<'e> {
                     started_at: Instant::now(),
                     txn_start_micros,
                     statements: 0,
+                    queried: false,
                     seen_operation_ids: HashSet::new(),
                     written_tables: HashSet::new(),
                     written_by_tenant: std::collections::BTreeSet::new(),
@@ -946,6 +1032,20 @@ impl<'e> SessionTransaction<'e> {
         &mut self,
         operation_id: Option<&str>,
     ) -> Result<(), SqlSurfaceError> {
+        self.check_statement_limits(operation_id)?;
+        if let TxnState::Active(active) = &mut self.state {
+            active.queried = true;
+        }
+        Ok(())
+    }
+
+    /// [`Self::check_and_register_statement`] の上限検査と文数の計上（`queried` は立てない）。
+    /// `SET TRANSACTION` が「最初の問い合わせ」を消費せずに、文数・持続時間の上限（DoS 対策）だけ
+    /// 受けるために分けてある（Issue #1939）。
+    fn check_statement_limits(
+        &mut self,
+        operation_id: Option<&str>,
+    ) -> Result<(), SqlSurfaceError> {
         let active = match &mut self.state {
             TxnState::Active(active) => active,
             _ => return Ok(()),
@@ -963,6 +1063,73 @@ impl<'e> SessionTransaction<'e> {
             }
         }
         active.statements = active.statements.saturating_add(1);
+        Ok(())
+    }
+
+    /// `SET TRANSACTION <モード>`（Issue #1939。SQL-38 (7)(a) のポインタ先が契約）。`core.rs` の
+    /// 実行分岐が呼ぶ。明示トランザクションの最初の問い合わせの前だけ受理する。
+    ///
+    /// - `Idle`・暗黙トランザクションは `25P01`（PG の警告ではなく拒否。NoticeResponse の送出経路が
+    ///   無いための fail-closed。暗黙は abort して `Idle` へ戻る）。状態・既定は変えない。
+    /// - 最初の問い合わせより後は `25001`（`Failed` へ遷移）。
+    /// - `Failed` は元のエラー（`25P02` 等）。
+    /// - `READ ONLY` から `READ WRITE` への変更は、まだ何も読んでいない（`queried` が偽・読み取り集合が
+    ///   空・writer 未取得）ことを条件に、`40001` 判定用の登録済みスナップショットで開き直す。
+    ///   開き直さずにモードだけ変えると直列化の検査を素通りするため必須。失敗は `XX000`（`Failed`）。
+    pub fn set_transaction_modes(
+        &mut self,
+        access_mode: Option<TxnAccessMode>,
+        isolation_level: Option<RequestedIsolationLevel>,
+    ) -> Result<(), SqlSurfaceError> {
+        if self.abort_if_implicit() {
+            return Err(SqlSurfaceError::NoActiveSqlTransaction);
+        }
+        match &self.state {
+            TxnState::Idle => return Err(SqlSurfaceError::NoActiveSqlTransaction),
+            TxnState::Failed { .. } => return Err(self.take_failed_error()),
+            TxnState::Active(active) if active.queried => {
+                self.fail();
+                return Err(SqlSurfaceError::SetTransactionAfterQuery);
+            }
+            TxnState::Active(_) => {}
+        }
+        self.check_statement_limits(None)?;
+        let mut reopen_failed = false;
+        if let TxnState::Active(active) = &mut self.state {
+            if let Some(mode) = access_mode {
+                if mode != active.access_mode {
+                    if mode == TxnAccessMode::ReadWrite {
+                        let untouched = active.writer.is_none()
+                            && active.temp.is_none()
+                            && active.read_set.is_empty()
+                            && !active.has_writes;
+                        match (untouched, active.storage.open_registered_snapshot()) {
+                            (true, Ok((snap, reg))) => {
+                                active.snapshot_generation =
+                                    reg.as_ref().map_or(0, |r| r.snapshot_generation());
+                                active.read_snapshot = snap;
+                                active.registration = reg;
+                            }
+                            _ => reopen_failed = true,
+                        }
+                    } else {
+                        active.registration = None;
+                    }
+                    if !reopen_failed {
+                        active.access_mode = mode;
+                    }
+                }
+            }
+            if !reopen_failed {
+                if let Some(level) = isolation_level {
+                    active.isolation_level = Some(level);
+                }
+            }
+        }
+        if reopen_failed {
+            self.fail();
+            return Err(internal_error());
+        }
         Ok(())
     }
 
@@ -1729,6 +1896,55 @@ mod tests {
                 "{sql}"
             );
             assert_eq!(v.access_mode, Some(TxnAccessMode::ReadOnly), "{sql}");
+        }
+    }
+
+    fn set_txn(sql: &str) -> Result<ValidatedSetTransaction, SqlSurfaceError> {
+        validate_set_transaction_tokens(&tokens_of(sql))
+    }
+
+    /// `SET TRANSACTION`／`SET SESSION CHARACTERISTICS AS TRANSACTION` の受理形（Issue #1939）。
+    #[test]
+    fn set_transaction_forms_are_accepted() {
+        let v = set_txn("SET TRANSACTION ISOLATION LEVEL SERIALIZABLE, READ ONLY").expect("ok");
+        assert_eq!(v.scope, SetTxnScope::Transaction);
+        assert_eq!(v.access_mode, Some(TxnAccessMode::ReadOnly));
+        assert_eq!(
+            v.isolation_level,
+            Some(RequestedIsolationLevel::Serializable)
+        );
+        let v = set_txn("set session characteristics as transaction read write").expect("ok");
+        assert_eq!(v.scope, SetTxnScope::SessionDefault);
+        assert_eq!(v.access_mode, Some(TxnAccessMode::ReadWrite));
+        assert_eq!(v.isolation_level, None);
+        assert!(is_set_transaction_head(&tokens_of(
+            "SET TRANSACTION READ ONLY"
+        )));
+        assert!(is_set_transaction_head(&tokens_of(
+            "SET SESSION CHARACTERISTICS AS TRANSACTION READ ONLY"
+        )));
+        assert!(!is_set_transaction_head(&tokens_of("SET TIME ZONE 'UTC'")));
+        assert!(!is_set_transaction_head(&tokens_of(
+            "SET SESSION AUTHORIZATION x"
+        )));
+    }
+
+    /// 空のモード列・重複・DEFERRABLE・SNAPSHOT・`LOCAL` 付き・`AS` 欠落・末尾の語は `42601`。
+    #[test]
+    fn set_transaction_malformed_forms_are_rejected() {
+        for sql in [
+            "SET TRANSACTION",
+            "SET TRANSACTION READ ONLY READ WRITE",
+            "SET TRANSACTION DEFERRABLE",
+            "SET TRANSACTION SNAPSHOT 'x'",
+            "SET TRANSACTION READ ONLY foo",
+            "SET LOCAL TRANSACTION READ ONLY",
+            "SET SESSION CHARACTERISTICS AS TRANSACTION",
+            "SET SESSION CHARACTERISTICS TRANSACTION READ ONLY",
+            "SET SESSION CHARACTERISTICS AS READ ONLY",
+        ] {
+            let e = set_txn(sql).expect_err(sql);
+            assert_eq!(e.wire_code(), "42601", "{sql}");
         }
     }
 

@@ -62,3 +62,4 @@ mod sql38_lock_table;
 mod sql38_read_only_concurrency;
 mod sql38_read_only_write_rejection;
 mod sql38_row_lock_clause;
+mod sql38_set_transaction;
