@@ -377,7 +377,11 @@ pub(crate) fn relation_positions(tokens: &[Token]) -> RelationWalk {
                             || is("INTO")
                             || is("TRUNCATE")
                             // `LOCK <表>`（`TABLE` 省略形。Issue #1958）。文頭の `LOCK` の直後だけ。
-                            || (is("LOCK") && i == 1)
+                            // 直後が省略可能な `TABLE` 構文語（次が名前）のときは関係ではない。
+                            || (is("LOCK")
+                                && i == 1
+                                && !(ident_is(Some(cur), "TABLE")
+                                    && tokens.get(i.saturating_add(1)).is_some_and(is_ident_like)))
                             || is("UPDATE")
                             || is("ONLY")
                             || is("REFERENCES")

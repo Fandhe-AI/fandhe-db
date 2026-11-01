@@ -78,6 +78,23 @@ fn skip(rest: &[Token]) -> &[Token] {
     rest.get(1..).unwrap_or(&[])
 }
 
+/// 名前解決・`search_path` ゲートより前にトランザクション外（`25P01`）を判定するための構造検証。
+///
+/// 解決前のトークン列は `schema.table` を `QualifiedIdent` で持つため、単一の名前へ畳んだ複製で
+/// [`validate_lock_tokens`] と同じ検証を行う（結果は捨てる。カタログは引かない）。
+pub(crate) fn validate_lock_structure_unresolved(tokens: &[Token]) -> Result<(), SqlSurfaceError> {
+    let folded: Vec<Token> = tokens
+        .iter()
+        .map(|t| match t {
+            Token::QualifiedIdent { qualifier, name } => {
+                Token::Ident(format!("{qualifier}.{name}"))
+            }
+            other => other.clone(),
+        })
+        .collect();
+    validate_lock_tokens(&folded).map(|_| ())
+}
+
 /// `LOCK [TABLE] [ONLY] <name> [*] [, ...] [IN <mode> MODE] [NOWAIT]` を構造検証する。
 ///
 /// 許可形以外（未知のモード語・`MODE` 欠落・末尾の余分なトークン等）は `42601`（fail-closed）。

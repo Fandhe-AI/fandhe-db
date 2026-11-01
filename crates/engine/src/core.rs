@@ -7434,6 +7434,12 @@ impl EngineCore {
         sql: &str,
     ) -> Result<crate::sql::SqlOutcome, crate::sql::allowlist::SqlSurfaceError> {
         let tokens = crate::sql::lexer::tokenize_marked(sql)?;
+        // SQL-38 (4)・Issue #1958: `LOCK` はトランザクション外なら、構造検証の後・SCHEMA 解決と
+        // `search_path` ゲートより前に `25P01` にする（名前由来の `3F000`／`42P01` に化けさせない）。
+        if crate::sql::lock_table::is_lock_statement(&tokens) {
+            crate::sql::lock_table::validate_lock_structure_unresolved(&tokens)?;
+            return Err(crate::sql::allowlist::SqlSurfaceError::NoActiveSqlTransaction);
+        }
         // 定数式の畳み込み（INSERT VALUES・DEFAULT）は parse 中に行われるため、セッション
         // TimeZone を parse 区間へも張る（ゾーン無し `TIMESTAMPTZ` リテラル・`AT LOCAL`。Issue #1576）。
         let parsed = {
@@ -7528,6 +7534,14 @@ impl EngineCore {
             // `parse_sql` と同じ字句解析 → 構文検証に、一時カタログの細かいゲートを足したもの。
             let parsed = (|| {
                 let tokens = crate::sql::lexer::tokenize_marked(sql)?;
+                // SQL-38 (4)・Issue #1958: `Idle`（トランザクション外）の `LOCK` は構造検証の後、
+                // 名前解決・`search_path` ゲートより前に `25P01`（`Failed` は上で `25P02` 済み）。
+                if txn.status() == crate::sql::transaction::TransactionStatus::Idle
+                    && crate::sql::lock_table::is_lock_statement(&tokens)
+                {
+                    crate::sql::lock_table::validate_lock_structure_unresolved(&tokens)?;
+                    return Err(crate::sql::allowlist::SqlSurfaceError::NoActiveSqlTransaction);
+                }
                 let resolver = self.schema_resolver(ctx);
                 self.parse_tokens_gated(tokens, session, Some(&resolver))
             })();

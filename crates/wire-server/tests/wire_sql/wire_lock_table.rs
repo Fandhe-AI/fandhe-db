@@ -69,6 +69,15 @@ fn simple_query_lock_table_outside_transaction_is_25p01() {
 }
 
 #[test]
+fn simple_query_lock_table_outside_transaction_precedes_name_resolution() {
+    // SQL-38 (4): 存在しない SCHEMA 修飾でも名前の解決より先に 25P01（3F000 にしない）。
+    let (mut s, _g) = connect();
+    send_simple_query(&mut s, "LOCK TABLE nosuch_schema.t");
+    expect_error_response_with_sqlstate(&mut s, "25P01");
+    assert_eq!(read_ready_for_query_status(&mut s), b'I');
+}
+
+#[test]
 fn simple_query_lock_table_missing_table_fails_the_transaction() {
     let (mut s, _g) = connect();
     send_simple_query(&mut s, "BEGIN");
