@@ -35,7 +35,7 @@ impl EngineCore {
                 );
             }
         }
-        txn.ensure_writer(stmt.nowait)?;
+        txn.ensure_writer_with(stmt.nowait)?;
         Ok(crate::sql::SqlOutcome::Lock)
     }
 }
