@@ -227,7 +227,8 @@ pub(crate) fn relation_positions(tokens: &[Token]) -> RelationWalk {
                 } else if delete_using_opener(tokens, i) {
                     // `DELETE FROM t USING a, b`（SQL-53 (b)、Issue #1754）。以降のカンマは表参照リストの区切り。
                     next.list = true;
-                } else if (w.eq_ignore_ascii_case("TRUNCATE") && i == 0)
+                } else if ((w.eq_ignore_ascii_case("TRUNCATE") || w.eq_ignore_ascii_case("LOCK"))
+                    && i == 0)
                     || (w.eq_ignore_ascii_case("TABLE") && ddl_head && i < 4)
                     || (head_drop
                         && i < 4
@@ -375,6 +376,8 @@ pub(crate) fn relation_positions(tokens: &[Token]) -> RelationWalk {
                         is("JOIN")
                             || is("INTO")
                             || is("TRUNCATE")
+                            // `LOCK <表>`（`TABLE` 省略形。Issue #1958）。文頭の `LOCK` の直後だけ。
+                            || (is("LOCK") && i == 1)
                             || is("UPDATE")
                             || is("ONLY")
                             || is("REFERENCES")
@@ -1154,6 +1157,16 @@ mod tests {
         same("TRUNCATE public.a, public.b", "TRUNCATE a, b");
         // カンマに続く `ONLY` の対象表（式の文脈と取り違えない）。
         same("TRUNCATE public.a, ONLY public.b", "TRUNCATE a, ONLY b");
+        // `LOCK`（`TABLE` 省略形・複数表。Issue #1958）。
+        same("LOCK public.t", "LOCK t");
+        same(
+            "LOCK TABLE public.t IN SHARE MODE",
+            "LOCK TABLE t IN SHARE MODE",
+        );
+        same(
+            "LOCK TABLE ONLY public.a, public.b NOWAIT",
+            "LOCK TABLE ONLY a, b NOWAIT",
+        );
         same("DROP TABLE IF EXISTS public.t", "DROP TABLE IF EXISTS t");
         same(
             "CREATE TABLE public.t (id TEXT)",

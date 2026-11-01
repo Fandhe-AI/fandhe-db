@@ -105,6 +105,8 @@ mod standard_body_binding;
 mod plpgsql_host;
 // `DO` ブロックの実行（SQL-68・Issue #2228）。
 mod do_block;
+// `LOCK TABLE` の実行（SQL-38・Issue #1958）。
+mod lock_exec;
 // `LANGUAGE sql|plpgsql` 関数の呼び出し位置の実行（SQL-67 (5)・Issue #2218）。
 mod routine_call;
 // `CREATE FUNCTION ... LANGUAGE plpgsql` の定義時検証（Issue #2217・SQL-67 (3)）。
@@ -1915,6 +1917,10 @@ pub enum ParsedSql {
     /// `ParsedSql::Statement` には載せない（DataModifyingCte・CreateTrigger と同じ理由。wire 側が
     /// 非書き込みと誤判定しないため）。**BREAKING CHANGE**（Issue #2228）: `ParsedSql` への variant 追加。
     Do(crate::sql::allowlist::ValidatedDo),
+    /// `LOCK [TABLE] ...`（SQL-38・Issue #1958）。トランザクション内でだけ writer を取得して保持する。
+    ///
+    /// **BREAKING CHANGE**（Issue #1958）: `ParsedSql` への variant 追加。
+    Lock(crate::sql::lock_table::ValidatedLockTable),
     /// `CREATE SCHEMA [IF NOT EXISTS] <name>`（TABLE-27、Issue #1713）。
     ///
     /// **BREAKING CHANGE**（Issue #1713）: `ParsedSql` への variant 追加。
@@ -2041,6 +2047,7 @@ fn statement_clock_scope(
         | ParsedSql::CreateTrigger(_)
         | ParsedSql::DropTrigger(_)
         | ParsedSql::Do(_)
+        | ParsedSql::Lock(_)
         | ParsedSql::CreateSchema(_)
         | ParsedSql::DropSchema(_)
         | ParsedSql::AlterSchema(_)
@@ -2110,6 +2117,7 @@ fn insert_sequence_scope(
         | ParsedSql::CreateTrigger(_)
         | ParsedSql::DropTrigger(_)
         | ParsedSql::Do(_)
+        | ParsedSql::Lock(_)
         | ParsedSql::CreateSchema(_)
         | ParsedSql::DropSchema(_)
         | ParsedSql::AlterSchema(_)
@@ -2177,6 +2185,7 @@ fn insert_default_clock_scope(
         | ParsedSql::CreateTrigger(_)
         | ParsedSql::DropTrigger(_)
         | ParsedSql::Do(_)
+        | ParsedSql::Lock(_)
         | ParsedSql::CreateSchema(_)
         | ParsedSql::DropSchema(_)
         | ParsedSql::AlterSchema(_)
@@ -4227,6 +4236,7 @@ impl EngineCore {
                     | crate::sql::SqlOutcome::CreateTrigger(_)
                     | crate::sql::SqlOutcome::DropTrigger(_)
                     | crate::sql::SqlOutcome::Do
+                    | crate::sql::SqlOutcome::Lock
                     | crate::sql::SqlOutcome::CreateSchema(_)
                     | crate::sql::SqlOutcome::DropSchema(_)
                     | crate::sql::SqlOutcome::AlterSchema(_)
@@ -4286,6 +4296,7 @@ impl EngineCore {
                     | crate::sql::SqlOutcome::CreateTrigger(_)
                     | crate::sql::SqlOutcome::DropTrigger(_)
                     | crate::sql::SqlOutcome::Do
+                    | crate::sql::SqlOutcome::Lock
                     | crate::sql::SqlOutcome::CreateSchema(_)
                     | crate::sql::SqlOutcome::DropSchema(_)
                     | crate::sql::SqlOutcome::AlterSchema(_)
@@ -4342,6 +4353,7 @@ impl EngineCore {
                     | crate::sql::SqlOutcome::CreateTrigger(_)
                     | crate::sql::SqlOutcome::DropTrigger(_)
                     | crate::sql::SqlOutcome::Do
+                    | crate::sql::SqlOutcome::Lock
                     | crate::sql::SqlOutcome::CreateSchema(_)
                     | crate::sql::SqlOutcome::DropSchema(_)
                     | crate::sql::SqlOutcome::AlterSchema(_)
@@ -4405,6 +4417,7 @@ impl EngineCore {
                     | crate::sql::SqlOutcome::CreateTrigger(_)
                     | crate::sql::SqlOutcome::DropTrigger(_)
                     | crate::sql::SqlOutcome::Do
+                    | crate::sql::SqlOutcome::Lock
                     | crate::sql::SqlOutcome::CreateSchema(_)
                     | crate::sql::SqlOutcome::DropSchema(_)
                     | crate::sql::SqlOutcome::AlterSchema(_)
@@ -4487,6 +4500,7 @@ impl EngineCore {
                     | crate::sql::SqlOutcome::CreateTrigger(_)
                     | crate::sql::SqlOutcome::DropTrigger(_)
                     | crate::sql::SqlOutcome::Do
+                    | crate::sql::SqlOutcome::Lock
                     | crate::sql::SqlOutcome::CreateSchema(_)
                     | crate::sql::SqlOutcome::DropSchema(_)
                     | crate::sql::SqlOutcome::AlterSchema(_)
@@ -5544,6 +5558,17 @@ impl EngineCore {
         if crate::sql::allowlist::is_do_statement(&tokens) {
             let stmt = crate::sql::allowlist::validate_do_tokens(&tokens)?;
             return Ok(ParsedSql::Do(stmt));
+        }
+
+        // SQL-38・Issue #1958: `LOCK [TABLE]` は構造検証だけで束縛する（カタログ照会は実行時。
+        // トランザクション外の判定〔`25P01`〕を名前の解決より先にする。`DECLARE` と同じ設計）。
+        // 一時表との衝突は参照の記録だけ行い（結果は使わない）、振り分け側が `0A000` で拒否する。
+        if crate::sql::lock_table::is_lock_statement(&tokens) {
+            let stmt = crate::sql::lock_table::validate_lock_tokens(&tokens)?;
+            for name in &stmt.table_names {
+                let _ = crate::sql::allowlist::TableLookup::table_exists(&storage_lookup, name)?;
+            }
+            return Ok(ParsedSql::Lock(stmt));
         }
 
         let is_declare_statement = matches!(
@@ -7362,6 +7387,10 @@ impl EngineCore {
                     "COPY via the extended query protocol is not supported yet",
                 ),
             ),
+            // SQL-38 (4)・Issue #1958: `LOCK` もトランザクション外は `25P01`（`DECLARE` と同じ分類）。
+            ParsedSql::Lock(_) => {
+                Err(crate::sql::allowlist::SqlSurfaceError::NoActiveSqlTransaction)
+            }
             // WIRE-15・TASK-218: カーソルは明示トランザクション内でのみ有効
             // （`sql::cursor` モジュールドキュメント参照）。トランザクション
             // 文脈を持たない本エントリポイントでは、`DECLARE` は「トランザク
@@ -7930,6 +7959,7 @@ impl EngineCore {
             // SQL-63・Issue #1876: 全副文・台帳記録・主クエリを共有 write txn で実行する。書いた全表へ
             // `mark_written` する（漏れると遅延 FK の COMMIT 時検査が取りこぼす。P0）。
             ParsedSql::Do(stmt) => self.execute_do_in_txn(ctx, session, txn, stmt),
+            ParsedSql::Lock(stmt) => self.execute_lock_in_active_txn(txn, stmt),
             ParsedSql::DataModifyingCte(stmt) => {
                 let write_txn = txn.write_txn().ok_or_else(|| SqlSurfaceError::Internal {
                     detail: "internal error".to_string(),
@@ -8858,7 +8888,7 @@ impl EngineCore {
             ParsedSql::CreateTrigger(_) => Ok(None),
             ParsedSql::DropTrigger(_) => Ok(None),
             // SQL-68・Issue #2228: `DO` は行を返さない（Describe は NoData）。
-            ParsedSql::Do(_) => Ok(None),
+            ParsedSql::Do(_) | ParsedSql::Lock(_) => Ok(None),
             ParsedSql::CreateSchema(_) => Ok(None),
             ParsedSql::DropSchema(_) => Ok(None),
             ParsedSql::AlterSchema(_) => Ok(None),

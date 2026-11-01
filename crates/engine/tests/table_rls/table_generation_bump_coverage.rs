@@ -80,8 +80,9 @@ const ALLOWLIST: &[(&str, u32)] = &[
     // ための追随（旧: 930／961）。
     // Issue #1690（`Storage::sequence_allocator` の追加）で行番号が移動したための追随（旧: 950／981）。
     // PR #2566 レビュー対応（一時 DB 判定 `Storage::is_temp_scoped` の追加。+12 行）で追随（旧: 963／994）。
-    ("storage.rs", 1009),
-    ("storage.rs", 1043),
+    // Issue #1958（`begin_explicit_write_txn_nowait` の追加。+20 行）で行番号が移動したための追随（旧: 1009／1043）。
+    ("storage.rs", 1029),
+    ("storage.rs", 1063),
     ("recovery/panic_hook.rs", 404),
     ("txn.rs", 210),
     ("txn.rs", 387),
