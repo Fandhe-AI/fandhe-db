@@ -249,7 +249,7 @@ define_error_classes! {
     /// 明示トランザクションの writer 取得時に、読み取りの前提が古くなっていたことを示す。
     /// `ROLLBACK` の後に最初から再試行してよい。文言は固定で、表名・テナント・件数を含めない。
     /// [`crate::sql::allowlist::SqlSurfaceError::SerializationFailure`] の写像
-    /// （送出経路の結線は TASK-333 の #2405）。
+    /// （送出は `SessionTransaction::ensure_writer_with`・TASK-333 の #2405）。
     SerializationFailure => ("40001", "SERIALIZATION_FAILURE"),
     /// 読み取り専用トランザクション内での書き込み系の文（`25006`。ERR-6・SQL-38・Issue #1934）。
     /// `BEGIN READ ONLY` の Tx が DML・DDL・`COPY FROM`・ロック・`USING OPERATION_ID` 付きの文を
