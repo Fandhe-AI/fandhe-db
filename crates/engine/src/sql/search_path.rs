@@ -421,14 +421,14 @@ pub(crate) fn check_unqualified_refs(
     if !session.search_path_hides_public() {
         return Ok(());
     }
-    if is_ddl_head(tokens) && !session.ddl_allowed() {
+    if is_ddl_head(tokens) && crate::sql::ddl::require_ddl_permission(session).is_err() {
         return Ok(());
     }
     // `GRANT`／`REVOKE`（SQL-40・Issue #1965）は現在ロールが束縛されていないセッションが `42501` を受け取る
     // 契約（`sql::grant_ddl::require_grant_principal`。カタログ照会・名前解決より前）を保つため、
     // その場合は参照ゲートを飛ばす。束縛済みのセッションでは未修飾の表名は他の文と同じく `42P01` になる
     // （カタログを引かない判定のため存在オラクルにならない）。
-    if is_grant_head(tokens) && session.current_role_id().is_none() {
+    if is_grant_head(tokens) && crate::sql::privilege_gate::bound_principal(session).is_err() {
         return Ok(());
     }
     // `SET`／`RESET`／`SHOW` は関係を参照しない。設定値（例 `truncate`）を文種と誤解釈して

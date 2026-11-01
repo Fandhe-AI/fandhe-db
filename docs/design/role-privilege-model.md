@@ -423,3 +423,24 @@ Issue #2232 は SQL-39 (7) のうち、メンバーシップの付与・取り�
 - 共通ゲートでの継承の利用（#1966〜#1969）、ポリシーの `TO` ロール（#2278 段 2。`has_privs_of` を呼ぶ）、認証主体の束縛（#1971）、所有者・`GRANTED BY`（#2236）。
 - INHERIT・ADMIN の喪失による ADMIN の到達性の再評価（依存の解決は ADMIN の根拠である直接の行に限る）。
 - PostgreSQL 16 以降の付与者ごとの複数行、CREATEROLE の作成者への暗黙の ADMIN。
+
+## 11. Issue #1966 実装記録（権限検査の共通ゲート）
+
+SQL-40 ポインタ。判定点を `sql/privilege_gate.rs` の `check`（主体・対象・必要権限）へ 1 本化し、DDL 経路を結線した。
+
+### 実装範囲
+
+- `Principal`・`DdlStatementKind`・`RequiredPrivilege`・`PrivilegeTarget` と、文種から必要権限を引く表（`required_privilege`。ワイルドカード腕なしの網羅 `match`）。
+- `core.rs` の DDL 腕・`udf_ddl.rs` は文種付きの `require_ddl` を呼ぶ。`ddl::require_ddl_permission`・`grant_ddl::require_grant_principal` は名前とシグネチャを保ったファサード。`search_path.rs`・`grant_ddl.rs` の `ddl_allowed()` 直読みを除去。
+- 公開 API・依存・挙動の変更なし。
+
+### 判断の記録
+
+- **DDL は `ddl_allowed` のビットだけで判定する**: 認証層の紐付け（#1971）が未実装で全セッションが未束縛のため、ロール・ACL を混ぜると全 DDL が拒否される。ロールの束縛は DDL 権限を広げない（回帰テストあり）。
+- **ファサードを残す**: 並行する PR が `require_ddl_permission` を呼ぶため、名前とシグネチャを維持した。
+- **`Some(0)` の扱い**: `search_path` の GRANT 分岐を `bound_principal` に揃え、PUBLIC の予約 ID `0` は未束縛と同じく拒否側に統一した。
+- **`DropFunction` の判定位置の非対称は残す**: 判定順序を変えないため（自動コミットは実行本体側、Tx 内は腕側）。
+
+### 対象外
+
+ロールベースの DDL 判定（#1971・#2234・#2236）、SELECT・DML・COPY・HTTP への結線（#1967〜#1969）、Rust API の生 DDL をゲートに通すこと、`DropFunction` の非対称の解消。

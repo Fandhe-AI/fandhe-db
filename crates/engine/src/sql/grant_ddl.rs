@@ -61,10 +61,7 @@ impl GrantRevokeOutcome {
 /// カタログ照会・名前解決・`0A000` 判定のいずれよりも前に `42501`（fail-closed）へ落とす。主体の無い付与は
 /// 記録できず、対象の有無を権限の無い主体に示さない（存在オラクルの防止）。
 pub(crate) fn require_grant_principal(session: &SessionState) -> Result<u64, SqlSurfaceError> {
-    match session.current_role_id() {
-        Some(id) if id != 0 => Ok(id),
-        _ => Err(SqlSurfaceError::InsufficientPrivilege),
-    }
+    crate::sql::privilege_gate::bound_principal(session)
 }
 
 /// `GRANT`／`REVOKE` を実行する（現在ロールの束縛・明示 Tx のゲートは呼び出し元で通過済み）。
@@ -141,7 +138,7 @@ pub(crate) fn execute_grant_revoke(
     let req = AclRequest {
         is_grant: stmt.is_grant,
         grantor_id,
-        owner_equivalent: session.ddl_allowed(),
+        owner_equivalent: crate::sql::privilege_gate::is_owner_equivalent(session),
         tables: &objects.tables,
         items: &items,
         grantees: &grantees,

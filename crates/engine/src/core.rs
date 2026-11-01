@@ -7521,7 +7521,10 @@ impl EngineCore {
                         );
                     }
                 }
-                crate::sql::ddl::require_ddl_permission(session)?;
+                crate::sql::privilege_gate::require_ddl(
+                    session,
+                    crate::sql::privilege_gate::DdlStatementKind::DropTable,
+                )?;
                 let outcome = crate::sql::ddl::execute_drop_table(&self.storage, stmt)?;
                 Ok(crate::sql::SqlOutcome::DropTable(outcome))
             }
@@ -7531,7 +7534,10 @@ impl EngineCore {
             // 通す。`ctx`（テナント境界）は `Storage::create_table` が取らない
             // ため未使用のまま——`CREATE TABLE` はテナントスコープの操作ではない。
             ParsedSql::CreateTable(stmt) => {
-                crate::sql::ddl::require_ddl_permission(session)?;
+                crate::sql::privilege_gate::require_ddl(
+                    session,
+                    crate::sql::privilege_gate::DdlStatementKind::CreateTable,
+                )?;
                 self.require_creation_target(
                     ctx,
                     session,
@@ -7576,7 +7582,10 @@ impl EngineCore {
             // SQL-52・Issue #1678: CTAS。DDL 権限ゲートを名前解決・カタログ照会（内側の問い合わせの
             // 実カタログ検証を含む）より先に置く（権限の無い主体へ元表・作成先の有無を返さない）。
             ParsedSql::CreateTableAs(stmt) => {
-                crate::sql::ddl::require_ddl_permission(session)?;
+                crate::sql::privilege_gate::require_ddl(
+                    session,
+                    crate::sql::privilege_gate::DdlStatementKind::CreateTableAs,
+                )?;
                 self.require_creation_target(
                     ctx,
                     session,
@@ -7606,7 +7615,10 @@ impl EngineCore {
             // セッションへテーブル・列の存在有無を返さない）。`ctx`（テナント
             // 境界）は `Storage::alter_table_add_column` が取らないため未使用。
             ParsedSql::AlterTable(stmt) => {
-                crate::sql::ddl::require_ddl_permission(session)?;
+                crate::sql::privilege_gate::require_ddl(
+                    session,
+                    crate::sql::privilege_gate::DdlStatementKind::AlterTable,
+                )?;
                 crate::sql::schema_dependency::check_alter_table(stmt)?;
                 // RLS-13（Issue #2275）: 一時表が同名の永続表を隠しているとき、永続表の有効化状態を
                 // 黙って変えない（一時表の行セキュリティは未対応。fail-closed の `0A000`）。
@@ -7630,7 +7642,10 @@ impl EngineCore {
             // TABLE-18・SQL-23・TASK-205（Issue #909）: `DropTable` と同じ判定
             // 順序（DDL 実行権限ゲート → カタログ照会を含む実行本体）。
             ParsedSql::CreateView(stmt) => {
-                crate::sql::ddl::require_ddl_permission(session)?;
+                crate::sql::privilege_gate::require_ddl(
+                    session,
+                    crate::sql::privilege_gate::DdlStatementKind::CreateView,
+                )?;
                 self.require_creation_target(ctx, session, stmt.public_qualified, stmt.name())?;
                 crate::sql::schema_dependency::check_view_body(stmt.name(), stmt.body_sql())?;
                 // TABLE-41 (1)・Issue #1659: 列別名リストと本文の出力列数の突合は、カタログを
@@ -7677,7 +7692,10 @@ impl EngineCore {
             // （権限の無い主体へ relation の有無・列構成を返さない）。以降は write txn 内で
             // 列の確定・本文の評価・定義と実体の原子的な作成を行う。
             ParsedSql::CreateMaterializedView(stmt) => {
-                crate::sql::ddl::require_ddl_permission(session)?;
+                crate::sql::privilege_gate::require_ddl(
+                    session,
+                    crate::sql::privilege_gate::DdlStatementKind::CreateMaterializedView,
+                )?;
                 self.require_creation_target(ctx, session, stmt.public_qualified, stmt.name())?;
                 crate::sql::schema_dependency::check_view_body(stmt.name(), stmt.body_sql())?;
                 let outcome = self.execute_create_materialized_view(ctx, session, stmt)?;
@@ -7685,19 +7703,28 @@ impl EngineCore {
             }
             // TABLE-42・Issue #1665: 権限ゲートを名前解決より先に置く（`CREATE` と同じ）。
             ParsedSql::RefreshMaterializedView(stmt) => {
-                crate::sql::ddl::require_ddl_permission(session)?;
+                crate::sql::privilege_gate::require_ddl(
+                    session,
+                    crate::sql::privilege_gate::DdlStatementKind::RefreshMaterializedView,
+                )?;
                 let outcome = self.execute_refresh_materialized_view(ctx, session, stmt)?;
                 Ok(crate::sql::SqlOutcome::RefreshMaterializedView(outcome))
             }
             ParsedSql::DropView(stmt) => {
-                crate::sql::ddl::require_ddl_permission(session)?;
+                crate::sql::privilege_gate::require_ddl(
+                    session,
+                    crate::sql::privilege_gate::DdlStatementKind::DropView,
+                )?;
                 let outcome = crate::sql::ddl::execute_drop_view(&self.storage, stmt)?;
                 Ok(crate::sql::SqlOutcome::DropView(outcome))
             }
             // TABLE-42 (5)・Issue #1667: `DropView` と同じ判定順序（DDL 権限ゲート → カタログ照会を
             // 含む実行本体）。権限の無い主体には対象の有無を問わず常に `42501` のみを返す。
             ParsedSql::DropMaterializedView(stmt) => {
-                crate::sql::ddl::require_ddl_permission(session)?;
+                crate::sql::privilege_gate::require_ddl(
+                    session,
+                    crate::sql::privilege_gate::DdlStatementKind::DropMaterializedView,
+                )?;
                 let outcome = crate::sql::ddl::execute_drop_materialized_view(&self.storage, stmt)?;
                 Ok(crate::sql::SqlOutcome::DropMaterializedView(outcome))
             }
@@ -7711,11 +7738,19 @@ impl EngineCore {
                 // Issue #2217: 権限の無いセッションにはカタログを引かず、従来どおりの `0A000`（構文段で
                 // 組み込み以外の関数に当たったときの拒否。権限検査より前）を返す。存在情報を出さない。
                 if let Some(pending) = stmt.pending_user_function.as_ref() {
-                    if crate::sql::ddl::require_ddl_permission(session).is_err() {
+                    if crate::sql::privilege_gate::require_ddl(
+                        session,
+                        crate::sql::privilege_gate::DdlStatementKind::CreateIndex,
+                    )
+                    .is_err()
+                    {
                         return Err(crate::sql::index_expr::udf_unsupported(pending.site));
                     }
                 }
-                crate::sql::ddl::require_ddl_permission(session)?;
+                crate::sql::privilege_gate::require_ddl(
+                    session,
+                    crate::sql::privilege_gate::DdlStatementKind::CreateIndex,
+                )?;
                 // Issue #2217: 構文段が保留した組み込み以外の関数は、権限検査の後に自テナントの UDF
                 // カタログの揮発性でエラーへ解決する（必ずエラー。`sql::index_udf`）。
                 if let Some(pending) = stmt.pending_user_function.as_ref() {
@@ -7730,7 +7765,10 @@ impl EngineCore {
                 Ok(crate::sql::SqlOutcome::CreateIndex(outcome))
             }
             ParsedSql::DropIndex(stmt) => {
-                crate::sql::ddl::require_ddl_permission(session)?;
+                crate::sql::privilege_gate::require_ddl(
+                    session,
+                    crate::sql::privilege_gate::DdlStatementKind::DropIndex,
+                )?;
                 let outcome = crate::sql::ddl::execute_drop_index(&self.storage, stmt)?;
                 Ok(crate::sql::SqlOutcome::DropIndex(outcome))
             }
@@ -7738,27 +7776,39 @@ impl EngineCore {
             // （DDL 実行権限ゲート → 実行本体）。ENUM 型は全テナント共有カタログで
             // `ctx` は取らない。権限の無い主体には型の有無を問わず常に `42501`。
             ParsedSql::CreateType(stmt) => {
-                crate::sql::ddl::require_ddl_permission(session)?;
+                crate::sql::privilege_gate::require_ddl(
+                    session,
+                    crate::sql::privilege_gate::DdlStatementKind::CreateType,
+                )?;
                 self.require_creation_target(ctx, session, false, stmt.name())?;
                 let outcome =
                     crate::sql::ddl::execute_create_type(&self.storage, stmt, &self.schema_limits)?;
                 Ok(crate::sql::SqlOutcome::CreateType(outcome))
             }
             ParsedSql::DropType(stmt) => {
-                crate::sql::ddl::require_ddl_permission(session)?;
+                crate::sql::privilege_gate::require_ddl(
+                    session,
+                    crate::sql::privilege_gate::DdlStatementKind::DropType,
+                )?;
                 let outcome = crate::sql::ddl::execute_drop_type(&self.storage, stmt)?;
                 Ok(crate::sql::SqlOutcome::DropType(outcome))
             }
             // TABLE-24・SQL-23（Issue #1688）: 他の DDL と同じ判定順序（DDL 実行権限ゲート →
             // 実行本体）。SEQUENCE の定義は全テナント共有カタログで `ctx` は取らない。
             ParsedSql::CreateSequence(stmt) => {
-                crate::sql::ddl::require_ddl_permission(session)?;
+                crate::sql::privilege_gate::require_ddl(
+                    session,
+                    crate::sql::privilege_gate::DdlStatementKind::CreateSequence,
+                )?;
                 self.require_creation_target(ctx, session, stmt.public_qualified, stmt.name())?;
                 let outcome = crate::sql::ddl::execute_create_sequence(&self.storage, stmt)?;
                 Ok(crate::sql::SqlOutcome::CreateSequence(outcome))
             }
             ParsedSql::DropSequence(stmt) => {
-                crate::sql::ddl::require_ddl_permission(session)?;
+                crate::sql::privilege_gate::require_ddl(
+                    session,
+                    crate::sql::privilege_gate::DdlStatementKind::DropSequence,
+                )?;
                 let outcome = crate::sql::ddl::execute_drop_sequence(&self.storage, stmt)?;
                 Ok(crate::sql::SqlOutcome::DropSequence(outcome))
             }
@@ -7776,7 +7826,10 @@ impl EngineCore {
             // TABLE-45（Issue #1722）: DDL 実行権限ゲート → 実行本体。権限の無い主体には対象表・トリガの
             // 有無を問わず常に `42501`。TRIGGER 定義はテナント単位のため `ctx.tenant_id()` を渡す。
             ParsedSql::CreateTrigger(stmt) => {
-                crate::sql::ddl::require_ddl_permission(session)?;
+                crate::sql::privilege_gate::require_ddl(
+                    session,
+                    crate::sql::privilege_gate::DdlStatementKind::CreateTrigger,
+                )?;
                 let outcome = crate::sql::trigger_ddl::execute_create_trigger(
                     &self.storage,
                     ctx.tenant_id(),
@@ -7785,7 +7838,10 @@ impl EngineCore {
                 Ok(crate::sql::SqlOutcome::CreateTrigger(outcome))
             }
             ParsedSql::DropTrigger(stmt) => {
-                crate::sql::ddl::require_ddl_permission(session)?;
+                crate::sql::privilege_gate::require_ddl(
+                    session,
+                    crate::sql::privilege_gate::DdlStatementKind::DropTrigger,
+                )?;
                 let outcome = crate::sql::trigger_ddl::execute_drop_trigger(
                     &self.storage,
                     ctx.tenant_id(),
@@ -7797,7 +7853,10 @@ impl EngineCore {
             // この権限ゲートで代替する）。権限の無い主体には対象表・ポリシーの有無を問わず常に `42501`。
             // ポリシー定義はテナント単位のため `ctx.tenant_id()` を渡す。
             ParsedSql::CreatePolicy(stmt) => {
-                crate::sql::ddl::require_ddl_permission(session)?;
+                crate::sql::privilege_gate::require_ddl(
+                    session,
+                    crate::sql::privilege_gate::DdlStatementKind::CreatePolicy,
+                )?;
                 let outcome = crate::sql::policy_ddl::execute_create_policy(
                     &self.storage,
                     ctx.tenant_id(),
@@ -7806,7 +7865,10 @@ impl EngineCore {
                 Ok(crate::sql::SqlOutcome::CreatePolicy(outcome))
             }
             ParsedSql::AlterPolicy(stmt) => {
-                crate::sql::ddl::require_ddl_permission(session)?;
+                crate::sql::privilege_gate::require_ddl(
+                    session,
+                    crate::sql::privilege_gate::DdlStatementKind::AlterPolicy,
+                )?;
                 let outcome = crate::sql::policy_ddl::execute_alter_policy(
                     &self.storage,
                     ctx.tenant_id(),
@@ -7815,7 +7877,10 @@ impl EngineCore {
                 Ok(crate::sql::SqlOutcome::AlterPolicy(outcome))
             }
             ParsedSql::DropPolicy(stmt) => {
-                crate::sql::ddl::require_ddl_permission(session)?;
+                crate::sql::privilege_gate::require_ddl(
+                    session,
+                    crate::sql::privilege_gate::DdlStatementKind::DropPolicy,
+                )?;
                 let outcome = crate::sql::policy_ddl::execute_drop_policy(
                     &self.storage,
                     ctx.tenant_id(),
@@ -7840,7 +7905,10 @@ impl EngineCore {
             // セッションへロールが束縛される #1966・#1971 の担当で、それまでは DDL 権限ゲートで代替する。
             // ロールはテナント単位のため `ctx.tenant_id()` を渡す。権限の無い主体には対象の有無を問わず `42501`。
             ParsedSql::CreateRole(stmt) => {
-                crate::sql::ddl::require_ddl_permission(session)?;
+                crate::sql::privilege_gate::require_ddl(
+                    session,
+                    crate::sql::privilege_gate::DdlStatementKind::CreateRole,
+                )?;
                 let outcome = crate::sql::role_ddl::execute_create_role(
                     &self.storage,
                     ctx.tenant_id(),
@@ -7850,7 +7918,10 @@ impl EngineCore {
                 Ok(crate::sql::SqlOutcome::CreateRole(outcome))
             }
             ParsedSql::DropRole(stmt) => {
-                crate::sql::ddl::require_ddl_permission(session)?;
+                crate::sql::privilege_gate::require_ddl(
+                    session,
+                    crate::sql::privilege_gate::DdlStatementKind::DropRole,
+                )?;
                 let outcome =
                     crate::sql::role_ddl::execute_drop_role(&self.storage, ctx.tenant_id(), stmt)?;
                 Ok(crate::sql::SqlOutcome::DropRole(outcome))
@@ -7859,20 +7930,29 @@ impl EngineCore {
             // のため `ctx.tenant_id()` を渡す（SEQUENCE との違い）。権限の無い主体には対象の有無を
             // 問わず常に `42501`。
             ParsedSql::CreateSchema(stmt) => {
-                crate::sql::ddl::require_ddl_permission(session)?;
+                crate::sql::privilege_gate::require_ddl(
+                    session,
+                    crate::sql::privilege_gate::DdlStatementKind::CreateSchema,
+                )?;
                 let outcome =
                     crate::sql::ddl::execute_create_schema(&self.storage, ctx.tenant_id(), stmt)?;
                 Ok(crate::sql::SqlOutcome::CreateSchema(outcome))
             }
             ParsedSql::DropSchema(stmt) => {
-                crate::sql::ddl::require_ddl_permission(session)?;
+                crate::sql::privilege_gate::require_ddl(
+                    session,
+                    crate::sql::privilege_gate::DdlStatementKind::DropSchema,
+                )?;
                 let outcome =
                     crate::sql::ddl::execute_drop_schema(&self.storage, ctx.tenant_id(), stmt)?;
                 Ok(crate::sql::SqlOutcome::DropSchema(outcome))
             }
             // TABLE-27（Issue #1716）: DDL 実行権限ゲート → 実行本体（`ALTER SCHEMA ... RENAME TO`）。
             ParsedSql::AlterSchema(stmt) => {
-                crate::sql::ddl::require_ddl_permission(session)?;
+                crate::sql::privilege_gate::require_ddl(
+                    session,
+                    crate::sql::privilege_gate::DdlStatementKind::AlterSchema,
+                )?;
                 let outcome =
                     crate::sql::ddl::execute_alter_schema(&self.storage, ctx.tenant_id(), stmt)?;
                 Ok(crate::sql::SqlOutcome::AlterSchema(outcome))
@@ -7880,7 +7960,10 @@ impl EngineCore {
             // TABLE-24・SQL-23（Issue #1689）: DDL 実行権限ゲート → 実行本体。`ctx.tenant_id()` は
             // RESTART なしの範囲検査で呼び出し元テナントの現在値を読むためだけに渡す。
             ParsedSql::AlterSequence(stmt) => {
-                crate::sql::ddl::require_ddl_permission(session)?;
+                crate::sql::privilege_gate::require_ddl(
+                    session,
+                    crate::sql::privilege_gate::DdlStatementKind::AlterSequence,
+                )?;
                 let outcome =
                     crate::sql::ddl::execute_alter_sequence(&self.storage, ctx.tenant_id(), stmt)?;
                 Ok(crate::sql::SqlOutcome::AlterSequence(outcome))
@@ -8517,13 +8600,19 @@ impl EngineCore {
             // write txn で commit され ROLLBACK で取り消せないため、型注釈・RETURNS の有無によらず
             // 明示トランザクションの中では行わない（他の DDL と同じ `0A000`）。
             ParsedSql::Statement(Statement::CreateFunction { .. }) => {
-                crate::sql::ddl::require_ddl_permission(session)?;
+                crate::sql::privilege_gate::require_ddl(
+                    session,
+                    crate::sql::privilege_gate::DdlStatementKind::CreateFunction,
+                )?;
                 Err(SqlSurfaceError::feature_not_supported(
                     "CREATE [OR REPLACE] FUNCTION is not supported inside a transaction block",
                 ))
             }
             ParsedSql::DropFunction(_) => {
-                crate::sql::ddl::require_ddl_permission(session)?;
+                crate::sql::privilege_gate::require_ddl(
+                    session,
+                    crate::sql::privilege_gate::DdlStatementKind::DropFunction,
+                )?;
                 Err(SqlSurfaceError::feature_not_supported(
                     "DROP FUNCTION is not supported inside a transaction block",
                 ))
@@ -8531,7 +8620,7 @@ impl EngineCore {
             // RLS-13（Issue #2274）: ポリシー DDL は独立した write txn で commit され ROLLBACK で取り消せない
             // ため明示トランザクション内では行わない。権限の無いセッションには存在を問わず `42501`（fail-closed）。
             ParsedSql::CreatePolicy(_) | ParsedSql::AlterPolicy(_) | ParsedSql::DropPolicy(_) => {
-                crate::sql::ddl::require_ddl_permission(session)?;
+                crate::sql::privilege_gate::require_server_ddl(session)?;
                 Err(SqlSurfaceError::feature_not_supported(
                     "policy DDL is not supported inside a transaction block",
                 ))
@@ -8548,7 +8637,7 @@ impl EngineCore {
             // SQL-39（Issue #1962）: ロール DDL も独立した write txn で commit され ROLLBACK で取り消せないため
             // 明示トランザクション内では行わない。権限の無いセッションには存在を問わず `42501`（fail-closed）。
             ParsedSql::CreateRole(_) | ParsedSql::DropRole(_) => {
-                crate::sql::ddl::require_ddl_permission(session)?;
+                crate::sql::privilege_gate::require_server_ddl(session)?;
                 Err(SqlSurfaceError::feature_not_supported(
                     "role DDL is not supported inside a transaction block",
                 ))
@@ -10285,7 +10374,10 @@ impl EngineCore {
                 body,
                 body_source,
             } => {
-                crate::sql::ddl::require_ddl_permission(session)?;
+                crate::sql::privilege_gate::require_ddl(
+                    session,
+                    crate::sql::privilege_gate::DdlStatementKind::CreateFunction,
+                )?;
                 let attrs = crate::sql::udf_ddl::function_attributes_from_clauses(&attributes);
                 // Issue #2217（SQL-67 (3)）: `LANGUAGE sql|plpgsql` は本体を原文のまま保存する経路へ。
                 // 呼び出しの実行は #2218（`core::routine_call`）。sql・plpgsql とも保存前に定義時検証。

@@ -27,7 +27,7 @@ Phase 6 の共通ゲートへ移行する前に結線漏れと README の再陳�
 | 軸 | 内容 | 主な実装 |
 | -- | ---- | -------- |
 | 1. テナント境界（RLS 相当） | `--users`（`username:tenant_id:phc`）の照合結果からサーバー側でテナントを導出し `PolicyContext` に載せる。DML・検索の可視性はこの軸で決まる。`PolicyContext` は認証主体（ロール）を持たない | `engine::policy`・`engine::tenant` |
-| 2. DDL 実行権限 | `--ddl-allowed-users` で列挙した username の接続だけが DDL を実行できる。判定点は `sql::ddl::require_ddl_permission` ただ 1 つ（カタログ照会なし・既定拒否 `42501`）。SQL 文から権限ビットを変える経路は無い | 下表「権限ビットの注入点」 |
+| 2. DDL 実行権限 | `--ddl-allowed-users` で列挙した username の接続だけが DDL を実行できる。判定点は `sql::privilege_gate::check` ただ 1 つ（`sql::ddl::require_ddl_permission` はそのファサード。カタログ照会なし・既定拒否 `42501`）。SQL 文から権限ビットを変える経路は無い | 下表「権限ビットの注入点」 |
 
 ロールと権限のカタログ（#1961）と `GRANT`／`REVOKE` の SQL 文（#1965）は実装済みだが、現在ロールを束縛する認証層（#1971）と
 権限検査ゲート（#1966〜#1969）は未実装のため、権限はまだ DML・SELECT・COPY の判定に効かない。wire の全セッションは現在ロールが未束縛で、
@@ -135,10 +135,23 @@ SQL 表層のディスパッチは `EngineCore::execute_parsed_statement`（自�
 `crates/wire-server/tests/http_nosql/nosql13_ddl.rs` 等。3 ケース（存在する・しない・他テナント所有）の網羅試験は
 Issue #1972 の担当（RLS-12 ポインタ）。
 
+## DDL 文種と必要権限の表
+
+実体は `DdlStatementKind::required_privilege`（網羅 `match`）。`ServerDdl` は `--ddl-allowed-users` による運用者権限。
+
+| `DdlStatementKind` | 現在の必要権限 | 移行先（ポインタ） |
+| ------------------ | -------------- | ------------------ |
+| `CreateTable`・`CreateTableAs`・`CreateView`・`CreateMaterializedView`・`CreateIndex`・`CreateType`・`CreateSequence`・`CreateTrigger`・`CreateFunction` | `ServerDdl` | SCHEMA の CREATE（#2234） |
+| `DropTable`・`AlterTable`・`RefreshMaterializedView`・`DropView`・`DropMaterializedView`・`DropIndex`・`DropType`・`DropSequence`・`AlterSequence`・`DropTrigger`・`DropFunction`・`CreatePolicy`・`AlterPolicy`・`DropPolicy` | `ServerDdl` | 所有者（#2236） |
+| `CreateRole`・`DropRole` | `ServerDdl` | CREATEROLE（#1971） |
+| `CreateSchema`・`DropSchema`・`AlterSchema` | `ServerDdl` | 所有者・データベース権限（#2234 以降） |
+
+ゲート対象外または別判定: 一時表、`SET`／`SHOW`、`setval`、GRANT／REVOKE（`privilege_gate::bound_principal` による現在ロール束縛の判定）。
+
 ## 新規文種追加時の権限検査チェックリスト
 
 - [ ] DDL に当たる文は、自動コミットの腕と明示トランザクション内の腕の**両方**で、カタログ照会・実行本体・`0A000`
-  判定より前に `require_ddl_permission` を呼ぶ。呼ぶ場所を `core.rs` の腕か実行本体かで揃え、
+  判定より前にゲートを呼ぶ（`DdlStatementKind` へ文種を足し、`required_privilege` の表と本書の「DDL 文種と必要権限の表」を更新したうえで `privilege_gate::require_ddl` を呼ぶ）。呼ぶ場所を `core.rs` の腕か実行本体かで揃え、
   `DropFunction` のような非対称を新たに作らない
 - [ ] 構文検証（`validate_*_tokens`）はカタログ照会をしない契約を守る
 - [ ] 新しい先頭キーワード（将来の GRANT／REVOKE／COMMENT 等）を持つ DDL は `sql/search_path.rs` の `is_ddl_head`
@@ -155,6 +168,7 @@ Issue #1972 の担当（RLS-12 ポインタ）。
 | 項目 | 担当 Issue |
 | ---- | ---------- |
 | ロール・権限モデルの ADR（共通ゲートへ `require_ddl_permission` を寄せる方針を含む） | #1960（PR #2828 で提案中） |
+| 権限検査の共通ゲート導入と DDL 経路への結線 | #1966（実装済み。`sql/privilege_gate.rs`） |
 | ロールのカタログ・`CREATE ROLE` 等 | #1959 配下（#1961〜#1963・#2232・#2233） |
 | GRANT／REVOKE・DML／検索／COPY 経路への結線 | #1964 配下（#1965〜#1969・#2234〜#2237） |
 | 認証済みユーザーとロールの紐付け・users ファイルのブートストラップ化 | #1971・#2238 |
@@ -168,7 +182,8 @@ Issue #1972 の担当（RLS-12 ポインタ）。
 
 | コマンド | 記録時点の結果 |
 | -------- | -------------- |
-| `git grep -n 'require_ddl_permission(session)' -- crates/engine/src` | `core.rs` 25 件（`CreateIndex` の特例で 1 腕あたり 2 呼び出し）と `sql/udf_ddl.rs` 1 件。ほかに `sql/ddl.rs` のテスト内 |
+| `git grep -n 'privilege_gate::require_ddl(' -- crates/engine/src` | `core.rs` の DDL 腕（`CreateIndex` の特例で 1 腕あたり 2 呼び出し。`CreateFunction` は自動コミットの腕のみ、`DropFunction` の自動コミット側は `sql/udf_ddl.rs`）。束ねた Tx 内の腕は `require_server_ddl` |
+| `git grep -n 'ddl_allowed()' -- crates/engine/src` | `sql/privilege_gate.rs`（`Principal::from_session`）と `sql/mode.rs`（定義）、テストのみ |
 | `git grep -n 'allow_ddl()' -- crates/wire-server/src` | 本番注入点は `handshake.rs` と `http/query/ddl.rs`。`extended_query.rs` は `#[cfg(test)]` |
 | `git grep -n '42501' -- crates/engine/src crates/wire-server/src` | 権限ゲート以外の発生源は上表のとおり |
 
