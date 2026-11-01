@@ -264,6 +264,7 @@ fn is_session_exempt(parsed: &ParsedSql) -> bool {
     matches!(
         parsed,
         ParsedSql::Transaction(_)
+            | ParsedSql::SetTransaction(_)
             | ParsedSql::CreateTable(_)
             | ParsedSql::CreateTempTable(_)
             | ParsedSql::DropTable(_)
