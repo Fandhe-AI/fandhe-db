@@ -1,7 +1,8 @@
-//! 明示トランザクションの writer 遅延取得（Issue #2400）のクレート内テスト。
+//! 明示トランザクションの writer 遅延取得（Issue #2400）と、暗黙トランザクションが従来どおり
+//! 開始時に writer を取る経路（Issue #2401）のクレート内テスト。
 //!
 //! `SessionTransaction::write_txn()`（`pub(crate)`）で writer の有無を直接観測する。対象ビヘイビアは
-//! PERSIST-4・SQL-31・TABLE-3（ポインタ表記のみ。設計記録は `docs/design/explicit-transaction.md`）。
+//! PERSIST-4・SQL-31・TABLE-3・WIRE-16（ポインタ表記のみ。設計記録は `docs/design/explicit-transaction.md`）。
 //! 結合側（他セッションの待機・`55P03`）は `tests/sql_t01_39/sql31_deferred_writer.rs` が担う。
 
 use super::EngineCore;
@@ -203,4 +204,82 @@ fn other_tenant_write_during_read_only_txn_is_not_blocked() {
         .expect("tenant-b write is not blocked");
     core.execute_sql_in_txn(&a, &mut session_a, &mut txn, "COMMIT")
         .expect("commit");
+}
+
+/// 暗黙 Tx の writer は開始時にちょうど 1 回だけ取得し、最初の書き込み文で取り直さない（Issue #2401。
+/// SQL-31・WIRE-16）。明示 Tx は `BEGIN` で 0 回、最初の書き込み文で 1 回となる対照も同じ場所で示す。
+#[test]
+fn implicit_txn_acquires_writer_once_at_begin_and_not_at_first_write() {
+    let (core, _g) = new_core("deferred-writer-implicit-once");
+    let caller = ctx("tenant-a");
+    let mut session = SessionState::default();
+    core.execute_sql_in_session(&caller, &mut session, &insert(1, "seed"))
+        .expect("seed");
+
+    let before = core.storage.write_txn_creations();
+    let mut txn = core.new_session_transaction();
+    core.begin_implicit_transaction(&mut txn, &session)
+        .expect("begin implicit");
+    assert_eq!(core.storage.write_txn_creations(), before + 1);
+    assert!(
+        txn.write_txn().is_some(),
+        "writer is held before any statement"
+    );
+
+    for sql in [
+        "SELECT id FROM documents LIMIT 10".to_string(),
+        insert(2, "imp-insert"),
+        "UPDATE documents SET n = 3 WHERE id = 1 USING OPERATION_ID 'imp-update'".to_string(),
+        "DELETE FROM documents WHERE id = 2 USING OPERATION_ID 'imp-delete'".to_string(),
+    ] {
+        core.execute_sql_in_txn(&caller, &mut session, &mut txn, &sql)
+            .unwrap_or_else(|e| panic!("{sql} must succeed, got {e:?}"));
+        assert_eq!(
+            core.storage.write_txn_creations(),
+            before + 1,
+            "{sql} must not re-acquire the writer"
+        );
+        assert!(txn.write_txn().is_some());
+    }
+    txn.commit_implicit(&mut session).expect("commit implicit");
+    assert!(txn.write_txn().is_none());
+    assert_eq!(txn.status(), TransactionStatus::Idle);
+
+    // 対照: 明示 Tx は BEGIN で 0 回、最初の書き込み文で 1 回。
+    let before = core.storage.write_txn_creations();
+    let mut txn = core.new_session_transaction();
+    core.execute_sql_in_txn(&caller, &mut session, &mut txn, "BEGIN")
+        .expect("begin");
+    assert_eq!(core.storage.write_txn_creations(), before);
+    core.execute_sql_in_txn(&caller, &mut session, &mut txn, &insert(5, "exp-insert"))
+        .expect("first write");
+    assert_eq!(core.storage.write_txn_creations(), before + 1);
+    core.execute_sql_in_txn(&caller, &mut session, &mut txn, "ROLLBACK")
+        .expect("rollback");
+}
+
+/// 暗黙 Tx の開始直後の読み取りスナップショットは、新たに開いた確定済み読み取りと同じ世代を指す
+/// （Issue #2401。snapshot は writer 取得後に開かれる）。
+#[test]
+fn implicit_txn_snapshot_matches_committed_state_at_begin() {
+    use redb::ReadableDatabase;
+    let (core, _g) = new_core("deferred-writer-implicit-gen");
+    let caller = ctx("tenant-a");
+    let mut session = SessionState::default();
+    core.execute_sql_in_session(&caller, &mut session, &insert(1, "seed"))
+        .expect("seed");
+    let mut txn = core.new_session_transaction();
+    core.begin_implicit_transaction(&mut txn, &session)
+        .expect("begin implicit");
+    let read_gen = |r: &redb::ReadTransaction| {
+        r.open_table(crate::storage::GENERATION_TABLE)
+            .expect("open generation table")
+            .get("generation")
+            .expect("get")
+            .map(|v| v.value())
+    };
+    let fresh = core.storage.db().begin_read().expect("begin_read");
+    let snapshot = txn.read_snapshot().expect("snapshot");
+    assert_eq!(read_gen(snapshot), read_gen(&fresh));
+    txn.abort_implicit();
 }
