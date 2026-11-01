@@ -1246,3 +1246,31 @@ API へ返却行と `CommandComplete` タグを届けることを確認する層
   --features fault-injection --test three_client_e2e three_clients_confirm_explicit_transaction --
   --ignored --nocapture` の `[e2e-record]` 行（クライアント版を含む。資格情報・テナント id・SQL 本文は
   出力しない）を PR 本文へ転記する。
+
+## 明示トランザクション内の述語形書き込みと 40001 の再試行の 3 クライアント検証（Issue #2412・SQL-31・SQL-19・ERR-7）
+
+writer の遅延取得・取得時の古さ判定（`40001`）・取得後の述語評価は engine の `sql31_*` と層 A の
+`tests/wire19_deferred_writer_status.rs` が確定オラクル。本節の層 B は同じ挙動が無改造クライアントの
+API 越しに観測できることを、簡易・拡張の両方で固定する。仕様ポインタ: SQL-31・SQL-19・ERR-7（TASK-335）。
+
+- テスト: `three_client_txn_retry_e2e.rs`（単独バイナリ・`#[ignore]`・`make e2e-three-client` に含まれる）。
+  クライアントごと・モードごとに新しいサーバー（`--write-lock-wait-ms 100`）と DB（`acct (k TEXT, bal BIGINT)`。
+  alice と bob の Private 行）を立てる。シナリオ定義・解析器・リテラル展開のガードは常時実行。
+- シナリオ: S1＝述語形書き込みの rollback と commit（同じ `operation_id` を 2 周で使い、rollback が台帳に
+  残らないことも示す）、S2a＝読まずに書く並行更新（`UPDATE 0`）、S2b＝読んでから書く並行更新（`40001`・
+  `25P02`・`ROLLBACK`・再試行は `UPDATE 0`）、S2c＝相手が writer 保持中（`55P03`・解放後の再試行）、
+  S3＝`40001` と同じ `operation_id` での再試行（成功）とエラー本文の非漏えい、S4＝他テナントの commit が
+  `40001` にならない陰性の対照。`55P03` は S2c の意図した 1 か所だけ許容する。
+- モデル: 主セッション（全体で 1 接続）＋主セッションの文の合間に新しい接続で実行して閉じる他セッション群。
+  全体が逐次で決定的になり、スレッド・sleep は使わない。他セッションも同じクライアントで駆動する。
+  psycopg／pg は専用スクリプト（`psycopg_txn_steps.py`・`pg_txn_steps.js`）が 1 プロセス内で両セッションを開く。
+  psql は一時ディレクトリに主スクリプトと群ごとのスクリプトを生成し、主スクリプトの `\!` から群を同期実行する
+  （パスは `[A-Za-z0-9/_.-]` のみ許可）。出力は 3 クライアント共通のマーカー（`@@<idx> <SQLSTATE>`・
+  `@@msg <idx> <本文>`）で解析し、欠落・重複・期待外の SQLSTATE は panic にする。
+- 送り方: 簡易は `$n` を定数の単引用符リテラルへ展開（`[a-z0-9-]` を機械検証）。psql の簡易は `;` を付けると
+  本文に含まれて送られるため `\g` で送る。拡張は psql が `\bind ... \g`、psycopg が `RawCursor`（パラメータ
+  無しは pipeline。`prepare=True` は `ROLLBACK` 後に psycopg が `DEALLOCATE ALL` を送り拒否されるため使えない）、
+  pg が `queryMode: 'extended'`。
+- 記録: `NODE_PATH=<pg の node_modules> cargo test -p fandhe-db-wire-server --test three_client_txn_retry_e2e --
+  --ignored --nocapture --test-threads=1` の `[e2e-record]` 行（クライアント版を含む。資格情報・テナント id・
+  SQL 本文は出力しない）を PR 本文へ転記する。
