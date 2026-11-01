@@ -91,6 +91,12 @@ mod dml_subquery_exec;
 mod cte_join_budget_tests;
 #[cfg(test)]
 mod deferred_writer_tests;
+// 明示トランザクションの読み取り集合（SQL-38・Issue #2404）。
+#[cfg(test)]
+mod read_set_tests;
+// commit 記録（SQL-38・Issue #2404）。
+#[cfg(test)]
+mod commit_log_tests;
 // writer 遅延取得の前後の回帰固定（Issue #2402。ポインタ: SQL-19・SQL-31・TASK-333）。
 #[cfg(test)]
 mod deferred_writer_regression_tests;
@@ -7803,6 +7809,25 @@ impl EngineCore {
         txn: &mut crate::sql::transaction::SessionTransaction<'e>,
         parsed: &ParsedSql,
     ) -> Result<crate::sql::SqlOutcome, crate::sql::allowlist::SqlSurfaceError> {
+        // 明示トランザクションの writer 取得前の文は、読んだ基底表を記録する区間を張る（SQL-38・
+        // Issue #2404。`sql::read_set`）。区間は writer 取得（`ensure_writer`）で確定して止まり、
+        // 文の終わりに成功・失敗を問わず `ActiveTxn` の集合へ取り込む（失敗時は Tx ごと `Failed` になる）。
+        let read_scope = txn.read_set_scope();
+        let result = self.execute_in_active_txn_inner(ctx, session, txn, parsed);
+        if let Some(scope) = read_scope {
+            txn.absorb_read_set(scope.finish());
+        }
+        result
+    }
+
+    /// [`Self::execute_in_active_txn`] の本体（読み取り集合の区間の内側で実行される）。
+    fn execute_in_active_txn_inner<'e>(
+        &'e self,
+        ctx: &PolicyContext,
+        session: &mut crate::sql::mode::SessionState,
+        txn: &mut crate::sql::transaction::SessionTransaction<'e>,
+        parsed: &ParsedSql,
+    ) -> Result<crate::sql::SqlOutcome, crate::sql::allowlist::SqlSurfaceError> {
         use crate::sql::allowlist::{SqlSurfaceError, Statement};
 
         // SQL-37（Issue #1586）: 読み取り文は文の開始時刻とトランザクション開始時刻を確定する
@@ -12608,6 +12633,24 @@ impl EngineCore {
     }
 
     fn begin_copy_active<'e>(
+        &'e self,
+        ctx: &PolicyContext,
+        session: &crate::sql::mode::SessionState,
+        txn: &mut crate::sql::transaction::SessionTransaction<'e>,
+        sql: &str,
+    ) -> Result<CopyPlan, crate::sql::allowlist::SqlSurfaceError> {
+        // `COPY (...) TO STDOUT` も明示トランザクションの文として読んだ基底表を記録する
+        // （SQL-38・Issue #2404。[`Self::execute_in_active_txn`] と同じ区間）。
+        let read_scope = txn.read_set_scope();
+        let result = self.begin_copy_active_inner(ctx, session, txn, sql);
+        if let Some(scope) = read_scope {
+            txn.absorb_read_set(scope.finish());
+        }
+        result
+    }
+
+    /// [`Self::begin_copy_active`] の本体（読み取り集合の区間の内側で実行される）。
+    fn begin_copy_active_inner<'e>(
         &'e self,
         ctx: &PolicyContext,
         session: &crate::sql::mode::SessionState,

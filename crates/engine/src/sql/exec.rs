@@ -4498,6 +4498,14 @@ pub(crate) fn map_write_error(
         | TenantWriteError::Storage(StorageError::Codec(_)) => {
             SqlSurfaceError::invalid_input(format!("{op} rejected: invalid row"))
         }
+        // commit 記録の足跡を安全に記録できない書き込み（1 commit あたりの上限超過など。
+        // 明示トランザクションの書き込み時直列化検査〔Issue #2404〕）。commit 前の fail-closed の
+        // 拒否で、固定文言のみ（テナント ID・表名・件数を含めない）。
+        TenantWriteError::Storage(StorageError::CommitFootprintUnrecordable) => {
+            SqlSurfaceError::PayloadTooLarge {
+                detail: "commit footprint limit exceeded".to_string(),
+            }
+        }
         // それ以外（redb バックエンド障害・commit 失敗・カタログ破損・認可失敗・
         // 台帳破損等）はサーバー側の内部事象として `XX000` へ写像する
         // （codex-review P0/P1 指摘・PR #189: バックエンド障害を入力不正として返すと

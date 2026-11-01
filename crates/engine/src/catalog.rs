@@ -2079,6 +2079,8 @@ fn rewrite_views_for_renamed_table_in_txn(
         views_table
             .insert(name.as_str(), encoded.as_slice())
             .map_err(CatalogError::from)?;
+        // commit 記録（SQL-38・Issue #2404）: ビュー定義の書き換えは表世代を進めないため DDL として記録する。
+        crate::storage::commit_log::note_ddl(write_txn, name);
     }
     Ok(())
 }
@@ -2222,6 +2224,8 @@ fn rewrite_views_for_renamed_column_in_txn(
         views_table
             .insert(name.as_str(), encoded.as_slice())
             .map_err(CatalogError::from)?;
+        // commit 記録（SQL-38・Issue #2404）: ビュー定義の書き換えは表世代を進めないため DDL として記録する。
+        crate::storage::commit_log::note_ddl(write_txn, name);
     }
     Ok(())
 }
@@ -3492,6 +3496,9 @@ pub enum CatalogError {
     /// トランザクションの取得がロック待ちの上限を超過した（`storage::StorageError`
     /// から写像。[`convert_storage_error`] 参照）。
     WriteLockTimeout,
+    /// commit が書き込んだ表の足跡を安全に記録できず commit 前に拒否された（Issue #2404。
+    /// `StorageError::CommitFootprintUnrecordable` の型付き保持。SQL 表層では `54000` の固定文言）。
+    CommitFootprintUnrecordable,
     /// `ALTER TABLE ... DROP COLUMN`／`ALTER COLUMN ... TYPE` が参照した列名が
     /// 対象テーブルに存在しない（TABLE-19・TASK-203、Issue #901）。
     ColumnNotFound(String),
@@ -3633,6 +3640,9 @@ impl fmt::Display for CatalogError {
             CatalogError::WriteLockTimeout => {
                 write!(f, "write lock not available: timed out waiting for writer")
             }
+            CatalogError::CommitFootprintUnrecordable => {
+                write!(f, "commit footprint limit exceeded")
+            }
             CatalogError::ColumnNotFound(name) => write!(f, "column not found: {name}"),
             CatalogError::ProtectedColumn(name) => {
                 write!(
@@ -3722,6 +3732,7 @@ impl std::error::Error for CatalogError {
             | CatalogError::IncompatibleTypeChange { .. }
             | CatalogError::UniqueConstraintViolation
             | CatalogError::WriteLockTimeout
+            | CatalogError::CommitFootprintUnrecordable
             | CatalogError::TooManyColumns { .. }
             | CatalogError::IndexAlreadyExists(_)
             | CatalogError::IndexNotFound(_)
@@ -5557,6 +5568,8 @@ fn apply_cascaded_objects_in_txn(
             // 実体・索引宣言・世代の掃除まで同一 txn で行う（Issue #1667）。
             CascadedObject::MaterializedView { name } => {
                 materialized::drop_materialized_view_in_txn(write_txn, name)?;
+                // commit 記録（SQL-38・Issue #2404）: スキーマ・カタログを変える書き込みは DDL として記録する。
+                crate::storage::commit_log::note_ddl(write_txn, name);
                 bump_table_generation_in_txn(write_txn, name)?;
             }
             CascadedObject::ForeignKey { table, constraint } => {
@@ -5567,6 +5580,8 @@ fn apply_cascaded_objects_in_txn(
         applied.push(obj);
     }
     for child in &fk_children {
+        // commit 記録（SQL-38・Issue #2404）: スキーマ・カタログを変える書き込みは DDL として記録する。
+        crate::storage::commit_log::note_ddl(write_txn, child);
         bump_table_generation_in_txn(write_txn, child)?;
     }
     Ok(applied)
@@ -5596,6 +5611,8 @@ fn drop_view_in_txn(write_txn: &redb::WriteTransaction, name: &str) -> Result<()
     if views_table.remove(name)?.is_none() {
         return Err(CatalogError::ViewNotFound(name.to_string()));
     }
+    // commit 記録（SQL-38・Issue #2404）: ビュー定義の変更は表世代を進めないため DDL として記録する。
+    crate::storage::commit_log::note_ddl(write_txn, name);
     Ok(())
 }
 
@@ -11517,6 +11534,9 @@ fn parse_unique_section<'a>(
 /// コールドスタート・アリーナ構築時に、対象テーブルの行テーブルだけを単一の
 /// `read_txn` 上で直接開くために必要（クレート外へは公開しない）。
 pub(crate) fn user_rows_table_name(table_name: &str) -> String {
+    // 明示トランザクションの読み取り集合（SQL-38・Issue #2404）。行テーブルに触れる経路は読み書きとも
+    // ここで名前を作るため、区間が張られているときだけ記録する（`sql::read_set`）。
+    crate::sql::read_set::record(table_name);
     format!("user_rows/{table_name}")
 }
 
@@ -11684,6 +11704,9 @@ pub(crate) fn convert_storage_error(e: StorageError) -> CatalogError {
         StorageError::WriteLockTimeout | StorageError::WriteTxnHeldByCurrentSession => {
             CatalogError::WriteLockTimeout
         }
+        // commit 記録の足跡を安全に記録できない書き込みは commit 前に拒否される（固定文言。
+        // テナント ID・表名・件数を含めない。Issue #2404）。
+        StorageError::CommitFootprintUnrecordable => CatalogError::CommitFootprintUnrecordable,
     }
 }
 
@@ -11929,6 +11952,8 @@ impl Storage {
         let (schema, pre_encoded) = Self::prepare_create_table(schema)?;
         let write_txn = self.begin_write_txn().map_err(convert_storage_error)?;
         Self::create_table_in_txn(&write_txn, &schema, pre_encoded)?;
+        // commit 記録（SQL-38・Issue #2404）: スキーマ・カタログを変える書き込みは DDL として記録する。
+        crate::storage::commit_log::note_ddl(&write_txn, &schema.name);
         bump_table_generation_in_txn(&write_txn, &schema.name)?;
         crate::recovery::commit_boundary::commit(write_txn).map_err(convert_storage_error)
     }
@@ -12333,6 +12358,8 @@ impl Storage {
             policy::remove_policies_for_table_in_txn(write_txn, name)?;
             // 永続キー索引（Issue #1071）。残置すると参照整合性検査が fail-open になりうる。
             crate::key_index::drop_indexes_for_table_in_txn(write_txn, name)?;
+            // commit 記録（SQL-38・Issue #2404）: スキーマ・カタログを変える書き込みは DDL として記録する。
+            crate::storage::commit_log::note_ddl(write_txn, name);
             bump_table_generation_in_txn(write_txn, name)?;
         }
         // 索引宣言（TASK-206・INDEX-7、Issue #908）は 1 回にまとめる（カタログ世代の bump も 1 回）。
@@ -12392,6 +12419,8 @@ impl Storage {
         let max_columns = Self::prevalidate_add_column(table_name, &column, max_columns)?;
         let write_txn = self.begin_write_txn().map_err(convert_storage_error)?;
         Self::alter_table_add_column_in_txn(&write_txn, table_name, column, max_columns, false)?;
+        // commit 記録（SQL-38・Issue #2404）: スキーマ・カタログを変える書き込みは DDL として記録する。
+        crate::storage::commit_log::note_ddl(&write_txn, table_name);
         bump_table_generation_in_txn(&write_txn, table_name)?;
         crate::recovery::commit_boundary::commit(write_txn).map_err(convert_storage_error)
     }
@@ -12415,6 +12444,8 @@ impl Storage {
         if !changed {
             return Ok(out);
         }
+        // commit 記録（SQL-38・Issue #2404）: スキーマ・カタログを変える書き込みは DDL として記録する。
+        crate::storage::commit_log::note_ddl(&write_txn, table_name);
         bump_table_generation_in_txn(&write_txn, table_name)?;
         let allocator = self.sequence_allocator();
         crate::recovery::commit_boundary::commit_and_finish(write_txn, (), |()| {
@@ -12604,6 +12635,8 @@ impl Storage {
         let write_txn = self.begin_write_txn().map_err(convert_storage_error)?;
         let dropped_sequence_ids =
             Self::alter_table_drop_column_in_txn(&write_txn, table_name, column_name, false)?;
+        // commit 記録（SQL-38・Issue #2404）: スキーマ・カタログを変える書き込みは DDL として記録する。
+        crate::storage::commit_log::note_ddl(&write_txn, table_name);
         bump_table_generation_in_txn(&write_txn, table_name)?;
         // 所有 SEQUENCE のメモリ上の現在値は commit 成功後に捨てる（`drop_tables` と同じ）。
         let allocator = self.sequence_allocator();
@@ -12982,6 +13015,8 @@ impl Storage {
                     .insert(child.name.as_str(), child_encoded.as_slice())
                     .map_err(CatalogError::from)?;
             }
+            // commit 記録（SQL-38・Issue #2404）: スキーマ・カタログを変える書き込みは DDL として記録する。
+            crate::storage::commit_log::note_ddl(&write_txn, &child.name);
             bump_table_generation_in_txn(&write_txn, &child.name)?;
         }
         // 式索引の式テキストも改名後のスキーマで再束縛して追随させる（INDEX-10、Issue #1651）。
@@ -13025,6 +13060,8 @@ impl Storage {
                 }
             })
         })?;
+        // commit 記録（SQL-38・Issue #2404）: スキーマ・カタログを変える書き込みは DDL として記録する。
+        crate::storage::commit_log::note_ddl(&write_txn, table_name);
         bump_table_generation_in_txn(&write_txn, table_name)?;
         crate::recovery::commit_boundary::commit(write_txn).map_err(convert_storage_error)?;
         Ok(())
@@ -13139,6 +13176,8 @@ impl Storage {
                     .insert(child.name.as_str(), child_encoded.as_slice())
                     .map_err(CatalogError::from)?;
             }
+            // commit 記録（SQL-38・Issue #2404）: スキーマ・カタログを変える書き込みは DDL として記録する。
+            crate::storage::commit_log::note_ddl(&write_txn, &child.name);
             bump_table_generation_in_txn(&write_txn, &child.name)?;
         }
         // 索引宣言の所有テーブル名の付け替え（索引カタログ世代も bump する）。
@@ -13209,6 +13248,8 @@ impl Storage {
                 .delete_table(user_uniq_table_def(&user_uniq_table_name(name)))
                 .map_err(CatalogError::from)?;
             crate::key_index::drop_indexes_for_table_in_txn(&write_txn, name)?;
+            // commit 記録（SQL-38・Issue #2404）: スキーマ・カタログを変える書き込みは DDL として記録する。
+            crate::storage::commit_log::note_ddl(&write_txn, name);
             bump_table_generation_in_txn(&write_txn, name)?;
         }
         crate::recovery::ledger::delete_table_in_txn(&write_txn, new_table_name)
@@ -13375,6 +13416,8 @@ impl Storage {
         // `row_table` の借用は上のブロックを抜けた時点で解放済みのため、
         // 別テーブルである索引テーブルの削除はここで安全に行える）。
         write_txn.delete_table(user_uniq_table_def(&user_uniq_table_name(table_name)))?;
+        // commit 記録（SQL-38・Issue #2404）: スキーマ・カタログを変える書き込みは DDL として記録する。
+        crate::storage::commit_log::note_ddl(&write_txn, table_name);
         bump_table_generation_in_txn(&write_txn, table_name)?;
         crate::recovery::commit_boundary::commit(write_txn).map_err(convert_storage_error)?;
         Ok(confirmed_name)
@@ -13493,6 +13536,8 @@ impl Storage {
             catalog_table.insert(table_name, encoded.as_slice())?;
         }
         write_txn.delete_table(user_uniq_table_def(&user_uniq_table_name(table_name)))?;
+        // commit 記録（SQL-38・Issue #2404）: スキーマ・カタログを変える書き込みは DDL として記録する。
+        crate::storage::commit_log::note_ddl(&write_txn, table_name);
         bump_table_generation_in_txn(&write_txn, table_name)?;
         crate::recovery::commit_boundary::commit(write_txn).map_err(convert_storage_error)?;
         Ok(confirmed_name)
@@ -13525,6 +13570,8 @@ impl Storage {
             // 冪等な no-op。txn を commit せず破棄する（世代も進めない）。
             return Ok(());
         }
+        // commit 記録（SQL-38・Issue #2404）: スキーマ・カタログを変える書き込みは DDL として記録する。
+        crate::storage::commit_log::note_ddl(&write_txn, table_name);
         bump_table_generation_in_txn(&write_txn, table_name)?;
         crate::recovery::commit_boundary::commit(write_txn).map_err(convert_storage_error)?;
         Ok(())
@@ -13631,6 +13678,8 @@ impl Storage {
             // 冪等な no-op。txn を commit せず破棄する（世代も進めない）。
             return Ok(());
         }
+        // commit 記録（SQL-38・Issue #2404）: スキーマ・カタログを変える書き込みは DDL として記録する。
+        crate::storage::commit_log::note_ddl(&write_txn, table_name);
         bump_table_generation_in_txn(&write_txn, table_name)?;
         crate::recovery::commit_boundary::commit(write_txn).map_err(convert_storage_error)?;
         Ok(())
@@ -13747,6 +13796,8 @@ impl Storage {
             // 冪等な no-op。txn を commit せず破棄する（世代も進めない）。
             return Ok(());
         }
+        // commit 記録（SQL-38・Issue #2404）: スキーマ・カタログを変える書き込みは DDL として記録する。
+        crate::storage::commit_log::note_ddl(&write_txn, table_name);
         bump_table_generation_in_txn(&write_txn, table_name)?;
         crate::recovery::commit_boundary::commit(write_txn).map_err(convert_storage_error)?;
         Ok(())
@@ -13988,6 +14039,8 @@ impl Storage {
                 .insert(table_name, encoded.as_slice())
                 .map_err(CatalogError::from)?;
         }
+        // commit 記録（SQL-38・Issue #2404）: スキーマ・カタログを変える書き込みは DDL として記録する。
+        crate::storage::commit_log::note_ddl(&write_txn, table_name);
         bump_table_generation_in_txn(&write_txn, table_name).map_err(AlterCheckError::Catalog)?;
         crate::recovery::commit_boundary::commit(write_txn)
             .map_err(convert_storage_error)
@@ -14158,6 +14211,8 @@ impl Storage {
             let mut catalog_table = write_txn.open_table(CATALOG_TABLE)?;
             catalog_table.insert(table_name, encoded.as_slice())?;
         }
+        // commit 記録（SQL-38・Issue #2404）: スキーマ・カタログを変える書き込みは DDL として記録する。
+        crate::storage::commit_log::note_ddl(&write_txn, table_name);
         bump_table_generation_in_txn(&write_txn, table_name)?;
         crate::recovery::commit_boundary::commit(write_txn).map_err(convert_storage_error)?;
         Ok(confirmed_name)
@@ -14321,6 +14376,8 @@ impl Storage {
                 )?;
             }
         }
+        // commit 記録（SQL-38・Issue #2404）: スキーマ・カタログを変える書き込みは DDL として記録する。
+        crate::storage::commit_log::note_ddl(&write_txn, table_name);
         bump_table_generation_in_txn(&write_txn, table_name)?;
         crate::recovery::commit_boundary::commit(write_txn).map_err(convert_storage_error)
     }
@@ -14813,6 +14870,8 @@ impl Storage {
                 column_name,
             )?;
         }
+        // commit 記録（SQL-38・Issue #2404）: スキーマ・カタログを変える書き込みは DDL として記録する。
+        crate::storage::commit_log::note_ddl(&write_txn, table_name);
         bump_table_generation_in_txn(&write_txn, table_name)?;
         crate::recovery::commit_boundary::commit(write_txn).map_err(convert_storage_error)?;
         Ok(())
@@ -14901,6 +14960,8 @@ impl Storage {
             def
         };
         for table_name in dependent_tables_in_txn(&write_txn, name)? {
+            // commit 記録（SQL-38・Issue #2404）: スキーマ・カタログを変える書き込みは DDL として記録する。
+            crate::storage::commit_log::note_ddl(&write_txn, &table_name);
             bump_table_generation_in_txn(&write_txn, &table_name)?;
         }
         crate::recovery::commit_boundary::commit(write_txn).map_err(convert_storage_error)?;
@@ -15056,6 +15117,8 @@ impl Storage {
                 ));
             }
             views_table.insert(name, encoded.as_slice())?;
+            // commit 記録（SQL-38・Issue #2404）: ビュー定義の変更は表世代を進めないため DDL として記録する。
+            crate::storage::commit_log::note_ddl(&write_txn, name);
         }
         crate::recovery::commit_boundary::commit(write_txn).map_err(convert_storage_error)
     }
@@ -15118,6 +15181,8 @@ impl Storage {
                 if views_table.remove(name)?.is_none() {
                     return Err(CatalogError::ViewNotFound(name.to_string()));
                 }
+                // commit 記録（SQL-38・Issue #2404）: ビュー定義の変更は表世代を進めないため DDL として記録する。
+                crate::storage::commit_log::note_ddl(&write_txn, name);
                 Vec::new()
             }
             DropBehavior::Cascade => {
@@ -15335,6 +15400,8 @@ impl Storage {
                 }
                 let encoded = encode_index_def(def)?;
                 materialized::create_matview_index_in_txn(&write_txn, def, &encoded)?;
+                // commit 記録（SQL-38・Issue #2404）: スキーマ・カタログを変える書き込みは DDL として記録する。
+                crate::storage::commit_log::note_ddl(&write_txn, &def.table);
                 bump_table_generation_in_txn(&write_txn, &def.table)?;
                 bump_index_catalog_generation_in_txn(&write_txn)?;
                 return crate::recovery::commit_boundary::commit(write_txn)
@@ -15501,6 +15568,8 @@ impl Storage {
             // 次回の書き込み時に遅延再構築される）。
             write_txn.delete_table(user_uniq_table_def(&user_uniq_table_name(&def.table)))?;
         }
+        // commit 記録（SQL-38・Issue #2404）: スキーマ・カタログを変える書き込みは DDL として記録する。
+        crate::storage::commit_log::note_ddl(&write_txn, &def.table);
         bump_table_generation_in_txn(&write_txn, &def.table)?;
         // 索引カタログ自体を変えたので専用世代も進める（Issue #1154。
         // `IndexCatalogGateCache` が古い HNSW 宣言判定を再利用しないようにする）。
@@ -15565,6 +15634,8 @@ impl Storage {
                 drop_unique_index_constraint_in_txn(&write_txn, &def)?;
             }
         }
+        // commit 記録（SQL-38・Issue #2404）: スキーマ・カタログを変える書き込みは DDL として記録する。
+        crate::storage::commit_log::note_ddl(&write_txn, &def.table);
         bump_table_generation_in_txn(&write_txn, &def.table)?;
         // 索引カタログ自体を変えたので専用世代も進める（Issue #1154。理由は
         // `Storage::create_index` と同じ）。
@@ -15815,6 +15886,8 @@ impl Storage {
                 }
             }
             views_table.insert(name, encoded.as_slice())?;
+            // commit 記録（SQL-38・Issue #2404）: ビュー定義の変更は表世代を進めないため DDL として記録する。
+            crate::storage::commit_log::note_ddl(&write_txn, name);
             // 置換（旧定義あり）では、未 commit の新定義を前提に依存ビューを同一 txn で
             // 再検証する。失敗は `?` で txn ごと破棄され、旧定義が残る（原子性）。
             if current.is_some() {
@@ -16049,6 +16122,13 @@ impl Storage {
             // 生の経路のため、キーの名前空間は入力 `row.tenant_id` に従う
             // （認可済みの名前空間で書くのは `crate::tenant::insert_row` の責務）。
             row_table.insert((row.tenant_id, id), encoded.as_slice())?;
+            // commit 記録の行の足跡（テスト専用の生の経路。SQL-38・Issue #2404）。
+            crate::storage::commit_log::note_row(
+                &write_txn,
+                table_name,
+                row.tenant_id,
+                row.visibility,
+            );
         }
         bump_table_generation_in_txn(&write_txn, table_name)?;
         crate::recovery::commit_boundary::commit(write_txn).map_err(convert_storage_error)
@@ -16109,6 +16189,12 @@ impl Storage {
                     .map_err(convert_storage_error)?;
                 // 物理キーは `(tenant_id, id)`（TABLE-12。`insert_row_into_table` と同じ）。
                 row_table.insert((row.tenant_id, *id), scratch.as_slice())?;
+                crate::storage::commit_log::note_row(
+                    &write_txn,
+                    table_name,
+                    row.tenant_id,
+                    row.visibility,
+                );
             }
         }
         bump_table_generation_in_txn(&write_txn, table_name)?;
@@ -16181,6 +16267,7 @@ impl Storage {
             // 物理キーは `(tenant_id, id)`（TABLE-12）。`tenant_id` は本 API の引数
             // （呼び出し元がテナントを明示する契約）。
             row_table.insert((tenant_id, id), encoded.as_slice())?;
+            crate::storage::commit_log::note_row(&write_txn, table_name, tenant_id, visibility);
         }
         bump_table_generation_in_txn(&write_txn, table_name)?;
         crate::recovery::commit_boundary::commit(write_txn).map_err(convert_storage_error)
@@ -16578,6 +16665,9 @@ pub(crate) fn table_lookup_error(e: CatalogError) -> SqlSurfaceError {
         // 取得しないため通常は到達しないが、`CatalogError` の網羅性のためここでも
         // 扱う（SQL-31・TASK-221）。
         CatalogError::WriteLockTimeout => SqlSurfaceError::LockNotAvailable,
+        CatalogError::CommitFootprintUnrecordable => SqlSurfaceError::Internal {
+            detail: "catalog lookup failed".to_string(),
+        },
     }
 }
 
@@ -16608,6 +16698,9 @@ pub(crate) fn get_table_schema_in_txn_impl(
     // 不正形式の名前は `TableNotFound`（存在しない）ではなく `Invalid`（形式不正）で
     // 拒否し、両 API 間でエラーバリアントを揃える。
     validate_relation_key(table_name)?;
+    // 明示トランザクションの読み取り集合（SQL-38・Issue #2404）。関係の解決点で記録する
+    // （行を読まない `EXPLAIN` とビュー名も拾う。区間が無ければ何もしない）。
+    crate::sql::read_set::record(table_name);
     let table = match read_txn.open_table(CATALOG_TABLE) {
         Ok(t) => t,
         // カタログテーブル未作成（1 テーブルも定義していない）は「存在しない」として扱う。
@@ -16629,6 +16722,8 @@ pub(crate) fn get_table_schema_in_txn_impl(
 fn list_tables_in_txn(
     read_txn: &impl crate::storage::read_source::ReadSource,
 ) -> Result<Vec<String>> {
+    // カタログ全体の列挙は参照先を確定できない読み取り（読み取り集合ではワイルドカード。Issue #2404）。
+    crate::sql::read_set::record_wildcard();
     let table = match read_txn.open_table(CATALOG_TABLE) {
         Ok(t) => t,
         Err(redb::TableError::TableDoesNotExist(_)) => return Ok(Vec::new()),
@@ -21858,6 +21953,7 @@ mod tests {
                 let mut t = w.open_table(CATALOG_TABLE).expect("catalog");
                 t.remove("orphan").expect("remove");
             }
+            crate::storage::commit_log::note_ddl(&w, "orphan");
             bump_table_generation_in_txn(&w, "orphan").expect("bump");
             crate::recovery::commit_boundary::commit(w).expect("commit");
         }
@@ -21901,6 +21997,7 @@ mod tests {
                 let mut t = w.open_table(CATALOG_TABLE).expect("catalog");
                 t.remove("orphan").expect("remove");
             }
+            crate::storage::commit_log::note_ddl(&w, "orphan");
             bump_table_generation_in_txn(&w, "orphan").expect("bump");
             crate::recovery::commit_boundary::commit(w).expect("commit");
         }
@@ -22573,6 +22670,7 @@ mod tests {
                 let mut t = w.open_table(CATALOG_TABLE).expect("catalog");
                 t.remove("orphan").expect("remove");
             }
+            crate::storage::commit_log::note_ddl(&w, "orphan");
             bump_table_generation_in_txn(&w, "orphan").expect("bump");
             crate::recovery::commit_boundary::commit(w).expect("commit");
         }
@@ -25934,6 +26032,7 @@ mod tests {
                 t.insert(d.name.as_str(), bytes.as_slice()).expect("insert");
             }
         }
+        crate::storage::commit_log::note_ddl(&write_txn, "docs");
         bump_table_generation_in_txn(&write_txn, "docs").expect("bump generation");
         crate::recovery::commit_boundary::commit(write_txn).expect("commit");
         let read = storage.db().begin_read().expect("read");

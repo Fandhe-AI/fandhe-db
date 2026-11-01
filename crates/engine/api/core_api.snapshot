@@ -276,6 +276,7 @@ pub enum StorageError {
     IncompatibleRowKeyFormat,
     WriteLockTimeout,
     WriteTxnHeldByCurrentSession,
+    CommitFootprintUnrecordable,
 }
 
 # source: crates/engine/src/catalog.rs :: CatalogError
@@ -304,6 +305,7 @@ pub enum CatalogError {
     ReservedSchemaName(String),
     BuiltinSchema(String),
     WriteLockTimeout,
+    CommitFootprintUnrecordable,
     ColumnNotFound(String),
     ProtectedColumn(String),
     IncompatibleTypeChange {
