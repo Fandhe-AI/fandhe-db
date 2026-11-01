@@ -4371,6 +4371,16 @@ pub(crate) fn map_write_error(
         // UPSERT `DO UPDATE` の衝突先が所有だが不可視（Issue #1254）。`_` 節
         // （`XX000`）へ落とさず `42501` を維持する。
         TenantWriteError::ConflictTargetNotVisible => SqlSurfaceError::ConflictTargetNotVisible,
+        // RLS-13（Issue #2277）: 利用者定義ポリシーの `WITH CHECK` 違反。`42501` を維持する。
+        TenantWriteError::RowSecurityPolicyViolation {
+            table,
+            policy,
+            using_expression,
+        } => SqlSurfaceError::RowSecurityPolicyViolation {
+            table,
+            policy,
+            using_expression,
+        },
         // `PRIMARY KEY`（Issue #903）・UNIQUE 制約（Issue #905。TABLE-16・TASK-204）のテナント内一意性制約
         // 違反。行キー衝突（`IdConflict`）と原因は異なるが `23505` は共有する。
         TenantWriteError::UniqueViolation => SqlSurfaceError::unique_violation(),
@@ -5923,6 +5933,15 @@ fn map_incremental_error(e: crate::incremental::IncrementalError) -> SqlSurfaceE
         // `CHECK` 制約違反（TABLE-16・TASK-204、Issue #906）もファイル形 INSERT で
         // 行形 INSERT（[`map_write_error`]）と同じ `23514` へ写像する（`_` 節へ
         // 丸めない）。制約名のみを含む固定文言。
+        IncrementalError::Write(TenantWriteError::RowSecurityPolicyViolation {
+            table,
+            policy,
+            using_expression,
+        }) => SqlSurfaceError::RowSecurityPolicyViolation {
+            table,
+            policy,
+            using_expression,
+        },
         IncrementalError::Write(TenantWriteError::WithCheckOptionViolation) => {
             SqlSurfaceError::WithCheckOptionViolation
         }

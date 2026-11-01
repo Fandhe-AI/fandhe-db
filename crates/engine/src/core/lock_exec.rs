@@ -16,6 +16,7 @@ impl EngineCore {
     /// 開いている Tx の上で `LOCK` を実行する。
     pub(crate) fn execute_lock_in_active_txn(
         &self,
+        ctx: &crate::policy::PolicyContext,
         txn: &mut SessionTransaction<'_>,
         stmt: &ValidatedLockTable,
     ) -> Result<crate::sql::SqlOutcome, SqlSurfaceError> {
@@ -24,6 +25,9 @@ impl EngineCore {
         if txn.access_mode() == Some(TxnAccessMode::ReadOnly) {
             return Err(SqlSurfaceError::ReadOnlySqlTransaction);
         }
+        // 存在確認は読み取りではないので読み取り集合へ記録しない（記録すると read を伴わない
+        // `LOCK` が先行 read 扱いになり、無関係な可視 commit で `40001` になる。#2405）。
+        let suspend = crate::sql::read_set::SuspendGuard::enter();
         for name in &stmt.table_names {
             if !TableLookup::table_exists(&self.storage, name)? {
                 // ビュー・索引など表でないものは `42809`、不在は `42P01`（INSERT／TRUNCATE と同じ分類）。
@@ -34,7 +38,8 @@ impl EngineCore {
                 );
             }
         }
-        txn.ensure_writer_with(stmt.nowait)?;
+        drop(suspend);
+        txn.ensure_writer_with(ctx, stmt.nowait)?;
         // writer 待機中に別セッションの DROP TABLE が確定しうるため、取得後に保持中の writer の
         // カタログで全対象表を再検証する（fail-closed。不在は取得前と同じ `42P01`／`42809`）。
         let write_txn = txn.write_txn().ok_or_else(|| SqlSurfaceError::Internal {

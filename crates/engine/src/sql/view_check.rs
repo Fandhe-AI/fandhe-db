@@ -30,7 +30,7 @@ fn unsupported_predicate() -> SqlSurfaceError {
 }
 
 /// 1 段の述語を束縛した評価器。
-struct CompiledLayer {
+pub(crate) struct CompiledLayer {
     group: BoundOrGroup,
     /// 評価に必要な列のデコードマスク（`row_codec::scan_scalar_columns_masked` へ渡す）。
     column_mask: Vec<bool>,
@@ -39,7 +39,10 @@ struct CompiledLayer {
 
 impl CompiledLayer {
     /// 部分クエリ・RLS 述語呼び出しを含む形は `0A000`。それ以外の束縛エラー（未知列等）は透過する。
-    fn bind(preds: &[WherePredicate], schema: &TableSchema) -> Result<Self, SqlSurfaceError> {
+    pub(crate) fn bind(
+        preds: &[WherePredicate],
+        schema: &TableSchema,
+    ) -> Result<Self, SqlSurfaceError> {
         // 部分クエリの検出は列写像の共有走査器へ恒等写像を渡し、部分クエリ葉で呼ばれる
         // `on_subquery` のエラーで行う（第 2 の走査器を作らない）。
         for p in preds {
@@ -76,7 +79,7 @@ impl CompiledLayer {
     }
 
     /// 1 行で述語を評価する。TRUE のときだけ `true`（FALSE・NULL は `false`）。
-    fn eval(
+    pub(crate) fn eval(
         &self,
         schema: &TableSchema,
         id: u64,

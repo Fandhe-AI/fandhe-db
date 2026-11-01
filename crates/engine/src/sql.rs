@@ -264,6 +264,7 @@ pub mod parser;
 pub mod partitioned;
 pub(crate) mod pk_point;
 pub mod plan;
+pub(crate) mod policy_eval;
 pub(crate) mod policy_expr;
 pub(crate) mod qualified_column;
 pub(crate) mod read_set;

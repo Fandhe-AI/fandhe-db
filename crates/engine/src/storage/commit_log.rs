@@ -18,7 +18,8 @@
 //!   書き込まれた表そのものは表世代の差分（`catalog::changed_table_generations_in_write_txn`）
 //!   で確定するため、frame に足跡が無い書き込み表は commit 前に拒否する（fail-closed。
 //!   書き込み点の結線漏れは取りこぼしではなく拒否として検出される）。
-//! - 照会 API [`CommitLog::records_between`] は #2405 の `40001` 判定が呼ぶ。
+//! - 照会 API [`CommitLog::records_between`] と衝突述語 [`conflicts_with`] は、
+//!   `SessionTransaction::ensure_writer_with`（#2405）が writer 取得時の `40001` 判定で呼ぶ。
 //!
 //! テナント境界（P0）: 足跡は書き込んだ行の実際の `(tenant_id, visibility)` を持つ。
 //! 全テナント共通で見える `Public` 行だけは、テナントを区別しない 1 要素へ畳む
@@ -83,6 +84,19 @@ impl TableFootprint {
             .saturating_add(self.private_tenants.len())
     }
 
+    /// この足跡が `ctx` のセッションから見て衝突の原因になるか（#2405）。
+    /// DDL は常に原因。行の足跡は `PolicyContext::is_visible` を通して可視なものだけを数える
+    /// （他テナントの `Private` 行だけを書いた commit は原因にならず、`40001` の有無から
+    /// 不可視の行の存在を推測できない。可視性の判定ロジックをここで二重に書かない）。
+    fn visible_to(&self, ctx: &crate::policy::PolicyContext) -> bool {
+        self.ddl
+            || (self.public && ctx.is_visible(ctx.tenant_id(), Visibility::Public))
+            || self
+                .private_tenants
+                .iter()
+                .any(|t| ctx.is_visible(t, Visibility::Private))
+    }
+
     /// 行の足跡が 1 つも無く DDL でもないか（0 行更新で表だけを触った場合）。
     fn is_empty(&self) -> bool {
         !self.public && self.private_tenants.is_empty() && !self.ddl
@@ -106,10 +120,25 @@ impl CommitRecord {
 }
 
 /// 記録から判定できない（床より古い・記録の欠け・mutex の汚染）ことを表す。
-/// 呼び出し側（#2405）は衝突として扱う（fail-closed）。
+/// 呼び出し側（`ensure_writer_with`・#2405）は衝突として扱う（fail-closed）。
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-#[cfg_attr(not(test), allow(dead_code))]
 pub(crate) struct Unverifiable;
+
+/// 読み取り集合と、`G_s` より後の commit 記録が衝突するか（SQL-38・Issue #2405）。
+/// `SessionTransaction::ensure_writer_with` が permit 保持中に呼ぶ純関数。読み取り集合に
+/// 含まれる表（ワイルドカードは全表）への書き込みで、`ctx` から可視な足跡または DDL を
+/// 持つ記録が 1 つでもあれば真。
+pub(crate) fn conflicts_with(
+    read_set: &crate::sql::read_set::ReadSet,
+    records: &[CommitRecord],
+    ctx: &crate::policy::PolicyContext,
+) -> bool {
+    records.iter().any(|r| {
+        r.tables
+            .iter()
+            .any(|(table, fp)| read_set.contains(table) && fp.visible_to(ctx))
+    })
+}
 
 #[derive(Default)]
 struct State {
@@ -285,8 +314,7 @@ impl CommitLog {
     }
 
     /// `g_s < G_c <= g_now` の記録を返す。床より古い・記録の欠け・汚染のときは
-    /// [`Unverifiable`]（#2405 が衝突として扱う）。
-    #[cfg_attr(not(test), allow(dead_code))]
+    /// [`Unverifiable`]（`ensure_writer_with` が衝突として扱う。#2405）。
     pub(crate) fn records_between(
         &self,
         g_s: u64,
@@ -873,5 +901,67 @@ mod tests {
         // Private は自テナントだけ可視。畳めない。
         assert!(ctx.is_visible("tenant-me", Visibility::Private));
         assert!(!ctx.is_visible("tenant-other", Visibility::Private));
+    }
+
+    // --- 衝突述語（#2405） ---
+
+    fn pctx(tenant: &str, vis: &[Visibility]) -> crate::policy::PolicyContext {
+        crate::policy::PolicyContext::with_visibilities(tenant, vis.iter().copied()).expect("ctx")
+    }
+
+    fn read_set_of(tables: &[&str]) -> crate::sql::read_set::ReadSet {
+        let mut s = crate::sql::read_set::ReadSet::default();
+        for t in tables {
+            s.record(t);
+        }
+        s
+    }
+
+    fn rec_fp(table: &str, fp: TableFootprint) -> CommitRecord {
+        CommitRecord {
+            generation: 1,
+            tables: vec![(table.into(), fp)],
+        }
+    }
+
+    #[test]
+    fn predicate_requires_read_table_and_visible_footprint() {
+        let both = [Visibility::Public, Visibility::Private];
+        let me = pctx("a", &both);
+        // 自テナントの Private は衝突、他テナントの Private・読んでいない表は衝突しない。
+        assert!(conflicts_with(&read_set_of(&["t"]), &[rec(1, "a")], &me));
+        assert!(!conflicts_with(&read_set_of(&["t"]), &[rec(1, "b")], &me));
+        assert!(!conflicts_with(&read_set_of(&["u"]), &[rec(1, "a")], &me));
+        assert!(!conflicts_with(&read_set_of(&[]), &[rec(1, "a")], &me));
+        // 大文字小文字は畳まれる。
+        assert!(conflicts_with(&read_set_of(&["T"]), &[rec(1, "a")], &me));
+    }
+
+    #[test]
+    fn predicate_public_ddl_and_wildcard() {
+        let public = TableFootprint {
+            public: true,
+            ..TableFootprint::default()
+        };
+        let ddl = TableFootprint {
+            ddl: true,
+            ..TableFootprint::default()
+        };
+        let me = pctx("a", &[Visibility::Public, Visibility::Private]);
+        let private_only = pctx("a", &[Visibility::Private]);
+        let r = read_set_of(&["t"]);
+        assert!(conflicts_with(&r, &[rec_fp("t", public.clone())], &me));
+        // Public を許可しない文脈では Public の足跡は原因にならない。
+        assert!(!conflicts_with(
+            &r,
+            &[rec_fp("t", public.clone())],
+            &private_only
+        ));
+        assert!(conflicts_with(&r, &[rec_fp("t", ddl)], &private_only));
+        // ワイルドカードは全表で評価し、不可視の足跡だけなら衝突しない。
+        let mut wild = crate::sql::read_set::ReadSet::default();
+        wild.set_wildcard();
+        assert!(conflicts_with(&wild, &[rec_fp("zzz", public)], &me));
+        assert!(!conflicts_with(&wild, &[rec(1, "b")], &me));
     }
 }

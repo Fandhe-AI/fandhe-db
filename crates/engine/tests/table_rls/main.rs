@@ -47,6 +47,7 @@ mod rls10_sql_function_paths;
 mod rls11_read_your_writes;
 mod rls13_policy_ddl;
 mod rls13_policy_roles_row_security;
+mod rls13_policy_with_check;
 mod rls13_row_security;
 mod rls_generalized;
 mod rls_implicit;

@@ -2,7 +2,7 @@
 //! 設計: `docs/design/explicit-transaction.md` 1a-4）。
 //!
 //! 役割: `ActiveTxn`（`sql::transaction`）が持つ「読み取り集合」の型 [`ReadSet`] と、文の実行区間だけ
-//! 記録を有効にする thread-local の RAII 区間 [`ReadSetScope`] を提供する。#2405 の `40001` 判定が
+//! 記録を有効にする thread-local の RAII 区間 [`ReadSetScope`] を提供する。`SessionTransaction::ensure_writer_with` の `40001` 判定（#2405）が
 //! writer 取得時にこの集合と commit 記録（`storage::commit_log`）を突き合わせる。
 //!
 //! 記録の方式: AST から参照表を集めない（ビュー・CTE・部分クエリ・PL/pgSQL の展開を AST で追うと
