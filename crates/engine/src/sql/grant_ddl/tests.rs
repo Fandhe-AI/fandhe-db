@@ -409,6 +409,72 @@ fn circular_grant_option_is_rejected() {
 }
 
 #[test]
+fn self_grant_option_is_rejected_so_revoke_cascade_reclaims_everything() {
+    let f = fx("grant_self_go");
+    let me = role(&f, T, "owner_role");
+    let bob = role(&f, T, "bob");
+    let so = session(me, true);
+    run(&f, T, &so, "GRANT SELECT ON docs TO bob WITH GRANT OPTION").expect("1");
+    // 非所有者の自己への GRANT OPTION 付与は循環として拒否する。
+    assert_eq!(
+        code(run(
+            &f,
+            T,
+            &session(bob, false),
+            "GRANT SELECT ON docs TO bob WITH GRANT OPTION"
+        )),
+        "0LP01"
+    );
+    run(&f, T, &so, "REVOKE SELECT ON docs FROM bob CASCADE").expect("cascade");
+    assert!(acl(&f, T, &tbl()).is_empty());
+}
+
+#[test]
+fn cycle_detection_is_per_privilege_bit() {
+    let f = fx("grant_cycle_bits");
+    let me = role(&f, T, "owner_role");
+    let a = role(&f, T, "a");
+    let b = role(&f, T, "b");
+    let c = role(&f, T, "c");
+    let so = session(me, true);
+    run(&f, T, &so, "GRANT SELECT ON docs TO a WITH GRANT OPTION").expect("1");
+    run(&f, T, &so, "GRANT UPDATE ON docs TO b WITH GRANT OPTION").expect("2");
+    run(&f, T, &so, "GRANT SELECT ON docs TO c WITH GRANT OPTION").expect("3");
+    run(
+        &f,
+        T,
+        &session(a, false),
+        "GRANT SELECT ON docs TO b WITH GRANT OPTION",
+    )
+    .expect("a->b select");
+    run(
+        &f,
+        T,
+        &session(b, false),
+        "GRANT UPDATE ON docs TO c WITH GRANT OPTION",
+    )
+    .expect("b->c update");
+    // 権限ごとには循環しない（SELECT: c<-owner のみ、UPDATE: a は上流に現れない）ため成功する。
+    run(
+        &f,
+        T,
+        &session(c, false),
+        "GRANT SELECT, UPDATE ON docs TO a WITH GRANT OPTION",
+    )
+    .expect("no per-bit cycle");
+    // 同じ権限での実際の循環（SELECT: a -> b なので b から a への SELECT は不可）は拒否される。
+    assert_eq!(
+        code(run(
+            &f,
+            T,
+            &session(b, false),
+            "GRANT SELECT ON docs TO a WITH GRANT OPTION"
+        )),
+        "0LP01"
+    );
+}
+
+#[test]
 fn table_level_revoke_cascades_to_column_rows_but_not_the_reverse() {
     let f = fx("revoke_cols");
     let me = role(&f, T, "owner_role");

@@ -284,7 +284,8 @@ impl AclStates {
 fn go_of(entries: &[AclEntry], x: u64) -> u16 {
     entries
         .iter()
-        .filter(|e| e.grantee_id == x)
+        // 自己付与の行（付与者 == 付与先）は独立した出所として数えない（循環による REVOKE 回避の防止）。
+        .filter(|e| e.grantee_id == x && e.grantor_id != x)
         .fold(0u16, |a, e| a | e.grant_options)
 }
 
@@ -599,11 +600,20 @@ impl Storage {
             let mut work: Vec<AclEntry> = entries.clone();
             if req.is_grant {
                 if req.grant_option && !req.owner_equivalent {
-                    let anc = ancestors_of(&entries, req.grantor_id, eff)?;
-                    if grantee_ids.iter().any(|g| anc.contains(g)) {
+                    // 自己への GRANT OPTION 付与は循環として拒否する。
+                    if grantee_ids.contains(&req.grantor_id) {
                         return Err(AclChangeError::InvalidGrant(
                             "grant options cannot be granted back to your own grantor",
                         ));
+                    }
+                    // 権限ビットごとに経路を辿る（別の権限の辺をつないで架空の循環を作らない）。
+                    for bit in (0..16).map(|i| 1u16 << i).filter(|b| eff & b != 0) {
+                        let anc = ancestors_of(&entries, req.grantor_id, bit)?;
+                        if grantee_ids.iter().any(|g| anc.contains(g)) {
+                            return Err(AclChangeError::InvalidGrant(
+                                "grant options cannot be granted back to your own grantor",
+                            ));
+                        }
                     }
                 }
                 for g in &grantee_ids {
