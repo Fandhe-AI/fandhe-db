@@ -302,6 +302,24 @@ fn nothing_is_retained_without_a_live_registration() {
     assert_eq!(stats(&core).0, 0);
 }
 
+/// `BEGIN READ ONLY` は commit 記録の登録簿へ載らず、他セッションの commit も保持されない
+/// （Issue #1933・SQL-38）。READ ONLY は writer を取れず `40001` 判定に到達しないため。
+#[test]
+fn read_only_transaction_is_not_registered_and_retains_nothing() {
+    let (core, _g) = new_core("clog-read-only");
+    let mut session = SessionState::default();
+    let mut txn = core.new_session_transaction();
+    core.execute_sql_in_txn(&ctx("tenant-a"), &mut session, &mut txn, "BEGIN READ ONLY")
+        .expect("begin read only");
+    assert_eq!(txn.snapshot_generation(), Some(0), "no registration");
+    for i in 0..5 {
+        run(&core, "tenant-b", &insert("ca", i, &format!("ro-{i}")));
+    }
+    assert_eq!(stats(&core).0, 0, "no record retained for READ ONLY");
+    rollback(&core, "tenant-a", &mut txn);
+    assert_eq!(stats(&core).0, 0);
+}
+
 #[test]
 fn retained_records_are_dropped_when_the_registration_ends_in_every_way() {
     let (core, _g) = new_core("clog-lifecycle");

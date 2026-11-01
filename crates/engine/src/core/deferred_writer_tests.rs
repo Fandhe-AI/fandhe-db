@@ -112,6 +112,36 @@ fn read_only_explicit_txn_creates_no_write_txn() {
     assert_eq!(txn.status(), TransactionStatus::Idle);
 }
 
+/// `BEGIN READ ONLY` の各読み取り文の後も writer を持たず、スナップショットだけを保持する
+/// （Issue #1933・SQL-38）。COMMIT・ROLLBACK で両方手放す。
+#[test]
+fn read_only_txn_holds_only_read_snapshot() {
+    let (core, _g) = new_core("deferred-writer-ro-snapshot");
+    let caller = ctx("tenant-a");
+    let mut session = SessionState::default();
+    core.execute_sql_in_session(&caller, &mut session, &insert(1, "seed"))
+        .expect("seed");
+    for end in ["COMMIT", "ROLLBACK"] {
+        let mut txn = core.new_session_transaction();
+        for sql in [
+            "BEGIN READ ONLY",
+            "SELECT id FROM documents LIMIT 10",
+            "DECLARE c CURSOR FOR SELECT id FROM documents LIMIT 10",
+            "FETCH 1 FROM c",
+            "EXPLAIN SELECT id FROM documents LIMIT 10",
+        ] {
+            core.execute_sql_in_txn(&caller, &mut session, &mut txn, sql)
+                .unwrap_or_else(|e| panic!("{sql} must succeed, got {e:?}"));
+            assert!(txn.write_txn().is_none(), "{sql} must not take the writer");
+            assert!(txn.read_snapshot().is_some(), "{sql}: snapshot is held");
+        }
+        core.execute_sql_in_txn(&caller, &mut session, &mut txn, end)
+            .expect("end");
+        assert!(txn.write_txn().is_none());
+        assert!(txn.read_snapshot().is_none());
+    }
+}
+
 /// DDL はトランザクション内で `0A000` となり、writer を取る前に拒否される。
 #[test]
 fn ddl_in_explicit_txn_does_not_take_writer() {

@@ -11,6 +11,7 @@
 //! こと、T6 は待ちが最初の書き込み文で起きること、T7 は `LOCK TABLE` の `55P03`（2 セッション E2E）、
 //! T8・T9 は文数・持続時間の上限が writer の待機より前に `BEGIN` 起点で検査されること、
 //! T10 はロック待ちの時間も `BEGIN` 起点の持続時間に入ることを確認する。
+//! Issue #1933（SQL-38 ポインタ）: T11 は `BEGIN READ ONLY` が開いている間も別セッションの書き込みが待たないこと。
 //! `sql31_transaction.rs` と同じ流儀（実 `Storage`・チャネル同期・holder を先に解放して join）。
 
 use std::sync::Arc;
@@ -436,4 +437,44 @@ fn lock_wait_time_counts_toward_duration_from_begin() {
     assert_eq!(status, TransactionStatus::Failed);
     let _ = run(&engine, &mut session, &mut txn, "ROLLBACK");
     assert_eq!(count_rows(&engine), 0);
+}
+
+/// T11（Issue #1933）: READ ONLY Tx が開いている間、別セッションの autocommit 書き込みと
+/// 明示 Tx の書き込みは待たずに確定し、READ ONLY 側の COMMIT は読み取りの解放だけで成功する。
+#[test]
+fn read_only_txn_does_not_block_other_sessions_writes() {
+    let (engine, path) = new_core(100);
+    let _cleanup = CleanupGuard(path);
+
+    let mut session_a = SessionState::default();
+    let mut ro = engine.new_session_transaction();
+    run(&engine, &mut session_a, &mut ro, "BEGIN READ ONLY").expect("begin read only");
+    run(&engine, &mut session_a, &mut ro, SELECT_SQL).expect("read-only select");
+
+    let started = Instant::now();
+    engine
+        .execute_sql_in_session(
+            &ctx("tenant-b"),
+            &mut SessionState::default(),
+            &insert_sql(1, "op-t11-auto"),
+        )
+        .expect("autocommit write is not blocked");
+    let mut session_b = SessionState::default();
+    let mut txn_b = engine.new_session_transaction();
+    run(&engine, &mut session_b, &mut txn_b, "BEGIN").expect("begin b");
+    run(
+        &engine,
+        &mut session_b,
+        &mut txn_b,
+        &insert_sql(2, "op-t11-txn"),
+    )
+    .expect("write b");
+    run(&engine, &mut session_b, &mut txn_b, "COMMIT").expect("commit b");
+    let elapsed = started.elapsed();
+
+    let commit = run(&engine, &mut session_a, &mut ro, "COMMIT").expect("commit read only");
+    assert!(matches!(commit, engine::sql::SqlOutcome::Commit));
+    assert_eq!(ro.status(), TransactionStatus::Idle);
+    assert!(elapsed < Duration::from_secs(1), "elapsed={elapsed:?}");
+    assert_eq!(count_rows(&engine), 2);
 }

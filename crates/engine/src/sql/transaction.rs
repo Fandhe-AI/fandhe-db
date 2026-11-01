@@ -768,6 +768,12 @@ impl<'e> SessionTransaction<'e> {
                     // 書き込みを待たせず、書き込みロック待ち（`55P03`）も `BEGIN` では生じない。
                     // 書き込み時直列化検査（SQL-38・Issue #2404）のため、`G_s` を commit 記録の登録簿へ
                     // 登録する（登録順序は `Storage::open_registered_snapshot`）。
+                    // READ ONLY（Issue #1933・SQL-38）は writer を取れず `40001` の判定に到達しないため、
+                    // 登録を伴わない素の読み取りトランザクションで開く。他セッションの commit に
+                    // 足跡の計算・commit 記録の保持を強いない。
+                    TxnOrigin::Explicit if access_mode == TxnAccessMode::ReadOnly => {
+                        (None, open_read_snapshot(storage)?, None)
+                    }
                     TxnOrigin::Explicit => {
                         let (snap, reg) = storage
                             .open_registered_snapshot()
@@ -1182,11 +1188,14 @@ impl<'e> SessionTransaction<'e> {
     }
 
     /// 文の実行区間で読み取り集合を記録する区間を張る。明示トランザクションかつ writer 未取得の
-    /// ときだけ `Some`（SQL-38・Issue #2404）。暗黙トランザクション・取得後・`Active` 以外は `None`。
+    /// ときだけ `Some`（SQL-38・Issue #2404）。READ ONLY は writer を取れず `40001` 判定に到達しないため
+    /// 記録しない（Issue #1933）。暗黙トランザクション・取得後・`Active` 以外は `None`。
     pub(crate) fn read_set_scope(&self) -> Option<crate::sql::read_set::ReadSetScope> {
         match &self.state {
             TxnState::Active(active)
-                if active.origin == TxnOrigin::Explicit && active.writer.is_none() =>
+                if active.origin == TxnOrigin::Explicit
+                    && active.access_mode == TxnAccessMode::ReadWrite
+                    && active.writer.is_none() =>
             {
                 Some(crate::sql::read_set::ReadSetScope::enter())
             }
