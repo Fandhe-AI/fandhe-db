@@ -308,7 +308,7 @@ pub(crate) fn apply_in_txn(
                         member.def.name.clone(),
                     ));
                 }
-                changed += grant_one(w, tenant, req, role, member, grantor)?;
+                changed += grant_one(w, tenant, req, role, member, grantor, &mut steps)?;
             } else {
                 changed += revoke_one(w, tenant, req, role, member, grantor, &mut steps)?;
             }
@@ -324,6 +324,7 @@ fn grant_one(
     role: &Resolved,
     member: &Resolved,
     grantor: u64,
+    steps: &mut usize,
 ) -> Result<usize> {
     match get_membership(w, tenant, member.id, role.id)? {
         None => {
@@ -360,7 +361,13 @@ fn grant_one(
                 return Ok(0);
             }
             put_membership_in_txn(w, tenant, member.id, role.id, updated)?;
-            Ok(1)
+            let mut changed = 1usize;
+            // ADMIN が真から偽へ落ちる更新は `REVOKE ADMIN OPTION` と同じ依存検査を通す（RESTRICT 契約。
+            // 依存があれば `2BP01` で txn 全体が巻き戻る）。
+            if existing.admin && !updated.admin {
+                resolve_dependents(w, tenant, member.id, role.id, false, steps, &mut changed)?;
+            }
+            Ok(changed)
         }
     }
 }

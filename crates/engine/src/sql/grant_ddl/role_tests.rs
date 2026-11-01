@@ -248,6 +248,27 @@ fn revoke_admin_restrict_and_cascade() {
     assert!(mem(&f, n, r).is_none());
 }
 
+/// `GRANT ... WITH ADMIN FALSE` による ADMIN の取り消しも `REVOKE ADMIN OPTION` と同じ依存検査（2BP01）を通る。
+#[test]
+fn grant_with_admin_false_respects_dependents() {
+    let f = fx("grant_admin_false");
+    let me = role(&f, "me");
+    let r = role(&f, "r");
+    let x = role(&f, "x");
+    let m = role(&f, "m");
+    let owner = session(me, true);
+    run(&f, &owner, "GRANT r TO x WITH ADMIN TRUE").expect("x admin");
+    run(&f, &session(x, false), "GRANT r TO m WITH ADMIN TRUE").expect("m admin by x");
+    let e = run(&f, &owner, "GRANT r TO x WITH ADMIN FALSE").expect_err("restrict");
+    assert_eq!(e.wire_code(), "2BP01");
+    assert!(mem(&f, x, r).expect("kept").admin);
+    assert!(mem(&f, m, r).is_some());
+    // 依存が無ければ ADMIN を落とせる。
+    run(&f, &owner, "REVOKE r FROM m").expect("drop dependent");
+    run(&f, &owner, "GRANT r TO x WITH ADMIN FALSE").expect("no dependents");
+    assert!(!mem(&f, x, r).expect("x").admin);
+}
+
 #[test]
 fn failed_statement_has_no_side_effects() {
     let f = fx("rm_atomic");
