@@ -1000,6 +1000,10 @@ pub(crate) fn map_outcome(outcome: SqlOutcome) -> OutcomeResponse {
         SqlOutcome::DropPolicy(_) => OutcomeResponse::Command {
             tag: "DROP POLICY".to_string(),
         },
+        // SQL-40（Issue #1965）: `GRANT`／`REVOKE` も件数を持たない固定タグ（警告は wire へ出さない）。
+        SqlOutcome::GrantRevoke(o) => OutcomeResponse::Command {
+            tag: if o.is_revoke() { "REVOKE" } else { "GRANT" }.to_string(),
+        },
         // SQL-39（Issue #1962）: ロール DDL も件数を持たない固定タグ（`CREATE USER` も PostgreSQL と同じ
         // `CREATE ROLE`）。
         SqlOutcome::CreateRole(_) => OutcomeResponse::Command {

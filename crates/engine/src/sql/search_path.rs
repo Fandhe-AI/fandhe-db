@@ -399,6 +399,14 @@ fn is_ddl_head(tokens: &[Token]) -> bool {
     )
 }
 
+/// 文が `GRANT`／`REVOKE` か（[`check_unqualified_refs`] が現在ロール未束縛のセッションで飛ばす）。
+fn is_grant_head(tokens: &[Token]) -> bool {
+    matches!(
+        tokens.first(),
+        Some(Token::Ident(w)) if w.eq_ignore_ascii_case("GRANT") || w.eq_ignore_ascii_case("REVOKE")
+    )
+}
+
 /// `public` が見えない `search_path` のセッションで、未修飾のテーブル参照が一時表以外なら `42P01` に
 /// する参照ゲート。実効 path に `public` が含まれる（既定の）セッションは何もせず、トークン走査もしない。
 ///
@@ -414,6 +422,13 @@ pub(crate) fn check_unqualified_refs(
         return Ok(());
     }
     if is_ddl_head(tokens) && !session.ddl_allowed() {
+        return Ok(());
+    }
+    // `GRANT`／`REVOKE`（SQL-40・Issue #1965）は現在ロールが束縛されていないセッションが `42501` を受け取る
+    // 契約（`sql::grant_ddl::require_grant_principal`。カタログ照会・名前解決より前）を保つため、
+    // その場合は参照ゲートを飛ばす。束縛済みのセッションでは未修飾の表名は他の文と同じく `42P01` になる
+    // （カタログを引かない判定のため存在オラクルにならない）。
+    if is_grant_head(tokens) && session.current_role_id().is_none() {
         return Ok(());
     }
     // `SET`／`RESET`／`SHOW` は関係を参照しない。設定値（例 `truncate`）を文種と誤解釈して
@@ -819,6 +834,32 @@ mod tests {
             marked_names("WITH \"true\" AS (SELECT 1) SELECT * FROM \"true\", u"),
             vec!["u"]
         );
+    }
+
+    /// SQL-40・Issue #1965: `GRANT`／`REVOKE` の参照ゲートは現在ロール未束縛のセッションでは飛ばす
+    /// （`42501` が `42P01` より先）。束縛済みなら表名だけを対象にし、ロール名は走査しない。
+    #[test]
+    fn grant_revoke_gate_is_skipped_only_for_unbound_sessions() {
+        let hidden = || {
+            let mut s = SessionState::default();
+            s.set_search_path(
+                SearchPath::new(vec![SearchPathElem::from_ident("elsewhere").unwrap()]).unwrap(),
+            )
+            .expect("path");
+            s
+        };
+        let toks = tokenize("GRANT SELECT ON t TO alice").expect("lex");
+        let unbound = hidden();
+        assert!(check_unqualified_refs(&unbound, &toks, &[]).is_ok());
+        let mut bound = hidden();
+        bound.bind_role_ids(1, 1);
+        let err = check_unqualified_refs(&bound, &toks, &[]).expect_err("hidden public");
+        assert_eq!(err.wire_code(), "42P01");
+        assert_eq!(
+            names("REVOKE SELECT (a) ON t, u FROM alice, bob"),
+            vec!["t", "u"]
+        );
+        assert_eq!(names("GRANT r1 TO r2"), Vec::<String>::new());
     }
 
     #[test]

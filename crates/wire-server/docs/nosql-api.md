@@ -1116,6 +1116,7 @@ Date: <IMF-fixdate>
 | `wire_code` | `code` | HTTP ステータス | 理由句 | NoSQL 表層での主な発生源 |
 | --- | --- | --- | --- | --- |
 | `08P01` | `PROTOCOL_VIOLATION` | 400 | Bad Request | 要求行・ヘッダ形状違反、未知ターゲットへのアクセス |
+| `0LP01` | `INVALID_GRANT_OPERATION` | 400 | Bad Request | NoSQL 表層の実要求からは到達不能（`GRANT`／`REVOKE` は SQL 表層専用。SQL-40） |
 | `20000` | `CASE_NOT_FOUND` | 400 | Bad Request | PL/pgSQL の `ELSE` の無い `CASE` 文が不一致（SQL 表層の PL/pgSQL 専用。NoSQL の `op` 語彙からは到達しない）。Issue #2225・SQL-68 |
 | `21000` | `CARDINALITY_VIOLATION` | 400 | Bad Request | NoSQL 表層の実要求からは到達不能（スカラーサブクエリは SQL 表層専用。後述） |
 | `22000` | `INVALID_INPUT` | 400 | Bad Request | `op` 別スキーマ検証での値の型・形状不正 |

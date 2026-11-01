@@ -193,6 +193,9 @@ pub const fn http_status(class: ErrorClass) -> u16 {
         // SQL 構文エラー系と同じ 400 とする。
         | ErrorClass::DependentObjectsStillExist
         | ErrorClass::WrongObjectType
+        // SQL-40（Issue #1965）: `GRANT`／`REVOKE` の不正な操作（`0LP01`）。NoSQL 表層に GRANT 相当の op は無く
+        // 構造的に到達しないが、網羅性のためクライアント入力起因の拒否として 400 とする。
+        | ErrorClass::InvalidGrantOperation
         // トランザクション状態エラー（SQL-31・TASK-221）は NoSQL 表層の `op` 語彙に
         // トランザクション制御が無く構造的に到達しないが、`ErrorClass` の網羅性の
         // ため他の `42601`／`22000` 系と同じ 400 へ寄せる。
@@ -253,7 +256,7 @@ mod tests {
 
     /// 期待表を明示的に列挙し、`ErrorClass::ALL` との突き合わせで非 vacuous に検証する。
     /// `match` にアームを足したが期待表の更新を忘れた、という乖離を (a)(b) が検出する。
-    const EXPECTED: [(ErrorClass, u16); 99] = [
+    const EXPECTED: [(ErrorClass, u16); 100] = [
         (ErrorClass::InvalidInput, 400),
         (ErrorClass::StringDataRightTruncation, 400),
         (ErrorClass::AuthInvalid, 401),
@@ -308,6 +311,7 @@ mod tests {
         (ErrorClass::FunctionExecutedNoReturnStatement, 400),
         (ErrorClass::DependentObjectsStillExist, 400),
         (ErrorClass::WrongObjectType, 400),
+        (ErrorClass::InvalidGrantOperation, 400),
         (ErrorClass::NotNullViolation, 400),
         (ErrorClass::UndefinedObject, 400),
         (ErrorClass::UndefinedColumn, 400),
