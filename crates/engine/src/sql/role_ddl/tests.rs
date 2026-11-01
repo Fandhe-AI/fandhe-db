@@ -22,7 +22,7 @@ fn open(label: &str) -> (CleanupGuard, Storage) {
 
 fn create(s: &Storage, tenant: &str, sql: &str) -> Result<CreateRoleOutcome, SqlSurfaceError> {
     let stmt = validate_create_role_tokens(&tokenize(sql).expect("lex"))?;
-    execute_create_role(s, tenant, &stmt)
+    execute_create_role(s, tenant, &SessionState::default(), &stmt)
 }
 
 fn drop_(s: &Storage, tenant: &str, sql: &str) -> Result<DropRoleOutcome, SqlSurfaceError> {
@@ -211,6 +211,7 @@ fn drop_removes_memberships_in_both_directions_only_in_its_tenant() {
         admin: false,
         inherit: true,
         set: true,
+        grantor_id: None,
     };
     let txn = s.begin_write_txn().expect("begin");
     // a は b のメンバー、c は a のメンバー、b と c は別の関係（無関係に残る）。

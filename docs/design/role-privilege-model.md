@@ -320,7 +320,7 @@ PostgreSQL 17 の公開挙動と本 ADR の D5・D8・D9・D10 に従い、spec 
 | J2 | 現在ロール ID の格納（`current_role_id`・`session_role_id`・`bind_role_ids`）は、並行する PR が同名・同意味で定義する予定のものと同じ形で最小限だけ追加した | マージ順によらず競合を重複の除去に留める。束縛は認証層が 1 回だけ行う契約（#1971）で、SQL からは書き換えられない |
 | J3 | 束縛ロールは書き込みと同じ txn で実在を確かめ、不在なら `42501` | DROP 済みの古い束縛で付与しない |
 | J4 | 所有者の機構（#2236）までの代替として、DDL 権限ゲートを通過した主体を「所有者相当」（対象の全権限を GRANT OPTION 付きで持つ）とみなす。記録される付与者は常に現在ロール ID | ポリシー DDL と同じ代替。別の所有者相当の主体が付けた付与は REVOKE できない（所有者の概念が入るまでの既知の制約）。所有者相当のロール自身が明示の GRANT OPTION を持つ場合、CASCADE がその主体の「所有者として付けた付与」まで依存とみなして取り消す（RESTRICT は拒否側に倒れる） |
-| J5 | 継承（メンバーシップ経由の権限）は見ない。付与者本人の直接の行と PUBLIC の行（「何らかの権限を持つか」の判定だけ）で判定する | 継承は #2232 の担当 |
+| J5 | （#2232 で見直し。§10 の M6）継承（INHERIT の閉包）を見る。付与者は最良のロールを選ぶ | 当初は継承を #2232 の担当として見なかった |
 | J6 | 表と列で許す権限は `PrivilegeObject::allowed_privileges` と一致させる。対象に許されない権限（`USAGE ON TABLE` 等）と PUBLIC への GRANT OPTION は `0LP01`（`ErrorClass::InvalidGrantOperation` を追加。HTTP 射影は 400・NoSQL 表層からは到達不能） | PostgreSQL 17 と同じ SQLSTATE |
 | J7 | 付与先ロールは自テナントのカタログだけで引く。不在と「他テナントにだけ在る」は同じ `42704`・同じ文言形式（`SqlSurfaceError::UndefinedRole`。利用者が書いた名前だけを含む） | D10 |
 | J8 | 範囲外の形は構文段で固定の `0A000`: `ON SCHEMA`・`ON SEQUENCE`・`ON FUNCTION`・`ON DATABASE` などの対象種別・`ALL ... IN SCHEMA`（#2234・#2235）、`GRANTED BY`、`ALTER DEFAULT PRIVILEGES`（#2237。汎用 `ALTER` より前で分岐） | 状態に依存しない拒否なので存在オラクルにならない |
@@ -368,7 +368,7 @@ Issue #1962 は決定 D1・D2 のうち、`CREATE ROLE`／`CREATE USER`／`DROP 
 | `CREATE ROLE`／`CREATE USER <名> [WITH] LOGIN/NOLOGIN, INHERIT/NOINHERIT, CREATEROLE/NOCREATEROLE, CREATEDB/NOCREATEDB, [ENCRYPTED] PASSWORD '...'/NULL` | 受理。`CREATE USER` の既定は `LOGIN`。コマンドタグは `CREATE ROLE` |
 | `NOSUPERUSER`・`NOBYPASSRLS`・`NOREPLICATION` | 受理（既定どおり） |
 | `SUPERUSER`・`BYPASSRLS`・`REPLICATION` | `42501`（テナント境界を越える属性。`BYPASSRLS` は #2278 段 2 で解禁） |
-| `UNENCRYPTED PASSWORD`・`IN ROLE`・`ROLE`・`ADMIN`・`VALID UNTIL`・`CONNECTION LIMIT` | `0A000`（#2232・#2233 の担当） |
+| `UNENCRYPTED PASSWORD`・`VALID UNTIL`・`CONNECTION LIMIT`・`SYSID` | `0A000`（#2233 の担当。`IN ROLE`・`ROLE`・`ADMIN` は #2232 で受理。§10） |
 | 重複・矛盾するオプション、未知語、`$n`、修飾名 | `42601` |
 | `pg_` 接頭辞・`public`・`none` | `42939` |
 | `DROP ROLE`／`DROP USER [IF EXISTS] a[, b]...` | 受理。全件を 1 つの write txn で処理し、途中で失敗したら全件取り消す |
@@ -390,3 +390,36 @@ Issue #1962 は決定 D1・D2 のうち、`CREATE ROLE`／`CREATE USER`／`DROP 
 ### 対象外
 
 `CREATEROLE`／`ADMIN OPTION` による判定（#1966・#1971）、ログイン名対応表への登録（#2233）、`VALID UNTIL`・`CONNECTION LIMIT`（#2233）、`IN ROLE`・`ROLE`・`ADMIN`（#2232）、`ALTER ROLE`・`SET ROLE`（#1963）、`BYPASSRLS` の属性ビット（#2278 段 2）、所有者による依存検査（#2236）、自分のセッションのロールを DROP したときの `55006`（#1971 の後）、`CREATE GROUP`／`DROP GROUP`。
+
+## 10. Issue #2232 実装記録（ロールのメンバーシップと継承）
+
+Issue #2232 は SQL-39 (7) のうち、メンバーシップの付与・取り消し・循環の拒否・INHERIT による継承・付与権限の継承・`pg_has_role` 相当の評価関数を実装した。グラフ探索は `catalog/role/graph.rs` の `effective_roles_in_txn` に 1 本化し（D8: 判定系を 2 つ作らない）、`SET ROLE`（#1963）・共通ゲート（#1966）・ポリシーの `TO` ロール（#2278 段 2）はこの関数群だけを呼ぶ。付与・取り消しの適用は `catalog/role/membership_apply.rs`（`Storage::apply_membership_changes`）、SQL の写像は `sql/grant_ddl.rs`、`CREATE ROLE` の句は `sql/allowlist/role.rs`・`sql/role_ddl.rs`。
+
+### 判断の記録
+
+- **M1 メンバーシップ blob を版 2 にして付与者を持たせた**: 版 2 は `[2, bits, grantor_id(u64 LE)]`。付与者なし（版 1・crate 内の生の書き込み）は版 1 のまま保存し、読み出しは両方を受ける。付与者 0・未知の版・予約ビット・切断・末尾の余りは `CorruptSchema`。キーは `(tenant, member, granted)` のままで、組ごとに 1 行。
+- **M2 付与・取り消しの権限は ADMIN**: 現在ロールから INHERIT の辺だけを辿った閉包（自分を含む）に、対象ロールへの直接の行で ADMIN が真のロールがあれば許可し、最も近いもの（同点はホップ順・ID 昇順）を付与者に記録する。ロールは自分自身の ADMIN を持たない。DDL 権限ゲートを通過した主体は所有者相当（#2236 までの代替）として常に許可し、付与者を問わず取り消せる。CREATEROLE 属性だけでは許可しない（#1966・#1971 が引き継ぐ）。
+- **判定順（計画からの変更）**: 実行ロールの現存 → 付与するロールの解決 → 付与先の解決（不在と他テナントのロールは同じ `42704`）→ ロール単位の ADMIN 判定（`42501`）→ 組ごとの循環検査（`0LP01`）→ 書き込み。計画は循環検査を ADMIN 判定より先としたが、PostgreSQL の `AddRoleMems` に合わせ権限判定を先にして、権限の無い主体にグラフの形を見せない側へ倒した。
+- **M3 循環**: オプションのビットを問わず全辺を辿る。1 文の複数の組は同じ write txn で前の組の書き込みを反映して検査する。メッセージは `0LP01` の固定接頭辞つきで、利用者が書いた名前だけを含む。
+- **M4 オプション**: 新規の既定は ADMIN 偽・INHERIT は付与時点の付与先ロールの属性・SET 真（後から属性を変えても遡らない）。既存行は `WITH` で明示したビットだけ更新し、明示が無ければ何もしない。REVOKE の `OPTION FOR` はそのビットだけを落とし、無指定は行を削除する。行が無い・付与者が一致しない取り消しは警告相当で何もしない。ADMIN を失った付与者が付けた行（付与者 = その主体・対象ロールが同じ）は、RESTRICT で `2BP01`、CASCADE で連鎖削除する（主体が別経路で ADMIN を保てば残す）。連鎖は 10,000 件で `54000`。
+- **M6 ACL の付与権限に継承を入れた（J5 の見直し）**: `catalog/privilege/apply.rs` は付与者の INHERIT 閉包の行と PUBLIC の和で「何らかの権限」を判定し、記録・取り消しの付与者を PostgreSQL の `select_best_grantor` と同じ方法（必要な GRANT OPTION をすべて持つ最も近いロール、無ければ最も多く持つロール）で選ぶ。閉包は書き込みと同じ txn のスナップショットで計算する。所有者相当は従来どおり。
+- **M9 `CREATE ROLE ... IN ROLE a / ROLE b / ADMIN c`**: 受理し（`IN GROUP`・`USER` も同義。各句の重複は `42601`）、ロール作成と同じ write txn で付与する（`Storage::create_role_with_memberships`）。1 つでも失敗すればロールごと commit しない。句があるとき現在ロールが未束縛なら `42501`。
+- **`pg_has_role` 相当**: `graph::has_role_privilege`（ID 解決済み）と `Storage::has_role_privilege_by_name`。権限文字列はカンマ区切り・大文字小文字無視で、`MEMBER`・`USAGE`・`SET`・各 `WITH ADMIN OPTION`／`WITH GRANT OPTION` の許可リストを OR で評価し、未知の語は全体を先に検証して拒否する（`InvalidPrivilege`。SQL へ結線する際に `22023` へ写す）。
+- **wire のタグ**: ロール形は PostgreSQL と同じ `GRANT ROLE`／`REVOKE ROLE`（`GrantRevokeOutcome::is_role` を追加）。
+- **DROP ROLE**: 付与者として参照されている行は付与者なしへ付け替える（PostgreSQL は bootstrap superuser へ付け替える）。付与者なしの行は所有者相当だけが取り消せる。
+
+### PostgreSQL 17 との逸脱（記録）
+
+- 付与者ごとに別の行を持つ PostgreSQL 16 以降の形はキーの制約上再現できない。別の付与者が付けた行への重複の付与は、非所有者に限り固定文言の `0A000`。
+- 所有者相当の主体は付与者を問わず取り消せる（PostgreSQL のスーパーユーザーの `GRANTED BY` の代替）。
+- `GRANT <ロール> TO PUBLIC` は `42704`（`role "public" does not exist` 相当。実機での確認は未実施）。
+- ADMIN の判定で、ADMIN が真の行そのものに INHERIT が必要かどうかは PostgreSQL の実機で未確認のため、行そのものは INHERIT を問わない側（計画どおり）にした。
+- 循環の `0LP01` のメッセージは `invalid grant operation:` の接頭辞つき。
+
+### 対象外（後続）
+
+- `current_user`・`current_role`・`session_user`・`user` と SQL の `pg_has_role(...)` の結線（`core.rs` の FROM なし SELECT のスコープ・Describe の型公告。判定関数と名前解決は本 Issue で用意済み）。
+- `SET ROLE`／`RESET ROLE`・`ALTER ROLE [NO]INHERIT`（#1963。`can_set_role` を呼ぶ）。
+- 共通ゲートでの継承の利用（#1966〜#1969）、ポリシーの `TO` ロール（#2278 段 2。`has_privs_of` を呼ぶ）、認証主体の束縛（#1971）、所有者・`GRANTED BY`（#2236）。
+- INHERIT・ADMIN の喪失による ADMIN の到達性の再評価（依存の解決は ADMIN の根拠である直接の行に限る）。
+- PostgreSQL 16 以降の付与者ごとの複数行、CREATEROLE の作成者への暗黙の ADMIN。

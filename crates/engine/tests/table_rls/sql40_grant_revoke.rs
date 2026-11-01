@@ -210,3 +210,48 @@ fn column_names_that_look_like_keywords_do_not_break_relation_scan() {
         );
     }
 }
+
+/// Issue #2232: ロール形の GRANT／REVOKE を公開 API で通す。ロールは SQL の `CREATE ROLE` で作る（ID は 1 から順に
+/// 採番される）。タグ用の `is_role`・循環 `0LP01`・存在オラクルの防止（不在と他テナントのロールが同じ `42704`）・
+/// `CREATE ROLE ... IN ROLE` を確かめる。
+#[test]
+fn role_membership_grant_revoke_through_the_session_api() {
+    let (_g, core) = open_fixture("sql40_role_membership");
+    let mut s = SessionState::default();
+    s.allow_ddl();
+    for name in ["me", "r", "m"] {
+        run(&core, "t1", &mut s, &format!("CREATE ROLE {name}")).expect("create role");
+    }
+    run(&core, "t2", &mut s, "CREATE ROLE only_t2").expect("t2 role");
+    // 現在ロールは最初に作った `me`（ID 1）。DDL 許可済みなので所有者相当。
+    s.bind_role_ids(1, 1);
+    match run(&core, "t1", &mut s, "GRANT r TO m WITH ADMIN OPTION").expect("grant") {
+        SqlOutcome::GrantRevoke(o) => assert!(o.is_role() && !o.is_revoke()),
+        other => panic!("unexpected {other:?}"),
+    }
+    assert_eq!(
+        err_of(&core, "t1", &mut s, "GRANT m TO r").wire_code(),
+        "0LP01"
+    );
+    assert_eq!(
+        err_of(&core, "t1", &mut s, "GRANT r TO r").wire_code(),
+        "0LP01"
+    );
+    let missing = err_of(&core, "t1", &mut s, "GRANT r TO nobody");
+    let foreign = err_of(&core, "t1", &mut s, "GRANT r TO only_t2");
+    assert_eq!(missing.wire_code(), "42704");
+    assert_eq!(foreign.wire_code(), "42704");
+    assert_eq!(
+        missing.client_message().replace("nobody", "X"),
+        foreign.client_message().replace("only_t2", "X")
+    );
+    match run(&core, "t1", &mut s, "REVOKE r FROM m").expect("revoke") {
+        SqlOutcome::GrantRevoke(o) => assert!(o.is_role() && o.is_revoke()),
+        other => panic!("unexpected {other:?}"),
+    }
+    run(&core, "t1", &mut s, "CREATE ROLE n IN ROLE r ROLE m").expect("create with clauses");
+    assert_eq!(
+        err_of(&core, "t1", &mut s, "CREATE ROLE p IN ROLE nobody").wire_code(),
+        "42704"
+    );
+}

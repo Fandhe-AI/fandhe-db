@@ -146,7 +146,10 @@ fn rejected_forms_map_to_documented_sqlstates() {
         ("CREATE ROLE r SUPERUSER", "42501"),
         ("CREATE ROLE r BYPASSRLS", "42501"),
         ("CREATE ROLE r REPLICATION", "42501"),
-        ("CREATE ROLE r IN ROLE other", "0A000"),
+        ("CREATE ROLE r SYSID 5", "0A000"),
+        // Issue #2232: メンバーシップ句は構文として受理され、現在ロールが未束縛なら対象の有無を問わず `42501`。
+        ("CREATE ROLE r IN ROLE other", "42501"),
+        ("CREATE ROLE r IN ROLE a IN ROLE b", "42601"),
         ("CREATE ROLE r VALID UNTIL '2030-01-01'", "0A000"),
         ("CREATE ROLE r CONNECTION LIMIT 3", "0A000"),
         ("CREATE ROLE r UNENCRYPTED PASSWORD 'x'", "0A000"),

@@ -9,6 +9,9 @@
 
 ### Added
 
+- ロールのメンバーシップと継承を追加した（Issue #2232・SQL-39 (7)・SQL-40）。`GRANT <ロール> TO <ロール> [WITH ADMIN|INHERIT|SET ...]`・`REVOKE [<オプション> OPTION FOR] <ロール> FROM <ロール> [CASCADE]` を実行し（循環 `0LP01`・ADMIN なし `42501`・依存 `2BP01`）、`CREATE ROLE ... IN ROLE／ROLE／ADMIN` を受理する。付与権限（`GRANT <権限> ON ...`）は付与者が INHERIT で継承するロールの GRANT OPTION も使え、記録される付与者は最良のロールになる。メンバーシップ blob は版 2（付与者つき）になり、版 1 は付与者なしとして読める。
+  公開 `GrantRevokeOutcome` に `is_role()` を追加した。wire はロール形に `GRANT ROLE`／`REVOKE ROLE` のコマンドタグを返す（権限形は `GRANT`／`REVOKE` のまま）。
+  挙動変更: ロール形 GRANT／REVOKE と `CREATE ROLE ... IN ROLE／ROLE／ADMIN` は `0A000` ではなく実行される（現在ロールが未束縛なら `42501`）。
 - `row_security`（`SET`／`RESET`／`SHOW`・StartupMessage）とポリシーの適用判定（`BYPASSRLS`・所有者・対象ロール）を追加した（Issue #2278・RLS-12・RLS-13・SQL-39）。RLS 有効な表への読み取り・書き込み・`COPY` は `row_security = off` のとき行を扱う前に `42501`（`query would be affected by row-level security policy for table "..."`。表名は自テナントのみ）で拒否する。
   BREAKING CHANGE: 公開 enum `SqlSurfaceError`・`TenantWriteError` に `RowSecurityOffRejected` を追加した（`wire_code` は既存の `42501` のまま）。網羅 `match` する外部コードは腕を足す。
 - `BEGIN READ ONLY` の Tx を開始できるようにし、書き込み系の文（DML・DDL・`COPY FROM`・ロック・`USING OPERATION_ID` 付き）を `25006`（`read_only_sql_transaction`）で拒否して Tx を `Failed` にする（Issue #1934・SQL-38 (3)・ERR-6）。判定は許可リスト方式で、writer・台帳・採番・カタログへ触れる前に拒否する。HTTP は 403 に射影する。

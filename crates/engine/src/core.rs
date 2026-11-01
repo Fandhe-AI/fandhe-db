@@ -7790,6 +7790,7 @@ impl EngineCore {
                 let outcome = crate::sql::role_ddl::execute_create_role(
                     &self.storage,
                     ctx.tenant_id(),
+                    session,
                     stmt,
                 )?;
                 Ok(crate::sql::SqlOutcome::CreateRole(outcome))
