@@ -531,13 +531,13 @@ const ALLOWLIST: &[(&str, u32)] = &[
     // `drop_schema_cascade` の `commit_and_finish`（615）は、表の削除を `drop_tables_collecting_sequences`
     // （各表の `bump_table_generation_in_txn` を同一 txn で呼ぶ）へ委譲しており、SCHEMA 行の削除自体は
     // 世代を持たないため、直前に bump を直接呼ばない（同じ txn・同じ commit で世代は進む）。
-    ("catalog/namespace.rs", 517),
-    ("catalog/namespace.rs", 555),
-    ("catalog/namespace.rs", 650),
-    ("catalog/namespace.rs", 694),
+    ("catalog/namespace.rs", 543),
+    ("catalog/namespace.rs", 583),
+    ("catalog/namespace.rs", 680),
+    ("catalog/namespace.rs", 724),
     // Issue #1716: `rename_schema` も `schemas` の 1 行付け替えだけで、行ストア・世代を変えない。
-    ("catalog/namespace.rs", 950),
-    ("catalog/namespace.rs", 1066),
+    ("catalog/namespace.rs", 980),
+    ("catalog/namespace.rs", 1096),
     // Issue #1645（所有 SEQUENCE の定義 blob 版 3・`commit_and_finish` 経路の追加）と base 取り込みで行が移動したため
     // 全件を現行行へ追随（commit 対象は SEQUENCE 定義・状態表のみで同じ理由により対象外）。
     // Issue #1694（SERIAL の暗黙 SEQUENCE・所有 SEQUENCE の削除と追従）の追加で行番号が移動したための追随
@@ -557,6 +557,8 @@ const ALLOWLIST: &[(&str, u32)] = &[
     // Issue #1962 の `sql::role_ddl` の crate 内テスト補助（`commit` ヘルパー。専用表だけを書き表世代の対象外）。
     ("sql/role_ddl/tests.rs", 39),
     ("catalog/privilege/tests.rs", 21),
+    // Issue #2234: SCHEMA 単位の ACL の単体テストの `write` ヘルパ（テスト専用の commit）。
+    ("catalog/privilege/schema/tests.rs", 21),
     ("catalog/sequence.rs", 1386),
     ("catalog/sequence.rs", 1399),
     ("catalog/sequence.rs", 1440),

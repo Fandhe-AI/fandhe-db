@@ -67,7 +67,8 @@ mod grant;
 pub use grant::ValidatedGrantRevoke;
 pub(crate) use grant::{
     is_alter_default_privileges_statement, is_grant_statement, is_revoke_statement,
-    reject_alter_default_privileges, validate_grant_revoke_tokens, GrantTarget, Grantee,
+    reject_alter_default_privileges, validate_grant_revoke_tokens, GrantScope, GrantTarget,
+    Grantee,
 };
 
 /// エラーメッセージへ含める入力断片の長さ上限。untrusted 入力をそのまま無加工で

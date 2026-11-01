@@ -73,6 +73,11 @@ fn wire_grant_revoke_without_bound_role_is_42501_for_every_target() {
             "REVOKE SELECT ON docs FROM bob",
             "REVOKE ALL ON nosuch FROM PUBLIC CASCADE",
             "GRANT r1 TO r2",
+            // SCHEMA 形（Issue #2234）も未束縛なら対象の有無を問わず同じ `42501`。
+            "GRANT USAGE ON SCHEMA s TO bob",
+            "GRANT CREATE ON SCHEMA nosuch TO PUBLIC",
+            "REVOKE USAGE ON SCHEMA s FROM bob",
+            "GRANT SELECT ON ALL TABLES IN SCHEMA s TO bob",
         ] {
             send_simple_query(&mut stream, sql);
             expect_error_response_with_sqlstate(&mut stream, "42501");
@@ -93,6 +98,8 @@ fn wire_grant_revoke_static_rejections() {
         ("GRANT USAGE ON TABLE docs TO bob", "0LP01"),
         ("GRANT SELECT ON docs TO PUBLIC WITH GRANT OPTION", "0LP01"),
         ("GRANT USAGE ON SCHEMA public TO bob", "0A000"),
+        ("GRANT SELECT ON SCHEMA s TO bob", "0LP01"),
+        ("GRANT USAGE ON SCHEMA s", "42601"),
         ("GRANT SELECT ON docs TO bob GRANTED BY carol", "0A000"),
         (
             "ALTER DEFAULT PRIVILEGES GRANT SELECT ON TABLES TO bob",
