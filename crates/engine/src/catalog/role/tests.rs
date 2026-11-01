@@ -308,6 +308,23 @@ fn missing_id_counter_with_existing_roles_is_rejected() {
     assert!(s.get_role("t2", "bob").expect("get").is_none());
 }
 
+/// 保存済みカウンタが 0・既存 ID 以下へ破損していれば、別ロールへ同じ ID を払い出さず拒否する。
+#[test]
+fn rolled_back_id_counter_is_rejected() {
+    for bad in [0u64, 1] {
+        let (_g, _p, s) = open("role-ids-counter-rolled-back");
+        assert_eq!(s.create_role("t1", &rdef("alice")).expect("first"), 1);
+        write(&s, |t| {
+            t.open_table(ROLE_ID_COUNTER_TABLE)?
+                .insert(ROLE_ID_COUNTER_KEY, bad)?;
+            Ok(())
+        })
+        .expect("corrupt counter");
+        assert!(is_fixed_corrupt(s.create_role("t2", &rdef("bob"))));
+        assert!(s.get_role("t2", "bob").expect("get").is_none());
+    }
+}
+
 #[test]
 fn per_tenant_limits_are_enforced() {
     let (_g, _p, s) = open("role-limits");

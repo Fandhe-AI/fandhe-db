@@ -505,7 +505,23 @@ fn allocate_role_id_in_txn(write_txn: &redb::WriteTransaction) -> Result<u64> {
     let mut counter = write_txn.open_table(ROLE_ID_COUNTER_TABLE)?;
     let stored = counter.get(ROLE_ID_COUNTER_KEY)?.map(|v| v.value());
     let current = match stored {
-        Some(v) => v,
+        Some(v) => {
+            // 保存済みカウンタが 0、または既存ロールの最大 ID 以下なら巻き戻っている。書き込む前に
+            // fail-closed で拒否する（設計 D1「ID は再利用しない」）。全行を保持せず順に走査する。
+            if v == 0 {
+                return Err(corrupt());
+            }
+            let roles = write_txn.open_table(ROLES_TABLE)?;
+            for entry in roles.iter()? {
+                let (k, val) = entry?;
+                let (_, name) = k.value();
+                let existing = decode_role_def(name, val.value())?;
+                if existing.id >= v {
+                    return Err(corrupt());
+                }
+            }
+            v
+        }
         None => {
             // カウンタ欠損は「未使用カタログ（全テナントでロール行 0 件）」のときだけ 1 から始める。
             // 既存ロールがあるのに欠損していれば ID 重複（ACL・メンバーシップの別名ロール化）を
@@ -545,7 +561,7 @@ fn create_role_limited(
     if get_role_in_txn(write_txn, tenant, &def.name)?.is_some() {
         return Err(invalid(ROLE_ALREADY_EXISTS_MESSAGE));
     }
-    if list_roles_limited(write_txn, tenant, usize::MAX)?.len() >= max_roles {
+    if list_roles_limited(write_txn, tenant, max_roles)?.len() >= max_roles {
         return Err(CatalogError::ViewLimitExceeded(
             ROLE_LIMIT_MESSAGE.to_string(),
         ));
@@ -594,7 +610,7 @@ pub(crate) fn put_membership_in_txn(
     check_membership_ids(member_id, granted_role_id)?;
     let is_new = get_membership(write_txn, tenant, member_id, granted_role_id)?.is_none();
     if is_new
-        && list_memberships_limited(write_txn, tenant, member_id, usize::MAX)?.len()
+        && list_memberships_limited(write_txn, tenant, member_id, MAX_ROLES_PER_TENANT)?.len()
             >= MAX_ROLES_PER_TENANT
     {
         return Err(CatalogError::ViewLimitExceeded(
