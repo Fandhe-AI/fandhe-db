@@ -8734,6 +8734,47 @@ impl EngineCore {
         self.describe_parsed_in_session_snap(session, parsed, false, &[], &self.result_limits, snap)
     }
 
+    /// [`PreparedSql::dummy_parsed`] の構築（Parse 時のダミー値置換 → 構造検証 parse）を、`BEGIN` 時点の
+    /// スナップショットのカタログで行い直す（Issue #2403）。ビュー展開・参照先の検証が Bind と同じ時点になる。
+    /// 一時表の経路・読み取り文以外（DML・DDL・`COPY` 等）は再 parse せず `None`（従来の `dummy_parsed`）。
+    fn reparse_dummy_with_snapshot(
+        &self,
+        session: &crate::sql::mode::SessionState,
+        prepared: &PreparedSql,
+        snap: &redb::ReadTransaction,
+    ) -> Result<Option<ParsedSql>, crate::sql::allowlist::SqlSurfaceError> {
+        let is_read = matches!(
+            prepared.dummy_parsed,
+            ParsedSql::Statement(_) | ParsedSql::LockingSelect(_)
+        );
+        if !is_read || !matches!(prepared.route, temp_route::PreparedRoute::Plain) {
+            return Ok(None);
+        }
+        let kinds: Vec<crate::sql::params::ParamLiteralKind> = prepared
+            .param_types
+            .iter()
+            .map(|t| t.literal_kind())
+            .collect();
+        let dummy_tokens = crate::sql::params::substitute_dummy_typed(&prepared.tokens, &kinds);
+        let positions: Vec<usize> = prepared
+            .tokens
+            .iter()
+            .enumerate()
+            .filter(|(_, t)| matches!(t, crate::sql::lexer::Token::Param(_)))
+            .map(|(i, _)| i)
+            .collect();
+        let _guard = crate::sql::const_expr::defer_param_value_errors(positions);
+        let _session_tz_scope = session_time_zone_scope(session);
+        let tokens = Self::normalize_row_count_clauses(dummy_tokens)?;
+        let mut parsed = self.parse_tokens_r(tokens, None, Some(snap))?;
+        attach_public_qualified(
+            &mut parsed,
+            &prepared.public_qualified,
+            prepared.create_public,
+        );
+        Ok(Some(parsed))
+    }
+
     /// 明示トランザクションが writer 取得前なら `BEGIN` 時点のスナップショットを返す（Describe 用。
     /// `Idle`・`Failed`・writer 取得後は `None`＝最新の確定済みスナップショット）。
     fn describe_snapshot<'t>(
@@ -8761,9 +8802,24 @@ impl EngineCore {
         let result = (|| {
             let snap = Self::describe_snapshot(txn)?;
             Self::check_prepared_for_session(session, prepared)?;
+            // カーソル文は txn の開いているカーソルから列を引く（従来の経路）。
+            if matches!(prepared.dummy_parsed, ParsedSql::Cursor(_)) {
+                return self.describe_parsed_in_txn_unscrubbed(
+                    session,
+                    txn,
+                    &prepared.dummy_parsed,
+                );
+            }
+            // writer 取得前の読み取り文は、Parse 時（最新カタログ）に展開済みの `dummy_parsed` を使わず、
+            // Bind と同じく `BEGIN` 時点のカタログで再検証・ビュー展開した文から列を導く（Issue #2403）。
+            let reparsed = match snap {
+                Some(snap) => self.reparse_dummy_with_snapshot(session, prepared, snap)?,
+                None => None,
+            };
+            let parsed = reparsed.as_ref().unwrap_or(&prepared.dummy_parsed);
             self.describe_parsed_in_session_snap(
                 session,
-                &prepared.dummy_parsed,
+                parsed,
                 prepared.order_by_distance_literal_is_param,
                 &prepared.where_equality_dummy_flags,
                 &self.result_limits,
@@ -9024,13 +9080,15 @@ impl EngineCore {
     /// 導出し、再帰項の束縛・列整合・型・照合の検査を [`crate::sql::recursive_eval::describe`] で行う。
     /// Describe の結果列導出と、Execute のアンカー実行前の事前検証が共有する唯一の実装で、
     /// 静的に決まるエラー（`42804`・`0A000` 等）がデータ依存の実行エラー（アンカー本文の除算エラー等）より
-    /// 先に決まり、両経路で同じエラーになる。
+    /// 先に決まり、両経路で同じエラーになる。`snap` が `Some` なら基底表のスキーマ解決をそのスナップショット
+    /// （明示トランザクションの `BEGIN` 時点。Issue #2403）で行い、実行と同じ読み取り源に揃える。
     fn describe_recursive_cte(
         &self,
         session: &crate::sql::mode::SessionState,
         validated: &crate::sql::allowlist::ValidatedRecursiveCte,
         skip_vector_literal_validation: bool,
         limits: &crate::result_limits::ResultLimits,
+        snap: Option<&redb::ReadTransaction>,
     ) -> Result<Vec<crate::sql::exec::ColumnMeta>, crate::sql::allowlist::SqlSurfaceError> {
         // 定数アンカーの `current_schema()` 系は、通常の定数 SELECT が張る検索パスのスコープ外で実行
         // されるため未対応（Execute の実行本体の前提）。Describe と Execute が同じ `0A000` になるよう
@@ -9046,19 +9104,20 @@ impl EngineCore {
         }
         let anchor_parsed = ParsedSql::Statement((*validated.anchor).clone());
         let anchor_columns = self
-            .describe_parsed_in_session_impl(
+            .describe_parsed_in_session_snap(
                 session,
                 &anchor_parsed,
                 skip_vector_literal_validation,
                 &[],
                 limits,
+                snap,
             )?
             .ok_or_else(|| crate::sql::allowlist::SqlSurfaceError::Internal {
                 detail: "internal error".to_string(),
             })?;
         let mut table_names = Vec::new();
         recursive_cte_tables(validated, &mut table_names);
-        let (_read_txn, schemas) = self.read_txn_with_schemas(&table_names)?;
+        let schemas = self.describe_table_schemas(snap, &table_names)?;
         let join_limits = crate::sql::join::JoinLimits::from_settings(
             self.group_by_limits,
             self.join_limits,
@@ -9516,6 +9575,7 @@ impl EngineCore {
                             *k,
                             skip_vector_literal_validation,
                             limits,
+                            snap,
                         )?;
                         let (schema, id_columns) =
                             crate::sql::join::cte_schema(rel.table(), &cols)?;
@@ -9552,6 +9612,7 @@ impl EngineCore {
                     validated,
                     skip_vector_literal_validation,
                     limits,
+                    snap,
                 )?;
                 Ok(Some(columns))
             }
@@ -10562,7 +10623,14 @@ impl EngineCore {
                 // 静的に決まるエラー（アンカーの束縛・再帰項の束縛・列数・型・照合・未対応型）は、アンカーを
                 // 実行する前に Describe と同じ経路で検査する（データ依存の実行エラーに覆われない。
                 // Describe／Execute で同じエラー）。
-                self.describe_recursive_cte(&*session, &validated, false, &limits)?;
+                // 実行と同じ読み取り源（確定済みスナップショットのとき。書き込みトランザクション由来は最新側）。
+                self.describe_recursive_cte(
+                    &*session,
+                    &validated,
+                    false,
+                    &limits,
+                    read_txn.snapshot(),
+                )?;
                 // 重複除去版（`UNION`）はアンカー候補へ結果行数上限を適用しない（捨てる重複は行数に
                 // 数えない契約。上限は重複除去後に `recursive_eval::execute` が判定する）。候補生成は
                 // ハード上限と各走査の入力上限で抑えられる。
@@ -10838,7 +10906,7 @@ impl EngineCore {
     }
 
     /// CTE slot `k` の結果列（列名リスト適用後）を、本文を実行せずに導出する（Describe 用。
-    /// [`Self::evaluate_cte_slot`] の結果列と一致する）。
+    /// [`Self::evaluate_cte_slot`] の結果列と一致する）。`snap` は基底表のスキーマ解決の読み取り源。
     fn describe_cte_slot(
         &self,
         session: &crate::sql::mode::SessionState,
@@ -10846,6 +10914,7 @@ impl EngineCore {
         k: usize,
         skip_vector_literal_validation: bool,
         limits: &crate::result_limits::ResultLimits,
+        snap: Option<&redb::ReadTransaction>,
     ) -> Result<Vec<crate::sql::exec::ColumnMeta>, crate::sql::allowlist::SqlSurfaceError> {
         use crate::sql::allowlist::{CteSlotSource, SqlSurfaceError, Statement};
         let slot = cte.slots.get(k).ok_or_else(|| SqlSurfaceError::Internal {
@@ -10853,12 +10922,13 @@ impl EngineCore {
         })?;
         let raw = match &slot.source {
             CteSlotSource::Scan(scan) => self
-                .describe_parsed_in_session_impl(
+                .describe_parsed_in_session_snap(
                     session,
                     &ParsedSql::Statement(Statement::Scan((**scan).clone())),
                     skip_vector_literal_validation,
                     &[],
                     limits,
+                    snap,
                 )?
                 .ok_or_else(|| SqlSurfaceError::Internal {
                     detail: "internal error".to_string(),
@@ -10870,6 +10940,7 @@ impl EngineCore {
                     *from,
                     skip_vector_literal_validation,
                     limits,
+                    snap,
                 )?;
                 // Execute（`evaluate_cte_slot`）と同じ明示 `LIMIT` の範囲検査を Describe でも行い、
                 // Describe 成功・Execute だけ上限違反になる乖離を作らない（Issue #1862）。

@@ -1754,7 +1754,13 @@ fn handle_describe_body(
                 // 一時表を持つセッション（または一時表の経路で準備した文）では、一時カタログの
                 // 変化を検出するためセッション対応の検証を通す（カーソル文は従来の経路）。
                 PreparedStatement::Parsed { parsed, prepared } => {
-                    if needs_session_revalidation(session, parsed) {
+                    // writer 取得前の明示トランザクションは、Parse 時（最新カタログ）に展開済みの `parsed` を
+                    // 使わず、Bind と同じ `BEGIN` 時点のカタログで再検証した文から列を導く（Issue #2403）。
+                    // カーソル文は開いているカーソルから列を引く従来の経路のまま。
+                    if needs_session_revalidation(session, parsed)
+                        || (EngineCore::txn_reads_begin_snapshot(txn)
+                            && !matches!(parsed, ParsedSql::Cursor(_)))
+                    {
                         engine
                             .describe_prepared_in_txn(session, txn, prepared)
                             .map_err(HandlerError::Sql)?

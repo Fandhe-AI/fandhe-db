@@ -498,3 +498,113 @@ fn extended_describe_uses_begin_snapshot_column_types() {
     assert_eq!(format!("{portal_cols:?}"), format!("{:?}", result.columns));
     a.ok("COMMIT");
 }
+
+/// 拡張クエリの文 Describe・Bind 後の portal Describe・Execute の結果列が一致することを確かめる
+/// （Issue #2403）。`params` が空でなければ `$n` つきの文として扱う。
+fn assert_extended_columns_agree(a: &mut Tx<'_>, sql: &str, params: &[Option<Vec<u8>>]) {
+    let core = a.core;
+    let prepared = core
+        .parse_sql_prepared(sql)
+        .unwrap_or_else(|e| panic!("prepare {sql}: {e:?}"));
+    let stmt_cols = core
+        .describe_prepared_in_txn(&a.session, &a.txn, &prepared)
+        .unwrap_or_else(|e| panic!("describe statement {sql}: {e:?}"))
+        .expect("columns");
+    let bound = core
+        .bind_prepared_in_txn(&a.session, &a.txn, &prepared, params)
+        .unwrap_or_else(|e| panic!("bind {sql}: {e:?}"));
+    let portal_cols = core
+        .describe_parsed_in_txn(&a.session, &a.txn, &bound)
+        .unwrap_or_else(|e| panic!("describe portal {sql}: {e:?}"))
+        .expect("columns");
+    let SqlOutcome::Query(result) = core
+        .execute_parsed_in_txn(&a.ctx, &mut a.session, &mut a.txn, &bound)
+        .unwrap_or_else(|e| panic!("execute {sql}: {e:?}"))
+    else {
+        panic!("expected Query outcome for {sql}");
+    };
+    let executed = format!("{:?}", result.columns);
+    assert!(executed.contains("BigInt"), "{sql}: {executed}");
+    assert_eq!(
+        format!("{stmt_cols:?}"),
+        executed,
+        "statement describe: {sql}"
+    );
+    assert_eq!(
+        format!("{portal_cols:?}"),
+        executed,
+        "portal describe: {sql}"
+    );
+}
+
+fn typed_core(label: &str) -> (EngineCore, CleanupGuard) {
+    let (core, g) = new_core(label);
+    let sys = ctx("sys");
+    ok(&core, &sys, "CREATE TABLE typed (k BIGINT, qty BIGINT)");
+    ok(
+        &core,
+        &ctx("tenant-a"),
+        "INSERT INTO typed (id, k, qty) VALUES (1, 1, 5) USING OPERATION_ID 'dt'",
+    );
+    ok(
+        &core,
+        &ctx("tenant-a"),
+        "INSERT INTO docs (id, n) VALUES (1, 7) USING OPERATION_ID 'dd'",
+    );
+    (core, g)
+}
+
+/// CTE 入力つき JOIN の Describe（`describe_cte_slot`。WITH 文は `$n` 非対応のためパラメータなしのみ）も `BEGIN` 時点のカタログで基底表の列型を決める。
+#[test]
+fn extended_describe_cte_join_uses_begin_snapshot() {
+    let (core, _g) = typed_core("sql31-snap-describe-cte");
+    let mut a = Tx::new(&core, "tenant-a");
+    a.ok("BEGIN");
+    ok(
+        &core,
+        &ctx("sys"),
+        "ALTER TABLE typed ALTER COLUMN qty TYPE TEXT",
+    );
+    let sql = "WITH c AS (SELECT id, qty FROM typed) \
+               SELECT c.qty FROM c JOIN docs d ON c.id = d.id LIMIT 100";
+    assert_extended_columns_agree(&mut a, sql, &[]);
+    a.ok("COMMIT");
+}
+
+/// `WITH RECURSIVE` の Describe と Execute 前の静的検証も `BEGIN` 時点のカタログで基底表を引く。
+#[test]
+fn extended_describe_recursive_cte_uses_begin_snapshot() {
+    let (core, _g) = typed_core("sql31-snap-describe-rec");
+    let mut a = Tx::new(&core, "tenant-a");
+    a.ok("BEGIN");
+    ok(
+        &core,
+        &ctx("sys"),
+        "ALTER TABLE typed ALTER COLUMN qty TYPE TEXT",
+    );
+    let sql = "WITH RECURSIVE t(k, qty) AS (SELECT k, qty FROM typed \
+               UNION ALL SELECT k + 1, qty FROM t WHERE k < 3) SELECT qty FROM t LIMIT 100";
+    assert_extended_columns_agree(&mut a, sql, &[]);
+    a.ok("COMMIT");
+}
+
+/// 文の Describe は、Parse 時（最新カタログ）に展開したビューではなく `BEGIN` 時点の定義で再展開した文から
+/// 列を導く（ビューの参照先が BEGIN 後に別の型の表へ置き換わっても Bind・Execute と一致する）。
+#[test]
+fn extended_describe_reexpands_view_against_begin_snapshot() {
+    let (core, _g) = typed_core("sql31-snap-describe-view");
+    let sys = ctx("sys");
+    ok(&core, &sys, "CREATE TABLE typed2 (qty TEXT)");
+    ok(&core, &sys, "CREATE VIEW v_t AS SELECT qty FROM typed");
+    let mut a = Tx::new(&core, "tenant-a");
+    a.ok("BEGIN");
+    ok(&core, &sys, "DROP VIEW v_t");
+    ok(&core, &sys, "CREATE VIEW v_t AS SELECT qty FROM typed2");
+    assert_extended_columns_agree(&mut a, "SELECT qty FROM v_t LIMIT 100", &[]);
+    assert_extended_columns_agree(
+        &mut a,
+        "SELECT qty FROM v_t WHERE qty = $1 LIMIT 100",
+        &[Some(b"5".to_vec())],
+    );
+    a.ok("COMMIT");
+}
