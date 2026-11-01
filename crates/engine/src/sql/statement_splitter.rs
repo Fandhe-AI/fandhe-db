@@ -390,7 +390,9 @@ pub fn classify_statement(stmt: &str) -> StatementEffect {
         // `LANGUAGE sql|plpgsql` の本体が書き込みうるため `Write` に倒す（fail-closed。複数文メッセージの
         // 書き込み配置制約をすり抜けない）。誤って `Write` にしても暗黙トランザクションになるだけ。
         Token::Keyword(Keyword::Select) => {
-            if calls_non_builtin_function(&tokens) {
+            // SQL-38・Issue #2230: 行ロック句つき `SELECT` は writer を取得するため `Write` に倒す
+            // （fail-closed。複数文メッセージでは暗黙トランザクションとなり、ロックが後続文まで保持される）。
+            if calls_non_builtin_function(&tokens) || has_row_lock_clause(&tokens) {
                 StatementEffect::Write
             } else {
                 StatementEffect::ReadOnly
@@ -641,6 +643,25 @@ fn syntax_form_confirmed(
             && terminator_before(i - 1);
     }
     true
+}
+
+/// 行ロック句（`FOR UPDATE`／`FOR NO KEY UPDATE`／`FOR SHARE`／`FOR KEY SHARE`）らしき並びを含むか。
+/// 括弧の深さは見ない保守的な検出（誤検出は `Write` 側へ倒れるだけ）。
+fn has_row_lock_clause(tokens: &[Token]) -> bool {
+    let word = |t: Option<&Token>| -> Option<String> {
+        match t {
+            Some(Token::Ident(n)) => Some(n.to_ascii_uppercase()),
+            Some(Token::Keyword(k)) => Some(format!("{k:?}").to_ascii_uppercase()),
+            _ => None,
+        }
+    };
+    (0..tokens.len()).any(|i| {
+        word(tokens.get(i)).as_deref() == Some("FOR")
+            && matches!(
+                word(tokens.get(i + 1)).as_deref(),
+                Some("UPDATE" | "SHARE" | "NO" | "KEY")
+            )
+    })
 }
 
 /// `(` の直前の語が構文上の語（`IN`・`AS`・`OVER` 等）でも組み込み関数名でもない呼び出しを含むか
@@ -1488,6 +1509,30 @@ mod tests {
         assert_eq!(
             classify_statement("COPY t (a, b) TO STDOUT WITH (FORMAT csv)"),
             StatementEffect::ReadOnly
+        );
+    }
+
+    #[test]
+    fn row_lock_select_is_classified_as_write_and_implicit_txn() {
+        for sql in [
+            "SELECT id FROM t FOR UPDATE",
+            "SELECT id FROM t FOR SHARE NOWAIT",
+            "SELECT id FROM t FOR NO KEY UPDATE",
+            "SELECT id FROM t FOR KEY SHARE",
+        ] {
+            assert_eq!(classify_statement(sql), StatementEffect::Write, "{sql}");
+        }
+        assert_eq!(
+            classify_statement("SELECT id FROM t"),
+            StatementEffect::ReadOnly
+        );
+        assert_eq!(
+            plan_multi_statement(
+                &["SELECT id FROM t FOR UPDATE", "UPDATE t SET v = 1"],
+                false
+            )
+            .expect("plan"),
+            MultiStatementPlan::ImplicitTransaction
         );
     }
 

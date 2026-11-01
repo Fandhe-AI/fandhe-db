@@ -7245,9 +7245,8 @@ impl EngineCore {
         // SQL-38・Issue #2230: 行ロック句つき SELECT は文単位の暗黙トランザクションで writer を取得し、
         // 文の終わりに解放する（`NOWAIT` は暗黙 Tx の開始時点で効かせる）。
         if matches!(parsed, ParsedSql::LockingSelect(_)) {
-            let outcome = self.execute_locking_select_autocommit(ctx, session, parsed)?;
-            session.apply_temp_on_commit()?;
-            return Ok(outcome);
+            // `ON COMMIT` の適用は `commit_implicit`（`commit_active`）側が行うため、ここでは呼ばない。
+            return self.execute_locking_select_autocommit(ctx, session, parsed);
         }
         let outcome = self.execute_parsed_statement(ctx, session, parsed)?;
         // 自動コミットの文が成功した直後に、一時表の `ON COMMIT` 動作を適用する
