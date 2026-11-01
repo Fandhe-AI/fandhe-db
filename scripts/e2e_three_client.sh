@@ -8,3 +8,5 @@ set -euo pipefail
 cargo test -p fandhe-db-wire-server --features fault-injection --test three_client_e2e -- --ignored
 cargo test -p fandhe-db-wire-server --test extended_syntax_e2e -- --ignored
 cargo test -p fandhe-db-wire-server --test three_client_extended_e2e -- --ignored
+# Issue #2412: 明示トランザクション内の述語形書き込みと 40001 の再試行（SQL-31・SQL-19・ERR-7）
+cargo test -p fandhe-db-wire-server --test three_client_txn_retry_e2e -- --ignored
