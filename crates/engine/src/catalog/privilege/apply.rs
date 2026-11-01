@@ -555,8 +555,22 @@ impl Storage {
             let si = states.idx(&write_txn, tenant, &t.object)?;
             let entries: Vec<AclEntry> = states.work_of(si).to_vec();
             // 付与者が持つ GRANT OPTION。列は表単位の行も合わせて見る。
-            let eff = if req.owner_equivalent || t.propagated {
+            let eff = if req.owner_equivalent {
                 want
+            } else if t.propagated {
+                // 表単位 REVOKE から派生した列ターゲット。表単位の対象と同じく、付与者の表の
+                // GRANT OPTION で絞る（0 なら表側が警告のみで無変更のため列も変更しない）。
+                if let PrivilegeObject::Column { table, .. } = &t.object {
+                    let table_entries = list_acl_for_object_in_txn(
+                        &*write_txn,
+                        tenant,
+                        &PrivilegeObject::Table(table.clone()),
+                    )?;
+                    let (tgo, _) = grantor_rights(&table_entries, req.grantor_id);
+                    want & tgo
+                } else {
+                    want
+                }
             } else {
                 let (mut go, mut any) = grantor_rights(&entries, req.grantor_id);
                 if let PrivilegeObject::Column { table, .. } = &t.object {

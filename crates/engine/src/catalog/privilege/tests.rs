@@ -450,6 +450,36 @@ mod apply_deps {
         }
     }
 
+    /// 表の GRANT OPTION を持たない非オーナーの表単位 REVOKE は、警告のみで ACL を変えず、
+    /// 呼び出し元が付与した列権限も残す（Issue #1965 レビュー指摘）。
+    #[test]
+    fn table_revoke_without_table_grant_option_warns_and_keeps_column_grants() {
+        let (_g, s) = open("acl_dep_tbl_rev_nogo");
+        mk_table(&s, T);
+        let owner = role(&s, "owner");
+        let bob = role(&s, "bob");
+        let carol = role(&s, "carol");
+        run(&s, owner, true, true, PRIV_SELECT, &["a"], bob, true, false).expect("g1");
+        run(
+            &s,
+            bob,
+            false,
+            true,
+            PRIV_SELECT,
+            &["a"],
+            carol,
+            false,
+            false,
+        )
+        .expect("g2");
+        let before = col_rows(&s, "a");
+        let out =
+            run(&s, bob, false, false, PRIV_SELECT, &[], carol, false, false).expect("revoke");
+        assert_eq!(out.warning, Some(AclWarning::NoPrivileges));
+        assert_eq!(out.rows_changed, 0);
+        assert_eq!(col_rows(&s, "a"), before);
+    }
+
     #[test]
     fn column_revoke_keeps_grant_when_table_grant_option_remains() {
         let (_g, s) = open("acl_dep_col_keep");
