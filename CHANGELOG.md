@@ -15,7 +15,7 @@
 - `SELECT` の行ロック句（`FOR UPDATE`／`FOR NO KEY UPDATE`／`FOR SHARE`／`FOR KEY SHARE`、`OF <名前>[, ...]`、`NOWAIT`／`SKIP LOCKED`）を構文解釈する（Issue #1957・SQL-38）。解析結果は新しい `sql::row_lock`（`LockingSelect`・`RowLocking`・`RowLockClause`・`LockStrength`・`LockWaitPolicy`）の型で `ParsedSql::LockingSelect` として実行計画へ渡す。`DISTINCT`・`GROUP BY`・`HAVING`・集計・ウィンドウ関数・集合演算・外部結合で NULL を補う側との併用は `0A000`、`OF` が FROM の参照名に無ければ `42P01`。ロックの取得は #2230、`SKIP LOCKED` の実行は #2231 の担当で、それまで実行入口は `0A000` の暫定ゲートで拒否する。詳細は [explicit-transaction.md](docs/design/explicit-transaction.md)。
   挙動変更: 受理する形と併用違反は `42601` から `0A000`（`OF` の解決失敗は `42P01`）になった（構文誤りは従来どおり `42601`）。公開 enum `ParsedSql` に `LockingSelect` を追加した（BREAKING CHANGE）。
 - `BEGIN ISOLATION LEVEL {SERIALIZABLE|REPEATABLE READ|READ COMMITTED|READ UNCOMMITTED}` を受理する（Issue #1938・SQL-38 (1)。要求レベルは記録のみで実行は不変）。`sql::transaction::RequestedIsolationLevel`・`SessionTransaction::begin_with_modes`（`isolation_level` 引数）・`SessionTransaction::isolation_level` を追加し、公開構造体 `ValidatedTxnControl` に `isolation_level` フィールドを追加した（BREAKING CHANGE）。
-- `40001`（serialization_failure）の `wire_code` と失敗状態への遷移の入口を追加した（Issue #2398・TASK-333・ERR-7・SQL-38）。`ErrorClass::SerializationFailure`・`SqlSurfaceError::SerializationFailure`（固定文言・表名やテナントを含まない）を追加し、HTTP 射影は 409。`SessionTransaction` に crate 内部の入口を置き、`40001` の後は `ROLLBACK` 以外が `25P02`、`ROLLBACK` で復帰する。判定と送出の結線は #2405（現状は到達しない）。
+- `40001`（serialization_failure）の `wire_code` と失敗状態への遷移の入口を追加した（Issue #2398・TASK-333・ERR-7・SQL-38）。`ErrorClass::SerializationFailure`・`SqlSurfaceError::SerializationFailure`（固定文言・表名やテナントを含まない）を追加し、HTTP 射影は 409。`SessionTransaction` に crate 内部の入口を置き、`40001` の後は `ROLLBACK` 以外が `25P02`、`ROLLBACK` で復帰する。判定と送出は #2405 で結線済み（`### Breaking Changes` の明示トランザクションの項を参照）。
   公開 enum `ErrorClass`・`SqlSurfaceError` に variant を追加した（BREAKING CHANGE）。
 - トランザクション制御の別名 `START TRANSACTION`・`END`・`ABORT` を受理する（Issue #1930・SQL-69 (1)・SQL-31。契約はポインタ先に従う）。`AND [NO] CHAIN` と `PREPARE TRANSACTION` の扱いを変更した。
   BREAKING CHANGE: 公開 enum `SqlOutcome`・`TxnControl` に `StartTransaction` を追加した。網羅 `match` する外部コードは腕を足す。
@@ -227,6 +227,13 @@
 
 ### Breaking Changes
 
+- 明示トランザクションが writer を取る時点を `BEGIN` から最初の書き込み文へ移した（Issue #2396・#2400・#2405・#2408・TASK-333・TASK-335・SQL-31・SQL-19・ERR-7・WIRE-15・WIRE-16・WIRE-19）。
+  BREAKING CHANGE: `BEGIN`／`START TRANSACTION` は writer を取らず、その時点の読み取りスナップショットだけを開く。書き込み文（DML・`COPY FROM`・`LOCK TABLE`）で初めて writer を取る。行ロック句の取得は #2230 で未完。
+  読み取りだけの Tx は他セッションを待たせず自分も待たない。`55P03` は `BEGIN` ではなく最初の書き込み文で返り Tx は `Failed`（以降 `25P02`）になる。`--write-lock-wait-ms` の待機は最初の書き込み文から効く。
+  持続時間と文数の上限は従来どおり `BEGIN` から数える。writer 取得前の読み取りは `BEGIN` 時点を見る。読んでから書く形で、読み取った表に後から可視の書き込み（DDL を含む）が commit されていれば、writer 取得時に `40001` を返し副作用は無い（以降 `25P02`、`ROLLBACK` だけ受理）。判定不能は `40001` に倒す。判定は自テナントから可視の書き込みに限り、`40001` の有無から他テナントの行の存在は観測できない。
+  暗黙のトランザクション（複数文メッセージ）は従来どおり開始時に writer を取り（WIRE-16）、トランザクション内 DDL の `0A000`・`BEGIN READ ONLY` の扱い・ReadyForQuery の状態バイトの意味は変わらない。
+  旧挙動（`BEGIN` で writer を取って直列化する）へ戻す互換スイッチ・設定は無い。`40001` を受けたクライアントは `ROLLBACK` して再試行する（同じ `operation_id` で再送できる。psql・psycopg・node `pg` で確認済み、#2412）。規則の詳細は [explicit-transaction.md](docs/design/explicit-transaction.md) の 1a 節。
+- `storage::StorageError::CommitFootprintUnrecordable`・`catalog::CatalogError::CommitFootprintUnrecordable` を追加した（Issue #2404・TASK-333）。commit の足跡を記録できない書き込みは commit 前に `54000`（固定文言）で拒否する（fail-closed）。網羅 `match` する外部コードは腕を足す。
 - `sql::udf_call::BuiltinFn`（Issue #1902・SQL-65）: variant `Left`／`Right`／`Reverse`／`Initcap` を追加した。網羅 `match` する外部コードは腕を足す。
 - `sql::udf_call::BoundExpr`（Issue #1909・SQL-65）: variant `MinMax { op, args }` と公開型 `MinMaxOp` を追加した。
   網羅 `match` する外部コードは腕を足す。
