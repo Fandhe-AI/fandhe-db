@@ -876,6 +876,9 @@ pub(crate) fn map_outcome(outcome: SqlOutcome) -> OutcomeResponse {
         SqlOutcome::Begin => OutcomeResponse::Command {
             tag: "BEGIN".to_string(),
         },
+        SqlOutcome::StartTransaction => OutcomeResponse::Command {
+            tag: "START TRANSACTION".to_string(),
+        },
         SqlOutcome::Commit => OutcomeResponse::Command {
             tag: "COMMIT".to_string(),
         },

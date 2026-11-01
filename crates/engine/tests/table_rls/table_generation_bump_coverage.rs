@@ -449,12 +449,12 @@ const ALLOWLIST: &[(&str, u32)] = &[
     // Issue #1553（明示トランザクションの最大時間・最大文数の CLI 設定化）の行追加でさらに移動（旧: 793）。
     // TABLE-44・Issue #1684（一時表の DML）: `commit_active` に一時側の確定・`ON COMMIT` 適用が加わり
     // 行が移動したための追随（旧: 899）。書き込み内容・commit の意味は不変。
-    // Issue #1932（BEGIN の READ ONLY／READ WRITE 構文解釈）と Issue #2399（`ActiveTxn` の writer を
+    // Issue #1930・#1932（別名受理・READ ONLY／READ WRITE 構文解釈）と Issue #2399（`ActiveTxn` の writer を
     // `Option` 化・読み取りスナップショット追加）の行追加でさらに移動（旧: 966）。書き込み内容・commit の意味は不変。
     // Issue #2400（明示 Tx の writer 遅延取得。`ensure_writer`・`open_read_snapshot` の追加と
-    // `begin_with_origin` の分岐）と Issue #1938（ISOLATION LEVEL 受理）の行追加でさらに移動（旧: 1120）。書き込み内容・commit の意味は不変。
+    // `begin_with_origin` の分岐）と Issue #1938（ISOLATION LEVEL 受理）・Issue #1930（別名受理）の行追加でさらに移動（旧: 1120）。書き込み内容・commit の意味は不変。
     // Issue #2403（読み取り源の三分岐 `TxnReadSource`・`read_source` の追加）の行追加でさらに移動（旧: 1275）。書き込み内容・commit の意味は不変。
-    ("sql/transaction.rs", 1383),
+    ("sql/transaction.rs", 1438),
     // TABLE-44・Issue #1684: 一時表ストア（セッション専用のインメモリ DB。永続 DB とは別インスタンス）の
     // 書き込みトランザクションの確定口（`TempRowStore::commit`）。確定するのは、一時コアの書き込み本体
     // （`tenant::*`・`catalog::*`。いずれも自分の DB の表世代を `bump_table_generation_in_txn` で進める）が

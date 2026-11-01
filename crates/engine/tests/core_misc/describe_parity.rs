@@ -95,6 +95,7 @@ fn assert_describe_matches_execute(core: &EngineCore, ctx: &PolicyContext, sql: 
         | SqlOutcome::AlterSchema(_)
         | SqlOutcome::AlterSequence(_)
         | SqlOutcome::Begin
+        | SqlOutcome::StartTransaction
         | SqlOutcome::Commit
         | SqlOutcome::Rollback
         | SqlOutcome::DeclareCursor

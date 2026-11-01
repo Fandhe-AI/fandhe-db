@@ -1095,3 +1095,63 @@ fn extended_query_sync_ready_for_query_status_reflects_transaction_state() {
     send_sync(&mut stream);
     assert_ready_for_query_status(&mut stream, b'I');
 }
+
+/// Issue #1930・SQL-69 (1): 拡張クエリでも `START TRANSACTION`／`END`／`ABORT` が
+/// `BEGIN`／`COMMIT`／`ROLLBACK` と同じ遷移になり、タグは `START TRANSACTION`／`COMMIT`／
+/// `ROLLBACK`。失敗状態では Parse(`ABORT`) だけが通り、`END` は `25P02` で拒否される。
+#[test]
+fn extended_transaction_aliases_tags_and_failed_state() {
+    let (core, _guard) = new_core_with_documents_table();
+    let users_path = write_user_store_file(&[("alice", "tenant-a", "correct-horse")]);
+    let addr = spawn_server_with_engine(&users_path, Arc::clone(&core));
+    let mut stream = authenticate_to_ready_for_query(addr, "alice", "correct-horse");
+
+    parse_and_bind(&mut stream, "st30", "pst30", "START TRANSACTION");
+    assert_eq!(
+        execute_and_read_command_complete(&mut stream, "pst30"),
+        "START TRANSACTION"
+    );
+    send_sync(&mut stream);
+    assert_ready_for_query_status(&mut stream, b'T');
+
+    parse_and_bind(&mut stream, "en30", "pen30", "END");
+    assert_eq!(
+        execute_and_read_command_complete(&mut stream, "pen30"),
+        "COMMIT"
+    );
+    send_sync(&mut stream);
+    assert_ready_for_query_status(&mut stream, b'I');
+
+    parse_and_bind(&mut stream, "st30b", "pst30b", "START TRANSACTION");
+    assert_eq!(
+        execute_and_read_command_complete(&mut stream, "pst30b"),
+        "START TRANSACTION"
+    );
+    send_sync(&mut stream);
+    assert_ready_for_query_status(&mut stream, b'T');
+
+    send_length_prefixed_message(
+        &mut stream,
+        b'P',
+        &parse_body("bad30", "SELEC id FROM documents", 0),
+    );
+    let (kind, _) = read_message(&mut stream);
+    assert_eq!(kind, b'E');
+    send_sync(&mut stream);
+    assert_ready_for_query_status(&mut stream, b'E');
+
+    // 失敗状態の Parse(END) は 25P02。
+    send_length_prefixed_message(&mut stream, b'P', &parse_body("en30b", "END", 0));
+    let (kind, _) = read_message(&mut stream);
+    assert_eq!(kind, b'E');
+    send_sync(&mut stream);
+    assert_ready_for_query_status(&mut stream, b'E');
+
+    parse_and_bind(&mut stream, "ab30", "pab30", "ABORT");
+    assert_eq!(
+        execute_and_read_command_complete(&mut stream, "pab30"),
+        "ROLLBACK"
+    );
+    send_sync(&mut stream);
+    assert_ready_for_query_status(&mut stream, b'I');
+}

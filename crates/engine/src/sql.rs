@@ -488,6 +488,9 @@ pub enum SqlOutcome {
     /// **BREAKING CHANGE**（Issue #942）: 本 variant の追加により `SqlOutcome`
     /// を網羅的にマッチする既存コードは更新が必要。
     Begin,
+    /// `START TRANSACTION`（Issue #1930・SQL-69 ポインタ。契約はポインタ先に従う）。
+    /// **BREAKING CHANGE**: variant 追加。
+    StartTransaction,
     /// `COMMIT [WORK|TRANSACTION]`（SQL-31・TASK-221）が成功したことを示す応答。
     /// `wire-server::simple_query` は `CommandComplete` タグ `COMMIT` を返す。
     Commit,

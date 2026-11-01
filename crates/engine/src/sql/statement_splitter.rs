@@ -442,10 +442,24 @@ pub fn classify_statement(stmt: &str) -> StatementEffect {
         Token::Ident(name) if name.eq_ignore_ascii_case("BEGIN") => {
             StatementEffect::TransactionControl(crate::sql::transaction::TxnControl::Begin)
         }
-        Token::Ident(name) if name.eq_ignore_ascii_case("COMMIT") => {
+        // Issue #1930: `START TRANSACTION` は `TRANSACTION` を伴うときだけ制御文。それ以外の
+        // `START ...` は未知の先頭語として下の既定（`Write`。fail-closed）へ倒す。
+        Token::Ident(name)
+            if name.eq_ignore_ascii_case("START")
+                && matches!(tokens.get(1), Some(Token::Ident(n)) if n.eq_ignore_ascii_case("TRANSACTION")) =>
+        {
+            StatementEffect::TransactionControl(
+                crate::sql::transaction::TxnControl::StartTransaction,
+            )
+        }
+        Token::Ident(name)
+            if name.eq_ignore_ascii_case("COMMIT") || name.eq_ignore_ascii_case("END") =>
+        {
             StatementEffect::TransactionControl(crate::sql::transaction::TxnControl::Commit)
         }
-        Token::Ident(name) if name.eq_ignore_ascii_case("ROLLBACK") => {
+        Token::Ident(name)
+            if name.eq_ignore_ascii_case("ROLLBACK") || name.eq_ignore_ascii_case("ABORT") =>
+        {
             StatementEffect::TransactionControl(crate::sql::transaction::TxnControl::Rollback)
         }
         Token::Ident(name) if name.eq_ignore_ascii_case("CREATE") => match tokens.get(1) {
@@ -1029,7 +1043,9 @@ pub fn check_write_placement(
             StatementEffect::Write if !in_txn && i != last_index => {
                 return Err(MultiStatementError::WriteNotLast);
             }
-            StatementEffect::TransactionControl(TxnControl::Begin) => {
+            StatementEffect::TransactionControl(
+                TxnControl::Begin | TxnControl::StartTransaction,
+            ) => {
                 in_txn = true;
             }
             StatementEffect::TransactionControl(TxnControl::Commit) => {
@@ -1358,6 +1374,36 @@ mod tests {
                 .expect("split"),
         );
         assert_eq!(pieces.len(), 2);
+    }
+
+    /// Issue #1930: `START TRANSACTION`／`END`／`ABORT` は制御文として分類され、
+    /// `TRANSACTION` を伴わない `START ...` は `Write`（fail-closed）に倒れる。
+    #[test]
+    fn transaction_aliases_are_classified_as_control_statements() {
+        use crate::sql::transaction::TxnControl;
+        assert_eq!(
+            classify_statement("START TRANSACTION"),
+            StatementEffect::TransactionControl(TxnControl::StartTransaction)
+        );
+        assert_eq!(
+            classify_statement("END"),
+            StatementEffect::TransactionControl(TxnControl::Commit)
+        );
+        assert_eq!(
+            classify_statement("abort"),
+            StatementEffect::TransactionControl(TxnControl::Rollback)
+        );
+        assert_eq!(classify_statement("START foo"), StatementEffect::Write);
+        let ins = "INSERT INTO t (id) VALUES (1) USING OPERATION_ID 'o1'";
+        let ins2 = "INSERT INTO t (id) VALUES (2) USING OPERATION_ID 'o2'";
+        assert_eq!(
+            plan_multi_statement(&["START TRANSACTION", ins, ins2, "END"], false),
+            Ok(MultiStatementPlan::Sequential)
+        );
+        assert_eq!(
+            plan_multi_statement(&["START TRANSACTION", ins, "END", ins2], false),
+            Err(MultiStatementError::WriteNotLast)
+        );
     }
 
     #[test]

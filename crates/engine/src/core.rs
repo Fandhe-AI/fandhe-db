@@ -4294,6 +4294,7 @@ impl EngineCore {
                     | crate::sql::SqlOutcome::AlterSchema(_)
                     | crate::sql::SqlOutcome::AlterSequence(_)
                     | crate::sql::SqlOutcome::Begin
+                    | crate::sql::SqlOutcome::StartTransaction
                     | crate::sql::SqlOutcome::Commit
                     | crate::sql::SqlOutcome::Rollback
                     | crate::sql::SqlOutcome::DeclareCursor
@@ -4357,6 +4358,7 @@ impl EngineCore {
                     | crate::sql::SqlOutcome::AlterSchema(_)
                     | crate::sql::SqlOutcome::AlterSequence(_)
                     | crate::sql::SqlOutcome::Begin
+                    | crate::sql::SqlOutcome::StartTransaction
                     | crate::sql::SqlOutcome::Commit
                     | crate::sql::SqlOutcome::Rollback
                     | crate::sql::SqlOutcome::DeclareCursor
@@ -4417,6 +4419,7 @@ impl EngineCore {
                     | crate::sql::SqlOutcome::AlterSchema(_)
                     | crate::sql::SqlOutcome::AlterSequence(_)
                     | crate::sql::SqlOutcome::Begin
+                    | crate::sql::SqlOutcome::StartTransaction
                     | crate::sql::SqlOutcome::Commit
                     | crate::sql::SqlOutcome::Rollback
                     | crate::sql::SqlOutcome::DeclareCursor
@@ -4484,6 +4487,7 @@ impl EngineCore {
                     | crate::sql::SqlOutcome::AlterSchema(_)
                     | crate::sql::SqlOutcome::AlterSequence(_)
                     | crate::sql::SqlOutcome::Begin
+                    | crate::sql::SqlOutcome::StartTransaction
                     | crate::sql::SqlOutcome::Commit
                     | crate::sql::SqlOutcome::Rollback
                     | crate::sql::SqlOutcome::DeclareCursor
@@ -4570,6 +4574,7 @@ impl EngineCore {
                     | crate::sql::SqlOutcome::AlterSchema(_)
                     | crate::sql::SqlOutcome::AlterSequence(_)
                     | crate::sql::SqlOutcome::Begin
+                    | crate::sql::SqlOutcome::StartTransaction
                     | crate::sql::SqlOutcome::Commit
                     | crate::sql::SqlOutcome::Rollback
                     | crate::sql::SqlOutcome::DeclareCursor
@@ -5079,13 +5084,7 @@ impl EngineCore {
         // `public.<一時表の名前>` は永続側の関係を指すため、裸の名前へ解決すると一時表に化ける。
         // 解決より前に拒否する（TABLE-27・Issue #1714。fail-closed）。
         crate::sql::temp_catalog::reject_public_qualified_temp(&tokens, temp)?;
-        let txn_control_head = matches!(
-            tokens.first(),
-            Some(crate::sql::lexer::Token::Ident(name))
-                if name.eq_ignore_ascii_case("BEGIN")
-                    || name.eq_ignore_ascii_case("COMMIT")
-                    || name.eq_ignore_ascii_case("ROLLBACK")
-        );
+        let txn_control_head = crate::sql::transaction::is_transaction_control_head(&tokens);
         // TABLE-44・Issue #1683: 次の 3 種は一時表の行を読み書きしないためトークン走査を飛ばす。
         // `CREATE [TEMP] TABLE` は列定義だけで（FOREIGN KEY の参照先が一時表の名前なら実行段が
         // `42P16`／`0A000`）、`DROP TABLE` は実行段が自セッションの一時カタログで名前を解決する。
@@ -5390,13 +5389,7 @@ impl EngineCore {
         } else {
             crate::sql::lexer::demote_quoted_null(tokens)
         };
-        let txn_control_head = matches!(
-            tokens.first(),
-            Some(crate::sql::lexer::Token::Ident(name))
-                if name.eq_ignore_ascii_case("BEGIN")
-                    || name.eq_ignore_ascii_case("COMMIT")
-                    || name.eq_ignore_ascii_case("ROLLBACK")
-        );
+        let txn_control_head = crate::sql::transaction::is_transaction_control_head(&tokens);
         if txn_control_head {
             let ctrl = crate::sql::transaction::validate_transaction_control_tokens(&tokens)?;
             return Ok(ParsedSql::Transaction(ctrl));
@@ -7876,6 +7869,10 @@ impl EngineCore {
                         ctrl.isolation_level,
                     )?;
                     Ok(crate::sql::SqlOutcome::Begin)
+                }
+                TxnControl::StartTransaction => {
+                    txn.begin(&self.storage, session)?;
+                    Ok(crate::sql::SqlOutcome::StartTransaction)
                 }
                 TxnControl::Commit => {
                     txn.commit(session)?;

@@ -589,6 +589,7 @@ Search・Aggregate・Scan）は確定済みのまま出力が決まる。想定�
 Issue #1931（`READ ONLY`）、挙動テストは #1940、`40001` は #2396 が担う。
 `BEGIN ISOLATION LEVEL ...` の構文解釈は Issue #1938 で実装した（`validate_transaction_control_tokens`）。
 受理範囲・エラー契約は上記ポインタ先に従い、本書には記述しない。
+`START TRANSACTION`／`END`／`ABORT` の別名は Issue #1930 で受理した（下記「別名」節はポインタのみ）。
 
 - **engine の宣言型**: `crates/engine/src/txn.rs` の `IsolationLevel` は単一バリアントのまま維持する。
   #1938 は要求されたレベルを別の `sql::transaction::RequestedIsolationLevel` として
@@ -813,7 +814,8 @@ production コード（`crates/wire-server/src/`）は無変更・テスト専�
   書き込み可能な Tx を渡さないよう `0A000` で拒否する暫定ゲート（write txn を取る前・状態は
   `Idle` のまま）。PostgreSQL との差異として、アクセスモードの重複・矛盾（`READ ONLY READ WRITE`）
   は `42601`（fail-closed）。引用識別子 `"READ"` も受理される（既存の `"WORK"` と同じ性質）。
-- savepoint、`START TRANSACTION`／`END`／`ABORT` などの別名。分離レベルの指定は「分離レベルの受理方針」節のポインタ先の契約に従う（`BEGIN ISOLATION LEVEL` は #1938 で実装済み、`SET TRANSACTION` 系は #1939）。
+- savepoint、`COMMIT AND CHAIN`・`PREPARE TRANSACTION`。分離レベルの指定は「分離レベルの受理方針」節のポインタ先の契約に従う（`BEGIN ISOLATION LEVEL` は #1938 で実装済み、`SET TRANSACTION` 系は #1939）。
+  別名 `START TRANSACTION`／`END`／`ABORT` は Issue #1930 で受理した（下記「別名」節）。
 - NoSQL 表層のトランザクション（設計上 `0A000`。`op` 許可リストに追加しない）。
 - 上限の既定値（20 秒・1,000 件・30 秒）と CLI のハード上限（60 秒・10,000 件。Issue #1553 で暫定採用）の確定 → オーナー判断。
 
@@ -827,3 +829,14 @@ production コード（`crates/wire-server/src/`）は無変更・テスト専�
 改訂（#2396・1a-8）: writer の取得前に宣言したカーソルは `BEGIN` 時点のスナップショット、
 取得後に宣言したカーソルは取得時点のスナップショットを読む（WIRE-15。実装は #2411）。
 取得前に宣言したカーソルが残っている間は、`BEGIN` 時点の `ReadTransaction` を保持し続ける。
+
+## 別名（Issue #1930・SQL-69 (1) ポインタ）
+
+本節はポインタ表記のみとし、受理構文・エラー契約の詳細は本書へ記述しない
+（AGENTS.md の公開境界拡張手順〔管理者承認〕が必要なため。現時点では承認を得ていない）。
+
+- ポインタ: `docs/spec/04-behavior/sql-surface.md` SQL-69・SQL-31。
+- 実装箇所: `sql::transaction::validate_transaction_control_tokens`・`is_transaction_control_head`・
+  `is_rollback_statement`、複数文メッセージの分割器（制御文の分類）。
+- テスト: `crates/engine/tests/sql_t40_up/sql69_txn_aliases.rs`・
+  `crates/wire-server/tests/wire_proto/sql69_txn_aliases.rs`・`wire942_extended_transaction.rs`。

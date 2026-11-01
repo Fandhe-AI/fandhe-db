@@ -39,16 +39,36 @@ use std::collections::HashSet;
 use std::time::{Duration, Instant};
 
 use crate::sql::allowlist::SqlSurfaceError;
-use crate::sql::lexer::Token;
+use crate::sql::lexer::{Keyword, Token};
 use crate::sql::mode::SessionState;
 
-/// `BEGIN`/`COMMIT`/`ROLLBACK` の種別（構造検証のみ。実行は
-/// [`SessionTransaction`] が担う）。
+/// `BEGIN`/`COMMIT`/`ROLLBACK`（別名 `START TRANSACTION`/`END`/`ABORT`。Issue #1930）の
+/// 種別（構造検証のみ。実行は [`SessionTransaction`] が担う）。契約は SQL-69・SQL-31 の
+/// ポインタ先に従う。`END` は `Commit`、`ABORT` は `Rollback` へ写像する。
+///
+/// **BREAKING CHANGE**（Issue #1930）: variant `StartTransaction` を追加した。
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum TxnControl {
     Begin,
+    StartTransaction,
     Commit,
     Rollback,
+}
+
+fn ident_is(tok: Option<&Token>, word: &str) -> bool {
+    matches!(tok, Some(Token::Ident(n)) if n.eq_ignore_ascii_case(word))
+}
+
+/// 先頭トークン列がトランザクション制御文（別名・`PREPARE TRANSACTION` を含む）かどうか。
+/// `core.rs` の parse 入口・一時表経路のトークン走査免除が共通で使う（SQL-31・SQL-69 (1)）。
+/// 受理可否の検証は [`validate_transaction_control_tokens`] が担う。
+pub(crate) fn is_transaction_control_head(tokens: &[Token]) -> bool {
+    let first = tokens.first();
+    ["BEGIN", "COMMIT", "ROLLBACK", "END", "ABORT"]
+        .iter()
+        .any(|w| ident_is(first, w))
+        || ((ident_is(first, "START") || ident_is(first, "PREPARE"))
+            && ident_is(tokens.get(1), "TRANSACTION"))
 }
 
 /// トランザクションのアクセスモード（SQL-38・Issue #1932）。`BEGIN READ ONLY`／
@@ -149,24 +169,50 @@ fn parse_txn_mode_item(rest: &[Token]) -> Result<(TxnModeItem, &[Token]), SqlSur
     Ok((TxnModeItem::Access(mode), tail))
 }
 
-/// `BEGIN`/`COMMIT`/`ROLLBACK` の規範形（`[WORK|TRANSACTION]` 修飾語と、`BEGIN` に限り
-/// アクセスモード `READ ONLY`／`READ WRITE` を受理。分離レベル指定・`DEFERRABLE`・
-/// `AND CHAIN`・`$n`・重複／矛盾するモード等は `42601`）を受理する。
-/// 先頭トークンが `BEGIN`/`COMMIT`/`ROLLBACK`（大小無視）であることは
-/// 呼び出し元（`core.rs::parse_tokens`）が確認済みの前提。
+/// トランザクション制御文の規範形を受理する。`BEGIN`/`START TRANSACTION`/`COMMIT`/`END`/
+/// `ROLLBACK`/`ABORT`（`START TRANSACTION` 以外は `[WORK|TRANSACTION]` 修飾語を許容し、
+/// `BEGIN` に限りアクセスモード `READ ONLY`／`READ WRITE` を受理）。
+/// 未対応・不正な後続句は拒否する（fail-closed。エラー契約は SQL-69・SQL-38 のポインタ先に従う）。先頭が制御文の語で
+/// あることは呼び出し元（[`is_transaction_control_head`]）が確認済みの前提。
 pub(crate) fn validate_transaction_control_tokens(
     tokens: &[Token],
 ) -> Result<ValidatedTxnControl, SqlSurfaceError> {
-    let Some(Token::Ident(head)) = tokens.first() else {
+    let Some((Token::Ident(head), tail)) = tokens.split_first() else {
         return Err(SqlSurfaceError::unsupported(
             "malformed transaction control statement",
         ));
     };
+    if head.eq_ignore_ascii_case("PREPARE") {
+        return Err(SqlSurfaceError::feature_not_supported(
+            "PREPARE TRANSACTION is not supported",
+        ));
+    }
+    // 受信 SQL 由来のトークン列のため添字スライスを使わず `split_first` で進める。
+    if head.eq_ignore_ascii_case("START") {
+        return match tail.split_first() {
+            Some((Token::Ident(kw), rest)) if kw.eq_ignore_ascii_case("TRANSACTION") => {
+                if rest.is_empty() {
+                    Ok(ValidatedTxnControl {
+                        control: TxnControl::StartTransaction,
+                        access_mode: None,
+                        isolation_level: None,
+                    })
+                } else {
+                    Err(SqlSurfaceError::unsupported(
+                        "unsupported clause after transaction control statement",
+                    ))
+                }
+            }
+            _ => Err(SqlSurfaceError::unsupported(
+                "malformed transaction control statement",
+            )),
+        };
+    }
     let ctrl = if head.eq_ignore_ascii_case("BEGIN") {
         TxnControl::Begin
-    } else if head.eq_ignore_ascii_case("COMMIT") {
+    } else if head.eq_ignore_ascii_case("COMMIT") || head.eq_ignore_ascii_case("END") {
         TxnControl::Commit
-    } else if head.eq_ignore_ascii_case("ROLLBACK") {
+    } else if head.eq_ignore_ascii_case("ROLLBACK") || head.eq_ignore_ascii_case("ABORT") {
         TxnControl::Rollback
     } else {
         return Err(SqlSurfaceError::unsupported(
@@ -174,16 +220,24 @@ pub(crate) fn validate_transaction_control_tokens(
         ));
     };
 
-    // 受信 SQL 由来のトークン列のため添字スライスを使わず `split_first` で進める。
-    let rest = tokens.split_first().map_or(&[][..], |(_, tail)| tail);
-    let mut rest = match rest.split_first() {
-        Some((Token::Ident(kw), tail))
+    let mut rest = match tail.split_first() {
+        Some((Token::Ident(kw), t))
             if kw.eq_ignore_ascii_case("WORK") || kw.eq_ignore_ascii_case("TRANSACTION") =>
         {
-            tail
+            t
         }
-        _ => rest,
+        _ => tail,
     };
+    if ctrl != TxnControl::Begin && matches!(rest.first(), Some(Token::Keyword(Keyword::And))) {
+        let after = rest.get(1);
+        let chain =
+            ident_is(after, "CHAIN") || (ident_is(after, "NO") && ident_is(rest.get(2), "CHAIN"));
+        if chain {
+            return Err(SqlSurfaceError::feature_not_supported(
+                "AND CHAIN is not supported",
+            ));
+        }
+    }
     let mut access_mode = None;
     let mut isolation_level = None;
     if ctrl == TxnControl::Begin {
@@ -220,15 +274,16 @@ pub(crate) fn validate_transaction_control_tokens(
     })
 }
 
-/// SQL テキストの先頭トークンが `ROLLBACK`（大小無視）かどうか。明示トランザクションが
+/// SQL テキストの先頭トークンが `ROLLBACK`／`ABORT`（大小無視）かどうか。明示トランザクションが
 /// `Failed` の間に受理してよい文かを parse 前に判定するために使う（SQL-31・TASK-221。
 /// `core::EngineCore::execute_sql_in_txn`、wire-server の拡張クエリ Parse が呼ぶ）。
-/// `ROLLBACK` の規範形の検証は通常どおり parse に任せる。字句解析に失敗した入力は
-/// `false`（fail-closed。`25P02` で拒否される側に倒す）。
+/// `END`・`COMMIT` は false（失敗状態では受理しない）。規範形の検証は通常どおり
+/// parse に任せる。字句解析に失敗した入力は `false`（fail-closed）。
 pub fn is_rollback_statement(sql: &str) -> bool {
     matches!(
         crate::sql::lexer::tokenize(sql).ok().as_deref().and_then(|t| t.first()),
-        Some(Token::Ident(name)) if name.eq_ignore_ascii_case("ROLLBACK")
+        Some(Token::Ident(name))
+            if name.eq_ignore_ascii_case("ROLLBACK") || name.eq_ignore_ascii_case("ABORT")
     )
 }
 
@@ -1528,12 +1583,63 @@ mod tests {
             "BEGIN READ ONLY DEFERRABLE",
             "COMMIT READ ONLY",
             "ROLLBACK READ WRITE",
-            "COMMIT AND CHAIN",
             "ROLLBACK TO SAVEPOINT x",
+            "START",
+            "START WORK",
+            "START TRANSACTION READ ONLY",
+            "START TRANSACTION ISOLATION LEVEL SERIALIZABLE",
+            "END foo",
+            "ABORT TO SAVEPOINT x",
+            "BEGIN AND CHAIN",
         ] {
             let err = validated(sql).unwrap_err();
             assert_eq!(err.wire_code(), "42601", "{sql}");
         }
+    }
+
+    /// SQL-69 (1)・Issue #1930: 別名が対応する制御種別へ写像される。
+    #[test]
+    fn aliases_are_accepted() {
+        for (sql, want) in [
+            ("START TRANSACTION", TxnControl::StartTransaction),
+            ("start transaction", TxnControl::StartTransaction),
+            ("END", TxnControl::Commit),
+            ("END WORK", TxnControl::Commit),
+            ("END TRANSACTION", TxnControl::Commit),
+            ("ABORT", TxnControl::Rollback),
+            ("ABORT WORK", TxnControl::Rollback),
+            ("abort transaction", TxnControl::Rollback),
+        ] {
+            let ctrl = validated(sql).unwrap().control;
+            assert_eq!(ctrl, want, "{sql}");
+            assert!(is_transaction_control_head(&tokens_of(sql)), "{sql}");
+        }
+        assert!(!is_transaction_control_head(&tokens_of("START foo")));
+    }
+
+    /// Issue #1930: 未対応の `AND [NO] CHAIN`・`PREPARE TRANSACTION` は `0A000`。
+    #[test]
+    fn chain_and_prepare_are_feature_not_supported() {
+        for sql in [
+            "COMMIT AND CHAIN",
+            "ROLLBACK AND CHAIN",
+            "END AND CHAIN",
+            "ABORT AND NO CHAIN",
+            "COMMIT WORK AND CHAIN",
+            "PREPARE TRANSACTION 'x'",
+        ] {
+            let err = validate_transaction_control_tokens(&tokens_of(sql)).unwrap_err();
+            assert_eq!(err.wire_code(), "0A000", "{sql}");
+        }
+    }
+
+    #[test]
+    fn rollback_statement_detection_includes_abort() {
+        assert!(is_rollback_statement("ABORT"));
+        assert!(is_rollback_statement("abort work"));
+        assert!(is_rollback_statement("ROLLBACK"));
+        assert!(!is_rollback_statement("END"));
+        assert!(!is_rollback_statement("COMMIT"));
     }
 
     /// SQL-38 (1)・Issue #1938: 4 レベルすべてを `BEGIN`／`BEGIN WORK`／`BEGIN TRANSACTION` で
