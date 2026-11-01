@@ -971,6 +971,19 @@ impl<'e> SessionTransaction<'e> {
         }
     }
 
+    /// writer の取得時に直列化の失敗（`40001`）を検出したとき、`Active` を `Failed` へ
+    /// 遷移させ、呼び出し元が返すべきエラーを返す（TASK-333・ERR-7・SQL-38・Issue #2398）。
+    ///
+    /// 遷移の規則は [`Self::fail`] に委ねる（`Active` 以外では状態を変えない冪等動作、
+    /// 暗黙トランザクションは `Idle` へ戻る）。`write_txn` は drop（abort）されるため
+    /// 行・台帳・カタログに副作用は残らない。以降は `Failed` ゲートが `ROLLBACK` 以外を
+    /// `25P02` で拒否する。判定ロジックと呼び出しは #2405 が結線する。
+    #[cfg_attr(not(test), allow(dead_code))]
+    pub(crate) fn fail_with_serialization_failure(&mut self) -> SqlSurfaceError {
+        self.fail();
+        SqlSurfaceError::SerializationFailure
+    }
+
     /// 任意のエラーで `Active` → `Failed` へ強制遷移させる（文実行中に
     /// エラーが起きた場合、`core.rs` の実行ディスパッチが呼ぶ）。
     ///
@@ -1390,6 +1403,107 @@ mod tests {
             Some(SearchMode::Precision),
             "a failed COMMIT must behave as ROLLBACK and restore the session state"
         );
+    }
+
+    /// ERR-7・SQL-38・TASK-333（Issue #2398）: `40001` で `Failed` へ遷移し、
+    /// `ROLLBACK` 以外は `25P02`、`ROLLBACK` で復帰でき、副作用が残らない。
+    #[test]
+    fn serialization_failure_fails_transaction_and_rollback_recovers() {
+        use crate::catalog::{ColumnDef, ColumnType, TableSchema};
+        use crate::sql::mode::SearchMode;
+        use crate::test_util::temp_db::{unique_db_path, CleanupGuard};
+
+        let path = unique_db_path("task333-40001");
+        let _cleanup = CleanupGuard(path.clone());
+        let storage = crate::storage::Storage::open(&path).expect("open storage");
+        storage
+            .create_table(&TableSchema::new(
+                "documents",
+                vec![ColumnDef::new("embedding", ColumnType::Vector(2), false)],
+            ))
+            .expect("create table");
+        let engine = crate::core::EngineCore::from_storage(
+            storage,
+            Box::new(crate::kernel::CpuScalarProvider),
+        );
+        let caller = crate::policy::PolicyContext::with_visibilities(
+            "tenant-a",
+            [
+                crate::storage::Visibility::Public,
+                crate::storage::Visibility::Private,
+            ],
+        )
+        .expect("valid tenant");
+        let mut session = SessionState::default();
+        let mut txn = engine.new_session_transaction();
+        let insert = "INSERT INTO documents (id, embedding) VALUES (1, '[1.0, 0.0]') \
+                      USING OPERATION_ID 'op-40001'";
+
+        // Idle で呼んでも状態は変わらない（エラー値だけ返る）。
+        let e = txn.fail_with_serialization_failure();
+        assert_eq!(e.wire_code(), "40001");
+        assert_eq!(txn.status(), TransactionStatus::Idle);
+
+        engine
+            .execute_sql_in_txn(
+                &caller,
+                &mut session,
+                &mut txn,
+                "SET search_mode = 'precision'",
+            )
+            .expect("set before begin");
+        engine
+            .execute_sql_in_txn(&caller, &mut session, &mut txn, "BEGIN")
+            .expect("begin");
+        engine
+            .execute_sql_in_txn(
+                &caller,
+                &mut session,
+                &mut txn,
+                "SET search_mode = 'recall'",
+            )
+            .expect("set inside");
+        engine
+            .execute_sql_in_txn(&caller, &mut session, &mut txn, insert)
+            .expect("insert");
+
+        let e = txn.fail_with_serialization_failure();
+        assert_eq!(e.wire_code(), "40001");
+        assert_eq!(
+            e.to_string(),
+            "could not serialize access due to read/write dependencies among transactions"
+        );
+        assert_eq!(txn.status(), TransactionStatus::Failed);
+
+        // 冪等: Failed で再度呼んでも Failed のまま。
+        let _ = txn.fail_with_serialization_failure();
+        assert_eq!(txn.status(), TransactionStatus::Failed);
+
+        for sql in ["SELECT 1", insert, "COMMIT", "not a valid statement"] {
+            let err = engine
+                .execute_sql_in_txn(&caller, &mut session, &mut txn, sql)
+                .expect_err("rejected while failed");
+            assert_eq!(err.wire_code(), "25P02", "sql: {sql}");
+        }
+        assert_eq!(txn.status(), TransactionStatus::Failed);
+
+        engine
+            .execute_sql_in_txn(&caller, &mut session, &mut txn, "ROLLBACK")
+            .expect("rollback recovers");
+        assert_eq!(txn.status(), TransactionStatus::Idle);
+        assert_eq!(session.search_mode(), Some(SearchMode::Precision));
+
+        // 副作用なし: 同じ operation_id・同内容の再送が成功する（台帳に記録が無い）。
+        engine
+            .execute_sql_in_txn(&caller, &mut session, &mut txn, insert)
+            .expect("retry with same operation_id succeeds");
+        // 次の BEGIN から再開できる。
+        engine
+            .execute_sql_in_txn(&caller, &mut session, &mut txn, "BEGIN")
+            .expect("begin again");
+        engine
+            .execute_sql_in_txn(&caller, &mut session, &mut txn, "ROLLBACK")
+            .expect("rollback");
     }
 
     #[test]

@@ -95,7 +95,7 @@ macro_rules! define_error_classes {
 pub(crate) const SHARED_WIRE_CODES: &[&str] = &["23502", "23505", "22023", "P0002"];
 
 define_error_classes! {
-    count = 97;
+    count = 98;
 
     /// 構文上受理された SQL の値・引数が不正（`22000`）。
     /// [`crate::sql::allowlist::SqlSurfaceError::InvalidInput`] の写像。
@@ -245,6 +245,12 @@ define_error_classes! {
     /// [`crate::catalog::CatalogError::WriteLockTimeout`]・
     /// [`crate::sql::allowlist::SqlSurfaceError::LockNotAvailable`] の写像。
     LockNotAvailable => ("55P03", "LOCK_NOT_AVAILABLE"),
+    /// 直列化の失敗（`40001`。ERR-6・ERR-7・SQL-38・TASK-333・Issue #2398）。
+    /// 明示トランザクションの writer 取得時に、読み取りの前提が古くなっていたことを示す。
+    /// `ROLLBACK` の後に最初から再試行してよい。文言は固定で、表名・テナント・件数を含めない。
+    /// [`crate::sql::allowlist::SqlSurfaceError::SerializationFailure`] の写像
+    /// （送出経路の結線は TASK-333 の #2405）。
+    SerializationFailure => ("40001", "SERIALIZATION_FAILURE"),
     /// 前提状態を満たさない対象への操作（`55000`）。TABLE-42・Issue #1664 が追加。
     /// 未実体化の MATERIALIZED VIEW（`WITH NO DATA`、または読み手の文脈に実体が無い）を
     /// 読もうとした場合に返す。他文脈の実体の有無・件数は含めない。
@@ -737,5 +743,17 @@ mod tests {
             .filter(|c| !c.has_connected_send_path())
             .collect();
         assert_eq!(unconnected, Vec::<ErrorClass>::new());
+    }
+
+    /// ERR-6・ERR-7・SQL-38・TASK-333（Issue #2398）: `40001` の分類。
+    #[test]
+    fn serialization_failure_class_is_40001() {
+        let c = ErrorClass::SerializationFailure;
+        assert_eq!(c.wire_code(), "40001");
+        assert_eq!(c.label(), "SERIALIZATION_FAILURE");
+        assert_eq!(
+            crate::sql::allowlist::SqlSurfaceError::SerializationFailure.wire_code(),
+            "40001"
+        );
     }
 }
