@@ -83,6 +83,7 @@ pub(crate) mod namespace;
 pub(crate) mod function;
 pub(crate) mod function_dependency;
 // TRIGGER のカタログ（TABLE-45・Issue #1722。設計記録: `docs/design/trigger-catalog.md`）。
+pub(crate) mod policy;
 pub(crate) mod trigger;
 // 表ごとの行セキュリティ有効化状態（RLS-13・Issue #2275）。
 pub mod row_security;
@@ -12355,6 +12356,8 @@ impl Storage {
             rowid_alloc::delete_table_in_txn(write_txn, name)?;
             // TRIGGER 定義（全テナント分。TABLE-45・Issue #1722）。残置すると同名再作成で旧定義が復活する。
             trigger::remove_triggers_for_table_in_txn(write_txn, name)?;
+            // 行セキュリティポリシー（全テナント分。RLS-13・Issue #2274）。同名再作成で旧定義を復活させない。
+            policy::remove_policies_for_table_in_txn(write_txn, name)?;
             // 行セキュリティ有効化状態（全テナント分。RLS-13・Issue #2275）。残置すると同名再作成で旧状態が復活する。
             row_security::remove_row_security_for_table_in_txn(write_txn, name)?;
             // 永続キー索引（Issue #1071）。残置すると参照整合性検査が fail-open になりうる。
@@ -12763,6 +12766,13 @@ impl Storage {
                     column_name.to_string(),
                 ));
             }
+            // ポリシーの式が参照する列も同様に削除できない（RLS-13・Issue #2274。ポリシー名・テナントを
+            // 応答に含めない。CASCADE による連鎖削除は未対応）。
+            if policy::policies_referencing_column_in_txn(write_txn, table_name, column_name)? {
+                return Err(CatalogError::DependentObjectsStillExist(
+                    column_name.to_string(),
+                ));
+            }
             // `PRIMARY KEY`（TABLE-16・TASK-204、Issue #903）の構成列は
             // `constraint::enforce_unique_keys_in_txn` がテナント全行を走査する
             // 前提として生存し続けなければならない。ここで拒否せず
@@ -12927,6 +12937,12 @@ impl Storage {
         if trigger::triggers_referencing_column_in_txn(&*write_txn, table_name, old_name)? {
             return Err(AlterCheckError::Sql(SqlSurfaceError::FeatureNotSupported {
                 detail: "renaming a column used by a trigger is not supported".to_string(),
+            }));
+        }
+        // ポリシーの式が参照する列の改名は追随が入るまで拒否する（RLS-13・Issue #2274 の暫定ガード）。
+        if policy::policies_referencing_column_in_txn(&*write_txn, table_name, old_name)? {
+            return Err(AlterCheckError::Sql(SqlSurfaceError::FeatureNotSupported {
+                detail: "renaming a column used by a policy is not supported".to_string(),
             }));
         }
         let mut schema = {
@@ -13172,6 +13188,8 @@ impl Storage {
         rename_index_def_table_in_txn(&write_txn, table_name, new_table_name)?;
         // TRIGGER 定義（全テナント分）も新しい表キーへ移す（TABLE-45・Issue #1722）。
         trigger::rename_table_in_txn(&write_txn, table_name, new_table_name)?;
+        // 行セキュリティポリシー（全テナント分）も新しい表キーへ移す（RLS-13・Issue #2274）。
+        policy::rename_table_in_txn(&write_txn, table_name, new_table_name)?;
         // 行セキュリティ有効化状態（全テナント分）も新しい表キーへ移す（RLS-13・Issue #2275）。
         row_security::rename_row_security_table_in_txn(&write_txn, table_name, new_table_name)?;
 
@@ -14631,6 +14649,12 @@ impl Storage {
         if trigger::triggers_referencing_column_in_txn(&*write_txn, table_name, column_name)? {
             return Err(AlterCheckError::Sql(SqlSurfaceError::FeatureNotSupported {
                 detail: "cannot alter type of a column used by a trigger".to_string(),
+            }));
+        }
+        // ポリシーの式が参照する列の型変更は拒否する（RLS-13・Issue #2274 の暫定ガード）。
+        if policy::policies_referencing_column_in_txn(&*write_txn, table_name, column_name)? {
+            return Err(AlterCheckError::Sql(SqlSurfaceError::FeatureNotSupported {
+                detail: "cannot alter type of a column used in a policy definition".to_string(),
             }));
         }
         let mut revalidate_schema: Option<TableSchema> = None;

@@ -228,6 +228,53 @@
 未決事項: マスクのキャッシュ化（判断 C）、ポリシー再帰の深さ上限値、`RlsSafetyNet` へのポリシー再判定の追加、
 PR #2828 のマージ後の相互リンクの追従。
 
+## カタログ形（#2274）
+
+RLS-13 のポインタ。ポリシーの定義だけを持ち、読み書きの経路への適用（USING・WITH CHECK の評価と合成）は
+Issue #2276・#2277 の担当のため、本節の導入後も行の可視性は変わらない（テナント境界は従来どおり）。
+
+### 保存とキー
+
+- 専用表 `policies`（キー `(table_key, tenant_id, policy_name)`、値は版付き blob）と採番表 `policy_id_counter`。どちらも
+  最初の書き込みまで作らない（遅延作成）。`catalog::trigger` と同じ型で、表キーを先頭に置くので表の DROP・RENAME は
+  全テナント分を前方一致の範囲走査だけで処理する
+- 全 API が `tenant_id` を必須引数に取り、範囲走査でも突き合わせる。他テナントの定義は構造上引けない。他テナントにしか
+  無い名前への `ALTER`／`DROP` は本当に無い場合と同じ `42704`（`IF EXISTS` は成功の no-op）
+- blob は版 1。並びは `version / id / owner(予約・常に 0) / permissive / command / roles / using / check / 参照列`。
+  未知の版・タグ・予約バイトが 0 以外・切断・末尾の余り・上限超過・キーと値の不整合は固定文言の `CorruptSchema`
+  （断片・tenant_id・式本文を含めない。応答は `XX000`）
+- 保存するのは束縛・往復一致を確認した正規化テキストだけ。読み出し時は untrusted として再解析する
+- 上限: 1 表・1 テナントあたり 64 件（超過は `54000`）、式は 4096 バイト、参照列は列数上限まで。確保の前に検証する
+
+### 判断
+
+| 項目 | 内容 |
+| ---- | ---- |
+| 所有者の判定 | ロール・所有者は未実装のため、既存の DDL 権限ゲート `require_ddl_permission`（`42501`）で代替する。権限ゲートはカタログ照会より前に置き、対象の有無を問わず同じ応答にする（[privilege-check-paths.md](privilege-check-paths.md)）。blob には予約バイトだけを置き、判定は持たない |
+| `TO` 句 | `PUBLIC`（既定）だけを受理する。名前付きロール・`CURRENT_USER`・`SESSION_USER` は #2278 が入るまで `0A000`（存在を確かめられない名前を保存すると fail-open になるため） |
+| 式の受理範囲 | `CHECK` 本体と同じ文法・`WHERE` と同じ束縛。存在しない列は `42703`、真偽値でない式（非真偽値列・リテラル・算術）は `42804`、`tenant_id`・`visibility`・`visible()` は `42601`。決定性（`42P17`）は要求しない |
+| `FOR` と句 | `SELECT`／`DELETE` の `WITH CHECK` と `INSERT` の `USING` は `42601`。`ALTER POLICY` で既存の `FOR` と矛盾する句を足す形は実行段で同じ `42601` |
+| `ALTER POLICY` | `RENAME TO` は他の句と併用できない（`42601`）。句が 1 つも無い形は PG 17 と同じく受理する（対象の存在だけ確かめる）。指定しない句は保持し、式は同じ txn のスキーマで再束縛して参照列を求め直す |
+| 句の順序 | PG 17 と同じ `AS`→`FOR`→`TO`→`USING`→`WITH CHECK`。順序違い・重複は `42601` |
+
+### ライフサイクル追随（同じ write txn）
+
+- `DROP TABLE`・`DROP SCHEMA ... CASCADE` の表削除は全テナント分のポリシーを消す（同名再作成で復活しない）。
+  `ALTER TABLE RENAME` は新しい表キーへ移す。`SET SCHEMA` は表キーを変えないため追随は不要
+- `DROP COLUMN` は、いずれかのテナントのポリシーが参照する列なら `2BP01`（RESTRICT・CASCADE とも。ポリシー名・テナントを
+  応答に含めない）。`RENAME COLUMN`・`ALTER COLUMN TYPE` は暫定で `0A000`（trigger の `UPDATE OF` と同じガード）
+- 対象表の世代（`bump_table_generation_in_txn`）を作成・変更・削除のたびに進める
+
+### PG 17 との差
+
+| 項目 | PG 17 | 本実装 |
+| ---- | ----- | ------ |
+| `DROP POLICY IF EXISTS` の NOTICE | 出る | 出さない（wire に NOTICE の仕組みが無い。`DROP TRIGGER IF EXISTS` と同じ） |
+| 明示トランザクション内の DDL | 受理 | `0A000`（権限なしは `42501`）。ポリシー DDL は独立した write txn で commit され ROLLBACK で取り消せない |
+| 式中の部分クエリ・`current_user` | 受理 | 拒否（評価側の再帰・認証情報の合成は #2276・#2278 の担当） |
+| `RENAME COLUMN` の追随 | ポリシーの式を自動で書き換える | 暫定ガードで拒否（自動追随は後続の課題） |
+| `DROP COLUMN CASCADE` | 依存ポリシーを連鎖削除 | `2BP01` で拒否 |
+
 ## セキュリティ観点（OWASP Top 10）
 
 | 観点 | 本設計での扱い |

@@ -479,6 +479,50 @@ fn view_definition_changes_are_recorded_as_ddl() {
 }
 
 #[test]
+fn policy_ddl_is_recorded_as_ddl_and_never_unrecordable() {
+    use crate::catalog::policy::{PolicyCommand, PolicyDef, PolicyExprs, PolicyRole};
+    let (core, _g) = new_core("clog-policy-ddl");
+    let (mut txn, g_s) = begin(&core, "tenant-a");
+    let def = PolicyDef {
+        id: 0,
+        name: "p".to_string(),
+        permissive: true,
+        command: PolicyCommand::All,
+        roles: vec![PolicyRole::Public],
+        using_sql: None,
+        check_sql: None,
+        referenced_columns: Vec::new(),
+    };
+    let exprs = || PolicyExprs {
+        using_sql: None,
+        check_sql: None,
+        referenced_columns: Vec::new(),
+    };
+    core.storage
+        .create_policy::<crate::catalog::CatalogError, _>("tenant-a", "ca", &def, |_| Ok(exprs()))
+        .expect("create policy");
+    core.storage
+        .alter_policy::<crate::catalog::CatalogError, _>("tenant-a", "ca", "p", |_, cur| {
+            Ok(cur.clone())
+        })
+        .expect("alter policy");
+    core.storage
+        .rename_policy("tenant-a", "ca", "p", "q")
+        .expect("rename policy");
+    assert!(core
+        .storage
+        .drop_policy("tenant-a", "ca", "q")
+        .expect("drop"));
+
+    let recs = records(&core, g_s).expect("verifiable");
+    assert_eq!(recs.len(), 4, "{recs:?}");
+    for rec in &recs {
+        assert!(footprint(rec, "ca").ddl, "{rec:?}");
+    }
+    rollback(&core, "tenant-a", &mut txn);
+}
+
+#[test]
 fn repeated_write_txns_are_never_rejected_by_a_reused_frame_address() {
     let (core, _g) = new_core("clog-handle-reuse");
     for _ in 0..16 {

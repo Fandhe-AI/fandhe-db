@@ -45,6 +45,7 @@ mod rls10_recursive_cte_paths;
 mod rls10_relational_paths;
 mod rls10_sql_function_paths;
 mod rls11_read_your_writes;
+mod rls13_policy_ddl;
 mod rls13_row_security;
 mod rls_generalized;
 mod rls_implicit;

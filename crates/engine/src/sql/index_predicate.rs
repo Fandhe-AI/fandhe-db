@@ -97,7 +97,9 @@ pub(crate) enum PredicateEvalError {
 
 /// 述語の木が参照する列名を重複なしで集める。`map_predicate_columns` の共有走査器に恒等写像を
 /// 渡して副作用で収集する（第 2 の走査器を作らない。`Or`・`Not`・式の内側も走査される）。
-fn collect_column_names(preds: &[WherePredicate]) -> Result<Vec<String>, SqlSurfaceError> {
+pub(crate) fn collect_column_names(
+    preds: &[WherePredicate],
+) -> Result<Vec<String>, SqlSurfaceError> {
     let seen: RefCell<Vec<String>> = RefCell::new(Vec::new());
     let record = |c: &str| {
         let mut v = seen.borrow_mut();

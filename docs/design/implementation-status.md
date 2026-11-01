@@ -1440,4 +1440,6 @@ Issue #1405（fix(engine)!: CREATE TYPE の型名の重複を 42710 で返す。
 
 **Issue #2273（docs(design): 行セキュリティポリシーとテナント境界の合成設計を書く。RLS-13 ポインタ。詳細は [row-security-policy-composition.md](row-security-policy-composition.md)）**: 親 #2272 の合成規則（テナント境界の内側で AND 合成し狭めるだけ）を、評価順・各経路の差し込み位置・PERMISSIVE／RESTRICTIVE・BYPASSRLS ほかが外す範囲・評価コンテキストと存在秘匿・索引走査との合成の 5 論点で PG 17 と対比して設計文書にまとめた。ドキュメントのみでコード・依存・CI は変更していない。
 
+**Issue #2274（feat(engine): ポリシーのカタログと CREATE／ALTER／DROP POLICY を実装する。RLS-13 ポインタ。詳細は [row-security-policy-composition.md](row-security-policy-composition.md) の「カタログ形（#2274）」節）**: テナントごとのポリシー定義を redb のカタログ（`catalog::policy`）へ永続化し、`CREATE POLICY`／`ALTER POLICY`／`DROP POLICY` を PG 17 と同じ SQLSTATE（`42710`・`42704`・`42501`・`42703`・`42804` ほか）で受け付けるようにした。式は定義時に束縛・正規化・往復一致を確認し、表の DROP・RENAME・参照列の DROP にライフサイクルを追随させる。所有者の判定はロール機構が入るまで DDL 権限ゲートで代替し、`TO` は `PUBLIC` のみ受理する。ポリシーを読み書きに適用する処理は含まず、行の可視性は変わらない（#2276・#2277 以降）。依存の変更なし。
+
 **Issue #2275（feat(engine): ALTER TABLE の ENABLE／DISABLE／FORCE／NO FORCE ROW LEVEL SECURITY を実装する。RLS-13 ポインタ。詳細は [row-security-policy-composition.md](row-security-policy-composition.md) の「有効化状態（#2275）」）**: 表 x テナントごとの有効化状態（enabled・forced の独立 2 ビット）を redb 表 `table_row_security` に永続化し、4 文の構文・DDL 実行・DROP／RENAME への追随・判定 API `user_policies_apply` を追加した。テナント境界には触れず、行の見え方への適用は #2276 以降。RLS アクションを含む複数アクション・一時表が隠す永続表への適用は `0A000`。
