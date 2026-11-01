@@ -3,7 +3,7 @@
 - ステータス: **Accepted（実装既定値）**
 - 対応: Issue #942・TASK-221
 - 改訂: Issue #2396・TASK-333（決定 1 を改訂。writer の遅延取得と `40001` の判定は
-  下記 1a。実装は #2399〜#2405・#2408 で進行中。#2399・#2400・#2401・#2404 は実施済み。設計記録は #2397）
+  下記 1a。実装は #2399〜#2405・#2408 で進行中。#2399・#2400・#2401・#2404・#2405 は実施済み。設計記録は #2397）
 - ポインタ: `docs/spec/04-behavior/sql-surface.md` SQL-31・
   `docs/spec/04-behavior/persistence.md` RECOVER-12・
   `docs/spec/04-behavior/error-format.md` ERR-6
@@ -290,7 +290,7 @@ Issue（#2399〜#2405・#2408〜#2413）が拠り所にする設計記録で、�
 経路のためのもの。
 
 照会 API は `CommitLog::records_between(g_s, g_now)`（床より古い・世代の欠け・汚染は `Unverifiable`）、
-`SessionTransaction::read_set()`・`snapshot_generation()`。本番からはまだ呼ばれない（#2405 が結線する）。
+`SessionTransaction::read_set()`・`snapshot_generation()`。`ensure_writer_with` が #2405 で結線した（1a-11）。
 
 **足跡の取り方（経路ごと）**:
 
@@ -302,6 +302,31 @@ Issue（#2399〜#2405・#2408〜#2413）が拠り所にする設計記録で、�
 | TRUNCATE | `retain_in` で消える各行のヘッダ（0 行でも `note_table`） |
 | DDL・マテビュー・トリガ定義・採番・CTAS・移行 | `note_ddl` |
 | テスト専用の生の挿入 | `note_row` |
+
+#### 1a-11. 実装上の決定（#2405）
+
+writer 取得時の `40001` 判定（1a-3・1a-6・1a-7）の実装で固定した決定。
+
+- **挿入位置と順序**: `SessionTransaction::ensure_writer_with` の中で、gate 取得 → 読み取り集合の確定 →
+  判定 → 衝突なしなら登録を外して終了、の順。判定は行・台帳・カタログ・世代へ何も書く前に、permit を
+  保持したまま行う。衝突なら `ActiveTxn` を drop（write txn の abort → permit 解放）して `Failed` へ遷移し、
+  副作用は残らない。
+- **`PolicyContext` の受け渡し**: `ensure_writer`／`ensure_writer_with` は書き込み文を実行する接続の
+  `PolicyContext` を必須引数で受ける（判定を飛ばす経路を作らない）。判定用の文脈を新たに作らない。
+- **判定の入力**: 読み取り集合が空なら判定しない。`g_now` は取得時点の確定世代（permit 保持中は他の commit が
+  起きないため安定）。`g_now` が `G_s` 以下なら衝突なし。
+- **判定不能は衝突**: commit 記録を持たないストレージ・記録の床より古い・世代の欠け・mutex 汚染は
+  `40001` に倒す（fail-closed。新しい `wire_code` は作らない）。世代の読み取り失敗は `XX000`。
+- **述語**: `storage::commit_log::conflicts_with`。読み取り集合に含まれる表（ワイルドカードは全表）への
+  記録のうち、DDL、または `PolicyContext::is_visible` で可視な足跡（自テナントの Private・Public）があれば衝突。
+  可視性は必ず `is_visible` を通し、判定ロジックを二重に持たない。他テナントの Private だけの commit は
+  原因にならない。
+- **取得前の存在確認**: `LOCK TABLE` の取得前の存在確認は読み取り集合へ入らない（読まずに書く形のため。
+  テストで固定）。
+- **採らないこと**: 早期の事前判定（gate を待つ前の衝突返却）は行わず、判定経路を 1 本に保つ。
+- テスト: `crates/engine/src/core/serialization_failure_tests.rs`・
+  `crates/engine/src/storage/commit_log.rs` の述語テスト・
+  `crates/engine/tests/sql_t01_39/sql31_serialization_failure.rs`（SQL-31・SQL-38）。
 
 ### 2. writer gate（待機上限付き。ロック待ちで `55P03`）
 
@@ -421,8 +446,8 @@ Failed { session_at_begin: SessionState, expired: bool } }`）。`ActiveTxn` は
     `42601` で拒否されるので届かない（#2230・#1958 は同じ入口を呼ぶ）。
   - `55P03`（待機上限超過）の発生点は `BEGIN` から最初の書き込み文へ移る。受けた Tx は `Failed`
     になり、以降の文は `25P02`、受理するのは `ROLLBACK` だけ。取得前は何も書いていない。
-  - `ensure_writer` は 1a-3 の「gate 取得 → permit 保持のまま判定 → 格納」の挿入点で、#2405 が
-    取得と格納の間に `40001` 判定を入れる。
+  - `ensure_writer` は 1a-3 の「gate 取得 → permit 保持のまま判定 → 格納」の挿入点で、`40001` 判定は
+    #2405 で入った（1a-11）。
   - 暗黙トランザクション（WIRE-16）は従来どおり開始時に writer を取る（スナップショットは取得後に開く。#2401）。
   - 取得の前後の回帰（read-your-writes・COMMIT までの隔離・ROLLBACK 後のキャッシュ非汚染・ファイル形
     `INSERT`・`USING PLAN`・`EXPLAIN`・`COPY FROM`・`setval`）は #2402 のテストで固定済み（SQL-19・SQL-31）。

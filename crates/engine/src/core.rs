@@ -97,6 +97,8 @@ mod read_set_tests;
 // commit 記録（SQL-38・Issue #2404）。
 #[cfg(test)]
 mod commit_log_tests;
+#[cfg(test)]
+mod serialization_failure_tests;
 // writer 遅延取得の前後の回帰固定（Issue #2402。ポインタ: SQL-19・SQL-31・TASK-333）。
 #[cfg(test)]
 mod deferred_writer_regression_tests;
@@ -8037,7 +8039,7 @@ impl EngineCore {
             ParsedSql::Insert(stmt) => {
                 let lookup = InsertSchemaLookup::new(&self.storage);
                 // 最初の書き込み文で writer を取得する（Issue #2400。待機超過は `55P03`。呼び出し元が `Failed` へ遷移）。
-                txn.ensure_writer()?;
+                txn.ensure_writer(ctx)?;
                 let write_txn = txn.write_txn().ok_or_else(|| SqlSurfaceError::Internal {
                     detail: "internal error".to_string(),
                 })?;
@@ -8064,7 +8066,7 @@ impl EngineCore {
             // `InTxn` を渡す。台帳・`mark_written` は基表の単位（ビュー名ではない）。
             ParsedSql::ViewInsert(stmt) => {
                 // 最初の書き込み文で writer を取得する（Issue #2400。待機超過は `55P03`。呼び出し元が `Failed` へ遷移）。
-                txn.ensure_writer()?;
+                txn.ensure_writer(ctx)?;
                 let write_txn = txn.write_txn().ok_or_else(|| SqlSurfaceError::Internal {
                     detail: "internal error".to_string(),
                 })?;
@@ -8080,7 +8082,7 @@ impl EngineCore {
             // 基表の単位（ビュー名ではない）。
             ParsedSql::ViewDelete(stmt) => {
                 // 最初の書き込み文で writer を取得する（Issue #2400。待機超過は `55P03`。呼び出し元が `Failed` へ遷移）。
-                txn.ensure_writer()?;
+                txn.ensure_writer(ctx)?;
                 let write_txn = txn.write_txn().ok_or_else(|| SqlSurfaceError::Internal {
                     detail: "internal error".to_string(),
                 })?;
@@ -8095,7 +8097,7 @@ impl EngineCore {
             }
             ParsedSql::ViewUpdate(stmt) => {
                 // 最初の書き込み文で writer を取得する（Issue #2400。待機超過は `55P03`。呼び出し元が `Failed` へ遷移）。
-                txn.ensure_writer()?;
+                txn.ensure_writer(ctx)?;
                 let write_txn = txn.write_txn().ok_or_else(|| SqlSurfaceError::Internal {
                     detail: "internal error".to_string(),
                 })?;
@@ -8110,7 +8112,7 @@ impl EngineCore {
             }
             ParsedSql::Delete(stmt) => {
                 // 最初の書き込み文で writer を取得する（Issue #2400。待機超過は `55P03`。呼び出し元が `Failed` へ遷移）。
-                txn.ensure_writer()?;
+                txn.ensure_writer(ctx)?;
                 let write_txn = txn.write_txn().ok_or_else(|| SqlSurfaceError::Internal {
                     detail: "internal error".to_string(),
                 })?;
@@ -8164,7 +8166,7 @@ impl EngineCore {
                     }
                 };
                 // 最初の書き込み文で writer を取得する（Issue #2400。待機超過は `55P03`。呼び出し元が `Failed` へ遷移）。
-                txn.ensure_writer()?;
+                txn.ensure_writer(ctx)?;
                 let write_txn = txn.write_txn().ok_or_else(|| SqlSurfaceError::Internal {
                     detail: "internal error".to_string(),
                 })?;
@@ -8193,7 +8195,7 @@ impl EngineCore {
             }
             ParsedSql::Truncate(stmt) => {
                 // 最初の書き込み文で writer を取得する（Issue #2400。待機超過は `55P03`。呼び出し元が `Failed` へ遷移）。
-                txn.ensure_writer()?;
+                txn.ensure_writer(ctx)?;
                 let write_txn = txn.write_txn().ok_or_else(|| SqlSurfaceError::Internal {
                     detail: "internal error".to_string(),
                 })?;
@@ -8325,7 +8327,7 @@ impl EngineCore {
                     return Ok(crate::sql::SqlOutcome::Query(result));
                 }
                 // 最初の書き込み文で writer を取得する（Issue #2400。待機超過は `55P03`。呼び出し元が `Failed` へ遷移）。
-                txn.ensure_writer()?;
+                txn.ensure_writer(ctx)?;
                 let write_txn = txn.write_txn().ok_or_else(|| SqlSurfaceError::Internal {
                     detail: "internal error".to_string(),
                 })?;
@@ -8350,10 +8352,10 @@ impl EngineCore {
             // SQL-63・Issue #1876: 全副文・台帳記録・主クエリを共有 write txn で実行する。書いた全表へ
             // `mark_written` する（漏れると遅延 FK の COMMIT 時検査が取りこぼす。P0）。
             ParsedSql::Do(stmt) => self.execute_do_in_txn(ctx, session, txn, stmt),
-            ParsedSql::Lock(stmt) => self.execute_lock_in_active_txn(txn, stmt),
+            ParsedSql::Lock(stmt) => self.execute_lock_in_active_txn(ctx, txn, stmt),
             ParsedSql::DataModifyingCte(stmt) => {
                 // 最初の書き込み文で writer を取得する（Issue #2400。待機超過は `55P03`。呼び出し元が `Failed` へ遷移）。
-                txn.ensure_writer()?;
+                txn.ensure_writer(ctx)?;
                 let write_txn = txn.write_txn().ok_or_else(|| SqlSurfaceError::Internal {
                     detail: "internal error".to_string(),
                 })?;
@@ -8366,7 +8368,7 @@ impl EngineCore {
             }
             ParsedSql::InsertSelect(stmt) => {
                 // 最初の書き込み文で writer を取得する（Issue #2400。待機超過は `55P03`。呼び出し元が `Failed` へ遷移）。
-                txn.ensure_writer()?;
+                txn.ensure_writer(ctx)?;
                 let write_txn = txn.write_txn().ok_or_else(|| SqlSurfaceError::Internal {
                     detail: "internal error".to_string(),
                 })?;
@@ -13072,6 +13074,11 @@ impl EngineCore {
         let resolver = self.schema_resolver(ctx);
         let copy_tokens =
             crate::sql::relation_name::tokenize_resolved_with(sql, false, Some(&resolver))?;
+        // `COPY FROM`（書き込み）の検証・schema lookup は読み取りではないので読み取り集合へ記録しない
+        // （記録すると write-only の COPY が先行 read 扱いになり、BEGIN 後の可視 commit で `40001` に
+        // なる。#2405。`LOCK TABLE` の存在確認・INSERT の writer 先取りと同じ扱い）。関数末尾まで有効。
+        let _suspend = (!crate::sql::allowlist::is_copy_to_statement(&copy_tokens))
+            .then(crate::sql::read_set::SuspendGuard::enter);
         // 読み取りの `COPY TO` は実行の読み取り源と同じ時点のカタログで検証する（Issue #2403。
         // 同時 DDL で検証と実行が食い違わない）。`COPY FROM`（書き込み）は従来どおり最新のカタログ。
         let stmt = if crate::sql::allowlist::is_copy_to_statement(&copy_tokens) {
@@ -13208,7 +13215,7 @@ impl EngineCore {
                 let table = batch.table.clone();
                 // writer は COPY の確定処理（CopyDone 後）で初めて取得する（Issue #2400。データ受信中は
                 // 持たない）。取得失敗（`55P03`）も下の `Err` 腕で `fail()` を通す。
-                let result = match txn.ensure_writer() {
+                let result = match txn.ensure_writer(ctx) {
                     Err(e) => Err(e),
                     Ok(()) => match txn.write_txn() {
                         Some(write_txn) => self.commit_copy_in_with_target(

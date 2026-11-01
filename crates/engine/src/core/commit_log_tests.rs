@@ -326,7 +326,7 @@ fn retained_records_are_dropped_when_the_registration_ends_in_every_way() {
     let (mut txn, _) = begin(&core, "tenant-a");
     run(&core, "tenant-b", &insert("ca", 3, "l-3"));
     assert_eq!(stats(&core).0, 1);
-    txn.ensure_writer().expect("writer");
+    txn.ensure_writer(&ctx("tenant-a")).expect("writer");
     assert_eq!(stats(&core).0, 0, "registration ends at writer acquisition");
     drop(txn);
 
