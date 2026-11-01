@@ -1423,3 +1423,5 @@ Issue #1405（fix(engine)!: CREATE TYPE の型名の重複を 42710 で返す。
 **Issue #1938（feat(engine): ISOLATION LEVEL 修飾子の構文を受理する。SQL-38 ポインタ）**: `BEGIN [WORK|TRANSACTION] ISOLATION LEVEL {SERIALIZABLE|REPEATABLE READ|READ COMMITTED|READ UNCOMMITTED}` を受理し、要求レベルを `sql::transaction::RequestedIsolationLevel` として `ActiveTxn` に記録する（`SessionTransaction::isolation_level()`）。実行は単一ライタのまま不変。公開構造体 `ValidatedTxnControl` に `isolation_level` フィールドを追加した（破壊的変更）。受理範囲の詳細は設計文書のポインタ先に従う。`START TRANSACTION` と `READ ONLY` は別 Issue。テストは `sql::transaction` の単体テストと `tests/sql_t01_39/sql38_begin_isolation_level.rs`。
 
 **Issue #1956（docs(design): 行ロック句・LOCK TABLE の扱いを設計文書へ記録する。SQL-38・TABLE-3・PERSIST-4・SQL-31 ポインタ）**: [explicit-transaction.md](explicit-transaction.md) に「行ロック句・`LOCK TABLE` の扱い」節を追加した（単一ライタの writer 取得への写像・取得経路・形ごとの担当 Issue・要確認事項を記録。契約はポインタのみ）。コードは変更していない。
+
+**Issue #1960（docs(design): ロール・権限モデルの ADR を起こす。親 #1959・SQL-39・SQL-40・RLS-12 ポインタ。詳細は [role-privilege-model.md](role-privilege-model.md)）**: ロールのカタログ・ACL・所有者・共通検査ゲート・users ファイルのブートストラップ化・テナント境界との関係を ADR として記録した。ドキュメントのみでコード・依存・CI は変更していない。ステータスは Proposed（オーナー承認待ち）で、#1960 は承認まで open に残す。後続 sub-issue の前提として参照する。
