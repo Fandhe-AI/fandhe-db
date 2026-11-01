@@ -1004,6 +1004,14 @@ pub(crate) fn map_outcome(outcome: SqlOutcome) -> OutcomeResponse {
         SqlOutcome::GrantRevoke(o) => OutcomeResponse::Command {
             tag: if o.is_revoke() { "REVOKE" } else { "GRANT" }.to_string(),
         },
+        // SQL-39（Issue #1962）: ロール DDL も件数を持たない固定タグ（`CREATE USER` も PostgreSQL と同じ
+        // `CREATE ROLE`）。
+        SqlOutcome::CreateRole(_) => OutcomeResponse::Command {
+            tag: "CREATE ROLE".to_string(),
+        },
+        SqlOutcome::DropRole(_) => OutcomeResponse::Command {
+            tag: "DROP ROLE".to_string(),
+        },
         // SQL-68（Issue #2228）: `DO` ブロックも件数を持たない固定タグ。
         SqlOutcome::Do => OutcomeResponse::Command {
             tag: "DO".to_string(),

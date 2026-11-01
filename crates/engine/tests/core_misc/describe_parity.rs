@@ -72,6 +72,8 @@ fn assert_describe_matches_execute(core: &EngineCore, ctx: &PolicyContext, sql: 
         | SqlOutcome::AlterPolicy(_)
         | SqlOutcome::DropPolicy(_)
         | SqlOutcome::GrantRevoke(_)
+        | SqlOutcome::CreateRole(_)
+        | SqlOutcome::DropRole(_)
         | SqlOutcome::Insert(_)
         | SqlOutcome::Truncate(_)
         | SqlOutcome::Delete(_)

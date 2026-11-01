@@ -86,8 +86,8 @@ pub(crate) mod function_dependency;
 pub(crate) mod policy;
 pub(crate) mod trigger;
 // ロール・メンバーシップ・ログイン名対応表と ACL のカタログ（SQL-39・SQL-40 のポインタ、Issue #1961。設計記録:
-// `docs/design/role-privilege-model.md`）。利用側（CREATE ROLE #1962・GRANT #1965・検査ゲート #1966 ほか）が
-// 入るまでは crate 内の呼び出し元がテストと relation のライフサイクル掃除だけのため、dead_code を許可する。
+// `docs/design/role-privilege-model.md`）。利用側のうち CREATE／DROP ROLE（#1962）は結線済みで、GRANT #1965・
+// 検査ゲート #1966 ほかが入るまでは crate 内の呼び出し元がテストと relation のライフサイクル掃除だけのため、dead_code を許可する。
 #[allow(dead_code)]
 pub(crate) mod privilege;
 #[allow(dead_code)]

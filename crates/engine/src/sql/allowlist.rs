@@ -47,6 +47,13 @@ pub(crate) use trigger::{
 };
 pub use trigger::{ValidatedCreateTrigger, ValidatedDropTrigger};
 // POLICY DDL の構文検証（RLS-13・Issue #2274）。
+mod role;
+pub(crate) use role::{
+    is_create_role_statement, is_drop_role_statement, validate_create_role_tokens,
+    validate_drop_role_tokens, RolePassword,
+};
+pub use role::{ValidatedCreateRole, ValidatedDropRole};
+
 mod policy;
 pub(crate) use policy::{
     is_alter_policy_statement, is_create_policy_statement, is_drop_policy_statement,
@@ -1167,6 +1174,17 @@ pub enum SqlSurfaceError {
     NoSchemaSelected,
     /// 予約名（`pg_` 接頭辞）の SCHEMA 名の指定（TABLE-27・ERR-6、Issue #1713）。`42939`。
     ReservedName { name: String },
+    /// `CREATE ROLE`／`CREATE USER` の名前が同一テナント内の既存ロールと衝突した（SQL-39・ERR-6、
+    /// Issue #1962）。`42710`。名前は利用者自身が書いた識別子だけで、内部 ID・他テナントの情報を含めない。
+    DuplicateRole { name: String },
+    /// `DROP ROLE` の対象が呼び出し元テナントに存在しない（SQL-39・RLS-12 のポインタ、Issue #1962）。
+    /// `42704`。他テナントにしか無い名前も同じ経路・同じ文言（存在を秘匿する）。
+    UndefinedRole { name: String },
+    /// `DROP ROLE` の対象に依存オブジェクト（ACL 等）が残っている（SQL-39・ERR-6、Issue #1962）。
+    /// `2BP01`。依存元は文言に含めない（security.md P0）。
+    RoleHasDependents { name: String },
+    /// 予約名（`pg_` 接頭辞・`public`・`none`）のロール名の指定（SQL-39、Issue #1962）。`42939`。
+    ReservedRoleName { name: String },
     /// `GENERATED ALWAYS AS IDENTITY` 列への明示値の書き込み（INSERT／UPDATE。TABLE-24・ERR-6、
     /// Issue #1695）。`428C9`。列名は利用者自身が書いた識別子のみ。
     GeneratedAlways { column: String },
@@ -1310,12 +1328,6 @@ pub enum SqlSurfaceError {
     /// ERR-6: `2BP01`）。依存元の名前一覧はエラー文言に含めない
     /// （security.md P0）。
     DependentObjectsStillExist { name: String },
-    /// `GRANT`／`REVOKE` の付与先ロールが自テナントに存在しない（`42704`。SQL-40・Issue #1965）。
-    /// 他テナントにだけ在るロールも同じ。`name` は利用者自身が書いた名前だけ。
-    ///
-    /// **BREAKING CHANGE**（Issue #1965）: variant を追加した。`SqlSurfaceError` を網羅的に `match`
-    /// するクレート外のコードは追随が必要。
-    UndefinedRole { name: String },
     /// `GRANT`／`REVOKE` の不正な操作（対象に許されない権限の種類・PUBLIC への GRANT OPTION。`0LP01`。
     /// SQL-40・Issue #1965）。`detail` は固定文言のみ。
     InvalidGrantOperation { detail: String },
@@ -1455,6 +1467,10 @@ impl SqlSurfaceError {
             Self::DuplicateSchema { name } => Self::DuplicateSchema { name: f(&name) },
             Self::InvalidSchemaName { name } => Self::InvalidSchemaName { name: f(&name) },
             Self::DuplicateObject { name } => Self::DuplicateObject { name: f(&name) },
+            Self::DuplicateRole { name } => Self::DuplicateRole { name: f(&name) },
+            Self::UndefinedRole { name } => Self::UndefinedRole { name: f(&name) },
+            Self::RoleHasDependents { name } => Self::RoleHasDependents { name: f(&name) },
+            Self::ReservedRoleName { name } => Self::ReservedRoleName { name: f(&name) },
             Self::DuplicateType { name } => Self::DuplicateType { name: f(&name) },
             Self::InvalidTableDefinition { table } => {
                 Self::InvalidTableDefinition { table: f(&table) }
@@ -1467,7 +1483,6 @@ impl SqlSurfaceError {
                 Self::DependentObjectsStillExist { name: f(&name) }
             }
             Self::WrongObjectType { name } => Self::WrongObjectType { name: f(&name) },
-            Self::UndefinedRole { name } => Self::UndefinedRole { name: f(&name) },
             Self::InvalidGrantOperation { detail } => {
                 Self::InvalidGrantOperation { detail: f(&detail) }
             }
@@ -1983,7 +1998,12 @@ impl ClassifiedError for SqlSurfaceError {
             SqlSurfaceError::InvalidSchemaName { .. } | SqlSurfaceError::NoSchemaSelected => {
                 ErrorClass::InvalidSchemaName
             }
-            SqlSurfaceError::ReservedName { .. } => ErrorClass::ReservedName,
+            SqlSurfaceError::ReservedName { .. } | SqlSurfaceError::ReservedRoleName { .. } => {
+                ErrorClass::ReservedName
+            }
+            SqlSurfaceError::DuplicateRole { .. } => ErrorClass::DuplicateObject,
+            SqlSurfaceError::UndefinedRole { .. } => ErrorClass::UndefinedObject,
+            SqlSurfaceError::RoleHasDependents { .. } => ErrorClass::DependentObjectsStillExist,
             SqlSurfaceError::GeneratedAlways { .. } => ErrorClass::GeneratedAlways,
             SqlSurfaceError::DuplicateObject { .. } => ErrorClass::DuplicateObject,
             SqlSurfaceError::DuplicateType { .. } => ErrorClass::DuplicateObject,
@@ -2020,7 +2040,6 @@ impl ClassifiedError for SqlSurfaceError {
             SqlSurfaceError::NotNullViolation { .. } => ErrorClass::NotNullViolation,
             SqlSurfaceError::UniqueViolation => ErrorClass::UniqueViolation,
             SqlSurfaceError::UndefinedObject { .. } => ErrorClass::UndefinedObject,
-            SqlSurfaceError::UndefinedRole { .. } => ErrorClass::UndefinedObject,
             SqlSurfaceError::InvalidGrantOperation { .. } => ErrorClass::InvalidGrantOperation,
             SqlSurfaceError::UndefinedType { .. } => ErrorClass::UndefinedObject,
             SqlSurfaceError::UndefinedCollation { .. } => ErrorClass::UndefinedObject,
@@ -2234,6 +2253,22 @@ impl std::fmt::Display for SqlSurfaceError {
             SqlSurfaceError::ReservedName { name } => {
                 write!(f, "unacceptable schema name: {name}")
             }
+            // ロール名は利用者自身が書いた識別子のみ（内部 ID・他テナントの情報・依存元は含めない。Issue #1962）。
+            SqlSurfaceError::DuplicateRole { name } => {
+                write!(f, "role \"{name}\" already exists")
+            }
+            SqlSurfaceError::UndefinedRole { name } => {
+                write!(f, "role \"{name}\" does not exist")
+            }
+            SqlSurfaceError::RoleHasDependents { name } => {
+                write!(
+                    f,
+                    "role \"{name}\" cannot be dropped because some objects depend on it"
+                )
+            }
+            SqlSurfaceError::ReservedRoleName { name } => {
+                write!(f, "role name \"{name}\" is reserved")
+            }
             // 列名は利用者自身が書いた識別子のみ（値・他テナントの情報は含めない。Issue #1695）。
             SqlSurfaceError::GeneratedAlways { column } => {
                 write!(f, "cannot insert a non-DEFAULT value into column {column}")
@@ -2380,9 +2415,6 @@ impl std::fmt::Display for SqlSurfaceError {
             // 名前はクライアント自身が指定した識別子（`UndefinedTable` と同じ扱い）。
             SqlSurfaceError::UndefinedObject { name } => {
                 write!(f, "index does not exist: {name}")
-            }
-            SqlSurfaceError::UndefinedRole { name } => {
-                write!(f, "role does not exist: {name}")
             }
             SqlSurfaceError::InvalidGrantOperation { detail } => {
                 write!(f, "invalid grant operation: {detail}")

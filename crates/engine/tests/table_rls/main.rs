@@ -56,6 +56,7 @@ mod rls_safety_net;
 mod rls_security;
 mod row_codec;
 mod row_id_tenant_scope;
+mod sql39_role_ddl;
 mod sql40_grant_revoke;
 mod table15_hnsw_invalidation;
 mod table16_check_constraint;

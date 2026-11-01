@@ -352,3 +352,41 @@ PostgreSQL 17 の公開挙動と本 ADR の D5・D8・D9・D10 に従い、spec 
 （#2236）、`ALTER DEFAULT PRIVILEGES`（#2237）、権限検査ゲート（#1966〜#1969）、列レベル制御（#2081）、認証主体とロールの束縛
 （#1971・#2238。それまで wire の全セッションは GRANT／REVOKE で `42501`）、`GRANTED BY`、NoticeResponse による警告の送出、
 ビュー・matview の列権限、relation 単位の ACL 掃除の逆引き索引。
+
+## 9. Issue #1962 実装記録
+
+Issue #1962 は決定 D1・D2 のうち、`CREATE ROLE`／`CREATE USER`／`DROP ROLE`（`DROP USER` を含む）の SQL 表層を実装した。構文検証は `sql/allowlist/role.rs`、実行は `sql/role_ddl.rs`、永続化は #1961 のカタログ（`catalog/role.rs`）に `drop_role_in_txn`・`Storage::drop_roles` と、`catalog/privilege.rs` に `acl_references_role_in_txn` を足した。ポインタ: SQL-39・RLS-12・WIRE-18。
+
+### 検証子の生成を engine へ移した
+
+`CREATE ROLE ... PASSWORD` は engine の実行腕で検証子を作る。engine から wire-server へは依存できないため、`hmac_sha256`・`base64_std`・SCRAM 検証子（`ScramVerifier`・`generate_verifier`）・`/dev/urandom` の読み取りを `engine::crypto` へ移した。wire-server は `pub use` で再公開するだけで、既存の呼び出し元・`hash-password`・認証の挙動は変わらない。保存形式（`SCRAM-SHA-256$4096:<salt>$<StoredKey>:<ServerKey>`）は認証側と単一実装を共有する。依存の追加はない。
+
+### 受理する構文
+
+| 構文 | 扱い |
+| ---- | ---- |
+| `CREATE ROLE`／`CREATE USER <名> [WITH] LOGIN/NOLOGIN, INHERIT/NOINHERIT, CREATEROLE/NOCREATEROLE, CREATEDB/NOCREATEDB, [ENCRYPTED] PASSWORD '...'/NULL` | 受理。`CREATE USER` の既定は `LOGIN`。コマンドタグは `CREATE ROLE` |
+| `NOSUPERUSER`・`NOBYPASSRLS`・`NOREPLICATION` | 受理（既定どおり） |
+| `SUPERUSER`・`BYPASSRLS`・`REPLICATION` | `42501`（テナント境界を越える属性。`BYPASSRLS` は #2278 段 2 で解禁） |
+| `UNENCRYPTED PASSWORD`・`IN ROLE`・`ROLE`・`ADMIN`・`VALID UNTIL`・`CONNECTION LIMIT` | `0A000`（#2232・#2233 の担当） |
+| 重複・矛盾するオプション、未知語、`$n`、修飾名 | `42601` |
+| `pg_` 接頭辞・`public`・`none` | `42939` |
+| `DROP ROLE`／`DROP USER [IF EXISTS] a[, b]...` | 受理。全件を 1 つの write txn で処理し、途中で失敗したら全件取り消す |
+
+### パスワード
+
+平文は `RolePassword`（`Debug` は伏せ字・`Display` なし・`Drop` で 0 上書き）に閉じ込め、権限ゲートと明示 Tx ゲートを通った後に検証子へ変換する。salt は CSPRNG の 16 バイトで、乱数源が読めなければロールを作らない。印字可能 ASCII 以外と 1024 バイト超は `22023`、空文字列はパスワード無し。`SCRAM-SHA-256$` で始まる文字列は、反復回数と salt 長が認証側の要求と一致するときだけ既にハッシュ済みとしてそのまま保存し、満たさなければ `22023` で拒否する。`md5` 形は `0A000`。エラー文言にはパスワードの内容・長さ・位置を含めない。
+
+### DROP ROLE の依存検査
+
+1 件ごとに、解決（無ければ `42704`、`IF EXISTS` は skip）→ 依存検査（`2BP01`）→ メンバーシップの掃除（member 側・granted 側の両方。PostgreSQL と同じく依存扱いにしない）→ 削除の順で行う。依存検査は `role_has_dependents_in_txn` に集約し、現在は ACL の付与先・付与者だけを見る。所有者（#2236）・ポリシーの `TO <ロール>`（#2278 段 2）の検査はこの関数へ足す。
+
+### 判断の記録
+
+- **42501 の判定は DDL 権限ゲート**: `CREATEROLE`／`ADMIN OPTION` による判定はセッションにロールが束縛される #1966・#1971 の担当で、ポリシー DDL と同じく `require_ddl_permission` で代替する。
+- **ログイン名対応表へは登録しない**: テナント修飾子の提供経路がまだ無く、カタログのロールで認証する経路（#2233）も無いため、`LOGIN` はロール blob に保存するだけでログインはできない（fail-closed）。修飾子の提供と既存 LOGIN ロールの後追い登録は #2233 の担当。
+- **明示トランザクション内は `0A000`**: ロールの write txn は独立に commit され ROLLBACK で取り消せないため（他の DDL と同じ）。権限が無ければ `42501` を先に返す。
+
+### 対象外
+
+`CREATEROLE`／`ADMIN OPTION` による判定（#1966・#1971）、ログイン名対応表への登録（#2233）、`VALID UNTIL`・`CONNECTION LIMIT`（#2233）、`IN ROLE`・`ROLE`・`ADMIN`（#2232）、`ALTER ROLE`・`SET ROLE`（#1963）、`BYPASSRLS` の属性ビット（#2278 段 2）、所有者による依存検査（#2236）、自分のセッションのロールを DROP したときの `55006`（#1971 の後）、`CREATE GROUP`／`DROP GROUP`。

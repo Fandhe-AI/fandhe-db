@@ -7,7 +7,7 @@
 //! TASK-228）が channel binding や鍵導出（HKDF）を必要とする際もこのモジュールの
 //! `hmac_sha256` を下請けに再利用できる。
 
-use engine::crypto::sha256::{digest, Sha256};
+use super::sha256::{digest, Sha256};
 
 const BLOCK_SIZE: usize = 64;
 
