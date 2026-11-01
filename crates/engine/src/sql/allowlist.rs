@@ -1096,6 +1096,9 @@ pub enum SqlSurfaceError {
     /// 直列化の失敗（`40001`。ERR-7・SQL-38・TASK-333・Issue #2398）。
     /// 型の段階で表名・テナント・件数を持たせない（非漏えいの保証。#2407）。
     SerializationFailure,
+    /// 読み取り専用トランザクション内での書き込み系の文（`25006`。ERR-6・SQL-38・Issue #1934）。
+    /// 型の段階で表名・テナント・件数を持たせない（非漏えいの保証）。
+    ReadOnlySqlTransaction,
     /// 未実体化の MATERIALIZED VIEW を読んだ（`55000`。TABLE-42・Issue #1664）。
     /// 文言は固定で、名前・件数・他文脈の情報を含めない。
     MaterializedViewNotPopulated,
@@ -1921,6 +1924,7 @@ impl ClassifiedError for SqlSurfaceError {
             SqlSurfaceError::InFailedSqlTransaction => ErrorClass::InFailedSqlTransaction,
             SqlSurfaceError::LockNotAvailable => ErrorClass::LockNotAvailable,
             SqlSurfaceError::SerializationFailure => ErrorClass::SerializationFailure,
+            SqlSurfaceError::ReadOnlySqlTransaction => ErrorClass::ReadOnlySqlTransaction,
             SqlSurfaceError::MaterializedViewNotPopulated
             | SqlSurfaceError::MaterializedViewNotRefreshableConcurrently
             | SqlSurfaceError::SequenceNotYetDefined
@@ -2131,6 +2135,9 @@ impl std::fmt::Display for SqlSurfaceError {
                     f,
                     "could not serialize access due to read/write dependencies among transactions"
                 )
+            }
+            SqlSurfaceError::ReadOnlySqlTransaction => {
+                write!(f, "cannot execute this statement in a read-only transaction")
             }
             SqlSurfaceError::LockNotAvailable => {
                 write!(f, "write lock not available: timed out waiting for writer")

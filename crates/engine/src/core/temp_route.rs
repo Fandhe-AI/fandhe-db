@@ -456,6 +456,13 @@ impl EngineCore {
         let epoch = temp.epoch();
         match stmt {
             crate::sql::allowlist::CopyStatement::From(v) => {
+                // Issue #1934・SQL-38 (3): 読み取り専用 Tx は一時表への `COPY FROM` も拒否する
+                // （fail-closed。PostgreSQL と異なり一時表を除外しない）。
+                if txn.as_ref().and_then(|t| t.access_mode())
+                    == Some(crate::sql::transaction::TxnAccessMode::ReadOnly)
+                {
+                    return Err(SqlSurfaceError::ReadOnlySqlTransaction);
+                }
                 if v.operation_id.is_some() {
                     return Err(crate::sql::temp_catalog::temp_table_unsupported());
                 }

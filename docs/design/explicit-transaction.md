@@ -221,7 +221,7 @@ Issue（#2399〜#2405・#2408〜#2413）が拠り所にする設計記録で、�
 #### 1a-9. 本節で決めないこと（申し送り）
 
 - `55P03` が出る箇所・上限の起点・状態バイトの検証と層 B → #2408
-- READ ONLY → #1933、行ロック句・`LOCK TABLE` → 「行ロック句・`LOCK TABLE` の扱い」節（#2230・#2231・#1957・#1958）
+- READ ONLY の上限・並行の検証 → #1933・#1935、書き込み拒否 → #1934、行ロック句・`LOCK TABLE` → 「行ロック句・`LOCK TABLE` の扱い」節（#2230・#2231・#1957・#1958）
 - CHANGELOG と `implementation-status.md` → #2413
 - 早期の事前判定（gate を待つ前に明らかな衝突を返す最適化）は任意とし、#2405 の判断に委ねる。
 
@@ -627,12 +627,11 @@ Issue #1931（`READ ONLY`）、挙動テストは #1940、`40001` は #2396 が�
 | 行ロック句によるロック取得・`NOWAIT` | SQL-38 (4) | #2230 | `42601` |
 | `SKIP LOCKED` の実行 | SQL-38 (4) | #2231 | `42601` |
 | `LOCK [TABLE]` の 8 モードの構文・取得・表名の解決 | SQL-38 (4)(7) | #1958 | 実装済み（#1958） |
-| READ ONLY トランザクション内での扱い | SQL-38 (3) | #1933・#1931 | `42601` |
+| READ ONLY トランザクション内での扱い | SQL-38 (3) | #1934 | 実装済み（#1934。書き込み系の文は `25006`） |
 | writer 取得時の直列化判定 | SQL-38 (2)・SQL-31 | #2396 系 | 1a 節の記録のとおり |
 
-- **READ ONLY トランザクション内**: 現状は #1932 の暫定ゲートが `BEGIN READ ONLY` 自体を拒否する
-  （「対象外・申し送り」のアクセスモード修飾子の項）ため、READ ONLY の Tx 内にロック句が届くことは無い。
-  #1933 で READ ONLY の実体が入った後の扱いは SQL-38 (3) のポインタに従う。
+- **READ ONLY トランザクション内**: ロック句つき SELECT・`LOCK TABLE` は `25006` で拒否する
+  （Issue #1934。「READ ONLY での書き込み拒否」節）。8 モードすべてを拒否する。
 - **要確認（担当 Issue が確定する。本節では決めない）**:
   - `SKIP LOCKED` の結果規則（単一ライタの下でどの行を飛ばすか）→ #2231（SQL-38 (4)）
   - トランザクション外の `LOCK TABLE` のエラー契約 → #1958（#1958 本文でも要確認）
@@ -810,9 +809,8 @@ production コード（`crates/wire-server/src/`）は無変更・テスト専�
   明示ブロックへ昇格させる PostgreSQL の意味論（`INSERT; BEGIN; ...`）は対象外。
 - アクセスモード修飾子（SQL-38・Issue #1932）: `BEGIN [WORK|TRANSACTION] [READ ONLY|READ WRITE]` を
   構文解釈し、`ActiveTxn` が `TxnAccessMode` を持つ。モードなしの `BEGIN` と `READ WRITE` は
-  従来どおりの読み書き Tx。読み取り専用の実体（#1933・#1934）が入るまで `READ ONLY` は
-  書き込み可能な Tx を渡さないよう `0A000` で拒否する暫定ゲート（write txn を取る前・状態は
-  `Idle` のまま）。PostgreSQL との差異として、アクセスモードの重複・矛盾（`READ ONLY READ WRITE`）
+  従来どおりの読み書き Tx。`READ ONLY` の暫定ゲート（`0A000`）は Issue #1934 で除去し、
+  `READ ONLY` の Tx を開始できる（「READ ONLY での書き込み拒否」節）。PostgreSQL との差異として、アクセスモードの重複・矛盾（`READ ONLY READ WRITE`）
   は `42601`（fail-closed）。引用識別子 `"READ"` も受理される（既存の `"WORK"` と同じ性質）。
 - savepoint、`COMMIT AND CHAIN`・`PREPARE TRANSACTION`。分離レベルの指定は「分離レベルの受理方針」節のポインタ先の契約に従う（`BEGIN ISOLATION LEVEL` は #1938 で実装済み、`SET TRANSACTION` 系は #1939）。
   別名 `START TRANSACTION`／`END`／`ABORT` は Issue #1930 で受理した（下記「別名」節）。
@@ -840,3 +838,22 @@ production コード（`crates/wire-server/src/`）は無変更・テスト専�
   `is_rollback_statement`、複数文メッセージの分割器（制御文の分類）。
 - テスト: `crates/engine/tests/sql_t40_up/sql69_txn_aliases.rs`・
   `crates/wire-server/tests/wire_proto/sql69_txn_aliases.rs`・`wire942_extended_transaction.rs`。
+
+## READ ONLY での書き込み拒否（SQL-38 (3)・ERR-6・Issue #1934）
+
+`BEGIN READ ONLY` の Tx は writer を一度も取らず、書き込み系の文を `25006`
+（`read_only_sql_transaction`）で拒否して `Failed` へ遷移させる。契約の詳細は spec のポインタ先に従い、
+本節は実装の構造だけを記す。
+
+- **判定は許可リスト方式**: `core.rs` の `read_only_permits` が読み取り・セッション設定・カーソル等だけを許し、
+  DML・DDL・`COPY FROM`・ロック・`USING OPERATION_ID` 付きの文と未知の variant は拒否する（fail-closed）。
+  文の種類だけで判定し、表名・テナントは参照しない。拒否は writer・台帳・採番・カタログへ触れる前に起きる。
+- **経路**: 主判定は `execute_in_active_txn_inner` の先頭（PL/pgSQL 本体・`DO` の入れ子の文も通る）。
+  `COPY FROM` は `begin_copy_active_inner` と一時表向けの入口で CopyInResponse の前に拒否する。
+  `SessionTransaction::ensure_writer_with` と `LOCK` 実行腕の `25006` は取りこぼしに備えた保険。
+- **優先順位**: `PARTITIONED` 付き書き込みは既存の `25001` が先。DDL・ポリシー・`CREATE FUNCTION` は
+  権限判定（`42501`）より先に `25006`。PL/pgSQL 本体の書き込みは、既存の非 VOLATILE 拒否（`0A000`）・
+  台帳必須構成の `23502` が先に動く（VOLATILE かつ台帳任意のときだけ `25006`）。
+- **PostgreSQL との既知の差**: 一時表への書き込みと `COPY FROM`、弱いモードの `LOCK TABLE` も拒否する
+  （fail-closed）。緩和が必要なら別 Issue で扱う。
+- HTTP の射影は 403。NoSQL にはトランザクション制御が無く到達しない。
