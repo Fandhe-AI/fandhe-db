@@ -1026,6 +1026,14 @@ pub(crate) fn map_outcome(outcome: SqlOutcome) -> OutcomeResponse {
         SqlOutcome::DropRole(_) => OutcomeResponse::Command {
             tag: "DROP ROLE".to_string(),
         },
+        // SQL-39（Issue #1963）: `ALTER ROLE`（`RENAME TO`・`ALTER USER` も同じタグ）と
+        // `SET ROLE`／`RESET ROLE`（`SET`／`RESET` タグ）。
+        SqlOutcome::AlterRole(_) => OutcomeResponse::Command {
+            tag: "ALTER ROLE".to_string(),
+        },
+        SqlOutcome::SetRole { reset } => OutcomeResponse::Command {
+            tag: if reset { "RESET" } else { "SET" }.to_string(),
+        },
         // SQL-68（Issue #2228）: `DO` ブロックも件数を持たない固定タグ。
         SqlOutcome::Do => OutcomeResponse::Command {
             tag: "DO".to_string(),

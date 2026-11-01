@@ -478,3 +478,173 @@ fn legacy_fixture_opens_with_empty_role_catalog() {
         );
     }
 }
+// ---- Issue #1963: ALTER ROLE ／ RENAME ／ SET ROLE の到達判定 ----
+
+fn put_member(s: &Storage, tenant: &str, member: u64, granted: u64, set: bool) {
+    write(s, |t| {
+        put_membership_in_txn(
+            t,
+            tenant,
+            member,
+            granted,
+            MembershipOptions {
+                admin: false,
+                inherit: true,
+                set,
+            },
+        )
+    })
+    .expect("put membership");
+}
+
+#[test]
+fn rename_keeps_id_and_moves_key() {
+    let (_g, _p, s) = open("role-rename");
+    let id = s.create_role("t1", &rdef("old")).expect("create");
+    s.create_role("t2", &rdef("other")).expect("create t2");
+    s.rename_role("t1", "old", "new", &[]).expect("rename");
+    assert!(s.get_role("t1", "old").expect("get").is_none());
+    let moved = s.get_role("t1", "new").expect("get").expect("exists");
+    assert_eq!(moved.id, id);
+    assert_eq!(moved.name, "new");
+    assert!(s.get_role("t2", "other").expect("get").is_some());
+}
+
+#[test]
+fn rename_rejections() {
+    let (_g, _p, s) = open("role-rename-rej");
+    let a = s.create_role("t1", &rdef("a")).expect("a");
+    s.create_role("t1", &rdef("b")).expect("b");
+    s.create_role("t2", &rdef("only_t2")).expect("t2");
+    let dup = s.rename_role("t1", "a", "b", &[]);
+    assert!(matches!(dup, Err(CatalogError::Invalid(m)) if m == ROLE_ALREADY_EXISTS_MESSAGE));
+    let missing = s.rename_role("t1", "nope", "c", &[]);
+    assert!(matches!(missing, Err(CatalogError::Invalid(m)) if m == ROLE_NOT_FOUND_MESSAGE));
+    let cross = s.rename_role("t1", "only_t2", "c", &[]);
+    assert!(matches!(cross, Err(CatalogError::Invalid(m)) if m == ROLE_NOT_FOUND_MESSAGE));
+    let prot = s.rename_role("t1", "a", "c", &[a]);
+    assert!(matches!(prot, Err(CatalogError::Invalid(m)) if m == ROLE_IN_SESSION_USE_MESSAGE));
+    assert!(s.get_role("t1", "a").expect("get").is_some());
+}
+
+#[test]
+fn rename_to_own_name_is_noop() {
+    let (_g, _p, s) = open("role-rename-self");
+    let id = s.create_role("t1", &rdef("a")).expect("a");
+    s.rename_role("t1", "a", "a", &[]).expect("self rename");
+    assert_eq!(s.get_role("t1", "a").expect("get").expect("some").id, id);
+}
+
+#[test]
+fn alter_role_keeps_unspecified_fields() {
+    let (_g, _p, s) = open("role-alter");
+    let mut d = rdef("a");
+    d.scram_verifier = b"SCRAM-SHA-256$x".to_vec();
+    d.legacy_phc = b"legacy".to_vec();
+    d.connection_limit = 3;
+    let id = s.create_role("t1", &d).expect("create");
+    s.alter_role("t1", "a", |r| {
+        r.attributes.login = false;
+        r.attributes.createdb = true;
+        r.id = 999;
+        r.name = "zzz".to_string();
+    })
+    .expect("alter");
+    let got = s.get_role("t1", "a").expect("get").expect("exists");
+    assert_eq!(got.id, id);
+    assert_eq!(got.name, "a");
+    assert!(!got.attributes.login && got.attributes.createdb && got.attributes.inherit);
+    assert_eq!(got.scram_verifier, b"SCRAM-SHA-256$x".to_vec());
+    assert_eq!(got.legacy_phc, b"legacy".to_vec());
+    assert_eq!(got.connection_limit, 3);
+    let missing = s.alter_role("t1", "nope", |_| {});
+    assert!(matches!(missing, Err(CatalogError::Invalid(m)) if m == ROLE_NOT_FOUND_MESSAGE));
+    let bad = s.alter_role("t1", "a", |r| r.scram_verifier = vec![0x01]);
+    assert!(matches!(bad, Err(CatalogError::Invalid(_))));
+}
+
+#[test]
+fn can_set_direct_indirect_and_broken_paths() {
+    let (_g, _p, s) = open("role-can-set");
+    let a = s.create_role("t1", &rdef("a")).expect("a");
+    let b = s.create_role("t1", &rdef("b")).expect("b");
+    let c = s.create_role("t1", &rdef("c")).expect("c");
+    let d = s.create_role("t1", &rdef("d")).expect("d");
+    let can = |from: u64, to: u64| {
+        let rt = s.db().begin_read().expect("read");
+        role_can_set_in_txn(&rt, "t1", from, to).expect("walk")
+    };
+    // 自分自身は常に可。メンバーシップが無ければ不可。
+    assert!(can(a, a));
+    assert!(!can(a, b));
+    // 直接（SET 真）。
+    put_member(&s, "t1", a, b, true);
+    assert!(can(a, b));
+    assert!(!can(b, a));
+    // 間接（全辺が SET 真）。
+    put_member(&s, "t1", b, c, true);
+    assert!(can(a, c));
+    // 経路中に SET 偽の辺があれば不可。
+    put_member(&s, "t1", c, d, false);
+    assert!(!can(a, d));
+    // SET 偽だけの付与は不可。
+    put_member(&s, "t1", d, a, false);
+    assert!(!can(d, a));
+}
+
+#[test]
+fn can_set_terminates_on_cycles_and_ignores_other_tenants() {
+    let (_g, _p, s) = open("role-can-set-cycle");
+    let a = s.create_role("t1", &rdef("a")).expect("a");
+    let b = s.create_role("t1", &rdef("b")).expect("b");
+    let c = s.create_role("t1", &rdef("c")).expect("c");
+    put_member(&s, "t1", a, b, true);
+    put_member(&s, "t1", b, a, true);
+    let rt = s.db().begin_read().expect("read");
+    assert!(!role_can_set_in_txn(&rt, "t1", a, c).expect("walk"));
+    drop(rt);
+    // 他テナントに同じ ID のメンバーシップがあっても辿らない。
+    put_member(&s, "t2", a, c, true);
+    let rt = s.db().begin_read().expect("read");
+    assert!(!role_can_set_in_txn(&rt, "t1", a, c).expect("walk"));
+}
+
+#[test]
+fn resolve_settable_role_distinguishes_missing_denied_allowed() {
+    let (_g, _p, s) = open("role-resolve-set");
+    let a = s.create_role("t1", &rdef("a")).expect("a");
+    let b = s.create_role("t1", &rdef("b")).expect("b");
+    s.create_role("t2", &rdef("t2only")).expect("t2");
+    put_member(&s, "t1", a, b, true);
+    assert_eq!(
+        s.resolve_settable_role("t1", a, "b").expect("r"),
+        SetRoleResolution::Allowed(b)
+    );
+    assert_eq!(
+        s.resolve_settable_role("t1", b, "a").expect("r"),
+        SetRoleResolution::Denied
+    );
+    assert_eq!(
+        s.resolve_settable_role("t1", a, "t2only").expect("r"),
+        SetRoleResolution::NotFound
+    );
+    assert_eq!(
+        s.resolve_settable_role("t1", a, "nope").expect("r"),
+        SetRoleResolution::NotFound
+    );
+}
+
+#[test]
+fn can_set_fails_closed_on_corrupt_membership() {
+    let (_g, _p, s) = open("role-can-set-corrupt");
+    let a = s.create_role("t1", &rdef("a")).expect("a");
+    let b = s.create_role("t1", &rdef("b")).expect("b");
+    write(&s, |t| {
+        t.open_table(ROLE_MEMBERSHIPS_TABLE)?
+            .insert(("t1", a, b), &[0xFFu8][..])?;
+        Ok(())
+    })
+    .expect("raw");
+    let rt = s.db().begin_read().expect("read");
+    assert!(role_can_set_in_txn(&rt, "t1", a, b).is_err());
+}
