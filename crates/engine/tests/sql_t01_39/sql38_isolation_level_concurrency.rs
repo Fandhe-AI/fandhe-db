@@ -121,6 +121,26 @@ impl<'e> Tx<'e> {
         }
     }
 
+    /// SELECT の返却行の `n` 列を行 id 順の文字列表現で返す（値の変化を検出する用途。
+    /// 具体的な `Cell` の型に依存せず、開始時点との同一性だけを比べる）。
+    fn values(&mut self, table: &str) -> Vec<(u64, String)> {
+        match self
+            .exec(&format!("SELECT n FROM {table}"))
+            .expect("select")
+        {
+            SqlOutcome::Query(r) => {
+                let mut v: Vec<_> = r
+                    .rows
+                    .iter()
+                    .map(|row| (row.id, format!("{:?}", row.cells)))
+                    .collect();
+                v.sort();
+                v
+            }
+            other => panic!("expected Query, got {other:?}"),
+        }
+    }
+
     fn expect_40001_then_recover(&mut self, sql: &str) {
         let err = self.run(sql).expect_err("40001");
         self.assert_failed_then_recover(&err);
@@ -234,10 +254,12 @@ fn no_non_repeatable_or_phantom_read_before_write_at_any_level() {
         let (core, _g) = new_core("iso-c-repeat");
         auto(&core, "INSERT INTO iso1 (id, n) VALUES (1, 1)");
         let mut a = Tx::begin_with(&core, "BEGIN", level);
-        assert_eq!(a.count("iso1"), 1);
+        let before = a.values("iso1");
+        assert_eq!(before.len(), 1);
         auto(&core, "INSERT INTO iso1 (id, n) VALUES (2, 2)");
         auto(&core, "UPDATE iso1 SET n = 9 WHERE id = 1");
-        assert_eq!(a.count("iso1"), 1, "{}", level.0);
+        // 行数（ファントム）と行の値（non-repeatable read）の両方が開始時点と同じ。
+        assert_eq!(a.values("iso1"), before, "{}", level.0);
         a.run("ROLLBACK").expect("rollback");
     }
 }
