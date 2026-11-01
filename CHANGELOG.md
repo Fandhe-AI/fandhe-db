@@ -9,7 +9,7 @@
 
 ### Added
 
-- `SET TRANSACTION <モード>` と `SET SESSION CHARACTERISTICS AS TRANSACTION <モード>` を受理する（Issue #1939・SQL-38 (7)(a)・SQL-31。モードは `ISOLATION LEVEL` 4 種・`READ ONLY`・`READ WRITE`。分離レベルは記録のみで実行は不変）。`SET TRANSACTION` は明示 Tx の最初の問い合わせの前だけ受理し、後は `25001`（Tx は `Failed`）、Tx 外・暗黙 Tx は `25P01` で拒否する（PostgreSQL の警告とは異なる fail-closed。NoticeResponse の送出経路が無いため）。`SET SESSION CHARACTERISTICS` の既定は以後の `BEGIN`／`START TRANSACTION` が引き継ぎ、autocommit の文・暗黙 Tx には効かない。応答タグは `SET`。
+- `SET TRANSACTION` と `SET SESSION CHARACTERISTICS AS TRANSACTION` を受理する（Issue #1939・SQL-38 (7)(a)・SQL-31 ポインタ。契約の詳細は spec 側を参照）。
   BREAKING CHANGE: 公開 enum `SqlOutcome`・`ParsedSql` に `SetTransaction`、`SqlSurfaceError` に `SetTransactionAfterQuery` を追加した。修飾子なしの `START TRANSACTION` がセッション既定を継承するようになった。
 - `row_security`（`SET`／`RESET`／`SHOW`・StartupMessage）とポリシーの適用判定（`BYPASSRLS`・所有者・対象ロール）を追加した（Issue #2278・RLS-12・RLS-13・SQL-39）。RLS 有効な表への読み取り・書き込み・`COPY` は `row_security = off` のとき行を扱う前に `42501`（`query would be affected by row-level security policy for table "..."`。表名は自テナントのみ）で拒否する。
   BREAKING CHANGE: 公開 enum `SqlSurfaceError`・`TenantWriteError` に `RowSecurityOffRejected` を追加した（`wire_code` は既存の `42501` のまま）。網羅 `match` する外部コードは腕を足す。
