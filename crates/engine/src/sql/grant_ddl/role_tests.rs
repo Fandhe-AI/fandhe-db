@@ -248,6 +248,30 @@ fn revoke_admin_restrict_and_cascade() {
     assert!(mem(&f, n, r).is_none());
 }
 
+/// 取消し対象の ADMIN に依存する付与（x 自身が付けた m の ADMIN を x が継承する循環）は代替の ADMIN 経路に
+/// 数えない。RESTRICT は 2BP01、CASCADE は依存する付与を消し、取消し後に x は付与できない。
+#[test]
+fn revoke_admin_ignores_self_dependent_admin_path() {
+    let f = fx("rm_selfdep");
+    let me = role(&f, "me");
+    let r = role(&f, "r");
+    let x = role(&f, "x");
+    let m = role(&f, "m");
+    let n = role(&f, "n");
+    let owner = session(me, true);
+    run(&f, &owner, "GRANT r TO x WITH ADMIN TRUE").expect("x admin");
+    run(&f, &owner, "GRANT m TO x").expect("x inherits m");
+    run(&f, &session(x, false), "GRANT r TO m WITH ADMIN TRUE").expect("m admin by x");
+    let e = run(&f, &owner, "REVOKE ADMIN OPTION FOR r FROM x").expect_err("restrict");
+    assert_eq!(e.wire_code(), "2BP01");
+    run(&f, &owner, "REVOKE ADMIN OPTION FOR r FROM x CASCADE").expect("cascade");
+    assert!(!mem(&f, x, r).expect("x").admin);
+    assert!(mem(&f, m, r).is_none());
+    let e = run(&f, &session(x, false), "GRANT r TO n").expect_err("x lost admin");
+    assert_eq!(e.wire_code(), "42501");
+    assert!(mem(&f, n, r).is_none());
+}
+
 /// `GRANT ... WITH ADMIN FALSE` による ADMIN の取り消しも `REVOKE ADMIN OPTION` と同じ依存検査（2BP01）を通る。
 #[test]
 fn grant_with_admin_false_respects_dependents() {

@@ -19,7 +19,9 @@ use std::collections::HashSet;
 
 use crate::catalog::{CatalogError, Storage};
 
-use super::graph::{best_admin_grantor, is_admin_of, would_create_cycle};
+use super::graph::{
+    best_admin_grantor, effective_roles_in_txn, is_admin_of, would_create_cycle, Mode,
+};
 use super::{
     get_membership, get_role_by_id_in_txn, get_role_in_txn, list_memberships_granted_by_in_txn,
     put_membership_in_txn, remove_membership_in_txn, validate_tenant, MembershipOptions, RoleDef,
@@ -132,6 +134,52 @@ fn resolve_member(w: &redb::WriteTransaction, tenant: &str, spec: &MemberSpec) -
     }
 }
 
+/// `y` が `r` へ「循環に依存しない」ADMIN を持つか。継承閉包の ADMIN 行ごとに付与者をたどり、付与者が
+/// 訪問中（= 取消し対象の ADMIN に依存して循環する）なら根拠にせず、付与者が ADMIN 経路を持たない
+/// （所有者相当）か、付与者自身が独立した ADMIN を持つ行だけを根拠とする。fail-closed（疑わしきは偽）。
+fn has_independent_admin(
+    w: &redb::WriteTransaction,
+    tenant: &str,
+    y: u64,
+    r: u64,
+    visiting: &mut Vec<u64>,
+    steps: &mut usize,
+) -> Result<bool> {
+    if y == r || visiting.contains(&y) {
+        return Ok(false);
+    }
+    *steps += 1;
+    if *steps > MAX_CASCADE_STEPS {
+        return Err(MembershipChangeError::LimitExceeded);
+    }
+    visiting.push(y);
+    let mut found = false;
+    for (node, _) in effective_roles_in_txn(w, tenant, y, Mode::Inherit)? {
+        if node == r {
+            continue;
+        }
+        let Some(o) = get_membership(w, tenant, node, r)? else {
+            continue;
+        };
+        if !o.admin {
+            continue;
+        }
+        found = match o.grantor_id {
+            None => true,
+            Some(g) if visiting.contains(&g) => false,
+            Some(g) => {
+                !is_admin_of(w, tenant, g, r)?
+                    || has_independent_admin(w, tenant, g, r, visiting, steps)?
+            }
+        };
+        if found {
+            break;
+        }
+    }
+    visiting.pop();
+    Ok(found)
+}
+
 /// `member` が `role` へ持つ ADMIN を失った後に、`member` が付けた付与のうち ADMIN の根拠を失ったものを
 /// 解決する（RESTRICT は `2BP01`、CASCADE は連鎖して削除）。`member` が別の経路で ADMIN を保てば何もしない。
 fn resolve_dependents(
@@ -149,7 +197,7 @@ fn resolve_dependents(
         if *steps > MAX_CASCADE_STEPS {
             return Err(MembershipChangeError::LimitExceeded);
         }
-        if is_admin_of(w, tenant, x, r)? {
+        if has_independent_admin(w, tenant, x, r, &mut Vec::new(), steps)? {
             continue;
         }
         for (m2, g2, o2) in list_memberships_granted_by_in_txn(w, tenant, x)? {
