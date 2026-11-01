@@ -259,3 +259,38 @@ Phase 6（#1929）では PostgreSQL 準拠のロールと GRANT／REVOKE を段�
 | インジェクション | ロール名・オブジェクト名は既存の識別子検証を通し、カタログのキーを未検証の文字列連結で作らない |
 | セキュリティ設定ミス・秘密情報 | 本書に資格情報や検証子の例を載せない。spec 本文を転記しない |
 | 脆弱な依存 | 依存の追加は無い |
+
+## 7. Issue #1961 実装記録
+
+Issue #1961 は決定 D1（ロールのカタログ）・D5（ACL のカタログ）・D12（既存 DB の移行と後方互換）のうち、永続化層だけを実装した。実装は `crates/engine/src/catalog/role.rs`（ロール・メンバーシップ・ログイン名対応表）と `catalog/privilege.rs`（ACL）。認証・権限検査・DDL 構文は含まず、wire-server は無変更のため `--users` の挙動は変わらない。ポインタ: SQL-39・SQL-40・RLS-12。
+
+### redb 表（すべて遅延作成）
+
+| 表名 | キー | 値 |
+| ---- | ---- | -- |
+| `roles` | `(tenant_id, role_name)` | ロール blob |
+| `role_id_counter` | 固定キー `next_id` | `u64`（1 始まり・再利用しない） |
+| `role_memberships` | `(tenant_id, member_id, granted_role_id)` | メンバーシップ blob |
+| `role_login_names` | 符号化済みログイン識別子 | ログイン対応 blob |
+| `acl` | `(tenant_id, object_kind, object_key, column, grantee_id, grantor_id)` | ACL blob |
+
+- 本 ADR の D5 は新しい表を 3 つと書く一方、ログイン名対応表を別表として記述している。実装ではこれを 4 表目（`role_login_names`）として定義した。ログイン名対応表だけがサーバー全体の表で、他の表はキーの先頭が `tenant_id` である。
+- 旧 DB は表が無いことがそのまま「空のカタログ」になる。読み取りでも表は作らない。`Storage::open` での移行処理は無い。
+- 各 blob は先頭が版バイト（現状 1）で、未知の版・予約ビット・切断・末尾の余り・上限超過は固定文言の `CorruptSchema` で拒否する。一覧と有無の判定でも破損した行を読み飛ばさない。
+
+### blob の形
+
+- ロール: 版 / 内部 ID `u64` / 属性ビット `u16`（LOGIN・INHERIT・CREATEROLE・CREATEDB。SUPERUSER 相当は作らない）/ connection_limit `i32` / valid_until（タグ + UTC マイクロ秒 `i64`）/ SCRAM 検証子と旧形式ハッシュ（`u16` 長 + 不透明な ASCII 印字可能バイト列。D3 の移行期間に併存）。
+- メンバーシップ: 版 / オプションビット（ADMIN・INHERIT・SET）。付与者は持たない。REVOKE の付与者指定などで必要になれば、#1965 が版 2 で足す。
+- ログイン対応: 版 / tenant_id / role_id。識別子は `<修飾子のバイト長>:<修飾子><ロール名>` の長さ接頭辞方式で単射に符号化する。解決時に参照先のロールが存在し、LOGIN 属性を持ち、ID と名前が一致することを確かめる。
+- ACL: 版 / privileges `u16` / grant_options `u16`。権限ビットは PostgreSQL 17 の公開の権限種別に揃え、対象の種別ごとに許可集合を持つ。
+
+### ID 0 の扱い
+
+ロール blob の内部 ID とメンバーシップのキーの ID では 0 を破損として拒否する。ACL の `grantee_id` だけは 0 を PUBLIC（同じテナントのロール全体）の予約 ID として受理する。`grantor_id` の 0 は破損である。
+
+### relation のライフサイクルへの追随
+
+名前をキーにした表・列の ACL 行は、DROP TABLE（CASCADE・DROP SCHEMA の表削除を含む）・DROP VIEW・DROP MATERIALIZED VIEW・ALTER TABLE RENAME・列の DROP・列の RENAME と同じ write txn の中で掃除・移動する（同名の再作成が古い付与を引き継ぐ fail-open を作らない）。スキーマ・シーケンス・関数は内部 ID をキーにし、ID は再利用されないため掃除は不要で、GRANT を解禁する #2234・#2235 の範囲とする。
+
+既知の制約: relation 単位の掃除は ACL 表を全件走査する（計算量は ACL の総件数に比例）。逆引き索引の追加は #1965 以降の判断とする。

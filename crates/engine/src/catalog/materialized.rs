@@ -1300,6 +1300,8 @@ pub(crate) fn drop_materialized_view_in_txn(
     delete_all_meta_in_txn(write_txn, name)?;
     delete_rows_table_in_txn(write_txn, name)?;
     retain_index_defs_in_txn(write_txn, |def| def.table != name)?;
+    // matview の権限（ACL。全テナント分。SQL-40・Issue #1961）。同名再作成へ旧付与を引き継がせない。
+    super::privilege::remove_relation_acl_in_txn(write_txn, name)?;
     Ok(())
 }
 

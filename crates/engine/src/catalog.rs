@@ -85,6 +85,13 @@ pub(crate) mod function_dependency;
 // TRIGGER のカタログ（TABLE-45・Issue #1722。設計記録: `docs/design/trigger-catalog.md`）。
 pub(crate) mod policy;
 pub(crate) mod trigger;
+// ロール・メンバーシップ・ログイン名対応表と ACL のカタログ（SQL-39・SQL-40 のポインタ、Issue #1961。設計記録:
+// `docs/design/role-privilege-model.md`）。利用側（CREATE ROLE #1962・GRANT #1965・検査ゲート #1966 ほか）が
+// 入るまでは crate 内の呼び出し元がテストと relation のライフサイクル掃除だけのため、dead_code を許可する。
+#[allow(dead_code)]
+pub(crate) mod privilege;
+#[allow(dead_code)]
+pub(crate) mod role;
 // 表ごとの行セキュリティ有効化状態（RLS-13・Issue #2275）。
 pub mod row_security;
 pub(crate) use materialized::read_materialized_view_in;
@@ -5627,6 +5634,9 @@ fn drop_view_in_txn(write_txn: &redb::WriteTransaction, name: &str) -> Result<()
     if views_table.remove(name)?.is_none() {
         return Err(CatalogError::ViewNotFound(name.to_string()));
     }
+    // ビューの権限（ACL。全テナント分。SQL-40・Issue #1961）。同名再作成へ旧付与を引き継がせない。
+    drop(views_table);
+    privilege::remove_relation_acl_in_txn(write_txn, name)?;
     // commit 記録（SQL-38・Issue #2404）: ビュー定義の変更は表世代を進めないため DDL として記録する。
     crate::storage::commit_log::note_ddl(write_txn, name);
     Ok(())
@@ -12374,6 +12384,8 @@ impl Storage {
             policy::remove_policies_for_table_in_txn(write_txn, name)?;
             // 行セキュリティ有効化状態（全テナント分。RLS-13・Issue #2275）。残置すると同名再作成で旧状態が復活する。
             row_security::remove_row_security_for_table_in_txn(write_txn, name)?;
+            // 権限（ACL。全テナント分。SQL-40・Issue #1961）。残置すると同名再作成で旧付与が復活する（fail-open）。
+            privilege::remove_relation_acl_in_txn(write_txn, name)?;
             // 永続キー索引（Issue #1071）。残置すると参照整合性検査が fail-open になりうる。
             crate::key_index::drop_indexes_for_table_in_txn(write_txn, name)?;
             // commit 記録（SQL-38・Issue #2404）: スキーマ・カタログを変える書き込みは DDL として記録する。
@@ -12882,6 +12894,8 @@ impl Storage {
         // 削除した列を含む索引宣言（TASK-206・INDEX-7、Issue #908）も同一 txn で
         // 削除する（[`delete_indexes_referencing_column_in_txn`] 参照）。
         delete_indexes_referencing_column_in_txn(write_txn, table_name, column_name)?;
+        // 列の権限（ACL。全テナント分。SQL-40・Issue #1961）。同名列の再追加へ旧付与を引き継がせない。
+        privilege::remove_column_acl_in_txn(write_txn, table_name, column_name)?;
         if !drop_owned_sequences {
             return Ok(Vec::new());
         }
@@ -13069,6 +13083,8 @@ impl Storage {
                 .insert(table_name, encoded.as_slice())
                 .map_err(CatalogError::from)?;
         }
+        // 列の権限（ACL。全テナント分）も新しい列名へ移す（SQL-40・Issue #1961）。
+        privilege::rename_column_acl_in_txn(&write_txn, table_name, old_name, new_name)?;
         // 列が所有する SEQUENCE の所有者（列名）を追従させる（TABLE-24・Issue #1694）。
         sequence::rewrite_sequence_owners_in_txn(&write_txn, |owner| {
             (owner.table == table_name && owner.column == old_name).then(|| {
@@ -13206,6 +13222,8 @@ impl Storage {
         policy::rename_table_in_txn(&write_txn, table_name, new_table_name)?;
         // 行セキュリティ有効化状態（全テナント分）も新しい表キーへ移す（RLS-13・Issue #2275）。
         row_security::rename_row_security_table_in_txn(&write_txn, table_name, new_table_name)?;
+        // 権限（ACL。全テナント分）も新しい表キーへ移す（SQL-40・Issue #1961）。
+        privilege::rename_relation_acl_in_txn(&write_txn, table_name, new_table_name)?;
 
         // カタログの付け替え（`encode_schema` が不変条件を再検証する）。
         schema.rename_table_references(new_table_name);
@@ -15201,6 +15219,9 @@ impl Storage {
                 if views_table.remove(name)?.is_none() {
                     return Err(CatalogError::ViewNotFound(name.to_string()));
                 }
+                // ビューの権限（ACL。全テナント分。SQL-40・Issue #1961）。同名再作成へ旧付与を引き継がせない。
+                drop(views_table);
+                privilege::remove_relation_acl_in_txn(&write_txn, name)?;
                 // commit 記録（SQL-38・Issue #2404）: ビュー定義の変更は表世代を進めないため DDL として記録する。
                 crate::storage::commit_log::note_ddl(&write_txn, name);
                 Vec::new()
