@@ -227,18 +227,9 @@ fn visible_rows_impl(
 ) -> Result<Vec<Row>, TenantError> {
     // RLS-13（Issue #2276）: この列挙は利用者ポリシーを反映しない（辞書構築・検索の検証用の読み取り口。
     // 反映は #2279）。適用表では部分的に広い集合を返さず、固定文言で拒否する（fail-closed）。
-    {
-        let read_txn = storage.db().begin_read().map_err(|_| {
-            TenantError::Catalog(CatalogError::Invalid(
-                "failed to begin read transaction".to_string(),
-            ))
-        })?;
-        crate::sql::row_policy::reject_if_policies_apply(&read_txn, ctx, table).map_err(|_| {
-            TenantError::Catalog(CatalogError::Invalid(
-                "row-level security policies are not yet supported for this query form".to_string(),
-            ))
-        })?;
-    }
+    // 列挙は複数の読み取り txn に跨るため、走査の前と後の 2 回判定する。走査中に別セッションが RLS を
+    // ENABLE していれば後段で検出でき、ポリシーを反映しない列挙結果を返さない（結果は破棄する）。
+    reject_policies_for_enumeration(storage, table, ctx)?;
     let max_scanned_rows = scan_limits.max_scanned_rows();
     let mut out = Vec::new();
     // カーソルは行ストアの物理キーと同じ `(tenant_id, id)` 形（TABLE-12）。`id` 単独では
@@ -276,7 +267,26 @@ fn visible_rows_impl(
             None => break,
         }
     }
+    reject_policies_for_enumeration(storage, table, ctx)?;
     Ok(out)
+}
+
+/// [`visible_rows_impl`] の拒否判定（短命な読み取り txn で適用表かを確かめる。固定文言・表名を含めない）。
+fn reject_policies_for_enumeration(
+    storage: &Storage,
+    table: &str,
+    ctx: &PolicyContext,
+) -> Result<(), TenantError> {
+    let read_txn = storage.db().begin_read().map_err(|_| {
+        TenantError::Catalog(CatalogError::Invalid(
+            "failed to begin read transaction".to_string(),
+        ))
+    })?;
+    crate::sql::row_policy::reject_if_policies_apply(&read_txn, ctx, table).map_err(|_| {
+        TenantError::Catalog(CatalogError::Invalid(
+            "row-level security policies are not yet supported for this query form".to_string(),
+        ))
+    })
 }
 
 /// 検索結果 `hits` が、`table` に対する `ctx` の可視集合へすべて収まって
@@ -4004,6 +4014,10 @@ pub(crate) fn update_row_unchecked(
         let mut pre_images = crate::constraint::UpdatedKeyPreImages::new();
         {
             let schema = require_table_schema_write(write_txn, table)?;
+            // RLS-13（Issue #2276）: 生の全列置換は USING を評価できない。適用表は書き込みと同じ write txn の
+            // 中で拒否する（判定と書き込みの間の ENABLE を TOCTOU にしない）。
+            crate::sql::row_policy::reject_if_policies_apply(write_txn, ctx, table)
+                .map_err(TenantWriteError::TriggerFailed)?;
             // 生の全列置換はトリガの発火に未対応（Issue #1725）。UPDATE トリガのある表は `0A000`。
             guard_no_update_triggers(write_txn, ctx.tenant_id(), table)?;
             schema.validate_row_embedding_dim(row.embedding.len())?;
@@ -5712,6 +5726,12 @@ fn delete_row_impl(
             // RLS-13（Issue #2276）: 可視集合を対象にする SQL 表層の id 形 DELETE（`OwnedVisible`）は、
             // 利用者ポリシーの USING を通らない行を対象外（`NotFound`・0 件）にする。所有だけで選ぶ
             // `Owned`（可視性を見ない Rust API）はポリシーも適用しない従来のスコープのまま。
+            // 所有だけで選ぶ `Owned`（Rust API）はポリシーを評価できないため、適用表では書き込みと同じ
+            // write txn の中で固定文言の 0A000 として拒否する（判定と書き込みの間の ENABLE を TOCTOU にしない）。
+            if scope == DeleteScope::Owned {
+                crate::sql::row_policy::reject_if_policies_apply(write_txn, ctx, table)
+                    .map_err(TenantWriteError::TriggerFailed)?;
+            }
             let policy = if scope == DeleteScope::OwnedVisible {
                 resolve_dml_row_policy(
                     write_txn,

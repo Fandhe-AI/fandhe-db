@@ -297,7 +297,7 @@ RLS-13 のポインタ。読み取り（SELECT）と UPDATE・DELETE の対象�
 3. **合成規則**: PG 17 と同じ。文ごとにコマンドの集合を選ぶ（SELECT は `FOR SELECT`＋`FOR ALL`、UPDATE は `FOR UPDATE`＋`FOR ALL`、
    DELETE は `FOR DELETE`＋`FOR ALL`）。UPDATE・DELETE は既存行を読む（`WHERE` が列を参照する・`RETURNING` がある・UPDATE の
    `SET` の右辺が式）ときに限り、SELECT の集合も別の層として AND する。各層は `(PERMISSIVE の OR) AND (RESTRICTIVE の AND)`、
-   適用される PERMISSIVE が無ければ全行拒否、式の NULL は偽。`USING` を持たないポリシーは USING 側に寄与しない
+   適用される PERMISSIVE が無ければ全行拒否、式の NULL は偽。式を省略した PERMISSIVE は TRUE の分岐として OR に加わる（書き込み側 `policy_eval` と同じ。RESTRICTIVE の TRUE は AND に何も足さない）
 4. **解決は行を読むのと同じスナップショットで行う**: `resolve_row_policy` が有効化状態と定義を `ReadSource`（読み取り txn・
    write txn・明示トランザクションの窓口）から引き、保存テキストを untrusted として再束縛する（`bind_where_predicates`）。
    書き込みは列挙と同じ write txn・同じスキーマの中で解決する（TOCTOU を作らない）。再束縛の失敗・破損は固定文言の `XX000`

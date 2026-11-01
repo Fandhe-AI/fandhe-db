@@ -817,7 +817,7 @@ fn policies_are_scoped_per_tenant_and_narrow_inside_the_tenant_boundary() {
 // 規則の細目
 // ---------------------------------------------------------------------
 
-/// 有効化しただけでポリシーが 0 件なら全行拒否（既定拒否）。USING の無いポリシーは何にも寄与しない。
+/// 有効化しただけでポリシーが 0 件なら全行拒否（既定拒否）。式を省略した PERMISSIVE は TRUE の分岐になる。
 #[test]
 fn default_deny_and_policy_without_using() {
     let (core, _g) = open_core("rls13-using-deny");
@@ -835,9 +835,9 @@ fn default_deny_and_policy_without_using() {
         "DELETE FROM docs WHERE n >= 0 USING OPERATION_ID 'op-deny-d'",
     );
     assert_eq!(affected(out), 0);
-    // USING を持たない PERMISSIVE は USING 側へ寄与しない（全行拒否のまま）。
+    // 式を省略した PERMISSIVE は TRUE として合成される（書き込み側と同じ意味。既定拒否とは区別する）。
     ok_as(&core, "alice", "CREATE POLICY nu ON docs FOR ALL");
-    assert!(ids_as(&core, "alice", "SELECT id FROM docs LIMIT 100").is_empty());
+    assert!(!ids_as(&core, "alice", "SELECT id FROM docs LIMIT 100").is_empty());
 }
 
 /// 式が NULL になる行は偽として扱う（`note` が NULL の行は `note = 'x'` を通らない）。

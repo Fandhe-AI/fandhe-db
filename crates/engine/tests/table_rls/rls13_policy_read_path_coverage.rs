@@ -57,6 +57,12 @@ const TABLE: &[(&str, usize, Class, &str)] = &[
         "DDL・スキーマ書き換え・世代・件数・ページ走査の内部。SQL 表層は行を返さない",
     ),
     (
+        "storage/commit_log.rs",
+        2,
+        Class::NonRead,
+        "commit 記録の足跡（読み取り集合の衝突検出）。可視性判定の照合だけで、利用者へ行を返さない",
+    ),
+    (
         "catalog/rowid_alloc.rs",
         1,
         Class::NonRead,

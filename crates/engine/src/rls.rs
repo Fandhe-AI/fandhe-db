@@ -265,16 +265,12 @@ pub(crate) struct PrefilterSnapshot {
 /// 利用者ポリシー（RLS-13・Issue #2276）の適用表なら、ポリシーのマスクを合成できない検索経路
 /// （`PrefilterSnapshot`・`SearchTimeFilter`）を固定文言で拒否する。適用されない表（既定）では何もしない。
 /// 拒否は `RlsError::Arena(Catalog(Invalid))` に載せる（表名・ポリシー名を含めない）。
-fn reject_if_row_policies_apply(
-    storage: &Storage,
+fn reject_if_row_policies_apply_in<R: crate::storage::read_source::ReadSource>(
+    src: &R,
     table: &str,
     ctx: &PolicyContext,
 ) -> Result<(), RlsError> {
-    let read_txn = storage
-        .db()
-        .begin_read()
-        .map_err(crate::storage::StorageError::from)?;
-    crate::sql::row_policy::reject_if_policies_apply(&read_txn, ctx, table).map_err(|_| {
+    crate::sql::row_policy::reject_if_policies_apply(src, ctx, table).map_err(|_| {
         RlsError::Arena(ArenaError::Catalog(CatalogError::Invalid(
             "row-level security policies are not yet supported for this query form".to_string(),
         )))
@@ -293,10 +289,17 @@ impl PrefilterSnapshot {
         // RLS-13（Issue #2276）: 利用者ポリシーの適用表では、この可視集合（テナント境界だけ）を検索の母集団に
         // できない（ポリシーのマスク合成は #2279）。固定文言で拒否する（`core::search`・公開の
         // `PrefilterIndex::build` が共通で通る入口）。
-        reject_if_row_policies_apply(storage, table, ctx)?;
-        // 世代を先に読んでからアリーナを構築する（アリーナ構築中に別の書き込みが
-        // コミットされても、その変更を見落とさない方向の順序。`search_with` の doc 参照）。
-        let built_generation = storage.current_generation()?;
+        // 拒否判定と世代の読み取りは同一の読み取り txn（同一スナップショット）で行う。判定直後に別セッションが
+        // RLS を ENABLE しても、その commit は世代を進めるため、この世代で束縛したアリーナは使用時に古いと
+        // 判定される（ポリシーを反映しないアリーナを正規スナップショットとして保持しない）。
+        let built_generation = {
+            let read_txn = storage
+                .db()
+                .begin_read()
+                .map_err(crate::storage::StorageError::from)?;
+            reject_if_row_policies_apply_in(&read_txn, table, ctx)?;
+            crate::storage::current_generation_in_txn(&read_txn)?
+        };
         // テーブル単位世代も同じ順序（アリーナ構築前）で読む。`search_with_hnsw` が
         // `search_or_fallback` へ渡す `read_txn` の世代と、この `arena` を束縛した
         // 世代とを一致させるための基準値（[`Self::built_table_generation`] ドキュメント
@@ -784,7 +787,8 @@ impl<'s> SearchTimeFilter<'s> {
         validate_search_k(k).map_err(|k| RlsError::InvalidK { k })?;
         // RLS-13（Issue #2276）: 利用者ポリシーの適用表は、検索時フィルタがポリシーを反映できない
         // （#2279）ため固定文言で拒否する。
-        reject_if_row_policies_apply(self.storage, &self.table_name, ctx)?;
+        // 拒否判定は行を読む読み取り txn の中で行う（[`Self::open_row_table`]）。
+        let table = self.open_row_table(ctx)?;
 
         if query.len() != self.dim as usize {
             return Err(RlsError::Kernel(KernelError::DimMismatch {
@@ -796,7 +800,7 @@ impl<'s> SearchTimeFilter<'s> {
             return Err(RlsError::Kernel(KernelError::NonFiniteQuery));
         }
 
-        let Some(table) = self.open_row_table()? else {
+        let Some(table) = table else {
             // 1 行も書き込まれていないテーブル（`VectorArena::build` の空アリーナ相当）。
             return Ok(Vec::new());
         };
@@ -923,7 +927,7 @@ impl<'s> SearchTimeFilter<'s> {
     /// [`PrefilterIndex::len`]/[`PrefilterIndex::is_empty`] も同じ片方向の乖離を持つ
     /// （`search` に渡した `SearchProvider` が破損行・非有限スコア行を除外しうるため）。
     pub fn len(&self, ctx: &PolicyContext) -> Result<usize, RlsError> {
-        let Some(table) = self.open_row_table()? else {
+        let Some(table) = self.open_row_table(ctx)? else {
             return Ok(0);
         };
         let mut count: usize = 0;
@@ -943,7 +947,7 @@ impl<'s> SearchTimeFilter<'s> {
     /// 見つかり次第打ち切るため全件走査の [`Self::len`] より軽い）。[`Self::search`] との
     /// 乖離は [`Self::len`] のドキュメント参照。
     pub fn is_empty(&self, ctx: &PolicyContext) -> Result<bool, RlsError> {
-        let Some(table) = self.open_row_table()? else {
+        let Some(table) = self.open_row_table(ctx)? else {
             return Ok(true);
         };
         for entry in table.iter().map_err(crate::storage::StorageError::from)? {
@@ -977,12 +981,18 @@ impl<'s> SearchTimeFilter<'s> {
     #[allow(clippy::type_complexity)]
     fn open_row_table(
         &self,
+        ctx: &PolicyContext,
     ) -> Result<Option<redb::ReadOnlyTable<(&'static str, u64), &'static [u8]>>, RlsError> {
         let read_txn = self
             .storage
             .db()
             .begin_read()
             .map_err(crate::storage::StorageError::from)?;
+        // RLS-13（Issue #2276）: 利用者ポリシーの適用表は、この検索時フィルタ・件数判定がポリシーを反映できない
+        // ため固定文言で拒否する。判定は行を読むのと同じ読み取り txn（同一スナップショット）で行い、判定後に
+        // 別 txn で行を読む TOCTOU を作らない。`len`／`is_empty` も同じ入口を通り、隠れた行の件数・存在を
+        // 漏らさない。
+        reject_if_row_policies_apply_in(&read_txn, &self.table_name, ctx)?;
         let row_table_name = crate::catalog::user_rows_table_name(&self.table_name);
         // 物理キーは `(tenant_id, id)`（対象ビヘイビア: TABLE-12）。走査はテーブル全行を
         // 対象とし（テナントで絞らない）、可視性判定は `ctx.is_visible` の単一照合パスへ

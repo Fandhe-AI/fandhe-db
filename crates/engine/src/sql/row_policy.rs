@@ -11,7 +11,7 @@
 //!   隠れた行の存在がエラーで推測できる）と台帳の内容ハッシュ（文の AST から出す）の両方が崩れるため。
 //!   式の評価は `sql::where_tree` の既存評価器を再利用し、第 2 の評価器は作らない。
 //! - 合成規則は PostgreSQL 17 と同じ。`(PERMISSIVE の OR) AND RESTRICTIVE の AND`、適用される PERMISSIVE が
-//!   1 件も無ければ全行拒否、式の NULL は偽。`USING` を持たないポリシーは USING 側へ寄与しない。
+//!   1 件も無ければ全行拒否、式の NULL は偽。式を省略した PERMISSIVE は TRUE の分岐として OR に加わる。
 //! - 所有者の扱いは暫定で、常に「所有者ではない」として適用する（狭める側＝fail-closed）。初期ロールの
 //!   `BYPASSRLS`・所有者除外・`row_security` は #2278 がこの前段へ足す。
 //!
@@ -188,8 +188,13 @@ fn compose_layer(
         if def.command != command && def.command != PolicyCommand::All {
             continue;
         }
-        // USING を持たないポリシーは USING 側へ寄与しない。
+        // 式を省略した適用ポリシーは TRUE として合成する（書き込み側 `sql::policy_eval` と同じ意味）。
+        // PERMISSIVE の TRUE は OR を恒真にして「適用される PERMISSIVE なし」の既定拒否と区別する。
+        // RESTRICTIVE の TRUE は AND に何も足さないので捨てる。
         let Some(sql) = def.using_sql.as_deref() else {
+            if def.permissive {
+                permissive.push(BoundConjunction::new(Vec::new(), Vec::new(), Vec::new()));
+            }
             continue;
         };
         let conj = bind_conjunction(sql, schema)?;

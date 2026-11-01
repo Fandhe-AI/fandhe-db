@@ -3767,6 +3767,15 @@ impl EngineCore {
             let schema_read_txn = self.storage.db().begin_read().map_err(StorageError::from)?;
             let schema = crate::catalog::get_table_schema_in_txn(&schema_read_txn, table)?;
             let built_generation = crate::storage::current_generation_in_txn(&schema_read_txn)?;
+            // RLS-13（Issue #2276）: 拒否判定も同じスナップショットで行う。以後の ENABLE の commit は世代を
+            // 進めるため、下の世代確認でこの回の辞書を破棄して再試行し、再試行で改めて拒否される。
+            crate::sql::row_policy::reject_if_policies_apply(&schema_read_txn, ctx, table)
+                .map_err(|_| {
+                    CoreError::Catalog(CatalogError::Invalid(
+                        "row-level security policies are not yet supported for this query form"
+                            .to_string(),
+                    ))
+                })?;
             drop(schema_read_txn);
 
             // `path`/`body` は列名の存在・`ColumnType::Text` に加え non-nullable
@@ -4714,25 +4723,6 @@ impl EngineCore {
                 "row-level security policies are not yet supported for this query form".to_string(),
             ))
         })
-    }
-
-    /// 全列置換・id 指定削除の Rust API（[`Self::update_row`]・[`Self::delete_row`]）用の拒否。これらは
-    /// 所有する行を id で直接書き換え、利用者ポリシーの USING を評価する経路を持たない（SQL 表層の
-    /// UPDATE／DELETE が評価する）。適用表では固定文言の `0A000` 相当（`TriggerFailed` の透過経路）で
-    /// 拒否し、ポリシーを素通りさせない。適用されない表（既定）では何もしない。
-    fn reject_raw_write_if_row_policies_apply(
-        &self,
-        ctx: &PolicyContext,
-        table: &str,
-    ) -> Result<(), crate::tenant::TenantWriteError> {
-        let read_txn = self
-            .storage
-            .db()
-            .begin_read()
-            .map_err(StorageError::from)
-            .map_err(crate::tenant::TenantWriteError::from)?;
-        crate::sql::row_policy::reject_if_policies_apply(&read_txn, ctx, table)
-            .map_err(crate::tenant::TenantWriteError::TriggerFailed)
     }
 
     /// [`Self::read_txn_with_schema`] の複数テーブル版（SQL-29 (c)・RLS-10 (b)・
@@ -14136,7 +14126,6 @@ impl EngineCore {
         // 生の表名は裸の識別子だけ（[`Self::insert_row`] と同じ理由）。
         crate::catalog::validate_identifier(table)
             .map_err(crate::tenant::TenantWriteError::from)?;
-        self.reject_raw_write_if_row_policies_apply(ctx, table)?;
         let ledger_write = self.ledger_mode.resolve(operation_id)?;
         crate::tenant::update_row_unchecked(
             crate::tenant::WriteTarget::Autocommit(&self.storage),
@@ -14161,7 +14150,6 @@ impl EngineCore {
         // 生の表名は裸の識別子だけ（[`Self::insert_row`] と同じ理由）。
         crate::catalog::validate_identifier(table)
             .map_err(crate::tenant::TenantWriteError::from)?;
-        self.reject_raw_write_if_row_policies_apply(ctx, table)?;
         let ledger_write = self.ledger_mode.resolve(operation_id)?;
         crate::tenant::delete_row_unchecked(&self.storage, table, ctx, id, ledger_write)
     }
@@ -16487,7 +16475,9 @@ impl VectorCore for EngineCore {
         // 存在しない行・`ctx` から不可視な行（他テナントの `Private` 行を含む）は
         // 区別せず `NotFound` に統一するため、他テナント行の存在探査には使えない
         // （fail-closed。RLS-9・security.md P0）。
-        let row = match self.storage.get_row_from_table(table, tenant_id, id) {
+        // 行・有効化状態・ポリシー・スキーマは同一の読み取り txn（同一スナップショット）から引く。
+        let read_txn = self.storage.db().begin_read().map_err(StorageError::from)?;
+        let row = match Storage::get_row_in_read_txn(&read_txn, table, tenant_id, id) {
             Ok(row) => row,
             // テーブル不存在・行不存在はいずれも「不可視と不存在を区別しない」契約に
             // 合流させる。それ以外（デコード不正等のデータ破損・バックエンドエラー）は
@@ -16506,7 +16496,6 @@ impl VectorCore for EngineCore {
         // RLS-13（Issue #2276）: 利用者ポリシー（SELECT の USING）を通らない行は存在しない行と同じ
         // `NotFound`。テナント境界の判定より後・行を返す前に、同じスナップショットで評価する。
         // 適用表でなければ（既定）スキーマも読まない（点取得の経路コストを増やさない）。
-        let read_txn = self.storage.db().begin_read().map_err(StorageError::from)?;
         let policy_applies = crate::sql::row_policy::policies_apply(&read_txn, ctx, table)
             .map_err(|_| {
                 CoreError::Catalog(CatalogError::Invalid(
