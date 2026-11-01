@@ -305,7 +305,7 @@ fn query_as_alice(addr: SocketAddr, body: &[u8]) -> HttpResponse {
 /// `status.rs::EXPECTED`（`#[cfg(test)]` 内で外部から参照不可）と同値の
 /// 期待表。両者の乖離は [`err4_projection_table_is_closed_over_all_error_classes`]
 /// が `http_status` 経由で検出する。
-const EXPECTED_STATUS: [(&str, u16); 94] = [
+const EXPECTED_STATUS: [(&str, u16); 95] = [
     ("22000", 400),
     ("22001", 400),
     ("22012", 400),
@@ -458,6 +458,8 @@ const EXPECTED_STATUS: [(&str, u16); 94] = [
     // 分割実行 DML の部分完了（`VD001`）・取り消し（`VD002`）（Issue #1129・SQL-19）: 409。
     // TASK-333・Issue #2398: 直列化の失敗（`40001`）は 409。
     ("40001", 409),
+    // Issue #1934: 読み取り専用トランザクション内の書き込み（`25006`）は 403。
+    ("25006", 403),
     ("VD001", 409),
     ("VD002", 409),
     // `AmbiguousColumn`（`42702`。SQL-28・RLS-10、Issue #924）: 複数テーブル
@@ -545,7 +547,7 @@ fn assert_projected_as(resp: &HttpResponse, expected_class: ErrorClass) {
 
 // --- R7: 射影表が ErrorClass::ALL 全体を閉じて覆うことの機械検証 -----------
 
-const _: () = assert!(ErrorClass::ALL.len() == 98);
+const _: () = assert!(ErrorClass::ALL.len() == 99);
 
 /// `wire_code` を共有する分類と、逆引き（`from_wire_code`）が返す分類の組
 /// （ERR-6。`23502`: TABLE-16・TASK-204・Issue #904、`23505`: Issue #1180）。
@@ -1018,6 +1020,8 @@ fn err4_f_unreachable_classes_project_via_production_encoder() {
         // TASK-333・Issue #2398: NoSQL の 1 要求は開始時に writer を取る暗黙トランザクションで、
         // `40001` には届かない。
         ErrorClass::SerializationFailure,
+        // Issue #1934: NoSQL にはトランザクション制御が無く、`25006` には届かない。
+        ErrorClass::ReadOnlySqlTransaction,
         // TASK-206・INDEX-7・SQL-23（Issue #908）: 索引 DDL は SQL 表層専用。
         // （`UndefinedObject`〔`42704`〕は Issue #2306 で未登録 ENUM 型名から到達可能に
         // なったため外した。固定は `err4_f_undefined_type_reachable_via_nosql_create_table`）

@@ -95,7 +95,7 @@ macro_rules! define_error_classes {
 pub(crate) const SHARED_WIRE_CODES: &[&str] = &["23502", "23505", "22023", "P0002"];
 
 define_error_classes! {
-    count = 98;
+    count = 99;
 
     /// 構文上受理された SQL の値・引数が不正（`22000`）。
     /// [`crate::sql::allowlist::SqlSurfaceError::InvalidInput`] の写像。
@@ -251,6 +251,12 @@ define_error_classes! {
     /// [`crate::sql::allowlist::SqlSurfaceError::SerializationFailure`] の写像
     /// （送出経路の結線は TASK-333 の #2405）。
     SerializationFailure => ("40001", "SERIALIZATION_FAILURE"),
+    /// 読み取り専用トランザクション内での書き込み系の文（`25006`。ERR-6・SQL-38・Issue #1934）。
+    /// `BEGIN READ ONLY` の Tx が DML・DDL・`COPY FROM`・ロック・`USING OPERATION_ID` 付きの文を
+    /// 実行しようとした場合に返す。`ROLLBACK` で Tx を閉じてから書き込み可能な Tx でやり直す。
+    /// 文言は固定で、表名・テナント・件数を含めない。
+    /// [`crate::sql::allowlist::SqlSurfaceError::ReadOnlySqlTransaction`] の写像。
+    ReadOnlySqlTransaction => ("25006", "READ_ONLY_SQL_TRANSACTION"),
     /// 前提状態を満たさない対象への操作（`55000`）。TABLE-42・Issue #1664 が追加。
     /// 未実体化の MATERIALIZED VIEW（`WITH NO DATA`、または読み手の文脈に実体が無い）を
     /// 読もうとした場合に返す。他文脈の実体の有無・件数は含めない。
@@ -754,6 +760,18 @@ mod tests {
         assert_eq!(
             crate::sql::allowlist::SqlSurfaceError::SerializationFailure.wire_code(),
             "40001"
+        );
+    }
+
+    /// ERR-6・SQL-38（Issue #1934）: `25006` の分類。
+    #[test]
+    fn read_only_sql_transaction_class_is_25006() {
+        let c = ErrorClass::ReadOnlySqlTransaction;
+        assert_eq!(c.wire_code(), "25006");
+        assert_eq!(c.label(), "READ_ONLY_SQL_TRANSACTION");
+        assert_eq!(
+            crate::sql::allowlist::SqlSurfaceError::ReadOnlySqlTransaction.wire_code(),
+            "25006"
         );
     }
 }

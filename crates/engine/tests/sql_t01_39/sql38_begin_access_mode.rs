@@ -1,9 +1,9 @@
 //! `BEGIN READ ONLY`／`BEGIN READ WRITE` のアクセスモード修飾子（SQL-38・Issue #1932）の
 //! 結合テスト。ポインタ: `docs/spec/04-behavior/` SQL-38・SQL-31。
 //!
-//! `EngineCore::execute_sql_in_txn` を production 経路として検証する。読み取り専用の実体
-//! （#1933／#1934）が入るまで `BEGIN READ ONLY` は `0A000` の暫定ゲートで拒否される。
-//! #1933／#1934 でその期待値を更新すること。
+//! `EngineCore::execute_sql_in_txn` を production 経路として検証する。`BEGIN READ ONLY` は
+//! Issue #1934 で開始できるようになった（書き込み文の `25006` 拒否は
+//! `sql38_read_only_write_rejection` が検証する）。
 
 use engine::catalog::{ColumnDef, ColumnType, TableSchema};
 use engine::core::EngineCore;
@@ -95,21 +95,34 @@ fn begin_read_write_and_plain_begin_behave_the_same() {
 }
 
 #[test]
-fn begin_read_only_is_rejected_with_0a000_and_leaves_no_state() {
+fn begin_read_only_starts_and_rejects_a_write_with_25006() {
     let (engine, path) = new_core();
     let _cleanup = CleanupGuard(path);
     let mut session = SessionState::default();
     let mut txn = engine.new_session_transaction();
     assert_eq!(
         run(&engine, &mut session, &mut txn, "BEGIN READ ONLY"),
-        Err("0A000".to_string())
+        Ok(SqlOutcome::Begin)
+    );
+    assert_eq!(txn.status(), TransactionStatus::InTransaction);
+    assert_eq!(txn.access_mode(), Some(TxnAccessMode::ReadOnly));
+    assert_eq!(
+        run(&engine, &mut session, &mut txn, &insert_sql(1, "op-ro")),
+        Err("25006".to_string())
+    );
+    assert_eq!(txn.status(), TransactionStatus::Failed);
+    assert_eq!(
+        run(&engine, &mut session, &mut txn, "ROLLBACK"),
+        Ok(SqlOutcome::Rollback)
     );
     assert_eq!(txn.status(), TransactionStatus::Idle);
-    // 書き込みゲートが残っていないこと（続く BEGIN が成功する）。
+    assert_eq!(count_rows(&engine), 0);
+    // 続く BEGIN（READ WRITE）が成功し、書き込めること。
     assert_eq!(
         run(&engine, &mut session, &mut txn, "BEGIN"),
         Ok(SqlOutcome::Begin)
     );
+    run(&engine, &mut session, &mut txn, &insert_sql(1, "op-ro")).expect("insert");
 }
 
 #[test]
