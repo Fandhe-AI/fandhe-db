@@ -1420,6 +1420,8 @@ Issue #1405（fix(engine)!: CREATE TYPE の型名の重複を 42710 で返す。
 
 **Issue #1937（docs(design): 分離レベルの受理方針を設計文書へ記録する。SQL-38・TABLE-3・PERSIST-4 ポインタ）**: [explicit-transaction.md](explicit-transaction.md) に「分離レベルの受理方針」節を追加した（契約は spec ポインタのみ。受理範囲は記述しない）。コードは変更していない。
 
+**Issue #1938（feat(engine): ISOLATION LEVEL 修飾子の構文を受理する。SQL-38 ポインタ）**: `BEGIN [WORK|TRANSACTION] ISOLATION LEVEL {SERIALIZABLE|REPEATABLE READ|READ COMMITTED|READ UNCOMMITTED}` を受理し、要求レベルを `sql::transaction::RequestedIsolationLevel` として `ActiveTxn` に記録する（`SessionTransaction::isolation_level()`）。実行は単一ライタのまま不変。公開構造体 `ValidatedTxnControl` に `isolation_level` フィールドを追加した（破壊的変更）。受理範囲の詳細は設計文書のポインタ先に従う。`START TRANSACTION` と `READ ONLY` は別 Issue。テストは `sql::transaction` の単体テストと `tests/sql_t01_39/sql38_begin_isolation_level.rs`。
+
 **Issue #1956（docs(design): 行ロック句・LOCK TABLE の扱いを設計文書へ記録する。SQL-38・TABLE-3・PERSIST-4・SQL-31 ポインタ）**: [explicit-transaction.md](explicit-transaction.md) に「行ロック句・`LOCK TABLE` の扱い」節を追加した（単一ライタの writer 取得への写像・取得経路・形ごとの担当 Issue・要確認事項を記録。契約はポインタのみ）。コードは変更していない。
 
 **Issue #1958（feat(engine)!: LOCK TABLE を構文解釈し書き込みロックとして処理する。SQL-38・SQL-31・RLS-12・TABLE-3 ポインタ）**: 新モジュール `sql::lock_table`（`ValidatedLockTable`・`LockMode`・構造検証のみ）と `core/lock_exec.rs`、`ParsedSql::Lock`・`SqlOutcome::Lock`（破壊的変更）を追加した。トランザクション外は `25P01`、内では表の存在確認（不在 `42P01`・ビュー等 `42809`）の後に `SessionTransaction::ensure_writer(nowait)` で writer を確保する（取得済みならゲートに触れない。NOWAIT は `Storage::begin_explicit_write_txn_nowait`）。関係名の解決器は文頭 `LOCK`（`TABLE` 省略形）も表参照として扱う。wire は CommandComplete `LOCK TABLE`。NOWAIT 取得失敗の SQL レベル E2E は遅延取得（#2400）の後に追加する（現状は `BEGIN` が writer を取得するため単体テストで担保）。修飾形の他テナント SCHEMA は既存の解決器の契約（`3F000`・不在 SCHEMA と同一応答）を維持しており、SQL-38 (7)(c) の文言との差は要確認。
