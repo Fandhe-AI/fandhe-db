@@ -19,6 +19,7 @@
 //! テナント境界（P0）: scope は呼び出し元が渡す検証済みの `tenant_id` だけ。他テナントのロールは不在と
 //! 同じ経路・同じ `42704` になる。エラー文言は固定で、内部 ID・tenant_id・依存元・パスワードを含めない。
 
+use crate::catalog::role::membership_apply::{MembershipChangeError, NewRoleMemberships};
 use crate::catalog::role::{
     DropRolesError, RoleDef, ROLE_ALREADY_EXISTS_MESSAGE, ROLE_HAS_DEPENDENTS_MESSAGE,
 };
@@ -29,6 +30,7 @@ use crate::crypto::scram_verifier::{
 use crate::sql::allowlist::{
     RolePassword, SqlSurfaceError, ValidatedCreateRole, ValidatedDropRole,
 };
+use crate::sql::mode::SessionState;
 use crate::storage::Storage;
 
 /// パスワード（平文または検証子文字列）の最大バイト数。超過は `22023`。
@@ -113,6 +115,7 @@ fn build_verifier(password: Option<&RolePassword>) -> Result<Vec<u8>, SqlSurface
 pub(crate) fn execute_create_role(
     storage: &Storage,
     tenant_id: &str,
+    session: &SessionState,
     stmt: &ValidatedCreateRole,
 ) -> Result<CreateRoleOutcome, SqlSurfaceError> {
     let scram_verifier = build_verifier(stmt.password.as_ref())?;
@@ -125,9 +128,30 @@ pub(crate) fn execute_create_role(
         scram_verifier,
         legacy_phc: Vec::new(),
     };
+    let has_memberships =
+        !(stmt.in_roles.is_empty() && stmt.member_roles.is_empty() && stmt.admin_roles.is_empty());
+    if !has_memberships {
+        storage
+            .create_role(tenant_id, &def)
+            .map_err(|e| map_role_error(e, &stmt.name))?;
+        return Ok(CreateRoleOutcome {});
+    }
+    // Issue #2232: メンバーシップ句はロール作成と同じ txn で付与する。付与者は現在ロールなので、未束縛は
+    // 対象の有無を問わず `42501`（`GRANT` と同じ fail-closed）。
+    let actor_id = crate::sql::grant_ddl::require_grant_principal(session)?;
+    let m = NewRoleMemberships {
+        actor_id,
+        owner_equivalent: session.ddl_allowed(),
+        in_roles: &stmt.in_roles,
+        member_roles: &stmt.member_roles,
+        admin_roles: &stmt.admin_roles,
+    };
     storage
-        .create_role(tenant_id, &def)
-        .map_err(|e| map_role_error(e, &stmt.name))?;
+        .create_role_with_memberships(tenant_id, &def, &m)
+        .map_err(|e| match e {
+            MembershipChangeError::Catalog(c) => map_role_error(c, &stmt.name),
+            other => crate::sql::grant_ddl::map_membership_error(other),
+        })?;
     Ok(CreateRoleOutcome {})
 }
 

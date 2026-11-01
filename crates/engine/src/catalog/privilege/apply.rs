@@ -13,8 +13,12 @@
 //! 所有者: ロール所有の機構（#2236）が入るまで、呼び出し元が `owner_equivalent`（DDL 権限ゲートを通過した
 //! 主体）を真にした場合に限り、対象の全権限を GRANT OPTION 付きで持つ「所有者相当」として扱う。記録される
 //! 付与者は常に現在ロール ID。したがって別の所有者相当の主体が付けた付与は REVOKE できない（所有者の概念が
-//! 入るまでの既知の制約）。継承（メンバーシップ経由の権限）は #2232 の担当で、本ファイルは付与者本人の直接の
-//! 行と PUBLIC の行だけを見る。
+//! 入るまでの既知の制約）。
+//!
+//! 継承（Issue #2232）: 付与権限は付与者本人の行と PUBLIC に加え、付与者が INHERIT で継承するロール
+//! （`catalog::role::graph::effective_roles_in_txn` の閉包。書き込みと同じ txn のスナップショット）の行も
+//! 見る。記録・取り消しの対象になる付与者は、PostgreSQL の `select_best_grantor` と同じく、必要な GRANT OPTION を
+//! すべて持つ最も近いロール（全部を持つロールが無ければ最も多く持つロール。同点は近さ→ホップ順）にする。
 //!
 //! 有界性: 対象の総数・CASCADE の反復回数に上限を置き、超過は固定の `LimitExceeded`（`54000`）にする。
 
@@ -31,6 +35,7 @@ use super::super::{
 use super::{
     list_acl_for_object_in_txn, upsert_acl_in_txn, AclEntry, PrivilegeObject, PUBLIC_GRANTEE_ID,
 };
+use crate::catalog::role::graph::{effective_roles_in_txn, Mode};
 use crate::catalog::role::{get_role_by_id_in_txn, get_role_in_txn, validate_tenant};
 
 /// 1 回の GRANT／REVOKE が走査する対象（表・列）の総数の上限（実装既定値）。
@@ -217,6 +222,42 @@ fn grantor_rights(entries: &[AclEntry], grantor: u64) -> (u16, u16) {
         }
     }
     (go, any)
+}
+
+/// 付与者の継承閉包（近い順。先頭は付与者自身）の行から、付与できる権限（GRANT OPTION の和）と何らかの権限の和を
+/// 返す。GRANT OPTION は付与者ごとに別々に判定するため、`pick_grantor` と併用する。
+fn closure_any(entries: &[AclEntry], closure: &[u64]) -> u16 {
+    closure
+        .iter()
+        .fold(0u16, |a, r| a | grantor_rights(entries, *r).1)
+}
+
+/// 対象の付与者を選ぶ（PostgreSQL の `select_best_grantor` 相当）。`want` のすべての GRANT OPTION を持つ最も近い
+/// ロール、無ければ最も多く持つロール（同点は近い方。何も持たなければ実行ロール）。列は表単位の行も合わせて
+/// 見る。
+fn pick_grantor(
+    entries: &[AclEntry],
+    table_entries: Option<&[AclEntry]>,
+    allowed: u16,
+    want: u16,
+    closure: &[u64],
+) -> u64 {
+    let mut best: Option<(u32, u64)> = None;
+    for r in closure {
+        let mut go = grantor_rights(entries, *r).0;
+        if let Some(te) = table_entries {
+            go |= grantor_rights(te, *r).0 & allowed;
+        }
+        let got = go & want;
+        if got == want {
+            return *r;
+        }
+        let n = got.count_ones();
+        if best.is_none_or(|(bn, _)| n > bn) {
+            best = Some((n, *r));
+        }
+    }
+    best.map_or(0, |(_, r)| r)
 }
 
 /// `grantor` が権限ビット `bits` について持つ GRANT OPTION の出所（上流の付与者）の集合。循環の検出に使う
@@ -419,7 +460,7 @@ fn has_any_column_privilege(
     write_txn: &redb::WriteTransaction,
     tenant: &str,
     table: &str,
-    grantor: u64,
+    closure: &[u64],
 ) -> Result<bool> {
     // ビュー・matview には列の ACL を作れない（`0A000` で拒否済み）ため、スキーマが無ければ「無い」。
     let schema = match require_table_schema_write_any_identity(write_txn, table) {
@@ -433,7 +474,7 @@ fn has_any_column_privilege(
             column: c.name.clone(),
         };
         let entries = list_acl_for_object_in_txn(write_txn, tenant, &obj)?;
-        if grantor_rights(&entries, grantor).1 != 0 {
+        if closure_any(&entries, closure) != 0 {
             return Ok(true);
         }
     }
@@ -462,6 +503,15 @@ impl Storage {
         if get_role_by_id_in_txn(&*write_txn, tenant, req.grantor_id)?.is_none() {
             return Err(AclChangeError::PermissionDenied);
         }
+        // 付与者の継承閉包（所有者相当は付与権限の判定を迂回するため本人だけ）。
+        let closure: Vec<u64> = if req.owner_equivalent {
+            vec![req.grantor_id]
+        } else {
+            effective_roles_in_txn(&*write_txn, tenant, req.grantor_id, Mode::Inherit)?
+                .into_iter()
+                .map(|(r, _)| r)
+                .collect()
+        };
         // 1. 対象 relation。
         let mut kinds: Vec<(String, RelKind)> = Vec::new();
         for t in req.tables {
@@ -571,19 +621,36 @@ impl Storage {
             }
             let si = states.idx(&write_txn, tenant, &t.object)?;
             let entries: Vec<AclEntry> = states.work_of(si).to_vec();
+            // 列の判定は表単位の行も参照する。
+            let table_entries: Option<Vec<AclEntry>> = match &t.object {
+                PrivilegeObject::Column { table, .. } if !req.owner_equivalent => {
+                    Some(list_acl_for_object_in_txn(
+                        &*write_txn,
+                        tenant,
+                        &PrivilegeObject::Table(table.clone()),
+                    )?)
+                }
+                _ => None,
+            };
+            // この対象の付与者（所有者相当は実行ロール。そうでなければ継承閉包から最良のロール）。
+            let need = if t.bits != 0 { want } else { want_p };
+            let gid = if req.owner_equivalent {
+                req.grantor_id
+            } else {
+                match &table_entries {
+                    // 波及ビットは表の GRANT OPTION だけで絞るため、表の行だけで付与者を選ぶ。
+                    Some(te) if t.bits == 0 => pick_grantor(te, None, allowed, need, &closure),
+                    te => pick_grantor(&entries, te.as_deref(), allowed, need, &closure),
+                }
+            };
             // 波及ビット: 付与者の表の GRANT OPTION で絞る（0 なら表側が警告のみで無変更のため
             // 列も変更しない）。
             let eff_p = if want_p == 0 {
                 0
             } else if req.owner_equivalent {
                 want_p
-            } else if let PrivilegeObject::Column { table, .. } = &t.object {
-                let table_entries = list_acl_for_object_in_txn(
-                    &*write_txn,
-                    tenant,
-                    &PrivilegeObject::Table(table.clone()),
-                )?;
-                let (tgo, _) = grantor_rights(&table_entries, req.grantor_id);
+            } else if let Some(te) = &table_entries {
+                let (tgo, _) = grantor_rights(te, gid);
                 want_p & tgo
             } else {
                 want_p
@@ -594,27 +661,18 @@ impl Storage {
             } else if req.owner_equivalent {
                 want
             } else {
-                let (mut go, mut any) = grantor_rights(&entries, req.grantor_id);
-                if let PrivilegeObject::Column { table, .. } = &t.object {
-                    let table_entries = list_acl_for_object_in_txn(
-                        &*write_txn,
-                        tenant,
-                        &PrivilegeObject::Table(table.clone()),
-                    )?;
-                    let (tgo, tany) = grantor_rights(&table_entries, req.grantor_id);
-                    go |= tgo & allowed;
-                    any |= tany & allowed;
+                let (mut go, _) = grantor_rights(&entries, gid);
+                let mut any = closure_any(&entries, &closure);
+                if let Some(te) = &table_entries {
+                    go |= grantor_rights(te, gid).0 & allowed;
+                    any |= closure_any(te, &closure) & allowed;
                 }
                 if go == 0 {
                     let mut has_any = any != 0;
                     if !has_any {
                         if let PrivilegeObject::Table(table) = &t.object {
-                            has_any = has_any_column_privilege(
-                                &write_txn,
-                                tenant,
-                                table,
-                                req.grantor_id,
-                            )?;
+                            has_any =
+                                has_any_column_privilege(&write_txn, tenant, table, &closure)?;
                         }
                     }
                     if !has_any {
@@ -641,7 +699,7 @@ impl Storage {
             if req.is_grant {
                 if req.grant_option && !req.owner_equivalent {
                     // 自己への GRANT OPTION 付与は循環として拒否する。
-                    if grantee_ids.contains(&req.grantor_id) {
+                    if grantee_ids.contains(&gid) {
                         return Err(AclChangeError::InvalidGrant(
                             "grant options cannot be granted back to your own grantor",
                         ));
@@ -658,7 +716,7 @@ impl Storage {
                     }
                     // 権限ビットごとに経路を辿る（別の権限の辺をつないで架空の循環を作らない）。
                     for bit in (0..16).map(|i| 1u16 << i).filter(|b| eff & b != 0) {
-                        let anc = ancestors_of(&path_entries, req.grantor_id, bit)?;
+                        let anc = ancestors_of(&path_entries, gid, bit)?;
                         if grantee_ids.iter().any(|g| anc.contains(g)) {
                             return Err(AclChangeError::InvalidGrant(
                                 "grant options cannot be granted back to your own grantor",
@@ -669,7 +727,7 @@ impl Storage {
                 for g in &grantee_ids {
                     if let Some(e) = work
                         .iter_mut()
-                        .find(|e| e.grantee_id == *g && e.grantor_id == req.grantor_id)
+                        .find(|e| e.grantee_id == *g && e.grantor_id == gid)
                     {
                         e.privileges |= eff;
                         if req.grant_option {
@@ -678,7 +736,7 @@ impl Storage {
                     } else {
                         work.push(AclEntry {
                             grantee_id: *g,
-                            grantor_id: req.grantor_id,
+                            grantor_id: gid,
                             privileges: eff,
                             grant_options: if req.grant_option { eff } else { 0 },
                         });
@@ -688,7 +746,7 @@ impl Storage {
                 for g in &grantee_ids {
                     if let Some(e) = work
                         .iter_mut()
-                        .find(|e| e.grantee_id == *g && e.grantor_id == req.grantor_id)
+                        .find(|e| e.grantee_id == *g && e.grantor_id == gid)
                     {
                         let old_go = e.grant_options;
                         if req.grant_option {

@@ -550,8 +550,12 @@ const ALLOWLIST: &[(&str, u32)] = &[
     // 書くだけで、どの表の行・スキーマ・`table_generation` にも影響しない（ACL・メンバーシップも ID 参照のみ。
     // 検査ゲートが入る後続 Issue でも世代ではなくカタログを直接読む）ため世代 bump は不要。
     // Issue #1962（`Storage::drop_roles`）の追加で `create_role`・`drop_roles` の 2 か所になった（同じ理由）。
-    ("catalog/role.rs", 876),
-    ("catalog/role.rs", 908),
+    ("catalog/role.rs", 952),
+    ("catalog/role.rs", 984),
+    // Issue #2232: メンバーシップの付与・取り消し（`apply_membership_changes`）とロール作成＋付与
+    // （`create_role_with_memberships`）。メンバーシップ表だけを書き、表の計画・世代に影響しない（同じ理由）。
+    ("catalog/role/membership_apply.rs", 286),
+    ("catalog/role/membership_apply.rs", 313),
     // Issue #1961 のロール・ACL カタログの単体テスト補助（`write` ヘルパー。専用表だけを書き表世代の対象外）。
     ("catalog/role/tests.rs", 37),
     // Issue #1962 の `sql::role_ddl` の crate 内テスト補助（`commit` ヘルパー。専用表だけを書き表世代の対象外）。

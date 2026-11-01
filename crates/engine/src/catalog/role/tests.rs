@@ -98,10 +98,30 @@ fn membership_and_login_blob_roundtrip() {
         admin: true,
         inherit: false,
         set: true,
+        grantor_id: None,
     };
     let bytes = encode_membership(opts);
     assert_eq!(bytes, vec![1, 0b101]);
     assert_eq!(decode_membership(&bytes).expect("decode"), opts);
+
+    // 版 2: 付与者つき（版 1 は付与者なしとして読める）。
+    let with_grantor = MembershipOptions {
+        grantor_id: Some(7),
+        ..opts
+    };
+    let bytes2 = encode_membership(with_grantor);
+    assert_eq!(bytes2, vec![2, 0b101, 7, 0, 0, 0, 0, 0, 0, 0]);
+    assert_eq!(decode_membership(&bytes2).expect("decode"), with_grantor);
+    for bad in [
+        vec![2, 0b101],
+        vec![2, 0b101, 0, 0, 0, 0, 0, 0, 0, 0],
+        vec![2, 0b101, 7, 0, 0, 0, 0, 0, 0],
+        vec![2, 0b101, 7, 0, 0, 0, 0, 0, 0, 0, 0],
+        vec![2, 0x08, 7, 0, 0, 0, 0, 0, 0, 0],
+        vec![3, 0, 7, 0, 0, 0, 0, 0, 0, 0],
+    ] {
+        assert!(is_fixed_corrupt(decode_membership(&bad)), "{bad:?}");
+    }
 
     let blob = encode_login_blob("t1", 9).expect("encode");
     assert_eq!(
@@ -386,6 +406,7 @@ fn role_catalog_survives_reopen() {
                 admin: false,
                 inherit: true,
                 set: true,
+                grantor_id: None,
             },
         )?;
         register_login_in_txn(t, &ident, "t1", a)

@@ -1016,6 +1016,7 @@ pub(crate) fn map_outcome(outcome: SqlOutcome) -> OutcomeResponse {
         },
         // SQL-40（Issue #1965）: `GRANT`／`REVOKE` も件数を持たない固定タグ（警告は wire へ出さない）。
         SqlOutcome::GrantRevoke(o) => OutcomeResponse::Command {
+            // Issue #2232: ロール形も権限形も PostgreSQL 17 と同じ `GRANT`／`REVOKE`（CMDTAG_GRANT／REVOKE）。
             tag: if o.is_revoke() { "REVOKE" } else { "GRANT" }.to_string(),
         },
         // SQL-39（Issue #1962）: ロール DDL も件数を持たない固定タグ（`CREATE USER` も PostgreSQL と同じ
