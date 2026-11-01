@@ -91,6 +91,9 @@ mod dml_subquery_exec;
 mod cte_join_budget_tests;
 #[cfg(test)]
 mod deferred_writer_tests;
+// writer 遅延取得の前後の回帰固定（Issue #2402。ポインタ: SQL-19・SQL-31・TASK-333）。
+#[cfg(test)]
+mod deferred_writer_regression_tests;
 mod dml_join_exec;
 #[cfg(test)]
 mod dml_join_exec_tests;
