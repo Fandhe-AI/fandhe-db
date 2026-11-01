@@ -69,3 +69,67 @@ fn write_lock_wait_timeout_is_55p03_over_wire_and_recovers_after_release() {
     assert_eq!(read_command_complete(&mut b), "INSERT 0 1");
     read_ready_for_query(&mut b);
 }
+
+/// 書き込みが最後以外にある複数文メッセージ（暗黙トランザクション。WIRE-16・SQL-31）は、writer を
+/// メッセージ先頭で取るため、writer が握られている間は先頭文の応答を送る前に `55P03` になる
+/// （Issue #2401）。接続は `'I'` に戻り、明示の `BEGIN` は待たない。
+#[test]
+fn implicit_multi_statement_message_is_55p03_at_start_while_writer_is_held() {
+    let path = temp_db::unique_db_path("write-lock-wait-implicit");
+    let _guard = temp_db::CleanupGuard(path.clone());
+    let storage = Storage::open(&path).expect("open storage");
+    storage
+        .create_table(&TableSchema::new(
+            "documents",
+            vec![ColumnDef::new("embedding", ColumnType::Vector(3), false)],
+        ))
+        .expect("create table");
+    let wait = wire_server::write_lock_wait_opt::resolve(Some("100")).expect("in range");
+    let core = Arc::new(
+        EngineCore::from_storage(storage, Box::new(CpuScalarProvider)).with_write_lock_wait(wait),
+    );
+    let users_path = write_user_store_file(&[
+        ("alice", "tenant-a", "correct-horse"),
+        ("bob", "tenant-b", "battery-staple"),
+    ]);
+    let addr = spawn_server_with_engine(&users_path, Arc::clone(&core));
+    let mut a = authenticate_to_ready_for_query(addr, "alice", "correct-horse");
+    let mut b = authenticate_to_ready_for_query(addr, "bob", "battery-staple");
+
+    let insert = |id: u32| {
+        format!(
+            "INSERT INTO documents (id, embedding) VALUES ({id}, '[0.1,0.2,0.3]') USING OPERATION_ID 'op-2401-{id}'"
+        )
+    };
+    let message = format!("{}; {}", insert(2), insert(3));
+
+    send_simple_query(&mut a, "BEGIN");
+    assert_eq!(read_command_complete(&mut a), "BEGIN");
+    read_ready_for_query(&mut a);
+    send_simple_query(&mut a, &insert(1));
+    assert_eq!(read_command_complete(&mut a), "INSERT 0 1");
+    read_ready_for_query(&mut a);
+
+    // 先頭文の CommandComplete より前に ErrorResponse が来る（1 文も実行されない）。
+    send_simple_query(&mut b, &message);
+    expect_error_response_with_sqlstate(&mut b, "55P03");
+    assert_eq!(read_ready_for_query_status(&mut b), b'I');
+
+    // 対照: 明示の BEGIN は writer を待たず成功する。
+    send_simple_query(&mut b, "BEGIN");
+    assert_eq!(read_command_complete(&mut b), "BEGIN");
+    assert_eq!(read_ready_for_query_status(&mut b), b'T');
+    send_simple_query(&mut b, "ROLLBACK");
+    assert_eq!(read_command_complete(&mut b), "ROLLBACK");
+    assert_eq!(read_ready_for_query_status(&mut b), b'I');
+
+    send_simple_query(&mut a, "ROLLBACK");
+    assert_eq!(read_command_complete(&mut a), "ROLLBACK");
+    read_ready_for_query(&mut a);
+
+    // 解放後は同じメッセージが成功する。
+    send_simple_query(&mut b, &message);
+    assert_eq!(read_command_complete(&mut b), "INSERT 0 1");
+    assert_eq!(read_command_complete(&mut b), "INSERT 0 1");
+    assert_eq!(read_ready_for_query_status(&mut b), b'I');
+}

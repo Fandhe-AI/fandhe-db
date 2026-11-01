@@ -3,7 +3,7 @@
 - ステータス: **Accepted（実装既定値）**
 - 対応: Issue #942・TASK-221
 - 改訂: Issue #2396・TASK-333（決定 1 を改訂。writer の遅延取得と `40001` の判定は
-  下記 1a。実装は #2399〜#2405・#2408 で進行中。#2399・#2400 は実施済み。設計記録は #2397）
+  下記 1a。実装は #2399〜#2405・#2408 で進行中。#2399・#2400・#2401 は実施済み。設計記録は #2397）
 - ポインタ: `docs/spec/04-behavior/sql-surface.md` SQL-31・
   `docs/spec/04-behavior/persistence.md` RECOVER-12・
   `docs/spec/04-behavior/error-format.md` ERR-6
@@ -664,6 +664,12 @@ production コード（`crates/wire-server/src/`）は無変更・テスト専�
   順序）、wire の `crates/wire-server/tests/recover12_explicit_txn_resend.rs`（層 A）、
   `three_client_e2e.rs` の層 B（psql／psycopg／node pg の 3 クライアント。
   [`three-client-e2e-harness.md`](./three-client-e2e-harness.md)）。
+- 暗黙トランザクションが従来どおり開始時に writer を取ることの固定（Issue #2401。SQL-31・
+  WIRE-16。本番コードの変更は無い）: 取得は開始時の 1 回だけで最初の書き込み文では取り直さない
+  （`core/deferred_writer_tests.rs`。明示 Tx との対照つき）、先頭の読み取りを跨いで保持する・
+  開始自体が `55P03` で `Idle` のまま 1 文も実行されない（`tests/core_misc/wire16_implicit_txn.rs`）、
+  待機上限での `55P03`（`tests/write_lock_wait.rs`）、wire 越しの複数文メッセージ
+  （`crates/wire-server/tests/write_lock_wait_parity.rs`）。
 - 先頭文（または唯一の文）が 0 行 DELETE の場合の再送判定（Issue #1403。実装済み）:
   明示トランザクション内の DELETE は autocommit と同じフォーム関数へ `WriteTarget::InTxn`
   を渡し、0 行でも台帳を共有 write txn へ記録して `mark_written` する。このため従来の

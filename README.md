@@ -597,14 +597,13 @@ cleartext password 認証のまま不変です。`scram-sha-256` を指定する
   未知ユーザーの存在を推測させる情報漏えいに繋がるため避けてください）。
 
 `--ddl-allowed-users`（SQL-23・TASK-202・TASK-203、Issue #899・#902・#909・#908）は
-`CREATE TABLE`・`DROP TABLE`・`CREATE VIEW`／`DROP VIEW`（TABLE-18・TASK-205）・
-`CREATE INDEX`／`DROP INDEX`（INDEX-7・TASK-206）・
-`CREATE TYPE ... AS ENUM`／`DROP TYPE`（TABLE-14・TASK-198）の DDL 実行権限を持つ
-username をカンマ区切りで列挙する opt-in CLI 引数です。
+DDL 実行権限を持つ username をカンマ区切りで列挙する opt-in CLI 引数です。
+対象は `CREATE`／`DROP`／`ALTER` 系の DDL 文全般（TABLE・VIEW・MATERIALIZED VIEW・INDEX・TYPE・
+SEQUENCE・SCHEMA・TRIGGER・FUNCTION など。一時表の作成・削除など意図的な例外あり）で、
+対象文種・判定点・判定順序の一覧は `docs/design/privilege-check-paths.md`（Issue #1973）を参照してください。
 `--search-engine`／`--durability` と同型の「プロセス起動時にのみ明示指定する
 注入点」で、未指定は DDL 実行権限を持つユーザーが 0 人のまま（**全ユーザーの
-`CREATE TABLE`／`DROP TABLE`／`CREATE VIEW`／`DROP VIEW`／`CREATE INDEX`／
-`DROP INDEX`／`CREATE TYPE`／`DROP TYPE` が `42501`（permission denied）で拒否されます**。fail-closed。
+対象 DDL が `42501`（permission denied）で拒否されます**。fail-closed。
 DDL は全テナント共有のカタログを変更するため既定で無効化されています）。列挙した username は
 `--users` で読み込んだユーザーストアへ実在する必要があり、未知の
 username・空要素・重複要素・フラグの重複指定はいずれも fail-closed で
