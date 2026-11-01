@@ -85,6 +85,8 @@ pub(crate) mod function_dependency;
 // TRIGGER のカタログ（TABLE-45・Issue #1722。設計記録: `docs/design/trigger-catalog.md`）。
 pub(crate) mod policy;
 pub(crate) mod trigger;
+// 表ごとの行セキュリティ有効化状態（RLS-13・Issue #2275）。
+pub mod row_security;
 pub(crate) use materialized::read_materialized_view_in;
 
 /// カタログ値を格納するテーブル。キーはテーブル名、値は [`encode_schema`] で
@@ -12356,6 +12358,8 @@ impl Storage {
             trigger::remove_triggers_for_table_in_txn(write_txn, name)?;
             // 行セキュリティポリシー（全テナント分。RLS-13・Issue #2274）。同名再作成で旧定義を復活させない。
             policy::remove_policies_for_table_in_txn(write_txn, name)?;
+            // 行セキュリティ有効化状態（全テナント分。RLS-13・Issue #2275）。残置すると同名再作成で旧状態が復活する。
+            row_security::remove_row_security_for_table_in_txn(write_txn, name)?;
             // 永続キー索引（Issue #1071）。残置すると参照整合性検査が fail-open になりうる。
             crate::key_index::drop_indexes_for_table_in_txn(write_txn, name)?;
             // commit 記録（SQL-38・Issue #2404）: スキーマ・カタログを変える書き込みは DDL として記録する。
@@ -13186,6 +13190,8 @@ impl Storage {
         trigger::rename_table_in_txn(&write_txn, table_name, new_table_name)?;
         // 行セキュリティポリシー（全テナント分）も新しい表キーへ移す（RLS-13・Issue #2274）。
         policy::rename_table_in_txn(&write_txn, table_name, new_table_name)?;
+        // 行セキュリティ有効化状態（全テナント分）も新しい表キーへ移す（RLS-13・Issue #2275）。
+        row_security::rename_row_security_table_in_txn(&write_txn, table_name, new_table_name)?;
 
         // カタログの付け替え（`encode_schema` が不変条件を再検証する）。
         schema.rename_table_references(new_table_name);

@@ -7260,6 +7260,17 @@ impl EngineCore {
             ParsedSql::AlterTable(stmt) => {
                 crate::sql::ddl::require_ddl_permission(session)?;
                 crate::sql::schema_dependency::check_alter_table(stmt)?;
+                // RLS-13（Issue #2275）: 一時表が同名の永続表を隠しているとき、永続表の有効化状態を
+                // 黙って変えない（一時表の行セキュリティは未対応。fail-closed の `0A000`）。
+                if let crate::sql::allowlist::ValidatedAlterTable::RowSecurity(rs) = stmt {
+                    if session.temp_tables().contains(&rs.table_name) {
+                        return Err(
+                            crate::sql::allowlist::SqlSurfaceError::feature_not_supported(
+                                "ROW LEVEL SECURITY is not supported for temporary tables",
+                            ),
+                        );
+                    }
+                }
                 let outcome = crate::sql::ddl::execute_alter_table(
                     &self.storage,
                     ctx.tenant_id(),
