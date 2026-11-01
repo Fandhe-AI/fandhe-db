@@ -178,6 +178,8 @@ fn sqlstates_follow_postgresql() {
         ("ALTER POLICY p ON nosuch RENAME TO r", "42P01"),
         ("DROP POLICY p ON nosuch", "42P01"),
         ("CREATE POLICY r ON v", "42809"),
+        ("DROP POLICY p ON v", "42809"),
+        ("DROP POLICY IF EXISTS p ON v", "42809"),
         // 式の束縛。
         ("CREATE POLICY r ON t USING (nope = 'x')", "42703"),
         ("CREATE POLICY r ON t USING (n)", "42804"),

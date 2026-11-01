@@ -705,7 +705,7 @@ impl Storage {
         Ok(())
     }
 
-    /// `scope` のポリシー `name` を削除し、存在して削除したら `true`。表が無ければ `TableNotFound`、ポリシーが
+    /// `scope` のポリシー `name` を削除し、存在して削除したら `true`。対象が表でなければ `WrongObjectKind`、表が無ければ `TableNotFound`、ポリシーが
     /// 無ければ（他テナントにしか無い場合を含む）`Ok(false)`。削除と対象表の世代更新は同一 write txn。
     pub(crate) fn drop_policy(&self, scope: &str, table_key: &str, name: &str) -> Result<bool> {
         validate_scope(scope)?;
@@ -714,14 +714,8 @@ impl Storage {
         let write_txn = self
             .begin_write_txn()
             .map_err(super::convert_storage_error)?;
-        let table_exists = match ReadSource::open_table(&*write_txn, CATALOG_TABLE) {
-            Ok(t) => t.get(table_key)?.is_some(),
-            Err(redb::TableError::TableDoesNotExist(_)) => false,
-            Err(e) => return Err(e.into()),
-        };
-        if !table_exists {
-            return Err(CatalogError::TableNotFound(table_key.to_string()));
-        }
+        // CREATE／ALTER と同じ対象検査（ビュー・索引・SEQUENCE 等は `WrongObjectKind`、無ければ `TableNotFound`）。
+        require_policy_target_in_txn(&write_txn, scope, table_key)?;
         if get_in_txn(&*write_txn, table_key, scope, name)?.is_none() {
             return Ok(false);
         }

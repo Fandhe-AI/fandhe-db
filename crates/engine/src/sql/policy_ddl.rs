@@ -203,6 +203,15 @@ pub(crate) fn execute_drop_policy(
     }
 }
 
+/// 解決済みカタログキー（`#<id>.<表名>`）から利用者が書いた表名の部分だけを取り出す。内部 ID を
+/// エラー文言へ出さないため（security.md P0。スキーマ ID の存在オラクル防止）。
+fn user_facing_relation_name(key: &str) -> String {
+    match key.strip_prefix('#').and_then(|r| r.split_once('.')) {
+        Some((_, rel)) => rel.to_string(),
+        None => key.to_string(),
+    }
+}
+
 /// ポリシーカタログの失敗を SQL 表層の契約へ写像する（同名の既存 `42710`・ポリシー不在 `42704`・
 /// 表不在 `42P01`・種別違い `42809`・列不在 `42703`・件数上限 `54000`・形状不正 `22000`・ロック timeout
 /// `55P03`・その他 `XX000`）。式の束縛エラーは SQLSTATE をそのまま透過する。文言は固定で、内部キー・
@@ -225,8 +234,12 @@ pub(crate) fn map_policy_error(e: PolicyDdlError, policy_name: &str) -> SqlSurfa
         CatalogError::ViewLimitExceeded(_) => {
             SqlSurfaceError::payload_too_large("too many policies")
         }
-        CatalogError::TableNotFound(name) => SqlSurfaceError::UndefinedTable { name },
-        CatalogError::WrongObjectKind(name) => SqlSurfaceError::WrongObjectType { name },
+        CatalogError::TableNotFound(name) => SqlSurfaceError::UndefinedTable {
+            name: user_facing_relation_name(&name),
+        },
+        CatalogError::WrongObjectKind(name) => SqlSurfaceError::WrongObjectType {
+            name: user_facing_relation_name(&name),
+        },
         CatalogError::ColumnNotFound(name) => SqlSurfaceError::undefined_column(name),
         CatalogError::WriteLockTimeout => SqlSurfaceError::LockNotAvailable,
         _ => SqlSurfaceError::Internal {
@@ -262,6 +275,13 @@ mod tests {
             code(CatalogError::WrongObjectKind("t".to_string())),
             "42809"
         );
+        for e in [
+            CatalogError::TableNotFound("#12.t".to_string()),
+            CatalogError::WrongObjectKind("#12.t".to_string()),
+        ] {
+            let m = map_policy_error(PolicyDdlError::Catalog(e), "p").client_message();
+            assert!(!m.contains("#12"), "{m}");
+        }
         assert_eq!(code(CatalogError::ColumnNotFound("c".to_string())), "42703");
         assert_eq!(code(CatalogError::WriteLockTimeout), "55P03");
         let corrupt = map_policy_error(
