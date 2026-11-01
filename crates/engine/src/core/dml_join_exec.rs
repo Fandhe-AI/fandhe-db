@@ -210,6 +210,8 @@ impl EngineCore {
                             max_scanned_rows,
                             predicate,
                             Some(&self.trigger_runtime),
+                            // 結合形は USING 側の列を参照する述語を必ず持つので既存行を読む（RLS-13）。
+                            true,
                         ),
                         Some(project) => crate::tenant::delete_rows_where_capturing_unchecked(
                             target,
@@ -223,6 +225,7 @@ impl EngineCore {
                             max_scanned_rows,
                             predicate,
                             project,
+                            true,
                         ),
                     }
                 }

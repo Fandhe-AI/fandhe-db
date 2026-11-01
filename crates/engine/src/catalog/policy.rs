@@ -407,6 +407,17 @@ pub(crate) fn list_policies_in_txn(
     list_in_txn(write_txn, table_key, scope)
 }
 
+/// `ReadSource`（読み取り txn・書き込み txn・明示トランザクションの読み取り窓口）から `scope` の表 `table_key`
+/// のポリシーを名前の昇順で引く（USING の適用側 `sql::row_policy` が、行を読むのと同じスナップショットから
+/// 解決する入口。存在しないテーブルは作成せず空を返す。他テナントの定義は構造上引けない）。
+pub(crate) fn list_policies_in_source<R: ReadSource>(
+    src: &R,
+    scope: &str,
+    table_key: &str,
+) -> Result<Vec<PolicyDef>> {
+    list_in_txn(src, table_key, scope)
+}
+
 /// 内部 ID を 1 つ払い出す（1 始まり・`checked_add`・再利用しない）。
 fn allocate_id_in_txn(write_txn: &redb::WriteTransaction) -> Result<u64> {
     let mut counter = write_txn.open_table(POLICY_ID_COUNTER_TABLE)?;

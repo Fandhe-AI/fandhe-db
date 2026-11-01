@@ -112,6 +112,14 @@ fn setup_with_policy(label: &str, policy_sql: &str) -> (CleanupGuard, EngineCore
         &mut s,
         "ALTER TABLE t FORCE ROW LEVEL SECURITY",
     );
+    // #2276 の USING 適用により、SELECT に適用できるポリシーが無いと全行が不可視になる。
+    // 結果確認用の SELECT を通すため、検査対象と干渉しない SELECT 専用の PERMISSIVE を足す。
+    ok(
+        &core,
+        "alice",
+        &mut s,
+        "CREATE POLICY sel_all ON t FOR SELECT USING (true)",
+    );
     ok(&core, "alice", &mut s, policy_sql);
     (g, core, s)
 }

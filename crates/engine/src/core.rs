@@ -3745,6 +3745,9 @@ impl EngineCore {
         ),
         CoreError,
     > {
+        // RLS-13（Issue #2276）: 辞書はテナント可視行から作る。ポリシーで隠れた行の語が辞書へ入ると
+        // クエリ展開から存在が推測できるため、適用表では辞書構築を拒否する（#2279 の担当）。
+        self.reject_if_row_policies_apply(ctx, table)?;
         if let Some(hit) = self.dictionary_cache.lookup(&self.storage, table, ctx) {
             return Ok(hit);
         }
@@ -3764,6 +3767,15 @@ impl EngineCore {
             let schema_read_txn = self.storage.db().begin_read().map_err(StorageError::from)?;
             let schema = crate::catalog::get_table_schema_in_txn(&schema_read_txn, table)?;
             let built_generation = crate::storage::current_generation_in_txn(&schema_read_txn)?;
+            // RLS-13（Issue #2276）: 拒否判定も同じスナップショットで行う。以後の ENABLE の commit は世代を
+            // 進めるため、下の世代確認でこの回の辞書を破棄して再試行し、再試行で改めて拒否される。
+            crate::sql::row_policy::reject_if_policies_apply(&schema_read_txn, ctx, table)
+                .map_err(|_| {
+                    CoreError::Catalog(CatalogError::Invalid(
+                        "row-level security policies are not yet supported for this query form"
+                            .to_string(),
+                    ))
+                })?;
             drop(schema_read_txn);
 
             // `path`/`body` は列名の存在・`ColumnType::Text` に加え non-nullable
@@ -3920,6 +3932,12 @@ impl EngineCore {
         ),
         CoreError,
     > {
+        // RLS-13（Issue #2276）: ポリシーの適用表では辞書構築を拒否する（`dictionary_snapshot_with_index` と同じ）。
+        crate::sql::row_policy::reject_if_policies_apply(write_txn, ctx, table).map_err(|_| {
+            CoreError::Catalog(CatalogError::Invalid(
+                "row-level security policies are not yet supported for this query form".to_string(),
+            ))
+        })?;
         let schema = crate::catalog::get_table_schema_in_txn(write_txn, table)?;
         let (path_idx, body_idx) = dictionary_required_columns(&schema)
             .map_err(|msg| CoreError::from(CatalogError::Invalid(msg)))?;
@@ -4688,6 +4706,22 @@ impl EngineCore {
                     StorageError::from(e)
                 ),
             }
+        })
+    }
+
+    /// 利用者ポリシー（RLS-13・Issue #2276）の適用表なら、ポリシーを反映できない Rust API の検索・辞書
+    /// 構築経路を固定文言で拒否する（`sql::row_policy::reject_if_policies_apply` の Rust API 版。
+    /// 拒否文言に表名・ポリシー名を含めない）。適用されない表（既定）では何もしない。
+    fn reject_if_row_policies_apply(
+        &self,
+        ctx: &PolicyContext,
+        table: &str,
+    ) -> Result<(), CoreError> {
+        let read_txn = self.storage.db().begin_read().map_err(StorageError::from)?;
+        crate::sql::row_policy::reject_if_policies_apply(&read_txn, ctx, table).map_err(|_| {
+            CoreError::Catalog(CatalogError::Invalid(
+                "row-level security policies are not yet supported for this query form".to_string(),
+            ))
         })
     }
 
@@ -16362,6 +16396,9 @@ impl VectorCore for EngineCore {
             Err(CatalogError::TableNotFound(_)) => return Err(CoreError::NotFound),
             Err(e) => return Err(CoreError::Catalog(e)),
         };
+        // RLS-13（Issue #2276）: 利用者ポリシーの適用表では、アリーナ・索引・キャッシュの検索経路が
+        // ポリシーを反映できない（#2279 の担当）ため、固定文言で拒否する（黙って素通りさせない）。
+        self.reject_if_row_policies_apply(ctx, table)?;
         let expected_dim = match schema.vector_dim() {
             Some(dim) if dim != 0 && dim <= crate::storage::MAX_EMBEDDING_DIM => dim,
             _ => return Err(CoreError::Arena(ArenaError::InvalidDim)),
@@ -16438,7 +16475,9 @@ impl VectorCore for EngineCore {
         // 存在しない行・`ctx` から不可視な行（他テナントの `Private` 行を含む）は
         // 区別せず `NotFound` に統一するため、他テナント行の存在探査には使えない
         // （fail-closed。RLS-9・security.md P0）。
-        let row = match self.storage.get_row_from_table(table, tenant_id, id) {
+        // 行・有効化状態・ポリシー・スキーマは同一の読み取り txn（同一スナップショット）から引く。
+        let read_txn = self.storage.db().begin_read().map_err(StorageError::from)?;
+        let row = match Storage::get_row_in_read_txn(&read_txn, table, tenant_id, id) {
             Ok(row) => row,
             // テーブル不存在・行不存在はいずれも「不可視と不存在を区別しない」契約に
             // 合流させる。それ以外（デコード不正等のデータ破損・バックエンドエラー）は
@@ -16453,6 +16492,58 @@ impl VectorCore for EngineCore {
         };
         if !ImplicitRlsHook::new(ctx).is_visible(&row.tenant_id, row.visibility) {
             return Err(CoreError::NotFound);
+        }
+        // RLS-13（Issue #2276）: 利用者ポリシー（SELECT の USING）を通らない行は存在しない行と同じ
+        // `NotFound`。テナント境界の判定より後・行を返す前に、同じスナップショットで評価する。
+        // 適用表でなければ（既定）スキーマも読まない（点取得の経路コストを増やさない）。
+        let policy_applies = crate::sql::row_policy::policies_apply(&read_txn, ctx, table)
+            .map_err(|_| {
+                CoreError::Catalog(CatalogError::Invalid(
+                    "row-level security policy could not be applied".to_string(),
+                ))
+            })?;
+        if !policy_applies {
+            return Ok(row);
+        }
+        let schema = crate::catalog::get_table_schema_in_txn(&read_txn, table)?;
+        if let Some(policy) = crate::sql::row_policy::resolve_row_policy(
+            &read_txn,
+            ctx,
+            &schema,
+            table,
+            crate::sql::row_policy::PolicyCmd::Select,
+        )
+        .map_err(|_| {
+            CoreError::Catalog(CatalogError::Invalid(
+                "row-level security policy could not be applied".to_string(),
+            ))
+        })? {
+            let mut mask = vec![false; schema.columns.len()];
+            policy.mark_needs(&mut mask);
+            let scanned =
+                crate::row_codec::scan_scalar_columns_masked(&schema, &row.metadata, Some(&mask))
+                    .map_err(|_| {
+                    CoreError::Catalog(CatalogError::Invalid(
+                        "row-level security policy could not be applied".to_string(),
+                    ))
+                })?;
+            let mut scratch = Vec::new();
+            let passed = policy
+                .passes(
+                    &scanned,
+                    row.id,
+                    &row.embedding,
+                    row.embedding.len(),
+                    &mut scratch,
+                )
+                .map_err(|_| {
+                    CoreError::Catalog(CatalogError::Invalid(
+                        "row-level security policy could not be applied".to_string(),
+                    ))
+                })?;
+            if !passed {
+                return Err(CoreError::NotFound);
+            }
         }
         Ok(row)
     }
