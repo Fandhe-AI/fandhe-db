@@ -346,6 +346,8 @@ Failed { session_at_begin: SessionState, expired: bool } }`）。`ActiveTxn` は
   - `ensure_writer` は 1a-3 の「gate 取得 → permit 保持のまま判定 → 格納」の挿入点で、#2405 が
     取得と格納の間に `40001` 判定を入れる。
   - 暗黙トランザクション（WIRE-16）は従来どおり開始時に writer を取る（スナップショットは取得後に開く。#2401）。
+  - 取得の前後の回帰（read-your-writes・COMMIT までの隔離・ROLLBACK 後のキャッシュ非汚染・ファイル形
+    `INSERT`・`USING PLAN`・`EXPLAIN`・`COPY FROM`・`setval`）は #2402 のテストで固定済み（SQL-19・SQL-31）。
   - **暫定の読み取りの意味**: スナップショット（`read_snapshot`）の結線は #2403 のため、writer 取得前の
     読み取りは文ごとの確定済み状態を見る。後続の `40001` 判定にとっては、読みが `BEGIN` 時点より新しい
     側へずれるだけで、偽陽性側にしか倒れず偽陰性は生まない。
