@@ -409,6 +409,7 @@ pub(crate) fn redact_row_conversion_error(e: SqlSurfaceError) -> SqlSurfaceError
         | E::RowSecurityPolicyViolation { .. }
         | E::RowSecurityOffRejected { .. }
         | E::InvalidCursorName
+        | E::InvalidSavepointSpecification
         | E::RecordNotAssigned
         | E::NoDataFound
         | E::TooManyRows

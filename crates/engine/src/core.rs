@@ -4410,6 +4410,8 @@ impl EngineCore {
                     | crate::sql::SqlOutcome::StartTransaction
                     | crate::sql::SqlOutcome::Commit
                     | crate::sql::SqlOutcome::Rollback
+                    | crate::sql::SqlOutcome::Savepoint
+                    | crate::sql::SqlOutcome::ReleaseSavepoint
                     | crate::sql::SqlOutcome::DeclareCursor
                     | crate::sql::SqlOutcome::Fetch(_)
                     | crate::sql::SqlOutcome::CloseCursor => {
@@ -4478,6 +4480,8 @@ impl EngineCore {
                     | crate::sql::SqlOutcome::StartTransaction
                     | crate::sql::SqlOutcome::Commit
                     | crate::sql::SqlOutcome::Rollback
+                    | crate::sql::SqlOutcome::Savepoint
+                    | crate::sql::SqlOutcome::ReleaseSavepoint
                     | crate::sql::SqlOutcome::DeclareCursor
                     | crate::sql::SqlOutcome::Fetch(_)
                     | crate::sql::SqlOutcome::CloseCursor => {
@@ -4543,6 +4547,8 @@ impl EngineCore {
                     | crate::sql::SqlOutcome::StartTransaction
                     | crate::sql::SqlOutcome::Commit
                     | crate::sql::SqlOutcome::Rollback
+                    | crate::sql::SqlOutcome::Savepoint
+                    | crate::sql::SqlOutcome::ReleaseSavepoint
                     | crate::sql::SqlOutcome::DeclareCursor
                     | crate::sql::SqlOutcome::Fetch(_)
                     | crate::sql::SqlOutcome::CloseCursor => {
@@ -4615,6 +4621,8 @@ impl EngineCore {
                     | crate::sql::SqlOutcome::StartTransaction
                     | crate::sql::SqlOutcome::Commit
                     | crate::sql::SqlOutcome::Rollback
+                    | crate::sql::SqlOutcome::Savepoint
+                    | crate::sql::SqlOutcome::ReleaseSavepoint
                     | crate::sql::SqlOutcome::DeclareCursor
                     | crate::sql::SqlOutcome::Fetch(_)
                     | crate::sql::SqlOutcome::CloseCursor => {
@@ -4706,6 +4714,8 @@ impl EngineCore {
                     | crate::sql::SqlOutcome::StartTransaction
                     | crate::sql::SqlOutcome::Commit
                     | crate::sql::SqlOutcome::Rollback
+                    | crate::sql::SqlOutcome::Savepoint
+                    | crate::sql::SqlOutcome::ReleaseSavepoint
                     | crate::sql::SqlOutcome::DeclareCursor
                     | crate::sql::SqlOutcome::Fetch(_)
                     | crate::sql::SqlOutcome::CloseCursor => {
@@ -8126,6 +8136,33 @@ impl EngineCore {
                 TxnControl::Rollback => {
                     txn.rollback(session)?;
                     Ok(crate::sql::SqlOutcome::Rollback)
+                }
+                // savepoint 系（SQL-69・Issue #1942。構文とスタックのみ。巻き戻しは #1941）。
+                // 名前は構文検証が必ず付けるため、欠落は防御として内部エラーで拒否する。
+                TxnControl::Savepoint
+                | TxnControl::ReleaseSavepoint
+                | TxnControl::RollbackToSavepoint => {
+                    let Some(name) = ctrl.savepoint_name.as_deref() else {
+                        txn.fail();
+                        return Err(crate::sql::allowlist::SqlSurfaceError::Internal {
+                            detail: "internal error".to_string(),
+                        });
+                    };
+                    match ctrl.control {
+                        TxnControl::Savepoint => {
+                            txn.savepoint(name)?;
+                            Ok(crate::sql::SqlOutcome::Savepoint)
+                        }
+                        TxnControl::ReleaseSavepoint => {
+                            txn.release_savepoint(name)?;
+                            Ok(crate::sql::SqlOutcome::ReleaseSavepoint)
+                        }
+                        _ => {
+                            txn.rollback_to_savepoint(name)?;
+                            // 成功経路は #1941 まで存在しない（常に Err）。
+                            Ok(crate::sql::SqlOutcome::Rollback)
+                        }
+                    }
                 }
             };
         }

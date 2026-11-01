@@ -9,6 +9,8 @@
 
 ### Added
 
+- `SAVEPOINT <名前>`・`RELEASE [SAVEPOINT] <名前>`・`ROLLBACK [WORK|TRANSACTION] TO [SAVEPOINT] <名前>` の構文と、明示 Tx の savepoint スタックを追加した（Issue #1942・SQL-69）。Tx の外は `25P01`、存在しない名前は新設の `3B001`（HTTP は 400）。巻き戻し本体は未実装（親 Issue #1941）のため、`ROLLBACK TO` は `0A000` で拒否して Tx を `Failed` にする（後続の `COMMIT` で書き込みを確定させない fail-closed）。CommandComplete タグは `SAVEPOINT`・`RELEASE`。
+  BREAKING CHANGE: 公開 enum `TxnControl`（`Savepoint`・`RollbackToSavepoint`・`ReleaseSavepoint`）・`SqlOutcome`（`Savepoint`・`ReleaseSavepoint`）・`ErrorClass`（`InvalidSavepointSpecification`）・`SqlSurfaceError`（`InvalidSavepointSpecification`）に variant を追加した。公開構造体 `ValidatedTxnControl` に `savepoint_name` を追加し `Copy` を外した。`is_rollback_statement` は `ROLLBACK TO ...` で `false` を返す。3 文の SQLSTATE は `42601` から変わる。
 - `row_security`（`SET`／`RESET`／`SHOW`・StartupMessage）とポリシーの適用判定（`BYPASSRLS`・所有者・対象ロール）を追加した（Issue #2278・RLS-12・RLS-13・SQL-39）。RLS 有効な表への読み取り・書き込み・`COPY` は `row_security = off` のとき行を扱う前に `42501`（`query would be affected by row-level security policy for table "..."`。表名は自テナントのみ）で拒否する。
   BREAKING CHANGE: 公開 enum `SqlSurfaceError`・`TenantWriteError` に `RowSecurityOffRejected` を追加した（`wire_code` は既存の `42501` のまま）。網羅 `match` する外部コードは腕を足す。
 - `BEGIN READ ONLY` の Tx を開始できるようにし、書き込み系の文（DML・DDL・`COPY FROM`・ロック・`USING OPERATION_ID` 付き）を `25006`（`read_only_sql_transaction`）で拒否して Tx を `Failed` にする（Issue #1934・SQL-38 (3)・ERR-6）。判定は許可リスト方式で、writer・台帳・採番・カタログへ触れる前に拒否する。HTTP は 403 に射影する。

@@ -1312,6 +1312,10 @@ pub enum SqlSurfaceError {
     /// 存在しない名前のいずれも区別しない固定文言のみを保持し、カーソル名
     /// 自体を含めない（security.md「存在情報を漏らさない」対応。ERR-6: `34000`）。
     InvalidCursorName,
+    /// `RELEASE`／`ROLLBACK TO` が参照した savepoint 名が、現在のトランザクションの
+    /// savepoint スタックに存在しない（SQL-69・Issue #1942。`3B001`）。固定文言のみを保持し、
+    /// savepoint 名を含めない（`34000` のカーソルと同じ安全側の方針）。
+    InvalidSavepointSpecification,
     /// PL/pgSQL の未代入のレコード変数のフィールドを参照した（`55000`。Issue #2225・SQL-68）。
     /// 固定文言のみ（変数名・フィールド名を含めない）。
     RecordNotAssigned,
@@ -2048,6 +2052,9 @@ impl ClassifiedError for SqlSurfaceError {
             | SqlSurfaceError::RowSecurityOffRejected { .. }
             | SqlSurfaceError::SchemaDependencyForbidden => ErrorClass::ForbiddenTenantMismatch,
             SqlSurfaceError::InvalidCursorName => ErrorClass::InvalidCursorName,
+            SqlSurfaceError::InvalidSavepointSpecification => {
+                ErrorClass::InvalidSavepointSpecification
+            }
             SqlSurfaceError::NoDataFound => ErrorClass::NoDataFound,
             SqlSurfaceError::TooManyRows => ErrorClass::TooManyRows,
             SqlSurfaceError::CaseNotFound => ErrorClass::CaseNotFound,
@@ -2408,6 +2415,10 @@ impl std::fmt::Display for SqlSurfaceError {
             // 参照）。
             SqlSurfaceError::InvalidCursorName => {
                 write!(f, "cursor does not exist")
+            }
+            // savepoint 名を含めない固定文言（SQL-69・Issue #1942）。
+            SqlSurfaceError::InvalidSavepointSpecification => {
+                write!(f, "savepoint does not exist")
             }
             // PostgreSQL と同じ固定文言（変数名・値・行の内容は含めない。Issue #2225）。
             SqlSurfaceError::RecordNotAssigned => write!(f, "record is not assigned yet"),

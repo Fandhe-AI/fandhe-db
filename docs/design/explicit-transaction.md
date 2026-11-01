@@ -850,7 +850,7 @@ production コード（`crates/wire-server/src/`）は無変更・テスト専�
   従来どおりの読み書き Tx。`READ ONLY` の暫定ゲート（`0A000`）は Issue #1934 で除去し、
   `READ ONLY` の Tx を開始できる（「READ ONLY での書き込み拒否」節）。PostgreSQL との差異として、アクセスモードの重複・矛盾（`READ ONLY READ WRITE`）
   は `42601`（fail-closed）。引用識別子 `"READ"` も受理される（既存の `"WORK"` と同じ性質）。
-- savepoint、`COMMIT AND CHAIN`・`PREPARE TRANSACTION`。分離レベルの指定は「分離レベルの受理方針」節のポインタ先の契約に従う（`BEGIN ISOLATION LEVEL` は #1938 で実装済み、`SET TRANSACTION` 系は #1939）。
+- savepoint の巻き戻し本体（#1941。構文とスタックは #1942 で実装済み。下記「SAVEPOINT 構文と savepoint スタック」節）、`COMMIT AND CHAIN`・`PREPARE TRANSACTION`。分離レベルの指定は「分離レベルの受理方針」節のポインタ先の契約に従う（`BEGIN ISOLATION LEVEL` は #1938 で実装済み、`SET TRANSACTION` 系は #1939）。
   別名 `START TRANSACTION`／`END`／`ABORT` は Issue #1930 で受理した（下記「別名」節）。
 - NoSQL 表層のトランザクション（設計上 `0A000`。`op` 許可リストに追加しない）。
 - 上限の既定値（20 秒・1,000 件・30 秒）と CLI のハード上限（60 秒・10,000 件。Issue #1553 で暫定採用）の確定 → オーナー判断。
@@ -876,6 +876,35 @@ production コード（`crates/wire-server/src/`）は無変更・テスト専�
   `is_rollback_statement`、複数文メッセージの分割器（制御文の分類）。
 - テスト: `crates/engine/tests/sql_t40_up/sql69_txn_aliases.rs`・
   `crates/wire-server/tests/wire_proto/sql69_txn_aliases.rs`・`wire942_extended_transaction.rs`。
+
+## SAVEPOINT 構文と savepoint スタック（Issue #1942・SQL-69 ポインタ）
+
+本節はポインタ表記と実装上の判断のみとし、受理構文・エラー契約の詳細は本書へ記述しない
+（「別名」節と同じ理由）。
+
+- ポインタ: `docs/spec/04-behavior/sql-surface.md` SQL-69。
+- 範囲: `SAVEPOINT`／`RELEASE`／`ROLLBACK TO` の構文解釈と、`ActiveTxn` が持つ名前付き
+  スタック（`sql::savepoint::SavepointStack`）まで。**巻き戻し本体は親 Issue #1941**。
+- 表現: `TxnControl` に 3 variant、`ValidatedTxnControl` に `savepoint_name` を追加した
+  （新しい `ParsedSql` variant は作らない。`ParsedSql::Transaction` を列挙する既存の分岐
+  〔一時表のトークン走査免除・Describe・制御文脈の無い入口の拒否〕がそのまま効くため）。
+- 実装箇所: `sql::transaction`（`validate_transaction_control_tokens`・`parse_savepoint_name`・
+  `SessionTransaction::{savepoint, release_savepoint, rollback_to_savepoint}`・
+  `is_rollback_statement`）、`core.rs` の `ParsedSql::Transaction` 分岐、複数文の分割器
+  （`ROLLBACK TO` を Tx 終了の `ROLLBACK` と区別し `in_txn` を変えない）。
+- 上限: 3 文とも文数・持続時間の上限に計上する（スタック長が文数上限で有界になる）。
+- fail-closed: 巻き戻しが未実装の間、`ROLLBACK TO` は成功させず必ず Tx を `Failed` へ倒す
+  （取り消したつもりの書き込みが後続の `COMMIT` で確定する fail-open を避ける）。
+- `is_rollback_statement` は `ROLLBACK TO ...` で `false`（Failed 中は一律 `25P02`）。
+  Failed は `ActiveTxn` を捨てるためスタックが残らず、Failed からの `ROLLBACK TO` 復帰は
+  #1941 でスタックの引き継ぎとあわせて扱う。
+- 名前の照合は大文字小文字を区別する完全一致（lexer が引用の有無を保持しないため、
+  混同を避ける安全側。PostgreSQL の畳み込みとの差異は既知）。
+- #1941 への申し送り: 巻き戻し本体（台帳・世代キャッシュ・カーソル・`written_tables` 等）、
+  Failed へのスタック引き継ぎ、crash-test。
+- テスト: `crates/engine/tests/sql_t40_up/sql69_savepoint_syntax.rs`・
+  `crates/wire-server/tests/wire_proto/sql69_savepoint_syntax.rs`、単体は
+  `sql::savepoint`・`sql::transaction`・`sql::statement_splitter`。
 
 ## READ ONLY での書き込み拒否（SQL-38 (3)・ERR-6・Issue #1934）
 

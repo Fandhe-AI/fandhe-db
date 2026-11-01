@@ -889,6 +889,12 @@ pub(crate) fn map_outcome(outcome: SqlOutcome) -> OutcomeResponse {
         SqlOutcome::Rollback => OutcomeResponse::Command {
             tag: "ROLLBACK".to_string(),
         },
+        SqlOutcome::Savepoint => OutcomeResponse::Command {
+            tag: "SAVEPOINT".to_string(),
+        },
+        SqlOutcome::ReleaseSavepoint => OutcomeResponse::Command {
+            tag: "RELEASE".to_string(),
+        },
         // SQL-23・TASK-85・TASK-202（Issue #899）: `CREATE TABLE`
         // （`exec::ddl::CreateTableOutcome`。行数・件数を一切持たない契約）の
         // 応答を pg 互換の `CommandComplete` タグ `CREATE TABLE`（件数を持たない

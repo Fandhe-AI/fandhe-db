@@ -305,7 +305,7 @@ fn query_as_alice(addr: SocketAddr, body: &[u8]) -> HttpResponse {
 /// `status.rs::EXPECTED`（`#[cfg(test)]` 内で外部から参照不可）と同値の
 /// 期待表。両者の乖離は [`err4_projection_table_is_closed_over_all_error_classes`]
 /// が `http_status` 経由で検出する。
-const EXPECTED_STATUS: [(&str, u16); 96] = [
+const EXPECTED_STATUS: [(&str, u16); 97] = [
     ("22000", 400),
     ("22001", 400),
     ("22012", 400),
@@ -316,6 +316,7 @@ const EXPECTED_STATUS: [(&str, u16); 96] = [
     ("28000", 401),
     ("42501", 403),
     ("34000", 404),
+    ("3B001", 400),
     ("42P01", 404),
     ("P0002", 404),
     ("23505", 409),
@@ -549,7 +550,7 @@ fn assert_projected_as(resp: &HttpResponse, expected_class: ErrorClass) {
 
 // --- R7: 射影表が ErrorClass::ALL 全体を閉じて覆うことの機械検証 -----------
 
-const _: () = assert!(ErrorClass::ALL.len() == 100);
+const _: () = assert!(ErrorClass::ALL.len() == 101);
 
 /// `wire_code` を共有する分類と、逆引き（`from_wire_code`）が返す分類の組
 /// （ERR-6。`23502`: TABLE-16・TASK-204・Issue #904、`23505`: Issue #1180）。
@@ -1007,6 +1008,8 @@ fn err4_f_unreachable_classes_project_via_production_encoder() {
     for class in [
         ErrorClass::RowNotFound,
         ErrorClass::InvalidCursorName,
+        // savepoint 系（Issue #1942・SQL-69）: NoSQL 表層にトランザクション制御が無く到達不能。
+        ErrorClass::InvalidSavepointSpecification,
         // PL/pgSQL の実行時エラー（Issue #2225・SQL-68）: PL/pgSQL 関数を呼ぶ op が NoSQL 表層に
         // 無く到達不能。
         ErrorClass::NoDataFound,
