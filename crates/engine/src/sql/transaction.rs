@@ -8,8 +8,8 @@
 //! 既存の autocommit 経路（[`crate::core::EngineCore::execute_sql_in_session`]）と
 //! ビット同一に振る舞い、`Active` の間は `BEGIN` 時点の読み取りスナップショットと、
 //! 共有 `redb::WriteTransaction`（[`crate::storage::Storage::begin_explicit_write_txn`]。
-//! 取得済み／未取得を `Option` で表し、現状は `BEGIN` で取得する）を保持して複数の
-//! 書き込み文を 1 回の commit にまとめる。
+//! 取得済み／未取得を `Option` で表し、明示 Tx は最初の書き込み文〔`ensure_writer`〕、
+//! 暗黙 Tx は開始時に取得する）を保持して複数の書き込み文を 1 回の commit にまとめる。
 //!
 //! commit 成功境界（`RECOVER-5`・`RECOVER-6`）: point of no return は `COMMIT`
 //! 文が呼ぶ [`crate::recovery::commit_boundary::commit`] の 1 回のみ。台帳
