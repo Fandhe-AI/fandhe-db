@@ -237,6 +237,15 @@ fn is_routable(parsed: &ParsedSql) -> bool {
             | Statement::Join(_)
             | Statement::SetOperation(_),
         ) => true,
+        // SQL-38・Issue #1957: 行ロック句付き SELECT は包んだ文が一時コアで実行できる形なら振り分け、
+        // 実行段の行ロックゲート（暫定 `0A000`）に通す（振り分け不能の誤分類にしない）。
+        ParsedSql::LockingSelect(l) => matches!(
+            l.statement(),
+            Statement::Select(_)
+                | Statement::Aggregate(_)
+                | Statement::Scan(_)
+                | Statement::Join(_)
+        ),
         ParsedSql::CreateIndex(_) | ParsedSql::DropIndex(_) => true,
         // SQL-53 (b)・Issue #1754: 一時表が関与する FROM／USING 形は一時コアの結合実行に未対応（`0A000`）。
         ParsedSql::UpdateFrom(_) | ParsedSql::DeleteUsing(_) => false,
@@ -912,6 +921,9 @@ impl EngineCore {
                 session.temp_tables_mut().bump_epoch()?;
                 Ok(crate::sql::SqlOutcome::DropIndex(outcome))
             }
+            // SQL-38・Issue #1957: 行ロック句付き SELECT は永続側と同じ暫定ゲート（ロックを取らずに
+            // 素の SELECT として実行しない）。
+            ParsedSql::LockingSelect(_) => Err(super::row_lock_not_supported()),
             ParsedSql::Statement(stmt) => {
                 core.execute_validated_in_session(ctx, session, stmt.clone())
             }
@@ -1053,6 +1065,7 @@ impl EngineCore {
             )),
             // 読み取り系は開いている書き込みトランザクションを読み取り源にする（自トランザクションの
             // 未 commit の変更を読める。キャッシュは使われない brute-force 経路）。
+            ParsedSql::LockingSelect(_) => Err(super::row_lock_not_supported()),
             ParsedSql::Statement(stmt) => match stmt {
                 Statement::Select(v) if v.using_plan().is_some() => {
                     self.execute_validated_with_dict(ctx, session, stmt.clone(), Some(write_txn))
