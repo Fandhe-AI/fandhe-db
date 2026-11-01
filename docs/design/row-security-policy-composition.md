@@ -343,7 +343,7 @@ RLS-13 のポインタ。読み取り（SELECT）と UPDATE・DELETE の対象�
   id 形・結合形・分割実行は常に「読む」
 - `UPDATE ... SET` の後の行に対する `WITH CHECK`／SELECT の `USING`（`42501`）は #2277
 - `SELECT ... FOR UPDATE／SHARE`（行ロック付き SELECT）の実行は現状 `0A000`（#2230）。実装時は SELECT と UPDATE の両方の USING を使う
-- `get_row` は行の取得とポリシー評価を別の read txn で行う（狭める方向のみで、読み取り結果が増えることはない）
+- `get_row` は行・スキーマ・有効化状態・ポリシーを同一の read txn（同一スナップショット）から取得して評価する（行の取得とポリシー評価の間に別の変更が割り込まない）
 - Rust API の拒否は `CoreError::Catalog(Invalid)`／`RlsError::Arena(Catalog(Invalid))`／`TenantError::Catalog(Invalid)` で表す
   （`CoreError` 等に `0A000` 相当の variant が無いため。SQL 表層では `0A000`）
 - 一括検索（`batch_search`・`batch_fallback`・`gpu_batch`）は呼び出し元が渡す配列を扱いテーブルを読まないため対象外。
