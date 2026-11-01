@@ -2037,8 +2037,16 @@ impl ParsedSql {
 /// 読む。TABLE-33・Issue #1575）。
 fn session_time_zone_scope(
     session: &crate::sql::mode::SessionState,
-) -> crate::datetime::SessionTimeZoneScope {
-    crate::datetime::SessionTimeZoneScope::enter(session.time_zone().clone())
+) -> (
+    crate::datetime::SessionTimeZoneScope,
+    crate::sql::policy_applicability::RowSecurityScope,
+) {
+    (
+        crate::datetime::SessionTimeZoneScope::enter(session.time_zone().clone()),
+        // RLS-13・Issue #2278: 書き込みの検査点が `SessionState` を持たないため、`row_security` も
+        // 同じ区間へ束縛する（off かつ RLS 有効な表への書き込みは行を書く前に `42501`）。
+        crate::sql::policy_applicability::RowSecurityScope::enter(session.row_security()),
+    )
 }
 
 /// 行ロック句つき SELECT の暫定ゲート（SQL-38・Issue #1957）。ロックの取得は Issue #2230、

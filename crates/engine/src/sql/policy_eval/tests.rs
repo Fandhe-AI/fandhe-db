@@ -181,8 +181,25 @@ fn conflict_using_kinds_select_their_commands_and_flag_using_expression() {
 
 #[test]
 fn user_policies_apply_only_when_enabled() {
-    assert!(!user_policies_apply_for_write(RowSecurityState::default()));
-    let s =
+    use crate::sql::policy_applicability::RowSecurityScope;
+    let enabled =
         RowSecurityState::default().apply(crate::catalog::row_security::RowSecurityAction::Enable);
-    assert!(user_policies_apply_for_write(s));
+    assert_eq!(
+        user_policies_decision_for_write(RowSecurityState::default()),
+        PolicyDecision::Skip
+    );
+    assert_eq!(
+        user_policies_decision_for_write(enabled),
+        PolicyDecision::Apply
+    );
+    // row_security = off: 有効な表は拒否、無効な表は影響なし。
+    let _off = RowSecurityScope::enter(false);
+    assert_eq!(
+        user_policies_decision_for_write(enabled),
+        PolicyDecision::RejectRowSecurityOff
+    );
+    assert_eq!(
+        user_policies_decision_for_write(RowSecurityState::default()),
+        PolicyDecision::Skip
+    );
 }

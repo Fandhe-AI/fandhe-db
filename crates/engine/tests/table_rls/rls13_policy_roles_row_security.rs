@@ -133,3 +133,45 @@ fn rls13_row_security_off_never_widens_tenant_boundary() {
     };
     assert_eq!(rows, 0, "off must not expose another tenant's rows");
 }
+
+/// RLS-13: RLS 有効な表では、`WITH CHECK (true)` のポリシーがあっても `row_security = off` の INSERT は
+/// 行を書く前に `42501` で拒否され、`on` へ戻すと成功する。RLS 無効な表は off の影響を受けない。
+#[test]
+fn rls13_row_security_off_rejects_write_to_rls_table_before_writing() {
+    let (core, _g) = new_core("rls13-rs-off-write");
+    let mut s = SessionState::default();
+    s.allow_ddl();
+    for sql in [
+        "CREATE TABLE t (id BIGINT PRIMARY KEY, name TEXT)",
+        "CREATE TABLE plain (id BIGINT PRIMARY KEY, name TEXT)",
+        "ALTER TABLE t ENABLE ROW LEVEL SECURITY",
+        "CREATE POLICY p ON t FOR ALL USING (true) WITH CHECK (true)",
+    ] {
+        ok(&core, "alice", &mut s, sql);
+    }
+    ok(&core, "alice", &mut s, "SET row_security = off");
+    assert_eq!(
+        code(
+            &core,
+            "alice",
+            &mut s,
+            "INSERT INTO t (id, name) VALUES (1, 'a')"
+        ),
+        "42501"
+    );
+    // RLS 無効な表は影響を受けない。
+    ok(
+        &core,
+        "alice",
+        &mut s,
+        "INSERT INTO plain (id, name) VALUES (1, 'a')",
+    );
+    ok(&core, "alice", &mut s, "SET row_security = on");
+    // 拒否された文は何も残さない（on の INSERT が主キー衝突しない = 先の文は書かれていない）。
+    ok(
+        &core,
+        "alice",
+        &mut s,
+        "INSERT INTO t (id, name) VALUES (1, 'a')",
+    );
+}

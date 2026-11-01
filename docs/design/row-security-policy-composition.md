@@ -246,8 +246,11 @@
 
 ### 段 1 で結線していないもの・申し送り
 
-- 適用判定点（#2276 の読み取り側・#2277 の書き込み側）は未マージのため `decide` への結線は各 Issue 側で行う。`RejectRowSecurityOff` は
-  行を書く前に文全体を拒否すること
+- 書き込み側（#2277 の WITH CHECK）は結線済み: `policy_eval::compile_in_txn` が `decide` を呼び、RLS 有効かつ
+  `row_security = off` の表への INSERT・UPDATE・UPSERT・COPY は行を書く前に `42501` で拒否する。`row_security` は
+  `SessionState` を持たない検査点へ、文の実行区間の RAII（`RowSecurityScope`。`session_time_zone_scope` と同じ張り方。
+  スコープ外の NoSQL・内部書き込みは on）で渡す
+- 読み取り側（#2276）は未マージのため `decide` への結線は #2276 側で行う（`RejectRowSecurityOff` は行を読む前に文全体を拒否する）
 - `CREATE/ALTER ROLE ... BYPASSRLS` の受理と指定・変更の権限規則（42501）・`DROP ROLE` とポリシー `TO` の依存（`2BP01`）: #1962・#1963
 - 認証主体とロール ID の紐付け: #1971。所有者: #2236。初期ロールへの `BYPASSRLS`: #2238
 - 段 2: ロール属性 `BYPASSRLS`、実効ロール集合（INHERIT 真の付与のみ・循環と上限）、`PolicyRole` へのロール ID 保存（再利用されない ID）、

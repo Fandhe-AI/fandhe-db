@@ -523,6 +523,10 @@ impl EngineCore {
         batch: crate::sql::copy::CopyInBatch,
     ) -> Result<crate::sql::exec::InsertOutcome, SqlSurfaceError> {
         use crate::sql::transaction::TransactionStatus;
+        // RLS-13・Issue #2278: COPY の書き込み検査点にもセッションの `row_security` を張る
+        // （RLS 有効かつ off の表へは行を書く前に `42501`）。
+        let _row_security_scope =
+            crate::sql::policy_applicability::RowSecurityScope::enter(session.row_security());
         let Some(target) = batch.temp.clone() else {
             let was_idle = txn.status() == TransactionStatus::Idle;
             // 移行済み表への `id` 省略 COPY（TABLE-24・Issue #1700）は所有 SEQUENCE から採番するため、

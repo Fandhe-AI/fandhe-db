@@ -14,6 +14,37 @@
 use crate::catalog::row_security::RowSecurityState;
 use crate::sql::mode::SessionState;
 
+thread_local! {
+    /// 現在の文の実行区間に束縛された `row_security`（`true` = on）。スコープが無い経路（NoSQL・内部
+    /// 書き込み等）は既定の on（利用者ポリシーを適用する側。fail-closed）。
+    static ROW_SECURITY_ON: std::cell::Cell<bool> = const { std::cell::Cell::new(true) };
+}
+
+/// セッションの `row_security` を文の実行区間へ束縛する RAII（`core.rs` のセッション入口が
+/// `session_time_zone_scope` と同じ区間で張る）。書き込みの検査点（`policy_eval::compile_in_txn`）は
+/// `SessionState` を持たないため、この束縛経由で [`decide`] へ実行時の値を渡す。
+pub(crate) struct RowSecurityScope {
+    prev: bool,
+}
+
+impl RowSecurityScope {
+    pub(crate) fn enter(on: bool) -> Self {
+        let prev = ROW_SECURITY_ON.with(|c| c.replace(on));
+        Self { prev }
+    }
+}
+
+impl Drop for RowSecurityScope {
+    fn drop(&mut self) {
+        ROW_SECURITY_ON.with(|c| c.set(self.prev));
+    }
+}
+
+/// 現在スレッドに束縛された `row_security`（スコープが無ければ on）。
+pub(crate) fn current_row_security() -> bool {
+    ROW_SECURITY_ON.with(std::cell::Cell::get)
+}
+
 /// 判定に使うセッション側の事情。判定は実行時に現在の [`SessionState`] から作り、準備済み文や
 /// 各種キャッシュのキーには混ぜない（判断 A）。
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -135,5 +166,26 @@ mod tests {
             decide(RowSecurityState::default(), &actor, false),
             PolicyDecision::Skip
         );
+    }
+}
+
+#[cfg(test)]
+mod scope_tests {
+    use super::*;
+
+    /// スコープは入れ子で巻き戻り、既定は on。
+    #[test]
+    fn scope_nests_and_restores() {
+        assert!(current_row_security());
+        {
+            let _a = RowSecurityScope::enter(false);
+            assert!(!current_row_security());
+            {
+                let _b = RowSecurityScope::enter(true);
+                assert!(current_row_security());
+            }
+            assert!(!current_row_security());
+        }
+        assert!(current_row_security());
     }
 }
