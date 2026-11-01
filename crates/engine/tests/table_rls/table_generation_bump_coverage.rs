@@ -80,8 +80,9 @@ const ALLOWLIST: &[(&str, u32)] = &[
     // ための追随（旧: 930／961）。
     // Issue #1690（`Storage::sequence_allocator` の追加）で行番号が移動したための追随（旧: 950／981）。
     // PR #2566 レビュー対応（一時 DB 判定 `Storage::is_temp_scoped` の追加。+12 行）で追随（旧: 963／994）。
-    ("storage.rs", 1146),
-    ("storage.rs", 1180),
+    // Issue #1958（`begin_explicit_write_txn_nowait` の追加。+20 行）の取り込みでさらに移動。
+    ("storage.rs", 1163),
+    ("storage.rs", 1197),
     ("recovery/panic_hook.rs", 404),
     ("txn.rs", 210),
     ("txn.rs", 387),
@@ -452,7 +453,7 @@ const ALLOWLIST: &[(&str, u32)] = &[
     // `Option` 化・読み取りスナップショット追加）の行追加でさらに移動（旧: 966）。書き込み内容・commit の意味は不変。
     // Issue #2400（明示 Tx の writer 遅延取得。`ensure_writer`・`open_read_snapshot` の追加と
     // `begin_with_origin` の分岐）と Issue #1938（ISOLATION LEVEL 受理）の行追加でさらに移動（旧: 1120）。書き込み内容・commit の意味は不変。
-    ("sql/transaction.rs", 1331),
+    ("sql/transaction.rs", 1341),
     // TABLE-44・Issue #1684: 一時表ストア（セッション専用のインメモリ DB。永続 DB とは別インスタンス）の
     // 書き込みトランザクションの確定口（`TempRowStore::commit`）。確定するのは、一時コアの書き込み本体
     // （`tenant::*`・`catalog::*`。いずれも自分の DB の表世代を `bump_table_generation_in_txn` で進める）が

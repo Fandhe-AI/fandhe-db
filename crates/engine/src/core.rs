@@ -97,6 +97,9 @@ mod read_set_tests;
 // commit 記録（SQL-38・Issue #2404）。
 #[cfg(test)]
 mod commit_log_tests;
+// writer 遅延取得の前後の回帰固定（Issue #2402。ポインタ: SQL-19・SQL-31・TASK-333）。
+#[cfg(test)]
+mod deferred_writer_regression_tests;
 mod dml_join_exec;
 #[cfg(test)]
 mod dml_join_exec_tests;
@@ -113,6 +116,8 @@ mod standard_body_binding;
 mod plpgsql_host;
 // `DO` ブロックの実行（SQL-68・Issue #2228）。
 mod do_block;
+// `LOCK TABLE` の実行（SQL-38・Issue #1958）。
+mod lock_exec;
 // `LANGUAGE sql|plpgsql` 関数の呼び出し位置の実行（SQL-67 (5)・Issue #2218）。
 mod routine_call;
 // `CREATE FUNCTION ... LANGUAGE plpgsql` の定義時検証（Issue #2217・SQL-67 (3)）。
@@ -1933,6 +1938,10 @@ pub enum ParsedSql {
     /// `ParsedSql::Statement` には載せない（DataModifyingCte・CreateTrigger と同じ理由。wire 側が
     /// 非書き込みと誤判定しないため）。**BREAKING CHANGE**（Issue #2228）: `ParsedSql` への variant 追加。
     Do(crate::sql::allowlist::ValidatedDo),
+    /// `LOCK [TABLE] ...`（SQL-38・Issue #1958）。トランザクション内でだけ writer を取得して保持する。
+    ///
+    /// **BREAKING CHANGE**（Issue #1958）: `ParsedSql` への variant 追加。
+    Lock(crate::sql::lock_table::ValidatedLockTable),
     /// `CREATE SCHEMA [IF NOT EXISTS] <name>`（TABLE-27、Issue #1713）。
     ///
     /// **BREAKING CHANGE**（Issue #1713）: `ParsedSql` への variant 追加。
@@ -2068,6 +2077,7 @@ fn statement_clock_scope(
         | ParsedSql::CreateTrigger(_)
         | ParsedSql::DropTrigger(_)
         | ParsedSql::Do(_)
+        | ParsedSql::Lock(_)
         | ParsedSql::CreateSchema(_)
         | ParsedSql::DropSchema(_)
         | ParsedSql::AlterSchema(_)
@@ -2138,6 +2148,7 @@ fn insert_sequence_scope(
         | ParsedSql::CreateTrigger(_)
         | ParsedSql::DropTrigger(_)
         | ParsedSql::Do(_)
+        | ParsedSql::Lock(_)
         | ParsedSql::CreateSchema(_)
         | ParsedSql::DropSchema(_)
         | ParsedSql::AlterSchema(_)
@@ -2206,6 +2217,7 @@ fn insert_default_clock_scope(
         | ParsedSql::CreateTrigger(_)
         | ParsedSql::DropTrigger(_)
         | ParsedSql::Do(_)
+        | ParsedSql::Lock(_)
         | ParsedSql::CreateSchema(_)
         | ParsedSql::DropSchema(_)
         | ParsedSql::AlterSchema(_)
@@ -4256,6 +4268,7 @@ impl EngineCore {
                     | crate::sql::SqlOutcome::CreateTrigger(_)
                     | crate::sql::SqlOutcome::DropTrigger(_)
                     | crate::sql::SqlOutcome::Do
+                    | crate::sql::SqlOutcome::Lock
                     | crate::sql::SqlOutcome::CreateSchema(_)
                     | crate::sql::SqlOutcome::DropSchema(_)
                     | crate::sql::SqlOutcome::AlterSchema(_)
@@ -4315,6 +4328,7 @@ impl EngineCore {
                     | crate::sql::SqlOutcome::CreateTrigger(_)
                     | crate::sql::SqlOutcome::DropTrigger(_)
                     | crate::sql::SqlOutcome::Do
+                    | crate::sql::SqlOutcome::Lock
                     | crate::sql::SqlOutcome::CreateSchema(_)
                     | crate::sql::SqlOutcome::DropSchema(_)
                     | crate::sql::SqlOutcome::AlterSchema(_)
@@ -4371,6 +4385,7 @@ impl EngineCore {
                     | crate::sql::SqlOutcome::CreateTrigger(_)
                     | crate::sql::SqlOutcome::DropTrigger(_)
                     | crate::sql::SqlOutcome::Do
+                    | crate::sql::SqlOutcome::Lock
                     | crate::sql::SqlOutcome::CreateSchema(_)
                     | crate::sql::SqlOutcome::DropSchema(_)
                     | crate::sql::SqlOutcome::AlterSchema(_)
@@ -4434,6 +4449,7 @@ impl EngineCore {
                     | crate::sql::SqlOutcome::CreateTrigger(_)
                     | crate::sql::SqlOutcome::DropTrigger(_)
                     | crate::sql::SqlOutcome::Do
+                    | crate::sql::SqlOutcome::Lock
                     | crate::sql::SqlOutcome::CreateSchema(_)
                     | crate::sql::SqlOutcome::DropSchema(_)
                     | crate::sql::SqlOutcome::AlterSchema(_)
@@ -4516,6 +4532,7 @@ impl EngineCore {
                     | crate::sql::SqlOutcome::CreateTrigger(_)
                     | crate::sql::SqlOutcome::DropTrigger(_)
                     | crate::sql::SqlOutcome::Do
+                    | crate::sql::SqlOutcome::Lock
                     | crate::sql::SqlOutcome::CreateSchema(_)
                     | crate::sql::SqlOutcome::DropSchema(_)
                     | crate::sql::SqlOutcome::AlterSchema(_)
@@ -5048,7 +5065,11 @@ impl EngineCore {
             // SCHEMA 名は関係名と別の名前空間で一時表を読み書きしないため走査対象外（TABLE-27・Issue #1713）。
             || crate::sql::allowlist::is_create_schema_statement(&tokens)
             || crate::sql::allowlist::is_drop_schema_statement(&tokens)
-            || crate::sql::allowlist::is_alter_schema_statement(&tokens);
+            || crate::sql::allowlist::is_alter_schema_statement(&tokens)
+            // `LOCK [TABLE]` は `LOCK`・`TABLE`・`IN`・`SHARE`・`MODE` 等のキーワードを含むため、名前走査だと
+            // 同名の一時表（`CREATE TEMP TABLE lock` 等）で誤判定する。対象表名の一時表衝突は
+            // parse 内の参照記録（`hits.temp_hit()`）で固定の `0A000` として拒否する（Issue #1958）。
+            || crate::sql::lock_table::is_lock_statement(&tokens);
         if txn_control_head || scan_exempt {
             let hits = crate::sql::temp_catalog::RelationHits::default();
             let parsed = self.parse_tokens_in(tokens, temp, &hits, self.ledger_mode, resolver)?;
@@ -5607,6 +5628,17 @@ impl EngineCore {
         if crate::sql::allowlist::is_do_statement(&tokens) {
             let stmt = crate::sql::allowlist::validate_do_tokens(&tokens)?;
             return Ok(ParsedSql::Do(stmt));
+        }
+
+        // SQL-38・Issue #1958: `LOCK [TABLE]` は構造検証だけで束縛する（カタログ照会は実行時。
+        // トランザクション外の判定〔`25P01`〕を名前の解決より先にする。`DECLARE` と同じ設計）。
+        // 一時表との衝突は参照の記録だけ行い（結果は使わない）、振り分け側が `0A000` で拒否する。
+        if crate::sql::lock_table::is_lock_statement(&tokens) {
+            let stmt = crate::sql::lock_table::validate_lock_tokens(&tokens)?;
+            for name in &stmt.table_names {
+                let _ = crate::sql::allowlist::TableLookup::table_exists(&storage_lookup, name)?;
+            }
+            return Ok(ParsedSql::Lock(stmt));
         }
 
         let is_declare_statement = matches!(
@@ -7428,6 +7460,10 @@ impl EngineCore {
                     "COPY via the extended query protocol is not supported yet",
                 ),
             ),
+            // SQL-38 (4)・Issue #1958: `LOCK` もトランザクション外は `25P01`（`DECLARE` と同じ分類）。
+            ParsedSql::Lock(_) => {
+                Err(crate::sql::allowlist::SqlSurfaceError::NoActiveSqlTransaction)
+            }
             // WIRE-15・TASK-218: カーソルは明示トランザクション内でのみ有効
             // （`sql::cursor` モジュールドキュメント参照）。トランザクション
             // 文脈を持たない本エントリポイントでは、`DECLARE` は「トランザク
@@ -7471,6 +7507,12 @@ impl EngineCore {
         sql: &str,
     ) -> Result<crate::sql::SqlOutcome, crate::sql::allowlist::SqlSurfaceError> {
         let tokens = crate::sql::lexer::tokenize_marked(sql)?;
+        // SQL-38 (4)・Issue #1958: `LOCK` はトランザクション外なら、構造検証の後・SCHEMA 解決と
+        // `search_path` ゲートより前に `25P01` にする（名前由来の `3F000`／`42P01` に化けさせない）。
+        if crate::sql::lock_table::is_lock_statement(&tokens) {
+            crate::sql::lock_table::validate_lock_structure_unresolved(&tokens)?;
+            return Err(crate::sql::allowlist::SqlSurfaceError::NoActiveSqlTransaction);
+        }
         // 定数式の畳み込み（INSERT VALUES・DEFAULT）は parse 中に行われるため、セッション
         // TimeZone を parse 区間へも張る（ゾーン無し `TIMESTAMPTZ` リテラル・`AT LOCAL`。Issue #1576）。
         let parsed = {
@@ -7565,6 +7607,14 @@ impl EngineCore {
             // `parse_sql` と同じ字句解析 → 構文検証に、一時カタログの細かいゲートを足したもの。
             let parsed = (|| {
                 let tokens = crate::sql::lexer::tokenize_marked(sql)?;
+                // SQL-38 (4)・Issue #1958: `Idle`（トランザクション外）の `LOCK` は構造検証の後、
+                // 名前解決・`search_path` ゲートより前に `25P01`（`Failed` は上で `25P02` 済み）。
+                if txn.status() == crate::sql::transaction::TransactionStatus::Idle
+                    && crate::sql::lock_table::is_lock_statement(&tokens)
+                {
+                    crate::sql::lock_table::validate_lock_structure_unresolved(&tokens)?;
+                    return Err(crate::sql::allowlist::SqlSurfaceError::NoActiveSqlTransaction);
+                }
                 let resolver = self.schema_resolver(ctx);
                 self.parse_tokens_gated(tokens, session, Some(&resolver))
             })();
@@ -8032,6 +8082,7 @@ impl EngineCore {
             // SQL-63・Issue #1876: 全副文・台帳記録・主クエリを共有 write txn で実行する。書いた全表へ
             // `mark_written` する（漏れると遅延 FK の COMMIT 時検査が取りこぼす。P0）。
             ParsedSql::Do(stmt) => self.execute_do_in_txn(ctx, session, txn, stmt),
+            ParsedSql::Lock(stmt) => self.execute_lock_in_active_txn(txn, stmt),
             ParsedSql::DataModifyingCte(stmt) => {
                 // 最初の書き込み文で writer を取得する（Issue #2400。待機超過は `55P03`。呼び出し元が `Failed` へ遷移）。
                 txn.ensure_writer()?;
@@ -8976,7 +9027,7 @@ impl EngineCore {
             ParsedSql::CreateTrigger(_) => Ok(None),
             ParsedSql::DropTrigger(_) => Ok(None),
             // SQL-68・Issue #2228: `DO` は行を返さない（Describe は NoData）。
-            ParsedSql::Do(_) => Ok(None),
+            ParsedSql::Do(_) | ParsedSql::Lock(_) => Ok(None),
             ParsedSql::CreateSchema(_) => Ok(None),
             ParsedSql::DropSchema(_) => Ok(None),
             ParsedSql::AlterSchema(_) => Ok(None),

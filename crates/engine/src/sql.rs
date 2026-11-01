@@ -251,6 +251,7 @@ pub(crate) mod join;
 pub(crate) mod json_fn;
 pub(crate) mod jsonpath_fn;
 pub mod lexer;
+pub mod lock_table;
 pub mod mode;
 pub(crate) mod numeric_fn;
 pub(crate) mod order_value;
@@ -415,6 +416,10 @@ pub enum SqlOutcome {
     ///
     /// **BREAKING CHANGE**（Issue #2228）: `SqlOutcome` への variant 追加。
     Do,
+    /// `LOCK [TABLE]` の成功（CommandComplete タグ `LOCK TABLE`。SQL-38・Issue #1958）。
+    ///
+    /// **BREAKING CHANGE**（Issue #1958）: `SqlOutcome` への variant 追加。
+    Lock,
     /// `EXPLAIN SELECT ... USING PLAN(...)`（TASK-78・SQL-6）の応答。検索本体は
     /// 実行せず、LLM クエリ展開・モード解決結果を可視化する `QUERY PLAN` 単一列の
     /// [`exec::QueryResult`]（`sql::explain` モジュールが構築）を返す。
