@@ -5153,6 +5153,32 @@ impl EngineCore {
         resolver: Option<crate::sql::relation_name::SchemaResolver<'_>>,
         read_snap: Option<&redb::ReadTransaction>,
     ) -> Result<ParsedSql, crate::sql::allowlist::SqlSurfaceError> {
+        // SQL-40（Issue #1965）: 現在ロール未束縛のセッションの `GRANT`／`REVOKE` は、状態依存の
+        // 検証（SCHEMA の名前解決 `3F000`・`search_path` ゲート `42P01` 等）の結果を示さず `42501` に
+        // する（対象の存在オラクルの防止。fail-closed）。構文・範囲外の拒否は状態に依存しないため維持する。
+        let grant_head = crate::sql::allowlist::is_grant_statement(&tokens)
+            || crate::sql::allowlist::is_revoke_statement(&tokens);
+        let result = self.parse_tokens_gated_core(tokens, session, resolver, read_snap);
+        if grant_head {
+            if let Err(e) = &result {
+                if matches!(e.wire_code(), "3F000" | "42P01" | "42704")
+                    && crate::sql::grant_ddl::require_grant_principal(session).is_err()
+                {
+                    return Err(crate::sql::allowlist::SqlSurfaceError::InsufficientPrivilege);
+                }
+            }
+        }
+        result
+    }
+
+    /// [`Self::parse_tokens_gated`] の本体（未束縛 `GRANT`／`REVOKE` のエラー正規化を持たない）。
+    fn parse_tokens_gated_core(
+        &self,
+        tokens: Vec<crate::sql::lexer::Token>,
+        session: &crate::sql::mode::SessionState,
+        resolver: Option<crate::sql::relation_name::SchemaResolver<'_>>,
+        read_snap: Option<&redb::ReadTransaction>,
+    ) -> Result<ParsedSql, crate::sql::allowlist::SqlSurfaceError> {
         // 標準 SQL の行数制限句の正規化は、参照ゲート・一時カタログ走査より前に行う（Issue #1793）。
         // 正規化が `0A000`（入れ子・非 SELECT の `WITH TIES`）で失敗した場合も、`search_path` が
         // `public` を隠すセッションでは参照ゲートの `42P01` を優先する（`42601` → `42P01` → その他）。

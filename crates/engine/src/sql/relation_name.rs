@@ -416,7 +416,11 @@ pub(crate) fn relation_positions(tokens: &[Token]) -> RelationWalk {
             let next_word = tokens.get(i.saturating_add(1)).is_some_and(|t| {
                 is_ident_like(t) && !ident_is(Some(t), "TO") && !ident_is(Some(t), "FROM")
             });
+            // 括弧内（権限の列リスト `SELECT ("on", "to")` 等）の語は構文語として扱わない。
+            // 状態遷移は括弧深さ 0 の最上位の `ON`・名前・`,`・`TO`／`FROM` だけで起こす。
+            let grant_top = levels.len() == 1;
             match grant_phase {
+                _ if !grant_top => {}
                 0 => {
                     if ident_is(Some(cur), "TO") || matches!(cur, Token::Keyword(Keyword::From)) {
                         grant_phase = 4;

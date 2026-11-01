@@ -87,8 +87,8 @@ fn unbound_session_gets_identical_42501_regardless_of_target() {
     }
 }
 
-/// 他テナントのスキーマで修飾した表は、存在しないスキーマと同じ応答（解決段で `3F000`。権限の有無に
-/// よらず同一で、他テナントのスキーマの存在を示さない）。
+/// 他テナントのスキーマで修飾した表は、存在しないスキーマと同じ応答（未束縛は名前解決より前に
+/// `42501`。スキーマの有無を区別させず、他テナントのスキーマの存在を示さない）。
 #[test]
 fn other_tenant_schema_is_indistinguishable_from_missing() {
     let (_g, core) = open_fixture("sql40_schema_oracle");
@@ -98,6 +98,7 @@ fn other_tenant_schema_is_indistinguishable_from_missing() {
     let mut s = SessionState::default();
     let a = err_of(&core, "t1", &mut s, "GRANT SELECT ON s_other.t TO alice");
     let b = err_of(&core, "t1", &mut s, "GRANT SELECT ON s_nowhere.t TO alice");
+    assert_eq!(a.wire_code(), "42501");
     assert_eq!(a.wire_code(), b.wire_code());
     assert_eq!(
         a.client_message().replace("s_other", "X"),
@@ -190,5 +191,22 @@ fn explicit_transaction_is_rejected_after_the_principal_gate() {
             core.execute_sql_in_txn(&ctx("t1"), &mut s, &mut txn, "ROLLBACK")
                 .expect("rollback");
         }
+    }
+}
+
+/// 列リスト内の語（`on`・`to`・`from`）を構文語として扱わず、修飾した表名も束縛まで `42501` になる。
+#[test]
+fn column_names_that_look_like_keywords_do_not_break_relation_scan() {
+    let (_g, core) = open_fixture("sql40_kw_cols");
+    let mut s = SessionState::default();
+    for sql in [
+        r#"GRANT SELECT ("on") ON s_nowhere.t TO alice"#,
+        r#"GRANT SELECT ("to", "on") ON s_nowhere.t TO alice"#,
+    ] {
+        assert_eq!(
+            err_of(&core, "t1", &mut s, sql).wire_code(),
+            "42501",
+            "{sql}"
+        );
     }
 }

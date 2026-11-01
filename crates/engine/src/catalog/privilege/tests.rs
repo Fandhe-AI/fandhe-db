@@ -500,4 +500,16 @@ mod apply_deps {
         let r = run(&s, bob, false, true, PRIV_SELECT, &[], alice, true, false);
         assert!(matches!(r, Err(AclChangeError::InvalidGrant(_))));
     }
+    #[test]
+    fn column_grant_option_cycle_follows_table_level_path() {
+        let (_g, s) = open("acl_dep_col_cycle");
+        mk_table(&s, T);
+        let owner = role(&s, "owner");
+        let a = role(&s, "a");
+        let b = role(&s, "b");
+        run(&s, owner, true, true, PRIV_SELECT, &[], a, true, false).expect("1");
+        run(&s, a, false, true, PRIV_SELECT, &[], b, true, false).expect("2");
+        let r = run(&s, b, false, true, PRIV_SELECT, &["a"], a, true, false);
+        assert!(matches!(r, Err(AclChangeError::InvalidGrant(_))));
+    }
 }

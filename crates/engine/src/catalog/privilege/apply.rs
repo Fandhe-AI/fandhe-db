@@ -606,9 +606,19 @@ impl Storage {
                             "grant options cannot be granted back to your own grantor",
                         ));
                     }
+                    // 列の付与は、同じ権限ビットの表単位の GRANT OPTION の経路（上流の付与者）も辿る
+                    // （列 ACL が空でも表単位の経路で上流へ戻る付与を循環として拒否する）。
+                    let mut path_entries: Vec<AclEntry> = entries.clone();
+                    if let PrivilegeObject::Column { table, .. } = &t.object {
+                        path_entries.extend(list_acl_for_object_in_txn(
+                            &*write_txn,
+                            tenant,
+                            &PrivilegeObject::Table(table.clone()),
+                        )?);
+                    }
                     // 権限ビットごとに経路を辿る（別の権限の辺をつないで架空の循環を作らない）。
                     for bit in (0..16).map(|i| 1u16 << i).filter(|b| eff & b != 0) {
-                        let anc = ancestors_of(&entries, req.grantor_id, bit)?;
+                        let anc = ancestors_of(&path_entries, req.grantor_id, bit)?;
                         if grantee_ids.iter().any(|g| anc.contains(g)) {
                             return Err(AclChangeError::InvalidGrant(
                                 "grant options cannot be granted back to your own grantor",
