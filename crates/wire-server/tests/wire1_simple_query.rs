@@ -243,11 +243,11 @@ fn wire1_sql_error_keeps_connection_and_next_query_succeeds() {
     let mut stream = authenticate_to_ready_for_query(addr, "alice", "correct-horse");
 
     // `DROP TABLE docs` は Issue #902（SQL-23・TASK-203）以降、許可リスト外の
-    // 構文ではなく DDL 実行権限ゲート（`42501`。既定拒否）で拒否されるため、
-    // 本テストの「許可リスト外の構文（`42601`）」の代表例としては使えなく
-    // なった。恒久的に許可リスト外のまま残る構文（`GRANT` は SQL 表層に
+    // 構文ではなく DDL 実行権限ゲート（`42501`。既定拒否）で拒否され、`GRANT` も Issue #1965（SQL-40）
+    // 以降は現在ロールの束縛ゲート（`42501`）に到達するようになったため、「許可リスト外の構文
+    // （`42601`）」の代表例としては使えない。恒久的に許可リスト外のまま残る構文（`VACUUM` は SQL 表層に
     // 到達経路自体を持たない）へ差し替える。
-    send_simple_query(&mut stream, "GRANT SELECT ON docs TO bob");
+    send_simple_query(&mut stream, "VACUUM docs");
     expect_error_response_with_sqlstate(&mut stream, "42601");
     read_ready_for_query(&mut stream);
 

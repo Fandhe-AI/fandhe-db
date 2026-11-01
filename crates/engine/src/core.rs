@@ -1946,6 +1946,10 @@ pub enum ParsedSql {
     AlterPolicy(crate::sql::allowlist::ValidatedAlterPolicy),
     /// `DROP POLICY [IF EXISTS] <名前> ON <表>`（RLS-13、Issue #2274）。
     DropPolicy(crate::sql::allowlist::ValidatedDropPolicy),
+    /// `GRANT`／`REVOKE`（SQL-40、Issue #1965）。
+    ///
+    /// **BREAKING CHANGE**（Issue #1965）: `ParsedSql` への variant 追加。
+    GrantRevoke(crate::sql::allowlist::ValidatedGrantRevoke),
     /// `DO [LANGUAGE plpgsql] '<本体>'`（SQL-68、Issue #2228）。
     ///
     /// `ParsedSql::Statement` には載せない（DataModifyingCte・CreateTrigger と同じ理由。wire 側が
@@ -2092,6 +2096,7 @@ fn statement_clock_scope(
         | ParsedSql::CreatePolicy(_)
         | ParsedSql::AlterPolicy(_)
         | ParsedSql::DropPolicy(_)
+        | ParsedSql::GrantRevoke(_)
         | ParsedSql::Do(_)
         | ParsedSql::Lock(_)
         | ParsedSql::CreateSchema(_)
@@ -2166,6 +2171,7 @@ fn insert_sequence_scope(
         | ParsedSql::CreatePolicy(_)
         | ParsedSql::AlterPolicy(_)
         | ParsedSql::DropPolicy(_)
+        | ParsedSql::GrantRevoke(_)
         | ParsedSql::Do(_)
         | ParsedSql::Lock(_)
         | ParsedSql::CreateSchema(_)
@@ -2238,6 +2244,7 @@ fn insert_default_clock_scope(
         | ParsedSql::CreatePolicy(_)
         | ParsedSql::AlterPolicy(_)
         | ParsedSql::DropPolicy(_)
+        | ParsedSql::GrantRevoke(_)
         | ParsedSql::Do(_)
         | ParsedSql::Lock(_)
         | ParsedSql::CreateSchema(_)
@@ -4351,6 +4358,7 @@ impl EngineCore {
                     | crate::sql::SqlOutcome::CreatePolicy(_)
                     | crate::sql::SqlOutcome::AlterPolicy(_)
                     | crate::sql::SqlOutcome::DropPolicy(_)
+                    | crate::sql::SqlOutcome::GrantRevoke(_)
                     | crate::sql::SqlOutcome::Do
                     | crate::sql::SqlOutcome::Lock
                     | crate::sql::SqlOutcome::CreateSchema(_)
@@ -4415,6 +4423,7 @@ impl EngineCore {
                     | crate::sql::SqlOutcome::CreatePolicy(_)
                     | crate::sql::SqlOutcome::AlterPolicy(_)
                     | crate::sql::SqlOutcome::DropPolicy(_)
+                    | crate::sql::SqlOutcome::GrantRevoke(_)
                     | crate::sql::SqlOutcome::Do
                     | crate::sql::SqlOutcome::Lock
                     | crate::sql::SqlOutcome::CreateSchema(_)
@@ -4476,6 +4485,7 @@ impl EngineCore {
                     | crate::sql::SqlOutcome::CreatePolicy(_)
                     | crate::sql::SqlOutcome::AlterPolicy(_)
                     | crate::sql::SqlOutcome::DropPolicy(_)
+                    | crate::sql::SqlOutcome::GrantRevoke(_)
                     | crate::sql::SqlOutcome::Do
                     | crate::sql::SqlOutcome::Lock
                     | crate::sql::SqlOutcome::CreateSchema(_)
@@ -4544,6 +4554,7 @@ impl EngineCore {
                     | crate::sql::SqlOutcome::CreatePolicy(_)
                     | crate::sql::SqlOutcome::AlterPolicy(_)
                     | crate::sql::SqlOutcome::DropPolicy(_)
+                    | crate::sql::SqlOutcome::GrantRevoke(_)
                     | crate::sql::SqlOutcome::Do
                     | crate::sql::SqlOutcome::Lock
                     | crate::sql::SqlOutcome::CreateSchema(_)
@@ -4631,6 +4642,7 @@ impl EngineCore {
                     | crate::sql::SqlOutcome::CreatePolicy(_)
                     | crate::sql::SqlOutcome::AlterPolicy(_)
                     | crate::sql::SqlOutcome::DropPolicy(_)
+                    | crate::sql::SqlOutcome::GrantRevoke(_)
                     | crate::sql::SqlOutcome::Do
                     | crate::sql::SqlOutcome::Lock
                     | crate::sql::SqlOutcome::CreateSchema(_)
@@ -5737,6 +5749,19 @@ impl EngineCore {
         }
 
         // SQL-68・Issue #2228: `DO` はカタログ照会なしの構造検証だけで束縛する。
+        // SQL-40・Issue #1965: `GRANT`／`REVOKE` は構造検証だけで束縛する（カタログ照会は実行段。権限の無い
+        // 主体にロール・対象の有無を示さないため）。`ALTER DEFAULT PRIVILEGES`（#2237）は汎用 `ALTER`
+        // （`ALTER TABLE` 扱い）より前に `0A000` で拒否する。
+        if crate::sql::allowlist::is_grant_statement(&tokens)
+            || crate::sql::allowlist::is_revoke_statement(&tokens)
+        {
+            let stmt = crate::sql::allowlist::validate_grant_revoke_tokens(&tokens)?;
+            return Ok(ParsedSql::GrantRevoke(stmt));
+        }
+        if crate::sql::allowlist::is_alter_default_privileges_statement(&tokens) {
+            return Err(crate::sql::allowlist::reject_alter_default_privileges());
+        }
+
         if crate::sql::allowlist::is_do_statement(&tokens) {
             let stmt = crate::sql::allowlist::validate_do_tokens(&tokens)?;
             return Ok(ParsedSql::Do(stmt));
@@ -7635,6 +7660,19 @@ impl EngineCore {
                 )?;
                 Ok(crate::sql::SqlOutcome::DropPolicy(outcome))
             }
+            // SQL-40（Issue #1965）: 現在ロールの束縛ゲート → 実行本体。未束縛（認証層が束縛していない現状の
+            // 全セッション）には対象・ロールの有無を問わず常に `42501`。ACL はテナント単位のため
+            // `ctx.tenant_id()` を渡す。
+            ParsedSql::GrantRevoke(stmt) => {
+                crate::sql::grant_ddl::require_grant_principal(session)?;
+                let outcome = crate::sql::grant_ddl::execute_grant_revoke(
+                    &self.storage,
+                    ctx.tenant_id(),
+                    session,
+                    stmt,
+                )?;
+                Ok(crate::sql::SqlOutcome::GrantRevoke(outcome))
+            }
             // TABLE-27（Issue #1713）: DDL 実行権限ゲート → 実行本体。SCHEMA はテナント単位のカタログ
             // のため `ctx.tenant_id()` を渡す（SEQUENCE との違い）。権限の無い主体には対象の有無を
             // 問わず常に `42501`。
@@ -8285,6 +8323,15 @@ impl EngineCore {
                 crate::sql::ddl::require_ddl_permission(session)?;
                 Err(SqlSurfaceError::feature_not_supported(
                     "policy DDL is not supported inside a transaction block",
+                ))
+            }
+            // SQL-40（Issue #1965）: ACL の書き込みは独立した write txn で commit され ROLLBACK で取り消せない
+            // ため明示トランザクション内では行わない。現在ロール未束縛のセッションには存在を問わず `42501`
+            // （自動コミットの腕と同じゲートを同じ位置〔カタログ照会・`0A000` より前〕に置く）。
+            ParsedSql::GrantRevoke(_) => {
+                crate::sql::grant_ddl::require_grant_principal(session)?;
+                Err(SqlSurfaceError::feature_not_supported(
+                    "GRANT/REVOKE is not supported inside a transaction block",
                 ))
             }
             // SQL-67・Issue #2220: FROM 句の集合返却関数の呼び出しも、本体を同じ Tx・RLS で実行するため
@@ -9538,6 +9585,7 @@ impl EngineCore {
             ParsedSql::CreatePolicy(_) | ParsedSql::AlterPolicy(_) | ParsedSql::DropPolicy(_) => {
                 Ok(None)
             }
+            ParsedSql::GrantRevoke(_) => Ok(None),
             // SQL-68・Issue #2228: `DO` は行を返さない（Describe は NoData）。
             ParsedSql::Do(_) | ParsedSql::Lock(_) => Ok(None),
             ParsedSql::CreateSchema(_) => Ok(None),

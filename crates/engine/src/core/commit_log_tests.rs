@@ -522,6 +522,47 @@ fn policy_ddl_is_recorded_as_ddl_and_never_unrecordable() {
     rollback(&core, "tenant-a", &mut txn);
 }
 
+/// SQL-40（Issue #1965）: `GRANT`／`REVOKE` の書き込みは対象 relation の DDL として記録され、記録不能にならない
+/// （`40001` の判定が権限変更を見逃さない）。SQL 文経由で実行し、束縛ロールを作る。
+#[test]
+fn grant_revoke_is_recorded_as_ddl_and_never_unrecordable() {
+    use crate::catalog::role::{RoleAttributes, RoleDef};
+    let (core, _g) = new_core("clog-grant-ddl");
+    let mk = |name: &str| RoleDef {
+        id: 0,
+        name: name.to_string(),
+        attributes: RoleAttributes::default(),
+        connection_limit: -1,
+        valid_until: None,
+        scram_verifier: Vec::new(),
+        legacy_phc: Vec::new(),
+    };
+    let owner = core
+        .storage
+        .create_role("tenant-a", &mk("owner_r"))
+        .expect("role");
+    core.storage
+        .create_role("tenant-a", &mk("alice"))
+        .expect("role");
+    let (mut txn, g_s) = begin(&core, "tenant-a");
+    let mut session = SessionState::default();
+    session.bind_role_ids(owner, owner);
+    session.allow_ddl();
+    for sql in [
+        "GRANT SELECT ON ca TO alice",
+        "REVOKE SELECT ON ca FROM alice",
+    ] {
+        core.execute_sql_in_session(&ctx("tenant-a"), &mut session, sql)
+            .unwrap_or_else(|e| panic!("{sql} must succeed, got {e:?}"));
+    }
+    let recs = records(&core, g_s).expect("verifiable");
+    assert_eq!(recs.len(), 2, "{recs:?}");
+    for rec in &recs {
+        assert!(footprint(rec, "ca").ddl, "{rec:?}");
+    }
+    rollback(&core, "tenant-a", &mut txn);
+}
+
 #[test]
 fn repeated_write_txns_are_never_rejected_by_a_reused_frame_address() {
     let (core, _g) = new_core("clog-handle-reuse");

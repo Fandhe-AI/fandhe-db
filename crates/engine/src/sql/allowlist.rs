@@ -55,6 +55,14 @@ pub(crate) use policy::{
 };
 pub use policy::{ValidatedAlterPolicy, ValidatedCreatePolicy, ValidatedDropPolicy};
 
+// GRANT／REVOKE の構文検証（SQL-40・Issue #1965）。
+mod grant;
+pub use grant::ValidatedGrantRevoke;
+pub(crate) use grant::{
+    is_alter_default_privileges_statement, is_grant_statement, is_revoke_statement,
+    reject_alter_default_privileges, validate_grant_revoke_tokens, GrantTarget, Grantee,
+};
+
 /// エラーメッセージへ含める入力断片の長さ上限。untrusted 入力をそのまま無加工で
 /// 長大にエラーへ埋め込まない（security.md「情報漏えい」対応）。値は
 /// [`crate::error_format`] の単一真実源を参照し、wire 応答直前の最終切り詰め
@@ -1302,6 +1310,15 @@ pub enum SqlSurfaceError {
     /// ERR-6: `2BP01`）。依存元の名前一覧はエラー文言に含めない
     /// （security.md P0）。
     DependentObjectsStillExist { name: String },
+    /// `GRANT`／`REVOKE` の付与先ロールが自テナントに存在しない（`42704`。SQL-40・Issue #1965）。
+    /// 他テナントにだけ在るロールも同じ。`name` は利用者自身が書いた名前だけ。
+    ///
+    /// **BREAKING CHANGE**（Issue #1965）: variant を追加した。`SqlSurfaceError` を網羅的に `match`
+    /// するクレート外のコードは追随が必要。
+    UndefinedRole { name: String },
+    /// `GRANT`／`REVOKE` の不正な操作（対象に許されない権限の種類・PUBLIC への GRANT OPTION。`0LP01`。
+    /// SQL-40・Issue #1965）。`detail` は固定文言のみ。
+    InvalidGrantOperation { detail: String },
     /// 名前は存在するが、要求された操作が期待するオブジェクト種別と一致
     /// しない（`DROP TABLE` にビュー名、`DROP VIEW` にテーブル名、ビューへの
     /// 書き込み系文。TABLE-18・SQL-23・TASK-205、Issue #909。ERR-6: `42809`）。
@@ -1450,6 +1467,10 @@ impl SqlSurfaceError {
                 Self::DependentObjectsStillExist { name: f(&name) }
             }
             Self::WrongObjectType { name } => Self::WrongObjectType { name: f(&name) },
+            Self::UndefinedRole { name } => Self::UndefinedRole { name: f(&name) },
+            Self::InvalidGrantOperation { detail } => {
+                Self::InvalidGrantOperation { detail: f(&detail) }
+            }
             Self::UndefinedObject { name } => Self::UndefinedObject { name: f(&name) },
             Self::UndefinedType { name } => Self::UndefinedType { name: f(&name) },
             Self::UndefinedWindow { name } => Self::UndefinedWindow { name: f(&name) },
@@ -1543,6 +1564,22 @@ impl SqlSurfaceError {
     /// テーブル名は untrusted な字句解析結果のため長さを切り詰める。
     pub(crate) fn duplicate_table(name: impl Into<String>) -> Self {
         SqlSurfaceError::DuplicateTable {
+            name: truncate_for_error(&name.into()),
+        }
+    }
+
+    /// `pub(crate)`: `sql::allowlist::grant` が対象に許されない権限・PUBLIC への GRANT OPTION を
+    /// `0LP01` で拒否するために使う。文言は固定で、呼び出し側が利用者入力を含めない。
+    pub(crate) fn invalid_grant_operation(detail: impl Into<String>) -> Self {
+        SqlSurfaceError::InvalidGrantOperation {
+            detail: truncate_for_error(&detail.into()),
+        }
+    }
+
+    /// `pub(crate)`: `sql::grant_ddl` が付与先ロールの不在（他テナントにだけ在る場合を含む）を写像する。
+    /// 名前は利用者自身が書いた綴りで、切り詰める。
+    pub(crate) fn undefined_role(name: impl Into<String>) -> Self {
+        SqlSurfaceError::UndefinedRole {
             name: truncate_for_error(&name.into()),
         }
     }
@@ -1983,6 +2020,8 @@ impl ClassifiedError for SqlSurfaceError {
             SqlSurfaceError::NotNullViolation { .. } => ErrorClass::NotNullViolation,
             SqlSurfaceError::UniqueViolation => ErrorClass::UniqueViolation,
             SqlSurfaceError::UndefinedObject { .. } => ErrorClass::UndefinedObject,
+            SqlSurfaceError::UndefinedRole { .. } => ErrorClass::UndefinedObject,
+            SqlSurfaceError::InvalidGrantOperation { .. } => ErrorClass::InvalidGrantOperation,
             SqlSurfaceError::UndefinedType { .. } => ErrorClass::UndefinedObject,
             SqlSurfaceError::UndefinedCollation { .. } => ErrorClass::UndefinedObject,
             SqlSurfaceError::UndefinedWindow { .. } => ErrorClass::UndefinedObject,
@@ -2341,6 +2380,12 @@ impl std::fmt::Display for SqlSurfaceError {
             // 名前はクライアント自身が指定した識別子（`UndefinedTable` と同じ扱い）。
             SqlSurfaceError::UndefinedObject { name } => {
                 write!(f, "index does not exist: {name}")
+            }
+            SqlSurfaceError::UndefinedRole { name } => {
+                write!(f, "role does not exist: {name}")
+            }
+            SqlSurfaceError::InvalidGrantOperation { detail } => {
+                write!(f, "invalid grant operation: {detail}")
             }
             SqlSurfaceError::UndefinedType { name } => {
                 write!(f, "type does not exist: {name}")

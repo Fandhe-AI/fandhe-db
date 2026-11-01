@@ -249,6 +249,12 @@ pub struct SessionState {
     /// `Box<str>`: `SessionState` を抱える `sql::transaction::TxnState` の enum 内サイズ差（clippy
     /// `large_enum_variant`）を増やさないため、`String` より小さい表現にする。
     resolution_tenant: Option<Box<str>>,
+    /// 現在のロール ID（#1971 以降で認証層が認証成功後に 1 回だけ設定する契約。SQL 文から書き換える
+    /// 経路は持たない）。`None`（現状の全セッション）は「BYPASSRLS なし・非所有者」として扱う
+    /// （利用者ポリシーを適用する＝狭める側。fail-closed）。
+    current_role_id: Option<u64>,
+    /// セッションのロール ID（`SESSION_USER` 相当。設定契約は `current_role_id` と同じ）。
+    session_role_id: Option<u64>,
 }
 
 /// `search_path` の世代の採番元。0 は採番されない。
@@ -329,6 +335,23 @@ impl SessionState {
     pub fn apply_startup_time_zone(&mut self, tz: crate::datetime::SessionTimeZone) {
         self.time_zone_reset = tz.clone();
         self.time_zone = tz;
+    }
+
+    /// 現在のロール ID（未紐付けは `None`）。
+    pub fn current_role_id(&self) -> Option<u64> {
+        self.current_role_id
+    }
+
+    /// セッションのロール ID（未紐付けは `None`）。
+    pub fn session_role_id(&self) -> Option<u64> {
+        self.session_role_id
+    }
+
+    /// 認証主体のロール ID を束縛する。認証層が認証成功後に 1 回だけ呼ぶ契約（`set_session_user` と同じ。
+    /// SQL 文経由の経路は持たない）。
+    pub fn bind_role_ids(&mut self, current: u64, session: u64) {
+        self.current_role_id = Some(current);
+        self.session_role_id = Some(session);
     }
 
     pub fn search_mode(&self) -> Option<SearchMode> {

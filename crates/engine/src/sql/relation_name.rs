@@ -179,6 +179,12 @@ pub(crate) fn relation_positions(tokens: &[Token]) -> RelationWalk {
         && ident_is(tokens.get(1), "POLICY");
     let trigger_head = trigger_head || policy_head;
     let mut trigger_on_pending = trigger_head;
+    // `GRANT|REVOKE <権限> [(列, ...)] ON [TABLE] <表>[, ...] TO|FROM <ロール>`（SQL-40・Issue #1965）。関係名の
+    // 位置は `ON [TABLE]` の直後のカンマ区切りだけで、列リスト・`TO`／`FROM` の後のロール名・
+    // `ON SCHEMA|SEQUENCE|FUNCTION|ALL ...`（範囲外の対象種別）は関係位置にしない（ロール名を表として解決させない）。
+    let grant_head = ident_is(tokens.first(), "GRANT") || ident_is(tokens.first(), "REVOKE");
+    // 0: `ON` の前、1: `ON` の直後、2: 名前待ち、3: 名前の直後（`,` で 2 へ）、4: 終了。
+    let mut grant_phase: u8 = 0;
 
     let mut levels: Vec<Level> = vec![Level::default()];
     let mut out = RelationWalk {
@@ -402,6 +408,62 @@ pub(crate) fn relation_positions(tokens: &[Token]) -> RelationWalk {
             is_create_name = false;
             if ident_is(prev, "ON") {
                 trigger_on_pending = false;
+            }
+        }
+        if grant_head {
+            relation_pos = false;
+            is_create_name = false;
+            let next_word = tokens.get(i.saturating_add(1)).is_some_and(|t| {
+                is_ident_like(t) && !ident_is(Some(t), "TO") && !ident_is(Some(t), "FROM")
+            });
+            match grant_phase {
+                0 => {
+                    if ident_is(Some(cur), "TO") || matches!(cur, Token::Keyword(Keyword::From)) {
+                        grant_phase = 4;
+                    } else if ident_is(Some(cur), "ON") {
+                        grant_phase = 1;
+                    }
+                }
+                1 => {
+                    let kind_word = [
+                        "SCHEMA",
+                        "SEQUENCE",
+                        "FUNCTION",
+                        "PROCEDURE",
+                        "ROUTINE",
+                        "DATABASE",
+                        "DOMAIN",
+                        "TYPE",
+                        "LANGUAGE",
+                        "TABLESPACE",
+                        "FOREIGN",
+                        "LARGE",
+                        "PARAMETER",
+                        "ALL",
+                    ]
+                    .iter()
+                    .any(|k| ident_is(Some(cur), k));
+                    if ident_is(Some(cur), "TABLE") && next_word {
+                        grant_phase = 2;
+                    } else if kind_word && next_word {
+                        grant_phase = 4;
+                    } else {
+                        relation_pos = is_ident_like(cur);
+                        grant_phase = 3;
+                    }
+                }
+                2 => {
+                    relation_pos = is_ident_like(cur);
+                    grant_phase = 3;
+                }
+                3 => {
+                    grant_phase = if matches!(cur, Token::Punct(',')) {
+                        2
+                    } else {
+                        4
+                    };
+                }
+                _ => {}
             }
         }
         // 索引 DDL の最初の `ON` だけが表参照を導く（JOIN の `ON <条件>` と区別する）。
@@ -1340,6 +1402,42 @@ mod tests {
         );
         let t = tokenize("CREATE POLICY p ON t USING (a > 1) WITH CHECK (b > 1)").expect("lex");
         assert_eq!(relation_positions(&t).positions.len(), 1);
+    }
+
+    /// SQL-40・Issue #1965: `GRANT`／`REVOKE` は `ON [TABLE]` の直後のカンマ区切りだけが関係位置で、列リスト・
+    /// `TO`／`FROM` の後のロール名・範囲外の対象種別（`ON SCHEMA s` 等）は関係位置にならない。
+    #[test]
+    fn grant_revoke_names_are_resolved() {
+        same(
+            "GRANT SELECT (a, b) ON TABLE public.t, public.u TO alice WITH GRANT OPTION",
+            "GRANT SELECT (a, b) ON TABLE t, u TO alice WITH GRANT OPTION",
+        );
+        same(
+            "REVOKE GRANT OPTION FOR ALL ON public.t FROM alice, bob CASCADE",
+            "REVOKE GRANT OPTION FOR ALL ON t FROM alice, bob CASCADE",
+        );
+        let got = rewrite_in_tenant("GRANT SELECT ON s.t TO alice").expect("resolved");
+        assert!(got.contains(&Token::Ident("#12.t".to_string())));
+        assert_eq!(
+            rewrite_in_tenant("GRANT SELECT ON z.t TO alice")
+                .expect_err("unknown")
+                .wire_code(),
+            "3F000"
+        );
+        let count = |sql: &str| {
+            relation_positions(&tokenize(sql).expect("lex"))
+                .positions
+                .len()
+        };
+        // ロール名・列名・種別語は関係位置ではない。
+        assert_eq!(count("REVOKE SELECT ON t FROM alice"), 1);
+        assert_eq!(count("GRANT SELECT (a, b) ON t, u TO a, b"), 2);
+        assert_eq!(count("GRANT SELECT ON TABLE t TO a"), 1);
+        assert_eq!(count("GRANT r1, r2 TO u"), 0);
+        assert_eq!(count("REVOKE ADMIN OPTION FOR r FROM u"), 0);
+        assert_eq!(count("GRANT USAGE ON SCHEMA s TO a"), 0);
+        assert_eq!(count("GRANT SELECT ON ALL TABLES IN SCHEMA s TO a"), 0);
+        assert_eq!(count("GRANT SELECT ON \"schema\" TO a"), 1);
     }
 
     /// TABLE-45・Issue #1722: `CREATE TRIGGER ... ON <表>`／`DROP TRIGGER ... ON <表>` の表名と

@@ -95,7 +95,7 @@ macro_rules! define_error_classes {
 pub(crate) const SHARED_WIRE_CODES: &[&str] = &["23502", "23505", "22023", "P0002"];
 
 define_error_classes! {
-    count = 99;
+    count = 100;
 
     /// 構文上受理された SQL の値・引数が不正（`22000`）。
     /// [`crate::sql::allowlist::SqlSurfaceError::InvalidInput`] の写像。
@@ -318,6 +318,9 @@ define_error_classes! {
     /// `TRUNCATE`〕。TABLE-18・SQL-23・TASK-205、Issue #909）。
     /// [`crate::catalog::CatalogError::WrongObjectKind`] の写像。
     WrongObjectType => ("42809", "WRONG_OBJECT_TYPE"),
+    /// `GRANT`／`REVOKE` の不正な操作（`0LP01`。SQL-40・Issue #1965）。対象に許されない権限の種類や、
+    /// PUBLIC への GRANT OPTION。[`crate::sql::allowlist::SqlSurfaceError::InvalidGrantOperation`] の写像。
+    InvalidGrantOperation => ("0LP01", "INVALID_GRANT_OPERATION"),
     /// 列に NOT NULL 制約が宣言されているにもかかわらず、値が省略またはNULL
     /// として書き込まれた（TABLE-16・TASK-204、Issue #904）。`wire_code`
     /// （`23502`）は [`ErrorClass::MissingOperationId`] と共有する

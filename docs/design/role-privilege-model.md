@@ -294,3 +294,61 @@ Issue #1961 は決定 D1（ロールのカタログ）・D5（ACL のカタロ�
 名前をキーにした表・列の ACL 行は、DROP TABLE（CASCADE・DROP SCHEMA の表削除を含む）・DROP VIEW・DROP MATERIALIZED VIEW・ALTER TABLE RENAME・列の DROP・列の RENAME と同じ write txn の中で掃除・移動する（同名の再作成が古い付与を引き継ぐ fail-open を作らない）。スキーマ・シーケンス・関数は内部 ID をキーにし、ID は再利用されないため掃除は不要で、GRANT を解禁する #2234・#2235 の範囲とする。
 
 既知の制約: relation 単位の掃除は ACL 表を全件走査する（計算量は ACL の総件数に比例）。逆引き索引の追加は #1965 以降の判断とする。
+
+## 8. Issue #1965 実装記録（GRANT／REVOKE の構文と権限カタログ更新）
+
+ビヘイビア ID のポインタは SQL-40（`docs/spec/04-behavior/sql-surface.md`）。関連は SQL-39・SQL-23・RLS-12。意味論は
+PostgreSQL 17 の公開挙動と本 ADR の D5・D8・D9・D10 に従い、spec 本文は転記しない。
+
+### 実装した範囲
+
+- 構文: `sql::allowlist::grant`（カタログを引かない構造検証）。権限形は表の `SELECT`・`INSERT`・`UPDATE`・
+  `DELETE`・`TRUNCATE`・`REFERENCES`・`TRIGGER`・`MAINTAIN` と `ALL [PRIVILEGES]`、列リスト、`ON [TABLE] 表[, ...]`、
+  付与先（ロール名・`PUBLIC`・`CURRENT_USER`／`CURRENT_ROLE`・`SESSION_USER`・旧来の `GROUP`）、`WITH GRANT OPTION`、
+  `REVOKE` の `GRANT OPTION FOR`・`CASCADE`／`RESTRICT`。ロール形（`GRANT ロール TO ロール`・`WITH ADMIN|INHERIT|SET`・
+  `REVOKE ... OPTION FOR`）は構造化だけを行い、実行は `0A000`（メンバーシップは #2232）。
+- 実行: `sql::grant_ddl`（SQLSTATE の写像）と `catalog::privilege::apply`（単一 write txn で ACL を原子的に更新し、
+  実際に行を書いた relation の世代を進めて DDL として commit 記録へ残す）。
+- 結線: `ParsedSql::GrantRevoke`・`SqlOutcome::GrantRevoke`・wire のコマンドタグ `GRANT`／`REVOKE`。
+  `relation_positions` は `ON [TABLE]` 直後の並びだけを関係位置にする（ロール名・列名・範囲外の対象種別は解決しない）。
+
+### 確定した判断
+
+| # | 判断 | 理由 |
+| - | ---- | ---- |
+| J1 | 付与者は `SessionState` の現在ロール ID。未束縛なら、カタログ照会・名前解決・`0A000` 判定（実行段のもの）より前に、自動コミットと明示 Tx の両方の腕で `42501` | 主体の無い付与は記録できない（fail-closed）。権限の無い主体に対象・ロールの有無を示さない |
+| J2 | 現在ロール ID の格納（`current_role_id`・`session_role_id`・`bind_role_ids`）は、並行する PR が同名・同意味で定義する予定のものと同じ形で最小限だけ追加した | マージ順によらず競合を重複の除去に留める。束縛は認証層が 1 回だけ行う契約（#1971）で、SQL からは書き換えられない |
+| J3 | 束縛ロールは書き込みと同じ txn で実在を確かめ、不在なら `42501` | DROP 済みの古い束縛で付与しない |
+| J4 | 所有者の機構（#2236）までの代替として、DDL 権限ゲートを通過した主体を「所有者相当」（対象の全権限を GRANT OPTION 付きで持つ）とみなす。記録される付与者は常に現在ロール ID | ポリシー DDL と同じ代替。別の所有者相当の主体が付けた付与は REVOKE できない（所有者の概念が入るまでの既知の制約）。所有者相当のロール自身が明示の GRANT OPTION を持つ場合、CASCADE がその主体の「所有者として付けた付与」まで依存とみなして取り消す（RESTRICT は拒否側に倒れる） |
+| J5 | 継承（メンバーシップ経由の権限）は見ない。付与者本人の直接の行と PUBLIC の行（「何らかの権限を持つか」の判定だけ）で判定する | 継承は #2232 の担当 |
+| J6 | 表と列で許す権限は `PrivilegeObject::allowed_privileges` と一致させる。対象に許されない権限（`USAGE ON TABLE` 等）と PUBLIC への GRANT OPTION は `0LP01`（`ErrorClass::InvalidGrantOperation` を追加。HTTP 射影は 400・NoSQL 表層からは到達不能） | PostgreSQL 17 と同じ SQLSTATE |
+| J7 | 付与先ロールは自テナントのカタログだけで引く。不在と「他テナントにだけ在る」は同じ `42704`・同じ文言形式（`SqlSurfaceError::UndefinedRole`。利用者が書いた名前だけを含む） | D10 |
+| J8 | 範囲外の形は構文段で固定の `0A000`: `ON SCHEMA`・`ON SEQUENCE`・`ON FUNCTION`・`ON DATABASE` などの対象種別・`ALL ... IN SCHEMA`（#2234・#2235）、`GRANTED BY`、`ALTER DEFAULT PRIVILEGES`（#2237。汎用 `ALTER` より前で分岐） | 状態に依存しない拒否なので存在オラクルにならない |
+| J9 | 明示トランザクション内は J1 のゲートの後で `0A000` | ACL の書き込みは独立した write txn で commit され、ROLLBACK で取り消せない |
+| J10 | ビュー・matview への表単位の GRANT／REVOKE は受理する。列リストはベース表だけで、ビュー・matview は `0A000` | ビューの列の解決（別名・式列）が未整備。fail-closed |
+| J11 | 一時表は一時カタログの振り分け（`parse_tokens_gated`）で `0A000`。ACL のキーは共有カタログの relation キーで、セッション内の一時表とは名前空間が違う | 既存の混在拒否に乗る |
+| J12 | PostgreSQL の警告（`01006`／`01007` 相当）は `GrantRevokeOutcome` に積むだけで wire へは出さない | NoticeResponse の仕組みが無い（ポリシー DDL と同じ扱い） |
+
+### PostgreSQL 17 の意味論のうち実装したもの
+
+- 解決順: 対象 relation（`42P01`・種別違い `42809`）→ 付与先ロール（`42704`）→ 列（`42703`）→ 付与権限の判定。
+  D10 の「テナント内の解決 → 権限検査」と整合する（束縛済みで権限の無いロールは、存在しない表に `42P01`、存在する表に
+  `42501` を受けるのは PostgreSQL と同じ。未束縛のロールには常に `42501`）。
+- 付与権限: 付与者が要求された権限の GRANT OPTION を 1 つも持たず対象に何の権限も持たなければ `42501`。権限はあるが
+  GRANT OPTION が無い場合は警告のみで何も変えない。GRANT OPTION のある分だけを付与し、`ALL` 以外で一部だけの場合は警告。
+  REVOKE も同じ判定。列への付与は表単位の GRANT OPTION も数える。
+- 書き込み: 既存の行を読んでビットを OR（GRANT）／落とす（REVOKE）。権限を落とすときは対応する GRANT OPTION も落とす。
+  `GRANT OPTION FOR` は GRANT OPTION だけを落とす。結果が 0 の行は削除する。REVOKE は付与者自身の行だけが対象。
+- 表単位の REVOKE は同じ付与先・付与者の列単位の行からも同じ権限を落とす。列単位の REVOKE は表単位の行に触れない。
+- CASCADE／RESTRICT: GRANT OPTION を失った付与先が、残りの GRANT OPTION（他の付与者からのものを含む）で賄えない
+  下流の付与を持つとき、RESTRICT は `2BP01`、CASCADE は連鎖して取り消す。訪問済みの集合と反復上限で有界にする
+  （超過は `54000`）。GRANT OPTION の循環付与（上流の付与者への付与）は `0LP01`。
+- 複数の対象・付与先・列は重複を除いた上で 1 つの write txn で原子的に処理する。どれか 1 つでもエラーなら commit しない。
+  各リストは件数の上限（256）、1 文の対象の総数は 20,000 で検証してから確保する。
+
+### 対象外（後続）
+
+メンバーシップの実行・循環拒否・継承（#2232）、スキーマ・シーケンス・関数・`ALL ... IN SCHEMA`（#2234・#2235）、所有者と PUBLIC の既定
+（#2236）、`ALTER DEFAULT PRIVILEGES`（#2237）、権限検査ゲート（#1966〜#1969）、列レベル制御（#2081）、認証主体とロールの束縛
+（#1971・#2238。それまで wire の全セッションは GRANT／REVOKE で `42501`）、`GRANTED BY`、NoticeResponse による警告の送出、
+ビュー・matview の列権限、relation 単位の ACL 掃除の逆引き索引。

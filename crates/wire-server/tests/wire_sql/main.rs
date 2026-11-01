@@ -28,6 +28,7 @@ mod wire_error_response;
 mod wire_explain;
 mod wire_extended_query;
 mod wire_float_columns;
+mod wire_grant_revoke;
 mod wire_hint_order;
 mod wire_identity_column;
 mod wire_index_ddl;

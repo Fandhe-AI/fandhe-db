@@ -1000,6 +1000,10 @@ pub(crate) fn map_outcome(outcome: SqlOutcome) -> OutcomeResponse {
         SqlOutcome::DropPolicy(_) => OutcomeResponse::Command {
             tag: "DROP POLICY".to_string(),
         },
+        // SQL-40（Issue #1965）: `GRANT`／`REVOKE` も件数を持たない固定タグ（警告は wire へ出さない）。
+        SqlOutcome::GrantRevoke(o) => OutcomeResponse::Command {
+            tag: if o.is_revoke() { "REVOKE" } else { "GRANT" }.to_string(),
+        },
         // SQL-68（Issue #2228）: `DO` ブロックも件数を持たない固定タグ。
         SqlOutcome::Do => OutcomeResponse::Command {
             tag: "DO".to_string(),
