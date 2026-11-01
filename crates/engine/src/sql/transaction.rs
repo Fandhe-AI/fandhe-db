@@ -822,6 +822,7 @@ impl<'e> SessionTransaction<'e> {
             TxnOrigin::Explicit,
             access_mode,
             isolation_level,
+            false,
         )
     }
 
@@ -839,6 +840,18 @@ impl<'e> SessionTransaction<'e> {
         storage: &'e crate::storage::Storage,
         session: &SessionState,
     ) -> Result<(), SqlSurfaceError> {
+        self.begin_implicit_with(storage, session, false)
+    }
+
+    /// [`Self::begin_implicit`] の `nowait` 指定版（autocommit の `SELECT ... FOR UPDATE NOWAIT`・
+    /// Issue #2230 の入口）。`nowait` なら writer を待たずに取得を試み、他者が保持していれば即時に
+    /// `55P03`（状態は `Idle` のまま）。待機方針は暗黙 Tx の開始時点（writer 取得時点）で決まる。
+    pub(crate) fn begin_implicit_with(
+        &mut self,
+        storage: &'e crate::storage::Storage,
+        session: &SessionState,
+        nowait: bool,
+    ) -> Result<(), SqlSurfaceError> {
         if !matches!(self.state, TxnState::Idle) {
             return Err(internal_error());
         }
@@ -848,6 +861,7 @@ impl<'e> SessionTransaction<'e> {
             TxnOrigin::Implicit,
             TxnAccessMode::ReadWrite,
             None,
+            nowait,
         )
     }
 
@@ -929,6 +943,7 @@ impl<'e> SessionTransaction<'e> {
         origin: TxnOrigin,
         access_mode: TxnAccessMode,
         isolation_level: Option<RequestedIsolationLevel>,
+        nowait: bool,
     ) -> Result<(), SqlSurfaceError> {
         match &self.state {
             TxnState::Idle => {
@@ -972,9 +987,12 @@ impl<'e> SessionTransaction<'e> {
                     // `begin_read_txn()` と同じ確定状態になる（writer の前に開くとゲート待ちの間の
                     // 他者の commit を跨ぎうる）。失敗時は writer を解放して固定文言の `XX000`。
                     TxnOrigin::Implicit => {
-                        let w = storage
-                            .begin_explicit_write_txn()
-                            .map_err(map_write_lock_err)?;
+                        let w = if nowait {
+                            storage.begin_explicit_write_txn_nowait()
+                        } else {
+                            storage.begin_explicit_write_txn()
+                        }
+                        .map_err(map_write_lock_err)?;
                         let snap = match open_read_snapshot(storage) {
                             Ok(snap) => snap,
                             Err(e) => {
@@ -2590,6 +2608,29 @@ mod tests {
             .expect("begin");
         txn.ensure_writer(&test_ctx())
             .expect("acquire after release");
+    }
+
+    /// 暗黙 Tx の `nowait` 開始は、他者が writer を保持していれば待たずに `55P03` になり `Idle` のまま、
+    /// 解放後は取得できる（autocommit の `FOR UPDATE NOWAIT`・Issue #2230）。
+    #[test]
+    fn begin_implicit_nowait_reports_55p03_while_held() {
+        let (mut storage, _g) = open_test_storage("txn-2230-nowait");
+        // 待機が起きれば上限（長め）まで待つので、即時失敗かどうかを経過時間で区別できる。
+        storage.set_write_lock_wait(Duration::from_secs(5));
+        let session = SessionState::default();
+        let holder = storage.begin_write_txn().expect("holder");
+        let started = Instant::now();
+        let mut txn = SessionTransaction::new(TransactionLimits::default());
+        let err = txn
+            .begin_implicit_with(&storage, &session, true)
+            .expect_err("nowait");
+        assert!(matches!(err, SqlSurfaceError::LockNotAvailable));
+        assert!(started.elapsed() < Duration::from_secs(2));
+        assert!(matches!(txn.status(), TransactionStatus::Idle));
+        drop(holder);
+        txn.begin_implicit_with(&storage, &session, true)
+            .expect("acquire after release");
+        assert!(txn.is_implicit_active());
     }
 
     /// `BEGIN` 直後のスナップショットは、新たに開いた確定済み読み取りと同じ世代を指す
