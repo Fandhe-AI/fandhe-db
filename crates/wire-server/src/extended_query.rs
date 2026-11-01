@@ -1956,7 +1956,7 @@ fn handle_bind_body(
                 let _session_tz_scope =
                     engine::datetime::SessionTimeZoneScope::enter(session.time_zone().clone());
                 engine
-                    .bind_prepared_in_session(session, prepared, &decoded)
+                    .bind_prepared_in_txn(session, txn, prepared, &decoded)
                     .map_err(HandlerError::Sql)?
             };
             let columns = engine
@@ -1977,11 +1977,14 @@ fn handle_bind_body(
                 // セッションでも世代つきの包みを作る（Bind 後に作られた同名の一時表への化けを
                 // Execute 前に `0A000` で拒否する。Issue #1760）。
                 || matches!(parsed, ParsedSql::Copy(_))
+                // writer 取得前の明示トランザクションは、Parse 時（最新カタログ）の解決結果を使い回さず、
+                // Bind で `BEGIN` 時点のカタログにより再検証する（Issue #2403）。
+                || EngineCore::txn_reads_begin_snapshot(txn)
             {
                 let _session_tz_scope =
                     engine::datetime::SessionTimeZoneScope::enter(session.time_zone().clone());
                 engine
-                    .bind_prepared_in_session(session, prepared, &[])
+                    .bind_prepared_in_txn(session, txn, prepared, &[])
                     .map_err(HandlerError::Sql)?
             } else {
                 parsed.clone()

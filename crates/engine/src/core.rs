@@ -5865,6 +5865,22 @@ impl EngineCore {
         // 最新の確定カタログで展開した文を古い行集合へ流さない）。
         let validated = match read_snap {
             Some(snap) => {
+                // 書き込みを含む文・`USING PLAN` の SELECT・`EXPLAIN` は実行が最新の確定カタログ
+                // （writer 取得後／自前で確定スナップショットを開く経路）を見るため、検証も最新の
+                // カタログで行い、検証と実行の参照時点を揃える（Issue #2403）。読み取り文だけを
+                // `BEGIN` 時点のスナップショットで検証・ビュー展開する。
+                let latest = crate::sql::allowlist::validate_session_with_tokens(
+                    &tokens,
+                    &storage_lookup,
+                    0,
+                    self.nesting_limits,
+                    ledger_mode,
+                );
+                if let Ok(v) = &latest {
+                    if Self::validated_runs_on_latest_catalog(v) {
+                        return latest.map(Self::session_with_into_parsed);
+                    }
+                }
                 let snap_catalog = crate::catalog::ViewWriteSnapshot::over(snap);
                 let snap_lookup = crate::sql::temp_catalog::SessionRelationLookup::new(
                     &snap_catalog,
@@ -5872,13 +5888,19 @@ impl EngineCore {
                     hits.temp_cell(),
                 )
                 .with_persistent_hit(hits.persistent_cell());
-                crate::sql::allowlist::validate_session_with_tokens(
+                let snap_validated = crate::sql::allowlist::validate_session_with_tokens(
                     &tokens,
                     &snap_lookup,
                     0,
                     self.nesting_limits,
                     ledger_mode,
-                )?
+                );
+                match (snap_validated, latest) {
+                    // 最新では失敗するが BEGIN 時点では書き込み系／最新参照の文として通る場合は
+                    // 最新側のエラーを返す（実行が最新カタログを見るため。fail-closed）。
+                    (Ok(v), Err(e)) if Self::validated_runs_on_latest_catalog(&v) => return Err(e),
+                    (r, _) => r?,
+                }
             }
             None => crate::sql::allowlist::validate_session_with_tokens(
                 &tokens,
@@ -5893,6 +5915,26 @@ impl EngineCore {
             crate::sql::allowlist::SessionWith::DataModifying(v) => {
                 Ok(ParsedSql::DataModifyingCte(v))
             }
+        }
+    }
+
+    /// 検証結果が、明示トランザクションの writer 取得前でも最新の確定カタログで実行される種類か
+    /// （データ変更 `WITH`・`USING PLAN` の SELECT・`EXPLAIN`。Issue #2403）。
+    fn validated_runs_on_latest_catalog(v: &crate::sql::allowlist::SessionWith) -> bool {
+        use crate::sql::allowlist::{SessionWith, Statement};
+        match v {
+            SessionWith::DataModifying(_) => true,
+            SessionWith::Statement(Statement::Explain(_)) => true,
+            SessionWith::Statement(Statement::Select(s)) => s.using_plan().is_some(),
+            SessionWith::Statement(_) => false,
+        }
+    }
+
+    /// [`crate::sql::allowlist::SessionWith`] を [`ParsedSql`] へ束縛する。
+    fn session_with_into_parsed(v: crate::sql::allowlist::SessionWith) -> ParsedSql {
+        match v {
+            crate::sql::allowlist::SessionWith::Statement(stmt) => ParsedSql::Statement(stmt),
+            crate::sql::allowlist::SessionWith::DataModifying(v) => ParsedSql::DataModifyingCte(v),
         }
     }
 
@@ -6712,6 +6754,7 @@ impl EngineCore {
         &self,
         prepared: &PreparedSql,
         values: &[Option<Vec<u8>>],
+        read_snap: Option<&redb::ReadTransaction>,
     ) -> Result<ParsedSql, crate::sql::allowlist::SqlSurfaceError> {
         if values.len() != prepared.param_count as usize {
             return Err(crate::sql::allowlist::SqlSurfaceError::invalid_input(
@@ -6805,7 +6848,11 @@ impl EngineCore {
             &kinds,
             &prepared.typed_positions,
         )?;
-        let mut parsed = self.parse_tokens(substituted)?;
+        // `read_snap` が `Some` なら（writer 取得前の明示トランザクションの Bind。Issue #2403）、
+        // 再 parse の検証・ビュー展開を `BEGIN` 時点のスナップショットのカタログで行い、
+        // 簡易クエリ経路（`execute_sql_in_txn`）と検証の参照時点を揃える。
+        let substituted = Self::normalize_row_count_clauses(substituted)?;
+        let mut parsed = self.parse_tokens_r(substituted, None, read_snap)?;
         attach_public_qualified(
             &mut parsed,
             &prepared.public_qualified,
@@ -6822,7 +6869,18 @@ impl EngineCore {
         prepared: &PreparedSql,
         values: &[Option<Vec<u8>>],
     ) -> Result<ParsedSql, crate::sql::allowlist::SqlSurfaceError> {
-        self.bind_prepared_unscrubbed(prepared, values)
+        self.bind_prepared_snap(prepared, values, None)
+    }
+
+    /// [`Self::bind_prepared`] の読み取りスナップショット指定版（Issue #2403）。
+    /// `read_snap` が `Some` の間は再 parse の検証・ビュー展開をそのスナップショットのカタログで行う。
+    pub(crate) fn bind_prepared_snap(
+        &self,
+        prepared: &PreparedSql,
+        values: &[Option<Vec<u8>>],
+        read_snap: Option<&redb::ReadTransaction>,
+    ) -> Result<ParsedSql, crate::sql::allowlist::SqlSurfaceError> {
+        self.bind_prepared_unscrubbed(prepared, values, read_snap)
             .map_err(|e| match prepared.resolution_tenant.as_deref() {
                 Some(t) => self.scrub_error_for_tenant(t, e),
                 None => e,

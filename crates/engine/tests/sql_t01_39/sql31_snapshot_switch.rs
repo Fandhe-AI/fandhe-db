@@ -338,3 +338,52 @@ fn plain_select_expands_view_against_begin_snapshot_catalog() {
         .expect_err("view created after BEGIN is not in the snapshot");
     assert_eq!(err.wire_code(), "42P01", "{err:?}");
 }
+
+/// 拡張クエリの Bind も `BEGIN` 時点のカタログでビューを展開する（Issue #2403）。Parse が `BEGIN` 後の
+/// 最新カタログで行われても、`bind_prepared_in_txn` は簡易クエリ経路と同じ結果になる。
+#[test]
+fn extended_bind_expands_view_against_begin_snapshot_catalog() {
+    let (core, _g) = new_core("sql31-snap-ext");
+    let sys = ctx("sys");
+    ok(&core, &sys, "CREATE TABLE tagged (tag TEXT)");
+    ok(
+        &core,
+        &ctx("tenant-a"),
+        "INSERT INTO tagged (id, tag) VALUES (1, 'a'), (2, 'b') USING OPERATION_ID 'tg'",
+    );
+    ok(
+        &core,
+        &sys,
+        "CREATE VIEW docs_v AS SELECT id FROM tagged WHERE tag = 'a'",
+    );
+    let mut a = Tx::new(&core, "tenant-a");
+    let simple_before = rows(ok(&core, &ctx("tenant-a"), "SELECT id FROM docs_v"));
+    a.ok("BEGIN");
+    ok(
+        &core,
+        &sys,
+        "CREATE OR REPLACE VIEW docs_v AS SELECT id FROM tagged WHERE tag = 'b'",
+    );
+    let prepared = core
+        .parse_sql_prepared("SELECT id FROM docs_v LIMIT 100")
+        .expect("prepare");
+    let bound = core
+        .bind_prepared_in_txn(&a.session, &a.txn, &prepared, &[])
+        .expect("bind");
+    let out = core
+        .execute_parsed_in_txn(&a.ctx, &mut a.session, &mut a.txn, &bound)
+        .expect("execute");
+    assert_eq!(rows(out), simple_before);
+}
+
+/// `EXPLAIN` は writer 取得前でも最新の確定カタログで実行されるため、検証も最新カタログで行う
+/// （`BEGIN` 後に作られた表でも `42P01` にならない。Issue #2403）。
+#[test]
+fn explain_validates_against_latest_catalog_not_begin_snapshot() {
+    let (core, _g) = new_core("sql31-snap-explain");
+    let sys = ctx("sys");
+    let mut a = Tx::new(&core, "tenant-a");
+    a.ok("BEGIN");
+    ok(&core, &sys, "CREATE TABLE late_t (n BIGINT)");
+    a.ok("EXPLAIN SELECT id FROM late_t");
+}
