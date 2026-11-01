@@ -1956,6 +1956,14 @@ pub enum ParsedSql {
     CreateRole(crate::sql::allowlist::ValidatedCreateRole),
     /// `DROP ROLE|USER [IF EXISTS] <名前>[, ...]`（SQL-39、Issue #1962）。
     DropRole(crate::sql::allowlist::ValidatedDropRole),
+    /// `ALTER ROLE|USER <名前> [WITH] <オプション>...`／`RENAME TO`（SQL-39、Issue #1963）。
+    ///
+    /// **BREAKING CHANGE**（Issue #1963）: `ParsedSql` への variant 追加。
+    AlterRole(crate::sql::allowlist::ValidatedAlterRole),
+    /// `SET [SESSION] ROLE`／`RESET ROLE`（SQL-39、Issue #1963）。セッションの現在ロールだけを変える。
+    ///
+    /// **BREAKING CHANGE**（Issue #1963）: `ParsedSql` への variant 追加。
+    SetRole(crate::sql::allowlist::ValidatedSetRole),
     /// `DO [LANGUAGE plpgsql] '<本体>'`（SQL-68、Issue #2228）。
     ///
     /// `ParsedSql::Statement` には載せない（DataModifyingCte・CreateTrigger と同じ理由。wire 側が
@@ -2122,6 +2130,8 @@ fn statement_clock_scope(
         | ParsedSql::GrantRevoke(_)
         | ParsedSql::CreateRole(_)
         | ParsedSql::DropRole(_)
+        | ParsedSql::AlterRole(_)
+        | ParsedSql::SetRole(_)
         | ParsedSql::Do(_)
         | ParsedSql::Lock(_)
         | ParsedSql::CreateSchema(_)
@@ -2199,6 +2209,8 @@ fn insert_sequence_scope(
         | ParsedSql::GrantRevoke(_)
         | ParsedSql::CreateRole(_)
         | ParsedSql::DropRole(_)
+        | ParsedSql::AlterRole(_)
+        | ParsedSql::SetRole(_)
         | ParsedSql::Do(_)
         | ParsedSql::Lock(_)
         | ParsedSql::CreateSchema(_)
@@ -2274,6 +2286,8 @@ fn insert_default_clock_scope(
         | ParsedSql::GrantRevoke(_)
         | ParsedSql::CreateRole(_)
         | ParsedSql::DropRole(_)
+        | ParsedSql::AlterRole(_)
+        | ParsedSql::SetRole(_)
         | ParsedSql::Do(_)
         | ParsedSql::Lock(_)
         | ParsedSql::CreateSchema(_)
@@ -2495,7 +2509,8 @@ fn read_only_permits(parsed: &ParsedSql) -> bool {
                 | Statement::SetRowSecurity { .. }
                 | Statement::ShowRowSecurity
         ),
-        ParsedSql::Cursor(_) | ParsedSql::Do(_) => true,
+        // SQL-39・Issue #1963: `SET ROLE`／`RESET ROLE` はセッション変数だけを変える（READ ONLY Tx でも可）。
+        ParsedSql::Cursor(_) | ParsedSql::Do(_) | ParsedSql::SetRole(_) => true,
         ParsedSql::Partitioned(control) => !control.writes(),
         ParsedSql::SequenceFunction(stmt) => !stmt.writes(),
         ParsedSql::SessionRouted(routed) => read_only_permits(routed.inner()),
@@ -4400,6 +4415,8 @@ impl EngineCore {
                     | crate::sql::SqlOutcome::GrantRevoke(_)
                     | crate::sql::SqlOutcome::CreateRole(_)
                     | crate::sql::SqlOutcome::DropRole(_)
+                    | crate::sql::SqlOutcome::AlterRole(_)
+                    | crate::sql::SqlOutcome::SetRole { .. }
                     | crate::sql::SqlOutcome::Do
                     | crate::sql::SqlOutcome::Lock
                     | crate::sql::SqlOutcome::CreateSchema(_)
@@ -4468,6 +4485,8 @@ impl EngineCore {
                     | crate::sql::SqlOutcome::GrantRevoke(_)
                     | crate::sql::SqlOutcome::CreateRole(_)
                     | crate::sql::SqlOutcome::DropRole(_)
+                    | crate::sql::SqlOutcome::AlterRole(_)
+                    | crate::sql::SqlOutcome::SetRole { .. }
                     | crate::sql::SqlOutcome::Do
                     | crate::sql::SqlOutcome::Lock
                     | crate::sql::SqlOutcome::CreateSchema(_)
@@ -4533,6 +4552,8 @@ impl EngineCore {
                     | crate::sql::SqlOutcome::GrantRevoke(_)
                     | crate::sql::SqlOutcome::CreateRole(_)
                     | crate::sql::SqlOutcome::DropRole(_)
+                    | crate::sql::SqlOutcome::AlterRole(_)
+                    | crate::sql::SqlOutcome::SetRole { .. }
                     | crate::sql::SqlOutcome::Do
                     | crate::sql::SqlOutcome::Lock
                     | crate::sql::SqlOutcome::CreateSchema(_)
@@ -4605,6 +4626,8 @@ impl EngineCore {
                     | crate::sql::SqlOutcome::GrantRevoke(_)
                     | crate::sql::SqlOutcome::CreateRole(_)
                     | crate::sql::SqlOutcome::DropRole(_)
+                    | crate::sql::SqlOutcome::AlterRole(_)
+                    | crate::sql::SqlOutcome::SetRole { .. }
                     | crate::sql::SqlOutcome::Do
                     | crate::sql::SqlOutcome::Lock
                     | crate::sql::SqlOutcome::CreateSchema(_)
@@ -4696,6 +4719,8 @@ impl EngineCore {
                     | crate::sql::SqlOutcome::GrantRevoke(_)
                     | crate::sql::SqlOutcome::CreateRole(_)
                     | crate::sql::SqlOutcome::DropRole(_)
+                    | crate::sql::SqlOutcome::AlterRole(_)
+                    | crate::sql::SqlOutcome::SetRole { .. }
                     | crate::sql::SqlOutcome::Do
                     | crate::sql::SqlOutcome::Lock
                     | crate::sql::SqlOutcome::CreateSchema(_)
@@ -5277,7 +5302,13 @@ impl EngineCore {
             // `GRANT`／`REVOKE` も構文語（`TO`・`ON`・`GRANT` 等）とロール名を含むため名前走査から外す。
             // 対象表名の一時表衝突は parse 内の参照記録で固定の `0A000` として拒否する。
             || crate::sql::allowlist::is_grant_statement(&tokens)
-            || crate::sql::allowlist::is_revoke_statement(&tokens);
+            || crate::sql::allowlist::is_revoke_statement(&tokens)
+            // ロール名も関係名とは別の名前空間で一時表を読み書きしない（SQL-39・Issue #1963）。名前走査だと
+            // 同名の一時表（`CREATE TEMP TABLE r` 等）を持つセッションで `ALTER ROLE r`／`SET ROLE r` が
+            // 一時表の振り分けに回り、固定の `0A000` になる。
+            || crate::sql::allowlist::is_alter_role_statement(&tokens)
+            || crate::sql::allowlist::is_set_role_statement(&tokens)
+            || crate::sql::allowlist::is_reset_role_statement(&tokens);
         if txn_control_head || scan_exempt {
             let hits = crate::sql::temp_catalog::RelationHits::default();
             let parsed =
@@ -5351,6 +5382,8 @@ impl EngineCore {
                     | ParsedSql::AlterSchema(_)
                     | ParsedSql::CreateRole(_)
                     | ParsedSql::DropRole(_)
+                    | ParsedSql::AlterRole(_)
+                    | ParsedSql::SetRole(_)
             )
         {
             return Ok(());
@@ -5839,6 +5872,17 @@ impl EngineCore {
             ));
         }
 
+        // SQL-39・Issue #1963: `SET [SESSION|LOCAL] ROLE`・`RESET ROLE` は許可リスト側の `SET` の振り分けへ
+        // 渡さず、構造検証だけで束縛する（名前解決・認可は実行段。未束縛セッションに有無を示さないため）。
+        if crate::sql::allowlist::is_set_role_statement(&tokens) {
+            let stmt = crate::sql::allowlist::validate_set_role_tokens(&tokens)?;
+            return Ok(ParsedSql::SetRole(stmt));
+        }
+        if crate::sql::allowlist::is_reset_role_statement(&tokens) {
+            return Ok(ParsedSql::SetRole(
+                crate::sql::allowlist::reset_role_statement(),
+            ));
+        }
         // SQL-68・Issue #2228: `DO` はカタログ照会なしの構造検証だけで束縛する。
         // SQL-40・Issue #1965: `GRANT`／`REVOKE` は構造検証だけで束縛する（カタログ照会は実行段。権限の無い
         // 主体にロール・対象の有無を示さないため）。`ALTER DEFAULT PRIVILEGES`（#2237）は汎用 `ALTER`
@@ -5945,6 +5989,12 @@ impl EngineCore {
         if crate::sql::allowlist::is_drop_policy_statement(&tokens) {
             let stmt = crate::sql::allowlist::validate_drop_policy_tokens(&tokens)?;
             return Ok(ParsedSql::DropPolicy(stmt));
+        }
+        // SQL-39・Issue #1963: `ALTER ROLE|USER` も汎用 `ALTER`（`ALTER TABLE` 扱い）より前に分岐する
+        // （カタログ照会なし）。
+        if crate::sql::allowlist::is_alter_role_statement(&tokens) {
+            let stmt = crate::sql::allowlist::validate_alter_role_tokens(&tokens)?;
+            return Ok(ParsedSql::AlterRole(stmt));
         }
         // RLS-13・Issue #2274: `ALTER POLICY` も汎用 `ALTER`（`ALTER TABLE` 扱い）より前に分岐する。
         if crate::sql::allowlist::is_alter_policy_statement(&tokens) {
@@ -7800,6 +7850,31 @@ impl EngineCore {
                     crate::sql::role_ddl::execute_drop_role(&self.storage, ctx.tenant_id(), stmt)?;
                 Ok(crate::sql::SqlOutcome::DropRole(outcome))
             }
+            // SQL-39（Issue #1963）: `ALTER ROLE` も `CREATE ROLE` と同じ DDL 権限ゲート（対象の有無を問わず
+            // `42501`）の後で実行する。パスワードの検証子化・改名の拒否判定は実行本体が担う。
+            ParsedSql::AlterRole(stmt) => {
+                crate::sql::ddl::require_ddl_permission(session)?;
+                let outcome = crate::sql::role_ddl::execute_alter_role(
+                    &self.storage,
+                    ctx.tenant_id(),
+                    session,
+                    stmt,
+                )?;
+                Ok(crate::sql::SqlOutcome::AlterRole(outcome))
+            }
+            // SQL-39（Issue #1963）: `SET ROLE`／`RESET ROLE` は DDL 権限ゲートを通らない。認可（未束縛 `42501`・
+            // メンバーシップの経路）は実行本体が行い、変えるのはセッションの現在ロールだけ。
+            ParsedSql::SetRole(stmt) => {
+                crate::sql::role_ddl::execute_set_role(
+                    &self.storage,
+                    ctx.tenant_id(),
+                    session,
+                    stmt,
+                )?;
+                Ok(crate::sql::SqlOutcome::SetRole {
+                    reset: stmt.is_reset_statement,
+                })
+            }
             // TABLE-27（Issue #1713）: DDL 実行権限ゲート → 実行本体。SCHEMA はテナント単位のカタログ
             // のため `ctx.tenant_id()` を渡す（SEQUENCE との違い）。権限の無い主体には対象の有無を
             // 問わず常に `42501`。
@@ -8465,11 +8540,25 @@ impl EngineCore {
             }
             // SQL-39（Issue #1962）: ロール DDL も独立した write txn で commit され ROLLBACK で取り消せないため
             // 明示トランザクション内では行わない。権限の無いセッションには存在を問わず `42501`（fail-closed）。
-            ParsedSql::CreateRole(_) | ParsedSql::DropRole(_) => {
+            ParsedSql::CreateRole(_) | ParsedSql::DropRole(_) | ParsedSql::AlterRole(_) => {
                 crate::sql::ddl::require_ddl_permission(session)?;
                 Err(SqlSurfaceError::feature_not_supported(
                     "role DDL is not supported inside a transaction block",
                 ))
+            }
+            // SQL-39（Issue #1963）: `SET ROLE`／`RESET ROLE` はセッション変数だけを変えるため明示 Tx 内でも
+            // 実行できる（`session_at_begin` の復元により ROLLBACK・abort で元に戻る）。ロールカタログは
+            // Tx 内で変わらない（ロール DDL は上で `0A000`）ため、名前解決は独立した読み取りで行う。
+            ParsedSql::SetRole(stmt) => {
+                crate::sql::role_ddl::execute_set_role(
+                    &self.storage,
+                    ctx.tenant_id(),
+                    session,
+                    stmt,
+                )?;
+                Ok(crate::sql::SqlOutcome::SetRole {
+                    reset: stmt.is_reset_statement,
+                })
             }
             // SQL-67・Issue #2220: FROM 句の集合返却関数の呼び出しも、本体を同じ Tx・RLS で実行するため
             // 汎用の読み取り腕より前で受け、Tx 上で本体を実行してから外側の後処理を適用する。
@@ -9725,7 +9814,10 @@ impl EngineCore {
                 Ok(None)
             }
             ParsedSql::GrantRevoke(_) => Ok(None),
-            ParsedSql::CreateRole(_) | ParsedSql::DropRole(_) => Ok(None),
+            ParsedSql::CreateRole(_)
+            | ParsedSql::DropRole(_)
+            | ParsedSql::AlterRole(_)
+            | ParsedSql::SetRole(_) => Ok(None),
             // SQL-68・Issue #2228: `DO` は行を返さない（Describe は NoData）。
             ParsedSql::Do(_) | ParsedSql::Lock(_) => Ok(None),
             ParsedSql::CreateSchema(_) => Ok(None),

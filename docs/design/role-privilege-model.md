@@ -390,3 +390,32 @@ Issue #1962 は決定 D1・D2 のうち、`CREATE ROLE`／`CREATE USER`／`DROP 
 ### 対象外
 
 `CREATEROLE`／`ADMIN OPTION` による判定（#1966・#1971）、ログイン名対応表への登録（#2233）、`VALID UNTIL`・`CONNECTION LIMIT`（#2233）、`IN ROLE`・`ROLE`・`ADMIN`（#2232）、`ALTER ROLE`・`SET ROLE`（#1963）、`BYPASSRLS` の属性ビット（#2278 段 2）、所有者による依存検査（#2236）、自分のセッションのロールを DROP したときの `55006`（#1971 の後）、`CREATE GROUP`／`DROP GROUP`。
+
+## 10. Issue #1963 実装記録（ALTER ROLE と SET ROLE／RESET ROLE）
+
+挙動は PostgreSQL 17 に合わせ、SQL-39（関連 RLS-12）のポインタで対応づける。spec 本文は転記しない。
+
+### 実装した範囲
+
+- `ALTER ROLE`／`ALTER USER <名> [WITH] <オプション>...` と `ALTER ROLE <名> RENAME TO <新名>`。コマンドタグは `ALTER ROLE`
+- `SET [SESSION] ROLE <名>|NONE`・`SET ROLE TO/= ...`・`RESET ROLE`。タグは `SET`／`RESET`
+- オプションの解析は `CREATE ROLE` と共有し（`ALTER` では未指定を「変更なし」とする）、拒否規則を二重管理しない
+- `SqlOutcome::AlterRole`・`SqlOutcome::SetRole`、`ParsedSql::AlterRole`・`ParsedSql::SetRole` を追加した（公開 enum への variant 追加）
+
+### 判断の記録
+
+| 判断 | 内容 |
+| ---- | ---- |
+| 未束縛セッション | `SET ROLE <名>` はカタログ照会より前に `42501`（ロールの有無を示さない）。`RESET ROLE`・`SET ROLE NONE` は何も変えず成功 |
+| 名前解決 | 自テナントのカタログだけを引く。不在も他テナントにだけ在る場合も同じ `42704` |
+| 認可 | `session_role_id` を起点に、`SET` 真のメンバーシップの辺だけを辿って対象に到達できれば可。自分自身は常に可。到達不能は固定文言の `42501` |
+| 探索の上限 | 訪問済み集合で循環を除き、ロール数と辺の走査数に上限を置く。超過は拒否側（fail-closed） |
+| 影響範囲 | `SET ROLE` が変えるのは `current_role_id` だけ。`PolicyContext`・`session_role_id`・`ddl_allowed` は変えない（テナント境界・DDL 権限ゲートは広がらない） |
+| 明示 Tx | `SET ROLE` は READ ONLY を含む明示 Tx 内でも実行でき、ROLLBACK で戻る。`ALTER ROLE` は DDL 権限ゲートの後に `0A000` |
+| `ALTER ROLE` の拒否 | DDL 権限ゲートが最初（`42501`）。`SUPERUSER`／`BYPASSRLS`／`REPLICATION` は `42501`。`VALID UNTIL`・`CONNECTION LIMIT`・ロール単位の `SET`・`ALL`・`IN DATABASE` は `0A000` |
+| `RENAME TO` | ロール表のキーだけを移し、ID・ACL・メンバーシップは保つ。セッション／現在のロール自身の改名は `0A000` |
+| パスワード | `CREATE ROLE` と同じ検証子生成（平文は `RolePassword` に閉じ込める）。`PASSWORD NULL` は検証子を空にする |
+
+### 対象外
+
+`CREATEROLE`／`ADMIN OPTION` による判定（#1966・#1971）、認証主体の束縛（#1971。それまで wire の実セッションでは `SET ROLE <名>` は常に `42501`）、INHERIT による継承（#2232）、`VALID UNTIL`・`CONNECTION LIMIT`・改名時のログイン名対応表への追随（#2233）、`current_user`／`SHOW role`、`SET SESSION AUTHORIZATION`、`SET LOCAL ROLE`。

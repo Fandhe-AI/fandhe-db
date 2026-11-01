@@ -446,6 +446,17 @@ pub enum SqlOutcome {
     ///
     /// **BREAKING CHANGE**（Issue #1962）: `SqlOutcome` への variant 追加。
     DropRole(role_ddl::DropRoleOutcome),
+    /// `ALTER ROLE`／`ALTER USER`（SQL-39、Issue #1963。コマンドタグは `ALTER ROLE`）。`RENAME TO` も同じ。
+    ///
+    /// **BREAKING CHANGE**（Issue #1963）: `SqlOutcome` への variant 追加。
+    AlterRole(role_ddl::AlterRoleOutcome),
+    /// `SET [SESSION] ROLE`／`RESET ROLE` が成功したことを示す応答（SQL-39、Issue #1963）。`reset` が真なら
+    /// `RESET ROLE`（CommandComplete タグ `RESET`）、偽なら `SET ROLE`（タグ `SET`）。
+    ///
+    /// **BREAKING CHANGE**（Issue #1963）: `SqlOutcome` への variant 追加。
+    SetRole {
+        reset: bool,
+    },
     /// `DO` ブロックの実行完了（CommandComplete タグ `DO`。SQL-68・Issue #2228）。
     ///
     /// **BREAKING CHANGE**（Issue #2228）: `SqlOutcome` への variant 追加。
