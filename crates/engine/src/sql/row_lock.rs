@@ -23,6 +23,7 @@
 
 use crate::sql::allowlist::{SqlSurfaceError, Statement};
 use crate::sql::lexer::{Keyword, Token};
+use crate::sql::relation::TableRef;
 
 /// ロックの強度（強い順に `Update` > `NoKeyUpdate` > `Share` > `KeyShare`）。
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -113,7 +114,7 @@ impl LockingSelect {
 pub(crate) struct RowLockingSyntax {
     clauses: Vec<RowLockClause>,
     /// 最上位の FROM の先頭の参照 `(表名, 別名)`（単一表の SELECT の `OF` 照合に使う）。
-    first_from: Option<(String, Option<String>)>,
+    first_from: Option<TableRef>,
     /// 先頭の `WITH` が定義した CTE 名。
     cte_names: Vec<String>,
     /// `DISTINCT`／`GROUP BY`／`HAVING`／`WINDOW`／集合演算が最上位にある。
@@ -308,7 +309,7 @@ pub(crate) fn extract_row_locking(
     // 最上位の併用違反の印・FROM の先頭の参照・CTE 名を句の前の部分から集める。
     let pre = tokens.get(..start).unwrap_or(&[]);
     let mut combo_violation = false;
-    let mut first_from: Option<(String, Option<String>)> = None;
+    let mut first_from: Option<TableRef> = None;
     let mut cte_names: Vec<String> = Vec::new();
     let mut depth: usize = 0;
     for (k, tok) in pre.iter().enumerate() {
@@ -434,51 +435,17 @@ fn cte_name_before_column_list(pre: &[Token], as_idx: usize) -> Option<&Token> {
     None
 }
 
-/// `pre[i..]`（`FROM` の直後）から先頭の参照 `(表名, 別名)` を読む。
-fn parse_first_from(pre: &[Token], i: usize) -> Option<(String, Option<String>)> {
-    let table = match pre.get(i)? {
-        Token::Ident(n) => n.clone(),
-        Token::QualifiedIdent { name, .. } => name.clone(),
-        _ => return None,
-    };
-    let mut n = i + 1;
-    if is_word(pre.get(n), "AS") {
-        n += 1;
-        if let Some(Token::Ident(a)) = pre.get(n) {
-            return Some((table, Some(a.clone())));
-        }
-        return Some((table, None));
+/// `pre[i..]`（`FROM` の直後）から先頭の参照を読む。別名の規則は単一表 FROM の構文解析と
+/// 同じ実装（`allowlist::probe_from_table_ref`）に一本化し、ここでは第 2 の規則を持たない。
+/// 修飾名（`s.t`）は名前部だけを表名として渡す（拡張クエリでは内部キー `#<id>.<name>` の
+/// 場合があり、公開名は [`TableRef::exposed_name`] が名前部へ正規化する）。
+fn parse_first_from(pre: &[Token], i: usize) -> Option<TableRef> {
+    let mut rest: Vec<Token> = pre.get(i..)?.to_vec();
+    if let Some(Token::QualifiedIdent { name, .. }) = rest.first() {
+        let name = name.clone();
+        *rest.first_mut()? = Token::Ident(name);
     }
-    const STOP: &[&str] = &[
-        "JOIN",
-        "INNER",
-        "LEFT",
-        "RIGHT",
-        "FULL",
-        "CROSS",
-        "NATURAL",
-        "ON",
-        "USING",
-        "GROUP",
-        "HAVING",
-        "WINDOW",
-        "UNION",
-        "INTERSECT",
-        "EXCEPT",
-        "OFFSET",
-        "FETCH",
-        "FOR",
-        "ORDER",
-        "LIMIT",
-        "HINT",
-        "OUTER",
-    ];
-    if let Some(Token::Ident(a)) = pre.get(n) {
-        if !STOP.iter().any(|w| a.eq_ignore_ascii_case(w)) {
-            return Some((table, Some(a.clone())));
-        }
-    }
-    Some((table, None))
+    crate::sql::allowlist::probe_from_table_ref(&rest).map(|(r, _)| r)
 }
 
 fn combo_error() -> SqlSurfaceError {
@@ -552,11 +519,11 @@ pub(crate) fn check_row_locking(
         }
     } else {
         // 単一表の SELECT。参照名は FROM の先頭の参照（別名があれば別名）。
-        let Some((table, alias)) = &syntax.first_from else {
+        let Some(first) = &syntax.first_from else {
             return Err(combo_error());
         };
-        let exposed = alias.as_deref().unwrap_or(table.as_str());
-        if syntax.cte_names.iter().any(|c| c == table) {
+        let exposed = first.exposed_name();
+        if syntax.cte_names.iter().any(|c| c == first.table()) {
             return Err(combo_error());
         }
         for name in &of_all {
@@ -797,23 +764,17 @@ mod tests {
 
     #[test]
     fn first_from_reads_alias() {
-        let syn = extract("SELECT x.id FROM public.a AS x FOR UPDATE OF x")
-            .unwrap()
-            .1
-            .unwrap();
-        assert_eq!(
-            syn.first_from,
-            Some(("a".to_string(), Some("x".to_string())))
-        );
-        let syn = extract("SELECT id FROM a x WHERE id = 1 FOR UPDATE")
-            .unwrap()
-            .1
-            .unwrap();
-        assert_eq!(
-            syn.first_from,
-            Some(("a".to_string(), Some("x".to_string())))
-        );
-        let syn = extract("SELECT id FROM a FOR UPDATE").unwrap().1.unwrap();
-        assert_eq!(syn.first_from, Some(("a".to_string(), None)));
+        let from = |sql: &str| extract(sql).unwrap().1.unwrap().first_from.unwrap();
+        let r = from("SELECT x.id FROM public.a AS x FOR UPDATE OF x");
+        assert_eq!((r.table(), r.alias()), ("a", Some("x")));
+        let r = from("SELECT id FROM a x WHERE id = 1 FOR UPDATE");
+        assert_eq!((r.table(), r.alias()), ("a", Some("x")));
+        let r = from("SELECT id FROM a FOR UPDATE");
+        assert_eq!((r.table(), r.alias()), ("a", None));
+        // 暗黙の別名が句の語と同名でも、単一表 FROM の規則どおり別名として読む。
+        let r = from("SELECT id FROM a for FOR UPDATE");
+        assert_eq!((r.table(), r.alias()), ("a", Some("for")));
+        let r = from("SELECT id FROM a window FOR UPDATE");
+        assert_eq!((r.table(), r.alias()), ("a", Some("window")));
     }
 }

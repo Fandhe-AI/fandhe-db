@@ -383,3 +383,47 @@ fn missing_tables_answer_the_same_with_or_without_the_clause() {
         without.expect_err("without").wire_code()
     );
 }
+
+/// 拡張クエリでは schema 修飾名が内部キーへ書き換わった後でも、`OF` は公開名（名前部）で
+/// 照合され、単純クエリと同じ結果になる。別名があれば元の表名では指せない。
+#[test]
+fn extended_query_schema_qualified_of_matches_simple_query() {
+    let (core, path) = new_core();
+    let _cleanup = CleanupGuard(path);
+    let mut s = SessionState::default();
+    s.allow_ddl();
+    assert!(s.bind_resolution_tenant("tenant-a"));
+    for sql in [
+        "CREATE SCHEMA s",
+        "CREATE TABLE s.docs (id BIGINT PRIMARY KEY, n INTEGER)",
+    ] {
+        core.execute_sql_in_session(&ctx(), &mut s, sql)
+            .unwrap_or_else(|e| panic!("{sql}: {e:?}"));
+    }
+    let ext = |sql: &str| {
+        core.parse_sql_prepared_with_declared_in_session(&s, sql, &[])
+            .map(|_| ())
+            .map_err(|e| e.wire_code().to_string())
+    };
+    assert_eq!(
+        ext("SELECT id FROM s.docs LIMIT 5 FOR UPDATE OF docs"),
+        Ok(())
+    );
+    assert_eq!(
+        ext("SELECT id FROM s.docs LIMIT 5 FOR UPDATE OF nothing"),
+        Err("42P01".to_string())
+    );
+    assert_eq!(
+        ext("SELECT d.id FROM s.docs AS d LIMIT 5 FOR UPDATE OF docs"),
+        Err("42P01".to_string())
+    );
+    assert_eq!(
+        ext("SELECT d.id FROM s.docs AS d LIMIT 5 FOR UPDATE OF d"),
+        Ok(())
+    );
+    // 暗黙の別名が句の語と同名（`window`）でも別名として扱う。
+    assert_eq!(
+        ext("SELECT id FROM documents window LIMIT 5 FOR UPDATE OF documents"),
+        Err("42P01".to_string())
+    );
+}
