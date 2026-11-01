@@ -339,3 +339,130 @@ fn commit_implicit_after_a_session_change_keeps_the_new_session_state() {
     txn.commit_implicit(&mut session).expect("commit");
     assert_eq!(session.search_mode(), Some(SearchMode::Recall));
 }
+
+/// 暗黙 Tx は開始時（最初の文の前）から writer を保持する（Issue #2401。SQL-31・WIRE-16）。
+/// 同一スレッドの再入検出により、別セッションの autocommit 書き込みは待たず即座に `55P03` になる。
+#[test]
+fn implicit_txn_holds_writer_from_start_before_any_statement() {
+    let (engine, path) = new_core();
+    let _cleanup = CleanupGuard(path);
+    let session = SessionState::default();
+    let mut txn = engine.new_session_transaction();
+    engine
+        .begin_implicit_transaction(&mut txn, &session)
+        .expect("begin implicit");
+
+    let err = engine
+        .execute_sql_in_session(
+            &ctx("tenant-b"),
+            &mut SessionState::default(),
+            &insert_sql(1, "op-other"),
+        )
+        .expect_err("writer is already held");
+    assert_eq!(err.wire_code(), "55P03");
+
+    txn.abort_implicit();
+    engine
+        .execute_sql_in_session(
+            &ctx("tenant-b"),
+            &mut SessionState::default(),
+            &insert_sql(1, "op-other"),
+        )
+        .expect("writer released after abort");
+    assert_eq!(count_rows(&engine, &ctx("tenant-b")), 1);
+}
+
+/// 先頭の読み取りを跨いでも writer を保持し続け、commit で解放する。明示 Tx は読み取りの間は
+/// writer を持たず別セッションが書ける、という起源ごとの差も対で示す（Issue #2401）。
+#[test]
+fn implicit_txn_keeps_writer_across_a_leading_read() {
+    let (engine, path) = new_core();
+    let _cleanup = CleanupGuard(path);
+    let caller = ctx("tenant-a");
+    let other = ctx("tenant-b");
+    let mut session = SessionState::default();
+    let select = format!("SELECT id FROM {TABLE} ORDER BY embedding <=> '[1.0, 0.0]' LIMIT 10");
+
+    let mut txn = engine.new_session_transaction();
+    engine
+        .begin_implicit_transaction(&mut txn, &session)
+        .expect("begin implicit");
+    engine
+        .execute_sql_in_txn(&caller, &mut session, &mut txn, &select)
+        .expect("leading read");
+    let err = engine
+        .execute_sql_in_session(&other, &mut SessionState::default(), &insert_sql(9, "o-1"))
+        .expect_err("writer still held after the read");
+    assert_eq!(err.wire_code(), "55P03");
+    engine
+        .execute_sql_in_txn(&caller, &mut session, &mut txn, &insert_sql(1, "imp-1"))
+        .expect("insert");
+    txn.commit_implicit(&mut session).expect("commit implicit");
+    engine
+        .execute_sql_in_session(&other, &mut SessionState::default(), &insert_sql(9, "o-1"))
+        .expect("writer released after commit");
+
+    // 対照: 明示 Tx は読み取りの間 writer を持たない。
+    let mut explicit = engine.new_session_transaction();
+    engine
+        .execute_sql_in_txn(&caller, &mut session, &mut explicit, "BEGIN")
+        .expect("begin");
+    engine
+        .execute_sql_in_txn(&caller, &mut session, &mut explicit, &select)
+        .expect("read");
+    engine
+        .execute_sql_in_session(&other, &mut SessionState::default(), &insert_sql(10, "o-2"))
+        .expect("explicit txn does not hold the writer during reads");
+    engine
+        .execute_sql_in_txn(&caller, &mut session, &mut explicit, "ROLLBACK")
+        .expect("rollback");
+}
+
+/// 別セッションが writer を握っている間は、暗黙 Tx の開始自体が `55P03` で失敗し、`Idle` のまま
+/// 1 文も実行されない。明示の `BEGIN` は writer を待たず成功する（Issue #2401）。
+#[test]
+fn begin_implicit_is_55p03_while_another_session_holds_the_writer() {
+    let (engine, path) = new_core();
+    let _cleanup = CleanupGuard(path);
+    let caller = ctx("tenant-a");
+    let mut holder_session = SessionState::default();
+    let mut holder = engine.new_session_transaction();
+    engine
+        .execute_sql_in_txn(&caller, &mut holder_session, &mut holder, "BEGIN")
+        .expect("holder begin");
+    engine
+        .execute_sql_in_txn(
+            &caller,
+            &mut holder_session,
+            &mut holder,
+            &insert_sql(1, "holder-1"),
+        )
+        .expect("holder first write takes the writer");
+
+    let session = SessionState::default();
+    let mut waiter = engine.new_session_transaction();
+    let err = engine
+        .begin_implicit_transaction(&mut waiter, &session)
+        .expect_err("writer is held by another session");
+    assert_eq!(err.wire_code(), "55P03");
+    assert_eq!(waiter.status(), TransactionStatus::Idle);
+    assert!(!waiter.is_implicit_active());
+
+    // 対照: 明示の BEGIN は writer を待たない。
+    let mut explicit_session = SessionState::default();
+    engine
+        .execute_sql_in_txn(&caller, &mut explicit_session, &mut waiter, "BEGIN")
+        .expect("explicit BEGIN does not wait");
+    engine
+        .execute_sql_in_txn(&caller, &mut explicit_session, &mut waiter, "ROLLBACK")
+        .expect("rollback");
+
+    engine
+        .execute_sql_in_txn(&caller, &mut holder_session, &mut holder, "ROLLBACK")
+        .expect("holder rollback");
+    engine
+        .begin_implicit_transaction(&mut waiter, &session)
+        .expect("begin implicit after release");
+    let mut session = session;
+    waiter.commit_implicit(&mut session).expect("commit");
+}
