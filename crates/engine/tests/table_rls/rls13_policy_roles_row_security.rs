@@ -356,3 +356,58 @@ fn ok_txn<'e>(
     core.execute_sql_in_txn(&ctx("alice"), s, txn, sql)
         .unwrap_or_else(|e| panic!("{sql}: {} {e}", e.wire_code()));
 }
+
+/// RLS-13・TABLE-27: SCHEMA 配下の表への `row_security = off` 拒否と `WITH CHECK` 違反の文言は、
+/// 内部キー（`#<id>.<name>`）ではなく `s.t` で表示する（読み取り・UPDATE・DELETE・INSERT・COPY TO）。
+#[test]
+fn rls13_schema_qualified_rejection_messages_hide_internal_key() {
+    let (core, _g) = new_core("rls13-rs-off-schema");
+    let mut s = SessionState::default();
+    s.allow_ddl();
+    for sql in [
+        "CREATE SCHEMA s",
+        "CREATE TABLE s.t (id BIGINT PRIMARY KEY, name TEXT)",
+        "ALTER TABLE s.t ENABLE ROW LEVEL SECURITY",
+        "CREATE POLICY p ON s.t FOR ALL USING (true) WITH CHECK (id = 1)",
+    ] {
+        ok(&core, "alice", &mut s, sql);
+    }
+    let c = ctx("alice");
+    let msg = "query would be affected by row-level security policy for table \"s.t\"";
+    // WITH CHECK 違反（row_security on）も表示名で返る。
+    let err = core
+        .execute_sql_in_session(&c, &mut s, "INSERT INTO s.t (id, name) VALUES (2, 'a')")
+        .expect_err("with check");
+    assert!(
+        !err.client_message().contains('#'),
+        "{}",
+        err.client_message()
+    );
+    assert!(
+        err.client_message().contains("s.t"),
+        "{}",
+        err.client_message()
+    );
+
+    ok(&core, "alice", &mut s, "SET row_security = off");
+    for sql in [
+        "SELECT id FROM s.t",
+        "UPDATE s.t SET name = 'x' WHERE id = 1",
+        "DELETE FROM s.t WHERE id = 1",
+        "INSERT INTO s.t (id, name) VALUES (1, 'a')",
+    ] {
+        let err = core.execute_sql_in_session(&c, &mut s, sql).expect_err(sql);
+        assert_eq!(err.wire_code(), "42501", "{sql}");
+        assert_eq!(err.client_message(), msg, "{sql}");
+    }
+    for sql in ["COPY s.t TO STDOUT", "COPY (SELECT id FROM s.t) TO STDOUT"] {
+        let err = core.begin_copy(&c, &s, sql).map(|_| ()).expect_err(sql);
+        assert_eq!(err.client_message(), msg, "{sql}");
+        let mut txn = core.new_session_transaction();
+        let err = core
+            .begin_copy_in_txn(&c, &s, &mut txn, sql)
+            .map(|_| ())
+            .expect_err(sql);
+        assert_eq!(err.client_message(), msg, "txn {sql}");
+    }
+}

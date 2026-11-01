@@ -1506,6 +1506,20 @@ impl SqlSurfaceError {
                 Self::InvalidFunctionDefinition { detail: f(&detail) }
             }
             Self::AmbiguousFunction { detail } => Self::AmbiguousFunction { detail: f(&detail) },
+            // RLS-13（Issue #2277・#2278）: 表名を持つ拒否も、SCHEMA 配下の表の内部キー
+            // （`#<id>.<name>`）を `<schema>.<name>` へ戻す対象に含める（TABLE-27・ADR D2）。
+            Self::RowSecurityOffRejected { table } => {
+                Self::RowSecurityOffRejected { table: f(&table) }
+            }
+            Self::RowSecurityPolicyViolation {
+                table,
+                policy,
+                using_expression,
+            } => Self::RowSecurityPolicyViolation {
+                table: f(&table),
+                policy,
+                using_expression,
+            },
             other => other,
         }
     }
