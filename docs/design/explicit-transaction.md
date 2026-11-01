@@ -638,7 +638,7 @@ Issue #1931（`READ ONLY`）、挙動テストは #1940、`40001` は #2396 が�
 各形の SQLSTATE・`SKIP LOCKED` の結果・トランザクション外の扱い・併用可否は本書へ記述しない。
 ポインタは `docs/spec/04-behavior/sql-surface.md` SQL-38（(3)(4)(5)(7)）・SQL-31、
 `docs/spec/04-behavior/data-model.md` TABLE-3、`docs/spec/04-behavior/persistence.md` PERSIST-4、
-関連は RLS-12・RLS-7。現状の main では行ロック句・`LOCK TABLE` はいずれも `42601` で拒否される（#1955 の現状欄）。
+関連は RLS-12・RLS-7。行ロック句の取得は #2230、`LOCK TABLE` は #1958 で実装済み（#1955 の現状欄は着手前の記録）。
 
 - **判断（実装側の写像）**: 行ロック句と `LOCK TABLE`（8 モード）は、単一ライタの writer 取得に写す。
   行・表・ロックモードの粒度は区別しない。根拠は 1a-1（書き込み文の一覧にロック句・`LOCK TABLE` が含まれ、
@@ -647,14 +647,21 @@ Issue #1931（`READ ONLY`）、挙動テストは #1940、`40001` は #2396 が�
   （`Storage::begin_explicit_write_txn`、`crates/engine/src/storage/writer_gate.rs` の `acquire`）を使い、
   取得時の `40001` 判定も同じ経路に載せる（1a-3・1a-6）。待機上限は 2 節の書き込みロック待機上限
   （`StorageError::WriteLockTimeout` から `55P03` への写像）に従う。
-  `NOWAIT` は「即時取得を試みる経路」で実現する。既存の `acquire` ／ `acquire_yielding` の流用か
-  新しい API にするかは #2230 で決める。
+  `NOWAIT` は「即時取得を試みる経路」で実現する。#2230 では `LOCK TABLE ... NOWAIT`（#1958）と同じ
+  `Storage::begin_explicit_write_txn_nowait` を流用し、新しい API は作らない。
+- **複数句の合成（#2230）**: 強度・`OF` の対象は writer の取得に影響しない。待機方針は
+  `SKIP LOCKED` を含む形を `0A000`（#2231 まで。writer に触れる前に返す）、含まず `NOWAIT` を含む形を nowait、
+  それ以外を待機とする（`RowLocking::writer_wait`）。
+- **保持期間（#2230）**: 明示 Tx は `ensure_writer_with` で取得して COMMIT／ROLLBACK まで保持し、dirty にはしない。
+  autocommit は文単位の暗黙 Tx（`begin_implicit_with(.., nowait)`）で取得し、文の終わりに解放する
+  （書き込みなしとして drop）。取得後の読み取りは句のない SELECT と同じ経路を通る。
+  一時表だけを対象にした行ロック句は未対応の `0A000` のまま。
 
 | 形 | spec ポインタ | 担当 | 現状 |
 | -- | ------------- | ---- | ---- |
-| 行ロック句 4 種・`OF`・`NOWAIT`・`SKIP LOCKED` の構文 | SQL-38 (7) | #1957 | 構文解釈済み（`ParsedSql::LockingSelect`）。実行は #2230 まで `0A000` の暫定ゲート |
-| 行ロック句によるロック取得・`NOWAIT` | SQL-38 (4) | #2230 | `42601` |
-| `SKIP LOCKED` の実行 | SQL-38 (4) | #2231 | `42601` |
+| 行ロック句 4 種・`OF`・`NOWAIT`・`SKIP LOCKED` の構文 | SQL-38 (7) | #1957 | 構文解釈済み（`ParsedSql::LockingSelect`） |
+| 行ロック句によるロック取得・`NOWAIT` | SQL-38 (4) | #2230 | 実装済み（#2230。writer の取得として扱う） |
+| `SKIP LOCKED` の実行 | SQL-38 (4) | #2231 | 未実装（`0A000`） |
 | `LOCK [TABLE]` の 8 モードの構文・取得・表名の解決 | SQL-38 (4)(7) | #1958 | 実装済み（#1958） |
 | READ ONLY トランザクション内での扱い | SQL-38 (3) | #1934 | 実装済み（#1934。書き込み系の文は `25006`） |
 | writer 取得時の直列化判定 | SQL-38 (2)・SQL-31 | #2396 系 | 1a 節の記録のとおり |

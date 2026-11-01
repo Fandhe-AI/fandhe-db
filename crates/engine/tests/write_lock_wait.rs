@@ -12,6 +12,8 @@
 //! T8・T9 は文数・持続時間の上限が writer の待機より前に `BEGIN` 起点で検査されること、
 //! T10 はロック待ちの時間も `BEGIN` 起点の持続時間に入ることを確認する。
 //! Issue #1933（SQL-38 ポインタ）: T11 は `BEGIN READ ONLY` が開いている間も別セッションの書き込みが待たないこと。
+//! Issue #2230（SQL-38 ポインタ）: T12〜T15 は行ロック句つき SELECT の writer 取得（待機上限・`NOWAIT` の
+//! `55P03`、解放後の再取得、autocommit の文末解放）を 2 セッションで確認する。
 //! `sql31_transaction.rs` と同じ流儀（実 `Storage`・チャネル同期・holder を先に解放して join）。
 
 use std::sync::Arc;
@@ -477,4 +479,143 @@ fn read_only_txn_does_not_block_other_sessions_writes() {
     assert_eq!(ro.status(), TransactionStatus::Idle);
     assert!(elapsed < Duration::from_secs(1), "elapsed={elapsed:?}");
     assert_eq!(count_rows(&engine), 2);
+}
+const LOCK_SQL: &str = "SELECT id FROM documents LIMIT 100 FOR UPDATE";
+const PLAIN_LOCK_SHAPE_SQL: &str = "SELECT id FROM documents LIMIT 100";
+
+fn autocommit(
+    engine: &Arc<EngineCore>,
+    sql: &str,
+) -> Result<engine::sql::SqlOutcome, engine::sql::allowlist::SqlSurfaceError> {
+    engine.execute_sql_in_session(&ctx("tenant-b"), &mut SessionState::default(), sql)
+}
+
+/// T12（Issue #2230・SQL-38）: 明示 Tx の行ロック句は writer の待機上限を超えると `55P03`、`NOWAIT` は
+/// 待たずに即時 `55P03`。Tx は `Failed`（後続は `25P02`）で、エラー文に holder の tenant 名・表名を含まない。
+#[test]
+fn explicit_row_lock_reports_55p03_when_writer_is_held() {
+    for (wait_ms, sql, nowait) in [
+        (5_000, format!("{LOCK_SQL} NOWAIT"), true),
+        (100, LOCK_SQL.to_string(), false),
+    ] {
+        let (engine, path) = new_core(wait_ms);
+        let _cleanup = CleanupGuard(path);
+        let (holder, release) = spawn_holder(&engine);
+
+        let mut session = SessionState::default();
+        let mut txn = engine.new_session_transaction();
+        run(&engine, &mut session, &mut txn, "BEGIN").expect("begin");
+        let started = Instant::now();
+        let lock = run(&engine, &mut session, &mut txn, &sql);
+        let elapsed = started.elapsed();
+        let status = txn.status();
+        let after = run(&engine, &mut session, &mut txn, SELECT_SQL);
+        let rollback = run(&engine, &mut session, &mut txn, "ROLLBACK");
+
+        release.send(()).expect("release");
+        holder.join().expect("holder");
+        let err = lock.expect_err("row lock must fail");
+        assert_eq!(err.wire_code(), "55P03", "{sql}");
+        let msg = err.to_string();
+        assert!(!msg.contains("tenant-a") && !msg.contains(TABLE), "{msg}");
+        if nowait {
+            assert!(elapsed < Duration::from_secs(1), "elapsed={elapsed:?}");
+        } else {
+            assert!(elapsed >= Duration::from_millis(100), "elapsed={elapsed:?}");
+        }
+        assert_eq!(status, TransactionStatus::Failed);
+        assert_eq!(after.expect_err("failed txn").wire_code(), "25P02");
+        rollback.expect("rollback");
+    }
+}
+
+/// T13: 明示 Tx の行ロック句は holder の解放後に取得して成功し、結果は句なし SELECT と同一。
+/// 取得後も writer を保持し続け、続く書き込みと COMMIT が成功する。
+#[test]
+fn explicit_row_lock_waits_for_release_then_acquires() {
+    let (engine, path) = new_core(5_000);
+    let _cleanup = CleanupGuard(path);
+    let (holder, release) = spawn_holder(&engine);
+
+    let mut session = SessionState::default();
+    let mut txn = engine.new_session_transaction();
+    run(&engine, &mut session, &mut txn, "BEGIN").expect("begin");
+    let releaser = std::thread::spawn(move || {
+        std::thread::sleep(Duration::from_millis(300));
+        release.send(()).expect("release");
+    });
+    let started = Instant::now();
+    let locked = run(&engine, &mut session, &mut txn, LOCK_SQL);
+    let elapsed = started.elapsed();
+    releaser.join().expect("releaser");
+    holder.join().expect("holder");
+    let locked = locked.expect("row lock succeeds after release");
+    assert!(elapsed >= Duration::from_millis(200), "elapsed={elapsed:?}");
+    let plain = run(&engine, &mut session, &mut txn, PLAIN_LOCK_SHAPE_SQL).expect("plain read");
+    assert_eq!(format!("{plain:?}"), format!("{locked:?}"));
+    run(&engine, &mut session, &mut txn, &insert_sql(1, "op-t13")).expect("write after lock");
+    run(&engine, &mut session, &mut txn, "COMMIT").expect("commit");
+    assert_eq!(count_rows(&engine), 1);
+}
+
+/// T14: autocommit の行ロック句は、`NOWAIT` なら holder の保持中に即時 `55P03`、通常形は待機して
+/// 解放後に成功する。
+#[test]
+fn autocommit_row_lock_reports_55p03_or_waits() {
+    let (engine, path) = new_core(5_000);
+    let _cleanup = CleanupGuard(path);
+    let (holder, release) = spawn_holder(&engine);
+
+    let started = Instant::now();
+    let nowait = autocommit(&engine, &format!("{LOCK_SQL} NOWAIT"));
+    let nowait_elapsed = started.elapsed();
+    let releaser = std::thread::spawn(move || {
+        std::thread::sleep(Duration::from_millis(300));
+        release.send(()).expect("release");
+    });
+    let started = Instant::now();
+    let waited = autocommit(&engine, LOCK_SQL);
+    let waited_elapsed = started.elapsed();
+    releaser.join().expect("releaser");
+    holder.join().expect("holder");
+
+    let err = nowait.expect_err("nowait must fail while held");
+    assert_eq!(err.wire_code(), "55P03");
+    let msg = err.to_string();
+    assert!(!msg.contains("tenant-a") && !msg.contains(TABLE), "{msg}");
+    assert!(
+        nowait_elapsed < Duration::from_secs(1),
+        "elapsed={nowait_elapsed:?}"
+    );
+    waited.expect("blocking form waits and succeeds after release");
+    assert!(
+        waited_elapsed >= Duration::from_millis(200),
+        "elapsed={waited_elapsed:?}"
+    );
+}
+
+/// T15: autocommit の行ロック句は文の終わりで writer を解放する。直後の別セッションの書き込みは
+/// 待たずに成功する。
+#[test]
+fn autocommit_row_lock_releases_writer_at_statement_end() {
+    let (engine, path) = new_core(5_000);
+    let _cleanup = CleanupGuard(path);
+    autocommit(&engine, LOCK_SQL).expect("autocommit row lock");
+    let started = Instant::now();
+    let other = {
+        let e = Arc::clone(&engine);
+        std::thread::spawn(move || {
+            e.execute_sql_in_session(
+                &ctx("tenant-b"),
+                &mut SessionState::default(),
+                &insert_sql(1, "op-t15"),
+            )
+        })
+        .join()
+        .expect("join")
+    };
+    let elapsed = started.elapsed();
+    other.expect("write after statement end");
+    assert!(elapsed < Duration::from_secs(1), "elapsed={elapsed:?}");
+    assert_eq!(count_rows(&engine), 1);
 }
