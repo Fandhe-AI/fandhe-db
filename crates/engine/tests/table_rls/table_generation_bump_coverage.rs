@@ -455,7 +455,8 @@ const ALLOWLIST: &[(&str, u32)] = &[
     // Issue #2400（明示 Tx の writer 遅延取得。`ensure_writer`・`open_read_snapshot` の追加と
     // `begin_with_origin` の分岐）と Issue #1938（ISOLATION LEVEL 受理）・Issue #1930（別名受理）の行追加でさらに移動（旧: 1120）。書き込み内容・commit の意味は不変。
     // Issue #2403（読み取り源の三分岐 `TxnReadSource`・`read_source` の追加）の行追加でさらに移動（旧: 1275）。書き込み内容・commit の意味は不変。
-    ("sql/transaction.rs", 1438),
+    // Issue #1934（BEGIN READ ONLY の暫定ゲート除去・ensure_writer の 25006）の行削除でさらに移動（旧: 1438）。書き込み内容・commit の意味は不変。
+    ("sql/transaction.rs", 1432),
     // TABLE-44・Issue #1684: 一時表ストア（セッション専用のインメモリ DB。永続 DB とは別インスタンス）の
     // 書き込みトランザクションの確定口（`TempRowStore::commit`）。確定するのは、一時コアの書き込み本体
     // （`tenant::*`・`catalog::*`。いずれも自分の DB の表世代を `bump_table_generation_in_txn` で進める）が
