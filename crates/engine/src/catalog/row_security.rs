@@ -155,7 +155,6 @@ fn get_in_txn<R: ReadSource>(src: &R, table_key: &str, scope: &str) -> Result<Ro
 
 /// 書き込み・読み取り txn の中で `scope` の表 `table_key` の状態を引く（#2276 以降が同じスナップショットで
 /// 引く入口。存在しないカタログ表は作成しない）。
-#[allow(dead_code)] // 評価側（#2276）が使うまではテストからのみ呼ばれる。
 pub(crate) fn row_security_state_in_txn<R: ReadSource>(
     src: &R,
     scope: &str,
