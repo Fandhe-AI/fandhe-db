@@ -104,6 +104,8 @@ fn assert_describe_matches_execute(core: &EngineCore, ctx: &PolicyContext, sql: 
         | SqlOutcome::StartTransaction
         | SqlOutcome::Commit
         | SqlOutcome::Rollback
+        | SqlOutcome::Savepoint
+        | SqlOutcome::ReleaseSavepoint
         | SqlOutcome::DeclareCursor
         | SqlOutcome::Fetch(_)
         | SqlOutcome::CloseCursor

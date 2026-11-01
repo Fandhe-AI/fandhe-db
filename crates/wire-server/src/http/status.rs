@@ -203,6 +203,9 @@ pub const fn http_status(class: ErrorClass) -> u16 {
         | ErrorClass::ActiveSqlTransaction
         | ErrorClass::NoActiveSqlTransaction
         | ErrorClass::InFailedSqlTransaction
+        // `InvalidSavepointSpecification`（`3B001`。SQL-69・Issue #1942）も NoSQL 表層には
+        // トランザクション制御が無く到達しないが、クライアント側の状態誤りとして 400 に寄せる。
+        | ErrorClass::InvalidSavepointSpecification
         // `NotNullViolation`（`23502`。TABLE-16・TASK-204、Issue #904）は
         // `wire_code` を共有する `MissingOperationId` と同じくクライアント側の
         // 入力不備であり 400 とする。
@@ -256,7 +259,7 @@ mod tests {
 
     /// 期待表を明示的に列挙し、`ErrorClass::ALL` との突き合わせで非 vacuous に検証する。
     /// `match` にアームを足したが期待表の更新を忘れた、という乖離を (a)(b) が検出する。
-    const EXPECTED: [(ErrorClass, u16); 100] = [
+    const EXPECTED: [(ErrorClass, u16); 101] = [
         (ErrorClass::InvalidInput, 400),
         (ErrorClass::StringDataRightTruncation, 400),
         (ErrorClass::AuthInvalid, 401),
@@ -305,6 +308,7 @@ mod tests {
         (ErrorClass::DuplicateColumn, 400),
         (ErrorClass::InvalidColumnReference, 400),
         (ErrorClass::InvalidCursorName, 404),
+        (ErrorClass::InvalidSavepointSpecification, 400),
         (ErrorClass::NoDataFound, 404),
         (ErrorClass::TooManyRows, 400),
         (ErrorClass::CaseNotFound, 400),

@@ -470,7 +470,33 @@ pub fn classify_statement(stmt: &str) -> StatementEffect {
         Token::Ident(name)
             if name.eq_ignore_ascii_case("ROLLBACK") || name.eq_ignore_ascii_case("ABORT") =>
         {
-            StatementEffect::TransactionControl(crate::sql::transaction::TxnControl::Rollback)
+            // Issue #1942（SQL-69）: `ROLLBACK [WORK|TRANSACTION] TO ...` は Tx 全体の終了ではない。
+            // `Rollback` に分類すると `in_txn` を誤って倒すため、別の制御として区別する。
+            let after_kw = match tokens.get(1) {
+                Some(Token::Ident(n))
+                    if n.eq_ignore_ascii_case("WORK") || n.eq_ignore_ascii_case("TRANSACTION") =>
+                {
+                    tokens.get(2)
+                }
+                other => other,
+            };
+            if name.eq_ignore_ascii_case("ROLLBACK")
+                && matches!(after_kw, Some(Token::Ident(n)) if n.eq_ignore_ascii_case("TO"))
+            {
+                StatementEffect::TransactionControl(
+                    crate::sql::transaction::TxnControl::RollbackToSavepoint,
+                )
+            } else {
+                StatementEffect::TransactionControl(crate::sql::transaction::TxnControl::Rollback)
+            }
+        }
+        Token::Ident(name) if name.eq_ignore_ascii_case("SAVEPOINT") => {
+            StatementEffect::TransactionControl(crate::sql::transaction::TxnControl::Savepoint)
+        }
+        Token::Ident(name) if name.eq_ignore_ascii_case("RELEASE") => {
+            StatementEffect::TransactionControl(
+                crate::sql::transaction::TxnControl::ReleaseSavepoint,
+            )
         }
         Token::Ident(name) if name.eq_ignore_ascii_case("CREATE") => match tokens.get(1) {
             Some(Token::Ident(next)) if next.eq_ignore_ascii_case("FUNCTION") => {
@@ -1774,6 +1800,47 @@ mod tests {
             classify_statement("ROLLBACK"),
             StatementEffect::TransactionControl(crate::sql::transaction::TxnControl::Rollback)
         );
+        // Issue #1942（SQL-69）: savepoint 系は `ROLLBACK` と区別し、`in_txn` を変えない。
+        for (sql, ctrl) in [
+            (
+                "SAVEPOINT a",
+                crate::sql::transaction::TxnControl::Savepoint,
+            ),
+            (
+                "RELEASE SAVEPOINT a",
+                crate::sql::transaction::TxnControl::ReleaseSavepoint,
+            ),
+            (
+                "ROLLBACK TO a",
+                crate::sql::transaction::TxnControl::RollbackToSavepoint,
+            ),
+            (
+                "rollback work to savepoint a",
+                crate::sql::transaction::TxnControl::RollbackToSavepoint,
+            ),
+        ] {
+            assert_eq!(
+                classify_statement(sql),
+                StatementEffect::TransactionControl(ctrl),
+                "{sql}"
+            );
+        }
+        assert!(check_write_placement(
+            &[
+                "BEGIN",
+                "INSERT INTO t (id) VALUES (1)",
+                "ROLLBACK TO a",
+                "INSERT INTO t (id) VALUES (2)",
+                "COMMIT"
+            ],
+            false
+        )
+        .is_ok());
+        assert!(check_write_placement(
+            &["SAVEPOINT a", "INSERT INTO t (id) VALUES (1)", "SELECT 1"],
+            false
+        )
+        .is_err());
         assert_eq!(
             classify_statement("SELECT 'unterminated"),
             StatementEffect::Rejected
