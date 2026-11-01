@@ -8093,6 +8093,7 @@ impl EngineCore {
     ) -> Result<crate::sql::SqlOutcome, crate::sql::allowlist::SqlSurfaceError> {
         use crate::sql::allowlist::SqlSurfaceError;
         use crate::sql::cursor::CursorStatement;
+        use crate::sql::transaction::TxnReadSource;
 
         match stmt {
             CursorStatement::Declare { name, query } => {
@@ -8117,30 +8118,35 @@ impl EngineCore {
                 // する（PR #1049 レビュー指摘 codex P1 対応。
                 // `execute_cursor_inner_query` のドキュメント参照）。
                 let remaining_bytes = registry.remaining_bytes();
-                // 自トランザクションが未 commit の変更を持つ間（dirty テーブルあり）は
-                // 共有書き込みトランザクションを読み取り源にして内側 SELECT を実行し、
-                // 未 commit の変更を反映する（Issue #1179。キャッシュは使われない）。
-                // 変更がなければ従来どおり確定済みスナップショットで実行する。
-                let outcome = if txn.dirty_tables()?.is_empty() {
-                    let read_txn = self.begin_read_txn()?;
-                    self.execute_cursor_inner_query(
+                // 読み取り源は [`SessionTransaction::read_source`] の三分岐（SQL-19・SQL-31・
+                // Issue #2403）。writer 取得前は `BEGIN` 時点のスナップショット（DECLARE は
+                // 結果を具体化するので、取得前に宣言したカーソルは BEGIN 時点を保つ）、
+                // 取得後で dirty ありは共有 write txn（Issue #1179）、変更なしは文ごとの確定状態。
+                let outcome = match txn.read_source()? {
+                    TxnReadSource::BeginSnapshot(snap) => self.execute_cursor_inner_query(
                         ctx,
                         session,
                         &inner,
                         remaining_bytes,
-                        &read_txn,
-                    )?
-                } else {
-                    let write_txn = txn.write_txn().ok_or_else(|| SqlSurfaceError::Internal {
-                        detail: "internal error".to_string(),
-                    })?;
-                    self.execute_cursor_inner_query(
+                        snap,
+                    )?,
+                    TxnReadSource::Writer(write_txn) => self.execute_cursor_inner_query(
                         ctx,
                         session,
                         &inner,
                         remaining_bytes,
                         write_txn,
-                    )?
+                    )?,
+                    TxnReadSource::Committed => {
+                        let read_txn = self.begin_read_txn()?;
+                        self.execute_cursor_inner_query(
+                            ctx,
+                            session,
+                            &inner,
+                            remaining_bytes,
+                            &read_txn,
+                        )?
+                    }
                 };
                 let result = match outcome {
                     crate::sql::SqlOutcome::Query(result) => result,
@@ -8184,10 +8190,11 @@ impl EngineCore {
 
     /// 明示トランザクション内の読み取り系文（`Active` のときのみ呼ばれる）。
     ///
-    /// 自トランザクションが未 commit の変更を持たない（dirty テーブルなし）間は、
-    /// BEGIN 時点の確定済みスナップショットに対する通常の読み取り経路
-    /// （[`Self::execute_validated_in_session`]。キャッシュ利用可。単一ライタにより
-    /// スナップショットは BEGIN 時点と一致する）へ委譲する。変更を持つ間は、
+    /// 読み取り源は [`crate::sql::transaction::SessionTransaction::read_source`] の三分岐
+    /// （SQL-19・SQL-31・Issue #2403）。writer 取得前は `BEGIN` 時点のスナップショットを
+    /// [`Self::execute_read_statement`] へ渡す（キャッシュ利用可）。writer 取得後で dirty なしの間は
+    /// 通常の読み取り経路（[`Self::execute_validated_in_session`]。permit 保持中は確定状態が
+    /// 取得時点と一致する）へ委譲する。変更を持つ間は、
     /// 共有書き込みトランザクションを読み取り源（[`crate::storage::read_source::ReadSource`]）
     /// にして同じ実行本体（[`Self::execute_read_statement`]。RLS・束縛・実行は
     /// autocommit と共通）を呼び、自トランザクションの未 commit の変更を反映する
@@ -8213,21 +8220,42 @@ impl EngineCore {
         stmt: crate::sql::allowlist::Statement,
     ) -> Result<crate::sql::SqlOutcome, crate::sql::allowlist::SqlSurfaceError> {
         use crate::sql::allowlist::Statement;
+        use crate::sql::transaction::TxnReadSource;
 
         // SQL-43（Issue #1531）: 定数式 SELECT はテーブルを読まないため、dirty
         // テーブルの有無に関わらず autocommit と同じ実行本体へ直接委譲する。
         if matches!(stmt, Statement::ConstSelect(_)) {
             return self.execute_validated_in_session(ctx, session, stmt);
         }
-        let dirty = txn.dirty_tables()?;
-        if dirty.is_empty() {
-            return self.execute_validated_in_session(ctx, session, stmt);
-        }
-        let write_txn =
-            txn.write_txn()
-                .ok_or_else(|| crate::sql::allowlist::SqlSurfaceError::Internal {
-                    detail: "internal error".to_string(),
-                })?;
+        let write_txn = match txn.read_source()? {
+            // writer 取得前は `BEGIN` 時点のスナップショットで読む（SQL-19・SQL-31・Issue #2403）。
+            // `USING PLAN` の SELECT と `EXPLAIN` は自前で確定スナップショットを開く既存経路のまま
+            // （設計記録 explicit-transaction.md の既知の残り）。
+            TxnReadSource::BeginSnapshot(snap) => {
+                return match stmt {
+                    Statement::Select(ref v) if v.using_plan().is_some() => {
+                        self.execute_validated_in_session(ctx, session, stmt)
+                    }
+                    Statement::Explain(_) => self.execute_validated_in_session(ctx, session, stmt),
+                    Statement::Select(_)
+                    | Statement::Aggregate(_)
+                    | Statement::Scan(_)
+                    | Statement::SetOperation(_)
+                    | Statement::Join(_)
+                    | Statement::BufferedView(_) => {
+                        self.execute_read_statement(ctx, session, stmt, snap)
+                    }
+                    _ => Err(crate::sql::allowlist::SqlSurfaceError::Internal {
+                        detail: "unexpected statement in transactional read path".to_string(),
+                    }),
+                };
+            }
+            // writer 保持中で変更なし: permit により確定状態は取得時点と一致する。
+            TxnReadSource::Committed => {
+                return self.execute_validated_in_session(ctx, session, stmt);
+            }
+            TxnReadSource::Writer(w) => w,
+        };
         match stmt {
             Statement::Select(ref v) if v.using_plan().is_some() => {
                 self.execute_validated_with_dict(ctx, session, stmt, Some(write_txn))
@@ -12426,15 +12454,19 @@ impl EngineCore {
             // 自トランザクションが未 commit の変更を持つ間は、共有書き込み
             // トランザクションを読み取り源にして走査する（他の読み取り文と同じ
             // 方針。[`Self::read_only_in_active_txn`] 参照）。
-            if !txn.dirty_tables()?.is_empty() {
-                let write_txn = txn.write_txn().ok_or_else(|| {
-                    crate::sql::allowlist::SqlSurfaceError::Internal {
-                        detail: "internal error".to_string(),
-                    }
-                })?;
-                let schema = table_schema_in(write_txn, v.inner.table_name())?;
-                let result = self.run_copy_to_scan(write_txn, ctx, session, &schema, v)?;
-                return Ok(CopyPlan::To(v.format, result, v.options.clone()));
+            // writer 取得前は `BEGIN` 時点のスナップショットで走査する（SQL-19・Issue #2403）。
+            match txn.read_source()? {
+                crate::sql::transaction::TxnReadSource::BeginSnapshot(snap) => {
+                    let schema = table_schema_in(snap, v.inner.table_name())?;
+                    let result = self.run_copy_to_scan(snap, ctx, session, &schema, v)?;
+                    return Ok(CopyPlan::To(v.format, result, v.options.clone()));
+                }
+                crate::sql::transaction::TxnReadSource::Writer(write_txn) => {
+                    let schema = table_schema_in(write_txn, v.inner.table_name())?;
+                    let result = self.run_copy_to_scan(write_txn, ctx, session, &schema, v)?;
+                    return Ok(CopyPlan::To(v.format, result, v.options.clone()));
+                }
+                crate::sql::transaction::TxnReadSource::Committed => {}
             }
         }
         self.begin_copy_validated(ctx, session, stmt, txn.txn_start_micros())

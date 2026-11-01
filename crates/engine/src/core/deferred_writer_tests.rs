@@ -283,3 +283,31 @@ fn implicit_txn_snapshot_matches_committed_state_at_begin() {
     assert_eq!(read_gen(snapshot), read_gen(&fresh));
     txn.abort_implicit();
 }
+
+/// 読み取り源の三分岐（SQL-19・SQL-31・Issue #2403）。取得前は `BEGIN` 時点のスナップショット、
+/// 書き込み後は共有 write txn、`Idle` は fail-closed（`XX000`）。
+#[test]
+fn read_source_switches_between_begin_snapshot_and_writer() {
+    use crate::sql::transaction::TxnReadSource;
+    let (core, _g) = new_core("deferred-writer-read-source");
+    let caller = ctx("tenant-a");
+    let mut session = SessionState::default();
+    let mut txn = core.new_session_transaction();
+    assert_eq!(
+        txn.read_source().err().map(|e| e.wire_code().to_string()),
+        Some("XX000".to_string()),
+        "Idle must fail closed"
+    );
+    core.execute_sql_in_txn(&caller, &mut session, &mut txn, "BEGIN")
+        .expect("begin");
+    assert!(matches!(
+        txn.read_source(),
+        Ok(TxnReadSource::BeginSnapshot(_))
+    ));
+    core.execute_sql_in_txn(&caller, &mut session, &mut txn, &insert(1, "w1"))
+        .expect("insert");
+    assert!(matches!(txn.read_source(), Ok(TxnReadSource::Writer(_))));
+    core.execute_sql_in_txn(&caller, &mut session, &mut txn, "ROLLBACK")
+        .expect("rollback");
+    assert!(txn.read_source().is_err());
+}

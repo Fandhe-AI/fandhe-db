@@ -1,0 +1,254 @@
+//! 明示トランザクションの読み取りスナップショットの切り替え（Issue #2403。親 #2396・TASK-333）の
+//! 結合テスト。ポインタ: SQL-19・SQL-31（設計記録は `docs/design/explicit-transaction.md` 1a-2）。
+//!
+//! 確認する契約: (1) writer 取得前の読み取りは `BEGIN` 時点のスナップショットを見て、他セッションの
+//! commit で変わらない、(2) writer 取得後の述語評価・読み取りは取得時点の最新の確定状態に自分の
+//! 未 commit 変更を加えた状態を見る、(3) テナント境界は変わらない。#2405 の `40001` 判定が入っても
+//! 壊れないよう、取得前に読む表（`docs`）と他セッションが書く表（`docs2`）を分ける。
+//! 同一スレッドで順に実行し、時間計測に依存しない。
+
+use engine::core::{CopyPlan, EngineCore};
+use engine::kernel::CpuScalarProvider;
+use engine::policy::PolicyContext;
+use engine::sql::mode::SessionState;
+use engine::sql::transaction::SessionTransaction;
+use engine::sql::SqlOutcome;
+use engine::storage::{Storage, Visibility};
+
+use crate::legacy_table;
+use crate::temp_db;
+use legacy_table::LegacyExec as _;
+use temp_db::{unique_db_path, CleanupGuard};
+
+fn new_core(label: &str) -> (EngineCore, CleanupGuard) {
+    let path = unique_db_path(label);
+    let guard = CleanupGuard(path.clone());
+    let storage = Storage::open(&path).expect("open storage");
+    let core = EngineCore::from_storage(storage, Box::new(CpuScalarProvider));
+    let sys = ctx("sys");
+    ok(&core, &sys, "CREATE TABLE docs (n BIGINT)");
+    ok(&core, &sys, "CREATE TABLE docs2 (n BIGINT)");
+    (core, guard)
+}
+
+fn ctx(tenant: &str) -> PolicyContext {
+    PolicyContext::with_visibilities(tenant, [Visibility::Public, Visibility::Private])
+        .expect("valid tenant")
+}
+
+fn ok(core: &EngineCore, ctx: &PolicyContext, sql: &str) -> SqlOutcome {
+    let mut session = SessionState::default();
+    session.allow_ddl();
+    core.execute_sql_in_session_legacy(ctx, &mut session, sql)
+        .unwrap_or_else(|e| panic!("{sql} must succeed, got {e:?}"))
+}
+
+fn rows(outcome: SqlOutcome) -> Vec<String> {
+    match outcome {
+        SqlOutcome::Query(r) => {
+            let mut v: Vec<String> = r
+                .rows
+                .iter()
+                .map(|row| format!("{:?}", row.cells))
+                .collect();
+            v.sort();
+            v
+        }
+        other => panic!("expected Query outcome, got {other:?}"),
+    }
+}
+
+struct Tx<'e> {
+    core: &'e EngineCore,
+    ctx: PolicyContext,
+    session: SessionState,
+    txn: SessionTransaction<'e>,
+}
+
+impl<'e> Tx<'e> {
+    fn new(core: &'e EngineCore, tenant: &str) -> Self {
+        Self {
+            core,
+            ctx: ctx(tenant),
+            session: SessionState::default(),
+            txn: core.new_session_transaction(),
+        }
+    }
+
+    fn ok(&mut self, sql: &str) -> SqlOutcome {
+        self.core
+            .execute_sql_in_txn(&self.ctx, &mut self.session, &mut self.txn, sql)
+            .unwrap_or_else(|e| panic!("{sql} must succeed in the transaction, got {e:?}"))
+    }
+
+    fn rows(&mut self, sql: &str) -> Vec<String> {
+        rows(self.ok(sql))
+    }
+}
+
+fn seed_docs(core: &EngineCore, tenant: &str) {
+    ok(
+        core,
+        &ctx(tenant),
+        "INSERT INTO docs (id, n) VALUES (1, 10), (2, 20), (3, 30) USING OPERATION_ID 'seed'",
+    );
+}
+
+/// AC1: 取得後の述語形 UPDATE／DELETE は、取得前に他セッションが commit した行を対象に含む。
+#[test]
+fn predicate_dml_after_writer_acquire_sees_rows_committed_before_acquire() {
+    let (core, _g) = new_core("sql31-snap-ac1");
+    seed_docs(&core, "tenant-a");
+    let mut a = Tx::new(&core, "tenant-a");
+    a.ok("BEGIN");
+    a.rows("SELECT id FROM docs LIMIT 100");
+    ok(
+        &core,
+        &ctx("tenant-a"),
+        "INSERT INTO docs2 (id, n) VALUES (7, 1), (8, 5) USING OPERATION_ID 'b1'",
+    );
+    a.ok("UPDATE docs2 SET n = 2 WHERE n = 1 USING OPERATION_ID 'a-up'");
+    a.ok("DELETE FROM docs2 WHERE n = 5 USING OPERATION_ID 'a-del'");
+    a.ok("COMMIT");
+    let after = rows(ok(
+        &core,
+        &ctx("tenant-a"),
+        "SELECT id, n FROM docs2 LIMIT 100",
+    ));
+    assert_eq!(
+        after.len(),
+        1,
+        "DELETE must have removed the concurrently committed row: {after:?}"
+    );
+    assert!(
+        after[0].contains('2'),
+        "UPDATE must have changed n to 2: {after:?}"
+    );
+}
+
+/// AC1 補足: 取得後の読み取りは取得時点の最新状態と自分の変更を見る。
+#[test]
+fn reads_after_writer_acquire_see_latest_committed_and_own_writes() {
+    let (core, _g) = new_core("sql31-snap-after");
+    seed_docs(&core, "tenant-a");
+    let mut a = Tx::new(&core, "tenant-a");
+    a.ok("BEGIN");
+    assert_eq!(a.rows("SELECT id FROM docs LIMIT 100").len(), 3);
+    ok(
+        &core,
+        &ctx("tenant-a"),
+        "INSERT INTO docs2 (id, n) VALUES (7, 1) USING OPERATION_ID 'b1'",
+    );
+    a.ok("INSERT INTO docs (id, n) VALUES (4, 40) USING OPERATION_ID 'a1'");
+    assert_eq!(a.rows("SELECT id FROM docs2 LIMIT 100").len(), 1);
+    assert_eq!(a.rows("SELECT id FROM docs LIMIT 100").len(), 4);
+    a.ok("COMMIT");
+}
+
+/// AC2: 取得前の読み取り（Scan・集計・集合演算・カーソル・COPY TO）は他セッションの
+/// commit で変わらず、`COMMIT` の後は最新が見える。
+#[test]
+fn reads_before_writer_acquire_keep_begin_time_snapshot() {
+    let (core, _g) = new_core("sql31-snap-before");
+    seed_docs(&core, "tenant-a");
+    let mut a = Tx::new(&core, "tenant-a");
+    a.ok("BEGIN");
+    let scan = a.rows("SELECT id, n FROM docs LIMIT 100");
+    assert_eq!(scan.len(), 3);
+
+    let other = ctx("tenant-a");
+    ok(
+        &core,
+        &other,
+        "INSERT INTO docs (id, n) VALUES (4, 40) USING OPERATION_ID 'b-ins'",
+    );
+    ok(
+        &core,
+        &other,
+        "UPDATE docs SET n = 99 WHERE id = 1 USING OPERATION_ID 'b-up'",
+    );
+    ok(
+        &core,
+        &other,
+        "DELETE FROM docs WHERE id = 2 USING OPERATION_ID 'b-del'",
+    );
+
+    assert_eq!(a.rows("SELECT id, n FROM docs LIMIT 100"), scan);
+    let count = a.rows("SELECT COUNT(*) FROM docs");
+    assert!(count[0].contains('3'), "COUNT must stay at 3: {count:?}");
+    assert_eq!(
+        a.rows("SELECT id FROM docs UNION ALL SELECT id FROM docs2 LIMIT 100")
+            .len(),
+        3
+    );
+
+    a.ok("DECLARE c CURSOR FOR SELECT id, n FROM docs LIMIT 100");
+    match a.ok("FETCH 100 FROM c") {
+        SqlOutcome::Fetch(r) => assert_eq!(r.rows.len(), 3),
+        other => panic!("unexpected {other:?}"),
+    }
+
+    let plan = core
+        .begin_copy_in_txn(
+            &a.ctx,
+            &a.session,
+            &mut a.txn,
+            "COPY (SELECT id, n FROM docs LIMIT 100) TO STDOUT",
+        )
+        .expect("copy to");
+    match plan {
+        CopyPlan::To(_, result, _) => assert_eq!(result.rows.len(), 3),
+        other => panic!("unexpected {other:?}"),
+    }
+
+    a.ok("COMMIT");
+    let latest = rows(ok(&core, &other, "SELECT id, n FROM docs LIMIT 100"));
+    assert_ne!(latest, scan);
+    assert_eq!(latest.len(), 3);
+}
+
+/// テナント境界: 取得前の読み取りに他テナントの行は現れず、他テナントの書き込みも待たされない。
+#[test]
+fn begin_snapshot_reads_do_not_cross_tenants() {
+    let (core, _g) = new_core("sql31-snap-tenant");
+    seed_docs(&core, "tenant-a");
+    ok(
+        &core,
+        &ctx("tenant-b"),
+        "INSERT INTO docs (id, n) VALUES (50, 500) USING OPERATION_ID 'b-seed'",
+    );
+    let mut a = Tx::new(&core, "tenant-a");
+    a.ok("BEGIN");
+    let before = a.rows("SELECT id, n FROM docs LIMIT 100");
+    assert_eq!(before.len(), 3);
+    assert!(before.iter().all(|r| !r.contains("500")));
+    ok(
+        &core,
+        &ctx("tenant-b"),
+        "INSERT INTO docs (id, n) VALUES (51, 501) USING OPERATION_ID 'b-more'",
+    );
+    assert_eq!(a.rows("SELECT id, n FROM docs LIMIT 100"), before);
+    a.ok("COMMIT");
+}
+
+/// キャッシュ経路: 取得前の SELECT を繰り返しても BEGIN 時点を返し、別セッションは最新を返す。
+#[test]
+fn begin_snapshot_reads_do_not_poison_or_use_stale_cache() {
+    let (core, _g) = new_core("sql31-snap-cache");
+    seed_docs(&core, "tenant-a");
+    let caller = ctx("tenant-a");
+    let q = "SELECT id FROM docs LIMIT 100";
+    let mut a = Tx::new(&core, "tenant-a");
+    a.ok("BEGIN");
+    assert_eq!(a.rows(q).len(), 3);
+    assert_eq!(a.rows(q).len(), 3);
+    ok(
+        &core,
+        &caller,
+        "INSERT INTO docs (id, n) VALUES (4, 40) USING OPERATION_ID 'b1'",
+    );
+    assert_eq!(rows(ok(&core, &caller, q)).len(), 4);
+    assert_eq!(a.rows(q).len(), 3);
+    assert_eq!(rows(ok(&core, &caller, q)).len(), 4);
+    a.ok("COMMIT");
+}

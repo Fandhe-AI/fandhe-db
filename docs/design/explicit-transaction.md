@@ -346,9 +346,17 @@ Failed { session_at_begin: SessionState, expired: bool } }`）。`ActiveTxn` は
   - `ensure_writer` は 1a-3 の「gate 取得 → permit 保持のまま判定 → 格納」の挿入点で、#2405 が
     取得と格納の間に `40001` 判定を入れる。
   - 暗黙トランザクション（WIRE-16）は従来どおり開始時に writer を取る（スナップショットは取得後に開く。#2401）。
-  - **暫定の読み取りの意味**: スナップショット（`read_snapshot`）の結線は #2403 のため、writer 取得前の
-    読み取りは文ごとの確定済み状態を見る。後続の `40001` 判定にとっては、読みが `BEGIN` 時点より新しい
-    側へずれるだけで、偽陽性側にしか倒れず偽陰性は生まない。
+  - **読み取りの意味（#2403 で結線済み）**: 読み取り源は `SessionTransaction::read_source` の三分岐で選ぶ。
+    writer 取得前は `read_snapshot`（`BEGIN` 時点）、取得後で dirty ありは共有 write txn（取得時点の
+    最新＋自分の変更）、取得後で変更なしは文ごとの確定状態（permit 保持中は取得時点と一致）。
+    取得後の述語形 `UPDATE`／`DELETE` の述語評価は、取得時点の write txn で行うため、`BEGIN` 後・取得前に
+    他セッションが commit した行も対象に入る。`dirty_tables` の比較基準は最新の確定状態のままにする
+    （`read_snapshot` 基準にすると取得前に他セッションが書いた表まで dirty になり、キャッシュ回避と
+    遅延 FK 検査の範囲が不要に広がるため）。
+  - **既知の残り**: 取得前の `USING PLAN` の SELECT・`EXPLAIN` は自前で確定スナップショットを開く
+    既存経路のまま文ごとの確定状態を見る（`BEGIN` 時点への一般化は辞書スナップショットの構築変更を伴い
+    #2402 と競合するため見送り）。読みが `BEGIN` 時点より新しい側へずれるだけで、`40001` 判定には
+    偽陽性側にしか倒れず偽陰性は生まない。
   - DoS 面: `BEGIN` だけで黙る接続が単一ライタを占有できなくなる。一方、読み取りだけの Tx は
     `ReadTransaction` を最大 `max_duration` 保持し、その間は redb がページを回収できない（有界。
     期限切れ処理がスナップショットを解放する）。
@@ -442,7 +450,7 @@ Failed { session_at_begin: SessionState, expired: bool } }`）。`ActiveTxn` は
 > 改訂（#2396・1a）: 以下の「単一ライタにより BEGIN 時点と厳密に一致する」「BEGIN 以降カタログと
 > 世代は誰にも変えられない」という根拠は、writer を保持している間（取得後）にしか成り立たない。
 > writer 取得前は「`BEGIN` で開いた確定済み `ReadTransaction` に固定する」、取得後は「取得時点の
-> 最新状態＋自トランザクションの未 commit 変更を読む」（#2403）に差し替わる。`USING PLAN` の
+> 最新状態＋自トランザクションの未 commit 変更を読む」（#2403 で実装済み。三分岐は 4 節）に差し替わった。`USING PLAN` の
 > 世代の事前・事後照合も同じ考え方で書き直す。
 
 - 自トランザクションが未 commit の変更を持たない（`SessionTransaction::dirty_tables`
