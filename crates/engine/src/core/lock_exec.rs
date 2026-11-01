@@ -16,6 +16,7 @@ impl EngineCore {
     /// 開いている Tx の上で `LOCK` を実行する。
     pub(crate) fn execute_lock_in_active_txn(
         &self,
+        ctx: &crate::policy::PolicyContext,
         txn: &mut SessionTransaction<'_>,
         stmt: &ValidatedLockTable,
     ) -> Result<crate::sql::SqlOutcome, SqlSurfaceError> {
@@ -35,7 +36,7 @@ impl EngineCore {
                 );
             }
         }
-        txn.ensure_writer_with(stmt.nowait)?;
+        txn.ensure_writer_with(ctx, stmt.nowait)?;
         // writer 待機中に別セッションの DROP TABLE が確定しうるため、取得後に保持中の writer の
         // カタログで全対象表を再検証する（fail-closed。不在は取得前と同じ `42P01`／`42809`）。
         let write_txn = txn.write_txn().ok_or_else(|| SqlSurfaceError::Internal {

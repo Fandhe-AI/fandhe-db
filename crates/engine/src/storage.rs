@@ -1043,8 +1043,7 @@ impl Storage {
         Ok(())
     }
 
-    /// commit 記録（永続ストレージのみ）。#2405 の判定が照会する。
-    #[cfg_attr(not(test), allow(dead_code))]
+    /// commit 記録（永続ストレージのみ）。`ensure_writer_with` の `40001` 判定（#2405）が照会する。
     pub(crate) fn commit_log(&self) -> Option<&std::sync::Arc<commit_log::CommitLog>> {
         self.commit_log.as_ref()
     }

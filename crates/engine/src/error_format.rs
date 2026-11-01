@@ -249,7 +249,7 @@ define_error_classes! {
     /// 明示トランザクションの writer 取得時に、読み取りの前提が古くなっていたことを示す。
     /// `ROLLBACK` の後に最初から再試行してよい。文言は固定で、表名・テナント・件数を含めない。
     /// [`crate::sql::allowlist::SqlSurfaceError::SerializationFailure`] の写像
-    /// （送出経路の結線は TASK-333 の #2405）。
+    /// （送出は `SessionTransaction::ensure_writer_with`・TASK-333 の #2405）。
     SerializationFailure => ("40001", "SERIALIZATION_FAILURE"),
     /// 前提状態を満たさない対象への操作（`55000`）。TABLE-42・Issue #1664 が追加。
     /// 未実体化の MATERIALIZED VIEW（`WITH NO DATA`、または読み手の文脈に実体が無い）を

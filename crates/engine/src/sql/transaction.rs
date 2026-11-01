@@ -1073,18 +1073,31 @@ impl<'e> SessionTransaction<'e> {
     ///   取得前は何も書いていないので副作用は無い。
     /// - `Idle`／`Failed`・READ ONLY は呼び出し側の不変条件違反として `XX000`（fail-closed。
     ///   READ ONLY は #1934 が `25006` へ置き換える）。
-    /// - 将来 #2405 が「gate 取得 → permit 保持のまま `40001` 判定 → 格納」の判定を
-    ///   取得と格納の間へ挿入する地点である。
-    pub(crate) fn ensure_writer(&mut self) -> Result<(), SqlSurfaceError> {
-        self.ensure_writer_with(false)
+    /// - gate 取得後、permit を保持したまま読み取り集合と後続 commit の書き込みを突き合わせ、
+    ///   衝突なら `40001`（#2405。[`Self::ensure_writer_with`]）。`ctx` は書き込み文を実行する
+    ///   接続の `PolicyContext` で、可視性の判定に使う。
+    pub(crate) fn ensure_writer(
+        &mut self,
+        ctx: &crate::policy::PolicyContext,
+    ) -> Result<(), SqlSurfaceError> {
+        self.ensure_writer_with(ctx, false)
     }
 
     /// [`Self::ensure_writer`] の `nowait` 指定版（`LOCK TABLE ... NOWAIT`・Issue #1958 の入口）。
     /// `nowait` なら待機せず即時に取得を試み、失敗は `55P03`。取得済みならゲートに触れず `Ok`
     /// （同一スレッドでの permit 再取得は必ず `55P03` になるためこの短絡は必須）。
-    /// 取得経路を 1 本に保つため、`40001` 判定の挿入地点もここ（#2405）。
-    pub(crate) fn ensure_writer_with(&mut self, nowait: bool) -> Result<(), SqlSurfaceError> {
-        match &mut self.state {
+    /// 取得経路を 1 本に保つため、`40001` 判定もここで行う（#2405）。
+    ///
+    /// 判定は行・台帳・カタログ・世代へ何も書く前に、permit を保持したまま行う。読み取り集合が
+    /// 空なら判定しない。`G_s` と取得時点の世代の間の commit 記録が得られない（記録なし・
+    /// 床より古い・欠け・汚染）場合と、世代の読み取り失敗（`XX000`）は拒否側に倒す。
+    /// 衝突なら `ActiveTxn` を drop（write txn の abort → permit 解放）して `Failed` へ遷移する。
+    pub(crate) fn ensure_writer_with(
+        &mut self,
+        ctx: &crate::policy::PolicyContext,
+        nowait: bool,
+    ) -> Result<(), SqlSurfaceError> {
+        let conflict = match &mut self.state {
             TxnState::Active(active) => {
                 if active.writer.is_some() {
                     return Ok(());
@@ -1104,12 +1117,47 @@ impl<'e> SessionTransaction<'e> {
                 if let Some(set) = crate::sql::read_set::disarm_current() {
                     active.read_set.merge(set);
                 }
-                // #2405 の `40001` 判定は、ここ（writer を格納した後）と登録を外す間に差し込む。
-                // 登録は判定が必要とする記録を刈り込ませないため、格納の後に外す。
-                active.registration = None;
-                Ok(())
+                // `40001` 判定（#2405）。登録は判定が必要とする記録を刈り込ませないため、
+                // 判定が済むまで外さない。
+                Self::detect_serialization_conflict(active, ctx)?
             }
-            _ => Err(internal_error()),
+            _ => return Err(internal_error()),
+        };
+        if conflict {
+            return Err(self.fail_with_serialization_failure());
+        }
+        if let TxnState::Active(active) = &mut self.state {
+            active.registration = None;
+        }
+        Ok(())
+    }
+
+    /// writer 取得直後（permit 保持中）に、読み取り集合と `G_s` 以降の commit 記録の衝突を判定する。
+    /// 衝突（または判定不能）なら `Ok(true)`。
+    fn detect_serialization_conflict(
+        active: &ActiveTxn<'_>,
+        ctx: &crate::policy::PolicyContext,
+    ) -> Result<bool, SqlSurfaceError> {
+        if active.read_set.is_empty() {
+            return Ok(false);
+        }
+        let g_now = active
+            .storage
+            .current_generation()
+            .map_err(|_| internal_error())?;
+        if g_now <= active.snapshot_generation {
+            return Ok(false);
+        }
+        let Some(log) = active.storage.commit_log() else {
+            return Ok(true);
+        };
+        match log.records_between(active.snapshot_generation, g_now) {
+            Ok(records) => Ok(crate::storage::commit_log::conflicts_with(
+                &active.read_set,
+                &records,
+                ctx,
+            )),
+            Err(_) => Ok(true),
         }
     }
 
@@ -1159,7 +1207,7 @@ impl<'e> SessionTransaction<'e> {
         }
     }
 
-    /// writer 取得前に読んだ基底表の集合（`Active` のときのみ `Some`。#2405 の判定が使う）。
+    /// writer 取得前に読んだ基底表の集合（`Active` のときのみ `Some`。判定本体は `ActiveTxn` を直接読むため、テストの観測用）。
     #[cfg_attr(not(test), allow(dead_code))]
     pub(crate) fn read_set(&self) -> Option<&crate::sql::read_set::ReadSet> {
         match &self.state {
@@ -1228,8 +1276,7 @@ impl<'e> SessionTransaction<'e> {
     /// 遷移の規則は [`Self::fail`] に委ねる（`Active` 以外では状態を変えない冪等動作、
     /// 暗黙トランザクションは `Idle` へ戻る）。`write_txn` は drop（abort）されるため
     /// 行・台帳・カタログに副作用は残らない。以降は `Failed` ゲートが `ROLLBACK` 以外を
-    /// `25P02` で拒否する。判定ロジックと呼び出しは #2405 が結線する。
-    #[cfg_attr(not(test), allow(dead_code))]
+    /// `25P02` で拒否する。`ensure_writer_with` の判定（#2405）が呼ぶ。
     pub(crate) fn fail_with_serialization_failure(&mut self) -> SqlSurfaceError {
         self.fail();
         SqlSurfaceError::SerializationFailure
@@ -1486,6 +1533,10 @@ fn map_write_lock_err(e: crate::storage::StorageError) -> SqlSurfaceError {
 
 #[cfg(test)]
 mod tests {
+    /// `ensure_writer` に渡す書き込み接続の文脈（テスト用）。
+    fn test_ctx() -> crate::policy::PolicyContext {
+        crate::policy::PolicyContext::new("alice").expect("ctx")
+    }
 
     #[test]
     fn limits_default_matches_constants() {
@@ -1941,7 +1992,7 @@ mod tests {
         assert!(txn.write_txn().is_none() && txn.read_snapshot().is_none());
 
         txn.begin(&storage, &session).expect("begin");
-        txn.ensure_writer().expect("ensure writer");
+        txn.ensure_writer(&test_ctx()).expect("ensure writer");
         assert!(txn.write_txn().is_some() && txn.read_snapshot().is_some());
         txn.fail();
         assert_eq!(txn.status(), TransactionStatus::Failed);
@@ -1962,20 +2013,20 @@ mod tests {
         let mut session = SessionState::default();
         let mut txn = SessionTransaction::new(TransactionLimits::default());
         assert!(matches!(
-            txn.ensure_writer(),
+            txn.ensure_writer(&test_ctx()),
             Err(SqlSurfaceError::Internal { .. })
         ));
         txn.begin(&storage, &session).expect("begin");
         let before = storage.write_txn_creations();
-        txn.ensure_writer().expect("first");
-        txn.ensure_writer().expect("second");
+        txn.ensure_writer(&test_ctx()).expect("first");
+        txn.ensure_writer(&test_ctx()).expect("second");
         assert_eq!(storage.write_txn_creations(), before + 1);
         // 書き込みなしの COMMIT は成功する。
         txn.commit(&mut session).expect("commit");
         txn.begin(&storage, &session).expect("begin");
         txn.fail();
         assert!(matches!(
-            txn.ensure_writer(),
+            txn.ensure_writer(&test_ctx()),
             Err(SqlSurfaceError::Internal { .. })
         ));
     }
@@ -1995,7 +2046,7 @@ mod tests {
             let handle = scope.spawn(move || {
                 let mut other = SessionTransaction::new(TransactionLimits::default());
                 other.begin(storage, &session).expect("begin does not wait");
-                let err = other.ensure_writer().expect_err("timeout");
+                let err = other.ensure_writer(&test_ctx()).expect_err("timeout");
                 assert!(matches!(err, SqlSurfaceError::LockNotAvailable));
                 assert!(other.write_txn().is_none());
                 tx_done.send(()).expect("send");
@@ -2006,7 +2057,8 @@ mod tests {
         drop(holder);
         txn.begin(&storage, &SessionState::default())
             .expect("begin");
-        txn.ensure_writer().expect("acquire after release");
+        txn.ensure_writer(&test_ctx())
+            .expect("acquire after release");
     }
 
     /// `BEGIN` 直後のスナップショットは、新たに開いた確定済み読み取りと同じ世代を指す
@@ -2070,10 +2122,11 @@ mod tests {
         let session = SessionState::default();
         let mut txn = SessionTransaction::new(TransactionLimits::default());
         txn.begin(&storage, &session).expect("begin");
-        txn.ensure_writer_with(false).expect("acquire");
+        txn.ensure_writer_with(&test_ctx(), false).expect("acquire");
         let created = storage.write_txn_creations();
-        txn.ensure_writer_with(false).expect("blocking");
-        txn.ensure_writer_with(true).expect("nowait");
+        txn.ensure_writer_with(&test_ctx(), false)
+            .expect("blocking");
+        txn.ensure_writer_with(&test_ctx(), true).expect("nowait");
         assert_eq!(storage.write_txn_creations(), created);
         assert!(txn.write_txn().is_some());
     }
@@ -2090,7 +2143,8 @@ mod tests {
                 drop(active.writer.take());
             }
             assert!(txn.write_txn().is_none());
-            txn.ensure_writer_with(nowait).expect("acquire");
+            txn.ensure_writer_with(&test_ctx(), nowait)
+                .expect("acquire");
             assert!(txn.write_txn().is_some());
         }
     }
@@ -2118,13 +2172,16 @@ mod tests {
             });
             held_rx.recv().expect("held");
             for nowait in [true, false] {
-                let err = txn.ensure_writer_with(nowait).expect_err("held elsewhere");
+                let err = txn
+                    .ensure_writer_with(&test_ctx(), nowait)
+                    .expect_err("held elsewhere");
                 assert!(matches!(err, SqlSurfaceError::LockNotAvailable), "{nowait}");
                 assert!(txn.write_txn().is_none());
             }
             done_tx.send(()).expect("release");
         });
-        txn.ensure_writer_with(true).expect("free after release");
+        txn.ensure_writer_with(&test_ctx(), true)
+            .expect("free after release");
     }
 
     /// `Active` 以外で呼ぶと `XX000`（fail-closed。Issue #1958）。
@@ -2132,7 +2189,7 @@ mod tests {
     fn ensure_writer_outside_transaction_is_internal_error() {
         let mut txn = SessionTransaction::new(TransactionLimits::default());
         assert!(matches!(
-            txn.ensure_writer_with(false),
+            txn.ensure_writer_with(&test_ctx(), false),
             Err(SqlSurfaceError::Internal { .. })
         ));
     }
