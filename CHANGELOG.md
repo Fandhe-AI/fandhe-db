@@ -9,6 +9,8 @@
 
 ### Added
 
+- `SELECT` の行ロック句（`FOR UPDATE`／`FOR NO KEY UPDATE`／`FOR SHARE`／`FOR KEY SHARE`、`OF <名前>[, ...]`、`NOWAIT`／`SKIP LOCKED`）を構文解釈する（Issue #1957・SQL-38）。解析結果は新しい `sql::row_lock`（`LockingSelect`・`RowLocking`・`RowLockClause`・`LockStrength`・`LockWaitPolicy`）の型で `ParsedSql::LockingSelect` として実行計画へ渡す。`DISTINCT`・`GROUP BY`・`HAVING`・集計・ウィンドウ関数・集合演算・外部結合で NULL を補う側との併用は `0A000`、`OF` が FROM の参照名に無ければ `42P01`。ロックの取得は #2230、`SKIP LOCKED` の実行は #2231 の担当で、それまで実行入口は `0A000` の暫定ゲートで拒否する。詳細は [explicit-transaction.md](docs/design/explicit-transaction.md)。
+  挙動変更: 受理する形と併用違反は `42601` から `0A000`（`OF` の解決失敗は `42P01`）になった（構文誤りは従来どおり `42601`）。公開 enum `ParsedSql` に `LockingSelect` を追加した（BREAKING CHANGE）。
 - `CREATE [OR REPLACE] FUNCTION` が SQL 標準形の関数本体 `RETURN <式>`・`BEGIN ATOMIC <文>; ... END` を受理する（Issue #2219・SQL-67 (2)。`LANGUAGE` 省略は sql）。標準形は定義時に名前を解決して参照先への依存辺を記録し、参照先の DROP・改名・列変更を `2BP01` で止める（CASCADE でも。連鎖削除・改名への追随は未対応）。簡易クエリの複数文メッセージは本体内の `;` で分割しない。詳細は [plpgsql-subset.md](docs/design/plpgsql-subset.md)。
   公開 enum `CreateFunctionBody` に `SqlStandard` を追加した（BREAKING CHANGE）。
 - WASM UDF サンドボックスの資源上限を追加した（Issue #1927・EXT-6／EXT-9）。`wasm_udf::SandboxLimits` に `fuel` を追加（BREAKING: 公開フィールドの追加）、`SandboxLimits::clamped`・`HARD_MAX_*`・`validate_wasm_*`・`WasmLimitOutOfRange`・`TrapKind::FuelExhausted`・`EngineCore::with_wasm_limits`／`wasm_limits` を追加した。`wasm-udf` ビルドでは epoch ティッカーで実行時間上限が効き、実行時の上限超過は `54000`（従来は `22000`）。起動フラグ `--wasm-max-memory-bytes`・`--wasm-max-call-duration-ms`・`--wasm-max-fuel`（下げる方向だけ）を追加。
