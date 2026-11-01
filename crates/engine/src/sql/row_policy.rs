@@ -138,7 +138,7 @@ fn unresolvable() -> SqlSurfaceError {
 
 /// `scope`（テナント）の表 `table_key` に利用者ポリシーが適用されるか。判定は書き込みと同じ単一の判定点
 /// （`policy_applicability::decide`）で行い、RLS 有効かつ `row_security = off` のときは行の探索・返却より前に
-/// `42501`（`InsufficientPrivilege`）で拒否する（部分的な結果を黙って返さない。RLS-13・Issue #2278）。
+/// `42501`（`RowSecurityOffRejected`）で拒否する（部分的な結果を黙って返さない。RLS-13・Issue #2278）。
 /// 所有者の扱いは暫定で常に `false`（モジュールドキュメント参照）。
 pub(crate) fn policies_apply<R: ReadSource>(
     src: &R,
@@ -151,7 +151,9 @@ pub(crate) fn policies_apply<R: ReadSource>(
     match crate::sql::policy_eval::user_policies_decision_for_write(state) {
         PolicyDecision::Skip => Ok(false),
         PolicyDecision::Apply => Ok(true),
-        PolicyDecision::RejectRowSecurityOff => Err(SqlSurfaceError::InsufficientPrivilege),
+        PolicyDecision::RejectRowSecurityOff => Err(SqlSurfaceError::RowSecurityOffRejected {
+            table: table_key.to_string(),
+        }),
     }
 }
 

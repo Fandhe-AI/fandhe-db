@@ -4385,6 +4385,9 @@ pub(crate) fn map_write_error(
             policy,
             using_expression,
         },
+        TenantWriteError::RowSecurityOffRejected { table } => {
+            SqlSurfaceError::RowSecurityOffRejected { table }
+        }
         // `PRIMARY KEY`（Issue #903）・UNIQUE 制約（Issue #905。TABLE-16・TASK-204）のテナント内一意性制約
         // 違反。行キー衝突（`IdConflict`）と原因は異なるが `23505` は共有する。
         TenantWriteError::UniqueViolation => SqlSurfaceError::unique_violation(),
@@ -5964,6 +5967,9 @@ fn map_incremental_error(e: crate::incremental::IncrementalError) -> SqlSurfaceE
             policy,
             using_expression,
         },
+        IncrementalError::Write(TenantWriteError::RowSecurityOffRejected { table }) => {
+            SqlSurfaceError::RowSecurityOffRejected { table }
+        }
         IncrementalError::Write(TenantWriteError::WithCheckOptionViolation) => {
             SqlSurfaceError::WithCheckOptionViolation
         }

@@ -236,3 +236,123 @@ fn rls13_row_security_off_rejects_reads_and_deletes() {
     ok(&core, "alice", &mut s, "SELECT id FROM plain");
     ok(&core, "alice", &mut s, "DELETE FROM plain WHERE id = 1");
 }
+
+const OFF_MSG: &str = "query would be affected by row-level security policy for table \"t\"";
+
+/// RLS-13: `row_security = off` の拒否は専用の `42501` 文言（PostgreSQL と同形・自テナントの表名入り）で、
+/// 読み取り・DELETE・INSERT のどれでも `WITH CHECK` 違反や DDL 権限の文言にならない。
+#[test]
+fn rls13_row_security_off_rejection_message_names_own_table() {
+    let (core, _g) = new_core("rls13-rs-off-msg");
+    let mut s = SessionState::default();
+    s.allow_ddl();
+    for sql in [
+        "CREATE TABLE t (id BIGINT PRIMARY KEY, name TEXT)",
+        "ALTER TABLE t ENABLE ROW LEVEL SECURITY",
+        "CREATE POLICY p ON t FOR ALL USING (true) WITH CHECK (true)",
+        "SET row_security = off",
+    ] {
+        ok(&core, "alice", &mut s, sql);
+    }
+    for sql in [
+        "SELECT id FROM t",
+        "DELETE FROM t WHERE id = 1",
+        "UPDATE t SET name = 'x' WHERE false",
+        "INSERT INTO t (id, name) VALUES (1, 'a')",
+    ] {
+        let err = core
+            .execute_sql_in_session(&ctx("alice"), &mut s, sql)
+            .expect_err(sql);
+        assert_eq!(err.wire_code(), "42501", "{sql}");
+        assert_eq!(err.client_message(), OFF_MSG, "{sql}");
+    }
+    // RLS の有効化状態は呼び出しテナントごとに引く。別テナントは自分の状態（未有効化）で判定され、
+    // alice の拒否も表名も観測できない（`row_security = off` でも通常どおり成功する）。
+    let mut other = SessionState::default();
+    ok(&core, "bob", &mut other, "SET row_security = off");
+    ok(&core, "bob", &mut other, "SELECT id FROM t");
+}
+
+/// RLS-13: `COPY ... TO STDOUT`（表形・`(SELECT ...)` 形）も、自動コミット・明示トランザクション（writer 取得前・
+/// 後）のすべてで `row_security = off` を反映し、ポリシーで絞った結果を黙って返さず `42501` で拒否する。
+#[test]
+fn rls13_row_security_off_rejects_copy_to_in_all_forms() {
+    let (core, _g) = new_core("rls13-rs-off-copy-to");
+    let mut s = SessionState::default();
+    s.allow_ddl();
+    for sql in [
+        "CREATE TABLE t (id BIGINT PRIMARY KEY, name TEXT)",
+        "CREATE TABLE plain (id BIGINT PRIMARY KEY, name TEXT)",
+        "INSERT INTO t (id, name) VALUES (1, 'a')",
+        "ALTER TABLE t ENABLE ROW LEVEL SECURITY",
+        "CREATE POLICY p ON t FOR ALL USING (id = 1)",
+    ] {
+        ok(&core, "alice", &mut s, sql);
+    }
+    let c = ctx("alice");
+    let forms = ["COPY t TO STDOUT", "COPY (SELECT id FROM t) TO STDOUT"];
+    // 対照: on ならポリシーで絞った結果を返す。
+    for sql in forms {
+        core.begin_copy(&c, &s, sql)
+            .unwrap_or_else(|e| panic!("{sql}: {e}"));
+    }
+    ok(&core, "alice", &mut s, "SET row_security = off");
+    for sql in forms {
+        let err = core.begin_copy(&c, &s, sql).map(|_| ()).expect_err(sql);
+        assert_eq!(err.wire_code(), "42501", "autocommit {sql}");
+        assert_eq!(err.client_message(), OFF_MSG, "autocommit {sql}");
+
+        // Idle の `begin_copy_in_txn`・writer 取得前の明示トランザクション。
+        let mut txn = core.new_session_transaction();
+        let err = core
+            .begin_copy_in_txn(&c, &s, &mut txn, sql)
+            .map(|_| ())
+            .expect_err(sql);
+        assert_eq!(err.wire_code(), "42501", "idle-txn {sql}");
+        assert_eq!(err.client_message(), OFF_MSG, "idle-txn {sql}");
+
+        let mut txn = core.new_session_transaction();
+        ok_txn(&core, &mut s, &mut txn, "BEGIN");
+        let err = core
+            .begin_copy_in_txn(&c, &s, &mut txn, sql)
+            .map(|_| ())
+            .expect_err(sql);
+        assert_eq!(err.wire_code(), "42501", "explicit {sql}");
+        assert_eq!(err.client_message(), OFF_MSG, "explicit {sql}");
+
+        // writer 取得後（未 commit の書き込みを持つ Tx）。
+        let mut txn = core.new_session_transaction();
+        ok_txn(&core, &mut s, &mut txn, "BEGIN");
+        ok_txn(
+            &core,
+            &mut s,
+            &mut txn,
+            "INSERT INTO plain (id, name) VALUES (9, 'z')",
+        );
+        let err = core
+            .begin_copy_in_txn(&c, &s, &mut txn, sql)
+            .map(|_| ())
+            .expect_err(sql);
+        assert_eq!(err.wire_code(), "42501", "writer {sql}");
+        assert_eq!(err.client_message(), OFF_MSG, "writer {sql}");
+    }
+    // RLS 無効な表の COPY TO は off でも影響を受けない。
+    core.begin_copy(&c, &s, "COPY plain TO STDOUT")
+        .expect("plain");
+    // on へ戻せば再び成功する。
+    ok(&core, "alice", &mut s, "SET row_security = on");
+    for sql in forms {
+        core.begin_copy(&c, &s, sql)
+            .unwrap_or_else(|e| panic!("{sql}: {e}"));
+    }
+}
+
+fn ok_txn<'e>(
+    core: &'e EngineCore,
+    s: &mut SessionState,
+    txn: &mut engine::sql::transaction::SessionTransaction<'e>,
+    sql: &str,
+) {
+    core.execute_sql_in_txn(&ctx("alice"), s, txn, sql)
+        .unwrap_or_else(|e| panic!("{sql}: {} {e}", e.wire_code()));
+}

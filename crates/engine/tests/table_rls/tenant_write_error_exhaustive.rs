@@ -31,9 +31,8 @@ fn expected_class(e: &TenantWriteError) -> ErrorClass {
     match e {
         TenantWriteError::Forbidden => ErrorClass::ForbiddenTenantMismatch,
         TenantWriteError::ConflictTargetNotVisible
-        | TenantWriteError::RowSecurityPolicyViolation { .. } => {
-            ErrorClass::ForbiddenTenantMismatch
-        }
+        | TenantWriteError::RowSecurityPolicyViolation { .. }
+        | TenantWriteError::RowSecurityOffRejected { .. } => ErrorClass::ForbiddenTenantMismatch,
         TenantWriteError::NotFound => ErrorClass::RowNotFound,
         TenantWriteError::IdConflict => ErrorClass::UniqueViolation,
         TenantWriteError::MissingOperationId => ErrorClass::MissingOperationId,
@@ -112,6 +111,9 @@ fn tenant_write_error_class_matches_expected_for_constructible_variants() {
         }),
         TenantWriteError::WriteLockTimeout,
         TenantWriteError::ConflictTargetNotVisible,
+        TenantWriteError::RowSecurityOffRejected {
+            table: "t".to_string(),
+        },
         TenantWriteError::RowSecurityPolicyViolation {
             table: "t".to_string(),
             policy: Some("p".to_string()),

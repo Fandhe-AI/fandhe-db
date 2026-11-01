@@ -412,6 +412,12 @@ pub enum TenantWriteError {
         policy: Option<String>,
         using_expression: bool,
     },
+    /// `row_security = off` のセッションが RLS 有効な自テナントの表へ書き込もうとした拒否
+    /// （RLS-13・Issue #2278）。行の探索・書き込みより前に返し、`write_txn` は commit されない。
+    /// `42501`（`ForbiddenTenantMismatch`）。PostgreSQL と同じ
+    /// `query would be affected by row-level security policy for table "..."` で、保持するのは
+    /// 自テナントの表名だけ（`WITH CHECK` 違反とは別 variant）。
+    RowSecurityOffRejected { table: String },
     /// 上記と同じ commit 前 abort 契約だが、原因が `RETURNING` 結果セットの
     /// バイト量上限超過（`sql::returning::MAX_RETURNING_RESULT_BYTES`）である
     /// 場合の専用 variant。`54000`（`PayloadTooLarge`）へ写像し、クライアントが
@@ -706,7 +712,8 @@ impl crate::error_format::ClassifiedError for TenantWriteError {
         match self {
             TenantWriteError::Forbidden => ErrorClass::ForbiddenTenantMismatch,
             TenantWriteError::ConflictTargetNotVisible
-            | TenantWriteError::RowSecurityPolicyViolation { .. } => {
+            | TenantWriteError::RowSecurityPolicyViolation { .. }
+            | TenantWriteError::RowSecurityOffRejected { .. } => {
                 ErrorClass::ForbiddenTenantMismatch
             }
             TenantWriteError::NotFound => ErrorClass::RowNotFound,
@@ -806,6 +813,10 @@ impl std::fmt::Display for TenantWriteError {
                 policy.as_deref(),
                 *using_expression,
             )),
+            TenantWriteError::RowSecurityOffRejected { table } => write!(
+                f,
+                "query would be affected by row-level security policy for table \"{table}\""
+            ),
             TenantWriteError::NotFound => write!(f, "tenant write target row not found"),
             TenantWriteError::IdConflict => write!(f, "tenant write id conflict"),
             TenantWriteError::MissingOperationId => write!(f, "missing operation_id"),
@@ -902,6 +913,9 @@ impl std::fmt::Debug for TenantWriteError {
         match self {
             TenantWriteError::Forbidden => f.write_str("Forbidden"),
             TenantWriteError::ConflictTargetNotVisible => f.write_str("ConflictTargetNotVisible"),
+            TenantWriteError::RowSecurityOffRejected { .. } => {
+                f.write_str("RowSecurityOffRejected")
+            }
             TenantWriteError::RowSecurityPolicyViolation { .. } => {
                 f.write_str("RowSecurityPolicyViolation")
             }

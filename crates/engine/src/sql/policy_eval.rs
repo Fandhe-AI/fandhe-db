@@ -193,10 +193,8 @@ pub(crate) fn reject_row_security_off_in_txn(
     let state =
         crate::catalog::row_security::row_security_state_in_txn(write_txn, tenant_id, table)?;
     match user_policies_decision_for_write(state) {
-        PolicyDecision::RejectRowSecurityOff => Err(TenantWriteError::RowSecurityPolicyViolation {
+        PolicyDecision::RejectRowSecurityOff => Err(TenantWriteError::RowSecurityOffRejected {
             table: table.to_string(),
-            policy: None,
-            using_expression: false,
         }),
         PolicyDecision::Skip | PolicyDecision::Apply => Ok(()),
     }
@@ -220,10 +218,8 @@ pub(crate) fn compile_in_txn(
         // `row_security = off` で適用されるはずの文は、コンパイル時点（行を書く前）に文全体を `42501` で
         // 拒否する。ポリシーの素通りには使えない（fail-closed）。
         PolicyDecision::RejectRowSecurityOff => {
-            return Err(TenantWriteError::RowSecurityPolicyViolation {
+            return Err(TenantWriteError::RowSecurityOffRejected {
                 table: table.to_string(),
-                policy: None,
-                using_expression: false,
             })
         }
     }

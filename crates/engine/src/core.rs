@@ -13206,6 +13206,11 @@ impl EngineCore {
         sql: &str,
     ) -> Result<CopyPlan, crate::sql::allowlist::SqlSurfaceError> {
         Self::check_resolution_tenant(session, ctx)?;
+        // RLS-13・Issue #2278: `COPY ... TO` の走査（`run_copy_to_scan`）が読む利用者ポリシーの適用判定は
+        // スレッドローカルの `row_security` を参照する。入口にセッション値を束縛し、`row_security = off`
+        // の後でも既定の on として絞った結果を黙って返さない（RLS 有効な表は走査前に `42501`）。
+        let _row_security_scope =
+            crate::sql::policy_applicability::RowSecurityScope::enter(session.row_security());
         self.begin_copy_unscrubbed(ctx, session, sql)
             .map_err(|e| self.scrub_error(ctx, e))
     }
@@ -13294,6 +13299,10 @@ impl EngineCore {
         sql: &str,
     ) -> Result<CopyPlan, crate::sql::allowlist::SqlSurfaceError> {
         Self::check_resolution_tenant(session, ctx)?;
+        // 自動コミット（`Idle`）・明示トランザクションのどちらの `COPY ... TO` 走査にも束縛する
+        // （[`Self::begin_copy`] と同じ理由）。
+        let _row_security_scope =
+            crate::sql::policy_applicability::RowSecurityScope::enter(session.row_security());
         self.begin_copy_in_txn_unscrubbed(ctx, session, txn, sql)
             .map_err(|e| self.scrub_error(ctx, e))
     }

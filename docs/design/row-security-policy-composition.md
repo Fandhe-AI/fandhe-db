@@ -251,7 +251,14 @@
   `row_security = off` の表への INSERT・UPDATE・UPSERT・COPY は行を書く前に `42501` で拒否する。`row_security` は
   `SessionState` を持たない検査点へ、文の実行区間の RAII（`RowSecurityScope`。`session_time_zone_scope` と同じ張り方。
   スコープ外の NoSQL・内部書き込みは on）で渡す
-- 読み取り側（#2276）は未マージのため `decide` への結線は #2276 側で行う（`RejectRowSecurityOff` は行を読む前に文全体を拒否する）
+- 読み取り側（#2276）も結線済み: `sql::row_policy::policies_apply` が書き込み側と同じ判定（`decide`）へ接続され、
+  RLS 有効かつ `row_security = off` の表は行を読む前に文全体を拒否する。`COPY ... TO`（`COPY (SELECT ...) TO` を含む）は
+  入口（`begin_copy`・`begin_copy_in_txn`）でセッション値を `RowSecurityScope` に束縛するため、自動コミット・明示
+  トランザクションのどちらでも off が反映される。残作業はロール・所有者・`BYPASSRLS` 属性の実値の供給（下の各 Issue）のみ
+- 拒否の文言は PG と同じ `query would be affected by row-level security policy for table "..."`（`42501`）で、専用 variant
+  `SqlSurfaceError::RowSecurityOffRejected`・`TenantWriteError::RowSecurityOffRejected` が表す（`WITH CHECK` 違反の
+  `RowSecurityPolicyViolation` や DDL 権限の `InsufficientPrivilege` とは別。新しい `wire_code` は作らない）。表名は呼び出し
+  テナント自身の表だけで、RLS 状態を自テナントのカタログから読んだ後にのみ拒否が起きるため、他テナントの存在は漏れない
 - `CREATE/ALTER ROLE ... BYPASSRLS` の受理と指定・変更の権限規則（42501）・`DROP ROLE` とポリシー `TO` の依存（`2BP01`）: #1962・#1963
 - 認証主体とロール ID の紐付け: #1971。所有者: #2236。初期ロールへの `BYPASSRLS`: #2238
 - 段 2: ロール属性 `BYPASSRLS`、実効ロール集合（INHERIT 真の付与のみ・循環と上限）、`PolicyRole` へのロール ID 保存（再利用されない ID）、

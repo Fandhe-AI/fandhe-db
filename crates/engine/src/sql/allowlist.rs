@@ -1300,6 +1300,13 @@ pub enum SqlSurfaceError {
         policy: Option<String>,
         using_expression: bool,
     },
+    /// `row_security = off` のセッションが、RLS 有効な自テナントの表を読み書きしようとした拒否
+    /// （RLS-13・Issue #2278）。`42501`（`ErrorClass::ForbiddenTenantMismatch` を再利用）。部分的な
+    /// 結果を黙って返さないための拒否で、文言は PostgreSQL と同じ
+    /// `query would be affected by row-level security policy for table "..."`。保持するのは
+    /// 呼び出しテナント自身の表名だけ（拒否は自テナントの表の RLS 状態を読んだ後にのみ起きるため、
+    /// 他テナントの存在は漏れない）。`WITH CHECK` 違反（[`Self::RowSecurityPolicyViolation`]）とは別物。
+    RowSecurityOffRejected { table: String },
     /// `FETCH`／`CLOSE` が参照したカーソル名が、現在のトランザクション内に
     /// 存在しない（WIRE-15・TASK-218）。他セッション所有のカーソル名・単に
     /// 存在しない名前のいずれも区別しない固定文言のみを保持し、カーソル名
@@ -2024,6 +2031,7 @@ impl ClassifiedError for SqlSurfaceError {
             SqlSurfaceError::InsufficientPrivilege
             | SqlSurfaceError::ConflictTargetNotVisible
             | SqlSurfaceError::RowSecurityPolicyViolation { .. }
+            | SqlSurfaceError::RowSecurityOffRejected { .. }
             | SqlSurfaceError::SchemaDependencyForbidden => ErrorClass::ForbiddenTenantMismatch,
             SqlSurfaceError::InvalidCursorName => ErrorClass::InvalidCursorName,
             SqlSurfaceError::NoDataFound => ErrorClass::NoDataFound,
@@ -2376,6 +2384,11 @@ impl std::fmt::Display for SqlSurfaceError {
                 policy.as_deref(),
                 *using_expression,
             )),
+            // PostgreSQL と同じ文言。表名は呼び出しテナント自身の表のみ（他テナントの情報は含めない）。
+            SqlSurfaceError::RowSecurityOffRejected { table } => write!(
+                f,
+                "query would be affected by row-level security policy for table \"{table}\""
+            ),
             // カーソル名・他セッション所有かどうかを一切含めない固定文言
             // （security.md P0。`SqlSurfaceError::InvalidCursorName` ドキュメント
             // 参照）。
