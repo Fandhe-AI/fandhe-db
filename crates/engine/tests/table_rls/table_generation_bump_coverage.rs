@@ -546,7 +546,7 @@ const ALLOWLIST: &[(&str, u32)] = &[
     // Issue #1961（ロールカタログ `Storage::create_role`）: ロール定義は専用 redb 表（`roles` ほか）へ
     // 書くだけで、どの表の行・スキーマ・`table_generation` にも影響しない（ACL・メンバーシップも ID 参照のみ。
     // 検査ゲートが入る後続 Issue でも世代ではなくカタログを直接読む）ため世代 bump は不要。
-    ("catalog/role.rs", 761),
+    ("catalog/role.rs", 777),
     // Issue #1961 のロール・ACL カタログの単体テスト補助（`write` ヘルパー。専用表だけを書き表世代の対象外）。
     ("catalog/role/tests.rs", 37),
     ("catalog/privilege/tests.rs", 21),

@@ -389,20 +389,34 @@ pub(crate) fn list_acl_for_object_in_txn<R: ReadSource>(
     Ok(out)
 }
 
+/// `collect_matching` の戻り値（集めた行と、続きがありうるときの再開キー）。
+type MatchBatch = (Vec<(AclKey, Vec<u8>)>, Option<AclKey>);
+
 /// relation（表・列）に属する行で `pred(kind, object_key, column)` が真のものを、全テナントから最大 `limit`
-/// 件集める（バッチ走査。ACL 表の全件走査。表が無ければ空）。
+/// 件集める（バッチ走査。ACL 表が無ければ空）。`after` が `Some` ならそのキーの直後から走査を再開し、
+/// 毎回表の先頭から走り直す O(N×バッチ数) の再走査を避ける。戻り値の 2 要素目は、上限に達して続きが
+/// ありうるときの再開キー（最後に集めたキー）で、`None` は走査完了を表す。
 fn collect_matching<R: ReadSource>(
     src: &R,
     limit: usize,
+    after: Option<&AclKey>,
     pred: &dyn Fn(u8, &str, &str) -> bool,
-) -> Result<Vec<(AclKey, Vec<u8>)>> {
+) -> Result<MatchBatch> {
     let table = match src.open_table(ACL_TABLE) {
         Ok(t) => t,
-        Err(redb::TableError::TableDoesNotExist(_)) => return Ok(Vec::new()),
+        Err(redb::TableError::TableDoesNotExist(_)) => return Ok((Vec::new(), None)),
         Err(e) => return Err(e.into()),
     };
     let mut out = Vec::new();
-    for entry in table.iter()? {
+    let iter = match after {
+        Some(a) => table.range::<(&str, u8, &str, &str, u64, u64)>((
+            std::ops::Bound::Excluded((a.0.as_str(), a.1, a.2.as_str(), a.3.as_str(), a.4, a.5)),
+            std::ops::Bound::Unbounded,
+        ))?,
+        None => table.iter()?,
+    };
+    let mut cursor = None;
+    for entry in iter {
         let (k, v) = entry?;
         let (t, kind, key, col, grantee, grantor) = k.value();
         if pred(kind, key, col) {
@@ -418,19 +432,21 @@ fn collect_matching<R: ReadSource>(
                 v.value().to_vec(),
             ));
             if out.len() >= limit {
+                cursor = out.last().map(|(key, _)| key.clone());
                 break;
             }
         }
     }
-    Ok(out)
+    Ok((out, cursor))
 }
 
 fn remove_matching(
     write_txn: &redb::WriteTransaction,
     pred: &dyn Fn(u8, &str, &str) -> bool,
 ) -> Result<()> {
+    let mut cursor: Option<AclKey> = None;
     loop {
-        let batch = collect_matching(write_txn, SWEEP_BATCH, pred)?;
+        let (batch, next) = collect_matching(write_txn, SWEEP_BATCH, cursor.as_ref(), pred)?;
         if batch.is_empty() {
             return Ok(());
         }
@@ -445,6 +461,10 @@ fn remove_matching(
                 *grantor,
             ))?;
         }
+        match next {
+            Some(c) => cursor = Some(c),
+            None => return Ok(()),
+        }
     }
 }
 
@@ -453,8 +473,9 @@ fn move_matching(
     pred: &dyn Fn(u8, &str, &str) -> bool,
     rewrite: &dyn Fn(&AclKey) -> AclKey,
 ) -> Result<()> {
+    let mut cursor: Option<AclKey> = None;
     loop {
-        let batch = collect_matching(write_txn, SWEEP_BATCH, pred)?;
+        let (batch, next) = collect_matching(write_txn, SWEEP_BATCH, cursor.as_ref(), pred)?;
         if batch.is_empty() {
             return Ok(());
         }
@@ -480,6 +501,10 @@ fn move_matching(
                 ),
                 blob.as_slice(),
             )?;
+        }
+        match next {
+            Some(c) => cursor = Some(c),
+            None => return Ok(()),
         }
     }
 }
