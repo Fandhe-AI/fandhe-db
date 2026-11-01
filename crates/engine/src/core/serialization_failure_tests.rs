@@ -305,6 +305,35 @@ fn wildcard_read_set_conflicts_only_on_visible_commits() {
     assert_serialization_failure(r);
 }
 
+/// 書き込みのみの `COPY FROM` は、BEGIN 後に同じ表へ可視な commit があっても `40001` にならない
+/// （schema lookup を読み取り集合へ記録しない。#2405）。
+#[test]
+fn write_only_copy_from_does_not_count_as_prior_read() {
+    use crate::core::CopyPlan;
+    let (core, _g) = new_core("ssi-copy-from", None);
+    let mut session = SessionState::default();
+    let caller = ctx("tenant-a");
+    let mut txn = tx(&core, &mut session, "tenant-a", &[]);
+    run(&core, "tenant-a", &insert("sa", 1, "a-1"));
+    let plan = core
+        .begin_copy_in_txn(
+            &caller,
+            &session,
+            &mut txn,
+            "COPY sa (id, embedding, n) FROM STDIN USING OPERATION_ID 'copy-1'",
+        )
+        .expect("begin copy");
+    let mut copy = match plan {
+        CopyPlan::From(s) => s,
+        CopyPlan::To(..) => panic!("expected COPY FROM plan"),
+    };
+    copy.feed(b"2\t[0.1,0.2]\t5\n").expect("feed");
+    let batch = copy.finish().expect("finish");
+    core.commit_copy_in_txn(&caller, &mut txn, batch)
+        .expect("write-only copy must not hit 40001");
+    step(&core, &mut session, &mut txn, "tenant-a", "COMMIT").expect("commit");
+}
+
 /// ビュー経由の読み取りでも基表への後続 commit で `40001`（読み取り集合と commit 記録の
 /// 表名が同じ名前空間であること）。
 #[test]

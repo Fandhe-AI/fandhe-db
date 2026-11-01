@@ -13074,6 +13074,11 @@ impl EngineCore {
         let resolver = self.schema_resolver(ctx);
         let copy_tokens =
             crate::sql::relation_name::tokenize_resolved_with(sql, false, Some(&resolver))?;
+        // `COPY FROM`（書き込み）の検証・schema lookup は読み取りではないので読み取り集合へ記録しない
+        // （記録すると write-only の COPY が先行 read 扱いになり、BEGIN 後の可視 commit で `40001` に
+        // なる。#2405。`LOCK TABLE` の存在確認・INSERT の writer 先取りと同じ扱い）。関数末尾まで有効。
+        let _suspend = (!crate::sql::allowlist::is_copy_to_statement(&copy_tokens))
+            .then(crate::sql::read_set::SuspendGuard::enter);
         // 読み取りの `COPY TO` は実行の読み取り源と同じ時点のカタログで検証する（Issue #2403。
         // 同時 DDL で検証と実行が食い違わない）。`COPY FROM`（書き込み）は従来どおり最新のカタログ。
         let stmt = if crate::sql::allowlist::is_copy_to_statement(&copy_tokens) {
