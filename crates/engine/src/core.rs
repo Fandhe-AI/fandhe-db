@@ -3718,6 +3718,32 @@ impl EngineCore {
         txn.begin_implicit(&self.storage, session)
     }
 
+    /// [`Self::begin_implicit_transaction`] の複数文版。writer を取得する前に `stmts` の行ロック句を
+    /// 構文だけで走査し、`SKIP LOCKED` なら `0A000`（writer に触れずに拒否）、いずれかが `NOWAIT` なら
+    /// writer を待たずに取得して他者保持中は即時 `55P03` にする（SQL-38・Issue #2230）。
+    /// 構文誤りなど走査できない文は無視し、その文の実行時に通常のエラーとして報告させる。
+    pub fn begin_implicit_transaction_for<'e>(
+        &'e self,
+        txn: &mut crate::sql::transaction::SessionTransaction<'e>,
+        session: &crate::sql::mode::SessionState,
+        stmts: &[&str],
+    ) -> Result<(), crate::sql::allowlist::SqlSurfaceError> {
+        let mut nowait = false;
+        for stmt in stmts {
+            let Ok(tokens) = crate::sql::lexer::tokenize(stmt) else {
+                continue;
+            };
+            let Ok(tokens) = Self::normalize_row_count_clauses(tokens) else {
+                continue;
+            };
+            let Ok((_, Some(syntax))) = crate::sql::row_lock::extract_row_locking(tokens) else {
+                continue;
+            };
+            nowait |= syntax.writer_wait()?;
+        }
+        txn.begin_implicit_with(&self.storage, session, nowait)
+    }
+
     /// 辞書的情報源抽出（TASK-109・PLAN-5）の設定
     /// （[`crate::dictionary::DictionaryConfig`]）を差し替えたビルダーを返す
     /// （[`Self::with_precision_policy`] と同じ流儀。未呼び出しなら

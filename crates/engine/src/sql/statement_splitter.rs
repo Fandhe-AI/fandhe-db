@@ -434,7 +434,7 @@ pub fn classify_statement(stmt: &str) -> StatementEffect {
                                 || n.eq_ignore_ascii_case("DELETE")
                     )
             });
-            if has_dml_body || calls_non_builtin_function(&tokens) {
+            if has_dml_body || calls_non_builtin_function(&tokens) || has_row_lock_clause(&tokens) {
                 StatementEffect::Write
             } else {
                 StatementEffect::ReadOnly
@@ -1519,6 +1519,7 @@ mod tests {
             "SELECT id FROM t FOR SHARE NOWAIT",
             "SELECT id FROM t FOR NO KEY UPDATE",
             "SELECT id FROM t FOR KEY SHARE",
+            "WITH x AS (SELECT id FROM t) SELECT * FROM x FOR UPDATE",
         ] {
             assert_eq!(classify_statement(sql), StatementEffect::Write, "{sql}");
         }

@@ -93,20 +93,18 @@ impl RowLocking {
     /// どれかの句が `SKIP LOCKED` なら `0A000`（#2231 まで。呼び出し元は writer・ゲートに触れる前に
     /// 本関数を呼ぶ）、そうでなくどれかが `NOWAIT` なら nowait、それ以外は待機する。
     pub(crate) fn writer_wait(&self) -> Result<bool, SqlSurfaceError> {
-        if self
-            .clauses
-            .iter()
-            .any(|c| c.wait == LockWaitPolicy::SkipLocked)
-        {
-            return Err(SqlSurfaceError::feature_not_supported(
-                "SKIP LOCKED is not supported yet",
-            ));
-        }
-        Ok(self
-            .clauses
-            .iter()
-            .any(|c| c.wait == LockWaitPolicy::NoWait))
+        compose_writer_wait(&self.clauses)
     }
+}
+
+/// [`RowLocking::writer_wait`] と [`RowLockingSyntax::writer_wait`] 共通の待機方針の合成。
+fn compose_writer_wait(clauses: &[RowLockClause]) -> Result<bool, SqlSurfaceError> {
+    if clauses.iter().any(|c| c.wait == LockWaitPolicy::SkipLocked) {
+        return Err(SqlSurfaceError::feature_not_supported(
+            "SKIP LOCKED is not supported yet",
+        ));
+    }
+    Ok(clauses.iter().any(|c| c.wait == LockWaitPolicy::NoWait))
 }
 
 /// 行ロック句つきの SELECT（行ロック句を除いた文の検証結果と、解析した句）。
@@ -141,6 +139,15 @@ pub(crate) struct RowLockingSyntax {
     cte_names: Vec<String>,
     /// `DISTINCT`／`GROUP BY`／`HAVING`／`WINDOW`／集合演算が最上位にある。
     combo_violation: bool,
+}
+
+impl RowLockingSyntax {
+    /// 構文段階の句から writer 取得の待機方針を合成する（[`RowLocking::writer_wait`] と同じ規則）。
+    /// 複数文メッセージの暗黙 Tx が writer を取得する前に、`SKIP LOCKED`（`0A000`）の拒否と
+    /// `NOWAIT` の反映を行うために使う（Issue #2230）。
+    pub(crate) fn writer_wait(&self) -> Result<bool, SqlSurfaceError> {
+        compose_writer_wait(&self.clauses)
+    }
 }
 
 fn is_word(token: Option<&Token>, word: &str) -> bool {
