@@ -159,9 +159,11 @@ fn relation_kind(write_txn: &redb::WriteTransaction, tenant: &str, key: &str) ->
 /// 更新対象の 1 オブジェクトと、その要求ビット。
 struct Target {
     object: PrivilegeObject,
+    /// 明示指定されたビット（付与者の権限判定・警告の対象）。
     bits: u16,
-    /// 表単位 REVOKE が列の行へ波及させたもの（付与権限の判定・警告の対象外）。
-    propagated: bool,
+    /// 表単位 REVOKE が列の行へ波及させたビット（表の GRANT OPTION で絞り、警告の対象外）。
+    /// 明示指定と別に保持し、統合で互いの判定規則が混ざらないようにする。
+    prop_bits: u16,
 }
 
 fn target_key(object: &PrivilegeObject) -> String {
@@ -182,8 +184,11 @@ fn add_target(
     let key = target_key(&object);
     if let Some(&i) = index.get(&key) {
         if let Some(t) = targets.get_mut(i) {
-            t.bits |= bits;
-            t.propagated &= propagated;
+            if propagated {
+                t.prop_bits |= bits;
+            } else {
+                t.bits |= bits;
+            }
         }
         return Ok(());
     }
@@ -193,8 +198,8 @@ fn add_target(
     index.insert(key, targets.len());
     targets.push(Target {
         object,
-        bits,
-        propagated,
+        bits: if propagated { 0 } else { bits },
+        prop_bits: if propagated { bits } else { 0 },
     });
     Ok(())
 }
@@ -363,13 +368,24 @@ fn resolve_dependents(
     Ok(())
 }
 
-fn merge_warning(cur: &mut Option<AclWarning>, new: AclWarning) {
-    *cur = match (*cur, new) {
-        (Some(AclWarning::NoPrivileges), _) | (_, AclWarning::NoPrivileges) => {
+/// 対象ごとの警告を集約する（01007 は「全対象で何も成立しなかった」場合に限る）。
+#[derive(Default)]
+struct WarningAcc {
+    none_seen: bool,
+    notall_seen: bool,
+    success_seen: bool,
+}
+
+impl WarningAcc {
+    fn finish(&self) -> Option<AclWarning> {
+        if self.none_seen && !self.success_seen && !self.notall_seen {
             Some(AclWarning::NoPrivileges)
+        } else if self.none_seen || self.notall_seen {
+            Some(AclWarning::NotAllPrivileges)
+        } else {
+            None
         }
-        _ => Some(AclWarning::NotAllPrivileges),
-    };
+    }
 }
 
 /// 書き込みの計画 1 件（`privileges` が 0 なら行の削除）。
@@ -543,34 +559,40 @@ impl Storage {
             }
         }
         // 4. 対象ごとの判定と計画。
-        let mut warning: Option<AclWarning> = None;
+        let mut warn_acc = WarningAcc::default();
         let mut states = AclStates::default();
         let mut affected: Vec<(u64, PrivilegeObject)> = Vec::new();
         for t in &targets {
             let allowed = t.object.allowed_privileges();
             let want = t.bits & allowed;
-            if want == 0 && t.propagated {
+            let want_p = t.prop_bits & allowed;
+            if t.bits == 0 && want_p == 0 {
                 continue;
             }
             let si = states.idx(&write_txn, tenant, &t.object)?;
             let entries: Vec<AclEntry> = states.work_of(si).to_vec();
-            // 付与者が持つ GRANT OPTION。列は表単位の行も合わせて見る。
-            let eff = if req.owner_equivalent {
+            // 波及ビット: 付与者の表の GRANT OPTION で絞る（0 なら表側が警告のみで無変更のため
+            // 列も変更しない）。
+            let eff_p = if want_p == 0 {
+                0
+            } else if req.owner_equivalent {
+                want_p
+            } else if let PrivilegeObject::Column { table, .. } = &t.object {
+                let table_entries = list_acl_for_object_in_txn(
+                    &*write_txn,
+                    tenant,
+                    &PrivilegeObject::Table(table.clone()),
+                )?;
+                let (tgo, _) = grantor_rights(&table_entries, req.grantor_id);
+                want_p & tgo
+            } else {
+                want_p
+            };
+            // 明示ビット: 付与者が持つ GRANT OPTION。列は表単位の行も合わせて見る。
+            let eff_e = if t.bits == 0 {
+                0
+            } else if req.owner_equivalent {
                 want
-            } else if t.propagated {
-                // 表単位 REVOKE から派生した列ターゲット。表単位の対象と同じく、付与者の表の
-                // GRANT OPTION で絞る（0 なら表側が警告のみで無変更のため列も変更しない）。
-                if let PrivilegeObject::Column { table, .. } = &t.object {
-                    let table_entries = list_acl_for_object_in_txn(
-                        &*write_txn,
-                        tenant,
-                        &PrivilegeObject::Table(table.clone()),
-                    )?;
-                    let (tgo, _) = grantor_rights(&table_entries, req.grantor_id);
-                    want & tgo
-                } else {
-                    want
-                }
             } else {
                 let (mut go, mut any) = grantor_rights(&entries, req.grantor_id);
                 if let PrivilegeObject::Column { table, .. } = &t.object {
@@ -601,12 +623,16 @@ impl Storage {
                 }
                 want & go
             };
-            if !t.propagated {
-                if eff == 0 {
-                    merge_warning(&mut warning, AclWarning::NoPrivileges);
-                } else if eff != want && want != allowed {
-                    merge_warning(&mut warning, AclWarning::NotAllPrivileges);
+            if t.bits != 0 {
+                if eff_e == 0 {
+                    warn_acc.none_seen = true;
+                } else if eff_e != want && want != allowed {
+                    warn_acc.notall_seen = true;
                 }
+            }
+            let eff = eff_e | eff_p;
+            if eff != 0 {
+                warn_acc.success_seen = true;
             }
             if eff == 0 {
                 continue;
@@ -694,7 +720,7 @@ impl Storage {
         // 5. 書き込み。
         if changes.is_empty() {
             return Ok(AclApplyOutcome {
-                warning,
+                warning: warn_acc.finish(),
                 rows_changed: 0,
             });
         }
@@ -723,7 +749,7 @@ impl Storage {
         let rows_changed = changes.len();
         commit_with_bumps(write_txn, &touched)?;
         Ok(AclApplyOutcome {
-            warning,
+            warning: warn_acc.finish(),
             rows_changed,
         })
     }

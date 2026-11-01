@@ -542,4 +542,115 @@ mod apply_deps {
         let r = run(&s, b, false, true, PRIV_SELECT, &["a"], a, true, false);
         assert!(matches!(r, Err(AclChangeError::InvalidGrant(_))));
     }
+
+    fn run_items(
+        s: &Storage,
+        grantor: u64,
+        is_grant: bool,
+        items: &[(u16, &[&str])],
+        grantee: u64,
+    ) -> std::result::Result<AclApplyOutcome, AclChangeError> {
+        let items: Vec<AclItem> = items
+            .iter()
+            .map(|(bits, cols)| AclItem {
+                bits: *bits,
+                columns: cols.iter().map(|c| c.to_string()).collect(),
+            })
+            .collect();
+        let tables = [T.to_string()];
+        let grantees = [GranteeSpec::Id(grantee)];
+        s.apply_acl_changes(
+            "tn",
+            &AclRequest {
+                is_grant,
+                grantor_id: grantor,
+                owner_equivalent: false,
+                tables: &tables,
+                items: &items,
+                grantees: &grantees,
+                grant_option: false,
+                cascade: false,
+            },
+        )
+    }
+
+    /// 表由来の波及ビットは、同じ列への明示指定と統合されても表の GRANT OPTION で絞られる
+    /// （列の GRANT OPTION だけでは取り消せない。Issue #1965 レビュー指摘）。
+    #[test]
+    fn merged_column_target_keeps_propagated_bits_gated_by_table_go() {
+        let (_g, s) = open("acl_dep_merge_prop");
+        mk_table(&s, T);
+        let owner = role(&s, "owner");
+        let bob = role(&s, "bob");
+        let carol = role(&s, "carol");
+        run(&s, owner, true, true, PRIV_SELECT, &["a"], bob, true, false).expect("g1");
+        run(
+            &s,
+            owner,
+            true,
+            true,
+            PRIV_UPDATE,
+            &["a"],
+            bob,
+            false,
+            false,
+        )
+        .expect("g2");
+        run(
+            &s,
+            bob,
+            false,
+            true,
+            PRIV_SELECT,
+            &["a"],
+            carol,
+            false,
+            false,
+        )
+        .expect("g3");
+        let before = col_rows(&s, "a");
+        let out = run_items(
+            &s,
+            bob,
+            false,
+            &[(PRIV_SELECT, &[]), (PRIV_UPDATE, &["a"])],
+            carol,
+        )
+        .expect("revoke");
+        assert_eq!(out.rows_changed, 0);
+        assert_eq!(col_rows(&s, "a"), before);
+    }
+
+    /// 先行ターゲットで付与が成立していれば、後続が何も付与しなくても 01006 になる（01007 ではない）。
+    #[test]
+    fn partial_success_across_targets_warns_not_all_privileges() {
+        let (_g, s) = open("acl_dep_warn_merge");
+        mk_table(&s, T);
+        let owner = role(&s, "owner");
+        let bob = role(&s, "bob");
+        let carol = role(&s, "carol");
+        run(&s, owner, true, true, PRIV_SELECT, &["a"], bob, true, false).expect("g1");
+        run(
+            &s,
+            owner,
+            true,
+            true,
+            PRIV_UPDATE,
+            &["b"],
+            bob,
+            false,
+            false,
+        )
+        .expect("g2");
+        let out = run_items(
+            &s,
+            bob,
+            true,
+            &[(PRIV_SELECT, &["a"]), (PRIV_UPDATE, &["b"])],
+            carol,
+        )
+        .expect("grant");
+        assert_eq!(out.warning, Some(AclWarning::NotAllPrivileges));
+        assert_eq!(out.rows_changed, 1);
+    }
 }
