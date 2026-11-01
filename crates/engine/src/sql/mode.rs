@@ -545,6 +545,14 @@ impl SessionState {
         self.ddl_allowed
     }
 
+    /// オブジェクト権限（ACL）の検査がこのセッションに適用されるか（現在ロールが束縛済みか）。
+    /// 未束縛のセッションは移行期の主体として判定しない（#1971 で束縛されると有効になる。
+    /// `sql::privilege_gate` の契約）。wire-server の Bind が、Parse と Execute の間の `REVOKE` を
+    /// 反映するために、束縛済みのセッションでだけ検証済みの文を再検証する条件に使う。
+    pub fn object_privileges_enforced(&self) -> bool {
+        self.current_role_id.is_some()
+    }
+
     /// 拡張クエリの Parse が SCHEMA 修飾の解決に使うテナント（未束縛なら `None`）。
     pub fn resolution_tenant(&self) -> Option<&str> {
         self.resolution_tenant.as_deref()

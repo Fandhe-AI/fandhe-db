@@ -274,6 +274,22 @@ fn is_syntax_keyword_here(tokens: &[Token], idx: usize) -> bool {
 /// 未修飾のテーブル参照の名前集め（参照ゲートの入力）。`skip` はゲート対象外のトークン添字
 /// （準備済み文で `public.` 修飾を外した位置）。トークン列は書き換えない。
 fn unqualified_relation_refs(tokens: &[Token], skip: &[usize]) -> Vec<GateRef> {
+    relation_refs(tokens, skip, false)
+}
+
+/// 読み取り系の権限検査（#1967。`sql::privilege_gate::read`）が使う参照先の名前集め。名前解決器で修飾を
+/// 解決した後のトークン列を受け取り、解決済みの内部キー（`#<id>.<name>`）も含めて返す（`search_path` の
+/// ゲートと同じ位置判定・構文語・CTE 名・表関数の除外規則を共有する。第 2 の走査器は作らない）。
+pub(crate) fn resolved_relation_ref_names(tokens: &[Token]) -> Vec<String> {
+    relation_refs(tokens, &[], true)
+        .into_iter()
+        .map(|r| r.name)
+        .collect()
+}
+
+/// [`unqualified_relation_refs`] と [`resolved_relation_ref_names`] の共通本体。`keep_internal_keys` が
+/// 真なら名前解決済みの内部キーを除外しない。
+fn relation_refs(tokens: &[Token], skip: &[usize], keep_internal_keys: bool) -> Vec<GateRef> {
     let walk = crate::sql::relation_name::relation_positions(tokens);
     let ctes = crate::sql::relation_name::collect_cte_scopes(tokens);
     // `DROP`／`ALTER`／`REFRESH` のオブジェクト名は `object_ddl_names` が（索引かどうかの区別つきで）
@@ -296,7 +312,7 @@ fn unqualified_relation_refs(tokens: &[Token], skip: &[usize]) -> Vec<GateRef> {
         // 名前解決器が `schema.name` の修飾を解決して置き換えた内部キー（`#<id>.<name>`）は修飾済みの
         // 参照なので、`search_path` による未修飾名の判定対象にしない（キーを作れるのは解決器だけ。
         // 字句解析器は `#` を含む識別子を作らない。Issue #1717）。
-        if name.starts_with('#') {
+        if !keep_internal_keys && name.starts_with('#') {
             continue;
         }
         // 構文語（`IF`・`ONLY`・`LATERAL` 等）は構文位置で判定する。CTE 名はその参照位置から実際に
@@ -334,7 +350,7 @@ fn unqualified_relation_refs(tokens: &[Token], skip: &[usize]) -> Vec<GateRef> {
     out.extend(
         object_ddl
             .into_iter()
-            .filter(|(i, r)| !skip.contains(i) && !r.name.starts_with('#'))
+            .filter(|(i, r)| !skip.contains(i) && (keep_internal_keys || !r.name.starts_with('#')))
             .map(|(_, r)| r),
     );
     out

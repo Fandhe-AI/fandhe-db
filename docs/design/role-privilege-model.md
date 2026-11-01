@@ -411,3 +411,52 @@ SQL-40 ポインタ。判定点を `sql/privilege_gate.rs` の `check`（主体�
 ### 対象外
 
 ロールベースの DDL 判定（#1971・#2234・#2236）、SELECT・DML・COPY・HTTP への結線（#1967〜#1969）、Rust API の生 DDL をゲートに通すこと、`DropFunction` の非対称の解消。
+
+## 12. Issue #1967 実装記録（SELECT・カーソル・検索経路への権限検査の結線）
+
+SQL-40 (1)(2)(3)(6)・RLS-12 ポインタ。読み取り系の文が参照する relation に、表単位の SELECT 権限検査を結線した。
+判定点は §11 の `privilege_gate::check` の 1 本のまま。参照先の収集と ACL の照会は `sql/privilege_gate/read.rs`。
+
+### 実装範囲
+
+- 対象の文: SELECT（JOIN・サブクエリ・CTE・再帰 CTE・集合演算・ビュー・matview・SQL 内の kNN／全文／ハイブリッド検索）、
+  EXPLAIN、`DECLARE`、行ロック句つき SELECT、PL/pgSQL の埋め込み SQL（`parse_tokens_gated` 経由）、
+  拡張クエリの Parse・Bind・Describe、HTTP 表層の bound 読み取り API（search・plan search・scan・aggregate・各 explain）。
+- 文種の分類は `read::classify`（`ParsedSql`・`Statement` の網羅 `match`。新しい variant の追加で分類の更新をコンパイラが強制）。
+- 参照先の収集は `search_path` の参照ゲートと同じ位置判定（`relation_positions`・CTE 名・構文語・表関数の除外）を共有する。
+  名前解決器で修飾を解決した後のトークンを走査し、解決済みの内部キー（`#<id>.<name>`）も含める。
+- `SessionState::object_privileges_enforced`（公開）を追加。wire の Bind が、束縛済みのセッションでは検証済みの文を
+  使い回さず毎回再検証する条件に使う。
+
+### 判断の記録
+
+- **未束縛のセッションは素通し**: #1971 が未実装で本番のセッションはすべて現在ロールが未束縛のため、ACL を判定すると
+  すべての SELECT が拒否される。`None` は明示の腕で素通しにし、トークンの複製・走査もしない（挙動・コストとも従来と同一）。
+  #1971 で束縛されたときに自動で有効になる。`Some(0)`（PUBLIC の予約 ID）は拒否。
+- **運用者権限は所有者相当**: `ddl_allowed` のセッションは全権限を持つ（所有者 #2236 まで。GRANT 側の `is_owner_equivalent` と同じ）。
+- **実効権限は直接付与と PUBLIC の和**: 継承メンバーシップ（#2860）は含めない。権限が狭くなる側の fail-closed で、
+  閉包関数が入ったときに ACL 照会へ足す。列単位の付与だけでは表単位の SELECT を満たさない（PG より厳しい暫定。列集合の判定は #2081）。
+- **判定順序は「構文 → 名前解決 → 権限」**: 収集は構文解析の成功後に行う。他テナントの SCHEMA 配下の表は解決の段で不在と
+  同じ応答になり、権限の分岐に入らない（D10）。
+- **ビューは自身の SELECT だけを判定する**: ビュー本文の再検証は内部の parse で行われ最上位のゲートを通らない。基底表は
+  ビュー所有者の権限で読む扱い（ビューを作れるのは所有者相当の主体だけで、PG の意味と一致する）。
+- **カタログで relation として引けない名前は検査しない**: 存在しないものは読めないので fail-open にならない。
+  別名などが偶然実在する表名と一致して余分に検査されるのは拒否側に倒れるだけ。
+- **カーソルは DECLARE で検査し FETCH では再検査しない**: 結果は DECLARE の時点で確定する（[sql-cursor.md](sql-cursor.md) §1）ため、
+  FETCH は確定済みの行を払い出すだけで新しい読み取りをしない。DECLARE の後に REVOKE や SET ROLE があっても開いている
+  カーソルには影響しない（PG と同じ）。
+- **拡張クエリは Parse でも検査する**: PG は Parse では検査しない意図的な差。権限の無い主体に列の型情報（Describe）を返さない
+  fail-closed を優先し、Parse と Execute の間の REVOKE は Bind の再検証で反映する。
+- **行ロック句は SELECT に加えて UPDATE を要求する**: ロック強度によらず、`OF` で絞られた表だけでなく参照先の全表に要求する（PG より厳しい側）。
+- **`EXPLAIN ANALYZE` は構文として受理されない（`42601`）**: 計画を返す形は `EXPLAIN` だけで、検査は対象の文と同じ。
+- **エラーは固定文言の `42501`**: 表名・ロール ID・テナントを含めない。明示 Tx 内の `42501` は Tx を `Failed` にする。
+  EXPLAIN・Describe は計画や列情報を返す前に拒否する。
+- **参照数の上限**: 重複除去後 256 件を超える文は ACL の照会より前に `PayloadTooLarge` で拒否する。
+
+### 対象外
+
+列集合の判定（#2081）、DML の読み取り側と書き込み・分割実行・DML の EXPLAIN（#1968。本書の収集関数を再利用する）、COPY（#1969）、
+継承メンバーシップ（#2860 のマージ後）、所有者（#2236）、SCHEMA の USAGE（#2234）、シーケンス・関数の権限（#2235）、
+認証済みユーザーとロールの紐付け（#1971。これが入るまで本番セッションでは検査が有効にならない）、
+主体を持たない engine の Rust API（`VectorCore::search`／`get_row`、`parse_sql` ＋ `execute_parsed_*`、`describe_parsed_*`）、
+存在オラクルの網羅試験（#1972）。

@@ -606,6 +606,69 @@ impl Storage {
     }
 }
 
+/// 読み取り系の権限検査（#1967。`sql::privilege_gate::read` から呼ばれる）の ACL 照会。`keys` の各 relation
+/// （表・ビュー・matview のキー）について、存在しなければ `None`、存在すれば `tenant` の表単位の ACL のうち
+/// 付与先が `role_id` か PUBLIC の行の権限ビットの和を返す。列単位の行は含めない（暫定の fail-closed。
+/// #2081）。1 つの read txn で全件を引く。形が不正なキーは relation として存在しない扱い（`None`。
+/// 誤分類された識別子を拒否側へも利用者エラーへも倒さない）。ACL 行の破損・件数超過は `Err`（素通しにしない）。
+pub(crate) fn relation_grant_bits_in_txn<R: ReadSource>(
+    src: &R,
+    tenant: &str,
+    keys: &[String],
+    role_id: u64,
+) -> Result<Vec<Option<u16>>> {
+    validate_tenant(tenant)?;
+    let mut out = Vec::with_capacity(keys.len());
+    for key in keys {
+        if validate_relation_key(key).is_err() || !relation_exists_in_txn(src, key)? {
+            out.push(None);
+            continue;
+        }
+        let entries =
+            list_acl_for_object_in_txn(src, tenant, &PrivilegeObject::Table(key.clone()))?;
+        let bits = entries
+            .iter()
+            .filter(|e| e.grantee_id == role_id || e.grantee_id == PUBLIC_GRANTEE_ID)
+            .fold(0u16, |acc, e| acc | e.privileges);
+        out.push(Some(bits));
+    }
+    Ok(out)
+}
+
+/// `key` が表・ビュー・matview のいずれかとして登録済みか（索引・SEQUENCE は relation ではない）。
+fn relation_exists_in_txn<R: ReadSource>(src: &R, key: &str) -> Result<bool> {
+    for def in [
+        super::CATALOG_TABLE,
+        super::VIEWS_TABLE,
+        super::materialized::MATERIALIZED_VIEWS_TABLE,
+    ] {
+        match src.open_table(def) {
+            Ok(t) => {
+                if t.get(key)?.is_some() {
+                    return Ok(true);
+                }
+            }
+            Err(redb::TableError::TableDoesNotExist(_)) => {}
+            Err(e) => return Err(e.into()),
+        }
+    }
+    Ok(false)
+}
+
+impl Storage {
+    /// [`relation_grant_bits_in_txn`] を新しい読み取り Tx で呼ぶ。
+    pub(crate) fn relation_grant_bits(
+        &self,
+        tenant: &str,
+        keys: &[String],
+        role_id: u64,
+    ) -> Result<Vec<Option<u16>>> {
+        use redb::ReadableDatabase;
+        let rt = self.db().begin_read()?;
+        relation_grant_bits_in_txn(&rt, tenant, keys, role_id)
+    }
+}
+
 /// `tenant` の ACL に、ロール `role_id` が付与先（`grantee_id`）または付与者（`grantor_id`）として載る行が
 /// あるか（`DROP ROLE` の依存検査。Issue #1962・`sql::role_ddl` から `catalog::role` 経由で呼ばれる）。
 /// PUBLIC の予約 ID 0 は対象外。テナントの範囲だけを走査するため他テナントの行は構造上引けない。件数が

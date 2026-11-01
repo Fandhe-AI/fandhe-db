@@ -1471,6 +1471,9 @@ fn needs_session_revalidation(session: &SessionState, parsed: &ParsedSql) -> boo
             // TABLE-27・Issue #1715: `public` が見えない `search_path` では、Parse 時の解決結果を
             // そのまま使わず、現在の path に照らして検証し直す。
             || session.search_path_hides_public()
+            // SQL-40・Issue #1967: 現在ロールが束縛済みのセッションは、Parse 後の `REVOKE` を反映するため
+            // 検証済みの文を使い回さず、現在の権限で検査し直す。
+            || session.object_privileges_enforced()
             || matches!(parsed, ParsedSql::SessionRouted(_)))
 }
 
@@ -1978,6 +1981,9 @@ fn handle_bind_body(
             // たびに検証し直す（Parse 後に `SET search_path` された文を古い解決結果で実行しない）。
             let parsed = if session.has_temp_tables()
                 || session.search_path_hides_public()
+                // SQL-40・Issue #1967: 束縛済みのロールは Bind のたびに権限を再検査する（Parse 後の
+                // `REVOKE` を Execute 前に反映する。未束縛のセッションは従来の経路のまま）。
+                || session.object_privileges_enforced()
                 || matches!(parsed, ParsedSql::SessionRouted(_))
                 // COPY は Execute で元 SQL を現在のカタログへ再解決するため、一時表を持たない
                 // セッションでも世代つきの包みを作る（Bind 後に作られた同名の一時表への化けを

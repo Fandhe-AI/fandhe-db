@@ -97,3 +97,51 @@ fn denial_message_is_fixed_and_has_no_detail() {
     assert_eq!(format!("{e:?}"), "InsufficientPrivilege");
     assert_eq!(e.client_message(), "permission denied for DDL statement");
 }
+
+// --- オブジェクト権限（#1967）-------------------------------------------------------------------
+
+fn rel(
+    principal: &Principal,
+    required_bits: u16,
+    granted_bits: u16,
+) -> Result<(), SqlSurfaceError> {
+    check(
+        principal,
+        PrivilegeTarget::Relation {
+            required_bits,
+            granted_bits,
+        },
+    )
+}
+
+#[test]
+fn object_privilege_decision_table() {
+    use crate::catalog::privilege::{PRIV_SELECT, PRIV_UPDATE};
+    // 未束縛は移行期の主体として素通し（#1971 で束縛されると有効になる）。
+    let unbound = Principal::from_session(&SessionState::default());
+    assert!(rel(&unbound, PRIV_SELECT, 0).is_ok());
+    assert!(!unbound.needs_acl_lookup());
+    // PUBLIC の予約 ID は拒否（運用者権限があっても）。
+    let mut zero = allowed();
+    zero.bind_role_ids(0, 0);
+    assert!(is_denied(rel(
+        &Principal::from_session(&zero),
+        PRIV_SELECT,
+        !0
+    )));
+    // 束縛済み: 要求ビットを全部持つときだけ許可。
+    let p = Principal::from_session(&bound_only());
+    assert!(p.needs_acl_lookup());
+    assert!(is_denied(rel(&p, PRIV_SELECT, 0)));
+    assert!(rel(&p, PRIV_SELECT, PRIV_SELECT).is_ok());
+    assert!(is_denied(rel(&p, PRIV_SELECT | PRIV_UPDATE, PRIV_SELECT)));
+    assert!(rel(&p, PRIV_SELECT | PRIV_UPDATE, PRIV_SELECT | PRIV_UPDATE).is_ok());
+    // 要求ビットが空なら（設計上の誤用）許可しない。
+    assert!(is_denied(rel(&p, 0, PRIV_SELECT)));
+    // 運用者権限は所有者相当として許可（ACL の照会も不要）。
+    let mut owner = bound_only();
+    owner.allow_ddl();
+    let p = Principal::from_session(&owner);
+    assert!(!p.needs_acl_lookup());
+    assert!(rel(&p, PRIV_SELECT, 0).is_ok());
+}

@@ -426,8 +426,13 @@ impl<'a, 'e> CorePlHost<'a, 'e> {
             } else {
                 None
             };
-            self.core
-                .parse_tokens_gated(tokens, self.session, Some(&resolver), read_snap)?
+            self.core.parse_tokens_gated(
+                tokens,
+                self.session,
+                self.ctx.tenant_id(),
+                Some(&resolver),
+                read_snap,
+            )?
         };
         let writes = classify(&parsed)?;
         if parsed_operation_id(&parsed).is_some() || is_partitioned_write(&parsed) {

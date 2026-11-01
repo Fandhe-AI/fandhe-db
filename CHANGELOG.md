@@ -9,6 +9,7 @@
 
 ### Added
 
+- 現在ロールが束縛済みのセッションの読み取り（SELECT・JOIN・サブクエリ・CTE・集合演算・ビュー・EXPLAIN・`DECLARE`・行ロック句・検索・拡張クエリ・HTTP の bound 読み取り API）に、`GRANT` で付与した表単位の SELECT 権限の検査を結線した（Issue #1967・SQL-40・RLS-12 ポインタ。権限不足は `42501`）。公開メソッド `SessionState::object_privileges_enforced` を追加した。現在ロールが未束縛のセッション（現状の全セッション）の挙動は変わらない。
 - `SET TRANSACTION` と `SET SESSION CHARACTERISTICS AS TRANSACTION` を受理する（Issue #1939・SQL-38 (7)(a)・SQL-31 ポインタ。契約の詳細は spec 側を参照）。
   BREAKING CHANGE: 公開 enum `SqlOutcome`・`ParsedSql` に `SetTransaction`、`SqlSurfaceError` に `SetTransactionAfterQuery` を追加した。修飾子なしの `START TRANSACTION` がセッション既定を継承するようになった。
 - `row_security`（`SET`／`RESET`／`SHOW`・StartupMessage）とポリシーの適用判定（`BYPASSRLS`・所有者・対象ロール）を追加した（Issue #2278・RLS-12・RLS-13・SQL-39）。RLS 有効な表への読み取り・書き込み・`COPY` は `row_security = off` のとき行を扱う前に `42501`（`query would be affected by row-level security policy for table "..."`。表名は自テナントのみ）で拒否する。

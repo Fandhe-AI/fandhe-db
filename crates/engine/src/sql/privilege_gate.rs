@@ -2,7 +2,9 @@
 //! `docs/design/role-privilege-model.md` の D4・D8・D10、経路一覧は
 //! `docs/design/privilege-check-paths.md`）。
 //!
-//! 権限判定の唯一の判定点。`(主体, 対象, 必要な権限)` の形で判定し、現時点の対象は DDL 文種のみ。
+//! 権限判定の唯一の判定点。`(主体, 対象, 必要な権限)` の形で判定し、対象は DDL 文種と、読み取り系の文が参照する
+//! relation（表・ビュー・matview。#1967）。relation の判定は [`read`] サブモジュールが参照先の収集と ACL の
+//! 照会を担い、本ファイルの [`check`] へ実効権限のビットを渡して判定する。
 //! 呼び出し元は `core.rs` の DDL 腕（[`require_ddl`]）、`sql::ddl::require_ddl_permission`
 //! （[`require_server_ddl`] への薄いファサード）、`sql::search_path`（参照ゲートの省略条件）、
 //! `sql::grant_ddl`（[`bound_principal`]・[`is_owner_equivalent`]）。
@@ -15,6 +17,11 @@
 //! - 拒否は固定文言の [`SqlSurfaceError::InsufficientPrivilege`]（`42501`）。ロール ID・文種名は含めない。
 //! - 主体は認証層が 1 回だけ設定した値の写しで、SQL 文から書き換える経路は持たない。
 //! - RLS の `PolicyContext` には触れない（権限判定は RLS より前段の追加の制限）。
+//! - オブジェクト権限（[`RequiredPrivilege::Object`]）は、現在ロールが束縛されたセッションにだけ適用する。
+//!   未束縛（`None`）は移行期の主体として判定しない（#1971 で認証済みユーザーとロールを紐付けると、本番の
+//!   セッションで自動的に有効になる。`check_required` の明示の腕）。`Some(0)`（PUBLIC の予約 ID）は拒否する。
+//!   運用者権限（`ddl_allowed`）は所有者相当として全権限を持つ（所有者の機構 #2236 まで）。
+//! - 列単位の付与だけでは表単位の要求を満たさない（暫定の fail-closed。列集合の判定は #2081 の担当）。
 
 use crate::sql::allowlist::SqlSurfaceError;
 use crate::sql::mode::SessionState;
@@ -29,6 +36,17 @@ pub(crate) struct Principal {
 }
 
 impl Principal {
+    /// オブジェクト権限の判定に ACL の照会が要るか（束縛済みで運用者権限を持たない主体）。
+    /// 偽なら [`check`] は ACL の中身に関係なく結果が決まるので、呼び出し元は照会を省略できる。
+    pub(crate) fn needs_acl_lookup(&self) -> bool {
+        self.current_role_id.is_some() && !self.ddl_allowed
+    }
+
+    /// ACL の照会に使う付与先ロール ID（束縛済みのときだけ `Some`）。
+    pub(crate) fn current_role_id(&self) -> Option<u64> {
+        self.current_role_id
+    }
+
     /// セッションの認証済み状態から主体を導出する。
     pub(crate) fn from_session(session: &SessionState) -> Self {
         Self {
@@ -142,11 +160,14 @@ impl DdlStatementKind {
     }
 }
 
-/// 判定に必要な権限。後続の #1967〜#1969 がオブジェクト権限（`PRIV_*` ビット）の variant を足す拡張点。
+/// 判定に必要な権限。
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum RequiredPrivilege {
     /// 全テナント共有カタログを変更する運用者権限（`--ddl-allowed-users`）。
     ServerDdl,
+    /// relation への表単位のオブジェクト権限（`catalog::privilege::PRIV_*` ビットの集合。全ビットが必要）。
+    /// 後続の #1968（DML）・#1969（COPY）が同じ variant を使う。
+    Object { bits: u16 },
 }
 
 /// 判定の対象。
@@ -154,23 +175,52 @@ pub(crate) enum RequiredPrivilege {
 pub(crate) enum PrivilegeTarget {
     /// DDL 文種。
     Ddl(DdlStatementKind),
+    /// relation（表・ビュー・matview）。`granted_bits` は呼び出し元が ACL から解決した実効権限
+    /// （現在ロールへの直接付与と PUBLIC の和。表単位の行だけで、列単位の付与は含めない）。
+    Relation {
+        required_bits: u16,
+        granted_bits: u16,
+    },
 }
 
 /// 権限判定の唯一の関数。権限不足は固定文言の `42501`（fail-closed）。
 /// `RequiredPrivilege` に variant を足したときは、未実装の判定を `Ok` に倒さず拒否側にする
 /// （ワイルドカード腕を置かない）。
 pub(crate) fn check(principal: &Principal, target: PrivilegeTarget) -> Result<(), SqlSurfaceError> {
-    let required = match target {
-        PrivilegeTarget::Ddl(kind) => kind.required_privilege(),
-    };
-    check_required(principal, required)
+    match target {
+        PrivilegeTarget::Ddl(kind) => check_required(principal, kind.required_privilege(), 0),
+        PrivilegeTarget::Relation {
+            required_bits,
+            granted_bits,
+        } => check_required(
+            principal,
+            RequiredPrivilege::Object {
+                bits: required_bits,
+            },
+            granted_bits,
+        ),
+    }
 }
 
 fn check_required(
     principal: &Principal,
     required: RequiredPrivilege,
+    granted_bits: u16,
 ) -> Result<(), SqlSurfaceError> {
     match required {
+        RequiredPrivilege::Object { bits } => match principal.current_role_id {
+            // 現在ロールが未束縛の主体（#1971 まで本番のセッションはすべてここ）。オブジェクト権限は判定しない。
+            None => Ok(()),
+            // PUBLIC の予約 ID は主体になれない（`bound_principal` と同じく拒否）。
+            Some(0) => Err(SqlSurfaceError::InsufficientPrivilege),
+            Some(_) => {
+                if principal.ddl_allowed || (bits != 0 && granted_bits & bits == bits) {
+                    Ok(())
+                } else {
+                    Err(SqlSurfaceError::InsufficientPrivilege)
+                }
+            }
+        },
         RequiredPrivilege::ServerDdl => {
             if principal.ddl_allowed {
                 Ok(())
@@ -198,6 +248,7 @@ pub(crate) fn require_server_ddl(session: &SessionState) -> Result<(), SqlSurfac
     check_required(
         &Principal::from_session(session),
         RequiredPrivilege::ServerDdl,
+        0,
     )
 }
 
@@ -213,6 +264,8 @@ pub(crate) fn bound_principal(session: &SessionState) -> Result<u64, SqlSurfaceE
 pub(crate) fn is_owner_equivalent(session: &SessionState) -> bool {
     require_server_ddl(session).is_ok()
 }
+
+pub(crate) mod read;
 
 #[cfg(test)]
 mod tests;

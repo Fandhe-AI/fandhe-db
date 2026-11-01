@@ -98,6 +98,9 @@ mod read_set_tests;
 // commit 記録（SQL-38・Issue #2404）。
 #[cfg(test)]
 mod commit_log_tests;
+// 読み取り系の文の SELECT 権限検査（SQL-40・Issue #1967）。
+#[cfg(test)]
+mod select_privilege_tests;
 #[cfg(test)]
 mod serialization_failure_tests;
 // `40001` の可視性境界・副作用ゼロの内部観測（Issue #2407。ポインタ: ERR-7・SQL-38・TABLE-3）。
@@ -5014,6 +5017,23 @@ impl EngineCore {
         }
     }
 
+    /// HTTP（NoSQL）表層の bound 読み取り API の入口で、対象表への SELECT 権限を判定する（SQL-40・
+    /// Issue #1967。束縛・計画・読み取り・EXPLAIN の組み立てより前）。現在ロール未束縛・運用者権限の
+    /// セッションは何もしない。`table` は呼び出し元が指定した relation 名で、権限不足は固定文言の `42501`。
+    fn require_table_select_privilege(
+        &self,
+        ctx: &PolicyContext,
+        session: &crate::sql::mode::SessionState,
+        table: &str,
+    ) -> Result<(), crate::sql::allowlist::SqlSurfaceError> {
+        crate::sql::privilege_gate::read::require_table_select(
+            &self.storage,
+            ctx.tenant_id(),
+            session,
+            table,
+        )
+    }
+
     /// 永続オブジェクトを作る DDL の作成先を `search_path` から判定する（TABLE-27・Issue #1715）。
     /// DDL 権限ゲートの直後・既存名の判定より前に呼ぶ（`42501` → `3F000`／`0A000` → `42P07` の順）。
     /// `explicit_public` は `public.` で明示修飾された作成（判定を飛ばして `public` へ作る）。
@@ -5217,7 +5237,36 @@ impl EngineCore {
     /// 通常の parse、あれば [`Self::route_temp_statement`]（一時コアへの振り分け。混在・対象外の
     /// 文種は `0A000`）に回す。トークン走査は保守的（一致しすぎても拒否側＝fail-closed）で、
     /// カタログを引かない文（`ALTER`・ビュー・カーソル等）や永続ビュー本文の再検証も覆う。
+    ///
+    /// SQL-40・Issue #1967: 構文解析（名前解決を含む）が成功した後、現在ロールが束縛されたセッションに限り、
+    /// 読み取り系の文の参照先へ SELECT 権限検査（[`crate::sql::privilege_gate::read`]）を行う。判定順は
+    /// 構文 `42601` → 名前解決 `42P01`／`3F000` → 権限 `42501`。`tenant` は呼び出し元の ctx のテナント。
+    /// 未束縛のセッションはトークンの複製も走査もしない（従来と同一）。
     fn parse_tokens_gated(
+        &self,
+        tokens: Vec<crate::sql::lexer::Token>,
+        session: &crate::sql::mode::SessionState,
+        tenant: &str,
+        resolver: Option<crate::sql::relation_name::SchemaResolver<'_>>,
+        read_snap: Option<&redb::ReadTransaction>,
+    ) -> Result<ParsedSql, crate::sql::allowlist::SqlSurfaceError> {
+        let gate_tokens = session.object_privileges_enforced().then(|| tokens.clone());
+        let parsed = self.parse_tokens_gated_grant_aware(tokens, session, resolver, read_snap)?;
+        if let Some(t) = gate_tokens {
+            crate::sql::privilege_gate::read::require_read_privileges(
+                &self.storage,
+                tenant,
+                session,
+                &t,
+                resolver,
+                crate::sql::privilege_gate::read::classify(&parsed),
+            )?;
+        }
+        Ok(parsed)
+    }
+
+    /// [`Self::parse_tokens_gated`] の構文解析部（未束縛 `GRANT`／`REVOKE` のエラー正規化を持つ）。
+    fn parse_tokens_gated_grant_aware(
         &self,
         tokens: Vec<crate::sql::lexer::Token>,
         session: &crate::sql::mode::SessionState,
@@ -5242,7 +5291,7 @@ impl EngineCore {
         result
     }
 
-    /// [`Self::parse_tokens_gated`] の本体（未束縛 `GRANT`／`REVOKE` のエラー正規化を持たない）。
+    /// [`Self::parse_tokens_gated_grant_aware`] の本体（未束縛 `GRANT`／`REVOKE` のエラー正規化を持たない）。
     fn parse_tokens_gated_core(
         &self,
         tokens: Vec<crate::sql::lexer::Token>,
@@ -7228,6 +7277,8 @@ impl EngineCore {
         // `bind_scan_with_dummy_flags` の
         // いずれが呼ばれても同じ配列を共有する）。
         Self::check_prepared_for_session(session, prepared)?;
+        // SQL-40・Issue #1967: 権限の無い主体に列の型情報を返さない（fail-closed）。
+        self.require_prepared_read_privileges(session, prepared, &prepared.dummy_parsed)?;
         self.describe_parsed_in_session_impl(
             session,
             &prepared.dummy_parsed,
@@ -8073,7 +8124,7 @@ impl EngineCore {
         let parsed = {
             let _session_tz_scope = session_time_zone_scope(session);
             let resolver = self.schema_resolver(ctx);
-            self.parse_tokens_gated(tokens, session, Some(&resolver), None)?
+            self.parse_tokens_gated(tokens, session, ctx.tenant_id(), Some(&resolver), None)?
         };
         // 一時カタログに対する細かいゲートは上の parse で通過済みのため、粗いゲートを持たない
         // 内部版を呼ぶ（TABLE-44・Issue #1681）。
@@ -8183,7 +8234,13 @@ impl EngineCore {
                 } else {
                     None
                 };
-                self.parse_tokens_gated(tokens, session, Some(&resolver), read_snap)
+                self.parse_tokens_gated(
+                    tokens,
+                    session,
+                    ctx.tenant_id(),
+                    Some(&resolver),
+                    read_snap,
+                )
             })();
             match parsed {
                 Ok(parsed) => parsed,
@@ -9272,6 +9329,8 @@ impl EngineCore {
         let result = (|| {
             let snap = Self::describe_snapshot(txn)?;
             Self::check_prepared_for_session(session, prepared)?;
+            // SQL-40・Issue #1967: 権限の無い主体に列の型情報を返さない（fail-closed）。
+            self.require_prepared_read_privileges(session, prepared, &prepared.dummy_parsed)?;
             // カーソル文は txn の開いているカーソルから列を引く（従来の経路）。
             if matches!(prepared.dummy_parsed, ParsedSql::Cursor(_)) {
                 return self.describe_parsed_in_txn_unscrubbed(
@@ -11705,6 +11764,7 @@ impl EngineCore {
             crate::sql::allowlist::SqlSurfaceError,
         >,
     {
+        self.require_table_select_privilege(ctx, session, table)?;
         let (read_txn, schema) = self.read_txn_with_schema(table)?;
         let bound = bind(&schema, session.udfs())?;
         if bound.table() != table {
@@ -11765,6 +11825,7 @@ impl EngineCore {
         // テーブル解決後に初めて解析することで、テーブル未存在＋ mode 値不正の
         // 要求で `42P01` が優先される SQL テキスト経由と同一の fail-closed
         // 順序を保つ。
+        self.require_table_select_privilege(ctx, session, table)?;
         let validated_limit =
             crate::sql::parser::validate_search_limit_with(limit, &self.result_limits)?;
         crate::sql::allowlist::validate_using_plan_question(question)?;
@@ -12921,6 +12982,7 @@ impl EngineCore {
         ) -> Result<crate::sql::explain::ExplainShape, E>,
         E: From<crate::sql::allowlist::SqlSurfaceError>,
     {
+        self.require_table_select_privilege(ctx, session, table)?;
         self.run_explain_plan(ctx, session, table, question, mode_literal, None, bind)
     }
 
@@ -12961,6 +13023,7 @@ impl EngineCore {
         )
             -> Result<crate::sql::parser::BoundScan, crate::sql::allowlist::SqlSurfaceError>,
     {
+        self.require_table_select_privilege(ctx, session, table)?;
         let (read_txn, schema) = self.read_txn_with_schema(table)?;
         let bound = bind(&schema, session.udfs())?;
         if bound.table() != table {
@@ -12995,6 +13058,7 @@ impl EngineCore {
             crate::sql::allowlist::SqlSurfaceError,
         >,
     {
+        self.require_table_select_privilege(ctx, session, table)?;
         let (read_txn, schema) = self.read_txn_with_schema(table)?;
         let bound = bind(&schema, session.udfs())?;
         if bound.table() != table {
@@ -13033,7 +13097,7 @@ impl EngineCore {
     /// テナント判定に使わない。
     pub fn explain_bound_search_in_session<F>(
         &self,
-        _ctx: &PolicyContext,
+        ctx: &PolicyContext,
         session: &crate::sql::mode::SessionState,
         table: &str,
         bind: F,
@@ -13047,6 +13111,7 @@ impl EngineCore {
             crate::sql::allowlist::SqlSurfaceError,
         >,
     {
+        self.require_table_select_privilege(ctx, session, table)?;
         let (read_txn, schema) = self.read_txn_with_schema(table)?;
         let bound = bind(&schema, session.udfs())?;
         if bound.table() != table {
@@ -13068,7 +13133,7 @@ impl EngineCore {
     /// と同じ。
     pub fn explain_bound_scan_in_session<F>(
         &self,
-        _ctx: &PolicyContext,
+        ctx: &PolicyContext,
         session: &crate::sql::mode::SessionState,
         table: &str,
         bind: F,
@@ -13080,6 +13145,7 @@ impl EngineCore {
         )
             -> Result<crate::sql::parser::BoundScan, crate::sql::allowlist::SqlSurfaceError>,
     {
+        self.require_table_select_privilege(ctx, session, table)?;
         let (read_txn, schema) = self.read_txn_with_schema(table)?;
         let bound = bind(&schema, session.udfs())?;
         if bound.table() != table {
@@ -13104,7 +13170,7 @@ impl EngineCore {
     /// と同じ。
     pub fn explain_bound_aggregate_in_session<F>(
         &self,
-        _ctx: &PolicyContext,
+        ctx: &PolicyContext,
         session: &crate::sql::mode::SessionState,
         table: &str,
         bind: F,
@@ -13118,6 +13184,7 @@ impl EngineCore {
             crate::sql::allowlist::SqlSurfaceError,
         >,
     {
+        self.require_table_select_privilege(ctx, session, table)?;
         let (read_txn, schema) = self.read_txn_with_schema(table)?;
         let bound = bind(&schema, session.udfs())?;
         if bound.table() != table {

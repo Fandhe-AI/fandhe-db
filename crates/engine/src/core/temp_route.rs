@@ -665,6 +665,32 @@ impl EngineCore {
         }
     }
 
+    /// 準備済み文（永続側の経路）の読み取り権限検査（SQL-40・Issue #1967）。拡張クエリの Parse・Bind・
+    /// Describe が、`parsed`（Parse の `dummy_parsed` か Bind が返した文）の文種に応じて、`PreparedSql` が
+    /// 保持する名前解決済みのトークン列の参照先を共通ゲートで判定する。現在ロール未束縛のセッションと
+    /// 一時表の経路は何もしない。束縛済みなのにテナントが分からないセッションは拒否する（fail-closed）。
+    pub(super) fn require_prepared_read_privileges(
+        &self,
+        session: &SessionState,
+        prepared: &super::PreparedSql,
+        parsed: &ParsedSql,
+    ) -> Result<(), SqlSurfaceError> {
+        if !session.object_privileges_enforced() || matches!(prepared.route, PreparedRoute::Temp(_))
+        {
+            return Ok(());
+        }
+        let tenant = session
+            .resolution_tenant()
+            .ok_or(SqlSurfaceError::InsufficientPrivilege)?;
+        crate::sql::privilege_gate::read::require_read_privileges_resolved(
+            &self.storage,
+            tenant,
+            session,
+            &prepared.tokens,
+            crate::sql::privilege_gate::read::classify(parsed),
+        )
+    }
+
     /// [`Self::parse_sql_prepared_with_declared`] のセッション対応版（拡張クエリの Parse。TABLE-44・
     /// Issue #1684）。一時カタログが空、または文が一時表の名前を含まなければ従来と同一。一時表の
     /// 名前を含む文は一時コアで構造検証し（一時表だけを参照する DML・読み取り・索引 DDL のみ。
@@ -676,6 +702,12 @@ impl EngineCore {
         declared: &[Option<crate::sql::params::DeclaredParamType>],
     ) -> Result<super::PreparedSql, SqlSurfaceError> {
         let result = self.parse_sql_prepared_in_session_inner(session, sql, declared);
+        // SQL-40・Issue #1967: 構文・名前解決に成功した文だけを権限検査する（`42601` → `42P01` → `42501`）。
+        // Describe 前の Parse の時点でも拒否する（権限の無い主体に列の型情報を返さない。PostgreSQL は
+        // Parse では検査しない意図的な差で、Bind で再検査する）。
+        if let Ok(prepared) = &result {
+            self.require_prepared_read_privileges(session, prepared, &prepared.dummy_parsed)?;
+        }
         // TABLE-27・Issue #1715: `public` が見えない `search_path` のセッションは、一時表以外の未修飾の
         // テーブル参照を `42P01` にする。判定順は構文エラー `42601` → 参照ゲート → その他の検証エラー。
         // 既定の path のセッションは何も足さない。
@@ -873,6 +905,9 @@ impl EngineCore {
                     &prepared.qualified_positions,
                 )?;
                 let parsed = self.bind_prepared_snap(prepared, values, read_snap)?;
+                // SQL-40・Issue #1967: Parse と Execute の間の `REVOKE` を反映するため、束縛済みの
+                // セッションでは Bind のたびに権限を再検査する（副作用の前）。
+                self.require_prepared_read_privileges(session, prepared, &parsed)?;
                 // `COPY`（Issue #1760）は Execute で元 SQL を現在のカタログへ再解決する
                 // （`begin_copy_temp`）ため、Bind 後に一時表が作成・削除されると宛先が永続表から
                 // 一時表（または逆）へ化ける。一時カタログの世代つきで包み、Execute 前の
