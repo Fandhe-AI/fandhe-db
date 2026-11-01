@@ -296,6 +296,7 @@ fn corrupted_entities_fail_closed() {
         meta.insert(("mv", key.as_bytes()), encode_meta(5).as_slice())
             .expect("ins");
     }
+    crate::storage::commit_log::note_ddl(&txn, "mv");
     bump_table_generation_in_txn(&txn, "mv").expect("bump");
     crate::recovery::commit_boundary::commit(txn).expect("commit");
     assert!(matches!(
@@ -317,6 +318,7 @@ fn corrupted_entities_fail_closed() {
         rows.insert((key.as_bytes(), 0u64), foreign.as_slice())
             .expect("ins");
     }
+    crate::storage::commit_log::note_ddl(&txn, "mv");
     bump_table_generation_in_txn(&txn, "mv").expect("bump");
     crate::recovery::commit_boundary::commit(txn).expect("commit");
     assert!(matches!(

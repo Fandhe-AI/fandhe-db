@@ -24,6 +24,8 @@ use std::path::Path;
 
 use redb::{ReadableDatabase, ReadableTable, TableDefinition};
 
+/// 明示トランザクションの書き込み時直列化検査が使う commit 記録（Issue #2404）。
+pub(crate) mod commit_log;
 /// 電源断シミュレーション用 `redb::StorageBackend` の共通モデル（TASK-145）。
 /// 本クレートのユニットテスト（本モジュール下部の `tests::power_loss`）と
 /// `crates/engine/tests/power_loss.rs` 統合テストの双方から `#[path]` 経由で
@@ -315,6 +317,12 @@ pub enum StorageError {
     /// トランザクションを取得しようとした（配線漏れに対する多層防御。許可リスト側で
     /// 本来は手前で拒否される想定）。到達した場合は内部矛盾として扱う。
     WriteTxnHeldByCurrentSession,
+    /// commit が書き込んだ表の行の足跡を安全に記録できない（1 commit あたりの上限超過・
+    /// 足跡の取得漏れ。明示トランザクションの書き込み時直列化検査〔SQL-38・Issue #2404〕が
+    /// 使う commit 記録のため）。不可視の組を可視扱いで記録するより書き込みを断る
+    /// fail-closed の拒否で、redb の commit より前に返るため durable な書き込みは無い。
+    /// `Display` にはテナント ID・表名・件数を含めない。
+    CommitFootprintUnrecordable,
 }
 
 impl fmt::Display for StorageError {
@@ -359,6 +367,9 @@ impl fmt::Display for StorageError {
             StorageError::WriteTxnHeldByCurrentSession => {
                 write!(f, "write transaction already held by current session")
             }
+            StorageError::CommitFootprintUnrecordable => {
+                write!(f, "commit footprint limit exceeded")
+            }
         }
     }
 }
@@ -377,7 +388,8 @@ impl std::error::Error for StorageError {
             | StorageError::GenerationCounterOverflow
             | StorageError::IncompatibleRowKeyFormat
             | StorageError::WriteLockTimeout
-            | StorageError::WriteTxnHeldByCurrentSession => None,
+            | StorageError::WriteTxnHeldByCurrentSession
+            | StorageError::CommitFootprintUnrecordable => None,
         }
     }
 }
@@ -413,8 +425,13 @@ pub type Result<T> = std::result::Result<T, StorageError>;
 /// フィールドの宣言順が drop 順序を決める（`txn` を先に drop＝abort してから
 /// `_permit` を解放する）。並べ替えてはならない。
 pub(crate) struct GatedWriteTxn {
-    txn: redb::WriteTransaction,
+    /// `Box` に入れるのは、書き込み点が `&redb::WriteTransaction` から commit 記録の frame を
+    /// 引くためのアドレス（[`commit_log::note_row`] 参照）を寿命中固定するため。
+    txn: Box<redb::WriteTransaction>,
     _permit: writer_gate::WriterPermit,
+    /// commit 記録の付帯物（永続ストレージだけ。一時表用のストレージは `None`）。
+    /// 宣言順が drop 順で、`txn`・`_permit` より後に frame の登録を外す。
+    recording: Option<commit_log::CommitSession>,
 }
 
 impl std::ops::Deref for GatedWriteTxn {
@@ -433,7 +450,11 @@ impl std::ops::DerefMut for GatedWriteTxn {
 impl GatedWriteTxn {
     /// 変更を破棄して閉じる。`txn` を abort した後にゲートを解放する。
     pub(crate) fn abort(self) -> Result<()> {
-        let GatedWriteTxn { txn, _permit } = self;
+        let GatedWriteTxn {
+            txn,
+            _permit,
+            recording: _recording,
+        } = self;
         txn.abort()?;
         Ok(())
     }
@@ -442,10 +463,23 @@ impl GatedWriteTxn {
     /// `write_txn.commit()` 直呼び出しと同じ効果）。permit は commit 後に解放する。
     #[cfg(test)]
     pub(crate) fn commit_raw_for_test(self) -> Result<()> {
-        let GatedWriteTxn { txn, _permit } = self;
+        let GatedWriteTxn {
+            txn,
+            _permit,
+            recording: _recording,
+        } = self;
         txn.commit()?;
         Ok(())
     }
+}
+
+/// commit 系の入口が [`CommitTxn::split_for_commit`] で受け取る部品。
+pub(crate) struct CommitParts {
+    pub(crate) txn: redb::WriteTransaction,
+    /// commit 完了まで保持すべき permit（あれば）。
+    pub(crate) permit: Option<writer_gate::WriterPermit>,
+    /// commit 記録の付帯物（あれば。[`commit_log::CommitSession`]）。
+    pub(crate) session: Option<commit_log::CommitSession>,
 }
 
 /// commit 系の入口（[`commit_write_txn`]・[`bump_generation_and_commit`]・
@@ -455,21 +489,34 @@ impl GatedWriteTxn {
 /// `db().begin_write()` で直接作るもの）は permit を持たない。
 pub(crate) trait CommitTxn {
     /// commit 対象の `redb::WriteTransaction` と、commit 完了まで保持すべき
-    /// permit（あれば）に分ける。呼び出し元は permit を `_permit` のような名前付き
-    /// 束縛で commit 完了まで保持すること（`_` で受けると即座に解放される）。
-    fn split_for_commit(self) -> (redb::WriteTransaction, Option<writer_gate::WriterPermit>);
+    /// permit（あれば）・commit 記録の付帯物に分ける。呼び出し元は permit を
+    /// `_permit` のような名前付き束縛で commit 完了まで保持すること（`_` で受けると
+    /// 即座に解放される）。
+    fn split_for_commit(self) -> CommitParts;
 }
 
 impl CommitTxn for redb::WriteTransaction {
-    fn split_for_commit(self) -> (redb::WriteTransaction, Option<writer_gate::WriterPermit>) {
-        (self, None)
+    fn split_for_commit(self) -> CommitParts {
+        CommitParts {
+            txn: self,
+            permit: None,
+            session: None,
+        }
     }
 }
 
 impl CommitTxn for GatedWriteTxn {
-    fn split_for_commit(self) -> (redb::WriteTransaction, Option<writer_gate::WriterPermit>) {
-        let GatedWriteTxn { txn, _permit } = self;
-        (txn, Some(_permit))
+    fn split_for_commit(self) -> CommitParts {
+        let GatedWriteTxn {
+            txn,
+            _permit,
+            recording,
+        } = self;
+        CommitParts {
+            txn: *txn,
+            permit: Some(_permit),
+            session: recording,
+        }
     }
 }
 
@@ -489,7 +536,7 @@ impl CommitTxn for GatedWriteTxn {
 /// カウンタ更新対象を誤る余地が生まれる（誤りは fail-open に直結する）。単一カウンタは
 /// 無関係なテーブルへの書き込みでも既存インデックスを失効させる（過剰拒否）が、
 /// fail-closed 方向のため許容する。
-pub(crate) fn prepare_generation_bump(write_txn: &redb::WriteTransaction) -> Result<()> {
+pub(crate) fn prepare_generation_bump(write_txn: &redb::WriteTransaction) -> Result<u64> {
     let mut gen_table = write_txn.open_table(GENERATION_TABLE)?;
     let current = gen_table
         .get(GENERATION_KEY)?
@@ -499,7 +546,7 @@ pub(crate) fn prepare_generation_bump(write_txn: &redb::WriteTransaction) -> Res
         .checked_add(1)
         .ok_or(StorageError::GenerationCounterOverflow)?;
     gen_table.insert(GENERATION_KEY, next)?;
-    Ok(())
+    Ok(next)
 }
 
 /// [`prepare_generation_bump`] 済みの `write_txn` を実際に commit する。この呼び出し
@@ -543,9 +590,22 @@ pub(crate) fn current_generation_in_txn(read_txn: &redb::ReadTransaction) -> Res
 /// 必要としない直接呼び出し元向けに残している。
 pub(crate) fn bump_generation_and_commit(write_txn: impl CommitTxn) -> Result<()> {
     // permit は commit 完了まで保持する（`GatedWriteTxn` 参照）。
-    let (write_txn, _permit) = write_txn.split_for_commit();
-    prepare_generation_bump(&write_txn)?;
-    commit_prepared_write_txn(write_txn)
+    let CommitParts {
+        txn: write_txn,
+        permit: _permit,
+        session,
+    } = write_txn.split_for_commit();
+    let g_c = prepare_generation_bump(&write_txn)?;
+    let record = match session.as_ref() {
+        Some(s) => s.prepare(&write_txn)?,
+        None => None,
+    };
+    commit_prepared_write_txn(write_txn)?;
+    // commit 成功後・permit 解放前に commit 記録へ追記する（1a-5 の順序不変条件）。
+    if let Some(s) = session.as_ref() {
+        s.finish(g_c, record);
+    }
+    Ok(())
 }
 
 /// `crate::txn::WriteTxn`/`BatchWriteTxn` の commit 経路を一本化する集約点
@@ -576,7 +636,11 @@ pub(crate) fn commit_write_txn(write_txn: impl CommitTxn, has_writes: bool) -> R
     if has_writes {
         bump_generation_and_commit(write_txn)
     } else {
-        let (write_txn, _permit) = write_txn.split_for_commit();
+        let CommitParts {
+            txn: write_txn,
+            permit: _permit,
+            session: _session,
+        } = write_txn.split_for_commit();
         write_txn.abort()?;
         Ok(())
     }
@@ -727,6 +791,9 @@ pub struct Storage {
     /// [`Self::writer_gate`] を待つ上限（既定 30 秒）。超過時は
     /// [`StorageError::WriteLockTimeout`]（`55P03`）を返す。
     write_lock_wait: std::time::Duration,
+    /// 明示トランザクションの書き込み時直列化検査（SQL-38・Issue #2404）が使う commit 記録と
+    /// 生存中スナップショットの登録簿。永続ストレージだけが持つ（一時表用は `None`）。
+    commit_log: Option<std::sync::Arc<commit_log::CommitLog>>,
     /// テスト専用の同期点コールバック（Issue #1363・TABLE-15）。feature
     /// `test-sync-points` 限定で、既定ビルドにはフィールドごと存在しない。
     #[cfg(feature = "test-sync-points")]
@@ -753,6 +820,11 @@ impl Storage {
         // 旧形式の表の `id` を移行済みの印へ一方向に移す（TABLE-23・Issue #2200）。
         // 一時表用の `open_with_backend` は対象外（永続 DB のカタログだけを移す）。
         crate::catalog::legacy_id_migration::migrate_legacy_ids(&storage)?;
+        // 移行の commit は記録対象外（open 前にセッションは存在しない）。ここから記録を始める。
+        if let Some(log) = storage.commit_log.as_ref() {
+            let read_txn = storage.db.begin_read()?;
+            log.arm(current_generation_in_txn(&read_txn)?);
+        }
         Ok(storage)
     }
 
@@ -769,6 +841,7 @@ impl Storage {
             temp_scoped: false,
             function_generations: Default::default(),
             write_lock_wait: DEFAULT_WRITE_LOCK_WAIT,
+            commit_log: Some(std::sync::Arc::new(commit_log::CommitLog::new())),
             #[cfg(feature = "test-sync-points")]
             sync_hook: std::sync::Mutex::new(None),
         }
@@ -788,6 +861,8 @@ impl Storage {
             .create_with_backend(backend)?;
         let mut storage = Self::from_db(db, WriteDurability::default());
         storage.temp_scoped = true;
+        // 一時表は他セッションの commit の影響を受けないため commit 記録を持たない。
+        storage.commit_log = None;
         Ok(storage)
     }
 
@@ -902,10 +977,75 @@ impl Storage {
     pub(crate) fn begin_write_txn(&self) -> Result<GatedWriteTxn> {
         let permit = self.acquire_writer_permit()?;
         let txn = self.begin_write_txn_raw()?;
+        self.wrap_gated(txn, permit)
+    }
+
+    /// `txn`・`permit` を [`GatedWriteTxn`] にまとめ、永続ストレージなら commit 記録の frame を登録する。
+    /// 記録を始めた永続ストレージでは、開始時点の確定状態を `base` として開く（単一ライタなので、
+    /// `begin_write` 直後の確定状態は write トランザクションの開始状態と一致する。差分を取るのは
+    /// commit 準備段階で登録が存在するときだけ）。
+    fn wrap_gated(
+        &self,
+        txn: redb::WriteTransaction,
+        permit: writer_gate::WriterPermit,
+    ) -> Result<GatedWriteTxn> {
+        let txn = Box::new(txn);
+        let recording = match self.commit_log.as_ref() {
+            Some(log) => {
+                let base = if log.is_armed() {
+                    Some(self.db.begin_read()?)
+                } else {
+                    None
+                };
+                let handle =
+                    commit_log::FootprintHandle::register(&txn, log.limits().max_per_commit);
+                Some(commit_log::CommitSession::new(
+                    std::sync::Arc::clone(log),
+                    handle,
+                    base,
+                ))
+            }
+            None => None,
+        };
         Ok(GatedWriteTxn {
             txn,
             _permit: permit,
+            recording,
         })
+    }
+
+    /// 明示トランザクションの確定済み読み取りスナップショットを開き、書き込み時直列化検査の
+    /// ために `G_s` を commit 記録の登録簿へ登録する（1a-7 の登録順序。Issue #2404）。
+    /// 一時表用ストレージ（commit 記録なし）は登録なしで読み取りだけを返す。
+    pub(crate) fn open_registered_snapshot(
+        &self,
+    ) -> Result<(
+        redb::ReadTransaction,
+        Option<commit_log::SnapshotRegistration>,
+    )> {
+        match self.commit_log.as_ref() {
+            Some(log) => {
+                let (read_txn, reg) = log.open_registered_snapshot(&self.db)?;
+                Ok((read_txn, Some(reg)))
+            }
+            None => Ok((self.db.begin_read()?, None)),
+        }
+    }
+
+    /// テスト専用: commit 記録を上限つきの新しいものへ差し替える（上限のテストが使う）。
+    #[cfg(test)]
+    pub(crate) fn replace_commit_log_for_test(&mut self, limits: commit_log::Limits) -> Result<()> {
+        let log = commit_log::CommitLog::with_limits(limits);
+        let read_txn = self.db.begin_read()?;
+        log.arm(current_generation_in_txn(&read_txn)?);
+        self.commit_log = Some(std::sync::Arc::new(log));
+        Ok(())
+    }
+
+    /// commit 記録（永続ストレージのみ）。#2405 の判定が照会する。
+    #[cfg_attr(not(test), allow(dead_code))]
+    pub(crate) fn commit_log(&self) -> Option<&std::sync::Arc<commit_log::CommitLog>> {
+        self.commit_log.as_ref()
     }
 
     /// 分割実行（述語形 UPDATE／DELETE のチャンク。ADR `docs/design/partitioned-dml.md`
@@ -924,10 +1064,7 @@ impl Storage {
                 }
             })?;
         let txn = self.begin_write_txn_raw()?;
-        Ok(GatedWriteTxn {
-            txn,
-            _permit: permit,
-        })
+        self.wrap_gated(txn, permit)
     }
 
     /// ゲートを待機上限（[`Self::write_lock_wait`]）つきで取得する。超過は
@@ -3275,6 +3412,7 @@ mod tests {
                 temp_scoped: false,
                 function_generations: Default::default(),
                 write_lock_wait: DEFAULT_WRITE_LOCK_WAIT,
+                commit_log: None,
                 #[cfg(feature = "test-sync-points")]
                 sync_hook: std::sync::Mutex::new(None),
             };
@@ -3343,6 +3481,7 @@ mod tests {
                 temp_scoped: false,
                 function_generations: Default::default(),
                 write_lock_wait: DEFAULT_WRITE_LOCK_WAIT,
+                commit_log: None,
                 #[cfg(feature = "test-sync-points")]
                 sync_hook: std::sync::Mutex::new(None),
             };
@@ -3407,6 +3546,7 @@ mod tests {
                 temp_scoped: false,
                 function_generations: Default::default(),
                 write_lock_wait: DEFAULT_WRITE_LOCK_WAIT,
+                commit_log: None,
                 #[cfg(feature = "test-sync-points")]
                 sync_hook: std::sync::Mutex::new(None),
             };
@@ -3451,6 +3591,7 @@ mod tests {
                 temp_scoped: false,
                 function_generations: Default::default(),
                 write_lock_wait: DEFAULT_WRITE_LOCK_WAIT,
+                commit_log: None,
                 #[cfg(feature = "test-sync-points")]
                 sync_hook: std::sync::Mutex::new(None),
             };

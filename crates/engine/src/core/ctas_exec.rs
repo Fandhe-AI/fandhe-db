@@ -231,6 +231,8 @@ impl EngineCore {
         }
 
         // 表の作成の世代 bump は commit の直前に行う（`commit_boundary::commit` の悉皆検査の契約）。
+        // commit 記録（SQL-38・Issue #2404）: スキーマ・カタログ・実体を変える書き込みは DDL として記録する。
+        crate::storage::commit_log::note_ddl(&write_txn, stmt.table_name());
         crate::catalog::bump_table_generation_in_txn(&write_txn, stmt.table_name())
             .map_err(map_create_table_catalog_error)?;
         crate::recovery::commit_boundary::commit(write_txn)
