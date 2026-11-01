@@ -110,10 +110,13 @@ pub(crate) fn validate_lock_tokens(
     }
     let mut table_names: Vec<String> = Vec::new();
     loop {
-        if is_word(rest.first(), "ONLY") && matches!(rest.get(1), Some(Token::Ident(_))) {
+        if is_word(rest.first(), "ONLY")
+            && matches!(rest.get(1), Some(Token::Ident(_) | Token::QuotedNull(_)))
+        {
             rest = skip(rest);
         }
-        let Some((Token::Ident(name), tail)) = rest.split_first() else {
+        // 引用付きの `NULL`／`DEFAULT`／現在時刻キーワード等は `QuotedNull` で来るため識別子へ降格する。
+        let Some((Token::Ident(name) | Token::QuotedNull(name), tail)) = rest.split_first() else {
             return Err(malformed());
         };
         rest = tail;

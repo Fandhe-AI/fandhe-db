@@ -253,3 +253,31 @@ fn other_tenants_and_missing_schemas_are_indistinguishable() {
     assert_eq!(count(&core, "bob", "sb.t"), before_b);
     assert_eq!(count(&core, "alice", "a"), before_a);
 }
+#[test]
+fn quoted_keyword_named_tables_are_lockable() {
+    let (core, _g) = new_core("sql38-lock-quoted");
+    ddl(
+        &core,
+        "alice",
+        "CREATE TABLE \"default\" (id BIGINT PRIMARY KEY)",
+    );
+    ddl(
+        &core,
+        "alice",
+        "CREATE TABLE \"current_date\" (id BIGINT PRIMARY KEY)",
+    );
+    for sql in [
+        "LOCK TABLE \"default\"",
+        "LOCK TABLE ONLY \"default\" *, \"current_date\" IN SHARE MODE",
+    ] {
+        let mut session = SessionState::default();
+        let mut txn = core.new_session_transaction();
+        run_as(&core, "alice", &mut session, &mut txn, "BEGIN").expect("begin");
+        assert_eq!(
+            run_as(&core, "alice", &mut session, &mut txn, sql),
+            Ok(SqlOutcome::Lock),
+            "{sql}"
+        );
+        run_as(&core, "alice", &mut session, &mut txn, "ROLLBACK").expect("rollback");
+    }
+}
