@@ -9,6 +9,8 @@
 
 ### Added
 
+- `40001`（serialization_failure）の `wire_code` と失敗状態への遷移の入口を追加した（Issue #2398・TASK-333・ERR-7・SQL-38）。`ErrorClass::SerializationFailure`・`SqlSurfaceError::SerializationFailure`（固定文言・表名やテナントを含まない）を追加し、HTTP 射影は 409。`SessionTransaction` に crate 内部の入口を置き、`40001` の後は `ROLLBACK` 以外が `25P02`、`ROLLBACK` で復帰する。判定と送出の結線は #2405（現状は到達しない）。
+  公開 enum `ErrorClass`・`SqlSurfaceError` に variant を追加した（BREAKING CHANGE）。
 - トランザクション制御の別名 `START TRANSACTION`・`END`・`ABORT` を受理する（Issue #1930・SQL-69 (1)・SQL-31）。`BEGIN`／`COMMIT`／`ROLLBACK` と同じ遷移・上限・エラーで、完了タグは `START TRANSACTION`／`COMMIT`／`ROLLBACK`。
   `COMMIT AND CHAIN` 等の `AND [NO] CHAIN` と `PREPARE TRANSACTION` は `0A000`（従来 `AND CHAIN` は `42601`）。
   BREAKING CHANGE: 公開 enum `SqlOutcome`・`TxnControl` に `StartTransaction` を追加した。網羅 `match` する外部コードは腕を足す。

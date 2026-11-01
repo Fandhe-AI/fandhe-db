@@ -385,6 +385,7 @@ pub(crate) fn redact_row_conversion_error(e: SqlSurfaceError) -> SqlSurfaceError
         | E::NoActiveSqlTransaction
         | E::InFailedSqlTransaction
         | E::LockNotAvailable
+        | E::SerializationFailure
         | E::MaterializedViewNotPopulated
         | E::SequenceNotYetDefined
         | E::LastvalNotYetDefined

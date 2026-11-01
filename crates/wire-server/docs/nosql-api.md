@@ -1201,6 +1201,7 @@ Date: <IMF-fixdate>
 | `23505` | `UNIQUE_VIOLATION` | 409 | Conflict | 行 `id` の重複、`PRIMARY KEY`／UNIQUE 制約のテナント内一意性違反（`insert`／`update`）。行制約由来のため commit 済みの根拠にならない |
 | `23505` | `DUPLICATE_OPERATION_ID` | 409 | Conflict | 台帳照合で内容一致と判定された `operation_id` の再送（`insert`／`update`／`delete`。`wire_code` は `UNIQUE_VIOLATION` と共有し `code` で区別。commit 済み確定の根拠。Issue #1180） |
 | `23514` | `CHECK_VIOLATION` | 409 | Conflict | `insert`／`update` が書き込む行が `CHECK` 制約（TABLE-16・TASK-204）を満たさない |
+| `40001` | `SERIALIZATION_FAILURE` | 409 | Conflict | 明示トランザクションの writer 取得時に直列化の失敗を検出した（`ROLLBACK` の後に最初から再試行してよい。NoSQL の 1 要求は開始時に writer を取る暗黙トランザクションのため到達不能。TASK-333・Issue #2398・ERR-7） |
 | `42P06` | `DUPLICATE_SCHEMA` | 409 | Conflict | SCHEMA 名が同一テナント内の既存 SCHEMA または組み込み SCHEMA と衝突した（TABLE-27・Issue #1713。NoSQL 表層からは到達しない） |
 | `42P07` | `DUPLICATE_TABLE` | 409 | Conflict | NoSQL 表層の実要求からは到達不能（`CREATE TABLE`／`CREATE VIEW`／`CREATE INDEX` は op 許可リスト外。後述） |
 | `55000` | `OBJECT_NOT_IN_PREREQUISITE_STATE` | 409 | Conflict | NoSQL 表層の実要求からは到達不能（未実体化の MATERIALIZED VIEW〔TABLE-42〕の読み取りは SQL 表層のみ。後述） |
@@ -1213,7 +1214,7 @@ Date: <IMF-fixdate>
 | `55P03` | `LOCK_NOT_AVAILABLE` | 503 | Service Unavailable | SQL 表層の明示トランザクション（SQL-31・TASK-221）が単一ライタを保持している間に、書き込み op（`insert`／`update`／`delete`）が書き込みゲートの待機上限を超えた |
 | `57014` | `QUERY_CANCELED` | 503 | Service Unavailable | 実行中の文を協調的に打ち切った（クライアント切断の検出。Issue #1798）。SQL 表層の接続スレッドが起点で、現状 NoSQL の `op` からは到達しない |
 
-到達不能な 23 分類（`20000`・`2F005`・`P0003`・`21000`・`42501`・`34000`・`P0002`（`ROW_NOT_FOUND`・`NO_DATA_FOUND`）・`42701`・`42P07`・`2BP01`・
+到達不能な 24 分類（`40001`・`20000`・`2F005`・`P0003`・`21000`・`42501`・`34000`・`P0002`（`ROW_NOT_FOUND`・`NO_DATA_FOUND`）・`42701`・`42P07`・`2BP01`・
 `42809`・`42703`・`42804`・`42710`・`42723`・`42P13`・`25000`・`25001`・`25P01`・`25P02`・`55000`・`44000`）の理由: NoSQL 表層はテナントをセッション
 （`SessionPrincipal::policy_context()`）からのみ導出し、クライアント自己申告の
 `tenant_id` 相当値は JSON／ヘッダ／パスいずれの位置でも `42601` で先に拒否する
