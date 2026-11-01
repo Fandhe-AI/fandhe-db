@@ -126,7 +126,19 @@ pub(crate) fn execute_alter_policy(
         AlterPolicyAction::Rename(new_name) => {
             storage
                 .rename_policy(tenant_id, &stmt.table, &stmt.name, new_name)
-                .map_err(|e| map_policy_error(e.into(), new_name))?;
+                .map_err(|e| {
+                    let e: PolicyDdlError = e.into();
+                    // 不在は旧名、改名先の重複は新名を報告する。
+                    let reported = match &e {
+                        PolicyDdlError::Catalog(CatalogError::Invalid(m))
+                            if m == POLICY_NOT_FOUND_MESSAGE =>
+                        {
+                            stmt.name.as_str()
+                        }
+                        _ => new_name.as_str(),
+                    };
+                    map_policy_error(e, reported)
+                })?;
         }
         AlterPolicyAction::Modify {
             roles,
@@ -251,6 +263,19 @@ pub(crate) fn map_policy_error(e: PolicyDdlError, policy_name: &str) -> SqlSurfa
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn rename_error_reports_source_name_for_not_found() {
+        let not_found =
+            PolicyDdlError::Catalog(CatalogError::Invalid(POLICY_NOT_FOUND_MESSAGE.to_string()));
+        let dup = PolicyDdlError::Catalog(CatalogError::Invalid(
+            POLICY_ALREADY_EXISTS_MESSAGE.to_string(),
+        ));
+        assert!(
+            matches!(map_policy_error(not_found, "old"), SqlSurfaceError::UndefinedObject { name } if name == "old")
+        );
+        assert_eq!(map_policy_error(dup, "new").wire_code(), "42710");
+    }
 
     #[test]
     fn catalog_errors_map_to_fixed_sqlstates() {

@@ -76,6 +76,32 @@ fn code_as(core: &EngineCore, tenant: &str, session: &mut SessionState, sql: &st
     }
 }
 
+/// `RENAME TO` の不在 (`42704`) は旧名、改名先の重複 (`42710`) は新名を報告する。
+#[test]
+fn rename_errors_report_the_matching_policy_name() {
+    let (_g, core) = open_fixture("pol-rename-name");
+    let mut s = allowed_session();
+    ok_as(&core, "alice", &mut s, "CREATE POLICY p ON t");
+    ok_as(&core, "alice", &mut s, "CREATE POLICY q ON t");
+    let missing = run_as(
+        &core,
+        "alice",
+        &mut s,
+        "ALTER POLICY oldname ON t RENAME TO newname",
+    )
+    .expect_err("must fail");
+    assert!(
+        matches!(&missing, SqlSurfaceError::UndefinedObject { name } if name == "oldname"),
+        "{missing:?}"
+    );
+    let dup =
+        run_as(&core, "alice", &mut s, "ALTER POLICY p ON t RENAME TO q").expect_err("must fail");
+    assert!(
+        matches!(&dup, SqlSurfaceError::DuplicateObject { name } if name == "q"),
+        "{dup:?}"
+    );
+}
+
 /// 権限の無い主体には、対象表・ポリシーの有無を問わず常に `42501`（存在オラクルにしない）。
 #[test]
 fn ddl_permission_gate_precedes_every_catalog_lookup() {
