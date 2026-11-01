@@ -31,7 +31,7 @@
 
 use std::collections::{BTreeSet, HashMap, VecDeque};
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
-use std::sync::{Arc, LazyLock, Mutex, MutexGuard};
+use std::sync::{Arc, Condvar, LazyLock, Mutex, MutexGuard};
 
 use redb::ReadableDatabase;
 
@@ -153,11 +153,16 @@ struct State {
     last_generation: u64,
     /// mutex の汚染を検知したか。
     tainted: bool,
+    /// 「記録を計算しない」と決めて commit 中の writer の数。0 でない間は登録を待たせる
+    /// （[`CommitLog::claim_skip_recording`]）。
+    unrecorded_inflight: usize,
 }
 
 /// `Storage` ごとの commit 記録と、生存中スナップショットの登録簿。
 pub(crate) struct CommitLog {
     state: Mutex<State>,
+    /// `unrecorded_inflight` が 0 になるのを待つ登録側の待機点。
+    unrecorded_done: Condvar,
     limits: Limits,
     /// `Storage::open` の最後で立てる。open 中の移行 commit は記録対象外。
     armed: AtomicBool,
@@ -173,6 +178,7 @@ impl CommitLog {
     pub(crate) fn with_limits(limits: Limits) -> Self {
         Self {
             state: Mutex::new(State::default()),
+            unrecorded_done: Condvar::new(),
             limits,
             armed: AtomicBool::new(false),
             live: AtomicUsize::new(0),
@@ -211,11 +217,40 @@ impl CommitLog {
 
     /// 今この commit の記録を計算する必要があるか。登録が無ければ不要。
     /// テストビルドでは、全既存テストが結線漏れ検査を通るよう常に計算する。
+    #[cfg(test)]
     pub(crate) fn should_record(&self) -> bool {
         if !self.armed.load(Ordering::SeqCst) {
             return false;
         }
         cfg!(test) || self.live.load(Ordering::SeqCst) > 0
+    }
+
+    /// commit の準備段階で「この commit の記録を計算しない」と決められるか。
+    /// 返り値は `(計算を省く, 解除が要る)`。登録が無いことの確認と、後から来る登録を待たせる印の
+    /// 設置を同じ mutex の下で行うため、確認後に登録が現れて記録が欠ける窓は残らない。
+    /// 解除が要るときは呼び出し側が [`Self::release_skip_recording`] を必ず呼ぶ。
+    pub(crate) fn claim_skip_recording(&self) -> (bool, bool) {
+        if !self.armed.load(Ordering::SeqCst) {
+            return (true, false);
+        }
+        if cfg!(test) {
+            return (false, false);
+        }
+        let mut st = self.lock();
+        if st.registrations.is_empty() {
+            st.unrecorded_inflight = st.unrecorded_inflight.saturating_add(1);
+            (true, true)
+        } else {
+            (false, false)
+        }
+    }
+
+    /// [`Self::claim_skip_recording`] で設置した印を外し、待たされた登録を起こす。
+    pub(crate) fn release_skip_recording(&self) {
+        let mut st = self.lock();
+        st.unrecorded_inflight = st.unrecorded_inflight.saturating_sub(1);
+        drop(st);
+        self.unrecorded_done.notify_all();
     }
 
     pub(crate) fn limits(&self) -> Limits {
@@ -231,6 +266,20 @@ impl CommitLog {
         db: &redb::Database,
     ) -> Result<(redb::ReadTransaction, SnapshotRegistration)> {
         let mut st = self.lock();
+        // 記録を計算しないと決めた commit が redb へ書き終えるまで登録を待たせる。待たないと、
+        // 他テナントの commit がその後に追記する「記録なし」の床上げで、この登録の `40001` 判定が
+        // 不能（衝突扱い）になり、不可視な commit の時点が `40001` から観測できてしまう。
+        // 待機中は mutex を手放す。解除は `CommitSession` の Drop（成功・失敗・panic を問わない）。
+        while st.unrecorded_inflight > 0 {
+            st = match self.unrecorded_done.wait(st) {
+                Ok(g) => g,
+                Err(poisoned) => {
+                    let mut g = poisoned.into_inner();
+                    g.tainted = true;
+                    g
+                }
+            };
+        }
         let read_txn = db.begin_read()?;
         let g_s = super::current_generation_in_txn(&read_txn)?;
         let id = st.next_id;
@@ -593,6 +642,16 @@ pub(crate) struct CommitSession {
     handle: FootprintHandle,
     /// write トランザクション開始時点の確定状態（記録が要る場合だけ開く）。
     base: Option<redb::ReadTransaction>,
+    /// `claim_skip_recording` の印を持っているか（Drop で外す）。
+    holds_skip: AtomicBool,
+}
+
+impl Drop for CommitSession {
+    fn drop(&mut self) {
+        if self.holds_skip.swap(false, Ordering::SeqCst) {
+            self.log.release_skip_recording();
+        }
+    }
 }
 
 impl CommitSession {
@@ -601,7 +660,12 @@ impl CommitSession {
         handle: FootprintHandle,
         base: Option<redb::ReadTransaction>,
     ) -> Self {
-        Self { log, handle, base }
+        Self {
+            log,
+            handle,
+            base,
+            holds_skip: AtomicBool::new(false),
+        }
     }
 
     /// commit 前の検査と記録の組み立て（`prepare_generation_bump` の後に呼ぶ）。
@@ -614,9 +678,13 @@ impl CommitSession {
         let Some(base) = self.base.as_ref() else {
             return Ok(None);
         };
-        // 登録が無いなら表世代の差分（表数に比例）も取らず記録も計算しない。準備段階の後に登録が
-        // 現れた場合は、追記側（`finish_commit`）が `None` を「記録なし」として床を上げる。
-        if !self.log.should_record() {
+        // 登録が無いなら表世代の差分（表数に比例）も取らず記録も計算しない。省く判断の間は印を
+        // 立て、後から来る登録を commit 完了まで待たせる（取りこぼしによる偽の `40001` を防ぐ）。
+        let (skip, held) = self.log.claim_skip_recording();
+        if held {
+            self.holds_skip.store(true, Ordering::SeqCst);
+        }
+        if skip {
             return Ok(None);
         }
         let written = crate::catalog::changed_table_generations_in_write_txn(write_txn, base)
