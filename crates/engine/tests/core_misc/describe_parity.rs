@@ -97,7 +97,8 @@ fn assert_describe_matches_execute(core: &EngineCore, ctx: &PolicyContext, sql: 
         | SqlOutcome::DeclareCursor
         | SqlOutcome::Fetch(_)
         | SqlOutcome::CloseCursor
-        | SqlOutcome::Do => None,
+        | SqlOutcome::Do
+        | SqlOutcome::Lock => None,
     };
 
     assert_eq!(

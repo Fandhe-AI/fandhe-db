@@ -991,6 +991,10 @@ pub(crate) fn map_outcome(outcome: SqlOutcome) -> OutcomeResponse {
         SqlOutcome::Do => OutcomeResponse::Command {
             tag: "DO".to_string(),
         },
+        // SQL-38（Issue #1958）: `LOCK TABLE` も件数を持たない固定タグ。
+        SqlOutcome::Lock => OutcomeResponse::Command {
+            tag: "LOCK TABLE".to_string(),
+        },
         // TABLE-27（Issue #1713）: SCHEMA DDL も件数を持たない固定タグ。
         SqlOutcome::CreateSchema(_) => OutcomeResponse::Command {
             tag: "CREATE SCHEMA".to_string(),
