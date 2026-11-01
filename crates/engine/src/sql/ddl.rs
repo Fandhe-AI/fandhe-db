@@ -348,6 +348,9 @@ pub(crate) fn map_create_table_catalog_error(e: CatalogError) -> SqlSurfaceError
         // 明示トランザクション（SQL-31・TASK-221）が単一ライタを保持中で書き込み
         // ゲートの待機上限を超えた。他の書き込み入口と同じく `55P03` を返す。
         CatalogError::WriteLockTimeout => SqlSurfaceError::LockNotAvailable,
+        CatalogError::CommitFootprintUnrecordable => SqlSurfaceError::PayloadTooLarge {
+            detail: "commit footprint limit exceeded".to_string(),
+        },
         // ENUM 列が参照する型が解決後〜書き込みトランザクションまでの間に削除された
         // 場合（Issue #1348）。事前解決の未登録と同じ `42704` に揃える（Issue #2306）。
         CatalogError::TypeNotFound(name) => SqlSurfaceError::UndefinedType { name },
@@ -664,6 +667,9 @@ fn map_drop_table_error(e: CatalogError) -> SqlSurfaceError {
         // ゲートの待機上限を超えた。他の書き込み入口と同じく `55P03` を返す
         // （`catalog::table_lookup_error` 系の写像と同じ契約）。
         CatalogError::WriteLockTimeout => SqlSurfaceError::LockNotAvailable,
+        CatalogError::CommitFootprintUnrecordable => SqlSurfaceError::PayloadTooLarge {
+            detail: "commit footprint limit exceeded".to_string(),
+        },
         // それ以外（redb バックエンド障害・カタログ破損・世代カウンタ枯渇等）は
         // サーバー側の内部事象として `XX000` へ丸める（`Storage::drop_table` の
         // ドキュメントが一覧する他の `CatalogError` variant はいずれもこの
@@ -735,6 +741,11 @@ pub enum AlterTableAction {
     /// `SET SCHEMA <schema>`（表の SCHEMA 移動。TABLE-27 のポインタ、Issue #1716）。移動先の
     /// 名前は利用者が書いた原文のまま。**BREAKING CHANGE**: variant 追加。
     SetSchema { schema_name: String },
+    /// `ENABLE／DISABLE／FORCE／NO FORCE ROW LEVEL SECURITY`（RLS-13 のポインタ、Issue #2275）。
+    /// 状態が変わらない再指定でも同じ応答になる。**BREAKING CHANGE**: variant 追加。
+    RowSecurity {
+        action: crate::catalog::row_security::RowSecurityAction,
+    },
 }
 
 /// `ALTER TABLE <table> ADD COLUMN <column> <type>` の実行本体（Issue #900）。
@@ -1048,6 +1059,9 @@ pub(crate) fn execute_alter_table(
         crate::sql::allowlist::ValidatedAlterTable::SetSchema(stmt) => {
             execute_alter_table_set_schema(storage, tenant_id, stmt)
         }
+        crate::sql::allowlist::ValidatedAlterTable::RowSecurity(stmt) => {
+            execute_alter_table_row_security(storage, tenant_id, stmt)
+        }
     }
 }
 
@@ -1317,7 +1331,8 @@ fn apply_alter_action_in_txn(
         | ValidatedAlterTable::AlterColumnType(_)
         | ValidatedAlterTable::RenameColumn(_)
         | ValidatedAlterTable::RenameTable(_)
-        | ValidatedAlterTable::SetSchema(_) => {
+        | ValidatedAlterTable::SetSchema(_)
+        | ValidatedAlterTable::RowSecurity(_) => {
             Err(AlterCheckError::Sql(SqlSurfaceError::FeatureNotSupported {
                 detail: "multiple ALTER TABLE actions including this action are not supported"
                     .to_string(),
@@ -1435,6 +1450,9 @@ fn map_alter_constraint_error(e: CatalogError) -> SqlSurfaceError {
         // 明示トランザクション（SQL-31・TASK-221）が単一ライタを保持中で書き込み
         // ゲートの待機上限を超えた。他の DDL・書き込み入口と同じく `55P03`。
         CatalogError::WriteLockTimeout => SqlSurfaceError::LockNotAvailable,
+        CatalogError::CommitFootprintUnrecordable => SqlSurfaceError::PayloadTooLarge {
+            detail: "commit footprint limit exceeded".to_string(),
+        },
         // ストレージ側の内部破損・想定外事象・本 DDL からは到達しないはずの
         // variant はいずれも詳細を露出しない `Internal`（`XX000`）へ丸める
         // （fail-closed。ワイルドカード腕を置かず全 variant を明示列挙する
@@ -1560,6 +1578,32 @@ pub(crate) fn execute_alter_table_rename_table(
         table_name: stmt.table_name.clone(),
         action: AlterTableAction::RenameTable {
             new_table_name: stmt.new_table_name.clone(),
+        },
+    })
+}
+
+/// `ALTER TABLE <table> ENABLE／DISABLE／FORCE／NO FORCE ROW LEVEL SECURITY` の実行本体（RLS-13 の
+/// ポインタ、Issue #2275）。呼び出し元（`core.rs`）は [`require_ddl_permission`] を必ず先に通している
+/// 前提（権限の無いセッションへ表の有無を返さない）。DDL を実行できる主体を「所有者」の代替とする。
+///
+/// 状態は `(表, tenant_id)` 単位で `Storage::alter_table_row_security` が単一 write txn で更新する。
+/// 判定順序: 表の存在確認（不在 `42P01`・ビュー等 `42809`）→ 状態の遷移。状態が変わらない再指定は
+/// 成功の no-op。ここが外す・付けるのは利用者ポリシーの適用だけで、テナント境界には触れない。
+pub(crate) fn execute_alter_table_row_security(
+    storage: &Storage,
+    tenant_id: &str,
+    stmt: &crate::sql::allowlist::ValidatedAlterTableRowSecurity,
+) -> Result<AlterTableOutcome, SqlSurfaceError> {
+    storage
+        .alter_table_row_security(tenant_id, &stmt.table_name, stmt.action)
+        .map_err(|e| match e {
+            CatalogError::TableNotFound(_) => undefined_table_or_view(storage, &stmt.table_name),
+            other => map_drop_alter_column_error(other),
+        })?;
+    Ok(AlterTableOutcome {
+        table_name: stmt.table_name.clone(),
+        action: AlterTableAction::RowSecurity {
+            action: stmt.action,
         },
     })
 }
@@ -1985,6 +2029,9 @@ fn map_drop_alter_column_error(e: CatalogError) -> SqlSurfaceError {
             ))
         }
         CatalogError::WriteLockTimeout => SqlSurfaceError::LockNotAvailable,
+        CatalogError::CommitFootprintUnrecordable => SqlSurfaceError::PayloadTooLarge {
+            detail: "commit footprint limit exceeded".to_string(),
+        },
         CatalogError::Backend(_)
         | CatalogError::CorruptSchema(_)
         | CatalogError::TableAlreadyExists(_)
@@ -2651,6 +2698,9 @@ fn map_add_column_error(e: CatalogError) -> SqlSurfaceError {
         // 明示トランザクション（SQL-31・TASK-221）が単一ライタを保持中で書き込み
         // ゲートの待機上限を超えた。他の DDL・書き込み入口と同じく `55P03`。
         CatalogError::WriteLockTimeout => SqlSurfaceError::LockNotAvailable,
+        CatalogError::CommitFootprintUnrecordable => SqlSurfaceError::PayloadTooLarge {
+            detail: "commit footprint limit exceeded".to_string(),
+        },
         // 対象名がビュー（Issue #909）。現行の `alter_table_add_column` はテーブル
         // 名前空間のみを引くため到達しないが、将来ビュー判別を内包した場合も
         // `42809` に揃える。
@@ -2765,6 +2815,9 @@ pub(crate) fn map_create_matview_error(e: CatalogError) -> SqlSurfaceError {
             "materialized view definition or data cannot be stored",
         ),
         CatalogError::WriteLockTimeout => SqlSurfaceError::LockNotAvailable,
+        CatalogError::CommitFootprintUnrecordable => SqlSurfaceError::PayloadTooLarge {
+            detail: "commit footprint limit exceeded".to_string(),
+        },
         _ => SqlSurfaceError::Internal {
             detail: "CREATE MATERIALIZED VIEW failed".to_string(),
         },
@@ -2803,6 +2856,9 @@ pub(crate) fn map_refresh_matview_error(e: CatalogError) -> SqlSurfaceError {
             "materialized view definition or data cannot be stored",
         ),
         CatalogError::WriteLockTimeout => SqlSurfaceError::LockNotAvailable,
+        CatalogError::CommitFootprintUnrecordable => SqlSurfaceError::PayloadTooLarge {
+            detail: "commit footprint limit exceeded".to_string(),
+        },
         _ => SqlSurfaceError::Internal {
             detail: "REFRESH MATERIALIZED VIEW failed".to_string(),
         },
@@ -2934,6 +2990,9 @@ pub(crate) fn map_drop_matview_error(e: CatalogError) -> SqlSurfaceError {
         }
         CatalogError::ViewLimitExceeded(detail) => SqlSurfaceError::PayloadTooLarge { detail },
         CatalogError::WriteLockTimeout => SqlSurfaceError::LockNotAvailable,
+        CatalogError::CommitFootprintUnrecordable => SqlSurfaceError::PayloadTooLarge {
+            detail: "commit footprint limit exceeded".to_string(),
+        },
         _ => SqlSurfaceError::Internal {
             detail: "DROP MATERIALIZED VIEW failed".to_string(),
         },
@@ -2956,6 +3015,9 @@ fn map_create_view_error(e: CatalogError) -> SqlSurfaceError {
         // ゲートの待機上限を超えた。他の書き込み入口（`CREATE TABLE`／
         // `DROP TABLE`）と同じく `55P03` を返す（`XX000` へ丸めない）。
         CatalogError::WriteLockTimeout => SqlSurfaceError::LockNotAvailable,
+        CatalogError::CommitFootprintUnrecordable => SqlSurfaceError::PayloadTooLarge {
+            detail: "commit footprint limit exceeded".to_string(),
+        },
         _ => SqlSurfaceError::Internal {
             detail: "CREATE VIEW failed".to_string(),
         },
@@ -3024,6 +3086,9 @@ fn map_drop_view_error(e: CatalogError) -> SqlSurfaceError {
         // ゲートの待機上限を超えた。他の書き込み入口（`CREATE TABLE`／
         // `DROP TABLE`）と同じく `55P03` を返す（`XX000` へ丸めない）。
         CatalogError::WriteLockTimeout => SqlSurfaceError::LockNotAvailable,
+        CatalogError::CommitFootprintUnrecordable => SqlSurfaceError::PayloadTooLarge {
+            detail: "commit footprint limit exceeded".to_string(),
+        },
         _ => SqlSurfaceError::Internal {
             detail: "DROP VIEW failed".to_string(),
         },
@@ -3187,6 +3252,9 @@ fn map_create_index_error(e: CatalogError) -> SqlSurfaceError {
             SqlSurfaceError::unsupported("malformed index definition in CREATE INDEX")
         }
         CatalogError::WriteLockTimeout => SqlSurfaceError::LockNotAvailable,
+        CatalogError::CommitFootprintUnrecordable => SqlSurfaceError::PayloadTooLarge {
+            detail: "commit footprint limit exceeded".to_string(),
+        },
         _ => SqlSurfaceError::Internal {
             detail: "CREATE INDEX failed".to_string(),
         },
@@ -3207,6 +3275,9 @@ fn map_drop_index_error(e: CatalogError) -> SqlSurfaceError {
             SqlSurfaceError::unsupported("malformed index reference in DROP INDEX")
         }
         CatalogError::WriteLockTimeout => SqlSurfaceError::LockNotAvailable,
+        CatalogError::CommitFootprintUnrecordable => SqlSurfaceError::PayloadTooLarge {
+            detail: "commit footprint limit exceeded".to_string(),
+        },
         _ => SqlSurfaceError::Internal {
             detail: "DROP INDEX failed".to_string(),
         },
@@ -3345,6 +3416,9 @@ pub(crate) fn map_sequence_error(e: CatalogError, internal_detail: &str) -> SqlS
             SqlSurfaceError::payload_too_large("too many sequences")
         }
         CatalogError::WriteLockTimeout => SqlSurfaceError::LockNotAvailable,
+        CatalogError::CommitFootprintUnrecordable => SqlSurfaceError::PayloadTooLarge {
+            detail: "commit footprint limit exceeded".to_string(),
+        },
         _ => SqlSurfaceError::Internal {
             detail: internal_detail.to_string(),
         },
@@ -3424,6 +3498,9 @@ pub(crate) fn map_schema_error(e: CatalogError, internal_detail: &str) -> SqlSur
         }
         CatalogError::Invalid(_) => SqlSurfaceError::unsupported("invalid schema name"),
         CatalogError::WriteLockTimeout => SqlSurfaceError::LockNotAvailable,
+        CatalogError::CommitFootprintUnrecordable => SqlSurfaceError::PayloadTooLarge {
+            detail: "commit footprint limit exceeded".to_string(),
+        },
         _ => SqlSurfaceError::Internal {
             detail: internal_detail.to_string(),
         },
@@ -3500,6 +3577,9 @@ fn map_create_type_error(e: CatalogError) -> SqlSurfaceError {
             SqlSurfaceError::unsupported("invalid enum type definition in CREATE TYPE")
         }
         CatalogError::WriteLockTimeout => SqlSurfaceError::LockNotAvailable,
+        CatalogError::CommitFootprintUnrecordable => SqlSurfaceError::PayloadTooLarge {
+            detail: "commit footprint limit exceeded".to_string(),
+        },
         _ => SqlSurfaceError::Internal {
             detail: "CREATE TYPE failed".to_string(),
         },
@@ -3519,6 +3599,9 @@ fn map_drop_type_error(e: CatalogError) -> SqlSurfaceError {
             SqlSurfaceError::unsupported("malformed type reference in DROP TYPE")
         }
         CatalogError::WriteLockTimeout => SqlSurfaceError::LockNotAvailable,
+        CatalogError::CommitFootprintUnrecordable => SqlSurfaceError::PayloadTooLarge {
+            detail: "commit footprint limit exceeded".to_string(),
+        },
         _ => SqlSurfaceError::Internal {
             detail: "DROP TYPE failed".to_string(),
         },

@@ -292,12 +292,43 @@ pub(crate) fn commit_and_finish<T>(
 ) -> StorageResult<(T, PostCommitResult)> {
     // 書き込みゲートの permit（`storage::GatedWriteTxn`）は commit 完了まで保持する
     // （SQL-31・TASK-221。`_` で受けると即座に解放されるため名前付き束縛にする）。
-    let (write_txn, _permit) = write_txn.split_for_commit();
+    let storage::CommitParts {
+        txn: write_txn,
+        permit: _permit,
+        session,
+    } = write_txn.split_for_commit();
+    let Some(session) = session else {
+        // commit 記録を持たない write トランザクション（一時表用ストレージ・テスト fixture）。
+        return commit_and_finish_with(
+            write_txn,
+            value,
+            post_commit,
+            |wt| storage::prepare_generation_bump(wt).map(|_| ()),
+            storage::commit_prepared_write_txn,
+        );
+    };
+    // commit 記録（SQL-38・Issue #2404）。準備段階（durable な書き込みの前）で世代の採番と
+    // 足跡の検査を行い、`Err` なら commit 前に拒否する。追記は commit 成功後・permit 解放前
+    // （`_permit` は本関数の終わりまで生きる）の `post_commit` 区間の先頭で行う（1a-5 の順序不変条件。
+    // `PostCommitPanicGuard` が armed のため追記は panic・失敗させない実装にしてある）。
+    let prepared: std::cell::RefCell<
+        Option<(u64, Option<crate::storage::commit_log::CommitRecord>)>,
+    > = std::cell::RefCell::new(None);
     commit_and_finish_with(
         write_txn,
         value,
-        post_commit,
-        storage::prepare_generation_bump,
+        |v| {
+            if let Some((g_c, record)) = prepared.borrow_mut().take() {
+                session.finish(g_c, record);
+            }
+            post_commit(v)
+        },
+        |wt| {
+            let g_c = storage::prepare_generation_bump(wt)?;
+            let record = session.prepare(wt)?;
+            *prepared.borrow_mut() = Some((g_c, record));
+            Ok(())
+        },
         storage::commit_prepared_write_txn,
     )
 }

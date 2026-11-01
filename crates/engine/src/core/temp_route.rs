@@ -997,6 +997,9 @@ impl EngineCore {
                 "this statement is not supported inside an explicit transaction",
             ));
         }
+        // 一時表はセッションローカルで他セッションの commit の影響を受けないため、この区間の読み取りは
+        // 明示トランザクションの読み取り集合へ記録しない（TABLE-44・SQL-38・Issue #2404）。
+        let _read_set_suspend = crate::sql::read_set::SuspendGuard::enter();
         let store = self.temp_store_for(ctx, session, routed)?;
         let core = store.core()?;
         txn.ensure_temp_txn(&store)?;

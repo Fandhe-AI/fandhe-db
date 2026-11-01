@@ -141,6 +141,8 @@ fn migrate_marks_with(
         }
         // スキーマ値が変わるため世代を進める（世代照合の網羅検査 table_generation_bump_coverage に従う。
         // open 中でキャッシュは未構築だが、カタログ変更は常に世代 bump と組にして不変条件を単純に保つ）。
+        // commit 記録（SQL-38・Issue #2404）: 移行はカタログを変える書き込みのため DDL として記録する。
+        crate::storage::commit_log::note_ddl(&txn, &name);
         super::bump_table_generation_in_txn(&txn, &name).map_err(catalog_to_storage)?;
         crate::recovery::commit_boundary::commit(txn)?;
         migrated += 1;
@@ -173,6 +175,8 @@ fn assign_missing_identities(
             drop(txn);
             return Err(StorageError::Codec(INTERRUPTED_MESSAGE.to_string()));
         }
+        // commit 記録（SQL-38・Issue #2404）: 移行はカタログを変える書き込みのため DDL として記録する。
+        crate::storage::commit_log::note_ddl(&txn, &name);
         super::bump_table_generation_in_txn(&txn, &name).map_err(catalog_to_storage)?;
         crate::recovery::commit_boundary::commit(txn)?;
         assigned += 1;

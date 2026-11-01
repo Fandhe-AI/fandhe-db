@@ -74,6 +74,9 @@ SQL 表層のディスパッチは `EngineCore::execute_parsed_statement`（自�
 | `ALTER SEQUENCE` | `AlterSequence` | `core.rs` の腕 | |
 | `CREATE TRIGGER` | `CreateTrigger` | `core.rs` の腕 | |
 | `DROP TRIGGER` | `DropTrigger` | `core.rs` の腕 | |
+| `CREATE POLICY` | `CreatePolicy` | `core.rs` の腕 | 表の所有者の判定はロール機構が入るまでこのゲートで代替（RLS-13・Issue #2274） |
+| `ALTER POLICY` | `AlterPolicy` | `core.rs` の腕 | |
+| `DROP POLICY` | `DropPolicy` | `core.rs` の腕 | `IF EXISTS` でも `42501` |
 | `CREATE SCHEMA` | `CreateSchema` | `core.rs` の腕 | |
 | `DROP SCHEMA` | `DropSchema` | `core.rs` の腕 | |
 | `ALTER SCHEMA` | `AlterSchema` | `core.rs` の腕 | |
@@ -82,7 +85,8 @@ SQL 表層のディスパッチは `EngineCore::execute_parsed_statement`（自�
 
 ### 明示トランザクション内（`execute_in_active_txn`）
 
-- `CREATE FUNCTION`・`DROP FUNCTION` の腕だけが `require_ddl_permission` → `0A000`（Tx 内では非対応）の順で評価する。
+- `CREATE FUNCTION`・`DROP FUNCTION`・`CREATE POLICY`・`ALTER POLICY`・`DROP POLICY` の腕だけが
+  `require_ddl_permission` → `0A000`（Tx 内では非対応）の順で評価する。
   権限の無いセッションは `42501`、有るセッションは `0A000`
 - その他の DDL は末尾の包括腕で `0A000`（`transaction_feature_not_supported`）となり、権限ゲートは通らない。
   権限の有無に関わらず同じ拒否のため存在情報は出ない。Tx 内で DDL を受理する変更を入れる場合は、

@@ -36,14 +36,28 @@ use crate::tenant::TenantWriteError;
 /// [`crate::sql::allowlist::parse_check_predicate_text`] で再パースできる
 /// （往復一致は呼び出し元 [`validate_and_build`] が検証する）。
 pub(crate) fn render_predicates(predicates: &[WherePredicate]) -> String {
+    render_predicates_with(predicates, false)
+}
+
+/// [`render_predicates`] の真偽定数対応版（ポリシー式用。RLS-13・Issue #2274）。構文段が
+/// `TRUE` を「述語なし」、`FALSE` を「分岐 0 個の `Or`」へ畳むため、空の述語列を `TRUE`、
+/// 分岐 0 個の `Or` を `FALSE` として描画し、再解析で同じ木へ戻す。
+pub(crate) fn render_predicates_with_bool_consts(predicates: &[WherePredicate]) -> String {
+    render_predicates_with(predicates, true)
+}
+
+fn render_predicates_with(predicates: &[WherePredicate], consts: bool) -> String {
+    if consts && predicates.is_empty() {
+        return "TRUE".to_string();
+    }
     predicates
         .iter()
-        .map(render_predicate)
+        .map(|p| render_predicate(p, consts))
         .collect::<Vec<_>>()
         .join(" AND ")
 }
 
-fn render_predicate(predicate: &WherePredicate) -> String {
+fn render_predicate(predicate: &WherePredicate, consts: bool) -> String {
     match predicate {
         WherePredicate::Equality { column, value } => {
             format!("{column} = '{}'", escape_literal(value))
@@ -99,20 +113,17 @@ fn render_predicate(predicate: &WherePredicate) -> String {
                 format!("{column} IS NULL")
             }
         }
-        WherePredicate::Not(inner) => format!("NOT {}", render_predicate(inner)),
+        WherePredicate::Not(inner) => format!("NOT {}", render_predicate(inner, consts)),
         // `parse_check_clause`（構文段）が `CHECK (...)` 本体の `OR` を既に
         // `42601` で拒否するため到達しない（TASK-208・Issue #912）。網羅性のため
         // 防御的に括弧付きで描画する。
         WherePredicate::Or(branches) => {
+            if consts && branches.is_empty() {
+                return "FALSE".to_string();
+            }
             let rendered: Vec<String> = branches
                 .iter()
-                .map(|branch| {
-                    branch
-                        .iter()
-                        .map(render_predicate)
-                        .collect::<Vec<_>>()
-                        .join(" AND ")
-                })
+                .map(|branch| render_predicates_with(branch, consts))
                 .collect();
             format!("({})", rendered.join(" OR "))
         }

@@ -46,6 +46,14 @@ pub(crate) use trigger::{
     validate_drop_trigger_tokens,
 };
 pub use trigger::{ValidatedCreateTrigger, ValidatedDropTrigger};
+// POLICY DDL の構文検証（RLS-13・Issue #2274）。
+mod policy;
+pub(crate) use policy::{
+    is_alter_policy_statement, is_create_policy_statement, is_drop_policy_statement,
+    validate_alter_policy_tokens, validate_create_policy_tokens, validate_drop_policy_tokens,
+    AlterPolicyAction,
+};
+pub use policy::{ValidatedAlterPolicy, ValidatedCreatePolicy, ValidatedDropPolicy};
 
 /// エラーメッセージへ含める入力断片の長さ上限。untrusted 入力をそのまま無加工で
 /// 長大にエラーへ埋め込まない（security.md「情報漏えい」対応）。値は
@@ -6075,6 +6083,15 @@ pub struct ValidatedAlterTableSetSchema {
     pub schema_name: String,
 }
 
+/// 許可形状の構造判定を通過した `ALTER TABLE <table> ENABLE／DISABLE／FORCE／NO FORCE ROW LEVEL
+/// SECURITY` 文（RLS-13 のポインタ、Issue #2275）。表の存在確認・種別判定は DDL 権限ゲート通過後の
+/// 実行段（`sql::ddl::execute_alter_table_row_security`）が担う（存在オラクル化を防ぐ）。
+#[derive(Debug, Clone, PartialEq)]
+pub struct ValidatedAlterTableRowSecurity {
+    pub table_name: String,
+    pub action: crate::catalog::row_security::RowSecurityAction,
+}
+
 /// 許可形状の構造判定を通過した `ALTER TABLE <table> ALTER COLUMN <column> TYPE
 /// <型名>` 文（TABLE-19・SQL-23、Issue #1167）。型名の意味づけ（ENUM 型名の
 /// 存在確認・`ColumnType` への変換）と互換性判定は実行段
@@ -6194,6 +6211,9 @@ pub enum ValidatedAlterTable {
     RenameTable(ValidatedAlterTableRenameTable),
     /// 表の SCHEMA 移動（TABLE-27 のポインタ、Issue #1716）。**BREAKING CHANGE**: variant 追加。
     SetSchema(ValidatedAlterTableSetSchema),
+    /// 行セキュリティ有効化状態の切り替え（RLS-13 のポインタ、Issue #2275）。
+    /// **BREAKING CHANGE**: variant 追加。
+    RowSecurity(ValidatedAlterTableRowSecurity),
 }
 
 /// `UPDATE ... SET <col> = <右辺>` の右辺 1 個ぶんの構文表現（Issue #1544・SQL-45 の
@@ -14764,6 +14784,41 @@ impl<'a> Parser<'a> {
         })
     }
 
+    /// 行セキュリティ切り替えアクション（`ENABLE／DISABLE／FORCE／NO FORCE ROW LEVEL SECURITY`）を
+    /// 読む。先頭が該当キーワードでなければ何も消費せず `None`。先頭が該当で `ROW LEVEL SECURITY` が
+    /// 続かなければ `42601`（fail-closed）。
+    fn parse_row_security_action(
+        &mut self,
+    ) -> Result<Option<crate::catalog::row_security::RowSecurityAction>, SqlSurfaceError> {
+        use crate::catalog::row_security::RowSecurityAction as A;
+        let unsupported = || SqlSurfaceError::unsupported("unsupported ALTER TABLE action");
+        let action = if self.peek_contextual_keyword("ENABLE") {
+            A::Enable
+        } else if self.peek_contextual_keyword("DISABLE") {
+            A::Disable
+        } else if self.peek_contextual_keyword("FORCE") {
+            A::Force
+        } else if self.peek_contextual_keyword("NO") {
+            A::NoForce
+        } else {
+            return Ok(None);
+        };
+        let is_no = action == A::NoForce;
+        self.advance();
+        if is_no {
+            // `NO` の直後は `FORCE` のみ（`NO FORCE`）。
+            if !self.peek_contextual_keyword("FORCE") {
+                return Err(unsupported());
+            }
+            self.advance();
+        }
+        self.expect_contextual_keyword("ROW")
+            .and_then(|()| self.expect_contextual_keyword("LEVEL"))
+            .and_then(|()| self.expect_contextual_keyword("SECURITY"))
+            .map_err(|_| unsupported())?;
+        Ok(Some(action))
+    }
+
     /// `ALTER TABLE <table>` の直後に続くアクション 1 個ぶん（`ADD`／`DROP`／`ALTER COLUMN`／
     /// `RENAME`）を読む。[`Self::parse_alter_table`] が `,` 区切りで繰り返し呼ぶ。
     fn parse_alter_table_action(
@@ -15098,6 +15153,12 @@ impl<'a> Parser<'a> {
                 table_name,
                 schema_name,
             });
+        }
+        // `ENABLE／DISABLE／FORCE／NO FORCE ROW LEVEL SECURITY`（RLS-13 のポインタ、Issue #2275）。
+        // 他の `ENABLE`／`DISABLE` 形（TRIGGER・RULE 等）や `NO` の後が `FORCE` 以外の形は、未対応
+        // アクションと同じ `42601`。カタログは見ない（存在・種別の判定は権限ゲート通過後の実行段）。
+        if let Some(action) = self.parse_row_security_action()? {
+            return Ok(ParsedAlterTableShape::RowSecurity { table_name, action });
         }
         if self.peek_contextual_keyword("RENAME") {
             self.advance();
@@ -20686,6 +20747,10 @@ enum ParsedAlterTableShape {
     SetSchema {
         table_name: String,
         schema_name: String,
+    },
+    RowSecurity {
+        table_name: String,
+        action: crate::catalog::row_security::RowSecurityAction,
     },
 }
 
@@ -28232,6 +28297,7 @@ fn into_validated_alter_table(
                     | ParsedAlterTableShape::AddForeignKey { .. }
                     | ParsedAlterTableShape::AddPrimaryKey { .. }
                     | ParsedAlterTableShape::AlterColumnType { .. }
+                    | ParsedAlterTableShape::RowSecurity { .. }
                     | ParsedAlterTableShape::Multiple { .. } => {
                         return Err(SqlSurfaceError::FeatureNotSupported {
                             detail: "multiple ALTER TABLE actions including this action are not supported"
@@ -28353,6 +28419,9 @@ fn into_validated_alter_table(
             table_name,
             new_table_name,
         }),
+        ParsedAlterTableShape::RowSecurity { table_name, action } => {
+            ValidatedAlterTable::RowSecurity(ValidatedAlterTableRowSecurity { table_name, action })
+        }
         ParsedAlterTableShape::SetSchema {
             table_name,
             schema_name,
@@ -41724,6 +41793,46 @@ mod body_expr_policy_tests {
         ] {
             let err = validate_alter_table(bad).expect_err(bad);
             assert_eq!(err.wire_code(), "42601", "{bad}");
+        }
+    }
+
+    /// 行セキュリティ切り替え 4 文を受理し（RLS-13・Issue #2275）、他形・混在・余剰は構文段で拒否する。
+    #[test]
+    fn alter_table_row_security_parses_and_rejects_bad_forms() {
+        use crate::catalog::row_security::RowSecurityAction as A;
+        for (sql, want) in [
+            ("ALTER TABLE docs ENABLE ROW LEVEL SECURITY", A::Enable),
+            ("alter table docs disable row level security;", A::Disable),
+            ("ALTER TABLE docs FORCE ROW LEVEL SECURITY", A::Force),
+            ("ALTER TABLE docs NO FORCE ROW LEVEL SECURITY", A::NoForce),
+        ] {
+            match validate_alter_table(sql).expect(sql) {
+                ValidatedAlterTable::RowSecurity(stmt) => {
+                    assert_eq!(stmt.table_name, "docs");
+                    assert_eq!(stmt.action, want, "{sql}");
+                }
+                other => panic!("unexpected: {other:?}"),
+            }
+        }
+        for bad in [
+            "ALTER TABLE docs ENABLE",
+            "ALTER TABLE docs ENABLE TRIGGER x",
+            "ALTER TABLE docs ENABLE RULE x",
+            "ALTER TABLE docs DISABLE TRIGGER ALL",
+            "ALTER TABLE docs NO ROW LEVEL SECURITY",
+            "ALTER TABLE docs NO FORCE",
+            "ALTER TABLE docs FORCE ROW LEVEL",
+            "ALTER TABLE docs ENABLE ROW LEVEL SECURITY extra",
+        ] {
+            let err = validate_alter_table(bad).expect_err(bad);
+            assert_eq!(err.wire_code(), "42601", "{bad}");
+        }
+        for mixed in [
+            "ALTER TABLE docs ENABLE ROW LEVEL SECURITY, FORCE ROW LEVEL SECURITY",
+            "ALTER TABLE docs ADD COLUMN z TEXT, ENABLE ROW LEVEL SECURITY",
+        ] {
+            let err = validate_alter_table(mixed).expect_err(mixed);
+            assert_eq!(err.wire_code(), "0A000", "{mixed}");
         }
     }
 
