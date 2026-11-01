@@ -171,8 +171,7 @@ fn parse_txn_mode_item(rest: &[Token]) -> Result<(TxnModeItem, &[Token]), SqlSur
 /// トランザクション制御文の規範形を受理する。`BEGIN`/`START TRANSACTION`/`COMMIT`/`END`/
 /// `ROLLBACK`/`ABORT`（`START TRANSACTION` 以外は `[WORK|TRANSACTION]` 修飾語を許容し、
 /// `BEGIN` に限りアクセスモード `READ ONLY`／`READ WRITE` を受理）。
-/// `AND [NO] CHAIN` と `PREPARE TRANSACTION` は `0A000`、分離レベル指定・`DEFERRABLE`・
-/// `$n`・重複／矛盾するモード等その他の後続句は `42601`（fail-closed）。先頭が制御文の語で
+/// 未対応・不正な後続句は拒否する（fail-closed。エラー契約は SQL-69・SQL-38 のポインタ先に従う）。先頭が制御文の語で
 /// あることは呼び出し元（[`is_transaction_control_head`]）が確認済みの前提。
 pub(crate) fn validate_transaction_control_tokens(
     tokens: &[Token],
@@ -277,7 +276,7 @@ pub(crate) fn validate_transaction_control_tokens(
 /// SQL テキストの先頭トークンが `ROLLBACK`／`ABORT`（大小無視）かどうか。明示トランザクションが
 /// `Failed` の間に受理してよい文かを parse 前に判定するために使う（SQL-31・TASK-221。
 /// `core::EngineCore::execute_sql_in_txn`、wire-server の拡張クエリ Parse が呼ぶ）。
-/// `END`・`COMMIT` は false（失敗状態では `25P02` で拒否する）。規範形の検証は通常どおり
+/// `END`・`COMMIT` は false（失敗状態では受理しない）。規範形の検証は通常どおり
 /// parse に任せる。字句解析に失敗した入力は `false`（fail-closed）。
 pub fn is_rollback_statement(sql: &str) -> bool {
     matches!(
