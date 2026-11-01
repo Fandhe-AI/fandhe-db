@@ -417,7 +417,7 @@ impl<'a, 'e> CorePlHost<'a, 'e> {
             let _tz = session_time_zone_scope(self.session);
             let resolver = self.core.schema_resolver(self.ctx);
             self.core
-                .parse_tokens_gated(tokens, self.session, Some(&resolver))?
+                .parse_tokens_gated(tokens, self.session, Some(&resolver), None)?
         };
         let writes = classify(&parsed)?;
         if parsed_operation_id(&parsed).is_some() || is_partitioned_write(&parsed) {

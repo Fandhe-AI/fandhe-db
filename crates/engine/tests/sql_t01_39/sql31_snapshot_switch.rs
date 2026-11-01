@@ -110,11 +110,7 @@ fn predicate_dml_after_writer_acquire_sees_rows_committed_before_acquire() {
     a.ok("UPDATE docs2 SET n = 2 WHERE n = 1 USING OPERATION_ID 'a-up'");
     a.ok("DELETE FROM docs2 WHERE n = 5 USING OPERATION_ID 'a-del'");
     a.ok("COMMIT");
-    let after = rows(ok(
-        &core,
-        &ctx("tenant-a"),
-        "SELECT id, n FROM docs2 LIMIT 100",
-    ));
+    let after = rows(ok(&core, &ctx("tenant-a"), "SELECT id, n FROM docs2"));
     assert_eq!(
         after.len(),
         1,
@@ -250,7 +246,7 @@ fn declare_and_copy_to_validate_against_begin_snapshot_catalog() {
             &a.ctx,
             &mut a.session,
             &mut a.txn,
-            "DECLARE d CURSOR FOR SELECT id, n FROM docs4 LIMIT 100",
+            "DECLARE d CURSOR FOR SELECT id, n FROM docs4",
         )
         .expect_err("table created after BEGIN is not in the snapshot");
     assert_eq!(err.wire_code(), "42P01", "{err:?}");
@@ -300,4 +296,45 @@ fn begin_snapshot_reads_do_not_poison_or_use_stale_cache() {
     assert_eq!(a.rows(q).len(), 3);
     assert_eq!(rows(ok(&core, &caller, q)).len(), 4);
     a.ok("COMMIT");
+}
+
+/// 通常の SELECT のビュー展開も `BEGIN` 時点のカタログで行う（Issue #2403）。`BEGIN` 後に他セッションが
+/// `CREATE OR REPLACE VIEW` で述語だけを変えても、writer 取得前の同一トランザクション内の結果は変わらず、
+/// BEGIN 後に作られたビューは見えない（`42P01`）。
+#[test]
+fn plain_select_expands_view_against_begin_snapshot_catalog() {
+    let (core, _g) = new_core("sql31-snap-view");
+    let sys = ctx("sys");
+    ok(&core, &sys, "CREATE TABLE tagged (tag TEXT)");
+    ok(
+        &core,
+        &ctx("tenant-a"),
+        "INSERT INTO tagged (id, tag) VALUES (1, 'a'), (2, 'b'), (3, 'c') USING OPERATION_ID 'tg'",
+    );
+    ok(
+        &core,
+        &sys,
+        "CREATE VIEW docs_v AS SELECT id FROM tagged WHERE tag = 'a'",
+    );
+    let before = rows(ok(&core, &ctx("tenant-a"), "SELECT id FROM docs_v"));
+    assert_eq!(before.len(), 1);
+    let mut a = Tx::new(&core, "tenant-a");
+    a.ok("BEGIN");
+
+    ok(
+        &core,
+        &sys,
+        "CREATE OR REPLACE VIEW docs_v AS SELECT id FROM tagged WHERE tag = 'b'",
+    );
+    ok(
+        &core,
+        &sys,
+        "CREATE VIEW docs_v2 AS SELECT id FROM tagged WHERE tag = 'c'",
+    );
+
+    assert_eq!(a.rows("SELECT id FROM docs_v LIMIT 100"), before);
+    let err = core
+        .execute_sql_in_txn(&a.ctx, &mut a.session, &mut a.txn, "SELECT id FROM docs_v2")
+        .expect_err("view created after BEGIN is not in the snapshot");
+    assert_eq!(err.wire_code(), "42P01", "{err:?}");
 }

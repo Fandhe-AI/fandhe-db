@@ -4994,6 +4994,7 @@ impl EngineCore {
         tokens: Vec<crate::sql::lexer::Token>,
         session: &crate::sql::mode::SessionState,
         resolver: Option<crate::sql::relation_name::SchemaResolver<'_>>,
+        read_snap: Option<&redb::ReadTransaction>,
     ) -> Result<ParsedSql, crate::sql::allowlist::SqlSurfaceError> {
         // 標準 SQL の行数制限句の正規化は、参照ゲート・一時カタログ走査より前に行う（Issue #1793）。
         // 正規化が `0A000`（入れ子・非 SELECT の `WITH TIES`）で失敗した場合も、`search_path` が
@@ -5012,12 +5013,12 @@ impl EngineCore {
         };
         // 実効 `search_path` に `public` が含まれる既定のセッションは何も足さない（追加コストなし）。
         if !session.search_path_hides_public() {
-            return self.parse_tokens_gated_inner(tokens, session, resolver);
+            return self.parse_tokens_gated_inner(tokens, session, resolver, read_snap);
         }
         // TABLE-27・Issue #1715: `public` が見えないセッションでは、一時表以外の未修飾のテーブル参照を
         // `42P01` にする。判定順は構文エラー `42601` → 参照ゲート `42P01` → その他の検証エラー。
         let gate = crate::sql::search_path::check_unqualified_refs(session, &tokens, &[]);
-        let parsed = self.parse_tokens_gated_inner(tokens, session, resolver);
+        let parsed = self.parse_tokens_gated_inner(tokens, session, resolver, read_snap);
         match (parsed, gate) {
             (Err(e), _) if e.wire_code() == "42601" => Err(e),
             (_, Err(gate_err)) => Err(gate_err),
@@ -5031,10 +5032,11 @@ impl EngineCore {
         tokens: Vec<crate::sql::lexer::Token>,
         session: &crate::sql::mode::SessionState,
         resolver: Option<crate::sql::relation_name::SchemaResolver<'_>>,
+        read_snap: Option<&redb::ReadTransaction>,
     ) -> Result<ParsedSql, crate::sql::allowlist::SqlSurfaceError> {
         let temp = session.temp_tables();
         if temp.is_empty() {
-            return self.parse_tokens_r(tokens, resolver);
+            return self.parse_tokens_r(tokens, resolver, read_snap);
         }
         // `public.<一時表の名前>` は永続側の関係を指すため、裸の名前へ解決すると一時表に化ける。
         // 解決より前に拒否する（TABLE-27・Issue #1714。fail-closed）。
@@ -5066,7 +5068,8 @@ impl EngineCore {
             || crate::sql::lock_table::is_lock_statement(&tokens);
         if txn_control_head || scan_exempt {
             let hits = crate::sql::temp_catalog::RelationHits::default();
-            let parsed = self.parse_tokens_in(tokens, temp, &hits, self.ledger_mode, resolver)?;
+            let parsed =
+                self.parse_tokens_in(tokens, temp, &hits, self.ledger_mode, resolver, read_snap)?;
             if hits.temp_hit() {
                 return Err(crate::sql::temp_catalog::temp_table_unsupported());
             }
@@ -5078,7 +5081,7 @@ impl EngineCore {
             return self.route_drop_index(tokens, session, resolver);
         }
         if !crate::sql::temp_catalog::tokens_reference_temp(&tokens, temp) {
-            return self.parse_tokens_r(tokens, resolver);
+            return self.parse_tokens_r(tokens, resolver, read_snap);
         }
         self.route_temp_statement(tokens, session, resolver)
     }
@@ -5216,7 +5219,7 @@ impl EngineCore {
         tokens: Vec<crate::sql::lexer::Token>,
     ) -> Result<ParsedSql, crate::sql::allowlist::SqlSurfaceError> {
         let tokens = Self::normalize_row_count_clauses(tokens)?;
-        self.parse_tokens_r(tokens, None)
+        self.parse_tokens_r(tokens, None, None)
     }
 
     /// 標準 SQL の `FETCH FIRST n ROWS ONLY`／`OFFSET n ROWS`／`WITH TIES` をトークン段で
@@ -5237,12 +5240,13 @@ impl EngineCore {
         &self,
         tokens: Vec<crate::sql::lexer::Token>,
         resolver: Option<crate::sql::relation_name::SchemaResolver<'_>>,
+        read_snap: Option<&redb::ReadTransaction>,
     ) -> Result<ParsedSql, crate::sql::allowlist::SqlSurfaceError> {
         // セッションを持たない入口（`parse_sql`・拡張クエリの Parse 等）は空の一時カタログで
         // 解決する（挙動は一時カタログ導入前と同一。TABLE-44・Issue #1681）。
         let temp = crate::sql::temp_catalog::SessionTempCatalog::default();
         let hits = crate::sql::temp_catalog::RelationHits::default();
-        self.parse_tokens_in(tokens, &temp, &hits, self.ledger_mode, resolver)
+        self.parse_tokens_in(tokens, &temp, &hits, self.ledger_mode, resolver, read_snap)
     }
 
     /// [`Self::parse_tokens`] のセッション一時カタログ対応版（TABLE-44・Issue #1681）。
@@ -5260,13 +5264,15 @@ impl EngineCore {
         hits: &crate::sql::temp_catalog::RelationHits,
         ledger_mode: LedgerMode,
         resolver: Option<crate::sql::relation_name::SchemaResolver<'_>>,
+        read_snap: Option<&redb::ReadTransaction>,
     ) -> Result<ParsedSql, crate::sql::allowlist::SqlSurfaceError> {
         // SELECT の行ロック句（SQL-38・Issue #1957）は、行数制限句の正規化の後・名前解決の前に
         // トークン列から取り除いて構文情報として保持し、既存の検証が文を受理した後に併用を検査する。
         // 構文誤りは `42601`、併用違反は `0A000`、`OF` の解決失敗は `42P01`。
         let tokens = Self::normalize_row_count_clauses(tokens)?;
         let (tokens, locking) = crate::sql::row_lock::extract_row_locking(tokens)?;
-        let parsed = self.parse_tokens_in_impl(tokens, temp, hits, ledger_mode, resolver)?;
+        let parsed =
+            self.parse_tokens_in_impl(tokens, temp, hits, ledger_mode, resolver, read_snap)?;
         let Some(locking) = locking else {
             return Ok(parsed);
         };
@@ -5294,6 +5300,7 @@ impl EngineCore {
         hits: &crate::sql::temp_catalog::RelationHits,
         ledger_mode: LedgerMode,
         resolver: Option<crate::sql::relation_name::SchemaResolver<'_>>,
+        read_snap: Option<&redb::ReadTransaction>,
     ) -> Result<ParsedSql, crate::sql::allowlist::SqlSurfaceError> {
         // 各入口で正規化済みでも冪等のため、ここでも最終的な保証として適用する（Issue #1793）。
         let mut tokens = Self::normalize_row_count_clauses(tokens)?;
@@ -5853,13 +5860,35 @@ impl EngineCore {
 
         // SQL-63・Issue #1876: 最上位の `WITH` にデータ変更 CTE を含む文だけが実行計画を持つ
         // （検出は `parse_with_clause` の結果。それ以外は従来どおり読み取りの `Statement`）。
-        match crate::sql::allowlist::validate_session_with_tokens(
-            &tokens,
-            &storage_lookup,
-            0,
-            self.nesting_limits,
-            ledger_mode,
-        )? {
+        // 明示トランザクションの writer 取得前（読み取り源が `BEGIN` 時点のスナップショット）は、
+        // 読み取り文の検証・ビュー展開も同じスナップショットのカタログで行う（Issue #2403。
+        // 最新の確定カタログで展開した文を古い行集合へ流さない）。
+        let validated = match read_snap {
+            Some(snap) => {
+                let snap_catalog = crate::catalog::ViewWriteSnapshot::over(snap);
+                let snap_lookup = crate::sql::temp_catalog::SessionRelationLookup::new(
+                    &snap_catalog,
+                    temp,
+                    hits.temp_cell(),
+                )
+                .with_persistent_hit(hits.persistent_cell());
+                crate::sql::allowlist::validate_session_with_tokens(
+                    &tokens,
+                    &snap_lookup,
+                    0,
+                    self.nesting_limits,
+                    ledger_mode,
+                )?
+            }
+            None => crate::sql::allowlist::validate_session_with_tokens(
+                &tokens,
+                &storage_lookup,
+                0,
+                self.nesting_limits,
+                ledger_mode,
+            )?,
+        };
+        match validated {
             crate::sql::allowlist::SessionWith::Statement(stmt) => Ok(ParsedSql::Statement(stmt)),
             crate::sql::allowlist::SessionWith::DataModifying(v) => {
                 Ok(ParsedSql::DataModifyingCte(v))
@@ -7512,7 +7541,7 @@ impl EngineCore {
         let parsed = {
             let _session_tz_scope = session_time_zone_scope(session);
             let resolver = self.schema_resolver(ctx);
-            self.parse_tokens_gated(tokens, session, Some(&resolver))?
+            self.parse_tokens_gated(tokens, session, Some(&resolver), None)?
         };
         // 一時カタログに対する細かいゲートは上の parse で通過済みのため、粗いゲートを持たない
         // 内部版を呼ぶ（TABLE-44・Issue #1681）。
@@ -7610,7 +7639,19 @@ impl EngineCore {
                     return Err(crate::sql::allowlist::SqlSurfaceError::NoActiveSqlTransaction);
                 }
                 let resolver = self.schema_resolver(ctx);
-                self.parse_tokens_gated(tokens, session, Some(&resolver))
+                // 明示トランザクションの writer 取得前は、読み取り文の検証・ビュー展開を
+                // `BEGIN` 時点のスナップショットのカタログで行う（Issue #2403）。
+                let read_snap = if txn.status()
+                    == crate::sql::transaction::TransactionStatus::InTransaction
+                {
+                    match txn.read_source()? {
+                        crate::sql::transaction::TxnReadSource::BeginSnapshot(snap) => Some(snap),
+                        _ => None,
+                    }
+                } else {
+                    None
+                };
+                self.parse_tokens_gated(tokens, session, Some(&resolver), read_snap)
             })();
             match parsed {
                 Ok(parsed) => parsed,

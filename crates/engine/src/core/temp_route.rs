@@ -343,6 +343,7 @@ impl EngineCore {
             &hits,
             LedgerMode::CompareOnlyWithoutLedger,
             resolver,
+            None,
         )?;
         // 索引 DDL はカタログを引かず構造だけを検証するため、`hits` では判定できない。
         // 対象の表が一時表なら一時コアで実行し、そうでなければ（一時表の名前が現れる永続表の索引は）
@@ -394,7 +395,7 @@ impl EngineCore {
         session: &SessionState,
         resolver: Option<crate::sql::relation_name::SchemaResolver<'_>>,
     ) -> Result<ParsedSql, SqlSurfaceError> {
-        let parsed = self.parse_tokens_r(tokens, resolver)?;
+        let parsed = self.parse_tokens_r(tokens, resolver, None)?;
         if let (ParsedSql::DropIndex(stmt), Some(store)) = (&parsed, session.temp_rows_arc()) {
             let is_temp_index = store
                 .core()?
