@@ -1987,6 +1987,13 @@ fn show_time_zone_columns() -> Vec<crate::sql::exec::ColumnMeta> {
 
 /// `SHOW search_path` の結果列（列名 `search_path`・text の 1 列。実行と Describe が共有する。
 /// TABLE-27・Issue #1715）。
+fn show_row_security_columns() -> Vec<crate::sql::exec::ColumnMeta> {
+    vec![crate::sql::exec::ColumnMeta::Computed {
+        name: "row_security".to_string(),
+        ty: Some(crate::catalog::ColumnType::Text),
+    }]
+}
+
 fn show_search_path_columns() -> Vec<crate::sql::exec::ColumnMeta> {
     vec![crate::sql::exec::ColumnMeta::Computed {
         name: "search_path".to_string(),
@@ -2451,6 +2458,8 @@ fn read_only_permits(parsed: &ParsedSql) -> bool {
                 | Statement::ShowTimeZone
                 | Statement::SetSearchPath { .. }
                 | Statement::ShowSearchPath
+                | Statement::SetRowSecurity { .. }
+                | Statement::ShowRowSecurity
         ),
         ParsedSql::Cursor(_) | ParsedSql::Do(_) => true,
         ParsedSql::Partitioned(control) => !control.writes(),
@@ -4277,6 +4286,13 @@ impl EngineCore {
                     "SET/SHOW search_path requires a session-aware entry point",
                 ))
             }
+            // RLS-13・Issue #2278: `row_security` もセッション変数（同じ決定的な契約）。
+            crate::sql::allowlist::Statement::SetRowSecurity { .. }
+            | crate::sql::allowlist::Statement::ShowRowSecurity => {
+                Err(crate::sql::allowlist::SqlSurfaceError::unsupported(
+                    "SET/SHOW row_security requires a session-aware entry point",
+                ))
+            }
             // TASK-79（SQL-9）: UDF 定義はセッションへ登録する statement のため、
             // セッションを持たないこのエントリポイントでは受理しない（`SET` と同じ
             // 「値の妥当性に関わらず一律 `42601`」の決定的な契約を踏襲する）。
@@ -4299,6 +4315,7 @@ impl EngineCore {
                     crate::sql::SqlOutcome::SetSearchMode(_)
                     | crate::sql::SqlOutcome::SetTimeZone
                     | crate::sql::SqlOutcome::SetSearchPath { .. }
+                    | crate::sql::SqlOutcome::SetRowSecurity { .. }
                     | crate::sql::SqlOutcome::Show(_)
                     | crate::sql::SqlOutcome::CreateFunction { .. }
                     | crate::sql::SqlOutcome::Explain(_)
@@ -4363,6 +4380,7 @@ impl EngineCore {
                     crate::sql::SqlOutcome::SetSearchMode(_)
                     | crate::sql::SqlOutcome::SetTimeZone
                     | crate::sql::SqlOutcome::SetSearchPath { .. }
+                    | crate::sql::SqlOutcome::SetRowSecurity { .. }
                     | crate::sql::SqlOutcome::Show(_)
                     | crate::sql::SqlOutcome::CreateFunction { .. }
                     | crate::sql::SqlOutcome::Explain(_)
@@ -4424,6 +4442,7 @@ impl EngineCore {
                     crate::sql::SqlOutcome::SetSearchMode(_)
                     | crate::sql::SqlOutcome::SetTimeZone
                     | crate::sql::SqlOutcome::SetSearchPath { .. }
+                    | crate::sql::SqlOutcome::SetRowSecurity { .. }
                     | crate::sql::SqlOutcome::Show(_)
                     | crate::sql::SqlOutcome::CreateFunction { .. }
                     | crate::sql::SqlOutcome::Explain(_)
@@ -4492,6 +4511,7 @@ impl EngineCore {
                     crate::sql::SqlOutcome::SetSearchMode(_)
                     | crate::sql::SqlOutcome::SetTimeZone
                     | crate::sql::SqlOutcome::SetSearchPath { .. }
+                    | crate::sql::SqlOutcome::SetRowSecurity { .. }
                     | crate::sql::SqlOutcome::Show(_)
                     | crate::sql::SqlOutcome::CreateFunction { .. }
                     | crate::sql::SqlOutcome::Explain(_)
@@ -4579,6 +4599,7 @@ impl EngineCore {
                     crate::sql::SqlOutcome::SetSearchMode(_)
                     | crate::sql::SqlOutcome::SetTimeZone
                     | crate::sql::SqlOutcome::SetSearchPath { .. }
+                    | crate::sql::SqlOutcome::SetRowSecurity { .. }
                     | crate::sql::SqlOutcome::Show(_)
                     | crate::sql::SqlOutcome::CreateFunction { .. }
                     | crate::sql::SqlOutcome::Explain(_)
@@ -5455,6 +5476,12 @@ impl EngineCore {
         if crate::sql::allowlist::is_show_search_path(&tokens) {
             return Ok(ParsedSql::Statement(
                 crate::sql::allowlist::Statement::ShowSearchPath,
+            ));
+        }
+        // RLS-13・Issue #2278: `SHOW row_security` も厳密一致のみ先に取り出す。
+        if crate::sql::allowlist::is_show_row_security(&tokens) {
+            return Ok(ParsedSql::Statement(
+                crate::sql::allowlist::Statement::ShowRowSecurity,
             ));
         }
 
@@ -8222,7 +8249,9 @@ impl EngineCore {
                 | Statement::SetTimeZone { .. }
                 | Statement::ShowTimeZone
                 | Statement::SetSearchPath { .. }
-                | Statement::ShowSearchPath),
+                | Statement::ShowSearchPath
+                | Statement::SetRowSecurity { .. }
+                | Statement::ShowRowSecurity),
             ) => self.execute_validated_in_session(ctx, session, stmt.clone()),
             // SQL-66（Issue #1920・#1922）: `CREATE [OR REPLACE] FUNCTION` は DDL 権限が無ければ `42501` で
             // 拒否する（fail-closed）。権限のあるセッションでも UDF カタログへ書く永続 DDL は独立した
@@ -8697,6 +8726,8 @@ impl EngineCore {
             | Statement::ShowTimeZone
             | Statement::SetSearchPath { .. }
             | Statement::ShowSearchPath
+            | Statement::SetRowSecurity { .. }
+            | Statement::ShowRowSecurity
             | Statement::CreateFunction { .. }
             | Statement::MaterializedView(_)
             | Statement::RecursiveCte(_)
@@ -9573,6 +9604,10 @@ impl EngineCore {
             // 列名 `search_path`（text）の 1 列固定。
             ParsedSql::Statement(Statement::SetSearchPath { .. }) => Ok(None),
             ParsedSql::Statement(Statement::ShowSearchPath) => Ok(Some(show_search_path_columns())),
+            ParsedSql::Statement(Statement::SetRowSecurity { .. }) => Ok(None),
+            ParsedSql::Statement(Statement::ShowRowSecurity) => {
+                Ok(Some(show_row_security_columns()))
+            }
             ParsedSql::Statement(Statement::CreateFunction { .. }) => Ok(None),
             // `EXPLAIN` は常に単一の `Computed` 列（`QUERY PLAN`）を返す
             // （`sql::explain::build_explain_result` と同一の列。中身の生成には
@@ -9897,6 +9932,33 @@ impl EngineCore {
                 }
                 Ok(crate::sql::SqlOutcome::SetSearchPath { reset })
             }
+            // RLS-13・Issue #2278: 構文段で検証済みの値をセッションへ代入する。`DEFAULT`・`RESET` は
+            // reset 値（起動パラメータ由来、無ければ on）へ戻す。利用者ポリシーの適用可否だけに作用し、
+            // テナント境界には作用しない。
+            crate::sql::allowlist::Statement::SetRowSecurity { value, reset } => {
+                match value {
+                    crate::sql::allowlist::RowSecuritySetting::On => session.set_row_security(true),
+                    crate::sql::allowlist::RowSecuritySetting::Off => {
+                        session.set_row_security(false)
+                    }
+                    crate::sql::allowlist::RowSecuritySetting::Default => {
+                        session.reset_row_security()
+                    }
+                }
+                Ok(crate::sql::SqlOutcome::SetRowSecurity { reset })
+            }
+            crate::sql::allowlist::Statement::ShowRowSecurity => Ok(crate::sql::SqlOutcome::Show(
+                crate::sql::exec::QueryResult {
+                    columns: show_row_security_columns(),
+                    rows: vec![crate::sql::exec::ResultRow {
+                        id: 0,
+                        score: 0.0,
+                        cells: vec![crate::sql::exec::Cell::Text(
+                            if session.row_security() { "on" } else { "off" }.to_string(),
+                        )],
+                    }],
+                },
+            )),
             crate::sql::allowlist::Statement::ShowSearchPath => Ok(crate::sql::SqlOutcome::Show(
                 crate::sql::exec::QueryResult {
                     columns: show_search_path_columns(),

@@ -809,6 +809,10 @@ pub(crate) fn map_outcome(outcome: SqlOutcome) -> OutcomeResponse {
         SqlOutcome::SetSearchPath { reset } => OutcomeResponse::Command {
             tag: if reset { "RESET" } else { "SET" }.to_string(),
         },
+        // RLS-13・Issue #2278: `SET row_security`／`RESET row_security` は `SET`／`RESET` タグ。
+        SqlOutcome::SetRowSecurity { reset } => OutcomeResponse::Command {
+            tag: if reset { "RESET" } else { "SET" }.to_string(),
+        },
         SqlOutcome::Show(result) => OutcomeResponse::Rows {
             result,
             shape: TagShape::Fixed("SHOW".to_string()),

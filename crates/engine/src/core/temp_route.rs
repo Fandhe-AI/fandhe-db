@@ -212,6 +212,8 @@ pub(crate) fn is_search_path_exempt(parsed: &ParsedSql) -> bool {
                     | Statement::ShowTimeZone
                     | Statement::SetSearchPath { .. }
                     | Statement::ShowSearchPath
+                    | Statement::SetRowSecurity { .. }
+                    | Statement::ShowRowSecurity
                     | Statement::CreateFunction { .. }
                     | Statement::ConstSelect(_)
             )

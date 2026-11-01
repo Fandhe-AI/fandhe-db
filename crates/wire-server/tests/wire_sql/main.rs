@@ -39,6 +39,7 @@ mod wire_policy_ddl;
 mod wire_result_rows_cap;
 mod wire_returning;
 mod wire_row_security;
+mod wire_row_security_setting;
 mod wire_scan;
 mod wire_scan_offset;
 mod wire_scan_order_by;
