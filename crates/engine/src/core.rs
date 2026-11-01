@@ -99,6 +99,9 @@ mod read_set_tests;
 mod commit_log_tests;
 #[cfg(test)]
 mod serialization_failure_tests;
+// `40001` の可視性境界・副作用ゼロの内部観測（Issue #2407。ポインタ: ERR-7・SQL-38・TABLE-3）。
+#[cfg(test)]
+mod serialization_failure_tenant_tests;
 // writer 遅延取得の前後の回帰固定（Issue #2402。ポインタ: SQL-19・SQL-31・TASK-333）。
 #[cfg(test)]
 mod deferred_writer_regression_tests;
