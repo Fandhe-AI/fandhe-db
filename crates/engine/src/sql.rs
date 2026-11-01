@@ -268,6 +268,7 @@ pub mod relation;
 pub(crate) mod relation_name;
 pub mod relation_snapshot;
 pub mod returning;
+pub mod row_lock;
 pub(crate) mod scalar_index;
 pub(crate) mod scalar_plan;
 pub mod scan;

@@ -1737,6 +1737,16 @@ pub enum ParsedSql {
     /// **BREAKING CHANGE**（Issue #1754）: 本 variant の追加により `ParsedSql` を網羅的に
     /// マッチするクレート外コードは追随が必要。
     DeleteUsing(Box<crate::sql::allowlist::ValidatedDeleteUsing>),
+    /// 行ロック句つきの `SELECT`（`FOR UPDATE`／`FOR NO KEY UPDATE`／`FOR SHARE`／`FOR KEY SHARE`、
+    /// `OF`、`NOWAIT`／`SKIP LOCKED`。SQL-38・Issue #1957）。構文解釈と併用検査（`sql::row_lock`）までを
+    /// 担い、実行入口は Issue #2230（ロックの取得）・#2231（`SKIP LOCKED` の実行）まで `0A000` で拒否する
+    /// （ロックを取らずに素の SELECT として実行する fail-open を作らない）。既存の [`Self::Statement`] に
+    /// フィールドを足さず別 variant にしているのは、句を黙って無視する経路を作らず、網羅 `match` の
+    /// 追随漏れをコンパイラに検出させるため。
+    ///
+    /// **BREAKING CHANGE**（Issue #1957）: 本 variant の追加により `ParsedSql` を網羅的に
+    /// マッチするクレート外コードは追随が必要（`#[non_exhaustive]`）。
+    LockingSelect(Box<crate::sql::row_lock::LockingSelect>),
     /// `BEGIN`／`COMMIT`／`ROLLBACK`（SQL-31・TASK-221）。トランザクション文脈を
     /// 持たない [`EngineCore::execute_parsed_in_session`] はこの variant を
     /// `0A000` で拒否する（トランザクション対応の実行入口は
@@ -2003,6 +2013,14 @@ fn session_time_zone_scope(
     crate::datetime::SessionTimeZoneScope::enter(session.time_zone().clone())
 }
 
+/// 行ロック句つき SELECT の暫定ゲート（SQL-38・Issue #1957）。ロックの取得は Issue #2230、
+/// `SKIP LOCKED` の実行は #2231 の担当で、それまでは受理した形も実行入口で `0A000` にする。
+fn row_lock_not_supported() -> crate::sql::allowlist::SqlSurfaceError {
+    crate::sql::allowlist::SqlSurfaceError::feature_not_supported(
+        "row-level locking clauses are not supported yet",
+    )
+}
+
 fn statement_clock_scope(
     parsed: &ParsedSql,
     txn_start_micros: Option<i64>,
@@ -2013,6 +2031,7 @@ fn statement_clock_scope(
             return statement_clock_scope(routed.inner(), txn_start_micros)
         }
         ParsedSql::Statement(_)
+        | ParsedSql::LockingSelect(_)
         | ParsedSql::Insert(_)
         | ParsedSql::InsertSelect(_)
         // SQL-63・Issue #1876: 副文と主クエリは同じ文の開始時刻を共有する。
@@ -2089,6 +2108,7 @@ fn insert_sequence_scope(
             .iter()
             .any(|d| d.command == crate::sql::returning::DmlCommand::Insert),
         ParsedSql::Statement(_)
+        | ParsedSql::LockingSelect(_)
         | ParsedSql::Truncate(_)
         | ParsedSql::Delete(_)
         | ParsedSql::Update(_)
@@ -2157,6 +2177,7 @@ fn insert_default_clock_scope(
             .iter()
             .any(|d| d.command == crate::sql::returning::DmlCommand::Insert),
         ParsedSql::Statement(_)
+        | ParsedSql::LockingSelect(_)
         | ParsedSql::Truncate(_)
         | ParsedSql::Delete(_)
         | ParsedSql::Update(_)
@@ -5237,6 +5258,40 @@ impl EngineCore {
         ledger_mode: LedgerMode,
         resolver: Option<crate::sql::relation_name::SchemaResolver<'_>>,
     ) -> Result<ParsedSql, crate::sql::allowlist::SqlSurfaceError> {
+        // SELECT の行ロック句（SQL-38・Issue #1957）は、行数制限句の正規化の後・名前解決の前に
+        // トークン列から取り除いて構文情報として保持し、既存の検証が文を受理した後に併用を検査する。
+        // 構文誤りは `42601`、併用違反は `0A000`、`OF` の解決失敗は `42P01`。
+        let tokens = Self::normalize_row_count_clauses(tokens)?;
+        let (tokens, locking) = crate::sql::row_lock::extract_row_locking(tokens)?;
+        let parsed = self.parse_tokens_in_impl(tokens, temp, hits, ledger_mode, resolver)?;
+        let Some(locking) = locking else {
+            return Ok(parsed);
+        };
+        match parsed {
+            ParsedSql::Statement(statement) => {
+                let locking = crate::sql::row_lock::check_row_locking(&statement, &locking)?;
+                Ok(ParsedSql::LockingSelect(Box::new(
+                    crate::sql::row_lock::LockingSelect { statement, locking },
+                )))
+            }
+            // 読み取り SELECT 以外（`setval`・データ変更 CTE など）に行ロック句は付けられない。
+            _ => Err(
+                crate::sql::allowlist::SqlSurfaceError::feature_not_supported(
+                    "row-level locking clauses are not supported for this statement",
+                ),
+            ),
+        }
+    }
+
+    /// [`Self::parse_tokens_in`] の本体（行ロック句を取り除いた後のトークン列を検証する）。
+    fn parse_tokens_in_impl(
+        &self,
+        tokens: Vec<crate::sql::lexer::Token>,
+        temp: &crate::sql::temp_catalog::SessionTempCatalog,
+        hits: &crate::sql::temp_catalog::RelationHits,
+        ledger_mode: LedgerMode,
+        resolver: Option<crate::sql::relation_name::SchemaResolver<'_>>,
+    ) -> Result<ParsedSql, crate::sql::allowlist::SqlSurfaceError> {
         // 各入口で正規化済みでも冪等のため、ここでも最終的な保証として適用する（Issue #1793）。
         let mut tokens = Self::normalize_row_count_clauses(tokens)?;
         // `schema.table` のテーブル参照を解決して未修飾の名前（public）または内部キー
@@ -7367,6 +7422,9 @@ impl EngineCore {
             ParsedSql::Statement(stmt) => {
                 self.execute_validated_in_session(ctx, session, stmt.clone())
             }
+            // SQL-38・Issue #1957: 行ロック句の取得は Issue #2230 まで未実装。ロックを取らずに素の
+            // SELECT として実行しない（fail-open にしない）。ストレージ・台帳・世代に触れる前に返す。
+            ParsedSql::LockingSelect(_) => Err(row_lock_not_supported()),
             // トランザクション文脈を持たない本エントリポイントは `BEGIN`／
             // `COMMIT`／`ROLLBACK` を受理しない（SQL-31・TASK-221。
             // トランザクション対応の実行入口は [`Self::execute_sql_in_txn`]）。
@@ -8039,6 +8097,9 @@ impl EngineCore {
             )),
             // COPY・DDL 等、明示トランザクション内での対応外の文（対象外。
             // `docs/design/explicit-transaction.md` 参照）。
+            // SQL-38・Issue #1957: セッション入口と同じ暫定ゲート（失敗は呼び出し元がトランザクションを
+            // `Failed` へ遷移させる）。
+            ParsedSql::LockingSelect(_) => Err(row_lock_not_supported()),
             _ => Err(SqlSurfaceError::transaction_feature_not_supported(
                 "this statement is not supported inside an explicit transaction",
             )),
@@ -8739,6 +8800,15 @@ impl EngineCore {
         let _session_tz_scope = session_time_zone_scope(session);
 
         match parsed {
+            // SQL-38・Issue #1957: 行ロック句の有無で結果列は変わらない。句を除いた文と同じ
+            // RowDescription を返す（副作用なし。実行は暫定ゲートで拒否）。
+            ParsedSql::LockingSelect(locking) => self.describe_parsed_in_session_impl(
+                session,
+                &ParsedSql::Statement(locking.statement().clone()),
+                skip_vector_literal_validation,
+                dummy_equality_flags,
+                limits,
+            ),
             // TABLE-44・Issue #1684: 一時表の文は一時コアが結果列を導出する。
             ParsedSql::SessionRouted(routed) if routed.is_persistent() => {
                 routed.require_current(session)?;
