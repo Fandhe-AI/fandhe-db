@@ -289,6 +289,7 @@ pub(super) fn update_rows_with_triggers(
             ctx.tenant_id(),
             &written,
             target.fk_check_mode(),
+            crate::constraint::RowPolicyWrite::Update,
         )?;
         // BEFORE ROW が SET に無い主キー・UNIQUE 列を書き換えうるため、BEFORE UPDATE の行トリガが
         // あれば全列を更新済みとして扱う（fail-closed）。文トリガは NEW を書き換えられないので、

@@ -1096,6 +1096,9 @@ pub enum SqlSurfaceError {
     /// 直列化の失敗（`40001`。ERR-7・SQL-38・TASK-333・Issue #2398）。
     /// 型の段階で表名・テナント・件数を持たせない（非漏えいの保証。#2407）。
     SerializationFailure,
+    /// 読み取り専用トランザクション内での書き込み系の文（`25006`。ERR-6・SQL-38・Issue #1934）。
+    /// 型の段階で表名・テナント・件数を持たせない（非漏えいの保証）。
+    ReadOnlySqlTransaction,
     /// 未実体化の MATERIALIZED VIEW を読んだ（`55000`。TABLE-42・Issue #1664）。
     /// 文言は固定で、名前・件数・他文脈の情報を含めない。
     MaterializedViewNotPopulated,
@@ -1262,6 +1265,15 @@ pub enum SqlSurfaceError {
     /// `tenant::TenantWriteError::ConflictTargetNotVisible` の写像先で、行 id・値・
     /// テナントを含まない固定文言のみを保持する。
     ConflictTargetNotVisible,
+    /// 利用者定義の行セキュリティポリシーの `WITH CHECK` 違反（RLS-13・Issue #2277）。`42501`
+    /// （`ErrorClass::ForbiddenTenantMismatch` を再利用）。`tenant::TenantWriteError::
+    /// RowSecurityPolicyViolation` の写像先で、自テナントの表名・ポリシー名だけを保持する
+    /// （行の値・id・他テナントの情報は含めない）。
+    RowSecurityPolicyViolation {
+        table: String,
+        policy: Option<String>,
+        using_expression: bool,
+    },
     /// `FETCH`／`CLOSE` が参照したカーソル名が、現在のトランザクション内に
     /// 存在しない（WIRE-15・TASK-218）。他セッション所有のカーソル名・単に
     /// 存在しない名前のいずれも区別しない固定文言のみを保持し、カーソル名
@@ -1912,6 +1924,7 @@ impl ClassifiedError for SqlSurfaceError {
             SqlSurfaceError::InFailedSqlTransaction => ErrorClass::InFailedSqlTransaction,
             SqlSurfaceError::LockNotAvailable => ErrorClass::LockNotAvailable,
             SqlSurfaceError::SerializationFailure => ErrorClass::SerializationFailure,
+            SqlSurfaceError::ReadOnlySqlTransaction => ErrorClass::ReadOnlySqlTransaction,
             SqlSurfaceError::MaterializedViewNotPopulated
             | SqlSurfaceError::MaterializedViewNotRefreshableConcurrently
             | SqlSurfaceError::SequenceNotYetDefined
@@ -1953,6 +1966,7 @@ impl ClassifiedError for SqlSurfaceError {
             | SqlSurfaceError::AggregateOrderByNotInArguments => ErrorClass::InvalidColumnReference,
             SqlSurfaceError::InsufficientPrivilege
             | SqlSurfaceError::ConflictTargetNotVisible
+            | SqlSurfaceError::RowSecurityPolicyViolation { .. }
             | SqlSurfaceError::SchemaDependencyForbidden => ErrorClass::ForbiddenTenantMismatch,
             SqlSurfaceError::InvalidCursorName => ErrorClass::InvalidCursorName,
             SqlSurfaceError::NoDataFound => ErrorClass::NoDataFound,
@@ -2122,6 +2136,9 @@ impl std::fmt::Display for SqlSurfaceError {
                     "could not serialize access due to read/write dependencies among transactions"
                 )
             }
+            SqlSurfaceError::ReadOnlySqlTransaction => {
+                write!(f, "cannot execute this statement in a read-only transaction")
+            }
             SqlSurfaceError::LockNotAvailable => {
                 write!(f, "write lock not available: timed out waiting for writer")
             }
@@ -2276,6 +2293,15 @@ impl std::fmt::Display for SqlSurfaceError {
                     "permission denied: ON CONFLICT DO UPDATE target row is not visible"
                 )
             }
+            SqlSurfaceError::RowSecurityPolicyViolation {
+                table,
+                policy,
+                using_expression,
+            } => f.write_str(&crate::tenant::row_security_violation_message(
+                table,
+                policy.as_deref(),
+                *using_expression,
+            )),
             // カーソル名・他セッション所有かどうかを一切含めない固定文言
             // （security.md P0。`SqlSurfaceError::InvalidCursorName` ドキュメント
             // 参照）。

@@ -399,7 +399,6 @@ fn list_in_txn<R: ReadSource>(src: &R, table_key: &str, scope: &str) -> Result<V
 
 /// 書き込み txn の中で `scope` の表 `table_key` のポリシーを名前の昇順で引く（適用側が文の開始時に同じ
 /// txn から読む入口。存在しないテーブルは作成せず空を返す。他テナントの定義は構造上引けない）。
-#[allow(dead_code)] // 適用側（USING・WITH CHECK の評価。後続 Issue）が使う読み取り入口。
 pub(crate) fn list_policies_in_txn(
     write_txn: &redb::WriteTransaction,
     scope: &str,

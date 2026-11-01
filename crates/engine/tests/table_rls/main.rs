@@ -48,6 +48,7 @@ mod rls11_read_your_writes;
 mod rls13_policy_ddl;
 mod rls13_policy_read_path_coverage;
 mod rls13_policy_using;
+mod rls13_policy_with_check;
 mod rls13_row_security;
 mod rls_generalized;
 mod rls_implicit;

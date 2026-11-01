@@ -9,6 +9,8 @@
 
 ### Added
 
+- `BEGIN READ ONLY` の Tx を開始できるようにし、書き込み系の文（DML・DDL・`COPY FROM`・ロック・`USING OPERATION_ID` 付き）を `25006`（`read_only_sql_transaction`）で拒否して Tx を `Failed` にする（Issue #1934・SQL-38 (3)・ERR-6）。判定は許可リスト方式で、writer・台帳・採番・カタログへ触れる前に拒否する。HTTP は 403 に射影する。
+  BREAKING CHANGE: 公開 enum `ErrorClass`・`SqlSurfaceError` に `ReadOnlySqlTransaction` を追加した。`BEGIN READ ONLY` は `0A000` ではなく開始できる。
 - `LOCK [TABLE] [ONLY] <表>[, ...] [IN <モード> MODE] [NOWAIT]` を受理し、トランザクション内で writer を取得して終了まで保持する（Issue #1958・SQL-38・TABLE-3）。8 モードと表・行の粒度は区別しない。`NOWAIT` は保持者がいれば待たずに `55P03`、トランザクション外は `25P01`、不在の表は `42P01`、ビュー等は `42809`。CommandComplete タグは `LOCK TABLE`。公開 enum `ParsedSql` に `Lock`、`SqlOutcome` に `Lock` を追加した（BREAKING CHANGE）。
 - `SELECT` の行ロック句（`FOR UPDATE`／`FOR NO KEY UPDATE`／`FOR SHARE`／`FOR KEY SHARE`、`OF <名前>[, ...]`、`NOWAIT`／`SKIP LOCKED`）を構文解釈する（Issue #1957・SQL-38）。解析結果は新しい `sql::row_lock`（`LockingSelect`・`RowLocking`・`RowLockClause`・`LockStrength`・`LockWaitPolicy`）の型で `ParsedSql::LockingSelect` として実行計画へ渡す。`DISTINCT`・`GROUP BY`・`HAVING`・集計・ウィンドウ関数・集合演算・外部結合で NULL を補う側との併用は `0A000`、`OF` が FROM の参照名に無ければ `42P01`。ロックの取得は #2230、`SKIP LOCKED` の実行は #2231 の担当で、それまで実行入口は `0A000` の暫定ゲートで拒否する。詳細は [explicit-transaction.md](docs/design/explicit-transaction.md)。
   挙動変更: 受理する形と併用違反は `42601` から `0A000`（`OF` の解決失敗は `42P01`）になった（構文誤りは従来どおり `42601`）。公開 enum `ParsedSql` に `LockingSelect` を追加した（BREAKING CHANGE）。

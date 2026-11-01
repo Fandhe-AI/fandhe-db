@@ -391,6 +391,17 @@ pub enum TenantWriteError {
     /// 痕跡ゼロ。RECOVER-11）。`42501`（`ForbiddenTenantMismatch`）へ写像し、id・値は
     /// 含めない固定文言にする。
     ConflictTargetNotVisible,
+    /// 利用者定義の行セキュリティポリシー（RLS-13・Issue #2277）の `WITH CHECK` が、書き込んだ新しい行を
+    /// 許可しない（`INSERT`・`UPDATE`・`ON CONFLICT DO UPDATE` の挿入側・更新側）。
+    /// `ON CONFLICT DO UPDATE` の既存行が `USING` を満たさないときは `using_expression` が真。
+    /// 単一の検査点（`constraint::enforce_row_constraints_in_txn`）が返し、`write_txn` は commit されず
+    /// 副作用ゼロ。`42501`（`ForbiddenTenantMismatch`）へ写像する。保持するのは自テナントの表名・
+    /// ポリシー名（RESTRICTIVE 違反のときだけ）だけで、行の値・id・他テナントの情報は含めない。
+    RowSecurityPolicyViolation {
+        table: String,
+        policy: Option<String>,
+        using_expression: bool,
+    },
     /// 上記と同じ commit 前 abort 契約だが、原因が `RETURNING` 結果セットの
     /// バイト量上限超過（`sql::returning::MAX_RETURNING_RESULT_BYTES`）である
     /// 場合の専用 variant。`54000`（`PayloadTooLarge`）へ写像し、クライアントが
@@ -684,7 +695,10 @@ impl crate::error_format::ClassifiedError for TenantWriteError {
         use crate::error_format::ErrorClass;
         match self {
             TenantWriteError::Forbidden => ErrorClass::ForbiddenTenantMismatch,
-            TenantWriteError::ConflictTargetNotVisible => ErrorClass::ForbiddenTenantMismatch,
+            TenantWriteError::ConflictTargetNotVisible
+            | TenantWriteError::RowSecurityPolicyViolation { .. } => {
+                ErrorClass::ForbiddenTenantMismatch
+            }
             TenantWriteError::NotFound => ErrorClass::RowNotFound,
             TenantWriteError::IdConflict => ErrorClass::UniqueViolation,
             TenantWriteError::DuplicateOperationId => ErrorClass::DuplicateOperationId,
@@ -740,6 +754,29 @@ impl crate::error_format::ClassifiedError for TenantWriteError {
     }
 }
 
+/// 行セキュリティポリシー違反（RLS-13・Issue #2277）の固定形の文言を組み立てる。`TenantWriteError`・
+/// `SqlSurfaceError` の `Display` が共有する唯一の整形点で、PostgreSQL 17 と同形
+/// （`new row violates row-level security policy ...`）。含めるのは自テナントの表名・ポリシー名だけで、
+/// 行の値・id・テナント・DETAIL は含めない。
+pub(crate) fn row_security_violation_message(
+    table: &str,
+    policy: Option<&str>,
+    using_expression: bool,
+) -> String {
+    let quote = |s: &str| format!("\"{}\"", s.replace('"', "\"\""));
+    let table = quote(table);
+    match (policy, using_expression) {
+        (Some(p), _) => format!(
+            "new row violates row-level security policy {} for table {table}",
+            quote(p)
+        ),
+        (None, true) => format!(
+            "new row violates row-level security policy (USING expression) for table {table}"
+        ),
+        (None, false) => format!("new row violates row-level security policy for table {table}"),
+    }
+}
+
 impl std::fmt::Display for TenantWriteError {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
@@ -750,6 +787,15 @@ impl std::fmt::Display for TenantWriteError {
                 f,
                 "permission denied: ON CONFLICT DO UPDATE target row is not visible"
             ),
+            TenantWriteError::RowSecurityPolicyViolation {
+                table,
+                policy,
+                using_expression,
+            } => f.write_str(&row_security_violation_message(
+                table,
+                policy.as_deref(),
+                *using_expression,
+            )),
             TenantWriteError::NotFound => write!(f, "tenant write target row not found"),
             TenantWriteError::IdConflict => write!(f, "tenant write id conflict"),
             TenantWriteError::MissingOperationId => write!(f, "missing operation_id"),
@@ -846,6 +892,9 @@ impl std::fmt::Debug for TenantWriteError {
         match self {
             TenantWriteError::Forbidden => f.write_str("Forbidden"),
             TenantWriteError::ConflictTargetNotVisible => f.write_str("ConflictTargetNotVisible"),
+            TenantWriteError::RowSecurityPolicyViolation { .. } => {
+                f.write_str("RowSecurityPolicyViolation")
+            }
             TenantWriteError::NotFound => f.write_str("NotFound"),
             TenantWriteError::IdConflict => f.write_str("IdConflict"),
             TenantWriteError::DuplicateOperationId => f.write_str("DuplicateOperationId"),
@@ -1107,6 +1156,7 @@ pub(crate) fn insert_row_unchecked(
             ctx.tenant_id(),
             &[RowId::from_legacy_id(id)],
             target.fk_check_mode(),
+            crate::constraint::RowPolicyWrite::Insert,
         )?;
         crate::catalog::bump_table_generation_in_txn(write_txn, table)?;
         Ok(((), TxnEffect::Wrote))
@@ -1300,6 +1350,7 @@ pub(crate) fn insert_rows_unchecked(
             ctx.tenant_id(),
             &ids,
             target.fk_check_mode(),
+            crate::constraint::RowPolicyWrite::Insert,
         )?;
         crate::catalog::bump_table_generation_in_txn(write_txn, table)?;
         Ok(((), TxnEffect::Wrote))
@@ -2112,6 +2163,7 @@ fn insert_typed_row_impl(
             ctx.tenant_id(),
             &[row_id],
             target.fk_check_mode(),
+            crate::constraint::RowPolicyWrite::Insert,
         )?;
         crate::catalog::bump_table_generation_in_txn(write_txn, table)?;
         Ok((InsertWriteReport { rows_written: 1 }, TxnEffect::Wrote))
@@ -2697,6 +2749,7 @@ pub(crate) fn insert_typed_rows_unchecked(
                 ctx.tenant_id(),
                 &ids,
                 target.fk_check_mode(),
+                crate::constraint::RowPolicyWrite::Insert,
             )?;
         }
         crate::catalog::bump_table_generation_in_txn(write_txn, table)?;
@@ -3304,6 +3357,38 @@ fn upsert_typed_rows_impl(
             // 書かなかった行は含めない（TABLE-16・TASK-204、Issue #903。
             // `constraint.rs` モジュールドキュメント参照）。
             let mut written_ids: Vec<u64> = Vec::new();
+            // `DO UPDATE` で更新した行の id（利用者定義ポリシーの更新側の `WITH CHECK` を掛ける対象。
+            // RLS-13・Issue #2277）。残りの `written_ids` は挿入側の規則で検査する。
+            let mut updated_write_ids: Vec<u64> = Vec::new();
+            // 利用者定義ポリシー（RLS-13・Issue #2277）。1 文につき 1 回コンパイルする。RLS が無効な
+            // 表では `None` で、費用は有効化状態の get 1 回だけ。
+            // - 提案行（VALUES の行）への INSERT 側 `WITH CHECK`: 衝突の有無・`DO NOTHING` を問わず
+            //   衝突判定の前に評価する（PostgreSQL の `ExecInsert` と同順）。
+            // - 既存行への `USING`（UPDATE 側・SELECT 側）: `DO UPDATE` で更新する可視な衝突先に掛ける。
+            let policy_proposed =
+                crate::sql::policy_eval::compile_in_txn(
+                    write_txn,
+                    ctx.tenant_id(),
+                    table,
+                    &schema,
+                    crate::sql::policy_eval::PolicyCheckKind::InsertCheck,
+                )?;
+            let policy_conflict_update =
+                crate::sql::policy_eval::compile_in_txn(
+                    write_txn,
+                    ctx.tenant_id(),
+                    table,
+                    &schema,
+                    crate::sql::policy_eval::PolicyCheckKind::ConflictUpdateUsing,
+                )?;
+            let policy_conflict_select =
+                crate::sql::policy_eval::compile_in_txn(
+                    write_txn,
+                    ctx.tenant_id(),
+                    table,
+                    &schema,
+                    crate::sql::policy_eval::PolicyCheckKind::ConflictSelectUsing,
+                )?;
             // 対象省略（SQL-49、Issue #1736）の衝突判定器。行の書き込み前に永続索引を最新にする。
             // 索引テーブルのハンドルは `enforce_row_constraints_in_txn` の前に drop する。
             let mut any_unique_probe: Option<crate::constraint::AnyUniqueProbe<'_>> =
@@ -3332,6 +3417,24 @@ fn upsert_typed_rows_impl(
                     })?,
                     None => *id,
                 };
+                // 提案行への INSERT 側ポリシー検査（RLS-13・Issue #2277）。衝突判定より前。
+                if let Some(checks) = policy_proposed.as_ref() {
+                    let proposed_embedding: &[f32] = match vector_idx {
+                        Some(idx) => match values.get(idx) {
+                            Some(crate::row_codec::Value::Vector(v)) => v.as_slice(),
+                            _ => {
+                                return Err(TenantWriteError::Catalog(CatalogError::Invalid(
+                                    "VECTOR column value missing or not a Vector".to_string(),
+                                )))
+                            }
+                        },
+                        None => &[],
+                    };
+                    let proposed_metadata =
+                        crate::row_codec::encode_scalar_columns(&schema, values)
+                            .map_err(|e| CatalogError::Invalid(e.to_string()))?;
+                    checks.enforce(&schema, insert_id, proposed_embedding, &proposed_metadata)?;
+                }
                 // 衝突判定の対象行 id を対象ごとに決定する（Issue #1074）。`(id)`
                 // 対象は常に VALUES 自身の `id` で判定する（既存挙動、無変更）。
                 // UNIQUE 対象は上記の事前走査で一致した既存行の `id` を使う（対象
@@ -3476,6 +3579,20 @@ fn upsert_typed_rows_impl(
                                     )));
                                 }
                             };
+                            // 既存行への利用者定義ポリシーの `USING`（RLS-13・Issue #2277）。テナント境界
+                            // （所有 ∩ 可視。上の `Invisible` 分岐）の後、`DO UPDATE ... WHERE` の前に評価する
+                            // （`WHERE` の評価結果・エラーが既存行の内容を漏らさないため。fail-closed）。
+                            for checks in [policy_conflict_update.as_ref(), policy_conflict_select.as_ref()]
+                                .into_iter()
+                                .flatten()
+                            {
+                                checks.enforce(
+                                    &schema,
+                                    write_id,
+                                    &existing.embedding,
+                                    &existing.metadata,
+                                )?;
+                            }
                             // `DO UPDATE ... WHERE`（SQL-49 (3)、Issue #1740）: 所有かつ可視と確定した
                             // 衝突行だけを、書き換え・`pre_images` 記録・`RETURNING` 投影・件数加算の
                             // **前**に評価する。偽・NULL の行は何も残さず次の行へ進み、SET の右辺も
@@ -3705,6 +3822,7 @@ fn upsert_typed_rows_impl(
                                 ))
                             })?;
                             written_ids.push(write_id);
+                            updated_write_ids.push(write_id);
                         }
                     }
                 } else {
@@ -3771,6 +3889,10 @@ fn upsert_typed_rows_impl(
                     .iter()
                     .map(|&id| RowId::from_legacy_id(id))
                     .collect();
+                let updated_rowids: Vec<RowId> = updated_write_ids
+                    .iter()
+                    .map(|&id| RowId::from_legacy_id(id))
+                    .collect();
                 let delta = crate::constraint::enforce_row_constraints_in_txn(
                     write_txn,
                     table,
@@ -3778,6 +3900,7 @@ fn upsert_typed_rows_impl(
                     ctx.tenant_id(),
                     &written_rowids,
                     write_target.fk_check_mode(),
+                    crate::constraint::RowPolicyWrite::Upsert { updated_ids: &updated_rowids },
                 )?;
                 // `DO UPDATE` で既存行を更新した場合、このテーブルを参照先とする
                 // `FOREIGN KEY`（TABLE-17・TASK-205、Issue #907）の参照先側を検査
@@ -3976,6 +4099,7 @@ pub(crate) fn update_row_unchecked(
                 ctx.tenant_id(),
                 &[RowId::from_legacy_id(id)],
                 target.fk_check_mode(),
+                crate::constraint::RowPolicyWrite::Update,
             )?;
             // 全列置換は参照先キー（主キー・UNIQUE 構成列）を変え得るため、このテーブルを
             // 参照先とする `FOREIGN KEY` の参照先側も検査する（TABLE-17・TASK-205、
@@ -5257,6 +5381,7 @@ fn update_row_columns_impl(
                     ctx.tenant_id(),
                     &[RowId::from_legacy_id(id)],
                     target.fk_check_mode(),
+                    crate::constraint::RowPolicyWrite::Update,
                 )?;
                 // このテーブルを参照先とする `FOREIGN KEY` の参照先側（TABLE-17・
                 // TASK-205、Issue #907。SET 列が主キー・UNIQUE 構成列を含む場合のみ
@@ -7373,6 +7498,7 @@ fn apply_predicate_update_in_txn<E>(
             ctx.tenant_id(),
             &candidate_rowids,
             fk_mode,
+            crate::constraint::RowPolicyWrite::Update,
         )
         .map_err(dml_write_err)?;
         // このテーブルを参照先とする `FOREIGN KEY` の参照先側（TABLE-17・TASK-205、
@@ -8118,6 +8244,7 @@ pub(crate) fn replace_typed_rows_by_text_key(
                     ctx.tenant_id(),
                     &ids,
                     target.fk_check_mode(),
+                    crate::constraint::RowPolicyWrite::Insert,
                 )?;
             }
         }

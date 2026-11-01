@@ -76,7 +76,7 @@ const TABLE: &[(&str, usize, Class, &str)] = &[
     ),
     (
         "constraint.rs",
-        21,
+        22,
         Class::NonRead,
         "一意性・参照整合性・CHECK の検査。テナント内の全行で判定する（ポリシーで隠れた行も含む。親 #2272 の規則）",
     ),

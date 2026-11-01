@@ -1806,6 +1806,7 @@ mod tests {
             "tenant-a",
             &[RowId::from_legacy_id(2)],
             crate::constraint::FkCheckMode::All,
+            crate::constraint::RowPolicyWrite::Internal,
         )
         .expect("C's own FK check (parent_code=NULL) must pass");
         let result = crate::constraint::enforce_referencing_rows_in_txn(
