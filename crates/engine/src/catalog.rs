@@ -2078,6 +2078,8 @@ fn rewrite_views_for_renamed_table_in_txn(
         views_table
             .insert(name.as_str(), encoded.as_slice())
             .map_err(CatalogError::from)?;
+        // commit 記録（SQL-38・Issue #2404）: ビュー定義の書き換えは表世代を進めないため DDL として記録する。
+        crate::storage::commit_log::note_ddl(write_txn, name);
     }
     Ok(())
 }
@@ -2221,6 +2223,8 @@ fn rewrite_views_for_renamed_column_in_txn(
         views_table
             .insert(name.as_str(), encoded.as_slice())
             .map_err(CatalogError::from)?;
+        // commit 記録（SQL-38・Issue #2404）: ビュー定義の書き換えは表世代を進めないため DDL として記録する。
+        crate::storage::commit_log::note_ddl(write_txn, name);
     }
     Ok(())
 }
@@ -3491,6 +3495,9 @@ pub enum CatalogError {
     /// トランザクションの取得がロック待ちの上限を超過した（`storage::StorageError`
     /// から写像。[`convert_storage_error`] 参照）。
     WriteLockTimeout,
+    /// commit が書き込んだ表の足跡を安全に記録できず commit 前に拒否された（Issue #2404。
+    /// `StorageError::CommitFootprintUnrecordable` の型付き保持。SQL 表層では `54000` の固定文言）。
+    CommitFootprintUnrecordable,
     /// `ALTER TABLE ... DROP COLUMN`／`ALTER COLUMN ... TYPE` が参照した列名が
     /// 対象テーブルに存在しない（TABLE-19・TASK-203、Issue #901）。
     ColumnNotFound(String),
@@ -3632,6 +3639,9 @@ impl fmt::Display for CatalogError {
             CatalogError::WriteLockTimeout => {
                 write!(f, "write lock not available: timed out waiting for writer")
             }
+            CatalogError::CommitFootprintUnrecordable => {
+                write!(f, "commit footprint limit exceeded")
+            }
             CatalogError::ColumnNotFound(name) => write!(f, "column not found: {name}"),
             CatalogError::ProtectedColumn(name) => {
                 write!(
@@ -3721,6 +3731,7 @@ impl std::error::Error for CatalogError {
             | CatalogError::IncompatibleTypeChange { .. }
             | CatalogError::UniqueConstraintViolation
             | CatalogError::WriteLockTimeout
+            | CatalogError::CommitFootprintUnrecordable
             | CatalogError::TooManyColumns { .. }
             | CatalogError::IndexAlreadyExists(_)
             | CatalogError::IndexNotFound(_)
@@ -5599,6 +5610,8 @@ fn drop_view_in_txn(write_txn: &redb::WriteTransaction, name: &str) -> Result<()
     if views_table.remove(name)?.is_none() {
         return Err(CatalogError::ViewNotFound(name.to_string()));
     }
+    // commit 記録（SQL-38・Issue #2404）: ビュー定義の変更は表世代を進めないため DDL として記録する。
+    crate::storage::commit_log::note_ddl(write_txn, name);
     Ok(())
 }
 
@@ -11692,9 +11705,7 @@ pub(crate) fn convert_storage_error(e: StorageError) -> CatalogError {
         }
         // commit 記録の足跡を安全に記録できない書き込みは commit 前に拒否される（固定文言。
         // テナント ID・表名・件数を含めない。Issue #2404）。
-        StorageError::CommitFootprintUnrecordable => {
-            CatalogError::Invalid("commit footprint limit exceeded".to_string())
-        }
+        StorageError::CommitFootprintUnrecordable => CatalogError::CommitFootprintUnrecordable,
     }
 }
 
@@ -15082,6 +15093,8 @@ impl Storage {
                 ));
             }
             views_table.insert(name, encoded.as_slice())?;
+            // commit 記録（SQL-38・Issue #2404）: ビュー定義の変更は表世代を進めないため DDL として記録する。
+            crate::storage::commit_log::note_ddl(&write_txn, name);
         }
         crate::recovery::commit_boundary::commit(write_txn).map_err(convert_storage_error)
     }
@@ -15144,6 +15157,8 @@ impl Storage {
                 if views_table.remove(name)?.is_none() {
                     return Err(CatalogError::ViewNotFound(name.to_string()));
                 }
+                // commit 記録（SQL-38・Issue #2404）: ビュー定義の変更は表世代を進めないため DDL として記録する。
+                crate::storage::commit_log::note_ddl(&write_txn, name);
                 Vec::new()
             }
             DropBehavior::Cascade => {
@@ -15847,6 +15862,8 @@ impl Storage {
                 }
             }
             views_table.insert(name, encoded.as_slice())?;
+            // commit 記録（SQL-38・Issue #2404）: ビュー定義の変更は表世代を進めないため DDL として記録する。
+            crate::storage::commit_log::note_ddl(&write_txn, name);
             // 置換（旧定義あり）では、未 commit の新定義を前提に依存ビューを同一 txn で
             // 再検証する。失敗は `?` で txn ごと破棄され、旧定義が残る（原子性）。
             if current.is_some() {
@@ -16624,6 +16641,9 @@ pub(crate) fn table_lookup_error(e: CatalogError) -> SqlSurfaceError {
         // 取得しないため通常は到達しないが、`CatalogError` の網羅性のためここでも
         // 扱う（SQL-31・TASK-221）。
         CatalogError::WriteLockTimeout => SqlSurfaceError::LockNotAvailable,
+        CatalogError::CommitFootprintUnrecordable => SqlSurfaceError::Internal {
+            detail: "catalog lookup failed".to_string(),
+        },
     }
 }
 

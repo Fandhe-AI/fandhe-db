@@ -482,7 +482,15 @@ pub(crate) struct FootprintHandle {
 
 impl Drop for FootprintHandle {
     fn drop(&mut self) {
-        frames_lock().remove(&self.addr);
+        // 登録解除は自分の frame と同一のときだけ行う。Box の解放後に別の write トランザクションが
+        // 同じアドレスを再利用して登録している場合、その新しい登録を消してはならない。
+        let mut frames = frames_lock();
+        if frames
+            .get(&self.addr)
+            .is_some_and(|f| Arc::ptr_eq(f, &self.frame))
+        {
+            frames.remove(&self.addr);
+        }
     }
 }
 
@@ -600,6 +608,25 @@ impl CommitSession {
                 continue;
             }
             tables.push((Box::<str>::from(key.as_ref()), fp.clone()));
+        }
+        // 表世代を持たない関係（ビュー定義の変更）は `written` に現れない。DDL として記録された
+        // frame の要素は、写し漏れて偽陰性にならないようここで追加する。
+        let mut extra: Vec<&Box<str>> = st
+            .tables
+            .iter()
+            .filter(|(name, fp)| {
+                fp.ddl
+                    && !tables
+                        .iter()
+                        .any(|(recorded, _)| recorded.as_ref() == name.as_ref())
+            })
+            .map(|(name, _)| name)
+            .collect();
+        extra.sort();
+        for name in extra {
+            if let Some(fp) = st.tables.get(name.as_ref()) {
+                tables.push((name.clone(), fp.clone()));
+            }
         }
         Ok(Some(CommitRecord {
             generation: 0,

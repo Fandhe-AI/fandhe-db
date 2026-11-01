@@ -444,3 +444,47 @@ fn upsert_update_side_is_recorded() {
     assert!(!fp.private_tenants.contains("tenant-a"));
     rollback(&core, "tenant-a", &mut txn);
 }
+
+// --- ビュー DDL・足跡登録の寿命（PR #2835 レビュー指摘） ---------------------------------------
+
+#[test]
+fn view_definition_changes_are_recorded_as_ddl() {
+    let (core, _g) = new_core("clog-view-ddl");
+    let (mut txn, g_s) = begin(&core, "tenant-a");
+
+    core.storage
+        .create_view("vw", "ca", "SELECT n FROM ca")
+        .expect("create view");
+    let old = core.storage.view_definition("vw").expect("get view");
+    core.storage
+        .create_or_replace_view_checked(
+            "vw",
+            "ca",
+            "SELECT embedding FROM ca",
+            &[],
+            old.as_ref(),
+            None,
+            true,
+            crate::catalog::ViewCheckOption::None,
+        )
+        .expect("replace view");
+    core.storage.drop_view("vw").expect("drop view");
+
+    let recs = records(&core, g_s).expect("verifiable");
+    assert_eq!(recs.len(), 3, "{recs:?}");
+    for rec in &recs {
+        assert!(footprint(rec, "vw").ddl, "{rec:?}");
+    }
+    rollback(&core, "tenant-a", &mut txn);
+}
+
+#[test]
+fn repeated_write_txns_are_never_rejected_by_a_reused_frame_address() {
+    let (core, _g) = new_core("clog-handle-reuse");
+    for _ in 0..16 {
+        let w = core.storage.begin_write_txn().expect("write txn");
+        crate::storage::commit_log::note_row(&w, "ca", "tenant-x", Visibility::Private);
+        crate::catalog::bump_table_generation_in_txn(&w, "ca").expect("bump");
+        crate::recovery::commit_boundary::commit(w).expect("a normal commit must not be rejected");
+    }
+}

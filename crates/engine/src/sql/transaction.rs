@@ -1344,10 +1344,19 @@ fn commit_active(
             Ok(())
         }
     };
-    result.map_err(|_| {
+    result.map_err(|e| {
         // commit 失敗はロールバック扱い（writer は消費済みで、permit も解放されている）。
         *session = session_at_begin;
-        internal_error()
+        match e {
+            // 足跡を記録できない書き込みは redb の commit 前に拒否される（Issue #2404）。
+            // 文実行時の上限超過と同じ `54000`・固定文言で返す（`internal_error` へ丸めない）。
+            crate::storage::StorageError::CommitFootprintUnrecordable => {
+                SqlSurfaceError::PayloadTooLarge {
+                    detail: "commit footprint limit exceeded".to_string(),
+                }
+            }
+            _ => internal_error(),
+        }
     })?;
     // 永続側の commit 成功後にだけ、一時側を確定し、続けて一時表の `ON COMMIT` 動作を適用する
     // （TABLE-44・Issue #1683・#1684。ROLLBACK・永続側の commit 失敗では `temp` を drop（abort）

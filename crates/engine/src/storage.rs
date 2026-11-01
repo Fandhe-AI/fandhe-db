@@ -422,16 +422,17 @@ pub type Result<T> = std::result::Result<T, StorageError>;
 /// の中で無期限に待つことはなく、ゲートの待機上限（`write_lock_wait`）で
 /// `55P03` へ倒れる。`Deref`/`DerefMut` で `redb::WriteTransaction` として扱える。
 ///
-/// フィールドの宣言順が drop 順序を決める（`txn` を先に drop＝abort してから
-/// `_permit` を解放する）。並べ替えてはならない。
+/// フィールドの宣言順が drop 順序を決める（`recording` の登録解除 → `txn` の abort →
+/// `_permit` の解放の順）。並べ替えてはならない。
 pub(crate) struct GatedWriteTxn {
+    /// commit 記録の付帯物（永続ストレージだけ。一時表用のストレージは `None`）。
+    /// 先頭に置くのは、`txn`（Box のアドレス）・`_permit` より先に frame の登録を外すため
+    /// （permit 解放後にアドレスが再利用されて新しい登録と競合しないように）。
+    recording: Option<commit_log::CommitSession>,
     /// `Box` に入れるのは、書き込み点が `&redb::WriteTransaction` から commit 記録の frame を
     /// 引くためのアドレス（[`commit_log::note_row`] 参照）を寿命中固定するため。
     txn: Box<redb::WriteTransaction>,
     _permit: writer_gate::WriterPermit,
-    /// commit 記録の付帯物（永続ストレージだけ。一時表用のストレージは `None`）。
-    /// 宣言順が drop 順で、`txn`・`_permit` より後に frame の登録を外す。
-    recording: Option<commit_log::CommitSession>,
 }
 
 impl std::ops::Deref for GatedWriteTxn {
