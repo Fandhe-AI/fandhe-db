@@ -1159,6 +1159,7 @@ Date: <IMF-fixdate>
 | `25P02` | `IN_FAILED_SQL_TRANSACTION` | 400 | Bad Request | NoSQL 表層の実要求からは到達不能（同上） |
 | `2BP01` | `DEPENDENT_OBJECTS_STILL_EXIST` | 400 | Bad Request | NoSQL 表層の実要求からは到達不能（`DROP TABLE`／`DROP VIEW` は SQL 表層専用の DDL。後述） |
 | `2F005` | `FUNCTION_EXECUTED_NO_RETURN_STATEMENT` | 400 | Bad Request | PL/pgSQL のスカラー関数が `RETURN` に達せず終わりに到達（SQL 表層の PL/pgSQL 専用。NoSQL の `op` 語彙からは到達しない）。Issue #2225・SQL-68 |
+| `3B001` | `INVALID_SAVEPOINT_SPECIFICATION` | 400 | Bad Request | `RELEASE`／`ROLLBACK TO` が存在しない savepoint 名を指した（SQL 表層専用。NoSQL にはトランザクション制御が無く到達不能。Issue #1942・SQL-69） |
 | `42601` | `UNSUPPORTED_SQL_SYNTAX` | 400 | Bad Request | JSON 構文エラー、`op` 別スキーマ違反、`tenant_id` 相当値の自己申告 |
 | `42701` | `DUPLICATE_COLUMN` | 400 | Bad Request | NoSQL 表層の実要求からは到達不能（`CREATE TABLE`・`ALTER TABLE ADD COLUMN` は op 許可リスト外。後述） |
 | `42702` | `AMBIGUOUS_COLUMN` | 400 | Bad Request | `aggregate.sort` が複数一致する出力名を参照したとき到達可能（Issue #1270）。`INNER JOIN`〔SQL-28・RLS-10、Issue #925〕は NoSQL 表層の op 語彙に無い。後述 |
@@ -1195,7 +1196,6 @@ Date: <IMF-fixdate>
 | `25006` | `READ_ONLY_SQL_TRANSACTION` | 403 | Forbidden | 読み取り専用トランザクション内で書き込み系の文を実行した（SQL 表層専用。NoSQL にはトランザクション制御が無く到達不能。Issue #1934・ERR-6） |
 | `42501` | `FORBIDDEN_TENANT_MISMATCH` | 403 | Forbidden | NoSQL 表層の実要求からは到達不能（射影のみ production エンコーダで固定。後述） |
 | `34000` | `INVALID_CURSOR_NAME` | 404 | Not Found | NoSQL 表層の実要求からは到達不能（カーソル〔`DECLARE`／`FETCH`／`CLOSE`〕は SQL 表層専用で op 許可リストに無い。後述） |
-| `3B001` | `INVALID_SAVEPOINT_SPECIFICATION` | 400 | Bad Request | `RELEASE`／`ROLLBACK TO` が存在しない savepoint 名を指した（SQL 表層専用。NoSQL にはトランザクション制御が無く到達不能。Issue #1942・SQL-69） |
 | `3F000` | `INVALID_SCHEMA_NAME` | 404 | Not Found | 呼び出し元テナントに存在しない SCHEMA を指した（TABLE-27・Issue #1713。他テナントの名前も同じ応答。NoSQL 表層からは到達しない） |
 | `42P01` | `TABLE_NOT_FOUND` | 404 | Not Found | 未定義テーブルへの `search`／`scan`／`aggregate`／`insert` |
 | `P0002` | `ROW_NOT_FOUND` | 404 | Not Found | NoSQL 表層の実要求からは到達不能（対応する op が許可リストに無い。後述） |
