@@ -1985,8 +1985,8 @@ fn show_time_zone_columns() -> Vec<crate::sql::exec::ColumnMeta> {
     }]
 }
 
-/// `SHOW search_path` の結果列（列名 `search_path`・text の 1 列。実行と Describe が共有する。
-/// TABLE-27・Issue #1715）。
+/// `SHOW row_security` の結果列（列名 `row_security`・text の 1 列。実行と Describe が共有する。
+/// RLS-13・Issue #2278）。
 fn show_row_security_columns() -> Vec<crate::sql::exec::ColumnMeta> {
     vec![crate::sql::exec::ColumnMeta::Computed {
         name: "row_security".to_string(),
@@ -1994,6 +1994,8 @@ fn show_row_security_columns() -> Vec<crate::sql::exec::ColumnMeta> {
     }]
 }
 
+/// `SHOW search_path` の結果列（列名 `search_path`・text の 1 列。実行と Describe が共有する。
+/// TABLE-27・Issue #1715）。
 fn show_search_path_columns() -> Vec<crate::sql::exec::ColumnMeta> {
     vec![crate::sql::exec::ColumnMeta::Computed {
         name: "search_path".to_string(),
