@@ -492,7 +492,10 @@ pub(crate) fn execute_drop_function(
 ) -> Result<DropFunctionOutcome, SqlSurfaceError> {
     // 権限検査は保存先（カタログ／セッション内）の振り分けより前。`IF EXISTS` でも `42501` にして、
     // 権限の無いセッションに対象の有無を区別させない（SQL-66・Issue #1922・fail-closed）。
-    crate::sql::ddl::require_ddl_permission(session)?;
+    crate::sql::privilege_gate::require_ddl(
+        session,
+        crate::sql::privilege_gate::DdlStatementKind::DropFunction,
+    )?;
     let mut removed = false;
     removed |= drop_from_catalog(storage, tenant_id, stmt)?;
     // 型の並びがある場合、セッション内の定義は引数の数と（型注釈のある引数の）型で照合する。

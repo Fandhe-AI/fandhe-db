@@ -202,7 +202,7 @@ pub struct SessionState {
     /// スコープの操作ではない）。付与は認証層（wire-server の handshake）が
     /// 認証成功後に 1 回だけ行う契約——SQL 文経由で自身の権限を昇格する経路は
     /// 構造的に存在しない（[`Self::allow_ddl`] 以外に本フィールドを変更する
-    /// 公開手段を持たない）。`sql::ddl::require_ddl_permission` が唯一の判定点。
+    /// 公開手段を持たない）。`sql::privilege_gate` が唯一の判定点（`require_ddl_permission` はそのファサード）。
     ddl_allowed: bool,
     /// TASK-79（SQL-9）: `CREATE FUNCTION` で登録した宣言的 UDF のセッション単位
     /// レジストリ。`SessionState` 自体が接続（＝認証済みテナント）単位の値型であるため、
@@ -540,7 +540,7 @@ impl SessionState {
     }
 
     /// このセッションが DDL 実行権限（SQL-23、TASK-203、Issue #902）を持つか。
-    /// [`crate::sql::ddl::require_ddl_permission`] が唯一の判定点として参照する。
+    /// [`crate::sql::privilege_gate`] が唯一の判定点として参照する。
     pub fn ddl_allowed(&self) -> bool {
         self.ddl_allowed
     }

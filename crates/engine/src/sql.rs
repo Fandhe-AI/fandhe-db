@@ -45,7 +45,7 @@
 //! - [`using_operation_id`][]: `USING OPERATION_ID '<id>'` 文末句の値型・検証（TASK-80）
 //! - [`ddl`][]: `CREATE TABLE`／`DROP TABLE`／`ALTER TABLE ADD COLUMN`（SQL-23・
 //!   TASK-202・TASK-203、Issue #899・#900・#902）の DDL 実行権限ゲート
-//!   （`require_ddl_permission`。DDL 全般が通る単一の判定点）と実行本体
+//!   （`sql::privilege_gate` が唯一の判定点。`require_ddl_permission` はそのファサード）と実行本体
 //! - [`using_plan`][]: `USING PLAN('<query>')` 文末句（`ORDER BY` の代替。SQL-5）の
 //!   LLM クエリ展開結果 → 既存 C4 ハイブリッド実行形への束縛（TASK-77）
 //! - [`aggregate`][]: 集計関数のみを結果列とする `GROUP BY` なし単一行 SELECT の
@@ -215,6 +215,7 @@ pub mod udf_ddl;
 pub mod grant_ddl;
 pub mod policy_applicability;
 pub mod policy_ddl;
+pub(crate) mod privilege_gate;
 pub mod role_ddl;
 pub(crate) mod routine_fold;
 pub mod trigger_ddl;
