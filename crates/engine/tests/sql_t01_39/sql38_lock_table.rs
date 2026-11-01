@@ -2,8 +2,8 @@
 //! SQL-38 (3)(4)(5)(7)・SQL-31・RLS-12・TABLE-3。
 //!
 //! `EngineCore::execute_sql_in_txn` を production 経路として検証する。NOWAIT の取得失敗（`55P03`）の
-//! SQL レベル E2E は、現状 `BEGIN` が writer を取得するため 2 つ目のセッションが `LOCK` へ到達できず、
-//! 遅延取得（#2400）の後に追加する（取得失敗の単体検証は `sql::transaction` の単体テスト）。
+//! 2 セッション E2E は `tests/write_lock_wait.rs` の T7 で固定済み（遅延取得 #2400 の後に #2409 で
+//! 追加。取得失敗の単体検証は `sql::transaction` の単体テスト）。
 
 use engine::core::EngineCore;
 use engine::kernel::CpuScalarProvider;

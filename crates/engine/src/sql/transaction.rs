@@ -1348,7 +1348,9 @@ impl<'e> SessionTransaction<'e> {
     /// wire 層（`wire-server::handshake::post_auth_loop`）が、次の要求を待つ
     /// 読み取りタイムアウトをこの残り時間で切り詰めるために使う（PR #1041
     /// レビュー指摘: 無通信のまま上限を過ぎてもライタを占有し続けないよう、
-    /// 期限到達時点で [`Self::release_if_expired`] を呼べるようにする）。
+    /// 期限到達時点で [`Self::release_if_expired`] を呼べるようにする。writer 未取得の
+    /// `Active` でも `BEGIN` 起点で効き、`BEGIN` 時点のスナップショットを保持し続けない。
+    /// Issue #2409 のテストで固定）。
     /// `Failed` は [`Self::fail`]／[`Self::release_if_expired`] の時点で共有
     /// 書き込みトランザクション（書き込みゲートの permit を内包）を既に drop
     /// 済みでライタを保持しないため、対象外（`None`）とする。
