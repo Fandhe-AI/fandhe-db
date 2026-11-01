@@ -8300,6 +8300,30 @@ impl EngineCore {
             // `mark_written` の相手がなく、`has_writes` だけを立てる（立てないと COMMIT が write txn を
             // 破棄して setval の永続化が落ちる）。`lastval` は読み取りのみで印を付けない。
             ParsedSql::SequenceFunction(stmt) => {
+                // `lastval()` は読み取りのみ（`writes()` が偽。READ ONLY でも許可する契約。Issue #1934）。
+                // writer を要求せず、writer が既にあればその txn、無ければスナップショット読み取りで
+                // シーケンスの存在を確認する（READ ONLY Tx で 25006 になり `Failed` へ遷移するのを防ぐ）。
+                if !stmt.writes() {
+                    let result = match txn.write_txn() {
+                        Some(write_txn) => {
+                            crate::sql::sequence_fn::execute_in_txn(
+                                &self.storage,
+                                write_txn,
+                                session,
+                                ctx.tenant_id(),
+                                stmt,
+                            )?
+                            .0
+                        }
+                        None => crate::sql::sequence_fn::execute_autocommit(
+                            &self.storage,
+                            session,
+                            ctx.tenant_id(),
+                            stmt,
+                        )?,
+                    };
+                    return Ok(crate::sql::SqlOutcome::Query(result));
+                }
                 // 最初の書き込み文で writer を取得する（Issue #2400。待機超過は `55P03`。呼び出し元が `Failed` へ遷移）。
                 txn.ensure_writer()?;
                 let write_txn = txn.write_txn().ok_or_else(|| SqlSurfaceError::Internal {

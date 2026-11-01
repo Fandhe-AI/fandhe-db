@@ -257,6 +257,29 @@ fn partitioned_write_keeps_25001() {
     run(&core, &mut session, &mut txn, "ROLLBACK").expect("rollback");
 }
 
+/// `lastval()` は読み取りのみで READ ONLY 内でも許可される。writer を要求せず（`25006` にならず）、
+/// トランザクションが `Failed` へ遷移しない（writer を取らないまま COMMIT できる）。
+#[test]
+fn lastval_is_allowed_without_writer_and_does_not_fail_txn() {
+    let (core, _g) = new_core("sql38-ro-lastval");
+    let mut session = ddl_session();
+    for sql in [
+        "CREATE TABLE lv (id BIGINT PRIMARY KEY, n BIGINT)",
+        "INSERT INTO lv (id, n) VALUES (1, nextval('sq')) USING OPERATION_ID 'lv-op-1'",
+    ] {
+        core.execute_sql_in_session(&ctx(), &mut session, sql)
+            .unwrap_or_else(|e| panic!("{sql}: {} {e}", e.wire_code()));
+    }
+    let mut txn = core.new_session_transaction();
+    run(&core, &mut session, &mut txn, "BEGIN READ ONLY").expect("begin");
+    run(&core, &mut session, &mut txn, "SELECT lastval()").expect("lastval in read only");
+    assert_eq!(txn.status(), TransactionStatus::InTransaction);
+    assert_eq!(
+        run(&core, &mut session, &mut txn, "COMMIT"),
+        Ok(SqlOutcome::Commit)
+    );
+}
+
 /// 許可側の回帰: 読み取り・セッション設定は READ ONLY 内で成功し、COMMIT できる。
 #[test]
 fn read_statements_are_allowed_and_commit() {
