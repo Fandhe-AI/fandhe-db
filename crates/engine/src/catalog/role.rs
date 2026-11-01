@@ -503,10 +503,20 @@ pub(crate) fn tenant_has_roles_in_txn<R: ReadSource>(src: &R, tenant: &str) -> R
 /// 内部 ID を 1 つ払い出す（1 始まり・`checked_add`・再利用しない）。
 fn allocate_role_id_in_txn(write_txn: &redb::WriteTransaction) -> Result<u64> {
     let mut counter = write_txn.open_table(ROLE_ID_COUNTER_TABLE)?;
-    let current = counter
-        .get(ROLE_ID_COUNTER_KEY)?
-        .map(|v| v.value())
-        .unwrap_or(1);
+    let stored = counter.get(ROLE_ID_COUNTER_KEY)?.map(|v| v.value());
+    let current = match stored {
+        Some(v) => v,
+        None => {
+            // カウンタ欠損は「未使用カタログ（全テナントでロール行 0 件）」のときだけ 1 から始める。
+            // 既存ロールがあるのに欠損していれば ID 重複（ACL・メンバーシップの別名ロール化）を
+            // 招くため fail-closed で拒否する（設計 D1「ID は再利用しない」）。
+            let roles = write_txn.open_table(ROLES_TABLE)?;
+            if roles.iter()?.next().is_some() {
+                return Err(corrupt());
+            }
+            1
+        }
+    };
     let next = current
         .checked_add(1)
         .ok_or(CatalogError::TableGenerationCounterOverflow)?;

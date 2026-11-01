@@ -293,6 +293,21 @@ fn role_ids_are_monotonic_and_never_reused() {
     assert!(!write(&s, |t| remove_role_in_txn(t, "t1", "nobody")).expect("absent"));
 }
 
+/// カウンタ欠損 + 既存ロールありは ID 重複を避けるため固定文言の CorruptSchema で拒否する。
+#[test]
+fn missing_id_counter_with_existing_roles_is_rejected() {
+    let (_g, _p, s) = open("role-ids-counter-missing");
+    assert_eq!(s.create_role("t1", &rdef("alice")).expect("first"), 1);
+    write(&s, |t| {
+        t.open_table(ROLE_ID_COUNTER_TABLE)?
+            .remove(ROLE_ID_COUNTER_KEY)?;
+        Ok(())
+    })
+    .expect("drop counter");
+    assert!(is_fixed_corrupt(s.create_role("t2", &rdef("bob"))));
+    assert!(s.get_role("t2", "bob").expect("get").is_none());
+}
+
 #[test]
 fn per_tenant_limits_are_enforced() {
     let (_g, _p, s) = open("role-limits");

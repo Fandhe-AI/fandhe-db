@@ -262,7 +262,7 @@ Phase 6（#1929）では PostgreSQL 準拠のロールと GRANT／REVOKE を段�
 
 ## 7. Issue #1961 実装記録
 
-#1961 は決定 D1（ロールのカタログ）・D5（ACL のカタログ）・D12（既存 DB の移行と後方互換）のうち、永続化層だけを実装した。実装は `crates/engine/src/catalog/role.rs`（ロール・メンバーシップ・ログイン名対応表）と `catalog/privilege.rs`（ACL）。認証・権限検査・DDL 構文は含まず、wire-server は無変更のため `--users` の挙動は変わらない。ポインタ: SQL-39・SQL-40・RLS-12。
+Issue #1961 は決定 D1（ロールのカタログ）・D5（ACL のカタログ）・D12（既存 DB の移行と後方互換）のうち、永続化層だけを実装した。実装は `crates/engine/src/catalog/role.rs`（ロール・メンバーシップ・ログイン名対応表）と `catalog/privilege.rs`（ACL）。認証・権限検査・DDL 構文は含まず、wire-server は無変更のため `--users` の挙動は変わらない。ポインタ: SQL-39・SQL-40・RLS-12。
 
 ### redb 表（すべて遅延作成）
 
