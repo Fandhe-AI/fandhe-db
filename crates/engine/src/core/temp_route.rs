@@ -244,7 +244,7 @@ fn is_routable(parsed: &ParsedSql) -> bool {
             | Statement::SetOperation(_),
         ) => true,
         // SQL-38・Issue #1957: 行ロック句付き SELECT は包んだ文が一時コアで実行できる形なら振り分け、
-        // 実行段の行ロックゲート（暫定 `0A000`）に通す（振り分け不能の誤分類にしない）。
+        // 実行段の行ロックゲート（一時表は未対応の `0A000`。Issue #2230 のスコープ外）に通す（振り分け不能の誤分類にしない）。
         ParsedSql::LockingSelect(l) => matches!(
             l.statement(),
             Statement::Select(_)
@@ -977,7 +977,7 @@ impl EngineCore {
                 session.temp_tables_mut().bump_epoch()?;
                 Ok(crate::sql::SqlOutcome::DropIndex(outcome))
             }
-            // SQL-38・Issue #1957: 行ロック句付き SELECT は永続側と同じ暫定ゲート（ロックを取らずに
+            // SQL-38・Issue #1957: 行ロック句付き SELECT は一時表の行ロック句は未対応のゲート（ロックを取らずに
             // 素の SELECT として実行しない）。
             ParsedSql::LockingSelect(_) => Err(super::row_lock_not_supported()),
             ParsedSql::Statement(stmt) => {

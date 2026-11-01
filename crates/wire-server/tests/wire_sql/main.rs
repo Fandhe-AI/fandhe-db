@@ -42,6 +42,7 @@ mod wire_policy_with_check;
 mod wire_result_rows_cap;
 mod wire_returning;
 mod wire_role_ddl;
+mod wire_row_lock;
 mod wire_row_security;
 mod wire_row_security_setting;
 mod wire_scan;
