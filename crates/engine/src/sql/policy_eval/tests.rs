@@ -142,8 +142,12 @@ fn using_expression_substitutes_for_missing_with_check() {
 }
 
 #[test]
-fn policy_without_expression_adds_nothing() {
+fn policy_without_expression_is_true() {
+    // 式なしの適用 PERMISSIVE は TRUE（「ポリシーなし」の既定拒否とは区別する）。
     let ps = [policy("p", true, PolicyCommand::Insert, None, None)];
+    assert!(run(&ps, PolicyCheckKind::InsertCheck, Some(1), "x").is_ok());
+    // 適用されない FOR 句の式なしポリシーは「適用ポリシーなし」のまま既定拒否。
+    let ps = [policy("p", true, PolicyCommand::Update, None, None)];
     assert!(run(&ps, PolicyCheckKind::InsertCheck, Some(1), "x").is_err());
     // 式を持たない RESTRICTIVE は合成を狭めない（PERMISSIVE が通れば通る）。
     let ps = [
@@ -151,6 +155,15 @@ fn policy_without_expression_adds_nothing() {
         policy("r", false, PolicyCommand::Insert, None, None),
     ];
     assert!(run(&ps, PolicyCheckKind::InsertCheck, Some(1), "x").is_ok());
+}
+
+#[test]
+fn with_check_only_policy_is_true_for_conflict_using() {
+    let ps = [policy("p", true, PolicyCommand::All, None, Some("n > 100"))];
+    assert!(run(&ps, PolicyCheckKind::ConflictUpdateUsing, Some(1), "z").is_ok());
+    assert!(run(&ps, PolicyCheckKind::ConflictSelectUsing, Some(1), "z").is_ok());
+    // WITH CHECK 側は従来どおり評価される。
+    assert!(run(&ps, PolicyCheckKind::UpdateCheck, Some(1), "z").is_err());
 }
 
 #[test]

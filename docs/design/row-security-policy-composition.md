@@ -296,7 +296,7 @@ Issue #2276・#2277 の担当のため、本節の導入後も行の可視性は
 - **種別は明示引数**: 検査点は `RowPolicyWrite`（`Insert`・`Update`・`Upsert { updated_ids }`・`Internal`）を必須引数に取る。
   thread-local にしないので、指定の付け忘れはコンパイルエラーになり「検査なし」（fail-open）の経路ができない
 - **合成**: `(PERMISSIVE の OR) AND (RESTRICTIVE の AND)`。式が NULL なら偽、該当する PERMISSIVE が無ければ既定拒否。
-  `WITH CHECK` が無ければ `USING` で代用する。式を持たないポリシーは合成に何も足さない（広げない側）。
+  `WITH CHECK` が無ければ `USING` で代用する。代用後も式が無い適用ポリシーは TRUE として合成する（PERMISSIVE は OR に TRUE が入る。「適用ポリシーなし」のときだけ既定拒否）。
   違反の報告は PERMISSIVE の合成を先に、続けて RESTRICTIVE を名前順に個別に評価する
 - **段の順序**: 索引同期の前、つまり `CHECK`・UNIQUE・ビューの `WITH CHECK OPTION`・`FOREIGN KEY` より前に評価する
   （PG の RLS の検査が制約・索引挿入より前であることに合わせた。PG 17 のソースでの照合は未実施で、要確認）

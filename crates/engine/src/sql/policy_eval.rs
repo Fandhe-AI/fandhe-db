@@ -10,8 +10,9 @@
 //!   本ファイルはそれらを読んで「この書き込みで、どの式をどう合成して評価するか」だけを決める。
 //!
 //! 合成規則: `(PERMISSIVE_1 OR ... OR PERMISSIVE_n) AND RESTRICTIVE_1 AND ...`。式が NULL なら偽、
-//! 該当する PERMISSIVE が 0 件なら既定拒否（常に偽）。式を持たないポリシーは合成に何も足さない
-//! （PERMISSIVE の OR を広げない側＝fail-closed）。テナント境界はこの外側で常に適用され、本ファイルの
+//! 適用される PERMISSIVE が 0 件なら既定拒否（常に偽）。式を省略した適用ポリシー（`WITH CHECK` を
+//! `USING` で代用してもなお式が無い場合を含む）は PostgreSQL と同じく TRUE として合成する
+//! （「ポリシーなし」と「式なしポリシー」を区別する）。テナント境界はこの外側で常に適用され、本ファイルの
 //! 合成は境界の内側で狭めるだけで、広げる経路を持たない。
 //!
 //! 暫定（#2278 まで）: ロール・所有者・`BYPASSRLS` の機構が無いため、全セッションを「所有者でも
@@ -75,6 +76,8 @@ pub(crate) fn user_policies_apply_for_write(state: RowSecurityState) -> bool {
 pub(crate) struct CompiledPolicyChecks {
     table: String,
     using_expression: bool,
+    /// 式を省略した PERMISSIVE ポリシーが適用される（TRUE として OR に合成される）。
+    permissive_always_true: bool,
     permissive: Vec<CompiledLayer>,
     restrictive: Vec<(String, CompiledLayer)>,
 }
@@ -96,11 +99,16 @@ impl CompiledPolicyChecks {
     ) -> Result<Self, TenantWriteError> {
         let mut permissive = Vec::new();
         let mut restrictive = Vec::new();
+        let mut permissive_always_true = false;
         for def in policies {
             if !kind.command_applies(def.command) {
                 continue;
             }
             let Some(text) = kind.expr(def) else {
+                // 式の省略は TRUE。RESTRICTIVE の TRUE は AND に何も足さないので捨ててよい。
+                if def.permissive {
+                    permissive_always_true = true;
+                }
                 continue;
             };
             let preds = crate::sql::allowlist::parse_index_predicate_text(text)
@@ -115,6 +123,7 @@ impl CompiledPolicyChecks {
         Ok(Self {
             table: table.to_string(),
             using_expression: kind.is_using_expression(),
+            permissive_always_true,
             permissive,
             restrictive,
         })
@@ -130,8 +139,8 @@ impl CompiledPolicyChecks {
         metadata: &[u8],
     ) -> Result<(), TenantWriteError> {
         let mut scratch = Vec::new();
-        let mut any_permissive = false;
-        for layer in &self.permissive {
+        let mut any_permissive = self.permissive_always_true;
+        for layer in self.permissive.iter().filter(|_| !any_permissive) {
             if layer
                 .eval(schema, id, embedding, metadata, &mut scratch)
                 .map_err(map_predicate_eval_error)?
