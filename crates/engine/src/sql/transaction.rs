@@ -24,8 +24,10 @@
 //! クライアントが `ROLLBACK` を発行できないため、エラー・上限超過では `Failed` ではなく
 //! `Idle` へ戻り、メッセージをまたがない。
 //!
-//! 読み取り（Issue #1179）: 自トランザクションが未 commit の変更を持たない間は
-//! BEGIN 時点の確定済みスナップショットで従来どおり読む（キャッシュ利用可）。変更を
+//! 読み取り（Issue #1179・#2403。SQL-19・SQL-31）: 読み取り源は [`SessionTransaction::read_source`]
+//! が三分岐で選ぶ。writer 未取得の間は `BEGIN` 時点の確定済みスナップショットで読む（キャッシュ利用可）。
+//! writer 取得後で自トランザクションが未 commit の変更を持たない間は、文ごとの確定状態
+//! （permit 保持中は取得時点と一致。キャッシュ利用可）で読む。変更を
 //! 持つ間（[`SessionTransaction::dirty_tables`] が非空）は、共有書き込み
 //! トランザクションを読み取り源（`storage::read_source::ReadSource`）にして同じ
 //! 実行本体で読み、未 commit の変更を反映する（テーブル世代キーのキャッシュは使わない）。
@@ -272,9 +274,8 @@ struct ActiveTxn<'e> {
     /// 暗黙 Tx は開始時に取得するため常に `Some`。`has_writes`／dirty なら必ず `Some`。
     writer: Option<crate::storage::GatedWriteTxn>,
     /// `BEGIN` 時点の確定済み読み取りスナップショット。明示 Tx では `BEGIN` で先に開き、
-    /// 暗黙 Tx では writer 取得の後に開く。どの読み取り経路にも結線しない（結線は #2403。
-    /// それまで writer 取得前の読み取りは文ごとの確定状態を見る）。`ActiveTxn` を捨てる全経路で自動的に解放される。
-    #[allow(dead_code)]
+    /// 暗黙 Tx では writer 取得の後に開く。writer 取得前の読み取り経路が
+    /// [`SessionTransaction::read_source`] 経由で使う（Issue #2403）。`ActiveTxn` を捨てる全経路で自動的に解放される。
     read_snapshot: redb::ReadTransaction,
     /// 明示 Tx が `BEGIN` で `Storage` の commit 記録の登録簿へ登録した `G_s` のハンドル（SQL-38・
     /// Issue #2404）。writer 未取得の間だけ保持し、writer 取得（[`SessionTransaction::ensure_writer`]）・
@@ -1057,6 +1058,32 @@ impl<'e> SessionTransaction<'e> {
         }
     }
 
+    /// 読み取り文が使う読み取り源を選ぶ（SQL-19・SQL-31・Issue #2403。設計記録 1a-2）。
+    /// `core.rs` の `read_only_in_active_txn`・`DECLARE`・`COPY TO` が呼び、判断を 1 か所に集約する。
+    ///
+    /// - writer 未取得: [`TxnReadSource::BeginSnapshot`]。#2404 が読み取り集合を記録する差し込み点。
+    /// - writer 取得済みで dirty あり: [`TxnReadSource::Writer`]。
+    /// - writer 取得済みで dirty なし: [`TxnReadSource::Committed`]。
+    ///
+    /// 暗黙 Tx は開始時に writer を取るため `BeginSnapshot` にならない。`Active` 以外、および
+    /// writer 未取得なのに書き込み記録がある不変条件違反は fail-closed に `XX000`。
+    pub(crate) fn read_source(&self) -> Result<TxnReadSource<'_>, SqlSurfaceError> {
+        let TxnState::Active(active) = &self.state else {
+            return Err(internal_error());
+        };
+        match active.writer.as_deref() {
+            None if active.has_writes => Err(internal_error()),
+            None => Ok(TxnReadSource::BeginSnapshot(&active.read_snapshot)),
+            Some(w) => {
+                if self.dirty_tables()?.is_empty() {
+                    Ok(TxnReadSource::Committed)
+                } else {
+                    Ok(TxnReadSource::Writer(w))
+                }
+            }
+        }
+    }
+
     /// 文の実行区間で読み取り集合を記録する区間を張る。明示トランザクションかつ writer 未取得の
     /// ときだけ `Some`（SQL-38・Issue #2404）。暗黙トランザクション・取得後・`Active` 以外は `None`。
     pub(crate) fn read_set_scope(&self) -> Option<crate::sql::read_set::ReadSetScope> {
@@ -1096,7 +1123,7 @@ impl<'e> SessionTransaction<'e> {
     }
 
     /// `BEGIN` 時点の確定済み読み取りスナップショット（`Active` のときのみ `Some`。
-    /// Issue #2399）。本番経路からはまだ呼ばれず、#2400・#2403 が読み取り経路へ結線する。
+    /// Issue #2399）。読み取り経路は [`Self::read_source`] を使い、本関数は状態の観測用。
     #[cfg_attr(not(test), allow(dead_code))]
     pub(crate) fn read_snapshot(&self) -> Option<&redb::ReadTransaction> {
         match &self.state {
@@ -1241,8 +1268,23 @@ impl<'e> SessionTransaction<'e> {
     }
 }
 
+/// トランザクション内の読み取り文が使う読み取り源（SQL-19・SQL-31・Issue #2403）。
+/// [`SessionTransaction::read_source`] が返し、`core.rs` の読み取り経路が分岐する。
+pub(crate) enum TxnReadSource<'a> {
+    /// writer 未取得（明示 Tx の取得前）: `BEGIN` 時点の確定済みスナップショット。
+    BeginSnapshot(&'a redb::ReadTransaction),
+    /// writer 取得済みで未 commit 変更あり: 共有 write txn（取得時点＋自分の変更）。
+    Writer(&'a redb::WriteTransaction),
+    /// writer 取得済みで変更なし: 文ごとの確定状態（permit 保持中は取得時点と一致）。
+    Committed,
+}
+
 /// [`SessionTransaction::dirty_tables`] の実体。`written` に、書き込みトランザクション
 /// 内の世代が `storage` の確定済み世代から変化したテーブルを加えて返す。
+///
+/// 比較基準は最新の確定状態で、writer 保持中は permit により write txn の基底（取得時点）と
+/// 一致する。`BEGIN` 時点のスナップショットを基準にすると、`BEGIN` から取得までに他セッションが
+/// 書いた表まで dirty になりキャッシュ回避と遅延 FK 検査の範囲が不要に広がるため使わない。
 fn collect_dirty_tables(
     storage: &crate::storage::Storage,
     write_txn: &redb::WriteTransaction,
