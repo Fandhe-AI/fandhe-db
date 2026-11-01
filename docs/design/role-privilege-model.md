@@ -435,3 +435,24 @@ Issue #1962 は決定 D1・D2 のうち、`CREATE ROLE`／`CREATE USER`／`DROP 
 - 対象外: SEQUENCE・FUNCTION 単位の ACL（#2235）、所有者・PUBLIC の既定（#2236）、`ALTER DEFAULT PRIVILEGES ... IN SCHEMA`
   （#2237）、表・列権限の参照時検査（#1967〜#1969）、権限検査の共通ゲートへの統合（#1966。判定は `sql/schema_privilege.rs`
   に集約済みで、ゲートへ移す）、存在オラクルの網羅試験（#1972）。
+
+## 11. Issue #1966 実装記録（権限検査の共通ゲート）
+
+SQL-40 ポインタ。判定点を `sql/privilege_gate.rs` の `check`（主体・対象・必要権限）へ 1 本化し、DDL 経路を結線した。
+
+### 実装範囲
+
+- `Principal`・`DdlStatementKind`・`RequiredPrivilege`・`PrivilegeTarget` と、文種から必要権限を引く表（`required_privilege`。ワイルドカード腕なしの網羅 `match`）。
+- `core.rs` の DDL 腕・`udf_ddl.rs` は文種付きの `require_ddl` を呼ぶ。`ddl::require_ddl_permission`・`grant_ddl::require_grant_principal` は名前とシグネチャを保ったファサード。`search_path.rs`・`grant_ddl.rs` の `ddl_allowed()` 直読みを除去。
+- 公開 API・依存・挙動の変更なし。
+
+### 判断の記録
+
+- **DDL は `ddl_allowed` のビットだけで判定する**: 認証層の紐付け（#1971）が未実装で全セッションが未束縛のため、ロール・ACL を混ぜると全 DDL が拒否される。ロールの束縛は DDL 権限を広げない（回帰テストあり）。
+- **ファサードを残す**: 並行する PR が `require_ddl_permission` を呼ぶため、名前とシグネチャを維持した。
+- **`Some(0)` の扱い**: `search_path` の GRANT 分岐を `bound_principal` に揃え、PUBLIC の予約 ID `0` は未束縛と同じく拒否側に統一した。
+- **`DropFunction` の判定位置の非対称は残す**: 判定順序を変えないため（自動コミットは実行本体側、Tx 内は腕側）。
+
+### 対象外
+
+ロールベースの DDL 判定（#1971・#2234・#2236）、SELECT・DML・COPY・HTTP への結線（#1967〜#1969）、Rust API の生 DDL をゲートに通すこと、`DropFunction` の非対称の解消。

@@ -1159,6 +1159,7 @@ Date: <IMF-fixdate>
 | `25P02` | `IN_FAILED_SQL_TRANSACTION` | 400 | Bad Request | NoSQL 表層の実要求からは到達不能（同上） |
 | `2BP01` | `DEPENDENT_OBJECTS_STILL_EXIST` | 400 | Bad Request | NoSQL 表層の実要求からは到達不能（`DROP TABLE`／`DROP VIEW` は SQL 表層専用の DDL。後述） |
 | `2F005` | `FUNCTION_EXECUTED_NO_RETURN_STATEMENT` | 400 | Bad Request | PL/pgSQL のスカラー関数が `RETURN` に達せず終わりに到達（SQL 表層の PL/pgSQL 専用。NoSQL の `op` 語彙からは到達しない）。Issue #2225・SQL-68 |
+| `3B001` | `INVALID_SAVEPOINT_SPECIFICATION` | 400 | Bad Request | `RELEASE`／`ROLLBACK TO` が存在しない savepoint 名を指した（SQL 表層専用。NoSQL にはトランザクション制御が無く到達不能。Issue #1942・SQL-69） |
 | `42601` | `UNSUPPORTED_SQL_SYNTAX` | 400 | Bad Request | JSON 構文エラー、`op` 別スキーマ違反、`tenant_id` 相当値の自己申告 |
 | `42701` | `DUPLICATE_COLUMN` | 400 | Bad Request | NoSQL 表層の実要求からは到達不能（`CREATE TABLE`・`ALTER TABLE ADD COLUMN` は op 許可リスト外。後述） |
 | `42702` | `AMBIGUOUS_COLUMN` | 400 | Bad Request | `aggregate.sort` が複数一致する出力名を参照したとき到達可能（Issue #1270）。`INNER JOIN`〔SQL-28・RLS-10、Issue #925〕は NoSQL 表層の op 語彙に無い。後述 |
@@ -1216,8 +1217,8 @@ Date: <IMF-fixdate>
 | `55P03` | `LOCK_NOT_AVAILABLE` | 503 | Service Unavailable | SQL 表層の明示トランザクション（SQL-31・TASK-221）が単一ライタを保持している間に、書き込み op（`insert`／`update`／`delete`）が書き込みゲートの待機上限を超えた |
 | `57014` | `QUERY_CANCELED` | 503 | Service Unavailable | 実行中の文を協調的に打ち切った（クライアント切断の検出。Issue #1798）。SQL 表層の接続スレッドが起点で、現状 NoSQL の `op` からは到達しない |
 
-到達不能な 25 分類（`40001`・`25006`・`20000`・`2F005`・`P0003`・`21000`・`42501`・`34000`・`P0002`（`ROW_NOT_FOUND`・`NO_DATA_FOUND`）・`42701`・`42P07`・`2BP01`・
-`42809`・`42703`・`42804`・`42710`・`42723`・`42P13`・`25000`・`25001`・`25P01`・`25P02`・`55000`・`44000`）の理由: NoSQL 表層はテナントをセッション
+到達不能な 26 分類（`40001`・`25006`・`20000`・`2F005`・`P0003`・`21000`・`42501`・`34000`・`P0002`（`ROW_NOT_FOUND`・`NO_DATA_FOUND`）・`42701`・`42P07`・`2BP01`・
+`42809`・`42703`・`42804`・`42710`・`42723`・`42P13`・`25000`・`25001`・`25P01`・`25P02`・`55000`・`44000`・`3B001`）の理由: NoSQL 表層はテナントをセッション
 （`SessionPrincipal::policy_context()`）からのみ導出し、クライアント自己申告の
 `tenant_id` 相当値は JSON／ヘッダ／パスいずれの位置でも `42601` で先に拒否する
 ため、`ForbiddenTenantMismatch` を実要求から誘発する経路が構造的に存在しない。

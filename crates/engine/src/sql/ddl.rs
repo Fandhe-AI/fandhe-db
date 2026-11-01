@@ -64,15 +64,12 @@ use crate::sql::ddl_column_type::{
 use crate::sql::mode::SessionState;
 use crate::storage::Storage;
 
-/// DDL 実行権限の唯一の判定点。`session.ddl_allowed()` が `false`（既定）の
-/// 場合、カタログ照会・書き込みトランザクション開始のいずれよりも前に
+/// DDL 実行権限の判定（共通ゲート `sql::privilege_gate` への薄いファサード。ADR D8）。
+/// 権限が無い（既定）場合、カタログ照会・書き込みトランザクション開始のいずれよりも前に
 /// [`SqlSurfaceError::InsufficientPrivilege`]（`42501`）へ fail-closed に落とす。
+/// 新しい呼び出し側は文種付きの `privilege_gate::require_ddl` を使う。
 pub(crate) fn require_ddl_permission(session: &SessionState) -> Result<(), SqlSurfaceError> {
-    if session.ddl_allowed() {
-        Ok(())
-    } else {
-        Err(SqlSurfaceError::InsufficientPrivilege)
-    }
+    crate::sql::privilege_gate::require_server_ddl(session)
 }
 
 /// `CREATE TABLE`（SQL-23・TASK-85）の成功応答。行数・件数のいずれも返さない

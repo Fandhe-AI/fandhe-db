@@ -45,7 +45,7 @@
 //! - [`using_operation_id`][]: `USING OPERATION_ID '<id>'` 文末句の値型・検証（TASK-80）
 //! - [`ddl`][]: `CREATE TABLE`／`DROP TABLE`／`ALTER TABLE ADD COLUMN`（SQL-23・
 //!   TASK-202・TASK-203、Issue #899・#900・#902）の DDL 実行権限ゲート
-//!   （`require_ddl_permission`。DDL 全般が通る単一の判定点）と実行本体
+//!   （`sql::privilege_gate` が唯一の判定点。`require_ddl_permission` はそのファサード）と実行本体
 //! - [`using_plan`][]: `USING PLAN('<query>')` 文末句（`ORDER BY` の代替。SQL-5）の
 //!   LLM クエリ展開結果 → 既存 C4 ハイブリッド実行形への束縛（TASK-77）
 //! - [`aggregate`][]: 集計関数のみを結果列とする `GROUP BY` なし単一行 SELECT の
@@ -215,6 +215,7 @@ pub mod udf_ddl;
 pub mod grant_ddl;
 pub mod policy_applicability;
 pub mod policy_ddl;
+pub(crate) mod privilege_gate;
 pub mod role_ddl;
 pub(crate) mod routine_fold;
 pub mod trigger_ddl;
@@ -277,6 +278,7 @@ pub mod relation_snapshot;
 pub mod returning;
 pub mod row_lock;
 pub(crate) mod row_policy;
+pub(crate) mod savepoint;
 pub(crate) mod scalar_index;
 pub(crate) mod scalar_plan;
 pub mod scan;
@@ -526,6 +528,14 @@ pub enum SqlOutcome {
     /// `ROLLBACK [WORK|TRANSACTION]`（SQL-31・TASK-221）が成功したことを示す応答。
     /// `wire-server::simple_query` は `CommandComplete` タグ `ROLLBACK` を返す。
     Rollback,
+    /// `SAVEPOINT <name>`（SQL-69・Issue #1942）が成功したことを示す応答。
+    /// `wire-server::simple_query` は `CommandComplete` タグ `SAVEPOINT` を返す。
+    /// **BREAKING CHANGE**: variant 追加。
+    Savepoint,
+    /// `RELEASE [SAVEPOINT] <name>`（SQL-69・Issue #1942）が成功したことを示す応答。
+    /// `wire-server::simple_query` は `CommandComplete` タグ `RELEASE` を返す。
+    /// **BREAKING CHANGE**: variant 追加。
+    ReleaseSavepoint,
     /// `CREATE TABLE <table> (<col> <type>[, ...]) [;]`（SQL-23・TASK-85・
     /// TASK-202、Issue #899）がセッション経由の実行経路
     /// （`crate::core::EngineCore::execute_parsed_in_session`）で成功したことを
