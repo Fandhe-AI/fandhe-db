@@ -46,6 +46,14 @@ pub(crate) use trigger::{
     validate_drop_trigger_tokens,
 };
 pub use trigger::{ValidatedCreateTrigger, ValidatedDropTrigger};
+// POLICY DDL の構文検証（RLS-13・Issue #2274）。
+mod policy;
+pub(crate) use policy::{
+    is_alter_policy_statement, is_create_policy_statement, is_drop_policy_statement,
+    validate_alter_policy_tokens, validate_create_policy_tokens, validate_drop_policy_tokens,
+    AlterPolicyAction,
+};
+pub use policy::{ValidatedAlterPolicy, ValidatedCreatePolicy, ValidatedDropPolicy};
 
 /// エラーメッセージへ含める入力断片の長さ上限。untrusted 入力をそのまま無加工で
 /// 長大にエラーへ埋め込まない（security.md「情報漏えい」対応）。値は

@@ -1927,6 +1927,14 @@ pub enum ParsedSql {
     CreateTrigger(crate::sql::allowlist::ValidatedCreateTrigger),
     /// `DROP TRIGGER [IF EXISTS] <名前> ON <表>`（TABLE-45、Issue #1722）。
     DropTrigger(crate::sql::allowlist::ValidatedDropTrigger),
+    /// `CREATE POLICY`（RLS-13、Issue #2274）。
+    ///
+    /// **BREAKING CHANGE**（Issue #2274）: `ParsedSql` への variant 追加。
+    CreatePolicy(crate::sql::allowlist::ValidatedCreatePolicy),
+    /// `ALTER POLICY`（RLS-13、Issue #2274）。
+    AlterPolicy(crate::sql::allowlist::ValidatedAlterPolicy),
+    /// `DROP POLICY [IF EXISTS] <名前> ON <表>`（RLS-13、Issue #2274）。
+    DropPolicy(crate::sql::allowlist::ValidatedDropPolicy),
     /// `DO [LANGUAGE plpgsql] '<本体>'`（SQL-68、Issue #2228）。
     ///
     /// `ParsedSql::Statement` には載せない（DataModifyingCte・CreateTrigger と同じ理由。wire 側が
@@ -2070,6 +2078,9 @@ fn statement_clock_scope(
         | ParsedSql::DropFunction(_)
         | ParsedSql::CreateTrigger(_)
         | ParsedSql::DropTrigger(_)
+        | ParsedSql::CreatePolicy(_)
+        | ParsedSql::AlterPolicy(_)
+        | ParsedSql::DropPolicy(_)
         | ParsedSql::Do(_)
         | ParsedSql::Lock(_)
         | ParsedSql::CreateSchema(_)
@@ -2141,6 +2152,9 @@ fn insert_sequence_scope(
         | ParsedSql::DropFunction(_)
         | ParsedSql::CreateTrigger(_)
         | ParsedSql::DropTrigger(_)
+        | ParsedSql::CreatePolicy(_)
+        | ParsedSql::AlterPolicy(_)
+        | ParsedSql::DropPolicy(_)
         | ParsedSql::Do(_)
         | ParsedSql::Lock(_)
         | ParsedSql::CreateSchema(_)
@@ -2210,6 +2224,9 @@ fn insert_default_clock_scope(
         | ParsedSql::DropFunction(_)
         | ParsedSql::CreateTrigger(_)
         | ParsedSql::DropTrigger(_)
+        | ParsedSql::CreatePolicy(_)
+        | ParsedSql::AlterPolicy(_)
+        | ParsedSql::DropPolicy(_)
         | ParsedSql::Do(_)
         | ParsedSql::Lock(_)
         | ParsedSql::CreateSchema(_)
@@ -4261,6 +4278,9 @@ impl EngineCore {
                     | crate::sql::SqlOutcome::DropFunction(_)
                     | crate::sql::SqlOutcome::CreateTrigger(_)
                     | crate::sql::SqlOutcome::DropTrigger(_)
+                    | crate::sql::SqlOutcome::CreatePolicy(_)
+                    | crate::sql::SqlOutcome::AlterPolicy(_)
+                    | crate::sql::SqlOutcome::DropPolicy(_)
                     | crate::sql::SqlOutcome::Do
                     | crate::sql::SqlOutcome::Lock
                     | crate::sql::SqlOutcome::CreateSchema(_)
@@ -4321,6 +4341,9 @@ impl EngineCore {
                     | crate::sql::SqlOutcome::DropFunction(_)
                     | crate::sql::SqlOutcome::CreateTrigger(_)
                     | crate::sql::SqlOutcome::DropTrigger(_)
+                    | crate::sql::SqlOutcome::CreatePolicy(_)
+                    | crate::sql::SqlOutcome::AlterPolicy(_)
+                    | crate::sql::SqlOutcome::DropPolicy(_)
                     | crate::sql::SqlOutcome::Do
                     | crate::sql::SqlOutcome::Lock
                     | crate::sql::SqlOutcome::CreateSchema(_)
@@ -4378,6 +4401,9 @@ impl EngineCore {
                     | crate::sql::SqlOutcome::DropFunction(_)
                     | crate::sql::SqlOutcome::CreateTrigger(_)
                     | crate::sql::SqlOutcome::DropTrigger(_)
+                    | crate::sql::SqlOutcome::CreatePolicy(_)
+                    | crate::sql::SqlOutcome::AlterPolicy(_)
+                    | crate::sql::SqlOutcome::DropPolicy(_)
                     | crate::sql::SqlOutcome::Do
                     | crate::sql::SqlOutcome::Lock
                     | crate::sql::SqlOutcome::CreateSchema(_)
@@ -4442,6 +4468,9 @@ impl EngineCore {
                     | crate::sql::SqlOutcome::DropFunction(_)
                     | crate::sql::SqlOutcome::CreateTrigger(_)
                     | crate::sql::SqlOutcome::DropTrigger(_)
+                    | crate::sql::SqlOutcome::CreatePolicy(_)
+                    | crate::sql::SqlOutcome::AlterPolicy(_)
+                    | crate::sql::SqlOutcome::DropPolicy(_)
                     | crate::sql::SqlOutcome::Do
                     | crate::sql::SqlOutcome::Lock
                     | crate::sql::SqlOutcome::CreateSchema(_)
@@ -4525,6 +4554,9 @@ impl EngineCore {
                     | crate::sql::SqlOutcome::DropFunction(_)
                     | crate::sql::SqlOutcome::CreateTrigger(_)
                     | crate::sql::SqlOutcome::DropTrigger(_)
+                    | crate::sql::SqlOutcome::CreatePolicy(_)
+                    | crate::sql::SqlOutcome::AlterPolicy(_)
+                    | crate::sql::SqlOutcome::DropPolicy(_)
                     | crate::sql::SqlOutcome::Do
                     | crate::sql::SqlOutcome::Lock
                     | crate::sql::SqlOutcome::CreateSchema(_)
@@ -5694,6 +5726,16 @@ impl EngineCore {
             let stmt = crate::sql::allowlist::validate_drop_trigger_tokens(&tokens)?;
             return Ok(ParsedSql::DropTrigger(stmt));
         }
+        // RLS-13・Issue #2274: `DROP POLICY` も汎用 `DROP` より前に分岐する（カタログ照会なし）。
+        if crate::sql::allowlist::is_drop_policy_statement(&tokens) {
+            let stmt = crate::sql::allowlist::validate_drop_policy_tokens(&tokens)?;
+            return Ok(ParsedSql::DropPolicy(stmt));
+        }
+        // RLS-13・Issue #2274: `ALTER POLICY` も汎用 `ALTER`（`ALTER TABLE` 扱い）より前に分岐する。
+        if crate::sql::allowlist::is_alter_policy_statement(&tokens) {
+            let stmt = crate::sql::allowlist::validate_alter_policy_tokens(&tokens)?;
+            return Ok(ParsedSql::AlterPolicy(stmt));
+        }
         if crate::sql::allowlist::is_drop_sequence_statement(&tokens) {
             let stmt = crate::sql::allowlist::validate_drop_sequence_tokens(&tokens)?;
             return Ok(ParsedSql::DropSequence(stmt));
@@ -5791,6 +5833,11 @@ impl EngineCore {
         if crate::sql::allowlist::is_create_trigger_statement(&tokens) {
             let stmt = crate::sql::allowlist::validate_create_trigger_tokens(&tokens)?;
             return Ok(ParsedSql::CreateTrigger(stmt));
+        }
+        // RLS-13・Issue #2274: `CREATE POLICY` も `CREATE TABLE`／`FUNCTION` 分岐へ渡さない（カタログ照会なし）。
+        if crate::sql::allowlist::is_create_policy_statement(&tokens) {
+            let stmt = crate::sql::allowlist::validate_create_policy_tokens(&tokens)?;
+            return Ok(ParsedSql::CreatePolicy(stmt));
         }
         if crate::sql::allowlist::is_create_schema_statement(&tokens) {
             let stmt = crate::sql::allowlist::validate_create_schema_tokens(&tokens)?;
@@ -7381,6 +7428,36 @@ impl EngineCore {
                 )?;
                 Ok(crate::sql::SqlOutcome::DropTrigger(outcome))
             }
+            // RLS-13（Issue #2274）: DDL 実行権限ゲート → 実行本体（表の所有者の判定はロール機構が入るまで
+            // この権限ゲートで代替する）。権限の無い主体には対象表・ポリシーの有無を問わず常に `42501`。
+            // ポリシー定義はテナント単位のため `ctx.tenant_id()` を渡す。
+            ParsedSql::CreatePolicy(stmt) => {
+                crate::sql::ddl::require_ddl_permission(session)?;
+                let outcome = crate::sql::policy_ddl::execute_create_policy(
+                    &self.storage,
+                    ctx.tenant_id(),
+                    stmt,
+                )?;
+                Ok(crate::sql::SqlOutcome::CreatePolicy(outcome))
+            }
+            ParsedSql::AlterPolicy(stmt) => {
+                crate::sql::ddl::require_ddl_permission(session)?;
+                let outcome = crate::sql::policy_ddl::execute_alter_policy(
+                    &self.storage,
+                    ctx.tenant_id(),
+                    stmt,
+                )?;
+                Ok(crate::sql::SqlOutcome::AlterPolicy(outcome))
+            }
+            ParsedSql::DropPolicy(stmt) => {
+                crate::sql::ddl::require_ddl_permission(session)?;
+                let outcome = crate::sql::policy_ddl::execute_drop_policy(
+                    &self.storage,
+                    ctx.tenant_id(),
+                    stmt,
+                )?;
+                Ok(crate::sql::SqlOutcome::DropPolicy(outcome))
+            }
             // TABLE-27（Issue #1713）: DDL 実行権限ゲート → 実行本体。SCHEMA はテナント単位のカタログ
             // のため `ctx.tenant_id()` を渡す（SEQUENCE との違い）。権限の無い主体には対象の有無を
             // 問わず常に `42501`。
@@ -7977,6 +8054,14 @@ impl EngineCore {
                 crate::sql::ddl::require_ddl_permission(session)?;
                 Err(SqlSurfaceError::feature_not_supported(
                     "DROP FUNCTION is not supported inside a transaction block",
+                ))
+            }
+            // RLS-13（Issue #2274）: ポリシー DDL は独立した write txn で commit され ROLLBACK で取り消せない
+            // ため明示トランザクション内では行わない。権限の無いセッションには存在を問わず `42501`（fail-closed）。
+            ParsedSql::CreatePolicy(_) | ParsedSql::AlterPolicy(_) | ParsedSql::DropPolicy(_) => {
+                crate::sql::ddl::require_ddl_permission(session)?;
+                Err(SqlSurfaceError::feature_not_supported(
+                    "policy DDL is not supported inside a transaction block",
                 ))
             }
             // SQL-67・Issue #2220: FROM 句の集合返却関数の呼び出しも、本体を同じ Tx・RLS で実行するため
@@ -9001,6 +9086,9 @@ impl EngineCore {
             ParsedSql::DropFunction(_) => Ok(None),
             ParsedSql::CreateTrigger(_) => Ok(None),
             ParsedSql::DropTrigger(_) => Ok(None),
+            ParsedSql::CreatePolicy(_) | ParsedSql::AlterPolicy(_) | ParsedSql::DropPolicy(_) => {
+                Ok(None)
+            }
             // SQL-68・Issue #2228: `DO` は行を返さない（Describe は NoData）。
             ParsedSql::Do(_) | ParsedSql::Lock(_) => Ok(None),
             ParsedSql::CreateSchema(_) => Ok(None),
