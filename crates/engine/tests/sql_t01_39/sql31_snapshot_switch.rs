@@ -339,6 +339,48 @@ fn plain_select_expands_view_against_begin_snapshot_catalog() {
     assert_eq!(err.wire_code(), "42P01", "{err:?}");
 }
 
+/// PL/pgSQL 本体内の SELECT も `BEGIN` 時点のカタログでビューを展開する（Issue #2403）。`BEGIN` 後に
+/// 他セッションが述語を変えても、関数内 SELECT は直接 SELECT と同じ結果（旧定義 × 旧行）になる。
+#[test]
+fn plpgsql_body_select_expands_view_against_begin_snapshot_catalog() {
+    let (core, _g) = new_core("sql31-snap-plpgsql-view");
+    let sys = ctx("sys");
+    ok(&core, &sys, "CREATE TABLE tagged (tag TEXT)");
+    ok(
+        &core,
+        &ctx("tenant-a"),
+        "INSERT INTO tagged (id, tag) VALUES (1, 'a'), (2, 'b'), (3, 'b') USING OPERATION_ID 'tg'",
+    );
+    ok(
+        &core,
+        &sys,
+        "CREATE VIEW docs_v AS SELECT id FROM tagged WHERE tag = 'a'",
+    );
+    ok(&core, &sys, "CREATE TABLE probe (n BIGINT)");
+    let mut a = Tx::new(&core, "tenant-a");
+    a.ok("BEGIN");
+
+    ok(
+        &core,
+        &sys,
+        "CREATE OR REPLACE VIEW docs_v AS SELECT id FROM tagged WHERE tag = 'b'",
+    );
+
+    // 本体の SELECT の結果を probe へ書き留める（本体内の読み取りは writer 取得前）。
+    a.ok(
+        "DO $$ DECLARE c bigint; BEGIN SELECT count(*) INTO c FROM docs_v; \
+         INSERT INTO probe (id, n) VALUES (1, c); END $$",
+    );
+    a.ok("COMMIT");
+    // BEGIN 時点の旧定義（tag = 'a'）× 旧行 = 1 行。新定義 × 旧行なら 2 行になる。
+    let probe = rows(ok(&core, &ctx("tenant-a"), "SELECT n FROM probe"));
+    assert_eq!(probe.len(), 1, "{probe:?}");
+    assert!(
+        probe[0].contains("1") && !probe[0].contains("2"),
+        "{probe:?}"
+    );
+}
+
 /// 拡張クエリの Bind も `BEGIN` 時点のカタログでビューを展開する（Issue #2403）。Parse が `BEGIN` 後の
 /// 最新カタログで行われても、`bind_prepared_in_txn` は簡易クエリ経路と同じ結果になる。
 #[test]

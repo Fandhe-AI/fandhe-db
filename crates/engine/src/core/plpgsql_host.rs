@@ -53,7 +53,7 @@ use crate::sql::cast::CastType;
 use crate::sql::exec::{Cell, ColumnMeta, QueryResult};
 use crate::sql::lexer::{self, Keyword, Token};
 use crate::sql::mode::SessionState;
-use crate::sql::transaction::{SessionTransaction, TransactionStatus};
+use crate::sql::transaction::{SessionTransaction, TransactionStatus, TxnReadSource};
 use crate::sql::udf_call::{RoutineDefinition, RoutineReturn};
 use crate::sql::SqlOutcome as CoreOutcome;
 use crate::trigger::call::TriggerOutcome;
@@ -416,8 +416,18 @@ impl<'a, 'e> CorePlHost<'a, 'e> {
             // parse 中の定数式畳み込みがセッション TimeZone を読む。
             let _tz = session_time_zone_scope(self.session);
             let resolver = self.core.schema_resolver(self.ctx);
+            // 明示トランザクションの writer 取得前は、検証・ビュー展開を `BEGIN` 時点の
+            // スナップショットのカタログで行い、後続の実行の読み取り元と揃える（Issue #2403）。
+            let read_snap = if self.txn.status() == TransactionStatus::InTransaction {
+                match self.txn.read_source()? {
+                    TxnReadSource::BeginSnapshot(snap) => Some(snap),
+                    _ => None,
+                }
+            } else {
+                None
+            };
             self.core
-                .parse_tokens_gated(tokens, self.session, Some(&resolver), None)?
+                .parse_tokens_gated(tokens, self.session, Some(&resolver), read_snap)?
         };
         let writes = classify(&parsed)?;
         if parsed_operation_id(&parsed).is_some() || is_partitioned_write(&parsed) {
