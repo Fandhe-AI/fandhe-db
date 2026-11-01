@@ -13,12 +13,14 @@
 //! 並行は `mpsc`・`Barrier` だけで順序を制御し、sleep は使わない。スレッド数・行数・ラウンド数は
 //! 定数で上限化する。
 
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{mpsc, Barrier};
 use std::thread;
 
 use engine::core::EngineCore;
 use engine::kernel::CpuScalarProvider;
 use engine::policy::PolicyContext;
+use engine::sql::exec::Cell;
 use engine::sql::mode::SessionState;
 use engine::sql::transaction::{SessionTransaction, TransactionStatus};
 use engine::sql::SqlOutcome;
@@ -32,8 +34,7 @@ use temp_db::{unique_db_path, CleanupGuard};
 const TENANTS: [&str; 3] = ["tenant-a", "tenant-b", "tenant-c"];
 /// 他テナントが一度に入れる行数の上限（多数 commit の世界）。
 const MANY_ROWS: u64 = 16;
-/// 並行 autocommit writer の 1 本あたりの回数・読み手のラウンド数（上限）。
-const WRITES_PER_THREAD: u64 = 8;
+/// 並行ケースの読み手のラウンド数（上限）。
 const ROUNDS: u64 = 8;
 
 fn ctx(tenant: &str) -> PolicyContext {
@@ -311,6 +312,8 @@ fn positive_control_own_commit_and_ddl_cause_40001() {
 }
 
 /// 並行: 他テナントが writer を保持・競合している間も、読み手は `40001` にならず commit できる。
+/// writer は読み手が書き込みを始める直前の合図（`go`）まで commit しないため、読み手の `BEGIN`
+/// 以降に他テナントの commit が必ず入り、読み手の writer 取得はその commit と交差する。
 #[test]
 fn other_tenants_concurrent_writers_do_not_cause_40001() {
     for reader in 0..TENANTS.len() {
@@ -319,23 +322,31 @@ fn other_tenants_concurrent_writers_do_not_cause_40001() {
         let mut r = Tx::begin(&core, TENANTS[reader]);
         r.run("SELECT n FROM t1").expect("read");
         thread::scope(|s| {
-            let (tx, rx) = mpsc::channel();
+            let (held_tx, held_rx) = mpsc::channel();
+            let mut gos = Vec::new();
             let hs: Vec<_> = owners
                 .iter()
                 .enumerate()
                 .map(|(i, owner)| {
-                    let (core, tx) = (&core, tx.clone());
+                    let (go_tx, go_rx) = mpsc::channel::<()>();
+                    gos.push(go_tx);
+                    let (core, held_tx) = (&core, held_tx.clone());
                     s.spawn(move || {
                         let mut b = Tx::begin(core, owner);
                         b.run(&format!("INSERT INTO t1 (id, n) VALUES ({}, 1)", 100 + i))
                             .expect("holder write");
-                        tx.send(()).expect("signal");
+                        held_tx.send(()).expect("signal");
+                        go_rx.recv().expect("go");
                         b.run("COMMIT").expect("holder commit");
                     })
                 })
                 .collect();
-            drop(tx);
-            rx.recv().expect("a holder has writer");
+            drop(held_tx);
+            // 先に writer を取った 1 本が保持している状態で、読み手が書き込みへ進む。
+            held_rx.recv().expect("a holder has writer");
+            for go in &gos {
+                go.send(()).expect("go");
+            }
             r.run("INSERT INTO t2 (id, n) VALUES (7, 7)")
                 .expect("invisible commits are not a cause");
             r.run("COMMIT").expect("commit");
@@ -347,39 +358,72 @@ fn other_tenants_concurrent_writers_do_not_cause_40001() {
 }
 
 /// 並行 autocommit writer（他の 2 テナント）が書き続けても、読み手の各ラウンドは `40001` にならない。
+/// 読み手は各ラウンドで `SELECT` の後、他テナントの commit が 1 件以上進むのを待ってから書き込む
+/// （`BEGIN` 以降の commit と writer 取得の交差を各ラウンドで保証する。sleep は使わない）。
 #[test]
 fn other_tenants_autocommit_storm_never_causes_40001() {
+    /// writer 1 本あたりの書き込み回数の上限（読み手が終われば早く止まる）。
+    const STORM_CAP: u64 = 4096;
     let (core, _g) = new_core("sft-storm");
     let barrier = Barrier::new(3);
+    let commits = AtomicU64::new(0);
+    let reader_done = AtomicBool::new(false);
+    let live_writers = AtomicU64::new(2);
+    let crossed = AtomicU64::new(0);
     thread::scope(|s| {
         for (i, owner) in [TENANTS[1], TENANTS[2]].into_iter().enumerate() {
-            let (core, barrier) = (&core, &barrier);
+            let (core, barrier, commits, done, live) =
+                (&core, &barrier, &commits, &reader_done, &live_writers);
             s.spawn(move || {
                 barrier.wait();
-                for k in 0..WRITES_PER_THREAD * ROUNDS {
+                for k in 0..STORM_CAP {
+                    if done.load(Ordering::SeqCst) {
+                        break;
+                    }
                     auto(
                         core,
                         owner,
                         &format!(
                             "INSERT INTO t1 (id, n) VALUES ({}, 1)",
-                            1000 * (i as u64 + 1) + k
+                            10_000 * (i as u64 + 1) + k
                         ),
                     );
+                    commits.fetch_add(1, Ordering::SeqCst);
                 }
+                live.fetch_sub(1, Ordering::SeqCst);
             });
         }
-        let (core, barrier) = (&core, &barrier);
+        let (core, barrier, commits, done, live, crossed) = (
+            &core,
+            &barrier,
+            &commits,
+            &reader_done,
+            &live_writers,
+            &crossed,
+        );
         s.spawn(move || {
             barrier.wait();
             for round in 0..ROUNDS {
                 let mut r = Tx::begin(core, TENANTS[0]);
                 r.run("SELECT n FROM t1").expect("read");
+                let seen = commits.load(Ordering::SeqCst);
+                while commits.load(Ordering::SeqCst) == seen && live.load(Ordering::SeqCst) > 0 {
+                    thread::yield_now();
+                }
+                if commits.load(Ordering::SeqCst) > seen {
+                    crossed.fetch_add(1, Ordering::SeqCst);
+                }
                 r.run(&format!("INSERT INTO t2 (id, n) VALUES ({round}, 1)"))
                     .expect("never 40001 from invisible commits");
                 r.run("COMMIT").expect("commit");
             }
+            done.store(true, Ordering::SeqCst);
         });
     });
+    assert!(
+        crossed.load(Ordering::SeqCst) >= 1,
+        "at least one round must cross another tenant's commit"
+    );
 }
 
 /// ERR-7: `40001` の後に副作用が残らない（行）。観測は 3 テナントの文脈から行い、再試行は成功する。
@@ -435,16 +479,25 @@ fn nextval_does_not_advance_after_40001() {
     r.expect_40001_then_recover(
         "INSERT INTO t2 (id, n) VALUES (7, nextval('s')) USING OPERATION_ID 'sft-op-1'",
     );
-    // 台帳にも残っておらず、同じ operation_id で再実行でき、採番は 1 から始まる。
+    // 失敗したのと同じテナントで同じ operation_id を再送する。台帳に残っていれば再送扱いで
+    // 採番も行も増えず、残っていなければ新規実行になる。どちらでも次の採番は 1 から始まる。
     auto(
         &core,
-        TENANTS[1],
+        TENANTS[0],
         "INSERT INTO t2 (id, n) VALUES (7, nextval('s')) USING OPERATION_ID 'sft-op-1'",
     );
     let mut s = SessionState::default();
     let out = core
-        .execute_sql_in_session_legacy(&ctx(TENANTS[1]), &mut s, "SELECT n FROM t2")
+        .execute_sql_in_session_legacy(&ctx(TENANTS[0]), &mut s, "SELECT n FROM t2")
         .expect("select");
-    let dump = format!("{out:?}");
-    assert!(dump.contains("SignedInteger(1)"), "must start at 1: {dump}");
+    let SqlOutcome::Query(q) = out else {
+        panic!("unexpected {out:?}");
+    };
+    let ns: Vec<&Cell> = q.rows.iter().map(|r| &r.cells[0]).collect();
+    assert_eq!(ns.len(), 1, "exactly one row after retry: {ns:?}");
+    assert!(
+        matches!(ns[0], Cell::SignedInteger(1)),
+        "must start at 1: {:?}",
+        ns[0]
+    );
 }
