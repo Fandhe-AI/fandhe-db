@@ -157,6 +157,33 @@ fn explicit_first_write_times_out_with_55p03() {
     rollback.expect("rollback");
 }
 
+/// T3b: 待つ側が暗黙トランザクションなら、writer は開始時に取るため `begin_implicit_transaction`
+/// 自体が待機上限で `55P03` になる（Issue #2401。SQL-31・WIRE-16）。`Idle` のまま 1 文も実行されない。
+#[test]
+fn implicit_begin_times_out_with_55p03_at_start() {
+    let (engine, path) = new_core(100);
+    let _cleanup = CleanupGuard(path);
+    let (holder, release) = spawn_holder(&engine);
+
+    let mut session = SessionState::default();
+    let mut txn = engine.new_session_transaction();
+    let started = Instant::now();
+    let begin = engine.begin_implicit_transaction(&mut txn, &session);
+    let elapsed = started.elapsed();
+    let status = txn.status();
+
+    release.send(()).expect("release");
+    holder.join().expect("holder");
+    assert_eq!(begin.expect_err("must time out").wire_code(), "55P03");
+    assert!(elapsed >= Duration::from_millis(100), "elapsed={elapsed:?}");
+    assert_eq!(status, engine::sql::transaction::TransactionStatus::Idle);
+
+    engine
+        .begin_implicit_transaction(&mut txn, &session)
+        .expect("begin implicit after release");
+    txn.commit_implicit(&mut session).expect("commit");
+}
+
 /// T4: 構築経路（`open`）に関係なく設定が効き、検索エンジン種別は変わらない。
 #[test]
 fn builder_applies_to_opened_core_without_changing_engine_kind() {
