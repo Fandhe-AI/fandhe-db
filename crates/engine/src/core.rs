@@ -5295,6 +5295,7 @@ impl EngineCore {
                 &t,
                 resolver,
                 crate::sql::privilege_gate::read::classify(&parsed),
+                read_snap,
             )?;
         }
         Ok(parsed)
@@ -7338,7 +7339,7 @@ impl EngineCore {
         // いずれが呼ばれても同じ配列を共有する）。
         Self::check_prepared_for_session(session, prepared)?;
         // SQL-40・Issue #1967: 権限の無い主体に列の型情報を返さない（fail-closed）。
-        self.require_prepared_read_privileges(session, prepared, &prepared.dummy_parsed)?;
+        self.require_prepared_read_privileges(session, prepared, &prepared.dummy_parsed, None)?;
         self.describe_parsed_in_session_impl(
             session,
             &prepared.dummy_parsed,
@@ -9456,7 +9457,7 @@ impl EngineCore {
             let snap = Self::describe_snapshot(txn)?;
             Self::check_prepared_for_session(session, prepared)?;
             // SQL-40・Issue #1967: 権限の無い主体に列の型情報を返さない（fail-closed）。
-            self.require_prepared_read_privileges(session, prepared, &prepared.dummy_parsed)?;
+            self.require_prepared_read_privileges(session, prepared, &prepared.dummy_parsed, snap)?;
             // カーソル文は txn の開いているカーソルから列を引く（従来の経路）。
             if matches!(prepared.dummy_parsed, ParsedSql::Cursor(_)) {
                 return self.describe_parsed_in_txn_unscrubbed(

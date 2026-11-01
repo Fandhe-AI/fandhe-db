@@ -408,3 +408,23 @@ fn bound_http_read_api_is_checked_before_binding() {
             .execute_bound_scan_in_session(&ctx(A), &unbound, "cb", |_, _| Err(never_bound()));
     assert_ne!(r.expect_err("binder").wire_code(), "42501");
 }
+
+/// BEGIN 後に別セッションが表を DROP しても、明示 Tx は BEGIN 時のスナップショットで解析・実行する。
+/// 権限検査も同じスナップショットで引き、最新カタログで不在の表を検査省略にしない（fail-closed）。
+#[test]
+fn explicit_txn_check_uses_begin_snapshot_after_concurrent_drop() {
+    let f = fx("selpriv-drop-after-begin");
+    let mut s = bound(f.alice, A, false);
+    let mut txn = f.core.new_session_transaction();
+    f.core
+        .execute_sql_in_txn(&ctx(A), &mut s, &mut txn, "BEGIN")
+        .expect("begin");
+    f.admin_run("DROP TABLE ca");
+    let r = f
+        .core
+        .execute_sql_in_txn(&ctx(A), &mut s, &mut txn, "SELECT id FROM ca LIMIT 5");
+    assert_eq!(code(r), "42501");
+    f.core
+        .execute_sql_in_txn(&ctx(A), &mut s, &mut txn, "ROLLBACK")
+        .expect("rollback");
+}

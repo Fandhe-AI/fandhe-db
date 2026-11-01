@@ -3959,7 +3959,7 @@ mod tests {
     #[test]
     fn insufficient_privilege_client_message_has_no_identifying_detail() {
         let msg = SqlSurfaceError::InsufficientPrivilege.client_message();
-        assert_eq!(msg, "permission denied for DDL statement");
+        assert_eq!(msg, "permission denied");
     }
 
     /// 一時 DB の払い出しは Issue #173 の共通ヘルパー（`crate::test_util::

@@ -2395,7 +2395,7 @@ impl std::fmt::Display for SqlSurfaceError {
             // テーブル名・ユーザー名を含めない固定文言（security.md P0。
             // `SqlSurfaceError::InsufficientPrivilege` ドキュメント参照）。
             SqlSurfaceError::InsufficientPrivilege => {
-                write!(f, "permission denied for DDL statement")
+                write!(f, "permission denied")
             }
             // オブジェクト名・SCHEMA 名・内部 ID を含めない固定文言（ADR D7・security.md P0）。
             SqlSurfaceError::SchemaDependencyForbidden => {

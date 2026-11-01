@@ -125,6 +125,8 @@ pub(crate) fn classify(parsed: &ParsedSql) -> ReadRequirement {
         | ParsedSql::GrantRevoke(_)
         | ParsedSql::CreateRole(_)
         | ParsedSql::DropRole(_)
+        | ParsedSql::AlterRole(_)
+        | ParsedSql::SetRole(_)
         | ParsedSql::Do(_)
         | ParsedSql::CreateSchema(_)
         | ParsedSql::DropSchema(_)
@@ -169,6 +171,7 @@ pub(crate) fn require_read_privileges(
     tokens: &[Token],
     resolver: Option<SchemaResolver<'_>>,
     requirement: ReadRequirement,
+    read_snap: Option<&redb::ReadTransaction>,
 ) -> Result<(), SqlSurfaceError> {
     let Some(required_bits) = requirement.bits() else {
         return Ok(());
@@ -192,6 +195,7 @@ pub(crate) fn require_read_privileges(
         &principal,
         required_bits,
         &crate::sql::search_path::resolved_relation_ref_names(&resolved),
+        read_snap,
     )
 }
 
@@ -203,6 +207,7 @@ pub(crate) fn require_read_privileges_resolved(
     session: &SessionState,
     resolved_tokens: &[Token],
     requirement: ReadRequirement,
+    read_snap: Option<&redb::ReadTransaction>,
 ) -> Result<(), SqlSurfaceError> {
     let Some(required_bits) = requirement.bits() else {
         return Ok(());
@@ -223,6 +228,7 @@ pub(crate) fn require_read_privileges_resolved(
         &principal,
         required_bits,
         &crate::sql::search_path::resolved_relation_ref_names(resolved_tokens),
+        read_snap,
     )
 }
 
@@ -233,6 +239,7 @@ fn require_relations(
     principal: &Principal,
     required_bits: u16,
     candidates: &[String],
+    read_snap: Option<&redb::ReadTransaction>,
 ) -> Result<(), SqlSurfaceError> {
     let mut names: Vec<String> = Vec::new();
     for name in candidates {
@@ -249,9 +256,16 @@ fn require_relations(
         return Ok(());
     }
     let role_id = principal.current_role_id().unwrap_or(0);
-    let bits = storage
-        .relation_grant_bits(tenant, &names, role_id)
-        .map_err(crate::catalog::table_lookup_error)?;
+    // 明示 Tx（BEGIN 時のスナップショットで解析・実行する経路）では、ACL と relation の存在確認も同じ
+    // スナップショットで引く。最新カタログで引くと、BEGIN 後に別セッションが DROP した表が `None`
+    // （存在しない扱い）になり、旧スナップショットで読めてしまう認可バイパスになる。
+    let bits = match read_snap {
+        Some(snap) => {
+            crate::catalog::privilege::relation_grant_bits_in_txn(snap, tenant, &names, role_id)
+        }
+        None => storage.relation_grant_bits(tenant, &names, role_id),
+    }
+    .map_err(crate::catalog::table_lookup_error)?;
     for granted in bits.into_iter().flatten() {
         check(
             principal,
@@ -288,6 +302,7 @@ pub(crate) fn require_table_select(
         &principal,
         PRIV_SELECT,
         &[table.to_string()],
+        None,
     )
 }
 

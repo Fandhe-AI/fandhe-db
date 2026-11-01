@@ -95,7 +95,7 @@ fn denial_message_is_fixed_and_has_no_detail() {
     s.bind_role_ids(4242, 4242);
     let e = require_ddl(&s, DdlStatementKind::DropTable).expect_err("denied");
     assert_eq!(format!("{e:?}"), "InsufficientPrivilege");
-    assert_eq!(e.client_message(), "permission denied for DDL statement");
+    assert_eq!(e.client_message(), "permission denied");
 }
 
 // --- オブジェクト権限（#1967）-------------------------------------------------------------------

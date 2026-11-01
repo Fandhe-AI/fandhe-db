@@ -676,6 +676,7 @@ impl EngineCore {
         session: &SessionState,
         prepared: &super::PreparedSql,
         parsed: &ParsedSql,
+        read_snap: Option<&redb::ReadTransaction>,
     ) -> Result<(), SqlSurfaceError> {
         if !session.object_privileges_enforced() || matches!(prepared.route, PreparedRoute::Temp(_))
         {
@@ -690,6 +691,7 @@ impl EngineCore {
             session,
             &prepared.tokens,
             crate::sql::privilege_gate::read::classify(parsed),
+            read_snap,
         )
     }
 
@@ -704,23 +706,22 @@ impl EngineCore {
         declared: &[Option<crate::sql::params::DeclaredParamType>],
     ) -> Result<super::PreparedSql, SqlSurfaceError> {
         let result = self.parse_sql_prepared_in_session_inner(session, sql, declared);
+        // TABLE-27・Issue #1715: `public` が見えない `search_path` のセッションは、一時表以外の未修飾の
+        // テーブル参照を `42P01` にする。判定順は構文エラー `42601` → 参照ゲート → 権限 → その他の検証エラー。
+        // 既定の path のセッションは何も足さない。権限検査より前に行うのは、権限の無いロールへ `42501` で
+        // 非可視の表の存在を漏らさないため。
+        if session.search_path_hides_public()
+            && !matches!(&result, Err(e) if e.wire_code() == "42601")
+        {
+            if let Ok(tokens) = crate::sql::lexer::tokenize_with_params(sql) {
+                crate::sql::search_path::check_unqualified_refs(session, &tokens, &[])?;
+            }
+        }
         // SQL-40・Issue #1967: 構文・名前解決に成功した文だけを権限検査する（`42601` → `42P01` → `42501`）。
         // Describe 前の Parse の時点でも拒否する（権限の無い主体に列の型情報を返さない。PostgreSQL は
         // Parse では検査しない意図的な差で、Bind で再検査する）。
         if let Ok(prepared) = &result {
-            self.require_prepared_read_privileges(session, prepared, &prepared.dummy_parsed)?;
-        }
-        // TABLE-27・Issue #1715: `public` が見えない `search_path` のセッションは、一時表以外の未修飾の
-        // テーブル参照を `42P01` にする。判定順は構文エラー `42601` → 参照ゲート → その他の検証エラー。
-        // 既定の path のセッションは何も足さない。
-        if !session.search_path_hides_public() {
-            return result;
-        }
-        if matches!(&result, Err(e) if e.wire_code() == "42601") {
-            return result;
-        }
-        if let Ok(tokens) = crate::sql::lexer::tokenize_with_params(sql) {
-            crate::sql::search_path::check_unqualified_refs(session, &tokens, &[])?;
+            self.require_prepared_read_privileges(session, prepared, &prepared.dummy_parsed, None)?;
         }
         result
     }
@@ -909,7 +910,7 @@ impl EngineCore {
                 let parsed = self.bind_prepared_snap(prepared, values, read_snap)?;
                 // SQL-40・Issue #1967: Parse と Execute の間の `REVOKE` を反映するため、束縛済みの
                 // セッションでは Bind のたびに権限を再検査する（副作用の前）。
-                self.require_prepared_read_privileges(session, prepared, &parsed)?;
+                self.require_prepared_read_privileges(session, prepared, &parsed, read_snap)?;
                 // `COPY`（Issue #1760）は Execute で元 SQL を現在のカタログへ再解決する
                 // （`begin_copy_temp`）ため、Bind 後に一時表が作成・削除されると宛先が永続表から
                 // 一時表（または逆）へ化ける。一時カタログの世代つきで包み、Execute 前の
