@@ -43,9 +43,8 @@ use crate::sql::lexer::{Keyword, Token};
 use crate::sql::mode::SessionState;
 
 /// `BEGIN`/`COMMIT`/`ROLLBACK`（別名 `START TRANSACTION`/`END`/`ABORT`。Issue #1930）の
-/// 種別（構造検証のみ。実行は [`SessionTransaction`] が担う）。`StartTransaction` は
-/// `Begin` と状態遷移が同一で、CommandComplete タグだけが異なる（`START TRANSACTION`）。
-/// `END` は `Commit`、`ABORT` は `Rollback` へ写像する。
+/// 種別（構造検証のみ。実行は [`SessionTransaction`] が担う）。契約は SQL-69・SQL-31 の
+/// ポインタ先に従う。`END` は `Commit`、`ABORT` は `Rollback` へ写像する。
 ///
 /// **BREAKING CHANGE**（Issue #1930）: variant `StartTransaction` を追加した。
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
