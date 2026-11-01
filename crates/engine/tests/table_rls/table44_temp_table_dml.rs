@@ -1269,3 +1269,19 @@ fn temp_create_index_if_not_exists_keeps_the_existing_index() {
     assert!(code(&core, &mut s, "DROP INDEX ix").starts_with("ok:"));
     assert_eq!(code(&core, &mut s, "DROP INDEX ix"), "42704");
 }
+
+/// SQL-38・Issue #1939: 一時表 `read` が存在しても、拡張クエリ（Parse／Describe／Bind）の
+/// `SET TRANSACTION READ ONLY` は `READ` を表参照と誤認せず、簡易クエリと同じく受理される。
+#[test]
+fn extended_set_transaction_is_not_mistaken_for_a_temp_table_reference() {
+    let (core, _g) = new_core("t44-set-tx-ext", LedgerMode::default());
+    let mut s = ddl_session();
+    run_ok(&core, &mut s, &format!("CREATE TEMP TABLE read {COLUMNS}"));
+    let prepared = core
+        .parse_sql_prepared_with_declared_in_session(&s, "SET TRANSACTION READ ONLY", &[])
+        .expect("parse");
+    core.describe_prepared_in_session(&s, &prepared)
+        .expect("describe");
+    core.bind_prepared_in_session(&s, &prepared, &[])
+        .expect("bind");
+}

@@ -883,6 +883,10 @@ pub(crate) fn map_outcome(outcome: SqlOutcome) -> OutcomeResponse {
         SqlOutcome::StartTransaction => OutcomeResponse::Command {
             tag: "START TRANSACTION".to_string(),
         },
+        // Issue #1939: `SET TRANSACTION`／`SET SESSION CHARACTERISTICS` は件数を持たない `SET`。
+        SqlOutcome::SetTransaction => OutcomeResponse::Command {
+            tag: "SET".to_string(),
+        },
         SqlOutcome::Commit => OutcomeResponse::Command {
             tag: "COMMIT".to_string(),
         },
