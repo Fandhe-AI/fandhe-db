@@ -48,7 +48,8 @@ fn insert_sql(id: u64, op_id: &str) -> String {
     )
 }
 
-/// holder が `BEGIN` で writer を握り、解放シグナル受信後に `ROLLBACK` する。
+/// holder が `BEGIN` ＋最初の書き込み文（Issue #2400）で writer を握り、解放シグナル受信後に
+/// `ROLLBACK` する。明示 Tx の writer は `BEGIN` ではなく最初の書き込み文で取得される。
 fn spawn_holder(
     engine: &Arc<EngineCore>,
 ) -> (std::thread::JoinHandle<()>, std::sync::mpsc::Sender<()>) {
@@ -60,7 +61,14 @@ fn spawn_holder(
         let mut session = SessionState::default();
         let mut txn = e.new_session_transaction();
         e.execute_sql_in_txn(&caller, &mut session, &mut txn, "BEGIN")
-            .expect("begin holds writer_gate");
+            .expect("begin");
+        e.execute_sql_in_txn(
+            &caller,
+            &mut session,
+            &mut txn,
+            &insert_sql(900, "op-holder"),
+        )
+        .expect("first write holds writer_gate");
         began_tx.send(()).expect("notify");
         release_rx.recv().expect("release signal");
         e.execute_sql_in_txn(&caller, &mut session, &mut txn, "ROLLBACK")
@@ -115,20 +123,38 @@ fn raised_wait_lets_blocked_insert_succeed_after_release() {
     res.expect("insert succeeds once writer is released within the wait");
 }
 
-/// T3: 待つ側が明示トランザクションの `BEGIN` でも `55P03`。
+/// T3: 待つ側が明示トランザクションなら `BEGIN` は待たず成功し、最初の書き込み文が `55P03`
+/// になる（Issue #2400）。`Failed` 後は `25P02`、`ROLLBACK` だけが成功する。
 #[test]
-fn explicit_begin_times_out_with_55p03() {
+fn explicit_first_write_times_out_with_55p03() {
     let (engine, path) = new_core(100);
     let _cleanup = CleanupGuard(path);
     let (holder, release) = spawn_holder(&engine);
 
     let mut session = SessionState::default();
     let mut txn = engine.new_session_transaction();
-    let res = engine.execute_sql_in_txn(&ctx("tenant-b"), &mut session, &mut txn, "BEGIN");
+    let begin_started = Instant::now();
+    let begin = engine.execute_sql_in_txn(&ctx("tenant-b"), &mut session, &mut txn, "BEGIN");
+    let begin_elapsed = begin_started.elapsed();
+    let write = engine.execute_sql_in_txn(
+        &ctx("tenant-b"),
+        &mut session,
+        &mut txn,
+        &insert_sql(1, "op-t3"),
+    );
+    let after = engine.execute_sql_in_txn(&ctx("tenant-b"), &mut session, &mut txn, "SELECT 1");
+    let rollback = engine.execute_sql_in_txn(&ctx("tenant-b"), &mut session, &mut txn, "ROLLBACK");
 
     release.send(()).expect("release");
     holder.join().expect("holder");
-    assert_eq!(res.expect_err("must time out").wire_code(), "55P03");
+    begin.expect("BEGIN does not wait for the writer");
+    assert!(
+        begin_elapsed < Duration::from_millis(100),
+        "begin_elapsed={begin_elapsed:?}"
+    );
+    assert_eq!(write.expect_err("must time out").wire_code(), "55P03");
+    assert_eq!(after.expect_err("failed txn").wire_code(), "25P02");
+    rollback.expect("rollback");
 }
 
 /// T4: 構築経路（`open`）に関係なく設定が効き、検索エンジン種別は変わらない。
