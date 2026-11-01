@@ -2423,6 +2423,47 @@ fn is_partitioned_write(parsed: &ParsedSql) -> bool {
     }
 }
 
+/// 読み取り専用トランザクション（`BEGIN READ ONLY`。SQL-38 (3)・Issue #1934）が実行してよい文か。
+/// 許可リスト方式で、明示的に読み取りと分かる文だけを許し、DML・DDL・`COPY FROM`・ロック・
+/// `USING OPERATION_ID` 付きの文と、将来追加される未知の variant（`_`）は拒否する（fail-closed）。
+/// 文の種類だけで判定し、表名・テナント・件数は参照しない（応答で存在を漏らさない）。
+/// [`EngineCore::execute_in_active_txn_inner`] の先頭が呼ぶ。`DO`・ルーチン呼び出しの外側は許し、
+/// 本体の各文は `execute_in_active_txn` を再び通って個別に判定される。
+fn read_only_permits(parsed: &ParsedSql) -> bool {
+    use crate::sql::allowlist::Statement;
+    if parsed_operation_id(parsed).is_some() {
+        return false;
+    }
+    match parsed {
+        ParsedSql::Statement(stmt) => matches!(
+            stmt,
+            Statement::Select(_)
+                | Statement::Aggregate(_)
+                | Statement::Scan(_)
+                | Statement::Explain(_)
+                | Statement::Join(_)
+                | Statement::BufferedView(_)
+                | Statement::ConstSelect(_)
+                | Statement::SetOperation(_)
+                | Statement::MaterializedView(_)
+                | Statement::RecursiveCte(_)
+                | Statement::FunctionScan(_)
+                | Statement::SetSearchMode { .. }
+                | Statement::SetTimeZone { .. }
+                | Statement::ShowTimeZone
+                | Statement::SetSearchPath { .. }
+                | Statement::ShowSearchPath
+        ),
+        ParsedSql::Cursor(_) | ParsedSql::Do(_) => true,
+        ParsedSql::Partitioned(control) => !control.writes(),
+        ParsedSql::SequenceFunction(stmt) => !stmt.writes(),
+        ParsedSql::SessionRouted(routed) => read_only_permits(routed.inner()),
+        // `COPY ... TO` は読み取りだが、拡張クエリ経路の `Copy` は in-txn で別途拒否される。
+        // `COPY FROM` は `begin_copy_active_inner` の入口が `25006` で拒否する。
+        _ => false,
+    }
+}
+
 /// [`EngineCore::parse_sql_prepared`] の結果（Issue #935・WIRE-12・TASK-217）。
 /// 拡張クエリプロトコルの Parse が `$n` を含む SQL テキストを値未確定のまま
 /// 構造検証した「束縛前テンプレート」を運ぶ。行・台帳・世代のいずれにも触れて
@@ -7939,6 +7980,17 @@ impl EngineCore {
     ) -> Result<crate::sql::SqlOutcome, crate::sql::allowlist::SqlSurfaceError> {
         use crate::sql::allowlist::{SqlSurfaceError, Statement};
 
+        // Issue #1934・SQL-38 (3): 読み取り専用 Tx は許可リスト外の文を、writer・台帳・採番・カタログへ
+        // 触れる前に `25006` で拒否する（`Failed` への遷移は呼び出し元）。PL/pgSQL 本体・`DO` の各文も
+        // ここを通るため入れ子の書き込みも止まる。`PARTITIONED` 付き書き込みの `25001` は呼び出し元の
+        // 先行判定が優先する。トップレベルでは `check_and_register_statement` が先に走るが、Tx は直後に
+        // `Failed` となり集合ごと破棄され、永続の台帳には触れない。
+        if txn.access_mode() == Some(crate::sql::transaction::TxnAccessMode::ReadOnly)
+            && !read_only_permits(parsed)
+        {
+            return Err(SqlSurfaceError::ReadOnlySqlTransaction);
+        }
+
         // SQL-37（Issue #1586）: 読み取り文は文の開始時刻とトランザクション開始時刻を確定する
         // （`Active` なのに開始時刻が無い場合は fail-closed の `Internal`）。
         let _clock_scope = statement_clock_scope(
@@ -8250,6 +8302,30 @@ impl EngineCore {
             // `mark_written` の相手がなく、`has_writes` だけを立てる（立てないと COMMIT が write txn を
             // 破棄して setval の永続化が落ちる）。`lastval` は読み取りのみで印を付けない。
             ParsedSql::SequenceFunction(stmt) => {
+                // `lastval()` は読み取りのみ（`writes()` が偽。READ ONLY でも許可する契約。Issue #1934）。
+                // writer を要求せず、writer が既にあればその txn、無ければスナップショット読み取りで
+                // シーケンスの存在を確認する（READ ONLY Tx で 25006 になり `Failed` へ遷移するのを防ぐ）。
+                if !stmt.writes() {
+                    let result = match txn.write_txn() {
+                        Some(write_txn) => {
+                            crate::sql::sequence_fn::execute_in_txn(
+                                &self.storage,
+                                write_txn,
+                                session,
+                                ctx.tenant_id(),
+                                stmt,
+                            )?
+                            .0
+                        }
+                        None => crate::sql::sequence_fn::execute_autocommit(
+                            &self.storage,
+                            session,
+                            ctx.tenant_id(),
+                            stmt,
+                        )?,
+                    };
+                    return Ok(crate::sql::SqlOutcome::Query(result));
+                }
                 // 最初の書き込み文で writer を取得する（Issue #2400。待機超過は `55P03`。呼び出し元が `Failed` へ遷移）。
                 txn.ensure_writer(ctx)?;
                 let write_txn = txn.write_txn().ok_or_else(|| SqlSurfaceError::Internal {
@@ -13032,6 +13108,13 @@ impl EngineCore {
             )
         }
         .map_err(|e| self.reclassify_matview_write_error(e))?;
+        // Issue #1934・SQL-38 (3): 読み取り専用 Tx の `COPY FROM` は CopyInResponse の前に拒否する
+        // （クライアントからデータを受け取らない。呼び出し元が `Failed` へ遷移させる）。
+        if matches!(stmt, crate::sql::allowlist::CopyStatement::From(_))
+            && txn.access_mode() == Some(crate::sql::transaction::TxnAccessMode::ReadOnly)
+        {
+            return Err(crate::sql::allowlist::SqlSurfaceError::ReadOnlySqlTransaction);
+        }
         if let crate::sql::allowlist::CopyStatement::To(v) = &stmt {
             // 通常の読み取り文と同じ文実行前チェック（文数・持続時間の上限。
             // 超過時は `Failed` へ遷移して拒否する）。`COPY FROM` は

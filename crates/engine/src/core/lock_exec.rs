@@ -20,11 +20,10 @@ impl EngineCore {
         txn: &mut SessionTransaction<'_>,
         stmt: &ValidatedLockTable,
     ) -> Result<crate::sql::SqlOutcome, SqlSurfaceError> {
-        // 防御（fail-closed）: 読み取り専用 Tx は #1933 が `25006` へ置き換えるまで書き込みロックを拒否する。
+        // 多層防御（fail-closed）: 読み取り専用 Tx の `LOCK` は `execute_in_active_txn_inner` の許可リストが
+        // 先に `25006` で拒否する。ここは writer を取る前の最終防衛線（Issue #1934）。
         if txn.access_mode() == Some(TxnAccessMode::ReadOnly) {
-            return Err(SqlSurfaceError::feature_not_supported(
-                "LOCK TABLE in a read only transaction is not supported yet",
-            ));
+            return Err(SqlSurfaceError::ReadOnlySqlTransaction);
         }
         for name in &stmt.table_names {
             if !TableLookup::table_exists(&self.storage, name)? {

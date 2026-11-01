@@ -72,9 +72,10 @@ pub(crate) fn is_transaction_control_head(tokens: &[Token]) -> bool {
 }
 
 /// トランザクションのアクセスモード（SQL-38・Issue #1932）。`BEGIN READ ONLY`／
-/// `BEGIN READ WRITE` の修飾子を表し、[`ActiveTxn`] が保持する。読み取り専用の実体
-/// （読み取り Tx で開く・書き込みの `25006`）は #1933／#1934 の範囲で、それまで
-/// `ReadOnly` は [`SessionTransaction::begin_with_mode`] が `0A000` で拒否する。
+/// `BEGIN READ WRITE` の修飾子を表し、[`ActiveTxn`] が保持する。読み取り専用
+/// は、`ReadOnly` の Tx が writer を一度も取らないことで成立する。書き込み系の文は
+/// `core.rs` の許可リスト判定（Issue #1934）が、取りこぼした経路は
+/// [`SessionTransaction::ensure_writer_with`] が `25006` で拒否する。
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum TxnAccessMode {
     ReadWrite,
@@ -319,8 +320,8 @@ enum TxnOrigin {
 /// `read_snapshot` より先に置いて permit の解放を遅らせない。
 struct ActiveTxn<'e> {
     origin: TxnOrigin,
-    /// アクセスモード（SQL-38・Issue #1932）。#1933／#1934 が読み取り Tx の開始と
-    /// 書き込み拒否の判定に使う。現状 `ReadOnly` は開始前に拒否されるため常に `ReadWrite`。
+    /// アクセスモード（SQL-38・Issue #1932）。`ReadOnly` は writer を取らず、書き込み系の文を
+    /// `25006` で拒否する判定（Issue #1934。`core.rs` の許可リスト）に使う。
     access_mode: TxnAccessMode,
     /// `BEGIN ISOLATION LEVEL` で明示された要求レベル（記録のみ。暗黙・未指定は `None`。Issue #1938）。
     isolation_level: Option<RequestedIsolationLevel>,
@@ -603,8 +604,7 @@ impl<'e> SessionTransaction<'e> {
     }
 
     /// アクセスモード付きの `BEGIN`（SQL-38・Issue #1932。`core.rs` の実行分岐が呼ぶ）。
-    /// `ReadOnly` は #1933／#1934 まで `Idle` 分岐の先頭で `0A000` 拒否する暫定ゲート
-    /// （書き込み可能な Tx を読み取り専用として渡さない fail-closed）。
+    /// `ReadOnly` の Tx は writer を取らず、書き込み系の文は `25006` で拒否される（Issue #1934）。
     pub fn begin_with_mode(
         &mut self,
         storage: &'e crate::storage::Storage,
@@ -745,13 +745,6 @@ impl<'e> SessionTransaction<'e> {
     ) -> Result<(), SqlSurfaceError> {
         match &self.state {
             TxnState::Idle => {
-                // 暫定ゲート（#1933／#1934 で除去）: 読み取り専用を宣言した接続へ書き込み可能な
-                // Tx を渡さないよう、writer を取る前に拒否する（状態は `Idle` のまま）。
-                if access_mode == TxnAccessMode::ReadOnly {
-                    return Err(SqlSurfaceError::feature_not_supported(
-                        "BEGIN READ ONLY is not supported yet",
-                    ));
-                }
                 // 壁時計の読み取り失敗（範囲外）は writer を開く前に fail-closed で返す
                 // （状態は `Idle` のまま）。
                 let txn_start_micros = crate::sql::time_fn::now_micros()?;
@@ -1071,8 +1064,9 @@ impl<'e> SessionTransaction<'e> {
     ///
     /// - 待機上限超過は `55P03`。呼び出し側は既存契約どおり `fail()` で `Failed` へ遷移させる。
     ///   取得前は何も書いていないので副作用は無い。
-    /// - `Idle`／`Failed`・READ ONLY は呼び出し側の不変条件違反として `XX000`（fail-closed。
-    ///   READ ONLY は #1934 が `25006` へ置き換える）。
+    /// - `Idle`／`Failed` は呼び出し側の不変条件違反として `XX000`（fail-closed）。
+    /// - READ ONLY は `25006`（Issue #1934）。`core.rs` の許可リストが取りこぼした書き込み経路の保険で、
+    ///   writer を取らないので行・カタログ・台帳へ副作用は無い。
     /// - gate 取得後、permit を保持したまま読み取り集合と後続 commit の書き込みを突き合わせ、
     ///   衝突なら `40001`（#2405。[`Self::ensure_writer_with`]）。`ctx` は書き込み文を実行する
     ///   接続の `PolicyContext` で、可視性の判定に使う。
@@ -1103,7 +1097,7 @@ impl<'e> SessionTransaction<'e> {
                     return Ok(());
                 }
                 if active.access_mode == TxnAccessMode::ReadOnly {
-                    return Err(internal_error());
+                    return Err(SqlSurfaceError::ReadOnlySqlTransaction);
                 }
                 let w = if nowait {
                     active.storage.begin_explicit_write_txn_nowait()
@@ -2029,6 +2023,26 @@ mod tests {
             txn.ensure_writer(&test_ctx()),
             Err(SqlSurfaceError::Internal { .. })
         ));
+    }
+
+    /// READ ONLY の Tx は `ensure_writer` が `25006` で拒否し、writer を一度も作らない（Issue #1934）。
+    #[test]
+    fn ensure_writer_in_read_only_txn_is_25006_and_creates_no_writer() {
+        let (storage, _g) = open_test_storage("txn-1934-ro-ensure");
+        let mut session = SessionState::default();
+        let mut txn = SessionTransaction::new(TransactionLimits::default());
+        txn.begin_with_mode(&storage, &session, TxnAccessMode::ReadOnly)
+            .expect("begin read only");
+        assert_eq!(txn.access_mode(), Some(TxnAccessMode::ReadOnly));
+        let before = storage.write_txn_creations();
+        for nowait in [false, true] {
+            assert!(matches!(
+                txn.ensure_writer_with(&test_ctx(), nowait),
+                Err(SqlSurfaceError::ReadOnlySqlTransaction)
+            ));
+        }
+        assert_eq!(storage.write_txn_creations(), before);
+        txn.commit(&mut session).expect("commit");
     }
 
     /// 別スレッドが gate を持つ間、`ensure_writer` は待機上限超過で `55P03` になり
