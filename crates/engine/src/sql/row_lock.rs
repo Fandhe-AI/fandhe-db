@@ -115,6 +115,8 @@ pub(crate) struct RowLockingSyntax {
     clauses: Vec<RowLockClause>,
     /// 最上位の FROM の先頭の参照 `(表名, 別名)`（単一表の SELECT の `OF` 照合に使う）。
     first_from: Option<TableRef>,
+    /// `first_from` がスキーマ修飾付き（`s.t`）か。修飾付きは CTE 名と衝突しない（実表）。
+    first_from_qualified: bool,
     /// 先頭の `WITH` が定義した CTE 名。
     cte_names: Vec<String>,
     /// `DISTINCT`／`GROUP BY`／`HAVING`／`WINDOW`／集合演算が最上位にある。
@@ -312,6 +314,7 @@ pub(crate) fn extract_row_locking(
     let pre = tokens.get(..start).unwrap_or(&[]);
     let mut combo_violation = false;
     let mut first_from: Option<TableRef> = None;
+    let mut first_from_qualified = false;
     let mut cte_names: Vec<String> = Vec::new();
     let mut depth: usize = 0;
     for (k, tok) in pre.iter().enumerate() {
@@ -333,6 +336,7 @@ pub(crate) fn extract_row_locking(
         match tok {
             Token::Keyword(Keyword::From) if first_from.is_none() => {
                 first_from = parse_first_from(pre, k + 1);
+                first_from_qualified = matches!(pre.get(k + 1), Some(Token::QualifiedIdent { .. }));
             }
             Token::Ident(w) => {
                 let upper = w.to_ascii_uppercase();
@@ -351,8 +355,12 @@ pub(crate) fn extract_row_locking(
                     "GROUP" if matches!(pre.get(k + 1), Some(Token::Keyword(Keyword::By))) => {
                         combo_violation = true
                     }
+                    // 列別名（`AS "union"`）を集合演算と誤認しないよう、直前が `AS` でなく、
+                    // 後続が SELECT の枝（`SELECT`／`ALL`／`DISTINCT`／`VALUES`／`TABLE`／`(`）のときだけ印を立てる。
                     "UNION" | "INTERSECT" | "EXCEPT"
-                        if crate::sql::fetch_clause::follows_operand(prev) =>
+                        if crate::sql::fetch_clause::follows_operand(prev)
+                            && !is_word(prev, "AS")
+                            && set_op_branch_follows(pre.get(k + 1)) =>
                     {
                         combo_violation = true
                     }
@@ -403,10 +411,23 @@ pub(crate) fn extract_row_locking(
         Some(RowLockingSyntax {
             clauses,
             first_from,
+            first_from_qualified,
             cte_names,
             combo_violation,
         }),
     ))
+}
+
+/// 集合演算語の直後が SELECT の枝の先頭か。
+fn set_op_branch_follows(next: Option<&Token>) -> bool {
+    match next {
+        Some(Token::Keyword(Keyword::Select)) | Some(Token::Punct('(')) => true,
+        Some(Token::Ident(w)) => matches!(
+            w.to_ascii_uppercase().as_str(),
+            "ALL" | "DISTINCT" | "VALUES" | "TABLE"
+        ),
+        _ => false,
+    }
 }
 
 /// 直前の識別子がキーワード相当の語（`JOIN`・`OUTER`・`ON` 等）で、次の語が名前の位置にある。
@@ -525,7 +546,7 @@ pub(crate) fn check_row_locking(
             return Err(combo_error());
         };
         let exposed = first.exposed_name();
-        if syntax.cte_names.iter().any(|c| c == first.table()) {
+        if !syntax.first_from_qualified && syntax.cte_names.iter().any(|c| c == first.table()) {
             return Err(combo_error());
         }
         for name in &of_all {
@@ -757,14 +778,35 @@ mod tests {
     }
 
     #[test]
+    fn qualified_from_is_flagged_so_it_never_matches_a_cte_name() {
+        let syn = extract("WITH t AS (SELECT 1) SELECT id FROM public.t FOR UPDATE")
+            .unwrap()
+            .1
+            .unwrap();
+        assert!(syn.first_from_qualified);
+        let syn = extract("WITH t AS (SELECT 1) SELECT id FROM t FOR UPDATE")
+            .unwrap()
+            .1
+            .unwrap();
+        assert!(!syn.first_from_qualified);
+    }
+
+    #[test]
     fn combo_marks() {
         for sql in [
             "SELECT DISTINCT id FROM a FOR UPDATE",
             "SELECT id FROM a GROUP BY id FOR UPDATE",
             "SELECT id FROM a GROUP BY id HAVING id > 1 FOR UPDATE",
             "SELECT id FROM a UNION SELECT id FROM b FOR UPDATE",
+            "SELECT id FROM a UNION ALL SELECT id FROM b FOR UPDATE",
         ] {
             assert!(extract(sql).unwrap().1.unwrap().combo_violation, "{sql}");
+        }
+        for sql in [
+            "SELECT id AS \"union\" FROM a LIMIT 5 FOR UPDATE",
+            "SELECT id AS \"except\" FROM a FOR UPDATE",
+        ] {
+            assert!(!extract(sql).unwrap().1.unwrap().combo_violation, "{sql}");
         }
         assert!(
             !extract("SELECT id FROM a FOR UPDATE")
