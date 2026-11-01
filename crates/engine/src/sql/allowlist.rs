@@ -1224,6 +1224,9 @@ pub enum SqlSurfaceError {
     /// 中で実行しようとした（Issue #1129。`25001`）。黙って原子実行へ切り替えず拒否する。
     /// 再 `BEGIN` の [`Self::ActiveSqlTransaction`] とは固定文言で区別する。
     PartitionedDmlInTransaction,
+    /// `SET TRANSACTION` を明示トランザクションの最初の問い合わせより後に実行した（Issue #1939。
+    /// `25001`）。トランザクションは `Failed` になる。再 `BEGIN` とは固定文言で区別する。
+    SetTransactionAfterQuery,
     /// 同じ `operation_id` の分割実行ジョブが実行中、または同時実行数の上限（テナント
     /// 単位・全体）に達した（Issue #1129。`55P03`）。上限の種別は文言に含めない。
     PartitionedJobBusy { detail: String },
@@ -2037,7 +2040,8 @@ impl ClassifiedError for SqlSurfaceError {
             | SqlSurfaceError::InvalidViewReplacement { .. } => ErrorClass::InvalidTableDefinition,
             SqlSurfaceError::PartialCompletion { .. } => ErrorClass::PartialCompletion,
             SqlSurfaceError::PartitionedDmlCancelled { .. } => ErrorClass::PartitionedDmlCancelled,
-            SqlSurfaceError::PartitionedDmlInTransaction => ErrorClass::ActiveSqlTransaction,
+            SqlSurfaceError::PartitionedDmlInTransaction
+            | SqlSurfaceError::SetTransactionAfterQuery => ErrorClass::ActiveSqlTransaction,
             SqlSurfaceError::PartitionedJobBusy { .. } => ErrorClass::LockNotAvailable,
             SqlSurfaceError::DuplicateColumn { .. } => ErrorClass::DuplicateColumn,
             SqlSurfaceError::InvalidColumnReference
@@ -2342,6 +2346,9 @@ impl std::fmt::Display for SqlSurfaceError {
             // 再 BEGIN の `transaction already in progress` と区別できる固定文言。
             SqlSurfaceError::PartitionedDmlInTransaction => {
                 write!(f, "partitioned DML cannot run inside a transaction block")
+            }
+            SqlSurfaceError::SetTransactionAfterQuery => {
+                write!(f, "SET TRANSACTION must be called before any query")
             }
             SqlSurfaceError::PartitionedJobBusy { detail } => {
                 write!(f, "{detail}")

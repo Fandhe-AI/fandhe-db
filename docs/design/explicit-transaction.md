@@ -624,7 +624,11 @@ Issue #1931（`READ ONLY`）、挙動テストは #1940、`40001` は #2396 が�
   #1938 は要求されたレベルを別の `sql::transaction::RequestedIsolationLevel` として
   `ValidatedTxnControl`（`ParsedSql::Transaction` の payload）から `ActiveTxn` へ記録するだけで、
   実行は変えない（`SessionTransaction::isolation_level()` で読める。暗黙・未指定は `None`）。
-  `SET TRANSACTION` 系の保持は #1939 で決める。引用識別子の `"ISOLATION"` 等が受理される既存の性質は変えていない。
+  引用識別子の `"ISOLATION"` 等が受理される既存の性質は変えていない。
+- **`SET TRANSACTION` 系の実装（Issue #1939）**: モード列の語彙は `BEGIN` と同じ関数
+  （`parse_txn_mode_list`）で解釈し、`ParsedSql::SetTransaction` へ運ぶ。契約は SQL-38 (7)(a)・SQL-31 の
+  ポインタ先に従い、本書には契約の詳細（受理時期・SQLSTATE・失敗状態への遷移・セッション既定の適用範囲）を書かない
+  （下記「公開境界」）。実装の入口は `SessionTransaction::set_transaction_modes` と `SessionState` の既定の保持。
 - **fail-closed・テナント境界**: 未対応・不正な形は従来どおり `42601`／`0A000` で拒否する。
   分離レベルの指定は RLS 相当のテナント境界にも可視集合にも影響しない。
 - **未割り当ての後続**: `SHOW` による分離レベル等の表示対応を担う sub-issue は #1936 配下にまだ無い。担当は #1936 で決める。
@@ -850,7 +854,7 @@ production コード（`crates/wire-server/src/`）は無変更・テスト専�
   従来どおりの読み書き Tx。`READ ONLY` の暫定ゲート（`0A000`）は Issue #1934 で除去し、
   `READ ONLY` の Tx を開始できる（「READ ONLY での書き込み拒否」節）。PostgreSQL との差異として、アクセスモードの重複・矛盾（`READ ONLY READ WRITE`）
   は `42601`（fail-closed）。引用識別子 `"READ"` も受理される（既存の `"WORK"` と同じ性質）。
-- savepoint の巻き戻し本体（#1941。構文とスタックは #1942 で実装済み。下記「SAVEPOINT 構文と savepoint スタック」節）、`COMMIT AND CHAIN`・`PREPARE TRANSACTION`。分離レベルの指定は「分離レベルの受理方針」節のポインタ先の契約に従う（`BEGIN ISOLATION LEVEL` は #1938 で実装済み、`SET TRANSACTION` 系は #1939）。
+- savepoint の巻き戻し本体（#1941。構文とスタックは #1942 で実装済み。下記「SAVEPOINT 構文と savepoint スタック」節）、`COMMIT AND CHAIN`・`PREPARE TRANSACTION`。分離レベルの指定は「分離レベルの受理方針」節のポインタ先の契約に従う（`BEGIN ISOLATION LEVEL` は #1938 で実装済み、`SET TRANSACTION` 系は #1939 で実装済み）。
   別名 `START TRANSACTION`／`END`／`ABORT` は Issue #1930 で受理した（下記「別名」節）。
 - NoSQL 表層のトランザクション（設計上 `0A000`。`op` 許可リストに追加しない）。
 - 上限の既定値（20 秒・1,000 件・30 秒）と CLI のハード上限（60 秒・10,000 件。Issue #1553 で暫定採用）の確定 → オーナー判断。
