@@ -515,6 +515,10 @@ pub enum SqlOutcome {
     /// `START TRANSACTION`（Issue #1930・SQL-69 ポインタ。契約はポインタ先に従う）。
     /// **BREAKING CHANGE**: variant 追加。
     StartTransaction,
+    /// `SET TRANSACTION`／`SET SESSION CHARACTERISTICS AS TRANSACTION`（Issue #1939）の成功応答。
+    /// `wire-server::simple_query` は `CommandComplete` タグ `SET` を返す。
+    /// **BREAKING CHANGE**: variant 追加。
+    SetTransaction,
     /// `COMMIT [WORK|TRANSACTION]`（SQL-31・TASK-221）が成功したことを示す応答。
     /// `wire-server::simple_query` は `CommandComplete` タグ `COMMIT` を返す。
     Commit,
