@@ -614,6 +614,22 @@ impl FkCheckMode {
     }
 }
 
+/// 検査点を呼ぶ書き込みの種別（RLS-13・Issue #2277）。利用者定義ポリシーの `WITH CHECK` をどの規則で
+/// 評価するかを呼び出し元が**明示**する（thread-local にしない。指定の付け忘れがコンパイルエラーに
+/// なり、「検査なし」＝fail-open の経路を作らない）。
+#[derive(Debug, Clone, Copy)]
+pub(crate) enum RowPolicyWrite<'a> {
+    /// 新しい行を挿入した（`INSERT`・`COPY FROM`・ファイル形 INSERT・BEFORE トリガ適用後の行）。
+    Insert,
+    /// 既存行を更新した（`UPDATE`・分割実行 DML・BEFORE トリガ適用後の行）。
+    Update,
+    /// UPSERT。`updated_ids` は `DO UPDATE` で更新した行（更新側の規則）、残りは挿入側の規則で評価する。
+    Upsert { updated_ids: &'a [RowId] },
+    /// ユーザーが直接書いた行ではない内部書き込み（`FOREIGN KEY` の参照アクションの連鎖等）。
+    /// 利用者定義ポリシーを適用しない（暫定。設計記録参照）。
+    Internal,
+}
+
 /// `tenant.rs` の各書き込み関数が書き込み後・commit 前に呼ぶ唯一の入口
 /// （TABLE-16・TASK-204）。永続キー索引（`key_index.rs`、Issue #1071）の同期 →
 /// `CHECK` 制約（Issue #906）→ 式索引の式評価（INDEX-10、Issue #1649。
@@ -641,6 +657,7 @@ pub(crate) fn enforce_row_constraints_in_txn(
     tenant_id: &str,
     written_ids: &[RowId],
     fk_mode: FkCheckMode,
+    policy: RowPolicyWrite<'_>,
 ) -> Result<crate::key_index::KeyIndexDelta, TenantWriteError> {
     enforce_row_constraints_impl(
         write_txn,
@@ -649,7 +666,7 @@ pub(crate) fn enforce_row_constraints_in_txn(
         tenant_id,
         written_ids,
         fk_mode,
-        true,
+        policy,
     )
 }
 
@@ -685,8 +702,20 @@ fn enforce_row_constraints_impl(
     tenant_id: &str,
     written_ids: &[RowId],
     fk_mode: FkCheckMode,
-    view_checks: bool,
+    policy: RowPolicyWrite<'_>,
 ) -> Result<crate::key_index::KeyIndexDelta, TenantWriteError> {
+    // ビューの `WITH CHECK OPTION` は、ユーザーが直接書いた行にだけ掛ける（内部の連鎖書き込みには掛けない）。
+    let view_checks = !matches!(policy, RowPolicyWrite::Internal);
+    // 利用者定義ポリシーの `WITH CHECK`（RLS-13・Issue #2277）。PostgreSQL の RLS の WCO は
+    // 制約・索引挿入より前に評価されるため、CHECK・UNIQUE・ビューの WCO より先に置く。
+    enforce_row_policies_in_txn(
+        write_txn,
+        table_name,
+        schema,
+        tenant_id,
+        written_ids,
+        policy,
+    )?;
     let delta =
         crate::key_index::sync_rows_in_txn(write_txn, table_name, schema, tenant_id, written_ids)?;
     enforce_check_constraints_in_txn(write_txn, table_name, schema, tenant_id, written_ids)?;
@@ -760,6 +789,78 @@ fn enforce_row_constraints_impl(
         fk_mode,
     )?;
     Ok(delta)
+}
+
+/// 利用者定義ポリシー（RLS-13・Issue #2277）の `WITH CHECK` 段。書いた行（`written_ids`。UPSERT の
+/// `DO NOTHING` で衝突した行は含まれない）を同一 write txn で読み戻し、書き込みの種別に応じた合成
+/// （[`crate::sql::policy_eval`]）で評価する。違反は [`TenantWriteError::RowSecurityPolicyViolation`]
+/// （`42501`）で、呼び出し元は commit しない（文全体が失敗し何も残らない）。RLS が無効な表・
+/// [`RowPolicyWrite::Internal`]・`written_ids` が空のときは何もしない。物理キーはサーバー側導出の
+/// `tenant_id` で名前空間化済みで、自テナントの行・ポリシーだけを読む。読み戻せない id は対象外
+/// （[`enforce_check_constraints_in_txn`] と同じ）。
+fn enforce_row_policies_in_txn(
+    write_txn: &redb::WriteTransaction,
+    table_name: &str,
+    schema: &TableSchema,
+    tenant_id: &str,
+    written_ids: &[RowId],
+    policy: RowPolicyWrite<'_>,
+) -> Result<(), TenantWriteError> {
+    use crate::sql::policy_eval::{compile_in_txn, PolicyCheckKind};
+    if written_ids.is_empty() {
+        return Ok(());
+    }
+    let (insert_kind, update_kind) = match policy {
+        RowPolicyWrite::Internal => return Ok(()),
+        RowPolicyWrite::Insert => (Some(PolicyCheckKind::InsertCheck), None),
+        RowPolicyWrite::Update => (None, Some(PolicyCheckKind::UpdateCheck)),
+        RowPolicyWrite::Upsert { .. } => (
+            Some(PolicyCheckKind::InsertCheck),
+            Some(PolicyCheckKind::UpdateCheck),
+        ),
+    };
+    let insert_checks = match insert_kind {
+        Some(kind) => compile_in_txn(write_txn, tenant_id, table_name, schema, kind)?,
+        None => None,
+    };
+    let update_checks = match update_kind {
+        Some(kind) => compile_in_txn(write_txn, tenant_id, table_name, schema, kind)?,
+        None => None,
+    };
+    if insert_checks.is_none() && update_checks.is_none() {
+        return Ok(());
+    }
+    let updated: HashSet<RowId> = match policy {
+        RowPolicyWrite::Upsert { updated_ids } => updated_ids.iter().copied().collect(),
+        RowPolicyWrite::Update => written_ids.iter().copied().collect(),
+        RowPolicyWrite::Insert | RowPolicyWrite::Internal => HashSet::new(),
+    };
+    let row_table_name = crate::catalog::user_rows_table_name(table_name);
+    let row_table = write_txn
+        .open_table(crate::catalog::user_rows_table_def(&row_table_name))
+        .map_err(crate::catalog::map_row_table_error)?;
+    let mut embedding: Vec<f32> = Vec::new();
+    for &id in written_ids {
+        let checks = if updated.contains(&id) {
+            update_checks.as_ref()
+        } else {
+            insert_checks.as_ref()
+        };
+        let Some(checks) = checks else {
+            continue;
+        };
+        let Some(guard) = row_table
+            .get(row_key(tenant_id, id))
+            .map_err(crate::catalog::CatalogError::from)?
+        else {
+            continue;
+        };
+        let buf = guard.value();
+        let (_dim, metadata) =
+            crate::storage::decode_row_embedding_and_metadata_into(buf, &mut embedding)?;
+        checks.enforce(schema, id.legacy_id(), &embedding, metadata)?;
+    }
+    Ok(())
 }
 
 /// ビューの `WITH CHECK OPTION`（TABLE-43 (2)・Issue #1673）の検査。書き込み区間のスコープ
@@ -4050,7 +4151,7 @@ fn propagate_referential_actions(
             tenant_id,
             &child_ids,
             fk_mode,
-            false,
+            RowPolicyWrite::Internal,
         )?;
     }
 
