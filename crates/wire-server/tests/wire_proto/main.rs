@@ -12,6 +12,7 @@ mod legacy_table;
 
 mod rls11_read_your_writes;
 mod sql38_set_transaction;
+mod sql69_savepoint_syntax;
 mod sql69_txn_aliases;
 mod wire11_bind_execute_sync;
 mod wire11_message_limits;
