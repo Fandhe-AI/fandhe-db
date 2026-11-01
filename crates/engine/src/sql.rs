@@ -278,6 +278,7 @@ pub mod relation_snapshot;
 pub mod returning;
 pub mod row_lock;
 pub(crate) mod row_policy;
+pub(crate) mod savepoint;
 pub(crate) mod scalar_index;
 pub(crate) mod scalar_plan;
 pub mod scan;
@@ -526,6 +527,14 @@ pub enum SqlOutcome {
     /// `ROLLBACK [WORK|TRANSACTION]`（SQL-31・TASK-221）が成功したことを示す応答。
     /// `wire-server::simple_query` は `CommandComplete` タグ `ROLLBACK` を返す。
     Rollback,
+    /// `SAVEPOINT <name>`（SQL-69・Issue #1942）が成功したことを示す応答。
+    /// `wire-server::simple_query` は `CommandComplete` タグ `SAVEPOINT` を返す。
+    /// **BREAKING CHANGE**: variant 追加。
+    Savepoint,
+    /// `RELEASE [SAVEPOINT] <name>`（SQL-69・Issue #1942）が成功したことを示す応答。
+    /// `wire-server::simple_query` は `CommandComplete` タグ `RELEASE` を返す。
+    /// **BREAKING CHANGE**: variant 追加。
+    ReleaseSavepoint,
     /// `CREATE TABLE <table> (<col> <type>[, ...]) [;]`（SQL-23・TASK-85・
     /// TASK-202、Issue #899）がセッション経由の実行経路
     /// （`crate::core::EngineCore::execute_parsed_in_session`）で成功したことを
