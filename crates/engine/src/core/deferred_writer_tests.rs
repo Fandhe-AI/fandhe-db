@@ -142,6 +142,84 @@ fn read_only_txn_holds_only_read_snapshot() {
     }
 }
 
+/// 別セッション（同テナント・他テナント）が書き込み・commit を繰り返す間も、`BEGIN READ ONLY` の Tx は
+/// writer を取らず、`write_txn` の生成数（choke point の証跡）に寄与しない（Issue #1935・SQL-38）。
+/// 書き込み文の `25006` 拒否の後も同様。対照として通常の `BEGIN` は最初の書き込み文で生成数を増やす。
+/// 結合側の並行・スナップショット一貫性は `tests/sql_t01_39/sql38_read_only_concurrency.rs` が担う。
+#[test]
+fn read_only_txn_never_takes_writer_while_others_commit() {
+    let (core, _g) = new_core("deferred-writer-ro-others");
+    let caller = ctx("tenant-a");
+    let mut session = SessionState::default();
+    core.execute_sql_in_session(&caller, &mut session, &insert(1, "seed"))
+        .expect("seed");
+    let mut txn = core.new_session_transaction();
+    let mut ro_session = SessionState::default();
+    core.execute_sql_in_txn(&caller, &mut ro_session, &mut txn, "BEGIN READ ONLY")
+        .expect("begin read only");
+    let others = [
+        ("tenant-a", 10u64),
+        ("tenant-b", 11),
+        ("tenant-a", 12),
+        ("tenant-b", 13),
+    ];
+    for (tenant, id) in others {
+        // 他セッションの書き込みは成功し、生成数を増やす。
+        let before = core.storage.write_txn_creations();
+        core.execute_sql_in_session(&ctx(tenant), &mut session, &insert(id, &format!("o-{id}")))
+            .expect("other session write");
+        assert!(core.storage.write_txn_creations() > before);
+
+        // READ ONLY 側の読み取り・カーソル・EXPLAIN は生成数に寄与しない。
+        let before = core.storage.write_txn_creations();
+        for sql in [
+            "SELECT id FROM documents LIMIT 10",
+            "DECLARE c CURSOR FOR SELECT id FROM documents LIMIT 10",
+            "FETCH 1 FROM c",
+            "CLOSE c",
+            "EXPLAIN SELECT id FROM documents LIMIT 10",
+        ] {
+            core.execute_sql_in_txn(&caller, &mut ro_session, &mut txn, sql)
+                .unwrap_or_else(|e| panic!("{sql} must succeed, got {e:?}"));
+            assert!(txn.write_txn().is_none(), "{sql} must not take the writer");
+            assert!(txn.read_snapshot().is_some(), "{sql}: snapshot is held");
+        }
+        assert_eq!(core.storage.write_txn_creations(), before);
+    }
+
+    // 書き込み文は 25006 で拒否され、writer を取らない。
+    let before = core.storage.write_txn_creations();
+    let err = core
+        .execute_sql_in_txn(&caller, &mut ro_session, &mut txn, &insert(99, "ro-w"))
+        .expect_err("25006");
+    assert_eq!(err.wire_code(), "25006");
+    assert!(txn.write_txn().is_none());
+    assert_eq!(core.storage.write_txn_creations(), before);
+
+    core.execute_sql_in_txn(&caller, &mut ro_session, &mut txn, "ROLLBACK")
+        .expect("rollback");
+    assert!(txn.write_txn().is_none());
+    assert!(txn.read_snapshot().is_none());
+
+    // 対照: 通常の BEGIN は最初の書き込み文で writer を取る。
+    let mut plain = core.new_session_transaction();
+    let mut plain_session = SessionState::default();
+    core.execute_sql_in_txn(&caller, &mut plain_session, &mut plain, "BEGIN")
+        .expect("begin");
+    let before = core.storage.write_txn_creations();
+    core.execute_sql_in_txn(
+        &caller,
+        &mut plain_session,
+        &mut plain,
+        &insert(98, "plain-w"),
+    )
+    .expect("plain write");
+    assert!(plain.write_txn().is_some());
+    assert!(core.storage.write_txn_creations() > before);
+    core.execute_sql_in_txn(&caller, &mut plain_session, &mut plain, "ROLLBACK")
+        .expect("rollback");
+}
+
 /// DDL はトランザクション内で `0A000` となり、writer を取る前に拒否される。
 #[test]
 fn ddl_in_explicit_txn_does_not_take_writer() {
