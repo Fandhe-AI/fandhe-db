@@ -250,6 +250,53 @@ fn savepoints_are_isolated_per_session_transaction() {
     run(&engine, &a, &mut sa, &mut ta, "RELEASE a").unwrap();
 }
 
+/// savepoint 時点のセッション状態（TimeZone・search_path・セッション UDF）が `ROLLBACK TO` で
+/// 復元される（PR #2863 レビュー指摘の回帰。writer 未取得でも成功する経路）。
+#[test]
+fn rollback_to_savepoint_restores_session_state() {
+    let (engine, path) = new_core();
+    let _c = CleanupGuard(path);
+    let caller = ctx("tenant-a");
+    let mut s = SessionState::default();
+    s.allow_ddl();
+    let tz_before = format!("{:?}", s.time_zone());
+    let sp_before = s.search_path().display();
+    let mut txn = engine.new_session_transaction();
+    run(&engine, &caller, &mut s, &mut txn, "BEGIN").unwrap();
+    run(&engine, &caller, &mut s, &mut txn, "SAVEPOINT a").unwrap();
+    run(
+        &engine,
+        &caller,
+        &mut s,
+        &mut txn,
+        "SET TIME ZONE 'Asia/Tokyo'",
+    )
+    .unwrap();
+    run(
+        &engine,
+        &caller,
+        &mut s,
+        &mut txn,
+        "SET search_path = other_schema",
+    )
+    .unwrap();
+    // Tx ブロック内の `CREATE FUNCTION` は拒否されるため、Tx オブジェクトを介さず同一セッションへ
+    // 登録する（セッション UDF が復元対象であることだけを検証する）。
+    engine
+        .execute_sql_in_session(&caller, &mut s, "CREATE FUNCTION f_sp(v) AS vec_norm(v)")
+        .unwrap();
+    assert_ne!(format!("{:?}", s.time_zone()), tz_before);
+    assert_ne!(s.search_path().display(), sp_before);
+    assert!(!s.udfs().is_empty());
+    run(&engine, &caller, &mut s, &mut txn, "ROLLBACK TO a").unwrap();
+    assert_eq!(txn.status(), TransactionStatus::InTransaction);
+    assert_eq!(format!("{:?}", s.time_zone()), tz_before);
+    assert_eq!(s.search_path().display(), sp_before);
+    assert!(s.udfs().is_empty());
+    run(&engine, &caller, &mut s, &mut txn, "COMMIT").unwrap();
+    assert_eq!(format!("{:?}", s.time_zone()), tz_before);
+}
+
 #[test]
 fn savepoint_statements_count_toward_statement_limit() {
     let (engine, path) = new_core();

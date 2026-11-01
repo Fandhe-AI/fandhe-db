@@ -19,6 +19,7 @@
 //! `[Restorable…, Unrestorable…]` の順に並ぶ。
 
 use crate::sql::allowlist::SqlSurfaceError;
+use crate::sql::mode::SessionState;
 
 /// savepoint の巻き戻し可否（redb の ephemeral savepoint の制約による）。
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -34,6 +35,9 @@ pub(crate) enum SavepointKind {
 struct Entry {
     name: String,
     kind: SavepointKind,
+    /// `SAVEPOINT` 時点のセッション状態（`SET TIME ZONE`・`search_path`・セッション UDF 等）。
+    /// `ROLLBACK TO` が redb の巻き戻しと対にして復元する（全体 `ROLLBACK` と同じ契約）。
+    session: Box<SessionState>,
 }
 
 /// savepoint 名の LIFO スタック（古い順に並ぶ）。
@@ -49,11 +53,18 @@ impl SavepointStack {
     }
 
     /// `SAVEPOINT name`。同名があっても重複して積む（新しい側が古い側を隠す）。
-    pub(crate) fn push(&mut self, name: &str, kind: SavepointKind) {
+    /// 作成時点のセッション状態 `session` を複製して保持する。
+    pub(crate) fn push(&mut self, name: &str, kind: SavepointKind, session: &SessionState) {
         self.entries.push(Entry {
             name: name.to_string(),
             kind,
+            session: Box::new(session.clone()),
         });
+    }
+
+    /// 位置 `pos` の savepoint 作成時点のセッション状態。範囲外は `None`。
+    pub(crate) fn session_at(&self, pos: usize) -> Option<&SessionState> {
+        self.entries.get(pos).map(|e| &*e.session)
     }
 
     /// 最も新しい同名の位置（0 が最古）。無ければ `None`。
@@ -106,8 +117,8 @@ mod tests {
     #[test]
     fn push_and_position_search_newest_first() {
         let mut s = SavepointStack::new();
-        s.push("a", R);
-        s.push("b", R);
+        s.push("a", R, &SessionState::default());
+        s.push("b", R, &SessionState::default());
         assert_eq!(s.len(), 2);
         assert_eq!(s.position("a"), Some(0));
         assert_eq!(s.position("b"), Some(1));
@@ -117,8 +128,8 @@ mod tests {
     #[test]
     fn same_name_shadows_older_one() {
         let mut s = SavepointStack::new();
-        s.push("a", R);
-        s.push("a", R);
+        s.push("a", R, &SessionState::default());
+        s.push("a", R, &SessionState::default());
         assert_eq!(s.position("a"), Some(1));
         s.release("a").unwrap();
         assert_eq!(s.len(), 1);
@@ -131,9 +142,9 @@ mod tests {
     #[test]
     fn release_pops_newer_savepoints_too() {
         let mut s = SavepointStack::new();
-        s.push("a", R);
-        s.push("b", R);
-        s.push("c", R);
+        s.push("a", R, &SessionState::default());
+        s.push("b", R, &SessionState::default());
+        s.push("c", R, &SessionState::default());
         s.release("b").unwrap();
         assert_eq!(s.len(), 1);
         assert_eq!(s.position("a"), Some(0));
@@ -143,7 +154,7 @@ mod tests {
     #[test]
     fn release_unknown_name_is_3b001_and_keeps_stack() {
         let mut s = SavepointStack::new();
-        s.push("a", R);
+        s.push("a", R, &SessionState::default());
         let e = s.release("zzz").unwrap_err();
         assert_eq!(e.wire_code(), "3B001");
         assert_eq!(s.len(), 1);
@@ -152,7 +163,7 @@ mod tests {
     #[test]
     fn names_match_case_sensitively() {
         let mut s = SavepointStack::new();
-        s.push("a", R);
+        s.push("a", R, &SessionState::default());
         assert_eq!(s.position("A"), None);
         assert!(s.release("A").is_err());
         assert_eq!(s.len(), 1);
@@ -161,9 +172,9 @@ mod tests {
     #[test]
     fn kind_is_kept_and_truncate_after_keeps_target() {
         let mut s = SavepointStack::new();
-        s.push("a", R);
-        s.push("b", R);
-        s.push("c", SavepointKind::Unrestorable);
+        s.push("a", R, &SessionState::default());
+        s.push("b", R, &SessionState::default());
+        s.push("c", SavepointKind::Unrestorable, &SessionState::default());
         assert_eq!(s.kind_at(0), Some(R));
         assert_eq!(s.kind_at(2), Some(SavepointKind::Unrestorable));
         assert_eq!(s.kind_at(3), None);
@@ -179,9 +190,9 @@ mod tests {
     fn has_restorable_tracks_kinds() {
         let mut s = SavepointStack::new();
         assert!(!s.has_restorable());
-        s.push("a", SavepointKind::Unrestorable);
+        s.push("a", SavepointKind::Unrestorable, &SessionState::default());
         assert!(!s.has_restorable());
-        s.push("b", R);
+        s.push("b", R, &SessionState::default());
         assert!(s.has_restorable());
         s.release("b").unwrap();
         assert!(!s.has_restorable());
@@ -190,8 +201,8 @@ mod tests {
     #[test]
     fn same_name_shadowing_uses_newest_kind() {
         let mut s = SavepointStack::new();
-        s.push("a", R);
-        s.push("a", SavepointKind::Unrestorable);
+        s.push("a", R, &SessionState::default());
+        s.push("a", SavepointKind::Unrestorable, &SessionState::default());
         let pos = s.position("a").unwrap();
         assert_eq!(s.kind_at(pos), Some(SavepointKind::Unrestorable));
     }

@@ -8314,7 +8314,7 @@ impl EngineCore {
                     };
                     match ctrl.control {
                         TxnControl::Savepoint => {
-                            txn.savepoint(name)?;
+                            txn.savepoint(name, session)?;
                             Ok(crate::sql::SqlOutcome::Savepoint)
                         }
                         TxnControl::ReleaseSavepoint => {
@@ -8322,7 +8322,7 @@ impl EngineCore {
                             Ok(crate::sql::SqlOutcome::ReleaseSavepoint)
                         }
                         _ => {
-                            txn.rollback_to_savepoint(name)?;
+                            txn.rollback_to_savepoint(name, session)?;
                             // 成功時は PostgreSQL と同じ `ROLLBACK` タグ（Issue #1943。巻き戻し不能は Err）。
                             Ok(crate::sql::SqlOutcome::Rollback)
                         }

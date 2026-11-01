@@ -1162,7 +1162,7 @@ impl<'e> SessionTransaction<'e> {
     /// writer 取得済みなら redb の `ephemeral_savepoint` を probe にして巻き戻せるかを決める。
     /// 成功すれば `Restorable`（最初の成功を基底 savepoint として保持）、dirty なら
     /// `Unrestorable`。engine 側の書き込み記録には頼らない（記録漏れで巻き戻し過ぎないため）。
-    pub fn savepoint(&mut self, name: &str) -> Result<(), SqlSurfaceError> {
+    pub fn savepoint(&mut self, name: &str, session: &SessionState) -> Result<(), SqlSurfaceError> {
         self.check_savepoint_state()?;
         self.check_and_register_statement(None)?;
         let kind = match &mut self.state {
@@ -1172,7 +1172,7 @@ impl<'e> SessionTransaction<'e> {
         match kind {
             Ok(kind) => {
                 if let TxnState::Active(active) = &mut self.state {
-                    active.savepoints.push(name, kind);
+                    active.savepoints.push(name, kind, session);
                 }
                 Ok(())
             }
@@ -1241,13 +1241,19 @@ impl<'e> SessionTransaction<'e> {
     /// 文の境界（`core.rs` の `ParsedSql::Transaction` 分岐）でだけ呼ばれ、その時点でハンドルは
     /// 1 つも開いていない（カーソルは行を確定して保持し、redb のハンドルを持ち越さない）。
     ///
+    /// セッション状態は savepoint 作成時点の複製へ戻す。
+    ///
     /// 復元後も `has_writes`・`written_tables`・`written_by_tenant`・`seen_operation_ids`・
     /// commit 記録の足跡は実際より大きい集合のまま残る（いずれも安全側。精度は #1944・#1945）。
-    pub fn rollback_to_savepoint(&mut self, name: &str) -> Result<(), SqlSurfaceError> {
+    pub fn rollback_to_savepoint(
+        &mut self,
+        name: &str,
+        session: &mut SessionState,
+    ) -> Result<(), SqlSurfaceError> {
         self.check_savepoint_state()?;
         self.check_and_register_statement(None)?;
         let result = match &mut self.state {
-            TxnState::Active(active) => Self::restore_to_savepoint(active, name),
+            TxnState::Active(active) => Self::restore_to_savepoint(active, name, session),
             _ => return Err(internal_error()),
         };
         if result.is_err() {
@@ -1257,7 +1263,11 @@ impl<'e> SessionTransaction<'e> {
     }
 
     /// [`Self::rollback_to_savepoint`] の本体。失敗時の `fail()` は呼び出し側が行う。
-    fn restore_to_savepoint(active: &mut ActiveTxn<'_>, name: &str) -> Result<(), SqlSurfaceError> {
+    fn restore_to_savepoint(
+        active: &mut ActiveTxn<'_>,
+        name: &str,
+        session: &mut SessionState,
+    ) -> Result<(), SqlSurfaceError> {
         use crate::sql::savepoint::SavepointKind;
         let pos = active
             .savepoints
@@ -1288,6 +1298,12 @@ impl<'e> SessionTransaction<'e> {
                 .restore_savepoint(base)
                 .map_err(|_| internal_error())?;
         }
+        // セッション状態（TimeZone・search_path・セッション UDF 等）も savepoint 時点へ戻す。
+        // redb の巻き戻し後に行い、失敗経路ではセッションを変更しない。
+        let Some(saved) = active.savepoints.session_at(pos) else {
+            return Err(internal_error());
+        };
+        *session = saved.clone();
         active.savepoints.truncate_after(pos);
         Ok(())
     }
@@ -2238,24 +2254,31 @@ mod tests {
         let mut txn = SessionTransaction::new(TransactionLimits::default());
         // Idle: 25P01・状態不変。
         for r in [
-            txn.savepoint("a"),
+            txn.savepoint("a", &SessionState::default()),
             txn.release_savepoint("a"),
-            txn.rollback_to_savepoint("a"),
+            txn.rollback_to_savepoint("a", &mut SessionState::default()),
         ] {
             assert_eq!(r.unwrap_err().wire_code(), "25P01");
             assert_eq!(txn.status(), TransactionStatus::Idle);
         }
         // Active: push・release、無い名前は 3B001 で Failed。
         let (mut txn, _s) = explicit_txn(&storage);
-        txn.savepoint("a").unwrap();
+        txn.savepoint("a", &SessionState::default()).unwrap();
         txn.release_savepoint("a").unwrap();
         assert_eq!(txn.status(), TransactionStatus::InTransaction);
         assert_eq!(txn.release_savepoint("a").unwrap_err().wire_code(), "3B001");
         assert_eq!(txn.status(), TransactionStatus::Failed);
         // Failed: 25P02。
-        assert_eq!(txn.savepoint("a").unwrap_err().wire_code(), "25P02");
         assert_eq!(
-            txn.rollback_to_savepoint("a").unwrap_err().wire_code(),
+            txn.savepoint("a", &SessionState::default())
+                .unwrap_err()
+                .wire_code(),
+            "25P02"
+        );
+        assert_eq!(
+            txn.rollback_to_savepoint("a", &mut SessionState::default())
+                .unwrap_err()
+                .wire_code(),
             "25P02"
         );
     }
@@ -2265,12 +2288,14 @@ mod tests {
     fn rollback_to_restorable_savepoint_succeeds_and_truncates_newer() {
         let (storage, _guard) = open_test_storage("savepoint-rollback-to-ok");
         let (mut txn, _s) = explicit_txn(&storage);
-        txn.savepoint("a").unwrap();
-        txn.savepoint("b").unwrap();
-        txn.rollback_to_savepoint("a").unwrap();
+        txn.savepoint("a", &SessionState::default()).unwrap();
+        txn.savepoint("b", &SessionState::default()).unwrap();
+        txn.rollback_to_savepoint("a", &mut SessionState::default())
+            .unwrap();
         assert_eq!(txn.status(), TransactionStatus::InTransaction);
         // 対象自身は残り（2 回目も成功）、新しい側は除かれている。
-        txn.rollback_to_savepoint("a").unwrap();
+        txn.rollback_to_savepoint("a", &mut SessionState::default())
+            .unwrap();
         assert_eq!(txn.release_savepoint("b").unwrap_err().wire_code(), "3B001");
     }
 
@@ -2280,7 +2305,9 @@ mod tests {
         let (storage, _guard) = open_test_storage("savepoint-rollback-to-unknown");
         let (mut txn, _s) = explicit_txn(&storage);
         assert_eq!(
-            txn.rollback_to_savepoint("zz").unwrap_err().wire_code(),
+            txn.rollback_to_savepoint("zz", &mut SessionState::default())
+                .unwrap_err()
+                .wire_code(),
             "3B001"
         );
         assert_eq!(txn.status(), TransactionStatus::Failed);
@@ -2294,9 +2321,14 @@ mod tests {
             max_statements: 2,
         });
         txn.begin(&storage, &SessionState::default()).unwrap();
-        txn.savepoint("a").unwrap();
-        txn.savepoint("a").unwrap();
-        assert_eq!(txn.savepoint("a").unwrap_err().wire_code(), "54000");
+        txn.savepoint("a", &SessionState::default()).unwrap();
+        txn.savepoint("a", &SessionState::default()).unwrap();
+        assert_eq!(
+            txn.savepoint("a", &SessionState::default())
+                .unwrap_err()
+                .wire_code(),
+            "54000"
+        );
         assert_eq!(txn.status(), TransactionStatus::Failed);
     }
 
