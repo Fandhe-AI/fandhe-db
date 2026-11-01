@@ -403,6 +403,7 @@ pub(crate) fn redact_row_conversion_error(e: SqlSurfaceError) -> SqlSurfaceError
         | E::MaterializedViewNotRefreshableConcurrently
         | E::ViewNotAutoUpdatable { .. }
         | E::PartitionedDmlInTransaction
+        | E::SetTransactionAfterQuery
         | E::InsufficientPrivilege
         | E::SchemaDependencyForbidden
         | E::ConflictTargetNotVisible

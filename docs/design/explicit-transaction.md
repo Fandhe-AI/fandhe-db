@@ -624,7 +624,22 @@ Issue #1931（`READ ONLY`）、挙動テストは #1940、`40001` は #2396 が�
   #1938 は要求されたレベルを別の `sql::transaction::RequestedIsolationLevel` として
   `ValidatedTxnControl`（`ParsedSql::Transaction` の payload）から `ActiveTxn` へ記録するだけで、
   実行は変えない（`SessionTransaction::isolation_level()` で読める。暗黙・未指定は `None`）。
-  `SET TRANSACTION` 系の保持は #1939 で決める。引用識別子の `"ISOLATION"` 等が受理される既存の性質は変えていない。
+  引用識別子の `"ISOLATION"` 等が受理される既存の性質は変えていない。
+- **`SET TRANSACTION` 系の実装（Issue #1939）**: モード列の語彙は `BEGIN` と同じ関数
+  （`parse_txn_mode_list`）で解釈し、`ParsedSql::SetTransaction` へ運ぶ。契約は SQL-38 (7)(a) のポインタ先に従い、
+  本書には実装上の判断と PostgreSQL との差だけを書く。
+  - `SET TRANSACTION`: `SessionTransaction::set_transaction_modes` が `ActiveTxn` の値を置き換える。
+    「最初の問い合わせの前」は `ActiveTxn.queried`（`check_and_register_statement` を通った文で立つ。
+    `SET TRANSACTION` 自身は立てないが、文数・持続時間の上限には計上する）で判定し、後なら `25001`（Tx は `Failed`）。
+    他の `SET`（`SET search_path` 等）も問い合わせとして数えるため、それらを挟んだ後は PostgreSQL と違い `25001` になる。
+  - `READ ONLY` から `READ WRITE` への変更は、未読・writer 未取得のときだけ受理し、`40001` 判定用の
+    登録済みスナップショットで開き直す（登録なしのまま書き込み可能にすると直列化検査を素通りするため）。
+  - `SET SESSION CHARACTERISTICS`: `SessionState` の既定（アクセスモード・要求分離レベル）を項目ごとに上書きし、
+    以後の `BEGIN`／`START TRANSACTION` が引き継ぐ（明示した修飾子が優先）。`session_at_begin` の復元に乗るため
+    Tx 内での変更は `ROLLBACK` で戻る。既定は明示 Tx の開始にだけ効き、autocommit の文・暗黙 Tx には効かない。
+  - Tx 外・暗黙 Tx の `SET TRANSACTION` は `25P01` で拒否する。PostgreSQL は警告のみだが、NoticeResponse の
+    送出経路が無いため fail-closed に倒している（差。追跡対象）。`[NOT] DEFERRABLE`・`SNAPSHOT` は
+    `BEGIN` と揃えて `42601`。
 - **fail-closed・テナント境界**: 未対応・不正な形は従来どおり `42601`／`0A000` で拒否する。
   分離レベルの指定は RLS 相当のテナント境界にも可視集合にも影響しない。
 - **未割り当ての後続**: `SHOW` による分離レベル等の表示対応を担う sub-issue は #1936 配下にまだ無い。担当は #1936 で決める。
@@ -850,7 +865,7 @@ production コード（`crates/wire-server/src/`）は無変更・テスト専�
   従来どおりの読み書き Tx。`READ ONLY` の暫定ゲート（`0A000`）は Issue #1934 で除去し、
   `READ ONLY` の Tx を開始できる（「READ ONLY での書き込み拒否」節）。PostgreSQL との差異として、アクセスモードの重複・矛盾（`READ ONLY READ WRITE`）
   は `42601`（fail-closed）。引用識別子 `"READ"` も受理される（既存の `"WORK"` と同じ性質）。
-- savepoint、`COMMIT AND CHAIN`・`PREPARE TRANSACTION`。分離レベルの指定は「分離レベルの受理方針」節のポインタ先の契約に従う（`BEGIN ISOLATION LEVEL` は #1938 で実装済み、`SET TRANSACTION` 系は #1939）。
+- savepoint、`COMMIT AND CHAIN`・`PREPARE TRANSACTION`。分離レベルの指定は「分離レベルの受理方針」節のポインタ先の契約に従う（`BEGIN ISOLATION LEVEL` は #1938 で実装済み、`SET TRANSACTION` 系は #1939 で実装済み）。
   別名 `START TRANSACTION`／`END`／`ABORT` は Issue #1930 で受理した（下記「別名」節）。
 - NoSQL 表層のトランザクション（設計上 `0A000`。`op` 許可リストに追加しない）。
 - 上限の既定値（20 秒・1,000 件・30 秒）と CLI のハード上限（60 秒・10,000 件。Issue #1553 で暫定採用）の確定 → オーナー判断。
