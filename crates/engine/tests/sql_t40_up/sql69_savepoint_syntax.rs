@@ -2,9 +2,10 @@
 //! `docs/spec/04-behavior/sql-surface.md` SQL-69 のポインタ）の結合テスト。
 //!
 //! `EngineCore::execute_sql_in_txn` を production 経路として、Idle での `25P01`、同名の遮蔽、
-//! 存在しない名前の `3B001`、巻き戻し未実装の `ROLLBACK TO` が fail-closed（`0A000`＋`Failed`）で
-//! 後続の `COMMIT` に書き込みを確定させないこと、セッション分離・文数上限への計上を固定する。
-//! 巻き戻し本体は親 Issue #1941 の範囲。
+//! 存在しない名前の `3B001`、書き込み後に作った（redb で巻き戻せない）savepoint への
+//! `ROLLBACK TO` が fail-closed（`0A000`＋`Failed`）で後続の `COMMIT` に書き込みを確定させない
+//! こと、セッション分離・文数上限への計上を固定する。巻き戻しの成功経路は
+//! `sql69_savepoint_rollback`（Issue #1943）が固定する。
 
 use engine::catalog::{ColumnDef, ColumnType, TableSchema};
 use engine::core::EngineCore;
@@ -139,7 +140,7 @@ fn release_unknown_name_is_3b001_and_fails_transaction() {
 }
 
 #[test]
-fn rollback_to_is_fail_closed_and_commit_does_not_persist_writes() {
+fn rollback_to_savepoint_after_writes_is_fail_closed_and_commit_does_not_persist() {
     let (engine, path) = new_core();
     let _c = CleanupGuard(path);
     let caller = ctx("tenant-a");

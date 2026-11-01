@@ -558,9 +558,13 @@ struct ActiveTxn<'e> {
     /// （カーソルの寿命がトランザクションの寿命に一致する設計。
     /// `sql::cursor` モジュールドキュメント参照）。
     cursors: crate::sql::cursor::CursorRegistry,
-    /// 名前付き savepoint スタック（SQL-69・Issue #1942）。`ActiveTxn` と寿命を共にする
-    /// （巻き戻し本体は #1941）。
+    /// 名前付き savepoint スタック（SQL-69・Issue #1942）。`ActiveTxn` と寿命を共にする。
     savepoints: crate::sql::savepoint::SavepointStack,
+    /// 永続側の巻き戻し先となる redb の ephemeral savepoint（Issue #1943）。writer が最初に
+    /// テーブルを開く前の状態を指す。`Restorable` な savepoint が 1 つ以上ある間だけ保持し、
+    /// 無くなれば drop する（生存中は redb のページ解放が遅れるため寿命を最小にする）。
+    /// 同一 savepoint へ何度でも復元できる。`ActiveTxn` を捨てる全経路で自動的に drop される。
+    savepoint_base: Option<redb::Savepoint>,
     /// dirty テーブル判定（[`SessionTransaction::dirty_tables`]）が確定済み世代を
     /// 読むための参照。`Active` の間だけ保持する（`begin` が渡す）。
     storage: &'e crate::storage::Storage,
@@ -1027,6 +1031,7 @@ impl<'e> SessionTransaction<'e> {
                     session_at_begin: session.clone(),
                     cursors: crate::sql::cursor::CursorRegistry::new(),
                     savepoints: crate::sql::savepoint::SavepointStack::new(),
+                    savepoint_base: None,
                     storage,
                 }));
                 Ok(())
@@ -1076,8 +1081,12 @@ impl<'e> SessionTransaction<'e> {
                     written_by_tenant,
                     written_tables,
                     storage,
+                    savepoint_base,
                     ..
                 } = *active;
+                // COMMIT が始まった後は巻き戻さない。commit 中の redb のページ解放を
+                // 妨げないよう、基底 savepoint は確定処理の前に破棄する（Issue #1943）。
+                drop(savepoint_base);
                 if started_at.elapsed() > self.limits.max_duration {
                     // `writer` を drop（abort）し、内包する permit を解放する。
                     drop(writer);
@@ -1146,24 +1155,70 @@ impl<'e> SessionTransaction<'e> {
         }
     }
 
-    /// `SAVEPOINT name`（SQL-69・Issue #1942）。明示 Tx の `Active` でだけ受理して push する。
+    /// `SAVEPOINT name`（SQL-69・Issue #1942・#1943）。明示 Tx の `Active` でだけ受理して push する。
     /// `Idle` は `25P01`（状態不変）、暗黙 Tx は abort して `25P01`、`Failed` は `25P02`。
     /// 文数・持続時間の上限に計上する（スタック長を文数上限で有界にする）。
+    ///
+    /// writer 取得済みなら redb の `ephemeral_savepoint` を probe にして巻き戻せるかを決める。
+    /// 成功すれば `Restorable`（最初の成功を基底 savepoint として保持）、dirty なら
+    /// `Unrestorable`。engine 側の書き込み記録には頼らない（記録漏れで巻き戻し過ぎないため）。
     pub fn savepoint(&mut self, name: &str) -> Result<(), SqlSurfaceError> {
         self.check_savepoint_state()?;
         self.check_and_register_statement(None)?;
-        if let TxnState::Active(active) = &mut self.state {
-            active.savepoints.push(name);
+        let kind = match &mut self.state {
+            TxnState::Active(active) => Self::probe_savepoint_kind(active),
+            _ => Err(internal_error()),
+        };
+        match kind {
+            Ok(kind) => {
+                if let TxnState::Active(active) = &mut self.state {
+                    active.savepoints.push(name, kind);
+                }
+                Ok(())
+            }
+            Err(e) => {
+                self.fail();
+                Err(e)
+            }
         }
-        Ok(())
+    }
+
+    /// `SAVEPOINT` 時点で巻き戻せるかを redb に問い合わせる。writer 未取得なら常に `Restorable`
+    /// （writer 取得時に基底を取る）。redb のエラー詳細は返さず内部エラーに写す。
+    fn probe_savepoint_kind(
+        active: &mut ActiveTxn<'_>,
+    ) -> Result<crate::sql::savepoint::SavepointKind, SqlSurfaceError> {
+        use crate::sql::savepoint::SavepointKind;
+        let Some(writer) = active.writer.as_deref() else {
+            return Ok(SavepointKind::Restorable);
+        };
+        match writer.ephemeral_savepoint() {
+            Ok(sp) => {
+                // permit を持つ間は確定状態が変わらないため、後続の probe は同じ root を指す。
+                // 基底が既にあれば新しい方は捨てる（drop）。
+                if active.savepoint_base.is_none() {
+                    active.savepoint_base = Some(sp);
+                }
+                Ok(SavepointKind::Restorable)
+            }
+            Err(redb::SavepointError::InvalidSavepoint) => Ok(SavepointKind::Unrestorable),
+            Err(_) => Err(internal_error()),
+        }
     }
 
     /// `RELEASE [SAVEPOINT] name`（SQL-69・Issue #1942）。無い名前は Tx を `Failed` にして `3B001`。
+    /// `Restorable` が 1 つも残らなくなれば基底 savepoint を解放する（Issue #1943）。
     pub fn release_savepoint(&mut self, name: &str) -> Result<(), SqlSurfaceError> {
         self.check_savepoint_state()?;
         self.check_and_register_statement(None)?;
         let result = match &mut self.state {
-            TxnState::Active(active) => active.savepoints.release(name),
+            TxnState::Active(active) => {
+                let r = active.savepoints.release(name);
+                if r.is_ok() && !active.savepoints.has_restorable() {
+                    active.savepoint_base = None;
+                }
+                r
+            }
             _ => return Err(internal_error()),
         };
         if result.is_err() {
@@ -1172,24 +1227,69 @@ impl<'e> SessionTransaction<'e> {
         result
     }
 
-    /// `ROLLBACK TO [SAVEPOINT] name`（SQL-69・Issue #1942）。巻き戻し本体は未実装（#1941）の
-    /// ため成功させない。無い名前は `3B001`、有る名前は `0A000`。どちらも Tx を `Failed` へ倒し、
-    /// 取り消したつもりの書き込みが後続の `COMMIT` で確定する fail-open を防ぐ。
+    /// `ROLLBACK TO [SAVEPOINT] name`（SQL-69・Issue #1942・#1943）。永続データ表の書き込みを
+    /// redb の `restore_savepoint` で巻き戻す。対象より新しい savepoint は取り除き、対象自身は
+    /// 残す。writer・登録・読み取りスナップショットには触れず、writer は Tx の終了まで保持する
+    /// （SQL-69 (3) のポインタ）。
+    ///
+    /// fail-closed（いずれも Tx を `Failed` へ倒す）: 無い名前は `3B001`、書き込み後に作った
+    /// （`Unrestorable`）savepoint と一時表の書き込みトランザクションが開いている場合は
+    /// `0A000`、基底欠落・redb エラーは `XX000`。取り消したつもりの書き込みが後続の `COMMIT`
+    /// で確定する fail-open を作らない。
+    ///
+    /// 不変条件: `restore_savepoint` は開いているテーブルのハンドルがあると panic する。本関数は
+    /// 文の境界（`core.rs` の `ParsedSql::Transaction` 分岐）でだけ呼ばれ、その時点でハンドルは
+    /// 1 つも開いていない（カーソルは行を確定して保持し、redb のハンドルを持ち越さない）。
+    ///
+    /// 復元後も `has_writes`・`written_tables`・`written_by_tenant`・`seen_operation_ids`・
+    /// commit 記録の足跡は実際より大きい集合のまま残る（いずれも安全側。精度は #1944・#1945）。
     pub fn rollback_to_savepoint(&mut self, name: &str) -> Result<(), SqlSurfaceError> {
         self.check_savepoint_state()?;
         self.check_and_register_statement(None)?;
-        let found = match &self.state {
-            TxnState::Active(active) => active.savepoints.position(name).is_some(),
+        let result = match &mut self.state {
+            TxnState::Active(active) => Self::restore_to_savepoint(active, name),
             _ => return Err(internal_error()),
         };
-        self.fail();
-        if found {
-            Err(SqlSurfaceError::feature_not_supported(
-                "ROLLBACK TO SAVEPOINT is not supported",
-            ))
-        } else {
-            Err(SqlSurfaceError::InvalidSavepointSpecification)
+        if result.is_err() {
+            self.fail();
         }
+        result
+    }
+
+    /// [`Self::rollback_to_savepoint`] の本体。失敗時の `fail()` は呼び出し側が行う。
+    fn restore_to_savepoint(active: &mut ActiveTxn<'_>, name: &str) -> Result<(), SqlSurfaceError> {
+        use crate::sql::savepoint::SavepointKind;
+        let pos = active
+            .savepoints
+            .position(name)
+            .ok_or(SqlSurfaceError::InvalidSavepointSpecification)?;
+        match active.savepoints.kind_at(pos) {
+            Some(SavepointKind::Restorable) => {}
+            Some(SavepointKind::Unrestorable) => {
+                return Err(SqlSurfaceError::feature_not_supported(
+                    "ROLLBACK TO SAVEPOINT is not supported for a savepoint established after \
+                     writes in the transaction",
+                ));
+            }
+            None => return Err(internal_error()),
+        }
+        // 一時表は別の in-memory ストアにあり、本経路では巻き戻せない。片側だけ巻き戻る
+        // fail-open を避けるため拒否する。
+        if active.temp.is_some() {
+            return Err(SqlSurfaceError::feature_not_supported(
+                "ROLLBACK TO SAVEPOINT is not supported in a transaction that used temporary tables",
+            ));
+        }
+        if let Some(writer) = active.writer.as_deref_mut() {
+            let Some(base) = active.savepoint_base.as_ref() else {
+                return Err(internal_error());
+            };
+            writer
+                .restore_savepoint(base)
+                .map_err(|_| internal_error())?;
+        }
+        active.savepoints.truncate_after(pos);
+        Ok(())
     }
 
     /// savepoint 文の共通の状態検査。明示 Tx の `Active` なら `Ok`。
@@ -1443,6 +1543,7 @@ impl<'e> SessionTransaction<'e> {
         ctx: &crate::policy::PolicyContext,
         nowait: bool,
     ) -> Result<(), SqlSurfaceError> {
+        let mut base_failed = false;
         let conflict = match &mut self.state {
             TxnState::Active(active) => {
                 if active.writer.is_some() {
@@ -1458,6 +1559,15 @@ impl<'e> SessionTransaction<'e> {
                 }
                 .map_err(map_write_lock_err)?;
                 active.writer = Some(w);
+                // 巻き戻し先の基底 savepoint を、writer がまだテーブルを開く前のここで取る
+                // （Issue #1943。redb は dirty な writer からは作れない）。`Restorable` が無ければ
+                // 取らない（通常の Tx に追跡の負担を足さない）。
+                if active.savepoints.has_restorable() {
+                    match active.writer.as_deref().map(|w| w.ephemeral_savepoint()) {
+                        Some(Ok(sp)) => active.savepoint_base = Some(sp),
+                        _ => base_failed = true,
+                    }
+                }
                 // 読み取り集合を確定する（SQL-38・Issue #2404）。同じ文の取得後の読み取り
                 // （`INSERT ... SELECT` の元表など）は集合へ入れない。
                 if let Some(set) = crate::sql::read_set::disarm_current() {
@@ -1465,10 +1575,19 @@ impl<'e> SessionTransaction<'e> {
                 }
                 // `40001` 判定（#2405）。登録は判定が必要とする記録を刈り込ませないため、
                 // 判定が済むまで外さない。
-                Self::detect_serialization_conflict(active, ctx)?
+                if base_failed {
+                    false
+                } else {
+                    Self::detect_serialization_conflict(active, ctx)?
+                }
             }
             _ => return Err(internal_error()),
         };
+        if base_failed {
+            // 新しい writer で基底を取れないのは不変条件違反。Tx を `Failed` に倒す。
+            self.fail();
+            return Err(internal_error());
+        }
         if conflict {
             return Err(self.fail_with_serialization_failure());
         }
@@ -2141,16 +2260,24 @@ mod tests {
         );
     }
 
+    /// Issue #1943: writer 取得前の savepoint は成功し、対象は残り新しい側は消える。
     #[test]
-    fn rollback_to_savepoint_always_fails_transaction() {
-        let (storage, _guard) = open_test_storage("savepoint-rollback-to");
+    fn rollback_to_restorable_savepoint_succeeds_and_truncates_newer() {
+        let (storage, _guard) = open_test_storage("savepoint-rollback-to-ok");
         let (mut txn, _s) = explicit_txn(&storage);
         txn.savepoint("a").unwrap();
-        assert_eq!(
-            txn.rollback_to_savepoint("a").unwrap_err().wire_code(),
-            "0A000"
-        );
-        assert_eq!(txn.status(), TransactionStatus::Failed);
+        txn.savepoint("b").unwrap();
+        txn.rollback_to_savepoint("a").unwrap();
+        assert_eq!(txn.status(), TransactionStatus::InTransaction);
+        // 対象自身は残り（2 回目も成功）、新しい側は除かれている。
+        txn.rollback_to_savepoint("a").unwrap();
+        assert_eq!(txn.release_savepoint("b").unwrap_err().wire_code(), "3B001");
+    }
+
+    /// 無い名前は `3B001` で Tx を `Failed` にする。
+    #[test]
+    fn rollback_to_unknown_savepoint_fails_transaction() {
+        let (storage, _guard) = open_test_storage("savepoint-rollback-to-unknown");
         let (mut txn, _s) = explicit_txn(&storage);
         assert_eq!(
             txn.rollback_to_savepoint("zz").unwrap_err().wire_code(),

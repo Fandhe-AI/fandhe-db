@@ -8323,7 +8323,7 @@ impl EngineCore {
                         }
                         _ => {
                             txn.rollback_to_savepoint(name)?;
-                            // 成功経路は #1941 まで存在しない（常に Err）。
+                            // 成功時は PostgreSQL と同じ `ROLLBACK` タグ（Issue #1943。巻き戻し不能は Err）。
                             Ok(crate::sql::SqlOutcome::Rollback)
                         }
                     }
