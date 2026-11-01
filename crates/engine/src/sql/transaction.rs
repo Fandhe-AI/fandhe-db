@@ -47,12 +47,21 @@ use crate::sql::mode::SessionState;
 /// ポインタ先に従う。`END` は `Commit`、`ABORT` は `Rollback` へ写像する。
 ///
 /// **BREAKING CHANGE**（Issue #1930）: variant `StartTransaction` を追加した。
+/// **BREAKING CHANGE**（Issue #1942）: savepoint 系の 3 variant（`Savepoint`・
+/// `RollbackToSavepoint`・`ReleaseSavepoint`）を追加した。名前は
+/// [`ValidatedTxnControl::savepoint_name`] が持つ。
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum TxnControl {
     Begin,
     StartTransaction,
     Commit,
     Rollback,
+    /// `SAVEPOINT <name>`（SQL-69・Issue #1942）。
+    Savepoint,
+    /// `ROLLBACK [WORK|TRANSACTION] TO [SAVEPOINT] <name>`（SQL-69・Issue #1942）。
+    RollbackToSavepoint,
+    /// `RELEASE [SAVEPOINT] <name>`（SQL-69・Issue #1942）。
+    ReleaseSavepoint,
 }
 
 fn ident_is(tok: Option<&Token>, word: &str) -> bool {
@@ -64,9 +73,17 @@ fn ident_is(tok: Option<&Token>, word: &str) -> bool {
 /// 受理可否の検証は [`validate_transaction_control_tokens`] が担う。
 pub(crate) fn is_transaction_control_head(tokens: &[Token]) -> bool {
     let first = tokens.first();
-    ["BEGIN", "COMMIT", "ROLLBACK", "END", "ABORT"]
-        .iter()
-        .any(|w| ident_is(first, w))
+    [
+        "BEGIN",
+        "COMMIT",
+        "ROLLBACK",
+        "END",
+        "ABORT",
+        "SAVEPOINT",
+        "RELEASE",
+    ]
+    .iter()
+    .any(|w| ident_is(first, w))
         || ((ident_is(first, "START") || ident_is(first, "PREPARE"))
             && ident_is(tokens.get(1), "TRANSACTION"))
 }
@@ -98,12 +115,52 @@ pub enum RequestedIsolationLevel {
 /// 明示されたときだけ `Some`（`COMMIT`／`ROLLBACK` は常に `None`）。`None` のときは
 /// セッションの既定（`SET SESSION CHARACTERISTICS`。Issue #1939）が適用される。`core.rs` の
 /// `ParsedSql::Transaction` が保持し、実行時に `begin_with_mode` へ渡される。
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+///
+/// **BREAKING CHANGE**（Issue #1942）: `savepoint_name` を追加し、`String` を持つため `Copy` を外した。
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ValidatedTxnControl {
     pub control: TxnControl,
     pub access_mode: Option<TxnAccessMode>,
     /// `BEGIN ISOLATION LEVEL` で明示されたときだけ `Some`（Issue #1938）。
     pub isolation_level: Option<RequestedIsolationLevel>,
+    /// savepoint 系 3 種（Issue #1942）のときだけ `Some`。照合は大文字小文字を区別する完全一致。
+    pub savepoint_name: Option<String>,
+}
+
+/// `SAVEPOINT`／`RELEASE`／`ROLLBACK TO` の名前部分を解析する（SQL-69・Issue #1942）。
+/// 残りが `<name>` 1 トークン、または `SAVEPOINT <name>` の 2 トークンのときだけ受理する。
+/// 名前は識別子（`Ident`・引用付き `NULL`）に限り `validate_identifier` で検証する。それ以外
+/// （キーワード・数値・余分な後続トークン）は `42601`。受信トークンのため添字は使わない。
+fn parse_savepoint_name(
+    rest: &[Token],
+    allow_savepoint_kw: bool,
+) -> Result<String, SqlSurfaceError> {
+    let bad = || SqlSurfaceError::unsupported("malformed savepoint statement");
+    let (first, tail) = rest.split_first().ok_or_else(bad)?;
+    let name_tok = if allow_savepoint_kw && !tail.is_empty() && ident_is(Some(first), "SAVEPOINT") {
+        match tail.split_first() {
+            Some((n, [])) => n,
+            _ => return Err(bad()),
+        }
+    } else if tail.is_empty() {
+        first
+    } else {
+        return Err(bad());
+    };
+    let (Token::Ident(raw) | Token::QuotedNull(raw)) = name_tok else {
+        return Err(bad());
+    };
+    crate::catalog::validate_identifier(raw).map_err(|_| bad())?;
+    Ok(raw.clone())
+}
+
+fn savepoint_control(control: TxnControl, name: String) -> ValidatedTxnControl {
+    ValidatedTxnControl {
+        control,
+        access_mode: None,
+        isolation_level: None,
+        savepoint_name: Some(name),
+    }
 }
 
 fn unsupported_txn_mode() -> SqlSurfaceError {
@@ -297,6 +354,7 @@ pub(crate) fn validate_transaction_control_tokens(
                         control: TxnControl::StartTransaction,
                         access_mode: None,
                         isolation_level: None,
+                        savepoint_name: None,
                     })
                 } else {
                     Err(SqlSurfaceError::unsupported(
@@ -308,6 +366,18 @@ pub(crate) fn validate_transaction_control_tokens(
                 "malformed transaction control statement",
             )),
         };
+    }
+    if head.eq_ignore_ascii_case("SAVEPOINT") {
+        return Ok(savepoint_control(
+            TxnControl::Savepoint,
+            parse_savepoint_name(tail, false)?,
+        ));
+    }
+    if head.eq_ignore_ascii_case("RELEASE") {
+        return Ok(savepoint_control(
+            TxnControl::ReleaseSavepoint,
+            parse_savepoint_name(tail, true)?,
+        ));
     }
     let ctrl = if head.eq_ignore_ascii_case("BEGIN") {
         TxnControl::Begin
@@ -329,6 +399,18 @@ pub(crate) fn validate_transaction_control_tokens(
         }
         _ => tail,
     };
+    // `ROLLBACK [WORK|TRANSACTION] TO [SAVEPOINT] <name>`（SQL-69・Issue #1942）。`ABORT TO` は
+    // PostgreSQL の文法にも無いため従来どおり後続句として拒否する。
+    if ctrl == TxnControl::Rollback && head.eq_ignore_ascii_case("ROLLBACK") {
+        if let Some((Token::Ident(to), after)) = rest.split_first() {
+            if to.eq_ignore_ascii_case("TO") {
+                return Ok(savepoint_control(
+                    TxnControl::RollbackToSavepoint,
+                    parse_savepoint_name(after, true)?,
+                ));
+            }
+        }
+    }
     if ctrl != TxnControl::Begin && matches!(rest.first(), Some(Token::Keyword(Keyword::And))) {
         let after = rest.get(1);
         let chain =
@@ -354,6 +436,7 @@ pub(crate) fn validate_transaction_control_tokens(
         control: ctrl,
         access_mode,
         isolation_level,
+        savepoint_name: None,
     })
 }
 
@@ -362,12 +445,28 @@ pub(crate) fn validate_transaction_control_tokens(
 /// `core::EngineCore::execute_sql_in_txn`、wire-server の拡張クエリ Parse が呼ぶ）。
 /// `END`・`COMMIT` は false（失敗状態では受理しない）。規範形の検証は通常どおり
 /// parse に任せる。字句解析に失敗した入力は `false`（fail-closed）。
+///
+/// `ROLLBACK [WORK|TRANSACTION] TO ...`（Issue #1942）は Tx 全体の `ROLLBACK` ではないため
+/// `false`（Failed 中は一律 `25P02`。Failed からの `ROLLBACK TO` 復帰は #1941 の範囲）。
 pub fn is_rollback_statement(sql: &str) -> bool {
-    matches!(
-        crate::sql::lexer::tokenize(sql).ok().as_deref().and_then(|t| t.first()),
-        Some(Token::Ident(name))
-            if name.eq_ignore_ascii_case("ROLLBACK") || name.eq_ignore_ascii_case("ABORT")
-    )
+    let Some(tokens) = crate::sql::lexer::tokenize(sql).ok() else {
+        return false;
+    };
+    let Some((Token::Ident(name), tail)) = tokens.split_first() else {
+        return false;
+    };
+    if !(name.eq_ignore_ascii_case("ROLLBACK") || name.eq_ignore_ascii_case("ABORT")) {
+        return false;
+    }
+    let rest = match tail.split_first() {
+        Some((Token::Ident(kw), t))
+            if kw.eq_ignore_ascii_case("WORK") || kw.eq_ignore_ascii_case("TRANSACTION") =>
+        {
+            t
+        }
+        _ => tail,
+    };
+    !ident_is(rest.first(), "TO")
 }
 
 /// [`SessionTransaction`] の対外的な状態（WIRE-19。`wire-server::result_encoder::
@@ -459,6 +558,9 @@ struct ActiveTxn<'e> {
     /// （カーソルの寿命がトランザクションの寿命に一致する設計。
     /// `sql::cursor` モジュールドキュメント参照）。
     cursors: crate::sql::cursor::CursorRegistry,
+    /// 名前付き savepoint スタック（SQL-69・Issue #1942）。`ActiveTxn` と寿命を共にする
+    /// （巻き戻し本体は #1941）。
+    savepoints: crate::sql::savepoint::SavepointStack,
     /// dirty テーブル判定（[`SessionTransaction::dirty_tables`]）が確定済み世代を
     /// 読むための参照。`Active` の間だけ保持する（`begin` が渡す）。
     storage: &'e crate::storage::Storage,
@@ -924,6 +1026,7 @@ impl<'e> SessionTransaction<'e> {
                     has_writes: false,
                     session_at_begin: session.clone(),
                     cursors: crate::sql::cursor::CursorRegistry::new(),
+                    savepoints: crate::sql::savepoint::SavepointStack::new(),
                     storage,
                 }));
                 Ok(())
@@ -1040,6 +1143,64 @@ impl<'e> SessionTransaction<'e> {
                 self.state = TxnState::Idle;
                 Ok(())
             }
+        }
+    }
+
+    /// `SAVEPOINT name`（SQL-69・Issue #1942）。明示 Tx の `Active` でだけ受理して push する。
+    /// `Idle` は `25P01`（状態不変）、暗黙 Tx は abort して `25P01`、`Failed` は `25P02`。
+    /// 文数・持続時間の上限に計上する（スタック長を文数上限で有界にする）。
+    pub fn savepoint(&mut self, name: &str) -> Result<(), SqlSurfaceError> {
+        self.check_savepoint_state()?;
+        self.check_and_register_statement(None)?;
+        if let TxnState::Active(active) = &mut self.state {
+            active.savepoints.push(name);
+        }
+        Ok(())
+    }
+
+    /// `RELEASE [SAVEPOINT] name`（SQL-69・Issue #1942）。無い名前は Tx を `Failed` にして `3B001`。
+    pub fn release_savepoint(&mut self, name: &str) -> Result<(), SqlSurfaceError> {
+        self.check_savepoint_state()?;
+        self.check_and_register_statement(None)?;
+        let result = match &mut self.state {
+            TxnState::Active(active) => active.savepoints.release(name),
+            _ => return Err(internal_error()),
+        };
+        if result.is_err() {
+            self.fail();
+        }
+        result
+    }
+
+    /// `ROLLBACK TO [SAVEPOINT] name`（SQL-69・Issue #1942）。巻き戻し本体は未実装（#1941）の
+    /// ため成功させない。無い名前は `3B001`、有る名前は `0A000`。どちらも Tx を `Failed` へ倒し、
+    /// 取り消したつもりの書き込みが後続の `COMMIT` で確定する fail-open を防ぐ。
+    pub fn rollback_to_savepoint(&mut self, name: &str) -> Result<(), SqlSurfaceError> {
+        self.check_savepoint_state()?;
+        self.check_and_register_statement(None)?;
+        let found = match &self.state {
+            TxnState::Active(active) => active.savepoints.position(name).is_some(),
+            _ => return Err(internal_error()),
+        };
+        self.fail();
+        if found {
+            Err(SqlSurfaceError::feature_not_supported(
+                "ROLLBACK TO SAVEPOINT is not supported",
+            ))
+        } else {
+            Err(SqlSurfaceError::InvalidSavepointSpecification)
+        }
+    }
+
+    /// savepoint 文の共通の状態検査。明示 Tx の `Active` なら `Ok`。
+    fn check_savepoint_state(&mut self) -> Result<(), SqlSurfaceError> {
+        if self.abort_if_implicit() {
+            return Err(SqlSurfaceError::NoActiveSqlTransaction);
+        }
+        match &self.state {
+            TxnState::Active(_) => Ok(()),
+            TxnState::Idle => Err(SqlSurfaceError::NoActiveSqlTransaction),
+            TxnState::Failed { .. } => Err(self.take_failed_error()),
         }
     }
 
@@ -1824,7 +1985,6 @@ mod tests {
             "BEGIN READ ONLY DEFERRABLE",
             "COMMIT READ ONLY",
             "ROLLBACK READ WRITE",
-            "ROLLBACK TO SAVEPOINT x",
             "START",
             "START WORK",
             "START TRANSACTION READ ONLY",
@@ -1881,6 +2041,136 @@ mod tests {
         assert!(is_rollback_statement("ROLLBACK"));
         assert!(!is_rollback_statement("END"));
         assert!(!is_rollback_statement("COMMIT"));
+        // Issue #1942: `ROLLBACK TO` は Tx 全体の ROLLBACK ではない。
+        assert!(!is_rollback_statement("ROLLBACK TO a"));
+        assert!(!is_rollback_statement("rollback work to savepoint a"));
+        assert!(!is_rollback_statement(
+            "ROLLBACK TRANSACTION TO SAVEPOINT a"
+        ));
+    }
+
+    /// Issue #1942（SQL-69）: savepoint 系 3 文の受理形と名前の抽出。
+    #[test]
+    fn savepoint_statements_are_accepted_with_name() {
+        for (sql, ctrl, name) in [
+            ("SAVEPOINT a", TxnControl::Savepoint, "a"),
+            ("savepoint Sp_1", TxnControl::Savepoint, "Sp_1"),
+            ("RELEASE a", TxnControl::ReleaseSavepoint, "a"),
+            ("RELEASE SAVEPOINT a", TxnControl::ReleaseSavepoint, "a"),
+            ("ROLLBACK TO a", TxnControl::RollbackToSavepoint, "a"),
+            (
+                "ROLLBACK TO SAVEPOINT a",
+                TxnControl::RollbackToSavepoint,
+                "a",
+            ),
+            ("ROLLBACK WORK TO a", TxnControl::RollbackToSavepoint, "a"),
+            (
+                "ROLLBACK TRANSACTION TO SAVEPOINT a",
+                TxnControl::RollbackToSavepoint,
+                "a",
+            ),
+            // `savepoint` という名前の savepoint（残りが 1 トークンなら名前）。
+            (
+                "RELEASE savepoint",
+                TxnControl::ReleaseSavepoint,
+                "savepoint",
+            ),
+            (
+                "ROLLBACK TO savepoint",
+                TxnControl::RollbackToSavepoint,
+                "savepoint",
+            ),
+        ] {
+            let v = validated(sql).unwrap_or_else(|e| panic!("{sql}: {e}"));
+            assert_eq!(v.control, ctrl, "{sql}");
+            assert_eq!(v.savepoint_name.as_deref(), Some(name), "{sql}");
+        }
+    }
+
+    #[test]
+    fn malformed_savepoint_statements_are_rejected_with_42601() {
+        for sql in [
+            "SAVEPOINT",
+            "SAVEPOINT a b",
+            "SAVEPOINT SAVEPOINT a",
+            "SAVEPOINT select",
+            "SAVEPOINT 1",
+            "RELEASE",
+            "RELEASE SAVEPOINT a b",
+            "ROLLBACK TO",
+            "ROLLBACK TO a AND CHAIN",
+            "ABORT TO a",
+        ] {
+            let err = validated(sql).unwrap_err();
+            assert_eq!(err.wire_code(), "42601", "{sql}");
+        }
+    }
+
+    fn explicit_txn(storage: &crate::storage::Storage) -> (SessionTransaction<'_>, SessionState) {
+        let mut txn = SessionTransaction::new(TransactionLimits::default());
+        let session = SessionState::default();
+        txn.begin(storage, &session).unwrap();
+        (txn, session)
+    }
+
+    #[test]
+    fn savepoint_state_machine_idle_active_failed() {
+        let (storage, _guard) = open_test_storage("savepoint-state");
+        let mut txn = SessionTransaction::new(TransactionLimits::default());
+        // Idle: 25P01・状態不変。
+        for r in [
+            txn.savepoint("a"),
+            txn.release_savepoint("a"),
+            txn.rollback_to_savepoint("a"),
+        ] {
+            assert_eq!(r.unwrap_err().wire_code(), "25P01");
+            assert_eq!(txn.status(), TransactionStatus::Idle);
+        }
+        // Active: push・release、無い名前は 3B001 で Failed。
+        let (mut txn, _s) = explicit_txn(&storage);
+        txn.savepoint("a").unwrap();
+        txn.release_savepoint("a").unwrap();
+        assert_eq!(txn.status(), TransactionStatus::InTransaction);
+        assert_eq!(txn.release_savepoint("a").unwrap_err().wire_code(), "3B001");
+        assert_eq!(txn.status(), TransactionStatus::Failed);
+        // Failed: 25P02。
+        assert_eq!(txn.savepoint("a").unwrap_err().wire_code(), "25P02");
+        assert_eq!(
+            txn.rollback_to_savepoint("a").unwrap_err().wire_code(),
+            "25P02"
+        );
+    }
+
+    #[test]
+    fn rollback_to_savepoint_always_fails_transaction() {
+        let (storage, _guard) = open_test_storage("savepoint-rollback-to");
+        let (mut txn, _s) = explicit_txn(&storage);
+        txn.savepoint("a").unwrap();
+        assert_eq!(
+            txn.rollback_to_savepoint("a").unwrap_err().wire_code(),
+            "0A000"
+        );
+        assert_eq!(txn.status(), TransactionStatus::Failed);
+        let (mut txn, _s) = explicit_txn(&storage);
+        assert_eq!(
+            txn.rollback_to_savepoint("zz").unwrap_err().wire_code(),
+            "3B001"
+        );
+        assert_eq!(txn.status(), TransactionStatus::Failed);
+    }
+
+    #[test]
+    fn savepoints_count_toward_statement_limit() {
+        let (storage, _guard) = open_test_storage("savepoint-limit");
+        let mut txn = SessionTransaction::new(TransactionLimits {
+            max_duration: Duration::from_secs(20),
+            max_statements: 2,
+        });
+        txn.begin(&storage, &SessionState::default()).unwrap();
+        txn.savepoint("a").unwrap();
+        txn.savepoint("a").unwrap();
+        assert_eq!(txn.savepoint("a").unwrap_err().wire_code(), "54000");
+        assert_eq!(txn.status(), TransactionStatus::Failed);
     }
 
     /// SQL-38 (1)・Issue #1938: 4 レベルすべてを `BEGIN`／`BEGIN WORK`／`BEGIN TRANSACTION` で

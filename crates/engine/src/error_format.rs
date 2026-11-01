@@ -95,7 +95,7 @@ macro_rules! define_error_classes {
 pub(crate) const SHARED_WIRE_CODES: &[&str] = &["23502", "23505", "22023", "P0002"];
 
 define_error_classes! {
-    count = 100;
+    count = 101;
 
     /// 構文上受理された SQL の値・引数が不正（`22000`）。
     /// [`crate::sql::allowlist::SqlSurfaceError::InvalidInput`] の写像。
@@ -307,6 +307,10 @@ define_error_classes! {
     /// 存在しない（`34000`）。WIRE-15・TASK-218 が追加。
     /// [`crate::sql::allowlist::SqlSurfaceError::InvalidCursorName`] の写像。
     InvalidCursorName => ("34000", "INVALID_CURSOR_NAME"),
+    /// `RELEASE`／`ROLLBACK TO` が参照した savepoint 名が、現在のトランザクションの
+    /// savepoint スタックに存在しない（`3B001`。SQL-69・Issue #1942）。
+    /// [`crate::sql::allowlist::SqlSurfaceError::InvalidSavepointSpecification`] の写像。
+    InvalidSavepointSpecification => ("3B001", "INVALID_SAVEPOINT_SPECIFICATION"),
     /// `DROP TABLE`／`DROP VIEW` の対象に、それを参照するビューが 1 つ以上残って
     /// いるため削除を拒否した（`2BP01`。TABLE-18・SQL-23・TASK-205、Issue #909）。
     /// [`crate::catalog::CatalogError::DependentViewsExist`] の写像。依存する
