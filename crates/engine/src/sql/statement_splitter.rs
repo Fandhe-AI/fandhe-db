@@ -439,6 +439,14 @@ pub fn classify_statement(stmt: &str) -> StatementEffect {
             }
         }
         Token::Ident(name) if name.eq_ignore_ascii_case("SET") => StatementEffect::SessionLocal,
+        // Issue #1963: `RESET ROLE` は `SET ROLE NONE` と同じセッション限定操作（redb commit を伴わない）。
+        // 厳密一致のみ `SessionLocal` とし、他の `RESET ...` は未知の先頭語として `Write`（fail-closed）に落とす。
+        Token::Ident(name)
+            if name.eq_ignore_ascii_case("RESET")
+                && crate::sql::allowlist::is_reset_role_statement(&tokens) =>
+        {
+            StatementEffect::SessionLocal
+        }
         Token::Ident(name) if name.eq_ignore_ascii_case("BEGIN") => {
             StatementEffect::TransactionControl(crate::sql::transaction::TxnControl::Begin)
         }
@@ -1624,6 +1632,20 @@ mod tests {
             classify_statement("CREATE FUNCTION f(x) AS x"),
             StatementEffect::SessionLocal
         );
+        // Issue #1963: `RESET ROLE` はセッション限定。他の `RESET` は書き込み扱い（fail-closed）。
+        assert_eq!(
+            classify_statement("RESET ROLE"),
+            StatementEffect::SessionLocal
+        );
+        assert_eq!(
+            classify_statement("reset role;"),
+            StatementEffect::SessionLocal
+        );
+        assert_eq!(
+            classify_statement("RESET row_security"),
+            StatementEffect::Write
+        );
+        assert_eq!(classify_statement("RESET ROLE x"), StatementEffect::Write);
         assert_eq!(
             classify_statement("CREATE TABLE t (id INT)"),
             StatementEffect::Write
