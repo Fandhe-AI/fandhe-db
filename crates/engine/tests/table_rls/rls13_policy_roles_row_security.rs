@@ -175,3 +175,34 @@ fn rls13_row_security_off_rejects_write_to_rls_table_before_writing() {
         "INSERT INTO t (id, name) VALUES (1, 'a')",
     );
 }
+
+/// RLS-13: 対象行が 0 件の書き込み（`WHERE false` の UPDATE・0 行の INSERT SELECT）でも、RLS 有効な表への
+/// `row_security = off` は文の開始時点で `42501` になる（結果が件数に依存しない）。RLS 無効な表は成功する。
+#[test]
+fn rls13_row_security_off_rejects_zero_row_writes() {
+    let (core, _g) = new_core("rls13-rs-off-empty");
+    let mut s = SessionState::default();
+    s.allow_ddl();
+    for sql in [
+        "CREATE TABLE t (id BIGINT PRIMARY KEY, name TEXT)",
+        "CREATE TABLE plain (id BIGINT PRIMARY KEY, name TEXT)",
+        "ALTER TABLE t ENABLE ROW LEVEL SECURITY",
+        "CREATE POLICY p ON t FOR ALL USING (true) WITH CHECK (true)",
+    ] {
+        ok(&core, "alice", &mut s, sql);
+    }
+    ok(&core, "alice", &mut s, "SET row_security = off");
+    for sql in [
+        "UPDATE t SET name = 'x' WHERE false",
+        "UPDATE t SET name = 'x' WHERE id = 99",
+        "INSERT INTO t (id, name) SELECT id, name FROM plain WHERE false",
+    ] {
+        assert_eq!(code(&core, "alice", &mut s, sql), "42501", "{sql}");
+    }
+    ok(
+        &core,
+        "alice",
+        &mut s,
+        "UPDATE plain SET name = 'x' WHERE false",
+    );
+}

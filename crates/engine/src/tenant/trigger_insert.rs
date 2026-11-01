@@ -57,6 +57,8 @@ pub(super) fn write_rows_with_triggers(
     plan: &InsertTriggerPlan<'_>,
     writes: &TriggerWriteHandle<'_>,
 ) -> Result<(Vec<RowId>, bool), TenantWriteError> {
+    // 行数が 0 でも `row_security = off` の拒否を開始時点で適用する（RLS-13・Issue #2278）。
+    crate::sql::policy_eval::reject_row_security_off_in_txn(write_txn, ctx.tenant_id(), table)?;
     let vector_idx = schema
         .columns
         .iter()

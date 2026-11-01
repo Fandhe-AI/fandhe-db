@@ -1095,6 +1095,7 @@ pub(crate) fn insert_row_unchecked(
     // `COMMIT`/`ROLLBACK` まで持ち越し）のいずれとも共有する（SQL-31・TASK-221）。
     target.with_txn(|write_txn| {
         let schema = require_table_schema_write(write_txn, table)?;
+        crate::sql::policy_eval::reject_row_security_off_in_txn(write_txn, ctx.tenant_id(), table)?;
         // 生の行挿入はトリガの発火に未対応（Issue #1723）。INSERT トリガのある表は `0A000`。
         guard_no_insert_triggers(write_txn, ctx.tenant_id(), table)?;
         schema.validate_row_embedding_dim(row.embedding.len())?;
@@ -1229,6 +1230,7 @@ pub(crate) fn insert_rows_unchecked(
 
     target.with_txn(|write_txn| {
         let schema = require_table_schema_write(write_txn, table)?;
+        crate::sql::policy_eval::reject_row_security_off_in_txn(write_txn, ctx.tenant_id(), table)?;
         // 生の行挿入はトリガの発火に未対応（Issue #1723）。INSERT トリガのある表は `0A000`。
         guard_no_insert_triggers(write_txn, ctx.tenant_id(), table)?;
         if rows.is_empty() {
@@ -1942,6 +1944,7 @@ fn insert_typed_row_impl(
     validate_relation_key(table)?;
     target.with_txn(|write_txn| {
         let schema = require_table_schema_write_any_identity(write_txn, table)?;
+        crate::sql::policy_eval::reject_row_security_off_in_txn(write_txn, ctx.tenant_id(), table)?;
         // `id` 省略は移行済み表だけが受理できる（束縛段の判定を、書き込み txn 内で取得した
         // スキーマで再確認する。別の識別方式へ差し替わった表に仮値 `id` を書かない fail-closed）。
         if id_omitted && !schema.is_migrated_id() {
@@ -2335,6 +2338,15 @@ pub(crate) fn record_ledger_only_unchecked(
 ) -> Result<(), TenantWriteError> {
     validate_relation_key(table)?;
     target.with_txn(|write_txn| {
+        // 0 行の `INSERT ... SELECT` でも、RLS 有効な表への `row_security = off` は台帳より前に
+        // `42501` で拒否する（RLS-13・Issue #2278）。`Skip` はこの表への INSERT 文ではないため対象外。
+        if !matches!(trigger_mode, LedgerOnlyTriggers::Skip) {
+            crate::sql::policy_eval::reject_row_security_off_in_txn(
+                write_txn,
+                ctx.tenant_id(),
+                table,
+            )?;
+        }
         // INSERT 文トリガは対象が 0 行でも 1 回発火する（Issue #1726）。分類は台帳より前に行う
         // （再送ではトリガを呼ばない）。行トリガは 0 行では発火しない。
         let triggers = match &trigger_mode {
@@ -2440,6 +2452,11 @@ pub(crate) fn insert_typed_rows_unchecked(
     target.with_txn(|write_txn| {
         let row_ids: Vec<RowId> = {
             let schema = require_table_schema_write_any_identity(write_txn, table)?;
+            crate::sql::policy_eval::reject_row_security_off_in_txn(
+                write_txn,
+                ctx.tenant_id(),
+                table,
+            )?;
             // INSERT トリガの分類（Issue #1723。台帳より前・同じ write txn 内。未結線の経路・
             // `WHEN` 付きは `0A000`）。
             let trigger_chain =
@@ -3990,6 +4007,11 @@ pub(crate) fn update_row_unchecked(
         let mut pre_images = crate::constraint::UpdatedKeyPreImages::new();
         {
             let schema = require_table_schema_write(write_txn, table)?;
+            crate::sql::policy_eval::reject_row_security_off_in_txn(
+                write_txn,
+                ctx.tenant_id(),
+                table,
+            )?;
             // 生の全列置換はトリガの発火に未対応（Issue #1725）。UPDATE トリガのある表は `0A000`。
             guard_no_update_triggers(write_txn, ctx.tenant_id(), table)?;
             schema.validate_row_embedding_dim(row.embedding.len())?;
@@ -4985,6 +5007,11 @@ fn update_row_columns_impl(
         let mut captured_row: Option<CapturedRow> = None;
         {
             let schema = require_table_schema_write(write_txn, table)?;
+            crate::sql::policy_eval::reject_row_security_off_in_txn(
+                write_txn,
+                ctx.tenant_id(),
+                table,
+            )?;
             if let Some(expected) = expected_schema {
                 if expected != &schema {
                     return Err(TenantWriteError::Catalog(CatalogError::Invalid(
@@ -7167,6 +7194,9 @@ fn apply_predicate_update_in_txn<E>(
     mut project: Option<&mut ReturningProjectFn<'_>>,
     mut should_stop: Option<&mut dyn FnMut() -> bool>,
 ) -> Result<usize, PredicateDmlError<E>> {
+    // 対象行が 0 件でも `row_security = off` の拒否を文の開始時点で適用する（RLS-13・Issue #2278）。
+    crate::sql::policy_eval::reject_row_security_off_in_txn(write_txn, ctx.tenant_id(), table)
+        .map_err(dml_write_err)?;
     if row_overrides.is_some_and(|o| o.len() != candidate_ids.len()) {
         return Err(dml_write_err(CatalogError::Invalid(
             "internal: per-row SET values do not match the candidate rows".to_string(),
@@ -7711,6 +7741,11 @@ pub(crate) fn replace_typed_rows_by_text_key(
         let mut removed_ids: Vec<RowId> = Vec::new();
         let outcome: Result<ReplaceOutcome, TenantWriteError> = (|| {
             let schema = require_table_schema_write(write_txn, table)?;
+            crate::sql::policy_eval::reject_row_security_off_in_txn(
+                write_txn,
+                ctx.tenant_id(),
+                table,
+            )?;
             // INSERT トリガの発火に未対応の経路（Issue #1723）。台帳照合・行変更より前に拒否する。
             guard_no_insert_triggers(write_txn, ctx.tenant_id(), table)?;
             // 旧行の置換（DELETE）・更新（UPDATE）もトリガ未対応（Issue #1725）。

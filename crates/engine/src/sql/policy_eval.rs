@@ -181,6 +181,27 @@ impl CompiledPolicyChecks {
     }
 }
 
+/// 書き込みの開始時点（行の探索・書き込みより前）に、`row_security = off` の拒否だけを判定する。
+/// 対象行が 0 件の `UPDATE`・`INSERT ... SELECT`・`COPY` でも、RLS 有効な表なら `42501` で拒否して
+/// 結果を件数に依存させない（RLS-13・Issue #2278）。RLS が無効な表・適用外は何もしない（費用は
+/// 有効化状態の get 1 回）。各書き込み入口がスキーマ取得の直後に呼ぶ。
+pub(crate) fn reject_row_security_off_in_txn(
+    write_txn: &redb::WriteTransaction,
+    tenant_id: &str,
+    table: &str,
+) -> Result<(), TenantWriteError> {
+    let state =
+        crate::catalog::row_security::row_security_state_in_txn(write_txn, tenant_id, table)?;
+    match user_policies_decision_for_write(state) {
+        PolicyDecision::RejectRowSecurityOff => Err(TenantWriteError::RowSecurityPolicyViolation {
+            table: table.to_string(),
+            policy: None,
+            using_expression: false,
+        }),
+        PolicyDecision::Skip | PolicyDecision::Apply => Ok(()),
+    }
+}
+
 /// write txn の中で表 `table` の有効化状態とポリシーを読み、`kind` の検査をコンパイルする。適用しない
 /// （RLS 無効・暫定の所有者扱いで対象外）ときは `None`。`tenant_id` はサーバー側導出の値で、他テナントの
 /// 定義・状態は引けない。RLS が無効な表の費用は状態の get 1 回だけ。
