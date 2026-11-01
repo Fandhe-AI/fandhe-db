@@ -1743,7 +1743,7 @@ fn handle_describe_body(
                 PreparedStatement::Parameterized { prepared, slots } => {
                     param_oids = slots.iter().map(|s| s.oid).collect();
                     engine
-                        .describe_prepared_in_session(session, prepared)
+                        .describe_prepared_in_txn(session, txn, prepared)
                         .map_err(HandlerError::Sql)?
                 }
                 // WIRE-15・TASK-218: `describe_parsed_in_txn` へ切り替え、
@@ -1756,7 +1756,7 @@ fn handle_describe_body(
                 PreparedStatement::Parsed { parsed, prepared } => {
                     if needs_session_revalidation(session, parsed) {
                         engine
-                            .describe_prepared_in_session(session, prepared)
+                            .describe_prepared_in_txn(session, txn, prepared)
                             .map_err(HandlerError::Sql)?
                     } else {
                         engine

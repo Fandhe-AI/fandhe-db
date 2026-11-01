@@ -8606,7 +8606,53 @@ impl EngineCore {
                 }
             };
         }
-        self.describe_parsed_in_session(session, parsed)
+        // writer 取得前の明示トランザクションは、Bind の再検証・実行と同じ `BEGIN` 時点のスナップショットで
+        // 結果列を決める（Issue #2403。最新カタログで決めると Execute の列比較と食い違う）。
+        let snap = Self::describe_snapshot(txn)?;
+        Self::coarse_temp_gate(session, parsed)?;
+        self.describe_parsed_in_session_snap(session, parsed, false, &[], &self.result_limits, snap)
+    }
+
+    /// 明示トランザクションが writer 取得前なら `BEGIN` 時点のスナップショットを返す（Describe 用。
+    /// `Idle`・`Failed`・writer 取得後は `None`＝最新の確定済みスナップショット）。
+    fn describe_snapshot<'t>(
+        txn: &'t crate::sql::transaction::SessionTransaction<'_>,
+    ) -> Result<Option<&'t redb::ReadTransaction>, crate::sql::allowlist::SqlSurfaceError> {
+        if txn.status() != crate::sql::transaction::TransactionStatus::InTransaction {
+            return Ok(None);
+        }
+        match txn.read_source()? {
+            crate::sql::transaction::TxnReadSource::BeginSnapshot(snap) => Ok(Some(snap)),
+            _ => Ok(None),
+        }
+    }
+
+    /// [`Self::describe_prepared_in_session`] の明示トランザクション対応版（拡張クエリの Describe 'S' が
+    /// パラメータ付きの文に対して呼ぶ。Issue #2403）。writer 取得前は `BEGIN` 時点のスナップショットで
+    /// 結果列を決め、Bind・Execute と読み取り源を揃える。
+    pub fn describe_prepared_in_txn(
+        &self,
+        session: &crate::sql::mode::SessionState,
+        txn: &crate::sql::transaction::SessionTransaction<'_>,
+        prepared: &PreparedSql,
+    ) -> Result<Option<Vec<crate::sql::exec::ColumnMeta>>, crate::sql::allowlist::SqlSurfaceError>
+    {
+        let result = (|| {
+            let snap = Self::describe_snapshot(txn)?;
+            Self::check_prepared_for_session(session, prepared)?;
+            self.describe_parsed_in_session_snap(
+                session,
+                &prepared.dummy_parsed,
+                prepared.order_by_distance_literal_is_param,
+                &prepared.where_equality_dummy_flags,
+                &self.result_limits,
+                snap,
+            )
+        })();
+        result.map_err(|e| match session.resolution_tenant() {
+            Some(t) => self.scrub_error_for_tenant(t, e),
+            None => e,
+        })
     }
 
     /// `describe_parsed_in_txn_unscrubbed` の公開入口。判定順序・エラー契約・結果は同関数と同一で、出口でだけ
@@ -8906,6 +8952,56 @@ impl EngineCore {
         )
     }
 
+    /// Describe 用のスキーマ解決（Issue #2403）。`snap` が `Some` なら明示トランザクションの
+    /// `BEGIN` 時点スナップショット（Bind の再検証・実行と同じ読み取り源）から、`None` なら最新の
+    /// 確定済みスナップショットから引く。拡張クエリの Describe が列型を Execute と同じ時点で決める。
+    fn describe_table_schema(
+        &self,
+        snap: Option<&redb::ReadTransaction>,
+        table_name: &str,
+    ) -> Result<crate::catalog::TableSchema, crate::sql::allowlist::SqlSurfaceError> {
+        match snap {
+            Some(snap) => table_schema_in(snap, table_name),
+            None => Ok(self.read_txn_with_schema(table_name)?.1),
+        }
+    }
+
+    /// [`Self::describe_table_schema`] の複数テーブル版（単一スナップショット上で解決する）。
+    fn describe_table_schemas(
+        &self,
+        snap: Option<&redb::ReadTransaction>,
+        table_names: &[String],
+    ) -> Result<
+        std::collections::HashMap<String, crate::catalog::TableSchema>,
+        crate::sql::allowlist::SqlSurfaceError,
+    > {
+        match snap {
+            Some(snap) => table_schemas_in(snap, table_names),
+            None => Ok(self.read_txn_with_schemas(table_names)?.1),
+        }
+    }
+
+    /// [`Self::describe_parsed_in_session_snap`] の読み取り源なし版（従来の入口。最新の確定済み
+    /// スナップショットで解決する）。
+    fn describe_parsed_in_session_impl(
+        &self,
+        session: &crate::sql::mode::SessionState,
+        parsed: &ParsedSql,
+        skip_vector_literal_validation: bool,
+        dummy_equality_flags: &[bool],
+        limits: &crate::result_limits::ResultLimits,
+    ) -> Result<Option<Vec<crate::sql::exec::ColumnMeta>>, crate::sql::allowlist::SqlSurfaceError>
+    {
+        self.describe_parsed_in_session_snap(
+            session,
+            parsed,
+            skip_vector_literal_validation,
+            dummy_equality_flags,
+            limits,
+            None,
+        )
+    }
+
     /// [`Self::describe_parsed_in_session`]／[`Self::describe_prepared_in_session`]
     /// が共有する実装本体。`skip_vector_literal_validation` が `true` のときのみ
     /// `ORDER BY` のベクトルリテラルの実パース（`parse_vector_literal` による
@@ -8922,13 +9018,14 @@ impl EngineCore {
     /// （`declarative_filter`）を Describe 時点では省略する。`$n` を含まない
     /// 通常の Describe（`describe_parsed_in_session` 経由）では常に空スライスに
     /// なり、実リテラルは従来どおり必ず検証される。
-    fn describe_parsed_in_session_impl(
+    fn describe_parsed_in_session_snap(
         &self,
         session: &crate::sql::mode::SessionState,
         parsed: &ParsedSql,
         skip_vector_literal_validation: bool,
         dummy_equality_flags: &[bool],
         limits: &crate::result_limits::ResultLimits,
+        snap: Option<&redb::ReadTransaction>,
     ) -> Result<Option<Vec<crate::sql::exec::ColumnMeta>>, crate::sql::allowlist::SqlSurfaceError>
     {
         use crate::sql::allowlist::{DeleteStatement, Statement, ValidatedUpdateForm};
@@ -8948,22 +9045,24 @@ impl EngineCore {
         match parsed {
             // SQL-38・Issue #1957: 行ロック句の有無で結果列は変わらない。句を除いた文と同じ
             // RowDescription を返す（副作用なし。実行は暫定ゲートで拒否）。
-            ParsedSql::LockingSelect(locking) => self.describe_parsed_in_session_impl(
+            ParsedSql::LockingSelect(locking) => self.describe_parsed_in_session_snap(
                 session,
                 &ParsedSql::Statement(locking.statement().clone()),
                 skip_vector_literal_validation,
                 dummy_equality_flags,
                 limits,
+                snap,
             ),
             // TABLE-44・Issue #1684: 一時表の文は一時コアが結果列を導出する。
             ParsedSql::SessionRouted(routed) if routed.is_persistent() => {
                 routed.require_current(session)?;
-                self.describe_parsed_in_session_impl(
+                self.describe_parsed_in_session_snap(
                     session,
                     routed.inner(),
                     skip_vector_literal_validation,
                     dummy_equality_flags,
                     limits,
+                    snap,
                 )
             }
             ParsedSql::SessionRouted(routed) => self.describe_temp_routed(
@@ -9230,7 +9329,7 @@ impl EngineCore {
                 }]))
             }
             ParsedSql::Statement(Statement::Aggregate(validated)) => {
-                let (_read_txn, schema) = self.read_txn_with_schema(validated.table_name())?;
+                let schema = self.describe_table_schema(snap, validated.table_name())?;
                 let bound = crate::sql::parser::bind_aggregate_with_dummy_flags(
                     validated,
                     &schema,
@@ -9242,7 +9341,7 @@ impl EngineCore {
                 )?))
             }
             ParsedSql::Statement(Statement::Scan(validated)) => {
-                let (_read_txn, schema) = self.read_txn_with_schema(validated.table_name())?;
+                let schema = self.describe_table_schema(snap, validated.table_name())?;
                 let bound = crate::sql::parser::bind_scan_with_dummy_flags(
                     validated,
                     &schema,
@@ -9262,7 +9361,7 @@ impl EngineCore {
             ParsedSql::Statement(Statement::SetOperation(validated)) => {
                 let mut table_names = Vec::new();
                 crate::sql::set_op::collect_branch_tables(&validated.tree, &mut table_names);
-                let (_read_txn, schemas) = self.read_txn_with_schemas(&table_names)?;
+                let schemas = self.describe_table_schemas(snap, &table_names)?;
                 let columns = crate::sql::set_op::describe_columns(
                     &schemas,
                     &validated.tree,
@@ -9280,7 +9379,7 @@ impl EngineCore {
             // アームと同じ方針）。
             ParsedSql::Statement(Statement::Join(validated)) => {
                 let table_names = crate::sql::join::collect_join_tables(validated);
-                let (_read_txn, mut schemas) = self.read_txn_with_schemas(&table_names)?;
+                let mut schemas = self.describe_table_schemas(snap, &table_names)?;
                 let mut cte_ids = crate::sql::join::CteIdColumns::new();
                 // SQL-62・Issue #1861: CTE 入力は本文を実行せず、結果列だけを導出して Execute と同じ
                 // 関数で合成スキーマにする（Describe は本体を実行しない契約）。
@@ -9336,11 +9435,14 @@ impl EngineCore {
             // （本文は実行せずに）導出し、外側の射影だけを適用する。
             ParsedSql::Statement(Statement::BufferedView(validated)) => {
                 Self::check_buffered_outer_limit(validated, limits)?;
-                check_buffered_view_collations(&self.begin_read_txn()?, validated)?;
+                match snap {
+                    Some(snap) => check_buffered_view_collations(snap, validated)?,
+                    None => check_buffered_view_collations(&self.begin_read_txn()?, validated)?,
+                }
                 let body_parsed = ParsedSql::Statement((*validated.body).clone());
                 // 本文は永続化済みで `$n` を含まないため、外側の `$n` 置換に
                 // 位置対応するダミーフラグは渡さない（本文の ENUM 検証を省略しない）。
-                let body_columns = self.describe_parsed_in_session_impl(
+                let body_columns = self.describe_parsed_in_session_snap(
                     session,
                     &body_parsed,
                     skip_vector_literal_validation,
@@ -9356,6 +9458,7 @@ impl EngineCore {
                             crate::result_limits::ResultLimits::default()
                         }
                     },
+                    snap,
                 )?;
                 match body_columns {
                     Some(cols) => {
@@ -9384,7 +9487,14 @@ impl EngineCore {
                 Ok(Some(bound.columns()))
             }
             ParsedSql::Statement(Statement::Select(validated)) => {
-                let (_read_txn, schema) = self.read_txn_with_schema(&validated.table_name)?;
+                // `USING PLAN` の実行は自前で確定スナップショットを開く既存経路のため、Describe も
+                // 最新側に揃える（読み取り源を `BEGIN` 時点へ切り替えない）。
+                let snap = if validated.using_plan().is_some() {
+                    None
+                } else {
+                    snap
+                };
+                let schema = self.describe_table_schema(snap, &validated.table_name)?;
                 if validated.using_plan().is_some() {
                     // `USING PLAN`: LLM 展開・再埋め込み（`plan_query`・
                     // `Embedder::embed_batch`）は行わず、投影列の束縛のみを行う

@@ -429,3 +429,72 @@ fn explain_validates_against_latest_catalog_not_begin_snapshot() {
     ok(&core, &sys, "CREATE TABLE late_t (n BIGINT)");
     a.ok("EXPLAIN SELECT id FROM late_t");
 }
+
+/// 拡張クエリの Describe も `BEGIN` 時点のカタログで結果列を決める（Issue #2403）。BEGIN 後に別セッションが
+/// 列型を変えても、Describe の列と Bind 後の Describe・Execute の列が一致する（`ResultTypeChanged` にならない）。
+/// パラメータ付き（`describe_prepared_in_txn`）と、Bind 済みの文（`describe_parsed_in_txn`）の両方を確かめる。
+#[test]
+fn extended_describe_uses_begin_snapshot_column_types() {
+    let (core, _g) = new_core("sql31-snap-describe");
+    let sys = ctx("sys");
+    ok(&core, &sys, "CREATE TABLE typed (qty BIGINT)");
+    ok(
+        &core,
+        &ctx("tenant-a"),
+        "INSERT INTO typed (id, qty) VALUES (1, 5) USING OPERATION_ID 'dt'",
+    );
+    let mut a = Tx::new(&core, "tenant-a");
+    a.ok("BEGIN");
+    // 別セッションが列型を変更して commit する（A の読み取りは writer 取得前）。
+    ok(&core, &sys, "ALTER TABLE typed ALTER COLUMN qty TYPE TEXT");
+
+    // パラメータなし: Parse（最新カタログ）→ Bind（BEGIN 時点で再検証）→ Describe → Execute。
+    let prepared = core
+        .parse_sql_prepared("SELECT qty FROM typed LIMIT 100")
+        .expect("prepare");
+    let bound = core
+        .bind_prepared_in_txn(&a.session, &a.txn, &prepared, &[])
+        .expect("bind");
+    let described = core
+        .describe_parsed_in_txn(&a.session, &a.txn, &bound)
+        .expect("describe")
+        .expect("columns");
+    let SqlOutcome::Query(result) = core
+        .execute_parsed_in_txn(&a.ctx, &mut a.session, &mut a.txn, &bound)
+        .expect("execute")
+    else {
+        panic!("expected Query outcome");
+    };
+    assert_eq!(
+        format!("{described:?}"),
+        format!("{:?}", result.columns),
+        "Describe の列は Execute の列（BEGIN 時点の BIGINT）と一致する"
+    );
+    assert!(format!("{described:?}").contains("BigInt"), "{described:?}");
+
+    // パラメータ付き: 文の Describe（'S'）・Bind 後の Describe・Execute がすべて同じ列型になる。
+    let prepared = core
+        .parse_sql_prepared("SELECT qty FROM typed WHERE qty = $1 LIMIT 100")
+        .expect("prepare with param");
+    let stmt_cols = core
+        .describe_prepared_in_txn(&a.session, &a.txn, &prepared)
+        .expect("describe prepared")
+        .expect("columns");
+    let bound = core
+        .bind_prepared_in_txn(&a.session, &a.txn, &prepared, &[Some(b"5".to_vec())])
+        .expect("bind with param");
+    let portal_cols = core
+        .describe_parsed_in_txn(&a.session, &a.txn, &bound)
+        .expect("describe bound")
+        .expect("columns");
+    let SqlOutcome::Query(result) = core
+        .execute_parsed_in_txn(&a.ctx, &mut a.session, &mut a.txn, &bound)
+        .expect("execute with param")
+    else {
+        panic!("expected Query outcome");
+    };
+    assert_eq!(result.rows.len(), 1);
+    assert_eq!(format!("{stmt_cols:?}"), format!("{:?}", result.columns));
+    assert_eq!(format!("{portal_cols:?}"), format!("{:?}", result.columns));
+    a.ok("COMMIT");
+}
