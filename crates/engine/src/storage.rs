@@ -966,6 +966,26 @@ impl Storage {
         self.begin_write_txn()
     }
 
+    /// `LOCK TABLE ... NOWAIT`（SQL-38・Issue #1958）用の入口。ゲートを待たずに 1 回だけ取得を試み、
+    /// 他者が保持していれば即座に `WriteLockTimeout`（`55P03`）を返す。取得後の扱いは
+    /// [`Self::begin_explicit_write_txn`] と同一。
+    pub(crate) fn begin_explicit_write_txn_nowait(&self) -> Result<GatedWriteTxn> {
+        let permit = self
+            .writer_gate
+            .acquire(std::time::Duration::ZERO)
+            .map_err(|e| match e {
+                writer_gate::GateError::Timeout => StorageError::WriteLockTimeout,
+                writer_gate::GateError::HeldByCurrentThread => {
+                    StorageError::WriteTxnHeldByCurrentSession
+                }
+            })?;
+        let txn = self.begin_write_txn_raw()?;
+        Ok(GatedWriteTxn {
+            txn,
+            _permit: permit,
+        })
+    }
+
     /// [`Storage::begin_write_txn`] の呼び出し回数（テスト専用）。全書き込み経路が
     /// choke point を経由していることの非 vacuous な証跡として使う。
     #[cfg(test)]

@@ -1000,6 +1000,14 @@ impl<'e> SessionTransaction<'e> {
     /// - 将来 #2405 が「gate 取得 → permit 保持のまま `40001` 判定 → 格納」の判定を
     ///   取得と格納の間へ挿入する地点である。
     pub(crate) fn ensure_writer(&mut self) -> Result<(), SqlSurfaceError> {
+        self.ensure_writer_with(false)
+    }
+
+    /// [`Self::ensure_writer`] の `nowait` 指定版（`LOCK TABLE ... NOWAIT`・Issue #1958 の入口）。
+    /// `nowait` なら待機せず即時に取得を試み、失敗は `55P03`。取得済みならゲートに触れず `Ok`
+    /// （同一スレッドでの permit 再取得は必ず `55P03` になるためこの短絡は必須）。
+    /// 取得経路を 1 本に保つため、`40001` 判定の挿入地点もここ（#2405）。
+    pub(crate) fn ensure_writer_with(&mut self, nowait: bool) -> Result<(), SqlSurfaceError> {
         match &mut self.state {
             TxnState::Active(active) => {
                 if active.writer.is_some() {
@@ -1008,10 +1016,12 @@ impl<'e> SessionTransaction<'e> {
                 if active.access_mode == TxnAccessMode::ReadOnly {
                     return Err(internal_error());
                 }
-                let w = active
-                    .storage
-                    .begin_explicit_write_txn()
-                    .map_err(map_write_lock_err)?;
+                let w = if nowait {
+                    active.storage.begin_explicit_write_txn_nowait()
+                } else {
+                    active.storage.begin_explicit_write_txn()
+                }
+                .map_err(map_write_lock_err)?;
                 active.writer = Some(w);
                 Ok(())
             }
@@ -1828,6 +1838,80 @@ mod tests {
         txn.begin(&storage, &session).expect("begin");
         txn.commit(&mut session).expect("commit");
         assert_eq!(txn.status(), TransactionStatus::Idle);
+    }
+
+    /// `ensure_writer` は取得済みなら（NOWAIT でも）ゲートに触れず成功する（SQL-38・Issue #1958）。
+    #[test]
+    fn ensure_writer_is_noop_when_already_held() {
+        let (storage, _g) = open_test_storage("txn-1958-noop");
+        let session = SessionState::default();
+        let mut txn = SessionTransaction::new(TransactionLimits::default());
+        txn.begin(&storage, &session).expect("begin");
+        txn.ensure_writer_with(false).expect("acquire");
+        let created = storage.write_txn_creations();
+        txn.ensure_writer_with(false).expect("blocking");
+        txn.ensure_writer_with(true).expect("nowait");
+        assert_eq!(storage.write_txn_creations(), created);
+        assert!(txn.write_txn().is_some());
+    }
+
+    /// writer 未取得なら取得して保持する（待機あり・NOWAIT とも。Issue #1958）。
+    #[test]
+    fn ensure_writer_acquires_when_absent() {
+        for nowait in [false, true] {
+            let (storage, _g) = open_test_storage("txn-1958-acquire");
+            let session = SessionState::default();
+            let mut txn = SessionTransaction::new(TransactionLimits::default());
+            txn.begin(&storage, &session).expect("begin");
+            if let TxnState::Active(active) = &mut txn.state {
+                drop(active.writer.take());
+            }
+            assert!(txn.write_txn().is_none());
+            txn.ensure_writer_with(nowait).expect("acquire");
+            assert!(txn.write_txn().is_some());
+        }
+    }
+
+    /// 他のセッションが writer を保持していれば、NOWAIT は即座に、待機ありは上限超過で `55P03`
+    /// （Issue #1958）。同期はチャネルで行い時間の大小は表明しない。
+    #[test]
+    fn ensure_writer_reports_lock_not_available_when_held_elsewhere() {
+        let (storage, _g) = open_test_storage("txn-1958-held");
+        let storage = storage.with_write_lock_wait(std::time::Duration::from_millis(20));
+        let session = SessionState::default();
+        let mut txn = SessionTransaction::new(TransactionLimits::default());
+        txn.begin(&storage, &session).expect("begin");
+        if let TxnState::Active(active) = &mut txn.state {
+            drop(active.writer.take());
+        }
+        let (held_tx, held_rx) = std::sync::mpsc::channel::<()>();
+        let (done_tx, done_rx) = std::sync::mpsc::channel::<()>();
+        std::thread::scope(|scope| {
+            let storage_ref = &storage;
+            scope.spawn(move || {
+                let _held = storage_ref.begin_explicit_write_txn().expect("holder");
+                held_tx.send(()).expect("signal");
+                let _ = done_rx.recv();
+            });
+            held_rx.recv().expect("held");
+            for nowait in [true, false] {
+                let err = txn.ensure_writer_with(nowait).expect_err("held elsewhere");
+                assert!(matches!(err, SqlSurfaceError::LockNotAvailable), "{nowait}");
+                assert!(txn.write_txn().is_none());
+            }
+            done_tx.send(()).expect("release");
+        });
+        txn.ensure_writer_with(true).expect("free after release");
+    }
+
+    /// `Active` 以外で呼ぶと `XX000`（fail-closed。Issue #1958）。
+    #[test]
+    fn ensure_writer_outside_transaction_is_internal_error() {
+        let mut txn = SessionTransaction::new(TransactionLimits::default());
+        assert!(matches!(
+            txn.ensure_writer_with(false),
+            Err(SqlSurfaceError::Internal { .. })
+        ));
     }
 
     /// `redb::ReadTransaction` を持たせても `SessionTransaction` が `Send` のままであること

@@ -1921,7 +1921,7 @@ fn index_name_exists_in_txn(write_txn: &redb::WriteTransaction, name: &str) -> R
 
 /// `name` が [`CATALOG_TABLE`] に表として登録済みかを write txn 内で判定する
 /// （relation 名前空間の衝突・存在確認用。表が未作成なら `false` で、表を作らない）。
-fn table_exists_in_txn(write_txn: &redb::WriteTransaction, name: &str) -> Result<bool> {
+pub(crate) fn table_exists_in_txn(write_txn: &redb::WriteTransaction, name: &str) -> Result<bool> {
     match write_txn.open_table(CATALOG_TABLE) {
         Ok(t) => Ok(t.get(name)?.is_some()),
         Err(redb::TableError::TableDoesNotExist(_)) => Ok(false),

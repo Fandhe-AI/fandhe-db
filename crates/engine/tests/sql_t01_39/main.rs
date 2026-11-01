@@ -53,4 +53,5 @@ mod sql37_current_time_functions;
 mod sql37_default_now;
 mod sql38_begin_access_mode;
 mod sql38_begin_isolation_level;
+mod sql38_lock_table;
 mod sql38_row_lock_clause;
