@@ -142,6 +142,7 @@ fn has_independent_admin(
     tenant: &str,
     y: u64,
     r: u64,
+    lost: &HashSet<u64>,
     visiting: &mut Vec<u64>,
     steps: &mut usize,
 ) -> Result<bool> {
@@ -167,9 +168,15 @@ fn has_independent_admin(
         found = match o.grantor_id {
             None => true,
             Some(g) if visiting.contains(&g) => false,
+            // 付与者が今回の連鎖で ADMIN の行を失った（lost）なら、ADMIN の不在を所有者相当の根拠にしない。
+            // 別経路で ADMIN を保つ場合だけ、その経路が独立かを再帰で確かめる（fail-closed）。
+            Some(g) if lost.contains(&g) => {
+                is_admin_of(w, tenant, g, r)?
+                    && has_independent_admin(w, tenant, g, r, lost, visiting, steps)?
+            }
             Some(g) => {
                 !is_admin_of(w, tenant, g, r)?
-                    || has_independent_admin(w, tenant, g, r, visiting, steps)?
+                    || has_independent_admin(w, tenant, g, r, lost, visiting, steps)?
             }
         };
         if found {
@@ -191,27 +198,40 @@ fn resolve_dependents(
     steps: &mut usize,
     changed: &mut usize,
 ) -> Result<()> {
-    let mut queue = vec![(member, role)];
-    while let Some((x, r)) = queue.pop() {
-        *steps += 1;
-        if *steps > MAX_CASCADE_STEPS {
-            return Err(MembershipChangeError::LimitExceeded);
-        }
-        if has_independent_admin(w, tenant, x, r, &mut Vec::new(), steps)? {
-            continue;
-        }
-        for (m2, g2, o2) in list_memberships_granted_by_in_txn(w, tenant, x)? {
-            if g2 != r {
+    // ADMIN の行を失ったメンバー。削除の確定のたびに増やし、評価順に依存しないよう固定点まで反復する。
+    let mut lost: HashSet<u64> = HashSet::new();
+    lost.insert(member);
+    loop {
+        let mut deleted = false;
+        let mut seeds: Vec<u64> = lost.iter().copied().collect();
+        seeds.sort_unstable();
+        let mut queue = seeds;
+        while let Some(x) = queue.pop() {
+            *steps += 1;
+            if *steps > MAX_CASCADE_STEPS {
+                return Err(MembershipChangeError::LimitExceeded);
+            }
+            if has_independent_admin(w, tenant, x, role, &lost, &mut Vec::new(), steps)? {
                 continue;
             }
-            if !cascade {
-                return Err(MembershipChangeError::DependentGrants);
+            for (m2, g2, o2) in list_memberships_granted_by_in_txn(w, tenant, x)? {
+                if g2 != role {
+                    continue;
+                }
+                if !cascade {
+                    return Err(MembershipChangeError::DependentGrants);
+                }
+                remove_membership_in_txn(w, tenant, m2, g2)?;
+                *changed += 1;
+                deleted = true;
+                if o2.admin {
+                    lost.insert(m2);
+                    queue.push(m2);
+                }
             }
-            remove_membership_in_txn(w, tenant, m2, g2)?;
-            *changed += 1;
-            if o2.admin {
-                queue.push((m2, g2));
-            }
+        }
+        if !deleted {
+            break;
         }
     }
     Ok(())

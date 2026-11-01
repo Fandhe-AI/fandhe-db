@@ -10,7 +10,7 @@
 ### Added
 
 - ロールのメンバーシップと継承を追加した（Issue #2232・SQL-39 (7)・SQL-40）。`GRANT <ロール> TO <ロール> [WITH ADMIN|INHERIT|SET ...]`・`REVOKE [<オプション> OPTION FOR] <ロール> FROM <ロール> [CASCADE]` を実行し（循環 `0LP01`・ADMIN なし `42501`・依存 `2BP01`）、`CREATE ROLE ... IN ROLE／ROLE／ADMIN` を受理する。付与権限（`GRANT <権限> ON ...`）は付与者が INHERIT で継承するロールの GRANT OPTION も使え、記録される付与者は最良のロールになる。メンバーシップ blob は版 2（付与者つき）になり、版 1 は付与者なしとして読める。
-  公開 `GrantRevokeOutcome` に `is_role()` を追加した。wire はロール形に `GRANT ROLE`／`REVOKE ROLE` のコマンドタグを返す（権限形は `GRANT`／`REVOKE` のまま）。
+  公開 `GrantRevokeOutcome` に `is_role()` を追加した。wire のコマンドタグはロール形も権限形と同じ `GRANT`／`REVOKE`。
   挙動変更: ロール形 GRANT／REVOKE と `CREATE ROLE ... IN ROLE／ROLE／ADMIN` は `0A000` ではなく実行される（現在ロールが未束縛なら `42501`）。
 - `SET TRANSACTION` と `SET SESSION CHARACTERISTICS AS TRANSACTION` を受理する（Issue #1939・SQL-38 (7)(a)・SQL-31 ポインタ。契約の詳細は spec 側を参照）。
   BREAKING CHANGE: 公開 enum `SqlOutcome`・`ParsedSql` に `SetTransaction`、`SqlSurfaceError` に `SetTransactionAfterQuery` を追加した。修飾子なしの `START TRANSACTION` がセッション既定を継承するようになった。

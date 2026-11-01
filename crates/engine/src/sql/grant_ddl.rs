@@ -40,8 +40,8 @@ impl GrantRevokeOutcome {
         self.is_revoke
     }
 
-    /// ロール形（メンバーシップの付与・取り消し）の応答なら真（wire のコマンドタグ `GRANT ROLE`／
-    /// `REVOKE ROLE` の選択に使う。PostgreSQL と同じタグ）。
+    /// ロール形（メンバーシップの付与・取り消し）の応答なら真（wire のコマンドタグは権限形と同じ
+    /// `GRANT`／`REVOKE` で、この区別は API 利用者向け）。
     pub fn is_role(&self) -> bool {
         self.is_role
     }

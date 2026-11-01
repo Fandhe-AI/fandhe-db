@@ -405,7 +405,7 @@ Issue #2232 は SQL-39 (7) のうち、メンバーシップの付与・取り�
 - **M6 ACL の付与権限に継承を入れた（J5 の見直し）**: `catalog/privilege/apply.rs` は付与者の INHERIT 閉包の行と PUBLIC の和で「何らかの権限」を判定し、記録・取り消しの付与者を PostgreSQL の `select_best_grantor` と同じ方法（必要な GRANT OPTION をすべて持つ最も近いロール、無ければ最も多く持つロール）で選ぶ。閉包は書き込みと同じ txn のスナップショットで計算する。所有者相当は従来どおり。
 - **M9 `CREATE ROLE ... IN ROLE a / ROLE b / ADMIN c`**: 受理し（`IN GROUP`・`USER` も同義。各句の重複は `42601`）、ロール作成と同じ write txn で付与する（`Storage::create_role_with_memberships`）。1 つでも失敗すればロールごと commit しない。句があるとき現在ロールが未束縛なら `42501`。
 - **`pg_has_role` 相当**: `graph::has_role_privilege`（ID 解決済み）と `Storage::has_role_privilege_by_name`。権限文字列はカンマ区切り・大文字小文字無視で、`MEMBER`・`USAGE`・`SET`・各 `WITH ADMIN OPTION`／`WITH GRANT OPTION` の許可リストを OR で評価し、未知の語は全体を先に検証して拒否する（`InvalidPrivilege`。SQL へ結線する際に `22023` へ写す）。
-- **wire のタグ**: ロール形は PostgreSQL と同じ `GRANT ROLE`／`REVOKE ROLE`（`GrantRevokeOutcome::is_role` を追加）。
+- **wire のタグ**: ロール形も権限形と同じ `GRANT`／`REVOKE`（PostgreSQL 17 の CMDTAG と同じ。`GrantRevokeOutcome::is_role` は API の区別用に追加）。
 - **DROP ROLE**: 付与者として参照されている行は付与者なしへ付け替える（PostgreSQL は bootstrap superuser へ付け替える）。付与者なしの行は所有者相当だけが取り消せる。
 
 ### PostgreSQL 17 との逸脱（記録）
@@ -421,7 +421,7 @@ Issue #2232 は SQL-39 (7) のうち、メンバーシップの付与・取り�
 - `current_user`・`current_role`・`session_user`・`user` と SQL の `pg_has_role(...)` の結線（`core.rs` の FROM なし SELECT のスコープ・Describe の型公告。判定関数と名前解決は本 Issue で用意済み）。
 - `SET ROLE`／`RESET ROLE`・`ALTER ROLE [NO]INHERIT`（#1963。`can_set_role` を呼ぶ）。
 - 共通ゲートでの継承の利用（#1966〜#1969）、ポリシーの `TO` ロール（#2278 段 2。`has_privs_of` を呼ぶ）、認証主体の束縛（#1971）、所有者・`GRANTED BY`（#2236）。
-- INHERIT・ADMIN の喪失による ADMIN の到達性の再評価（依存の解決は ADMIN の根拠である直接の行に限る）。
+- INHERIT・ADMIN の喪失による ADMIN の到達性の再評価（依存の解決は ADMIN の根拠である直接の行に限る）。CASCADE 中に ADMIN の行を失った付与者は所有者相当の根拠にせず、削除の確定を固定点まで反復して評価順に依存させない。
 - PostgreSQL 16 以降の付与者ごとの複数行、CREATEROLE の作成者への暗黙の ADMIN。
 
 ## 11. Issue #1966 実装記録（権限検査の共通ゲート）

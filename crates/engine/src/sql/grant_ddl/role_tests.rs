@@ -272,6 +272,33 @@ fn revoke_admin_ignores_self_dependent_admin_path() {
     assert!(mem(&f, n, r).is_none());
 }
 
+/// CASCADE の途中で ADMIN を失った付与者（b）を、所有者相当の根拠として扱わない（回帰）。c は b が付けた d の
+/// ADMIN を継承して e へ付与しているため、b・c の行が先に消えても d の行と e の行は最終的にすべて消える。
+#[test]
+fn cascade_does_not_treat_lost_admin_grantor_as_owner_equivalent() {
+    let f = fx("rm_lost_grantor");
+    let me = role(&f, "me");
+    let r = role(&f, "r");
+    let a = role(&f, "a");
+    let b = role(&f, "b");
+    let c = role(&f, "c");
+    let d = role(&f, "d");
+    let e = role(&f, "e");
+    let owner = session(me, true);
+    run(&f, &owner, "GRANT r TO a WITH ADMIN TRUE").expect("a admin");
+    run(&f, &session(a, false), "GRANT r TO b WITH ADMIN TRUE").expect("b admin");
+    run(&f, &session(a, false), "GRANT r TO c WITH ADMIN TRUE").expect("c admin");
+    run(&f, &session(b, false), "GRANT r TO d WITH ADMIN TRUE").expect("d admin by b");
+    run(&f, &owner, "GRANT d TO c").expect("c inherits d");
+    run(&f, &session(c, false), "GRANT r TO e").expect("e by c");
+    assert_eq!(mem(&f, e, r).expect("row").grantor_id, Some(c));
+    run(&f, &owner, "REVOKE ADMIN OPTION FOR r FROM a CASCADE").expect("cascade");
+    assert!(!mem(&f, a, r).expect("a").admin);
+    for (m, name) in [(b, "b"), (c, "c"), (d, "d"), (e, "e")] {
+        assert!(mem(&f, m, r).is_none(), "{name} must be revoked");
+    }
+}
+
 /// `GRANT ... WITH ADMIN FALSE` による ADMIN の取り消しも `REVOKE ADMIN OPTION` と同じ依存検査（2BP01）を通る。
 #[test]
 fn grant_with_admin_false_respects_dependents() {
