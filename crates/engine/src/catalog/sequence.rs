@@ -1417,6 +1417,8 @@ impl Storage {
             .begin_write_txn()
             .map_err(super::convert_storage_error)?;
         let created = create_table_with_implicit_sequences_in_txn(&write_txn, schema, serials)?;
+        // commit 記録（SQL-38・Issue #2404）: スキーマ・カタログ・実体を変える書き込みは DDL として記録する。
+        crate::storage::commit_log::note_ddl(&write_txn, &schema.name);
         super::bump_table_generation_in_txn(&write_txn, &schema.name)?;
         crate::recovery::commit_boundary::commit(write_txn)
             .map_err(super::convert_storage_error)?;

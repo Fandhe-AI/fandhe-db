@@ -623,6 +623,8 @@ pub(crate) fn remove_triggers_referencing_function_in_txn(
         }
     }
     for t in &touched_tables {
+        // commit 記録（SQL-38・Issue #2404）: スキーマ・カタログ・実体を変える書き込みは DDL として記録する。
+        crate::storage::commit_log::note_ddl(write_txn, t);
         bump_table_generation_in_txn(write_txn, t)?;
     }
     Ok(())
@@ -761,6 +763,8 @@ impl Storage {
             let mut table = write_txn.open_table(TRIGGERS_TABLE)?;
             table.insert((table_key, scope, stored.name.as_str()), blob.as_slice())?;
         }
+        // commit 記録（SQL-38・Issue #2404）: スキーマ・カタログ・実体を変える書き込みは DDL として記録する。
+        crate::storage::commit_log::note_ddl(&write_txn, table_key);
         bump_table_generation_in_txn(&write_txn, table_key)?;
         crate::recovery::commit_boundary::commit(write_txn)
             .map_err(super::convert_storage_error)?;
@@ -806,6 +810,8 @@ impl Storage {
             let mut table = write_txn.open_table(TRIGGERS_TABLE)?;
             table.remove((table_key, scope, name))?;
         }
+        // commit 記録（SQL-38・Issue #2404）: スキーマ・カタログ・実体を変える書き込みは DDL として記録する。
+        crate::storage::commit_log::note_ddl(&write_txn, table_key);
         bump_table_generation_in_txn(&write_txn, table_key)?;
         crate::recovery::commit_boundary::commit(write_txn)
             .map_err(super::convert_storage_error)?;

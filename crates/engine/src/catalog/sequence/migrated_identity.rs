@@ -397,6 +397,8 @@ impl Storage {
         if matches!(outcome, MigratedIdIdentityOutcome::AlreadyAssigned { .. }) {
             return Ok(outcome);
         }
+        // commit 記録（SQL-38・Issue #2404）: スキーマ・カタログ・実体を変える書き込みは DDL として記録する。
+        crate::storage::commit_log::note_ddl(&write_txn, table);
         crate::catalog::bump_table_generation_in_txn(&write_txn, table)?;
         crate::recovery::commit_boundary::commit(write_txn)
             .map_err(crate::catalog::convert_storage_error)?;

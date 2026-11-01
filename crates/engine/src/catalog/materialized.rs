@@ -81,6 +81,9 @@ const MAX_SCHEMA_BLOB_BYTES: usize = 2 * 1024 * 1024;
 /// 実体の行表名を組み立てる唯一の点。`validate_identifier` は `/` を拒否するため、
 /// `user_rows/*` やユーザー表の名前と衝突しない。
 fn matview_rows_table_name(name: &str) -> String {
+    // 明示トランザクションの読み取り集合（SQL-38・Issue #2404）。実体の行テーブルに触れる経路は
+    // ここで名前を作る（区間が無ければ何もしない）。
+    crate::sql::read_set::record(name);
     format!("matview_rows/{name}")
 }
 
@@ -816,6 +819,8 @@ pub(crate) fn create_materialized_view_in_txn(
     if let Some(e) = entities {
         write_entities_in_txn(write_txn, &def.name, &def.columns, e, &keys)?;
     }
+    // commit 記録（SQL-38・Issue #2404）: スキーマ・カタログ・実体を変える書き込みは DDL として記録する。
+    crate::storage::commit_log::note_ddl(write_txn, &def.name);
     bump_table_generation_in_txn(write_txn, &def.name)?;
     Ok(())
 }
@@ -865,6 +870,8 @@ pub(crate) fn finish_streamed_refresh_in_txn(
     let mut def = def.clone();
     def.populated = populated;
     store_def_in_txn(write_txn, &def)?;
+    // commit 記録（SQL-38・Issue #2404）: スキーマ・カタログ・実体を変える書き込みは DDL として記録する。
+    crate::storage::commit_log::note_ddl(write_txn, &def.name);
     bump_table_generation_in_txn(write_txn, &def.name)?;
     Ok(())
 }
@@ -956,6 +963,8 @@ pub(crate) fn finish_streamed_create_in_txn(
     write_txn: &redb::WriteTransaction,
     name: &str,
 ) -> Result<()> {
+    // commit 記録（SQL-38・Issue #2404）: スキーマ・カタログ・実体を変える書き込みは DDL として記録する。
+    crate::storage::commit_log::note_ddl(write_txn, name);
     bump_table_generation_in_txn(write_txn, name)?;
     Ok(())
 }
@@ -1053,6 +1062,8 @@ impl Storage {
             .begin_write_txn()
             .map_err(super::convert_storage_error)?;
         insert_def_in_txn(&write_txn, &def, &encoded)?;
+        // commit 記録（SQL-38・Issue #2404）: スキーマ・カタログ・実体を変える書き込みは DDL として記録する。
+        crate::storage::commit_log::note_ddl(&write_txn, &def.name);
         bump_table_generation_in_txn(&write_txn, &def.name)?;
         crate::recovery::commit_boundary::commit(write_txn).map_err(super::convert_storage_error)
     }
@@ -1120,6 +1131,8 @@ impl Storage {
         write_entities_in_txn(&write_txn, name, &def.columns, entities, &keys)?;
         def.populated = true;
         store_def_in_txn(&write_txn, &def)?;
+        // commit 記録（SQL-38・Issue #2404）: スキーマ・カタログ・実体を変える書き込みは DDL として記録する。
+        crate::storage::commit_log::note_ddl(&write_txn, name);
         bump_table_generation_in_txn(&write_txn, name)?;
         crate::recovery::commit_boundary::commit(write_txn).map_err(super::convert_storage_error)
     }
@@ -1136,6 +1149,8 @@ impl Storage {
         delete_rows_table_in_txn(&write_txn, name)?;
         def.populated = false;
         store_def_in_txn(&write_txn, &def)?;
+        // commit 記録（SQL-38・Issue #2404）: スキーマ・カタログ・実体を変える書き込みは DDL として記録する。
+        crate::storage::commit_log::note_ddl(&write_txn, name);
         bump_table_generation_in_txn(&write_txn, name)?;
         crate::recovery::commit_boundary::commit(write_txn).map_err(super::convert_storage_error)
     }
@@ -1238,6 +1253,8 @@ impl Storage {
         }
         for &name in &existing {
             drop_materialized_view_in_txn(&write_txn, name)?;
+            // commit 記録（SQL-38・Issue #2404）: スキーマ・カタログ・実体を変える書き込みは DDL として記録する。
+            crate::storage::commit_log::note_ddl(&write_txn, name);
             bump_table_generation_in_txn(&write_txn, name)?;
         }
         let dropped = existing.len();

@@ -268,6 +268,9 @@ pub(super) fn update_rows_with_triggers(
             row_table
                 .insert(key, encoded.as_slice())
                 .map_err(CatalogError::from)?;
+            // commit 記録の行の足跡（SQL-38・Issue #2404）。可視性は更新前後で不変（上の
+            // `visibility`）のため、更新後の行 1 つで前後を表す。
+            crate::storage::commit_log::note_row_bytes(write_txn, table, encoded.as_slice());
         }
         statement_writes::record(table, *id);
         if track_pre_images {
@@ -413,7 +416,11 @@ pub(super) fn delete_rows_with_triggers(
                 .open_table(user_rows_table_def(&row_table_name))
                 .map_err(map_row_table_error)?;
             let key = row_key(ctx.tenant_id(), RowId::from_legacy_id(*id));
-            row_table.remove(&key).map_err(CatalogError::from)?;
+            // commit 記録の行の足跡: 削除される前の行（SQL-38・Issue #2404）。
+            let removed = row_table.remove(&key).map_err(CatalogError::from)?;
+            if let Some(removed) = removed.as_ref() {
+                crate::storage::commit_log::note_row_bytes(write_txn, table, removed.value());
+            }
         }
         statement_writes::record(table, *id);
         if needs_fk_removed_pre_image {

@@ -276,6 +276,14 @@ struct ActiveTxn<'e> {
     /// それまで writer 取得前の読み取りは文ごとの確定状態を見る）。`ActiveTxn` を捨てる全経路で自動的に解放される。
     #[allow(dead_code)]
     read_snapshot: redb::ReadTransaction,
+    /// 明示 Tx が `BEGIN` で `Storage` の commit 記録の登録簿へ登録した `G_s` のハンドル（SQL-38・
+    /// Issue #2404）。writer 未取得の間だけ保持し、writer 取得（[`SessionTransaction::ensure_writer`]）・
+    /// `COMMIT`・`ROLLBACK`・`fail`・期限切れ・drop のどの経路でも外れる。暗黙 Tx・一時表用ストレージは `None`。
+    registration: Option<crate::storage::commit_log::SnapshotRegistration>,
+    /// `read_snapshot` の世代 `G_s`（登録時に読んだ値。登録を外した後も #2405 の判定が使う。暗黙 Tx は 0）。
+    snapshot_generation: u64,
+    /// writer 取得前に読んだ基底表の集合（SQL-38・Issue #2404。`sql::read_set`）。writer 取得後は増えない。
+    read_set: crate::sql::read_set::ReadSet,
     /// 一時表（TABLE-44・Issue #1684）の書き込みトランザクション。最初の一時表の文で遅延して開く。
     /// `ActiveTxn` を取り出して drop する全経路（`rollback`／`fail`／`release_if_expired`／
     /// 暗黙の abort／`SessionTransaction` の drop）で自動的に abort する。commit は
@@ -704,12 +712,19 @@ impl<'e> SessionTransaction<'e> {
                         });
                     }
                 };
-                let (write_txn, read_snapshot) = match origin {
+                let (write_txn, read_snapshot, registration) = match origin {
                     // 明示トランザクション（Issue #2400）: `BEGIN` では writer を取らず、
                     // 読み取りスナップショットだけを開く。writer は最初の書き込み文が
                     // [`Self::ensure_writer`] で取得するため、読み取りだけの Tx は他セッションの
                     // 書き込みを待たせず、書き込みロック待ち（`55P03`）も `BEGIN` では生じない。
-                    TxnOrigin::Explicit => (None, open_read_snapshot(storage)?),
+                    // 書き込み時直列化検査（SQL-38・Issue #2404）のため、`G_s` を commit 記録の登録簿へ
+                    // 登録する（登録順序は `Storage::open_registered_snapshot`）。
+                    TxnOrigin::Explicit => {
+                        let (snap, reg) = storage
+                            .open_registered_snapshot()
+                            .map_err(|_| internal_error())?;
+                        (None, snap, reg)
+                    }
                     // 暗黙トランザクション（WIRE-16・Issue #1175）: 従来どおり開始時に writer を
                     // 取る（#2401 が前提とする）。スナップショットは permit 保持中に開けば文ごとの
                     // `begin_read_txn()` と同じ確定状態になる（writer の前に開くとゲート待ちの間の
@@ -725,9 +740,11 @@ impl<'e> SessionTransaction<'e> {
                                 return Err(e);
                             }
                         };
-                        (Some(w), snap)
+                        (Some(w), snap, None)
                     }
                 };
+                let snapshot_generation =
+                    registration.as_ref().map_or(0, |r| r.snapshot_generation());
                 self.generation = next_generation;
                 self.state = TxnState::Active(Box::new(ActiveTxn {
                     origin,
@@ -735,6 +752,9 @@ impl<'e> SessionTransaction<'e> {
                     isolation_level,
                     writer: write_txn,
                     read_snapshot,
+                    registration,
+                    snapshot_generation,
+                    read_set: crate::sql::read_set::ReadSet::default(),
                     temp: None,
                     started_at: Instant::now(),
                     txn_start_micros,
@@ -1023,9 +1043,55 @@ impl<'e> SessionTransaction<'e> {
                 }
                 .map_err(map_write_lock_err)?;
                 active.writer = Some(w);
+                // 読み取り集合を確定する（SQL-38・Issue #2404）。同じ文の取得後の読み取り
+                // （`INSERT ... SELECT` の元表など）は集合へ入れない。
+                if let Some(set) = crate::sql::read_set::disarm_current() {
+                    active.read_set.merge(set);
+                }
+                // #2405 の `40001` 判定は、ここ（writer を格納した後）と登録を外す間に差し込む。
+                // 登録は判定が必要とする記録を刈り込ませないため、格納の後に外す。
+                active.registration = None;
                 Ok(())
             }
             _ => Err(internal_error()),
+        }
+    }
+
+    /// 文の実行区間で読み取り集合を記録する区間を張る。明示トランザクションかつ writer 未取得の
+    /// ときだけ `Some`（SQL-38・Issue #2404）。暗黙トランザクション・取得後・`Active` 以外は `None`。
+    pub(crate) fn read_set_scope(&self) -> Option<crate::sql::read_set::ReadSetScope> {
+        match &self.state {
+            TxnState::Active(active)
+                if active.origin == TxnOrigin::Explicit && active.writer.is_none() =>
+            {
+                Some(crate::sql::read_set::ReadSetScope::enter())
+            }
+            _ => None,
+        }
+    }
+
+    /// 文の区間で記録した読み取りを `Active` の集合へ取り込む。
+    pub(crate) fn absorb_read_set(&mut self, set: crate::sql::read_set::ReadSet) {
+        if let TxnState::Active(active) = &mut self.state {
+            active.read_set.merge(set);
+        }
+    }
+
+    /// writer 取得前に読んだ基底表の集合（`Active` のときのみ `Some`。#2405 の判定が使う）。
+    #[cfg_attr(not(test), allow(dead_code))]
+    pub(crate) fn read_set(&self) -> Option<&crate::sql::read_set::ReadSet> {
+        match &self.state {
+            TxnState::Active(active) => Some(&active.read_set),
+            _ => None,
+        }
+    }
+
+    /// `BEGIN` の読み取りスナップショットの世代 `G_s`（`Active` のときのみ `Some`。暗黙 Tx は 0）。
+    #[cfg_attr(not(test), allow(dead_code))]
+    pub(crate) fn snapshot_generation(&self) -> Option<u64> {
+        match &self.state {
+            TxnState::Active(active) => Some(active.snapshot_generation),
+            _ => None,
         }
     }
 
@@ -1278,10 +1344,19 @@ fn commit_active(
             Ok(())
         }
     };
-    result.map_err(|_| {
+    result.map_err(|e| {
         // commit 失敗はロールバック扱い（writer は消費済みで、permit も解放されている）。
         *session = session_at_begin;
-        internal_error()
+        match e {
+            // 足跡を記録できない書き込みは redb の commit 前に拒否される（Issue #2404）。
+            // 文実行時の上限超過と同じ `54000`・固定文言で返す（`internal_error` へ丸めない）。
+            crate::storage::StorageError::CommitFootprintUnrecordable => {
+                SqlSurfaceError::PayloadTooLarge {
+                    detail: "commit footprint limit exceeded".to_string(),
+                }
+            }
+            _ => internal_error(),
+        }
     })?;
     // 永続側の commit 成功後にだけ、一時側を確定し、続けて一時表の `ON COMMIT` 動作を適用する
     // （TABLE-44・Issue #1683・#1684。ROLLBACK・永続側の commit 失敗では `temp` を drop（abort）
