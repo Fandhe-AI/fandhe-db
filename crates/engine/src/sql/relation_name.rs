@@ -172,6 +172,12 @@ pub(crate) fn relation_positions(tokens: &[Token]) -> RelationWalk {
     // 位置判定を上書きする。
     let trigger_head = ((head_create || head_drop) && ident_is(tokens.get(1), "TRIGGER"))
         || (head_create && ident_is(tokens.get(1), "OR") && ident_is(tokens.get(3), "TRIGGER"));
+    // `CREATE|ALTER|DROP POLICY <名前> ON <表> ...`（RLS-13・Issue #2274）も同じ規則で、関係名の位置は
+    // 最初の `ON` の直後だけ。`USING (...)`・`WITH CHECK (...)` の式中の語（列名・`USING` 等）を関係位置と
+    // 誤検出して `search_path` ゲートや解決へ渡さない。
+    let policy_head = (head_create || head_drop || ident_is(tokens.first(), "ALTER"))
+        && ident_is(tokens.get(1), "POLICY");
+    let trigger_head = trigger_head || policy_head;
     let mut trigger_on_pending = trigger_head;
 
     let mut levels: Vec<Level> = vec![Level::default()];
@@ -227,7 +233,8 @@ pub(crate) fn relation_positions(tokens: &[Token]) -> RelationWalk {
                 } else if delete_using_opener(tokens, i) {
                     // `DELETE FROM t USING a, b`（SQL-53 (b)、Issue #1754）。以降のカンマは表参照リストの区切り。
                     next.list = true;
-                } else if (w.eq_ignore_ascii_case("TRUNCATE") && i == 0)
+                } else if ((w.eq_ignore_ascii_case("TRUNCATE") || w.eq_ignore_ascii_case("LOCK"))
+                    && i == 0)
                     || (w.eq_ignore_ascii_case("TABLE") && ddl_head && i < 4)
                     || (head_drop
                         && i < 4
@@ -375,6 +382,12 @@ pub(crate) fn relation_positions(tokens: &[Token]) -> RelationWalk {
                         is("JOIN")
                             || is("INTO")
                             || is("TRUNCATE")
+                            // `LOCK <表>`（`TABLE` 省略形。Issue #1958）。文頭の `LOCK` の直後だけ。
+                            // 直後が省略可能な `TABLE` 構文語（次が名前）のときは関係ではない。
+                            || (is("LOCK")
+                                && i == 1
+                                && !(ident_is(Some(cur), "TABLE")
+                                    && tokens.get(i.saturating_add(1)).is_some_and(is_ident_like)))
                             || is("UPDATE")
                             || is("ONLY")
                             || is("REFERENCES")
@@ -1154,6 +1167,16 @@ mod tests {
         same("TRUNCATE public.a, public.b", "TRUNCATE a, b");
         // カンマに続く `ONLY` の対象表（式の文脈と取り違えない）。
         same("TRUNCATE public.a, ONLY public.b", "TRUNCATE a, ONLY b");
+        // `LOCK`（`TABLE` 省略形・複数表。Issue #1958）。
+        same("LOCK public.t", "LOCK t");
+        same(
+            "LOCK TABLE public.t IN SHARE MODE",
+            "LOCK TABLE t IN SHARE MODE",
+        );
+        same(
+            "LOCK TABLE ONLY public.a, public.b NOWAIT",
+            "LOCK TABLE ONLY a, b NOWAIT",
+        );
         same("DROP TABLE IF EXISTS public.t", "DROP TABLE IF EXISTS t");
         same(
             "CREATE TABLE public.t (id TEXT)",
@@ -1282,6 +1305,41 @@ mod tests {
         assert!(rewrite_relation_names(&mut t, Some(&probe)).is_ok());
         assert_ne!(t, before);
         assert!(t.iter().any(|x| matches!(x, Token::QualifiedIdent { .. })));
+    }
+
+    /// RLS-13・Issue #2274: `CREATE|ALTER|DROP POLICY ... ON <表>` の表名だけが解決され、式中の語
+    /// （`USING`・`WITH CHECK`・列名）は関係位置にならない。未知の SCHEMA は `3F000`。
+    #[test]
+    fn policy_ddl_names_are_resolved() {
+        same(
+            "CREATE POLICY p ON public.t FOR SELECT USING (owner = 'a')",
+            "CREATE POLICY p ON t FOR SELECT USING (owner = 'a')",
+        );
+        same(
+            "ALTER POLICY p ON public.t RENAME TO q",
+            "ALTER POLICY p ON t RENAME TO q",
+        );
+        same(
+            "DROP POLICY IF EXISTS p ON public.t",
+            "DROP POLICY IF EXISTS p ON t",
+        );
+        let got = rewrite_in_tenant("CREATE POLICY p ON s.t USING (a > 1)").expect("resolved");
+        let keys: Vec<&str> = got
+            .iter()
+            .filter_map(|t| match t {
+                Token::Ident(n) if n.starts_with('#') => Some(n.as_str()),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(keys, vec!["#12.t"]);
+        assert_eq!(
+            rewrite_in_tenant("DROP POLICY p ON z.t")
+                .expect_err("unknown")
+                .wire_code(),
+            "3F000"
+        );
+        let t = tokenize("CREATE POLICY p ON t USING (a > 1) WITH CHECK (b > 1)").expect("lex");
+        assert_eq!(relation_positions(&t).positions.len(), 1);
     }
 
     /// TABLE-45・Issue #1722: `CREATE TRIGGER ... ON <表>`／`DROP TRIGGER ... ON <表>` の表名と

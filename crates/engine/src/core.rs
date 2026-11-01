@@ -91,6 +91,15 @@ mod dml_subquery_exec;
 mod cte_join_budget_tests;
 #[cfg(test)]
 mod deferred_writer_tests;
+// 明示トランザクションの読み取り集合（SQL-38・Issue #2404）。
+#[cfg(test)]
+mod read_set_tests;
+// commit 記録（SQL-38・Issue #2404）。
+#[cfg(test)]
+mod commit_log_tests;
+// writer 遅延取得の前後の回帰固定（Issue #2402。ポインタ: SQL-19・SQL-31・TASK-333）。
+#[cfg(test)]
+mod deferred_writer_regression_tests;
 mod dml_join_exec;
 #[cfg(test)]
 mod dml_join_exec_tests;
@@ -107,6 +116,8 @@ mod standard_body_binding;
 mod plpgsql_host;
 // `DO` ブロックの実行（SQL-68・Issue #2228）。
 mod do_block;
+// `LOCK TABLE` の実行（SQL-38・Issue #1958）。
+mod lock_exec;
 // `LANGUAGE sql|plpgsql` 関数の呼び出し位置の実行（SQL-67 (5)・Issue #2218）。
 mod routine_call;
 // `CREATE FUNCTION ... LANGUAGE plpgsql` の定義時検証（Issue #2217・SQL-67 (3)）。
@@ -1735,6 +1746,16 @@ pub enum ParsedSql {
     /// **BREAKING CHANGE**（Issue #1754）: 本 variant の追加により `ParsedSql` を網羅的に
     /// マッチするクレート外コードは追随が必要。
     DeleteUsing(Box<crate::sql::allowlist::ValidatedDeleteUsing>),
+    /// 行ロック句つきの `SELECT`（`FOR UPDATE`／`FOR NO KEY UPDATE`／`FOR SHARE`／`FOR KEY SHARE`、
+    /// `OF`、`NOWAIT`／`SKIP LOCKED`。SQL-38・Issue #1957）。構文解釈と併用検査（`sql::row_lock`）までを
+    /// 担い、実行入口は Issue #2230（ロックの取得）・#2231（`SKIP LOCKED` の実行）まで `0A000` で拒否する
+    /// （ロックを取らずに素の SELECT として実行する fail-open を作らない）。既存の [`Self::Statement`] に
+    /// フィールドを足さず別 variant にしているのは、句を黙って無視する経路を作らず、網羅 `match` の
+    /// 追随漏れをコンパイラに検出させるため。
+    ///
+    /// **BREAKING CHANGE**（Issue #1957）: 本 variant の追加により `ParsedSql` を網羅的に
+    /// マッチするクレート外コードは追随が必要（`#[non_exhaustive]`）。
+    LockingSelect(Box<crate::sql::row_lock::LockingSelect>),
     /// `BEGIN`／`COMMIT`／`ROLLBACK`（SQL-31・TASK-221）。トランザクション文脈を
     /// 持たない [`EngineCore::execute_parsed_in_session`] はこの variant を
     /// `0A000` で拒否する（トランザクション対応の実行入口は
@@ -1912,11 +1933,23 @@ pub enum ParsedSql {
     CreateTrigger(crate::sql::allowlist::ValidatedCreateTrigger),
     /// `DROP TRIGGER [IF EXISTS] <名前> ON <表>`（TABLE-45、Issue #1722）。
     DropTrigger(crate::sql::allowlist::ValidatedDropTrigger),
+    /// `CREATE POLICY`（RLS-13、Issue #2274）。
+    ///
+    /// **BREAKING CHANGE**（Issue #2274）: `ParsedSql` への variant 追加。
+    CreatePolicy(crate::sql::allowlist::ValidatedCreatePolicy),
+    /// `ALTER POLICY`（RLS-13、Issue #2274）。
+    AlterPolicy(crate::sql::allowlist::ValidatedAlterPolicy),
+    /// `DROP POLICY [IF EXISTS] <名前> ON <表>`（RLS-13、Issue #2274）。
+    DropPolicy(crate::sql::allowlist::ValidatedDropPolicy),
     /// `DO [LANGUAGE plpgsql] '<本体>'`（SQL-68、Issue #2228）。
     ///
     /// `ParsedSql::Statement` には載せない（DataModifyingCte・CreateTrigger と同じ理由。wire 側が
     /// 非書き込みと誤判定しないため）。**BREAKING CHANGE**（Issue #2228）: `ParsedSql` への variant 追加。
     Do(crate::sql::allowlist::ValidatedDo),
+    /// `LOCK [TABLE] ...`（SQL-38・Issue #1958）。トランザクション内でだけ writer を取得して保持する。
+    ///
+    /// **BREAKING CHANGE**（Issue #1958）: `ParsedSql` への variant 追加。
+    Lock(crate::sql::lock_table::ValidatedLockTable),
     /// `CREATE SCHEMA [IF NOT EXISTS] <name>`（TABLE-27、Issue #1713）。
     ///
     /// **BREAKING CHANGE**（Issue #1713）: `ParsedSql` への variant 追加。
@@ -1997,6 +2030,14 @@ fn session_time_zone_scope(
     crate::datetime::SessionTimeZoneScope::enter(session.time_zone().clone())
 }
 
+/// 行ロック句つき SELECT の暫定ゲート（SQL-38・Issue #1957）。ロックの取得は Issue #2230、
+/// `SKIP LOCKED` の実行は #2231 の担当で、それまでは受理した形も実行入口で `0A000` にする。
+fn row_lock_not_supported() -> crate::sql::allowlist::SqlSurfaceError {
+    crate::sql::allowlist::SqlSurfaceError::feature_not_supported(
+        "row-level locking clauses are not supported yet",
+    )
+}
+
 fn statement_clock_scope(
     parsed: &ParsedSql,
     txn_start_micros: Option<i64>,
@@ -2007,6 +2048,7 @@ fn statement_clock_scope(
             return statement_clock_scope(routed.inner(), txn_start_micros)
         }
         ParsedSql::Statement(_)
+        | ParsedSql::LockingSelect(_)
         | ParsedSql::Insert(_)
         | ParsedSql::InsertSelect(_)
         // SQL-63・Issue #1876: 副文と主クエリは同じ文の開始時刻を共有する。
@@ -2042,7 +2084,11 @@ fn statement_clock_scope(
         | ParsedSql::DropFunction(_)
         | ParsedSql::CreateTrigger(_)
         | ParsedSql::DropTrigger(_)
+        | ParsedSql::CreatePolicy(_)
+        | ParsedSql::AlterPolicy(_)
+        | ParsedSql::DropPolicy(_)
         | ParsedSql::Do(_)
+        | ParsedSql::Lock(_)
         | ParsedSql::CreateSchema(_)
         | ParsedSql::DropSchema(_)
         | ParsedSql::AlterSchema(_)
@@ -2082,6 +2128,7 @@ fn insert_sequence_scope(
             .iter()
             .any(|d| d.command == crate::sql::returning::DmlCommand::Insert),
         ParsedSql::Statement(_)
+        | ParsedSql::LockingSelect(_)
         | ParsedSql::Truncate(_)
         | ParsedSql::Delete(_)
         | ParsedSql::Update(_)
@@ -2111,7 +2158,11 @@ fn insert_sequence_scope(
         | ParsedSql::DropFunction(_)
         | ParsedSql::CreateTrigger(_)
         | ParsedSql::DropTrigger(_)
+        | ParsedSql::CreatePolicy(_)
+        | ParsedSql::AlterPolicy(_)
+        | ParsedSql::DropPolicy(_)
         | ParsedSql::Do(_)
+        | ParsedSql::Lock(_)
         | ParsedSql::CreateSchema(_)
         | ParsedSql::DropSchema(_)
         | ParsedSql::AlterSchema(_)
@@ -2149,6 +2200,7 @@ fn insert_default_clock_scope(
             .iter()
             .any(|d| d.command == crate::sql::returning::DmlCommand::Insert),
         ParsedSql::Statement(_)
+        | ParsedSql::LockingSelect(_)
         | ParsedSql::Truncate(_)
         | ParsedSql::Delete(_)
         | ParsedSql::Update(_)
@@ -2178,7 +2230,11 @@ fn insert_default_clock_scope(
         | ParsedSql::DropFunction(_)
         | ParsedSql::CreateTrigger(_)
         | ParsedSql::DropTrigger(_)
+        | ParsedSql::CreatePolicy(_)
+        | ParsedSql::AlterPolicy(_)
+        | ParsedSql::DropPolicy(_)
         | ParsedSql::Do(_)
+        | ParsedSql::Lock(_)
         | ParsedSql::CreateSchema(_)
         | ParsedSql::DropSchema(_)
         | ParsedSql::AlterSchema(_)
@@ -4228,7 +4284,11 @@ impl EngineCore {
                     | crate::sql::SqlOutcome::DropFunction(_)
                     | crate::sql::SqlOutcome::CreateTrigger(_)
                     | crate::sql::SqlOutcome::DropTrigger(_)
+                    | crate::sql::SqlOutcome::CreatePolicy(_)
+                    | crate::sql::SqlOutcome::AlterPolicy(_)
+                    | crate::sql::SqlOutcome::DropPolicy(_)
                     | crate::sql::SqlOutcome::Do
+                    | crate::sql::SqlOutcome::Lock
                     | crate::sql::SqlOutcome::CreateSchema(_)
                     | crate::sql::SqlOutcome::DropSchema(_)
                     | crate::sql::SqlOutcome::AlterSchema(_)
@@ -4287,7 +4347,11 @@ impl EngineCore {
                     | crate::sql::SqlOutcome::DropFunction(_)
                     | crate::sql::SqlOutcome::CreateTrigger(_)
                     | crate::sql::SqlOutcome::DropTrigger(_)
+                    | crate::sql::SqlOutcome::CreatePolicy(_)
+                    | crate::sql::SqlOutcome::AlterPolicy(_)
+                    | crate::sql::SqlOutcome::DropPolicy(_)
                     | crate::sql::SqlOutcome::Do
+                    | crate::sql::SqlOutcome::Lock
                     | crate::sql::SqlOutcome::CreateSchema(_)
                     | crate::sql::SqlOutcome::DropSchema(_)
                     | crate::sql::SqlOutcome::AlterSchema(_)
@@ -4343,7 +4407,11 @@ impl EngineCore {
                     | crate::sql::SqlOutcome::DropFunction(_)
                     | crate::sql::SqlOutcome::CreateTrigger(_)
                     | crate::sql::SqlOutcome::DropTrigger(_)
+                    | crate::sql::SqlOutcome::CreatePolicy(_)
+                    | crate::sql::SqlOutcome::AlterPolicy(_)
+                    | crate::sql::SqlOutcome::DropPolicy(_)
                     | crate::sql::SqlOutcome::Do
+                    | crate::sql::SqlOutcome::Lock
                     | crate::sql::SqlOutcome::CreateSchema(_)
                     | crate::sql::SqlOutcome::DropSchema(_)
                     | crate::sql::SqlOutcome::AlterSchema(_)
@@ -4406,7 +4474,11 @@ impl EngineCore {
                     | crate::sql::SqlOutcome::DropFunction(_)
                     | crate::sql::SqlOutcome::CreateTrigger(_)
                     | crate::sql::SqlOutcome::DropTrigger(_)
+                    | crate::sql::SqlOutcome::CreatePolicy(_)
+                    | crate::sql::SqlOutcome::AlterPolicy(_)
+                    | crate::sql::SqlOutcome::DropPolicy(_)
                     | crate::sql::SqlOutcome::Do
+                    | crate::sql::SqlOutcome::Lock
                     | crate::sql::SqlOutcome::CreateSchema(_)
                     | crate::sql::SqlOutcome::DropSchema(_)
                     | crate::sql::SqlOutcome::AlterSchema(_)
@@ -4488,7 +4560,11 @@ impl EngineCore {
                     | crate::sql::SqlOutcome::DropFunction(_)
                     | crate::sql::SqlOutcome::CreateTrigger(_)
                     | crate::sql::SqlOutcome::DropTrigger(_)
+                    | crate::sql::SqlOutcome::CreatePolicy(_)
+                    | crate::sql::SqlOutcome::AlterPolicy(_)
+                    | crate::sql::SqlOutcome::DropPolicy(_)
                     | crate::sql::SqlOutcome::Do
+                    | crate::sql::SqlOutcome::Lock
                     | crate::sql::SqlOutcome::CreateSchema(_)
                     | crate::sql::SqlOutcome::DropSchema(_)
                     | crate::sql::SqlOutcome::AlterSchema(_)
@@ -5021,7 +5097,11 @@ impl EngineCore {
             // SCHEMA 名は関係名と別の名前空間で一時表を読み書きしないため走査対象外（TABLE-27・Issue #1713）。
             || crate::sql::allowlist::is_create_schema_statement(&tokens)
             || crate::sql::allowlist::is_drop_schema_statement(&tokens)
-            || crate::sql::allowlist::is_alter_schema_statement(&tokens);
+            || crate::sql::allowlist::is_alter_schema_statement(&tokens)
+            // `LOCK [TABLE]` は `LOCK`・`TABLE`・`IN`・`SHARE`・`MODE` 等のキーワードを含むため、名前走査だと
+            // 同名の一時表（`CREATE TEMP TABLE lock` 等）で誤判定する。対象表名の一時表衝突は
+            // parse 内の参照記録（`hits.temp_hit()`）で固定の `0A000` として拒否する（Issue #1958）。
+            || crate::sql::lock_table::is_lock_statement(&tokens);
         if txn_control_head || scan_exempt {
             let hits = crate::sql::temp_catalog::RelationHits::default();
             let parsed = self.parse_tokens_in(tokens, temp, &hits, self.ledger_mode, resolver)?;
@@ -5212,6 +5292,40 @@ impl EngineCore {
     /// 判定に使う台帳モードで、通常は `self.ledger_mode`。一時表への書き込みの分類 parse だけが
     /// 緩めたモードを渡す。
     fn parse_tokens_in(
+        &self,
+        tokens: Vec<crate::sql::lexer::Token>,
+        temp: &crate::sql::temp_catalog::SessionTempCatalog,
+        hits: &crate::sql::temp_catalog::RelationHits,
+        ledger_mode: LedgerMode,
+        resolver: Option<crate::sql::relation_name::SchemaResolver<'_>>,
+    ) -> Result<ParsedSql, crate::sql::allowlist::SqlSurfaceError> {
+        // SELECT の行ロック句（SQL-38・Issue #1957）は、行数制限句の正規化の後・名前解決の前に
+        // トークン列から取り除いて構文情報として保持し、既存の検証が文を受理した後に併用を検査する。
+        // 構文誤りは `42601`、併用違反は `0A000`、`OF` の解決失敗は `42P01`。
+        let tokens = Self::normalize_row_count_clauses(tokens)?;
+        let (tokens, locking) = crate::sql::row_lock::extract_row_locking(tokens)?;
+        let parsed = self.parse_tokens_in_impl(tokens, temp, hits, ledger_mode, resolver)?;
+        let Some(locking) = locking else {
+            return Ok(parsed);
+        };
+        match parsed {
+            ParsedSql::Statement(statement) => {
+                let locking = crate::sql::row_lock::check_row_locking(&statement, &locking)?;
+                Ok(ParsedSql::LockingSelect(Box::new(
+                    crate::sql::row_lock::LockingSelect { statement, locking },
+                )))
+            }
+            // 読み取り SELECT 以外（`setval`・データ変更 CTE など）に行ロック句は付けられない。
+            _ => Err(
+                crate::sql::allowlist::SqlSurfaceError::feature_not_supported(
+                    "row-level locking clauses are not supported for this statement",
+                ),
+            ),
+        }
+    }
+
+    /// [`Self::parse_tokens_in`] の本体（行ロック句を取り除いた後のトークン列を検証する）。
+    fn parse_tokens_in_impl(
         &self,
         tokens: Vec<crate::sql::lexer::Token>,
         temp: &crate::sql::temp_catalog::SessionTempCatalog,
@@ -5548,6 +5662,17 @@ impl EngineCore {
             return Ok(ParsedSql::Do(stmt));
         }
 
+        // SQL-38・Issue #1958: `LOCK [TABLE]` は構造検証だけで束縛する（カタログ照会は実行時。
+        // トランザクション外の判定〔`25P01`〕を名前の解決より先にする。`DECLARE` と同じ設計）。
+        // 一時表との衝突は参照の記録だけ行い（結果は使わない）、振り分け側が `0A000` で拒否する。
+        if crate::sql::lock_table::is_lock_statement(&tokens) {
+            let stmt = crate::sql::lock_table::validate_lock_tokens(&tokens)?;
+            for name in &stmt.table_names {
+                let _ = crate::sql::allowlist::TableLookup::table_exists(&storage_lookup, name)?;
+            }
+            return Ok(ParsedSql::Lock(stmt));
+        }
+
         let is_declare_statement = matches!(
             tokens.first(),
             Some(crate::sql::lexer::Token::Ident(name)) if name.eq_ignore_ascii_case("DECLARE")
@@ -5606,6 +5731,16 @@ impl EngineCore {
         if crate::sql::allowlist::is_drop_trigger_statement(&tokens) {
             let stmt = crate::sql::allowlist::validate_drop_trigger_tokens(&tokens)?;
             return Ok(ParsedSql::DropTrigger(stmt));
+        }
+        // RLS-13・Issue #2274: `DROP POLICY` も汎用 `DROP` より前に分岐する（カタログ照会なし）。
+        if crate::sql::allowlist::is_drop_policy_statement(&tokens) {
+            let stmt = crate::sql::allowlist::validate_drop_policy_tokens(&tokens)?;
+            return Ok(ParsedSql::DropPolicy(stmt));
+        }
+        // RLS-13・Issue #2274: `ALTER POLICY` も汎用 `ALTER`（`ALTER TABLE` 扱い）より前に分岐する。
+        if crate::sql::allowlist::is_alter_policy_statement(&tokens) {
+            let stmt = crate::sql::allowlist::validate_alter_policy_tokens(&tokens)?;
+            return Ok(ParsedSql::AlterPolicy(stmt));
         }
         if crate::sql::allowlist::is_drop_sequence_statement(&tokens) {
             let stmt = crate::sql::allowlist::validate_drop_sequence_tokens(&tokens)?;
@@ -5704,6 +5839,11 @@ impl EngineCore {
         if crate::sql::allowlist::is_create_trigger_statement(&tokens) {
             let stmt = crate::sql::allowlist::validate_create_trigger_tokens(&tokens)?;
             return Ok(ParsedSql::CreateTrigger(stmt));
+        }
+        // RLS-13・Issue #2274: `CREATE POLICY` も `CREATE TABLE`／`FUNCTION` 分岐へ渡さない（カタログ照会なし）。
+        if crate::sql::allowlist::is_create_policy_statement(&tokens) {
+            let stmt = crate::sql::allowlist::validate_create_policy_tokens(&tokens)?;
+            return Ok(ParsedSql::CreatePolicy(stmt));
         }
         if crate::sql::allowlist::is_create_schema_statement(&tokens) {
             let stmt = crate::sql::allowlist::validate_create_schema_tokens(&tokens)?;
@@ -7120,6 +7260,17 @@ impl EngineCore {
             ParsedSql::AlterTable(stmt) => {
                 crate::sql::ddl::require_ddl_permission(session)?;
                 crate::sql::schema_dependency::check_alter_table(stmt)?;
+                // RLS-13（Issue #2275）: 一時表が同名の永続表を隠しているとき、永続表の有効化状態を
+                // 黙って変えない（一時表の行セキュリティは未対応。fail-closed の `0A000`）。
+                if let crate::sql::allowlist::ValidatedAlterTable::RowSecurity(rs) = stmt {
+                    if session.temp_tables().contains(&rs.table_name) {
+                        return Err(
+                            crate::sql::allowlist::SqlSurfaceError::feature_not_supported(
+                                "ROW LEVEL SECURITY is not supported for temporary tables",
+                            ),
+                        );
+                    }
+                }
                 let outcome = crate::sql::ddl::execute_alter_table(
                     &self.storage,
                     ctx.tenant_id(),
@@ -7294,6 +7445,36 @@ impl EngineCore {
                 )?;
                 Ok(crate::sql::SqlOutcome::DropTrigger(outcome))
             }
+            // RLS-13（Issue #2274）: DDL 実行権限ゲート → 実行本体（表の所有者の判定はロール機構が入るまで
+            // この権限ゲートで代替する）。権限の無い主体には対象表・ポリシーの有無を問わず常に `42501`。
+            // ポリシー定義はテナント単位のため `ctx.tenant_id()` を渡す。
+            ParsedSql::CreatePolicy(stmt) => {
+                crate::sql::ddl::require_ddl_permission(session)?;
+                let outcome = crate::sql::policy_ddl::execute_create_policy(
+                    &self.storage,
+                    ctx.tenant_id(),
+                    stmt,
+                )?;
+                Ok(crate::sql::SqlOutcome::CreatePolicy(outcome))
+            }
+            ParsedSql::AlterPolicy(stmt) => {
+                crate::sql::ddl::require_ddl_permission(session)?;
+                let outcome = crate::sql::policy_ddl::execute_alter_policy(
+                    &self.storage,
+                    ctx.tenant_id(),
+                    stmt,
+                )?;
+                Ok(crate::sql::SqlOutcome::AlterPolicy(outcome))
+            }
+            ParsedSql::DropPolicy(stmt) => {
+                crate::sql::ddl::require_ddl_permission(session)?;
+                let outcome = crate::sql::policy_ddl::execute_drop_policy(
+                    &self.storage,
+                    ctx.tenant_id(),
+                    stmt,
+                )?;
+                Ok(crate::sql::SqlOutcome::DropPolicy(outcome))
+            }
             // TABLE-27（Issue #1713）: DDL 実行権限ゲート → 実行本体。SCHEMA はテナント単位のカタログ
             // のため `ctx.tenant_id()` を渡す（SEQUENCE との違い）。権限の無い主体には対象の有無を
             // 問わず常に `42501`。
@@ -7338,6 +7519,9 @@ impl EngineCore {
             ParsedSql::Statement(stmt) => {
                 self.execute_validated_in_session(ctx, session, stmt.clone())
             }
+            // SQL-38・Issue #1957: 行ロック句の取得は Issue #2230 まで未実装。ロックを取らずに素の
+            // SELECT として実行しない（fail-open にしない）。ストレージ・台帳・世代に触れる前に返す。
+            ParsedSql::LockingSelect(_) => Err(row_lock_not_supported()),
             // トランザクション文脈を持たない本エントリポイントは `BEGIN`／
             // `COMMIT`／`ROLLBACK` を受理しない（SQL-31・TASK-221。
             // トランザクション対応の実行入口は [`Self::execute_sql_in_txn`]）。
@@ -7364,6 +7548,10 @@ impl EngineCore {
                     "COPY via the extended query protocol is not supported yet",
                 ),
             ),
+            // SQL-38 (4)・Issue #1958: `LOCK` もトランザクション外は `25P01`（`DECLARE` と同じ分類）。
+            ParsedSql::Lock(_) => {
+                Err(crate::sql::allowlist::SqlSurfaceError::NoActiveSqlTransaction)
+            }
             // WIRE-15・TASK-218: カーソルは明示トランザクション内でのみ有効
             // （`sql::cursor` モジュールドキュメント参照）。トランザクション
             // 文脈を持たない本エントリポイントでは、`DECLARE` は「トランザク
@@ -7407,6 +7595,12 @@ impl EngineCore {
         sql: &str,
     ) -> Result<crate::sql::SqlOutcome, crate::sql::allowlist::SqlSurfaceError> {
         let tokens = crate::sql::lexer::tokenize_marked(sql)?;
+        // SQL-38 (4)・Issue #1958: `LOCK` はトランザクション外なら、構造検証の後・SCHEMA 解決と
+        // `search_path` ゲートより前に `25P01` にする（名前由来の `3F000`／`42P01` に化けさせない）。
+        if crate::sql::lock_table::is_lock_statement(&tokens) {
+            crate::sql::lock_table::validate_lock_structure_unresolved(&tokens)?;
+            return Err(crate::sql::allowlist::SqlSurfaceError::NoActiveSqlTransaction);
+        }
         // 定数式の畳み込み（INSERT VALUES・DEFAULT）は parse 中に行われるため、セッション
         // TimeZone を parse 区間へも張る（ゾーン無し `TIMESTAMPTZ` リテラル・`AT LOCAL`。Issue #1576）。
         let parsed = {
@@ -7501,6 +7695,14 @@ impl EngineCore {
             // `parse_sql` と同じ字句解析 → 構文検証に、一時カタログの細かいゲートを足したもの。
             let parsed = (|| {
                 let tokens = crate::sql::lexer::tokenize_marked(sql)?;
+                // SQL-38 (4)・Issue #1958: `Idle`（トランザクション外）の `LOCK` は構造検証の後、
+                // 名前解決・`search_path` ゲートより前に `25P01`（`Failed` は上で `25P02` 済み）。
+                if txn.status() == crate::sql::transaction::TransactionStatus::Idle
+                    && crate::sql::lock_table::is_lock_statement(&tokens)
+                {
+                    crate::sql::lock_table::validate_lock_structure_unresolved(&tokens)?;
+                    return Err(crate::sql::allowlist::SqlSurfaceError::NoActiveSqlTransaction);
+                }
                 let resolver = self.schema_resolver(ctx);
                 self.parse_tokens_gated(tokens, session, Some(&resolver))
             })();
@@ -7612,6 +7814,25 @@ impl EngineCore {
     /// [`Self::execute_parsed_in_txn`] の `Active` 分岐本体（SQL-31・TASK-221。
     /// エラー時のトランザクション遷移は呼び出し元が一括して行う）。
     fn execute_in_active_txn<'e>(
+        &'e self,
+        ctx: &PolicyContext,
+        session: &mut crate::sql::mode::SessionState,
+        txn: &mut crate::sql::transaction::SessionTransaction<'e>,
+        parsed: &ParsedSql,
+    ) -> Result<crate::sql::SqlOutcome, crate::sql::allowlist::SqlSurfaceError> {
+        // 明示トランザクションの writer 取得前の文は、読んだ基底表を記録する区間を張る（SQL-38・
+        // Issue #2404。`sql::read_set`）。区間は writer 取得（`ensure_writer`）で確定して止まり、
+        // 文の終わりに成功・失敗を問わず `ActiveTxn` の集合へ取り込む（失敗時は Tx ごと `Failed` になる）。
+        let read_scope = txn.read_set_scope();
+        let result = self.execute_in_active_txn_inner(ctx, session, txn, parsed);
+        if let Some(scope) = read_scope {
+            txn.absorb_read_set(scope.finish());
+        }
+        result
+    }
+
+    /// [`Self::execute_in_active_txn`] の本体（読み取り集合の区間の内側で実行される）。
+    fn execute_in_active_txn_inner<'e>(
         &'e self,
         ctx: &PolicyContext,
         session: &mut crate::sql::mode::SessionState,
@@ -7871,6 +8092,14 @@ impl EngineCore {
                     "DROP FUNCTION is not supported inside a transaction block",
                 ))
             }
+            // RLS-13（Issue #2274）: ポリシー DDL は独立した write txn で commit され ROLLBACK で取り消せない
+            // ため明示トランザクション内では行わない。権限の無いセッションには存在を問わず `42501`（fail-closed）。
+            ParsedSql::CreatePolicy(_) | ParsedSql::AlterPolicy(_) | ParsedSql::DropPolicy(_) => {
+                crate::sql::ddl::require_ddl_permission(session)?;
+                Err(SqlSurfaceError::feature_not_supported(
+                    "policy DDL is not supported inside a transaction block",
+                ))
+            }
             // SQL-67・Issue #2220: FROM 句の集合返却関数の呼び出しも、本体を同じ Tx・RLS で実行するため
             // 汎用の読み取り腕より前で受け、Tx 上で本体を実行してから外側の後処理を適用する。
             ParsedSql::Statement(Statement::BufferedView(validated))
@@ -7949,6 +8178,7 @@ impl EngineCore {
             // SQL-63・Issue #1876: 全副文・台帳記録・主クエリを共有 write txn で実行する。書いた全表へ
             // `mark_written` する（漏れると遅延 FK の COMMIT 時検査が取りこぼす。P0）。
             ParsedSql::Do(stmt) => self.execute_do_in_txn(ctx, session, txn, stmt),
+            ParsedSql::Lock(stmt) => self.execute_lock_in_active_txn(txn, stmt),
             ParsedSql::DataModifyingCte(stmt) => {
                 // 最初の書き込み文で writer を取得する（Issue #2400。待機超過は `55P03`。呼び出し元が `Failed` へ遷移）。
                 txn.ensure_writer()?;
@@ -7991,6 +8221,9 @@ impl EngineCore {
             )),
             // COPY・DDL 等、明示トランザクション内での対応外の文（対象外。
             // `docs/design/explicit-transaction.md` 参照）。
+            // SQL-38・Issue #1957: セッション入口と同じ暫定ゲート（失敗は呼び出し元がトランザクションを
+            // `Failed` へ遷移させる）。
+            ParsedSql::LockingSelect(_) => Err(row_lock_not_supported()),
             _ => Err(SqlSurfaceError::transaction_feature_not_supported(
                 "this statement is not supported inside an explicit transaction",
             )),
@@ -8691,6 +8924,15 @@ impl EngineCore {
         let _session_tz_scope = session_time_zone_scope(session);
 
         match parsed {
+            // SQL-38・Issue #1957: 行ロック句の有無で結果列は変わらない。句を除いた文と同じ
+            // RowDescription を返す（副作用なし。実行は暫定ゲートで拒否）。
+            ParsedSql::LockingSelect(locking) => self.describe_parsed_in_session_impl(
+                session,
+                &ParsedSql::Statement(locking.statement().clone()),
+                skip_vector_literal_validation,
+                dummy_equality_flags,
+                limits,
+            ),
             // TABLE-44・Issue #1684: 一時表の文は一時コアが結果列を導出する。
             ParsedSql::SessionRouted(routed) if routed.is_persistent() => {
                 routed.require_current(session)?;
@@ -8880,8 +9122,11 @@ impl EngineCore {
             ParsedSql::DropFunction(_) => Ok(None),
             ParsedSql::CreateTrigger(_) => Ok(None),
             ParsedSql::DropTrigger(_) => Ok(None),
+            ParsedSql::CreatePolicy(_) | ParsedSql::AlterPolicy(_) | ParsedSql::DropPolicy(_) => {
+                Ok(None)
+            }
             // SQL-68・Issue #2228: `DO` は行を返さない（Describe は NoData）。
-            ParsedSql::Do(_) => Ok(None),
+            ParsedSql::Do(_) | ParsedSql::Lock(_) => Ok(None),
             ParsedSql::CreateSchema(_) => Ok(None),
             ParsedSql::DropSchema(_) => Ok(None),
             ParsedSql::AlterSchema(_) => Ok(None),
@@ -12399,6 +12644,24 @@ impl EngineCore {
     }
 
     fn begin_copy_active<'e>(
+        &'e self,
+        ctx: &PolicyContext,
+        session: &crate::sql::mode::SessionState,
+        txn: &mut crate::sql::transaction::SessionTransaction<'e>,
+        sql: &str,
+    ) -> Result<CopyPlan, crate::sql::allowlist::SqlSurfaceError> {
+        // `COPY (...) TO STDOUT` も明示トランザクションの文として読んだ基底表を記録する
+        // （SQL-38・Issue #2404。[`Self::execute_in_active_txn`] と同じ区間）。
+        let read_scope = txn.read_set_scope();
+        let result = self.begin_copy_active_inner(ctx, session, txn, sql);
+        if let Some(scope) = read_scope {
+            txn.absorb_read_set(scope.finish());
+        }
+        result
+    }
+
+    /// [`Self::begin_copy_active`] の本体（読み取り集合の区間の内側で実行される）。
+    fn begin_copy_active_inner<'e>(
         &'e self,
         ctx: &PolicyContext,
         session: &crate::sql::mode::SessionState,

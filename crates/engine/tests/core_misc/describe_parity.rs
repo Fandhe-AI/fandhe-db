@@ -68,6 +68,9 @@ fn assert_describe_matches_execute(core: &EngineCore, ctx: &PolicyContext, sql: 
         | SqlOutcome::DropFunction(_)
         | SqlOutcome::CreateTrigger(_)
         | SqlOutcome::DropTrigger(_)
+        | SqlOutcome::CreatePolicy(_)
+        | SqlOutcome::AlterPolicy(_)
+        | SqlOutcome::DropPolicy(_)
         | SqlOutcome::Insert(_)
         | SqlOutcome::Truncate(_)
         | SqlOutcome::Delete(_)
@@ -97,7 +100,8 @@ fn assert_describe_matches_execute(core: &EngineCore, ctx: &PolicyContext, sql: 
         | SqlOutcome::DeclareCursor
         | SqlOutcome::Fetch(_)
         | SqlOutcome::CloseCursor
-        | SqlOutcome::Do => None,
+        | SqlOutcome::Do
+        | SqlOutcome::Lock => None,
     };
 
     assert_eq!(
@@ -552,5 +556,26 @@ fn describe_update_delete_upsert_without_returning_reports_no_columns() {
             .describe_parsed_in_session(&session, &parsed)
             .expect("describe should succeed");
         assert_eq!(described, None, "{sql} must report no columns");
+    }
+}
+
+/// RLS-13（Issue #2274）: ポリシー DDL は結果列を持たない。Describe は実行せず（DDL 権限のない
+/// セッションでも副作用なく）列なしと答える。
+#[test]
+fn describe_policy_ddl_reports_no_columns() {
+    let path = unique_db_path("describe-policy-ddl");
+    let _guard = CleanupGuard(path.clone());
+    let core = new_core_with_documents_table(&path);
+    let session = SessionState::default();
+    for sql in [
+        "CREATE POLICY p ON documents USING (body = 'x')",
+        "ALTER POLICY p ON documents RENAME TO q",
+        "DROP POLICY IF EXISTS p ON documents",
+    ] {
+        let parsed = core.parse_sql(sql).expect("parse_sql should succeed");
+        let described = core
+            .describe_parsed_in_session(&session, &parsed)
+            .expect("describe should succeed");
+        assert!(described.is_none(), "{sql}");
     }
 }

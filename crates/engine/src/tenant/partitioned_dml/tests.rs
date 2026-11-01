@@ -53,6 +53,7 @@ fn seed(storage: &Storage, tenant: &str, rows: &[(u64, &str)]) {
             })
             .expect("encode row");
             t.insert((tenant, *id), encoded.as_slice()).expect("insert");
+            crate::storage::commit_log::note_row(&txn, TABLE, tenant, Visibility::Private);
         }
     }
     crate::catalog::bump_table_generation_in_txn(&txn, TABLE).expect("bump");
@@ -676,6 +677,7 @@ fn inject_normal_ledger_entry(storage: &Storage, tenant: &str, o: &OperationId) 
         &hash(b"normal"),
     )
     .expect("record");
+    crate::storage::commit_log::note_table(&txn, TABLE);
     crate::catalog::bump_table_generation_in_txn(&txn, TABLE).expect("bump");
     crate::recovery::commit_boundary::commit(txn).expect("commit");
 }

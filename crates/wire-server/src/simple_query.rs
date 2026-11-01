@@ -987,9 +987,23 @@ pub(crate) fn map_outcome(outcome: SqlOutcome) -> OutcomeResponse {
         SqlOutcome::DropTrigger(_) => OutcomeResponse::Command {
             tag: "DROP TRIGGER".to_string(),
         },
+        // RLS-13（Issue #2274）: POLICY DDL も件数を持たない固定タグ。
+        SqlOutcome::CreatePolicy(_) => OutcomeResponse::Command {
+            tag: "CREATE POLICY".to_string(),
+        },
+        SqlOutcome::AlterPolicy(_) => OutcomeResponse::Command {
+            tag: "ALTER POLICY".to_string(),
+        },
+        SqlOutcome::DropPolicy(_) => OutcomeResponse::Command {
+            tag: "DROP POLICY".to_string(),
+        },
         // SQL-68（Issue #2228）: `DO` ブロックも件数を持たない固定タグ。
         SqlOutcome::Do => OutcomeResponse::Command {
             tag: "DO".to_string(),
+        },
+        // SQL-38（Issue #1958）: `LOCK TABLE` も件数を持たない固定タグ。
+        SqlOutcome::Lock => OutcomeResponse::Command {
+            tag: "LOCK TABLE".to_string(),
         },
         // TABLE-27（Issue #1713）: SCHEMA DDL も件数を持たない固定タグ。
         SqlOutcome::CreateSchema(_) => OutcomeResponse::Command {

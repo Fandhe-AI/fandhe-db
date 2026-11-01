@@ -212,6 +212,7 @@ mod truncate_restart_identity_tests;
 // `CREATE FUNCTION`／`DROP FUNCTION` の UDF カタログ書き込み経路（SQL-66・Issue #1920）。
 pub mod udf_ddl;
 // TRIGGER DDL（TABLE-45・Issue #1722）。
+pub mod policy_ddl;
 pub(crate) mod routine_fold;
 pub mod trigger_ddl;
 pub(crate) mod udf_load;
@@ -251,6 +252,7 @@ pub(crate) mod join;
 pub(crate) mod json_fn;
 pub(crate) mod jsonpath_fn;
 pub mod lexer;
+pub mod lock_table;
 pub mod mode;
 pub(crate) mod numeric_fn;
 pub(crate) mod order_value;
@@ -261,12 +263,15 @@ pub mod parser;
 pub mod partitioned;
 pub(crate) mod pk_point;
 pub mod plan;
+pub(crate) mod policy_expr;
 pub(crate) mod qualified_column;
+pub(crate) mod read_set;
 pub(crate) mod regex_op;
 pub mod relation;
 pub(crate) mod relation_name;
 pub mod relation_snapshot;
 pub mod returning;
+pub mod row_lock;
 pub(crate) mod scalar_index;
 pub(crate) mod scalar_plan;
 pub mod scan;
@@ -409,10 +414,22 @@ pub enum SqlOutcome {
     ///
     /// **BREAKING CHANGE**（Issue #1722）: `CreateTrigger` と同じ。
     DropTrigger(trigger_ddl::DropTriggerOutcome),
+    /// `CREATE POLICY`（RLS-13、Issue #2274）。
+    ///
+    /// **BREAKING CHANGE**（Issue #2274）: `SqlOutcome` への variant 追加。
+    CreatePolicy(policy_ddl::CreatePolicyOutcome),
+    /// `ALTER POLICY`（RLS-13、Issue #2274）。
+    AlterPolicy(policy_ddl::AlterPolicyOutcome),
+    /// `DROP POLICY`（RLS-13、Issue #2274）。
+    DropPolicy(policy_ddl::DropPolicyOutcome),
     /// `DO` ブロックの実行完了（CommandComplete タグ `DO`。SQL-68・Issue #2228）。
     ///
     /// **BREAKING CHANGE**（Issue #2228）: `SqlOutcome` への variant 追加。
     Do,
+    /// `LOCK [TABLE]` の成功（CommandComplete タグ `LOCK TABLE`。SQL-38・Issue #1958）。
+    ///
+    /// **BREAKING CHANGE**（Issue #1958）: `SqlOutcome` への variant 追加。
+    Lock,
     /// `EXPLAIN SELECT ... USING PLAN(...)`（TASK-78・SQL-6）の応答。検索本体は
     /// 実行せず、LLM クエリ展開・モード解決結果を可視化する `QUERY PLAN` 単一列の
     /// [`exec::QueryResult`]（`sql::explain` モジュールが構築）を返す。

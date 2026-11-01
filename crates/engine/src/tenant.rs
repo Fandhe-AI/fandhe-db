@@ -953,6 +953,7 @@ impl From<LedgerRecordError> for TenantWriteError {
 /// （本関数はキー生成に関与しない）。他テナントの行キーへ触れる経路を持たないため、
 /// 他テナント行の有無で分岐する処理は本関数にも存在しない（RLS-9・fail-closed）。
 fn insert_unique_row(
+    write_txn: &redb::WriteTransaction,
     table: &str,
     row_table: &mut redb::Table<'_, (&'static str, u64), &'static [u8]>,
     key: (&str, u64),
@@ -967,6 +968,8 @@ fn insert_unique_row(
     }
     // データ変更 CTE の文内変更集合（Issue #1877）へ記録する。スコープ外では何もしない。
     statement_writes::record(table, key.1);
+    // commit 記録の行の足跡（挿入は後の行だけ。SQL-38・Issue #2404）。
+    crate::storage::commit_log::note_row_bytes(write_txn, table, encoded);
     Ok(())
 }
 
@@ -1075,7 +1078,7 @@ pub(crate) fn insert_row_unchecked(
             .map_err(map_row_table_error)?;
         // 物理キーはサーバー側導出テナントで名前空間化する（TABLE-12・RLS-9）。
         let key = row_key(ctx.tenant_id(), RowId::from_legacy_id(id));
-        insert_unique_row(table, &mut row_table, key, encoded.as_slice())?;
+        insert_unique_row(write_txn, table, &mut row_table, key, encoded.as_slice())?;
         // `CHECK` 制約（Issue #906）と `PRIMARY KEY`（Issue #903）・UNIQUE 制約（Issue #905）の
         // テナント内一意性制約（いずれも TABLE-16・TASK-204）は、
         // 台帳照合（上記 `ledger::record_in_txn`）と行の書き込み（`insert_unique_row`）が
@@ -1266,7 +1269,7 @@ pub(crate) fn insert_rows_unchecked(
                     "batch encode arena range out of bounds".to_string(),
                 ))
             })?;
-            insert_unique_row(table, &mut row_table, key, encoded)?;
+            insert_unique_row(write_txn, table, &mut row_table, key, encoded)?;
         }
         drop(row_table);
         // `PRIMARY KEY`（Issue #903）・UNIQUE 制約（Issue #905。TABLE-16・TASK-204）のテナント内一意性制約検査
@@ -2083,7 +2086,7 @@ fn insert_typed_row_impl(
             .map_err(map_row_table_error)?;
         let key = row_key(ctx.tenant_id(), row_id);
         let encoded = encode_row(&row)?;
-        insert_unique_row(table, &mut row_table, key, encoded.as_slice())?;
+        insert_unique_row(write_txn, table, &mut row_table, key, encoded.as_slice())?;
         drop(row_table);
         // `PRIMARY KEY`（Issue #903）・UNIQUE 制約（Issue #905。TABLE-16・TASK-204）のテナント内一意性制約検査
         // （[`insert_row_unchecked`] と同じ判定順序。`constraint.rs` モジュール
@@ -2662,7 +2665,7 @@ pub(crate) fn insert_typed_rows_unchecked(
                 })?;
                 let key = row_key(ctx.tenant_id(), row_id);
                 let encoded = encode_row(&row)?;
-                insert_unique_row(table, &mut row_table, key, encoded.as_slice())?;
+                insert_unique_row(write_txn, table, &mut row_table, key, encoded.as_slice())?;
             }
             drop(row_table);
             row_ids
@@ -3660,6 +3663,13 @@ fn upsert_typed_rows_impl(
                             row_table
                                 .insert(key, encoded.as_slice())
                                 .map_err(CatalogError::from)?;
+                            // commit 記録の行の足跡（SQL-38・Issue #2404）。UPSERT の更新側。可視性は
+                            // 更新前後で不変（上の `existing.visibility`）のため更新後の行で前後を表す。
+                            crate::storage::commit_log::note_row_bytes(
+                                write_txn,
+                                table,
+                                encoded.as_slice(),
+                            );
                             // `RETURNING`（Issue #1182）: 更新後の値を投影する。
                             if let Some(project) = project.as_mut() {
                                 let values = captured_values_from_parts(
@@ -3711,7 +3721,7 @@ fn upsert_typed_rows_impl(
                         metadata: &metadata,
                     };
                     let encoded = encode_row(&row)?;
-                    insert_unique_row(table, &mut row_table, key, encoded.as_slice())?;
+                    insert_unique_row(write_txn, table, &mut row_table, key, encoded.as_slice())?;
                     // `RETURNING`（Issue #1182）: 挿入した値を投影する。
                     if let Some(project) = project.as_mut() {
                         let values =
@@ -3888,9 +3898,16 @@ pub(crate) fn update_row_unchecked(
             let key = row_key(ctx.tenant_id(), RowId::from_legacy_id(id));
             let owns_existing = match row_table.get(&key).map_err(CatalogError::from)? {
                 Some(guard) => {
-                    let (existing_tenant, _existing_visibility) =
+                    let (existing_tenant, existing_visibility) =
                         decode_row_tenant_and_visibility(guard.value())?;
                     if ctx.is_owner(existing_tenant) {
+                        // commit 記録の行の足跡: 上書きされる前の行（SQL-38・Issue #2404）。
+                        crate::storage::commit_log::note_row(
+                            write_txn,
+                            table,
+                            existing_tenant,
+                            existing_visibility,
+                        );
                         // 上書きする前の全列値を ON UPDATE 連鎖の pre-image として
                         // 積む（Issue #1076）。所有者判定が確定した後にのみフル
                         // デコードを試みる（`update_row_columns_unchecked` と同じ
@@ -3930,6 +3947,8 @@ pub(crate) fn update_row_unchecked(
                 .insert(key, encoded.as_slice())
                 .map_err(CatalogError::from)?;
             statement_writes::record(table, id);
+            // commit 記録の行の足跡: 書き込んだ後の行。
+            crate::storage::commit_log::note_row_bytes(write_txn, table, encoded.as_slice());
         }
         // `PRIMARY KEY`（Issue #903）・UNIQUE 制約（Issue #905。TABLE-16・TASK-204）のテナント内一意性制約検査
         // （[`insert_row_unchecked`] と同じ判定順序。`constraint.rs` モジュール
@@ -5039,6 +5058,10 @@ fn update_row_columns_impl(
                     &plan,
                     &writes,
                 )?;
+                // commit 記録（SQL-38・Issue #2404）: 0 行でも世代を進める経路のため表を記録する。
+                if done.applied == 0 {
+                    crate::storage::commit_log::note_table(write_txn, table);
+                }
                 crate::catalog::bump_table_generation_in_txn(write_txn, table)?;
                 return Ok((done.applied, TxnEffect::Wrote));
             }
@@ -5157,6 +5180,13 @@ fn update_row_columns_impl(
                         .insert(key, encoded.as_slice())
                         .map_err(CatalogError::from)?;
                     statement_writes::record(table, id);
+                    // commit 記録の行の足跡（SQL-38・Issue #2404）。可視性は更新前後で不変
+                    // （上の `visibility = row.visibility`）のため、更新後の行 1 つで前後を表す。
+                    crate::storage::commit_log::note_row_bytes(
+                        write_txn,
+                        table,
+                        encoded.as_slice(),
+                    );
                     // `RETURNING`（Issue #1182）: 書いた値（更新後）そのものを捕捉する。
                     if project.is_some() {
                         captured_row = Some(CapturedRow {
@@ -5215,6 +5245,10 @@ fn update_row_columns_impl(
         // `project` と同じ commit 成功境界。`Err` は `write_txn` の abort）。
         if let (Some(project), Some(captured)) = (project.as_mut(), captured_row.as_ref()) {
             project(captured)?;
+        }
+        // commit 記録（SQL-38・Issue #2404）: 0 行でも世代を進める経路のため表を記録する。
+        if rows_affected == 0 {
+            crate::storage::commit_log::note_table(write_txn, table);
         }
         crate::catalog::bump_table_generation_in_txn(write_txn, table)?;
         Ok((rows_affected, TxnEffect::Wrote))
@@ -5558,6 +5592,10 @@ fn delete_row_impl(
                     write_txn, &target, table, ctx, &schema, candidates, &plan, &writes,
                 )?;
                 if done.applied > 0 || done.trigger_wrote {
+                    // commit 記録（SQL-38・Issue #2404）: 0 行でも世代を進める経路のため表を記録する。
+                    if done.applied == 0 {
+                        crate::storage::commit_log::note_table(write_txn, table);
+                    }
                     crate::catalog::bump_table_generation_in_txn(write_txn, table)?;
                 }
                 let outcome = if done.applied > 0 {
@@ -5585,6 +5623,15 @@ fn delete_row_impl(
                     let owns = ctx.is_owner(existing_tenant)
                         && (scope == DeleteScope::Owned
                             || ctx.is_visible(existing_tenant, existing_visibility));
+                    if owns {
+                        // commit 記録の行の足跡: 削除される前の行（SQL-38・Issue #2404）。
+                        crate::storage::commit_log::note_row(
+                            write_txn,
+                            table,
+                            existing_tenant,
+                            existing_visibility,
+                        );
+                    }
                     if owns && (capture.is_some() || needs_fk_removed_pre_image) {
                         // `remove` の直前・同一 `guard` 生存期間内にフルデコードする
                         // （削除後では対象バイト列が失われるため）。物理行フォーマット
@@ -6307,6 +6354,10 @@ fn delete_rows_where_impl<E>(
                 &trigger_writes,
             )?;
             if done.applied > 0 || done.trigger_wrote {
+                // commit 記録（SQL-38・Issue #2404）: 0 行でも世代を進める経路のため表を記録する。
+                if done.applied == 0 {
+                    crate::storage::commit_log::note_table(write_txn, table);
+                }
                 crate::catalog::bump_table_generation_in_txn(write_txn, table)
                     .map_err(dml_write_err)?;
             }
@@ -6610,6 +6661,10 @@ fn update_rows_where_impl<E>(
                 &trigger_writes,
             )?;
             if done.applied > 0 || done.trigger_wrote {
+                // commit 記録（SQL-38・Issue #2404）: 0 行でも世代を進める経路のため表を記録する。
+                if done.applied == 0 {
+                    crate::storage::commit_log::note_table(write_txn, table);
+                }
                 crate::catalog::bump_table_generation_in_txn(write_txn, table)
                     .map_err(dml_write_err)?;
             }
@@ -6796,6 +6851,10 @@ pub(crate) fn update_rows_joined_unchecked<E>(
                 &trigger_writes,
             )?;
             if done.applied > 0 || done.trigger_wrote {
+                // commit 記録（SQL-38・Issue #2404）: 0 行でも世代を進める経路のため表を記録する。
+                if done.applied == 0 {
+                    crate::storage::commit_log::note_table(write_txn, table);
+                }
                 crate::catalog::bump_table_generation_in_txn(write_txn, table)
                     .map_err(dml_write_err)?;
             }
@@ -6879,6 +6938,10 @@ fn apply_predicate_delete_in_txn<E>(
                 .remove(&key)
                 .map_err(|e| dml_write_err(CatalogError::from(e)))?;
             statement_writes::record(table, *id);
+            // commit 記録の行の足跡: 削除される前の行（SQL-38・Issue #2404）。
+            if let Some(guard) = removed_guard.as_ref() {
+                crate::storage::commit_log::note_row_bytes(write_txn, table, guard.value());
+            }
             if needs_fk_removed_pre_image || project.is_some() {
                 if let Some(guard) = removed_guard {
                     let row = crate::storage::decode_row(RowId::from_legacy_id(*id), guard.value())
@@ -7063,6 +7126,9 @@ fn apply_predicate_update_in_txn<E>(
                 .insert(key, encoded.as_slice())
                 .map_err(|e| dml_write_err(CatalogError::from(e)))?;
             statement_writes::record(table, *id);
+            // commit 記録の行の足跡（SQL-38・Issue #2404）。可視性は更新前後で不変
+            // （上の `visibility = existing.visibility`）のため、更新後の行 1 つで前後を表す。
+            crate::storage::commit_log::note_row_bytes(write_txn, table, encoded.as_slice());
             // `RETURNING`（Issue #1182）: 書いた値（更新後）を行ごとに投影する。
             if let Some(project) = project.as_mut() {
                 let values = captured_values_from_parts(schema, embedding_value, &metadata)
@@ -7311,8 +7377,12 @@ pub(crate) fn truncate_tables_unchecked(
                         .map_err(map_row_table_error)?;
                     let start = std::ops::Bound::Included((tenant, 0u64));
                     let end = std::ops::Bound::Included((tenant, u64::MAX));
+                    // commit 記録（SQL-38・Issue #2404）: 0 行でも表世代を進めるため表を記録し、
                     row_table
-                        .retain_in((start, end), |_, _| false)
+                        .retain_in((start, end), |_, row_bytes| {
+                            crate::storage::commit_log::note_row_bytes(write_txn, table, row_bytes);
+                            false
+                        })
                         .map_err(CatalogError::from)?;
                     drop(row_table);
                     // 永続一意索引（TABLE-16・TASK-204、Issue #1070）のテナント範囲をクリアする
@@ -7341,6 +7411,8 @@ pub(crate) fn truncate_tables_unchecked(
                         None,
                         target.fk_check_mode(),
                     )?;
+                    // commit 記録（SQL-38・Issue #2404）: 0 行でも世代を進める経路のため表を記録する。
+                    crate::storage::commit_log::note_table(write_txn, table);
                     crate::catalog::bump_table_generation_in_txn(write_txn, table)?;
                 }
 
@@ -7698,6 +7770,10 @@ pub(crate) fn replace_typed_rows_by_text_key(
                 let removed_guard = row_table
                     .remove(&(tenant, *id))
                     .map_err(CatalogError::from)?;
+                // commit 記録の行の足跡: 置換で消える前の行（SQL-38・Issue #2404）。
+                if let Some(guard) = removed_guard.as_ref() {
+                    crate::storage::commit_log::note_row_bytes(write_txn, table, guard.value());
+                }
                 if needs_fk_removed_pre_image {
                     if let Some(guard) = removed_guard {
                         let row =
@@ -7784,6 +7860,8 @@ pub(crate) fn replace_typed_rows_by_text_key(
                 row_table
                     .insert(key, scratch.as_slice())
                     .map_err(CatalogError::from)?;
+                // commit 記録の行の足跡: 書き込んだ後の行。
+                crate::storage::commit_log::note_row_bytes(write_txn, table, scratch.as_slice());
                 if first_id.is_none() {
                     first_id = Some(id);
                 }
@@ -9149,6 +9227,7 @@ mod tests {
                     .expect("seed row without a VECTOR column");
             }
         }
+        crate::storage::commit_log::note_ddl(&write_txn, "notes");
         crate::catalog::bump_table_generation_in_txn(&write_txn, "notes")
             .expect("bump table generation for seeded rows");
         crate::recovery::commit_boundary::commit(write_txn).expect("commit seed txn");
@@ -10130,6 +10209,7 @@ mod tests {
                     .insert(key, corrupted)
                     .expect("overwrite with corrupted body");
             }
+            crate::storage::commit_log::note_ddl(&write_txn, "docs");
             crate::catalog::bump_table_generation_in_txn(&write_txn, "docs")
                 .expect("bump generation");
             crate::recovery::commit_boundary::commit(write_txn).expect("commit corruption");
@@ -11200,6 +11280,7 @@ mod tests {
             assert!(crate::storage::decode_row(RowId::from_legacy_id(id), corrupted).is_err());
             t.insert(key, corrupted).expect("overwrite");
         }
+        crate::storage::commit_log::note_ddl(&write_txn, "docs");
         crate::catalog::bump_table_generation_in_txn(&write_txn, "docs").expect("bump generation");
         crate::recovery::commit_boundary::commit(write_txn).expect("commit corruption");
     }
@@ -11567,6 +11648,7 @@ mod tests {
             write_txn
                 .delete_table(crate::catalog::user_uniq_table_def(&name))
                 .expect("delete index table");
+            crate::storage::commit_log::note_ddl(&write_txn, "docs");
             crate::catalog::bump_table_generation_in_txn(&write_txn, "docs")
                 .expect("bump generation");
             crate::recovery::commit_boundary::commit(write_txn).expect("commit");
