@@ -346,6 +346,8 @@ Failed { session_at_begin: SessionState, expired: bool } }`）。`ActiveTxn` は
   - `ensure_writer` は 1a-3 の「gate 取得 → permit 保持のまま判定 → 格納」の挿入点で、#2405 が
     取得と格納の間に `40001` 判定を入れる。
   - 暗黙トランザクション（WIRE-16）は従来どおり開始時に writer を取る（スナップショットは取得後に開く。#2401）。
+  - 取得の前後の回帰（read-your-writes・COMMIT までの隔離・ROLLBACK 後のキャッシュ非汚染・ファイル形
+    `INSERT`・`USING PLAN`・`EXPLAIN`・`COPY FROM`・`setval`）は #2402 のテストで固定済み（SQL-19・SQL-31）。
   - **読み取りの意味（#2403 で結線済み）**: 読み取り源は `SessionTransaction::read_source` の三分岐で選ぶ。
     writer 取得前は `read_snapshot`（`BEGIN` 時点）、取得後で dirty ありは共有 write txn（取得時点の
     最新＋自分の変更）、取得後で変更なしは文ごとの確定状態（permit 保持中は取得時点と一致）。
@@ -357,6 +359,11 @@ Failed { session_at_begin: SessionState, expired: bool } }`）。`ActiveTxn` は
     既存経路のまま文ごとの確定状態を見る（`BEGIN` 時点への一般化は辞書スナップショットの構築変更を伴い
     #2402 と競合するため見送り）。読みが `BEGIN` 時点より新しい側へずれるだけで、`40001` 判定には
     偽陽性側にしか倒れず偽陰性は生まない。
+  - **検証のカタログ引き先（#2403 レビュー対応）**: 明示 Tx 内の `DECLARE` と `COPY TO` の検証は、実行と同じ
+    読み取り源（`BEGIN` 時点のスナップショット／共有 write txn／確定状態）でカタログを引く。
+    `COPY FROM` は書き込みのため最新のカタログで検証する。文の字句・構文解析の入口（`parse_tokens_gated`
+    系。Parse メッセージ等 Tx 状態を持たない入口と共有）は今も最新の確定カタログで解決し、実行段が
+    スナップショットのスキーマで再束縛する。食い違いは `42P01` 等の fail-closed になる（誤読はしない）。
   - DoS 面: `BEGIN` だけで黙る接続が単一ライタを占有できなくなる。一方、読み取りだけの Tx は
     `ReadTransaction` を最大 `max_duration` 保持し、その間は redb がページを回収できない（有界。
     期限切れ処理がスナップショットを解放する）。

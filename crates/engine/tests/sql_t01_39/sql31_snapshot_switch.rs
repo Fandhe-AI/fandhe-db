@@ -207,6 +207,55 @@ fn reads_before_writer_acquire_keep_begin_time_snapshot() {
     assert_eq!(latest.len(), 3);
 }
 
+/// 同時 DDL: writer 取得前の `DECLARE`・`COPY TO` の検証は `BEGIN` 時点のカタログで解決する。
+/// `BEGIN` 後に他セッションが DROP した表は読め（スナップショットに存在する）、`BEGIN` 後に
+/// 作られた表は `42P01` になる（実行の読み取り源とカタログの引き先が食い違わない）。
+#[test]
+fn declare_and_copy_to_validate_against_begin_snapshot_catalog() {
+    let (core, _g) = new_core("sql31-snap-ddl");
+    let sys = ctx("sys");
+    ok(&core, &sys, "CREATE TABLE docs3 (n BIGINT)");
+    seed_docs(&core, "tenant-a");
+    ok(
+        &core,
+        &ctx("tenant-a"),
+        "INSERT INTO docs3 (id, n) VALUES (1, 10) USING OPERATION_ID 'd3-ins'",
+    );
+    let mut a = Tx::new(&core, "tenant-a");
+    a.ok("BEGIN");
+
+    ok(&core, &sys, "DROP TABLE docs3");
+    ok(&core, &sys, "CREATE TABLE docs4 (n BIGINT)");
+
+    a.ok("DECLARE c CURSOR FOR SELECT id, n FROM docs3 LIMIT 100");
+    match a.ok("FETCH 100 FROM c") {
+        SqlOutcome::Fetch(r) => assert_eq!(r.rows.len(), 1),
+        other => panic!("unexpected {other:?}"),
+    }
+    let plan = core
+        .begin_copy_in_txn(
+            &a.ctx,
+            &a.session,
+            &mut a.txn,
+            "COPY (SELECT id, n FROM docs3 LIMIT 100) TO STDOUT",
+        )
+        .expect("copy to of a table dropped after BEGIN");
+    match plan {
+        CopyPlan::To(_, result, _) => assert_eq!(result.rows.len(), 1),
+        other => panic!("unexpected {other:?}"),
+    }
+
+    let err = core
+        .execute_sql_in_txn(
+            &a.ctx,
+            &mut a.session,
+            &mut a.txn,
+            "DECLARE d CURSOR FOR SELECT id, n FROM docs4 LIMIT 100",
+        )
+        .expect_err("table created after BEGIN is not in the snapshot");
+    assert_eq!(err.wire_code(), "42P01", "{err:?}");
+}
+
 /// テナント境界: 取得前の読み取りに他テナントの行は現れず、他テナントの書き込みも待たされない。
 #[test]
 fn begin_snapshot_reads_do_not_cross_tenants() {

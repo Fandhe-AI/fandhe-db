@@ -5181,18 +5181,32 @@ impl TxnViewLookup<'_, '_> {
 /// 1 つの read スナップショットを読む [`TableLookup`]（[`Storage::with_view_write_snapshot`] 専用）。
 /// `impl TableLookup for Storage` と同じ写像だが、呼び出しごとに新しい read txn を開かず、
 /// 全照会が同一スナップショットを見る（ビュー書き込みの書き換えの TOCTOU 回避）。
-pub(crate) struct ViewWriteSnapshot<'a> {
-    read_txn: &'a redb::ReadTransaction,
+///
+/// 読み取り源は [`crate::storage::read_source::ReadSource`] で総称化してあり、明示トランザクション内の文の検証
+/// （`DECLARE`・`COPY TO`。Issue #2403）が `BEGIN` 時点のスナップショットまたは共有 write txn を
+/// カタログの引き先にするためにも使う（検証の解決先と実行の読み取り源を一致させる）。
+pub(crate) struct ViewWriteSnapshot<
+    'a,
+    R: crate::storage::read_source::ReadSource = redb::ReadTransaction,
+> {
+    read_txn: &'a R,
 }
 
-impl ViewWriteSnapshot<'_> {
+impl<'a, R: crate::storage::read_source::ReadSource> ViewWriteSnapshot<'a, R> {
+    /// 与えた読み取り源を引き先にするカタログ照会を作る。
+    pub(crate) fn over(read_txn: &'a R) -> Self {
+        Self { read_txn }
+    }
+}
+
+impl<R: crate::storage::read_source::ReadSource> ViewWriteSnapshot<'_, R> {
     /// 同一スナップショットから表スキーマを読む（束縛用）。
     pub(crate) fn table_schema(&self, name: &str) -> Result<TableSchema> {
         get_table_schema_in_txn(self.read_txn, name)
     }
 }
 
-impl TableLookup for ViewWriteSnapshot<'_> {
+impl<R: crate::storage::read_source::ReadSource> TableLookup for ViewWriteSnapshot<'_, R> {
     fn table_exists(&self, name: &str) -> std::result::Result<bool, SqlSurfaceError> {
         match self.table_schema(name) {
             Ok(_) => Ok(true),
@@ -5207,10 +5221,10 @@ impl TableLookup for ViewWriteSnapshot<'_> {
             Err(redb::TableError::TableDoesNotExist(_)) => return Ok(None),
             Err(e) => return Err(table_lookup_error(CatalogError::from(e))),
         };
-        match table
+        let found = table
             .get(name)
-            .map_err(|e| table_lookup_error(CatalogError::from(e)))?
-        {
+            .map_err(|e| table_lookup_error(CatalogError::from(e)))?;
+        match found {
             Some(guard) => decode_view_def(guard.value())
                 .map(Some)
                 .map_err(table_lookup_error),

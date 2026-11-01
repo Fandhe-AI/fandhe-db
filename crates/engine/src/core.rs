@@ -91,6 +91,9 @@ mod dml_subquery_exec;
 mod cte_join_budget_tests;
 #[cfg(test)]
 mod deferred_writer_tests;
+// writer 遅延取得の前後の回帰固定（Issue #2402。ポインタ: SQL-19・SQL-31・TASK-333）。
+#[cfg(test)]
+mod deferred_writer_regression_tests;
 mod dml_join_exec;
 #[cfg(test)]
 mod dml_join_exec_tests;
@@ -8166,11 +8169,27 @@ impl EngineCore {
                 // （基底テーブル＋ビュー由来述語。RLS は後段の実行経路が参照
                 // セッション自身の `ctx` で暗黙適用する）が適用される。
                 // `table` はビュー展開後の基底テーブル名。
-                let (inner, _table) = crate::sql::cursor::validate_declare_inner(
-                    query,
-                    &self.storage,
-                    self.nesting_limits,
-                )?;
+                // 検証のカタログ引き先は実行の読み取り源（`BEGIN` 時点のスナップショット／共有
+                // write txn／確定状態）と一致させる（Issue #2403。同時 DDL でも検証と実行が食い違わない）。
+                let (inner, _table) = match txn.read_source()? {
+                    TxnReadSource::BeginSnapshot(snap) => {
+                        crate::sql::cursor::validate_declare_inner(
+                            query,
+                            &crate::catalog::ViewWriteSnapshot::over(snap),
+                            self.nesting_limits,
+                        )?
+                    }
+                    TxnReadSource::Writer(w) => crate::sql::cursor::validate_declare_inner(
+                        query,
+                        &crate::catalog::ViewWriteSnapshot::over(w),
+                        self.nesting_limits,
+                    )?,
+                    TxnReadSource::Committed => crate::sql::cursor::validate_declare_inner(
+                        query,
+                        &self.storage,
+                        self.nesting_limits,
+                    )?,
+                };
                 let registry = txn.cursors_mut().ok_or_else(|| SqlSurfaceError::Internal {
                     detail: "internal error".to_string(),
                 })?;
@@ -12510,11 +12529,39 @@ impl EngineCore {
         let resolver = self.schema_resolver(ctx);
         let copy_tokens =
             crate::sql::relation_name::tokenize_resolved_with(sql, false, Some(&resolver))?;
-        let stmt = crate::sql::allowlist::validate_copy_tokens(
-            &copy_tokens,
-            &self.storage,
-            self.ledger_mode,
-        )
+        // 読み取りの `COPY TO` は実行の読み取り源と同じ時点のカタログで検証する（Issue #2403。
+        // 同時 DDL で検証と実行が食い違わない）。`COPY FROM`（書き込み）は従来どおり最新のカタログ。
+        let stmt = if crate::sql::allowlist::is_copy_to_statement(&copy_tokens) {
+            match txn.read_source()? {
+                crate::sql::transaction::TxnReadSource::BeginSnapshot(snap) => {
+                    crate::sql::allowlist::validate_copy_tokens(
+                        &copy_tokens,
+                        &crate::catalog::ViewWriteSnapshot::over(snap),
+                        self.ledger_mode,
+                    )
+                }
+                crate::sql::transaction::TxnReadSource::Writer(w) => {
+                    crate::sql::allowlist::validate_copy_tokens(
+                        &copy_tokens,
+                        &crate::catalog::ViewWriteSnapshot::over(w),
+                        self.ledger_mode,
+                    )
+                }
+                crate::sql::transaction::TxnReadSource::Committed => {
+                    crate::sql::allowlist::validate_copy_tokens(
+                        &copy_tokens,
+                        &self.storage,
+                        self.ledger_mode,
+                    )
+                }
+            }
+        } else {
+            crate::sql::allowlist::validate_copy_tokens(
+                &copy_tokens,
+                &self.storage,
+                self.ledger_mode,
+            )
+        }
         .map_err(|e| self.reclassify_matview_write_error(e))?;
         if let crate::sql::allowlist::CopyStatement::To(v) = &stmt {
             // 通常の読み取り文と同じ文実行前チェック（文数・持続時間の上限。

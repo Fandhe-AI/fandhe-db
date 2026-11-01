@@ -29051,6 +29051,18 @@ pub fn validate_copy(
 /// （`core.rs::execute_sql_in_session` が先頭トークン判定のために既に
 /// トークナイズ済みの場合）が同一 SQL 文字列を再トークナイズせずに済む
 /// （`validate_insert_tokens`・Issue #485 と同じ設計）。
+/// 解決済みの `COPY` 文のトークン列が `COPY ... TO`（読み取り）形かを返す（Issue #2403）。
+/// 明示トランザクション内で、読み取りの `COPY TO` だけを `BEGIN` 時点のカタログで検証し、
+/// `COPY FROM`（書き込み）は最新のカタログで検証するための振り分けに使う。
+pub(crate) fn is_copy_to_statement(tokens: &[Token]) -> bool {
+    match tokens.split_first() {
+        Some((_, rest)) => {
+            matches!(rest.first(), Some(Token::Punct('('))) || is_copy_table_to_form(rest)
+        }
+        None => false,
+    }
+}
+
 pub(crate) fn validate_copy_tokens(
     tokens: &[Token],
     lookup: &impl TableLookup,
