@@ -1767,6 +1767,8 @@ pub enum ParsedSql {
     /// [`EngineCore::execute_sql_in_txn`]／[`EngineCore::execute_parsed_in_txn`]）。
     /// `BEGIN` のアクセスモード修飾子を含む検証結果（Issue #1932。破壊的変更: 中身を `TxnControl` から変更）。
     Transaction(crate::sql::transaction::ValidatedTxnControl),
+    /// `SET TRANSACTION`／`SET SESSION CHARACTERISTICS AS TRANSACTION`（Issue #1939）。
+    SetTransaction(crate::sql::transaction::ValidatedSetTransaction),
     /// `DROP TABLE [IF EXISTS] <table> [, <table>]*`（SQL-23・TASK-203、Issue #902。複数指定は
     /// TABLE-37 (1)・Issue #1639）。DDL 実行権限ゲート
     /// （`sql::ddl::require_ddl_permission`）の判定は
@@ -2094,6 +2096,7 @@ fn statement_clock_scope(
         | ParsedSql::DeleteUsing(_) => true,
         ParsedSql::Truncate(_)
         | ParsedSql::Transaction(_)
+        | ParsedSql::SetTransaction(_)
         | ParsedSql::DropTable(_)
         | ParsedSql::CreateTable(_)
         | ParsedSql::CreateTableAs(_)
@@ -2172,6 +2175,7 @@ fn insert_sequence_scope(
         | ParsedSql::ViewDelete(_)
         | ParsedSql::ViewUpdate(_)
         | ParsedSql::Transaction(_)
+        | ParsedSql::SetTransaction(_)
         | ParsedSql::DropTable(_)
         | ParsedSql::CreateTable(_)
         | ParsedSql::CreateTableAs(_)
@@ -2247,6 +2251,7 @@ fn insert_default_clock_scope(
         | ParsedSql::ViewDelete(_)
         | ParsedSql::ViewUpdate(_)
         | ParsedSql::Transaction(_)
+        | ParsedSql::SetTransaction(_)
         | ParsedSql::DropTable(_)
         | ParsedSql::CreateTable(_)
         | ParsedSql::CreateTableAs(_)
@@ -4408,6 +4413,7 @@ impl EngineCore {
                     | crate::sql::SqlOutcome::AlterSequence(_)
                     | crate::sql::SqlOutcome::Begin
                     | crate::sql::SqlOutcome::StartTransaction
+                    | crate::sql::SqlOutcome::SetTransaction
                     | crate::sql::SqlOutcome::Commit
                     | crate::sql::SqlOutcome::Rollback
                     | crate::sql::SqlOutcome::DeclareCursor
@@ -4476,6 +4482,7 @@ impl EngineCore {
                     | crate::sql::SqlOutcome::AlterSequence(_)
                     | crate::sql::SqlOutcome::Begin
                     | crate::sql::SqlOutcome::StartTransaction
+                    | crate::sql::SqlOutcome::SetTransaction
                     | crate::sql::SqlOutcome::Commit
                     | crate::sql::SqlOutcome::Rollback
                     | crate::sql::SqlOutcome::DeclareCursor
@@ -4541,6 +4548,7 @@ impl EngineCore {
                     | crate::sql::SqlOutcome::AlterSequence(_)
                     | crate::sql::SqlOutcome::Begin
                     | crate::sql::SqlOutcome::StartTransaction
+                    | crate::sql::SqlOutcome::SetTransaction
                     | crate::sql::SqlOutcome::Commit
                     | crate::sql::SqlOutcome::Rollback
                     | crate::sql::SqlOutcome::DeclareCursor
@@ -4613,6 +4621,7 @@ impl EngineCore {
                     | crate::sql::SqlOutcome::AlterSequence(_)
                     | crate::sql::SqlOutcome::Begin
                     | crate::sql::SqlOutcome::StartTransaction
+                    | crate::sql::SqlOutcome::SetTransaction
                     | crate::sql::SqlOutcome::Commit
                     | crate::sql::SqlOutcome::Rollback
                     | crate::sql::SqlOutcome::DeclareCursor
@@ -4704,6 +4713,7 @@ impl EngineCore {
                     | crate::sql::SqlOutcome::AlterSequence(_)
                     | crate::sql::SqlOutcome::Begin
                     | crate::sql::SqlOutcome::StartTransaction
+                    | crate::sql::SqlOutcome::SetTransaction
                     | crate::sql::SqlOutcome::Commit
                     | crate::sql::SqlOutcome::Rollback
                     | crate::sql::SqlOutcome::DeclareCursor
@@ -5255,7 +5265,8 @@ impl EngineCore {
         // `public.<一時表の名前>` は永続側の関係を指すため、裸の名前へ解決すると一時表に化ける。
         // 解決より前に拒否する（TABLE-27・Issue #1714。fail-closed）。
         crate::sql::temp_catalog::reject_public_qualified_temp(&tokens, temp)?;
-        let txn_control_head = crate::sql::transaction::is_transaction_control_head(&tokens);
+        let txn_control_head = crate::sql::transaction::is_transaction_control_head(&tokens)
+            || crate::sql::transaction::is_set_transaction_head(&tokens);
         // TABLE-44・Issue #1683: 次の 3 種は一時表の行を読み書きしないためトークン走査を飛ばす。
         // `CREATE [TEMP] TABLE` は列定義だけで（FOREIGN KEY の参照先が一時表の名前なら実行段が
         // `42P16`／`0A000`）、`DROP TABLE` は実行段が自セッションの一時カタログで名前を解決する。
@@ -5343,6 +5354,7 @@ impl EngineCore {
             || matches!(
                 parsed,
                 ParsedSql::Transaction(_)
+                    | ParsedSql::SetTransaction(_)
                     | ParsedSql::CreateTable(_)
                     | ParsedSql::CreateTempTable(_)
                     | ParsedSql::DropTable(_)
@@ -5570,6 +5582,12 @@ impl EngineCore {
         if txn_control_head {
             let ctrl = crate::sql::transaction::validate_transaction_control_tokens(&tokens)?;
             return Ok(ParsedSql::Transaction(ctrl));
+        }
+        // Issue #1939: `SET TRANSACTION`／`SET SESSION CHARACTERISTICS` は他の `SET`（TimeZone 等）
+        // の頭判定より前に結論を出す（`SET SESSION <x>` を別の SET として食わせない）。
+        if crate::sql::transaction::is_set_transaction_head(&tokens) {
+            let v = crate::sql::transaction::validate_set_transaction_tokens(&tokens)?;
+            return Ok(ParsedSql::SetTransaction(v));
         }
 
         // TABLE-24・Issue #1691: `SELECT setval(...)`／`SELECT lastval()` は専用の検証器で受理するか
@@ -7862,9 +7880,11 @@ impl EngineCore {
             // （`0A000`）は明示トランザクション対応の実行入口
             // （[`Self::execute_parsed_in_txn`]・`Active` 中に未対応の文を
             // 拒否する場合）専用のまま維持する。
-            ParsedSql::Transaction(_) => Err(crate::sql::allowlist::SqlSurfaceError::unsupported(
-                "transaction control statements are not supported by this entry point",
-            )),
+            ParsedSql::Transaction(_) | ParsedSql::SetTransaction(_) => {
+                Err(crate::sql::allowlist::SqlSurfaceError::unsupported(
+                    "transaction control statements are not supported by this entry point",
+                ))
+            }
             // Issue #1759・WIRE-21 (1): 拡張クエリの `COPY` は Parse／Bind／Describe まで受理し、
             // Execute は wire-server が先に横取りして `begin_copy*` へ結線する（Issue #1760）ため
             // 通常は到達しない。他の呼び出し元への防御的な fail-closed（`0A000`・副作用なし。
@@ -8104,21 +8124,43 @@ impl EngineCore {
                 return self.execute_parsed_in_txn_inner(ctx, session, txn, routed.inner());
             }
         }
-        if let ParsedSql::Transaction(ctrl) = parsed {
-            return match ctrl.control {
-                TxnControl::Begin => {
-                    txn.begin_with_modes(
-                        &self.storage,
-                        session,
-                        ctrl.access_mode
-                            .unwrap_or(crate::sql::transaction::TxnAccessMode::ReadWrite),
-                        ctrl.isolation_level,
-                    )?;
-                    Ok(crate::sql::SqlOutcome::Begin)
+        if let ParsedSql::SetTransaction(v) = parsed {
+            use crate::sql::transaction::SetTxnScope;
+            return match v.scope {
+                SetTxnScope::Transaction => {
+                    txn.set_transaction_modes(v.access_mode, v.isolation_level)?;
+                    Ok(crate::sql::SqlOutcome::SetTransaction)
                 }
-                TxnControl::StartTransaction => {
-                    txn.begin(&self.storage, session)?;
-                    Ok(crate::sql::SqlOutcome::StartTransaction)
+                SetTxnScope::SessionDefault => {
+                    match txn.status() {
+                        TransactionStatus::Failed => return Err(txn.take_failed_error()),
+                        TransactionStatus::InTransaction => {
+                            // 他の文と同じく文数・持続時間の上限に計上する（`queried` も立つ）。
+                            txn.check_and_register_statement(None)?;
+                        }
+                        TransactionStatus::Idle => {}
+                    }
+                    session.apply_transaction_defaults(v.access_mode, v.isolation_level);
+                    Ok(crate::sql::SqlOutcome::SetTransaction)
+                }
+            };
+        }
+        if let ParsedSql::Transaction(ctrl) = parsed {
+            // Issue #1939: 修飾子が無い項目は `SET SESSION CHARACTERISTICS` の既定で補う
+            // （明示した修飾子が優先）。実行中の Tx は自分の値を持つため既定の変更に影響されない。
+            let access_mode = ctrl
+                .access_mode
+                .or(session.default_access_mode())
+                .unwrap_or(crate::sql::transaction::TxnAccessMode::ReadWrite);
+            let isolation_level = ctrl.isolation_level.or(session.default_isolation_level());
+            return match ctrl.control {
+                TxnControl::Begin | TxnControl::StartTransaction => {
+                    txn.begin_with_modes(&self.storage, session, access_mode, isolation_level)?;
+                    Ok(if ctrl.control == TxnControl::Begin {
+                        crate::sql::SqlOutcome::Begin
+                    } else {
+                        crate::sql::SqlOutcome::StartTransaction
+                    })
                 }
                 TxnControl::Commit => {
                     txn.commit(session)?;
@@ -10035,7 +10077,7 @@ impl EngineCore {
             }
             // `BEGIN`／`COMMIT`／`ROLLBACK`（SQL-31・TASK-221）は結果列を持たない
             // （`CommandComplete` のみ）。
-            ParsedSql::Transaction(_) => Ok(None),
+            ParsedSql::Transaction(_) | ParsedSql::SetTransaction(_) => Ok(None),
             // Issue #1759: `COPY` は結果列を持たない（Describe は NoData。CopyIn/CopyOut の
             // 開始は Execute 側の責務で Issue #1760）。
             ParsedSql::Copy(_) => Ok(None),

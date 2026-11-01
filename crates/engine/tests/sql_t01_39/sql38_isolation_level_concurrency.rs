@@ -6,7 +6,7 @@
 //! 分担: 単一スレッドでの受理は `sql38_begin_isolation_level`、`40001` の網羅は
 //! `sql31_serialization_failure*`、READ ONLY は `sql38_read_only_concurrency`。本モジュールは
 //! 「弱いレベルを要求しても保証が弱まらない」「要求レベルが記録どおりで実際より強い保証を装わない」
-//! ことを、レベル別・レベル混在で確かめる。`SET TRANSACTION` 経路は #1939、`SHOW` は対象外。
+//! ことを、レベル別・レベル混在で確かめる。`SET TRANSACTION` 経路は `sql38_set_transaction.rs`（#1939）、`SHOW` は対象外。
 //!
 //! 方針: 順序制御は `mpsc` と `Barrier` だけで行い、sleep・実時間の閾値は使わない。許容する
 //! `wire_code` は期待値（`40001`）だけで、`55P03` などは fail-closed でテスト失敗。スレッド数・

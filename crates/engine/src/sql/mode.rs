@@ -261,12 +261,46 @@ pub struct SessionState {
     current_role_id: Option<u64>,
     /// セッションのロール ID（`SESSION_USER` 相当。設定契約は `current_role_id` と同じ）。
     session_role_id: Option<u64>,
+    /// `SET SESSION CHARACTERISTICS AS TRANSACTION READ ONLY|READ WRITE` で設定した、以後の明示
+    /// トランザクション（`BEGIN`／`START TRANSACTION`）の既定アクセスモード（Issue #1939）。`None` は
+    /// 未設定（`READ WRITE`）。autocommit の文・暗黙トランザクションには効かない。接続単位の値型で、
+    /// ROLLBACK／abort の巻き戻しで取り消される。
+    default_access_mode: Option<crate::sql::transaction::TxnAccessMode>,
+    /// 同じく既定の要求分離レベル（記録のみ。実行の保証は変えない）。
+    default_isolation_level: Option<crate::sql::transaction::RequestedIsolationLevel>,
 }
 
 /// `search_path` の世代の採番元。0 は採番されない。
 static NEXT_SEARCH_PATH_EPOCH: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(1);
 
 impl SessionState {
+    /// `SET SESSION CHARACTERISTICS` が設定した既定アクセスモード（未設定は `None`。Issue #1939）。
+    pub fn default_access_mode(&self) -> Option<crate::sql::transaction::TxnAccessMode> {
+        self.default_access_mode
+    }
+
+    /// `SET SESSION CHARACTERISTICS` が設定した既定の要求分離レベル（未設定は `None`）。
+    pub fn default_isolation_level(
+        &self,
+    ) -> Option<crate::sql::transaction::RequestedIsolationLevel> {
+        self.default_isolation_level
+    }
+
+    /// `SET SESSION CHARACTERISTICS AS TRANSACTION ...` の適用。`Some` の項目だけを上書きする
+    /// （指定しなかった項目の既定は変えない）。`core.rs` の実行分岐が検証成功後にだけ呼ぶ。
+    pub(crate) fn apply_transaction_defaults(
+        &mut self,
+        access_mode: Option<crate::sql::transaction::TxnAccessMode>,
+        isolation_level: Option<crate::sql::transaction::RequestedIsolationLevel>,
+    ) {
+        if access_mode.is_some() {
+            self.default_access_mode = access_mode;
+        }
+        if isolation_level.is_some() {
+            self.default_isolation_level = isolation_level;
+        }
+    }
+
     /// セッションの現在の `search_path`（TABLE-27・Issue #1715）。
     pub fn search_path(&self) -> &crate::sql::search_path::SearchPath {
         self.search_path.as_ref()
