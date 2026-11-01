@@ -1085,6 +1085,9 @@ pub enum SqlSurfaceError {
     /// 取得（[`crate::storage::Storage::begin_write_txn`]）がロック待ちの上限を
     /// 超過した（`55P03`）。
     LockNotAvailable,
+    /// 直列化の失敗（`40001`。ERR-7・SQL-38・TASK-333・Issue #2398）。
+    /// 型の段階で表名・テナント・件数を持たせない（非漏えいの保証。#2407）。
+    SerializationFailure,
     /// 未実体化の MATERIALIZED VIEW を読んだ（`55000`。TABLE-42・Issue #1664）。
     /// 文言は固定で、名前・件数・他文脈の情報を含めない。
     MaterializedViewNotPopulated,
@@ -1900,6 +1903,7 @@ impl ClassifiedError for SqlSurfaceError {
             SqlSurfaceError::NoActiveSqlTransaction => ErrorClass::NoActiveSqlTransaction,
             SqlSurfaceError::InFailedSqlTransaction => ErrorClass::InFailedSqlTransaction,
             SqlSurfaceError::LockNotAvailable => ErrorClass::LockNotAvailable,
+            SqlSurfaceError::SerializationFailure => ErrorClass::SerializationFailure,
             SqlSurfaceError::MaterializedViewNotPopulated
             | SqlSurfaceError::MaterializedViewNotRefreshableConcurrently
             | SqlSurfaceError::SequenceNotYetDefined
@@ -2102,6 +2106,12 @@ impl std::fmt::Display for SqlSurfaceError {
                 write!(
                     f,
                     "current transaction is aborted, commands ignored until end of transaction block"
+                )
+            }
+            SqlSurfaceError::SerializationFailure => {
+                write!(
+                    f,
+                    "could not serialize access due to read/write dependencies among transactions"
                 )
             }
             SqlSurfaceError::LockNotAvailable => {
