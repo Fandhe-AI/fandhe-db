@@ -75,6 +75,10 @@ def main() -> int:
                     dbname="irrelevant-db-name",
                     connect_timeout=5,
                     autocommit=True,
+                    # 自動 prepare を無効化する。長寿命接続で同一文が繰り返されると
+                    # prepare_threshold（既定 5）超過後に自動 prepare され、ROLLBACK 後に
+                    # `DEALLOCATE ALL`（本サーバーは 42601 で拒否）が送られるため。
+                    prepare_threshold=None,
                 )
             conn = conns[key]
             try:
