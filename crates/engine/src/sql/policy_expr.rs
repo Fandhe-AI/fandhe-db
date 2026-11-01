@@ -68,7 +68,7 @@ pub(crate) fn bind_policy_expr(
         ));
     }
 
-    let sql = crate::sql::check_constraint::render_predicates(preds);
+    let sql = crate::sql::check_constraint::render_predicates_with_bool_consts(preds);
     if sql.len() > MAX_POLICY_SQL_LEN {
         return Err(SqlSurfaceError::payload_too_large(MSG_TOO_LONG));
     }

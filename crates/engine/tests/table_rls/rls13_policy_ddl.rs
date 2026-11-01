@@ -477,3 +477,28 @@ fn definitions_survive_restart() {
     // 他テナントには見えない。
     ok_as(&core, "bob", &mut s, "CREATE POLICY keep ON t");
 }
+
+/// 真偽定数（`TRUE`／`FALSE`）のポリシー式が CREATE／ALTER とも受理される（Issue #2274 の指摘対応）。
+#[test]
+fn boolean_constant_expressions_are_accepted() {
+    let (_g, core) = open_fixture("pol-const");
+    let mut s = allowed_session();
+    for (i, clause) in [
+        "USING (TRUE)",
+        "USING (FALSE)",
+        "WITH CHECK (TRUE)",
+        "WITH CHECK (FALSE)",
+        "USING (a = 'x' OR TRUE) WITH CHECK (NOT (a = 'x' OR FALSE))",
+    ]
+    .iter()
+    .enumerate()
+    {
+        let sql = format!("CREATE POLICY c{i} ON t FOR ALL {clause}");
+        ok_as(&core, "alice", &mut s, &sql);
+        let sql = format!("ALTER POLICY c{i} ON t {clause}");
+        assert!(matches!(
+            ok_as(&core, "alice", &mut s, &sql),
+            SqlOutcome::AlterPolicy(_)
+        ));
+    }
+}

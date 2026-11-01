@@ -83,3 +83,27 @@ fn merge_keeps_schema_order_without_duplicates() {
     );
     assert_eq!(m, vec!["n", "owner"]);
 }
+
+/// 真偽定数は `TRUE`／`FALSE` として描画され、再束縛しても同じ木へ戻る（Issue #2274 の指摘対応）。
+#[test]
+fn boolean_constants_round_trip() {
+    for sql in [
+        "TRUE",
+        "FALSE",
+        "owner = 'a' AND FALSE",
+        "owner = 'a' OR TRUE",
+        "NOT (owner = 'a' OR TRUE)",
+        "n > 1 AND (owner = 'a' OR FALSE)",
+    ] {
+        let b = bind(sql).unwrap_or_else(|e| panic!("{sql}: {e:?}"));
+        let preds = crate::sql::allowlist::parse_index_predicate_text(sql).expect("parse");
+        let again = crate::sql::allowlist::parse_index_predicate_text(&b.sql).expect("reparse");
+        assert_eq!(preds, again, "{sql}");
+        assert_eq!(
+            bind_stored_policy_expr(&b.sql, &schema()).expect("rebind"),
+            b
+        );
+    }
+    assert_eq!(bind("TRUE").expect("bind").sql, "TRUE");
+    assert_eq!(bind("FALSE").expect("bind").sql, "FALSE");
+}
