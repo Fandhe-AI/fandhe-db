@@ -3,7 +3,7 @@
 - ステータス: **Accepted（実装既定値）**
 - 対応: Issue #942・TASK-221
 - 改訂: Issue #2396・TASK-333（決定 1 を改訂。writer の遅延取得と `40001` の判定は
-  下記 1a。実装は #2399〜#2405・#2408 で進行中。設計記録は #2397）
+  下記 1a。実装は #2399〜#2405・#2408 で進行中。#2399・#2400 は実施済み。設計記録は #2397）
 - ポインタ: `docs/spec/04-behavior/sql-surface.md` SQL-31・
   `docs/spec/04-behavior/persistence.md` RECOVER-12・
   `docs/spec/04-behavior/error-format.md` ERR-6
@@ -332,11 +332,26 @@ Failed { session_at_begin: SessionState, expired: bool } }`）。`ActiveTxn` は
 
 - **改訂（#2396・1a。#2399 で状態の形を実施済み）**: `ActiveTxn` は `writer: Option<GatedWriteTxn>`
   （未取得／取得済み）と `BEGIN` 時点の確定済み `read_snapshot: ReadTransaction` を持つ。
-  - 挙動不変のリファクタ（SQL-31・PERSIST-4・TASK-333）。writer は現状も `BEGIN` で取得するため、
-    `Active` の間は常に `Some`。スナップショットはどの読み取り経路にも結線していない
-    （結線は #2400・#2403）。
-  - スナップショットは writer の取得**後**に開く（permit 保持中に開けば文ごとの読み取りと同じ確定
-    状態になり挙動が変わらない）。#2400 で `BEGIN` 時に先に開く順序へ変える。
+  - #2399 は挙動不変のリファクタ（SQL-31・PERSIST-4・TASK-333）。#2400 で明示トランザクションの
+    writer を `BEGIN` ではなく**最初の書き込み文**で取得する形へ変えた（BREAKING。実施済み）。
+    `BEGIN` は読み取りスナップショットだけを開き、writer を待たない（`55P03` も出さない）。
+  - 取得の入口は `SessionTransaction::ensure_writer`（冪等）。`core.rs` の書き込み腕
+    （INSERT・ビュー DML・DELETE・UPDATE・TRUNCATE・データ変更 CTE・INSERT…SELECT・`setval` 系）が
+    `write_txn()` を取る直前に呼ぶ。`COPY FROM` は確定処理（CopyDone 後）で取得するため、
+    データ受信中は持たない。`lastval` も同じ腕のため writer を取る（粒度は粗いが安全側）。
+    DDL（`0A000`）・一時表・読み取り・カーソルは取得しない。ロック句・`LOCK TABLE` は今も
+    `42601` で拒否されるので届かない（#2230・#1958 は同じ入口を呼ぶ）。
+  - `55P03`（待機上限超過）の発生点は `BEGIN` から最初の書き込み文へ移る。受けた Tx は `Failed`
+    になり、以降の文は `25P02`、受理するのは `ROLLBACK` だけ。取得前は何も書いていない。
+  - `ensure_writer` は 1a-3 の「gate 取得 → permit 保持のまま判定 → 格納」の挿入点で、#2405 が
+    取得と格納の間に `40001` 判定を入れる。
+  - 暗黙トランザクション（WIRE-16）は従来どおり開始時に writer を取る（スナップショットは取得後に開く。#2401）。
+  - **暫定の読み取りの意味**: スナップショット（`read_snapshot`）の結線は #2403 のため、writer 取得前の
+    読み取りは文ごとの確定済み状態を見る。後続の `40001` 判定にとっては、読みが `BEGIN` 時点より新しい
+    側へずれるだけで、偽陽性側にしか倒れず偽陰性は生まない。
+  - DoS 面: `BEGIN` だけで黙る接続が単一ライタを占有できなくなる。一方、読み取りだけの Tx は
+    `ReadTransaction` を最大 `max_duration` 保持し、その間は redb がページを回収できない（有界。
+    期限切れ処理がスナップショットを解放する）。
   - writer が `None` で `has_writes` が真の状態は不変条件違反で、`COMMIT` は `XX000`
     （`session` を開始時点へ復元）、`dirty_tables` は `Err` で fail-closed に倒す。
   - writer を取得しないまま `COMMIT` した場合は読み取りトランザクションを drop するだけで、

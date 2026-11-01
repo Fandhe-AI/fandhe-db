@@ -421,9 +421,10 @@ fn insert_row_sql(id: u64, op: &str) -> String {
     )
 }
 
-/// 他セッション（同一テナント・別テナントとも）の書き込みは、明示トランザクションが
-/// 単一ライタの permit を保持している間は `55P03` になり、カーソルの行集合は
-/// 変わらない。`COMMIT` 後の新しいスナップショットで初めて書き込みが見える。
+/// 読み取りだけの明示トランザクションは単一ライタの permit を取らない（Issue #2400）ため、
+/// 他セッション（同一テナント・別テナントとも）の書き込みは待たされず成功する。カーソルの
+/// 行集合は DECLARE 時点で確定しており、他接続の commit の影響を受けない。`COMMIT` 後の
+/// 新しいトランザクションで初めて他接続の行が見える。
 #[test]
 fn wire15_cursor_row_set_is_unaffected_by_other_session_write_during_fetch() {
     let (core, _guard) =
@@ -441,19 +442,16 @@ fn wire15_cursor_row_set_is_unaffected_by_other_session_write_during_fetch() {
     let (mut seen, tag) = read_fetch_page(&mut a);
     assert_eq!(tag, "FETCH 2");
 
-    // 同一テナント・別テナントの他接続の書き込みはライタ待機上限で `55P03`。
+    // 同一テナント・別テナントの他接続の書き込みは writer を待たずに成功する（AC1）。
     let mut b = authenticate_to_ready_for_query(addr, "alice2", "correct-horse");
     let mut c = authenticate_to_ready_for_query(addr, "bob", "battery-staple");
     for (stream, id, op) in [(&mut b, 99u64, "op-1178-b"), (&mut c, 98u64, "op-1178-c")] {
-        send_simple_query(stream, &insert_row_sql(id, op));
-        let (ty, body) = read_message(stream);
-        assert_eq!(ty, b'E');
-        let text = String::from_utf8_lossy(&body);
-        assert!(text.contains("55P03"), "expected 55P03, got: {text:?}");
-        // 他テナント ID・行 ID を応答へ含めない。
-        assert!(!text.contains("tenant-"), "tenant id leaked: {text:?}");
-        assert!(!text.contains(&id.to_string()), "row id leaked: {text:?}");
-        read_ready_for_query(stream);
+        let started = std::time::Instant::now();
+        simple_ok(stream, &insert_row_sql(id, op), "INSERT 0 1");
+        assert!(
+            started.elapsed() < std::time::Duration::from_millis(300),
+            "write must not wait for a read-only explicit transaction"
+        );
     }
 
     // 残りのカーソル行は元の集合の残りだけ（他セッションの行を含まない）。
@@ -466,13 +464,11 @@ fn wire15_cursor_row_set_is_unaffected_by_other_session_write_during_fetch() {
 
     simple_ok(&mut a, "COMMIT", "COMMIT");
 
-    // ライタ解放後は他接続の書き込みが通る。
-    simple_ok(&mut b, &insert_row_sql(99, "op-1178-b2"), "INSERT 0 1");
-
     // 新しい明示トランザクションのスナップショットでは commit 済みの行が見える。
     begin_and_declare(&mut a);
     send_simple_query(&mut a, "FETCH 100 FROM c");
     let (mut all, tag) = read_fetch_page(&mut a);
+    // 別テナントの行（98）は RLS で見えない。同一テナントの行（99）だけが見える。
     assert_eq!(tag, "FETCH 6");
     all.sort();
     assert_eq!(all, vec!["1", "2", "3", "4", "5", "99"]);

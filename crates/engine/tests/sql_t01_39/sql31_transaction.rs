@@ -779,7 +779,8 @@ fn new_core_with_short_write_lock_wait() -> (EngineCore, std::path::PathBuf) {
     )
 }
 
-/// 明示トランザクション（`BEGIN`）が `writer_gate` を保持している間、別セッションの
+/// 明示トランザクション（`BEGIN` ＋最初の書き込み文。writer は最初の書き込み文で取得する。
+/// Issue #2400）が `writer_gate` を保持している間、別セッションの
 /// 自動コミット `INSERT` が待機タイムアウトすると `TenantWriteError::WriteLockTimeout`
 /// が SQL 表層で `55P03`（`SqlSurfaceError::LockNotAvailable`）へ写像されることを
 /// 固定する（codex-review 指摘・Issue #942）。`map_write_error`〔`sql/exec.rs`〕に
@@ -803,7 +804,15 @@ fn autocommit_insert_times_out_with_lock_not_available_while_explicit_transactio
         let mut txn = holder_engine.new_session_transaction();
         holder_engine
             .execute_sql_in_txn(&caller_a, &mut session, &mut txn, "BEGIN")
-            .expect("begin holds writer_gate");
+            .expect("begin");
+        holder_engine
+            .execute_sql_in_txn(
+                &caller_a,
+                &mut session,
+                &mut txn,
+                &insert_sql(900, "op-holder"),
+            )
+            .expect("first write holds writer_gate");
         began_tx.send(()).expect("notify begin done");
         // 別セッションの自動コミット `INSERT` がタイムアウトするまで `writer_gate`
         // を保持し続ける（解放シグナルを受けてから ROLLBACK する）。
