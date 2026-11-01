@@ -741,6 +741,11 @@ pub enum AlterTableAction {
     /// `SET SCHEMA <schema>`（表の SCHEMA 移動。TABLE-27 のポインタ、Issue #1716）。移動先の
     /// 名前は利用者が書いた原文のまま。**BREAKING CHANGE**: variant 追加。
     SetSchema { schema_name: String },
+    /// `ENABLE／DISABLE／FORCE／NO FORCE ROW LEVEL SECURITY`（RLS-13 のポインタ、Issue #2275）。
+    /// 状態が変わらない再指定でも同じ応答になる。**BREAKING CHANGE**: variant 追加。
+    RowSecurity {
+        action: crate::catalog::row_security::RowSecurityAction,
+    },
 }
 
 /// `ALTER TABLE <table> ADD COLUMN <column> <type>` の実行本体（Issue #900）。
@@ -1054,6 +1059,9 @@ pub(crate) fn execute_alter_table(
         crate::sql::allowlist::ValidatedAlterTable::SetSchema(stmt) => {
             execute_alter_table_set_schema(storage, tenant_id, stmt)
         }
+        crate::sql::allowlist::ValidatedAlterTable::RowSecurity(stmt) => {
+            execute_alter_table_row_security(storage, tenant_id, stmt)
+        }
     }
 }
 
@@ -1323,7 +1331,8 @@ fn apply_alter_action_in_txn(
         | ValidatedAlterTable::AlterColumnType(_)
         | ValidatedAlterTable::RenameColumn(_)
         | ValidatedAlterTable::RenameTable(_)
-        | ValidatedAlterTable::SetSchema(_) => {
+        | ValidatedAlterTable::SetSchema(_)
+        | ValidatedAlterTable::RowSecurity(_) => {
             Err(AlterCheckError::Sql(SqlSurfaceError::FeatureNotSupported {
                 detail: "multiple ALTER TABLE actions including this action are not supported"
                     .to_string(),
@@ -1569,6 +1578,32 @@ pub(crate) fn execute_alter_table_rename_table(
         table_name: stmt.table_name.clone(),
         action: AlterTableAction::RenameTable {
             new_table_name: stmt.new_table_name.clone(),
+        },
+    })
+}
+
+/// `ALTER TABLE <table> ENABLE／DISABLE／FORCE／NO FORCE ROW LEVEL SECURITY` の実行本体（RLS-13 の
+/// ポインタ、Issue #2275）。呼び出し元（`core.rs`）は [`require_ddl_permission`] を必ず先に通している
+/// 前提（権限の無いセッションへ表の有無を返さない）。DDL を実行できる主体を「所有者」の代替とする。
+///
+/// 状態は `(表, tenant_id)` 単位で `Storage::alter_table_row_security` が単一 write txn で更新する。
+/// 判定順序: 表の存在確認（不在 `42P01`・ビュー等 `42809`）→ 状態の遷移。状態が変わらない再指定は
+/// 成功の no-op。ここが外す・付けるのは利用者ポリシーの適用だけで、テナント境界には触れない。
+pub(crate) fn execute_alter_table_row_security(
+    storage: &Storage,
+    tenant_id: &str,
+    stmt: &crate::sql::allowlist::ValidatedAlterTableRowSecurity,
+) -> Result<AlterTableOutcome, SqlSurfaceError> {
+    storage
+        .alter_table_row_security(tenant_id, &stmt.table_name, stmt.action)
+        .map_err(|e| match e {
+            CatalogError::TableNotFound(_) => undefined_table_or_view(storage, &stmt.table_name),
+            other => map_drop_alter_column_error(other),
+        })?;
+    Ok(AlterTableOutcome {
+        table_name: stmt.table_name.clone(),
+        action: AlterTableAction::RowSecurity {
+            action: stmt.action,
         },
     })
 }
