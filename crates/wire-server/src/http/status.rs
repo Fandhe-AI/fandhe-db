@@ -76,6 +76,9 @@ pub const fn http_status(class: ErrorClass) -> u16 {
         // 一時的な失敗で、`ROLLBACK` の後に最初から再試行してよいため 409 に射影する。
         // NoSQL の 1 要求は開始時に writer を取る暗黙トランザクションのため到達しない。
         ErrorClass::SerializationFailure => 409,
+        // Issue #1934・ERR-6: 読み取り専用トランザクション内の書き込み（`25006`）。要求の状態が
+        // 操作を許さないため 403 に射影する。NoSQL 表層にはトランザクション制御が無く到達しない。
+        ErrorClass::ReadOnlySqlTransaction => 403,
         // Issue #1798・ERR-6: 協調的中断（`57014`）。サーバー側の都合で打ち切られた一時的な失敗として
         // `LockNotAvailable` と同じ 503 に射影する（HTTP 表層への到達経路は #1951 以降）。
         ErrorClass::QueryCanceled => 503,
@@ -250,7 +253,7 @@ mod tests {
 
     /// 期待表を明示的に列挙し、`ErrorClass::ALL` との突き合わせで非 vacuous に検証する。
     /// `match` にアームを足したが期待表の更新を忘れた、という乖離を (a)(b) が検出する。
-    const EXPECTED: [(ErrorClass, u16); 98] = [
+    const EXPECTED: [(ErrorClass, u16); 99] = [
         (ErrorClass::InvalidInput, 400),
         (ErrorClass::StringDataRightTruncation, 400),
         (ErrorClass::AuthInvalid, 401),
@@ -283,6 +286,7 @@ mod tests {
         (ErrorClass::InvalidTextRepresentation, 400),
         (ErrorClass::LockNotAvailable, 503),
         (ErrorClass::SerializationFailure, 409),
+        (ErrorClass::ReadOnlySqlTransaction, 403),
         (ErrorClass::ObjectNotInPrerequisiteState, 409),
         (ErrorClass::SequenceGeneratorLimitExceeded, 400),
         (ErrorClass::DuplicateSchema, 409),

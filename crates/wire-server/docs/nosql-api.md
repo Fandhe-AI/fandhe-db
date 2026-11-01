@@ -1191,6 +1191,7 @@ Date: <IMF-fixdate>
 | `P0003` | `TOO_MANY_ROWS` | 400 | Bad Request | PL/pgSQL の `INTO STRICT`（および DML の `RETURNING INTO`）が 2 行以上（SQL 表層の PL/pgSQL 専用。NoSQL の `op` 語彙からは到達しない）。Issue #2225・SQL-68 |
 | `28000` | `AUTH_REQUIRED` | 401 | Unauthorized | `Authorization` ヘッダ欠落 |
 | `28P01` | `AUTH_INVALID` | 401 | Unauthorized | トークン形式不正・失効・セッション未存在 |
+| `25006` | `READ_ONLY_SQL_TRANSACTION` | 403 | Forbidden | 読み取り専用トランザクション内で書き込み系の文を実行した（SQL 表層専用。NoSQL にはトランザクション制御が無く到達不能。Issue #1934・ERR-6） |
 | `42501` | `FORBIDDEN_TENANT_MISMATCH` | 403 | Forbidden | NoSQL 表層の実要求からは到達不能（射影のみ production エンコーダで固定。後述） |
 | `34000` | `INVALID_CURSOR_NAME` | 404 | Not Found | NoSQL 表層の実要求からは到達不能（カーソル〔`DECLARE`／`FETCH`／`CLOSE`〕は SQL 表層専用で op 許可リストに無い。後述） |
 | `3F000` | `INVALID_SCHEMA_NAME` | 404 | Not Found | 呼び出し元テナントに存在しない SCHEMA を指した（TABLE-27・Issue #1713。他テナントの名前も同じ応答。NoSQL 表層からは到達しない） |
@@ -1214,7 +1215,7 @@ Date: <IMF-fixdate>
 | `55P03` | `LOCK_NOT_AVAILABLE` | 503 | Service Unavailable | SQL 表層の明示トランザクション（SQL-31・TASK-221）が単一ライタを保持している間に、書き込み op（`insert`／`update`／`delete`）が書き込みゲートの待機上限を超えた |
 | `57014` | `QUERY_CANCELED` | 503 | Service Unavailable | 実行中の文を協調的に打ち切った（クライアント切断の検出。Issue #1798）。SQL 表層の接続スレッドが起点で、現状 NoSQL の `op` からは到達しない |
 
-到達不能な 24 分類（`40001`・`20000`・`2F005`・`P0003`・`21000`・`42501`・`34000`・`P0002`（`ROW_NOT_FOUND`・`NO_DATA_FOUND`）・`42701`・`42P07`・`2BP01`・
+到達不能な 25 分類（`40001`・`25006`・`20000`・`2F005`・`P0003`・`21000`・`42501`・`34000`・`P0002`（`ROW_NOT_FOUND`・`NO_DATA_FOUND`）・`42701`・`42P07`・`2BP01`・
 `42809`・`42703`・`42804`・`42710`・`42723`・`42P13`・`25000`・`25001`・`25P01`・`25P02`・`55000`・`44000`）の理由: NoSQL 表層はテナントをセッション
 （`SessionPrincipal::policy_context()`）からのみ導出し、クライアント自己申告の
 `tenant_id` 相当値は JSON／ヘッダ／パスいずれの位置でも `42601` で先に拒否する
