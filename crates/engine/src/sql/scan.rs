@@ -68,6 +68,7 @@ use crate::sql::order_value::{
     scalar_key_ref_to_owned, NullPlacement, OrderValue, ScalarKeyRef,
 };
 use crate::sql::parser::{BoundOrderKey, BoundOrderTarget, BoundScan, OrderKind, ProjectedColumn};
+use crate::sql::row_policy::{resolve_row_policy, BoundRowPolicy, PolicyCmd, PolicyNeeds};
 use crate::sql::udf_call::{self, ExprValue};
 use crate::storage::{self, StorageError};
 use redb::ReadableTable;
@@ -206,6 +207,18 @@ fn try_alloc_bytes_for_budget(
         })?;
     owned.extend_from_slice(bytes);
     Ok(owned)
+}
+
+/// 利用者ポリシー（RLS-13・Issue #2276）が求める復号段階へ引き上げる（ポリシーが embedding を参照すれば
+/// `Embedding`、スカラー列を参照して `Fast` なら `DimAndScalar`）。段階を下げることはしない。
+fn raise_tier_for_policy(tier: DecodeTier, needs: PolicyNeeds) -> DecodeTier {
+    if needs.embedding {
+        DecodeTier::Embedding
+    } else if needs.scalar && tier == DecodeTier::Fast {
+        DecodeTier::DimAndScalar
+    } else {
+        tier
+    }
 }
 
 /// 可視行 1 件のデコード段階（[`crate::sql::aggregate::DecodeTier`] と同じ意図・
@@ -478,6 +491,7 @@ fn with_visible_row<T>(
     scalar_mask: &[bool],
     expected_dim: Option<u32>,
     ctx: &PolicyContext,
+    policy: Option<&BoundRowPolicy>,
     embedding_scratch: &mut Vec<f32>,
     where_expr_scratch: &mut Vec<StackValue>,
     build: impl FnOnce(u32, &[Option<row_codec::ScalarRef<'_>>], &[f32]) -> Result<T, SqlSurfaceError>,
@@ -527,6 +541,24 @@ fn with_visible_row<T>(
     // `scalar_mask` へ反映済み（`DecodeTier::Fast` ならそもそも式評価に到達
     // しない）なので、ここでは `scanned` の値をそのまま `.as_text()` へ写す
     // だけでよい（`sql::aggregate`／`sql::group_by` 等と同じ契約）。
+    // POLICY 段（RLS-13・Issue #2276）。テナント境界の内側・利用者の `WHERE` より前に、利用者ポリシーの
+    // `USING` を評価する。`WHERE` の式（CAST・0 除算等）がポリシーで隠れた行に対して先に走ると、
+    // エラーの有無から存在が分かってしまうため。通らない行は存在しない行と同じ扱い。
+    if let Some(policy) = policy {
+        let policy_embedding: &[f32] = match tier {
+            DecodeTier::Embedding => embedding_scratch.as_slice(),
+            DecodeTier::Fast | DecodeTier::DimAndScalar => &[],
+        };
+        if !policy.passes(
+            &scanned,
+            id,
+            policy_embedding,
+            dim as usize,
+            where_expr_scratch,
+        )? {
+            return Ok(None);
+        }
+    }
     // SCALAR 段（WHERE）。
     if !declarative_filter::matches_all(&bound.metadata_filters, &scanned) {
         return Ok(None);
@@ -1143,7 +1175,13 @@ fn execute_scan_with_budget_inner(
     }
 
     let expected_dim = schema.vector_dim();
-    let (tier, scalar_mask) = decode_tier_for(schema, bound);
+    // RLS-13（Issue #2276）: 利用者ポリシーを行を読むのと同じスナップショットから 1 回だけ解決する。
+    // 適用表ではポリシーが参照する列・embedding を復号対象へ加える（マスク外の列を NULL と取り違えない）。
+    let policy = resolve_row_policy(read_txn, ctx, schema, &bound.table, PolicyCmd::Select)?;
+    let (mut tier, mut scalar_mask) = decode_tier_for(schema, bound);
+    if let Some(p) = &policy {
+        tier = raise_tier_for_policy(tier, p.mark_needs(&mut scalar_mask));
+    }
 
     // 結果列メタデータは行数によらず常に構築する（空集合でも列は返す既存契約。
     // `sql::exec::execute_statement`・`sql::aggregate::execute_aggregate` と同じ）。
@@ -1257,6 +1295,7 @@ fn execute_scan_with_budget_inner(
                 &scalar_mask,
                 expected_dim,
                 ctx,
+                policy.as_ref(),
                 &mut embedding_scratch,
                 &mut where_expr_scratch,
                 |dim, scanned, embedding| {
@@ -1398,6 +1437,7 @@ fn execute_scan_with_budget_inner(
                 &scalar_mask,
                 expected_dim,
                 ctx,
+                policy.as_ref(),
                 &mut embedding_scratch,
                 &mut where_expr_scratch,
                 |dim, scanned, embedding| {
@@ -1555,6 +1595,7 @@ fn execute_scan_with_budget_inner(
                     &scalar_mask,
                     expected_dim,
                     ctx,
+                    policy.as_ref(),
                     &mut embedding_scratch,
                     &mut where_expr_scratch,
                     |_dim, scanned, embedding| {
@@ -1888,6 +1929,7 @@ fn execute_scan_with_budget_inner(
                 &scalar_mask,
                 expected_dim,
                 ctx,
+                policy.as_ref(),
                 &mut embedding_scratch,
                 &mut where_expr_scratch,
                 |dim, scanned, embedding| {

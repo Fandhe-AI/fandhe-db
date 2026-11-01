@@ -785,6 +785,10 @@ pub(crate) fn execute_statement_with_cache(
     hnsw_cache: Option<crate::sql::hnsw_cache::HnswCacheAccess<'_>>,
     scalar_cache: Option<crate::sql::scalar_index::ScalarCacheAccess<'_>>,
 ) -> Result<QueryResult, SqlSurfaceError> {
+    // RLS-13（Issue #2276）: ランキング付き検索（距離順・ハイブリッド・`USING PLAN`）は、アリーナ・
+    // HNSW・スカラー索引・疎索引・各キャッシュがテナント可視集合だけをキーにしており、利用者ポリシーを
+    // 反映できない（#2279 の担当）。適用表では固定文言の `0A000` で拒否し、ポリシーを素通りさせない。
+    crate::sql::row_policy::reject_if_policies_apply(read_txn, ctx, &bound.table)?;
     // 書き込みトランザクション由来（自トランザクションの未 commit 変更を読む経路。
     // Issue #1179）ではテーブル世代キーのキャッシュ群を一切使わない（未 commit の
     // 内容から作ったエントリを共有しない。`storage::read_source` モジュールドキュメント
@@ -4733,6 +4737,12 @@ fn execute_predicate_delete_inner(
     // Issue #997 で CLI 起動時設定値まで一本化）に、呼び出し元から渡された
     // `max_affected_rows`（`EngineCore::dml_limits`）を渡す。
     let limit = max_affected_rows;
+    // RLS-13（Issue #2276）: PostgreSQL と同じく、`WHERE` が列を参照する・`RETURNING` がある文は既存行を
+    // 読むので DELETE のポリシーに SELECT のポリシーも AND する（`WHERE` 無しの全件削除は DELETE のみ）。
+    let reads_existing = project.is_some()
+        || !bound.metadata_filters().is_empty()
+        || !bound.expr_filters().is_empty()
+        || !bound.or_filters().is_empty();
     let result = run_where_predicate(
         schema,
         bound.metadata_filters(),
@@ -4751,6 +4761,7 @@ fn execute_predicate_delete_inner(
                 max_scanned_rows,
                 predicate,
                 triggers,
+                reads_existing,
             ),
             Some(project) => crate::tenant::delete_rows_where_capturing_unchecked(
                 target,
@@ -4764,6 +4775,7 @@ fn execute_predicate_delete_inner(
                 max_scanned_rows,
                 predicate,
                 project,
+                reads_existing,
             ),
         },
     );
@@ -4910,6 +4922,14 @@ fn execute_predicate_update_inner(
     // ADR §6「上限 API の統合」。Issue #997 で CLI 起動時設定値まで一本化）に、
     // 呼び出し元から渡された `max_affected_rows`（`EngineCore::dml_limits`）を渡す。
     let limit = max_affected_rows;
+    // RLS-13（Issue #2276）: `WHERE` が列を参照する・`RETURNING` がある・`SET` の右辺が式（列を参照しうる）の
+    // 文は既存行を読むので、UPDATE のポリシーに SELECT のポリシーも AND する。リテラルだけの SET を
+    // `WHERE` 無しで行う文は UPDATE のポリシーのみ（PostgreSQL 17 と同じ）。
+    let reads_existing = project.is_some()
+        || !bound.metadata_filters().is_empty()
+        || !bound.expr_filters().is_empty()
+        || !bound.or_filters().is_empty()
+        || !bound.set_exprs().is_empty();
     let result = run_where_predicate(
         schema,
         bound.metadata_filters(),
@@ -4931,6 +4951,7 @@ fn execute_predicate_update_inner(
                 max_scanned_rows,
                 predicate,
                 triggers,
+                reads_existing,
             ),
             Some(project) => crate::tenant::update_rows_where_capturing_unchecked(
                 target,
@@ -4947,6 +4968,7 @@ fn execute_predicate_update_inner(
                 max_scanned_rows,
                 predicate,
                 project,
+                reads_existing,
             ),
         },
     );

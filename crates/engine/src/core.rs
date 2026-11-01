@@ -3702,6 +3702,9 @@ impl EngineCore {
         ),
         CoreError,
     > {
+        // RLS-13（Issue #2276）: 辞書はテナント可視行から作る。ポリシーで隠れた行の語が辞書へ入ると
+        // クエリ展開から存在が推測できるため、適用表では辞書構築を拒否する（#2279 の担当）。
+        self.reject_if_row_policies_apply(ctx, table)?;
         if let Some(hit) = self.dictionary_cache.lookup(&self.storage, table, ctx) {
             return Ok(hit);
         }
@@ -3877,6 +3880,12 @@ impl EngineCore {
         ),
         CoreError,
     > {
+        // RLS-13（Issue #2276）: ポリシーの適用表では辞書構築を拒否する（`dictionary_snapshot_with_index` と同じ）。
+        crate::sql::row_policy::reject_if_policies_apply(write_txn, ctx, table).map_err(|_| {
+            CoreError::Catalog(CatalogError::Invalid(
+                "row-level security policies are not yet supported for this query form".to_string(),
+            ))
+        })?;
         let schema = crate::catalog::get_table_schema_in_txn(write_txn, table)?;
         let (path_idx, body_idx) = dictionary_required_columns(&schema)
             .map_err(|msg| CoreError::from(CatalogError::Invalid(msg)))?;
@@ -4646,6 +4655,41 @@ impl EngineCore {
                 ),
             }
         })
+    }
+
+    /// 利用者ポリシー（RLS-13・Issue #2276）の適用表なら、ポリシーを反映できない Rust API の検索・辞書
+    /// 構築経路を固定文言で拒否する（`sql::row_policy::reject_if_policies_apply` の Rust API 版。
+    /// 拒否文言に表名・ポリシー名を含めない）。適用されない表（既定）では何もしない。
+    fn reject_if_row_policies_apply(
+        &self,
+        ctx: &PolicyContext,
+        table: &str,
+    ) -> Result<(), CoreError> {
+        let read_txn = self.storage.db().begin_read().map_err(StorageError::from)?;
+        crate::sql::row_policy::reject_if_policies_apply(&read_txn, ctx, table).map_err(|_| {
+            CoreError::Catalog(CatalogError::Invalid(
+                "row-level security policies are not yet supported for this query form".to_string(),
+            ))
+        })
+    }
+
+    /// 全列置換・id 指定削除の Rust API（[`Self::update_row`]・[`Self::delete_row`]）用の拒否。これらは
+    /// 所有する行を id で直接書き換え、利用者ポリシーの USING を評価する経路を持たない（SQL 表層の
+    /// UPDATE／DELETE が評価する）。適用表では固定文言の `0A000` 相当（`TriggerFailed` の透過経路）で
+    /// 拒否し、ポリシーを素通りさせない。適用されない表（既定）では何もしない。
+    fn reject_raw_write_if_row_policies_apply(
+        &self,
+        ctx: &PolicyContext,
+        table: &str,
+    ) -> Result<(), crate::tenant::TenantWriteError> {
+        let read_txn = self
+            .storage
+            .db()
+            .begin_read()
+            .map_err(StorageError::from)
+            .map_err(crate::tenant::TenantWriteError::from)?;
+        crate::sql::row_policy::reject_if_policies_apply(&read_txn, ctx, table)
+            .map_err(crate::tenant::TenantWriteError::TriggerFailed)
     }
 
     /// [`Self::read_txn_with_schema`] の複数テーブル版（SQL-29 (c)・RLS-10 (b)・
@@ -14002,6 +14046,7 @@ impl EngineCore {
         // 生の表名は裸の識別子だけ（[`Self::insert_row`] と同じ理由）。
         crate::catalog::validate_identifier(table)
             .map_err(crate::tenant::TenantWriteError::from)?;
+        self.reject_raw_write_if_row_policies_apply(ctx, table)?;
         let ledger_write = self.ledger_mode.resolve(operation_id)?;
         crate::tenant::update_row_unchecked(
             crate::tenant::WriteTarget::Autocommit(&self.storage),
@@ -14026,6 +14071,7 @@ impl EngineCore {
         // 生の表名は裸の識別子だけ（[`Self::insert_row`] と同じ理由）。
         crate::catalog::validate_identifier(table)
             .map_err(crate::tenant::TenantWriteError::from)?;
+        self.reject_raw_write_if_row_policies_apply(ctx, table)?;
         let ledger_write = self.ledger_mode.resolve(operation_id)?;
         crate::tenant::delete_row_unchecked(&self.storage, table, ctx, id, ledger_write)
     }
@@ -16272,6 +16318,9 @@ impl VectorCore for EngineCore {
             Err(CatalogError::TableNotFound(_)) => return Err(CoreError::NotFound),
             Err(e) => return Err(CoreError::Catalog(e)),
         };
+        // RLS-13（Issue #2276）: 利用者ポリシーの適用表では、アリーナ・索引・キャッシュの検索経路が
+        // ポリシーを反映できない（#2279 の担当）ため、固定文言で拒否する（黙って素通りさせない）。
+        self.reject_if_row_policies_apply(ctx, table)?;
         let expected_dim = match schema.vector_dim() {
             Some(dim) if dim != 0 && dim <= crate::storage::MAX_EMBEDDING_DIM => dim,
             _ => return Err(CoreError::Arena(ArenaError::InvalidDim)),
@@ -16363,6 +16412,59 @@ impl VectorCore for EngineCore {
         };
         if !ImplicitRlsHook::new(ctx).is_visible(&row.tenant_id, row.visibility) {
             return Err(CoreError::NotFound);
+        }
+        // RLS-13（Issue #2276）: 利用者ポリシー（SELECT の USING）を通らない行は存在しない行と同じ
+        // `NotFound`。テナント境界の判定より後・行を返す前に、同じスナップショットで評価する。
+        // 適用表でなければ（既定）スキーマも読まない（点取得の経路コストを増やさない）。
+        let read_txn = self.storage.db().begin_read().map_err(StorageError::from)?;
+        let policy_applies = crate::sql::row_policy::policies_apply(&read_txn, ctx, table)
+            .map_err(|_| {
+                CoreError::Catalog(CatalogError::Invalid(
+                    "row-level security policy could not be applied".to_string(),
+                ))
+            })?;
+        if !policy_applies {
+            return Ok(row);
+        }
+        let schema = crate::catalog::get_table_schema_in_txn(&read_txn, table)?;
+        if let Some(policy) = crate::sql::row_policy::resolve_row_policy(
+            &read_txn,
+            ctx,
+            &schema,
+            table,
+            crate::sql::row_policy::PolicyCmd::Select,
+        )
+        .map_err(|_| {
+            CoreError::Catalog(CatalogError::Invalid(
+                "row-level security policy could not be applied".to_string(),
+            ))
+        })? {
+            let mut mask = vec![false; schema.columns.len()];
+            policy.mark_needs(&mut mask);
+            let scanned =
+                crate::row_codec::scan_scalar_columns_masked(&schema, &row.metadata, Some(&mask))
+                    .map_err(|_| {
+                    CoreError::Catalog(CatalogError::Invalid(
+                        "row-level security policy could not be applied".to_string(),
+                    ))
+                })?;
+            let mut scratch = Vec::new();
+            let passed = policy
+                .passes(
+                    &scanned,
+                    row.id,
+                    &row.embedding,
+                    row.embedding.len(),
+                    &mut scratch,
+                )
+                .map_err(|_| {
+                    CoreError::Catalog(CatalogError::Invalid(
+                        "row-level security policy could not be applied".to_string(),
+                    ))
+                })?;
+            if !passed {
+                return Err(CoreError::NotFound);
+            }
         }
         Ok(row)
     }

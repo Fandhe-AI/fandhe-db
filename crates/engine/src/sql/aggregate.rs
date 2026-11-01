@@ -553,6 +553,18 @@ impl ReferencedColumns {
         }
     }
 
+    /// 利用者ポリシー（RLS-13・Issue #2276）が参照する列・embedding を反映する。漏れると縮小デコードした行で
+    /// ポリシー式が列を NULL と取り違え、ポリシーの判定が黙って誤る（fail-open になりうる）。
+    pub(crate) fn include_policy(&mut self, policy: &crate::sql::row_policy::BoundRowPolicy) {
+        let needs = policy.mark_needs(&mut self.scalar_mask);
+        if needs.scalar {
+            self.has_scalar_reference = true;
+        }
+        if needs.embedding {
+            self.needs_embedding = true;
+        }
+    }
+
     /// `GROUP BY` 式キー（Issue #1817・SQL-58）が参照する列・embedding を反映する。
     /// `sql::group_by::execute_grouped_aggregate` が [`Self::derive`] の直後に呼ぶ。漏れると縮小
     /// デコードした行でキー式が列を NULL と取り違え、黙って誤ったグループ化になる。
@@ -2295,11 +2307,23 @@ pub(crate) fn execute_aggregate_with_group_limits(
     // Issue #1179）ではテーブル世代キーのキャッシュを一切使わない（未 commit の
     // 内容から作ったエントリを共有しない。`storage::read_source` モジュールドキュメント
     // 「キャッシュの構造的ゲート」参照）。
-    let (visible_cache, arena_cache, scalar_cache) = if read_txn.snapshot().is_some() {
-        (visible_cache, arena_cache, scalar_cache)
-    } else {
-        (None, None, None)
-    };
+    //
+    // RLS-13（Issue #2276）: 利用者ポリシーは行を読むのと同じスナップショットから 1 回だけ解決する。
+    // 適用表では、ポリシーを反映できない高速経路（可視 id ビットマップ・アリーナ・スカラー索引の
+    // 相乗り/候補削減）を使わず、ポリシー段を通る通常の走査へ倒す（件数をそのまま返さない）。
+    let policy = crate::sql::row_policy::resolve_row_policy(
+        read_txn,
+        ctx,
+        schema,
+        &bound.table,
+        crate::sql::row_policy::PolicyCmd::Select,
+    )?;
+    let (visible_cache, arena_cache, scalar_cache) =
+        if read_txn.snapshot().is_some() && policy.is_none() {
+            (visible_cache, arena_cache, scalar_cache)
+        } else {
+            (None, None, None)
+        };
     // TASK-167（SQL-14）: `GROUP BY` ありは複数行結果を返すため
     // `sql::group_by::execute_grouped_aggregate` へ分岐する（グループ表の有界化・
     // `HAVING`/`ORDER BY`/`LIMIT` はそちらの責務）。`GROUP BY` なしは以下の
@@ -2341,7 +2365,7 @@ pub(crate) fn execute_aggregate_with_group_limits(
     // TASK-199）の列参照も `ReferencedColumns::derive` が `scalar_mask` へ
     // 反映済みのため、以下の判定式は型を問わず「スカラー列参照の有無」だけを見る
     // （新型ごとの分岐は増えない。#894 で判定式自体の網羅性を確認済み）。
-    let referenced = ReferencedColumns::derive(
+    let mut referenced = ReferencedColumns::derive(
         schema,
         &bound.items,
         &bound.metadata_filters,
@@ -2349,6 +2373,9 @@ pub(crate) fn execute_aggregate_with_group_limits(
         &bound.or_filters,
         &[],
     );
+    if let Some(p) = &policy {
+        referenced.include_policy(p);
+    }
     let tier = select_decode_tier(
         &referenced,
         !bound.expr_filters.is_empty() || !bound.or_filters.is_empty(),
@@ -2622,6 +2649,23 @@ pub(crate) fn execute_aggregate_with_group_limits(
             // `ReferencedColumns::derive` が `scalar_mask` へ反映済みのため、
             // `scanned` をそのまま `.as_text()` へ写せばよい（`sql::scan` と同じ
             // 契約）。
+
+            // POLICY 段（RLS-13・Issue #2276）: テナント境界の内側・利用者の `WHERE` より前。
+            if let Some(policy) = &policy {
+                let policy_embedding: &[f32] = match tier {
+                    DecodeTier::Embedding => embedding_scratch.as_slice(),
+                    DecodeTier::Fast | DecodeTier::DimAndScalar => &[],
+                };
+                if !policy.passes(
+                    &scanned,
+                    id,
+                    policy_embedding,
+                    dim as usize,
+                    &mut expr_scratch,
+                )? {
+                    continue;
+                }
+            }
 
             // SCALAR 段（WHERE）: 既存の検索 SELECT 実行経路（`sql::exec`）と同じ
             // 意味論（等価・前方一致条件 → 式述語の順）で適用する。

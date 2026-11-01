@@ -262,6 +262,25 @@ pub(crate) struct PrefilterSnapshot {
     built_table_generation: u64,
 }
 
+/// 利用者ポリシー（RLS-13・Issue #2276）の適用表なら、ポリシーのマスクを合成できない検索経路
+/// （`PrefilterSnapshot`・`SearchTimeFilter`）を固定文言で拒否する。適用されない表（既定）では何もしない。
+/// 拒否は `RlsError::Arena(Catalog(Invalid))` に載せる（表名・ポリシー名を含めない）。
+fn reject_if_row_policies_apply(
+    storage: &Storage,
+    table: &str,
+    ctx: &PolicyContext,
+) -> Result<(), RlsError> {
+    let read_txn = storage
+        .db()
+        .begin_read()
+        .map_err(crate::storage::StorageError::from)?;
+    crate::sql::row_policy::reject_if_policies_apply(&read_txn, ctx, table).map_err(|_| {
+        RlsError::Arena(ArenaError::Catalog(CatalogError::Invalid(
+            "row-level security policies are not yet supported for this query form".to_string(),
+        )))
+    })
+}
+
 impl PrefilterSnapshot {
     /// `table` に対し `ctx` の可視性述語で可視行のみのインデックスを構築する（RLS-1）。
     /// テーブル不存在は [`RlsError::NotFound`] へ丸め込む（存在情報を漏らさない。
@@ -271,6 +290,10 @@ impl PrefilterSnapshot {
         table: &str,
         ctx: &PolicyContext,
     ) -> Result<Self, RlsError> {
+        // RLS-13（Issue #2276）: 利用者ポリシーの適用表では、この可視集合（テナント境界だけ）を検索の母集団に
+        // できない（ポリシーのマスク合成は #2279）。固定文言で拒否する（`core::search`・公開の
+        // `PrefilterIndex::build` が共通で通る入口）。
+        reject_if_row_policies_apply(storage, table, ctx)?;
         // 世代を先に読んでからアリーナを構築する（アリーナ構築中に別の書き込みが
         // コミットされても、その変更を見落とさない方向の順序。`search_with` の doc 参照）。
         let built_generation = storage.current_generation()?;
@@ -759,6 +782,9 @@ impl<'s> SearchTimeFilter<'s> {
         max_bytes: usize,
     ) -> Result<Vec<SearchHit>, RlsError> {
         validate_search_k(k).map_err(|k| RlsError::InvalidK { k })?;
+        // RLS-13（Issue #2276）: 利用者ポリシーの適用表は、検索時フィルタがポリシーを反映できない
+        // （#2279）ため固定文言で拒否する。
+        reject_if_row_policies_apply(self.storage, &self.table_name, ctx)?;
 
         if query.len() != self.dim as usize {
             return Err(RlsError::Kernel(KernelError::DimMismatch {
