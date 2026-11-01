@@ -89,6 +89,8 @@ mod dml_subquery_exec;
 // 述語形 UPDATE ... FROM／DELETE ... USING の結合実行（SQL-53・Issue #1755）。
 #[cfg(test)]
 mod cte_join_budget_tests;
+#[cfg(test)]
+mod deferred_writer_tests;
 mod dml_join_exec;
 #[cfg(test)]
 mod dml_join_exec_tests;
@@ -7664,6 +7666,8 @@ impl EngineCore {
             // 経路を作らない）へ `InTxn` を渡す。
             ParsedSql::Insert(stmt) => {
                 let lookup = InsertSchemaLookup::new(&self.storage);
+                // 最初の書き込み文で writer を取得する（Issue #2400。待機超過は `55P03`。呼び出し元が `Failed` へ遷移）。
+                txn.ensure_writer()?;
                 let write_txn = txn.write_txn().ok_or_else(|| SqlSurfaceError::Internal {
                     detail: "internal error".to_string(),
                 })?;
@@ -7689,6 +7693,8 @@ impl EngineCore {
             // ビューへの INSERT（TABLE-43・Issue #1671）。基表形へ書き換えて同じフォーム関数へ
             // `InTxn` を渡す。台帳・`mark_written` は基表の単位（ビュー名ではない）。
             ParsedSql::ViewInsert(stmt) => {
+                // 最初の書き込み文で writer を取得する（Issue #2400。待機超過は `55P03`。呼び出し元が `Failed` へ遷移）。
+                txn.ensure_writer()?;
                 let write_txn = txn.write_txn().ok_or_else(|| SqlSurfaceError::Internal {
                     detail: "internal error".to_string(),
                 })?;
@@ -7703,6 +7709,8 @@ impl EngineCore {
             // ビューへの DELETE／UPDATE（TABLE-43・Issue #1672）。INSERT と同じく台帳・`mark_written` は
             // 基表の単位（ビュー名ではない）。
             ParsedSql::ViewDelete(stmt) => {
+                // 最初の書き込み文で writer を取得する（Issue #2400。待機超過は `55P03`。呼び出し元が `Failed` へ遷移）。
+                txn.ensure_writer()?;
                 let write_txn = txn.write_txn().ok_or_else(|| SqlSurfaceError::Internal {
                     detail: "internal error".to_string(),
                 })?;
@@ -7716,6 +7724,8 @@ impl EngineCore {
                 Ok(outcome)
             }
             ParsedSql::ViewUpdate(stmt) => {
+                // 最初の書き込み文で writer を取得する（Issue #2400。待機超過は `55P03`。呼び出し元が `Failed` へ遷移）。
+                txn.ensure_writer()?;
                 let write_txn = txn.write_txn().ok_or_else(|| SqlSurfaceError::Internal {
                     detail: "internal error".to_string(),
                 })?;
@@ -7729,6 +7739,8 @@ impl EngineCore {
                 Ok(outcome)
             }
             ParsedSql::Delete(stmt) => {
+                // 最初の書き込み文で writer を取得する（Issue #2400。待機超過は `55P03`。呼び出し元が `Failed` へ遷移）。
+                txn.ensure_writer()?;
                 let write_txn = txn.write_txn().ok_or_else(|| SqlSurfaceError::Internal {
                     detail: "internal error".to_string(),
                 })?;
@@ -7781,6 +7793,8 @@ impl EngineCore {
                         v.returning().is_some()
                     }
                 };
+                // 最初の書き込み文で writer を取得する（Issue #2400。待機超過は `55P03`。呼び出し元が `Failed` へ遷移）。
+                txn.ensure_writer()?;
                 let write_txn = txn.write_txn().ok_or_else(|| SqlSurfaceError::Internal {
                     detail: "internal error".to_string(),
                 })?;
@@ -7808,6 +7822,8 @@ impl EngineCore {
                 Ok(outcome)
             }
             ParsedSql::Truncate(stmt) => {
+                // 最初の書き込み文で writer を取得する（Issue #2400。待機超過は `55P03`。呼び出し元が `Failed` へ遷移）。
+                txn.ensure_writer()?;
                 let write_txn = txn.write_txn().ok_or_else(|| SqlSurfaceError::Internal {
                     detail: "internal error".to_string(),
                 })?;
@@ -7906,6 +7922,8 @@ impl EngineCore {
             // `mark_written` の相手がなく、`has_writes` だけを立てる（立てないと COMMIT が write txn を
             // 破棄して setval の永続化が落ちる）。`lastval` は読み取りのみで印を付けない。
             ParsedSql::SequenceFunction(stmt) => {
+                // 最初の書き込み文で writer を取得する（Issue #2400。待機超過は `55P03`。呼び出し元が `Failed` へ遷移）。
+                txn.ensure_writer()?;
                 let write_txn = txn.write_txn().ok_or_else(|| SqlSurfaceError::Internal {
                     detail: "internal error".to_string(),
                 })?;
@@ -7931,6 +7949,8 @@ impl EngineCore {
             // `mark_written` する（漏れると遅延 FK の COMMIT 時検査が取りこぼす。P0）。
             ParsedSql::Do(stmt) => self.execute_do_in_txn(ctx, session, txn, stmt),
             ParsedSql::DataModifyingCte(stmt) => {
+                // 最初の書き込み文で writer を取得する（Issue #2400。待機超過は `55P03`。呼び出し元が `Failed` へ遷移）。
+                txn.ensure_writer()?;
                 let write_txn = txn.write_txn().ok_or_else(|| SqlSurfaceError::Internal {
                     detail: "internal error".to_string(),
                 })?;
@@ -7942,6 +7962,8 @@ impl EngineCore {
                 Ok(outcome)
             }
             ParsedSql::InsertSelect(stmt) => {
+                // 最初の書き込み文で writer を取得する（Issue #2400。待機超過は `55P03`。呼び出し元が `Failed` へ遷移）。
+                txn.ensure_writer()?;
                 let write_txn = txn.write_txn().ok_or_else(|| SqlSurfaceError::Internal {
                     detail: "internal error".to_string(),
                 })?;
@@ -12484,15 +12506,20 @@ impl EngineCore {
                     batch.operation_id.as_ref().map(|id| id.as_str()),
                 )?;
                 let table = batch.table.clone();
-                let result = match txn.write_txn() {
-                    Some(write_txn) => self.commit_copy_in_with_target(
-                        crate::tenant::WriteTarget::InTxn(write_txn),
-                        ctx,
-                        batch,
-                    ),
-                    None => Err(crate::sql::allowlist::SqlSurfaceError::Internal {
-                        detail: "internal error".to_string(),
-                    }),
+                // writer は COPY の確定処理（CopyDone 後）で初めて取得する（Issue #2400。データ受信中は
+                // 持たない）。取得失敗（`55P03`）も下の `Err` 腕で `fail()` を通す。
+                let result = match txn.ensure_writer() {
+                    Err(e) => Err(e),
+                    Ok(()) => match txn.write_txn() {
+                        Some(write_txn) => self.commit_copy_in_with_target(
+                            crate::tenant::WriteTarget::InTxn(write_txn),
+                            ctx,
+                            batch,
+                        ),
+                        None => Err(crate::sql::allowlist::SqlSurfaceError::Internal {
+                            detail: "internal error".to_string(),
+                        }),
+                    },
                 };
                 match result {
                     Ok(outcome) => {
