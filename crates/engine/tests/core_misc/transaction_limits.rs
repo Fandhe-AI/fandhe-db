@@ -7,6 +7,7 @@
 //! であることを確認する（文数は加算前に判定するため、N 文目までは成功し N+1 文目で失敗）。
 //! Issue #2409（SQL-31）: 持続時間・文数は writer の取得時点ではなく `BEGIN` から数える
 //! （writer 取得前の読み取り文も文数に入る）ことを末尾の 4 テストで固定する。
+//! Issue #1933（SQL-38）: `BEGIN READ ONLY` にも同じ上限が効くことを末尾の 2 テストで固定する。
 //! 既存の `sql31_transaction.rs` と同じ流儀（実 `Storage` ＋ `CpuScalarProvider`）。
 
 use engine::catalog::{ColumnDef, ColumnType, TableSchema};
@@ -263,6 +264,66 @@ fn expiry_without_writer_releases_and_reports_once() {
         .execute_sql_in_txn(&caller, &mut session, &mut txn, "COMMIT")
         .expect_err("failed txn");
     assert_eq!(second.wire_code(), "25P02");
+    engine
+        .execute_sql_in_txn(&caller, &mut session, &mut txn, "ROLLBACK")
+        .expect("rollback");
+    assert_eq!(txn.status(), TransactionStatus::Idle);
+}
+
+/// Issue #1933: READ ONLY の読み取り文も文数に入り、n+1 文目が `54000`・以後は `25P02`。
+#[test]
+fn read_only_statement_limit_is_enforced() {
+    let n = 3;
+    let (engine, path) = new_core(limits_with_statements(n));
+    let _cleanup = CleanupGuard(path);
+    let caller = ctx();
+    let mut session = SessionState::default();
+    let mut txn = engine.new_session_transaction();
+    engine
+        .execute_sql_in_txn(&caller, &mut session, &mut txn, "BEGIN READ ONLY")
+        .expect("begin");
+    for i in 1..=n {
+        engine
+            .execute_sql_in_txn(&caller, &mut session, &mut txn, SELECT_SQL)
+            .unwrap_or_else(|e| panic!("statement {i} within limit failed: {e}"));
+    }
+    let err = engine
+        .execute_sql_in_txn(&caller, &mut session, &mut txn, SELECT_SQL)
+        .expect_err("statement beyond the limit");
+    assert_eq!(err.wire_code(), "54000");
+    assert_eq!(txn.status(), TransactionStatus::Failed);
+    let err = engine
+        .execute_sql_in_txn(&caller, &mut session, &mut txn, SELECT_SQL)
+        .expect_err("failed txn");
+    assert_eq!(err.wire_code(), "25P02");
+    engine
+        .execute_sql_in_txn(&caller, &mut session, &mut txn, "ROLLBACK")
+        .expect("rollback");
+    assert_eq!(txn.status(), TransactionStatus::Idle);
+}
+
+/// Issue #1933: READ ONLY でも期限は `BEGIN` 起点で効き、期限後の文は `54000`、
+/// 失敗済みの Tx に対する `release_if_expired` は何もしない。
+#[test]
+fn read_only_duration_limit_fails_statement_after_expiry() {
+    let (engine, path) = new_core(limits_with_duration_ms(200));
+    let _cleanup = CleanupGuard(path);
+    let caller = ctx();
+    let mut session = SessionState::default();
+    let mut txn = engine.new_session_transaction();
+    for sql in ["BEGIN READ ONLY", SELECT_SQL] {
+        engine
+            .execute_sql_in_txn(&caller, &mut session, &mut txn, sql)
+            .unwrap_or_else(|e| panic!("{sql}: {e}"));
+    }
+    std::thread::sleep(std::time::Duration::from_millis(400));
+    assert_eq!(txn.remaining_duration(), Some(std::time::Duration::ZERO));
+    let err = engine
+        .execute_sql_in_txn(&caller, &mut session, &mut txn, SELECT_SQL)
+        .expect_err("expired select");
+    assert_eq!(err.wire_code(), "54000");
+    assert_eq!(txn.status(), TransactionStatus::Failed);
+    assert!(!txn.release_if_expired());
     engine
         .execute_sql_in_txn(&caller, &mut session, &mut txn, "ROLLBACK")
         .expect("rollback");
