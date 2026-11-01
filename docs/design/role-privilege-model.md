@@ -417,7 +417,7 @@ Issue #1962 は決定 D1・D2 のうち、`CREATE ROLE`／`CREATE USER`／`DROP 
 | K1 | 検査対象は束縛ロールを持ち所有者相当（DDL 権限ゲート通過）でない主体だけ。未束縛・所有者相当は従来どおり検査しない | 未束縛に拒否を課すと既存の SCHEMA 利用が全て `42501` になる。権限を広げる経路は作らず、#1971 で全セッションが束縛された時点で全面適用になる |
 | K2 | `public`・`pg_catalog`・`information_schema`・`pg_temp` への `ON SCHEMA`・`ALL ... IN SCHEMA` は構文段の `0A000` | 行・内部 ID を持たない仮想 SCHEMA。状態に依存しない拒否 |
 | K3 | 他テナントの SCHEMA は解決器が先に `None`（`3F000`）にし、権限検査の分岐は走らない | 権限の有無が存在オラクルにならない（D10） |
-| K4 | `search_path` 上の USAGE の無い SCHEMA は PostgreSQL 17 と同じく見えないものとして飛ばす（`creation_target`・`current_schema()` の probe）。修飾名は `42501` | PostgreSQL は path 上の SCHEMA を黙って飛ばす。未修飾名は現状テナント SCHEMA へ解決されない |
+| K4 | `search_path` 上の USAGE の無い SCHEMA は、作成先の判定（`creation_target`）では `42501`（受入基準どおり。他テナント・不在は従来どおり次の要素へ進み存在オラクルにしない）。`current_schema()`・`current_schemas()` の値の列挙では見えないものとして飛ばす。修飾名も `42501` | 受入基準の「`search_path` 経由も `42501`」に合わせる。値の列挙は権限エラーにせず可視な SCHEMA だけを返す。未修飾名は現状テナント SCHEMA へ解決されない |
 | K5 | 作成先が SCHEMA の作成系 DDL は CREATE 判定を `require_creation_target` に結線するが、`ServerDdl` ゲートを必要条件として残す | `ServerDdl` を CREATE に置き換えるとロールの束縛だけで DDL 権限が広がる。所有者の機構（#2236）・主体の束縛（#1971）の後 |
 | K7 | 修飾名の作成位置でも USAGE を要求する（PostgreSQL は CREATE だけで足りる。拒否側の意図的な差） | 解決器は位置を区別しない。権限を広げない |
 | K9 | `ALL SEQUENCES／FUNCTIONS／ROUTINES／PROCEDURES IN SCHEMA` は `0A000` のまま（#2235） | SEQUENCE・FUNCTION 単位の ACL 適用は #2235 の中核 |
@@ -428,8 +428,8 @@ Issue #1962 は決定 D1・D2 のうち、`CREATE ROLE`／`CREATE USER`／`DROP 
 
 ### 既知の差・対象外
 
-- 受入基準の「`search_path` 経由も `42501`」は PostgreSQL 17（path から飛ばす）と異なるため、飛ばす側を採った（K4）。spec 側で別の
-  契約を意図している場合は spec リポ側の課題として扱う。
+- 受入基準の「`search_path` 経由も `42501`」は、作成先の判定で `42501` を返すことで満たす（K4）。PostgreSQL 17 は path 上の
+  SCHEMA を飛ばすため、この点は PostgreSQL と異なる（受入基準を優先した意図的な差）。
 - `GRANT ... ON SCHEMA` の実行は、SCHEMA の所有者の概念が無いため所有者相当（DDL 権限ゲート通過）か、対象に GRANT OPTION を
   持つ束縛ロールだけ（#2236 まで）。継承（#2232）は USAGE 判定のロール集合に未反映（直接の行と PUBLIC の行だけ）。
 - 対象外: SEQUENCE・FUNCTION 単位の ACL（#2235）、所有者・PUBLIC の既定（#2236）、`ALTER DEFAULT PRIVILEGES ... IN SCHEMA`

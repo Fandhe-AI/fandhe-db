@@ -832,7 +832,9 @@ impl EngineCore {
     /// 準備済み文のトークン列に現れる SCHEMA 修飾の内部キー（`#<id>.<名前>`。解決器だけが作れる）から
     /// SCHEMA ID を集め、束縛ロールの USAGE を再検査する（Bind の入口。件数はトークン数で有界）。
     /// 解決時のテナント（`resolution_tenant`）が無ければ Parse が SCHEMA を解決していないため何もしない。
-    fn recheck_prepared_schema_usage(
+    /// wire-server は `$n` を持たない準備済み文（`PreparedStatement::Parsed`）の Bind でも、解決結果を
+    /// 使い回す分岐で必ず本メソッドを呼ぶ（Parse は主体を持たないため、ここが唯一の USAGE 検査点）。
+    pub fn recheck_prepared_schema_usage(
         &self,
         session: &SessionState,
         prepared: &super::PreparedSql,

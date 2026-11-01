@@ -265,3 +265,40 @@ fn dropping_schema_releases_roles_for_drop_role() {
     ok(&core, "t1", &mut o, "DROP SCHEMA s CASCADE");
     ok(&core, "t1", &mut o, "DROP ROLE alice");
 }
+
+#[test]
+fn usage_denial_survives_residual_column_qualifier() {
+    let (core, _g, mut o, mut a) = fixture("sacl_qual");
+    // 列修飾（`t.id`）が残る文でも USAGE の拒否は `42601` に化けず `42501`。
+    assert_eq!(code(&core, "t1", &mut a, "SELECT t.id FROM s.t"), "42501");
+    ok(&core, "t1", &mut o, "GRANT USAGE ON SCHEMA s TO alice");
+    ok(&core, "t1", &mut a, "SELECT t.id FROM s.t");
+}
+
+#[test]
+fn prepared_without_params_is_rechecked_by_public_entry() {
+    let (core, _g, mut o, mut a) = fixture("sacl_prep");
+    ok(&core, "t1", &mut o, "GRANT USAGE ON SCHEMA s TO alice");
+    assert!(a.bind_resolution_tenant("t1"));
+    // `$n` 無しの文は wire 側で Parsed のまま保持される。Bind の入口（wire が呼ぶ公開メソッド）が
+    // USAGE の取り消しを反映して `42501` にする。
+    let prepared = core
+        .parse_sql_prepared_with_declared_in_session(&a, "SELECT id FROM s.t", &[])
+        .expect("parse");
+    assert!(core.recheck_prepared_schema_usage(&a, &prepared).is_ok());
+    ok(&core, "t1", &mut o, "REVOKE USAGE ON SCHEMA s FROM alice");
+    let err = core
+        .recheck_prepared_schema_usage(&a, &prepared)
+        .expect_err("revoked");
+    assert_eq!(err.wire_code(), "42501");
+}
+
+#[test]
+fn search_path_creation_target_requires_usage() {
+    let (core, _g, _o, mut a) = fixture("sacl_ct");
+    ok(&core, "t1", &mut a, "SET search_path = s, public");
+    let err = core
+        .require_creation_target(&ctx("t1"), &a, false, "x")
+        .expect_err("denied");
+    assert_eq!(err.wire_code(), "42501");
+}

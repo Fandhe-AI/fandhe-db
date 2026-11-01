@@ -610,7 +610,11 @@ impl<'a, 'e> CorePlHost<'a, 'e> {
         ];
         let resolver = self.core.schema_resolver_for(self.ctx, self.session);
         crate::sql::relation_name::rewrite_relation_names_full(&mut toks, Some(&resolver))
-            .map_err(|_| not_found())?;
+            .map_err(|e| match e {
+                // USAGE の拒否は `42501` のまま返す（`42P01` へ化けさせない。Issue #2234）。
+                SqlSurfaceError::InsufficientPrivilege => e,
+                _ => not_found(),
+            })?;
         let Some(Token::Ident(key)) = toks.get(3) else {
             return Err(not_found());
         };

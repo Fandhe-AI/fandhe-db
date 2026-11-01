@@ -5063,9 +5063,9 @@ impl EngineCore {
         })
     }
 
-    /// `search_path` の要素の可視性 probe（`creation_target`・`current_schema()`）。自テナントに在り、かつ
-    /// USAGE を持つ SCHEMA だけが「在る」。USAGE の無い SCHEMA は PostgreSQL と同じく path 上で黙って
-    /// 飛ばす（`42501` にしない。設計記録 K4）。他テナントの SCHEMA は不在と同じ。
+    /// `search_path` の要素の可視性 probe（`current_schema()`・`current_schemas()`）。自テナントに在り、かつ
+    /// USAGE を持つ SCHEMA だけが「在る」。USAGE の無い SCHEMA は値の列挙では黙って飛ばす（設計記録 K4）。
+    /// 作成先の判定（`creation_target`）は飛ばさず `42501` にする。他テナントの SCHEMA は不在と同じ。
     pub(crate) fn schema_visible_for(
         &self,
         ctx: &PolicyContext,
@@ -5084,6 +5084,25 @@ impl EngineCore {
             Err(crate::sql::allowlist::SqlSurfaceError::InsufficientPrivilege) => Ok(false),
             Err(e) => Err(e),
         }
+    }
+
+    /// `creation_target` 用の probe。自テナントに在る SCHEMA に USAGE が無ければ `42501`（飛ばさない。
+    /// 他テナント・不在は `false` で、権限の有無が存在オラクルにならない。Issue #2234、設計記録 K4）。
+    fn schema_exists_requiring_usage(
+        &self,
+        ctx: &PolicyContext,
+        session: &crate::sql::mode::SessionState,
+        schema: &str,
+    ) -> Result<bool, crate::sql::allowlist::SqlSurfaceError> {
+        let Some(id) = self
+            .storage
+            .schema_id(ctx.tenant_id(), schema)
+            .map_err(crate::catalog::table_lookup_error)?
+        else {
+            return Ok(false);
+        };
+        self.check_schema_usage_for(ctx.tenant_id(), session, id)?;
+        Ok(true)
     }
 
     /// 永続オブジェクトを作る DDL の作成先を `search_path` から判定する（TABLE-27・Issue #1715）。
@@ -5118,7 +5137,8 @@ impl EngineCore {
         if explicit_public {
             return Ok(());
         }
-        let probe = |schema: &str| self.schema_visible_for(ctx, session, schema);
+        // 作成先の判定では、path 上の USAGE の無い SCHEMA を飛ばさず `42501` にする（受入基準。K4）。
+        let probe = |schema: &str| self.schema_exists_requiring_usage(ctx, session, schema);
         crate::sql::search_path::creation_target(session, &probe).map(|_| ())
     }
 
