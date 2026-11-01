@@ -71,6 +71,7 @@ pub use temp_route::SessionRoutedSql;
 
 mod ctas_exec;
 mod matview_exec;
+mod row_lock_exec;
 
 // INSERT ... SELECT の実行本体（SQL-51・Issue #1733）。
 mod insert_select_exec;
@@ -1753,7 +1754,8 @@ pub enum ParsedSql {
     DeleteUsing(Box<crate::sql::allowlist::ValidatedDeleteUsing>),
     /// 行ロック句つきの `SELECT`（`FOR UPDATE`／`FOR NO KEY UPDATE`／`FOR SHARE`／`FOR KEY SHARE`、
     /// `OF`、`NOWAIT`／`SKIP LOCKED`。SQL-38・Issue #1957）。構文解釈と併用検査（`sql::row_lock`）までを
-    /// 担い、実行入口は Issue #2230（ロックの取得）・#2231（`SKIP LOCKED` の実行）まで `0A000` で拒否する
+    /// 担う。実行は Issue #2230 で writer の取得（`NOWAIT` は `55P03`）として実装済み（`core::row_lock_exec`）。
+    /// `SKIP LOCKED` の実行は #2231 まで、一時表だけを対象にした形も `0A000` で拒否する
     /// （ロックを取らずに素の SELECT として実行する fail-open を作らない）。既存の [`Self::Statement`] に
     /// フィールドを足さず別 variant にしているのは、句を黙って無視する経路を作らず、網羅 `match` の
     /// 追随漏れをコンパイラに検出させるため。
@@ -2064,8 +2066,10 @@ fn session_time_zone_scope(
     )
 }
 
-/// 行ロック句つき SELECT の暫定ゲート（SQL-38・Issue #1957）。ロックの取得は Issue #2230、
-/// `SKIP LOCKED` の実行は #2231 の担当で、それまでは受理した形も実行入口で `0A000` にする。
+/// 一時表だけを対象にした行ロック句つき SELECT の暫定ゲート（SQL-38・Issue #1957。`core::temp_route`
+/// から呼ばれる）。永続表の取得は Issue #2230 で実装済みだが、一時表はセッション専用で競合せず、
+/// 一時コアの Tx 経路との整合が未整理のため `0A000` のままにする（ロックを取らない素の SELECT として
+/// 実行する fail-open を作らない）。
 fn row_lock_not_supported() -> crate::sql::allowlist::SqlSurfaceError {
     crate::sql::allowlist::SqlSurfaceError::feature_not_supported(
         "row-level locking clauses are not supported yet",
@@ -3717,6 +3721,32 @@ impl EngineCore {
         session: &crate::sql::mode::SessionState,
     ) -> Result<(), crate::sql::allowlist::SqlSurfaceError> {
         txn.begin_implicit(&self.storage, session)
+    }
+
+    /// [`Self::begin_implicit_transaction`] の複数文版。writer を取得する前に `stmts` の行ロック句を
+    /// 構文だけで走査し、`SKIP LOCKED` なら `0A000`（writer に触れずに拒否）、いずれかが `NOWAIT` なら
+    /// writer を待たずに取得して他者保持中は即時 `55P03` にする（SQL-38・Issue #2230）。
+    /// 構文誤りなど走査できない文は無視し、その文の実行時に通常のエラーとして報告させる。
+    pub fn begin_implicit_transaction_for<'e>(
+        &'e self,
+        txn: &mut crate::sql::transaction::SessionTransaction<'e>,
+        session: &crate::sql::mode::SessionState,
+        stmts: &[&str],
+    ) -> Result<(), crate::sql::allowlist::SqlSurfaceError> {
+        let mut nowait = false;
+        for stmt in stmts {
+            let Ok(tokens) = crate::sql::lexer::tokenize(stmt) else {
+                continue;
+            };
+            let Ok(tokens) = Self::normalize_row_count_clauses(tokens) else {
+                continue;
+            };
+            let Ok((_, Some(syntax))) = crate::sql::row_lock::extract_row_locking(tokens) else {
+                continue;
+            };
+            nowait |= syntax.writer_wait()?;
+        }
+        txn.begin_implicit_with(&self.storage, session, nowait)
     }
 
     /// 辞書的情報源抽出（TASK-109・PLAN-5）の設定
@@ -7256,6 +7286,12 @@ impl EngineCore {
         {
             return self.execute_subquery_dml_autocommit(ctx, session, parsed);
         }
+        // SQL-38・Issue #2230: 行ロック句つき SELECT は文単位の暗黙トランザクションで writer を取得し、
+        // 文の終わりに解放する（`NOWAIT` は暗黙 Tx の開始時点で効かせる）。
+        if matches!(parsed, ParsedSql::LockingSelect(_)) {
+            // `ON COMMIT` の適用は `commit_implicit`（`commit_active`）側が行うため、ここでは呼ばない。
+            return self.execute_locking_select_autocommit(ctx, session, parsed);
+        }
         let outcome = self.execute_parsed_statement(ctx, session, parsed)?;
         // 自動コミットの文が成功した直後に、一時表の `ON COMMIT` 動作を適用する
         // （TABLE-44・Issue #1683。失敗した文では適用しない。明示・暗黙トランザクションの
@@ -7862,9 +7898,12 @@ impl EngineCore {
             ParsedSql::Statement(stmt) => {
                 self.execute_validated_in_session(ctx, session, stmt.clone())
             }
-            // SQL-38・Issue #1957: 行ロック句の取得は Issue #2230 まで未実装。ロックを取らずに素の
-            // SELECT として実行しない（fail-open にしない）。ストレージ・台帳・世代に触れる前に返す。
-            ParsedSql::LockingSelect(_) => Err(row_lock_not_supported()),
+            // SQL-38・Issue #2230: 行ロック句つき SELECT は `execute_parsed_in_session_inner` が
+            // 暗黙 Tx の入口へ振り分けるため、ここへは届かない。届いたら構造上の誤りとして、
+            // ロックを取らずに素の SELECT として実行せず fail-closed で拒否する。
+            ParsedSql::LockingSelect(_) => Err(crate::sql::allowlist::SqlSurfaceError::Internal {
+                detail: "internal error".to_string(),
+            }),
             // トランザクション文脈を持たない本エントリポイントは `BEGIN`／
             // `COMMIT`／`ROLLBACK` を受理しない（SQL-31・TASK-221。
             // トランザクション対応の実行入口は [`Self::execute_sql_in_txn`]）。
@@ -8658,9 +8697,11 @@ impl EngineCore {
             )),
             // COPY・DDL 等、明示トランザクション内での対応外の文（対象外。
             // `docs/design/explicit-transaction.md` 参照）。
-            // SQL-38・Issue #1957: セッション入口と同じ暫定ゲート（失敗は呼び出し元がトランザクションを
+            // SQL-38・Issue #2230: writer を遅延取得して読み取る（失敗は呼び出し元がトランザクションを
             // `Failed` へ遷移させる）。
-            ParsedSql::LockingSelect(_) => Err(row_lock_not_supported()),
+            ParsedSql::LockingSelect(locking) => {
+                self.execute_locking_select_in_active_txn(ctx, session, txn, locking)
+            }
             _ => Err(SqlSurfaceError::transaction_feature_not_supported(
                 "this statement is not supported inside an explicit transaction",
             )),

@@ -301,3 +301,61 @@ fn implicit_transaction_waits_before_first_statement_and_reads_after_acquiring_w
     assert_eq!(last, vec!["1".to_string(), "2".to_string()]);
     assert_eq!(read_ready_for_query_status(&mut a), b'I');
 }
+
+/// 複数文メッセージ内の `FOR UPDATE NOWAIT` は暗黙 Tx の writer 取得時点で待機方針に反映され、
+/// 待機上限（5 秒）を待たずに即時 `55P03` になる。`FOR UPDATE SKIP LOCKED` は writer に触れる前に
+/// `0A000`（Issue #2230。ポインタ: SQL-38）。
+#[test]
+fn multi_statement_nowait_is_immediate_55p03_and_skip_locked_is_0a000() {
+    let path = temp_db::unique_db_path("write-lock-wait-row-lock-multi");
+    let _guard = temp_db::CleanupGuard(path.clone());
+    let storage = Storage::open(&path).expect("open storage");
+    storage
+        .create_table(&TableSchema::new(
+            "documents",
+            vec![ColumnDef::new("embedding", ColumnType::Vector(3), false)],
+        ))
+        .expect("create table");
+    let wait = wire_server::write_lock_wait_opt::resolve(Some("5000")).expect("in range");
+    let core = Arc::new(
+        EngineCore::from_storage(storage, Box::new(CpuScalarProvider)).with_write_lock_wait(wait),
+    );
+    let users_path = write_user_store_file(&[
+        ("alice", "tenant-a", "correct-horse"),
+        ("bob", "tenant-b", "battery-staple"),
+    ]);
+    let addr = spawn_server_with_engine(&users_path, Arc::clone(&core));
+    let mut a = authenticate_to_ready_for_query(addr, "alice", "correct-horse");
+    let mut b = authenticate_to_ready_for_query(addr, "bob", "battery-staple");
+
+    send_simple_query(&mut a, "BEGIN");
+    assert_eq!(read_command_complete(&mut a), "BEGIN");
+    read_ready_for_query(&mut a);
+    send_simple_query(
+        &mut a,
+        "INSERT INTO documents (id, embedding) VALUES (1, '[0.1,0.2,0.3]') USING OPERATION_ID 'op-2230-m1'",
+    );
+    assert_eq!(read_command_complete(&mut a), "INSERT 0 1");
+    read_ready_for_query(&mut a);
+
+    let started = std::time::Instant::now();
+    send_simple_query(
+        &mut b,
+        "SELECT id FROM documents FOR UPDATE NOWAIT; SELECT 1",
+    );
+    expect_error_response_with_sqlstate(&mut b, "55P03");
+    assert_eq!(read_ready_for_query_status(&mut b), b'I');
+    assert!(
+        started.elapsed() < std::time::Duration::from_secs(3),
+        "NOWAIT must not wait for the write lock"
+    );
+
+    let started = std::time::Instant::now();
+    send_simple_query(
+        &mut b,
+        "SELECT id FROM documents FOR UPDATE SKIP LOCKED; SELECT 1",
+    );
+    expect_error_response_with_sqlstate(&mut b, "0A000");
+    assert_eq!(read_ready_for_query_status(&mut b), b'I');
+    assert!(started.elapsed() < std::time::Duration::from_secs(3));
+}
