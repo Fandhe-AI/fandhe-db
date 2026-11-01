@@ -608,3 +608,97 @@ fn extended_describe_reexpands_view_against_begin_snapshot() {
     );
     a.ok("COMMIT");
 }
+
+/// `FETCH` の結果行を、先頭列（id）を含む表示文字列の整列済み一覧で返す。
+fn fetch_rows(a: &mut Tx<'_>, sql: &str) -> Vec<String> {
+    match a.ok(sql) {
+        SqlOutcome::Fetch(r) => {
+            let mut v: Vec<String> = r
+                .rows
+                .iter()
+                .map(|row| format!("{:?}", row.cells))
+                .collect();
+            v.sort();
+            v
+        }
+        other => panic!("expected Fetch outcome for {sql}, got {other:?}"),
+    }
+}
+
+/// WIRE-15（2026-10-16 改訂注記）・SQL-19・SQL-31・Issue #2411: writer 取得後に宣言したカーソルは
+/// 取得時点の最新の確定状態に自分の未 commit 変更を加えた行集合で確定し、他テナントの行は入らない。
+#[test]
+fn cursor_declared_after_writer_acquire_sees_acquire_time_snapshot_and_own_writes() {
+    let (core, _g) = new_core("sql31-cur-after");
+    seed_docs(&core, "tenant-a");
+    let mut a = Tx::new(&core, "tenant-a");
+    a.ok("BEGIN");
+    ok(
+        &core,
+        &ctx("tenant-a"),
+        "INSERT INTO docs2 (id, n) VALUES (7, 1) USING OPERATION_ID 'b-a'",
+    );
+    ok(
+        &core,
+        &ctx("tenant-b"),
+        "INSERT INTO docs2 (id, n) VALUES (8, 1) USING OPERATION_ID 'b-b'",
+    );
+    a.ok("INSERT INTO docs (id, n) VALUES (4, 40) USING OPERATION_ID 'a-w'");
+    a.ok("DECLARE c2 CURSOR FOR SELECT id FROM docs2 LIMIT 100");
+    let c2 = fetch_rows(&mut a, "FETCH 100 FROM c2");
+    assert_eq!(c2.len(), 1, "own-tenant commit only: {c2:?}");
+    assert!(c2[0].contains('7'), "must see tenant-a row 7: {c2:?}");
+    a.ok("DECLARE c3 CURSOR FOR SELECT id FROM docs LIMIT 100");
+    assert_eq!(fetch_rows(&mut a, "FETCH 100 FROM c3").len(), 4);
+    a.ok("COMMIT");
+}
+
+/// WIRE-15・SQL-19・SQL-31・Issue #2411: writer 取得前に宣言したカーソルは取得の後も `BEGIN` 時点の
+/// 行集合のまま払い出され、同じトランザクションの取得後に宣言したカーソルは取得時点の状態を見る。
+#[test]
+fn cursor_declared_before_writer_acquire_keeps_begin_snapshot_after_acquire() {
+    let (core, _g) = new_core("sql31-cur-before");
+    seed_docs(&core, "tenant-a");
+    let mut a = Tx::new(&core, "tenant-a");
+    a.ok("BEGIN");
+    a.ok("DECLARE c1 CURSOR FOR SELECT id, n FROM docs LIMIT 100");
+    assert_eq!(fetch_rows(&mut a, "FETCH 1 FROM c1").len(), 1);
+    ok(
+        &core,
+        &ctx("tenant-a"),
+        "INSERT INTO docs2 (id, n) VALUES (7, 1) USING OPERATION_ID 'b1'",
+    );
+    a.ok("INSERT INTO docs (id, n) VALUES (4, 40) USING OPERATION_ID 'a-w'");
+    let rest = fetch_rows(&mut a, "FETCH 100 FROM c1");
+    assert_eq!(
+        rest.len(),
+        2,
+        "BEGIN-time snapshot has 3 rows in total: {rest:?}"
+    );
+    assert!(
+        rest.iter().all(|r| !r.contains("40")),
+        "own insert must not leak into an earlier cursor: {rest:?}"
+    );
+    a.ok("DECLARE c2 CURSOR FOR SELECT id FROM docs2 LIMIT 100");
+    assert_eq!(fetch_rows(&mut a, "FETCH 100 FROM c2").len(), 1);
+    a.ok("COMMIT");
+}
+
+/// WIRE-15・SQL-19・SQL-31・Issue #2411: 書き込みを伴わない writer 取得（`LOCK TABLE`）の後に
+/// 宣言したカーソルも、取得時点の最新の確定状態を見る（dirty なしの読み取り源）。
+#[test]
+fn cursor_declared_after_lock_table_sees_acquire_time_snapshot() {
+    let (core, _g) = new_core("sql31-cur-lock");
+    seed_docs(&core, "tenant-a");
+    let mut a = Tx::new(&core, "tenant-a");
+    a.ok("BEGIN");
+    ok(
+        &core,
+        &ctx("tenant-a"),
+        "INSERT INTO docs (id, n) VALUES (9, 90) USING OPERATION_ID 'b1'",
+    );
+    a.ok("LOCK TABLE docs2");
+    a.ok("DECLARE c CURSOR FOR SELECT id FROM docs LIMIT 100");
+    assert_eq!(fetch_rows(&mut a, "FETCH 100 FROM c").len(), 4);
+    a.ok("COMMIT");
+}
