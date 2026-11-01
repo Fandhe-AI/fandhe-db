@@ -163,12 +163,7 @@ impl EngineCore {
         let udfs = session.udfs().clone();
         // `current_schema` 系を含む文だけ SCHEMA の実在を照会する（`execute_validated_in_session` と同じ）。
         let _schema_fn = if crate::sql::const_select::uses_schema_fn(validated) {
-            let probe = |schema: &str| {
-                self.storage
-                    .schema_id(ctx.tenant_id(), schema)
-                    .map(|id| id.is_some())
-                    .map_err(crate::catalog::table_lookup_error)
-            };
+            let probe = |schema: &str| self.schema_visible_for(ctx, session, schema);
             let values = crate::sql::search_path::resolve_schema_functions(session, &probe)?;
             Some(crate::sql::search_path::SchemaFnScope::enter(
                 crate::sql::search_path::SchemaFnMode::Values(values),

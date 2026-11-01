@@ -59,6 +59,7 @@ mod row_codec;
 mod row_id_tenant_scope;
 mod sql39_role_ddl;
 mod sql40_grant_revoke;
+mod sql40_schema_grant;
 mod table15_hnsw_invalidation;
 mod table16_check_constraint;
 mod table16_primary_key;

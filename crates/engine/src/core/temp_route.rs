@@ -829,6 +829,40 @@ impl EngineCore {
             )
     }
 
+    /// 準備済み文のトークン列に現れる SCHEMA 修飾の内部キー（`#<id>.<名前>`。解決器だけが作れる）から
+    /// SCHEMA ID を集め、束縛ロールの USAGE を再検査する（Bind の入口。件数はトークン数で有界）。
+    /// 解決時のテナント（`resolution_tenant`）が無ければ Parse が SCHEMA を解決していないため何もしない。
+    fn recheck_prepared_schema_usage(
+        &self,
+        session: &SessionState,
+        prepared: &super::PreparedSql,
+    ) -> Result<(), SqlSurfaceError> {
+        if crate::sql::schema_privilege::acl_checked_principal(session).is_none() {
+            return Ok(());
+        }
+        let Some(tenant) = session.resolution_tenant() else {
+            return Ok(());
+        };
+        let mut seen: Vec<u64> = Vec::new();
+        for t in &prepared.tokens {
+            let crate::sql::lexer::Token::Ident(name) = t else {
+                continue;
+            };
+            if !name.starts_with('#') {
+                continue;
+            }
+            if let Ok(crate::catalog::namespace::RelationKey::InSchema { schema_id, .. }) =
+                crate::catalog::namespace::RelationKey::parse(name)
+            {
+                if !seen.contains(&schema_id) {
+                    seen.push(schema_id);
+                    self.check_schema_usage_for(tenant, session, schema_id)?;
+                }
+            }
+        }
+        Ok(())
+    }
+
     fn bind_prepared_in_session_snap(
         &self,
         session: &SessionState,
@@ -872,6 +906,9 @@ impl EngineCore {
                     &prepared.tokens,
                     &prepared.qualified_positions,
                 )?;
+                // SCHEMA 修飾の USAGE を Bind 時点の ACL で再検査する（Parse は主体を持たない入口で
+                // 解決するため、Parse 後の `REVOKE` を Execute へ反映する。Issue #2234、設計記録 K12）。
+                self.recheck_prepared_schema_usage(session, prepared)?;
                 let parsed = self.bind_prepared_snap(prepared, values, read_snap)?;
                 // `COPY`（Issue #1760）は Execute で元 SQL を現在のカタログへ再解決する
                 // （`begin_copy_temp`）ため、Bind 後に一時表が作成・削除されると宛先が永続表から

@@ -281,6 +281,7 @@ pub(crate) mod scalar_index;
 pub(crate) mod scalar_plan;
 pub mod scan;
 pub(crate) mod schema_dependency;
+pub(crate) mod schema_privilege;
 pub mod search_path;
 pub(crate) mod sequence_fn;
 pub(crate) mod sequence_scope;

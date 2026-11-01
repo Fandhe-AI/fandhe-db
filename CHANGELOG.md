@@ -9,6 +9,7 @@
 
 ### Added
 
+- `GRANT`／`REVOKE` が SCHEMA 単位（`ON SCHEMA`・`ON ALL TABLES IN SCHEMA`。権限は USAGE・CREATE）を受理する（Issue #2234・SQL-40・RLS-12）。束縛ロール（DDL 権限ゲート通過の主体を除く）が USAGE の無い SCHEMA を修飾名で参照すると `42501`（他テナント・不在は `3F000`）。現在ロール未束縛のセッションの `GRANT … ON SCHEMA s` は `0A000` ではなく `42501` になる。公開 API の変更はない。
 - `SET TRANSACTION` と `SET SESSION CHARACTERISTICS AS TRANSACTION` を受理する（Issue #1939・SQL-38 (7)(a)・SQL-31 ポインタ。契約の詳細は spec 側を参照）。
   BREAKING CHANGE: 公開 enum `SqlOutcome`・`ParsedSql` に `SetTransaction`、`SqlSurfaceError` に `SetTransactionAfterQuery` を追加した。修飾子なしの `START TRANSACTION` がセッション既定を継承するようになった。
 - `row_security`（`SET`／`RESET`／`SHOW`・StartupMessage）とポリシーの適用判定（`BYPASSRLS`・所有者・対象ロール）を追加した（Issue #2278・RLS-12・RLS-13・SQL-39）。RLS 有効な表への読み取り・書き込み・`COPY` は `row_security = off` のとき行を扱う前に `42501`（`query would be affected by row-level security policy for table "..."`。表名は自テナントのみ）で拒否する。

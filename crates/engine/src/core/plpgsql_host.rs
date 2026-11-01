@@ -415,7 +415,7 @@ impl<'a, 'e> CorePlHost<'a, 'e> {
         let parsed = {
             // parse 中の定数式畳み込みがセッション TimeZone を読む。
             let _tz = session_time_zone_scope(self.session);
-            let resolver = self.core.schema_resolver(self.ctx);
+            let resolver = self.core.schema_resolver_for(self.ctx, self.session);
             // 明示トランザクションの writer 取得前は、検証・ビュー展開を `BEGIN` 時点の
             // スナップショットのカタログで行い、後続の実行の読み取り元と揃える（Issue #2403）。
             let read_snap = if self.txn.status() == TransactionStatus::InTransaction {
@@ -477,7 +477,7 @@ impl<'a, 'e> CorePlHost<'a, 'e> {
         }
         let mut work: Vec<Token> = tokens.to_vec();
         {
-            let resolver = self.core.schema_resolver(self.ctx);
+            let resolver = self.core.schema_resolver_for(self.ctx, self.session);
             // 関係名の解決に失敗する文は、後続の解析が同じ理由で拒否する（ここでは検査を省く）。
             if crate::sql::relation_name::rewrite_relation_names_full(&mut work, Some(&resolver))
                 .is_err()
@@ -608,7 +608,7 @@ impl<'a, 'e> CorePlHost<'a, 'e> {
             Token::Keyword(Keyword::From),
             rel,
         ];
-        let resolver = self.core.schema_resolver(self.ctx);
+        let resolver = self.core.schema_resolver_for(self.ctx, self.session);
         crate::sql::relation_name::rewrite_relation_names_full(&mut toks, Some(&resolver))
             .map_err(|_| not_found())?;
         let Some(Token::Ident(key)) = toks.get(3) else {

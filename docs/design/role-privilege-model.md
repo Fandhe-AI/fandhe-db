@@ -323,7 +323,7 @@ PostgreSQL 17 の公開挙動と本 ADR の D5・D8・D9・D10 に従い、spec 
 | J5 | 継承（メンバーシップ経由の権限）は見ない。付与者本人の直接の行と PUBLIC の行（「何らかの権限を持つか」の判定だけ）で判定する | 継承は #2232 の担当 |
 | J6 | 表と列で許す権限は `PrivilegeObject::allowed_privileges` と一致させる。対象に許されない権限（`USAGE ON TABLE` 等）と PUBLIC への GRANT OPTION は `0LP01`（`ErrorClass::InvalidGrantOperation` を追加。HTTP 射影は 400・NoSQL 表層からは到達不能） | PostgreSQL 17 と同じ SQLSTATE |
 | J7 | 付与先ロールは自テナントのカタログだけで引く。不在と「他テナントにだけ在る」は同じ `42704`・同じ文言形式（`SqlSurfaceError::UndefinedRole`。利用者が書いた名前だけを含む） | D10 |
-| J8 | 範囲外の形は構文段で固定の `0A000`: `ON SCHEMA`・`ON SEQUENCE`・`ON FUNCTION`・`ON DATABASE` などの対象種別・`ALL ... IN SCHEMA`（#2234・#2235）、`GRANTED BY`、`ALTER DEFAULT PRIVILEGES`（#2237。汎用 `ALTER` より前で分岐） | 状態に依存しない拒否なので存在オラクルにならない |
+| J8 | 範囲外の形は構文段で固定の `0A000`（`ON SCHEMA`・`ON ALL TABLES IN SCHEMA` は #2234 で解禁。§10）: `ON SCHEMA`・`ON SEQUENCE`・`ON FUNCTION`・`ON DATABASE` などの対象種別・`ALL ... IN SCHEMA`（#2234・#2235）、`GRANTED BY`、`ALTER DEFAULT PRIVILEGES`（#2237。汎用 `ALTER` より前で分岐） | 状態に依存しない拒否なので存在オラクルにならない |
 | J9 | 明示トランザクション内は J1 のゲートの後で `0A000` | ACL の書き込みは独立した write txn で commit され、ROLLBACK で取り消せない |
 | J10 | ビュー・matview への表単位の GRANT／REVOKE は受理する。列リストはベース表だけで、ビュー・matview は `0A000` | ビューの列の解決（別名・式列）が未整備。fail-closed |
 | J11 | 一時表は一時カタログの振り分け（`parse_tokens_gated`）で `0A000`。ACL のキーは共有カタログの relation キーで、セッション内の一時表とは名前空間が違う | 既存の混在拒否に乗る |
@@ -390,3 +390,48 @@ Issue #1962 は決定 D1・D2 のうち、`CREATE ROLE`／`CREATE USER`／`DROP 
 ### 対象外
 
 `CREATEROLE`／`ADMIN OPTION` による判定（#1966・#1971）、ログイン名対応表への登録（#2233）、`VALID UNTIL`・`CONNECTION LIMIT`（#2233）、`IN ROLE`・`ROLE`・`ADMIN`（#2232）、`ALTER ROLE`・`SET ROLE`（#1963）、`BYPASSRLS` の属性ビット（#2278 段 2）、所有者による依存検査（#2236）、自分のセッションのロールを DROP したときの `55006`（#1971 の後）、`CREATE GROUP`／`DROP GROUP`。
+
+## 10. Issue #2234 実装記録（SCHEMA 単位の GRANT／REVOKE と USAGE 検査）
+
+ビヘイビア ID ポインタ: SQL-40・RLS-12（spec 本文は転記しない）。意味論は PostgreSQL 17 の公開挙動と D5・D8・D10、
+[schema-tenant-namespace.md](schema-tenant-namespace.md) D10 に従う。
+
+### 実装した範囲
+
+- 構文（`sql/allowlist/grant.rs`）: `GRANT／REVOKE {USAGE|CREATE|ALL [PRIVILEGES]} ON SCHEMA <名>[, ...]` と
+  `GRANT／REVOKE <表の権限> ON ALL TABLES IN SCHEMA <名>[, ...]`。SCHEMA 名は裸の識別子（修飾名・列リストは `42601`）、
+  SCHEMA に許されない権限は `0LP01`。
+- 適用（`catalog/privilege/apply.rs`）: SCHEMA 名は書き込みと同じ txn のスナップショットで自テナントの内部 ID へ解決し
+  （不在・他テナントは同じ `3F000`）、`PrivilegeObject::Schema(id)` の ACL を更新する。`ALL TABLES IN SCHEMA` は
+  その txn で既に在る表・ビュー・matview だけへ展開し（後から作った表には効かない。SEQUENCE は含めない）、既存の表対象の
+  判定規則（GRANT OPTION・警告・CASCADE）へ流す。展開数は走査上限（`54000`）で有界。
+- 読み取りと掃除（`catalog/privilege/schema.rs`）: ロール集合と PUBLIC の行の権限ビットの和、`DROP SCHEMA`（RESTRICT・
+  CASCADE）と同じ txn での ACL 行の掃除（残ると付与先ロールの `DROP ROLE` が永久に `2BP01` になるため）。
+- USAGE 検査（`sql/schema_privilege.rs`・`core.rs` の `schema_resolver_for`）: 解決済みの内部キーの SCHEMA にだけ、
+  「自テナント内の解決 → 権限検査」の順で行う。USAGE が無ければ `42501`。準備済み文は Bind で再検査する。
+
+### 判断（K1〜K14 のうち主なもの）
+
+| # | 判断 | 理由 |
+| - | ---- | ---- |
+| K1 | 検査対象は束縛ロールを持ち所有者相当（DDL 権限ゲート通過）でない主体だけ。未束縛・所有者相当は従来どおり検査しない | 未束縛に拒否を課すと既存の SCHEMA 利用が全て `42501` になる。権限を広げる経路は作らず、#1971 で全セッションが束縛された時点で全面適用になる |
+| K2 | `public`・`pg_catalog`・`information_schema`・`pg_temp` への `ON SCHEMA`・`ALL ... IN SCHEMA` は構文段の `0A000` | 行・内部 ID を持たない仮想 SCHEMA。状態に依存しない拒否 |
+| K3 | 他テナントの SCHEMA は解決器が先に `None`（`3F000`）にし、権限検査の分岐は走らない | 権限の有無が存在オラクルにならない（D10） |
+| K4 | `search_path` 上の USAGE の無い SCHEMA は PostgreSQL 17 と同じく見えないものとして飛ばす（`creation_target`・`current_schema()` の probe）。修飾名は `42501` | PostgreSQL は path 上の SCHEMA を黙って飛ばす。未修飾名は現状テナント SCHEMA へ解決されない |
+| K5 | 作成先が SCHEMA の作成系 DDL は CREATE 判定を `require_creation_target` に結線するが、`ServerDdl` ゲートを必要条件として残す | `ServerDdl` を CREATE に置き換えるとロールの束縛だけで DDL 権限が広がる。所有者の機構（#2236）・主体の束縛（#1971）の後 |
+| K7 | 修飾名の作成位置でも USAGE を要求する（PostgreSQL は CREATE だけで足りる。拒否側の意図的な差） | 解決器は位置を区別しない。権限を広げない |
+| K9 | `ALL SEQUENCES／FUNCTIONS／ROUTINES／PROCEDURES IN SCHEMA` は `0A000` のまま（#2235） | SEQUENCE・FUNCTION 単位の ACL 適用は #2235 の中核 |
+| K10 | `DROP SCHEMA` の同じ txn で ACL 行を掃除（commit 呼び出しは増やさない） | `DROP ROLE` の依存検査・件数上限の消費を防ぐ |
+| K11 | ビュー本文（保存済みの解決済みキー）経由の参照は USAGE を再検査しない | PostgreSQL はビューの所有者の権限で参照する。所有者の機構（#2236）まで対象外 |
+| K12 | 準備済み文は Bind でトークン列の `#<id>.` キーから SCHEMA ID を集めて USAGE を再検査 | Parse 後の `REVOKE` を Execute に反映する |
+| K13 | 明示トランザクション内は現在ロールのゲート（`42501`）の後で `0A000`（J9 と同じ） | ACL の書き込みは独立した write txn で ROLLBACK で取り消せない |
+
+### 既知の差・対象外
+
+- 受入基準の「`search_path` 経由も `42501`」は PostgreSQL 17（path から飛ばす）と異なるため、飛ばす側を採った（K4）。spec 側で別の
+  契約を意図している場合は spec リポ側の課題として扱う。
+- `GRANT ... ON SCHEMA` の実行は、SCHEMA の所有者の概念が無いため所有者相当（DDL 権限ゲート通過）か、対象に GRANT OPTION を
+  持つ束縛ロールだけ（#2236 まで）。継承（#2232）は USAGE 判定のロール集合に未反映（直接の行と PUBLIC の行だけ）。
+- 対象外: SEQUENCE・FUNCTION 単位の ACL（#2235）、所有者・PUBLIC の既定（#2236）、`ALTER DEFAULT PRIVILEGES ... IN SCHEMA`
+  （#2237）、表・列権限の参照時検査（#1967〜#1969）、権限検査の共通ゲートへの統合（#1966。判定は `sql/schema_privilege.rs`
+  に集約済みで、ゲートへ移す）、存在オラクルの網羅試験（#1972）。
