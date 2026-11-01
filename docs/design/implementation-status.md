@@ -1423,3 +1423,5 @@ Issue #1405（fix(engine)!: CREATE TYPE の型名の重複を 42710 で返す。
 **Issue #1938（feat(engine): ISOLATION LEVEL 修飾子の構文を受理する。SQL-38 ポインタ）**: `BEGIN [WORK|TRANSACTION] ISOLATION LEVEL {SERIALIZABLE|REPEATABLE READ|READ COMMITTED|READ UNCOMMITTED}` を受理し、要求レベルを `sql::transaction::RequestedIsolationLevel` として `ActiveTxn` に記録する（`SessionTransaction::isolation_level()`）。実行は単一ライタのまま不変。公開構造体 `ValidatedTxnControl` に `isolation_level` フィールドを追加した（破壊的変更）。受理範囲の詳細は設計文書のポインタ先に従う。`START TRANSACTION` と `READ ONLY` は別 Issue。テストは `sql::transaction` の単体テストと `tests/sql_t01_39/sql38_begin_isolation_level.rs`。
 
 **Issue #1956（docs(design): 行ロック句・LOCK TABLE の扱いを設計文書へ記録する。SQL-38・TABLE-3・PERSIST-4・SQL-31 ポインタ）**: [explicit-transaction.md](explicit-transaction.md) に「行ロック句・`LOCK TABLE` の扱い」節を追加した（単一ライタの writer 取得への写像・取得経路・形ごとの担当 Issue・要確認事項を記録。契約はポインタのみ）。コードは変更していない。
+
+**Issue #1973（docs(design): 権限モデルと検査経路一覧を設計文書へまとめる。RLS-12・SQL-40 ポインタ。詳細は [privilege-check-paths.md](privilege-check-paths.md)）**: 現行実装の権限モデル（テナント境界と DDL 実行権限の 2 軸）・権限ビットの注入点・文種ごとの検査経路一覧・ゲート対象外の経路・新規文種追加時のチェックリスト・移行先 Issue を新規文書に記録した。README の `--ddl-allowed-users` 節の対象 DDL 列挙を同文書へのポインタに置き換えた。ドキュメントのみでコード・依存・CI は変更していない。
