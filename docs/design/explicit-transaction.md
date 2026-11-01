@@ -220,7 +220,7 @@ Issue（#2399〜#2405・#2408〜#2413）が拠り所にする設計記録で、�
 
 #### 1a-9. 本節で決めないこと（申し送り）
 
-- `55P03` が出る箇所・上限の起点・状態バイトの検証と層 B → #2408
+- `55P03` が出る箇所・上限の起点の検証は #2409 で実施済み。状態バイトの検証と層 B → #2408 配下の残り（#2410〜#2412）
 - READ ONLY の上限・並行の検証 → #1933・#1935、書き込み拒否 → #1934、行ロック句・`LOCK TABLE` → 「行ロック句・`LOCK TABLE` の扱い」節（#2230・#2231・#1957・#1958）
 - CHANGELOG と `implementation-status.md` → #2413
 - 早期の事前判定（gate を待つ前に明らかな衝突を返す最適化）は任意とし、#2405 の判断に委ねる。
@@ -516,7 +516,11 @@ Failed { session_at_begin: SessionState, expired: bool } }`）。`ActiveTxn` は
 - **改訂（#2396・1a）**: `max_duration`・`max_statements` はこれまでどおり `BEGIN` から数える
   （不変）。`lock_wait` が効き始めるのは最初の書き込み文から。下記の「`Active` の間だけ
   読み取りタイムアウトを切り詰める」規則には「`Active` かつ writer 未取得」の場合が新たに
-  生じる。その扱いは本節では決めず、#2408 へ申し送る。
+  生じる。**決定（#2409）**: 切り詰めと期限での解放は writer の有無に関係なく `Active` 全体に
+  効く（起点は `BEGIN`）。writer 未取得の場合の目的は、`BEGIN` 時点の読み取りスナップショットを
+  解放して redb がページを回収できるようにすること。engine 側は #2409 のテスト
+  （`tests/write_lock_wait.rs` T5〜T10・`core_misc/transaction_limits.rs`）で固定し、wire 側の
+  確認は #2410 に委ねる。
 - 超過時は `54000`（`PayloadTooLarge`）で `Failed` へ遷移する。
 - 起動時 CLI（`--max-transaction-duration-ms`・`--max-transaction-statements`。Issue #1553）で
   設定できる。範囲・ハード上限は [transaction-limits-cli.md](transaction-limits-cli.md) 参照。
@@ -820,6 +824,9 @@ production コード（`crates/wire-server/src/`）は無変更・テスト専�
 - #2396 関連の申し送り: #2408（`55P03`・上限の起点・カーソル・状態バイトの整合と層 B）、
   #2411（カーソルの分割の実装）、#2413（CHANGELOG・実装記録）、#1933（READ ONLY）、
   #2230（行ロック句・`LOCK TABLE` は専用節を参照）。
+- 待ちの途中で期限を越えた最初の書き込み文は、writer を取って成功する（取得後に期限を再検査しない）。
+  次の文か `COMMIT` が `54000` で拒否し永続化しない（fail-closed。#2409 の T10 で現行契約を固定）。
+  取得後の再検査が要るなら別 Issue で扱う。
 - 書き込み後の読み取りでのキャッシュ・HNSW の再利用（テーブル単位の最適化。現状は
   brute-force）。
 - `DUPLICATE_OPERATION_ID` と `UNIQUE_VIOLATION` の `code` ラベル区別は Issue #1180 で
