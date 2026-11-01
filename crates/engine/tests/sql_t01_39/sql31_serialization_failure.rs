@@ -5,7 +5,7 @@
 //! 最初の書き込みで `40001`、以降は拒否され `ROLLBACK` で復帰する、(2) 読まずに書く形・読み取り
 //! だけの形・無関係な表への commit では `40001` にならない、(3) 他テナントの Private 行だけの
 //! commit は原因にならず、エラー文にテナント・表名を含めない。
-//! 同一スレッドで 2 セッションを順に操作する（並行・3 テナントの網羅は #2406・#2407）。
+//! 同一スレッドで 2 セッションを順に操作する（並行は `sql31_serialization_failure_concurrent`〔#2406〕、3 テナントの網羅は #2407）。
 
 use engine::core::EngineCore;
 use engine::kernel::CpuScalarProvider;
