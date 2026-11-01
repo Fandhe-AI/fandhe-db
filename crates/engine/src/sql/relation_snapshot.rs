@@ -88,6 +88,24 @@ impl RelationSnapshot {
             Err(e) => return Err(catalog_internal(catalog::map_row_table_error(e))),
         };
 
+        // RLS-13（Issue #2276）: 結合・部分クエリが読む可視行にも利用者ポリシーを適用する。ポリシーの
+        // 有効化・定義の変更は表の世代を進めるため、世代キーのキャッシュ（`GenerationKeyedCache`）は
+        // ポリシー適用後の可視集合を安全に共有できる。
+        let policy = crate::sql::row_policy::resolve_row_policy(
+            read_txn,
+            ctx,
+            table,
+            &table.name,
+            crate::sql::row_policy::PolicyCmd::Select,
+        )?;
+        let mut policy_mask = vec![false; table.columns.len()];
+        let policy_needs = policy
+            .as_ref()
+            .map(|p| p.mark_needs(&mut policy_mask))
+            .unwrap_or_default();
+        let mut policy_embedding: Vec<f32> = Vec::new();
+        let mut policy_scratch: Vec<crate::sql::expr_program::StackValue> = Vec::new();
+
         let mut visible_rows: Vec<(String, u64)> = Vec::new();
         if let Some(opened) = opened {
             for entry in opened.iter().map_err(storage_internal)? {
@@ -101,7 +119,7 @@ impl RelationSnapshot {
                 // RLS 段（無条件・デコード前）: ヘッダのみ読み、不可視行は
                 // embedding・metadata を一切デコードしない（security.md P0
                 // 「テナント境界」・Issue #137 の既存契約踏襲）。
-                let (tenant_id, visibility, _offset) =
+                let (tenant_id, visibility, body_offset) =
                     storage::decode_row_header(buf).map_err(storage_internal)?;
                 if !ctx.is_visible(tenant_id, visibility) {
                     continue;
@@ -134,6 +152,36 @@ impl RelationSnapshot {
                 // `crate::row_codec::validate_scalar_columns`（検証専用・`Vec`
                 // 確保なし）で同じ構造検証を通す。
                 crate::row_codec::validate_scalar_columns(table, metadata)?;
+
+                // POLICY 段（RLS-13・Issue #2276）: テナント境界の内側。通らない行は存在しない行と同じ
+                // 扱いで、後続の結合・部分クエリには現れない。
+                if let Some(policy) = &policy {
+                    let (policy_dim, policy_metadata) = if policy_needs.embedding {
+                        storage::decode_row_body_into(buf, body_offset, &mut policy_embedding)
+                            .map_err(storage_internal)?
+                    } else {
+                        (dim, metadata)
+                    };
+                    let scanned = crate::row_codec::scan_scalar_columns_masked(
+                        table,
+                        policy_metadata,
+                        Some(&policy_mask),
+                    )?;
+                    let embedding: &[f32] = if policy_needs.embedding {
+                        policy_embedding.as_slice()
+                    } else {
+                        &[]
+                    };
+                    if !policy.passes(
+                        &scanned,
+                        id,
+                        embedding,
+                        policy_dim as usize,
+                        &mut policy_scratch,
+                    )? {
+                        continue;
+                    }
+                }
 
                 if visible_rows.len() >= crate::arena::MAX_ARENA_ROWS {
                     return Err(SqlSurfaceError::payload_too_large(

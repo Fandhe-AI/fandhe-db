@@ -1075,7 +1075,24 @@ fn materialize_rows(
     state_cap: usize,
 ) -> Result<MaterializeOutput, SqlSurfaceError> {
     let expected_dim = schema.vector_dim();
-    let (tier, scalar_mask) = decode_tier_for_window(schema, bound);
+    // RLS-13（Issue #2276）: 利用者ポリシーを行を読むのと同じスナップショットから 1 回だけ解決し、
+    // 参照する列・embedding を復号対象へ加える（マスク外の列を NULL と取り違えない）。
+    let policy = crate::sql::row_policy::resolve_row_policy(
+        read_txn,
+        ctx,
+        schema,
+        bound.table(),
+        crate::sql::row_policy::PolicyCmd::Select,
+    )?;
+    let (mut tier, mut scalar_mask) = decode_tier_for_window(schema, bound);
+    if let Some(p) = &policy {
+        let needs = p.mark_needs(&mut scalar_mask);
+        if needs.embedding {
+            tier = DecodeTier::Embedding;
+        } else if needs.scalar && tier == DecodeTier::Fast {
+            tier = DecodeTier::DimAndScalar;
+        }
+    }
     let expr_filter_programs: Vec<ExprProgram> = bound
         .expr_filters()
         .iter()
@@ -1158,6 +1175,23 @@ fn materialize_rows(
             // Issue #919・SQL-26: `sql::scan::execute_scan_with_budget` と同じ
             // 契約（`decode_tier_for_window` が `TextColumnRef` を `scalar_mask`
             // へ反映済みのため、`scanned` をそのまま `.as_text()` へ写せばよい）。
+
+            // POLICY 段（RLS-13・Issue #2276）: テナント境界の内側・利用者の `WHERE` より前。
+            if let Some(policy) = &policy {
+                let policy_embedding: &[f32] = match tier {
+                    DecodeTier::Embedding => embedding_scratch.as_slice(),
+                    DecodeTier::Fast | DecodeTier::DimAndScalar => &[],
+                };
+                if !policy.passes(
+                    &scanned,
+                    id,
+                    policy_embedding,
+                    dim as usize,
+                    &mut expr_scratch,
+                )? {
+                    continue;
+                }
+            }
 
             if !declarative_filter::matches_all(bound.metadata_filters(), &scanned) {
                 continue;

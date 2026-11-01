@@ -16333,9 +16333,20 @@ impl Storage {
         tenant_id: &str,
         id: u64,
     ) -> Result<StorageRow> {
-        validate_relation_key(table_name)?;
         let read_txn = self.db().begin_read()?;
-        require_legacy_row_identity_read(&read_txn, table_name)?;
+        Self::get_row_in_read_txn(&read_txn, table_name, tenant_id, id)
+    }
+
+    /// [`Self::get_row_from_table`] の、呼び出し元が開いた読み取り txn 上で取得する版。行・ポリシー・
+    /// 有効化状態を同一スナップショットから引きたい経路（`core::get_row`。RLS-13・Issue #2276）が使う。
+    pub(crate) fn get_row_in_read_txn(
+        read_txn: &redb::ReadTransaction,
+        table_name: &str,
+        tenant_id: &str,
+        id: u64,
+    ) -> Result<StorageRow> {
+        validate_relation_key(table_name)?;
+        require_legacy_row_identity_read(read_txn, table_name)?;
         let row_table_name = user_rows_table_name(table_name);
         let row_table = match read_txn.open_table(user_rows_table_def(&row_table_name)) {
             Ok(t) => t,
