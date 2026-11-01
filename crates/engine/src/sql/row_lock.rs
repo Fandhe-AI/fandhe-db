@@ -334,7 +334,17 @@ pub(crate) fn extract_row_locking(
             Token::Ident(w) => {
                 let upper = w.to_ascii_uppercase();
                 match upper.as_str() {
-                    "DISTINCT" | "HAVING" => combo_violation = true,
+                    // 表名・列名・別名としての `distinct`／`having`（引用付きを含む）を誤認しないよう、
+                    // `DISTINCT` は直前が `SELECT`、`HAVING` はオペランド終端の直後だけを句とみなす。
+                    "DISTINCT" if matches!(prev, Some(Token::Keyword(Keyword::Select))) => {
+                        combo_violation = true
+                    }
+                    "HAVING"
+                        if crate::sql::fetch_clause::follows_operand(prev)
+                            && !prev_is_clause_word(prev) =>
+                    {
+                        combo_violation = true
+                    }
                     "GROUP" if matches!(pre.get(k + 1), Some(Token::Keyword(Keyword::By))) => {
                         combo_violation = true
                     }
@@ -360,7 +370,13 @@ pub(crate) fn extract_row_locking(
                             n += 1;
                         }
                         if matches!(pre.get(n), Some(Token::Punct('('))) {
-                            if let Some(Token::Ident(name)) = prev {
+                            // 列リスト付き（`c(a, b) AS (`）は直前が `)` なので対応する `(` の前の名前を取る。
+                            let name_tok = if matches!(prev, Some(Token::Punct(')'))) {
+                                cte_name_before_column_list(pre, k)
+                            } else {
+                                prev
+                            };
+                            if let Some(Token::Ident(name)) = name_tok {
                                 cte_names.push(name.clone());
                             }
                         }
@@ -371,8 +387,6 @@ pub(crate) fn extract_row_locking(
             _ => {}
         }
     }
-    // 列リスト付きの CTE（`c(a, b) AS (`）の名前は、深さ 0 の `AS` の直前が `)` になる。
-    // 名前を取り損ねても `OF` が 42P01 になるだけで、ロックを取らずに実行する経路は生まれない。
     // 先頭が WITH でない文では CTE 名を持たない。
     if !is_word(tokens.first(), "WITH") {
         cte_names.clear();
@@ -390,6 +404,34 @@ pub(crate) fn extract_row_locking(
             combo_violation,
         }),
     ))
+}
+
+/// 直前の識別子がキーワード相当の語（`JOIN`・`OUTER`・`ON` 等）で、次の語が名前の位置にある。
+fn prev_is_clause_word(prev: Option<&Token>) -> bool {
+    const WORDS: &[&str] = &[
+        "JOIN", "OUTER", "ON", "USING", "AS", "BY", "WHERE", "AND", "OR", "NOT", "FROM",
+    ];
+    matches!(prev, Some(Token::Ident(w)) if WORDS.iter().any(|x| w.eq_ignore_ascii_case(x)))
+}
+
+/// `pre[as_idx]`（`AS`）の直前が `)` のとき、対応する `(` の直前の名前トークンを返す。
+fn cte_name_before_column_list(pre: &[Token], as_idx: usize) -> Option<&Token> {
+    let mut depth: usize = 0;
+    let mut k = as_idx;
+    while k > 0 {
+        k -= 1;
+        match pre.get(k)? {
+            Token::Punct(')') => depth = depth.saturating_add(1),
+            Token::Punct('(') => {
+                depth = depth.saturating_sub(1);
+                if depth == 0 {
+                    return k.checked_sub(1).and_then(|p| pre.get(p));
+                }
+            }
+            _ => {}
+        }
+    }
+    None
 }
 
 /// `pre[i..]`（`FROM` の直後）から先頭の参照 `(表名, 別名)` を読む。
@@ -707,6 +749,16 @@ mod tests {
             .1
             .unwrap();
         assert_eq!(syn.cte_names, vec!["c".to_string()]);
+    }
+
+    #[test]
+    fn column_list_cte_name_and_quoted_clause_words() {
+        let (_, syn) = extract("WITH c(a, b) AS (SELECT 1) SELECT a FROM c FOR UPDATE").unwrap();
+        assert_eq!(syn.unwrap().cte_names, vec!["c".to_string()]);
+        let (_, syn) = extract("SELECT id FROM \"having\" LIMIT 5 FOR UPDATE").unwrap();
+        assert!(!syn.unwrap().combo_violation);
+        let (_, syn) = extract("SELECT id FROM a JOIN \"having\" ON a.x = 1 FOR UPDATE").unwrap();
+        assert!(!syn.unwrap().combo_violation);
     }
 
     #[test]

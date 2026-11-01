@@ -7623,11 +7623,12 @@ impl EngineCore {
         if let ParsedSql::Transaction(ctrl) = parsed {
             return match ctrl.control {
                 TxnControl::Begin => {
-                    txn.begin_with_mode(
+                    txn.begin_with_modes(
                         &self.storage,
                         session,
                         ctrl.access_mode
                             .unwrap_or(crate::sql::transaction::TxnAccessMode::ReadWrite),
+                        ctrl.isolation_level,
                     )?;
                     Ok(crate::sql::SqlOutcome::Begin)
                 }

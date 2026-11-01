@@ -317,9 +317,37 @@ fn temp_table_select_with_clause_is_gated() {
             &mut session,
             "SELECT v FROM tmp_lock WHERE v = 'x' LIMIT 5 FOR UPDATE",
         )
-        .expect_err("rejected")
-        .wire_code();
-    assert_eq!(code, "0A000");
+        .expect_err("rejected");
+    assert_eq!(code.wire_code(), "0A000");
+    // 一時表向けの汎用拒否ではなく、行ロックの実行ゲートに到達している。
+    assert!(
+        code.to_string().contains("row-level locking"),
+        "unexpected: {code}"
+    );
+}
+
+#[test]
+fn clause_words_as_quoted_names_are_not_combination_violations() {
+    let (core, path) = new_core();
+    let _cleanup = CleanupGuard(path);
+    // 引用付きの表名 `having`／`distinct` を HAVING／DISTINCT 句と誤認しない（FROM の表は未存在で 42P01）。
+    for sql in [
+        "SELECT id FROM \"having\" LIMIT 5 FOR UPDATE",
+        "SELECT id FROM \"distinct\" LIMIT 5 FOR UPDATE",
+    ] {
+        let code = parse_code(&core, sql);
+        assert_ne!(code, "0A000", "{sql}");
+    }
+}
+
+#[test]
+fn cte_with_column_list_is_rejected() {
+    let (core, path) = new_core();
+    let _cleanup = CleanupGuard(path);
+    let r = core.parse_sql(
+        "WITH c(a, b) AS (SELECT id, title FROM documents LIMIT 5) SELECT a FROM c LIMIT 5 FOR UPDATE",
+    );
+    assert_eq!(r.expect_err("rejected").wire_code(), "0A000");
 }
 
 #[test]
