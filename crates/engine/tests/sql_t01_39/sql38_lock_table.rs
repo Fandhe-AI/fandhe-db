@@ -281,3 +281,43 @@ fn quoted_keyword_named_tables_are_lockable() {
         run_as(&core, "alice", &mut session, &mut txn, "ROLLBACK").expect("rollback");
     }
 }
+
+/// キーワードと同名の一時表（`lock`・`table`・`mode` 等）を持つセッションでも、永続表への
+/// `LOCK TABLE` は通り、一時表そのものへの `LOCK` は固定の `0A000` で拒否される（fail-closed）。
+#[test]
+fn keyword_named_temp_tables_do_not_block_persistent_lock() {
+    let (core, _g) = new_core("sql38-lock-temp-kw");
+    ddl(&core, "alice", "CREATE TABLE t (id BIGINT PRIMARY KEY)");
+    let mut session = SessionState::default();
+    session.allow_ddl();
+    for name in ["\"lock\"", "\"table\"", "\"mode\"", "\"share\"", "\"in\""] {
+        core.execute_sql_in_session(
+            &ctx("alice"),
+            &mut session,
+            &format!("CREATE TEMP TABLE {name} (id BIGINT PRIMARY KEY)"),
+        )
+        .unwrap_or_else(|e| panic!("{name}: {} {e}", e.wire_code()));
+    }
+    let mut txn = core.new_session_transaction();
+    run_as(&core, "alice", &mut session, &mut txn, "BEGIN").expect("begin");
+    assert_eq!(
+        run_as(
+            &core,
+            "alice",
+            &mut session,
+            &mut txn,
+            "LOCK TABLE t IN SHARE MODE NOWAIT"
+        ),
+        Ok(SqlOutcome::Lock)
+    );
+    assert_eq!(
+        code(run_as(
+            &core,
+            "alice",
+            &mut session,
+            &mut txn,
+            "LOCK TABLE \"lock\""
+        )),
+        "0A000"
+    );
+}

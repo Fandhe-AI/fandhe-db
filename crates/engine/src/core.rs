@@ -5035,7 +5035,11 @@ impl EngineCore {
             // SCHEMA 名は関係名と別の名前空間で一時表を読み書きしないため走査対象外（TABLE-27・Issue #1713）。
             || crate::sql::allowlist::is_create_schema_statement(&tokens)
             || crate::sql::allowlist::is_drop_schema_statement(&tokens)
-            || crate::sql::allowlist::is_alter_schema_statement(&tokens);
+            || crate::sql::allowlist::is_alter_schema_statement(&tokens)
+            // `LOCK [TABLE]` は `LOCK`・`TABLE`・`IN`・`SHARE`・`MODE` 等のキーワードを含むため、名前走査だと
+            // 同名の一時表（`CREATE TEMP TABLE lock` 等）で誤判定する。対象表名の一時表衝突は
+            // parse 内の参照記録（`hits.temp_hit()`）で固定の `0A000` として拒否する（Issue #1958）。
+            || crate::sql::lock_table::is_lock_statement(&tokens);
         if txn_control_head || scan_exempt {
             let hits = crate::sql::temp_catalog::RelationHits::default();
             let parsed = self.parse_tokens_in(tokens, temp, &hits, self.ledger_mode, resolver)?;
