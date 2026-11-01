@@ -312,6 +312,31 @@ fn implicit_transaction_has_no_read_set_scope() {
     txn.abort_implicit();
 }
 
+/// `BEGIN READ ONLY` は読み取り集合の区間を張らず、読み取りの後も集合は空のまま
+/// （Issue #1933・SQL-38）。
+#[test]
+fn read_only_transaction_has_no_read_set_scope() {
+    let (core, _g) = new_core("readset-read-only");
+    let mut session = SessionState::default();
+    seed(&core, &mut session);
+    let caller = ctx("tenant-a");
+    let mut txn = core.new_session_transaction();
+    core.execute_sql_in_txn(&caller, &mut session, &mut txn, "BEGIN READ ONLY")
+        .expect("begin read only");
+    assert!(txn.read_set_scope().is_none());
+    core.execute_sql_in_txn(
+        &caller,
+        &mut session,
+        &mut txn,
+        "SELECT id FROM ra LIMIT 10",
+    )
+    .expect("select");
+    assert!(txn.read_set_scope().is_none());
+    assert!(txn.read_set().expect("active").is_empty());
+    core.execute_sql_in_txn(&caller, &mut session, &mut txn, "ROLLBACK")
+        .expect("rollback");
+}
+
 #[test]
 fn autocommit_statements_do_not_leak_into_a_later_transaction() {
     let (core, _g) = new_core("readset-autocommit");
