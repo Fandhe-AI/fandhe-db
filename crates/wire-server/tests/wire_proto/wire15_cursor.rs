@@ -54,6 +54,19 @@ fn new_core_with_rows() -> (Arc<EngineCore>, temp_db::CleanupGuard) {
 fn new_core_with_rows_and_write_lock_wait(
     wait: Option<std::time::Duration>,
 ) -> (Arc<EngineCore>, temp_db::CleanupGuard) {
+    new_core_with_tables(wait, false)
+}
+
+/// `docs` に加えて `notes` 表（`docs` と同じ列構成・行なし）を持つ版（Issue #2411。writer 取得前に
+/// 読む表と他接続が書く表を分け、SQL-31 の `40001` を避けるために使う）。
+fn new_core_with_docs_and_notes() -> (Arc<EngineCore>, temp_db::CleanupGuard) {
+    new_core_with_tables(None, true)
+}
+
+fn new_core_with_tables(
+    wait: Option<std::time::Duration>,
+    with_notes: bool,
+) -> (Arc<EngineCore>, temp_db::CleanupGuard) {
     let path = temp_db::unique_db_path("wire15-cursor");
     let guard = temp_db::CleanupGuard(path.clone());
     let mut storage = Storage::open(&path).expect("open storage");
@@ -69,6 +82,17 @@ fn new_core_with_rows_and_write_lock_wait(
             ],
         ))
         .expect("create table");
+    if with_notes {
+        storage
+            .create_table(&TableSchema::new(
+                "notes",
+                vec![
+                    ColumnDef::new("embedding", ColumnType::Vector(3), false),
+                    ColumnDef::new("lang", ColumnType::Text, false),
+                ],
+            ))
+            .expect("create notes table");
+    }
 
     let ctx =
         PolicyContext::with_visibilities("tenant-a", [Visibility::Public, Visibility::Private])
@@ -472,5 +496,140 @@ fn wire15_cursor_row_set_is_unaffected_by_other_session_write_during_fetch() {
     assert_eq!(tag, "FETCH 6");
     all.sort();
     assert_eq!(all, vec!["1", "2", "3", "4", "5", "99"]);
+    simple_ok(&mut a, "COMMIT", "COMMIT");
+}
+
+fn insert_into_sql(table: &str, id: u64, op: &str) -> String {
+    format!(
+        "INSERT INTO {table} (id, embedding, lang) VALUES ({id}, '[0.1,0.2,0.3]', 'ja') USING OPERATION_ID '{op}'"
+    )
+}
+
+/// `FETCH 100 FROM <cursor>` を発行して、行 ID（整列済み）とタグを返す。
+fn fetch_all(stream: &mut std::net::TcpStream, cursor: &str) -> (Vec<String>, String) {
+    send_simple_query(stream, &format!("FETCH 100 FROM {cursor}"));
+    let (mut ids, tag) = read_fetch_page(stream);
+    ids.sort();
+    (ids, tag)
+}
+
+/// WIRE-15（2026-10-16 改訂注記）・SQL-19・SQL-31・Issue #2411: 読み取りだけの区間（writer 取得前）に
+/// 宣言したカーソルは `BEGIN` 時点の行集合で確定し、`BEGIN` 後・`DECLARE` 前に他接続が commit した
+/// 行を含まない。
+#[test]
+fn wire15_cursor_declared_before_writer_reads_begin_snapshot() {
+    let (core, _guard) = new_core_with_rows();
+    let users_path = write_user_store_file(&[
+        ("alice", "tenant-a", "correct-horse"),
+        ("alice2", "tenant-a", "correct-horse"),
+    ]);
+    let addr = spawn_server_with_engine(&users_path, core);
+    let mut a = authenticate_to_ready_for_query(addr, "alice", "correct-horse");
+    let mut b = authenticate_to_ready_for_query(addr, "alice2", "correct-horse");
+
+    simple_ok(&mut a, "BEGIN", "BEGIN");
+    simple_ok(&mut b, &insert_row_sql(99, "op-2411-w1"), "INSERT 0 1");
+    simple_ok(
+        &mut a,
+        "DECLARE c CURSOR FOR SELECT id FROM docs LIMIT 100",
+        "DECLARE CURSOR",
+    );
+    let (ids, tag) = fetch_all(&mut a, "c");
+    assert_eq!(tag, "FETCH 5");
+    assert_eq!(ids, vec!["1", "2", "3", "4", "5"]);
+    simple_ok(&mut a, "COMMIT", "COMMIT");
+
+    begin_and_declare(&mut a);
+    let (ids, _) = fetch_all(&mut a, "c");
+    assert_eq!(ids, vec!["1", "2", "3", "4", "5", "99"]);
+    simple_ok(&mut a, "COMMIT", "COMMIT");
+}
+
+/// WIRE-15・SQL-19・SQL-31・Issue #2411: writer 取得後に宣言したカーソルは取得時点の最新の確定状態
+/// （他接続の commit）に自トランザクションの未 commit 変更を加えた行集合で確定し、他テナントの
+/// 行は含まない。
+#[test]
+fn wire15_cursor_declared_after_writer_reads_acquire_time_snapshot() {
+    let (core, _guard) = new_core_with_rows();
+    let users_path = write_user_store_file(&[
+        ("alice", "tenant-a", "correct-horse"),
+        ("alice2", "tenant-a", "correct-horse"),
+        ("bob", "tenant-b", "battery-staple"),
+    ]);
+    let addr = spawn_server_with_engine(&users_path, core);
+    let mut a = authenticate_to_ready_for_query(addr, "alice", "correct-horse");
+    let mut b = authenticate_to_ready_for_query(addr, "alice2", "correct-horse");
+    let mut c = authenticate_to_ready_for_query(addr, "bob", "battery-staple");
+
+    simple_ok(&mut a, "BEGIN", "BEGIN");
+    simple_ok(&mut b, &insert_row_sql(99, "op-2411-w2-b"), "INSERT 0 1");
+    simple_ok(&mut c, &insert_row_sql(98, "op-2411-w2-c"), "INSERT 0 1");
+    // 取得前に docs を読んでいないため 40001 にならない。
+    send_simple_query(&mut a, &insert_row_sql(50, "op-2411-w2-a"));
+    assert_eq!(read_command_complete(&mut a), "INSERT 0 1");
+    assert_eq!(read_ready_for_query_status(&mut a), b'T');
+    simple_ok(
+        &mut a,
+        "DECLARE c CURSOR FOR SELECT id FROM docs LIMIT 100",
+        "DECLARE CURSOR",
+    );
+    let (ids, tag) = fetch_all(&mut a, "c");
+    assert_eq!(tag, "FETCH 7");
+    assert_eq!(ids, vec!["1", "2", "3", "4", "5", "50", "99"]);
+    simple_ok(&mut a, "COMMIT", "COMMIT");
+}
+
+/// WIRE-15・SQL-19・SQL-31・Issue #2411: 同一トランザクション内で、writer 取得前のカーソルは
+/// `BEGIN` 時点のまま、取得後のカーソルは取得時点の状態を払い出す。
+#[test]
+fn wire15_cursors_split_around_writer_acquire_in_one_transaction() {
+    let (core, _guard) = new_core_with_docs_and_notes();
+    let users_path = write_user_store_file(&[
+        ("alice", "tenant-a", "correct-horse"),
+        ("alice2", "tenant-a", "correct-horse"),
+    ]);
+    let addr = spawn_server_with_engine(&users_path, core);
+    let mut a = authenticate_to_ready_for_query(addr, "alice", "correct-horse");
+    let mut b = authenticate_to_ready_for_query(addr, "alice2", "correct-horse");
+
+    simple_ok(&mut a, "BEGIN", "BEGIN");
+    simple_ok(
+        &mut a,
+        "DECLARE before CURSOR FOR SELECT id FROM docs LIMIT 100",
+        "DECLARE CURSOR",
+    );
+    send_simple_query(&mut a, "FETCH 2 FROM before");
+    let (mut seen, tag) = read_fetch_page(&mut a);
+    assert_eq!(tag, "FETCH 2");
+
+    simple_ok(
+        &mut b,
+        &insert_into_sql("notes", 77, "op-2411-w3-b"),
+        "INSERT 0 1",
+    );
+    // writer を取得する（読み取り済みの docs には他接続の commit が無いので衝突しない）。
+    simple_ok(&mut a, &insert_row_sql(50, "op-2411-w3-a"), "INSERT 0 1");
+
+    let (rest, tag) = fetch_all(&mut a, "before");
+    assert_eq!(tag, "FETCH 3");
+    seen.extend(rest);
+    seen.sort();
+    assert_eq!(seen, vec!["1", "2", "3", "4", "5"]);
+
+    simple_ok(
+        &mut a,
+        "DECLARE after_notes CURSOR FOR SELECT id FROM notes LIMIT 100",
+        "DECLARE CURSOR",
+    );
+    simple_ok(
+        &mut a,
+        "DECLARE after_docs CURSOR FOR SELECT id FROM docs LIMIT 100",
+        "DECLARE CURSOR",
+    );
+    assert_eq!(fetch_all(&mut a, "after_notes").0, vec!["77"]);
+    assert_eq!(
+        fetch_all(&mut a, "after_docs").0,
+        vec!["1", "2", "3", "4", "5", "50"]
+    );
     simple_ok(&mut a, "COMMIT", "COMMIT");
 }

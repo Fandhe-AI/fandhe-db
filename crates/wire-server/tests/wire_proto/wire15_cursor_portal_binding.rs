@@ -565,3 +565,80 @@ fn fetch_portal_kept_across_sync_is_rejected_after_cursor_close() {
 
     assert_resume_rejected_without_leaking_rows(&mut stream);
 }
+
+// --- writer 取得前後のカーソルのスナップショット（Issue #2411。WIRE-15・SQL-19・SQL-31） ---
+
+/// WIRE-15（2026-10-16 改訂注記）・SQL-19・SQL-31・Issue #2411: writer 取得後に宣言したカーソルを
+/// 拡張クエリの portal で `max_rows` 分割して払い出しても、行集合は取得時点の最新の確定状態
+/// （他接続の commit）に自分の未 commit 変更を加えたものになる。
+#[test]
+fn extended_declare_after_writer_fetch_portal_reads_acquire_time_snapshot() {
+    let (core, _guard) = new_core_with_documents_table();
+    seed_rows(&core, 3);
+    let users_path = write_user_store_file(&[("alice", "tenant-a", "correct-horse")]);
+    let addr = spawn_server_with_engine(&users_path, Arc::clone(&core));
+    let mut stream = authenticate_to_ready_for_query(addr, "alice", "correct-horse");
+
+    send_simple_query(&mut stream, "BEGIN");
+    assert_eq!(read_command_complete(&mut stream), "BEGIN");
+    read_ready_for_query(&mut stream);
+
+    // BEGIN の後に他接続（同一テナント）が commit する。
+    let mut other = engine::sql::mode::SessionState::default();
+    core.execute_sql_in_session(
+        &owner_ctx(),
+        &mut other,
+        "INSERT INTO documents (id, embedding, body) VALUES (99, '[0.1,0.2,0.3]', 'other-99') \
+         USING OPERATION_ID 'w4-other'",
+    )
+    .expect("other session commit");
+
+    // 自分の書き込みで writer を取得する（documents は未読のため 40001 にならない）。
+    send_simple_query(
+        &mut stream,
+        "INSERT INTO documents (id, embedding, body) VALUES (50, '[0.1,0.2,0.3]', 'own-50') \
+         USING OPERATION_ID 'w4-own'",
+    );
+    assert_eq!(read_command_complete(&mut stream), "INSERT 0 1");
+    read_ready_for_query(&mut stream);
+
+    send_simple_query(
+        &mut stream,
+        "DECLARE c CURSOR FOR SELECT id, body FROM documents LIMIT 100",
+    );
+    assert_eq!(read_command_complete(&mut stream), "DECLARE CURSOR");
+    read_ready_for_query(&mut stream);
+
+    parse_and_bind(&mut stream, "sf", "pf", "FETCH 100 FROM c");
+    let mut bodies: Vec<String> = Vec::new();
+    loop {
+        send_length_prefixed_message(&mut stream, b'E', &execute_body("pf", 2));
+        // 1 回の Execute で DataRow が最大 2 件、続けて PortalSuspended か CommandComplete が届く。
+        let mut finished = false;
+        loop {
+            let (kind, body) = read_message(&mut stream);
+            match kind {
+                b'D' => bodies.push(String::from_utf8_lossy(&body).into_owned()),
+                b's' => break,
+                b'C' => {
+                    finished = true;
+                    break;
+                }
+                other => panic!("unexpected message {other}"),
+            }
+        }
+        if finished {
+            break;
+        }
+    }
+    assert_eq!(bodies.len(), 5, "3 seeded + other session's 99 + own 50");
+    assert!(bodies.iter().any(|b| b.contains("other-99")));
+    assert!(bodies.iter().any(|b| b.contains("own-50")));
+    send_sync(&mut stream);
+    let (kind, _) = read_message(&mut stream);
+    assert_eq!(kind, b'Z', "expected ReadyForQuery after Sync");
+
+    send_simple_query(&mut stream, "COMMIT");
+    assert_eq!(read_command_complete(&mut stream), "COMMIT");
+    read_ready_for_query(&mut stream);
+}
