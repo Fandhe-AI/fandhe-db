@@ -393,8 +393,12 @@ pub(crate) fn redact_row_conversion_error(e: SqlSurfaceError) -> SqlSurfaceError
         | E::SequenceGeneratorLimitExceeded { .. }
         | E::DuplicateSchema { .. }
         | E::InvalidSchemaName { .. }
-        | E::NoSchemaSelected
         | E::ReservedName { .. }
+        | E::DuplicateRole { .. }
+        | E::UndefinedRole { .. }
+        | E::RoleHasDependents { .. }
+        | E::ReservedRoleName { .. }
+        | E::NoSchemaSelected
         | E::GeneratedAlways { .. }
         | E::MaterializedViewNotRefreshableConcurrently
         | E::ViewNotAutoUpdatable { .. }

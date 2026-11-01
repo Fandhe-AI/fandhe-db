@@ -40,6 +40,7 @@ mod wire_policy_using;
 mod wire_policy_with_check;
 mod wire_result_rows_cap;
 mod wire_returning;
+mod wire_role_ddl;
 mod wire_row_security;
 mod wire_scan;
 mod wire_scan_offset;
