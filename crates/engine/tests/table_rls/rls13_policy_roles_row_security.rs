@@ -411,3 +411,55 @@ fn rls13_schema_qualified_rejection_messages_hide_internal_key() {
         assert_eq!(err.client_message(), msg, "txn {sql}");
     }
 }
+
+/// RLS-13: `COPY ... FROM STDIN` は開始時の `row_security = off` をバッチへ保持し、公開 API の完了経路
+/// （`commit_copy_in`・`commit_copy_in_txn` の Idle／明示トランザクション）でも `42501` で拒否する。
+/// 呼び出し側が完了時にスコープを束縛しなくても、既定の on へ戻って書き込みが通ることはない。
+#[test]
+fn rls13_row_security_off_copy_from_is_rejected_on_public_commit_paths() {
+    use engine::core::CopyPlan;
+    let (core, _g) = new_core("rls13-rs-off-copy-from");
+    let mut s = SessionState::default();
+    s.allow_ddl();
+    for sql in [
+        "CREATE TABLE t (id BIGINT PRIMARY KEY, name TEXT)",
+        "ALTER TABLE t ENABLE ROW LEVEL SECURITY",
+        "CREATE POLICY p ON t FOR ALL USING (true) WITH CHECK (true)",
+        "SET row_security = off",
+    ] {
+        ok(&core, "alice", &mut s, sql);
+    }
+    let c = ctx("alice");
+    let sql = "COPY t (id, name) FROM STDIN";
+    let batch = |core: &EngineCore, s: &SessionState| {
+        let CopyPlan::From(mut cs) = core.begin_copy(&c, s, sql).expect("begin") else {
+            panic!("expected COPY FROM plan");
+        };
+        cs.feed(b"1\ta\n").expect("feed");
+        cs.finish().expect("finish")
+    };
+    let err = core
+        .commit_copy_in(&c, batch(&core, &s))
+        .expect_err("autocommit");
+    assert_eq!(err.wire_code(), "42501");
+    assert_eq!(err.client_message(), OFF_MSG);
+
+    // Idle の `commit_copy_in_txn`。
+    let mut txn = core.new_session_transaction();
+    let err = core
+        .commit_copy_in_txn(&c, &mut txn, batch(&core, &s))
+        .expect_err("idle txn");
+    assert_eq!(err.wire_code(), "42501");
+
+    // 明示トランザクション。
+    let mut txn = core.new_session_transaction();
+    ok_txn(&core, &mut s, &mut txn, "BEGIN");
+    let err = core
+        .commit_copy_in_txn(&c, &mut txn, batch(&core, &s))
+        .expect_err("explicit txn");
+    assert_eq!(err.wire_code(), "42501");
+
+    // 何も書かれていない。on へ戻せば同じ COPY が成功する。
+    ok(&core, "alice", &mut s, "SET row_security = on");
+    core.commit_copy_in(&c, batch(&core, &s)).expect("on");
+}

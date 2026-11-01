@@ -872,6 +872,11 @@ pub struct CopyInSession {
     /// 一時 DB へ行う（`EngineCore::commit_copy_in_txn_in_session`）。永続の入口
     /// （`commit_copy_in`／`commit_copy_in_txn`）は一時表向けのバッチを `0A000` で拒否する。
     temp: Option<crate::sql::temp_rows::TempCopyTarget>,
+    /// COPY 開始時点のセッションの `row_security`（RLS-13・Issue #2278）。完了経路
+    /// （`commit_copy_in`／`commit_copy_in_txn`）は束縛区間の外で呼ばれうるため、値を
+    /// [`CopyInBatch`] へ引き継いで検査点の直前に復元する（失われると既定の on になり、
+    /// `off` のセッションが拒否されるはずの書き込みを通してしまう）。
+    row_security: bool,
 }
 
 /// COPY の 1 列分の種別（binary 形式の型変換を wire-server が選ぶための公開情報。
@@ -1048,7 +1053,16 @@ impl CopyInSession {
             format,
             running_bytes: 0,
             temp: None,
+            // 呼び出し元（`EngineCore::begin_copy*`）が `RowSecurityScope` を束縛した区間で作る。
+            row_security: crate::sql::policy_applicability::current_row_security(),
         })
+    }
+
+    /// COPY 開始時のセッションの `row_security` を明示的に記録する（`begin_copy_validated` が呼ぶ）。
+    #[must_use]
+    pub(crate) fn with_row_security(mut self, on: bool) -> Self {
+        self.row_security = on;
+        self
     }
 
     /// 一時表向けの COPY として印を付ける（`EngineCore::begin_copy` の一時表の経路が呼ぶ）。
@@ -1144,6 +1158,7 @@ impl CopyInSession {
             splitter,
             mut sink,
             temp,
+            row_security,
             ..
         } = self;
         if let Some(fields) = splitter.finish()? {
@@ -1165,6 +1180,7 @@ impl CopyInSession {
             schema: *sink.schema,
             evaluated_at: sink.clock_used.then_some(sink.clock.txn_start_micros),
             temp,
+            row_security,
         })
     }
 }
@@ -1181,6 +1197,8 @@ pub struct CopyInBatch {
     pub(crate) evaluated_at: Option<i64>,
     /// 一時表向けのバッチなら対象ストアと準備時の一時カタログ世代（`CopyInSession::with_temp`）。
     pub(crate) temp: Option<crate::sql::temp_rows::TempCopyTarget>,
+    /// COPY 開始時のセッションの `row_security`（[`CopyInSession`] から引き継ぐ。RLS-13・Issue #2278）。
+    pub(crate) row_security: bool,
 }
 
 impl CopyInBatch {

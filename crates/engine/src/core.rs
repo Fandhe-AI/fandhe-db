@@ -13236,17 +13236,20 @@ impl EngineCore {
                     txn_start_micros: txn_start_micros.unwrap_or(stmt_start_micros),
                     stmt_start_micros,
                 };
-                Ok(CopyPlan::From(crate::sql::copy::CopyInSession::new(
-                    v.table_name,
-                    v.columns,
-                    v.format,
-                    v.options,
-                    v.operation_id,
-                    schema,
-                    self.batch_limits,
-                    clock,
-                    session.time_zone().clone(),
-                )?))
+                Ok(CopyPlan::From(
+                    crate::sql::copy::CopyInSession::new(
+                        v.table_name,
+                        v.columns,
+                        v.format,
+                        v.options,
+                        v.operation_id,
+                        schema,
+                        self.batch_limits,
+                        clock,
+                        session.time_zone().clone(),
+                    )?
+                    .with_row_security(session.row_security()),
+                ))
             }
             crate::sql::allowlist::CopyStatement::To(v) => {
                 let (read_txn, schema) = self.read_txn_with_schema(v.inner.table_name())?;
@@ -13522,7 +13525,13 @@ impl EngineCore {
             evaluated_at,
             // 一時表向けの印は呼び出し元（`commit_copy_in*` の各入口）が振り分け済み。ここでは使わない。
             temp: _,
+            row_security,
         } = batch;
+        // RLS-13・Issue #2278: COPY 開始時の `row_security` を検査点の直前に復元する。公開入口
+        // （`commit_copy_in`／`commit_copy_in_txn`）は呼び出し側のスコープ外で呼ばれうるため、
+        // バッチが持つ値で束縛する（wire-server の `commit_copy_in_txn_in_session` の束縛と同じ値）。
+        let _row_security_scope =
+            crate::sql::policy_applicability::RowSecurityScope::enter(row_security);
         // COPY の束縛は wire メッセージをまたいで完了済みのため、台帳 v3 の評価時刻を
         // 書き込み区間へ明示的に渡す（Issue #2188。None は v2 の権威値）。
         let _ledger_clock_scope = crate::sql::time_fn::LedgerClockScope::enter(evaluated_at);
