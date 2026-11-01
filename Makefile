@@ -170,7 +170,7 @@ simd-codegen-check: ## SIMD カーネルの生成コード検査（要素ごと�
 simd-codegen-check-cross: ## simd-codegen-check の aarch64 版
 	@scripts/simd_codegen_check.sh cross
 
-# TASK-73（WIRE-1）/TASK-82（SQL-5〜7,9,10）/TASK-165（SQL-12・SEARCH-9）/TASK-168（SQL-13・SQL-14）/TASK-187（SQL-11）/Issue #454（広域取得）/Issue #705・#706（TASK-153・ERR-5。commit 後 panic 注入フラグ・3 クライアント detail 到達検証）/Issue #943（WIRE-19。3 クライアントのトランザクション状態遷移検証）/Issue #1177（WIRE-17・WIRE-18・SQL-16。SCRAM／psql \copy 往復／複数行 INSERT と NoSQL rows[] パリティ）/Issue #1176（WIRE-11・WIRE-13・WIRE-14・SQL-10。拡張クエリ／型復元／バイナリ受信）/Issue #1339（SQL-32。分割実行 DML）/Issue #1347（SQL-21。RETURNING の返却行・タグ受領）/Issue #1354（RECOVER-12。新しい BEGIN 内の再送による明示トランザクションの成否確定）psql/psycopg/pg 実クライアント統合テスト（opt-in・`ci` には含めない。要 psql・python3+psycopg・node+pg。PSQL_BIN/PYTHON_BIN/NODE_BIN で上書き可）
+# TASK-73（WIRE-1）/TASK-82（SQL-5〜7,9,10）/TASK-165（SQL-12・SEARCH-9）/TASK-168（SQL-13・SQL-14）/TASK-187（SQL-11）/Issue #454（広域取得）/Issue #705・#706（TASK-153・ERR-5。commit 後 panic 注入フラグ・3 クライアント detail 到達検証）/Issue #943（WIRE-19。3 クライアントのトランザクション状態遷移検証）/Issue #1177（WIRE-17・WIRE-18・SQL-16。SCRAM／psql \copy 往復／複数行 INSERT と NoSQL rows[] パリティ）/Issue #1176（WIRE-11・WIRE-13・WIRE-14・SQL-10。拡張クエリ／型復元／バイナリ受信）/Issue #1339（SQL-32。分割実行 DML）/Issue #1347（SQL-21。RETURNING の返却行・タグ受領）/Issue #1354（RECOVER-12。新しい BEGIN 内の再送による明示トランザクションの成否確定）/Issue #2412（SQL-31・SQL-19・ERR-7。明示トランザクション内の述語形書き込みと 40001 の再試行）psql/psycopg/pg 実クライアント統合テスト（opt-in・`ci` には含めない。要 psql・python3+psycopg・node+pg。PSQL_BIN/PYTHON_BIN/NODE_BIN で上書き可）
 .PHONY: e2e-three-client
 e2e-three-client: ## psql/psycopg/pg 実クライアント統合テスト（opt-in・ci 対象外）
 	@scripts/e2e_three_client.sh

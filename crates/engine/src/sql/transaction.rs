@@ -768,6 +768,12 @@ impl<'e> SessionTransaction<'e> {
                     // 書き込みを待たせず、書き込みロック待ち（`55P03`）も `BEGIN` では生じない。
                     // 書き込み時直列化検査（SQL-38・Issue #2404）のため、`G_s` を commit 記録の登録簿へ
                     // 登録する（登録順序は `Storage::open_registered_snapshot`）。
+                    // READ ONLY（Issue #1933・SQL-38）は writer を取れず `40001` の判定に到達しないため、
+                    // 登録を伴わない素の読み取りトランザクションで開く。他セッションの commit に
+                    // 足跡の計算・commit 記録の保持を強いない。
+                    TxnOrigin::Explicit if access_mode == TxnAccessMode::ReadOnly => {
+                        (None, open_read_snapshot(storage)?, None)
+                    }
                     TxnOrigin::Explicit => {
                         let (snap, reg) = storage
                             .open_registered_snapshot()
@@ -1182,11 +1188,14 @@ impl<'e> SessionTransaction<'e> {
     }
 
     /// 文の実行区間で読み取り集合を記録する区間を張る。明示トランザクションかつ writer 未取得の
-    /// ときだけ `Some`（SQL-38・Issue #2404）。暗黙トランザクション・取得後・`Active` 以外は `None`。
+    /// ときだけ `Some`（SQL-38・Issue #2404）。READ ONLY は writer を取れず `40001` 判定に到達しないため
+    /// 記録しない（Issue #1933）。暗黙トランザクション・取得後・`Active` 以外は `None`。
     pub(crate) fn read_set_scope(&self) -> Option<crate::sql::read_set::ReadSetScope> {
         match &self.state {
             TxnState::Active(active)
-                if active.origin == TxnOrigin::Explicit && active.writer.is_none() =>
+                if active.origin == TxnOrigin::Explicit
+                    && active.access_mode == TxnAccessMode::ReadWrite
+                    && active.writer.is_none() =>
             {
                 Some(crate::sql::read_set::ReadSetScope::enter())
             }
@@ -1348,7 +1357,9 @@ impl<'e> SessionTransaction<'e> {
     /// wire 層（`wire-server::handshake::post_auth_loop`）が、次の要求を待つ
     /// 読み取りタイムアウトをこの残り時間で切り詰めるために使う（PR #1041
     /// レビュー指摘: 無通信のまま上限を過ぎてもライタを占有し続けないよう、
-    /// 期限到達時点で [`Self::release_if_expired`] を呼べるようにする）。
+    /// 期限到達時点で [`Self::release_if_expired`] を呼べるようにする。writer 未取得の
+    /// `Active` でも `BEGIN` 起点で効き、`BEGIN` 時点のスナップショットを保持し続けない。
+    /// Issue #2409 のテストで固定）。
     /// `Failed` は [`Self::fail`]／[`Self::release_if_expired`] の時点で共有
     /// 書き込みトランザクション（書き込みゲートの permit を内包）を既に drop
     /// 済みでライタを保持しないため、対象外（`None`）とする。

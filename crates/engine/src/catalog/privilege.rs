@@ -29,6 +29,9 @@ use crate::storage::read_source::ReadSource;
 use super::role::validate_tenant;
 use super::{validate_identifier, validate_relation_key, CatalogError, Result, Storage};
 
+mod apply;
+pub(crate) use apply::{AclChangeError, AclItem, AclRequest, AclWarning, GranteeSpec};
+
 /// ACL の専用カタログ表。キーは `(tenant_id, object_kind, object_key, column, grantee_id, grantor_id)`。
 #[allow(clippy::type_complexity)] // 6 成分の複合キー（先頭 tenant_id）。型別名にすると redb の寿命推論が崩れる。
 pub(crate) const ACL_TABLE: TableDefinition<(&str, u8, &str, &str, u64, u64), &[u8]> =
@@ -601,6 +604,44 @@ impl Storage {
         let rt = self.db().begin_read()?;
         list_acl_for_object_in_txn(&rt, tenant, object)
     }
+}
+
+/// `tenant` の ACL に、ロール `role_id` が付与先（`grantee_id`）または付与者（`grantor_id`）として載る行が
+/// あるか（`DROP ROLE` の依存検査。Issue #1962・`sql::role_ddl` から `catalog::role` 経由で呼ばれる）。
+/// PUBLIC の予約 ID 0 は対象外。テナントの範囲だけを走査するため他テナントの行は構造上引けない。件数が
+/// [`MAX_ACL_ENTRIES_PER_TENANT`] を超える・行が破損している場合は読み飛ばさず `Err`（fail-closed）。
+pub(crate) fn acl_references_role_in_txn<R: ReadSource>(
+    src: &R,
+    tenant: &str,
+    role_id: u64,
+) -> Result<bool> {
+    validate_tenant(tenant)?;
+    if role_id == PUBLIC_GRANTEE_ID {
+        return Ok(false);
+    }
+    let table = match src.open_table(ACL_TABLE) {
+        Ok(t) => t,
+        Err(redb::TableError::TableDoesNotExist(_)) => return Ok(false),
+        Err(e) => return Err(e.into()),
+    };
+    let mut seen = 0usize;
+    for entry in table.range((tenant, 0u8, "", "", 0u64, 0u64)..)? {
+        let (k, v) = entry?;
+        let key = k.value();
+        if key.0 != tenant {
+            break;
+        }
+        seen += 1;
+        if seen > MAX_ACL_ENTRIES_PER_TENANT {
+            return Err(corrupt());
+        }
+        // 破損行は参照の有無に関わらず Err にする（decode_row が構造を検証する）。
+        decode_row(key, v.value())?;
+        if key.4 == role_id || key.5 == role_id {
+            return Ok(true);
+        }
+    }
+    Ok(false)
 }
 
 #[cfg(test)]

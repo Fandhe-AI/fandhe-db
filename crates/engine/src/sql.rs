@@ -212,8 +212,10 @@ mod truncate_restart_identity_tests;
 // `CREATE FUNCTION`／`DROP FUNCTION` の UDF カタログ書き込み経路（SQL-66・Issue #1920）。
 pub mod udf_ddl;
 // TRIGGER DDL（TABLE-45・Issue #1722）。
+pub mod grant_ddl;
 pub mod policy_applicability;
 pub mod policy_ddl;
+pub mod role_ddl;
 pub(crate) mod routine_fold;
 pub mod trigger_ddl;
 pub(crate) mod udf_load;
@@ -432,6 +434,18 @@ pub enum SqlOutcome {
     AlterPolicy(policy_ddl::AlterPolicyOutcome),
     /// `DROP POLICY`（RLS-13、Issue #2274）。
     DropPolicy(policy_ddl::DropPolicyOutcome),
+    /// `GRANT`／`REVOKE`（SQL-40、Issue #1965）が成功したことを示す応答（CommandComplete タグ `GRANT`／`REVOKE`）。
+    ///
+    /// **BREAKING CHANGE**（Issue #1965）: `SqlOutcome` への variant 追加。
+    GrantRevoke(grant_ddl::GrantRevokeOutcome),
+    /// `CREATE ROLE`／`CREATE USER`（SQL-39、Issue #1962。コマンドタグは PostgreSQL と同じく `CREATE ROLE`）。
+    ///
+    /// **BREAKING CHANGE**（Issue #1962）: `SqlOutcome` への variant 追加。
+    CreateRole(role_ddl::CreateRoleOutcome),
+    /// `DROP ROLE`／`DROP USER`（SQL-39、Issue #1962）。
+    ///
+    /// **BREAKING CHANGE**（Issue #1962）: `SqlOutcome` への variant 追加。
+    DropRole(role_ddl::DropRoleOutcome),
     /// `DO` ブロックの実行完了（CommandComplete タグ `DO`。SQL-68・Issue #2228）。
     ///
     /// **BREAKING CHANGE**（Issue #2228）: `SqlOutcome` への variant 追加。

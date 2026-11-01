@@ -302,6 +302,24 @@ fn nothing_is_retained_without_a_live_registration() {
     assert_eq!(stats(&core).0, 0);
 }
 
+/// `BEGIN READ ONLY` は commit 記録の登録簿へ載らず、他セッションの commit も保持されない
+/// （Issue #1933・SQL-38）。READ ONLY は writer を取れず `40001` 判定に到達しないため。
+#[test]
+fn read_only_transaction_is_not_registered_and_retains_nothing() {
+    let (core, _g) = new_core("clog-read-only");
+    let mut session = SessionState::default();
+    let mut txn = core.new_session_transaction();
+    core.execute_sql_in_txn(&ctx("tenant-a"), &mut session, &mut txn, "BEGIN READ ONLY")
+        .expect("begin read only");
+    assert_eq!(txn.snapshot_generation(), Some(0), "no registration");
+    for i in 0..5 {
+        run(&core, "tenant-b", &insert("ca", i, &format!("ro-{i}")));
+    }
+    assert_eq!(stats(&core).0, 0, "no record retained for READ ONLY");
+    rollback(&core, "tenant-a", &mut txn);
+    assert_eq!(stats(&core).0, 0);
+}
+
 #[test]
 fn retained_records_are_dropped_when_the_registration_ends_in_every_way() {
     let (core, _g) = new_core("clog-lifecycle");
@@ -516,6 +534,47 @@ fn policy_ddl_is_recorded_as_ddl_and_never_unrecordable() {
 
     let recs = records(&core, g_s).expect("verifiable");
     assert_eq!(recs.len(), 4, "{recs:?}");
+    for rec in &recs {
+        assert!(footprint(rec, "ca").ddl, "{rec:?}");
+    }
+    rollback(&core, "tenant-a", &mut txn);
+}
+
+/// SQL-40（Issue #1965）: `GRANT`／`REVOKE` の書き込みは対象 relation の DDL として記録され、記録不能にならない
+/// （`40001` の判定が権限変更を見逃さない）。SQL 文経由で実行し、束縛ロールを作る。
+#[test]
+fn grant_revoke_is_recorded_as_ddl_and_never_unrecordable() {
+    use crate::catalog::role::{RoleAttributes, RoleDef};
+    let (core, _g) = new_core("clog-grant-ddl");
+    let mk = |name: &str| RoleDef {
+        id: 0,
+        name: name.to_string(),
+        attributes: RoleAttributes::default(),
+        connection_limit: -1,
+        valid_until: None,
+        scram_verifier: Vec::new(),
+        legacy_phc: Vec::new(),
+    };
+    let owner = core
+        .storage
+        .create_role("tenant-a", &mk("owner_r"))
+        .expect("role");
+    core.storage
+        .create_role("tenant-a", &mk("alice"))
+        .expect("role");
+    let (mut txn, g_s) = begin(&core, "tenant-a");
+    let mut session = SessionState::default();
+    session.bind_role_ids(owner, owner);
+    session.allow_ddl();
+    for sql in [
+        "GRANT SELECT ON ca TO alice",
+        "REVOKE SELECT ON ca FROM alice",
+    ] {
+        core.execute_sql_in_session(&ctx("tenant-a"), &mut session, sql)
+            .unwrap_or_else(|e| panic!("{sql} must succeed, got {e:?}"));
+    }
+    let recs = records(&core, g_s).expect("verifiable");
+    assert_eq!(recs.len(), 2, "{recs:?}");
     for rec in &recs {
         assert!(footprint(rec, "ca").ddl, "{rec:?}");
     }

@@ -455,7 +455,9 @@ const ALLOWLIST: &[(&str, u32)] = &[
     // Issue #2400（明示 Tx の writer 遅延取得。`ensure_writer`・`open_read_snapshot` の追加と
     // `begin_with_origin` の分岐）と Issue #1938（ISOLATION LEVEL 受理）・Issue #1930（別名受理）の行追加でさらに移動（旧: 1120）。書き込み内容・commit の意味は不変。
     // Issue #2403（読み取り源の三分岐 `TxnReadSource`・`read_source` の追加）の行追加でさらに移動（旧: 1275）。書き込み内容・commit の意味は不変。
-    ("sql/transaction.rs", 1479),
+    // Issue #2409（最初の書き込み文での 55P03・BEGIN 起点の持続時間・文数上限）の行追加でさらに移動（旧: 1479）。書き込み内容・commit の意味は不変。
+    // Issue #1933（READ ONLY Tx を redb 読み取りトランザクションで開く）の行追加でさらに移動（旧: 1481）。書き込み内容・commit の意味は不変。
+    ("sql/transaction.rs", 1490),
     // TABLE-44・Issue #1684: 一時表ストア（セッション専用のインメモリ DB。永続 DB とは別インスタンス）の
     // 書き込みトランザクションの確定口（`TempRowStore::commit`）。確定するのは、一時コアの書き込み本体
     // （`tenant::*`・`catalog::*`。いずれも自分の DB の表世代を `bump_table_generation_in_txn` で進める）が
@@ -545,9 +547,13 @@ const ALLOWLIST: &[(&str, u32)] = &[
     // Issue #1961（ロールカタログ `Storage::create_role`）: ロール定義は専用 redb 表（`roles` ほか）へ
     // 書くだけで、どの表の行・スキーマ・`table_generation` にも影響しない（ACL・メンバーシップも ID 参照のみ。
     // 検査ゲートが入る後続 Issue でも世代ではなくカタログを直接読む）ため世代 bump は不要。
-    ("catalog/role.rs", 777),
+    // Issue #1962（`Storage::drop_roles`）の追加で `create_role`・`drop_roles` の 2 か所になった（同じ理由）。
+    ("catalog/role.rs", 876),
+    ("catalog/role.rs", 908),
     // Issue #1961 のロール・ACL カタログの単体テスト補助（`write` ヘルパー。専用表だけを書き表世代の対象外）。
     ("catalog/role/tests.rs", 37),
+    // Issue #1962 の `sql::role_ddl` の crate 内テスト補助（`commit` ヘルパー。専用表だけを書き表世代の対象外）。
+    ("sql/role_ddl/tests.rs", 39),
     ("catalog/privilege/tests.rs", 21),
     ("catalog/sequence.rs", 1386),
     ("catalog/sequence.rs", 1399),

@@ -3,7 +3,7 @@
 - ステータス: **Accepted（実装既定値）**
 - 対応: Issue #942・TASK-221
 - 改訂: Issue #2396・TASK-333（決定 1 を改訂。writer の遅延取得と `40001` の判定は
-  下記 1a。実装は #2399〜#2405・#2408 で進行中。#2399・#2400・#2401・#2404・#2405 は実施済み。設計記録は #2397）
+  下記 1a。実装は #2399〜#2405・#2408 で進行中。#2399・#2400・#2401・#2404・#2405・#2412 は実施済み。設計記録は #2397）
 - ポインタ: `docs/spec/04-behavior/sql-surface.md` SQL-31・
   `docs/spec/04-behavior/persistence.md` RECOVER-12・
   `docs/spec/04-behavior/error-format.md` ERR-6
@@ -216,13 +216,13 @@ Issue（#2399〜#2405・#2408〜#2413）が拠り所にする設計記録で、�
   カーソルは取得時点のスナップショットを読む（WIRE-15）。
 - 取得前に宣言したカーソルの内側の SELECT は読み取り集合に入る。
 - 取得前のカーソルが残っている間は、`BEGIN` 時点の `ReadTransaction` を保持する。
-- 実装は #2411、検証は #2408。
+- 実装は #2403、検証は #2411（engine・wire）。
 
 #### 1a-9. 本節で決めないこと（申し送り）
 
-- `55P03` が出る箇所・上限の起点・状態バイトの検証と層 B → #2408
-- READ ONLY の上限・並行の検証 → #1933・#1935、書き込み拒否 → #1934、行ロック句・`LOCK TABLE` → 「行ロック句・`LOCK TABLE` の扱い」節（#2230・#2231・#1957・#1958）
-- CHANGELOG と `implementation-status.md` → #2413
+- `55P03` が出る箇所・上限の起点の検証は #2409 で実施済み。状態バイトの検証は #2410、3 クライアントの層 B は #2412 で実施済み（`docs/design/three-client-e2e-harness.md` の #2412 の節）
+- READ ONLY の読み取りトランザクション・上限の適用 → #1933 で実装済み（「READ ONLY の読み取りトランザクション」節）。並行のスナップショット一貫性・テナント境界の検証 → #1935 で検証済み（`tests/sql_t01_39/sql38_read_only_concurrency.rs`・`core/deferred_writer_tests.rs`）、書き込み拒否 → #1934、行ロック句・`LOCK TABLE` → 「行ロック句・`LOCK TABLE` の扱い」節（#2230・#2231・#1957・#1958）
+- CHANGELOG と `implementation-status.md` は #2413 で記載済み
 - 早期の事前判定（gate を待つ前に明らかな衝突を返す最適化）は任意とし、#2405 の判断に委ねる。
 
 #### 1a-10. 実装上の決定（#2404）
@@ -516,7 +516,11 @@ Failed { session_at_begin: SessionState, expired: bool } }`）。`ActiveTxn` は
 - **改訂（#2396・1a）**: `max_duration`・`max_statements` はこれまでどおり `BEGIN` から数える
   （不変）。`lock_wait` が効き始めるのは最初の書き込み文から。下記の「`Active` の間だけ
   読み取りタイムアウトを切り詰める」規則には「`Active` かつ writer 未取得」の場合が新たに
-  生じる。その扱いは本節では決めず、#2408 へ申し送る。
+  生じる。**決定（#2409）**: 切り詰めと期限での解放は writer の有無に関係なく `Active` 全体に
+  効く（起点は `BEGIN`）。writer 未取得の場合の目的は、`BEGIN` 時点の読み取りスナップショットを
+  解放して redb がページを回収できるようにすること。engine 側は #2409 のテスト
+  （`tests/write_lock_wait.rs` T5〜T10・`core_misc/transaction_limits.rs`）で固定し、wire 側の
+  確認は #2410 に委ねる。
 - 超過時は `54000`（`PayloadTooLarge`）で `Failed` へ遷移する。
 - 起動時 CLI（`--max-transaction-duration-ms`・`--max-transaction-statements`。Issue #1553）で
   設定できる。範囲・ハード上限は [transaction-limits-cli.md](transaction-limits-cli.md) 参照。
@@ -788,6 +792,12 @@ production コード（`crates/wire-server/src/`）は無変更・テスト専�
   開始自体が `55P03` で `Idle` のまま 1 文も実行されない（`tests/core_misc/wire16_implicit_txn.rs`）、
   待機上限での `55P03`（`tests/write_lock_wait.rs`）、wire 越しの複数文メッセージ
   （`crates/wire-server/tests/write_lock_wait_parity.rs`）。
+- wire 越しの開始時取得と状態バイトの固定（Issue #2410。SQL-31・WIRE-16・WIRE-19。本番コードの
+  変更は無い）: 先頭が読み取りの暗黙 Tx は先頭文の `RowDescription` より前に `55P03` になり、
+  書き込みが最後の複数文メッセージ（順次実行）との対照で取得時点を判別する。待機中は応答が届かず、
+  取得後にスナップショットを開く（`write_lock_wait_parity.rs`）。遅延取得後の `ReadyForQuery` の
+  状態バイト（writer を持たない `Active`・最初の書き込みの `55P03`／`40001`・`BEGIN` を含む複数文・
+  拡張クエリ・期限切れ）は `crates/wire-server/tests/wire19_deferred_writer_status.rs`。
 - 先頭文（または唯一の文）が 0 行 DELETE の場合の再送判定（Issue #1403。実装済み）:
   明示トランザクション内の DELETE は autocommit と同じフォーム関数へ `WriteTarget::InTxn`
   を渡し、0 行でも台帳を共有 write txn へ記録して `mark_written` する。このため従来の
@@ -818,8 +828,11 @@ production コード（`crates/wire-server/src/`）は無変更・テスト専�
 ## 対象外・申し送り
 
 - #2396 関連の申し送り: #2408（`55P03`・上限の起点・カーソル・状態バイトの整合と層 B）、
-  #2411（カーソルの分割の実装）、#2413（CHANGELOG・実装記録）、#1933（READ ONLY）、
+  #2411（カーソルの分割の検証。実装は #2403）、#2413（CHANGELOG・実装記録。記載済み）、#1933（READ ONLY）、
   #2230（行ロック句・`LOCK TABLE` は専用節を参照）。
+- 待ちの途中で期限を越えた最初の書き込み文は、writer を取って成功する（取得後に期限を再検査しない）。
+  次の文か `COMMIT` が `54000` で拒否し永続化しない（fail-closed。#2409 の T10 で現行契約を固定）。
+  取得後の再検査が要るなら別 Issue で扱う。
 - 書き込み後の読み取りでのキャッシュ・HNSW の再利用（テーブル単位の最適化。現状は
   brute-force）。
 - `DUPLICATE_OPERATION_ID` と `UNIQUE_VIOLATION` の `code` ラベル区別は Issue #1180 で
@@ -850,7 +863,7 @@ production コード（`crates/wire-server/src/`）は無変更・テスト専�
 クローズされる。詳細は `docs/design/sql-cursor.md` 参照。
 
 改訂（#2396・1a-8）: writer の取得前に宣言したカーソルは `BEGIN` 時点のスナップショット、
-取得後に宣言したカーソルは取得時点のスナップショットを読む（WIRE-15。実装は #2411）。
+取得後に宣言したカーソルは取得時点のスナップショットを読む（WIRE-15。実装は #2403・検証は #2411）。
 取得前に宣言したカーソルが残っている間は、`BEGIN` 時点の `ReadTransaction` を保持し続ける。
 
 ## 別名（Issue #1930・SQL-69 (1) ポインタ）
@@ -882,3 +895,17 @@ production コード（`crates/wire-server/src/`）は無変更・テスト専�
 - **PostgreSQL との既知の差**: 一時表への書き込みと `COPY FROM`、弱いモードの `LOCK TABLE` も拒否する
   （fail-closed）。緩和が必要なら別 Issue で扱う。
 - HTTP の射影は 403。NoSQL にはトランザクション制御が無く到達しない。
+
+## READ ONLY の読み取りトランザクション（SQL-38・SQL-31・SQL-46・Issue #1933）
+
+`BEGIN READ ONLY` は writer を取らず、commit 記録の登録簿にも載らない素の redb 読み取りトランザクションで開く。
+
+- **登録しない理由**: READ ONLY は `ensure_writer_with` で必ず `25006` になり `40001` の判定に到達しない。
+  登録があると他セッションの commit が足跡を計算し、記録を `G_s` より新しい分だけ保持させられるため、
+  その負荷を READ ONLY が他セッションへ掛けないようにする。`BEGIN READ ONLY` が他セッションの commit 中に
+  待たされることもない。
+- **読み取り集合**: `read_set_scope` は READ ONLY で `None`。読み取り集合は空のまま。
+- **世代**: `snapshot_generation` は未登録の 0（暗黙 Tx と同じ扱いで、判定には使わない）。
+- **EXPLAIN**: writer を取らないことだけを保証する。検証は従来どおり最新の確定カタログ（#2403 の既存契約）。
+- **上限**: 持続時間・文数は `BEGIN` から数え、アクセスモードに関係なく効く。
+- 並行のスナップショット一貫性・テナント境界は #1935 で検証済み（`tests/sql_t01_39/sql38_read_only_concurrency.rs`・`core/deferred_writer_tests.rs`）。`USING PLAN` 付き SELECT と `EXPLAIN` は文ごとに最新の確定状態を読む既知の残りのため、一貫性の対象外（writer を取らないことだけを確かめる）。

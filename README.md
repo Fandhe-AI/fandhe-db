@@ -101,7 +101,7 @@ cargo test -p fandhe-db-wire-server --test wire_framing
 | `make docker-build` / `make docker-shell` / `make docker-ci` | Docker による環境非依存の開発・検証（`compose.yaml` 参照） |
 | `make bench-simd` / `make bench-c1` / `make recall-regression` / `make precision-regression` | 時間依存・spec 閾値依存の回帰チェック（`ci` には含めない。`.github/workflows/bench.yml`・`recall.yml` から実行。`precision-regression` は目標値未確定のため `recall.yml` へ未接続。詳細は下記「`precision` 評価ハーネス」参照） |
 | `make precision-report` | TASK-163 の判断材料レポート・パラメータ感度スイープ（実測値を標準出力へ出すため**ローカル専用**。CI・GitHub Actions からは実行しない） |
-| `make e2e-three-client` | TASK-73（WIRE-1）／TASK-165（SQL-12・SEARCH-9）／TASK-168（SQL-13・SQL-14）／TASK-153（ERR-5。commit 後 panic 緊急応答の 3 クライアント detail 到達検証）／Issue #1177（WIRE-17・WIRE-18・SQL-16。SCRAM／psql `\copy` 往復／複数行 INSERT と NoSQL `rows[]` パリティ）／Issue #1176（WIRE-11・WIRE-13・WIRE-14・SQL-10。拡張クエリ・型復元・バイナリ受信）／Issue #2445（WIRE-14・WIRE-26。numeric のバイナリ結果・バイナリパラメータ）実 `psql`／`psycopg`／`pg` クライアント統合テスト（`ci` には含めない opt-in。要 `psql`・`python3`+`psycopg`・`node`+`pg`。`PSQL_BIN`/`PYTHON_BIN`/`NODE_BIN` で上書き可） |
+| `make e2e-three-client` | TASK-73（WIRE-1）／TASK-165（SQL-12・SEARCH-9）／TASK-168（SQL-13・SQL-14）／TASK-153（ERR-5。commit 後 panic 緊急応答の 3 クライアント detail 到達検証）／Issue #1177（WIRE-17・WIRE-18・SQL-16。SCRAM／psql `\copy` 往復／複数行 INSERT と NoSQL `rows[]` パリティ）／Issue #1176（WIRE-11・WIRE-13・WIRE-14・SQL-10。拡張クエリ・型復元・バイナリ受信）／Issue #2445（WIRE-14・WIRE-26。numeric のバイナリ結果・バイナリパラメータ）／Issue #2412（SQL-31・SQL-19・ERR-7。明示トランザクション内の述語形書き込みと 40001 の再試行）実 `psql`／`psycopg`／`pg` クライアント統合テスト（`ci` には含めない opt-in。要 `psql`・`python3`+`psycopg`・`node`+`pg`。`PSQL_BIN`/`PYTHON_BIN`/`NODE_BIN` で上書き可） |
 | `make e2e-three-client-tls` | TASK-228（WIRE-9・WIRE-1）Issue #969: TLS 1.3 越しの実 `psql`／`psycopg`／`pg` クライアント統合テスト（`ci` には含めない opt-in。要 `psql`・`python3`+`psycopg`・`node`+`pg`。`PSQL_BIN`/`PYTHON_BIN`/`NODE_BIN` で上書き可。証明書・鍵は実行時に生成しリポジトリへは置かない） |
 | `make e2e-three-client-http` | TASK-183（HTTP-13）NoSQL 表層（`--surface nosql`）の無改造 HTTP クライアント（curl／urllib／fetch）統合テスト（`ci` には含めない opt-in。要 `curl`・`python3`・`node`（≥18）。`CURL_BIN`／`PYTHON_BIN`／`NODE_BIN` で上書き可）。実行記録（`[e2e-record]`）を stderr へ出力する。PR 記録様式は `docs/design/three-client-e2e-harness.md` 参照 |
 
@@ -528,7 +528,7 @@ SELECT の結果行数上限にも使われます（Issue #1796・#2211）。こ
 
 `--write-lock-wait-ms <N>`（既定 30,000・範囲 `100`〜`60,000` ミリ秒）（Issue #1554・SQL-46）は、書き込みロック
 （単一ライタ）の待機上限を、プロセス全体に対して起動時に設定します（未指定は現行の 30 秒で、挙動は変わりません）。
-超過時の SQLSTATE は従来と同じ `55P03` です。autocommit の書き込み・明示トランザクションの `BEGIN`・分割実行 DML の
+超過時の SQLSTATE は従来と同じ `55P03` です。autocommit の書き込み・明示トランザクションの最初の書き込み文（DML・`LOCK TABLE`。`BEGIN` と読み取りでは待たない）・分割実行 DML の
 チャンクに効き、SQL 表層と NoSQL（HTTP）表層の両方が対象です。範囲外・非数値・値欠落・2 回目以降の重複指定は
 fail-closed で起動エラーです。環境変数は設けません（詳細: [docs/design/write-lock-wait-cli.md](docs/design/write-lock-wait-cli.md)）。
 
@@ -544,7 +544,8 @@ fail-closed で起動エラーです。環境変数は設けません（詳細: 
 プロセス全体に対して起動時に設定します（未指定は現行の既定値で、挙動は変わりません。兄弟フラグと違い既定の
 上下どちらへも設定できますが、ハード上限〔60 秒・10,000 文〕は超えられません）。設定値は明示トランザクションと
 暗黙トランザクション（`BEGIN` を含まない複数文メッセージ）の両方に効き、超過時の SQLSTATE は従来と同じ
-`54000` です。持続時間を 30 秒より長く明示指定すると、書き込みロック待ち上限（30 秒）を超えるため、長い
+`54000` です。持続時間・文数は `BEGIN` から数えます（writer 取得前の読み取り文と書き込みロックの待ち時間を含む）。
+持続時間を 30 秒より長く明示指定すると、書き込みロック待ち上限（30 秒）を超えるため、長い
 トランザクションが書き手を握っている間にほかのセッションの書き込みが `55P03` を受け得る旨の `WARNING` 行を
 起動ログに出します。範囲外・非数値・値欠落・2 回目以降の重複指定は fail-closed で起動エラーです
 （詳細: [docs/design/transaction-limits-cli.md](docs/design/transaction-limits-cli.md)）。

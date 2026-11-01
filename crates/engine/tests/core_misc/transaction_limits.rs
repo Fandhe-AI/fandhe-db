@@ -5,6 +5,9 @@
 //! `TransactionLimits` を `EngineCore::with_transaction_limits` へ注入した状態を再現し、
 //! 設定値を既定より下げた場合・上げた場合の双方で「上限ちょうどは成功・超過は `54000`」
 //! であることを確認する（文数は加算前に判定するため、N 文目までは成功し N+1 文目で失敗）。
+//! Issue #2409（SQL-31）: 持続時間・文数は writer の取得時点ではなく `BEGIN` から数える
+//! （writer 取得前の読み取り文も文数に入る）ことを末尾の 4 テストで固定する。
+//! Issue #1933（SQL-38）: `BEGIN READ ONLY` にも同じ上限が効くことを末尾の 2 テストで固定する。
 //! 既存の `sql31_transaction.rs` と同じ流儀（実 `Storage` ＋ `CpuScalarProvider`）。
 
 use engine::catalog::{ColumnDef, ColumnType, TableSchema};
@@ -139,4 +142,190 @@ fn lowered_duration_limit_fails_statement_and_commit_after_expiry() {
         .execute_sql_in_txn(&caller, &mut session, &mut txn, "COMMIT")
         .expect_err("commit after expiry");
     assert_eq!(err.wire_code(), "54000");
+}
+const SELECT_SQL: &str = "SELECT id FROM documents ORDER BY embedding <=> '[1.0, 0.0]' LIMIT 10";
+
+fn limits_with_duration_ms(ms: u64) -> TransactionLimits {
+    TransactionLimits {
+        max_duration: std::time::Duration::from_millis(ms),
+        max_statements: 1_000,
+    }
+}
+
+/// Issue #2409（SQL-31）: writer 取得前の読み取り文も文数に入る。最初の書き込みから数えるなら
+/// 2 文目扱いで通ってしまうため、この形（読み取り 2 ＋ 書き込み 2）で起点の違いを区別できる。
+#[test]
+fn reads_before_first_write_count_toward_statement_limit() {
+    let (engine, path) = new_core(limits_with_statements(3));
+    let _cleanup = CleanupGuard(path);
+    let caller = ctx();
+    let mut session = SessionState::default();
+    let mut txn = engine.new_session_transaction();
+    for sql in ["BEGIN", SELECT_SQL, SELECT_SQL] {
+        engine
+            .execute_sql_in_txn(&caller, &mut session, &mut txn, sql)
+            .unwrap_or_else(|e| panic!("{sql}: {e}"));
+    }
+    engine
+        .execute_sql_in_txn(&caller, &mut session, &mut txn, &insert_sql(1))
+        .expect("third statement is within the limit");
+    let err = engine
+        .execute_sql_in_txn(&caller, &mut session, &mut txn, &insert_sql(2))
+        .expect_err("fourth statement beyond the limit");
+    assert_eq!(err.wire_code(), "54000");
+    assert_eq!(txn.status(), TransactionStatus::Failed);
+}
+
+/// Issue #2409（SQL-31）: 持続時間は `BEGIN` から数える。writer 未取得のまま上限を越えたあとの
+/// 最初の書き込み文は `54000`。
+#[test]
+fn duration_limit_counts_from_begin_not_from_first_write() {
+    let (engine, path) = new_core(limits_with_duration_ms(200));
+    let _cleanup = CleanupGuard(path);
+    let caller = ctx();
+    let mut session = SessionState::default();
+    let mut txn = engine.new_session_transaction();
+    for sql in ["BEGIN", SELECT_SQL] {
+        engine
+            .execute_sql_in_txn(&caller, &mut session, &mut txn, sql)
+            .unwrap_or_else(|e| panic!("{sql}: {e}"));
+    }
+    std::thread::sleep(std::time::Duration::from_millis(300));
+    let err = engine
+        .execute_sql_in_txn(&caller, &mut session, &mut txn, &insert_sql(1))
+        .expect_err("first write after the begin-based deadline");
+    assert_eq!(err.wire_code(), "54000");
+    assert_eq!(txn.status(), TransactionStatus::Failed);
+    engine
+        .execute_sql_in_txn(&caller, &mut session, &mut txn, "ROLLBACK")
+        .expect("rollback");
+}
+
+/// Issue #2409（SQL-31）: writer の取得は持続時間の起点をリセットしない。
+#[test]
+fn writer_acquisition_does_not_reset_duration_clock() {
+    let (engine, path) = new_core(limits_with_duration_ms(500));
+    let _cleanup = CleanupGuard(path);
+    let caller = ctx();
+    let mut session = SessionState::default();
+    let mut txn = engine.new_session_transaction();
+    engine
+        .execute_sql_in_txn(&caller, &mut session, &mut txn, "BEGIN")
+        .expect("begin");
+    std::thread::sleep(std::time::Duration::from_millis(300));
+    engine
+        .execute_sql_in_txn(&caller, &mut session, &mut txn, &insert_sql(1))
+        .expect("first write acquires the writer within the limit");
+    std::thread::sleep(std::time::Duration::from_millis(300));
+    let err = engine
+        .execute_sql_in_txn(&caller, &mut session, &mut txn, "COMMIT")
+        .expect_err("600 ms since BEGIN exceeds 500 ms");
+    assert_eq!(err.wire_code(), "54000");
+    let _ = engine.execute_sql_in_txn(&caller, &mut session, &mut txn, "ROLLBACK");
+    let mut other = SessionState::default();
+    match engine
+        .execute_sql_in_session(&caller, &mut other, "SELECT id FROM documents LIMIT 10")
+        .expect("select")
+    {
+        engine::sql::SqlOutcome::Query(q) => assert!(q.rows.is_empty()),
+        _ => panic!("unexpected outcome"),
+    }
+}
+
+/// Issue #2409（SQL-31）: writer 未取得の `Active` でも期限は `BEGIN` 起点で効き、
+/// `release_if_expired` が 1 度だけ解放して `Failed` にし、最初の `COMMIT` が `54000` を一度だけ返す。
+#[test]
+fn expiry_without_writer_releases_and_reports_once() {
+    let (engine, path) = new_core(limits_with_duration_ms(200));
+    let _cleanup = CleanupGuard(path);
+    let caller = ctx();
+    let mut session = SessionState::default();
+    let mut txn = engine.new_session_transaction();
+    for sql in ["BEGIN", SELECT_SQL] {
+        engine
+            .execute_sql_in_txn(&caller, &mut session, &mut txn, sql)
+            .unwrap_or_else(|e| panic!("{sql}: {e}"));
+    }
+    let remaining = txn.remaining_duration().expect("active");
+    assert!(
+        remaining > std::time::Duration::ZERO && remaining <= std::time::Duration::from_millis(200),
+        "remaining={remaining:?}"
+    );
+    std::thread::sleep(std::time::Duration::from_millis(400));
+    assert_eq!(txn.remaining_duration(), Some(std::time::Duration::ZERO));
+    assert!(txn.release_if_expired());
+    assert_eq!(txn.status(), TransactionStatus::Failed);
+    assert!(!txn.release_if_expired());
+    let first = engine
+        .execute_sql_in_txn(&caller, &mut session, &mut txn, "COMMIT")
+        .expect_err("expired commit");
+    assert_eq!(first.wire_code(), "54000");
+    let second = engine
+        .execute_sql_in_txn(&caller, &mut session, &mut txn, "COMMIT")
+        .expect_err("failed txn");
+    assert_eq!(second.wire_code(), "25P02");
+    engine
+        .execute_sql_in_txn(&caller, &mut session, &mut txn, "ROLLBACK")
+        .expect("rollback");
+    assert_eq!(txn.status(), TransactionStatus::Idle);
+}
+
+/// Issue #1933: READ ONLY の読み取り文も文数に入り、n+1 文目が `54000`・以後は `25P02`。
+#[test]
+fn read_only_statement_limit_is_enforced() {
+    let n = 3;
+    let (engine, path) = new_core(limits_with_statements(n));
+    let _cleanup = CleanupGuard(path);
+    let caller = ctx();
+    let mut session = SessionState::default();
+    let mut txn = engine.new_session_transaction();
+    engine
+        .execute_sql_in_txn(&caller, &mut session, &mut txn, "BEGIN READ ONLY")
+        .expect("begin");
+    for i in 1..=n {
+        engine
+            .execute_sql_in_txn(&caller, &mut session, &mut txn, SELECT_SQL)
+            .unwrap_or_else(|e| panic!("statement {i} within limit failed: {e}"));
+    }
+    let err = engine
+        .execute_sql_in_txn(&caller, &mut session, &mut txn, SELECT_SQL)
+        .expect_err("statement beyond the limit");
+    assert_eq!(err.wire_code(), "54000");
+    assert_eq!(txn.status(), TransactionStatus::Failed);
+    let err = engine
+        .execute_sql_in_txn(&caller, &mut session, &mut txn, SELECT_SQL)
+        .expect_err("failed txn");
+    assert_eq!(err.wire_code(), "25P02");
+    engine
+        .execute_sql_in_txn(&caller, &mut session, &mut txn, "ROLLBACK")
+        .expect("rollback");
+    assert_eq!(txn.status(), TransactionStatus::Idle);
+}
+
+/// Issue #1933: READ ONLY でも期限は `BEGIN` 起点で効き、期限後の文は `54000`、
+/// 失敗済みの Tx に対する `release_if_expired` は何もしない。
+#[test]
+fn read_only_duration_limit_fails_statement_after_expiry() {
+    let (engine, path) = new_core(limits_with_duration_ms(200));
+    let _cleanup = CleanupGuard(path);
+    let caller = ctx();
+    let mut session = SessionState::default();
+    let mut txn = engine.new_session_transaction();
+    for sql in ["BEGIN READ ONLY", SELECT_SQL] {
+        engine
+            .execute_sql_in_txn(&caller, &mut session, &mut txn, sql)
+            .unwrap_or_else(|e| panic!("{sql}: {e}"));
+    }
+    std::thread::sleep(std::time::Duration::from_millis(400));
+    assert_eq!(txn.remaining_duration(), Some(std::time::Duration::ZERO));
+    let err = engine
+        .execute_sql_in_txn(&caller, &mut session, &mut txn, SELECT_SQL)
+        .expect_err("expired select");
+    assert_eq!(err.wire_code(), "54000");
+    assert_eq!(txn.status(), TransactionStatus::Failed);
+    assert!(!txn.release_if_expired());
+    engine
+        .execute_sql_in_txn(&caller, &mut session, &mut txn, "ROLLBACK")
+        .expect("rollback");
+    assert_eq!(txn.status(), TransactionStatus::Idle);
 }

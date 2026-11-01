@@ -29,8 +29,9 @@ Phase 6 の共通ゲートへ移行する前に結線漏れと README の再陳�
 | 1. テナント境界（RLS 相当） | `--users`（`username:tenant_id:phc`）の照合結果からサーバー側でテナントを導出し `PolicyContext` に載せる。DML・検索の可視性はこの軸で決まる。`PolicyContext` は認証主体（ロール）を持たない | `engine::policy`・`engine::tenant` |
 | 2. DDL 実行権限 | `--ddl-allowed-users` で列挙した username の接続だけが DDL を実行できる。判定点は `sql::ddl::require_ddl_permission` ただ 1 つ（カタログ照会なし・既定拒否 `42501`）。SQL 文から権限ビットを変える経路は無い | 下表「権限ビットの注入点」 |
 
-ロール・GRANT／REVOKE・オブジェクト権限・所有者の概念は現状存在しない。`GRANT` 等は SQL 表層の許可リスト外として
-`42601` で拒否される（`crates/wire-server/tests/wire1_simple_query.rs` が根拠）。
+ロールと権限のカタログ（#1961）と `GRANT`／`REVOKE` の SQL 文（#1965）は実装済みだが、現在ロールを束縛する認証層（#1971）と
+権限検査ゲート（#1966〜#1969）は未実装のため、権限はまだ DML・SELECT・COPY の判定に効かない。wire の全セッションは現在ロールが未束縛で、
+`GRANT`／`REVOKE` は対象・ロールの有無を問わず `42501` になる（後述）。所有者の概念は未実装（#2236）。
 DDL 権限は全テナント共有のカタログを変更する操作の運用者権限であり、軸 1 とは独立に評価される。
 
 ## 権限ビットの注入点（本番コード）
@@ -78,6 +79,7 @@ SQL 表層のディスパッチは `EngineCore::execute_parsed_statement`（自�
 | `ALTER POLICY` | `AlterPolicy` | `core.rs` の腕 | |
 | `DROP POLICY` | `DropPolicy` | `core.rs` の腕 | `IF EXISTS` でも `42501` |
 | `CREATE SCHEMA` | `CreateSchema` | `core.rs` の腕 | |
+| `GRANT`／`REVOKE` | `GrantRevoke` | `core.rs` の腕（`sql::grant_ddl::require_grant_principal`） | DDL 権限ではなく現在ロールの束縛を判定する（未束縛は `42501`。カタログ照会・名前解決より前）。DDL 権限ゲートを通過した主体は所有者の機構（#2236）までの代替として所有者相当に扱う（SQL-40・Issue #1965。[role-privilege-model.md](role-privilege-model.md) §8）。構文エラー `42601`・範囲外の形 `0A000`・不正な付与 `0LP01` は状態に依存しないため判定点より前（構文段）に返る。`search_path` の参照ゲートは現在ロール未束縛のセッションでは飛ばす（`42501` を先にする） |
 | `DROP SCHEMA` | `DropSchema` | `core.rs` の腕 | |
 | `ALTER SCHEMA` | `AlterSchema` | `core.rs` の腕 | |
 | `CREATE [OR REPLACE] FUNCTION` | `Statement::CreateFunction` | `core.rs` の `execute_validated_with_dict` 内の腕 | |
@@ -88,6 +90,8 @@ SQL 表層のディスパッチは `EngineCore::execute_parsed_statement`（自�
 - `CREATE FUNCTION`・`DROP FUNCTION`・`CREATE POLICY`・`ALTER POLICY`・`DROP POLICY` の腕だけが
   `require_ddl_permission` → `0A000`（Tx 内では非対応）の順で評価する。
   権限の無いセッションは `42501`、有るセッションは `0A000`
+- `GRANT`／`REVOKE`（Issue #1965）の腕は `require_grant_principal`（現在ロールの束縛。未束縛は `42501`）→ `0A000`
+  の順で評価する（ACL の書き込みは独立した write txn で commit され ROLLBACK で取り消せないため）
 - その他の DDL は末尾の包括腕で `0A000`（`transaction_feature_not_supported`）となり、権限ゲートは通らない。
   権限の有無に関わらず同じ拒否のため存在情報は出ない。Tx 内で DDL を受理する変更を入れる場合は、
   各 DDL の腕でゲートを先に呼ぶこと（チェックリスト参照）

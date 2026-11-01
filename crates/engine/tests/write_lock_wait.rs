@@ -5,6 +5,13 @@
 //!
 //! 境界: 上限ちょうど（60,000 ms）は実時間で待てないため `validate_*` のユニットテスト
 //! （`storage.rs`）で固定し、挙動側は下限ちょうど（100 ms）で固定する。
+//!
+//! Issue #2409（SQL-31・SQL-46・SQL-38・TASK-335 ポインタ）: 明示 Tx の writer 取得が最初の
+//! 書き込み文（DML・`LOCK TABLE`）へ移った後の契約を固定する。T5 は `BEGIN`・読み取りが待たない
+//! こと、T6 は待ちが最初の書き込み文で起きること、T7 は `LOCK TABLE` の `55P03`（2 セッション E2E）、
+//! T8・T9 は文数・持続時間の上限が writer の待機より前に `BEGIN` 起点で検査されること、
+//! T10 はロック待ちの時間も `BEGIN` 起点の持続時間に入ることを確認する。
+//! Issue #1933（SQL-38 ポインタ）: T11 は `BEGIN READ ONLY` が開いている間も別セッションの書き込みが待たないこと。
 //! `sql31_transaction.rs` と同じ流儀（実 `Storage`・チャネル同期・holder を先に解放して join）。
 
 use std::sync::Arc;
@@ -15,6 +22,7 @@ use engine::core::EngineCore;
 use engine::kernel::CpuScalarProvider;
 use engine::policy::PolicyContext;
 use engine::sql::mode::SessionState;
+use engine::sql::transaction::{TransactionLimits, TransactionStatus};
 use engine::storage::{validate_write_lock_wait_ms, Storage, Visibility};
 
 #[path = "../src/test_util/temp_db.rs"]
@@ -24,6 +32,13 @@ use temp_db::{unique_db_path, CleanupGuard};
 const TABLE: &str = "documents";
 
 fn new_core(wait_ms: u64) -> (Arc<EngineCore>, std::path::PathBuf) {
+    new_core_with_limits(wait_ms, TransactionLimits::default())
+}
+
+fn new_core_with_limits(
+    wait_ms: u64,
+    limits: TransactionLimits,
+) -> (Arc<EngineCore>, std::path::PathBuf) {
     let path = unique_db_path("write-lock-wait");
     let storage = Storage::open(&path).expect("open storage");
     storage
@@ -33,7 +48,8 @@ fn new_core(wait_ms: u64) -> (Arc<EngineCore>, std::path::PathBuf) {
         ))
         .expect("create table");
     let core = EngineCore::from_storage(storage, Box::new(CpuScalarProvider))
-        .with_write_lock_wait(validate_write_lock_wait_ms(wait_ms).expect("in range"));
+        .with_write_lock_wait(validate_write_lock_wait_ms(wait_ms).expect("in range"))
+        .with_transaction_limits(limits);
     (Arc::new(core), path)
 }
 
@@ -198,4 +214,267 @@ fn builder_applies_to_opened_core_without_changing_engine_kind() {
     let core = core.with_write_lock_wait(Duration::from_millis(250));
     assert_eq!(core.write_lock_wait(), Duration::from_millis(250));
     assert_eq!(core.search_engine_kind(), kind);
+}
+
+const SELECT_SQL: &str = "SELECT id FROM documents ORDER BY embedding <=> '[1.0, 0.0]' LIMIT 10";
+
+type Txn<'e> = engine::sql::transaction::SessionTransaction<'e>;
+
+fn run<'e>(
+    engine: &'e Arc<EngineCore>,
+    session: &mut SessionState,
+    txn: &mut Txn<'e>,
+    sql: &str,
+) -> Result<engine::sql::SqlOutcome, engine::sql::allowlist::SqlSurfaceError> {
+    engine.execute_sql_in_txn(&ctx("tenant-b"), session, txn, sql)
+}
+
+fn count_rows(engine: &Arc<EngineCore>) -> usize {
+    let outcome = engine
+        .execute_sql_in_session(
+            &ctx("tenant-b"),
+            &mut SessionState::default(),
+            "SELECT id FROM documents LIMIT 100",
+        )
+        .expect("select");
+    match outcome {
+        engine::sql::SqlOutcome::Query(q) => q.rows.len(),
+        _ => panic!("unexpected outcome"),
+    }
+}
+
+/// T5: writer を他セッションが握っていても、`BEGIN`・読み取り文・`BEGIN READ ONLY` は待たない。
+#[test]
+fn begin_and_reads_do_not_wait_while_writer_is_held() {
+    let (engine, path) = new_core(5_000);
+    let _cleanup = CleanupGuard(path);
+    let (holder, release) = spawn_holder(&engine);
+
+    let mut session = SessionState::default();
+    let mut txn = engine.new_session_transaction();
+    let started = Instant::now();
+    let begin = run(&engine, &mut session, &mut txn, "BEGIN");
+    let select = run(&engine, &mut session, &mut txn, SELECT_SQL);
+    let status = txn.status();
+    let expired = txn.release_if_expired();
+    let rollback = run(&engine, &mut session, &mut txn, "ROLLBACK");
+
+    let mut ro = engine.new_session_transaction();
+    let ro_begin = run(&engine, &mut session, &mut ro, "BEGIN READ ONLY");
+    let ro_select = run(&engine, &mut session, &mut ro, SELECT_SQL);
+    let ro_rollback = run(&engine, &mut session, &mut ro, "ROLLBACK");
+    let elapsed = started.elapsed();
+
+    release.send(()).expect("release");
+    holder.join().expect("holder");
+    begin.expect("BEGIN does not wait");
+    select.expect("read does not wait");
+    ro_begin.expect("BEGIN READ ONLY does not wait");
+    ro_select.expect("read-only read does not wait");
+    rollback.expect("rollback");
+    ro_rollback.expect("rollback read only");
+    assert_eq!(status, TransactionStatus::InTransaction);
+    assert!(!expired);
+    assert!(elapsed < Duration::from_secs(1), "elapsed={elapsed:?}");
+}
+
+/// T6: 待ちは最初の書き込み文で起き、holder の解放後に取得して成功・COMMIT できる。
+#[test]
+fn first_write_waits_for_release_then_acquires() {
+    let (engine, path) = new_core(5_000);
+    let _cleanup = CleanupGuard(path);
+    let (holder, release) = spawn_holder(&engine);
+
+    let mut session = SessionState::default();
+    let mut txn = engine.new_session_transaction();
+    run(&engine, &mut session, &mut txn, "BEGIN").expect("begin");
+    run(&engine, &mut session, &mut txn, SELECT_SQL).expect("read");
+    let releaser = std::thread::spawn(move || {
+        std::thread::sleep(Duration::from_millis(300));
+        release.send(()).expect("release");
+    });
+    let started = Instant::now();
+    let write = run(&engine, &mut session, &mut txn, &insert_sql(1, "op-t6"));
+    let elapsed = started.elapsed();
+    releaser.join().expect("releaser");
+    holder.join().expect("holder");
+    write.expect("first write succeeds after release");
+    assert!(elapsed >= Duration::from_millis(200), "elapsed={elapsed:?}");
+    run(&engine, &mut session, &mut txn, "COMMIT").expect("commit");
+    assert_eq!(count_rows(&engine), 1);
+}
+
+/// T7: 最初の書き込み文が `LOCK TABLE` のときも `55P03`。NOWAIT は即時、通常形は待機上限で失敗する。
+/// エラー文は固定文言で、holder のテナント名・表名を含まない（SQL-38・#1958 の 2 セッション E2E）。
+#[test]
+fn lock_table_as_first_write_reports_55p03() {
+    for (wait_ms, sql, nowait) in [
+        (5_000, "LOCK TABLE documents NOWAIT", true),
+        (100, "LOCK TABLE documents", false),
+    ] {
+        let (engine, path) = new_core(wait_ms);
+        let _cleanup = CleanupGuard(path);
+        let (holder, release) = spawn_holder(&engine);
+
+        let mut session = SessionState::default();
+        let mut txn = engine.new_session_transaction();
+        run(&engine, &mut session, &mut txn, "BEGIN").expect("begin");
+        let started = Instant::now();
+        let lock = run(&engine, &mut session, &mut txn, sql);
+        let elapsed = started.elapsed();
+        let status = txn.status();
+        let after = run(&engine, &mut session, &mut txn, SELECT_SQL);
+        let rollback = run(&engine, &mut session, &mut txn, "ROLLBACK");
+
+        release.send(()).expect("release");
+        holder.join().expect("holder");
+        let err = lock.expect_err("lock must fail");
+        assert_eq!(err.wire_code(), "55P03", "{sql}");
+        let msg = err.to_string();
+        assert!(!msg.contains("tenant-a") && !msg.contains(TABLE), "{msg}");
+        if nowait {
+            assert!(elapsed < Duration::from_secs(1), "elapsed={elapsed:?}");
+        } else {
+            assert!(elapsed >= Duration::from_millis(100), "elapsed={elapsed:?}");
+        }
+        assert_eq!(status, TransactionStatus::Failed);
+        assert_eq!(after.expect_err("failed txn").wire_code(), "25P02");
+        rollback.expect("rollback");
+    }
+}
+
+/// T8: writer 取得前の読み取りも文数に入り、上限超過の `54000` は writer の待機より前に決まる。
+#[test]
+fn statement_limit_hit_before_writer_wait() {
+    let limits = TransactionLimits {
+        max_duration: Duration::from_secs(20),
+        max_statements: 2,
+    };
+    let (engine, path) = new_core_with_limits(5_000, limits);
+    let _cleanup = CleanupGuard(path);
+    let (holder, release) = spawn_holder(&engine);
+
+    let mut session = SessionState::default();
+    let mut txn = engine.new_session_transaction();
+    run(&engine, &mut session, &mut txn, "BEGIN").expect("begin");
+    run(&engine, &mut session, &mut txn, SELECT_SQL).expect("read 1");
+    run(&engine, &mut session, &mut txn, SELECT_SQL).expect("read 2");
+    let started = Instant::now();
+    let write = run(&engine, &mut session, &mut txn, &insert_sql(1, "op-t8"));
+    let elapsed = started.elapsed();
+    let status = txn.status();
+    let _ = run(&engine, &mut session, &mut txn, "ROLLBACK");
+
+    release.send(()).expect("release");
+    holder.join().expect("holder");
+    assert_eq!(
+        write.expect_err("over statement limit").wire_code(),
+        "54000"
+    );
+    assert!(elapsed < Duration::from_secs(1), "elapsed={elapsed:?}");
+    assert_eq!(status, TransactionStatus::Failed);
+}
+
+/// T9: 持続時間は `BEGIN` から数える。writer 未取得のまま期限を越えた最初の書き込み文は
+/// 待たずに `54000`（`55P03` ではない）。
+#[test]
+fn duration_limit_hit_before_writer_wait() {
+    let limits = TransactionLimits {
+        max_duration: Duration::from_millis(200),
+        max_statements: 1_000,
+    };
+    let (engine, path) = new_core_with_limits(5_000, limits);
+    let _cleanup = CleanupGuard(path);
+    let (holder, release) = spawn_holder(&engine);
+
+    let mut session = SessionState::default();
+    let mut txn = engine.new_session_transaction();
+    run(&engine, &mut session, &mut txn, "BEGIN").expect("begin");
+    run(&engine, &mut session, &mut txn, SELECT_SQL).expect("read");
+    std::thread::sleep(Duration::from_millis(400));
+    let started = Instant::now();
+    let write = run(&engine, &mut session, &mut txn, &insert_sql(1, "op-t9"));
+    let elapsed = started.elapsed();
+    let status = txn.status();
+    let _ = run(&engine, &mut session, &mut txn, "ROLLBACK");
+
+    release.send(()).expect("release");
+    holder.join().expect("holder");
+    assert_eq!(write.expect_err("expired").wire_code(), "54000");
+    assert!(elapsed < Duration::from_secs(1), "elapsed={elapsed:?}");
+    assert_eq!(status, TransactionStatus::Failed);
+}
+
+/// T10: ロック待ちの時間も `BEGIN` 起点の持続時間に入る。文の開始時点で上限内なら待って成功し、
+/// 次の文か `COMMIT` が `54000` で拒否して永続化しない（現行の契約）。
+#[test]
+fn lock_wait_time_counts_toward_duration_from_begin() {
+    let limits = TransactionLimits {
+        max_duration: Duration::from_millis(300),
+        max_statements: 1_000,
+    };
+    let (engine, path) = new_core_with_limits(5_000, limits);
+    let _cleanup = CleanupGuard(path);
+    let (holder, release) = spawn_holder(&engine);
+
+    let mut session = SessionState::default();
+    let mut txn = engine.new_session_transaction();
+    run(&engine, &mut session, &mut txn, "BEGIN").expect("begin");
+    let releaser = std::thread::spawn(move || {
+        std::thread::sleep(Duration::from_millis(600));
+        release.send(()).expect("release");
+    });
+    let write = run(&engine, &mut session, &mut txn, &insert_sql(1, "op-t10"));
+    releaser.join().expect("releaser");
+    holder.join().expect("holder");
+    write.expect("statement started within the limit succeeds after the wait");
+    let commit = run(&engine, &mut session, &mut txn, "COMMIT");
+    let status = txn.status();
+    assert_eq!(
+        commit.expect_err("expired during wait").wire_code(),
+        "54000"
+    );
+    assert_eq!(status, TransactionStatus::Failed);
+    let _ = run(&engine, &mut session, &mut txn, "ROLLBACK");
+    assert_eq!(count_rows(&engine), 0);
+}
+
+/// T11（Issue #1933）: READ ONLY Tx が開いている間、別セッションの autocommit 書き込みと
+/// 明示 Tx の書き込みは待たずに確定し、READ ONLY 側の COMMIT は読み取りの解放だけで成功する。
+#[test]
+fn read_only_txn_does_not_block_other_sessions_writes() {
+    let (engine, path) = new_core(100);
+    let _cleanup = CleanupGuard(path);
+
+    let mut session_a = SessionState::default();
+    let mut ro = engine.new_session_transaction();
+    run(&engine, &mut session_a, &mut ro, "BEGIN READ ONLY").expect("begin read only");
+    run(&engine, &mut session_a, &mut ro, SELECT_SQL).expect("read-only select");
+
+    let started = Instant::now();
+    engine
+        .execute_sql_in_session(
+            &ctx("tenant-b"),
+            &mut SessionState::default(),
+            &insert_sql(1, "op-t11-auto"),
+        )
+        .expect("autocommit write is not blocked");
+    let mut session_b = SessionState::default();
+    let mut txn_b = engine.new_session_transaction();
+    run(&engine, &mut session_b, &mut txn_b, "BEGIN").expect("begin b");
+    run(
+        &engine,
+        &mut session_b,
+        &mut txn_b,
+        &insert_sql(2, "op-t11-txn"),
+    )
+    .expect("write b");
+    run(&engine, &mut session_b, &mut txn_b, "COMMIT").expect("commit b");
+    let elapsed = started.elapsed();
+
+    let commit = run(&engine, &mut session_a, &mut ro, "COMMIT").expect("commit read only");
+    assert!(matches!(commit, engine::sql::SqlOutcome::Commit));
+    assert_eq!(ro.status(), TransactionStatus::Idle);
+    assert!(elapsed < Duration::from_secs(1), "elapsed={elapsed:?}");
+    assert_eq!(count_rows(&engine), 2);
 }

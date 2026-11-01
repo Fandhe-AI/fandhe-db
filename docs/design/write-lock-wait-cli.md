@@ -25,7 +25,7 @@
 
 ## 効く経路
 
-autocommit の書き込み、明示トランザクションの `BEGIN`、分割実行 DML のチャンク（いずれも同じ `write_lock_wait`）。SQL 表層と NoSQL（HTTP）表層の両方（同じ `EngineCore`）。
+autocommit の書き込み、明示トランザクションの最初の書き込み文（DML・`LOCK TABLE`。`BEGIN` と読み取りでは待たない）、分割実行 DML のチャンク（いずれも同じ `write_lock_wait`）。SQL 表層と NoSQL（HTTP）表層の両方（同じ `EngineCore`）。
 
 ## SQLSTATE（従来と同じ）
 

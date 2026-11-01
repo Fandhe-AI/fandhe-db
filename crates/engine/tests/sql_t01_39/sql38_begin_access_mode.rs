@@ -158,3 +158,49 @@ fn malformed_access_mode_is_a_syntax_error() {
         assert_eq!(txn.status(), TransactionStatus::Idle);
     }
 }
+
+/// Issue #1933: READ ONLY の COMMIT・ROLLBACK は読み取りの解放だけで、書き込みを残さず、
+/// 続く書き込み Tx が待たずに成功する。`25006` で Failed になった後の ROLLBACK も同じ。
+#[test]
+fn read_only_commit_and_rollback_only_release_the_snapshot() {
+    for end in ["COMMIT", "ROLLBACK"] {
+        let (engine, path) = new_core();
+        let _cleanup = CleanupGuard(path);
+        let mut session = SessionState::default();
+        let mut txn = engine.new_session_transaction();
+        run(&engine, &mut session, &mut txn, "BEGIN READ ONLY").expect("begin");
+        run(
+            &engine,
+            &mut session,
+            &mut txn,
+            &format!("SELECT id FROM {TABLE} LIMIT 10"),
+        )
+        .expect("select");
+        assert!(run(&engine, &mut session, &mut txn, end).is_ok(), "{end}");
+        assert_eq!(txn.status(), TransactionStatus::Idle);
+        assert_eq!(count_rows(&engine), 0);
+        run(&engine, &mut session, &mut txn, "BEGIN").expect("begin rw");
+        run(&engine, &mut session, &mut txn, &insert_sql(1, "op-after")).expect("insert");
+        run(&engine, &mut session, &mut txn, "COMMIT").expect("commit");
+        assert_eq!(count_rows(&engine), 1);
+    }
+}
+
+#[test]
+fn read_only_failed_by_25006_then_rollback_frees_the_next_writer() {
+    let (engine, path) = new_core();
+    let _cleanup = CleanupGuard(path);
+    let mut session = SessionState::default();
+    let mut ro = engine.new_session_transaction();
+    run(&engine, &mut session, &mut ro, "BEGIN READ ONLY").expect("begin");
+    assert_eq!(
+        run(&engine, &mut session, &mut ro, &insert_sql(1, "op-x")),
+        Err("25006".to_string())
+    );
+    run(&engine, &mut session, &mut ro, "ROLLBACK").expect("rollback");
+    let mut rw = engine.new_session_transaction();
+    run(&engine, &mut session, &mut rw, "BEGIN").expect("begin rw");
+    run(&engine, &mut session, &mut rw, &insert_sql(1, "op-y")).expect("insert");
+    run(&engine, &mut session, &mut rw, "COMMIT").expect("commit");
+    assert_eq!(count_rows(&engine), 1);
+}

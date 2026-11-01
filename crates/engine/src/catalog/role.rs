@@ -72,6 +72,13 @@ pub(crate) const LOGIN_ALREADY_EXISTS_MESSAGE: &str = "login name already exists
 /// 件数上限超過の `ViewLimitExceeded` 文言（`54000`）。
 pub(crate) const ROLE_LIMIT_MESSAGE: &str = "too many roles";
 
+/// `DROP ROLE` の対象に依存オブジェクトがあるときの固定文言（[`DropRolesError::HasDependents`] へ写され、
+/// `sql::role_ddl` が `2BP01` にする。依存元は含めない）。
+pub(crate) const ROLE_HAS_DEPENDENTS_MESSAGE: &str = "role has dependent objects";
+
+/// メンバーシップ表の 1 回の走査で許容する行数の上限（破損・暴走の検出用。超過は `CorruptSchema`）。
+const MAX_MEMBERSHIP_SCAN: usize = 1_000_000;
+
 /// ロール属性のビット（予約ビットは 0 でなければ破損。SUPERUSER 相当はテナント境界を越えるためビットを
 /// 作らない。RLS-12 のポインタ）。
 const ATTR_LOGIN: u16 = 1 << 0;
@@ -574,7 +581,23 @@ fn create_role_limited(
     Ok(stored.id)
 }
 
-/// ロールを生の削除で消し、存在して消したら `true`。依存検査（所有・メンバーシップ・ACL）は #1962 の担当。
+/// [`Storage::drop_roles`] の失敗。`sql::role_ddl` が SQLSTATE（`42704`／`2BP01`／その他）へ写す。
+#[derive(Debug)]
+pub(crate) enum DropRolesError {
+    /// 対象が無い（他テナントにしか無い場合を含む）。値は利用者が書いた名前。
+    NotFound(String),
+    /// 対象に依存オブジェクトがある。値は利用者が書いた名前（依存元は運ばない）。
+    HasDependents(String),
+    Catalog(CatalogError),
+}
+
+impl From<CatalogError> for DropRolesError {
+    fn from(e: CatalogError) -> Self {
+        Self::Catalog(e)
+    }
+}
+
+/// ロールを生の削除で消し、存在して消したら `true`。依存検査・メンバーシップ掃除は [`drop_role_in_txn`] の担当。
 pub(crate) fn remove_role_in_txn(
     write_txn: &redb::WriteTransaction,
     tenant: &str,
@@ -588,6 +611,82 @@ pub(crate) fn remove_role_in_txn(
     let mut table = write_txn.open_table(ROLES_TABLE)?;
     table.remove((tenant, name))?;
     Ok(true)
+}
+
+/// `role_id` が member 側にも granted 側にも現れるメンバーシップ行を同じ txn で削除する（`DROP ROLE` は PostgreSQL と
+/// 同じくメンバーシップを自動で取り消し、依存扱いにしない。Issue #1962）。他テナントの行は構造上走査しない。
+/// 走査行数が [`MAX_MEMBERSHIP_SCAN`] を超える・行が破損している場合は `Err`（fail-closed）。
+pub(crate) fn remove_memberships_of_role_in_txn(
+    write_txn: &redb::WriteTransaction,
+    tenant: &str,
+    role_id: u64,
+) -> Result<usize> {
+    validate_tenant(tenant)?;
+    if role_id == 0 {
+        return Err(invalid("invalid role membership"));
+    }
+    let mut doomed: Vec<(u64, u64)> = Vec::new();
+    match ReadSource::open_table(write_txn, ROLE_MEMBERSHIPS_TABLE) {
+        Ok(table) => {
+            let mut seen = 0usize;
+            for entry in table.range((tenant, 0u64, 0u64)..)? {
+                let (k, v) = entry?;
+                let (t, member, granted) = k.value();
+                if t != tenant {
+                    break;
+                }
+                seen += 1;
+                if seen > MAX_MEMBERSHIP_SCAN || member == 0 || granted == 0 || member == granted {
+                    return Err(corrupt());
+                }
+                decode_membership(v.value())?;
+                if member == role_id || granted == role_id {
+                    doomed.push((member, granted));
+                }
+            }
+        }
+        Err(redb::TableError::TableDoesNotExist(_)) => return Ok(0),
+        Err(e) => return Err(e.into()),
+    }
+    if doomed.is_empty() {
+        return Ok(0);
+    }
+    let mut table = write_txn.open_table(ROLE_MEMBERSHIPS_TABLE)?;
+    for (member, granted) in &doomed {
+        table.remove((tenant, *member, *granted))?;
+    }
+    Ok(doomed.len())
+}
+
+/// ロール `role_id` に依存するオブジェクトがあるか（`DROP ROLE` の `2BP01` 判定。Issue #1962）。現在カタログに
+/// あるのは ACL（付与先・付与者）だけ。所有者（#2236）・ポリシーの `TO <ロール>`（#2278 段 2）の検査は、この関数へ
+/// 足す拡張点とする。
+pub(crate) fn role_has_dependents_in_txn<R: ReadSource>(
+    src: &R,
+    tenant: &str,
+    role_id: u64,
+) -> Result<bool> {
+    super::privilege::acl_references_role_in_txn(src, tenant, role_id)
+}
+
+/// `DROP ROLE` の 1 件分: 解決 → 依存検査 → メンバーシップ掃除 → 削除（呼び出し側が単一 write txn で束ねる）。
+/// 対象が無ければ `Ok(false)`（`IF EXISTS` の判断は呼び出し側）。依存があれば
+/// `Invalid(ROLE_HAS_DEPENDENTS_MESSAGE)`。
+pub(crate) fn drop_role_in_txn(
+    write_txn: &redb::WriteTransaction,
+    tenant: &str,
+    name: &str,
+) -> Result<bool> {
+    validate_tenant(tenant)?;
+    validate_identifier(name)?;
+    let Some(role) = get_role_in_txn(write_txn, tenant, name)? else {
+        return Ok(false);
+    };
+    if role_has_dependents_in_txn(write_txn, tenant, role.id)? {
+        return Err(invalid(ROLE_HAS_DEPENDENTS_MESSAGE));
+    }
+    remove_memberships_of_role_in_txn(write_txn, tenant, role.id)?;
+    remove_role_in_txn(write_txn, tenant, name)
 }
 
 fn check_membership_ids(member_id: u64, granted_role_id: u64) -> Result<()> {
@@ -777,6 +876,39 @@ impl Storage {
         crate::recovery::commit_boundary::commit(write_txn)
             .map_err(super::convert_storage_error)?;
         Ok(id)
+    }
+
+    /// `tenant` のロール `names` を単一 write txn・1 回の commit で順に削除し、実際に消した件数を返す
+    /// （`DROP ROLE a, b`。Issue #1962）。対象が無い名前は `if_exists` なら skip、そうでなければ
+    /// [`DropRolesError::NotFound`]。依存があれば [`DropRolesError::HasDependents`]。途中で失敗したら
+    /// commit せず全件取り消す（原子的）。エラーは利用者が書いた名前だけを運ぶ。
+    pub(crate) fn drop_roles(
+        &self,
+        tenant: &str,
+        names: &[String],
+        if_exists: bool,
+    ) -> std::result::Result<usize, DropRolesError> {
+        validate_tenant(tenant)?;
+        let write_txn = self
+            .begin_write_txn()
+            .map_err(super::convert_storage_error)?;
+        let mut removed = 0usize;
+        for name in names {
+            match drop_role_in_txn(&write_txn, tenant, name) {
+                Ok(true) => removed += 1,
+                Ok(false) if if_exists => {}
+                Ok(false) => return Err(DropRolesError::NotFound(name.clone())),
+                Err(CatalogError::Invalid(m)) if m == ROLE_HAS_DEPENDENTS_MESSAGE => {
+                    return Err(DropRolesError::HasDependents(name.clone()));
+                }
+                Err(e) => return Err(e.into()),
+            }
+        }
+        if removed > 0 {
+            crate::recovery::commit_boundary::commit(write_txn)
+                .map_err(super::convert_storage_error)?;
+        }
+        Ok(removed)
     }
 
     /// `tenant` のロール `name` を引く（読み取り専用。他テナントのロールは構造上引けず、不在と同じ `None`）。

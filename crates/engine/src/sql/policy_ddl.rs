@@ -217,7 +217,7 @@ pub(crate) fn execute_drop_policy(
 
 /// 解決済みカタログキー（`#<id>.<表名>`）から利用者が書いた表名の部分だけを取り出す。内部 ID を
 /// エラー文言へ出さないため（security.md P0。スキーマ ID の存在オラクル防止）。
-fn user_facing_relation_name(key: &str) -> String {
+pub(crate) fn user_facing_relation_name(key: &str) -> String {
     match key.strip_prefix('#').and_then(|r| r.split_once('.')) {
         Some((_, rel)) => rel.to_string(),
         None => key.to_string(),

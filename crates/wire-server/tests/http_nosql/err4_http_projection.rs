@@ -305,7 +305,7 @@ fn query_as_alice(addr: SocketAddr, body: &[u8]) -> HttpResponse {
 /// `status.rs::EXPECTED`（`#[cfg(test)]` 内で外部から参照不可）と同値の
 /// 期待表。両者の乖離は [`err4_projection_table_is_closed_over_all_error_classes`]
 /// が `http_status` 経由で検出する。
-const EXPECTED_STATUS: [(&str, u16); 95] = [
+const EXPECTED_STATUS: [(&str, u16); 96] = [
     ("22000", 400),
     ("22001", 400),
     ("22012", 400),
@@ -362,6 +362,8 @@ const EXPECTED_STATUS: [(&str, u16); 95] = [
     // `err4_f_unreachable_classes_project_via_production_encoder` 参照）。
     ("2BP01", 400),
     ("42809", 400),
+    // SQL-40（Issue #1965）: `GRANT`／`REVOKE` の不正な操作。NoSQL 表層からは到達不能。
+    ("0LP01", 400),
     // TASK-206・INDEX-7・SQL-23（Issue #908）: `CREATE INDEX`／`DROP INDEX` が
     // 新設する 2 分類（索引不在・参照列不在）。索引名の衝突は `42P07` を共有する。
     // SQL 表層専用の DDL であり NoSQL `op` 許可リストには含めないため、
@@ -547,7 +549,7 @@ fn assert_projected_as(resp: &HttpResponse, expected_class: ErrorClass) {
 
 // --- R7: 射影表が ErrorClass::ALL 全体を閉じて覆うことの機械検証 -----------
 
-const _: () = assert!(ErrorClass::ALL.len() == 99);
+const _: () = assert!(ErrorClass::ALL.len() == 100);
 
 /// `wire_code` を共有する分類と、逆引き（`from_wire_code`）が返す分類の組
 /// （ERR-6。`23502`: TABLE-16・TASK-204・Issue #904、`23505`: Issue #1180）。
@@ -1013,6 +1015,8 @@ fn err4_f_unreachable_classes_project_via_production_encoder() {
         ErrorClass::FunctionExecutedNoReturnStatement,
         ErrorClass::DependentObjectsStillExist,
         ErrorClass::WrongObjectType,
+        // SQL-40（Issue #1965）: `GRANT`／`REVOKE` の不正な操作（`0LP01`）。GRANT 相当の op は NoSQL 表層に無く到達不能。
+        ErrorClass::InvalidGrantOperation,
         ErrorClass::InvalidTransactionState,
         ErrorClass::ActiveSqlTransaction,
         ErrorClass::NoActiveSqlTransaction,
