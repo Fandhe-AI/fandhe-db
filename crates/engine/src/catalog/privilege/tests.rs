@@ -621,6 +621,40 @@ mod apply_deps {
         assert_eq!(col_rows(&s, "a"), before);
     }
 
+    /// 列 GRANT が列 GRANT OPTION を持つ近いロールを付与者に記録しても、表単位 REVOKE が列権限を残さない。
+    #[test]
+    fn table_revoke_removes_column_grant_recorded_under_nearer_grantor() {
+        let (_g, s) = open("acl_dep_tbl_rev_nearer");
+        mk_table(&s, T);
+        let owner = role(&s, "owner");
+        let bob = role(&s, "bob");
+        let carol = role(&s, "carol");
+        run(&s, owner, true, true, PRIV_SELECT, &[], bob, true, false).expect("g1");
+        run(
+            &s,
+            bob,
+            false,
+            true,
+            PRIV_SELECT,
+            &["a"],
+            carol,
+            false,
+            false,
+        )
+        .expect("g2");
+        assert_eq!(
+            col_rows(&s, "a")
+                .iter()
+                .filter(|e| e.grantee_id == carol)
+                .count(),
+            1
+        );
+        run(&s, bob, false, false, PRIV_SELECT, &[], carol, false, false).expect("revoke");
+        assert!(col_rows(&s, "a")
+            .iter()
+            .all(|e| e.grantee_id != carol || e.privileges == 0));
+    }
+
     /// 先行ターゲットで付与が成立していれば、後続が何も付与しなくても 01006 になる（01007 ではない）。
     #[test]
     fn partial_success_across_targets_warns_not_all_privileges() {

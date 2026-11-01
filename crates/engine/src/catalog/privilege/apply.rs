@@ -743,22 +743,37 @@ impl Storage {
                     }
                 }
             } else {
-                for g in &grantee_ids {
-                    if let Some(e) = work
-                        .iter_mut()
-                        .find(|e| e.grantee_id == *g && e.grantor_id == gid)
-                    {
-                        let old_go = e.grant_options;
-                        if req.grant_option {
-                            e.grant_options &= !eff;
-                        } else {
-                            e.privileges &= !eff;
-                            e.grant_options &= e.privileges;
+                // 表単位の REVOKE の伝播（列の行）は、先行する列 GRANT が列＋表の行から選んだ付与者
+                // （継承閉包の別ロール）の行も対象にする。ただし表の GRANT OPTION を持つ付与者だけ。
+                let mut grantors: Vec<(u64, u16)> = vec![(gid, eff)];
+                if t.bits == 0 && !req.owner_equivalent {
+                    if let Some(te) = &table_entries {
+                        for r in &closure {
+                            let m = want_p & grantor_rights(te, *r).0;
+                            if *r != gid && m != 0 {
+                                grantors.push((*r, m));
+                            }
                         }
-                        if e.grant_options != old_go
-                            && !affected.iter().any(|(a, o)| a == g && *o == t.object)
+                    }
+                }
+                for (gr, eff) in grantors {
+                    for g in &grantee_ids {
+                        if let Some(e) = work
+                            .iter_mut()
+                            .find(|e| e.grantee_id == *g && e.grantor_id == gr)
                         {
-                            affected.push((*g, t.object.clone()));
+                            let old_go = e.grant_options;
+                            if req.grant_option {
+                                e.grant_options &= !eff;
+                            } else {
+                                e.privileges &= !eff;
+                                e.grant_options &= e.privileges;
+                            }
+                            if e.grant_options != old_go
+                                && !affected.iter().any(|(a, o)| a == g && *o == t.object)
+                            {
+                                affected.push((*g, t.object.clone()));
+                            }
                         }
                     }
                 }
