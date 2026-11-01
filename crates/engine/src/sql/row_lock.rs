@@ -4,10 +4,11 @@
 //!
 //! 役割分担:
 //!
-//! - 本モジュールは構文の解釈と、ほかの句との併用検査までを担う。ロックの取得（writer の取得・
-//!   `NOWAIT`・保持期間）は #2230、`SKIP LOCKED` の実行は #2231、`LOCK TABLE` は #1958 の担当で、
-//!   本モジュールは一切触れない。受理した形は `core::ParsedSql::LockingSelect` まで届くが、実行入口は
-//!   #2230 まで `0A000` で拒否する（ロックを取らずに素の SELECT として実行する fail-open を作らない）。
+//! - 本モジュールは構文の解釈と、ほかの句との併用検査、複数句の待機方針の合成（[`RowLocking::writer_wait`]）
+//!   までを担う。ロックの取得（writer の取得・`NOWAIT`・保持期間）は `core::row_lock_exec`（#2230）、
+//!   `SKIP LOCKED` の実行は #2231、`LOCK TABLE` は #1958 の担当で、本モジュールは writer に触れない。
+//!   受理した形は `core::ParsedSql::LockingSelect` まで届き、`SKIP LOCKED` を含む形は writer に触れる前に
+//!   `0A000` で拒否する（ロックを取らずに素の SELECT として実行する fail-open を作らない）。
 //! - 呼び出し元は `core::EngineCore::parse_tokens_in`（行数制限句の正規化の後・名前解決の前に
 //!   [`extract_row_locking`] を 1 回だけ呼び、検証済みの文を得た後に [`check_row_locking`] を呼ぶ）。
 //!   `fetch_clause::normalize_statement_tokens` の中には置かない（PL/pgSQL・ビュー本文・
@@ -75,8 +76,8 @@ impl RowLockClause {
     }
 }
 
-/// 1 つの SELECT に付いた行ロック句の並び（1 個以上）。複数の句が同じ表に及ぶときの強度・待機方針の
-/// 合成は本 Issue では決めず、#2230 が担う。
+/// 1 つの SELECT に付いた行ロック句の並び（1 個以上）。単一ライタ（TABLE-3）のため強度・`OF` の対象は
+/// writer の取得に影響せず、待機方針だけを [`RowLocking::writer_wait`] が合成する（#2230）。
 #[derive(Debug, Clone, PartialEq)]
 pub struct RowLocking {
     pub(crate) clauses: Vec<RowLockClause>,
@@ -87,10 +88,27 @@ impl RowLocking {
     pub fn clauses(&self) -> &[RowLockClause] {
         &self.clauses
     }
+
+    /// writer 取得の待機方針を合成する（`Ok(true)` は `NOWAIT`、`Ok(false)` は待機あり）。
+    /// どれかの句が `SKIP LOCKED` なら `0A000`（#2231 まで。呼び出し元は writer・ゲートに触れる前に
+    /// 本関数を呼ぶ）、そうでなくどれかが `NOWAIT` なら nowait、それ以外は待機する。
+    pub(crate) fn writer_wait(&self) -> Result<bool, SqlSurfaceError> {
+        compose_writer_wait(&self.clauses)
+    }
+}
+
+/// [`RowLocking::writer_wait`] と [`RowLockingSyntax::writer_wait`] 共通の待機方針の合成。
+fn compose_writer_wait(clauses: &[RowLockClause]) -> Result<bool, SqlSurfaceError> {
+    if clauses.iter().any(|c| c.wait == LockWaitPolicy::SkipLocked) {
+        return Err(SqlSurfaceError::feature_not_supported(
+            "SKIP LOCKED is not supported yet",
+        ));
+    }
+    Ok(clauses.iter().any(|c| c.wait == LockWaitPolicy::NoWait))
 }
 
 /// 行ロック句つきの SELECT（行ロック句を除いた文の検証結果と、解析した句）。
-/// 実行入口は #2230 まで `0A000` で拒否する。
+/// 実行は `core::row_lock_exec` が writer を取得して行う。
 #[derive(Debug, Clone, PartialEq)]
 pub struct LockingSelect {
     pub(crate) statement: Statement,
@@ -121,6 +139,15 @@ pub(crate) struct RowLockingSyntax {
     cte_names: Vec<String>,
     /// `DISTINCT`／`GROUP BY`／`HAVING`／`WINDOW`／集合演算が最上位にある。
     combo_violation: bool,
+}
+
+impl RowLockingSyntax {
+    /// 構文段階の句から writer 取得の待機方針を合成する（[`RowLocking::writer_wait`] と同じ規則）。
+    /// 複数文メッセージの暗黙 Tx が writer を取得する前に、`SKIP LOCKED`（`0A000`）の拒否と
+    /// `NOWAIT` の反映を行うために使う（Issue #2230）。
+    pub(crate) fn writer_wait(&self) -> Result<bool, SqlSurfaceError> {
+        compose_writer_wait(&self.clauses)
+    }
 }
 
 fn is_word(token: Option<&Token>, word: &str) -> bool {
@@ -831,5 +858,33 @@ mod tests {
         assert_eq!((r.table(), r.alias()), ("a", Some("for")));
         let r = from("SELECT id FROM a window FOR UPDATE");
         assert_eq!((r.table(), r.alias()), ("a", Some("window")));
+    }
+
+    fn wait_of(sql: &str) -> Result<bool, &'static str> {
+        RowLocking {
+            clauses: clauses(sql),
+        }
+        .writer_wait()
+        .map_err(|e| e.wire_code())
+    }
+
+    /// 複数句の待機方針の合成（#2230）: SKIP LOCKED が最優先で `0A000`、次に NOWAIT、既定は待機。
+    #[test]
+    fn writer_wait_composition() {
+        assert_eq!(wait_of("SELECT id FROM a FOR UPDATE"), Ok(false));
+        assert_eq!(wait_of("SELECT id FROM a FOR UPDATE FOR SHARE"), Ok(false));
+        assert_eq!(wait_of("SELECT id FROM a FOR UPDATE NOWAIT"), Ok(true));
+        assert_eq!(
+            wait_of("SELECT id FROM a FOR SHARE OF a FOR UPDATE NOWAIT"),
+            Ok(true)
+        );
+        assert_eq!(
+            wait_of("SELECT id FROM a FOR UPDATE SKIP LOCKED"),
+            Err("0A000")
+        );
+        assert_eq!(
+            wait_of("SELECT id FROM a FOR UPDATE NOWAIT FOR SHARE SKIP LOCKED"),
+            Err("0A000")
+        );
     }
 }

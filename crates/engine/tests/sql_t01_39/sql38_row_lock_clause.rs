@@ -2,9 +2,10 @@
 //! `OF`、`NOWAIT`／`SKIP LOCKED`。SQL-38・Issue #1957）の結合テスト。
 //! ポインタ: `docs/spec/04-behavior/` SQL-38。
 //!
-//! 構文解釈・併用検査（`ParsedSql::LockingSelect` が得られること）と、実行入口が #2230 まで
-//! `0A000` の暫定ゲートで拒否することを別々に確かめる。ロックの取得（#2230）・`SKIP LOCKED` の
-//! 実行（#2231）が入ったらゲートの期待値を更新すること。
+//! 構文解釈・併用検査（`ParsedSql::LockingSelect` が得られること）と、実行（Issue #2230。writer の
+//! 取得・保持期間・句なし SELECT との結果同一性）を確かめる。`SKIP LOCKED` の実行（#2231）と一時表への
+//! 行ロック句は未対応の `0A000` のまま。2 セッションの待機・時間計測を伴うテストは
+//! `tests/write_lock_wait.rs`（単独バイナリ）に置く。
 
 use engine::catalog::{ColumnDef, ColumnType, TableSchema};
 use engine::core::{EngineCore, ParsedSql};
@@ -209,15 +210,143 @@ fn cte_target_is_rejected() {
     assert_eq!(r.expect_err("rejected").wire_code(), "0A000");
 }
 
+/// 行を投入する（autocommit の INSERT）。`author_id` は 1 または 2。
+fn seed(core: &EngineCore, session: &mut SessionState) {
+    for (id, title, author) in [(1, "x", 1), (2, "x", 2), (3, "y", 1), (4, "x", 1)] {
+        core.execute_sql_in_session(
+            &ctx(),
+            session,
+            &format!(
+                "INSERT INTO documents (id, embedding, title, author_id) VALUES ({id}, '[1.0, 0.0]', '{title}', {author}) USING OPERATION_ID 'seed-d{id}'"
+            ),
+        )
+        .expect("insert document");
+    }
+    for (id, name) in [(1, "alice"), (2, "bob")] {
+        core.execute_sql_in_session(
+            &ctx(),
+            session,
+            &format!(
+                "INSERT INTO authors (id, embedding, name) VALUES ({id}, '[0.0, 1.0]', '{name}') USING OPERATION_ID 'seed-a{id}'"
+            ),
+        )
+        .expect("insert author");
+    }
+}
+
+/// ロック句つきと句なしで同じ結果になる文の組（句は末尾に付ける）。
+const SAME_RESULT_QUERIES: &[&str] = &[
+    "SELECT id, title FROM documents WHERE title = 'x' LIMIT 10",
+    "SELECT id FROM documents ORDER BY embedding <=> '[1.0, 0.0]' LIMIT 3",
+    "SELECT documents.id, authors.name FROM documents JOIN authors ON documents.author_id = authors.id LIMIT 10",
+    "SELECT documents.id FROM documents JOIN authors ON documents.author_id = authors.id WHERE documents.title = 'x' LIMIT 10",
+];
+
+/// SQL-38・Issue #2230: ロック句つき SELECT の結果は、句のない同じ SELECT と同一
+/// （autocommit・明示 Tx〔取得直後〕のいずれでも）。
 #[test]
-fn execution_is_gated_with_0a000_and_changes_nothing() {
+fn locking_select_returns_same_rows_as_plain_select() {
     let (core, path) = new_core();
     let _cleanup = CleanupGuard(path);
-    let sql = "SELECT id FROM documents WHERE title = 'x' LIMIT 5 FOR UPDATE";
-    // セッションを持たない後方互換の入口（`execute_sql`）は許可リストの検証器を直接呼ぶ入口で、
-    // 行ロック句の構文を認識しない（従来どおり拒否側 `42601`。実行はしない）。
+    let mut session = SessionState::default();
+    seed(&core, &mut session);
+    let clauses = [
+        " FOR UPDATE",
+        " FOR NO KEY UPDATE",
+        " FOR SHARE",
+        " FOR KEY SHARE",
+        " FOR UPDATE NOWAIT",
+        " FOR SHARE NOWAIT",
+    ];
+    for q in SAME_RESULT_QUERIES {
+        let plain = core
+            .execute_sql_in_session(&ctx(), &mut session, q)
+            .expect("plain");
+        for c in clauses {
+            let sql = format!("{q}{c}");
+            // autocommit。
+            let locked = core
+                .execute_sql_in_session(&ctx(), &mut session, &sql)
+                .unwrap_or_else(|e| panic!("autocommit {sql}: {e}"));
+            assert_eq!(format!("{plain:?}"), format!("{locked:?}"), "{sql}");
+            // 明示 Tx（取得直後）。
+            let mut txn = core.new_session_transaction();
+            core.execute_sql_in_txn(&ctx(), &mut session, &mut txn, "BEGIN")
+                .expect("begin");
+            let locked = core
+                .execute_sql_in_txn(&ctx(), &mut session, &mut txn, &sql)
+                .unwrap_or_else(|e| panic!("in txn {sql}: {e}"));
+            assert_eq!(format!("{plain:?}"), format!("{locked:?}"), "{sql}");
+            assert_eq!(txn.status(), TransactionStatus::InTransaction);
+            // 取得後の句なし SELECT とも一致し、COMMIT できる。
+            let again = core
+                .execute_sql_in_txn(&ctx(), &mut session, &mut txn, q)
+                .expect("plain in txn");
+            assert_eq!(format!("{plain:?}"), format!("{again:?}"), "{sql}");
+            core.execute_sql_in_txn(&ctx(), &mut session, &mut txn, "COMMIT")
+                .expect("commit");
+        }
+    }
+}
+
+/// 自 Tx の未 commit の INSERT の後でも、ロック句つきと句なしの結果は同じで、未 commit 行を含む。
+#[test]
+fn locking_select_sees_own_uncommitted_rows_like_plain_select() {
+    let (core, path) = new_core();
+    let _cleanup = CleanupGuard(path);
+    let mut session = SessionState::default();
+    seed(&core, &mut session);
+    let mut txn = core.new_session_transaction();
+    core.execute_sql_in_txn(&ctx(), &mut session, &mut txn, "BEGIN")
+        .expect("begin");
+    core.execute_sql_in_txn(
+        &ctx(),
+        &mut session,
+        &mut txn,
+        "INSERT INTO documents (id, embedding, title, author_id) VALUES (9, '[1.0, 0.0]', 'x', 2) USING OPERATION_ID 'own-9'",
+    )
+    .expect("insert");
+    let q = "SELECT id FROM documents WHERE title = 'x' LIMIT 10";
+    let plain = core
+        .execute_sql_in_txn(&ctx(), &mut session, &mut txn, q)
+        .expect("plain");
+    let locked = core
+        .execute_sql_in_txn(&ctx(), &mut session, &mut txn, &format!("{q} FOR UPDATE"))
+        .expect("locked");
+    assert_eq!(format!("{plain:?}"), format!("{locked:?}"));
+    assert_eq!(txn.status(), TransactionStatus::InTransaction);
+    core.execute_sql_in_txn(&ctx(), &mut session, &mut txn, "ROLLBACK")
+        .expect("rollback");
+}
+
+/// 他テナントの Private 行は、ロック句つき SELECT の結果にも現れない（句なしと同一）。
+#[test]
+fn locking_select_does_not_leak_other_tenants_rows() {
+    let (core, path) = new_core();
+    let _cleanup = CleanupGuard(path);
+    let mut session = SessionState::default();
+    seed(&core, &mut session);
+    let other =
+        PolicyContext::with_visibilities("tenant-b", [Visibility::Public, Visibility::Private])
+            .expect("tenant b");
+    let q = "SELECT id FROM documents WHERE title = 'x' LIMIT 10";
+    let plain = core
+        .execute_sql_in_session(&other, &mut session, q)
+        .expect("plain");
+    let locked = core
+        .execute_sql_in_session(&other, &mut session, &format!("{q} FOR UPDATE"))
+        .expect("locked");
+    assert_eq!(format!("{plain:?}"), format!("{locked:?}"));
+}
+
+/// `SKIP LOCKED` は #2231 まで `0A000`。writer に触れない（別スレッドの NOWAIT 取得が成功する）。
+#[test]
+fn skip_locked_is_still_0a000_without_touching_writer() {
+    let (core, path) = new_core();
+    let _cleanup = CleanupGuard(path);
+    let sql = "SELECT id FROM documents WHERE title = 'x' LIMIT 5 FOR UPDATE SKIP LOCKED";
+    // セッションを持たない後方互換の入口（`execute_sql`）は行ロック句の構文を認識しない。
     assert!(core.execute_sql(&ctx(), sql).is_err());
-    // autocommit・セッション。
     let mut session = SessionState::default();
     assert_eq!(
         core.execute_sql_in_session(&ctx(), &mut session, sql)
@@ -225,7 +354,6 @@ fn execution_is_gated_with_0a000_and_changes_nothing() {
             .wire_code(),
         "0A000"
     );
-    // 明示トランザクション内（失敗状態へ移る）。
     let mut txn = core.new_session_transaction();
     core.execute_sql_in_txn(&ctx(), &mut session, &mut txn, "BEGIN")
         .expect("begin");
@@ -236,7 +364,6 @@ fn execution_is_gated_with_0a000_and_changes_nothing() {
         "0A000"
     );
     assert_eq!(txn.status(), TransactionStatus::Failed);
-    // 既存のエラーと同じ扱い（失敗状態では 25P02）。
     assert_eq!(
         core.execute_sql_in_txn(&ctx(), &mut session, &mut txn, "SELECT 1")
             .expect_err("failed txn")
@@ -245,8 +372,141 @@ fn execution_is_gated_with_0a000_and_changes_nothing() {
     );
     core.execute_sql_in_txn(&ctx(), &mut session, &mut txn, "ROLLBACK")
         .expect("rollback");
+    // writer を取っていないので、別セッションの NOWAIT 取得が成功する。
+    std::thread::scope(|scope| {
+        scope
+            .spawn(|| {
+                let mut s2 = SessionState::default();
+                core.execute_sql_in_session(
+                    &ctx(),
+                    &mut s2,
+                    "SELECT id FROM documents WHERE title = 'x' LIMIT 5 FOR UPDATE NOWAIT",
+                )
+                .expect("nowait succeeds");
+            })
+            .join()
+            .expect("join");
+    });
 }
 
+type Attempt = (Result<(), (String, String)>, TransactionStatus);
+
+/// 別セッション（別スレッド）で `BEGIN` → `sql` を実行し、結果と Tx の状態を返す。
+fn attempt_in_other_session(core: &EngineCore, sql: &str) -> Attempt {
+    std::thread::scope(|scope| {
+        scope
+            .spawn(|| {
+                let mut s2 = SessionState::default();
+                let mut t2 = core.new_session_transaction();
+                core.execute_sql_in_txn(&ctx(), &mut s2, &mut t2, "BEGIN")
+                    .expect("begin");
+                let r = core.execute_sql_in_txn(&ctx(), &mut s2, &mut t2, sql);
+                let status = t2.status();
+                let _ = core.execute_sql_in_txn(&ctx(), &mut s2, &mut t2, "ROLLBACK");
+                (
+                    r.map(|_| ())
+                        .map_err(|e| (e.wire_code().to_string(), e.to_string())),
+                    status,
+                )
+            })
+            .join()
+            .expect("join")
+    })
+}
+
+/// 明示 Tx のロック句は COMMIT まで writer を保持する（別セッションの NOWAIT は `55P03`）。
+/// 解放後は取得できる。エラー文に tenant 名・表名を含まない。
+#[test]
+fn explicit_txn_holds_writer_until_commit() {
+    let (core, path) = new_core();
+    let _cleanup = CleanupGuard(path);
+    let mut session = SessionState::default();
+    seed(&core, &mut session);
+    let lock_sql = "SELECT id FROM documents WHERE title = 'x' LIMIT 5 FOR UPDATE";
+    let nowait_sql = format!("{lock_sql} NOWAIT");
+    let mut txn = core.new_session_transaction();
+    core.execute_sql_in_txn(&ctx(), &mut session, &mut txn, "BEGIN")
+        .expect("begin");
+    core.execute_sql_in_txn(&ctx(), &mut session, &mut txn, lock_sql)
+        .expect("lock");
+    let (r, status) = attempt_in_other_session(&core, &nowait_sql);
+    let (code, msg) = r.expect_err("held");
+    assert_eq!(code, "55P03");
+    assert!(
+        !msg.contains("tenant-a") && !msg.contains("documents"),
+        "{msg}"
+    );
+    assert_eq!(status, TransactionStatus::Failed);
+    core.execute_sql_in_txn(&ctx(), &mut session, &mut txn, "COMMIT")
+        .expect("commit");
+    let (r, status) = attempt_in_other_session(&core, &nowait_sql);
+    r.expect("acquired after commit");
+    assert_eq!(status, TransactionStatus::InTransaction);
+}
+
+/// autocommit のロック句は文の終わりで writer を解放する（直後の別セッションの NOWAIT が成功する）。
+#[test]
+fn autocommit_releases_writer_at_statement_end() {
+    let (core, path) = new_core();
+    let _cleanup = CleanupGuard(path);
+    let mut session = SessionState::default();
+    seed(&core, &mut session);
+    let sql = "SELECT id FROM documents WHERE title = 'x' LIMIT 5 FOR UPDATE";
+    core.execute_sql_in_session(&ctx(), &mut session, sql)
+        .expect("autocommit lock");
+    let (r, _) = attempt_in_other_session(&core, &format!("{sql} NOWAIT"));
+    r.expect("released at statement end");
+}
+
+/// 先行の句なし SELECT が読み取り集合に入った後、同じ表へ可視の commit が入ると、ロック句つき
+/// SELECT は書き込み時直列化検査で `40001`（#2396 と同じ判定経路）。不可視の行の書き込みでは起きない。
+#[test]
+fn serialization_failure_on_lock_after_stale_read() {
+    let (core, path) = new_core();
+    let _cleanup = CleanupGuard(path);
+    let mut session = SessionState::default();
+    seed(&core, &mut session);
+    let q = "SELECT id FROM documents WHERE title = 'x' LIMIT 10";
+    let other =
+        PolicyContext::with_visibilities("tenant-b", [Visibility::Public, Visibility::Private])
+            .expect("tenant b");
+    // 他テナントの不可視の行への書き込みでは 40001 にならない。
+    let mut txn = core.new_session_transaction();
+    core.execute_sql_in_txn(&ctx(), &mut session, &mut txn, "BEGIN")
+        .expect("begin");
+    core.execute_sql_in_txn(&ctx(), &mut session, &mut txn, q)
+        .expect("read");
+    let mut s2 = SessionState::default();
+    core.execute_sql_in_session(
+        &other,
+        &mut s2,
+        "INSERT INTO documents (id, embedding, title, author_id) VALUES (100, '[1.0, 0.0]', 'x', 1) USING OPERATION_ID 'other-100'",
+    )
+    .expect("other tenant insert");
+    core.execute_sql_in_txn(&ctx(), &mut session, &mut txn, &format!("{q} FOR UPDATE"))
+        .expect("invisible commit does not conflict");
+    core.execute_sql_in_txn(&ctx(), &mut session, &mut txn, "ROLLBACK")
+        .expect("rollback");
+    // 可視の行への書き込みは 40001。
+    let mut txn = core.new_session_transaction();
+    core.execute_sql_in_txn(&ctx(), &mut session, &mut txn, "BEGIN")
+        .expect("begin");
+    core.execute_sql_in_txn(&ctx(), &mut session, &mut txn, q)
+        .expect("read");
+    core.execute_sql_in_session(
+        &ctx(),
+        &mut s2,
+        "INSERT INTO documents (id, embedding, title, author_id) VALUES (101, '[1.0, 0.0]', 'x', 1) USING OPERATION_ID 'own-101'",
+    )
+    .expect("visible insert");
+    let err = core
+        .execute_sql_in_txn(&ctx(), &mut session, &mut txn, &format!("{q} FOR UPDATE"))
+        .expect_err("serialization failure");
+    assert_eq!(err.wire_code(), "40001");
+    assert_eq!(txn.status(), TransactionStatus::Failed);
+    core.execute_sql_in_txn(&ctx(), &mut session, &mut txn, "ROLLBACK")
+        .expect("rollback");
+}
 #[test]
 fn describe_matches_the_statement_without_the_clause() {
     let (core, path) = new_core();
@@ -273,7 +533,7 @@ fn describe_matches_the_statement_without_the_clause() {
 }
 
 #[test]
-fn extended_query_parse_and_describe_succeed_and_execute_is_gated() {
+fn extended_query_parse_and_describe_succeed_and_execute_returns_plain_rows() {
     let (core, path) = new_core();
     let _cleanup = CleanupGuard(path);
     let session = SessionState::default();
@@ -287,19 +547,20 @@ fn extended_query_parse_and_describe_succeed_and_execute_is_gated() {
         core.describe_prepared_in_session(&session, &plain)
             .expect("describe plain")
     );
-    let bound = core
-        .bind_prepared(&prepared, &[Some(b"x".to_vec())])
-        .expect("bind");
+    let params = [Some(b"x".to_vec())];
+    let bound = core.bind_prepared(&prepared, &params).expect("bind");
     assert!(matches!(bound, ParsedSql::LockingSelect(_)));
+    let bound_plain = core.bind_prepared(&plain, &params).expect("bind plain");
     let mut session = SessionState::default();
-    assert_eq!(
-        core.execute_parsed_in_session(&ctx(), &mut session, &bound)
-            .expect_err("gated")
-            .wire_code(),
-        "0A000"
-    );
+    seed(&core, &mut session);
+    let locked = core
+        .execute_parsed_in_session(&ctx(), &mut session, &bound)
+        .expect("execute locking select");
+    let plain_out = core
+        .execute_parsed_in_session(&ctx(), &mut session, &bound_plain)
+        .expect("execute plain");
+    assert_eq!(format!("{plain_out:?}"), format!("{locked:?}"));
 }
-
 #[test]
 fn temp_table_select_with_clause_is_gated() {
     let (core, path) = new_core();

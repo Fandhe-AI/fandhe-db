@@ -328,7 +328,7 @@ fn run_implicit_transaction<'e, S: WireStream>(
     stmts: &[&str],
 ) -> io::Result<LoopSignal> {
     let snapshot = session.clone();
-    if let Err(e) = engine.begin_implicit_transaction(txn, session) {
+    if let Err(e) = engine.begin_implicit_transaction_for(txn, session, stmts) {
         // ライタゲートの待機上限超過（`55P03`）等。1 文も実行しない。
         respond_error(stream, e.error_class(), &e.client_message())?;
         finish_failed(stream, session, txn)?;
