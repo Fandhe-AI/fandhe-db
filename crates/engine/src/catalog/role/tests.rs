@@ -528,6 +528,14 @@ fn rename_rejections() {
 }
 
 #[test]
+fn rename_to_own_name_is_noop() {
+    let (_g, _p, s) = open("role-rename-self");
+    let id = s.create_role("t1", &rdef("a")).expect("a");
+    s.rename_role("t1", "a", "a", &[]).expect("self rename");
+    assert_eq!(s.get_role("t1", "a").expect("get").expect("some").id, id);
+}
+
+#[test]
 fn alter_role_keeps_unspecified_fields() {
     let (_g, _p, s) = open("role-alter");
     let mut d = rdef("a");

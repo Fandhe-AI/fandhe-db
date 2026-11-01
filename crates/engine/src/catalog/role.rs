@@ -844,6 +844,10 @@ pub(crate) fn rename_role_in_txn(
     if protected_ids.contains(&def.id) {
         return Err(invalid(ROLE_IN_SESSION_USE_MESSAGE));
     }
+    // 自分自身の現在名への改名は PostgreSQL と同じく no-op で成功する（重複は別ロールの場合のみ）。
+    if old_name == new_name {
+        return Ok(());
+    }
     if get_role_in_txn(write_txn, tenant, new_name)?.is_some() {
         return Err(invalid(ROLE_ALREADY_EXISTS_MESSAGE));
     }
