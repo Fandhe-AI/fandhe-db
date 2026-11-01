@@ -214,8 +214,10 @@ fn grantor_rights(entries: &[AclEntry], grantor: u64) -> (u16, u16) {
     (go, any)
 }
 
-/// `grantor` の GRANT OPTION の出所（上流の付与者）の集合。循環の検出に使う（有界・訪問済み集合付き）。
-fn ancestors_of(entries: &[AclEntry], grantor: u64) -> Result<Vec<u64>> {
+/// `grantor` が権限ビット `bits` について持つ GRANT OPTION の出所（上流の付与者）の集合。循環の検出に使う
+/// （有界・訪問済み集合付き）。付与する権限ビットと重なる GRANT OPTION の経路だけを辿り、別の権限の
+/// 経路を同じ上流とみなさない。
+fn ancestors_of(entries: &[AclEntry], grantor: u64, bits: u16) -> Result<Vec<u64>> {
     let mut seen: Vec<u64> = Vec::new();
     let mut stack = vec![grantor];
     let mut steps = 0usize;
@@ -225,7 +227,7 @@ fn ancestors_of(entries: &[AclEntry], grantor: u64) -> Result<Vec<u64>> {
             return Err(AclChangeError::LimitExceeded);
         }
         for e in entries {
-            if e.grantee_id == g && e.grant_options != 0 && !seen.contains(&e.grantor_id) {
+            if e.grantee_id == g && e.grant_options & bits != 0 && !seen.contains(&e.grantor_id) {
                 seen.push(e.grantor_id);
                 stack.push(e.grantor_id);
             }
@@ -234,35 +236,127 @@ fn ancestors_of(entries: &[AclEntry], grantor: u64) -> Result<Vec<u64>> {
     Ok(seen)
 }
 
-/// REVOKE の後始末。GRANT OPTION を失った付与先 `x` が付けた付与のうち、`x` の残りの GRANT OPTION で
-/// 賄えない権限は依存する付与として、RESTRICT なら `2BP01`、CASCADE なら連鎖して取り消す。
-fn resolve_dependents(work: &mut [AclEntry], start: Vec<u64>, cascade: bool) -> Result<()> {
+/// 1 オブジェクトの ACL 行の作業状態（`before` は txn スナップショット、`work` は更新後）。
+struct AclState {
+    object: PrivilegeObject,
+    before: Vec<AclEntry>,
+    work: Vec<AclEntry>,
+}
+
+/// 作業状態の集合（挿入順を保つ。表と列の依存解決で相互参照するため、1 箇所で持つ）。
+#[derive(Default)]
+struct AclStates {
+    order: Vec<AclState>,
+    index: HashMap<String, usize>,
+}
+
+impl AclStates {
+    /// `object` の作業状態の位置を返す（無ければ txn から読み込む）。
+    fn idx(
+        &mut self,
+        write_txn: &redb::WriteTransaction,
+        tenant: &str,
+        object: &PrivilegeObject,
+    ) -> Result<usize> {
+        let key = target_key(object);
+        if let Some(&i) = self.index.get(&key) {
+            return Ok(i);
+        }
+        if self.order.len() >= MAX_TARGET_VISITS {
+            return Err(AclChangeError::LimitExceeded);
+        }
+        let before = list_acl_for_object_in_txn(write_txn, tenant, object)?;
+        self.index.insert(key, self.order.len());
+        self.order.push(AclState {
+            object: object.clone(),
+            work: before.clone(),
+            before,
+        });
+        Ok(self.order.len() - 1)
+    }
+
+    fn work_of(&self, i: usize) -> &[AclEntry] {
+        self.order.get(i).map_or(&[][..], |s| s.work.as_slice())
+    }
+}
+
+/// `x` が `entries` で持つ GRANT OPTION ビットの和。
+fn go_of(entries: &[AclEntry], x: u64) -> u16 {
+    entries
+        .iter()
+        .filter(|e| e.grantee_id == x)
+        .fold(0u16, |a, e| a | e.grant_options)
+}
+
+/// 表の列名（表でない・スキーマが無ければ空）。
+fn table_column_names(write_txn: &redb::WriteTransaction, table: &str) -> Result<Vec<String>> {
+    match require_table_schema_write_any_identity(write_txn, table) {
+        Ok(s) => Ok(s.columns.iter().map(|c| c.name.clone()).collect()),
+        Err(CatalogError::TableNotFound(_)) => Ok(Vec::new()),
+        Err(e) => Err(e.into()),
+    }
+}
+
+/// REVOKE の後始末。GRANT OPTION を失った `(付与先 x, 範囲)` について、`x` が付けた付与のうち `x` の残りの
+/// GRANT OPTION で賄えない権限は依存する付与として、RESTRICT なら `2BP01`、CASCADE なら連鎖して取り消す。
+/// 範囲が表なら表の行と全列の行を、列ならその列の行を見る。列の付与は列自身の GRANT OPTION に加えて
+/// 表単位の GRANT OPTION（更新後の表の行）でも賄える。
+fn resolve_dependents(
+    write_txn: &redb::WriteTransaction,
+    tenant: &str,
+    states: &mut AclStates,
+    start: Vec<(u64, PrivilegeObject)>,
+    cascade: bool,
+) -> Result<()> {
     let mut queue = start;
     let mut steps = 0usize;
-    while let Some(x) = queue.pop() {
+    while let Some((x, scope)) = queue.pop() {
         steps += 1;
         if steps > MAX_CASCADE_STEPS {
             return Err(AclChangeError::LimitExceeded);
         }
-        let total_go = work
-            .iter()
-            .filter(|e| e.grantee_id == x)
-            .fold(0u16, |a, e| a | e.grant_options);
-        for i in 0..work.len() {
-            let Some(e) = work.get_mut(i) else { break };
-            if e.grantor_id != x {
+        let mut objs: Vec<PrivilegeObject> = Vec::new();
+        match &scope {
+            PrivilegeObject::Table(t) => {
+                objs.push(scope.clone());
+                for c in table_column_names(write_txn, t)? {
+                    objs.push(PrivilegeObject::Column {
+                        table: t.clone(),
+                        column: c,
+                    });
+                }
+            }
+            PrivilegeObject::Column { .. } => objs.push(scope.clone()),
+            _ => continue,
+        }
+        for obj in objs {
+            let i = states.idx(write_txn, tenant, &obj)?;
+            let mut covered = go_of(states.work_of(i), x);
+            if let PrivilegeObject::Column { table, .. } = &obj {
+                let ti = states.idx(write_txn, tenant, &PrivilegeObject::Table(table.clone()))?;
+                covered |= go_of(states.work_of(ti), x);
+            }
+            let Some(state) = states.order.get_mut(i) else {
                 continue;
+            };
+            for e in state.work.iter_mut() {
+                if e.grantor_id != x {
+                    continue;
+                }
+                let uncovered = e.privileges & !covered;
+                if uncovered == 0 {
+                    continue;
+                }
+                if !cascade {
+                    return Err(AclChangeError::DependentPrivileges);
+                }
+                let old_go = e.grant_options;
+                e.privileges &= !uncovered;
+                e.grant_options &= e.privileges;
+                if e.grant_options != old_go {
+                    queue.push((e.grantee_id, obj.clone()));
+                }
             }
-            let uncovered = e.privileges & !total_go;
-            if uncovered == 0 {
-                continue;
-            }
-            if !cascade {
-                return Err(AclChangeError::DependentPrivileges);
-            }
-            e.privileges &= !uncovered;
-            e.grant_options &= e.privileges;
-            queue.push(e.grantee_id);
         }
     }
     Ok(())
@@ -449,14 +543,16 @@ impl Storage {
         }
         // 4. 対象ごとの判定と計画。
         let mut warning: Option<AclWarning> = None;
-        let mut changes: Vec<Change> = Vec::new();
+        let mut states = AclStates::default();
+        let mut affected: Vec<(u64, PrivilegeObject)> = Vec::new();
         for t in &targets {
             let allowed = t.object.allowed_privileges();
             let want = t.bits & allowed;
-            let entries = list_acl_for_object_in_txn(&*write_txn, tenant, &t.object)?;
             if want == 0 && t.propagated {
                 continue;
             }
+            let si = states.idx(&write_txn, tenant, &t.object)?;
+            let entries: Vec<AclEntry> = states.work_of(si).to_vec();
             // 付与者が持つ GRANT OPTION。列は表単位の行も合わせて見る。
             let eff = if req.owner_equivalent || t.propagated {
                 want
@@ -503,7 +599,7 @@ impl Storage {
             let mut work: Vec<AclEntry> = entries.clone();
             if req.is_grant {
                 if req.grant_option && !req.owner_equivalent {
-                    let anc = ancestors_of(&entries, req.grantor_id)?;
+                    let anc = ancestors_of(&entries, req.grantor_id, eff)?;
                     if grantee_ids.iter().any(|g| anc.contains(g)) {
                         return Err(AclChangeError::InvalidGrant(
                             "grant options cannot be granted back to your own grantor",
@@ -529,7 +625,6 @@ impl Storage {
                     }
                 }
             } else {
-                let mut affected: Vec<u64> = Vec::new();
                 for g in &grantee_ids {
                     if let Some(e) = work
                         .iter_mut()
@@ -542,14 +637,25 @@ impl Storage {
                             e.privileges &= !eff;
                             e.grant_options &= e.privileges;
                         }
-                        if e.grant_options != old_go && !affected.contains(g) {
-                            affected.push(*g);
+                        if e.grant_options != old_go
+                            && !affected.iter().any(|(a, o)| a == g && *o == t.object)
+                        {
+                            affected.push((*g, t.object.clone()));
                         }
                     }
                 }
-                resolve_dependents(&mut work, affected, req.cascade)?;
             }
-            diff_into(&mut changes, &t.object, &entries, &work);
+            if let Some(st) = states.order.get_mut(si) {
+                st.work = work;
+            }
+        }
+        // 失った GRANT OPTION に依存する付与を、表・列をまたいで解決する（全対象の直接更新の後）。
+        if !req.is_grant {
+            resolve_dependents(&write_txn, tenant, &mut states, affected, req.cascade)?;
+        }
+        let mut changes: Vec<Change> = Vec::new();
+        for st in &states.order {
+            diff_into(&mut changes, &st.object, &st.before, &st.work);
         }
         // 5. 書き込み。
         if changes.is_empty() {

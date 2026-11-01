@@ -350,3 +350,154 @@ fn acl_survives_reopen() {
         }]
     );
 }
+// ---- GRANT／REVOKE の依存解決（Issue #1965 レビュー指摘。表と列をまたぐ GRANT OPTION の伝播）----
+
+mod apply_deps {
+    use super::*;
+    use crate::catalog::privilege::apply::{
+        AclApplyOutcome, AclChangeError, AclItem, AclRequest, GranteeSpec,
+    };
+    use crate::catalog::role::{RoleAttributes, RoleDef};
+
+    const T: &str = "acl_t";
+
+    fn role(s: &Storage, name: &str) -> u64 {
+        s.create_role(
+            "tn",
+            &RoleDef {
+                id: 0,
+                name: name.to_string(),
+                attributes: RoleAttributes {
+                    login: true,
+                    inherit: true,
+                    ..RoleAttributes::default()
+                },
+                connection_limit: -1,
+                valid_until: None,
+                scram_verifier: Vec::new(),
+                legacy_phc: Vec::new(),
+            },
+        )
+        .expect("role")
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn run(
+        s: &Storage,
+        grantor: u64,
+        owner: bool,
+        is_grant: bool,
+        bits: u16,
+        columns: &[&str],
+        grantee: u64,
+        go: bool,
+        cascade: bool,
+    ) -> std::result::Result<AclApplyOutcome, AclChangeError> {
+        let items = [AclItem {
+            bits,
+            columns: columns.iter().map(|c| c.to_string()).collect(),
+        }];
+        let tables = [T.to_string()];
+        let grantees = [GranteeSpec::Id(grantee)];
+        s.apply_acl_changes(
+            "tn",
+            &AclRequest {
+                is_grant,
+                grantor_id: grantor,
+                owner_equivalent: owner,
+                tables: &tables,
+                items: &items,
+                grantees: &grantees,
+                grant_option: go,
+                cascade,
+            },
+        )
+    }
+
+    fn col_rows(s: &Storage, c: &str) -> Vec<AclEntry> {
+        s.list_acl_for_object("tn", &col(T, c)).expect("list")
+    }
+
+    #[test]
+    fn revoking_table_grant_option_restricts_or_cascades_to_column_grants() {
+        for cascade in [false, true] {
+            let (_g, s) = open("acl_dep_tbl_go");
+            mk_table(&s, T);
+            let owner = role(&s, "owner");
+            let bob = role(&s, "bob");
+            let carol = role(&s, "carol");
+            run(&s, owner, true, true, PRIV_SELECT, &[], bob, true, false).expect("g1");
+            run(
+                &s,
+                bob,
+                false,
+                true,
+                PRIV_SELECT,
+                &["a"],
+                carol,
+                false,
+                false,
+            )
+            .expect("g2");
+            let r = run(&s, owner, true, false, PRIV_SELECT, &[], bob, true, cascade);
+            if cascade {
+                r.expect("cascade");
+                assert!(col_rows(&s, "a").iter().all(|e| e.grantee_id != carol));
+            } else {
+                assert!(matches!(r, Err(AclChangeError::DependentPrivileges)));
+                assert_eq!(col_rows(&s, "a").len(), 1);
+            }
+        }
+    }
+
+    #[test]
+    fn column_revoke_keeps_grant_when_table_grant_option_remains() {
+        let (_g, s) = open("acl_dep_col_keep");
+        mk_table(&s, T);
+        let owner = role(&s, "owner");
+        let bob = role(&s, "bob");
+        let carol = role(&s, "carol");
+        run(&s, owner, true, true, PRIV_SELECT, &[], bob, true, false).expect("g1");
+        run(&s, owner, true, true, PRIV_SELECT, &["a"], bob, true, false).expect("g2");
+        run(
+            &s,
+            bob,
+            false,
+            true,
+            PRIV_SELECT,
+            &["a"],
+            carol,
+            false,
+            false,
+        )
+        .expect("g3");
+        run(
+            &s,
+            owner,
+            true,
+            false,
+            PRIV_SELECT,
+            &["a"],
+            bob,
+            true,
+            false,
+        )
+        .expect("restrict ok");
+        assert!(col_rows(&s, "a").iter().any(|e| e.grantee_id == carol));
+    }
+
+    #[test]
+    fn grant_option_cycle_is_judged_per_privilege_bit() {
+        let (_g, s) = open("acl_dep_bits");
+        mk_table(&s, T);
+        let owner = role(&s, "owner");
+        let alice = role(&s, "alice");
+        let bob = role(&s, "bob");
+        run(&s, owner, true, true, PRIV_SELECT, &[], alice, true, false).expect("1");
+        run(&s, owner, true, true, PRIV_UPDATE, &[], bob, true, false).expect("2");
+        run(&s, alice, false, true, PRIV_SELECT, &[], bob, true, false).expect("3");
+        run(&s, bob, false, true, PRIV_UPDATE, &[], alice, true, false).expect("update ok");
+        let r = run(&s, bob, false, true, PRIV_SELECT, &[], alice, true, false);
+        assert!(matches!(r, Err(AclChangeError::InvalidGrant(_))));
+    }
+}

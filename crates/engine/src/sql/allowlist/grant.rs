@@ -113,6 +113,14 @@ pub struct ValidatedGrantRevoke {
 }
 
 impl ValidatedGrantRevoke {
+    /// 権限形なら対象表名（解決済み）を返す。一時表との衝突検査（core.rs の parse）で使う。
+    pub(crate) fn object_table_names(&self) -> Option<&[String]> {
+        match &self.target {
+            GrantTarget::Objects(o) => Some(&o.tables),
+            GrantTarget::Roles(_) => None,
+        }
+    }
+
     /// `REVOKE` なら真（wire のコマンドタグの選択に使う）。
     pub fn is_revoke(&self) -> bool {
         !self.is_grant

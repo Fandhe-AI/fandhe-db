@@ -5216,7 +5216,11 @@ impl EngineCore {
             // `LOCK [TABLE]` は `LOCK`・`TABLE`・`IN`・`SHARE`・`MODE` 等のキーワードを含むため、名前走査だと
             // 同名の一時表（`CREATE TEMP TABLE lock` 等）で誤判定する。対象表名の一時表衝突は
             // parse 内の参照記録（`hits.temp_hit()`）で固定の `0A000` として拒否する（Issue #1958）。
-            || crate::sql::lock_table::is_lock_statement(&tokens);
+            || crate::sql::lock_table::is_lock_statement(&tokens)
+            // `GRANT`／`REVOKE` も構文語（`TO`・`ON`・`GRANT` 等）とロール名を含むため名前走査から外す。
+            // 対象表名の一時表衝突は parse 内の参照記録で固定の `0A000` として拒否する。
+            || crate::sql::allowlist::is_grant_statement(&tokens)
+            || crate::sql::allowlist::is_revoke_statement(&tokens);
         if txn_control_head || scan_exempt {
             let hits = crate::sql::temp_catalog::RelationHits::default();
             let parsed =
@@ -5780,6 +5784,14 @@ impl EngineCore {
             || crate::sql::allowlist::is_revoke_statement(&tokens)
         {
             let stmt = crate::sql::allowlist::validate_grant_revoke_tokens(&tokens)?;
+            // 一時表との衝突は参照の記録だけ行い（結果は使わない）、振り分け側が `0A000` で拒否する
+            // （`LOCK` と同じ設計）。
+            if let Some(names) = stmt.object_table_names() {
+                for name in names {
+                    let _ =
+                        crate::sql::allowlist::TableLookup::table_exists(&storage_lookup, name)?;
+                }
+            }
             return Ok(ParsedSql::GrantRevoke(stmt));
         }
         if crate::sql::allowlist::is_alter_default_privileges_statement(&tokens) {
