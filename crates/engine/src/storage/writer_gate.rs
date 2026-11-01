@@ -2,8 +2,8 @@
 //! `redb` の単一ライタ（`TABLE-3`）を安全に共有するための待機付きゲート。
 //!
 //! `redb::WriteTransaction` は待機上限を持たない `Database::begin_write` でしか
-//! 得られない。明示トランザクションが `BEGIN` から `COMMIT`/`ROLLBACK` まで
-//! ライタを占有すると、autocommit 書き込みが無期限に止まってしまう。本モジュールは
+//! 得られない。明示トランザクションが最初の書き込み文（Issue #2400。`BEGIN` では
+//! 取得しない）から `COMMIT`/`ROLLBACK` までライタを占有すると、autocommit 書き込みが無期限に止まってしまう。本モジュールは
 //! 「ライタを握る前に必ずこのゲートを通す」という choke point を追加し、
 //! autocommit（[`crate::storage::Storage::begin_write_txn`]）・明示トランザクション
 //! （[`crate::storage::Storage::begin_explicit_write_txn`]）のどちらも、ゲートを
