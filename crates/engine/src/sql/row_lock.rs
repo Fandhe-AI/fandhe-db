@@ -165,11 +165,13 @@ fn parse_clause(tokens: &[Token], mut i: usize) -> Result<(RowLockClause, usize)
         i += 1;
         loop {
             match tokens.get(i) {
-                Some(Token::Ident(name))
-                    if !["NOWAIT", "SKIP", "FOR", "OF"]
-                        .iter()
-                        .any(|w| name.eq_ignore_ascii_case(w)) =>
-                {
+                // `OF` / `,` の直後は名前が必須の位置なので、待機方針語と同じ綴りでも名前として受理する
+                // （`AS "nowait"` への `OF "nowait"`）。字句段は引用有無を保持しないため綴りでは区別できない。
+                // 引用付きの値関数名（`"current_date"` = QuotedNull）・真偽語（QuotedBoolWord）も FROM の
+                // 識別子解析と同様に受理する。
+                Some(
+                    Token::Ident(name) | Token::QuotedNull(name) | Token::QuotedBoolWord(name),
+                ) => {
                     of.push(name.clone());
                     i += 1;
                 }
@@ -668,6 +670,17 @@ mod tests {
         untouched("SELECT id FROM a FOR UPDATE ORDER BY id");
         untouched("SELECT id FROM a FOR UPDATE WHERE id = 1");
         untouched("SELECT RANK() OVER w FROM a FOR UPDATE WINDOW w AS (ORDER BY id)");
+    }
+
+    #[test]
+    fn of_accepts_quoted_names_spelled_like_keywords() {
+        for name in ["nowait", "skip", "current_date", "true"] {
+            let sql = format!("SELECT id FROM a AS \"{name}\" FOR UPDATE OF \"{name}\" NOWAIT");
+            let cs = clauses(&sql);
+            assert_eq!(cs.len(), 1, "{sql}");
+            assert_eq!(cs[0].of(), [name.to_string()], "{sql}");
+            assert_eq!(cs[0].wait(), LockWaitPolicy::NoWait, "{sql}");
+        }
     }
 
     #[test]
