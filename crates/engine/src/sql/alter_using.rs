@@ -401,6 +401,7 @@ pub(crate) fn redact_row_conversion_error(e: SqlSurfaceError) -> SqlSurfaceError
         | E::InsufficientPrivilege
         | E::SchemaDependencyForbidden
         | E::ConflictTargetNotVisible
+        | E::RowSecurityPolicyViolation { .. }
         | E::InvalidCursorName
         | E::RecordNotAssigned
         | E::NoDataFound

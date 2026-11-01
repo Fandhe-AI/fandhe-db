@@ -165,7 +165,7 @@
 | `INSERT` | WITH CHECK。`RETURNING` があれば新行に SELECT のポリシー | 同じ |
 | `ON CONFLICT DO UPDATE` | 既存行が UPDATE の USING（と SELECT のポリシー）を満たさなければエラー。更新後の行は WITH CHECK | 2 層を区別する。テナント境界外・不可視の衝突は現行の `ConflictTargetNotVisible`（`42501`・存在情報を出さない既存契約）を維持し、テナント内でポリシーにより隠れた衝突行は PG 17 の挙動に揃える。判定順はテナント境界 → ポリシー |
 | BEFORE トリガとの順序 | BEFORE トリガ後の行に WITH CHECK | 同じ |
-| 失敗時の原子性 | 文全体が失敗し何も書かない | 同じ。分割実行 DML でも WITH CHECK 違反の文は何も書かない |
+| 失敗時の原子性 | 文全体が失敗し何も書かない | 同じ。ただし利用者が明示する非原子の分割実行 DML（`PARTITIONED`）はチャンク単位で、違反したチャンクは何も書かずにジョブを止め、確定済みのチャンクは残る（`CHECK` 違反と同じ契約。#2277） |
 
 ## エラー契約と HTTP 射影
 
@@ -286,3 +286,34 @@ Issue #2276・#2277 の担当のため、本節の導入後も行の可視性は
 | 認証の不備 | `current_user` 等は認証済み `SessionState` だけから取り、クライアント申告のテナント・ロールを使わない |
 | 秘密情報・設定 | 実ユーザー名・資格情報を載せない。private spec の本文は転記せずポインタのみ |
 | 脆弱な依存 | 依存追加なし |
+
+## WITH CHECK の適用（#2277）
+
+`INSERT`・`UPDATE`・`INSERT ... ON CONFLICT DO UPDATE` で書いた行に利用者定義ポリシーの `WITH CHECK` を適用する
+（RLS-13 のポインタ）。実装は `sql::policy_eval`（選択・合成・評価）と、書き込みの単一の検査点
+`constraint::enforce_row_constraints_in_txn` の新しい段。
+
+- **種別は明示引数**: 検査点は `RowPolicyWrite`（`Insert`・`Update`・`Upsert { updated_ids }`・`Internal`）を必須引数に取る。
+  thread-local にしないので、指定の付け忘れはコンパイルエラーになり「検査なし」（fail-open）の経路ができない
+- **合成**: `(PERMISSIVE の OR) AND (RESTRICTIVE の AND)`。式が NULL なら偽、該当する PERMISSIVE が無ければ既定拒否。
+  `WITH CHECK` が無ければ `USING` で代用する。式を持たないポリシーは合成に何も足さない（広げない側）。
+  違反の報告は PERMISSIVE の合成を先に、続けて RESTRICTIVE を名前順に個別に評価する
+- **段の順序**: 索引同期の前、つまり `CHECK`・UNIQUE・ビューの `WITH CHECK OPTION`・`FOREIGN KEY` より前に評価する
+  （PG の RLS の検査が制約・索引挿入より前であることに合わせた。PG 17 のソースでの照合は未実施で、要確認）
+- **ON CONFLICT**: (1) 提案行に INSERT 側の `WITH CHECK` を、衝突判定より前に全行へ評価する。(2) 既存行に UPDATE 側と
+  SELECT 側の `USING` を、テナント境界（所有 ∩ 可視。外れは従来の `ConflictTargetNotVisible`）の後・`DO UPDATE ... WHERE` の
+  前に評価する。(3) 更新後の行に UPDATE 側の `WITH CHECK` を検査点で評価する。(1) の PG 17 との順序は要確認
+- **エラー**: `TenantWriteError::RowSecurityPolicyViolation`（`42501`。新しい `wire_code` は作らず HTTP 射影も既存の
+  `42501` のまま）。文言は PG と同形で、含めるのは自テナントの表名とポリシー名（RESTRICTIVE 違反のときだけ）に限る。
+  行の値・id・テナントは含めない
+- **原子性**: 検査点で失敗すると write txn は commit されず、台帳・行・索引とも残らない。明示トランザクションでは
+  既存の文失敗の扱いに乗る
+- **暫定（#2278 まで）**: 所有者・`BYPASSRLS` の機構が無いので、全セッションを非所有者として扱う
+  （`policy_eval::user_policies_apply_for_write` の 1 か所）。そのため `ENABLE` だけで INSERT ポリシーの無い表は
+  全員の INSERT が `42501` になり、`FORCE`／`NO FORCE` の違いはまだ観測できない
+- **連鎖書き込み**: `FOREIGN KEY` の参照アクションが子表へ書く行（`Internal`）には適用しない（暫定。PG の RI は
+  ポリシーを実質的に掛けない。#2278 で再検討）
+- **一時表**: 一時表への `ENABLE` は `0A000`（#2275）のため、一時表への書き込みは検査対象にならない
+- **未対応（後続）**: `RETURNING` の新しい行への SELECT ポリシー、対象行の選択への `USING`（#2276）
+- **PG との差**: NOT NULL・行キー衝突（`23505`）は検査点より前に検出されるため、RLS 違反と同時に起きたときのエラーが
+  PG と異なりうる（他テナントへの漏えいはない）

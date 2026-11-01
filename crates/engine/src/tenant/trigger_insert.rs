@@ -139,6 +139,7 @@ pub(super) fn write_rows_with_triggers(
             ctx.tenant_id(),
             &[*row_id],
             crate::constraint::FkCheckMode::Skip,
+            crate::constraint::RowPolicyWrite::Insert,
         )?;
         written.push(*row_id);
         if !plan.after.is_empty() {

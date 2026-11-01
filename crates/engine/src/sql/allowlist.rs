@@ -1262,6 +1262,15 @@ pub enum SqlSurfaceError {
     /// `tenant::TenantWriteError::ConflictTargetNotVisible` の写像先で、行 id・値・
     /// テナントを含まない固定文言のみを保持する。
     ConflictTargetNotVisible,
+    /// 利用者定義の行セキュリティポリシーの `WITH CHECK` 違反（RLS-13・Issue #2277）。`42501`
+    /// （`ErrorClass::ForbiddenTenantMismatch` を再利用）。`tenant::TenantWriteError::
+    /// RowSecurityPolicyViolation` の写像先で、自テナントの表名・ポリシー名だけを保持する
+    /// （行の値・id・他テナントの情報は含めない）。
+    RowSecurityPolicyViolation {
+        table: String,
+        policy: Option<String>,
+        using_expression: bool,
+    },
     /// `FETCH`／`CLOSE` が参照したカーソル名が、現在のトランザクション内に
     /// 存在しない（WIRE-15・TASK-218）。他セッション所有のカーソル名・単に
     /// 存在しない名前のいずれも区別しない固定文言のみを保持し、カーソル名
@@ -1953,6 +1962,7 @@ impl ClassifiedError for SqlSurfaceError {
             | SqlSurfaceError::AggregateOrderByNotInArguments => ErrorClass::InvalidColumnReference,
             SqlSurfaceError::InsufficientPrivilege
             | SqlSurfaceError::ConflictTargetNotVisible
+            | SqlSurfaceError::RowSecurityPolicyViolation { .. }
             | SqlSurfaceError::SchemaDependencyForbidden => ErrorClass::ForbiddenTenantMismatch,
             SqlSurfaceError::InvalidCursorName => ErrorClass::InvalidCursorName,
             SqlSurfaceError::NoDataFound => ErrorClass::NoDataFound,
@@ -2276,6 +2286,15 @@ impl std::fmt::Display for SqlSurfaceError {
                     "permission denied: ON CONFLICT DO UPDATE target row is not visible"
                 )
             }
+            SqlSurfaceError::RowSecurityPolicyViolation {
+                table,
+                policy,
+                using_expression,
+            } => f.write_str(&crate::tenant::row_security_violation_message(
+                table,
+                policy.as_deref(),
+                *using_expression,
+            )),
             // カーソル名・他セッション所有かどうかを一切含めない固定文言
             // （security.md P0。`SqlSurfaceError::InvalidCursorName` ドキュメント
             // 参照）。

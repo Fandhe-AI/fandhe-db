@@ -505,7 +505,8 @@ const ALLOWLIST: &[(&str, u32)] = &[
     // Issue #2207（GIN 相当索引の維持。`TenantWriteError::GinIndexEntryLimitExceeded` の追加・`catalog.rs` の行追加）で
     // `tenant.rs`・`catalog.rs` の各エントリを現行行へ追随（commit 対象は変わらない）。
     // Issue #1723（`TenantWriteError::TriggerFailed` の追加）で現行行へ追随（commit 対象は変わらない）。
-    ("tenant.rs", 598),
+    // Issue #2277（`TenantWriteError::RowSecurityPolicyViolation` の追加）で現行行へ追随（commit 対象は変わらない）。
+    ("tenant.rs", 609),
     // Issue #1688（SEQUENCE のカタログ）: `catalog/sequence.rs` の `create_sequence`／`drop_sequence` は
     // SEQUENCE の定義表・状態表・ID カウンタだけを書く。表の行スキーマ（`user_rows/{table}`）も
     // 表のスキーマ世代も変えないため、`bump_table_generation_in_txn` を伴わない。Issue #1690 の
