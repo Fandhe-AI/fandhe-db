@@ -5037,6 +5037,7 @@ impl EngineCore {
         tokens: Vec<crate::sql::lexer::Token>,
         session: &crate::sql::mode::SessionState,
         resolver: Option<crate::sql::relation_name::SchemaResolver<'_>>,
+        read_snap: Option<&redb::ReadTransaction>,
     ) -> Result<ParsedSql, crate::sql::allowlist::SqlSurfaceError> {
         // 標準 SQL の行数制限句の正規化は、参照ゲート・一時カタログ走査より前に行う（Issue #1793）。
         // 正規化が `0A000`（入れ子・非 SELECT の `WITH TIES`）で失敗した場合も、`search_path` が
@@ -5055,12 +5056,12 @@ impl EngineCore {
         };
         // 実効 `search_path` に `public` が含まれる既定のセッションは何も足さない（追加コストなし）。
         if !session.search_path_hides_public() {
-            return self.parse_tokens_gated_inner(tokens, session, resolver);
+            return self.parse_tokens_gated_inner(tokens, session, resolver, read_snap);
         }
         // TABLE-27・Issue #1715: `public` が見えないセッションでは、一時表以外の未修飾のテーブル参照を
         // `42P01` にする。判定順は構文エラー `42601` → 参照ゲート `42P01` → その他の検証エラー。
         let gate = crate::sql::search_path::check_unqualified_refs(session, &tokens, &[]);
-        let parsed = self.parse_tokens_gated_inner(tokens, session, resolver);
+        let parsed = self.parse_tokens_gated_inner(tokens, session, resolver, read_snap);
         match (parsed, gate) {
             (Err(e), _) if e.wire_code() == "42601" => Err(e),
             (_, Err(gate_err)) => Err(gate_err),
@@ -5074,10 +5075,11 @@ impl EngineCore {
         tokens: Vec<crate::sql::lexer::Token>,
         session: &crate::sql::mode::SessionState,
         resolver: Option<crate::sql::relation_name::SchemaResolver<'_>>,
+        read_snap: Option<&redb::ReadTransaction>,
     ) -> Result<ParsedSql, crate::sql::allowlist::SqlSurfaceError> {
         let temp = session.temp_tables();
         if temp.is_empty() {
-            return self.parse_tokens_r(tokens, resolver);
+            return self.parse_tokens_r(tokens, resolver, read_snap);
         }
         // `public.<一時表の名前>` は永続側の関係を指すため、裸の名前へ解決すると一時表に化ける。
         // 解決より前に拒否する（TABLE-27・Issue #1714。fail-closed）。
@@ -5103,7 +5105,8 @@ impl EngineCore {
             || crate::sql::lock_table::is_lock_statement(&tokens);
         if txn_control_head || scan_exempt {
             let hits = crate::sql::temp_catalog::RelationHits::default();
-            let parsed = self.parse_tokens_in(tokens, temp, &hits, self.ledger_mode, resolver)?;
+            let parsed =
+                self.parse_tokens_in(tokens, temp, &hits, self.ledger_mode, resolver, read_snap)?;
             if hits.temp_hit() {
                 return Err(crate::sql::temp_catalog::temp_table_unsupported());
             }
@@ -5115,7 +5118,7 @@ impl EngineCore {
             return self.route_drop_index(tokens, session, resolver);
         }
         if !crate::sql::temp_catalog::tokens_reference_temp(&tokens, temp) {
-            return self.parse_tokens_r(tokens, resolver);
+            return self.parse_tokens_r(tokens, resolver, read_snap);
         }
         self.route_temp_statement(tokens, session, resolver)
     }
@@ -5253,7 +5256,7 @@ impl EngineCore {
         tokens: Vec<crate::sql::lexer::Token>,
     ) -> Result<ParsedSql, crate::sql::allowlist::SqlSurfaceError> {
         let tokens = Self::normalize_row_count_clauses(tokens)?;
-        self.parse_tokens_r(tokens, None)
+        self.parse_tokens_r(tokens, None, None)
     }
 
     /// 標準 SQL の `FETCH FIRST n ROWS ONLY`／`OFFSET n ROWS`／`WITH TIES` をトークン段で
@@ -5274,12 +5277,13 @@ impl EngineCore {
         &self,
         tokens: Vec<crate::sql::lexer::Token>,
         resolver: Option<crate::sql::relation_name::SchemaResolver<'_>>,
+        read_snap: Option<&redb::ReadTransaction>,
     ) -> Result<ParsedSql, crate::sql::allowlist::SqlSurfaceError> {
         // セッションを持たない入口（`parse_sql`・拡張クエリの Parse 等）は空の一時カタログで
         // 解決する（挙動は一時カタログ導入前と同一。TABLE-44・Issue #1681）。
         let temp = crate::sql::temp_catalog::SessionTempCatalog::default();
         let hits = crate::sql::temp_catalog::RelationHits::default();
-        self.parse_tokens_in(tokens, &temp, &hits, self.ledger_mode, resolver)
+        self.parse_tokens_in(tokens, &temp, &hits, self.ledger_mode, resolver, read_snap)
     }
 
     /// [`Self::parse_tokens`] のセッション一時カタログ対応版（TABLE-44・Issue #1681）。
@@ -5297,13 +5301,15 @@ impl EngineCore {
         hits: &crate::sql::temp_catalog::RelationHits,
         ledger_mode: LedgerMode,
         resolver: Option<crate::sql::relation_name::SchemaResolver<'_>>,
+        read_snap: Option<&redb::ReadTransaction>,
     ) -> Result<ParsedSql, crate::sql::allowlist::SqlSurfaceError> {
         // SELECT の行ロック句（SQL-38・Issue #1957）は、行数制限句の正規化の後・名前解決の前に
         // トークン列から取り除いて構文情報として保持し、既存の検証が文を受理した後に併用を検査する。
         // 構文誤りは `42601`、併用違反は `0A000`、`OF` の解決失敗は `42P01`。
         let tokens = Self::normalize_row_count_clauses(tokens)?;
         let (tokens, locking) = crate::sql::row_lock::extract_row_locking(tokens)?;
-        let parsed = self.parse_tokens_in_impl(tokens, temp, hits, ledger_mode, resolver)?;
+        let parsed =
+            self.parse_tokens_in_impl(tokens, temp, hits, ledger_mode, resolver, read_snap)?;
         let Some(locking) = locking else {
             return Ok(parsed);
         };
@@ -5331,6 +5337,7 @@ impl EngineCore {
         hits: &crate::sql::temp_catalog::RelationHits,
         ledger_mode: LedgerMode,
         resolver: Option<crate::sql::relation_name::SchemaResolver<'_>>,
+        read_snap: Option<&redb::ReadTransaction>,
     ) -> Result<ParsedSql, crate::sql::allowlist::SqlSurfaceError> {
         // 各入口で正規化済みでも冪等のため、ここでも最終的な保証として適用する（Issue #1793）。
         let mut tokens = Self::normalize_row_count_clauses(tokens)?;
@@ -5899,17 +5906,81 @@ impl EngineCore {
 
         // SQL-63・Issue #1876: 最上位の `WITH` にデータ変更 CTE を含む文だけが実行計画を持つ
         // （検出は `parse_with_clause` の結果。それ以外は従来どおり読み取りの `Statement`）。
-        match crate::sql::allowlist::validate_session_with_tokens(
-            &tokens,
-            &storage_lookup,
-            0,
-            self.nesting_limits,
-            ledger_mode,
-        )? {
+        // 明示トランザクションの writer 取得前（読み取り源が `BEGIN` 時点のスナップショット）は、
+        // 読み取り文の検証・ビュー展開も同じスナップショットのカタログで行う（Issue #2403。
+        // 最新の確定カタログで展開した文を古い行集合へ流さない）。
+        let validated = match read_snap {
+            Some(snap) => {
+                // 書き込みを含む文・`USING PLAN` の SELECT・`EXPLAIN` は実行が最新の確定カタログ
+                // （writer 取得後／自前で確定スナップショットを開く経路）を見るため、検証も最新の
+                // カタログで行い、検証と実行の参照時点を揃える（Issue #2403）。読み取り文だけを
+                // `BEGIN` 時点のスナップショットで検証・ビュー展開する。
+                let latest = crate::sql::allowlist::validate_session_with_tokens(
+                    &tokens,
+                    &storage_lookup,
+                    0,
+                    self.nesting_limits,
+                    ledger_mode,
+                );
+                if let Ok(v) = &latest {
+                    if Self::validated_runs_on_latest_catalog(v) {
+                        return latest.map(Self::session_with_into_parsed);
+                    }
+                }
+                let snap_catalog = crate::catalog::ViewWriteSnapshot::over(snap);
+                let snap_lookup = crate::sql::temp_catalog::SessionRelationLookup::new(
+                    &snap_catalog,
+                    temp,
+                    hits.temp_cell(),
+                )
+                .with_persistent_hit(hits.persistent_cell());
+                let snap_validated = crate::sql::allowlist::validate_session_with_tokens(
+                    &tokens,
+                    &snap_lookup,
+                    0,
+                    self.nesting_limits,
+                    ledger_mode,
+                );
+                match (snap_validated, latest) {
+                    // 最新では失敗するが BEGIN 時点では書き込み系／最新参照の文として通る場合は
+                    // 最新側のエラーを返す（実行が最新カタログを見るため。fail-closed）。
+                    (Ok(v), Err(e)) if Self::validated_runs_on_latest_catalog(&v) => return Err(e),
+                    (r, _) => r?,
+                }
+            }
+            None => crate::sql::allowlist::validate_session_with_tokens(
+                &tokens,
+                &storage_lookup,
+                0,
+                self.nesting_limits,
+                ledger_mode,
+            )?,
+        };
+        match validated {
             crate::sql::allowlist::SessionWith::Statement(stmt) => Ok(ParsedSql::Statement(stmt)),
             crate::sql::allowlist::SessionWith::DataModifying(v) => {
                 Ok(ParsedSql::DataModifyingCte(v))
             }
+        }
+    }
+
+    /// 検証結果が、明示トランザクションの writer 取得前でも最新の確定カタログで実行される種類か
+    /// （データ変更 `WITH`・`USING PLAN` の SELECT・`EXPLAIN`。Issue #2403）。
+    fn validated_runs_on_latest_catalog(v: &crate::sql::allowlist::SessionWith) -> bool {
+        use crate::sql::allowlist::{SessionWith, Statement};
+        match v {
+            SessionWith::DataModifying(_) => true,
+            SessionWith::Statement(Statement::Explain(_)) => true,
+            SessionWith::Statement(Statement::Select(s)) => s.using_plan().is_some(),
+            SessionWith::Statement(_) => false,
+        }
+    }
+
+    /// [`crate::sql::allowlist::SessionWith`] を [`ParsedSql`] へ束縛する。
+    fn session_with_into_parsed(v: crate::sql::allowlist::SessionWith) -> ParsedSql {
+        match v {
+            crate::sql::allowlist::SessionWith::Statement(stmt) => ParsedSql::Statement(stmt),
+            crate::sql::allowlist::SessionWith::DataModifying(v) => ParsedSql::DataModifyingCte(v),
         }
     }
 
@@ -6729,6 +6800,7 @@ impl EngineCore {
         &self,
         prepared: &PreparedSql,
         values: &[Option<Vec<u8>>],
+        read_snap: Option<&redb::ReadTransaction>,
     ) -> Result<ParsedSql, crate::sql::allowlist::SqlSurfaceError> {
         if values.len() != prepared.param_count as usize {
             return Err(crate::sql::allowlist::SqlSurfaceError::invalid_input(
@@ -6822,7 +6894,11 @@ impl EngineCore {
             &kinds,
             &prepared.typed_positions,
         )?;
-        let mut parsed = self.parse_tokens(substituted)?;
+        // `read_snap` が `Some` なら（writer 取得前の明示トランザクションの Bind。Issue #2403）、
+        // 再 parse の検証・ビュー展開を `BEGIN` 時点のスナップショットのカタログで行い、
+        // 簡易クエリ経路（`execute_sql_in_txn`）と検証の参照時点を揃える。
+        let substituted = Self::normalize_row_count_clauses(substituted)?;
+        let mut parsed = self.parse_tokens_r(substituted, None, read_snap)?;
         attach_public_qualified(
             &mut parsed,
             &prepared.public_qualified,
@@ -6839,7 +6915,18 @@ impl EngineCore {
         prepared: &PreparedSql,
         values: &[Option<Vec<u8>>],
     ) -> Result<ParsedSql, crate::sql::allowlist::SqlSurfaceError> {
-        self.bind_prepared_unscrubbed(prepared, values)
+        self.bind_prepared_snap(prepared, values, None)
+    }
+
+    /// [`Self::bind_prepared`] の読み取りスナップショット指定版（Issue #2403）。
+    /// `read_snap` が `Some` の間は再 parse の検証・ビュー展開をそのスナップショットのカタログで行う。
+    pub(crate) fn bind_prepared_snap(
+        &self,
+        prepared: &PreparedSql,
+        values: &[Option<Vec<u8>>],
+        read_snap: Option<&redb::ReadTransaction>,
+    ) -> Result<ParsedSql, crate::sql::allowlist::SqlSurfaceError> {
+        self.bind_prepared_unscrubbed(prepared, values, read_snap)
             .map_err(|e| match prepared.resolution_tenant.as_deref() {
                 Some(t) => self.scrub_error_for_tenant(t, e),
                 None => e,
@@ -7599,7 +7686,7 @@ impl EngineCore {
         let parsed = {
             let _session_tz_scope = session_time_zone_scope(session);
             let resolver = self.schema_resolver(ctx);
-            self.parse_tokens_gated(tokens, session, Some(&resolver))?
+            self.parse_tokens_gated(tokens, session, Some(&resolver), None)?
         };
         // 一時カタログに対する細かいゲートは上の parse で通過済みのため、粗いゲートを持たない
         // 内部版を呼ぶ（TABLE-44・Issue #1681）。
@@ -7697,7 +7784,19 @@ impl EngineCore {
                     return Err(crate::sql::allowlist::SqlSurfaceError::NoActiveSqlTransaction);
                 }
                 let resolver = self.schema_resolver(ctx);
-                self.parse_tokens_gated(tokens, session, Some(&resolver))
+                // 明示トランザクションの writer 取得前は、読み取り文の検証・ビュー展開を
+                // `BEGIN` 時点のスナップショットのカタログで行う（Issue #2403）。
+                let read_snap = if txn.status()
+                    == crate::sql::transaction::TransactionStatus::InTransaction
+                {
+                    match txn.read_source()? {
+                        crate::sql::transaction::TxnReadSource::BeginSnapshot(snap) => Some(snap),
+                        _ => None,
+                    }
+                } else {
+                    None
+                };
+                self.parse_tokens_gated(tokens, session, Some(&resolver), read_snap)
             })();
             match parsed {
                 Ok(parsed) => parsed,
@@ -8323,6 +8422,7 @@ impl EngineCore {
     ) -> Result<crate::sql::SqlOutcome, crate::sql::allowlist::SqlSurfaceError> {
         use crate::sql::allowlist::SqlSurfaceError;
         use crate::sql::cursor::CursorStatement;
+        use crate::sql::transaction::TxnReadSource;
 
         match stmt {
             CursorStatement::Declare { name, query } => {
@@ -8334,11 +8434,27 @@ impl EngineCore {
                 // （基底テーブル＋ビュー由来述語。RLS は後段の実行経路が参照
                 // セッション自身の `ctx` で暗黙適用する）が適用される。
                 // `table` はビュー展開後の基底テーブル名。
-                let (inner, _table) = crate::sql::cursor::validate_declare_inner(
-                    query,
-                    &self.storage,
-                    self.nesting_limits,
-                )?;
+                // 検証のカタログ引き先は実行の読み取り源（`BEGIN` 時点のスナップショット／共有
+                // write txn／確定状態）と一致させる（Issue #2403。同時 DDL でも検証と実行が食い違わない）。
+                let (inner, _table) = match txn.read_source()? {
+                    TxnReadSource::BeginSnapshot(snap) => {
+                        crate::sql::cursor::validate_declare_inner(
+                            query,
+                            &crate::catalog::ViewWriteSnapshot::over(snap),
+                            self.nesting_limits,
+                        )?
+                    }
+                    TxnReadSource::Writer(w) => crate::sql::cursor::validate_declare_inner(
+                        query,
+                        &crate::catalog::ViewWriteSnapshot::over(w),
+                        self.nesting_limits,
+                    )?,
+                    TxnReadSource::Committed => crate::sql::cursor::validate_declare_inner(
+                        query,
+                        &self.storage,
+                        self.nesting_limits,
+                    )?,
+                };
                 let registry = txn.cursors_mut().ok_or_else(|| SqlSurfaceError::Internal {
                     detail: "internal error".to_string(),
                 })?;
@@ -8347,30 +8463,35 @@ impl EngineCore {
                 // する（PR #1049 レビュー指摘 codex P1 対応。
                 // `execute_cursor_inner_query` のドキュメント参照）。
                 let remaining_bytes = registry.remaining_bytes();
-                // 自トランザクションが未 commit の変更を持つ間（dirty テーブルあり）は
-                // 共有書き込みトランザクションを読み取り源にして内側 SELECT を実行し、
-                // 未 commit の変更を反映する（Issue #1179。キャッシュは使われない）。
-                // 変更がなければ従来どおり確定済みスナップショットで実行する。
-                let outcome = if txn.dirty_tables()?.is_empty() {
-                    let read_txn = self.begin_read_txn()?;
-                    self.execute_cursor_inner_query(
+                // 読み取り源は [`SessionTransaction::read_source`] の三分岐（SQL-19・SQL-31・
+                // Issue #2403）。writer 取得前は `BEGIN` 時点のスナップショット（DECLARE は
+                // 結果を具体化するので、取得前に宣言したカーソルは BEGIN 時点を保つ）、
+                // 取得後で dirty ありは共有 write txn（Issue #1179）、変更なしは文ごとの確定状態。
+                let outcome = match txn.read_source()? {
+                    TxnReadSource::BeginSnapshot(snap) => self.execute_cursor_inner_query(
                         ctx,
                         session,
                         &inner,
                         remaining_bytes,
-                        &read_txn,
-                    )?
-                } else {
-                    let write_txn = txn.write_txn().ok_or_else(|| SqlSurfaceError::Internal {
-                        detail: "internal error".to_string(),
-                    })?;
-                    self.execute_cursor_inner_query(
+                        snap,
+                    )?,
+                    TxnReadSource::Writer(write_txn) => self.execute_cursor_inner_query(
                         ctx,
                         session,
                         &inner,
                         remaining_bytes,
                         write_txn,
-                    )?
+                    )?,
+                    TxnReadSource::Committed => {
+                        let read_txn = self.begin_read_txn()?;
+                        self.execute_cursor_inner_query(
+                            ctx,
+                            session,
+                            &inner,
+                            remaining_bytes,
+                            &read_txn,
+                        )?
+                    }
                 };
                 let result = match outcome {
                     crate::sql::SqlOutcome::Query(result) => result,
@@ -8414,10 +8535,11 @@ impl EngineCore {
 
     /// 明示トランザクション内の読み取り系文（`Active` のときのみ呼ばれる）。
     ///
-    /// 自トランザクションが未 commit の変更を持たない（dirty テーブルなし）間は、
-    /// BEGIN 時点の確定済みスナップショットに対する通常の読み取り経路
-    /// （[`Self::execute_validated_in_session`]。キャッシュ利用可。単一ライタにより
-    /// スナップショットは BEGIN 時点と一致する）へ委譲する。変更を持つ間は、
+    /// 読み取り源は [`crate::sql::transaction::SessionTransaction::read_source`] の三分岐
+    /// （SQL-19・SQL-31・Issue #2403）。writer 取得前は `BEGIN` 時点のスナップショットを
+    /// [`Self::execute_read_statement`] へ渡す（キャッシュ利用可）。writer 取得後で dirty なしの間は
+    /// 通常の読み取り経路（[`Self::execute_validated_in_session`]。permit 保持中は確定状態が
+    /// 取得時点と一致する）へ委譲する。変更を持つ間は、
     /// 共有書き込みトランザクションを読み取り源（[`crate::storage::read_source::ReadSource`]）
     /// にして同じ実行本体（[`Self::execute_read_statement`]。RLS・束縛・実行は
     /// autocommit と共通）を呼び、自トランザクションの未 commit の変更を反映する
@@ -8443,21 +8565,42 @@ impl EngineCore {
         stmt: crate::sql::allowlist::Statement,
     ) -> Result<crate::sql::SqlOutcome, crate::sql::allowlist::SqlSurfaceError> {
         use crate::sql::allowlist::Statement;
+        use crate::sql::transaction::TxnReadSource;
 
         // SQL-43（Issue #1531）: 定数式 SELECT はテーブルを読まないため、dirty
         // テーブルの有無に関わらず autocommit と同じ実行本体へ直接委譲する。
         if matches!(stmt, Statement::ConstSelect(_)) {
             return self.execute_validated_in_session(ctx, session, stmt);
         }
-        let dirty = txn.dirty_tables()?;
-        if dirty.is_empty() {
-            return self.execute_validated_in_session(ctx, session, stmt);
-        }
-        let write_txn =
-            txn.write_txn()
-                .ok_or_else(|| crate::sql::allowlist::SqlSurfaceError::Internal {
-                    detail: "internal error".to_string(),
-                })?;
+        let write_txn = match txn.read_source()? {
+            // writer 取得前は `BEGIN` 時点のスナップショットで読む（SQL-19・SQL-31・Issue #2403）。
+            // `USING PLAN` の SELECT と `EXPLAIN` は自前で確定スナップショットを開く既存経路のまま
+            // （設計記録 explicit-transaction.md の既知の残り）。
+            TxnReadSource::BeginSnapshot(snap) => {
+                return match stmt {
+                    Statement::Select(ref v) if v.using_plan().is_some() => {
+                        self.execute_validated_in_session(ctx, session, stmt)
+                    }
+                    Statement::Explain(_) => self.execute_validated_in_session(ctx, session, stmt),
+                    Statement::Select(_)
+                    | Statement::Aggregate(_)
+                    | Statement::Scan(_)
+                    | Statement::SetOperation(_)
+                    | Statement::Join(_)
+                    | Statement::BufferedView(_) => {
+                        self.execute_read_statement(ctx, session, stmt, snap)
+                    }
+                    _ => Err(crate::sql::allowlist::SqlSurfaceError::Internal {
+                        detail: "unexpected statement in transactional read path".to_string(),
+                    }),
+                };
+            }
+            // writer 保持中で変更なし: permit により確定状態は取得時点と一致する。
+            TxnReadSource::Committed => {
+                return self.execute_validated_in_session(ctx, session, stmt);
+            }
+            TxnReadSource::Writer(w) => w,
+        };
         match stmt {
             Statement::Select(ref v) if v.using_plan().is_some() => {
                 self.execute_validated_with_dict(ctx, session, stmt, Some(write_txn))
@@ -8581,7 +8724,109 @@ impl EngineCore {
                 }
             };
         }
-        self.describe_parsed_in_session(session, parsed)
+        // writer 取得前の明示トランザクションは、Bind の再検証・実行と同じ `BEGIN` 時点のスナップショットで
+        // 結果列を決める（Issue #2403。最新カタログで決めると Execute の列比較と食い違う）。
+        let snap = Self::describe_snapshot(txn)?;
+        Self::coarse_temp_gate(session, parsed)?;
+        self.describe_parsed_in_session_snap(session, parsed, false, &[], &self.result_limits, snap)
+    }
+
+    /// [`PreparedSql::dummy_parsed`] の構築（Parse 時のダミー値置換 → 構造検証 parse）を、`BEGIN` 時点の
+    /// スナップショットのカタログで行い直す（Issue #2403）。ビュー展開・参照先の検証が Bind と同じ時点になる。
+    /// 一時表の経路・読み取り文以外（DML・DDL・`COPY` 等）は再 parse せず `None`（従来の `dummy_parsed`）。
+    fn reparse_dummy_with_snapshot(
+        &self,
+        session: &crate::sql::mode::SessionState,
+        prepared: &PreparedSql,
+        snap: &redb::ReadTransaction,
+    ) -> Result<Option<ParsedSql>, crate::sql::allowlist::SqlSurfaceError> {
+        let is_read = matches!(
+            prepared.dummy_parsed,
+            ParsedSql::Statement(_) | ParsedSql::LockingSelect(_)
+        );
+        if !is_read || !matches!(prepared.route, temp_route::PreparedRoute::Plain) {
+            return Ok(None);
+        }
+        let kinds: Vec<crate::sql::params::ParamLiteralKind> = prepared
+            .param_types
+            .iter()
+            .map(|t| t.literal_kind())
+            .collect();
+        let dummy_tokens = crate::sql::params::substitute_dummy_typed(&prepared.tokens, &kinds);
+        let positions: Vec<usize> = prepared
+            .tokens
+            .iter()
+            .enumerate()
+            .filter(|(_, t)| matches!(t, crate::sql::lexer::Token::Param(_)))
+            .map(|(i, _)| i)
+            .collect();
+        let _guard = crate::sql::const_expr::defer_param_value_errors(positions);
+        let _session_tz_scope = session_time_zone_scope(session);
+        let tokens = Self::normalize_row_count_clauses(dummy_tokens)?;
+        let mut parsed = self.parse_tokens_r(tokens, None, Some(snap))?;
+        attach_public_qualified(
+            &mut parsed,
+            &prepared.public_qualified,
+            prepared.create_public,
+        );
+        Ok(Some(parsed))
+    }
+
+    /// 明示トランザクションが writer 取得前なら `BEGIN` 時点のスナップショットを返す（Describe 用。
+    /// `Idle`・`Failed`・writer 取得後は `None`＝最新の確定済みスナップショット）。
+    fn describe_snapshot<'t>(
+        txn: &'t crate::sql::transaction::SessionTransaction<'_>,
+    ) -> Result<Option<&'t redb::ReadTransaction>, crate::sql::allowlist::SqlSurfaceError> {
+        if txn.status() != crate::sql::transaction::TransactionStatus::InTransaction {
+            return Ok(None);
+        }
+        match txn.read_source()? {
+            crate::sql::transaction::TxnReadSource::BeginSnapshot(snap) => Ok(Some(snap)),
+            _ => Ok(None),
+        }
+    }
+
+    /// [`Self::describe_prepared_in_session`] の明示トランザクション対応版（拡張クエリの Describe 'S' が
+    /// パラメータ付きの文に対して呼ぶ。Issue #2403）。writer 取得前は `BEGIN` 時点のスナップショットで
+    /// 結果列を決め、Bind・Execute と読み取り源を揃える。
+    pub fn describe_prepared_in_txn(
+        &self,
+        session: &crate::sql::mode::SessionState,
+        txn: &crate::sql::transaction::SessionTransaction<'_>,
+        prepared: &PreparedSql,
+    ) -> Result<Option<Vec<crate::sql::exec::ColumnMeta>>, crate::sql::allowlist::SqlSurfaceError>
+    {
+        let result = (|| {
+            let snap = Self::describe_snapshot(txn)?;
+            Self::check_prepared_for_session(session, prepared)?;
+            // カーソル文は txn の開いているカーソルから列を引く（従来の経路）。
+            if matches!(prepared.dummy_parsed, ParsedSql::Cursor(_)) {
+                return self.describe_parsed_in_txn_unscrubbed(
+                    session,
+                    txn,
+                    &prepared.dummy_parsed,
+                );
+            }
+            // writer 取得前の読み取り文は、Parse 時（最新カタログ）に展開済みの `dummy_parsed` を使わず、
+            // Bind と同じく `BEGIN` 時点のカタログで再検証・ビュー展開した文から列を導く（Issue #2403）。
+            let reparsed = match snap {
+                Some(snap) => self.reparse_dummy_with_snapshot(session, prepared, snap)?,
+                None => None,
+            };
+            let parsed = reparsed.as_ref().unwrap_or(&prepared.dummy_parsed);
+            self.describe_parsed_in_session_snap(
+                session,
+                parsed,
+                prepared.order_by_distance_literal_is_param,
+                &prepared.where_equality_dummy_flags,
+                &self.result_limits,
+                snap,
+            )
+        })();
+        result.map_err(|e| match session.resolution_tenant() {
+            Some(t) => self.scrub_error_for_tenant(t, e),
+            None => e,
+        })
     }
 
     /// `describe_parsed_in_txn_unscrubbed` の公開入口。判定順序・エラー契約・結果は同関数と同一で、出口でだけ
@@ -8832,13 +9077,15 @@ impl EngineCore {
     /// 導出し、再帰項の束縛・列整合・型・照合の検査を [`crate::sql::recursive_eval::describe`] で行う。
     /// Describe の結果列導出と、Execute のアンカー実行前の事前検証が共有する唯一の実装で、
     /// 静的に決まるエラー（`42804`・`0A000` 等）がデータ依存の実行エラー（アンカー本文の除算エラー等）より
-    /// 先に決まり、両経路で同じエラーになる。
+    /// 先に決まり、両経路で同じエラーになる。`snap` が `Some` なら基底表のスキーマ解決をそのスナップショット
+    /// （明示トランザクションの `BEGIN` 時点。Issue #2403）で行い、実行と同じ読み取り源に揃える。
     fn describe_recursive_cte(
         &self,
         session: &crate::sql::mode::SessionState,
         validated: &crate::sql::allowlist::ValidatedRecursiveCte,
         skip_vector_literal_validation: bool,
         limits: &crate::result_limits::ResultLimits,
+        snap: Option<&redb::ReadTransaction>,
     ) -> Result<Vec<crate::sql::exec::ColumnMeta>, crate::sql::allowlist::SqlSurfaceError> {
         // 定数アンカーの `current_schema()` 系は、通常の定数 SELECT が張る検索パスのスコープ外で実行
         // されるため未対応（Execute の実行本体の前提）。Describe と Execute が同じ `0A000` になるよう
@@ -8854,19 +9101,20 @@ impl EngineCore {
         }
         let anchor_parsed = ParsedSql::Statement((*validated.anchor).clone());
         let anchor_columns = self
-            .describe_parsed_in_session_impl(
+            .describe_parsed_in_session_snap(
                 session,
                 &anchor_parsed,
                 skip_vector_literal_validation,
                 &[],
                 limits,
+                snap,
             )?
             .ok_or_else(|| crate::sql::allowlist::SqlSurfaceError::Internal {
                 detail: "internal error".to_string(),
             })?;
         let mut table_names = Vec::new();
         recursive_cte_tables(validated, &mut table_names);
-        let (_read_txn, schemas) = self.read_txn_with_schemas(&table_names)?;
+        let schemas = self.describe_table_schemas(snap, &table_names)?;
         let join_limits = crate::sql::join::JoinLimits::from_settings(
             self.group_by_limits,
             self.join_limits,
@@ -8878,6 +9126,56 @@ impl EngineCore {
             &schemas,
             session.udfs(),
             &join_limits,
+        )
+    }
+
+    /// Describe 用のスキーマ解決（Issue #2403）。`snap` が `Some` なら明示トランザクションの
+    /// `BEGIN` 時点スナップショット（Bind の再検証・実行と同じ読み取り源）から、`None` なら最新の
+    /// 確定済みスナップショットから引く。拡張クエリの Describe が列型を Execute と同じ時点で決める。
+    fn describe_table_schema(
+        &self,
+        snap: Option<&redb::ReadTransaction>,
+        table_name: &str,
+    ) -> Result<crate::catalog::TableSchema, crate::sql::allowlist::SqlSurfaceError> {
+        match snap {
+            Some(snap) => table_schema_in(snap, table_name),
+            None => Ok(self.read_txn_with_schema(table_name)?.1),
+        }
+    }
+
+    /// [`Self::describe_table_schema`] の複数テーブル版（単一スナップショット上で解決する）。
+    fn describe_table_schemas(
+        &self,
+        snap: Option<&redb::ReadTransaction>,
+        table_names: &[String],
+    ) -> Result<
+        std::collections::HashMap<String, crate::catalog::TableSchema>,
+        crate::sql::allowlist::SqlSurfaceError,
+    > {
+        match snap {
+            Some(snap) => table_schemas_in(snap, table_names),
+            None => Ok(self.read_txn_with_schemas(table_names)?.1),
+        }
+    }
+
+    /// [`Self::describe_parsed_in_session_snap`] の読み取り源なし版（従来の入口。最新の確定済み
+    /// スナップショットで解決する）。
+    fn describe_parsed_in_session_impl(
+        &self,
+        session: &crate::sql::mode::SessionState,
+        parsed: &ParsedSql,
+        skip_vector_literal_validation: bool,
+        dummy_equality_flags: &[bool],
+        limits: &crate::result_limits::ResultLimits,
+    ) -> Result<Option<Vec<crate::sql::exec::ColumnMeta>>, crate::sql::allowlist::SqlSurfaceError>
+    {
+        self.describe_parsed_in_session_snap(
+            session,
+            parsed,
+            skip_vector_literal_validation,
+            dummy_equality_flags,
+            limits,
+            None,
         )
     }
 
@@ -8897,13 +9195,14 @@ impl EngineCore {
     /// （`declarative_filter`）を Describe 時点では省略する。`$n` を含まない
     /// 通常の Describe（`describe_parsed_in_session` 経由）では常に空スライスに
     /// なり、実リテラルは従来どおり必ず検証される。
-    fn describe_parsed_in_session_impl(
+    fn describe_parsed_in_session_snap(
         &self,
         session: &crate::sql::mode::SessionState,
         parsed: &ParsedSql,
         skip_vector_literal_validation: bool,
         dummy_equality_flags: &[bool],
         limits: &crate::result_limits::ResultLimits,
+        snap: Option<&redb::ReadTransaction>,
     ) -> Result<Option<Vec<crate::sql::exec::ColumnMeta>>, crate::sql::allowlist::SqlSurfaceError>
     {
         use crate::sql::allowlist::{DeleteStatement, Statement, ValidatedUpdateForm};
@@ -8923,22 +9222,24 @@ impl EngineCore {
         match parsed {
             // SQL-38・Issue #1957: 行ロック句の有無で結果列は変わらない。句を除いた文と同じ
             // RowDescription を返す（副作用なし。実行は暫定ゲートで拒否）。
-            ParsedSql::LockingSelect(locking) => self.describe_parsed_in_session_impl(
+            ParsedSql::LockingSelect(locking) => self.describe_parsed_in_session_snap(
                 session,
                 &ParsedSql::Statement(locking.statement().clone()),
                 skip_vector_literal_validation,
                 dummy_equality_flags,
                 limits,
+                snap,
             ),
             // TABLE-44・Issue #1684: 一時表の文は一時コアが結果列を導出する。
             ParsedSql::SessionRouted(routed) if routed.is_persistent() => {
                 routed.require_current(session)?;
-                self.describe_parsed_in_session_impl(
+                self.describe_parsed_in_session_snap(
                     session,
                     routed.inner(),
                     skip_vector_literal_validation,
                     dummy_equality_flags,
                     limits,
+                    snap,
                 )
             }
             ParsedSql::SessionRouted(routed) => self.describe_temp_routed(
@@ -9208,7 +9509,7 @@ impl EngineCore {
                 }]))
             }
             ParsedSql::Statement(Statement::Aggregate(validated)) => {
-                let (_read_txn, schema) = self.read_txn_with_schema(validated.table_name())?;
+                let schema = self.describe_table_schema(snap, validated.table_name())?;
                 let bound = crate::sql::parser::bind_aggregate_with_dummy_flags(
                     validated,
                     &schema,
@@ -9220,7 +9521,7 @@ impl EngineCore {
                 )?))
             }
             ParsedSql::Statement(Statement::Scan(validated)) => {
-                let (_read_txn, schema) = self.read_txn_with_schema(validated.table_name())?;
+                let schema = self.describe_table_schema(snap, validated.table_name())?;
                 let bound = crate::sql::parser::bind_scan_with_dummy_flags(
                     validated,
                     &schema,
@@ -9240,7 +9541,7 @@ impl EngineCore {
             ParsedSql::Statement(Statement::SetOperation(validated)) => {
                 let mut table_names = Vec::new();
                 crate::sql::set_op::collect_branch_tables(&validated.tree, &mut table_names);
-                let (_read_txn, schemas) = self.read_txn_with_schemas(&table_names)?;
+                let schemas = self.describe_table_schemas(snap, &table_names)?;
                 let columns = crate::sql::set_op::describe_columns(
                     &schemas,
                     &validated.tree,
@@ -9258,7 +9559,7 @@ impl EngineCore {
             // アームと同じ方針）。
             ParsedSql::Statement(Statement::Join(validated)) => {
                 let table_names = crate::sql::join::collect_join_tables(validated);
-                let (_read_txn, mut schemas) = self.read_txn_with_schemas(&table_names)?;
+                let mut schemas = self.describe_table_schemas(snap, &table_names)?;
                 let mut cte_ids = crate::sql::join::CteIdColumns::new();
                 // SQL-62・Issue #1861: CTE 入力は本文を実行せず、結果列だけを導出して Execute と同じ
                 // 関数で合成スキーマにする（Describe は本体を実行しない契約）。
@@ -9271,6 +9572,7 @@ impl EngineCore {
                             *k,
                             skip_vector_literal_validation,
                             limits,
+                            snap,
                         )?;
                         let (schema, id_columns) =
                             crate::sql::join::cte_schema(rel.table(), &cols)?;
@@ -9307,6 +9609,7 @@ impl EngineCore {
                     validated,
                     skip_vector_literal_validation,
                     limits,
+                    snap,
                 )?;
                 Ok(Some(columns))
             }
@@ -9314,11 +9617,14 @@ impl EngineCore {
             // （本文は実行せずに）導出し、外側の射影だけを適用する。
             ParsedSql::Statement(Statement::BufferedView(validated)) => {
                 Self::check_buffered_outer_limit(validated, limits)?;
-                check_buffered_view_collations(&self.begin_read_txn()?, validated)?;
+                match snap {
+                    Some(snap) => check_buffered_view_collations(snap, validated)?,
+                    None => check_buffered_view_collations(&self.begin_read_txn()?, validated)?,
+                }
                 let body_parsed = ParsedSql::Statement((*validated.body).clone());
                 // 本文は永続化済みで `$n` を含まないため、外側の `$n` 置換に
                 // 位置対応するダミーフラグは渡さない（本文の ENUM 検証を省略しない）。
-                let body_columns = self.describe_parsed_in_session_impl(
+                let body_columns = self.describe_parsed_in_session_snap(
                     session,
                     &body_parsed,
                     skip_vector_literal_validation,
@@ -9334,6 +9640,7 @@ impl EngineCore {
                             crate::result_limits::ResultLimits::default()
                         }
                     },
+                    snap,
                 )?;
                 match body_columns {
                     Some(cols) => {
@@ -9362,7 +9669,14 @@ impl EngineCore {
                 Ok(Some(bound.columns()))
             }
             ParsedSql::Statement(Statement::Select(validated)) => {
-                let (_read_txn, schema) = self.read_txn_with_schema(&validated.table_name)?;
+                // `USING PLAN` の実行は自前で確定スナップショットを開く既存経路のため、Describe も
+                // 最新側に揃える（読み取り源を `BEGIN` 時点へ切り替えない）。
+                let snap = if validated.using_plan().is_some() {
+                    None
+                } else {
+                    snap
+                };
+                let schema = self.describe_table_schema(snap, &validated.table_name)?;
                 if validated.using_plan().is_some() {
                     // `USING PLAN`: LLM 展開・再埋め込み（`plan_query`・
                     // `Embedder::embed_batch`）は行わず、投影列の束縛のみを行う
@@ -10306,7 +10620,14 @@ impl EngineCore {
                 // 静的に決まるエラー（アンカーの束縛・再帰項の束縛・列数・型・照合・未対応型）は、アンカーを
                 // 実行する前に Describe と同じ経路で検査する（データ依存の実行エラーに覆われない。
                 // Describe／Execute で同じエラー）。
-                self.describe_recursive_cte(&*session, &validated, false, &limits)?;
+                // 実行と同じ読み取り源（確定済みスナップショットのとき。書き込みトランザクション由来は最新側）。
+                self.describe_recursive_cte(
+                    &*session,
+                    &validated,
+                    false,
+                    &limits,
+                    read_txn.snapshot(),
+                )?;
                 // 重複除去版（`UNION`）はアンカー候補へ結果行数上限を適用しない（捨てる重複は行数に
                 // 数えない契約。上限は重複除去後に `recursive_eval::execute` が判定する）。候補生成は
                 // ハード上限と各走査の入力上限で抑えられる。
@@ -10582,7 +10903,7 @@ impl EngineCore {
     }
 
     /// CTE slot `k` の結果列（列名リスト適用後）を、本文を実行せずに導出する（Describe 用。
-    /// [`Self::evaluate_cte_slot`] の結果列と一致する）。
+    /// [`Self::evaluate_cte_slot`] の結果列と一致する）。`snap` は基底表のスキーマ解決の読み取り源。
     fn describe_cte_slot(
         &self,
         session: &crate::sql::mode::SessionState,
@@ -10590,6 +10911,7 @@ impl EngineCore {
         k: usize,
         skip_vector_literal_validation: bool,
         limits: &crate::result_limits::ResultLimits,
+        snap: Option<&redb::ReadTransaction>,
     ) -> Result<Vec<crate::sql::exec::ColumnMeta>, crate::sql::allowlist::SqlSurfaceError> {
         use crate::sql::allowlist::{CteSlotSource, SqlSurfaceError, Statement};
         let slot = cte.slots.get(k).ok_or_else(|| SqlSurfaceError::Internal {
@@ -10597,12 +10919,13 @@ impl EngineCore {
         })?;
         let raw = match &slot.source {
             CteSlotSource::Scan(scan) => self
-                .describe_parsed_in_session_impl(
+                .describe_parsed_in_session_snap(
                     session,
                     &ParsedSql::Statement(Statement::Scan((**scan).clone())),
                     skip_vector_literal_validation,
                     &[],
                     limits,
+                    snap,
                 )?
                 .ok_or_else(|| SqlSurfaceError::Internal {
                     detail: "internal error".to_string(),
@@ -10614,6 +10937,7 @@ impl EngineCore {
                     *from,
                     skip_vector_literal_validation,
                     limits,
+                    snap,
                 )?;
                 // Execute（`evaluate_cte_slot`）と同じ明示 `LIMIT` の範囲検査を Describe でも行い、
                 // Describe 成功・Execute だけ上限違反になる乖離を作らない（Issue #1862）。
@@ -12672,11 +12996,39 @@ impl EngineCore {
         let resolver = self.schema_resolver(ctx);
         let copy_tokens =
             crate::sql::relation_name::tokenize_resolved_with(sql, false, Some(&resolver))?;
-        let stmt = crate::sql::allowlist::validate_copy_tokens(
-            &copy_tokens,
-            &self.storage,
-            self.ledger_mode,
-        )
+        // 読み取りの `COPY TO` は実行の読み取り源と同じ時点のカタログで検証する（Issue #2403。
+        // 同時 DDL で検証と実行が食い違わない）。`COPY FROM`（書き込み）は従来どおり最新のカタログ。
+        let stmt = if crate::sql::allowlist::is_copy_to_statement(&copy_tokens) {
+            match txn.read_source()? {
+                crate::sql::transaction::TxnReadSource::BeginSnapshot(snap) => {
+                    crate::sql::allowlist::validate_copy_tokens(
+                        &copy_tokens,
+                        &crate::catalog::ViewWriteSnapshot::over(snap),
+                        self.ledger_mode,
+                    )
+                }
+                crate::sql::transaction::TxnReadSource::Writer(w) => {
+                    crate::sql::allowlist::validate_copy_tokens(
+                        &copy_tokens,
+                        &crate::catalog::ViewWriteSnapshot::over(w),
+                        self.ledger_mode,
+                    )
+                }
+                crate::sql::transaction::TxnReadSource::Committed => {
+                    crate::sql::allowlist::validate_copy_tokens(
+                        &copy_tokens,
+                        &self.storage,
+                        self.ledger_mode,
+                    )
+                }
+            }
+        } else {
+            crate::sql::allowlist::validate_copy_tokens(
+                &copy_tokens,
+                &self.storage,
+                self.ledger_mode,
+            )
+        }
         .map_err(|e| self.reclassify_matview_write_error(e))?;
         if let crate::sql::allowlist::CopyStatement::To(v) = &stmt {
             // 通常の読み取り文と同じ文実行前チェック（文数・持続時間の上限。
@@ -12686,15 +13038,19 @@ impl EngineCore {
             // 自トランザクションが未 commit の変更を持つ間は、共有書き込み
             // トランザクションを読み取り源にして走査する（他の読み取り文と同じ
             // 方針。[`Self::read_only_in_active_txn`] 参照）。
-            if !txn.dirty_tables()?.is_empty() {
-                let write_txn = txn.write_txn().ok_or_else(|| {
-                    crate::sql::allowlist::SqlSurfaceError::Internal {
-                        detail: "internal error".to_string(),
-                    }
-                })?;
-                let schema = table_schema_in(write_txn, v.inner.table_name())?;
-                let result = self.run_copy_to_scan(write_txn, ctx, session, &schema, v)?;
-                return Ok(CopyPlan::To(v.format, result, v.options.clone()));
+            // writer 取得前は `BEGIN` 時点のスナップショットで走査する（SQL-19・Issue #2403）。
+            match txn.read_source()? {
+                crate::sql::transaction::TxnReadSource::BeginSnapshot(snap) => {
+                    let schema = table_schema_in(snap, v.inner.table_name())?;
+                    let result = self.run_copy_to_scan(snap, ctx, session, &schema, v)?;
+                    return Ok(CopyPlan::To(v.format, result, v.options.clone()));
+                }
+                crate::sql::transaction::TxnReadSource::Writer(write_txn) => {
+                    let schema = table_schema_in(write_txn, v.inner.table_name())?;
+                    let result = self.run_copy_to_scan(write_txn, ctx, session, &schema, v)?;
+                    return Ok(CopyPlan::To(v.format, result, v.options.clone()));
+                }
+                crate::sql::transaction::TxnReadSource::Committed => {}
             }
         }
         self.begin_copy_validated(ctx, session, stmt, txn.txn_start_micros())

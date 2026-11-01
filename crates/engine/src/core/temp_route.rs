@@ -343,6 +343,7 @@ impl EngineCore {
             &hits,
             LedgerMode::CompareOnlyWithoutLedger,
             resolver,
+            None,
         )?;
         // 索引 DDL はカタログを引かず構造だけを検証するため、`hits` では判定できない。
         // 対象の表が一時表なら一時コアで実行し、そうでなければ（一時表の名前が現れる永続表の索引は）
@@ -394,7 +395,7 @@ impl EngineCore {
         session: &SessionState,
         resolver: Option<crate::sql::relation_name::SchemaResolver<'_>>,
     ) -> Result<ParsedSql, SqlSurfaceError> {
-        let parsed = self.parse_tokens_r(tokens, resolver)?;
+        let parsed = self.parse_tokens_r(tokens, resolver, None)?;
         if let (ParsedSql::DropIndex(stmt), Some(store)) = (&parsed, session.temp_rows_arc()) {
             let is_temp_index = store
                 .core()?
@@ -776,6 +777,48 @@ impl EngineCore {
         prepared: &super::PreparedSql,
         values: &[Option<Vec<u8>>],
     ) -> Result<ParsedSql, SqlSurfaceError> {
+        self.bind_prepared_in_session_snap(session, prepared, values, None)
+    }
+
+    /// [`Self::bind_prepared_in_session`] の明示トランザクション対応版（拡張クエリの Bind。Issue #2403）。
+    /// writer 取得前のトランザクションでは、永続側の再 parse（検証・ビュー展開）を `BEGIN` 時点の
+    /// スナップショットのカタログで行い、簡易クエリ経路と検証の参照時点を揃える。
+    pub fn bind_prepared_in_txn(
+        &self,
+        session: &SessionState,
+        txn: &crate::sql::transaction::SessionTransaction<'_>,
+        prepared: &super::PreparedSql,
+        values: &[Option<Vec<u8>>],
+    ) -> Result<ParsedSql, SqlSurfaceError> {
+        let read_snap = if txn.status() == crate::sql::transaction::TransactionStatus::InTransaction
+        {
+            match txn.read_source()? {
+                crate::sql::transaction::TxnReadSource::BeginSnapshot(snap) => Some(snap),
+                _ => None,
+            }
+        } else {
+            None
+        };
+        self.bind_prepared_in_session_snap(session, prepared, values, read_snap)
+    }
+
+    /// 明示トランザクションが writer 取得前（`BEGIN` 時点のスナップショットで読む）か。
+    /// wire 層が、Parse 時の解決結果を使い回さず Bind で再検証すべきかの判定に使う（Issue #2403）。
+    pub fn txn_reads_begin_snapshot(txn: &crate::sql::transaction::SessionTransaction<'_>) -> bool {
+        txn.status() == crate::sql::transaction::TransactionStatus::InTransaction
+            && matches!(
+                txn.read_source(),
+                Ok(crate::sql::transaction::TxnReadSource::BeginSnapshot(_))
+            )
+    }
+
+    fn bind_prepared_in_session_snap(
+        &self,
+        session: &SessionState,
+        prepared: &super::PreparedSql,
+        values: &[Option<Vec<u8>>],
+        read_snap: Option<&redb::ReadTransaction>,
+    ) -> Result<ParsedSql, SqlSurfaceError> {
         let temp = session.temp_tables();
         match &prepared.route {
             PreparedRoute::Temp(store) => {
@@ -812,7 +855,7 @@ impl EngineCore {
                     &prepared.tokens,
                     &prepared.qualified_positions,
                 )?;
-                let parsed = self.bind_prepared(prepared, values)?;
+                let parsed = self.bind_prepared_snap(prepared, values, read_snap)?;
                 // `COPY`（Issue #1760）は Execute で元 SQL を現在のカタログへ再解決する
                 // （`begin_copy_temp`）ため、Bind 後に一時表が作成・削除されると宛先が永続表から
                 // 一時表（または逆）へ化ける。一時カタログの世代つきで包み、Execute 前の

@@ -37,6 +37,7 @@ mod sql29_subquery_scalar;
 mod sql30_window;
 mod sql31_deferred_writer;
 mod sql31_deferred_writer_regression;
+mod sql31_snapshot_switch;
 mod sql31_transaction;
 mod sql31_txn_dml;
 mod sql31_txn_file_insert_using_plan;

@@ -1092,7 +1092,7 @@ impl Storage {
     /// matview 定義を既存の read txn（同一スナップショット）から取得する（無ければ `None`）。
     /// ビュー書き込みの書き換え（TABLE-43）が指紋と同じスナップショットで解決するために使う。
     pub(crate) fn materialized_view_definition_in(
-        read_txn: &redb::ReadTransaction,
+        read_txn: &impl crate::storage::read_source::ReadSource,
         name: &str,
     ) -> Result<Option<MaterializedViewDef>> {
         if name.starts_with('#') {
@@ -1105,7 +1105,8 @@ impl Storage {
             Err(redb::TableError::TableDoesNotExist(_)) => return Ok(None),
             Err(e) => return Err(e.into()),
         };
-        match table.get(name)? {
+        let found = table.get(name)?;
+        match found {
             Some(g) => Ok(Some(decode_materialized_view_def(name, g.value())?)),
             None => Ok(None),
         }

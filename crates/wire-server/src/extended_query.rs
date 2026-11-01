@@ -1743,7 +1743,7 @@ fn handle_describe_body(
                 PreparedStatement::Parameterized { prepared, slots } => {
                     param_oids = slots.iter().map(|s| s.oid).collect();
                     engine
-                        .describe_prepared_in_session(session, prepared)
+                        .describe_prepared_in_txn(session, txn, prepared)
                         .map_err(HandlerError::Sql)?
                 }
                 // WIRE-15・TASK-218: `describe_parsed_in_txn` へ切り替え、
@@ -1754,9 +1754,15 @@ fn handle_describe_body(
                 // 一時表を持つセッション（または一時表の経路で準備した文）では、一時カタログの
                 // 変化を検出するためセッション対応の検証を通す（カーソル文は従来の経路）。
                 PreparedStatement::Parsed { parsed, prepared } => {
-                    if needs_session_revalidation(session, parsed) {
+                    // writer 取得前の明示トランザクションは、Parse 時（最新カタログ）に展開済みの `parsed` を
+                    // 使わず、Bind と同じ `BEGIN` 時点のカタログで再検証した文から列を導く（Issue #2403）。
+                    // カーソル文は開いているカーソルから列を引く従来の経路のまま。
+                    if needs_session_revalidation(session, parsed)
+                        || (EngineCore::txn_reads_begin_snapshot(txn)
+                            && !matches!(parsed, ParsedSql::Cursor(_)))
+                    {
                         engine
-                            .describe_prepared_in_session(session, prepared)
+                            .describe_prepared_in_txn(session, txn, prepared)
                             .map_err(HandlerError::Sql)?
                     } else {
                         engine
@@ -1956,7 +1962,7 @@ fn handle_bind_body(
                 let _session_tz_scope =
                     engine::datetime::SessionTimeZoneScope::enter(session.time_zone().clone());
                 engine
-                    .bind_prepared_in_session(session, prepared, &decoded)
+                    .bind_prepared_in_txn(session, txn, prepared, &decoded)
                     .map_err(HandlerError::Sql)?
             };
             let columns = engine
@@ -1977,11 +1983,14 @@ fn handle_bind_body(
                 // セッションでも世代つきの包みを作る（Bind 後に作られた同名の一時表への化けを
                 // Execute 前に `0A000` で拒否する。Issue #1760）。
                 || matches!(parsed, ParsedSql::Copy(_))
+                // writer 取得前の明示トランザクションは、Parse 時（最新カタログ）の解決結果を使い回さず、
+                // Bind で `BEGIN` 時点のカタログにより再検証する（Issue #2403）。
+                || EngineCore::txn_reads_begin_snapshot(txn)
             {
                 let _session_tz_scope =
                     engine::datetime::SessionTimeZoneScope::enter(session.time_zone().clone());
                 engine
-                    .bind_prepared_in_session(session, prepared, &[])
+                    .bind_prepared_in_txn(session, txn, prepared, &[])
                     .map_err(HandlerError::Sql)?
             } else {
                 parsed.clone()

@@ -426,9 +426,22 @@ Failed { session_at_begin: SessionState, expired: bool } }`）。`ActiveTxn` は
   - 暗黙トランザクション（WIRE-16）は従来どおり開始時に writer を取る（スナップショットは取得後に開く。#2401）。
   - 取得の前後の回帰（read-your-writes・COMMIT までの隔離・ROLLBACK 後のキャッシュ非汚染・ファイル形
     `INSERT`・`USING PLAN`・`EXPLAIN`・`COPY FROM`・`setval`）は #2402 のテストで固定済み（SQL-19・SQL-31）。
-  - **暫定の読み取りの意味**: スナップショット（`read_snapshot`）の結線は #2403 のため、writer 取得前の
-    読み取りは文ごとの確定済み状態を見る。後続の `40001` 判定にとっては、読みが `BEGIN` 時点より新しい
-    側へずれるだけで、偽陽性側にしか倒れず偽陰性は生まない。
+  - **読み取りの意味（#2403 で結線済み）**: 読み取り源は `SessionTransaction::read_source` の三分岐で選ぶ。
+    writer 取得前は `read_snapshot`（`BEGIN` 時点）、取得後で dirty ありは共有 write txn（取得時点の
+    最新＋自分の変更）、取得後で変更なしは文ごとの確定状態（permit 保持中は取得時点と一致）。
+    取得後の述語形 `UPDATE`／`DELETE` の述語評価は、取得時点の write txn で行うため、`BEGIN` 後・取得前に
+    他セッションが commit した行も対象に入る。`dirty_tables` の比較基準は最新の確定状態のままにする
+    （`read_snapshot` 基準にすると取得前に他セッションが書いた表まで dirty になり、キャッシュ回避と
+    遅延 FK 検査の範囲が不要に広がるため）。
+  - **既知の残り**: 取得前の `USING PLAN` の SELECT・`EXPLAIN` は自前で確定スナップショットを開く
+    既存経路のまま文ごとの確定状態を見る（`BEGIN` 時点への一般化は辞書スナップショットの構築変更を伴い
+    #2402 と競合するため見送り）。読みが `BEGIN` 時点より新しい側へずれるだけで、`40001` 判定には
+    偽陽性側にしか倒れず偽陰性は生まない。
+  - **検証のカタログ引き先（#2403 レビュー対応）**: 明示 Tx 内の `DECLARE` と `COPY TO` の検証は、実行と同じ
+    読み取り源（`BEGIN` 時点のスナップショット／共有 write txn／確定状態）でカタログを引く。
+    `COPY FROM` は書き込みのため最新のカタログで検証する。文の字句・構文解析の入口（`parse_tokens_gated`
+    系。Parse メッセージ等 Tx 状態を持たない入口と共有）は今も最新の確定カタログで解決し、実行段が
+    スナップショットのスキーマで再束縛する。食い違いは `42P01` 等の fail-closed になる（誤読はしない）。
   - DoS 面: `BEGIN` だけで黙る接続が単一ライタを占有できなくなる。一方、読み取りだけの Tx は
     `ReadTransaction` を最大 `max_duration` 保持し、その間は redb がページを回収できない（有界。
     期限切れ処理がスナップショットを解放する）。
@@ -522,7 +535,7 @@ Failed { session_at_begin: SessionState, expired: bool } }`）。`ActiveTxn` は
 > 改訂（#2396・1a）: 以下の「単一ライタにより BEGIN 時点と厳密に一致する」「BEGIN 以降カタログと
 > 世代は誰にも変えられない」という根拠は、writer を保持している間（取得後）にしか成り立たない。
 > writer 取得前は「`BEGIN` で開いた確定済み `ReadTransaction` に固定する」、取得後は「取得時点の
-> 最新状態＋自トランザクションの未 commit 変更を読む」（#2403）に差し替わる。`USING PLAN` の
+> 最新状態＋自トランザクションの未 commit 変更を読む」（#2403 で実装済み。三分岐は 4 節）に差し替わった。`USING PLAN` の
 > 世代の事前・事後照合も同じ考え方で書き直す。
 
 - 自トランザクションが未 commit の変更を持たない（`SessionTransaction::dirty_tables`
