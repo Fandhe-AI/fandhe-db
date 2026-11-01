@@ -5743,6 +5743,12 @@ fn delete_row_impl(
             // 次元検証は不要だが、テーブル不存在の判定・並行 DDL との整合のため
             // `insert_row`/`update_row` と同じ前段を通す。
             let schema = require_table_schema_write(write_txn, table)?;
+            // RLS-13（Issue #2278）: `row_security = off` は対象行の有無に関わらず `42501` で拒否する。
+            crate::sql::policy_eval::reject_row_security_off_in_txn(
+                write_txn,
+                ctx.tenant_id(),
+                table,
+            )?;
             needs_fk_removed_pre_image = schema.primary_key().is_some()
                 || !schema.unique_constraints().is_empty()
                 || crate::catalog::referencing_foreign_keys_in_txn(write_txn, table)?
@@ -6618,6 +6624,13 @@ fn delete_rows_where_impl<E>(
         let (candidate_ids, schema, trigger_plan) = {
             let schema =
                 require_table_schema_write_any_identity(write_txn, table).map_err(dml_write_err)?;
+            // RLS-13（Issue #2278）: `row_security = off` は 0 行の文でも行の探索より前に `42501` で拒否する。
+            crate::sql::policy_eval::reject_row_security_off_in_txn(
+                write_txn,
+                ctx.tenant_id(),
+                table,
+            )
+            .map_err(dml_write_err)?;
             if let Some(expected) = expected_schema {
                 if expected != &schema {
                     return Err(dml_write_err(CatalogError::Invalid(

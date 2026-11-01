@@ -206,3 +206,33 @@ fn rls13_row_security_off_rejects_zero_row_writes() {
         "UPDATE plain SET name = 'x' WHERE false",
     );
 }
+
+/// RLS-13: `row_security = off` は SELECT・DELETE（述語形・id 形・0 行の文を含む）も行の探索より前に
+/// `42501` で拒否する（空結果・部分削除を黙って返さない）。RLS 無効な表は成功する。
+#[test]
+fn rls13_row_security_off_rejects_reads_and_deletes() {
+    let (core, _g) = new_core("rls13-rs-off-read-delete");
+    let mut s = SessionState::default();
+    s.allow_ddl();
+    for sql in [
+        "CREATE TABLE t (id BIGINT PRIMARY KEY, name TEXT)",
+        "CREATE TABLE plain (id BIGINT PRIMARY KEY, name TEXT)",
+        "INSERT INTO t (id, name) VALUES (1, 'a')",
+        "INSERT INTO plain (id, name) VALUES (1, 'a')",
+        "ALTER TABLE t ENABLE ROW LEVEL SECURITY",
+        "CREATE POLICY p ON t FOR ALL USING (false)",
+    ] {
+        ok(&core, "alice", &mut s, sql);
+    }
+    ok(&core, "alice", &mut s, "SET row_security = off");
+    for sql in [
+        "SELECT id FROM t",
+        "DELETE FROM t WHERE false",
+        "DELETE FROM t WHERE id = 1",
+        "DELETE FROM t WHERE name = 'a'",
+    ] {
+        assert_eq!(code(&core, "alice", &mut s, sql), "42501", "{sql}");
+    }
+    ok(&core, "alice", &mut s, "SELECT id FROM plain");
+    ok(&core, "alice", &mut s, "DELETE FROM plain WHERE id = 1");
+}
