@@ -788,6 +788,12 @@ production コード（`crates/wire-server/src/`）は無変更・テスト専�
   開始自体が `55P03` で `Idle` のまま 1 文も実行されない（`tests/core_misc/wire16_implicit_txn.rs`）、
   待機上限での `55P03`（`tests/write_lock_wait.rs`）、wire 越しの複数文メッセージ
   （`crates/wire-server/tests/write_lock_wait_parity.rs`）。
+- wire 越しの開始時取得と状態バイトの固定（Issue #2410。SQL-31・WIRE-16・WIRE-19。本番コードの
+  変更は無い）: 先頭が読み取りの暗黙 Tx は先頭文の `RowDescription` より前に `55P03` になり、
+  書き込みが最後の複数文メッセージ（順次実行）との対照で取得時点を判別する。待機中は応答が届かず、
+  取得後にスナップショットを開く（`write_lock_wait_parity.rs`）。遅延取得後の `ReadyForQuery` の
+  状態バイト（writer を持たない `Active`・最初の書き込みの `55P03`／`40001`・`BEGIN` を含む複数文・
+  拡張クエリ・期限切れ）は `crates/wire-server/tests/wire19_deferred_writer_status.rs`。
 - 先頭文（または唯一の文）が 0 行 DELETE の場合の再送判定（Issue #1403。実装済み）:
   明示トランザクション内の DELETE は autocommit と同じフォーム関数へ `WriteTarget::InTxn`
   を渡し、0 行でも台帳を共有 write txn へ記録して `mark_written` する。このため従来の
