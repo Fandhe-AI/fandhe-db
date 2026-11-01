@@ -136,16 +136,25 @@ fn unresolvable() -> SqlSurfaceError {
     }
 }
 
-/// `scope`（テナント）の表 `table_key` に利用者ポリシーが適用されるか（有効化状態のみで判定する）。
+/// `scope`（テナント）の表 `table_key` に利用者ポリシーが適用されるか。判定は書き込みと同じ単一の判定点
+/// （`policy_applicability::decide`）で行い、RLS 有効かつ `row_security = off` のときは行の探索・返却より前に
+/// `42501`（`RowSecurityOffRejected`）で拒否する（部分的な結果を黙って返さない。RLS-13・Issue #2278）。
 /// 所有者の扱いは暫定で常に `false`（モジュールドキュメント参照）。
 pub(crate) fn policies_apply<R: ReadSource>(
     src: &R,
     ctx: &PolicyContext,
     table_key: &str,
 ) -> Result<bool, SqlSurfaceError> {
+    use crate::sql::policy_applicability::PolicyDecision;
     let state =
         row_security_state_in_txn(src, ctx.tenant_id(), table_key).map_err(|_| unresolvable())?;
-    Ok(state.user_policies_apply(false))
+    match crate::sql::policy_eval::user_policies_decision_for_write(state) {
+        PolicyDecision::Skip => Ok(false),
+        PolicyDecision::Apply => Ok(true),
+        PolicyDecision::RejectRowSecurityOff => Err(SqlSurfaceError::RowSecurityOffRejected {
+            table: table_key.to_string(),
+        }),
+    }
 }
 
 /// ポリシーを適用できない経路の入口に置く。適用表なら固定文言の `0A000`、そうでなければ何もしない。

@@ -15,13 +15,14 @@
 //! （「ポリシーなし」と「式なしポリシー」を区別する）。テナント境界はこの外側で常に適用され、本ファイルの
 //! 合成は境界の内側で狭めるだけで、広げる経路を持たない。
 //!
-//! 暫定（#2278 まで）: ロール・所有者・`BYPASSRLS` の機構が無いため、全セッションを「所有者でも
-//! `BYPASSRLS` でもない」として扱う（[`user_policies_apply_for_write`]。狭める側）。
+//! 暫定（ロール #1971・所有者 #2236 まで）: ロール・所有者・`BYPASSRLS` の機構が無いため、全セッションを「所有者でも
+//! `BYPASSRLS` でもない」として扱う（[`user_policies_decision_for_write`]。狭める側）。
 
 use crate::catalog::policy::{PolicyCommand, PolicyDef};
 use crate::catalog::row_security::RowSecurityState;
 use crate::catalog::{CatalogError, TableSchema};
 use crate::sql::index_predicate::map_predicate_eval_error;
+use crate::sql::policy_applicability::{current_row_security, decide, PolicyActor, PolicyDecision};
 use crate::sql::view_check::CompiledLayer;
 use crate::tenant::TenantWriteError;
 
@@ -66,10 +67,18 @@ impl PolicyCheckKind {
     }
 }
 
-/// 利用者定義ポリシーを書き込みに適用するか。判定は 1 か所に閉じる（#2278 がここだけを差し替える）。
-/// 暫定では全セッションを非所有者・`BYPASSRLS` なしとして扱う。
-pub(crate) fn user_policies_apply_for_write(state: RowSecurityState) -> bool {
-    state.user_policies_apply(false)
+/// 利用者定義ポリシーを書き込みに適用するかの判定（単一の判定点 `policy_applicability::decide` へ委譲）。
+/// 暫定では全セッションを非所有者・`BYPASSRLS` なしとして扱い、`row_security` は文の実行区間に束縛された
+/// セッションの現在値（`RowSecurityScope`。スコープ外は on）を使う。RLS 有効かつ off は
+/// `RejectRowSecurityOff`（呼び出し元が行を書く前に `42501` で拒否する。RLS-13・Issue #2278）。
+pub(crate) fn user_policies_decision_for_write(state: RowSecurityState) -> PolicyDecision {
+    let actor = PolicyActor {
+        current_role_id: None,
+        session_role_id: None,
+        bypass_rls: false,
+        row_security: current_row_security(),
+    };
+    decide(state, &actor, false)
 }
 
 /// 合成済みの 1 検査（1 文につき種類ごとに 1 回コンパイルする）。
@@ -172,6 +181,25 @@ impl CompiledPolicyChecks {
     }
 }
 
+/// 書き込みの開始時点（行の探索・書き込みより前）に、`row_security = off` の拒否だけを判定する。
+/// 対象行が 0 件の `UPDATE`・`INSERT ... SELECT`・`COPY` でも、RLS 有効な表なら `42501` で拒否して
+/// 結果を件数に依存させない（RLS-13・Issue #2278）。RLS が無効な表・適用外は何もしない（費用は
+/// 有効化状態の get 1 回）。各書き込み入口がスキーマ取得の直後に呼ぶ。
+pub(crate) fn reject_row_security_off_in_txn(
+    write_txn: &redb::WriteTransaction,
+    tenant_id: &str,
+    table: &str,
+) -> Result<(), TenantWriteError> {
+    let state =
+        crate::catalog::row_security::row_security_state_in_txn(write_txn, tenant_id, table)?;
+    match user_policies_decision_for_write(state) {
+        PolicyDecision::RejectRowSecurityOff => Err(TenantWriteError::RowSecurityOffRejected {
+            table: table.to_string(),
+        }),
+        PolicyDecision::Skip | PolicyDecision::Apply => Ok(()),
+    }
+}
+
 /// write txn の中で表 `table` の有効化状態とポリシーを読み、`kind` の検査をコンパイルする。適用しない
 /// （RLS 無効・暫定の所有者扱いで対象外）ときは `None`。`tenant_id` はサーバー側導出の値で、他テナントの
 /// 定義・状態は引けない。RLS が無効な表の費用は状態の get 1 回だけ。
@@ -184,8 +212,16 @@ pub(crate) fn compile_in_txn(
 ) -> Result<Option<CompiledPolicyChecks>, TenantWriteError> {
     let state =
         crate::catalog::row_security::row_security_state_in_txn(write_txn, tenant_id, table)?;
-    if !user_policies_apply_for_write(state) {
-        return Ok(None);
+    match user_policies_decision_for_write(state) {
+        PolicyDecision::Skip => return Ok(None),
+        PolicyDecision::Apply => {}
+        // `row_security = off` で適用されるはずの文は、コンパイル時点（行を書く前）に文全体を `42501` で
+        // 拒否する。ポリシーの素通りには使えない（fail-closed）。
+        PolicyDecision::RejectRowSecurityOff => {
+            return Err(TenantWriteError::RowSecurityOffRejected {
+                table: table.to_string(),
+            })
+        }
     }
     let policies = crate::catalog::policy::list_policies_in_txn(write_txn, tenant_id, table)?;
     CompiledPolicyChecks::compile(table, schema, &policies, kind).map(Some)

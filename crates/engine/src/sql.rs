@@ -213,6 +213,7 @@ mod truncate_restart_identity_tests;
 pub mod udf_ddl;
 // TRIGGER DDL（TABLE-45・Issue #1722）。
 pub mod grant_ddl;
+pub mod policy_applicability;
 pub mod policy_ddl;
 pub mod role_ddl;
 pub(crate) mod routine_fold;
@@ -391,6 +392,13 @@ pub enum SqlOutcome {
     ///
     /// **Issue #1715 で追加した破壊的変更（BREAKING CHANGE）**: variant を追加した。
     SetSearchPath {
+        reset: bool,
+    },
+    /// `SET [SESSION] row_security ...`／`RESET row_security` の成功応答（タグは `SET`・`RESET`。
+    /// RLS-13・Issue #2278）。新しい値は `SessionState::row_security` が保持する。
+    ///
+    /// **Issue #2278 で追加した破壊的変更（BREAKING CHANGE）**: variant を追加した。
+    SetRowSecurity {
         reset: bool,
     },
     /// `SHOW timezone`／`SHOW TIME ZONE` の応答（列名 `TimeZone`・text の 1 行。CommandComplete

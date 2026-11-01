@@ -164,6 +164,8 @@ pub(super) fn update_rows_with_triggers(
     plan: &RowTriggerPlan<'_>,
     writes: &TriggerWriteHandle<'_>,
 ) -> Result<TriggeredDml, TenantWriteError> {
+    // 対象行が 0 件でも `row_security = off` の拒否を文の開始時点で適用する（RLS-13・Issue #2278）。
+    crate::sql::policy_eval::reject_row_security_off_in_txn(write_txn, ctx.tenant_id(), table)?;
     if spec
         .row_overrides
         .is_some_and(|o| o.len() != candidate_ids.len())

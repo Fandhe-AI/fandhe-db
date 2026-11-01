@@ -63,6 +63,7 @@ fn assert_describe_matches_execute(core: &EngineCore, ctx: &PolicyContext, sql: 
         SqlOutcome::SetSearchMode(_)
         | SqlOutcome::SetTimeZone
         | SqlOutcome::SetSearchPath { .. }
+        | SqlOutcome::SetRowSecurity { .. }
         | SqlOutcome::Show(_)
         | SqlOutcome::CreateFunction { .. }
         | SqlOutcome::DropFunction(_)

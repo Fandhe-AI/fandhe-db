@@ -249,6 +249,12 @@ pub struct SessionState {
     /// `Box<str>`: `SessionState` を抱える `sql::transaction::TxnState` の enum 内サイズ差（clippy
     /// `large_enum_variant`）を増やさないため、`String` より小さい表現にする。
     resolution_tenant: Option<Box<str>>,
+    /// `row_security = off` か（RLS-13。既定は `false` = on）。`#[derive(Default)]` で既定が on に
+    /// なるよう、否定形で持つ。利用者ポリシーの適用可否だけに作用し、テナント境界には作用しない
+    /// （判定は [`crate::sql::policy_applicability::decide`]）。ROLLBACK／abort の巻き戻しで取り消される。
+    row_security_off: bool,
+    /// `RESET row_security`／`SET row_security TO DEFAULT` の戻り先が off か（起動パラメータ由来）。
+    row_security_reset_off: bool,
     /// 現在のロール ID（#1971 以降で認証層が認証成功後に 1 回だけ設定する契約。SQL 文から書き換える
     /// 経路は持たない）。`None`（現状の全セッション）は「BYPASSRLS なし・非所有者」として扱う
     /// （利用者ポリシーを適用する＝狭める側。fail-closed）。
@@ -335,6 +341,28 @@ impl SessionState {
     pub fn apply_startup_time_zone(&mut self, tz: crate::datetime::SessionTimeZone) {
         self.time_zone_reset = tz.clone();
         self.time_zone = tz;
+    }
+
+    /// セッションの `row_security`（既定 on = `true`。RLS-13）。
+    pub fn row_security(&self) -> bool {
+        !self.row_security_off
+    }
+
+    /// 検証済みの `row_security` を現在値にする（`core.rs` の `SetRowSecurity` 実行腕が値の検証後にのみ呼ぶ）。
+    pub(crate) fn set_row_security(&mut self, on: bool) {
+        self.row_security_off = !on;
+    }
+
+    /// `RESET row_security`／`SET row_security TO DEFAULT` の実体。現在値を reset 値へ戻す。
+    pub(crate) fn reset_row_security(&mut self) {
+        self.row_security_off = self.row_security_reset_off;
+    }
+
+    /// StartupMessage の `row_security` を現在値と reset 値の両方へ設定する。wire-server の handshake が
+    /// 認証成功後に 1 回だけ呼ぶ契約（SQL 文経由の経路は持たない）。
+    pub fn apply_startup_row_security(&mut self, on: bool) {
+        self.row_security_off = !on;
+        self.row_security_reset_off = !on;
     }
 
     /// 現在のロール ID（未紐付けは `None`）。

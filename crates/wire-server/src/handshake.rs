@@ -438,6 +438,7 @@ fn parse_startup_params(params_body: &[u8]) -> Result<StartupParams> {
     let mut pos = 0usize;
     let mut user: Option<String> = None;
     let mut time_zone: Option<String> = None;
+    let mut row_security: Option<String> = None;
     loop {
         let key = read_c_string(params_body, &mut pos)?;
         if key.is_empty() {
@@ -466,11 +467,27 @@ fn parse_startup_params(params_body: &[u8]) -> Result<StartupParams> {
                 return Err(HandshakeError::Protocol("TimeZone parameter is too long"));
             }
             time_zone = Some(value.to_string());
+        } else if key.eq_ignore_ascii_case("row_security") {
+            // RLS-13・Issue #2278: StartupMessage の `row_security`。TimeZone と同じく長さと重複だけを
+            // ここで検査し、解釈は認証成功後に行う。重複は fail-closed で拒否する。
+            if row_security.is_some() {
+                return Err(HandshakeError::Protocol("duplicate row_security parameter"));
+            }
+            if value.len() > MAX_ROW_SECURITY_SETTING_LEN {
+                return Err(HandshakeError::Protocol(
+                    "row_security parameter is too long",
+                ));
+            }
+            row_security = Some(value.to_string());
         }
         // その他のパラメータは意図的に読み捨てる（ポインタ: WIRE-2）。
     }
     let user = user.ok_or(HandshakeError::Protocol("missing required parameter: user"))?;
-    Ok(StartupParams { user, time_zone })
+    Ok(StartupParams {
+        user,
+        time_zone,
+        row_security,
+    })
 }
 
 /// StartupMessage から取り出す値（TASK-67・WIRE-2。`TimeZone` は TABLE-33・Issue #1575）。
@@ -480,7 +497,12 @@ fn parse_startup_params(params_body: &[u8]) -> Result<StartupParams> {
 struct StartupParams {
     user: String,
     time_zone: Option<String>,
+    /// `row_security` の生テキスト（未検証。`None` は既定の on。RLS-13・Issue #2278）。
+    row_security: Option<String>,
 }
+
+/// StartupMessage の `row_security` 値の最大バイト長（真偽の語は短いので小さな上限で足りる）。
+const MAX_ROW_SECURITY_SETTING_LEN: usize = 16;
 
 /// PasswordMessage（'p'）を読み、末尾 null を除いた生パスワードバイト列を返す。
 ///
@@ -1607,6 +1629,7 @@ fn run_authenticated_session<S: WireStream>(
     let StartupParams {
         user: username,
         time_zone: startup_time_zone,
+        row_security: startup_row_security,
     } = params;
     let outcome = match authenticate(stream, store, &username) {
         Ok(o) => o,
@@ -1651,6 +1674,22 @@ fn run_authenticated_session<S: WireStream>(
                 let msg = crate::error_response::encode_fatal(
                     ErrorClass::InvalidParameterValue,
                     engine::datetime::INVALID_TIME_ZONE_DETAIL,
+                )
+                .map_err(|_| io::Error::other("failed to encode ErrorResponse"))?;
+                return stream.write_all(&msg);
+            }
+        }
+    }
+    // RLS-13・Issue #2278: StartupMessage の `row_security` も認証成功後に解決する。真偽として読めない値は
+    // AuthenticationOk の後に FATAL `22023`（固定文言・値を含めない）で切断する（黙って読み捨てると、
+    // off を期待するクライアントが部分的な結果を無言で受け取るため。fail-closed）。
+    if let Some(text) = &startup_row_security {
+        match engine::sql::allowlist::parse_row_security_bool(text) {
+            Some(on) => session.apply_startup_row_security(on),
+            None => {
+                let msg = crate::error_response::encode_fatal(
+                    ErrorClass::InvalidParameterValue,
+                    engine::sql::allowlist::INVALID_ROW_SECURITY_DETAIL,
                 )
                 .map_err(|_| io::Error::other("failed to encode ErrorResponse"))?;
                 return stream.write_all(&msg);

@@ -213,6 +213,57 @@
   常に「所有者ではない」として適用する（ENABLE 済みならすべてのセッションにポリシーが適用され、FORCE の有無で結果は
   変わらない）。行の見え方の PG 17 照合（4 状態 x 所有者/非所有者）のうち所有者側は #2278 へ申し送る
 
+## 対象ロール・BYPASSRLS・row_security（#2278）
+
+実装は段階を分けた。本節は **段 1（ロール DDL・ロールカタログに依存しない機構）** の確定事項で、段 2（`TO` の名前付きロール、
+メンバーシップの継承、ロール属性 `BYPASSRLS`）は #1961（ロールのカタログ）と #2277（WITH CHECK の判定点）のマージ後に行う。
+
+### 判定点（段 1）
+
+- 単一の判定は `sql::policy_applicability::decide`。順序は PG 17 の `check_enable_rls` と同じ（無効化 → `BYPASSRLS` → 所有者かつ
+  `FORCE` なし → `row_security = off` → 適用）。`row_security = off` は適用されるはずの文だけを `RejectRowSecurityOff`
+  （`42501`）にし、素通りには使えない。読み取り側（#2276）・書き込み側（#2277）の判定点はここを呼ぶ（第 2 の判定系を作らない）
+- `Skip` で外れるのは利用者ポリシーだけで、テナント境界（`PolicyContext`・`ImplicitRlsHook`・`RlsSafetyNet`）は常に適用される
+- ロール・`row_security` は `SessionState` に持ち、判断 A のとおり `PolicyContext` にもキャッシュキーにも混ぜない。判定は実行時
+
+### 確定事項（安全側）
+
+| 項目 | 内容 |
+| ---- | ---- |
+| ロール ID の無いセッション | 現状の全セッション・NoSQL は「`BYPASSRLS` なし・非所有者」。利用者ポリシーを適用する（狭める側）。初期ロールの `BYPASSRLS` は #2238 の初期ロール投入が属性で満たす。接続利用者を一律 `BYPASSRLS` 扱いにする逆向きは採らない（fail-open になる） |
+| 所有者 | 所有者表（#2236）が入るまで `is_owner` は常に false |
+| `BYPASSRLS` の継承 | しない（現在のロール自身の属性だけを見る。PG 17 と同じ） |
+| ロール ID の設定 | 認証層が認証成功後に 1 回だけ `SessionState::bind_role_ids` を呼ぶ契約。SQL 文から書き換える経路は無い（呼び出し元は #1971） |
+| メンバーシップ探索（段 2） | 循環検出と深さ上限を置き、超過は文を `54000` 系で拒否する。黙ってロールを落とさない（RESTRICTIVE の対象が外れて広がるのを防ぐ） |
+
+### `row_security` の受理（段 1）
+
+- `SET [SESSION] row_security {TO|=} <値>`・`RESET row_security`・`SHOW row_security`。値は on/off/true/false/yes/no/1/0
+  （大文字小文字無視。識別子・文字列・数値）と `DEFAULT`。不正値は `22023`（固定文言・値を含めない）、`SET LOCAL` は `0A000`
+- PG との差: 一意な接頭辞形（`of` 等）は受理しない（受理を狭める側）。SQL 文の `SET` は ROLLBACK／abort で取り消される（PG と同じ）
+- StartupMessage の `row_security` は認証成功後に解釈して初期値・reset 値にする。不正値は FATAL `22023` で切断、重複は `08P01`。
+  従来の黙った読み捨ては、`off` を期待するクライアントが部分的な結果を無言で受け取るため解消した。`options`（`-c row_security=off`）は未対応
+- NoSQL（HTTP）は変更できない（既定 on・ロール未紐付け）
+
+### 段 1 で結線していないもの・申し送り
+
+- 書き込み側（#2277 の WITH CHECK）は結線済み: `policy_eval::compile_in_txn` が `decide` を呼び、RLS 有効かつ
+  `row_security = off` の表への INSERT・UPDATE・UPSERT・COPY は行を書く前に `42501` で拒否する。`row_security` は
+  `SessionState` を持たない検査点へ、文の実行区間の RAII（`RowSecurityScope`。`session_time_zone_scope` と同じ張り方。
+  スコープ外の NoSQL・内部書き込みは on）で渡す
+- 読み取り側（#2276）も結線済み: `sql::row_policy::policies_apply` が書き込み側と同じ判定（`decide`）へ接続され、
+  RLS 有効かつ `row_security = off` の表は行を読む前に文全体を拒否する。`COPY ... TO`（`COPY (SELECT ...) TO` を含む）は
+  入口（`begin_copy`・`begin_copy_in_txn`）でセッション値を `RowSecurityScope` に束縛するため、自動コミット・明示
+  トランザクションのどちらでも off が反映される。残作業はロール・所有者・`BYPASSRLS` 属性の実値の供給（下の各 Issue）のみ
+- 拒否の文言は PG と同じ `query would be affected by row-level security policy for table "..."`（`42501`）で、専用 variant
+  `SqlSurfaceError::RowSecurityOffRejected`・`TenantWriteError::RowSecurityOffRejected` が表す（`WITH CHECK` 違反の
+  `RowSecurityPolicyViolation` や DDL 権限の `InsufficientPrivilege` とは別。新しい `wire_code` は作らない）。表名は呼び出し
+  テナント自身の表だけで、RLS 状態を自テナントのカタログから読んだ後にのみ拒否が起きるため、他テナントの存在は漏れない
+- `CREATE/ALTER ROLE ... BYPASSRLS` の受理と指定・変更の権限規則（42501）・`DROP ROLE` とポリシー `TO` の依存（`2BP01`）: #1962・#1963
+- 認証主体とロール ID の紐付け: #1971。所有者: #2236。初期ロールへの `BYPASSRLS`: #2238
+- 段 2: ロール属性 `BYPASSRLS`、実効ロール集合（INHERIT 真の付与のみ・循環と上限）、`PolicyRole` へのロール ID 保存（再利用されない ID）、
+  `TO` 句の名前解決（不在と他テナントは同一の `42704`）、ポリシー選択への反映、`BYPASSRLS` 付与規則
+
 ## sub-issue への申し送りと未決事項
 
 | Issue | 本書で担当する節・判断 |

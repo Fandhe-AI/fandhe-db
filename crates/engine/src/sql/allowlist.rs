@@ -1300,6 +1300,13 @@ pub enum SqlSurfaceError {
         policy: Option<String>,
         using_expression: bool,
     },
+    /// `row_security = off` のセッションが、RLS 有効な自テナントの表を読み書きしようとした拒否
+    /// （RLS-13・Issue #2278）。`42501`（`ErrorClass::ForbiddenTenantMismatch` を再利用）。部分的な
+    /// 結果を黙って返さないための拒否で、文言は PostgreSQL と同じ
+    /// `query would be affected by row-level security policy for table "..."`。保持するのは
+    /// 呼び出しテナント自身の表名だけ（拒否は自テナントの表の RLS 状態を読んだ後にのみ起きるため、
+    /// 他テナントの存在は漏れない）。`WITH CHECK` 違反（[`Self::RowSecurityPolicyViolation`]）とは別物。
+    RowSecurityOffRejected { table: String },
     /// `FETCH`／`CLOSE` が参照したカーソル名が、現在のトランザクション内に
     /// 存在しない（WIRE-15・TASK-218）。他セッション所有のカーソル名・単に
     /// 存在しない名前のいずれも区別しない固定文言のみを保持し、カーソル名
@@ -1499,6 +1506,20 @@ impl SqlSurfaceError {
                 Self::InvalidFunctionDefinition { detail: f(&detail) }
             }
             Self::AmbiguousFunction { detail } => Self::AmbiguousFunction { detail: f(&detail) },
+            // RLS-13（Issue #2277・#2278）: 表名を持つ拒否も、SCHEMA 配下の表の内部キー
+            // （`#<id>.<name>`）を `<schema>.<name>` へ戻す対象に含める（TABLE-27・ADR D2）。
+            Self::RowSecurityOffRejected { table } => {
+                Self::RowSecurityOffRejected { table: f(&table) }
+            }
+            Self::RowSecurityPolicyViolation {
+                table,
+                policy,
+                using_expression,
+            } => Self::RowSecurityPolicyViolation {
+                table: f(&table),
+                policy,
+                using_expression,
+            },
             other => other,
         }
     }
@@ -2024,6 +2045,7 @@ impl ClassifiedError for SqlSurfaceError {
             SqlSurfaceError::InsufficientPrivilege
             | SqlSurfaceError::ConflictTargetNotVisible
             | SqlSurfaceError::RowSecurityPolicyViolation { .. }
+            | SqlSurfaceError::RowSecurityOffRejected { .. }
             | SqlSurfaceError::SchemaDependencyForbidden => ErrorClass::ForbiddenTenantMismatch,
             SqlSurfaceError::InvalidCursorName => ErrorClass::InvalidCursorName,
             SqlSurfaceError::NoDataFound => ErrorClass::NoDataFound,
@@ -2376,6 +2398,11 @@ impl std::fmt::Display for SqlSurfaceError {
                 policy.as_deref(),
                 *using_expression,
             )),
+            // PostgreSQL と同じ文言。表名は呼び出しテナント自身の表のみ（他テナントの情報は含めない）。
+            SqlSurfaceError::RowSecurityOffRejected { table } => write!(
+                f,
+                "query would be affected by row-level security policy for table \"{table}\""
+            ),
             // カーソル名・他セッション所有かどうかを一切含めない固定文言
             // （security.md P0。`SqlSurfaceError::InvalidCursorName` ドキュメント
             // 参照）。
@@ -3222,6 +3249,15 @@ pub enum Statement {
     /// `SHOW search_path`（TABLE-27・Issue #1715）。列名 `search_path` の text 1 行を返す。
     /// **#1715 で追加した破壊的変更（BREAKING CHANGE）**: variant 追加。
     ShowSearchPath,
+    /// `SET [SESSION] row_security {TO|=} <bool>`／`RESET row_security`（RLS-13・Issue #2278）。
+    /// 値は構文段で検証済み（不正値は `22023`）。`reset` は `RESET` 由来か（応答タグの出し分け用）。
+    /// **#2278 で追加した破壊的変更（BREAKING CHANGE）**: variant 追加。
+    SetRowSecurity {
+        value: RowSecuritySetting,
+        reset: bool,
+    },
+    /// `SHOW row_security`（RLS-13・Issue #2278）。列名 `row_security` の text 1 行（`on`／`off`）。
+    ShowRowSecurity,
     /// `CREATE FUNCTION <name>(<param>[, <param>...]) AS <expr>`（TASK-79・SQL-9）。
     /// カタログ照会を必要としない（セッションのみに影響するため FROM テーブルの
     /// 存在確認は行わない）。パラメータ名重複・登録済み名との衝突・列参照の禁止
@@ -18987,6 +19023,8 @@ pub(crate) fn require_row_query_statement(
         | Statement::ShowTimeZone
         | Statement::SetSearchPath { .. }
         | Statement::ShowSearchPath
+        | Statement::SetRowSecurity { .. }
+        | Statement::ShowRowSecurity
         | Statement::CreateFunction { .. } => Err(SqlSurfaceError::unsupported(format!(
             "{what} requires a SELECT query"
         ))),
@@ -23645,6 +23683,96 @@ pub(crate) fn is_show_time_zone(tokens: &[Token]) -> bool {
     ok && p.expect_end_of_statement().is_ok()
 }
 
+/// `SET row_security` の値（RLS-13・Issue #2278）。`Default` は reset 値（起動パラメータ由来、無ければ on）。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum RowSecuritySetting {
+    On,
+    Off,
+    Default,
+}
+
+/// `row_security` が不正値のときの固定文言（値を含めない）。
+pub const INVALID_ROW_SECURITY_DETAIL: &str = "parameter \"row_security\" requires a Boolean value";
+
+/// 真偽値の文字列表現（on/off/true/false/yes/no/1/0。大文字小文字無視）。PG の一意な接頭辞形は受理しない
+/// （受理を狭める側。fail-closed）。`row_security` の SET と起動パラメータで共有する。
+pub fn parse_row_security_bool(text: &str) -> Option<bool> {
+    match text.to_ascii_lowercase().as_str() {
+        "on" | "true" | "yes" | "1" => Some(true),
+        "off" | "false" | "no" | "0" => Some(false),
+        _ => None,
+    }
+}
+
+/// 文が `SHOW row_security`（末尾 `;` 可）か。厳密一致のみ真。
+pub(crate) fn is_show_row_security(tokens: &[Token]) -> bool {
+    let mut p = Parser::new(tokens);
+    p.expect_ident_matching("SHOW").is_ok()
+        && p.expect_ident_matching("row_security").is_ok()
+        && p.expect_end_of_statement().is_ok()
+}
+
+/// 文が `SET [SESSION|LOCAL] row_security ...` の頭か。`SET LOCAL` も真にして
+/// [`parse_set_row_security`] が `0A000` で拒否する（`SET LOCAL` を別経路の `42601` へ流さない）。
+/// TimeZone 系の頭判定（`SESSION`・`LOCAL` で真になる）より前に評価する。
+fn is_set_row_security_head(tokens: &[Token]) -> bool {
+    let name_at = |i: usize| matches!(tokens.get(i), Some(Token::Ident(w)) if w.eq_ignore_ascii_case("row_security"));
+    let modifier_at_1 = matches!(tokens.get(1), Some(Token::Ident(w))
+        if w.eq_ignore_ascii_case("SESSION") || w.eq_ignore_ascii_case("LOCAL"));
+    name_at(1) || (modifier_at_1 && name_at(2))
+}
+
+/// `SET [SESSION] row_security {TO|=} {on|off|true|false|yes|no|1|0|DEFAULT}`（RLS-13・Issue #2278）。
+/// `SET LOCAL` は `0A000`、真偽として読めない値は `22023`（値を応答に含めない）。
+fn parse_set_row_security(tokens: &[Token]) -> Result<RowSecuritySetting, SqlSurfaceError> {
+    let invalid = || SqlSurfaceError::InvalidParameterValue {
+        detail: INVALID_ROW_SECURITY_DETAIL,
+    };
+    let mut p = Parser::new(tokens);
+    p.expect_ident_matching("SET")?;
+    if p.peek_ident_matches("LOCAL") {
+        return Err(SqlSurfaceError::FeatureNotSupported {
+            detail: "SET LOCAL is not supported".to_string(),
+        });
+    }
+    if p.peek_ident_matches("SESSION") {
+        p.advance();
+    }
+    p.expect_ident_matching("row_security")?;
+    if p.peek_ident_matches("TO") {
+        p.advance();
+    } else {
+        p.expect_punct('=')?;
+    }
+    let value = match p.advance() {
+        Some(Token::Ident(w)) if w.eq_ignore_ascii_case("DEFAULT") => RowSecuritySetting::Default,
+        Some(Token::Ident(w))
+        | Some(Token::QuotedBoolWord(w))
+        | Some(Token::StringLiteral(w))
+        | Some(Token::Number(w)) => match parse_row_security_bool(w) {
+            Some(true) => RowSecuritySetting::On,
+            Some(false) => RowSecuritySetting::Off,
+            None => return Err(invalid()),
+        },
+        Some(_) => return Err(invalid()),
+        None => {
+            return Err(SqlSurfaceError::unsupported(
+                "expected row_security value".to_string(),
+            ))
+        }
+    };
+    p.expect_end_of_statement()?;
+    Ok(value)
+}
+
+/// 文が `RESET row_security`（末尾 `;` 可）か。
+fn is_reset_row_security(tokens: &[Token]) -> bool {
+    let mut p = Parser::new(tokens);
+    p.expect_ident_matching("RESET").is_ok()
+        && p.expect_ident_matching("row_security").is_ok()
+        && p.expect_end_of_statement().is_ok()
+}
+
 /// 文が `SHOW search_path`（末尾 `;` 可。TABLE-27・Issue #1715）か。他の `SHOW` は従来どおり別経路が
 /// 解析するため厳密一致のみ真にする。
 pub(crate) fn is_show_search_path(tokens: &[Token]) -> bool {
@@ -27044,6 +27172,19 @@ fn validate_sql_tokens_impl(
         },
         // TABLE-27・Issue #1715: `SET [SESSION] search_path` は TimeZone 系の振り分けより先に判定する
         // （`SET SESSION` の 2 語目が TimeZone 系の頭として扱われるため）。他の `SET` の挙動は不変。
+        // RLS-13・Issue #2278: `row_security` も TimeZone 系より先に判定する（`SET SESSION`／`SET LOCAL` の
+        // 2 語目が TimeZone 系の頭として扱われるため）。
+        _ if is_set_statement && is_set_row_security_head(tokens) => {
+            let value = parse_set_row_security(tokens)?;
+            Ok(Statement::SetRowSecurity {
+                value,
+                reset: false,
+            })
+        }
+        _ if is_reset_row_security(tokens) => Ok(Statement::SetRowSecurity {
+            value: RowSecuritySetting::Default,
+            reset: true,
+        }),
         _ if is_set_statement && is_set_search_path_head(tokens) => {
             let value = parse_set_search_path(tokens)?;
             Ok(Statement::SetSearchPath {
@@ -27138,6 +27279,8 @@ fn validate_sql_tokens_impl(
                 | Statement::ShowTimeZone
                 | Statement::SetSearchPath { .. }
                 | Statement::ShowSearchPath
+                | Statement::SetRowSecurity { .. }
+                | Statement::ShowRowSecurity
                 | Statement::CreateFunction { .. }
                 | Statement::Explain(_)
                 // Issue #929（SQL-29 (c)）: `validate_select_statement` は集合演算
@@ -27455,10 +27598,11 @@ pub fn validate_statement(
         Statement::Select(stmt) => Ok(stmt),
         Statement::SetSearchMode { .. }
         | Statement::SetTimeZone { .. }
-        | Statement::SetSearchPath { .. } => Err(SqlSurfaceError::unsupported(
+        | Statement::SetSearchPath { .. }
+        | Statement::SetRowSecurity { .. } => Err(SqlSurfaceError::unsupported(
             "SET is not a query statement (use a session-aware entry point)",
         )),
-        Statement::ShowTimeZone | Statement::ShowSearchPath => Err(SqlSurfaceError::unsupported(
+        Statement::ShowTimeZone | Statement::ShowSearchPath | Statement::ShowRowSecurity => Err(SqlSurfaceError::unsupported(
             "SHOW is not a query statement (use a session-aware entry point)",
         )),
         Statement::CreateFunction { .. } => Err(SqlSurfaceError::unsupported(
