@@ -186,7 +186,9 @@ fn write_without_read_and_read_only_never_conflict() {
 
     // LOCK TABLE の取得前の存在確認は読み取り集合へ入らない。
     let mut txn = tx(&core, &mut session, "tenant-a", &[]);
-    run(&core, "tenant-b", &insert("sa", 3, "b-2"));
+    // 同一テナント（可視）の commit。他テナントの Private 書き込みだと可視性判定で無視され、
+    // 存在確認が表を記録していても検出できない。
+    run(&core, "tenant-a", &insert("sa", 3, "a-2"));
     step(&core, &mut session, &mut txn, "tenant-a", "LOCK TABLE sa").expect("lock without read");
     step(&core, &mut session, &mut txn, "tenant-a", "COMMIT").expect("commit");
 
