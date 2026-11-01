@@ -259,7 +259,8 @@ fn is_syntax_keyword_here(tokens: &[Token], idx: usize) -> bool {
         return next_is_name;
     }
     if w.eq_ignore_ascii_case("TABLE") {
-        return is(prev, "TRUNCATE") && (next_is_name);
+        // `LOCK TABLE <表>` の `TABLE` も構文語（Issue #1958。文頭の `LOCK` の直後だけ）。
+        return (is(prev, "TRUNCATE") || (is(prev, "LOCK") && idx == 1)) && next_is_name;
     }
     if w.eq_ignore_ascii_case("LATERAL") {
         let after = tokens.get(idx.saturating_add(1));
@@ -734,6 +735,10 @@ mod tests {
         assert_eq!(names("DROP TABLE IF EXISTS t"), vec!["t"]);
         assert_eq!(names("DELETE FROM ONLY t"), vec!["t"]);
         assert_eq!(names("TRUNCATE TABLE ONLY t"), vec!["t"]);
+        // `LOCK TABLE` の `TABLE` は構文語（Issue #1958）。
+        assert_eq!(names("LOCK TABLE t"), vec!["t"]);
+        assert_eq!(names("LOCK TABLE ONLY a, b IN SHARE MODE"), vec!["a", "b"]);
+        assert_eq!(names("LOCK t"), vec!["t"]);
         assert_eq!(names("SELECT * FROM a, LATERAL f(a.x)"), vec!["a"]);
         assert_eq!(
             names("INSERT INTO t (a) VALUES (1) ON CONFLICT (a) DO UPDATE SET a = 2"),

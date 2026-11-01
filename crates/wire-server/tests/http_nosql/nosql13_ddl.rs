@@ -1183,6 +1183,23 @@ fn create_table_tenant_id_self_declaration_is_42601() {
 
 // --- alter_table -----------------------------------------------------------
 
+/// RLS-13（Issue #2275）: `alter_table` op は `add_column`／`drop_column` だけの閉じた JSON スキーマで、
+/// 行セキュリティの切り替えには到達できない（未知のキーは拒否され、成功扱いにならない）。NoSQL 表層への
+/// 適用は #2280 の担当。現行の拒否は成功（200）にならないことだけを固定する。
+#[test]
+fn alter_table_row_security_keys_are_rejected_by_the_closed_schema() {
+    let (core, _guard) = new_core_with_docs_table();
+    let session = ddl_session(core);
+    for body in [
+        br#"{"op":"alter_table","table":"docs","enable_row_level_security":true}"#.as_slice(),
+        br#"{"op":"alter_table","table":"docs","row_level_security":"enable"}"#.as_slice(),
+        br#"{"op":"alter_table","table":"docs","force_row_level_security":true}"#.as_slice(),
+    ] {
+        let resp = query(&session, body);
+        assert_ne!(resp.status, 200, "got: {resp:?}");
+    }
+}
+
 #[test]
 fn alter_table_add_column_succeeds() {
     let (core, _guard) = new_core_with_docs_table();

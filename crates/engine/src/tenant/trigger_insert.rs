@@ -129,7 +129,7 @@ pub(super) fn write_rows_with_triggers(
             let mut row_table = write_txn
                 .open_table(user_rows_table_def(&row_table_name))
                 .map_err(map_row_table_error)?;
-            insert_unique_row(table, &mut row_table, key, encoded.as_slice())?;
+            insert_unique_row(write_txn, table, &mut row_table, key, encoded.as_slice())?;
         }
         // この 1 行の制約検査（FK は全行の後に 1 回）。
         crate::constraint::enforce_row_constraints_in_txn(

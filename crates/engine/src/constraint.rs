@@ -4645,7 +4645,15 @@ fn apply_referential_action(
                     ));
                 };
                 pre_images.record(*id, original_values.clone());
-                row_table.remove(key).map_err(CatalogError::from)?;
+                let removed = row_table.remove(key).map_err(CatalogError::from)?;
+                // commit 記録の行の足跡: 連鎖で消える前の子行（SQL-38・Issue #2404）。
+                if let Some(removed) = removed.as_ref() {
+                    crate::storage::commit_log::note_row_bytes(
+                        write_txn,
+                        &child_schema.name,
+                        removed.value(),
+                    );
+                }
                 deleted_ids.push(*id);
             }
             // `row_table`（可変借用）をここで drop してから、直後の
@@ -4788,6 +4796,12 @@ fn apply_referential_action(
             row_table
                 .insert(key, encoded.as_slice())
                 .map_err(CatalogError::from)?;
+            // commit 記録の行の足跡: 連鎖で書き換わった子行。可視性は不変のため更新後の行で前後を表す。
+            crate::storage::commit_log::note_row_bytes(
+                write_txn,
+                &child_schema.name,
+                encoded.as_slice(),
+            );
         }
     }
     Ok((

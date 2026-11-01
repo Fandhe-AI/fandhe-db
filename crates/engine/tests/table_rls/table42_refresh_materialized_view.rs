@@ -685,6 +685,16 @@ fn writer_gate_contention_is_55p03_and_keeps_old_entity() {
         holder_core
             .execute_sql_in_txn(&caller, &mut session, &mut txn, "BEGIN")
             .expect("begin");
+        // writer は最初の書き込み文で取得される（Issue #2400）ため、書き込みを 1 文入れて握る。
+        holder_core
+            .execute_sql_in_txn(
+                &caller,
+                &mut session,
+                &mut txn,
+                "INSERT INTO docs (id, embedding, lang, body) VALUES (900, '[1.0,0.0]', 'ja', 'h1') \
+                 USING OPERATION_ID 'op-t42-holder'",
+            )
+            .expect("first write holds writer");
         began_tx.send(()).expect("notify");
         release_rx.recv().expect("release");
         holder_core

@@ -8,8 +8,8 @@
 //! 既存の autocommit 経路（[`crate::core::EngineCore::execute_sql_in_session`]）と
 //! ビット同一に振る舞い、`Active` の間は `BEGIN` 時点の読み取りスナップショットと、
 //! 共有 `redb::WriteTransaction`（[`crate::storage::Storage::begin_explicit_write_txn`]。
-//! 取得済み／未取得を `Option` で表し、現状は `BEGIN` で取得する）を保持して複数の
-//! 書き込み文を 1 回の commit にまとめる。
+//! 取得済み／未取得を `Option` で表し、明示 Tx は最初の書き込み文〔`ensure_writer`〕、
+//! 暗黙 Tx は開始時に取得する）を保持して複数の書き込み文を 1 回の commit にまとめる。
 //!
 //! commit 成功境界（`RECOVER-5`・`RECOVER-6`）: point of no return は `COMMIT`
 //! 文が呼ぶ [`crate::recovery::commit_boundary::commit`] の 1 回のみ。台帳
@@ -80,6 +80,18 @@ pub enum TxnAccessMode {
     ReadOnly,
 }
 
+/// `BEGIN ISOLATION LEVEL ...` でクライアントが要求した分離レベル（SQL-38 (1) ポインタ・Issue #1938）。
+/// 要求を記録するだけで実行時の保証は変えない（実行は単一ライタの直列化のまま。
+/// `crate::txn::IsolationLevel` 参照）。後続の `SET TRANSACTION` 系・表示系が読む口として
+/// [`SessionTransaction::isolation_level`] から取り出せる。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum RequestedIsolationLevel {
+    ReadUncommitted,
+    ReadCommitted,
+    RepeatableRead,
+    Serializable,
+}
+
 /// [`validate_transaction_control_tokens`] の検証結果。`access_mode` は `BEGIN` で
 /// 明示されたときだけ `Some`（`COMMIT`／`ROLLBACK` は常に `None`）。`None` を残すのは
 /// 将来のセッション既定値（#1939）を適用する余地のため。`core.rs` の
@@ -88,15 +100,58 @@ pub enum TxnAccessMode {
 pub struct ValidatedTxnControl {
     pub control: TxnControl,
     pub access_mode: Option<TxnAccessMode>,
+    /// `BEGIN ISOLATION LEVEL` で明示されたときだけ `Some`（Issue #1938）。
+    pub isolation_level: Option<RequestedIsolationLevel>,
 }
 
 fn unsupported_txn_mode() -> SqlSurfaceError {
     SqlSurfaceError::unsupported("unsupported transaction mode")
 }
 
-/// `BEGIN` のモード句 1 項目（`READ ONLY`／`READ WRITE`）を読み、残りのトークンを返す。
-/// 未知の語・単独の `READ` は `42601`（fail-closed）。#1938 は ISOLATION LEVEL をここへ足す。
-fn parse_txn_mode_item(rest: &[Token]) -> Result<(TxnAccessMode, &[Token]), SqlSurfaceError> {
+/// `BEGIN` のモード句 1 項目。アクセスモードか分離レベルのどちらか。
+enum TxnModeItem {
+    Access(TxnAccessMode),
+    Isolation(RequestedIsolationLevel),
+}
+
+/// `ISOLATION LEVEL <レベル>` 項目を 1 つ消費する（先頭が `ISOLATION` の前提）。
+/// 不完全・未知のレベルは `42601`（fail-closed。入力語はメッセージへ含めない）。
+fn parse_isolation_level_item(
+    rest: &[Token],
+) -> Result<(RequestedIsolationLevel, &[Token]), SqlSurfaceError> {
+    fn word<'a>(rest: &'a [Token], kw: &str) -> Option<&'a [Token]> {
+        match rest.split_first() {
+            Some((Token::Ident(w), tail)) if w.eq_ignore_ascii_case(kw) => Some(tail),
+            _ => None,
+        }
+    }
+    let rest = word(rest, "ISOLATION").ok_or_else(unsupported_txn_mode)?;
+    let rest = word(rest, "LEVEL").ok_or_else(unsupported_txn_mode)?;
+    if let Some(t) = word(rest, "SERIALIZABLE") {
+        return Ok((RequestedIsolationLevel::Serializable, t));
+    }
+    if let Some(t) = word(rest, "REPEATABLE") {
+        let t = word(t, "READ").ok_or_else(unsupported_txn_mode)?;
+        return Ok((RequestedIsolationLevel::RepeatableRead, t));
+    }
+    if let Some(t) = word(rest, "READ") {
+        if let Some(t) = word(t, "COMMITTED") {
+            return Ok((RequestedIsolationLevel::ReadCommitted, t));
+        }
+        if let Some(t) = word(t, "UNCOMMITTED") {
+            return Ok((RequestedIsolationLevel::ReadUncommitted, t));
+        }
+    }
+    Err(unsupported_txn_mode())
+}
+
+/// `BEGIN` のモード句 1 項目（`READ ONLY`／`READ WRITE`／`ISOLATION LEVEL ...`）を読み、
+/// 残りのトークンを返す。未知の語・単独の `READ` は `42601`（fail-closed）。
+fn parse_txn_mode_item(rest: &[Token]) -> Result<(TxnModeItem, &[Token]), SqlSurfaceError> {
+    if matches!(rest.first(), Some(Token::Ident(x)) if x.eq_ignore_ascii_case("ISOLATION")) {
+        let (level, tail) = parse_isolation_level_item(rest)?;
+        return Ok((TxnModeItem::Isolation(level), tail));
+    }
     let word = |t: Option<&Token>, w: &str| matches!(t, Some(Token::Ident(x)) if x.eq_ignore_ascii_case(w));
     if !word(rest.first(), "READ") {
         return Err(unsupported_txn_mode());
@@ -110,7 +165,7 @@ fn parse_txn_mode_item(rest: &[Token]) -> Result<(TxnAccessMode, &[Token]), SqlS
         return Err(unsupported_txn_mode());
     };
     let tail = after_read.split_first().map_or(&[][..], |(_, t)| t);
-    Ok((mode, tail))
+    Ok((TxnModeItem::Access(mode), tail))
 }
 
 /// トランザクション制御文の規範形を受理する。`BEGIN`/`START TRANSACTION`/`COMMIT`/`END`/
@@ -140,6 +195,7 @@ pub(crate) fn validate_transaction_control_tokens(
                     Ok(ValidatedTxnControl {
                         control: TxnControl::StartTransaction,
                         access_mode: None,
+                        isolation_level: None,
                     })
                 } else {
                     Err(SqlSurfaceError::unsupported(
@@ -183,6 +239,7 @@ pub(crate) fn validate_transaction_control_tokens(
         }
     }
     let mut access_mode = None;
+    let mut isolation_level = None;
     if ctrl == TxnControl::Begin {
         // モード句ループ。2 項目目以降は任意の `,` で区切れる構造にしてある（#1938 向け）が、
         // 現状は項目がアクセスモード 1 つのため、重複・矛盾は `42601`。トークン数で有界。
@@ -194,8 +251,12 @@ pub(crate) fn validate_transaction_control_tokens(
                 }
             }
             first = false;
-            let (mode, tail) = parse_txn_mode_item(rest)?;
-            if access_mode.replace(mode).is_some() {
+            let (item, tail) = parse_txn_mode_item(rest)?;
+            let duplicated = match item {
+                TxnModeItem::Access(m) => access_mode.replace(m).is_some(),
+                TxnModeItem::Isolation(l) => isolation_level.replace(l).is_some(),
+            };
+            if duplicated {
                 return Err(unsupported_txn_mode());
             }
             rest = tail;
@@ -209,6 +270,7 @@ pub(crate) fn validate_transaction_control_tokens(
     Ok(ValidatedTxnControl {
         control: ctrl,
         access_mode,
+        isolation_level,
     })
 }
 
@@ -260,15 +322,25 @@ struct ActiveTxn<'e> {
     /// アクセスモード（SQL-38・Issue #1932）。#1933／#1934 が読み取り Tx の開始と
     /// 書き込み拒否の判定に使う。現状 `ReadOnly` は開始前に拒否されるため常に `ReadWrite`。
     access_mode: TxnAccessMode,
-    /// 共有書き込みトランザクション。`None` は writer 未取得（後続 Issue #2400 以降に生じる
-    /// 状態）。本 Issue の時点では `BEGIN`（明示・暗黙とも）で必ず取得するため、`Active` の間は
-    /// 常に `Some`。
+    /// `BEGIN ISOLATION LEVEL` で明示された要求レベル（記録のみ。暗黙・未指定は `None`。Issue #1938）。
+    isolation_level: Option<RequestedIsolationLevel>,
+    /// 共有書き込みトランザクション。`None` は writer 未取得。明示 Tx は `BEGIN` では取らず
+    /// 最初の書き込み文が [`SessionTransaction::ensure_writer`] で取得する（Issue #2400）。
+    /// 暗黙 Tx は開始時に取得するため常に `Some`。`has_writes`／dirty なら必ず `Some`。
     writer: Option<crate::storage::GatedWriteTxn>,
-    /// `BEGIN` 時点の確定済み読み取りスナップショット。writer 取得の後に開くため、文ごとの
-    /// 読み取りが見る確定状態と同じ。本 Issue ではどの読み取り経路にも結線しない（結線は
-    /// #2400・#2403）。`ActiveTxn` を捨てる全経路で自動的に解放される。
+    /// `BEGIN` 時点の確定済み読み取りスナップショット。明示 Tx では `BEGIN` で先に開き、
+    /// 暗黙 Tx では writer 取得の後に開く。どの読み取り経路にも結線しない（結線は #2403。
+    /// それまで writer 取得前の読み取りは文ごとの確定状態を見る）。`ActiveTxn` を捨てる全経路で自動的に解放される。
     #[allow(dead_code)]
     read_snapshot: redb::ReadTransaction,
+    /// 明示 Tx が `BEGIN` で `Storage` の commit 記録の登録簿へ登録した `G_s` のハンドル（SQL-38・
+    /// Issue #2404）。writer 未取得の間だけ保持し、writer 取得（[`SessionTransaction::ensure_writer`]）・
+    /// `COMMIT`・`ROLLBACK`・`fail`・期限切れ・drop のどの経路でも外れる。暗黙 Tx・一時表用ストレージは `None`。
+    registration: Option<crate::storage::commit_log::SnapshotRegistration>,
+    /// `read_snapshot` の世代 `G_s`（登録時に読んだ値。登録を外した後も #2405 の判定が使う。暗黙 Tx は 0）。
+    snapshot_generation: u64,
+    /// writer 取得前に読んだ基底表の集合（SQL-38・Issue #2404。`sql::read_set`）。writer 取得後は増えない。
+    read_set: crate::sql::read_set::ReadSet,
     /// 一時表（TABLE-44・Issue #1684）の書き込みトランザクション。最初の一時表の文で遅延して開く。
     /// `ActiveTxn` を取り出して drop する全経路（`rollback`／`fail`／`release_if_expired`／
     /// 暗黙の abort／`SessionTransaction` の drop）で自動的に abort する。commit は
@@ -510,16 +582,25 @@ impl<'e> SessionTransaction<'e> {
         }
     }
 
-    /// `BEGIN`。`Idle` から `Active` へ遷移する。`storage` から
-    /// [`crate::storage::Storage::begin_explicit_write_txn`] で単一ライタの
-    /// permit を取得したまま保持する（`writer_gate` モジュールドキュメント
-    /// 参照。待機上限超過は `55P03`）。
+    /// `BEGIN`。`Idle` から `Active` へ遷移する。読み取りスナップショットだけを開き、
+    /// 単一ライタの permit（`writer_gate` モジュールドキュメント参照）は取らない。
+    /// 最初の書き込み文が [`Self::ensure_writer`] で取得し、待機上限超過の `55P03` は
+    /// そこで起きる（Issue #2400）。
     pub fn begin(
         &mut self,
         storage: &'e crate::storage::Storage,
         session: &SessionState,
     ) -> Result<(), SqlSurfaceError> {
         self.begin_with_mode(storage, session, TxnAccessMode::ReadWrite)
+    }
+
+    /// `Active` なトランザクションが `BEGIN` で明示された分離レベル（Issue #1938）。
+    /// 未指定・暗黙・`Active` 以外は `None`。
+    pub fn isolation_level(&self) -> Option<RequestedIsolationLevel> {
+        match &self.state {
+            TxnState::Active(a) => a.isolation_level,
+            _ => None,
+        }
     }
 
     /// アクセスモード付きの `BEGIN`（SQL-38・Issue #1932。`core.rs` の実行分岐が呼ぶ）。
@@ -531,13 +612,31 @@ impl<'e> SessionTransaction<'e> {
         session: &SessionState,
         access_mode: TxnAccessMode,
     ) -> Result<(), SqlSurfaceError> {
+        self.begin_with_modes(storage, session, access_mode, None)
+    }
+
+    /// アクセスモードと要求分離レベル付きの `BEGIN`（Issue #1938。`core.rs` の実行分岐が呼ぶ）。
+    /// レベルは記録のみで実行は [`Self::begin_with_mode`] と同一。
+    pub fn begin_with_modes(
+        &mut self,
+        storage: &'e crate::storage::Storage,
+        session: &SessionState,
+        access_mode: TxnAccessMode,
+        isolation_level: Option<RequestedIsolationLevel>,
+    ) -> Result<(), SqlSurfaceError> {
         // 暗黙トランザクションはメッセージ内で完結する。明示 `BEGIN` が届くのは
         // 呼び出し側の不変条件違反（制御文を含むメッセージは暗黙にならない）なので、
         // 暗黙の `Active` は abort して `Idle` へ戻し、内部エラーで拒否する。
         if self.abort_if_implicit() {
             return Err(internal_error());
         }
-        self.begin_with_origin(storage, session, TxnOrigin::Explicit, access_mode)
+        self.begin_with_origin(
+            storage,
+            session,
+            TxnOrigin::Explicit,
+            access_mode,
+            isolation_level,
+        )
     }
 
     /// 暗黙トランザクション（Issue #1175）を開始する。`BEGIN` を含まない複数文
@@ -562,6 +661,7 @@ impl<'e> SessionTransaction<'e> {
             session,
             TxnOrigin::Implicit,
             TxnAccessMode::ReadWrite,
+            None,
         )
     }
 
@@ -642,6 +742,7 @@ impl<'e> SessionTransaction<'e> {
         session: &SessionState,
         origin: TxnOrigin,
         access_mode: TxnAccessMode,
+        isolation_level: Option<RequestedIsolationLevel>,
     ) -> Result<(), SqlSurfaceError> {
         match &self.state {
             TxnState::Idle => {
@@ -655,48 +756,62 @@ impl<'e> SessionTransaction<'e> {
                 // 壁時計の読み取り失敗（範囲外）は writer を開く前に fail-closed で返す
                 // （状態は `Idle` のまま）。
                 let txn_start_micros = crate::sql::time_fn::now_micros()?;
-                let write_txn = storage
-                    .begin_explicit_write_txn()
-                    .map_err(map_write_lock_err)?;
-                // 世代番号を先に進めてから `Active` へ遷移する（PR #1049
-                // レビュー指摘対応。オーバーフロー目前で頭打ちにし、万一
-                // 到達しても既存の世代番号を使い回して衝突させることはない
-                // ―― 到達し得ない前提の防御的縮退のため専用の `wire_code`
-                // は設けず、`Internal` として拒否する）。`write_txn` を
-                // 閉包へ move させないよう、先に `match` で判定してから
-                // 代入する（`ok_or_else` クロージャは呼ばれない場合でも
-                // 構築時に move が確定するため使えない）。
-                // 読み取りスナップショットは writer（permit）取得の後に開く。permit 保持中に
-                // 開けば文ごとの `begin_read_txn()` が返すものと同じ確定状態になり挙動が
-                // 変わらない（writer の前に開くとゲート待ちの間の他者の commit を跨ぎうる）。
-                // 失敗時は writer を解放して `Idle` のまま固定文言の `XX000` で拒否する
-                // （fail-closed）。
-                let read_snapshot = {
-                    use redb::ReadableDatabase;
-                    match storage.db().begin_read() {
-                        Ok(snapshot) => snapshot,
-                        Err(_) => {
-                            drop(write_txn);
-                            return Err(internal_error());
-                        }
-                    }
-                };
+                // 世代番号を先に判定してから `Active` へ遷移する（PR #1049 レビュー指摘対応。
+                // オーバーフロー目前で頭打ちにし、万一到達しても既存の世代番号を使い回して
+                // 衝突させることはない。到達し得ない前提の防御的縮退のため専用の
+                // `wire_code` は設けず `Internal` として拒否する）。writer を取る前に判定して
+                // 失敗時に解放するものを持たない。
                 let next_generation = match self.generation.checked_add(1) {
                     Some(g) => g,
                     None => {
-                        // 読み取りスナップショットは関数を抜ける際に併せて解放される。
-                        drop(write_txn);
                         return Err(SqlSurfaceError::Internal {
                             detail: "internal error".to_string(),
                         });
                     }
                 };
+                let (write_txn, read_snapshot, registration) = match origin {
+                    // 明示トランザクション（Issue #2400）: `BEGIN` では writer を取らず、
+                    // 読み取りスナップショットだけを開く。writer は最初の書き込み文が
+                    // [`Self::ensure_writer`] で取得するため、読み取りだけの Tx は他セッションの
+                    // 書き込みを待たせず、書き込みロック待ち（`55P03`）も `BEGIN` では生じない。
+                    // 書き込み時直列化検査（SQL-38・Issue #2404）のため、`G_s` を commit 記録の登録簿へ
+                    // 登録する（登録順序は `Storage::open_registered_snapshot`）。
+                    TxnOrigin::Explicit => {
+                        let (snap, reg) = storage
+                            .open_registered_snapshot()
+                            .map_err(|_| internal_error())?;
+                        (None, snap, reg)
+                    }
+                    // 暗黙トランザクション（WIRE-16・Issue #1175）: 従来どおり開始時に writer を
+                    // 取る（#2401 が前提とする）。スナップショットは permit 保持中に開けば文ごとの
+                    // `begin_read_txn()` と同じ確定状態になる（writer の前に開くとゲート待ちの間の
+                    // 他者の commit を跨ぎうる）。失敗時は writer を解放して固定文言の `XX000`。
+                    TxnOrigin::Implicit => {
+                        let w = storage
+                            .begin_explicit_write_txn()
+                            .map_err(map_write_lock_err)?;
+                        let snap = match open_read_snapshot(storage) {
+                            Ok(snap) => snap,
+                            Err(e) => {
+                                drop(w);
+                                return Err(e);
+                            }
+                        };
+                        (Some(w), snap, None)
+                    }
+                };
+                let snapshot_generation =
+                    registration.as_ref().map_or(0, |r| r.snapshot_generation());
                 self.generation = next_generation;
                 self.state = TxnState::Active(Box::new(ActiveTxn {
                     origin,
                     access_mode,
-                    writer: Some(write_txn),
+                    isolation_level,
+                    writer: write_txn,
                     read_snapshot,
+                    registration,
+                    snapshot_generation,
+                    read_set: crate::sql::read_set::ReadSet::default(),
                     temp: None,
                     started_at: Instant::now(),
                     txn_start_micros,
@@ -951,6 +1066,92 @@ impl<'e> SessionTransaction<'e> {
         }
     }
 
+    /// writer が未取得なら取得する（Issue #2400。明示 Tx の最初の書き込み文の入口）。
+    /// `core.rs` の各書き込み経路が `write_txn()` を取る直前に呼ぶ。取得済みなら何もしない
+    /// （冪等。2 文目以降や PL/pgSQL 本体の入れ子の書き込みで再取得しない）。
+    ///
+    /// - 待機上限超過は `55P03`。呼び出し側は既存契約どおり `fail()` で `Failed` へ遷移させる。
+    ///   取得前は何も書いていないので副作用は無い。
+    /// - `Idle`／`Failed`・READ ONLY は呼び出し側の不変条件違反として `XX000`（fail-closed。
+    ///   READ ONLY は #1934 が `25006` へ置き換える）。
+    /// - 将来 #2405 が「gate 取得 → permit 保持のまま `40001` 判定 → 格納」の判定を
+    ///   取得と格納の間へ挿入する地点である。
+    pub(crate) fn ensure_writer(&mut self) -> Result<(), SqlSurfaceError> {
+        self.ensure_writer_with(false)
+    }
+
+    /// [`Self::ensure_writer`] の `nowait` 指定版（`LOCK TABLE ... NOWAIT`・Issue #1958 の入口）。
+    /// `nowait` なら待機せず即時に取得を試み、失敗は `55P03`。取得済みならゲートに触れず `Ok`
+    /// （同一スレッドでの permit 再取得は必ず `55P03` になるためこの短絡は必須）。
+    /// 取得経路を 1 本に保つため、`40001` 判定の挿入地点もここ（#2405）。
+    pub(crate) fn ensure_writer_with(&mut self, nowait: bool) -> Result<(), SqlSurfaceError> {
+        match &mut self.state {
+            TxnState::Active(active) => {
+                if active.writer.is_some() {
+                    return Ok(());
+                }
+                if active.access_mode == TxnAccessMode::ReadOnly {
+                    return Err(internal_error());
+                }
+                let w = if nowait {
+                    active.storage.begin_explicit_write_txn_nowait()
+                } else {
+                    active.storage.begin_explicit_write_txn()
+                }
+                .map_err(map_write_lock_err)?;
+                active.writer = Some(w);
+                // 読み取り集合を確定する（SQL-38・Issue #2404）。同じ文の取得後の読み取り
+                // （`INSERT ... SELECT` の元表など）は集合へ入れない。
+                if let Some(set) = crate::sql::read_set::disarm_current() {
+                    active.read_set.merge(set);
+                }
+                // #2405 の `40001` 判定は、ここ（writer を格納した後）と登録を外す間に差し込む。
+                // 登録は判定が必要とする記録を刈り込ませないため、格納の後に外す。
+                active.registration = None;
+                Ok(())
+            }
+            _ => Err(internal_error()),
+        }
+    }
+
+    /// 文の実行区間で読み取り集合を記録する区間を張る。明示トランザクションかつ writer 未取得の
+    /// ときだけ `Some`（SQL-38・Issue #2404）。暗黙トランザクション・取得後・`Active` 以外は `None`。
+    pub(crate) fn read_set_scope(&self) -> Option<crate::sql::read_set::ReadSetScope> {
+        match &self.state {
+            TxnState::Active(active)
+                if active.origin == TxnOrigin::Explicit && active.writer.is_none() =>
+            {
+                Some(crate::sql::read_set::ReadSetScope::enter())
+            }
+            _ => None,
+        }
+    }
+
+    /// 文の区間で記録した読み取りを `Active` の集合へ取り込む。
+    pub(crate) fn absorb_read_set(&mut self, set: crate::sql::read_set::ReadSet) {
+        if let TxnState::Active(active) = &mut self.state {
+            active.read_set.merge(set);
+        }
+    }
+
+    /// writer 取得前に読んだ基底表の集合（`Active` のときのみ `Some`。#2405 の判定が使う）。
+    #[cfg_attr(not(test), allow(dead_code))]
+    pub(crate) fn read_set(&self) -> Option<&crate::sql::read_set::ReadSet> {
+        match &self.state {
+            TxnState::Active(active) => Some(&active.read_set),
+            _ => None,
+        }
+    }
+
+    /// `BEGIN` の読み取りスナップショットの世代 `G_s`（`Active` のときのみ `Some`。暗黙 Tx は 0）。
+    #[cfg_attr(not(test), allow(dead_code))]
+    pub(crate) fn snapshot_generation(&self) -> Option<u64> {
+        match &self.state {
+            TxnState::Active(active) => Some(active.snapshot_generation),
+            _ => None,
+        }
+    }
+
     /// `BEGIN` 時点の確定済み読み取りスナップショット（`Active` のときのみ `Some`。
     /// Issue #2399）。本番経路からはまだ呼ばれず、#2400・#2403 が読み取り経路へ結線する。
     #[cfg_attr(not(test), allow(dead_code))]
@@ -1116,6 +1317,14 @@ fn collect_dirty_tables(
     Ok(dirty)
 }
 
+/// 確定済み状態の読み取りスナップショットを開く。失敗は固定文言の `XX000`（fail-closed）。
+fn open_read_snapshot(
+    storage: &crate::storage::Storage,
+) -> Result<redb::ReadTransaction, SqlSurfaceError> {
+    use redb::ReadableDatabase;
+    storage.db().begin_read().map_err(|_| internal_error())
+}
+
 /// 内部エラー（`XX000`）。他テナントの情報を含まない固定文言。
 fn internal_error() -> SqlSurfaceError {
     SqlSurfaceError::Internal {
@@ -1192,10 +1401,19 @@ fn commit_active(
             Ok(())
         }
     };
-    result.map_err(|_| {
+    result.map_err(|e| {
         // commit 失敗はロールバック扱い（writer は消費済みで、permit も解放されている）。
         *session = session_at_begin;
-        internal_error()
+        match e {
+            // 足跡を記録できない書き込みは redb の commit 前に拒否される（Issue #2404）。
+            // 文実行時の上限超過と同じ `54000`・固定文言で返す（`internal_error` へ丸めない）。
+            crate::storage::StorageError::CommitFootprintUnrecordable => {
+                SqlSurfaceError::PayloadTooLarge {
+                    detail: "commit footprint limit exceeded".to_string(),
+                }
+            }
+            _ => internal_error(),
+        }
     })?;
     // 永続側の commit 成功後にだけ、一時側を確定し、続けて一時表の `ON COMMIT` 動作を適用する
     // （TABLE-44・Issue #1683・#1684。ROLLBACK・永続側の commit 失敗では `temp` を drop（abort）
@@ -1323,8 +1541,6 @@ mod tests {
             "BEGIN READ ONLY,",
             "BEGIN , READ ONLY",
             "BEGIN READ ONLY DEFERRABLE",
-            "BEGIN ISOLATION LEVEL SERIALIZABLE",
-            "BEGIN READ ONLY ISOLATION LEVEL SERIALIZABLE",
             "COMMIT READ ONLY",
             "ROLLBACK READ WRITE",
             "ROLLBACK TO SAVEPOINT x",
@@ -1384,6 +1600,66 @@ mod tests {
         assert!(is_rollback_statement("ROLLBACK"));
         assert!(!is_rollback_statement("END"));
         assert!(!is_rollback_statement("COMMIT"));
+    }
+
+    /// SQL-38 (1)・Issue #1938: 4 レベルすべてを `BEGIN`／`BEGIN WORK`／`BEGIN TRANSACTION` で
+    /// 受理し、要求レベルを記録する（大小無視）。アクセスモードとの併記も受理する。
+    #[test]
+    fn begin_isolation_levels_are_accepted() {
+        let levels = [
+            ("SERIALIZABLE", RequestedIsolationLevel::Serializable),
+            ("REPEATABLE READ", RequestedIsolationLevel::RepeatableRead),
+            ("read committed", RequestedIsolationLevel::ReadCommitted),
+            ("Read Uncommitted", RequestedIsolationLevel::ReadUncommitted),
+        ];
+        for head in ["BEGIN", "BEGIN WORK", "BEGIN TRANSACTION", "begin"] {
+            for (text, expected) in levels {
+                let sql = format!("{head} ISOLATION LEVEL {text}");
+                let v = validated(&sql).expect(&sql);
+                assert_eq!(v.control, TxnControl::Begin, "{sql}");
+                assert_eq!(v.isolation_level, Some(expected), "{sql}");
+                assert_eq!(v.access_mode, None, "{sql}");
+            }
+        }
+        for sql in [
+            "BEGIN ISOLATION LEVEL SERIALIZABLE READ ONLY",
+            "BEGIN READ ONLY, ISOLATION LEVEL SERIALIZABLE",
+            "BEGIN READ ONLY ISOLATION LEVEL SERIALIZABLE",
+        ] {
+            let v = validated(sql).expect(sql);
+            assert_eq!(
+                v.isolation_level,
+                Some(RequestedIsolationLevel::Serializable),
+                "{sql}"
+            );
+            assert_eq!(v.access_mode, Some(TxnAccessMode::ReadOnly), "{sql}");
+        }
+    }
+
+    /// 不完全・未知・重複・区切り誤り・未対応の併記・`COMMIT`／`ROLLBACK` への指定は `42601`。
+    #[test]
+    fn malformed_isolation_level_clauses_are_rejected() {
+        for sql in [
+            "BEGIN ISOLATION",
+            "BEGIN ISOLATION LEVEL",
+            "BEGIN ISOLATION LEVEL READ",
+            "BEGIN ISOLATION LEVEL REPEATABLE",
+            "BEGIN ISOLATION LEVEL FOO",
+            "BEGIN ISOLATION SERIALIZABLE",
+            "BEGIN LEVEL SERIALIZABLE",
+            "BEGIN ISOLATION LEVEL READ WRITE",
+            "BEGIN ISOLATION LEVEL SERIALIZABLE ISOLATION LEVEL READ COMMITTED",
+            "BEGIN ISOLATION LEVEL SERIALIZABLE ISOLATION LEVEL SERIALIZABLE",
+            "BEGIN , ISOLATION LEVEL SERIALIZABLE",
+            "BEGIN ISOLATION LEVEL SERIALIZABLE,",
+            "BEGIN ISOLATION LEVEL SERIALIZABLE DEFERRABLE",
+            "BEGIN ISOLATION LEVEL SERIALIZABLE NOT DEFERRABLE",
+            "COMMIT ISOLATION LEVEL SERIALIZABLE",
+            "ROLLBACK ISOLATION LEVEL READ COMMITTED",
+        ] {
+            let err = validated(sql).unwrap_err();
+            assert_eq!(err.wire_code(), "42601", "{sql}");
+        }
     }
 
     /// `COMMIT` の commit 自体が失敗した場合は PostgreSQL と同じくロールバック
@@ -1605,17 +1881,17 @@ mod tests {
         (storage, guard)
     }
 
-    /// `BEGIN` 後は writer と読み取りスナップショットの両方を保持し、終了経路
-    /// （COMMIT・ROLLBACK・fail・暗黙の abort）の後はどちらも手放す
-    /// （SQL-31・PERSIST-4・TASK-333、Issue #2399）。
+    /// 明示 `BEGIN` は読み取りスナップショットだけを保持し writer は取らない。暗黙 Tx は
+    /// 開始時に両方を保持する。終了経路の後はどちらも手放す（SQL-31・PERSIST-4・TASK-333、
+    /// Issue #2399・#2400）。
     #[test]
-    fn begin_holds_writer_and_read_snapshot() {
-        let (storage, _g) = open_test_storage("txn-2399-holds");
+    fn begin_holds_snapshot_and_defers_writer() {
+        let (storage, _g) = open_test_storage("txn-2400-holds");
         let mut session = SessionState::default();
         let mut txn = SessionTransaction::new(TransactionLimits::default());
 
         txn.begin(&storage, &session).expect("begin");
-        assert!(txn.write_txn().is_some());
+        assert!(txn.write_txn().is_none());
         assert!(txn.read_snapshot().is_some());
         txn.commit(&mut session).expect("commit");
         assert!(txn.write_txn().is_none() && txn.read_snapshot().is_none());
@@ -1625,6 +1901,8 @@ mod tests {
         assert!(txn.write_txn().is_none() && txn.read_snapshot().is_none());
 
         txn.begin(&storage, &session).expect("begin");
+        txn.ensure_writer().expect("ensure writer");
+        assert!(txn.write_txn().is_some() && txn.read_snapshot().is_some());
         txn.fail();
         assert_eq!(txn.status(), TransactionStatus::Failed);
         assert!(txn.write_txn().is_none() && txn.read_snapshot().is_none());
@@ -1637,8 +1915,62 @@ mod tests {
         assert!(txn.write_txn().is_none() && txn.read_snapshot().is_none());
     }
 
+    /// `ensure_writer` は冪等で、`Idle`／`Failed` では `XX000` で拒否する（Issue #2400）。
+    #[test]
+    fn ensure_writer_is_idempotent_and_fail_closed() {
+        let (storage, _g) = open_test_storage("txn-2400-ensure");
+        let mut session = SessionState::default();
+        let mut txn = SessionTransaction::new(TransactionLimits::default());
+        assert!(matches!(
+            txn.ensure_writer(),
+            Err(SqlSurfaceError::Internal { .. })
+        ));
+        txn.begin(&storage, &session).expect("begin");
+        let before = storage.write_txn_creations();
+        txn.ensure_writer().expect("first");
+        txn.ensure_writer().expect("second");
+        assert_eq!(storage.write_txn_creations(), before + 1);
+        // 書き込みなしの COMMIT は成功する。
+        txn.commit(&mut session).expect("commit");
+        txn.begin(&storage, &session).expect("begin");
+        txn.fail();
+        assert!(matches!(
+            txn.ensure_writer(),
+            Err(SqlSurfaceError::Internal { .. })
+        ));
+    }
+
+    /// 別スレッドが gate を持つ間、`ensure_writer` は待機上限超過で `55P03` になり
+    /// writer は `None` のまま（`BEGIN` 自体は待たない。Issue #2400）。
+    #[test]
+    fn ensure_writer_times_out_with_55p03_and_stays_deferred() {
+        let (mut storage, _g) = open_test_storage("txn-2400-timeout");
+        storage.set_write_lock_wait(Duration::from_millis(50));
+        let session = SessionState::default();
+        let mut txn = SessionTransaction::new(TransactionLimits::default());
+        let holder = storage.begin_write_txn().expect("holder");
+        let (tx_done, rx_done) = std::sync::mpsc::channel::<()>();
+        std::thread::scope(|scope| {
+            let storage = &storage;
+            let handle = scope.spawn(move || {
+                let mut other = SessionTransaction::new(TransactionLimits::default());
+                other.begin(storage, &session).expect("begin does not wait");
+                let err = other.ensure_writer().expect_err("timeout");
+                assert!(matches!(err, SqlSurfaceError::LockNotAvailable));
+                assert!(other.write_txn().is_none());
+                tx_done.send(()).expect("send");
+            });
+            rx_done.recv().expect("recv");
+            handle.join().expect("join");
+        });
+        drop(holder);
+        txn.begin(&storage, &SessionState::default())
+            .expect("begin");
+        txn.ensure_writer().expect("acquire after release");
+    }
+
     /// `BEGIN` 直後のスナップショットは、新たに開いた確定済み読み取りと同じ世代を指す
-    /// （writer 取得後に開くため挙動が変わらない、という不変条件。Issue #2399）。
+    /// （明示 Tx は `BEGIN` で開くため、その時点の確定状態と一致する。Issue #2399・#2400）。
     #[test]
     fn snapshot_matches_committed_state_at_begin() {
         use redb::ReadableDatabase;
@@ -1669,7 +2001,6 @@ mod tests {
         txn.begin(&storage, &session).expect("begin");
         session.set_search_mode(SearchMode::Recall);
         if let TxnState::Active(active) = &mut txn.state {
-            drop(active.writer.take());
             active.has_writes = true;
         }
         assert!(txn.dirty_tables().is_err());
@@ -1688,11 +2019,82 @@ mod tests {
         let mut session = SessionState::default();
         let mut txn = SessionTransaction::new(TransactionLimits::default());
         txn.begin(&storage, &session).expect("begin");
+        txn.commit(&mut session).expect("commit");
+        assert_eq!(txn.status(), TransactionStatus::Idle);
+    }
+
+    /// `ensure_writer` は取得済みなら（NOWAIT でも）ゲートに触れず成功する（SQL-38・Issue #1958）。
+    #[test]
+    fn ensure_writer_is_noop_when_already_held() {
+        let (storage, _g) = open_test_storage("txn-1958-noop");
+        let session = SessionState::default();
+        let mut txn = SessionTransaction::new(TransactionLimits::default());
+        txn.begin(&storage, &session).expect("begin");
+        txn.ensure_writer_with(false).expect("acquire");
+        let created = storage.write_txn_creations();
+        txn.ensure_writer_with(false).expect("blocking");
+        txn.ensure_writer_with(true).expect("nowait");
+        assert_eq!(storage.write_txn_creations(), created);
+        assert!(txn.write_txn().is_some());
+    }
+
+    /// writer 未取得なら取得して保持する（待機あり・NOWAIT とも。Issue #1958）。
+    #[test]
+    fn ensure_writer_acquires_when_absent() {
+        for nowait in [false, true] {
+            let (storage, _g) = open_test_storage("txn-1958-acquire");
+            let session = SessionState::default();
+            let mut txn = SessionTransaction::new(TransactionLimits::default());
+            txn.begin(&storage, &session).expect("begin");
+            if let TxnState::Active(active) = &mut txn.state {
+                drop(active.writer.take());
+            }
+            assert!(txn.write_txn().is_none());
+            txn.ensure_writer_with(nowait).expect("acquire");
+            assert!(txn.write_txn().is_some());
+        }
+    }
+
+    /// 他のセッションが writer を保持していれば、NOWAIT は即座に、待機ありは上限超過で `55P03`
+    /// （Issue #1958）。同期はチャネルで行い時間の大小は表明しない。
+    #[test]
+    fn ensure_writer_reports_lock_not_available_when_held_elsewhere() {
+        let (storage, _g) = open_test_storage("txn-1958-held");
+        let storage = storage.with_write_lock_wait(std::time::Duration::from_millis(20));
+        let session = SessionState::default();
+        let mut txn = SessionTransaction::new(TransactionLimits::default());
+        txn.begin(&storage, &session).expect("begin");
         if let TxnState::Active(active) = &mut txn.state {
             drop(active.writer.take());
         }
-        txn.commit(&mut session).expect("commit");
-        assert_eq!(txn.status(), TransactionStatus::Idle);
+        let (held_tx, held_rx) = std::sync::mpsc::channel::<()>();
+        let (done_tx, done_rx) = std::sync::mpsc::channel::<()>();
+        std::thread::scope(|scope| {
+            let storage_ref = &storage;
+            scope.spawn(move || {
+                let _held = storage_ref.begin_explicit_write_txn().expect("holder");
+                held_tx.send(()).expect("signal");
+                let _ = done_rx.recv();
+            });
+            held_rx.recv().expect("held");
+            for nowait in [true, false] {
+                let err = txn.ensure_writer_with(nowait).expect_err("held elsewhere");
+                assert!(matches!(err, SqlSurfaceError::LockNotAvailable), "{nowait}");
+                assert!(txn.write_txn().is_none());
+            }
+            done_tx.send(()).expect("release");
+        });
+        txn.ensure_writer_with(true).expect("free after release");
+    }
+
+    /// `Active` 以外で呼ぶと `XX000`（fail-closed。Issue #1958）。
+    #[test]
+    fn ensure_writer_outside_transaction_is_internal_error() {
+        let mut txn = SessionTransaction::new(TransactionLimits::default());
+        assert!(matches!(
+            txn.ensure_writer_with(false),
+            Err(SqlSurfaceError::Internal { .. })
+        ));
     }
 
     /// `redb::ReadTransaction` を持たせても `SessionTransaction` が `Send` のままであること

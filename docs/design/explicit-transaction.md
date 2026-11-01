@@ -3,7 +3,7 @@
 - ステータス: **Accepted（実装既定値）**
 - 対応: Issue #942・TASK-221
 - 改訂: Issue #2396・TASK-333（決定 1 を改訂。writer の遅延取得と `40001` の判定は
-  下記 1a。実装は #2399〜#2405・#2408 で進行中。設計記録は #2397）
+  下記 1a。実装は #2399〜#2405・#2408 で進行中。#2399・#2400・#2401・#2404 は実施済み。設計記録は #2397）
 - ポインタ: `docs/spec/04-behavior/sql-surface.md` SQL-31・
   `docs/spec/04-behavior/persistence.md` RECOVER-12・
   `docs/spec/04-behavior/error-format.md` ERR-6
@@ -225,6 +225,84 @@ Issue（#2399〜#2405・#2408〜#2413）が拠り所にする設計記録で、�
 - CHANGELOG と `implementation-status.md` → #2413
 - 早期の事前判定（gate を待つ前に明らかな衝突を返す最適化）は任意とし、#2405 の判断に委ねる。
 
+#### 1a-10. 実装上の決定（#2404）
+
+読み取り集合（1a-4）と commit 記録（1a-5・1a-7）の実装で固定した決定。判定（`40001`）は #2405。
+
+**読み取り集合**（`sql/read_set.rs`）:
+
+- AST から参照表を集めない。実行時に必ず通る 2 点で記録する: `catalog::user_rows_table_name`
+  （行テーブル名の生成点）と、関係の解決点 `catalog::get_table_schema_in_txn_impl`（行を読まない
+  `EXPLAIN` とビュー名を拾う）。マテビューの実体名の生成点も同様。カタログ全体の列挙
+  （`list_tables_in_txn`）はワイルドカード。どれも読み取りを過大に見積もる側に倒れる。
+- 記録は thread-local の RAII 区間。`core.rs` の `execute_in_active_txn` と `begin_copy_active`
+  が、明示トランザクションかつ writer 未取得のときだけ張る。writer を取得した時点
+  （`SessionTransaction::ensure_writer`）で区間の内容を `ActiveTxn::read_set` へ移して以降を止める。
+  同じ文の取得後の読み取り（`INSERT ... SELECT` の元表）は入らない。
+- 一時表の文は `core/temp_route.rs` の振り分けで記録を止める。表数の上限 `MAX_READ_SET_TABLES`
+  （1024）を超えたらワイルドカードへ畳む。
+- `information_schema`・`pg_catalog` は関係として未対応（`0A000`）のため、それらを読む経路は存在せず、
+  記録の対象外（対応する場合は列挙点でワイルドカードにすること）。
+- 既知の限界: 読み取りが別スレッドで表を開く経路は記録されない（表の解決は文の実行スレッド上で
+  行われる前提。並列化されるのは行の採点だけ）。
+
+**commit 記録**（`storage/commit_log.rs`）:
+
+- `Storage` が `Option<Arc<CommitLog>>` を持つ（一時表用ストレージは `None`）。`Storage::open` の
+  最後（移行 commit の後）に arm し、それ以前の commit は記録対象外。
+- 登録は `Storage::open_registered_snapshot`（ログのロックを保持して `ReadTransaction` を開き `G_s` を
+  読んで登録）。`ActiveTxn::registration` が持ち、writer を `active.writer` へ格納した後に外す
+  （#2405 の判定の差し込み位置。判定中に必要な記録を刈り込ませない）。
+- 追記は `commit_and_finish` の準備段階（世代の採番と検査。durable な書き込みの前）と、commit 成功後・
+  permit 解放前（post-commit 区間の先頭）の 2 段。追記は panic・失敗させない（mutex の汚染は回収して
+  `tainted` を立て、照会側が判定不能として扱う）。
+- 書き込まれた表は表世代の差分（`catalog::changed_table_generations_in_write_txn`）で確定する。
+  開始時点の確定状態は、記録を始めた永続ストレージで `begin_write` の直後に開いた `ReadTransaction` を
+  使う。差分を取るのは commit の準備段階で登録が存在するときだけで、登録が無ければ差分も取らず記録も
+  保持しない。準備段階の後に登録が現れた場合は、その commit の記録が無いので床をその世代まで上げる
+  （fail-closed。`BEGIN` が進行中の autocommit と重なると、その `BEGIN` は最初の書き込みで `40001`
+  になりうる。偽陽性側で、窓は準備段階から追記までに限られる）。
+- 行の足跡は書き込み点が `note_row`・`note_row_bytes`（行のヘッダから `(tenant_id, visibility)` を読む）・
+  `note_table`（0 行でも世代を進める経路）・`note_ddl` で、`GatedWriteTxn`（`Box` でアドレス固定）に結び付く
+  frame へ積む。frame は process 共有の登録簿にアドレスをキーとして置く（逆参照しない）。
+  書き込まれた表のうち足跡も DDL も積まれていないものがあれば、redb の commit より前に拒否する
+  （`StorageError::CommitFootprintUnrecordable`。`54000` の固定文言 `commit footprint limit exceeded`。
+  テナント ID・表名・件数は含めない）。書き込み点の結線漏れは取りこぼしではなく拒否として表れる。
+  クレート内テストでは常に検査する（`cfg(test)` で記録要否を常に真にしている）ため、全既存テストが
+  結線漏れの検出器になる。
+- `Public` 行は表ごとに 1 要素へ畳む。`PolicyContext::is_visible` は `Public` 行のテナントを見ないため
+  判定は変わらない（`commit_log::tests::public_collapse_matches_policy_is_visible` が `is_visible` に対して
+  固定する）。`Private` は `(tenant_id, Private)` のまま畳まない。更新で可視性が変わらない経路は更新後の
+  行 1 つで前後を表し、削除・置換・TRUNCATE は消える前の行のヘッダから積む。
+- DDL（スキーマ・カタログ・マテビュー実体・トリガ・移行）は `note_ddl`。マテビューの更新を DDL として
+  扱うのは偽陽性側の近似（読んだセッションに `40001` が出る側）で、行の足跡を持たない実体の更新を
+  表単位で表す。
+
+| 定数（実装既定値。spec 由来の数値ではない） | 値 | 超えたときの扱い |
+| --- | --- | --- |
+| `MAX_COMMIT_RECORDS` | 16384 | 最古から追い出し、床を上げる |
+| `MAX_FOOTPRINT_ELEMENTS`（全記録の合計） | 262144 | 同上 |
+| `MAX_FOOTPRINT_ELEMENTS_PER_COMMIT` | 1024 | commit 前に `54000` で拒否 |
+| `MAX_READ_SET_TABLES` | 1024 | ワイルドカードへ畳む |
+
+1 commit の上限は全体の上限より小さい。RLS 下の書き込みは所有者の行に限られるため、通常の 1 commit が持つのは
+表ごとに「自テナントの Private」と「Public」の 2 要素までで、1 commit の上限は複数テナントにまたがる管理系
+経路のためのもの。
+
+照会 API は `CommitLog::records_between(g_s, g_now)`（床より古い・世代の欠け・汚染は `Unverifiable`）、
+`SessionTransaction::read_set()`・`snapshot_generation()`。本番からはまだ呼ばれない（#2405 が結線する）。
+
+**足跡の取り方（経路ごと）**:
+
+| 経路 | 足跡 |
+| --- | --- |
+| 挿入（単一・複数・型付き・トリガ・UPSERT の挿入側） | `insert_unique_row` が書いた行のヘッダから |
+| 更新（単一行・述語形・結合形・トリガ・UPSERT の更新側・FK の連鎖） | 更新後の行（可視性は不変）。UPSERT の更新側は更新前の行も |
+| 削除（単一行・述語形・置換・FK の連鎖・トリガ） | 消える前の行のヘッダ |
+| TRUNCATE | `retain_in` で消える各行のヘッダ（0 行でも `note_table`） |
+| DDL・マテビュー・トリガ定義・採番・CTAS・移行 | `note_ddl` |
+| テスト専用の生の挿入 | `note_row` |
+
 ### 2. writer gate（待機上限付き。ロック待ちで `55P03`）
 
 `crates/engine/src/storage/writer_gate.rs`。`Mutex<GateState>` と `Condvar` で
@@ -332,11 +410,28 @@ Failed { session_at_begin: SessionState, expired: bool } }`）。`ActiveTxn` は
 
 - **改訂（#2396・1a。#2399 で状態の形を実施済み）**: `ActiveTxn` は `writer: Option<GatedWriteTxn>`
   （未取得／取得済み）と `BEGIN` 時点の確定済み `read_snapshot: ReadTransaction` を持つ。
-  - 挙動不変のリファクタ（SQL-31・PERSIST-4・TASK-333）。writer は現状も `BEGIN` で取得するため、
-    `Active` の間は常に `Some`。スナップショットはどの読み取り経路にも結線していない
-    （結線は #2400・#2403）。
-  - スナップショットは writer の取得**後**に開く（permit 保持中に開けば文ごとの読み取りと同じ確定
-    状態になり挙動が変わらない）。#2400 で `BEGIN` 時に先に開く順序へ変える。
+  - #2399 は挙動不変のリファクタ（SQL-31・PERSIST-4・TASK-333）。#2400 で明示トランザクションの
+    writer を `BEGIN` ではなく**最初の書き込み文**で取得する形へ変えた（BREAKING。実施済み）。
+    `BEGIN` は読み取りスナップショットだけを開き、writer を待たない（`55P03` も出さない）。
+  - 取得の入口は `SessionTransaction::ensure_writer`（冪等）。`core.rs` の書き込み腕
+    （INSERT・ビュー DML・DELETE・UPDATE・TRUNCATE・データ変更 CTE・INSERT…SELECT・`setval` 系）が
+    `write_txn()` を取る直前に呼ぶ。`COPY FROM` は確定処理（CopyDone 後）で取得するため、
+    データ受信中は持たない。`lastval` も同じ腕のため writer を取る（粒度は粗いが安全側）。
+    DDL（`0A000`）・一時表・読み取り・カーソルは取得しない。ロック句・`LOCK TABLE` は今も
+    `42601` で拒否されるので届かない（#2230・#1958 は同じ入口を呼ぶ）。
+  - `55P03`（待機上限超過）の発生点は `BEGIN` から最初の書き込み文へ移る。受けた Tx は `Failed`
+    になり、以降の文は `25P02`、受理するのは `ROLLBACK` だけ。取得前は何も書いていない。
+  - `ensure_writer` は 1a-3 の「gate 取得 → permit 保持のまま判定 → 格納」の挿入点で、#2405 が
+    取得と格納の間に `40001` 判定を入れる。
+  - 暗黙トランザクション（WIRE-16）は従来どおり開始時に writer を取る（スナップショットは取得後に開く。#2401）。
+  - 取得の前後の回帰（read-your-writes・COMMIT までの隔離・ROLLBACK 後のキャッシュ非汚染・ファイル形
+    `INSERT`・`USING PLAN`・`EXPLAIN`・`COPY FROM`・`setval`）は #2402 のテストで固定済み（SQL-19・SQL-31）。
+  - **暫定の読み取りの意味**: スナップショット（`read_snapshot`）の結線は #2403 のため、writer 取得前の
+    読み取りは文ごとの確定済み状態を見る。後続の `40001` 判定にとっては、読みが `BEGIN` 時点より新しい
+    側へずれるだけで、偽陽性側にしか倒れず偽陰性は生まない。
+  - DoS 面: `BEGIN` だけで黙る接続が単一ライタを占有できなくなる。一方、読み取りだけの Tx は
+    `ReadTransaction` を最大 `max_duration` 保持し、その間は redb がページを回収できない（有界。
+    期限切れ処理がスナップショットを解放する）。
   - writer が `None` で `has_writes` が真の状態は不変条件違反で、`COMMIT` は `XX000`
     （`session` を開始時点へ復元）、`dirty_tables` は `Err` で fail-closed に倒す。
   - writer を取得しないまま `COMMIT` した場合は読み取りトランザクションを drop するだけで、
@@ -479,11 +574,15 @@ Search・Aggregate・Scan）は確定済みのまま出力が決まる。想定�
 `docs/spec/04-behavior/data-model.md` TABLE-3、`docs/spec/04-behavior/persistence.md` PERSIST-4。
 構文の実装は #1938（`ISOLATION LEVEL`）・#1939（`SET TRANSACTION`／`SET SESSION CHARACTERISTICS`）・
 Issue #1931（`READ ONLY`）、挙動テストは #1940、`40001` は #2396 が担う。
-現状の main では `BEGIN ISOLATION LEVEL ...` は `42601` で拒否される
-（`validate_transaction_control_tokens`）。`BEGIN READ ONLY` は構文受理後に暫定ゲートで `0A000` となる。#1938 がこの拒否を受理へ変え、コードコメントとテストも更新する。
+`BEGIN ISOLATION LEVEL ...` の構文解釈は Issue #1938 で実装した（`validate_transaction_control_tokens`）。
+受理範囲・エラー契約は上記ポインタ先に従い、本書には記述しない。
+`START TRANSACTION`／`END`／`ABORT` の別名は Issue #1930 で受理した（下記「別名」節）。`BEGIN READ ONLY` は構文受理後に暫定ゲートで `0A000` となる。
 
 - **engine の宣言型**: `crates/engine/src/txn.rs` の `IsolationLevel` は単一バリアントのまま維持する。
-  保持の形は #1938・#1939 で決める。
+  #1938 は要求されたレベルを別の `sql::transaction::RequestedIsolationLevel` として
+  `ValidatedTxnControl`（`ParsedSql::Transaction` の payload）から `ActiveTxn` へ記録するだけで、
+  実行は変えない（`SessionTransaction::isolation_level()` で読める。暗黙・未指定は `None`）。
+  `SET TRANSACTION` 系の保持は #1939 で決める。引用識別子の `"ISOLATION"` 等が受理される既存の性質は変えていない。
 - **fail-closed・テナント境界**: 未対応・不正な形は従来どおり `42601`／`0A000` で拒否する。
   分離レベルの指定は RLS 相当のテナント境界にも可視集合にも影響しない。
 - **未割り当ての後続**: `SHOW` による分離レベル等の表示対応を担う sub-issue は #1936 配下にまだ無い。担当は #1936 で決める。
@@ -511,10 +610,10 @@ Issue #1931（`READ ONLY`）、挙動テストは #1940、`40001` は #2396 が�
 
 | 形 | spec ポインタ | 担当 | 現状 |
 | -- | ------------- | ---- | ---- |
-| 行ロック句 4 種・`OF`・`NOWAIT`・`SKIP LOCKED` の構文 | SQL-38 (7) | #1957 | `42601` |
+| 行ロック句 4 種・`OF`・`NOWAIT`・`SKIP LOCKED` の構文 | SQL-38 (7) | #1957 | 構文解釈済み（`ParsedSql::LockingSelect`）。実行は #2230 まで `0A000` の暫定ゲート |
 | 行ロック句によるロック取得・`NOWAIT` | SQL-38 (4) | #2230 | `42601` |
 | `SKIP LOCKED` の実行 | SQL-38 (4) | #2231 | `42601` |
-| `LOCK [TABLE]` の 8 モードの構文・取得・表名の解決 | SQL-38 (4)(7) | #1958 | `42601` |
+| `LOCK [TABLE]` の 8 モードの構文・取得・表名の解決 | SQL-38 (4)(7) | #1958 | 実装済み（#1958） |
 | READ ONLY トランザクション内での扱い | SQL-38 (3) | #1933・#1931 | `42601` |
 | writer 取得時の直列化判定 | SQL-38 (2)・SQL-31 | #2396 系 | 1a 節の記録のとおり |
 
@@ -646,6 +745,12 @@ production コード（`crates/wire-server/src/`）は無変更・テスト専�
   順序）、wire の `crates/wire-server/tests/recover12_explicit_txn_resend.rs`（層 A）、
   `three_client_e2e.rs` の層 B（psql／psycopg／node pg の 3 クライアント。
   [`three-client-e2e-harness.md`](./three-client-e2e-harness.md)）。
+- 暗黙トランザクションが従来どおり開始時に writer を取ることの固定（Issue #2401。SQL-31・
+  WIRE-16。本番コードの変更は無い）: 取得は開始時の 1 回だけで最初の書き込み文では取り直さない
+  （`core/deferred_writer_tests.rs`。明示 Tx との対照つき）、先頭の読み取りを跨いで保持する・
+  開始自体が `55P03` で `Idle` のまま 1 文も実行されない（`tests/core_misc/wire16_implicit_txn.rs`）、
+  待機上限での `55P03`（`tests/write_lock_wait.rs`）、wire 越しの複数文メッセージ
+  （`crates/wire-server/tests/write_lock_wait_parity.rs`）。
 - 先頭文（または唯一の文）が 0 行 DELETE の場合の再送判定（Issue #1403。実装済み）:
   明示トランザクション内の DELETE は autocommit と同じフォーム関数へ `WriteTarget::InTxn`
   を渡し、0 行でも台帳を共有 write txn へ記録して `mark_written` する。このため従来の
@@ -696,7 +801,7 @@ production コード（`crates/wire-server/src/`）は無変更・テスト専�
   書き込み可能な Tx を渡さないよう `0A000` で拒否する暫定ゲート（write txn を取る前・状態は
   `Idle` のまま）。PostgreSQL との差異として、アクセスモードの重複・矛盾（`READ ONLY READ WRITE`）
   は `42601`（fail-closed）。引用識別子 `"READ"` も受理される（既存の `"WORK"` と同じ性質）。
-- savepoint、`COMMIT AND CHAIN`・`PREPARE TRANSACTION`（いずれも `0A000`）。分離レベルの指定は「分離レベルの受理方針」節のポインタ先の契約に従い #1938・#1939 が実装する。
+- savepoint、`COMMIT AND CHAIN`・`PREPARE TRANSACTION`（いずれも `0A000`）。分離レベルの指定は「分離レベルの受理方針」節のポインタ先の契約に従う（`BEGIN ISOLATION LEVEL` は #1938 で実装済み、`SET TRANSACTION` 系は #1939）。
   別名 `START TRANSACTION`／`END`／`ABORT` は Issue #1930 で受理した（下記「別名」節）。
 - NoSQL 表層のトランザクション（設計上 `0A000`。`op` 許可リストに追加しない）。
 - 上限の既定値（20 秒・1,000 件・30 秒）と CLI のハード上限（60 秒・10,000 件。Issue #1553 で暫定採用）の確定 → オーナー判断。
