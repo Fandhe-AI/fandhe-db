@@ -186,6 +186,32 @@
 | `WITH CHECK` 違反は `42501`。エラーは書こうとした行の情報だけ | 論点 4・エラー契約 |
 | 式内の部分クエリ・関数も呼び出し元のテナント境界内で評価。`SECURITY DEFINER` でも切り替わらない | 論点 4 |
 
+## 有効化状態（#2275）
+
+`ALTER TABLE ... ENABLE／DISABLE／FORCE／NO FORCE ROW LEVEL SECURITY`（RLS-13 のポインタ）の状態の保存形と判定式。
+本 Issue が入れるのは構文・DDL の実行・永続化・ライフサイクル追随・判定 API だけで、行の見え方への適用は #2276 以降。
+
+- **保存形**: redb 表 `table_row_security`。キーは `(表キー, tenant_id)`、値は `[版, flags]` の 2 バイト（bit0 = enabled、
+  bit1 = forced、他は 0 必須）。最初の書き込みまで表を作らず、両ビットとも false なら行を消す（行が無い＝既定）。
+  decode は長さ・版・予約ビットを検証し、不正は固定文言の `CorruptSchema`（`XX000`）で断片を出さない
+- **2 ビットの独立**: PG の `relrowsecurity`・`relforcerowsecurity` と同じ。各アクションは自分のビットだけを変える
+  （`ENABLE`／`DISABLE` は enabled、`FORCE`／`NO FORCE` は forced）。FORCE だけで ENABLE していなければ誰にも適用しない
+- **判定式**: `RowSecurityState::user_policies_apply(is_owner) = enabled && (!is_owner || forced)`。`BYPASSRLS`・
+  `row_security` は #2278 が前段に足す。`is_owner` は引数で受け、所有者の根拠は #2278 が決める
+- **テナント独立**: 状態はテナントごと。全 API が `tenant_id` を必須に取り、範囲走査でも突き合わせる。
+  テナント境界（`PolicyContext`・`ImplicitRlsHook`）には触れない（判断 A）
+- **再指定**: 状態が変わらない再指定は成功の no-op（カタログも表の世代も変えない）。変わったときは世代を進める
+- **ライフサイクル**: `DROP TABLE`（`DROP SCHEMA ... CASCADE` 経由を含む）で全テナント分を削除し、`RENAME TO` で
+  新しい表キーへ移す。`SET SCHEMA` は表キーが変わらないので追随不要
+- **所有者の代替**: DDL を実行できる主体は #2274 と同じく DDL 実行権限ゲート（カタログ照会より前）で判定する。
+  権限の無い主体には対象の有無を問わず `42501`
+- **PG との差**: (1) `ENABLE ..., FORCE ...` のように RLS アクションを含む複数アクションの `ALTER TABLE` は `0A000`
+  （PG は受理）。(2) 明示トランザクション内の DDL は既存どおり `0A000`。(3) 一時表が同名の永続表を隠しているとき、
+  永続表の状態を黙って変えず `0A000`（一時表の行セキュリティは未対応）。(4) NoSQL の `alter_table` op は閉じた
+  JSON スキーマで本 DDL に到達しない（#2280）
+- **暫定状態**: #2276 が入るまで ENABLE しても自テナント内の行の見え方は変わらない（ポリシー定義と同じく、状態だけを
+  先行して入れる）。行の見え方の PG 17 照合（4 状態 x 所有者/非所有者）は #2276・#2278 へ申し送る
+
 ## sub-issue への申し送りと未決事項
 
 | Issue | 本書で担当する節・判断 |
