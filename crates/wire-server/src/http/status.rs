@@ -72,6 +72,10 @@ pub const fn http_status(class: ErrorClass) -> u16 {
         // 待ちタイムアウト。NoSQL 表層からは `insert`／`update`／`delete` op が
         // 待たされて到達しうる（一時的なサーバー側の輻輳として 503 に射影する）。
         ErrorClass::LockNotAvailable => 503,
+        // TASK-333・Issue #2398・ERR-4・ERR-7: 直列化の失敗（`40001`）。対象の状態と矛盾する
+        // 一時的な失敗で、`ROLLBACK` の後に最初から再試行してよいため 409 に射影する。
+        // NoSQL の 1 要求は開始時に writer を取る暗黙トランザクションのため到達しない。
+        ErrorClass::SerializationFailure => 409,
         // Issue #1798・ERR-6: 協調的中断（`57014`）。サーバー側の都合で打ち切られた一時的な失敗として
         // `LockNotAvailable` と同じ 503 に射影する（HTTP 表層への到達経路は #1951 以降）。
         ErrorClass::QueryCanceled => 503,
@@ -246,7 +250,7 @@ mod tests {
 
     /// 期待表を明示的に列挙し、`ErrorClass::ALL` との突き合わせで非 vacuous に検証する。
     /// `match` にアームを足したが期待表の更新を忘れた、という乖離を (a)(b) が検出する。
-    const EXPECTED: [(ErrorClass, u16); 97] = [
+    const EXPECTED: [(ErrorClass, u16); 98] = [
         (ErrorClass::InvalidInput, 400),
         (ErrorClass::StringDataRightTruncation, 400),
         (ErrorClass::AuthInvalid, 401),
@@ -278,6 +282,7 @@ mod tests {
         (ErrorClass::IntervalFieldOverflow, 400),
         (ErrorClass::InvalidTextRepresentation, 400),
         (ErrorClass::LockNotAvailable, 503),
+        (ErrorClass::SerializationFailure, 409),
         (ErrorClass::ObjectNotInPrerequisiteState, 409),
         (ErrorClass::SequenceGeneratorLimitExceeded, 400),
         (ErrorClass::DuplicateSchema, 409),
