@@ -221,7 +221,7 @@ Issue（#2399〜#2405・#2408〜#2413）が拠り所にする設計記録で、�
 #### 1a-9. 本節で決めないこと（申し送り）
 
 - `55P03` が出る箇所・上限の起点・状態バイトの検証と層 B → #2408
-- READ ONLY → #1933、行ロック句 → #2230
+- READ ONLY → #1933、行ロック句・`LOCK TABLE` → 「行ロック句・`LOCK TABLE` の扱い」節（#2230・#2231・#1957・#1958）
 - CHANGELOG と `implementation-status.md` → #2413
 - 早期の事前判定（gate を待つ前に明らかな衝突を返す最適化）は任意とし、#2405 の判断に委ねる。
 
@@ -325,15 +325,23 @@ DML は `PredicateDmlError<E>` を使う）を導入した。Issue #942 では�
 
 `SessionTransaction<'e>`（`enum TxnState<'e> { Idle, Active(Box<ActiveTxn<'e>>),
 Failed { session_at_begin: SessionState, expired: bool } }`）。`ActiveTxn` は
-`write_txn: GatedWriteTxn`（permit を内包）・`started_at`・
+`writer: Option<GatedWriteTxn>`（permit を内包）・`read_snapshot: ReadTransaction`・`started_at`・
 `statements`・`seen_operation_ids`・`written_tables`・`written_by_tenant`・`has_writes`・
 `session_at_begin` と、dirty テーブル判定（確定済みの世代の読み取り）に使う
 `&'e Storage` を保持する。
 
-- **改訂（#2396・1a）**: `ActiveTxn.write_txn` は常に持つ前提ではなくなる。`BEGIN` 時点の
-  確定済み `ReadTransaction` と `Option` の writer（未取得／取得済み）の形に変わる（#2399）。
-  writer を取得しないまま `COMMIT` した場合は読み取りトランザクションを drop するだけで、
-  commit も世代の更新もしない。以下の記述は改訂前（`BEGIN` で取得）のもの。
+- **改訂（#2396・1a。#2399 で状態の形を実施済み）**: `ActiveTxn` は `writer: Option<GatedWriteTxn>`
+  （未取得／取得済み）と `BEGIN` 時点の確定済み `read_snapshot: ReadTransaction` を持つ。
+  - 挙動不変のリファクタ（SQL-31・PERSIST-4・TASK-333）。writer は現状も `BEGIN` で取得するため、
+    `Active` の間は常に `Some`。スナップショットはどの読み取り経路にも結線していない
+    （結線は #2400・#2403）。
+  - スナップショットは writer の取得**後**に開く（permit 保持中に開けば文ごとの読み取りと同じ確定
+    状態になり挙動が変わらない）。#2400 で `BEGIN` 時に先に開く順序へ変える。
+  - writer が `None` で `has_writes` が真の状態は不変条件違反で、`COMMIT` は `XX000`
+    （`session` を開始時点へ復元）、`dirty_tables` は `Err` で fail-closed に倒す。
+  - writer を取得しないまま `COMMIT` した場合は読み取りトランザクションを drop するだけで、
+    commit も世代の更新もしない（一時側の確定・`ON COMMIT` は従来どおり実行する）。
+  以下の記述は改訂前（`BEGIN` で取得）のもの。
 - **`BEGIN`**: `Idle` → `Active`（`Storage::begin_explicit_write_txn` 経由。改訂後は
   `BEGIN` で writer を取得しない。取得は最初の書き込み文）。
   `Active` 中の再 `BEGIN` は `25001`（`ActiveSqlTransaction`）で `Failed` へ
@@ -482,6 +490,47 @@ Issue #1931（`READ ONLY`）、挙動テストは #1940、`40001` は #2396 が�
 - **公開境界**: 受理範囲などの契約詳細を本書へ記述する場合は、AGENTS.md の公開境界拡張手順（管理者承認）が必要。
   現時点では承認を得ておらず、記述していない。
 
+## 行ロック句・`LOCK TABLE` の扱い（Issue #1956）
+
+行ロック句（`SELECT ... FOR UPDATE／NO KEY UPDATE／SHARE／KEY SHARE [OF ...] [NOWAIT|SKIP LOCKED]`）と
+`LOCK TABLE` の受理・結果の契約は spec 側が定義する。本節は実装側の写像と担当の分担だけを記録し、
+各形の SQLSTATE・`SKIP LOCKED` の結果・トランザクション外の扱い・併用可否は本書へ記述しない。
+ポインタは `docs/spec/04-behavior/sql-surface.md` SQL-38（(3)(4)(5)(7)）・SQL-31、
+`docs/spec/04-behavior/data-model.md` TABLE-3、`docs/spec/04-behavior/persistence.md` PERSIST-4、
+関連は RLS-12・RLS-7。現状の main では行ロック句・`LOCK TABLE` はいずれも `42601` で拒否される（#1955 の現状欄）。
+
+- **判断（実装側の写像）**: 行ロック句と `LOCK TABLE`（8 モード）は、単一ライタの writer 取得に写す。
+  行・表・ロックモードの粒度は区別しない。根拠は 1a-1（書き込み文の一覧にロック句・`LOCK TABLE` が含まれ、
+  writer 取得の契機になる）と #1955 本文。行単位の細粒度ロックと複数ライタ（MVCC）は対象外（#1955 本文）。
+- **取得経路（実装側の判断）**: 明示トランザクション内では #2396 の遅延取得経路
+  （`Storage::begin_explicit_write_txn`、`crates/engine/src/storage/writer_gate.rs` の `acquire`）を使い、
+  取得時の `40001` 判定も同じ経路に載せる（1a-3・1a-6）。待機上限は 2 節の書き込みロック待機上限
+  （`StorageError::WriteLockTimeout` から `55P03` への写像）に従う。
+  `NOWAIT` は「即時取得を試みる経路」で実現する。既存の `acquire` ／ `acquire_yielding` の流用か
+  新しい API にするかは #2230 で決める。
+
+| 形 | spec ポインタ | 担当 | 現状 |
+| -- | ------------- | ---- | ---- |
+| 行ロック句 4 種・`OF`・`NOWAIT`・`SKIP LOCKED` の構文 | SQL-38 (7) | #1957 | `42601` |
+| 行ロック句によるロック取得・`NOWAIT` | SQL-38 (4) | #2230 | `42601` |
+| `SKIP LOCKED` の実行 | SQL-38 (4) | #2231 | `42601` |
+| `LOCK [TABLE]` の 8 モードの構文・取得・表名の解決 | SQL-38 (4)(7) | #1958 | `42601` |
+| READ ONLY トランザクション内での扱い | SQL-38 (3) | #1933・#1931 | `42601` |
+| writer 取得時の直列化判定 | SQL-38 (2)・SQL-31 | #2396 系 | 1a 節の記録のとおり |
+
+- **READ ONLY トランザクション内**: 現状は #1932 の暫定ゲートが `BEGIN READ ONLY` 自体を拒否する
+  （「対象外・申し送り」のアクセスモード修飾子の項）ため、READ ONLY の Tx 内にロック句が届くことは無い。
+  #1933 で READ ONLY の実体が入った後の扱いは SQL-38 (3) のポインタに従う。
+- **要確認（担当 Issue が確定する。本節では決めない）**:
+  - `SKIP LOCKED` の結果規則（単一ライタの下でどの行を飛ばすか）→ #2231（SQL-38 (4)）
+  - トランザクション外の `LOCK TABLE` のエラー契約 → #1958（#1958 本文でも要確認）
+  - autocommit の文に付いたロック句が writer を保持する期間 → #2230
+- **テナント境界（fail-closed）**: ロック句の結果と `LOCK TABLE` の表名解決を、他テナントの行・表の
+  存在や件数のオラクルにしない。1a-6 の「可視性判定関数を共有し、側チャネルを作らない」を再利用する
+  （SQL-38 (5)・RLS-12・RLS-7）。未対応の形は従来どおり `42601`／`0A000` で拒否する。
+- **公開境界**: 受理範囲・SQLSTATE などの契約詳細を本書へ記述する場合は、AGENTS.md の公開境界拡張手順
+  （管理者承認）が必要。現時点では承認を得ておらず、記述していない。
+
 ## `#943` との分担
 
 `ReadyForQuery` の状態バイト（`'I'`／`'T'`／`'E'`。WIRE-19）は当初 `#943` が
@@ -628,7 +677,7 @@ production コード（`crates/wire-server/src/`）は無変更・テスト専�
 
 - #2396 関連の申し送り: #2408（`55P03`・上限の起点・カーソル・状態バイトの整合と層 B）、
   #2411（カーソルの分割の実装）、#2413（CHANGELOG・実装記録）、#1933（READ ONLY）、
-  #2230（行ロック句）。
+  #2230（行ロック句・`LOCK TABLE` は専用節を参照）。
 - 書き込み後の読み取りでのキャッシュ・HNSW の再利用（テーブル単位の最適化。現状は
   brute-force）。
 - `DUPLICATE_OPERATION_ID` と `UNIQUE_VIOLATION` の `code` ラベル区別は Issue #1180 で

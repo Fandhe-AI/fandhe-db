@@ -6,8 +6,9 @@
 //! [`SessionTransaction`] を保持し、`core::EngineCore::execute_sql_in_txn`／
 //! `execute_parsed_in_txn` へ `&mut` で渡す。`Idle`（トランザクション外）の間は
 //! 既存の autocommit 経路（[`crate::core::EngineCore::execute_sql_in_session`]）と
-//! ビット同一に振る舞い、`Active` の間だけ共有 `redb::WriteTransaction`
-//! （[`crate::storage::Storage::begin_explicit_write_txn`]）を保持して複数の
+//! ビット同一に振る舞い、`Active` の間は `BEGIN` 時点の読み取りスナップショットと、
+//! 共有 `redb::WriteTransaction`（[`crate::storage::Storage::begin_explicit_write_txn`]。
+//! 取得済み／未取得を `Option` で表し、現状は `BEGIN` で取得する）を保持して複数の
 //! 書き込み文を 1 回の commit にまとめる。
 //!
 //! commit 成功境界（`RECOVER-5`・`RECOVER-6`）: point of no return は `COMMIT`
@@ -192,15 +193,26 @@ enum TxnOrigin {
     Implicit,
 }
 
-/// トランザクション中に開いている共有書き込みトランザクションと、その
-/// 付随状態。`write_txn`（[`crate::storage::GatedWriteTxn`]）は書き込みゲートの
-/// permit を内包し、drop 時は abort してから permit を解放する。
+/// トランザクション中の状態。`BEGIN` 時点の読み取りスナップショット（`read_snapshot`）と、
+/// 取得済み／未取得を表せる共有書き込みトランザクション（`writer`）、およびその付随状態を持つ
+/// （SQL-31・PERSIST-4・TASK-333、Issue #2399。設計記録は `docs/design/explicit-transaction.md`）。
+/// `writer` の中身（[`crate::storage::GatedWriteTxn`]）は書き込みゲートの permit を内包し、
+/// drop 時は abort してから permit を解放する。フィールドの宣言順が drop 順で、`writer` を
+/// `read_snapshot` より先に置いて permit の解放を遅らせない。
 struct ActiveTxn<'e> {
     origin: TxnOrigin,
     /// アクセスモード（SQL-38・Issue #1932）。#1933／#1934 が読み取り Tx の開始と
     /// 書き込み拒否の判定に使う。現状 `ReadOnly` は開始前に拒否されるため常に `ReadWrite`。
     access_mode: TxnAccessMode,
-    write_txn: crate::storage::GatedWriteTxn,
+    /// 共有書き込みトランザクション。`None` は writer 未取得（後続 Issue #2400 以降に生じる
+    /// 状態）。本 Issue の時点では `BEGIN`（明示・暗黙とも）で必ず取得するため、`Active` の間は
+    /// 常に `Some`。
+    writer: Option<crate::storage::GatedWriteTxn>,
+    /// `BEGIN` 時点の確定済み読み取りスナップショット。writer 取得の後に開くため、文ごとの
+    /// 読み取りが見る確定状態と同じ。本 Issue ではどの読み取り経路にも結線しない（結線は
+    /// #2400・#2403）。`ActiveTxn` を捨てる全経路で自動的に解放される。
+    #[allow(dead_code)]
+    read_snapshot: redb::ReadTransaction,
     /// 一時表（TABLE-44・Issue #1684）の書き込みトランザクション。最初の一時表の文で遅延して開く。
     /// `ActiveTxn` を取り出して drop する全経路（`rollback`／`fail`／`release_if_expired`／
     /// 暗黙の abort／`SessionTransaction` の drop）で自動的に abort する。commit は
@@ -511,7 +523,7 @@ impl<'e> SessionTransaction<'e> {
         match std::mem::replace(&mut self.state, TxnState::Idle) {
             TxnState::Active(active) if active.origin == TxnOrigin::Implicit => {
                 let ActiveTxn {
-                    write_txn,
+                    writer,
                     temp,
                     started_at,
                     has_writes,
@@ -522,13 +534,13 @@ impl<'e> SessionTransaction<'e> {
                     ..
                 } = *active;
                 if started_at.elapsed() > self.limits.max_duration {
-                    drop(write_txn);
+                    drop(writer);
                     *session = session_at_begin;
                     return Err(SqlSurfaceError::payload_too_large(LIMIT_EXCEEDED_MESSAGE));
                 }
                 commit_active(
                     storage,
-                    write_txn,
+                    writer,
                     temp,
                     has_writes,
                     &written_by_tenant,
@@ -563,7 +575,7 @@ impl<'e> SessionTransaction<'e> {
         if !self.is_implicit_active() {
             return false;
         }
-        // `write_txn` は drop（abort）され、内包する permit はその後に解放される。
+        // `writer` は drop（abort）され、内包する permit はその後に解放される。
         self.state = TxnState::Idle;
         true
     }
@@ -578,13 +590,13 @@ impl<'e> SessionTransaction<'e> {
         match &self.state {
             TxnState::Idle => {
                 // 暫定ゲート（#1933／#1934 で除去）: 読み取り専用を宣言した接続へ書き込み可能な
-                // Tx を渡さないよう、write_txn を取る前に拒否する（状態は `Idle` のまま）。
+                // Tx を渡さないよう、writer を取る前に拒否する（状態は `Idle` のまま）。
                 if access_mode == TxnAccessMode::ReadOnly {
                     return Err(SqlSurfaceError::feature_not_supported(
                         "BEGIN READ ONLY is not supported yet",
                     ));
                 }
-                // 壁時計の読み取り失敗（範囲外）は write_txn を開く前に fail-closed で返す
+                // 壁時計の読み取り失敗（範囲外）は writer を開く前に fail-closed で返す
                 // （状態は `Idle` のまま）。
                 let txn_start_micros = crate::sql::time_fn::now_micros()?;
                 let write_txn = storage
@@ -598,9 +610,25 @@ impl<'e> SessionTransaction<'e> {
                 // 閉包へ move させないよう、先に `match` で判定してから
                 // 代入する（`ok_or_else` クロージャは呼ばれない場合でも
                 // 構築時に move が確定するため使えない）。
+                // 読み取りスナップショットは writer（permit）取得の後に開く。permit 保持中に
+                // 開けば文ごとの `begin_read_txn()` が返すものと同じ確定状態になり挙動が
+                // 変わらない（writer の前に開くとゲート待ちの間の他者の commit を跨ぎうる）。
+                // 失敗時は writer を解放して `Idle` のまま固定文言の `XX000` で拒否する
+                // （fail-closed）。
+                let read_snapshot = {
+                    use redb::ReadableDatabase;
+                    match storage.db().begin_read() {
+                        Ok(snapshot) => snapshot,
+                        Err(_) => {
+                            drop(write_txn);
+                            return Err(internal_error());
+                        }
+                    }
+                };
                 let next_generation = match self.generation.checked_add(1) {
                     Some(g) => g,
                     None => {
+                        // 読み取りスナップショットは関数を抜ける際に併せて解放される。
                         drop(write_txn);
                         return Err(SqlSurfaceError::Internal {
                             detail: "internal error".to_string(),
@@ -611,7 +639,8 @@ impl<'e> SessionTransaction<'e> {
                 self.state = TxnState::Active(Box::new(ActiveTxn {
                     origin,
                     access_mode,
-                    write_txn,
+                    writer: Some(write_txn),
+                    read_snapshot,
                     temp: None,
                     started_at: Instant::now(),
                     txn_start_micros,
@@ -663,7 +692,7 @@ impl<'e> SessionTransaction<'e> {
             }
             TxnState::Active(active) => {
                 let ActiveTxn {
-                    write_txn,
+                    writer,
                     temp,
                     started_at,
                     has_writes,
@@ -674,8 +703,8 @@ impl<'e> SessionTransaction<'e> {
                     ..
                 } = *active;
                 if started_at.elapsed() > self.limits.max_duration {
-                    // `write_txn` を drop（abort）し、内包する permit を解放する。
-                    drop(write_txn);
+                    // `writer` を drop（abort）し、内包する permit を解放する。
+                    drop(writer);
                     self.state = TxnState::Failed {
                         session_at_begin: Box::new(session_at_begin),
                         expired: false,
@@ -685,7 +714,7 @@ impl<'e> SessionTransaction<'e> {
                 // 状態は冒頭の `mem::replace` で既に `Idle`。成否によらず `Idle`。
                 commit_active(
                     storage,
-                    write_txn,
+                    writer,
                     temp,
                     has_writes,
                     &written_by_tenant,
@@ -724,7 +753,7 @@ impl<'e> SessionTransaction<'e> {
                 Err(SqlSurfaceError::NoActiveSqlTransaction)
             }
             TxnState::Active(active) => {
-                // `write_txn` は先に drop（abort）してから `permit` を解放する
+                // `writer` は先に drop（abort）してから `permit` を解放する
                 // （構造体のフィールド宣言順どおりの drop 順序。writer_gate
                 // モジュールドキュメント参照）。
                 *session = active.session_at_begin;
@@ -819,9 +848,12 @@ impl<'e> SessionTransaction<'e> {
     pub(crate) fn dirty_tables(&self) -> Result<HashSet<String>, SqlSurfaceError> {
         match &self.state {
             TxnState::Active(active) if !active.has_writes => Ok(HashSet::new()),
-            TxnState::Active(active) => {
-                collect_dirty_tables(active.storage, &active.write_txn, &active.written_tables)
-            }
+            // writer 未取得で書き込み記録がある状態は不変条件違反。`Ok(empty)` にせず `Err` を返し、
+            // 呼び出し元（`table_already_written` 等）が fail-closed に dirty とみなす。
+            TxnState::Active(active) => match active.writer.as_deref() {
+                Some(w) => collect_dirty_tables(active.storage, w, &active.written_tables),
+                None => Err(internal_error()),
+            },
             _ => Ok(HashSet::new()),
         }
     }
@@ -853,12 +885,22 @@ impl<'e> SessionTransaction<'e> {
         }
     }
 
-    /// 現在保持している共有 `redb::WriteTransaction`（`Active` のときのみ
-    /// `Some`）。書き込み系の実行本体が [`crate::tenant::WriteTarget::InTxn`]
+    /// 現在保持している共有 `redb::WriteTransaction`（`Active` かつ writer 取得済みの
+    /// ときのみ `Some`）。書き込み系の実行本体が [`crate::tenant::WriteTarget::InTxn`]
     /// を構築するために使う。
     pub(crate) fn write_txn(&self) -> Option<&redb::WriteTransaction> {
         match &self.state {
-            TxnState::Active(active) => Some(&*active.write_txn),
+            TxnState::Active(active) => active.writer.as_deref(),
+            _ => None,
+        }
+    }
+
+    /// `BEGIN` 時点の確定済み読み取りスナップショット（`Active` のときのみ `Some`。
+    /// Issue #2399）。本番経路からはまだ呼ばれず、#2400・#2403 が読み取り経路へ結線する。
+    #[cfg_attr(not(test), allow(dead_code))]
+    pub(crate) fn read_snapshot(&self) -> Option<&redb::ReadTransaction> {
+        match &self.state {
+            TxnState::Active(active) => Some(&active.read_snapshot),
             _ => None,
         }
     }
@@ -1038,7 +1080,7 @@ fn internal_error() -> SqlSurfaceError {
 #[allow(clippy::too_many_arguments)]
 fn commit_active(
     storage: &crate::storage::Storage,
-    write_txn: crate::storage::GatedWriteTxn,
+    writer: Option<crate::storage::GatedWriteTxn>,
     temp: Option<TempTxn>,
     has_writes: bool,
     written_by_tenant: &std::collections::BTreeSet<(String, String)>,
@@ -1046,7 +1088,13 @@ fn commit_active(
     session_at_begin: SessionState,
     session: &mut SessionState,
 ) -> Result<(), SqlSurfaceError> {
-    if has_writes {
+    // writer 未取得で書き込み記録がある状態は不変条件違反（未 commit 変更の取りこぼしを
+    // 黙認しない）。fail-closed に開始時点へ復元して `XX000`。
+    if has_writes && writer.is_none() {
+        *session = session_at_begin;
+        return Err(internal_error());
+    }
+    if let (true, Some(write_txn)) = (has_writes, writer.as_deref()) {
         // 遅延 FK 検査の対象は「書き込んだテナント × dirty テーブル」の直積
         // （Issue #1179）。`mark_written` が記録するのは文が直接対象にしたテーブル
         // だけで、参照アクション（`CASCADE`・`SET NULL`・`SET DEFAULT`）の連鎖で
@@ -1054,10 +1102,10 @@ fn commit_active(
         // を持ちうるため、記録だけに頼ると COMMIT で違反を見逃す（fail-open）。
         // テーブル世代（書き換えた全経路が bump する契約）由来の dirty 集合との和を
         // 取り、テナント集合は上位集合（fail-closed）として全書き込みテナントを使う。
-        let dirty = match collect_dirty_tables(storage, &write_txn, written_tables) {
+        let dirty = match collect_dirty_tables(storage, write_txn, written_tables) {
             Ok(dirty) => dirty,
             Err(_) => {
-                drop(write_txn);
+                drop(writer);
                 *session = session_at_begin;
                 return Err(internal_error());
             }
@@ -1068,26 +1116,28 @@ fn commit_active(
             .iter()
             .flat_map(|tenant| dirty.iter().map(move |table| (*tenant, table)));
         for (tenant_id, table) in pairs {
-            if let Err(e) = crate::constraint::enforce_deferred_foreign_keys_in_txn(
-                &write_txn, tenant_id, table,
-            ) {
-                // `write_txn` を drop（abort）し permit を解放したうえで開始時点の
+            if let Err(e) =
+                crate::constraint::enforce_deferred_foreign_keys_in_txn(write_txn, tenant_id, table)
+            {
+                // `writer` を drop（abort）し permit を解放したうえで開始時点の
                 // セッション状態を復元する（commit 自体の失敗と同じロールバック扱い）。
-                drop(write_txn);
+                drop(writer);
                 *session = session_at_begin;
                 return Err(crate::sql::exec::map_write_error(e, "commit"));
             }
         }
     }
-    let result = if has_writes {
-        crate::recovery::commit_boundary::commit(write_txn)
-    } else {
-        drop(write_txn);
-        Ok(())
+    // 一時側の commit・`ON COMMIT` は書き込みの有無によらず実行するため、writer が無くても
+    // ここで早期 return しない。
+    let result = match writer {
+        Some(w) if has_writes => crate::recovery::commit_boundary::commit(w),
+        other => {
+            drop(other);
+            Ok(())
+        }
     };
     result.map_err(|_| {
-        // commit 失敗はロールバック扱い（`write_txn` は消費済みで、permit も
-        // 解放されている）。
+        // commit 失敗はロールバック扱い（writer は消費済みで、permit も解放されている）。
         *session = session_at_begin;
         internal_error()
     })?;
@@ -1425,5 +1475,124 @@ mod tests {
         // `begin`/`commit`/`rollback` 自体の redb 結線は `core.rs`・wire-server
         // 側の結合テストで検証する（本テストは構文受理のみを対象とする）。
         let _ = &mut txn;
+    }
+
+    /// 一時 DB に表を 1 つ作った `Storage` を返すテスト補助（Issue #2399 の単体テスト用）。
+    fn open_test_storage(
+        tag: &str,
+    ) -> (
+        crate::storage::Storage,
+        crate::test_util::temp_db::CleanupGuard,
+    ) {
+        use crate::catalog::{ColumnDef, ColumnType, TableSchema};
+        use crate::test_util::temp_db::{unique_db_path, CleanupGuard};
+        let path = unique_db_path(tag);
+        let guard = CleanupGuard(path.clone());
+        let storage = crate::storage::Storage::open(&path).expect("open storage");
+        storage
+            .create_table(&TableSchema::new(
+                "documents",
+                vec![ColumnDef::new("embedding", ColumnType::Vector(2), false)],
+            ))
+            .expect("create table");
+        (storage, guard)
+    }
+
+    /// `BEGIN` 後は writer と読み取りスナップショットの両方を保持し、終了経路
+    /// （COMMIT・ROLLBACK・fail・暗黙の abort）の後はどちらも手放す
+    /// （SQL-31・PERSIST-4・TASK-333、Issue #2399）。
+    #[test]
+    fn begin_holds_writer_and_read_snapshot() {
+        let (storage, _g) = open_test_storage("txn-2399-holds");
+        let mut session = SessionState::default();
+        let mut txn = SessionTransaction::new(TransactionLimits::default());
+
+        txn.begin(&storage, &session).expect("begin");
+        assert!(txn.write_txn().is_some());
+        assert!(txn.read_snapshot().is_some());
+        txn.commit(&mut session).expect("commit");
+        assert!(txn.write_txn().is_none() && txn.read_snapshot().is_none());
+
+        txn.begin(&storage, &session).expect("begin");
+        txn.rollback(&mut session).expect("rollback");
+        assert!(txn.write_txn().is_none() && txn.read_snapshot().is_none());
+
+        txn.begin(&storage, &session).expect("begin");
+        txn.fail();
+        assert_eq!(txn.status(), TransactionStatus::Failed);
+        assert!(txn.write_txn().is_none() && txn.read_snapshot().is_none());
+        txn.rollback(&mut session).expect("rollback");
+
+        txn.begin_implicit(&storage, &session)
+            .expect("begin_implicit");
+        assert!(txn.write_txn().is_some() && txn.read_snapshot().is_some());
+        txn.abort_implicit();
+        assert!(txn.write_txn().is_none() && txn.read_snapshot().is_none());
+    }
+
+    /// `BEGIN` 直後のスナップショットは、新たに開いた確定済み読み取りと同じ世代を指す
+    /// （writer 取得後に開くため挙動が変わらない、という不変条件。Issue #2399）。
+    #[test]
+    fn snapshot_matches_committed_state_at_begin() {
+        use redb::ReadableDatabase;
+        let (storage, _g) = open_test_storage("txn-2399-gen");
+        let session = SessionState::default();
+        let mut txn = SessionTransaction::new(TransactionLimits::default());
+        txn.begin(&storage, &session).expect("begin");
+        let read_gen = |r: &redb::ReadTransaction| {
+            r.open_table(crate::storage::GENERATION_TABLE)
+                .expect("open generation table")
+                .get("generation")
+                .expect("get")
+                .map(|v| v.value())
+        };
+        let fresh = storage.db().begin_read().expect("begin_read");
+        let snapshot = txn.read_snapshot().expect("snapshot");
+        assert_eq!(read_gen(snapshot), read_gen(&fresh));
+    }
+
+    /// writer 未取得のまま書き込み記録がある状態は不変条件違反で、COMMIT・dirty 判定とも
+    /// fail-closed に倒れ、`session` は `BEGIN` 時点へ復元される（Issue #2399）。
+    #[test]
+    fn commit_without_writer_but_with_writes_is_fail_closed() {
+        use crate::sql::mode::SearchMode;
+        let (storage, _g) = open_test_storage("txn-2399-failclosed");
+        let mut session = SessionState::default();
+        let mut txn = SessionTransaction::new(TransactionLimits::default());
+        txn.begin(&storage, &session).expect("begin");
+        session.set_search_mode(SearchMode::Recall);
+        if let TxnState::Active(active) = &mut txn.state {
+            drop(active.writer.take());
+            active.has_writes = true;
+        }
+        assert!(txn.dirty_tables().is_err());
+        assert!(txn.table_already_written("documents"));
+        let err = txn.commit(&mut session).expect_err("fail-closed");
+        assert!(matches!(err, SqlSurfaceError::Internal { .. }));
+        assert_eq!(txn.status(), TransactionStatus::Idle);
+        assert_eq!(session.search_mode(), None);
+    }
+
+    /// writer 未取得で書き込みも無ければ COMMIT は成功して `Idle` へ戻る
+    /// （後続 #2400 の「読み取りだけのトランザクション」の形。Issue #2399）。
+    #[test]
+    fn commit_without_writer_and_without_writes_is_ok() {
+        let (storage, _g) = open_test_storage("txn-2399-readonly");
+        let mut session = SessionState::default();
+        let mut txn = SessionTransaction::new(TransactionLimits::default());
+        txn.begin(&storage, &session).expect("begin");
+        if let TxnState::Active(active) = &mut txn.state {
+            drop(active.writer.take());
+        }
+        txn.commit(&mut session).expect("commit");
+        assert_eq!(txn.status(), TransactionStatus::Idle);
+    }
+
+    /// `redb::ReadTransaction` を持たせても `SessionTransaction` が `Send` のままであること
+    /// （wire-server が接続スレッドで保持するため。Issue #2399）。
+    #[test]
+    fn session_transaction_stays_send() {
+        fn assert_send<T: Send>() {}
+        assert_send::<SessionTransaction<'static>>();
     }
 }

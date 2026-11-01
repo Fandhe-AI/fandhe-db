@@ -1414,6 +1414,10 @@ Issue #1405（fix(engine)!: CREATE TYPE の型名の重複を 42710 で返す。
 
 **Issue #2398（feat(engine): 40001（serialization_failure）の wire_code と失敗状態への遷移を追加する。ERR-7・SQL-38・TASK-333 ポインタ）**: `ErrorClass::SerializationFailure`（`40001`）と `SqlSurfaceError::SerializationFailure`（フィールド無し・固定文言）を追加し、HTTP 射影を 409 に揃えた（`status.rs`・err4 の期待表・`nosql-api.md`。NoSQL からは到達しない）。`SessionTransaction::fail_with_serialization_failure` が既存の `fail()` に委ねて `Active` を `Failed` へ遷移させ、以降は既存ゲートが `ROLLBACK` 以外を `25P02` で拒否し、`ROLLBACK` で `Idle` に戻る。単体テストで副作用なし（同一 operation_id の再送が成功）まで固定した。40001 の判定と入口の呼び出しは #2405 が結線する。
 
+**Issue #2399（refactor(engine): 明示トランザクションの状態に読み取りスナップショットと未取得の writer を持たせる。SQL-31・PERSIST-4・TASK-333 ポインタ。詳細は [explicit-transaction.md](explicit-transaction.md) 決定 4）**: `sql::transaction::ActiveTxn` の `write_txn` を `writer: Option<GatedWriteTxn>` に変え、`read_snapshot: redb::ReadTransaction` を追加した。挙動は不変で、writer は従来どおり `BEGIN`（明示・暗黙）で取得し、スナップショットは writer 取得後に開く。`SessionTransaction::read_snapshot()`（`pub(crate)`・本番経路未使用）を追加した。writer が `None` で書き込み記録がある状態は `commit_active`・`dirty_tables` が `XX000` で fail-closed にする。後続の #2400 でスナップショットを先に開く順序へ反転し、#2403 で読み取り経路へ結線する。
+
 **Issue #1932（feat(engine)!: BEGIN の READ ONLY／READ WRITE 修飾子を構文解釈する。SQL-38 ポインタ。詳細は [explicit-transaction.md](explicit-transaction.md)）**: `ParsedSql::Transaction` の中身を `ValidatedTxnControl`（`control`＋`access_mode: Option<TxnAccessMode>`）へ変更（破壊的変更）。`BEGIN [WORK|TRANSACTION] [READ ONLY|READ WRITE]` を受理し、`ActiveTxn` にモードを保持する。`READ ONLY` は #1933／#1934 まで `0A000` の暫定ゲートで拒否（fail-closed）。重複・矛盾モードや未知の修飾子は `42601`。単体テストと `sql38_begin_access_mode` 結合テストを追加。依存の変更なし。
 
 **Issue #1937（docs(design): 分離レベルの受理方針を設計文書へ記録する。SQL-38・TABLE-3・PERSIST-4 ポインタ）**: [explicit-transaction.md](explicit-transaction.md) に「分離レベルの受理方針」節を追加した（契約は spec ポインタのみ。受理範囲は記述しない）。コードは変更していない。
+
+**Issue #1956（docs(design): 行ロック句・LOCK TABLE の扱いを設計文書へ記録する。SQL-38・TABLE-3・PERSIST-4・SQL-31 ポインタ）**: [explicit-transaction.md](explicit-transaction.md) に「行ロック句・`LOCK TABLE` の扱い」節を追加した（単一ライタの writer 取得への写像・取得経路・形ごとの担当 Issue・要確認事項を記録。契約はポインタのみ）。コードは変更していない。
