@@ -2,10 +2,10 @@
 //! SQL 水準の結合テスト。ポインタ: `docs/spec/04-behavior/rls.md` の RLS-13、設計記録は
 //! `docs/design/row-security-policy-composition.md`。
 //!
-//! 本 Issue が入れるのは有効化状態の DDL と永続化だけで、行の見え方への適用（既定拒否・USING の評価）は
-//! #2276 以降の担当。そのため本ファイルは (1) 構文・SQLSTATE・権限ゲートの契約、(2) 状態遷移と
-//! テナントごとの独立・ライフサイクル・永続化、(3) 状態を切り替えてもテナント境界が変わらないこと
-//! を固定し、「ENABLE 後の自テナント内の行の見え方」は PostgreSQL と異なる期待値を主張しない。
+//! 本 Issue が入れたのは有効化状態の DDL と永続化で、行の見え方への適用（既定拒否・USING の評価）は
+//! #2276 で入った（組合せ行列は `rls13_policy_using.rs`）。本ファイルは (1) 構文・SQLSTATE・権限ゲートの
+//! 契約、(2) 状態遷移とテナントごとの独立・ライフサイクル・永続化、(3) 状態を切り替えてもテナント境界が
+//! 変わらないこと（ENABLE 後の既定拒否を含む）を固定する。
 
 use engine::catalog::row_security::RowSecurityState;
 use engine::catalog::{ColumnDef, ColumnType, TableSchema};
@@ -309,11 +309,19 @@ fn tenant_boundary_is_unchanged_by_any_state() {
     let base_a = count(&core, "ta", &mut a);
     assert_eq!(base_a.len(), 1);
     assert!(base_a[0].contains("from-a") && !base_a[0].contains("from-b"));
-    for sql in FOUR {
+    // 行への適用は #2276 から入った: ENABLE 済みでポリシーが無ければ既定拒否（自テナントの行も 0 件）。
+    // どの状態でも他テナントの行は見えず、他テナントの状態は効かない（tb は一度も有効化しない）。
+    let mut enabled = false;
+    for (i, sql) in FOUR.iter().enumerate() {
         ok_as(&core, "ta", &mut a, sql);
+        match i {
+            0 => enabled = true,
+            1 => enabled = false,
+            _ => {}
+        }
         let rows = count(&core, "ta", &mut a);
-        assert_eq!(rows.len(), 1, "{sql}");
-        assert!(!rows[0].contains("from-b"), "{sql}");
+        assert_eq!(rows.len(), usize::from(!enabled), "{sql}");
+        assert!(rows.iter().all(|r| !r.contains("from-b")), "{sql}");
         let rows_b = count(&core, "tb", &mut b);
         assert_eq!(rows_b.len(), 1, "{sql}");
         assert!(!rows_b[0].contains("from-a"), "{sql}");

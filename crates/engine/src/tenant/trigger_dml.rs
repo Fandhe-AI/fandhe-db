@@ -490,12 +490,17 @@ pub(super) fn delete_rows_with_triggers(
 /// id 指定形（`WHERE id = <n>`）の対象判定。所有かつ可視（`owned_visible`）または所有（そうでなければ）で、
 /// 同じ文の先の副文が書いた行でないときだけ `true`。内容（本体）には触れない（ヘッダのみ。RLS-9・RLS-10:
 /// 不存在・他テナント・不可視を区別しない）。
+///
+/// `policy`（RLS-13・Issue #2276）が `Some` なら、所有・可視と確認できた行に限り本体を復号して利用者
+/// ポリシーの USING を評価し、通らない行は対象にしない（0 件・エラーなし）。
 pub(super) fn id_is_target(
     write_txn: &redb::WriteTransaction,
     table: &str,
     ctx: &PolicyContext,
     id: u64,
     owned_visible: bool,
+    schema: &crate::catalog::TableSchema,
+    policy: Option<&crate::sql::row_policy::BoundRowPolicy>,
 ) -> Result<bool, TenantWriteError> {
     let row_table_name = user_rows_table_name(table);
     let row_table = write_txn
@@ -506,7 +511,20 @@ pub(super) fn id_is_target(
         Some(_) if statement_writes::is_prior(table, id) => false,
         Some(guard) => match crate::storage::decode_row_tenant_and_visibility(guard.value()) {
             Ok((tenant_id, visibility)) => {
-                ctx.is_owner(tenant_id) && (!owned_visible || ctx.is_visible(tenant_id, visibility))
+                let base = ctx.is_owner(tenant_id)
+                    && (!owned_visible || ctx.is_visible(tenant_id, visibility));
+                match (base, policy) {
+                    (true, Some(policy)) => {
+                        let row = crate::storage::decode_row_for_key(
+                            ctx.tenant_id(),
+                            RowId::from_legacy_id(id),
+                            guard.value(),
+                        )
+                        .map_err(TenantWriteError::from)?;
+                        super::row_passes_policy(policy, schema, &row)?
+                    }
+                    (base, _) => base,
+                }
             }
             // ヘッダのデコード失敗は不可視と同じ扱い（本体には触れない）。
             Err(_) => false,

@@ -292,7 +292,9 @@ impl BoundConjunction {
         }
     }
 
-    fn matches(
+    /// 1 分岐（`AND` の連言）を評価する。`pub(crate)`: `sql::row_policy` が利用者ポリシーの合成結果
+    /// （連言）を同じ評価器で評価するために使う（第 2 の評価器を作らない）。
+    pub(crate) fn matches(
         &self,
         scanned: &[Option<ScalarRef<'_>>],
         id: u64,
@@ -318,7 +320,7 @@ impl BoundConjunction {
         Ok(true)
     }
 
-    fn references_embedding(&self) -> bool {
+    pub(crate) fn references_embedding(&self) -> bool {
         self.expr_filters.iter().any(udf_call::references_embedding)
             || self
                 .or_groups
@@ -326,7 +328,7 @@ impl BoundConjunction {
                 .any(BoundOrGroup::references_embedding)
     }
 
-    fn visit_column_indices(&self, out: &mut dyn FnMut(usize)) {
+    pub(crate) fn visit_column_indices(&self, out: &mut dyn FnMut(usize)) {
         for filter in &self.metadata_filters {
             out(filter.column_index());
         }

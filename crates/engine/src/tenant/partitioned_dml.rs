@@ -516,10 +516,29 @@ fn chunk_loop<E>(
             width = width.min(remaining.saturating_add(1));
         }
 
+        // RLS-13（Issue #2276）: 利用者ポリシーをチャンクの write txn・同じスキーマから解決する
+        // （チャンクごとに最新の状態を読む。ポリシーは行を狭めるだけで、対象は常に所有・可視の内側）。
+        let policy = resolve_dml_row_policy(
+            &write_txn,
+            ctx,
+            &schema,
+            table,
+            match kind {
+                Kind::Delete => crate::sql::row_policy::PolicyCmd::Delete {
+                    reads_existing: true,
+                },
+                Kind::Update { .. } => crate::sql::row_policy::PolicyCmd::Update {
+                    reads_existing: true,
+                },
+            },
+        )
+        .map_err(w)?;
         let scan = scan_chunk(
             &write_txn,
             table,
             ctx,
+            &schema,
+            policy.as_ref(),
             state.cursor,
             needs_embedding,
             width,
@@ -689,6 +708,8 @@ fn scan_chunk<E>(
     write_txn: &redb::WriteTransaction,
     table: &str,
     ctx: &PolicyContext,
+    schema: &crate::catalog::TableSchema,
+    policy: Option<&crate::sql::row_policy::BoundRowPolicy>,
     cursor: Option<RowId>,
     needs_embedding: bool,
     width: usize,
@@ -713,6 +734,12 @@ fn scan_chunk<E>(
         .map_err(|e| w(map_row_table_error(e)))?;
     let mut candidates: Vec<RowId> = Vec::with_capacity(width.min(4096));
     let mut embedding_scratch: Vec<f32> = Vec::new();
+    // ポリシー段の復号マスク・スタック（行ごとに確保しない。ポリシーが無ければ未使用）。
+    let mut policy_mask: Vec<bool> = vec![false; schema.columns.len()];
+    let policy_needs = policy
+        .map(|p| p.mark_needs(&mut policy_mask))
+        .unwrap_or_default();
+    let mut policy_scratch: Vec<crate::sql::expr_program::StackValue> = Vec::new();
     let mut scanned: usize = 0;
     let mut last_scanned: Option<RowId> = None;
     let mut exhausted = true;
@@ -739,12 +766,39 @@ fn scan_chunk<E>(
             if !ctx.is_owner(row_tenant) || !ctx.is_visible(row_tenant, visibility) {
                 break 'row false;
             }
-            let (dim, metadata): (u32, &[u8]) = if needs_embedding {
+            let (dim, metadata): (u32, &[u8]) = if needs_embedding || policy_needs.embedding {
                 crate::storage::decode_row_body_into(buf, offset, &mut embedding_scratch)
                     .map_err(w)?
             } else {
                 crate::storage::decode_row_dim_and_metadata_borrowed(buf).map_err(w)?
             };
+            // POLICY 段（RLS-13・Issue #2276）: 所有・可視の内側・利用者の述語より前。通らない行は
+            // 走査数には数え済みのまま候補から外す（存在しない行と同じ扱い）。
+            if let Some(policy) = policy {
+                let cols = crate::row_codec::scan_scalar_columns_masked(
+                    schema,
+                    metadata,
+                    Some(&policy_mask),
+                )
+                .map_err(|e| w(TenantWriteError::TriggerFailed(SqlSurfaceError::from(e))))?;
+                let policy_embedding: &[f32] = if policy_needs.embedding {
+                    embedding_scratch.as_slice()
+                } else {
+                    &[]
+                };
+                let passed = policy
+                    .passes(
+                        &cols,
+                        rowid.legacy_id(),
+                        policy_embedding,
+                        dim as usize,
+                        &mut policy_scratch,
+                    )
+                    .map_err(|e| w(TenantWriteError::TriggerFailed(e)))?;
+                if !passed {
+                    break 'row false;
+                }
+            }
             let embedding: &[f32] = if needs_embedding {
                 embedding_scratch.as_slice()
             } else {

@@ -225,6 +225,11 @@ fn visible_rows_impl(
     scan_limits: crate::scan_limits::ScanLimits,
     allow_allocated: bool,
 ) -> Result<Vec<Row>, TenantError> {
+    // RLS-13（Issue #2276）: この列挙は利用者ポリシーを反映しない（辞書構築・検索の検証用の読み取り口。
+    // 反映は #2279）。適用表では部分的に広い集合を返さず、固定文言で拒否する（fail-closed）。
+    // 列挙は複数の読み取り txn に跨るため、走査の前と後の 2 回判定する。走査中に別セッションが RLS を
+    // ENABLE していれば後段で検出でき、ポリシーを反映しない列挙結果を返さない（結果は破棄する）。
+    reject_policies_for_enumeration(storage, table, ctx)?;
     let max_scanned_rows = scan_limits.max_scanned_rows();
     let mut out = Vec::new();
     // カーソルは行ストアの物理キーと同じ `(tenant_id, id)` 形（TABLE-12）。`id` 単独では
@@ -262,7 +267,26 @@ fn visible_rows_impl(
             None => break,
         }
     }
+    reject_policies_for_enumeration(storage, table, ctx)?;
     Ok(out)
+}
+
+/// [`visible_rows_impl`] の拒否判定（短命な読み取り txn で適用表かを確かめる。固定文言・表名を含めない）。
+fn reject_policies_for_enumeration(
+    storage: &Storage,
+    table: &str,
+    ctx: &PolicyContext,
+) -> Result<(), TenantError> {
+    let read_txn = storage.db().begin_read().map_err(|_| {
+        TenantError::Catalog(CatalogError::Invalid(
+            "failed to begin read transaction".to_string(),
+        ))
+    })?;
+    crate::sql::row_policy::reject_if_policies_apply(&read_txn, ctx, table).map_err(|_| {
+        TenantError::Catalog(CatalogError::Invalid(
+            "row-level security policies are not yet supported for this query form".to_string(),
+        ))
+    })
 }
 
 /// 検索結果 `hits` が、`table` に対する `ctx` の可視集合へすべて収まって
@@ -3990,6 +4014,10 @@ pub(crate) fn update_row_unchecked(
         let mut pre_images = crate::constraint::UpdatedKeyPreImages::new();
         {
             let schema = require_table_schema_write(write_txn, table)?;
+            // RLS-13（Issue #2276）: 生の全列置換は USING を評価できない。適用表は書き込みと同じ write txn の
+            // 中で拒否する（判定と書き込みの間の ENABLE を TOCTOU にしない）。
+            crate::sql::row_policy::reject_if_policies_apply(write_txn, ctx, table)
+                .map_err(TenantWriteError::TriggerFailed)?;
             // 生の全列置換はトリガの発火に未対応（Issue #1725）。UPDATE トリガのある表は `0A000`。
             guard_no_update_triggers(write_txn, ctx.tenant_id(), table)?;
             schema.validate_row_embedding_dim(row.embedding.len())?;
@@ -5006,6 +5034,18 @@ fn update_row_columns_impl(
             // 式項の静的な型照合は束縛段（`sql::set_expr::bind_set_expr`）で完了済み。
             require_expected_schema_for_set_exprs(set_exprs, expected_schema)?;
 
+            // RLS-13（Issue #2276）: 利用者ポリシーの USING を、対象行の選択（所有かつ可視の判定の内側）へ
+            // 適用する。通らない行は不在・不可視と同じ扱い（`UPDATE 0`・エラーなし）にする。
+            let policy = resolve_dml_row_policy(
+                write_txn,
+                ctx,
+                &schema,
+                table,
+                crate::sql::row_policy::PolicyCmd::Update {
+                    reads_existing: true,
+                },
+            )?;
+
             // トリガの分類は台帳より前・同じ write txn の中で行う（再送ではトリガを呼ばない。Issue #1725）。
             let trigger_plan = plan_update_triggers(
                 write_txn,
@@ -5165,7 +5205,15 @@ fn update_row_columns_impl(
                 )?;
                 // 不在・他テナント・不可視の id でも空の対象で同じ経路を通す（AFTER STATEMENT を 1 か所で
                 // 発火し、呼び出し列を存在情報で変えない）。
-                let is_target = trigger_dml::id_is_target(write_txn, table, ctx, id, true)?;
+                let is_target = trigger_dml::id_is_target(
+                    write_txn,
+                    table,
+                    ctx,
+                    id,
+                    true,
+                    &schema,
+                    policy.as_ref(),
+                )?;
                 let candidates: &[u64] = if is_target { &[id] } else { &[] };
                 let done = trigger_dml::update_rows_with_triggers(
                     write_txn,
@@ -5228,11 +5276,16 @@ fn update_row_columns_impl(
                             // 「存在し、かつ可視」と確定しているため、ここでの
                             // デコード失敗（ストレージ破損等）を `XX000` として
                             // 伝播しても、不存在の id との応答差にはならない。
-                            Some(crate::storage::decode_row_for_key(
+                            let row = crate::storage::decode_row_for_key(
                                 ctx.tenant_id(),
                                 RowId::from_legacy_id(id),
                                 raw,
-                            )?)
+                            )?;
+                            // 利用者ポリシー（RLS-13）を通らない行は不可視と同じ扱いにする。
+                            match &policy {
+                                Some(policy) if !row_passes_policy(policy, &schema, &row)? => None,
+                                _ => Some(row),
+                            }
                         }
                         // ヘッダのデコード自体が失敗した場合（フォーマット不整合等）、
                         // または所有・可視のいずれかを満たさない場合は区別せず
@@ -5670,6 +5723,28 @@ fn delete_row_impl(
                     )));
                 }
             }
+            // RLS-13（Issue #2276）: 可視集合を対象にする SQL 表層の id 形 DELETE（`OwnedVisible`）は、
+            // 利用者ポリシーの USING を通らない行を対象外（`NotFound`・0 件）にする。所有だけで選ぶ
+            // `Owned`（可視性を見ない Rust API）はポリシーも適用しない従来のスコープのまま。
+            // 所有だけで選ぶ `Owned`（Rust API）はポリシーを評価できないため、適用表では書き込みと同じ
+            // write txn の中で固定文言の 0A000 として拒否する（判定と書き込みの間の ENABLE を TOCTOU にしない）。
+            if scope == DeleteScope::Owned {
+                crate::sql::row_policy::reject_if_policies_apply(write_txn, ctx, table)
+                    .map_err(TenantWriteError::TriggerFailed)?;
+            }
+            let policy = if scope == DeleteScope::OwnedVisible {
+                resolve_dml_row_policy(
+                    write_txn,
+                    ctx,
+                    &schema,
+                    table,
+                    crate::sql::row_policy::PolicyCmd::Delete {
+                        reads_existing: true,
+                    },
+                )?
+            } else {
+                None
+            };
             // トリガの分類は台帳より前・同じ write txn の中で行う（再送ではトリガを呼ばない。Issue #1725）。
             let trigger_plan = crate::trigger::plan::plan_row_triggers(
                 write_txn,
@@ -5707,6 +5782,8 @@ fn delete_row_impl(
                     ctx,
                     id,
                     scope == DeleteScope::OwnedVisible,
+                    &schema,
+                    policy.as_ref(),
                 )?;
                 if !is_target && not_found_ledger == DeleteNotFoundLedger::Discard {
                     return Err(TenantWriteError::NotFound);
@@ -5748,6 +5825,19 @@ fn delete_row_impl(
                     let owns = ctx.is_owner(existing_tenant)
                         && (scope == DeleteScope::Owned
                             || ctx.is_visible(existing_tenant, existing_visibility));
+                    // 利用者ポリシー（RLS-13）。所有・可視と確定した行に限り本体を復号して評価し、
+                    // 通らない行は不在と同じ扱い（0 件・エラーなし）にする。
+                    let owns = match (&policy, owns) {
+                        (Some(policy), true) => {
+                            let row = crate::storage::decode_row_for_key(
+                                ctx.tenant_id(),
+                                RowId::from_legacy_id(id),
+                                guard.value(),
+                            )?;
+                            row_passes_policy(policy, &schema, &row)?
+                        }
+                        (_, owns) => owns,
+                    };
                     if owns {
                         // commit 記録の行の足跡: 削除される前の行（SQL-38・Issue #2404）。
                         crate::storage::commit_log::note_row(
@@ -6065,6 +6155,46 @@ fn dml_write_err<E>(e: impl Into<TenantWriteError>) -> PredicateDmlError<E> {
     PredicateDmlError::Write(e.into())
 }
 
+/// 書き込み系（述語形 UPDATE／DELETE・id 形・結合形・分割実行）が、対象行の選択に使う利用者ポリシー
+/// （RLS-13・Issue #2276）を、行を読む write txn から解決する唯一の入口。`sql::row_policy` の薄い写像で、
+/// 解決の失敗（破損・再束縛不能）は固定文言の `SqlSurfaceError`（`XX000`）を `TriggerFailed` の透過経路
+/// （`SqlSurfaceError` をそのまま運ぶ）に載せ、write txn を commit せず破棄させる（fail-closed）。
+/// 適用されない表（既定）は `None`。
+pub(crate) fn resolve_dml_row_policy(
+    write_txn: &redb::WriteTransaction,
+    ctx: &PolicyContext,
+    schema: &crate::catalog::TableSchema,
+    table: &str,
+    cmd: crate::sql::row_policy::PolicyCmd,
+) -> Result<Option<crate::sql::row_policy::BoundRowPolicy>, TenantWriteError> {
+    crate::sql::row_policy::resolve_row_policy(write_txn, ctx, schema, table, cmd)
+        .map_err(TenantWriteError::TriggerFailed)
+}
+
+/// 取得済みの行 1 件（`Row`。所有・可視と確認済み）が利用者ポリシーを通るか（id 形 UPDATE／DELETE 用。
+/// 述語形は列挙段 [`enumerate_dml_candidates_with`] が同じ [`BoundRowPolicy::passes`] を適用する）。
+/// 評価の失敗は固定文言の `SqlSurfaceError` を `TriggerFailed` の透過経路に載せる（fail-closed）。
+pub(crate) fn row_passes_policy(
+    policy: &crate::sql::row_policy::BoundRowPolicy,
+    schema: &crate::catalog::TableSchema,
+    row: &Row,
+) -> Result<bool, TenantWriteError> {
+    let mut mask = vec![false; schema.columns.len()];
+    policy.mark_needs(&mut mask);
+    let scanned = crate::row_codec::scan_scalar_columns_masked(schema, &row.metadata, Some(&mask))
+        .map_err(|e| TenantWriteError::TriggerFailed(SqlSurfaceError::from(e)))?;
+    let mut scratch: Vec<crate::sql::expr_program::StackValue> = Vec::new();
+    policy
+        .passes(
+            &scanned,
+            row.id,
+            &row.embedding,
+            row.embedding.len(),
+            &mut scratch,
+        )
+        .map_err(TenantWriteError::TriggerFailed)
+}
+
 /// 候補行 1 件分の借用ビュー（述語クロージャへ渡す入力。行データを複製しない）。
 /// `embedding` は呼び出し元が `needs_embedding = false` を渡した場合は常に空
 /// スライス（`WHERE` が embedding を参照しない場合、デコードコストを避ける。
@@ -6117,10 +6247,13 @@ pub(crate) struct DmlCandidate<'a> {
 ///
 /// `predicate` が `Err(e)` を返した場合はその時点で呼び出し元へ伝播する
 /// （呼び出し元が `write_txn` を破棄することで副作用ゼロを保つ）。
+#[allow(clippy::too_many_arguments)]
 fn enumerate_dml_candidates<E>(
     table: &str,
     row_table: &redb::Table<'_, (&'static str, u64), &'static [u8]>,
     ctx: &PolicyContext,
+    schema: &crate::catalog::TableSchema,
+    policy: Option<&crate::sql::row_policy::BoundRowPolicy>,
     needs_embedding: bool,
     limit: Option<std::num::NonZeroUsize>,
     max_scanned_rows: usize,
@@ -6130,6 +6263,8 @@ fn enumerate_dml_candidates<E>(
         table,
         row_table,
         ctx,
+        schema,
+        policy,
         needs_embedding,
         limit,
         max_scanned_rows,
@@ -6143,10 +6278,15 @@ fn enumerate_dml_candidates<E>(
 /// 結合形 `UPDATE ... FROM` が「probe 時点で確定した行ごとの SET 値」を候補と同じ並びで運ぶための
 /// 拡張で、走査範囲・総走査上限・所有かつ可視の選定・`limit` の早期終了は上記と完全に同一
 /// （`T = ()` の薄いラッパーが既存の呼び出し元のビット同一性を保つ）。
+#[allow(clippy::too_many_arguments)]
 fn enumerate_dml_candidates_with<E, T>(
     table: &str,
     row_table: &redb::Table<'_, (&'static str, u64), &'static [u8]>,
     ctx: &PolicyContext,
+    // RLS-13（Issue #2276）: 利用者ポリシーの束縛結果（適用表のみ `Some`）とその表のスキーマ。呼び出し元が
+    // 同じ write txn から解決した値を必須引数として渡すため、全呼び出し元が型で強制される。
+    schema: &crate::catalog::TableSchema,
+    policy: Option<&crate::sql::row_policy::BoundRowPolicy>,
     needs_embedding: bool,
     limit: Option<std::num::NonZeroUsize>,
     max_scanned_rows: usize,
@@ -6158,6 +6298,12 @@ fn enumerate_dml_candidates_with<E, T>(
     let max_scanned_rows = crate::scan_limits::ScanLimits::new(max_scanned_rows).max_scanned_rows();
     let mut candidate_ids: Vec<(u64, T)> = Vec::new();
     let mut embedding_scratch: Vec<f32> = Vec::new();
+    // ポリシー段の復号マスク・スタック（行ごとに確保しない）。ポリシーが無ければ全て未使用。
+    let mut policy_mask: Vec<bool> = vec![false; schema.columns.len()];
+    let policy_needs = policy
+        .map(|p| p.mark_needs(&mut policy_mask))
+        .unwrap_or_default();
+    let mut policy_scratch: Vec<crate::sql::expr_program::StackValue> = Vec::new();
     // 総走査行数（対象テナント所有行のみを対象に加算する）。`visible_rows` の
     // `MAX_SCANNED_ROWS` と同じ計算量 DoS 対策（codex-review P1 指摘・Issue #871）:
     // 一致行数の上限（`limit`）は述語に一致した行にしか効かないため、一致しない
@@ -6217,13 +6363,46 @@ fn enumerate_dml_candidates_with<E, T>(
             continue;
         }
 
-        let (dim, metadata): (u32, &[u8]) = if needs_embedding {
+        // ポリシーが embedding を参照する場合は述語の要否によらず復号する（述語へ渡す値は下で
+        // `needs_embedding` に従い従来どおり空スライスのまま）。
+        let decode_embedding = needs_embedding || policy_needs.embedding;
+        let (dim, metadata): (u32, &[u8]) = if decode_embedding {
             crate::storage::decode_row_body_into(buf, offset, &mut embedding_scratch)
                 .map_err(|e| dml_write_err(e))?
         } else {
             crate::storage::decode_row_dim_and_metadata_borrowed(buf)
                 .map_err(|e| dml_write_err(e))?
         };
+
+        // POLICY 段（RLS-13・Issue #2276）。テナント境界（上の所有・可視の判定）の内側・利用者の
+        // `WHERE`（`predicate`）より前に、更新・削除の対象行選択へ利用者ポリシーの USING を適用する。
+        // 通らない行は存在しない行と同じ扱い（候補に入らず、述語も評価しない）で、エラーにも出ない。
+        // 総走査数は上で数え済み（ポリシーで落ちた行も数えるため、上限の挙動はテナント所有行数だけに依存）。
+        if let Some(policy) = policy {
+            let scanned_cols =
+                crate::row_codec::scan_scalar_columns_masked(schema, metadata, Some(&policy_mask))
+                    .map_err(|e| {
+                        dml_write_err(TenantWriteError::TriggerFailed(SqlSurfaceError::from(e)))
+                    })?;
+            let policy_embedding: &[f32] = if policy_needs.embedding {
+                embedding_scratch.as_slice()
+            } else {
+                &[]
+            };
+            let passed = policy
+                .passes(
+                    &scanned_cols,
+                    id,
+                    policy_embedding,
+                    dim as usize,
+                    &mut policy_scratch,
+                )
+                .map_err(|e| dml_write_err(TenantWriteError::TriggerFailed(e)))?;
+            if !passed {
+                continue;
+            }
+        }
+
         let embedding: &[f32] = if needs_embedding {
             embedding_scratch.as_slice()
         } else {
@@ -6300,6 +6479,7 @@ pub(crate) fn delete_rows_where_unchecked<E>(
         predicate,
         None,
         None,
+        true,
     )
 }
 
@@ -6318,6 +6498,8 @@ pub(crate) fn delete_rows_where_with_triggers<E>(
     max_scanned_rows: usize,
     predicate: impl FnMut(&DmlCandidate<'_>) -> Result<bool, E>,
     triggers: Option<&crate::trigger::TriggerRuntime>,
+    // RLS-13（Issue #2276）: 利用者ポリシーの SELECT 層も AND するか（`WHERE`・`RETURNING` が既存行を読む）。
+    reads_existing: bool,
 ) -> Result<PredicateDmlOutcome, PredicateDmlError<E>> {
     delete_rows_where_impl(
         target,
@@ -6332,6 +6514,7 @@ pub(crate) fn delete_rows_where_with_triggers<E>(
         predicate,
         None,
         triggers,
+        reads_existing,
     )
 }
 
@@ -6357,6 +6540,7 @@ pub(crate) fn delete_rows_where_capturing_unchecked<E>(
     max_scanned_rows: usize,
     predicate: impl FnMut(&DmlCandidate<'_>) -> Result<bool, E>,
     project: &mut ReturningProjectFn<'_>,
+    reads_existing: bool,
 ) -> Result<PredicateDmlOutcome, PredicateDmlError<E>> {
     delete_rows_where_impl(
         target,
@@ -6371,6 +6555,7 @@ pub(crate) fn delete_rows_where_capturing_unchecked<E>(
         predicate,
         Some(project),
         None,
+        reads_existing,
     )
 }
 
@@ -6391,6 +6576,7 @@ fn delete_rows_where_impl<E>(
     project: Option<&mut ReturningProjectFn<'_>>,
     // DELETE トリガの通過証（Issue #1725）。`RETURNING` 付きは常に未結線として扱う（`0A000`）。
     triggers: Option<&crate::trigger::TriggerRuntime>,
+    reads_existing: bool,
 ) -> Result<PredicateDmlOutcome, PredicateDmlError<E>> {
     validate_relation_key(table).map_err(dml_write_err)?;
     let triggers = if project.is_some() { None } else { triggers };
@@ -6440,6 +6626,16 @@ fn delete_rows_where_impl<E>(
                 )
                 .map_err(dml_write_err)?;
             }
+            // RLS-13（Issue #2276）: 利用者ポリシーを列挙と同じ write txn・同じスキーマから解決する
+            // （TOCTOU を作らない）。UPDATE・DELETE は既存行を読む前提で SELECT のポリシーも AND する。
+            let policy = resolve_dml_row_policy(
+                write_txn,
+                ctx,
+                &schema,
+                table,
+                crate::sql::row_policy::PolicyCmd::Delete { reads_existing },
+            )
+            .map_err(dml_write_err)?;
             let row_table_name = user_rows_table_name(table);
             let row_table = write_txn
                 .open_table(user_rows_table_def(&row_table_name))
@@ -6448,6 +6644,8 @@ fn delete_rows_where_impl<E>(
                 table,
                 &row_table,
                 ctx,
+                &schema,
+                policy.as_ref(),
                 needs_embedding,
                 limit,
                 max_scanned_rows,
@@ -6576,6 +6774,7 @@ pub(crate) fn update_rows_where_unchecked<E>(
         predicate,
         None,
         None,
+        true,
     )
 }
 
@@ -6597,6 +6796,8 @@ pub(crate) fn update_rows_where_with_triggers<E>(
     max_scanned_rows: usize,
     predicate: impl FnMut(&DmlCandidate<'_>) -> Result<bool, E>,
     triggers: Option<&crate::trigger::TriggerRuntime>,
+    // RLS-13（Issue #2276）: 利用者ポリシーの SELECT 層も AND するか（`WHERE`・`RETURNING`・`SET` 右辺が既存行を読む）。
+    reads_existing: bool,
 ) -> Result<PredicateDmlOutcome, PredicateDmlError<E>> {
     update_rows_where_impl(
         target,
@@ -6614,6 +6815,7 @@ pub(crate) fn update_rows_where_with_triggers<E>(
         predicate,
         None,
         triggers,
+        reads_existing,
     )
 }
 
@@ -6638,6 +6840,7 @@ pub(crate) fn update_rows_where_capturing_unchecked<E>(
     max_scanned_rows: usize,
     predicate: impl FnMut(&DmlCandidate<'_>) -> Result<bool, E>,
     project: &mut ReturningProjectFn<'_>,
+    reads_existing: bool,
 ) -> Result<PredicateDmlOutcome, PredicateDmlError<E>> {
     update_rows_where_impl(
         target,
@@ -6655,6 +6858,7 @@ pub(crate) fn update_rows_where_capturing_unchecked<E>(
         predicate,
         Some(project),
         None,
+        reads_existing,
     )
 }
 
@@ -6678,6 +6882,7 @@ fn update_rows_where_impl<E>(
     project: Option<&mut ReturningProjectFn<'_>>,
     // UPDATE トリガの通過証（Issue #1725）。`RETURNING` 付きは常に未結線として扱う（`0A000`）。
     triggers: Option<&crate::trigger::TriggerRuntime>,
+    reads_existing: bool,
 ) -> Result<PredicateDmlOutcome, PredicateDmlError<E>> {
     validate_relation_key(table).map_err(dml_write_err)?;
     let triggers = if project.is_some() { None } else { triggers };
@@ -6744,6 +6949,15 @@ fn update_rows_where_impl<E>(
                 )
                 .map_err(dml_write_err)?;
             }
+            // RLS-13（Issue #2276）: 利用者ポリシーを列挙と同じ write txn・同じスキーマから解決する。
+            let policy = resolve_dml_row_policy(
+                write_txn,
+                ctx,
+                &schema,
+                table,
+                crate::sql::row_policy::PolicyCmd::Update { reads_existing },
+            )
+            .map_err(dml_write_err)?;
             let row_table_name = user_rows_table_name(table);
             let row_table = write_txn
                 .open_table(user_rows_table_def(&row_table_name))
@@ -6752,6 +6966,8 @@ fn update_rows_where_impl<E>(
                 table,
                 &row_table,
                 ctx,
+                &schema,
+                policy.as_ref(),
                 needs_embedding,
                 limit,
                 max_scanned_rows,
@@ -6914,6 +7130,17 @@ pub(crate) fn update_rows_joined_unchecked<E>(
             )
             .map_err(dml_write_err)?;
 
+            // RLS-13（Issue #2276）: 利用者ポリシーを列挙と同じ write txn・同じスキーマから解決する。
+            let policy = resolve_dml_row_policy(
+                write_txn,
+                ctx,
+                &schema,
+                table,
+                crate::sql::row_policy::PolicyCmd::Update {
+                    reads_existing: true,
+                },
+            )
+            .map_err(dml_write_err)?;
             let row_table_name = user_rows_table_name(table);
             let row_table = write_txn
                 .open_table(user_rows_table_def(&row_table_name))
@@ -6922,6 +7149,8 @@ pub(crate) fn update_rows_joined_unchecked<E>(
                 table,
                 &row_table,
                 ctx,
+                &schema,
+                policy.as_ref(),
                 needs_embedding,
                 limit,
                 max_scanned_rows,
@@ -11054,6 +11283,7 @@ mod tests {
             MAX_SCANNED_ROWS,
             |_c| Ok(true),
             &mut project,
+            true,
         );
         assert!(
             matches!(
@@ -11117,6 +11347,7 @@ mod tests {
             MAX_SCANNED_ROWS,
             |_c| Ok(true),
             &mut project,
+            true,
         );
         assert!(matches!(
             result,

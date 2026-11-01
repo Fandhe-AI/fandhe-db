@@ -1456,6 +1456,22 @@ pub(crate) fn execute_grouped_aggregate(
 
     let expected_dim = schema.vector_dim();
 
+    // RLS-13（Issue #2276）: 利用者ポリシーを行を読むのと同じスナップショットから 1 回だけ解決する。
+    // 適用表ではポリシーを反映できない索引・アリーナ経由の候補削減を使わず、ポリシー段を通る
+    // 全走査へ倒す（グループ・件数にポリシーで隠れた行を現さない）。
+    let policy = crate::sql::row_policy::resolve_row_policy(
+        read_txn,
+        ctx,
+        schema,
+        &bound.table,
+        crate::sql::row_policy::PolicyCmd::Select,
+    )?;
+    let (arena_cache, scalar_cache) = if policy.is_some() {
+        (None, None)
+    } else {
+        (arena_cache, scalar_cache)
+    };
+
     // Issue #350: `GROUP BY` キー列（`group_by.column_indices`。SQL-25 (d) で
     // 複数列へ一般化）は必ず参照するため `extra_scalar_indices` へ渡す。
     // `GROUP BY` は複数グループの走査を要するため `aggregate.rs::
@@ -1472,6 +1488,9 @@ pub(crate) fn execute_grouped_aggregate(
     );
     // Issue #1817・SQL-58: 式キーが参照する列・embedding もデコード対象へ反映する。
     referenced.include_group_key_exprs(group_by.key_exprs.iter().map(|k| &k.source));
+    if let Some(p) = &policy {
+        referenced.include_policy(p);
+    }
     let tier = if referenced.needs_embedding() {
         DecodeTier::Embedding
     } else {
@@ -1781,6 +1800,23 @@ pub(crate) fn execute_grouped_aggregate(
                         metadata,
                         Some(referenced.scalar_mask()),
                     )?;
+
+                // POLICY 段（RLS-13・Issue #2276）: テナント境界の内側・利用者の `WHERE` より前。
+                if let Some(policy) = &policy {
+                    let policy_embedding: &[f32] = match tier {
+                        DecodeTier::Embedding => embedding_scratch.as_slice(),
+                        DecodeTier::Fast | DecodeTier::DimAndScalar => &[],
+                    };
+                    if !policy.passes(
+                        &scanned,
+                        id,
+                        policy_embedding,
+                        dim as usize,
+                        &mut expr_scratch,
+                    )? {
+                        continue;
+                    }
+                }
 
                 // SCALAR 段（WHERE）。
                 if !declarative_filter::matches_all(&bound.metadata_filters, &scanned) {
