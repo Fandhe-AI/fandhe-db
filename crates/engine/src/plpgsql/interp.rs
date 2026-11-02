@@ -724,28 +724,38 @@ fn scalar_text(v: PlScalar) -> Result<String, SqlSurfaceError> {
 
 /// 書式文字列の `%` を引数で順に置き換える（`%%` は `%`。個数は定義時に一致を検査済みで、
 /// 実行時に足りなければ空として扱い panic しない）。
-fn format_message(fmt: &str, args: &[String]) -> String {
+fn format_message<E>(
+    fmt: &str,
+    arg_count: usize,
+    mut next_arg: impl FnMut(usize) -> Result<String, E>,
+) -> Result<String, E> {
     let mut out = String::new();
-    let mut it = args.iter();
+    let mut used = 0usize;
     let mut chars = fmt.chars().peekable();
     while let Some(c) = chars.next() {
         if c == '%' {
             if chars.peek() == Some(&'%') {
                 chars.next();
                 out.push('%');
-            } else if let Some(a) = it.next() {
-                out.push_str(a);
+            } else if used < arg_count {
+                // 引数は 1 件ずつ評価し、出力が上限を超えた後は評価だけ続けて文字列を保持しない。
+                let a = next_arg(used)?;
+                used += 1;
+                if out.len() <= crate::notice::MAX_NOTICE_FIELD_BYTES {
+                    out.push_str(&a);
+                }
             }
-        } else {
+        } else if out.len() <= crate::notice::MAX_NOTICE_FIELD_BYTES {
             out.push(c);
         }
-        // 生成途中で上限に達したら打ち切る（確保は上限 + 1 引数分に収まる）。
-        if out.len() > crate::notice::MAX_NOTICE_FIELD_BYTES {
-            break;
-        }
+    }
+    // プレースホルダに使われなかった引数も評価する（評価エラーは伝播させる）。
+    while used < arg_count {
+        next_arg(used)?;
+        used += 1;
     }
     crate::notice::clamp_field(&mut out);
-    out
+    Ok(out)
 }
 
 fn scalar_bytes(v: &PlScalar) -> usize {
@@ -1132,6 +1142,15 @@ impl<'a> Interp<'a> {
         r
     }
 
+    /// `RAISE` の引数 1 件を評価して通知欄の上限へ切り詰めた文字列にする。
+    fn eval_raise_arg(&mut self, a: Option<&SqlExpr>) -> Result<String, SqlSurfaceError> {
+        let a = a.ok_or_else(|| internal("RAISE argument index out of range"))?;
+        let v = self.eval(a)?;
+        let mut t = scalar_text(v)?;
+        crate::notice::clamp_field(&mut t);
+        Ok(t)
+    }
+
     /// `RAISE`。`DEBUG`／`LOG` は引数を評価して捨てる。通知（`INFO`／`NOTICE`／`WARNING`）は
     /// `notice` の区間へ溜め、`EXCEPTION` は利用者指定の SQLSTATE を持つエラーを返す。
     fn exec_raise(&mut self, r: &RaiseStmt) -> Result<Flow, SqlSurfaceError> {
@@ -1145,14 +1164,18 @@ impl<'a> Interp<'a> {
                 )))
             }));
         }
-        let mut shown = Vec::with_capacity(r.args.len());
-        for a in &r.args {
-            let v = self.eval(a)?;
-            let mut t = scalar_text(v)?;
-            // 保持前に 1 引数あたり通知欄の上限へ切り詰める（値長 × 引数数の確保を防ぐ）。
-            crate::notice::clamp_field(&mut t);
-            shown.push(t);
-        }
+        // 引数は全件を保持せず、展開時に 1 件ずつ評価して上限付き出力へ直接書き込む。
+        let mut formatted = match &r.fmt {
+            Some(f) => Some(format_message(f, r.args.len(), |i| {
+                self.eval_raise_arg(r.args.get(i))
+            })?),
+            None => {
+                for a in &r.args {
+                    self.eval_raise_arg(Some(a))?;
+                }
+                None
+            }
+        };
         let (mut message, mut detail, mut hint, mut errcode) = (None, None, None, None);
         for (opt, e) in &r.using {
             let v = self.eval(e)?;
@@ -1179,7 +1202,7 @@ impl<'a> Interp<'a> {
             .or_else(|| r.condition_code.clone())
             .unwrap_or_else(|| default_state.to_string());
         let message = match (&r.fmt, message) {
-            (Some(f), _) => format_message(f, &shown),
+            (Some(_), _) => formatted.take().unwrap_or_default(),
             (None, Some(m)) => m,
             (None, None) => r.condition_name.clone().unwrap_or_else(|| sqlstate.clone()),
         };
@@ -1694,8 +1717,7 @@ mod raise_format_tests {
         clamp_field(&mut arg);
         assert!(arg.len() <= MAX_NOTICE_FIELD_BYTES);
         let fmt = "%".repeat(1000);
-        let args = vec![arg; 1000];
-        let out = format_message(&fmt, &args);
+        let out = format_message::<()>(&fmt, 1000, |_| Ok(arg.clone())).unwrap();
         assert!(out.len() <= MAX_NOTICE_FIELD_BYTES);
     }
 
