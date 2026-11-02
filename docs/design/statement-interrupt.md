@@ -5,7 +5,7 @@
 - ステータス: 採用（設計記録。Issue #1798 で実装）
 - ビヘイビア ID（ポインタのみ）: SQL-34・WIRE-11（関連: WIRE-15・ERR-6・SQL-71）。spec 本文は転記しない
 - 対象: engine の協調的中断の仕組み（`engine::interrupt`）と `57014`、wire-server の切断検出（`liveness`）
-- 後続: #1950／#1952／#1953／#1954（statement_timeout。#1951 の機構は本文「文単位のデッドライン」節）
+- 後続: #1950／#1952／#1953／#1954（statement_timeout。#1951 の機構は本文「文単位のデッドライン」節、#1953 の結線は「書き込み・COPY・ベクトル検索への結線」節）
 
 ## 背景
 
@@ -23,7 +23,7 @@ engine には中断の仕組みが無かったため、実行中の文を外か�
 - エラーは `SqlSurfaceError::QueryCanceled` から `ErrorClass::QueryCanceled`（`57014`、ラベル `QUERY_CANCELED`）。文言は PostgreSQL と同じ固定の英語で、理由・件数・テナント・行の内容を含めない。HTTP への射影は 503
 - 確認点: `sql::scan::with_visible_row`（全走査経路が通る入口。順序なし・経路 (A)・(B) の両パス・PK 点検索・GIN 候補）、`sql::window` の実体化ループ、`sql::group_by`・`sql::aggregate` の行取り込みループ、`sql::relation_snapshot` の入力読み込み、`sql::join::exec` のプローブと一致ペアのループ
 - 置かない場所: commit 処理中・台帳（recovery）・commit 成功境界より後。中断は commit 前の `Err` としてしか起きないので、autocommit は副作用ゼロ、明示トランザクションは `Failed`（`25P02`）という既存の契約がそのまま成り立つ
-- 分割実行 DML（PARTITIONED）は `interrupt::suppressed` でジョブ全体を包み、この Issue では中断の対象外にする。チャンク commit 後に `57014` を返すと、commit 済みなら `VD001` という契約（SQL-32／SQL-71 (4)）とずれるため。分割実行の中断は #1950 で扱う
+- 分割実行 DML（PARTITIONED）は `interrupt::suppressed` でジョブ全体を包み、この Issue では中断の対象外にする。チャンク commit 後に `57014` を返すと、commit 済みなら `VD001` という契約（SQL-32／SQL-71 (4)）とずれるため。文の期限だけは #1953 で注入時計により明示評価する（「書き込み・COPY・ベクトル検索への結線」節）
 - `SessionState` や `PolicyContext` には載せない。前者は値型で `sql/transaction.rs` が clone して巻き戻し、後者は `Eq` を索引の同一性照合に使っているため。engine には既に thread-local の前例がある
 - `parallel_search` の `thread::scope` ワーカーからは thread-local が見えない。距離 ORDER BY の `LIMIT` 省略は #2242 の管轄で本件の経路外
 
@@ -42,7 +42,34 @@ SQL-71 のポインタ。statement_timeout の engine 側の機構で、同じ `
 - エラー文言: `StatementTimeout` は `canceling statement due to statement timeout`、それ以外は従来の `canceling statement due to user request`。いずれも固定文言で件数・テナント・期限値を含めない
 - `parallel_search` のワーカースレッドからは thread-local が見えない（期限の伝搬は対象外）
 
-後続への申し送り: セッション状態・`SET`／`SHOW statement_timeout`・wire の `'Q'`／`'E'` での導入は #1954、走査・結合・集約・ソートの確認点の密度は #1952、書き込み・COPY・ベクトル検索の確認点とロック待ちの期限内計上（`remaining_at`／`current_deadline`）は #1953、分割実行 DML への期限適用は #1950。
+後続への申し送り: セッション状態・`SET`／`SHOW statement_timeout`・wire の `'Q'`／`'E'` での導入は #1954、走査・結合・集約・ソートの確認点の密度は #1952、書き込み・COPY・ベクトル検索の確認点とロック待ちの期限内計上（`remaining_at`／`current_deadline`）は #1953、分割実行 DML への期限適用は #1953（実装済み。下の節）。
+
+### 書き込み・COPY・ベクトル検索への結線（Issue #1953）
+
+SQL-71・SQL-32 のポインタ。#1951 の機構を、書き込み・COPY・分割実行 DML・ベクトル検索・GPU バッチへ広げた。期限が無効なら従来と挙動・性能は変わらない（時計を読まない）。導入口（wire の `statement_timeout`）は #1954。
+
+確認点
+
+| 経路 | 場所 | 中断時の扱い |
+| ---- | ---- | ------------ |
+| INSERT／UPSERT／UPDATE／DELETE／TRUNCATE の行ループ | `tenant::check_interrupt`。候補の列挙（`enumerate_dml_candidates_with`）・適用段・INSERT の行書き込み・UPSERT の行ごとの分岐・TRUNCATE の表ごとの段・FK 参照アクションの連鎖の段・置換（`replace_typed_rows_by_text_key`） | commit 前の `Err`。autocommit は副作用ゼロ、明示 Tx は `25P02`（savepoint があれば `ROLLBACK TO` で復帰） |
+| COPY FROM | 開始時の期限を `CopyInSession` に保持し、`feed`／`feed_fields`／`finish`・行の取り込み（1024 行に 1 回）で確認する。バッチへ引き継ぎ、`commit_copy_in(_txn)` が `DeadlineScope` に入れて INSERT の行ループと書き込みロック待ちへ効かせる | 同上。台帳にも残らない |
+| 書き込みロック待ち | `Storage` の writer 取得点（autocommit・明示 Tx・分割実行のチャンク）の待機時間を `min(write_lock_wait, 残り時間)` にする（`interrupt::effective_lock_wait`）。期限が先に来た待機失敗は `55P03` ではなく `57014`（`interrupt::lock_wait_error`。写像点は DML・DDL・Tx・分割実行の取り消し） | 待機を縮めるだけで `write_lock_wait` の上限は緩めない。NOWAIT・`SKIP LOCKED` の判定は変えない |
+| 分割実行 DML | `suppressed` を維持したまま、`chunk_loop` がジョブ開始時に期限を読み、注入時計で (a) チャンク開始前 (b) 走査の行ごと (c) 適用段の打ち切り判定 (d) commit 直前を評価する（`PartitionedStopCause::DeadlineExceeded`） | 実行中のチャンクは commit せず破棄する（適用段で検出しても部分 commit にしない）。commit 済みが無ければ `57014`、あれば `VD001`（原因 `57014`）。同じ `operation_id` の再送で続きから再開できる |
+| kNN・WHERE 付き kNN・hybrid・HNSW | arena の構築ループ（redb 走査・キャッシュ済み行・部分集合）。RLS で落ちる他テナント行も走査コストを払うため `predicate` より前に置く。DISTANCE 段の呼び出しの直前と直後に即時の確認を置く。`ArenaError::Interrupted` を `57014` に戻し、WHERE 内の評価が返した `57014` も `XX000` に丸めない | commit 前の読み取りなので副作用なし |
+| GPU バッチ（engine の公開 API を直接呼ぶ用途） | `run_batch_search` の行ループ、`run_tiled_batch_search` の group／tile／chunk 境界。`BatchSearchError::QueryCanceled` | 必ず `BatchExecError::Input` で返し、CPU 縮退・ラッチ・縮退イベントを起こさない |
+
+commit 境界より後（`commit_boundary::commit` の後・台帳の記録・recovery）には確認点を置かない。
+
+分割実行で `suppressed` を外さない理由: 切断（`ClientGone`）まで分割実行で効かせると #1798 の判断（チャンク commit 後に `57014` を返さない）が崩れる。期限だけを注入時計で明示評価すれば、既存の `committed == 0 ? 原因のコード : VD001` の写像がそのまま SQL-71 (4) を満たす。#1951 の「分割実行への期限適用は #1950」の申し送りは本 Issue で置き換える。
+
+公開 API の変更（BREAKING）: `ArenaError::Interrupted(InterruptReason)` と `BatchSearchError::QueryCanceled { reason }` を追加した（網羅的 `match` の下流は追随が必要）。`TenantWriteError` には variant を足さず、`TriggerFailed` が `SqlSurfaceError` を透過するキャリアとして `57014` を運ぶ。`core_api.snapshot` は `ArenaError` の追記で更新した。
+
+中断遅れの上限: 行ループは「最も重い 1 反復 × `CHECK_STRIDE`」。ベクトル検索は距離カーネル・`parallel_search` のワーカー・HNSW の ef 探索と索引の構築（キャッシュミス時）の内部に確認点を持たないため、期限後も呼び出し 1 回分（HNSW 索引構築を含みうる）が走り切ってから、直後の確認で止まる。
+
+テスト: `tests/sql_t40_up/sql1953_deadline_writes.rs`・`sql1953_deadline_vector.rs`（sleep なしの決定的テスト）、`tests/sql1953_deadline_lock_wait.rs`（実時間のロック待ち。束ねず単独）、`tenant/partitioned_dml/tests.rs`（疑似時計）、`batch_search`・`batch_fallback`・`arena`・`interrupt/deadline` の単体テスト。
+
+対象外（#1953）: wire の `SET`／`SHOW statement_timeout`・起動時 CLI・`'Q'`／`'E'` での導入（#1954。COPY FROM でクライアントのデータ送信を待つ読み取りは協調的中断では止められない）、距離カーネル内部・`parallel_search`・HNSW 内部への確認点（`KernelError`／`SearchProvider` の公開 API 変更と `search_or_fallback` の縮退吸収の整理が要る）、DDL の行ループ（索引構築・`ALTER TABLE` の書き換え）、分割実行での `ClientGone`・SQL-77 のチャンク間待機、HTTP（NoSQL）表層の既定値、既存ベンチでの無効時オーバーヘッドの実測。
 
 ### wire の切断検出
 
@@ -74,6 +101,6 @@ spec 側の判断（CancelRequest の受理契約の新設）が必要で、Issu
 ## 対象外
 
 - CancelRequest の受け付け（spec 判断待ち）
-- 分割実行 DML の中断（#1950）
-- デッドラインの wire／CLI 結線（#1954）と各実行ループへの確認点の拡充（#1952・#1953）
+- 分割実行 DML の切断（`ClientGone`）による中断（#1798 の判断を維持。文の期限は #1953 で適用済み）
+- デッドラインの wire／CLI 結線（#1954）。確認点の拡充は #1952（読み取り）・#1953（書き込み・COPY・ベクトル検索）。#1953 の対象外は同節末尾
 - 切断検出の CLI による無効化・間隔変更

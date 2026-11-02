@@ -575,6 +575,16 @@ Accepted と、15 節の提案値のオーナー確認後」。後者は 2026-10
 副作用なしの `42501`、途中の拒否は既存の部分完了の写像（`VD001`、原因クラス `42501`）。再 GRANT 後の再送で再開できる。
 NoSQL 表層の分割実行はセッションを取らないため再検査を渡さない（#1969 以降で扱う）。
 
+## 文の期限（Issue #1953）
+
+SQL-71 (4)・SQL-32 のポインタ。詳細は [statement-interrupt.md](statement-interrupt.md) の「書き込み・COPY・ベクトル検索への結線（Issue #1953）」節。
+
+- 停止原因 `PartitionedStopCause::DeadlineExceeded` を追加した。`chunk_loop` がジョブ開始時に `interrupt::current_deadline()` を読み、注入時計（`Hooks::clock`）で、チャンク開始前・走査の行ごと・適用段の打ち切り判定・commit 直前の 4 点を評価する。
+- 実行中のチャンクは commit せず破棄する。適用段（`stop_by_hold` 経由）で検出しても部分 commit にしない。commit 済みのチャンクはそのまま残る。
+- コードへの写像は既存の規則どおり。最初の commit 前は `57014`（副作用ゼロ。ジョブ記録・台帳なし）、commit 後は `VD001`（原因 `57014`）。同じ `operation_id` の再送で続きから再開できる。
+- `interrupt::suppressed` は維持する。切断（`ClientGone`）で分割実行を打ち切らない #1798 の判断は変えず、期限だけを明示評価する。共有の適用段（`apply_predicate_*_in_txn`）の `check()` は `suppressed` 区間では何もしない。
+- チャンクの writer 取得待ちは文の期限で短縮される（`Storage::begin_partitioned_chunk_txn`）。期限が先に来た場合は `55P03` ではなく期限超過として止める。
+
 ## スコープ外・申し送り
 
 - `crates/` 配下のコード変更・実装（#1127〜#1131 の担当）
