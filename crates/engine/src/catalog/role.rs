@@ -1028,7 +1028,8 @@ pub(crate) fn resolve_login_in_txn<R: ReadSource>(
     };
     let Some(blob) = blob else {
         // 未登録でもロール表の点参照を 1 回行う（存在の時間差を抑える。結果は捨てる）。
-        let _ = get_role_in_txn(src, DUMMY_LOOKUP_TENANT, role_name)?;
+        // テナント "-" が実在し得るため、参照の失敗は捨てて常に Ok(None) とする（fail-closed を保つ）。
+        let _ = get_role_in_txn(src, DUMMY_LOOKUP_TENANT, role_name);
         return Ok(None);
     };
     let (tenant, role_id) = decode_login_blob(&blob)?;
@@ -1039,7 +1040,7 @@ pub(crate) fn resolve_login_in_txn<R: ReadSource>(
     Ok(Some(LoginResolution { tenant, role }))
 }
 
-/// 未登録の識別子の解決で行うダミー参照のテナント（実在しない固定値。結果は使わない）。
+/// 未登録の識別子の解決で行うダミー参照のテナント（時間差の均質化専用。実在し得るため結果もエラーも使わない）。
 const DUMMY_LOOKUP_TENANT: &str = "-";
 
 /// ログイン識別子の修飾子の導出に使うドメインタグ（以後変えない値。変えると既存の識別子が無効になる）。

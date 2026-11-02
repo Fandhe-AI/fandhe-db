@@ -160,3 +160,24 @@ fn date_only_valid_until_is_accepted() {
     ok(&core, "t", "ALTER ROLE future VALID UNTIL '2000-01-01'");
     assert!(lookup(&core, "t", "future").expect("future").is_expired());
 }
+
+#[test]
+fn timestamptz_valid_until_with_surrounding_spaces_is_accepted() {
+    let (_g, core) = open_core("sql39-login-trim-tz");
+    ok(
+        &core,
+        "t",
+        "CREATE ROLE spaced LOGIN VALID UNTIL '  2999-01-01 00:00:00+00  '",
+    );
+    assert!(!lookup(&core, "t", "spaced").expect("spaced").is_expired());
+}
+
+#[test]
+fn unregistered_login_resolves_to_none_even_if_dummy_tenant_exists() {
+    let (_g, core) = open_core("sql39-login-dummy-tenant");
+    // ダミー参照用のテナント名 "-" が実在しても、未登録の識別子は None のまま。
+    ok(&core, "-", "CREATE ROLE ghost LOGIN");
+    ok(&core, "t", "CREATE ROLE real LOGIN");
+    let ident = EngineCore::login_identifier("t", "ghost").expect("identifier");
+    assert!(core.resolve_login_role(&ident).expect("lookup").is_none());
+}

@@ -145,7 +145,7 @@ fn resolve_valid_until(
                 SqlSurfaceError::datetime_field_overflow("VALID UNTIL value is out of range")
             });
     }
-    match crate::datetime::parse_timestamptz(literal, session.time_zone()) {
+    match crate::datetime::parse_timestamptz(literal.trim(), session.time_zone()) {
         Ok(micros) => Ok(Some(micros)),
         Err(TimestampTzLiteralError::Literal(DateTimeLiteralError::Format(_))) => Err(
             SqlSurfaceError::invalid_datetime_format("invalid VALID UNTIL value"),
