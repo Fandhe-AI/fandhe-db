@@ -9,6 +9,7 @@
 
 ### Added
 
+- `ROLLBACK TO` の後、Tx 内の書き込み記録を savepoint 時点へ戻す。読み取りは確定状態のキャッシュ・索引を再び使い、全書き込みを巻き戻した Tx の `COMMIT` はグローバル世代を進めない（Issue #1945・SQL-69）。公開 API の変更はない。
 - `ROLLBACK TO` で巻き戻した文の `operation_id` を同一 Tx 内で再利用できるようにした。巻き戻した文の台帳記録は `COMMIT` 後に残らない（Issue #1944・SQL-69・RECOVER-1）。公開 API の変更はない。
 - `GRANT`／`REVOKE` が SCHEMA 単位（`ON SCHEMA`・`ON ALL TABLES IN SCHEMA`。権限は USAGE・CREATE）を受理する（Issue #2234・SQL-40・RLS-12）。束縛ロール（DDL 権限ゲート通過の主体を除く）が USAGE の無い SCHEMA を修飾名で参照すると `42501`（他テナント・不在は `3F000`）。現在ロール未束縛のセッションの `GRANT … ON SCHEMA s` は `0A000` ではなく `42501` になる。公開 API の変更はない。
 - `ALTER ROLE`／`ALTER USER`（属性・パスワードの変更と `RENAME TO`）と `SET ROLE`／`RESET ROLE` を追加した（Issue #1963・SQL-39）。`SET ROLE` はセッションのロールから `SET` 真のメンバーシップを辿れる対象にだけ切り替え、未所属は `42501`、他テナントのロールは不在と同じ `42704`。`PolicyContext`・DDL 権限は変えない。BREAKING CHANGE: 公開 enum `ParsedSql`・`SqlOutcome` に variant（`AlterRole`・`SetRole`）を追加した。
