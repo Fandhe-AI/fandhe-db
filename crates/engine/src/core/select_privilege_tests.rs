@@ -436,6 +436,48 @@ fn portal_execute_denies_when_referenced_relation_was_dropped() {
     assert_eq!(e.wire_code(), "42P01");
 }
 
+/// SCHEMA 修飾の参照先が Bind 後に DROP されたときの再検査エラーは、内部 relation キー
+/// （`#<schema_id>.<name>`）を含めず利用者向けの名前だけを返す（内部 ID の露出防止。ADR D2）。
+#[test]
+fn portal_execute_stale_schema_relation_error_hides_internal_key() {
+    let f = fx("selpriv-portal-dropped-schema");
+    f.admin_run("CREATE SCHEMA s");
+    f.admin_run("CREATE TABLE s.t (id BIGINT PRIMARY KEY, name TEXT)");
+    f.admin_run("GRANT USAGE ON SCHEMA s TO alice");
+    f.admin_run("GRANT SELECT ON s.t TO alice");
+    let s = bound(f.alice, A, false);
+    let prepared = f
+        .core
+        .parse_sql_prepared_with_declared_in_session(&s, "SELECT id FROM s.t", &[])
+        .expect("parse");
+    let txn = f.core.new_session_transaction();
+    let parsed = f
+        .core
+        .bind_prepared_in_txn(&s, &txn, &prepared, &[])
+        .expect("bind");
+    f.admin_run("DROP TABLE s.t");
+    let e = f
+        .core
+        .recheck_prepared_read_privileges_in_txn(&s, &txn, &prepared, &parsed)
+        .expect_err("dropped relation must not skip the check");
+    assert_eq!(e.wire_code(), "42P01");
+    assert!(!e.client_message().contains('#'), "{}", e.client_message());
+    assert!(e.client_message().contains('t'));
+}
+
+/// 未修飾名は `search_path` で SCHEMA 配下の表へは解決されない（`public` の裸の名前だけを引く）ため、
+/// 同名の SCHEMA 表への権限は未修飾の参照に効かない。SELECT 権限の無いロールは、SCHEMA の USAGE が
+/// あっても未修飾名で SCHEMA 表を読めない（存在しない扱いの `42P01`）。
+#[test]
+fn unqualified_name_never_reaches_schema_table() {
+    let f = fx("selpriv-unqualified-schema");
+    f.admin_run("CREATE SCHEMA s");
+    f.admin_run("CREATE TABLE s.only_in_schema (id BIGINT PRIMARY KEY)");
+    f.admin_run("GRANT USAGE ON SCHEMA s TO alice");
+    assert_eq!(f.alice_run("SELECT id FROM only_in_schema"), "42P01");
+    assert_eq!(f.alice_run("SELECT id FROM s.only_in_schema"), "42501");
+}
+
 #[test]
 fn bound_http_read_api_is_checked_before_binding() {
     let f = fx("selpriv-http");

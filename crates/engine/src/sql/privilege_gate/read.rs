@@ -275,7 +275,10 @@ fn require_relations(
             // DROP 後に展開済みの文だけが残った状態であり、検査を省略すると SET ROLE 後のロールが
             // 権限なしで基底表を読める認可バイパスになる。fail-closed で拒否する（fail-open にしない）。
             if missing_is_stale {
-                return Err(SqlSurfaceError::undefined_table(name.as_str()));
+                // 内部キー（`#<schema_id>.<name>`）は利用者へ出さない（ADR D2）。公開名の名前部だけを返す。
+                return Err(SqlSurfaceError::undefined_table(
+                    crate::catalog::namespace::relation_name_part(name),
+                ));
             }
             continue;
         };
