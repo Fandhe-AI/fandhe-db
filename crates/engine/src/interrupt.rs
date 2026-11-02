@@ -20,7 +20,10 @@
 
 mod deadline;
 
-pub use deadline::{current_deadline, DeadlineGuard, DeadlineScope, StatementDeadline};
+pub use deadline::{
+    checks_seen, current_deadline, install_fire_after_checks, DeadlineGuard, DeadlineScope,
+    StatementDeadline,
+};
 
 use std::cell::{Cell, RefCell};
 use std::marker::PhantomData;

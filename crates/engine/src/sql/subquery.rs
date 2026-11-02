@@ -1656,6 +1656,8 @@ fn resolve_in_subquery(
     let mut ints: Vec<i128> = Vec::new();
     let mut floats: Vec<f64> = Vec::new();
     for row in &result.rows {
+        // Issue #1952: 協調的中断の確認点（サブクエリ結果の突き合わせの行ごと。commit 前の読み取り経路）。
+        crate::interrupt::check()?;
         let cell = row.cells.first().ok_or_else(|| SqlSurfaceError::Internal {
             detail: "subquery row missing projected cell".to_string(),
         })?;
@@ -2405,6 +2407,8 @@ pub(crate) fn merge_scalar_projection_items(
             .try_reserve(result.rows.len())
             .map_err(|_| merge_too_large())?;
         for row in &result.rows {
+            // Issue #1952: 協調的中断の確認点（スカラー投影の統合の行ごと。commit 前の読み取り経路）。
+            crate::interrupt::check()?;
             let value = c.value_for(row.id, &row.cells, hidden_base, hidden)?;
             let per_cell = std::mem::size_of::<Cell>()
                 .checked_add(super::cursor::estimate_cell_bytes(&value))
@@ -2925,6 +2929,8 @@ fn resolve_quantified_compare(
     let mut has_null = false;
     let mut extremes: Option<(&Cell, &Cell)> = None;
     for row in &result.rows {
+        // Issue #1952: 協調的中断の確認点（サブクエリ結果の突き合わせの行ごと。commit 前の読み取り経路）。
+        crate::interrupt::check()?;
         let cell = row.cells.first().ok_or_else(|| SqlSurfaceError::Internal {
             detail: "subquery row missing projected cell".to_string(),
         })?;
@@ -4460,6 +4466,8 @@ fn resolve_correlated_scalar_aggregate(
     let mut values: std::collections::HashMap<Vec<u8>, Cell> = std::collections::HashMap::new();
     let mut used = 0usize;
     'rows: for row in result.rows {
+        // Issue #1952: 協調的中断の確認点（相関スカラー集約の行ごと。commit 前の読み取り経路）。
+        crate::interrupt::check()?;
         if row.cells.len() != keys.len().saturating_add(1) {
             return Err(SqlSurfaceError::Internal {
                 detail: "correlated scalar aggregate row has an unexpected width".to_string(),
@@ -4838,6 +4846,8 @@ fn resolve_correlated_scalar_rows(
         .try_reserve(result.rows.len())
         .map_err(|_| super::join::semi::too_large())?;
     for row in result.rows {
+        // Issue #1952: 協調的中断の確認点（相関サブクエリのキー構築の行ごと。commit 前の読み取り経路）。
+        crate::interrupt::check()?;
         let key_cells = inner_key_cells(&row, &key_positions, &analysis.keys)?;
         let id = row.id;
         let y = match scalar_pos {
