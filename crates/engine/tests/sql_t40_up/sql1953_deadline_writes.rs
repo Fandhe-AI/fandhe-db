@@ -124,6 +124,27 @@ fn sql71_expired_deadline_stops_primary_key_point_update() {
     assert_ne!(snapshot(&core, "t"), before);
 }
 
+/// SQL-71: 対象行が 0 件（述語に一致なし・不在 id）でも、期限切れなら台帳記録の前に `57014` で止まる
+/// （確認点が行ループ内だけだと `Wrote` で commit してしまう。codex P1 指摘）。
+#[test]
+fn sql71_expired_deadline_stops_zero_row_writes() {
+    let statements: &[&str] = &[
+        "UPDATE t SET v = 1 WHERE k > 1000 USING OPERATION_ID 'z-upd'",
+        "DELETE FROM t WHERE k > 1000 USING OPERATION_ID 'z-del'",
+        "DELETE FROM t WHERE id = 99999 USING OPERATION_ID 'z-del-id'",
+        "UPDATE t SET v = 1 WHERE id = 99999 USING OPERATION_ID 'z-upd-id'",
+    ];
+    for sql in statements {
+        let (core, _g) = open("sql1953-zero-row");
+        let before = snapshot(&core, "t");
+        let e = err_under(expired(), &core, sql);
+        assert_eq!(e.wire_code(), "57014", "{sql}");
+        assert_eq!(e.to_string(), TIMEOUT_MSG, "{sql}");
+        assert_eq!(snapshot(&core, "t"), before, "table changed by {sql}");
+        run(&core, sql).unwrap_or_else(|e| panic!("resend must succeed for {sql}: {e:?}"));
+    }
+}
+
 /// SQL-71: 十分先の期限なら期限なしと同じ結果になる。
 #[test]
 fn sql71_far_deadline_does_not_change_write_behavior() {

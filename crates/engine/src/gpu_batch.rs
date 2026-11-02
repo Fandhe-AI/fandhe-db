@@ -2589,6 +2589,11 @@ fn run_tiled_batch_search(
         }
     }
 
+    // 最終 dispatch・readback の後にも期限を即時確認する（group/tile/chunk 開始前だけでは、
+    // 1 group・1 tile・1 chunk のバッチが期限超過のまま成功を返す。Issue #1953）。
+    // PartialTopK 経路も同じ合流点を通る。
+    check_batch_interrupt()?;
+
     Ok(hits)
 }
 

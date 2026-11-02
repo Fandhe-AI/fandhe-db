@@ -4169,6 +4169,8 @@ pub(crate) fn update_row_unchecked(
             // （`encode_row` のエラー → 台帳の内容照合 → `NotFound`）は変わらない。
             let encoded = encode_row(row)?;
             let content_hash = content_hash::for_update_encoded(id, &encoded)?;
+            // Issue #1953（SQL-71）: 台帳記録の前の即時確認。期限切れなら副作用を残さず `57014`。
+            check_interrupt_now()?;
             ledger::record_in_txn(
                 write_txn,
                 ctx.tenant_id(),
@@ -5912,6 +5914,9 @@ fn delete_row_impl(
             // 削除要求のクライアント由来の内容は id のみ（`content_hash::for_delete`
             // ドキュメント参照）。
             let content_hash = content_hash::for_delete(id);
+            // Issue #1953（SQL-71）: 不在 id でも評価される即時確認。台帳記録の前に置き、期限切れなら
+            // 副作用を残さず `57014` で止める。
+            check_interrupt_now()?;
             ledger::record_in_txn(
                 write_txn,
                 ctx.tenant_id(),
@@ -6770,6 +6775,9 @@ fn delete_rows_where_impl<E>(
             )
             .map_err(dml_write_err)?;
 
+            // Issue #1953（SQL-71）: 対象行数に依存しない即時確認。台帳記録の前に置き、対象 0 行でも
+            // 期限切れなら台帳へ副作用を残さず `57014` で止める。
+            check_interrupt_now().map_err(dml_write_err)?;
             ledger::record_in_txn(
                 write_txn,
                 ctx.tenant_id(),
@@ -7092,6 +7100,8 @@ fn update_rows_where_impl<E>(
             )
             .map_err(dml_write_err)?;
 
+            // Issue #1953（SQL-71）: 台帳記録の前の即時確認（対象 0 行でも評価される）。
+            check_interrupt_now().map_err(dml_write_err)?;
             ledger::record_in_txn_accepting(
                 write_txn,
                 ctx.tenant_id(),
@@ -7285,6 +7295,8 @@ pub(crate) fn update_rows_joined_unchecked<E>(
                     },
                 )));
             }
+            // Issue #1953（SQL-71）: 台帳記録の前の即時確認（対象 0 行でも評価される）。
+            check_interrupt_now().map_err(dml_write_err)?;
             ledger::record_in_txn_accepting(
                 write_txn,
                 ctx.tenant_id(),
