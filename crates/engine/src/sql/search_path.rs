@@ -253,7 +253,11 @@ fn is_syntax_keyword_here(tokens: &[Token], idx: usize) -> bool {
         return false;
     };
     if w.eq_ignore_ascii_case("IF") {
-        return is(Some(idx.saturating_add(1)), "EXISTS") || is(Some(idx.saturating_add(1)), "NOT");
+        // `IF [NOT] EXISTS` は DDL（`CREATE`／`DROP`／`ALTER`）の句。SELECT の `FROM "if" exists`（`exists` は
+        // 暗黙の別名）のように、それ以外の文では実表 `if` の参照として残す（権限検査から外さない）。
+        return ["CREATE", "DROP", "ALTER"].iter().any(|k| is(Some(0), k))
+            && (is(Some(idx.saturating_add(1)), "EXISTS")
+                || is(Some(idx.saturating_add(1)), "NOT"));
     }
     if w.eq_ignore_ascii_case("ONLY") {
         // `ONLY` を修飾語として受理する文は `TRUNCATE`・`LOCK`・`ALTER`（所有者変更）・DML だけ。SELECT の

@@ -673,3 +673,54 @@ fn select_follows_inherit_membership_closure() {
     f.admin_run("GRANT mid TO alice WITH INHERIT FALSE");
     assert_eq!(f.alice_run(q), "42501");
 }
+
+/// 構文語と同名の実表（`"if"`・`"only"`・`"exists"`）は、暗黙別名・`AS` 別名・別名なしのどれで読んでも
+/// 権限検査から外れない（通常 SQL と準備済み文の両方。権限なしは `42501`、権限ありは成功）。収集器の
+/// 推測ではなく、解析が実在を確認した relation も検査対象に合成する（Issue #1967）。
+#[test]
+fn syntax_word_named_tables_are_gated_in_both_protocols() {
+    let f = fx("selpriv-syntax-words");
+    let s = bound(f.alice, A, false);
+    let mut simple = bound(f.alice, A, false);
+    for word in ["if", "only", "exists"] {
+        f.admin_run(&format!("CREATE TABLE \"{word}\" (id BIGINT PRIMARY KEY)"));
+        let queries = [
+            format!("SELECT id FROM \"{word}\""),
+            format!("SELECT x.id FROM \"{word}\" AS x"),
+            format!("SELECT x.id FROM \"{word}\" x"),
+            format!("SELECT id FROM \"{word}\" exists"),
+        ];
+        for q in &queries {
+            // `exists` 自身を別名にする形は `"exists"` 表では意味が変わるため、構文が通るものだけを見る。
+            let denied_simple = code(f.core.execute_sql_in_session(&ctx(A), &mut simple, q));
+            if denied_simple == "42601" || denied_simple == "42P01" {
+                continue;
+            }
+            assert_eq!(denied_simple, "42501", "simple: {q}");
+            let e = f
+                .core
+                .parse_sql_prepared_with_declared_in_session(&s, q, &[])
+                .expect_err("prepared denied");
+            assert_eq!(e.wire_code(), "42501", "prepared: {q}");
+        }
+        f.admin_run(&format!("GRANT SELECT ON \"{word}\" TO alice"));
+        for q in &queries {
+            let granted = code(f.core.execute_sql_in_session(&ctx(A), &mut simple, q));
+            if granted == "42601" || granted == "42P01" {
+                continue;
+            }
+            assert_eq!(granted, "ok", "simple granted: {q}");
+            f.core
+                .parse_sql_prepared_with_declared_in_session(&s, q, &[])
+                .unwrap_or_else(|e| panic!("prepared granted {q}: {e:?}"));
+        }
+    }
+    // 対象の形が 1 件も通らずに空振りしていないこと。
+    assert_eq!(
+        code(
+            f.core
+                .execute_sql_in_session(&ctx(A), &mut simple, "SELECT id FROM \"if\" exists")
+        ),
+        "ok"
+    );
+}

@@ -198,7 +198,7 @@ pub(crate) fn require_read_privileges(
         tenant,
         &principal,
         required_bits,
-        &crate::sql::search_path::resolved_relation_ref_names(&resolved),
+        &gate_relation_names(&resolved, snapshot.parsed_relations),
         snapshot.read_snap,
         snapshot.parsed_relations,
     )
@@ -233,7 +233,7 @@ pub(crate) fn require_read_privileges_resolved(
         tenant,
         &principal,
         required_bits,
-        &crate::sql::search_path::resolved_relation_ref_names(resolved_tokens),
+        &gate_relation_names(resolved_tokens, scope.parsed_relations),
         scope.read_snap,
         scope.parsed_relations,
     )
@@ -246,6 +246,25 @@ pub(crate) struct ParsedScope<'a> {
     pub(crate) read_snap: Option<&'a redb::ReadTransaction>,
     /// 構文解析がカタログで実在を確認した relation 名（ビュー展開前のビュー自身を含む）。
     pub(crate) parsed_relations: &'a [String],
+}
+
+/// 権限検査の対象にする relation 名の合成（トークン収集器の候補 ∪ 解析が実在を確認した名前）。収集器は
+/// 字句の推測で構文語・別名を除くため取りこぼし（偽陰性。実表 `"if"`・`"only"` を構文語と誤認する等）がありうる。
+/// 解析（`RelationHits`）が relation として解決した名前のうち、文のトークンに識別子として現れるものは、
+/// 収集器が除外したかにかかわらず必ず加える（ビュー展開で初めて現れる基底表はトークンに無いので加えない。
+/// 基底表はビュー所有者の権限で読む扱い。ADR §12）。一致しすぎても拒否側にだけ倒れる。
+fn gate_relation_names(resolved_tokens: &[Token], parsed_relations: &[String]) -> Vec<String> {
+    let mut names = crate::sql::search_path::resolved_relation_ref_names(resolved_tokens);
+    for rel in parsed_relations {
+        let in_tokens = resolved_tokens.iter().any(|t| {
+            crate::sql::relation_name::unqualified_ident_name(t)
+                .is_some_and(|n| n.eq_ignore_ascii_case(rel))
+        });
+        if in_tokens && !names.contains(rel) {
+            names.push(rel.clone());
+        }
+    }
+    names
 }
 
 /// 解決済みの relation 名の並びに対する判定（表名を直接渡す HTTP 表層の入口と共有する）。
