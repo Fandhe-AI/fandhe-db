@@ -110,6 +110,11 @@ crash-test-interrupt: ## crash_test.sh の中断パス（SIGTERM・プロセス�
 crash-test-cross-table: ## 2 テーブル横断トランザクション（storage 直叩き＋SQL 明示 Tx）のクラッシュ耐性回帰テスト
 	scripts/crash_test_cross_table.sh
 
+# 明示トランザクションの実行中・COMMIT 直前・直後の決定的 SIGKILL 回帰テスト（Issue #2416・PERSIST-1/SQL-31/TABLE-10。scripts/crash_test_txn_kill_points.sh を実行）
+.PHONY: crash-test-txn-kill-points
+crash-test-txn-kill-points: ## 明示トランザクションの実行中・COMMIT 直前・直後の SIGKILL 回帰テスト
+	scripts/crash_test_txn_kill_points.sh
+
 # 永続一意索引・クラッシュ耐性回帰テスト（Issue #1070・TABLE-16。scripts/crash_test_unique_index.sh を実行）
 .PHONY: crash-test-unique-index
 crash-test-unique-index: ## 永続一意索引・クラッシュ耐性回帰テスト
@@ -207,7 +212,7 @@ worktree-lag-check-selftest: ## worktree-lag-check のセルフテスト
 	@scripts/tests/check_worktree_lag_test.sh
 
 .PHONY: ci
-ci: lint-docs fmt-check lint test test-default-build crash-test crash-test-interrupt crash-test-cross-table crash-test-unique-index crash-test-partitioned-dml crash-test-temp-table crash-test-view-write crash-test-sequence crash-test-gin-index tmp-leak-check core-api-check sort-determinism-check scripts-test simd-codegen-check deny ## CI（ci.yml）と同等のチェックを一括実行する
+ci: lint-docs fmt-check lint test test-default-build crash-test crash-test-interrupt crash-test-cross-table crash-test-txn-kill-points crash-test-unique-index crash-test-partitioned-dml crash-test-temp-table crash-test-view-write crash-test-sequence crash-test-gin-index tmp-leak-check core-api-check sort-determinism-check scripts-test simd-codegen-check deny ## CI（ci.yml）と同等のチェックを一括実行する
 
 # TASK-127 の性能・Recall 受け入れ基準回帰ベンチを実行する（時間依存のため ci には含めない。.github/workflows/bench.yml から週次 schedule / workflow_dispatch で実行）
 .PHONY: bench-simd

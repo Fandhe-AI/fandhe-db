@@ -16,6 +16,12 @@
 # Issue #2415: 同じ骨格を txn モード（SQL 明示トランザクションで 3 表をまたぐ複数文。
 # SQL-31・TABLE-10）でも実行する（既存ジョブ内。必須チェック名は不変）。
 #
+# Issue #2416: txn モードでは write.log の最後の行（IN_TXN / COMMITTED）から kill が Tx の
+# 途中に当たったかを分類し、ack を超える幽霊コミットの上限検査を足す。txn 段全体で 1 度も
+# 「Tx の途中」を観測しなければ失敗にする（空虚な成功の拒否）。判定単位をセットごとにしない
+# のは遅い runner での不安定化を避けるため（アサーションの弱体化ではない）。実行中・COMMIT
+# 直前・直後の 3 点は scripts/crash_test_txn_kill_points.sh がセットごとに決定的に検証する。
+#
 # 使い方: scripts/crash_test_cross_table.sh [セット数（既定 2）] [反復回数（既定 10）]
 
 set -u
@@ -173,6 +179,26 @@ run_mode() {
         trap - EXIT
         exit 1
       fi
+      if [ "${mode}" = "txn" ]; then
+        # 書き切られた最後の進行行で kill 位置を分類する。TXN_BATCH（道具側）= 4 と対応。
+        last_line="$(grep -E '^(IN_TXN batch=[0-9]+|COMMITTED batch=[0-9]+ rows=[0-9]+)$' "${WRITE_LOG}" | tail -1)"
+        acked_n="${acked:-0}"
+        max_rows=$((acked_n + 4))
+        if [ "${rows}" -gt "${max_rows}" ]; then
+          echo "ERROR: row count ${rows} exceeds acked ${acked_n} + one transaction, phantom commit suspected (set ${set_no} iteration ${i})" >&2
+          rm -rf "${WORKDIR}"
+          trap - EXIT
+          exit 1
+        fi
+        if [[ "${last_line}" == IN_TXN* ]]; then
+          saw_in_flight=true
+        elif [ "${rows}" -ne "${acked_n}" ]; then
+          echo "ERROR: row count ${rows} differs from acked ${acked_n} although no transaction was in flight (set ${set_no} iteration ${i})" >&2
+          rm -rf "${WORKDIR}"
+          trap - EXIT
+          exit 1
+        fi
+      fi
       last_rows="${rows}"
       completed=$((completed + 1))
     done
@@ -201,6 +227,7 @@ rm -rf "${SELF_CHECK_DIR}"
 
 total_iterations=$((SETS * ITERATIONS))
 total_completed=0
+saw_in_flight=false
 for run_mode_name in batch txn; do
   completed=0
   run_mode "${run_mode_name}"
@@ -209,6 +236,10 @@ for run_mode_name in batch txn; do
     exit 1
   fi
   total_completed=$((total_completed + completed))
+  if [ "${run_mode_name}" = "txn" ] && [ "${saw_in_flight}" != "true" ]; then
+    echo "ERROR: txn mode never observed an in-flight transaction (SIGKILL always landed outside a transaction)" >&2
+    exit 1
+  fi
 done
 
 echo "crash_test_cross_table.sh: OK (${SETS} sets x ${ITERATIONS} iterations x 2 modes (batch, txn) = ${total_completed} SIGKILL reps)"

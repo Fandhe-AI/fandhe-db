@@ -34,7 +34,17 @@
 //! 「全部残るか全く残らないか」を検査する。writer は `BEGIN` ではなく最初の書き込み文で取得
 //! される前提（Issue #2396）に依存しないよう、Tx 内で `SELECT` して条件を決めず、期待値は
 //! `UPDATE` の `WHERE` に畳み込む。どの文でも `55P03`・`40001` 等が起こりうる前提で扱う。
-//! SIGKILL の当てどころの制御は Issue #2416、DDL は #2417／#2418 の担当。
+//! DDL の kill 制御は #2417／#2418 の担当。
+//!
+//! kill 位置の制御（Issue #2416。ビヘイビア: PERSIST-1・SQL-31・TABLE-10）:
+//! - `write <db_path> txn` は台帳 `UPDATE` の直後に `IN_TXN batch=<k>` を出す。スクリプトは
+//!   最後の行が `IN_TXN` なら「Tx の途中に kill が当たった」と分類し、全反復で 1 度も観測
+//!   しなければ失敗にする（空虚な成功の拒否）。
+//! - `write-pause <db_path> <in-txn|before-commit|after-commit> <warmup>` は `warmup` 件を
+//!   コミットしたのち、次の Tx の指定点で `PAUSED point=<p> batch=<k> expect_rows=<n>
+//!   expect_batches=<m>` を出して停止する（`PAUSE_LIMIT_SECS` で上限。SIGKILL が来なければ
+//!   非 0 終了）。`scripts/crash_test_txn_kill_points.sh` が PAUSED を待って kill -9 し、
+//!   再起動後の verify が期待値と完全一致することを確かめる。
 
 use std::io::Write as _;
 
@@ -103,6 +113,7 @@ fn main() {
             Some(Mode::Txn) => run_verify_txn(path),
             None => usage(),
         },
+        ["write-pause", path, point, warmup] => run_write_pause(path, point, warmup),
         ["self-check", workdir, "txn"] => run_self_check_txn(workdir),
         _ => usage(),
     };
@@ -112,6 +123,7 @@ fn main() {
 fn usage() -> i32 {
     eprintln!(
         "usage: crash_tool_cross_table <write|verify> <db_path> [batch|txn] | \
+         write-pause <db_path> <in-txn|before-commit|after-commit> <warmup> | \
          self-check <workdir> txn"
     );
     2
@@ -649,65 +661,178 @@ fn run_write_txn(path: &str) -> i32 {
     }
 }
 
-/// 3 表をまたぐ明示 Tx を繰り返す。`BEGIN` 直後の最初の文を条件付き `UPDATE` にし、
-/// `COMMIT` 成功後にだけ `COMMITTED` を出す。
+/// 明示 Tx の中で SIGKILL を当てたい位置（Issue #2416）。`run_one_txn` が各位置を通過した
+/// 直後に観測フックへ通知する。ランダム kill 用（`write`）と決定的 kill 用（`write-pause`）が
+/// 同じ Tx 本体を共有し、両者の文列が食い違わないようにする。
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum TxnPoint {
+    /// 台帳 `UPDATE` の成功直後（writer 取得済みで、未コミットの書き込みがある）。
+    AfterFirstWrite,
+    /// 明細前半の `INSERT` の成功直後（2 表に未コミットの書き込みが途中まである）。
+    InTxn,
+    /// バッチ `INSERT` の成功直後で、`COMMIT` を送る前。
+    BeforeCommit,
+    /// `COMMIT` が `Ok` を返した直後で、ack 行を出す前。
+    AfterCommit,
+}
+
+/// 3 表をまたぐ明示 Tx を 1 回分実行する。`obs` は各 [`TxnPoint`] の通過直後に呼ばれる。
+/// `write_txn_inner`（ランダム kill）と `write_pause_inner`（決定的 kill）から呼ばれる。
+fn run_one_txn(
+    core: &EngineCore,
+    k: u64,
+    obs: &mut dyn FnMut(TxnPoint, u64) -> Res<()>,
+) -> Res<()> {
+    let pause = || std::thread::sleep(std::time::Duration::from_millis(STMT_PAUSE_MS));
+    let mut t = TxnSession::begin(core, TXN_TENANT)?;
+    pause();
+    // writer は最初の書き込み文で取得される。期待値は WHERE に畳み込み、Tx 内で SELECT しない。
+    match t.run(&format!(
+        "UPDATE xt_ledger SET applied = applied + 1 WHERE id = 0 AND applied = {k}"
+    ))? {
+        SqlOutcome::Update(u) if u.rows_affected == 1 => {}
+        _ => {
+            let _ = t.run("ROLLBACK");
+            return Err("ledger update did not match exactly one row".to_string());
+        }
+    }
+    obs(TxnPoint::AfterFirstWrite, k)?;
+    pause();
+    let half = TXN_BATCH / 2;
+    for (idx, range) in [0..half, half..TXN_BATCH].into_iter().enumerate() {
+        let values: Vec<String> = range
+            .map(|j| {
+                let id = k * TXN_BATCH + j;
+                format!("({id}, {k}, '{}')", payload_of(k, j))
+            })
+            .collect();
+        t.run(&format!(
+            "INSERT INTO xt_items (id, seq, payload) VALUES {}",
+            values.join(", ")
+        ))?;
+        if idx == 0 {
+            obs(TxnPoint::InTxn, k)?;
+        }
+        pause();
+    }
+    t.run(&format!(
+        "INSERT INTO xt_batches (id, seq, n) VALUES ({k}, {k}, {TXN_BATCH})"
+    ))?;
+    obs(TxnPoint::BeforeCommit, k)?;
+    pause();
+    t.run("COMMIT")?;
+    obs(TxnPoint::AfterCommit, k)
+}
+
+/// stdout へ 1 行書き切って flush する（kill 時に行が途中で切れる窓を最小化する）。
+fn emit_line(line: &str) -> Res<()> {
+    let stdout = std::io::stdout();
+    let mut out = stdout.lock();
+    writeln!(out, "{line}").map_err(|e| format!("stdout write failed: {e}"))?;
+    out.flush().map_err(|e| format!("stdout flush failed: {e}"))
+}
+
+/// 3 表をまたぐ明示 Tx を繰り返す。台帳 `UPDATE` 直後に `IN_TXN batch=<k>` を出し
+/// （Tx の途中に kill が当たったことをスクリプトが観測する印）、`COMMIT` 成功後にだけ
+/// `COMMITTED` を出す。
 fn write_txn_inner(path: &str) -> Res<()> {
     let core = open_txn_core(path)?;
     ensure_txn_schema(&core)?;
     // 再開: 3 表が整合していなければ fail-closed で開始を拒否する。
     let start = check_snapshot(&read_snapshot(&core, TXN_TENANT)?, true)
         .map_err(|e| format!("inconsistent state on resume: {e}"))?;
-    let stdout = std::io::stdout();
-    let mut out = stdout.lock();
-    let pause = || std::thread::sleep(std::time::Duration::from_millis(STMT_PAUSE_MS));
 
     for n in 0..MAX_TXNS {
         let k = start
             .checked_add(n)
             .ok_or_else(|| "txn seq overflow".to_string())?;
-        let mut t = TxnSession::begin(&core, TXN_TENANT)?;
-        pause();
-        // writer は最初の書き込み文で取得される。期待値は WHERE に畳み込み、Tx 内で SELECT しない。
-        match t.run(&format!(
-            "UPDATE xt_ledger SET applied = applied + 1 WHERE id = 0 AND applied = {k}"
-        ))? {
-            SqlOutcome::Update(u) if u.rows_affected == 1 => {}
-            _ => {
-                let _ = t.run("ROLLBACK");
-                return Err("ledger update did not match exactly one row".to_string());
+        run_one_txn(&core, k, &mut |point, k| match point {
+            TxnPoint::AfterFirstWrite => emit_line(&format!("IN_TXN batch={k}")),
+            TxnPoint::AfterCommit => {
+                let total = k
+                    .checked_add(1)
+                    .and_then(|v| v.checked_mul(TXN_BATCH))
+                    .ok_or_else(|| "row count overflow".to_string())?;
+                emit_line(&format!("COMMITTED batch={k} rows={total}"))
             }
-        }
-        pause();
-        let half = TXN_BATCH / 2;
-        for range in [0..half, half..TXN_BATCH] {
-            let values: Vec<String> = range
-                .map(|j| {
-                    let id = k * TXN_BATCH + j;
-                    format!("({id}, {k}, '{}')", payload_of(k, j))
-                })
-                .collect();
-            t.run(&format!(
-                "INSERT INTO xt_items (id, seq, payload) VALUES {}",
-                values.join(", ")
-            ))?;
-            pause();
-        }
-        t.run(&format!(
-            "INSERT INTO xt_batches (id, seq, n) VALUES ({k}, {k}, {TXN_BATCH})"
-        ))?;
-        pause();
-        t.run("COMMIT")?;
-
-        let total = k
-            .checked_add(1)
-            .and_then(|v| v.checked_mul(TXN_BATCH))
-            .ok_or_else(|| "row count overflow".to_string())?;
-        writeln!(out, "COMMITTED batch={k} rows={total}")
-            .map_err(|e| format!("stdout write failed: {e}"))?;
-        out.flush()
-            .map_err(|e| format!("stdout flush failed: {e}"))?;
+            _ => Ok(()),
+        })?;
     }
     Ok(())
+}
+
+/// `write-pause` の一時停止の上限秒数。SIGKILL が来なければ非 0 終了する（無限待ちしない）。
+const PAUSE_LIMIT_SECS: u64 = 60;
+
+fn parse_point(s: &str) -> Option<TxnPoint> {
+    match s {
+        "in-txn" => Some(TxnPoint::InTxn),
+        "before-commit" => Some(TxnPoint::BeforeCommit),
+        "after-commit" => Some(TxnPoint::AfterCommit),
+        _ => None,
+    }
+}
+
+fn run_write_pause(path: &str, point: &str, warmup: &str) -> i32 {
+    let (Some(point), Ok(warmup)) = (parse_point(point), warmup.parse::<u64>()) else {
+        return usage();
+    };
+    if warmup == 0 || warmup > MAX_TXNS {
+        return usage();
+    }
+    match write_pause_inner(path, point, warmup) {
+        Ok(()) => 0,
+        Err(reason) => {
+            eprintln!("ERROR: {reason}");
+            1
+        }
+    }
+}
+
+/// `warmup` 件の完全な Tx をコミットしたのち、次の Tx の指定点で `PAUSED` を出して停止する。
+/// 期待値は途中・COMMIT 直前では「その Tx は全く残らない」、COMMIT 直後では「全部残る」
+/// （COMMIT は redb の Immediate commit を同期的に行うため）。
+fn write_pause_inner(path: &str, point: TxnPoint, warmup: u64) -> Res<()> {
+    let core = open_txn_core(path)?;
+    ensure_txn_schema(&core)?;
+    let start = check_snapshot(&read_snapshot(&core, TXN_TENANT)?, true)
+        .map_err(|e| format!("inconsistent state on resume: {e}"))?;
+    let target = start
+        .checked_add(warmup)
+        .ok_or_else(|| "txn seq overflow".to_string())?;
+
+    for k in start..target {
+        run_one_txn(&core, k, &mut |p, k| {
+            if p != TxnPoint::AfterCommit {
+                return Ok(());
+            }
+            let total = k
+                .checked_add(1)
+                .and_then(|v| v.checked_mul(TXN_BATCH))
+                .ok_or_else(|| "row count overflow".to_string())?;
+            emit_line(&format!("COMMITTED batch={k} rows={total}"))
+        })?;
+    }
+
+    let (name, committed_batches) = match point {
+        TxnPoint::AfterCommit => ("after-commit", target.checked_add(1)),
+        TxnPoint::BeforeCommit => ("before-commit", Some(target)),
+        _ => ("in-txn", Some(target)),
+    };
+    let expect_batches = committed_batches.ok_or_else(|| "txn seq overflow".to_string())?;
+    let expect_rows = expect_batches
+        .checked_mul(TXN_BATCH)
+        .ok_or_else(|| "row count overflow".to_string())?;
+    run_one_txn(&core, target, &mut |p, k| {
+        if p != point {
+            return Ok(());
+        }
+        emit_line(&format!(
+            "PAUSED point={name} batch={k} expect_rows={expect_rows} expect_batches={expect_batches}"
+        ))?;
+        std::thread::sleep(std::time::Duration::from_secs(PAUSE_LIMIT_SECS));
+        Err("pause limit reached without SIGKILL".to_string())
+    })
 }
 
 fn run_verify_txn(path: &str) -> i32 {
