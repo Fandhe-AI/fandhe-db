@@ -16,6 +16,12 @@
 //! 入るまでの既知の制約）。継承（メンバーシップ経由の権限）は #2232 の担当で、本ファイルは付与者本人の直接の
 //! 行と PUBLIC の行だけを見る。
 //!
+//! SEQUENCE・関数（Issue #2235）: 名前は書き込みと同じ txn で内部 ID へ解決する（SEQUENCE の不在 `42P01`・
+//! 表を指せば `42809`、関数の不在・型の不一致・他テナントの関数は区別せず `42883`）。関数は PostgreSQL の
+//! `proacl` が NULL の状態（PUBLIC が EXECUTE を持つ暗黙の既定）を持つため、印（`function::ACL_INIT_TABLE`）
+//! の無い関数への初回の変更は、暗黙の既定を作業状態へ展開してから判定し、差分があれば全行と印を同じ
+//! txn で書く（設計記録 S5）。
+//!
 //! 有界性: 対象の総数・CASCADE の反復回数に上限を置き、超過は固定の `LimitExceeded`（`54000`）にする。
 
 use std::collections::HashMap;
@@ -28,8 +34,12 @@ use super::super::{
     bump_table_generation_in_txn, index_name_exists_in_txn, materialized_view_exists_in_txn,
     require_table_schema_write_any_identity, CatalogError, Storage, CATALOG_TABLE, VIEWS_TABLE,
 };
+use super::function::{
+    acl_initialized_in_txn, implicit_default_entry, mark_acl_initialized_in_txn,
+};
 use super::{
-    list_acl_for_object_in_txn, upsert_acl_in_txn, AclEntry, PrivilegeObject, PUBLIC_GRANTEE_ID,
+    corrupt, list_acl_for_object_in_txn, upsert_acl_in_txn, AclEntry, PrivilegeObject,
+    PUBLIC_GRANTEE_ID,
 };
 use crate::catalog::role::{get_role_by_id_in_txn, get_role_in_txn, validate_tenant};
 
@@ -59,6 +69,19 @@ pub(crate) enum AclScope {
     Schemas,
     /// `schemas` 配下の、実行時点で既に在る relation（表・ビュー・matview）へ展開する。
     AllTablesInSchemas,
+    /// `sequences`（解決済みの relation キー。書き込みと同じ txn で内部 ID へ解決する。Issue #2235）。
+    Sequences,
+    /// `functions`（関数キーと任意の引数型。書き込みと同じ txn で内部 ID へ解決する。Issue #2235）。
+    Functions,
+}
+
+/// `ON FUNCTION` の対象 1 件（Issue #2235）。
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct AclFunctionRef {
+    /// 解決済みの関数キー。
+    pub(crate) name: String,
+    /// 引数型の並び。`None` は名前だけで指す。
+    pub(crate) arg_types: Option<Vec<crate::catalog::ColumnType>>,
 }
 
 /// 権限 1 項目。`columns` が空なら表単位。
@@ -80,6 +103,10 @@ pub(crate) struct AclRequest<'a> {
     pub(crate) tables: &'a [String],
     /// SCHEMA 名（`scope` が `Schemas`／`AllTablesInSchemas` のとき）。利用者が書いた裸の名前。
     pub(crate) schemas: &'a [String],
+    /// SEQUENCE のキー（`scope` が `Sequences` のとき）。
+    pub(crate) sequences: &'a [String],
+    /// 関数の指定（`scope` が `Functions` のとき）。
+    pub(crate) functions: &'a [AclFunctionRef],
     pub(crate) items: &'a [AclItem],
     pub(crate) grantees: &'a [GranteeSpec],
     /// `WITH GRANT OPTION`（GRANT）／`GRANT OPTION FOR`（REVOKE）。
@@ -114,6 +141,8 @@ pub(crate) enum AclChangeError {
     ColumnNotFound(String),
     /// SCHEMA が自テナントに無い（他テナントにだけ在る場合を含む。利用者が書いた名前。`3F000`）。
     SchemaNotFound(String),
+    /// 関数が自テナントに無い・型が一致しない（他テナントにだけ在る場合を含む。`42883`。固定文言）。
+    FunctionNotFound,
     /// 付与者が未束縛・不在、または対象に何の権限も持たない（`42501`）。
     PermissionDenied,
     /// RESTRICT で依存する付与が残る（`2BP01`）。
@@ -170,6 +199,18 @@ fn relation_kind(write_txn: &redb::WriteTransaction, tenant: &str, key: &str) ->
     } else {
         Err(CatalogError::TableNotFound(key.to_string()).into())
     }
+}
+
+/// SEQUENCE のキーを内部 ID へ解決する（Issue #2235）。テナント内の解決を先に行い（他テナントの SCHEMA・
+/// 不在は `TableNotFound`）、表・ビュー・索引を指すときは `WrongObjectKind`。
+fn resolve_sequence_id(write_txn: &redb::WriteTransaction, tenant: &str, key: &str) -> Result<u64> {
+    crate::catalog::namespace::ensure_tenant_key_schema_alive_in_txn(write_txn, tenant, key)?;
+    if let Some(def) = crate::catalog::sequence::sequence_definition_in_txn(write_txn, key)? {
+        return Ok(def.id);
+    }
+    // SEQUENCE ではない: 他の種別なら `WrongObjectKind`、何も無ければ `TableNotFound`。
+    relation_kind(write_txn, tenant, key)?;
+    Err(CatalogError::WrongObjectKind(key.to_string()).into())
 }
 
 /// 更新対象の 1 オブジェクトと、その要求ビット。
@@ -262,8 +303,11 @@ fn ancestors_of(entries: &[AclEntry], grantor: u64, bits: u16) -> Result<Vec<u64
 /// 1 オブジェクトの ACL 行の作業状態（`before` は txn スナップショット、`work` は更新後）。
 struct AclState {
     object: PrivilegeObject,
+    /// 差分の基準。印の無い関数（`implicit`）は、暗黙の既定を展開した行（保存値ではない）。
     before: Vec<AclEntry>,
     work: Vec<AclEntry>,
+    /// 暗黙の既定（PUBLIC・EXECUTE）を展開した関数か。差分があれば全行と印を書く（S5）。
+    implicit: bool,
 }
 
 /// 作業状態の集合（挿入順を保つ。表と列の依存解決で相互参照するため、1 箇所で持つ）。
@@ -271,6 +315,8 @@ struct AclState {
 struct AclStates {
     order: Vec<AclState>,
     index: HashMap<String, usize>,
+    /// 暗黙の既定を展開するときの付与者（現在ロール）。
+    seed_grantor: u64,
 }
 
 impl AclStates {
@@ -288,12 +334,24 @@ impl AclStates {
         if self.order.len() >= MAX_TARGET_VISITS {
             return Err(AclChangeError::LimitExceeded);
         }
-        let before = list_acl_for_object_in_txn(write_txn, tenant, object)?;
+        let mut implicit = false;
+        let before = match object {
+            PrivilegeObject::Function(id) if !acl_initialized_in_txn(write_txn, tenant, *id)? => {
+                // 印が無いのに行がある状態は不整合（fail-closed）。
+                if !list_acl_for_object_in_txn(write_txn, tenant, object)?.is_empty() {
+                    return Err(corrupt().into());
+                }
+                implicit = true;
+                vec![implicit_default_entry(self.seed_grantor)]
+            }
+            _ => list_acl_for_object_in_txn(write_txn, tenant, object)?,
+        };
         self.index.insert(key, self.order.len());
         self.order.push(AclState {
             object: object.clone(),
             work: before.clone(),
             before,
+            implicit,
         });
         Ok(self.order.len() - 1)
     }
@@ -350,8 +408,10 @@ fn resolve_dependents(
                     });
                 }
             }
-            PrivilegeObject::Column { .. } | PrivilegeObject::Schema(_) => objs.push(scope.clone()),
-            _ => continue,
+            PrivilegeObject::Column { .. }
+            | PrivilegeObject::Schema(_)
+            | PrivilegeObject::Sequence(_)
+            | PrivilegeObject::Function(_) => objs.push(scope.clone()),
         }
         for obj in objs {
             let i = states.idx(write_txn, tenant, &obj)?;
@@ -484,7 +544,7 @@ impl Storage {
         // （不在・他テナントは区別なく `SchemaNotFound`。存在オラクルにしない）。
         let mut kinds: Vec<(String, RelKind)> = Vec::new();
         let mut schema_ids: Vec<u64> = Vec::new();
-        if req.scope != AclScope::Tables {
+        if matches!(req.scope, AclScope::Schemas | AclScope::AllTablesInSchemas) {
             for name in req.schemas {
                 let id = crate::catalog::namespace::schema_id_in_txn(&*write_txn, tenant, name)?
                     .ok_or_else(|| AclChangeError::SchemaNotFound(name.clone()))?;
@@ -493,6 +553,8 @@ impl Storage {
                 }
             }
         }
+        let mut sequence_ids: Vec<u64> = Vec::new();
+        let mut function_ids: Vec<u64> = Vec::new();
         match req.scope {
             AclScope::Tables => {
                 for t in req.tables {
@@ -501,6 +563,28 @@ impl Storage {
                 }
             }
             AclScope::Schemas => {}
+            AclScope::Sequences => {
+                for key in req.sequences {
+                    let id = resolve_sequence_id(&write_txn, tenant, key)?;
+                    if !sequence_ids.contains(&id) {
+                        sequence_ids.push(id);
+                    }
+                }
+            }
+            AclScope::Functions => {
+                for f in req.functions {
+                    let id = crate::catalog::function::resolve_function_id_in_txn(
+                        &*write_txn,
+                        tenant,
+                        &f.name,
+                        f.arg_types.as_deref(),
+                    )?
+                    .ok_or(AclChangeError::FunctionNotFound)?;
+                    if !function_ids.contains(&id) {
+                        function_ids.push(id);
+                    }
+                }
+            }
             AclScope::AllTablesInSchemas => {
                 // 実行時点（この txn のスナップショット）で既に在る relation だけへ展開する。後から作られる
                 // 表には効かない（PostgreSQL と同じ）。総数は走査上限で有界。
@@ -554,6 +638,22 @@ impl Storage {
                         item.bits,
                         false,
                     )?;
+                }
+            }
+        }
+        for (ids, wrap) in [
+            (
+                &sequence_ids,
+                PrivilegeObject::Sequence as fn(u64) -> PrivilegeObject,
+            ),
+            (
+                &function_ids,
+                PrivilegeObject::Function as fn(u64) -> PrivilegeObject,
+            ),
+        ] {
+            for id in ids {
+                for item in req.items {
+                    add_target(&mut targets, &mut index, wrap(*id), item.bits, false)?;
                 }
             }
         }
@@ -622,7 +722,10 @@ impl Storage {
         }
         // 4. 対象ごとの判定と計画。
         let mut warn_acc = WarningAcc::default();
-        let mut states = AclStates::default();
+        let mut states = AclStates {
+            seed_grantor: req.grantor_id,
+            ..AclStates::default()
+        };
         let mut affected: Vec<(u64, PrivilegeObject)> = Vec::new();
         for t in &targets {
             let allowed = t.object.allowed_privileges();
@@ -776,11 +879,28 @@ impl Storage {
             resolve_dependents(&write_txn, tenant, &mut states, affected, req.cascade)?;
         }
         let mut changes: Vec<Change> = Vec::new();
+        let mut init_marks: Vec<u64> = Vec::new();
         for st in &states.order {
-            diff_into(&mut changes, &st.object, &st.before, &st.work);
+            if st.implicit {
+                // 暗黙の既定のままなら何も書かない。差分があれば展開した全行と印を同じ txn で書く
+                // （行だけでは「既定のまま」と「PUBLIC から取り消し済み」を区別できない。S5）。
+                if st.work != st.before {
+                    for e in &st.work {
+                        changes.push(Change {
+                            object: st.object.clone(),
+                            entry: *e,
+                        });
+                    }
+                    if let PrivilegeObject::Function(id) = &st.object {
+                        init_marks.push(*id);
+                    }
+                }
+            } else {
+                diff_into(&mut changes, &st.object, &st.before, &st.work);
+            }
         }
         // 5. 書き込み。
-        if changes.is_empty() {
+        if changes.is_empty() && init_marks.is_empty() {
             return Ok(AclApplyOutcome {
                 warning: warn_acc.finish(),
                 rows_changed: 0,
@@ -796,6 +916,9 @@ impl Storage {
                 c.entry.privileges,
                 c.entry.grant_options,
             )?;
+        }
+        for id in &init_marks {
+            mark_acl_initialized_in_txn(&write_txn, tenant, *id)?;
         }
         let mut touched: Vec<String> = Vec::new();
         for c in &changes {

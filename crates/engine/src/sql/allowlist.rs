@@ -20348,6 +20348,40 @@ pub(crate) fn is_drop_function_statement(tokens: &[Token]) -> bool {
         && matches!(tokens.get(1), Some(Token::Ident(name)) if name.eq_ignore_ascii_case("FUNCTION"))
 }
 
+/// 関数名の直後の任意の型の並び `( [<型>[, ...]] )` を読む（`DROP FUNCTION` と `GRANT|REVOKE ... ON FUNCTION`
+/// の共有ヘルパー。型の解析器を複製しない）。括弧が無ければ `None`（名前だけで指す）、`f()` は `Some(空)`。
+/// 型は [`crate::sql::cast::parse_cast_type`] で読み、個数は `MAX_UDF_PARAMS` で検証してから確保する。
+fn parse_function_arg_types(
+    p: &mut Parser<'_>,
+) -> Result<Option<Vec<crate::catalog::ColumnType>>, SqlSurfaceError> {
+    if !matches!(p.peek(), Some(Token::Punct('('))) {
+        return Ok(None);
+    }
+    p.advance();
+    let mut types = Vec::new();
+    if !matches!(p.peek(), Some(Token::Punct(')'))) {
+        loop {
+            if types.len() >= crate::sql::udf_call::MAX_UDF_PARAMS {
+                return Err(SqlSurfaceError::payload_too_large(
+                    "too many function parameters",
+                ));
+            }
+            let cast = crate::sql::cast::parse_cast_type(&p.tokens, &mut p.pos)?;
+            let ty = cast
+                .result_column_type()
+                .ok_or_else(|| SqlSurfaceError::unsupported("unsupported argument type"))?;
+            types.push(ty);
+            if matches!(p.peek(), Some(Token::Punct(','))) {
+                p.advance();
+            } else {
+                break;
+            }
+        }
+    }
+    p.expect_punct(')')?;
+    Ok(Some(types))
+}
+
 /// [`ValidatedDropFunction`] の構造検証本体（SQL-66、Issue #1920）。受理するのは
 /// `DROP FUNCTION [IF EXISTS] <name> [(<型>[, ...])] [CASCADE | RESTRICT]` だけで、複数名は
 /// `0A000`、その他の形（引数名つき等）は型として読めず拒否する。型は
@@ -20368,32 +20402,7 @@ pub(crate) fn validate_drop_function_tokens(
     let name = p.expect_ident()?;
     crate::catalog::validate_relation_key(&name)
         .map_err(|_| SqlSurfaceError::unsupported("invalid function name in DROP FUNCTION"))?;
-    let mut arg_types = None;
-    if matches!(p.peek(), Some(Token::Punct('('))) {
-        p.advance();
-        let mut types = Vec::new();
-        if !matches!(p.peek(), Some(Token::Punct(')'))) {
-            loop {
-                if types.len() >= crate::sql::udf_call::MAX_UDF_PARAMS {
-                    return Err(SqlSurfaceError::payload_too_large(
-                        "too many function parameters",
-                    ));
-                }
-                let cast = crate::sql::cast::parse_cast_type(&p.tokens, &mut p.pos)?;
-                let ty = cast
-                    .result_column_type()
-                    .ok_or_else(|| SqlSurfaceError::unsupported("unsupported argument type"))?;
-                types.push(ty);
-                if matches!(p.peek(), Some(Token::Punct(','))) {
-                    p.advance();
-                } else {
-                    break;
-                }
-            }
-        }
-        p.expect_punct(')')?;
-        arg_types = Some(types);
-    }
+    let arg_types = parse_function_arg_types(&mut p)?;
     let mut behavior = DropFunctionBehavior::Restrict;
     if p.peek_ident_matches("CASCADE") {
         p.advance();

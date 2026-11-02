@@ -259,6 +259,7 @@ pub mod lexer;
 pub mod lock_table;
 pub mod mode;
 pub(crate) mod numeric_fn;
+pub(crate) mod object_privilege;
 pub(crate) mod order_value;
 pub(crate) mod param_coerce;
 pub(crate) mod param_infer;

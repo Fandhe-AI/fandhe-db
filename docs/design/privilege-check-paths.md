@@ -109,9 +109,11 @@ SQL 表層のディスパッチは `EngineCore::execute_parsed_statement`（自�
 | ---- | ---- | ---------- |
 | 一時表 | `CreateTempTable`（`sql::ddl::execute_create_temp_table`）はゲート対象外。`DROP TABLE` の一時表のみ分岐もゲートを通らない。`SessionRouted`（一時表だけを参照する文を一時コアへ回す `core/temp_route.rs`）も同様 | セッション内で閉じ、共有カタログを変更しないため（[temp-table.md](temp-table.md)） |
 | `SET`／`SHOW`（search_mode・TimeZone・search_path） | DDL ゲートなし。セッション状態のみを変える | 作用がセッションに閉じる |
-| `setval`／`lastval` | `SequenceFunction`。DDL ゲートなし | 作用が呼び出し元テナントに閉じる（コード中の設計記録参照） |
+| `setval`／`lastval` | `SequenceFunction`。DDL ゲートなし。ACL で判定すべき主体（束縛済みかつ所有者相当でない）には SEQUENCE の ACL を判定する（`setval`=UPDATE、`lastval`=USAGE か SELECT。Issue #2235） | 作用が呼び出し元テナントに閉じる（コード中の設計記録参照）。判定は `sql/object_privilege.rs` |
+| `nextval`／`currval`（INSERT の VALUES・DEFAULT） | `tenant::assign_sequence_values` が採番の前に SEQUENCE の ACL を判定する（`nextval`=USAGE か UPDATE、`currval`=USAGE か SELECT）。SERIAL・IDENTITY・`OWNED BY` 済みの列 DEFAULT の暗黙の採番は免除（SQL-40 (6)(a)）。採番文脈（`SequenceScope`）が主体を運び、セッションの無い経路は検査しない | Issue #2235（設計記録 `role-privilege-model.md` §14） |
+| UDF・`LANGUAGE sql\|plpgsql` 関数の呼び出し | 文の実行区間の頭で `core.rs::function_acl_scope` が EXECUTE を持たないカタログ由来の関数キーの集合を張り、解決点（`udf_call::bind_call` の宣言的 UDF 展開・`routine_fold` のルーチン呼び出し・`function_scan::plan`）で `42501` にする。新規の関数は PUBLIC が EXECUTE を持つ（既定） | Issue #2235（§14 S5・S7）。wire-server が core の外で行う INSERT 値・UPDATE／DELETE 述語の束縛は未結線（既知の差） |
 | DML・SELECT・カーソル・COPY・TRUNCATE・検索 | DDL ゲートなし。軸 1（テナント境界・可視性）のみで制御 | 現状はロール別権限を持たない |
-| UDF の呼び出し | 権限の無いセッションでも呼べる。本体は呼び出し元の権限・可視性で実行し `SECURITY DEFINER` は拒否 | 根拠テスト `crates/engine/tests/sql_t40_up/sql67_function_privileges.rs` |
+| UDF の呼び出し | DDL 権限の無いセッションでも呼べる（ACL の EXECUTE は別軸で、束縛ロールにだけ課す。次の行）。本体は呼び出し元の権限・可視性で実行し `SECURITY DEFINER` は拒否 | 根拠テスト `crates/engine/tests/sql_t40_up/sql67_function_privileges.rs` |
 | `search_path` の参照ゲート | `sql/search_path.rs` の `is_ddl_head`（先頭が CREATE／DROP／ALTER／REFRESH）かつ権限なしのときは参照走査を飛ばし、存在判定より前に `42501` を返す契約を保つ | 存在オラクル防止 |
 | NoSQL（HTTP `POST /v1/query`） | `create_table`／`alter_table`／`drop_table` の op だけがトークン列として SQL 表層と同じ実行器へ到達する（`http/query/ddl.rs`。第 2 の判定は無い）。それ以外の DDL 相当の op は `classify_op` の許可リストで `0A000` | `http/query/gate.rs`・`op.rs` |
 | engine の Rust API | `Storage::create_table`／`delete_table` 等の `PolicyContext` を取らない生 DDL はゲートを持たない。SQL 表層からはゲート通過後にだけ到達する | `catalog.rs` の doc コメント。移行先で扱う |
