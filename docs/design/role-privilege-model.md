@@ -514,3 +514,67 @@ SQL-39 (3)(7)・WIRE-18 ポインタ。ロールのカタログ（#1961）・`CR
 ### 対象外
 
 HTTP `POST /v1/session` でのカタログのロールの照合、cleartext 方式でのカタログのロールの照合、users ファイルのユーザーとロールの対応づけ（#1971）、ブートストラップ専用化（#2238）、カタログのロールの DDL 権限、メンバーシップ（#2232）、存在オラクルの網羅試験（#1972）、`current_user`・`session_user` の値。
+
+## 14. Issue #2236 実装記録（オブジェクト所有者と PUBLIC）
+
+SQL-40・RLS-12 ポインタ。表・ビュー・matview・SCHEMA・関数に所有者ロールを持たせ、`ALTER ... OWNER TO` と所有者による
+DROP・ALTER・GRANT を実装した。
+
+### 実装範囲
+
+- **保存**: 新しい表 `object_owners`（遅延作成）。キーは `(object_kind, object_key, tenant_id)`、値は版 1 の blob（所有者の
+  ロール ID）。kind と key は ACL と同じ規則（relation は relation キー、SCHEMA・関数は内部 ID の 10 進正規形）。relation は
+  全テナント共有カタログにあるため所有者はテナントごとの行で、`tenant_id` を末尾に置いて DROP・改名の掃除を範囲走査にした。
+  読み書きは 3 成分の完全一致で、他テナントの行は引けない。判定の唯一の関数は `catalog::privilege::owner::is_owner_in_txn`。
+- **作成者の記録**: `CREATE TABLE`・CTAS・`CREATE VIEW`・`CREATE MATERIALIZED VIEW`・`CREATE SCHEMA`・`CREATE FUNCTION`
+  の成功時に、束縛中の現在ロールを所有者として記録する（`OR REPLACE` は既存の所有者を変えない）。未束縛のセッションは
+  記録せず、所有者の無い対象は運用者権限でしか扱えない。`CREATE SCHEMA ... AUTHORIZATION <ロール>` は指定ロールを所有者にする。
+- **所有者による DROP・ALTER**: `DROP SCHEMA`・`ALTER SCHEMA ... RENAME`・`DROP FUNCTION` は `ServerDdlOrOwner`。運用者権限が
+  無い束縛ロールは、書き込み txn の中で所有者を検査し、非所有者は `42501`。ゲートは `GateDecision::{Allowed, OwnerCheckRequired}`
+  を返し、未束縛はカタログ照会より前に `42501`。
+- **`OWNER TO`**: `ALTER {TABLE|VIEW|MATERIALIZED VIEW|SCHEMA} <名> OWNER TO <ロール>`。解決・判定・書き込み・ACL の
+  書き換え・世代の更新を単一の write txn で行う（`Storage::alter_object_owner`）。
+- **GRANT／REVOKE・SCHEMA の利用**: 付与者が対象の所有者なら所有者相当（`ddl_allowed` に加算）。SCHEMA の所有者は USAGE・CREATE を
+  暗黙に持つ。
+- **DROP ROLE**: そのテナントで所有者として現れるロールは `2BP01`（所有権を移してから削除する）。
+- **`REASSIGN OWNED`・`DROP OWNED`**: 状態に依存しない固定の `0A000`。
+
+### 判断の記録
+
+| # | 判断 | 理由 |
+| - | ---- | ---- |
+| O1 | 所有者の権限は加算のみ。`ddl_allowed` による所有者相当は全経路で維持する | J4・K1、および読み取り・書き込み・COPY のゲートの前提を壊さない |
+| O2 | 共有カタログの relation（表・ビュー・matview）は、所有者が行えるのを ACL 管理（GRANT／REVOKE）と `OWNER TO` に限る。構造を変える DROP・ALTER は `ServerDdl` のまま | D6。共有定義の変更は他テナントへ波及する |
+| O3 | テナント別定義（SCHEMA・関数）の DROP・ALTER は「運用者権限または所有者」 | D6 |
+| O4 | 判定順序: 運用者権限ならカタログ照会なしで許可。未束縛で運用者権限も無ければ照会より前に `42501`。束縛ロールは自テナントで解決し（不在・他テナントは従来どおり `3F000`／`42883`）、その後に所有者を検査 | D10。検査と書き込みを同じ txn にして TOCTOU を防ぐ |
+| O5 | 所有者行の無い対象はどのロールの所有にもならない（ブートストラップロールの合成はしない） | 初期ロール所有は #2238 の担当。拒否側 |
+| O6 | 作成者の記録は作成の成功直後の別 write txn（SCHEMA は作成と同じ txn）。この間でクラッシュすると所有者の無い対象が残るが、O5 により拒否側に倒れる | 作成経路が多く、全経路へ所有者を通すと公開 API の変更が大きい |
+| O7 | SCHEMA の所有者も `object_owners` に置く（kind=SCHEMA・内部 ID キー）。D6 が示した SCHEMA blob の予約領域は使わない | 改名で blob を移す処理と旧バイナリの互換を増やさない。内部 ID は再利用されず、改名で変わらない |
+| O8 | `OWNER TO` の実行者は運用者権限または現在の所有者。所有者が実行する場合は、新所有者へ SET 可能であること、対象がテナント SCHEMA 配下なら新所有者がその CREATE を持つことを要求する。運用者権限はこの 2 点を免除する。未束縛は照会より前に `42501`（運用者権限があっても束縛が要る） | PostgreSQL 17 と同じ制約 |
+| O9 | 新所有者は自テナントのカタログだけで解決する。不在と他テナントにだけ在る場合は同じ `42704` | D10 |
+| O10 | `OWNER TO` は、そのテナントの ACL 行（表なら列行も）の旧所有者を新所有者へ置き換える（grantor・grantee の両方。衝突はビットの OR。自己付与になる行は削除） | 旧所有者の付与が取り消せないまま残る fail-open を防ぐ |
+| O11 | GRANT／REVOKE は、付与者が対象の所有者なら所有者相当（`apply.rs` の対象ごとの判定）。付与者は従来どおり現在ロール | O1 |
+| O12 | SCHEMA の USAGE・CREATE の判定（`schema_privileges_in_txn`）に、所有者の暗黙の権限を足す | 所有者は暗黙に全権限を持つ |
+| O13 | 運用者権限の無い所有者の `DROP SCHEMA ... CASCADE` は、配下に共有カタログの relation（表・ビュー・SEQUENCE）があれば `42501` | D6。PostgreSQL との意図的な差 |
+| O14 | `REASSIGN OWNED`・`DROP OWNED` は構文段で固定の `0A000` | 状態に依存しない拒否は存在オラクルにならない |
+| O15 | PUBLIC への既定付与（関数の EXECUTE など）は入れない | 関数の EXECUTE は #2235、既定権限は #2237 の担当 |
+| O16 | 明示トランザクション内の `OWNER TO` と `DROP FUNCTION` は、ゲート（`42501`）の後で `0A000` | 独立した write txn で commit され ROLLBACK で取り消せない（J9・K13 と同じ） |
+| O17 | `DROP ROLE` の依存検査（`role_has_dependents_in_txn`）に所有者を加える | §9 の拡張点 |
+
+### PUBLIC の境界
+
+`GRANT ... TO PUBLIC` は ACL の `grantee_id = 0` の行で、キーの先頭が `tenant_id` のため、同じテナントのロールにだけ作用する。
+他テナントのロールにも、他テナントの同名 SCHEMA（内部 ID が別）にも及ばない（`tests/table_rls/sql40_object_owner.rs`）。
+
+### 既知の差・対象外・申し送り
+
+- 受理しない `OWNER TO`: `ALTER SEQUENCE`・`ALTER FUNCTION`・`ALTER PROCEDURE`・`ALTER ROUTINE`・`IF EXISTS`・`ALTER TABLE` の
+  複数アクション（`0A000` または構文エラー）。SEQUENCE と暗黙の SEQUENCE（SERIAL・IDENTITY）の所有者は未実装で、表の所有者の移譲に追随しない。
+- 所有者に基づく INDEX・TRIGGER・POLICY・TYPE の DDL 判定、`REFRESH MATERIALIZED VIEW` の所有者・MAINTAIN 判定、テナント SCHEMA 内の
+  relation の所有者による DROP・ALTER は `ServerDdl` のまま。行セキュリティの `user_policies_apply(is_owner)` は実際の所有者へ結線していない
+  （所有者にも RLS がかかる拒否側）。
+- メンバーシップ経由の所有者権限（#2232）と、読み取り・書き込み・COPY のゲート（#1967〜#1969）への所有者の組み込みは、それぞれの
+  Issue が入った時点で `is_owner_in_txn`（権限の集約点）を広げる形で結線する。
+- J4 の残存制約（別の運用者が付けた付与を REVOKE できない）は変わらない。
+- PostgreSQL との意図的な差: O13、および SCHEMA の改名・所有者変更でデータベースの CREATE 権限を検査しないこと。
+- 既存オブジェクト（改訂前に作られたもの）の所有者は未設定のまま（O5）。初期ロールへの移行は #2238。

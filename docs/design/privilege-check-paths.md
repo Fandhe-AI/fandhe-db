@@ -31,7 +31,7 @@ Phase 6 の共通ゲートへ移行する前に結線漏れと README の再陳�
 
 ロールと権限のカタログ（#1961）と `GRANT`／`REVOKE` の SQL 文（#1965）は実装済みだが、現在ロールを束縛する認証層（#1971）と
 権限検査ゲート（#1966〜#1969）は未実装のため、権限はまだ DML・SELECT・COPY の判定に効かない。wire の全セッションは現在ロールが未束縛で、
-`GRANT`／`REVOKE` は対象・ロールの有無を問わず `42501` になる（後述）。所有者の概念は未実装（#2236）。
+`GRANT`／`REVOKE` は対象・ロールの有無を問わず `42501` になる（後述）。所有者の概念は #2236 で追加済み（`object_owners`。`ddl_allowed` の所有者相当に加算）。
 DDL 権限は全テナント共有のカタログを変更する操作の運用者権限であり、軸 1 とは独立に評価される。
 
 ## 権限ビットの注入点（本番コード）
@@ -80,8 +80,9 @@ SQL 表層のディスパッチは `EngineCore::execute_parsed_statement`（自�
 | `DROP POLICY` | `DropPolicy` | `core.rs` の腕 | `IF EXISTS` でも `42501` |
 | `CREATE SCHEMA` | `CreateSchema` | `core.rs` の腕 | |
 | `GRANT`／`REVOKE` | `GrantRevoke` | `core.rs` の腕（`sql::grant_ddl::require_grant_principal`） | DDL 権限ではなく現在ロールの束縛を判定する（未束縛は `42501`。カタログ照会・名前解決より前）。DDL 権限ゲートを通過した主体は所有者の機構（#2236）までの代替として所有者相当に扱う（SQL-40・Issue #1965。[role-privilege-model.md](role-privilege-model.md) §8）。構文エラー `42601`・範囲外の形 `0A000`・不正な付与 `0LP01` は状態に依存しないため判定点より前（構文段）に返る。`search_path` の参照ゲートは現在ロール未束縛のセッションでは飛ばす（`42501` を先にする） |
-| `DROP SCHEMA` | `DropSchema` | `core.rs` の腕 | |
-| `ALTER SCHEMA` | `AlterSchema` | `core.rs` の腕 | |
+| `DROP SCHEMA` | `DropSchema` | `core.rs` の腕 | 運用者権限またはテナント内の所有者（書き込み txn 内で検査。未束縛は照会より前に `42501`。Issue #2236） |
+| `ALTER SCHEMA` | `AlterSchema` | `core.rs` の腕 | `RENAME TO` は運用者権限または所有者（Issue #2236）。`OWNER TO` は下の `ALTER ... OWNER TO` |
+| `ALTER {TABLE\|VIEW\|MATERIALIZED VIEW\|SCHEMA} ... OWNER TO` | `AlterOwner` | `core.rs` の腕（`sql::owner_ddl`） | 現在ロールの束縛（未束縛は `42501`）→ 運用者権限または所有者（新所有者へ SET 可能であること等）を書き込み txn 内で判定。明示 Tx 内は `0A000`（Issue #2236。[role-privilege-model.md](role-privilege-model.md) §14） |
 | `CREATE [OR REPLACE] FUNCTION` | `Statement::CreateFunction` | `core.rs` の `execute_validated_with_dict` 内の腕 | |
 | `DROP FUNCTION` | `DropFunction` | **実行本体** `sql::udf_ddl::execute_drop_function` の先頭 | `core.rs` の腕ではゲートを呼ばない非対称（下記） |
 
@@ -142,9 +143,10 @@ Issue #1972 の担当（RLS-12 ポインタ）。
 | `DdlStatementKind` | 現在の必要権限 | 移行先（ポインタ） |
 | ------------------ | -------------- | ------------------ |
 | `CreateTable`・`CreateTableAs`・`CreateView`・`CreateMaterializedView`・`CreateIndex`・`CreateType`・`CreateSequence`・`CreateTrigger`・`CreateFunction` | `ServerDdl` | SCHEMA の CREATE（#2234） |
-| `DropTable`・`AlterTable`・`RefreshMaterializedView`・`DropView`・`DropMaterializedView`・`DropIndex`・`DropType`・`DropSequence`・`AlterSequence`・`DropTrigger`・`DropFunction`・`CreatePolicy`・`AlterPolicy`・`DropPolicy` | `ServerDdl` | 所有者（#2236） |
+| `DropTable`・`AlterTable`・`RefreshMaterializedView`・`DropView`・`DropMaterializedView`・`DropIndex`・`DropType`・`DropSequence`・`AlterSequence`・`DropTrigger`・`CreatePolicy`・`AlterPolicy`・`DropPolicy` | `ServerDdl` | `ServerDdl` のまま（共有定義の変更は運用者権限。所有者は ACL 管理と `OWNER TO` だけ。§14 O2） |
 | `CreateRole`・`DropRole` | `ServerDdl` | CREATEROLE（#1971） |
-| `CreateSchema`・`DropSchema`・`AlterSchema` | `ServerDdl` | 所有者・データベース権限（#2234 以降） |
+| `CreateSchema` | `ServerDdl` | データベース権限（#2234 以降） |
+| `DropSchema`・`AlterSchema`・`DropFunction`・`AlterOwner` | `ServerDdlOrOwner`（運用者権限、または所有者を実行本体が write txn 内で検査） | 所有者のメンバーシップ継承（#2232） |
 
 ゲート対象外または別判定: 一時表、`SET`／`SHOW`、`setval`、GRANT／REVOKE（`privilege_gate::bound_principal` による現在ロール束縛の判定）。
 

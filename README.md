@@ -619,6 +619,11 @@ username・空要素・重複要素・フラグの重複指定はいずれも fa
 `docs/design/sql-create-table.md`・`docs/design/drop-table.md`・
 `docs/design/create-view.md`・`docs/design/index-ddl-declaration.md` 参照）。
 
+オブジェクト所有者（Issue #2236）は、この運用者権限とは別に、表・ビュー・matview・SCHEMA・関数の作成者
+（現在ロールが束縛されたセッション）として記録されます。所有者は運用者権限なしで GRANT／REVOKE・
+`ALTER ... OWNER TO`・SCHEMA と関数の削除ができますが、運用者権限が縮むことはありません
+（詳細は `docs/design/role-privilege-model.md` §14）。
+
 `--tls-cert`／`--tls-key`／`--tls-mode`（Issue #967・親 #941・TASK-228。
 WIRE-7, WIRE-9 ポインタ）は SQL 表層（pg wire）の TLS を有効化する opt-in
 CLI 引数です。`--tls-cert`（サーバー証明書チェーン PEM）・`--tls-key`
