@@ -348,3 +348,41 @@ fn owner_to_inside_a_transaction_block_is_not_supported() {
             .expect("rollback");
     }
 }
+
+/// SCHEMA 配下の表への `OWNER TO`: 名前解決器が `s.t` を内部キーへ置き換えた後に束縛され、所有者が行う場合は
+/// 新所有者がその SCHEMA の CREATE を持つことを要求する（付与するまで `42501`、付与後は成功）。
+#[test]
+fn owner_to_on_a_schema_qualified_relation_requires_create_on_the_schema() {
+    let f = fx("sql40_owner_qualified");
+    let mut alice_ddl = bound(ALICE, true);
+    f.ok("t1", &mut alice_ddl, "CREATE SCHEMA s");
+    f.ok("t1", &mut alice_ddl, "CREATE TABLE s.t (a TEXT)");
+    let mut alice = bound(ALICE, false);
+    // alice は bob へ SET できないため、運用者権限なしでは移譲できない。メンバーシップの代わりに、
+    // 自分自身（CURRENT_USER）への移譲が no-op で通ることで解決とキーの検証が通っていることを確認する。
+    f.ok("t1", &mut alice, "ALTER TABLE s.t OWNER TO CURRENT_USER");
+    assert_eq!(
+        f.code("t1", &mut alice, "ALTER TABLE s.t OWNER TO bob"),
+        "42501"
+    );
+    // 運用者権限は SET 可能性と CREATE の要求を免除する。
+    f.ok(
+        "t1",
+        &mut bound(ALICE, true),
+        "ALTER TABLE s.t OWNER TO bob",
+    );
+    // 移譲後は bob が所有者で（修飾名の解決に必要な USAGE は SCHEMA の所有者 alice が付与する）、
+    // alice は GRANT できない。
+    f.ok("t1", &mut alice, "GRANT USAGE ON SCHEMA s TO bob");
+    f.ok("t1", &mut bound(BOB, false), "GRANT SELECT ON s.t TO alice");
+    // alice はもう所有者ではない（自分自身への移譲も所有者でなければ通らない）。
+    assert_eq!(
+        f.code("t1", &mut alice, "ALTER TABLE s.t OWNER TO CURRENT_USER"),
+        "42501"
+    );
+    // 不在の SCHEMA・不在の表は束縛前に解決されて固定のエラーになる。
+    assert_eq!(
+        f.code("t1", &mut alice, "ALTER TABLE nosuch.t OWNER TO alice"),
+        "3F000"
+    );
+}

@@ -127,3 +127,17 @@ fn create_schema_authorization_forms() {
         "0A000"
     );
 }
+
+/// NoSQL（HTTP）の DDL 入口は `validate_alter_table_tokens` を直接呼ぶ。`OWNER TO` はそこへ届いても
+/// 受理されず（所有者を変える経路にならない）、複数アクションの末尾に混ぜても同じ（Issue #2236。D13）。
+#[test]
+fn alter_table_entry_never_accepts_owner_to() {
+    for sql in [
+        "ALTER TABLE t OWNER TO r",
+        "ALTER TABLE t ADD COLUMN c TEXT, OWNER TO r",
+        "ALTER TABLE t OWNER TO r, ADD COLUMN c TEXT",
+    ] {
+        let tokens = tokenize(sql).expect("lex");
+        assert!(validate_alter_table_tokens(&tokens).is_err(), "{sql}");
+    }
+}
