@@ -1,0 +1,840 @@
+//! ロール形 `GRANT`／`REVOKE`・`CREATE ROLE ... IN ROLE`・継承の単体テスト（SQL-39 (7)・SQL-40、Issue #2232）。
+//!
+//! 付与者の記録・ADMIN の継承・循環・オプションの更新・RESTRICT／CASCADE・存在オラクルの防止・ACL の付与権限の
+//! 継承・`pg_has_role` 相当の評価を、`pub(crate)` のカタログ API と SQL 表層の実行本体で確かめる。
+//! ロール ID は 1 から順に採番される（`create_role` の契約）ため、テストは作成順で ID を使う。
+
+use super::*;
+use crate::catalog::privilege::{AclEntry, PrivilegeObject, PRIV_SELECT};
+use crate::catalog::role::graph::{has_role_privilege, HasRoleError};
+use crate::catalog::role::{get_membership, MembershipOptions, RoleAttributes, RoleDef};
+use crate::catalog::{ColumnDef, ColumnType, TableSchema};
+use crate::sql::lexer::tokenize;
+use crate::test_util::temp_db::{unique_db_path, CleanupGuard};
+use redb::ReadableDatabase;
+
+const T: &str = "t1";
+
+struct Fx {
+    _g: CleanupGuard,
+    s: Storage,
+}
+
+fn fx(label: &str) -> Fx {
+    let path = unique_db_path(label);
+    let g = CleanupGuard(path.clone());
+    let s = Storage::open(&path).expect("open");
+    s.create_table(&TableSchema::new(
+        "docs",
+        vec![ColumnDef::new("a", ColumnType::Text, true)],
+    ))
+    .expect("table");
+    Fx { _g: g, s }
+}
+
+fn mk(f: &Fx, tenant: &str, name: &str, inherit: bool) -> u64 {
+    f.s.create_role(
+        tenant,
+        &RoleDef {
+            id: 0,
+            name: name.to_string(),
+            attributes: RoleAttributes {
+                inherit,
+                ..RoleAttributes::default()
+            },
+            connection_limit: -1,
+            valid_until: None,
+            scram_verifier: Vec::new(),
+            legacy_phc: Vec::new(),
+        },
+    )
+    .expect("role")
+}
+
+fn role(f: &Fx, name: &str) -> u64 {
+    mk(f, T, name, true)
+}
+
+fn session(id: u64, owner: bool) -> SessionState {
+    let mut s = SessionState::default();
+    s.bind_role_ids(id, id);
+    if owner {
+        s.allow_ddl();
+    }
+    s
+}
+
+fn run(f: &Fx, s: &SessionState, sql: &str) -> Result<GrantRevokeOutcome, SqlSurfaceError> {
+    let stmt = crate::sql::allowlist::validate_grant_revoke_tokens(&tokenize(sql).expect("lex"))?;
+    execute_grant_revoke(&f.s, T, s, &stmt)
+}
+
+fn code(r: Result<GrantRevokeOutcome, SqlSurfaceError>) -> &'static str {
+    r.expect_err("must fail").wire_code()
+}
+
+fn mem(f: &Fx, m: u64, g: u64) -> Option<MembershipOptions> {
+    let rt = f.s.db().begin_read().expect("read");
+    get_membership(&rt, T, m, g).expect("get")
+}
+
+fn priv_check(f: &Fx, user: u64, role: u64, privs: &str) -> bool {
+    let rt = f.s.db().begin_read().expect("read");
+    has_role_privilege(&rt, T, user, role, privs).expect("check")
+}
+
+#[test]
+fn grant_records_grantor_and_defaults() {
+    let f = fx("rm_defaults");
+    let me = role(&f, "me");
+    let r = role(&f, "r");
+    let m_inh = mk(&f, T, "m_inh", true);
+    let m_noinh = mk(&f, T, "m_noinh", false);
+    let s = session(me, true);
+    let out = run(&f, &s, "GRANT r TO m_inh, m_noinh").expect("grant");
+    assert!(out.is_role() && !out.is_revoke() && out.warning.is_none());
+    assert_eq!(
+        mem(&f, m_inh, r),
+        Some(MembershipOptions {
+            admin: false,
+            inherit: true,
+            set: true,
+            grantor_id: Some(me),
+            grantor_root: true,
+        })
+    );
+    // NOINHERIT 属性のロールへの既定は INHERIT 偽。属性を後から変えても既存の付与は遡って変わらない。
+    assert!(!mem(&f, m_noinh, r).expect("row").inherit);
+}
+
+#[test]
+fn explicit_options_update_only_what_is_named() {
+    let f = fx("rm_update");
+    let me = role(&f, "me");
+    let r = role(&f, "r");
+    let m = role(&f, "m");
+    let s = session(me, true);
+    run(&f, &s, "GRANT r TO m WITH ADMIN TRUE, INHERIT FALSE").expect("grant");
+    let a = mem(&f, m, r).expect("row");
+    assert!(a.admin && !a.inherit && a.set);
+    run(&f, &s, "GRANT r TO m WITH SET FALSE").expect("update");
+    let b = mem(&f, m, r).expect("row");
+    assert!(b.admin && !b.inherit && !b.set);
+    assert_eq!(b.grantor_id, Some(me));
+    // 明示が無ければ何も変えない。
+    run(&f, &s, "GRANT r TO m").expect("noop");
+    assert_eq!(mem(&f, m, r), Some(b));
+}
+
+#[test]
+fn cycles_are_rejected_with_0lp01() {
+    let f = fx("rm_cycle");
+    let me = role(&f, "me");
+    role(&f, "a");
+    role(&f, "b");
+    role(&f, "c");
+    let s = session(me, true);
+    let e = run(&f, &s, "GRANT a TO a").expect_err("self");
+    assert_eq!(e.wire_code(), "0LP01");
+    run(&f, &s, "GRANT a TO b").expect("b in a");
+    run(&f, &s, "GRANT b TO c").expect("c in b");
+    // a を c のメンバーにすると a→c→b→a ではなく c→b→a、逆向きの a への付与が循環になる。
+    let e = run(&f, &s, "GRANT c TO a").expect_err("indirect");
+    assert_eq!(e.wire_code(), "0LP01");
+    assert!(e
+        .client_message()
+        .ends_with("role \"c\" is a member of role \"a\""));
+    // オプションが偽の辺でも循環は検出する。
+    run(&f, &s, "GRANT a TO b WITH INHERIT FALSE, SET FALSE").expect("update");
+    assert_eq!(code(run(&f, &s, "GRANT c TO a")), "0LP01");
+}
+
+#[test]
+fn unknown_and_foreign_tenant_roles_are_indistinguishable() {
+    let f = fx("rm_oracle");
+    let me = role(&f, "me");
+    role(&f, "r");
+    mk(&f, "t2", "only_t2", true);
+    let s = session(me, true);
+    let a = run(&f, &s, "GRANT r TO nobody").expect_err("missing");
+    let b = run(&f, &s, "GRANT r TO only_t2").expect_err("foreign");
+    assert_eq!(a.wire_code(), "42704");
+    assert_eq!(b.wire_code(), "42704");
+    assert_eq!(
+        a.client_message().replace("nobody", "X"),
+        b.client_message().replace("only_t2", "X")
+    );
+    let a = run(&f, &s, "GRANT nobody TO me").expect_err("missing role");
+    let b = run(&f, &s, "GRANT only_t2 TO me").expect_err("foreign role");
+    assert_eq!(a.wire_code(), b.wire_code());
+    assert_eq!(code(run(&f, &s, "GRANT r TO PUBLIC")), "42704");
+}
+
+#[test]
+fn admin_is_checked_through_inherit_closure_only() {
+    let f = fx("rm_admin");
+    let me = role(&f, "me");
+    let r = role(&f, "r");
+    let x = role(&f, "x");
+    let y = role(&f, "y");
+    let target = role(&f, "target");
+    let owner = session(me, true);
+    run(&f, &owner, "GRANT r TO x WITH ADMIN TRUE").expect("x admin");
+    // x は自分の ADMIN で付与でき、付与者は x。
+    run(&f, &session(x, false), "GRANT r TO target").expect("x grants");
+    assert_eq!(mem(&f, target, r).expect("row").grantor_id, Some(x));
+    // ADMIN を持たない主体は 42501（存在しないロールへの付与は先に 42704）。
+    assert_eq!(code(run(&f, &session(y, false), "GRANT r TO me")), "42501");
+    // y が x を継承（INHERIT 真）すれば、x の ADMIN で付与でき、付与者は x。
+    run(&f, &owner, "GRANT x TO y WITH INHERIT TRUE").expect("y in x");
+    run(&f, &session(y, false), "GRANT r TO me").expect("y via x");
+    assert_eq!(mem(&f, me, r).expect("row").grantor_id, Some(x));
+    // 継承しない経路（INHERIT 偽・SET 真）では ADMIN は届かない。
+    run(&f, &owner, "REVOKE r FROM me").expect("cleanup");
+    run(&f, &owner, "GRANT x TO y WITH INHERIT FALSE").expect("no inherit");
+    assert_eq!(code(run(&f, &session(y, false), "GRANT r TO me")), "42501");
+    // ロールは自分自身の ADMIN を持たない。
+    assert_eq!(code(run(&f, &session(x, false), "GRANT x TO me")), "42501");
+}
+
+#[test]
+fn revoke_options_and_grantor_matching() {
+    let f = fx("rm_revoke");
+    let me = role(&f, "me");
+    let r = role(&f, "r");
+    let x = role(&f, "x");
+    let z = role(&f, "z");
+    let m = role(&f, "m");
+    let owner = session(me, true);
+    run(&f, &owner, "GRANT r TO x WITH ADMIN TRUE").expect("x admin");
+    run(&f, &owner, "GRANT r TO z WITH ADMIN TRUE").expect("z admin");
+    run(&f, &session(x, false), "GRANT r TO m").expect("by x");
+    // 付与者が一致しない（z が取り消そうとする）ときは何もしない。
+    let out = run(&f, &session(z, false), "REVOKE r FROM m").expect("noop");
+    assert!(out.is_revoke() && out.is_role());
+    assert!(mem(&f, m, r).is_some());
+    // OPTION FOR はそのビットだけを落とす。
+    run(&f, &session(x, false), "REVOKE SET OPTION FOR r FROM m").expect("set off");
+    let o = mem(&f, m, r).expect("row");
+    assert!(!o.set && o.inherit);
+    // 所有者相当は付与者を問わず取り消せる。
+    run(&f, &owner, "REVOKE r FROM m").expect("owner");
+    assert!(mem(&f, m, r).is_none());
+    // 行が無ければ警告相当で何もしない。
+    run(&f, &owner, "REVOKE r FROM m").expect("again");
+}
+
+#[test]
+fn revoke_admin_restrict_and_cascade() {
+    let f = fx("rm_cascade");
+    let me = role(&f, "me");
+    let r = role(&f, "r");
+    let x = role(&f, "x");
+    let m = role(&f, "m");
+    let n = role(&f, "n");
+    let owner = session(me, true);
+    run(&f, &owner, "GRANT r TO x WITH ADMIN TRUE").expect("x admin");
+    run(&f, &session(x, false), "GRANT r TO m WITH ADMIN TRUE").expect("m admin by x");
+    // m が付けた付与（m の ADMIN は x の付与に依存）。
+    run(&f, &session(m, false), "GRANT r TO n").expect("n by m");
+    assert_eq!(mem(&f, n, r).expect("row").grantor_id, Some(m));
+    // RESTRICT（既定）は依存する付与があれば 2BP01 で何も変えない。
+    let e = run(&f, &owner, "REVOKE ADMIN OPTION FOR r FROM x").expect_err("restrict");
+    assert_eq!(e.wire_code(), "2BP01");
+    assert!(mem(&f, x, r).expect("kept").admin);
+    // CASCADE は連鎖して消す（m の付与 → n の付与）。
+    run(&f, &owner, "REVOKE ADMIN OPTION FOR r FROM x CASCADE").expect("cascade");
+    assert!(!mem(&f, x, r).expect("x").admin);
+    assert!(mem(&f, m, r).is_none());
+    assert!(mem(&f, n, r).is_none());
+}
+
+/// 取消し対象の ADMIN に依存する付与（x 自身が付けた m の ADMIN を x が継承する循環）は代替の ADMIN 経路に
+/// 数えない。RESTRICT は 2BP01、CASCADE は依存する付与を消し、取消し後に x は付与できない。
+#[test]
+fn revoke_admin_ignores_self_dependent_admin_path() {
+    let f = fx("rm_selfdep");
+    let me = role(&f, "me");
+    let r = role(&f, "r");
+    let x = role(&f, "x");
+    let m = role(&f, "m");
+    let n = role(&f, "n");
+    let owner = session(me, true);
+    run(&f, &owner, "GRANT r TO x WITH ADMIN TRUE").expect("x admin");
+    run(&f, &owner, "GRANT m TO x").expect("x inherits m");
+    run(&f, &session(x, false), "GRANT r TO m WITH ADMIN TRUE").expect("m admin by x");
+    let e = run(&f, &owner, "REVOKE ADMIN OPTION FOR r FROM x").expect_err("restrict");
+    assert_eq!(e.wire_code(), "2BP01");
+    run(&f, &owner, "REVOKE ADMIN OPTION FOR r FROM x CASCADE").expect("cascade");
+    assert!(!mem(&f, x, r).expect("x").admin);
+    assert!(mem(&f, m, r).is_none());
+    let e = run(&f, &session(x, false), "GRANT r TO n").expect_err("x lost admin");
+    assert_eq!(e.wire_code(), "42501");
+    assert!(mem(&f, n, r).is_none());
+}
+
+/// CASCADE の途中で ADMIN を失った付与者（b）を、所有者相当の根拠として扱わない（回帰）。c は b が付けた d の
+/// ADMIN を継承して e へ付与しているため、b・c の行が先に消えても d の行と e の行は最終的にすべて消える。
+#[test]
+fn cascade_does_not_treat_lost_admin_grantor_as_owner_equivalent() {
+    let f = fx("rm_lost_grantor");
+    let me = role(&f, "me");
+    let r = role(&f, "r");
+    let a = role(&f, "a");
+    let b = role(&f, "b");
+    let c = role(&f, "c");
+    let d = role(&f, "d");
+    let e = role(&f, "e");
+    let owner = session(me, true);
+    run(&f, &owner, "GRANT r TO a WITH ADMIN TRUE").expect("a admin");
+    run(&f, &session(a, false), "GRANT r TO b WITH ADMIN TRUE").expect("b admin");
+    run(&f, &session(a, false), "GRANT r TO c WITH ADMIN TRUE").expect("c admin");
+    run(&f, &session(b, false), "GRANT r TO d WITH ADMIN TRUE").expect("d admin by b");
+    run(&f, &owner, "GRANT d TO c").expect("c inherits d");
+    run(&f, &session(c, false), "GRANT r TO e").expect("e by c");
+    assert_eq!(mem(&f, e, r).expect("row").grantor_id, Some(c));
+    run(&f, &owner, "REVOKE ADMIN OPTION FOR r FROM a CASCADE").expect("cascade");
+    assert!(!mem(&f, a, r).expect("a").admin);
+    for (m, name) in [(b, "b"), (c, "c"), (d, "d"), (e, "e")] {
+        assert!(mem(&f, m, r).is_none(), "{name} must be revoked");
+    }
+}
+
+/// 1 文が複数メンバーの ADMIN を同時に落とすとき、依存の評価は文全体の変更を反映した後に集合ごとで行われ、
+/// メンバーの並び順に依存しない（回帰）。x は y 経由の ADMIN も継承しているため、`x, y` の順でも `y, x` の
+/// 順でも x は ADMIN を完全に失い、x が付けた n の付与は RESTRICT で拒否・CASCADE で削除される。
+fn admin_revoke_fixture(label: &str) -> (Fx, SessionState, u64, u64, u64, u64) {
+    let f = fx(label);
+    let me = role(&f, "me");
+    let r = role(&f, "r");
+    let x = role(&f, "x");
+    let y = role(&f, "y");
+    let n = role(&f, "n");
+    let owner = session(me, true);
+    run(&f, &owner, "GRANT r TO x, y WITH ADMIN TRUE").expect("x y admin");
+    run(&f, &owner, "GRANT y TO x").expect("x inherits y");
+    run(&f, &session(x, false), "GRANT r TO n").expect("n by x");
+    assert_eq!(mem(&f, n, r).expect("row").grantor_id, Some(x));
+    (f, owner, r, x, y, n)
+}
+
+#[test]
+fn multi_member_admin_revoke_is_order_independent() {
+    for (order, cascade_sql) in [
+        ("x, y", true),
+        ("y, x", true),
+        ("x, y", false),
+        ("y, x", false),
+    ] {
+        let label = format!("rm_multi_{}_{}", order.replace([',', ' '], ""), cascade_sql);
+        let (f, owner, r, x, y, n) = admin_revoke_fixture(&label);
+        let sql = format!("REVOKE ADMIN OPTION FOR r FROM {order}");
+        if cascade_sql {
+            run(&f, &owner, &format!("{sql} CASCADE")).expect("cascade");
+            assert!(!mem(&f, x, r).expect("x").admin, "{order}");
+            assert!(!mem(&f, y, r).expect("y").admin, "{order}");
+            assert!(mem(&f, n, r).is_none(), "{order}: n must be revoked");
+        } else {
+            let e = run(&f, &owner, &sql).expect_err("restrict");
+            assert_eq!(e.wire_code(), "2BP01", "{order}");
+            // 拒否された文は何も変えない。
+            assert!(mem(&f, x, r).expect("x").admin, "{order}");
+            assert!(mem(&f, y, r).expect("y").admin, "{order}");
+            assert!(mem(&f, n, r).is_some(), "{order}");
+        }
+    }
+}
+
+/// メンバーシップそのものの取り消し（`REVOKE r FROM x, y`）でも同じ順序非依存を保つ。
+#[test]
+fn multi_member_membership_revoke_is_order_independent() {
+    for order in ["x, y", "y, x"] {
+        let label = format!("rm_multi_mem_{}", order.replace([',', ' '], ""));
+        let (f, owner, r, x, y, n) = admin_revoke_fixture(&label);
+        let e = run(&f, &owner, &format!("REVOKE r FROM {order}")).expect_err("restrict");
+        assert_eq!(e.wire_code(), "2BP01", "{order}");
+        assert!(
+            mem(&f, x, r).is_some() && mem(&f, y, r).is_some(),
+            "{order}"
+        );
+        run(&f, &owner, &format!("REVOKE r FROM {order} CASCADE")).expect("cascade");
+        assert!(
+            mem(&f, x, r).is_none() && mem(&f, y, r).is_none(),
+            "{order}"
+        );
+        assert!(mem(&f, n, r).is_none(), "{order}: n must be revoked");
+    }
+}
+
+/// 所有者相当の付与は ADMIN の依存評価で独立した根拠として扱う（回帰）。o（所有者相当）が x・y へ ADMIN 付きで
+/// 付与し、x が z へ付与した後に `GRANT z TO o`・`GRANT y TO x` を作っても、y 経由で x は ADMIN を保つため、
+/// x の直接の ADMIN の取り消しは RESTRICT でも成功し、CASCADE でも z の付与は残る。
+#[test]
+fn owner_equivalent_grants_are_independent_admin_roots() {
+    for cascade in [false, true] {
+        let f = fx(&format!("rm_root_{cascade}"));
+        let me = role(&f, "me");
+        let r = role(&f, "r");
+        let x = role(&f, "x");
+        role(&f, "y");
+        let z = role(&f, "z");
+        role(&f, "w");
+        let owner = session(me, true);
+        run(&f, &owner, "GRANT r TO x, y WITH ADMIN TRUE").expect("x y admin");
+        run(&f, &session(x, false), "GRANT r TO z WITH ADMIN TRUE").expect("z by x");
+        run(&f, &owner, "GRANT z TO me").expect("owner inherits z");
+        run(&f, &owner, "GRANT y TO x").expect("x inherits y");
+        let sql = if cascade {
+            "REVOKE ADMIN OPTION FOR r FROM x CASCADE"
+        } else {
+            "REVOKE ADMIN OPTION FOR r FROM x"
+        };
+        run(&f, &owner, sql).expect("revoke");
+        assert!(!mem(&f, x, r).expect("x").admin);
+        assert!(mem(&f, z, r).expect("z kept").admin, "cascade={cascade}");
+        // x は y 経由の ADMIN を保つので、引き続き付与できる。
+        run(&f, &session(x, false), "GRANT r TO w").expect("x still admin via y");
+    }
+}
+
+/// 所有者相当（DDL 許可済み）の付与者が付けた行は、付与者の ADMIN の喪失による依存の対象外（回帰）。o が x へ
+/// ADMIN を付与し、DDL 許可済みの x が m へ付与しても、x の ADMIN の取り消しは RESTRICT で成功し CASCADE でも
+/// m の付与は残る。所有者相当でない付与者 x2 が付けた m2 の付与は従来どおり 2BP01・連鎖削除される。
+/// メンバーシップ自体の取り消し・`WITH ADMIN FALSE` も同じ規則に従う。
+#[test]
+fn owner_equivalent_grantor_rows_are_exempt_from_admin_dependents() {
+    for sql in [
+        "REVOKE ADMIN OPTION FOR r FROM {x}",
+        "REVOKE r FROM {x}",
+        "GRANT r TO {x} WITH ADMIN FALSE",
+    ] {
+        for cascade in [false, true] {
+            let f = fx(&format!("rm_exempt_{}_{cascade}", sql.len()));
+            let me = role(&f, "me");
+            let r = role(&f, "r");
+            let x = role(&f, "x");
+            let x2 = role(&f, "x2");
+            let m = role(&f, "m");
+            let m2 = role(&f, "m2");
+            let owner = session(me, true);
+            run(&f, &owner, "GRANT r TO x, x2 WITH ADMIN TRUE").expect("admins");
+            run(&f, &session(x, true), "GRANT r TO m").expect("m by owner-equivalent x");
+            run(&f, &session(x2, false), "GRANT r TO m2").expect("m2 by x2");
+            assert_eq!(mem(&f, m, r).expect("m").grantor_id, Some(x));
+            // x（所有者相当の付与のみ）の ADMIN を失っても m は残る。
+            let revoke_x = sql.replace("{x}", "x") + if cascade { " CASCADE" } else { "" };
+            let revoke_x = if sql.starts_with("GRANT") {
+                sql.replace("{x}", "x")
+            } else {
+                revoke_x
+            };
+            run(&f, &owner, &revoke_x).expect("x revoke must not be blocked");
+            assert!(mem(&f, m, r).is_some(), "{revoke_x}: m must stay");
+            // 所有者相当でない x2 の依存は従来どおり。
+            let revoke_x2 = sql.replace("{x}", "x2") + if cascade { " CASCADE" } else { "" };
+            if sql.starts_with("GRANT") {
+                let e = run(&f, &owner, &sql.replace("{x}", "x2")).expect_err("restrict");
+                assert_eq!(e.wire_code(), "2BP01");
+                assert!(mem(&f, m2, r).is_some());
+            } else if cascade {
+                run(&f, &owner, &revoke_x2).expect("cascade");
+                assert!(mem(&f, m2, r).is_none(), "{revoke_x2}: m2 must go");
+            } else {
+                let e = run(&f, &owner, &revoke_x2).expect_err("restrict");
+                assert_eq!(e.wire_code(), "2BP01");
+                assert!(mem(&f, m2, r).is_some());
+            }
+        }
+    }
+}
+
+/// 所有者相当による既存行の更新は付与の根拠を記録し直す（回帰）。x が付けた m の行へ所有者が ADMIN を足すと、
+/// 行は所有者相当の独立した付与（grantor_root）になり、x の ADMIN を CASCADE で取り消しても m の ADMIN が残る。
+/// 旧付与者だけが与えたオプションが残る場合（所有者の付与が包含しない）は単一行で表せないため `0A000` で拒否し、
+/// 状態は変わらない。所有者相当でない付与者による更新は root を付けない。
+#[test]
+fn owner_equivalent_update_of_existing_row_records_its_own_basis() {
+    let f = fx("rm_reroot");
+    let me = role(&f, "me");
+    let r = role(&f, "r");
+    let x = role(&f, "x");
+    let m = role(&f, "m");
+    let owner = session(me, true);
+    run(&f, &owner, "GRANT r TO x WITH ADMIN TRUE").expect("x admin");
+    run(&f, &session(x, false), "GRANT r TO m").expect("m by x");
+    assert!(!mem(&f, m, r).expect("m").grantor_root);
+    // 非所有者の付与者 x による更新は root を付けない。
+    run(&f, &session(x, false), "GRANT r TO m WITH SET FALSE").expect("x update");
+    let row = mem(&f, m, r).expect("m");
+    assert!(!row.grantor_root && row.grantor_id == Some(x));
+    run(&f, &session(x, false), "GRANT r TO m WITH SET TRUE").expect("x update back");
+    // 所有者が ADMIN を足す: 既定の INHERIT・SET も所有者の付与が裏付けるため root になる。
+    run(&f, &owner, "GRANT r TO m WITH ADMIN TRUE").expect("owner adds admin");
+    let row = mem(&f, m, r).expect("m");
+    assert!(row.grantor_root && row.grantor_id == Some(me) && row.admin);
+    run(&f, &owner, "REVOKE ADMIN OPTION FOR r FROM x CASCADE").expect("cascade");
+    assert!(mem(&f, m, r).expect("m kept").admin);
+}
+
+#[test]
+fn owner_equivalent_update_not_covering_existing_options_is_refused() {
+    let f = fx("rm_reroot_refuse");
+    let me = role(&f, "me");
+    let r = role(&f, "r");
+    let x = role(&f, "x");
+    let m = mk(&f, T, "m", false);
+    let owner = session(me, true);
+    run(&f, &owner, "GRANT r TO x WITH ADMIN TRUE").expect("x admin");
+    run(&f, &session(x, false), "GRANT r TO m WITH INHERIT TRUE").expect("m by x");
+    let before = mem(&f, m, r);
+    // m は NOINHERIT のため所有者の付与の既定は INHERIT 偽だが、行には x が与えた INHERIT が残る。
+    let e = run(&f, &owner, "GRANT r TO m WITH ADMIN TRUE").expect_err("refused");
+    assert_eq!(e.wire_code(), "0A000");
+    assert_eq!(mem(&f, m, r), before);
+}
+
+/// 1 行 = 1 つの付与根拠（既存行の更新）の回帰。root 行へ非 root の根拠でオプションを足す更新・別の付与者による
+/// 更新は `0A000` で拒否され状態は変わらない。言い直しは状態を変えない。所有者相当の言い直しは、変更がなくても
+/// 行を root へ付け替える（旧付与者の CASCADE で消えない）。
+#[test]
+fn existing_row_updates_keep_one_grant_basis() {
+    // Codex: root 行へ、DDL 許可のない同じ付与者が ADMIN で追加しようとする。
+    let f = fx("rm_basis_root");
+    let me = role(&f, "me");
+    let r = role(&f, "r");
+    let x = role(&f, "x");
+    let m = role(&f, "m");
+    let owner = session(me, true);
+    run(&f, &owner, "GRANT r TO x WITH ADMIN TRUE").expect("x admin");
+    run(&f, &session(x, true), "GRANT r TO m").expect("root row");
+    assert!(mem(&f, m, r).expect("m").grantor_root);
+    let before = mem(&f, m, r);
+    let e = run(&f, &session(x, false), "GRANT r TO m WITH ADMIN TRUE").expect_err("refused");
+    assert_eq!(e.wire_code(), "0A000");
+    assert_eq!(mem(&f, m, r), before);
+    // 言い直しは no-op（根拠を足さない）。
+    run(&f, &session(x, false), "GRANT r TO m").expect("restate");
+    assert_eq!(mem(&f, m, r), before);
+    run(&f, &owner, "REVOKE ADMIN OPTION FOR r FROM x CASCADE").expect("cascade");
+    assert!(!mem(&f, m, r).expect("m").admin);
+
+    // Bugbot: 所有者相当の言い直しは変更がなくても root へ付け替える。別の付与者 g2 の追加は拒否。
+    let f = fx("rm_basis_restate");
+    let me = role(&f, "me");
+    let r = role(&f, "r");
+    let x = role(&f, "x");
+    let g2 = role(&f, "g2");
+    let m = role(&f, "m");
+    let owner = session(me, true);
+    run(&f, &owner, "GRANT r TO x, g2 WITH ADMIN TRUE").expect("admins");
+    run(&f, &session(x, false), "GRANT r TO m").expect("m by x");
+    let before = mem(&f, m, r);
+    let e =
+        run(&f, &session(g2, false), "GRANT r TO m WITH ADMIN TRUE").expect_err("other grantor");
+    assert_eq!(e.wire_code(), "0A000");
+    run(&f, &session(g2, false), "GRANT r TO m").expect("restate by g2");
+    assert_eq!(mem(&f, m, r), before);
+    run(&f, &owner, "GRANT r TO m").expect("owner restates");
+    assert!(mem(&f, m, r).expect("m").grantor_root);
+    run(&f, &owner, "REVOKE ADMIN OPTION FOR r FROM x CASCADE").expect("cascade");
+    assert!(mem(&f, m, r).is_some(), "owner-backed row must survive");
+}
+
+/// `GRANT ... WITH ADMIN FALSE` による ADMIN の取り消しも `REVOKE ADMIN OPTION` と同じ依存検査（2BP01）を通る。
+#[test]
+fn grant_with_admin_false_respects_dependents() {
+    let f = fx("grant_admin_false");
+    let me = role(&f, "me");
+    let r = role(&f, "r");
+    let x = role(&f, "x");
+    let m = role(&f, "m");
+    let owner = session(me, true);
+    run(&f, &owner, "GRANT r TO x WITH ADMIN TRUE").expect("x admin");
+    run(&f, &session(x, false), "GRANT r TO m WITH ADMIN TRUE").expect("m admin by x");
+    let e = run(&f, &owner, "GRANT r TO x WITH ADMIN FALSE").expect_err("restrict");
+    assert_eq!(e.wire_code(), "2BP01");
+    assert!(mem(&f, x, r).expect("kept").admin);
+    assert!(mem(&f, m, r).is_some());
+    // 依存が無ければ ADMIN を落とせる。
+    run(&f, &owner, "REVOKE r FROM m").expect("drop dependent");
+    run(&f, &owner, "GRANT r TO x WITH ADMIN FALSE").expect("no dependents");
+    assert!(!mem(&f, x, r).expect("x").admin);
+}
+
+#[test]
+fn failed_statement_has_no_side_effects() {
+    let f = fx("rm_atomic");
+    let me = role(&f, "me");
+    let r = role(&f, "r");
+    let a = role(&f, "a");
+    let s = session(me, true);
+    // 2 つ目の付与先が存在しない: 1 つ目も書かれない。
+    assert_eq!(code(run(&f, &s, "GRANT r TO a, nobody")), "42704");
+    assert!(mem(&f, a, r).is_none());
+    // 2 つ目の組が循環: 1 つ目も書かれない。
+    assert_eq!(code(run(&f, &s, "GRANT r, a TO a")), "0LP01");
+    assert!(mem(&f, a, r).is_none());
+}
+
+#[test]
+fn unbound_session_is_denied_for_role_form() {
+    let f = fx("rm_unbound");
+    role(&f, "r");
+    role(&f, "m");
+    let mut s = SessionState::default();
+    s.allow_ddl();
+    assert_eq!(code(run(&f, &s, "GRANT r TO m")), "42501");
+    assert_eq!(code(run(&f, &s, "GRANT nobody TO m")), "42501");
+}
+
+#[test]
+fn pg_has_role_semantics_follow_inherit_and_set() {
+    let f = fx("rm_has_role");
+    let me = role(&f, "me");
+    let r = role(&f, "r");
+    role(&f, "a");
+    let m = role(&f, "m");
+    let o = session(me, true);
+    run(&f, &o, "GRANT r TO m WITH INHERIT FALSE").expect("g");
+    assert!(priv_check(&f, m, r, "MEMBER"));
+    assert!(!priv_check(&f, m, r, "USAGE"));
+    assert!(priv_check(&f, m, r, "SET"));
+    assert!(priv_check(&f, m, r, "usage, member"));
+    run(&f, &o, "GRANT r TO m WITH INHERIT TRUE, SET FALSE").expect("g2");
+    assert!(priv_check(&f, m, r, "USAGE"));
+    assert!(!priv_check(&f, m, r, "SET"));
+    // 間接: m → a（INHERIT 真）→ r（INHERIT 偽）なら m の USAGE は r に届かない。
+    run(&f, &o, "REVOKE r FROM m").expect("clean");
+    run(&f, &o, "GRANT a TO m WITH INHERIT TRUE").expect("m in a");
+    run(&f, &o, "GRANT r TO a WITH INHERIT FALSE").expect("a in r");
+    assert!(!priv_check(&f, m, r, "USAGE"));
+    assert!(priv_check(&f, m, r, "MEMBER"));
+    assert!(priv_check(&f, m, r, "SET"));
+    // 自分自身は常に真。ADMIN OPTION は付与していなければ偽。
+    assert!(priv_check(&f, m, m, "USAGE"));
+    assert!(!priv_check(&f, m, r, "MEMBER WITH ADMIN OPTION"));
+    // 未知の語は、他の語が真でも必ず拒否する。
+    let rt = f.s.db().begin_read().expect("read");
+    assert!(matches!(
+        has_role_privilege(&rt, T, m, r, "MEMBER, bogus"),
+        Err(HasRoleError::InvalidPrivilege(w)) if w == "bogus"
+    ));
+}
+
+#[test]
+fn has_role_by_name_does_not_reveal_other_tenants() {
+    let f = fx("rm_has_role_name");
+    role(&f, "r");
+    role(&f, "u");
+    mk(&f, "t2", "only_t2", true);
+    let missing =
+        f.s.has_role_privilege_by_name(T, None, 2, "nobody", "MEMBER");
+    let foreign =
+        f.s.has_role_privilege_by_name(T, None, 2, "only_t2", "MEMBER");
+    match (missing, foreign) {
+        (Err(HasRoleError::RoleNotFound(a)), Err(HasRoleError::RoleNotFound(b))) => {
+            assert_eq!((a.as_str(), b.as_str()), ("nobody", "only_t2"));
+        }
+        other => panic!("unexpected {other:?}"),
+    }
+    assert!(f
+        .s
+        .has_role_privilege_by_name(T, Some("u"), 0, "r", "MEMBER")
+        .map(|v| !v)
+        .expect("ok"));
+}
+
+#[test]
+fn acl_grant_option_is_inherited_and_best_grantor_recorded() {
+    let f = fx("rm_acl");
+    let me = role(&f, "me");
+    let r = role(&f, "r");
+    let m = role(&f, "m");
+    let q = role(&f, "q");
+    let owner = session(me, true);
+    run(&f, &owner, "GRANT SELECT ON docs TO r WITH GRANT OPTION").expect("r go");
+    // m が r を継承しない: 付与できない（r の権限を何も持たない）。
+    run(&f, &owner, "GRANT r TO m WITH INHERIT FALSE").expect("m in r");
+    assert_eq!(
+        code(run(&f, &session(m, false), "GRANT SELECT ON docs TO q")),
+        "42501"
+    );
+    // INHERIT 真なら成功し、付与者は r。
+    run(&f, &owner, "GRANT r TO m WITH INHERIT TRUE").expect("inherit");
+    run(&f, &session(m, false), "GRANT SELECT ON docs TO q").expect("via r");
+    let rows =
+        f.s.list_acl_for_object(T, &PrivilegeObject::Table("docs".to_string()))
+            .expect("acl");
+    assert!(rows.contains(&AclEntry {
+        grantee_id: q,
+        grantor_id: r,
+        privileges: PRIV_SELECT,
+        grant_options: 0
+    }));
+    // REVOKE も同じ方法で選んだ付与者（r）の行だけを対象にする。
+    run(&f, &session(m, false), "REVOKE SELECT ON docs FROM q").expect("revoke via r");
+    let rows =
+        f.s.list_acl_for_object(T, &PrivilegeObject::Table("docs".to_string()))
+            .expect("acl");
+    assert!(!rows.iter().any(|e| e.grantee_id == q));
+}
+
+/// 表単位の REVOKE の列への波及は、`select_best_grantor` が選んだ付与者名義の行だけを取り消す。表の GRANT OPTION
+/// を持つ別の継承ロール（より遠い r_far）名義で記録された列の付与は、その付与者自身の REVOKE でだけ消える（回帰）。
+#[test]
+fn table_revoke_propagation_only_touches_selected_grantor_rows() {
+    let f = fx("rm_acl_prop");
+    let me = role(&f, "me");
+    let near = role(&f, "r_near");
+    role(&f, "mid");
+    let far = role(&f, "r_far");
+    let actor = role(&f, "actor");
+    let q = role(&f, "q");
+    let owner = session(me, true);
+    run(
+        &f,
+        &owner,
+        "GRANT SELECT ON docs TO r_near, r_far WITH GRANT OPTION",
+    )
+    .expect("go");
+    run(&f, &owner, "GRANT r_near TO actor").expect("near");
+    run(&f, &owner, "GRANT mid TO actor").expect("mid");
+    run(&f, &owner, "GRANT r_far TO mid").expect("far");
+    // 遠い r_far 自身が列の付与を行う（名義は r_far）。
+    run(&f, &session(far, false), "GRANT SELECT (a) ON docs TO q").expect("col by far");
+    // actor の表の付与は最も近い r_near 名義で記録される。
+    run(&f, &session(actor, false), "GRANT SELECT ON docs TO q").expect("table by near");
+    let col = PrivilegeObject::Column {
+        table: "docs".to_string(),
+        column: "a".to_string(),
+    };
+    let rows = f.s.list_acl_for_object(T, &col).expect("acl");
+    assert!(rows
+        .iter()
+        .any(|e| e.grantee_id == q && e.grantor_id == far));
+    // actor の表の REVOKE は r_near 名義の行だけを対象にし、r_far 名義の列の付与は残る。
+    run(&f, &session(actor, false), "REVOKE SELECT ON docs FROM q").expect("revoke");
+    let rows = f.s.list_acl_for_object(T, &col).expect("acl");
+    assert!(
+        rows.iter()
+            .any(|e| e.grantee_id == q && e.grantor_id == far),
+        "far grantor's column grant must survive: {rows:?}"
+    );
+    assert!(!rows
+        .iter()
+        .any(|e| e.grantee_id == q && e.grantor_id == near));
+}
+
+/// 対象の所有者が付与者の INHERIT 閉包に含まれるとき、所有者の暗黙の全 GRANT OPTION を認めて所有者名義で付与・
+/// 取り消す（PostgreSQL の `select_best_grantor` 相当）。継承しないメンバーシップ経由では認めない（回帰）。
+#[test]
+fn inherited_owner_grants_and_revokes_under_owner_name() {
+    let f = fx("rm_acl_owner");
+    let me = role(&f, "me");
+    let r = role(&f, "r");
+    let m = role(&f, "m");
+    let q = role(&f, "q");
+    let txn = f.s.begin_write_txn().expect("begin");
+    crate::catalog::privilege::owner::set_owner_unchecked_in_txn(
+        &txn,
+        T,
+        &PrivilegeObject::Table("docs".to_string()),
+        r,
+    )
+    .expect("owner");
+    crate::recovery::commit_boundary::commit(txn).expect("commit");
+    let owner = session(me, true);
+    let docs = PrivilegeObject::Table("docs".to_string());
+    // 継承しない: 明示 ACL が無ければ付与できない。
+    run(&f, &owner, "GRANT r TO m WITH INHERIT FALSE").expect("m in r");
+    assert_eq!(
+        code(run(&f, &session(m, false), "GRANT SELECT ON docs TO q")),
+        "42501"
+    );
+    // 継承する: 所有者 r 名義で付与でき、REVOKE も r 名義の行に作用する。
+    run(&f, &owner, "GRANT r TO m WITH INHERIT TRUE").expect("inherit");
+    run(&f, &session(m, false), "GRANT SELECT ON docs TO q").expect("via owner r");
+    let rows = f.s.list_acl_for_object(T, &docs).expect("acl");
+    assert!(rows.contains(&AclEntry {
+        grantee_id: q,
+        grantor_id: r,
+        privileges: PRIV_SELECT,
+        grant_options: 0
+    }));
+    run(&f, &session(m, false), "REVOKE SELECT ON docs FROM q").expect("revoke");
+    let rows = f.s.list_acl_for_object(T, &docs).expect("acl");
+    assert!(!rows.iter().any(|e| e.grantee_id == q));
+}
+
+#[test]
+fn drop_role_detaches_grantor_references() {
+    let f = fx("rm_drop_grantor");
+    let me = role(&f, "me");
+    let r = role(&f, "r");
+    let x = role(&f, "x");
+    let m = role(&f, "m");
+    let owner = session(me, true);
+    run(&f, &owner, "GRANT r TO x WITH ADMIN TRUE").expect("x admin");
+    run(&f, &session(x, false), "GRANT r TO m").expect("by x");
+    let stmt =
+        crate::sql::allowlist::validate_drop_role_tokens(&tokenize("DROP ROLE x").expect("lex"))
+            .expect("parse");
+    crate::sql::role_ddl::execute_drop_role(&f.s, T, &stmt).expect("drop");
+    let row = mem(&f, m, r).expect("row kept");
+    assert_eq!(row.grantor_id, None);
+    // 付与者なしの行は所有者相当だけが取り消せる。
+    let z = role(&f, "z");
+    run(&f, &owner, "GRANT r TO z WITH ADMIN TRUE").expect("z admin");
+    run(&f, &session(z, false), "REVOKE r FROM m").expect("noop for non-owner");
+    assert!(mem(&f, m, r).is_some());
+    run(&f, &owner, "REVOKE r FROM m").expect("owner");
+    assert!(mem(&f, m, r).is_none());
+}
+
+#[test]
+fn create_role_membership_clauses_are_atomic() {
+    use crate::sql::allowlist::validate_create_role_tokens;
+    let f = fx("rm_create_clauses");
+    let me = role(&f, "me");
+    let a = role(&f, "a");
+    let b = role(&f, "b");
+    let c = role(&f, "c");
+    let owner = session(me, true);
+    let create = |sql: &str, s: &SessionState| {
+        let stmt = validate_create_role_tokens(&tokenize(sql).expect("lex"))?;
+        crate::sql::role_ddl::execute_create_role(&f.s, T, s, &stmt)
+    };
+    create("CREATE ROLE n IN ROLE a ROLE b ADMIN c", &owner).expect("create");
+    let n = f.s.get_role(T, "n").expect("get").expect("some").id;
+    assert_eq!(mem(&f, n, a).expect("in a").grantor_id, Some(me));
+    assert!(mem(&f, b, n).is_some());
+    let adm = mem(&f, c, n).expect("admin");
+    assert!(adm.admin);
+    // 未束縛は 42501、存在しないロールは 42704 で、どちらもロールは作られない。
+    let unbound = {
+        let mut s = SessionState::default();
+        s.allow_ddl();
+        s
+    };
+    assert_eq!(
+        create("CREATE ROLE p IN ROLE a", &unbound)
+            .expect_err("unbound")
+            .wire_code(),
+        "42501"
+    );
+    assert_eq!(
+        create("CREATE ROLE p IN ROLE nobody", &owner)
+            .expect_err("missing")
+            .wire_code(),
+        "42704"
+    );
+    assert!(f.s.get_role(T, "p").expect("get").is_none());
+    // IN ROLE と ROLE に同じロールを指定すると循環。
+    assert_eq!(
+        create("CREATE ROLE q IN ROLE a ROLE a", &owner)
+            .expect_err("cycle")
+            .wire_code(),
+        "0LP01"
+    );
+    assert!(f.s.get_role(T, "q").expect("get").is_none());
+}

@@ -552,12 +552,13 @@ fn dropped_bound_role_is_denied() {
 }
 
 #[test]
-fn role_form_and_current_role_edge_cases() {
+fn role_form_unknown_roles_and_current_role_edge_cases() {
     let f = fx("grant_roleform");
     let me = role(&f, T, "owner_role");
     let so = session(me, true);
-    assert_eq!(code(run(&f, T, &so, "GRANT r1 TO r2")), "0A000");
-    assert_eq!(code(run(&f, T, &so, "REVOKE r1 FROM r2")), "0A000");
+    // ロール形の実行は Issue #2232 で実装済み（詳細は `role_tests`）。存在しないロールは 42704。
+    assert_eq!(code(run(&f, T, &so, "GRANT r1 TO r2")), "42704");
+    assert_eq!(code(run(&f, T, &so, "REVOKE r1 FROM r2")), "42704");
     // SESSION_USER は束縛されたセッションロール。
     assert!(run(&f, T, &so, "GRANT SELECT ON docs TO SESSION_USER").is_ok());
 }
