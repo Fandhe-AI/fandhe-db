@@ -255,6 +255,11 @@ pub struct SessionState {
     row_security_off: bool,
     /// `RESET row_security`／`SET row_security TO DEFAULT` の戻り先が off か（起動パラメータ由来）。
     row_security_reset_off: bool,
+    /// セッションの `statement_timeout`（ミリ秒。`0` は無効。Issue #1954・SQL-71 ポインタ）。
+    /// `SessionState` に置くため `BEGIN`／`SAVEPOINT` 時の複製と `ROLLBACK`／`ROLLBACK TO` で巻き戻る。
+    statement_timeout_ms: u32,
+    /// `RESET statement_timeout`／`SET ... TO DEFAULT` の戻り先（起動時 CLI の既定値）。
+    statement_timeout_reset_ms: u32,
     /// 現在のロール ID（#1971 以降で認証層が認証成功後に 1 回だけ束縛する契約。以後 SQL 文から変えられる
     /// のは認可済みの `SET ROLE`／`RESET ROLE`〔`sql::role_ddl`〕だけで、`session_role_id` に戻る側へも
     /// 到達できる範囲にしか動かない）。`None`（現状の全セッション）は「BYPASSRLS なし・非所有者」として
@@ -399,6 +404,32 @@ impl SessionState {
     pub fn apply_startup_row_security(&mut self, on: bool) {
         self.row_security_off = !on;
         self.row_security_reset_off = !on;
+    }
+
+    /// セッションの `statement_timeout`（`0` は無効。wire-server が文ごとに期限を張るときに読む）。
+    pub fn statement_timeout(&self) -> std::time::Duration {
+        std::time::Duration::from_millis(u64::from(self.statement_timeout_ms))
+    }
+
+    /// 検証済みの `statement_timeout` を現在値にする（`core.rs` の `SetStatementTimeout` 実行腕のみ）。
+    pub(crate) fn set_statement_timeout_ms(&mut self, ms: u32) {
+        self.statement_timeout_ms = ms;
+    }
+
+    /// `RESET statement_timeout`／`SET statement_timeout TO DEFAULT` の実体。現在値を reset 値へ戻す。
+    pub(crate) fn reset_statement_timeout(&mut self) {
+        self.statement_timeout_ms = self.statement_timeout_reset_ms;
+    }
+
+    /// 起動時 CLI の既定値を現在値と reset 値の両方へ設定する。wire-server の handshake が認証成功後に
+    /// 1 回だけ呼ぶ契約（SQL 文経由の経路は持たない）。CLI 側で検証済みの値が来る前提だが、上限超過は
+    /// 上限へ丸める（`0`＝無効側へは倒さない）。
+    pub fn apply_default_statement_timeout(&mut self, timeout: std::time::Duration) {
+        let max = crate::interrupt::MAX_STATEMENT_TIMEOUT_MS;
+        let ms = u64::try_from(timeout.as_millis()).unwrap_or(max).min(max);
+        let ms = u32::try_from(ms).unwrap_or(u32::MAX);
+        self.statement_timeout_ms = ms;
+        self.statement_timeout_reset_ms = ms;
     }
 
     /// 現在のロール ID（未紐付けは `None`）。

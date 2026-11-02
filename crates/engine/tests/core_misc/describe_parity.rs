@@ -64,6 +64,7 @@ fn assert_describe_matches_execute(core: &EngineCore, ctx: &PolicyContext, sql: 
         | SqlOutcome::SetTimeZone
         | SqlOutcome::SetSearchPath { .. }
         | SqlOutcome::SetRowSecurity { .. }
+        | SqlOutcome::SetStatementTimeout { .. }
         | SqlOutcome::Show(_)
         | SqlOutcome::CreateFunction { .. }
         | SqlOutcome::DropFunction(_)
@@ -154,6 +155,31 @@ fn describe_select_all_matches_execute() {
         &ctx,
         "SELECT id, body FROM documents ORDER BY embedding <=> '[0.1,0.2,0.3]' LIMIT 5",
     );
+}
+
+/// SQL-71・Issue #1954: `SHOW statement_timeout` の Describe 列は実行結果の列（`statement_timeout`・text）と一致する。
+#[test]
+fn describe_show_statement_timeout_matches_execute() {
+    let path = unique_db_path("describe-show-statement-timeout");
+    let _guard = CleanupGuard(path.clone());
+    let core = new_core_with_documents_table(&path);
+    let ctx = PolicyContext::new("tenant-a").expect("valid tenant");
+    let parsed = core
+        .parse_sql("SHOW statement_timeout")
+        .expect("parse should succeed");
+    let described = core
+        .describe_parsed_in_session(&SessionState::default(), &parsed)
+        .expect("describe should succeed")
+        .expect("SHOW has result columns");
+    assert_eq!(described.len(), 1);
+    let mut session = SessionState::default();
+    match core
+        .execute_sql_in_session(&ctx, &mut session, "SHOW statement_timeout")
+        .expect("execute should succeed")
+    {
+        SqlOutcome::Show(result) => assert_eq!(result.columns, described),
+        other => panic!("expected Show, got {other:?}"),
+    }
 }
 
 #[test]

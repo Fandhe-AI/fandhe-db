@@ -469,6 +469,8 @@ pub(crate) fn run_copy_statement_as<'e, S: WireStream>(
     finish: Finish,
     role: StatementRole,
 ) -> io::Result<crate::copy::CopyStep> {
+    // SQL-71・Issue #1954: COPY も文単位のデッドラインの下で実行する（関数末尾まで生存させる）。
+    let _deadline = install_statement_deadline(session);
     use engine::sql::transaction::TransactionStatus;
     match txn.status() {
         TransactionStatus::Idle => {
@@ -644,6 +646,19 @@ pub(crate) enum StatementRole {
     ImplicitFinal,
 }
 
+/// セッションの `statement_timeout`（SQL-71・Issue #1954）から現在時刻起点の文デッドラインを張る。
+/// 簡易クエリの各文（[`run_statement_as`]・[`run_copy_statement_as`]）と拡張クエリの Execute が
+/// 文の実行開始時に呼ぶ。`0`（無効）なら期限は増えない。入れ子は engine 側が早い方を採る。
+/// 戻り値のガードは文の実行が終わるまで名前付き束縛で保持すること（drop で期限が外れる）。
+pub(crate) fn install_statement_deadline(
+    session: &SessionState,
+) -> engine::interrupt::DeadlineGuard {
+    engine::interrupt::DeadlineScope::install(engine::interrupt::StatementDeadline::after(
+        std::time::Instant::now(),
+        session.statement_timeout(),
+    ))
+}
+
 /// [`run_statement`] の本体（[`StatementRole`] で暗黙トランザクション内の位置を指定する）。
 #[allow(clippy::too_many_arguments)]
 fn run_statement_as<'e, S: WireStream>(
@@ -656,6 +671,9 @@ fn run_statement_as<'e, S: WireStream>(
     finish: Finish,
     role: StatementRole,
 ) -> io::Result<StatementStatus> {
+    // SQL-71・Issue #1954: 期限は文ごとに張る（同じ `'Q'` 内の `SET statement_timeout` が後続文へ
+    // 効くよう、メッセージ単位では張らない）。ガードは関数末尾まで生存させる。
+    let _deadline = install_statement_deadline(session);
     // PL/pgSQL の `RAISE NOTICE` 等の通知を、この 1 文の実行区間だけ溜める（Issue #2227・SQL-70）。
     // 区間は実行の外側（緊急応答の登録区間の外）に張り、応答の最初のフレームより前に書き出す。
     let notices = engine::notice::StatementNotices::enter();
@@ -829,6 +847,10 @@ pub(crate) fn map_outcome(outcome: SqlOutcome) -> OutcomeResponse {
         },
         // RLS-13・Issue #2278: `SET row_security`／`RESET row_security` は `SET`／`RESET` タグ。
         SqlOutcome::SetRowSecurity { reset } => OutcomeResponse::Command {
+            tag: if reset { "RESET" } else { "SET" }.to_string(),
+        },
+        // SQL-71・Issue #1954: `SET statement_timeout`／`RESET statement_timeout` も `SET`／`RESET` タグ。
+        SqlOutcome::SetStatementTimeout { reset } => OutcomeResponse::Command {
             tag: if reset { "RESET" } else { "SET" }.to_string(),
         },
         SqlOutcome::Show(result) => OutcomeResponse::Rows {
