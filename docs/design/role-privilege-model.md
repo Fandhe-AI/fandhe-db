@@ -470,7 +470,7 @@ SQL-40 ポインタ。判定点を `sql/privilege_gate.rs` の `check`（主体�
 | K4 | `search_path` 上の USAGE の無い SCHEMA は、作成先の判定（`creation_target`）では `42501`（受入基準どおり。他テナント・不在は従来どおり次の要素へ進み存在オラクルにしない）。`current_schema()`・`current_schemas()` の値の列挙では見えないものとして飛ばす。修飾名も `42501` | 受入基準の「`search_path` 経由も `42501`」に合わせる。値の列挙は権限エラーにせず可視な SCHEMA だけを返す。未修飾名は現状テナント SCHEMA へ解決されない |
 | K5 | 作成先が SCHEMA の作成系 DDL は CREATE 判定を `require_creation_target` に結線するが、`ServerDdl` ゲートを必要条件として残す | `ServerDdl` を CREATE に置き換えるとロールの束縛だけで DDL 権限が広がる。所有者の機構（#2236）・主体の束縛（#1971）の後 |
 | K7 | 修飾名の作成位置でも USAGE を要求する（PostgreSQL は CREATE だけで足りる。拒否側の意図的な差） | 解決器は位置を区別しない。権限を広げない |
-| K9 | `ALL SEQUENCES／FUNCTIONS／ROUTINES／PROCEDURES IN SCHEMA` は `0A000` のまま（#2235） | SEQUENCE・FUNCTION 単位の ACL 適用は #2235 の中核 |
+| K9 | `ALL SEQUENCES／FUNCTIONS／ROUTINES／PROCEDURES IN SCHEMA` は `0A000` のまま（単一の `ON SEQUENCE`・`ON FUNCTION` は #2235 で対応済み。`ALL ... IN SCHEMA` は後続。§15 S11） | SEQUENCE・FUNCTION 単位の ACL 適用は #2235 の中核 |
 | K10 | `DROP SCHEMA` の同じ txn で ACL 行を掃除（commit 呼び出しは増やさない） | `DROP ROLE` の依存検査・件数上限の消費を防ぐ |
 | K11 | ビュー本文（保存済みの解決済みキー）経由の参照は USAGE を再検査しない | PostgreSQL はビューの所有者の権限で参照する。所有者の機構（#2236）まで対象外 |
 | K12 | 準備済み文は Bind でトークン列の `#<id>.` キーから SCHEMA ID を集めて USAGE を再検査 | Parse 後の `REVOKE` を Execute に反映する |
@@ -534,3 +534,55 @@ SQL-39・WIRE-2 ポインタ。D3・D4 のうち、users ファイルのユー�
 ### 対象外
 
 HTTP `POST /v1/session` での対応づけ（HTTP-4。#2238。`auth::users_file_role::verify_and_bind` は再利用できる形にしてある）、ブートストラップのマーカー・初期ロールの投入、パスワードの照合元をカタログの検証子へ切り替えること（#2238）、`CREATEROLE`／`ADMIN OPTION` の判定、メンバーシップ（#2232）、存在オラクルの網羅試験（#1972）。
+
+## 15. Issue #2235 実装記録（SEQUENCE と FUNCTION 単位の GRANT／REVOKE）
+
+ビヘイビア ID ポインタ: SQL-40（特に (6)(a)）・RLS-12（spec 本文は転記しない）。意味論は PostgreSQL 17 の公開挙動と
+D5・D8・D10、§12（#2234）の K1〜K13 に揃える。
+
+### 実装した範囲
+
+- 構文（`sql/allowlist/grant.rs`・`sql/relation_name.rs`）: `GRANT／REVOKE {USAGE|SELECT|UPDATE|ALL [PRIVILEGES]} ON SEQUENCE <名>[, ...]` と
+  `GRANT／REVOKE {EXECUTE|ALL [PRIVILEGES]} ON FUNCTION <名>[(<型>, ...)][, ...]`。SEQUENCE は表と同じ解決器で SCHEMA 修飾を
+  内部キーへ、関数名は `DROP FUNCTION` と同じ規則（括弧の有無に依らず関数位置・存在しない SCHEMA は `3F000`）で解決する。
+  型の並びは `DROP FUNCTION` と共有のヘルパー（`parse_function_arg_types`）で読む。許されない権限は `0LP01`、列リストは `42601`。
+- 適用（`catalog/privilege/apply.rs`）: SEQUENCE・関数は書き込みと同じ txn で内部 ID へ解決する（SEQUENCE の不在 `42P01`・表を指すと
+  `42809`、関数の不在・型の不一致・他テナントの関数は同じ `42883`）。既存の GRANT OPTION・警告・CASCADE／RESTRICT の規則へ流す。
+- 判定（`sql/object_privilege.rs`）: SEQUENCE は any-of（`nextval`=USAGE|UPDATE、`currval`・`lastval`=USAGE|SELECT、`setval`=UPDATE）。
+  関数は文の実行区間の頭で張る拒否集合（`FunctionAclScope`）を、式束縛の宣言的 UDF 展開（`udf_call::bind_call`）と
+  `LANGUAGE sql|plpgsql` の解決（`routine_fold`・`function_scan::plan`）で引く。
+- 掃除: SEQUENCE の ACL 行は `drop_sequence_in_txn`・`drop_owned_sequences_in_txn`（DROP SEQUENCE・所有表の道連れ・
+  `DROP SCHEMA ... CASCADE`）の同じ txn で全テナント分を消す。関数の行と印は `remove_function_in_txn` で消す。
+
+### 判断（S1〜S14）
+
+| # | 判断 | 理由 |
+| - | ---- | ---- |
+| S1 | 検査対象は `acl_checked_principal` が `Some` の主体（束縛済みかつ所有者相当でない）だけ。未束縛・所有者相当・セッションを持たない Rust API 経路は検査しない（K1 と同じ） | 未束縛に課すと既存の採番・関数呼び出しが全て `42501` になる。#1971 で全セッションが束縛された時点で全面適用になる |
+| S2 | SEQUENCE の判定は any-of（いずれか 1 ビット）。all-of の `check_schema_privilege` は流用しない | PostgreSQL の `nextval_internal`・`currval`・`setval` と同じ |
+| S3 | DEFAULT 採番の免除は「SEQUENCE が書き込み先の表のその列に所有されている」とき（SERIAL・IDENTITY・`OWNED BY` 済み）だけ。所有されない SEQUENCE を参照する利用者の `DEFAULT nextval('s')` と VALUES 内の明示の `nextval`／`currval` は検査する。`assign_pseudo_id`（移行済み表の所有 SEQUENCE）は免除 | 受入基準 (A2) と SQL-40 (6)(a)。PostgreSQL は SERIAL でも USAGE を要求するが仕様を優先する（既知の差） |
+| S4 | 判定順はテナント内の解決を先に、権限を後に（D10）。SEQUENCE は `42P01` → `42501` → `22003`（setval）／`55000`（currval）。関数は `42883` → `42501`。他テナントの SCHEMA 修飾は解決器が先に `3F000` | 権限の有無を存在オラクルにしない |
+| S5 | 関数の既定（PUBLIC が EXECUTE）は PostgreSQL の「proacl が NULL」と同じ暗黙の既定。遅延作成表 `acl_init`（キー `(tenant_id, object_kind, object_key)`、値は版 1 バイト）の印を「ACL 実体化済み」の目印にする。印が無ければ PUBLIC が EXECUTE を持つ。印が無いのに行がある場合は `CorruptSchema`（fail-closed）。印の無い関数への初回の GRANT／REVOKE は暗黙の既定（付与者は現在ロール）を作業状態へ展開してから判定し、差分があれば全行と印を同じ txn で書く | 既存の関数がそのまま誰でも呼べる（後方互換）。行だけでは「既定のまま」と「PUBLIC から取り消し済み」を区別できず、付与者自身の行で実体化を表すと後から REVOKE したとき既定へ復帰する fail-open の穴がある |
+| S6 | SEQUENCE には暗黙の既定を持たせない（行が無ければ所有者相当・未束縛以外は権限なし） | PostgreSQL の既定（所有者だけ）と同じ。所有者の機構は #2236 |
+| S7 | 関数の EXECUTE 検査は解決点で行う。core が文の実行区間の頭で、主体が持たない関数キーの集合（denied set。1 回の読み取り txn・関数は 1 テナント最大 64 件）を RAII のスレッドローカル `FunctionAclScope` へ張る。入れ子の入口はスコープが既にあれば何もしない | `Storage` を借用して参照点へ渡せない（unsafe 禁止）。ロード時の除外は `42501` が `42883` に化け GRANT のたびに世代 bump が要る。入れ子の展開・ビュー本文・PL/pgSQL 本体内の呼び出しも同じ点を通るので呼び出し元ロールで判定される（PostgreSQL と同じ） |
+| S8 | 拒否集合は `Storage::denied_function_keys`（`catalog/privilege/function.rs`）が全カタログ関数について算出する。セッションのレジストリには ID を持たせない | `UdfRegistry`・`UdfDefinition`（pub）を変えず、作成・置換・ロードの各登録点に ID の記録を足さない |
+| S9 | セッション内だけの関数（カタログに無い宣言的 UDF・WASM UDF）は ACL 対象外で GRANT の対象にもならない（`42883`） | ID が無く作成したセッション自身しか呼べない |
+| S10 | トリガ関数の起動時は EXECUTE を検査しない | PostgreSQL は CREATE TRIGGER の時点で検査する。CREATE TRIGGER は ServerDdl ゲートの対象 |
+| S11 | `ALL SEQUENCES／FUNCTIONS IN SCHEMA`・`PROCEDURE`・`ROUTINE`・`DATABASE` 等は `0A000` のまま | 本 Issue では単一オブジェクトの形に絞った（`ALL ... IN SCHEMA` は後続） |
+| S12 | 削除への追随: SEQUENCE の行は定義の削除と同じ txn（`RESTART` が呼ぶ状態行の削除には結線しない）、関数の行と印は `remove_function_in_txn`。`CREATE OR REPLACE FUNCTION` は ID を保つので ACL を引き継ぐ | 残った行は `DROP ROLE` の依存検査を永久に `2BP01` にし、件数上限を消費する（K10 と同じ） |
+| S13 | `ON TABLE <seq>` は従来どおり `42809`（PostgreSQL はシーケンスへ読み替える） | 範囲を広げない。既知の差 |
+| S14 | 拒否は既存の固定文言 `InsufficientPrivilege`（`42501`）。名前・ID・ACL の断片を含めない | 存在オラクル・情報漏えいの防止 |
+
+### 既知の差・対象外
+
+- SERIAL 列の暗黙の採番は SEQUENCE 権限を要求しない（PostgreSQL は USAGE を要求。S3）。`ON TABLE <seq>` の読み替えなし（S13）。
+- 関数の EXECUTE は、文の実行区間の頭で張るスコープで判定する。式を束縛する入口のうち、core が束縛を行う経路（簡易クエリ・
+  明示 Tx・準備済み文の検索／スキャン／集計の Bind・Execute）は覆う。wire-server が core の外で行う INSERT 値・UPDATE／DELETE 述語の
+  束縛（`execute_bound_insert`／`update`／`delete` 系）は core が `SessionState` を受け取らないため未結線（後続）。
+  スコープが無い区間（内部経路）は検査しない。索引の式の維持（書き込み時の式評価）は呼び出し元ロールで判定される（PostgreSQL は再検査しない）。
+- COPY・NoSQL・ファイル形 INSERT など採番文脈にセッションが無い経路の `DEFAULT nextval('<所有されない SEQUENCE>')` は検査しない（`acl_role` が `None`）。
+- 関数の暗黙の既定を展開するときの付与者は、その時点の現在ロール（所有者の機構〔#2236〕までの暫定）。別の所有者相当の主体は
+  その行を REVOKE できない（§8 の既知の制約と同じ）。
+- 継承（#2232）は判定のロール集合に未反映（直接の行と PUBLIC の行だけ）。
+- 対象外: 所有者の機構と付与者の記録（#2236）、`ALTER DEFAULT PRIVILEGES`（#2237）、表・列の参照時検査（#1967〜#1969）と共通ゲートへの
+  統合（#1966 の後続）、`ALL SEQUENCES／FUNCTIONS IN SCHEMA`、PROCEDURE／ROUTINE、SECURITY DEFINER、存在オラクルの網羅試験（#1972）。

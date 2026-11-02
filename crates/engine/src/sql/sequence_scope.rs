@@ -105,6 +105,9 @@ pub(crate) type SharedSessionSequences = Arc<Mutex<SessionSequenceState>>;
 pub(crate) struct SequenceContext {
     pub(crate) allocator: Arc<SequenceAllocator>,
     pub(crate) session: Option<SharedSessionSequences>,
+    /// ACL で判定すべき主体（束縛ロール ID。Issue #2235）。`None` は検査しない主体（未束縛・所有者相当・
+    /// セッションを持たない経路）。`tenant::assign_sequence_values` が採番の前に SEQUENCE の権限を検査する。
+    pub(crate) acl_role: Option<u64>,
 }
 
 thread_local! {
@@ -125,10 +128,12 @@ impl SequenceScope {
     pub(crate) fn enter(
         allocator: Arc<SequenceAllocator>,
         session: SharedSessionSequences,
+        acl_role: Option<u64>,
     ) -> Self {
         let ctx = SequenceContext {
             allocator,
             session: Some(session),
+            acl_role,
         };
         let prev = CURRENT.with(|c| c.replace(Some(ctx)));
         // 前の文の受け渡し値を持ち越さない。
@@ -150,6 +155,7 @@ impl SequenceScope {
         let ctx = SequenceContext {
             allocator,
             session: None,
+            acl_role: None,
         };
         let prev = CURRENT.with(|c| c.replace(Some(ctx)));
         ASSIGNED.with(|a| a.borrow_mut().clear());
@@ -197,10 +203,10 @@ mod tests {
     fn scope_is_restored_on_drop_and_nests() {
         assert!(current().is_none());
         let alloc = Arc::new(SequenceAllocator::default());
-        let outer = SequenceScope::enter(Arc::clone(&alloc), Arc::default());
+        let outer = SequenceScope::enter(Arc::clone(&alloc), Arc::default(), None);
         assert!(current().is_some());
         {
-            let _inner = SequenceScope::enter(Arc::clone(&alloc), Arc::default());
+            let _inner = SequenceScope::enter(Arc::clone(&alloc), Arc::default(), None);
             assert!(current().is_some());
         }
         assert!(current().is_some());
@@ -265,7 +271,8 @@ mod tests {
 
     #[test]
     fn assigned_values_are_taken_once() {
-        let _scope = SequenceScope::enter(Arc::new(SequenceAllocator::default()), Arc::default());
+        let _scope =
+            SequenceScope::enter(Arc::new(SequenceAllocator::default()), Arc::default(), None);
         let _ = take_assigned();
         record_assigned(0, 1, 7);
         assert_eq!(take_assigned(), vec![(0, 1, 7)]);
