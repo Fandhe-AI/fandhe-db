@@ -8321,14 +8321,14 @@ impl EngineCore {
         txn: &mut crate::sql::transaction::SessionTransaction<'e>,
         sql: &str,
     ) -> Result<crate::sql::SqlOutcome, crate::sql::allowlist::SqlSurfaceError> {
-        // `Failed` 中は `ROLLBACK` 以外を parse より前に `25P02` で拒否する
+        // `Failed` 中は `ROLLBACK`・`ROLLBACK TO`（Issue #1947）以外を parse より前に `25P02` で拒否する
         // （PR #1041 レビュー指摘: parse を先に行うと、不正な SQL に対して
         // `42601` 等が返り `Failed` であることがクライアントへ伝わらない）。
         // `ROLLBACK` かどうかは先頭トークンだけで判定し、`ROLLBACK` の規範形の
         // 検証は通常どおり parse に任せる。字句解析自体に失敗した入力は
         // `ROLLBACK` ではないものとして `25P02` に倒す。
         if txn.status() == crate::sql::transaction::TransactionStatus::Failed
-            && !crate::sql::transaction::is_rollback_statement(sql)
+            && !crate::sql::transaction::is_allowed_while_failed(sql)
         {
             return Err(txn.take_failed_error());
         }
@@ -8398,8 +8398,8 @@ impl EngineCore {
     /// 直接遷移させる。それ以外は `txn.status()` に応じて分岐する:
     /// - `Idle`: 既存の [`Self::execute_parsed_in_session`]（autocommit）へ
     ///   そのまま委譲（挙動は不変）。
-    /// - `Failed`: `ROLLBACK` 以外は一切実行せず `25P02` を返す
-    ///   （`ParsedSql::Transaction(Rollback)` は上の分岐で既に処理済み）。
+    /// - `Failed`: `ROLLBACK`・`ROLLBACK TO` 以外は一切実行せず `25P02` を返す
+    ///   （`ParsedSql::Transaction` は上の分岐で既に処理済み。Issue #1947）。
     /// - `Active`: 上限検査・`operation_id` 再利用検査（[`crate::sql::
     ///   transaction::SessionTransaction::check_and_register_statement`]）を
     ///   経てから、明示トランザクション内で対応する書き込み系（`INSERT`・
@@ -8516,8 +8516,10 @@ impl EngineCore {
                 }
                 txn.check_and_register_statement(parsed_operation_id(parsed))?;
                 let result = self.execute_in_active_txn(ctx, session, txn, parsed);
-                if result.is_err() {
-                    txn.fail();
+                if let Err(e) = &result {
+                    // `XX000`・`40001` は復帰不可、それ以外は savepoint があれば `ROLLBACK TO` で
+                    // 復帰できる失敗状態へ（Issue #1947）。
+                    txn.fail_for(e);
                 }
                 result
             }

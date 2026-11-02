@@ -1483,13 +1483,13 @@ fn handle_parse_body(
 ) -> Result<(), HandlerError> {
     // フレーム本体の構造検証（`08P01`）だけを先に行う。
     let msg = parse_parse_body(body)?;
-    // 明示トランザクションが `Failed` の間は、`ROLLBACK` と空文字列以外を、
+    // 明示トランザクションが `Failed` の間は、`ROLLBACK`・`ROLLBACK TO`（Issue #1947）と空文字列以外を、
     // パラメータ型 OID 指定の未対応（`0A000`）等の機能検証や parse より前に
     // `25P02` で拒否する（SQL-31・TASK-221。簡易クエリの
     // `EngineCore::execute_sql_in_txn` と同じ判定順序。PR #1041 レビュー指摘）。
     if txn.status() == engine::sql::transaction::TransactionStatus::Failed
         && !engine::sql::lexer::is_effectively_empty(&msg.query)
-        && !engine::sql::transaction::is_rollback_statement(&msg.query)
+        && !engine::sql::transaction::is_allowed_while_failed(&msg.query)
     {
         return Err(HandlerError::Sql(txn.take_failed_error()));
     }
@@ -1868,7 +1868,8 @@ fn handle_bind_body(
                     | PreparedStatement::Parsed {
                         parsed: ParsedSql::Transaction(
                             engine::sql::transaction::ValidatedTxnControl {
-                                control: engine::sql::transaction::TxnControl::Rollback,
+                                control: engine::sql::transaction::TxnControl::Rollback
+                                    | engine::sql::transaction::TxnControl::RollbackToSavepoint,
                                 ..
                             }
                         ),
@@ -2206,7 +2207,8 @@ fn portal_is_exempt_while_failed(state: &ExtendedQueryState, portal_name: &str) 
                 matches!(
                     **parsed,
                     ParsedSql::Transaction(engine::sql::transaction::ValidatedTxnControl {
-                        control: engine::sql::transaction::TxnControl::Rollback,
+                        control: engine::sql::transaction::TxnControl::Rollback
+                            | engine::sql::transaction::TxnControl::RollbackToSavepoint,
                         ..
                     })
                 ) && matches!(portal.state, PortalState::Ready)
