@@ -5146,29 +5146,19 @@ impl EngineCore {
         Ok(true)
     }
 
-    /// 作成前に同名の relation が無かったか（所有者の記録対象か）を返す。判定できなければ「あった」と
-    /// みなして記録しない（既存 relation の所有を奪わない。fail-closed。Issue #2236）。
-    fn relation_absent_before_create(&self, relation_key: &str) -> bool {
-        matches!(self.storage.relation_name_exists(relation_key), Ok(false))
-    }
-
     /// 新規作成する relation の所有者として、束縛中のロールを作成と同じ write txn で書くよう予約する
     /// （Issue #2236。CREATE TABLE・CTAS・VIEW・MATERIALIZED VIEW の腕が作成の直前に呼び、返した guard を
     /// 作成の完了まで保持する）。未束縛は予約せず、所有者の無い relation は運用者権限でしか扱えない（拒否側）。
     /// 所有者の保存は作成本体（`catalog`）が「新規に作った」ことを確認できた txn の中で行うため、作成後の
-    /// DROP・同名再作成と競合して別の対象へ所有者を付けない。
+    /// DROP・同名再作成と競合して別の対象へ所有者を付けない。事前の存在照会は行わず（照会と作成の間の
+    /// 別セッションの DROP で所有者が落ちるため）、既存対象の維持は `set_owner_if_absent` が担う。
     fn arm_created_relation_owner(
         &self,
         ctx: &PolicyContext,
         session: &crate::sql::mode::SessionState,
-        absent_before: bool,
         relation_key: &str,
     ) -> crate::catalog::privilege::owner::PendingOwnerGuard {
-        let role = if absent_before {
-            session.current_role_id()
-        } else {
-            None
-        };
+        let role = session.current_role_id();
         crate::catalog::privilege::owner::arm_pending_owner(ctx.tenant_id(), relation_key, role)
     }
 
@@ -7799,9 +7789,7 @@ impl EngineCore {
                         ),
                     );
                 }
-                let absent_before = self.relation_absent_before_create(&stmt.table_name);
-                let _owner_guard =
-                    self.arm_created_relation_owner(ctx, session, absent_before, &stmt.table_name);
+                let _owner_guard = self.arm_created_relation_owner(ctx, session, &stmt.table_name);
                 let outcome = crate::sql::ddl::execute_create_table(
                     &self.storage,
                     stmt,
@@ -7822,9 +7810,7 @@ impl EngineCore {
                     stmt.public_qualified,
                     stmt.table_name(),
                 )?;
-                let absent_before = self.relation_absent_before_create(stmt.table_name());
-                let _owner_guard =
-                    self.arm_created_relation_owner(ctx, session, absent_before, stmt.table_name());
+                let _owner_guard = self.arm_created_relation_owner(ctx, session, stmt.table_name());
                 let outcome = self.execute_create_table_as(ctx, session, stmt)?;
                 Ok(crate::sql::SqlOutcome::CreateTableAs(outcome))
             }
@@ -7914,9 +7900,7 @@ impl EngineCore {
                     },
                 )?;
                 // TABLE-41 (2)・Issue #1660: `OR REPLACE` は互換性検査付きの置換経路へ。
-                let absent_before = self.relation_absent_before_create(stmt.name());
-                let _owner_guard =
-                    self.arm_created_relation_owner(ctx, session, absent_before, stmt.name());
+                let _owner_guard = self.arm_created_relation_owner(ctx, session, stmt.name());
                 let outcome = if stmt.or_replace() {
                     self.create_or_replace_view_in_session(session, stmt)?
                 } else {
@@ -7934,9 +7918,7 @@ impl EngineCore {
                 )?;
                 self.require_creation_target(ctx, session, stmt.public_qualified, stmt.name())?;
                 crate::sql::schema_dependency::check_view_body(stmt.name(), stmt.body_sql())?;
-                let absent_before = self.relation_absent_before_create(stmt.name());
-                let _owner_guard =
-                    self.arm_created_relation_owner(ctx, session, absent_before, stmt.name());
+                let _owner_guard = self.arm_created_relation_owner(ctx, session, stmt.name());
                 let outcome = self.execute_create_materialized_view(ctx, session, stmt)?;
                 Ok(crate::sql::SqlOutcome::CreateMaterializedView(outcome))
             }
@@ -9009,6 +8991,9 @@ impl EngineCore {
             // SQL-40（Issue #2236）: 所有者の変更も独立した write txn で commit され ROLLBACK で取り消せない
             // ため明示トランザクション内では行わない。未束縛は存在を問わず `42501`（ゲートを `0A000` より前に置く）。
             ParsedSql::AlterOwner(_) => {
+                // 自動コミット（`execute_alter_owner`）と同じく、運用者権限があっても現在ロールが未束縛なら
+                // `0A000` より前に `42501` で拒否する（O8）。
+                crate::sql::privilege_gate::bound_principal(session)?;
                 crate::sql::privilege_gate::require_ddl_or_owner(
                     session,
                     crate::sql::privilege_gate::DdlStatementKind::AlterOwner,

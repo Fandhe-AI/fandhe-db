@@ -325,8 +325,17 @@ fn reassign_and_drop_owned_are_static_rejections() {
 fn owner_to_inside_a_transaction_block_is_not_supported() {
     let f = fx("sql40_owner_tx");
     f.ok("t1", &mut bound(ALICE, true), "CREATE TABLE docs (a TEXT)");
-    for (is_bound, expected) in [(false, "42501"), (true, "0A000")] {
-        let mut s = SessionState::default();
+    // 運用者権限つきでも未束縛なら `42501`（自動コミットと同じ契約）。
+    for (is_bound, is_operator, expected) in [
+        (false, false, "42501"),
+        (false, true, "42501"),
+        (true, false, "0A000"),
+    ] {
+        let mut s = if is_operator {
+            operator()
+        } else {
+            SessionState::default()
+        };
         if is_bound {
             s.bind_role_ids(ALICE, ALICE);
         }
