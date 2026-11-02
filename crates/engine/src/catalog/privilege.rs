@@ -636,7 +636,7 @@ impl Storage {
 
 /// 読み取り系の権限検査（#1967。`sql::privilege_gate::read` から呼ばれる）の ACL 照会。`keys` の各 relation
 /// （表・ビュー・matview のキー）について、存在しなければ `None`、存在すれば `tenant` の表単位の ACL のうち
-/// 付与先が `role_id` か PUBLIC の行の権限ビットの和を返す。列単位の行は含めない（暫定の fail-closed。
+/// 付与先が `role_id` の INHERIT 閉包のロールか PUBLIC の行の権限ビットの和を返す。列単位の行は含めない（暫定の fail-closed。
 /// #2081）。1 つの read txn で全件を引く。形が不正なキーは relation として存在しない扱い（`None`。
 /// 誤分類された識別子を拒否側へも利用者エラーへも倒さない）。ACL 行の破損・件数超過は `Err`（素通しにしない）。
 pub(crate) fn relation_grant_bits_in_txn<R: ReadSource>(
@@ -646,6 +646,22 @@ pub(crate) fn relation_grant_bits_in_txn<R: ReadSource>(
     role_id: u64,
 ) -> Result<Vec<Option<u16>>> {
     validate_tenant(tenant)?;
+    // 同じスナップショットで INHERIT が真の辺だけの閉包を求め、到達するロール（自身を含む）への付与と
+    // 所有者の暗黙権限を合算する（INHERIT FALSE の辺・他テナントのロールには波及しない）。PUBLIC の予約
+    // ID 0 は主体になれないため閉包を求めず、PUBLIC の付与だけを数える。
+    let roles: Vec<u64> = if role_id == PUBLIC_GRANTEE_ID {
+        Vec::new()
+    } else {
+        super::role::graph::effective_roles_in_txn(
+            src,
+            tenant,
+            role_id,
+            super::role::graph::Mode::Inherit,
+        )?
+        .into_iter()
+        .map(|(id, _)| id)
+        .collect()
+    };
     let mut out = Vec::with_capacity(keys.len());
     for key in keys {
         if validate_relation_key(key).is_err() || !relation_exists_in_txn(src, key)? {
@@ -656,13 +672,16 @@ pub(crate) fn relation_grant_bits_in_txn<R: ReadSource>(
             list_acl_for_object_in_txn(src, tenant, &PrivilegeObject::Table(key.clone()))?;
         let bits = entries
             .iter()
-            .filter(|e| e.grantee_id == role_id || e.grantee_id == PUBLIC_GRANTEE_ID)
+            .filter(|e| e.grantee_id == PUBLIC_GRANTEE_ID || roles.contains(&e.grantee_id))
             .fold(0u16, |acc, e| acc | e.privileges);
         // 所有者は自身の relation の全権限を暗黙に持つ（`OWNER TO` は自己付与行を作らない・消す）。
-        // 同じ読み取りスナップショットで所有者行を引き、ACL に加算する。
-        let owner =
-            owner::is_owner_in_txn(src, tenant, &PrivilegeObject::Table(key.clone()), role_id)?;
-        let bits = if owner { bits | u16::MAX } else { bits };
+        // 閉包内のいずれかのロールが所有者なら、同じ読み取りスナップショットで確認して加算する。
+        let owner_id = owner::owner_of_in_txn(src, tenant, &PrivilegeObject::Table(key.clone()))?;
+        let bits = if owner_id.is_some_and(|o| roles.contains(&o)) {
+            bits | u16::MAX
+        } else {
+            bits
+        };
         out.push(Some(bits));
     }
     Ok(out)

@@ -645,3 +645,31 @@ fn dropped_materialized_view_is_rejected_after_parse() {
         .expect_err("dropped matview must not skip the check");
     assert_eq!(e.wire_code(), "42P01");
 }
+
+/// INHERIT の閉包を SELECT の実効権限に反映する（Issue #1967・#2860）。INHERIT 真の辺（多段を含む）の先への
+/// 付与で読め、INHERIT 偽の辺では読めず、`REVOKE` 後は読めない。
+#[test]
+fn select_follows_inherit_membership_closure() {
+    let f = fx("selpriv-inherit");
+    let q = "SELECT id FROM ca LIMIT 5";
+    f.admin_run("CREATE ROLE readers");
+    f.admin_run("CREATE ROLE mid");
+    f.admin_run("GRANT SELECT ON ca TO readers");
+    assert_eq!(f.alice_run(q), "42501");
+    // INHERIT 偽の辺は権限を運ばない。
+    f.admin_run("GRANT readers TO alice WITH INHERIT FALSE");
+    assert_eq!(f.alice_run(q), "42501");
+    f.admin_run("REVOKE readers FROM alice");
+    f.admin_run("GRANT readers TO alice WITH INHERIT TRUE");
+    assert_eq!(f.alice_run(q), "ok");
+    f.admin_run("REVOKE readers FROM alice");
+    assert_eq!(f.alice_run(q), "42501");
+    // 多段（alice -> mid -> readers）。
+    f.admin_run("GRANT readers TO mid WITH INHERIT TRUE");
+    f.admin_run("GRANT mid TO alice WITH INHERIT TRUE");
+    assert_eq!(f.alice_run(q), "ok");
+    // 途中の辺が INHERIT 偽なら届かない。
+    f.admin_run("REVOKE mid FROM alice");
+    f.admin_run("GRANT mid TO alice WITH INHERIT FALSE");
+    assert_eq!(f.alice_run(q), "42501");
+}

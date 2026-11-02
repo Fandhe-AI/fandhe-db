@@ -203,7 +203,7 @@ pub(crate) enum PrivilegeTarget {
     /// DDL 文種。
     Ddl(DdlStatementKind),
     /// relation（表・ビュー・matview）。`granted_bits` は呼び出し元が ACL から解決した実効権限
-    /// （現在ロールへの直接付与と PUBLIC の和。表単位の行だけで、列単位の付与は含めない）。
+    /// （現在ロールの INHERIT 閉包への付与と PUBLIC の和。表単位の行だけで、列単位の付与は含めない）。
     Relation {
         required_bits: u16,
         granted_bits: u16,
