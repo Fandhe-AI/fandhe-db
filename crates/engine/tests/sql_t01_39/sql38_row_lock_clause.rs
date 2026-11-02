@@ -965,3 +965,41 @@ fn extended_query_schema_qualified_of_matches_simple_query() {
         Err("42P01".to_string())
     );
 }
+
+/// 他セッション保持中でも、`SKIP LOCKED` の空結果は句なし SELECT と同じ execute 時の検査を通る
+/// （負の `LIMIT` は句なしと同じ wire_code で拒否され、成功の空結果に化けない）。
+#[test]
+fn skip_locked_held_still_runs_execute_time_checks() {
+    let (core, path) = new_core();
+    let _cleanup = CleanupGuard(path);
+    let mut session = SessionState::default();
+    seed(&core, &mut session);
+    let plain_sql = "SELECT id FROM documents WHERE title = 'x' ORDER BY id LIMIT -1";
+    let plain_code = core
+        .execute_sql_in_session(&ctx(), &mut SessionState::default(), plain_sql)
+        .expect_err("plain negative limit is rejected")
+        .wire_code()
+        .to_string();
+    let mut txn = hold_writer(&core, &mut session);
+    let sql = format!("{plain_sql} FOR UPDATE SKIP LOCKED");
+    let err = autocommit_in_other_session(&core, &ctx(), &sql).expect_err("must be rejected");
+    assert_eq!(err, plain_code);
+    core.execute_sql_in_txn(&ctx(), &mut session, &mut txn, "COMMIT")
+        .expect("commit");
+}
+
+/// 複数文メッセージでは、`NOWAIT` と `SKIP LOCKED` が同じ SELECT に混在し最後の文でなくても、
+/// `SKIP LOCKED` を含む形は writer に触れず `0A000`（合成結果の `NOWAIT` 優先に隠れない）。
+#[test]
+fn multi_statement_skip_locked_is_0a000_even_with_nowait_mix() {
+    let (core, path) = new_core();
+    let _cleanup = CleanupGuard(path);
+    let session = SessionState::default();
+    let mut txn = core.new_session_transaction();
+    let mixed =
+        format!("{Q_LOCK} FOR UPDATE OF documents NOWAIT FOR SHARE OF documents SKIP LOCKED");
+    let err = core
+        .begin_implicit_transaction_for(&mut txn, &session, &[mixed.as_str(), "SELECT 1"])
+        .expect_err("rejected");
+    assert_eq!(err.wire_code(), "0A000");
+}

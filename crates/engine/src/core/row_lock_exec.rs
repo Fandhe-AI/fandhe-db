@@ -12,8 +12,8 @@
 //! autocommit なら文の終わりまで保持する。取得後の読み取りは句のない `SELECT` と同じ経路
 //! （`read_only_in_active_txn`）を通るため、結果と RLS の暗黙適用は同一になる。
 //!
-//! `SKIP LOCKED` は待たずに取得を試み、他セッションが保持していれば行を読まずに 0 行を返す
-//! （列は Describe と同じ経路で導出し、句なし `SELECT` と一致する）。0 行はテナントの可視行に
+//! `SKIP LOCKED` は待たずに取得を試み、他セッションが保持していれば 0 行を返す（結果の行は捨てる）
+//! （句なし `SELECT` と同じ execute 経路を通すため 22000／42501 等の検査も効く）。0 行はテナントの可視行に
 //! 依存しないため、他テナントの行の存在・件数のオラクルにならない（SQL-38 (5)・RLS-12）。
 //! 取得できた場合は `SKIP LOCKED` を外した行ロック句と同じに扱い、`40001` 判定も効く。
 //!
@@ -45,7 +45,7 @@ impl EngineCore {
             WriterWait::NoWait => txn.ensure_writer_with(ctx, true)?,
             WriterWait::SkipLocked => {
                 if !txn.try_ensure_writer(ctx)? {
-                    return self.skip_locked_empty_result(session, locking);
+                    return self.skip_locked_empty_result(ctx, session, Some(&*txn), locking);
                 }
             }
         }
@@ -55,7 +55,7 @@ impl EngineCore {
     /// autocommit の行ロック句つき `SELECT` を、文単位の暗黙 Tx で実行する。待機方針は暗黙 Tx の
     /// 開始（writer 取得）の前に決める。成功時は書き込みなしとして writer を解放し、失敗時は
     /// Tx の drop で abort する（permit を取り残さない）。`SKIP LOCKED` で他者保持中なら暗黙 Tx を
-    /// 開始せず（`Idle` のまま）0 行を返す。
+    /// 開始せず（`Idle` のまま）0 行を返し、一時表の `ON COMMIT` だけ適用する。
     pub(super) fn execute_locking_select_autocommit(
         &self,
         ctx: &PolicyContext,
@@ -73,7 +73,10 @@ impl EngineCore {
             WriterWait::NoWait => txn.begin_implicit_with(&self.storage, session, true)?,
             WriterWait::SkipLocked => {
                 if !txn.try_begin_implicit(&self.storage, session)? {
-                    return self.skip_locked_empty_result(session, locking);
+                    let outcome = self.skip_locked_empty_result(ctx, session, None, locking)?;
+                    // autocommit の文が成功したので、一時表の `ON COMMIT` を暗黙 Tx の commit と同様に適用する。
+                    session.apply_temp_on_commit()?;
+                    return Ok(outcome);
                 }
             }
         }
@@ -82,28 +85,36 @@ impl EngineCore {
         Ok(outcome)
     }
 
-    /// `SKIP LOCKED` が writer を取得できなかったときの 0 行結果。行は一切読まず（読み取り集合にも
-    /// 何も入れない）、列は句を除いた文の Describe と同じ経路で導出する。Describe が列を返さない
-    /// （`None`）のは不変条件違反として `XX000` に倒す（fail-closed）。
-    fn skip_locked_empty_result(
-        &self,
-        session: &SessionState,
+    /// `SKIP LOCKED` が writer を取得できなかったときの 0 行結果。句を除いた文を、句なし `SELECT` と同じ
+    /// execute 経路（明示 Tx は `read_only_in_active_txn`、autocommit は `execute_parsed_statement`）で
+    /// 実行し、結果の行だけを捨てて列を返す。これにより BEGIN 時点のスナップショット・負の
+    /// `LIMIT`／`OFFSET` の `22000`・`row_security = off` の `42501` など execute 時の検査を必ず通し、
+    /// 検査に落ちる文が成功の空結果に化けない（fail-closed）。読んだ行は結果へ載せないため、他者保持中の
+    /// 行の存在・件数は観測できない。`txn` が `Some` なら明示 Tx（writer 未取得で `BeginSnapshot`）の経路。
+    fn skip_locked_empty_result<'e>(
+        &'e self,
+        ctx: &PolicyContext,
+        session: &mut SessionState,
+        txn: Option<&SessionTransaction<'e>>,
         locking: &LockingSelect,
     ) -> Result<crate::sql::SqlOutcome, SqlSurfaceError> {
-        let described = self.describe_parsed_in_session(
-            session,
-            &super::ParsedSql::Statement(locking.statement().clone()),
-        )?;
-        let Some(columns) = described else {
-            return Err(SqlSurfaceError::Internal {
-                detail: "internal error".to_string(),
-            });
+        let stmt = locking.statement().clone();
+        let outcome = match txn {
+            Some(txn) => self.read_only_in_active_txn(ctx, session, txn, stmt)?,
+            None => {
+                self.execute_parsed_statement(ctx, session, &super::ParsedSql::Statement(stmt))?
+            }
         };
-        Ok(crate::sql::SqlOutcome::Query(
-            crate::sql::exec::QueryResult {
-                columns,
-                rows: Vec::new(),
-            },
-        ))
+        match outcome {
+            crate::sql::SqlOutcome::Query(q) => Ok(crate::sql::SqlOutcome::Query(
+                crate::sql::exec::QueryResult {
+                    columns: q.columns,
+                    rows: Vec::new(),
+                },
+            )),
+            _ => Err(SqlSurfaceError::Internal {
+                detail: "internal error".to_string(),
+            }),
+        }
     }
 }

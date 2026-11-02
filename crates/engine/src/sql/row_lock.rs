@@ -160,6 +160,14 @@ impl RowLockingSyntax {
     pub(crate) fn writer_wait(&self) -> WriterWait {
         compose_writer_wait(&self.clauses)
     }
+
+    /// 元の句のいずれかが `SKIP LOCKED` か（合成結果ではなく句そのものを見る。`NOWAIT` と混在しても
+    /// `true`。複数文メッセージの `0A000` 判定用）。
+    pub(crate) fn has_skip_locked(&self) -> bool {
+        self.clauses
+            .iter()
+            .any(|c| c.wait == LockWaitPolicy::SkipLocked)
+    }
 }
 
 fn is_word(token: Option<&Token>, word: &str) -> bool {

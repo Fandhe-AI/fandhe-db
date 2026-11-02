@@ -3772,10 +3772,12 @@ impl EngineCore {
             let Ok((_, Some(syntax))) = crate::sql::row_lock::extract_row_locking(tokens) else {
                 continue;
             };
-            match syntax.writer_wait() {
-                crate::sql::row_lock::WriterWait::Block => {}
-                crate::sql::row_lock::WriterWait::NoWait => nowait = true,
-                crate::sql::row_lock::WriterWait::SkipLocked => skip_locked = true,
+            // SKIP LOCKED は合成結果（NOWAIT 優先）ではなく元の句から検出する。
+            if syntax.has_skip_locked() {
+                skip_locked = true;
+            }
+            if syntax.writer_wait() == crate::sql::row_lock::WriterWait::NoWait {
+                nowait = true;
             }
         }
         if skip_locked {
