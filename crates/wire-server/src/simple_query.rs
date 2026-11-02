@@ -1294,7 +1294,7 @@ fn respond_rows_with_tag<S: WireStream>(
             // 指摘 P1）。ここで `fail()` せずに `Active` のまま返すと、直前の
             // `INSERT` 等の書き込みが未確定のまま残り、後続の `COMMIT` で
             // 誤って永続化されてしまう。
-            txn.fail();
+            txn.fail_unrecoverable();
             respond_error(
                 stream,
                 ErrorClass::InternalError,
@@ -1337,7 +1337,7 @@ fn respond_rows_with_tag<S: WireStream>(
                 buffer.flush(stream)?;
                 // 行エンコード失敗も上記と同じ理由で `Active` を `Failed` へ
                 // 強制遷移させる（SQL-31・PR #1041 レビュー指摘 P1）。
-                txn.fail();
+                txn.fail_unrecoverable();
                 respond_error(
                     stream,
                     ErrorClass::InternalError,
@@ -1367,7 +1367,7 @@ fn respond_rows_with_tag<S: WireStream>(
             buffer.flush(stream)?;
             // `CommandComplete` エンコード失敗も同様に `Failed` へ遷移させる
             // （SQL-31・PR #1041 レビュー指摘 P1）。
-            txn.fail();
+            txn.fail_unrecoverable();
             respond_error(
                 stream,
                 ErrorClass::InternalError,

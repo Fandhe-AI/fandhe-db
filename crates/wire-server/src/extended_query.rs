@@ -1064,6 +1064,10 @@ pub(crate) struct ExtendedQueryState {
     /// `handshake::post_auth_loop` は Sync（'S'）・Terminate（'X'）以外の
     /// メッセージを読み捨てる。
     pub(crate) ignore_till_sync: bool,
+    /// `ignore_till_sync` を立てたエラーが内部エラー（`XX000`）だったか。真なら
+    /// `handshake::post_auth_loop` は明示 Tx を `ROLLBACK TO` で復帰できない `Failed` へ倒し
+    /// writer を即時解放する（エラー契約。Issue #1947）。Sync で `false` へ戻す。
+    pub(crate) ignore_till_sync_internal: bool,
     /// 同期回復中に読み捨てた COPY 系メッセージ（'d'/'c'/'f'）のバイト数・件数
     /// （Issue #1761）。`handshake::post_auth_loop` が加算し、Sync で 0 へ戻す。
     pub(crate) ignored_copy_bytes: usize,
@@ -1084,6 +1088,7 @@ impl ExtendedQueryState {
             statements: PreparedStatementStore::with_max_named(limits.max_prepared_statements),
             portals: PortalStore::new(),
             ignore_till_sync: false,
+            ignore_till_sync_internal: false,
             ignored_copy_bytes: 0,
             ignored_copy_messages: 0,
         }
@@ -1410,6 +1415,9 @@ fn respond_error_and_await_sync<S: WireStream>(
     stream.write_all(&body)?;
     stream.flush()?;
     state.ignore_till_sync = true;
+    if err.error_class() == ErrorClass::InternalError {
+        state.ignore_till_sync_internal = true;
+    }
     Ok(())
 }
 
@@ -2797,6 +2805,7 @@ pub(crate) fn handle_sync<S: WireStream>(
     };
 
     state.ignore_till_sync = false;
+    state.ignore_till_sync_internal = false;
     state.ignored_copy_bytes = 0;
     state.ignored_copy_messages = 0;
     // WIRE-11・SQL-31・TASK-221・Issue #1174: 明示トランザクション中
