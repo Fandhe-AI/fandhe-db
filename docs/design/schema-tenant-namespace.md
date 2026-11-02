@@ -195,6 +195,8 @@ README の公開済み要点を超えて具体化しない。公開境界を広�
 
 ### D10. 権限（#1713・#2234）
 
+Phase 6（#2234）の契約と実装記録は [role-privilege-model.md](role-privilege-model.md) §10 を参照する。
+
 - Phase 6 まで: `CREATE`・`DROP`・`ALTER SCHEMA` と、SCHEMA を指定する作成系 DDL は、既存の
   `--ddl-allowed-users` のゲート（`sql::ddl::require_ddl_permission`）に従う。既定拒否を維持
   する。同じテナントのセッションは、そのテナントのすべての SCHEMA を参照できる（境界は

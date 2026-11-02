@@ -30,7 +30,9 @@ use super::role::validate_tenant;
 use super::{validate_identifier, validate_relation_key, CatalogError, Result, Storage};
 
 mod apply;
-pub(crate) use apply::{AclChangeError, AclItem, AclRequest, AclWarning, GranteeSpec};
+mod schema;
+pub(crate) use apply::{AclChangeError, AclItem, AclRequest, AclScope, AclWarning, GranteeSpec};
+pub(crate) use schema::remove_schema_acl_in_txn;
 
 /// ACL の専用カタログ表。キーは `(tenant_id, object_kind, object_key, column, grantee_id, grantor_id)`。
 #[allow(clippy::type_complexity)] // 6 成分の複合キー（先頭 tenant_id）。型別名にすると redb の寿命推論が崩れる。

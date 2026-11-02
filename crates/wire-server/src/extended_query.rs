@@ -2003,6 +2003,12 @@ fn handle_bind_body(
                     .bind_prepared_in_txn(session, txn, prepared, &[])
                     .map_err(HandlerError::Sql)?
             } else {
+                // 解決結果を使い回す分岐でも、SCHEMA 修飾の USAGE は Bind 時点の ACL で再検査する
+                // （Parse は主体を持たない入口で解決するため、ここを通らないと Parse 後の `REVOKE` や
+                // 権限の無い束縛ロールが `$n` 無しの文で USAGE 検査を迂回できる。Issue #2234、K12）。
+                engine
+                    .recheck_prepared_schema_usage(session, prepared)
+                    .map_err(HandlerError::Sql)?;
                 parsed.clone()
             };
             // WIRE-15・TASK-218: `describe_parsed_in_txn` へ切り替える
