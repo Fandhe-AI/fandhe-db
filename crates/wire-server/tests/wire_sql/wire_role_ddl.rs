@@ -125,7 +125,7 @@ fn wire_alter_role_tag_and_sqlstates() {
     for (sql, state) in [
         ("ALTER ROLE r1 LOGIN", "42704"),
         ("ALTER ROLE r2 SUPERUSER", "42501"),
-        ("ALTER ROLE r2 VALID UNTIL 'infinity'", "0A000"),
+        ("ALTER ROLE r2 CONNECTION LIMIT -5", "22023"),
         ("ALTER ROLE r2 BOGUS", "42601"),
     ] {
         send_simple_query(&mut stream, sql);

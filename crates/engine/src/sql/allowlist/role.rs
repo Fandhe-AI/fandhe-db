@@ -7,7 +7,7 @@
 //!
 //! 受理しない形（すべて固定文言。パスワードのリテラル・名前以外のトークンはエラーに含めない）:
 //! `SUPERUSER`／`BYPASSRLS`／`REPLICATION`（テナント境界を越える属性。`42501`）、`UNENCRYPTED PASSWORD`・
-//! `IN ROLE`・`ROLE`・`ADMIN`・`VALID UNTIL`・`CONNECTION LIMIT` など後続 Issue の担当（`0A000`）、
+//! `IN ROLE`・`ROLE`・`ADMIN` など後続 Issue の担当（`0A000`）、
 //! オプションの重複・矛盾・未知語・`$n` プレースホルダ・修飾名（`42601`）、予約名（`42939`）。
 //!
 //! パスワードの平文は [`RolePassword`] に閉じ込める。`Debug` は伏せ字で、`Display` は実装しない。
@@ -56,6 +56,10 @@ pub struct ValidatedCreateRole {
     pub(crate) attributes: RoleAttributes,
     /// `None` はパスワード未指定または `PASSWORD NULL`。
     pub(crate) password: Option<RolePassword>,
+    /// `VALID UNTIL '<文字列>'` の生のリテラル（時刻への解決は `sql::role_ddl` がセッションの TimeZone で行う）。
+    pub(crate) valid_until_literal: Option<String>,
+    /// `CONNECTION LIMIT <整数>`（-1 は無制限。範囲は構文段で検査済み）。
+    pub(crate) connection_limit: Option<i32>,
 }
 
 /// 構造検証済みの `DROP ROLE [IF EXISTS] <名前>[, ...]`（`DROP USER` も同じ。SQL-39、Issue #1962）。
@@ -165,6 +169,8 @@ pub(crate) fn validate_create_role_tokens(
             createdb: opts.createdb.unwrap_or(false),
         },
         password: opts.password.flatten(),
+        valid_until_literal: opts.valid_until,
+        connection_limit: opts.connection_limit,
     })
 }
 
@@ -178,6 +184,58 @@ struct ParsedRoleOptions {
     createdb: Option<bool>,
     /// `None` は未指定、`Some(None)` は `PASSWORD NULL`。
     password: Option<Option<RolePassword>>,
+    /// `VALID UNTIL` の生のリテラル（Issue #2233）。
+    valid_until: Option<String>,
+    /// `CONNECTION LIMIT` の値（Issue #2233）。
+    connection_limit: Option<i32>,
+}
+
+/// `VALID UNTIL` の後ろ（文字列リテラルのみ）を読む。エラー文言にリテラルを含めない。
+fn parse_valid_until_value(p: &mut Parser<'_>) -> Result<String, SqlSurfaceError> {
+    if !p.eat_word("UNTIL") {
+        return Err(SqlSurfaceError::unsupported("expected UNTIL after VALID"));
+    }
+    match p.advance() {
+        Some(Token::StringLiteral(s)) => Ok(s.clone()),
+        _ => Err(SqlSurfaceError::unsupported(
+            "expected a string literal after VALID UNTIL",
+        )),
+    }
+}
+
+/// `CONNECTION LIMIT` の後ろ（符号付き整数リテラル。-1 以上・`i32` の範囲）を読む。
+/// 整数でないものは `42601`、範囲外は `22023`（値を文言に含めない）。
+fn parse_connection_limit_value(p: &mut Parser<'_>) -> Result<i32, SqlSurfaceError> {
+    // `LIMIT` は字句段で予約語（`Keyword::Limit`）として切り出される。
+    if !matches!(p.peek(), Some(Token::Keyword(Keyword::Limit))) {
+        return Err(SqlSurfaceError::unsupported(
+            "expected LIMIT after CONNECTION",
+        ));
+    }
+    p.advance();
+    let negative = matches!(p.peek(), Some(Token::Punct('-')));
+    if negative {
+        p.advance();
+    }
+    let digits = match p.advance() {
+        Some(Token::Number(n)) if !n.is_empty() && n.bytes().all(|b| b.is_ascii_digit()) => {
+            n.clone()
+        }
+        _ => {
+            return Err(SqlSurfaceError::unsupported(
+                "expected an integer after CONNECTION LIMIT",
+            ))
+        }
+    };
+    let out_of_range = || SqlSurfaceError::InvalidParameterValue {
+        detail: "invalid connection limit",
+    };
+    let magnitude: i64 = digits.parse().map_err(|_| out_of_range())?;
+    let value = if negative { -magnitude } else { magnitude };
+    if value < -1 {
+        return Err(out_of_range());
+    }
+    i32::try_from(value).map_err(|_| out_of_range())
 }
 
 /// ロールのオプション列（`LOGIN`・`PASSWORD '...'` など）を文末または `;` まで読む。`for_alter` が真のとき
@@ -242,8 +300,25 @@ fn parse_role_options(
             "ROLE" | "USER" | "ADMIN" | "SYSID" if for_alter => {
                 return Err(SqlSurfaceError::unsupported("unrecognized role option"));
             }
-            // メンバーシップ（#2232）・認証側の意味づけ（#2233）は後続 Issue の担当。
-            "IN" | "ROLE" | "USER" | "ADMIN" | "SYSID" | "VALID" | "CONNECTION" => {
+            // 認証の有効期限・接続数上限（Issue #2233）。重複は他のオプションと同じ `42601`。
+            "VALID" => {
+                if out.valid_until.is_some() {
+                    return Err(SqlSurfaceError::unsupported(
+                        "conflicting or redundant options",
+                    ));
+                }
+                out.valid_until = Some(parse_valid_until_value(p)?);
+            }
+            "CONNECTION" => {
+                if out.connection_limit.is_some() {
+                    return Err(SqlSurfaceError::unsupported(
+                        "conflicting or redundant options",
+                    ));
+                }
+                out.connection_limit = Some(parse_connection_limit_value(p)?);
+            }
+            // メンバーシップ（#2232）は後続 Issue の担当。
+            "IN" | "ROLE" | "USER" | "ADMIN" | "SYSID" => {
                 return Err(SqlSurfaceError::feature_not_supported(
                     "this role option is not supported yet",
                 ));
@@ -288,6 +363,10 @@ pub struct RoleOptionPatch {
     pub(crate) createdb: Option<bool>,
     /// `None` は変更なし、`Some(None)` は `PASSWORD NULL`（検証子を空にする）。
     pub(crate) password: Option<Option<RolePassword>>,
+    /// `VALID UNTIL` の生のリテラル。`None` は変更なし（Issue #2233）。
+    pub(crate) valid_until_literal: Option<String>,
+    /// `CONNECTION LIMIT`。`None` は変更なし（Issue #2233）。
+    pub(crate) connection_limit: Option<i32>,
 }
 
 /// `ALTER ROLE` の変更内容。
@@ -403,6 +482,8 @@ pub(crate) fn validate_alter_role_tokens(
             createrole: opts.createrole,
             createdb: opts.createdb,
             password: opts.password,
+            valid_until_literal: opts.valid_until,
+            connection_limit: opts.connection_limit,
         }),
     })
 }
@@ -559,7 +640,9 @@ mod tests {
             format!("CREATE ROLE '{marker}'"),
             format!("CREATE ROLE r SUPERUSER PASSWORD '{marker}'"),
             format!("CREATE ROLE r UNENCRYPTED PASSWORD '{marker}'"),
-            format!("CREATE ROLE r PASSWORD '{marker}' VALID UNTIL '2030-01-01'"),
+            format!("CREATE ROLE r PASSWORD '{marker}' VALID UNTIL '{marker}' BOGUS"),
+            format!("CREATE ROLE r PASSWORD '{marker}' VALID 5"),
+            format!("CREATE ROLE r PASSWORD '{marker}' CONNECTION LIMIT '{marker}'"),
             format!("CREATE ROLE r PASSWORD '{marker}'; DROP TABLE t"),
         ] {
             let e = create(&sql).expect_err("rejected");
@@ -567,6 +650,47 @@ mod tests {
             assert!(!format!("{e:?}").contains(marker), "{e:?}");
             assert!(!e.client_message().contains(marker));
         }
+    }
+
+    /// Issue #2233: `VALID UNTIL`・`CONNECTION LIMIT` の受理と拒否（CREATE・ALTER 共通の解析）。
+    #[test]
+    fn valid_until_and_connection_limit_forms() {
+        let v = create("CREATE ROLE r VALID UNTIL '2030-01-01' CONNECTION LIMIT 3").expect("ok");
+        assert_eq!(v.valid_until_literal.as_deref(), Some("2030-01-01"));
+        assert_eq!(v.connection_limit, Some(3));
+        let v = create("CREATE ROLE r CONNECTION LIMIT -1").expect("minus one");
+        assert_eq!(v.connection_limit, Some(-1));
+        assert_eq!(
+            create("CREATE ROLE r CONNECTION LIMIT 0")
+                .expect("zero")
+                .connection_limit,
+            Some(0)
+        );
+        // 範囲外は 22023、整数でない・リテラルでないものは 42601、重複は 42601。
+        for sql in [
+            "CREATE ROLE r CONNECTION LIMIT -2",
+            "CREATE ROLE r CONNECTION LIMIT 99999999999",
+        ] {
+            assert_eq!(code(create(sql)), "22023", "{sql}");
+        }
+        for sql in [
+            "CREATE ROLE r CONNECTION LIMIT 1.5",
+            "CREATE ROLE r CONNECTION LIMIT 'x'",
+            "CREATE ROLE r CONNECTION 3",
+            "CREATE ROLE r VALID '2030-01-01'",
+            "CREATE ROLE r VALID UNTIL 5",
+            "CREATE ROLE r VALID UNTIL",
+            "CREATE ROLE r VALID UNTIL '2030-01-01' VALID UNTIL 'infinity'",
+            "CREATE ROLE r CONNECTION LIMIT 1 CONNECTION LIMIT 2",
+        ] {
+            assert_eq!(code(create(sql)), "42601", "{sql}");
+        }
+        let a = alter("ALTER ROLE r VALID UNTIL 'infinity' CONNECTION LIMIT 7").expect("alter");
+        let AlterRoleAction::Options(p) = a.action else {
+            panic!("options expected");
+        };
+        assert_eq!(p.valid_until_literal.as_deref(), Some("infinity"));
+        assert_eq!(p.connection_limit, Some(7));
     }
 
     #[test]
@@ -588,8 +712,6 @@ mod tests {
             "USER x",
             "ADMIN x",
             "SYSID 1",
-            "VALID UNTIL 'infinity'",
-            "CONNECTION LIMIT 1",
         ] {
             assert_eq!(
                 code(create(&format!("CREATE ROLE r {kw}"))),
@@ -691,8 +813,6 @@ mod tests {
             assert_eq!(code(alter(sql)), "42501", "{sql}");
         }
         for sql in [
-            "ALTER ROLE r VALID UNTIL 'infinity'",
-            "ALTER ROLE r CONNECTION LIMIT 1",
             "ALTER ROLE r SET search_path = x",
             "ALTER ROLE r RESET ALL",
             "ALTER ROLE r IN DATABASE d SET x = 1",
@@ -723,7 +843,7 @@ mod tests {
         for sql in [
             format!("ALTER ROLE r PASSWORD '{marker}' BOGUS"),
             format!("ALTER ROLE r PASSWORD '{marker}' SUPERUSER"),
-            format!("ALTER ROLE r PASSWORD '{marker}' VALID UNTIL '2030-01-01'"),
+            format!("ALTER ROLE r PASSWORD '{marker}' VALID UNTIL '{marker}' BOGUS"),
             format!("ALTER ROLE r PASSWORD '{marker}' PASSWORD '{marker}'"),
         ] {
             let e = alter(&sql).expect_err("rejected");
