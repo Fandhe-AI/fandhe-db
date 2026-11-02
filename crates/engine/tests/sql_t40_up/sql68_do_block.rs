@@ -103,14 +103,14 @@ fn body_error_leaves_no_side_effects() {
     );
     assert!(!c.is_empty());
     assert_eq!(count(&core, "alice"), 0);
-    // 実行時エラー（`0A000` の RAISE）でも同様。
+    // 実行時エラー（`RAISE EXCEPTION`。Issue #2227 で P0001 になった）でも同様。
     assert_eq!(
         code(
             &core,
             "alice",
             "DO 'BEGIN INSERT INTO t (n) VALUES (1); RAISE EXCEPTION ''x''; END'"
         ),
-        "0A000"
+        "P0001"
     );
     assert_eq!(count(&core, "alice"), 0);
 }

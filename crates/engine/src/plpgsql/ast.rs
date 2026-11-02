@@ -8,6 +8,7 @@
 use std::collections::HashMap;
 use std::sync::{Arc, RwLock};
 
+use crate::plpgsql::condition::ExcCond;
 use crate::plpgsql_limits::{HARD_MAX_PLPGSQL_BODY_BYTES, HARD_MAX_PLPGSQL_NESTING_DEPTH};
 use crate::sql::ddl_column_type::SqlColumnTypeName;
 use crate::sql::lexer::Token;
@@ -75,6 +76,16 @@ pub(crate) enum VarKind {
     Found,
     /// トリガ関数（`ReturnShape::Trigger`）にだけ暗黙宣言するトリガ変数（Issue #2228）。
     Trigger(TriggerVar),
+    /// `EXCEPTION` ハンドラの本体だけに暗黙宣言する `SQLSTATE`・`SQLERRM`（Issue #2227・SQL-70）。
+    /// 値はハンドラに入る時に捕捉したエラーから設定する（text 型）。
+    ExceptionState(ExceptionVar),
+}
+
+/// ハンドラの暗黙変数の種別。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum ExceptionVar {
+    Sqlstate,
+    Sqlerrm,
 }
 
 /// トリガ変数の種別（`NEW`・`OLD`・`TG_*`。PostgreSQL の PL/pgSQL がトリガ関数へ渡す変数のうち、
@@ -440,7 +451,54 @@ pub(crate) enum Stmt {
     GetDiagnostics {
         items: Vec<(AssignTarget, DiagItem)>,
     },
+    /// `RAISE`（Issue #2227・SQL-70）。
+    Raise(RaiseStmt),
     Null,
+}
+
+/// `RAISE` の水準。`Debug`／`Log` はクライアントへ送らず捨てる（引数は評価する）。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum RaiseLevel {
+    Debug,
+    Log,
+    Info,
+    Notice,
+    Warning,
+    Exception,
+}
+
+/// `RAISE ... USING` の項目（`MESSAGE`・`DETAIL`・`HINT`・`ERRCODE` だけ受理する）。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum RaiseOpt {
+    Message,
+    Detail,
+    Hint,
+    Errcode,
+}
+
+/// `RAISE` 文。`rethrow` は引数なしの `RAISE;`（捕捉中のエラーの再送出）。それ以外は書式文字列
+/// （`fmt`・`args`）か条件指定（`condition_code`）のどちらか（または `USING` だけ）。
+#[derive(Debug, Clone, PartialEq)]
+pub(crate) struct RaiseStmt {
+    pub(crate) level: RaiseLevel,
+    pub(crate) rethrow: bool,
+    /// 書式文字列（`%` の数と `args` の数は定義時に一致を検査済み）。
+    pub(crate) fmt: Option<String>,
+    pub(crate) args: Vec<SqlExpr>,
+    /// `RAISE 条件名`／`RAISE SQLSTATE '...'` が指す SQLSTATE（5 文字。定義時に検証済み）。
+    pub(crate) condition_code: Option<String>,
+    /// `RAISE 条件名` の既定メッセージ（条件名そのもの）。
+    pub(crate) condition_name: Option<String>,
+    pub(crate) using: Vec<(RaiseOpt, SqlExpr)>,
+    /// 文の行番号（1 始まり。本体の原文の先頭行が 1）。`W`（呼び出し文脈）に出す。
+    pub(crate) line: u32,
+}
+
+/// `EXCEPTION WHEN cond [OR cond ...] THEN stmts` の 1 節。
+#[derive(Debug, Clone, PartialEq)]
+pub(crate) struct Handler {
+    pub(crate) conds: Vec<ExcCond>,
+    pub(crate) stmts: Vec<Stmt>,
 }
 
 /// `[<<label>>] [DECLARE ...] BEGIN ... END`。
@@ -450,6 +508,10 @@ pub(crate) struct Block {
     /// このブロックの `DECLARE` で宣言した変数。
     pub(crate) decls: Vec<VarId>,
     pub(crate) stmts: Vec<Stmt>,
+    /// `EXCEPTION` 節（無ければ `None`）。あれば暗黙 savepoint まで巻き戻して捕捉する（Issue #2227）。
+    pub(crate) handlers: Option<Vec<Handler>>,
+    /// ハンドラ用の暗黙変数 `(SQLSTATE, SQLERRM)`（`handlers` があるときだけ `Some`）。
+    pub(crate) handler_vars: Option<(VarId, VarId)>,
 }
 
 /// 解析結果。
@@ -467,7 +529,12 @@ impl Body {
     pub(crate) fn may_write(&self) -> bool {
         fn any_write(stmts: &[Stmt]) -> bool {
             stmts.iter().any(|s| match s {
-                Stmt::Block(b) => any_write(&b.stmts),
+                Stmt::Block(b) => {
+                    any_write(&b.stmts)
+                        || b.handlers
+                            .as_ref()
+                            .is_some_and(|hs| hs.iter().any(|h| any_write(&h.stmts)))
+                }
                 Stmt::If { branches, else_ } => {
                     branches.iter().any(|(_, st)| any_write(st))
                         || else_.as_deref().is_some_and(any_write)
@@ -488,6 +555,7 @@ impl Body {
                 | Stmt::Return(_)
                 | Stmt::ReturnNext(_)
                 | Stmt::GetDiagnostics { .. }
+                | Stmt::Raise(_)
                 | Stmt::Null => false,
             })
         }

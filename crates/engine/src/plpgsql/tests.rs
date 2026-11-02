@@ -422,7 +422,6 @@ fn case_expression_inside_condition_does_not_cut_at_inner_then() {
 #[test]
 fn rejects_out_of_scope_with_0a000() {
     let srcs = [
-        "BEGIN RAISE NOTICE 'x'; END",
         "BEGIN ASSERT true; END",
         "BEGIN OPEN c; END",
         "BEGIN FETCH c INTO a; END",
@@ -440,7 +439,7 @@ fn rejects_out_of_scope_with_0a000() {
         "BEGIN CALL f(); END",
         "BEGIN COPY t FROM stdin; END",
         "BEGIN EXPLAIN SELECT 1; END",
-        "BEGIN NULL; EXCEPTION WHEN others THEN NULL; END",
+        "BEGIN RAISE EXCEPTION 'x' USING COLUMN = 'c'; END",
         "DECLARE c CURSOR FOR SELECT 1; BEGIN NULL; END",
         "DECLARE c NO SCROLL CURSOR FOR SELECT 1; BEGIN NULL; END",
         "DECLARE c refcursor; BEGIN NULL; END",
@@ -1712,4 +1711,104 @@ fn dollar_tag_longer_than_limit_is_rejected() {
     let tag = "a".repeat(63);
     let src = format!("BEGIN EXECUTE ${tag}$select 1${tag}$; END");
     let _ = ok(&src);
+}
+
+// ---- RAISE と EXCEPTION（Issue #2227・SQL-70） ----
+
+#[test]
+fn raise_forms_are_accepted() {
+    for src in [
+        "BEGIN RAISE NOTICE 'x'; END",
+        "BEGIN RAISE NOTICE 'a % b %%', a; END",
+        "BEGIN RAISE EXCEPTION 'x'; END",
+        "BEGIN RAISE 'x'; END",
+        "BEGIN RAISE WARNING 'x' USING DETAIL = 'd', HINT = 'h'; END",
+        "BEGIN RAISE EXCEPTION USING MESSAGE = 'm', ERRCODE = 'P0100'; END",
+        "BEGIN RAISE EXCEPTION USING ERRCODE = 'unique_violation'; END",
+        "BEGIN RAISE unique_violation; END",
+        "BEGIN RAISE EXCEPTION SQLSTATE '23505' USING MESSAGE = 'x'; END",
+        "BEGIN RAISE DEBUG 'x'; RAISE LOG 'x'; RAISE INFO 'x'; END",
+        "BEGIN BEGIN NULL; EXCEPTION WHEN others THEN RAISE; END; END",
+        "BEGIN BEGIN NULL; EXCEPTION WHEN unique_violation OR SQLSTATE '22012' THEN NULL; END; END",
+    ] {
+        ok(src);
+    }
+}
+
+#[test]
+fn raise_definition_time_errors() {
+    for (src, c) in [
+        ("BEGIN RAISE NOTICE 'a %'; END", "42601"),
+        ("BEGIN RAISE NOTICE 'a', 1; END", "42601"),
+        (
+            "BEGIN RAISE EXCEPTION USING ERRCODE = 'VD001'; END",
+            "42601",
+        ),
+        ("BEGIN RAISE EXCEPTION SQLSTATE 'abc'; END", "42601"),
+        (
+            "BEGIN RAISE EXCEPTION 'x' USING MESSAGE = 'y'; END",
+            "42601",
+        ),
+        (
+            "BEGIN RAISE EXCEPTION USING DETAIL = 'a', DETAIL = 'b'; END",
+            "42601",
+        ),
+        ("BEGIN RAISE EXCEPTION USING BOGUS = 'a'; END", "42601"),
+        ("BEGIN RAISE nosuch_cond; END", "42704"),
+        ("BEGIN RAISE; END", "42601"),
+        (
+            "BEGIN NULL; EXCEPTION WHEN nosuch_cond THEN NULL; END",
+            "42704",
+        ),
+        ("BEGIN NULL; EXCEPTION END", "42601"),
+        ("BEGIN RAISE EXCEPTION 'x' USING TABLE = 't'; END", "0A000"),
+    ] {
+        assert_eq!(code(src), c, "for {src:?}");
+    }
+}
+
+#[test]
+fn exception_clause_structure_and_variables() {
+    let b = ok(
+        "BEGIN BEGIN NULL; EXCEPTION WHEN division_by_zero THEN NULL; WHEN OTHERS THEN NULL; END; END",
+    );
+    let Some(super::ast::Stmt::Block(inner)) = b.block.stmts.first() else {
+        panic!("inner block");
+    };
+    assert_eq!(inner.handlers.as_ref().map(Vec::len), Some(2));
+    assert!(inner.handler_vars.is_some());
+    // SQLSTATE／SQLERRM はハンドラの中だけで見える。
+    ok("BEGIN BEGIN NULL; EXCEPTION WHEN OTHERS THEN RAISE NOTICE '% %', sqlstate, sqlerrm; END; END");
+    assert!(parse_body(
+        "BEGIN BEGIN NULL; EXCEPTION WHEN OTHERS THEN NULL; END; RAISE NOTICE '%', sqlstate; END",
+        &opts()
+    )
+    .is_ok_and(|b| {
+        // 本体側の `sqlstate` は変数ではない（解決は埋め込み式の分類で行うため構文解析は通る）。
+        b.vars.iter().filter(|v| v.name == "sqlstate").count() == 1
+    }));
+}
+
+#[test]
+fn raise_line_numbers_start_at_one() {
+    let b = ok("BEGIN\n  NULL;\n  RAISE EXCEPTION 'x';\nEND");
+    let line = b.block.stmts.iter().find_map(|s| match s {
+        super::ast::Stmt::Raise(r) => Some(r.line),
+        _ => None,
+    });
+    assert_eq!(line, Some(3));
+}
+
+#[test]
+fn exception_nesting_respects_the_depth_limit() {
+    let mut src = String::new();
+    for _ in 0..40 {
+        src.push_str("BEGIN ");
+    }
+    src.push_str("NULL;");
+    for _ in 0..40 {
+        src.push_str(" EXCEPTION WHEN OTHERS THEN NULL; END;");
+    }
+    src.truncate(src.len() - 1);
+    assert_eq!(code(&src), "54001");
 }

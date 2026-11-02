@@ -469,6 +469,10 @@ pub fn is_rollback_statement(sql: &str) -> bool {
     !ident_is(rest.first(), "TO")
 }
 
+/// PL/pgSQL の内部 savepoint の名前（Issue #2227）。NUL を含むため、SQL 字句解析器を通る利用者の
+/// `SAVEPOINT`／`RELEASE`／`ROLLBACK TO` の名前とは決して一致しない。
+const PL_INTERNAL_SAVEPOINT_NAME: &str = "\0plpgsql-exception-block";
+
 /// 明示トランザクションが `Failed` の間に受理してよい文かを parse 前に判定する（Issue #1947・
 /// SQL-31・SQL-69 のポインタ）。真になるのは [`is_rollback_statement`] が真の `ROLLBACK`／`ABORT` と、
 /// `ROLLBACK [WORK|TRANSACTION] TO ...`（savepoint への復帰）だけ。`ABORT TO` は構文上受理しない
@@ -1474,11 +1478,21 @@ impl<'e> SessionTransaction<'e> {
         name: &str,
         session: &mut SessionState,
     ) -> Result<(), SqlSurfaceError> {
-        use crate::sql::savepoint::SavepointKind;
         let pos = active
             .savepoints
             .position(name)
             .ok_or(SqlSurfaceError::InvalidSavepointSpecification)?;
+        Self::restore_at(active, pos, session)
+    }
+
+    /// 位置 `pos` の savepoint まで巻き戻す本体（名前で引く [`Self::restore_to_savepoint`] と、位置を
+    /// 直接持つ PL/pgSQL の内部 savepoint〔[`Self::pl_rollback_to`]〕が共有する）。
+    fn restore_at(
+        active: &mut ActiveTxn<'_>,
+        pos: usize,
+        session: &mut SessionState,
+    ) -> Result<(), SqlSurfaceError> {
+        use crate::sql::savepoint::SavepointKind;
         match active.savepoints.kind_at(pos) {
             Some(SavepointKind::Restorable) => {}
             Some(SavepointKind::Unrestorable) => {
@@ -1537,6 +1551,101 @@ impl<'e> SessionTransaction<'e> {
         active.seen_operation_ids.truncate_to(op_wm);
         active.savepoints.truncate_after(pos);
         Ok(())
+    }
+
+    /// PL/pgSQL の `EXCEPTION` 節つきブロック用の内部 savepoint を積み、その位置を返す
+    /// （Issue #2227・SQL-70。`plpgsql_host::CorePlHost::block_savepoint` が呼ぶ）。
+    ///
+    /// 利用者の `SAVEPOINT` 文と違い、明示・暗黙どちらの `Active` でも受理し（暗黙 Tx の `DO` でも
+    /// 使える）、文数・持続時間に計上せず、`queried` も立てない。名前は NUL を含み利用者が書けない
+    /// 内部名のため、利用者の `RELEASE`／`ROLLBACK TO` の名前検索には決して一致しない。巻き戻し可否は
+    /// 既存の [`Self::probe_savepoint_kind`] が決める（書き込み後なら `Unrestorable`。詳細は
+    /// `docs/design/explicit-transaction.md`）。`Active` 以外は呼び出し側の不変条件違反で `XX000`。
+    pub(crate) fn pl_savepoint_push(
+        &mut self,
+        session: &SessionState,
+    ) -> Result<usize, SqlSurfaceError> {
+        let TxnState::Active(active) = &mut self.state else {
+            return Err(internal_error());
+        };
+        let kind = match Self::probe_savepoint_kind(active) {
+            Ok(k) => k,
+            Err(e) => {
+                self.fail_unrecoverable();
+                return Err(e);
+            }
+        };
+        let TxnState::Active(active) = &mut self.state else {
+            return Err(internal_error());
+        };
+        let wm = active.cursors.next_id();
+        let marks = (kind == crate::sql::savepoint::SavepointKind::Restorable).then(|| {
+            crate::sql::savepoint::WriteMarks {
+                has_writes: active.has_writes,
+                written_tables: active.written_tables.clone(),
+                written_by_tenant: active.written_by_tenant.clone(),
+            }
+        });
+        let op_wm = active.seen_operation_ids.len();
+        active
+            .savepoints
+            .push(PL_INTERNAL_SAVEPOINT_NAME, kind, session, wm, op_wm, marks);
+        active.savepoints.top_position().ok_or_else(internal_error)
+    }
+
+    /// [`Self::pl_savepoint_push`] が返した位置まで巻き戻す（位置自身は残す。除去は
+    /// [`Self::pl_release`]）。巻き戻せない（`Unrestorable`・一時表を使用中）場合は固定文言の
+    /// `0A000`、基底欠落等は `XX000` で、いずれも [`Self::fail_for`] で Tx を失敗状態へ倒す
+    /// （取り消したつもりの書き込みが `COMMIT` で確定する fail-open を作らない）。
+    ///
+    /// 不変条件: `restore_savepoint` は開いているテーブルのハンドルがあると panic する。
+    /// 「ハンドルが開いている」ならその writer は dirty で、その時点以降に積んだ savepoint は
+    /// `Unrestorable` になり、本関数は復元を試みる前に `0A000` で返す。つまり `Restorable` の復元は
+    /// 構造上ハンドルを持たない文の境界でだけ起きる。
+    pub(crate) fn pl_rollback_to(
+        &mut self,
+        pos: usize,
+        session: &mut SessionState,
+    ) -> Result<(), SqlSurfaceError> {
+        let result = match &mut self.state {
+            TxnState::Active(active) => {
+                if active.savepoints.kind_at(pos)
+                    == Some(crate::sql::savepoint::SavepointKind::Unrestorable)
+                {
+                    Err(SqlSurfaceError::feature_not_supported(
+                        "an EXCEPTION block cannot catch errors after the transaction has \
+                         written data",
+                    ))
+                } else if active.temp.is_some() {
+                    Err(SqlSurfaceError::feature_not_supported(
+                        "an EXCEPTION block cannot catch errors in a transaction that used \
+                         temporary tables",
+                    ))
+                } else {
+                    Self::restore_at(active, pos, session)
+                }
+            }
+            _ => Err(internal_error()),
+        };
+        if let Err(e) = &result {
+            self.fail_for(e);
+        }
+        result
+    }
+
+    /// [`Self::pl_savepoint_push`] の savepoint（と、それより新しい内部 savepoint）を取り除く。
+    /// 失敗状態へ倒れた後（`FailedRecoverable`）でも内部エントリを残さない（利用者の
+    /// `ROLLBACK TO` から見えるスタックを汚さない）。`Restorable` が 1 つも残らなければ基底
+    /// savepoint を解放する。`Idle`・`Failed`（`ActiveTxn` が既に無い）では何もしない。
+    pub(crate) fn pl_release(&mut self, pos: usize) {
+        let active = match &mut self.state {
+            TxnState::Active(a) | TxnState::FailedRecoverable(a) => a,
+            _ => return,
+        };
+        active.savepoints.truncate_from(pos);
+        if !active.savepoints.has_restorable() {
+            active.savepoint_base = None;
+        }
     }
 
     /// savepoint 文の共通の状態検査。明示 Tx の `Active` なら `Ok`。
@@ -2079,7 +2188,7 @@ impl<'e> SessionTransaction<'e> {
     }
 
     /// 復帰させてはならない失敗（内部エラー・直列化失敗）か。
-    fn is_unrecoverable_error(e: &SqlSurfaceError) -> bool {
+    pub(crate) fn is_unrecoverable_error(e: &SqlSurfaceError) -> bool {
         matches!(
             e,
             SqlSurfaceError::Internal { .. } | SqlSurfaceError::SerializationFailure
