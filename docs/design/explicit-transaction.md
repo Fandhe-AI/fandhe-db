@@ -644,7 +644,7 @@ Issue #1931（`READ ONLY`）、挙動テストは #1940、`40001` は #2396 が�
 
 行ロック句（`SELECT ... FOR UPDATE／NO KEY UPDATE／SHARE／KEY SHARE [OF ...] [NOWAIT|SKIP LOCKED]`）と
 `LOCK TABLE` の受理・結果の契約は spec 側が定義する。本節は実装側の写像と担当の分担だけを記録し、
-各形の SQLSTATE・`SKIP LOCKED` の結果・トランザクション外の扱い・併用可否は本書へ記述しない。
+各形の SQLSTATE・トランザクション外の扱い・併用可否は本書へ記述しない。
 ポインタは `docs/spec/04-behavior/sql-surface.md` SQL-38（(3)(4)(5)(7)）・SQL-31、
 `docs/spec/04-behavior/data-model.md` TABLE-3、`docs/spec/04-behavior/persistence.md` PERSIST-4、
 関連は RLS-12・RLS-7。行ロック句の取得は #2230、`LOCK TABLE` は #1958 で実装済み（#1955 の現状欄は着手前の記録）。
@@ -658,9 +658,12 @@ Issue #1931（`READ ONLY`）、挙動テストは #1940、`40001` は #2396 が�
   （`StorageError::WriteLockTimeout` から `55P03` への写像）に従う。
   `NOWAIT` は「即時取得を試みる経路」で実現する。#2230 では `LOCK TABLE ... NOWAIT`（#1958）と同じ
   `Storage::begin_explicit_write_txn_nowait` を流用し、新しい API は作らない。
-- **複数句の合成（#2230）**: 強度・`OF` の対象は writer の取得に影響しない。待機方針は
-  `SKIP LOCKED` を含む形を `0A000`（#2231 まで。writer に触れる前に返す）、含まず `NOWAIT` を含む形を nowait、
-  それ以外を待機とする（`RowLocking::writer_wait`）。
+- **複数句の合成（#2230・#2231）**: 強度・`OF` の対象は writer の取得に影響しない。待機方針は
+  `RowLocking::writer_wait` が `WriterWait` を返す（合成規則は spec 側の SQL-38 を参照）。
+- **`SKIP LOCKED` の実装（#2231）**: 実装箇所は `crates/engine/src/core/row_lock_exec.rs`、
+  writer の取得を試みる API は `try_ensure_writer`・`try_begin_implicit`（`sql/transaction.rs`）。
+  契約の詳細は spec 側（SQL-38 (4)(5)・RLS-12・RLS-13）を参照し、本書へは記述しない。
+
 - **保持期間（#2230）**: 明示 Tx は `ensure_writer_with` で取得して COMMIT／ROLLBACK まで保持し、dirty にはしない。
   autocommit は文単位の暗黙 Tx（`begin_implicit_with(.., nowait)`）で取得し、文の終わりに解放する
   （書き込みなしとして drop）。取得後の読み取りは句のない SELECT と同じ経路を通る。
@@ -670,7 +673,7 @@ Issue #1931（`READ ONLY`）、挙動テストは #1940、`40001` は #2396 が�
 | -- | ------------- | ---- | ---- |
 | 行ロック句 4 種・`OF`・`NOWAIT`・`SKIP LOCKED` の構文 | SQL-38 (7) | #1957 | 構文解釈済み（`ParsedSql::LockingSelect`） |
 | 行ロック句によるロック取得・`NOWAIT` | SQL-38 (4) | #2230 | 実装済み（#2230。writer の取得として扱う） |
-| `SKIP LOCKED` の実行 | SQL-38 (4) | #2231 | 未実装（`0A000`） |
+| `SKIP LOCKED` の実行 | SQL-38 (4)(5) | #2231 | 実装済み（#2231。実装箇所は上記） |
 | `LOCK [TABLE]` の 8 モードの構文・取得・表名の解決 | SQL-38 (4)(7) | #1958 | 実装済み（#1958） |
 | READ ONLY トランザクション内での扱い | SQL-38 (3) | #1934 | 実装済み（#1934。書き込み系の文は `25006`） |
 | writer 取得時の直列化判定 | SQL-38 (2)・SQL-31 | #2396 系 | 1a 節の記録のとおり |
@@ -678,7 +681,7 @@ Issue #1931（`READ ONLY`）、挙動テストは #1940、`40001` は #2396 が�
 - **READ ONLY トランザクション内**: ロック句つき SELECT・`LOCK TABLE` は `25006` で拒否する
   （Issue #1934。「READ ONLY での書き込み拒否」節）。8 モードすべてを拒否する。
 - **要確認（担当 Issue が確定する。本節では決めない）**:
-  - `SKIP LOCKED` の結果規則（単一ライタの下でどの行を飛ばすか）→ #2231（SQL-38 (4)）
+  - `SKIP LOCKED` の結果規則 → #2231 で実装済み（実装箇所のみ上記に記録）
   - トランザクション外の `LOCK TABLE` のエラー契約 → #1958（#1958 本文でも要確認）
   - autocommit の文に付いたロック句が writer を保持する期間 → #2230
 - **テナント境界（fail-closed）**: ロック句の結果と `LOCK TABLE` の表名解決を、他テナントの行・表の

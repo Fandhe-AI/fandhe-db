@@ -11,7 +11,7 @@
 //!   `TRIGGER`・`MAINTAIN` と `ALL [PRIVILEGES]`、列リスト `<権限> (列, ...)`。
 //! - ロール形: `GRANT <ロール>[, ...] TO <付与先>[, ...] [WITH {ADMIN|INHERIT|SET} {OPTION|TRUE|FALSE}[, ...]]`・
 //!   `REVOKE [{ADMIN|INHERIT|SET} OPTION FOR] <ロール>[, ...] FROM <付与先>[, ...] [CASCADE|RESTRICT]`。
-//!   構造化だけを行い、実行（メンバーシップの保存・循環拒否・継承）は #2232 の担当（実行段は `0A000`）。
+//!   構造化だけを行い、実行（メンバーシップの保存・循環拒否・継承）は #2232 で実装済み（`sql::grant_ddl`）。
 //!
 //! - SCHEMA 形（Issue #2234）: `GRANT|REVOKE {USAGE|CREATE|ALL [PRIVILEGES]}[, ...] ON SCHEMA <名>[, ...]`
 //!   と `GRANT|REVOKE <表の権限>[, ...] ON ALL TABLES IN SCHEMA <名>[, ...]`。SCHEMA 名は裸の識別子で、
@@ -134,7 +134,7 @@ pub(crate) enum RoleOption {
     Set,
 }
 
-/// ロール形の `GRANT`／`REVOKE`（実行は #2232。構造化だけを行う）。
+/// ロール形の `GRANT`／`REVOKE`（構造化だけを行う。実行は `sql::grant_ddl`、Issue #2232）。
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) struct GrantRoles {
     pub(crate) roles: Vec<String>,

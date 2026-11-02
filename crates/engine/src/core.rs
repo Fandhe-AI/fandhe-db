@@ -1766,7 +1766,7 @@ pub enum ParsedSql {
     /// 行ロック句つきの `SELECT`（`FOR UPDATE`／`FOR NO KEY UPDATE`／`FOR SHARE`／`FOR KEY SHARE`、
     /// `OF`、`NOWAIT`／`SKIP LOCKED`。SQL-38・Issue #1957）。構文解釈と併用検査（`sql::row_lock`）までを
     /// 担う。実行は Issue #2230 で writer の取得（`NOWAIT` は `55P03`）として実装済み（`core::row_lock_exec`）。
-    /// `SKIP LOCKED` の実行は #2231 まで、一時表だけを対象にした形も `0A000` で拒否する
+    /// `SKIP LOCKED` の実行は #2231（`core::row_lock_exec`）。一時表だけを対象にした形は `0A000` で拒否する
     /// （ロックを取らずに素の SELECT として実行する fail-open を作らない）。既存の [`Self::Statement`] に
     /// フィールドを足さず別 variant にしているのは、句を黙って無視する経路を作らず、網羅 `match` の
     /// 追随漏れをコンパイラに検出させるため。
@@ -3761,8 +3761,8 @@ impl EngineCore {
     }
 
     /// [`Self::begin_implicit_transaction`] の複数文版。writer を取得する前に `stmts` の行ロック句を
-    /// 構文だけで走査し、`SKIP LOCKED` なら `0A000`（writer に触れずに拒否）、いずれかが `NOWAIT` なら
-    /// writer を待たずに取得して他者保持中は即時 `55P03` にする（SQL-38・Issue #2230）。
+    /// 構文だけで走査し、行ロック句の待機方針（`RowLockingSyntax`）を暗黙 Tx の開始へ反映する
+    /// （SQL-38・Issue #2230・#2231。受理範囲と規則の詳細は spec 側を参照）。
     /// 構文誤りなど走査できない文は無視し、その文の実行時に通常のエラーとして報告させる。
     pub fn begin_implicit_transaction_for<'e>(
         &'e self,
@@ -3771,6 +3771,7 @@ impl EngineCore {
         stmts: &[&str],
     ) -> Result<(), crate::sql::allowlist::SqlSurfaceError> {
         let mut nowait = false;
+        let mut skip_locked = false;
         for stmt in stmts {
             let Ok(tokens) = crate::sql::lexer::tokenize(stmt) else {
                 continue;
@@ -3781,7 +3782,20 @@ impl EngineCore {
             let Ok((_, Some(syntax))) = crate::sql::row_lock::extract_row_locking(tokens) else {
                 continue;
             };
-            nowait |= syntax.writer_wait()?;
+            // SKIP LOCKED は合成結果（NOWAIT 優先）ではなく元の句から検出する。
+            if syntax.has_skip_locked() {
+                skip_locked = true;
+            }
+            if syntax.writer_wait() == crate::sql::row_lock::WriterWait::NoWait {
+                nowait = true;
+            }
+        }
+        if skip_locked {
+            return Err(
+                crate::sql::allowlist::SqlSurfaceError::feature_not_supported(
+                    "SKIP LOCKED is not supported in a multi-statement implicit transaction",
+                ),
+            );
         }
         txn.begin_implicit_with(&self.storage, session, nowait)
     }
@@ -5788,8 +5802,19 @@ impl EngineCore {
         // 構文誤りは `42601`、併用違反は `0A000`、`OF` の解決失敗は `42P01`。
         let tokens = Self::normalize_row_count_clauses(tokens)?;
         let (tokens, locking) = crate::sql::row_lock::extract_row_locking(tokens)?;
-        let parsed =
-            self.parse_tokens_in_impl(tokens, temp, hits, ledger_mode, resolver, read_snap)?;
+        // `SKIP LOCKED` の空結果前の RLS 判定（RLS-13）は、外側の FROM に現れないサブクエリ・CTE 内側の
+        // 表にも掛ける。名前解決（`schema.name` → 内部キー）の後のトークン列から実参照表だけを集める
+        // ため、impl 側が解決後の表名を `read_tables` へ書き出す。
+        let mut read_tables: Vec<String> = Vec::new();
+        let parsed = self.parse_tokens_in_impl(
+            tokens,
+            temp,
+            hits,
+            ledger_mode,
+            resolver,
+            read_snap,
+            locking.is_some().then_some(&mut read_tables),
+        )?;
         let Some(locking) = locking else {
             return Ok(parsed);
         };
@@ -5797,7 +5822,11 @@ impl EngineCore {
             ParsedSql::Statement(statement) => {
                 let locking = crate::sql::row_lock::check_row_locking(&statement, &locking)?;
                 Ok(ParsedSql::LockingSelect(Box::new(
-                    crate::sql::row_lock::LockingSelect { statement, locking },
+                    crate::sql::row_lock::LockingSelect {
+                        statement,
+                        locking,
+                        read_tables,
+                    },
                 )))
             }
             // 読み取り SELECT 以外（`setval`・データ変更 CTE など）に行ロック句は付けられない。
@@ -5810,6 +5839,7 @@ impl EngineCore {
     }
 
     /// [`Self::parse_tokens_in`] の本体（行ロック句を取り除いた後のトークン列を検証する）。
+    #[allow(clippy::too_many_arguments)] // 名前解決後の表名の書き出し先（行ロック句つき SELECT 用）を足したため
     fn parse_tokens_in_impl(
         &self,
         tokens: Vec<crate::sql::lexer::Token>,
@@ -5818,6 +5848,7 @@ impl EngineCore {
         ledger_mode: LedgerMode,
         resolver: Option<crate::sql::relation_name::SchemaResolver<'_>>,
         read_snap: Option<&redb::ReadTransaction>,
+        read_tables_out: Option<&mut Vec<String>>,
     ) -> Result<ParsedSql, crate::sql::allowlist::SqlSurfaceError> {
         // 各入口で正規化済みでも冪等のため、ここでも最終的な保証として適用する（Issue #1793）。
         let mut tokens = Self::normalize_row_count_clauses(tokens)?;
@@ -5830,6 +5861,9 @@ impl EngineCore {
             crate::sql::relation_name::rewrite_relation_names_full(&mut tokens, resolver)?;
         let public_names = rewrite.names;
         let create_public = rewrite.create_public;
+        if let Some(out) = read_tables_out {
+            *out = crate::sql::search_path::resolved_relation_names(&tokens);
+        }
         let storage_lookup = crate::sql::temp_catalog::SessionRelationLookup::new(
             &self.storage,
             temp,

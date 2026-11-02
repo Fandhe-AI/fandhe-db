@@ -463,7 +463,8 @@ const ALLOWLIST: &[(&str, u32)] = &[
     // Issue #1945（savepoint 巻き戻しでの書き込み記録の保存・復元）の行追加でさらに移動（旧: 1978）。書き込み内容・commit の意味は不変。
     // Issue #1944（savepoint 巻き戻しでの冪等台帳の整合）の行追加でさらに移動（旧: 1978）。書き込み内容・commit の意味は不変。
     // Issue #1947（失敗状態からの ROLLBACK TO 復帰）の行追加でさらに移動（旧: 2060）。書き込み内容・commit の意味は不変。
-    ("sql/transaction.rs", 2230),
+    // Issue #2231（`SKIP LOCKED` の取得入口 `try_ensure_writer`・`try_begin_implicit` と取得方針 `WriterAcquire` の追加）の行追加でさらに移動（旧: 2230）。書き込み内容・commit の意味は不変。
+    ("sql/transaction.rs", 2300),
     // TABLE-44・Issue #1684: 一時表ストア（セッション専用のインメモリ DB。永続 DB とは別インスタンス）の
     // 書き込みトランザクションの確定口（`TempRowStore::commit`）。確定するのは、一時コアの書き込み本体
     // （`tenant::*`・`catalog::*`。いずれも自分の DB の表世代を `bump_table_generation_in_txn` で進める）が
@@ -558,11 +559,16 @@ const ALLOWLIST: &[(&str, u32)] = &[
     // 後続の base 取り込みで role.rs の行番号が +4 行移動したための追随（対象外の理由は同じ）。
     // Issue #2233（ログイン名対応表の追随・`sync_login_names` の追加で行番号が移動。同じ理由で対象外）。
     // PR #2867 レビュー対応で role.rs の行番号が +1 行移動したための追随（同じ理由で対象外）。
-    ("catalog/role.rs", 1163),
-    ("catalog/role.rs", 1195),
-    ("catalog/role.rs", 1214),
-    ("catalog/role.rs", 1233),
-    ("catalog/role.rs", 1286),
+    // Issue #2232 の取り込み・メンバーシップ blob の版 3 追加で role.rs の行番号が +92 行移動（同じ理由で対象外）。
+    ("catalog/role.rs", 1255),
+    ("catalog/role.rs", 1287),
+    ("catalog/role.rs", 1306),
+    ("catalog/role.rs", 1325),
+    ("catalog/role.rs", 1378),
+    // Issue #2232: メンバーシップの付与・取り消し（`apply_membership_changes`）とロール作成＋付与
+    // （`create_role_with_memberships`）。メンバーシップ表だけを書き、表の計画・世代に影響しない（同じ理由）。
+    ("catalog/role/membership_apply.rs", 314),
+    ("catalog/role/membership_apply.rs", 341),
     // Issue #1961 のロール・ACL カタログの単体テスト補助（`write` ヘルパー。専用表だけを書き表世代の対象外）。
     ("catalog/role/tests.rs", 37),
     // Issue #1962 の `sql::role_ddl` の crate 内テスト補助（`commit` ヘルパー。専用表だけを書き表世代の対象外）。
@@ -574,6 +580,8 @@ const ALLOWLIST: &[(&str, u32)] = &[
     ("catalog/privilege/owner/tests.rs", 20),
     ("sql/owner_ddl/tests.rs", 75),
     ("sql/owner_ddl/tests.rs", 225),
+    // Issue #2232: 継承した所有者名義の付与の単体テスト（所有者表を直接書くテスト専用の commit。表世代の対象外）。
+    ("sql/grant_ddl/role_tests.rs", 745),
     // Issue #2235: SEQUENCE・関数単位の ACL の単体テストの `write` ヘルパ（テスト専用の commit。専用表だけを書き表世代の対象外）。
     ("catalog/privilege/sequence/tests.rs", 23),
     ("catalog/privilege/function/tests.rs", 20),

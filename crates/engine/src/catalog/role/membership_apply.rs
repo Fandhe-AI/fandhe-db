@@ -1,0 +1,545 @@
+//! ロール形 `GRANT`／`REVOKE`（メンバーシップの付与・取り消し）の適用（SQL-39 (7)・SQL-40 のポインタ、
+//! Issue #2232。設計記録: `docs/design/role-privilege-model.md` §11 の M1〜M4）。
+//!
+//! 役割: `sql::grant_ddl` が構造検証済みの文から作る [`MembershipRequest`] を、単一の write txn・1 回の commit で
+//! メンバーシップ表へ原子的に反映する。循環（`0LP01`）・ADMIN の判定（`42501`）・付与者の記録・オプションの
+//! 更新・`RESTRICT`／`CASCADE` を担う。グラフの探索は [`super::graph`] だけを呼ぶ（判定系を 2 つ作らない）。
+//!
+//! 判定順（決定的・fail-closed。すべて commit 前に返るため副作用ゼロ）: 実行ロールの現存確認 → 付与される
+//! ロールの解決（`42704`。他テナントにだけ在るロールも不在と同じ）→ 付与先の解決（同上）→ 組ごとに
+//! ADMIN の判定（`42501`）→ 循環の検査（`0LP01`）→ 書き込み。PostgreSQL の `AddRoleMems` と同じく権限の判定が
+//! 循環の検査より先で、権限の無い主体にグラフの形を示さない。
+//!
+//! 所有者相当: DDL 権限ゲートを通過した主体（`owner_equivalent`）は、所有者の機構（#2236）までの代替として
+//! 常に許可し、付与者を問わず取り消せる（PostgreSQL のスーパーユーザーの代替。ADR に逸脱として記録）。
+//! 付与者ごとに別の行を持つ PostgreSQL 16 以降の形はキーの制約上再現できないため、別の付与者が付けた行への
+//! 重複の付与は `Unsupported`（`0A000`）で拒否する。
+
+use std::collections::HashSet;
+
+use crate::catalog::{CatalogError, Storage};
+
+use super::graph::{
+    best_admin_grantor, effective_roles_in_txn, is_admin_of, would_create_cycle, Mode,
+};
+use super::{
+    get_membership, get_role_by_id_in_txn, get_role_in_txn, list_memberships_granted_by_in_txn,
+    put_membership_in_txn, remove_membership_in_txn, validate_tenant, MembershipOptions, RoleDef,
+};
+
+/// 連鎖（CASCADE）で処理する行数の上限（実装既定値。超過は `LimitExceeded`）。
+const MAX_CASCADE_STEPS: usize = 10_000;
+
+/// ロール形のオプション名。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum MembershipOpt {
+    Admin,
+    Inherit,
+    Set,
+}
+
+/// 付与先（メンバー）の指定。解決は書き込みと同じ txn の中で行う。
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) enum MemberSpec {
+    /// `PUBLIC`（PostgreSQL と同じく `role "public" does not exist` 相当で拒否する）。
+    Public,
+    /// 解決済みのロール ID（`CURRENT_USER`・`SESSION_USER`。現存は txn 内で確かめる）。
+    Id(u64),
+    /// ロール名（自テナント内だけを引く）。
+    Name(String),
+}
+
+/// [`Storage::apply_membership_changes`] への要求。
+#[derive(Debug, Clone)]
+pub(crate) struct MembershipRequest<'a> {
+    pub(crate) is_grant: bool,
+    /// 実行ロール（現在ロール）の ID。0 は不可。
+    pub(crate) actor_id: u64,
+    /// 所有者相当（DDL 権限ゲート通過済み）か。
+    pub(crate) owner_equivalent: bool,
+    pub(crate) roles: &'a [String],
+    pub(crate) members: &'a [MemberSpec],
+    /// `GRANT` の `WITH ...` で明示したオプション。
+    pub(crate) with_options: &'a [(MembershipOpt, bool)],
+    /// `REVOKE` の `<オプション> OPTION FOR`。
+    pub(crate) option_for: Option<MembershipOpt>,
+    pub(crate) cascade: bool,
+}
+
+/// 成功結果。
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub(crate) struct MembershipOutcome {
+    /// 書き込んだ（追加・更新・削除した）行数。
+    pub(crate) rows_changed: usize,
+}
+
+/// 失敗の分類。`sql::grant_ddl` が SQLSTATE へ写す。文言に他テナントの情報・内部キーを含めない。
+#[derive(Debug)]
+pub(crate) enum MembershipChangeError {
+    Catalog(CatalogError),
+    /// ロールが自テナントに無い（他テナントにだけ在る場合を含む）。利用者が書いた名前。
+    RoleNotFound(String),
+    /// 実行ロールが未束縛・不在、または ADMIN が無い（`42501`）。
+    PermissionDenied,
+    /// RESTRICT で依存する付与が残る（`2BP01`）。
+    DependentGrants,
+    /// 循環（`0LP01`）。`(付与されるロール名, 付与先名)`。
+    Circular(String, String),
+    /// 未対応の形（`0A000`）。固定文言。
+    Unsupported(&'static str),
+    /// 連鎖数の上限超過（`54000`）。
+    LimitExceeded,
+}
+
+impl From<CatalogError> for MembershipChangeError {
+    fn from(e: CatalogError) -> Self {
+        Self::Catalog(e)
+    }
+}
+
+type Result<T> = std::result::Result<T, MembershipChangeError>;
+
+/// ADMIN の判定。許可なら記録・照合に使う付与者（所有者相当は実行ロール自身）を返す。
+fn authorize(
+    w: &redb::WriteTransaction,
+    tenant: &str,
+    req: &MembershipRequest<'_>,
+    role_id: u64,
+) -> Result<u64> {
+    if req.owner_equivalent {
+        return Ok(req.actor_id);
+    }
+    best_admin_grantor(w, tenant, req.actor_id, role_id)?
+        .ok_or(MembershipChangeError::PermissionDenied)
+}
+
+fn pick(opts: &[(MembershipOpt, bool)], which: MembershipOpt) -> Option<bool> {
+    opts.iter().find(|(o, _)| *o == which).map(|(_, v)| *v)
+}
+
+struct Resolved {
+    id: u64,
+    def: RoleDef,
+}
+
+fn resolve_member(w: &redb::WriteTransaction, tenant: &str, spec: &MemberSpec) -> Result<Resolved> {
+    match spec {
+        MemberSpec::Public => Err(MembershipChangeError::RoleNotFound("public".to_string())),
+        MemberSpec::Id(id) => get_role_by_id_in_txn(w, tenant, *id)?
+            .map(|def| Resolved { id: *id, def })
+            .ok_or(MembershipChangeError::PermissionDenied),
+        MemberSpec::Name(n) => get_role_in_txn(w, tenant, n)?
+            .map(|def| Resolved { id: def.id, def })
+            .ok_or_else(|| MembershipChangeError::RoleNotFound(n.clone())),
+    }
+}
+
+/// `y` が `r` へ「循環に依存しない」ADMIN を持つか。継承閉包の ADMIN 行ごとに付与者をたどり、付与者が
+/// 訪問中（= 取消し対象の ADMIN に依存して循環する）なら根拠にせず、付与者が ADMIN 経路を持たない
+/// （所有者相当）か、付与者自身が独立した ADMIN を持つ行だけを根拠とする。fail-closed（疑わしきは偽）。
+fn has_independent_admin(
+    w: &redb::WriteTransaction,
+    tenant: &str,
+    y: u64,
+    r: u64,
+    lost: &HashSet<u64>,
+    visiting: &mut Vec<u64>,
+    steps: &mut usize,
+) -> Result<bool> {
+    if y == r || visiting.contains(&y) {
+        return Ok(false);
+    }
+    *steps += 1;
+    if *steps > MAX_CASCADE_STEPS {
+        return Err(MembershipChangeError::LimitExceeded);
+    }
+    visiting.push(y);
+    let mut found = false;
+    for (node, _) in effective_roles_in_txn(w, tenant, y, Mode::Inherit)? {
+        if node == r {
+            continue;
+        }
+        let Some(o) = get_membership(w, tenant, node, r)? else {
+            continue;
+        };
+        if !o.admin {
+            continue;
+        }
+        found = match o.grantor_id {
+            None => true,
+            // 所有者相当の権限を根拠に付けた行は、付与者の現在の ADMIN の有無を問わず独立した根拠（根）。
+            // 付与者が後から継承で ADMIN を得ても、その経路を辿って循環扱いにしない。
+            Some(_) if o.grantor_root => true,
+            Some(g) if visiting.contains(&g) => false,
+            // 付与者が今回の連鎖で ADMIN の行を失った（lost）なら、ADMIN の不在を所有者相当の根拠にしない。
+            // 別経路で ADMIN を保つ場合だけ、その経路が独立かを再帰で確かめる（fail-closed）。
+            Some(g) if lost.contains(&g) => {
+                is_admin_of(w, tenant, g, r)?
+                    && has_independent_admin(w, tenant, g, r, lost, visiting, steps)?
+            }
+            Some(g) => {
+                !is_admin_of(w, tenant, g, r)?
+                    || has_independent_admin(w, tenant, g, r, lost, visiting, steps)?
+            }
+        };
+        if found {
+            break;
+        }
+    }
+    visiting.pop();
+    Ok(found)
+}
+
+/// `role` への ADMIN の行を失った主体の集合 `seeds` について、その主体が付けた付与のうち ADMIN の根拠を
+/// 失ったものを解決する（RESTRICT は `2BP01`、CASCADE は連鎖して削除）。別の経路で ADMIN を保てる主体の付与は
+/// 残す。1 文が複数のメンバーの ADMIN を同時に落とす場合も、文全体の直接変更を反映した後に集合ごと 1 回で
+/// 評価するため、メンバーの並び順で結果が変わらない（Codex 指摘の順序依存の解消）。
+fn resolve_dependents(
+    w: &redb::WriteTransaction,
+    tenant: &str,
+    seeds: &[u64],
+    role: u64,
+    cascade: bool,
+    steps: &mut usize,
+    changed: &mut usize,
+) -> Result<()> {
+    // ADMIN の行を失った主体。削除の確定のたびに増やし、評価順に依存しないよう固定点まで反復する。
+    let mut lost: HashSet<u64> = seeds.iter().copied().collect();
+    loop {
+        let mut deleted = false;
+        let mut queue: Vec<u64> = lost.iter().copied().collect();
+        queue.sort_unstable();
+        while let Some(x) = queue.pop() {
+            *steps += 1;
+            if *steps > MAX_CASCADE_STEPS {
+                return Err(MembershipChangeError::LimitExceeded);
+            }
+            if has_independent_admin(w, tenant, x, role, &lost, &mut Vec::new(), steps)? {
+                continue;
+            }
+            for (m2, g2, o2) in list_memberships_granted_by_in_txn(w, tenant, x)? {
+                if g2 != role {
+                    continue;
+                }
+                // 所有者相当の権限を根拠とした付与は付与者の ADMIN に依存しないため、RESTRICT の拒否にも
+                // CASCADE の削除にも含めない（`has_independent_admin` が根として扱うのと同じ規則）。
+                if o2.grantor_root {
+                    continue;
+                }
+                if !cascade {
+                    return Err(MembershipChangeError::DependentGrants);
+                }
+                remove_membership_in_txn(w, tenant, m2, g2)?;
+                *changed += 1;
+                deleted = true;
+                if o2.admin {
+                    lost.insert(m2);
+                    queue.push(m2);
+                }
+            }
+        }
+        if !deleted {
+            break;
+        }
+    }
+    Ok(())
+}
+
+/// `CREATE ROLE ... IN ROLE / ROLE / ADMIN` の句（名前の列。空なら句なし）。
+#[derive(Debug, Clone, Copy)]
+pub(crate) struct NewRoleMemberships<'a> {
+    pub(crate) actor_id: u64,
+    pub(crate) owner_equivalent: bool,
+    /// 新しいロールをメンバーにするロール（`IN ROLE`）。
+    pub(crate) in_roles: &'a [String],
+    /// 新しいロールへメンバーとして加えるロール（`ROLE`）。
+    pub(crate) member_roles: &'a [String],
+    /// 新しいロールへ ADMIN 付きで加えるロール（`ADMIN`）。
+    pub(crate) admin_roles: &'a [String],
+}
+
+impl Storage {
+    /// ロールの作成と `IN ROLE`・`ROLE`・`ADMIN` の付与を、単一 write txn・1 回の commit で行う（Issue #2232）。
+    /// どれか 1 つでも失敗したらロールの作成ごと commit しない。作成の失敗は `Catalog`（呼び出し側が
+    /// `42710` などへ写す）、付与の失敗は [`MembershipChangeError`] の各分類で返る。
+    pub(crate) fn create_role_with_memberships(
+        &self,
+        tenant: &str,
+        def: &RoleDef,
+        m: &NewRoleMemberships<'_>,
+    ) -> Result<u64> {
+        validate_tenant(tenant)?;
+        let write_txn = self
+            .begin_write_txn()
+            .map_err(crate::catalog::convert_storage_error)?;
+        let w: &redb::WriteTransaction = &write_txn;
+        let id = super::create_role_in_txn(w, tenant, def)?;
+        let me = [MemberSpec::Name(def.name.clone())];
+        let me_role = [def.name.clone()];
+        let base = MembershipRequest {
+            is_grant: true,
+            actor_id: m.actor_id,
+            owner_equivalent: m.owner_equivalent,
+            roles: &[],
+            members: &[],
+            with_options: &[],
+            option_for: None,
+            cascade: false,
+        };
+        // IN ROLE: 新しいロールを各ロールのメンバーにする。
+        if !m.in_roles.is_empty() {
+            let req = MembershipRequest {
+                roles: m.in_roles,
+                members: &me,
+                ..base.clone()
+            };
+            apply_in_txn(w, tenant, &req)?;
+        }
+        // ROLE／ADMIN: 各ロールを新しいロールのメンバーにする（ADMIN は ADMIN 付き）。
+        let admin_on = [(MembershipOpt::Admin, true)];
+        for (names, with_options) in [(m.member_roles, &[][..]), (m.admin_roles, &admin_on[..])] {
+            if names.is_empty() {
+                continue;
+            }
+            let members: Vec<MemberSpec> =
+                names.iter().map(|n| MemberSpec::Name(n.clone())).collect();
+            let req = MembershipRequest {
+                roles: &me_role,
+                members: &members,
+                with_options,
+                ..base.clone()
+            };
+            apply_in_txn(w, tenant, &req)?;
+        }
+        crate::recovery::commit_boundary::commit(write_txn)
+            .map_err(crate::catalog::convert_storage_error)?;
+        Ok(id)
+    }
+
+    /// `tenant` のメンバーシップへロール形の `GRANT`／`REVOKE` を単一 write txn・1 回の commit で反映する。
+    ///
+    /// 呼び出し元は `sql::grant_ddl::execute_grant_revoke`（現在ロールの束縛・明示 Tx のゲートの後）と、
+    /// `CREATE ROLE ... IN ROLE`（`sql::role_ddl`）。エラーはすべて commit 前に返る。変更が 0 件ならそのまま
+    /// 破棄する。relation の世代は進めない（メンバーシップは表の計画に影響しない。#1961 と同じ）。
+    pub(crate) fn apply_membership_changes(
+        &self,
+        tenant: &str,
+        req: &MembershipRequest<'_>,
+    ) -> Result<MembershipOutcome> {
+        validate_tenant(tenant)?;
+        if req.actor_id == 0 {
+            return Err(MembershipChangeError::PermissionDenied);
+        }
+        let write_txn = self
+            .begin_write_txn()
+            .map_err(crate::catalog::convert_storage_error)?;
+        let w: &redb::WriteTransaction = &write_txn;
+        let rows = apply_in_txn(w, tenant, req)?;
+        if rows == 0 {
+            return Ok(MembershipOutcome::default());
+        }
+        crate::recovery::commit_boundary::commit(write_txn)
+            .map_err(crate::catalog::convert_storage_error)?;
+        Ok(MembershipOutcome { rows_changed: rows })
+    }
+}
+
+/// 呼び出し側が持つ write txn の中で要求を適用する（`CREATE ROLE ... IN ROLE` が作成と同じ txn で呼ぶ）。
+/// 変更した行数を返す。
+pub(crate) fn apply_in_txn(
+    w: &redb::WriteTransaction,
+    tenant: &str,
+    req: &MembershipRequest<'_>,
+) -> Result<usize> {
+    if req.actor_id == 0 || get_role_by_id_in_txn(w, tenant, req.actor_id)?.is_none() {
+        return Err(MembershipChangeError::PermissionDenied);
+    }
+    let mut roles: Vec<Resolved> = Vec::new();
+    let mut seen_roles: HashSet<u64> = HashSet::new();
+    for n in req.roles {
+        let def = get_role_in_txn(w, tenant, n)?
+            .ok_or_else(|| MembershipChangeError::RoleNotFound(n.clone()))?;
+        if seen_roles.insert(def.id) {
+            roles.push(Resolved { id: def.id, def });
+        }
+    }
+    let mut members: Vec<Resolved> = Vec::new();
+    let mut seen_members: HashSet<u64> = HashSet::new();
+    for m in req.members {
+        let r = resolve_member(w, tenant, m)?;
+        if seen_members.insert(r.id) {
+            members.push(r);
+        }
+    }
+    let mut changed = 0usize;
+    let mut steps = 0usize;
+    for role in &roles {
+        // PostgreSQL と同じく、ADMIN の判定はロール単位で最初に行う。
+        let grantor = authorize(w, tenant, req, role.id)?;
+        // この文で `role` への ADMIN を失う主体。直接の変更をすべて反映した後にまとめて依存を評価する。
+        let mut lost_admins: Vec<u64> = Vec::new();
+        for member in &members {
+            if req.is_grant {
+                if would_create_cycle(w, tenant, member.id, role.id)? {
+                    return Err(MembershipChangeError::Circular(
+                        role.def.name.clone(),
+                        member.def.name.clone(),
+                    ));
+                }
+                let (n, lost) = grant_one(w, tenant, req, role, member, grantor)?;
+                changed += n;
+                if lost {
+                    lost_admins.push(member.id);
+                }
+            } else {
+                let (n, lost) = revoke_one(w, tenant, req, role, member, grantor)?;
+                changed += n;
+                if lost {
+                    lost_admins.push(member.id);
+                }
+            }
+        }
+        if !lost_admins.is_empty() {
+            // GRANT 側（ADMIN を真から偽へ更新）は常に RESTRICT 契約、REVOKE 側は文の CASCADE に従う。
+            let cascade = !req.is_grant && req.cascade;
+            resolve_dependents(
+                w,
+                tenant,
+                &lost_admins,
+                role.id,
+                cascade,
+                &mut steps,
+                &mut changed,
+            )?;
+        }
+    }
+    Ok(changed)
+}
+
+fn grant_one(
+    w: &redb::WriteTransaction,
+    tenant: &str,
+    req: &MembershipRequest<'_>,
+    role: &Resolved,
+    member: &Resolved,
+    grantor: u64,
+) -> Result<(usize, bool)> {
+    match get_membership(w, tenant, member.id, role.id)? {
+        None => {
+            // 既定値: ADMIN は偽、INHERIT は付与時点の付与先ロールの属性、SET は真。
+            let opts = MembershipOptions {
+                admin: pick(req.with_options, MembershipOpt::Admin).unwrap_or(false),
+                inherit: pick(req.with_options, MembershipOpt::Inherit)
+                    .unwrap_or(member.def.attributes.inherit),
+                set: pick(req.with_options, MembershipOpt::Set).unwrap_or(true),
+                grantor_id: Some(grantor),
+                grantor_root: req.owner_equivalent,
+            };
+            put_membership_in_txn(w, tenant, member.id, role.id, opts)?;
+            Ok((1, false))
+        }
+        Some(existing) => {
+            // 1 行 = 1 つの付与根拠。実行者の根拠（所有者相当の root、または ADMIN による付与者 `grantor`）が
+            // 行の根拠と同じなら通常の更新。root が非 root の行へ付与するときは、更新後の行が今回の付与で
+            // 裏付けられる場合だけ root へ付け替える。非 root が別根拠の行へオプションを足す・変える場合は、
+            // 単一行で 2 つの根拠を表せないため副作用なく拒否する（言い直しは no-op）。
+            let same_basis = if req.owner_equivalent {
+                existing.grantor_root
+            } else {
+                !existing.grantor_root && existing.grantor_id == Some(grantor)
+            };
+            // 明示したオプションだけを更新する。明示が無ければ何も変えない（PostgreSQL は警告のみ）。
+            let mut updated = existing;
+            if let Some(v) = pick(req.with_options, MembershipOpt::Admin) {
+                updated.admin = v;
+            }
+            if let Some(v) = pick(req.with_options, MembershipOpt::Inherit) {
+                updated.inherit = v;
+            }
+            if let Some(v) = pick(req.with_options, MembershipOpt::Set) {
+                updated.set = v;
+            }
+            if !same_basis {
+                if req.owner_equivalent {
+                    // 所有者相当の今回の付与（明示 + 既定値）が更新後の行を裏付ける場合だけ root へ付け替える
+                    // （オプションが変わらない言い直しも付け替える）。旧付与者だけが与えたオプションが残る
+                    // 場合は root にすると過剰保持になるため、変更を伴うなら拒否し、言い直しなら何もしない。
+                    let owner_admin = pick(req.with_options, MembershipOpt::Admin).unwrap_or(false);
+                    let owner_inherit = pick(req.with_options, MembershipOpt::Inherit)
+                        .unwrap_or(member.def.attributes.inherit);
+                    let owner_set = pick(req.with_options, MembershipOpt::Set).unwrap_or(true);
+                    let covered = (!updated.admin || owner_admin)
+                        && (!updated.inherit || owner_inherit)
+                        && (!updated.set || owner_set);
+                    if !covered {
+                        if updated == existing {
+                            return Ok((0, false));
+                        }
+                        return Err(MembershipChangeError::Unsupported(
+                            "membership options granted by another grantor cannot be combined",
+                        ));
+                    }
+                    updated.grantor_id = Some(grantor);
+                    updated.grantor_root = true;
+                } else if updated == existing {
+                    return Ok((0, false));
+                } else {
+                    return Err(MembershipChangeError::Unsupported(
+                        "membership already granted by another grantor is not supported",
+                    ));
+                }
+            } else if updated == existing {
+                return Ok((0, false));
+            }
+            put_membership_in_txn(w, tenant, member.id, role.id, updated)?;
+            // ADMIN が真から偽へ落ちる更新は `REVOKE ADMIN OPTION` と同じ依存検査（呼び出し側が文全体を
+            // まとめて評価する。RESTRICT 契約で、依存があれば `2BP01` で txn 全体が巻き戻る）に回す。
+            Ok((1, existing.admin && !updated.admin))
+        }
+    }
+}
+
+fn revoke_one(
+    w: &redb::WriteTransaction,
+    tenant: &str,
+    req: &MembershipRequest<'_>,
+    role: &Resolved,
+    member: &Resolved,
+    grantor: u64,
+) -> Result<(usize, bool)> {
+    let Some(existing) = get_membership(w, tenant, member.id, role.id)? else {
+        return Ok((0, false));
+    };
+    // 所有者相当は付与者を問わず取り消せる。そうでなければ付与者が一致する行だけ（不一致は警告相当で何もしない）。
+    if !req.owner_equivalent && existing.grantor_id != Some(grantor) {
+        return Ok((0, false));
+    }
+    let mut changed = 0usize;
+    let mut lost_admin = false;
+    match req.option_for {
+        None => {
+            remove_membership_in_txn(w, tenant, member.id, role.id)?;
+            changed += 1;
+            lost_admin = existing.admin;
+        }
+        Some(opt) => {
+            let mut updated = existing;
+            match opt {
+                MembershipOpt::Admin => {
+                    updated.admin = false;
+                    lost_admin = existing.admin;
+                }
+                MembershipOpt::Inherit => updated.inherit = false,
+                MembershipOpt::Set => updated.set = false,
+            }
+            if updated != existing {
+                put_membership_in_txn(w, tenant, member.id, role.id, updated)?;
+                changed += 1;
+            }
+        }
+    }
+    // INHERIT を失う（または行ごと消える）ことによる、ADMIN の到達性の変化は追跡しない。依存の解決は ADMIN の
+    // 根拠である直接の行に限る（到達性の再評価は後続で扱う。ADR §11 の対象外）。ADMIN の行を失ったかどうかは
+    // 呼び出し側へ返し、文全体の変更を反映した後にまとめて依存を評価させる。
+    Ok((changed, lost_admin))
+}
