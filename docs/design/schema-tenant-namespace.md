@@ -195,6 +195,8 @@ README の公開済み要点を超えて具体化しない。公開境界を広�
 
 ### D10. 権限（#1713・#2234）
 
+Phase 6（#2234）の契約と実装記録は [role-privilege-model.md](role-privilege-model.md) §10 を参照する。
+
 - Phase 6 まで: `CREATE`・`DROP`・`ALTER SCHEMA` と、SCHEMA を指定する作成系 DDL は、既存の
   `--ddl-allowed-users` のゲート（`sql::ddl::require_ddl_permission`）に従う。既定拒否を維持
   する。同じテナントのセッションは、そのテナントのすべての SCHEMA を参照できる（境界は
@@ -509,3 +511,8 @@ SCHEMA 導入（#1713〜#1717）後もテナント境界が保たれることの
 - **現状の挙動として固定したもの（fail-closed）**: `search_path` に自テナントの SCHEMA だけを置いた未修飾名の解決・作成は未対応（`42P01`／`0A000`）、テナント SCHEMA 間の `SET SCHEMA` は `42501`。受理されるようになったら本テストの期待を更新する
 - **未カバー**: 物理表へ他テナントの行を直接差し込む多層防御（D3）の検査。SQL 表は採番方式で、`tenant::insert_row` などの公開 API が拒否するため再現できず、raw redb での行エンコードが要る。処理時間の差による存在の推測（D4 の時間的な側面）は決定的に検査できない
 - **対象外**: wire-server の応答（#1718）、SCHEMA 単位の GRANT（#2234）、利用者定義の RLS ポリシー、crash テストの新設
+
+## 追記（Issue #2236）
+
+SCHEMA の所有者は、上記の blob の予約領域ではなく `object_owners` 表（kind=SCHEMA・内部 ID キー）に保持する。blob の形式は変えていない
+（[role-privilege-model.md](role-privilege-model.md) §14 O7）。

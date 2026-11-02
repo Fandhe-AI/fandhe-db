@@ -57,9 +57,21 @@ fn facades_agree_with_gate() {
 
 #[test]
 fn privilege_table_is_total_and_unique() {
-    assert_eq!(DdlStatementKind::ALL.len(), 28);
+    assert_eq!(DdlStatementKind::ALL.len(), 29);
     for (i, a) in DdlStatementKind::ALL.iter().enumerate() {
-        assert_eq!(a.required_privilege(), RequiredPrivilege::ServerDdl);
+        let owner_capable = matches!(
+            a,
+            DdlStatementKind::DropSchema
+                | DdlStatementKind::AlterSchema
+                | DdlStatementKind::DropFunction
+                | DdlStatementKind::AlterOwner
+        );
+        let expected = if owner_capable {
+            RequiredPrivilege::ServerDdlOrOwner
+        } else {
+            RequiredPrivilege::ServerDdl
+        };
+        assert_eq!(a.required_privilege(), expected, "{a:?}");
         for b in &DdlStatementKind::ALL[i + 1..] {
             assert_ne!(a, b);
         }
@@ -96,4 +108,36 @@ fn denial_message_is_fixed_and_has_no_detail() {
     let e = require_ddl(&s, DdlStatementKind::DropTable).expect_err("denied");
     assert_eq!(format!("{e:?}"), "InsufficientPrivilege");
     assert_eq!(e.client_message(), "permission denied for DDL statement");
+}
+
+#[test]
+fn owner_capable_kinds_defer_to_owner_check_for_bound_roles_only() {
+    let kinds = [
+        DdlStatementKind::DropSchema,
+        DdlStatementKind::AlterSchema,
+        DdlStatementKind::DropFunction,
+        DdlStatementKind::AlterOwner,
+    ];
+    for k in kinds {
+        // 運用者権限は所有者検査なしで許可。
+        assert_eq!(
+            require_ddl_or_owner(&allowed(), k).ok(),
+            Some(GateDecision::Allowed)
+        );
+        // 束縛ロールだけなら所有者検査を要求する（ゲート単体では許可しない）。
+        let mut s = SessionState::default();
+        s.bind_role_ids(7, 7);
+        assert_eq!(
+            require_ddl_or_owner(&s, k).ok(),
+            Some(GateDecision::OwnerCheckRequired(7))
+        );
+        assert!(is_denied(require_ddl(&s, k)), "{k:?}");
+        // 未束縛・PUBLIC（0）はカタログを引く前に 42501。
+        assert!(is_denied(
+            require_ddl_or_owner(&SessionState::default(), k).map(|_| ())
+        ));
+        let mut zero = SessionState::default();
+        zero.bind_role_ids(0, 0);
+        assert!(is_denied(require_ddl_or_owner(&zero, k).map(|_| ())));
+    }
 }

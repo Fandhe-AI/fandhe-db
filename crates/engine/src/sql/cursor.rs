@@ -485,6 +485,23 @@ impl CursorRegistry {
         self.cursors.get(name).map(|c| c.id)
     }
 
+    /// 次に払い出すカーソル識別子（savepoint 作成時の高水位として記録する）。
+    pub(crate) fn next_id(&self) -> u64 {
+        self.next_id
+    }
+
+    /// 識別子が `watermark` 以上のカーソル（その時点より後に宣言されたもの）をすべて閉じる。
+    /// `ROLLBACK TO SAVEPOINT` が、取り消した書き込みを具体化済みのカーソルを残さないために使う
+    /// （`transaction.rs::restore_to_savepoint` から呼ばれる。Issue #1946・SQL-69 (5)）。
+    ///
+    /// 不変条件: `next_id` は戻さない（portal 束縛の `cursor_id` が再利用されず、閉じた
+    /// カーソルを指す portal は照合で必ず拒否される）。残るカーソルの取得位置も戻さない
+    /// （行集合は `DECLARE` 時点で確定済みで、巻き戻しの影響を受けない）。
+    pub(crate) fn close_declared_since(&mut self, watermark: u64) {
+        self.cursors.retain(|_, c| c.id < watermark);
+        self.total_bytes = self.cursors.values().map(|c| c.bytes).sum();
+    }
+
     /// `name` のカーソルを閉じる。不在は `34000`（[`Self::fetch`] と同じ
     /// 固定文言・同じ fail-closed 契約）。
     pub(crate) fn close(&mut self, name: &str) -> Result<(), SqlSurfaceError> {
@@ -664,6 +681,46 @@ mod tests {
         registry
             .declare("c0".to_string(), empty)
             .expect("slot freed after close");
+    }
+
+    /// `close_declared_since` は水位以上のカーソルだけを閉じ、残りの位置・バイト合計を保ち、
+    /// `next_id` を戻さない（Issue #1946）。
+    #[test]
+    fn close_declared_since_closes_only_newer_cursors() {
+        let row = |id: u64| crate::sql::exec::ResultRow {
+            id,
+            score: 0.0,
+            cells: vec![],
+        };
+        let result = |ids: &[u64]| QueryResult {
+            columns: vec![],
+            rows: ids.iter().map(|i| row(*i)).collect(),
+        };
+        let mut registry = CursorRegistry::new();
+        registry
+            .declare("old".to_string(), result(&[1, 2, 3]))
+            .unwrap();
+        registry.fetch("old", 1).unwrap();
+        let old_bytes = registry.total_bytes;
+        let watermark = registry.next_id();
+        registry
+            .declare("new1".to_string(), result(&[4, 5]))
+            .unwrap();
+        registry.declare("new2".to_string(), result(&[6])).unwrap();
+        let next_before = registry.next_id();
+
+        registry.close_declared_since(watermark);
+
+        assert_eq!(registry.fetch("new1", 1).unwrap_err().wire_code(), "34000");
+        assert_eq!(registry.close("new2").unwrap_err().wire_code(), "34000");
+        assert_eq!(registry.total_bytes, old_bytes);
+        assert_eq!(registry.next_id(), next_before);
+        // 位置は保たれ、続きの 2 件が返る。
+        let rest = registry.fetch("old", 10).unwrap();
+        assert_eq!(
+            rest.rows.iter().map(|r| r.id).collect::<Vec<_>>(),
+            vec![2, 3]
+        );
     }
 
     #[test]

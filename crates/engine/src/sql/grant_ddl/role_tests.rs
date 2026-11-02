@@ -299,6 +299,72 @@ fn cascade_does_not_treat_lost_admin_grantor_as_owner_equivalent() {
     }
 }
 
+/// 1 文が複数メンバーの ADMIN を同時に落とすとき、依存の評価は文全体の変更を反映した後に集合ごとで行われ、
+/// メンバーの並び順に依存しない（回帰）。x は y 経由の ADMIN も継承しているため、`x, y` の順でも `y, x` の
+/// 順でも x は ADMIN を完全に失い、x が付けた n の付与は RESTRICT で拒否・CASCADE で削除される。
+fn admin_revoke_fixture(label: &str) -> (Fx, SessionState, u64, u64, u64, u64) {
+    let f = fx(label);
+    let me = role(&f, "me");
+    let r = role(&f, "r");
+    let x = role(&f, "x");
+    let y = role(&f, "y");
+    let n = role(&f, "n");
+    let owner = session(me, true);
+    run(&f, &owner, "GRANT r TO x, y WITH ADMIN TRUE").expect("x y admin");
+    run(&f, &owner, "GRANT y TO x").expect("x inherits y");
+    run(&f, &session(x, false), "GRANT r TO n").expect("n by x");
+    assert_eq!(mem(&f, n, r).expect("row").grantor_id, Some(x));
+    (f, owner, r, x, y, n)
+}
+
+#[test]
+fn multi_member_admin_revoke_is_order_independent() {
+    for (order, cascade_sql) in [
+        ("x, y", true),
+        ("y, x", true),
+        ("x, y", false),
+        ("y, x", false),
+    ] {
+        let label = format!("rm_multi_{}_{}", order.replace([',', ' '], ""), cascade_sql);
+        let (f, owner, r, x, y, n) = admin_revoke_fixture(&label);
+        let sql = format!("REVOKE ADMIN OPTION FOR r FROM {order}");
+        if cascade_sql {
+            run(&f, &owner, &format!("{sql} CASCADE")).expect("cascade");
+            assert!(!mem(&f, x, r).expect("x").admin, "{order}");
+            assert!(!mem(&f, y, r).expect("y").admin, "{order}");
+            assert!(mem(&f, n, r).is_none(), "{order}: n must be revoked");
+        } else {
+            let e = run(&f, &owner, &sql).expect_err("restrict");
+            assert_eq!(e.wire_code(), "2BP01", "{order}");
+            // 拒否された文は何も変えない。
+            assert!(mem(&f, x, r).expect("x").admin, "{order}");
+            assert!(mem(&f, y, r).expect("y").admin, "{order}");
+            assert!(mem(&f, n, r).is_some(), "{order}");
+        }
+    }
+}
+
+/// メンバーシップそのものの取り消し（`REVOKE r FROM x, y`）でも同じ順序非依存を保つ。
+#[test]
+fn multi_member_membership_revoke_is_order_independent() {
+    for order in ["x, y", "y, x"] {
+        let label = format!("rm_multi_mem_{}", order.replace([',', ' '], ""));
+        let (f, owner, r, x, y, n) = admin_revoke_fixture(&label);
+        let e = run(&f, &owner, &format!("REVOKE r FROM {order}")).expect_err("restrict");
+        assert_eq!(e.wire_code(), "2BP01", "{order}");
+        assert!(
+            mem(&f, x, r).is_some() && mem(&f, y, r).is_some(),
+            "{order}"
+        );
+        run(&f, &owner, &format!("REVOKE r FROM {order} CASCADE")).expect("cascade");
+        assert!(
+            mem(&f, x, r).is_none() && mem(&f, y, r).is_none(),
+            "{order}"
+        );
+        assert!(mem(&f, n, r).is_none(), "{order}: n must be revoked");
+    }
+}
+
 /// `GRANT ... WITH ADMIN FALSE` による ADMIN の取り消しも `REVOKE ADMIN OPTION` と同じ依存検査（2BP01）を通る。
 #[test]
 fn grant_with_admin_false_respects_dependents() {
@@ -436,6 +502,52 @@ fn acl_grant_option_is_inherited_and_best_grantor_recorded() {
         f.s.list_acl_for_object(T, &PrivilegeObject::Table("docs".to_string()))
             .expect("acl");
     assert!(!rows.iter().any(|e| e.grantee_id == q));
+}
+
+/// 表単位の REVOKE の列への波及は、`select_best_grantor` が選んだ付与者名義の行だけを取り消す。表の GRANT OPTION
+/// を持つ別の継承ロール（より遠い r_far）名義で記録された列の付与は、その付与者自身の REVOKE でだけ消える（回帰）。
+#[test]
+fn table_revoke_propagation_only_touches_selected_grantor_rows() {
+    let f = fx("rm_acl_prop");
+    let me = role(&f, "me");
+    let near = role(&f, "r_near");
+    role(&f, "mid");
+    let far = role(&f, "r_far");
+    let actor = role(&f, "actor");
+    let q = role(&f, "q");
+    let owner = session(me, true);
+    run(
+        &f,
+        &owner,
+        "GRANT SELECT ON docs TO r_near, r_far WITH GRANT OPTION",
+    )
+    .expect("go");
+    run(&f, &owner, "GRANT r_near TO actor").expect("near");
+    run(&f, &owner, "GRANT mid TO actor").expect("mid");
+    run(&f, &owner, "GRANT r_far TO mid").expect("far");
+    // 遠い r_far 自身が列の付与を行う（名義は r_far）。
+    run(&f, &session(far, false), "GRANT SELECT (a) ON docs TO q").expect("col by far");
+    // actor の表の付与は最も近い r_near 名義で記録される。
+    run(&f, &session(actor, false), "GRANT SELECT ON docs TO q").expect("table by near");
+    let col = PrivilegeObject::Column {
+        table: "docs".to_string(),
+        column: "a".to_string(),
+    };
+    let rows = f.s.list_acl_for_object(T, &col).expect("acl");
+    assert!(rows
+        .iter()
+        .any(|e| e.grantee_id == q && e.grantor_id == far));
+    // actor の表の REVOKE は r_near 名義の行だけを対象にし、r_far 名義の列の付与は残る。
+    run(&f, &session(actor, false), "REVOKE SELECT ON docs FROM q").expect("revoke");
+    let rows = f.s.list_acl_for_object(T, &col).expect("acl");
+    assert!(
+        rows.iter()
+            .any(|e| e.grantee_id == q && e.grantor_id == far),
+        "far grantor's column grant must survive: {rows:?}"
+    );
+    assert!(!rows
+        .iter()
+        .any(|e| e.grantee_id == q && e.grantor_id == near));
 }
 
 #[test]

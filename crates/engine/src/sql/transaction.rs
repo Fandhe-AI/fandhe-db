@@ -447,7 +447,7 @@ pub(crate) fn validate_transaction_control_tokens(
 /// parse に任せる。字句解析に失敗した入力は `false`（fail-closed）。
 ///
 /// `ROLLBACK [WORK|TRANSACTION] TO ...`（Issue #1942）は Tx 全体の `ROLLBACK` ではないため
-/// `false`（Failed 中は一律 `25P02`。Failed からの `ROLLBACK TO` 復帰は #1941 の範囲）。
+/// `false`。Failed 中に `ROLLBACK TO` も通す判定は [`is_allowed_while_failed`]（Issue #1947）。
 pub fn is_rollback_statement(sql: &str) -> bool {
     let Some(tokens) = crate::sql::lexer::tokenize(sql).ok() else {
         return false;
@@ -467,6 +467,36 @@ pub fn is_rollback_statement(sql: &str) -> bool {
         _ => tail,
     };
     !ident_is(rest.first(), "TO")
+}
+
+/// 明示トランザクションが `Failed` の間に受理してよい文かを parse 前に判定する（Issue #1947・
+/// SQL-31・SQL-69 のポインタ）。真になるのは [`is_rollback_statement`] が真の `ROLLBACK`／`ABORT` と、
+/// `ROLLBACK [WORK|TRANSACTION] TO ...`（savepoint への復帰）だけ。`ABORT TO` は構文上受理しない
+/// ため偽。字句解析に失敗した入力は偽（fail-closed）。`core::EngineCore::execute_sql_in_txn` と
+/// wire-server の拡張クエリ Parse が呼ぶ。名前の妥当性・復帰の可否は通常どおり parse と
+/// [`SessionTransaction::rollback_to_savepoint`] が判定する。
+pub fn is_allowed_while_failed(sql: &str) -> bool {
+    if is_rollback_statement(sql) {
+        return true;
+    }
+    let Some(tokens) = crate::sql::lexer::tokenize(sql).ok() else {
+        return false;
+    };
+    let Some((Token::Ident(name), tail)) = tokens.split_first() else {
+        return false;
+    };
+    if !name.eq_ignore_ascii_case("ROLLBACK") {
+        return false;
+    }
+    let rest = match tail.split_first() {
+        Some((Token::Ident(kw), t))
+            if kw.eq_ignore_ascii_case("WORK") || kw.eq_ignore_ascii_case("TRANSACTION") =>
+        {
+            t
+        }
+        _ => tail,
+    };
+    ident_is(rest.first(), "TO")
 }
 
 /// [`SessionTransaction`] の対外的な状態（WIRE-19。`wire-server::result_encoder::
@@ -491,6 +521,44 @@ pub enum TransactionStatus {
 enum TxnOrigin {
     Explicit,
     Implicit,
+}
+
+/// Tx 内で登録済みの `operation_id` の登録順ログと照合用集合（Issue #1944）。
+///
+/// `ActiveTxn` が保持し、`check_statement_limits` が重複を `25000` で拒否する。`SAVEPOINT` は
+/// ログ長を水位として記録し、`ROLLBACK TO` が [`Self::truncate_to`] で水位より後を取り消す。
+/// ログ長は文数上限で有界になる。
+#[derive(Debug, Default)]
+struct SeenOperationIds {
+    order: Vec<String>,
+    set: HashSet<String>,
+}
+
+impl SeenOperationIds {
+    /// 新規なら登録して `true`、登録済みなら `false`。
+    fn insert(&mut self, id: &str) -> bool {
+        if self.set.insert(id.to_string()) {
+            self.order.push(id.to_string());
+            true
+        } else {
+            false
+        }
+    }
+
+    /// 現在のログ長（savepoint の水位）。
+    fn len(&self) -> usize {
+        self.order.len()
+    }
+
+    /// 水位 `wm` より後に登録された ID を取り消す。
+    fn truncate_to(&mut self, wm: usize) {
+        if wm >= self.order.len() {
+            return;
+        }
+        for id in self.order.drain(wm..) {
+            self.set.remove(&id);
+        }
+    }
 }
 
 /// トランザクション中の状態。`BEGIN` 時点の読み取りスナップショット（`read_snapshot`）と、
@@ -535,7 +603,9 @@ struct ActiveTxn<'e> {
     /// `check_and_register_statement` を通った文が 1 つでもあるか（Issue #1939）。`SET TRANSACTION` は
     /// 最初の問い合わせの前でだけ受理するため、その判定に使う（`SET TRANSACTION` 自身は立てない）。
     queried: bool,
-    seen_operation_ids: HashSet<String>,
+    /// この Tx 内で登録済みの `operation_id`。登録順ログと照合用集合を持ち、`ROLLBACK TO` が
+    /// savepoint の水位より後の分を取り消す（Issue #1944）。
+    seen_operation_ids: SeenOperationIds,
     written_tables: HashSet<String>,
     /// このトランザクション内で書き込んだ `(tenant_id, table)` の組の集合
     /// （TABLE-17・TASK-205、Issue #1077）。COMMIT 時の遅延 `FOREIGN KEY` 検査
@@ -558,9 +628,13 @@ struct ActiveTxn<'e> {
     /// （カーソルの寿命がトランザクションの寿命に一致する設計。
     /// `sql::cursor` モジュールドキュメント参照）。
     cursors: crate::sql::cursor::CursorRegistry,
-    /// 名前付き savepoint スタック（SQL-69・Issue #1942）。`ActiveTxn` と寿命を共にする
-    /// （巻き戻し本体は #1941）。
+    /// 名前付き savepoint スタック（SQL-69・Issue #1942）。`ActiveTxn` と寿命を共にする。
     savepoints: crate::sql::savepoint::SavepointStack,
+    /// 永続側の巻き戻し先となる redb の ephemeral savepoint（Issue #1943）。writer が最初に
+    /// テーブルを開く前の状態を指す。`Restorable` な savepoint が 1 つ以上ある間だけ保持し、
+    /// 無くなれば drop する（生存中は redb のページ解放が遅れるため寿命を最小にする）。
+    /// 同一 savepoint へ何度でも復元できる。`ActiveTxn` を捨てる全経路で自動的に drop される。
+    savepoint_base: Option<redb::Savepoint>,
     /// dirty テーブル判定（[`SessionTransaction::dirty_tables`]）が確定済み世代を
     /// 読むための参照。`Active` の間だけ保持する（`begin` が渡す）。
     storage: &'e crate::storage::Storage,
@@ -584,6 +658,12 @@ impl TempTxn {
 enum TxnState<'e> {
     Idle,
     Active(Box<ActiveTxn<'e>>),
+    /// 文エラー後も `ROLLBACK TO` で復帰できるよう `ActiveTxn`（writer・基底 savepoint・
+    /// savepoint スタックを含む）を保持した失敗状態（Issue #1947・SQL-31・SQL-69 のポインタ）。
+    /// 外部からは [`TransactionStatus::Failed`] に見え、`Active` 専用のアクセサ（`write_txn`・
+    /// `read_source` 等）は `Active` だけを照合するため、この状態の `ActiveTxn` は文の実行に
+    /// 使われない（fail-closed）。保持条件は [`SessionTransaction::fail`] を参照。
+    FailedRecoverable(Box<ActiveTxn<'e>>),
     /// `expired` は、持続時間の上限超過（[`SessionTransaction::release_if_expired`]）
     /// で `Failed` へ遷移し、まだ `54000` をクライアントへ報告していないことを表す。
     Failed {
@@ -731,7 +811,7 @@ impl<'e> SessionTransaction<'e> {
         match &self.state {
             TxnState::Idle => TransactionStatus::Idle,
             TxnState::Active(_) => TransactionStatus::InTransaction,
-            TxnState::Failed { .. } => TransactionStatus::Failed,
+            TxnState::Failed { .. } | TxnState::FailedRecoverable(_) => TransactionStatus::Failed,
         }
     }
 
@@ -1020,13 +1100,14 @@ impl<'e> SessionTransaction<'e> {
                     txn_start_micros,
                     statements: 0,
                     queried: false,
-                    seen_operation_ids: HashSet::new(),
+                    seen_operation_ids: SeenOperationIds::default(),
                     written_tables: HashSet::new(),
                     written_by_tenant: std::collections::BTreeSet::new(),
                     has_writes: false,
                     session_at_begin: session.clone(),
                     cursors: crate::sql::cursor::CursorRegistry::new(),
                     savepoints: crate::sql::savepoint::SavepointStack::new(),
+                    savepoint_base: None,
                     storage,
                 }));
                 Ok(())
@@ -1038,7 +1119,9 @@ impl<'e> SessionTransaction<'e> {
                 self.fail();
                 Err(SqlSurfaceError::ActiveSqlTransaction)
             }
-            TxnState::Failed { .. } => Err(self.take_failed_error()),
+            TxnState::Failed { .. } | TxnState::FailedRecoverable(_) => {
+                Err(self.take_failed_error())
+            }
         }
     }
 
@@ -1076,8 +1159,12 @@ impl<'e> SessionTransaction<'e> {
                     written_by_tenant,
                     written_tables,
                     storage,
+                    savepoint_base,
                     ..
                 } = *active;
+                // COMMIT が始まった後は巻き戻さない。commit 中の redb のページ解放を
+                // 妨げないよう、基底 savepoint は確定処理の前に破棄する（Issue #1943）。
+                drop(savepoint_base);
                 if started_at.elapsed() > self.limits.max_duration {
                     // `writer` を drop（abort）し、内包する permit を解放する。
                     drop(writer);
@@ -1113,6 +1200,11 @@ impl<'e> SessionTransaction<'e> {
                 };
                 Err(self.take_failed_error())
             }
+            TxnState::FailedRecoverable(active) => {
+                // 復帰の余地（`ROLLBACK TO`）を残すため、保持中の `ActiveTxn` を戻して `25P02`。
+                self.state = TxnState::FailedRecoverable(active);
+                Err(self.take_failed_error())
+            }
         }
     }
 
@@ -1143,27 +1235,93 @@ impl<'e> SessionTransaction<'e> {
                 self.state = TxnState::Idle;
                 Ok(())
             }
+            TxnState::FailedRecoverable(active) => {
+                // 保持していた writer は drop（abort）され、permit が解放される（Issue #1947）。
+                *session = active.session_at_begin;
+                self.state = TxnState::Idle;
+                Ok(())
+            }
         }
     }
 
-    /// `SAVEPOINT name`（SQL-69・Issue #1942）。明示 Tx の `Active` でだけ受理して push する。
+    /// `SAVEPOINT name`（SQL-69・Issue #1942・#1943）。明示 Tx の `Active` でだけ受理して push する。
     /// `Idle` は `25P01`（状態不変）、暗黙 Tx は abort して `25P01`、`Failed` は `25P02`。
     /// 文数・持続時間の上限に計上する（スタック長を文数上限で有界にする）。
-    pub fn savepoint(&mut self, name: &str) -> Result<(), SqlSurfaceError> {
+    ///
+    /// writer 取得済みなら redb の `ephemeral_savepoint` を probe にして巻き戻せるかを決める。
+    /// 成功すれば `Restorable`（最初の成功を基底 savepoint として保持）、dirty なら
+    /// `Unrestorable`。engine 側の書き込み記録には頼らない（記録漏れで巻き戻し過ぎないため）。
+    pub fn savepoint(&mut self, name: &str, session: &SessionState) -> Result<(), SqlSurfaceError> {
         self.check_savepoint_state()?;
         self.check_and_register_statement(None)?;
-        if let TxnState::Active(active) = &mut self.state {
-            active.savepoints.push(name);
+        let kind = match &mut self.state {
+            TxnState::Active(active) => Self::probe_savepoint_kind(active),
+            _ => Err(internal_error()),
+        };
+        match kind {
+            Ok(kind) => {
+                if let TxnState::Active(active) = &mut self.state {
+                    let wm = active.cursors.next_id();
+                    // 巻き戻せる savepoint だけ書き込み記録を複製する（ROLLBACK TO で復元。Issue #1945）。
+                    let marks =
+                        (kind == crate::sql::savepoint::SavepointKind::Restorable).then(|| {
+                            crate::sql::savepoint::WriteMarks {
+                                has_writes: active.has_writes,
+                                written_tables: active.written_tables.clone(),
+                                written_by_tenant: active.written_by_tenant.clone(),
+                            }
+                        });
+                    let op_wm = active.seen_operation_ids.len();
+                    active
+                        .savepoints
+                        .push(name, kind, session, wm, op_wm, marks);
+                }
+                Ok(())
+            }
+            Err(e) => {
+                // 基底の取得失敗は不変条件違反。復帰の余地を残さない（Issue #1947）。
+                self.fail_unrecoverable();
+                Err(e)
+            }
         }
-        Ok(())
+    }
+
+    /// `SAVEPOINT` 時点で巻き戻せるかを redb に問い合わせる。writer 未取得なら常に `Restorable`
+    /// （writer 取得時に基底を取る）。redb のエラー詳細は返さず内部エラーに写す。
+    fn probe_savepoint_kind(
+        active: &mut ActiveTxn<'_>,
+    ) -> Result<crate::sql::savepoint::SavepointKind, SqlSurfaceError> {
+        use crate::sql::savepoint::SavepointKind;
+        let Some(writer) = active.writer.as_deref() else {
+            return Ok(SavepointKind::Restorable);
+        };
+        match writer.ephemeral_savepoint() {
+            Ok(sp) => {
+                // permit を持つ間は確定状態が変わらないため、後続の probe は同じ root を指す。
+                // 基底が既にあれば新しい方は捨てる（drop）。
+                if active.savepoint_base.is_none() {
+                    active.savepoint_base = Some(sp);
+                }
+                Ok(SavepointKind::Restorable)
+            }
+            Err(redb::SavepointError::InvalidSavepoint) => Ok(SavepointKind::Unrestorable),
+            Err(_) => Err(internal_error()),
+        }
     }
 
     /// `RELEASE [SAVEPOINT] name`（SQL-69・Issue #1942）。無い名前は Tx を `Failed` にして `3B001`。
+    /// `Restorable` が 1 つも残らなくなれば基底 savepoint を解放する（Issue #1943）。
     pub fn release_savepoint(&mut self, name: &str) -> Result<(), SqlSurfaceError> {
         self.check_savepoint_state()?;
         self.check_and_register_statement(None)?;
         let result = match &mut self.state {
-            TxnState::Active(active) => active.savepoints.release(name),
+            TxnState::Active(active) => {
+                let r = active.savepoints.release(name);
+                if r.is_ok() && !active.savepoints.has_restorable() {
+                    active.savepoint_base = None;
+                }
+                r
+            }
             _ => return Err(internal_error()),
         };
         if result.is_err() {
@@ -1172,24 +1330,176 @@ impl<'e> SessionTransaction<'e> {
         result
     }
 
-    /// `ROLLBACK TO [SAVEPOINT] name`（SQL-69・Issue #1942）。巻き戻し本体は未実装（#1941）の
-    /// ため成功させない。無い名前は `3B001`、有る名前は `0A000`。どちらも Tx を `Failed` へ倒し、
-    /// 取り消したつもりの書き込みが後続の `COMMIT` で確定する fail-open を防ぐ。
-    pub fn rollback_to_savepoint(&mut self, name: &str) -> Result<(), SqlSurfaceError> {
+    /// `ROLLBACK TO [SAVEPOINT] name`（SQL-69・Issue #1942・#1943）。永続データ表の書き込みを
+    /// redb の `restore_savepoint` で巻き戻す。対象より新しい savepoint は取り除き、対象自身は
+    /// 残す。writer・登録・読み取りスナップショットには触れず、writer は Tx の終了まで保持する
+    /// （SQL-69 (3) のポインタ）。
+    ///
+    /// fail-closed（いずれも Tx を `Failed` へ倒す）: 無い名前は `3B001`、書き込み後に作った
+    /// （`Unrestorable`）savepoint と一時表の書き込みトランザクションが開いている場合は
+    /// `0A000`、基底欠落・redb エラーは `XX000`。取り消したつもりの書き込みが後続の `COMMIT`
+    /// で確定する fail-open を作らない。
+    ///
+    /// 不変条件: `restore_savepoint` は開いているテーブルのハンドルがあると panic する。本関数は
+    /// 文の境界（`core.rs` の `ParsedSql::Transaction` 分岐）でだけ呼ばれ、その時点でハンドルは
+    /// 1 つも開いていない（カーソルは行を確定して保持し、redb のハンドルを持ち越さない）。
+    ///
+    /// セッション状態は savepoint 作成時点の複製へ戻す。
+    ///
+    /// Tx 内の書き込み記録（`has_writes`・`written_tables`・`written_by_tenant`）は savepoint
+    /// 作成時点の複製へ戻す（Issue #1945）。これにより復元後の読み取りは確定スナップショット
+    /// （世代キーのキャッシュ・索引）へ戻り、全書き込みを巻き戻した Tx の `COMMIT` は空の
+    /// write txn を commit せず（グローバル世代を進めない）、遅延 FK の走査範囲も実際の書き込みに
+    /// 一致する。記録を縮める前に、redb 復元後の表世代が確定状態と一致すること（世代差分ゼロ）を
+    /// 突き合わせ、不一致は `XX000`（fail-closed）。
+    ///
+    /// `operation_id` の Tx 内登録は水位まで戻す（Issue #1944）。
+    ///
+    /// 戻さないもの: commit 記録の足跡（巻き戻した行の足跡が
+    /// 残り、他の明示 Tx が余分に `40001` を受けうる安全側の過剰。偽陰性は生まない）、
+    /// 採番状態（`SequenceAllocator`・`currval`。PostgreSQL と同じく非トランザクショナルで、
+    /// 全体 `ROLLBACK` と同じ扱い）。
+    pub fn rollback_to_savepoint(
+        &mut self,
+        name: &str,
+        session: &mut SessionState,
+    ) -> Result<(), SqlSurfaceError> {
+        if matches!(self.state, TxnState::FailedRecoverable(_)) {
+            return self.rollback_to_savepoint_from_failed(name, session);
+        }
         self.check_savepoint_state()?;
         self.check_and_register_statement(None)?;
-        let found = match &self.state {
-            TxnState::Active(active) => active.savepoints.position(name).is_some(),
+        let result = match &mut self.state {
+            TxnState::Active(active) => Self::restore_to_savepoint(active, name, session),
             _ => return Err(internal_error()),
         };
-        self.fail();
-        if found {
-            Err(SqlSurfaceError::feature_not_supported(
-                "ROLLBACK TO SAVEPOINT is not supported",
-            ))
-        } else {
-            Err(SqlSurfaceError::InvalidSavepointSpecification)
+        if let Err(e) = &result {
+            self.fail_for(e);
         }
+        result
+    }
+
+    /// 失敗状態（[`TxnState::FailedRecoverable`]）からの `ROLLBACK TO`（Issue #1947・SQL-31・SQL-69 の
+    /// ポインタ）。保持中の `ActiveTxn` に対して文数・持続時間の上限を検査・計上してから、`Active`
+    /// 中と同じ [`Self::restore_to_savepoint`] で巻き戻す（巻き戻しの本体は 1 つに保つ）。
+    ///
+    /// - 成功: `Active` へ戻る（writer・読み取りスナップショットは保持したまま継続できる）。
+    /// - `3B001`・`0A000`: 状態を `FailedRecoverable` に据え置く（別の savepoint で再試行できる）。
+    /// - `XX000`・上限超過（`54000`）: 保持中の `ActiveTxn` を破棄して `Failed`（復帰不可）。
+    ///
+    /// 全分岐で状態を書き戻し、`ActiveTxn` を取りこぼして `Idle` へ落ちる経路を作らない。
+    ///
+    /// 不変条件: `restore_savepoint` は開いているテーブルのハンドルがあると panic する。失敗した
+    /// 文の redb ハンドルは RAII で解放済みで、`ActiveTxn` はハンドルを保持しない。
+    fn rollback_to_savepoint_from_failed(
+        &mut self,
+        name: &str,
+        session: &mut SessionState,
+    ) -> Result<(), SqlSurfaceError> {
+        let TxnState::FailedRecoverable(mut active) =
+            std::mem::replace(&mut self.state, TxnState::Idle)
+        else {
+            return Err(internal_error());
+        };
+        if active.started_at.elapsed() > self.limits.max_duration
+            || active.statements >= self.limits.max_statements
+        {
+            self.state = TxnState::Failed {
+                session_at_begin: Box::new(active.session_at_begin),
+                expired: false,
+            };
+            return Err(SqlSurfaceError::payload_too_large(LIMIT_EXCEEDED_MESSAGE));
+        }
+        active.statements = active.statements.saturating_add(1);
+        match Self::restore_to_savepoint(&mut active, name, session) {
+            Ok(()) => {
+                active.queried = true;
+                self.state = TxnState::Active(active);
+                Ok(())
+            }
+            Err(e) => {
+                if Self::is_unrecoverable_error(&e) {
+                    self.state = TxnState::Failed {
+                        session_at_begin: Box::new(active.session_at_begin),
+                        expired: false,
+                    };
+                } else {
+                    self.state = TxnState::FailedRecoverable(active);
+                }
+                Err(e)
+            }
+        }
+    }
+
+    /// [`Self::rollback_to_savepoint`] の本体。失敗時の `fail()` は呼び出し側が行う。
+    fn restore_to_savepoint(
+        active: &mut ActiveTxn<'_>,
+        name: &str,
+        session: &mut SessionState,
+    ) -> Result<(), SqlSurfaceError> {
+        use crate::sql::savepoint::SavepointKind;
+        let pos = active
+            .savepoints
+            .position(name)
+            .ok_or(SqlSurfaceError::InvalidSavepointSpecification)?;
+        match active.savepoints.kind_at(pos) {
+            Some(SavepointKind::Restorable) => {}
+            Some(SavepointKind::Unrestorable) => {
+                return Err(SqlSurfaceError::feature_not_supported(
+                    "ROLLBACK TO SAVEPOINT is not supported for a savepoint established after \
+                     writes in the transaction",
+                ));
+            }
+            None => return Err(internal_error()),
+        }
+        // 一時表は別の in-memory ストアにあり、本経路では巻き戻せない。片側だけ巻き戻る
+        // fail-open を避けるため拒否する。
+        if active.temp.is_some() {
+            return Err(SqlSurfaceError::feature_not_supported(
+                "ROLLBACK TO SAVEPOINT is not supported in a transaction that used temporary tables",
+            ));
+        }
+        if let Some(writer) = active.writer.as_deref_mut() {
+            let Some(base) = active.savepoint_base.as_ref() else {
+                return Err(internal_error());
+            };
+            writer
+                .restore_savepoint(base)
+                .map_err(|_| internal_error())?;
+            // 突き合わせ（fail-closed）: 復元後の表世代は確定状態と一致するはず。差分が残る・
+            // 世代の読み取りに失敗する場合は不変条件違反なので、記録を縮める前に拒否する。
+            let residual = collect_dirty_tables(active.storage, writer, &HashSet::new())?;
+            if !residual.is_empty() {
+                return Err(internal_error());
+            }
+        }
+        // セッション状態（TimeZone・search_path・セッション UDF 等）も savepoint 時点へ戻す。
+        // redb の巻き戻し後に行い、失敗経路ではセッションを変更しない。
+        let Some(saved) = active.savepoints.session_at(pos) else {
+            return Err(internal_error());
+        };
+        *session = saved.clone();
+        // savepoint より後に宣言されたカーソルは取り消した書き込みを具体化済みのため閉じる
+        // （PostgreSQL と同じ。FETCH は 34000 になる）。
+        let Some(wm) = active.savepoints.cursor_watermark_at(pos) else {
+            return Err(internal_error());
+        };
+        active.cursors.close_declared_since(wm);
+        // 書き込み記録を savepoint 時点へ戻す（Issue #1945）。`truncate_after` の前に読む。
+        let Some(marks) = active.savepoints.write_marks_at(pos).cloned() else {
+            return Err(internal_error());
+        };
+        active.has_writes = marks.has_writes;
+        active.written_tables = marks.written_tables;
+        active.written_by_tenant = marks.written_by_tenant;
+        // 巻き戻した範囲の operation_id を取り消し、同一 Tx 内で再利用できるようにする。
+        // 水位は truncate_after の前に読む（Issue #1944）。
+        let Some(op_wm) = active.savepoints.op_id_watermark_at(pos) else {
+            return Err(internal_error());
+        };
+        active.seen_operation_ids.truncate_to(op_wm);
+        active.savepoints.truncate_after(pos);
+        Ok(())
     }
 
     /// savepoint 文の共通の状態検査。明示 Tx の `Active` なら `Ok`。
@@ -1200,7 +1510,9 @@ impl<'e> SessionTransaction<'e> {
         match &self.state {
             TxnState::Active(_) => Ok(()),
             TxnState::Idle => Err(SqlSurfaceError::NoActiveSqlTransaction),
-            TxnState::Failed { .. } => Err(self.take_failed_error()),
+            TxnState::Failed { .. } | TxnState::FailedRecoverable(_) => {
+                Err(self.take_failed_error())
+            }
         }
     }
 
@@ -1232,11 +1544,12 @@ impl<'e> SessionTransaction<'e> {
         if active.started_at.elapsed() > self.limits.max_duration
             || active.statements >= self.limits.max_statements
         {
-            self.fail();
+            // 上限超過は復帰させない（DoS 対策。writer を即時に解放する。Issue #1947）。
+            self.fail_unrecoverable();
             return Err(SqlSurfaceError::payload_too_large(LIMIT_EXCEEDED_MESSAGE));
         }
         if let Some(id) = operation_id {
-            if !active.seen_operation_ids.insert(id.to_string()) {
+            if !active.seen_operation_ids.insert(id) {
                 self.fail();
                 return Err(SqlSurfaceError::InvalidTransactionState);
             }
@@ -1265,7 +1578,9 @@ impl<'e> SessionTransaction<'e> {
         }
         match &self.state {
             TxnState::Idle => return Err(SqlSurfaceError::NoActiveSqlTransaction),
-            TxnState::Failed { .. } => return Err(self.take_failed_error()),
+            TxnState::Failed { .. } | TxnState::FailedRecoverable(_) => {
+                return Err(self.take_failed_error())
+            }
             TxnState::Active(active) if active.queried => {
                 self.fail();
                 return Err(SqlSurfaceError::SetTransactionAfterQuery);
@@ -1306,7 +1621,7 @@ impl<'e> SessionTransaction<'e> {
             }
         }
         if reopen_failed {
-            self.fail();
+            self.fail_unrecoverable();
             return Err(internal_error());
         }
         Ok(())
@@ -1443,6 +1758,7 @@ impl<'e> SessionTransaction<'e> {
         ctx: &crate::policy::PolicyContext,
         nowait: bool,
     ) -> Result<(), SqlSurfaceError> {
+        let mut base_failed = false;
         let conflict = match &mut self.state {
             TxnState::Active(active) => {
                 if active.writer.is_some() {
@@ -1458,6 +1774,15 @@ impl<'e> SessionTransaction<'e> {
                 }
                 .map_err(map_write_lock_err)?;
                 active.writer = Some(w);
+                // 巻き戻し先の基底 savepoint を、writer がまだテーブルを開く前のここで取る
+                // （Issue #1943。redb は dirty な writer からは作れない）。`Restorable` が無ければ
+                // 取らない（通常の Tx に追跡の負担を足さない）。
+                if active.savepoints.has_restorable() {
+                    match active.writer.as_deref().map(|w| w.ephemeral_savepoint()) {
+                        Some(Ok(sp)) => active.savepoint_base = Some(sp),
+                        _ => base_failed = true,
+                    }
+                }
                 // 読み取り集合を確定する（SQL-38・Issue #2404）。同じ文の取得後の読み取り
                 // （`INSERT ... SELECT` の元表など）は集合へ入れない。
                 if let Some(set) = crate::sql::read_set::disarm_current() {
@@ -1465,10 +1790,19 @@ impl<'e> SessionTransaction<'e> {
                 }
                 // `40001` 判定（#2405）。登録は判定が必要とする記録を刈り込ませないため、
                 // 判定が済むまで外さない。
-                Self::detect_serialization_conflict(active, ctx)?
+                if base_failed {
+                    false
+                } else {
+                    Self::detect_serialization_conflict(active, ctx)?
+                }
             }
             _ => return Err(internal_error()),
         };
+        if base_failed {
+            // 新しい writer で基底を取れないのは不変条件違反。復帰不可の `Failed` に倒す。
+            self.fail_unrecoverable();
+            return Err(internal_error());
+        }
         if conflict {
             return Err(self.fail_with_serialization_failure());
         }
@@ -1627,7 +1961,8 @@ impl<'e> SessionTransaction<'e> {
     /// 行・台帳・カタログに副作用は残らない。以降は `Failed` ゲートが `ROLLBACK` 以外を
     /// `25P02` で拒否する。`ensure_writer_with` の判定（#2405）が呼ぶ。
     pub(crate) fn fail_with_serialization_failure(&mut self) -> SqlSurfaceError {
-        self.fail();
+        // writer 保持のまま復帰させると以降の衝突判定を素通りするため、復帰不可で倒す（Issue #1947）。
+        self.fail_unrecoverable();
         SqlSurfaceError::SerializationFailure
     }
 
@@ -1648,11 +1983,64 @@ impl<'e> SessionTransaction<'e> {
             return;
         }
         if let TxnState::Active(active) = std::mem::replace(&mut self.state, TxnState::Idle) {
+            if Self::is_recoverable(&active) {
+                // `ROLLBACK TO` で復帰できるよう `ActiveTxn`（writer 含む）を保持する。解放は
+                // `ROLLBACK`・持続時間上限（`release_if_expired`）・復帰不可の失敗で行う。
+                self.state = TxnState::FailedRecoverable(active);
+                return;
+            }
             // `write_txn` は drop（abort）され、`permit` はその後に解放される。
             self.state = TxnState::Failed {
                 session_at_begin: Box::new(active.session_at_begin),
                 expired: false,
             };
+        }
+    }
+
+    /// 失敗した `Active` を `ROLLBACK TO` 復帰用に保持してよいか（Issue #1947）。明示 Tx で、
+    /// 巻き戻せる savepoint があり、一時表を使っておらず（`ROLLBACK TO` は `0A000` 確定）、
+    /// 巻き戻し先（writer 未取得、または基底 savepoint）が存在するときだけ真。それ以外は
+    /// 従来どおり即時に writer を解放する。
+    fn is_recoverable(active: &ActiveTxn<'_>) -> bool {
+        active.origin == TxnOrigin::Explicit
+            && active.savepoints.has_restorable()
+            && active.temp.is_none()
+            && (active.writer.is_none() || active.savepoint_base.is_some())
+    }
+
+    /// 復帰させてはならない失敗（内部エラー・直列化失敗）か。
+    fn is_unrecoverable_error(e: &SqlSurfaceError) -> bool {
+        matches!(
+            e,
+            SqlSurfaceError::Internal { .. } | SqlSurfaceError::SerializationFailure
+        )
+    }
+
+    /// エラーの種類に応じて [`Self::fail`]（復帰可）か [`Self::fail_unrecoverable`] を選ぶ。
+    /// `core.rs` の文実行ディスパッチが、文のエラー（`XX000`・`40001` は復帰不可）で呼ぶ。
+    pub(crate) fn fail_for(&mut self, e: &SqlSurfaceError) {
+        if Self::is_unrecoverable_error(e) {
+            self.fail_unrecoverable();
+        } else {
+            self.fail();
+        }
+    }
+
+    /// `ROLLBACK TO` での復帰を許さない失敗遷移（Issue #1947）。`Active`・`FailedRecoverable` の
+    /// `ActiveTxn` を破棄（writer を abort して permit を解放）して `Failed` へ。暗黙 Tx は
+    /// `Idle`。`Idle`・`Failed` では何もしない（冪等）。
+    pub fn fail_unrecoverable(&mut self) {
+        if self.abort_if_implicit() {
+            return;
+        }
+        match std::mem::replace(&mut self.state, TxnState::Idle) {
+            TxnState::Active(active) | TxnState::FailedRecoverable(active) => {
+                self.state = TxnState::Failed {
+                    session_at_begin: Box::new(active.session_at_begin),
+                    expired: false,
+                };
+            }
+            other => self.state = other,
         }
     }
 
@@ -1664,7 +2052,9 @@ impl<'e> SessionTransaction<'e> {
     /// `54000` を返す（[`Self::take_failed_error`]）。
     pub fn release_if_expired(&mut self) -> bool {
         let expired = match &self.state {
-            TxnState::Active(active) => active.started_at.elapsed() > self.limits.max_duration,
+            TxnState::Active(active) | TxnState::FailedRecoverable(active) => {
+                active.started_at.elapsed() > self.limits.max_duration
+            }
             _ => false,
         };
         if !expired {
@@ -1675,7 +2065,9 @@ impl<'e> SessionTransaction<'e> {
         if self.abort_if_implicit() {
             return true;
         }
-        if let TxnState::Active(active) = std::mem::replace(&mut self.state, TxnState::Idle) {
+        if let TxnState::Active(active) | TxnState::FailedRecoverable(active) =
+            std::mem::replace(&mut self.state, TxnState::Idle)
+        {
             self.state = TxnState::Failed {
                 session_at_begin: Box::new(active.session_at_begin),
                 expired: true,
@@ -1706,12 +2098,14 @@ impl<'e> SessionTransaction<'e> {
     /// 期限到達時点で [`Self::release_if_expired`] を呼べるようにする。writer 未取得の
     /// `Active` でも `BEGIN` 起点で効き、`BEGIN` 時点のスナップショットを保持し続けない。
     /// Issue #2409 のテストで固定）。
-    /// `Failed` は [`Self::fail`]／[`Self::release_if_expired`] の時点で共有
+    /// `Failed` は [`Self::fail_unrecoverable`]／[`Self::release_if_expired`] の時点で共有
     /// 書き込みトランザクション（書き込みゲートの permit を内包）を既に drop
-    /// 済みでライタを保持しないため、対象外（`None`）とする。
+    /// 済みでライタを保持しないため、対象外（`None`）とする。一方、復帰可能な失敗状態
+    /// （`FailedRecoverable`。Issue #1947）は writer を保持しうるため `Active` と同じく
+    /// 残り時間を返し、期限到達時に [`Self::release_if_expired`] で解放できるようにする。
     pub fn remaining_duration(&self) -> Option<Duration> {
         match &self.state {
-            TxnState::Active(active) => Some(
+            TxnState::Active(active) | TxnState::FailedRecoverable(active) => Some(
                 self.limits
                     .max_duration
                     .saturating_sub(active.started_at.elapsed()),
@@ -2043,6 +2437,19 @@ mod tests {
         assert!(!is_rollback_statement("COMMIT"));
         // Issue #1942: `ROLLBACK TO` は Tx 全体の ROLLBACK ではない。
         assert!(!is_rollback_statement("ROLLBACK TO a"));
+        assert!(is_allowed_while_failed("ROLLBACK TO a"));
+        assert!(is_allowed_while_failed("rollback work to savepoint a"));
+        assert!(is_allowed_while_failed(
+            "ROLLBACK TRANSACTION TO SAVEPOINT a"
+        ));
+        assert!(is_allowed_while_failed("ROLLBACK"));
+        assert!(is_allowed_while_failed("ABORT"));
+        assert!(!is_allowed_while_failed("ABORT TO a"));
+        assert!(!is_allowed_while_failed("COMMIT"));
+        assert!(!is_allowed_while_failed("END"));
+        assert!(!is_allowed_while_failed("SAVEPOINT a"));
+        assert!(!is_allowed_while_failed("RELEASE a"));
+        assert!(!is_allowed_while_failed("ROLLBACK 'unterminated"));
         assert!(!is_rollback_statement("rollback work to savepoint a"));
         assert!(!is_rollback_statement(
             "ROLLBACK TRANSACTION TO SAVEPOINT a"
@@ -2119,41 +2526,91 @@ mod tests {
         let mut txn = SessionTransaction::new(TransactionLimits::default());
         // Idle: 25P01・状態不変。
         for r in [
-            txn.savepoint("a"),
+            txn.savepoint("a", &SessionState::default()),
             txn.release_savepoint("a"),
-            txn.rollback_to_savepoint("a"),
+            txn.rollback_to_savepoint("a", &mut SessionState::default()),
         ] {
             assert_eq!(r.unwrap_err().wire_code(), "25P01");
             assert_eq!(txn.status(), TransactionStatus::Idle);
         }
         // Active: push・release、無い名前は 3B001 で Failed。
         let (mut txn, _s) = explicit_txn(&storage);
-        txn.savepoint("a").unwrap();
+        txn.savepoint("a", &SessionState::default()).unwrap();
         txn.release_savepoint("a").unwrap();
         assert_eq!(txn.status(), TransactionStatus::InTransaction);
         assert_eq!(txn.release_savepoint("a").unwrap_err().wire_code(), "3B001");
         assert_eq!(txn.status(), TransactionStatus::Failed);
         // Failed: 25P02。
-        assert_eq!(txn.savepoint("a").unwrap_err().wire_code(), "25P02");
         assert_eq!(
-            txn.rollback_to_savepoint("a").unwrap_err().wire_code(),
+            txn.savepoint("a", &SessionState::default())
+                .unwrap_err()
+                .wire_code(),
+            "25P02"
+        );
+        assert_eq!(
+            txn.rollback_to_savepoint("a", &mut SessionState::default())
+                .unwrap_err()
+                .wire_code(),
             "25P02"
         );
     }
 
+    /// Issue #1944: 巻き戻した operation_id は再利用でき、巻き戻していない ID は従来どおり拒否する。
     #[test]
-    fn rollback_to_savepoint_always_fails_transaction() {
-        let (storage, _guard) = open_test_storage("savepoint-rollback-to");
+    fn rollback_to_savepoint_releases_operation_ids_after_watermark() {
+        let (storage, _guard) = open_test_storage("savepoint-opid");
         let (mut txn, _s) = explicit_txn(&storage);
-        txn.savepoint("a").unwrap();
-        assert_eq!(
-            txn.rollback_to_savepoint("a").unwrap_err().wire_code(),
-            "0A000"
-        );
+        let mut ss = SessionState::default();
+        txn.check_and_register_statement(Some("op-0")).unwrap();
+        txn.savepoint("a", &ss).unwrap();
+        txn.check_and_register_statement(Some("op-1")).unwrap();
+        txn.rollback_to_savepoint("a", &mut ss).unwrap();
+        txn.check_and_register_statement(Some("op-1")).unwrap();
+        txn.rollback_to_savepoint("a", &mut ss).unwrap();
+        txn.check_and_register_statement(Some("op-1")).unwrap();
+        // savepoint より前の ID は巻き戻していないので拒否され、Tx は Failed になる。
+        let e = txn.check_and_register_statement(Some("op-0")).unwrap_err();
+        assert_eq!(e.wire_code(), "25000");
         assert_eq!(txn.status(), TransactionStatus::Failed);
+    }
+
+    /// Issue #1944: RELEASE は登録済み ID を変えない。
+    #[test]
+    fn release_savepoint_keeps_operation_ids() {
+        let (storage, _guard) = open_test_storage("savepoint-opid-release");
+        let (mut txn, _s) = explicit_txn(&storage);
+        txn.savepoint("a", &SessionState::default()).unwrap();
+        txn.check_and_register_statement(Some("op-1")).unwrap();
+        txn.release_savepoint("a").unwrap();
+        let e = txn.check_and_register_statement(Some("op-1")).unwrap_err();
+        assert_eq!(e.wire_code(), "25000");
+    }
+
+    /// Issue #1943: writer 取得前の savepoint は成功し、対象は残り新しい側は消える。
+    #[test]
+    fn rollback_to_restorable_savepoint_succeeds_and_truncates_newer() {
+        let (storage, _guard) = open_test_storage("savepoint-rollback-to-ok");
+        let (mut txn, _s) = explicit_txn(&storage);
+        txn.savepoint("a", &SessionState::default()).unwrap();
+        txn.savepoint("b", &SessionState::default()).unwrap();
+        txn.rollback_to_savepoint("a", &mut SessionState::default())
+            .unwrap();
+        assert_eq!(txn.status(), TransactionStatus::InTransaction);
+        // 対象自身は残り（2 回目も成功）、新しい側は除かれている。
+        txn.rollback_to_savepoint("a", &mut SessionState::default())
+            .unwrap();
+        assert_eq!(txn.release_savepoint("b").unwrap_err().wire_code(), "3B001");
+    }
+
+    /// 無い名前は `3B001` で Tx を `Failed` にする。
+    #[test]
+    fn rollback_to_unknown_savepoint_fails_transaction() {
+        let (storage, _guard) = open_test_storage("savepoint-rollback-to-unknown");
         let (mut txn, _s) = explicit_txn(&storage);
         assert_eq!(
-            txn.rollback_to_savepoint("zz").unwrap_err().wire_code(),
+            txn.rollback_to_savepoint("zz", &mut SessionState::default())
+                .unwrap_err()
+                .wire_code(),
             "3B001"
         );
         assert_eq!(txn.status(), TransactionStatus::Failed);
@@ -2167,9 +2624,14 @@ mod tests {
             max_statements: 2,
         });
         txn.begin(&storage, &SessionState::default()).unwrap();
-        txn.savepoint("a").unwrap();
-        txn.savepoint("a").unwrap();
-        assert_eq!(txn.savepoint("a").unwrap_err().wire_code(), "54000");
+        txn.savepoint("a", &SessionState::default()).unwrap();
+        txn.savepoint("a", &SessionState::default()).unwrap();
+        assert_eq!(
+            txn.savepoint("a", &SessionState::default())
+                .unwrap_err()
+                .wire_code(),
+            "54000"
+        );
         assert_eq!(txn.status(), TransactionStatus::Failed);
     }
 
@@ -2652,6 +3114,49 @@ mod tests {
         let fresh = storage.db().begin_read().expect("begin_read");
         let snapshot = txn.read_snapshot().expect("snapshot");
         assert_eq!(read_gen(snapshot), read_gen(&fresh));
+    }
+
+    /// Issue #1945: writer 取得後に記録した書き込みは `ROLLBACK TO` で savepoint 時点へ戻り、
+    /// 読み取りは確定スナップショットへ復帰し、全巻き戻し後の `COMMIT` はグローバル世代を進めない。
+    #[test]
+    fn rollback_to_restores_write_marks_and_commit_keeps_generation() {
+        let (storage, _g) = open_test_storage("txn-1945-marks");
+        let (mut txn, mut session) = explicit_txn(&storage);
+        txn.savepoint("a", &session).unwrap();
+        txn.ensure_writer(&test_ctx()).unwrap();
+        txn.mark_written("tenant-a", "documents");
+        assert!(txn.table_already_written("documents"));
+        let before = storage.current_generation().unwrap();
+        txn.rollback_to_savepoint("a", &mut session).unwrap();
+        assert_eq!(txn.status(), TransactionStatus::InTransaction);
+        assert!(txn.dirty_tables().unwrap().is_empty());
+        assert!(!txn.table_already_written("documents"));
+        // 対象自身は残り、2 回目の巻き戻しも成功する（ハンドルが残っていない）。
+        txn.rollback_to_savepoint("a", &mut session).unwrap();
+        txn.commit(&mut session).unwrap();
+        assert_eq!(storage.current_generation().unwrap(), before);
+    }
+
+    /// Issue #1945: 復元後に書き直せば記録が立て直され、`release` は記録を変えない。
+    #[test]
+    fn release_keeps_write_marks_and_rewrite_after_rollback_marks_again() {
+        let (storage, _g) = open_test_storage("txn-1945-release");
+        let (mut txn, mut session) = explicit_txn(&storage);
+        txn.ensure_writer(&test_ctx()).unwrap();
+        txn.mark_written("tenant-a", "documents");
+        txn.savepoint("a", &session).unwrap();
+        assert!(txn.table_already_written("documents"));
+        txn.release_savepoint("a").unwrap();
+        assert!(txn.table_already_written("documents"));
+        txn.rollback(&mut session).unwrap();
+
+        let (mut txn, mut session) = explicit_txn(&storage);
+        txn.savepoint("a", &session).unwrap();
+        txn.ensure_writer(&test_ctx()).unwrap();
+        txn.mark_written("tenant-a", "documents");
+        txn.rollback_to_savepoint("a", &mut session).unwrap();
+        txn.mark_written("tenant-a", "documents");
+        assert!(txn.table_already_written("documents"));
     }
 
     /// writer 未取得のまま書き込み記録がある状態は不変条件違反で、COMMIT・dirty 判定とも

@@ -1,5 +1,5 @@
 //! ロール形 `GRANT`／`REVOKE`（メンバーシップの付与・取り消し）の適用（SQL-39 (7)・SQL-40 のポインタ、
-//! Issue #2232。設計記録: `docs/design/role-privilege-model.md` §10 の M1〜M4）。
+//! Issue #2232。設計記録: `docs/design/role-privilege-model.md` §11 の M1〜M4）。
 //!
 //! 役割: `sql::grant_ddl` が構造検証済みの文から作る [`MembershipRequest`] を、単一の write txn・1 回の commit で
 //! メンバーシップ表へ原子的に反映する。循環（`0LP01`）・ADMIN の判定（`42501`）・付与者の記録・オプションの
@@ -187,25 +187,25 @@ fn has_independent_admin(
     Ok(found)
 }
 
-/// `member` が `role` へ持つ ADMIN を失った後に、`member` が付けた付与のうち ADMIN の根拠を失ったものを
-/// 解決する（RESTRICT は `2BP01`、CASCADE は連鎖して削除）。`member` が別の経路で ADMIN を保てば何もしない。
+/// `role` への ADMIN の行を失った主体の集合 `seeds` について、その主体が付けた付与のうち ADMIN の根拠を
+/// 失ったものを解決する（RESTRICT は `2BP01`、CASCADE は連鎖して削除）。別の経路で ADMIN を保てる主体の付与は
+/// 残す。1 文が複数のメンバーの ADMIN を同時に落とす場合も、文全体の直接変更を反映した後に集合ごと 1 回で
+/// 評価するため、メンバーの並び順で結果が変わらない（Codex 指摘の順序依存の解消）。
 fn resolve_dependents(
     w: &redb::WriteTransaction,
     tenant: &str,
-    member: u64,
+    seeds: &[u64],
     role: u64,
     cascade: bool,
     steps: &mut usize,
     changed: &mut usize,
 ) -> Result<()> {
-    // ADMIN の行を失ったメンバー。削除の確定のたびに増やし、評価順に依存しないよう固定点まで反復する。
-    let mut lost: HashSet<u64> = HashSet::new();
-    lost.insert(member);
+    // ADMIN の行を失った主体。削除の確定のたびに増やし、評価順に依存しないよう固定点まで反復する。
+    let mut lost: HashSet<u64> = seeds.iter().copied().collect();
     loop {
         let mut deleted = false;
-        let mut seeds: Vec<u64> = lost.iter().copied().collect();
-        seeds.sort_unstable();
-        let mut queue = seeds;
+        let mut queue: Vec<u64> = lost.iter().copied().collect();
+        queue.sort_unstable();
         while let Some(x) = queue.pop() {
             *steps += 1;
             if *steps > MAX_CASCADE_STEPS {
@@ -368,6 +368,8 @@ pub(crate) fn apply_in_txn(
     for role in &roles {
         // PostgreSQL と同じく、ADMIN の判定はロール単位で最初に行う。
         let grantor = authorize(w, tenant, req, role.id)?;
+        // この文で `role` への ADMIN を失う主体。直接の変更をすべて反映した後にまとめて依存を評価する。
+        let mut lost_admins: Vec<u64> = Vec::new();
         for member in &members {
             if req.is_grant {
                 if would_create_cycle(w, tenant, member.id, role.id)? {
@@ -376,10 +378,31 @@ pub(crate) fn apply_in_txn(
                         member.def.name.clone(),
                     ));
                 }
-                changed += grant_one(w, tenant, req, role, member, grantor, &mut steps)?;
+                let (n, lost) = grant_one(w, tenant, req, role, member, grantor)?;
+                changed += n;
+                if lost {
+                    lost_admins.push(member.id);
+                }
             } else {
-                changed += revoke_one(w, tenant, req, role, member, grantor, &mut steps)?;
+                let (n, lost) = revoke_one(w, tenant, req, role, member, grantor)?;
+                changed += n;
+                if lost {
+                    lost_admins.push(member.id);
+                }
             }
+        }
+        if !lost_admins.is_empty() {
+            // GRANT 側（ADMIN を真から偽へ更新）は常に RESTRICT 契約、REVOKE 側は文の CASCADE に従う。
+            let cascade = !req.is_grant && req.cascade;
+            resolve_dependents(
+                w,
+                tenant,
+                &lost_admins,
+                role.id,
+                cascade,
+                &mut steps,
+                &mut changed,
+            )?;
         }
     }
     Ok(changed)
@@ -392,8 +415,7 @@ fn grant_one(
     role: &Resolved,
     member: &Resolved,
     grantor: u64,
-    steps: &mut usize,
-) -> Result<usize> {
+) -> Result<(usize, bool)> {
     match get_membership(w, tenant, member.id, role.id)? {
         None => {
             // 既定値: ADMIN は偽、INHERIT は付与時点の付与先ロールの属性、SET は真。
@@ -405,7 +427,7 @@ fn grant_one(
                 grantor_id: Some(grantor),
             };
             put_membership_in_txn(w, tenant, member.id, role.id, opts)?;
-            Ok(1)
+            Ok((1, false))
         }
         Some(existing) => {
             let same_grantor = existing.grantor_id == Some(grantor);
@@ -426,16 +448,12 @@ fn grant_one(
                 updated.set = v;
             }
             if updated == existing {
-                return Ok(0);
+                return Ok((0, false));
             }
             put_membership_in_txn(w, tenant, member.id, role.id, updated)?;
-            let mut changed = 1usize;
-            // ADMIN が真から偽へ落ちる更新は `REVOKE ADMIN OPTION` と同じ依存検査を通す（RESTRICT 契約。
-            // 依存があれば `2BP01` で txn 全体が巻き戻る）。
-            if existing.admin && !updated.admin {
-                resolve_dependents(w, tenant, member.id, role.id, false, steps, &mut changed)?;
-            }
-            Ok(changed)
+            // ADMIN が真から偽へ落ちる更新は `REVOKE ADMIN OPTION` と同じ依存検査（呼び出し側が文全体を
+            // まとめて評価する。RESTRICT 契約で、依存があれば `2BP01` で txn 全体が巻き戻る）に回す。
+            Ok((1, existing.admin && !updated.admin))
         }
     }
 }
@@ -447,14 +465,13 @@ fn revoke_one(
     role: &Resolved,
     member: &Resolved,
     grantor: u64,
-    steps: &mut usize,
-) -> Result<usize> {
+) -> Result<(usize, bool)> {
     let Some(existing) = get_membership(w, tenant, member.id, role.id)? else {
-        return Ok(0);
+        return Ok((0, false));
     };
     // 所有者相当は付与者を問わず取り消せる。そうでなければ付与者が一致する行だけ（不一致は警告相当で何もしない）。
     if !req.owner_equivalent && existing.grantor_id != Some(grantor) {
-        return Ok(0);
+        return Ok((0, false));
     }
     let mut changed = 0usize;
     let mut lost_admin = false;
@@ -480,18 +497,8 @@ fn revoke_one(
             }
         }
     }
-    if lost_admin {
-        resolve_dependents(
-            w,
-            tenant,
-            member.id,
-            role.id,
-            req.cascade,
-            steps,
-            &mut changed,
-        )?;
-    }
     // INHERIT を失う（または行ごと消える）ことによる、ADMIN の到達性の変化は追跡しない。依存の解決は ADMIN の
-    // 根拠である直接の行に限る（到達性の再評価は後続で扱う。ADR §10 の対象外）。
-    Ok(changed)
+    // 根拠である直接の行に限る（到達性の再評価は後続で扱う。ADR §11 の対象外）。ADMIN の行を失ったかどうかは
+    // 呼び出し側へ返し、文全体の変更を反映した後にまとめて依存を評価させる。
+    Ok((changed, lost_admin))
 }

@@ -1,34 +1,43 @@
-//! `CREATE ROLE`／`CREATE USER`／`DROP ROLE` の実行本体（SQL-39 のポインタ、Issue #1962。設計記録:
-//! `docs/design/role-privilege-model.md`）。
+//! `CREATE ROLE`／`CREATE USER`／`DROP ROLE`／`ALTER ROLE`／`SET ROLE`／`RESET ROLE` の実行本体（SQL-39 の
+//! ポインタ、Issue #1962・#1963。設計記録: `docs/design/role-privilege-model.md`）。
 //!
 //! 役割: 構造検証済みの文（`sql::allowlist::{ValidatedCreateRole, ValidatedDropRole}`）をロールカタログ
 //! （`catalog::role`）への書き込みへ写し、`CatalogError` を SQLSTATE の契約へ写像する。呼び出し元は
 //! `core.rs` の `ParsedSql::{CreateRole, DropRole}` 腕で、DDL 権限ゲート（`sql::ddl::require_ddl_permission`。
 //! 権限なしは対象の有無を問わず `42501`）と明示トランザクション内の `0A000` を通過した後にだけ来る。
 //! `CREATEROLE`／`ADMIN OPTION` による判定への差し替えは #1966・#1971 の担当で、それまでは DDL 権限ゲートで
-//! 代替する（ポリシー DDL と同じ方針）。
+//! 代替する（ポリシー DDL と同じ方針）。`ALTER ROLE` も同じゲートを通過した後にだけ来る。
+//!
+//! `SET ROLE`（Issue #1963）: DDL 権限ゲートは通らない。認可は「セッションのロール（`session_role_id`）から
+//! `SET` 真のメンバーシップの経路で対象へ到達できるか」だけで決まり（ADR D4）、変えるのは
+//! `SessionState::current_role_id` だけ（テナントの可視範囲・`ddl_allowed`・`session_role_id` は不変）。
+//! ロール未束縛のセッションは、カタログ照会・名前解決より前に `42501`（主体の無いセッションにロールの
+//! 有無を示さない。fail-closed）。`RESET ROLE`・`SET ROLE NONE` は現在のロールをセッションのロールへ戻す。
 //!
 //! パスワード: 平文は SCRAM-SHA-256 検証子（`engine::crypto::scram_verifier`。wire-server の認証と同一形式）
 //! にして保存し、平文は保存もエラー応答への反映もしない。salt は CSPRNG（`crypto::random`）で作り、乱数源が
 //! 読めなければロールを作らない（fail-closed）。
 //!
-//! ログイン名対応表（`catalog::role::register_login_in_txn`）へは登録しない: テナント修飾子を提供する経路が
-//! まだ無く、カタログのロールで認証する経路（#2233）も無いため、`LOGIN` 属性はロール blob に保存するだけで
-//! ログインはできない状態になる（fail-closed）。修飾子の提供と登録は #2233 の担当。
+//! ログイン名対応表（Issue #2233）: ロールの作成・削除・改名は `catalog::role` が同じ txn で対応表
+//! （修飾子は `tenant_id` から決定的に導出）を更新する。認証（wire-server の SCRAM）が対応表から検証子・
+//! `VALID UNTIL`・`CONNECTION LIMIT` を引く。`VALID UNTIL` のリテラルはここでセッションの TimeZone により
+//! UTC マイクロ秒へ解決する（`'infinity'` は期限なし）。
 //!
 //! テナント境界（P0）: scope は呼び出し元が渡す検証済みの `tenant_id` だけ。他テナントのロールは不在と
 //! 同じ経路・同じ `42704` になる。エラー文言は固定で、内部 ID・tenant_id・依存元・パスワードを含めない。
 
 use crate::catalog::role::membership_apply::{MembershipChangeError, NewRoleMemberships};
 use crate::catalog::role::{
-    DropRolesError, RoleDef, ROLE_ALREADY_EXISTS_MESSAGE, ROLE_HAS_DEPENDENTS_MESSAGE,
+    DropRolesError, RoleDef, SetRoleResolution, ROLE_ALREADY_EXISTS_MESSAGE,
+    ROLE_HAS_DEPENDENTS_MESSAGE, ROLE_IN_SESSION_USE_MESSAGE, ROLE_NOT_FOUND_MESSAGE,
 };
 use crate::catalog::CatalogError;
 use crate::crypto::scram_verifier::{
     generate_verifier, GenerateVerifierError, ScramVerifier, SALT_LEN, SCRAM_ITERATIONS,
 };
 use crate::sql::allowlist::{
-    RolePassword, SqlSurfaceError, ValidatedCreateRole, ValidatedDropRole,
+    AlterRoleAction, RolePassword, SetRoleTarget, SqlSurfaceError, ValidatedAlterRole,
+    ValidatedCreateRole, ValidatedDropRole, ValidatedSetRole,
 };
 use crate::sql::mode::SessionState;
 use crate::storage::Storage;
@@ -55,6 +64,10 @@ impl DropRoleOutcome {
         self.skipped
     }
 }
+
+/// `ALTER ROLE`／`ALTER USER` の成功応答（結果を持たない。wire はコマンドタグ `ALTER ROLE` を返す）。
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub struct AlterRoleOutcome {}
 
 /// パスワードを保存用の検証子文字列にする。空文字列は「パスワード無し」（空）。
 ///
@@ -111,6 +124,44 @@ fn build_verifier(password: Option<&RolePassword>) -> Result<Vec<u8>, SqlSurface
     Ok(verifier.to_verifier_string().into_bytes())
 }
 
+/// `VALID UNTIL` のリテラルを UTC マイクロ秒へ解決する。`'infinity'`（大小無視）は `None`（期限なし）。
+/// 解析できない値は `22007`／`22008`／`22023`（文言に値を含めない。Issue #2233）。
+fn resolve_valid_until(
+    literal: &str,
+    session: &SessionState,
+) -> Result<Option<i64>, SqlSurfaceError> {
+    use crate::datetime::{DateTimeLiteralError, TimestampTzLiteralError};
+    if literal.trim().eq_ignore_ascii_case("infinity") {
+        return Ok(None);
+    }
+    // 日付だけの書式（`'2030-01-01'`）は PostgreSQL と同じくセッション TimeZone の当日 0 時として扱う。
+    if let Ok(days) = crate::datetime::parse_date(literal.trim()) {
+        let naive = i64::from(days).saturating_mul(crate::datetime::MICROS_PER_DAY);
+        return session
+            .time_zone()
+            .local_to_utc_micros(naive)
+            .filter(|m| crate::datetime::validate_timestamptz_micros(*m))
+            .map(Some)
+            .ok_or_else(|| {
+                SqlSurfaceError::datetime_field_overflow("VALID UNTIL value is out of range")
+            });
+    }
+    match crate::datetime::parse_timestamptz(literal.trim(), session.time_zone()) {
+        Ok(micros) => Ok(Some(micros)),
+        Err(TimestampTzLiteralError::Literal(DateTimeLiteralError::Format(_))) => Err(
+            SqlSurfaceError::invalid_datetime_format("invalid VALID UNTIL value"),
+        ),
+        Err(TimestampTzLiteralError::Literal(DateTimeLiteralError::Overflow(_))) => Err(
+            SqlSurfaceError::datetime_field_overflow("VALID UNTIL value is out of range"),
+        ),
+        Err(TimestampTzLiteralError::UnknownTimeZone) => {
+            Err(SqlSurfaceError::InvalidParameterValue {
+                detail: "time zone not recognized",
+            })
+        }
+    }
+}
+
 /// `CREATE ROLE`／`CREATE USER` を実行する（権限・明示 Tx のゲートは呼び出し元で通過済み）。
 pub(crate) fn execute_create_role(
     storage: &Storage,
@@ -119,12 +170,16 @@ pub(crate) fn execute_create_role(
     stmt: &ValidatedCreateRole,
 ) -> Result<CreateRoleOutcome, SqlSurfaceError> {
     let scram_verifier = build_verifier(stmt.password.as_ref())?;
+    let valid_until = match &stmt.valid_until_literal {
+        Some(lit) => resolve_valid_until(lit, session)?,
+        None => None,
+    };
     let def = RoleDef {
         id: 0,
         name: stmt.name.clone(),
         attributes: stmt.attributes,
-        connection_limit: -1,
-        valid_until: None,
+        connection_limit: stmt.connection_limit.unwrap_or(-1),
+        valid_until,
         scram_verifier,
         legacy_phc: Vec::new(),
     };
@@ -176,7 +231,128 @@ pub(crate) fn execute_drop_role(
     }
 }
 
-/// ロールカタログの失敗を SQL 表層の契約へ写像する（同名の既存 `42710`・ロール不在 `42704`・依存あり
+/// `ALTER ROLE`／`ALTER USER` を実行する（DDL 権限・明示 Tx のゲートは呼び出し元で通過済み。Issue #1963）。
+///
+/// - オプション変更: 指定した属性・パスワードだけを書き換える（`PASSWORD NULL` は検証子を空にする。
+///   `legacy_phc` は保つ。`VALID UNTIL`・`CONNECTION LIMIT` は指定時だけ書き換える）。指定が空なら存在の確認だけをする
+/// - `RENAME TO`: 格納キーだけを移す。対象がセッションのロール・現在のロールなら `0A000`
+///   （PostgreSQL と同じ）。新名の重複は `42710`
+///
+/// 他テナントにだけ在るロールは不在と同じ `42704`。
+pub(crate) fn execute_alter_role(
+    storage: &Storage,
+    tenant_id: &str,
+    session: &SessionState,
+    stmt: &ValidatedAlterRole,
+) -> Result<AlterRoleOutcome, SqlSurfaceError> {
+    match &stmt.action {
+        AlterRoleAction::Options(patch) => {
+            let new_verifier = match &patch.password {
+                Some(pw) => Some(build_verifier(pw.as_ref())?),
+                None => None,
+            };
+            let new_valid_until = match &patch.valid_until_literal {
+                Some(lit) => Some(resolve_valid_until(lit, session)?),
+                None => None,
+            };
+            if new_verifier.is_none()
+                && new_valid_until.is_none()
+                && patch.connection_limit.is_none()
+                && patch.login.is_none()
+                && patch.inherit.is_none()
+                && patch.createrole.is_none()
+                && patch.createdb.is_none()
+            {
+                // 指定なしは存在の確認だけ（書き込まない）。
+                return match storage.get_role(tenant_id, &stmt.name) {
+                    Ok(Some(_)) => Ok(AlterRoleOutcome {}),
+                    Ok(None) => Err(SqlSurfaceError::UndefinedRole {
+                        name: stmt.name.clone(),
+                    }),
+                    Err(e) => Err(map_role_error(e, &stmt.name)),
+                };
+            }
+            storage
+                .alter_role(tenant_id, &stmt.name, |def| {
+                    if let Some(v) = patch.login {
+                        def.attributes.login = v;
+                    }
+                    if let Some(v) = patch.inherit {
+                        def.attributes.inherit = v;
+                    }
+                    if let Some(v) = patch.createrole {
+                        def.attributes.createrole = v;
+                    }
+                    if let Some(v) = patch.createdb {
+                        def.attributes.createdb = v;
+                    }
+                    if let Some(v) = new_verifier {
+                        def.scram_verifier = v;
+                    }
+                    if let Some(v) = new_valid_until {
+                        def.valid_until = v;
+                    }
+                    if let Some(v) = patch.connection_limit {
+                        def.connection_limit = v;
+                    }
+                })
+                .map_err(|e| map_role_error(e, &stmt.name))?;
+            Ok(AlterRoleOutcome {})
+        }
+        AlterRoleAction::Rename { new_name } => {
+            let protected: Vec<u64> = [session.session_role_id(), session.current_role_id()]
+                .into_iter()
+                .flatten()
+                .collect();
+            match storage.rename_role(tenant_id, &stmt.name, new_name, &protected) {
+                Ok(()) => Ok(AlterRoleOutcome {}),
+                Err(CatalogError::Invalid(m)) if m == ROLE_ALREADY_EXISTS_MESSAGE => {
+                    Err(SqlSurfaceError::DuplicateRole {
+                        name: new_name.clone(),
+                    })
+                }
+                Err(e) => Err(map_role_error(e, &stmt.name)),
+            }
+        }
+    }
+}
+
+/// `SET [SESSION] ROLE`／`RESET ROLE` を実行する（Issue #1963）。判定順は未束縛 `42501`（照会より前）→
+/// 自テナントのカタログで名前解決（不在・他テナントのみは同じ `42704`）→ 認可（`42501`）→ 代入。
+/// 失敗した `SET ROLE` はセッションを変えない。`SessionState` を書き換えるのは認可後の 1 か所だけ。
+pub(crate) fn execute_set_role(
+    storage: &Storage,
+    tenant_id: &str,
+    session: &mut SessionState,
+    stmt: &ValidatedSetRole,
+) -> Result<(), SqlSurfaceError> {
+    match &stmt.target {
+        SetRoleTarget::None => {
+            session.reset_current_role();
+            Ok(())
+        }
+        SetRoleTarget::Role(name) => {
+            let Some(session_role) = session.session_role_id() else {
+                return Err(SqlSurfaceError::InsufficientPrivilege);
+            };
+            match storage
+                .resolve_settable_role(tenant_id, session_role, name)
+                .map_err(|e| map_role_error(e, name))?
+            {
+                SetRoleResolution::NotFound => {
+                    Err(SqlSurfaceError::UndefinedRole { name: name.clone() })
+                }
+                SetRoleResolution::Denied => Err(SqlSurfaceError::InsufficientPrivilege),
+                SetRoleResolution::Allowed(id) => {
+                    session.set_current_role_id(id);
+                    Ok(())
+                }
+            }
+        }
+    }
+}
+
+/// ロールカタログの失敗を SQL 表層の契約へ写像する（同名の既存 `42710`・ロール不在 `42704`・使用中の改名 `0A000`・依存あり
 /// `2BP01`・件数上限 `54000`・形状不正 `22000`・ロック timeout `55P03`・その他 `XX000`）。文言は固定で、
 /// 内部 ID・tenant_id・依存元・パスワードを含めない。`role_name` は利用者自身が書いた名前。
 pub(crate) fn map_role_error(e: CatalogError, role_name: &str) -> SqlSurfaceError {
@@ -190,6 +366,12 @@ pub(crate) fn map_role_error(e: CatalogError, role_name: &str) -> SqlSurfaceErro
             SqlSurfaceError::RoleHasDependents {
                 name: role_name.to_string(),
             }
+        }
+        CatalogError::Invalid(m) if m == ROLE_NOT_FOUND_MESSAGE => SqlSurfaceError::UndefinedRole {
+            name: role_name.to_string(),
+        },
+        CatalogError::Invalid(m) if m == ROLE_IN_SESSION_USE_MESSAGE => {
+            SqlSurfaceError::feature_not_supported("a role in use by the session cannot be renamed")
         }
         CatalogError::Invalid(_) => SqlSurfaceError::invalid_input("invalid role definition"),
         CatalogError::ViewLimitExceeded(_) => SqlSurfaceError::payload_too_large("too many roles"),

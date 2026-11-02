@@ -3501,6 +3501,8 @@ pub enum CatalogError {
     /// 組み込み SCHEMA（`public`・`pg_catalog`・`information_schema`）の削除（TABLE-27・
     /// Issue #1713。`42501`）。
     BuiltinSchema(String),
+    /// 呼び出し主体が対象の所有者でない（Issue #2236。`42501`。対象名・所有者を含めない）。
+    NotObjectOwner,
     /// 明示トランザクション（SQL-31・TASK-221）の単一ライタ占有により、書き込み
     /// トランザクションの取得がロック待ちの上限を超過した（`storage::StorageError`
     /// から写像。[`convert_storage_error`] 参照）。
@@ -3646,6 +3648,7 @@ impl fmt::Display for CatalogError {
                 write!(f, "reserved schema name: {name}")
             }
             CatalogError::BuiltinSchema(name) => write!(f, "built-in schema: {name}"),
+            CatalogError::NotObjectOwner => write!(f, "must be owner of the object"),
             CatalogError::WriteLockTimeout => {
                 write!(f, "write lock not available: timed out waiting for writer")
             }
@@ -3736,6 +3739,7 @@ impl std::error::Error for CatalogError {
             | CatalogError::SchemaNotFound(_)
             | CatalogError::ReservedSchemaName(_)
             | CatalogError::BuiltinSchema(_)
+            | CatalogError::NotObjectOwner
             | CatalogError::ColumnNotFound(_)
             | CatalogError::ProtectedColumn(_)
             | CatalogError::IncompatibleTypeChange { .. }
@@ -5637,6 +5641,7 @@ fn drop_view_in_txn(write_txn: &redb::WriteTransaction, name: &str) -> Result<()
     // ビューの権限（ACL。全テナント分。SQL-40・Issue #1961）。同名再作成へ旧付与を引き継がせない。
     drop(views_table);
     privilege::remove_relation_acl_in_txn(write_txn, name)?;
+    privilege::owner::remove_relation_owners_in_txn(write_txn, name)?;
     // commit 記録（SQL-38・Issue #2404）: ビュー定義の変更は表世代を進めないため DDL として記録する。
     crate::storage::commit_log::note_ddl(write_txn, name);
     Ok(())
@@ -12137,6 +12142,8 @@ impl Storage {
             let mut table = write_txn.open_table(CATALOG_TABLE)?;
             table.insert(schema.name.as_str(), encoded.as_slice())?;
         }
+        // 予約された作成者を所有者として同じ txn に書く（Issue #2236。別 txn だと DROP・同名再作成と競合する）。
+        privilege::owner::apply_pending_relation_owner_in_txn(write_txn, schema.name.as_str())?;
         Ok(())
     }
 
@@ -12386,6 +12393,7 @@ impl Storage {
             row_security::remove_row_security_for_table_in_txn(write_txn, name)?;
             // 権限（ACL。全テナント分。SQL-40・Issue #1961）。残置すると同名再作成で旧付与が復活する（fail-open）。
             privilege::remove_relation_acl_in_txn(write_txn, name)?;
+            privilege::owner::remove_relation_owners_in_txn(write_txn, name)?;
             // 永続キー索引（Issue #1071）。残置すると参照整合性検査が fail-open になりうる。
             crate::key_index::drop_indexes_for_table_in_txn(write_txn, name)?;
             // commit 記録（SQL-38・Issue #2404）: スキーマ・カタログを変える書き込みは DDL として記録する。
@@ -13224,6 +13232,7 @@ impl Storage {
         row_security::rename_row_security_table_in_txn(&write_txn, table_name, new_table_name)?;
         // 権限（ACL。全テナント分）も新しい表キーへ移す（SQL-40・Issue #1961）。
         privilege::rename_relation_acl_in_txn(&write_txn, table_name, new_table_name)?;
+        privilege::owner::rename_relation_owners_in_txn(&write_txn, table_name, new_table_name)?;
 
         // カタログの付け替え（`encode_schema` が不変条件を再検証する）。
         schema.rename_table_references(new_table_name);
@@ -15157,6 +15166,8 @@ impl Storage {
             views_table.insert(name, encoded.as_slice())?;
             // commit 記録（SQL-38・Issue #2404）: ビュー定義の変更は表世代を進めないため DDL として記録する。
             crate::storage::commit_log::note_ddl(&write_txn, name);
+            // 予約された作成者を所有者として同じ txn に書く（Issue #2236）。
+            privilege::owner::apply_pending_relation_owner_in_txn(&write_txn, name)?;
         }
         crate::recovery::commit_boundary::commit(write_txn).map_err(convert_storage_error)
     }
@@ -15222,6 +15233,7 @@ impl Storage {
                 // ビューの権限（ACL。全テナント分。SQL-40・Issue #1961）。同名再作成へ旧付与を引き継がせない。
                 drop(views_table);
                 privilege::remove_relation_acl_in_txn(&write_txn, name)?;
+                privilege::owner::remove_relation_owners_in_txn(&write_txn, name)?;
                 // commit 記録（SQL-38・Issue #2404）: ビュー定義の変更は表世代を進めないため DDL として記録する。
                 crate::storage::commit_log::note_ddl(&write_txn, name);
                 Vec::new()
@@ -15929,6 +15941,11 @@ impl Storage {
             views_table.insert(name, encoded.as_slice())?;
             // commit 記録（SQL-38・Issue #2404）: ビュー定義の変更は表世代を進めないため DDL として記録する。
             crate::storage::commit_log::note_ddl(&write_txn, name);
+            // 新規に作った（旧定義なし）ときだけ、予約された作成者を所有者として同じ txn に書く
+            // （置換は既存の所有者を変えない。Issue #2236）。
+            if current.is_none() {
+                privilege::owner::apply_pending_relation_owner_in_txn(&write_txn, name)?;
+            }
             // 置換（旧定義あり）では、未 commit の新定義を前提に依存ビューを同一 txn で
             // 再検証する。失敗は `?` で txn ごと破棄され、旧定義が残る（原子性）。
             if current.is_some() {
@@ -16683,6 +16700,7 @@ pub(crate) fn table_lookup_error(e: CatalogError) -> SqlSurfaceError {
         | CatalogError::SchemaNotFound(_)
         | CatalogError::ReservedSchemaName(_)
         | CatalogError::BuiltinSchema(_)
+        | CatalogError::NotObjectOwner
         | CatalogError::ColumnNotFound(_)
         | CatalogError::ProtectedColumn(_)
         | CatalogError::IncompatibleTypeChange { .. }

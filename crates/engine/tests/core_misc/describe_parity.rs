@@ -73,8 +73,11 @@ fn assert_describe_matches_execute(core: &EngineCore, ctx: &PolicyContext, sql: 
         | SqlOutcome::AlterPolicy(_)
         | SqlOutcome::DropPolicy(_)
         | SqlOutcome::GrantRevoke(_)
+        | SqlOutcome::AlterOwner(_)
         | SqlOutcome::CreateRole(_)
         | SqlOutcome::DropRole(_)
+        | SqlOutcome::AlterRole(_)
+        | SqlOutcome::SetRole { .. }
         | SqlOutcome::Insert(_)
         | SqlOutcome::Truncate(_)
         | SqlOutcome::Delete(_)

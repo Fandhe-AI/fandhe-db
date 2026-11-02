@@ -8611,6 +8611,13 @@ fn bind_call(
                 args.len()
             )));
         }
+        // EXECUTE 権限（Issue #2235。拒否集合は `core.rs` が文の実行区間の頭で張る。入れ子の展開もここを
+        // 通るので呼び出し元ロールで判定される）。引数個数による解決（不一致は `42883`）の後・展開の前に
+        // 検査し、拒否は副作用の前に返る。ACL 対象はカタログ由来の関数だけで、同名のセッションローカル
+        // 関数は免除する。
+        if env.registry.is_catalog_origin(name) {
+            crate::sql::object_privilege::check_execute(name)?;
+        }
         // 型注釈つきパラメータ（SQL-66 (1)）は実引数を宣言型へ暗黙変換する。型なしは従来どおり。
         // `param_types.len() == params.len()` は `define_function_with_types` が確立する不変条件。
         let mut bound_args = Vec::with_capacity(args.len());

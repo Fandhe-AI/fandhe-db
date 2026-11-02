@@ -1155,3 +1155,53 @@ fn extended_transaction_aliases_tags_and_failed_state() {
     send_sync(&mut stream);
     assert_ready_for_query_status(&mut stream, b'I');
 }
+/// Issue #1947（SQL-31・SQL-69）: savepoint を作った後に失敗した Tx は、拡張クエリでも
+/// `ROLLBACK TO` の Parse/Bind/Execute が `Failed` 中に受理されて `InTransaction`（`'T'`）へ復帰し、
+/// 復帰後の書き込みだけが `COMMIT` で確定する。ほかの文は従来どおり `25P02`。
+#[test]
+fn extended_rollback_to_recovers_failed_transaction() {
+    let (core, _guard) = new_core_with_documents_table();
+    let users_path = write_user_store_file(&[("alice", "tenant-a", "correct-horse")]);
+    let addr = spawn_server_with_engine(&users_path, Arc::clone(&core));
+    let mut stream = authenticate_to_ready_for_query(addr, "alice", "correct-horse");
+
+    send_simple_query(&mut stream, "BEGIN");
+    assert_eq!(read_command_complete(&mut stream), "BEGIN");
+    read_ready_for_query(&mut stream);
+    send_simple_query(&mut stream, "SAVEPOINT a");
+    assert_eq!(read_command_complete(&mut stream), "SAVEPOINT");
+    read_ready_for_query(&mut stream);
+    send_simple_query(&mut stream, &insert_sql(45, "op-1947-45"));
+    assert_eq!(read_command_complete(&mut stream), "INSERT 0 1");
+    read_ready_for_query(&mut stream);
+
+    // 入れ子の BEGIN で Failed へ（savepoint があるため復帰可能）。
+    send_simple_query(&mut stream, "BEGIN");
+    expect_error_response_with_sqlstate(&mut stream, "25001");
+    assert_ready_for_query_status(&mut stream, b'E');
+
+    // ROLLBACK TO 以外は拡張クエリでも 25P02。
+    send_length_prefixed_message(&mut stream, b'P', &parse_body("bad", "SELEC 1", 0));
+    expect_error_response_with_sqlstate(&mut stream, "25P02");
+    send_sync(&mut stream);
+    assert_ready_for_query_status(&mut stream, b'E');
+
+    // ROLLBACK TO a は Parse/Bind/Execute とも受理される。
+    parse_and_bind(&mut stream, "rbt", "prbt", "ROLLBACK TO a");
+    assert_eq!(
+        execute_and_read_command_complete(&mut stream, "prbt"),
+        "ROLLBACK"
+    );
+    send_sync(&mut stream);
+    assert_ready_for_query_status(&mut stream, b'T');
+
+    send_simple_query(&mut stream, &insert_sql(46, "op-1947-46"));
+    assert_eq!(read_command_complete(&mut stream), "INSERT 0 1");
+    read_ready_for_query(&mut stream);
+    send_simple_query(&mut stream, "COMMIT");
+    assert_eq!(read_command_complete(&mut stream), "COMMIT");
+    read_ready_for_query(&mut stream);
+
+    assert_eq!(visible_rows_with_id(&core, 45), 0);
+    assert_eq!(visible_rows_with_id(&core, 46), 1);
+}

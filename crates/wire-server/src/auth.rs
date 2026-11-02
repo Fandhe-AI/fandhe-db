@@ -10,7 +10,9 @@ pub mod argon2id;
 pub use engine::crypto::base64_std;
 pub mod blake2b;
 pub use engine::crypto::hmac_sha256;
+pub mod role_connections;
 pub mod scram;
+pub(crate) mod users_file_role;
 
 use std::collections::{HashMap, HashSet};
 use std::path::Path;
@@ -110,6 +112,9 @@ pub struct UserStore {
     /// （全 DDL 文が `42501` で拒否される。`sql::ddl::require_ddl_permission`
     /// ドキュメント参照）。
     ddl_allowed: HashSet<String>,
+    /// カタログのロールの `CONNECTION LIMIT` を強制する同時接続数の台帳（WIRE-18、Issue #2233）。
+    /// サーバー単位で共有される（`UserStore` を共有するため、複数のサーバーが混ざらない）。
+    role_connections: role_connections::RoleConnectionRegistry,
 }
 
 /// [`UserStore::load_from_file`] のロード時検証エラー（fail-closed。起動を中断する）。
@@ -326,6 +331,7 @@ impl UserStore {
             auth_method: AuthMethod::default(),
             scram_mock_key: None,
             ddl_allowed: HashSet::new(),
+            role_connections: role_connections::RoleConnectionRegistry::new(),
         })
     }
 
@@ -382,6 +388,11 @@ impl UserStore {
         let record = self.users.get(username)?;
         let verifier = record.scram_verifier.as_ref()?;
         Some((record.tenant_id.as_str(), verifier))
+    }
+
+    /// カタログのロールの同時接続数の台帳（`handshake` が認証成功の後に確保する。Issue #2233）。
+    pub fn role_connections(&self) -> &role_connections::RoleConnectionRegistry {
+        &self.role_connections
     }
 
     /// ロード済みレコード数。ユーザー名・テナント ID 等の存在情報は含まない
@@ -465,6 +476,7 @@ impl UserStore {
             auth_method: AuthMethod::default(),
             scram_mock_key: None,
             ddl_allowed: HashSet::new(),
+            role_connections: role_connections::RoleConnectionRegistry::new(),
         }
     }
 }

@@ -10,7 +10,7 @@
 //!
 //! 受理しない形（すべて固定文言。パスワードのリテラル・名前以外のトークンはエラーに含めない）:
 //! `SUPERUSER`／`BYPASSRLS`／`REPLICATION`（テナント境界を越える属性。`42501`）、`UNENCRYPTED PASSWORD`・
-//! `VALID UNTIL`・`CONNECTION LIMIT`・`SYSID` など後続 Issue の担当（`0A000`）、
+//! `SYSID` など後続 Issue の担当（`0A000`）、
 //! オプションの重複・矛盾・未知語・`$n` プレースホルダ・修飾名（`42601`）、予約名（`42939`）。
 //!
 //! パスワードの平文は [`RolePassword`] に閉じ込める。`Debug` は伏せ字で、`Display` は実装しない。
@@ -59,6 +59,10 @@ pub struct ValidatedCreateRole {
     pub(crate) attributes: RoleAttributes,
     /// `None` はパスワード未指定または `PASSWORD NULL`。
     pub(crate) password: Option<RolePassword>,
+    /// `VALID UNTIL '<文字列>'` の生のリテラル（時刻への解決は `sql::role_ddl` がセッションの TimeZone で行う）。
+    pub(crate) valid_until_literal: Option<String>,
+    /// `CONNECTION LIMIT <整数>`（-1 は無制限。範囲は構文段で検査済み）。
+    pub(crate) connection_limit: Option<i32>,
     /// `IN ROLE a, ...`（`IN GROUP` も同じ）: 新しいロールを `a` のメンバーにする。
     pub(crate) in_roles: Vec<String>,
     /// `ROLE b, ...`（`USER` も同じ）: `b` を新しいロールのメンバーにする。
@@ -196,17 +200,107 @@ pub(crate) fn validate_create_role_tokens(
     }
     let _ = p.eat_word("WITH");
 
-    let mut login = None;
-    let mut inherit = None;
-    let mut createrole = None;
-    let mut createdb = None;
+    let opts = parse_role_options(&mut p, false)?;
+    p.expect_end_of_statement()?;
+
+    Ok(ValidatedCreateRole {
+        name,
+        attributes: RoleAttributes {
+            login: opts.login.unwrap_or(is_user),
+            inherit: opts.inherit.unwrap_or(true),
+            createrole: opts.createrole.unwrap_or(false),
+            createdb: opts.createdb.unwrap_or(false),
+        },
+        password: opts.password.flatten(),
+        valid_until_literal: opts.valid_until,
+        connection_limit: opts.connection_limit,
+        in_roles: opts.in_roles.unwrap_or_default(),
+        member_roles: opts.member_roles.unwrap_or_default(),
+        admin_roles: opts.admin_roles.unwrap_or_default(),
+    })
+}
+
+/// `CREATE ROLE`／`ALTER ROLE` が共有するオプション列の解析結果。`None` は「指定なし」で、既定値を当てるのは
+/// CREATE 側、「変更なし」と読むのは ALTER 側（拒否規則を 1 か所に保つため解析は共有する。Issue #1963）。
+#[derive(Default)]
+struct ParsedRoleOptions {
+    login: Option<bool>,
+    inherit: Option<bool>,
+    createrole: Option<bool>,
+    createdb: Option<bool>,
+    /// `None` は未指定、`Some(None)` は `PASSWORD NULL`。
+    password: Option<Option<RolePassword>>,
+    /// `VALID UNTIL` の生のリテラル（Issue #2233）。
+    valid_until: Option<String>,
+    /// `CONNECTION LIMIT` の値（Issue #2233）。
+    connection_limit: Option<i32>,
+    /// `IN ROLE`／`IN GROUP` の名前列（CREATE のみ。Issue #2232）。
+    in_roles: Option<Vec<String>>,
+    /// `ROLE`／`USER` の名前列（CREATE のみ）。
+    member_roles: Option<Vec<String>>,
+    /// `ADMIN` の名前列（CREATE のみ）。
+    admin_roles: Option<Vec<String>>,
+}
+
+/// `VALID UNTIL` の後ろ（文字列リテラルのみ）を読む。エラー文言にリテラルを含めない。
+fn parse_valid_until_value(p: &mut Parser<'_>) -> Result<String, SqlSurfaceError> {
+    if !p.eat_word("UNTIL") {
+        return Err(SqlSurfaceError::unsupported("expected UNTIL after VALID"));
+    }
+    match p.advance() {
+        Some(Token::StringLiteral(s)) => Ok(s.clone()),
+        _ => Err(SqlSurfaceError::unsupported(
+            "expected a string literal after VALID UNTIL",
+        )),
+    }
+}
+
+/// `CONNECTION LIMIT` の後ろ（符号付き整数リテラル。-1 以上・`i32` の範囲）を読む。
+/// 整数でないものは `42601`、範囲外は `22023`（値を文言に含めない）。
+fn parse_connection_limit_value(p: &mut Parser<'_>) -> Result<i32, SqlSurfaceError> {
+    // `LIMIT` は字句段で予約語（`Keyword::Limit`）として切り出される。
+    if !matches!(p.peek(), Some(Token::Keyword(Keyword::Limit))) {
+        return Err(SqlSurfaceError::unsupported(
+            "expected LIMIT after CONNECTION",
+        ));
+    }
+    p.advance();
+    let negative = matches!(p.peek(), Some(Token::Punct('-')));
+    if negative {
+        p.advance();
+    }
+    let digits = match p.advance() {
+        Some(Token::Number(n)) if !n.is_empty() && n.bytes().all(|b| b.is_ascii_digit()) => {
+            n.clone()
+        }
+        _ => {
+            return Err(SqlSurfaceError::unsupported(
+                "expected an integer after CONNECTION LIMIT",
+            ))
+        }
+    };
+    let out_of_range = || SqlSurfaceError::InvalidParameterValue {
+        detail: "invalid connection limit",
+    };
+    let magnitude: i64 = digits.parse().map_err(|_| out_of_range())?;
+    let value = if negative { -magnitude } else { magnitude };
+    if value < -1 {
+        return Err(out_of_range());
+    }
+    i32::try_from(value).map_err(|_| out_of_range())
+}
+
+/// ロールのオプション列（`LOGIN`・`PASSWORD '...'` など）を文末または `;` まで読む。`for_alter` が真のとき
+/// CREATE 専用語（`ROLE`・`USER`・`ADMIN`・`SYSID`）は `42601`、ロール単位の設定・`IN DATABASE`（`IN`・`SET`・
+/// `RESET`）は `0A000`。偽（CREATE）のときは従来どおり後続 Issue の担当語をまとめて `0A000`。
+fn parse_role_options(
+    p: &mut Parser<'_>,
+    for_alter: bool,
+) -> Result<ParsedRoleOptions, SqlSurfaceError> {
+    let mut out = ParsedRoleOptions::default();
     let mut superuser_group = None;
     let mut bypassrls_group = None;
     let mut replication_group = None;
-    let mut password: Option<Option<RolePassword>> = None;
-    let mut in_roles: Option<Vec<String>> = None;
-    let mut member_roles: Option<Vec<String>> = None;
-    let mut admin_roles: Option<Vec<String>> = None;
 
     while let Some(tok) = p.peek() {
         let word = match tok {
@@ -216,14 +310,14 @@ pub(crate) fn validate_create_role_tokens(
         };
         p.advance();
         match word.as_str() {
-            "LOGIN" => set_once(&mut login, true)?,
-            "NOLOGIN" => set_once(&mut login, false)?,
-            "INHERIT" => set_once(&mut inherit, true)?,
-            "NOINHERIT" => set_once(&mut inherit, false)?,
-            "CREATEROLE" => set_once(&mut createrole, true)?,
-            "NOCREATEROLE" => set_once(&mut createrole, false)?,
-            "CREATEDB" => set_once(&mut createdb, true)?,
-            "NOCREATEDB" => set_once(&mut createdb, false)?,
+            "LOGIN" => set_once(&mut out.login, true)?,
+            "NOLOGIN" => set_once(&mut out.login, false)?,
+            "INHERIT" => set_once(&mut out.inherit, true)?,
+            "NOINHERIT" => set_once(&mut out.inherit, false)?,
+            "CREATEROLE" => set_once(&mut out.createrole, true)?,
+            "NOCREATEROLE" => set_once(&mut out.createrole, false)?,
+            "CREATEDB" => set_once(&mut out.createdb, true)?,
+            "NOCREATEDB" => set_once(&mut out.createdb, false)?,
             // 既定どおりなので何もしない（重複・矛盾だけ検出する）。
             "NOSUPERUSER" => set_once(&mut superuser_group, false)?,
             "NOBYPASSRLS" => set_once(&mut bypassrls_group, false)?,
@@ -236,28 +330,55 @@ pub(crate) fn validate_create_role_tokens(
                 if word == "ENCRYPTED" && !p.eat_word("PASSWORD") {
                     return Err(SqlSurfaceError::unsupported("unrecognized role option"));
                 }
-                if password.is_some() {
+                if out.password.is_some() {
                     return Err(SqlSurfaceError::unsupported(
                         "conflicting or redundant options",
                     ));
                 }
-                password = Some(parse_password_value(&mut p)?);
+                out.password = Some(parse_password_value(p)?);
             }
             "UNENCRYPTED" => {
                 return Err(SqlSurfaceError::feature_not_supported(
                     "UNENCRYPTED PASSWORD is not supported",
                 ));
             }
+            // ALTER ROLE のロール単位の設定・`IN DATABASE`（状態に依存しない拒否）。
+            "IN" | "SET" | "RESET" if for_alter => {
+                return Err(SqlSurfaceError::feature_not_supported(
+                    "per-role settings are not supported",
+                ));
+            }
+            // CREATE 専用語は ALTER では構文エラー。
+            "ROLE" | "USER" | "ADMIN" | "SYSID" if for_alter => {
+                return Err(SqlSurfaceError::unsupported("unrecognized role option"));
+            }
+            // 認証の有効期限・接続数上限（Issue #2233）。重複は他のオプションと同じ `42601`。
+            "VALID" => {
+                if out.valid_until.is_some() {
+                    return Err(SqlSurfaceError::unsupported(
+                        "conflicting or redundant options",
+                    ));
+                }
+                out.valid_until = Some(parse_valid_until_value(p)?);
+            }
+            "CONNECTION" => {
+                if out.connection_limit.is_some() {
+                    return Err(SqlSurfaceError::unsupported(
+                        "conflicting or redundant options",
+                    ));
+                }
+                out.connection_limit = Some(parse_connection_limit_value(p)?);
+            }
+            // メンバーシップ句（#2232。CREATE のみ。ALTER は上の腕で拒否済み）。
             "IN" => {
                 if !(p.eat_word("ROLE") || p.eat_word("GROUP")) {
                     return Err(SqlSurfaceError::unsupported("unrecognized role option"));
                 }
-                set_names_once(&mut in_roles, &mut p)?;
+                set_names_once(&mut out.in_roles, p)?;
             }
-            "ROLE" | "USER" => set_names_once(&mut member_roles, &mut p)?,
-            "ADMIN" => set_names_once(&mut admin_roles, &mut p)?,
-            // 認証側の意味づけ（#2233）は後続 Issue の担当。
-            "SYSID" | "VALID" | "CONNECTION" => {
+            "ROLE" | "USER" => set_names_once(&mut out.member_roles, p)?,
+            "ADMIN" => set_names_once(&mut out.admin_roles, p)?,
+            "SYSID" => {
                 return Err(SqlSurfaceError::feature_not_supported(
                     "this role option is not supported yet",
                 ));
@@ -265,21 +386,7 @@ pub(crate) fn validate_create_role_tokens(
             _ => return Err(SqlSurfaceError::unsupported("unrecognized role option")),
         }
     }
-    p.expect_end_of_statement()?;
-
-    Ok(ValidatedCreateRole {
-        name,
-        attributes: RoleAttributes {
-            login: login.unwrap_or(is_user),
-            inherit: inherit.unwrap_or(true),
-            createrole: createrole.unwrap_or(false),
-            createdb: createdb.unwrap_or(false),
-        },
-        password: password.flatten(),
-        in_roles: in_roles.unwrap_or_default(),
-        member_roles: member_roles.unwrap_or_default(),
-        admin_roles: admin_roles.unwrap_or_default(),
-    })
+    Ok(out)
 }
 
 /// [`ValidatedDropRole`] の構造検証本体（SQL-39、Issue #1962）。`DROP ROLE|USER [IF EXISTS] a[, b]...`。
@@ -307,6 +414,206 @@ pub(crate) fn validate_drop_role_tokens(
     Ok(ValidatedDropRole { names, if_exists })
 }
 
+/// `ALTER ROLE` のオプション変更。`None` は「変更なし」（Issue #1963）。
+#[derive(Debug, Clone, PartialEq, Eq, Default)]
+pub struct RoleOptionPatch {
+    pub(crate) login: Option<bool>,
+    pub(crate) inherit: Option<bool>,
+    pub(crate) createrole: Option<bool>,
+    pub(crate) createdb: Option<bool>,
+    /// `None` は変更なし、`Some(None)` は `PASSWORD NULL`（検証子を空にする）。
+    pub(crate) password: Option<Option<RolePassword>>,
+    /// `VALID UNTIL` の生のリテラル。`None` は変更なし（Issue #2233）。
+    pub(crate) valid_until_literal: Option<String>,
+    /// `CONNECTION LIMIT`。`None` は変更なし（Issue #2233）。
+    pub(crate) connection_limit: Option<i32>,
+}
+
+/// `ALTER ROLE` の変更内容。
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum AlterRoleAction {
+    /// 属性・パスワードの変更（空の指定は存在確認だけの no-op）。
+    Options(RoleOptionPatch),
+    /// `RENAME TO <新しい名前>`。
+    Rename { new_name: String },
+}
+
+/// 構造検証済みの `ALTER ROLE`／`ALTER USER`（SQL-39、Issue #1963）。実行は
+/// `sql::role_ddl::execute_alter_role`、呼び出し元は `core.rs` の `ParsedSql::AlterRole` 腕。
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ValidatedAlterRole {
+    pub(crate) name: String,
+    pub(crate) action: AlterRoleAction,
+}
+
+/// `SET ROLE` の対象。
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum SetRoleTarget {
+    /// 利用者が書いたロール名（存在・認可は実行段が判定する）。
+    Role(String),
+    /// `NONE`（セッションのロールへ戻す）。
+    None,
+}
+
+/// 構造検証済みの `SET [SESSION] ROLE ...`／`RESET ROLE`（SQL-39、Issue #1963）。実行は
+/// `sql::role_ddl::execute_set_role`、呼び出し元は `core.rs` の `ParsedSql::SetRole` 腕。
+/// `target` が `None` のときセッションのロールへ戻す（`RESET ROLE`・`SET ROLE NONE`・`SET role TO DEFAULT`）。
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ValidatedSetRole {
+    pub(crate) target: SetRoleTarget,
+    /// 文が `RESET ROLE` か（コマンドタグ `RESET`）。
+    pub(crate) is_reset_statement: bool,
+}
+
+/// 先頭 2 トークンが `ALTER ROLE`／`ALTER USER` か（汎用 `ALTER`〔`ALTER TABLE` 扱い〕より前に分岐する）。
+pub(crate) fn is_alter_role_statement(tokens: &[Token]) -> bool {
+    ident_at(tokens, 0, "ALTER") && is_role_or_user(tokens)
+}
+
+/// `SET [SESSION|LOCAL] ROLE ...` の頭か。`SET LOCAL` も真にして [`validate_set_role_tokens`] が
+/// `0A000` で拒否する（別経路の `42601` へ流さない）。`SET SESSION AUTHORIZATION` は含まない。
+pub(crate) fn is_set_role_statement(tokens: &[Token]) -> bool {
+    if !ident_at(tokens, 0, "SET") {
+        return false;
+    }
+    ident_at(tokens, 1, "ROLE")
+        || ((ident_at(tokens, 1, "SESSION") || ident_at(tokens, 1, "LOCAL"))
+            && ident_at(tokens, 2, "ROLE"))
+}
+
+/// 文が `RESET ROLE`（末尾 `;` 可）か。厳密一致のみ真。
+pub(crate) fn is_reset_role_statement(tokens: &[Token]) -> bool {
+    let mut p = Parser::new(tokens);
+    p.expect_ident_matching("RESET").is_ok()
+        && p.expect_ident_matching("ROLE").is_ok()
+        && p.expect_end_of_statement().is_ok()
+}
+
+/// [`ValidatedAlterRole`] の構造検証本体（SQL-39、Issue #1963）。カタログは照会しない。
+///
+/// 対象に `CURRENT_USER`／`CURRENT_ROLE`／`SESSION_USER`・`ALL` を取る形は `0A000`（状態に依存しない拒否）。
+pub(crate) fn validate_alter_role_tokens(
+    tokens: &[Token],
+) -> Result<ValidatedAlterRole, SqlSurfaceError> {
+    let mut p = Parser::new(tokens);
+    p.expect_ident_matching("ALTER")?;
+    p.advance();
+    let name = parse_role_name(&mut p)?;
+    let lower = name.to_ascii_lowercase();
+    if matches!(
+        lower.as_str(),
+        "current_user" | "current_role" | "session_user"
+    ) || lower == "all"
+    {
+        return Err(SqlSurfaceError::feature_not_supported(
+            "this ALTER ROLE target form is not supported",
+        ));
+    }
+    if is_reserved_syntax_word(&name) {
+        return Err(SqlSurfaceError::unsupported("invalid role name"));
+    }
+    if p.eat_word("RENAME") {
+        if !p.eat_word("TO") {
+            return Err(SqlSurfaceError::unsupported("expected TO after RENAME"));
+        }
+        let new_name = parse_role_name(&mut p)?;
+        if is_reserved_syntax_word(&new_name) {
+            return Err(SqlSurfaceError::unsupported("invalid role name"));
+        }
+        if is_reserved_role_name(&new_name) {
+            return Err(SqlSurfaceError::ReservedRoleName {
+                name: truncate_for_error(&new_name),
+            });
+        }
+        p.expect_end_of_statement()?;
+        return Ok(ValidatedAlterRole {
+            name,
+            action: AlterRoleAction::Rename { new_name },
+        });
+    }
+    let _ = p.eat_word("WITH");
+    let opts = parse_role_options(&mut p, true)?;
+    p.expect_end_of_statement()?;
+    Ok(ValidatedAlterRole {
+        name,
+        action: AlterRoleAction::Options(RoleOptionPatch {
+            login: opts.login,
+            inherit: opts.inherit,
+            createrole: opts.createrole,
+            createdb: opts.createdb,
+            password: opts.password,
+            valid_until_literal: opts.valid_until,
+            connection_limit: opts.connection_limit,
+        }),
+    })
+}
+
+/// [`ValidatedSetRole`] の構造検証本体（`SET [SESSION] ROLE {名前|'名前'|NONE}`・
+/// `SET [SESSION] role {TO|=} {名前|'名前'|NONE|DEFAULT}`。SQL-39、Issue #1963）。
+/// `SET LOCAL` は `0A000`、`$n`・修飾名・その他は `42601`。
+pub(crate) fn validate_set_role_tokens(
+    tokens: &[Token],
+) -> Result<ValidatedSetRole, SqlSurfaceError> {
+    let mut p = Parser::new(tokens);
+    p.expect_ident_matching("SET")?;
+    if p.eat_word("LOCAL") {
+        return Err(SqlSurfaceError::feature_not_supported(
+            "SET LOCAL is not supported",
+        ));
+    }
+    let _ = p.eat_word("SESSION");
+    p.expect_ident_matching("ROLE")?;
+    let with_assign = if p.eat_word("TO") {
+        true
+    } else if matches!(p.peek(), Some(Token::Punct('='))) {
+        p.advance();
+        true
+    } else {
+        false
+    };
+    let target = match p.advance() {
+        Some(Token::Ident(n)) if n.eq_ignore_ascii_case("NONE") => SetRoleTarget::None,
+        Some(Token::Ident(n)) if with_assign && n.eq_ignore_ascii_case("DEFAULT") => {
+            SetRoleTarget::None
+        }
+        Some(Token::Ident(n)) => {
+            let name = n.clone();
+            crate::catalog::validate_identifier(&name)
+                .map_err(|_| SqlSurfaceError::unsupported("invalid role name"))?;
+            // `DEFAULT` は予約語（PostgreSQL でも `SET ROLE DEFAULT` は構文エラー。`TO`／`=` 形のみ受理）。
+            if is_reserved_syntax_word(&name) || name.eq_ignore_ascii_case("DEFAULT") {
+                return Err(SqlSurfaceError::unsupported("invalid role name"));
+            }
+            SetRoleTarget::Role(name)
+        }
+        Some(Token::StringLiteral(s)) if s.eq_ignore_ascii_case("none") => SetRoleTarget::None,
+        Some(Token::StringLiteral(s)) => {
+            let name = s.clone();
+            crate::catalog::validate_identifier(&name)
+                .map_err(|_| SqlSurfaceError::unsupported("invalid role name"))?;
+            SetRoleTarget::Role(name)
+        }
+        Some(Token::QualifiedIdent { .. }) => {
+            return Err(SqlSurfaceError::unsupported(
+                "role names cannot be schema-qualified",
+            ))
+        }
+        _ => return Err(SqlSurfaceError::unsupported("expected a role name")),
+    };
+    p.expect_end_of_statement()?;
+    Ok(ValidatedSetRole {
+        target,
+        is_reset_statement: false,
+    })
+}
+
+/// `RESET ROLE` を [`ValidatedSetRole`]（`NONE` 相当・タグ `RESET`）にする。
+pub(crate) fn reset_role_statement() -> ValidatedSetRole {
+    ValidatedSetRole {
+        target: SetRoleTarget::None,
+        is_reset_statement: true,
+    }
+}
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -393,7 +700,9 @@ mod tests {
             format!("CREATE ROLE '{marker}'"),
             format!("CREATE ROLE r SUPERUSER PASSWORD '{marker}'"),
             format!("CREATE ROLE r UNENCRYPTED PASSWORD '{marker}'"),
-            format!("CREATE ROLE r PASSWORD '{marker}' VALID UNTIL '2030-01-01'"),
+            format!("CREATE ROLE r PASSWORD '{marker}' VALID UNTIL '{marker}' BOGUS"),
+            format!("CREATE ROLE r PASSWORD '{marker}' VALID 5"),
+            format!("CREATE ROLE r PASSWORD '{marker}' CONNECTION LIMIT '{marker}'"),
             format!("CREATE ROLE r PASSWORD '{marker}'; DROP TABLE t"),
         ] {
             let e = create(&sql).expect_err("rejected");
@@ -401,6 +710,47 @@ mod tests {
             assert!(!format!("{e:?}").contains(marker), "{e:?}");
             assert!(!e.client_message().contains(marker));
         }
+    }
+
+    /// Issue #2233: `VALID UNTIL`・`CONNECTION LIMIT` の受理と拒否（CREATE・ALTER 共通の解析）。
+    #[test]
+    fn valid_until_and_connection_limit_forms() {
+        let v = create("CREATE ROLE r VALID UNTIL '2030-01-01' CONNECTION LIMIT 3").expect("ok");
+        assert_eq!(v.valid_until_literal.as_deref(), Some("2030-01-01"));
+        assert_eq!(v.connection_limit, Some(3));
+        let v = create("CREATE ROLE r CONNECTION LIMIT -1").expect("minus one");
+        assert_eq!(v.connection_limit, Some(-1));
+        assert_eq!(
+            create("CREATE ROLE r CONNECTION LIMIT 0")
+                .expect("zero")
+                .connection_limit,
+            Some(0)
+        );
+        // 範囲外は 22023、整数でない・リテラルでないものは 42601、重複は 42601。
+        for sql in [
+            "CREATE ROLE r CONNECTION LIMIT -2",
+            "CREATE ROLE r CONNECTION LIMIT 99999999999",
+        ] {
+            assert_eq!(code(create(sql)), "22023", "{sql}");
+        }
+        for sql in [
+            "CREATE ROLE r CONNECTION LIMIT 1.5",
+            "CREATE ROLE r CONNECTION LIMIT 'x'",
+            "CREATE ROLE r CONNECTION 3",
+            "CREATE ROLE r VALID '2030-01-01'",
+            "CREATE ROLE r VALID UNTIL 5",
+            "CREATE ROLE r VALID UNTIL",
+            "CREATE ROLE r VALID UNTIL '2030-01-01' VALID UNTIL 'infinity'",
+            "CREATE ROLE r CONNECTION LIMIT 1 CONNECTION LIMIT 2",
+        ] {
+            assert_eq!(code(create(sql)), "42601", "{sql}");
+        }
+        let a = alter("ALTER ROLE r VALID UNTIL 'infinity' CONNECTION LIMIT 7").expect("alter");
+        let AlterRoleAction::Options(p) = a.action else {
+            panic!("options expected");
+        };
+        assert_eq!(p.valid_until_literal.as_deref(), Some("infinity"));
+        assert_eq!(p.connection_limit, Some(7));
     }
 
     #[test]
@@ -440,13 +790,7 @@ mod tests {
 
     #[test]
     fn unsupported_and_malformed_options() {
-        for kw in ["SYSID 1", "VALID UNTIL 'infinity'", "CONNECTION LIMIT 1"] {
-            assert_eq!(
-                code(create(&format!("CREATE ROLE r {kw}"))),
-                "0A000",
-                "{kw}"
-            );
-        }
+        assert_eq!(code(create("CREATE ROLE r SYSID 1")), "0A000");
         for sql in [
             "CREATE ROLE r LOGIN NOLOGIN",
             "CREATE ROLE r LOGIN LOGIN",
@@ -487,5 +831,158 @@ mod tests {
         assert!(is_drop_role_statement(&t("drop role r")));
         assert!(!is_create_role_statement(&t("CREATE TABLE t (a INT)")));
         assert!(!is_drop_role_statement(&t("DROP TABLE t")));
+    }
+
+    fn alter(sql: &str) -> Result<ValidatedAlterRole, SqlSurfaceError> {
+        validate_alter_role_tokens(&tokenize(sql).expect("lex"))
+    }
+
+    fn set_role(sql: &str) -> Result<ValidatedSetRole, SqlSurfaceError> {
+        validate_set_role_tokens(&tokenize(sql).expect("lex"))
+    }
+
+    #[test]
+    fn alter_role_option_patch() {
+        let v = alter("ALTER ROLE r WITH NOLOGIN CREATEDB").expect("ok");
+        assert_eq!(v.name, "r");
+        let AlterRoleAction::Options(p) = v.action else {
+            panic!("options");
+        };
+        assert_eq!(p.login, Some(false));
+        assert_eq!(p.createdb, Some(true));
+        assert_eq!(p.inherit, None);
+        assert_eq!(p.createrole, None);
+        assert!(p.password.is_none());
+        let AlterRoleAction::Options(p) = alter("ALTER USER r PASSWORD NULL;").expect("ok").action
+        else {
+            panic!("options");
+        };
+        assert_eq!(p.password, Some(None));
+        let AlterRoleAction::Options(p) = alter("ALTER ROLE r").expect("ok").action else {
+            panic!("options");
+        };
+        assert_eq!(p, RoleOptionPatch::default());
+    }
+
+    #[test]
+    fn alter_role_rename_and_rejections() {
+        let v = alter("ALTER ROLE a RENAME TO b").expect("ok");
+        assert_eq!(
+            v.action,
+            AlterRoleAction::Rename {
+                new_name: "b".to_string()
+            }
+        );
+        assert_eq!(code(alter("ALTER ROLE a RENAME TO pg_x")), "42939");
+        assert_eq!(code(alter("ALTER ROLE a RENAME TO public")), "42939");
+        assert_eq!(code(alter("ALTER ROLE a RENAME TO current_user")), "42601");
+        assert_eq!(code(alter("ALTER ROLE a RENAME b")), "42601");
+        for sql in [
+            "ALTER ROLE r SUPERUSER",
+            "ALTER ROLE r BYPASSRLS",
+            "ALTER ROLE r REPLICATION",
+        ] {
+            assert_eq!(code(alter(sql)), "42501", "{sql}");
+        }
+        for sql in [
+            "ALTER ROLE r SET search_path = x",
+            "ALTER ROLE r RESET ALL",
+            "ALTER ROLE r IN DATABASE d SET x = 1",
+            "ALTER ROLE ALL SET x = 1",
+            "ALTER ROLE current_user NOLOGIN",
+            "ALTER ROLE session_user NOLOGIN",
+        ] {
+            assert_eq!(code(alter(sql)), "0A000", "{sql}");
+        }
+        for sql in [
+            "ALTER ROLE r ROLE x",
+            "ALTER ROLE r ADMIN x",
+            "ALTER ROLE r LOGIN NOLOGIN",
+            "ALTER ROLE r BOGUS",
+            "ALTER ROLE",
+            "ALTER ROLE s.r NOLOGIN",
+            "ALTER ROLE r PASSWORD",
+        ] {
+            assert_eq!(code(alter(sql)), "42601", "{sql}");
+        }
+    }
+
+    #[test]
+    fn alter_role_password_never_appears_in_debug_or_errors() {
+        let marker = "ZZ-alter-secret-ZZ";
+        let v = alter(&format!("ALTER ROLE r PASSWORD '{marker}'")).expect("ok");
+        assert!(!format!("{v:?}").contains(marker));
+        for sql in [
+            format!("ALTER ROLE r PASSWORD '{marker}' BOGUS"),
+            format!("ALTER ROLE r PASSWORD '{marker}' SUPERUSER"),
+            format!("ALTER ROLE r PASSWORD '{marker}' VALID UNTIL '{marker}' BOGUS"),
+            format!("ALTER ROLE r PASSWORD '{marker}' PASSWORD '{marker}'"),
+        ] {
+            let e = alter(&sql).expect_err("rejected");
+            assert!(!e.to_string().contains(marker), "{e}");
+            assert!(!format!("{e:?}").contains(marker), "{e:?}");
+        }
+    }
+
+    #[test]
+    fn set_role_forms() {
+        assert_eq!(
+            set_role("SET ROLE r1").expect("ok").target,
+            SetRoleTarget::Role("r1".to_string())
+        );
+        assert_eq!(
+            set_role("SET SESSION ROLE 'r1';").expect("ok").target,
+            SetRoleTarget::Role("r1".to_string())
+        );
+        assert_eq!(
+            set_role("SET role TO r1").expect("ok").target,
+            SetRoleTarget::Role("r1".to_string())
+        );
+        assert_eq!(
+            set_role("SET role = r1").expect("ok").target,
+            SetRoleTarget::Role("r1".to_string())
+        );
+        for sql in [
+            "SET ROLE NONE",
+            "SET ROLE 'none'",
+            "SET SESSION ROLE none",
+            "SET role TO DEFAULT",
+            "SET role = DEFAULT",
+        ] {
+            let v = set_role(sql).expect("ok");
+            assert_eq!(v.target, SetRoleTarget::None, "{sql}");
+            assert!(!v.is_reset_statement);
+        }
+        assert_eq!(code(set_role("SET LOCAL ROLE r")), "0A000");
+        for sql in [
+            "SET ROLE",
+            "SET ROLE DEFAULT",
+            "SET ROLE s.r",
+            "SET ROLE r r2",
+            "SET ROLE current_user",
+            "SET ROLE 'bad name'",
+            "SET ROLE 1",
+        ] {
+            assert_eq!(code(set_role(sql)), "42601", "{sql}");
+        }
+        let with_param = crate::sql::lexer::tokenize_with_params("SET ROLE $1").expect("lex");
+        assert_eq!(code(validate_set_role_tokens(&with_param)), "42601");
+    }
+
+    #[test]
+    fn set_role_detection() {
+        let t = |s: &str| tokenize(s).expect("lex");
+        assert!(is_set_role_statement(&t("set role x")));
+        assert!(is_set_role_statement(&t("SET SESSION ROLE x")));
+        assert!(is_set_role_statement(&t("SET LOCAL ROLE x")));
+        assert!(!is_set_role_statement(&t("SET SESSION AUTHORIZATION x")));
+        assert!(!is_set_role_statement(&t("SET search_mode = x")));
+        assert!(is_reset_role_statement(&t("RESET ROLE;")));
+        assert!(!is_reset_role_statement(&t("RESET ROLE x")));
+        assert!(!is_reset_role_statement(&t("RESET row_security")));
+        assert!(is_alter_role_statement(&t("alter user u")));
+        assert!(!is_alter_role_statement(&t(
+            "ALTER TABLE t ADD COLUMN c INT"
+        )));
     }
 }

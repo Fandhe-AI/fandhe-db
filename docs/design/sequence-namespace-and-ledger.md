@@ -315,6 +315,7 @@ CACHE は引き続き `0A000` で、内部の値は 1 固定のまま。永続�
 - **状態は `SeqCursor { last_value: n, is_called }`**。既存の純関数 `advance` が `is_called = true` なら次は `n + increment`（範囲外は CYCLE で折り返し、NO CYCLE で `2200H`）、`false` なら次は `n` そのものを満たす。戻り値は `is_called` によらず `n`
 - **作用は呼び出し元テナントの状態行 `(tenant_id, sequence_id)` だけ**（TABLE-24 (2)）。operation_id 台帳は開かない（D1。冪等で、台帳には採番値を保存しない）
 - **DDL 権限ゲートはかけない**。PostgreSQL でも UPDATE 権限相当で、作用範囲が自テナントに閉じるため（全テナントへ作用する RESTART とは異なる）。自動運転下で安全側に倒した判断のため、人間の確認が要る
+  （追記・Issue #2235: SEQUENCE 単位の GRANT／REVOKE の導入により、ACL で判定すべき主体〔束縛済みかつ所有者相当でない〕には `setval` が UPDATE、`lastval` が USAGE か SELECT を要求する。DDL ゲートをかけない点は変わらず、未束縛・所有者相当は従来どおり検査しない。詳細は [role-privilege-model.md](role-privilege-model.md) §14）
 - **メモリ上の現在値（D4）**: アロケータはメモリを優先して読むため、`setval` が後退させうる。トランザクション内は共有 write txn へ状態行を書いた直後にメモリも更新する（ROLLBACK しても戻らず、PostgreSQL の `setval` の非トランザクション性と一致。戻るのは永続値だけ）。autocommit は `commit_and_finish` の commit 後クロージャでメモリを更新する（writer permit を保持したまま）。commit 前に更新すると、commit 失敗でメモリが永続値より後ろに下がり、払い出し済みの値を再び払い出しうる
 - **`has_writes`**: `commit_active` は `has_writes == false` で write txn を破棄する。`setval` は表を書かず `mark_written` の相手がないため、`SessionTransaction::mark_sequence_written` が `has_writes` だけを立てる（`written_tables` に偽の名前を入れない）。これが無いと `BEGIN; setval; COMMIT` の永続化が落ちる
 - **セッション状態（D6）**: `setval(..., true)` は `currval` を更新するが、`lastval` の対象（`last`）は変えない（PostgreSQL 17 の `do_setval` は `last_used_seq` に触れない）。`is_called = false` はどちらも更新しない。件数上限（`54000`）は commit の前に検査する

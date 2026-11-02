@@ -213,6 +213,7 @@ mod truncate_restart_identity_tests;
 pub mod udf_ddl;
 // TRIGGER DDL（TABLE-45・Issue #1722）。
 pub mod grant_ddl;
+pub mod owner_ddl;
 pub mod policy_applicability;
 pub mod policy_ddl;
 pub(crate) mod privilege_gate;
@@ -259,6 +260,7 @@ pub mod lexer;
 pub mod lock_table;
 pub mod mode;
 pub(crate) mod numeric_fn;
+pub(crate) mod object_privilege;
 pub(crate) mod order_value;
 pub(crate) mod param_coerce;
 pub(crate) mod param_infer;
@@ -283,6 +285,7 @@ pub(crate) mod scalar_index;
 pub(crate) mod scalar_plan;
 pub mod scan;
 pub(crate) mod schema_dependency;
+pub(crate) mod schema_privilege;
 pub mod search_path;
 pub(crate) mod sequence_fn;
 pub(crate) mod sequence_scope;
@@ -440,6 +443,11 @@ pub enum SqlOutcome {
     ///
     /// **BREAKING CHANGE**（Issue #1965）: `SqlOutcome` への variant 追加。
     GrantRevoke(grant_ddl::GrantRevokeOutcome),
+    /// `ALTER {TABLE|VIEW|MATERIALIZED VIEW|SCHEMA} ... OWNER TO`（SQL-40、Issue #2236。コマンドタグは
+    /// 対象に応じた `ALTER <種別>`）。
+    ///
+    /// **BREAKING CHANGE**（Issue #2236）: `SqlOutcome` への variant 追加。
+    AlterOwner(owner_ddl::AlterOwnerOutcome),
     /// `CREATE ROLE`／`CREATE USER`（SQL-39、Issue #1962。コマンドタグは PostgreSQL と同じく `CREATE ROLE`）。
     ///
     /// **BREAKING CHANGE**（Issue #1962）: `SqlOutcome` への variant 追加。
@@ -448,6 +456,17 @@ pub enum SqlOutcome {
     ///
     /// **BREAKING CHANGE**（Issue #1962）: `SqlOutcome` への variant 追加。
     DropRole(role_ddl::DropRoleOutcome),
+    /// `ALTER ROLE`／`ALTER USER`（SQL-39、Issue #1963。コマンドタグは `ALTER ROLE`）。`RENAME TO` も同じ。
+    ///
+    /// **BREAKING CHANGE**（Issue #1963）: `SqlOutcome` への variant 追加。
+    AlterRole(role_ddl::AlterRoleOutcome),
+    /// `SET [SESSION] ROLE`／`RESET ROLE` が成功したことを示す応答（SQL-39、Issue #1963）。`reset` が真なら
+    /// `RESET ROLE`（CommandComplete タグ `RESET`）、偽なら `SET ROLE`（タグ `SET`）。
+    ///
+    /// **BREAKING CHANGE**（Issue #1963）: `SqlOutcome` への variant 追加。
+    SetRole {
+        reset: bool,
+    },
     /// `DO` ブロックの実行完了（CommandComplete タグ `DO`。SQL-68・Issue #2228）。
     ///
     /// **BREAKING CHANGE**（Issue #2228）: `SqlOutcome` への variant 追加。

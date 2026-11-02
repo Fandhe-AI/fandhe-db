@@ -575,6 +575,16 @@ cleartext password 認証のまま不変です。`scram-sha-256` を指定する
   `hash-password --with-scram-sha-256` の時点で拒否されます（libpq・
   node-postgres 等の一般的なクライアント実装と結果が一致することを保証する
   ための設計判断です）。
+- **カタログのロール**（`CREATE ROLE ... LOGIN PASSWORD`。Issue #2233）でも SCRAM 接続できます。
+  接続の user には、`wire-server login-identifier --tenant <tenant_id> --role <ロール名>`
+  （DB を開かない）で得たログイン識別子を渡します。接続のテナントはロールの所属で決まります。
+  ロール不在・`VALID UNTIL` 超過・誤パスワードは同じ `28P01`、`NOLOGIN` は検証後の `28000`、
+  `CONNECTION LIMIT` 超過は認証成功後の `53300` です。
+- **users ファイルのユーザーとロールの対応づけ**（Issue #1971）: テナントにロールが 1 件でもあると、
+  そのテナントの users ファイルのユーザーは同名の `LOGIN` ロールへ対応づけられ、セッションへ
+  束縛されます。同名ロールが無いユーザーは誤パスワードと同じ `28P01` で拒否されます。
+  先に `CREATE ROLE <ユーザー名> LOGIN` を作ってから他のロールを作ってください
+  （ロールが 0 件のテナントは従来どおりです）。
 - **NoSQL 表層（`--surface nosql`）とは併用できません**（起動時 fail-closed で
   拒否）。`POST /v1/session` は Argon2id 照合を直接呼ぶ別経路であり SASL の
   ような往復を持たないためです（HTTP-10）。
@@ -613,6 +623,11 @@ username・空要素・重複要素・フラグの重複指定はいずれも fa
 権限で、`RLS` の判定は変更しません。詳細な構文・権限判定順序は
 `docs/design/sql-create-table.md`・`docs/design/drop-table.md`・
 `docs/design/create-view.md`・`docs/design/index-ddl-declaration.md` 参照）。
+
+オブジェクト所有者（Issue #2236）は、この運用者権限とは別に、表・ビュー・matview・SCHEMA・関数の作成者
+（現在ロールが束縛されたセッション）として記録されます。所有者は運用者権限なしで GRANT／REVOKE・
+`ALTER ... OWNER TO`・SCHEMA と関数の削除ができますが、運用者権限が縮むことはありません
+（詳細は `docs/design/role-privilege-model.md` §14）。
 
 `--tls-cert`／`--tls-key`／`--tls-mode`（Issue #967・親 #941・TASK-228。
 WIRE-7, WIRE-9 ポインタ）は SQL 表層（pg wire）の TLS を有効化する opt-in

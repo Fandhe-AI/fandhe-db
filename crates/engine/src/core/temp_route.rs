@@ -207,6 +207,8 @@ pub(crate) fn is_search_path_exempt(parsed: &ParsedSql) -> bool {
             | ParsedSql::DropFunction(_)
             | ParsedSql::CreateRole(_)
             | ParsedSql::DropRole(_)
+            | ParsedSql::AlterRole(_)
+            | ParsedSql::SetRole(_)
             | ParsedSql::Cursor(CursorStatement::Fetch { .. } | CursorStatement::Close { .. })
             | ParsedSql::Statement(
                 Statement::SetSearchMode { .. }
@@ -540,6 +542,7 @@ impl EngineCore {
                 crate::sql::sequence_scope::SequenceScope::enter(
                     Arc::clone(self.storage.sequence_allocator()),
                     session.sequences_handle(),
+                    crate::sql::schema_privilege::acl_checked_principal(session),
                 )
             });
             let outcome = self.commit_copy_in_txn(ctx, txn, batch)?;
@@ -829,6 +832,54 @@ impl EngineCore {
             )
     }
 
+    /// 準備済み文のトークン列に現れる SCHEMA 修飾の内部キー（`#<id>.<名前>`。解決器だけが作れる）から
+    /// SCHEMA ID を集め、束縛ロールの USAGE を再検査する（Bind の入口。件数はトークン数で有界）。
+    /// 解決時のテナント（`resolution_tenant`）が無ければ Parse が SCHEMA を解決していないため何もしない。
+    /// wire-server は `$n` を持たない準備済み文（`PreparedStatement::Parsed`）の Bind でも、解決結果を
+    /// 使い回す分岐で必ず本メソッドを呼ぶ（Parse は主体を持たないため、ここが唯一の USAGE 検査点）。
+    pub fn recheck_prepared_schema_usage(
+        &self,
+        session: &SessionState,
+        prepared: &super::PreparedSql,
+    ) -> Result<(), SqlSurfaceError> {
+        if crate::sql::schema_privilege::acl_checked_principal(session).is_none() {
+            return Ok(());
+        }
+        let Some(tenant) = session.resolution_tenant() else {
+            return Ok(());
+        };
+        let mut seen: Vec<u64> = Vec::new();
+        for t in &prepared.tokens {
+            let crate::sql::lexer::Token::Ident(name) = t else {
+                continue;
+            };
+            if !name.starts_with('#') {
+                continue;
+            }
+            if let Ok(crate::catalog::namespace::RelationKey::InSchema {
+                schema_id,
+                name: rel,
+            }) = crate::catalog::namespace::RelationKey::parse(name)
+            {
+                if !seen.contains(&schema_id) {
+                    seen.push(schema_id);
+                    // Parse 後に DROP SCHEMA された場合は ACL 行も消えるため、USAGE 検査より先に
+                    // 生存を再検証し、解決器経路と同じ undefined table（42P01）にする（42501 に化けさせない）。
+                    let alive = self
+                        .storage
+                        .schema_names_for_tenant(tenant)
+                        .map_err(crate::catalog::table_lookup_error)?
+                        .contains_key(&schema_id);
+                    if !alive {
+                        return Err(SqlSurfaceError::undefined_table(rel));
+                    }
+                    self.check_schema_usage_for(tenant, session, schema_id)?;
+                }
+            }
+        }
+        Ok(())
+    }
+
     fn bind_prepared_in_session_snap(
         &self,
         session: &SessionState,
@@ -872,6 +923,9 @@ impl EngineCore {
                     &prepared.tokens,
                     &prepared.qualified_positions,
                 )?;
+                // SCHEMA 修飾の USAGE を Bind 時点の ACL で再検査する（Parse は主体を持たない入口で
+                // 解決するため、Parse 後の `REVOKE` を Execute へ反映する。Issue #2234、設計記録 K12）。
+                self.recheck_prepared_schema_usage(session, prepared)?;
                 let parsed = self.bind_prepared_snap(prepared, values, read_snap)?;
                 // `COPY`（Issue #1760）は Execute で元 SQL を現在のカタログへ再解決する
                 // （`begin_copy_temp`）ため、Bind 後に一時表が作成・削除されると宛先が永続表から

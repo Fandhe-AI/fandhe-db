@@ -98,6 +98,11 @@ mod read_set_tests;
 // commit 記録（SQL-38・Issue #2404）。
 #[cfg(test)]
 mod commit_log_tests;
+// SCHEMA 単位の GRANT／REVOKE と USAGE 検査（SQL-40・Issue #2234）。
+#[cfg(test)]
+mod schema_acl_tests;
+#[cfg(test)]
+mod sequence_function_acl_tests;
 #[cfg(test)]
 mod serialization_failure_tests;
 // `40001` の可視性境界・副作用ゼロの内部観測（Issue #2407。ポインタ: ERR-7・SQL-38・TABLE-3）。
@@ -124,6 +129,9 @@ mod plpgsql_host;
 mod do_block;
 // `LOCK TABLE` の実行（SQL-38・Issue #1958）。
 mod lock_exec;
+// カタログのロールによる認証の入口（SQL-39・WIRE-18、Issue #2233）。
+mod login_role;
+pub use login_role::{LoginLookupError, LoginRoleCredentials, UsersFileRoleBinding};
 // `LANGUAGE sql|plpgsql` 関数の呼び出し位置の実行（SQL-67 (5)・Issue #2218）。
 mod routine_call;
 // `CREATE FUNCTION ... LANGUAGE plpgsql` の定義時検証（Issue #2217・SQL-67 (3)）。
@@ -1954,12 +1962,22 @@ pub enum ParsedSql {
     ///
     /// **BREAKING CHANGE**（Issue #1965）: `ParsedSql` への variant 追加。
     GrantRevoke(crate::sql::allowlist::ValidatedGrantRevoke),
+    /// `ALTER {TABLE|VIEW|MATERIALIZED VIEW|SCHEMA} ... OWNER TO`（SQL-40・Issue #2236）。
+    AlterOwner(crate::sql::allowlist::ValidatedAlterOwner),
     /// `CREATE ROLE|USER`（SQL-39、Issue #1962）。
     ///
     /// **BREAKING CHANGE**（Issue #1962）: `ParsedSql` への variant 追加。
     CreateRole(crate::sql::allowlist::ValidatedCreateRole),
     /// `DROP ROLE|USER [IF EXISTS] <名前>[, ...]`（SQL-39、Issue #1962）。
     DropRole(crate::sql::allowlist::ValidatedDropRole),
+    /// `ALTER ROLE|USER <名前> [WITH] <オプション>...`／`RENAME TO`（SQL-39、Issue #1963）。
+    ///
+    /// **BREAKING CHANGE**（Issue #1963）: `ParsedSql` への variant 追加。
+    AlterRole(crate::sql::allowlist::ValidatedAlterRole),
+    /// `SET [SESSION] ROLE`／`RESET ROLE`（SQL-39、Issue #1963）。セッションの現在ロールだけを変える。
+    ///
+    /// **BREAKING CHANGE**（Issue #1963）: `ParsedSql` への variant 追加。
+    SetRole(crate::sql::allowlist::ValidatedSetRole),
     /// `DO [LANGUAGE plpgsql] '<本体>'`（SQL-68、Issue #2228）。
     ///
     /// `ParsedSql::Statement` には載せない（DataModifyingCte・CreateTrigger と同じ理由。wire 側が
@@ -2127,8 +2145,11 @@ fn statement_clock_scope(
         | ParsedSql::AlterPolicy(_)
         | ParsedSql::DropPolicy(_)
         | ParsedSql::GrantRevoke(_)
+        | ParsedSql::AlterOwner(_)
         | ParsedSql::CreateRole(_)
         | ParsedSql::DropRole(_)
+        | ParsedSql::AlterRole(_)
+        | ParsedSql::SetRole(_)
         | ParsedSql::Do(_)
         | ParsedSql::Lock(_)
         | ParsedSql::CreateSchema(_)
@@ -2205,8 +2226,11 @@ fn insert_sequence_scope(
         | ParsedSql::AlterPolicy(_)
         | ParsedSql::DropPolicy(_)
         | ParsedSql::GrantRevoke(_)
+        | ParsedSql::AlterOwner(_)
         | ParsedSql::CreateRole(_)
         | ParsedSql::DropRole(_)
+        | ParsedSql::AlterRole(_)
+        | ParsedSql::SetRole(_)
         | ParsedSql::Do(_)
         | ParsedSql::Lock(_)
         | ParsedSql::CreateSchema(_)
@@ -2220,6 +2244,7 @@ fn insert_sequence_scope(
         crate::sql::sequence_scope::SequenceScope::enter(
             std::sync::Arc::clone(storage.sequence_allocator()),
             session.sequences_handle(),
+            crate::sql::schema_privilege::acl_checked_principal(session),
         )
     })
 }
@@ -2281,8 +2306,11 @@ fn insert_default_clock_scope(
         | ParsedSql::AlterPolicy(_)
         | ParsedSql::DropPolicy(_)
         | ParsedSql::GrantRevoke(_)
+        | ParsedSql::AlterOwner(_)
         | ParsedSql::CreateRole(_)
         | ParsedSql::DropRole(_)
+        | ParsedSql::AlterRole(_)
+        | ParsedSql::SetRole(_)
         | ParsedSql::Do(_)
         | ParsedSql::Lock(_)
         | ParsedSql::CreateSchema(_)
@@ -2504,7 +2532,8 @@ fn read_only_permits(parsed: &ParsedSql) -> bool {
                 | Statement::SetRowSecurity { .. }
                 | Statement::ShowRowSecurity
         ),
-        ParsedSql::Cursor(_) | ParsedSql::Do(_) => true,
+        // SQL-39・Issue #1963: `SET ROLE`／`RESET ROLE` はセッション変数だけを変える（READ ONLY Tx でも可）。
+        ParsedSql::Cursor(_) | ParsedSql::Do(_) | ParsedSql::SetRole(_) => true,
         ParsedSql::Partitioned(control) => !control.writes(),
         ParsedSql::SequenceFunction(stmt) => !stmt.writes(),
         ParsedSql::SessionRouted(routed) => read_only_permits(routed.inner()),
@@ -4433,8 +4462,11 @@ impl EngineCore {
                     | crate::sql::SqlOutcome::AlterPolicy(_)
                     | crate::sql::SqlOutcome::DropPolicy(_)
                     | crate::sql::SqlOutcome::GrantRevoke(_)
+                    | crate::sql::SqlOutcome::AlterOwner(_)
                     | crate::sql::SqlOutcome::CreateRole(_)
                     | crate::sql::SqlOutcome::DropRole(_)
+                    | crate::sql::SqlOutcome::AlterRole(_)
+                    | crate::sql::SqlOutcome::SetRole { .. }
                     | crate::sql::SqlOutcome::Do
                     | crate::sql::SqlOutcome::Lock
                     | crate::sql::SqlOutcome::CreateSchema(_)
@@ -4504,8 +4536,11 @@ impl EngineCore {
                     | crate::sql::SqlOutcome::AlterPolicy(_)
                     | crate::sql::SqlOutcome::DropPolicy(_)
                     | crate::sql::SqlOutcome::GrantRevoke(_)
+                    | crate::sql::SqlOutcome::AlterOwner(_)
                     | crate::sql::SqlOutcome::CreateRole(_)
                     | crate::sql::SqlOutcome::DropRole(_)
+                    | crate::sql::SqlOutcome::AlterRole(_)
+                    | crate::sql::SqlOutcome::SetRole { .. }
                     | crate::sql::SqlOutcome::Do
                     | crate::sql::SqlOutcome::Lock
                     | crate::sql::SqlOutcome::CreateSchema(_)
@@ -4572,8 +4607,11 @@ impl EngineCore {
                     | crate::sql::SqlOutcome::AlterPolicy(_)
                     | crate::sql::SqlOutcome::DropPolicy(_)
                     | crate::sql::SqlOutcome::GrantRevoke(_)
+                    | crate::sql::SqlOutcome::AlterOwner(_)
                     | crate::sql::SqlOutcome::CreateRole(_)
                     | crate::sql::SqlOutcome::DropRole(_)
+                    | crate::sql::SqlOutcome::AlterRole(_)
+                    | crate::sql::SqlOutcome::SetRole { .. }
                     | crate::sql::SqlOutcome::Do
                     | crate::sql::SqlOutcome::Lock
                     | crate::sql::SqlOutcome::CreateSchema(_)
@@ -4647,8 +4685,11 @@ impl EngineCore {
                     | crate::sql::SqlOutcome::AlterPolicy(_)
                     | crate::sql::SqlOutcome::DropPolicy(_)
                     | crate::sql::SqlOutcome::GrantRevoke(_)
+                    | crate::sql::SqlOutcome::AlterOwner(_)
                     | crate::sql::SqlOutcome::CreateRole(_)
                     | crate::sql::SqlOutcome::DropRole(_)
+                    | crate::sql::SqlOutcome::AlterRole(_)
+                    | crate::sql::SqlOutcome::SetRole { .. }
                     | crate::sql::SqlOutcome::Do
                     | crate::sql::SqlOutcome::Lock
                     | crate::sql::SqlOutcome::CreateSchema(_)
@@ -4741,8 +4782,11 @@ impl EngineCore {
                     | crate::sql::SqlOutcome::AlterPolicy(_)
                     | crate::sql::SqlOutcome::DropPolicy(_)
                     | crate::sql::SqlOutcome::GrantRevoke(_)
+                    | crate::sql::SqlOutcome::AlterOwner(_)
                     | crate::sql::SqlOutcome::CreateRole(_)
                     | crate::sql::SqlOutcome::DropRole(_)
+                    | crate::sql::SqlOutcome::AlterRole(_)
+                    | crate::sql::SqlOutcome::SetRole { .. }
                     | crate::sql::SqlOutcome::Do
                     | crate::sql::SqlOutcome::Lock
                     | crate::sql::SqlOutcome::CreateSchema(_)
@@ -5024,6 +5068,100 @@ impl EngineCore {
         }
     }
 
+    /// [`Self::schema_resolver`] のセッション（主体）付き版（Issue #2234、設計記録 K1・K3）。解決した SCHEMA
+    /// に対して束縛ロールの USAGE を検査する。順序は「自テナント内の解決 → 権限検査」で、他テナントの
+    /// SCHEMA・不在は解決器が先に `None`（`3F000`）にする（権限の有無が存在オラクルにならない）。USAGE が
+    /// 無ければ `42501`。判定を飛ばす主体（未束縛・所有者相当）は `sql::schema_privilege` が決める。
+    pub(crate) fn schema_resolver_for<'a>(
+        &'a self,
+        ctx: &'a PolicyContext,
+        session: &'a crate::sql::mode::SessionState,
+    ) -> impl Fn(&str) -> Result<Option<u64>, crate::sql::allowlist::SqlSurfaceError> + 'a {
+        move |schema: &str| {
+            let id = self
+                .storage
+                .schema_id(ctx.tenant_id(), schema)
+                .map_err(crate::catalog::table_lookup_error)?;
+            if let Some(id) = id {
+                self.check_schema_usage_for(ctx.tenant_id(), session, id)?;
+            }
+            Ok(id)
+        }
+    }
+
+    /// 解決済みの SCHEMA `schema_id` への USAGE を検査する（解決器・Bind の再検査・`search_path` の probe が
+    /// 共有する唯一の呼び出し点）。
+    pub(crate) fn check_schema_usage_for(
+        &self,
+        tenant_id: &str,
+        session: &crate::sql::mode::SessionState,
+        schema_id: u64,
+    ) -> Result<(), crate::sql::allowlist::SqlSurfaceError> {
+        crate::sql::schema_privilege::check_schema_usage(session, &|role| {
+            self.storage
+                .schema_privileges(tenant_id, schema_id, &[role])
+                .map_err(crate::catalog::table_lookup_error)
+        })
+    }
+
+    /// `search_path` の要素の可視性 probe（`current_schema()`・`current_schemas()`）。自テナントに在り、かつ
+    /// USAGE を持つ SCHEMA だけが「在る」。USAGE の無い SCHEMA は値の列挙では黙って飛ばす（設計記録 K4）。
+    /// 作成先の判定（`creation_target`）は飛ばさず `42501` にする。他テナントの SCHEMA は不在と同じ。
+    pub(crate) fn schema_visible_for(
+        &self,
+        ctx: &PolicyContext,
+        session: &crate::sql::mode::SessionState,
+        schema: &str,
+    ) -> Result<bool, crate::sql::allowlist::SqlSurfaceError> {
+        let Some(id) = self
+            .storage
+            .schema_id(ctx.tenant_id(), schema)
+            .map_err(crate::catalog::table_lookup_error)?
+        else {
+            return Ok(false);
+        };
+        match self.check_schema_usage_for(ctx.tenant_id(), session, id) {
+            Ok(()) => Ok(true),
+            Err(crate::sql::allowlist::SqlSurfaceError::InsufficientPrivilege) => Ok(false),
+            Err(e) => Err(e),
+        }
+    }
+
+    /// `creation_target` 用の probe。自テナントに在る SCHEMA に USAGE が無ければ `42501`（飛ばさない。
+    /// 他テナント・不在は `false` で、権限の有無が存在オラクルにならない。Issue #2234、設計記録 K4）。
+    fn schema_exists_requiring_usage(
+        &self,
+        ctx: &PolicyContext,
+        session: &crate::sql::mode::SessionState,
+        schema: &str,
+    ) -> Result<bool, crate::sql::allowlist::SqlSurfaceError> {
+        let Some(id) = self
+            .storage
+            .schema_id(ctx.tenant_id(), schema)
+            .map_err(crate::catalog::table_lookup_error)?
+        else {
+            return Ok(false);
+        };
+        self.check_schema_usage_for(ctx.tenant_id(), session, id)?;
+        Ok(true)
+    }
+
+    /// 新規作成する relation の所有者として、束縛中のロールを作成と同じ write txn で書くよう予約する
+    /// （Issue #2236。CREATE TABLE・CTAS・VIEW・MATERIALIZED VIEW の腕が作成の直前に呼び、返した guard を
+    /// 作成の完了まで保持する）。未束縛は予約せず、所有者の無い relation は運用者権限でしか扱えない（拒否側）。
+    /// 所有者の保存は作成本体（`catalog`）が「新規に作った」ことを確認できた txn の中で行うため、作成後の
+    /// DROP・同名再作成と競合して別の対象へ所有者を付けない。事前の存在照会は行わず（照会と作成の間の
+    /// 別セッションの DROP で所有者が落ちるため）、既存対象の維持は `set_owner_if_absent` が担う。
+    fn arm_created_relation_owner(
+        &self,
+        ctx: &PolicyContext,
+        session: &crate::sql::mode::SessionState,
+        relation_key: &str,
+    ) -> crate::catalog::privilege::owner::PendingOwnerGuard {
+        let role = session.current_role_id();
+        crate::catalog::privilege::owner::arm_pending_owner(ctx.tenant_id(), relation_key, role)
+    }
+
     /// 永続オブジェクトを作る DDL の作成先を `search_path` から判定する（TABLE-27・Issue #1715）。
     /// DDL 権限ゲートの直後・既存名の判定より前に呼ぶ（`42501` → `3F000`／`0A000` → `42P07` の順）。
     /// `explicit_public` は `public.` で明示修飾された作成（判定を飛ばして `public` へ作る）。
@@ -5038,15 +5176,26 @@ impl EngineCore {
     ) -> Result<(), crate::sql::allowlist::SqlSurfaceError> {
         // `schema.name` で明示修飾された作成（解決済みの内部キー `#<id>.<name>`。キーを作れるのは
         // 名前解決器だけ）は作成先が文中で確定しているので、`search_path` による作成先判定を飛ばす。
-        if explicit_public || created_name.starts_with('#') {
+        if created_name.starts_with('#') {
+            // 作成先が SCHEMA で確定している作成は CREATE 権限を検査する（Issue #2234、設計記録 K5）。
+            // `ServerDdl` ゲートが必要条件として先に通るため現時点では所有者相当だけが来て観測上は
+            // 変わらない。置き換えは所有者の機構（#2236）・認証主体の束縛（#1971）の後。
+            if let Ok(crate::catalog::namespace::RelationKey::InSchema { schema_id, .. }) =
+                crate::catalog::namespace::RelationKey::parse(created_name)
+            {
+                crate::sql::schema_privilege::check_schema_create(session, &|role| {
+                    self.storage
+                        .schema_privileges(ctx.tenant_id(), schema_id, &[role])
+                        .map_err(crate::catalog::table_lookup_error)
+                })?;
+            }
             return Ok(());
         }
-        let probe = |schema: &str| {
-            self.storage
-                .schema_id(ctx.tenant_id(), schema)
-                .map(|id| id.is_some())
-                .map_err(crate::catalog::table_lookup_error)
-        };
+        if explicit_public {
+            return Ok(());
+        }
+        // 作成先の判定では、path 上の USAGE の無い SCHEMA を飛ばさず `42501` にする（受入基準。K4）。
+        let probe = |schema: &str| self.schema_exists_requiring_usage(ctx, session, schema);
         crate::sql::search_path::creation_target(session, &probe).map(|_| ())
     }
 
@@ -5239,12 +5388,25 @@ impl EngineCore {
         // する（対象の存在オラクルの防止。fail-closed）。構文・範囲外の拒否は状態に依存しないため維持する。
         let grant_head = crate::sql::allowlist::is_grant_statement(&tokens)
             || crate::sql::allowlist::is_revoke_statement(&tokens);
+        // Issue #2236: `ALTER ... OWNER TO` も同じ契約にする。運用者権限も束縛ロールも持たないセッションには、
+        // SCHEMA 名の解決 `3F000` 等で対象の有無を示さず、権限ゲートと同じ `42501` を返す。
+        let owner_head = crate::sql::allowlist::is_alter_owner_statement(&tokens);
         let result = self.parse_tokens_gated_core(tokens, session, resolver, read_snap);
-        if grant_head {
+        if grant_head || owner_head {
             if let Err(e) = &result {
-                if matches!(e.wire_code(), "3F000" | "42P01" | "42704")
-                    && crate::sql::grant_ddl::require_grant_principal(session).is_err()
-                {
+                let unprivileged = if grant_head {
+                    crate::sql::grant_ddl::require_grant_principal(session).is_err()
+                } else {
+                    // 実行本体（`execute_alter_owner`）と同じ条件（O8）。運用者権限があっても現在ロールが
+                    // 未束縛なら対象の有無にかかわらず `42501` に正規化する。
+                    crate::sql::privilege_gate::bound_principal(session).is_err()
+                        || crate::sql::privilege_gate::require_ddl_or_owner(
+                            session,
+                            crate::sql::privilege_gate::DdlStatementKind::AlterOwner,
+                        )
+                        .is_err()
+                };
+                if matches!(e.wire_code(), "3F000" | "42P01" | "42704") && unprivileged {
                     return Err(crate::sql::allowlist::SqlSurfaceError::InsufficientPrivilege);
                 }
             }
@@ -5328,7 +5490,17 @@ impl EngineCore {
             // `GRANT`／`REVOKE` も構文語（`TO`・`ON`・`GRANT` 等）とロール名を含むため名前走査から外す。
             // 対象表名の一時表衝突は parse 内の参照記録で固定の `0A000` として拒否する。
             || crate::sql::allowlist::is_grant_statement(&tokens)
-            || crate::sql::allowlist::is_revoke_statement(&tokens);
+            || crate::sql::allowlist::is_revoke_statement(&tokens)
+            // `ALTER ... OWNER TO <ロール>`（Issue #2236）も構文語（`OWNER`・`TO`）とロール名を含むため名前走査から
+            // 外す。対象 relation の一時表衝突は parse 内の参照記録（`hits.temp_hit()`）で固定の `0A000` として
+            // 拒否し、一時表の所有者は持たない。
+            || crate::sql::allowlist::is_alter_owner_statement(&tokens)
+            // ロール名も関係名とは別の名前空間で一時表を読み書きしない（SQL-39・Issue #1963）。名前走査だと
+            // 同名の一時表（`CREATE TEMP TABLE r` 等）を持つセッションで `ALTER ROLE r`／`SET ROLE r` が
+            // 一時表の振り分けに回り、固定の `0A000` になる。
+            || crate::sql::allowlist::is_alter_role_statement(&tokens)
+            || crate::sql::allowlist::is_set_role_statement(&tokens)
+            || crate::sql::allowlist::is_reset_role_statement(&tokens);
         if txn_control_head || scan_exempt {
             let hits = crate::sql::temp_catalog::RelationHits::default();
             let parsed =
@@ -5403,6 +5575,8 @@ impl EngineCore {
                     | ParsedSql::AlterSchema(_)
                     | ParsedSql::CreateRole(_)
                     | ParsedSql::DropRole(_)
+                    | ParsedSql::AlterRole(_)
+                    | ParsedSql::SetRole(_)
             )
         {
             return Ok(());
@@ -5897,10 +6071,36 @@ impl EngineCore {
             ));
         }
 
+        // SQL-39・Issue #1963: `SET [SESSION|LOCAL] ROLE`・`RESET ROLE` は許可リスト側の `SET` の振り分けへ
+        // 渡さず、構造検証だけで束縛する（名前解決・認可は実行段。未束縛セッションに有無を示さないため）。
+        if crate::sql::allowlist::is_set_role_statement(&tokens) {
+            let stmt = crate::sql::allowlist::validate_set_role_tokens(&tokens)?;
+            return Ok(ParsedSql::SetRole(stmt));
+        }
+        if crate::sql::allowlist::is_reset_role_statement(&tokens) {
+            return Ok(ParsedSql::SetRole(
+                crate::sql::allowlist::reset_role_statement(),
+            ));
+        }
         // SQL-68・Issue #2228: `DO` はカタログ照会なしの構造検証だけで束縛する。
         // SQL-40・Issue #1965: `GRANT`／`REVOKE` は構造検証だけで束縛する（カタログ照会は実行段。権限の無い
         // 主体にロール・対象の有無を示さないため）。`ALTER DEFAULT PRIVILEGES`（#2237）は汎用 `ALTER`
         // （`ALTER TABLE` 扱い）より前に `0A000` で拒否する。
+        // Issue #2236: `ALTER {TABLE|VIEW|MATERIALIZED VIEW|SCHEMA} <名> OWNER TO` は汎用 `ALTER` と
+        // `ALTER SCHEMA` より前に束縛する（構造検証だけ。カタログ照会は実行段）。`REASSIGN OWNED`・
+        // `DROP OWNED` は汎用 `DROP` より前に固定の `0A000` で拒否する（状態に依存しない）。
+        if crate::sql::allowlist::is_owned_by_statement(&tokens) {
+            return Err(crate::sql::allowlist::reject_owned_by());
+        }
+        if crate::sql::allowlist::is_alter_owner_statement(&tokens) {
+            let stmt = crate::sql::allowlist::validate_alter_owner_tokens(&tokens)?;
+            // 一時表との衝突は参照の記録だけ行い（結果は使わない）、振り分け側が `0A000` で拒否する
+            // （`GRANT` と同じ設計）。
+            if let Some(name) = stmt.relation_name() {
+                let _ = crate::sql::allowlist::TableLookup::table_exists(&storage_lookup, name)?;
+            }
+            return Ok(ParsedSql::AlterOwner(stmt));
+        }
         if crate::sql::allowlist::is_grant_statement(&tokens)
             || crate::sql::allowlist::is_revoke_statement(&tokens)
         {
@@ -6003,6 +6203,12 @@ impl EngineCore {
         if crate::sql::allowlist::is_drop_policy_statement(&tokens) {
             let stmt = crate::sql::allowlist::validate_drop_policy_tokens(&tokens)?;
             return Ok(ParsedSql::DropPolicy(stmt));
+        }
+        // SQL-39・Issue #1963: `ALTER ROLE|USER` も汎用 `ALTER`（`ALTER TABLE` 扱い）より前に分岐する
+        // （カタログ照会なし）。
+        if crate::sql::allowlist::is_alter_role_statement(&tokens) {
+            let stmt = crate::sql::allowlist::validate_alter_role_tokens(&tokens)?;
+            return Ok(ParsedSql::AlterRole(stmt));
         }
         // RLS-13・Issue #2274: `ALTER POLICY` も汎用 `ALTER`（`ALTER TABLE` 扱い）より前に分岐する。
         if crate::sql::allowlist::is_alter_policy_statement(&tokens) {
@@ -7275,6 +7481,7 @@ impl EngineCore {
         session: &mut crate::sql::mode::SessionState,
         parsed: &ParsedSql,
     ) -> Result<crate::sql::SqlOutcome, crate::sql::allowlist::SqlSurfaceError> {
+        let _function_acl_scope = self.function_acl_scope(ctx, session)?;
         // 永続側の文を包んだ形（世代の検査は公開入口の粗いゲートが済ませている）は中身を実行する。
         if let ParsedSql::SessionRouted(routed) = parsed {
             if routed.is_persistent() {
@@ -7582,6 +7789,7 @@ impl EngineCore {
                         ),
                     );
                 }
+                let _owner_guard = self.arm_created_relation_owner(ctx, session, &stmt.table_name);
                 let outcome = crate::sql::ddl::execute_create_table(
                     &self.storage,
                     stmt,
@@ -7602,6 +7810,7 @@ impl EngineCore {
                     stmt.public_qualified,
                     stmt.table_name(),
                 )?;
+                let _owner_guard = self.arm_created_relation_owner(ctx, session, stmt.table_name());
                 let outcome = self.execute_create_table_as(ctx, session, stmt)?;
                 Ok(crate::sql::SqlOutcome::CreateTableAs(outcome))
             }
@@ -7691,6 +7900,7 @@ impl EngineCore {
                     },
                 )?;
                 // TABLE-41 (2)・Issue #1660: `OR REPLACE` は互換性検査付きの置換経路へ。
+                let _owner_guard = self.arm_created_relation_owner(ctx, session, stmt.name());
                 let outcome = if stmt.or_replace() {
                     self.create_or_replace_view_in_session(session, stmt)?
                 } else {
@@ -7708,6 +7918,7 @@ impl EngineCore {
                 )?;
                 self.require_creation_target(ctx, session, stmt.public_qualified, stmt.name())?;
                 crate::sql::schema_dependency::check_view_body(stmt.name(), stmt.body_sql())?;
+                let _owner_guard = self.arm_created_relation_owner(ctx, session, stmt.name());
                 let outcome = self.execute_create_materialized_view(ctx, session, stmt)?;
                 Ok(crate::sql::SqlOutcome::CreateMaterializedView(outcome))
             }
@@ -7901,6 +8112,32 @@ impl EngineCore {
             // SQL-40（Issue #1965）: 現在ロールの束縛ゲート → 実行本体。未束縛（認証層が束縛していない現状の
             // 全セッション）には対象・ロールの有無を問わず常に `42501`。ACL はテナント単位のため
             // `ctx.tenant_id()` を渡す。
+            // SQL-40（Issue #2236）: 権限ゲート（未束縛は `42501`）→ 実行本体（束縛・解決・所有者の判定を
+            // 単一の write txn で行う）。一時表を対象にした `OWNER TO` は一時表の所有者を持たないため
+            // `0A000`（`GRANT` と同じ設計）。
+            ParsedSql::AlterOwner(stmt) => {
+                crate::sql::privilege_gate::require_ddl_or_owner(
+                    session,
+                    crate::sql::privilege_gate::DdlStatementKind::AlterOwner,
+                )?;
+                if stmt
+                    .relation_name()
+                    .is_some_and(|name| session.temp_tables().contains(name))
+                {
+                    return Err(
+                        crate::sql::allowlist::SqlSurfaceError::feature_not_supported(
+                            "OWNER TO is not supported for temporary tables",
+                        ),
+                    );
+                }
+                let outcome = crate::sql::owner_ddl::execute_alter_owner(
+                    &self.storage,
+                    ctx.tenant_id(),
+                    session,
+                    stmt,
+                )?;
+                Ok(crate::sql::SqlOutcome::AlterOwner(outcome))
+            }
             ParsedSql::GrantRevoke(stmt) => {
                 crate::sql::grant_ddl::require_grant_principal(session)?;
                 let outcome = crate::sql::grant_ddl::execute_grant_revoke(
@@ -7936,6 +8173,31 @@ impl EngineCore {
                     crate::sql::role_ddl::execute_drop_role(&self.storage, ctx.tenant_id(), stmt)?;
                 Ok(crate::sql::SqlOutcome::DropRole(outcome))
             }
+            // SQL-39（Issue #1963）: `ALTER ROLE` も `CREATE ROLE` と同じ DDL 権限ゲート（対象の有無を問わず
+            // `42501`）の後で実行する。パスワードの検証子化・改名の拒否判定は実行本体が担う。
+            ParsedSql::AlterRole(stmt) => {
+                crate::sql::ddl::require_ddl_permission(session)?;
+                let outcome = crate::sql::role_ddl::execute_alter_role(
+                    &self.storage,
+                    ctx.tenant_id(),
+                    session,
+                    stmt,
+                )?;
+                Ok(crate::sql::SqlOutcome::AlterRole(outcome))
+            }
+            // SQL-39（Issue #1963）: `SET ROLE`／`RESET ROLE` は DDL 権限ゲートを通らない。認可（未束縛 `42501`・
+            // メンバーシップの経路）は実行本体が行い、変えるのはセッションの現在ロールだけ。
+            ParsedSql::SetRole(stmt) => {
+                crate::sql::role_ddl::execute_set_role(
+                    &self.storage,
+                    ctx.tenant_id(),
+                    session,
+                    stmt,
+                )?;
+                Ok(crate::sql::SqlOutcome::SetRole {
+                    reset: stmt.is_reset_statement,
+                })
+            }
             // TABLE-27（Issue #1713）: DDL 実行権限ゲート → 実行本体。SCHEMA はテナント単位のカタログ
             // のため `ctx.tenant_id()` を渡す（SEQUENCE との違い）。権限の無い主体には対象の有無を
             // 問わず常に `42501`。
@@ -7944,27 +8206,48 @@ impl EngineCore {
                     session,
                     crate::sql::privilege_gate::DdlStatementKind::CreateSchema,
                 )?;
-                let outcome =
-                    crate::sql::ddl::execute_create_schema(&self.storage, ctx.tenant_id(), stmt)?;
+                // 所有者（`AUTHORIZATION` の指定、省略時は作成者＝束縛中の現在ロール）を同じ write txn で
+                // 記録する（Issue #2236。未束縛で指定も無ければ記録せず、運用者権限でしか扱えない）。
+                let owner = crate::sql::owner_ddl::resolve_schema_owner(
+                    &self.storage,
+                    ctx.tenant_id(),
+                    session,
+                    stmt.authorization.as_ref(),
+                )?;
+                let outcome = crate::sql::ddl::execute_create_schema(
+                    &self.storage,
+                    ctx.tenant_id(),
+                    stmt,
+                    owner,
+                )?;
                 Ok(crate::sql::SqlOutcome::CreateSchema(outcome))
             }
+            // Issue #2236: 運用者権限、またはテナント内の所有者（書き込み txn 内で検査）。
             ParsedSql::DropSchema(stmt) => {
-                crate::sql::privilege_gate::require_ddl(
+                let decision = crate::sql::privilege_gate::require_ddl_or_owner(
                     session,
                     crate::sql::privilege_gate::DdlStatementKind::DropSchema,
                 )?;
-                let outcome =
-                    crate::sql::ddl::execute_drop_schema(&self.storage, ctx.tenant_id(), stmt)?;
+                let outcome = crate::sql::ddl::execute_drop_schema(
+                    &self.storage,
+                    ctx.tenant_id(),
+                    stmt,
+                    decision.owner_gate(),
+                )?;
                 Ok(crate::sql::SqlOutcome::DropSchema(outcome))
             }
             // TABLE-27（Issue #1716）: DDL 実行権限ゲート → 実行本体（`ALTER SCHEMA ... RENAME TO`）。
             ParsedSql::AlterSchema(stmt) => {
-                crate::sql::privilege_gate::require_ddl(
+                let decision = crate::sql::privilege_gate::require_ddl_or_owner(
                     session,
                     crate::sql::privilege_gate::DdlStatementKind::AlterSchema,
                 )?;
-                let outcome =
-                    crate::sql::ddl::execute_alter_schema(&self.storage, ctx.tenant_id(), stmt)?;
+                let outcome = crate::sql::ddl::execute_alter_schema(
+                    &self.storage,
+                    ctx.tenant_id(),
+                    stmt,
+                    decision.owner_gate(),
+                )?;
                 Ok(crate::sql::SqlOutcome::AlterSchema(outcome))
             }
             // TABLE-24・SQL-23（Issue #1689）: DDL 実行権限ゲート → 実行本体。`ctx.tenant_id()` は
@@ -8083,7 +8366,7 @@ impl EngineCore {
         // TimeZone を parse 区間へも張る（ゾーン無し `TIMESTAMPTZ` リテラル・`AT LOCAL`。Issue #1576）。
         let parsed = {
             let _session_tz_scope = session_time_zone_scope(session);
-            let resolver = self.schema_resolver(ctx);
+            let resolver = self.schema_resolver_for(ctx, session);
             self.parse_tokens_gated(tokens, session, Some(&resolver), None)?
         };
         // 一時カタログに対する細かいゲートは上の parse で通過済みのため、粗いゲートを持たない
@@ -8109,6 +8392,36 @@ impl EngineCore {
             });
         }
         crate::sql::udf_load::load(&self.storage, ctx.tenant_id(), session.udfs_mut())
+    }
+
+    /// 関数 EXECUTE の拒否集合を文の実行区間へ張る（SQL-40・RLS-12 のポインタ、Issue #2235。設計記録
+    /// `role-privilege-model.md` S1・S7）。公開のセッション入口（簡易クエリ・明示 Tx・準備済み文の
+    /// Bind／Execute）が、UDF を束縛する区間の頭で呼び、戻り値のガードを区間の終わりまで保持する。
+    /// ACL で判定すべき主体（束縛済みかつ所有者相当でない）で、カタログ由来の関数がセッションに 1 件以上
+    /// あるときだけ、1 回の読み取り txn で拒否集合を作る。入れ子の入口（PL/pgSQL 本体の文など）はスコープが
+    /// 既にあれば何もしない（呼び出し元ロールの判定を保つ）。読み取りの失敗は `XX000`（fail-closed）。
+    fn function_acl_scope(
+        &self,
+        ctx: &PolicyContext,
+        session: &crate::sql::mode::SessionState,
+    ) -> Result<
+        Option<crate::sql::object_privilege::FunctionAclScope>,
+        crate::sql::allowlist::SqlSurfaceError,
+    > {
+        use crate::sql::object_privilege::FunctionAclScope;
+        if FunctionAclScope::is_active() || session.udfs().catalog_entry_count() == 0 {
+            return Ok(None);
+        }
+        let Some(role) = crate::sql::schema_privilege::acl_checked_principal(session) else {
+            return Ok(None);
+        };
+        let denied = self
+            .storage
+            .denied_function_keys(ctx.tenant_id(), role)
+            .map_err(|_| crate::sql::allowlist::SqlSurfaceError::Internal {
+                detail: "could not evaluate function privileges".to_string(),
+            })?;
+        Ok(Some(FunctionAclScope::enter(denied)))
     }
 
     /// 他セッションの `CREATE`／`DROP FUNCTION` を反映する（SQL-66・Issue #1921）。wire-server が
@@ -8151,14 +8464,14 @@ impl EngineCore {
         txn: &mut crate::sql::transaction::SessionTransaction<'e>,
         sql: &str,
     ) -> Result<crate::sql::SqlOutcome, crate::sql::allowlist::SqlSurfaceError> {
-        // `Failed` 中は `ROLLBACK` 以外を parse より前に `25P02` で拒否する
+        // `Failed` 中は `ROLLBACK`・`ROLLBACK TO`（Issue #1947）以外を parse より前に `25P02` で拒否する
         // （PR #1041 レビュー指摘: parse を先に行うと、不正な SQL に対して
         // `42601` 等が返り `Failed` であることがクライアントへ伝わらない）。
         // `ROLLBACK` かどうかは先頭トークンだけで判定し、`ROLLBACK` の規範形の
         // 検証は通常どおり parse に任せる。字句解析自体に失敗した入力は
         // `ROLLBACK` ではないものとして `25P02` に倒す。
         if txn.status() == crate::sql::transaction::TransactionStatus::Failed
-            && !crate::sql::transaction::is_rollback_statement(sql)
+            && !crate::sql::transaction::is_allowed_while_failed(sql)
         {
             return Err(txn.take_failed_error());
         }
@@ -8181,7 +8494,7 @@ impl EngineCore {
                     crate::sql::lock_table::validate_lock_structure_unresolved(&tokens)?;
                     return Err(crate::sql::allowlist::SqlSurfaceError::NoActiveSqlTransaction);
                 }
-                let resolver = self.schema_resolver(ctx);
+                let resolver = self.schema_resolver_for(ctx, session);
                 // 明示トランザクションの writer 取得前は、読み取り文の検証・ビュー展開を
                 // `BEGIN` 時点のスナップショットのカタログで行う（Issue #2403）。
                 let read_snap = if txn.status()
@@ -8228,8 +8541,8 @@ impl EngineCore {
     /// 直接遷移させる。それ以外は `txn.status()` に応じて分岐する:
     /// - `Idle`: 既存の [`Self::execute_parsed_in_session`]（autocommit）へ
     ///   そのまま委譲（挙動は不変）。
-    /// - `Failed`: `ROLLBACK` 以外は一切実行せず `25P02` を返す
-    ///   （`ParsedSql::Transaction(Rollback)` は上の分岐で既に処理済み）。
+    /// - `Failed`: `ROLLBACK`・`ROLLBACK TO` 以外は一切実行せず `25P02` を返す
+    ///   （`ParsedSql::Transaction` は上の分岐で既に処理済み。Issue #1947）。
     /// - `Active`: 上限検査・`operation_id` 再利用検査（[`crate::sql::
     ///   transaction::SessionTransaction::check_and_register_statement`]）を
     ///   経てから、明示トランザクション内で対応する書き込み系（`INSERT`・
@@ -8248,6 +8561,7 @@ impl EngineCore {
         txn: &mut crate::sql::transaction::SessionTransaction<'e>,
         parsed: &ParsedSql,
     ) -> Result<crate::sql::SqlOutcome, crate::sql::allowlist::SqlSurfaceError> {
+        let _function_acl_scope = self.function_acl_scope(ctx, session)?;
         use crate::sql::transaction::{TransactionStatus, TxnControl};
 
         // 永続側の文を包んだ形（世代の検査は公開入口の粗いゲートが済ませている）は中身を実行する。
@@ -8315,7 +8629,7 @@ impl EngineCore {
                     };
                     match ctrl.control {
                         TxnControl::Savepoint => {
-                            txn.savepoint(name)?;
+                            txn.savepoint(name, session)?;
                             Ok(crate::sql::SqlOutcome::Savepoint)
                         }
                         TxnControl::ReleaseSavepoint => {
@@ -8323,8 +8637,8 @@ impl EngineCore {
                             Ok(crate::sql::SqlOutcome::ReleaseSavepoint)
                         }
                         _ => {
-                            txn.rollback_to_savepoint(name)?;
-                            // 成功経路は #1941 まで存在しない（常に Err）。
+                            txn.rollback_to_savepoint(name, session)?;
+                            // 成功時は PostgreSQL と同じ `ROLLBACK` タグ（Issue #1943。巻き戻し不能は Err）。
                             Ok(crate::sql::SqlOutcome::Rollback)
                         }
                     }
@@ -8346,8 +8660,10 @@ impl EngineCore {
                 }
                 txn.check_and_register_statement(parsed_operation_id(parsed))?;
                 let result = self.execute_in_active_txn(ctx, session, txn, parsed);
-                if result.is_err() {
-                    txn.fail();
+                if let Err(e) = &result {
+                    // `XX000`・`40001` は復帰不可、それ以外は savepoint があれば `ROLLBACK TO` で
+                    // 復帰できる失敗状態へ（Issue #1947）。
+                    txn.fail_for(e);
                 }
                 result
             }
@@ -8646,7 +8962,8 @@ impl EngineCore {
                 ))
             }
             ParsedSql::DropFunction(_) => {
-                crate::sql::privilege_gate::require_ddl(
+                // 所有者（束縛ロール）も `0A000` まで進める（Issue #2236。未束縛は `42501`）。
+                crate::sql::privilege_gate::require_ddl_or_owner(
                     session,
                     crate::sql::privilege_gate::DdlStatementKind::DropFunction,
                 )?;
@@ -8671,13 +8988,41 @@ impl EngineCore {
                     "GRANT/REVOKE is not supported inside a transaction block",
                 ))
             }
+            // SQL-40（Issue #2236）: 所有者の変更も独立した write txn で commit され ROLLBACK で取り消せない
+            // ため明示トランザクション内では行わない。未束縛は存在を問わず `42501`（ゲートを `0A000` より前に置く）。
+            ParsedSql::AlterOwner(_) => {
+                // 自動コミット（`execute_alter_owner`）と同じく、運用者権限があっても現在ロールが未束縛なら
+                // `0A000` より前に `42501` で拒否する（O8）。
+                crate::sql::privilege_gate::bound_principal(session)?;
+                crate::sql::privilege_gate::require_ddl_or_owner(
+                    session,
+                    crate::sql::privilege_gate::DdlStatementKind::AlterOwner,
+                )?;
+                Err(SqlSurfaceError::feature_not_supported(
+                    "ALTER ... OWNER TO is not supported inside a transaction block",
+                ))
+            }
             // SQL-39（Issue #1962）: ロール DDL も独立した write txn で commit され ROLLBACK で取り消せないため
             // 明示トランザクション内では行わない。権限の無いセッションには存在を問わず `42501`（fail-closed）。
-            ParsedSql::CreateRole(_) | ParsedSql::DropRole(_) => {
+            ParsedSql::CreateRole(_) | ParsedSql::DropRole(_) | ParsedSql::AlterRole(_) => {
                 crate::sql::privilege_gate::require_server_ddl(session)?;
                 Err(SqlSurfaceError::feature_not_supported(
                     "role DDL is not supported inside a transaction block",
                 ))
+            }
+            // SQL-39（Issue #1963）: `SET ROLE`／`RESET ROLE` はセッション変数だけを変えるため明示 Tx 内でも
+            // 実行できる（`session_at_begin` の復元により ROLLBACK・abort で元に戻る）。ロールカタログは
+            // Tx 内で変わらない（ロール DDL は上で `0A000`）ため、名前解決は独立した読み取りで行う。
+            ParsedSql::SetRole(stmt) => {
+                crate::sql::role_ddl::execute_set_role(
+                    &self.storage,
+                    ctx.tenant_id(),
+                    session,
+                    stmt,
+                )?;
+                Ok(crate::sql::SqlOutcome::SetRole {
+                    reset: stmt.is_reset_statement,
+                })
             }
             // SQL-67・Issue #2220: FROM 句の集合返却関数の呼び出しも、本体を同じ Tx・RLS で実行するため
             // 汎用の読み取り腕より前で受け、Tx 上で本体を実行してから外側の後処理を適用する。
@@ -9935,7 +10280,11 @@ impl EngineCore {
                 Ok(None)
             }
             ParsedSql::GrantRevoke(_) => Ok(None),
-            ParsedSql::CreateRole(_) | ParsedSql::DropRole(_) => Ok(None),
+            ParsedSql::AlterOwner(_) => Ok(None),
+            ParsedSql::CreateRole(_)
+            | ParsedSql::DropRole(_)
+            | ParsedSql::AlterRole(_)
+            | ParsedSql::SetRole(_) => Ok(None),
             // SQL-68・Issue #2228: `DO` は行を返さない（Describe は NoData）。
             ParsedSql::Do(_) | ParsedSql::Lock(_) => Ok(None),
             ParsedSql::CreateSchema(_) => Ok(None),
@@ -10800,12 +11149,7 @@ impl EngineCore {
                 // 以下の get で確かめてからスコープを張る（含まない文は照会コストゼロ。
                 // 他テナントの SCHEMA は不在と同じ扱い。TABLE-27 (7)・Issue #1718）。
                 let _schema_fn = if crate::sql::const_select::uses_schema_fn(&validated) {
-                    let probe = |schema: &str| {
-                        self.storage
-                            .schema_id(ctx.tenant_id(), schema)
-                            .map(|id| id.is_some())
-                            .map_err(crate::catalog::table_lookup_error)
-                    };
+                    let probe = |schema: &str| self.schema_visible_for(ctx, session, schema);
                     let values =
                         crate::sql::search_path::resolve_schema_functions(session, &probe)?;
                     Some(crate::sql::search_path::SchemaFnScope::enter(
@@ -11743,6 +12087,7 @@ impl EngineCore {
             crate::sql::allowlist::SqlSurfaceError,
         >,
     {
+        let _function_acl_scope = self.function_acl_scope(ctx, session)?;
         let (read_txn, schema) = self.read_txn_with_schema(table)?;
         let bound = bind(&schema, session.udfs())?;
         if bound.table() != table {
@@ -11794,6 +12139,7 @@ impl EngineCore {
             &crate::sql::udf_call::UdfRegistry,
         ) -> Result<PlanSearchBinding, crate::sql::allowlist::SqlSurfaceError>,
     {
+        let _function_acl_scope = self.function_acl_scope(ctx, session)?;
         // `LIMIT`・`question` の多層防御（`Self::run_using_plan_select` 側の
         // 検証に加え、engine 側でも独立に通す。NoSQL 表層の `search.rs::
         // bind_search` が既に同じ検証を通しているが、本メソッドが engine の
@@ -12959,6 +13305,7 @@ impl EngineCore {
         ) -> Result<crate::sql::explain::ExplainShape, E>,
         E: From<crate::sql::allowlist::SqlSurfaceError>,
     {
+        let _function_acl_scope = self.function_acl_scope(ctx, session)?;
         self.run_explain_plan(ctx, session, table, question, mode_literal, None, bind)
     }
 
@@ -12999,6 +13346,7 @@ impl EngineCore {
         )
             -> Result<crate::sql::parser::BoundScan, crate::sql::allowlist::SqlSurfaceError>,
     {
+        let _function_acl_scope = self.function_acl_scope(ctx, session)?;
         let (read_txn, schema) = self.read_txn_with_schema(table)?;
         let bound = bind(&schema, session.udfs())?;
         if bound.table() != table {
@@ -13033,6 +13381,7 @@ impl EngineCore {
             crate::sql::allowlist::SqlSurfaceError,
         >,
     {
+        let _function_acl_scope = self.function_acl_scope(ctx, session)?;
         let (read_txn, schema) = self.read_txn_with_schema(table)?;
         let bound = bind(&schema, session.udfs())?;
         if bound.table() != table {
@@ -13381,7 +13730,7 @@ impl EngineCore {
         )? {
             return Ok(plan);
         }
-        let resolver = self.schema_resolver(ctx);
+        let resolver = self.schema_resolver_for(ctx, session);
         let copy_tokens =
             crate::sql::relation_name::tokenize_resolved_with(sql, false, Some(&resolver))?;
         let stmt = crate::sql::allowlist::validate_copy_tokens(
@@ -13496,8 +13845,8 @@ impl EngineCore {
             TransactionStatus::Failed => Err(txn.take_failed_error()),
             TransactionStatus::InTransaction => {
                 let result = self.begin_copy_active(ctx, session, txn, sql);
-                if result.is_err() {
-                    txn.fail();
+                if let Err(e) = &result {
+                    txn.fail_for(e);
                 }
                 result
             }
@@ -13552,7 +13901,7 @@ impl EngineCore {
         if let Some(plan) = self.begin_copy_temp(ctx, session, Some(&mut *txn), sql)? {
             return Ok(plan);
         }
-        let resolver = self.schema_resolver(ctx);
+        let resolver = self.schema_resolver_for(ctx, session);
         let copy_tokens =
             crate::sql::relation_name::tokenize_resolved_with(sql, false, Some(&resolver))?;
         // `COPY FROM`（書き込み）の検証・schema lookup は読み取りではないので読み取り集合へ記録しない
@@ -13715,7 +14064,7 @@ impl EngineCore {
                         Ok(outcome)
                     }
                     Err(e) => {
-                        txn.fail();
+                        txn.fail_for(&e);
                         Err(e)
                     }
                 }

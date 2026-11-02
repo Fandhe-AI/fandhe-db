@@ -150,8 +150,8 @@ fn rejected_forms_map_to_documented_sqlstates() {
         // Issue #2232: メンバーシップ句は構文として受理され、現在ロールが未束縛なら対象の有無を問わず `42501`。
         ("CREATE ROLE r IN ROLE other", "42501"),
         ("CREATE ROLE r IN ROLE a IN ROLE b", "42601"),
-        ("CREATE ROLE r VALID UNTIL '2030-01-01'", "0A000"),
-        ("CREATE ROLE r CONNECTION LIMIT 3", "0A000"),
+        ("CREATE ROLE r VALID UNTIL 'not-a-time'", "22007"),
+        ("CREATE ROLE r CONNECTION LIMIT -5", "22023"),
         ("CREATE ROLE r UNENCRYPTED PASSWORD 'x'", "0A000"),
         ("CREATE ROLE r LOGIN NOLOGIN", "42601"),
         ("CREATE ROLE r BOGUS", "42601"),

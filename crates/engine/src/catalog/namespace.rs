@@ -24,6 +24,9 @@ use redb::{ReadableDatabase, ReadableTable, TableDefinition};
 
 use crate::storage::read_source::ReadSource;
 
+use super::privilege::owner::{remove_owner_in_txn, OwnerGate};
+use super::privilege::PrivilegeObject;
+
 use super::{
     validate_identifier, CatalogError, Result, Storage, CATALOG_TABLE, ENUM_TYPES_TABLE,
     INDEX_CATALOG_TABLE, MAX_LIST_TABLES, VIEWS_TABLE,
@@ -465,6 +468,32 @@ pub(crate) fn enumerate_schema_objects_in_txn<R: ReadSource>(
     Ok(objects)
 }
 
+/// SCHEMA `schema_id` 配下の relation（表・ビュー・matview）のキーを列挙する（`GRANT ... ON ALL TABLES IN
+/// SCHEMA` の展開元。Issue #2234）。SEQUENCE・索引・型は含めない（PostgreSQL の `ALL TABLES` と同じ）。
+/// 呼び出し元の write txn のスナップショットで走査するため、「実行時点で既にあるもの」だけを返す。各種別は
+/// [`MAX_LIST_TABLES`] 件で打ち切り（超過は `Invalid`）、重複は除く。
+pub(crate) fn schema_relation_keys_in_txn<R: ReadSource>(
+    src: &R,
+    schema_id: u64,
+) -> Result<Vec<String>> {
+    let start = RelationKey::schema_prefix(schema_id);
+    let end = RelationKey::schema_prefix_end(schema_id);
+    let mut out: Vec<String> = Vec::new();
+    let mut seen: std::collections::HashSet<String> = std::collections::HashSet::new();
+    for def in [
+        CATALOG_TABLE,
+        VIEWS_TABLE,
+        super::materialized::MATERIALIZED_VIEWS_TABLE,
+    ] {
+        for key in str_keys_in_range(src, def, &start, &end)? {
+            if seen.insert(key.clone()) {
+                out.push(key);
+            }
+        }
+    }
+    Ok(out)
+}
+
 impl Storage {
     /// `tenant_id` に SCHEMA `name` を作る。判定順は識別子 → 予約名（`IF NOT EXISTS` より先。
     /// `42939`）→ 組み込み名・同名の既存（`IF NOT EXISTS` なら成功の no-op、無ければ
@@ -476,7 +505,25 @@ impl Storage {
         name: &str,
         if_not_exists: bool,
     ) -> Result<CreateSchemaResult> {
-        self.create_schema_with_limit(tenant_id, name, if_not_exists, MAX_SCHEMAS_PER_TENANT)
+        self.create_schema_owned(tenant_id, name, if_not_exists, None)
+    }
+
+    /// [`Self::create_schema`] に所有者の記録を足したもの（Issue #2236）。`owner` が `Some` なら、新規作成時に
+    /// 同じ write txn でそのロールを所有者として記録する（`IF NOT EXISTS` で既存のときは何も書かない）。
+    pub(crate) fn create_schema_owned(
+        &self,
+        tenant_id: &str,
+        name: &str,
+        if_not_exists: bool,
+        owner: Option<u64>,
+    ) -> Result<CreateSchemaResult> {
+        self.create_schema_with_limit(
+            tenant_id,
+            name,
+            if_not_exists,
+            MAX_SCHEMAS_PER_TENANT,
+            owner,
+        )
     }
 
     /// [`Self::create_schema`] の本体（件数上限を引数にしてテストで小さい値を注入する）。
@@ -486,6 +533,7 @@ impl Storage {
         name: &str,
         if_not_exists: bool,
         max_schemas: usize,
+        owner: Option<u64>,
     ) -> Result<CreateSchemaResult> {
         validate_tenant_id(tenant_id)?;
         validate_identifier(name)?;
@@ -514,6 +562,14 @@ impl Storage {
             let mut table = write_txn.open_table(SCHEMAS_TABLE)?;
             table.insert((tenant_id, name), encode_schema_def(id).as_slice())?;
         }
+        if let Some(owner) = owner {
+            super::privilege::owner::set_owner_in_txn(
+                &write_txn,
+                tenant_id,
+                &super::privilege::PrivilegeObject::Schema(id),
+                owner,
+            )?;
+        }
         crate::recovery::commit_boundary::commit(write_txn)
             .map_err(super::convert_storage_error)?;
         Ok(CreateSchemaResult::Created)
@@ -530,6 +586,18 @@ impl Storage {
         name: &str,
         if_exists: bool,
     ) -> Result<DropSchemaResult> {
+        self.drop_schema_gated(tenant_id, name, if_exists, OwnerGate::Skip)
+    }
+
+    /// [`Self::drop_schema`] に所有者検査（Issue #2236）を足したもの。検査は存在判定の直後・空判定より前に
+    /// 同じ write txn で行う（所有者でない主体に SCHEMA の中身の有無を示さない）。
+    pub(crate) fn drop_schema_gated(
+        &self,
+        tenant_id: &str,
+        name: &str,
+        if_exists: bool,
+        gate: OwnerGate,
+    ) -> Result<DropSchemaResult> {
         validate_tenant_id(tenant_id)?;
         validate_identifier(name)?;
         if is_builtin_schema_name(name) {
@@ -545,6 +613,7 @@ impl Storage {
                 Err(CatalogError::SchemaNotFound(name.to_string()))
             };
         };
+        gate.check(&*write_txn, tenant_id, &PrivilegeObject::Schema(id))?;
         if schema_has_objects_in_txn(&*write_txn, tenant_id, id)? {
             return Err(CatalogError::DependentObjectsStillExist(name.to_string()));
         }
@@ -552,6 +621,9 @@ impl Storage {
             let mut table = write_txn.open_table(SCHEMAS_TABLE)?;
             table.remove((tenant_id, name))?;
         }
+        remove_owner_in_txn(&write_txn, tenant_id, &PrivilegeObject::Schema(id))?;
+        // SCHEMA 単位の ACL 行を同じ txn で掃除する（残ると `DROP ROLE` が `2BP01` で永久に拒否される。#2234）。
+        super::privilege::remove_schema_acl_in_txn(&write_txn, tenant_id, id)?;
         crate::recovery::commit_boundary::commit(write_txn)
             .map_err(super::convert_storage_error)?;
         Ok(DropSchemaResult::Dropped)
@@ -572,6 +644,19 @@ impl Storage {
         name: &str,
         if_exists: bool,
     ) -> Result<DropSchemaResult> {
+        self.drop_schema_cascade_gated(tenant_id, name, if_exists, OwnerGate::Skip)
+    }
+
+    /// [`Self::drop_schema_cascade`] に所有者検査（Issue #2236）を足したもの。所有者でも運用者権限が無い主体は、
+    /// 配下に共有カタログの relation（表・ビュー・SEQUENCE）がある `CASCADE` を実行できない
+    /// （[`CatalogError::NotObjectOwner`]。共有定義の削除は運用者権限。ADR D6・O13）。
+    pub(crate) fn drop_schema_cascade_gated(
+        &self,
+        tenant_id: &str,
+        name: &str,
+        if_exists: bool,
+        gate: OwnerGate,
+    ) -> Result<DropSchemaResult> {
         validate_tenant_id(tenant_id)?;
         validate_identifier(name)?;
         if is_builtin_schema_name(name) {
@@ -587,7 +672,16 @@ impl Storage {
                 Err(CatalogError::SchemaNotFound(name.to_string()))
             };
         };
+        gate.check(&*write_txn, tenant_id, &PrivilegeObject::Schema(id))?;
         let objects = enumerate_schema_objects_in_txn(&*write_txn, id)?;
+        if gate != OwnerGate::Skip
+            && (!objects.tables.is_empty()
+                || !objects.views.is_empty()
+                || !objects.sequences.is_empty()
+                || objects.unsupported_kinds)
+        {
+            return Err(CatalogError::NotObjectOwner);
+        }
         if objects.unsupported_kinds {
             return Err(CatalogError::DependentObjectsStillExist(name.to_string()));
         }
@@ -646,6 +740,9 @@ impl Storage {
             let mut table = write_txn.open_table(SCHEMAS_TABLE)?;
             table.remove((tenant_id, name))?;
         }
+        // SCHEMA 単位の ACL 行も同じ txn で掃除する（#2234）。
+        super::privilege::remove_schema_acl_in_txn(&write_txn, tenant_id, id)?;
+        remove_owner_in_txn(&write_txn, tenant_id, &PrivilegeObject::Schema(id))?;
         let allocator = self.sequence_allocator();
         crate::recovery::commit_boundary::commit_and_finish(write_txn, (), |()| {
             for id in &dropped_sequence_ids {
@@ -668,6 +765,17 @@ impl Storage {
     /// （`ReservedSchemaName`）→ 付け替えを 1 回の commit で行う。
     /// `sql::ddl::execute_alter_schema` から呼ばれる（権限ゲート通過後）。
     pub(crate) fn rename_schema(&self, tenant_id: &str, old: &str, new: &str) -> Result<()> {
+        self.rename_schema_gated(tenant_id, old, new, OwnerGate::Skip)
+    }
+
+    /// [`Self::rename_schema`] に所有者検査（Issue #2236）を足したもの（検査は旧名の解決の直後）。
+    pub(crate) fn rename_schema_gated(
+        &self,
+        tenant_id: &str,
+        old: &str,
+        new: &str,
+        gate: OwnerGate,
+    ) -> Result<()> {
         validate_tenant_id(tenant_id)?;
         validate_identifier(old)?;
         validate_identifier(new)?;
@@ -680,6 +788,7 @@ impl Storage {
         let Some(id) = schema_id_in_txn(&*write_txn, tenant_id, old)? else {
             return Err(CatalogError::SchemaNotFound(old.to_string()));
         };
+        gate.check(&*write_txn, tenant_id, &PrivilegeObject::Schema(id))?;
         if is_builtin_schema_name(new) || schema_id_in_txn(&*write_txn, tenant_id, new)?.is_some() {
             return Err(CatalogError::SchemaAlreadyExists(new.to_string()));
         }
@@ -1000,16 +1109,16 @@ mod tests {
     #[test]
     fn per_tenant_limit_is_enforced() {
         let (s, _g) = tmp_storage("ns-limit");
-        s.create_schema_with_limit("alice", "a", false, 2)
+        s.create_schema_with_limit("alice", "a", false, 2, None)
             .expect("1");
-        s.create_schema_with_limit("alice", "b", false, 2)
+        s.create_schema_with_limit("alice", "b", false, 2, None)
             .expect("2");
         assert!(matches!(
-            s.create_schema_with_limit("alice", "c", false, 2),
+            s.create_schema_with_limit("alice", "c", false, 2, None),
             Err(CatalogError::ViewLimitExceeded(_))
         ));
         // 他テナントの件数は数えない。
-        s.create_schema_with_limit("bob", "a", false, 2)
+        s.create_schema_with_limit("bob", "a", false, 2, None)
             .expect("bob");
     }
 
