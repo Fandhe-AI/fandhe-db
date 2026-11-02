@@ -9,32 +9,57 @@
 //! - wire-server の `post_auth_loop` が `'Q'`／`'E'` のメッセージ処理ごとにスコープを入れる。
 //! - engine 側の確認点（`sql::scan`・`window`・`group_by`・`aggregate`・`join`・
 //!   `relation_snapshot`）は #1797 の `cap + 1` 件目の早期中断と同じ行ループに `check()?` を置く。
-//! - 将来の `statement_timeout`（#1951）は同じ [`check`] にデッドラインを足すだけで済ませ、
-//!   並行する第 2 の仕組みを作らない（[`InterruptReason`] が拡張点）。
+//! - 文単位のデッドライン（#1951。[`DeadlineScope`]・[`StatementDeadline`]）は同じ [`check`] に
+//!   時刻比較を足して実現し、並行する第 2 の仕組みは作らない。poll スタックとは別の
+//!   thread-local スロットに持つ（`deadline.rs` の `//!` 参照）。導入は wire-server（#1954）が行う。
 //!
 //! 安全性: 中断は commit 前の `Err` としてしか起きない（確認点を commit 処理・台帳・成功境界
 //! より後ろに置かない）。このため autocommit は副作用ゼロ、明示トランザクションは `Failed`
 //! （`25P02`）という既存の契約がそのまま成り立つ。スコープは thread-local なので、他接続の
 //! 文へ届く経路は存在しない。
 
+mod deadline;
+
+pub use deadline::{current_deadline, DeadlineGuard, DeadlineScope, StatementDeadline};
+
 use std::cell::{Cell, RefCell};
 use std::marker::PhantomData;
 use std::rc::Rc;
+use std::time::Instant;
 
-/// 中断の理由。エラー文言には出さない（固定文言。件数・テナント情報を含めない）。
+/// 中断の理由。エラー文言は理由ごとの固定文言のみで、件数・テナント情報を含めない。
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum InterruptReason {
     /// クライアントが切断した（wire-server の生存確認が検出）。
     ClientGone,
     /// 利用者による取り消し（将来の CancelRequest 受理用の拡張点。現状は発生しない）。
     UserCancel,
-    /// 文のデッドライン超過（#1951／#1950 の statement_timeout 用の拡張点。現状は発生しない）。
+    /// 文のデッドライン超過（#1951 の [`DeadlineScope`] が [`check`] で検出する）。
     StatementTimeout,
 }
 
 /// 中断判定を [`check`] 何回に 1 回行うか。判定本体（ソケット probe 等）は高価なため、
 /// 通常の行ごとのコストは thread-local のカウンタ加算だけにする。
 pub const CHECK_STRIDE: u32 = 1024;
+
+/// 時計の読み出し口。デッドライン判定の唯一の時計読み出し点で、テストでは読み出し回数を数えて
+/// 「無効時は時計を読まない」「stride ごとに 1 回」を決定的に検証する。
+pub(crate) fn clock_now() -> Instant {
+    #[cfg(test)]
+    CLOCK_READS.with(|c| c.set(c.get() + 1));
+    Instant::now()
+}
+
+#[cfg(test)]
+thread_local! {
+    static CLOCK_READS: Cell<u64> = const { Cell::new(0) };
+}
+
+/// このスレッドでの [`clock_now`] の累計呼び出し回数（テスト専用）。
+#[cfg(test)]
+pub(crate) fn clock_reads() -> u64 {
+    CLOCK_READS.with(Cell::get)
+}
 
 type PollFn = Box<dyn FnMut() -> Option<InterruptReason>>;
 
@@ -118,6 +143,10 @@ impl InterruptScope {
 pub(crate) fn check() -> Result<(), crate::sql::allowlist::SqlSurfaceError> {
     if SUPPRESSED.with(Cell::get) > 0 {
         return Ok(());
+    }
+    // デッドラインは poll スタックと独立に評価する（無効時は時計を読まない）。
+    if let Some(reason) = deadline::poll() {
+        return Err(crate::sql::allowlist::SqlSurfaceError::QueryCanceled { reason });
     }
     let fired = STACK.with(|s| {
         // 再入（`poll` 内からの `check`）は借用失敗として無視する。

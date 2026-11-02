@@ -1355,7 +1355,8 @@ pub enum SqlSurfaceError {
     /// 固定文言のみ。
     FunctionExecutedNoReturnStatement,
     /// 実行中の文を協調的に打ち切った（Issue #1798。ERR-6: `57014`）。`crate::interrupt`
-    /// の確認点が返し、commit 前の `Err` としてのみ起きる。理由は応答に出さない。
+    /// の確認点が返し、commit 前の `Err` としてのみ起きる。文言は理由ごとの固定文言のみで、
+    /// 件数・テナント情報は含めない（Issue #1951 で statement timeout 用の文言を追加）。
     QueryCanceled {
         reason: crate::interrupt::InterruptReason,
     },
@@ -2462,7 +2463,12 @@ impl std::fmt::Display for SqlSurfaceError {
             SqlSurfaceError::FunctionExecutedNoReturnStatement => {
                 write!(f, "control reached end of function without RETURN")
             }
-            // PostgreSQL と同じ固定文言。理由（切断・取り消し等）は含めない。
+            // PostgreSQL と同じ固定文言。期限超過のみ専用文言で、切断・取り消しは従来のまま。
+            SqlSurfaceError::QueryCanceled {
+                reason: crate::interrupt::InterruptReason::StatementTimeout,
+            } => {
+                write!(f, "canceling statement due to statement timeout")
+            }
             SqlSurfaceError::QueryCanceled { .. } => {
                 write!(f, "canceling statement due to user request")
             }
