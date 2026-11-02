@@ -1139,7 +1139,7 @@ crash 道具 `crates/engine/examples/crash_tool_cross_table.rs` の `txn` モー
 - `verify`: 台帳の適用数 S に対し、バッチ表が 0..S の連番・明細表が 0..S×4 の連番かつ導出 payload と一致、表間の件数一致、S が 0 なら失敗、別テナントから 0 行であること。1 表だけ進んだ／戻った状態（部分コミット）は失敗になる。
 - `self-check txn`: 完全な Tx は ok、台帳・明細・バッチのどれか 1 つだけ進めた DB と空 DB は ng になることを確かめ、オラクルの空振りを防ぐ。
 - `scripts/crash_test_cross_table.sh` が既存の `crash-test-cross-table` ジョブ内で batch・txn の 2 段を同じ検査（SIGKILL の終了コード 137・acked 下限・行数の単調増加）で実行する。
-- 申し送り: kill 位置の制御と中断未観測の検査は #2416 で実装済み（次節）。DDL は #2417／#2418。
+- 申し送り: kill 位置の制御と中断未観測の検査は #2416 で実装済み（次節）。DDL は #2417（道具）・#2418（kill 位置の分類）で実装済み。
 
 ## 明示トランザクションの kill 位置制御（Issue #2416・PERSIST-1・SQL-31・TABLE-10 ポインタ）
 
@@ -1148,4 +1148,4 @@ crash 道具 `crates/engine/examples/crash_tool_cross_table.rs` の `txn` モー
 - 期待値: 途中・COMMIT 直前の kill では当該 Tx は何も残らず、COMMIT 直後の kill では全部残る。`COMMIT` は redb の Immediate commit を同期的に行い、ack 前でも `Ok` 返却後は永続済みのため、直後は完全一致で検証できる。
 - `scripts/crash_test_txn_kill_points.sh`（`make crash-test-txn-kill-points`）が 3 点をセットごとに実行し、PAUSED が最後の進行行であること・終了コード 137・verify の `rows`／`batches` が期待値と完全一致することを確かめる。観測できなかった点があれば失敗にする。
 - ランダム段（`crash_test_cross_table.sh` の txn 段）は最後の進行行で kill 位置を分類し、`rows <= acked + 4` の上限検査を足し、txn 段全体で `IN_TXN` を 1 度も観測しなければ失敗にする。判定を段全体にするのは遅い runner での不安定化を避けるため（3 点の網羅は決定的段が担う）。
-- 実行場所: 既存の `crash-test-cross-table` ジョブの step（必須チェック名は不変）。DDL の kill 制御は #2417／#2418、DDL エラー・`55P03` は #2419。
+- 実行場所: 既存の `crash-test-cross-table` ジョブの step（必須チェック名は不変）。DDL の道具は #2417、kill 位置の分類は #2418、DDL エラー・`55P03` は #2419。
