@@ -99,6 +99,21 @@ impl EngineCore {
         txn: Option<&SessionTransaction<'e>>,
         locking: &LockingSelect,
     ) -> Result<crate::sql::SqlOutcome, SqlSurfaceError> {
+        // autocommit は通常実行の入口（`execute_parsed_statement`）を通らないため、文の束縛区間の
+        // スコープ（時計・JSONPath／正規表現の上限・セッション TimeZone と `row_security`）をここで張る。
+        // 明示 Tx は呼び出し元（`execute_in_active_txn_inner`）が Tx 開始時刻つきで張り済み。
+        let _autocommit_scopes = match txn {
+            Some(_) => None,
+            None => Some((
+                super::statement_clock_scope(
+                    &super::ParsedSql::Statement(locking.statement().clone()),
+                    None,
+                )?,
+                crate::sql::jsonpath_fn::JsonPathLimitsScope::enter(self.jsonpath_limits),
+                crate::sql::regex_op::RegexLimitsScope::enter(self.regex_limits),
+                super::session_time_zone_scope(session),
+            )),
+        };
         // 行走査を省いても、対象表の RLS 適用判定（`row_security = off` の 42501 拒否）は空結果の前に行う
         // （RLS-13。writer の空き具合で拒否と空結果が分かれて存在のオラクルにならないよう、取得の成否に依らず同じ検査）。
         self.reject_skip_locked_row_security_off(ctx, session, txn, locking)?;

@@ -535,6 +535,8 @@ fn skip_locked_with_subqueries_returns_zero_rows_while_held() {
         "SELECT id FROM documents WHERE id IN (SELECT id FROM authors) ORDER BY id LIMIT 10",
         "SELECT id, (SELECT max(id) FROM authors) FROM documents ORDER BY id LIMIT 10",
         "SELECT id FROM documents WHERE NOT EXISTS (SELECT 1 FROM authors WHERE name = 'zzz') ORDER BY id LIMIT 10",
+        // 時刻関数を含むサブクエリ: 通常実行と同じ時計の束縛を張るため writer 保持中でも 0A000 にならない。
+        "SELECT id FROM documents WHERE id IN (SELECT id FROM authors WHERE now() > '2000-01-01T00:00:00Z'::timestamptz) ORDER BY id LIMIT 10",
     ];
     let mut holder = hold_writer(&core, &mut session);
     for q in queries {
