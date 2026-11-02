@@ -272,6 +272,12 @@
 //! `EngineCore::with_write_lock_wait` へ 1 回だけ注入する
 //! （`docs/design/write-lock-wait-cli.md`）。
 //!
+//! `--statement-timeout-ms`（Issue #1954。SQL-71・SQL-46）: 全セッションの `statement_timeout` の
+//! 既定値をミリ秒（`0`〜`2147483647`。既定 `0`＝無効）で起動時に設定する opt-in 注入点。セッションは
+//! `SET statement_timeout` で上書きでき、`RESET` は本値へ戻る。超過した文は `57014`。範囲外・非数値・
+//! 値欠落・重複指定は fail-closed で起動エラー。値の解決は `wire_server::statement_timeout_opt::resolve`
+//! に一本化し、`EngineCore::with_default_statement_timeout` へ 1 回だけ注入する。
+//!
 //! `--max-transaction-duration-ms`／`--max-transaction-statements`（Issue #1553。SQL-46）:
 //! 明示トランザクション（暗黙トランザクションにも同じ値が効く）の最大持続時間
 //! （`100`〜`60000` ミリ秒・既定 20000）と最大文数（`1`〜`10000`・既定 1000）を、
@@ -537,6 +543,7 @@ fn run_server(args: &[String]) -> ExitCode {
     let mut wasm_limits_raw: [Option<String>; 3] = Default::default();
     let mut max_result_rows_raw: Option<String> = None;
     let mut write_lock_wait_raw: Option<String> = None;
+    let mut statement_timeout_raw: Option<String> = None;
     let mut read_timeout_secs_raw: Option<String> = None;
     let mut max_connections_raw: Option<String> = None;
     let mut max_prepared_statements_raw: Option<String> = None;
@@ -1263,6 +1270,25 @@ fn run_server(args: &[String]) -> ExitCode {
                     return ExitCode::FAILURE;
                 }
                 write_lock_wait_raw = Some(v.clone());
+                i += 2;
+            }
+            wire_server::statement_timeout_opt::FLAG => {
+                let Some(v) = args.get(i + 1) else {
+                    engine::log_stderr!(
+                        "wire-server: {} requires a non-negative integer argument",
+                        wire_server::statement_timeout_opt::FLAG
+                    );
+                    return ExitCode::FAILURE;
+                };
+                // Issue #1954: 他の起動時構成フラグと同じく 2 回目以降の指定を fail-closed に拒否する。
+                if statement_timeout_raw.is_some() {
+                    engine::log_stderr!(
+                        "wire-server: {} specified more than once",
+                        wire_server::statement_timeout_opt::FLAG
+                    );
+                    return ExitCode::FAILURE;
+                }
+                statement_timeout_raw = Some(v.clone());
                 i += 2;
             }
             wire_server::connection_limits_opt::READ_TIMEOUT_FLAG => {
@@ -2235,6 +2261,17 @@ fn run_server(args: &[String]) -> ExitCode {
             }
         };
 
+    // Issue #1954: `statement_timeout` の既定値を bind・ユーザーストア読込より前に解決する
+    // （fail-closed）。未指定は 0（無効）＝現行挙動。
+    let default_statement_timeout =
+        match wire_server::statement_timeout_opt::resolve(statement_timeout_raw.as_deref()) {
+            Ok(d) => d,
+            Err(e) => {
+                engine::log_stderr!("wire-server: invalid statement timeout configuration: {e}");
+                return ExitCode::FAILURE;
+            }
+        };
+
     // Issue #1553: 明示トランザクションの最大持続時間・最大文数を bind・ユーザーストア読込より
     // 前に解決する（fail-closed）。未指定は `TransactionLimits::default()`＝現行挙動。
     let transaction_limits = match wire_server::transaction_limits_opt::resolve(
@@ -2707,6 +2744,8 @@ fn run_server(args: &[String]) -> ExitCode {
     // Issue #1554: 未指定でも常に呼ぶ（既定は `DEFAULT_WRITE_LOCK_WAIT` で、未注入と
     // 挙動がビット同一）。
     core = core.with_write_lock_wait(write_lock_wait);
+    // Issue #1954: 未指定でも常に呼ぶ（既定は 0＝無効で、未注入と挙動が同一）。
+    core = core.with_default_statement_timeout(default_statement_timeout);
     // Issue #1553: 未指定でも常に呼ぶ（既定は `TransactionLimits::default()` で、未注入と挙動が同一）。
     core = core.with_transaction_limits(transaction_limits);
     // Issue #1128: 未指定でも常に呼ぶ（既定は `PartitionedDmlLimits::default()`）。

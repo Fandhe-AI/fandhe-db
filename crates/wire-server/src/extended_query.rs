@@ -2337,6 +2337,9 @@ fn execute_portal<'e, S: WireStream>(
     portal_name: &str,
     max_rows: i32,
 ) -> Result<PortalExecution, HandlerError> {
+    // SQL-71・Issue #1954: Execute ごとに文単位のデッドラインを張る（Parse／Bind／Describe は対象外。
+    // `max_rows` による portal 再開も Execute ごとに新しい期限）。ガードは関数末尾まで生存させる。
+    let _deadline = crate::simple_query::install_statement_deadline(session);
     // 明示トランザクションが `Failed`（エラーによる abort・持続時間上限による
     // 解放後）の間は、`ROLLBACK`（未実行の `Ready`）と空文字列の portal 以外への
     // Execute を、portal の存在確認や実行状態に依らず最初に `25P02`（期限切れの
