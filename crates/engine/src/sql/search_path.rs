@@ -293,7 +293,7 @@ pub(crate) fn resolved_relation_ref_names(tokens: &[Token]) -> Vec<String> {
 }
 
 /// [`resolved_relation_ref_names`] が構文語として除外しきれない `ONLY <識別子>` の `ONLY`（実表 `"only"`
-/// の可能性があるもの）の名前。権限ゲートは、これが実在する relation として引けた場合に限り通常の参照と
+/// の可能性があるもの）と、その直後の識別子（別名の可能性があるもの）の名前。権限ゲートは、これが実在する relation として引けた場合に限り通常の参照と
 /// 同じく検査する（別名にだけ権限がある主体が実表 `"only"` を読む認可バイパスを防ぐ）。
 pub(crate) fn resolved_optional_only_names(tokens: &[Token]) -> Vec<String> {
     relation_refs(tokens, &[], true)
@@ -312,6 +312,10 @@ fn relation_refs(tokens: &[Token], skip: &[usize], keep_internal_keys: bool) -> 
     // 数えるため、位置走査の側では二重に数えない。
     let object_ddl = object_ddl_names(tokens);
     let mut out = Vec::new();
+    // 曖昧な `ONLY` の直後の識別子の添字。`FROM "only" x` では `x` は別名であり実表ではない一方、
+    // `FROM ONLY t` では `t` が実表になる。字句では区別できないため、後続名も「実在すれば検査する」
+    // 候補に倒す（別名が実在しない表名のとき必須扱いで 42501 になる誤拒否を避ける。Issue #1968）。
+    let mut after_ambiguous_only: Option<usize> = None;
     for pos in walk.positions {
         if pos.create_name
             || skip.contains(&pos.index)
@@ -345,8 +349,10 @@ fn relation_refs(tokens: &[Token], skip: &[usize], keep_internal_keys: bool) -> 
                 is_index: false,
                 optional: true,
             });
+            after_ambiguous_only = Some(pos.index.saturating_add(1));
             continue;
         }
+        let follows_ambiguous_only = after_ambiguous_only == Some(pos.index);
         if is_syntax_keyword_here(tokens, pos.index)
             || ctes
                 .iter()
@@ -372,7 +378,7 @@ fn relation_refs(tokens: &[Token], skip: &[usize], keep_internal_keys: bool) -> 
         out.push(GateRef {
             name: name.to_string(),
             is_index: false,
-            optional: false,
+            optional: follows_ambiguous_only,
         });
     }
     // `DROP`／`ALTER`／`REFRESH` の対象名にも位置走査と同じ除外を掛ける。Bind・Describe は書き換え後の
