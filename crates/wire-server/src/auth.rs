@@ -9,6 +9,7 @@
 pub mod argon2id;
 pub use engine::crypto::base64_std;
 pub mod blake2b;
+pub mod bootstrap;
 pub use engine::crypto::hmac_sha256;
 pub mod role_connections;
 pub mod scram;
@@ -75,6 +76,8 @@ pub enum AuthMethod {
 
 /// ユーザーストア 1 行分のレコード（`username:tenant_id:phc[:scram_verifier]` 形式）。
 struct UserRecord {
+    /// ファイル上の行番号（1 起算。ブートストラップの起動ログ用。Issue #2238）。
+    line: usize,
     tenant_id: String,
     phc: String,
     scram_verifier: Option<scram::ScramVerifier>,
@@ -315,6 +318,7 @@ impl UserStore {
                 .insert(
                     username.to_string(),
                     UserRecord {
+                        line: line_no,
                         tenant_id: tenant_id.to_string(),
                         phc: phc.to_string(),
                         scram_verifier,
@@ -388,6 +392,31 @@ impl UserStore {
         let record = self.users.get(username)?;
         let verifier = record.scram_verifier.as_ref()?;
         Some((record.tenant_id.as_str(), verifier))
+    }
+
+    /// 素の username が属するテナント（users ファイルの行。無ければ `None`）。ブートストラップ後は
+    /// 「素の username からテナントへの経路振り分け」だけがファイルの役割になる（Issue #2238）。
+    pub(crate) fn tenant_of(&self, username: &str) -> Option<&str> {
+        self.users.get(username).map(|r| r.tenant_id.as_str())
+    }
+
+    /// ブートストラップへ渡す行（PHC・SCRAM 検証子・`--ddl-allowed-users` の列挙の有無・行番号）。
+    /// `--ddl-allowed-users` の適用後に呼ぶこと。行番号の昇順で返す（Issue #2238）。
+    pub(crate) fn bootstrap_users(&self) -> Vec<engine::core::BootstrapUser> {
+        let mut rows: Vec<engine::core::BootstrapUser> = self
+            .users
+            .iter()
+            .map(|(username, r)| engine::core::BootstrapUser {
+                line: r.line,
+                username: username.clone(),
+                tenant_id: r.tenant_id.clone(),
+                phc: r.phc.clone(),
+                scram_verifier: r.scram_verifier.as_ref().map(|v| v.to_verifier_string()),
+                ddl_listed: self.ddl_allowed.contains(username),
+            })
+            .collect();
+        rows.sort_by_key(|u| u.line);
+        rows
     }
 
     /// カタログのロールの同時接続数の台帳（`handshake` が認証成功の後に確保する。Issue #2233）。
@@ -465,6 +494,7 @@ impl UserStore {
             users.insert(
                 username.to_string(),
                 UserRecord {
+                    line: 0,
                     tenant_id: tenant_id.to_string(),
                     phc: phc.to_string(),
                     scram_verifier: None,

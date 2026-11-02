@@ -69,6 +69,15 @@ impl Fixture {
 
     /// `ddl_users` は `--ddl-allowed-users` 相当（Issue #1971 の優先関係の確認用）。
     fn start_with(label: &str, ddl_users: &[&str]) -> Self {
+        Self::start_inner(label, ddl_users, false)
+    }
+
+    /// 起動時のブートストラップ（Issue #2238）を実行してから接続を受け付ける（`main.rs` と同じ順序）。
+    fn start_bootstrapped(label: &str, ddl_users: &[&str]) -> Self {
+        Self::start_inner(label, ddl_users, true)
+    }
+
+    fn start_inner(label: &str, ddl_users: &[&str], bootstrap: bool) -> Self {
         let dir = TempDir::new(label);
         let users = dir.0.join("users.txt");
         let phc = argon2id::encode_phc(
@@ -96,6 +105,10 @@ impl Fixture {
                 .expect("ddl users"),
         );
         let core = Arc::new(EngineCore::open(dir.0.join("db.redb")).expect("open engine"));
+        if bootstrap {
+            wire_server::auth::bootstrap::bootstrap_users_file(&store, &core)
+                .expect("bootstrap users file");
+        }
         let listener = TcpListener::bind("127.0.0.1:0").expect("bind");
         let addr = listener.local_addr().expect("addr");
         let (s2, c2) = (Arc::clone(&store), Arc::clone(&core));
@@ -638,4 +651,22 @@ fn ddl_allowed_users_never_widens_beyond_the_catalog() {
         simple_query(&mut s, "CREATE TABLE ufr_t (id BIGINT)").as_deref(),
         Some("42501")
     );
+}
+
+/// ブートストラップ後（Issue #2238）は、素の username の SCRAM もカタログの検証子で照合する。
+/// ファイルの検証子（`pw-ops`）ではなく、`ALTER ROLE ... PASSWORD` で変えた値だけが通る。
+#[test]
+fn bootstrapped_users_file_user_authenticates_against_the_catalog_verifier() {
+    let f = Fixture::start_bootstrapped("boot-scram", &["ops"]);
+    // 初回: ファイルから取り込んだ検証子で通り、初期ロールは同名ロールへ束縛される。
+    let mut s = expect_ready(f.login("ops", b"pw-ops"));
+    assert_eq!(simple_query(&mut s, "SET ROLE ops"), None);
+    drop(s);
+    f.sql(TENANT, "ALTER ROLE ops PASSWORD 'pw-changed'");
+    // ファイルの検証子は変わっていないが、カタログが正なので旧パスワードは通らない。
+    let (body, after_ok, elapsed, _) = expect_rejected(f.login("ops", b"pw-ops"));
+    assert!(!after_ok);
+    assert_eq!(sqlstate(&body), "28P01");
+    assert!(elapsed >= wire_server::auth::AUTH_FAILURE_DELAY);
+    let _ready = expect_ready(f.login("ops", b"pw-changed"));
 }

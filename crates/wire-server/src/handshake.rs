@@ -1324,6 +1324,28 @@ struct CatalogPrincipal {
     role_name: String,
     login: bool,
     connection_limit: i32,
+    /// users ファイル経路で、テナントのブートストラップ済みマーカーがあるか（Issue #2238）。真なら
+    /// `allow_ddl` は `--ddl-allowed-users` と永続の DDL フラグの積で決める。
+    bootstrapped: bool,
+    /// 初期ロールの全権限（オブジェクト権限の所有者相当。DDL は含まない。経路を問わず束縛時に写す）。
+    all_object_privileges: bool,
+    /// 初期ロールの永続の DDL フラグ。
+    ddl_flag: bool,
+}
+
+impl CatalogPrincipal {
+    /// users ファイルのユーザーを同名ロールへ対応づけた結果から作る（Issue #1971・#2238）。
+    fn from_bound(b: auth::users_file_role::BoundUsersFileRole) -> Self {
+        Self {
+            role_id: b.role_id,
+            role_name: b.role_name,
+            login: b.login,
+            connection_limit: b.connection_limit,
+            bootstrapped: b.bootstrapped,
+            all_object_privileges: b.all_object_privileges,
+            ddl_flag: b.ddl_flag,
+        }
+    }
 }
 
 /// `store.auth_method()` に応じて cleartext／SCRAM-SHA-256 のいずれかの認証
@@ -1371,12 +1393,7 @@ fn authenticate_cleartext<S: WireStream>(
 fn users_file_kind(binding: auth::users_file_role::UsersFileBinding) -> PrincipalKind {
     match binding {
         auth::users_file_role::UsersFileBinding::Bound(b) => {
-            PrincipalKind::UsersFileBound(CatalogPrincipal {
-                role_id: b.role_id,
-                role_name: b.role_name,
-                login: b.login,
-                connection_limit: b.connection_limit,
-            })
+            PrincipalKind::UsersFileBound(CatalogPrincipal::from_bound(b))
         }
         _ => PrincipalKind::UsersFile,
     }
@@ -1490,6 +1507,8 @@ fn authenticate_scram<S: WireStream>(
     // 検索失敗・検証子の解析失敗は、すべてモック検証子（`success == false`）へ畳み込み、同じ
     // `28P01` と `AUTH_FAILURE_DELAY` へ収束させる（早期 return しない）。
     let mut catalog_principal: Option<CatalogPrincipal> = None;
+    // ブートストラップ済みテナントの素の username でカタログの検証子を使ったとき、そのロール ID。
+    let mut catalog_verifier_role_id: Option<u64> = None;
     let (tenant_id, verifier) = if engine::core::EngineCore::is_login_identifier(username) {
         match resolve_catalog_scram(engine, username) {
             Some((c, v)) => {
@@ -1499,6 +1518,9 @@ fn authenticate_scram<S: WireStream>(
                     role_name: c.role_name,
                     login: c.login,
                     connection_limit: c.connection_limit,
+                    bootstrapped: false,
+                    all_object_privileges: c.initial_privileges.all_object_privileges,
+                    ddl_flag: c.initial_privileges.ddl,
                 });
                 (Some(tenant), v)
             }
@@ -1506,7 +1528,19 @@ fn authenticate_scram<S: WireStream>(
         }
     } else {
         match store.scram_lookup(username) {
-            Some((tenant, v)) => (Some(tenant.to_string()), v.clone()),
+            Some((tenant, v)) => {
+                // ブートストラップ済みテナントの素の username は、ファイルの検証子ではなくカタログの
+                // ロールの検証子で照合する（Issue #2238）。ロールの検証子が使えない（不在・期限切れ・
+                // 検証子なし・不正）ときはモック検証子へ倒し、同じ `28P01`・同じ遅延へ収束させる。
+                match catalog_scram_for_users_file(engine, tenant, username) {
+                    CatalogScram::NotBootstrapped => (Some(tenant.to_string()), v.clone()),
+                    CatalogScram::Verifier(role_id, cv) => {
+                        catalog_verifier_role_id = Some(role_id);
+                        (Some(tenant.to_string()), cv)
+                    }
+                    CatalogScram::Unusable => (None, mock),
+                }
+            }
             None => (None, mock),
         }
     };
@@ -1588,12 +1622,28 @@ fn authenticate_scram<S: WireStream>(
         match auth::users_file_role::bind_users_file_user(engine, tenant, username) {
             auth::users_file_role::UsersFileBinding::Unbound => {}
             auth::users_file_role::UsersFileBinding::Bound(b) => {
-                users_file_principal = Some(CatalogPrincipal {
-                    role_id: b.role_id,
-                    role_name: b.role_name,
-                    login: b.login,
-                    connection_limit: b.connection_limit,
-                });
+                // カタログの検証子で照合したときは、証明の後に再取得した値が同じロール ID・同じ検証子で
+                // あることを確かめる（待機中のパスワード変更・ロールの削除／再作成を許さない。fail-closed）。
+                let unchanged = match catalog_verifier_role_id {
+                    None => true,
+                    Some(id) => {
+                        b.bootstrapped
+                            && b.role_id == id
+                            && scram::ScramVerifier::parse(&b.scram_verifier)
+                                .map(|cur| {
+                                    cur.salt == verifier.salt
+                                        && cur.iterations == verifier.iterations
+                                        && cur.stored_key == verifier.stored_key
+                                        && cur.server_key == verifier.server_key
+                                })
+                                .unwrap_or(false)
+                    }
+                };
+                if unchanged {
+                    users_file_principal = Some(CatalogPrincipal::from_bound(b));
+                } else {
+                    success = false;
+                }
             }
             auth::users_file_role::UsersFileBinding::Reject => success = false,
         }
@@ -1624,6 +1674,53 @@ fn authenticate_scram<S: WireStream>(
         (None, None) => PrincipalKind::UsersFile,
     };
     Ok(AuthOutcome::Success(AuthenticatedPrincipal { ctx, kind }))
+}
+
+/// ブートストラップ済みテナントの素の username に対する SCRAM 検証子の解決結果（Issue #2238）。
+enum CatalogScram {
+    /// マーカーが無い（または engine が無い・引けない）。従来どおりファイルの検証子で照合する。
+    NotBootstrapped,
+    /// カタログのロールの検証子（ロール ID つき）。
+    Verifier(u64, scram::ScramVerifier),
+    /// カタログが正だが、使える検証子が無い（不在・期限切れ・検証子なし・不正）。モックへ倒す。
+    Unusable,
+}
+
+/// users ファイルの行（`tenant`）の素の username について、カタログが正なら SCRAM 検証子を引く。
+/// 読み取りの失敗は `Unusable`（モックへ倒す。fail-closed。固定文言で記録し、テナント・名前は出さない）。
+fn catalog_scram_for_users_file(
+    engine: Option<&engine::core::EngineCore>,
+    tenant: &str,
+    username: &str,
+) -> CatalogScram {
+    let Some(engine) = engine else {
+        return CatalogScram::NotBootstrapped;
+    };
+    match engine.resolve_users_file_role(tenant, username) {
+        Ok(engine::core::UsersFileRoleBinding::Role(c)) if c.bootstrapped => {
+            if c.is_expired() || c.scram_verifier.is_empty() {
+                return CatalogScram::Unusable;
+            }
+            match scram::ScramVerifier::parse(&c.scram_verifier) {
+                Ok(v)
+                    if v.iterations == scram::SCRAM_ITERATIONS
+                        && v.salt.len() == scram::SALT_LEN =>
+                {
+                    CatalogScram::Verifier(c.role_id, v)
+                }
+                _ => CatalogScram::Unusable,
+            }
+        }
+        // マーカーのあるテナントで同名ロールが無い。ファイルの検証子で証明させず、モックへ倒す。
+        Ok(engine::core::UsersFileRoleBinding::Missing) => CatalogScram::Unusable,
+        Ok(_) => CatalogScram::NotBootstrapped,
+        Err(_) => {
+            engine::log_stderr!(
+                "wire-server: role catalog lookup failed during authentication; treating as authentication failure"
+            );
+            CatalogScram::Unusable
+        }
+    }
 }
 
 /// 認証成功直前にカタログのロールを再取得し、最新の `LOGIN`・`CONNECTION LIMIT` を `principal` へ反映する。
@@ -1965,8 +2062,16 @@ fn run_authenticated_session<S: WireStream>(
     // 可視性のみを運び認証主体を持たないため、この判定は `ctx` ではなく
     // `store`（`--ddl-allowed-users`）に基づく。SQL 文経由でセッションが自身の
     // 権限を昇格させる経路は構造的に存在しない。
+    // ブートストラップ済みテナントの束縛セッションでは、`--ddl-allowed-users` の列挙と永続の DDL フラグの積
+    // にする（Issue #2238。CLI へ後から足しても DDL は広がらず、外せば狭まる。fail-closed）。
     if ddl_by_users_file && store.is_ddl_allowed(&username) {
-        session.allow_ddl();
+        let persistent_ok = match &catalog_role {
+            Some(p) if p.bootstrapped => p.ddl_flag,
+            _ => true,
+        };
+        if persistent_ok {
+            session.allow_ddl();
+        }
     }
     // TABLE-27・Issue #1715: `search_path` の `"$user"` は、認証成功後に確定した username から
     // 展開する（接続ごとに 1 回だけ設定し、SQL 文から変える経路は持たない。ADR D6）。
@@ -1977,6 +2082,10 @@ fn run_authenticated_session<S: WireStream>(
         Some(p) => {
             session.set_session_user(&p.role_name);
             session.bind_role_ids(p.role_id, p.role_id);
+            // 初期ロールの全権限（SQL-39 (5)）はロールの性質なので、経路を問わず束縛時に写す。DDL は含まない。
+            if p.all_object_privileges {
+                session.grant_bootstrap_all_privileges();
+            }
         }
         None => session.set_session_user(&username),
     }

@@ -109,6 +109,12 @@
 //! で拒否される既定）。値の解決は `ddl_permission_opt::parse`・
 //! `UserStore::with_ddl_allowed_users` に一本化する。
 //!
+//! `--users` ファイルは**初期ブートストラップ専用**（Issue #2238・SQL-39 (3)(5)）: 起動時に、ロールが
+//! 無いテナントでだけファイルの行から初期ロール（`LOGIN`・`CREATEROLE`・テナントのオブジェクトへの
+//! 全権限）を作る。以後の認証・権限はカタログが正で、ファイルの書き換え・`--ddl-allowed-users` の
+//! 後からの追加では権限が広がらない（`--ddl-allowed-users` は初回の写像と、以後は永続の DDL 権限との積）。
+//! 食い違いは起動ログの警告に出す。ユーザーの追加・パスワードの変更は `CREATE ROLE`／`ALTER ROLE` で行う。
+//!
 //! `--max-table-columns`／`--max-array-elements`／`--max-enum-labels`（Issue #1548。
 //! SQL-46）: 1 テーブルの列数（`1`〜`256`）・配列列 1 個の要素数（`1`〜`1024`）・
 //! ENUM 型 1 個のラベル数（`1`〜`256`）の上限を、プロセス全体に対して起動時に
@@ -2639,6 +2645,28 @@ fn run_server(args: &[String]) -> ExitCode {
     if core.sync_login_names().is_err() {
         engine::log_stderr!("wire-server: failed to synchronize role login names");
         return ExitCode::FAILURE;
+    }
+    // SQL-39 (3)(5)・Issue #2238: `--users` ファイルは初期ブートストラップ専用。ロールが無いテナントでだけ
+    // ファイルの行から初期ロールを作り（既存ロールのあるテナントはマーカーだけを補う）、以後の認証・
+    // 権限はカタログを正とする。`--ddl-allowed-users` の適用後（上）に呼ぶ。失敗したらカタログへ何も
+    // 書かれていないので listen せず起動を拒否する（fail-closed。固定文言で、資格情報・テナントを含めない）。
+    match wire_server::auth::bootstrap::bootstrap_users_file(&store, &core) {
+        Ok(summary) => {
+            if summary.tenants_bootstrapped + summary.tenants_adopted > 0 {
+                engine::log_stderr!(
+                    "wire-server: users file bootstrapped {} tenant(s) and adopted {} existing tenant(s)",
+                    summary.tenants_bootstrapped,
+                    summary.tenants_adopted
+                );
+            }
+            for w in &summary.warnings {
+                engine::log_stderr!("{w}");
+            }
+        }
+        Err(e) => {
+            engine::log_stderr!("wire-server: users file bootstrap failed: {e}");
+            return ExitCode::FAILURE;
+        }
     }
     // TASK-117（PLAN-9）: opt-in 注入。未指定（既定）では `query_planner`/
     // `embedder` とも未設定のままとなり、`USING PLAN` は従来どおり
