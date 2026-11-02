@@ -8,7 +8,7 @@
 use std::time::{Duration, Instant};
 
 use engine::core::EngineCore;
-use engine::interrupt::{DeadlineScope, StatementDeadline};
+use engine::interrupt::{checks_seen, install_fire_after_checks, DeadlineScope, StatementDeadline};
 use engine::kernel::CpuScalarProvider;
 use engine::policy::PolicyContext;
 use engine::sql::allowlist::SqlSurfaceError;
@@ -130,4 +130,30 @@ fn sql71_expired_join_fails_the_explicit_transaction() {
     assert_eq!(err.wire_code(), "25P02");
     core.execute_sql_in_txn(&caller, &mut session, &mut txn, "ROLLBACK")
         .expect("rollback");
+}
+
+/// SQL-71: 走査の確認点を通り抜けた後に期限が切れても、後段の確認点が `57014` にする。
+/// 期限を実行前から切らす試験は走査側の確認点で先に中断され後段を検出できないため、時計に依存しない
+/// 確認回数プローブで「n 回目まで通し、n+1 回目で発火」を全 n について確かめる。確認回数の
+/// 下限（`MIN_CHECKS`）は走査分に後段の確認点が加わった実測値で、後段の確認点を外すと下回る。
+#[test]
+fn sql71_deadline_firing_after_the_scan_is_caught_by_later_stages() {
+    // QUERIES と同順の確認回数の実測値（回帰ピン。確認点の追加で増えるのは構わず、減るのは退行）。
+    const MIN_CHECKS: &[u32] = &[30, 30, 42, 30, 8, 8, 10, 10, 10, 7, 6, 6];
+    let (core, _g) = open("sql1952-probe");
+    for (i, sql) in QUERIES.iter().enumerate() {
+        let total = {
+            let _scope = install_fire_after_checks(u32::MAX);
+            run(&core, sql).expect(sql);
+            checks_seen()
+        };
+        assert!(total >= MIN_CHECKS[i], "{sql}: checks {total}");
+        for n in 0..total {
+            let _scope = install_fire_after_checks(n);
+            let e = run(&core, sql).expect_err(sql);
+            assert_eq!(e.wire_code(), "57014", "{sql} n={n}");
+        }
+        let _scope = install_fire_after_checks(total);
+        run(&core, sql).unwrap_or_else(|e| panic!("{sql}: budget == total must pass: {e:?}"));
+    }
 }
