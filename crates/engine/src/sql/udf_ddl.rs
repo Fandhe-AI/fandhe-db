@@ -21,6 +21,7 @@ use crate::catalog::function::{
     FUNCTION_RECURSIVE_MESSAGE,
 };
 use crate::catalog::function_dependency::{FunctionDependency, FUNCTION_DEPENDEE_MISSING_MESSAGE};
+use crate::catalog::privilege::owner::OwnerGate;
 use crate::catalog::CatalogError;
 use crate::sql::allowlist::{
     DropFunctionBehavior, FunctionAttributeClauses, FunctionLanguageClause, FunctionParallelClause,
@@ -78,6 +79,20 @@ pub(crate) fn udf_cast_from_function_type(ft: &FunctionType) -> Option<CastType>
         other => other,
     };
     (function_type_from_udf_cast(&cast).ok().as_ref() == Some(ft)).then_some(cast)
+}
+
+/// 新規作成した関数の所有者として、束縛中のロールを記録する（Issue #2236）。未束縛（認証層が
+/// ロールを束縛していない従来のセッション）では何も書かず、所有者の無い関数は運用者権限でしか
+/// 扱えない（拒否側）。記録の失敗は作成の成否に影響させない（所有者行が無い状態は fail-closed）。
+fn record_creator_as_owner(
+    storage: &Storage,
+    tenant_id: &str,
+    session: &SessionState,
+    function_key: &str,
+) {
+    if let Some(role) = session.current_role_id().filter(|id| *id != 0) {
+        let _ = storage.record_function_owner(tenant_id, function_key, role);
+    }
 }
 
 /// カタログへ書く [`FunctionDef`] を検証済みの定義から組み立てる（`CREATE`・`OR REPLACE` 共通）。
@@ -210,6 +225,7 @@ pub(crate) fn execute_create_function_persistent(
     storage
         .create_function_with_limit(tenant_id, &def, max_functions)
         .map_err(map_function_error)?;
+    record_creator_as_owner(storage, tenant_id, session, &def.function_key);
     let key = prepared.key.clone();
     commit_function_definition(session.udfs_mut(), prepared);
     // カタログに永続化した定義はカタログ由来として印付けする（他セッションの DROP を refresh が
@@ -254,7 +270,7 @@ pub(crate) fn execute_create_or_replace_function_persistent(
     // 再度行う（並行する別セッションの置換との合成で循環が残るのを防ぐ）。
     let target = prepared.key.to_ascii_lowercase();
     let new_body = &prepared.body;
-    storage
+    let replaced = storage
         .replace_function_checked(tenant_id, &def, max_functions, &|latest| {
             let mut bodies = std::collections::BTreeMap::new();
             for d in latest {
@@ -278,6 +294,10 @@ pub(crate) fn execute_create_or_replace_function_persistent(
             Ok(())
         })
         .map_err(map_function_error)?;
+    // 置換は既存の所有者を変えない。新規に作った場合だけ作成者を所有者にする（Issue #2236）。
+    if replaced == crate::catalog::function::ReplaceOutcome::Created {
+        record_creator_as_owner(storage, tenant_id, session, &def.function_key);
+    }
     let key = prepared.key.clone();
     commit_function_definition(session.udfs_mut(), prepared);
     session.udfs_mut().mark_catalog_origin(&key);
@@ -411,15 +431,20 @@ pub(crate) fn execute_create_routine_persistent(
     if or_replace {
         // 関数間の循環は、標準形の依存辺について write txn 内で検査される（`replace_function_with_deps`）。
         // 辺を持たない新定義は別の定義を呼ばないため、置換で辺だけが消える。
-        storage
+        let replaced = storage
             .replace_function_with_deps(tenant_id, &def, max_functions, &|_| Ok(()), &dependencies)
             .map_err(map_function_error)?;
+        // 置換は既存の所有者を変えない。新規に作った場合だけ作成者を所有者にする（Issue #2236）。
+        if replaced == crate::catalog::function::ReplaceOutcome::Created {
+            record_creator_as_owner(storage, tenant_id, session, &def.function_key);
+        }
         // 宣言的 UDF を置き換えた場合、セッションに旧本体の展開が残らないよう取り除く。
         session.udfs_mut().remove(name);
     } else {
         storage
             .create_function_with_deps(tenant_id, &def, max_functions, &dependencies)
             .map_err(map_function_error)?;
+        record_creator_as_owner(storage, tenant_id, session, &def.function_key);
     }
     // commit 後に同じセッションへ登録する（すぐ呼べるようにする。他セッションは世代で refresh）。
     // 非カタログ登録・WASM・容量で入れられない場合は登録せず、次の refresh のロードに任せる。
@@ -492,12 +517,30 @@ pub(crate) fn execute_drop_function(
 ) -> Result<DropFunctionOutcome, SqlSurfaceError> {
     // 権限検査は保存先（カタログ／セッション内）の振り分けより前。`IF EXISTS` でも `42501` にして、
     // 権限の無いセッションに対象の有無を区別させない（SQL-66・Issue #1922・fail-closed）。
-    crate::sql::privilege_gate::require_ddl(
+    // 運用者権限が無くても束縛ロールなら所有者検査つきで進む（Issue #2236。未束縛は `42501`）。
+    let decision = crate::sql::privilege_gate::require_ddl_or_owner(
         session,
         crate::sql::privilege_gate::DdlStatementKind::DropFunction,
     )?;
+    let (gate, owner_only) = match decision {
+        crate::sql::privilege_gate::GateDecision::Allowed => (OwnerGate::Skip, false),
+        crate::sql::privilege_gate::GateDecision::OwnerCheckRequired(role) => {
+            (OwnerGate::RequireOwner(role), true)
+        }
+    };
     let mut removed = false;
-    removed |= drop_from_catalog(storage, tenant_id, stmt)?;
+    removed |= drop_from_catalog(storage, tenant_id, stmt, gate)?;
+    // 所有者としての削除は、カタログで所有を確認して消せた定義に限る。所有を確認できない
+    // セッション内だけの定義を、運用者権限なしで消させない（権限を広げない）。
+    if owner_only && !removed {
+        return if stmt.if_exists {
+            Ok(DropFunctionOutcome { skipped: true })
+        } else {
+            Err(SqlSurfaceError::undefined_function(
+                "function does not exist",
+            ))
+        };
+    }
     // 型の並びがある場合、セッション内の定義は引数の数と（型注釈のある引数の）型で照合する。
     // WASM UDF は (vector, scalar) の固定 2 引数なので、同じ名前空間を共有する
     // `UdfRegistry::remove` が両表を消す設計に合わせて判定にも含める。
@@ -572,18 +615,19 @@ fn drop_from_catalog(
     storage: &Storage,
     tenant_id: &str,
     stmt: &ValidatedDropFunction,
+    gate: OwnerGate,
 ) -> Result<bool, SqlSurfaceError> {
     let cascade = stmt.behavior == DropFunctionBehavior::Cascade;
     let Some(types) = &stmt.arg_types else {
         return storage
-            .drop_function_by_name(tenant_id, &stmt.name, cascade)
+            .drop_function_by_name_gated(tenant_id, &stmt.name, cascade, gate)
             .map(|sig| sig.is_some())
             .map_err(map_function_error);
     };
     // 列挙・署名照合・削除を 1 つの write txn で行う（読みと削除の間に別セッションの
     // drop／再作成が割り込んで新しい定義を誤って消さないため）。
     storage
-        .drop_function_matching(tenant_id, &stmt.name, cascade, |def| {
+        .drop_function_matching_gated(tenant_id, &stmt.name, cascade, gate, |def| {
             if def.params.len() != types.len() {
                 return Ok(false);
             }
@@ -651,6 +695,8 @@ fn map_function_error(e: CatalogError) -> SqlSurfaceError {
             SqlSurfaceError::undefined_function("function schema does not exist")
         }
         CatalogError::WriteLockTimeout => SqlSurfaceError::LockNotAvailable,
+        // 所有者でない主体の DROP（Issue #2236）。対象名・所有者を含めない固定の `42501`。
+        CatalogError::NotObjectOwner => SqlSurfaceError::InsufficientPrivilege,
         _ => SqlSurfaceError::Internal {
             detail: "function catalog operation failed".to_string(),
         },

@@ -633,11 +633,15 @@ impl Storage {
             }
             let si = states.idx(&write_txn, tenant, &t.object)?;
             let entries: Vec<AclEntry> = states.work_of(si).to_vec();
+            // 所有者相当: 運用者権限（呼び出し元の `owner_equivalent`）に加え、付与者が対象の所有者のとき
+            // （Issue #2236。加算のみで運用者権限を縮めない）。列は親の表の所有者を見る。
+            let owner_equivalent = req.owner_equivalent
+                || super::owner::is_owner_in_txn(&*write_txn, tenant, &t.object, req.grantor_id)?;
             // 波及ビット: 付与者の表の GRANT OPTION で絞る（0 なら表側が警告のみで無変更のため
             // 列も変更しない）。
             let eff_p = if want_p == 0 {
                 0
-            } else if req.owner_equivalent {
+            } else if owner_equivalent {
                 want_p
             } else if let PrivilegeObject::Column { table, .. } = &t.object {
                 let table_entries = list_acl_for_object_in_txn(
@@ -653,7 +657,7 @@ impl Storage {
             // 明示ビット: 付与者が持つ GRANT OPTION。列は表単位の行も合わせて見る。
             let eff_e = if t.bits == 0 {
                 0
-            } else if req.owner_equivalent {
+            } else if owner_equivalent {
                 want
             } else {
                 let (mut go, mut any) = grantor_rights(&entries, req.grantor_id);
@@ -701,7 +705,7 @@ impl Storage {
             }
             let mut work: Vec<AclEntry> = entries.clone();
             if req.is_grant {
-                if req.grant_option && !req.owner_equivalent {
+                if req.grant_option && !owner_equivalent {
                     // 自己への GRANT OPTION 付与は循環として拒否する。
                     if grantee_ids.contains(&req.grantor_id) {
                         return Err(AclChangeError::InvalidGrant(

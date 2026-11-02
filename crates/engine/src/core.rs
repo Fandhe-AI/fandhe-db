@@ -5133,6 +5133,33 @@ impl EngineCore {
         Ok(true)
     }
 
+    /// 作成前に同名の relation が無かったか（所有者の記録対象か）を返す。判定できなければ「あった」と
+    /// みなして記録しない（既存 relation の所有を奪わない。fail-closed。Issue #2236）。
+    fn relation_absent_before_create(&self, relation_key: &str) -> bool {
+        matches!(self.storage.relation_name_exists(relation_key), Ok(false))
+    }
+
+    /// 新規作成した relation の所有者として、束縛中のロールを記録する（Issue #2236。CREATE TABLE・CTAS・
+    /// VIEW・MATERIALIZED VIEW の腕が成功した直後に呼ぶ）。未束縛は何も書かず、所有者の無い relation は
+    /// 運用者権限でしか扱えない（拒否側）。記録の失敗は作成の成否に影響させない（所有者行が無い状態は
+    /// fail-closed）。
+    fn record_created_relation_owner(
+        &self,
+        ctx: &PolicyContext,
+        session: &crate::sql::mode::SessionState,
+        absent_before: bool,
+        relation_key: &str,
+    ) {
+        if !absent_before {
+            return;
+        }
+        if let Some(role) = session.current_role_id().filter(|id| *id != 0) {
+            let _ = self
+                .storage
+                .record_relation_owner(ctx.tenant_id(), relation_key, role);
+        }
+    }
+
     /// 永続オブジェクトを作る DDL の作成先を `search_path` から判定する（TABLE-27・Issue #1715）。
     /// DDL 権限ゲートの直後・既存名の判定より前に呼ぶ（`42501` → `3F000`／`0A000` → `42P07` の順）。
     /// `explicit_public` は `public.` で明示修飾された作成（判定を飛ばして `public` へ作る）。
@@ -7727,11 +7754,13 @@ impl EngineCore {
                         ),
                     );
                 }
+                let absent_before = self.relation_absent_before_create(&stmt.table_name);
                 let outcome = crate::sql::ddl::execute_create_table(
                     &self.storage,
                     stmt,
                     &self.schema_limits,
                 )?;
+                self.record_created_relation_owner(ctx, session, absent_before, &stmt.table_name);
                 Ok(crate::sql::SqlOutcome::CreateTable(outcome))
             }
             // SQL-52・Issue #1678: CTAS。DDL 権限ゲートを名前解決・カタログ照会（内側の問い合わせの
@@ -7747,7 +7776,9 @@ impl EngineCore {
                     stmt.public_qualified,
                     stmt.table_name(),
                 )?;
+                let absent_before = self.relation_absent_before_create(stmt.table_name());
                 let outcome = self.execute_create_table_as(ctx, session, stmt)?;
+                self.record_created_relation_owner(ctx, session, absent_before, stmt.table_name());
                 Ok(crate::sql::SqlOutcome::CreateTableAs(outcome))
             }
             // TABLE-44・Issue #1683: 一時表の作成は DDL 実行権限ゲートの対象外（セッション内で
@@ -7836,11 +7867,13 @@ impl EngineCore {
                     },
                 )?;
                 // TABLE-41 (2)・Issue #1660: `OR REPLACE` は互換性検査付きの置換経路へ。
+                let absent_before = self.relation_absent_before_create(stmt.name());
                 let outcome = if stmt.or_replace() {
                     self.create_or_replace_view_in_session(session, stmt)?
                 } else {
                     crate::sql::ddl::execute_create_view(&self.storage, stmt)?
                 };
+                self.record_created_relation_owner(ctx, session, absent_before, stmt.name());
                 Ok(crate::sql::SqlOutcome::CreateView(outcome))
             }
             // TABLE-42・Issue #1664: DDL 権限ゲートを名前解決・カタログ照会より先に置く
@@ -7853,7 +7886,9 @@ impl EngineCore {
                 )?;
                 self.require_creation_target(ctx, session, stmt.public_qualified, stmt.name())?;
                 crate::sql::schema_dependency::check_view_body(stmt.name(), stmt.body_sql())?;
+                let absent_before = self.relation_absent_before_create(stmt.name());
                 let outcome = self.execute_create_materialized_view(ctx, session, stmt)?;
+                self.record_created_relation_owner(ctx, session, absent_before, stmt.name());
                 Ok(crate::sql::SqlOutcome::CreateMaterializedView(outcome))
             }
             // TABLE-42・Issue #1665: 権限ゲートを名前解決より先に置く（`CREATE` と同じ）。
@@ -8114,27 +8149,41 @@ impl EngineCore {
                     session,
                     crate::sql::privilege_gate::DdlStatementKind::CreateSchema,
                 )?;
-                let outcome =
-                    crate::sql::ddl::execute_create_schema(&self.storage, ctx.tenant_id(), stmt)?;
+                // 作成者（束縛ロール）を所有者として同じ write txn で記録する（Issue #2236）。
+                let outcome = crate::sql::ddl::execute_create_schema(
+                    &self.storage,
+                    ctx.tenant_id(),
+                    stmt,
+                    session.current_role_id().filter(|id| *id != 0),
+                )?;
                 Ok(crate::sql::SqlOutcome::CreateSchema(outcome))
             }
+            // Issue #2236: 運用者権限、またはテナント内の所有者（書き込み txn 内で検査）。
             ParsedSql::DropSchema(stmt) => {
-                crate::sql::privilege_gate::require_ddl(
+                let decision = crate::sql::privilege_gate::require_ddl_or_owner(
                     session,
                     crate::sql::privilege_gate::DdlStatementKind::DropSchema,
                 )?;
-                let outcome =
-                    crate::sql::ddl::execute_drop_schema(&self.storage, ctx.tenant_id(), stmt)?;
+                let outcome = crate::sql::ddl::execute_drop_schema(
+                    &self.storage,
+                    ctx.tenant_id(),
+                    stmt,
+                    decision.owner_gate(),
+                )?;
                 Ok(crate::sql::SqlOutcome::DropSchema(outcome))
             }
             // TABLE-27（Issue #1716）: DDL 実行権限ゲート → 実行本体（`ALTER SCHEMA ... RENAME TO`）。
             ParsedSql::AlterSchema(stmt) => {
-                crate::sql::privilege_gate::require_ddl(
+                let decision = crate::sql::privilege_gate::require_ddl_or_owner(
                     session,
                     crate::sql::privilege_gate::DdlStatementKind::AlterSchema,
                 )?;
-                let outcome =
-                    crate::sql::ddl::execute_alter_schema(&self.storage, ctx.tenant_id(), stmt)?;
+                let outcome = crate::sql::ddl::execute_alter_schema(
+                    &self.storage,
+                    ctx.tenant_id(),
+                    stmt,
+                    decision.owner_gate(),
+                )?;
                 Ok(crate::sql::SqlOutcome::AlterSchema(outcome))
             }
             // TABLE-24・SQL-23（Issue #1689）: DDL 実行権限ゲート → 実行本体。`ctx.tenant_id()` は
@@ -8816,7 +8865,8 @@ impl EngineCore {
                 ))
             }
             ParsedSql::DropFunction(_) => {
-                crate::sql::privilege_gate::require_ddl(
+                // 所有者（束縛ロール）も `0A000` まで進める（Issue #2236。未束縛は `42501`）。
+                crate::sql::privilege_gate::require_ddl_or_owner(
                     session,
                     crate::sql::privilege_gate::DdlStatementKind::DropFunction,
                 )?;

@@ -26,7 +26,7 @@ use redb::{ReadableTable, TableDefinition};
 use crate::storage::read_source::ReadSource;
 
 use super::super::role::validate_tenant;
-use super::super::{CatalogError, Result};
+use super::super::{CatalogError, Result, Storage};
 use super::{PrivilegeObject, KIND_COLUMN, KIND_FUNCTION, KIND_SCHEMA, KIND_TABLE};
 
 /// 所有者の専用カタログ表。キーは `(object_kind, object_key, tenant_id)`。
@@ -38,6 +38,40 @@ const OWNER_BLOB_VERSION: u8 = 1;
 
 /// relation の掃除で 1 度に集める行数（無制限にメモリへ載せない）。
 const SWEEP_BATCH: usize = 256;
+
+/// 破壊的な操作（DROP・ALTER）の write txn 内で課す所有者検査の要求（Issue #2236）。
+///
+/// 検査は対象の解決（テナント内）より後・変更より前に、変更と同じ write txn の中で行う
+/// （並行する `OWNER TO` との TOCTOU を防ぐ）。呼び出し元は `sql::ddl`・`sql::udf_ddl` が
+/// `sql::privilege_gate::GateDecision` から組み立てる。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum OwnerGate {
+    /// 検査しない（運用者権限で許可済みの経路、および従来の呼び出し）。
+    Skip,
+    /// `role_id` が対象の所有者でなければ [`CatalogError::NotObjectOwner`]。
+    RequireOwner(u64),
+}
+
+impl OwnerGate {
+    /// 対象 `object` について要求を満たすか検査する（満たさなければ `NotObjectOwner`）。
+    pub(crate) fn check<R: ReadSource>(
+        self,
+        src: &R,
+        tenant: &str,
+        object: &PrivilegeObject,
+    ) -> Result<()> {
+        match self {
+            Self::Skip => Ok(()),
+            Self::RequireOwner(role_id) => {
+                if is_owner_in_txn(src, tenant, object, role_id)? {
+                    Ok(())
+                } else {
+                    Err(CatalogError::NotObjectOwner)
+                }
+            }
+        }
+    }
+}
 
 fn corrupt() -> CatalogError {
     CatalogError::CorruptSchema("invalid object owner entry".to_string())
@@ -247,6 +281,64 @@ pub(crate) fn owner_references_role_in_txn<R: ReadSource>(
         }
     }
     Ok(false)
+}
+
+/// relation（表・ビュー・matview）が現存するか。
+fn relation_exists_in_txn<R: ReadSource>(src: &R, key: &str) -> Result<bool> {
+    match src.open_table(super::super::CATALOG_TABLE) {
+        Ok(t) => {
+            if t.get(key)?.is_some() {
+                return Ok(true);
+            }
+        }
+        Err(redb::TableError::TableDoesNotExist(_)) => {}
+        Err(e) => return Err(e.into()),
+    }
+    match src.open_table(super::super::VIEWS_TABLE) {
+        Ok(t) => {
+            if t.get(key)?.is_some() {
+                return Ok(true);
+            }
+        }
+        Err(redb::TableError::TableDoesNotExist(_)) => {}
+        Err(e) => return Err(e.into()),
+    }
+    match src.open_table(super::super::materialized::MATERIALIZED_VIEWS_TABLE) {
+        Ok(t) => Ok(t.get(key)?.is_some()),
+        Err(redb::TableError::TableDoesNotExist(_)) => Ok(false),
+        Err(e) => Err(e.into()),
+    }
+}
+
+impl Storage {
+    /// 新規作成した relation（表・ビュー・matview）の所有者として `owner` を記録する（Issue #2236。作成に成功
+    /// した直後に `core.rs` の CREATE 系の腕が呼ぶ。呼び出し元は作成前に同名の relation が無かったことを確認する）。
+    /// 作成と別の write txn のため、この間でクラッシュすると所有者の無い relation が残るが、所有者行が無い
+    /// 対象は運用者権限でしか扱えない（拒否側に倒れる。ADR O6）。既に所有者行があれば何も変えない。
+    pub(crate) fn record_relation_owner(
+        &self,
+        tenant: &str,
+        relation_key: &str,
+        owner: u64,
+    ) -> Result<()> {
+        validate_tenant(tenant)?;
+        let write_txn = self
+            .begin_write_txn()
+            .map_err(super::super::convert_storage_error)?;
+        // 作成直後でも DROP と競合しうるため、relation が現存するときだけ書く（孤児行を作らない）。
+        if !relation_exists_in_txn(&*write_txn, relation_key)? {
+            return Ok(());
+        }
+        set_owner_if_absent_in_txn(
+            &write_txn,
+            tenant,
+            &PrivilegeObject::Table(relation_key.to_string()),
+            owner,
+        )?;
+        crate::recovery::commit_boundary::commit(write_txn)
+            .map_err(super::super::convert_storage_error)?;
+        Ok(())
+    }
 }
 
 #[cfg(test)]

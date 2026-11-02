@@ -3501,6 +3501,8 @@ pub enum CatalogError {
     /// 組み込み SCHEMA（`public`・`pg_catalog`・`information_schema`）の削除（TABLE-27・
     /// Issue #1713。`42501`）。
     BuiltinSchema(String),
+    /// 呼び出し主体が対象の所有者でない（Issue #2236。`42501`。対象名・所有者を含めない）。
+    NotObjectOwner,
     /// 明示トランザクション（SQL-31・TASK-221）の単一ライタ占有により、書き込み
     /// トランザクションの取得がロック待ちの上限を超過した（`storage::StorageError`
     /// から写像。[`convert_storage_error`] 参照）。
@@ -3646,6 +3648,7 @@ impl fmt::Display for CatalogError {
                 write!(f, "reserved schema name: {name}")
             }
             CatalogError::BuiltinSchema(name) => write!(f, "built-in schema: {name}"),
+            CatalogError::NotObjectOwner => write!(f, "must be owner of the object"),
             CatalogError::WriteLockTimeout => {
                 write!(f, "write lock not available: timed out waiting for writer")
             }
@@ -3736,6 +3739,7 @@ impl std::error::Error for CatalogError {
             | CatalogError::SchemaNotFound(_)
             | CatalogError::ReservedSchemaName(_)
             | CatalogError::BuiltinSchema(_)
+            | CatalogError::NotObjectOwner
             | CatalogError::ColumnNotFound(_)
             | CatalogError::ProtectedColumn(_)
             | CatalogError::IncompatibleTypeChange { .. }
@@ -16687,6 +16691,7 @@ pub(crate) fn table_lookup_error(e: CatalogError) -> SqlSurfaceError {
         | CatalogError::SchemaNotFound(_)
         | CatalogError::ReservedSchemaName(_)
         | CatalogError::BuiltinSchema(_)
+        | CatalogError::NotObjectOwner
         | CatalogError::ColumnNotFound(_)
         | CatalogError::ProtectedColumn(_)
         | CatalogError::IncompatibleTypeChange { .. }
