@@ -224,9 +224,6 @@ pub(crate) fn plan(
         }
         return Err(missing());
     };
-    // EXECUTE 権限（Issue #2235）。解決の直後・起動の前に検査する（他の拒否より先に権限を判定しない:
-    // 関数の不在は上で `42883` になっており、存在する関数に限って権限を判定する）。
-    crate::sql::object_privilege::check_execute(&scan.name)?;
     let RoutineReturn::Set(cols) = &def.ret else {
         return Err(unsupported(
             "only set-returning LANGUAGE sql functions are supported in FROM",
@@ -234,6 +231,11 @@ pub(crate) fn plan(
     };
     if scan.args.len() != def.param_types.len() {
         return Err(missing());
+    }
+    // EXECUTE 権限（Issue #2235）。引数個数による解決（不一致は `42883`）の後・起動の前に検査する。
+    // ACL 対象はカタログ由来の関数だけ（同名のセッションローカル関数は免除）。
+    if registry.is_catalog_origin(&scan.name) {
+        crate::sql::object_privilege::check_execute(&scan.name)?;
     }
     for arg in &scan.args {
         let mut detect = Folder::new(registry, FoldMode::Detect);

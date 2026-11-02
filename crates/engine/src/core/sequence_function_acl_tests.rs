@@ -492,3 +492,26 @@ fn function_acl_lifecycle() {
         crate::catalog::privilege::PRIV_EXECUTE
     );
 }
+
+/// 判定順（S4）: 引数個数が合わない呼び出しは関数が解決できないので、EXECUTE を取り消した後も
+/// `42501` ではなく `42883`（宣言的 UDF・`LANGUAGE sql`・FROM の集合返却関数の 3 経路）。
+#[test]
+fn arity_mismatch_is_42883_before_execute_check() {
+    let (core, _g, mut a) = fn_fixture("sfacl_fn_arity");
+    let mut o = owner_session(&core);
+    for f in ["addone", "r", "sr"] {
+        ok(
+            &core,
+            &mut o,
+            &format!("REVOKE EXECUTE ON FUNCTION {f} FROM PUBLIC"),
+        );
+    }
+    for sql in [
+        "SELECT addone() FROM t",
+        "SELECT r(1)",
+        "SELECT * FROM sr(1)",
+    ] {
+        assert_eq!(code(&core, &mut a, sql), "42883", "{sql}");
+    }
+    assert_eq!(code(&core, &mut a, "SELECT addone(n) FROM t"), "42501");
+}

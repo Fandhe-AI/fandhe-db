@@ -202,10 +202,17 @@ impl<'a, 'b> Folder<'a, 'b> {
             self.found = true;
             return Ok(original.clone());
         }
-        // EXECUTE 権限（Issue #2235）。解決の直後・型検査と起動の前に検査する（`Detect` は呼び出しの有無を
-        // 探るだけなので、拒否で検出を妨げない。拒否は実行・Describe の両方で同じ `42501`）。
+        if args.len() != def.param_types.len() {
+            return Err(SqlSurfaceError::undefined_function(
+                "function does not exist or its argument count does not match",
+            ));
+        }
+        // EXECUTE 権限（Issue #2235）。引数個数による解決（不一致は `42883`）の直後・型検査と起動の前に
+        // 検査する（`Detect` は呼び出しの有無を探るだけなので、拒否で検出を妨げない）。
         if let Expr::Call { name, .. } = original {
-            crate::sql::object_privilege::check_execute(name)?;
+            if self.registry.is_catalog_origin(name) {
+                crate::sql::object_privilege::check_execute(name)?;
+            }
         }
         let ret = match &def.ret {
             RoutineReturn::Scalar(t) => t.clone(),
@@ -229,11 +236,6 @@ impl<'a, 'b> Folder<'a, 'b> {
         }
         if matches!(ret, CastType::Array(_)) {
             return Err(unsupported("unsupported return type of a function call"));
-        }
-        if args.len() != def.param_types.len() {
-            return Err(SqlSurfaceError::undefined_function(
-                "function does not exist or its argument count does not match",
-            ));
         }
         // 引数の型検査と評価。`Describe`・起動しない場合も型検査は行い、どの経路でも同じエラーにする。
         let mut values: Vec<PlScalar> = Vec::with_capacity(args.len());
