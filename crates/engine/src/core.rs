@@ -5079,6 +5079,28 @@ impl EngineCore {
             session,
             table,
         )
+        .map_err(|e| self.table_resolution_before_denial(table, e))
+    }
+
+    /// 権限拒否（`42501`）を返す直前に、対象表が引けるかを確認する。引けなければ名前解決の
+    /// エラー（`42P01`）を優先する（SQL 表層・bound DELETE と同じ「名前解決 → 権限」の順。
+    /// Issue #1969）。引ける表では元の拒否をそのまま返す。権限以外のエラーも素通し。
+    fn table_resolution_before_denial(
+        &self,
+        table: &str,
+        denial: crate::sql::allowlist::SqlSurfaceError,
+    ) -> crate::sql::allowlist::SqlSurfaceError {
+        use crate::sql::allowlist::SqlSurfaceError as E;
+        if !matches!(
+            denial,
+            E::InsufficientPrivilege | E::RelationPermissionDenied
+        ) {
+            return denial;
+        }
+        match self.read_txn_with_schema(table) {
+            Err(e) => e,
+            Ok(_) => denial,
+        }
     }
 
     /// HTTP（NoSQL）表層の bound 書き込み API で、対象表に `required_bits` の権限があるかを判定する
@@ -5098,6 +5120,7 @@ impl EngineCore {
             table,
             required_bits,
         )
+        .map_err(|e| self.table_resolution_before_denial(table, e))
     }
 
     /// [`Self::schema_resolver`] のセッション（主体）付き版（Issue #2234、設計記録 K1・K3）。解決した SCHEMA
@@ -14097,7 +14120,8 @@ impl EngineCore {
                     Err(_) => Err(()),
                 },
             };
-            allowed.map_err(|()| crate::sql::allowlist::SqlSurfaceError::InsufficientPrivilege)?;
+            allowed
+                .map_err(|()| crate::sql::allowlist::SqlSurfaceError::RelationPermissionDenied)?;
         }
         self.execute_bound_insert_with_target(
             target,

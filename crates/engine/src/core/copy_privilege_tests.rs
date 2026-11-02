@@ -551,3 +551,41 @@ fn unbound_session_keeps_bound_writes_unchanged() {
         })
         .expect("unbound delete");
 }
+
+#[test]
+fn bound_reads_resolve_table_before_privilege() {
+    let f = fx("httppriv-read-order");
+    let s = bound(f.alice, false);
+    let bind_must_not_run = |_: &crate::catalog::TableSchema,
+                             _: &crate::sql::udf_call::UdfRegistry|
+     -> Result<
+        crate::sql::parser::BoundScan,
+        crate::sql::allowlist::SqlSurfaceError,
+    > { panic!("bind must not run before the privilege check") };
+    // 不在の表は権限の有無に関わらず 42P01。
+    let e = f
+        .core
+        .execute_bound_scan_in_session(&ctx(), &s, "nosuch", bind_must_not_run)
+        .expect_err("undefined table");
+    assert_eq!(e.wire_code(), "42P01");
+    // 在る表で権限なしは 42501（束縛より前に拒否）。
+    let e = f
+        .core
+        .execute_bound_scan_in_session(&ctx(), &s, "ca", bind_must_not_run)
+        .expect_err("denied");
+    assert_eq!(e.wire_code(), "42501");
+}
+
+#[test]
+fn recheck_denies_missing_relation() {
+    let f = fx("httppriv-recheck-missing");
+    let sess = bound(f.alice, false);
+    let rc = crate::sql::privilege_gate::write::RelationPrivilegeRecheck::for_session(
+        &sess,
+        A,
+        crate::catalog::privilege::PRIV_INSERT,
+    )
+    .expect("bound principal");
+    let r = f.core.begin_read_txn().expect("txn");
+    assert!(rc.check_in_txn(&r, &["nosuch".to_string()]).is_err());
+}

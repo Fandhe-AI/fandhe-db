@@ -390,7 +390,11 @@ impl RelationPrivilegeRecheck {
     pub(crate) fn check_in_txn<R: ReadSource>(&self, src: &R, tables: &[String]) -> Result<(), ()> {
         let bits =
             relation_grant_bits_in_txn(src, &self.tenant, tables, self.role_id).map_err(|_| ())?;
-        for granted in bits.into_iter().flatten() {
+        for granted in bits {
+            // 引けない relation（不在・不正キー）は権限を確認できないので拒否する（fail-closed）。
+            let Some(granted) = granted else {
+                return Err(());
+            };
             if self.required_bits == 0 || granted & self.required_bits != self.required_bits {
                 return Err(());
             }
