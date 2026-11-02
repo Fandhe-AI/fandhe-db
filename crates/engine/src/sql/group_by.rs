@@ -696,6 +696,9 @@ fn observe_group_enumeration(
     // 避け、容量検査より前に確保が起きないようにする）。スロット列
     // （`&[u32]`）は借用のまま [`observe_group_slots`] へ渡せるため複製不要。
     for (value, slots) in groups {
+        // Issue #1952: 協調的中断の確認点（索引経路のグループ値ごと。`with_visible_row` を通らない
+        // commit 前の読み取り経路）。
+        crate::interrupt::check()?;
         let current_group_count = string_groups.len() + usize::from(null_group.is_some());
         check_new_group_budget(
             current_group_count,
@@ -825,6 +828,8 @@ fn observe_group_slots(
     let arena = snapshot.arena();
     let mut expr_scratch: Vec<StackValue> = Vec::new();
     for &slot in slots {
+        // Issue #1952: 協調的中断の確認点（索引経路のスロットごと。commit 前の読み取り経路）。
+        crate::interrupt::check()?;
         let slot_idx = usize::try_from(slot)
             .map_err(|_| accumulator_bug("candidate slot does not fit in usize"))?;
         // 集計 `id` 値は rowid → 応答境界（従来方式の表の `id` 列値）を明示的に通す
@@ -958,6 +963,8 @@ fn observe_candidate_slots_grouped_inner(
     let column_index = single_text_key_column(group_by)
         .ok_or_else(|| accumulator_bug("single-key GROUP BY path called without a TEXT key"))?;
     'candidates: for &slot in slots {
+        // Issue #1952: 協調的中断の確認点（索引経路の候補スロットごと。commit 前の読み取り経路）。
+        crate::interrupt::check()?;
         let slot_idx = usize::try_from(slot)
             .map_err(|_| accumulator_bug("candidate slot does not fit in usize"))?;
         // 集計 `id` 値は rowid → 応答境界（従来方式の表の `id` 列値）を明示的に通す
@@ -2355,6 +2362,9 @@ fn finish_groups(
     // キー所属マスクを 1 回だけ作る（通常の `GROUP BY` は `None` で常に 0）。
     let set_masks = grouping_set_masks(group_by)?;
     for (set_index, key, accs) in group_entries {
+        // Issue #1952: 協調的中断の確認点（グループ確定・HAVING 評価のグループごと。
+        // commit 前の読み取り経路）。
+        crate::interrupt::check()?;
         let mut cells: Vec<Cell> = accs
             .into_iter()
             .map(Accumulator::finish)
@@ -2460,6 +2470,9 @@ fn finish_groups(
                 .then_with(|| a.0.cmp(&b.0))
         });
     }
+    // Issue #1952: ソート本体の比較関数内では中断しない（全順序が崩れると panic しうる）。
+    // 直後に 1 回確認して以降の射影段へ進む前に期限切れを検出する。
+    crate::interrupt::check()?;
 
     // Issue #916・SQL-25 (b)・TASK-209: `OFFSET` はソート確定後・`LIMIT` 適用前に
     // 適用する（グループはすでに可視行のみから構成済み〔`sql::aggregate` の
@@ -2511,6 +2524,8 @@ fn finish_groups(
     // 式列が返す BYTEA／配列セルの累計見積りバイト数（結果バイト予算への課金。Issue #1592）。
     let mut computed_bytes: usize = 0;
     for (_, key, cells, _) in finished {
+        // Issue #1952: 協調的中断の確認点（出力射影のグループごと）。
+        crate::interrupt::check()?;
         let row_cells = project_row(
             bound,
             schema,

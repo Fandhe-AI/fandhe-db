@@ -106,6 +106,8 @@ pub(super) fn run_aggregate(
     }
 
     for &ti in order {
+        // Issue #1952: 協調的中断の確認点（集約入力タプルごと。commit 前の読み取り経路）。
+        crate::interrupt::check()?;
         let tuple = tuples
             .get(ti as usize)
             .ok_or_else(|| SqlSurfaceError::Internal {
@@ -223,6 +225,8 @@ pub(super) fn run_aggregate(
     }
     let mut finished: Vec<Finished> = Vec::with_capacity(groups.len());
     for g in groups {
+        // Issue #1952: 協調的中断の確認点（グループ確定・HAVING 評価のグループごと）。
+        crate::interrupt::check()?;
         let mut item_cells = Vec::with_capacity(g.accs.len());
         for acc in g.accs {
             item_cells.push(acc.finish()?);
@@ -256,6 +260,8 @@ pub(super) fn run_aggregate(
     // ENUM 値・型クラスとセルの不整合は `Internal`（fail-closed）で伝播させ、
     // 比較器の中で NULL／Equal へ握りつぶして誤った順序を返さない。
     for f in &finished {
+        // Issue #1952: 協調的中断の確認点（ソートキー検証のグループごと）。
+        crate::interrupt::check()?;
         if f.key_cells.len() != agg.keys.len() {
             return Err(SqlSurfaceError::Internal {
                 detail: "JOIN aggregate key cell count mismatch".to_string(),
@@ -315,6 +321,8 @@ pub(super) fn run_aggregate(
             std::cmp::Ordering::Equal
         });
     }
+    // Issue #1952: ソート本体の比較関数内では中断しない（panic 回避）。直後に 1 回確認する。
+    crate::interrupt::check()?;
 
     let start = offset.min(finished.len());
     let end = match limit {
@@ -333,6 +341,8 @@ pub(super) fn run_aggregate(
             detail: "JOIN aggregate output window out of range".to_string(),
         })?;
     for f in window {
+        // Issue #1952: 協調的中断の確認点（出力行の射影ごと）。
+        crate::interrupt::check()?;
         let mut cells = Vec::with_capacity(agg.out.len());
         for o in &agg.out {
             let cell = match o {

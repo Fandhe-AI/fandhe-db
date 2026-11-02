@@ -969,6 +969,8 @@ fn apply_rows(
         let mut scratch: Vec<StackValue> = Vec::new();
         let mut kept = Vec::with_capacity(rows.len());
         for row in rows {
+            // Issue #1952: 協調的中断の確認点（外側 WHERE の行ごと。commit 前の読み取り経路）。
+            crate::interrupt::check()?;
             let keep = with_scanned(&plan.scan.types, &plan.scan.referenced, &row, |scanned| {
                 where_matches(
                     &plan.scan.bound.metadata_filters,
@@ -991,12 +993,16 @@ fn apply_rows(
     if !windows.is_empty() {
         let mut evaluator = CellWindowEvaluator::new(windows, &plan.scan.types)?;
         for row in &rows {
+            // Issue #1952: 協調的中断の確認点（ウィンドウ母集合への取り込みの行ごと）。
+            crate::interrupt::check()?;
             with_scanned(&plan.scan.types, &plan.scan.referenced, row, |scanned| {
                 evaluator.push_row(scanned)
             })?;
         }
         let values = evaluator.finish()?;
         for (r, row) in rows.iter_mut().enumerate() {
+            // Issue #1952: 協調的中断の確認点（ウィンドウ値の付与の行ごと）。
+            crate::interrupt::check()?;
             for item_values in &values {
                 row.cells
                     .push(item_values.get(r).cloned().ok_or_else(internal_error)?);
@@ -1010,6 +1016,8 @@ fn apply_rows(
     }
     let mut out_rows = Vec::new();
     for row in rows.into_iter().skip(plan.offset).take(plan.limit) {
+        // Issue #1952: 協調的中断の確認点（外側射影の行ごと）。
+        crate::interrupt::check()?;
         let mut cells = Vec::with_capacity(plan.out.len());
         for col in &plan.out {
             let index = match col {
@@ -1044,6 +1052,8 @@ fn apply_aggregate(
     )?;
     let mut scratch: Vec<StackValue> = Vec::new();
     for row in &result.rows {
+        // Issue #1952: 協調的中断の確認点（集計形の外側取り込みの行ごと）。
+        crate::interrupt::check()?;
         with_scanned(&plan.types, &plan.referenced, row, |scanned| {
             if !where_matches(
                 &plan.bound.metadata_filters,
@@ -1079,6 +1089,8 @@ fn sort_rows(
     let idx = {
         let mut keys: Vec<Vec<SortKey<'_>>> = Vec::with_capacity(rows.len());
         for row in &rows {
+            // Issue #1952: 協調的中断の確認点（ソートキー抽出の行ごと）。
+            crate::interrupt::check()?;
             let mut k = Vec::with_capacity(order.len());
             for o in order {
                 let cell = row.cells.get(o.index).ok_or_else(internal_error)?;
@@ -1127,6 +1139,8 @@ fn sort_rows(
     if let Some(e) = failure.into_inner() {
         return Err(e);
     }
+    // Issue #1952: ソート本体の比較関数内では中断しない（全順序が崩れると panic しうる）。直後に 1 回確認する。
+    crate::interrupt::check()?;
     reorder(rows, &idx)
 }
 
@@ -1186,6 +1200,8 @@ fn sort_rows_by_keys(
     let mut scratch: Vec<StackValue> = Vec::new();
     let mut keys: Vec<Vec<Option<OrderValue>>> = Vec::with_capacity(rows.len());
     for row in &rows {
+        // Issue #1952: 協調的中断の確認点（式キー評価の行ごと）。
+        crate::interrupt::check()?;
         let k = with_scanned(&scan.types, &scan.referenced, row, |scanned| {
             let mut out: Vec<Option<OrderValue>> = Vec::with_capacity(spec.len());
             for key in spec {
@@ -1228,6 +1244,8 @@ fn sort_rows_by_keys(
         }
         Ordering::Equal
     });
+    // Issue #1952: ソート本体の直後に 1 回確認する（比較関数内では中断しない）。
+    crate::interrupt::check()?;
     reorder(rows, &idx)
 }
 
@@ -1236,6 +1254,8 @@ fn reorder(rows: Vec<ResultRow>, idx: &[usize]) -> Result<Vec<ResultRow>, SqlSur
     let mut slots: Vec<Option<ResultRow>> = rows.into_iter().map(Some).collect();
     let mut sorted = Vec::with_capacity(slots.len());
     for &i in idx {
+        // Issue #1952: 協調的中断の確認点（並べ替え適用の行ごと）。
+        crate::interrupt::check()?;
         sorted.push(
             slots
                 .get_mut(i)
@@ -1803,5 +1823,36 @@ mod tests {
         // 形が計画と食い違えば fail-closed。
         assert!(compare_record_cells(&rec(Some(1)), &arr(&[1]), &int, false).is_err());
         assert!(compare_record_cells(&r2(1, "a"), &r2(1, "a"), &int, false).is_err());
+    }
+
+    /// Issue #1952（SQL-71 のポインタ）: 走査を経由せず後段の並べ替え適用だけを呼んでも、
+    /// 期限切れなら確認点で `57014` になり、期限が先なら並べ替え結果は変わらない。
+    #[test]
+    fn reorder_checks_the_statement_deadline_per_row() {
+        use crate::interrupt::{DeadlineScope, StatementDeadline};
+        use std::time::{Duration, Instant};
+        let rows = || -> Vec<ResultRow> {
+            (0..3u64)
+                .map(|id| ResultRow {
+                    id,
+                    score: 0.0,
+                    cells: Vec::new(),
+                })
+                .collect()
+        };
+        {
+            let _scope = DeadlineScope::install(StatementDeadline::at(Instant::now()));
+            let err = reorder(rows(), &[2, 1, 0]).expect_err("expired deadline");
+            assert_eq!(err.wire_code(), "57014");
+        }
+        let _scope = DeadlineScope::install(StatementDeadline::after(
+            Instant::now(),
+            Duration::from_secs(3600),
+        ));
+        let sorted = reorder(rows(), &[2, 1, 0]).expect("far deadline");
+        assert_eq!(
+            sorted.iter().map(|r| r.id).collect::<Vec<_>>(),
+            vec![2, 1, 0]
+        );
     }
 }

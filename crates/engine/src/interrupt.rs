@@ -24,7 +24,10 @@
 
 mod deadline;
 
-pub use deadline::{current_deadline, DeadlineGuard, DeadlineScope, StatementDeadline};
+pub use deadline::{
+    checks_seen, current_deadline, install_fire_after_checks, DeadlineGuard, DeadlineScope,
+    StatementDeadline,
+};
 pub(crate) use deadline::{effective_lock_wait, is_expired_now, lock_wait_error};
 
 use std::cell::{Cell, RefCell};

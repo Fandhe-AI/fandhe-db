@@ -748,6 +748,8 @@ fn eval_tree(
                     let mut seen: HashSet<Vec<u8>> = HashSet::new();
                     let mut rows = Vec::new();
                     for row in l.rows.into_iter().chain(r.rows) {
+                        // Issue #1952: 協調的中断の確認点（UNION の重複除去の行ごと。commit 前の読み取り経路）。
+                        crate::interrupt::check()?;
                         // 行キー生成も文全体で共有する累計バイト予算の対象
                         // （PR #1105 レビュー指摘対応。`seen` への格納で複製される
                         // 分の追加メモリを見逃さない）。長さを `row_key_len` で
@@ -772,6 +774,8 @@ fn eval_tree(
                 SetOperator::Intersect | SetOperator::Except => {
                     let mut right_keys: HashSet<Vec<u8>> = HashSet::new();
                     for row in &r.rows {
+                        // Issue #1952: 協調的中断の確認点（INTERSECT／EXCEPT の右辺キー構築の行ごと。commit 前の読み取り経路）。
+                        crate::interrupt::check()?;
                         // 順序は上と同じ理由（長さ算出 → 予算確認 → 確保）。
                         budget.charge(row_key_len(row)?)?;
                         let key = row_key(row)?;
@@ -781,6 +785,8 @@ fn eval_tree(
                     let mut seen: HashSet<Vec<u8>> = HashSet::new();
                     let mut rows = Vec::new();
                     for row in l.rows.into_iter() {
+                        // Issue #1952: 協調的中断の確認点（INTERSECT／EXCEPT の左辺突き合わせの行ごと。commit 前の読み取り経路）。
+                        crate::interrupt::check()?;
                         // 順序は上と同じ理由（長さ算出 → 予算確認 → 確保）。
                         budget.charge(row_key_len(&row)?)?;
                         let key = row_key(&row)?;
