@@ -69,6 +69,13 @@ pub(crate) const ROLE_ALREADY_EXISTS_MESSAGE: &str = "role already exists";
 /// 同じログイン識別子が既に登録済みのときの `Invalid` 文言。
 pub(crate) const LOGIN_ALREADY_EXISTS_MESSAGE: &str = "login name already exists";
 
+/// `ALTER ROLE` の対象ロールが無いときの `Invalid` 文言。`sql::role_ddl` が `42704` へ写す（Issue #1963）。
+pub(crate) const ROLE_NOT_FOUND_MESSAGE: &str = "role does not exist";
+
+/// `ALTER ROLE ... RENAME` の対象がセッションの現在・セッションユーザーのときの `Invalid` 文言
+/// （PostgreSQL と同じく改名できない。`sql::role_ddl` が `0A000` へ写す。Issue #1963）。
+pub(crate) const ROLE_IN_SESSION_USE_MESSAGE: &str = "role is in use by the session";
+
 /// 件数上限超過の `ViewLimitExceeded` 文言（`54000`）。
 pub(crate) const ROLE_LIMIT_MESSAGE: &str = "too many roles";
 
@@ -795,6 +802,136 @@ pub(crate) fn list_memberships_of_member_in_txn<R: ReadSource>(
     list_memberships_limited(src, tenant, member_id, MAX_ROLES_PER_TENANT)
 }
 
+/// ロールの属性・検証子を `mutate` で書き換えて同じキーへ保存する（`ALTER ROLE ... 属性`。Issue #1963）。
+/// 内部 ID・名前は変えない（`mutate` が変えても ID と名前は元の値へ戻す）。対象が無ければ
+/// `Invalid(ROLE_NOT_FOUND_MESSAGE)`（他テナントにしか無い場合も同じ）。形状が不正なら保存せず `Invalid`。
+pub(crate) fn alter_role_in_txn(
+    write_txn: &redb::WriteTransaction,
+    tenant: &str,
+    name: &str,
+    mutate: impl FnOnce(&mut RoleDef),
+) -> Result<()> {
+    validate_tenant(tenant)?;
+    let Some(current) = get_role_in_txn(write_txn, tenant, name)? else {
+        return Err(invalid(ROLE_NOT_FOUND_MESSAGE));
+    };
+    let mut next = current.clone();
+    mutate(&mut next);
+    next.id = current.id;
+    next.name = current.name;
+    let blob = encode_role_def(&next)?;
+    let mut table = write_txn.open_table(ROLES_TABLE)?;
+    table.insert((tenant, name), blob.as_slice())?;
+    Ok(())
+}
+
+/// ロールの名前を変える（`ALTER ROLE ... RENAME TO`。Issue #1963）。blob に名前は無く ACL・メンバーシップは
+/// ID キーのため、格納キー `(tenant, name)` を移すだけで ID・属性・検証子はそのまま保つ。旧名が無ければ
+/// `Invalid(ROLE_NOT_FOUND_MESSAGE)`、新名が既にあれば `Invalid(ROLE_ALREADY_EXISTS_MESSAGE)`、対象が
+/// `protected_ids`（セッションの現在・セッションユーザー）に含まれれば `Invalid(ROLE_IN_SESSION_USE_MESSAGE)`。
+pub(crate) fn rename_role_in_txn(
+    write_txn: &redb::WriteTransaction,
+    tenant: &str,
+    old_name: &str,
+    new_name: &str,
+    protected_ids: &[u64],
+) -> Result<()> {
+    validate_tenant(tenant)?;
+    validate_identifier(new_name)?;
+    let Some(def) = get_role_in_txn(write_txn, tenant, old_name)? else {
+        return Err(invalid(ROLE_NOT_FOUND_MESSAGE));
+    };
+    if protected_ids.contains(&def.id) {
+        return Err(invalid(ROLE_IN_SESSION_USE_MESSAGE));
+    }
+    // 自分自身の現在名への改名は PostgreSQL と同じく no-op で成功する（重複は別ロールの場合のみ）。
+    if old_name == new_name {
+        return Ok(());
+    }
+    if get_role_in_txn(write_txn, tenant, new_name)?.is_some() {
+        return Err(invalid(ROLE_ALREADY_EXISTS_MESSAGE));
+    }
+    let mut renamed = def;
+    renamed.name = new_name.to_string();
+    let blob = encode_role_def(&renamed)?;
+    let mut table = write_txn.open_table(ROLES_TABLE)?;
+    table.remove((tenant, old_name))?;
+    table.insert((tenant, new_name), blob.as_slice())?;
+    Ok(())
+}
+
+/// `SET ROLE` の名前解決・認可の結果（[`resolve_settable_role_in_txn`]）。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum SetRoleResolution {
+    /// 自テナントに該当するロールが無い（他テナントにしか無い場合を含む）。
+    NotFound,
+    /// ロールはあるが、セッションのロールから `SET` 真のメンバーシップの経路で到達できない。
+    Denied,
+    /// 到達できる。値は対象ロールの内部 ID。
+    Allowed(u64),
+}
+
+/// `from_id` から `SET` 真のメンバーシップだけを辿って `target_id` に到達できるか（PostgreSQL の
+/// `member_can_set_role` 相当。ADR D4。Issue #1963）。`from_id == target_id` は常に真。
+/// 循環は訪問済み集合で除く。訪問ロール数が [`MAX_ROLES_PER_TENANT`]、走査する辺の総数が
+/// [`MAX_MEMBERSHIP_SCAN`] を超えたら到達不能（`false`）として拒否側へ倒す（fail-closed）。
+/// 行の破損は `Err`。他テナントのメンバーシップはキーの先頭が `tenant_id` のため辿れない。
+pub(crate) fn role_can_set_in_txn<R: ReadSource>(
+    src: &R,
+    tenant: &str,
+    from_id: u64,
+    target_id: u64,
+) -> Result<bool> {
+    validate_tenant(tenant)?;
+    if from_id == target_id {
+        return Ok(true);
+    }
+    let mut visited = std::collections::HashSet::new();
+    visited.insert(from_id);
+    let mut queue = std::collections::VecDeque::new();
+    queue.push_back(from_id);
+    let mut scanned = 0usize;
+    while let Some(member) = queue.pop_front() {
+        for (granted, opts) in list_memberships_of_member_in_txn(src, tenant, member)? {
+            scanned = scanned.saturating_add(1);
+            if scanned > MAX_MEMBERSHIP_SCAN {
+                return Ok(false);
+            }
+            if !opts.set {
+                continue;
+            }
+            if granted == target_id {
+                return Ok(true);
+            }
+            if visited.insert(granted) {
+                if visited.len() > MAX_ROLES_PER_TENANT {
+                    return Ok(false);
+                }
+                queue.push_back(granted);
+            }
+        }
+    }
+    Ok(false)
+}
+
+/// `SET ROLE <name>` の名前解決と認可を 1 つの読み取りで行う（Issue #1963）。名前は自テナントのカタログだけで
+/// 引き、不在と他テナントにしか無い場合は同じ [`SetRoleResolution::NotFound`]（ADR D10）。
+pub(crate) fn resolve_settable_role_in_txn<R: ReadSource>(
+    src: &R,
+    tenant: &str,
+    session_role_id: u64,
+    name: &str,
+) -> Result<SetRoleResolution> {
+    let Some(target) = get_role_in_txn(src, tenant, name)? else {
+        return Ok(SetRoleResolution::NotFound);
+    };
+    if role_can_set_in_txn(src, tenant, session_role_id, target.id)? {
+        Ok(SetRoleResolution::Allowed(target.id))
+    } else {
+        Ok(SetRoleResolution::Denied)
+    }
+}
+
 /// ログイン識別子を登録する。重複は `Invalid(LOGIN_ALREADY_EXISTS_MESSAGE)`。識別子は正規形のみ受理する。
 pub(crate) fn register_login_in_txn(
     write_txn: &redb::WriteTransaction,
@@ -909,6 +1046,54 @@ impl Storage {
                 .map_err(super::convert_storage_error)?;
         }
         Ok(removed)
+    }
+
+    /// `tenant` のロール `name` の属性・検証子を単一 write txn・1 回の commit で書き換える
+    /// （`ALTER ROLE`。Issue #1963。表の世代は進めない）。対象が無ければ `Invalid(ROLE_NOT_FOUND_MESSAGE)`。
+    pub(crate) fn alter_role(
+        &self,
+        tenant: &str,
+        name: &str,
+        mutate: impl FnOnce(&mut RoleDef),
+    ) -> Result<()> {
+        validate_tenant(tenant)?;
+        let write_txn = self
+            .begin_write_txn()
+            .map_err(super::convert_storage_error)?;
+        alter_role_in_txn(&write_txn, tenant, name, mutate)?;
+        crate::recovery::commit_boundary::commit(write_txn)
+            .map_err(super::convert_storage_error)?;
+        Ok(())
+    }
+
+    /// `tenant` のロールを単一 write txn・1 回の commit で改名する（`ALTER ROLE ... RENAME TO`。
+    /// Issue #1963）。エラーは [`rename_role_in_txn`] のとおり。
+    pub(crate) fn rename_role(
+        &self,
+        tenant: &str,
+        old_name: &str,
+        new_name: &str,
+        protected_ids: &[u64],
+    ) -> Result<()> {
+        validate_tenant(tenant)?;
+        let write_txn = self
+            .begin_write_txn()
+            .map_err(super::convert_storage_error)?;
+        rename_role_in_txn(&write_txn, tenant, old_name, new_name, protected_ids)?;
+        crate::recovery::commit_boundary::commit(write_txn)
+            .map_err(super::convert_storage_error)?;
+        Ok(())
+    }
+
+    /// `SET ROLE` の名前解決・認可（読み取り専用。[`resolve_settable_role_in_txn`]）。
+    pub(crate) fn resolve_settable_role(
+        &self,
+        tenant: &str,
+        session_role_id: u64,
+        name: &str,
+    ) -> Result<SetRoleResolution> {
+        let rt = self.db().begin_read()?;
+        resolve_settable_role_in_txn(&rt, tenant, session_role_id, name)
     }
 
     /// `tenant` のロール `name` を引く（読み取り専用。他テナントのロールは構造上引けず、不在と同じ `None`）。

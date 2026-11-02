@@ -101,3 +101,61 @@ fn wire_role_ddl_without_permission_is_42501() {
         read_ready_for_query(&mut stream);
     }
 }
+/// `ALTER ROLE`／`ALTER USER`（`RENAME TO` を含む）はタグ `ALTER ROLE`。不在は `42704`、禁止属性は `42501`
+/// （SQL-39、Issue #1963）。
+#[test]
+fn wire_alter_role_tag_and_sqlstates() {
+    let (addr, _guard) = serve(true);
+    let mut stream = authenticate_to_ready_for_query(addr, "alice", "pw-alice");
+
+    send_simple_query(&mut stream, "CREATE ROLE r1");
+    assert_eq!(read_command_complete(&mut stream), "CREATE ROLE");
+    read_ready_for_query(&mut stream);
+
+    for sql in [
+        "ALTER ROLE r1 WITH LOGIN CREATEDB",
+        "ALTER USER r1 PASSWORD 'dummy-pw'",
+        "ALTER ROLE r1 RENAME TO r2",
+    ] {
+        send_simple_query(&mut stream, sql);
+        assert_eq!(read_command_complete(&mut stream), "ALTER ROLE", "{sql}");
+        read_ready_for_query(&mut stream);
+    }
+
+    for (sql, state) in [
+        ("ALTER ROLE r1 LOGIN", "42704"),
+        ("ALTER ROLE r2 SUPERUSER", "42501"),
+        ("ALTER ROLE r2 VALID UNTIL 'infinity'", "0A000"),
+        ("ALTER ROLE r2 BOGUS", "42601"),
+    ] {
+        send_simple_query(&mut stream, sql);
+        expect_error_response_with_sqlstate(&mut stream, state);
+        read_ready_for_query(&mut stream);
+    }
+}
+
+/// 認証主体のロールが未束縛の wire セッションでは、`SET ROLE <名前>` は名前の有無を問わず `42501`、
+/// `RESET ROLE` はタグ `RESET`、`SET ROLE NONE` はタグ `SET`（SQL-39、Issue #1963）。
+#[test]
+fn wire_set_role_on_unbound_session() {
+    let (addr, _guard) = serve(true);
+    let mut stream = authenticate_to_ready_for_query(addr, "alice", "pw-alice");
+
+    send_simple_query(&mut stream, "CREATE ROLE r1");
+    assert_eq!(read_command_complete(&mut stream), "CREATE ROLE");
+    read_ready_for_query(&mut stream);
+
+    for sql in ["SET ROLE r1", "SET ROLE nosuch", "SET SESSION ROLE r1"] {
+        send_simple_query(&mut stream, sql);
+        expect_error_response_with_sqlstate(&mut stream, "42501");
+        read_ready_for_query(&mut stream);
+    }
+
+    send_simple_query(&mut stream, "RESET ROLE");
+    assert_eq!(read_command_complete(&mut stream), "RESET");
+    read_ready_for_query(&mut stream);
+
+    send_simple_query(&mut stream, "SET ROLE NONE");
+    assert_eq!(read_command_complete(&mut stream), "SET");
+    read_ready_for_query(&mut stream);
+}
