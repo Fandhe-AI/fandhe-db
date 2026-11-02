@@ -458,14 +458,14 @@ pub(crate) enum PreparedStatement {
     /// セッションで Bind のたびにセッション対応の経路で検証し直せるよう、元の [`PreparedSql`] も
     /// 保持する（一時表を持たないセッションでは `parsed` をそのまま使い、従来と挙動が同一）。
     Parsed {
-        parsed: ParsedSql,
-        prepared: Box<PreparedSql>,
+        parsed: Box<ParsedSql>,
+        prepared: std::sync::Arc<PreparedSql>,
     },
     /// `$n` を含む文（WIRE-12）。engine の [`PreparedSql`] テンプレートと、
     /// `$n` ごとの公告 OID・バイナリ可否（[`ParamSlot`]）を保持する。Bind が
     /// `engine.bind_prepared` で値を束縛して [`ParsedSql`] を得る。
     Parameterized {
-        prepared: PreparedSql,
+        prepared: std::sync::Arc<PreparedSql>,
         slots: Vec<ParamSlot>,
     },
 }
@@ -917,7 +917,9 @@ struct Portal {
     /// Bind 時点の準備済み文（権限再検査用のスナップショット。`PreparedStatement::Empty` は `None`）。
     /// Execute の読み取り権限再検査は、現在の statement を名前で引き直さず必ずこの値を使う
     /// （無名 statement の置換・破棄後も、実行する文と検査する文を同一にそろえる。Issue #1967）。
-    prepared_snapshot: Option<PreparedSql>,
+    /// 不変の準備済み文は `Arc` で statement と共有する（Bind ごとに深く複製しないため、多数の portal を
+    /// 開いても保持量は増えず、[`MAX_PREPARED_SQL_BYTES_PER_SESSION`] の算入外の複製が生じない）。
+    prepared_snapshot: Option<std::sync::Arc<PreparedSql>>,
 }
 
 /// 接続単位で portal を保持する（[`PreparedStatementStore`] と同型の設計）。
@@ -1555,13 +1557,16 @@ fn handle_parse_body(
                     return Err(HandlerError::DeclaredParamTypesExceedPlaceholders);
                 }
                 PreparedStatement::Parsed {
-                    parsed: parsed.clone(),
-                    prepared: Box::new(prepared),
+                    parsed: Box::new(parsed.clone()),
+                    prepared: std::sync::Arc::new(prepared),
                 }
             }
             None => {
                 let slots = build_param_slots(&prepared, &declared_oids)?;
-                PreparedStatement::Parameterized { prepared, slots }
+                PreparedStatement::Parameterized {
+                    prepared: std::sync::Arc::new(prepared),
+                    slots,
+                }
             }
         }
     };
@@ -1774,7 +1779,7 @@ fn handle_describe_body(
                     // カーソル文は開いているカーソルから列を引く従来の経路のまま。
                     if needs_session_revalidation(session, parsed)
                         || (EngineCore::txn_reads_begin_snapshot(txn)
-                            && !matches!(parsed, ParsedSql::Cursor(_)))
+                            && !matches!(&**parsed, ParsedSql::Cursor(_)))
                     {
                         engine
                             .describe_prepared_in_txn(session, txn, prepared)
@@ -1876,22 +1881,18 @@ fn handle_bind_body(
     // ステートメントの判定より先に行う（PR #1041 レビュー指摘:
     // 機能・対象の検証が先行すると `Failed` 中でも `25P02` 以外が返る）。
     if txn.status() == engine::sql::transaction::TransactionStatus::Failed {
-        let is_exit_or_empty = matches!(
-            state.statements.get(&msg.statement_name),
-            Some(
-                PreparedStatement::Empty
-                    | PreparedStatement::Parsed {
-                        parsed: ParsedSql::Transaction(
-                            engine::sql::transaction::ValidatedTxnControl {
-                                control: engine::sql::transaction::TxnControl::Rollback
-                                    | engine::sql::transaction::TxnControl::RollbackToSavepoint,
-                                ..
-                            }
-                        ),
-                        ..
-                    }
-            )
-        );
+        let is_exit_or_empty = match state.statements.get(&msg.statement_name) {
+            Some(PreparedStatement::Empty) => true,
+            Some(PreparedStatement::Parsed { parsed, .. }) => matches!(
+                &**parsed,
+                ParsedSql::Transaction(engine::sql::transaction::ValidatedTxnControl {
+                    control: engine::sql::transaction::TxnControl::Rollback
+                        | engine::sql::transaction::TxnControl::RollbackToSavepoint,
+                    ..
+                })
+            ),
+            _ => false,
+        };
         if !is_exit_or_empty {
             return Err(HandlerError::Sql(txn.take_failed_error()));
         }
@@ -1997,11 +1998,11 @@ fn handle_bind_body(
                 // SQL-40・Issue #1967: 束縛済みのロールは Bind のたびに権限を再検査する（Parse 後の
                 // `REVOKE` を Execute 前に反映する。未束縛のセッションは従来の経路のまま）。
                 || session.object_privileges_enforced()
-                || matches!(parsed, ParsedSql::SessionRouted(_))
+                || matches!(&**parsed, ParsedSql::SessionRouted(_))
                 // COPY は Execute で元 SQL を現在のカタログへ再解決するため、一時表を持たない
                 // セッションでも世代つきの包みを作る（Bind 後に作られた同名の一時表への化けを
                 // Execute 前に `0A000` で拒否する。Issue #1760）。
-                || matches!(parsed, ParsedSql::Copy(_))
+                || matches!(&**parsed, ParsedSql::Copy(_))
                 // writer 取得前の明示トランザクションは、Parse 時（最新カタログ）の解決結果を使い回さず、
                 // Bind で `BEGIN` 時点のカタログにより再検証する（Issue #2403）。
                 || EngineCore::txn_reads_begin_snapshot(txn)
@@ -2018,7 +2019,7 @@ fn handle_bind_body(
                 engine
                     .recheck_prepared_schema_usage(session, prepared)
                     .map_err(HandlerError::Sql)?;
-                parsed.clone()
+                (**parsed).clone()
             };
             // WIRE-15・TASK-218: `describe_parsed_in_txn` へ切り替える
             // （`handle_describe_body` と同じ理由。`FETCH` の portal 列メタは
@@ -2047,8 +2048,10 @@ fn handle_bind_body(
     }
 
     let prepared_snapshot = match state.statements.get(&msg.statement_name) {
-        Some(PreparedStatement::Parsed { prepared, .. }) => Some((**prepared).clone()),
-        Some(PreparedStatement::Parameterized { prepared, .. }) => Some(prepared.clone()),
+        Some(PreparedStatement::Parsed { prepared, .. }) => Some(std::sync::Arc::clone(prepared)),
+        Some(PreparedStatement::Parameterized { prepared, .. }) => {
+            Some(std::sync::Arc::clone(prepared))
+        }
         _ => None,
     };
     let portal = Portal {
@@ -3006,6 +3009,52 @@ mod tests {
             .expect("portal")
             .prepared_snapshot
             .is_some());
+        let _ = std::fs::remove_file(&path);
+    }
+
+    /// Issue #1967 レビュー指摘: 同じ文を多数の named portal へ Bind しても準備済み文は複製されず、
+    /// statement と全 portal が同一の `Arc` を共有する（算入外の複製で接続の保持量上限を迂回できない）。
+    #[test]
+    fn many_portals_share_one_prepared_statement() {
+        use engine::kernel::CpuScalarProvider;
+        use engine::storage::Storage;
+        let path = std::env::temp_dir().join(format!(
+            "portal-share-{}-{:?}.redb",
+            std::process::id(),
+            std::thread::current().id()
+        ));
+        let storage = Storage::open(&path).expect("open storage");
+        let core = EngineCore::from_storage(storage, Box::new(CpuScalarProvider));
+        let session = engine::sql::mode::SessionState::default();
+        let mut txn = engine::sql::transaction::SessionTransaction::new(
+            engine::sql::transaction::TransactionLimits::default(),
+        );
+        let mut state = ExtendedQueryState::new();
+        let mut parse = vec![b's', 0];
+        parse.extend_from_slice(b"SELECT 1");
+        parse.extend(std::iter::repeat_n(b' ', 100_000));
+        parse.push(0);
+        parse.extend_from_slice(&0i16.to_be_bytes());
+        handle_parse_body(&core, &session, &mut txn, &mut state.statements, &parse)
+            .map_err(|_| ())
+            .expect("parse");
+        for i in 0..MAX_PORTALS_PER_SESSION {
+            let mut bind = format!("p{i}").into_bytes();
+            bind.push(0);
+            bind.extend_from_slice(b"s\0");
+            bind.extend_from_slice(&[0, 0, 0, 0, 0, 0]);
+            handle_bind_body(&core, &session, &mut txn, &mut state, &bind)
+                .map_err(|_| ())
+                .expect("bind");
+        }
+        let statement_arc = match state.statements.get("s") {
+            Some(PreparedStatement::Parsed { prepared, .. }) => prepared,
+            _ => panic!("parsed statement expected"),
+        };
+        assert_eq!(
+            std::sync::Arc::strong_count(statement_arc),
+            1 + MAX_PORTALS_PER_SESSION
+        );
         let _ = std::fs::remove_file(&path);
     }
 
