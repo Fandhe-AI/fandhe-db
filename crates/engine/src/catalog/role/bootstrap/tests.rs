@@ -252,3 +252,36 @@ fn corrupt_marker_and_privilege_blobs_fail_closed() {
     put(Some(&[1, 1]), None);
     assert!(s.resolve_tenant_role("t1", "alice").is_err());
 }
+
+#[test]
+fn legacy_db_with_empty_tenant_is_not_bootstrapped_but_marked() {
+    let (_g, s) = open("bootstrap-legacy-empty");
+    // マーカー導入前の既存 DB を模す: t0 にロールがありロール表はあるが、マーカー表は無い。
+    let w = s.begin_write_txn().expect("w");
+    create_role_in_txn(&w, "t0", &initial_role_def(&user(1, "root", "t0", false))).expect("role");
+    finish(w);
+    let users = [user(1, "root", "t0", false), user(2, "alice", "t1", true)];
+    let r = s.bootstrap_users_file(&users).expect("bootstrap");
+    assert_eq!(r.tenants_adopted, 1);
+    assert_eq!(r.tenants_skipped, 1);
+    assert_eq!(r.tenants_bootstrapped, 0);
+    assert!(role(&s, "t1", "alice").is_none());
+    assert!(marked(&s, "t1"));
+    assert!(r
+        .entries
+        .iter()
+        .any(|e| e.kind == BootstrapEntryKind::LegacyEmptyTenantSkipped));
+    // 2 回目以降も再投入しない。
+    let again = s.bootstrap_users_file(&users).expect("again");
+    assert_eq!(again.tenants_bootstrapped, 0);
+    assert!(role(&s, "t1", "alice").is_none());
+}
+
+#[test]
+fn fresh_db_bootstraps_all_tenants_in_one_run() {
+    let (_g, s) = open("bootstrap-fresh-multi");
+    let users = [user(1, "a", "t1", false), user(2, "b", "t2", false)];
+    let r = s.bootstrap_users_file(&users).expect("bootstrap");
+    assert_eq!(r.tenants_bootstrapped, 2);
+    assert_eq!(r.tenants_skipped, 0);
+}

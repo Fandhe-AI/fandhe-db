@@ -10,7 +10,10 @@
 //! - マーカーあり → 何も書かない。食い違いを検出して報告だけする（全ロールを消しても再投入しない）。
 //! - マーカーなし・ロール 1 件以上 → 採用: マーカーだけを補う。同名ロールが資格情報を全く持たない場合に限り
 //!   ファイルの資格情報を補い、`--ddl-allowed-users` の列挙には DDL フラグの行を書く（全権限は付けない）。
-//! - マーカーなし・ロール 0 件 → 投入: 全行から初期ロールを作り、初期権限の行とマーカーを書く。
+//! - マーカーなし・ロール 0 件 → 新規 DB なら投入: 全行から初期ロールを作り、初期権限の行とマーカーを書く。
+//!   マーカー導入前の既存 DB（txn 開始時にロール表があり、マーカー表が無い）なら投入せず警告し、マーカーだけを
+//!   書く（D11 の移行規則。ロールを全削除したテナントへ古いファイルから主体・資格情報・権限を再作成しない。
+//!   マーカーで冪等にするため、後の起動で同じテナントが新規扱いになることもない）。
 //!
 //! 全テナント分を 1 つの write txn・1 回の commit で行い、途中で失敗したら何も書かない（部分投入を残さない）。
 //!
@@ -122,6 +125,8 @@ pub enum BootstrapEntryKind {
     DdlNotApplied,
     /// ロールに DDL フラグがあるが列挙から外れている。DDL は狭まる。
     DdlNarrowed,
+    /// マーカー導入前の既存 DB でロール 0 件のテナント。投入せずマーカーだけを書く（ファイルから再作成しない）。
+    LegacyEmptyTenantSkipped,
     /// 識別子として不正な username（採用・マーカーありのテナントでは警告に留める）。
     InvalidName,
 }
@@ -141,6 +146,8 @@ pub struct BootstrapReport {
     pub tenants_bootstrapped: usize,
     /// 採用（マーカーだけを補った）テナント数。
     pub tenants_adopted: usize,
+    /// 既存 DB のロール 0 件で投入を見送った（マーカーだけを書いた）テナント数。
+    pub tenants_skipped: usize,
 }
 
 /// ブートストラップの失敗（固定文言。資格情報・tenant_id は含めない）。
@@ -342,6 +349,18 @@ fn inspect_user<R: ReadSource>(
     Ok(())
 }
 
+/// 表が存在するか（遅延作成の表の有無で新規 DB と既存 DB を区別する）。
+fn table_exists<K: redb::Key + 'static, V: redb::Value + 'static>(
+    src: &redb::WriteTransaction,
+    def: TableDefinition<K, V>,
+) -> std::result::Result<bool, BootstrapError> {
+    match ReadSource::open_table(src, def) {
+        Ok(_) => Ok(true),
+        Err(redb::TableError::TableDoesNotExist(_)) => Ok(false),
+        Err(e) => Err(e.into()),
+    }
+}
+
 /// 全テナント分のブートストラップを `write_txn` の中で行う（commit は呼び出し側。失敗時は呼び出し側が
 /// txn を捨てるので何も残らない）。
 pub(crate) fn bootstrap_in_txn(
@@ -355,6 +374,10 @@ pub(crate) fn bootstrap_in_txn(
     for u in users {
         by_tenant.entry(u.tenant_id.as_str()).or_default().push(u);
     }
+    // 「新規 DB か、マーカー導入前の既存 DB か」はループの前に 1 回だけ判定する（ループ内で最初のテナントの
+    // 投入がロール表・マーカー表を作るため、途中で判定すると後続のテナントを誤って既存 DB 扱いにする）。
+    let legacy_db =
+        table_exists(write_txn, ROLES_TABLE)? && !table_exists(write_txn, BOOTSTRAP_MARKER_TABLE)?;
     let mut report = BootstrapReport::default();
     for (tenant, mut rows) in by_tenant {
         validate_tenant(tenant).map_err(|_| BootstrapError::InvalidInput)?;
@@ -369,6 +392,15 @@ pub(crate) fn bootstrap_in_txn(
         if tenant_has_roles_in_txn(write_txn, tenant)? {
             adopt_tenant(write_txn, tenant, &rows, &mut report)?;
             report.tenants_adopted += 1;
+        } else if legacy_db {
+            put_marker(write_txn, tenant)?;
+            for u in &rows {
+                report.entries.push(BootstrapEntry {
+                    line: u.line,
+                    kind: BootstrapEntryKind::LegacyEmptyTenantSkipped,
+                });
+            }
+            report.tenants_skipped += 1;
         } else {
             bootstrap_tenant(write_txn, tenant, &rows, &mut report)?;
             report.tenants_bootstrapped += 1;
@@ -494,7 +526,8 @@ impl Storage {
             .begin_write_txn()
             .map_err(super::super::convert_storage_error)?;
         let report = bootstrap_in_txn(&write_txn, users)?;
-        let wrote = report.tenants_bootstrapped + report.tenants_adopted > 0;
+        let wrote =
+            report.tenants_bootstrapped + report.tenants_adopted + report.tenants_skipped > 0;
         if wrote {
             crate::recovery::commit_boundary::commit(write_txn)
                 .map_err(super::super::convert_storage_error)?;

@@ -41,6 +41,9 @@ fn warning_for(line: usize, kind: BootstrapEntryKind) -> Option<String> {
         BootstrapEntryKind::DdlNarrowed => {
             "has a DDL grant but is not listed in --ddl-allowed-users; DDL is not granted"
         }
+        BootstrapEntryKind::LegacyEmptyTenantSkipped => {
+            "belongs to a tenant with no roles in an existing catalog; the role is not created from the file (create it with CREATE ROLE)"
+        }
         BootstrapEntryKind::InvalidName => {
             "is not a valid role name; the user cannot log in"
         }
