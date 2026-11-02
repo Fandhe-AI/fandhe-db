@@ -739,7 +739,12 @@ fn format_message(fmt: &str, args: &[String]) -> String {
         } else {
             out.push(c);
         }
+        // 生成途中で上限に達したら打ち切る（確保は上限 + 1 引数分に収まる）。
+        if out.len() > crate::notice::MAX_NOTICE_FIELD_BYTES {
+            break;
+        }
     }
+    crate::notice::clamp_field(&mut out);
     out
 }
 
@@ -1143,7 +1148,10 @@ impl<'a> Interp<'a> {
         let mut shown = Vec::with_capacity(r.args.len());
         for a in &r.args {
             let v = self.eval(a)?;
-            shown.push(scalar_text(v)?);
+            let mut t = scalar_text(v)?;
+            // 保持前に 1 引数あたり通知欄の上限へ切り詰める（値長 × 引数数の確保を防ぐ）。
+            crate::notice::clamp_field(&mut t);
+            shown.push(t);
         }
         let (mut message, mut detail, mut hint, mut errcode) = (None, None, None, None);
         for (opt, e) in &r.using {
@@ -1153,7 +1161,8 @@ impl<'a> Interp<'a> {
                     detail: "RAISE statement option cannot be null",
                 });
             }
-            let t = scalar_text(v)?;
+            let mut t = scalar_text(v)?;
+            crate::notice::clamp_field(&mut t);
             match opt {
                 RaiseOpt::Message => message = Some(t),
                 RaiseOpt::Detail => detail = Some(t),
@@ -1670,5 +1679,34 @@ pub(crate) mod test_support {
         pub(crate) fn statements_run(&self) -> usize {
             super::counters().statements
         }
+    }
+}
+
+#[cfg(test)]
+mod raise_format_tests {
+    use super::format_message;
+    use crate::notice::{clamp_field, MAX_NOTICE_FIELD_BYTES};
+
+    /// 長大な引数を多数の `%` へ展開しても、結果は通知欄の上限内へ打ち切られる。
+    #[test]
+    fn format_message_stops_at_field_limit() {
+        let mut arg = "あ".repeat(MAX_NOTICE_FIELD_BYTES);
+        clamp_field(&mut arg);
+        assert!(arg.len() <= MAX_NOTICE_FIELD_BYTES);
+        let fmt = "%".repeat(1000);
+        let args = vec![arg; 1000];
+        let out = format_message(&fmt, &args);
+        assert!(out.len() <= MAX_NOTICE_FIELD_BYTES);
+    }
+
+    /// 切り詰めは文字境界で行い、上限以下の入力は変えない。
+    #[test]
+    fn clamp_field_respects_char_boundary() {
+        let mut s = "a".repeat(MAX_NOTICE_FIELD_BYTES - 1) + "あ";
+        clamp_field(&mut s);
+        assert_eq!(s.len(), MAX_NOTICE_FIELD_BYTES - 1);
+        let mut short = "xyz".to_string();
+        clamp_field(&mut short);
+        assert_eq!(short, "xyz");
     }
 }

@@ -126,15 +126,32 @@ pub(crate) fn is_valid_sqlstate(s: &str) -> bool {
 
 /// NUL を取り除き、[`MAX_NOTICE_FIELD_BYTES`] 以内（文字境界）へ切り詰める。
 pub(crate) fn sanitize_text(s: &str) -> String {
-    let cleaned: String = s.chars().filter(|c| *c != '\0').collect();
-    if cleaned.len() <= MAX_NOTICE_FIELD_BYTES {
-        return cleaned;
+    // 全文の複製を作らず、NUL を除きながら上限に達した時点で打ち切る（長大入力でも確保は上限内）。
+    let mut out = String::with_capacity(s.len().min(MAX_NOTICE_FIELD_BYTES));
+    for c in s.chars() {
+        if c == '\0' {
+            continue;
+        }
+        if out.len().saturating_add(c.len_utf8()) > MAX_NOTICE_FIELD_BYTES {
+            break;
+        }
+        out.push(c);
+    }
+    out
+}
+
+/// 文字列を [`MAX_NOTICE_FIELD_BYTES`] 以内（文字境界）へその場で切り詰め、余剰容量を解放する。
+/// RAISE の引数・書式展開結果を保持前に抑え、長大な値の繰り返しによるメモリ枯渇を防ぐ。
+pub(crate) fn clamp_field(s: &mut String) {
+    if s.len() <= MAX_NOTICE_FIELD_BYTES {
+        return;
     }
     let mut end = MAX_NOTICE_FIELD_BYTES;
-    while end > 0 && !cleaned.is_char_boundary(end) {
+    while end > 0 && !s.is_char_boundary(end) {
         end -= 1;
     }
-    cleaned.get(..end).unwrap_or("").to_string()
+    s.truncate(end);
+    s.shrink_to_fit();
 }
 
 #[derive(Default)]
