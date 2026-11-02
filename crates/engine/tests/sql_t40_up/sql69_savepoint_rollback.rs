@@ -285,3 +285,60 @@ fn rollback_to_does_not_touch_other_tenants_committed_rows() {
     assert_eq!(committed_rows(&core, &b), 1);
     assert_eq!(committed_rows(&core, &a), 0);
 }
+
+/// savepoint より後に宣言したカーソルは `ROLLBACK TO` で閉じられ、取り消した行を返さない
+/// （PR #2863 レビュー指摘）。
+#[test]
+fn rollback_to_closes_cursors_declared_after_savepoint() {
+    let (core, _g) = new_core("sql69-rb-cursor");
+    let caller = ctx("tenant-a");
+    let mut s = SessionState::default();
+    let mut txn = core.new_session_transaction();
+    run(&core, &caller, &mut s, &mut txn, "BEGIN").unwrap();
+    run(
+        &core,
+        &caller,
+        &mut s,
+        &mut txn,
+        "DECLARE before CURSOR FOR SELECT id FROM documents LIMIT 10",
+    )
+    .unwrap();
+    run(&core, &caller, &mut s, &mut txn, "SAVEPOINT a").unwrap();
+    run(&core, &caller, &mut s, &mut txn, &insert_sql(1, "op-1")).unwrap();
+    run(
+        &core,
+        &caller,
+        &mut s,
+        &mut txn,
+        "DECLARE c CURSOR FOR SELECT id FROM documents LIMIT 10",
+    )
+    .unwrap();
+    run(&core, &caller, &mut s, &mut txn, "ROLLBACK TO a").unwrap();
+    assert!(run(&core, &caller, &mut s, &mut txn, "FETCH 1 FROM c").is_err());
+}
+
+/// savepoint より前に宣言したカーソルは `ROLLBACK TO` 後も残る。
+#[test]
+fn rollback_to_keeps_cursors_declared_before_savepoint() {
+    let (core, _g) = new_core("sql69-rb-cursor-keep");
+    let caller = ctx("tenant-a");
+    let mut s = SessionState::default();
+    let mut txn = core.new_session_transaction();
+    run(&core, &caller, &mut s, &mut txn, "BEGIN").unwrap();
+    run(
+        &core,
+        &caller,
+        &mut s,
+        &mut txn,
+        "DECLARE before CURSOR FOR SELECT id FROM documents LIMIT 10",
+    )
+    .unwrap();
+    run(&core, &caller, &mut s, &mut txn, "SAVEPOINT a").unwrap();
+    run(&core, &caller, &mut s, &mut txn, &insert_sql(1, "op-1")).unwrap();
+    run(&core, &caller, &mut s, &mut txn, "ROLLBACK TO a").unwrap();
+    let out = run(&core, &caller, &mut s, &mut txn, "FETCH 5 FROM before").unwrap();
+    match out {
+        SqlOutcome::Fetch(result) => assert!(result.rows.is_empty()),
+        other => panic!("expected Fetch, got {other:?}"),
+    }
+}

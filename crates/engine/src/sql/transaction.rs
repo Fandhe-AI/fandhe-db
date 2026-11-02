@@ -1172,7 +1172,8 @@ impl<'e> SessionTransaction<'e> {
         match kind {
             Ok(kind) => {
                 if let TxnState::Active(active) = &mut self.state {
-                    active.savepoints.push(name, kind, session);
+                    let wm = active.cursors.next_id();
+                    active.savepoints.push(name, kind, session, wm);
                 }
                 Ok(())
             }
@@ -1304,6 +1305,12 @@ impl<'e> SessionTransaction<'e> {
             return Err(internal_error());
         };
         *session = saved.clone();
+        // savepoint より後に宣言されたカーソルは取り消した書き込みを具体化済みのため閉じる
+        // （PostgreSQL と同じ。FETCH は 34000 になる）。
+        let Some(wm) = active.savepoints.cursor_watermark_at(pos) else {
+            return Err(internal_error());
+        };
+        active.cursors.close_declared_since(wm);
         active.savepoints.truncate_after(pos);
         Ok(())
     }
