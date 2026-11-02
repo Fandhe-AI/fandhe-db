@@ -30,6 +30,7 @@ use super::role::validate_tenant;
 use super::{validate_identifier, validate_relation_key, CatalogError, Result, Storage};
 
 mod apply;
+pub(crate) mod owner;
 mod schema;
 pub(crate) use apply::{AclChangeError, AclItem, AclRequest, AclScope, AclWarning, GranteeSpec};
 pub(crate) use schema::remove_schema_acl_in_txn;

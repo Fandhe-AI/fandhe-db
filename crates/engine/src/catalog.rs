@@ -5637,6 +5637,7 @@ fn drop_view_in_txn(write_txn: &redb::WriteTransaction, name: &str) -> Result<()
     // ビューの権限（ACL。全テナント分。SQL-40・Issue #1961）。同名再作成へ旧付与を引き継がせない。
     drop(views_table);
     privilege::remove_relation_acl_in_txn(write_txn, name)?;
+    privilege::owner::remove_relation_owners_in_txn(write_txn, name)?;
     // commit 記録（SQL-38・Issue #2404）: ビュー定義の変更は表世代を進めないため DDL として記録する。
     crate::storage::commit_log::note_ddl(write_txn, name);
     Ok(())
@@ -12386,6 +12387,7 @@ impl Storage {
             row_security::remove_row_security_for_table_in_txn(write_txn, name)?;
             // 権限（ACL。全テナント分。SQL-40・Issue #1961）。残置すると同名再作成で旧付与が復活する（fail-open）。
             privilege::remove_relation_acl_in_txn(write_txn, name)?;
+            privilege::owner::remove_relation_owners_in_txn(write_txn, name)?;
             // 永続キー索引（Issue #1071）。残置すると参照整合性検査が fail-open になりうる。
             crate::key_index::drop_indexes_for_table_in_txn(write_txn, name)?;
             // commit 記録（SQL-38・Issue #2404）: スキーマ・カタログを変える書き込みは DDL として記録する。
@@ -13224,6 +13226,7 @@ impl Storage {
         row_security::rename_row_security_table_in_txn(&write_txn, table_name, new_table_name)?;
         // 権限（ACL。全テナント分）も新しい表キーへ移す（SQL-40・Issue #1961）。
         privilege::rename_relation_acl_in_txn(&write_txn, table_name, new_table_name)?;
+        privilege::owner::rename_relation_owners_in_txn(&write_txn, table_name, new_table_name)?;
 
         // カタログの付け替え（`encode_schema` が不変条件を再検証する）。
         schema.rename_table_references(new_table_name);
@@ -15222,6 +15225,7 @@ impl Storage {
                 // ビューの権限（ACL。全テナント分。SQL-40・Issue #1961）。同名再作成へ旧付与を引き継がせない。
                 drop(views_table);
                 privilege::remove_relation_acl_in_txn(&write_txn, name)?;
+                privilege::owner::remove_relation_owners_in_txn(&write_txn, name)?;
                 // commit 記録（SQL-38・Issue #2404）: ビュー定義の変更は表世代を進めないため DDL として記録する。
                 crate::storage::commit_log::note_ddl(&write_txn, name);
                 Vec::new()
