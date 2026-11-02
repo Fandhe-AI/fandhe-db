@@ -802,7 +802,7 @@ SQL-40・NOSQL-2 ポインタ。COPY と HTTP（NoSQL）表層の書き込み入
 - 判定順は「構文 `42601` → 名前解決 `42P01`／`3F000` → 権限 `42501`」。COPY FROM は権限を読み取り専用 Tx の `25006` より前に置く。
 - `FROM STDIN` 形はトークン走査をしない（`STDIN` を relation と誤認しないため）。`TO` 形はトークン走査の参照先に `inner.table_name()` を加える。
 - 一時表の COPY は `begin_copy_temp` が先に分岐するため対象外（セッションの所有物）。
-- HTTP の `SessionState` は `SessionPrincipal::session_state()` の 1 箇所で作る。ロールの束縛は #1971 がここへ足す。現状は未束縛で、
+- HTTP の `SessionState` は `SessionPrincipal::session_state()` の 1 箇所で作る。現在ロールの束縛は #2238 がここへ足す。現状は未束縛で、
   本番の挙動は従来と同一。
 - bound 書き込み API の公開シグネチャに `session: &SessionState` を追加した（破壊的変更）。
 
@@ -814,5 +814,5 @@ Autocommit の COPY commit と単発の bound DML は、判定と書き込みが
 ### 対象外
 
 列単位の判定（#2081）、SEQUENCE の USAGE（`id` 省略 COPY の採番。#2235 の判定が COPY の採番に及ぶかは未確認）、主体を持たない engine の Rust API、
-`SHOW`／`CANCEL PARTITIONED DML` のロール単位のジョブ所有、存在オラクルの網羅試験（#1972）。HTTP・pg wire の結合テストでロールを束縛する
-手段は #1971 まで無く、HTTP の `42501` の end-to-end 検証は engine での手動束縛セッションと wire のエラー写像の単体テストで担保する。
+`SHOW`／`CANCEL PARTITIONED DML` のロール単位のジョブ所有、存在オラクルの網羅試験（#1972）。HTTP の結合テストでロールを束縛する
+手段は #2238 まで無く、HTTP の `42501` の end-to-end 検証は engine での手動束縛セッションと wire のエラー写像の単体テストで担保する。

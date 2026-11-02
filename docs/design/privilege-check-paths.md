@@ -140,7 +140,7 @@ Autocommit の commit 時の再判定は別 txn で ACL を読むため、判定
 
 HTTP の各 op ハンドラは `SessionPrincipal::session_state()`（`http/session/middleware.rs`）で `SessionState` を作り、
 engine の bound API へ渡す。`SessionState::default()` を `http/query/` の本番コードで直接組み立てない。
-ロールの束縛は #1971 がこの関数へ足す拡張点で、現状は未束縛（本番の挙動は不変）。
+HTTP の現在ロールの束縛は #2238 がこの関数へ足す拡張点で、現状は未束縛（本番の挙動は不変）。
 
 | op・入口 | 必要ビット（SQL 表層の同等の文と同じ関数が決める） | 検査点 |
 | -------- | -------------------------------------------------- | ------ |

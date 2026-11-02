@@ -74,7 +74,7 @@ impl SessionPrincipal {
     /// ここから受け取った値を engine の bound API へ渡す（engine の権限ゲートが SQL 表層と同じ判定を行う）。
     ///
     /// 契約: `ddl_allowed` は認証層（セッション発行）が確定した値の写しで、JSON 本文・パスから主体を
-    /// 変える経路は持たない。現在ロールの束縛は認証済みユーザーとロールの紐付け（Issue #1971）がこの関数へ
+    /// 変える経路は持たない。HTTP の現在ロールの束縛は認証済みユーザーとロールの紐付け（Issue #2238）がこの関数へ
     /// 足す拡張点で、現状は未束縛（オブジェクト権限を判定しない移行期の主体。本番の挙動は従来と同一）。
     pub fn session_state(&self) -> engine::sql::mode::SessionState {
         let mut session = engine::sql::mode::SessionState::default();
@@ -320,7 +320,7 @@ mod tests {
     #[test]
     fn session_state_mirrors_ddl_allowed_and_leaves_the_role_unbound() {
         // SQL-40・Issue #1969: HTTP 表層の `SessionState` は `session_state()` だけで作る。
-        // 運用者権限は認証層が確定した値の写しで、現在ロールは #1971 まで未束縛。
+        // 運用者権限は認証層が確定した値の写しで、現在ロールは #2238 まで未束縛。
         let sessions = SessionStore::new();
         let now = Instant::now();
         for ddl in [false, true] {
