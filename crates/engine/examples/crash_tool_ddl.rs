@@ -470,27 +470,29 @@ fn physical_tables(path: &str) -> Res<BTreeSet<String>> {
     Ok(tables.map(|h| h.name().to_string()).collect())
 }
 
-/// raw redb の物理表名のうち、`dropped` の名前とセグメント（`/` 区切り）が完全一致するものを数える。
+/// 物理表名のセグメント（`/` 区切り）が `dd_<r>`・`dd_<r>_v`・`dd_<r>_k` のとき `<r>` を返す。
 /// 接頭辞を決め打ちしない（`dd_1` と `dd_10` を取り違えない）。
-fn raw_residue(path: &str, dropped: &BTreeSet<u64>) -> Res<Vec<String>> {
-    let db = redb::Database::open(path).map_err(|_| "raw open failed".to_string())?;
-    let r = db.begin_read().map_err(|_| "raw read failed".to_string())?;
-    let tables = r
-        .list_tables()
-        .map_err(|_| "raw list tables failed".to_string())?;
-    let mut hits = Vec::new();
-    for h in tables {
-        let name = h.name().to_string();
-        let bad = name.split('/').any(|seg| {
-            dropped.iter().any(|j| {
-                seg == format!("dd_{j}") || seg == format!("dd_{j}_v") || seg == format!("dd_{j}_k")
-            })
-        });
-        if bad {
-            hits.push(name);
-        }
-    }
-    Ok(hits)
+fn seg_round(seg: &str) -> Option<u64> {
+    let rest = seg.strip_prefix("dd_")?;
+    let num = rest
+        .strip_suffix("_v")
+        .or_else(|| rest.strip_suffix("_k"))
+        .unwrap_or(rest);
+    num.parse().ok()
+}
+
+/// raw redb の物理表名のうち、生存表（`live`）に属さない `dd_<r>` を指すものを返す。
+/// DROP 済みの表の残骸に加え、カタログ未登録の表（CREATE TABLE の部分適用の残骸）も拒否する。
+fn raw_residue(path: &str, live: &BTreeSet<u64>) -> Res<Vec<String>> {
+    let tables = physical_tables(path)?;
+    Ok(tables
+        .into_iter()
+        .filter(|name| {
+            name.split('/')
+                .filter_map(seg_round)
+                .any(|r| !live.contains(&r))
+        })
+        .collect())
 }
 
 /// 戻り値は（適用済みの段数 n, 作成済みのラウンド数）。
@@ -575,15 +577,11 @@ fn verify(path: &str) -> Res<(u64, u64)> {
     };
     // EngineCore を閉じてから raw redb を読む（DROP 済みの表の物理表の残骸）。
     let (live, _) = expected(n);
-    let dropped: BTreeSet<u64> = created
-        .iter()
-        .copied()
-        .filter(|j| !live.contains_key(j))
-        .collect();
-    let residue = raw_residue(path, &dropped)?;
+    let live_rounds: BTreeSet<u64> = live.keys().copied().collect();
+    let residue = raw_residue(path, &live_rounds)?;
     if !residue.is_empty() {
         return Err(format!(
-            "physical tables of dropped tables remain: count={}",
+            "physical tables of dropped or unregistered tables remain: count={}",
             residue.len()
         ));
     }
@@ -688,6 +686,10 @@ fn self_check(dir: &str) -> Res<()> {
     neg("drop-residue", &|p| {
         run_sqls(p, &steps(0..11))?;
         raw_create(p, "user_rows/dd_0")
+    })?;
+    neg("unregistered-table-residue", &|p| {
+        run_sqls(p, &steps(0..5))?;
+        raw_create(p, "user_rows/dd_1")
     })?;
     neg("missing-drop", &|p| {
         let mut v = steps(0..10);
