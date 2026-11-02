@@ -13,7 +13,7 @@
 //! 所有者: ロール所有の機構（#2236）が入るまで、呼び出し元が `owner_equivalent`（DDL 権限ゲートを通過した
 //! 主体）を真にした場合に限り、対象の全権限を GRANT OPTION 付きで持つ「所有者相当」として扱う。記録される
 //! 付与者は常に現在ロール ID。したがって別の所有者相当の主体が付けた付与は REVOKE できない（所有者の概念が
-//! 入るまでの既知の制約）。
+//! 入るまでの既知の制約）。対象の所有者が付与者の INHERIT 閉包に含まれる場合は、所有者名義の付与者として扱う。
 //!
 //! 継承（Issue #2232）: 付与権限は付与者本人の行と PUBLIC に加え、付与者が INHERIT で継承するロール
 //! （`catalog::role::graph::effective_roles_in_txn` の閉包。書き込みと同じ txn のスナップショット）の行も
@@ -799,8 +799,18 @@ impl Storage {
             let entries: Vec<AclEntry> = states.work_of(si).to_vec();
             // 所有者相当: 運用者権限（呼び出し元の `owner_equivalent`）に加え、付与者が対象の所有者のとき
             // （Issue #2236。加算のみで運用者権限を縮めない）。列は親の表の所有者を見る。
-            let owner_equivalent = req.owner_equivalent
-                || super::owner::is_owner_in_txn(&*write_txn, tenant, &t.object, req.grantor_id)?;
+            // 対象の所有者が付与者の INHERIT 閉包に含まれる（付与者自身を含む）ときは、PostgreSQL の
+            // `select_best_grantor` と同じく所有者の暗黙の全 GRANT OPTION を認め、所有者名義で付与・取り消す。
+            // 閉包は INHERIT の辺だけを辿るため、継承しないメンバーシップ経由の所有者は候補にならない。
+            let owner_gid: Option<u64> = if req.owner_equivalent {
+                Some(req.grantor_id)
+            } else if matches!(t.object, PrivilegeObject::Sequence(_)) {
+                None
+            } else {
+                super::owner::owner_of_in_txn(&*write_txn, tenant, &t.object)?
+                    .filter(|o| closure.contains(o))
+            };
+            let owner_equivalent = owner_gid.is_some();
             // 列の判定は表単位の行も参照する。
             let table_entries: Option<Vec<AclEntry>> = match &t.object {
                 PrivilegeObject::Column { table, .. } if !owner_equivalent => {
@@ -814,8 +824,8 @@ impl Storage {
             };
             // この対象の付与者（所有者相当は実行ロール。そうでなければ継承閉包から最良のロール）。
             let need = if t.bits != 0 { want } else { want_p };
-            let gid = if owner_equivalent {
-                req.grantor_id
+            let gid = if let Some(o) = owner_gid {
+                o
             } else {
                 match &table_entries {
                     // 波及ビットは表の GRANT OPTION だけで絞るため、表の行だけで付与者を選ぶ。

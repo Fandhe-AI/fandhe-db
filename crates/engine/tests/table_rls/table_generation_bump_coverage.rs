@@ -580,6 +580,8 @@ const ALLOWLIST: &[(&str, u32)] = &[
     ("catalog/privilege/owner/tests.rs", 20),
     ("sql/owner_ddl/tests.rs", 75),
     ("sql/owner_ddl/tests.rs", 225),
+    // Issue #2232: 継承した所有者名義の付与の単体テスト（所有者表を直接書くテスト専用の commit。表世代の対象外）。
+    ("sql/grant_ddl/role_tests.rs", 745),
     // Issue #2235: SEQUENCE・関数単位の ACL の単体テストの `write` ヘルパ（テスト専用の commit。専用表だけを書き表世代の対象外）。
     ("catalog/privilege/sequence/tests.rs", 23),
     ("catalog/privilege/function/tests.rs", 20),

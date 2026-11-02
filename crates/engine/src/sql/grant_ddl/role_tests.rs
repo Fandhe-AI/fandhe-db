@@ -725,6 +725,47 @@ fn table_revoke_propagation_only_touches_selected_grantor_rows() {
         .any(|e| e.grantee_id == q && e.grantor_id == near));
 }
 
+/// 対象の所有者が付与者の INHERIT 閉包に含まれるとき、所有者の暗黙の全 GRANT OPTION を認めて所有者名義で付与・
+/// 取り消す（PostgreSQL の `select_best_grantor` 相当）。継承しないメンバーシップ経由では認めない（回帰）。
+#[test]
+fn inherited_owner_grants_and_revokes_under_owner_name() {
+    let f = fx("rm_acl_owner");
+    let me = role(&f, "me");
+    let r = role(&f, "r");
+    let m = role(&f, "m");
+    let q = role(&f, "q");
+    let txn = f.s.begin_write_txn().expect("begin");
+    crate::catalog::privilege::owner::set_owner_unchecked_in_txn(
+        &txn,
+        T,
+        &PrivilegeObject::Table("docs".to_string()),
+        r,
+    )
+    .expect("owner");
+    crate::recovery::commit_boundary::commit(txn).expect("commit");
+    let owner = session(me, true);
+    let docs = PrivilegeObject::Table("docs".to_string());
+    // 継承しない: 明示 ACL が無ければ付与できない。
+    run(&f, &owner, "GRANT r TO m WITH INHERIT FALSE").expect("m in r");
+    assert_eq!(
+        code(run(&f, &session(m, false), "GRANT SELECT ON docs TO q")),
+        "42501"
+    );
+    // 継承する: 所有者 r 名義で付与でき、REVOKE も r 名義の行に作用する。
+    run(&f, &owner, "GRANT r TO m WITH INHERIT TRUE").expect("inherit");
+    run(&f, &session(m, false), "GRANT SELECT ON docs TO q").expect("via owner r");
+    let rows = f.s.list_acl_for_object(T, &docs).expect("acl");
+    assert!(rows.contains(&AclEntry {
+        grantee_id: q,
+        grantor_id: r,
+        privileges: PRIV_SELECT,
+        grant_options: 0
+    }));
+    run(&f, &session(m, false), "REVOKE SELECT ON docs FROM q").expect("revoke");
+    let rows = f.s.list_acl_for_object(T, &docs).expect("acl");
+    assert!(!rows.iter().any(|e| e.grantee_id == q));
+}
+
 #[test]
 fn drop_role_detaches_grantor_references() {
     let f = fx("rm_drop_grantor");
