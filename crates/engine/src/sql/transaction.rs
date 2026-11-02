@@ -493,6 +493,44 @@ enum TxnOrigin {
     Implicit,
 }
 
+/// Tx 内で登録済みの `operation_id` の登録順ログと照合用集合（Issue #1944）。
+///
+/// `ActiveTxn` が保持し、`check_statement_limits` が重複を `25000` で拒否する。`SAVEPOINT` は
+/// ログ長を水位として記録し、`ROLLBACK TO` が [`Self::truncate_to`] で水位より後を取り消す。
+/// ログ長は文数上限で有界になる。
+#[derive(Debug, Default)]
+struct SeenOperationIds {
+    order: Vec<String>,
+    set: HashSet<String>,
+}
+
+impl SeenOperationIds {
+    /// 新規なら登録して `true`、登録済みなら `false`。
+    fn insert(&mut self, id: &str) -> bool {
+        if self.set.insert(id.to_string()) {
+            self.order.push(id.to_string());
+            true
+        } else {
+            false
+        }
+    }
+
+    /// 現在のログ長（savepoint の水位）。
+    fn len(&self) -> usize {
+        self.order.len()
+    }
+
+    /// 水位 `wm` より後に登録された ID を取り消す。
+    fn truncate_to(&mut self, wm: usize) {
+        if wm >= self.order.len() {
+            return;
+        }
+        for id in self.order.drain(wm..) {
+            self.set.remove(&id);
+        }
+    }
+}
+
 /// トランザクション中の状態。`BEGIN` 時点の読み取りスナップショット（`read_snapshot`）と、
 /// 取得済み／未取得を表せる共有書き込みトランザクション（`writer`）、およびその付随状態を持つ
 /// （SQL-31・PERSIST-4・TASK-333、Issue #2399。設計記録は `docs/design/explicit-transaction.md`）。
@@ -535,7 +573,9 @@ struct ActiveTxn<'e> {
     /// `check_and_register_statement` を通った文が 1 つでもあるか（Issue #1939）。`SET TRANSACTION` は
     /// 最初の問い合わせの前でだけ受理するため、その判定に使う（`SET TRANSACTION` 自身は立てない）。
     queried: bool,
-    seen_operation_ids: HashSet<String>,
+    /// この Tx 内で登録済みの `operation_id`。登録順ログと照合用集合を持ち、`ROLLBACK TO` が
+    /// savepoint の水位より後の分を取り消す（Issue #1944）。
+    seen_operation_ids: SeenOperationIds,
     written_tables: HashSet<String>,
     /// このトランザクション内で書き込んだ `(tenant_id, table)` の組の集合
     /// （TABLE-17・TASK-205、Issue #1077）。COMMIT 時の遅延 `FOREIGN KEY` 検査
@@ -1024,7 +1064,7 @@ impl<'e> SessionTransaction<'e> {
                     txn_start_micros,
                     statements: 0,
                     queried: false,
-                    seen_operation_ids: HashSet::new(),
+                    seen_operation_ids: SeenOperationIds::default(),
                     written_tables: HashSet::new(),
                     written_by_tenant: std::collections::BTreeSet::new(),
                     has_writes: false,
@@ -1182,7 +1222,10 @@ impl<'e> SessionTransaction<'e> {
                                 written_by_tenant: active.written_by_tenant.clone(),
                             }
                         });
-                    active.savepoints.push(name, kind, session, wm, marks);
+                    let op_wm = active.seen_operation_ids.len();
+                    active
+                        .savepoints
+                        .push(name, kind, session, wm, op_wm, marks);
                 }
                 Ok(())
             }
@@ -1260,7 +1303,9 @@ impl<'e> SessionTransaction<'e> {
     /// 一致する。記録を縮める前に、redb 復元後の表世代が確定状態と一致すること（世代差分ゼロ）を
     /// 突き合わせ、不一致は `XX000`（fail-closed）。
     ///
-    /// 戻さないもの: `seen_operation_ids`（Issue #1944）、commit 記録の足跡（巻き戻した行の足跡が
+    /// `operation_id` の Tx 内登録は水位まで戻す（Issue #1944）。
+    ///
+    /// 戻さないもの: commit 記録の足跡（巻き戻した行の足跡が
     /// 残り、他の明示 Tx が余分に `40001` を受けうる安全側の過剰。偽陰性は生まない）、
     /// 採番状態（`SequenceAllocator`・`currval`。PostgreSQL と同じく非トランザクショナルで、
     /// 全体 `ROLLBACK` と同じ扱い）。
@@ -1342,6 +1387,12 @@ impl<'e> SessionTransaction<'e> {
         active.has_writes = marks.has_writes;
         active.written_tables = marks.written_tables;
         active.written_by_tenant = marks.written_by_tenant;
+        // 巻き戻した範囲の operation_id を取り消し、同一 Tx 内で再利用できるようにする。
+        // 水位は truncate_after の前に読む（Issue #1944）。
+        let Some(op_wm) = active.savepoints.op_id_watermark_at(pos) else {
+            return Err(internal_error());
+        };
+        active.seen_operation_ids.truncate_to(op_wm);
         active.savepoints.truncate_after(pos);
         Ok(())
     }
@@ -1390,7 +1441,7 @@ impl<'e> SessionTransaction<'e> {
             return Err(SqlSurfaceError::payload_too_large(LIMIT_EXCEEDED_MESSAGE));
         }
         if let Some(id) = operation_id {
-            if !active.seen_operation_ids.insert(id.to_string()) {
+            if !active.seen_operation_ids.insert(id) {
                 self.fail();
                 return Err(SqlSurfaceError::InvalidTransactionState);
             }
@@ -2319,6 +2370,37 @@ mod tests {
                 .wire_code(),
             "25P02"
         );
+    }
+
+    /// Issue #1944: 巻き戻した operation_id は再利用でき、巻き戻していない ID は従来どおり拒否する。
+    #[test]
+    fn rollback_to_savepoint_releases_operation_ids_after_watermark() {
+        let (storage, _guard) = open_test_storage("savepoint-opid");
+        let (mut txn, _s) = explicit_txn(&storage);
+        let mut ss = SessionState::default();
+        txn.check_and_register_statement(Some("op-0")).unwrap();
+        txn.savepoint("a", &ss).unwrap();
+        txn.check_and_register_statement(Some("op-1")).unwrap();
+        txn.rollback_to_savepoint("a", &mut ss).unwrap();
+        txn.check_and_register_statement(Some("op-1")).unwrap();
+        txn.rollback_to_savepoint("a", &mut ss).unwrap();
+        txn.check_and_register_statement(Some("op-1")).unwrap();
+        // savepoint より前の ID は巻き戻していないので拒否され、Tx は Failed になる。
+        let e = txn.check_and_register_statement(Some("op-0")).unwrap_err();
+        assert_eq!(e.wire_code(), "25000");
+        assert_eq!(txn.status(), TransactionStatus::Failed);
+    }
+
+    /// Issue #1944: RELEASE は登録済み ID を変えない。
+    #[test]
+    fn release_savepoint_keeps_operation_ids() {
+        let (storage, _guard) = open_test_storage("savepoint-opid-release");
+        let (mut txn, _s) = explicit_txn(&storage);
+        txn.savepoint("a", &SessionState::default()).unwrap();
+        txn.check_and_register_statement(Some("op-1")).unwrap();
+        txn.release_savepoint("a").unwrap();
+        let e = txn.check_and_register_statement(Some("op-1")).unwrap_err();
+        assert_eq!(e.wire_code(), "25000");
     }
 
     /// Issue #1943: writer 取得前の savepoint は成功し、対象は残り新しい側は消える。
