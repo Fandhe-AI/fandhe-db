@@ -644,7 +644,7 @@ Issue #1931（`READ ONLY`）、挙動テストは #1940、`40001` は #2396 が�
 
 行ロック句（`SELECT ... FOR UPDATE／NO KEY UPDATE／SHARE／KEY SHARE [OF ...] [NOWAIT|SKIP LOCKED]`）と
 `LOCK TABLE` の受理・結果の契約は spec 側が定義する。本節は実装側の写像と担当の分担だけを記録し、
-各形の SQLSTATE・`SKIP LOCKED` の結果・トランザクション外の扱い・併用可否は本書へ記述しない。
+各形の SQLSTATE・トランザクション外の扱い・併用可否は本書へ記述しない（`SKIP LOCKED` は下記の実装側の写像のみ）。
 ポインタは `docs/spec/04-behavior/sql-surface.md` SQL-38（(3)(4)(5)(7)）・SQL-31、
 `docs/spec/04-behavior/data-model.md` TABLE-3、`docs/spec/04-behavior/persistence.md` PERSIST-4、
 関連は RLS-12・RLS-7。行ロック句の取得は #2230、`LOCK TABLE` は #1958 で実装済み（#1955 の現状欄は着手前の記録）。
@@ -658,19 +658,33 @@ Issue #1931（`READ ONLY`）、挙動テストは #1940、`40001` は #2396 が�
   （`StorageError::WriteLockTimeout` から `55P03` への写像）に従う。
   `NOWAIT` は「即時取得を試みる経路」で実現する。#2230 では `LOCK TABLE ... NOWAIT`（#1958）と同じ
   `Storage::begin_explicit_write_txn_nowait` を流用し、新しい API は作らない。
-- **複数句の合成（#2230）**: 強度・`OF` の対象は writer の取得に影響しない。待機方針は
-  `SKIP LOCKED` を含む形を `0A000`（#2231 まで。writer に触れる前に返す）、含まず `NOWAIT` を含む形を nowait、
-  それ以外を待機とする（`RowLocking::writer_wait`）。
+- **複数句の合成（#2230・#2231）**: 強度・`OF` の対象は writer の取得に影響しない。待機方針は
+  `NOWAIT` を含む形を nowait、含まず `SKIP LOCKED` を含む形を skip、それ以外を待機とする
+  （優先順位は `NOWAIT` > `SKIP LOCKED` > 待機。PostgreSQL の同一表に効く複数句の規則に倣う。
+  `RowLocking::writer_wait` が `WriterWait` を返す）。
+- **`SKIP LOCKED` の写像（#2231。SQL-38 (4)(5)）**: 待たずに writer の取得を試み（`NOWAIT` と同じ即時取得経路）、
+  他セッションが保持していれば writer を取らず、行を読まずに 0 行を返す。列は句なし SELECT と同じ Describe の
+  経路で導出する。取得できた場合（空き・自 Tx が保持済み）は `SKIP LOCKED` を外した行ロック句と同じ扱いで、
+  `40001` 判定もそのまま効く（空結果へ化けさせない）。取得を試みた結果は型で返し（`try_ensure_writer`・
+  `try_begin_implicit`）、他の経路の `55P03` が空結果に変わらないようにする。取得できなかったとき、明示 Tx は
+  `Active` のまま（`Failed` にしない）、autocommit は暗黙 Tx を開始しない。
+  単一ライタの writer 粒度のため、キュー処理の `ORDER BY ... LIMIT 1 FOR UPDATE SKIP LOCKED` は、
+  1 台目が保持している間 2 台目が次の行ではなく 0 行を受け取る（PostgreSQL の行単位の `SKIP LOCKED` とは異なる）。
+  ワーカー側は 0 行を「現在は取れない」として再試行（バックオフ）する前提とする。
+  複数文メッセージの暗黙 Tx（`BEGIN` なしで行ロック句 SELECT が最後以外）は、メッセージ全体を 0 行にできず
+  待ってから取得するのも句の意味に反するため、`SKIP LOCKED` を含めば writer に触れる前に `0A000` のまま残す
+  （`NOWAIT` と混在しても `0A000` を優先）。行ロック句 SELECT が最後の文なら逐次 autocommit で動くため、
+  `SELECT 1; SELECT ... SKIP LOCKED` は動作し `SELECT ... SKIP LOCKED; SELECT 1` は `0A000` になる非対称性がある。
 - **保持期間（#2230）**: 明示 Tx は `ensure_writer_with` で取得して COMMIT／ROLLBACK まで保持し、dirty にはしない。
   autocommit は文単位の暗黙 Tx（`begin_implicit_with(.., nowait)`）で取得し、文の終わりに解放する
-  （書き込みなしとして drop）。取得後の読み取りは句のない SELECT と同じ経路を通る。
+  （書き込みなしとして drop）。`SKIP LOCKED` で取得できなかった場合は writer を取らない。取得後の読み取りは句のない SELECT と同じ経路を通る。
   一時表だけを対象にした行ロック句は未対応の `0A000` のまま。
 
 | 形 | spec ポインタ | 担当 | 現状 |
 | -- | ------------- | ---- | ---- |
 | 行ロック句 4 種・`OF`・`NOWAIT`・`SKIP LOCKED` の構文 | SQL-38 (7) | #1957 | 構文解釈済み（`ParsedSql::LockingSelect`） |
 | 行ロック句によるロック取得・`NOWAIT` | SQL-38 (4) | #2230 | 実装済み（#2230。writer の取得として扱う） |
-| `SKIP LOCKED` の実行 | SQL-38 (4) | #2231 | 未実装（`0A000`） |
+| `SKIP LOCKED` の実行 | SQL-38 (4)(5) | #2231 | 実装済み（#2231。writer 粒度。複数文の暗黙 Tx は `0A000`） |
 | `LOCK [TABLE]` の 8 モードの構文・取得・表名の解決 | SQL-38 (4)(7) | #1958 | 実装済み（#1958） |
 | READ ONLY トランザクション内での扱い | SQL-38 (3) | #1934 | 実装済み（#1934。書き込み系の文は `25006`） |
 | writer 取得時の直列化判定 | SQL-38 (2)・SQL-31 | #2396 系 | 1a 節の記録のとおり |
@@ -678,10 +692,11 @@ Issue #1931（`READ ONLY`）、挙動テストは #1940、`40001` は #2396 が�
 - **READ ONLY トランザクション内**: ロック句つき SELECT・`LOCK TABLE` は `25006` で拒否する
   （Issue #1934。「READ ONLY での書き込み拒否」節）。8 モードすべてを拒否する。
 - **要確認（担当 Issue が確定する。本節では決めない）**:
-  - `SKIP LOCKED` の結果規則（単一ライタの下でどの行を飛ばすか）→ #2231（SQL-38 (4)）
+  - `SKIP LOCKED` の結果規則 → #2231 で SQL-38 (4) に従い実装済み（上記の写像を参照）
   - トランザクション外の `LOCK TABLE` のエラー契約 → #1958（#1958 本文でも要確認）
   - autocommit の文に付いたロック句が writer を保持する期間 → #2230
-- **テナント境界（fail-closed）**: ロック句の結果と `LOCK TABLE` の表名解決を、他テナントの行・表の
+- **テナント境界（fail-closed）**: `SKIP LOCKED` の 0 行は行を読まずに返すため、テナントの可視行に依存せず
+  存在・件数のオラクルにならない。ロック句の結果と `LOCK TABLE` の表名解決を、他テナントの行・表の
   存在や件数のオラクルにしない。1a-6 の「可視性判定関数を共有し、側チャネルを作らない」を再利用する
   （SQL-38 (5)・RLS-12・RLS-7）。未対応の形は従来どおり `42601`／`0A000` で拒否する。
 - **公開境界**: 受理範囲・SQLSTATE などの契約詳細を本書へ記述する場合は、AGENTS.md の公開境界拡張手順

@@ -3,8 +3,8 @@
 //! ポインタ: `docs/spec/04-behavior/` SQL-38。
 //!
 //! 構文解釈・併用検査（`ParsedSql::LockingSelect` が得られること）と、実行（Issue #2230。writer の
-//! 取得・保持期間・句なし SELECT との結果同一性）を確かめる。`SKIP LOCKED` の実行（#2231）と一時表への
-//! 行ロック句は未対応の `0A000` のまま。2 セッションの待機・時間計測を伴うテストは
+//! 取得・保持期間・句なし SELECT との結果同一性）と、`SKIP LOCKED` の実行（#2231。他セッション保持中は
+//! 0 行）を確かめる。一時表への行ロック句は未対応の `0A000` のまま。2 セッションの待機・時間計測を伴うテストは
 //! `tests/write_lock_wait.rs`（単独バイナリ）に置く。
 
 use engine::catalog::{ColumnDef, ColumnType, TableSchema};
@@ -339,56 +339,333 @@ fn locking_select_does_not_leak_other_tenants_rows() {
     assert_eq!(format!("{plain:?}"), format!("{locked:?}"));
 }
 
-/// `SKIP LOCKED` は #2231 まで `0A000`。writer に触れない（別スレッドの NOWAIT 取得が成功する）。
-#[test]
-fn skip_locked_is_still_0a000_without_touching_writer() {
-    let (core, path) = new_core();
-    let _cleanup = CleanupGuard(path);
-    let sql = "SELECT id FROM documents WHERE title = 'x' LIMIT 5 FOR UPDATE SKIP LOCKED";
-    // セッションを持たない後方互換の入口（`execute_sql`）は行ロック句の構文を認識しない。
-    assert!(core.execute_sql(&ctx(), sql).is_err());
-    let mut session = SessionState::default();
-    assert_eq!(
-        core.execute_sql_in_session(&ctx(), &mut session, sql)
-            .expect_err("gated")
-            .wire_code(),
-        "0A000"
-    );
-    let mut txn = core.new_session_transaction();
-    core.execute_sql_in_txn(&ctx(), &mut session, &mut txn, "BEGIN")
-        .expect("begin");
-    assert_eq!(
-        core.execute_sql_in_txn(&ctx(), &mut session, &mut txn, sql)
-            .expect_err("gated")
-            .wire_code(),
-        "0A000"
-    );
-    assert_eq!(txn.status(), TransactionStatus::Failed);
-    assert_eq!(
-        core.execute_sql_in_txn(&ctx(), &mut session, &mut txn, "SELECT 1")
-            .expect_err("failed txn")
-            .wire_code(),
-        "25P02"
-    );
-    core.execute_sql_in_txn(&ctx(), &mut session, &mut txn, "ROLLBACK")
-        .expect("rollback");
-    // writer を取っていないので、別セッションの NOWAIT 取得が成功する。
+/// 実行結果から `QueryResult` を取り出す。
+fn query_of(outcome: engine::sql::SqlOutcome) -> engine::sql::exec::QueryResult {
+    match outcome {
+        engine::sql::SqlOutcome::Query(q) => q,
+        other => panic!("expected query outcome: {other:?}"),
+    }
+}
+
+/// 別セッション（別スレッド）で autocommit の `sql` を実行し、結果を返す（保持役は呼び出し側スレッド）。
+fn autocommit_in_other_session(
+    core: &EngineCore,
+    ctx: &PolicyContext,
+    sql: &str,
+) -> Result<engine::sql::exec::QueryResult, String> {
     std::thread::scope(|scope| {
         scope
             .spawn(|| {
                 let mut s2 = SessionState::default();
-                core.execute_sql_in_session(
-                    &ctx(),
-                    &mut s2,
-                    "SELECT id FROM documents WHERE title = 'x' LIMIT 5 FOR UPDATE NOWAIT",
-                )
-                .expect("nowait succeeds");
+                core.execute_sql_in_session(ctx, &mut s2, sql)
+                    .map(query_of)
+                    .map_err(|e| e.wire_code().to_string())
+            })
+            .join()
+            .expect("join")
+    })
+}
+
+const Q_LOCK: &str = "SELECT id, title FROM documents WHERE title = 'x' ORDER BY id LIMIT 10";
+
+/// 呼び出し側スレッドで `BEGIN; ... FOR UPDATE` を実行し writer を保持した Tx を返す。
+fn hold_writer<'e>(
+    core: &'e EngineCore,
+    session: &mut SessionState,
+) -> engine::sql::transaction::SessionTransaction<'e> {
+    let mut txn = core.new_session_transaction();
+    core.execute_sql_in_txn(&ctx(), session, &mut txn, "BEGIN")
+        .expect("begin");
+    core.execute_sql_in_txn(&ctx(), session, &mut txn, &format!("{Q_LOCK} FOR UPDATE"))
+        .expect("hold");
+    txn
+}
+
+/// SQL-38 (4)・Issue #2231: writer が空いていれば `SKIP LOCKED` は句なしと同じ行を返し、
+/// 明示 Tx なら COMMIT まで writer を保持する（別セッションの NOWAIT は `55P03`）。
+#[test]
+fn skip_locked_acquires_free_writer_and_holds_it_in_txn() {
+    let (core, path) = new_core();
+    let _cleanup = CleanupGuard(path);
+    let mut session = SessionState::default();
+    seed(&core, &mut session);
+    let plain = query_of(
+        core.execute_sql_in_session(&ctx(), &mut session, Q_LOCK)
+            .expect("plain"),
+    );
+    assert!(!plain.rows.is_empty());
+    let sql = format!("{Q_LOCK} FOR UPDATE SKIP LOCKED");
+    let locked = query_of(
+        core.execute_sql_in_session(&ctx(), &mut session, &sql)
+            .expect("autocommit"),
+    );
+    assert_eq!(format!("{plain:?}"), format!("{locked:?}"));
+    // autocommit は文の終わりで解放する。
+    attempt_in_other_session(&core, &format!("{Q_LOCK} FOR UPDATE NOWAIT"))
+        .0
+        .expect("released");
+    let mut txn = core.new_session_transaction();
+    core.execute_sql_in_txn(&ctx(), &mut session, &mut txn, "BEGIN")
+        .expect("begin");
+    let locked = query_of(
+        core.execute_sql_in_txn(&ctx(), &mut session, &mut txn, &sql)
+            .expect("in txn"),
+    );
+    assert_eq!(format!("{plain:?}"), format!("{locked:?}"));
+    let (r, _) = attempt_in_other_session(&core, &format!("{Q_LOCK} FOR UPDATE NOWAIT"));
+    assert_eq!(r.expect_err("held").0, "55P03");
+    core.execute_sql_in_txn(&ctx(), &mut session, &mut txn, "COMMIT")
+        .expect("commit");
+}
+
+/// 他セッションが保持中の autocommit `SKIP LOCKED` は 0 行（列は句なしと一致）。解放後は全行を返す。
+#[test]
+fn skip_locked_returns_zero_rows_while_held_autocommit() {
+    let (core, path) = new_core();
+    let _cleanup = CleanupGuard(path);
+    let mut session = SessionState::default();
+    seed(&core, &mut session);
+    let plain = query_of(
+        core.execute_sql_in_session(&ctx(), &mut session, Q_LOCK)
+            .expect("plain"),
+    );
+    let mut txn = hold_writer(&core, &mut session);
+    let sql = format!("{Q_LOCK} FOR SHARE SKIP LOCKED");
+    let r = autocommit_in_other_session(&core, &ctx(), &sql).expect("skip");
+    assert!(r.rows.is_empty());
+    assert_eq!(format!("{:?}", r.columns), format!("{:?}", plain.columns));
+    core.execute_sql_in_txn(&ctx(), &mut session, &mut txn, "COMMIT")
+        .expect("commit");
+    let r = autocommit_in_other_session(&core, &ctx(), &sql).expect("after release");
+    assert_eq!(format!("{r:?}"), format!("{plain:?}"));
+}
+
+/// 他セッションが保持中の明示 Tx の `SKIP LOCKED` は 0 行で、Tx は `Active` のまま続行でき、
+/// writer も取らない。解放後の再実行は writer を取得して行を返す。
+#[test]
+fn skip_locked_returns_zero_rows_while_held_in_txn() {
+    let (core, path) = new_core();
+    let _cleanup = CleanupGuard(path);
+    let mut session = SessionState::default();
+    seed(&core, &mut session);
+    let plain = query_of(
+        core.execute_sql_in_session(&ctx(), &mut session, Q_LOCK)
+            .expect("plain"),
+    );
+    let mut holder = hold_writer(&core, &mut session);
+    let sql = format!("{Q_LOCK} FOR UPDATE SKIP LOCKED");
+    std::thread::scope(|scope| {
+        scope
+            .spawn(|| {
+                let mut s2 = SessionState::default();
+                let mut t2 = core.new_session_transaction();
+                core.execute_sql_in_txn(&ctx(), &mut s2, &mut t2, "BEGIN")
+                    .expect("begin");
+                let r = query_of(
+                    core.execute_sql_in_txn(&ctx(), &mut s2, &mut t2, &sql)
+                        .expect("skip"),
+                );
+                assert!(r.rows.is_empty());
+                assert_eq!(format!("{:?}", r.columns), format!("{:?}", plain.columns));
+                assert_eq!(t2.status(), TransactionStatus::InTransaction);
+                core.execute_sql_in_txn(&ctx(), &mut s2, &mut t2, "SELECT 1")
+                    .expect("txn still usable");
+                // writer を取っていない。
+                assert_eq!(
+                    core.execute_sql_in_txn(
+                        &ctx(),
+                        &mut s2,
+                        &mut t2,
+                        &format!("{Q_LOCK} FOR UPDATE NOWAIT")
+                    )
+                    .expect_err("held")
+                    .wire_code(),
+                    "55P03"
+                );
             })
             .join()
             .expect("join");
     });
+    // 保持役が解放した後は writer を取得して行を返す。
+    core.execute_sql_in_txn(&ctx(), &mut session, &mut holder, "COMMIT")
+        .expect("commit");
+    let r = query_of(
+        core.execute_sql_in_session(&ctx(), &mut session, &sql)
+            .expect("after release"),
+    );
+    assert_eq!(format!("{r:?}"), format!("{plain:?}"));
 }
 
+/// 自 Tx が既に writer を保持していれば `SKIP LOCKED` は行を返す（自分の未 commit 行を含む）。
+#[test]
+fn skip_locked_returns_rows_when_own_txn_holds_writer() {
+    let (core, path) = new_core();
+    let _cleanup = CleanupGuard(path);
+    let mut session = SessionState::default();
+    seed(&core, &mut session);
+    let mut txn = core.new_session_transaction();
+    core.execute_sql_in_txn(&ctx(), &mut session, &mut txn, "BEGIN")
+        .expect("begin");
+    core.execute_sql_in_txn(
+        &ctx(),
+        &mut session,
+        &mut txn,
+        "INSERT INTO documents (id, embedding, title, author_id) VALUES (50, '[1.0, 0.0]', 'x', 1) USING OPERATION_ID 'own-50'",
+    )
+    .expect("insert");
+    let plain = query_of(
+        core.execute_sql_in_txn(&ctx(), &mut session, &mut txn, Q_LOCK)
+            .expect("plain"),
+    );
+    let locked = query_of(
+        core.execute_sql_in_txn(
+            &ctx(),
+            &mut session,
+            &mut txn,
+            &format!("{Q_LOCK} FOR UPDATE SKIP LOCKED"),
+        )
+        .expect("skip locked"),
+    );
+    assert_eq!(format!("{plain:?}"), format!("{locked:?}"));
+    assert!(locked.rows.len() >= 2);
+    core.execute_sql_in_txn(&ctx(), &mut session, &mut txn, "ROLLBACK")
+        .expect("rollback");
+}
+
+/// writer が空いていて先行読み取りと衝突する場合、`SKIP LOCKED` は `40001` を返し 0 行にしない。
+#[test]
+fn skip_locked_does_not_swallow_serialization_failure() {
+    let (core, path) = new_core();
+    let _cleanup = CleanupGuard(path);
+    let mut session = SessionState::default();
+    seed(&core, &mut session);
+    let mut txn = core.new_session_transaction();
+    core.execute_sql_in_txn(&ctx(), &mut session, &mut txn, "BEGIN")
+        .expect("begin");
+    core.execute_sql_in_txn(&ctx(), &mut session, &mut txn, Q_LOCK)
+        .expect("read");
+    let mut s2 = SessionState::default();
+    core.execute_sql_in_session(
+        &ctx(),
+        &mut s2,
+        "INSERT INTO documents (id, embedding, title, author_id) VALUES (101, '[1.0, 0.0]', 'x', 1) USING OPERATION_ID 'own-101'",
+    )
+    .expect("visible insert");
+    let err = core
+        .execute_sql_in_txn(
+            &ctx(),
+            &mut session,
+            &mut txn,
+            &format!("{Q_LOCK} FOR UPDATE SKIP LOCKED"),
+        )
+        .expect_err("serialization failure");
+    assert_eq!(err.wire_code(), "40001");
+    assert_eq!(txn.status(), TransactionStatus::Failed);
+    core.execute_sql_in_txn(&ctx(), &mut session, &mut txn, "ROLLBACK")
+        .expect("rollback");
+}
+
+/// 複数句の合成: `NOWAIT` が `SKIP LOCKED` に優先する（保持中は `55P03`）。`SKIP LOCKED` のみなら 0 行。
+#[test]
+fn skip_locked_composition_with_nowait_across_clauses() {
+    let (core, path) = new_core();
+    let _cleanup = CleanupGuard(path);
+    let mut session = SessionState::default();
+    seed(&core, &mut session);
+    let mut holder = hold_writer(&core, &mut session);
+    let join = "SELECT documents.id FROM documents JOIN authors ON documents.author_id = authors.id LIMIT 10";
+    let nowait_wins =
+        format!("{join} FOR UPDATE OF documents NOWAIT FOR SHARE OF authors SKIP LOCKED");
+    assert_eq!(
+        autocommit_in_other_session(&core, &ctx(), &nowait_wins).expect_err("nowait"),
+        "55P03"
+    );
+    let skip = format!("{join} FOR UPDATE OF documents SKIP LOCKED FOR SHARE OF authors");
+    let r = autocommit_in_other_session(&core, &ctx(), &skip).expect("skip");
+    assert!(r.rows.is_empty());
+    core.execute_sql_in_txn(&ctx(), &mut session, &mut holder, "COMMIT")
+        .expect("commit");
+}
+
+/// キュー処理の典型例: 単一ライタ下では、1 台目が保持中の 2 台目は次の行ではなく 0 行を受け取る。
+#[test]
+fn skip_locked_queue_pattern_second_worker_gets_zero_rows() {
+    let (core, path) = new_core();
+    let _cleanup = CleanupGuard(path);
+    let mut session = SessionState::default();
+    seed(&core, &mut session);
+    let pop = "SELECT id FROM documents ORDER BY id LIMIT 1 FOR UPDATE SKIP LOCKED";
+    let mut w1 = core.new_session_transaction();
+    core.execute_sql_in_txn(&ctx(), &mut session, &mut w1, "BEGIN")
+        .expect("begin");
+    let first = query_of(
+        core.execute_sql_in_txn(&ctx(), &mut session, &mut w1, pop)
+            .expect("worker 1"),
+    );
+    assert_eq!(first.rows.len(), 1);
+    let second = autocommit_in_other_session(&core, &ctx(), pop).expect("worker 2");
+    assert!(second.rows.is_empty());
+    core.execute_sql_in_txn(&ctx(), &mut session, &mut w1, "COMMIT")
+        .expect("commit");
+    let second = autocommit_in_other_session(&core, &ctx(), pop).expect("worker 2 retry");
+    assert_eq!(second.rows.len(), 1);
+}
+
+/// テナント境界（SQL-38 (5)・RLS-12）: 保持中の 0 行は、他テナントの行数によらず同一で、
+/// 他テナントの存在・件数のオラクルにならない。
+#[test]
+fn skip_locked_empty_result_does_not_depend_on_tenant_rows() {
+    let (core, path) = new_core();
+    let _cleanup = CleanupGuard(path);
+    let mut session = SessionState::default();
+    seed(&core, &mut session);
+    let other =
+        PolicyContext::with_visibilities("tenant-b", [Visibility::Public, Visibility::Private])
+            .expect("tenant b");
+    let mut holder = hold_writer(&core, &mut session);
+    let sql = format!("{Q_LOCK} FOR UPDATE SKIP LOCKED");
+    let before = autocommit_in_other_session(&core, &ctx(), &sql).expect("skip");
+    core.execute_sql_in_txn(&ctx(), &mut session, &mut holder, "COMMIT")
+        .expect("commit");
+    let mut sb = SessionState::default();
+    for id in 200..205 {
+        core.execute_sql_in_session(
+            &other,
+            &mut sb,
+            &format!(
+                "INSERT INTO documents (id, embedding, title, author_id) VALUES ({id}, '[1.0, 0.0]', 'x', 1) USING OPERATION_ID 'b-{id}'"
+            ),
+        )
+        .expect("tenant-b insert");
+    }
+    let mut holder = hold_writer(&core, &mut session);
+    let after = autocommit_in_other_session(&core, &ctx(), &sql).expect("skip");
+    assert_eq!(format!("{before:?}"), format!("{after:?}"));
+    assert!(after.rows.is_empty());
+    core.execute_sql_in_txn(&ctx(), &mut session, &mut holder, "COMMIT")
+        .expect("commit");
+}
+
+/// READ ONLY Tx の `SKIP LOCKED` は `25006`。
+#[test]
+fn skip_locked_in_read_only_txn_is_25006() {
+    let (core, path) = new_core();
+    let _cleanup = CleanupGuard(path);
+    let mut session = SessionState::default();
+    seed(&core, &mut session);
+    let mut txn = core.new_session_transaction();
+    core.execute_sql_in_txn(&ctx(), &mut session, &mut txn, "BEGIN READ ONLY")
+        .expect("begin");
+    let err = core
+        .execute_sql_in_txn(
+            &ctx(),
+            &mut session,
+            &mut txn,
+            &format!("{Q_LOCK} FOR UPDATE SKIP LOCKED"),
+        )
+        .expect_err("read only");
+    assert_eq!(err.wire_code(), "25006");
+}
 type Attempt = (Result<(), (String, String)>, TransactionStatus);
 
 /// 別セッション（別スレッド）で `BEGIN` → `sql` を実行し、結果と Tx の状態を返す。
