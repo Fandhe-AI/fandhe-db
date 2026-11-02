@@ -5728,16 +5728,26 @@ impl EngineCore {
         // 構文誤りは `42601`、併用違反は `0A000`、`OF` の解決失敗は `42P01`。
         let tokens = Self::normalize_row_count_clauses(tokens)?;
         let (tokens, locking) = crate::sql::row_lock::extract_row_locking(tokens)?;
+        // `SKIP LOCKED` の空結果前の RLS 判定（RLS-13）は、外側の FROM に現れないサブクエリ・CTE 内側の
+        // 表にも掛ける。内側の文は実行時に解決されるため、トークン列の識別子を保守的に集める。
+        let candidates = locking
+            .as_ref()
+            .map(|_| crate::sql::row_lock::candidate_relation_names(&tokens));
         let parsed =
             self.parse_tokens_in_impl(tokens, temp, hits, ledger_mode, resolver, read_snap)?;
         let Some(locking) = locking else {
             return Ok(parsed);
         };
+        let read_tables = candidates.unwrap_or_default();
         match parsed {
             ParsedSql::Statement(statement) => {
                 let locking = crate::sql::row_lock::check_row_locking(&statement, &locking)?;
                 Ok(ParsedSql::LockingSelect(Box::new(
-                    crate::sql::row_lock::LockingSelect { statement, locking },
+                    crate::sql::row_lock::LockingSelect {
+                        statement,
+                        locking,
+                        read_tables,
+                    },
                 )))
             }
             // 読み取り SELECT 以外（`setval`・データ変更 CTE など）に行ロック句は付けられない。

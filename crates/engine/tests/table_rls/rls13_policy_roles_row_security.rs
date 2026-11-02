@@ -516,3 +516,43 @@ fn rls13_skip_locked_rejects_row_security_off_regardless_of_writer_state() {
     }
     ok_txn(&core, &mut holder, &mut ht, "COMMIT");
 }
+
+/// RLS-13・Issue #2231: 外側の FROM に現れずサブクエリ（IN・EXISTS・スカラー）の内側だけで読まれる
+/// RLS 有効表も、`SKIP LOCKED` では writer の保持有無に依らず `row_security = off` で同じ `42501` になる
+/// （保持中だけ 0 行になって writer 状態のオラクルになる経路を作らない）。
+#[test]
+fn rls13_skip_locked_rejects_row_security_off_for_subquery_only_tables() {
+    let (core, _g) = new_core("rls13-skip-locked-subquery");
+    let mut s = SessionState::default();
+    s.allow_ddl();
+    for sql in [
+        "CREATE TABLE t (id BIGINT PRIMARY KEY, name TEXT)",
+        "CREATE TABLE u (id BIGINT PRIMARY KEY, name TEXT)",
+        "ALTER TABLE u ENABLE ROW LEVEL SECURITY",
+        "CREATE POLICY p ON u FOR ALL USING (true) WITH CHECK (true)",
+    ] {
+        ok(&core, "alice", &mut s, sql);
+    }
+    let queries = [
+        "SELECT id FROM t WHERE id IN (SELECT id FROM u) FOR UPDATE SKIP LOCKED",
+        "SELECT id FROM t WHERE EXISTS (SELECT 1 FROM u WHERE u.id = t.id) FOR UPDATE SKIP LOCKED",
+        "SELECT id FROM t WHERE id = (SELECT max(id) FROM u) FOR UPDATE SKIP LOCKED",
+    ];
+    let mut other = SessionState::default();
+    ok(&core, "alice", &mut other, "SET row_security = off");
+
+    // writer が空いている場合。
+    for q in queries {
+        assert_eq!(code(&core, "alice", &mut other, q), "42501", "free: {q}");
+    }
+
+    // 別セッションが writer を保持している場合も同じ拒否になる。
+    let mut holder = SessionState::default();
+    let mut ht = core.new_session_transaction();
+    ok_txn(&core, &mut holder, &mut ht, "BEGIN");
+    ok_txn(&core, &mut holder, &mut ht, "SELECT id FROM t FOR UPDATE");
+    for q in queries {
+        assert_eq!(code(&core, "alice", &mut other, q), "42501", "held: {q}");
+    }
+    ok_txn(&core, &mut holder, &mut ht, "COMMIT");
+}

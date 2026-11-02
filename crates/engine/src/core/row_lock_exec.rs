@@ -139,6 +139,12 @@ impl EngineCore {
             crate::sql::policy_applicability::RowSecurityScope::enter(session.row_security());
         let mut tables = Vec::new();
         super::buffered_body_tables(locking.statement(), &mut tables);
+        // 外側の FROM に現れない表（サブクエリ内側など）はトークン列の識別子候補で補う。
+        for t in locking.read_tables() {
+            if !tables.iter().any(|x| x.eq_ignore_ascii_case(t)) {
+                tables.push(t.clone());
+            }
+        }
         let check =
             |src: &dyn Fn(&str) -> Result<bool, SqlSurfaceError>| -> Result<(), SqlSurfaceError> {
                 for t in &tables {
