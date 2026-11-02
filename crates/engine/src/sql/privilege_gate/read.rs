@@ -41,7 +41,7 @@ pub(crate) const MAX_READ_RELATION_REFS: usize = 256;
 /// 文が要求する読み取り側の権限。
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum ReadRequirement {
-    /// 本ゲートの対象外（DML・COPY・DDL・セッション制御等。DML の権限は #1968、COPY は #1969）。
+    /// 本ゲートの対象外（DML・COPY・DDL・セッション制御等。DML の権限は `write.rs`、COPY は #1969）。
     NotApplicable,
     /// 参照するすべての relation に表単位の SELECT。
     Select,
@@ -81,8 +81,8 @@ pub(crate) fn classify(parsed: &ParsedSql) -> ReadRequirement {
                 NotApplicable
             }
         }
-        // DML の読み取り側（SELECT 元・FROM／USING・サブクエリ）と書き込みの権限は #1968 が本モジュールの
-        // 収集関数を再利用して結線する。COPY は #1969。
+        // DML の読み取り側（SELECT 元・FROM／USING・サブクエリ）と書き込みの権限は `write.rs`（#1968）が
+        // 本モジュールの収集・照会関数を再利用して判定する。COPY は #1969。
         ParsedSql::Insert(_)
         | ParsedSql::InsertSelect(_)
         | ParsedSql::DataModifyingCte(_)
