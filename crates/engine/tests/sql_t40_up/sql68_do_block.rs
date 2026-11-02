@@ -163,8 +163,8 @@ fn body_error_in_explicit_transaction_fails_the_transaction() {
             &mut txn,
             "DO 'BEGIN RAISE EXCEPTION ''x''; END'",
         )
-        .expect_err("raise is unsupported");
-    assert_eq!(e.wire_code(), "0A000");
+        .expect_err("raise exception fails the statement");
+    assert_eq!(e.wire_code(), "P0001");
     let e = core
         .execute_sql_in_txn(&c, &mut ts, &mut txn, "SELECT COUNT(*) FROM t")
         .expect_err("failed transaction");
