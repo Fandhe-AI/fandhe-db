@@ -276,6 +276,10 @@ fn set_role_does_not_change_tenant_boundary_or_ddl_permission() {
     );
     ok(&core, "alice", &mut admin, "CREATE ROLE me");
     ok(&core, "bob", &mut admin, "CREATE ROLE bobs");
+    // 表単位の SELECT 権限ゲート（Issue #1967）の下でも件数比較が意味を持つよう、`me` に付与しておく。
+    let mut granter = allowed_session();
+    granter.bind_role_ids(1, 1);
+    ok(&core, "alice", &mut granter, "GRANT SELECT ON t TO me");
     let mut s = SessionState::default();
     s.bind_role_ids(1, 1);
     let read = |core: &EngineCore, tenant: &str, s: &mut SessionState| match core
