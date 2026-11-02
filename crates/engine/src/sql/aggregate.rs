@@ -2459,6 +2459,9 @@ pub(crate) fn execute_aggregate_with_group_limits(
                 // 全体で共有する。
                 let mut fast_path_text_accumulator_bytes: usize = 0;
                 for &id in snapshot.visible_ids() {
+                    // Issue #1952: 協調的中断の確認点（スナップショット可視行の集約ループ。
+                    // commit 前の読み取り経路）。
+                    crate::interrupt::check()?;
                     for (accumulator, item) in accumulators.iter_mut().zip(&bound.items) {
                         observe_with_budgets(
                             accumulator,
@@ -3428,6 +3431,9 @@ pub(crate) fn observe_candidate_slots(
     // 索引経路と全走査で成否が変わってはならない）。
     let mut distinct_budget = crate::sql::distinct::DistinctBudget::new();
     'candidates: for &slot in slots {
+        // Issue #1952: 協調的中断の確認点（索引候補スロットごと。`with_visible_row` を通らない
+        // 索引経路。中断は `54000` 以外のため呼び出し元で全走査へ退避せずそのまま伝播する）。
+        crate::interrupt::check()?;
         let slot_idx = usize::try_from(slot)
             .map_err(|_| accumulator_bug("candidate slot does not fit in usize"))?;
         // 集計 `id` 値は rowid → 応答境界（従来方式の表の `id` 列値）を明示的に通す

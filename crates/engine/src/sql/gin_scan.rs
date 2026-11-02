@@ -398,6 +398,8 @@ where
     // （索引テーブルから列挙すると、行はあるがマーカーが無いテナントを見落とす）。
     let mut after: Option<String> = None;
     loop {
+        // Issue #1952: 協調的中断の確認点（テナント列挙の 1 ホップごと。commit 前の読み取り経路）。
+        crate::interrupt::check()?;
         let start: Bound<(&str, u64)> = match &after {
             None => Bound::Unbounded,
             Some(t) => Bound::Excluded((t.as_str(), u64::MAX)),
@@ -451,6 +453,8 @@ where
         .range::<(&str, u64)>((start, end))
         .map_err(storage_failure)?
     {
+        // Issue #1952: 協調的中断の確認点（縮退範囲走査の行ごと。commit 前の読み取り経路）。
+        crate::interrupt::check()?;
         let (k, v) = entry.map_err(storage_failure)?;
         let (key_tenant, id) = k.value();
         if visit(key_tenant, id, v.value())? {
@@ -610,6 +614,9 @@ where
         return Ok(false);
     }
     loop {
+        // Issue #1952: 協調的中断の確認点（leapfrog 交差の反復ごと。候補が 1 件も
+        // `with_visible_row` に届かないままポスティングを読み続ける区間を含む。commit 前の読み取り経路）。
+        crate::interrupt::check()?;
         let mut target = 0u64;
         for c in cursors.iter() {
             match c.head {
@@ -659,6 +666,8 @@ where
     }
     let mut last: Option<u64> = None;
     while let Some(Reverse((raw, i))) = heap.pop() {
+        // Issue #1952: 協調的中断の確認点（k-way マージのポップごと。commit 前の読み取り経路）。
+        crate::interrupt::check()?;
         if last != Some(raw) {
             last = Some(raw);
             if visit_row(rows, tenant, raw, visit)? {

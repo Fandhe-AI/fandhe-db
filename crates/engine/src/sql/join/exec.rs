@@ -154,6 +154,8 @@ pub(super) fn run_joins(
     )?;
     let mut order: Vec<u32> = Vec::with_capacity(acc.len());
     for i in 0..acc.len() {
+        // Issue #1952: 協調的中断の確認点（出力順序配列の構築ループ。commit 前の読み取り経路）。
+        crate::interrupt::check()?;
         order.push(to_u32(i, "JOIN row count exceeds limit")?);
     }
     order.sort_by(|&a, &b| {
@@ -169,6 +171,9 @@ pub(super) fn run_joins(
         }
         Ordering::Equal
     });
+    // Issue #1952: ソート本体（比較関数）は `Result` を返せず、途中で全順序を崩すと標準ソートが
+    // panic しうるため中断しない。直後に 1 回確認して、以降の段へ進む前に期限切れを検出する。
+    crate::interrupt::check()?;
     Ok((acc, order))
 }
 
@@ -243,10 +248,12 @@ fn join_step(
     let mut scratch: Vec<crate::sql::expr_program::StackValue> = Vec::new();
     let mut table: HashMap<Vec<u8>, Vec<u32>> = HashMap::new();
     for (idx, row) in new_rows.iter().enumerate() {
+        // Issue #1952: 協調的中断の確認点（ビルド側の行ごと。右のみの ON 残余が無い場合も通る。
+        // commit 前の読み取り経路）。
+        crate::interrupt::check()?;
         let idx_u32 = to_u32(idx, "JOIN build side row count exceeds limit")?;
         // 右のみの ON 残余: 偽の行は一致候補にならない（保存側なら未一致のまま NULL 補完される）。
         if !step.on_new.is_empty() {
-            crate::interrupt::check()?;
             probe.fill(None);
             let slot = probe
                 .get_mut(new_rel)
@@ -430,10 +437,14 @@ pub(super) fn materialize_step(
         }
     };
     for &(ti, ni) in pairs {
+        // Issue #1952: 協調的中断の確認点（一致ペアの実体化。commit 前の読み取り経路）。
+        crate::interrupt::check()?;
         push_tuple(acc.get(ti as usize), Some(ni));
     }
     if step.preserve_acc {
         for (ti, &m) in matched_acc.iter().enumerate() {
+            // Issue #1952: 協調的中断の確認点（NULL 補完行〔保存側 acc〕の実体化）。
+            crate::interrupt::check()?;
             if !m {
                 push_tuple(acc.get(ti), None);
             }
@@ -441,6 +452,8 @@ pub(super) fn materialize_step(
     }
     if step.preserve_new {
         for (ni, &m) in matched_new.iter().enumerate() {
+            // Issue #1952: 協調的中断の確認点（NULL 補完行〔保存側 new〕の実体化）。
+            crate::interrupt::check()?;
             if !m {
                 push_tuple(None, Some(to_u32(ni, "JOIN row count exceeds limit")?));
             }
