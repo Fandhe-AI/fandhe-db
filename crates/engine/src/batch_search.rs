@@ -194,6 +194,14 @@ pub enum BatchSearchError {
     /// とは別に区別する（構造契約違反と可視性違反は異なる原因として wire_code
     /// 設計上も切り分けたいため）。
     PrimaryResultRejected,
+    /// 走査中の協調キャンセルポイント（[`crate::interrupt`]）が文の中断（`57014`。文の期限超過
+    /// 〔Issue #1953〕・クライアント切断〔Issue #1798〕）を検出した。縮退（CPU への切り替え）や
+    /// 結果の部分返却を起こさず、そのまま打ち切る。理由ごとの固定文言のみで、件数・テナント情報を
+    /// 含めない。**BREAKING CHANGE**（Issue #1953）: variant を追加した（網羅的 `match` の下流は
+    /// 追随が必要）。
+    QueryCanceled {
+        reason: crate::interrupt::InterruptReason,
+    },
 }
 
 impl fmt::Display for BatchSearchError {
@@ -254,6 +262,9 @@ impl fmt::Display for BatchSearchError {
                 f,
                 "batch_search: primary backend result violated batch result contract"
             ),
+            BatchSearchError::QueryCanceled { .. } => {
+                write!(f, "batch_search: canceling statement")
+            }
         }
     }
 }
@@ -1346,6 +1357,15 @@ pub(crate) fn run_batch_search<S: BatchRowSource>(
         .map_err(|e| BatchSearchError::AllocationFailed(e.to_string()))?;
     let empty_query_indices: Vec<usize> = Vec::new();
     for row_idx in 0..source.row_count() {
+        // 協調キャンセルポイント（Issue #1953）。到達不能な行（他テナント）も走査コストを払うため、
+        // 行の絞り込みより前に置く。中断時は常駐バッファをプールへ返してから打ち切る。
+        if let Err(reason) = crate::interrupt::check_reason() {
+            row_buffer_pool()
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .release(row_buf);
+            return Err(BatchSearchError::QueryCanceled { reason });
+        }
         let Some(row_tenant) = source.tenant_ids().get(row_idx).map(String::as_str) else {
             continue;
         };
@@ -1789,6 +1809,54 @@ mod tests {
         let vectors = [1.0f32, 0.0, 0.0, 1.0];
         let matrix = ResidentMatrix::build(&ids, &tenants, &visibilities, 2, &vectors).unwrap();
         assert_eq!(matrix.row_count(), 2);
+    }
+
+    // Issue #1953（SQL-71 のポインタ）: 期限切れの文では走査の行ループが `QueryCanceled` で打ち切る。
+    // 部分結果は返さず、期限が無ければ（または十分先なら）通常どおり結果が返る。
+    #[test]
+    fn expired_deadline_cancels_the_scan_loop_without_partial_results() {
+        let ids = [1u64, 2];
+        let tenants = ["tenant-a".to_string(), "tenant-a".to_string()];
+        let visibilities = [Visibility::Public, Visibility::Public];
+        let vectors = [1.0f32, 0.0, 0.0, 1.0];
+        let matrix = ResidentMatrix::build(&ids, &tenants, &visibilities, 2, &vectors).unwrap();
+        let ctx = crate::policy::PolicyContext::new("tenant-a").unwrap();
+        let query = [1.0f32, 0.0];
+        let queries = [BatchQuery {
+            vector: &query,
+            k: 2,
+            ctx: &ctx,
+        }];
+        {
+            let _scope = crate::interrupt::DeadlineScope::install(
+                crate::interrupt::StatementDeadline::at(std::time::Instant::now()),
+            );
+            let err = run_batch_search(&matrix, &queries).unwrap_err();
+            assert_eq!(
+                err,
+                BatchSearchError::QueryCanceled {
+                    reason: crate::interrupt::InterruptReason::StatementTimeout
+                }
+            );
+            assert_eq!(err.to_string(), "batch_search: canceling statement");
+        }
+        {
+            let _scope = crate::interrupt::DeadlineScope::install(
+                crate::interrupt::StatementDeadline::after(
+                    std::time::Instant::now(),
+                    std::time::Duration::from_secs(3600),
+                ),
+            );
+            assert_eq!(
+                run_batch_search(&matrix, &queries).unwrap()[0].hits.len(),
+                2
+            );
+        }
+        // 期限なし。ガードが外れた後に中断が残らない。
+        assert_eq!(
+            run_batch_search(&matrix, &queries).unwrap()[0].hits.len(),
+            2
+        );
     }
 
     // Cursor Bugbot 指摘対応: 容量チェックは `MAX_TENANT_ID_LEN` で予算計上する

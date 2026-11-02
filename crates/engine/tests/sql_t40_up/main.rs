@@ -13,6 +13,8 @@ mod temp_db;
 mod sql1797_early_stop;
 mod sql1798_interrupt;
 mod sql1951_statement_deadline;
+mod sql1953_deadline_vector;
+mod sql1953_deadline_writes;
 mod sql24_expr_lhs_null_between_in;
 mod sql41_bool_literal_where;
 mod sql42_aggregate_arith_projection;

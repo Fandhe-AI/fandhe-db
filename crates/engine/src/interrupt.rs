@@ -12,6 +12,10 @@
 //! - 文単位のデッドライン（#1951。[`DeadlineScope`]・[`StatementDeadline`]）は同じ [`check`] に
 //!   時刻比較を足して実現し、並行する第 2 の仕組みは作らない。poll スタックとは別の
 //!   thread-local スロットに持つ（`deadline.rs` の `//!` 参照）。導入は wire-server（#1954）が行う。
+//! - #1953 で書き込み（INSERT／UPDATE／DELETE／UPSERT／TRUNCATE）・COPY・ベクトル検索（arena
+//!   走査・DISTANCE 段）・GPU バッチの確認点と、書き込みロック待ちの期限内計上
+//!   （[`effective_lock_wait`]・[`lock_wait_error`]）を足した。分割実行 DML は [`suppressed`] を
+//!   維持しつつ、期限だけ注入時計で明示評価する（`tenant/partitioned_dml.rs`）。
 //!
 //! 安全性: 中断は commit 前の `Err` としてしか起きない（確認点を commit 処理・台帳・成功境界
 //! より後ろに置かない）。このため autocommit は副作用ゼロ、明示トランザクションは `Failed`
@@ -21,6 +25,7 @@
 mod deadline;
 
 pub use deadline::{current_deadline, DeadlineGuard, DeadlineScope, StatementDeadline};
+pub(crate) use deadline::{effective_lock_wait, is_expired_now, lock_wait_error};
 
 use std::cell::{Cell, RefCell};
 use std::marker::PhantomData;
@@ -141,12 +146,20 @@ impl InterruptScope {
 ///
 /// 呼び出し元は #1797 の早期中断と同じ行ループ（commit 前の読み取り経路）に限る。
 pub(crate) fn check() -> Result<(), crate::sql::allowlist::SqlSurfaceError> {
+    check_reason()
+        .map_err(|reason| crate::sql::allowlist::SqlSurfaceError::QueryCanceled { reason })
+}
+
+/// [`check`] の理由だけを返す版。`SqlSurfaceError` を持たない層（`ArenaError`・
+/// `BatchSearchError` など。#1953）が自分のエラー型へ写すための確認点で、判定は [`check`] と
+/// 同一（ビット同一の挙動）。
+pub(crate) fn check_reason() -> Result<(), InterruptReason> {
     if SUPPRESSED.with(Cell::get) > 0 {
         return Ok(());
     }
     // デッドラインは poll スタックと独立に評価する（無効時は時計を読まない）。
     if let Some(reason) = deadline::poll() {
-        return Err(crate::sql::allowlist::SqlSurfaceError::QueryCanceled { reason });
+        return Err(reason);
     }
     let fired = STACK.with(|s| {
         // 再入（`poll` 内からの `check`）は借用失敗として無視する。
@@ -167,7 +180,7 @@ pub(crate) fn check() -> Result<(), crate::sql::allowlist::SqlSurfaceError> {
         reason
     });
     match fired {
-        Some(reason) => Err(crate::sql::allowlist::SqlSurfaceError::QueryCanceled { reason }),
+        Some(reason) => Err(reason),
         None => Ok(()),
     }
 }

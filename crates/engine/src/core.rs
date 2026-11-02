@@ -14310,6 +14310,10 @@ impl EngineCore {
         if batch.temp.is_some() {
             return Err(crate::sql::temp_catalog::temp_table_unsupported());
         }
+        // Issue #1953（SQL-71）: COPY 開始時の期限を commit 経路（INSERT 行ループ・writer 待ち）へ
+        // 効かせる。既にスレッドに期限があれば厳しい方が勝つ（緩めない）。writer 取得の前に確認する。
+        let _deadline_scope = crate::interrupt::DeadlineScope::install(batch.deadline);
+        batch.deadline.check()?;
         // 出口で SCHEMA 配下の relation の内部キー（`#<id>.<name>`）を表示名へ戻す
         // （COPY 開始後に別接続が表を削除した場合の `UndefinedTable` 等。ADR D2・Issue #1717）。
         self.commit_copy_in_with_target(
@@ -14358,9 +14362,11 @@ impl EngineCore {
                     batch.operation_id.as_ref().map(|id| id.as_str()),
                 )?;
                 let table = batch.table.clone();
+                // Issue #1953（SQL-71）: COPY 開始時の期限を writer 取得と行ループへ効かせる。
+                let _deadline_scope = crate::interrupt::DeadlineScope::install(batch.deadline);
                 // writer は COPY の確定処理（CopyDone 後）で初めて取得する（Issue #2400。データ受信中は
-                // 持たない）。取得失敗（`55P03`）も下の `Err` 腕で `fail()` を通す。
-                let result = match txn.ensure_writer(ctx) {
+                // 持たない）。取得失敗（`55P03`。期限が先なら `57014`）も下の `Err` 腕で `fail()` を通す。
+                let result = match batch.deadline.check().and_then(|()| txn.ensure_writer(ctx)) {
                     Err(e) => Err(e),
                     Ok(()) => match txn.write_txn() {
                         Some(write_txn) => self.commit_copy_in_with_target(
@@ -14404,6 +14410,8 @@ impl EngineCore {
             temp: _,
             row_security,
             privilege_recheck,
+            // 期限は公開入口が `DeadlineScope` へ入れ済み。
+            deadline: _,
         } = batch;
         // RLS-13・Issue #2278: COPY 開始時の `row_security` を検査点の直前に復元する。公開入口
         // （`commit_copy_in`／`commit_copy_in_txn`）は呼び出し側のスコープ外で呼ばれうるため、

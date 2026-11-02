@@ -375,7 +375,7 @@ pub(crate) fn map_role_error(e: CatalogError, role_name: &str) -> SqlSurfaceErro
         }
         CatalogError::Invalid(_) => SqlSurfaceError::invalid_input("invalid role definition"),
         CatalogError::ViewLimitExceeded(_) => SqlSurfaceError::payload_too_large("too many roles"),
-        CatalogError::WriteLockTimeout => SqlSurfaceError::LockNotAvailable,
+        CatalogError::WriteLockTimeout => crate::interrupt::lock_wait_error(),
         _ => SqlSurfaceError::Internal {
             detail: "role catalog operation failed".to_string(),
         },

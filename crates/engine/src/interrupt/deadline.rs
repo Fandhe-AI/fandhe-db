@@ -59,9 +59,18 @@ impl StatementDeadline {
     }
 
     /// `now` からの残り時間。無効は `None`、期限後は `Some(ZERO)`。書き込みロック待ちを期限内に
-    /// 数える結線（#1953）が使う。
+    /// 数える結線（#1953。[`effective_lock_wait`]）が使う。
     pub fn remaining_at(&self, now: Instant) -> Option<Duration> {
         self.0.map(|at| at.saturating_duration_since(now))
+    }
+
+    /// 現在時刻からの残り時間。無効なら時計を読まず `None`。
+    fn remaining_at_now(&self) -> Option<Duration> {
+        if self.0.is_some() {
+            self.remaining_at(clock_now())
+        } else {
+            None
+        }
     }
 
     /// 即時に時計を読んで判定する（文境界などの粗い確認点用）。無効なら時計を読まない。
@@ -153,6 +162,37 @@ impl DeadlineScope {
 /// 現在のスレッドの実効期限（無効なら [`StatementDeadline::disabled`]）。
 pub fn current_deadline() -> StatementDeadline {
     StatementDeadline(DEADLINE.with(Cell::get).at)
+}
+
+/// 書き込みロック（writer gate）の実効待機時間（#1953。SQL-71 (3) のポインタ）。期限が無効なら
+/// 時計を読まず `configured` をそのまま返し、有効なら `min(configured, 残り時間)` にする。
+/// 待機時間を減らす方向にしか働かないため、`write_lock_wait` の上限は緩まない。`Duration::ZERO`
+/// （NOWAIT）は常に `ZERO` のまま。storage の writer 取得点から呼ばれる。
+pub(crate) fn effective_lock_wait(configured: Duration) -> Duration {
+    let current = current_deadline();
+    match current.remaining_at_now() {
+        Some(remaining) => configured.min(remaining),
+        None => configured,
+    }
+}
+
+/// 現在のスレッドの期限が既に切れているか（無効なら時計を読まず `false`）。
+pub(crate) fn is_expired_now() -> bool {
+    let current = current_deadline();
+    current.is_enabled() && current.is_expired_at(clock_now())
+}
+
+/// writer gate 待ちの失敗（`55P03` 相当）を表層エラーへ写す共通点。待機中に文の期限が来て
+/// いたなら `57014`（StatementTimeout）、そうでなければ `55P03`（`LockNotAvailable`）を返す。
+/// エラー文言は固定で、件数・テナント・期限値を含めない。
+pub(crate) fn lock_wait_error() -> SqlSurfaceError {
+    if is_expired_now() {
+        SqlSurfaceError::QueryCanceled {
+            reason: InterruptReason::StatementTimeout,
+        }
+    } else {
+        SqlSurfaceError::LockNotAvailable
+    }
 }
 
 /// `interrupt::check()` から呼ばれる確認点本体。無効時のコストは thread-local の読み出しと
@@ -335,5 +375,55 @@ mod tests {
         let _g = DeadlineScope::install(past());
         assert!(suppressed(|| check().is_ok()));
         assert!(check().is_err());
+    }
+
+    #[test]
+    fn lock_wait_helpers() {
+        // 無効: 時計を読まず configured のまま、写像は 55P03。
+        let before = clock_reads();
+        assert_eq!(
+            effective_lock_wait(Duration::from_secs(30)),
+            Duration::from_secs(30)
+        );
+        assert!(!is_expired_now());
+        assert_eq!(clock_reads(), before);
+        assert!(matches!(
+            lock_wait_error(),
+            SqlSurfaceError::LockNotAvailable
+        ));
+        // 有効（十分先）: min は configured 側。NOWAIT は ZERO のまま。
+        {
+            let _g = DeadlineScope::install(StatementDeadline::after(Instant::now(), HOUR));
+            assert_eq!(
+                effective_lock_wait(Duration::from_secs(30)),
+                Duration::from_secs(30)
+            );
+            assert_eq!(effective_lock_wait(Duration::ZERO), Duration::ZERO);
+            assert!(matches!(
+                lock_wait_error(),
+                SqlSurfaceError::LockNotAvailable
+            ));
+        }
+        // 有効（残りが configured より短い）: 残り側。
+        {
+            let _g = DeadlineScope::install(StatementDeadline::after(
+                Instant::now(),
+                Duration::from_secs(5),
+            ));
+            let w = effective_lock_wait(Duration::from_secs(30));
+            assert!(w <= Duration::from_secs(5));
+        }
+        // 期限切れ: ZERO で 57014。
+        {
+            let _g = DeadlineScope::install(past());
+            assert_eq!(effective_lock_wait(Duration::from_secs(30)), Duration::ZERO);
+            assert!(is_expired_now());
+            assert!(matches!(
+                lock_wait_error(),
+                SqlSurfaceError::QueryCanceled {
+                    reason: InterruptReason::StatementTimeout
+                }
+            ));
+        }
     }
 }

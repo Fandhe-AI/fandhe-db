@@ -525,6 +525,8 @@ pub enum TenantWriteError {
     SequenceEvaluationFailed(SqlSurfaceError),
     /// ROW／STATEMENT トリガの発火が失敗した（TABLE-45・Issue #1723・#1726）。未結線の経路・`WHEN` 付きの
     /// 拒否（`0A000`）、返却行の構造違い（`42804`）、割り込み（`57014`）、トリガ関数が返したエラーを
+    /// （Issue #1953 以降は書き込み行ループの期限・割り込み確認と、writer 待ち中の期限切れ `57014` も
+    /// この透過キャリアで運ぶ。[`check_interrupt`]）
     /// 内側の [`SqlSurfaceError`] のまま保持する（[`TenantWriteError::SequenceEvaluationFailed`] と同じ透過）。
     /// 値・行・トリガ名・テナントは含めない。write トランザクションは commit せず破棄する。
     /// **BREAKING CHANGE**（Issue #1723）: variant を追加した（本 enum は `#[non_exhaustive]`
@@ -559,6 +561,16 @@ pub enum TenantWriteError {
     WriteLockTimeout,
 }
 
+/// 書き込み行ループの協調キャンセルポイント（Issue #1953。SQL-71・SQL-32 のポインタ）。
+/// `interrupt::check` の `57014` を `TriggerFailed` の透過経路で運ぶ（`TenantWriteError` に
+/// variant を足さず公開 API を保つ。`sql::exec` の写像が `TriggerFailed(inner) => inner` で
+/// そのまま `SqlSurfaceError::QueryCanceled` に戻す）。commit 前の `Err` としてしか使わない
+/// （autocommit は write txn 破棄で副作用ゼロ、明示 Tx は Failed）。分割実行の `suppressed` 区間
+/// では no-op（期限は `tenant::partitioned_dml` が注入時計で明示評価する）。
+pub(crate) fn check_interrupt() -> Result<(), TenantWriteError> {
+    crate::interrupt::check().map_err(TenantWriteError::TriggerFailed)
+}
+
 /// [`Storage::begin_write_txn`]（choke point。SQL-31・TASK-221 の単一ライタ占有に
 /// より `55P03` を返しうる）が返す `StorageError` を `TenantWriteError` へ写像する。
 /// `TenantWriteError::from(StorageError)` は汎用の `Storage(e)` へ包むだけで
@@ -567,7 +579,15 @@ pub enum TenantWriteError {
 fn convert_write_txn_err(e: StorageError) -> TenantWriteError {
     match e {
         StorageError::WriteLockTimeout | StorageError::WriteTxnHeldByCurrentSession => {
-            TenantWriteError::WriteLockTimeout
+            // 待機中に文の期限が来ていたなら `55P03` ではなく `57014`（Issue #1953。SQL-71 (3)）。
+            // `TriggerFailed` は `SqlSurfaceError` を透過して運ぶキャリアとして使う。
+            if crate::interrupt::is_expired_now() {
+                TenantWriteError::TriggerFailed(SqlSurfaceError::QueryCanceled {
+                    reason: crate::interrupt::InterruptReason::StatementTimeout,
+                })
+            } else {
+                TenantWriteError::WriteLockTimeout
+            }
         }
         other => TenantWriteError::Storage(other),
     }
@@ -2811,6 +2831,7 @@ pub(crate) fn insert_typed_rows_unchecked(
                 .open_table(user_rows_table_def(&row_table_name))
                 .map_err(map_row_table_error)?;
             for (row_idx, (_, orig_values)) in rows.iter().enumerate() {
+                check_interrupt()?;
                 let values: &[crate::row_codec::Value] = match &sequence_rows {
                     Some(owned) => owned
                         .get(row_idx)
@@ -3521,6 +3542,7 @@ fn upsert_typed_rows_impl(
             // 積む（新規挿入行は「更新」ではないため対象外）。
             let mut pre_images = crate::constraint::UpdatedKeyPreImages::new();
             for (row_idx, (id, values)) in rows.iter().enumerate() {
+                check_interrupt()?;
                 // 新規挿入分岐が使う行 id（採番方式の表は払い出し済みの rowid）。
                 let insert_id: u64 = match &new_row_ids {
                     Some(ids) => ids.get(row_idx).map(|r| r.legacy_id()).ok_or_else(|| {
@@ -6445,6 +6467,9 @@ fn enumerate_dml_candidates_with<E, T>(
         .map_err(|e| dml_write_err(CatalogError::from(e)))?
     {
         let (k, v) = entry.map_err(|e| dml_write_err(CatalogError::from(e)))?;
+        // 協調キャンセルポイント（Issue #1953）。所有・可視・ポリシーで落ちる行も走査コストを払うため、
+        // 述語評価より前の反復先頭に置く。
+        check_interrupt().map_err(dml_write_err)?;
         let (key_tenant, id) = k.value();
         if key_tenant != tenant {
             // 閉区間により理論上到達しないが、defense-in-depth として維持する
@@ -7407,6 +7432,7 @@ fn apply_predicate_delete_in_txn<E>(
             .open_table(user_rows_table_def(&row_table_name))
             .map_err(|e| dml_write_err(map_row_table_error(e)))?;
         for id in candidate_ids {
+            check_interrupt().map_err(dml_write_err)?;
             // 分割実行の writer 保持時間打ち切り（1 件以上適用した後のみ判定。
             // 原子経路は `None` を渡すため常に全件適用する）。
             if applied > 0 && should_stop.as_mut().is_some_and(|f| f()) {
@@ -7539,6 +7565,7 @@ fn apply_predicate_update_in_txn<E>(
             .open_table(user_rows_table_def(&row_table_name))
             .map_err(|e| dml_write_err(map_row_table_error(e)))?;
         for (pos, id) in candidate_ids.iter().enumerate() {
+            check_interrupt().map_err(dml_write_err)?;
             // 分割実行の writer 保持時間打ち切り（1 件以上適用した後のみ判定。
             // 原子経路は `None` を渡すため常に全件適用する）。
             if applied > 0 && should_stop.as_mut().is_some_and(|f| f()) {
@@ -7743,6 +7770,8 @@ pub(crate) fn truncate_tables_unchecked(
     target
         .with_txn_post_commit(
             |write_txn| {
+                // 協調キャンセルポイント（Issue #1953）。台帳記録・行削除より前に置く。
+                check_interrupt()?;
                 let tenant = ctx.tenant_id();
                 // パス 0: 対象集合の確定。RESTRICT の判定・CASCADE の連鎖はカタログの FK 宣言だけで
                 // 行い（行ストアは読まない）、行を消す前に済ませる（拒否時は何も書かれない）。
@@ -7867,6 +7896,7 @@ pub(crate) fn truncate_tables_unchecked(
                 // 親子を同じ文で指定した場合に、パス 2 の FK 判定が「同じ文で消える子の行」を
                 // 見て誤って `23503` にしないため（子のキー索引も先に空になる）。
                 for (table, schema) in all_tables.iter().zip(&schemas) {
+                    check_interrupt()?;
                     let row_table_name = user_rows_table_name(table);
                     let mut row_table = write_txn
                         .open_table(user_rows_table_def(&row_table_name))
@@ -7898,6 +7928,7 @@ pub(crate) fn truncate_tables_unchecked(
                 // 自テナントの参照元行が（同じ文の対象外の表に）残れば `23503`。他テナントの行は
                 // 走査も削除もしない。`Truncated` は参照アクション（Issue #1076）を発火させない。
                 for (table, schema) in all_tables.iter().zip(&schemas) {
+                    check_interrupt()?;
                     crate::constraint::enforce_referencing_rows_in_txn(
                         write_txn,
                         table,
@@ -8152,6 +8183,8 @@ pub(crate) fn replace_typed_rows_by_text_key(
                     .map_err(CatalogError::from)?;
                 for entry in &mut iter {
                     let (k, v) = entry.map_err(CatalogError::from)?;
+                    // 協調キャンセルポイント（Issue #1953）。
+                    check_interrupt()?;
                     let (_key_tenant, id) = k.value();
                     let raw = v.value();
                     scanned_count = scanned_count.saturating_add(1);
