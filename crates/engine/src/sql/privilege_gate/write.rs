@@ -17,7 +17,7 @@
 //! - 判別できない式（SET 右辺の式・ON CONFLICT 句）は SELECT を要求する側（厳しい側）に倒す。
 //! - ビューへの DML はビュー自身の権限だけを判定する（基底表はビュー所有者の権限で書く扱い）。
 //! - `SHOW`／`CANCEL PARTITIONED DML` はジョブ表だけを触り利用者の行に触れないので対象外。一時表だけを
-//!   対象にする文はセッションの所有物なので対象外。`COPY` は #1969、`LOCK` は対象外。
+//!   対象にする文はセッションの所有物なので対象外。`COPY` は `copy.rs`（#1969）、`LOCK` は対象外。
 //! - エラーは固定文言の `42501`。表名・ロール ID・テナントを含めない。
 
 use crate::catalog::privilege::{
@@ -212,7 +212,7 @@ pub(crate) fn classify_write(parsed: &ParsedSql) -> WriteRequirement {
                 na()
             }
         }
-        // 読み取り・カーソル・行ロック（read ゲートが担う）。COPY は #1969、LOCK TABLE は対象外。
+        // 読み取り・カーソル・行ロック（read ゲートが担う）。COPY は `copy.rs`（#1969。begin_copy* が直接呼ぶ）、LOCK TABLE は対象外。
         ParsedSql::Statement(_)
         | ParsedSql::LockingSelect(_)
         | ParsedSql::Cursor(_)
@@ -390,6 +390,39 @@ fn self_read_targets(req: &WriteRequirement, tokens: &[Token]) -> Vec<String> {
         }
     }
     out
+}
+
+/// 表名を直接受け取る入口（HTTP 表層の bound 書き込み API。Issue #1969）用。`table` は解決済みの relation
+/// キーで、`required_bits` は SQL 表層の同等の文と同じ関数（[`partitioned_update_bits`] 等）が決めた値。
+/// 現在ロール未束縛・運用者権限のセッションは何もしない。権限不足は固定文言の `42501`。
+pub(crate) fn require_table_write(
+    storage: &Storage,
+    tenant: &str,
+    session: &SessionState,
+    table: &str,
+    required_bits: u16,
+) -> Result<(), SqlSurfaceError> {
+    let principal = Principal::from_session(session);
+    if !principal.needs_acl_lookup() {
+        return check(
+            &principal,
+            PrivilegeTarget::Relation {
+                required_bits,
+                granted_bits: 0,
+            },
+        )
+        .map(|_| ());
+    }
+    // 呼び出し元が名前解決（`42P01`）を済ませた表なので、照会で見つからなければ解決後に DROP された
+    // ものとして拒否する（fail-closed。DML の書き込み先と同じ規則）。
+    require_relations_bits(
+        storage,
+        tenant,
+        &principal,
+        &[(table.to_string(), required_bits)],
+        None,
+        &[table.to_string()],
+    )
 }
 
 /// 書き込み txn の内側で権限を再判定するための値（分割実行 DML のチャンクごとの再検査と、TRUNCATE の

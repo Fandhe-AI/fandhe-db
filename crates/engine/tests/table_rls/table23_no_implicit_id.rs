@@ -1217,7 +1217,12 @@ fn checked_single_row_delete_rejects_before_touching_an_allocated_table() {
             operation_id: None,
         };
         let err = core
-            .execute_bound_delete_checked_in_session(&alice, &bound, reject)
+            .execute_bound_delete_checked_in_session(
+                &alice,
+                &engine::sql::mode::SessionState::default(),
+                &bound,
+                reject,
+            )
             .expect_err("allocated table is rejected");
         assert_eq!(err.wire_code(), "0A000");
     }
@@ -1230,7 +1235,12 @@ fn checked_single_row_delete_rejects_before_touching_an_allocated_table() {
         operation_id: None,
     };
     let err = core
-        .execute_bound_delete_checked_in_session(&alice, &missing, reject)
+        .execute_bound_delete_checked_in_session(
+            &alice,
+            &engine::sql::mode::SessionState::default(),
+            &missing,
+            reject,
+        )
         .expect_err("undefined table");
     assert_eq!(err.wire_code(), "42P01");
 }

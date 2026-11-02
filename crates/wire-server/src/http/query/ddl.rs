@@ -121,7 +121,6 @@ use engine::sql::allowlist::{
     validate_drop_table_tokens, SqlSurfaceError,
 };
 use engine::sql::lexer::{tokenize, Keyword, Token};
-use engine::sql::mode::SessionState;
 
 use crate::http::response as http_response;
 use crate::http::session::middleware::SessionPrincipal;
@@ -883,10 +882,7 @@ fn run_ddl(
             "temporary tables are not available on this surface",
         ));
     }
-    let mut session = SessionState::default();
-    if principal.ddl_allowed() {
-        session.allow_ddl();
-    }
+    let mut session = principal.session_state();
     core.execute_parsed_in_session(principal.policy_context(), &mut session, &parsed)?;
     Ok(())
 }

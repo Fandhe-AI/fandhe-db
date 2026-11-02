@@ -84,12 +84,18 @@ fn execute_bound_predicate_update_in_session_updates_matching_rows() {
 
     let operation_id = op("pred-update-1");
     let outcome = core
-        .execute_bound_predicate_update_in_session(&owner, TABLE, Some(&operation_id), |_schema| {
-            Ok((
-                vec![("lang".to_string(), InsertLiteral::String("fr".to_string()))],
-                lang_eq("ja"),
-            ))
-        })
+        .execute_bound_predicate_update_in_session(
+            &owner,
+            &engine::sql::mode::SessionState::default(),
+            TABLE,
+            Some(&operation_id),
+            |_schema| {
+                Ok((
+                    vec![("lang".to_string(), InsertLiteral::String("fr".to_string()))],
+                    lang_eq("ja"),
+                ))
+            },
+        )
         .expect("predicate update should succeed");
     assert_eq!(outcome.rows_affected, 2);
 }
@@ -100,9 +106,15 @@ fn execute_bound_predicate_update_in_session_requires_operation_id_before_schema
     let owner = ctx(TENANT_A, [Visibility::Private]);
 
     let err = core
-        .execute_bound_predicate_update_in_session(&owner, "missing_table", None, |_schema| {
-            panic!("bind closure must not run before the operation_id gate");
-        })
+        .execute_bound_predicate_update_in_session(
+            &owner,
+            &engine::sql::mode::SessionState::default(),
+            "missing_table",
+            None,
+            |_schema| {
+                panic!("bind closure must not run before the operation_id gate");
+            },
+        )
         .expect_err("missing operation_id must be rejected");
     assert!(matches!(err, SqlSurfaceError::MissingOperationId));
 }
@@ -116,6 +128,7 @@ fn execute_bound_predicate_update_in_session_rejects_undefined_table_with_42p01(
     let err = core
         .execute_bound_predicate_update_in_session(
             &owner,
+            &engine::sql::mode::SessionState::default(),
             "missing_table",
             Some(&operation_id),
             |_schema| panic!("bind closure must not run for an undefined table"),
@@ -132,12 +145,18 @@ fn execute_bound_predicate_update_in_session_rejects_empty_predicate_list_with_4
     let operation_id = op("pred-update-empty");
 
     let err = core
-        .execute_bound_predicate_update_in_session(&owner, TABLE, Some(&operation_id), |_schema| {
-            Ok((
-                vec![("lang".to_string(), InsertLiteral::String("fr".to_string()))],
-                Vec::new(),
-            ))
-        })
+        .execute_bound_predicate_update_in_session(
+            &owner,
+            &engine::sql::mode::SessionState::default(),
+            TABLE,
+            Some(&operation_id),
+            |_schema| {
+                Ok((
+                    vec![("lang".to_string(), InsertLiteral::String("fr".to_string()))],
+                    Vec::new(),
+                ))
+            },
+        )
         .expect_err("empty predicate list must be rejected");
     assert!(matches!(err, SqlSurfaceError::UnsupportedSyntax { .. }));
 }
@@ -154,14 +173,20 @@ fn execute_bound_predicate_update_in_session_rejects_predicate_call_form() {
     let operation_id = op("pred-update-call");
 
     let err = core
-        .execute_bound_predicate_update_in_session(&owner, TABLE, Some(&operation_id), |_schema| {
-            Ok((
-                vec![("lang".to_string(), InsertLiteral::String("fr".to_string()))],
-                vec![WherePredicate::PredicateCall {
-                    name: "visible".to_string(),
-                }],
-            ))
-        })
+        .execute_bound_predicate_update_in_session(
+            &owner,
+            &engine::sql::mode::SessionState::default(),
+            TABLE,
+            Some(&operation_id),
+            |_schema| {
+                Ok((
+                    vec![("lang".to_string(), InsertLiteral::String("fr".to_string()))],
+                    vec![WherePredicate::PredicateCall {
+                        name: "visible".to_string(),
+                    }],
+                ))
+            },
+        )
         .expect_err("PredicateCall form must be rejected");
     assert!(matches!(err, SqlSurfaceError::UnsupportedSyntax { .. }));
 }
@@ -183,12 +208,18 @@ fn execute_bound_predicate_update_in_session_matches_sql_ledger_key_space_for_re
     // 同一 `operation_id`・同一内容で NoSQL 経路から再送すると `23505`。
     let operation_id = op("pred-parity-1");
     let err = core
-        .execute_bound_predicate_update_in_session(&owner, TABLE, Some(&operation_id), |_schema| {
-            Ok((
-                vec![("lang".to_string(), InsertLiteral::String("fr".to_string()))],
-                lang_eq("ja"),
-            ))
-        })
+        .execute_bound_predicate_update_in_session(
+            &owner,
+            &engine::sql::mode::SessionState::default(),
+            TABLE,
+            Some(&operation_id),
+            |_schema| {
+                Ok((
+                    vec![("lang".to_string(), InsertLiteral::String("fr".to_string()))],
+                    lang_eq("ja"),
+                ))
+            },
+        )
         .expect_err("same-content resend must be a duplicate");
     assert!(matches!(err, SqlSurfaceError::DuplicateOperationId));
 }
@@ -209,12 +240,18 @@ fn execute_bound_predicate_update_in_session_matches_sql_ledger_key_space_for_co
     // 同一 `operation_id` だが SET 値が異なる ⇒ `22023`。
     let operation_id = op("pred-mismatch-1");
     let err = core
-        .execute_bound_predicate_update_in_session(&owner, TABLE, Some(&operation_id), |_schema| {
-            Ok((
-                vec![("lang".to_string(), InsertLiteral::String("de".to_string()))],
-                lang_eq("ja"),
-            ))
-        })
+        .execute_bound_predicate_update_in_session(
+            &owner,
+            &engine::sql::mode::SessionState::default(),
+            TABLE,
+            Some(&operation_id),
+            |_schema| {
+                Ok((
+                    vec![("lang".to_string(), InsertLiteral::String("de".to_string()))],
+                    lang_eq("ja"),
+                ))
+            },
+        )
         .expect_err("different-content resend must be a content mismatch");
     assert!(matches!(err, SqlSurfaceError::OperationIdContentMismatch));
 }
@@ -229,12 +266,18 @@ fn execute_bound_predicate_update_in_session_does_not_affect_other_tenant_rows()
 
     let operation_id = op("pred-update-isolation");
     let outcome = core
-        .execute_bound_predicate_update_in_session(&owner, TABLE, Some(&operation_id), |_schema| {
-            Ok((
-                vec![("lang".to_string(), InsertLiteral::String("fr".to_string()))],
-                lang_eq("ja"),
-            ))
-        })
+        .execute_bound_predicate_update_in_session(
+            &owner,
+            &engine::sql::mode::SessionState::default(),
+            TABLE,
+            Some(&operation_id),
+            |_schema| {
+                Ok((
+                    vec![("lang".to_string(), InsertLiteral::String("fr".to_string()))],
+                    lang_eq("ja"),
+                ))
+            },
+        )
         .expect("predicate update should succeed");
     // tenant-a の可視行は 1 件のみ（tenant-b の行は数えない・変更しない）。
     assert_eq!(outcome.rows_affected, 1);
@@ -254,9 +297,13 @@ fn execute_bound_predicate_delete_in_session_deletes_matching_rows() {
 
     let operation_id = op("pred-delete-1");
     let outcome = core
-        .execute_bound_predicate_delete_in_session(&owner, TABLE, Some(&operation_id), |_schema| {
-            Ok(lang_eq("ja"))
-        })
+        .execute_bound_predicate_delete_in_session(
+            &owner,
+            &engine::sql::mode::SessionState::default(),
+            TABLE,
+            Some(&operation_id),
+            |_schema| Ok(lang_eq("ja")),
+        )
         .expect("predicate delete should succeed");
     assert_eq!(outcome.rows_affected, 2);
 }
@@ -267,9 +314,15 @@ fn execute_bound_predicate_delete_in_session_requires_operation_id() {
     let owner = ctx(TENANT_A, [Visibility::Private]);
 
     let err = core
-        .execute_bound_predicate_delete_in_session(&owner, "missing_table", None, |_schema| {
-            panic!("bind closure must not run before the operation_id gate");
-        })
+        .execute_bound_predicate_delete_in_session(
+            &owner,
+            &engine::sql::mode::SessionState::default(),
+            "missing_table",
+            None,
+            |_schema| {
+                panic!("bind closure must not run before the operation_id gate");
+            },
+        )
         .expect_err("missing operation_id must be rejected");
     assert!(matches!(err, SqlSurfaceError::MissingOperationId));
 }
@@ -282,9 +335,13 @@ fn execute_bound_predicate_delete_in_session_rejects_empty_predicate_list_with_4
     let operation_id = op("pred-delete-empty");
 
     let err = core
-        .execute_bound_predicate_delete_in_session(&owner, TABLE, Some(&operation_id), |_schema| {
-            Ok(Vec::new())
-        })
+        .execute_bound_predicate_delete_in_session(
+            &owner,
+            &engine::sql::mode::SessionState::default(),
+            TABLE,
+            Some(&operation_id),
+            |_schema| Ok(Vec::new()),
+        )
         .expect_err("empty predicate list must be rejected");
     assert!(matches!(err, SqlSurfaceError::UnsupportedSyntax { .. }));
 }
@@ -304,9 +361,13 @@ fn execute_bound_predicate_delete_in_session_matches_sql_ledger_key_space_for_re
 
     let operation_id = op("pred-delete-parity-1");
     let err = core
-        .execute_bound_predicate_delete_in_session(&owner, TABLE, Some(&operation_id), |_schema| {
-            Ok(lang_eq("ja"))
-        })
+        .execute_bound_predicate_delete_in_session(
+            &owner,
+            &engine::sql::mode::SessionState::default(),
+            TABLE,
+            Some(&operation_id),
+            |_schema| Ok(lang_eq("ja")),
+        )
         .expect_err("same-content resend must be a duplicate");
     assert!(matches!(err, SqlSurfaceError::DuplicateOperationId));
 }
@@ -321,9 +382,13 @@ fn execute_bound_predicate_delete_in_session_does_not_affect_other_tenant_rows()
 
     let operation_id = op("pred-delete-isolation");
     let outcome = core
-        .execute_bound_predicate_delete_in_session(&owner, TABLE, Some(&operation_id), |_schema| {
-            Ok(lang_eq("ja"))
-        })
+        .execute_bound_predicate_delete_in_session(
+            &owner,
+            &engine::sql::mode::SessionState::default(),
+            TABLE,
+            Some(&operation_id),
+            |_schema| Ok(lang_eq("ja")),
+        )
         .expect("predicate delete should succeed");
     assert_eq!(outcome.rows_affected, 1);
 }
@@ -387,6 +452,7 @@ fn execute_bound_predicate_update_in_session_accepts_numeric_eq_literal_text_mat
     let outcome = core
         .execute_bound_predicate_update_in_session(
             &owner,
+            &engine::sql::mode::SessionState::default(),
             "amounts",
             Some(&operation_id),
             |_schema| {
@@ -423,6 +489,7 @@ fn execute_bound_predicate_delete_in_session_accepts_or_and_in_forms() {
     let outcome = core
         .execute_bound_predicate_delete_in_session(
             &owner,
+            &engine::sql::mode::SessionState::default(),
             TABLE,
             Some(&op("pred-delete-or")),
             |_schema| Ok(vec![WherePredicate::Or(vec![lang_eq("ja"), lang_eq("en")])]),
@@ -434,6 +501,7 @@ fn execute_bound_predicate_delete_in_session_accepts_or_and_in_forms() {
     let outcome = core
         .execute_bound_predicate_delete_in_session(
             &owner,
+            &engine::sql::mode::SessionState::default(),
             TABLE,
             Some(&op("pred-delete-in")),
             |_schema| {

@@ -77,7 +77,6 @@ use engine::catalog::TableSchema;
 use engine::core::EngineCore;
 use engine::error_format::{ClassifiedError, ErrorClass};
 use engine::sql::allowlist::{self, SqlSurfaceError};
-use engine::sql::mode::SessionState;
 use engine::sql::parser::{
     validate_search_offset, AggregateTarget, BoundAggregate, BoundAggregateItem, HavingOp,
     HavingSpec,
@@ -549,7 +548,7 @@ pub fn execute(
     let table = validated.required_str("table")?;
     ident::check_identifier(table)?;
 
-    let session = SessionState::default();
+    let session = principal.session_state();
     let result = engine.execute_bound_aggregate_in_session(
         principal.policy_context(),
         &session,
@@ -577,7 +576,7 @@ pub fn explain(
     let table = validated.required_str("table")?;
     ident::check_identifier(table)?;
 
-    let session = SessionState::default();
+    let session = principal.session_state();
     let result = engine.explain_bound_aggregate_in_session(
         principal.policy_context(),
         &session,

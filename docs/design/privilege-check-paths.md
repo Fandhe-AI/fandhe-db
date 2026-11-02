@@ -30,7 +30,7 @@ Phase 6 の共通ゲートへ移行する前に結線漏れと README の再陳�
 | 2. DDL 実行権限 | `--ddl-allowed-users` で列挙した username の接続だけが DDL を実行できる。判定点は `sql::privilege_gate::check` ただ 1 つ（`sql::ddl::require_ddl_permission` はそのファサード。カタログ照会なし・既定拒否 `42501`）。SQL 文から権限ビットを変える経路は無い | 下表「権限ビットの注入点」 |
 
 ロールと権限のカタログ（#1961）と `GRANT`／`REVOKE` の SQL 文（#1965）は実装済みだが、現在ロールを束縛する認証層（#1971）と
-権限検査ゲートは DDL（#1966）・読み取り系の文（#1967）・書き込み系の文（#1968）まで実装済みで、COPY（#1969）にはまだ効かない。wire の全セッションは現在ロールが未束縛で、
+権限検査ゲートは DDL（#1966）・読み取り系の文（#1967）・書き込み系の文（#1968）・COPY と HTTP の bound 書き込み入口（#1969）まで実装済み。wire の全セッションは現在ロールが未束縛で、
 `GRANT`／`REVOKE` は対象・ロールの有無を問わず `42501` になる（後述）。所有者の概念は #2236 で追加済み（`object_owners`。`ddl_allowed` の所有者相当に加算）。
 DDL 権限は全テナント共有のカタログを変更する操作の運用者権限であり、軸 1 とは独立に評価される。
 
@@ -119,6 +119,53 @@ SQL 表層のディスパッチは `EngineCore::execute_parsed_statement`（自�
 | HTTP の bound 読み取り API | 入口で、束縛・計画・読み取りより前 | `EngineCore::require_table_select_privilege` |
 | ビュー・matview | それ自身の SELECT だけ（基底表は検査しない） | 収集の対象はトークン上の名前のみ |
 
+### COPY（INSERT／SELECT 権限。#1969）
+
+現在ロールが束縛済みのセッションにだけ適用する。判定は `privilege_gate::check`、COPY の要求の組み立ては
+`sql/privilege_gate/copy.rs`（`require_copy_privileges`）。`COPY ... FROM STDIN` は対象表の INSERT、
+`COPY ... TO STDOUT` は読む relation の SELECT を要求する。
+
+| 経路 | 検査する時点 | 実装 |
+| ---- | ------------ | ---- |
+| 簡易クエリ（`begin_copy`） | 構文検証・名前解決の後、CopyInResponse・走査より前 | `core.rs` の `begin_copy_unscrubbed` |
+| 明示 Tx（`begin_copy_in_txn`） | 同上。読み取り専用 Tx の `25006`・文数登録・走査より前（権限 `42501` が先） | `core.rs` の `begin_copy_active_inner` |
+| 拡張クエリ Parse・Bind・Describe | Parse と Describe で拒否する（列の型情報を返さない）。Execute は上の `begin_copy*` | `core/temp_route.rs` の `require_prepared_read_privileges` |
+| CopyDone 後の commit | 書き込みの直前に INSERT を再判定する（begin から commit までの REVOKE を検出）。明示 Tx では write txn から ACL を読む | `core.rs` の `commit_copy_in_with_target`（`CopyInBatch.privilege_recheck`） |
+| 一時表の COPY | 対象外（セッションの所有物）。`begin_copy_temp` が先に分岐する | `core/temp_route.rs` |
+
+Autocommit の commit 時の再判定は別 txn で ACL を読むため、判定と書き込みの間の REVOKE の窓が残る
+（単発 DML と同じ。分割実行のようなチャンク単位の write txn 内判定ではない）。
+
+### HTTP（NoSQL）表層の bound 書き込み入口（#1969）
+
+HTTP の各 op ハンドラは `SessionPrincipal::session_state()`（`http/session/middleware.rs`）で `SessionState` を作り、
+engine の bound API へ渡す。`SessionState::default()` を `http/query/` の本番コードで直接組み立てない。
+HTTP の現在ロールの束縛は #2238 がこの関数へ足す拡張点で、現状は未束縛（本番の挙動は不変）。
+
+| op・入口 | 必要ビット（SQL 表層の同等の文と同じ関数が決める） | 検査点 |
+| -------- | -------------------------------------------------- | ------ |
+| `insert`（`execute_bound_insert_in_session`） | INSERT | 名前解決・束縛の後、書き込みより前 |
+| 単一行 `update`（`execute_bound_update_in_session`） | UPDATE + SELECT | 同上 |
+| 単一行 `delete`（`execute_bound_delete_in_session`・`execute_bound_delete_checked_in_session`） | DELETE + SELECT | 同上（前者は束縛済みの主体のときだけ存在確認 `42P01` を先に行う） |
+| 述語形 `update`／`delete`（`execute_bound_predicate_*_in_session`） | `write::partitioned_update_bits`／`partitioned_delete_bits` | 束縛・形検査の後、書き込みより前 |
+| 分割実行（`execute_bound_partitioned_*_in_session`） | 同上 | 入口と、各チャンクの write txn 内の再判定（`RelationPrivilegeRecheck`） |
+| `scan`・`search`・`aggregate`・`explain` | SELECT（#1967） | 入口 |
+| `create_table` 等の DDL op | DDL 権限（`ddl_allowed`） | `execute_parsed_in_session` |
+| `show_partitioned_dml`・`cancel_partitioned_dml` | 対象外 | ジョブ表だけに触れる（ロール単位のジョブ所有はスコープ外） |
+
+### 主体（`SessionState`）を持たない Rust API
+
+次の engine の公開 API は主体を取らないため権限を検査しない。`crates/wire-server/src` からは呼ばれない
+（テスト用の `parse_sql`・`execute_*_sql` を除く。再検証手順の grep で確認する）。組み込み利用者が直接呼ぶ入口であり、
+SQL 表層・HTTP 表層の主体付き入口だけがゲートを通る。
+
+| API | 備考 |
+| --- | ---- |
+| `insert_row`・`update_row`・`delete_row` | 行単位の生 API |
+| `execute_insert_sql`・`execute_update_sql`・`execute_delete_sql`・`execute_truncate_sql` | セッションなしの SQL 入口 |
+| `parse_sql` + `execute_parsed_*`（セッションなし） | 同上 |
+| `commit_copy_in`・`commit_copy_in_txn` | バッチが `privilege_recheck` を運ぶため、COPY を `begin_copy*` で開始した主体の権限は commit で再判定される |
+
 ## ゲート対象外・特例の経路
 
 | 経路 | 扱い | 根拠・理由 |
@@ -128,7 +175,7 @@ SQL 表層のディスパッチは `EngineCore::execute_parsed_statement`（自�
 | `setval`／`lastval` | `SequenceFunction`。DDL ゲートなし。ACL で判定すべき主体（束縛済みかつ所有者相当でない）には SEQUENCE の ACL を判定する（`setval`=UPDATE、`lastval`=USAGE か SELECT。Issue #2235） | 作用が呼び出し元テナントに閉じる（コード中の設計記録参照）。判定は `sql/object_privilege.rs` |
 | `nextval`／`currval`（INSERT の VALUES・DEFAULT） | `tenant::assign_sequence_values` が採番の前に SEQUENCE の ACL を判定する（`nextval`=USAGE か UPDATE、`currval`=USAGE か SELECT）。SERIAL・IDENTITY・`OWNED BY` 済みの列 DEFAULT の暗黙の採番は免除（SQL-40 (6)(a)）。採番文脈（`SequenceScope`）が主体を運び、セッションの無い経路は検査しない | Issue #2235（設計記録 `role-privilege-model.md` §14） |
 | UDF・`LANGUAGE sql\|plpgsql` 関数の呼び出し | 文の実行区間の頭で `core.rs::function_acl_scope` が EXECUTE を持たないカタログ由来の関数キーの集合を張り、解決点（`udf_call::bind_call` の宣言的 UDF 展開・`routine_fold` のルーチン呼び出し・`function_scan::plan`）で `42501` にする。新規の関数は PUBLIC が EXECUTE を持つ（既定） | Issue #2235（§14 S5・S7）。wire-server が core の外で行う INSERT 値・UPDATE／DELETE 述語の束縛は未結線（既知の差） |
-| COPY | DDL ゲートなし。軸 1（テナント境界・可視性）のみで制御 | #1969 で結線する |
+| COPY の一時表 | ゲート対象外 | セッションの所有物。永続表の COPY は上の「COPY」節 |
 | `SHOW`／`CANCEL PARTITIONED DML` | 書き込みゲートの対象外 | ジョブ表だけを読み書きし利用者の行に触れない（ロール単位のジョブ所有はスコープ外） |
 | トリガ起点の内部書き込み・FK の参照アクション | 呼び出し元の権限を検査しない | 所有者実行の意味（PostgreSQL と同じ）。文の入口で対象表を判定済み |
 | `LOCK TABLE` | 本 Issue（#1968）の対象外 | スコープ外の候補 |
@@ -187,6 +234,8 @@ Issue #1972 の担当（RLS-12 ポインタ）。
   読み取りなら SELECT を要求する側へ、そうでなければ対象外の理由をコメントへ記録する
 - [ ] 書き込み系の文種（`ParsedSql` の新しい variant）は `privilege_gate::write::classify_write` の網羅 `match` に分類を足し、
   書き込み先と必要ビットを返すか、対象外の理由をコメントへ記録する。CASCADE のように文の外へ及ぶ書き込みは write txn 内で再判定する
+- [ ] HTTP の op は `principal.session_state()` で `SessionState` を作り、engine の bound API へ渡す（`SessionState::default()` を
+  本番コードで直接組み立てない）。bound 書き込み API は SQL 表層と同じビット関数から必要ビットを決める
 - [ ] 本書の検査経路一覧・README の `--ddl-allowed-users` 節・`implementation-status.md` を更新する
 
 ## 移行先（未実装・ポインタのみ）
@@ -211,6 +260,8 @@ Issue #1972 の担当（RLS-12 ポインタ）。
 | `git grep -n 'privilege_gate::require_ddl(' -- crates/engine/src` | `core.rs` の DDL 腕（`CreateIndex` の特例で 1 腕あたり 2 呼び出し。`CreateFunction` は自動コミットの腕のみ、`DropFunction` の自動コミット側は `sql/udf_ddl.rs`）。束ねた Tx 内の腕は `require_server_ddl` |
 | `git grep -n 'privilege_gate::read::' -- crates/engine/src` | `core.rs`（`parse_tokens_gated`・bound 読み取り API の入口）と `core/temp_route.rs`（拡張クエリ）。#1967 の記録時点 |
 | `git grep -n 'privilege_gate::write::' -- crates/engine/src` | `core.rs`（`parse_tokens_gated`・分割実行・TRUNCATE）、`core/temp_route.rs`（拡張クエリ・TRUNCATE）、`sql/exec.rs`・`tenant.rs`（再判定の受け渡し）。#1968 の記録時点 |
+| `git grep -n 'privilege_gate::copy::' -- crates/engine/src` | `core.rs`（`begin_copy_unscrubbed`・`begin_copy_active_inner`）と `core/temp_route.rs`（拡張クエリ）。#1969 の記録時点 |
+| `git grep -n 'SessionState::default()' -- crates/wire-server/src/http` | `http/query/` の本番コードには無い（`session/middleware.rs` の `session_state()` のみ。残りは `#[cfg(test)]`）。#1969 の記録時点 |
 | `git grep -n 'ddl_allowed()' -- crates/engine/src` | `sql/privilege_gate.rs`（`Principal::from_session`）と `sql/mode.rs`（定義）、テストのみ |
 | `git grep -n 'allow_ddl()' -- crates/wire-server/src` | 本番注入点は `handshake.rs` と `http/query/ddl.rs`。`extended_query.rs` は `#[cfg(test)]` |
 | `git grep -n '42501' -- crates/engine/src crates/wire-server/src` | 権限ゲート以外の発生源は上表のとおり |

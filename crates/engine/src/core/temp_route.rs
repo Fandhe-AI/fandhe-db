@@ -721,6 +721,18 @@ impl EngineCore {
             crate::sql::privilege_gate::read::classify(parsed),
             scope,
         )?;
+        // SQL-40・Issue #1969: `COPY` は Parse・Bind・Describe でも判定する（権限の無い主体に列の型情報を
+        // 返さない）。Execute は `begin_copy*` が判定する。
+        if let ParsedSql::Copy(vc) = parsed {
+            return crate::sql::privilege_gate::copy::require_copy_privileges(
+                &self.storage,
+                tenant,
+                session,
+                vc.statement(),
+                &prepared.tokens,
+                scope.read_snap,
+            );
+        }
         // SQL-40・Issue #1968: 書き込み系の文（INSERT／UPDATE／DELETE／TRUNCATE 等）も同じ入口で判定する。
         crate::sql::privilege_gate::write::require_write_privileges_resolved(
             &self.storage,

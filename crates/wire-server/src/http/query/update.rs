@@ -328,6 +328,7 @@ pub fn execute(
             let id = dml_target::row_id_from_address(address)?;
             core.execute_bound_update_in_session(
                 principal.policy_context(),
+                &principal.session_state(),
                 table,
                 operation_id.as_ref(),
                 |schema| {
@@ -362,6 +363,7 @@ pub fn execute(
             };
             core.execute_bound_predicate_update_in_session(
                 principal.policy_context(),
+                &principal.session_state(),
                 table,
                 operation_id.as_ref(),
                 bind,
@@ -387,6 +389,7 @@ pub fn execute(
                 // 共通本体（内容照合ハッシュ・実行器・上限）へ到達する。
                 Some(m) => core.execute_bound_partitioned_update_in_session(
                     principal.policy_context(),
+                    &principal.session_state(),
                     table,
                     operation_id.as_ref(),
                     m.chunk_rows,
@@ -394,6 +397,7 @@ pub fn execute(
                 )?,
                 None => core.execute_bound_predicate_update_in_session(
                     principal.policy_context(),
+                    &principal.session_state(),
                     table,
                     operation_id.as_ref(),
                     bind,

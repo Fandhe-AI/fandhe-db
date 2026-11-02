@@ -215,12 +215,14 @@ pub fn execute(
             };
             core.execute_bound_delete_checked_in_session(
                 principal.policy_context(),
+                &principal.session_state(),
                 &bound,
                 super::gate::reject_allocated_schema,
             )?
         }
         TargetForm::RowAddress(address) => core.execute_bound_predicate_delete_in_session(
             principal.policy_context(),
+            &principal.session_state(),
             table,
             operation_id.as_ref(),
             |schema| dml_target::bind_primary_key_predicates(address, schema),
@@ -241,6 +243,7 @@ pub fn execute(
                 // 共通本体へ到達する。
                 Some(m) => core.execute_bound_partitioned_delete_in_session(
                     principal.policy_context(),
+                    &principal.session_state(),
                     table,
                     operation_id.as_ref(),
                     m.chunk_rows,
@@ -248,6 +251,7 @@ pub fn execute(
                 )?,
                 None => core.execute_bound_predicate_delete_in_session(
                     principal.policy_context(),
+                    &principal.session_state(),
                     table,
                     operation_id.as_ref(),
                     bind,

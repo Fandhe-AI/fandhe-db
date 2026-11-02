@@ -9,6 +9,8 @@
 
 ### Added
 
+- `COPY ... FROM STDIN`（INSERT）・`COPY ... TO STDOUT`（SELECT）と HTTP（NoSQL）表層の bound 書き込み入口に、現在ロールが束縛済みのセッションの表単位の権限検査を結線した（Issue #1969・SQL-40・NOSQL-2 ポインタ。権限不足は `42501`）。COPY は CopyInResponse・走査より前と CopyDone 後の commit 直前に判定し、拡張クエリは Parse・Bind・Describe でも拒否する。未束縛・運用者権限のセッションは従来と同一。
+  BREAKING CHANGE: `EngineCore::execute_bound_{insert,update,delete,delete_checked,predicate_update,predicate_delete,partitioned_update,partitioned_delete}_in_session` の第 2 引数に `session: &SessionState` を追加した（`ctx` の直後）。
 - 現在ロールが束縛済みのセッションの読み取り（SELECT・JOIN・サブクエリ・CTE・集合演算・ビュー・EXPLAIN・`DECLARE`・行ロック句・検索・拡張クエリ・HTTP の bound 読み取り API）に、`GRANT` で付与した表単位の SELECT 権限の検査を結線した（Issue #1967・SQL-40・RLS-12 ポインタ。権限不足は `42501`）。公開メソッド `SessionState::object_privileges_enforced` を追加した。現在ロールが未束縛のセッション（現状の全セッション）の挙動は変わらない。
 - 現在ロールが束縛済みのセッションの書き込み（INSERT・UPSERT・UPDATE・DELETE・TRUNCATE とその RETURNING・INSERT ... SELECT・UPDATE ... FROM・DELETE ... USING・ビュー DML・データ変更 CTE・分割実行・拡張クエリ）に、`GRANT` で付与した表単位の権限の検査を結線した（Issue #1968・SQL-40・RLS-12・SQL-19・SQL-22 ポインタ。権限不足は `42501`で、行・台帳は変化しない）。分割実行はチャンクごと、TRUNCATE CASCADE は連鎖後の全表を再判定する。現在ロールが未束縛のセッション（現状の全セッション）の挙動は変わらない。
 - ロールのメンバーシップと継承を追加した（Issue #2232・SQL-39 (7)・SQL-40）。`GRANT <ロール> TO <ロール> [WITH ADMIN|INHERIT|SET ...]`・`REVOKE [<オプション> OPTION FOR] <ロール> FROM <ロール> [CASCADE]` を実行し（循環 `0LP01`・ADMIN なし `42501`・依存 `2BP01`）、`CREATE ROLE ... IN ROLE／ROLE／ADMIN` を受理する。付与権限（`GRANT <権限> ON ...`）は付与者が INHERIT で継承するロールの GRANT OPTION も使え、記録される付与者は最良のロールになる。メンバーシップ blob は版 2（付与者つき）になり、版 1 は付与者なしとして読める。

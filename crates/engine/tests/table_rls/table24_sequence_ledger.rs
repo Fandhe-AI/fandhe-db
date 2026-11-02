@@ -470,6 +470,7 @@ fn nosql_insert(
     let op_id = op.map(|o| OperationId::parse(o).expect("op id"));
     core.execute_bound_insert_in_session(
         &ctx(tenant),
+        &engine::sql::mode::SessionState::default(),
         "d",
         1,
         op_id.as_ref(),

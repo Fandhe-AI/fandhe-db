@@ -256,9 +256,14 @@ fn execute_bound_insert_in_session_writes_rows() {
     let op_id = OperationId::parse("op-1").expect("valid operation_id");
 
     let outcome = core
-        .execute_bound_insert_in_session(&policy, TABLE, 2, Some(&op_id), |_schema| {
-            Ok(vec![bound(1, Some("op-1")), bound(2, Some("op-1"))])
-        })
+        .execute_bound_insert_in_session(
+            &policy,
+            &engine::sql::mode::SessionState::default(),
+            TABLE,
+            2,
+            Some(&op_id),
+            |_schema| Ok(vec![bound(1, Some("op-1")), bound(2, Some("op-1"))]),
+        )
         .expect("insert session ok");
     assert_eq!(outcome.rows_affected, 2);
 
@@ -277,9 +282,14 @@ fn execute_bound_insert_in_session_missing_operation_id_precedes_schema_lookup()
     let policy = ctx("tenant-a", [Visibility::Private]);
 
     let err = core
-        .execute_bound_insert_in_session(&policy, "no_such_table", 1, None, |_schema| {
-            Ok(vec![bound(1, None)])
-        })
+        .execute_bound_insert_in_session(
+            &policy,
+            &engine::sql::mode::SessionState::default(),
+            "no_such_table",
+            1,
+            None,
+            |_schema| Ok(vec![bound(1, None)]),
+        )
         .expect_err("must reject");
     assert_eq!(err.wire_code(), "23502");
 }
@@ -292,7 +302,14 @@ fn execute_bound_insert_in_session_rejects_empty_batch() {
     let op_id = OperationId::parse("op-1").expect("valid operation_id");
 
     let err = core
-        .execute_bound_insert_in_session(&policy, TABLE, 0, Some(&op_id), |_schema| Ok(vec![]))
+        .execute_bound_insert_in_session(
+            &policy,
+            &engine::sql::mode::SessionState::default(),
+            TABLE,
+            0,
+            Some(&op_id),
+            |_schema| Ok(vec![]),
+        )
         .expect_err("must reject");
     assert_eq!(err.wire_code(), "22000");
 }
@@ -310,9 +327,14 @@ fn execute_bound_insert_in_session_rejects_operation_id_mismatch_between_guard_a
     let guard_op_id = OperationId::parse("op-guard").expect("valid operation_id");
 
     let err = core
-        .execute_bound_insert_in_session(&policy, TABLE, 1, Some(&guard_op_id), |_schema| {
-            Ok(vec![bound(1, Some("op-bound-differs"))])
-        })
+        .execute_bound_insert_in_session(
+            &policy,
+            &engine::sql::mode::SessionState::default(),
+            TABLE,
+            1,
+            Some(&guard_op_id),
+            |_schema| Ok(vec![bound(1, Some("op-bound-differs"))]),
+        )
         .expect_err("must reject operation_id mismatch");
     assert_eq!(err.wire_code(), "22000");
 
@@ -338,9 +360,14 @@ fn execute_bound_insert_in_session_row_count_limit_precedes_bind() {
     let op_id = OperationId::parse("op-1").expect("valid operation_id");
 
     let err = core
-        .execute_bound_insert_in_session(&policy, TABLE, 2, Some(&op_id), |_schema| {
-            panic!("bind must not be called when the row count limit is exceeded")
-        })
+        .execute_bound_insert_in_session(
+            &policy,
+            &engine::sql::mode::SessionState::default(),
+            TABLE,
+            2,
+            Some(&op_id),
+            |_schema| panic!("bind must not be called when the row count limit is exceeded"),
+        )
         .expect_err("must reject");
     assert_eq!(err.wire_code(), "54000");
 }
@@ -359,9 +386,14 @@ fn execute_bound_insert_in_session_batch_total_bytes_limit_is_54000() {
     let op_id = OperationId::parse("op-1").expect("valid operation_id");
 
     let err = core
-        .execute_bound_insert_in_session(&policy, TABLE, 2, Some(&op_id), |_schema| {
-            Ok(vec![bound(1, Some("op-1")), bound(2, Some("op-1"))])
-        })
+        .execute_bound_insert_in_session(
+            &policy,
+            &engine::sql::mode::SessionState::default(),
+            TABLE,
+            2,
+            Some(&op_id),
+            |_schema| Ok(vec![bound(1, Some("op-1")), bound(2, Some("op-1"))]),
+        )
         .expect_err("must reject");
     assert_eq!(err.wire_code(), "54000");
 }
@@ -380,9 +412,14 @@ fn execute_bound_insert_in_session_chunk_total_limit_is_54000() {
     let op_id = OperationId::parse("op-1").expect("valid operation_id");
 
     let err = core
-        .execute_bound_insert_in_session(&policy, TABLE, 2, Some(&op_id), |_schema| {
-            Ok(vec![bound(1, Some("op-1")), bound(2, Some("op-1"))])
-        })
+        .execute_bound_insert_in_session(
+            &policy,
+            &engine::sql::mode::SessionState::default(),
+            TABLE,
+            2,
+            Some(&op_id),
+            |_schema| Ok(vec![bound(1, Some("op-1")), bound(2, Some("op-1"))]),
+        )
         .expect_err("must reject");
     assert_eq!(err.wire_code(), "54000");
 }
@@ -401,9 +438,14 @@ fn execute_bound_insert_in_session_over_limit_leaves_ledger_unrecorded() {
     let op_id = OperationId::parse("op-1").expect("valid operation_id");
 
     let err = core
-        .execute_bound_insert_in_session(&policy, TABLE, 2, Some(&op_id), |_schema| {
-            Ok(vec![bound(1, Some("op-1")), bound(2, Some("op-1"))])
-        })
+        .execute_bound_insert_in_session(
+            &policy,
+            &engine::sql::mode::SessionState::default(),
+            TABLE,
+            2,
+            Some(&op_id),
+            |_schema| Ok(vec![bound(1, Some("op-1")), bound(2, Some("op-1"))]),
+        )
         .expect_err("must reject");
     assert_eq!(err.wire_code(), "54000");
 
@@ -428,9 +470,14 @@ fn execute_bound_insert_in_session_compare_only_without_ledger_accepts_none() {
     let policy = ctx("tenant-a", [Visibility::Private]);
 
     let outcome = core
-        .execute_bound_insert_in_session(&policy, TABLE, 1, None, |_schema| {
-            Ok(vec![bound(1, None)])
-        })
+        .execute_bound_insert_in_session(
+            &policy,
+            &engine::sql::mode::SessionState::default(),
+            TABLE,
+            1,
+            None,
+            |_schema| Ok(vec![bound(1, None)]),
+        )
         .expect("insert session ok");
     assert_eq!(outcome.rows_affected, 1);
 }

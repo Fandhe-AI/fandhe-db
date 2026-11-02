@@ -320,6 +320,7 @@ pub(crate) fn is_owner_equivalent(session: &SessionState) -> bool {
     require_server_ddl(session).is_ok()
 }
 
+pub(crate) mod copy;
 pub(crate) mod read;
 pub(crate) mod write;
 

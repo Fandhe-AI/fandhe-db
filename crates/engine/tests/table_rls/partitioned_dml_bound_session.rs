@@ -121,6 +121,7 @@ fn bound_delete(
 ) -> Result<u64, SqlSurfaceError> {
     core.execute_bound_partitioned_delete_in_session(
         &ctx(tenant),
+        &engine::sql::mode::SessionState::default(),
         "docs",
         Some(&op(id)),
         chunk,
@@ -138,6 +139,7 @@ fn bound_update(
 ) -> Result<u64, SqlSurfaceError> {
     core.execute_bound_partitioned_update_in_session(
         &ctx(tenant),
+        &engine::sql::mode::SessionState::default(),
         "docs",
         Some(&op(id)),
         chunk,
@@ -192,6 +194,7 @@ fn bound_update_n(
 ) -> Result<u64, SqlSurfaceError> {
     core.execute_bound_partitioned_update_in_session(
         &ctx("alice"),
+        &engine::sql::mode::SessionState::default(),
         "docs",
         Some(&op(id)),
         chunk,
@@ -264,6 +267,7 @@ fn atomic_and_partitioned_bound_entries_do_not_share_a_hash_in_either_direction(
     // 原子的 → 分割実行。
     core.execute_bound_predicate_update_in_session(
         &ctx("alice"),
+        &engine::sql::mode::SessionState::default(),
         "docs",
         Some(&op("m1")),
         |_schema: &TableSchema| Ok((set_n("7"), all_rows())),
@@ -278,6 +282,7 @@ fn atomic_and_partitioned_bound_entries_do_not_share_a_hash_in_either_direction(
     let e = core
         .execute_bound_predicate_update_in_session(
             &ctx("alice"),
+            &engine::sql::mode::SessionState::default(),
             "docs",
             Some(&op("m2")),
             |_schema: &TableSchema| Ok((set_n("8"), all_rows())),
@@ -336,6 +341,7 @@ fn decision_order_is_ledger_then_chunk_then_table_then_predicate_form() {
     let e = core
         .execute_bound_partitioned_delete_in_session(
             &ctx("alice"),
+            &engine::sql::mode::SessionState::default(),
             "missing",
             None,
             nz(1_000_000_000),
@@ -347,6 +353,7 @@ fn decision_order_is_ledger_then_chunk_then_table_then_predicate_form() {
     let e = core
         .execute_bound_partitioned_delete_in_session(
             &ctx("alice"),
+            &engine::sql::mode::SessionState::default(),
             "missing",
             Some(&op("o1")),
             nz(usize::MAX),
@@ -358,6 +365,7 @@ fn decision_order_is_ledger_then_chunk_then_table_then_predicate_form() {
     let e = core
         .execute_bound_partitioned_delete_in_session(
             &ctx("alice"),
+            &engine::sql::mode::SessionState::default(),
             "missing",
             Some(&op("o2")),
             None,
@@ -369,6 +377,7 @@ fn decision_order_is_ledger_then_chunk_then_table_then_predicate_form() {
     let e = core
         .execute_bound_partitioned_delete_in_session(
             &ctx("alice"),
+            &engine::sql::mode::SessionState::default(),
             "docs",
             Some(&op("o3")),
             None,

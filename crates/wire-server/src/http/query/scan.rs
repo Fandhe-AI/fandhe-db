@@ -70,10 +70,8 @@ use engine::catalog::TableSchema;
 use engine::core::EngineCore;
 use engine::error_format::{ClassifiedError, ErrorClass};
 use engine::json::JsonValue;
-use engine::policy::PolicyContext;
 use engine::sql::allowlist::{Projection, ScalarOrderKey, SqlSurfaceError, MAX_SCALAR_ORDER_KEYS};
 use engine::sql::exec::QueryResult;
-use engine::sql::mode::SessionState;
 use engine::sql::parser::{
     bind_projection, validate_search_limit_with, validate_search_offset, BoundScan,
 };
@@ -392,15 +390,16 @@ impl<'a> PreparedScan<'a> {
 /// 検証・写像と `filter` の束縛順序）は [`PreparedScan`] のドキュメントを参照。
 pub fn execute(
     core: &EngineCore,
-    ctx: &PolicyContext,
+    principal: &SessionPrincipal,
     validated: &Validated<'_>,
 ) -> Result<QueryResult, ScanError> {
+    let ctx = principal.policy_context();
     if validated.optional_bool("explain")?.unwrap_or(false) {
         return Err(ScanError::ExplainNotSupported);
     }
 
     let prepared = PreparedScan::prepare(validated, &core.result_limits())?;
-    let session = SessionState::default();
+    let session = principal.session_state();
     let result =
         core.execute_bound_scan_in_session(ctx, &session, prepared.table, |schema, udfs| {
             prepared.bind(schema, udfs)
@@ -414,11 +413,12 @@ pub fn execute(
 /// [`PreparedScan::bind`] を渡す（第 2 の binder を作らない設計）。
 pub fn explain(
     core: &EngineCore,
-    ctx: &PolicyContext,
+    principal: &SessionPrincipal,
     validated: &Validated<'_>,
 ) -> Result<QueryResult, ScanError> {
+    let ctx = principal.policy_context();
     let prepared = PreparedScan::prepare(validated, &core.result_limits())?;
-    let session = SessionState::default();
+    let session = principal.session_state();
     let result =
         core.explain_bound_scan_in_session(ctx, &session, prepared.table, |schema, udfs| {
             prepared.bind(schema, udfs)
@@ -434,7 +434,7 @@ pub fn handle(
     validated: &Validated<'_>,
     now_wall: SystemTime,
 ) -> Vec<u8> {
-    match execute(core, principal.policy_context(), validated) {
+    match execute(core, principal, validated) {
         Ok(result) => match super::response::encode(&result) {
             Ok(body) => http_response::encode_ok(&body, now_wall),
             Err(err) => {
@@ -454,7 +454,7 @@ pub fn handle_explain(
     validated: &Validated<'_>,
     now_wall: SystemTime,
 ) -> Vec<u8> {
-    match explain(core, principal.policy_context(), validated) {
+    match explain(core, principal, validated) {
         Ok(result) => match super::response::encode_explain(&result) {
             Ok(body) => http_response::encode_ok(&body, now_wall),
             Err(err) => {

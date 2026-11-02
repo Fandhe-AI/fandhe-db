@@ -80,16 +80,22 @@ fn execute_bound_update_in_session_is_reachable_and_updates_the_targeted_row() {
 
     let operation_id = op("nosql-update-1");
     let outcome = core
-        .execute_bound_update_in_session(&owner, TABLE, Some(&operation_id), |schema| {
-            let validated = ValidatedUpdate {
-                table_name: TABLE.to_string(),
-                assignments: vec![("lang".to_string(), engine_insert_literal_string("en"))],
-                id_literal: "1".to_string(),
-                operation_id: Some(operation_id.clone()),
-                returning: None,
-            };
-            bind_update(&validated, schema)
-        })
+        .execute_bound_update_in_session(
+            &owner,
+            &engine::sql::mode::SessionState::default(),
+            TABLE,
+            Some(&operation_id),
+            |schema| {
+                let validated = ValidatedUpdate {
+                    table_name: TABLE.to_string(),
+                    assignments: vec![("lang".to_string(), engine_insert_literal_string("en"))],
+                    id_literal: "1".to_string(),
+                    operation_id: Some(operation_id.clone()),
+                    returning: None,
+                };
+                bind_update(&validated, schema)
+            },
+        )
         .expect("update ok");
     assert_eq!(outcome.rows_affected, 1);
 }
@@ -110,16 +116,22 @@ fn execute_bound_update_in_session_requires_operation_id_before_schema_lookup() 
         )
     };
     let err = bare_core
-        .execute_bound_update_in_session(&owner, "does_not_exist", None, |schema| {
-            let validated = ValidatedUpdate {
-                table_name: "does_not_exist".to_string(),
-                assignments: vec![("lang".to_string(), engine_insert_literal_string("en"))],
-                id_literal: "1".to_string(),
-                operation_id: None,
-                returning: None,
-            };
-            bind_update(&validated, schema)
-        })
+        .execute_bound_update_in_session(
+            &owner,
+            &engine::sql::mode::SessionState::default(),
+            "does_not_exist",
+            None,
+            |schema| {
+                let validated = ValidatedUpdate {
+                    table_name: "does_not_exist".to_string(),
+                    assignments: vec![("lang".to_string(), engine_insert_literal_string("en"))],
+                    id_literal: "1".to_string(),
+                    operation_id: None,
+                    returning: None,
+                };
+                bind_update(&validated, schema)
+            },
+        )
         .expect_err("must reject");
     assert_eq!(err.wire_code(), "23502");
 }
@@ -130,16 +142,22 @@ fn execute_bound_update_in_session_rejects_undefined_table_with_42p01() {
     let owner = ctx(TENANT_A, [Visibility::Private]);
     let operation_id = op("nosql-update-undefined");
     let err = core
-        .execute_bound_update_in_session(&owner, "does_not_exist", Some(&operation_id), |schema| {
-            let validated = ValidatedUpdate {
-                table_name: "does_not_exist".to_string(),
-                assignments: vec![("lang".to_string(), engine_insert_literal_string("en"))],
-                id_literal: "1".to_string(),
-                operation_id: Some(operation_id.clone()),
-                returning: None,
-            };
-            bind_update(&validated, schema)
-        })
+        .execute_bound_update_in_session(
+            &owner,
+            &engine::sql::mode::SessionState::default(),
+            "does_not_exist",
+            Some(&operation_id),
+            |schema| {
+                let validated = ValidatedUpdate {
+                    table_name: "does_not_exist".to_string(),
+                    assignments: vec![("lang".to_string(), engine_insert_literal_string("en"))],
+                    id_literal: "1".to_string(),
+                    operation_id: Some(operation_id.clone()),
+                    returning: None,
+                };
+                bind_update(&validated, schema)
+            },
+        )
         .expect_err("must reject");
     assert_eq!(err.wire_code(), "42P01");
 }
@@ -152,19 +170,25 @@ fn execute_bound_update_in_session_rejects_bound_plan_operation_id_mismatch() {
 
     let requested = op("nosql-update-outer");
     let err = core
-        .execute_bound_update_in_session(&owner, TABLE, Some(&requested), |schema| {
-            // `bind` closure が引数と異なる `operation_id` を持つ計画を返す
-            // （早期ガードと実書き込みの乖離を防ぐ判定の固定）。
-            let inner = op("nosql-update-inner");
-            let validated = ValidatedUpdate {
-                table_name: TABLE.to_string(),
-                assignments: vec![("lang".to_string(), engine_insert_literal_string("en"))],
-                id_literal: "1".to_string(),
-                operation_id: Some(inner),
-                returning: None,
-            };
-            bind_update(&validated, schema)
-        })
+        .execute_bound_update_in_session(
+            &owner,
+            &engine::sql::mode::SessionState::default(),
+            TABLE,
+            Some(&requested),
+            |schema| {
+                // `bind` closure が引数と異なる `operation_id` を持つ計画を返す
+                // （早期ガードと実書き込みの乖離を防ぐ判定の固定）。
+                let inner = op("nosql-update-inner");
+                let validated = ValidatedUpdate {
+                    table_name: TABLE.to_string(),
+                    assignments: vec![("lang".to_string(), engine_insert_literal_string("en"))],
+                    id_literal: "1".to_string(),
+                    operation_id: Some(inner),
+                    returning: None,
+                };
+                bind_update(&validated, schema)
+            },
+        )
         .expect_err("must reject");
     assert_eq!(err.wire_code(), "22000");
 }
@@ -187,16 +211,22 @@ fn execute_bound_update_in_session_matches_sql_ledger_key_space_for_resend_detec
     // ことで、台帳キー空間が表層を跨いで共有されていることを固定する。
     let shared = op("shared-op");
     let err = core
-        .execute_bound_update_in_session(&owner, TABLE, Some(&shared), |schema| {
-            let validated = ValidatedUpdate {
-                table_name: TABLE.to_string(),
-                assignments: vec![("lang".to_string(), engine_insert_literal_string("en"))],
-                id_literal: "1".to_string(),
-                operation_id: Some(shared.clone()),
-                returning: None,
-            };
-            bind_update(&validated, schema)
-        })
+        .execute_bound_update_in_session(
+            &owner,
+            &engine::sql::mode::SessionState::default(),
+            TABLE,
+            Some(&shared),
+            |schema| {
+                let validated = ValidatedUpdate {
+                    table_name: TABLE.to_string(),
+                    assignments: vec![("lang".to_string(), engine_insert_literal_string("en"))],
+                    id_literal: "1".to_string(),
+                    operation_id: Some(shared.clone()),
+                    returning: None,
+                };
+                bind_update(&validated, schema)
+            },
+        )
         .expect_err("must reject as duplicate");
     assert_eq!(err.wire_code(), "23505");
 }
@@ -215,17 +245,23 @@ fn execute_bound_update_in_session_matches_sql_ledger_key_space_for_content_mism
 
     let shared = op("shared-op-2");
     let err = core
-        .execute_bound_update_in_session(&owner, TABLE, Some(&shared), |schema| {
-            let validated = ValidatedUpdate {
-                table_name: TABLE.to_string(),
-                // 内容を変えて再送 → 内容不一致（`22023`）。
-                assignments: vec![("lang".to_string(), engine_insert_literal_string("fr"))],
-                id_literal: "1".to_string(),
-                operation_id: Some(shared.clone()),
-                returning: None,
-            };
-            bind_update(&validated, schema)
-        })
+        .execute_bound_update_in_session(
+            &owner,
+            &engine::sql::mode::SessionState::default(),
+            TABLE,
+            Some(&shared),
+            |schema| {
+                let validated = ValidatedUpdate {
+                    table_name: TABLE.to_string(),
+                    // 内容を変えて再送 → 内容不一致（`22023`）。
+                    assignments: vec![("lang".to_string(), engine_insert_literal_string("fr"))],
+                    id_literal: "1".to_string(),
+                    operation_id: Some(shared.clone()),
+                    returning: None,
+                };
+                bind_update(&validated, schema)
+            },
+        )
         .expect_err("must reject as content mismatch");
     assert_eq!(err.wire_code(), "22023");
 }
@@ -239,16 +275,22 @@ fn execute_bound_update_in_session_returns_zero_rows_for_other_tenant_row() {
 
     let operation_id = op("nosql-update-other-tenant");
     let outcome = core
-        .execute_bound_update_in_session(&owner_a, TABLE, Some(&operation_id), |schema| {
-            let validated = ValidatedUpdate {
-                table_name: TABLE.to_string(),
-                assignments: vec![("lang".to_string(), engine_insert_literal_string("en"))],
-                id_literal: "1".to_string(),
-                operation_id: Some(operation_id.clone()),
-                returning: None,
-            };
-            bind_update(&validated, schema)
-        })
+        .execute_bound_update_in_session(
+            &owner_a,
+            &engine::sql::mode::SessionState::default(),
+            TABLE,
+            Some(&operation_id),
+            |schema| {
+                let validated = ValidatedUpdate {
+                    table_name: TABLE.to_string(),
+                    assignments: vec![("lang".to_string(), engine_insert_literal_string("en"))],
+                    id_literal: "1".to_string(),
+                    operation_id: Some(operation_id.clone()),
+                    returning: None,
+                };
+                bind_update(&validated, schema)
+            },
+        )
         .expect("update ok (0 rows)");
     assert_eq!(outcome.rows_affected, 0);
 }
@@ -269,7 +311,11 @@ fn execute_bound_delete_in_session_is_reachable_and_deletes_the_targeted_row() {
         operation_id: Some(op("nosql-delete-1")),
     };
     let outcome = core
-        .execute_bound_delete_in_session(&owner, &bound)
+        .execute_bound_delete_in_session(
+            &owner,
+            &engine::sql::mode::SessionState::default(),
+            &bound,
+        )
         .expect("delete ok");
     assert_eq!(outcome.rows_affected, 1);
 }
@@ -286,7 +332,11 @@ fn execute_bound_delete_in_session_requires_operation_id() {
         operation_id: None,
     };
     let err = core
-        .execute_bound_delete_in_session(&owner, &bound)
+        .execute_bound_delete_in_session(
+            &owner,
+            &engine::sql::mode::SessionState::default(),
+            &bound,
+        )
         .expect_err("must reject");
     assert_eq!(err.wire_code(), "23502");
 }
@@ -301,7 +351,11 @@ fn execute_bound_delete_in_session_rejects_undefined_table_with_42p01() {
         operation_id: Some(op("nosql-delete-undefined")),
     };
     let err = core
-        .execute_bound_delete_in_session(&owner, &bound)
+        .execute_bound_delete_in_session(
+            &owner,
+            &engine::sql::mode::SessionState::default(),
+            &bound,
+        )
         .expect_err("must reject");
     assert_eq!(err.wire_code(), "42P01");
 }
@@ -324,7 +378,11 @@ fn execute_bound_delete_in_session_matches_sql_ledger_key_space_for_resend_detec
         operation_id: Some(op("del-op")),
     };
     let err = core
-        .execute_bound_delete_in_session(&owner, &bound)
+        .execute_bound_delete_in_session(
+            &owner,
+            &engine::sql::mode::SessionState::default(),
+            &bound,
+        )
         .expect_err("must reject as duplicate");
     assert_eq!(err.wire_code(), "23505");
 }
@@ -340,7 +398,11 @@ fn execute_bound_delete_in_session_returns_zero_rows_for_missing_id() {
         operation_id: Some(op("nosql-delete-missing")),
     };
     let outcome = core
-        .execute_bound_delete_in_session(&owner, &bound)
+        .execute_bound_delete_in_session(
+            &owner,
+            &engine::sql::mode::SessionState::default(),
+            &bound,
+        )
         .expect("delete ok (0 rows)");
     assert_eq!(outcome.rows_affected, 0);
 }
