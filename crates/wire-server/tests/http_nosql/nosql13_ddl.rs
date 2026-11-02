@@ -1184,8 +1184,9 @@ fn create_table_tenant_id_self_declaration_is_42601() {
 // --- alter_table -----------------------------------------------------------
 
 /// RLS-13（Issue #2275）: `alter_table` op は `add_column`／`drop_column` だけの閉じた JSON スキーマで、
-/// 行セキュリティの切り替えには到達できない（未知のキーは拒否され、成功扱いにならない）。NoSQL 表層への
-/// 適用は #2280 の担当。現行の拒否は成功（200）にならないことだけを固定する。
+/// 行セキュリティの切り替えには到達できない（未知のキーは拒否され、成功扱いにならない）。NoSQL 表層からの
+/// ポリシー管理の不在は `rls13_nosql_policy.rs`（Issue #2280）が `42601` まで固定する。ここでは成功（200）に
+/// ならないことだけを固定する。
 #[test]
 fn alter_table_row_security_keys_are_rejected_by_the_closed_schema() {
     let (core, _guard) = new_core_with_docs_table();

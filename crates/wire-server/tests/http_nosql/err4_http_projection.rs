@@ -15,7 +15,9 @@
 //! [`err4_projection_table_is_closed_over_all_error_classes`] で機械的に
 //! 固定する。production コードは変更しない（テスト専任）。
 //!
-//! 到達不能類型（`42501`・`P0002`・`34000`・`42701`）の扱い: NoSQL 表層は
+//! 到達不能類型（`P0002`・`34000`・`42701`）の扱い（`42501` は DDL 実行権限の不足と、
+//! 行セキュリティポリシーの `WITH CHECK` 違反〔RLS-13・Issue #2280。`rls13_nosql_policy.rs`〕で
+//! 実要求から到達する）: NoSQL 表層は
 //! テナントをセッション（`SessionPrincipal::policy_context()`）からのみ
 //! 導出し、クライアント自己申告の `tenant_id` 相当値は JSON／ヘッダ／パス
 //! いずれの位置でも `42601` で先に拒否する（`gate.rs`・
