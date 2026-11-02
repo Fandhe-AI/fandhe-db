@@ -449,6 +449,15 @@ fn parse_execute_body(body: &[u8]) -> Result<ExecuteMessage, BodyError> {
     })
 }
 
+/// 文が保持する準備済み文の共有参照（`Empty` は `None`）。保持量の会計で portal との共有を判定する。
+fn prepared_arc(stmt: &PreparedStatement) -> Option<&std::sync::Arc<PreparedSql>> {
+    match stmt {
+        PreparedStatement::Empty => None,
+        PreparedStatement::Parsed { prepared, .. }
+        | PreparedStatement::Parameterized { prepared, .. } => Some(prepared),
+    }
+}
+
 /// 接続単位で Parse 済みステートメントを保持する（`sql_bytes` は
 /// [`MAX_PREPARED_SQL_BYTES_PER_SESSION`] の累計判定用。`Empty` は空文字列の
 /// クエリテキスト——PostgreSQL は空文の Parse を構文エラーにせず受理する）。
@@ -636,6 +645,11 @@ fn int_kind(effective_oid: i32) -> BinaryParam {
 pub(crate) struct PreparedStatementStore {
     statements: std::collections::HashMap<String, (PreparedStatement, usize)>,
     total_sql_bytes: usize,
+    /// ストアからは外れたが、portal が準備済み文（`prepared_snapshot`）を保持し続けている文の
+    /// 弱参照とバイト数。最後の参照が消えるまで [`MAX_PREPARED_SQL_BYTES_PER_SESSION`] に算入する
+    /// （無名 statement の再 Parse や Close で台帳から外しても、旧文が portal 経由で生存するため）。
+    /// 要素数は生存 portal 数（[`MAX_PORTALS_PER_SESSION`] + 無名）以下に抑えられ、挿入のたびに掃除する。
+    orphans: Vec<(std::sync::Weak<PreparedSql>, usize)>,
     /// 名前付きステートメント件数の上限。既定は
     /// [`crate::limits::MAX_PREPARED_STATEMENTS_PER_SESSION`]、`--max-prepared-statements`
     /// （Issue #2454・WIRE-25 ポインタ）で起動時に上書きされる。
@@ -663,6 +677,7 @@ impl PreparedStatementStore {
         PreparedStatementStore {
             statements: std::collections::HashMap::new(),
             total_sql_bytes: 0,
+            orphans: Vec::new(),
             max_named,
         }
     }
@@ -695,18 +710,40 @@ impl PreparedStatementStore {
 
         // 既存の同名エントリ（無名の再 Parse による黙った置換）が保持していた
         // バイト数を先に差し引いてから累計判定する。
-        let existing_bytes = self.statements.get(&name).map(|(_, bytes)| *bytes);
-        let base = existing_bytes
-            .map(|b| self.total_sql_bytes.saturating_sub(b))
-            .unwrap_or(self.total_sql_bytes);
-        let new_total = base
-            .checked_add(sql_bytes)
+        // 置換される文を portal が保持している場合は、バイト数を差し引かず孤児として算入し続ける。
+        self.sweep_orphans();
+        let existing = self
+            .statements
+            .get(&name)
+            .map(|(stmt, bytes)| (*bytes, prepared_arc(stmt).map(std::sync::Arc::downgrade)));
+        let held_by_portal = existing
+            .as_ref()
+            .and_then(|(_, weak)| weak.as_ref())
+            .is_some_and(|w| w.strong_count() > 1);
+        let credit = match existing {
+            Some((bytes, _)) if !held_by_portal => bytes,
+            _ => 0,
+        };
+        let new_total = self
+            .total_sql_bytes
+            .saturating_sub(credit)
+            .checked_add(self.orphan_bytes())
+            .and_then(|t| t.checked_add(sql_bytes))
             .ok_or(StoreError::TotalBytesExceeded)?;
         if new_total > MAX_PREPARED_SQL_BYTES_PER_SESSION {
             return Err(StoreError::TotalBytesExceeded);
         }
 
-        self.total_sql_bytes = new_total;
+        let old_bytes = existing.as_ref().map_or(0, |(b, _)| *b);
+        if held_by_portal {
+            if let Some((bytes, Some(weak))) = existing {
+                self.orphans.push((weak, bytes));
+            }
+        }
+        self.total_sql_bytes = self
+            .total_sql_bytes
+            .saturating_sub(old_bytes)
+            .saturating_add(sql_bytes);
         self.statements.insert(name, (statement, sql_bytes));
         Ok(())
     }
@@ -718,10 +755,27 @@ impl PreparedStatementStore {
     /// Close（'C'。statement 対象。Issue #934）が呼ぶ。存在しない名前を渡しても
     /// 何もせず成功する（PostgreSQL と同じ挙動）。累計バイト数も併せて減算する。
     fn remove(&mut self, name: &str) {
-        if let Some((_, bytes)) = self.statements.get(name) {
-            self.total_sql_bytes = self.total_sql_bytes.saturating_sub(*bytes);
+        if let Some((stmt, bytes)) = self.statements.remove(name) {
+            self.total_sql_bytes = self.total_sql_bytes.saturating_sub(bytes);
+            if let Some(arc) = prepared_arc(&stmt) {
+                if std::sync::Arc::strong_count(arc) > 1 {
+                    self.orphans.push((std::sync::Arc::downgrade(arc), bytes));
+                }
+            }
         }
-        self.statements.remove(name);
+    }
+
+    /// 最後の参照が消えた孤児を台帳から外す。
+    fn sweep_orphans(&mut self) {
+        self.orphans.retain(|(w, _)| w.strong_count() > 0);
+    }
+
+    /// 生存している孤児のバイト数合計（飽和加算）。
+    fn orphan_bytes(&self) -> usize {
+        self.orphans
+            .iter()
+            .filter(|(w, _)| w.strong_count() > 0)
+            .fold(0usize, |acc, (_, b)| acc.saturating_add(*b))
     }
 }
 
@@ -3055,6 +3109,77 @@ mod tests {
             std::sync::Arc::strong_count(statement_arc),
             1 + MAX_PORTALS_PER_SESSION
         );
+        let _ = std::fs::remove_file(&path);
+    }
+
+    /// Issue #1967 レビュー指摘: 無名 statement の再 Parse で台帳から外れた旧文でも、portal が保持して
+    /// いる間は接続の保持量に算入され続け、上限を超える前に Parse が拒否される。portal を Close すれば
+    /// 容量が戻り、再び Parse できる。
+    #[test]
+    fn replaced_statement_held_by_portal_stays_accounted_until_portal_closes() {
+        use engine::kernel::CpuScalarProvider;
+        use engine::storage::Storage;
+        let path = std::env::temp_dir().join(format!(
+            "portal-orphan-{}-{:?}.redb",
+            std::process::id(),
+            std::thread::current().id()
+        ));
+        let storage = Storage::open(&path).expect("open storage");
+        let core = EngineCore::from_storage(storage, Box::new(CpuScalarProvider));
+        let session = engine::sql::mode::SessionState::default();
+        let mut txn = engine::sql::transaction::SessionTransaction::new(
+            engine::sql::transaction::TransactionLimits::default(),
+        );
+        let mut state = ExtendedQueryState::new();
+        let parse_unnamed = |pad: usize| {
+            let mut b = vec![0u8];
+            b.extend_from_slice(b"SELECT 1");
+            b.extend(std::iter::repeat_n(b' ', pad));
+            b.push(0);
+            b.extend_from_slice(&0i16.to_be_bytes());
+            b
+        };
+        let pad = 900 * 1024;
+        let mut accepted = 0usize;
+        let mut rejected = false;
+        for i in 0..MAX_PORTALS_PER_SESSION {
+            if handle_parse_body(
+                &core,
+                &session,
+                &mut txn,
+                &mut state.statements,
+                &parse_unnamed(pad),
+            )
+            .is_err()
+            {
+                rejected = true;
+                break;
+            }
+            let mut bind = format!("p{i}").into_bytes();
+            bind.push(0);
+            bind.push(0);
+            bind.extend_from_slice(&[0, 0, 0, 0, 0, 0]);
+            handle_bind_body(&core, &session, &mut txn, &mut state, &bind)
+                .map_err(|_| ())
+                .expect("bind");
+            accepted += 1;
+        }
+        assert!(
+            rejected,
+            "旧文を保持する portal があっても Parse が拒否されない"
+        );
+        assert!(accepted <= MAX_PREPARED_SQL_BYTES_PER_SESSION / pad);
+        // 旧文を保持する portal を閉じると容量が戻る。
+        state.portals.clear_all();
+        handle_parse_body(
+            &core,
+            &session,
+            &mut txn,
+            &mut state.statements,
+            &parse_unnamed(pad),
+        )
+        .map_err(|_| ())
+        .expect("parse after portals closed");
         let _ = std::fs::remove_file(&path);
     }
 
