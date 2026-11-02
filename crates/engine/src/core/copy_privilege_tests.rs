@@ -603,11 +603,12 @@ fn explicit_txn_copy_uses_begin_snapshot_acl() {
         .expect("begin");
     f.admin_run("GRANT INSERT ON ca TO alice");
     f.admin_run("GRANT SELECT ON ca TO alice");
-    let e = f
+    let Err(e) = f
         .core
         .begin_copy_in_txn(&ctx(), &s, &mut txn, &copy_from("ca", "bs1"))
-        .err()
-        .expect("insert granted after BEGIN is not visible");
+    else {
+        panic!("insert granted after BEGIN must not be visible");
+    };
     assert_eq!(e.wire_code(), "42501");
     f.core
         .execute_sql_in_txn(&ctx(), &mut s, &mut txn, "ROLLBACK")
