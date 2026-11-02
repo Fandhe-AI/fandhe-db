@@ -740,6 +740,21 @@ mod tests {
     }
 
     #[test]
+    fn recursive_cte_self_reference_is_not_a_relation() {
+        assert!(names(
+            "WITH RECURSIVE r(n) AS (SELECT 1 UNION SELECT n + 1 FROM r WHERE n < 3) SELECT n FROM r"
+        )
+        .is_empty());
+        // 再帰 CTE の本文の基底表は引き続き数える。
+        assert_eq!(
+            names(
+                "WITH RECURSIVE r(n) AS (SELECT n FROM base UNION SELECT n FROM r) SELECT n FROM r"
+            ),
+            vec!["base"]
+        );
+    }
+
+    #[test]
     fn cte_name_hides_only_where_visible() {
         // 非再帰 CTE は自身の本文から見えない（同名の実リレーションを読む）。
         assert_eq!(

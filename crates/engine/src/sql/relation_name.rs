@@ -810,7 +810,7 @@ pub(crate) fn collect_cte_names(tokens: &[Token]) -> Vec<String> {
 pub(crate) struct CteScope {
     /// CTE 名（利用者が書いたとおり）。
     pub name: String,
-    /// 可視範囲の開始添字（自身の本文の `)` の直後。自身の本文と先行する CTE の本文は含まない）。
+    /// 可視範囲の開始添字（非再帰は自身の本文の `)` の直後、`WITH RECURSIVE` は `RECURSIVE` の直後。自身の本文と先行する CTE の本文は含まない）。
     pub visible_from: usize,
     /// 可視範囲の終了添字（排他。`WITH` を含む括弧の `)`、無ければ末尾）。
     pub visible_to: usize,
@@ -834,8 +834,12 @@ pub(crate) fn collect_cte_scopes(tokens: &[Token]) -> Vec<CteScope> {
         }
         let scope_end = enclosing_scope_end(tokens, start);
         let mut j = start + 1;
+        // `WITH RECURSIVE` の CTE 名は同じ WITH 句のすべての本文（自己参照を含む）から見える。
+        // 自己参照を実表として拾うと、実表を読まない再帰 CTE まで権限検査で拒否されてしまう。
+        let mut recursive_from = None;
         if ident_is(tokens.get(j), "RECURSIVE") {
             j += 1;
+            recursive_from = Some(j);
         }
         while let Some(name) = tokens.get(j).and_then(unqualified_ident_name) {
             j += 1;
@@ -864,7 +868,7 @@ pub(crate) fn collect_cte_scopes(tokens: &[Token]) -> Vec<CteScope> {
             j = after;
             out.push(CteScope {
                 name: name.to_string(),
-                visible_from: after,
+                visible_from: recursive_from.unwrap_or(after),
                 visible_to: scope_end,
             });
             if matches!(tokens.get(j), Some(Token::Punct(','))) {
