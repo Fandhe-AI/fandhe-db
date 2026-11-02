@@ -1037,6 +1037,11 @@ pub(crate) fn map_outcome(outcome: SqlOutcome) -> OutcomeResponse {
             // Issue #2232: ロール形も権限形も PostgreSQL 17 と同じ `GRANT`／`REVOKE`（CMDTAG_GRANT／REVOKE）。
             tag: if o.is_revoke() { "REVOKE" } else { "GRANT" }.to_string(),
         },
+        // SQL-40（Issue #2237）: `ALTER DEFAULT PRIVILEGES` は件数を持たない固定タグ（PostgreSQL と同じ。
+        // `GRANT`／`REVOKE` の別なく同じ）。
+        SqlOutcome::AlterDefaultPrivileges(_) => OutcomeResponse::Command {
+            tag: "ALTER DEFAULT PRIVILEGES".to_string(),
+        },
         // SQL-40（Issue #2236）: `ALTER ... OWNER TO` は対象の種別に応じた `ALTER <種別>` タグ
         // （PostgreSQL と同じ。件数なし）。
         SqlOutcome::AlterOwner(o) => OutcomeResponse::Command {

@@ -30,6 +30,7 @@ use super::role::validate_tenant;
 use super::{validate_identifier, validate_relation_key, CatalogError, Result, Storage};
 
 mod apply;
+pub(crate) mod default_acl;
 mod function;
 pub(crate) mod owner;
 mod owner_change;
