@@ -1,6 +1,6 @@
 //! `SELECT ... FOR UPDATE／SHARE ...` の行ロック句（SQL-38・Issue #2230）の pg wire 結合テスト。
 //! 簡易クエリ（'Q'）の往復、拡張クエリ（Parse／Bind／Execute／Sync）、2 クライアント間の `NOWAIT` の
-//! `55P03`（ReadyForQuery の状態は autocommit なら `I`）を固定する。時間計測は使わない。
+//! `NOWAIT`・`SKIP LOCKED`（#2231）の pg wire 経路を固定する（SQL-38 (4)(5)）。時間計測は使わない。
 
 use crate::common;
 
@@ -116,16 +116,106 @@ fn nowait_from_second_client_is_55p03_until_first_commits() {
     assert_eq!(read_ready_for_query_status(&mut second), b'I');
 }
 
+/// `SKIP LOCKED` の簡易クエリ経路（SQL-38 (4)・#2231）。期待値の詳細はアサーションが正。
 #[test]
-fn skip_locked_is_0a000_over_the_wire() {
+fn skip_locked_from_second_client_is_zero_rows_until_first_commits() {
     let (addr, _g) = start();
-    let mut s = client(addr);
+    let mut first = client(addr);
+    let mut second = client(addr);
+
+    send_simple_query(&mut first, "BEGIN");
+    assert_eq!(read_command_complete(&mut first), "BEGIN");
+    read_ready_for_query(&mut first);
     send_simple_query(
-        &mut s,
-        "SELECT id FROM t WHERE id = 1 LIMIT 10 FOR UPDATE SKIP LOCKED",
+        &mut first,
+        "SELECT id FROM t WHERE id = 1 LIMIT 10 FOR UPDATE",
     );
-    expect_error_response_with_sqlstate(&mut s, "0A000");
-    assert_eq!(read_ready_for_query_status(&mut s), b'I');
+    read_row_description(&mut first);
+    read_data_row(&mut first);
+    assert_eq!(read_command_complete(&mut first), "SELECT 1");
+    assert_eq!(read_ready_for_query_status(&mut first), b'T');
+
+    let skip = "SELECT id FROM t WHERE id = 1 LIMIT 10 FOR UPDATE SKIP LOCKED";
+    send_simple_query(&mut second, skip);
+    assert_eq!(read_row_description(&mut second), vec!["id".to_string()]);
+    assert_eq!(read_command_complete(&mut second), "SELECT 0");
+    assert_eq!(read_ready_for_query_status(&mut second), b'I');
+
+    // 明示 Tx の中でも 0 行で、ReadyForQuery は `T`（失敗状態 `E` にならない）。
+    send_simple_query(&mut second, "BEGIN");
+    assert_eq!(read_command_complete(&mut second), "BEGIN");
+    read_ready_for_query(&mut second);
+    send_simple_query(&mut second, skip);
+    assert_eq!(read_row_description(&mut second), vec!["id".to_string()]);
+    assert_eq!(read_command_complete(&mut second), "SELECT 0");
+    assert_eq!(read_ready_for_query_status(&mut second), b'T');
+    send_simple_query(&mut second, "ROLLBACK");
+    assert_eq!(read_command_complete(&mut second), "ROLLBACK");
+    assert_eq!(read_ready_for_query_status(&mut second), b'I');
+
+    send_simple_query(&mut first, "COMMIT");
+    assert_eq!(read_command_complete(&mut first), "COMMIT");
+    assert_eq!(read_ready_for_query_status(&mut first), b'I');
+
+    send_simple_query(&mut second, skip);
+    assert_eq!(read_row_description(&mut second), vec!["id".to_string()]);
+    assert_eq!(read_data_row(&mut second), vec![Some("1".to_string())]);
+    assert_eq!(read_command_complete(&mut second), "SELECT 1");
+    assert_eq!(read_ready_for_query_status(&mut second), b'I');
+}
+
+/// `SKIP LOCKED` の拡張クエリ経路（SQL-38 (4)・#2231）。期待値の詳細はアサーションが正。
+#[test]
+fn extended_query_skip_locked_returns_zero_rows_while_held() {
+    let (addr, _g) = start();
+    let mut first = client(addr);
+    let mut second = client(addr);
+
+    send_simple_query(&mut first, "BEGIN");
+    assert_eq!(read_command_complete(&mut first), "BEGIN");
+    read_ready_for_query(&mut first);
+    send_simple_query(
+        &mut first,
+        "SELECT id FROM t WHERE id = 1 LIMIT 10 FOR UPDATE",
+    );
+    read_row_description(&mut first);
+    read_data_row(&mut first);
+    read_command_complete(&mut first);
+    read_ready_for_query(&mut first);
+
+    send_length_prefixed_message(
+        &mut second,
+        b'P',
+        &parse_body(
+            "",
+            "SELECT id FROM t WHERE id = 1 LIMIT 10 FOR UPDATE SKIP LOCKED",
+            0,
+        ),
+    );
+    send_length_prefixed_message(&mut second, b'B', &bind_body("", ""));
+    send_length_prefixed_message(&mut second, b'E', &execute_body("", 0));
+    send_length_prefixed_message(&mut second, b'S', &[]);
+    let mut tags = Vec::new();
+    let mut rows = 0;
+    loop {
+        let (t, body) = read_message(&mut second);
+        match t {
+            b'C' => tags.push(String::from_utf8_lossy(&body[..body.len() - 1]).to_string()),
+            b'D' => rows += 1,
+            b'Z' => {
+                assert_eq!(body.last().copied(), Some(b'I'));
+                break;
+            }
+            b'1' | b'2' | b'T' | b'n' => {}
+            other => panic!("unexpected message {}", other as char),
+        }
+    }
+    assert_eq!(tags, vec!["SELECT 0".to_string()]);
+    assert_eq!(rows, 0);
+
+    send_simple_query(&mut first, "COMMIT");
+    assert_eq!(read_command_complete(&mut first), "COMMIT");
+    read_ready_for_query(&mut first);
 }
 
 #[test]
