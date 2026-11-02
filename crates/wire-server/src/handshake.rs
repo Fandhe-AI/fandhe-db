@@ -1303,6 +1303,9 @@ enum PrincipalKind {
     UsersFile,
     /// カタログのロール。テナントはロールの所属から決まる（クライアントの申告は使わない）。
     CatalogRole(CatalogPrincipal),
+    /// 同名のカタログのロールへ対応づけた users ファイルのユーザー（Issue #1971）。束縛・属性の判定は
+    /// `CatalogRole` と共通だが、DDL 権限の付与は users ファイルの経路（`--ddl-allowed-users`）に従う。
+    UsersFileBound(CatalogPrincipal),
 }
 
 /// 認証済みのカタログのロール。検証の後の判定（LOGIN 属性・`CONNECTION LIMIT`）と、セッションへの
@@ -1325,7 +1328,7 @@ fn authenticate<S: WireStream>(
     username: &str,
 ) -> Result<AuthOutcome> {
     match store.auth_method() {
-        AuthMethod::Cleartext => authenticate_cleartext(stream, store, username),
+        AuthMethod::Cleartext => authenticate_cleartext(stream, store, engine, username),
         AuthMethod::ScramSha256 => authenticate_scram(stream, store, engine, username),
     }
 }
@@ -1334,21 +1337,39 @@ fn authenticate<S: WireStream>(
 fn authenticate_cleartext<S: WireStream>(
     stream: &mut S,
     store: &UserStore,
+    engine: Option<&engine::core::EngineCore>,
     username: &str,
 ) -> Result<AuthOutcome> {
     write_authentication_cleartext_password(stream)?;
     let password = read_password_message(stream)?;
-    match auth::verify(store, username, &password) {
+    match auth::users_file_role::verify_and_bind(store, engine, username, &password) {
         Err(_failure) => {
             write_error_response(stream, ErrorClass::AuthInvalid, auth::AuthFailure::MESSAGE)?;
             Ok(AuthOutcome::Failure)
         }
-        // cleartext 方式はカタログのロールを照合しない（`:` を含む識別子は users ファイルに存在できず、
-        // 未知ユーザーとして同じ `28P01` になる。Issue #2233・J5）。
-        Ok(ctx) => Ok(AuthOutcome::Success(AuthenticatedPrincipal {
+        // cleartext 方式はカタログのロールのパスワードを照合しない（`:` を含む識別子は users ファイルに
+        // 存在できず、未知ユーザーとして同じ `28P01` になる。Issue #2233・J5）。users ファイルのユーザーは、
+        // カタログが正のテナントでは同名ロールへ対応づける（Issue #1971。失敗は上の `Err` と同じ応答）。
+        Ok((ctx, binding)) => Ok(AuthOutcome::Success(AuthenticatedPrincipal {
             ctx,
-            kind: PrincipalKind::UsersFile,
+            kind: users_file_kind(binding),
         })),
+    }
+}
+
+/// users ファイルの対応づけ結果を主体の種別へ写す（`Reject` は呼び出し側が失敗へ畳むため、ここへは
+/// 来ない。万一来ても権限を広げない未束縛へは倒さず、束縛しない種別を返さない設計上 `UsersFile`）。
+fn users_file_kind(binding: auth::users_file_role::UsersFileBinding) -> PrincipalKind {
+    match binding {
+        auth::users_file_role::UsersFileBinding::Bound(b) => {
+            PrincipalKind::UsersFileBound(CatalogPrincipal {
+                role_id: b.role_id,
+                role_name: b.role_name,
+                login: b.login,
+                connection_limit: b.connection_limit,
+            })
+        }
+        _ => PrincipalKind::UsersFile,
     }
 }
 
@@ -1549,6 +1570,26 @@ fn authenticate_scram<S: WireStream>(
         }
     }
 
+    // users ファイルのユーザーは、証明の検証が通った後に同名ロールへ対応づける（Issue #1971）。対応づけの
+    // 失敗（カタログが正のテナントで同名ロールが無い・期限切れ・読み取り失敗）は、誤パスワードと同じ
+    // `success = false` に畳み、同じ `28P01`・同じ遅延へ収束させる（パスワードを知らない相手に区別させない）。
+    let mut users_file_principal: Option<CatalogPrincipal> = None;
+    if success && catalog_principal.is_none() {
+        let tenant = tenant_id.as_deref().unwrap_or_default();
+        match auth::users_file_role::bind_users_file_user(engine, tenant, username) {
+            auth::users_file_role::UsersFileBinding::Unbound => {}
+            auth::users_file_role::UsersFileBinding::Bound(b) => {
+                users_file_principal = Some(CatalogPrincipal {
+                    role_id: b.role_id,
+                    role_name: b.role_name,
+                    login: b.login,
+                    connection_limit: b.connection_limit,
+                });
+            }
+            auth::users_file_role::UsersFileBinding::Reject => success = false,
+        }
+    }
+
     let elapsed = verify_start.elapsed();
     if !success && elapsed < auth::AUTH_FAILURE_DELAY {
         std::thread::sleep(auth::AUTH_FAILURE_DELAY - elapsed);
@@ -1568,9 +1609,10 @@ fn authenticate_scram<S: WireStream>(
     let tenant_id = tenant_id.ok_or(HandshakeError::Protocol("unreachable: missing tenant_id"))?;
     let ctx = auth::session_policy_context(&tenant_id)
         .map_err(|_| HandshakeError::Protocol("policy context rejected tenant_id"))?;
-    let kind = match catalog_principal {
-        Some(p) => PrincipalKind::CatalogRole(p),
-        None => PrincipalKind::UsersFile,
+    let kind = match (catalog_principal, users_file_principal) {
+        (Some(p), _) => PrincipalKind::CatalogRole(p),
+        (None, Some(p)) => PrincipalKind::UsersFileBound(p),
+        (None, None) => PrincipalKind::UsersFile,
     };
     Ok(AuthOutcome::Success(AuthenticatedPrincipal { ctx, kind }))
 }
@@ -1797,9 +1839,15 @@ fn run_authenticated_session<S: WireStream>(
     // 区別できない）。拒否は AuthenticationOk の後の FATAL（固定文言。テナント・内部 ID を含めない）で、
     // BackendKeyData・ReadyForQuery は送らない。ガードはセッションの寿命の間保持し、どの経路で抜けても
     // drop で接続数が戻る。
+    // DDL 権限は users ファイルの経路（`--ddl-allowed-users`）にだけ付ける。ログイン識別子経由の主体には
+    // 付けない（Issue #1971・J7。束縛しても DDL 権限は広がらない）。
+    let ddl_by_users_file = matches!(
+        kind,
+        PrincipalKind::UsersFile | PrincipalKind::UsersFileBound(_)
+    );
     let (_role_connection_guard, catalog_role) = match kind {
         PrincipalKind::UsersFile => (None, None),
-        PrincipalKind::CatalogRole(p) => {
+        PrincipalKind::CatalogRole(p) | PrincipalKind::UsersFileBound(p) => {
             if !p.login {
                 let msg = crate::error_response::encode_fatal(
                     ErrorClass::AuthRequired,
@@ -1908,13 +1956,14 @@ fn run_authenticated_session<S: WireStream>(
     // 可視性のみを運び認証主体を持たないため、この判定は `ctx` ではなく
     // `store`（`--ddl-allowed-users`）に基づく。SQL 文経由でセッションが自身の
     // 権限を昇格させる経路は構造的に存在しない。
-    if store.is_ddl_allowed(&username) {
+    if ddl_by_users_file && store.is_ddl_allowed(&username) {
         session.allow_ddl();
     }
     // TABLE-27・Issue #1715: `search_path` の `"$user"` は、認証成功後に確定した username から
     // 展開する（接続ごとに 1 回だけ設定し、SQL 文から変える経路は持たない。ADR D6）。
     // カタログのロールでは、主体そのものがロールなので生のロール名（修飾子なし）を渡し、ロールの束縛も
-    // 行う（users ファイルのユーザーとロールの対応づけは #1971 の担当）。
+    // 行う。users ファイルのユーザーも、カタログが正のテナントでは認証時に同名ロールへ対応づけ済みで、
+    // 同じ束縛を行う（Issue #1971。ロールが無いテナントは従来どおり未束縛）。
     match &catalog_role {
         Some(p) => {
             session.set_session_user(&p.role_name);
