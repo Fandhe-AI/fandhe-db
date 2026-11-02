@@ -196,6 +196,7 @@ pub(crate) fn require_read_privileges(
         required_bits,
         &crate::sql::search_path::resolved_relation_ref_names(&resolved),
         read_snap,
+        false,
     )
 }
 
@@ -229,6 +230,7 @@ pub(crate) fn require_read_privileges_resolved(
         required_bits,
         &crate::sql::search_path::resolved_relation_ref_names(resolved_tokens),
         read_snap,
+        true,
     )
 }
 
@@ -240,6 +242,7 @@ fn require_relations(
     required_bits: u16,
     candidates: &[String],
     read_snap: Option<&redb::ReadTransaction>,
+    missing_is_stale: bool,
 ) -> Result<(), SqlSurfaceError> {
     let mut names: Vec<String> = Vec::new();
     for name in candidates {
@@ -266,7 +269,16 @@ fn require_relations(
         None => storage.relation_grant_bits(tenant, &names, role_id),
     }
     .map_err(crate::catalog::table_lookup_error)?;
-    for granted in bits.into_iter().flatten() {
+    for (name, granted) in names.iter().zip(bits) {
+        let Some(granted) = granted else {
+            // 準備済み文（Parse 済みで名前解決済みのトークン列）の参照先が消えている場合は、別セッションの
+            // DROP 後に展開済みの文だけが残った状態であり、検査を省略すると SET ROLE 後のロールが
+            // 権限なしで基底表を読める認可バイパスになる。fail-closed で拒否する（fail-open にしない）。
+            if missing_is_stale {
+                return Err(SqlSurfaceError::undefined_table(name.as_str()));
+            }
+            continue;
+        };
         check(
             principal,
             PrivilegeTarget::Relation {
@@ -303,6 +315,7 @@ pub(crate) fn require_table_select(
         PRIV_SELECT,
         &[table.to_string()],
         None,
+        false,
     )
 }
 

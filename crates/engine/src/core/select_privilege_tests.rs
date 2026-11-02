@@ -411,6 +411,31 @@ fn portal_execute_rechecks_privileges_after_bind() {
     assert_eq!(e.wire_code(), "42501");
 }
 
+/// Bind 後に参照先が DROP されても、Execute 前の再検査は検査を省略せず拒否する（fail-closed。
+/// 展開済みの文だけが残って、権限の無いロールが読めてしまう経路を作らない）。
+#[test]
+fn portal_execute_denies_when_referenced_relation_was_dropped() {
+    let f = fx("selpriv-portal-dropped");
+    let sql = "SELECT id FROM ca LIMIT 5";
+    f.admin_run("GRANT SELECT ON ca TO alice");
+    let s = bound(f.alice, A, false);
+    let prepared = f
+        .core
+        .parse_sql_prepared_with_declared_in_session(&s, sql, &[])
+        .expect("parse");
+    let txn = f.core.new_session_transaction();
+    let parsed = f
+        .core
+        .bind_prepared_in_txn(&s, &txn, &prepared, &[])
+        .expect("bind");
+    f.admin_run("DROP TABLE ca");
+    let e = f
+        .core
+        .recheck_prepared_read_privileges_in_txn(&s, &txn, &prepared, &parsed)
+        .expect_err("dropped relation must not skip the check");
+    assert_eq!(e.wire_code(), "42P01");
+}
+
 #[test]
 fn bound_http_read_api_is_checked_before_binding() {
     let f = fx("selpriv-http");

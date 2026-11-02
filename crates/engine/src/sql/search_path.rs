@@ -657,6 +657,16 @@ mod tests {
     }
 
     #[test]
+    fn recursive_cte_self_reference_is_not_a_relation_ref() {
+        let sql = "WITH RECURSIVE docs(n) AS (SELECT 1 UNION ALL SELECT n+1 FROM docs WHERE n<3) \
+                   SELECT n FROM docs";
+        assert!(names(sql).is_empty());
+        // 非再帰 CTE の本文の同名参照は実テーブルのまま数える。
+        let sql = "WITH docs AS (SELECT 1 FROM docs) SELECT * FROM docs";
+        assert_eq!(names(sql), vec!["docs".to_string()]);
+    }
+
+    #[test]
     fn default_value_displays_as_user_then_public() {
         assert_eq!(SearchPath::default().display(), "\"$user\", public");
     }
