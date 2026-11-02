@@ -1031,6 +1031,26 @@ nosql16_explain_targets.rs`（`vector` 指定 `search`・`scan`・`aggregate` �
 実行して列名・型・行集合の一致を検証する層 B `three_client_http_e2e.rs`
 （Issue #779。`make e2e-three-client-http`）でも固定している。
 
+### 行セキュリティポリシーの適用
+
+SQL の `CREATE POLICY` で定義した利用者ポリシー（RLS-13）は、NoSQL の各 op にも SQL と同じ規則で効く
+（同じ実行器を共有し、第 2 の評価器は無い。テナント境界が常に先で、ポリシーはその内側で行を狭めるだけ）。
+
+- 読み取り（`scan`・`search`〔`vector`〕・`aggregate`。主キー等値の点取得を含む）: `SELECT` の `USING`
+  を通る行だけが対象。除外された行は存在しない行と区別できない（件数・集計・`explain` にも含めない）
+- 書き込み（`insert`・`update`・`delete`。単一行形・述語形・`mode: "partitioned"`）: `USING` で対象行を
+  選び、書く行は `WITH CHECK` を満たす必要がある。違反は `42501`（403）。`where` 単一行形で隠れた行を
+  指すと、存在しない `id` を指したときと同じ応答（`updated: 0`／`deleted: 0`）になる
+- 適用表への `search` + `plan` は、SQL の `USING PLAN` と同じく辞書構築を拒否する（fail-closed。
+  現状は内部エラー分類の `XX000`・500。表名・ポリシー名は応答に含めない）
+- NoSQL からポリシーを定義・変更する手段は無い（`create_policy` は語彙外の `0A000`、`alter_table` の
+  行セキュリティ用キーは閉じたスキーマで `42601`）。`row_security` は常に on で、HTTP の主体は
+  ロール未束縛（所有者除外・`BYPASSRLS` は効かない）
+- 一意性はテナント内で判定するため、ポリシーで見えない同テナントの行と `id` が衝突する `insert` は
+  `23505` になる（他テナントの行とは衝突しない）
+
+検証コード: `crates/wire-server/tests/http_nosql/rls13_nosql_policy.rs`。
+
 ## エラー応答
 
 本節の数値・文言は spec 由来の閾値ではなく、`crates/wire-server/src/http/
@@ -1195,14 +1215,14 @@ Date: <IMF-fixdate>
 | `28000` | `AUTH_REQUIRED` | 401 | Unauthorized | `Authorization` ヘッダ欠落 |
 | `28P01` | `AUTH_INVALID` | 401 | Unauthorized | トークン形式不正・失効・セッション未存在 |
 | `25006` | `READ_ONLY_SQL_TRANSACTION` | 403 | Forbidden | 読み取り専用トランザクション内で書き込み系の文を実行した（SQL 表層専用。NoSQL にはトランザクション制御が無く到達不能。Issue #1934・ERR-6） |
-| `42501` | `FORBIDDEN_TENANT_MISMATCH` | 403 | Forbidden | NoSQL 表層の実要求からは到達不能（射影のみ production エンコーダで固定。後述） |
+| `42501` | `FORBIDDEN_TENANT_MISMATCH` | 403 | Forbidden | DDL 実行権限の不足、または `insert`／`update` が行セキュリティポリシーの `WITH CHECK` に違反した（RLS-13。`code` は補助ラベルで、ポリシー違反も同じ値。応答に行の値・テナント ID・ポリシーの内容は含めない。後述「行セキュリティポリシーの適用」） |
 | `34000` | `INVALID_CURSOR_NAME` | 404 | Not Found | NoSQL 表層の実要求からは到達不能（カーソル〔`DECLARE`／`FETCH`／`CLOSE`〕は SQL 表層専用で op 許可リストに無い。後述） |
 | `3F000` | `INVALID_SCHEMA_NAME` | 404 | Not Found | 呼び出し元テナントに存在しない SCHEMA を指した（TABLE-27・Issue #1713。他テナントの名前も同じ応答。NoSQL 表層からは到達しない） |
 | `42P01` | `TABLE_NOT_FOUND` | 404 | Not Found | 未定義テーブルへの `search`／`scan`／`aggregate`／`insert` |
 | `P0002` | `ROW_NOT_FOUND` | 404 | Not Found | NoSQL 表層の実要求からは到達不能（対応する op が許可リストに無い。後述） |
 | `P0002` | `NO_DATA_FOUND` | 404 | Not Found | PL/pgSQL の `INTO STRICT` が 0 行（`wire_code` は `ROW_NOT_FOUND` と共有。SQL 表層の PL/pgSQL 専用で NoSQL の `op` 語彙からは到達しない）。Issue #2225・SQL-68 |
 | `23503` | `FOREIGN_KEY_VIOLATION` | 409 | Conflict | `FOREIGN KEY`（TABLE-17・TASK-205）を宣言したテーブルへの `insert`／`update` で参照先の値が同一テナント内に無い、または参照先の `update`／`delete` で参照元の行が残る |
-| `23505` | `UNIQUE_VIOLATION` | 409 | Conflict | 行 `id` の重複、`PRIMARY KEY`／UNIQUE 制約のテナント内一意性違反（`insert`／`update`）。行制約由来のため commit 済みの根拠にならない |
+| `23505` | `UNIQUE_VIOLATION` | 409 | Conflict | 行 `id` の重複、`PRIMARY KEY`／UNIQUE 制約のテナント内一意性違反（`insert`／`update`。行セキュリティポリシーで見えない同テナントの行との衝突でも起きる。一意性はテナント内で判定する）。行制約由来のため commit 済みの根拠にならない |
 | `23505` | `DUPLICATE_OPERATION_ID` | 409 | Conflict | 台帳照合で内容一致と判定された `operation_id` の再送（`insert`／`update`／`delete`。`wire_code` は `UNIQUE_VIOLATION` と共有し `code` で区別。commit 済み確定の根拠。Issue #1180） |
 | `23514` | `CHECK_VIOLATION` | 409 | Conflict | `insert`／`update` が書き込む行が `CHECK` 制約（TABLE-16・TASK-204）を満たさない |
 | `40001` | `SERIALIZATION_FAILURE` | 409 | Conflict | 明示トランザクションの writer 取得時に直列化の失敗を検出した（`ROLLBACK` の後に最初から再試行してよい。NoSQL の 1 要求は開始時に writer を取る暗黙トランザクションのため到達不能。TASK-333・Issue #2398・ERR-7） |
@@ -1218,7 +1238,7 @@ Date: <IMF-fixdate>
 | `55P03` | `LOCK_NOT_AVAILABLE` | 503 | Service Unavailable | SQL 表層の明示トランザクション（SQL-31・TASK-221）が単一ライタを保持している間に、書き込み op（`insert`／`update`／`delete`）が書き込みゲートの待機上限を超えた |
 | `57014` | `QUERY_CANCELED` | 503 | Service Unavailable | 実行中の文を協調的に打ち切った（クライアント切断の検出。Issue #1798）。SQL 表層の接続スレッドが起点で、現状 NoSQL の `op` からは到達しない |
 
-到達不能な 26 分類（`40001`・`25006`・`20000`・`2F005`・`P0003`・`21000`・`42501`・`34000`・`P0002`（`ROW_NOT_FOUND`・`NO_DATA_FOUND`）・`42701`・`42P07`・`2BP01`・
+到達不能な 25 分類（`40001`・`25006`・`20000`・`2F005`・`P0003`・`21000`・`34000`・`P0002`（`ROW_NOT_FOUND`・`NO_DATA_FOUND`）・`42701`・`42P07`・`2BP01`・
 `42809`・`42703`・`42804`・`42710`・`42723`・`42P13`・`25000`・`25001`・`25P01`・`25P02`・`55000`・`44000`・`3B001`）の理由: NoSQL 表層はテナントをセッション
 （`SessionPrincipal::policy_context()`）からのみ導出し、クライアント自己申告の
 `tenant_id` 相当値は JSON／ヘッダ／パスいずれの位置でも `42601` で先に拒否する

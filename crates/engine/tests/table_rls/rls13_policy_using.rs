@@ -950,3 +950,35 @@ fn ranked_search_applies_policies_only_for_tables_where_they_apply() {
     disable_rls(&core);
     assert_eq!(ids_as(&core, "alice", sql), unrestricted);
 }
+
+// ---------------------------------------------------------------------
+// 5. COPY ... TO STDOUT への適用（Issue #2280）
+// ---------------------------------------------------------------------
+
+/// `COPY <table> TO` と `COPY (SELECT ...) TO` は SELECT と同じ USING に従う（適用できるポリシーが無ければ 0 行）。
+/// 期待値は組合せ行列ごとの独立オラクル（`expected_select`）。他テナントの Private 行は常に出ない。
+#[test]
+fn copy_to_matches_select_oracle_for_every_policy_combination() {
+    use engine::core::CopyPlan;
+    for (i, pols) in cases().iter().enumerate() {
+        let (core, _g) = open_core(&format!("rls13-using-copyto-{i}"));
+        setup_policies(&core, pols);
+        let expected = expected_select(pols);
+        for sql in [
+            "COPY docs TO STDOUT",
+            "COPY (SELECT * FROM docs LIMIT 100) TO STDOUT",
+        ] {
+            let CopyPlan::To(_, r, _) = core
+                .begin_copy(&ctx("alice"), &ddl_session(), sql)
+                .unwrap_or_else(|e| panic!("case {i}: {sql}: {e}"))
+            else {
+                panic!("expected TO plan");
+            };
+            assert_eq!(
+                sorted(r.rows.iter().map(|row| row.id).collect()),
+                expected,
+                "case {i}: {sql}"
+            );
+        }
+    }
+}
