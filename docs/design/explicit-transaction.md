@@ -496,7 +496,8 @@ Failed { session_at_begin: SessionState, expired: bool } }`）。`ActiveTxn` は
 - **`Active` 中のどの文でエラーが起きても**、その場で `write_txn` を abort
   し permit を解放して `Failed`（ロックは保持しない）へ遷移し、元のエラーを
   そのまま返す。Failed 状態から `COMMIT` はできないため、失敗した文が残した
-  部分書き込みが永続化されることはない。**redb の savepoint は不要**。
+  部分書き込みが永続化されることはない。**文エラーの扱いに redb の savepoint は不要**
+  （`ROLLBACK TO` の巻き戻しでの利用は「savepoint の redb 結線（Issue #1943）」節を参照）。
   構文・許可リスト検証のエラー（`execute_sql_in_txn` の `parse_sql` 失敗）、
   簡易クエリの複数文分割・位置検証のエラー、拡張クエリプロトコルの
   Parse／Bind／Describe／Execute のエラー応答も同じく `Failed` へ遷移させる
@@ -895,7 +896,7 @@ production コード（`crates/wire-server/src/`）は無変更・テスト専�
 
 - ポインタ: `docs/spec/04-behavior/sql-surface.md` SQL-69。
 - 範囲: `SAVEPOINT`／`RELEASE`／`ROLLBACK TO` の構文解釈と、`ActiveTxn` が持つ名前付き
-  スタック（`sql::savepoint::SavepointStack`）まで。**巻き戻し本体は親 Issue #1941**。
+  スタック（`sql::savepoint::SavepointStack`）まで。巻き戻しは Issue #1943（次節）。
 - 表現: `TxnControl` に 3 variant、`ValidatedTxnControl` に `savepoint_name` を追加した
   （新しい `ParsedSql` variant は作らない。`ParsedSql::Transaction` を列挙する既存の分岐
   〔一時表のトークン走査免除・Describe・制御文脈の無い入口の拒否〕がそのまま効くため）。
@@ -904,8 +905,9 @@ production コード（`crates/wire-server/src/`）は無変更・テスト専�
   `is_rollback_statement`）、`core.rs` の `ParsedSql::Transaction` 分岐、複数文の分割器
   （`ROLLBACK TO` を Tx 終了の `ROLLBACK` と区別し `in_txn` を変えない）。
 - 上限: 3 文とも文数・持続時間の上限に計上する（スタック長が文数上限で有界になる）。
-- fail-closed: 巻き戻しが未実装の間、`ROLLBACK TO` は成功させず必ず Tx を `Failed` へ倒す
-  （取り消したつもりの書き込みが後続の `COMMIT` で確定する fail-open を避ける）。
+- fail-closed: 巻き戻せない `ROLLBACK TO` は成功させず必ず Tx を `Failed` へ倒す
+  （取り消したつもりの書き込みが後続の `COMMIT` で確定する fail-open を避ける。#1943 で
+  巻き戻せる条件が定まった。次節）。
 - `is_rollback_statement` は `ROLLBACK TO ...` で `false`（Failed 中は一律 `25P02`）。
   Failed は `ActiveTxn` を捨てるためスタックが残らず、Failed からの `ROLLBACK TO` 復帰は
   #1941 でスタックの引き継ぎとあわせて扱う。
@@ -916,6 +918,54 @@ production コード（`crates/wire-server/src/`）は無変更・テスト専�
 - テスト: `crates/engine/tests/sql_t40_up/sql69_savepoint_syntax.rs`・
   `crates/wire-server/tests/wire_proto/sql69_savepoint_syntax.rs`、単体は
   `sql::savepoint`・`sql::transaction`・`sql::statement_splitter`。
+
+## savepoint の redb 結線（Issue #1943・SQL-69 ポインタ）
+
+本節はポインタ表記と実装上の判断のみ（spec 本文は転記しない）。ポインタ:
+`docs/spec/04-behavior/sql-surface.md` SQL-69（(3) は writer の保持）。
+
+- 採用する API: `WriteTransaction::ephemeral_savepoint`／`restore_savepoint`。
+  `persistent_savepoint` は採用しない（`Durability::Immediate` が必須で
+  `WriteDurability::None` の構成と両立せず、system table に残るため後始末と crash の
+  残骸の問題が出る）。
+- redb 4.2.0 の保証と制約（`transactions.rs` で確認）:
+  - dirty（テーブルを一度でも開いた）な write txn からは savepoint を作れない
+    （`InvalidSavepoint`）。dirty は一度立つと下りない。
+  - 取れるのは確定済みの root で、トランザクション途中の状態ではない。
+  - 復元すると、それより後に作った savepoint は無効になる。同じ savepoint へは何度でも復元できる。
+  - 復元時にテーブルのハンドルが開いていると panic する（assert）。
+  - 生存中は作成後に不要になったページの解放が遅れる。
+- 帰結: 巻き戻せるのは「writer が最初にテーブルを開く前の状態」だけである。
+  書き込み後に作った savepoint の巻き戻しは redb の API だけでは実現できない
+  （engine 層の undo 記録などの別方式が要る。要否はオーナー判断）。
+- 本 DB での結線:
+  - 各 savepoint に種別を持たせる（`sql::savepoint::SavepointKind`）。`Restorable` は作成時に
+    writer 未取得、または writer 取得済みで redb の probe（`ephemeral_savepoint`）が成功した
+    もの。`Unrestorable` は probe が `InvalidSavepoint` だったもの。engine の書き込み記録には
+    頼らない（記録漏れで savepoint より前の書き込みまで巻き戻す事故を構造的に避ける）。
+    スタックは古い側から `[Restorable…, Unrestorable…]` の順に並ぶ。
+  - 基底 savepoint（`ActiveTxn::savepoint_base`）は、writer 取得直後（テーブルを開く前。
+    `ensure_writer_with`）か、`SAVEPOINT` 時の最初の probe 成功で取る。`Restorable` が
+    1 つも残らなくなる `RELEASE` と、`COMMIT` の確定処理の前に解放する。
+  - `ROLLBACK TO` は writer が無ければ何もせず、あれば `restore_savepoint(基底)` を呼ぶ。
+    成功後に対象より新しい savepoint を除く（対象は残す）。writer・登録・読み取りスナップ
+    ショットには触れず、writer は Tx の終了まで保持する（SQL-69 (3)）。
+  - fail-closed（Tx を `Failed` にする）: `Unrestorable` は `0A000`、一時表の書き込み
+    トランザクションが開いている Tx は `0A000`（別ストアのため片側だけ巻き戻る fail-open を
+    避ける）、基底の欠落・redb エラーは `XX000`（詳細は返さない）。
+  - 復元後に作る savepoint は redb が dirty になるため `Unrestorable` になる（保守側の制約）。
+    `LOCK TABLE` などで writer を先に取っても、テーブルを開くため同様に `Unrestorable`。
+- 付随状態: 復元後も `has_writes`・`written_tables`・`written_by_tenant`・
+  `seen_operation_ids`・commit 記録の足跡は実際より大きい集合のまま残す。読み取りは
+  writer 経由のまま復元後の root を見る・遅延 FK 検査の走査範囲は広いだけ・COMMIT は
+  内容の変わらない root を確定するだけ・他 Tx が余分に `40001` を受けうる、といずれも
+  安全側。精度の改善は #1944（台帳）・#1945（Tx 内キャッシュ・世代）、カーソルは #1946、
+  `Failed` からの復帰は #1947 の範囲。
+- 退けた案: Tx の途中で `Durability::None` の commit をして新しい writer で savepoint を取る
+  案。他セッションに未確定の状態が見え、分離が壊れるため退けた。
+- テスト: `crates/engine/tests/sql_t40_up/sql69_savepoint_rollback.rs`・
+  `crates/wire-server/tests/wire_proto/sql69_savepoint_syntax.rs`、単体は
+  `sql::savepoint`・`sql::transaction`。
 
 ## READ ONLY での書き込み拒否（SQL-38 (3)・ERR-6・Issue #1934）
 

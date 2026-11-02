@@ -485,6 +485,18 @@ impl CursorRegistry {
         self.cursors.get(name).map(|c| c.id)
     }
 
+    /// 次に払い出すカーソル識別子（savepoint 作成時の高水位として記録する）。
+    pub(crate) fn next_id(&self) -> u64 {
+        self.next_id
+    }
+
+    /// 識別子が `watermark` 以上のカーソル（その時点より後に宣言されたもの）をすべて閉じる。
+    /// `ROLLBACK TO SAVEPOINT` が、取り消した書き込みを具体化済みのカーソルを残さないために使う。
+    pub(crate) fn close_declared_since(&mut self, watermark: u64) {
+        self.cursors.retain(|_, c| c.id < watermark);
+        self.total_bytes = self.cursors.values().map(|c| c.bytes).sum();
+    }
+
     /// `name` のカーソルを閉じる。不在は `34000`（[`Self::fetch`] と同じ
     /// 固定文言・同じ fail-closed 契約）。
     pub(crate) fn close(&mut self, name: &str) -> Result<(), SqlSurfaceError> {
