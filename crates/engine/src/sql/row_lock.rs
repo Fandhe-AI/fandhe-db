@@ -6,7 +6,7 @@
 //!
 //! - 本モジュールは構文の解釈と、ほかの句との併用検査、複数句の待機方針の合成（[`RowLocking::writer_wait`]）
 //!   までを担う。ロックの取得（writer の取得・`NOWAIT`・保持期間）は `core::row_lock_exec`（#2230）、
-//!   `SKIP LOCKED` の実行（#2231）、`LOCK TABLE` は #1958 の担当で、本モジュールは writer に触れない。
+//!   `SKIP LOCKED` の実行（#2231）は同モジュールの担当、`LOCK TABLE` は #1958 の担当で、本モジュールは writer に触れない。
 //!   受理した形は `core::ParsedSql::LockingSelect` まで届き、待機方針（[`WriterWait`]）に従って実行段が
 //!   writer を取得する（ロックを取らずに素の SELECT として実行する fail-open を作らない）。
 //! - 呼び出し元は `core::EngineCore::parse_tokens_in`（行数制限句の正規化の後・名前解決の前に
@@ -89,8 +89,8 @@ impl RowLocking {
         &self.clauses
     }
 
-    /// writer 取得の待機方針を合成する（優先順位は `NOWAIT` > `SKIP LOCKED` > 待機。PostgreSQL の
-    /// 同一表に効く複数句の規則に合わせる。#2231）。呼び出し元は writer・ゲートに触れる前に呼ぶ。
+    /// writer 取得の待機方針を複数句から合成する（SQL-38 (4)・#2231。規則は spec 側を参照）。
+    /// 呼び出し元は writer・ゲートに触れる前に呼ぶ。
     pub(crate) fn writer_wait(&self) -> WriterWait {
         compose_writer_wait(&self.clauses)
     }
@@ -100,11 +100,11 @@ impl RowLocking {
 /// `core::row_lock_exec`（実行段）と複数文メッセージの暗黙 Tx 開始（`core.rs`）が参照する。
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum WriterWait {
-    /// 待機あり（上限は書き込みゲートの待機上限。超過は `55P03`）。
+    /// 待機あり。
     Block,
-    /// `NOWAIT`: 待たずに取得を試み、他者保持中は即時 `55P03`。
+    /// `NOWAIT`。
     NoWait,
-    /// `SKIP LOCKED`: 待たずに取得を試み、他者保持中は行を読まずに 0 行を返す。
+    /// `SKIP LOCKED`。
     SkipLocked,
 }
 
@@ -126,9 +126,8 @@ pub struct LockingSelect {
     pub(crate) statement: Statement,
     pub(crate) locking: RowLocking,
     /// 名前解決済みのトークン列でテーブル参照位置にある表名（サブクエリ・CTE の内側を含む。列名・別名・
-    /// CTE 名は含まない。`schema.name` は内部キーへ解決済み）。`SKIP LOCKED` の空結果前の
-    /// `row_security = off` 拒否（RLS-13）が、外側の FROM に現れない表にも同じ判定を掛けるために使う
-    /// （writer の保持有無で拒否と空結果が分かれる存在オラクルを作らない）。
+    /// CTE 名は含まない。`schema.name` は内部キーへ解決済み）。`SKIP LOCKED` 実行段の RLS-13 判定が、
+    /// 外側の FROM に現れない表にも同じ判定を掛けるために使う。
     pub(crate) read_tables: Vec<String>,
 }
 
@@ -165,14 +164,12 @@ pub(crate) struct RowLockingSyntax {
 
 impl RowLockingSyntax {
     /// 構文段階の句から writer 取得の待機方針を合成する（[`RowLocking::writer_wait`] と同じ規則）。
-    /// 複数文メッセージの暗黙 Tx が writer を取得する前に、`SKIP LOCKED` の拒否（`0A000`）と
-    /// `NOWAIT` の反映を行うために使う（Issue #2230・#2231）。
+    /// 複数文メッセージの暗黙 Tx が writer を取得する前の判定に使う（Issue #2230・#2231）。
     pub(crate) fn writer_wait(&self) -> WriterWait {
         compose_writer_wait(&self.clauses)
     }
 
-    /// 元の句のいずれかが `SKIP LOCKED` か（合成結果ではなく句そのものを見る。`NOWAIT` と混在しても
-    /// `true`。複数文メッセージの `0A000` 判定用）。
+    /// 元の句のいずれかが `SKIP LOCKED` か（合成結果ではなく句そのものを見る。複数文メッセージの判定用）。
     pub(crate) fn has_skip_locked(&self) -> bool {
         self.clauses
             .iter()
@@ -897,7 +894,7 @@ mod tests {
         .writer_wait()
     }
 
-    /// 複数句の待機方針の合成（#2230・#2231）: NOWAIT > SKIP LOCKED > 待機。
+    /// 複数句の待機方針の合成（#2230・#2231。SQL-38 (4)）。
     #[test]
     fn writer_wait_composition() {
         use WriterWait::*;

@@ -8,19 +8,15 @@
 //! [`EngineCore::execute_locking_select_autocommit`] を呼ぶ。
 //!
 //! 単一ライタ（TABLE-3）のため、行・表・強度の粒度は区別せず writer の取得として扱う
-//! （`LOCK TABLE`〔`lock_exec`〕と同じ写像）。writer は明示 Tx なら COMMIT／ROLLBACK まで、
-//! autocommit なら文の終わりまで保持する。取得後の読み取りは句のない `SELECT` と同じ経路
-//! （`read_only_in_active_txn`）を通るため、結果と RLS の暗黙適用は同一になる。
+//! （`LOCK TABLE`〔`lock_exec`〕と同じ写像）。取得後の読み取りは句のない `SELECT` と同じ経路
+//! （`read_only_in_active_txn`）を通る。
 //!
-//! `SKIP LOCKED` は待たずに取得を試み、他セッションが保持していれば 0 行を返す（結果の行は捨てる）
-//! （句なし `SELECT` と同じ execute 経路を通すため 22000／42501 等の検査も効く）。0 行はテナントの可視行に
-//! 依存しないため、他テナントの行の存在・件数のオラクルにならない（SQL-38 (5)・RLS-12）。空結果の前に対象表の
-//! `row_security = off` 拒否（`policies_apply`。RLS-13）を行う。
-//! 取得できた場合は `SKIP LOCKED` を外した行ロック句と同じに扱い、`40001` 判定も効く。
+//! `SKIP LOCKED`（#2231）は writer の取得を試み、取得できなければ行を読まずに列メタデータだけで
+//! 空の結果を返す（`skip_locked_empty_result`）。対象表の RLS 判定（RLS-13）はその前に行う。
+//! 契約の詳細は spec 側（SQL-38 (4)(5)・RLS-12・RLS-13）を参照し、本書へは記述しない。
 //!
-//! fail-closed の順序: writer の取得（`55P03`／`SKIP LOCKED` の空結果／`40001`）→ 読み取り。
-//! ロックを取れなかった文が素の `SELECT` として行を返すことはない。エラー文言は固定で、
-//! tenant 名・表名を含まない。読み取り専用 Tx の `25006` は呼び出し元の許可リストが先に返す。
+//! 順序は fail-closed: writer の取得 → 読み取り。ロックを取れなかった文が素の `SELECT` として
+//! 行を返すことはなく、エラー文言は固定で tenant 名・表名を含まない。
 
 use super::EngineCore;
 use crate::policy::PolicyContext;
@@ -33,7 +29,7 @@ use redb::ReadableDatabase;
 impl EngineCore {
     /// 開いている Tx の上で行ロック句つき `SELECT` を実行する。writer は未取得なら遅延取得
     /// （#2396 の経路。`40001` 判定を含む）し、取得済みなら素通りする。dirty にはしない。
-    /// `SKIP LOCKED` で他者保持中なら writer を取らず、Tx は `Active` のまま 0 行を返す。
+    /// `SKIP LOCKED` で取得できなければ [`Self::skip_locked_empty_result`] へ回す。
     /// エラー時の `Failed` 遷移は呼び出し元が担う。
     pub(crate) fn execute_locking_select_in_active_txn<'e>(
         &'e self,
@@ -56,8 +52,8 @@ impl EngineCore {
 
     /// autocommit の行ロック句つき `SELECT` を、文単位の暗黙 Tx で実行する。待機方針は暗黙 Tx の
     /// 開始（writer 取得）の前に決める。成功時は書き込みなしとして writer を解放し、失敗時は
-    /// Tx の drop で abort する（permit を取り残さない）。`SKIP LOCKED` で他者保持中なら暗黙 Tx を
-    /// 開始せず（`Idle` のまま）0 行を返し、一時表の `ON COMMIT` だけ適用する。
+    /// Tx の drop で abort する（permit を取り残さない）。`SKIP LOCKED` で取得できなければ
+    /// [`Self::skip_locked_empty_result`] へ回す（#2231。契約は spec 側を参照）。
     pub(super) fn execute_locking_select_autocommit(
         &self,
         ctx: &PolicyContext,
@@ -87,11 +83,9 @@ impl EngineCore {
         Ok(outcome)
     }
 
-    /// `SKIP LOCKED` が writer を取得できなかったときの 0 行結果。句を除いた文の列メタデータを
-    /// Describe と同じ経路（`describe_parsed_in_txn_unscrubbed`／`describe_parsed_in_session_unscrubbed`。
-    /// 明示 Tx は `BEGIN` 時点のスナップショット）で導出し、行なしの結果として返す。行は読まないため、
-    /// 他者保持中の行の存在・件数は観測できず、全件走査も明示 Tx の read_set 取り込みも起きない。
-    /// `txn` が `Some` なら明示 Tx の経路。
+    /// `SKIP LOCKED` が writer を取得できなかったときの空結果（SQL-38 (4)(5)・RLS-12）。列メタデータは
+    /// Describe と同じ経路（`describe_parsed_in_txn_unscrubbed`／`describe_parsed_in_session_unscrubbed`）で
+    /// 導出し、行は読まない。`txn` が `Some` なら明示 Tx の経路。
     fn skip_locked_empty_result<'e>(
         &'e self,
         ctx: &PolicyContext,
@@ -114,15 +108,11 @@ impl EngineCore {
                 super::session_time_zone_scope(session),
             )),
         };
-        // 行走査を省いても、対象表の RLS 適用判定（`row_security = off` の 42501 拒否）は空結果の前に行う
-        // （RLS-13。writer の空き具合で拒否と空結果が分かれて存在のオラクルにならないよう、取得の成否に依らず同じ検査）。
+        // 対象表の RLS 適用判定（RLS-13）は、取得の成否に依らず空結果の前に同じ検査を行う。
         self.reject_skip_locked_row_security_off(ctx, session, txn, locking)?;
-        // 行を読む本体は実行せず、Describe と同じ列メタデータ導出（検索・集計の本体を呼ばない）だけを行う。
-        // 全件走査・結果バイト上限（54000）・明示 Tx の read_set 取り込みを起こさず、構文・列・
-        // `LIMIT`／`OFFSET` の範囲などの束縛時検査は Describe 経路で効く。
+        // 行を読む本体は実行せず、Describe と同じ列メタデータ導出だけを行う。
         let parsed = super::ParsedSql::Statement(locking.statement().clone());
-        // サブクエリを含む `SELECT` は Describe 経路が未解決のまま束縛して `42601` になるため、通常実行と同じ
-        // 「束縛前にサブクエリを解決」を内側の評価だけ行って通す（外側の行走査は省く）。
+        // サブクエリを含む `SELECT` は、通常実行と同じ「束縛前にサブクエリを解決」を通す。
         let columns = match self.describe_with_resolved_subqueries(ctx, session, txn, locking)? {
             Some(columns) => Some(columns),
             None => match txn {
@@ -352,7 +342,7 @@ impl EngineCore {
 
     /// `SKIP LOCKED` の空結果の前に、文が読む各表へ `row_policy::policies_apply` を適用する。
     /// 明示 Tx は `BEGIN` 時点のスナップショット（writer 未取得のため）、それ以外は確定済みの最新状態で判定する。
-    /// 適用表（RLS 有効）は行を読まないため素通りで、`row_security = off` のときだけ `42501` を返す。
+    /// 判定の規則は RLS-13 を参照（spec 側）。
     fn reject_skip_locked_row_security_off(
         &self,
         ctx: &PolicyContext,

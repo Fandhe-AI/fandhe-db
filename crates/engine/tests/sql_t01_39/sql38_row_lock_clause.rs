@@ -3,8 +3,7 @@
 //! ポインタ: `docs/spec/04-behavior/` SQL-38。
 //!
 //! 構文解釈・併用検査（`ParsedSql::LockingSelect` が得られること）と、実行（Issue #2230。writer の
-//! 取得・保持期間・句なし SELECT との結果同一性）と、`SKIP LOCKED` の実行（#2231。他セッション保持中は
-//! 0 行）を確かめる。一時表への行ロック句は未対応の `0A000` のまま。2 セッションの待機・時間計測を伴うテストは
+//! 取得・保持期間・句なし SELECT との結果同一性）と、`SKIP LOCKED` の実行（#2231）を確かめる。2 セッションの待機・時間計測を伴うテストは
 //! `tests/write_lock_wait.rs`（単独バイナリ）に置く。
 
 use engine::catalog::{ColumnDef, ColumnType, TableSchema};
@@ -381,8 +380,7 @@ fn hold_writer<'e>(
     txn
 }
 
-/// SQL-38 (4)・Issue #2231: writer が空いていれば `SKIP LOCKED` は句なしと同じ行を返し、
-/// 明示 Tx なら COMMIT まで writer を保持する（別セッションの NOWAIT は `55P03`）。
+/// SQL-38 (4)・Issue #2231: `SKIP LOCKED` で writer が空いている場合（期待値はアサーションが正）。
 #[test]
 fn skip_locked_acquires_free_writer_and_holds_it_in_txn() {
     let (core, path) = new_core();
@@ -418,7 +416,7 @@ fn skip_locked_acquires_free_writer_and_holds_it_in_txn() {
         .expect("commit");
 }
 
-/// 他セッションが保持中の autocommit `SKIP LOCKED` は 0 行（列は句なしと一致）。解放後は全行を返す。
+/// `SKIP LOCKED`・他セッション保持中・autocommit（SQL-38 (4)(5)・#2231）。
 #[test]
 fn skip_locked_returns_zero_rows_while_held_autocommit() {
     let (core, path) = new_core();
@@ -440,8 +438,7 @@ fn skip_locked_returns_zero_rows_while_held_autocommit() {
     assert_eq!(format!("{r:?}"), format!("{plain:?}"));
 }
 
-/// 他セッションが保持中の明示 Tx の `SKIP LOCKED` は 0 行で、Tx は `Active` のまま続行でき、
-/// writer も取らない。解放後の再実行は writer を取得して行を返す。
+/// `SKIP LOCKED`・他セッション保持中・明示 Tx（SQL-38 (4)(5)・#2231）。
 #[test]
 fn skip_locked_returns_zero_rows_while_held_in_txn() {
     let (core, path) = new_core();
@@ -496,8 +493,7 @@ fn skip_locked_returns_zero_rows_while_held_in_txn() {
     assert_eq!(format!("{r:?}"), format!("{plain:?}"));
 }
 
-/// Issue #2231: 他者保持中の `SKIP LOCKED` は行を読まずに列だけ導出するため、明示 Tx でも結果の
-/// 行数・バイト上限（`54000`）に左右されず 0 行を返し、Tx は `InTransaction` のまま続行できる。
+/// Issue #2231: 空結果が行を読まずに列だけ導出されること（SQL-38 (4)）。
 #[test]
 fn skip_locked_empty_result_does_not_read_rows_in_txn() {
     let (core, path) = new_core();
@@ -523,8 +519,7 @@ fn skip_locked_empty_result_does_not_read_rows_in_txn() {
         .expect("release");
 }
 
-/// Issue #2231: サブクエリ（`WHERE` の `IN`・投影内スカラー・集計の `WHERE`）を含む文も、他者保持中の
-/// `SKIP LOCKED` は 42601 にならず 0 行を返し、列は句なしの同じ文と一致する（autocommit・明示 Tx）。
+/// Issue #2231: サブクエリ・時刻関数を含む文の空結果（SQL-38 (4)(5)）。
 #[test]
 fn skip_locked_with_subqueries_returns_zero_rows_while_held() {
     let (core, path) = new_core();
@@ -535,7 +530,7 @@ fn skip_locked_with_subqueries_returns_zero_rows_while_held() {
         "SELECT id FROM documents WHERE id IN (SELECT id FROM authors) ORDER BY id LIMIT 10",
         "SELECT id, (SELECT max(id) FROM authors) FROM documents ORDER BY id LIMIT 10",
         "SELECT id FROM documents WHERE NOT EXISTS (SELECT 1 FROM authors WHERE name = 'zzz') ORDER BY id LIMIT 10",
-        // 時刻関数を含むサブクエリ: 通常実行と同じ時計の束縛を張るため writer 保持中でも 0A000 にならない。
+        // 時刻関数を含むサブクエリ（通常実行と同じ束縛スコープ）。
         "SELECT id FROM documents WHERE id IN (SELECT id FROM authors WHERE now() > '2000-01-01T00:00:00Z'::timestamptz) ORDER BY id LIMIT 10",
     ];
     let mut holder = hold_writer(&core, &mut session);
@@ -574,7 +569,7 @@ fn skip_locked_with_subqueries_returns_zero_rows_while_held() {
         .expect("commit");
 }
 
-/// 自 Tx が既に writer を保持していれば `SKIP LOCKED` は行を返す（自分の未 commit 行を含む）。
+/// `SKIP LOCKED`・自 Tx が writer を保持している場合（SQL-38 (4)・#2231）。
 #[test]
 fn skip_locked_returns_rows_when_own_txn_holds_writer() {
     let (core, path) = new_core();
@@ -610,7 +605,7 @@ fn skip_locked_returns_rows_when_own_txn_holds_writer() {
         .expect("rollback");
 }
 
-/// writer が空いていて先行読み取りと衝突する場合、`SKIP LOCKED` は `40001` を返し 0 行にしない。
+/// `SKIP LOCKED` と直列化判定の関係（SQL-38 (2)(4)・#2231）。
 #[test]
 fn skip_locked_does_not_swallow_serialization_failure() {
     let (core, path) = new_core();
@@ -643,7 +638,7 @@ fn skip_locked_does_not_swallow_serialization_failure() {
         .expect("rollback");
 }
 
-/// 複数句の合成: `NOWAIT` が `SKIP LOCKED` に優先する（保持中は `55P03`）。`SKIP LOCKED` のみなら 0 行。
+/// `SKIP LOCKED` と `NOWAIT` の複数句の合成（SQL-38 (4)・#2231）。
 #[test]
 fn skip_locked_composition_with_nowait_across_clauses() {
     let (core, path) = new_core();
@@ -665,7 +660,7 @@ fn skip_locked_composition_with_nowait_across_clauses() {
         .expect("commit");
 }
 
-/// キュー処理の典型例: 単一ライタ下では、1 台目が保持中の 2 台目は次の行ではなく 0 行を受け取る。
+/// `SKIP LOCKED` のキュー処理の典型例（SQL-38 (4)・#2231）。
 #[test]
 fn skip_locked_queue_pattern_second_worker_gets_zero_rows() {
     let (core, path) = new_core();
@@ -689,8 +684,7 @@ fn skip_locked_queue_pattern_second_worker_gets_zero_rows() {
     assert_eq!(second.rows.len(), 1);
 }
 
-/// テナント境界（SQL-38 (5)・RLS-12）: 保持中の 0 行は、他テナントの行数によらず同一で、
-/// 他テナントの存在・件数のオラクルにならない。
+/// テナント境界（SQL-38 (5)・RLS-12）: 空結果が他テナントの存在オラクルにならないこと。
 #[test]
 fn skip_locked_empty_result_does_not_depend_on_tenant_rows() {
     let (core, path) = new_core();
@@ -724,7 +718,7 @@ fn skip_locked_empty_result_does_not_depend_on_tenant_rows() {
         .expect("commit");
 }
 
-/// READ ONLY Tx の `SKIP LOCKED` は `25006`。
+/// READ ONLY Tx での `SKIP LOCKED`（SQL-38 (3)・#2231）。
 #[test]
 fn skip_locked_in_read_only_txn_is_25006() {
     let (core, path) = new_core();
@@ -1044,8 +1038,7 @@ fn extended_query_schema_qualified_of_matches_simple_query() {
     );
 }
 
-/// 他セッション保持中でも、`SKIP LOCKED` の空結果は句なし SELECT と同じ execute 時の検査を通る
-/// （負の `LIMIT` は句なしと同じ wire_code で拒否され、成功の空結果に化けない）。
+/// `SKIP LOCKED` の空結果が execute 時の検査を通ること（SQL-38 (4)・#2231）。
 #[test]
 fn skip_locked_held_still_runs_execute_time_checks() {
     let (core, path) = new_core();
@@ -1066,8 +1059,7 @@ fn skip_locked_held_still_runs_execute_time_checks() {
         .expect("commit");
 }
 
-/// 複数文メッセージでは、`NOWAIT` と `SKIP LOCKED` が同じ SELECT に混在し最後の文でなくても、
-/// `SKIP LOCKED` を含む形は writer に触れず `0A000`（合成結果の `NOWAIT` 優先に隠れない）。
+/// 複数文メッセージでの `SKIP LOCKED`（SQL-38 (4)・#2231。期待値はアサーションが正）。
 #[test]
 fn multi_statement_skip_locked_is_0a000_even_with_nowait_mix() {
     let (core, path) = new_core();

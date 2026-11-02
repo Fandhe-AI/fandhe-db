@@ -464,9 +464,7 @@ fn rls13_row_security_off_copy_from_is_rejected_on_public_commit_paths() {
     core.commit_copy_in(&c, batch(&core, &s)).expect("on");
 }
 
-/// RLS-13・Issue #2231: RLS 有効な表への `FOR UPDATE SKIP LOCKED` は、writer が空いていても他者保持中でも
-/// （autocommit・明示 Tx とも）`row_security = off` なら同じ `42501` で拒否され、明示 Tx は失敗状態になる。
-/// `on` に戻すと他者保持中は 0 行になる（空結果が拒否を隠さない）。
+/// RLS-13・Issue #2231: `SKIP LOCKED` の空結果前の RLS 判定（期待値はアサーションが正）。
 #[test]
 fn rls13_skip_locked_rejects_row_security_off_regardless_of_writer_state() {
     let (core, _g) = new_core("rls13-skip-locked-off");
@@ -517,9 +515,7 @@ fn rls13_skip_locked_rejects_row_security_off_regardless_of_writer_state() {
     ok_txn(&core, &mut holder, &mut ht, "COMMIT");
 }
 
-/// RLS-13・Issue #2231: 外側の FROM に現れずサブクエリ（IN・EXISTS・スカラー）の内側だけで読まれる
-/// RLS 有効表も、`SKIP LOCKED` では writer の保持有無に依らず `row_security = off` で同じ `42501` になる
-/// （保持中だけ 0 行になって writer 状態のオラクルになる経路を作らない）。
+/// RLS-13・Issue #2231: サブクエリ内側の表への RLS 判定（期待値はアサーションが正）。
 #[test]
 fn rls13_skip_locked_rejects_row_security_off_for_subquery_only_tables() {
     let (core, _g) = new_core("rls13-skip-locked-subquery");
@@ -556,9 +552,7 @@ fn rls13_skip_locked_rejects_row_security_off_for_subquery_only_tables() {
     }
     ok_txn(&core, &mut holder, &mut ht, "COMMIT");
 }
-/// RLS-13・Issue #2231: 別名・列名が RLS 有効表と同名でも、実参照表でなければ `SKIP LOCKED` の
-/// 空結果前の判定対象にならない（writer 保持中だけ `42501` になる誤拒否を作らない）。
-/// 実参照になるスキーマ修飾のサブクエリ表は、writer の保持有無に依らず同じ `42501` になる。
+/// RLS-13・Issue #2231: 実参照表だけが RLS 判定の対象になること（期待値はアサーションが正）。
 #[test]
 fn rls13_skip_locked_rls_check_uses_resolved_relations_only() {
     let (core, _g) = new_core("rls13-skip-locked-resolved");

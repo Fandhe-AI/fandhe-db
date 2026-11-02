@@ -1763,7 +1763,7 @@ pub enum ParsedSql {
     /// 行ロック句つきの `SELECT`（`FOR UPDATE`／`FOR NO KEY UPDATE`／`FOR SHARE`／`FOR KEY SHARE`、
     /// `OF`、`NOWAIT`／`SKIP LOCKED`。SQL-38・Issue #1957）。構文解釈と併用検査（`sql::row_lock`）までを
     /// 担う。実行は Issue #2230 で writer の取得（`NOWAIT` は `55P03`）として実装済み（`core::row_lock_exec`）。
-    /// `SKIP LOCKED` の実行は #2231 で実装済み（取得できなければ 0 行）。一時表だけを対象にした形は `0A000` で拒否する
+    /// `SKIP LOCKED` の実行は #2231（`core::row_lock_exec`）。一時表だけを対象にした形は `0A000` で拒否する
     /// （ロックを取らずに素の SELECT として実行する fail-open を作らない）。既存の [`Self::Statement`] に
     /// フィールドを足さず別 variant にしているのは、句を黙って無視する経路を作らず、網羅 `match` の
     /// 追随漏れをコンパイラに検出させるため。
@@ -3753,11 +3753,8 @@ impl EngineCore {
     }
 
     /// [`Self::begin_implicit_transaction`] の複数文版。writer を取得する前に `stmts` の行ロック句を
-    /// 構文だけで走査し、`SKIP LOCKED` を含めば `0A000`（writer に触れずに拒否。メッセージ全体を 0 行には
-    /// できず、待ってから取得するのも句の意味に反するため。文ごとの合成とは別規則で、`NOWAIT` と混在しても
-    /// `0A000` を優先する）、いずれかが `NOWAIT` なら writer を待たずに取得して他者保持中は即時 `55P03`
-    /// にする（SQL-38・Issue #2230・#2231）。行ロック句 SELECT が最後の文なら逐次 autocommit で動くため、
-    /// `SELECT ... SKIP LOCKED; SELECT 1` だけが拒否される非対称性がある。
+    /// 構文だけで走査し、行ロック句の待機方針（`RowLockingSyntax`）を暗黙 Tx の開始へ反映する
+    /// （SQL-38・Issue #2230・#2231。受理範囲と規則の詳細は spec 側を参照）。
     /// 構文誤りなど走査できない文は無視し、その文の実行時に通常のエラーとして報告させる。
     pub fn begin_implicit_transaction_for<'e>(
         &'e self,

@@ -644,7 +644,7 @@ Issue #1931（`READ ONLY`）、挙動テストは #1940、`40001` は #2396 が�
 
 行ロック句（`SELECT ... FOR UPDATE／NO KEY UPDATE／SHARE／KEY SHARE [OF ...] [NOWAIT|SKIP LOCKED]`）と
 `LOCK TABLE` の受理・結果の契約は spec 側が定義する。本節は実装側の写像と担当の分担だけを記録し、
-各形の SQLSTATE・トランザクション外の扱い・併用可否は本書へ記述しない（`SKIP LOCKED` は下記の実装箇所のみ）。
+各形の SQLSTATE・トランザクション外の扱い・併用可否は本書へ記述しない。
 ポインタは `docs/spec/04-behavior/sql-surface.md` SQL-38（(3)(4)(5)(7)）・SQL-31、
 `docs/spec/04-behavior/data-model.md` TABLE-3、`docs/spec/04-behavior/persistence.md` PERSIST-4、
 関連は RLS-12・RLS-7。行ロック句の取得は #2230、`LOCK TABLE` は #1958 で実装済み（#1955 の現状欄は着手前の記録）。
@@ -659,9 +659,7 @@ Issue #1931（`READ ONLY`）、挙動テストは #1940、`40001` は #2396 が�
   `NOWAIT` は「即時取得を試みる経路」で実現する。#2230 では `LOCK TABLE ... NOWAIT`（#1958）と同じ
   `Storage::begin_explicit_write_txn_nowait` を流用し、新しい API は作らない。
 - **複数句の合成（#2230・#2231）**: 強度・`OF` の対象は writer の取得に影響しない。待機方針は
-  `NOWAIT` を含む形を nowait、含まず `SKIP LOCKED` を含む形を skip、それ以外を待機とする
-  （優先順位は `NOWAIT` > `SKIP LOCKED` > 待機。PostgreSQL の同一表に効く複数句の規則に倣う。
-  `RowLocking::writer_wait` が `WriterWait` を返す）。
+  `RowLocking::writer_wait` が `WriterWait` を返す（合成規則は spec 側の SQL-38 を参照）。
 - **`SKIP LOCKED` の実装（#2231）**: 実装箇所は `crates/engine/src/core/row_lock_exec.rs`、
   writer の取得を試みる API は `try_ensure_writer`・`try_begin_implicit`（`sql/transaction.rs`）。
   契約の詳細は spec 側（SQL-38 (4)(5)・RLS-12・RLS-13）を参照し、本書へは記述しない。

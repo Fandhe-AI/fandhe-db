@@ -952,10 +952,8 @@ impl<'e> SessionTransaction<'e> {
     }
 
     /// [`Self::begin_implicit_with`] の `SKIP LOCKED` 版（autocommit の `SELECT ... FOR UPDATE
-    /// SKIP LOCKED`・Issue #2231 の入口）。writer を待たずに取得を試み、取得できれば `Ok(true)`
-    /// （暗黙 Tx は `Active`）。他セッション保持中（`WriteLockTimeout`／`WriteTxnHeldByCurrentSession`）
-    /// だけを `Ok(false)` とし、状態は `Idle` のまま・何も開かない。それ以外の失敗は
-    /// [`Self::begin_implicit_with`] と同じエラー（`55P03` へ化けさせない）。
+    /// SKIP LOCKED`・Issue #2231 の入口）。取得結果を `Ok(bool)` で返し、取得失敗の分類は
+    /// [`is_write_lock_unavailable`] に集約する（SQL-38 (4)(5)。契約は spec 側を参照）。
     pub(crate) fn try_begin_implicit(
         &mut self,
         storage: &'e crate::storage::Storage,
@@ -1809,10 +1807,8 @@ impl<'e> SessionTransaction<'e> {
     }
 
     /// [`Self::ensure_writer_with`] の `SKIP LOCKED` 版（明示 Tx の `SELECT ... FOR UPDATE SKIP LOCKED`・
-    /// Issue #2231 の入口）。writer を待たずに取得を試み、取得できた（取得済みを含む）なら `Ok(true)`。
-    /// 他セッション保持中だけを `Ok(false)` とし、その場合は状態を一切変えない（`Active` のまま・
-    /// writer なし・登録も維持。呼び出し側は `fail()` しない）。`25006`・`XX000`・`40001` などの失敗は
-    /// [`Self::ensure_writer_with`] と同じエラーのまま返す（`40001` を空結果へ化けさせない）。
+    /// Issue #2231 の入口）。取得結果を `Ok(bool)` で返し、それ以外の失敗は
+    /// [`Self::ensure_writer_with`] と同じエラーのまま返す（SQL-38 (4)(5)。契約は spec 側を参照）。
     pub(crate) fn try_ensure_writer(
         &mut self,
         ctx: &crate::policy::PolicyContext,
@@ -1820,8 +1816,7 @@ impl<'e> SessionTransaction<'e> {
         self.acquire_writer(ctx, WriterAcquire::Try)
     }
 
-    /// [`Self::ensure_writer_with`]・[`Self::try_ensure_writer`] 共通の取得本体。`skip_locked` のときだけ
-    /// 他者保持中を `Ok(false)` にする（取得経路を 1 本に保ち、`40001` 判定も共有する）。
+    /// [`Self::ensure_writer_with`]・[`Self::try_ensure_writer`] 共通の取得本体（取得経路を 1 本に保つ）。
     fn acquire_writer(
         &mut self,
         ctx: &crate::policy::PolicyContext,
@@ -2349,14 +2344,14 @@ fn map_write_lock_err(e: crate::storage::StorageError) -> SqlSurfaceError {
 }
 
 /// writer の取得方針（`begin_with_origin`・`acquire_writer` の内部引数。Issue #2231）。
-/// 呼び出し元の公開入口が `bool` で表す待機／`NOWAIT` に、`SKIP LOCKED` 用の `Try` を加えたもの。
+/// 呼び出し元の公開入口が `bool` で表す待機／`NOWAIT` に、`SKIP LOCKED` 用の `Try` を加えたもの（SQL-38 (4)）。
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum WriterAcquire {
-    /// 待機上限まで待つ（失敗は `55P03`）。
+    /// 待機する。
     Wait,
-    /// 待たずに取得を試み、他者保持中は `55P03`。
+    /// `NOWAIT` 用。
     NoWait,
-    /// 待たずに取得を試み、他者保持中は「取得せず」（`Ok(false)`）。
+    /// `SKIP LOCKED` 用（取得結果を `Ok(bool)` で返す）。
     Try,
 }
 
@@ -2367,8 +2362,8 @@ impl WriterAcquire {
     }
 }
 
-/// writer を他者が保持していて取得できなかった（`55P03` の原因となる）エラーか。`SKIP LOCKED`
-/// （#2231）が「取得せず」と他の失敗を区別する唯一の判定で、`map_write_lock_err` と同じ集合。
+/// writer を他者が保持していて取得できなかったエラーか（`map_write_lock_err` と同じ集合）。
+/// `SKIP LOCKED`（#2231）が取得失敗の種別を区別する唯一の判定。
 fn is_write_lock_unavailable(e: &crate::storage::StorageError) -> bool {
     matches!(
         e,
@@ -3196,8 +3191,7 @@ mod tests {
         assert!(txn.is_implicit_active());
     }
 
-    /// `SKIP LOCKED` の入口（Issue #2231）: 他者保持中は待たずに `Ok(false)` で状態を変えず
-    /// （暗黙は `Idle`、明示は `Active` のまま writer なし）、解放後は `Ok(true)` で取得する。
+    /// `SKIP LOCKED` の入口（Issue #2231）の取得結果と状態を固定する（SQL-38 (4)）。
     #[test]
     fn try_acquire_returns_false_while_held_without_changing_state() {
         let (mut storage, _g) = open_test_storage("txn-2231-skip");

@@ -1,6 +1,6 @@
 //! `SELECT ... FOR UPDATE／SHARE ...` の行ロック句（SQL-38・Issue #2230）の pg wire 結合テスト。
 //! 簡易クエリ（'Q'）の往復、拡張クエリ（Parse／Bind／Execute／Sync）、2 クライアント間の `NOWAIT` の
-//! `55P03`・`SKIP LOCKED` の 0 行（#2231）（ReadyForQuery の状態は autocommit なら `I`）を固定する。時間計測は使わない。
+//! `NOWAIT`・`SKIP LOCKED`（#2231）の pg wire 経路を固定する（SQL-38 (4)(5)）。時間計測は使わない。
 
 use crate::common;
 
@@ -116,8 +116,7 @@ fn nowait_from_second_client_is_55p03_until_first_commits() {
     assert_eq!(read_ready_for_query_status(&mut second), b'I');
 }
 
-/// 1 つ目の接続が保持している間、2 つ目の autocommit の `SKIP LOCKED` は 0 行（RowDescription は
-/// 句なしと同じ列・`SELECT 0`・ReadyForQuery は `I`）。1 つ目が COMMIT した後は行を返す（SQL-38 (4)・#2231）。
+/// `SKIP LOCKED` の簡易クエリ経路（SQL-38 (4)・#2231）。期待値の詳細はアサーションが正。
 #[test]
 fn skip_locked_from_second_client_is_zero_rows_until_first_commits() {
     let (addr, _g) = start();
@@ -165,8 +164,7 @@ fn skip_locked_from_second_client_is_zero_rows_until_first_commits() {
     assert_eq!(read_ready_for_query_status(&mut second), b'I');
 }
 
-/// 拡張クエリ（Parse／Bind／Execute／Sync）でも、保持中の `SKIP LOCKED` の Execute は 0 行で
-/// `SELECT 0` を返す。
+/// `SKIP LOCKED` の拡張クエリ経路（SQL-38 (4)・#2231）。期待値の詳細はアサーションが正。
 #[test]
 fn extended_query_skip_locked_returns_zero_rows_while_held() {
     let (addr, _g) = start();

@@ -619,8 +619,7 @@ fn autocommit_row_lock_releases_writer_at_statement_end() {
     assert!(elapsed < Duration::from_secs(1), "elapsed={elapsed:?}");
     assert_eq!(count_rows(&engine), 1);
 }
-/// T16（Issue #2231・SQL-38 (4)）: 待機上限が長くても、`SKIP LOCKED` は holder の保持中に待たず 0 行を返す
-/// （autocommit・明示 Tx とも。`55P03` にならず、明示 Tx は `Active` のまま）。
+/// T16（Issue #2231・SQL-38 (4)）: `SKIP LOCKED` が writer の待機上限を待たないことを固定する。
 #[test]
 fn skip_locked_returns_zero_rows_immediately_while_writer_is_held() {
     let (engine, path) = new_core(5_000);
