@@ -224,6 +224,10 @@ struct GateRef {
     name: String,
     /// `DROP INDEX`／`ALTER INDEX` の対象名か（一時表の索引は一時 DB の索引カタログで照会する）。
     is_index: bool,
+    /// `ONLY` の直後に識別子が続く位置の `ONLY` 自身。構文語 `FROM ONLY t` か、引用符付きの実表 `"only"`
+    /// か字句だけでは区別できない（引用符の有無はトークンに残らない）ため、権限ゲートは「実在する表として
+    /// 引けるときだけ」検査対象にする（引けなければ構文語として無視。Issue #1968 の指摘対応）。
+    optional: bool,
 }
 
 /// 添字 `idx` の識別子が、表名ではなく構文語として置かれているか。名前の一致だけでは判定せず、
@@ -283,6 +287,18 @@ fn unqualified_relation_refs(tokens: &[Token], skip: &[usize]) -> Vec<GateRef> {
 pub(crate) fn resolved_relation_ref_names(tokens: &[Token]) -> Vec<String> {
     relation_refs(tokens, &[], true)
         .into_iter()
+        .filter(|r| !r.optional)
+        .map(|r| r.name)
+        .collect()
+}
+
+/// [`resolved_relation_ref_names`] が構文語として除外しきれない `ONLY <識別子>` の `ONLY`（実表 `"only"`
+/// の可能性があるもの）の名前。権限ゲートは、これが実在する relation として引けた場合に限り通常の参照と
+/// 同じく検査する（別名にだけ権限がある主体が実表 `"only"` を読む認可バイパスを防ぐ）。
+pub(crate) fn resolved_optional_only_names(tokens: &[Token]) -> Vec<String> {
+    relation_refs(tokens, &[], true)
+        .into_iter()
+        .filter(|r| r.optional)
         .map(|r| r.name)
         .collect()
 }
@@ -317,6 +333,20 @@ fn relation_refs(tokens: &[Token], skip: &[usize], keep_internal_keys: bool) -> 
         }
         // 構文語（`IF`・`ONLY`・`LATERAL` 等）は構文位置で判定する。CTE 名はその参照位置から実際に
         // 可視なものだけを除外する（非再帰 CTE は自身の本文から見えない。`sql::cte` の契約）。
+        let ambiguous_only = keep_internal_keys
+            && name.eq_ignore_ascii_case("ONLY")
+            && matches!(
+                tokens.get(pos.index.saturating_add(1)),
+                Some(t) if crate::sql::relation_name::is_ident_like(t)
+            );
+        if ambiguous_only {
+            out.push(GateRef {
+                name: name.to_string(),
+                is_index: false,
+                optional: true,
+            });
+            continue;
+        }
         if is_syntax_keyword_here(tokens, pos.index)
             || ctes
                 .iter()
@@ -342,6 +372,7 @@ fn relation_refs(tokens: &[Token], skip: &[usize], keep_internal_keys: bool) -> 
         out.push(GateRef {
             name: name.to_string(),
             is_index: false,
+            optional: false,
         });
     }
     // `DROP`／`ALTER`／`REFRESH` の対象名にも位置走査と同じ除外を掛ける。Bind・Describe は書き換え後の
@@ -393,6 +424,7 @@ fn object_ddl_names(tokens: &[Token]) -> Vec<(usize, GateRef)> {
             GateRef {
                 name: name.to_string(),
                 is_index,
+                optional: false,
             },
         ));
         if matches!(tokens.get(i + 1), Some(Token::Punct(','))) {
@@ -886,7 +918,8 @@ mod tests {
             refs,
             vec![GateRef {
                 name: "i".to_string(),
-                is_index: true
+                is_index: true,
+                optional: false
             }]
         );
         let toks = tokenize("DROP VIEW v").expect("lex");

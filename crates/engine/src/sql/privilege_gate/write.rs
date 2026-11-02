@@ -306,7 +306,18 @@ pub(crate) fn require_write_privileges(
     let mut resolved = tokens.to_vec();
     crate::sql::relation_name::rewrite_relation_names_full(&mut resolved, resolver)?;
     let candidates = crate::sql::search_path::resolved_relation_ref_names(&resolved);
-    require_relations_bits(storage, tenant, &principal, &build_wants(&req, &candidates))
+    let optional: Vec<(String, u16)> =
+        crate::sql::search_path::resolved_optional_only_names(&resolved)
+            .into_iter()
+            .map(|n| (n, PRIV_SELECT))
+            .collect();
+    require_relations_bits(
+        storage,
+        tenant,
+        &principal,
+        &build_wants(&req, &candidates),
+        &optional,
+    )
 }
 
 /// [`require_write_privileges`] の、名前解決済みのトークン列を受け取る版（拡張クエリの Parse・Bind・
@@ -327,7 +338,18 @@ pub(crate) fn require_write_privileges_resolved(
         return check_unlooked(&principal, &req);
     }
     let candidates = crate::sql::search_path::resolved_relation_ref_names(resolved_tokens);
-    require_relations_bits(storage, tenant, &principal, &build_wants(&req, &candidates))
+    let optional: Vec<(String, u16)> =
+        crate::sql::search_path::resolved_optional_only_names(resolved_tokens)
+            .into_iter()
+            .map(|n| (n, PRIV_SELECT))
+            .collect();
+    require_relations_bits(
+        storage,
+        tenant,
+        &principal,
+        &build_wants(&req, &candidates),
+        &optional,
+    )
 }
 
 /// 書き込み txn の内側で権限を再判定するための値（分割実行 DML のチャンクごとの再検査と、TRUNCATE の
@@ -362,7 +384,12 @@ impl RelationPrivilegeRecheck {
     pub(crate) fn check_in_txn<R: ReadSource>(&self, src: &R, tables: &[String]) -> Result<(), ()> {
         let bits =
             relation_grant_bits_in_txn(src, &self.tenant, tables, self.role_id).map_err(|_| ())?;
-        for granted in bits.into_iter().flatten() {
+        // ACL を解決できない表（`None`）は権限を確認できないので拒否する（fail-closed。parse 時の
+        // `require_relations_bits` と同じ扱い）。
+        for granted in bits {
+            let Some(granted) = granted else {
+                return Err(());
+            };
             if self.required_bits == 0 || granted & self.required_bits != self.required_bits {
                 return Err(());
             }

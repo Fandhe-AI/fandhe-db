@@ -330,3 +330,15 @@ fn missing_table_still_reports_42p01_before_privilege() {
     let f = fx("dmlpriv-missing");
     assert_eq!(f.alice_run(&ins("nope", 1, "m1")), "42P01");
 }
+
+#[test]
+fn quoted_only_table_with_alias_is_checked_as_a_relation() {
+    // 実表 `"only"` を別名 `ca` で読む文は、別名と同名の表 `ca` の権限では通らない（`ONLY` を構文語と
+    // 誤認して検査対象から落とさない。Issue #1968 のレビュー指摘）。
+    let f = fx("dmlpriv-only");
+    f.admin_run("CREATE TABLE \"only\" (k BIGINT PRIMARY KEY)");
+    f.admin_run("GRANT SELECT ON ca TO alice");
+    assert_eq!(f.alice_run("SELECT k FROM \"only\" ca LIMIT 5"), "42501");
+    f.admin_run("GRANT SELECT ON \"only\" TO alice");
+    assert_ne!(f.alice_run("SELECT k FROM \"only\" ca LIMIT 5"), "42501");
+}

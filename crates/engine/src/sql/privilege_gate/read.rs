@@ -194,6 +194,7 @@ pub(crate) fn require_read_privileges(
         &principal,
         required_bits,
         &crate::sql::search_path::resolved_relation_ref_names(&resolved),
+        &crate::sql::search_path::resolved_optional_only_names(&resolved),
     )
 }
 
@@ -225,6 +226,7 @@ pub(crate) fn require_read_privileges_resolved(
         &principal,
         required_bits,
         &crate::sql::search_path::resolved_relation_ref_names(resolved_tokens),
+        &crate::sql::search_path::resolved_optional_only_names(resolved_tokens),
     )
 }
 
@@ -235,12 +237,17 @@ fn require_relations(
     principal: &Principal,
     required_bits: u16,
     candidates: &[String],
+    optional_only: &[String],
 ) -> Result<(), SqlSurfaceError> {
     let wants: Vec<(String, u16)> = candidates
         .iter()
         .map(|n| (n.clone(), required_bits))
         .collect();
-    require_relations_bits(storage, tenant, principal, &wants)
+    let optional: Vec<(String, u16)> = optional_only
+        .iter()
+        .map(|n| (n.clone(), required_bits))
+        .collect();
+    require_relations_bits(storage, tenant, principal, &wants, &optional)
 }
 
 /// relation ごとに必要ビットが異なる版の判定（#1968 の書き込み系ゲートと共有する唯一の ACL 照会点）。
@@ -250,6 +257,7 @@ pub(super) fn require_relations_bits(
     tenant: &str,
     principal: &Principal,
     wants: &[(String, u16)],
+    optional: &[(String, u16)],
 ) -> Result<(), SqlSurfaceError> {
     let mut merged: Vec<(String, u16)> = Vec::new();
     for (name, bits) in wants {
@@ -263,14 +271,44 @@ pub(super) fn require_relations_bits(
             ));
         }
     }
-    if merged.is_empty() {
+    // 構文語か実表か区別できない `ONLY` は、実在する relation として引けたときだけ検査する。
+    // 必須として既に集めた名前と重なるものは必須側で検査済み。
+    let optional: Vec<&(String, u16)> = optional
+        .iter()
+        .filter(|(n, _)| !merged.iter().any(|(m, _)| m == n))
+        .collect();
+    if merged.is_empty() && optional.is_empty() {
         return Ok(());
     }
-    let names: Vec<String> = merged.iter().map(|(n, _)| n.clone()).collect();
+    if merged.len().saturating_add(optional.len()) > MAX_READ_RELATION_REFS {
+        return Err(SqlSurfaceError::payload_too_large(
+            "too many relation references",
+        ));
+    }
+    let names: Vec<String> = merged
+        .iter()
+        .map(|(n, _)| n.clone())
+        .chain(optional.iter().map(|(n, _)| n.clone()))
+        .collect();
     let role_id = principal.current_role_id().unwrap_or(0);
     let bits = storage
         .relation_grant_bits(tenant, &names, role_id)
         .map_err(crate::catalog::table_lookup_error)?;
+    let optional_start = merged.len();
+    for (idx, granted) in bits.iter().enumerate().skip(optional_start) {
+        let (Some(granted), Some((_, required_bits))) =
+            (granted, optional.get(idx.saturating_sub(optional_start)))
+        else {
+            continue;
+        };
+        check(
+            principal,
+            PrivilegeTarget::Relation {
+                required_bits: *required_bits,
+                granted_bits: *granted,
+            },
+        )?;
+    }
     for ((_, required_bits), granted) in merged.iter().zip(bits) {
         // 最新のカタログで relation として引けない名前は、権限を確認できないので拒否する（fail-closed）。
         // 名前解決（`42P01`）を通った参照先は BEGIN 時点のスナップショットでは存在しうる（別セッションが
@@ -314,6 +352,7 @@ pub(crate) fn require_table_select(
         &principal,
         PRIV_SELECT,
         &[table.to_string()],
+        &[],
     )
 }
 
