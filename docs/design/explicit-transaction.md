@@ -957,7 +957,7 @@ production コード（`crates/wire-server/src/`）は無変更・テスト専�
   - 復元後に作る savepoint は redb が dirty になるため `Unrestorable` になる（保守側の制約）。
     `LOCK TABLE` などで writer を先に取っても、テーブルを開くため同様に `Unrestorable`。
 - 付随状態: commit 記録の足跡は戻さない（書き込み記録は Issue #1945、`seen_operation_ids` は
-  Issue #1944 で復元する。次節以降参照）。カーソルは Issue #1946（次々節）、`Failed` からの復帰は #1947 の範囲。
+  Issue #1944 で復元する。次節以降参照）。カーソルは Issue #1946（次々節）、`Failed` からの復帰は #1947（「失敗状態からの savepoint 復帰」節）の範囲。
 - 退けた案: Tx の途中で `Durability::None` の commit をして新しい writer で savepoint を取る
   案。他セッションに未確定の状態が見え、分離が壊れるため退けた。
 - テスト: `crates/engine/tests/sql_t40_up/sql69_savepoint_rollback.rs`・
@@ -1026,6 +1026,35 @@ production コード（`crates/wire-server/src/`）は無変更・テスト専�
   本 Issue の範囲外。公開 API の変更なし。
 - テスト: engine `sql69_savepoint_cursor`・`sql69_savepoint_rollback`・`sql::cursor`、
   wire-server `wire15_cursor_portal_binding`。
+
+## 失敗状態からの savepoint 復帰（Issue #1947・SQL-31・SQL-69 ポインタ）
+
+文エラーで `Failed`（`25P02`）になった明示 Tx を、`ROLLBACK TO` で `InTransaction` に戻せる。
+
+- 状態: `TxnState::FailedRecoverable(ActiveTxn)` を追加した。外から見える状態は `Failed`
+  （ReadyForQuery `'E'`）のままで、`Active` だけを照合する既存のアクセサ（writer・読み取り源・
+  カーソル）は失敗した Tx に何も渡さない（fail-closed）。`ActiveTxn` に失敗フラグを足す案は、
+  直し漏れた 1 箇所が fail-open になるため退けた。
+- 保持条件（`SessionTransaction::fail`）: 明示 Tx・巻き戻せる savepoint がある・一時表を使っていない
+  （一時表の Tx は `ROLLBACK TO` が `0A000` 確定）・巻き戻し先（writer 未取得、または基底 savepoint）
+  がある。満たさなければ従来どおり即時に writer を解放する（savepoint 作成前の失敗は復帰できない）。
+- 復帰させない失敗（`fail_unrecoverable`）: 文数・持続時間の上限超過（`54000`）、`40001`（保持した
+  writer が衝突判定を素通りするため）、`XX000`（不変条件違反・redb エラー）。
+- 受理する文: `ROLLBACK` と `ROLLBACK [WORK|TRANSACTION] TO ...`（parse 前の判定は
+  `is_allowed_while_failed`。字句エラーは偽）。ほかは `25P02` で状態も保持したまま。`3B001`・`0A000`
+  は `FailedRecoverable` に据え置き、別の savepoint で再試行できる。
+- 復帰: Active 中と同じ `restore_to_savepoint` を使う（キャッシュ・カーソルの整合は同関数に足す
+  #1945・#1946 がそのまま効く）。文数・持続時間の上限に計上する。成功で `Active`、全分岐で状態を
+  書き戻す。
+- writer の保持と DoS: 復帰の余地がある間は writer を保持するが、`remaining_duration`・
+  `release_if_expired` を `FailedRecoverable` にも効かせ、`BEGIN` 起点の持続時間上限で必ず解放する
+  （期限後は `54000` を 1 度だけ返し、以降は `25P02`）。
+- 結線: engine `core.rs` の parse 前ゲートと文実行ディスパッチ（`fail_for`）、wire-server の拡張クエリ
+  Parse・Bind・Execute の免除に `ROLLBACK TO` を追加した。
+- テスト: `crates/engine/tests/sql_t40_up/sql69_savepoint_failed_recovery.rs`・
+  `crates/engine/tests/core_misc/transaction_limits.rs`（期限）・
+  `crates/wire-server/tests/wire_proto/sql69_savepoint_syntax.rs`・
+  `crates/wire-server/tests/wire942_extended_transaction.rs`、単体は `sql::transaction`。
 
 ## READ ONLY での書き込み拒否（SQL-38 (3)・ERR-6・Issue #1934）
 
