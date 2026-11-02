@@ -276,6 +276,11 @@ fn set_role_does_not_change_tenant_boundary_or_ddl_permission() {
     );
     ok(&core, "alice", &mut admin, "CREATE ROLE me");
     ok(&core, "bob", &mut admin, "CREATE ROLE bobs");
+    // 表の読み取りは権限ゲート（SQL-40）の対象のため、境界の確認用に SELECT を付与しておく。
+    // GRANT は付与者の束縛が要る（未束縛は 42501）ため、運用者権限のまま `me` を束縛した別セッションで行う。
+    let mut grantor = allowed_session();
+    grantor.bind_role_ids(1, 1);
+    ok(&core, "alice", &mut grantor, "GRANT SELECT ON t TO me");
     let mut s = SessionState::default();
     s.bind_role_ids(1, 1);
     let read = |core: &EngineCore, tenant: &str, s: &mut SessionState| match core
