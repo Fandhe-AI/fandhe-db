@@ -1816,6 +1816,16 @@ pub(crate) fn push_d_field(body: &mut Vec<u8>, detail: &str) {
     body.push(0);
 }
 
+/// `ErrorResponse`／`NoticeResponse` の 1 フィールド（タグ 1 バイト＋値＋NUL 終端）を `body` へ追記する
+/// （`H`〔hint〕・`W`〔where〕・`V`〔非ローカライズ severity〕用。Issue #2227・SQL-70。
+/// [`push_d_field`] と同じ「フィールド終端・フレーム化は呼び出し元が担う」方針）。値の NUL 検査は
+/// 呼び出し元（`crate::error_response`）が済ませる。
+pub(crate) fn push_field(body: &mut Vec<u8>, tag: u8, value: &str) {
+    body.push(tag);
+    body.extend_from_slice(value.as_bytes());
+    body.push(0);
+}
+
 /// `ErrorResponse`（'E'）を `S`/`C`/`M` の 3 フィールドのみ、severity `ERROR`
 /// 固定で組み立てる（`sqlstate`/`message`。他テナント・存在情報は含めない）。
 ///

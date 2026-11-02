@@ -37,7 +37,7 @@ use crate::plpgsql::ast::{
 };
 use crate::plpgsql::embedded::validate_embedded;
 use crate::plpgsql::host::{
-    PlHost, PlScalar, ResolvedType, RowDemand, SqlOutcome as HostOutcome, VarLookup,
+    PlHost, PlSavepoint, PlScalar, ResolvedType, RowDemand, SqlOutcome as HostOutcome, VarLookup,
 };
 use crate::plpgsql::interp::{
     run_function, run_trigger_function, CallOutcome, ExecBudget, ReturnSpec, TriggerReturn,
@@ -233,6 +233,8 @@ struct CorePlHost<'a, 'e> {
     /// `42702` の検査済みの文・式（種別（式 0・埋め込み SQL 1）とアドレスをキーにする。本体の AST は起動の間不変で、ループで検査を
     /// 繰り返さない）。値は読み出さないので、アドレスの再利用で誤って参照されることはない。
     conflict_checked: HashSet<(u8, usize)>,
+    /// `DO` ブロックの実行か（`W` の呼び出し文脈を `inline_code_block` と表示する。Issue #2227）。
+    inline_block: bool,
 }
 
 /// 条件の比較オペランド。リテラルのトークン（SQL を経由しない）か、SQL で求めた型付きの値。
@@ -908,6 +910,38 @@ impl PlHost for CorePlHost<'_, '_> {
         map_outcome(out, demand)
     }
 
+    // ---- `EXCEPTION` 節（Issue #2227・SQL-70）。Tx の内部 savepoint API へ委ねる ----
+
+    fn block_savepoint(&mut self) -> Result<PlSavepoint, SqlSurfaceError> {
+        self.txn.pl_savepoint_push(&*self.session).map(PlSavepoint)
+    }
+
+    fn rollback_block(&mut self, sp: &PlSavepoint) -> Result<(), SqlSurfaceError> {
+        self.txn.pl_rollback_to(sp.0, self.session)
+    }
+
+    fn release_block(&mut self, sp: PlSavepoint) {
+        self.txn.pl_release(sp.0);
+    }
+
+    fn can_catch(&self) -> bool {
+        self.txn.status() == TransactionStatus::InTransaction
+    }
+
+    /// `SQLERRM` は、入口の出口と同じ `scrub_error`（SCHEMA 配下の内部キー `#<id>.` を利用者向けの
+    /// 名前へ戻す）を通した文言にする。
+    fn handler_message(&mut self, e: &SqlSurfaceError) -> String {
+        self.core.scrub_error(self.ctx, e.clone()).client_message()
+    }
+
+    fn context_label(&self) -> String {
+        if self.inline_block {
+            "PL/pgSQL function inline_code_block".to_string()
+        } else {
+            "PL/pgSQL function".to_string()
+        }
+    }
+
     fn resolve_type(&mut self, ty: &DeclType) -> Result<ResolvedType, SqlSurfaceError> {
         match ty {
             DeclType::Named(_) => Err(internal(
@@ -1030,6 +1064,7 @@ impl EngineCore {
             txn,
             opts,
             conflict_checked: HashSet::new(),
+            inline_block: true,
         };
         run_function(body, args, ret, &mut host, &mut budget)
     }
@@ -1067,6 +1102,7 @@ impl EngineCore {
             txn,
             opts: PlCallOptions { may_write },
             conflict_checked: HashSet::new(),
+            inline_block: false,
         };
         match def.language {
             FunctionLanguage::Sql => {
@@ -1132,6 +1168,7 @@ impl EngineCore {
             txn,
             opts: PlCallOptions { may_write },
             conflict_checked: HashSet::new(),
+            inline_block: false,
         };
         let mut body = parse_sql_function_body(&def.body_source, &opts)?;
         validate_embedded(&mut body, self)?;
@@ -1180,6 +1217,7 @@ impl EngineCore {
             txn,
             opts: inv.opts,
             conflict_checked: HashSet::new(),
+            inline_block: false,
         };
         match run_trigger_function(inv.body, &inv.vars, &mut host, &mut budget)? {
             TriggerReturn::Null => Ok(TriggerOutcome::Skip),

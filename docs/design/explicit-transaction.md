@@ -1120,3 +1120,12 @@ production コード（`crates/wire-server/src/`）は無変更・テスト専�
 - **finish**: 同一文の再送は `23505`、巻き戻した内容での再送は `22023`（台帳は commit した内容を保持）。
 - **対象外**: 書き込み後に作った savepoint（`Unrestorable`）、wire-server 経由の試験、
   `WriteDurability::None` 構成。
+
+## PL/pgSQL の内部 savepoint（Issue #2227・SQL-70）
+
+`EXCEPTION` 節つきの PL/pgSQL ブロックは、本体の前に `SessionTransaction::pl_savepoint_push` で内部 savepoint を積み、
+捕捉時に `pl_rollback_to`、全出口で `pl_release` する。利用者の `SAVEPOINT` と同じ `SavepointStack` を使い、
+不変条件 `[Restorable…, Unrestorable…]` を保つ。名前は NUL を含み利用者が書けないため `RELEASE`／`ROLLBACK TO` から
+見えず、文数に計上せず、暗黙 Tx でも積める。巻き戻せない（`Unrestorable`・一時表を使った Tx）ときは捕捉せず `0A000`
+で Tx を失敗させる（`FailedRecoverable` でも内部エントリは `pl_release` で必ず除去する）。詳細は
+[plpgsql-subset.md](plpgsql-subset.md)「Issue #2227 追記」節。書き込み後の `ROLLBACK TO` の対応は #2879。

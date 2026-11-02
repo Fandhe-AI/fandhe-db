@@ -127,4 +127,42 @@ pub(crate) trait PlHost {
 
     /// `%TYPE`・`%ROWTYPE`・`RECORD` の呼び出し時の解決（D4）。`Named` はインタプリタ自身が解く。
     fn resolve_type(&mut self, ty: &DeclType) -> Result<ResolvedType, SqlSurfaceError>;
+
+    // ---- `EXCEPTION` 節（Issue #2227・SQL-70）。既定実装は「巻き戻す対象が無いホスト」用 ----
+
+    /// `EXCEPTION` 節つきブロックの本体に入る前に、暗黙の savepoint を積む。利用者の `SAVEPOINT`
+    /// からは見えない内部エントリで、ブロックの全出口で [`Self::release_block`] を呼ぶこと。
+    fn block_savepoint(&mut self) -> Result<PlSavepoint, SqlSurfaceError> {
+        Ok(PlSavepoint(0))
+    }
+
+    /// 本体のエラーを捕捉する前に、`sp` の時点まで永続データ・Tx 内の記録を巻き戻す。巻き戻せない
+    /// （書き込み後に入ったブロック・一時表を使用中）場合は `0A000` を返し、呼び出し側は捕捉せず
+    /// そのエラーを伝える（巻き戻さずに続行する fail-open を作らない）。変数は巻き戻さない。
+    fn rollback_block(&mut self, _sp: &PlSavepoint) -> Result<(), SqlSurfaceError> {
+        Ok(())
+    }
+
+    /// 暗黙 savepoint を取り除く（成功・捕捉・伝播のどの出口でも 1 回だけ呼ぶ）。
+    fn release_block(&mut self, _sp: PlSavepoint) {}
+
+    /// 捕捉しうる状態か（`false` は Tx が既に失敗状態で、捕捉せずに伝える）。
+    fn can_catch(&self) -> bool {
+        true
+    }
+
+    /// `SQLERRM` に入れる利用者向けの文言（内部キー等を戻した後の値）。
+    fn handler_message(&mut self, e: &SqlSurfaceError) -> String {
+        e.client_message()
+    }
+
+    /// `W`（呼び出し文脈）の行頭に出す呼び出し元の表示（`DO` は
+    /// `PL/pgSQL function inline_code_block`。関数定義は名前を持たないため `PL/pgSQL function`）。
+    fn context_label(&self) -> String {
+        "PL/pgSQL function inline_code_block".to_string()
+    }
 }
+
+/// [`PlHost::block_savepoint`] が返す、暗黙 savepoint を指す不透明な印。
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct PlSavepoint(pub(crate) usize);
