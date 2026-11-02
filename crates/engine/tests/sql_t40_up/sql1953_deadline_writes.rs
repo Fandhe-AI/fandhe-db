@@ -88,6 +88,8 @@ fn err_under(deadline: StatementDeadline, core: &EngineCore, sql: &str) -> SqlSu
 #[test]
 fn sql71_expired_deadline_leaves_no_trace_for_autocommit_writes() {
     let statements: &[&str] = &[
+        // 単一行 INSERT も複数行と同じ契約（codex P1 指摘）。
+        "INSERT INTO t (id, k, v) VALUES (9, 9, 9) USING OPERATION_ID 'w-ins1'",
         "INSERT INTO t (id, k, v) VALUES (10, 1, 1), (11, 2, 2) USING OPERATION_ID 'w-ins'",
         "UPDATE t SET v = v + 1 WHERE k > 0 USING OPERATION_ID 'w-upd'",
         "DELETE FROM t WHERE k > 0 USING OPERATION_ID 'w-del'",
@@ -277,6 +279,33 @@ fn sql71_copy_commit_stops_when_the_deadline_has_passed_at_commit() {
     let batch = copy_batch(&core, "c-2").expect("ingest");
     core.commit_copy_in(&ctx(), batch).expect("commit");
     assert_ne!(snapshot(&core, "t"), before);
+}
+
+/// SQL-71: 1 行だけの COPY（単一行の書き込み経路へ委譲される）も、期限切れなら `57014` で止まる。
+#[test]
+fn sql71_single_row_copy_commit_stops_when_the_deadline_has_passed() {
+    let (core, _g) = open("sql1953-copy-one");
+    let before = snapshot(&core, "t");
+    let plan = core
+        .begin_copy(
+            &ctx(),
+            &SessionState::default(),
+            "COPY t (id, k, v) FROM STDIN USING OPERATION_ID 'c-one'",
+        )
+        .expect("begin");
+    let mut cs = match plan {
+        CopyPlan::From(s) => s,
+        CopyPlan::To(..) => panic!("expected COPY FROM plan"),
+    };
+    cs.feed(b"30\t1\t1\n").expect("feed");
+    let batch = cs.finish().expect("finish");
+    let err = {
+        let _scope = DeadlineScope::install(expired());
+        core.commit_copy_in(&ctx(), batch)
+            .expect_err("deadline passed at commit")
+    };
+    assert_eq!(err.wire_code(), "57014");
+    assert_eq!(snapshot(&core, "t"), before);
 }
 
 /// SQL-71: 十分先の期限なら COPY は正常に取り込まれる。

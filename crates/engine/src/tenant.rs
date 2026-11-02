@@ -2070,6 +2070,9 @@ fn insert_typed_row_impl(
     target.with_txn(|write_txn| {
         let schema = require_table_schema_write_any_identity(write_txn, table)?;
         crate::sql::policy_eval::reject_row_security_off_in_txn(write_txn, ctx.tenant_id(), table)?;
+        // Issue #1953（SQL-71）: 単一行 INSERT・1 行 COPY も複数行経路と同じ契約で、台帳・行ストアへ
+        // 書く前に期限を確認する（期限切れは commit 前の `57014`。スコープが無ければ no-op）。
+        check_interrupt()?;
         // `id` 省略は移行済み表だけが受理できる（束縛段の判定を、書き込み txn 内で取得した
         // スキーマで再確認する。別の識別方式へ差し替わった表に仮値 `id` を書かない fail-closed）。
         if id_omitted && !schema.is_migrated_id() {
