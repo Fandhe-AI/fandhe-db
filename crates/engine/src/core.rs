@@ -5407,11 +5407,14 @@ impl EngineCore {
                 let unprivileged = if grant_head {
                     crate::sql::grant_ddl::require_grant_principal(session).is_err()
                 } else {
-                    crate::sql::privilege_gate::require_ddl_or_owner(
-                        session,
-                        crate::sql::privilege_gate::DdlStatementKind::AlterOwner,
-                    )
-                    .is_err()
+                    // 実行本体（`execute_alter_owner`）と同じ条件（O8）。運用者権限があっても現在ロールが
+                    // 未束縛なら対象の有無にかかわらず `42501` に正規化する。
+                    crate::sql::privilege_gate::bound_principal(session).is_err()
+                        || crate::sql::privilege_gate::require_ddl_or_owner(
+                            session,
+                            crate::sql::privilege_gate::DdlStatementKind::AlterOwner,
+                        )
+                        .is_err()
                 };
                 if matches!(e.wire_code(), "3F000" | "42P01" | "42704") && unprivileged {
                     return Err(crate::sql::allowlist::SqlSurfaceError::InsufficientPrivilege);

@@ -233,6 +233,7 @@ fn unbound_owner_to_is_denied_uniformly() {
             "ALTER TABLE docs OWNER TO bob",
             "ALTER TABLE nosuch OWNER TO ghost",
             "ALTER SCHEMA nosuch OWNER TO ghost",
+            "ALTER TABLE nosuch.t OWNER TO bob",
         ] {
             let e = f.err("t1", &mut s, sql);
             assert_eq!(e.wire_code(), "42501", "{sql}");

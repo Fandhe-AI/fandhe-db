@@ -112,8 +112,9 @@ fn rewrite_acl_for_object(
         } else {
             e.grantor_id
         };
-        // 所有者が自分自身へ付けた行は暗黙の権限と重複するため残さない。
-        if grantee == grantor {
+        // 新所有者が自分自身へ付けた行は暗黙の権限と重複するため残さない。無関係なロールの自己付与
+        // （grantee == grantor で新所有者でない行）は有効な権限なので保持する（O10）。
+        if grantee == new_owner && grantor == new_owner {
             continue;
         }
         let slot = merged.entry((grantee, grantor)).or_insert((0, 0));
@@ -235,3 +236,6 @@ impl Storage {
         commit_with_bumps(write_txn, &bumps)
     }
 }
+
+#[cfg(test)]
+mod tests;
