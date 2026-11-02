@@ -256,7 +256,13 @@ fn is_syntax_keyword_here(tokens: &[Token], idx: usize) -> bool {
         return is(Some(idx.saturating_add(1)), "EXISTS") || is(Some(idx.saturating_add(1)), "NOT");
     }
     if w.eq_ignore_ascii_case("ONLY") {
-        return next_is_name;
+        // `ONLY` を修飾語として受理する文は `TRUNCATE`・`LOCK`・`ALTER`（所有者変更）・DML だけ。SELECT の
+        // `FROM` 句などでは構文語ではなく関係名（`FROM "only" AS x` の実表 `only`）であり、字句上は引用の
+        // 有無を区別できないため、それ以外の文では常に関係名として残す（権限検査から外さない。fail-closed）。
+        return next_is_name
+            && ["TRUNCATE", "LOCK", "ALTER", "DELETE", "UPDATE", "INSERT"]
+                .iter()
+                .any(|k| is(Some(0), k));
     }
     if w.eq_ignore_ascii_case("TABLE") {
         // `LOCK TABLE <表>` の `TABLE` も構文語（Issue #1958。文頭の `LOCK` の直後だけ）。
@@ -834,7 +840,11 @@ mod tests {
         assert_eq!(names("TRUNCATE a, ONLY b"), vec!["a", "b"]);
         assert_eq!(names("TRUNCATE public.a, ONLY b"), vec!["b"]);
         assert_eq!(names("TRUNCATE a, ONLY b, ONLY c"), vec!["a", "b", "c"]);
-        assert_eq!(names("SELECT id FROM a, ONLY b LIMIT 5"), vec!["a", "b"]);
+        // SELECT の `FROM` 句では `ONLY` は構文語ではなく関係名（実表 `only` の可能性を残す）。
+        assert_eq!(
+            names("SELECT id FROM a, ONLY b LIMIT 5"),
+            vec!["a", "ONLY", "b"]
+        );
         // 直前が式の語に見える引用付き識別子（表名・索引名・別名）でも、導入語の後の表名は残る。
         assert_eq!(names("CREATE INDEX \"is\" ON t (a)"), vec!["t"]);
         assert_eq!(names("CREATE INDEX \"in\" ON t (a)"), vec!["t"]);

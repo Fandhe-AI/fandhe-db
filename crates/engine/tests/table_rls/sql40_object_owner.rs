@@ -431,3 +431,33 @@ fn owner_reads_own_relations_without_explicit_grant() {
     assert_eq!(f.code("t1", &mut alice, "SELECT id FROM ot"), "42501");
     f.ok("t1", &mut bob, "SELECT id FROM ot");
 }
+
+/// 構文語と同名の実表（`"only"`）も権限検査から外れない（別名付きでも `42501`）。権限を付与すると読める。
+/// 再帰 CTE の自己参照だけの問い合わせは、実表の権限が無いロールでも成功する（Issue #1967）。
+#[test]
+fn syntax_word_named_table_is_gated_and_recursive_cte_self_reference_is_not() {
+    let f = fx("sql40_only_table");
+    let mut op = bound(ALICE, true);
+    f.ok(
+        "t1",
+        &mut op,
+        "CREATE TABLE \"only\" (id BIGINT PRIMARY KEY)",
+    );
+    let mut bob = bound(BOB, false);
+    for sql in [
+        "SELECT id FROM \"only\"",
+        "SELECT id FROM \"only\" AS x LIMIT 5",
+        "SELECT x.id FROM \"only\" x",
+    ] {
+        assert_eq!(f.code("t1", &mut bob, sql), "42501", "{sql}");
+    }
+    f.ok("t1", &mut op, "GRANT SELECT ON \"only\" TO bob");
+    f.ok("t1", &mut bob, "SELECT id FROM \"only\" AS x LIMIT 5");
+    // 実表 t が無い再帰 CTE（自己参照 t は CTE を指す）。
+    f.ok(
+        "t1",
+        &mut bob,
+        "WITH RECURSIVE t(n) AS (SELECT 1 UNION ALL SELECT n + 1 FROM t WHERE n < 3) \
+         SELECT n FROM t",
+    );
+}
