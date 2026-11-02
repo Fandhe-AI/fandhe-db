@@ -192,7 +192,7 @@ fn assert_minimal_fields(sql: &str, body: &[u8]) {
         kinds.contains(&b'C') && kinds.contains(&b'M'),
         "{sql}: {kinds:?}"
     );
-    for forbidden in [b'D', b'H', b't', b'c', b'd', b'n'] {
+    for forbidden in *b"DHtcdn" {
         assert!(
             !kinds.contains(&forbidden),
             "{sql}: unexpected field {} in {kinds:?}",
