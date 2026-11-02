@@ -209,6 +209,8 @@ pub(super) fn filter_tuples(
     let mut scratch: Vec<StackValue> = Vec::new();
     let mut kept: Vec<u32> = Vec::with_capacity(order.len());
     for &ti in &order {
+        // Issue #1952: 協調的中断の確認点（残余 WHERE のタプルごと。commit 前の読み取り経路）。
+        crate::interrupt::check()?;
         let tuple = tuples
             .get(ti as usize)
             .ok_or_else(|| SqlSurfaceError::Internal {
@@ -245,6 +247,8 @@ pub(super) fn sort_by_keys(
     let mut flat: Vec<Option<super::values::CmpVal<'_>>> =
         Vec::with_capacity(order.len().saturating_mul(nkeys));
     for &ti in &order {
+        // Issue #1952: 協調的中断の確認点（ソートキー抽出のタプルごと。commit 前の読み取り経路）。
+        crate::interrupt::check()?;
         let tuple = tuples
             .get(ti as usize)
             .ok_or_else(|| SqlSurfaceError::Internal {
@@ -270,6 +274,8 @@ pub(super) fn sort_by_keys(
         }
         std::cmp::Ordering::Equal
     });
+    // Issue #1952: 比較関数内では中断せず（全順序が崩れると標準ソートが panic しうる）、直後に 1 回確認する。
+    crate::interrupt::check()?;
     // `perm` は `0..order.len()` の並べ替えなので範囲外は起きない。行を黙って
     // 落とさず、万一の不整合は `Internal` にする。
     perm.into_iter()
