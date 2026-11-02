@@ -439,12 +439,15 @@ fn grant_one(
             Ok((1, false))
         }
         Some(existing) => {
-            let same_grantor = existing.grantor_id == Some(grantor);
-            if !req.owner_equivalent && !same_grantor {
-                return Err(MembershipChangeError::Unsupported(
-                    "membership already granted by another grantor is not supported",
-                ));
-            }
+            // 1 行 = 1 つの付与根拠。実行者の根拠（所有者相当の root、または ADMIN による付与者 `grantor`）が
+            // 行の根拠と同じなら通常の更新。root が非 root の行へ付与するときは、更新後の行が今回の付与で
+            // 裏付けられる場合だけ root へ付け替える。非 root が別根拠の行へオプションを足す・変える場合は、
+            // 単一行で 2 つの根拠を表せないため副作用なく拒否する（言い直しは no-op）。
+            let same_basis = if req.owner_equivalent {
+                existing.grantor_root
+            } else {
+                !existing.grantor_root && existing.grantor_id == Some(grantor)
+            };
             // 明示したオプションだけを更新する。明示が無ければ何も変えない（PostgreSQL は警告のみ）。
             let mut updated = existing;
             if let Some(v) = pick(req.with_options, MembershipOpt::Admin) {
@@ -456,29 +459,37 @@ fn grant_one(
             if let Some(v) = pick(req.with_options, MembershipOpt::Set) {
                 updated.set = v;
             }
-            if updated == existing {
-                return Ok((0, false));
-            }
-            // 所有者相当による既存行の更新: PostgreSQL では (role, member, grantor) ごとの別行になるが、本実装は
-            // 単一行のため、更新後の行が所有者相当の今回の付与（明示 + 既定値）で裏付けられる場合だけ、行を
-            // 所有者相当の独立した付与（`grantor_root`）として記録し直す。旧付与者だけが与えたオプションが残る
-            // 場合は、root にすると過剰保持、そのままだと所有者の付与が旧付与者に依存するため、単一行で
-            // 表せないものとして副作用なく拒否する（fail-closed）。既に root の行は付与者・根拠を変えない。
-            if req.owner_equivalent && !existing.grantor_root {
-                let owner_admin = pick(req.with_options, MembershipOpt::Admin).unwrap_or(false);
-                let owner_inherit = pick(req.with_options, MembershipOpt::Inherit)
-                    .unwrap_or(member.def.attributes.inherit);
-                let owner_set = pick(req.with_options, MembershipOpt::Set).unwrap_or(true);
-                let covered = (!updated.admin || owner_admin)
-                    && (!updated.inherit || owner_inherit)
-                    && (!updated.set || owner_set);
-                if !covered {
+            if !same_basis {
+                if req.owner_equivalent {
+                    // 所有者相当の今回の付与（明示 + 既定値）が更新後の行を裏付ける場合だけ root へ付け替える
+                    // （オプションが変わらない言い直しも付け替える）。旧付与者だけが与えたオプションが残る
+                    // 場合は root にすると過剰保持になるため、変更を伴うなら拒否し、言い直しなら何もしない。
+                    let owner_admin = pick(req.with_options, MembershipOpt::Admin).unwrap_or(false);
+                    let owner_inherit = pick(req.with_options, MembershipOpt::Inherit)
+                        .unwrap_or(member.def.attributes.inherit);
+                    let owner_set = pick(req.with_options, MembershipOpt::Set).unwrap_or(true);
+                    let covered = (!updated.admin || owner_admin)
+                        && (!updated.inherit || owner_inherit)
+                        && (!updated.set || owner_set);
+                    if !covered {
+                        if updated == existing {
+                            return Ok((0, false));
+                        }
+                        return Err(MembershipChangeError::Unsupported(
+                            "membership options granted by another grantor cannot be combined",
+                        ));
+                    }
+                    updated.grantor_id = Some(grantor);
+                    updated.grantor_root = true;
+                } else if updated == existing {
+                    return Ok((0, false));
+                } else {
                     return Err(MembershipChangeError::Unsupported(
-                        "membership options granted by another grantor cannot be combined",
+                        "membership already granted by another grantor is not supported",
                     ));
                 }
-                updated.grantor_id = Some(grantor);
-                updated.grantor_root = true;
+            } else if updated == existing {
+                return Ok((0, false));
             }
             put_membership_in_txn(w, tenant, member.id, role.id, updated)?;
             // ADMIN が真から偽へ落ちる更新は `REVOKE ADMIN OPTION` と同じ依存検査（呼び出し側が文全体を

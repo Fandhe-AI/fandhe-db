@@ -493,6 +493,53 @@ fn owner_equivalent_update_not_covering_existing_options_is_refused() {
     assert_eq!(mem(&f, m, r), before);
 }
 
+/// 1 行 = 1 つの付与根拠（既存行の更新）の回帰。root 行へ非 root の根拠でオプションを足す更新・別の付与者による
+/// 更新は `0A000` で拒否され状態は変わらない。言い直しは状態を変えない。所有者相当の言い直しは、変更がなくても
+/// 行を root へ付け替える（旧付与者の CASCADE で消えない）。
+#[test]
+fn existing_row_updates_keep_one_grant_basis() {
+    // Codex: root 行へ、DDL 許可のない同じ付与者が ADMIN で追加しようとする。
+    let f = fx("rm_basis_root");
+    let me = role(&f, "me");
+    let r = role(&f, "r");
+    let x = role(&f, "x");
+    let m = role(&f, "m");
+    let owner = session(me, true);
+    run(&f, &owner, "GRANT r TO x WITH ADMIN TRUE").expect("x admin");
+    run(&f, &session(x, true), "GRANT r TO m").expect("root row");
+    assert!(mem(&f, m, r).expect("m").grantor_root);
+    let before = mem(&f, m, r);
+    let e = run(&f, &session(x, false), "GRANT r TO m WITH ADMIN TRUE").expect_err("refused");
+    assert_eq!(e.wire_code(), "0A000");
+    assert_eq!(mem(&f, m, r), before);
+    // 言い直しは no-op（根拠を足さない）。
+    run(&f, &session(x, false), "GRANT r TO m").expect("restate");
+    assert_eq!(mem(&f, m, r), before);
+    run(&f, &owner, "REVOKE ADMIN OPTION FOR r FROM x CASCADE").expect("cascade");
+    assert!(!mem(&f, m, r).expect("m").admin);
+
+    // Bugbot: 所有者相当の言い直しは変更がなくても root へ付け替える。別の付与者 g2 の追加は拒否。
+    let f = fx("rm_basis_restate");
+    let me = role(&f, "me");
+    let r = role(&f, "r");
+    let x = role(&f, "x");
+    let g2 = role(&f, "g2");
+    let m = role(&f, "m");
+    let owner = session(me, true);
+    run(&f, &owner, "GRANT r TO x, g2 WITH ADMIN TRUE").expect("admins");
+    run(&f, &session(x, false), "GRANT r TO m").expect("m by x");
+    let before = mem(&f, m, r);
+    let e =
+        run(&f, &session(g2, false), "GRANT r TO m WITH ADMIN TRUE").expect_err("other grantor");
+    assert_eq!(e.wire_code(), "0A000");
+    run(&f, &session(g2, false), "GRANT r TO m").expect("restate by g2");
+    assert_eq!(mem(&f, m, r), before);
+    run(&f, &owner, "GRANT r TO m").expect("owner restates");
+    assert!(mem(&f, m, r).expect("m").grantor_root);
+    run(&f, &owner, "REVOKE ADMIN OPTION FOR r FROM x CASCADE").expect("cascade");
+    assert!(mem(&f, m, r).is_some(), "owner-backed row must survive");
+}
+
 /// `GRANT ... WITH ADMIN FALSE` による ADMIN の取り消しも `REVOKE ADMIN OPTION` と同じ依存検査（2BP01）を通る。
 #[test]
 fn grant_with_admin_false_respects_dependents() {
