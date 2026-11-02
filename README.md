@@ -575,6 +575,11 @@ cleartext password 認証のまま不変です。`scram-sha-256` を指定する
   `hash-password --with-scram-sha-256` の時点で拒否されます（libpq・
   node-postgres 等の一般的なクライアント実装と結果が一致することを保証する
   ための設計判断です）。
+- **カタログのロール**（`CREATE ROLE ... LOGIN PASSWORD`。Issue #2233）でも SCRAM 接続できます。
+  接続の user には、`wire-server login-identifier --tenant <tenant_id> --role <ロール名>`
+  （DB を開かない）で得たログイン識別子を渡します。接続のテナントはロールの所属で決まります。
+  ロール不在・`VALID UNTIL` 超過・誤パスワードは同じ `28P01`、`NOLOGIN` は検証後の `28000`、
+  `CONNECTION LIMIT` 超過は認証成功後の `53300` です。
 - **NoSQL 表層（`--surface nosql`）とは併用できません**（起動時 fail-closed で
   拒否）。`POST /v1/session` は Argon2id 照合を直接呼ぶ別経路であり SASL の
   ような往復を持たないためです（HTTP-10）。

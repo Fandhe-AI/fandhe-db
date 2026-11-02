@@ -22,7 +22,7 @@ fn open(label: &str) -> (CleanupGuard, Storage) {
 
 fn create(s: &Storage, tenant: &str, sql: &str) -> Result<CreateRoleOutcome, SqlSurfaceError> {
     let stmt = validate_create_role_tokens(&tokenize(sql).expect("lex"))?;
-    execute_create_role(s, tenant, &stmt)
+    execute_create_role(s, tenant, &SessionState::default(), &stmt)
 }
 
 fn drop_(s: &Storage, tenant: &str, sql: &str) -> Result<DropRoleOutcome, SqlSurfaceError> {

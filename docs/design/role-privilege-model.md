@@ -485,3 +485,32 @@ SQL-40 ポインタ。判定点を `sql/privilege_gate.rs` の `check`（主体�
 - 対象外: SEQUENCE・FUNCTION 単位の ACL（#2235）、所有者・PUBLIC の既定（#2236）、`ALTER DEFAULT PRIVILEGES ... IN SCHEMA`
   （#2237）、表・列権限の参照時検査（#1967〜#1969）、権限検査の共通ゲートへの統合（#1966。判定は `sql/schema_privilege.rs`
   に集約済みで、ゲートへ移す）、存在オラクルの網羅試験（#1972）。
+
+## 13. Issue #2233 実装記録（カタログのロールで SCRAM-SHA-256 認証する）
+
+SQL-39 (3)(7)・WIRE-18 ポインタ。ロールのカタログ（#1961）・`CREATE`／`ALTER ROLE`（#1962・#1963）の上に、認証側の照合と `VALID UNTIL`・`CONNECTION LIMIT` を実装した。
+
+### 実装範囲
+
+- **ログイン識別子**: `tenant_id` から決定的に導出した修飾子（`hex(SHA-256(ドメインタグ ‖ tenant_id))` の先頭 16 バイト。小文字 16 進 32 文字）と、ロール名から D1 の符号化で作る。ドメインタグ（`fandhe-db/login-qualifier/v1`）は変えない。運用者は `wire-server login-identifier --tenant <id> --role <name>`（DB を開かない）で値を得て、利用者に接続の user として渡す。
+- **対応表の追随**: `CREATE ROLE` で登録、`DROP ROLE` で解除、`ALTER ROLE ... RENAME` で旧識別子の解除と新識別子の登録を、いずれもロールと同じ write txn で行う。起動時に `EngineCore::sync_login_names()` が全テナントを走査して未登録分を登録する（冪等・件数上限つき。失敗なら起動を拒否）。
+- **認証**: 接続の user が識別子の正規形ならカタログの経路（SCRAM 方式のときだけ）、そうでなければ users ファイルの経路（無変更）。照合は既存の SCRAM 実装。接続のテナントは対応表の blob とロール表のキーから導出し、クライアントの申告は使わない。
+- **失敗の収束**: ロール不在・`VALID UNTIL` 超過・検証子なし・カタログ読み取り失敗・検証子の解析失敗は、すべてモック検証子（`success == false`）に畳み込み、同じ `28P01` と `AUTH_FAILURE_DELAY` に揃える。期限切れでも server-first の salt はモックのもの。
+- **検証後の判定**: パスワードの検証が通り `AuthenticationOk` を送った後に、`NOLOGIN` なら FATAL `28000`、`CONNECTION LIMIT` 超過なら FATAL `53300`（`BackendKeyData`・`ReadyForQuery` は送らない。文言は固定でテナント・内部 ID を含まない）。接続数は `UserStore` が持つ `RoleConnectionRegistry`（RAII ガード）で数える。`-1` は無制限、`0` はすべて拒否。
+- **SQL 表層**: `VALID UNTIL '<文字列>'`（セッションの TimeZone で UTC マイクロ秒へ。`'infinity'` は期限なし。解析不能は `22007`／`22008`）と `CONNECTION LIMIT <整数>`（-1 未満・`i32` 範囲外は `22023`、整数でなければ `42601`）を `CREATE`／`ALTER ROLE` で受理する。`ALTER` は指定した項目だけを変える。
+- **セッション**: 認証したロールを `bind_role_ids(role_id, role_id)` で束縛し、`set_session_user` には修飾子なしのロール名を渡す。`ddl_allowed` は偽のまま（カタログのロールの DDL 権限は #1971・#2234・#2238 の担当）。
+
+### 判断の記録
+
+- **D1 の置き換え（NOLOGIN も対応表へ載せる）**: D1 は NOLOGIN を対応表に載せないとしていたが、「パスワード検証の後に `28000`」を満たすには NOLOGIN のロールでも検証子を引ける必要があるため、全ロールを登録する。`resolve_login_in_txn` は `LOGIN` 属性を検査せず、判定は認証層が検証の後に行う。
+- **修飾子は永続の表を持たない**: 修飾子は `tenant_id` から導出するので、新しい表も採番も要らない。衝突は 128 ビットで実質起きず、万一起きても対応表の重複登録拒否で fail-closed になる。
+- **解決は点の参照のみ**: 認証経路ではテナント内の走査をしない。未登録の識別子でもロール表の点参照を 1 回行い、読む回数をそろえる。残る時間差はマイクロ秒単位で、users ファイルの HashMap 参照との差と同程度。
+- **経路の振り分けは入力の形だけ**: 識別子の正規形かどうかは存在のオラクルにならない。cleartext 方式ではカタログの識別子は users ファイルに存在できず、未知ユーザーと同じ `28P01` になる。
+- **改名は旧識別子を無効にする**: PostgreSQL と同じく、旧名ではログインできなくなる。
+
+- **証明の検証後の再取得**: client-final 待ちの間に属性が変わりうるため、検証成功後・`AuthenticationOk` 前にロールを再取得し、ロール ID・テナント・検証子の一致と `VALID UNTIL` を確認する（不一致・不在・読み取り失敗は通常の `28P01`）。`LOGIN`・`CONNECTION LIMIT` は再取得した最新値で判定する。
+- **日付だけの `VALID UNTIL`**: `'2030-01-01'` はセッション TimeZone の当日 0 時として受理する。
+
+### 対象外
+
+HTTP `POST /v1/session` でのカタログのロールの照合、cleartext 方式でのカタログのロールの照合、users ファイルのユーザーとロールの対応づけ（#1971）、ブートストラップ専用化（#2238）、カタログのロールの DDL 権限、メンバーシップ（#2232）、存在オラクルの網羅試験（#1972）、`current_user`・`session_user` の値。
