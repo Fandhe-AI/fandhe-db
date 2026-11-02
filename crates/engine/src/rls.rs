@@ -287,7 +287,7 @@ impl PrefilterSnapshot {
         ctx: &PolicyContext,
     ) -> Result<Self, RlsError> {
         // RLS-13（Issue #2276）: 利用者ポリシーの適用表では、この可視集合（テナント境界だけ）を検索の母集団に
-        // できない（ポリシーのマスク合成は #2279）。固定文言で拒否する（`core::search`・公開の
+        // できない（Rust API はポリシーを同じスナップショットで評価できないため、#2279 でも拒否を維持）。固定文言で拒否する（`core::search`・公開の
         // `PrefilterIndex::build` が共通で通る入口）。
         // 拒否判定と世代の読み取りは同一の読み取り txn（同一スナップショット）で行う。判定直後に別セッションが
         // RLS を ENABLE しても、その commit は世代を進めるため、この世代で束縛したアリーナは使用時に古いと
@@ -786,7 +786,7 @@ impl<'s> SearchTimeFilter<'s> {
     ) -> Result<Vec<SearchHit>, RlsError> {
         validate_search_k(k).map_err(|k| RlsError::InvalidK { k })?;
         // RLS-13（Issue #2276）: 利用者ポリシーの適用表は、検索時フィルタがポリシーを反映できない
-        // （#2279）ため固定文言で拒否する。
+        // （#2279 でも Rust API は拒否を維持。SQL 表層はアリーナの行フックで適用済み）ため固定文言で拒否する。
         // 拒否判定は行を読む読み取り txn の中で行う（[`Self::open_row_table`]）。
         let table = self.open_row_table(ctx)?;
 

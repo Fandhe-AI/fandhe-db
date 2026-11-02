@@ -9,6 +9,7 @@
 
 ### Added
 
+- 利用者ポリシー（`CREATE POLICY ... USING`）を kNN・ハイブリッド検索と索引走査の経路へ適用した（Issue #2279・RLS-13 ポインタ）。ポリシー適用表のランキング付き検索（距離順・ハイブリッド・`HINT ORDER`。wire・HTTP の `op: search` を含む）は `0A000` ではなく、ポリシーを通る行だけで順位・件数・スコアを決める（除外行は上位 k の枠を消費しない）。`EXPLAIN` は適用表で `FullVisible` を報告しない。`EngineCore::search`・`PrefilterIndex`・`USING PLAN` の辞書構築は適用表で従来どおり `0A000`。公開 API の変更はない。
 - `COPY ... FROM STDIN`（INSERT）・`COPY ... TO STDOUT`（SELECT）と HTTP（NoSQL）表層の bound 書き込み入口に、現在ロールが束縛済みのセッションの表単位の権限検査を結線した（Issue #1969・SQL-40・NOSQL-2 ポインタ。権限不足は `42501`）。COPY は CopyInResponse・走査より前と CopyDone 後の commit 直前に判定し、拡張クエリは Parse・Bind・Describe でも拒否する。未束縛・運用者権限のセッションは従来と同一。
   BREAKING CHANGE: `EngineCore::execute_bound_{insert,update,delete,delete_checked,predicate_update,predicate_delete,partitioned_update,partitioned_delete}_in_session` の第 2 引数に `session: &SessionState` を追加した（`ctx` の直後）。
 - 現在ロールが束縛済みのセッションの読み取り（SELECT・JOIN・サブクエリ・CTE・集合演算・ビュー・EXPLAIN・`DECLARE`・行ロック句・検索・拡張クエリ・HTTP の bound 読み取り API）に、`GRANT` で付与した表単位の SELECT 権限の検査を結線した（Issue #1967・SQL-40・RLS-12 ポインタ。権限不足は `42501`）。公開メソッド `SessionState::object_privileges_enforced` を追加した。現在ロールが未束縛のセッション（現状の全セッション）の挙動は変わらない。
