@@ -5729,16 +5729,21 @@ impl EngineCore {
         let tokens = Self::normalize_row_count_clauses(tokens)?;
         let (tokens, locking) = crate::sql::row_lock::extract_row_locking(tokens)?;
         // `SKIP LOCKED` の空結果前の RLS 判定（RLS-13）は、外側の FROM に現れないサブクエリ・CTE 内側の
-        // 表にも掛ける。内側の文は実行時に解決されるため、トークン列の識別子を保守的に集める。
-        let candidates = locking
-            .as_ref()
-            .map(|_| crate::sql::row_lock::candidate_relation_names(&tokens));
-        let parsed =
-            self.parse_tokens_in_impl(tokens, temp, hits, ledger_mode, resolver, read_snap)?;
+        // 表にも掛ける。名前解決（`schema.name` → 内部キー）の後のトークン列から実参照表だけを集める
+        // ため、impl 側が解決後の表名を `read_tables` へ書き出す。
+        let mut read_tables: Vec<String> = Vec::new();
+        let parsed = self.parse_tokens_in_impl(
+            tokens,
+            temp,
+            hits,
+            ledger_mode,
+            resolver,
+            read_snap,
+            locking.is_some().then_some(&mut read_tables),
+        )?;
         let Some(locking) = locking else {
             return Ok(parsed);
         };
-        let read_tables = candidates.unwrap_or_default();
         match parsed {
             ParsedSql::Statement(statement) => {
                 let locking = crate::sql::row_lock::check_row_locking(&statement, &locking)?;
@@ -5760,6 +5765,7 @@ impl EngineCore {
     }
 
     /// [`Self::parse_tokens_in`] の本体（行ロック句を取り除いた後のトークン列を検証する）。
+    #[allow(clippy::too_many_arguments)] // 名前解決後の表名の書き出し先（行ロック句つき SELECT 用）を足したため
     fn parse_tokens_in_impl(
         &self,
         tokens: Vec<crate::sql::lexer::Token>,
@@ -5768,6 +5774,7 @@ impl EngineCore {
         ledger_mode: LedgerMode,
         resolver: Option<crate::sql::relation_name::SchemaResolver<'_>>,
         read_snap: Option<&redb::ReadTransaction>,
+        read_tables_out: Option<&mut Vec<String>>,
     ) -> Result<ParsedSql, crate::sql::allowlist::SqlSurfaceError> {
         // 各入口で正規化済みでも冪等のため、ここでも最終的な保証として適用する（Issue #1793）。
         let mut tokens = Self::normalize_row_count_clauses(tokens)?;
@@ -5780,6 +5787,9 @@ impl EngineCore {
             crate::sql::relation_name::rewrite_relation_names_full(&mut tokens, resolver)?;
         let public_names = rewrite.names;
         let create_public = rewrite.create_public;
+        if let Some(out) = read_tables_out {
+            *out = crate::sql::search_path::resolved_relation_names(&tokens);
+        }
         let storage_lookup = crate::sql::temp_catalog::SessionRelationLookup::new(
             &self.storage,
             temp,

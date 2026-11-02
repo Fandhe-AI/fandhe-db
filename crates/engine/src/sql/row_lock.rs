@@ -119,32 +119,16 @@ fn compose_writer_wait(clauses: &[RowLockClause]) -> WriterWait {
     }
 }
 
-/// 行ロック句を除いた文のトークン列から、表名の候補（識別子。原文・ASCII 小文字化の両形、重複なし）を集める。
-/// サブクエリの内側は実行時に解決されるため構文木からは辿れず、過大側（列名・別名を含む）に倒す。
-/// 候補は `core::row_lock_exec` が RLS 判定（`policies_apply`）にだけ使い、表でない名前は適用なしで素通りする。
-pub(crate) fn candidate_relation_names(tokens: &[crate::sql::lexer::Token]) -> Vec<String> {
-    let mut out: Vec<String> = Vec::new();
-    for t in tokens {
-        if let crate::sql::lexer::Token::Ident(name) = t {
-            for n in [name.clone(), name.to_ascii_lowercase()] {
-                if !out.contains(&n) {
-                    out.push(n);
-                }
-            }
-        }
-    }
-    out
-}
-
 /// 行ロック句つきの SELECT（行ロック句を除いた文の検証結果と、解析した句）。
 /// 実行は `core::row_lock_exec` が writer を取得して行う。
 #[derive(Debug, Clone, PartialEq)]
 pub struct LockingSelect {
     pub(crate) statement: Statement,
     pub(crate) locking: RowLocking,
-    /// 文のトークン列に現れる識別子（サブクエリ・CTE の内側を含む。表名の候補で、列名・別名も混じる）。
-    /// `SKIP LOCKED` の空結果前の `row_security = off` 拒否（RLS-13）が、外側の FROM に現れない表にも
-    /// 同じ判定を掛けるために使う（writer の保持有無で拒否と空結果が分かれる存在オラクルを作らない）。
+    /// 名前解決済みのトークン列でテーブル参照位置にある表名（サブクエリ・CTE の内側を含む。列名・別名・
+    /// CTE 名は含まない。`schema.name` は内部キーへ解決済み）。`SKIP LOCKED` の空結果前の
+    /// `row_security = off` 拒否（RLS-13）が、外側の FROM に現れない表にも同じ判定を掛けるために使う
+    /// （writer の保持有無で拒否と空結果が分かれる存在オラクルを作らない）。
     pub(crate) read_tables: Vec<String>,
 }
 

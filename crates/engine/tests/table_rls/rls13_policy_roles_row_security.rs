@@ -556,3 +556,48 @@ fn rls13_skip_locked_rejects_row_security_off_for_subquery_only_tables() {
     }
     ok_txn(&core, &mut holder, &mut ht, "COMMIT");
 }
+/// RLS-13・Issue #2231: 別名・列名が RLS 有効表と同名でも、実参照表でなければ `SKIP LOCKED` の
+/// 空結果前の判定対象にならない（writer 保持中だけ `42501` になる誤拒否を作らない）。
+/// 実参照になるスキーマ修飾のサブクエリ表は、writer の保持有無に依らず同じ `42501` になる。
+#[test]
+fn rls13_skip_locked_rls_check_uses_resolved_relations_only() {
+    let (core, _g) = new_core("rls13-skip-locked-resolved");
+    let mut s = SessionState::default();
+    s.allow_ddl();
+    for sql in [
+        "CREATE TABLE t (id BIGINT PRIMARY KEY, name TEXT)",
+        "CREATE TABLE u (id BIGINT PRIMARY KEY, name TEXT)",
+        "ALTER TABLE u ENABLE ROW LEVEL SECURITY",
+        "CREATE POLICY p ON u FOR ALL USING (true) WITH CHECK (true)",
+        "CREATE SCHEMA sc",
+        "CREATE TABLE sc.v (id BIGINT PRIMARY KEY)",
+        "ALTER TABLE sc.v ENABLE ROW LEVEL SECURITY",
+        "CREATE POLICY pv ON sc.v FOR ALL USING (true) WITH CHECK (true)",
+    ] {
+        ok(&core, "alice", &mut s, sql);
+    }
+    let mut other = SessionState::default();
+    ok(&core, "alice", &mut other, "SET row_security = off");
+    // 別名 u（RLS 有効表と同名）・列名 name は実参照表ではない。
+    let alias = "SELECT id FROM t AS u FOR UPDATE SKIP LOCKED";
+    let qualified = "SELECT id FROM t WHERE id IN (SELECT id FROM sc.v) FOR UPDATE SKIP LOCKED";
+
+    // writer が空いている場合。
+    match ok(&core, "alice", &mut other, alias) {
+        SqlOutcome::Query(r) => assert!(r.rows.is_empty()),
+        o => panic!("expected query, got {o:?}"),
+    }
+    assert_eq!(code(&core, "alice", &mut other, qualified), "42501");
+
+    // writer 保持中も結果は変わらない。
+    let mut holder = SessionState::default();
+    let mut ht = core.new_session_transaction();
+    ok_txn(&core, &mut holder, &mut ht, "BEGIN");
+    ok_txn(&core, &mut holder, &mut ht, "SELECT id FROM t FOR UPDATE");
+    match ok(&core, "alice", &mut other, alias) {
+        SqlOutcome::Query(r) => assert!(r.rows.is_empty()),
+        o => panic!("expected query, got {o:?}"),
+    }
+    assert_eq!(code(&core, "alice", &mut other, qualified), "42501");
+    ok_txn(&core, &mut holder, &mut ht, "COMMIT");
+}
