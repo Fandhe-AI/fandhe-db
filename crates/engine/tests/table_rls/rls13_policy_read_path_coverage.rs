@@ -30,7 +30,7 @@ const TABLE: &[(&str, usize, Class, &str)] = &[
         "arena.rs",
         1,
         Class::Rejected,
-        "アリーナ構築。検索系の入口（ランキング付き SELECT・Rust API の検索・rls.rs）が適用表を拒否する",
+        "アリーナ構築。ランキング付き SELECT は exec.rs の行フックでポリシーを適用し、Rust API の検索（rls.rs・core.rs）は適用表を拒否する",
     ),
     (
         "batch_fallback.rs",
@@ -102,7 +102,7 @@ const TABLE: &[(&str, usize, Class, &str)] = &[
         "rls.rs",
         8,
         Class::Rejected,
-        "PrefilterSnapshot::build・SearchTimeFilter::search が適用表を拒否する（マスク合成は #2279）",
+        "PrefilterSnapshot::build・SearchTimeFilter::search が適用表を拒否する（Rust API のため #2279 でも拒否を維持）",
     ),
     (
         "core.rs",
@@ -150,7 +150,7 @@ const TABLE: &[(&str, usize, Class, &str)] = &[
         "sql/exec.rs",
         4,
         Class::Applied,
-        "ランキング付き検索（execute_statement_with_cache）は適用表を拒否。RETURNING 整形・INSERT は非読み取り",
+        "ランキング付き検索（execute_statement_with_cache。#2279）は on_visible_row のポリシー段で適用。RETURNING 整形・INSERT は非読み取り",
     ),
     (
         "tenant.rs",
@@ -288,11 +288,12 @@ fn classified_entry_points_call_the_policy_module() {
         "sql/group_by.rs",
         "sql/window.rs",
         "sql/relation_snapshot.rs",
+        "sql/exec.rs",
         "tenant.rs",
         "tenant/partitioned_dml.rs",
         "tenant/trigger_dml.rs",
     ];
-    let rejecting: &[&str] = &["sql/exec.rs", "core.rs"];
+    let rejecting: &[&str] = &["core.rs"];
     for rel in applied.iter().chain(rejecting) {
         let text = std::fs::read_to_string(root.join(rel)).expect("read source");
         assert!(
