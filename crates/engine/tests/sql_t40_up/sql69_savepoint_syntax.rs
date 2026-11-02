@@ -2,9 +2,10 @@
 //! `docs/spec/04-behavior/sql-surface.md` SQL-69 のポインタ）の結合テスト。
 //!
 //! `EngineCore::execute_sql_in_txn` を production 経路として、Idle での `25P01`、同名の遮蔽、
-//! 存在しない名前の `3B001`、巻き戻し未実装の `ROLLBACK TO` が fail-closed（`0A000`＋`Failed`）で
-//! 後続の `COMMIT` に書き込みを確定させないこと、セッション分離・文数上限への計上を固定する。
-//! 巻き戻し本体は親 Issue #1941 の範囲。
+//! 存在しない名前の `3B001`、書き込み後に作った（redb で巻き戻せない）savepoint への
+//! `ROLLBACK TO` が fail-closed（`0A000`＋`Failed`）で後続の `COMMIT` に書き込みを確定させない
+//! こと、セッション分離・文数上限への計上を固定する。巻き戻しの成功経路は
+//! `sql69_savepoint_rollback`（Issue #1943）が固定する。
 
 use engine::catalog::{ColumnDef, ColumnType, TableSchema};
 use engine::core::EngineCore;
@@ -139,7 +140,7 @@ fn release_unknown_name_is_3b001_and_fails_transaction() {
 }
 
 #[test]
-fn rollback_to_is_fail_closed_and_commit_does_not_persist_writes() {
+fn rollback_to_savepoint_after_writes_is_fail_closed_and_commit_does_not_persist() {
     let (engine, path) = new_core();
     let _c = CleanupGuard(path);
     let caller = ctx("tenant-a");
@@ -247,6 +248,53 @@ fn savepoints_are_isolated_per_session_transaction() {
     let err = run(&engine, &b, &mut sb, &mut tb, "RELEASE a").unwrap_err();
     assert_eq!(err.wire_code(), "3B001");
     run(&engine, &a, &mut sa, &mut ta, "RELEASE a").unwrap();
+}
+
+/// savepoint 時点のセッション状態（TimeZone・search_path・セッション UDF）が `ROLLBACK TO` で
+/// 復元される（PR #2863 レビュー指摘の回帰。writer 未取得でも成功する経路）。
+#[test]
+fn rollback_to_savepoint_restores_session_state() {
+    let (engine, path) = new_core();
+    let _c = CleanupGuard(path);
+    let caller = ctx("tenant-a");
+    let mut s = SessionState::default();
+    s.allow_ddl();
+    let tz_before = format!("{:?}", s.time_zone());
+    let sp_before = s.search_path().display();
+    let mut txn = engine.new_session_transaction();
+    run(&engine, &caller, &mut s, &mut txn, "BEGIN").unwrap();
+    run(&engine, &caller, &mut s, &mut txn, "SAVEPOINT a").unwrap();
+    run(
+        &engine,
+        &caller,
+        &mut s,
+        &mut txn,
+        "SET TIME ZONE 'Asia/Tokyo'",
+    )
+    .unwrap();
+    run(
+        &engine,
+        &caller,
+        &mut s,
+        &mut txn,
+        "SET search_path = other_schema",
+    )
+    .unwrap();
+    // Tx ブロック内の `CREATE FUNCTION` は拒否されるため、Tx オブジェクトを介さず同一セッションへ
+    // 登録する（セッション UDF が復元対象であることだけを検証する）。
+    engine
+        .execute_sql_in_session(&caller, &mut s, "CREATE FUNCTION f_sp(v) AS vec_norm(v)")
+        .unwrap();
+    assert_ne!(format!("{:?}", s.time_zone()), tz_before);
+    assert_ne!(s.search_path().display(), sp_before);
+    assert!(!s.udfs().is_empty());
+    run(&engine, &caller, &mut s, &mut txn, "ROLLBACK TO a").unwrap();
+    assert_eq!(txn.status(), TransactionStatus::InTransaction);
+    assert_eq!(format!("{:?}", s.time_zone()), tz_before);
+    assert_eq!(s.search_path().display(), sp_before);
+    assert!(s.udfs().is_empty());
+    run(&engine, &caller, &mut s, &mut txn, "COMMIT").unwrap();
+    assert_eq!(format!("{:?}", s.time_zone()), tz_before);
 }
 
 #[test]
