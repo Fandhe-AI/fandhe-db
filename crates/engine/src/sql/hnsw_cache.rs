@@ -2474,6 +2474,44 @@ pub fn classify_ann_plan(input: AnnShapeInput) -> AnnPlan {
     }
 }
 
+/// 利用者ポリシー（RLS-13・Issue #2279）が適用される問い合わせの ANN 形状入力を補正する。
+///
+/// ポリシー適用後のアリーナは「テナント可視の真部分集合」になりうるため、可視全集合を前提とする
+/// `FullVisible` 形状（フィルタなし・DISTANCE 先行）へ分類してはならない（索引ベースの入力との
+/// 恒等性が崩れ、ポリシーで除かれた行が結果に混ざりうる）。ポリシーがあるときは `Subset` 形状
+/// （`filters_empty = false`・`scalar_prefilter = true`）へ倒す。`sql::exec` の実行判定と
+/// `core` の `EXPLAIN`／Describe が同じ補正を通すことで、両者の `ann_plan` を一致させる。
+/// 公開の [`AnnShapeInput`] へフィールドを足さない（外部からの構造体リテラルを壊さない）ための
+/// crate 内部関数。
+pub(crate) fn ann_shape_with_row_policy(
+    mut input: AnnShapeInput,
+    policy_present: bool,
+) -> AnnShapeInput {
+    if policy_present {
+        input.filters_empty = false;
+        input.scalar_prefilter = true;
+    }
+    input
+}
+
+/// `Subset` 形状の探索に先立ち、テナント可視の全集合スナップショットから索引ベースだけを用意する
+/// （RLS-13・Issue #2279）。
+///
+/// `prepare_subset` は索引ベースが未構築のとき構築せず plain scan へ縮退する（ベースを作るのは
+/// `FullVisible` 経路だけ）。ポリシー適用表では `FullVisible` に入らないため、何もしないと ANN が
+/// 一度も使われない。ベースはテナント境界だけの内容（キャッシュのキーと同じ）から作るので、
+/// ポリシーは索引へ入らない。返る候補は `Overlay::compute` がポリシー適用後のアリーナへ写像し、
+/// 部分集合の外のノードは除外される。戻り値は捨てる（構築・登録が目的）。
+pub(crate) fn prepare_base_from_full_visible(
+    access: &HnswCacheAccess<'_>,
+    read_txn: &redb::ReadTransaction,
+    table: &str,
+    ctx: &PolicyContext,
+    full_visible_arena: &VectorArena,
+) {
+    let _ = prepare_full_visible(access, read_txn, table, ctx, full_visible_arena);
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -4343,5 +4381,38 @@ mod tests {
         );
         assert_eq!(cache.stats().ef_cap_fallbacks, 1);
         assert_eq!(cache.stats().hybrid_resumed_rounds, 0);
+    }
+
+    /// 補正関数: ポリシーなしは恒等、ありなら常に `Subset` 系（`FullVisible` にならない）。
+    #[test]
+    fn ann_shape_with_row_policy_never_yields_full_visible_when_policy_present() {
+        for filters_empty in [false, true] {
+            for scalar_prefilter in [false, true] {
+                let base = AnnShapeInput {
+                    hnsw_enabled: true,
+                    engine_kind_unknown: false,
+                    is_hybrid: false,
+                    is_precision: false,
+                    filters_empty,
+                    scalar_prefilter,
+                };
+                let same = ann_shape_with_row_policy(base, false);
+                assert_eq!(classify_ann_plan(same), classify_ann_plan(base));
+                let fixed = ann_shape_with_row_policy(base, true);
+                assert_eq!(classify_ann_plan(fixed), AnnPlan::HnswSubset);
+            }
+        }
+        let precision = AnnShapeInput {
+            hnsw_enabled: true,
+            engine_kind_unknown: false,
+            is_hybrid: false,
+            is_precision: true,
+            filters_empty: true,
+            scalar_prefilter: false,
+        };
+        assert_eq!(
+            classify_ann_plan(ann_shape_with_row_policy(precision, true)),
+            AnnPlan::PlainScanPrecision
+        );
     }
 }

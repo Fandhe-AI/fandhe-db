@@ -8,7 +8,8 @@
 //!    オラクル（Rust のクロージャ）で出し、production の判定関数を使わない
 //! 2. 除かれた行は存在しない行と同じ（0 件・`RETURNING` に出ない・エラーにならない。利用者の式より先に評価）
 //! 3. テナント境界は常に先で、ポリシーは内側で狭めるだけ（他テナントの有効化・定義は効かない）
-//! 4. ポリシーを反映できない経路（ランキング付き検索）は適用表に限り `0A000` で拒否する（fail-closed）
+//! 4. ランキング付き検索（距離順・ハイブリッド）にもポリシーが効く（#2279。詳細は `rls13_policy_search`）。
+//!    Rust API の検索・`USING PLAN` の辞書構築は適用表に限り `0A000` で拒否する（fail-closed）
 
 use engine::catalog::{ColumnDef, ColumnType, TableSchema};
 use engine::core::EngineCore;
@@ -928,28 +929,24 @@ fn select_policy_is_added_only_when_the_statement_reads_existing_rows() {
 }
 
 // ---------------------------------------------------------------------
-// 4. ポリシーを反映できない経路は fail-closed
+// 4. ランキング付き検索への適用
 // ---------------------------------------------------------------------
 
-/// ランキング付き検索は、適用表に限り固定文言の `0A000` で拒否する。適用していない表・DISABLE 後は従来どおり成功する。
+/// ランキング付き検索（#2279）は、適用表でポリシーを通った行だけを返す。適用していない表・DISABLE 後は従来どおり。
+/// 詳細（ハイブリッド・HNSW・`EXPLAIN`）は `rls13_policy_search` が固定する。
 #[test]
-fn ranked_search_is_rejected_only_for_tables_where_policies_apply() {
+fn ranked_search_applies_policies_only_for_tables_where_they_apply() {
     let (core, _g) = open_core("rls13-using-ranked");
     let sql = "SELECT id FROM docs ORDER BY embedding <=> '[1,0]' LIMIT 3";
-    // 未有効化: 成功。
-    assert!(!query_as(&core, "alice", sql).rows.is_empty());
+    // 未有効化: テナント境界だけで見える行（alice: 1〜5 のうち不可視を除く全件）。
+    let unrestricted = ids_as(&core, "alice", sql);
+    assert!(!unrestricted.is_empty());
     setup_policies(&core, &[&P_JA]);
-    match run_as(&core, "alice", sql) {
-        Err(e) => {
-            assert_eq!(e.wire_code(), "0A000");
-            let msg = e.client_message().to_string();
-            assert!(!msg.contains("docs"), "表名を含めない: {msg}");
-            assert!(!msg.contains("pj"), "ポリシー名を含めない: {msg}");
-        }
-        Ok(o) => panic!("ranked search must be rejected, got {o:?}"),
-    }
+    // 適用後: ポリシー（lang = 'ja'）を通る alice の可視行（id 1・3）だけ。他テナントの Private（id 6）は出ない。
+    let applied = ids_as(&core, "alice", sql);
+    assert_eq!(applied, sorted(expected_select(&[&P_JA])));
     // 他テナントの有効化はこのテナントの検索を妨げない。
     assert!(!query_as(&core, "bob", sql).rows.is_empty());
     disable_rls(&core);
-    assert!(!query_as(&core, "alice", sql).rows.is_empty());
+    assert_eq!(ids_as(&core, "alice", sql), unrestricted);
 }

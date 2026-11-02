@@ -226,7 +226,7 @@ fn visible_rows_impl(
     allow_allocated: bool,
 ) -> Result<Vec<Row>, TenantError> {
     // RLS-13（Issue #2276）: この列挙は利用者ポリシーを反映しない（辞書構築・検索の検証用の読み取り口。
-    // 反映は #2279）。適用表では部分的に広い集合を返さず、固定文言で拒否する（fail-closed）。
+    // 列挙用の Rust API のため #2279 でも拒否を維持）。適用表では部分的に広い集合を返さず、固定文言で拒否する（fail-closed）。
     // 列挙は複数の読み取り txn に跨るため、走査の前と後の 2 回判定する。走査中に別セッションが RLS を
     // ENABLE していれば後段で検出でき、ポリシーを反映しない列挙結果を返さない（結果は破棄する）。
     reject_policies_for_enumeration(storage, table, ctx)?;
